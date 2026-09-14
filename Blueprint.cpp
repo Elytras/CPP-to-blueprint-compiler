@@ -22,7 +22,13 @@ FBlueprintClass::FBlueprintClass(FPackage& InPkg, std::string InClassName,
 {
 }
 
-FIndex FBlueprintClass::ScriptPackage(const std::string& PackageName)
+/*
+Imports a package by path. Native code lives under /Script/<Module>, but a Blueprint lives in
+its own /Game asset package — and either way the package OBJECT's class is CoreUObject.Package,
+so both spell the same row. Only the CDO of a Blueprint parent differs: its class is the
+Blueprint itself, so a /Game path shows up there as a ClassPackage.
+*/
+FIndex FBlueprintClass::PackageImport(const std::string& PackageName)
 {
     const std::string Key = "pkg:" + PackageName;
     auto It = ImportCache.find(Key);
@@ -39,7 +45,7 @@ FIndex FBlueprintClass::EngineClass(const std::string& PackageName, const std::s
     auto It = ImportCache.find(Key);
     if (It != ImportCache.end()) return Imp(It->second);
 
-    const FIndex Outer = ScriptPackage(PackageName);
+    const FIndex Outer = PackageImport(PackageName);
     const int32 Row = P.AddImport({ "/Script/CoreUObject", "Class", Outer, ClassName_ });
     ImportCache.emplace(Key, Row);
     return Imp(Row);
@@ -51,7 +57,7 @@ FIndex FBlueprintClass::ScriptStruct(const std::string& PackageName, const std::
     auto It = ImportCache.find(Key);
     if (It != ImportCache.end()) return Imp(It->second);
 
-    const FIndex Outer = ScriptPackage(PackageName);
+    const FIndex Outer = PackageImport(PackageName);
     const int32 Row = P.AddImport({ "/Script/CoreUObject", "ScriptStruct", Outer, StructName });
     ImportCache.emplace(Key, Row);
     return Imp(Row);
@@ -94,8 +100,8 @@ void FBlueprintClass::Finish()
     const FIndex ScsNodeClass = EngineClass("/Script/Engine", "SCS_Node");
     const FIndex ScsClass = EngineClass("/Script/Engine", "SimpleConstructionScript");
 
-    const FIndex EnginePkg = ScriptPackage("/Script/Engine");
-    const FIndex CorePkg = ScriptPackage("/Script/CoreUObject");
+    const FIndex EnginePkg = PackageImport("/Script/Engine");
+    const FIndex CorePkg = PackageImport("/Script/CoreUObject");
     const FIndex BpgcCdo = Imp(P.AddImport({ "/Script/Engine", "BlueprintGeneratedClass",
                                              EnginePkg, "Default__BlueprintGeneratedClass" }));
     const FIndex FunctionCdo = Imp(P.AddImport({ "/Script/CoreUObject", "Function",
@@ -115,7 +121,7 @@ void FBlueprintClass::Finish()
     FIndex ParentIdx, ParentCdo;
     if (bParentIsBlueprint)
     {
-        const FIndex ParentPkgIdx = ScriptPackage(ParentPackage);
+        const FIndex ParentPkgIdx = PackageImport(ParentPackage);
         ParentIdx = Imp(P.AddImport({ "/Script/Engine", "BlueprintGeneratedClass",
                                       ParentPkgIdx, ParentClass }));
         ParentCdo = Imp(P.AddImport({ ParentPackage, ParentClass, ParentPkgIdx,
@@ -125,7 +131,7 @@ void FBlueprintClass::Finish()
     {
         ParentIdx = EngineClass(ParentPackage, ParentClass);
         ParentCdo = Imp(P.AddImport({ ParentPackage, ParentClass,
-                                      ScriptPackage(ParentPackage), "Default__" + ParentClass }));
+                                      PackageImport(ParentPackage), "Default__" + ParentClass }));
     }
 
     // Row numbers are fixed here so the exports can refer to each other before they exist.

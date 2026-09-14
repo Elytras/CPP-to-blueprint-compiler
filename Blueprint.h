@@ -33,7 +33,7 @@ public:
                     std::string ParentPackage, std::string ParentClass, bool bParentIsBlueprint);
 
     /* Imports, memoised: the same engine object asked for twice yields the same row. */
-    FIndex ScriptPackage(const std::string& PackageName);        // "/Script/Engine"
+    FIndex PackageImport(const std::string& PackageName);   // "/Script/Engine" or "/Game/Mod/Asset"
     FIndex EngineClass(const std::string& PackageName, const std::string& ClassName);
     FIndex ScriptStruct(const std::string& PackageName, const std::string& StructName);
     FIndex EngineFunction(const std::string& PackageName, const std::string& OwningClass,
