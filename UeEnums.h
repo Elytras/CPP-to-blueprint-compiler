@@ -4,7 +4,7 @@ UeEnums.h — UE 4.27's serialization enums, generated from the engine headers.
 
 These are the vocabularies a package writer has to speak exactly: Kismet opcodes, and the
 flag words stored on functions, properties, classes and export rows. They are generated
-rather than hand-copied (scratchpad genenums.py) because a single mistyped bit produces an
+rather than hand-copied (tools/genenums.py) because a single mistyped bit produces an
 asset that loads and then misbehaves, which is far worse than one that fails outright.
 
 Emitting an opcode is a separate question from naming it: the full EExprToken set is here so
