@@ -7,18 +7,20 @@ Two modes, answering different questions.
 against Epic's own bytes. That is the regression gate on the package format: if the container
 ever drifts, this catches it offline, with no game and no editor involved.
 
-`gen` writes the actual deliverable — a Blueprint class authored here in C++, with an event
-whose body is real Kismet bytecode, plus the two spawn-hook subclasses DRG's mod loader looks
-for by name. Nothing verifies that one but the game, which is rather the point of it.
+`compile` writes the actual deliverable. Its classes come from a mod source that clang has
+already type-checked, so a misspelled function or a base class that does not exist is a
+compile error rather than an asset that loads and misbehaves. Nothing verifies the result
+but the game, which is rather the point of it.
 
 usage: assetgen verify <out-dir> <reference-dir>
-       assetgen gen <out-dir>
+       assetgen compile <source.cpp> <include-dir> <out-dir>
 */
 #include <cstdio>
 #include <string>
 #include <vector>
 
 #include "Blueprint.h"
+#include "Cpp.h"
 #include "Package.h"
 #include "Script.h"
 
@@ -182,93 +184,12 @@ bool Diff(const std::string& Label, const std::string& Mine, const std::string& 
     return true;
 }
 
-/* Gives a generated package a stable identity, with no editor around to allocate one. */
-void StampIdentity(FPackage& P, const std::string& PackageName)
-{
-    const uint32 H = StrCrc32(PackageName);
-    P.SetGuid(H, H ^ 0x9E3779B9u, ~H, H * 2654435761u);
-    P.SetPackageSource(H);
-}
-
 bool Save(FPackage& P, const std::string& Base)
 {
     std::string Err;
     if (!P.Save(Base, &Err)) { printf("  FAILED %s: %s\n", Base.c_str(), Err.c_str()); return false; }
     printf("  wrote %s.uasset / .uexp\n", Base.c_str());
     return true;
-}
-
-/* ---- the generated mod ---- */
-
-const char* kModPath = "/Game/_ElytrasMods/CppTest";
-
-/*
-The class this whole exercise is for:
-
-    class Test : public AActor
-    {
-        void ReceiveBeginPlay()
-        {
-            GetFSDGameState(this)->PostGameMessage("Hello from a C++ generated Blueprint");
-        }
-    };
-
-Deliberately NOT UKismetSystemLibrary::PrintString: its body is wrapped in
-`#if !(UE_BUILD_SHIPPING || UE_BUILD_TEST)`, so against the retail game the call would run and
-do nothing at all. PostGameMessage is the game's own message path and survives shipping.
-
-The call shape is copied from ModMOTD's "Post Multiline Game Message", which is known to work:
-a pure library call yields the game state, and the message is sent on it through EX_Context.
-
-ReceiveBeginPlay rather than ReceiveTick only so the greeting arrives once instead of every
-frame; swapping the event name and adding a float DeltaSeconds param is the whole difference.
-*/
-bool GenerateTest(const std::string& OutDir)
-{
-    const std::string PackageName = std::string(kModPath) + "/Test";
-    FPackage P(PackageName);
-    StampIdentity(P, PackageName);
-
-    FBlueprintClass BP(P, "Test_C", "/Script/Engine", "Actor", /*bParentIsBlueprint=*/false);
-
-    const FIndex GetGameState = BP.EngineFunction("/Script/FSD", "GameFunctionLibrary", "GetFSDGameState");
-    const FIndex PostGameMessage = BP.EngineFunction("/Script/FSD", "FSDGameState", "PostGameMessage");
-    const FIndex BeginPlay = BP.EngineFunction("/Script/Engine", "Actor", "ReceiveBeginPlay");
-
-    BP.AddFunction("ReceiveBeginPlay", BeginPlay, {}, [=](FScript& S) {
-        S.Context(
-            [=](FScript& Obj) {                     // GetFSDGameState(this)
-                Obj.CallMath(GetGameState);
-                Obj.Self();
-                Obj.EndFunctionParms();
-            },
-            [=](FScript& Call) {                    // .PostGameMessage("...")
-                Call.FinalFunction(PostGameMessage);
-                Call.StringConst("Hello from a C++ generated Blueprint");
-                Call.EndFunctionParms();
-            });
-        S.Return();
-        S.EndOfScript();
-    });
-
-    BP.Finish();
-    return Save(P, OutDir + "/Test");
-}
-
-/*
-DRG's mod loader spawns assets named InitCave and InitSpacerig, so a mod's entry point is the
-asset name rather than any registration call. Both simply derive from the class above.
-*/
-bool GenerateSpawnHook(const std::string& OutDir, const std::string& AssetName)
-{
-    const std::string PackageName = std::string(kModPath) + "/" + AssetName;
-    FPackage P(PackageName);
-    StampIdentity(P, PackageName);
-
-    FBlueprintClass BP(P, AssetName + "_C", std::string(kModPath) + "/Test", "Test_C",
-                       /*bParentIsBlueprint=*/true);
-    BP.Finish();
-    return Save(P, OutDir + "/" + AssetName);
 }
 
 int Verify(const std::string& OutDir, const std::string& RefDir)
@@ -293,16 +214,15 @@ int main(int argc, char** argv)
     if (argc >= 4 && std::string(argv[1]) == "verify")
         return Verify(argv[2], argv[3]);
 
-    if (argc >= 3 && std::string(argv[1]) == "gen")
+    if (argc >= 5 && std::string(argv[1]) == "compile")
     {
-        const std::string OutDir = argv[2];
-        const bool bOk = GenerateTest(OutDir)
-                       && GenerateSpawnHook(OutDir, "InitCave")
-                       && GenerateSpawnHook(OutDir, "InitSpacerig");
-        return bOk ? 0 : 1;
+        std::string Err;
+        if (CompileToAssets(argv[2], argv[3], argv[4], &Err)) return 0;
+        printf("  FAILED: %s\n", Err.c_str());
+        return 1;
     }
 
     printf("usage: assetgen verify <out-dir> <reference-dir>\n"
-           "       assetgen gen <out-dir>\n");
+           "       assetgen compile <source.cpp> <include-dir> <out-dir>\n");
     return 2;
 }

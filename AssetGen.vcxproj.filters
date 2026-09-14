@@ -14,6 +14,9 @@
     <ClInclude Include="Blueprint.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="Cpp.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="Package.h">
       <Filter>Header Files</Filter>
     </ClInclude>
@@ -28,6 +31,9 @@
     <ClCompile Include="Blueprint.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="Cpp.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="Main.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -37,5 +43,16 @@
     <ClCompile Include="Script.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="Mod Input">
+      <UniqueIdentifier>{2a6e94b3-0f57-4c28-8d1a-63b7e0f5c214}</UniqueIdentifier>
+    </Filter>
+    <None Include="ue\UeApi.h">
+      <Filter>Mod Input</Filter>
+    </None>
+    <None Include="mods\HelloWorld.cpp">
+      <Filter>Mod Input</Filter>
+    </None>
   </ItemGroup>
 </Project>
