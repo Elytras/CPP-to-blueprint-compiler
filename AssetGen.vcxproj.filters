@@ -45,14 +45,14 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <Filter Include="Mod Input">
+    <Filter Include="Tools">
       <UniqueIdentifier>{2a6e94b3-0f57-4c28-8d1a-63b7e0f5c214}</UniqueIdentifier>
     </Filter>
-    <None Include="ue\UeApi.h">
-      <Filter>Mod Input</Filter>
+    <None Include="tools\genueapi.py">
+      <Filter>Tools</Filter>
     </None>
-    <None Include="mods\HelloWorld.cpp">
-      <Filter>Mod Input</Filter>
+    <None Include="tools\genenums.py">
+      <Filter>Tools</Filter>
     </None>
   </ItemGroup>
 </Project>

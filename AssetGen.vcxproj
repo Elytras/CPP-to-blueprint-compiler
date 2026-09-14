@@ -86,10 +86,11 @@
     <ClCompile Include="Package.cpp" />
     <ClCompile Include="Script.cpp" />
   </ItemGroup>
-  <!-- Input to the generator, not part of it: UeApi.h is compiled by clang, HelloWorld.cpp by AssetGen. -->
+  <!-- Mod sources and the generated UeApi headers live in BpMods\, outside this project: they are
+       input to assetgen.exe and to clang, never compiled into the tool itself. -->
   <ItemGroup>
-    <None Include="ue\UeApi.h" />
-    <None Include="mods\HelloWorld.cpp" />
+    <None Include="tools\genueapi.py" />
+    <None Include="tools\genenums.py" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />
