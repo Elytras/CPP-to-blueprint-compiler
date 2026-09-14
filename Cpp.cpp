@@ -16,6 +16,7 @@ half-written asset to explain.
 #include <cstdio>
 #include <cstdlib>
 #include <map>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -431,8 +432,16 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     valid C++, and its diagnostics are a far better error message than anything we could invent.
     */
     const std::string AstPath = OutDir + "/ast.json";
+    /*
+    Both the UeApi directory and its parent are on the include path, so a mod may spell its
+    include either way ("FSD.h" or "UeApi/FSD.h"). A quoted include otherwise resolves relative
+    to the mod source, which silently works for a file sitting in BpMods and fails for one
+    anywhere else.
+    */
+    const std::string Parent = std::filesystem::path(IncludeDir).parent_path().string();
     const std::string Cmd = "clang++ -std=c++17 -fsyntax-only -Xclang -ast-dump=json"
-                            " \"" + SourcePath + "\" -I\"" + IncludeDir + "\" > \"" + AstPath + "\"";
+                            " \"" + SourcePath + "\" -I\"" + IncludeDir + "\" -I\"" + Parent
+                          + "\" > \"" + AstPath + "\"";
     if (system(("\"" + Cmd + "\"").c_str()) != 0)
     {
         *Err = "clang rejected " + SourcePath + " (diagnostics above)";
