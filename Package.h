@@ -82,6 +82,15 @@ only consulted for StructProperty tags, where the tag carries the struct's FName
 void Tag(FArc& Ar, const std::string& Name, const std::string& Type,
          const std::function<void(FArc&)>& Value, const std::string& StructName = "");
 
+/*
+Writes a BoolProperty tag.
+
+A bool is the one property whose value lives in the tag rather than after it: FPropertyTag
+carries BoolVal and the payload is zero bytes. Writing one through Tag() produces a tag the
+loader reads as false no matter what the value closure appended.
+*/
+void TagBool(FArc& Ar, const std::string& Name, bool Value);
+
 /* Terminates a tagged-property block. Every object's property list ends with the name "None". */
 inline void TagEnd(FArc& Ar) { Ar.Name("None"); }
 

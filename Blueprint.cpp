@@ -219,7 +219,24 @@ void FBlueprintClass::Finish()
     Cdo.SerBeforeCreate = { Exp(RowClass).V, ParentCdo.V };
     if (bParentIsBlueprint)
         Cdo.CreateBeforeSer = { ParentIdx.V };      // the parent class object, for a BP parent
-    Cdo.Serialize = [](FArc& Ar) { TagEnd(Ar); };   // a CDO omits the lazy-object guid
+    /*
+    AActor's constructor leaves PrimaryActorTick.bCanEverTick false, so an actor that overrides
+    ReceiveTick and says nothing else loads fine and never ticks. The Blueprint compiler sets the
+    flag on the CDO in exactly this case (KismetCompiler.cpp, SetCanEverTick), and a shipped
+    class shows it: Autosprint's name table carries PrimaryActorTick / ActorTickFunction /
+    bCanEverTick precisely because it has a tick event.
+    */
+    const bool bOverridesTick = std::any_of(Functions.begin(), Functions.end(),
+        [](const FPending& F) { return F.Def.Name == "ReceiveTick"; });
+
+    Cdo.Serialize = [bOverridesTick](FArc& Ar) {
+        if (bOverridesTick)
+            Tag(Ar, "PrimaryActorTick", "StructProperty", [](FArc& V) {
+                TagBool(V, "bCanEverTick", true);
+                TagEnd(V);
+            }, "ActorTickFunction");
+        TagEnd(Ar);                                 // a CDO omits the lazy-object guid
+    };
     P.AddExport(std::move(Cdo));
 
     for (size_t I = 0; I < Functions.size(); ++I)

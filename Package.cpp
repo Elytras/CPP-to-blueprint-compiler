@@ -135,6 +135,16 @@ void FArc::Guid(const uint32 (&G)[4])
     for (uint32 V : G) U32(V);
 }
 
+void TagBool(FArc& Ar, const std::string& Name, bool Value)
+{
+    Ar.Name(Name);
+    Ar.Name("BoolProperty");
+    Ar.I32(0);                                    // the value is in the tag, so no payload
+    Ar.I32(0);                                    // ArrayIndex
+    Ar.U8(Value ? 1 : 0);                         // BoolVal
+    Ar.U8(0);                                     // no property guid follows
+}
+
 void Tag(FArc& Ar, const std::string& Name, const std::string& Type,
          const std::function<void(FArc&)>& Value, const std::string& StructName)
 {

@@ -134,7 +134,8 @@ pair covers the shape a generated event actually needs — reach a subsystem, te
 */
 struct FStmtIR
 {
-    bool bHasTarget = false;
+    bool bHasTarget = false;    // the call is made on an object another call produced
+    bool bSelfCall = false;     // the call is made on `this`
     FCallIR Target;
     FCallIR Call;
 };
@@ -330,14 +331,29 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             /* The object being called on has to be produced by a call of its own. */
             const Json* Member = Strip(First(*S));
             const Json* Object = Member ? Strip(First(*Member)) : nullptr;
-            if (!Object || Kind(*Object) != "CallExpr")
+            const std::string ObjKind = Object ? Kind(*Object) : "<none>";
+
+            if (ObjKind == "CXXThisExpr")
             {
-                *Err = std::string("TODO: unimplemented call target ") + (Object ? Kind(*Object) : "<none>");
+                /*
+                A call on `this` needs no context at all: the VM already has this object, so the
+                call is emitted directly. Wrapping it in EX_Context would push a redundant self
+                and make the VM skip-count a call that can never be null.
+                */
+                St.bSelfCall = true;
+                bOk = LowerCall(*S, BP, St.Call, Err);
+            }
+            else if (ObjKind == "CallExpr")
+            {
+                St.bHasTarget = true;
+                bOk = LowerCall(*Object, BP, St.Target, Err) && LowerCall(*S, BP, St.Call, Err);
+            }
+            else
+            {
+                *Err = "TODO: unimplemented call target " + ObjKind;
                 bOk = false;
                 return;
             }
-            St.bHasTarget = true;
-            bOk = LowerCall(*Object, BP, St.Target, Err) && LowerCall(*S, BP, St.Call, Err);
         }
         else if (K == "CallExpr")
         {
@@ -405,9 +421,15 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                         [St](FScript& O) { O.CallMath(St.Target.Fn); EmitArgs(O, St.Target.Args); O.EndFunctionParms(); },
                         [St](FScript& C) { C.FinalFunction(St.Call.Fn); EmitArgs(C, St.Call.Args); C.EndFunctionParms(); });
                 }
+                else if (St.bSelfCall)
+                {
+                    S.FinalFunction(St.Call.Fn);
+                    EmitArgs(S, St.Call.Args);
+                    S.EndFunctionParms();
+                }
                 else
                 {
-                    S.CallMath(St.Call.Fn);
+                    S.CallMath(St.Call.Fn);     // a static library call stands alone
                     EmitArgs(S, St.Call.Args);
                     S.EndFunctionParms();
                 }
