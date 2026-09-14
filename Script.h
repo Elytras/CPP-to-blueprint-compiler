@@ -130,6 +130,7 @@ which is what makes the engine able to find it by name.
 */
 int32 AddFunctionExport(FPackage& P, const FFunctionDef& Def, FIndex OwnerClass,
                         FIndex FunctionClass, FIndex FunctionTemplate,
-                        const std::function<void(FScript&)>& Body);
+                        const std::function<void(FScript&)>& Body,
+                        const std::vector<int32>& BytecodeRefs);
 
 }   // namespace Uasset

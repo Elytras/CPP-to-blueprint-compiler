@@ -229,7 +229,8 @@ void FScript::Unimplemented(EExprToken Token, std::string* Err)
 
 int32 AddFunctionExport(FPackage& P, const FFunctionDef& Def, FIndex OwnerClass,
                         FIndex FunctionClass, FIndex FunctionTemplate,
-                        const std::function<void(FScript&)>& Body)
+                        const std::function<void(FScript&)>& Body,
+                        const std::vector<int32>& BytecodeRefs)
 {
     FExport E;
     E.ClassIndex = FunctionClass;
@@ -238,6 +239,15 @@ int32 AddFunctionExport(FPackage& P, const FFunctionDef& Def, FIndex OwnerClass,
     E.OuterIndex = OwnerClass;
     E.ObjectName = Def.Name;
     E.ObjectFlags = RF_Public;
+
+    /*
+    A function's preload dependencies, as a real cooked class states them: everything the
+    bytecode reaches must be CREATED before this function is serialized, and the class it lives
+    in must be created before it is. Note what is absent - a function declares no
+    serialize-before-create for its own class or template, unlike every other export here.
+    */
+    E.CreateBeforeSer = BytecodeRefs;
+    E.CreateBeforeCreate = { OwnerClass.V };
 
     const FFunctionDef Captured = Def;
     E.Serialize = [Captured, Body](FArc& Ar) {

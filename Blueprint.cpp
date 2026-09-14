@@ -12,6 +12,8 @@ FuncMap maps their names, and whose SimpleConstructionScript owns one default sc
 */
 #include "Blueprint.h"
 
+#include <algorithm>
+
 namespace Uasset
 {
 FBlueprintClass::FBlueprintClass(FPackage& InPkg, std::string InClassName,
@@ -75,6 +77,12 @@ FIndex FBlueprintClass::EngineFunction(const std::string& PackageName,
     const FIndex Owner = EngineClass(PackageName, OwningClass);
     const int32 Row = P.AddImport({ "/Script/CoreUObject", "Function", Owner, FunctionName });
     ImportCache.emplace(Key, Row);
+
+    // Both are reachable from a function body, so both become preload dependencies of one.
+    for (FIndex Ref : { Imp(Row), Owner })
+        if (std::find(CallImports.begin(), CallImports.end(), Ref.V) == CallImports.end())
+            CallImports.push_back(Ref.V);
+
     return Imp(Row);
 }
 
@@ -156,6 +164,20 @@ void FBlueprintClass::Finish()
     Class.ObjectName = ClassName;
     Class.ObjectFlags = RF_Public | RF_Transactional;
     Class.bIsAsset = true;
+
+    /*
+    Preload dependencies, in the shape a cooked BPGC states them (read out of a shipped DRG
+    class with dumpedl.py, not inferred).
+
+    The serialize-before-serialize edge onto the parent is the one that matters most: without
+    it the loader reaches a subclass that names its parent and finds the parent still waiting
+    to be serialized, which aborts the async loading thread outright.
+    */
+    Class.SerBeforeSer = { ParentIdx.V, ParentCdo.V, Exp(RowScs).V };
+    Class.SerBeforeCreate = { BpgcClass.V, BpgcCdo.V };
+    Class.CreateBeforeCreate = { ParentIdx.V };
+    for (int32 I = 0; I < NumFunctions; ++I)        // Children and FuncMap name these
+        Class.CreateBeforeSer.push_back(Exp(RowFirstFunction + I).V);
     Class.Serialize = [=](FArc& Ar) {
         Tag(Ar, "SimpleConstructionScript", "ObjectProperty",
             [=](FArc& V) { V.Idx(Exp(RowScs)); });
@@ -193,11 +215,20 @@ void FBlueprintClass::Finish()
     Cdo.TemplateIndex = ParentCdo;
     Cdo.ObjectName = CDOName;
     Cdo.ObjectFlags = RF_Public | RF_ClassDefaultObject | RF_ArchetypeObject;
+    Cdo.SerBeforeSer = { Exp(RowScsNode).V, Exp(RowRootTemplate).V };
+    Cdo.SerBeforeCreate = { Exp(RowClass).V, ParentCdo.V };
+    if (bParentIsBlueprint)
+        Cdo.CreateBeforeSer = { ParentIdx.V };      // the parent class object, for a BP parent
     Cdo.Serialize = [](FArc& Ar) { TagEnd(Ar); };   // a CDO omits the lazy-object guid
     P.AddExport(std::move(Cdo));
 
-    for (const FPending& F : Functions)
-        AddFunctionExport(P, F.Def, Exp(RowClass), FunctionClass, FunctionCdo, F.Body);
+    for (size_t I = 0; I < Functions.size(); ++I)
+    {
+        std::vector<int32> Refs = CallImports;
+        Refs.push_back(Exp(RowFirstFunction + int32(I)).V);   // a body can reference its own export
+        AddFunctionExport(P, Functions[I].Def, Exp(RowClass), FunctionClass, FunctionCdo,
+                          Functions[I].Body, Refs);
+    }
 
     /*
     A default scene root. An actor can technically live without one, but every cooked actor
@@ -210,6 +241,9 @@ void FBlueprintClass::Finish()
     RootTemplate.OuterIndex = Exp(RowClass);
     RootTemplate.ObjectName = "DefaultSceneRoot_GEN_VARIABLE";
     RootTemplate.ObjectFlags = RF_Public | RF_Transactional | RF_ArchetypeObject;
+    RootTemplate.SerBeforeSer = { Exp(RowClass).V };
+    RootTemplate.SerBeforeCreate = { SceneCompClass.V, SceneCompCdo.V };
+    RootTemplate.CreateBeforeCreate = { Exp(RowClass).V };
     RootTemplate.Serialize = [](FArc& Ar) { TagEnd(Ar); Ar.Bool(false); };
     P.AddExport(std::move(RootTemplate));
 
@@ -219,6 +253,9 @@ void FBlueprintClass::Finish()
     ScsNode.OuterIndex = Exp(RowScs);
     ScsNode.ObjectName = "SCS_Node_0";
     ScsNode.ObjectFlags = RF_Transactional;
+    ScsNode.CreateBeforeSer = { Exp(RowRootTemplate).V, SceneCompClass.V };
+    ScsNode.SerBeforeCreate = { ScsNodeClass.V, ScsNodeCdo.V };
+    ScsNode.CreateBeforeCreate = { Exp(RowScs).V };
     ScsNode.Serialize = [=](FArc& Ar) {
         Tag(Ar, "ComponentClass", "ObjectProperty", [=](FArc& V) { V.Idx(SceneCompClass); });
         Tag(Ar, "ComponentTemplate", "ObjectProperty",
@@ -236,6 +273,9 @@ void FBlueprintClass::Finish()
     Scs.OuterIndex = Exp(RowClass);
     Scs.ObjectName = "SimpleConstructionScript_0";
     Scs.ObjectFlags = RF_Transactional;
+    Scs.CreateBeforeSer = { Exp(RowScsNode).V };
+    Scs.SerBeforeCreate = { ScsClass.V, ScsCdo.V };
+    Scs.CreateBeforeCreate = { Exp(RowClass).V };
     Scs.Serialize = [=](FArc& Ar) {
         Tag(Ar, "DefaultSceneRootNode", "ObjectProperty",
             [=](FArc& V) { V.Idx(Exp(RowScsNode)); });

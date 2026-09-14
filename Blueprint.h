@@ -65,6 +65,17 @@ private:
     bool bParentIsBlueprint = false;
 
     std::unordered_map<std::string, int32> ImportCache;
+
+    /*
+    Every import a function body could call, and the classes declaring them.
+
+    The event-driven loader wants each function export to list what its bytecode reaches, as
+    create-before-serialize edges. Which function used which import is not tracked - the script
+    is assembled inside a closure that runs later - so every function declares the union. Over-
+    declaring only forces those objects to exist earlier, which is what a real cooked class does
+    anyway; under-declaring is the failure that crashes the async loader.
+    */
+    std::vector<int32> CallImports;
     std::vector<FPending> Functions;
 
     int32 ClassRow = -1;
