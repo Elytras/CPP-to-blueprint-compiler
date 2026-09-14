@@ -3,9 +3,14 @@
 
 The dump is already the right shape: it declares every reflected function as ordinary C++, so
 this is a filter rather than a translation. What it filters on is the only rule that matters -
-a function is emitted if and only if AssetGen can currently compile a call to it into Kismet
-bytecode. Anything taking a struct, an enum or an FName is left out, because emitting it would
-let a mod write a call that type-checks and then cannot be generated.
+a member is emitted if and only if AssetGen can currently compile a use of it into Kismet
+bytecode: a call for a function, a read or an assignment for a property. Anything involving a
+struct, an enum, an FName or a container is left out, because emitting it would let a mod write
+something that type-checks and then cannot be generated.
+
+A property is spelled for the VM, not for memory. Nothing here is ever laid over a real object -
+clang only ever parses these headers - so Dumper-7's `uint8 bHidden : 1` becomes a plain `bool`,
+which is what the FBoolProperty behind it actually is and what picks EX_LetBool downstream.
 
 Blueprint packages are skipped too: Dumper-7 names them by asset name and does not record the
 /Game path an import needs, so their classes would be unaddressable.
@@ -27,12 +32,15 @@ import re
 import sys
 
 DECL = re.compile(r"^\t(static\s+)?([A-Za-z_][\w:<>,\s\*&]*?)\s+(\w+)\((.*)\);\s*$")
-# The root (UObject) has no base and carries an alignas; everything else derives from something.
-CLASS = re.compile(r"^class\s+(?:alignas\(\w+\)\s+)?(\w+)(?:\s+final)?(?:\s*:\s*public\s+(\w+))?\s*$")
+# The root (UObject) has no base; everything else derives from something. Either may carry an
+# alignment prefix, spelled alignas(...) or SDK_ALIGN(...) - and a class line that fails to match
+# here is not skipped, it silently donates its whole body to the class above it.
+CLASS = re.compile(r"^class\s+(?:\w+\([^)]*\)\s+)?(\w+)(?:\s+final)?(?:\s*:\s*public\s+(\w+))?\s*$")
 CLASS_COMMENT = re.compile(r"^// Class\s+([\w/\.\-]+)\.(\w+)\s*$")
 # Dumper-7 labels a cooked Blueprint class by its generated-class kind, never as "Class".
 BP_COMMENT = re.compile(r"^// \w*BlueprintGeneratedClass\s")
 PTR = re.compile(r"^(?:const\s+)?class\s+(\w+)\s*\*$")
+FIELD = re.compile(r"^\t([A-Za-z_][\w:<>,\*& ]*?)\s+([A-Za-z_]\w*)\s*(:\s*\d+)?;\s*//")
 INCLUDE = re.compile(r'^#include\s+"(\w+)_classes\.hpp"')
 
 SCALARS = {"void": "void", "bool": "bool", "float": "float", "int32": "int", "int": "int"}
@@ -123,10 +131,24 @@ def parse_params(text):
     return out
 
 
+def parse_field(cur, m, skipped):
+    raw, fname, bits = m.group(1), m.group(2), m.group(3)
+    if fname.startswith(("Pad_", "BitPad_")):
+        return                              # Dumper-7's layout filler, not a reflected property
+    if "FString" in raw or "FText" in raw:
+        return                              # a text property reads as a value we cannot yet carry
+    mapped = "bool" if bits else map_type(raw)
+    if mapped in KINDS or mapped == "void":
+        skipped[mapped if mapped in KINDS else "other"] += 1
+        return
+    cur.fields.append((mapped, fname))
+
+
 class Klass(object):
     def __init__(self, cpp, base, package, ue_name):
         self.cpp, self.base, self.package, self.ue_name = cpp, base, package, ue_name
         self.funcs = []
+        self.fields = []
 
 
 def parse_header(path):
@@ -154,8 +176,13 @@ def parse_header(path):
                 classes.append(cur)
             pending = None
             continue
-        if cur is None or "//" in line:
-            continue                        # a field carries an offset comment; a declaration does not
+        if cur is None:
+            continue
+        if "//" in line:                    # a property carries an offset comment; a declaration does not
+            m = FIELD.match(line)
+            if m:
+                parse_field(cur, m, skipped)
+            continue
         m = DECL.match(line)
         if not m:
             continue
@@ -259,7 +286,7 @@ def main():
     if not os.path.isdir(out_dir):
         os.makedirs(out_dir)
 
-    funcs = 0
+    funcs, fields = 0, 0
     for pkg, members in sorted(by_pkg.items()):
         body, referenced = [], set()
         defined = set(k.cpp for k in members)
@@ -267,6 +294,15 @@ def main():
             inherits = " : public %s" % k.base if k.base else ""
             body.append("class %s%s\n{\npublic:\n    UE_CLASS(\"/Script/%s\", \"%s\");"
                         % (k.cpp, inherits, pkg, k.ue_name))
+            names = set(f for _, _, f, _ in k.funcs)
+            for ftype, fname in k.fields:
+                if fname in names:
+                    continue                # a property and a function of one name cannot coexist
+                body.append("    %s %s;" % (ftype, fname))
+                fields += 1
+                m = PTR.match(ftype)
+                if m:
+                    referenced.add(m.group(1))
             for is_static, ret, fname, params in k.funcs:
                 args = ", ".join("%s %s" % (t, n) for t, n in params)
                 body.append("    %s%s %s(%s);" % ("static " if is_static else "", ret, fname, args))
@@ -281,7 +317,7 @@ def main():
                "/*",
                "Package /Script/%s, generated by AssetGen/tools/genueapi.py. Do not edit." % pkg,
                "",
-               "A function is here if and only if AssetGen can compile a call to it.",
+               "A member is here if and only if AssetGen can compile a use of it.",
                "*/",
                "#include \"UeMeta.h\""]
         # A base class must be complete, so its package is included; a pointer only needs a name.
@@ -300,20 +336,22 @@ def main():
                 "",
                 "Generated by AssetGen/tools/genueapi.py. Do not edit.",
                 "",
-                "A function is here if and only if AssetGen can compile a call to it, so clang",
+                "A member is here if and only if AssetGen can compile a use of it, so clang",
                 "accepting a mod source is the same statement as AssetGen being able to generate it.",
-                "%d classes, %d functions across %d packages." % (len(ordered), funcs, len(by_pkg)),
+                "%d classes, %d functions, %d properties across %d packages."
+                % (len(ordered), funcs, fields, len(by_pkg)),
                 "",
                 "Including this pulls in all of them, which is convenient and slow: it costs clang a",
                 "56 MB AST dump for a twenty-line mod. Prefer naming the two or three packages the",
                 "mod actually uses.",
                 "",
-                "TODO: unimplemented argument kinds held %d functions back - %s." % (sum(totals.values()), reach),
+                "TODO: unimplemented value kinds held %d members back - %s." % (sum(totals.values()), reach),
                 "*/"]
     umbrella += ["#include \"%s.h\"" % pkg for pkg in sorted(by_pkg)]
     io.open(os.path.join(out_dir, "UeApi.h"), "w", encoding="utf-8-sig", newline="\n").write("\n".join(umbrella) + "\n")
 
-    print("UeApi: %d classes, %d functions, %d packages" % (len(ordered), funcs, len(by_pkg)))
+    print("UeApi: %d classes, %d functions, %d properties, %d packages"
+          % (len(ordered), funcs, fields, len(by_pkg)))
     print("  out of reach: " + reach)
     print("  blueprint packages skipped (no /Game path in the dump): %d" % skipped_bp)
 

@@ -53,6 +53,14 @@ FIndex FBlueprintClass::EngineClass(const std::string& PackageName, const std::s
     return Imp(Row);
 }
 
+FIndex FBlueprintClass::PropertyOwner(const std::string& PackageName, const std::string& ClassName_)
+{
+    const FIndex Idx = EngineClass(PackageName, ClassName_);
+    if (std::find(CallImports.begin(), CallImports.end(), Idx.V) == CallImports.end())
+        CallImports.push_back(Idx.V);
+    return Idx;
+}
+
 FIndex FBlueprintClass::ScriptStruct(const std::string& PackageName, const std::string& StructName)
 {
     const std::string Key = "str:" + PackageName + "." + StructName;

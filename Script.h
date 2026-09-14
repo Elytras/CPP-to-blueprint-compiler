@@ -77,6 +77,20 @@ public:
     void FieldPath(const std::string& PropertyName, FIndex Owner);
     void NullFieldPath();
     void LocalVariable(const std::string& PropertyName, FIndex Owner);
+    void InstanceVariable(const std::string& PropertyName, FIndex Owner);
+
+    /*
+    An assignment, `Var = Value`.
+
+    Which opcode to use is a property of the destination's type, not a choice: EX_Let names the
+    property it writes and then copies ElementSize bytes, while EX_LetBool and EX_LetObj know
+    their own width and so carry no property at all. Passing EX_Let for a bool writes a byte
+    over a bitfield's whole containing byte; passing it for an object ref skips the reference
+    bookkeeping. Both are silent offline.
+    */
+    void Let(EExprToken LetOp, const std::string& PropertyName, FIndex Owner,
+             const std::function<void(FScript&)>& Var,
+             const std::function<void(FScript&)>& Value);
 
     /*
     Calls something on another object: `ObjectExpr` yields the target, `ContextExpr` is the

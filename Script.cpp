@@ -158,6 +158,23 @@ void FScript::LocalVariable(const std::string& PropertyName, FIndex Owner)
     FieldPath(PropertyName, Owner);
 }
 
+void FScript::InstanceVariable(const std::string& PropertyName, FIndex Owner)
+{
+    Op(EX_InstanceVariable);
+    FieldPath(PropertyName, Owner);
+}
+
+void FScript::Let(EExprToken LetOp, const std::string& PropertyName, FIndex Owner,
+                  const std::function<void(FScript&)>& Var,
+                  const std::function<void(FScript&)>& Value)
+{
+    Op(LetOp);
+    if (LetOp == EX_Let)
+        FieldPath(PropertyName, Owner);     // only the general form names its destination
+    Var(*this);
+    Value(*this);
+}
+
 void FScript::Context(const std::function<void(FScript&)>& ObjectExpr,
                       const std::function<void(FScript&)>& ContextExpr)
 {

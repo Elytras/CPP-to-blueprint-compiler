@@ -41,6 +41,18 @@ const Json* First(const Json& N)
     return (It == N.end() || It->empty()) ? nullptr : &(*It)[0];
 }
 
+const Json* Nth(const Json& N, size_t I)
+{
+    auto It = N.find("inner");
+    return (It == N.end() || It->size() <= I) ? nullptr : &(*It)[I];
+}
+
+std::string TypeOf(const Json& N)
+{
+    auto It = N.find("type");
+    return It == N.end() ? std::string() : It->value("qualType", std::string());
+}
+
 /* Casts, parens and temporaries carry no meaning here; the operand underneath does. */
 const Json* Strip(const Json* N)
 {
@@ -115,11 +127,13 @@ struct FRecord
 
 struct FArgIR
 {
-    enum EKind { Self, Int, Float, Bool, Str } K = Self;
+    enum EKind { Self, Int, Float, Bool, Str, Field } K = Self;
     int32 I = 0;
     float F = 0.0f;
     bool B = false;
-    std::string S;
+    std::string S;          // Str: the literal. Field: the property name.
+    FIndex Owner;           // Field: the class that declares it
+    EExprToken LetOp = EX_Let;      // Field: the opcode that writes this type
 };
 
 struct FCallIR
@@ -129,15 +143,23 @@ struct FCallIR
 };
 
 /*
-One statement: a static library call, optionally acting as the target of a member call. That
-pair covers the shape a generated event actually needs — reach a subsystem, tell it something.
+One statement. The shapes a generated event actually needs: reach a subsystem and tell it
+something, call something on yourself, or write one of your own properties.
 */
 struct FStmtIR
 {
-    bool bHasTarget = false;    // the call is made on an object another call produced
-    bool bSelfCall = false;     // the call is made on `this`
+    enum EKind
+    {
+        StaticCall,     // a static library call, standing alone (not `Call`: that is a member)
+        TargetCall,     // a call on the object another call produced
+        SelfCall,       // a call on `this`
+        Assign,         // `this->Field = value`
+    } K = StaticCall;
+
     FCallIR Target;
     FCallIR Call;
+    FArgIR Var;                 // Assign: the destination
+    FArgIR Value;               // Assign: what is written
 };
 
 void EmitArgs(FScript& S, const std::vector<FArgIR>& Args)
@@ -151,6 +173,7 @@ void EmitArgs(FScript& S, const std::vector<FArgIR>& Args)
         case FArgIR::Float: S.FloatConst(A.F); break;
         case FArgIR::Bool: A.B ? S.True() : S.False(); break;
         case FArgIR::Str: S.StringConst(A.S); break;
+        case FArgIR::Field: S.InstanceVariable(A.S, A.Owner); break;
         }
     }
 }
@@ -186,7 +209,8 @@ private:
     bool Generate(const FRecord& R, const std::string& OutDir, std::string* Err);
     bool LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FStmtIR>& Out, std::string* Err);
     bool LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR& Out, std::string* Err);
-    bool LowerArg(const Json& ArgNode, FArgIR& Out, std::string* Err);
+    bool LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
+    bool LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
 
     /* The native function behind an override, found by walking the declared ancestry. */
     FIndex FindEvent(FBlueprintClass& BP, const std::string& FromRecord, const std::string& Method);
@@ -201,6 +225,7 @@ private:
     std::string ModPackage;
     std::map<std::string, FRecord> Records;
     std::map<std::string, std::string> MethodOwner;   // clang decl id -> owning record
+    std::map<std::string, std::string> FieldOwner;    // clang decl id -> declaring record
 };
 
 bool FCompiler::Collect(std::string* Err)
@@ -234,6 +259,10 @@ bool FCompiler::Collect(std::string* Err)
                 R.Methods[Name(C)] = &C;
                 MethodOwner[C.value("id", std::string())] = R.CppName;
             }
+            else if (Kind(C) == "FieldDecl" && C.contains("name"))
+            {
+                FieldOwner[C.value("id", std::string())] = R.CppName;
+            }
         });
         Records[R.CppName] = R;
     });
@@ -257,12 +286,56 @@ FIndex FCompiler::FindEvent(FBlueprintClass& BP, const std::string& FromRecord, 
     return Null();      // not an override: a new function, which the FuncMap still reaches
 }
 
-bool FCompiler::LowerArg(const Json& ArgNode, FArgIR& Out, std::string* Err)
+/*
+The opcode that writes a value of this type. See FScript::Let - this is dictated by the
+destination, so it is read off the declared type rather than chosen.
+*/
+EExprToken LetOpFor(const std::string& QualType)
+{
+    if (QualType == "bool") return EX_LetBool;
+    if (!QualType.empty() && QualType.back() == '*') return EX_LetObj;
+    return EX_Let;
+}
+
+bool FCompiler::LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& Out, std::string* Err)
+{
+    /*
+    Only `this->Field` for now. Reaching a property through another object means EX_Context, whose
+    RValuePointer must then name the property being read rather than the null a call writes - a
+    different shape, not a longer one.
+    */
+    const Json* Obj = Strip(First(MemberNode));
+    const std::string ObjKind = Obj ? Kind(*Obj) : "<none>";
+    if (ObjKind != "CXXThisExpr")
+    {
+        *Err = "TODO: a property is only reachable on `this`, not on " + ObjKind;
+        return false;
+    }
+
+    auto It = FieldOwner.find(MemberNode.value("referencedMemberDecl", std::string()));
+    if (It == FieldOwner.end()) { *Err = "access to an unknown property: " + Name(MemberNode); return false; }
+    const FRecord* R = Find(It->second);
+    if (!R) { *Err = "access to a property of an unknown class: " + Name(MemberNode); return false; }
+    if (!R->IsNative())
+    {
+        *Err = "TODO: a generated class declares no properties of its own yet: " + Name(MemberNode);
+        return false;
+    }
+
+    Out.K = FArgIR::Field;
+    Out.S = Name(MemberNode);
+    Out.Owner = BP.PropertyOwner(R->UePackage, R->UeName);
+    Out.LetOp = LetOpFor(TypeOf(MemberNode));
+    return true;
+}
+
+bool FCompiler::LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, std::string* Err)
 {
     const Json* N = Strip(&ArgNode);
     if (!N) { *Err = "empty argument expression"; return false; }
 
     const std::string K = Kind(*N);
+    if (K == "MemberExpr") return LowerField(*N, BP, Out, Err);
     if (K == "CXXThisExpr") { Out.K = FArgIR::Self; return true; }
     if (K == "StringLiteral") { Out.K = FArgIR::Str; Out.S = Unquote(N->value("value", std::string())); return true; }
     if (K == "IntegerLiteral") { Out.K = FArgIR::Int; Out.I = int32(std::stoll(N->value("value", std::string("0")))); return true; }
@@ -310,7 +383,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         if (bFirst) { bFirst = false; return; }
         if (!bOk) return;
         FArgIR A;
-        bOk = LowerArg(C, A, Err);
+        bOk = LowerArg(C, BP, A, Err);
         if (bOk) Out.Args.push_back(A);
     });
     return bOk;
@@ -340,12 +413,12 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 call is emitted directly. Wrapping it in EX_Context would push a redundant self
                 and make the VM skip-count a call that can never be null.
                 */
-                St.bSelfCall = true;
+                St.K = FStmtIR::SelfCall;
                 bOk = LowerCall(*S, BP, St.Call, Err);
             }
             else if (ObjKind == "CallExpr")
             {
-                St.bHasTarget = true;
+                St.K = FStmtIR::TargetCall;
                 bOk = LowerCall(*Object, BP, St.Target, Err) && LowerCall(*S, BP, St.Call, Err);
             }
             else
@@ -358,6 +431,20 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
         else if (K == "CallExpr")
         {
             bOk = LowerCall(*S, BP, St.Call, Err);
+        }
+        else if (K == "BinaryOperator" && S->value("opcode", std::string()) == "=")
+        {
+            const Json* Lhs = Strip(Nth(*S, 0));
+            const Json* Rhs = Strip(Nth(*S, 1));
+            if (!Lhs || !Rhs) { *Err = "assignment with a missing side"; bOk = false; return; }
+            if (Kind(*Lhs) != "MemberExpr")
+            {
+                *Err = "TODO: assignment to " + Kind(*Lhs) + ", not a property";
+                bOk = false;
+                return;
+            }
+            St.K = FStmtIR::Assign;
+            bOk = LowerField(*Lhs, BP, St.Var, Err) && LowerArg(*Rhs, BP, St.Value, Err);
         }
         else
         {
@@ -415,23 +502,31 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         BP.AddFunction(Entry.first, FindEvent(BP, R.CppName, Entry.first), Params, [Stmts](FScript& S) {
             for (const FStmtIR& St : Stmts)
             {
-                if (St.bHasTarget)
+                switch (St.K)
                 {
+                case FStmtIR::TargetCall:
                     S.Context(
                         [St](FScript& O) { O.CallMath(St.Target.Fn); EmitArgs(O, St.Target.Args); O.EndFunctionParms(); },
                         [St](FScript& C) { C.FinalFunction(St.Call.Fn); EmitArgs(C, St.Call.Args); C.EndFunctionParms(); });
-                }
-                else if (St.bSelfCall)
-                {
+                    break;
+
+                case FStmtIR::SelfCall:
                     S.FinalFunction(St.Call.Fn);
                     EmitArgs(S, St.Call.Args);
                     S.EndFunctionParms();
-                }
-                else
-                {
+                    break;
+
+                case FStmtIR::Assign:
+                    S.Let(St.Var.LetOp, St.Var.S, St.Var.Owner,
+                          [St](FScript& V) { EmitArgs(V, { St.Var }); },
+                          [St](FScript& V) { EmitArgs(V, { St.Value }); });
+                    break;
+
+                case FStmtIR::StaticCall:
                     S.CallMath(St.Call.Fn);     // a static library call stands alone
                     EmitArgs(S, St.Call.Args);
                     S.EndFunctionParms();
+                    break;
                 }
             }
             S.Return();

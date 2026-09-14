@@ -40,6 +40,14 @@ public:
                           const std::string& FunctionName);
 
     /*
+    The class declaring a property a function body reads or writes. Same import as EngineClass,
+    but it also records a load dependency - which EngineClass must not do, since it is equally
+    the route to the parent class and to an ObjectProperty's type, neither of which is a thing
+    the bytecode reaches.
+    */
+    FIndex PropertyOwner(const std::string& PackageName, const std::string& ClassName);
+
+    /*
     Declares a function on the class. `Super` should be the engine UFunction being overridden
     for an event like ReceiveTick, or null for a new method.
     */
