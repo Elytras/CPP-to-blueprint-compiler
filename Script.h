@@ -75,7 +75,17 @@ public:
 
     /* A reference to a property, as the on-disk FFieldPath: path names then owning export. */
     void FieldPath(const std::string& PropertyName, FIndex Owner);
+    void NullFieldPath();
     void LocalVariable(const std::string& PropertyName, FIndex Owner);
+
+    /*
+    Calls something on another object: `ObjectExpr` yields the target, `ContextExpr` is the
+    call made on it. The skip count the VM needs is measured for you — and it counts MEMORY
+    bytes, not the bytes written here, which is a difference an object reference makes every
+    time it appears.
+    */
+    void Context(const std::function<void(FScript&)>& ObjectExpr,
+                 const std::function<void(FScript&)>& ContextExpr);
 
     /* A struct literal: the members are written by `Members`, in the struct's own field order. */
     void StructConst(FIndex Struct, int32 SerializedSize, const std::function<void(FScript&)>& Members);

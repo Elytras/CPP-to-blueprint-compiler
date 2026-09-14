@@ -145,10 +145,38 @@ void FScript::FieldPath(const std::string& PropertyName, FIndex Owner)
     Memory += kMemObjectRef;
 }
 
+void FScript::NullFieldPath()
+{
+    Ar.I32(0);                          // an empty path
+    Ar.Idx(Null());
+    Memory += kMemObjectRef;
+}
+
 void FScript::LocalVariable(const std::string& PropertyName, FIndex Owner)
 {
     Op(EX_LocalVariable);
     FieldPath(PropertyName, Owner);
+}
+
+void FScript::Context(const std::function<void(FScript&)>& ObjectExpr,
+                      const std::function<void(FScript&)>& ContextExpr)
+{
+    Op(EX_Context);
+    ObjectExpr(*this);
+
+    /*
+    The skip count lets the VM jump the whole call when the target turns out to be null, and
+    it is expressed in loaded bytes. So the context expression is built separately, measured,
+    and only then spliced in behind its own length.
+    */
+    FScript Inner(Ar.Owner());
+    ContextExpr(Inner);
+
+    Ar.I32(Inner.MemorySize());
+    Memory += 4;
+    NullFieldPath();                    // RValuePointer: nothing is assigned from the call
+    Ar.Raw(Inner.Bytes().data(), Inner.Bytes().size());
+    Memory += Inner.MemorySize();
 }
 
 void FScript::StructConst(FIndex Struct, int32 SerializedSize,

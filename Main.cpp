@@ -207,8 +207,18 @@ The class this whole exercise is for:
 
     class Test : public AActor
     {
-        void ReceiveBeginPlay() { PrintString("Hello from a C++ generated Blueprint"); }
+        void ReceiveBeginPlay()
+        {
+            GetFSDGameState(this)->PostGameMessage("Hello from a C++ generated Blueprint");
+        }
     };
+
+Deliberately NOT UKismetSystemLibrary::PrintString: its body is wrapped in
+`#if !(UE_BUILD_SHIPPING || UE_BUILD_TEST)`, so against the retail game the call would run and
+do nothing at all. PostGameMessage is the game's own message path and survives shipping.
+
+The call shape is copied from ModMOTD's "Post Multiline Game Message", which is known to work:
+a pure library call yields the game state, and the message is sent on it through EX_Context.
 
 ReceiveBeginPlay rather than ReceiveTick only so the greeting arrives once instead of every
 frame; swapping the event name and adding a float DeltaSeconds param is the whole difference.
@@ -221,21 +231,22 @@ bool GenerateTest(const std::string& OutDir)
 
     FBlueprintClass BP(P, "Test_C", "/Script/Engine", "Actor", /*bParentIsBlueprint=*/false);
 
-    const FIndex PrintString = BP.EngineFunction("/Script/Engine", "KismetSystemLibrary", "PrintString");
-    const FIndex LinearColor = BP.ScriptStruct("/Script/CoreUObject", "LinearColor");
+    const FIndex GetGameState = BP.EngineFunction("/Script/FSD", "GameFunctionLibrary", "GetFSDGameState");
+    const FIndex PostGameMessage = BP.EngineFunction("/Script/FSD", "FSDGameState", "PostGameMessage");
     const FIndex BeginPlay = BP.EngineFunction("/Script/Engine", "Actor", "ReceiveBeginPlay");
 
     BP.AddFunction("ReceiveBeginPlay", BeginPlay, {}, [=](FScript& S) {
-        S.CallMath(PrintString);
-        S.Self();                                   // WorldContextObject
-        S.StringConst("Hello from a C++ generated Blueprint");
-        S.True();                                   // bPrintToScreen
-        S.True();                                   // bPrintToLog
-        S.StructConst(LinearColor, 16, [](FScript& C) {
-            C.FloatConst(0.0f); C.FloatConst(0.66f); C.FloatConst(1.0f); C.FloatConst(1.0f);
-        });
-        S.FloatConst(8.0f);                         // Duration
-        S.EndFunctionParms();
+        S.Context(
+            [=](FScript& Obj) {                     // GetFSDGameState(this)
+                Obj.CallMath(GetGameState);
+                Obj.Self();
+                Obj.EndFunctionParms();
+            },
+            [=](FScript& Call) {                    // .PostGameMessage("...")
+                Call.FinalFunction(PostGameMessage);
+                Call.StringConst("Hello from a C++ generated Blueprint");
+                Call.EndFunctionParms();
+            });
         S.Return();
         S.EndOfScript();
     });
