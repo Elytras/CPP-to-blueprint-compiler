@@ -73,11 +73,16 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClInclude Include="Blueprint.h" />
     <ClInclude Include="Package.h" />
+    <ClInclude Include="Script.h" />
+    <ClInclude Include="UeEnums.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="Blueprint.cpp" />
     <ClCompile Include="Main.cpp" />
     <ClCompile Include="Package.cpp" />
+    <ClCompile Include="Script.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />

@@ -254,14 +254,35 @@ bool FPackage::Save(const std::string& OutBaseNoExt, std::string* Err) const
     */
     FArc PreloadDeps(Self);
     std::vector<int32> FirstDep(Exports.size(), -1);
+    std::vector<std::vector<int32>> CreateBeforeCreate(Exports.size());
     for (size_t I = 0; I < Exports.size(); ++I)
     {
         const FExport& E = Exports[I];
+        CreateBeforeCreate[I] = E.CreateBeforeCreate;
+
+        /*
+        An export that declares nothing still has the obvious dependency: it cannot be created
+        before the objects its own row points at. Deriving that much keeps a hand-written
+        package loadable without making every caller spell out the whole table.
+        */
+        if (E.SerBeforeSer.empty() && E.CreateBeforeSer.empty()
+            && E.SerBeforeCreate.empty() && E.CreateBeforeCreate.empty())
+        {
+            for (FIndex Ref : { E.ClassIndex, E.SuperIndex, E.TemplateIndex, E.OuterIndex })
+            {
+                if (Ref.V == 0) continue;
+                std::vector<int32>& Into = CreateBeforeCreate[I];
+                if (std::find(Into.begin(), Into.end(), Ref.V) == Into.end()) Into.push_back(Ref.V);
+            }
+        }
+
         const size_t Count = E.SerBeforeSer.size() + E.CreateBeforeSer.size()
-                           + E.SerBeforeCreate.size() + E.CreateBeforeCreate.size();
+                           + E.SerBeforeCreate.size() + CreateBeforeCreate[I].size();
         FirstDep[I] = Count ? int32(PreloadDeps.B.size() / 4) : -1;
-        for (const std::vector<int32>* List : { &E.SerBeforeSer, &E.CreateBeforeSer,
-                                                &E.SerBeforeCreate, &E.CreateBeforeCreate })
+        const std::vector<int32>* const Phases[4] = {
+            &E.SerBeforeSer, &E.CreateBeforeSer, &E.SerBeforeCreate, &CreateBeforeCreate[I]
+        };
+        for (const std::vector<int32>* List : Phases)
             for (int32 V : *List) PreloadDeps.I32(V);
     }
     const int32 PreloadCount = int32(PreloadDeps.B.size() / 4);
@@ -362,7 +383,7 @@ bool FPackage::Save(const std::string& OutBaseNoExt, std::string* Err) const
         ExportTable.I32(int32(E.SerBeforeSer.size()));
         ExportTable.I32(int32(E.CreateBeforeSer.size()));
         ExportTable.I32(int32(E.SerBeforeCreate.size()));
-        ExportTable.I32(int32(E.CreateBeforeCreate.size()));
+        ExportTable.I32(int32(CreateBeforeCreate[I].size()));
     }
     if (ExportTable.B.size() != size_t(kExportEntrySize) * Exports.size())
         return Fail("export entry size drifted from 104 bytes");

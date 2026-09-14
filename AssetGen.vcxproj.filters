@@ -11,15 +11,30 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="Blueprint.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="Package.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Script.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="UeEnums.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="Blueprint.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="Main.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="Package.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Script.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>

@@ -20,6 +20,7 @@ removes LocalizationId and PersistentGuid from the summary.
 #include <vector>
 
 #include "SharedLib/core/Types.h"
+#include "UeEnums.h"
 
 namespace Uasset
 {
@@ -112,17 +113,6 @@ struct FExport
     std::function<void(FArc&)> Serialize;
 
     std::vector<int32> SerBeforeSer, CreateBeforeSer, SerBeforeCreate, CreateBeforeCreate;
-};
-
-/* Object flags, as they appear in an export row (Obj.h EObjectFlags). */
-enum : uint32
-{
-    RF_Public = 0x00000001,
-    RF_Standalone = 0x00000002,
-    RF_Transactional = 0x00000008,
-    RF_ClassDefaultObject = 0x00000010,
-    RF_ArchetypeObject = 0x00000020,
-    RF_DefaultSubObject = 0x00080000,
 };
 
 class FPackage
