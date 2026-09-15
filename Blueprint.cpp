@@ -47,8 +47,16 @@ FIndex FBlueprintClass::EngineClass(const std::string& PackageName, const std::s
     auto It = ImportCache.find(Key);
     if (It != ImportCache.end()) return Imp(It->second);
 
+    /*
+    An import row names the class OF the object it imports, and a class living under /Game is a
+    BlueprintGeneratedClass rather than a UClass. Getting this wrong does not fail the write; it
+    fails the load, when the linker looks for an object of the class the row claims.
+    */
+    const bool bBlueprint = PackageName.compare(0, 6, "/Game/") == 0;
     const FIndex Outer = PackageImport(PackageName);
-    const int32 Row = P.AddImport({ "/Script/CoreUObject", "Class", Outer, ClassName_ });
+    const int32 Row = P.AddImport({ bBlueprint ? "/Script/Engine" : "/Script/CoreUObject",
+                                    bBlueprint ? "BlueprintGeneratedClass" : "Class",
+                                    Outer, ClassName_ });
     ImportCache.emplace(Key, Row);
     return Imp(Row);
 }
@@ -105,6 +113,11 @@ void FBlueprintClass::AddFunction(const std::string& Name, FIndex Super,
     Functions.push_back(FPending{ Def, Body });
 }
 
+void FBlueprintClass::AddVariable(const FPropertyDef& Var)
+{
+    Vars.push_back(Var);
+}
+
 void FBlueprintClass::Finish()
 {
     const std::string CDOName = "Default__" + ClassName;
@@ -134,21 +147,10 @@ void FBlueprintClass::Finish()
     Blueprint parent both live in that Blueprint's own cooked package; for an engine class
     they are ordinary /Script imports.
     */
-    FIndex ParentIdx, ParentCdo;
-    if (bParentIsBlueprint)
-    {
-        const FIndex ParentPkgIdx = PackageImport(ParentPackage);
-        ParentIdx = Imp(P.AddImport({ "/Script/Engine", "BlueprintGeneratedClass",
-                                      ParentPkgIdx, ParentClass }));
-        ParentCdo = Imp(P.AddImport({ ParentPackage, ParentClass, ParentPkgIdx,
-                                      "Default__" + ParentClass }));
-    }
-    else
-    {
-        ParentIdx = EngineClass(ParentPackage, ParentClass);
-        ParentCdo = Imp(P.AddImport({ ParentPackage, ParentClass,
-                                      PackageImport(ParentPackage), "Default__" + ParentClass }));
-    }
+    const FIndex ParentIdx = EngineClass(ParentPackage, ParentClass);
+    const FIndex ParentCdo = Imp(P.AddImport({ ParentPackage, ParentClass,
+                                               PackageImport(ParentPackage),
+                                               "Default__" + ParentClass }));
 
     // Row numbers are fixed here so the exports can refer to each other before they exist.
     const int32 RowClass = 0;
@@ -186,6 +188,11 @@ void FBlueprintClass::Finish()
     Class.CreateBeforeCreate = { ParentIdx.V };
     for (int32 I = 0; I < NumFunctions; ++I)        // Children and FuncMap name these
         Class.CreateBeforeSer.push_back(Exp(RowFirstFunction + I).V);
+    /* A variable's own type is serialized with it, so whatever it points at has to exist first. */
+    for (const FPropertyDef& V : Vars)
+        if (V.Extra.V != 0)
+            Class.CreateBeforeSer.push_back(V.Extra.V);
+    const std::vector<FPropertyDef> ClassVars = Vars;
     Class.Serialize = [=](FArc& Ar) {
         Tag(Ar, "SimpleConstructionScript", "ObjectProperty",
             [=](FArc& V) { V.Idx(Exp(RowScs)); });
@@ -195,7 +202,8 @@ void FBlueprintClass::Finish()
         Ar.Idx(ParentIdx);                          // SuperStruct
         Ar.I32(NumFunctions);                       // Children, as an array of UField*
         for (int32 I = 0; I < NumFunctions; ++I) Ar.Idx(Exp(RowFirstFunction + I));
-        Ar.I32(0);                                  // ChildProperties: no class variables yet
+        Ar.I32(int32(ClassVars.size()));            // ChildProperties: the class variables
+        for (const FPropertyDef& V : ClassVars) WriteProperty(Ar, V);
         Ar.I32(0);                                  // script bytecode size
         Ar.I32(0);                                  // script storage size
 

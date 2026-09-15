@@ -59,6 +59,13 @@ public:
                      const std::vector<FPropertyDef>& Params,
                      const std::function<void(FScript&, FIndex)>& Body);
 
+    /*
+    Declares a class variable. It becomes one ChildProperties entry on the class, which is what
+    an EX_InstanceVariable FFieldPath owned by this class resolves against. No CDO default is
+    written, so the value the instance starts at is the type's zero.
+    */
+    void AddVariable(const FPropertyDef& Var);
+
     /* Writes the class, its CDO, its functions and a default scene root into the package. */
     void Finish();
 
@@ -89,8 +96,14 @@ private:
     */
     std::vector<int32> CallImports;
     std::vector<FPending> Functions;
+    std::vector<FPropertyDef> Vars;
 
-    int32 ClassRow = -1;
+    /*
+    The class is always export row 0 - Finish() lays the rows out that way, and it is fixed here
+    rather than there because ClassIndex() is asked for while a body is being lowered, which is
+    long before Finish() runs.
+    */
+    int32 ClassRow = 0;
 };
 
 }   // namespace Uasset
