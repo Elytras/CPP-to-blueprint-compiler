@@ -42,6 +42,7 @@ struct FPropertyDef
 /* Convenience builders for the property kinds the generator can currently emit. */
 FPropertyDef FloatParam(const std::string& Name, uint64 ExtraFlags = 0);
 FPropertyDef IntParam(const std::string& Name, uint64 ExtraFlags = 0);
+FPropertyDef Int64Param(const std::string& Name, uint64 ExtraFlags = 0);
 FPropertyDef BoolParam(const std::string& Name, uint64 ExtraFlags = 0);
 FPropertyDef ObjectParam(const std::string& Name, FIndex Class, uint64 ExtraFlags = 0);
 

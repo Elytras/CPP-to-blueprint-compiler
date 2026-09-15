@@ -39,6 +39,12 @@ FPropertyDef IntParam(const std::string& Name, uint64 ExtraFlags)
                          CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, Null() };
 }
 
+FPropertyDef Int64Param(const std::string& Name, uint64 ExtraFlags)
+{
+    return FPropertyDef{ "Int64Property", Name, RF_Public, 1, 8,
+                         CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, Null() };
+}
+
 FPropertyDef BoolParam(const std::string& Name, uint64 ExtraFlags)
 {
     return FPropertyDef{ "BoolProperty", Name, RF_Public, 1, 1,
