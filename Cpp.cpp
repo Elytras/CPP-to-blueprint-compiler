@@ -195,14 +195,15 @@ struct FStmtIR
         TargetCall,     // a call on the object another call produced
         SelfCall,       // a call on `this`
         Assign,         // `this->Field = value`
+        Decl,           // `int64 x [= value];` - a function-local scratch variable
         Return,         // `return <value>;` - Value carries what to return (or Self kind = void)
     } K = StaticCall;
 
     FCallIR Target;
     FCallIR Call;
-    FArgIR Var;                 // Assign: the destination
-    FArgIR Value;                // Assign / Return: what is written or returned
-    bool bHasValue = false;      // Return: false = void return (EX_Nothing operand)
+    FArgIR Var;                 // Assign / Decl: the destination (Decl: a Local, Var.S = its name)
+    FArgIR Value;                // Assign / Decl / Return: what is written or returned
+    bool bHasValue = false;      // Return / Decl: false = no value (void return / uninitialised local)
 };
 
 /*
@@ -355,7 +356,8 @@ public:
 private:
     bool Collect(std::string* Err);
     bool Generate(const FRecord& R, const std::string& OutDir, std::string* Err);
-    bool LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FStmtIR>& Out, std::string* Err);
+    bool LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FStmtIR>& Out,
+                   std::vector<FPropertyDef>& Locals, std::string* Err);
     bool LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR& Out, std::string* Err);
     bool LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     bool LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
@@ -581,13 +583,13 @@ bool FCompiler::LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, 
     if (K == "DeclRefExpr")
     {
         /*
-        A bare name in an expression - typically a reference to a function parameter or a local
-        variable. Only parameters are supported so far, and they lower to EX_LocalVariable
-        against the enclosing function's own FField chain.
+        A bare name in an expression - a reference to a function parameter or a function-local
+        variable. Both live on the enclosing function's own FField chain, so both lower to the
+        same EX_LocalVariable; a ParmVarDecl is a parameter, a plain VarDecl a `DeclStmt` local.
         */
         const Json& Ref = (*N)["referencedDecl"];
         const std::string RefKind = Ref.value("kind", std::string());
-        if (RefKind != "ParmVarDecl")
+        if (RefKind != "ParmVarDecl" && RefKind != "VarDecl")
         {
             *Err = "TODO: DeclRefExpr to " + RefKind;
             return false;
@@ -700,7 +702,31 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
     return bOk;
 }
 
-bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FStmtIR>& Out, std::string* Err)
+/*
+The FField class + on-disk size for a function-local scalar. A local's stored type is the same
+as a parameter's; what differs is that it carries none of the CPF_Parm machinery, so the engine
+lays it in the frame after the call arguments rather than reading it off the caller's stack.
+Only the integer locals the reader walk declares are supported - an object or float local would
+add a type with no reader that needs it yet.
+*/
+bool LocalProperty(const std::string& QualType, const std::string& VarName,
+                   FPropertyDef* Out, std::string* Err)
+{
+    if (QualType == "int64" || QualType == "const int64" || QualType == "long long")
+        *Out = FPropertyDef{ "Int64Property", VarName, RF_Public, 1, 8, 0, Null() };
+    else if (QualType == "int" || QualType == "int32" || QualType == "const int"
+          || QualType == "const int32")
+        *Out = FPropertyDef{ "IntProperty", VarName, RF_Public, 1, 4, 0, Null() };
+    else
+    {
+        *Err = "TODO: a function-local of type " + QualType + " is not supported yet";
+        return false;
+    }
+    return true;
+}
+
+bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FStmtIR>& Out,
+                          std::vector<FPropertyDef>& Locals, std::string* Err)
 {
     bool bOk = true;
     ForEach(Body, [&](const Json& Raw) {
@@ -710,6 +736,39 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
 
         FStmtIR St;
         const std::string K = Kind(*S);
+        if (K == "DeclStmt")
+        {
+            /*
+            One or more function-local declarations. Each VarDecl becomes a scratch property on
+            the function plus, if it has an initialiser, an EX_Let that writes it - the frame
+            zero-initialises a local, so a bare `int64 x;` needs no statement of its own. clang
+            groups several comma-declared vars under one DeclStmt, so every inner VarDecl is
+            walked rather than just the first.
+            */
+            bool bAny = false;
+            ForEach(*S, [&](const Json& D) {
+                if (!bOk || Kind(D) != "VarDecl") return;
+                bAny = true;
+                const std::string VarName = Name(D);
+                FPropertyDef PD;
+                if (!LocalProperty(TypeOf(D), VarName, &PD, Err)) { bOk = false; return; }
+                Locals.push_back(PD);
+
+                FStmtIR Ds;
+                Ds.K = FStmtIR::Decl;
+                Ds.Var.K = FArgIR::Local;
+                Ds.Var.S = VarName;
+                Ds.Var.LetOp = LetOpFor(TypeOf(D));
+                if (const Json* Init = Strip(First(D)))
+                {
+                    Ds.bHasValue = true;
+                    if (!LowerArg(*Init, BP, Ds.Value, Err)) { bOk = false; return; }
+                }
+                Out.push_back(Ds);
+            });
+            if (!bAny && bOk) { *Err = "a declaration statement declares nothing usable"; bOk = false; }
+            return;
+        }
         if (K == "CXXMemberCallExpr")
         {
             /* The object being called on has to be produced by a call of its own. */
@@ -940,11 +999,19 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         }
 
         std::vector<FStmtIR> Stmts;
-        if (!LowerBody(*Body, BP, Stmts, Err))
+        std::vector<FPropertyDef> Locals;
+        if (!LowerBody(*Body, BP, Stmts, Locals, Err))
         {
             *Err = R.CppName + "::" + Entry.first + ": " + *Err;
             return false;
         }
+        /*
+        A function's scratch variables live in the same ChildProperties list as its parameters,
+        after the ReturnValue - the engine tells the two apart by CPF_Parm, which a local lacks.
+        Appending them here keeps the parm chain (which UE walks by name for the call frame)
+        exactly as it was, so a reader with no locals emits byte-for-byte what it did before.
+        */
+        for (const FPropertyDef& L : Locals) Params.push_back(L);
 
         const bool bEndsWithReturn = !Stmts.empty() && Stmts.back().K == FStmtIR::Return;
 
@@ -984,6 +1051,18 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
 
                 case FStmtIR::StaticCall:
                     EmitCall(S, St.Call, SelfExp, nullptr);   // a static library call stands alone
+                    break;
+
+                case FStmtIR::Decl:
+                    /*
+                    A local declaration with an initialiser is one EX_Let into the local; without
+                    one it emits nothing, since the frame already zeroed the slot. The local is a
+                    LocalVariable owned by the function (SelfExp), same as a parameter reference.
+                    */
+                    if (St.bHasValue)
+                        S.Let(St.Var.LetOp, St.Var.S, SelfExp,
+                              [St, SelfExp](FScript& V) { EmitArg(V, St.Var, SelfExp, nullptr); },
+                              [St, SelfExp](FScript& V) { EmitArg(V, St.Value, SelfExp, nullptr); });
                     break;
 
                 case FStmtIR::Return:
