@@ -73,7 +73,8 @@ public:
     void Int64Const(int64 Value);
     void ByteConst(uint8 Value);
     void FloatConst(float Value);
-    void StringConst(const std::string& Value);     // ANSI; UnicodeStringConst when it must be
+    void StringConst(const std::string& Value);     // ANSI, one byte per char
+    void UnicodeStringConst(const std::u16string& Value);   // UCS-2, two bytes per char
     void True();
     void False();
 

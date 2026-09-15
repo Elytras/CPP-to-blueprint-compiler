@@ -134,6 +134,7 @@ struct FArgIR
     int32 I = 0;
     float F = 0.0f;
     bool B = false;
+    bool bWide = false;     // Str: true = UCS-2 literal, emit EX_UnicodeStringConst
     std::string S;          // Str: the literal. Field: the property name.
     FIndex Owner;           // Field: the class that declares it
     EExprToken LetOp = EX_Let;      // Field: the opcode that writes this type
@@ -185,7 +186,26 @@ bool EmitArg(FScript& S, const FArgIR& A, std::string* Err)
     case FArgIR::Int:   S.IntConst(A.I); return true;
     case FArgIR::Float: S.FloatConst(A.F); return true;
     case FArgIR::Bool:  A.B ? S.True() : S.False(); return true;
-    case FArgIR::Str:   S.StringConst(A.S); return true;
+    case FArgIR::Str:
+        if (A.bWide)
+        {
+            /*
+            Widen the narrow byte stream we captured from the AST: clang reports a wide-string
+            literal as its source spelling, so a mod that writes L"hi" arrives here as "hi" +
+            bWide=true. Anything above 0x7F is a non-ASCII code point that a proper UTF-8 or
+            UTF-16 decode would need to handle - the mod sources this needs today are ASCII
+            names/messages, so a byte-by-byte widen is enough.
+            */
+            std::u16string W;
+            W.reserve(A.S.size());
+            for (unsigned char C : A.S) W.push_back(char16_t(C));
+            S.UnicodeStringConst(W);
+        }
+        else
+        {
+            S.StringConst(A.S);
+        }
+        return true;
     case FArgIR::Field: S.InstanceVariable(A.S, A.Owner); return true;
     case FArgIR::Call:
         if (A.Sub && !A.Sub->Intrinsic.empty())
@@ -366,7 +386,25 @@ bool FCompiler::LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, 
     const std::string K = Kind(*N);
     if (K == "MemberExpr") return LowerField(*N, BP, Out, Err);
     if (K == "CXXThisExpr") { Out.K = FArgIR::Self; return true; }
-    if (K == "StringLiteral") { Out.K = FArgIR::Str; Out.S = Unquote(N->value("value", std::string())); return true; }
+    if (K == "StringLiteral")
+    {
+        /*
+        Wide-string literals arrive as clang's source spelling ("L\"hi\"" for L"hi"), so the
+        detection is on the literal's type - const wchar_t [N] or const char16_t [N] - rather
+        than on the value bytes. Unquote already strips the leading and trailing quote; the L
+        (or u / U) prefix has to go before that.
+        */
+        Out.K = FArgIR::Str;
+        const std::string Ty = TypeOf(*N);
+        Out.bWide = Ty.find("wchar_t") != std::string::npos
+                 || Ty.find("char16_t") != std::string::npos
+                 || Ty.find("char32_t") != std::string::npos;
+        std::string V = N->value("value", std::string());
+        if (!V.empty() && (V.front() == 'L' || V.front() == 'u' || V.front() == 'U'))
+            V.erase(V.begin());     // drop the encoding prefix so Unquote sees a bare "..." literal
+        Out.S = Unquote(V);
+        return true;
+    }
     if (K == "IntegerLiteral") { Out.K = FArgIR::Int; Out.I = int32(std::stoll(N->value("value", std::string("0")))); return true; }
     if (K == "FloatingLiteral") { Out.K = FArgIR::Float; Out.F = std::stof(N->value("value", std::string("0"))); return true; }
     if (K == "CXXBoolLiteralExpr") { Out.K = FArgIR::Bool; Out.B = N->value("value", false); return true; }

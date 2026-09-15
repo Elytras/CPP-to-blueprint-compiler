@@ -188,6 +188,20 @@ void FScript::StringConst(const std::string& Value)
     Memory += int32(Value.size()) + 1;
 }
 
+void FScript::UnicodeStringConst(const std::u16string& Value)
+{
+    /*
+    UE stores an FString as widechar - a mod source that spells its literal L"..." should reach
+    the VM as UCS-2 so the loaded FString does not have to be reconstructed from a narrow copy.
+    Two bytes per code unit, one two-byte null terminator: what the disassembler's
+    ReadUnicodeString mirrors on the way out.
+    */
+    Op(EX_UnicodeStringConst);
+    Ar.Raw(Value.data(), Value.size() * 2);
+    Ar.U16(0);
+    Memory += int32(Value.size() * 2) + 2;
+}
+
 void FScript::True() { Op(EX_True); }
 void FScript::False() { Op(EX_False); }
 
