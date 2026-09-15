@@ -164,6 +164,14 @@ void FScript::InstanceVariable(const std::string& PropertyName, FIndex Owner)
     FieldPath(PropertyName, Owner);
 }
 
+void FScript::StructMember(const std::string& MemberName, FIndex MemberOwner,
+                           const std::function<void(FScript&)>& StructExpr)
+{
+    Op(EX_StructMemberContext);
+    FieldPath(MemberName, MemberOwner);     // the member: a pointer in memory, an FFieldPath on disk
+    StructExpr(*this);                       // the expression yielding the struct's address
+}
+
 void FScript::Let(EExprToken LetOp, const std::string& PropertyName, FIndex Owner,
                   const std::function<void(FScript&)>& Var,
                   const std::function<void(FScript&)>& Value)

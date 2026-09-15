@@ -80,6 +80,17 @@ public:
     void InstanceVariable(const std::string& PropertyName, FIndex Owner);
 
     /*
+    Addresses `Struct.Member`: the member's FFieldPath, then the expression that yields the
+    struct's address. It reads or writes at (that address + Member.Offset_Internal), typed as
+    Member. The VM's only guard is that the inner expression produced a non-null property, so a
+    Member whose offset/type does not match what actually lives at that address reinterprets the
+    bytes there. That is the point: it reaches an offset without naming the property that owns it,
+    which is what a private/cross-package field read needs to avoid the load-time mismatch.
+    */
+    void StructMember(const std::string& MemberName, FIndex MemberOwner,
+                      const std::function<void(FScript&)>& StructExpr);
+
+    /*
     An assignment, `Var = Value`.
 
     Which opcode to use is a property of the destination's type, not a choice: EX_Let names the
