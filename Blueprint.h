@@ -48,6 +48,21 @@ public:
     FIndex PropertyOwner(const std::string& PackageName, const std::string& ClassName);
 
     /*
+    A class's default object, as the bytecode sees it. A call to a static function runs against
+    the CDO of the class declaring it, and EX_Context needs that object as a literal - so this
+    is an import the script names, and therefore a load dependency like any function it calls.
+    */
+    FIndex ClassDefaultObject(const std::string& PackageName, const std::string& ClassName);
+
+    /*
+    Whether this class gets the SimpleConstructionScript / SCS_Node / DefaultSceneRoot trio.
+    Every cooked actor Blueprint has it, and nothing that is not an actor may: an SCS fixes up
+    its root node through the owning class's CDO cast to AActor, which for (say) a function
+    library is not an actor at all.
+    */
+    void SetIsActor(bool bValue) { bIsActor = bValue; }
+
+    /*
     Declares a function on the class. `Super` should be the engine UFunction being overridden
     for an event like ReceiveTick, or null for a new method.
 
@@ -57,7 +72,8 @@ public:
     */
     void AddFunction(const std::string& Name, FIndex Super,
                      const std::vector<FPropertyDef>& Params,
-                     const std::function<void(FScript&, FIndex)>& Body);
+                     const std::function<void(FScript&, FIndex)>& Body,
+                     uint32 FunctionFlags = 0);      // 0 = the event-override default
 
     /*
     Declares a class variable. It becomes one ChildProperties entry on the class, which is what
@@ -82,6 +98,7 @@ private:
     std::string ClassName;
     std::string ParentPackage, ParentClass;
     bool bParentIsBlueprint = false;
+    bool bIsActor = true;
 
     std::unordered_map<std::string, int32> ImportCache;
 

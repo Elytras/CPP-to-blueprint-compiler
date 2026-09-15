@@ -122,6 +122,9 @@ bool FindLiteral(const Json& N, std::string& Out)
     return bFound;
 }
 
+/* Whether a declaration is `static`. clang spells the storage class on the declaration itself. */
+bool IsStaticDecl(const Json& Decl) { return Decl.value("storageClass", std::string()) == "static"; }
+
 struct FRecord
 {
     std::string CppName;
@@ -157,6 +160,7 @@ struct FCallIR
     std::string Intrinsic;              // non-empty when this is an __NAME__ compiler intrinsic
     FIndex Extra;                       // Intrinsic: an auxiliary import (e.g. the donor script struct)
     bool bScript = false;               // the callee is Blueprint bytecode, not a native function
+    FIndex Context;                     // the CDO a static call runs against; null = call on self
     std::vector<FArgIR> Args;
 };
 
@@ -174,6 +178,9 @@ void EmitCallOp(FScript& S, const FCallIR& Call)
     if (Call.bScript) S.FinalFunction(Call.Fn);
     else S.CallMath(Call.Fn);
 }
+
+/* A whole call: the context it runs against, the opcode, its arguments, and the terminator. */
+bool EmitCall(FScript& S, const FCallIR& Call, FIndex SelfExp, std::string* Err);
 
 /*
 One statement. The shapes a generated event actually needs: reach a subsystem and tell it
@@ -275,10 +282,7 @@ bool EmitArg(FScript& S, const FArgIR& A, FIndex SelfExp, std::string* Err)
         value where the enclosing expression reads its operand from, so nesting one needs no
         temporary - the call expression simply stands where a literal would.
         */
-        EmitCallOp(S, *A.Sub);
-        if (!EmitArgs(S, A.Sub->Args, SelfExp, Err)) return false;
-        S.EndFunctionParms();
-        return true;
+        return EmitCall(S, *A.Sub, SelfExp, Err);
     }
     if (Err) *Err = "internal: unknown argument kind";
     return false;
@@ -288,6 +292,36 @@ bool EmitArgs(FScript& S, const std::vector<FArgIR>& Args, FIndex SelfExp, std::
 {
     for (const FArgIR& A : Args)
         if (!EmitArg(S, A, SelfExp, Err)) return false;
+    return true;
+}
+
+bool EmitCall(FScript& S, const FCallIR& Call, FIndex SelfExp, std::string* Err)
+{
+    /*
+    A static function runs against the CDO of the class that declares it, not against whatever
+    object happens to be running the caller - so the call is wrapped in an EX_Context naming
+    that CDO. EX_CallMath is the exception: it looks the CDO up itself from the function's own
+    outer, which is exactly why a native static library call needs no context at all.
+    */
+    if (Call.Context.V != 0)
+    {
+        bool bOk = true;
+        std::string SubErr;
+        S.Context(
+            [&](FScript& O) { O.ObjectConst(Call.Context); },
+            [&](FScript& C)
+            {
+                EmitCallOp(C, Call);
+                bOk = EmitArgs(C, Call.Args, SelfExp, &SubErr);
+                C.EndFunctionParms();
+            });
+        if (!bOk && Err) *Err = SubErr;
+        return bOk;
+    }
+
+    EmitCallOp(S, Call);
+    if (!EmitArgs(S, Call.Args, SelfExp, Err)) return false;
+    S.EndFunctionParms();
     return true;
 }
 
@@ -584,6 +618,14 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         }
         Out.Fn = BP.EngineFunction(R->UePackage, R->UeName, MethodName);
         Out.bScript = R->UePackage.compare(0, 6, "/Game/") == 0;   // a Blueprint, not a /Script class
+        /*
+        EX_CallMath resolves the CDO itself, so a native static needs no context; every other
+        static does, and a Blueprint's function is never reached through EX_CallMath.
+        */
+        auto Decl = R->Methods.find(MethodName);
+        const bool bStatic = Decl != R->Methods.end() && IsStaticDecl(*Decl->second);
+        if (Out.bScript && bStatic)
+            Out.Context = BP.ClassDefaultObject(R->UePackage, R->UeName);
     }
 
     /* inner[0] is the callee; everything after it is an argument. */
@@ -697,6 +739,16 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                        bParentIsBlueprint ? ModPackage + "/" + B->CppName : B->UePackage,
                        bParentIsBlueprint ? B->CppName + "_C" : B->UeName,
                        bParentIsBlueprint);
+
+    /*
+    Only an actor gets the SimpleConstructionScript trio. The ancestry is walked in the mod's own
+    declarations rather than asked of the engine: the UeApi headers a mod includes declare each
+    native class with its base, so the chain from a mod class up to Actor is all in Records.
+    */
+    bool bIsActor = false;
+    for (const FRecord* A = &R; A && !A->Base.empty(); A = Find(A->Base))
+        if (A->UeName == "Actor") { bIsActor = true; break; }
+    BP.SetIsActor(bIsActor);
 
     /*
     Turn a mod-source qualType into an FPropertyDef. `Where` names the location for the
@@ -833,6 +885,15 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
 
         const bool bEndsWithReturn = !Stmts.empty() && Stmts.back().K == FStmtIR::Return;
 
+        /*
+        A static method is not an event: the engine never dispatches it, script calls it by name.
+        Leaving it FUNC_Event would have the loader treat a library function as an overridable
+        entry point on a class that has no such entry point.
+        */
+        const uint32 Flags = IsStaticDecl(M)
+            ? uint32(FUNC_Static | FUNC_BlueprintCallable | FUNC_Public | FUNC_Final)
+            : 0u;
+
         BP.AddFunction(Entry.first, FindEvent(BP, R.CppName, Entry.first), Params,
                        [Stmts, bEndsWithReturn](FScript& S, FIndex SelfExp) {
             for (const FStmtIR& St : Stmts)
@@ -841,7 +902,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 {
                 case FStmtIR::TargetCall:
                     S.Context(
-                        [St, SelfExp](FScript& O) { EmitCallOp(O, St.Target); EmitArgs(O, St.Target.Args, SelfExp, nullptr); O.EndFunctionParms(); },
+                        [St, SelfExp](FScript& O) { EmitCall(O, St.Target, SelfExp, nullptr); },
                         [St, SelfExp](FScript& C) { C.FinalFunction(St.Call.Fn); EmitArgs(C, St.Call.Args, SelfExp, nullptr); C.EndFunctionParms(); });
                     break;
 
@@ -851,6 +912,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                     S.EndFunctionParms();
                     break;
 
+
                 case FStmtIR::Assign:
                     S.Let(St.Var.LetOp, St.Var.S, St.Var.Owner,
                           [St, SelfExp](FScript& V) { EmitArgs(V, { St.Var }, SelfExp, nullptr); },
@@ -858,9 +920,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                     break;
 
                 case FStmtIR::StaticCall:
-                    EmitCallOp(S, St.Call);     // a static library call stands alone
-                    EmitArgs(S, St.Call.Args, SelfExp, nullptr);
-                    S.EndFunctionParms();
+                    EmitCall(S, St.Call, SelfExp, nullptr);   // a static library call stands alone
                     break;
 
                 case FStmtIR::Return:
@@ -884,7 +944,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             */
             if (!bEndsWithReturn) S.Return();
             S.EndOfScript();
-        });
+        }, Flags);
     }
 
     BP.Finish();

@@ -80,6 +80,7 @@ public:
     void True();
     void False();
     void NoObject();                                // a null object reference, `nullptr`
+    void ObjectConst(FIndex Object);                // a literal reference to a loaded object
 
     /*
     A branch. Targets are MEMORY offsets into this same script - the VM does not know how big

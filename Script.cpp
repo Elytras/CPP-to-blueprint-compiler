@@ -228,6 +228,13 @@ void FScript::True() { Op(EX_True); }
 void FScript::False() { Op(EX_False); }
 void FScript::NoObject() { Op(EX_NoObject); }
 
+void FScript::ObjectConst(FIndex Object)
+{
+    Op(EX_ObjectConst);
+    Ar.Idx(Object);
+    Memory += kMemObjectRef;
+}
+
 void FScript::FieldPath(const std::string& PropertyName, FIndex Owner)
 {
     /*

@@ -69,6 +69,24 @@ FIndex FBlueprintClass::PropertyOwner(const std::string& PackageName, const std:
     return Idx;
 }
 
+FIndex FBlueprintClass::ClassDefaultObject(const std::string& PackageName,
+                                           const std::string& ClassName_)
+{
+    const std::string Key = "cdo:" + PackageName + "." + ClassName_;
+    auto It = ImportCache.find(Key);
+    if (It == ImportCache.end())
+    {
+        // A CDO's own class is the class it defaults, so the row names that rather than "Class".
+        const int32 Row = P.AddImport({ PackageName, ClassName_, PackageImport(PackageName),
+                                        "Default__" + ClassName_ });
+        It = ImportCache.emplace(Key, Row).first;
+    }
+    const FIndex Idx = Imp(It->second);
+    if (std::find(CallImports.begin(), CallImports.end(), Idx.V) == CallImports.end())
+        CallImports.push_back(Idx.V);
+    return Idx;
+}
+
 FIndex FBlueprintClass::ScriptStruct(const std::string& PackageName, const std::string& StructName)
 {
     const std::string Key = "str:" + PackageName + "." + StructName;
@@ -104,12 +122,14 @@ FIndex FBlueprintClass::EngineFunction(const std::string& PackageName,
 
 void FBlueprintClass::AddFunction(const std::string& Name, FIndex Super,
                                   const std::vector<FPropertyDef>& Params,
-                                  const std::function<void(FScript&, FIndex)>& Body)
+                                  const std::function<void(FScript&, FIndex)>& Body,
+                                  uint32 FunctionFlags)
 {
     FFunctionDef Def;
     Def.Name = Name;
     Def.Super = Super;
     Def.Params = Params;
+    if (FunctionFlags != 0) Def.FunctionFlags = FunctionFlags;
     Functions.push_back(FPending{ Def, Body });
 }
 
@@ -125,22 +145,12 @@ void FBlueprintClass::Finish()
     const FIndex BpgcClass = EngineClass("/Script/Engine", "BlueprintGeneratedClass");
     const FIndex ObjectClass = EngineClass("/Script/CoreUObject", "Object");
     const FIndex FunctionClass = EngineClass("/Script/CoreUObject", "Function");
-    const FIndex SceneCompClass = EngineClass("/Script/Engine", "SceneComponent");
-    const FIndex ScsNodeClass = EngineClass("/Script/Engine", "SCS_Node");
-    const FIndex ScsClass = EngineClass("/Script/Engine", "SimpleConstructionScript");
-
     const FIndex EnginePkg = PackageImport("/Script/Engine");
     const FIndex CorePkg = PackageImport("/Script/CoreUObject");
     const FIndex BpgcCdo = Imp(P.AddImport({ "/Script/Engine", "BlueprintGeneratedClass",
                                              EnginePkg, "Default__BlueprintGeneratedClass" }));
     const FIndex FunctionCdo = Imp(P.AddImport({ "/Script/CoreUObject", "Function",
                                                  CorePkg, "Default__Function" }));
-    const FIndex SceneCompCdo = Imp(P.AddImport({ "/Script/Engine", "SceneComponent",
-                                                  EnginePkg, "Default__SceneComponent" }));
-    const FIndex ScsNodeCdo = Imp(P.AddImport({ "/Script/Engine", "SCS_Node",
-                                                EnginePkg, "Default__SCS_Node" }));
-    const FIndex ScsCdo = Imp(P.AddImport({ "/Script/Engine", "SimpleConstructionScript",
-                                            EnginePkg, "Default__SimpleConstructionScript" }));
 
     /*
     The parent, and the parent's default object which the CDO uses as its template. For a
@@ -159,6 +169,7 @@ void FBlueprintClass::Finish()
     const int32 RowRootTemplate = RowFirstFunction + int32(Functions.size());
     const int32 RowScsNode = RowRootTemplate + 1;
     const int32 RowScs = RowScsNode + 1;
+    const FIndex ScsIdx = bIsActor ? Exp(RowScs) : Null();      // null for a class with no SCS
     ClassRow = RowClass;
 
     /* The class. Its Children and FuncMap are what make its functions reachable. */
@@ -183,7 +194,8 @@ void FBlueprintClass::Finish()
     it the loader reaches a subclass that names its parent and finds the parent still waiting
     to be serialized, which aborts the async loading thread outright.
     */
-    Class.SerBeforeSer = { ParentIdx.V, ParentCdo.V, Exp(RowScs).V };
+    Class.SerBeforeSer = { ParentIdx.V, ParentCdo.V };
+    if (bIsActor) Class.SerBeforeSer.push_back(ScsIdx.V);
     Class.SerBeforeCreate = { BpgcClass.V, BpgcCdo.V };
     Class.CreateBeforeCreate = { ParentIdx.V };
     for (int32 I = 0; I < NumFunctions; ++I)        // Children and FuncMap name these
@@ -193,9 +205,11 @@ void FBlueprintClass::Finish()
         if (V.Extra.V != 0)
             Class.CreateBeforeSer.push_back(V.Extra.V);
     const std::vector<FPropertyDef> ClassVars = Vars;
+    const bool bActor = bIsActor;
     Class.Serialize = [=](FArc& Ar) {
-        Tag(Ar, "SimpleConstructionScript", "ObjectProperty",
-            [=](FArc& V) { V.Idx(Exp(RowScs)); });
+        if (bActor)
+            Tag(Ar, "SimpleConstructionScript", "ObjectProperty",
+                [=](FArc& V) { V.Idx(ScsIdx); });
         TagEnd(Ar);
         Ar.Bool(false);
 
@@ -231,7 +245,7 @@ void FBlueprintClass::Finish()
     Cdo.TemplateIndex = ParentCdo;
     Cdo.ObjectName = CDOName;
     Cdo.ObjectFlags = RF_Public | RF_ClassDefaultObject | RF_ArchetypeObject;
-    Cdo.SerBeforeSer = { Exp(RowScsNode).V, Exp(RowRootTemplate).V };
+    if (bIsActor) Cdo.SerBeforeSer = { Exp(RowScsNode).V, Exp(RowRootTemplate).V };
     Cdo.SerBeforeCreate = { Exp(RowClass).V, ParentCdo.V };
     if (bParentIsBlueprint)
         Cdo.CreateBeforeSer = { ParentIdx.V };      // the parent class object, for a BP parent
@@ -268,8 +282,19 @@ void FBlueprintClass::Finish()
     /*
     A default scene root. An actor can technically live without one, but every cooked actor
     Blueprint has this trio, so the generated class keeps the same shape rather than betting
-    on the loader tolerating a rootless actor.
+    on the loader tolerating a rootless actor. A class that is not an actor gets none of it -
+    USimpleConstructionScript reaches its owner's CDO as an AActor, which for anything else is
+    a reinterpret of an unrelated object.
     */
+    if (!bIsActor) return;
+
+    const FIndex SceneCompClass = EngineClass("/Script/Engine", "SceneComponent");
+    const FIndex ScsNodeClass = EngineClass("/Script/Engine", "SCS_Node");
+    const FIndex ScsClass = EngineClass("/Script/Engine", "SimpleConstructionScript");
+    const FIndex SceneCompCdo = ClassDefaultObject("/Script/Engine", "SceneComponent");
+    const FIndex ScsNodeCdo = ClassDefaultObject("/Script/Engine", "SCS_Node");
+    const FIndex ScsCdo = ClassDefaultObject("/Script/Engine", "SimpleConstructionScript");
+
     FExport RootTemplate;
     RootTemplate.ClassIndex = SceneCompClass;
     RootTemplate.TemplateIndex = SceneCompCdo;
