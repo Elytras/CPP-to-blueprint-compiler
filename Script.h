@@ -68,10 +68,27 @@ public:
     void EndFunctionParms();
 
     void IntConst(int32 Value);
+    void Int64Const(int64 Value);
+    void ByteConst(uint8 Value);
     void FloatConst(float Value);
     void StringConst(const std::string& Value);     // ANSI; UnicodeStringConst when it must be
     void True();
     void False();
+
+    /*
+    A branch. Targets are MEMORY offsets into this same script - the VM does not know how big
+    the on-disk form of a reference was. Because the target is usually a forward jump into
+    bytecode not yet written, the sequence is:
+
+        int32 Patch = Jump(0);              // or JumpIfNot(0, Cond)
+        ... emit the body the jump skips ...
+        PatchJumpTarget(Patch, MemorySize());   // now MemorySize is the target's memory address
+
+    Backward jumps skip the patch: pass MemorySize() at the loop head straight in.
+    */
+    int32 Jump(int32 MemTarget);
+    int32 JumpIfNot(int32 MemTarget, const std::function<void(FScript&)>& Cond);
+    void PatchJumpTarget(int32 StorageOffset, int32 MemTarget);
 
     /* A reference to a property, as the on-disk FFieldPath: path names then owning export. */
     void FieldPath(const std::string& PropertyName, FIndex Owner);

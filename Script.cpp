@@ -114,6 +114,49 @@ void FScript::IntConst(int32 Value)
     Memory += 4;
 }
 
+void FScript::Int64Const(int64 Value)
+{
+    Op(EX_Int64Const);
+    Ar.Raw(&Value, 8);
+    Memory += 8;
+}
+
+void FScript::ByteConst(uint8 Value)
+{
+    Op(EX_ByteConst);
+    Ar.U8(Value);
+    Memory += 1;
+}
+
+int32 FScript::Jump(int32 MemTarget)
+{
+    Op(EX_Jump);
+    const int32 PatchAt = int32(Ar.B.size());
+    Ar.U32(uint32(MemTarget));                      // memory offset into this script
+    Memory += 4;
+    return PatchAt;
+}
+
+int32 FScript::JumpIfNot(int32 MemTarget, const std::function<void(FScript&)>& Cond)
+{
+    Op(EX_JumpIfNot);
+    const int32 PatchAt = int32(Ar.B.size());
+    Ar.U32(uint32(MemTarget));
+    Memory += 4;
+    Cond(*this);                                    // the boolean expression to test
+    return PatchAt;
+}
+
+void FScript::PatchJumpTarget(int32 StorageOffset, int32 MemTarget)
+{
+    const uint32 V = uint32(MemTarget);
+    /* Direct byte poke into the already-written stream; endianness matches Ar.U32. */
+    Ar.B[StorageOffset + 0] = uint8(V);
+    Ar.B[StorageOffset + 1] = uint8(V >> 8);
+    Ar.B[StorageOffset + 2] = uint8(V >> 16);
+    Ar.B[StorageOffset + 3] = uint8(V >> 24);
+}
+
 void FScript::FloatConst(float Value)
 {
     Op(EX_FloatConst);
