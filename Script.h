@@ -79,6 +79,7 @@ public:
     void UnicodeStringConst(const std::u16string& Value);   // UCS-2, two bytes per char
     void True();
     void False();
+    void NoObject();                                // a null object reference, `nullptr`
 
     /*
     A branch. Targets are MEMORY offsets into this same script - the VM does not know how big

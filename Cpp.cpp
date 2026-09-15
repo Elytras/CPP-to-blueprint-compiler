@@ -70,7 +70,8 @@ const Json* Strip(const Json* N)
         if (K != "ImplicitCastExpr" && K != "CStyleCastExpr" && K != "ParenExpr"
             && K != "ConstantExpr" && K != "ExprWithCleanups"
             && K != "CXXBindTemporaryExpr" && K != "MaterializeTemporaryExpr"
-            && K != "CXXConstructExpr" && K != "CXXFunctionalCastExpr")
+            && K != "CXXConstructExpr" && K != "CXXFunctionalCastExpr"
+            && K != "CXXDefaultArgExpr")
             return N;
         const Json* Inner = First(*N);
         if (!Inner) return N;
@@ -128,6 +129,7 @@ struct FRecord
     std::string UeName;
     std::string Base;
     std::map<std::string, const Json*> Methods;     // method name -> CXXMethodDecl
+    std::vector<const Json*> Fields;                // FieldDecl, in declaration order
 
     bool IsNative() const { return !UePackage.empty(); }
 };
@@ -138,7 +140,7 @@ struct FCallIR;
 
 struct FArgIR
 {
-    enum EKind { Self, Int, Float, Bool, Str, Field, Local, Call } K = Self;
+    enum EKind { Self, Int, Float, Bool, Str, Field, Local, Call, NullObj } K = Self;
     int32 I = 0;
     float F = 0.0f;
     bool B = false;
@@ -154,8 +156,24 @@ struct FCallIR
     FIndex Fn;                          // Fn is set for a resolved UFunction; empty for intrinsics
     std::string Intrinsic;              // non-empty when this is an __NAME__ compiler intrinsic
     FIndex Extra;                       // Intrinsic: an auxiliary import (e.g. the donor script struct)
+    bool bScript = false;               // the callee is Blueprint bytecode, not a native function
     std::vector<FArgIR> Args;
 };
+
+/*
+Writes the call itself - the opcode, not its arguments.
+
+Which opcode is not a preference. EX_CallMath dereferences UFunction::Func and calls it with
+the CALLER's frame, which is only correct for a native function; for one implemented in
+bytecode Func is UObject::ProcessInternal, which would then run the callee against a frame
+that describes the caller. EX_FinalFunction routes through UFunction::Invoke, which builds the
+callee its own frame, so that is what a call into another generated class has to use.
+*/
+void EmitCallOp(FScript& S, const FCallIR& Call)
+{
+    if (Call.bScript) S.FinalFunction(Call.Fn);
+    else S.CallMath(Call.Fn);
+}
 
 /*
 One statement. The shapes a generated event actually needs: reach a subsystem and tell it
@@ -190,11 +208,14 @@ declared in Types.h / ReadProperty.cpp - they do not name a UFunction, so callin
 through a per-name lowering rather than through a normal EX_CallMath. Only the intrinsics with
 a switch arm below are actually emittable; the rest are rejected at Lower time.
 */
+bool EmitArgs(FScript& S, const std::vector<FArgIR>& Args, FIndex SelfExp, std::string* Err);
+
 bool EmitArg(FScript& S, const FArgIR& A, FIndex SelfExp, std::string* Err)
 {
     switch (A.K)
     {
-    case FArgIR::Self:  S.Self(); return true;
+    case FArgIR::Self:    S.Self(); return true;
+    case FArgIR::NullObj: S.NoObject(); return true;
     case FArgIR::Int:   S.IntConst(A.I); return true;
     case FArgIR::Float: S.FloatConst(A.F); return true;
     case FArgIR::Bool:  A.B ? S.True() : S.False(); return true;
@@ -244,15 +265,26 @@ bool EmitArg(FScript& S, const FArgIR& A, FIndex SelfExp, std::string* Err)
             if (!bInnerOk) { if (Err) *Err = SubErr; return false; }
             return true;
         }
-        if (Err) *Err = "TODO: unimplemented intrinsic " + A.Sub->Intrinsic;
-        return false;
+        if (!A.Sub->Intrinsic.empty())
+        {
+            if (Err) *Err = "TODO: unimplemented intrinsic " + A.Sub->Intrinsic;
+            return false;
+        }
+        /*
+        A call whose value flows into the surrounding expression. The VM leaves a call's return
+        value where the enclosing expression reads its operand from, so nesting one needs no
+        temporary - the call expression simply stands where a literal would.
+        */
+        EmitCallOp(S, *A.Sub);
+        if (!EmitArgs(S, A.Sub->Args, SelfExp, Err)) return false;
+        S.EndFunctionParms();
+        return true;
     }
     if (Err) *Err = "internal: unknown argument kind";
     return false;
 }
 
-bool EmitArgs(FScript& S, const std::vector<FArgIR>& Args, FIndex SelfExp,
-              std::string* Err = nullptr)
+bool EmitArgs(FScript& S, const std::vector<FArgIR>& Args, FIndex SelfExp, std::string* Err)
 {
     for (const FArgIR& A : Args)
         if (!EmitArg(S, A, SelfExp, Err)) return false;
@@ -307,6 +339,7 @@ private:
     std::map<std::string, FRecord> Records;
     std::map<std::string, std::string> MethodOwner;   // clang decl id -> owning record
     std::map<std::string, std::string> FieldOwner;    // clang decl id -> declaring record
+    const FRecord* Cur = nullptr;                     // the record Generate is working on
 
     /* One row per generated class, baked into AssetRegistry.bin once the run succeeds. */
     std::vector<FRegistryAsset> RegistryRows;
@@ -345,6 +378,7 @@ bool FCompiler::Collect(std::string* Err)
             }
             else if (Kind(C) == "FieldDecl" && C.contains("name"))
             {
+                R.Fields.push_back(&C);
                 FieldOwner[C.value("id", std::string())] = R.CppName;
             }
         });
@@ -400,15 +434,21 @@ bool FCompiler::LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& 
     if (It == FieldOwner.end()) { *Err = "access to an unknown property: " + Name(MemberNode); return false; }
     const FRecord* R = Find(It->second);
     if (!R) { *Err = "access to a property of an unknown class: " + Name(MemberNode); return false; }
-    if (!R->IsNative())
+    if (!R->IsNative() && R != Cur)
     {
-        *Err = "TODO: a generated class declares no properties of its own yet: " + Name(MemberNode);
+        /*
+        A variable declared on an ANCESTOR generated class. Its FFieldPath owner would be that
+        other mod class, which is a Blueprint import rather than an engine one - a different
+        import row than PropertyOwner writes, so it is refused rather than mis-spelled.
+        */
+        *Err = "TODO: a property declared on another generated class is not reachable yet: "
+             + Name(MemberNode);
         return false;
     }
 
     Out.K = FArgIR::Field;
     Out.S = Name(MemberNode);
-    Out.Owner = BP.PropertyOwner(R->UePackage, R->UeName);
+    Out.Owner = R->IsNative() ? BP.PropertyOwner(R->UePackage, R->UeName) : BP.ClassIndex();
     Out.LetOp = LetOpFor(TypeOf(MemberNode));
     return true;
 }
@@ -421,6 +461,7 @@ bool FCompiler::LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, 
     const std::string K = Kind(*N);
     if (K == "MemberExpr") return LowerField(*N, BP, Out, Err);
     if (K == "CXXThisExpr") { Out.K = FArgIR::Self; return true; }
+    if (K == "CXXNullPtrLiteralExpr") { Out.K = FArgIR::NullObj; return true; }
     if (K == "StringLiteral")
     {
         /*
@@ -474,13 +515,7 @@ bool FCompiler::LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, 
         */
         Out.K = FArgIR::Call;
         Out.Sub = std::make_shared<FCallIR>();
-        if (!LowerCall(*N, BP, *Out.Sub, Err)) return false;
-        if (Out.Sub->Intrinsic.empty())
-        {
-            *Err = "TODO: a normal function call in argument position is not supported yet";
-            return false;
-        }
-        return true;
+        return LowerCall(*N, BP, *Out.Sub, Err);
     }
 
     *Err = "TODO: unimplemented argument " + K;
@@ -548,6 +583,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
             return false;
         }
         Out.Fn = BP.EngineFunction(R->UePackage, R->UeName, MethodName);
+        Out.bScript = R->UePackage.compare(0, 6, "/Game/") == 0;   // a Blueprint, not a /Script class
     }
 
     /* inner[0] is the callee; everything after it is an argument. */
@@ -650,6 +686,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
 {
     const FRecord* B = Find(R.Base);
     if (!B) { *Err = R.CppName + " derives from an undeclared class: " + R.Base; return false; }
+    Cur = &R;
 
     const std::string PackageName = ModPackage + "/" + R.CppName;
     FPackage P(PackageName);
@@ -661,53 +698,92 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                        bParentIsBlueprint ? B->CppName + "_C" : B->UeName,
                        bParentIsBlueprint);
 
+    /*
+    Turn a mod-source qualType into an FPropertyDef. `Where` names the location for the
+    error message ("parameter X on Y", "return type on Y", "property X"); ExtraFlags is
+    CPF_ReturnParm | CPF_OutParm for a ReturnValue and zero for an ordinary param or variable.
+    */
+    auto TypeToProperty = [&](const std::string& Type, const std::string& PName,
+                              uint64 ExtraFlags, const std::string& Where,
+                              FPropertyDef* Out, std::string* PErr) -> bool
+    {
+        if (Type == "float") { *Out = FloatParam(PName, ExtraFlags); return true; }
+        if (Type == "int" || Type == "int32") { *Out = IntParam(PName, ExtraFlags); return true; }
+        if (Type == "int64" || Type == "long long") { *Out = Int64Param(PName, ExtraFlags); return true; }
+        if (Type == "bool") { *Out = BoolParam(PName, ExtraFlags); return true; }
+        if (Type == "const char *" || Type == "const char*"
+            || Type == "FString" || Type == "struct FString")
+        { *Out = StringParam(PName, ExtraFlags); return true; }
+        if (Type == "FName" || Type == "struct FName")
+        { *Out = NameParam(PName, ExtraFlags); return true; }
+
+        /* Object pointer, spelled `[const] class X *`. Resolve X against Records. */
+        std::string ClassName;
+        {
+            const size_t Star = Type.find('*');
+            const std::string Head = Star == std::string::npos ? Type : Type.substr(0, Star);
+            size_t I = 0;
+            while (I < Head.size() && Head[I] == ' ') ++I;
+            if (Head.compare(I, 6, "const ") == 0) I += 6;
+            if (Head.compare(I, 6, "class ") == 0) I += 6;
+            size_t J = Head.size();
+            while (J > I && (Head[J - 1] == ' ' || Head[J - 1] == '\t')) --J;
+            if (Star != std::string::npos && J > I) ClassName = Head.substr(I, J - I);
+        }
+        const FRecord* PR = ClassName.empty() ? nullptr : Find(ClassName);
+        if (!PR) { *PErr = "TODO: unimplemented " + Where + ": " + Type; return false; }
+        const FIndex ClassImp = PR->IsNative()
+            ? BP.EngineClass(PR->UePackage, PR->UeName)
+            : BP.EngineClass(ModPackage + "/" + PR->CppName, PR->CppName + "_C");
+        *Out = ObjectParam(PName, ClassImp, ExtraFlags);
+        return true;
+    };
+
+    /*
+    The class variables, in declaration order. A field with an initializer is accepted only when
+    that initializer is the type's zero: the CDO writes no defaults, so anything else would be
+    silently dropped rather than honoured.
+    */
+    for (const Json* F : R.Fields)
+    {
+        const std::string FieldName = Name(*F);
+        if (const Json* Init = Strip(First(*F)))
+        {
+            const std::string IK = Kind(*Init);
+            const std::string IV = Init->value("value", std::string());
+            const bool bZero = (IK == "IntegerLiteral" && IV == "0")
+                            || (IK == "FloatingLiteral" && (IV == "0" || IV == "0.0"))
+                            || (IK == "CXXBoolLiteralExpr" && !Init->value("value", false))
+                            || (IK == "StringLiteral" && Unquote(IV).empty());
+            if (!bZero)
+            {
+                *Err = "TODO: a class variable's initializer is not written to the CDO yet: "
+                     + FieldName;
+                return false;
+            }
+        }
+
+        FPropertyDef PD;
+        std::string PErr;
+        if (!TypeToProperty(TypeOf(*F), FieldName, 0, "property " + FieldName, &PD, &PErr))
+        { *Err = PErr; return false; }
+
+        /*
+        A parm's flags are the wrong ones for a variable: CPF_Parm makes the engine count it as
+        part of the call frame, and CPF_BlueprintReadOnly forbids the very assignment the field
+        exists for. What is left is a plain, script-writable class variable.
+        */
+        PD.PropertyFlags = (PD.PropertyFlags & ~uint64(CPF_Parm | CPF_BlueprintReadOnly))
+                         | CPF_Edit | CPF_BlueprintVisible | CPF_DisableEditOnInstance;
+        BP.AddVariable(PD);
+    }
+
     for (const auto& Entry : R.Methods)
     {
         const Json& M = *Entry.second;
         const Json* Body = nullptr;
         ForEach(M, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Body = &C; });
         if (!Body) continue;                    // a declaration without a definition defines nothing
-
-        /*
-        Turn a mod-source qualType into an FPropertyDef. `Where` names the location for the
-        error message ("parameter X on Y" or "return type on Y"); ExtraFlags is CPF_ReturnParm |
-        CPF_OutParm for a ReturnValue and zero for an ordinary param.
-        */
-        auto TypeToProperty = [&](const std::string& Type, const std::string& PName,
-                                  uint64 ExtraFlags, const std::string& Where,
-                                  FPropertyDef* Out, std::string* PErr) -> bool
-        {
-            if (Type == "float") { *Out = FloatParam(PName, ExtraFlags); return true; }
-            if (Type == "int" || Type == "int32") { *Out = IntParam(PName, ExtraFlags); return true; }
-            if (Type == "int64" || Type == "long long") { *Out = Int64Param(PName, ExtraFlags); return true; }
-            if (Type == "bool") { *Out = BoolParam(PName, ExtraFlags); return true; }
-            if (Type == "const char *" || Type == "const char*"
-                || Type == "FString" || Type == "struct FString")
-            { *Out = StringParam(PName, ExtraFlags); return true; }
-            if (Type == "FName" || Type == "struct FName")
-            { *Out = NameParam(PName, ExtraFlags); return true; }
-
-            /* Object pointer, spelled `[const] class X *`. Resolve X against Records. */
-            std::string ClassName;
-            {
-                const size_t Star = Type.find('*');
-                const std::string Head = Star == std::string::npos ? Type : Type.substr(0, Star);
-                size_t I = 0;
-                while (I < Head.size() && Head[I] == ' ') ++I;
-                if (Head.compare(I, 6, "const ") == 0) I += 6;
-                if (Head.compare(I, 6, "class ") == 0) I += 6;
-                size_t J = Head.size();
-                while (J > I && (Head[J - 1] == ' ' || Head[J - 1] == '\t')) --J;
-                if (Star != std::string::npos && J > I) ClassName = Head.substr(I, J - I);
-            }
-            const FRecord* PR = ClassName.empty() ? nullptr : Find(ClassName);
-            if (!PR) { *PErr = "TODO: unimplemented " + Where + ": " + Type; return false; }
-            const FIndex ClassImp = PR->IsNative()
-                ? BP.EngineClass(PR->UePackage, PR->UeName)
-                : BP.EngineClass(ModPackage + "/" + PR->CppName, PR->CppName + "_C");
-            *Out = ObjectParam(PName, ClassImp, ExtraFlags);
-            return true;
-        };
 
         std::vector<FPropertyDef> Params;
         bool bOk = true;
@@ -765,25 +841,25 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 {
                 case FStmtIR::TargetCall:
                     S.Context(
-                        [St, SelfExp](FScript& O) { O.CallMath(St.Target.Fn); EmitArgs(O, St.Target.Args, SelfExp); O.EndFunctionParms(); },
-                        [St, SelfExp](FScript& C) { C.FinalFunction(St.Call.Fn); EmitArgs(C, St.Call.Args, SelfExp); C.EndFunctionParms(); });
+                        [St, SelfExp](FScript& O) { EmitCallOp(O, St.Target); EmitArgs(O, St.Target.Args, SelfExp, nullptr); O.EndFunctionParms(); },
+                        [St, SelfExp](FScript& C) { C.FinalFunction(St.Call.Fn); EmitArgs(C, St.Call.Args, SelfExp, nullptr); C.EndFunctionParms(); });
                     break;
 
                 case FStmtIR::SelfCall:
                     S.FinalFunction(St.Call.Fn);
-                    EmitArgs(S, St.Call.Args, SelfExp);
+                    EmitArgs(S, St.Call.Args, SelfExp, nullptr);
                     S.EndFunctionParms();
                     break;
 
                 case FStmtIR::Assign:
                     S.Let(St.Var.LetOp, St.Var.S, St.Var.Owner,
-                          [St, SelfExp](FScript& V) { EmitArgs(V, { St.Var }, SelfExp); },
-                          [St, SelfExp](FScript& V) { EmitArgs(V, { St.Value }, SelfExp); });
+                          [St, SelfExp](FScript& V) { EmitArgs(V, { St.Var }, SelfExp, nullptr); },
+                          [St, SelfExp](FScript& V) { EmitArgs(V, { St.Value }, SelfExp, nullptr); });
                     break;
 
                 case FStmtIR::StaticCall:
-                    S.CallMath(St.Call.Fn);     // a static library call stands alone
-                    EmitArgs(S, St.Call.Args, SelfExp);
+                    EmitCallOp(S, St.Call);     // a static library call stands alone
+                    EmitArgs(S, St.Call.Args, SelfExp, nullptr);
                     S.EndFunctionParms();
                     break;
 
