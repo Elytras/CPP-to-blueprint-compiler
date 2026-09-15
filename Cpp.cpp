@@ -380,8 +380,31 @@ private:
     std::vector<FRegistryAsset> RegistryRows;
 };
 
+/*
+Checks a UE_CLASS naming a Blueprint. Its package is the asset's own path, not the folder the
+asset sits in - `/Game/Mods/Lib/Lib`, not `/Game/Mods/Lib` - and a cooked BPGC is always the
+asset name plus "_C", so the two spellings have to agree. They are strings either way, and the
+folder form is the natural thing to write; it produces a package that does not exist, every
+import under it resolves to null, and the first sign of it is a null UFunction at call time.
+*/
+void BadClassMeta(const FRecord& R, std::string* Err, bool* bOk)
+{
+    if (!*bOk || R.UePackage.compare(0, 6, "/Game/") != 0) return;
+    if (R.UeName.size() < 3 || R.UeName.compare(R.UeName.size() - 2, 2, "_C") != 0) return;
+
+    const size_t Slash = R.UePackage.rfind('/');
+    const std::string Asset = Slash == std::string::npos ? R.UePackage : R.UePackage.substr(Slash + 1);
+    if (Asset + "_C" == R.UeName) return;
+
+    *Err = "UE_CLASS on " + R.CppName + " names the package \"" + R.UePackage + "\", which does"
+           " not end in the asset that declares " + R.UeName + ". Did you mean \"" + R.UePackage
+         + "/" + R.UeName.substr(0, R.UeName.size() - 2) + "\"?";
+    *bOk = false;
+}
+
 bool FCompiler::Collect(std::string* Err)
 {
+    bool bMetaOk = true;
     ForEach(Doc, [&](const Json& N) {
         if (Kind(N) == "VarDecl" && Name(N) == "UeModPackage") FindLiteral(N, ModPackage);
         if (Kind(N) != "CXXRecordDecl" || !N.contains("name") || !N.contains("inner")) return;
@@ -404,6 +427,7 @@ bool FCompiler::Collect(std::string* Err)
                         R.UePackage = Meta.substr(0, Colon);
                         R.UeName = Meta.substr(Colon + 1);
                     }
+                    BadClassMeta(R, Err, &bMetaOk);
                 }
             }
             else if (Kind(C) == "CXXMethodDecl" && C.contains("name"))
@@ -419,6 +443,7 @@ bool FCompiler::Collect(std::string* Err)
         });
         Records[R.CppName] = R;
     });
+    if (!bMetaOk) return false;
 
     if (ModPackage.empty())
     {
