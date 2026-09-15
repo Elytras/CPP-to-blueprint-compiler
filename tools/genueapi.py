@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """Emit the UeApi headers a Blueprint mod compiles against, from a Dumper-7 SDK dump.
 
 The dump is already the right shape: it declares every reflected function as ordinary C++, so
@@ -12,17 +12,42 @@ A property is spelled for the VM, not for memory. Nothing here is ever laid over
 clang only ever parses these headers - so Dumper-7's `uint8 bHidden : 1` becomes a plain `bool`,
 which is what the FBoolProperty behind it actually is and what picks EX_LetBool downstream.
 
-Blueprint packages are skipped too: Dumper-7 names them by asset name and does not record the
-/Game path an import needs, so their classes would be unaddressable.
+Blueprint packages are skipped too, for now: a dump spells every name through FName::ToString,
+which strips the package path, so a Blueprint arrives as `Foo_C` with no way back to
+/Game/Where/Foo - and an import needs exactly that. Dumper-7 grew a `FullAssetPaths=1` setting
+that spells both the object dumps and the SDK class comment with GetPathName instead; admitting
+Blueprint classes here waits on a dump taken with it.
 
 That skip is also what keeps the flat C++ namespace here honest. Asset names are unique per
 /Game path, not globally - DRG's modding API guarantees collisions, since every mod ships its
 own InitCave and InitSpacerig - and Dumper-7's NameCollisions.inl duly lists InitCave_0,
 InitCave_3, InitCave_19. Measured against this dump, no *native* class collides (the only 7
-collisions are /Game structs), so emitting native packages flat is safe today. When Blueprint
-classes or UserDefinedStructs are admitted, the disambiguator has to be the /Game path mirrored
-into a C++ namespace, NOT Dumper-7's index suffix: that index is assigned per dump, so a game
-update could renumber it and silently re-point a mod at a different asset.
+collisions are /Game structs), so emitting native packages flat is safe today.
+
+When Blueprint classes are admitted, the shape they take is settled:
+
+  - The disambiguator is the /Game path mirrored into a C++ namespace, NEVER Dumper-7's index
+    suffix: that index is assigned per dump, so a game update could renumber it and silently
+    re-point a mod at a different asset. /Game/Enemies/BP_Foo -> namespace Game::Enemies.
+  - One header per ASSET NAME, not per path, so an include is derivable from the class name -
+    which is what an author knows. Names that collide share a header and are separated by their
+    namespaces inside it. Measured against DRG's own pak: 51,556 assets, 51,449 of those names
+    unique, 107 colliding and every one of them exactly twice.
+  - Each header ends with `using Foo_C = Game::Enemies::Foo_C;` for every name that is unique
+    across the whole emission, so a mod writes the bare name in the overwhelming majority of
+    cases and only a genuine collision forces the qualified spelling. The point of leaving the
+    colliding ones unaliased is that referring to one then fails to COMPILE rather than
+    resolving silently to whichever was emitted last.
+  - Only base-game assets are emitted. Another mod's InitCave is not API, and including it would
+    make the headers depend on which mods happened to be installed when the dump was taken. The
+    filter is the game's own pak index: a /Game package listed there is base game, anything else
+    arrived from a mod.
+
+Note for whoever does it: AssetGen resolves a base class by the bare name clang reports in
+`bases[0].type.qualType` against a map keyed on the bare CXXRecordDecl name, so a namespaced
+base ("Game::Enemies::ABar_C") misses and reports "derives from an undeclared class". Same gap
+in its object-pointer parse, which strips `class ` and `const ` but not a qualifier. Both need
+to handle qualified names before these headers exist.
 
 usage: genueapi.py <SDK dir> <output dir>      e.g. DrgMods/SDK/SDK  BpMods/UeApi
 """

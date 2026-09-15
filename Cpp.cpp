@@ -365,6 +365,12 @@ private:
     /* The native function behind an override, found by walking the declared ancestry. */
     FIndex FindEvent(FBlueprintClass& BP, const std::string& FromRecord, const std::string& Method);
 
+    /*
+    Records are keyed on the bare name clang gives a CXXRecordDecl, and a base class arrives as
+    the qualType spelling - so this only resolves while every declared class is at namespace
+    scope. Blueprint classes will not be (their /Game path becomes their namespace, see
+    genueapi.py), and a qualified base misses here rather than failing loudly. See TODO.md.
+    */
     const FRecord* Find(const std::string& CppName) const
     {
         auto It = Records.find(CppName);
