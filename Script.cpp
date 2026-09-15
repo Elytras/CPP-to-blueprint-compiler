@@ -45,6 +45,16 @@ FPropertyDef Int64Param(const std::string& Name, uint64 ExtraFlags)
                          CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, Null() };
 }
 
+FPropertyDef StringParam(const std::string& Name, uint64 ExtraFlags)
+{
+    /*
+    An FString on the wire; ElementSize is what the engine stores per instance - a TArray<TCHAR>
+    header, three int32 wide - not the length of any particular string.
+    */
+    return FPropertyDef{ "StrProperty", Name, RF_Public, 1, 16,
+                         CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, Null() };
+}
+
 FPropertyDef BoolParam(const std::string& Name, uint64 ExtraFlags)
 {
     return FPropertyDef{ "BoolProperty", Name, RF_Public, 1, 1,

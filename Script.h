@@ -44,6 +44,7 @@ FPropertyDef FloatParam(const std::string& Name, uint64 ExtraFlags = 0);
 FPropertyDef IntParam(const std::string& Name, uint64 ExtraFlags = 0);
 FPropertyDef Int64Param(const std::string& Name, uint64 ExtraFlags = 0);
 FPropertyDef BoolParam(const std::string& Name, uint64 ExtraFlags = 0);
+FPropertyDef StringParam(const std::string& Name, uint64 ExtraFlags = 0);
 FPropertyDef ObjectParam(const std::string& Name, FIndex Class, uint64 ExtraFlags = 0);
 
 /* Writes one ChildProperties entry: the field class name, then FField and FProperty. */

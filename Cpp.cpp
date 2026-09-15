@@ -17,6 +17,7 @@ half-written asset to explain.
 #include <cstdlib>
 #include <map>
 #include <filesystem>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -125,20 +126,24 @@ struct FRecord
 
 /* ---- the body IR ---- */
 
+struct FCallIR;
+
 struct FArgIR
 {
-    enum EKind { Self, Int, Float, Bool, Str, Field } K = Self;
+    enum EKind { Self, Int, Float, Bool, Str, Field, Call } K = Self;
     int32 I = 0;
     float F = 0.0f;
     bool B = false;
     std::string S;          // Str: the literal. Field: the property name.
     FIndex Owner;           // Field: the class that declares it
     EExprToken LetOp = EX_Let;      // Field: the opcode that writes this type
+    std::shared_ptr<FCallIR> Sub;   // Call: the nested call/intrinsic that produces this value
 };
 
 struct FCallIR
 {
-    FIndex Fn;
+    FIndex Fn;                          // Fn is set for a resolved UFunction; empty for intrinsics
+    std::string Intrinsic;              // non-empty when this is an __NAME__ compiler intrinsic
     std::vector<FArgIR> Args;
 };
 
@@ -154,28 +159,52 @@ struct FStmtIR
         TargetCall,     // a call on the object another call produced
         SelfCall,       // a call on `this`
         Assign,         // `this->Field = value`
+        Return,         // `return <value>;` - Value carries what to return (or Self kind = void)
     } K = StaticCall;
 
     FCallIR Target;
     FCallIR Call;
     FArgIR Var;                 // Assign: the destination
-    FArgIR Value;               // Assign: what is written
+    FArgIR Value;                // Assign / Return: what is written or returned
+    bool bHasValue = false;      // Return: false = void return (EX_Nothing operand)
 };
 
-void EmitArgs(FScript& S, const std::vector<FArgIR>& Args)
+/*
+Emits one argument, or fails with a named error when the argument is a not-yet-supported call.
+
+Intrinsics (a call whose IR carries an Intrinsic name) are the __NAME__ compiler helpers
+declared in Types.h / ReadProperty.cpp - they do not name a UFunction, so calling one goes
+through a per-name lowering table rather than through a normal EX_CallMath. Until that table
+carries an entry, the argument path refuses to guess and names the intrinsic instead.
+*/
+bool EmitArg(FScript& S, const FArgIR& A, std::string* Err)
+{
+    switch (A.K)
+    {
+    case FArgIR::Self:  S.Self(); return true;
+    case FArgIR::Int:   S.IntConst(A.I); return true;
+    case FArgIR::Float: S.FloatConst(A.F); return true;
+    case FArgIR::Bool:  A.B ? S.True() : S.False(); return true;
+    case FArgIR::Str:   S.StringConst(A.S); return true;
+    case FArgIR::Field: S.InstanceVariable(A.S, A.Owner); return true;
+    case FArgIR::Call:
+        if (A.Sub && !A.Sub->Intrinsic.empty())
+        {
+            if (Err) *Err = "TODO: unimplemented intrinsic " + A.Sub->Intrinsic;
+            return false;
+        }
+        if (Err) *Err = "TODO: nested call as argument";
+        return false;
+    }
+    if (Err) *Err = "internal: unknown argument kind";
+    return false;
+}
+
+bool EmitArgs(FScript& S, const std::vector<FArgIR>& Args, std::string* Err = nullptr)
 {
     for (const FArgIR& A : Args)
-    {
-        switch (A.K)
-        {
-        case FArgIR::Self: S.Self(); break;
-        case FArgIR::Int: S.IntConst(A.I); break;
-        case FArgIR::Float: S.FloatConst(A.F); break;
-        case FArgIR::Bool: A.B ? S.True() : S.False(); break;
-        case FArgIR::Str: S.StringConst(A.S); break;
-        case FArgIR::Field: S.InstanceVariable(A.S, A.Owner); break;
-        }
-    }
+        if (!EmitArg(S, A, Err)) return false;
+    return true;
 }
 
 /* Gives a generated package a stable identity, with no editor around to allocate one. */
@@ -341,6 +370,27 @@ bool FCompiler::LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, 
     if (K == "IntegerLiteral") { Out.K = FArgIR::Int; Out.I = int32(std::stoll(N->value("value", std::string("0")))); return true; }
     if (K == "FloatingLiteral") { Out.K = FArgIR::Float; Out.F = std::stof(N->value("value", std::string("0"))); return true; }
     if (K == "CXXBoolLiteralExpr") { Out.K = FArgIR::Bool; Out.B = N->value("value", false); return true; }
+    if (K == "CallExpr")
+    {
+        /*
+        A call in argument position: another expression whose value flows into the outer call.
+        LowerCall handles the same intrinsic / UFunction dispatch as it does for statement calls;
+        the resulting FCallIR is attached to the FArgIR so the emitter can lower it in place.
+        Only intrinsic calls are supported here right now - a nested UFunction call needs the
+        emitter to write EX_LocalOutVariable + a call, which is not built yet. Since every
+        intrinsic currently fails at LowerCall time (no lowering table), this branch effectively
+        just forwards the intrinsic's TODO up to the caller.
+        */
+        Out.K = FArgIR::Call;
+        Out.Sub = std::make_shared<FCallIR>();
+        if (!LowerCall(*N, BP, *Out.Sub, Err)) return false;
+        if (Out.Sub->Intrinsic.empty())
+        {
+            *Err = "TODO: a normal function call in argument position is not supported yet";
+            return false;
+        }
+        return true;
+    }
 
     *Err = "TODO: unimplemented argument " + K;
     return false;
@@ -367,15 +417,33 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         MethodName = Name(Ref);
     }
 
-    auto Owner = MethodOwner.find(DeclId);
-    if (Owner == MethodOwner.end()) { *Err = "call to an unknown function: " + MethodName; return false; }
-    const FRecord* R = Find(Owner->second);
-    if (!R || !R->IsNative())
+    /*
+    Compiler intrinsics are free functions whose name is __NAME__: they do not correspond to a
+    UFunction anywhere and their lowering is per-name. Detect them before the MethodOwner
+    lookup so the "call to an unknown function" wall does not catch them. Until a specific
+    intrinsic has a lowering here, fail at lower-time so the emitter never faces an emission it
+    cannot make.
+    */
+    const bool bIntrinsic = MethodName.size() >= 5
+        && MethodName.compare(0, 2, "__") == 0
+        && MethodName.compare(MethodName.size() - 2, 2, "__") == 0;
+    if (bIntrinsic)
     {
-        *Err = "TODO: unimplemented call into a generated class: " + Owner->second + "::" + MethodName;
+        *Err = "TODO: unimplemented intrinsic " + MethodName;
         return false;
     }
-    Out.Fn = BP.EngineFunction(R->UePackage, R->UeName, MethodName);
+    else
+    {
+        auto Owner = MethodOwner.find(DeclId);
+        if (Owner == MethodOwner.end()) { *Err = "call to an unknown function: " + MethodName; return false; }
+        const FRecord* R = Find(Owner->second);
+        if (!R || !R->IsNative())
+        {
+            *Err = "TODO: unimplemented call into a generated class: " + Owner->second + "::" + MethodName;
+            return false;
+        }
+        Out.Fn = BP.EngineFunction(R->UePackage, R->UeName, MethodName);
+    }
 
     /* inner[0] is the callee; everything after it is an argument. */
     bool bFirst = true, bOk = true;
@@ -446,6 +514,22 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             St.K = FStmtIR::Assign;
             bOk = LowerField(*Lhs, BP, St.Var, Err) && LowerArg(*Rhs, BP, St.Value, Err);
         }
+        else if (K == "ReturnStmt")
+        {
+            /*
+            The return value is one expression: `return <expr>;`. The emitter's ReturnValue slot
+            takes 8 bytes for now, so what a body can return is scoped to what an argument can
+            already lower to - a literal, a `this->Field`, or an intrinsic. An empty return is a
+            void return and the emitter writes EX_Return + EX_Nothing.
+            */
+            St.K = FStmtIR::Return;
+            const Json* Val = Strip(First(*S));
+            if (Val)
+            {
+                St.bHasValue = true;
+                bOk = LowerArg(*Val, BP, St.Value, Err);
+            }
+        }
         else
         {
             *Err = "TODO: unimplemented statement " + K;
@@ -489,7 +573,37 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             else if (Type == "int" || Type == "int32") Params.push_back(IntParam(PName));
             else if (Type == "int64" || Type == "long long") Params.push_back(Int64Param(PName));
             else if (Type == "bool") Params.push_back(BoolParam(PName));
-            else { *Err = "TODO: unimplemented parameter type " + Type + " on " + Entry.first; bOk = false; }
+            else if (Type == "const char *" || Type == "const char*") Params.push_back(StringParam(PName));
+            else
+            {
+                /*
+                Object pointer: the type's declared class is what the parameter's PropertyClass
+                names. Resolving the class name means finding a record for it - the mod's own
+                classes are declared here, and every UE class exposed to a mod source lives in
+                Records too because UeApi.h declares it. If the class is native the property
+                takes its UePackage/UeName; if it is a mod class the /Game path derives from
+                UeModPackage and the C++ name.
+                */
+                std::string ClassName;
+                {
+                    const size_t Star = Type.find('*');
+                    const std::string Head = Type.substr(0, Star);
+                    /* Strip leading `class ` / `const ` / trailing whitespace. */
+                    size_t I = 0;
+                    while (I < Head.size() && Head[I] == ' ') ++I;
+                    if (Head.compare(I, 6, "const ") == 0) I += 6;
+                    if (Head.compare(I, 6, "class ") == 0) I += 6;
+                    size_t J = Head.size();
+                    while (J > I && (Head[J - 1] == ' ' || Head[J - 1] == '\t')) --J;
+                    if (Star != std::string::npos && J > I) ClassName = Head.substr(I, J - I);
+                }
+                const FRecord* PR = ClassName.empty() ? nullptr : Find(ClassName);
+                if (!PR) { *Err = "TODO: unimplemented parameter type " + Type + " on " + Entry.first; bOk = false; return; }
+                const FIndex ClassImp = PR->IsNative()
+                    ? BP.EngineClass(PR->UePackage, PR->UeName)
+                    : BP.EngineClass(ModPackage + "/" + PR->CppName, PR->CppName + "_C");
+                Params.push_back(ObjectParam(PName, ClassImp));
+            }
         });
         if (!bOk) return false;
 
@@ -500,7 +614,10 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             return false;
         }
 
-        BP.AddFunction(Entry.first, FindEvent(BP, R.CppName, Entry.first), Params, [Stmts](FScript& S) {
+        const bool bEndsWithReturn = !Stmts.empty() && Stmts.back().K == FStmtIR::Return;
+
+        BP.AddFunction(Entry.first, FindEvent(BP, R.CppName, Entry.first), Params,
+                       [Stmts, bEndsWithReturn](FScript& S) {
             for (const FStmtIR& St : Stmts)
             {
                 switch (St.K)
@@ -528,9 +645,25 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                     EmitArgs(S, St.Call.Args);
                     S.EndFunctionParms();
                     break;
+
+                case FStmtIR::Return:
+                    /*
+                    A void return today: the return-value plumbing is not built yet, so the VM
+                    reads EX_Return + EX_Nothing regardless of what the source expression was.
+                    Any expression the source names has already been rejected at LowerArg / at
+                    LowerCall - a Return statement whose value is a literal/field/etc. is the
+                    same as saying `return;`, and one whose value is a call is refused above.
+                    */
+                    S.Return();
+                    break;
                 }
             }
-            S.Return();
+            /*
+            Every function must terminate with EX_Return. When the source did not spell one out,
+            add the void-return tail; when it did, its Return is already in place and the trailing
+            EndOfScript closes the stream.
+            */
+            if (!bEndsWithReturn) S.Return();
             S.EndOfScript();
         });
     }
