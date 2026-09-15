@@ -87,4 +87,5 @@ def main():
             print(f"  +{i:03x} {c.hex()}  {sv:<12} {note}")
         print()
 
-main()
+if __name__ == "__main__":
+    main()

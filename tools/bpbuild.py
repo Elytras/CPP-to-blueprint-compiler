@@ -19,6 +19,9 @@ import sys
 
 import yaml
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from dumpexp import load as load_package
+
 MOD_PACKAGE = re.compile(r'UE_MOD_PACKAGE\s*\(\s*"([^"]+)"')
 
 UNREALPAK = r"C:\Program Files\Epic Games\UE_4.27\Engine\Binaries\Win64\UnrealPak.exe"
@@ -93,6 +96,43 @@ def run_unrealpak(fsd_dir, pak_path):
     return True
 
 
+def check_mod_imports(staged, mod_packages):
+    """Report imports of a mod package that no mod in this build actually produces.
+
+    A generated asset lives at <mod package>/<class>, so `/Game/Mods/Lib/Lib`, while the folder
+    it sits in - `/Game/Mods/Lib` - is not a package at all. Naming the folder in a UE_CLASS
+    reads as correct whenever the mod and its class share a name, and nothing offline notices:
+    the import table is written, the package loads, and every object under that import resolves
+    to null. The first sign of it is a null UFunction at call time, one frame inside the VM.
+
+    Only imports under a known mod package are judged. A mod is free to reference a real game
+    asset, and there is no list of those to check against.
+    """
+    produced = set()
+    for _mod, content, package in staged:
+        for f in os.listdir(content):
+            if f.endswith(".uasset"):
+                produced.add(package + "/" + f[:-len(".uasset")])
+
+    bad = []
+    for _mod, content, _package in staged:
+        for f in sorted(os.listdir(content)):
+            if not f.endswith(".uasset"):
+                continue
+            base = os.path.join(content, f[:-len(".uasset")])
+            imports = load_package(base)[4]
+            for entry in imports:
+                if not entry.startswith("Package'"):
+                    continue
+                name = entry[len("Package'"):-1]
+                under = any(name == m or name.startswith(m + "/") for m in mod_packages)
+                if under and name not in produced:
+                    bad.append((f, name))
+    for asset, name in bad:
+        print("  %s imports %s, which no mod in this build produces" % (asset, name))
+    return not bad
+
+
 def main():
     if len(sys.argv) < 4:
         sys.exit(__doc__.strip().splitlines()[-1])
@@ -117,6 +157,7 @@ def main():
     toolchain_time = max(newest(api_headers), newest([assetgen]))
 
     built, packed, skipped, failed = [], [], [], []
+    staged = []
     for mod in order(mods):
         name = mod["name"]
         sources = [os.path.join(bp, s) for s in (mod.get("sources") or [])]
@@ -130,6 +171,7 @@ def main():
         stage_fsd = os.path.join(bp, "build", name, "FSD")
         stage_content = os.path.join(stage_fsd, "Content", *package.replace("/Game/", "").split("/"))
         assets = staged_assets(stage_content)
+        staged.append((name, stage_content, package))
 
         stale = force or not assets or max(newest(sources), toolchain_time) > oldest(assets)
         if not stale:
@@ -163,6 +205,9 @@ def main():
             packed.append(name)
         else:
             failed.append(name)
+
+    if not failed and not check_mod_imports(staged, set(p for _n, _c, p in staged)):
+        failed.append("cross-mod imports")
 
     print("built %d, packed %d, up to date %d, failed %d"
           % (len(built), len(packed), len(skipped), len(failed)))
