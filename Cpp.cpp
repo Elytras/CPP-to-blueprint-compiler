@@ -16,6 +16,8 @@ half-written asset to explain.
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
+#include <set>
 #include <map>
 #include <filesystem>
 #include <memory>
@@ -404,14 +406,21 @@ private:
     FIndex FindEvent(FBlueprintClass& BP, const std::string& FromRecord, const std::string& Method);
 
     /*
-    Records are keyed on the bare name clang gives a CXXRecordDecl, and a base class arrives as
-    the qualType spelling - so this only resolves while every declared class is at namespace
-    scope. Blueprint classes will not be (their /Game path becomes their namespace, see
-    genueapi.py), and a qualified base misses here rather than failing loudly. See TODO.md.
+    A class by the name a mod spelled.
+
+    Records are keyed on the QUALIFIED name, because a Blueprint class is namespaced by its
+    /Game path (genueapi.py) and several assets can share a leaf name - 32 of them are called
+    InitCave_C in this game. A bare name is then resolved through Bare, which holds only the
+    names exactly one class claims; an ambiguous one is absent, so it fails to resolve here
+    rather than silently picking whichever class was collected last.
     */
     const FRecord* Find(const std::string& CppName) const
     {
         auto It = Records.find(CppName);
+        if (It != Records.end()) return &It->second;
+        auto B = Bare.find(CppName);
+        if (B == Bare.end()) return nullptr;
+        It = Records.find(B->second);
         return It == Records.end() ? nullptr : &It->second;
     }
 
@@ -420,6 +429,7 @@ private:
     std::map<std::string, FRecord> Records;
     std::map<std::string, std::string> MethodOwner;   // clang decl id -> owning record
     std::map<std::string, std::string> FieldOwner;    // clang decl id -> declaring record
+    std::map<std::string, std::string> Bare;          // unambiguous leaf name -> qualified name
     const FRecord* Cur = nullptr;                     // the record Generate is working on
 
     /* One row per generated class, baked into AssetRegistry.bin once the run succeeds. */
@@ -451,12 +461,29 @@ void BadClassMeta(const FRecord& R, std::string* Err, bool* bOk)
 bool FCompiler::Collect(std::string* Err)
 {
     bool bMetaOk = true;
-    ForEach(Doc, [&](const Json& N) {
+    std::set<std::string> Ambiguous;
+
+    /*
+    Walk declarations, carrying the namespace they are in.
+
+    A generated UeApi header puts each Blueprint class in a namespace mirroring its /Game path,
+    so a walk of the translation unit's top level alone sees none of them - and a mod naming one
+    then reads as deriving from a class that was never declared.
+    */
+    std::function<void(const Json&, const std::string&)> Walk =
+        [&](const Json& Scope, const std::string& Ns)
+    {
+    ForEach(Scope, [&](const Json& N) {
+        if (Kind(N) == "NamespaceDecl" && N.contains("name"))
+        {
+            Walk(N, Ns + Name(N) + "::");
+            return;
+        }
         if (Kind(N) == "VarDecl" && Name(N) == "UeModPackage") FindLiteral(N, ModPackage);
         if (Kind(N) != "CXXRecordDecl" || !N.contains("name") || !N.contains("inner")) return;
 
         FRecord R;
-        R.CppName = Name(N);
+        R.CppName = Ns + Name(N);
         auto Bases = N.find("bases");
         if (Bases != N.end() && !Bases->empty())
             R.Base = (*Bases)[0]["type"].value("qualType", std::string());
@@ -487,8 +514,22 @@ bool FCompiler::Collect(std::string* Err)
                 FieldOwner[C.value("id", std::string())] = R.CppName;
             }
         });
+        /*
+        The leaf name is a shortcut to the qualified one, and only while it is unambiguous. Once
+        a second class claims it the shortcut is withdrawn rather than overwritten, so a mod that
+        names it bare fails to resolve instead of reaching the wrong asset.
+        */
+        const std::string Leaf = Name(N);
+        if (!Ns.empty() && !Ambiguous.count(Leaf))
+        {
+            auto Prev = Bare.find(Leaf);
+            if (Prev == Bare.end()) Bare.emplace(Leaf, R.CppName);
+            else { Bare.erase(Prev); Ambiguous.insert(Leaf); }
+        }
         Records[R.CppName] = R;
     });
+    };
+    Walk(Doc, std::string());
     if (!bMetaOk) return false;
 
     if (ModPackage.empty())
@@ -926,11 +967,18 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     FPackage P(PackageName);
     StampIdentity(P, PackageName);
 
-    const bool bParentIsBlueprint = !B->IsNative();
-    FBlueprintClass BP(P, R.CppName + "_C",
-                       bParentIsBlueprint ? ModPackage + "/" + B->CppName : B->UePackage,
-                       bParentIsBlueprint ? B->CppName + "_C" : B->UeName,
-                       bParentIsBlueprint);
+    /*
+    Two different questions about the parent, and they used to be one. Whether it is declared in
+    THIS source decides how its package and class are spelled; whether it is a Blueprint at all
+    decides the CDO's create-before-serialize edge onto it - and a parent named by UE_CLASS at a
+    /Game path is a Blueprint that this source did not declare. A cooked class states that edge
+    (measured on BP_ThornsComponent, whose CDO lists its parent BPGC), so it is asked separately.
+    */
+    const bool bParentIsLocal = !B->IsNative();
+    const std::string ParentPkg = bParentIsLocal ? ModPackage + "/" + B->CppName : B->UePackage;
+    FBlueprintClass BP(P, R.CppName + "_C", ParentPkg,
+                       bParentIsLocal ? B->CppName + "_C" : B->UeName,
+                       ParentPkg.compare(0, 6, "/Game/") == 0);
 
     /*
     What the class inherits from decides two things on disk. The ancestry is walked in the mod's
@@ -1166,7 +1214,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     if (!P.Save(OutDir + "/" + R.CppName, Err)) return false;
     RegistryRows.push_back({ PackageName, R.CppName + "_C", "BlueprintGeneratedClass" });
     printf("  %-14s -> %s.uasset  (%s %s)\n", R.CppName.c_str(), R.CppName.c_str(),
-           bParentIsBlueprint ? "extends BP" : "extends native", R.Base.c_str());
+           B->IsNative() ? "extends" : "extends BP", R.Base.c_str());
     return true;
 }
 
