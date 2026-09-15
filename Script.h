@@ -65,7 +65,8 @@ public:
     void Op(EExprToken Token);
     void Self();
     void Nothing();
-    void Return();                                  // EX_Return + EX_Nothing, the usual pairing
+    void Return();                                  // EX_Return + EX_Nothing, void tail
+    void Return(const std::function<void(FScript&)>& Value);   // EX_Return + expression
     void EndOfScript();
     void EndFunctionParms();
 

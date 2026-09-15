@@ -96,7 +96,7 @@ FIndex FBlueprintClass::EngineFunction(const std::string& PackageName,
 
 void FBlueprintClass::AddFunction(const std::string& Name, FIndex Super,
                                   const std::vector<FPropertyDef>& Params,
-                                  const std::function<void(FScript&)>& Body)
+                                  const std::function<void(FScript&, FIndex)>& Body)
 {
     FFunctionDef Def;
     Def.Name = Name;
@@ -250,9 +250,11 @@ void FBlueprintClass::Finish()
     for (size_t I = 0; I < Functions.size(); ++I)
     {
         std::vector<int32> Refs = CallImports;
-        Refs.push_back(Exp(RowFirstFunction + int32(I)).V);   // a body can reference its own export
+        const FIndex SelfExp = Exp(RowFirstFunction + int32(I));
+        Refs.push_back(SelfExp.V);              // a body can reference its own export
+        const auto& Body = Functions[I].Body;
         AddFunctionExport(P, Functions[I].Def, Exp(RowClass), FunctionClass, FunctionCdo,
-                          Functions[I].Body, Refs);
+                          [Body, SelfExp](FScript& S) { Body(S, SelfExp); }, Refs);
     }
 
     /*

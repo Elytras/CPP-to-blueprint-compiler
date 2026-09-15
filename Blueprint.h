@@ -50,10 +50,14 @@ public:
     /*
     Declares a function on the class. `Super` should be the engine UFunction being overridden
     for an event like ReceiveTick, or null for a new method.
+
+    Body takes the function's OWN export index so bytecode that names its own params can spell
+    the FFieldPath owner ("Ref" belongs to <thisFunction>, not to <thisClass>). The index is
+    not known here; Finish() fills it in when the function's export row is fixed.
     */
     void AddFunction(const std::string& Name, FIndex Super,
                      const std::vector<FPropertyDef>& Params,
-                     const std::function<void(FScript&)>& Body);
+                     const std::function<void(FScript&, FIndex)>& Body);
 
     /* Writes the class, its CDO, its functions and a default scene root into the package. */
     void Finish();
@@ -64,7 +68,7 @@ private:
     struct FPending
     {
         FFunctionDef Def;
-        std::function<void(FScript&)> Body;
+        std::function<void(FScript&, FIndex)> Body;
     };
 
     FPackage& P;

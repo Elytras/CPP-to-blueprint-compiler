@@ -123,6 +123,18 @@ void FScript::Return()
     Op(EX_Nothing);                     // the return expression: this function returns nothing
 }
 
+void FScript::Return(const std::function<void(FScript&)>& Value)
+{
+    /*
+    A value return: the VM evaluates the expression into the function's ReturnValue property
+    slot, so the caller can just read the property after the call. Which property is looked up
+    by name (the parm chain must carry a "ReturnValue" entry with the matching type); the
+    bytecode only carries the value expression.
+    */
+    Op(EX_Return);
+    Value(*this);
+}
+
 void FScript::IntConst(int32 Value)
 {
     Op(EX_IntConst);

@@ -130,13 +130,13 @@ struct FCallIR;
 
 struct FArgIR
 {
-    enum EKind { Self, Int, Float, Bool, Str, Field, Call } K = Self;
+    enum EKind { Self, Int, Float, Bool, Str, Field, Local, Call } K = Self;
     int32 I = 0;
     float F = 0.0f;
     bool B = false;
     bool bWide = false;     // Str: true = UCS-2 literal, emit EX_UnicodeStringConst
-    std::string S;          // Str: the literal. Field: the property name.
-    FIndex Owner;           // Field: the class that declares it
+    std::string S;          // Str: the literal. Field/Local: the property name.
+    FIndex Owner;           // Field: the class that declares it (Local owner = function itself, resolved at emit)
     EExprToken LetOp = EX_Let;      // Field: the opcode that writes this type
     std::shared_ptr<FCallIR> Sub;   // Call: the nested call/intrinsic that produces this value
 };
@@ -145,6 +145,7 @@ struct FCallIR
 {
     FIndex Fn;                          // Fn is set for a resolved UFunction; empty for intrinsics
     std::string Intrinsic;              // non-empty when this is an __NAME__ compiler intrinsic
+    FIndex Extra;                       // Intrinsic: an auxiliary import (e.g. the donor script struct)
     std::vector<FArgIR> Args;
 };
 
@@ -173,12 +174,15 @@ struct FStmtIR
 /*
 Emits one argument, or fails with a named error when the argument is a not-yet-supported call.
 
+SelfExp is the enclosing function's own export index - EX_LocalVariable's FFieldPath owner
+because a param property lives on its function. Nothing else at emit-time needs it.
+
 Intrinsics (a call whose IR carries an Intrinsic name) are the __NAME__ compiler helpers
 declared in Types.h / ReadProperty.cpp - they do not name a UFunction, so calling one goes
-through a per-name lowering table rather than through a normal EX_CallMath. Until that table
-carries an entry, the argument path refuses to guess and names the intrinsic instead.
+through a per-name lowering rather than through a normal EX_CallMath. Only the intrinsics with
+a switch arm below are actually emittable; the rest are rejected at Lower time.
 */
-bool EmitArg(FScript& S, const FArgIR& A, std::string* Err)
+bool EmitArg(FScript& S, const FArgIR& A, FIndex SelfExp, std::string* Err)
 {
     switch (A.K)
     {
@@ -207,23 +211,43 @@ bool EmitArg(FScript& S, const FArgIR& A, std::string* Err)
         }
         return true;
     case FArgIR::Field: S.InstanceVariable(A.S, A.Owner); return true;
+    case FArgIR::Local: S.LocalVariable(A.S, SelfExp); return true;
     case FArgIR::Call:
-        if (A.Sub && !A.Sub->Intrinsic.empty())
+        if (!A.Sub) { if (Err) *Err = "internal: Call arg has no sub-call"; return false; }
+        if (A.Sub->Intrinsic == "__AddrOf__")
         {
-            if (Err) *Err = "TODO: unimplemented intrinsic " + A.Sub->Intrinsic;
-            return false;
+            /*
+            Type-confusion read: read the 8 bytes at the argument's storage AS the uint64 Key of
+            FScreenMessageString. StructMemberContext copies Member.ElementSize (8) bytes from
+            (innerAddress + Member.Offset_Internal). Key's offset is 0, so the copy is straight
+            out of the argument's own storage - which for a pointer-typed parameter is the
+            pointer value itself, returned as int64.
+            */
+            if (A.Sub->Args.size() != 1)
+            {
+                if (Err) *Err = "__AddrOf__ takes exactly one argument";
+                return false;
+            }
+            const FArgIR& Inner = A.Sub->Args[0];
+            std::string SubErr;
+            bool bInnerOk = true;
+            S.StructMember("Key", A.Sub->Extra,
+                [&](FScript& Ctx) { bInnerOk = EmitArg(Ctx, Inner, SelfExp, &SubErr); });
+            if (!bInnerOk) { if (Err) *Err = SubErr; return false; }
+            return true;
         }
-        if (Err) *Err = "TODO: nested call as argument";
+        if (Err) *Err = "TODO: unimplemented intrinsic " + A.Sub->Intrinsic;
         return false;
     }
     if (Err) *Err = "internal: unknown argument kind";
     return false;
 }
 
-bool EmitArgs(FScript& S, const std::vector<FArgIR>& Args, std::string* Err = nullptr)
+bool EmitArgs(FScript& S, const std::vector<FArgIR>& Args, FIndex SelfExp,
+              std::string* Err = nullptr)
 {
     for (const FArgIR& A : Args)
-        if (!EmitArg(S, A, Err)) return false;
+        if (!EmitArg(S, A, SelfExp, Err)) return false;
     return true;
 }
 
@@ -408,6 +432,24 @@ bool FCompiler::LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, 
     if (K == "IntegerLiteral") { Out.K = FArgIR::Int; Out.I = int32(std::stoll(N->value("value", std::string("0")))); return true; }
     if (K == "FloatingLiteral") { Out.K = FArgIR::Float; Out.F = std::stof(N->value("value", std::string("0"))); return true; }
     if (K == "CXXBoolLiteralExpr") { Out.K = FArgIR::Bool; Out.B = N->value("value", false); return true; }
+    if (K == "DeclRefExpr")
+    {
+        /*
+        A bare name in an expression - typically a reference to a function parameter or a local
+        variable. Only parameters are supported so far, and they lower to EX_LocalVariable
+        against the enclosing function's own FField chain.
+        */
+        const Json& Ref = (*N)["referencedDecl"];
+        const std::string RefKind = Ref.value("kind", std::string());
+        if (RefKind != "ParmVarDecl")
+        {
+            *Err = "TODO: DeclRefExpr to " + RefKind;
+            return false;
+        }
+        Out.K = FArgIR::Local;
+        Out.S = Ref.value("name", std::string());
+        return true;
+    }
     if (K == "CallExpr")
     {
         /*
@@ -457,18 +499,32 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
 
     /*
     Compiler intrinsics are free functions whose name is __NAME__: they do not correspond to a
-    UFunction anywhere and their lowering is per-name. Detect them before the MethodOwner
-    lookup so the "call to an unknown function" wall does not catch them. Until a specific
-    intrinsic has a lowering here, fail at lower-time so the emitter never faces an emission it
-    cannot make.
+    UFunction anywhere and their lowering is per-name. Each one resolves its supporting imports
+    here (Extra) so the emit closure can stay reference-free; a name with no lowering fails at
+    Lower time so the emitter never faces an emission it cannot make.
     */
     const bool bIntrinsic = MethodName.size() >= 5
         && MethodName.compare(0, 2, "__") == 0
         && MethodName.compare(MethodName.size() - 2, 2, "__") == 0;
     if (bIntrinsic)
     {
-        *Err = "TODO: unimplemented intrinsic " + MethodName;
-        return false;
+        Out.Intrinsic = MethodName;
+        if (MethodName == "__AddrOf__")
+        {
+            /*
+            The donor struct: any UScriptStruct with an 8-byte scalar at Offset_Internal=0 will
+            do. FScreenMessageString.Key (uint64) is in /Script/Engine and always loaded, so it
+            costs one import row and no plugin dependency. FDateTime.Ticks would be the natural
+            fit but is not reflected in a shipping build - Dumper-7's dump shows the struct as
+            an eight-byte pad.
+            */
+            Out.Extra = BP.ScriptStruct("/Script/Engine", "ScreenMessageString");
+        }
+        else
+        {
+            *Err = "TODO: unimplemented intrinsic " + MethodName;
+            return false;
+        }
     }
     else
     {
@@ -601,49 +657,81 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         ForEach(M, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Body = &C; });
         if (!Body) continue;                    // a declaration without a definition defines nothing
 
+        /*
+        Turn a mod-source qualType into an FPropertyDef. `Where` names the location for the
+        error message ("parameter X on Y" or "return type on Y"); ExtraFlags is CPF_ReturnParm |
+        CPF_OutParm for a ReturnValue and zero for an ordinary param.
+        */
+        auto TypeToProperty = [&](const std::string& Type, const std::string& PName,
+                                  uint64 ExtraFlags, const std::string& Where,
+                                  FPropertyDef* Out, std::string* PErr) -> bool
+        {
+            if (Type == "float") { *Out = FloatParam(PName, ExtraFlags); return true; }
+            if (Type == "int" || Type == "int32") { *Out = IntParam(PName, ExtraFlags); return true; }
+            if (Type == "int64" || Type == "long long") { *Out = Int64Param(PName, ExtraFlags); return true; }
+            if (Type == "bool") { *Out = BoolParam(PName, ExtraFlags); return true; }
+            if (Type == "const char *" || Type == "const char*") { *Out = StringParam(PName, ExtraFlags); return true; }
+
+            /* Object pointer, spelled `[const] class X *`. Resolve X against Records. */
+            std::string ClassName;
+            {
+                const size_t Star = Type.find('*');
+                const std::string Head = Star == std::string::npos ? Type : Type.substr(0, Star);
+                size_t I = 0;
+                while (I < Head.size() && Head[I] == ' ') ++I;
+                if (Head.compare(I, 6, "const ") == 0) I += 6;
+                if (Head.compare(I, 6, "class ") == 0) I += 6;
+                size_t J = Head.size();
+                while (J > I && (Head[J - 1] == ' ' || Head[J - 1] == '\t')) --J;
+                if (Star != std::string::npos && J > I) ClassName = Head.substr(I, J - I);
+            }
+            const FRecord* PR = ClassName.empty() ? nullptr : Find(ClassName);
+            if (!PR) { *PErr = "TODO: unimplemented " + Where + ": " + Type; return false; }
+            const FIndex ClassImp = PR->IsNative()
+                ? BP.EngineClass(PR->UePackage, PR->UeName)
+                : BP.EngineClass(ModPackage + "/" + PR->CppName, PR->CppName + "_C");
+            *Out = ObjectParam(PName, ClassImp, ExtraFlags);
+            return true;
+        };
+
         std::vector<FPropertyDef> Params;
         bool bOk = true;
         ForEach(M, [&](const Json& C) {
             if (Kind(C) != "ParmVarDecl" || !bOk) return;
             const std::string Type = C["type"].value("qualType", std::string());
             const std::string PName = Name(C);
-            if (Type == "float") Params.push_back(FloatParam(PName));
-            else if (Type == "int" || Type == "int32") Params.push_back(IntParam(PName));
-            else if (Type == "int64" || Type == "long long") Params.push_back(Int64Param(PName));
-            else if (Type == "bool") Params.push_back(BoolParam(PName));
-            else if (Type == "const char *" || Type == "const char*") Params.push_back(StringParam(PName));
-            else
-            {
-                /*
-                Object pointer: the type's declared class is what the parameter's PropertyClass
-                names. Resolving the class name means finding a record for it - the mod's own
-                classes are declared here, and every UE class exposed to a mod source lives in
-                Records too because UeApi.h declares it. If the class is native the property
-                takes its UePackage/UeName; if it is a mod class the /Game path derives from
-                UeModPackage and the C++ name.
-                */
-                std::string ClassName;
-                {
-                    const size_t Star = Type.find('*');
-                    const std::string Head = Type.substr(0, Star);
-                    /* Strip leading `class ` / `const ` / trailing whitespace. */
-                    size_t I = 0;
-                    while (I < Head.size() && Head[I] == ' ') ++I;
-                    if (Head.compare(I, 6, "const ") == 0) I += 6;
-                    if (Head.compare(I, 6, "class ") == 0) I += 6;
-                    size_t J = Head.size();
-                    while (J > I && (Head[J - 1] == ' ' || Head[J - 1] == '\t')) --J;
-                    if (Star != std::string::npos && J > I) ClassName = Head.substr(I, J - I);
-                }
-                const FRecord* PR = ClassName.empty() ? nullptr : Find(ClassName);
-                if (!PR) { *Err = "TODO: unimplemented parameter type " + Type + " on " + Entry.first; bOk = false; return; }
-                const FIndex ClassImp = PR->IsNative()
-                    ? BP.EngineClass(PR->UePackage, PR->UeName)
-                    : BP.EngineClass(ModPackage + "/" + PR->CppName, PR->CppName + "_C");
-                Params.push_back(ObjectParam(PName, ClassImp));
-            }
+            FPropertyDef PD;
+            std::string PErr;
+            if (!TypeToProperty(Type, PName, 0, "parameter " + PName + " on " + Entry.first,
+                                &PD, &PErr))
+            { *Err = PErr; bOk = false; return; }
+            Params.push_back(PD);
         });
         if (!bOk) return false;
+
+        /*
+        A non-void return grows the parm chain by one ReturnValue property. UE walks the chain
+        looking for that exact name, so the emitter's Return-with-value has somewhere to write.
+        The type comes from the method signature's return part - "int64 (class UObject *)"
+        splits at the '(' and trims.
+        */
+        const std::string FnQual = M["type"].value("qualType", std::string());
+        std::string RetType;
+        {
+            const size_t LParen = FnQual.find('(');
+            RetType = LParen == std::string::npos ? FnQual : FnQual.substr(0, LParen);
+            while (!RetType.empty() && (RetType.back() == ' ' || RetType.back() == '\t'))
+                RetType.pop_back();
+        }
+        if (!RetType.empty() && RetType != "void")
+        {
+            FPropertyDef PD;
+            std::string PErr;
+            if (!TypeToProperty(RetType, "ReturnValue", CPF_ReturnParm | CPF_OutParm,
+                                "return type on " + Entry.first, &PD, &PErr))
+            { *Err = PErr; return false; }
+            Params.push_back(PD);
+        }
 
         std::vector<FStmtIR> Stmts;
         if (!LowerBody(*Body, BP, Stmts, Err))
@@ -655,44 +743,46 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         const bool bEndsWithReturn = !Stmts.empty() && Stmts.back().K == FStmtIR::Return;
 
         BP.AddFunction(Entry.first, FindEvent(BP, R.CppName, Entry.first), Params,
-                       [Stmts, bEndsWithReturn](FScript& S) {
+                       [Stmts, bEndsWithReturn](FScript& S, FIndex SelfExp) {
             for (const FStmtIR& St : Stmts)
             {
                 switch (St.K)
                 {
                 case FStmtIR::TargetCall:
                     S.Context(
-                        [St](FScript& O) { O.CallMath(St.Target.Fn); EmitArgs(O, St.Target.Args); O.EndFunctionParms(); },
-                        [St](FScript& C) { C.FinalFunction(St.Call.Fn); EmitArgs(C, St.Call.Args); C.EndFunctionParms(); });
+                        [St, SelfExp](FScript& O) { O.CallMath(St.Target.Fn); EmitArgs(O, St.Target.Args, SelfExp); O.EndFunctionParms(); },
+                        [St, SelfExp](FScript& C) { C.FinalFunction(St.Call.Fn); EmitArgs(C, St.Call.Args, SelfExp); C.EndFunctionParms(); });
                     break;
 
                 case FStmtIR::SelfCall:
                     S.FinalFunction(St.Call.Fn);
-                    EmitArgs(S, St.Call.Args);
+                    EmitArgs(S, St.Call.Args, SelfExp);
                     S.EndFunctionParms();
                     break;
 
                 case FStmtIR::Assign:
                     S.Let(St.Var.LetOp, St.Var.S, St.Var.Owner,
-                          [St](FScript& V) { EmitArgs(V, { St.Var }); },
-                          [St](FScript& V) { EmitArgs(V, { St.Value }); });
+                          [St, SelfExp](FScript& V) { EmitArgs(V, { St.Var }, SelfExp); },
+                          [St, SelfExp](FScript& V) { EmitArgs(V, { St.Value }, SelfExp); });
                     break;
 
                 case FStmtIR::StaticCall:
                     S.CallMath(St.Call.Fn);     // a static library call stands alone
-                    EmitArgs(S, St.Call.Args);
+                    EmitArgs(S, St.Call.Args, SelfExp);
                     S.EndFunctionParms();
                     break;
 
                 case FStmtIR::Return:
                     /*
-                    A void return today: the return-value plumbing is not built yet, so the VM
-                    reads EX_Return + EX_Nothing regardless of what the source expression was.
-                    Any expression the source names has already been rejected at LowerArg / at
-                    LowerCall - a Return statement whose value is a literal/field/etc. is the
-                    same as saying `return;`, and one whose value is a call is refused above.
+                    An explicit return. Void form (no value expression) uses the same
+                    EX_Return + EX_Nothing pairing an implicit tail would; a value return runs
+                    the source expression inside the Return op so the VM writes into the
+                    ReturnValue slot straight away.
                     */
-                    S.Return();
+                    if (St.bHasValue)
+                        S.Return([St, SelfExp](FScript& V) { EmitArg(V, St.Value, SelfExp, nullptr); });
+                    else
+                        S.Return();
                     break;
                 }
             }
