@@ -25,6 +25,7 @@ half-written asset to explain.
 
 #include "Blueprint.h"
 #include "Package.h"
+#include "Registry.h"
 #include "Script.h"
 
 namespace Uasset
@@ -306,6 +307,9 @@ private:
     std::map<std::string, FRecord> Records;
     std::map<std::string, std::string> MethodOwner;   // clang decl id -> owning record
     std::map<std::string, std::string> FieldOwner;    // clang decl id -> declaring record
+
+    /* One row per generated class, baked into AssetRegistry.bin once the run succeeds. */
+    std::vector<FRegistryAsset> RegistryRows;
 };
 
 bool FCompiler::Collect(std::string* Err)
@@ -809,6 +813,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
 
     BP.Finish();
     if (!P.Save(OutDir + "/" + R.CppName, Err)) return false;
+    RegistryRows.push_back({ PackageName, R.CppName + "_C", "BlueprintGeneratedClass" });
     printf("  %-14s -> %s.uasset  (%s %s)\n", R.CppName.c_str(), R.CppName.c_str(),
            bParentIsBlueprint ? "extends BP" : "extends native", R.Base.c_str());
     return true;
@@ -866,6 +871,15 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         ++Generated;
     }
     if (Generated == 0) { *Err = "the source declares no class deriving from a UE class"; return false; }
+
+    /*
+    The registry bake. A cooked package carries no asset-registry data of its own, so without
+    this the generated classes are invisible to the registry until something scans their path
+    for them - which today is the mod DLL, the dependency the pak is meant to shed.
+    */
+    if (!SaveAssetRegistry(RegistryRows, OutDir + "/AssetRegistry.bin", Err)) return false;
+    printf("  %-14s -> AssetRegistry.bin  (%d asset%s)\n", "registry",
+           int32(RegistryRows.size()), RegistryRows.size() == 1 ? "" : "s");
 
     remove(AstPath.c_str());        // kept only on failure; otherwise it would land in the pak
     return true;
