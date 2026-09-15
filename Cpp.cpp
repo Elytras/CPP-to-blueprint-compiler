@@ -160,6 +160,7 @@ struct FCallIR
     FIndex Fn;                          // Fn is set for a resolved UFunction; empty for intrinsics
     std::string Intrinsic;              // non-empty when this is an __NAME__ compiler intrinsic
     FIndex Extra;                       // Intrinsic: an auxiliary import (e.g. the donor script struct)
+    FIndex Extra2;                      // Intrinsic: a second auxiliary import (used by two-step puns)
     bool bScript = false;               // the callee is Blueprint bytecode, not a native function
     FIndex Context;                     // the CDO a static call runs against; null = call on self
     std::vector<FArgIR> Args;
@@ -271,6 +272,43 @@ bool EmitArg(FScript& S, const FArgIR& A, FIndex SelfExp, std::string* Err)
             bool bInnerOk = true;
             S.StructMember("Key", A.Sub->Extra,
                 [&](FScript& Ctx) { bInnerOk = EmitArg(Ctx, Inner, SelfExp, &SubErr); });
+            if (!bInnerOk) { if (Err) *Err = SubErr; return false; }
+            return true;
+        }
+        if (A.Sub->Intrinsic == "__Read64__")
+        {
+            /*
+            Emit `Context(StructMember(DataTable@0 on FDataTableRowHandle, arg),
+            InstanceVariable(Key on FScreenMessageString))`. The inner LocalVariable
+            for `arg` supplies &AddrSlot; StructMember reads those 8 bytes as UObject*;
+            EX_Context makes that the current object; EX_InstanceVariable(Key@0) reads
+            8 bytes at obj+0 = Addr as uint64. Net: RESULT = *(int64*)Addr.
+
+            EX_Context's skip counts MEMORY bytes and is measured for us by Context()
+            (the same mechanism CDO-context calls use elsewhere), so no manual patch.
+            */
+            if (A.Sub->Args.size() != 1)
+            {
+                if (Err) *Err = "__Read64__ takes exactly one argument (the address)";
+                return false;
+            }
+            const FArgIR& Inner = A.Sub->Args[0];
+            const FIndex DataTableStruct = A.Sub->Extra;
+            const FIndex ScreenMsgStruct = A.Sub->Extra2;
+            std::string SubErr;
+            bool bInnerOk = true;
+            S.Context(
+                [&](FScript& O)
+                {
+                    /* Pun the arg's 8 bytes as UObject*: read DataTable@0 off the arg slot. */
+                    O.StructMember("DataTable", DataTableStruct,
+                        [&](FScript& I) { bInnerOk = EmitArg(I, Inner, SelfExp, &SubErr); });
+                },
+                [&](FScript& C)
+                {
+                    /* Deref: read Key@0 off Stack.Object (our address), 8 bytes typed as uint64. */
+                    C.InstanceVariable("Key", ScreenMsgStruct);
+                });
             if (!bInnerOk) { if (Err) *Err = SubErr; return false; }
             return true;
         }
@@ -667,6 +705,35 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
             an eight-byte pad.
             */
             Out.Extra = BP.ScriptStruct("/Script/Engine", "ScreenMessageString");
+        }
+        else if (MethodName == "__Read64__")
+        {
+            /*
+            Arbitrary 8-byte deref: read *(int64*)Addr with two type-confusions and no
+            fabricated header.
+
+            Bytecode shape:
+                EX_Context(
+                    <object slot> = EX_StructMemberContext(
+                        DataTableRowHandle.DataTable @ 0x0,
+                        EX_LocalVariable(AddrParam)),
+                    <skip / rvalue-null / inner> = EX_InstanceVariable(
+                        FScreenMessageString.Key @ 0x0))
+
+            The struct-member step reads the Addr slot's 8 raw bytes as UObject* -
+            DataTable is an ObjectProperty at offset 0 of FDataTableRowHandle in
+            /Script/Engine (SDK-verified), and StructMemberContext copies its
+            ElementSize (8) bytes starting at (innerAddress + Offset_Internal) = the
+            slot's own storage. EX_Context then treats those bytes as Stack.Object
+            with no vtable / IsValid touched, and the inner EX_InstanceVariable does
+            `Stack.Object + Key.Offset_Internal` = Addr + 0 = Addr, and copies 8 bytes
+            typed as uint64 into ReturnValue.
+
+            Both donor properties live in the same /Script/Engine struct pair used
+            by AddrOf, so this costs one extra import row and no plugin dependency.
+            */
+            Out.Extra = BP.ScriptStruct("/Script/Engine", "DataTableRowHandle");
+            Out.Extra2 = BP.ScriptStruct("/Script/Engine", "ScreenMessageString");
         }
         else
         {
