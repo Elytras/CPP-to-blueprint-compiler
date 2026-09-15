@@ -55,6 +55,16 @@ FPropertyDef StringParam(const std::string& Name, uint64 ExtraFlags)
                          CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, Null() };
 }
 
+FPropertyDef NameParam(const std::string& Name, uint64 ExtraFlags)
+{
+    /*
+    An FName on the wire: two int32s (a comparison index and an instance number). ElementSize
+    is 8 - what the engine stores per instance, independent of any particular name's spelling.
+    */
+    return FPropertyDef{ "NameProperty", Name, RF_Public, 1, 8,
+                         CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, Null() };
+}
+
 FPropertyDef BoolParam(const std::string& Name, uint64 ExtraFlags)
 {
     return FPropertyDef{ "BoolProperty", Name, RF_Public, 1, 1,

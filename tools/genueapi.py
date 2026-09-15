@@ -93,8 +93,6 @@ KINDS = ("enum", "struct", "name", "container", "other")
 def classify(t):
     if t.startswith("struct ") or t.startswith("const struct "):
         return "struct"
-    if "FName" in t:
-        return "name"
     if t.startswith(("TArray<", "TMap<", "TSet<", "const TArray<", "const TMap<", "const TSet<")):
         return "container"
     if re.match(r"^(?:const\s+)?E[A-Z]\w*&?$", t):
@@ -102,13 +100,29 @@ def classify(t):
     return "other"
 
 
+# UE text types the compile surface carries as real structs (in Types.h): the generator emits
+# the aliased spelling rather than dropping the member or collapsing it to a C-string. Includes
+# the const-reference forms Dumper-7 spells for a by-const-ref parameter.
+TEXT_TYPES = {
+    "class FString":         "FString",
+    "const class FString&":  "FString",
+    "const class FString &": "FString",
+    "class FName":           "FName",
+    "const class FName&":    "FName",
+    "const class FName &":   "FName",
+    "FName":                 "FName",
+    "const FName&":          "FName",
+    "const FName &":         "FName",
+}
+
+
 def map_type(raw):
     """The C++ spelling to emit, or a KINDS reason when AssetGen could not compile such a value."""
     t = " ".join(raw.split())
     if t in SCALARS:
         return SCALARS[t]
-    if t in ("class FString", "const class FString&", "const class FString &"):
-        return "const char*"
+    if t in TEXT_TYPES:
+        return TEXT_TYPES[t]
     m = PTR.match(t)
     if m:
         return "class %s*" % m.group(1)
@@ -154,8 +168,8 @@ def parse_field(cur, m, skipped):
     raw, fname, bits = m.group(1), m.group(2), m.group(3)
     if fname.startswith(("Pad_", "BitPad_")):
         return                              # Dumper-7's layout filler, not a reflected property
-    if "FString" in raw or "FText" in raw:
-        return                              # a text property reads as a value we cannot yet carry
+    if "FText" in raw:
+        return                              # FText has no compile-time surface yet - dropped
     mapped = "bool" if bits else map_type(raw)
     if mapped in KINDS or mapped == "void":
         skipped[mapped if mapped in KINDS else "other"] += 1

@@ -54,7 +54,13 @@ std::string TypeOf(const Json& N)
     return It == N.end() ? std::string() : It->value("qualType", std::string());
 }
 
-/* Casts, parens and temporaries carry no meaning here; the operand underneath does. */
+/* Casts, parens and temporaries carry no meaning here; the operand underneath does.
+
+   CXXConstructExpr is stripped too - a Types.h wrapper like FString or FName has an implicit
+   constructor from a string literal, so `PostGameMessage("hi")` reaches the emitter as
+   CXXConstructExpr(FString, StringLiteral). Only the string literal matters for lowering; the
+   constructor is a compile-surface artifact. This does drop later constructor args if any, so
+   it is safe only because our wrappers take a single literal. */
 const Json* Strip(const Json* N)
 {
     while (N)
@@ -62,7 +68,8 @@ const Json* Strip(const Json* N)
         const std::string K = Kind(*N);
         if (K != "ImplicitCastExpr" && K != "CStyleCastExpr" && K != "ParenExpr"
             && K != "ConstantExpr" && K != "ExprWithCleanups"
-            && K != "CXXBindTemporaryExpr" && K != "MaterializeTemporaryExpr")
+            && K != "CXXBindTemporaryExpr" && K != "MaterializeTemporaryExpr"
+            && K != "CXXConstructExpr" && K != "CXXFunctionalCastExpr")
             return N;
         const Json* Inner = First(*N);
         if (!Inner) return N;
@@ -670,7 +677,11 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             if (Type == "int" || Type == "int32") { *Out = IntParam(PName, ExtraFlags); return true; }
             if (Type == "int64" || Type == "long long") { *Out = Int64Param(PName, ExtraFlags); return true; }
             if (Type == "bool") { *Out = BoolParam(PName, ExtraFlags); return true; }
-            if (Type == "const char *" || Type == "const char*") { *Out = StringParam(PName, ExtraFlags); return true; }
+            if (Type == "const char *" || Type == "const char*"
+                || Type == "FString" || Type == "struct FString")
+            { *Out = StringParam(PName, ExtraFlags); return true; }
+            if (Type == "FName" || Type == "struct FName")
+            { *Out = NameParam(PName, ExtraFlags); return true; }
 
             /* Object pointer, spelled `[const] class X *`. Resolve X against Records. */
             std::string ClassName;
