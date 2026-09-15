@@ -486,7 +486,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             const std::string Type = C["type"].value("qualType", std::string());
             const std::string PName = Name(C);
             if (Type == "float") Params.push_back(FloatParam(PName));
-            else if (Type == "int") Params.push_back(IntParam(PName));
+            else if (Type == "int" || Type == "int32") Params.push_back(IntParam(PName));
+            else if (Type == "int64" || Type == "long long") Params.push_back(Int64Param(PName));
             else if (Type == "bool") Params.push_back(BoolParam(PName));
             else { *Err = "TODO: unimplemented parameter type " + Type + " on " + Entry.first; bOk = false; }
         });

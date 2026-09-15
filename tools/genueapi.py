@@ -43,7 +43,26 @@ PTR = re.compile(r"^(?:const\s+)?class\s+(\w+)\s*\*$")
 FIELD = re.compile(r"^\t([A-Za-z_][\w:<>,\*& ]*?)\s+([A-Za-z_]\w*)\s*(:\s*\d+)?;\s*//")
 INCLUDE = re.compile(r'^#include\s+"(\w+)_classes\.hpp"')
 
-SCALARS = {"void": "void", "bool": "bool", "float": "float", "int32": "int", "int": "int"}
+SCALARS = {
+    "void":   "void",
+    "bool":   "bool",
+    "float":  "float",
+    "double": "double",
+    # Signed integers. int32 collapses to int for now, so a regen against this dump keeps the
+    # existing UeApi headers byte-identical; int64/int16/int8 emit their UE spellings, which
+    # Types.h aliases so clang accepts them.
+    "int":    "int",
+    "int8":   "int8",
+    "int16":  "int16",
+    "int32":  "int",
+    "int64":  "int64",
+    # Unsigned integers. Bitfields upstream still resolve to bool through parse_field; these are
+    # for plain byte/short/int/long members that Dumper-7 spells with a UE alias.
+    "uint8":  "uint8",
+    "uint16": "uint16",
+    "uint32": "uint32",
+    "uint64": "uint64",
+}
 
 """
 Why a type is out of reach. The blockers are not the same size, and not the ones they look like.
