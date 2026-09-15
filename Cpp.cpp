@@ -13,6 +13,7 @@ half-written asset to explain.
 */
 #include "Cpp.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
@@ -439,6 +440,40 @@ FIndex FCompiler::FindEvent(FBlueprintClass& BP, const std::string& FromRecord, 
 }
 
 /*
+A generated class's EClassFlags.
+
+A cooked class stores the full set, and almost all of it is INHERITED from the native parent
+(EClassFlags' CLASS_Inherit mask) rather than being a property of the Blueprint - so it cannot
+be one constant. Three shipped DRG classes were read to fix the values below:
+
+  BP_JetBootsBurnTrigger  : Actor               0x00840814
+  BP_ThornsComponent      : ThornsPerkComponent  0x00A40814  adds CLASS_DefaultToInstanced
+  STE_Thorns              : StatusEffect         0x00841810  no CLASS_Config; its
+                                                             CLASS_EditInlineNew is the parent's
+                                                             own and is editor-only
+
+Common to all three is CLASS_Parsed | CLASS_ReplicationDataIsSetUp | CLASS_CompiledFromBlueprint;
+everything else comes from the parent. Since a native parent's flags are not in the Dumper-7 dump,
+the ones a mod actually derives from are listed here and anything else gets the safe assumption:
+CLASS_HasInstancedReference over-declared costs an instancing pass that finds nothing, whereas
+omitting it on a parent that does have instanced subobjects stops them being instanced at all.
+A function library is the one case where the parent is known to have neither.
+*/
+uint32 ClassFlagsFor(const std::vector<std::string>& Ancestry)
+{
+    const uint32 Base = CLASS_Parsed | CLASS_ReplicationDataIsSetUp | CLASS_CompiledFromBlueprint;
+    auto Derives = [&](const char* Name) {
+        return std::find(Ancestry.begin(), Ancestry.end(), Name) != Ancestry.end();
+    };
+
+    if (Derives("Actor")) return Base | CLASS_Config | CLASS_HasInstancedReference;
+    if (Derives("ActorComponent"))
+        return Base | CLASS_Config | CLASS_HasInstancedReference | CLASS_DefaultToInstanced;
+    if (Derives("BlueprintFunctionLibrary")) return Base;
+    return Base | CLASS_HasInstancedReference;
+}
+
+/*
 The opcode that writes a value of this type. See FScript::Let - this is dictated by the
 destination, so it is read off the declared type rather than chosen.
 */
@@ -741,14 +776,17 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                        bParentIsBlueprint);
 
     /*
-    Only an actor gets the SimpleConstructionScript trio. The ancestry is walked in the mod's own
-    declarations rather than asked of the engine: the UeApi headers a mod includes declare each
-    native class with its base, so the chain from a mod class up to Actor is all in Records.
+    What the class inherits from decides two things on disk. The ancestry is walked in the mod's
+    own declarations rather than asked of the engine: the UeApi headers a mod includes declare
+    each native class with its base, so the chain up to Actor (or UObject) is all in Records.
     */
-    bool bIsActor = false;
-    for (const FRecord* A = &R; A && !A->Base.empty(); A = Find(A->Base))
-        if (A->UeName == "Actor") { bIsActor = true; break; }
+    std::vector<std::string> Ancestry;
+    for (const FRecord* A = &R; A; A = A->Base.empty() ? nullptr : Find(A->Base))
+        if (!A->UeName.empty()) Ancestry.push_back(A->UeName);
+
+    const bool bIsActor = std::find(Ancestry.begin(), Ancestry.end(), "Actor") != Ancestry.end();
     BP.SetIsActor(bIsActor);
+    BP.SetClassFlags(ClassFlagsFor(Ancestry));
 
     /*
     Turn a mod-source qualType into an FPropertyDef. `Where` names the location for the

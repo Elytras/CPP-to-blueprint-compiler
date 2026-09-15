@@ -63,6 +63,13 @@ public:
     void SetIsActor(bool bValue) { bIsActor = bValue; }
 
     /*
+    The class's EClassFlags, as they go on disk. A cooked class stores the FULL set, and most of
+    it is inherited from the native parent rather than chosen - so the caller supplies it and
+    this layer just writes it. See ClassFlagsFor() in Cpp.cpp for the measured values.
+    */
+    void SetClassFlags(uint32 Flags) { ClassFlags = Flags; }
+
+    /*
     Declares a function on the class. `Super` should be the engine UFunction being overridden
     for an event like ReceiveTick, or null for a new method.
 
@@ -99,6 +106,7 @@ private:
     std::string ParentPackage, ParentClass;
     bool bParentIsBlueprint = false;
     bool bIsActor = true;
+    uint32 ClassFlags = 0x00840814;     // an actor Blueprint's, the shape this generator started at
 
     std::unordered_map<std::string, int32> ImportCache;
 

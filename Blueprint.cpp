@@ -206,6 +206,7 @@ void FBlueprintClass::Finish()
             Class.CreateBeforeSer.push_back(V.Extra.V);
     const std::vector<FPropertyDef> ClassVars = Vars;
     const bool bActor = bIsActor;
+    const uint32 Flags = ClassFlags;
     Class.Serialize = [=](FArc& Ar) {
         if (bActor)
             Tag(Ar, "SimpleConstructionScript", "ObjectProperty",
@@ -228,7 +229,7 @@ void FBlueprintClass::Finish()
             Ar.Idx(Exp(RowFirstFunction + I));
         }
 
-        Ar.U32(0x00840814);                         // ClassFlags, as the cooker emits for a BPGC
+        Ar.U32(Flags);                              // ClassFlags, the full cooked set
         Ar.Idx(ObjectClass);                        // ClassWithin
         Ar.Name("Engine");                          // ClassConfigName
         Ar.I32(0);                                  // implemented interfaces
