@@ -8,7 +8,7 @@ namespace
 {
 constexpr int32 kDiskObjectRef = 4;
 constexpr int32 kMemObjectRef = 8;
-constexpr int32 kFNameSize = 8;
+constexpr int32 kFNameSize = 12;    // sizeof(FScriptName): the in-memory bytecode form of a name (8 on disk)
 }   // namespace
 
 /* ---- properties ---- */
