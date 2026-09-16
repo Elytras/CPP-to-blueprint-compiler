@@ -147,6 +147,16 @@ void Tag(FArc& Ar, const std::string& Name, const std::string& Type,
         Ar.Name(StructName);
         for (int32 I = 0; I < 4; ++I) Ar.U32(0);  // StructGuid, zero for engine structs
     }
+    else if (Type == "ByteProperty" || Type == "EnumProperty")
+        Ar.Name(StructName.empty() ? "None" : StructName);          // EnumName
+    else if (Type == "ArrayProperty" || Type == "SetProperty")
+        Ar.Name(StructName);                                        // InnerType
+    else if (Type == "MapProperty")
+    {
+        const size_t Comma = StructName.find(',');                  // "InnerType,ValueType"
+        Ar.Name(StructName.substr(0, Comma));
+        Ar.Name(StructName.substr(Comma + 1));
+    }
     Ar.U8(0);                                     // HasPropertyGuid
     Ar.Append(Scratch);
 }

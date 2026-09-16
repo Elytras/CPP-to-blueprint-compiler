@@ -17,17 +17,17 @@ PTR = re.compile(r"^(?:const\s+)?class\s+((?:\w+::)?\w+)\s*\*$")
 TPL = re.compile(r"^(?:const\s+)?(TSubclassOf|TSoftObjectPtr|TSoftClassPtr)<class\s+((?:\w+::)?\w+)>\s*&?$")
 
 
-def class_ref(t):
-    """The class a `class X*` or `TWrapper<class X>` spelling names, or None."""
-    m = PTR.match(t) or TPL.match(t)
-    return m.group(m.lastindex) if m else None
-TPL = re.compile(r"^(?:const\s+)?(TSubclassOf|TSoftObjectPtr|TSoftClassPtr)<class\s+((?:\w+::)?\w+)>\s*&?$")
+CLASS_WORD = re.compile(r"class\s+((?:\w+::)?\w+)")
+CONTAINER = re.compile(r"^(?:const\s+)?(TArray|TSet|TMap)<(.*)>\s*&?$")
 
 
-def class_ref(t):
-    """The class a `class X*` or `TWrapper<class X>` spelling names, or None."""
-    m = PTR.match(t) or TPL.match(t)
-    return m.group(m.lastindex) if m else None
+def class_refs(t):
+    """Every class a spelling names: `class X*`, `TWrapper<class X>`, `TArray<class X*>`, ..."""
+    return CLASS_WORD.findall(t)
+
+
+def split_args(text):
+    return [a.strip() for a in split_params(text)]
 FIELD = re.compile(r"^\t([A-Za-z_][\w:<>,\*& ]*?)\s+([A-Za-z_]\w*)\s*(:\s*\d+)?;\s*//")
 INCLUDE = re.compile(r'^#include\s+"(\w+)_classes\.hpp"')
 
@@ -81,7 +81,7 @@ TEXT_TYPES = {
 
 STRUCTS = {}     # cpp name -> Struct, filled by parse_structs before any class header is mapped
 ENUMS = {}       # cpp name -> Enum
-OUT_PTR = re.compile(r"^((?:struct\s+)?[A-Za-z_]\w*)\s*\*$")     # Dumper-7 spells a non-object out-parm as T*
+OUT_PTR = re.compile(r"^((?:struct\s+)?[A-Za-z_][\w<>, \*:]*?)\s*\*$")     # Dumper-7 spells a non-object out-parm as T*
 STRUCT_REF = re.compile(r"^(?:const\s+)?struct\s+(F\w+)\s*&?$")
 ENUM_REF = re.compile(r"^(?:const\s+)?(?:TEnumAsByte<)?(E\w+)>?\s*&?$")
 
@@ -89,16 +89,24 @@ ENUM_REF = re.compile(r"^(?:const\s+)?(?:TEnumAsByte<)?(E\w+)>?\s*&?$")
 def map_type(raw):
     """The C++ spelling to emit, or a KINDS reason when AssetGen cannot compile such a value."""
     t = " ".join(raw.split())
-    if t in SCALARS:
-        return SCALARS[t]
-    if t in TEXT_TYPES:
-        return TEXT_TYPES[t]
+    base = t[6:] if t.startswith("const ") else t          # `const int32&`: a by-value scalar to the caller
+    base = base[:-1].rstrip() if base.endswith("&") else base
+    if base in SCALARS:
+        return SCALARS[base]
+    if base in TEXT_TYPES:
+        return TEXT_TYPES[base]
     m = PTR.match(t)
     if m:
         return "class %s*" % m.group(1)
     m = TPL.match(t)
     if m:
         return "%s<class %s>" % (m.group(1), m.group(2))
+    m = CONTAINER.match(t)
+    if m:
+        args = [map_type(a) for a in split_args(m.group(2))]
+        if any(a in KINDS or a == "void" or a.endswith("&") for a in args) or len(args) != (2 if m.group(1) == "TMap" else 1):
+            return "container"
+        return "%s<%s>" % (m.group(1), ", ".join(args))
     m = OUT_PTR.match(t)
     if m:
         inner = map_type(m.group(1))
@@ -217,7 +225,10 @@ def struct_align(st):
 def struct_deps(st):
     """Struct names this one must be declared after."""
     out = [st.base] if st.base in STRUCTS else []
-    out += [t for t, _ in st.fields if t in STRUCTS and t != st.cpp]
+    for t, _ in st.fields:
+        for word in re.findall(r"\bF\w+", t):          # the struct itself, or a container's element / key / value
+            if word in STRUCTS and word != st.cpp:
+                out.append(word)
     return out
 
 
@@ -290,8 +301,9 @@ def write_operators(classes, out_dir):
 def write_types(out_dir):
     rows = ['{', '  "enums": {']
     ens = sorted(ENUMS.values(), key=lambda e: e.cpp)
-    rows += ['    "%s": {"package": "/Script/%s", "name": "%s", "underlying": "%s"}%s'
-             % (e.cpp, e.pkg, e.cpp, e.underlying, "," if i + 1 < len(ens) else "") for i, e in enumerate(ens)]
+    rows += ['    "%s": {"package": "/Script/%s", "name": "%s", "underlying": "%s", "first": "%s"}%s'
+             % (e.cpp, e.pkg, e.cpp, e.underlying, e.values[0][0] if e.values else "", "," if i + 1 < len(ens) else "")
+             for i, e in enumerate(ens)]
     rows += ['  },', '  "structs": {']
     sts = sorted(STRUCTS.values(), key=lambda t: t.cpp)
     for i, st in enumerate(sts):
@@ -582,11 +594,10 @@ def main():
     write_types(out_dir)
 
     def rewrite(ctype):
-        target = by_name.get(class_ref(ctype) or "")
-        if not target:
-            return ctype
-        m = TPL.match(ctype)
-        return "%s<class %s>" % (m.group(1), target.emit) if m else "class %s*" % target.emit
+        def one(m):
+            target = by_name.get(m.group(1))
+            return "class %s" % target.emit if target else m.group(0)
+        return CLASS_WORD.sub(one, ctype)
 
     funcs, fields, aliased = 0, 0, 0
     for pkg, members in sorted(by_pkg.items()):
@@ -625,16 +636,14 @@ def main():
                     continue
                 body.append("    %s %s;" % (rewrite(ftype), fname))
                 fields += 1
-                if class_ref(ftype):
-                    referenced.add(class_ref(ftype))
+                referenced.update(class_refs(ftype))
             for is_static, ret, fname, params in k.funcs:
                 args = ", ".join("%s %s" % (rewrite(t), n) for t, n in params)
                 body.append("    %s%s %s(%s);"
                             % ("static " if is_static else "", rewrite(ret), fname, args))
                 funcs += 1
                 for t in [ret] + [t for t, _ in params]:
-                    if class_ref(t):
-                        referenced.add(class_ref(t))
+                    referenced.update(class_refs(t))
             body.append("};\n")
         if ns_open:
             body.append("}   // namespace %s\n" % ns_open)

@@ -10,7 +10,7 @@ namespace
 {
 constexpr int32 kDiskObjectRef = 4;
 constexpr int32 kMemObjectRef = 8;
-constexpr int32 kFNameSize = 8;
+constexpr int32 kFNameSize = 12;    // sizeof(FScriptName): the in-memory bytecode form of a name (8 on disk)
 }   // namespace
 
 /* ---- properties ---- */
@@ -70,6 +70,40 @@ FPropertyDef ObjectParam(const std::string& Name, FIndex Class, uint64 ExtraFlag
                          CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, Class };
 }
 
+/* Container elements carry no parm flags of their own; the element property is named like its container. */
+FPropertyDef Element(const FPropertyDef& In)
+{
+    FPropertyDef E = In;
+    E.PropertyFlags &= ~uint64(CPF_Parm | CPF_OutParm | CPF_ReferenceParm | CPF_BlueprintVisible
+                               | CPF_BlueprintReadOnly | CPF_Edit | CPF_DisableEditOnInstance);
+    return E;
+}
+
+FPropertyDef ArrayParam(const std::string& Name, const FPropertyDef& Inner, uint64 ExtraFlags)
+{
+    FPropertyDef P{ "ArrayProperty", Name, RF_Public, 1, 16,
+                    CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, FIndex(), Inner.Type };
+    P.Inner = std::make_shared<FPropertyDef>(Element(Inner));
+    return P;
+}
+
+FPropertyDef SetParam(const std::string& Name, const FPropertyDef& Elem, uint64 ExtraFlags)
+{
+    FPropertyDef P{ "SetProperty", Name, RF_Public, 1, 80,
+                    CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, FIndex(), Elem.Type };
+    P.Inner = std::make_shared<FPropertyDef>(Element(Elem));
+    return P;
+}
+
+FPropertyDef MapParam(const std::string& Name, const FPropertyDef& Key, const FPropertyDef& Value, uint64 ExtraFlags)
+{
+    FPropertyDef P{ "MapProperty", Name, RF_Public, 1, 80,
+                    CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, FIndex(), Key.Type + "," + Value.Type };
+    P.Inner = std::make_shared<FPropertyDef>(Element(Key));
+    P.Value = std::make_shared<FPropertyDef>(Element(Value));
+    return P;
+}
+
 FPropertyDef StructParam(const std::string& Name, FIndex Struct, const std::string& StructName,
                          int32 Size, uint64 ExtraFlags)
 {
@@ -85,7 +119,20 @@ void WriteZeroValueTag(FArc& Ar, const FPropertyDef& P)
             || P.Type == "ObjectProperty")
             V.I32(0);
         else if (P.Type == "Int64Property") V.I64(0);
-        else if (P.Type == "ByteProperty") V.U8(0);
+        else if (P.Type == "ByteProperty") { if (P.StructName.empty()) V.U8(0); else V.Name(P.EnumZero); }   // an enum byte is its enumerator's name
+        else if (P.Type == "SetProperty" || P.Type == "MapProperty") { V.I32(0); V.I32(0); }   // removed count, count
+        else if (P.Type == "ArrayProperty")
+        {
+            V.I32(0);
+            /* An array of structs carries an inner tag after the count, even when empty. */
+            if (P.Inner && P.Inner->Type == "StructProperty")
+            {
+                V.Name(P.Name); V.Name("StructProperty"); V.I32(0); V.I32(0);
+                V.Name(P.Inner->StructName);
+                for (int32 I = 0; I < 4; ++I) V.U32(0);
+                V.U8(0);
+            }
+        }
         else if (P.Type == "NameProperty") V.Name("None");
         else if (P.Type == "TextProperty") { V.U32(0); V.U8(0xFF); V.I32(0); }   // flags, ETextHistoryType::None, no invariant string
         else if (P.Type == "StructProperty")
@@ -134,6 +181,13 @@ void WriteProperty(FArc& Ar, const FPropertyDef& P)
     }
     else if (P.Type == "ByteProperty")
         Ar.Idx(P.Extra);                // Enum
+    else if (P.Type == "ArrayProperty" || P.Type == "SetProperty")
+        WriteProperty(Ar, *P.Inner);    // SerializeSingleField: type name then the field
+    else if (P.Type == "MapProperty")
+    {
+        WriteProperty(Ar, *P.Inner);    // KeyProp
+        WriteProperty(Ar, *P.Value);    // ValueProp
+    }
     // TODO: unimplemented tails - ArrayProperty (Inner), MapProperty, SetProperty,
     // EnumProperty (Enum + UnderlyingProp), DelegateProperty (SignatureFunction).
 }
@@ -270,9 +324,14 @@ void FScript::ObjectConst(FIndex Object)
 
 void FScript::FieldPath(const std::string& PropertyName, FIndex Owner)
 {
+    FieldPath(std::vector<std::string>{ PropertyName }, Owner);
+}
+
+void FScript::FieldPath(const std::vector<std::string>& Path, FIndex Owner)
+{
     // On disk: segment count, segments, owning object. In memory: one pointer.
-    Ar.I32(1);
-    Ar.Name(PropertyName);
+    Ar.I32(int32(Path.size()));
+    for (const std::string& Segment : Path) Ar.Name(Segment);
     Ar.Idx(Owner);
     Memory += kMemObjectRef;
 }
@@ -314,9 +373,16 @@ void FScript::Let(EExprToken LetOp, const std::string& PropertyName, FIndex Owne
                   const std::function<void(FScript&)>& Var,
                   const std::function<void(FScript&)>& Value)
 {
+    LetPath(LetOp, { PropertyName }, Owner, Var, Value);
+}
+
+void FScript::LetPath(EExprToken LetOp, const std::vector<std::string>& Path, FIndex Owner,
+                      const std::function<void(FScript&)>& Var,
+                      const std::function<void(FScript&)>& Value)
+{
     Op(LetOp);
     if (LetOp == EX_Let)
-        FieldPath(PropertyName, Owner);
+        FieldPath(Path, Owner);
     Var(*this);
     Value(*this);
 }

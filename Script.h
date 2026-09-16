@@ -1,6 +1,7 @@
 ﻿#pragma once
 #include <string>
 #include <vector>
+#include <memory>
 
 #include "Package.h"
 #include "UeEnums.h"
@@ -17,8 +18,11 @@ struct FPropertyDef
     int32 ElementSize = 0;
     uint64 PropertyFlags = 0;
     FIndex Extra;                       // ObjectProperty / SoftObjectProperty: PropertyClass. StructProperty: Struct. ByteProperty: Enum.
-    std::string StructName;             // StructProperty: the struct's name, for the default-value tag
+    std::string StructName;             // StructProperty: the struct; ByteProperty: the enum; Array/Set/Map: inner type(s). For the default-value tag.
     FIndex Extra2;                      // ClassProperty / SoftClassProperty: MetaClass. Last, so the aggregate inits above it still line up.
+    std::string EnumZero;               // ByteProperty with an enum: the enumerator the zero value is written as
+    std::shared_ptr<FPropertyDef> Inner;    // ArrayProperty / SetProperty: element; MapProperty: key
+    std::shared_ptr<FPropertyDef> Value;    // MapProperty: value
 };
 
 FPropertyDef FloatParam(const std::string& Name, uint64 ExtraFlags = 0);
@@ -33,6 +37,9 @@ FPropertyDef ObjectParam(const std::string& Name, FIndex Class, uint64 ExtraFlag
 FPropertyDef ClassParam(const std::string& Name, FIndex ClassClass, FIndex MetaClass, uint64 ExtraFlags = 0);
 FPropertyDef SoftObjectParam(const std::string& Name, FIndex Class, uint64 ExtraFlags = 0);
 FPropertyDef SoftClassParam(const std::string& Name, FIndex ClassClass, FIndex MetaClass, uint64 ExtraFlags = 0);
+FPropertyDef ArrayParam(const std::string& Name, const FPropertyDef& Inner, uint64 ExtraFlags = 0);
+FPropertyDef SetParam(const std::string& Name, const FPropertyDef& Element, uint64 ExtraFlags = 0);
+FPropertyDef MapParam(const std::string& Name, const FPropertyDef& Key, const FPropertyDef& Value, uint64 ExtraFlags = 0);
 FPropertyDef StructParam(const std::string& Name, FIndex Struct, const std::string& StructName,
                          int32 Size, uint64 ExtraFlags = 0);
 
@@ -82,6 +89,7 @@ public:
     void PatchJumpTarget(int32 StorageOffset, int32 MemTarget);
 
     void FieldPath(const std::string& PropertyName, FIndex Owner);
+    void FieldPath(const std::vector<std::string>& Path, FIndex Owner);     // innermost first: {"Items", "Items"} is an array's element
     void NullFieldPath();
     void LocalVariable(const std::string& PropertyName, FIndex Owner);
     void LocalOutVariable(const std::string& PropertyName, FIndex Owner);
@@ -95,6 +103,9 @@ public:
     void Let(EExprToken LetOp, const std::string& PropertyName, FIndex Owner,
              const std::function<void(FScript&)>& Var,
              const std::function<void(FScript&)>& Value);
+    void LetPath(EExprToken LetOp, const std::vector<std::string>& Path, FIndex Owner,
+                 const std::function<void(FScript&)>& Var,
+                 const std::function<void(FScript&)>& Value);
 
     /* The skip count is MEMORY bytes of ContextExpr, measured here. */
     void Context(const std::function<void(FScript&)>& ObjectExpr,
