@@ -147,6 +147,8 @@ void Tag(FArc& Ar, const std::string& Name, const std::string& Type,
         Ar.Name(StructName);
         for (int32 I = 0; I < 4; ++I) Ar.U32(0);  // StructGuid, zero for engine structs
     }
+    else if (Type == "ByteProperty" || Type == "EnumProperty")
+        Ar.Name(StructName.empty() ? std::string("None") : StructName);   // EnumName
     Ar.U8(0);                                     // HasPropertyGuid
     Ar.Append(Scratch);
 }

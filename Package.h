@@ -49,7 +49,8 @@ private:
     FPackage* Pkg = nullptr;
 };
 
-/* One FPropertyTag + value. Value runs into a scratch archive first so the tag's Size is measured. StructName only for StructProperty. */
+/* One FPropertyTag + value. Value runs into a scratch archive first so the tag's Size is measured.
+   StructName is the StructProperty's struct, or the ByteProperty/EnumProperty's enum (empty = None). */
 void Tag(FArc& Ar, const std::string& Name, const std::string& Type,
          const std::function<void(FArc&)>& Value, const std::string& StructName = "");
 
