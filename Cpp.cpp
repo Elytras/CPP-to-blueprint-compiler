@@ -157,6 +157,14 @@ bool FindLiteral(const Json& N, std::string& Out)
 
 bool IsStaticDecl(const Json& Decl) { return Decl.value("storageClass", std::string()) == "static"; }
 
+/* UE_PURE: clang keeps [[gnu::pure]] as a PureAttr child, and copies it onto an out-of-line definition. */
+bool IsPureDecl(const Json& Decl)
+{
+    bool bPure = false;
+    ForEach(Decl, [&](const Json& C) { bPure = bPure || Kind(C) == "PureAttr"; });
+    return bPure;
+}
+
 struct FRecord
 {
     std::string CppName;
@@ -1909,9 +1917,11 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             : FIndex{};
 
         /* A static left FUNC_Event would be treated by the loader as an overridable entry point. */
-        const uint32 Flags = IsStaticDecl(Decl)
+        uint32 Flags = IsStaticDecl(Decl)
             ? uint32(FUNC_Static | FUNC_BlueprintCallable | FUNC_Public | FUNC_Final)
-            : 0u;
+            : FFunctionDef().FunctionFlags;
+        /* All 7229 BlueprintPure functions in the DRG dump are BlueprintCallable too. */
+        if (IsPureDecl(M)) Flags |= FUNC_BlueprintPure | FUNC_BlueprintCallable;
 
         BP.AddFunction(Entry.first, FindEvent(BP, R.CppName, Entry.first), Params,
                        [Stmts, bEndsWithReturn, bScratchNeeded, DerefStruct](FScript& S, FIndex SelfExp) {
