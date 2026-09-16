@@ -315,6 +315,19 @@ bool EmitArg(FScript& S, const FArgIR& A, FIndex SelfExp, std::string* Err)
                 [&](FScript& I) { I.IntZero(); });
             return true;
         }
+        if (A.Sub->Intrinsic == "__RefAtInline__")
+        {
+            const FIndex View = A.Sub->Extra;
+            const std::string Scratch = A.S;
+            S.ArrayGetByRef(
+                [&](FScript& O)
+                {
+                    O.StructMember("NameHashes", View,
+                        [&](FScript& I) { I.LocalVariable(Scratch, SelfExp); });
+                },
+                [&](FScript& I) { I.IntZero(); });
+            return true;
+        }
         if (!A.Sub->Intrinsic.empty())
         {
             if (Err) *Err = "TODO: unimplemented intrinsic " + A.Sub->Intrinsic;
@@ -464,6 +477,8 @@ private:
     bool HoistReadCall(FArgIR& A, const FReadViewSpec& V, FBlueprintClass& BP,
                        std::vector<FPropertyDef>& Locals,
                        std::vector<FStmtIR>& OutPre, std::string* Err);
+    bool HoistRefAt(FArgIR& A, FBlueprintClass& BP, std::vector<FPropertyDef>& Locals,
+                    std::vector<FStmtIR>& OutPre, std::string* Err);
 
     FIndex FindEvent(FBlueprintClass& BP, const std::string& FromRecord, const std::string& Method);
 
@@ -1116,6 +1131,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
             /* Donor: any struct with an 8-byte scalar at offset 0. FDateTime.Ticks is not reflected in shipping. */
             Out.Extra = BP.ScriptStruct("/Script/Engine", "ScreenMessageString");
         }
+        else if (MethodName == "__RefAt__") {}   // resolved by HoistRefAt
         else if (FindReadView(MethodName))
         {
             /* Placeholder: the hoist pass rewrites each __Read*__ call into two statements
@@ -1466,6 +1482,56 @@ bool FCompiler::HoistReadsInArg(FArgIR& A, FBlueprintClass& BP,
 
     if (const FReadViewSpec* V = FindReadView(A.Sub->Intrinsic))
         return HoistReadCall(A, *V, BP, Locals, OutPre, Err);
+    if (A.Sub->Intrinsic == "__RefAt__")
+        return HoistRefAt(A, BP, Locals, OutPre, Err);
+    return true;
+}
+
+/* __RefAt__(Addr) stays an inline ArrayGetByRef, so a CustomThunk stepping it with a null
+   result sees MostRecentPropertyAddress == Addr. A temp would hand it the temp's address
+   instead. Each use gets its own FDeref scratch, so later reads in the statement can't
+   overwrite its Data before the call runs. */
+bool FCompiler::HoistRefAt(FArgIR& A, FBlueprintClass& BP, std::vector<FPropertyDef>& Locals,
+                           std::vector<FStmtIR>& OutPre, std::string* Err)
+{
+    if (A.Sub->Args.size() != 1)
+    {
+        *Err = "__RefAt__ takes exactly one argument (the address)";
+        return false;
+    }
+    const FIndex DerefStruct = BP.ScriptStruct(ModPackage + "/FDeref", "FDeref");
+    const std::string Scratch = "__RefScratch" + std::to_string(ReadTmpCounter++) + "__";
+    FPropertyDef PD = StructParam(Scratch, DerefStruct, "FDeref", 16, 0);
+    PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+    Locals.push_back(PD);
+
+    auto Assign = [&](const char* Field, FArgIR Value)
+    {
+        FStmtIR St;
+        St.K = FStmtIR::Assign;
+        St.Var.K = FArgIR::Member;
+        St.Var.S = Field;
+        St.Var.Owner = DerefStruct;
+        St.Var.LetOp = EX_Let;
+        St.Var.Base = std::make_shared<FArgIR>();
+        St.Var.Base->K = FArgIR::Local;
+        St.Var.Base->S = Scratch;
+        St.Value = std::move(Value);
+        OutPre.push_back(std::move(St));
+    };
+    FArgIR One;
+    One.K = FArgIR::Int;
+    One.I = 1;
+    Assign("Num", One);
+    Assign("Data", std::move(A.Sub->Args[0]));
+
+    const FIndex View = BP.ScriptStruct("/Script/Engine", "MaterialCachedParameterEntry");
+    A = FArgIR{};
+    A.K = FArgIR::Call;
+    A.S = Scratch;
+    A.Sub = std::make_shared<FCallIR>();
+    A.Sub->Intrinsic = "__RefAtInline__";
+    A.Sub->Extra = View;
     return true;
 }
 
