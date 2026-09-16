@@ -150,7 +150,11 @@ def main():
         staged.append((name, stage_content, package))
 
         stale = force or not assets or max(newest(sources), toolchain_time) > oldest(assets)
-        if not stale:
+        pak = os.path.join(bp, "out", name + "_P.pak")
+        # After a --no-pak run the assets are fresh and the pak is not; judged on the assets alone the
+        # old pak would ship, and a mod calling a function it lacks crashes on the null UFunction.
+        unpacked = not no_pak and newest(assets) > newest([pak])
+        if not stale and not unpacked:
             print("%-16s up to date" % name)
             skipped.append(name)
             continue
@@ -159,7 +163,7 @@ def main():
             os.makedirs(stage_content)
         ok = True
         for source in sources:
-            if not source.endswith(".cpp"):
+            if not stale or not source.endswith(".cpp"):
                 continue
             proc = subprocess.run([assetgen, "compile", source, ue_api, stage_content])
             if proc.returncode != 0:
@@ -170,12 +174,12 @@ def main():
             failed.append(name)
             continue
 
-        print("%-16s compiled -> %s" % (name, package))
-        built.append(name)
+        if stale:
+            print("%-16s compiled -> %s" % (name, package))
+            built.append(name)
 
         if no_pak:
             continue
-        pak = os.path.join(bp, "out", name + "_P.pak")
         if not os.path.isdir(os.path.dirname(pak)):
             os.makedirs(os.path.dirname(pak))
         if run_unrealpak(stage_fsd, pak):
