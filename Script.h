@@ -8,6 +8,18 @@
 
 namespace Uasset
 {
+bool IsAscii(const std::string& S);
+std::u16string Utf8To16(const std::string& Utf8);
+
+/* A member's literal initializer. None = the type's zero value. */
+struct FDefaultValue
+{
+    enum EKind { None, Int, Float, Bool, Str } K = None;
+    int64 I = 0;                        // Int, Bool
+    double F = 0.0;                     // Float
+    std::string S;                      // Str: UTF-8, for StrProperty / NameProperty / TextProperty
+};
+
 /* One ChildProperties entry. ElementSize must equal the type's runtime size; the engine lays the struct out from it. */
 struct FPropertyDef
 {
@@ -21,6 +33,7 @@ struct FPropertyDef
     std::string StructName;             // StructProperty: the struct's name, for the default-value tag
     FIndex Extra2;                      // ClassProperty: MetaClass (the subclass filter). Trailing so 7-/8-arg aggregate inits still land at Extra.
     std::shared_ptr<FPropertyDef> Inner; // ArrayProperty only: FArrayProperty::Serialize writes Inner inline via SerializeSingleField.
+    FDefaultValue Default;              // written into the CDO / struct default instance
 };
 
 FPropertyDef FloatParam(const std::string& Name, uint64 ExtraFlags = 0);
@@ -42,8 +55,8 @@ FPropertyDef ArrayParam(const std::string& Name, FPropertyDef Inner, uint64 Extr
 
 void WriteProperty(FArc& Ar, const FPropertyDef& P);
 
-/* The property as a tagged-property entry holding its zero value. */
-void WriteZeroValueTag(FArc& Ar, const FPropertyDef& P);
+/* The property as a tagged-property entry holding P.Default (its zero value when unset). */
+void WriteDefaultTag(FArc& Ar, const FPropertyDef& P);
 
 /*
 Kismet bytecode buffer. MemorySize and StorageSize differ by design: a property reference is

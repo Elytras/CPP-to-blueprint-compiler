@@ -1,5 +1,6 @@
 ﻿#include "Script.h"
 
+#include <algorithm>
 #include <cstring>
 
 namespace Uasset
@@ -94,9 +95,50 @@ FPropertyDef ArrayParam(const std::string& Name, FPropertyDef Inner, uint64 Extr
     return Def;
 }
 
-void WriteZeroValueTag(FArc& Ar, const FPropertyDef& P)
+bool IsAscii(const std::string& S)
 {
-    if (P.Type == "BoolProperty") { TagBool(Ar, P.Name, false); return; }
+    return std::all_of(S.begin(), S.end(), [](char C) { return uint8(C) < 0x80; });
+}
+
+std::u16string Utf8To16(const std::string& Utf8)
+{
+    std::u16string W;
+    for (size_t I = 0; I < Utf8.size();)
+    {
+        const uint8 C = uint8(Utf8[I]);
+        const int32 Extra = C >= 0xF0 ? 3 : C >= 0xE0 ? 2 : C >= 0xC0 ? 1 : 0;
+        uint32 Cp = Extra == 0 ? C : C & (0x3F >> Extra);
+        for (int32 J = 1; J <= Extra && I + J < Utf8.size(); ++J) Cp = (Cp << 6) | (uint8(Utf8[I + J]) & 0x3F);
+        I += size_t(Extra) + 1;
+        if (Cp >= 0x10000)
+        {
+            Cp -= 0x10000;
+            W.push_back(char16_t(0xD800 + (Cp >> 10)));
+            W.push_back(char16_t(0xDC00 + (Cp & 0x3FF)));
+        }
+        else W.push_back(char16_t(Cp));
+    }
+    return W;
+}
+
+namespace
+{
+/* FString's operator<<: empty is length 0, ANSI a positive length, UTF-16 a negative one (both count the null). */
+void WriteFStringValue(FArc& Ar, const std::string& Utf8)
+{
+    if (Utf8.empty()) { Ar.I32(0); return; }
+    if (IsAscii(Utf8)) { Ar.Str(Utf8); return; }
+    const std::u16string W = Utf8To16(Utf8);
+    Ar.I32(-int32(W.size() + 1));
+    Ar.Raw(W.data(), W.size() * 2);
+    Ar.U16(0);
+}
+}   // namespace
+
+void WriteDefaultTag(FArc& Ar, const FPropertyDef& P)
+{
+    const FDefaultValue& D = P.Default;
+    if (P.Type == "BoolProperty") { TagBool(Ar, P.Name, D.K != FDefaultValue::None && D.I != 0); return; }
     if (P.Type == "ArrayProperty")
     {
         // ArrayProperty has an extra `FName InnerType` in its tag header, so it can't share the
@@ -110,14 +152,25 @@ void WriteZeroValueTag(FArc& Ar, const FPropertyDef& P)
         Ar.I32(0);                          // Num
         return;
     }
+    const bool bSet = D.K != FDefaultValue::None;
     Tag(Ar, P.Name, P.Type, [&](FArc& V) {
-        if (P.Type == "IntProperty" || P.Type == "FloatProperty" || P.Type == "StrProperty"
-            || P.Type == "ObjectProperty" || P.Type == "ClassProperty")
-            V.I32(0);
-        else if (P.Type == "Int64Property") V.I64(0);
-        else if (P.Type == "ByteProperty") V.U8(0);
-        else if (P.Type == "NameProperty") V.Name("None");
-        else if (P.Type == "TextProperty") { V.U32(0); V.U8(0xFF); V.I32(0); }   // flags, ETextHistoryType::None, no invariant string
+        if (P.Type == "IntProperty") V.I32(int32(D.I));
+        else if (P.Type == "FloatProperty") { const float F = float(D.F); V.Raw(&F, 4); }
+        else if (P.Type == "Int64Property") V.I64(D.I);
+        else if (P.Type == "ByteProperty") V.U8(uint8(D.I));
+        else if (P.Type == "StrProperty") WriteFStringValue(V, D.S);
+        else if (P.Type == "NameProperty") V.Name(bSet ? D.S : std::string("None"));
+        else if (P.Type == "TextProperty")
+        {
+            /* A literal is a culture-invariant text, like EX_TextConst's LiteralString: Flags,
+               ETextHistoryType::None, bHasCultureInvariantString, the string. */
+            const bool bText = bSet && !D.S.empty();
+            V.U32(bText ? 2 : 0);           // ETextFlag::CultureInvariant
+            V.U8(0xFF);
+            V.I32(bText ? 1 : 0);
+            if (bText) WriteFStringValue(V, D.S);
+        }
+        else if (P.Type == "ObjectProperty" || P.Type == "ClassProperty") V.I32(0);
         else if (P.Type == "StructProperty") TagEnd(V);
     }, P.StructName);
 }
@@ -275,12 +328,7 @@ void FScript::TextConst(const std::string& Value, bool bWide)
     Op(EX_TextConst);
     Ar.U8(3);                           // EBlueprintTextLiteralType::LiteralString
     Memory += 1;
-    if (bWide)
-    {
-        std::u16string W;
-        for (unsigned char C : Value) W.push_back(char16_t(C));
-        UnicodeStringConst(W);
-    }
+    if (bWide || !IsAscii(Value)) UnicodeStringConst(Utf8To16(Value));
     else StringConst(Value);
 }
 
