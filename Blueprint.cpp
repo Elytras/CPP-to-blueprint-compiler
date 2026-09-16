@@ -71,9 +71,14 @@ FIndex FBlueprintClass::ScriptStruct(const std::string& PackageName, const std::
     auto It = ImportCache.find(Key);
     if (It != ImportCache.end()) return Imp(It->second);
 
+    // A /Game struct is a UserDefinedStruct; its bytecode references need it created first.
+    const bool bBlueprint = PackageName.compare(0, 6, "/Game/") == 0;
     const FIndex Outer = PackageImport(PackageName);
-    const int32 Row = P.AddImport({ "/Script/CoreUObject", "ScriptStruct", Outer, StructName });
+    const int32 Row = P.AddImport({ bBlueprint ? "/Script/Engine" : "/Script/CoreUObject",
+                                    bBlueprint ? "UserDefinedStruct" : "ScriptStruct",
+                                    Outer, StructName });
     ImportCache.emplace(Key, Row);
+    if (bBlueprint) CallImports.push_back(Imp(Row).V);
     return Imp(Row);
 }
 
@@ -232,6 +237,9 @@ void FBlueprintClass::Finish()
         std::vector<int32> Refs = CallImports;
         const FIndex SelfExp = Exp(RowFirstFunction + int32(I));
         Refs.push_back(SelfExp.V);
+        for (const FPropertyDef& Prop : Functions[I].Def.Params)
+            if (Prop.Extra.V != 0 && std::find(Refs.begin(), Refs.end(), Prop.Extra.V) == Refs.end())
+                Refs.push_back(Prop.Extra.V);
         const auto& Body = Functions[I].Body;
         AddFunctionExport(P, Functions[I].Def, Exp(RowClass), FunctionClass, FunctionCdo,
                           [Body, SelfExp](FScript& S) { Body(S, SelfExp); }, Refs);
@@ -294,6 +302,46 @@ void FBlueprintClass::Finish()
         Ar.Bool(false);
     };
     P.AddExport(std::move(Scs));
+}
+
+/* Measured on DRG's MM_ResourceInfo: Guid tag, empty UStruct body, StructFlags 0, then the default
+   instance as a tag per member. */
+void FBlueprintClass::FinishStruct(const uint32 (&Guid)[4])
+{
+    const FIndex UdsClass = EngineClass("/Script/Engine", "UserDefinedStruct");
+    const FIndex UdsCdo = ClassDefaultObject("/Script/Engine", "UserDefinedStruct");
+    ClassRow = 0;
+
+    FExport S;
+    S.ClassIndex = UdsClass;
+    S.TemplateIndex = UdsCdo;
+    S.ObjectName = ClassName;
+    S.ObjectFlags = RF_Public | RF_Standalone | RF_Transactional;
+    S.bIsAsset = true;
+    S.SerBeforeCreate = { UdsClass.V, UdsCdo.V };
+    for (const FPropertyDef& V : Vars)
+        if (V.Extra.V != 0)
+            S.CreateBeforeSer.push_back(V.Extra.V);
+
+    uint32 G[4] = { Guid[0], Guid[1], Guid[2], Guid[3] };
+    const std::vector<FPropertyDef> Members = Vars;
+    S.Serialize = [=](FArc& Ar) {
+        Tag(Ar, "Guid", "StructProperty", [=](FArc& V) { V.Guid(G); }, "Guid");
+        TagEnd(Ar);
+        Ar.Bool(false);
+
+        Ar.Idx(Null());                             // SuperStruct
+        Ar.I32(0);                                  // Children
+        Ar.I32(int32(Members.size()));              // ChildProperties
+        for (const FPropertyDef& M : Members) WriteProperty(Ar, M);
+        Ar.I32(0);                                  // script bytecode size
+        Ar.I32(0);                                  // script storage size
+        Ar.U32(0);                                  // StructFlags
+
+        for (const FPropertyDef& M : Members) WriteZeroValueTag(Ar, M);
+        TagEnd(Ar);
+    };
+    P.AddExport(std::move(S));
 }
 
 }   // namespace Uasset

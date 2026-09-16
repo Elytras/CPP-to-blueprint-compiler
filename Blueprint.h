@@ -46,6 +46,9 @@ public:
 
     void Finish();
 
+    /* Writes the package as one UserDefinedStruct export whose members are the AddVariable()s. */
+    void FinishStruct(const uint32 (&Guid)[4]);
+
     FIndex ClassIndex() const { return Exp(ClassRow); }
 
 private:

@@ -62,6 +62,27 @@ FPropertyDef ObjectParam(const std::string& Name, FIndex Class, uint64 ExtraFlag
                          CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, Class };
 }
 
+FPropertyDef StructParam(const std::string& Name, FIndex Struct, const std::string& StructName,
+                         int32 Size, uint64 ExtraFlags)
+{
+    return FPropertyDef{ "StructProperty", Name, RF_Public, 1, Size,
+                         CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, Struct, StructName };
+}
+
+void WriteZeroValueTag(FArc& Ar, const FPropertyDef& P)
+{
+    if (P.Type == "BoolProperty") { TagBool(Ar, P.Name, false); return; }
+    Tag(Ar, P.Name, P.Type, [&](FArc& V) {
+        if (P.Type == "IntProperty" || P.Type == "FloatProperty" || P.Type == "StrProperty"
+            || P.Type == "ObjectProperty")
+            V.I32(0);
+        else if (P.Type == "Int64Property") V.I64(0);
+        else if (P.Type == "ByteProperty") V.U8(0);
+        else if (P.Type == "NameProperty") V.Name("None");
+        else if (P.Type == "StructProperty") TagEnd(V);
+    }, P.StructName);
+}
+
 void WriteProperty(FArc& Ar, const FPropertyDef& P)
 {
     Ar.Name(P.Type);

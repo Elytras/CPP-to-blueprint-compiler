@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <set>
 #include <map>
@@ -117,24 +118,27 @@ struct FRecord
     std::map<std::string, const Json*> MethodDefs;  // out-of-line definition (carries body/parms)
     std::vector<const Json*> Fields;
     bool bIsLocal = false;      // UePackage == ModPackage/CppName: cooked here, published at its /Game path
+    bool bIsStruct = false;     // UE_STRUCT: cooked as a UserDefinedStruct asset
 
     bool IsNative() const { return !UePackage.empty() && !bIsLocal; }
+    bool IsGenerated() const { return !IsNative() && (bIsStruct || !Base.empty()); }
 };
 
 struct FCallIR;
 
 struct FArgIR
 {
-    enum EKind { Self, Int, Int64, Float, Bool, Str, Name, Field, Local, LocalOut, Call, NullObj } K = Self;
+    enum EKind { Self, Int, Int64, Float, Bool, Str, Name, Field, Local, LocalOut, Member, Call, NullObj } K = Self;
     int32 I = 0;
     int64 I64 = 0;
     float F = 0.0f;
     bool B = false;
     bool bWide = false;     // Str: emit EX_UnicodeStringConst
-    std::string S;          // Str: the literal; Field/Local/LocalOut: the property name
-    FIndex Owner;           // Field: declaring class (locals are owned by the function, resolved at emit)
+    std::string S;          // Str: the literal; Field/Local/LocalOut/Member: the property name
+    FIndex Owner;           // Field: declaring class; Member: the struct (locals are owned by the function, resolved at emit)
     EExprToken LetOp = EX_Let;
     std::shared_ptr<FCallIR> Sub;
+    std::shared_ptr<FArgIR> Base;   // Member: the struct-valued expression
 };
 
 struct FCallIR
@@ -216,6 +220,15 @@ bool EmitArg(FScript& S, const FArgIR& A, FIndex SelfExp, std::string* Err)
     case FArgIR::Field: S.InstanceVariable(A.S, A.Owner); return true;
     case FArgIR::Local: S.LocalVariable(A.S, SelfExp); return true;
     case FArgIR::LocalOut: S.LocalOutVariable(A.S, SelfExp); return true;
+    case FArgIR::Member:
+    {
+        if (!A.Base) { if (Err) *Err = "internal: Member arg has no base"; return false; }
+        bool bOk = true;
+        std::string SubErr;
+        S.StructMember(A.S, A.Owner, [&](FScript& C) { bOk = EmitArg(C, *A.Base, SelfExp, &SubErr); });
+        if (!bOk && Err) *Err = SubErr;
+        return bOk;
+    }
     case FArgIR::Call:
         if (!A.Sub) { if (Err) *Err = "internal: Call arg has no sub-call"; return false; }
         if (A.Sub->Intrinsic == "__CurrentFunction__")
@@ -350,6 +363,11 @@ public:
 private:
     bool Collect(std::string* Err);
     bool Generate(const FRecord& R, const std::string& OutDir, std::string* Err);
+    bool GenerateStruct(const FRecord& R, const std::string& OutDir, std::string* Err);
+    bool TypeToProperty(const std::string& QualType, const std::string& PName, uint64 ExtraFlags,
+                        const std::string& Where, FBlueprintClass& BP, FPropertyDef* Out, std::string* Err);
+    bool LayoutOf(const std::string& QualType, int32* Size, int32* Align, std::string* Err);
+    bool StructLayout(const FRecord& R, int32* Size, int32* Align, std::string* Err);
     bool LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FStmtIR>& Out,
                    std::vector<FPropertyDef>& Locals, std::string* Err);
     bool LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR& Out, std::string* Err);
@@ -530,6 +548,10 @@ bool FCompiler::Collect(std::string* Err)
                     BadClassMeta(R, Err, &bMetaOk);
                 }
             }
+            else if (Kind(C) == "VarDecl" && Name(C) == "UeStructMeta")
+            {
+                R.bIsStruct = true;
+            }
             else if (Kind(C) == "CXXMethodDecl" && C.contains("name"))
             {
                 R.Methods[Name(C)] = &C;
@@ -650,18 +672,30 @@ std::string MathFuncFor(const std::string& Op, const std::string& Flavour)
 
 bool FCompiler::LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& Out, std::string* Err)
 {
-    const Json* Obj = Strip(First(MemberNode));
+    auto It = FieldOwner.find(MemberNode.value("referencedMemberDecl", std::string()));
+    if (It == FieldOwner.end()) { *Err = "access to an unknown property: " + Name(MemberNode); return false; }
+    const FRecord* R = Find(It->second);
+    if (!R) { *Err = "access to a property of an unknown class: " + Name(MemberNode); return false; }
+
+    const Json* ObjRaw = First(MemberNode);
+    if (R->bIsStruct)
+    {
+        if (!ObjRaw) { *Err = "struct member access with no object: " + Name(MemberNode); return false; }
+        Out.K = FArgIR::Member;
+        Out.S = Name(MemberNode);
+        Out.Owner = BP.ScriptStruct(ModPackage + "/" + R->CppName, R->CppName);
+        Out.LetOp = LetOpFor(TypeOf(MemberNode));
+        Out.Base = std::make_shared<FArgIR>();
+        return LowerArg(*ObjRaw, BP, *Out.Base, Err);
+    }
+
+    const Json* Obj = Strip(ObjRaw);
     const std::string ObjKind = Obj ? Kind(*Obj) : "<none>";
     if (ObjKind != "CXXThisExpr")
     {
         *Err = "TODO: a property is only reachable on `this`, not on " + ObjKind;
         return false;
     }
-
-    auto It = FieldOwner.find(MemberNode.value("referencedMemberDecl", std::string()));
-    if (It == FieldOwner.end()) { *Err = "access to an unknown property: " + Name(MemberNode); return false; }
-    const FRecord* R = Find(It->second);
-    if (!R) { *Err = "access to a property of an unknown class: " + Name(MemberNode); return false; }
     if (!R->IsNative() && R != Cur)
     {
         *Err = "TODO: a property declared on another generated class is not reachable yet: "
@@ -950,29 +984,6 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
     return bOk;
 }
 
-/* Same builders as parameters, minus the parm flags; object-typed locals would need a class import. */
-bool LocalProperty(const std::string& QualType, const std::string& VarName,
-                   FPropertyDef* Out, std::string* Err)
-{
-    std::string T = QualType;
-    if (T.compare(0, 6, "const ") == 0) T = T.substr(6);
-
-    if (T == "int64" || T == "long long")           *Out = Int64Param(VarName);
-    else if (T == "int" || T == "int32")            *Out = IntParam(VarName);
-    else if (T == "bool")                           *Out = BoolParam(VarName);
-    else if (T == "float")                          *Out = FloatParam(VarName);
-    else if (T == "uint8" || T == "unsigned char")  *Out = ByteParam(VarName);
-    else if (T == "FName" || T == "struct FName" || T == "class FName")
-                                                    *Out = NameParam(VarName);
-    else
-    {
-        *Err = "TODO: a function-local of type " + QualType + " is not supported yet";
-        return false;
-    }
-    Out->PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
-    return true;
-}
-
 bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FStmtIR>& Out,
                           std::vector<FPropertyDef>& Locals, std::string* Err)
 {
@@ -993,7 +1004,9 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 bAny = true;
                 const std::string VarName = Name(D);
                 FPropertyDef PD;
-                if (!LocalProperty(TypeOf(D), VarName, &PD, Err)) { bOk = false; return; }
+                if (!TypeToProperty(TypeOf(D), VarName, 0, "local " + VarName, BP, &PD, Err))
+                { bOk = false; return; }
+                PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
                 Locals.push_back(PD);
 
                 FStmtIR Ds;
@@ -1001,7 +1014,10 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 Ds.Var.K = FArgIR::Local;
                 Ds.Var.S = VarName;
                 Ds.Var.LetOp = LetOpFor(TypeOf(D));
-                if (const Json* Init = Strip(First(D)))
+                const Json* Init = Strip(First(D));
+                /* `FStats S;` carries an implicit argless CXXConstructExpr: no initialiser. */
+                if (Init && Kind(*Init) == "CXXConstructExpr" && !First(*Init)) Init = nullptr;
+                if (Init)
                 {
                     Ds.bHasValue = true;
                     if (!LowerArg(*Init, BP, Ds.Value, Err)) { bOk = false; return; }
@@ -1197,6 +1213,122 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
     return bOk;
 }
 
+std::string StripTypeKeywords(std::string T)
+{
+    for (const char* Prefix : { "const ", "struct ", "class " })
+        if (T.compare(0, strlen(Prefix), Prefix) == 0) T = T.substr(strlen(Prefix));
+    while (!T.empty() && (T.back() == ' ' || T.back() == '\t')) T.pop_back();
+    return T;
+}
+
+/* The CDO / struct default instance writes no values, so only zero initialisers are accepted. */
+bool RejectNonZeroInitialiser(const Json& F, std::string* Err)
+{
+    const Json* Init = Strip(First(F));
+    if (!Init) return true;
+    const std::string IK = Kind(*Init);
+    const std::string IV = Init->value("value", std::string());
+    const bool bZero = (IK == "IntegerLiteral" && IV == "0")
+                    || (IK == "FloatingLiteral" && (IV == "0" || IV == "0.0"))
+                    || (IK == "CXXBoolLiteralExpr" && !Init->value("value", false))
+                    || (IK == "StringLiteral" && Unquote(IV).empty());
+    if (bZero) return true;
+    *Err = "TODO: a variable's initializer is not written to the defaults yet: " + Name(F);
+    return false;
+}
+
+bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& PName, uint64 ExtraFlags,
+                               const std::string& Where, FBlueprintClass& BP, FPropertyDef* Out, std::string* Err)
+{
+    const std::string Type = StripTypeKeywords(QualType);
+    if (Type == "float") { *Out = FloatParam(PName, ExtraFlags); return true; }
+    if (Type == "int" || Type == "int32") { *Out = IntParam(PName, ExtraFlags); return true; }
+    if (Type == "int64" || Type == "long long") { *Out = Int64Param(PName, ExtraFlags); return true; }
+    if (Type == "bool") { *Out = BoolParam(PName, ExtraFlags); return true; }
+    if (Type == "uint8" || Type == "unsigned char") { *Out = ByteParam(PName, ExtraFlags); return true; }
+    if (Type == "char *" || Type == "char*" || Type == "FString")
+    { *Out = StringParam(PName, ExtraFlags); return true; }
+    if (Type == "FName") { *Out = NameParam(PName, ExtraFlags); return true; }
+
+    if (const FRecord* SR = Find(Type); SR && SR->bIsStruct)
+    {
+        int32 Size = 0, Align = 0;
+        if (!StructLayout(*SR, &Size, &Align, Err)) return false;
+        *Out = StructParam(PName, BP.ScriptStruct(ModPackage + "/" + SR->CppName, SR->CppName),
+                           SR->CppName, Size, ExtraFlags);
+        return true;
+    }
+
+    /* Object pointer, spelled `[const] class X *`. */
+    const size_t Star = Type.find('*');
+    const std::string ClassName = Star == std::string::npos ? std::string()
+                                                            : StripTypeKeywords(Type.substr(0, Star));
+    const FRecord* PR = ClassName.empty() ? nullptr : Find(ClassName);
+    if (!PR || PR->bIsStruct) { *Err = "TODO: unimplemented " + Where + ": " + QualType; return false; }
+    const FIndex ClassImp = PR->IsNative()
+        ? BP.EngineClass(PR->UePackage, PR->UeName)
+        : BP.EngineClass(ModPackage + "/" + PR->CppName, PR->CppName + "_C");
+    *Out = ObjectParam(PName, ClassImp, ExtraFlags);
+    return true;
+}
+
+bool FCompiler::LayoutOf(const std::string& QualType, int32* Size, int32* Align, std::string* Err)
+{
+    const std::string T = StripTypeKeywords(QualType);
+    if (T == "float" || T == "int" || T == "int32") { *Size = 4; *Align = 4; return true; }
+    if (T == "int64" || T == "long long") { *Size = 8; *Align = 8; return true; }
+    if (T == "bool" || T == "uint8" || T == "unsigned char") { *Size = 1; *Align = 1; return true; }
+    if (T == "FName") { *Size = 8; *Align = 4; return true; }
+    if (T == "FString" || T == "char *" || T == "char*") { *Size = 16; *Align = 8; return true; }
+    if (!T.empty() && T.back() == '*') { *Size = 8; *Align = 8; return true; }
+    if (const FRecord* SR = Find(T); SR && SR->bIsStruct) return StructLayout(*SR, Size, Align, Err);
+    *Err = "TODO: unimplemented struct member type: " + QualType;
+    return false;
+}
+
+/* UStruct::Link: members at their natural alignment, size rounded up to the largest one. */
+bool FCompiler::StructLayout(const FRecord& R, int32* Size, int32* Align, std::string* Err)
+{
+    int32 Offset = 0, MaxAlign = 1;
+    for (const Json* F : R.Fields)
+    {
+        int32 S = 0, A = 1;
+        if (!LayoutOf(TypeOf(*F), &S, &A, Err)) return false;
+        Offset = (Offset + A - 1) / A * A + S;
+        MaxAlign = std::max(MaxAlign, A);
+    }
+    *Align = MaxAlign;
+    *Size = std::max(1, (Offset + MaxAlign - 1) / MaxAlign * MaxAlign);
+    return true;
+}
+
+bool FCompiler::GenerateStruct(const FRecord& R, const std::string& OutDir, std::string* Err)
+{
+    Cur = &R;
+    const std::string PackageName = ModPackage + "/" + R.CppName;
+    FPackage P(PackageName);
+    StampIdentity(P, PackageName);
+    FBlueprintClass BP(P, R.CppName, "", "", false);
+
+    for (const Json* F : R.Fields)
+    {
+        if (!RejectNonZeroInitialiser(*F, Err)) return false;
+        FPropertyDef PD;
+        if (!TypeToProperty(TypeOf(*F), Name(*F), 0, "member " + Name(*F), BP, &PD, Err)) return false;
+        PD.PropertyFlags = CPF_Edit | CPF_BlueprintVisible;
+        BP.AddVariable(PD);
+    }
+
+    const uint32 H = StrCrc32(PackageName);
+    const uint32 Guid[4] = { ~H, H * 2654435761u, H ^ 0x9E3779B9u, H };
+    BP.FinishStruct(Guid);
+    if (!P.Save(OutDir + "/" + R.CppName, Err)) return false;
+    RegistryRows.push_back({ PackageName, R.CppName, "UserDefinedStruct" });
+    printf("  %-14s -> %s.uasset  (struct, %d members)\n", R.CppName.c_str(), R.CppName.c_str(),
+           int32(R.Fields.size()));
+    return true;
+}
+
 bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::string* Err)
 {
     const FRecord* B = Find(R.Base);
@@ -1223,66 +1355,14 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     BP.SetIsActor(bIsActor);
     BP.SetClassFlags(ClassFlagsFor(Ancestry));
 
-    auto TypeToProperty = [&](const std::string& Type, const std::string& PName,
-                              uint64 ExtraFlags, const std::string& Where,
-                              FPropertyDef* Out, std::string* PErr) -> bool
-    {
-        if (Type == "float") { *Out = FloatParam(PName, ExtraFlags); return true; }
-        if (Type == "int" || Type == "int32") { *Out = IntParam(PName, ExtraFlags); return true; }
-        if (Type == "int64" || Type == "long long") { *Out = Int64Param(PName, ExtraFlags); return true; }
-        if (Type == "bool") { *Out = BoolParam(PName, ExtraFlags); return true; }
-        if (Type == "uint8" || Type == "unsigned char") { *Out = ByteParam(PName, ExtraFlags); return true; }
-        if (Type == "const char *" || Type == "const char*"
-            || Type == "FString" || Type == "struct FString")
-        { *Out = StringParam(PName, ExtraFlags); return true; }
-        if (Type == "FName" || Type == "struct FName")
-        { *Out = NameParam(PName, ExtraFlags); return true; }
-
-        /* Object pointer, spelled `[const] class X *`. */
-        std::string ClassName;
-        {
-            const size_t Star = Type.find('*');
-            const std::string Head = Star == std::string::npos ? Type : Type.substr(0, Star);
-            size_t I = 0;
-            while (I < Head.size() && Head[I] == ' ') ++I;
-            if (Head.compare(I, 6, "const ") == 0) I += 6;
-            if (Head.compare(I, 6, "class ") == 0) I += 6;
-            size_t J = Head.size();
-            while (J > I && (Head[J - 1] == ' ' || Head[J - 1] == '\t')) --J;
-            if (Star != std::string::npos && J > I) ClassName = Head.substr(I, J - I);
-        }
-        const FRecord* PR = ClassName.empty() ? nullptr : Find(ClassName);
-        if (!PR) { *PErr = "TODO: unimplemented " + Where + ": " + Type; return false; }
-        const FIndex ClassImp = PR->IsNative()
-            ? BP.EngineClass(PR->UePackage, PR->UeName)
-            : BP.EngineClass(ModPackage + "/" + PR->CppName, PR->CppName + "_C");
-        *Out = ObjectParam(PName, ClassImp, ExtraFlags);
-        return true;
-    };
-
-    /* Non-zero field initialisers are refused: the CDO writes no defaults. */
     for (const Json* F : R.Fields)
     {
         const std::string FieldName = Name(*F);
-        if (const Json* Init = Strip(First(*F)))
-        {
-            const std::string IK = Kind(*Init);
-            const std::string IV = Init->value("value", std::string());
-            const bool bZero = (IK == "IntegerLiteral" && IV == "0")
-                            || (IK == "FloatingLiteral" && (IV == "0" || IV == "0.0"))
-                            || (IK == "CXXBoolLiteralExpr" && !Init->value("value", false))
-                            || (IK == "StringLiteral" && Unquote(IV).empty());
-            if (!bZero)
-            {
-                *Err = "TODO: a class variable's initializer is not written to the CDO yet: "
-                     + FieldName;
-                return false;
-            }
-        }
+        if (!RejectNonZeroInitialiser(*F, Err)) return false;
 
         FPropertyDef PD;
         std::string PErr;
-        if (!TypeToProperty(TypeOf(*F), FieldName, 0, "property " + FieldName, &PD, &PErr))
+        if (!TypeToProperty(TypeOf(*F), FieldName, 0, "property " + FieldName, BP, &PD, &PErr))
         { *Err = PErr; return false; }
 
         /* CPF_Parm would make it part of the call frame; CPF_BlueprintReadOnly would forbid assignment. */
@@ -1320,7 +1400,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             FPropertyDef PD;
             std::string PErr;
             if (!TypeToProperty(Type, PName, ExtraFlags,
-                                "parameter " + PName + " on " + Entry.first, &PD, &PErr))
+                                "parameter " + PName + " on " + Entry.first, BP, &PD, &PErr))
             { *Err = PErr; bOk = false; return; }
             Params.push_back(PD);
             if (bOutParm) CurrentOutParms.insert(PName);
@@ -1341,7 +1421,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             FPropertyDef PD;
             std::string PErr;
             if (!TypeToProperty(RetType, "ReturnValue", CPF_ReturnParm | CPF_OutParm,
-                                "return type on " + Entry.first, &PD, &PErr))
+                                "return type on " + Entry.first, BP, &PD, &PErr))
             { *Err = PErr; return false; }
             Params.push_back(PD);
         }
@@ -1405,19 +1485,19 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     for (const auto& Entry : Records)
     {
         const FRecord& R = Entry.second;
-        if (R.IsNative() || R.Base.empty()) continue;
-        if (!Generate(R, OutDir, Err))
+        if (!R.IsGenerated()) continue;
+        if (!(R.bIsStruct ? GenerateStruct(R, OutDir, Err) : Generate(R, OutDir, Err)))
         {
             /* Remove every generated asset; keep the AST for inspection. */
             for (const auto& Other : Records)
-                if (!Other.second.IsNative() && !Other.second.Base.empty())
+                if (Other.second.IsGenerated())
                     for (const char* Ext : { ".uasset", ".uexp" })
                         remove((OutDir + "/" + Other.first + Ext).c_str());
             return false;
         }
         ++Generated;
     }
-    if (Generated == 0) { *Err = "the source declares no class deriving from a UE class"; return false; }
+    if (Generated == 0) { *Err = "the source declares no UE_STRUCT and no class deriving from a UE class"; return false; }
 
     /* A cooked package carries no registry data; without the bake the classes are invisible to it. */
     if (!SaveAssetRegistry(RegistryRows, OutDir + "/AssetRegistry.bin", Err)) return false;

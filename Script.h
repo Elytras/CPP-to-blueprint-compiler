@@ -17,6 +17,7 @@ struct FPropertyDef
     int32 ElementSize = 0;
     uint64 PropertyFlags = 0;
     FIndex Extra;                       // ObjectProperty: PropertyClass. StructProperty: Struct. ByteProperty: Enum.
+    std::string StructName;             // StructProperty: the struct's name, for the default-value tag
 };
 
 FPropertyDef FloatParam(const std::string& Name, uint64 ExtraFlags = 0);
@@ -27,8 +28,13 @@ FPropertyDef ByteParam(const std::string& Name, uint64 ExtraFlags = 0);
 FPropertyDef StringParam(const std::string& Name, uint64 ExtraFlags = 0);
 FPropertyDef NameParam(const std::string& Name, uint64 ExtraFlags = 0);
 FPropertyDef ObjectParam(const std::string& Name, FIndex Class, uint64 ExtraFlags = 0);
+FPropertyDef StructParam(const std::string& Name, FIndex Struct, const std::string& StructName,
+                         int32 Size, uint64 ExtraFlags = 0);
 
 void WriteProperty(FArc& Ar, const FPropertyDef& P);
+
+/* The property as a tagged-property entry holding its zero value. */
+void WriteZeroValueTag(FArc& Ar, const FPropertyDef& P);
 
 /*
 Kismet bytecode buffer. MemorySize and StorageSize differ by design: a property reference is
