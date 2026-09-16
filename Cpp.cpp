@@ -758,6 +758,7 @@ private:
        local (and its Num=1 prologue) and the counter that names each hoisted temp. */
     bool ReadScratchAdded = false;
     int32 ReadTmpCounter = 0;
+    int32 LoopDepth = 0;                              // LowerBody: the loops around the statement being lowered
 };
 
 void EmitStmts(const std::vector<FStmtIR>& Stmts, FScript& S, FIndex SelfExp)
@@ -2330,6 +2331,22 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                     Ds.bHasValue = true;
                     if (!LowerArg(*First(D), BP, Ds.Value, Err)) { bOk = false; return; }
                 }
+                else if (LoopDepth > 0 && !Ds.bHasValue)
+                {
+                    /* The frame initialises a local once, on entry, but C++ constructs it again each time a loop
+                       reaches the declaration. A twin nothing writes keeps the entry value to copy back. */
+                    const std::string Fresh = "__Fresh" + VarName + "__";
+                    if (std::none_of(Locals.begin(), Locals.end(), [&](const FPropertyDef& L) { return L.Name == Fresh; }))
+                    {
+                        FPropertyDef Twin;
+                        if (!TypeToProperty(VarType, Fresh, 0, "local " + VarName, BP, &Twin, Err)) { bOk = false; return; }
+                        Twin.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+                        Locals.push_back(Twin);
+                    }
+                    Ds.bHasValue = true;
+                    Ds.Value.K = FArgIR::Local;
+                    Ds.Value.S = Fresh;
+                }
                 Out.push_back(Ds);
             });
             if (!bAny && bOk) { *Err = "a declaration statement declares nothing usable"; bOk = false; }
@@ -2474,6 +2491,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             St.K = FStmtIR::While;
             if (!LowerArg(*Cond, BP, St.Cond, Err)) { bOk = false; return; }
             St.Body = std::make_shared<std::vector<FStmtIR>>();
+            ++LoopDepth;
             if (Kind(*Body) == "CompoundStmt")
             {
                 if (!LowerBody(*Body, BP, *St.Body, Locals, Err)) { bOk = false; return; }
@@ -2483,6 +2501,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 Json Wrap = { {"kind", "CompoundStmt"}, {"inner", Json::array({*Body})} };
                 if (!LowerBody(Wrap, BP, *St.Body, Locals, Err)) { bOk = false; return; }
             }
+            --LoopDepth;
         }
         else if (K == "ForStmt")
         {
@@ -2518,7 +2537,9 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             if (Inc) BodyArr.push_back(*Inc);
 
             Json WrapBody = { {"kind", "CompoundStmt"}, {"inner", BodyArr} };
+            ++LoopDepth;
             if (!LowerBody(WrapBody, BP, *St.Body, Locals, Err)) { bOk = false; return; }
+            --LoopDepth;
         }
         else
         {
@@ -3163,6 +3184,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         ReadTmpCounter = 0;
         RefAddr.clear();
         RefAlias.clear();
+        LoopDepth = 0;
         if (Fn.Body && !LowerBody(*Fn.Body, BP, Stmts, Locals, Err))
         {
             *Err = R.CppName + "::" + Fn.Name + ": " + *Err;
