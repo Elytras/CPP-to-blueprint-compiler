@@ -765,7 +765,7 @@ void WrapInCall(FArgIR& Arg, FIndex Fn)
 /* Converts Arg (of kind KindOfLowered) to a string, name or text via the Kismet Conv_* library. */
 bool FCompiler::ConvertArg(EStrKind To, FBlueprintClass& BP, FArgIR& Arg, std::string* Err)
 {
-    const EStrKind From = KindOfLowered(Arg, Arg.InnerType);
+    EStrKind From = KindOfLowered(Arg, Arg.InnerType);
     if (To == From || From == SK_None || (To != SK_Str && To != SK_Name && To != SK_Text)) return true;
 
     /* A literal folds into the destination's own constant. */
@@ -774,6 +774,22 @@ bool FCompiler::ConvertArg(EStrKind To, FBlueprintClass& BP, FArgIR& Arg, std::s
 
     auto Lib = [&](const char* Class, const char* Fn) { return BP.EngineFunction("/Script/Engine", Class, Fn); };
     if (From == SK_Name && To == SK_Text) { WrapInCall(Arg, Lib("KismetTextLibrary", "Conv_NameToText")); return true; }
+    if (From == SK_Int64)
+    {
+        /* DRG has no Conv_Int64ToString; text is the only route. Args after Value are the node
+           defaults: bAlwaysSign=false, bUseGrouping=false, MinimumIntegralDigits=1, MaximumIntegralDigits=324. */
+        WrapInCall(Arg, Lib("KismetTextLibrary", "Conv_Int64ToText"));
+        FArgIR Sign;  Sign.K = FArgIR::Bool; Sign.B = false;
+        FArgIR Group; Group.K = FArgIR::Bool; Group.B = false;
+        FArgIR Min;   Min.K = FArgIR::Int;   Min.I = 1;
+        FArgIR Max;   Max.K = FArgIR::Int;   Max.I = 324;
+        Arg.Sub->Args.insert(Arg.Sub->Args.end(), { Sign, Group, Min, Max });
+        Arg.InnerType = "FText";
+        if (To == SK_Text) return true;
+        WrapInCall(Arg, Lib("KismetTextLibrary", "Conv_TextToString"));
+        Arg.InnerType = "FString";
+        From = SK_Str;
+    }
 
     if (From != SK_Str)
     {
