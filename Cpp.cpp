@@ -144,6 +144,34 @@ struct FArgIR
 
 enum EStrKind { SK_None, SK_Str, SK_Name, SK_Text, SK_Int, SK_Int64, SK_Float, SK_Bool, SK_Byte, SK_Object };
 
+EStrKind KindByName(const std::string& N)
+{
+    static const std::map<std::string, EStrKind> M = {
+        { "Str", SK_Str }, { "Name", SK_Name }, { "Text", SK_Text }, { "Int", SK_Int }, { "Int64", SK_Int64 },
+        { "Float", SK_Float }, { "Bool", SK_Bool }, { "Byte", SK_Byte }, { "Object", SK_Object } };
+    auto It = M.find(N);
+    return It == M.end() ? SK_None : It->second;
+}
+
+const char* TypeNameOf(EStrKind K)
+{
+    switch (K)
+    {
+    case SK_Str: return "FString"; case SK_Name: return "FName"; case SK_Text: return "FText";
+    case SK_Int: return "int"; case SK_Int64: return "int64"; case SK_Float: return "float";
+    case SK_Bool: return "bool"; case SK_Byte: return "uint8"; case SK_Object: return "UObject *";
+    default: return "";
+    }
+}
+
+/* One row of UeApi/Conv.json: a Kismet Conv_XToY and the constants for its formatting parameters. */
+struct FConv
+{
+    EStrKind From = SK_None, To = SK_None;
+    std::string Package, Class, Fn;
+    std::vector<Json> Extra;
+};
+
 struct FCallIR
 {
     FIndex Fn;                          // empty for intrinsics
@@ -395,6 +423,9 @@ private:
     bool LowerArgRaw(const Json& N, const std::string& OuterType, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     bool ConvertArg(EStrKind To, FBlueprintClass& BP, FArgIR& Arg, std::string* Err);
     Json Doc;
+    std::vector<FConv> Convs;
+    const FConv* FindConv(EStrKind From, EStrKind To) const;
+    void ApplyConv(const FConv& C, FBlueprintClass& BP, FArgIR& Arg);
     std::string ModPackage;
     std::map<std::string, FRecord> Records;
     std::map<std::string, std::string> MethodOwner;   // clang decl id -> owning record
@@ -762,57 +793,45 @@ void WrapInCall(FArgIR& Arg, FIndex Fn)
     Arg.Sub->Args.push_back(Inner);
 }
 
-/* Converts Arg (of kind KindOfLowered) to a string, name or text via the Kismet Conv_* library. */
+const FConv* FCompiler::FindConv(EStrKind From, EStrKind To) const
+{
+    for (const FConv& C : Convs)
+        if (C.From == From && C.To == To) return &C;
+    return nullptr;
+}
+
+void FCompiler::ApplyConv(const FConv& C, FBlueprintClass& BP, FArgIR& Arg)
+{
+    WrapInCall(Arg, BP.EngineFunction(C.Package, C.Class, C.Fn));
+    for (const Json& E : C.Extra)
+    {
+        FArgIR X;
+        if (E.is_boolean()) { X.K = FArgIR::Bool; X.B = E.get<bool>(); }
+        else                { X.K = FArgIR::Int;  X.I = E.get<int32>(); }
+        Arg.Sub->Args.push_back(X);
+    }
+    Arg.InnerType = TypeNameOf(C.To);
+}
+
+/* Converts Arg (of kind KindOfLowered) to the slot's kind: a literal folds, else a Conv_XToY from
+   UeApi/Conv.json, else two of them through FString. */
 bool FCompiler::ConvertArg(EStrKind To, FBlueprintClass& BP, FArgIR& Arg, std::string* Err)
 {
-    EStrKind From = KindOfLowered(Arg, Arg.InnerType);
-    if (To == From || From == SK_None || (To != SK_Str && To != SK_Name && To != SK_Text)) return true;
+    const EStrKind From = KindOfLowered(Arg, Arg.InnerType);
+    if (To == From || From == SK_None || To == SK_None || To == SK_Object) return true;
 
-    /* A literal folds into the destination's own constant. */
     if (Arg.K == FArgIR::Str && !Arg.bWide && To == SK_Name) { Arg.K = FArgIR::Name; return true; }
     if (Arg.K == FArgIR::Str && To == SK_Text) { Arg.K = FArgIR::Text; return true; }
+    if (Arg.K == FArgIR::Int && To == SK_Int64) { Arg.K = FArgIR::Int64; Arg.I64 = Arg.I; return true; }
+    if (Arg.K == FArgIR::Int && To == SK_Float) { Arg.K = FArgIR::Float; Arg.F = float(Arg.I); return true; }
+    if (Arg.K == FArgIR::Int && To == SK_Bool)  { Arg.K = FArgIR::Bool;  Arg.B = Arg.I != 0; return true; }
 
-    auto Lib = [&](const char* Class, const char* Fn) { return BP.EngineFunction("/Script/Engine", Class, Fn); };
-    if (From == SK_Name && To == SK_Text) { WrapInCall(Arg, Lib("KismetTextLibrary", "Conv_NameToText")); return true; }
-    if (From == SK_Int64)
-    {
-        /* DRG has no Conv_Int64ToString; text is the only route. Args after Value are the node
-           defaults: bAlwaysSign=false, bUseGrouping=false, MinimumIntegralDigits=1, MaximumIntegralDigits=324. */
-        WrapInCall(Arg, Lib("KismetTextLibrary", "Conv_Int64ToText"));
-        FArgIR Sign;  Sign.K = FArgIR::Bool; Sign.B = false;
-        FArgIR Group; Group.K = FArgIR::Bool; Group.B = false;
-        FArgIR Min;   Min.K = FArgIR::Int;   Min.I = 1;
-        FArgIR Max;   Max.K = FArgIR::Int;   Max.I = 324;
-        Arg.Sub->Args.insert(Arg.Sub->Args.end(), { Sign, Group, Min, Max });
-        Arg.InnerType = "FText";
-        if (To == SK_Text) return true;
-        WrapInCall(Arg, Lib("KismetTextLibrary", "Conv_TextToString"));
-        Arg.InnerType = "FString";
-        From = SK_Str;
-    }
-
-    if (From != SK_Str)
-    {
-        const char* Fn = nullptr;
-        const char* Class = "KismetStringLibrary";
-        switch (From)
-        {
-        case SK_Name:   Fn = "Conv_NameToString"; break;
-        case SK_Text:   Fn = "Conv_TextToString"; Class = "KismetTextLibrary"; break;
-        case SK_Int:    Fn = "Conv_IntToString"; break;
-        case SK_Float:  Fn = "Conv_FloatToString"; break;
-        case SK_Bool:   Fn = "Conv_BoolToString"; break;
-        case SK_Byte:   Fn = "Conv_ByteToString"; break;
-        case SK_Object: Fn = "Conv_ObjectToString"; break;
-        default: break;
-        }
-        if (!Fn) { *Err = "TODO: no Kismet conversion to string from " + Arg.InnerType; return false; }
-        WrapInCall(Arg, Lib(Class, Fn));
-        Arg.InnerType = "FString";
-    }
-    if (To == SK_Name) { WrapInCall(Arg, Lib("KismetStringLibrary", "Conv_StringToName")); Arg.InnerType = "FName"; }
-    else if (To == SK_Text) { WrapInCall(Arg, Lib("KismetTextLibrary", "Conv_StringToText")); Arg.InnerType = "FText"; }
-    return true;
+    if (const FConv* Direct = FindConv(From, To)) { ApplyConv(*Direct, BP, Arg); return true; }
+    const FConv* In  = FindConv(From, SK_Str);
+    const FConv* Out = FindConv(SK_Str, To);
+    if (In && Out) { ApplyConv(*In, BP, Arg); ApplyConv(*Out, BP, Arg); return true; }
+    *Err = std::string("no Kismet conversion from ") + Arg.InnerType + " to " + TypeNameOf(To);
+    return false;
 }
 
 bool FCompiler::LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, std::string* Err)
@@ -900,6 +919,16 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             { *Err = "__ClassOf__: no enclosing class in scope"; return false; }
 
             const std::string CalleePkg = ModPackage + "/" + Cur->CppName;
+    if (K == "CXXMemberCallExpr")
+    {
+        const Json* Callee = Strip(First(*N));
+        if (Callee && Kind(*Callee) == "MemberExpr" && Name(*Callee).compare(0, 9, "operator ") == 0)
+        {
+            const Json* Obj = First(*Callee);
+            if (!Obj) { *Err = "conversion operator with no object"; return false; }
+            return LowerArg(*Obj, BP, Out, Err) && ConvertArg(StrKindOf(TypeOf(*N)), BP, Out, Err);
+        }
+    }
     if (K == "CXXOperatorCallExpr")
     {
         const Json* Callee = Strip(First(*N));
@@ -1607,6 +1636,21 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     if (Text.empty()) { *Err = "clang produced no AST at " + AstPath; return false; }
     Doc = Json::parse(Text, nullptr, false);
     if (Doc.is_discarded()) { *Err = "could not parse clang's AST dump"; return false; }
+
+    const std::string ConvText = ReadText(IncludeDir + "/Conv.json");
+    const Json ConvDoc = Json::parse(ConvText, nullptr, false);
+    if (!ConvDoc.is_array()) { *Err = "missing or invalid " + IncludeDir + "/Conv.json (run genueapi.py)"; return false; }
+    for (const Json& Row : ConvDoc)
+    {
+        FConv C;
+        C.From = KindByName(Row.value("from", std::string()));
+        C.To = KindByName(Row.value("to", std::string()));
+        C.Package = Row.value("package", std::string());
+        C.Class = Row.value("class", std::string());
+        C.Fn = Row.value("fn", std::string());
+        for (const Json& E : Row["extra"]) C.Extra.push_back(E);
+        Convs.push_back(C);
+    }
 
     if (!Collect(Err)) return false;
 
