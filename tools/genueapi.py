@@ -56,6 +56,12 @@ TEXT_TYPES = {
     "FName":                 "FName",
     "const FName&":          "FName",
     "const FName &":         "FName",
+    "class FText":           "FText",
+    "const class FText&":    "FText",
+    "const class FText &":   "FText",
+    "FText":                 "FText",
+    "const FText&":          "FText",
+    "const FText &":         "FText",
 }
 
 
@@ -109,8 +115,6 @@ def parse_params(text):
 def parse_field(cur, m, skipped):
     raw, fname, bits = m.group(1), m.group(2), m.group(3)
     if fname.startswith(("Pad_", "BitPad_")):
-        return
-    if "FText" in raw:
         return
     mapped = "bool" if bits else map_type(raw)
     if mapped in KINDS or mapped == "void":

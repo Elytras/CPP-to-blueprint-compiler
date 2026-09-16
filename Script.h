@@ -27,6 +27,7 @@ FPropertyDef BoolParam(const std::string& Name, uint64 ExtraFlags = 0);
 FPropertyDef ByteParam(const std::string& Name, uint64 ExtraFlags = 0);
 FPropertyDef StringParam(const std::string& Name, uint64 ExtraFlags = 0);
 FPropertyDef NameParam(const std::string& Name, uint64 ExtraFlags = 0);
+FPropertyDef TextParam(const std::string& Name, uint64 ExtraFlags = 0);
 FPropertyDef ObjectParam(const std::string& Name, FIndex Class, uint64 ExtraFlags = 0);
 FPropertyDef StructParam(const std::string& Name, FIndex Struct, const std::string& StructName,
                          int32 Size, uint64 ExtraFlags = 0);
@@ -60,6 +61,7 @@ public:
     void NameConst(const std::string& NameStr);
     void StringConst(const std::string& Value);             // ANSI
     void UnicodeStringConst(const std::u16string& Value);   // UCS-2
+    void TextConst(const std::string& Value, bool bWide);   // EX_TextConst LiteralString
     void True();
     void False();
     void NoObject();

@@ -44,6 +44,12 @@ FPropertyDef NameParam(const std::string& Name, uint64 ExtraFlags)
                          CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, Null() };
 }
 
+FPropertyDef TextParam(const std::string& Name, uint64 ExtraFlags)
+{
+    return FPropertyDef{ "TextProperty", Name, RF_Public, 1, 24,
+                         CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, Null() };
+}
+
 FPropertyDef BoolParam(const std::string& Name, uint64 ExtraFlags)
 {
     return FPropertyDef{ "BoolProperty", Name, RF_Public, 1, 1,
@@ -79,6 +85,7 @@ void WriteZeroValueTag(FArc& Ar, const FPropertyDef& P)
         else if (P.Type == "Int64Property") V.I64(0);
         else if (P.Type == "ByteProperty") V.U8(0);
         else if (P.Type == "NameProperty") V.Name("None");
+        else if (P.Type == "TextProperty") { V.U32(0); V.U8(0xFF); V.I32(0); }   // flags, ETextHistoryType::None, no invariant string
         else if (P.Type == "StructProperty") TagEnd(V);
     }, P.StructName);
 }
@@ -220,6 +227,20 @@ void FScript::UnicodeStringConst(const std::u16string& Value)
     Ar.Raw(Value.data(), Value.size() * 2);
     Ar.U16(0);
     Memory += int32(Value.size() * 2) + 2;
+}
+
+void FScript::TextConst(const std::string& Value, bool bWide)
+{
+    Op(EX_TextConst);
+    Ar.U8(3);                           // EBlueprintTextLiteralType::LiteralString
+    Memory += 1;
+    if (bWide)
+    {
+        std::u16string W;
+        for (unsigned char C : Value) W.push_back(char16_t(C));
+        UnicodeStringConst(W);
+    }
+    else StringConst(Value);
 }
 
 void FScript::True() { Op(EX_True); }
