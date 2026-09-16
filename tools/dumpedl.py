@@ -1,19 +1,5 @@
 ﻿#!/usr/bin/env python3
-"""Print a cooked package's event-driven-loader preload dependency table, with names resolved.
-
-The EDL table is the part of a package that decides load ORDER, and getting it wrong does not
-corrupt anything - it produces "Missing Dependency, request for X but it was still waiting for
-serialization" at runtime and nothing at all offline. So it is worth reading out of assets that
-are known to load, rather than reasoned about.
-
-Each export declares four lists, in the order the loader reads them:
-  SerBeforeSer     these must be SERIALIZED before I am serialized
-  CreateBeforeSer  these must be CREATED before I am serialized
-  SerBeforeCreate  these must be SERIALIZED before I am created
-  CreateBeforeCre  these must be CREATED before I am created
-
-usage: dumpedl.py <file.uasset>
-"""
+"""usage: dumpedl.py <file.uasset>"""
 import io
 import struct
 import sys
@@ -51,7 +37,8 @@ def main():
         sys.exit(__doc__.strip().splitlines()[-1])
     data = io.open(sys.argv[1], "rb").read()
 
-    r = Reader(data, 4)                             # skip the magic
+    # UE4.27 PackageFileSummary.cpp, PKG_FilterEditorOnly form (no LocalizationId / PersistentGuid).
+    r = Reader(data, 4)                             # magic
     r.i32()                                         # LegacyFileVersion
     r.i32()                                         # LegacyUE3Version
     r.i32()                                         # FileVersionUE4
@@ -62,7 +49,6 @@ def main():
     r.fstring()                                     # FolderName
     r.i32()                                         # PackageFlags
     name_count, name_off = r.i32(), r.i32()
-    # LocalizationId and PersistentGuid are absent: these packages set PKG_FilterEditorOnly.
     r.i32(); r.i32()                                # GatherableTextData count/offset
     export_count, export_off = r.i32(), r.i32()
     import_count, import_off = r.i32(), r.i32()
@@ -116,7 +102,6 @@ def main():
         exports.append(obj)
         dep_meta.append((first, counts))
 
-    # The summary states where the table is; every dep index is relative to its start.
     total = preload_count
     deps = list(struct.unpack_from("<%di" % total, data, preload_off)) if total else []
 

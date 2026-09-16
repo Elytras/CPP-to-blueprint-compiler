@@ -1,18 +1,5 @@
 ﻿/*
-Main.cpp — the AssetGen driver.
-
-Two modes, answering different questions.
-
-`verify` rebuilds a real cooked DRG asset (_ElytrasMods/Autosprint/InitCave) and diffs it
-against Epic's own bytes. That is the regression gate on the package format: if the container
-ever drifts, this catches it offline, with no game and no editor involved.
-
-`compile` writes the actual deliverable. Its classes come from a mod source that clang has
-already type-checked, so a misspelled function or a base class that does not exist is a
-compile error rather than an asset that loads and misbehaves. Nothing verifies the result
-but the game, which is rather the point of it.
-
-usage: assetgen verify <out-dir> <reference-dir>
+usage: assetgen verify <out-dir> <reference-dir>     rebuilds Autosprint/InitCave and byte-diffs it against the cooked original
        assetgen compile <source.cpp> <include-dir> <out-dir>
 */
 #include <cstdio>
@@ -28,8 +15,6 @@ using namespace Uasset;
 
 namespace
 {
-/* ---- the regression specimen ---- */
-
 void BuildInitCave(FPackage& P, const std::string& ParentPkg, const std::string& ParentClass,
                    const std::string& ClassName)
 {

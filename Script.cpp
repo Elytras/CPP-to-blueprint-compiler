@@ -1,17 +1,4 @@
-﻿/*
-Script.cpp — property, function and bytecode emission.
-
-The layouts here were read out of cooked DRG assets byte by byte and then checked against UE
-4.27's serializers, because every one of them has a detail that guessing gets wrong: a
-property carries ElementSize as well as ArrayDim, a UStruct's Children is an array rather
-than the linked-list head the runtime type suggests, and a property referenced from bytecode
-is a whole FFieldPath on disk even though it is one pointer in memory.
-
-That last point is why FScript tracks two sizes. The engine stores both and they disagree by
-design; writing the same number twice produces an asset that loads and then reads past the
-end of its own script.
-*/
-#include "Script.h"
+﻿#include "Script.h"
 
 #include <cstring>
 
@@ -19,7 +6,6 @@ namespace Uasset
 {
 namespace
 {
-/* On disk an object reference is a 4-byte FPackageIndex; once loaded it is a pointer. */
 constexpr int32 kDiskObjectRef = 4;
 constexpr int32 kMemObjectRef = 8;
 constexpr int32 kFNameSize = 8;
@@ -47,20 +33,13 @@ FPropertyDef Int64Param(const std::string& Name, uint64 ExtraFlags)
 
 FPropertyDef StringParam(const std::string& Name, uint64 ExtraFlags)
 {
-    /*
-    An FString on the wire; ElementSize is what the engine stores per instance - a TArray<TCHAR>
-    header, three int32 wide - not the length of any particular string.
-    */
+    // ElementSize 16 = the TArray<TCHAR> header, not any string's length.
     return FPropertyDef{ "StrProperty", Name, RF_Public, 1, 16,
                          CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, Null() };
 }
 
 FPropertyDef NameParam(const std::string& Name, uint64 ExtraFlags)
 {
-    /*
-    An FName on the wire: two int32s (a comparison index and an instance number). ElementSize
-    is 8 - what the engine stores per instance, independent of any particular name's spelling.
-    */
     return FPropertyDef{ "NameProperty", Name, RF_Public, 1, 8,
                          CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, Null() };
 }
@@ -68,6 +47,12 @@ FPropertyDef NameParam(const std::string& Name, uint64 ExtraFlags)
 FPropertyDef BoolParam(const std::string& Name, uint64 ExtraFlags)
 {
     return FPropertyDef{ "BoolProperty", Name, RF_Public, 1, 1,
+                         CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, Null() };
+}
+
+FPropertyDef ByteParam(const std::string& Name, uint64 ExtraFlags)
+{
+    return FPropertyDef{ "ByteProperty", Name, RF_Public, 1, 1,
                          CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, Null() };
 }
 
@@ -79,7 +64,7 @@ FPropertyDef ObjectParam(const std::string& Name, FIndex Class, uint64 ExtraFlag
 
 void WriteProperty(FArc& Ar, const FPropertyDef& P)
 {
-    Ar.Name(P.Type);                    // the FField class, e.g. "FloatProperty"
+    Ar.Name(P.Type);
 
     Ar.Name(P.Name);                    // FField::Serialize
     Ar.U32(P.ObjectFlags);
@@ -91,27 +76,24 @@ void WriteProperty(FArc& Ar, const FPropertyDef& P)
     Ar.Name("None");                    // RepNotifyFunc
     Ar.U8(0);                           // BlueprintReplicationCondition
 
-    /*
-    The type's own tail. Only the kinds the generator emits are handled; anything else would
-    have to invent bytes it cannot know, so it is left to fail at the call site instead.
-    */
     if (P.Type == "ObjectProperty" || P.Type == "ClassProperty")
         Ar.Idx(P.Extra);                // PropertyClass
     else if (P.Type == "StructProperty")
-        Ar.Idx(P.Extra);                // the UScriptStruct
+        Ar.Idx(P.Extra);                // Struct
     else if (P.Type == "BoolProperty")
     {
-        // A whole-byte bool rather than a bitfield: it owns the byte, so the field mask is full.
+        // Whole-byte bool, not a bitfield.
         Ar.U8(1);                       // FieldSize
         Ar.U8(0);                       // ByteOffset
         Ar.U8(1);                       // ByteMask
         Ar.U8(0xFF);                    // FieldMask
         Ar.U8(1);                       // BoolSize
-        Ar.U8(0);                       // NativeBool - declared by a Blueprint, not by C++
+        Ar.U8(0);                       // NativeBool
     }
-    // FloatProperty, IntProperty, NameProperty, StrProperty: no tail.
+    else if (P.Type == "ByteProperty")
+        Ar.Idx(P.Extra);                // Enum
     // TODO: unimplemented tails - ArrayProperty (Inner), MapProperty, SetProperty,
-    // EnumProperty (Enum + UnderlyingProp), ByteProperty (Enum), DelegateProperty (SignatureFunction).
+    // EnumProperty (Enum + UnderlyingProp), DelegateProperty (SignatureFunction).
 }
 
 /* ---- bytecode ---- */
@@ -130,17 +112,12 @@ void FScript::EndFunctionParms() { Op(EX_EndFunctionParms); }
 void FScript::Return()
 {
     Op(EX_Return);
-    Op(EX_Nothing);                     // the return expression: this function returns nothing
+    Op(EX_Nothing);
 }
 
 void FScript::Return(const std::function<void(FScript&)>& Value)
 {
-    /*
-    A value return: the VM evaluates the expression into the function's ReturnValue property
-    slot, so the caller can just read the property after the call. Which property is looked up
-    by name (the parm chain must carry a "ReturnValue" entry with the matching type); the
-    bytecode only carries the value expression.
-    */
+    // The parm chain must carry a "ReturnValue" entry of the matching type; the VM finds it by name.
     Op(EX_Return);
     Value(*this);
 }
@@ -170,7 +147,7 @@ int32 FScript::Jump(int32 MemTarget)
 {
     Op(EX_Jump);
     const int32 PatchAt = int32(Ar.B.size());
-    Ar.U32(uint32(MemTarget));                      // memory offset into this script
+    Ar.U32(uint32(MemTarget));
     Memory += 4;
     return PatchAt;
 }
@@ -181,14 +158,13 @@ int32 FScript::JumpIfNot(int32 MemTarget, const std::function<void(FScript&)>& C
     const int32 PatchAt = int32(Ar.B.size());
     Ar.U32(uint32(MemTarget));
     Memory += 4;
-    Cond(*this);                                    // the boolean expression to test
+    Cond(*this);
     return PatchAt;
 }
 
 void FScript::PatchJumpTarget(int32 StorageOffset, int32 MemTarget)
 {
     const uint32 V = uint32(MemTarget);
-    /* Direct byte poke into the already-written stream; endianness matches Ar.U32. */
     Ar.B[StorageOffset + 0] = uint8(V);
     Ar.B[StorageOffset + 1] = uint8(V >> 8);
     Ar.B[StorageOffset + 2] = uint8(V >> 16);
@@ -202,6 +178,13 @@ void FScript::FloatConst(float Value)
     Memory += 4;
 }
 
+void FScript::NameConst(const std::string& NameStr)
+{
+    Op(EX_NameConst);
+    Ar.Name(NameStr);
+    Memory += kFNameSize;
+}
+
 void FScript::StringConst(const std::string& Value)
 {
     Op(EX_StringConst);
@@ -212,12 +195,6 @@ void FScript::StringConst(const std::string& Value)
 
 void FScript::UnicodeStringConst(const std::u16string& Value)
 {
-    /*
-    UE stores an FString as widechar - a mod source that spells its literal L"..." should reach
-    the VM as UCS-2 so the loaded FString does not have to be reconstructed from a narrow copy.
-    Two bytes per code unit, one two-byte null terminator: what the disassembler's
-    ReadUnicodeString mirrors on the way out.
-    */
     Op(EX_UnicodeStringConst);
     Ar.Raw(Value.data(), Value.size() * 2);
     Ar.U16(0);
@@ -237,11 +214,7 @@ void FScript::ObjectConst(FIndex Object)
 
 void FScript::FieldPath(const std::string& PropertyName, FIndex Owner)
 {
-    /*
-    A property reference serializes as the path that finds it again: how many name segments,
-    the segments themselves, then the object that owns the outermost one. In memory the same
-    reference collapses to a single pointer, which is the entire reason MemorySize exists.
-    */
+    // On disk: segment count, segments, owning object. In memory: one pointer.
     Ar.I32(1);
     Ar.Name(PropertyName);
     Ar.Idx(Owner);
@@ -250,7 +223,7 @@ void FScript::FieldPath(const std::string& PropertyName, FIndex Owner)
 
 void FScript::NullFieldPath()
 {
-    Ar.I32(0);                          // an empty path
+    Ar.I32(0);
     Ar.Idx(Null());
     Memory += kMemObjectRef;
 }
@@ -258,6 +231,12 @@ void FScript::NullFieldPath()
 void FScript::LocalVariable(const std::string& PropertyName, FIndex Owner)
 {
     Op(EX_LocalVariable);
+    FieldPath(PropertyName, Owner);
+}
+
+void FScript::LocalOutVariable(const std::string& PropertyName, FIndex Owner)
+{
+    Op(EX_LocalOutVariable);
     FieldPath(PropertyName, Owner);
 }
 
@@ -271,8 +250,8 @@ void FScript::StructMember(const std::string& MemberName, FIndex MemberOwner,
                            const std::function<void(FScript&)>& StructExpr)
 {
     Op(EX_StructMemberContext);
-    FieldPath(MemberName, MemberOwner);     // the member: a pointer in memory, an FFieldPath on disk
-    StructExpr(*this);                       // the expression yielding the struct's address
+    FieldPath(MemberName, MemberOwner);
+    StructExpr(*this);
 }
 
 void FScript::Let(EExprToken LetOp, const std::string& PropertyName, FIndex Owner,
@@ -281,7 +260,7 @@ void FScript::Let(EExprToken LetOp, const std::string& PropertyName, FIndex Owne
 {
     Op(LetOp);
     if (LetOp == EX_Let)
-        FieldPath(PropertyName, Owner);     // only the general form names its destination
+        FieldPath(PropertyName, Owner);
     Var(*this);
     Value(*this);
 }
@@ -292,17 +271,13 @@ void FScript::Context(const std::function<void(FScript&)>& ObjectExpr,
     Op(EX_Context);
     ObjectExpr(*this);
 
-    /*
-    The skip count lets the VM jump the whole call when the target turns out to be null, and
-    it is expressed in loaded bytes. So the context expression is built separately, measured,
-    and only then spliced in behind its own length.
-    */
+    // Skip count is MEMORY bytes, so the inner expression is built and measured separately first.
     FScript Inner(Ar.Owner());
     ContextExpr(Inner);
 
     Ar.I32(Inner.MemorySize());
     Memory += 4;
-    NullFieldPath();                    // RValuePointer: nothing is assigned from the call
+    NullFieldPath();                    // RValuePointer
     Ar.Raw(Inner.Bytes().data(), Inner.Bytes().size());
     Memory += Inner.MemorySize();
 }
@@ -368,31 +343,23 @@ int32 AddFunctionExport(FPackage& P, const FFunctionDef& Def, FIndex OwnerClass,
     E.ObjectName = Def.Name;
     E.ObjectFlags = RF_Public;
 
-    /*
-    A function's preload dependencies, as a real cooked class states them: everything the
-    bytecode reaches must be CREATED before this function is serialized, and the class it lives
-    in must be created before it is. Note what is absent - a function declares no
-    serialize-before-create for its own class or template, unlike every other export here.
-    */
+    // As cooked: bytecode refs are CreateBeforeSer, the owning class CreateBeforeCreate,
+    // and no SerBeforeCreate for class/template (unlike every other export).
     E.CreateBeforeSer = BytecodeRefs;
     E.CreateBeforeCreate = { OwnerClass.V };
 
     const FFunctionDef Captured = Def;
     E.Serialize = [Captured, Body](FArc& Ar) {
-        TagEnd(Ar);                     // a UFunction has no reflected properties of its own
-        Ar.Bool(false);                 // no lazy-object guid
+        TagEnd(Ar);
+        Ar.Bool(false);                 // lazy-object guid
 
         Ar.Idx(Captured.Super);         // UStruct::SuperStruct
-        Ar.I32(0);                      // Children: a function owns no UFields
+        Ar.I32(0);                      // Children
 
         Ar.I32(int32(Captured.Params.size()));
         for (const FPropertyDef& Prop : Captured.Params)
             WriteProperty(Ar, Prop);
 
-        /*
-        The script is built against the same package so its FNames land in the one name table,
-        then written behind its two sizes: what it costs loaded, and what it costs here.
-        */
         FScript Script(Ar.Owner());
         Body(Script);
         Ar.I32(Script.MemorySize());

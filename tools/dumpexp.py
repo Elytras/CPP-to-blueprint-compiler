@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""Dump one cooked export's payload with FName / FPackageIndex annotations.
-
-usage: dumpexp.py <base-path-without-ext> <export-index> [count]
-"""
+"""usage: dumpexp.py <base-path-without-ext> <export-index> [count]"""
 import struct, sys
 
 class R:

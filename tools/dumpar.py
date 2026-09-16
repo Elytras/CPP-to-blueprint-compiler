@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
-"""Read back an AssetRegistry.bin and print the assets it declares.
-
-The check on the registry writer: the engine is the only real consumer, so the next best
-control is an independent reader that walks the same three sections (name batch, fixed tag
-store, body) and insists the file ends exactly where the body does. A writer that gets a count,
-a magic or a name index wrong fails here rather than in a silent no-op at game startup.
-
-usage: dumpar.py <AssetRegistry.bin>
-"""
+"""usage: dumpar.py <AssetRegistry.bin>"""
 import struct
 import sys
 
@@ -44,13 +36,13 @@ class Reader(object):
 
 
 def read_name_batch(r):
-    """The batch is counts, then hashes / 2-byte headers / string bytes as three runs."""
+    """Counts, then hashes / 2-byte headers / string bytes as three runs."""
     count = r.u32()
     if count == 0:
         return []
     string_bytes = r.u32()
     r.u64()                                     # hash algorithm id
-    r.take(8 * count)                           # hashes, recomputed by the loader when stale
+    r.take(8 * count)                           # hashes
 
     headers = [r.take(2) for _ in range(count)]
     strings = r.take(string_bytes)
@@ -69,7 +61,6 @@ def read_name_batch(r):
 
 
 def read_store(r):
-    """An empty store is all this writer emits; anything else means the tag format got used."""
     if r.u32() != BEGIN_MAGIC:
         sys.exit("tag store: bad begin magic")
     counts = [r.i32() for _ in range(STORE_VIEWS)]

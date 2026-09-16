@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""Emit AssetGen/UeEnums.h from UE 4.27's own headers, so the values can't drift by transcription.
-
-The enums a package writer has to get exactly right - Kismet opcodes and the flag words on
-functions, properties, classes and exports - are generated rather than hand-copied, because a
-single mistyped bit produces an asset that loads and then misbehaves.
-
-usage: genenums.py <path to UE_4.27/Engine/Source/Runtime>
-"""
+"""usage: genenums.py <path to UE_4.27/Engine/Source/Runtime>"""
 import re, io, os, sys
 
 if len(sys.argv) < 2:
@@ -18,7 +11,7 @@ MACROS = UE + "/CoreUObject/Public/UObject/ObjectMacros.h"
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "UeEnums.h")
 
 def grab(path, enum_name):
-    """Pull (name, value, comment) triples out of one enum block."""
+    """(name, value, comment) triples from one enum block."""
     text = io.open(path, encoding="utf-8", errors="replace").read()
     m = re.search(r"enum\s+" + enum_name + r"\s*(?::\s*\w+\s*)?\{", text)
     if not m:

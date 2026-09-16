@@ -1,17 +1,4 @@
-﻿/*
-Cpp.cpp — clang's AST, walked into packages.
-
-Two passes per function body, and the split matters. The first resolves every call to an import
-and lowers the body into a tiny IR; the second replays that IR as bytecode from inside the
-export's serialize closure. They cannot be one pass, because imports have to be added before
-the import table is written and the closure runs after — resolving a function name lazily would
-append a row to a table that is already on disk.
-
-The IR is also where the subset is enforced. By the time a closure exists, every construct in
-the body has already been accepted or rejected by name, so emission cannot fail and there is no
-half-written asset to explain.
-*/
-#include "Cpp.h"
+﻿#include "Cpp.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -58,13 +45,8 @@ std::string TypeOf(const Json& N)
     return It == N.end() ? std::string() : It->value("qualType", std::string());
 }
 
-/* Casts, parens and temporaries carry no meaning here; the operand underneath does.
-
-   CXXConstructExpr is stripped too - a Types.h wrapper like FString or FName has an implicit
-   constructor from a string literal, so `PostGameMessage("hi")` reaches the emitter as
-   CXXConstructExpr(FString, StringLiteral). Only the string literal matters for lowering; the
-   constructor is a compile-surface artifact. This does drop later constructor args if any, so
-   it is safe only because our wrappers take a single literal. */
+/* Stripping CXXConstructExpr drops any ctor args after the first; safe only because the
+   Types.h wrappers take a single literal. */
 const Json* Strip(const Json* N)
 {
     while (N)
@@ -91,7 +73,6 @@ void ForEach(const Json& N, const F& Fn)
     for (const Json& C : *It) Fn(C);
 }
 
-/* The literal as C++ meant it: clang reports the source spelling, quotes and escapes included. */
 std::string Unquote(const std::string& Spelling)
 {
     if (Spelling.size() < 2) return Spelling;
@@ -106,13 +87,12 @@ std::string Unquote(const std::string& Spelling)
         case 't': Out.push_back('\t'); break;
         case 'r': Out.push_back('\r'); break;
         case '0': Out.push_back('\0'); break;
-        default: Out.push_back(C); break;       // covers \\ , \" and \'
+        default: Out.push_back(C); break;
         }
     }
     return Out;
 }
 
-/* The first string literal under a node — how UE_CLASS and UE_MOD_PACKAGE reach the generator. */
 bool FindLiteral(const Json& N, std::string& Out)
 {
     if (Kind(N) == "StringLiteral" && N.contains("value"))
@@ -125,101 +105,87 @@ bool FindLiteral(const Json& N, std::string& Out)
     return bFound;
 }
 
-/* Whether a declaration is `static`. clang spells the storage class on the declaration itself. */
 bool IsStaticDecl(const Json& Decl) { return Decl.value("storageClass", std::string()) == "static"; }
 
 struct FRecord
 {
     std::string CppName;
-    std::string UePackage;                          // set by UE_CLASS; empty means "declared here"
+    std::string UePackage;                          // from UE_CLASS; empty = declared here
     std::string UeName;
     std::string Base;
-    std::map<std::string, const Json*> Methods;     // method name -> CXXMethodDecl
-    std::vector<const Json*> Fields;                // FieldDecl, in declaration order
+    std::map<std::string, const Json*> Methods;     // in-class decl (carries storageClass)
+    std::map<std::string, const Json*> MethodDefs;  // out-of-line definition (carries body/parms)
+    std::vector<const Json*> Fields;
+    bool bIsLocal = false;      // UePackage == ModPackage/CppName: cooked here, published at its /Game path
 
-    bool IsNative() const { return !UePackage.empty(); }
+    bool IsNative() const { return !UePackage.empty() && !bIsLocal; }
 };
-
-/* ---- the body IR ---- */
 
 struct FCallIR;
 
 struct FArgIR
 {
-    enum EKind { Self, Int, Float, Bool, Str, Field, Local, Call, NullObj } K = Self;
+    enum EKind { Self, Int, Int64, Float, Bool, Str, Name, Field, Local, LocalOut, Call, NullObj } K = Self;
     int32 I = 0;
+    int64 I64 = 0;
     float F = 0.0f;
     bool B = false;
-    bool bWide = false;     // Str: true = UCS-2 literal, emit EX_UnicodeStringConst
-    std::string S;          // Str: the literal. Field/Local: the property name.
-    FIndex Owner;           // Field: the class that declares it (Local owner = function itself, resolved at emit)
-    EExprToken LetOp = EX_Let;      // Field: the opcode that writes this type
-    std::shared_ptr<FCallIR> Sub;   // Call: the nested call/intrinsic that produces this value
+    bool bWide = false;     // Str: emit EX_UnicodeStringConst
+    std::string S;          // Str: the literal; Field/Local/LocalOut: the property name
+    FIndex Owner;           // Field: declaring class (locals are owned by the function, resolved at emit)
+    EExprToken LetOp = EX_Let;
+    std::shared_ptr<FCallIR> Sub;
 };
 
 struct FCallIR
 {
-    FIndex Fn;                          // Fn is set for a resolved UFunction; empty for intrinsics
-    std::string Intrinsic;              // non-empty when this is an __NAME__ compiler intrinsic
-    FIndex Extra;                       // Intrinsic: an auxiliary import (e.g. the donor script struct)
-    FIndex Extra2;                      // Intrinsic: a second auxiliary import (used by two-step puns)
-    bool bScript = false;               // the callee is Blueprint bytecode, not a native function
-    FIndex Context;                     // the CDO a static call runs against; null = call on self
+    FIndex Fn;                          // empty for intrinsics
+    std::string Intrinsic;              // __NAME__ compiler intrinsic
+    FIndex Extra;
+    FIndex Extra2;
+    bool bScript = false;               // callee is Blueprint bytecode
+    FIndex Context;                     // CDO a static call runs against; null = self
     std::vector<FArgIR> Args;
 };
 
-/*
-Writes the call itself - the opcode, not its arguments.
-
-Which opcode is not a preference. EX_CallMath dereferences UFunction::Func and calls it with
-the CALLER's frame, which is only correct for a native function; for one implemented in
-bytecode Func is UObject::ProcessInternal, which would then run the callee against a frame
-that describes the caller. EX_FinalFunction routes through UFunction::Invoke, which builds the
-callee its own frame, so that is what a call into another generated class has to use.
-*/
+/* EX_CallMath calls UFunction::Func with the CALLER's frame, which is only correct for a native;
+   a bytecode callee must go through EX_FinalFunction (UFunction::Invoke builds its own frame). */
 void EmitCallOp(FScript& S, const FCallIR& Call)
 {
     if (Call.bScript) S.FinalFunction(Call.Fn);
     else S.CallMath(Call.Fn);
 }
 
-/* A whole call: the context it runs against, the opcode, its arguments, and the terminator. */
 bool EmitCall(FScript& S, const FCallIR& Call, FIndex SelfExp, std::string* Err);
 
-/*
-One statement. The shapes a generated event actually needs: reach a subsystem and tell it
-something, call something on yourself, or write one of your own properties.
-*/
 struct FStmtIR
 {
     enum EKind
     {
-        StaticCall,     // a static library call, standing alone (not `Call`: that is a member)
-        TargetCall,     // a call on the object another call produced
-        SelfCall,       // a call on `this`
-        Assign,         // `this->Field = value`
-        Decl,           // `int64 x [= value];` - a function-local scratch variable
-        Return,         // `return <value>;` - Value carries what to return (or Self kind = void)
+        StaticCall,
+        TargetCall,     // call on the object another call produced
+        SelfCall,
+        Assign,
+        Decl,
+        Return,
+        If,
+        While,
     } K = StaticCall;
 
     FCallIR Target;
     FCallIR Call;
-    FArgIR Var;                 // Assign / Decl: the destination (Decl: a Local, Var.S = its name)
-    FArgIR Value;                // Assign / Decl / Return: what is written or returned
-    bool bHasValue = false;      // Return / Decl: false = no value (void return / uninitialised local)
+    FArgIR Var;
+    FArgIR Value;
+    FArgIR Cond;
+    bool bHasValue = false;
+    std::shared_ptr<std::vector<FStmtIR>> Then;
+    std::shared_ptr<std::vector<FStmtIR>> Else;
+    std::shared_ptr<std::vector<FStmtIR>> Body;
+    bool bAssignLocal = false;
+    bool bAssignOutParm = false;
 };
 
-/*
-Emits one argument, or fails with a named error when the argument is a not-yet-supported call.
-
-SelfExp is the enclosing function's own export index - EX_LocalVariable's FFieldPath owner
-because a param property lives on its function. Nothing else at emit-time needs it.
-
-Intrinsics (a call whose IR carries an Intrinsic name) are the __NAME__ compiler helpers
-declared in Types.h / ReadProperty.cpp - they do not name a UFunction, so calling one goes
-through a per-name lowering rather than through a normal EX_CallMath. Only the intrinsics with
-a switch arm below are actually emittable; the rest are rejected at Lower time.
-*/
+/* SelfExp: the enclosing function's export index, FFieldPath owner of its params and locals. */
 bool EmitArgs(FScript& S, const std::vector<FArgIR>& Args, FIndex SelfExp, std::string* Err);
 
 bool EmitArg(FScript& S, const FArgIR& A, FIndex SelfExp, std::string* Err)
@@ -229,18 +195,14 @@ bool EmitArg(FScript& S, const FArgIR& A, FIndex SelfExp, std::string* Err)
     case FArgIR::Self:    S.Self(); return true;
     case FArgIR::NullObj: S.NoObject(); return true;
     case FArgIR::Int:   S.IntConst(A.I); return true;
+    case FArgIR::Int64: S.Int64Const(A.I64); return true;
     case FArgIR::Float: S.FloatConst(A.F); return true;
     case FArgIR::Bool:  A.B ? S.True() : S.False(); return true;
+    case FArgIR::Name:  S.NameConst(A.S); return true;
     case FArgIR::Str:
         if (A.bWide)
         {
-            /*
-            Widen the narrow byte stream we captured from the AST: clang reports a wide-string
-            literal as its source spelling, so a mod that writes L"hi" arrives here as "hi" +
-            bWide=true. Anything above 0x7F is a non-ASCII code point that a proper UTF-8 or
-            UTF-16 decode would need to handle - the mod sources this needs today are ASCII
-            names/messages, so a byte-by-byte widen is enough.
-            */
+            /* clang reports L"hi" as the narrow spelling; byte-widening is enough for ASCII sources. */
             std::u16string W;
             W.reserve(A.S.size());
             for (unsigned char C : A.S) W.push_back(char16_t(C));
@@ -253,63 +215,66 @@ bool EmitArg(FScript& S, const FArgIR& A, FIndex SelfExp, std::string* Err)
         return true;
     case FArgIR::Field: S.InstanceVariable(A.S, A.Owner); return true;
     case FArgIR::Local: S.LocalVariable(A.S, SelfExp); return true;
+    case FArgIR::LocalOut: S.LocalOutVariable(A.S, SelfExp); return true;
     case FArgIR::Call:
         if (!A.Sub) { if (Err) *Err = "internal: Call arg has no sub-call"; return false; }
-        if (A.Sub->Intrinsic == "__AddrOf__")
+        if (A.Sub->Intrinsic == "__CurrentFunction__")
         {
-            /*
-            Type-confusion read: read the 8 bytes at the argument's storage AS the uint64 Key of
-            FScreenMessageString. StructMemberContext copies Member.ElementSize (8) bytes from
-            (innerAddress + Member.Offset_Internal). Key's offset is 0, so the copy is straight
-            out of the argument's own storage - which for a pointer-typed parameter is the
-            pointer value itself, returned as int64.
-            */
+            S.ObjectConst(SelfExp);
+            return true;
+        }
+        if (A.Sub->Intrinsic == "__AddrOf__" || A.Sub->Intrinsic == "__NameIndex__")
+        {
+            /* StructMember with a donor field at Offset_Internal=0 copies ElementSize bytes straight out
+               of the argument's own storage: ScreenMessageString.Key (8) / IntPoint.X (4 = ComparisonIndex). */
+            const std::string InnerField = A.Sub->Intrinsic == "__AddrOf__" ? "Key" : "X";
             if (A.Sub->Args.size() != 1)
             {
-                if (Err) *Err = "__AddrOf__ takes exactly one argument";
+                if (Err) *Err = A.Sub->Intrinsic + " takes exactly one argument";
                 return false;
             }
             const FArgIR& Inner = A.Sub->Args[0];
             std::string SubErr;
             bool bInnerOk = true;
-            S.StructMember("Key", A.Sub->Extra,
+            S.StructMember(InnerField, A.Sub->Extra,
                 [&](FScript& Ctx) { bInnerOk = EmitArg(Ctx, Inner, SelfExp, &SubErr); });
             if (!bInnerOk) { if (Err) *Err = SubErr; return false; }
             return true;
         }
-        if (A.Sub->Intrinsic == "__Read64__")
+        if (A.Sub->Intrinsic == "__Read64__" || A.Sub->Intrinsic == "__Read32__"
+            || A.Sub->Intrinsic == "__ReadFloat__" || A.Sub->Intrinsic == "__ReadByte__"
+            || A.Sub->Intrinsic == "__ReadObject__" || A.Sub->Intrinsic == "__ReadName__")
         {
-            /*
-            Emit `Context(StructMember(DataTable@0 on FDataTableRowHandle, arg),
-            InstanceVariable(Key on FScreenMessageString))`. The inner LocalVariable
-            for `arg` supplies &AddrSlot; StructMember reads those 8 bytes as UObject*;
-            EX_Context makes that the current object; EX_InstanceVariable(Key@0) reads
-            8 bytes at obj+0 = Addr as uint64. Net: RESULT = *(int64*)Addr.
+            /* Outer pun DataTableRowHandle.DataTable @0 reinterprets the int64 as Stack.Object; the inner
+               InstanceVariable then copies donor.ElementSize bytes from Addr+0. Every donor must be a
+               top-level UScriptStruct (OwnerChainDepth=0) or execInstanceVariable_bypass.lua rejects it. */
+            std::string InnerField;
+            if (A.Sub->Intrinsic == "__Read64__")        InnerField = "Key";
+            else if (A.Sub->Intrinsic == "__Read32__")   InnerField = "X";
+            else if (A.Sub->Intrinsic == "__ReadFloat__") InnerField = "X";
+            else if (A.Sub->Intrinsic == "__ReadByte__")  InnerField = "B";
+            else if (A.Sub->Intrinsic == "__ReadObject__") InnerField = "DataTable";
+            else /* __ReadName__ */                       InnerField = "AssetPathName";
 
-            EX_Context's skip counts MEMORY bytes and is measured for us by Context()
-            (the same mechanism CDO-context calls use elsewhere), so no manual patch.
-            */
             if (A.Sub->Args.size() != 1)
             {
-                if (Err) *Err = "__Read64__ takes exactly one argument (the address)";
+                if (Err) *Err = A.Sub->Intrinsic + " takes exactly one argument (the address)";
                 return false;
             }
             const FArgIR& Inner = A.Sub->Args[0];
             const FIndex DataTableStruct = A.Sub->Extra;
-            const FIndex ScreenMsgStruct = A.Sub->Extra2;
+            const FIndex InnerStruct = A.Sub->Extra2;
             std::string SubErr;
             bool bInnerOk = true;
             S.Context(
                 [&](FScript& O)
                 {
-                    /* Pun the arg's 8 bytes as UObject*: read DataTable@0 off the arg slot. */
                     O.StructMember("DataTable", DataTableStruct,
                         [&](FScript& I) { bInnerOk = EmitArg(I, Inner, SelfExp, &SubErr); });
                 },
                 [&](FScript& C)
                 {
-                    /* Deref: read Key@0 off Stack.Object (our address), 8 bytes typed as uint64. */
-                    C.InstanceVariable("Key", ScreenMsgStruct);
+                    C.InstanceVariable(InnerField, InnerStruct);
                 });
             if (!bInnerOk) { if (Err) *Err = SubErr; return false; }
             return true;
@@ -319,11 +284,6 @@ bool EmitArg(FScript& S, const FArgIR& A, FIndex SelfExp, std::string* Err)
             if (Err) *Err = "TODO: unimplemented intrinsic " + A.Sub->Intrinsic;
             return false;
         }
-        /*
-        A call whose value flows into the surrounding expression. The VM leaves a call's return
-        value where the enclosing expression reads its operand from, so nesting one needs no
-        temporary - the call expression simply stands where a literal would.
-        */
         return EmitCall(S, *A.Sub, SelfExp, Err);
     }
     if (Err) *Err = "internal: unknown argument kind";
@@ -339,12 +299,7 @@ bool EmitArgs(FScript& S, const std::vector<FArgIR>& Args, FIndex SelfExp, std::
 
 bool EmitCall(FScript& S, const FCallIR& Call, FIndex SelfExp, std::string* Err)
 {
-    /*
-    A static function runs against the CDO of the class that declares it, not against whatever
-    object happens to be running the caller - so the call is wrapped in an EX_Context naming
-    that CDO. EX_CallMath is the exception: it looks the CDO up itself from the function's own
-    outer, which is exactly why a native static library call needs no context at all.
-    */
+    /* A static call runs against its class's CDO via EX_Context; EX_CallMath finds the CDO itself. */
     if (Call.Context.V != 0)
     {
         bool bOk = true;
@@ -367,7 +322,6 @@ bool EmitCall(FScript& S, const FCallIR& Call, FIndex SelfExp, std::string* Err)
     return true;
 }
 
-/* Gives a generated package a stable identity, with no editor around to allocate one. */
 void StampIdentity(FPackage& P, const std::string& PackageName)
 {
     const uint32 H = StrCrc32(PackageName);
@@ -402,18 +356,10 @@ private:
     bool LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     bool LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
 
-    /* The native function behind an override, found by walking the declared ancestry. */
     FIndex FindEvent(FBlueprintClass& BP, const std::string& FromRecord, const std::string& Method);
 
-    /*
-    A class by the name a mod spelled.
-
-    Records are keyed on the QUALIFIED name, because a Blueprint class is namespaced by its
-    /Game path (genueapi.py) and several assets can share a leaf name - 32 of them are called
-    InitCave_C in this game. A bare name is then resolved through Bare, which holds only the
-    names exactly one class claims; an ambiguous one is absent, so it fails to resolve here
-    rather than silently picking whichever class was collected last.
-    */
+    /* Records are keyed by qualified name; Bare holds only leaf names exactly one class claims,
+       so an ambiguous bare name fails instead of picking the last class collected. */
     const FRecord* Find(const std::string& CppName) const
     {
         auto It = Records.find(CppName);
@@ -430,19 +376,94 @@ private:
     std::map<std::string, std::string> MethodOwner;   // clang decl id -> owning record
     std::map<std::string, std::string> FieldOwner;    // clang decl id -> declaring record
     std::map<std::string, std::string> Bare;          // unambiguous leaf name -> qualified name
-    const FRecord* Cur = nullptr;                     // the record Generate is working on
-
-    /* One row per generated class, baked into AssetRegistry.bin once the run succeeds. */
+    const FRecord* Cur = nullptr;                     // record Generate is working on
+    std::set<std::string> CurrentOutParms;            // T& parm names of the function being lowered
     std::vector<FRegistryAsset> RegistryRows;
 };
 
-/*
-Checks a UE_CLASS naming a Blueprint. Its package is the asset's own path, not the folder the
-asset sits in - `/Game/Mods/Lib/Lib`, not `/Game/Mods/Lib` - and a cooked BPGC is always the
-asset name plus "_C", so the two spellings have to agree. They are strings either way, and the
-folder form is the natural thing to write; it produces a package that does not exist, every
-import under it resolves to null, and the first sign of it is a null UFunction at call time.
-*/
+void EmitStmts(const std::vector<FStmtIR>& Stmts, FScript& S, FIndex SelfExp)
+{
+    for (const FStmtIR& St : Stmts)
+    {
+        switch (St.K)
+        {
+        case FStmtIR::TargetCall:
+            S.Context(
+                [St, SelfExp](FScript& O) { EmitCall(O, St.Target, SelfExp, nullptr); },
+                [St, SelfExp](FScript& C) { C.FinalFunction(St.Call.Fn); EmitArgs(C, St.Call.Args, SelfExp, nullptr); C.EndFunctionParms(); });
+            break;
+
+        case FStmtIR::SelfCall:
+            S.FinalFunction(St.Call.Fn);
+            EmitArgs(S, St.Call.Args, SelfExp, nullptr);
+            S.EndFunctionParms();
+            break;
+
+        case FStmtIR::Assign:
+        {
+            /* Let's PropertyChain owner: the declaring class for a Field, the function for a local. */
+            const bool bLocalDest = St.Var.K == FArgIR::Local || St.Var.K == FArgIR::LocalOut;
+            const FIndex VarOwner = bLocalDest ? SelfExp : St.Var.Owner;
+            S.Let(St.Var.LetOp, St.Var.S, VarOwner,
+                  [St, SelfExp](FScript& V) { EmitArg(V, St.Var, SelfExp, nullptr); },
+                  [St, SelfExp](FScript& V) { EmitArg(V, St.Value, SelfExp, nullptr); });
+            break;
+        }
+
+        case FStmtIR::StaticCall:
+            EmitCall(S, St.Call, SelfExp, nullptr);
+            break;
+
+        case FStmtIR::Decl:
+            /* No initialiser emits nothing: the frame already zeroed the slot. */
+            if (St.bHasValue)
+                S.Let(St.Var.LetOp, St.Var.S, SelfExp,
+                      [St, SelfExp](FScript& V) { EmitArg(V, St.Var, SelfExp, nullptr); },
+                      [St, SelfExp](FScript& V) { EmitArg(V, St.Value, SelfExp, nullptr); });
+            break;
+
+        case FStmtIR::Return:
+            if (St.bHasValue)
+                S.Return([St, SelfExp](FScript& V) { EmitArg(V, St.Value, SelfExp, nullptr); });
+            else
+                S.Return();
+            break;
+
+        case FStmtIR::If:
+        {
+            const int32 NotPatch = S.JumpIfNot(0,
+                [St, SelfExp](FScript& C) { EmitArg(C, St.Cond, SelfExp, nullptr); });
+            if (St.Then) EmitStmts(*St.Then, S, SelfExp);
+            if (St.Else && !St.Else->empty())
+            {
+                const int32 EndPatch = S.Jump(0);
+                S.PatchJumpTarget(NotPatch, S.MemorySize());
+                EmitStmts(*St.Else, S, SelfExp);
+                S.PatchJumpTarget(EndPatch, S.MemorySize());
+            }
+            else
+            {
+                S.PatchJumpTarget(NotPatch, S.MemorySize());
+            }
+            break;
+        }
+
+        case FStmtIR::While:
+        {
+            const int32 Head = S.MemorySize();
+            const int32 ExitPatch = S.JumpIfNot(0,
+                [St, SelfExp](FScript& C) { EmitArg(C, St.Cond, SelfExp, nullptr); });
+            if (St.Body) EmitStmts(*St.Body, S, SelfExp);
+            S.Jump(Head);
+            S.PatchJumpTarget(ExitPatch, S.MemorySize());
+            break;
+        }
+        }
+    }
+}
+
+/* A Blueprint UE_CLASS package must be the asset path (/Game/Mods/Lib/Lib), not its folder: the
+   folder form names a package that does not exist, and the first symptom is a null UFunction at call time. */
 void BadClassMeta(const FRecord& R, std::string* Err, bool* bOk)
 {
     if (!*bOk || R.UePackage.compare(0, 6, "/Game/") != 0) return;
@@ -463,13 +484,7 @@ bool FCompiler::Collect(std::string* Err)
     bool bMetaOk = true;
     std::set<std::string> Ambiguous;
 
-    /*
-    Walk declarations, carrying the namespace they are in.
-
-    A generated UeApi header puts each Blueprint class in a namespace mirroring its /Game path,
-    so a walk of the translation unit's top level alone sees none of them - and a mod naming one
-    then reads as deriving from a class that was never declared.
-    */
+    /* UeApi headers put Blueprint classes in namespaces mirroring their /Game path. */
     std::function<void(const Json&, const std::string&)> Walk =
         [&](const Json& Scope, const std::string& Ns)
     {
@@ -480,6 +495,18 @@ bool FCompiler::Collect(std::string* Err)
             return;
         }
         if (Kind(N) == "VarDecl" && Name(N) == "UeModPackage") FindLiteral(N, ModPackage);
+        /* Out-of-line method definition: previousDecl points at the in-class decl, already collected. */
+        if (Kind(N) == "CXXMethodDecl" && N.contains("previousDecl") && N.contains("inner"))
+        {
+            const std::string PrevId = N.value("previousDecl", std::string());
+            auto OwnerIt = MethodOwner.find(PrevId);
+            if (OwnerIt == MethodOwner.end()) return;
+            auto RecIt = Records.find(OwnerIt->second);
+            if (RecIt == Records.end()) return;
+            RecIt->second.MethodDefs[Name(N)] = &N;
+            MethodOwner[N.value("id", std::string())] = OwnerIt->second;
+            return;
+        }
         if (Kind(N) != "CXXRecordDecl" || !N.contains("name") || !N.contains("inner")) return;
 
         FRecord R;
@@ -514,11 +541,7 @@ bool FCompiler::Collect(std::string* Err)
                 FieldOwner[C.value("id", std::string())] = R.CppName;
             }
         });
-        /*
-        The leaf name is a shortcut to the qualified one, and only while it is unambiguous. Once
-        a second class claims it the shortcut is withdrawn rather than overwritten, so a mod that
-        names it bare fails to resolve instead of reaching the wrong asset.
-        */
+        /* A leaf name claimed by a second class is withdrawn, not overwritten. */
         const std::string Leaf = Name(N);
         if (!Ns.empty() && !Ambiguous.count(Leaf))
         {
@@ -537,6 +560,20 @@ bool FCompiler::Collect(std::string* Err)
         *Err = "the source declares no UE_MOD_PACKAGE, so its classes have no /Game path";
         return false;
     }
+
+    for (auto& It : Records)
+    {
+        FRecord& R = It.second;
+        if (R.UePackage.empty()) continue;
+        if (R.UePackage != ModPackage + "/" + R.CppName) continue;
+        if (R.UeName != R.CppName + "_C")
+        {
+            *Err = "UE_CLASS on " + R.CppName + " says \"" + R.UeName
+                 + "\", but cooking it here requires \"" + R.CppName + "_C\"";
+            return false;
+        }
+        R.bIsLocal = true;
+    }
     return true;
 }
 
@@ -548,29 +585,13 @@ FIndex FCompiler::FindEvent(FBlueprintClass& BP, const std::string& FromRecord, 
             return BP.EngineFunction(R->UePackage, R->UeName, Method);
         if (R->Base.empty()) break;
     }
-    return Null();      // not an override: a new function, which the FuncMap still reaches
+    return Null();      // not an override
 }
 
-/*
-A generated class's EClassFlags.
-
-A cooked class stores the full set, and almost all of it is INHERITED from the native parent
-(EClassFlags' CLASS_Inherit mask) rather than being a property of the Blueprint - so it cannot
-be one constant. Three shipped DRG classes were read to fix the values below:
-
-  BP_JetBootsBurnTrigger  : Actor               0x00840814
-  BP_ThornsComponent      : ThornsPerkComponent  0x00A40814  adds CLASS_DefaultToInstanced
-  STE_Thorns              : StatusEffect         0x00841810  no CLASS_Config; its
-                                                             CLASS_EditInlineNew is the parent's
-                                                             own and is editor-only
-
-Common to all three is CLASS_Parsed | CLASS_ReplicationDataIsSetUp | CLASS_CompiledFromBlueprint;
-everything else comes from the parent. Since a native parent's flags are not in the Dumper-7 dump,
-the ones a mod actually derives from are listed here and anything else gets the safe assumption:
-CLASS_HasInstancedReference over-declared costs an instancing pass that finds nothing, whereas
-omitting it on a parent that does have instanced subobjects stops them being instanced at all.
-A function library is the one case where the parent is known to have neither.
-*/
+/* Measured on shipped DRG classes: BP_JetBootsBurnTrigger (Actor) 0x00840814, BP_ThornsComponent
+   (ThornsPerkComponent) 0x00A40814, STE_Thorns (StatusEffect) 0x00841810. Everything beyond Base is
+   inherited from the native parent (CLASS_Inherit), which the dump does not carry; unknown parents
+   get CLASS_HasInstancedReference since omitting it on a parent that needs it breaks instancing. */
 uint32 ClassFlagsFor(const std::vector<std::string>& Ancestry)
 {
     const uint32 Base = CLASS_Parsed | CLASS_ReplicationDataIsSetUp | CLASS_CompiledFromBlueprint;
@@ -585,10 +606,6 @@ uint32 ClassFlagsFor(const std::vector<std::string>& Ancestry)
     return Base | CLASS_HasInstancedReference;
 }
 
-/*
-The opcode that writes a value of this type. See FScript::Let - this is dictated by the
-destination, so it is read off the declared type rather than chosen.
-*/
 EExprToken LetOpFor(const std::string& QualType)
 {
     if (QualType == "bool") return EX_LetBool;
@@ -596,13 +613,43 @@ EExprToken LetOpFor(const std::string& QualType)
     return EX_Let;
 }
 
+/* clang may canonicalise `int64` to `long long`. */
+bool IsInt64Type(const std::string& QualType)
+{
+    return QualType.find("int64") != std::string::npos
+        || QualType.find("long long") != std::string::npos
+        || QualType.find("__int64") != std::string::npos;
+}
+
+bool IsObjectType(const std::string& QualType)
+{
+    return !QualType.empty() && QualType.back() == '*';
+}
+
+std::string MathFuncFor(const std::string& Op, const std::string& Flavour)
+{
+    if (Flavour == "ObjectObject")
+    {
+        /* KismetMathLibrary defines only ==/!= on object pointers. */
+        if (Op == "==") return "EqualEqual_ObjectObject";
+        if (Op == "!=") return "NotEqual_ObjectObject";
+        return "";
+    }
+    if (Op == "+") return "Add_" + Flavour;
+    if (Op == "-") return "Subtract_" + Flavour;
+    if (Op == "*") return "Multiply_" + Flavour;
+    if (Op == "&") return "And_" + Flavour;
+    if (Op == "|") return "Or_" + Flavour;
+    if (Op == "^") return "Xor_" + Flavour;
+    if (Op == "==") return "EqualEqual_" + Flavour;
+    if (Op == "!=") return "NotEqual_" + Flavour;
+    if (Op == "<") return "Less_" + Flavour;
+    if (Op == ">") return "Greater_" + Flavour;
+    return "";
+}
+
 bool FCompiler::LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& Out, std::string* Err)
 {
-    /*
-    Only `this->Field` for now. Reaching a property through another object means EX_Context, whose
-    RValuePointer must then name the property being read rather than the null a call writes - a
-    different shape, not a longer one.
-    */
     const Json* Obj = Strip(First(MemberNode));
     const std::string ObjKind = Obj ? Kind(*Obj) : "<none>";
     if (ObjKind != "CXXThisExpr")
@@ -617,11 +664,6 @@ bool FCompiler::LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& 
     if (!R) { *Err = "access to a property of an unknown class: " + Name(MemberNode); return false; }
     if (!R->IsNative() && R != Cur)
     {
-        /*
-        A variable declared on an ANCESTOR generated class. Its FFieldPath owner would be that
-        other mod class, which is a Blueprint import rather than an engine one - a different
-        import row than PropertyOwner writes, so it is refused rather than mis-spelled.
-        */
         *Err = "TODO: a property declared on another generated class is not reachable yet: "
              + Name(MemberNode);
         return false;
@@ -636,6 +678,11 @@ bool FCompiler::LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& 
 
 bool FCompiler::LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, std::string* Err)
 {
+    /* Read the outer type before Strip peels the FName ctor off `FName("X")`. */
+    const std::string OuterType = TypeOf(ArgNode);
+    const bool bIsFNameSlot = (OuterType == "FName" || OuterType == "struct FName"
+                              || OuterType == "class FName");
+
     const Json* N = Strip(&ArgNode);
     if (!N) { *Err = "empty argument expression"; return false; }
 
@@ -643,23 +690,34 @@ bool FCompiler::LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, 
     if (K == "MemberExpr") return LowerField(*N, BP, Out, Err);
     if (K == "CXXThisExpr") { Out.K = FArgIR::Self; return true; }
     if (K == "CXXNullPtrLiteralExpr") { Out.K = FArgIR::NullObj; return true; }
+    if ((K == "CXXConstructExpr" || K == "CXXTemporaryObjectExpr") && bIsFNameSlot)
+    {
+        /* `FName()`: an argless ctor node Strip could not descend into. */
+        Out.K = FArgIR::Name;
+        Out.S = "None";
+        return true;
+    }
     if (K == "StringLiteral")
     {
-        /*
-        Wide-string literals arrive as clang's source spelling ("L\"hi\"" for L"hi"), so the
-        detection is on the literal's type - const wchar_t [N] or const char16_t [N] - rather
-        than on the value bytes. Unquote already strips the leading and trailing quote; the L
-        (or u / U) prefix has to go before that.
-        */
+        std::string V = N->value("value", std::string());
+        if (!V.empty() && (V.front() == 'L' || V.front() == 'u' || V.front() == 'U'))
+            V.erase(V.begin());     // drop the L/u/U prefix
+        const std::string Text = Unquote(V);
+
+        if (bIsFNameSlot)
+        {
+            Out.K = FArgIR::Name;
+            Out.S = Text;
+            return true;
+        }
+
+        /* Wide literals are detected by type; the value is clang's source spelling. */
         Out.K = FArgIR::Str;
         const std::string Ty = TypeOf(*N);
         Out.bWide = Ty.find("wchar_t") != std::string::npos
                  || Ty.find("char16_t") != std::string::npos
                  || Ty.find("char32_t") != std::string::npos;
-        std::string V = N->value("value", std::string());
-        if (!V.empty() && (V.front() == 'L' || V.front() == 'u' || V.front() == 'U'))
-            V.erase(V.begin());     // drop the encoding prefix so Unquote sees a bare "..." literal
-        Out.S = Unquote(V);
+        Out.S = Text;
         return true;
     }
     if (K == "IntegerLiteral") { Out.K = FArgIR::Int; Out.I = int32(std::stoll(N->value("value", std::string("0")))); return true; }
@@ -667,11 +725,7 @@ bool FCompiler::LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, 
     if (K == "CXXBoolLiteralExpr") { Out.K = FArgIR::Bool; Out.B = N->value("value", false); return true; }
     if (K == "DeclRefExpr")
     {
-        /*
-        A bare name in an expression - a reference to a function parameter or a function-local
-        variable. Both live on the enclosing function's own FField chain, so both lower to the
-        same EX_LocalVariable; a ParmVarDecl is a parameter, a plain VarDecl a `DeclStmt` local.
-        */
+        /* A T& out-parm needs EX_LocalOutVariable so writes reach the caller's storage. */
         const Json& Ref = (*N)["referencedDecl"];
         const std::string RefKind = Ref.value("kind", std::string());
         if (RefKind != "ParmVarDecl" && RefKind != "VarDecl")
@@ -679,24 +733,101 @@ bool FCompiler::LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, 
             *Err = "TODO: DeclRefExpr to " + RefKind;
             return false;
         }
-        Out.K = FArgIR::Local;
-        Out.S = Ref.value("name", std::string());
+        const std::string RefName = Ref.value("name", std::string());
+        Out.K = CurrentOutParms.count(RefName) ? FArgIR::LocalOut : FArgIR::Local;
+        Out.S = RefName;
         return true;
     }
     if (K == "CallExpr")
     {
-        /*
-        A call in argument position: another expression whose value flows into the outer call.
-        LowerCall handles the same intrinsic / UFunction dispatch as it does for statement calls;
-        the resulting FCallIR is attached to the FArgIR so the emitter can lower it in place.
-        Only intrinsic calls are supported here right now - a nested UFunction call needs the
-        emitter to write EX_LocalOutVariable + a call, which is not built yet. Since every
-        intrinsic currently fails at LowerCall time (no lowering table), this branch effectively
-        just forwards the intrinsic's TODO up to the caller.
-        */
+        const Json* CalleeNode = Strip(First(*N));
+        const std::string CalleeName = (CalleeNode && Kind(*CalleeNode) == "DeclRefExpr")
+            ? (*CalleeNode)["referencedDecl"].value("name", std::string())
+            : std::string();
+        if (CalleeName == "__ClassOf__")
+        {
+            /* `__ClassOf__(x)` lowers to Cur::GetParmClassName(<this function>, FName("x")); x is never
+               evaluated. The enclosing class must declare GetParmClassName (see ReadProperty.cpp). */
+            const Json* Arg = Nth(*N, 1);       // inner[0] is the callee
+            if (!Arg) { *Err = "__ClassOf__ requires an argument"; return false; }
+            const Json* AS = Strip(Arg);
+            if (!AS || Kind(*AS) != "DeclRefExpr")
+            { *Err = "__ClassOf__ argument must be a bare parameter or local reference"; return false; }
+            const std::string ParmName = (*AS)["referencedDecl"].value("name", std::string());
+            if (ParmName.empty())
+            { *Err = "__ClassOf__: argument DeclRefExpr has no name"; return false; }
+            if (!Cur)
+            { *Err = "__ClassOf__: no enclosing class in scope"; return false; }
+
+            const std::string CalleePkg = ModPackage + "/" + Cur->CppName;
+            const std::string CalleeCls = Cur->CppName + "_C";
+            Out.K = FArgIR::Call;
+            Out.Sub = std::make_shared<FCallIR>();
+            Out.Sub->Fn = BP.EngineFunction(CalleePkg, CalleeCls, "GetParmClassName");
+            Out.Sub->bScript = true;
+            Out.Sub->Context = BP.ClassDefaultObject(CalleePkg, CalleeCls);
+
+            FArgIR FnArg;
+            FnArg.K = FArgIR::Call;
+            FnArg.Sub = std::make_shared<FCallIR>();
+            FnArg.Sub->Intrinsic = "__CurrentFunction__";
+            Out.Sub->Args.push_back(FnArg);
+
+            FArgIR NameArg;
+            NameArg.K = FArgIR::Name;
+            NameArg.S = ParmName;
+            Out.Sub->Args.push_back(NameArg);
+            return true;
+        }
+
         Out.K = FArgIR::Call;
         Out.Sub = std::make_shared<FCallIR>();
         return LowerCall(*N, BP, *Out.Sub, Err);
+    }
+    if (K == "UnaryOperator")
+    {
+        const std::string Op = N->value("opcode", std::string());
+        if (Op != "!") { *Err = "TODO: unimplemented unary operator " + Op; return false; }
+        const Json* Operand = Nth(*N, 0);
+        if (!Operand) { *Err = "unary `!` with a missing operand"; return false; }
+
+        Out.K = FArgIR::Call;
+        Out.Sub = std::make_shared<FCallIR>();
+        Out.Sub->Fn = BP.EngineFunction("/Script/Engine", "KismetMathLibrary", "Not_PreBool");
+        Out.Sub->bScript = false;
+
+        FArgIR A;
+        if (!LowerArg(*Operand, BP, A, Err)) return false;
+        Out.Sub->Args.push_back(A);
+        return true;
+    }
+    if (K == "BinaryOperator")
+    {
+        const std::string Op = N->value("opcode", std::string());
+        const Json* LhsRaw = Nth(*N, 0);
+        const Json* RhsRaw = Nth(*N, 1);
+        if (!LhsRaw || !RhsRaw) { *Err = "binary operator with a missing side"; return false; }
+        /* Flavour is read from the UNSTRIPPED sides: clang's promotion cast carries the common type. */
+        const std::string LhsTy = TypeOf(*LhsRaw), RhsTy = TypeOf(*RhsRaw);
+        std::string Flavour;
+        if (IsObjectType(LhsTy) || IsObjectType(RhsTy))      Flavour = "ObjectObject";
+        else if (IsInt64Type(LhsTy) || IsInt64Type(RhsTy))   Flavour = "Int64Int64";
+        else                                                 Flavour = "IntInt";
+        const std::string MathFn = MathFuncFor(Op, Flavour);
+        if (MathFn.empty())
+        { *Err = "TODO: unimplemented binary operator " + Op + " on " + Flavour; return false; }
+
+        Out.K = FArgIR::Call;
+        Out.Sub = std::make_shared<FCallIR>();
+        Out.Sub->Fn = BP.EngineFunction("/Script/Engine", "KismetMathLibrary", MathFn);
+        Out.Sub->bScript = false;
+
+        FArgIR LA, RA;
+        if (!LowerArg(*LhsRaw, BP, LA, Err)) return false;
+        if (!LowerArg(*RhsRaw, BP, RA, Err)) return false;
+        Out.Sub->Args.push_back(LA);
+        Out.Sub->Args.push_back(RA);
+        return true;
     }
 
     *Err = "TODO: unimplemented argument " + K;
@@ -724,12 +855,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         MethodName = Name(Ref);
     }
 
-    /*
-    Compiler intrinsics are free functions whose name is __NAME__: they do not correspond to a
-    UFunction anywhere and their lowering is per-name. Each one resolves its supporting imports
-    here (Extra) so the emit closure can stay reference-free; a name with no lowering fails at
-    Lower time so the emitter never faces an emission it cannot make.
-    */
+    /* __NAME__ free functions are compiler intrinsics; each resolves its imports here (Extra/Extra2). */
     const bool bIntrinsic = MethodName.size() >= 5
         && MethodName.compare(0, 2, "__") == 0
         && MethodName.compare(MethodName.size() - 2, 2, "__") == 0;
@@ -738,43 +864,45 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         Out.Intrinsic = MethodName;
         if (MethodName == "__AddrOf__")
         {
-            /*
-            The donor struct: any UScriptStruct with an 8-byte scalar at Offset_Internal=0 will
-            do. FScreenMessageString.Key (uint64) is in /Script/Engine and always loaded, so it
-            costs one import row and no plugin dependency. FDateTime.Ticks would be the natural
-            fit but is not reflected in a shipping build - Dumper-7's dump shows the struct as
-            an eight-byte pad.
-            */
+            /* Donor: any struct with an 8-byte scalar at offset 0. FDateTime.Ticks is not reflected in shipping. */
             Out.Extra = BP.ScriptStruct("/Script/Engine", "ScreenMessageString");
         }
         else if (MethodName == "__Read64__")
         {
-            /*
-            Arbitrary 8-byte deref: read *(int64*)Addr with two type-confusions and no
-            fabricated header.
-
-            Bytecode shape:
-                EX_Context(
-                    <object slot> = EX_StructMemberContext(
-                        DataTableRowHandle.DataTable @ 0x0,
-                        EX_LocalVariable(AddrParam)),
-                    <skip / rvalue-null / inner> = EX_InstanceVariable(
-                        FScreenMessageString.Key @ 0x0))
-
-            The struct-member step reads the Addr slot's 8 raw bytes as UObject* -
-            DataTable is an ObjectProperty at offset 0 of FDataTableRowHandle in
-            /Script/Engine (SDK-verified), and StructMemberContext copies its
-            ElementSize (8) bytes starting at (innerAddress + Offset_Internal) = the
-            slot's own storage. EX_Context then treats those bytes as Stack.Object
-            with no vtable / IsValid touched, and the inner EX_InstanceVariable does
-            `Stack.Object + Key.Offset_Internal` = Addr + 0 = Addr, and copies 8 bytes
-            typed as uint64 into ReturnValue.
-
-            Both donor properties live in the same /Script/Engine struct pair used
-            by AddrOf, so this costs one extra import row and no plugin dependency.
-            */
+            /* __Read*__: EX_Context(StructMember(Extra.DataTable @0, Addr), InstanceVariable(Extra2 field @0)).
+               Extra2 must be a top-level struct (OwnerChainDepth=0) for the execInstanceVariable_bypass bitfix. */
             Out.Extra = BP.ScriptStruct("/Script/Engine", "DataTableRowHandle");
             Out.Extra2 = BP.ScriptStruct("/Script/Engine", "ScreenMessageString");
+        }
+        else if (MethodName == "__Read32__")
+        {
+            Out.Extra = BP.ScriptStruct("/Script/Engine", "DataTableRowHandle");
+            Out.Extra2 = BP.ScriptStruct("/Script/CoreUObject", "IntPoint");
+        }
+        else if (MethodName == "__ReadFloat__")
+        {
+            Out.Extra = BP.ScriptStruct("/Script/Engine", "DataTableRowHandle");
+            Out.Extra2 = BP.ScriptStruct("/Script/CoreUObject", "Vector2D");
+        }
+        else if (MethodName == "__ReadByte__")
+        {
+            Out.Extra = BP.ScriptStruct("/Script/Engine", "DataTableRowHandle");
+            Out.Extra2 = BP.ScriptStruct("/Script/CoreUObject", "Color");
+        }
+        else if (MethodName == "__ReadObject__")
+        {
+            Out.Extra = BP.ScriptStruct("/Script/Engine", "DataTableRowHandle");
+            Out.Extra2 = BP.ScriptStruct("/Script/Engine", "DataTableRowHandle");
+        }
+        else if (MethodName == "__ReadName__")
+        {
+            Out.Extra = BP.ScriptStruct("/Script/Engine", "DataTableRowHandle");
+            Out.Extra2 = BP.ScriptStruct("/Script/CoreUObject", "SoftObjectPath");
+        }
+        else if (MethodName == "__NameIndex__")
+        {
+            /* First 4 bytes of the FName slot = ComparisonIndex; no class check involved. */
+            Out.Extra = BP.ScriptStruct("/Script/CoreUObject", "IntPoint");
         }
         else
         {
@@ -787,24 +915,30 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         auto Owner = MethodOwner.find(DeclId);
         if (Owner == MethodOwner.end()) { *Err = "call to an unknown function: " + MethodName; return false; }
         const FRecord* R = Find(Owner->second);
-        if (!R || !R->IsNative())
-        {
-            *Err = "TODO: unimplemented call into a generated class: " + Owner->second + "::" + MethodName;
-            return false;
-        }
-        Out.Fn = BP.EngineFunction(R->UePackage, R->UeName, MethodName);
-        Out.bScript = R->UePackage.compare(0, 6, "/Game/") == 0;   // a Blueprint, not a /Script class
-        /*
-        EX_CallMath resolves the CDO itself, so a native static needs no context; every other
-        static does, and a Blueprint's function is never reached through EX_CallMath.
-        */
+        if (!R) { *Err = "call to a function on an unknown class: " + Owner->second; return false; }
+
         auto Decl = R->Methods.find(MethodName);
         const bool bStatic = Decl != R->Methods.end() && IsStaticDecl(*Decl->second);
+
+        if (!R->IsNative() && !bStatic)
+        {
+            *Err = "TODO: unimplemented instance-method call into a generated class: "
+                 + Owner->second + "::" + MethodName;
+            return false;
+        }
+
+        const std::string CalleePackage = R->IsNative() ? R->UePackage
+                                                        : ModPackage + "/" + R->CppName;
+        const std::string CalleeName    = R->IsNative() ? R->UeName
+                                                        : R->CppName + "_C";
+        Out.Fn = BP.EngineFunction(CalleePackage, CalleeName, MethodName);
+        Out.bScript = CalleePackage.compare(0, 6, "/Game/") == 0;
+        /* A Blueprint static needs the CDO context; EX_CallMath finds it itself for a native. */
         if (Out.bScript && bStatic)
-            Out.Context = BP.ClassDefaultObject(R->UePackage, R->UeName);
+            Out.Context = BP.ClassDefaultObject(CalleePackage, CalleeName);
     }
 
-    /* inner[0] is the callee; everything after it is an argument. */
+    /* inner[0] is the callee. */
     bool bFirst = true, bOk = true;
     ForEach(CallExprNode, [&](const Json& C) {
         if (bFirst) { bFirst = false; return; }
@@ -816,26 +950,26 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
     return bOk;
 }
 
-/*
-The FField class + on-disk size for a function-local scalar. A local's stored type is the same
-as a parameter's; what differs is that it carries none of the CPF_Parm machinery, so the engine
-lays it in the frame after the call arguments rather than reading it off the caller's stack.
-Only the integer locals the reader walk declares are supported - an object or float local would
-add a type with no reader that needs it yet.
-*/
+/* Same builders as parameters, minus the parm flags; object-typed locals would need a class import. */
 bool LocalProperty(const std::string& QualType, const std::string& VarName,
                    FPropertyDef* Out, std::string* Err)
 {
-    if (QualType == "int64" || QualType == "const int64" || QualType == "long long")
-        *Out = FPropertyDef{ "Int64Property", VarName, RF_Public, 1, 8, 0, Null() };
-    else if (QualType == "int" || QualType == "int32" || QualType == "const int"
-          || QualType == "const int32")
-        *Out = FPropertyDef{ "IntProperty", VarName, RF_Public, 1, 4, 0, Null() };
+    std::string T = QualType;
+    if (T.compare(0, 6, "const ") == 0) T = T.substr(6);
+
+    if (T == "int64" || T == "long long")           *Out = Int64Param(VarName);
+    else if (T == "int" || T == "int32")            *Out = IntParam(VarName);
+    else if (T == "bool")                           *Out = BoolParam(VarName);
+    else if (T == "float")                          *Out = FloatParam(VarName);
+    else if (T == "uint8" || T == "unsigned char")  *Out = ByteParam(VarName);
+    else if (T == "FName" || T == "struct FName" || T == "class FName")
+                                                    *Out = NameParam(VarName);
     else
     {
         *Err = "TODO: a function-local of type " + QualType + " is not supported yet";
         return false;
     }
+    Out->PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
     return true;
 }
 
@@ -852,13 +986,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
         const std::string K = Kind(*S);
         if (K == "DeclStmt")
         {
-            /*
-            One or more function-local declarations. Each VarDecl becomes a scratch property on
-            the function plus, if it has an initialiser, an EX_Let that writes it - the frame
-            zero-initialises a local, so a bare `int64 x;` needs no statement of its own. clang
-            groups several comma-declared vars under one DeclStmt, so every inner VarDecl is
-            walked rather than just the first.
-            */
+            /* clang groups comma-declared vars under one DeclStmt. */
             bool bAny = false;
             ForEach(*S, [&](const Json& D) {
                 if (!bOk || Kind(D) != "VarDecl") return;
@@ -885,18 +1013,12 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
         }
         if (K == "CXXMemberCallExpr")
         {
-            /* The object being called on has to be produced by a call of its own. */
             const Json* Member = Strip(First(*S));
             const Json* Object = Member ? Strip(First(*Member)) : nullptr;
             const std::string ObjKind = Object ? Kind(*Object) : "<none>";
 
             if (ObjKind == "CXXThisExpr")
             {
-                /*
-                A call on `this` needs no context at all: the VM already has this object, so the
-                call is emitted directly. Wrapping it in EX_Context would push a redundant self
-                and make the VM skip-count a call that can never be null.
-                */
                 St.K = FStmtIR::SelfCall;
                 bOk = LowerCall(*S, BP, St.Call, Err);
             }
@@ -916,28 +1038,62 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
         {
             bOk = LowerCall(*S, BP, St.Call, Err);
         }
-        else if (K == "BinaryOperator" && S->value("opcode", std::string()) == "=")
+        else if ((K == "BinaryOperator" && S->value("opcode", std::string()) == "=")
+              || K == "CXXOperatorCallExpr")
         {
-            const Json* Lhs = Strip(Nth(*S, 0));
-            const Json* Rhs = Strip(Nth(*S, 1));
-            if (!Lhs || !Rhs) { *Err = "assignment with a missing side"; bOk = false; return; }
-            if (Kind(*Lhs) != "MemberExpr")
+            /* Scalar `=` is a BinaryOperator [LHS, RHS]; class-type `=` is a CXXOperatorCallExpr
+               [operator=, LHS, RHS]. */
+            const Json* Lhs = nullptr;
+            const Json* Rhs = nullptr;
+            if (K == "BinaryOperator")
             {
-                *Err = "TODO: assignment to " + Kind(*Lhs) + ", not a property";
+                Lhs = Strip(Nth(*S, 0));
+                Rhs = Strip(Nth(*S, 1));
+            }
+            else
+            {
+                const Json* Callee = Strip(Nth(*S, 0));
+                const std::string OpName = (Callee && Callee->contains("referencedDecl"))
+                    ? (*Callee)["referencedDecl"].value("name", std::string())
+                    : std::string();
+                if (OpName != "operator=")
+                { *Err = "TODO: unimplemented operator overload " + OpName; bOk = false; return; }
+                Lhs = Strip(Nth(*S, 1));
+                Rhs = Strip(Nth(*S, 2));
+            }
+            if (!Lhs || !Rhs) { *Err = "assignment with a missing side"; bOk = false; return; }
+
+            const std::string LK = Kind(*Lhs);
+            if (LK == "MemberExpr")
+            {
+                St.K = FStmtIR::Assign;
+                bOk = LowerField(*Lhs, BP, St.Var, Err) && LowerArg(*Rhs, BP, St.Value, Err);
+            }
+            else if (LK == "DeclRefExpr")
+            {
+                const Json& Ref = (*Lhs)["referencedDecl"];
+                const std::string RefKind = Ref.value("kind", std::string());
+                if (RefKind != "ParmVarDecl" && RefKind != "VarDecl")
+                { *Err = "TODO: assignment to a DeclRefExpr of kind " + RefKind; bOk = false; return; }
+                const std::string RefName = Ref.value("name", std::string());
+                const bool bOut = CurrentOutParms.count(RefName) != 0;
+                St.K = FStmtIR::Assign;
+                St.Var.K = bOut ? FArgIR::LocalOut : FArgIR::Local;
+                St.Var.S = RefName;
+                St.Var.LetOp = LetOpFor(TypeOf(*Lhs));
+                St.bAssignLocal = !bOut;
+                St.bAssignOutParm = bOut;
+                bOk = LowerArg(*Rhs, BP, St.Value, Err);
+            }
+            else
+            {
+                *Err = "TODO: assignment to " + LK + ", not a property or local";
                 bOk = false;
                 return;
             }
-            St.K = FStmtIR::Assign;
-            bOk = LowerField(*Lhs, BP, St.Var, Err) && LowerArg(*Rhs, BP, St.Value, Err);
         }
         else if (K == "ReturnStmt")
         {
-            /*
-            The return value is one expression: `return <expr>;`. The emitter's ReturnValue slot
-            takes 8 bytes for now, so what a body can return is scoped to what an argument can
-            already lower to - a literal, a `this->Field`, or an intrinsic. An empty return is a
-            void return and the emitter writes EX_Return + EX_Nothing.
-            */
             St.K = FStmtIR::Return;
             const Json* Val = Strip(First(*S));
             if (Val)
@@ -945,6 +1101,90 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 St.bHasValue = true;
                 bOk = LowerArg(*Val, BP, St.Value, Err);
             }
+        }
+        else if (K == "IfStmt")
+        {
+            /* IfStmt inner is [cond, then, else?]; an init-stmt would prepend one. */
+            if (S->value("hasInit", false) || S->value("hasVar", false))
+            {
+                *Err = "TODO: `if` with an init-statement / condition-variable is not supported";
+                bOk = false;
+                return;
+            }
+            const Json* Cond = Nth(*S, 0);
+            const Json* Then = Nth(*S, 1);
+            const Json* Else = Nth(*S, 2);
+            if (!Cond || !Then) { *Err = "`if` with a missing condition or then-branch"; bOk = false; return; }
+
+            St.K = FStmtIR::If;
+            if (!LowerArg(*Cond, BP, St.Cond, Err)) { bOk = false; return; }
+
+            /* A single-statement branch is wrapped in a synthetic CompoundStmt. */
+            auto LowerBranch = [&](const Json& Branch, std::shared_ptr<std::vector<FStmtIR>>& OutBody) -> bool
+            {
+                OutBody = std::make_shared<std::vector<FStmtIR>>();
+                if (Kind(Branch) == "CompoundStmt") return LowerBody(Branch, BP, *OutBody, Locals, Err);
+                Json Wrap = { {"kind", "CompoundStmt"}, {"inner", Json::array({Branch})} };
+                return LowerBody(Wrap, BP, *OutBody, Locals, Err);
+            };
+            if (!LowerBranch(*Then, St.Then)) { bOk = false; return; }
+            if (Else && !LowerBranch(*Else, St.Else)) { bOk = false; return; }
+        }
+        else if (K == "WhileStmt")
+        {
+            /* WhileStmt inner is [cond, body]. */
+            const Json* Cond = Nth(*S, 0);
+            const Json* Body = Nth(*S, 1);
+            if (!Cond || !Body) { *Err = "`while` with a missing condition or body"; bOk = false; return; }
+
+            St.K = FStmtIR::While;
+            if (!LowerArg(*Cond, BP, St.Cond, Err)) { bOk = false; return; }
+            St.Body = std::make_shared<std::vector<FStmtIR>>();
+            if (Kind(*Body) == "CompoundStmt")
+            {
+                if (!LowerBody(*Body, BP, *St.Body, Locals, Err)) { bOk = false; return; }
+            }
+            else
+            {
+                Json Wrap = { {"kind", "CompoundStmt"}, {"inner", Json::array({*Body})} };
+                if (!LowerBody(Wrap, BP, *St.Body, Locals, Err)) { bOk = false; return; }
+            }
+        }
+        else if (K == "ForStmt")
+        {
+            /* Desugars to `{ init; while (cond) { body; inc; } }`. ForStmt inner is
+               [init, condVar, cond, inc, body] with absent parts kept as inline JSON nulls. */
+            auto AtOr = [&](size_t I) -> const Json* {
+                const Json* P = Nth(*S, I);
+                return (P && !P->is_null()) ? P : nullptr;
+            };
+            const Json* Init = AtOr(0);
+            const Json* Cond = AtOr(2);
+            const Json* Inc = AtOr(3);
+            const Json* Body = AtOr(4);
+            if (!Cond || !Body) { *Err = "TODO: `for` needs a condition and a body"; bOk = false; return; }
+
+            if (Init)
+            {
+                Json WrapInit = { {"kind", "CompoundStmt"}, {"inner", Json::array({*Init})} };
+                if (!LowerBody(WrapInit, BP, Out, Locals, Err)) { bOk = false; return; }
+            }
+
+            St.K = FStmtIR::While;
+            if (!LowerArg(*Cond, BP, St.Cond, Err)) { bOk = false; return; }
+            St.Body = std::make_shared<std::vector<FStmtIR>>();
+
+            Json BodyArr = Json::array();
+            if (Kind(*Body) == "CompoundStmt")
+            {
+                auto It = Body->find("inner");
+                if (It != Body->end()) for (const Json& C : *It) BodyArr.push_back(C);
+            }
+            else BodyArr.push_back(*Body);
+            if (Inc) BodyArr.push_back(*Inc);
+
+            Json WrapBody = { {"kind", "CompoundStmt"}, {"inner", BodyArr} };
+            if (!LowerBody(WrapBody, BP, *St.Body, Locals, Err)) { bOk = false; return; }
         }
         else
         {
@@ -967,24 +1207,14 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     FPackage P(PackageName);
     StampIdentity(P, PackageName);
 
-    /*
-    Two different questions about the parent, and they used to be one. Whether it is declared in
-    THIS source decides how its package and class are spelled; whether it is a Blueprint at all
-    decides the CDO's create-before-serialize edge onto it - and a parent named by UE_CLASS at a
-    /Game path is a Blueprint that this source did not declare. A cooked class states that edge
-    (measured on BP_ThornsComponent, whose CDO lists its parent BPGC), so it is asked separately.
-    */
+    /* Parent-is-local decides the spelling; parent-is-Blueprint (/Game) decides the CDO's
+       create-before-serialize edge onto it (measured on BP_ThornsComponent). */
     const bool bParentIsLocal = !B->IsNative();
     const std::string ParentPkg = bParentIsLocal ? ModPackage + "/" + B->CppName : B->UePackage;
     FBlueprintClass BP(P, R.CppName + "_C", ParentPkg,
                        bParentIsLocal ? B->CppName + "_C" : B->UeName,
                        ParentPkg.compare(0, 6, "/Game/") == 0);
 
-    /*
-    What the class inherits from decides two things on disk. The ancestry is walked in the mod's
-    own declarations rather than asked of the engine: the UeApi headers a mod includes declare
-    each native class with its base, so the chain up to Actor (or UObject) is all in Records.
-    */
     std::vector<std::string> Ancestry;
     for (const FRecord* A = &R; A; A = A->Base.empty() ? nullptr : Find(A->Base))
         if (!A->UeName.empty()) Ancestry.push_back(A->UeName);
@@ -993,11 +1223,6 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     BP.SetIsActor(bIsActor);
     BP.SetClassFlags(ClassFlagsFor(Ancestry));
 
-    /*
-    Turn a mod-source qualType into an FPropertyDef. `Where` names the location for the
-    error message ("parameter X on Y", "return type on Y", "property X"); ExtraFlags is
-    CPF_ReturnParm | CPF_OutParm for a ReturnValue and zero for an ordinary param or variable.
-    */
     auto TypeToProperty = [&](const std::string& Type, const std::string& PName,
                               uint64 ExtraFlags, const std::string& Where,
                               FPropertyDef* Out, std::string* PErr) -> bool
@@ -1006,13 +1231,14 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         if (Type == "int" || Type == "int32") { *Out = IntParam(PName, ExtraFlags); return true; }
         if (Type == "int64" || Type == "long long") { *Out = Int64Param(PName, ExtraFlags); return true; }
         if (Type == "bool") { *Out = BoolParam(PName, ExtraFlags); return true; }
+        if (Type == "uint8" || Type == "unsigned char") { *Out = ByteParam(PName, ExtraFlags); return true; }
         if (Type == "const char *" || Type == "const char*"
             || Type == "FString" || Type == "struct FString")
         { *Out = StringParam(PName, ExtraFlags); return true; }
         if (Type == "FName" || Type == "struct FName")
         { *Out = NameParam(PName, ExtraFlags); return true; }
 
-        /* Object pointer, spelled `[const] class X *`. Resolve X against Records. */
+        /* Object pointer, spelled `[const] class X *`. */
         std::string ClassName;
         {
             const size_t Star = Type.find('*');
@@ -1034,11 +1260,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         return true;
     };
 
-    /*
-    The class variables, in declaration order. A field with an initializer is accepted only when
-    that initializer is the type's zero: the CDO writes no defaults, so anything else would be
-    silently dropped rather than honoured.
-    */
+    /* Non-zero field initialisers are refused: the CDO writes no defaults. */
     for (const Json* F : R.Fields)
     {
         const std::string FieldName = Name(*F);
@@ -1063,11 +1285,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         if (!TypeToProperty(TypeOf(*F), FieldName, 0, "property " + FieldName, &PD, &PErr))
         { *Err = PErr; return false; }
 
-        /*
-        A parm's flags are the wrong ones for a variable: CPF_Parm makes the engine count it as
-        part of the call frame, and CPF_BlueprintReadOnly forbids the very assignment the field
-        exists for. What is left is a plain, script-writable class variable.
-        */
+        /* CPF_Parm would make it part of the call frame; CPF_BlueprintReadOnly would forbid assignment. */
         PD.PropertyFlags = (PD.PropertyFlags & ~uint64(CPF_Parm | CPF_BlueprintReadOnly))
                          | CPF_Edit | CPF_BlueprintVisible | CPF_DisableEditOnInstance;
         BP.AddVariable(PD);
@@ -1075,32 +1293,41 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
 
     for (const auto& Entry : R.Methods)
     {
-        const Json& M = *Entry.second;
+        /* The OOL definition carries body/parms; only the in-class decl carries storageClass. */
+        const Json& Decl = *Entry.second;
+        auto DefIt = R.MethodDefs.find(Entry.first);
+        const Json& M = DefIt != R.MethodDefs.end() ? *DefIt->second : Decl;
         const Json* Body = nullptr;
         ForEach(M, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Body = &C; });
-        if (!Body) continue;                    // a declaration without a definition defines nothing
+        if (!Body) continue;
 
         std::vector<FPropertyDef> Params;
+        CurrentOutParms.clear();
         bool bOk = true;
         ForEach(M, [&](const Json& C) {
             if (Kind(C) != "ParmVarDecl" || !bOk) return;
-            const std::string Type = C["type"].value("qualType", std::string());
+            std::string Type = C["type"].value("qualType", std::string());
             const std::string PName = Name(C);
+            /* Every T& parm is treated as an out-parm. */
+            bool bOutParm = false;
+            while (!Type.empty() && (Type.back() == '&' || Type.back() == ' ' || Type.back() == '\t'))
+            {
+                if (Type.back() == '&') bOutParm = true;
+                Type.pop_back();
+            }
+            const uint64 ExtraFlags = bOutParm ? (CPF_OutParm | CPF_ReferenceParm) : 0;
+
             FPropertyDef PD;
             std::string PErr;
-            if (!TypeToProperty(Type, PName, 0, "parameter " + PName + " on " + Entry.first,
-                                &PD, &PErr))
+            if (!TypeToProperty(Type, PName, ExtraFlags,
+                                "parameter " + PName + " on " + Entry.first, &PD, &PErr))
             { *Err = PErr; bOk = false; return; }
             Params.push_back(PD);
+            if (bOutParm) CurrentOutParms.insert(PName);
         });
         if (!bOk) return false;
 
-        /*
-        A non-void return grows the parm chain by one ReturnValue property. UE walks the chain
-        looking for that exact name, so the emitter's Return-with-value has somewhere to write.
-        The type comes from the method signature's return part - "int64 (class UObject *)"
-        splits at the '(' and trims.
-        */
+        /* UE finds the return property by the exact name "ReturnValue". */
         const std::string FnQual = M["type"].value("qualType", std::string());
         std::string RetType;
         {
@@ -1126,85 +1353,19 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             *Err = R.CppName + "::" + Entry.first + ": " + *Err;
             return false;
         }
-        /*
-        A function's scratch variables live in the same ChildProperties list as its parameters,
-        after the ReturnValue - the engine tells the two apart by CPF_Parm, which a local lacks.
-        Appending them here keeps the parm chain (which UE walks by name for the call frame)
-        exactly as it was, so a reader with no locals emits byte-for-byte what it did before.
-        */
+        /* Locals follow ReturnValue in ChildProperties; the engine tells them apart by CPF_Parm. */
         for (const FPropertyDef& L : Locals) Params.push_back(L);
 
         const bool bEndsWithReturn = !Stmts.empty() && Stmts.back().K == FStmtIR::Return;
 
-        /*
-        A static method is not an event: the engine never dispatches it, script calls it by name.
-        Leaving it FUNC_Event would have the loader treat a library function as an overridable
-        entry point on a class that has no such entry point.
-        */
-        const uint32 Flags = IsStaticDecl(M)
+        /* A static left FUNC_Event would be treated by the loader as an overridable entry point. */
+        const uint32 Flags = IsStaticDecl(Decl)
             ? uint32(FUNC_Static | FUNC_BlueprintCallable | FUNC_Public | FUNC_Final)
             : 0u;
 
         BP.AddFunction(Entry.first, FindEvent(BP, R.CppName, Entry.first), Params,
                        [Stmts, bEndsWithReturn](FScript& S, FIndex SelfExp) {
-            for (const FStmtIR& St : Stmts)
-            {
-                switch (St.K)
-                {
-                case FStmtIR::TargetCall:
-                    S.Context(
-                        [St, SelfExp](FScript& O) { EmitCall(O, St.Target, SelfExp, nullptr); },
-                        [St, SelfExp](FScript& C) { C.FinalFunction(St.Call.Fn); EmitArgs(C, St.Call.Args, SelfExp, nullptr); C.EndFunctionParms(); });
-                    break;
-
-                case FStmtIR::SelfCall:
-                    S.FinalFunction(St.Call.Fn);
-                    EmitArgs(S, St.Call.Args, SelfExp, nullptr);
-                    S.EndFunctionParms();
-                    break;
-
-
-                case FStmtIR::Assign:
-                    S.Let(St.Var.LetOp, St.Var.S, St.Var.Owner,
-                          [St, SelfExp](FScript& V) { EmitArgs(V, { St.Var }, SelfExp, nullptr); },
-                          [St, SelfExp](FScript& V) { EmitArgs(V, { St.Value }, SelfExp, nullptr); });
-                    break;
-
-                case FStmtIR::StaticCall:
-                    EmitCall(S, St.Call, SelfExp, nullptr);   // a static library call stands alone
-                    break;
-
-                case FStmtIR::Decl:
-                    /*
-                    A local declaration with an initialiser is one EX_Let into the local; without
-                    one it emits nothing, since the frame already zeroed the slot. The local is a
-                    LocalVariable owned by the function (SelfExp), same as a parameter reference.
-                    */
-                    if (St.bHasValue)
-                        S.Let(St.Var.LetOp, St.Var.S, SelfExp,
-                              [St, SelfExp](FScript& V) { EmitArg(V, St.Var, SelfExp, nullptr); },
-                              [St, SelfExp](FScript& V) { EmitArg(V, St.Value, SelfExp, nullptr); });
-                    break;
-
-                case FStmtIR::Return:
-                    /*
-                    An explicit return. Void form (no value expression) uses the same
-                    EX_Return + EX_Nothing pairing an implicit tail would; a value return runs
-                    the source expression inside the Return op so the VM writes into the
-                    ReturnValue slot straight away.
-                    */
-                    if (St.bHasValue)
-                        S.Return([St, SelfExp](FScript& V) { EmitArg(V, St.Value, SelfExp, nullptr); });
-                    else
-                        S.Return();
-                    break;
-                }
-            }
-            /*
-            Every function must terminate with EX_Return. When the source did not spell one out,
-            add the void-return tail; when it did, its Return is already in place and the trailing
-            EndOfScript closes the stream.
-            */
+            EmitStmts(Stmts, S, SelfExp);
             if (!bEndsWithReturn) S.Return();
             S.EndOfScript();
         }, Flags);
@@ -1221,17 +1382,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
 bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir,
                     const std::string& OutDir, std::string* Err)
 {
-    /*
-    clang is the validator, not just the parser: if this command fails the mod source was not
-    valid C++, and its diagnostics are a far better error message than anything we could invent.
-    */
     const std::string AstPath = OutDir + "/ast.json";
-    /*
-    Both the UeApi directory and its parent are on the include path, so a mod may spell its
-    include either way ("FSD.h" or "UeApi/FSD.h"). A quoted include otherwise resolves relative
-    to the mod source, which silently works for a file sitting in BpMods and fails for one
-    anywhere else.
-    */
+    /* Both the UeApi dir and its parent are include paths, so "FSD.h" and "UeApi/FSD.h" both resolve. */
     const std::string Parent = std::filesystem::path(IncludeDir).parent_path().string();
     const std::string Cmd = "clang++ -std=c++17 -fsyntax-only -Xclang -ast-dump=json"
                             " \"" + SourcePath + "\" -I\"" + IncludeDir + "\" -I\"" + Parent
@@ -1253,14 +1405,10 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     for (const auto& Entry : Records)
     {
         const FRecord& R = Entry.second;
-        if (R.IsNative() || R.Base.empty()) continue;      // declarations, not definitions of a mod class
+        if (R.IsNative() || R.Base.empty()) continue;
         if (!Generate(R, OutDir, Err))
         {
-            /*
-            A half-written mod is worse than none: the assets already saved would ship against a
-            class that was never regenerated. The AST stays behind, since that is what a failure
-            wants looked at.
-            */
+            /* Remove every generated asset; keep the AST for inspection. */
             for (const auto& Other : Records)
                 if (!Other.second.IsNative() && !Other.second.Base.empty())
                     for (const char* Ext : { ".uasset", ".uexp" })
@@ -1271,16 +1419,12 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     }
     if (Generated == 0) { *Err = "the source declares no class deriving from a UE class"; return false; }
 
-    /*
-    The registry bake. A cooked package carries no asset-registry data of its own, so without
-    this the generated classes are invisible to the registry until something scans their path
-    for them - which today is the mod DLL, the dependency the pak is meant to shed.
-    */
+    /* A cooked package carries no registry data; without the bake the classes are invisible to it. */
     if (!SaveAssetRegistry(RegistryRows, OutDir + "/AssetRegistry.bin", Err)) return false;
     printf("  %-14s -> AssetRegistry.bin  (%d asset%s)\n", "registry",
            int32(RegistryRows.size()), RegistryRows.size() == 1 ? "" : "s");
 
-    remove(AstPath.c_str());        // kept only on failure; otherwise it would land in the pak
+    remove(AstPath.c_str());        // kept only on failure
     return true;
 }
 }   // namespace

@@ -1,16 +1,4 @@
-﻿/*
-Blueprint.cpp — assembling a Blueprint class out of the package primitives.
-
-The export order matters and is not arbitrary. The class comes first so that everything
-outered to it (its functions, its scene root, its construction script) can name it, and the
-loader is told the rest through the create-before-create dependencies the package writer
-derives from each row.
-
-The layout mirrors what the editor's cooker produces for the same class, because that is the
-only shape known to load: a BlueprintGeneratedClass whose Children lists its functions, whose
-FuncMap maps their names, and whose SimpleConstructionScript owns one default scene root.
-*/
-#include "Blueprint.h"
+﻿#include "Blueprint.h"
 
 #include <algorithm>
 
@@ -24,12 +12,6 @@ FBlueprintClass::FBlueprintClass(FPackage& InPkg, std::string InClassName,
 {
 }
 
-/*
-Imports a package by path. Native code lives under /Script/<Module>, but a Blueprint lives in
-its own /Game asset package — and either way the package OBJECT's class is CoreUObject.Package,
-so both spell the same row. Only the CDO of a Blueprint parent differs: its class is the
-Blueprint itself, so a /Game path shows up there as a ClassPackage.
-*/
 FIndex FBlueprintClass::PackageImport(const std::string& PackageName)
 {
     const std::string Key = "pkg:" + PackageName;
@@ -47,11 +29,7 @@ FIndex FBlueprintClass::EngineClass(const std::string& PackageName, const std::s
     auto It = ImportCache.find(Key);
     if (It != ImportCache.end()) return Imp(It->second);
 
-    /*
-    An import row names the class OF the object it imports, and a class living under /Game is a
-    BlueprintGeneratedClass rather than a UClass. Getting this wrong does not fail the write; it
-    fails the load, when the linker looks for an object of the class the row claims.
-    */
+    // A /Game class is a BlueprintGeneratedClass, not a Class; the wrong row fails at load, not write.
     const bool bBlueprint = PackageName.compare(0, 6, "/Game/") == 0;
     const FIndex Outer = PackageImport(PackageName);
     const int32 Row = P.AddImport({ bBlueprint ? "/Script/Engine" : "/Script/CoreUObject",
@@ -76,7 +54,7 @@ FIndex FBlueprintClass::ClassDefaultObject(const std::string& PackageName,
     auto It = ImportCache.find(Key);
     if (It == ImportCache.end())
     {
-        // A CDO's own class is the class it defaults, so the row names that rather than "Class".
+        // A CDO's class is the class it defaults, not "Class".
         const int32 Row = P.AddImport({ PackageName, ClassName_, PackageImport(PackageName),
                                         "Default__" + ClassName_ });
         It = ImportCache.emplace(Key, Row).first;
@@ -107,12 +85,10 @@ FIndex FBlueprintClass::EngineFunction(const std::string& PackageName,
     auto It = ImportCache.find(Key);
     if (It != ImportCache.end()) return Imp(It->second);
 
-    // A function is outered to the class that declares it, which must therefore be imported too.
     const FIndex Owner = EngineClass(PackageName, OwningClass);
     const int32 Row = P.AddImport({ "/Script/CoreUObject", "Function", Owner, FunctionName });
     ImportCache.emplace(Key, Row);
 
-    // Both are reachable from a function body, so both become preload dependencies of one.
     for (FIndex Ref : { Imp(Row), Owner })
         if (std::find(CallImports.begin(), CallImports.end(), Ref.V) == CallImports.end())
             CallImports.push_back(Ref.V);
@@ -152,27 +128,20 @@ void FBlueprintClass::Finish()
     const FIndex FunctionCdo = Imp(P.AddImport({ "/Script/CoreUObject", "Function",
                                                  CorePkg, "Default__Function" }));
 
-    /*
-    The parent, and the parent's default object which the CDO uses as its template. For a
-    Blueprint parent both live in that Blueprint's own cooked package; for an engine class
-    they are ordinary /Script imports.
-    */
     const FIndex ParentIdx = EngineClass(ParentPackage, ParentClass);
     const FIndex ParentCdo = Imp(P.AddImport({ ParentPackage, ParentClass,
                                                PackageImport(ParentPackage),
                                                "Default__" + ParentClass }));
 
-    // Row numbers are fixed here so the exports can refer to each other before they exist.
     const int32 RowClass = 0;
     const int32 RowCdo = 1;
     const int32 RowFirstFunction = 2;
     const int32 RowRootTemplate = RowFirstFunction + int32(Functions.size());
     const int32 RowScsNode = RowRootTemplate + 1;
     const int32 RowScs = RowScsNode + 1;
-    const FIndex ScsIdx = bIsActor ? Exp(RowScs) : Null();      // null for a class with no SCS
+    const FIndex ScsIdx = bIsActor ? Exp(RowScs) : Null();
     ClassRow = RowClass;
 
-    /* The class. Its Children and FuncMap are what make its functions reachable. */
     std::vector<std::string> FunctionNames;
     for (const FPending& F : Functions) FunctionNames.push_back(F.Def.Name);
     const int32 NumFunctions = int32(Functions.size());
@@ -186,21 +155,14 @@ void FBlueprintClass::Finish()
     Class.ObjectFlags = RF_Public | RF_Transactional;
     Class.bIsAsset = true;
 
-    /*
-    Preload dependencies, in the shape a cooked BPGC states them (read out of a shipped DRG
-    class with dumpedl.py, not inferred).
-
-    The serialize-before-serialize edge onto the parent is the one that matters most: without
-    it the loader reaches a subclass that names its parent and finds the parent still waiting
-    to be serialized, which aborts the async loading thread outright.
-    */
+    // Preload edges as a shipped DRG BPGC states them (dumpedl.py). Missing the parent
+    // serialize-before-serialize edge aborts the async loading thread.
     Class.SerBeforeSer = { ParentIdx.V, ParentCdo.V };
     if (bIsActor) Class.SerBeforeSer.push_back(ScsIdx.V);
     Class.SerBeforeCreate = { BpgcClass.V, BpgcCdo.V };
     Class.CreateBeforeCreate = { ParentIdx.V };
-    for (int32 I = 0; I < NumFunctions; ++I)        // Children and FuncMap name these
+    for (int32 I = 0; I < NumFunctions; ++I)
         Class.CreateBeforeSer.push_back(Exp(RowFirstFunction + I).V);
-    /* A variable's own type is serialized with it, so whatever it points at has to exist first. */
     for (const FPropertyDef& V : Vars)
         if (V.Extra.V != 0)
             Class.CreateBeforeSer.push_back(V.Extra.V);
@@ -215,9 +177,9 @@ void FBlueprintClass::Finish()
         Ar.Bool(false);
 
         Ar.Idx(ParentIdx);                          // SuperStruct
-        Ar.I32(NumFunctions);                       // Children, as an array of UField*
+        Ar.I32(NumFunctions);                       // Children
         for (int32 I = 0; I < NumFunctions; ++I) Ar.Idx(Exp(RowFirstFunction + I));
-        Ar.I32(int32(ClassVars.size()));            // ChildProperties: the class variables
+        Ar.I32(int32(ClassVars.size()));            // ChildProperties
         for (const FPropertyDef& V : ClassVars) WriteProperty(Ar, V);
         Ar.I32(0);                                  // script bytecode size
         Ar.I32(0);                                  // script storage size
@@ -229,7 +191,7 @@ void FBlueprintClass::Finish()
             Ar.Idx(Exp(RowFirstFunction + I));
         }
 
-        Ar.U32(Flags);                              // ClassFlags, the full cooked set
+        Ar.U32(Flags);                              // ClassFlags
         Ar.Idx(ObjectClass);                        // ClassWithin
         Ar.Name("Engine");                          // ClassConfigName
         Ar.I32(0);                                  // implemented interfaces
@@ -249,14 +211,9 @@ void FBlueprintClass::Finish()
     if (bIsActor) Cdo.SerBeforeSer = { Exp(RowScsNode).V, Exp(RowRootTemplate).V };
     Cdo.SerBeforeCreate = { Exp(RowClass).V, ParentCdo.V };
     if (bParentIsBlueprint)
-        Cdo.CreateBeforeSer = { ParentIdx.V };      // the parent class object, for a BP parent
-    /*
-    AActor's constructor leaves PrimaryActorTick.bCanEverTick false, so an actor that overrides
-    ReceiveTick and says nothing else loads fine and never ticks. The Blueprint compiler sets the
-    flag on the CDO in exactly this case (KismetCompiler.cpp, SetCanEverTick), and a shipped
-    class shows it: Autosprint's name table carries PrimaryActorTick / ActorTickFunction /
-    bCanEverTick precisely because it has a tick event.
-    */
+        Cdo.CreateBeforeSer = { ParentIdx.V };
+    // AActor defaults bCanEverTick to false; the BP compiler sets it on the CDO when ReceiveTick
+    // is overridden (KismetCompiler.cpp, SetCanEverTick), else the actor loads and never ticks.
     const bool bOverridesTick = std::any_of(Functions.begin(), Functions.end(),
         [](const FPending& F) { return F.Def.Name == "ReceiveTick"; });
 
@@ -274,19 +231,12 @@ void FBlueprintClass::Finish()
     {
         std::vector<int32> Refs = CallImports;
         const FIndex SelfExp = Exp(RowFirstFunction + int32(I));
-        Refs.push_back(SelfExp.V);              // a body can reference its own export
+        Refs.push_back(SelfExp.V);
         const auto& Body = Functions[I].Body;
         AddFunctionExport(P, Functions[I].Def, Exp(RowClass), FunctionClass, FunctionCdo,
                           [Body, SelfExp](FScript& S) { Body(S, SelfExp); }, Refs);
     }
 
-    /*
-    A default scene root. An actor can technically live without one, but every cooked actor
-    Blueprint has this trio, so the generated class keeps the same shape rather than betting
-    on the loader tolerating a rootless actor. A class that is not an actor gets none of it -
-    USimpleConstructionScript reaches its owner's CDO as an AActor, which for anything else is
-    a reinterpret of an unrelated object.
-    */
     if (!bIsActor) return;
 
     const FIndex SceneCompClass = EngineClass("/Script/Engine", "SceneComponent");

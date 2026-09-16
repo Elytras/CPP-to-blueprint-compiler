@@ -1,12 +1,4 @@
-﻿/*
-Package.cpp — the cooked-package layout, transcribed from UE 4.27's savers.
-
-Save runs the caller's export closures twice. The first pass exists only to discover FNames:
-the name table has to be complete and sorted before any index it hands out is meaningful, and
-the payloads are the only place most names appear. The second pass emits the real bytes, by
-which time every FName resolves. Section sizes are all computable up front, so the summary is
-written once to measure itself and once with the offsets filled in.
-*/
+﻿// Layout transcribed from UE4.27 PackageFileSummary.cpp / LinkerSave.cpp / UnrealNames.cpp.
 #include "Package.h"
 
 #include <algorithm>
@@ -20,14 +12,10 @@ namespace
 constexpr uint32 kPackageFileTag = 0x9E2A83C1;
 constexpr int32 kLegacyFileVersion = -7;
 constexpr uint32 kPkgFilterEditorOnly = 0x80000000;
-constexpr int32 kImportEntrySize = 28;    // 3 FNames + 1 FPackageIndex
+constexpr int32 kImportEntrySize = 28;
 constexpr int32 kExportEntrySize = 104;
 
-/*
-The two CRC tables UE keeps. CRCTable_DEPRECATED is the MSB-first 0x04C11DB7 table used by the
-name hash; CRCTablesSB8[0] is the ordinary reflected CRC-32 table used by StrCrc32. Both are
-built once on first use rather than pasted in as literals.
-*/
+/* Deprecated = CRCTable_DEPRECATED (MSB-first 0x04C11DB7, used by Strihash); Reflected = CRCTablesSB8[0] (used by StrCrc32). */
 struct FCrcTables
 {
     uint32 Deprecated[256]{};
@@ -60,7 +48,6 @@ std::string Lower(const std::string& S)
     return R;
 }
 
-/* FString on disk: length including the null terminator, then the ANSI bytes and that null. */
 void WriteFString(std::vector<uint8>& B, const std::string& S)
 {
     const int32 Len = int32(S.size()) + 1;
@@ -81,11 +68,11 @@ void SplitName(const std::string& S, std::string& OutBase, int32& OutNumber)
 
     const std::string Digits = S.substr(Underscore + 1);
     if (Digits.size() > 1 && Digits[0] == '0') return;       // leading zeros are part of the name
-    if (Digits.size() > 9) return;                           // would not round-trip through int32
+    if (Digits.size() > 9) return;
     for (char C : Digits) if (C < '0' || C > '9') return;
 
     OutBase = S.substr(0, Underscore);
-    OutNumber = std::stoi(Digits) + 1;                       // the stored number is one-based
+    OutNumber = std::stoi(Digits) + 1;                       // stored number is one-based
 }
 
 uint32 Strihash(const std::string& S)
@@ -104,7 +91,7 @@ uint32 StrCrc32(const std::string& S)
     uint32 C = 0xFFFFFFFFu;
     for (char Ch : S)
     {
-        const uint32 W = uint8(Ch);   // TCHAR widened; the upper three bytes are zero for ANSI
+        const uint32 W = uint8(Ch);   // hashes all four bytes of the widened TCHAR
         for (int32 Shift : { 0, 8, 16, 24 })
             C = (C >> 8) ^ Crc().Reflected[(C ^ ((W >> Shift) & 0xFFu)) & 0xFFu];
     }
@@ -139,10 +126,10 @@ void TagBool(FArc& Ar, const std::string& Name, bool Value)
 {
     Ar.Name(Name);
     Ar.Name("BoolProperty");
-    Ar.I32(0);                                    // the value is in the tag, so no payload
+    Ar.I32(0);                                    // Size
     Ar.I32(0);                                    // ArrayIndex
     Ar.U8(Value ? 1 : 0);                         // BoolVal
-    Ar.U8(0);                                     // no property guid follows
+    Ar.U8(0);                                     // HasPropertyGuid
 }
 
 void Tag(FArc& Ar, const std::string& Name, const std::string& Type,
@@ -158,9 +145,9 @@ void Tag(FArc& Ar, const std::string& Name, const std::string& Type,
     if (Type == "StructProperty")
     {
         Ar.Name(StructName);
-        for (int32 I = 0; I < 4; ++I) Ar.U32(0);  // the struct's guid, zero for engine structs
+        for (int32 I = 0; I < 4; ++I) Ar.U32(0);  // StructGuid, zero for engine structs
     }
-    Ar.U8(0);                                     // no property guid follows
+    Ar.U8(0);                                     // HasPropertyGuid
     Ar.Append(Scratch);
 }
 
@@ -184,7 +171,7 @@ int32 FPackage::AddExport(FExport&& In)
 
 int32 FPackage::NameIndex(const std::string& S)
 {
-    // Only the base of a numbered name reaches the table; the number rides in the FName itself.
+    // Only the base of a numbered name reaches the table.
     std::string Base;
     int32 Number = 0;
     SplitName(S, Base, Number);
@@ -193,10 +180,7 @@ int32 FPackage::NameIndex(const std::string& S)
     auto It = NameLookup.find(Key);
     if (It != NameLookup.end()) return It->second;
 
-    /*
-    Before the table is sorted an index would be a lie, so pass one records the name and hands
-    back zero; every FName is a fixed eight bytes either way, so payload sizes still line up.
-    */
+    // Pass one returns 0 for everything; every FName is 8 bytes regardless, so sizes still line up.
     if (bNamesFinal) return 0;
     NameLookup.emplace(Key, 0);
     Names.push_back(Base);
@@ -210,21 +194,21 @@ bool FPackage::Save(const std::string& OutBaseNoExt, std::string* Err) const
     FPackage* Self = const_cast<FPackage*>(this);
     Self->NameIndex(PackageName);
 
-    // First we let every payload run purely to collect the FNames it mentions.
+    // Pass one: run every payload only to collect FNames.
     for (const FExport& E : Exports)
     {
         FArc Discard(Self);
         E.Serialize(Discard);
     }
 
-    // The name table is stored sorted, compared case-insensitively; indices follow that order.
+    // The name table is stored sorted case-insensitively; indices follow that order.
     std::sort(Self->Names.begin(), Self->Names.end(),
               [](const std::string& A, const std::string& B) { return Lower(A) < Lower(B); });
     Self->NameLookup.clear();
     for (int32 I = 0; I < int32(Names.size()); ++I) Self->NameLookup[Lower(Names[size_t(I)])] = I;
     Self->bNamesFinal = true;
 
-    // Now the payloads serialize for real, with every FName resolvable.
+    // Pass two: real bytes.
     std::vector<std::vector<uint8>> Payloads;
     Payloads.reserve(Exports.size());
     for (const FExport& E : Exports)
@@ -234,7 +218,6 @@ bool FPackage::Save(const std::string& OutBaseNoExt, std::string* Err) const
         Payloads.push_back(std::move(Ar.B));
     }
 
-    // Sections whose contents do not depend on any offset.
     std::vector<uint8> NameTable;
     for (const std::string& S : Names)
     {
@@ -258,10 +241,7 @@ bool FPackage::Save(const std::string& OutBaseNoExt, std::string* Err) const
     if (ImportTable.B.size() != size_t(kImportEntrySize) * Imports.size())
         return Fail("import entry size drifted from 28 bytes");
 
-    /*
-    The EDL table is one flat run of FPackageIndex values; each export's row points at its own
-    slice by first index plus the four per-phase counts, in the order the loader reads them.
-    */
+    // EDL table: one flat run of FPackageIndex; each export row gives its first index plus four per-phase counts.
     FArc PreloadDeps(Self);
     std::vector<int32> FirstDep(Exports.size(), -1);
     std::vector<std::vector<int32>> CreateBeforeCreate(Exports.size());
@@ -270,11 +250,7 @@ bool FPackage::Save(const std::string& OutBaseNoExt, std::string* Err) const
         const FExport& E = Exports[I];
         CreateBeforeCreate[I] = E.CreateBeforeCreate;
 
-        /*
-        An export that declares nothing still has the obvious dependency: it cannot be created
-        before the objects its own row points at. Deriving that much keeps a hand-written
-        package loadable without making every caller spell out the whole table.
-        */
+        // An export that declares nothing gets CreateBeforeCreate on the objects its own row references.
         if (E.SerBeforeSer.empty() && E.CreateBeforeSer.empty()
             && E.SerBeforeCreate.empty() && E.CreateBeforeCreate.empty())
         {
@@ -297,10 +273,7 @@ bool FPackage::Save(const std::string& OutBaseNoExt, std::string* Err) const
     }
     const int32 PreloadCount = int32(PreloadDeps.B.size() / 4);
 
-    /*
-    Offsets: everything downstream of the summary has a known size, so the summary is written
-    once against zeroed offsets purely to learn how long it is, then again for real.
-    */
+    // The summary is written once with zero offsets to measure itself, then again for real.
     struct FOffsets
     {
         int32 TotalHeaderSize = 0, NameOff = 0, ExportOff = 0, ImportOff = 0;
@@ -313,7 +286,7 @@ bool FPackage::Save(const std::string& OutBaseNoExt, std::string* Err) const
         S.U32(kPackageFileTag);
         S.I32(kLegacyFileVersion);
         S.I32(0);                                   // LegacyUE3Version
-        S.I32(0);                                   // FileVersionUE4 - saved unversioned
+        S.I32(0);                                   // FileVersionUE4
         S.I32(0);                                   // FileVersionLicenseeUE4
         S.I32(0);                                   // CustomVersion count
         S.I32(O.TotalHeaderSize);
@@ -321,7 +294,7 @@ bool FPackage::Save(const std::string& OutBaseNoExt, std::string* Err) const
         S.U32(kPkgFilterEditorOnly);
         S.I32(int32(Names.size()));
         S.I32(O.NameOff);
-        // LocalizationId is omitted: PKG_FilterEditorOnly is set.
+        // LocalizationId omitted: PKG_FilterEditorOnly.
         S.I32(0); S.I32(0);                         // GatherableTextData count/offset
         S.I32(int32(Exports.size()));
         S.I32(O.ExportOff);
@@ -332,11 +305,11 @@ bool FPackage::Save(const std::string& OutBaseNoExt, std::string* Err) const
         S.I32(0);                                   // SearchableNamesOffset
         S.I32(0);                                   // ThumbnailTableOffset
         S.Guid(PkgGuid);
-        // PersistentGuid is omitted for the same reason as LocalizationId.
-        S.I32(1);                                   // one generation
+        // PersistentGuid omitted: PKG_FilterEditorOnly.
+        S.I32(1);                                   // Generations count
         S.I32(int32(Exports.size()));
         S.I32(int32(Names.size()));
-        for (int32 I = 0; I < 2; ++I)               // SavedBy / CompatibleWith engine versions
+        for (int32 I = 0; I < 2; ++I)               // SavedByEngineVersion, CompatibleWithEngineVersion
         {
             S.U16(0); S.U16(0); S.U16(0); S.U32(0); S.I32(0);
         }
@@ -366,7 +339,6 @@ bool FPackage::Save(const std::string& OutBaseNoExt, std::string* Err) const
     for (const std::vector<uint8>& P : Payloads) PayloadCursor += int64(P.size());
     Off.BulkDataStart = PayloadCursor;
 
-    // The export table can only be written now: its rows carry absolute payload offsets.
     FArc ExportTable(Self);
     for (size_t I = 0; I < Exports.size(); ++I)
     {
@@ -409,7 +381,7 @@ bool FPackage::Save(const std::string& OutBaseNoExt, std::string* Err) const
 
     std::vector<uint8> Exp;
     for (const std::vector<uint8>& P : Payloads) Exp.insert(Exp.end(), P.begin(), P.end());
-    const uint32 Tail = kPackageFileTag;            // .uexp closes with the package tag again
+    const uint32 Tail = kPackageFileTag;            // .uexp ends with the package tag
     Exp.insert(Exp.end(), (const uint8*)&Tail, (const uint8*)&Tail + 4);
 
     auto Dump = [&](const std::string& Path, const std::vector<uint8>& Bytes) {

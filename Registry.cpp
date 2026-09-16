@@ -1,18 +1,4 @@
-﻿/*
-Registry.cpp — the AssetRegistry.bin layout, transcribed from UE 4.27's savers.
-
-The file is three sections written in load order (FAssetRegistryWriter's destructor, which
-flushes them that way so the reader never seeks): the FName batch, the fixed tag store, then
-the body — asset rows, dependencies, package data — whose FNames are indices into that batch.
-
-Two deliberate simplifications, both load-bearing enough to name. The name batch's saved hashes
-are only used when the stored algorithm id matches the running engine's; writing a different id
-makes the loader hash the strings itself (UnrealNames.cpp, CanUseSavedHashes), which buys us out
-of porting CityHash64 for no behavioural difference. And a generated mod has no asset tags, so
-the tag store is written empty and every row's map handle is zero — the value FStoreBuilder
-itself returns for an empty map.
-*/
-#include "Registry.h"
+﻿#include "Registry.h"
 
 #include <cstdio>
 #include <unordered_map>
@@ -27,17 +13,11 @@ constexpr uint32 kVersionGuid[4] = { 0x717F9EE7, 0xE9B0493A, 0x88B39132, 0x1B388
 constexpr int32 kVersionFixedTags = 8;          // FAssetRegistryVersion::LatestVersion in 4.27
 constexpr uint32 kStoreBeginMagic = 0x12345679;
 constexpr uint32 kStoreEndMagic = 0x87654321;
-constexpr int32 kStoreViewCount = 11;           // @see FixedTagPrivate::VisitViews
-constexpr uint32 kNumberedNameBit = 0x80000000; // FName index flag for a name that carries a number
-constexpr uint64 kUnusableHashVersion = 0;      // != FNameHash::AlgorithmId, so the loader rehashes
+constexpr int32 kStoreViewCount = 11;           // FixedTagPrivate::VisitViews
+constexpr uint32 kNumberedNameBit = 0x80000000;
+constexpr uint64 kUnusableHashVersion = 0;      // != FNameHash::AlgorithmId, so the loader rehashes (UnrealNames.cpp CanUseSavedHashes)
 
-/*
-FBin — a little-endian byte sink that also owns the name batch.
-
-`Name` is the whole reason this is its own writer rather than Package.h's FArc: an asset
-registry FName is an index into a batch built in first-use order, not into the sorted table a
-package header carries.
-*/
+/* Registry FNames index a first-use-order name batch, not a package header's sorted table. */
 class FBin
 {
 public:
@@ -53,7 +33,6 @@ public:
         B.insert(B.end(), Bytes, Bytes + N);
     }
 
-    /* An FName: its batch index, plus the number when the string ends in one ("Foo_2"). */
     void Name(const std::string& S)
     {
         std::string Base;
@@ -70,10 +49,7 @@ public:
     std::vector<uint8> B;
 
 private:
-    /*
-    Names are pooled case-insensitively — two spellings share one FName entry — and the batch
-    stores whichever spelling was seen first, which is what the engine's name pool does too.
-    */
+    /* Case-insensitive pool, first spelling wins, like the engine's name pool. */
     uint32 NameIndex(const std::string& S)
     {
         std::string Key = S;
@@ -92,20 +68,13 @@ private:
     std::unordered_map<std::string, uint32> NameLookup;
 };
 
-/* Everything before the last slash: FAssetData's PackagePath, its Outer's path. */
 std::string PackagePathOf(const std::string& PackageName)
 {
     const size_t Slash = PackageName.rfind('/');
     return Slash == std::string::npos ? PackageName : PackageName.substr(0, Slash);
 }
 
-/*
-Writes the name batch: counts, then hashes, 2-byte headers and the string bytes as three runs.
-
-Note the archive form packs the strings with no alignment padding between them — unlike the
-split name-data/hash-data form next to it in UnrealNames.cpp, which pads wide names. Every name
-we write is ANSI, so the header's wide bit is always clear.
-*/
+/* Archive-form name batch (UnrealNames.cpp): strings packed with no alignment padding. */
 void WriteNameBatch(const std::vector<std::string>& Names, std::vector<uint8>& Out)
 {
     FBin Batch;
@@ -125,7 +94,7 @@ void WriteNameBatch(const std::vector<std::string>& Names, std::vector<uint8>& O
     for (const std::string& S : Names)
     {
         const uint32 Len = uint32(S.size());
-        Batch.U8(uint8(Len >> 8));                              // the high bit would mean UTF-16
+        Batch.U8(uint8(Len >> 8));                              // high bit set would mean UTF-16
         Batch.U8(uint8(Len & 0xFF));
     }
     for (const std::string& S : Names) Batch.Raw(S.data(), S.size());
@@ -133,10 +102,6 @@ void WriteNameBatch(const std::vector<std::string>& Names, std::vector<uint8>& O
     Out.insert(Out.end(), Batch.B.begin(), Batch.B.end());
 }
 
-/*
-Writes an empty fixed tag store: the begin magic, a zero element count for each of the eleven
-views, an empty FText blob, no view data at all, and the end magic.
-*/
 void WriteEmptyStore(std::vector<uint8>& Out)
 {
     FBin Store;
@@ -153,15 +118,11 @@ bool SaveAssetRegistry(const std::vector<FRegistryAsset>& Assets, const std::str
 {
     auto Fail = [&](const char* Msg) { if (Err) *Err = Msg; return false; };
 
-    /*
-    First the body, because writing it is what discovers the names: every FName it emits
-    registers with the batch, and the batch has to precede it in the file.
-    */
+    // The body is written first because it is what registers the names the batch must precede it with.
     FBin Body;
     Body.I32(int32(Assets.size()));
     for (const FRegistryAsset& A : Assets)
     {
-        // FAssetData derives ObjectPath from the package and asset names; so do we.
         Body.Name(A.PackageName + "." + A.AssetName);           // ObjectPath
         Body.Name(PackagePathOf(A.PackageName));                // PackagePath
         Body.Name(A.AssetClass);
@@ -173,12 +134,7 @@ bool SaveAssetRegistry(const std::vector<FRegistryAsset>& Assets, const std::str
         Body.U32(A.PackageFlags);
     }
 
-    /*
-    The dependency section is length-prefixed so a registry loaded with bLoadDependencies off
-    can seek past it. We have no dependency graph to offer — the loader treats that as "nothing
-    depends on these", which for a self-contained mod class is true.
-    */
-    Body.I64(4);                                                // section size: just the count
+    Body.I64(4);                                                // dependency section size: just the count
     Body.I32(0);                                                // dependency node count
     Body.I32(0);                                                // package data count
 
