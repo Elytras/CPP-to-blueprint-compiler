@@ -6,7 +6,7 @@ import os
 import re
 import sys
 
-DECL = re.compile(r"^\t(static\s+)?([A-Za-z_][\w:<>,\s\*&]*?)\s+(\w+)\((.*)\);\s*$")
+DECL = re.compile(r"^\t(static\s+)?([A-Za-z_][\w:<>,\s\*&]*?)\s+(\w+)\((.*)\)(\s*const)?;\s*$")
 # A class line this fails to match is not skipped: it silently donates its body to the class above.
 CLASS = re.compile(r"^class\s+(?:\w+\([^)]*\)\s+)?((?:\w+::)?\w+)(?:\s+final)?"
                    r"(?:\s*:\s*public\s+((?:\w+::)?\w+))?\s*$")
@@ -14,7 +14,10 @@ CLASS = re.compile(r"^class\s+(?:\w+\([^)]*\)\s+)?((?:\w+::)?\w+)(?:\s+final)?"
 # /Game path is only present when the dump was taken with Dumper-7's FullAssetPaths=1.
 CLASS_COMMENT = re.compile(r"^// (\w+)\s+([\w/\.\-]+)\.(\w+)\s*$")
 PTR = re.compile(r"^(?:const\s+)?class\s+((?:\w+::)?\w+)\s*\*$")
-TPL = re.compile(r"^(?:const\s+)?(TSubclassOf|TSoftObjectPtr|TSoftClassPtr)<class\s+((?:\w+::)?\w+)>\s*&?$")
+TPL = re.compile(r"^(?:const\s+)?(TSubclassOf|TSoftObjectPtr|TSoftClassPtr|TScriptInterface)<class\s+((?:\w+::)?\w+)>\s*&?$")
+# A sparse delegate's second argument is its name as a string, which a C++ template cannot take; it is dropped.
+DELEGATE = re.compile(r'^(?:const\s+)?(TDelegate|TMulticastInlineDelegate|TMulticastSparseDelegate)'
+                      r'<([\w\s\*&]+?)\((.*)\)(?:,\s*"\w+")?>\s*&?$')
 
 
 CLASS_WORD = re.compile(r"class\s+((?:\w+::)?\w+)")
@@ -28,7 +31,8 @@ def class_refs(t):
 
 def split_args(text):
     return [a.strip() for a in split_params(text)]
-FIELD = re.compile(r"^\t([A-Za-z_][\w:<>,\*& ]*?)\s+([A-Za-z_]\w*)\s*(:\s*\d+)?;\s*//")
+FIELD = re.compile(r"^\t([A-Za-z_][\w:<>,\*& ()\"]*?)\s+([A-Za-z_]\w*)\s*(:\s*\d+)?;\s*//")
+NO_STRUCT_LITERAL = ("TDelegate<", "TMulticast", "TScriptInterface<")    # EX_StructConst has no zero for these
 INCLUDE = re.compile(r'^#include\s+"(\w+)_classes\.hpp"')
 
 SCALARS = {
@@ -101,6 +105,12 @@ def map_type(raw):
     m = TPL.match(t)
     if m:
         return "%s<class %s>" % (m.group(1), m.group(2))
+    m = DELEGATE.match(t)
+    if m:
+        ret, params = map_type(m.group(2)), parse_params(m.group(3))
+        if ret in KINDS or isinstance(params, str):
+            return "other"
+        return "%s<%s(%s)>" % (m.group(1), ret, ", ".join("%s %s" % p for p in params))
     m = CONTAINER.match(t)
     if m:
         args = [map_type(a) for a in split_args(m.group(2))]
@@ -202,7 +212,7 @@ def resolve_structs():
         own, complete = [], base.complete if base else True
         for raw, name in st.raw_fields:
             mapped = map_type(raw)
-            if mapped in KINDS or mapped == "void":
+            if mapped in KINDS or mapped == "void" or any(s in mapped for s in NO_STRUCT_LITERAL):
                 complete = False
                 continue
             own.append((mapped, name))
@@ -373,6 +383,7 @@ class Klass(object):
         self.emit = ""
         self.header = ""
         self.funcs = []
+        self.const_funcs = set()
         self.raw_funcs = []      # (return, name, params) as Dumper-7 spelled them, before any mapping
         self.fields = []
 
@@ -418,6 +429,8 @@ def parse_header(path):
             skipped[ret if ret in KINDS else params] += 1
             continue
         cur.funcs.append((bool(m.group(1)), ret, m.group(3), params))
+        if m.group(5):
+            cur.const_funcs.add(m.group(3))
     return classes, skipped, includes
 
 
@@ -518,6 +531,30 @@ def wildcard_param(raw, name, tpl):
     elem = ("K" if "Key" in name else "V") if tpl == "TMap" else "T"
     core = core.replace("TMap<int32, int32>", "TMap<K, V>").replace("int32", elem)
     return core + "&" if out else "const %s&" % core
+
+
+FUNC_BITS = {"Final": 0x1, "RequiredAPI": 0x2, "BlueprintAuthorityOnly": 0x4, "BlueprintCosmetic": 0x8, "Net": 0x40,
+             "NetReliable": 0x80, "NetRequest": 0x100, "Exec": 0x200, "Native": 0x400, "Event": 0x800,
+             "NetResponse": 0x1000, "Static": 0x2000, "NetMulticast": 0x4000, "UbergraphFunction": 0x8000,
+             "MulticastDelegate": 0x10000, "Public": 0x20000, "Private": 0x40000, "Protected": 0x80000,
+             "Delegate": 0x100000, "NetServer": 0x200000, "HasOutParams": 0x400000, "HasDefaults": 0x800000,
+             "NetClient": 0x1000000, "DLLImport": 0x2000000, "BlueprintCallable": 0x4000000,
+             "BlueprintEvent": 0x8000000, "BlueprintPure": 0x10000000, "EditorOnly": 0x20000000,
+             "Const": 0x40000000, "NetValidate": 0x80000000}
+
+
+def write_events(sdk_dir, out_dir):
+    """Events.json: "Package.Class.Function" -> EFunctionFlags of every BlueprintEvent, the functions a Blueprint
+    overrides or implements. The compiler copies part of these onto the override (KismetCompiler.cpp)."""
+    rows = []
+    for name in sorted(f for f in os.listdir(sdk_dir) if f.endswith("_functions.cpp")):
+        text = io.open(os.path.join(sdk_dir, name), encoding="utf-8", errors="replace").read()
+        for m in re.finditer(r"^// Function ([\w\.]+)\n// \(([^)]*)\)", text, re.M):
+            names = m.group(2).split(", ")
+            if "BlueprintEvent" in names:
+                rows.append('  "%s": %d' % (m.group(1), sum(FUNC_BITS[n] for n in names)))
+    io.open(os.path.join(out_dir, "Events.json"), "w", encoding="utf-8", newline="\n").write("{\n" + ",\n".join(rows) + "\n}\n")
+    print("  events: %d" % len(rows))
 
 
 def write_containers(classes, sdk_dir, out_dir):
@@ -658,6 +695,7 @@ def main():
 
     conv_structs = write_conversions(ordered, out_dir)
     write_containers(ordered, sdk_dir, out_dir)
+    write_events(sdk_dir, out_dir)
     ops_by_pkg = write_operators(ordered, out_dir)
     write_types(out_dir)
 
@@ -716,8 +754,8 @@ def main():
                     variants.append([p for p in params if p is not wco[0]])
                 for plist in variants:
                     args = ", ".join("%s %s" % (rewrite(t), n) for t, n in plist)
-                    body.append("    %s%s %s(%s);"
-                                % ("static " if is_static else "", rewrite(ret), fname, args))
+                    body.append("    %s%s %s(%s)%s;" % ("static " if is_static else "", rewrite(ret), fname, args,
+                                                         " const" if fname in k.const_funcs else ""))
                 funcs += 1
                 for t in [ret] + [t for t, _ in params]:
                     referenced.update(class_refs(t))
