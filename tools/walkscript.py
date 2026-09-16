@@ -135,7 +135,7 @@ def main():
                 t = W(blob, cand + 4, names, imports, exports)
                 while t.o < script_end: t.expr()
                 if t.o == script_end: p = cand; break
-            except Exception: pass
+            except (Exception, SystemExit): pass     # expr() exits on an unknown op; a wrong candidate hits one
     assert p is not None, 'no ScriptStorageSize found'
     bytecode, storage = struct.unpack_from('<i', blob, p - 4)[0], struct.unpack_from('<i', blob, p)[0]
     print('%s: header ScriptBytecodeSize=%d ScriptStorageSize=%d, script at +%d' % (e['name'], bytecode, storage, p + 4))
