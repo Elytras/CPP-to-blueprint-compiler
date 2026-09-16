@@ -237,12 +237,15 @@ void FBlueprintClass::Finish()
     const bool bOverridesTick = std::any_of(Functions.begin(), Functions.end(),
         [](const FPending& F) { return F.Def.Name == "ReceiveTick"; });
 
-    Cdo.Serialize = [bOverridesTick](FArc& Ar) {
+    Cdo.Serialize = [bOverridesTick, ClassVars](FArc& Ar) {
         if (bOverridesTick)
             Tag(Ar, "PrimaryActorTick", "StructProperty", [](FArc& V) {
                 TagBool(V, "bCanEverTick", true);
                 TagEnd(V);
             }, "ActorTickFunction");
+        /* Only initialised members: an absent tag keeps the parent CDO's (zero) value. */
+        for (const FPropertyDef& V : ClassVars)
+            if (V.Default.K != FDefaultValue::None) WriteDefaultTag(Ar, V);
         TagEnd(Ar);                                 // a CDO omits the lazy-object guid
     };
     P.AddExport(std::move(Cdo));
@@ -353,7 +356,7 @@ void FBlueprintClass::FinishStruct(const uint32 (&Guid)[4])
         Ar.I32(0);                                  // script storage size
         Ar.U32(0);                                  // StructFlags
 
-        for (const FPropertyDef& M : Members) WriteZeroValueTag(Ar, M);
+        for (const FPropertyDef& M : Members) WriteDefaultTag(Ar, M);
         TagEnd(Ar);
     };
     P.AddExport(std::move(S));

@@ -81,21 +81,70 @@ void ForEach(const Json& N, const F& Fn)
     for (const Json& C : *It) Fn(C);
 }
 
-std::string Unquote(const std::string& Spelling)
+/* A clang StringLiteral spelling (prefix, quotes, escapes) as UTF-8. clang escapes a narrow
+   literal's non-ASCII bytes in octal, and a wide literal's code units in octal or hex. */
+std::string Unquote(std::string Spelling)
 {
-    if (Spelling.size() < 2) return Spelling;
-    std::string Out;
-    for (size_t I = 1; I + 1 < Spelling.size(); ++I)
+    bool bWide = false;
+    if (Spelling.compare(0, 2, "u8") == 0) Spelling.erase(0, 2);
+    else if (!Spelling.empty() && (Spelling[0] == 'L' || Spelling[0] == 'u' || Spelling[0] == 'U'))
     {
-        if (Spelling[I] != '\\' || I + 2 >= Spelling.size()) { Out.push_back(Spelling[I]); continue; }
-        const char C = Spelling[++I];
-        switch (C)
+        bWide = true;
+        Spelling.erase(0, 1);
+    }
+    if (Spelling.size() < 2) return Spelling;
+
+    const size_t End = Spelling.size() - 1;     // the closing quote
+    auto Hex = [](char C) { return C <= '9' ? C - '0' : (C | 0x20) - 'a' + 10; };
+    std::vector<uint32> Units;
+    for (size_t I = 1; I < End; ++I)
+    {
+        if (Spelling[I] != '\\' || I + 1 >= End) { Units.push_back(uint8(Spelling[I])); continue; }
+        char C = Spelling[++I];
+        if (C >= '0' && C <= '7')
         {
-        case 'n': Out.push_back('\n'); break;
-        case 't': Out.push_back('\t'); break;
-        case 'r': Out.push_back('\r'); break;
-        case '0': Out.push_back('\0'); break;
-        default: Out.push_back(C); break;
+            uint32 V = 0;
+            for (int32 N = 0; N < 3 && I < End && Spelling[I] >= '0' && Spelling[I] <= '7'; ++N, ++I)
+                V = V * 8 + uint32(Spelling[I] - '0');
+            Units.push_back(V);
+            --I;
+        }
+        else if (C == 'x')
+        {
+            uint32 V = 0;
+            while (I + 1 < End && std::isxdigit(uint8(Spelling[I + 1]))) V = V * 16 + uint32(Hex(Spelling[++I]));
+            Units.push_back(V);
+        }
+        else
+        {
+            static const std::map<char, char> Simple = {
+                { 'n', '\n' }, { 't', '\t' }, { 'r', '\r' }, { 'a', '\a' }, { 'b', '\b' }, { 'f', '\f' }, { 'v', '\v' } };
+            auto It = Simple.find(C);
+            Units.push_back(uint8(It != Simple.end() ? It->second : C));
+        }
+    }
+
+    std::string Out;
+    for (size_t I = 0; I < Units.size(); ++I)
+    {
+        uint32 Cp = Units[I];
+        if (!bWide) { Out.push_back(char(Cp)); continue; }
+        if (Cp >= 0xD800 && Cp < 0xDC00 && I + 1 < Units.size() && Units[I + 1] >= 0xDC00 && Units[I + 1] < 0xE000)
+            Cp = 0x10000 + ((Cp - 0xD800) << 10) + (Units[++I] - 0xDC00);
+        if (Cp < 0x80) Out.push_back(char(Cp));
+        else if (Cp < 0x800) { Out.push_back(char(0xC0 | (Cp >> 6))); Out.push_back(char(0x80 | (Cp & 0x3F))); }
+        else if (Cp < 0x10000)
+        {
+            Out.push_back(char(0xE0 | (Cp >> 12)));
+            Out.push_back(char(0x80 | ((Cp >> 6) & 0x3F)));
+            Out.push_back(char(0x80 | (Cp & 0x3F)));
+        }
+        else
+        {
+            Out.push_back(char(0xF0 | (Cp >> 18)));
+            Out.push_back(char(0x80 | ((Cp >> 12) & 0x3F)));
+            Out.push_back(char(0x80 | ((Cp >> 6) & 0x3F)));
+            Out.push_back(char(0x80 | (Cp & 0x3F)));
         }
     }
     return Out;
@@ -241,6 +290,7 @@ struct FCallIR
     FIndex Extra;
     FIndex Extra2;
     bool bScript = false;               // callee is Blueprint bytecode
+    bool bInstance = false;             // non-static method: needs the context object, not the class CDO
     FIndex Context;                     // CDO a static call runs against; null = self
     std::string VirtualName;            // a generated class's own instance method: EX_VirtualFunction resolves it by name at run time
     std::shared_ptr<FArgIR> Target;     // the object an instance call runs against; null = self
@@ -248,11 +298,13 @@ struct FCallIR
 };
 
 /* EX_CallMath calls UFunction::Func with the CALLER's frame, which is only correct for a native;
-   a bytecode callee must go through EX_FinalFunction (UFunction::Invoke builds its own frame). */
+   a bytecode callee must go through EX_FinalFunction (UFunction::Invoke builds its own frame).
+   EX_CallMath also runs on the function's outer-class CDO and ignores EX_Context, so it is only
+   right for a static: an instance native on it would run against e.g. Default__FSDGameState. */
 void EmitCallOp(FScript& S, const FCallIR& Call)
 {
     if (!Call.VirtualName.empty()) S.VirtualFunction(Call.VirtualName);
-    else if (Call.bScript) S.FinalFunction(Call.Fn);
+    else if (Call.bScript || Call.bInstance) S.FinalFunction(Call.Fn);
     else S.CallMath(Call.Fn);
 }
 
@@ -333,18 +385,9 @@ bool EmitArg(FScript& S, const FArgIR& A, FIndex SelfExp, std::string* Err)
     case FArgIR::Name:  S.NameConst(A.S); return true;
     case FArgIR::Text:  S.TextConst(A.S, A.bWide); return true;
     case FArgIR::Str:
-        if (A.bWide)
-        {
-            /* clang reports L"hi" as the narrow spelling; byte-widening is enough for ASCII sources. */
-            std::u16string W;
-            W.reserve(A.S.size());
-            for (unsigned char C : A.S) W.push_back(char16_t(C));
-            S.UnicodeStringConst(W);
-        }
-        else
-        {
-            S.StringConst(A.S);
-        }
+        /* EX_StringConst is Latin-1, so anything non-ASCII goes out as UTF-16. */
+        if (A.bWide || !IsAscii(A.S)) S.UnicodeStringConst(Utf8To16(A.S));
+        else S.StringConst(A.S);
         return true;
     case FArgIR::Field: S.InstanceVariable(A.S, A.Owner); return true;
     case FArgIR::Local: S.LocalVariable(A.S, SelfExp); return true;
@@ -385,24 +428,38 @@ bool EmitArg(FScript& S, const FArgIR& A, FIndex SelfExp, std::string* Err)
         }
         if (A.Sub->Intrinsic == "__DerefReadI64__" || A.Sub->Intrinsic == "__DerefReadI32__"
             || A.Sub->Intrinsic == "__DerefReadF__" || A.Sub->Intrinsic == "__DerefReadU8__"
-            || A.Sub->Intrinsic == "__DerefReadStr__")
+            || A.Sub->Intrinsic == "__DerefReadStr__" || A.Sub->Intrinsic == "__DerefReadText__")
         {
             /* Hoisted Read: outer StructMember reads the view struct's TArray<T> at offset 0 out of
                the caller's FDeref __DerefScratch__ (Num=1, Data=<addr>). ArrayGetByRef then copies
                InnerProp.ElementSize bytes from Data[0] into the caller's dest. No class-owner check
                is involved (StructMemberContext + ArrayGetByRef are both guard-free). */
             const char* ViewField =
-                A.Sub->Intrinsic == "__DerefReadI64__" ? "NameHashes"     :
-                A.Sub->Intrinsic == "__DerefReadI32__" ? "Mapping"        :
-                A.Sub->Intrinsic == "__DerefReadF__"   ? "Data"           :
-                A.Sub->Intrinsic == "__DerefReadStr__" ? "AssetScanPaths" :
-                                                        "Kilobyte";
+                A.Sub->Intrinsic == "__DerefReadI64__"  ? "NameHashes"     :
+                A.Sub->Intrinsic == "__DerefReadI32__"  ? "Mapping"        :
+                A.Sub->Intrinsic == "__DerefReadF__"    ? "Data"           :
+                A.Sub->Intrinsic == "__DerefReadStr__"  ? "AssetScanPaths" :
+                A.Sub->Intrinsic == "__DerefReadText__" ? "Data"           :
+                                                         "Kilobyte";
             const FIndex ViewStruct = A.Sub->Extra;
             S.ArrayGetByRef(
                 [&](FScript& O)
                 {
                     O.StructMember(ViewField, ViewStruct,
                         [&](FScript& I) { I.LocalVariable("__DerefScratch__", SelfExp); });
+                },
+                [&](FScript& I) { I.IntZero(); });
+            return true;
+        }
+        if (A.Sub->Intrinsic == "__RefAtInline__")
+        {
+            const FIndex View = A.Sub->Extra;
+            const std::string Scratch = A.S;
+            S.ArrayGetByRef(
+                [&](FScript& O)
+                {
+                    O.StructMember("NameHashes", View,
+                        [&](FScript& I) { I.LocalVariable(Scratch, SelfExp); });
                 },
                 [&](FScript& I) { I.IntZero(); });
             return true;
@@ -492,18 +549,21 @@ static const FReadViewSpec kReadViews[] = {
     { "__ReadByte__",   "__DerefReadU8__",  "uint8",           "/Script/Engine", "BandwidthTestItem"            },
     { "__ReadObject__", "__DerefReadI64__", "class UObject *", "/Script/Engine", "MaterialCachedParameterEntry" },
     { "__ReadName__",   "__DerefReadI64__", "FName",           "/Script/Engine", "MaterialCachedParameterEntry" },
-    /* Wider/narrower variants that share a same-size view: CopySingleValue on the InnerProp only
-       cares about ElementSize (a memcpy), so the tmp's type just decides the FField class the
+    /* __ReadClass__ shares the int64 view: CopySingleValue on the InnerProp only cares about
+       ElementSize (an 8-byte memcpy), so the tmp's type just decides the FField class the
        assign lands in - which is what __ClassOf__(Out) checks against at each Get<T>PropertyByName. */
-    { "__ReadDouble__", "__DerefReadI64__", "double",          "/Script/Engine", "MaterialCachedParameterEntry" },
-    { "__ReadUInt64__", "__DerefReadI64__", "uint64",          "/Script/Engine", "MaterialCachedParameterEntry" },
-    { "__ReadUInt32__", "__DerefReadI32__", "uint32",          "/Script/Engine", "LODMappingData"               },
-    { "__ReadInt8__",   "__DerefReadU8__",  "int8",            "/Script/Engine", "BandwidthTestItem"            },
     { "__ReadClass__",  "__DerefReadI64__", "class UClass *",  "/Script/Engine", "MaterialCachedParameterEntry" },
     /* FString view: FStrProperty::CopySingleValue does a deep FString operator= (allocates a
        fresh TArray<TCHAR>), so ArrayGetByRef of the FString at *(FString*)Addr into an
        FString local produces an owned copy that DestroyStruct cleans up on return. */
     { "__ReadString__", "__DerefReadStr__", "FString",         "/Script/Engine", "AssetManagerSearchRules"      },
+    /* FText view: no engine ScriptStruct has TArray<FText> at offset 0, so ReadProperty.cpp
+       declares its own FDerefTextView { TArray<FText> Data; } which AssetGen cooks as a sibling
+       .uasset in the ReadProperty mod folder. Blueprint.cpp:81 registers it on CallImports so
+       its script init preloads before any bytecode referencing it. Same deep-copy pattern as
+       FString: FTextProperty::CopySingleValue is an FText operator= that shares the TSharedRef
+       refcount, so DestroyStruct cleans up on return. */
+    { "__ReadText__",   "__DerefReadText__", "FText",           "/Game/_ElytrasMods/ReadProperty/FDerefTextView", "FDerefTextView" },
 };
 
 const FReadViewSpec* FindReadView(const std::string& Intrinsic)
@@ -553,6 +613,8 @@ private:
     bool HoistReadCall(FArgIR& A, const FReadViewSpec& V, FBlueprintClass& BP,
                        std::vector<FPropertyDef>& Locals,
                        std::vector<FStmtIR>& OutPre, std::string* Err);
+    bool HoistRefAt(FArgIR& A, FBlueprintClass& BP, std::vector<FPropertyDef>& Locals,
+                    std::vector<FStmtIR>& OutPre, std::string* Err);
 
     FIndex FindEvent(FBlueprintClass& BP, const std::string& FromRecord, const std::string& Method);
 
@@ -1148,18 +1210,13 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
     }
     if (K == "StringLiteral")
     {
-        std::string V = N->value("value", std::string());
-        if (!V.empty() && (V.front() == 'L' || V.front() == 'u' || V.front() == 'U'))
-            V.erase(V.begin());     // drop the L/u/U prefix
-        const std::string Text = Unquote(V);
-
         /* Wide literals are detected by type; the value is clang's source spelling. */
         Out.K = FArgIR::Str;
         const std::string Ty = TypeOf(*N);
         Out.bWide = Ty.find("wchar_t") != std::string::npos
                  || Ty.find("char16_t") != std::string::npos
                  || Ty.find("char32_t") != std::string::npos;
-        Out.S = Text;
+        Out.S = Unquote(N->value("value", std::string()));
         return true;
     }
     if (K == "CXXMemberCallExpr")
@@ -1452,6 +1509,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
             /* Donor: any struct with an 8-byte scalar at offset 0. FDateTime.Ticks is not reflected in shipping. */
             Out.Extra = BP.ScriptStruct("/Script/Engine", "ScreenMessageString");
         }
+        else if (MethodName == "__RefAt__") {}   // resolved by HoistRefAt
         else if (FindReadView(MethodName))
         {
             /* Placeholder: the hoist pass rewrites each __Read*__ call into two statements
@@ -1487,6 +1545,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
                                                         : R->CppName + "_C";
         Out.Fn = BP.EngineFunction(CalleePackage, CalleeName, MethodName);
         Out.bScript = CalleePackage.compare(0, 6, "/Game/") == 0;
+        Out.bInstance = !bStatic;
         /* A Blueprint static needs the CDO context; EX_CallMath finds it itself for a native. */
         if (Out.bScript && bStatic)
             Out.Context = BP.ClassDefaultObject(CalleePackage, CalleeName);
@@ -1812,6 +1871,56 @@ bool FCompiler::HoistReadsInArg(FArgIR& A, FBlueprintClass& BP,
 
     if (const FReadViewSpec* V = FindReadView(A.Sub->Intrinsic))
         return HoistReadCall(A, *V, BP, Locals, OutPre, Err);
+    if (A.Sub->Intrinsic == "__RefAt__")
+        return HoistRefAt(A, BP, Locals, OutPre, Err);
+    return true;
+}
+
+/* __RefAt__(Addr) stays an inline ArrayGetByRef, so a CustomThunk stepping it with a null
+   result sees MostRecentPropertyAddress == Addr. A temp would hand it the temp's address
+   instead. Each use gets its own FDeref scratch, so later reads in the statement can't
+   overwrite its Data before the call runs. */
+bool FCompiler::HoistRefAt(FArgIR& A, FBlueprintClass& BP, std::vector<FPropertyDef>& Locals,
+                           std::vector<FStmtIR>& OutPre, std::string* Err)
+{
+    if (A.Sub->Args.size() != 1)
+    {
+        *Err = "__RefAt__ takes exactly one argument (the address)";
+        return false;
+    }
+    const FIndex DerefStruct = BP.ScriptStruct(ModPackage + "/FDeref", "FDeref");
+    const std::string Scratch = "__RefScratch" + std::to_string(ReadTmpCounter++) + "__";
+    FPropertyDef PD = StructParam(Scratch, DerefStruct, "FDeref", 16, 0);
+    PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+    Locals.push_back(PD);
+
+    auto Assign = [&](const char* Field, FArgIR Value)
+    {
+        FStmtIR St;
+        St.K = FStmtIR::Assign;
+        St.Var.K = FArgIR::Member;
+        St.Var.S = Field;
+        St.Var.Owner = DerefStruct;
+        St.Var.LetOp = EX_Let;
+        St.Var.Base = std::make_shared<FArgIR>();
+        St.Var.Base->K = FArgIR::Local;
+        St.Var.Base->S = Scratch;
+        St.Value = std::move(Value);
+        OutPre.push_back(std::move(St));
+    };
+    FArgIR One;
+    One.K = FArgIR::Int;
+    One.I = 1;
+    Assign("Num", One);
+    Assign("Data", std::move(A.Sub->Args[0]));
+
+    const FIndex View = BP.ScriptStruct("/Script/Engine", "MaterialCachedParameterEntry");
+    A = FArgIR{};
+    A.K = FArgIR::Call;
+    A.S = Scratch;
+    A.Sub = std::make_shared<FCallIR>();
+    A.Sub->Intrinsic = "__RefAtInline__";
+    A.Sub->Extra = View;
     return true;
 }
 
@@ -1875,19 +1984,45 @@ std::string StripTypeKeywords(std::string T)
     return T;
 }
 
-/* The CDO / struct default instance writes no values, so only zero initialisers are accepted. */
-bool RejectNonZeroInitialiser(const Json& F, std::string* Err)
+/* A member initializer becomes PD.Default, which the CDO / struct default instance writes. It must
+   be a literal the member's own type can hold (optionally negated), nullptr, or an argless ctor. */
+bool LowerDefault(const Json& F, FPropertyDef& PD, std::string* Err)
 {
     const Json* Init = Strip(First(F));
     if (!Init) return true;
-    const std::string IK = Kind(*Init);
-    const std::string IV = Init->value("value", std::string());
-    const bool bZero = (IK == "IntegerLiteral" && IV == "0")
-                    || (IK == "FloatingLiteral" && (IV == "0" || IV == "0.0"))
-                    || (IK == "CXXBoolLiteralExpr" && !Init->value("value", false))
-                    || (IK == "StringLiteral" && Unquote(IV).empty());
-    if (bZero) return true;
-    *Err = "TODO: a variable's initializer is not written to the defaults yet: " + Name(F);
+    std::string K = Kind(*Init);
+    const bool bNeg = K == "UnaryOperator" && Init->value("opcode", std::string()) == "-";
+    if (bNeg)
+    {
+        Init = Strip(First(*Init));
+        K = Init ? Kind(*Init) : std::string();
+    }
+    if (!bNeg && (K == "CXXNullPtrLiteralExpr" || (K == "CXXConstructExpr" && !First(*Init)))) return true;
+
+    FDefaultValue& D = PD.Default;
+    const std::string& T = PD.Type;
+    const bool bNumber = K == "IntegerLiteral" || K == "FloatingLiteral" || K == "CXXBoolLiteralExpr";
+    if (bNumber && (T == "IntProperty" || T == "Int64Property" || T == "ByteProperty"
+                    || T == "FloatProperty" || T == "BoolProperty"))
+    {
+        const std::string V = K == "CXXBoolLiteralExpr" ? std::string() : Init->value("value", std::string("0"));
+        double Num = K == "CXXBoolLiteralExpr" ? (Init->value("value", false) ? 1.0 : 0.0)
+                   : K == "FloatingLiteral"    ? std::strtod(V.c_str(), nullptr)
+                                               : double(std::strtoull(V.c_str(), nullptr, 10));
+        int64 Int = K == "IntegerLiteral" ? int64(std::strtoull(V.c_str(), nullptr, 10)) : int64(Num);
+        if (bNeg) { Num = -Num; Int = -Int; }
+        if (T == "FloatProperty") { D.K = Num != 0.0 ? FDefaultValue::Float : FDefaultValue::None; D.F = Num; }
+        else if (T == "BoolProperty") { D.K = Num != 0.0 ? FDefaultValue::Bool : FDefaultValue::None; D.I = 1; }
+        else { D.K = Int != 0 ? FDefaultValue::Int : FDefaultValue::None; D.I = Int; }
+        return true;
+    }
+    if (!bNeg && K == "StringLiteral" && (T == "StrProperty" || T == "NameProperty" || T == "TextProperty"))
+    {
+        D.S = Unquote(Init->value("value", std::string()));
+        D.K = D.S.empty() ? FDefaultValue::None : FDefaultValue::Str;
+        return true;
+    }
+    *Err = "TODO: an initializer must be a literal of the member's own type: " + Name(F);
     return false;
 }
 
@@ -1939,12 +2074,8 @@ bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& P
         return true;
     }
     if (Type == "float") { *Out = FloatParam(PName, ExtraFlags); return true; }
-    if (Type == "double") { *Out = DoubleParam(PName, ExtraFlags); return true; }
     if (Type == "int" || Type == "int32") { *Out = IntParam(PName, ExtraFlags); return true; }
     if (Type == "int64" || Type == "long long") { *Out = Int64Param(PName, ExtraFlags); return true; }
-    if (Type == "int8" || Type == "signed char") { *Out = Int8Param(PName, ExtraFlags); return true; }
-    if (Type == "uint32" || Type == "unsigned int") { *Out = UInt32Param(PName, ExtraFlags); return true; }
-    if (Type == "uint64" || Type == "unsigned long long") { *Out = UInt64Param(PName, ExtraFlags); return true; }
     if (Type == "bool") { *Out = BoolParam(PName, ExtraFlags); return true; }
     if (Type == "uint8" || Type == "unsigned char") { *Out = ByteParam(PName, ExtraFlags); return true; }
     if (Type == "char *" || Type == "char*" || Type == "FString")
@@ -2002,13 +2133,9 @@ bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& P
 bool FCompiler::LayoutOf(const std::string& QualType, int32* Size, int32* Align, std::string* Err)
 {
     const std::string T = StripTypeKeywords(QualType);
-    if (T == "float" || T == "int" || T == "int32"
-        || T == "uint32" || T == "unsigned int") { *Size = 4; *Align = 4; return true; }
-    if (T == "int64" || T == "long long"
-        || T == "uint64" || T == "unsigned long long"
-        || T == "double") { *Size = 8; *Align = 8; return true; }
-    if (T == "bool" || T == "uint8" || T == "unsigned char"
-        || T == "int8" || T == "signed char") { *Size = 1; *Align = 1; return true; }
+    if (T == "float" || T == "int" || T == "int32") { *Size = 4; *Align = 4; return true; }
+    if (T == "int64" || T == "long long") { *Size = 8; *Align = 8; return true; }
+    if (T == "bool" || T == "uint8" || T == "unsigned char") { *Size = 1; *Align = 1; return true; }
     if (T == "FName") { *Size = 8; *Align = 4; return true; }
     if (T == "FString" || T == "char *" || T == "char*") { *Size = 16; *Align = 8; return true; }
     if (T == "FText") { *Size = 24; *Align = 8; return true; }
@@ -2051,9 +2178,9 @@ bool FCompiler::GenerateStruct(const FRecord& R, const std::string& OutDir, std:
 
     for (const Json* F : R.Fields)
     {
-        if (!RejectNonZeroInitialiser(*F, Err)) return false;
         FPropertyDef PD;
         if (!TypeToProperty(TypeOf(*F), Name(*F), 0, "member " + Name(*F), BP, &PD, Err)) return false;
+        if (!LowerDefault(*F, PD, Err)) return false;
         PD.PropertyFlags = CPF_Edit | CPF_BlueprintVisible;
         BP.AddVariable(PD);
     }
@@ -2097,12 +2224,11 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     for (const Json* F : R.Fields)
     {
         const std::string FieldName = Name(*F);
-        if (!RejectNonZeroInitialiser(*F, Err)) return false;
-
         FPropertyDef PD;
         std::string PErr;
         if (!TypeToProperty(TypeOf(*F), FieldName, 0, "property " + FieldName, BP, &PD, &PErr))
         { *Err = PErr; return false; }
+        if (!LowerDefault(*F, PD, Err)) return false;
 
         /* CPF_Parm would make it part of the call frame; CPF_BlueprintReadOnly would forbid assignment. */
         PD.PropertyFlags = (PD.PropertyFlags & ~uint64(CPF_Parm | CPF_BlueprintReadOnly))
