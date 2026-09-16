@@ -19,6 +19,12 @@ FPropertyDef FloatParam(const std::string& Name, uint64 ExtraFlags)
                          CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, Null() };
 }
 
+FPropertyDef DoubleParam(const std::string& Name, uint64 ExtraFlags)
+{
+    return FPropertyDef{ "DoubleProperty", Name, RF_Public, 1, 8,
+                         CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, Null() };
+}
+
 FPropertyDef IntParam(const std::string& Name, uint64 ExtraFlags)
 {
     return FPropertyDef{ "IntProperty", Name, RF_Public, 1, 4,
@@ -28,6 +34,24 @@ FPropertyDef IntParam(const std::string& Name, uint64 ExtraFlags)
 FPropertyDef Int64Param(const std::string& Name, uint64 ExtraFlags)
 {
     return FPropertyDef{ "Int64Property", Name, RF_Public, 1, 8,
+                         CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, Null() };
+}
+
+FPropertyDef Int8Param(const std::string& Name, uint64 ExtraFlags)
+{
+    return FPropertyDef{ "Int8Property", Name, RF_Public, 1, 1,
+                         CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, Null() };
+}
+
+FPropertyDef UInt32Param(const std::string& Name, uint64 ExtraFlags)
+{
+    return FPropertyDef{ "UInt32Property", Name, RF_Public, 1, 4,
+                         CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, Null() };
+}
+
+FPropertyDef UInt64Param(const std::string& Name, uint64 ExtraFlags)
+{
+    return FPropertyDef{ "UInt64Property", Name, RF_Public, 1, 8,
                          CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, Null() };
 }
 
@@ -68,6 +92,14 @@ FPropertyDef ObjectParam(const std::string& Name, FIndex Class, uint64 ExtraFlag
                          CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, Class };
 }
 
+FPropertyDef ClassParam(const std::string& Name, FIndex UClassImp, FIndex MetaClass, uint64 ExtraFlags)
+{
+    // Storage is a UClass* (8b). Extra = PropertyClass (always UClass); Extra2 = MetaClass filter.
+    return FPropertyDef{ "ClassProperty", Name, RF_Public, 1, 8,
+                         CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags,
+                         UClassImp, "", MetaClass };
+}
+
 FPropertyDef StructParam(const std::string& Name, FIndex Struct, const std::string& StructName,
                          int32 Size, uint64 ExtraFlags)
 {
@@ -80,10 +112,11 @@ void WriteZeroValueTag(FArc& Ar, const FPropertyDef& P)
     if (P.Type == "BoolProperty") { TagBool(Ar, P.Name, false); return; }
     Tag(Ar, P.Name, P.Type, [&](FArc& V) {
         if (P.Type == "IntProperty" || P.Type == "FloatProperty" || P.Type == "StrProperty"
-            || P.Type == "ObjectProperty")
+            || P.Type == "ObjectProperty" || P.Type == "ClassProperty" || P.Type == "UInt32Property")
             V.I32(0);
-        else if (P.Type == "Int64Property") V.I64(0);
-        else if (P.Type == "ByteProperty") V.U8(0);
+        else if (P.Type == "Int64Property" || P.Type == "UInt64Property") V.I64(0);
+        else if (P.Type == "DoubleProperty") { double Z = 0.0; V.Raw(&Z, 8); }
+        else if (P.Type == "ByteProperty" || P.Type == "Int8Property") V.U8(0);
         else if (P.Type == "NameProperty") V.Name("None");
         else if (P.Type == "TextProperty") { V.U32(0); V.U8(0xFF); V.I32(0); }   // flags, ETextHistoryType::None, no invariant string
         else if (P.Type == "StructProperty") TagEnd(V);
@@ -104,8 +137,13 @@ void WriteProperty(FArc& Ar, const FPropertyDef& P)
     Ar.Name("None");                    // RepNotifyFunc
     Ar.U8(0);                           // BlueprintReplicationCondition
 
-    if (P.Type == "ObjectProperty" || P.Type == "ClassProperty")
+    if (P.Type == "ObjectProperty")
         Ar.Idx(P.Extra);                // PropertyClass
+    else if (P.Type == "ClassProperty")
+    {
+        Ar.Idx(P.Extra);                // PropertyClass = UClass
+        Ar.Idx(P.Extra2);               // MetaClass (the subclass filter)
+    }
     else if (P.Type == "StructProperty")
         Ar.Idx(P.Extra);                // Struct
     else if (P.Type == "BoolProperty")
@@ -334,6 +372,17 @@ void FScript::StructConst(FIndex Struct, int32 SerializedSize,
     Memory += 4;
     Members(*this);
     Op(EX_EndStructConst);
+}
+
+void FScript::IntZero() { Op(EX_IntZero); }
+void FScript::IntOne() { Op(EX_IntOne); }
+
+void FScript::ArrayGetByRef(const std::function<void(FScript&)>& ArrayExpr,
+                            const std::function<void(FScript&)>& IndexExpr)
+{
+    Op(EX_ArrayGetByRef);
+    ArrayExpr(*this);
+    IndexExpr(*this);
 }
 
 void FScript::CallMath(FIndex Function)
