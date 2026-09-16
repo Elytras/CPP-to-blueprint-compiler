@@ -165,6 +165,16 @@ bool IsPureDecl(const Json& Decl)
     return bPure;
 }
 
+std::vector<std::string> ParmNames(const Json& Decl)
+{
+    std::vector<std::string> Out;
+    ForEach(Decl, [&](const Json& C) { if (Kind(C) == "ParmVarDecl") Out.push_back(Name(C)); });
+    return Out;
+}
+
+/* WorldContextObject, WorldContext, Dumper-7's WorldContextObject_0: the parameter a Blueprint wires to self. */
+bool IsWcoName(const std::string& N) { return N.compare(0, 12, "WorldContext") == 0; }
+
 struct FRecord
 {
     std::string CppName;
@@ -553,6 +563,7 @@ private:
     std::map<std::string, std::string> Bare;          // unambiguous leaf name -> qualified name
     const FRecord* Cur = nullptr;                     // record Generate is working on
     std::set<std::string> CurrentOutParms;            // T& parm names of the function being lowered
+    std::string CurrentWco;                           // its WorldContext* parm when it is a static, else empty
     std::vector<FRegistryAsset> RegistryRows;
 
     /* Per-function state reset in Generate: whether this function needs the FDeref scratch
@@ -704,7 +715,9 @@ bool FCompiler::Collect(std::string* Err)
             }
             else if (Kind(C) == "CXXMethodDecl" && C.contains("name"))
             {
-                R.Methods[Name(C)] = &C;
+                /* genueapi's overload without the world context shares the name; the longer one is the UFunction. */
+                const Json*& Slot = R.Methods[Name(C)];
+                if (!Slot || ParmNames(C).size() > ParmNames(*Slot).size()) Slot = &C;
                 MethodOwner[C.value("id", std::string())] = R.CppName;
             }
             else if (Kind(C) == "FieldDecl" && C.contains("name"))
@@ -1148,6 +1161,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
     if (!Callee) { *Err = "call with no callee"; return false; }
 
     std::string DeclId, MethodName;
+    const Json* FullDecl = nullptr;     // the UFunction's own signature, whichever overload was called
     if (K == "CXXMemberCallExpr")
     {
         if (Kind(*Callee) != "MemberExpr") { *Err = "TODO: unimplemented callee " + Kind(*Callee); return false; }
@@ -1201,6 +1215,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
 
         auto Decl = R->Methods.find(MethodName);
         const bool bStatic = Decl != R->Methods.end() && IsStaticDecl(*Decl->second);
+        if (Decl != R->Methods.end()) FullDecl = Decl->second;
 
         if (!R->IsNative() && !bStatic) Out.VirtualName = MethodName;
 
@@ -1218,14 +1233,31 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
 
     /* inner[0] is the callee. */
     bool bFirst = true, bOk = true;
+    std::vector<bool> Defaulted;
     ForEach(CallExprNode, [&](const Json& C) {
         if (bFirst) { bFirst = false; return; }
         if (!bOk) return;
         FArgIR A;
         bOk = LowerArg(C, BP, A, Err);
         if (bOk) Out.Args.push_back(A);
+        Defaulted.push_back(Kind(C) == "CXXDefaultArgExpr");
     });
-    return bOk;
+    if (!bOk || !FullDecl) return bOk;
+
+    /* A world context the call leaves out - to its default, or through genueapi's overload without
+       it - is wired like the Blueprint editor wires the hidden pin: self, or the enclosing static's
+       own world context parameter, since a static's self is a CDO with no world. */
+    const std::vector<std::string> Parms = ParmNames(*FullDecl);
+    for (size_t I = 0; I < Parms.size(); ++I)
+    {
+        if (!IsWcoName(Parms[I])) continue;
+        FArgIR Wco;
+        if (!CurrentWco.empty()) { Wco.K = FArgIR::Local; Wco.S = CurrentWco; }
+        if (Out.Args.size() + 1 == Parms.size()) Out.Args.insert(Out.Args.begin() + I, Wco);
+        else if (I < Defaulted.size() && Defaulted[I]) Out.Args[I] = Wco;
+        break;
+    }
+    return true;
 }
 
 bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FStmtIR>& Out,
@@ -1850,6 +1882,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
 
         std::vector<FPropertyDef> Params;
         CurrentOutParms.clear();
+        CurrentWco.clear();
         bool bOk = true;
         ForEach(M, [&](const Json& C) {
             if (Kind(C) != "ParmVarDecl" || !bOk) return;
@@ -1871,6 +1904,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             { *Err = PErr; bOk = false; return; }
             Params.push_back(PD);
             if (bOutParm) CurrentOutParms.insert(PName);
+            if (IsStaticDecl(Decl) && CurrentWco.empty() && IsWcoName(PName)) CurrentWco = PName;
         });
         if (!bOk) return false;
 
