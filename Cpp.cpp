@@ -41,6 +41,7 @@ const Json* Nth(const Json& N, size_t I)
 }
 
 std::string StripTypeKeywords(std::string T);
+const Json* PeelLvalue(const Json* N);
 
 std::string TypeOf(const Json& N)
 {
@@ -64,6 +65,7 @@ const Json* Strip(const Json* N)
             && K != "ConstantExpr" && K != "ExprWithCleanups"
             && K != "CXXBindTemporaryExpr" && K != "MaterializeTemporaryExpr"
             && K != "CXXConstructExpr" && K != "CXXFunctionalCastExpr"
+            && K != "CXXStaticCastExpr" && K != "CXXReinterpretCastExpr" && K != "CXXConstCastExpr"
             && K != "CXXDefaultArgExpr")
             return N;
         const Json* Inner = First(*N);
@@ -314,6 +316,7 @@ struct FCallIR
     bool bInstance = false;             // non-static method: needs the context object, not the class CDO
     FIndex Context;                     // CDO a static call runs against; null = self
     std::string VirtualName;            // a generated class's own instance method: EX_VirtualFunction resolves it by name at run time
+    std::string View;                   // __RefAtInline__: the TArray field of the view struct in Extra
     std::shared_ptr<FArgIR> Target;     // the object an instance call runs against; null = self
     std::vector<FArgIR> Args;
 };
@@ -355,6 +358,17 @@ struct FStmtIR
     bool bAssignLocal = false;
     bool bAssignOutParm = false;
 };
+
+/* The TArray field at offset 0 of a read's engine view struct (kReadViews), by its __DerefRead*__. */
+const char* ViewFieldOf(const std::string& DerefIntrinsic)
+{
+    return DerefIntrinsic == "__DerefReadI64__"  ? "NameHashes"     :
+           DerefIntrinsic == "__DerefReadI32__"  ? "Mapping"        :
+           DerefIntrinsic == "__DerefReadF__"    ? "Data"           :
+           DerefIntrinsic == "__DerefReadStr__"  ? "AssetScanPaths" :
+           DerefIntrinsic == "__DerefReadText__" ? "Data"           :
+                                                   "Kilobyte";
+}
 
 /* SelfExp: the enclosing function's export index, FFieldPath owner of its params and locals. */
 bool EmitArgs(FScript& S, const std::vector<FArgIR>& Args, FIndex SelfExp, std::string* Err);
@@ -449,11 +463,13 @@ bool EmitArg(FScript& S, const FArgIR& A, FIndex SelfExp, std::string* Err)
             S.ObjectConst(SelfExp);
             return true;
         }
-        if (A.Sub->Intrinsic == "__AddrOf__" || A.Sub->Intrinsic == "__NameIndex__")
+        if (A.Sub->Intrinsic == "__AddrOf__" || A.Sub->Intrinsic == "__NameIndex__" || A.Sub->Intrinsic == "__AsObject__")
         {
             /* StructMember with a donor field at Offset_Internal=0 copies ElementSize bytes straight out
-               of the argument's own storage: ScreenMessageString.Key (8) / IntPoint.X (4 = ComparisonIndex). */
-            const std::string InnerField = A.Sub->Intrinsic == "__AddrOf__" ? "Key" : "X";
+               of the argument's own storage: ScreenMessageString.Key (8) / IntPoint.X (4 = ComparisonIndex) /
+               DebugDisplayProperty.obj (8, an int64 read back as a UObject*). */
+            const std::string InnerField = A.Sub->Intrinsic == "__AddrOf__" ? "Key"
+                                         : A.Sub->Intrinsic == "__AsObject__" ? "obj" : "X";
             if (A.Sub->Args.size() != 1)
             {
                 if (Err) *Err = A.Sub->Intrinsic + " takes exactly one argument";
@@ -475,13 +491,7 @@ bool EmitArg(FScript& S, const FArgIR& A, FIndex SelfExp, std::string* Err)
                the caller's FDeref __DerefScratch__ (Num=1, Data=<addr>). ArrayGetByRef then copies
                InnerProp.ElementSize bytes from Data[0] into the caller's dest. No class-owner check
                is involved (StructMemberContext + ArrayGetByRef are both guard-free). */
-            const char* ViewField =
-                A.Sub->Intrinsic == "__DerefReadI64__"  ? "NameHashes"     :
-                A.Sub->Intrinsic == "__DerefReadI32__"  ? "Mapping"        :
-                A.Sub->Intrinsic == "__DerefReadF__"    ? "Data"           :
-                A.Sub->Intrinsic == "__DerefReadStr__"  ? "AssetScanPaths" :
-                A.Sub->Intrinsic == "__DerefReadText__" ? "Data"           :
-                                                         "Kilobyte";
+            const char* ViewField = ViewFieldOf(A.Sub->Intrinsic);
             const FIndex ViewStruct = A.Sub->Extra;
             S.ArrayGetByRef(
                 [&](FScript& O)
@@ -499,7 +509,7 @@ bool EmitArg(FScript& S, const FArgIR& A, FIndex SelfExp, std::string* Err)
             S.ArrayGetByRef(
                 [&](FScript& O)
                 {
-                    O.StructMember("NameHashes", View,
+                    O.StructMember(A.Sub->View, View,
                         [&](FScript& I) { I.LocalVariable(Scratch, SelfExp); });
                 },
                 [&](FScript& I) { I.IntZero(); });
@@ -659,6 +669,25 @@ private:
                              FArgIR& Out, std::string* Err);
     bool LowerDelegateValue(const Json& Obj, const Json& Fn, FArgIR& Out, std::string* Err);
 
+    /* Raw pointers: a pointer to anything but a UObject (void*, int32*, FName*, UObject**) is an address,
+       an int64 at run time. NormalizePointers respells them int64 in a declaration's subtree before
+       lowering, so every int64 path takes them; the pointer type stays in type.origQualType. */
+    bool IsRawPointer(std::string QualType) const;
+    void NormalizePointers(Json& N) const;
+    bool IsDerefLvalue(const Json& N) const;
+    const FReadViewSpec* ViewFor(const std::string& Pointee) const;
+    bool LowerAddress(const Json& Lvalue, FBlueprintClass& BP, FArgIR& Out, std::string* Pointee, std::string* Err);
+    bool ReadThrough(FArgIR Addr, const std::string& Pointee, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
+    bool RefThrough(FArgIR Addr, const std::string& Pointee, FArgIR& Out, std::string* Err);
+    bool ScaleIndex(const Json& IndexNode, const std::string& Pointee, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
+    bool HoistOperand(FArgIR& Operand, FBlueprintClass& BP, std::vector<FPropertyDef>& Locals,
+                      std::vector<FStmtIR>& OutPre, std::string* Err);
+    bool HasDerefStruct(std::string* Err) const;
+    bool LowerPtrCastSource(const Json& Call, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
+    std::map<std::string, std::string> RefAddr;     // VarDecl id -> pointee: `T& R = *P` keeps the address in an int64 local R
+    std::map<std::string, Json> RefAlias;           // VarDecl id -> the variable `T& R = V` is another name for; a copy,
+                                                    // since a for-init is lowered out of a temporary Json
+
     /* Post-pass over the IR that turns every `__Read*__(Addr)` sub-expression into a pair of
        statements hoisted to the enclosing statement level:
            __DerefScratch__.Data = <Addr>
@@ -739,6 +768,15 @@ void EmitStmts(const std::vector<FStmtIR>& Stmts, FScript& S, FIndex SelfExp)
         {
         case FStmtIR::Assign:
         {
+            if (St.Var.K == FArgIR::Call && St.Var.Sub && St.Var.Sub->Intrinsic == "__RefAtInline__")
+            {
+                /* `*P = V`: EX_Let writes the value into whatever address the destination leaves (ScriptCore.cpp
+                   execLet). LetBool / LetObj would cast the destination property, which a view's never is. */
+                S.LetPath(EX_Let, { St.Var.Sub->View, St.Var.Sub->View }, St.Var.Sub->Extra,
+                          [St, SelfExp](FScript& V) { EmitArg(V, St.Var, SelfExp, nullptr); },
+                          [St, SelfExp](FScript& V) { EmitArg(V, St.Value, SelfExp, nullptr); });
+                break;
+            }
             /* Let's property path: the variable itself, or an array element as {element, array}; the
                path's owner is the declaring class for a Field, the function for a local. */
             const FArgIR& Top = St.Var.K == FArgIR::Index ? *St.Var.Base : St.Var;
@@ -1044,6 +1082,8 @@ std::string MathFuncFor(const std::string& Op, const std::string& Flavour)
     if (Op == "!=") return "NotEqual_" + Flavour;
     if (Op == "<") return "Less_" + Flavour;
     if (Op == ">") return "Greater_" + Flavour;
+    if (Op == "<=") return "LessEqual_" + Flavour;
+    if (Op == ">=") return "GreaterEqual_" + Flavour;
     return "";
 }
 
@@ -1122,6 +1162,7 @@ std::string FCompiler::Canon(std::string T) const
 {
     T = StripTypeKeywords(T);
     while (!T.empty() && (T.back() == '&' || T.back() == ' ')) T.pop_back();
+    if (T.size() > 6 && T.compare(T.size() - 6, 6, "*const") == 0) T.erase(T.size() - 5);  // `const T&` of a pointer T
     T = StripTypeKeywords(T);
     const EStrKind K = StrKindOf(T);
     if (K != SK_None) return TypeNameOf(K);
@@ -1146,6 +1187,55 @@ bool FCompiler::ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgI
     const EStrKind FromKind = KindOfLowered(Arg, Arg.InnerType);
     const std::string From = FromKind != SK_None ? TypeNameOf(FromKind) : Canon(Arg.InnerType);
     const EStrKind ToKind = StrKindOf(To);
+
+    /* Addresses, raw pointers being int64 by now: nullptr is 0, an object pointer is its object's
+       address, an address read back as an object pointer is the same 8 bytes, and an address is true
+       when nonzero. C++ only reaches the object <-> int64 pairs through a pointer cast. */
+    auto Reinterpret = [&](const char* Intrinsic, FIndex Donor, const std::string& Type) {
+        FArgIR Operand = Arg;
+        Arg = FArgIR();
+        Arg.K = FArgIR::Call;
+        Arg.InnerType = Type;
+        Arg.Sub = std::make_shared<FCallIR>();
+        Arg.Sub->Intrinsic = Intrinsic;
+        Arg.Sub->Extra = Donor;
+        Arg.Sub->Args.push_back(Operand);
+    };
+    if (ToKind == SK_Int64 && Arg.K == FArgIR::NullObj) { Arg.K = FArgIR::Int64; Arg.I64 = 0; Arg.InnerType = "int64"; return true; }
+    if (ToKind == SK_Int64 && FromKind == SK_Object)
+    {
+        Reinterpret("__AddrOf__", BP.ScriptStruct("/Script/Engine", "ScreenMessageString"), "int64");
+        return true;
+    }
+    if (ToKind == SK_Object && Arg.K == FArgIR::Int)
+    {
+        if (Arg.I == 0) { Arg = FArgIR(); Arg.K = FArgIR::NullObj; return true; }
+        Arg.K = FArgIR::Int64;
+        Arg.I64 = Arg.I;
+    }
+    else if (ToKind == SK_Object && FromKind == SK_Int) { *Err = "an int becomes a pointer through int64: " + ToType; return false; }
+    if (ToKind == SK_Object && KindOfLowered(Arg, Arg.InnerType) == SK_Int64)
+    {
+        Reinterpret("__AsObject__", BP.ScriptStruct("/Script/Engine", "DebugDisplayProperty"), ToType);
+        return true;
+    }
+    if (ToKind == SK_Bool && FromKind == SK_Object)
+    {
+        /* `if (Obj)` tests the object the way a Blueprint does, so a pending-kill object is false too. */
+        WrapInCall(Arg, BP.EngineFunction("/Script/Engine", "KismetSystemLibrary", "IsValid"));
+        Arg.InnerType = "bool";
+        return true;
+    }
+    if (ToKind == SK_Bool && FromKind == SK_Int64)
+    {
+        WrapInCall(Arg, BP.EngineFunction("/Script/Engine", "KismetMathLibrary", "NotEqual_Int64Int64"));
+        FArgIR Zero;
+        Zero.K = FArgIR::Int64;
+        Arg.Sub->Args.push_back(Zero);
+        Arg.InnerType = "bool";
+        return true;
+    }
+
     if (To == From || From.empty() || To.empty() || ToKind == SK_Object) return true;
 
     std::string ToIface, FromIface;
@@ -1264,6 +1354,17 @@ bool FCompiler::LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& 
                                   : BP.ScriptStruct(ModPackage + "/" + R->CppName, R->CppName);
         Out.LetOp = LetOpFor(TypeOf(MemberNode));
         Out.Base = std::make_shared<FArgIR>();
+        /* `P->X` and `(*P).X`: StructMember offsets into the memory P points at. The base is only offset into,
+           never copied, so the int64 view serves a struct of any size. */
+        const Json* Bare = PeelLvalue(ObjRaw);
+        const bool bArrow = MemberNode.value("isArrow", false);
+        if (bArrow || IsDerefLvalue(*Bare))
+        {
+            FArgIR Addr;
+            std::string Pointee;
+            return (bArrow ? LowerArg(*ObjRaw, BP, Addr, Err) : LowerAddress(*Bare, BP, Addr, &Pointee, Err))
+                && RefThrough(std::move(Addr), "int64", *Out.Base, Err);
+        }
         return LowerArg(*ObjRaw, BP, *Out.Base, Err);
     }
 
@@ -1341,11 +1442,332 @@ bool FCompiler::LowerDispatcherCall(const Json& Call, const Json& Callee, const 
     return true;
 }
 
+/* What a raw pointer expression points at ("int32" for an `int32 *`), from the spelling NormalizePointers kept. */
+std::string PointeeOf(const Json& N)
+{
+    auto T = N.find("type");
+    if (T == N.end() || !T->contains("origQualType")) return std::string();
+    std::string Q = StripTypeKeywords((*T)["origQualType"].get<std::string>());
+    if (Q.find('(') != std::string::npos || Q.find('&') != std::string::npos) return std::string();
+    if (Q.size() > 6 && Q.compare(Q.size() - 5, 5, "const") == 0) Q = StripTypeKeywords(Q.substr(0, Q.size() - 5));
+    return Q.empty() || Q.back() != '*' ? std::string() : StripTypeKeywords(Q.substr(0, Q.size() - 1));
+}
+
+/* An lvalue as written: parentheses and const-adding casts looked through, nothing that copies it. */
+const Json* PeelLvalue(const Json* N)
+{
+    while (N && First(*N) && (Kind(*N) == "ParenExpr" || Kind(*N) == "ExprWithCleanups"
+                              || (Kind(*N) == "ImplicitCastExpr" && N->value("castKind", std::string()) == "NoOp")))
+        N = First(*N);
+    return N;
+}
+
+/* `Items[i]` on a TArray: a Kismet ArrayGetByRef, not pointer indexing. */
+bool IsTArrayElement(const Json& N)
+{
+    if (Kind(N) != "CXXOperatorCallExpr") return false;
+    const Json* Callee = Strip(First(N));
+    const Json* Arr = Nth(N, 1);
+    std::string Inner;
+    return Callee && Callee->contains("referencedDecl") && Name((*Callee)["referencedDecl"]) == "operator[]"
+        && Arr && TemplateArg(TypeOf(*Arr), "TArray", &Inner);
+}
+
+/* A variable, a member of one, or a member of this: what `T& R` can be another name for. */
+bool IsAliasable(const Json& N)
+{
+    if (Kind(N) == "DeclRefExpr")
+    {
+        const std::string K = N["referencedDecl"].value("kind", std::string());
+        return K == "VarDecl" || K == "ParmVarDecl";
+    }
+    if (Kind(N) != "MemberExpr" || !First(N)) return false;
+    const Json* Base = PeelLvalue(First(N));
+    if (Kind(*Base) == "CXXThisExpr") return true;
+    return !N.value("isArrow", false) && IsAliasable(*Base);
+}
+
+/* The intrinsics that read their operand's storage through a StructMember donor field. */
+bool IsReinterpret(const std::string& Intrinsic)
+{
+    return Intrinsic == "__AddrOf__" || Intrinsic == "__AsObject__" || Intrinsic == "__NameIndex__";
+}
+
+/* Whether an operand leaves MostRecentProperty and its storage behind, as a StructMember reinterpretation
+   needs (ScriptCore.cpp execStructMemberContext); a call or a literal leaves neither. */
+bool IsStored(const FArgIR& A)
+{
+    return A.K == FArgIR::Local || A.K == FArgIR::LocalOut || A.K == FArgIR::Field || A.K == FArgIR::Member
+        || A.K == FArgIR::Index || (A.K == FArgIR::Call && A.Sub && A.Sub->Intrinsic == "__RefAtInline__");
+}
+
+bool FCompiler::IsRawPointer(std::string T) const
+{
+    T = StripTypeKeywords(T);
+    if (T.size() > 6 && T.compare(T.size() - 5, 5, "const") == 0 && (T[T.size() - 6] == '*' || T[T.size() - 6] == ' '))
+        T = StripTypeKeywords(T.substr(0, T.size() - 5));        // `int32 *const`
+    if (T.empty() || T.back() != '*' || T.find('(') != std::string::npos || T.find("::*") != std::string::npos)
+        return false;
+    const std::string Pointee = StripTypeKeywords(T.substr(0, T.size() - 1));
+    for (const char* Char : { "char", "wchar_t", "char16_t", "char32_t", "TCHAR" })
+        if (Pointee == Char) return false;                          // a string literal
+    if (!Pointee.empty() && Pointee.back() == '*') return true;
+    /* A UObject class carries UE_CLASS or a base; FString, FName and the containers are plain C++ records. */
+    if (const FRecord* R = Find(Pointee)) return R->bIsStruct || (R->UePackage.empty() && R->Base.empty());
+    /* ponytail: a class these headers only forward-declare is still an object when UE's prefix says so, so a
+       property of it stays a reference the GC sees; an undefined class without the prefix passes for raw. */
+    return !(Pointee.size() > 1 && (Pointee[0] == 'U' || Pointee[0] == 'A') && std::isupper(uint8(Pointee[1])));
+}
+
+/* A reference's referent and a function type's return are respelled too: `void *&` is `int64 &`. */
+void FCompiler::NormalizePointers(Json& N) const
+{
+    if (!N.is_structured()) return;
+    auto T = N.is_object() ? N.find("type") : N.end();
+    if (T != N.end() && T->is_object() && T->contains("qualType") && !T->contains("origQualType"))
+    {
+        const std::string Q = (*T)["qualType"].get<std::string>();
+        size_t Core = std::min(Q.find('('), Q.size());
+        while (Core > 0 && (Q[Core - 1] == ' ' || Q[Core - 1] == '&')) --Core;
+        if (IsRawPointer(Q.substr(0, Core)))
+        {
+            const std::string Rest = Q.substr(Core);
+            (*T)["origQualType"] = Q;
+            (*T)["qualType"] = "int64" + std::string(!Rest.empty() && Rest[0] == '&' ? " " : "") + Rest;
+        }
+    }
+    for (Json& C : N) NormalizePointers(C);
+}
+
+bool FCompiler::HasDerefStruct(std::string* Err) const
+{
+    const FRecord* D = Find("FDeref");
+    if (D && D->bIsStruct && !D->IsNative()) return true;
+    *Err = "memory through a pointer needs this mod to declare "
+           "`struct FDeref { UE_STRUCT; int64 Data; int32 Num; int32 Max; };` (as ReadProperty.cpp does)";
+    return false;
+}
+
+/* `*P`, `P[i]` on a raw pointer, `__PtrCast__<T&>(A)`, and a reference local that keeps an address. */
+bool FCompiler::IsDerefLvalue(const Json& N) const
+{
+    const std::string K = Kind(N);
+    if (K == "UnaryOperator") return N.value("opcode", std::string()) == "*";
+    if (K == "ArraySubscriptExpr") return true;
+    if (K == "DeclRefExpr") return RefAddr.count(N["referencedDecl"].value("id", std::string())) != 0;
+    if (K != "CallExpr" || N.value("valueCategory", std::string()) != "lvalue") return false;
+    const Json* Callee = Strip(First(N));
+    return Callee && Kind(*Callee) == "DeclRefExpr" && Name((*Callee)["referencedDecl"]) == "__PtrCast__";
+}
+
+/* The __Read*__ that loads a Pointee. It also sizes a __RefAt__'s view: a callee copying the view's element
+   into a buffer sized for the Pointee needs the two to agree, so no view means no whole-value access. */
+const FReadViewSpec* FCompiler::ViewFor(const std::string& PointeeType) const
+{
+    const std::string P = StripTypeKeywords(PointeeType);
+    const char* Read = nullptr;
+    if (!P.empty() && P.back() == '*')
+        Read = IsRawPointer(P) ? "__Read64__"
+             : StripTypeKeywords(P.substr(0, P.size() - 1)) == "UClass" ? "__ReadClass__" : "__ReadObject__";
+    else if (P == "int64" || P == "uint64" || P == "long long" || P == "unsigned long long") Read = "__Read64__";
+    else if (P == "int" || P == "int32" || P == "uint32" || P == "unsigned int") Read = "__Read32__";
+    else if (P == "float") Read = "__ReadFloat__";
+    else if (P == "uint8" || P == "int8" || P == "unsigned char" || P == "signed char" || P == "char" || P == "bool")
+        Read = "__ReadByte__";
+    else if (auto E = Enums.find(P); E != Enums.end() && E->second.Underlying == "uint8") Read = "__ReadByte__";
+    else if (P == "FName") Read = "__ReadName__";
+    else if (P == "FString") Read = "__ReadString__";
+    else if (P == "FText") Read = "__ReadText__";
+    return Read ? FindReadView(Read) : nullptr;
+}
+
+/* The value at Addr: a __Read*__, which the hoist pass loads into a temp. */
+bool FCompiler::ReadThrough(FArgIR Addr, const std::string& Pointee, FBlueprintClass& BP, FArgIR& Out, std::string* Err)
+{
+    const FReadViewSpec* V = ViewFor(Pointee);
+    if (!V) { *Err = "TODO: a whole " + Pointee + " through a pointer; P->Member reaches its members"; return false; }
+    Out = FArgIR();
+    Out.K = FArgIR::Call;
+    Out.InnerType = V->ResultType;
+    Out.Sub = std::make_shared<FCallIR>();
+    Out.Sub->Intrinsic = V->Intrinsic;
+    Out.Sub->Args.push_back(std::move(Addr));
+    if (StripTypeKeywords(Pointee) != "bool") return true;
+    WrapInCall(Out, BP.EngineFunction("/Script/Engine", "KismetMathLibrary", "NotEqual_ByteByte"));
+    FArgIR Zero;
+    Zero.K = FArgIR::Byte;
+    Out.Sub->Args.push_back(Zero);
+    Out.InnerType = "bool";
+    return true;
+}
+
+/* The memory at Addr as an lvalue: a __RefAt__, whose hoist types its view by the Pointee. */
+bool FCompiler::RefThrough(FArgIR Addr, const std::string& Pointee, FArgIR& Out, std::string* Err)
+{
+    if (!ViewFor(Pointee)) { *Err = "TODO: a whole " + Pointee + " through a pointer; P->Member reaches its members"; return false; }
+    Out = FArgIR();
+    Out.K = FArgIR::Call;
+    Out.InnerType = StripTypeKeywords(Pointee);
+    Out.Sub = std::make_shared<FCallIR>();
+    Out.Sub->Intrinsic = "__RefAt__";
+    Out.Sub->Args.push_back(std::move(Addr));
+    return true;
+}
+
+/* An index or pointer offset in bytes: Count * sizeof(Pointee), folded for a literal. */
+bool FCompiler::ScaleIndex(const Json& IndexNode, const std::string& Pointee, FBlueprintClass& BP, FArgIR& Out, std::string* Err)
+{
+    int32 Size = 0, Align = 0;
+    if (!LayoutOf(Pointee, &Size, &Align, Err) || !LowerArg(IndexNode, BP, Out, Err)) return false;
+    if (Out.K == FArgIR::Int || Out.K == FArgIR::Int64)
+    {
+        Out.I64 = (Out.K == FArgIR::Int ? int64(Out.I) : Out.I64) * Size;
+        Out.K = FArgIR::Int64;
+        Out.InnerType = "int64";
+        return true;
+    }
+    if (!ConvertArg("int64", BP, Out, Err)) return false;
+    if (Size == 1) return true;
+    WrapInCall(Out, BP.EngineFunction("/Script/Engine", "KismetMathLibrary", "Multiply_Int64Int64"));
+    FArgIR Bytes;
+    Bytes.K = FArgIR::Int64;
+    Bytes.I64 = Size;
+    Out.Sub->Args.push_back(Bytes);
+    Out.InnerType = "int64";
+    return true;
+}
+
+/* Where an lvalue sits: through a raw pointer (`*P`, `P[i]`), `__PtrCast__<T&>(A)`, a reference local that
+   keeps an address, or a TArray element (the array's Data pointer plus the offset). A Blueprint variable
+   itself has no address the VM hands out. */
+bool FCompiler::LowerAddress(const Json& Lvalue, FBlueprintClass& BP, FArgIR& Out, std::string* Pointee, std::string* Err)
+{
+    auto PlusOffset = [&](FArgIR Base, FArgIR Offset) {
+        Out = std::move(Base);
+        if (Offset.K == FArgIR::Int64 && Offset.I64 == 0) return;
+        WrapInCall(Out, BP.EngineFunction("/Script/Engine", "KismetMathLibrary", "Add_Int64Int64"));
+        Out.Sub->Args.push_back(std::move(Offset));
+        Out.InnerType = "int64";
+    };
+    const Json* N = Strip(&Lvalue);
+    const std::string K = N ? Kind(*N) : std::string();
+    if (K == "UnaryOperator" && N->value("opcode", std::string()) == "*")
+    {
+        const Json* Ptr = Nth(*N, 0);
+        *Pointee = Ptr ? PointeeOf(*Ptr) : std::string();
+        if (Pointee->empty()) { *Err = "TODO: `*` on " + (Ptr ? TypeOf(*Ptr) : std::string()) + ", which is not a raw pointer"; return false; }
+        return LowerArg(*Ptr, BP, Out, Err);
+    }
+    if (K == "ArraySubscriptExpr")
+    {
+        const Json* Base = Nth(*N, 0);
+        const Json* Index = Nth(*N, 1);
+        if (Base && Index && PointeeOf(*Base).empty()) std::swap(Base, Index);     // `2[P]`
+        *Pointee = Base ? PointeeOf(*Base) : std::string();
+        if (Pointee->empty() || !Index) { *Err = "TODO: indexing that is not through a raw pointer: " + TypeOf(*N); return false; }
+        FArgIR Ptr, Offset;
+        if (!LowerArg(*Base, BP, Ptr, Err) || !ScaleIndex(*Index, *Pointee, BP, Offset, Err)) return false;
+        PlusOffset(std::move(Ptr), std::move(Offset));
+        return true;
+    }
+    if (K == "CallExpr" && IsDerefLvalue(*N))
+    {
+        *Pointee = StripTypeKeywords(TypeOf(*N));
+        return LowerPtrCastSource(*N, BP, Out, Err) && ConvertArg("int64", BP, Out, Err);
+    }
+    if (K == "DeclRefExpr")
+    {
+        const Json& Ref = (*N)["referencedDecl"];
+        if (auto A = RefAddr.find(Ref.value("id", std::string())); A != RefAddr.end())
+        {
+            *Pointee = A->second;
+            Out = FArgIR();
+            Out.K = FArgIR::Local;
+            Out.S = Ref.value("name", std::string());
+            Out.InnerType = "int64";
+            return true;
+        }
+        if (auto A = RefAlias.find(Ref.value("id", std::string())); A != RefAlias.end())
+            return LowerAddress(A->second, BP, Out, Pointee, Err);
+    }
+    if (N && IsTArrayElement(*N))
+    {
+        const Json* Index = Nth(*N, 2);
+        *Pointee = StripTypeKeywords(TypeOf(*N));
+        FArgIR Array, Offset;
+        if (!Index || !LowerArg(*Nth(*N, 1), BP, Array, Err) || !ScaleIndex(*Index, *Pointee, BP, Offset, Err)) return false;
+        if (!IsStored(Array)) { *Err = "the address of an element needs an array variable"; return false; }
+        Array.InnerType = "class UObject *";    // a TArray's first 8 bytes are its Data pointer, read as __AddrOf__ reads one
+        if (!ConvertArg("int64", BP, Array, Err)) return false;
+        PlusOffset(std::move(Array), std::move(Offset));
+        return true;
+    }
+    *Err = "TODO: the address of " + (N ? K : std::string("nothing")) + ": a Blueprint variable has none the VM hands "
+           "out; point into an object (`(uint8*)Obj`), a TArray element (`&Items[I]`) or memory through a pointer";
+    return false;
+}
+
+/* `__PtrCast__`'s argument: a reference local that keeps an address stands for that address, a reference to a
+   Blueprint variable has none to give, and anything else converts by value. */
+bool FCompiler::LowerPtrCastSource(const Json& Call, FBlueprintClass& BP, FArgIR& Out, std::string* Err)
+{
+    const Json* Arg = Nth(Call, 1);
+    if (!Arg) { *Err = "__PtrCast__ takes one argument"; return false; }
+    const Json* Src = Strip(Arg);
+    const std::string Id = Src && Kind(*Src) == "DeclRefExpr" ? (*Src)["referencedDecl"].value("id", std::string()) : std::string();
+    if (RefAlias.count(Id))
+    {
+        *Err = "__PtrCast__ of " + Name((*Src)["referencedDecl"]) + ", a reference to a Blueprint variable, which has no address";
+        return false;
+    }
+    std::string Pointee;
+    return RefAddr.count(Id) ? LowerAddress(*Src, BP, Out, &Pointee, Err) : LowerArg(*Arg, BP, Out, Err);
+}
+
+/* The operand of a StructMember reinterpretation (__AddrOf__, __AsObject__, __NameIndex__) that is not stored
+   anywhere goes into a temp first: EX_StructMemberContext reads the storage the operand leaves behind. */
+bool FCompiler::HoistOperand(FArgIR& Operand, FBlueprintClass& BP, std::vector<FPropertyDef>& Locals,
+                             std::vector<FStmtIR>& OutPre, std::string* Err)
+{
+    if (IsStored(Operand)) return true;
+    const std::string Type = Operand.K == FArgIR::Int64 ? std::string("int64")
+                           : Operand.K == FArgIR::Self ? std::string("class UObject *") : Operand.InnerType;
+    const std::string Tmp = "__PtrTmp" + std::to_string(ReadTmpCounter++) + "__";
+    FPropertyDef PD;
+    if (!TypeToProperty(Type, Tmp, 0, Tmp, BP, &PD, Err)) return false;
+    PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+    Locals.push_back(PD);
+
+    FStmtIR St;
+    St.K = FStmtIR::Assign;
+    St.Var.K = FArgIR::Local;
+    St.Var.S = Tmp;
+    St.Var.LetOp = LetOpFor(StripTypeKeywords(Type));
+    St.bAssignLocal = true;
+    St.Value = std::move(Operand);
+    OutPre.push_back(std::move(St));
+
+    Operand = FArgIR();
+    Operand.K = FArgIR::Local;
+    Operand.S = Tmp;
+    Operand.InnerType = Type;
+    return true;
+}
+
 /* The outer (pre-Strip) type is the slot the value lands in; a string-kind mismatch against the
    value's own type becomes a Kismet conversion, so `FName n = Str + Count` just works. */
 bool FCompiler::LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, std::string* Err)
 {
     const std::string OuterType = TypeOf(ArgNode);
+    /* Memory through a pointer that is not read (no LValueToRValue above it) binds a reference parameter: the
+       memory itself, so the callee's writes land there. */
+    if (const Json* Bare = PeelLvalue(&ArgNode); Bare && IsDerefLvalue(*Bare))
+    {
+        FArgIR Addr;
+        std::string Pointee;
+        return LowerAddress(*Bare, BP, Addr, &Pointee, Err) && RefThrough(std::move(Addr), Pointee, Out, Err)
+            && ConvertArg(OuterType, BP, Out, Err);
+    }
     const Json* N = Strip(&ArgNode);
     if (!N) { *Err = "empty argument expression"; return false; }
     if (!LowerArgRaw(*N, OuterType, BP, Out, Err)) return false;
@@ -1546,6 +1968,14 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             *Err = "TODO: DeclRefExpr to " + RefKind;
             return false;
         }
+        /* A reference local is the variable it names, or the value at the address it keeps. */
+        if (auto A = RefAlias.find(Ref.value("id", std::string())); A != RefAlias.end()) return LowerArg(A->second, BP, Out, Err);
+        if (IsDerefLvalue(*N))
+        {
+            FArgIR Addr;
+            std::string Pointee;
+            return LowerAddress(*N, BP, Addr, &Pointee, Err) && ReadThrough(std::move(Addr), Pointee, BP, Out, Err);
+        }
         const std::string RefName = Ref.value("name", std::string());
         Out.K = CurrentOutParms.count(RefName) ? FArgIR::LocalOut : FArgIR::Local;
         Out.S = RefName;
@@ -1618,9 +2048,36 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             return true;
         }
 
+        if (CalleeName == "__PtrCast__")
+        {
+            /* `__PtrCast__<T&>(A)` is the T at address A; any other target converts A by value (see Intrin.h). */
+            if (IsDerefLvalue(*N))
+            {
+                FArgIR Addr;
+                std::string Pointee;
+                return LowerAddress(*N, BP, Addr, &Pointee, Err) && ReadThrough(std::move(Addr), Pointee, BP, Out, Err);
+            }
+            return LowerPtrCastSource(*N, BP, Out, Err) && ConvertArg(TypeOf(*N), BP, Out, Err);
+        }
+
         Out.K = FArgIR::Call;
         Out.Sub = std::make_shared<FCallIR>();
         return LowerCall(*N, BP, *Out.Sub, Err);
+    }
+    if (K == "ArraySubscriptExpr" || (K == "UnaryOperator" && N->value("opcode", std::string()) == "*"))
+    {
+        FArgIR Addr;
+        std::string Pointee;
+        return LowerAddress(*N, BP, Addr, &Pointee, Err) && ReadThrough(std::move(Addr), Pointee, BP, Out, Err);
+    }
+    if (K == "UnaryOperator" && N->value("opcode", std::string()) == "&")
+    {
+        std::string Pointee;
+        const Json* Operand = Nth(*N, 0);
+        if (!Operand) { *Err = "unary `&` with a missing operand"; return false; }
+        if (!LowerAddress(*Operand, BP, Out, &Pointee, Err)) return false;
+        Out.InnerType = "int64";
+        return true;
     }
     if (K == "UnaryOperator")
     {
@@ -1645,6 +2102,39 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         const Json* LhsRaw = Nth(*N, 0);
         const Json* RhsRaw = Nth(*N, 1);
         if (!LhsRaw || !RhsRaw) { *Err = "binary operator with a missing side"; return false; }
+        /* Pointer arithmetic counts elements: P + N moves N * sizeof(*P) bytes, P - Q counts the elements between. */
+        const std::string LP = PointeeOf(*LhsRaw), RP = PointeeOf(*RhsRaw);
+        if ((Op == "+" || Op == "-") && (!LP.empty() || !RP.empty()))
+        {
+            auto Math = [&](const char* Fn, FArgIR A, FArgIR B) {
+                FArgIR C;
+                C.K = FArgIR::Call;
+                C.InnerType = "int64";
+                C.Sub = std::make_shared<FCallIR>();
+                C.Sub->Fn = BP.EngineFunction("/Script/Engine", "KismetMathLibrary", Fn);
+                C.Sub->Args = { std::move(A), std::move(B) };
+                return C;
+            };
+            FArgIR Ptr, Other;
+            if (!LP.empty() && !RP.empty())
+            {
+                int32 Size = 0, Align = 0;
+                if (!LayoutOf(LP, &Size, &Align, Err) || !LowerArg(*LhsRaw, BP, Ptr, Err) || !LowerArg(*RhsRaw, BP, Other, Err))
+                    return false;
+                Out = Math("Subtract_Int64Int64", std::move(Ptr), std::move(Other));
+                if (Size == 1) return true;
+                FArgIR Bytes;
+                Bytes.K = FArgIR::Int64;
+                Bytes.I64 = Size;
+                Out = Math("Divide_Int64Int64", std::move(Out), std::move(Bytes));
+                return true;
+            }
+            const bool bPtrLeft = !LP.empty();
+            if (!LowerArg(bPtrLeft ? *LhsRaw : *RhsRaw, BP, Ptr, Err)
+                || !ScaleIndex(bPtrLeft ? *RhsRaw : *LhsRaw, bPtrLeft ? LP : RP, BP, Other, Err)) return false;
+            Out = Math(Op == "+" ? "Add_Int64Int64" : "Subtract_Int64Int64", std::move(Ptr), std::move(Other));
+            return true;
+        }
         /* Flavour is read from the UNSTRIPPED sides: clang's promotion cast carries the common type. */
         const std::string LhsTy = TypeOf(*LhsRaw), RhsTy = TypeOf(*RhsRaw);
         std::string Flavour;
@@ -1801,18 +2291,38 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 if (!bOk || Kind(D) != "VarDecl") return;
                 bAny = true;
                 const std::string VarName = Name(D);
+                std::string VarType = TypeOf(D);
+                FStmtIR Ds;
+                const Json* RefInit = First(D) ? PeelLvalue(First(D)) : nullptr;
+                if (!VarType.empty() && VarType.back() == '&' && RefInit && Kind(*RefInit) != "MaterializeTemporaryExpr")
+                {
+                    /* `T& R = V` is another name for V; `T& R = *P` keeps the address in an int64 local. A `const T& R`
+                       bound to a temporary falls through to a copy, which lives as long. */
+                    if (IsAliasable(*RefInit) && !IsDerefLvalue(*RefInit))
+                    {
+                        RefAlias[D.value("id", std::string())] = *RefInit;
+                        return;
+                    }
+                    std::string Pointee;
+                    if (!LowerAddress(*RefInit, BP, Ds.Value, &Pointee, Err))
+                    { *Err = "reference " + VarName + ": " + *Err; bOk = false; return; }
+                    RefAddr[D.value("id", std::string())] = Pointee;
+                    VarType = "int64";
+                    Ds.bHasValue = true;
+                }
+                while (!VarType.empty() && (VarType.back() == '&' || VarType.back() == ' ')) VarType.pop_back();
+                VarType = StripTypeKeywords(VarType);
                 FPropertyDef PD;
-                if (!TypeToProperty(TypeOf(D), VarName, 0, "local " + VarName, BP, &PD, Err))
+                if (!TypeToProperty(VarType, VarName, 0, "local " + VarName, BP, &PD, Err))
                 { bOk = false; return; }
                 PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
                 Locals.push_back(PD);
 
-                FStmtIR Ds;
                 Ds.K = FStmtIR::Decl;
                 Ds.Var.K = FArgIR::Local;
                 Ds.Var.S = VarName;
-                Ds.Var.LetOp = LetOpFor(TypeOf(D));
-                const Json* Init = Strip(First(D));
+                Ds.Var.LetOp = LetOpFor(VarType);
+                const Json* Init = Ds.bHasValue ? nullptr : Strip(First(D));
                 /* `FStats S;` carries an implicit argless CXXConstructExpr: no initialiser. */
                 if (Init && Kind(*Init) == "CXXConstructExpr" && !First(*Init)) Init = nullptr;
                 if (Init)
@@ -1862,8 +2372,23 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             }
             if (!Lhs || !Rhs) { *Err = "assignment with a missing side"; bOk = false; return; }
 
+            /* A reference local is the variable it names, or the memory at the address it keeps. */
+            while (Kind(*Lhs) == "DeclRefExpr")
+            {
+                auto A = RefAlias.find((*Lhs)["referencedDecl"].value("id", std::string()));
+                if (A == RefAlias.end()) break;
+                Lhs = Strip(&A->second);
+            }
             const std::string LK = Kind(*Lhs);
-            if (LK == "MemberExpr")
+            if (IsDerefLvalue(*Lhs))
+            {
+                FArgIR Addr;
+                std::string Pointee;
+                St.K = FStmtIR::Assign;
+                bOk = LowerAddress(*Lhs, BP, Addr, &Pointee, Err) && RefThrough(std::move(Addr), Pointee, St.Var, Err)
+                   && LowerArg(*Rhs, BP, St.Value, Err);
+            }
+            else if (LK == "MemberExpr")
             {
                 St.K = FStmtIR::Assign;
                 bOk = LowerField(*Lhs, BP, St.Var, Err) && LowerArg(*Rhs, BP, St.Value, Err);
@@ -2015,6 +2540,7 @@ bool FCompiler::HoistReadCall(FArgIR& A, const FReadViewSpec& V, FBlueprintClass
         *Err = std::string(V.Intrinsic) + " takes exactly one argument (the address)";
         return false;
     }
+    if (!HasDerefStruct(Err)) return false;
     FArgIR AddrExpr = std::move(A.Sub->Args[0]);
 
     /* First hoist in this function adds the FDeref __DerefScratch__ local; the prologue seeds
@@ -2081,6 +2607,8 @@ bool FCompiler::HoistReadsInArg(FArgIR& A, FBlueprintClass& BP,
 {
     if ((A.K == FArgIR::Member || A.K == FArgIR::Field || A.K == FArgIR::InterfaceCtx) && A.Base)
         return HoistReadsInArg(*A.Base, BP, Locals, OutPre, Err);
+    if (A.K == FArgIR::Index && A.Base && A.Sub && A.Sub->Args.size() == 1)
+        return HoistReadsInArg(*A.Base, BP, Locals, OutPre, Err) && HoistReadsInArg(A.Sub->Args[0], BP, Locals, OutPre, Err);
     if (A.K == FArgIR::DynCast && A.Sub)
         return HoistReadsInArg(A.Sub->Args[0], BP, Locals, OutPre, Err);
     if (A.K != FArgIR::Call || !A.Sub) return true;
@@ -2095,6 +2623,8 @@ bool FCompiler::HoistReadsInArg(FArgIR& A, FBlueprintClass& BP,
         return HoistReadCall(A, *V, BP, Locals, OutPre, Err);
     if (A.Sub->Intrinsic == "__RefAt__")
         return HoistRefAt(A, BP, Locals, OutPre, Err);
+    if (IsReinterpret(A.Sub->Intrinsic) && A.Sub->Args.size() == 1)
+        return HoistOperand(A.Sub->Args[0], BP, Locals, OutPre, Err);
     return true;
 }
 
@@ -2110,6 +2640,7 @@ bool FCompiler::HoistRefAt(FArgIR& A, FBlueprintClass& BP, std::vector<FProperty
         *Err = "__RefAt__ takes exactly one argument (the address)";
         return false;
     }
+    if (!HasDerefStruct(Err)) return false;
     const FIndex DerefStruct = BP.ScriptStruct(ModPackage + "/FDeref", "FDeref");
     const std::string Scratch = "__RefScratch" + std::to_string(ReadTmpCounter++) + "__";
     FPropertyDef PD = StructParam(Scratch, DerefStruct, "FDeref", 16, 0);
@@ -2136,23 +2667,32 @@ bool FCompiler::HoistRefAt(FArgIR& A, FBlueprintClass& BP, std::vector<FProperty
     Assign("Num", One);
     Assign("Data", std::move(A.Sub->Args[0]));
 
-    const FIndex View = BP.ScriptStruct("/Script/Engine", "MaterialCachedParameterEntry");
+    /* A callee that steps the argument into a buffer copies the view's element type, so the view
+       matches what the address holds; the user's own __RefAt__(Addr) is typed int64. */
+    const FReadViewSpec* V = ViewFor(A.InnerType);
+    if (!V) V = FindReadView("__Read64__");
+    const std::string InnerType = A.InnerType;
     A = FArgIR{};
     A.K = FArgIR::Call;
     A.S = Scratch;
+    A.InnerType = InnerType;
     A.Sub = std::make_shared<FCallIR>();
     A.Sub->Intrinsic = "__RefAtInline__";
-    A.Sub->Extra = View;
+    A.Sub->Extra = BP.ScriptStruct(V->ViewStructPkg, V->ViewStructName);
+    A.Sub->View = ViewFieldOf(V->DerefIntrinsic);
     return true;
 }
 
 bool ContainsRead(const FArgIR& A)
 {
     if ((A.K == FArgIR::Member || A.K == FArgIR::Field || A.K == FArgIR::InterfaceCtx) && A.Base) return ContainsRead(*A.Base);
+    if (A.K == FArgIR::Index && A.Base && A.Sub && A.Sub->Args.size() == 1)
+        return ContainsRead(*A.Base) || ContainsRead(A.Sub->Args[0]);
     if (A.K == FArgIR::DynCast && A.Sub) return ContainsRead(A.Sub->Args[0]);
     if (A.K != FArgIR::Call || !A.Sub) return false;
     if (A.Sub->Target && ContainsRead(*A.Sub->Target)) return true;
-    if (FindReadView(A.Sub->Intrinsic)) return true;
+    if (FindReadView(A.Sub->Intrinsic) || A.Sub->Intrinsic == "__RefAt__") return true;
+    if (IsReinterpret(A.Sub->Intrinsic) && A.Sub->Args.size() == 1 && !IsStored(A.Sub->Args[0])) return true;
     for (const FArgIR& CA : A.Sub->Args) if (ContainsRead(CA)) return true;
     return false;
 }
@@ -2165,8 +2705,8 @@ bool FCompiler::HoistReadsInStmt(FStmtIR& St, FBlueprintClass& BP,
        scratch would serve every check but the first. Force the user to lift it into the body. */
     if (St.K == FStmtIR::While && ContainsRead(St.Cond))
     {
-        *Err = "TODO: `__Read*__` in a `while` condition would only be re-primed once; "
-               "extract the read into the loop body";
+        *Err = "TODO: a `while` condition that reads memory or converts a computed pointer is hoisted out of the "
+               "loop and would be evaluated once; keep the value in a local the loop body updates";
         return false;
     }
 
@@ -2177,6 +2717,7 @@ bool FCompiler::HoistReadsInStmt(FStmtIR& St, FBlueprintClass& BP,
     if (!HoistReadsInArg(St.Var,   BP, Locals, OutPre, Err)) return false;
     if (!HoistReadsInArg(St.Value, BP, Locals, OutPre, Err)) return false;
     if (!HoistReadsInArg(St.Cond,  BP, Locals, OutPre, Err)) return false;
+    if (St.Call.Target && !HoistReadsInArg(*St.Call.Target, BP, Locals, OutPre, Err)) return false;
     for (FArgIR& CA : St.Call.Args)
         if (!HoistReadsInArg(CA, BP, Locals, OutPre, Err)) return false;
     for (FArgIR& CA : St.Target.Args)
@@ -2364,9 +2905,12 @@ bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& P
 bool FCompiler::LayoutOf(const std::string& QualType, int32* Size, int32* Align, std::string* Err)
 {
     const std::string T = StripTypeKeywords(QualType);
-    if (T == "float" || T == "int" || T == "int32") { *Size = 4; *Align = 4; return true; }
-    if (T == "int64" || T == "long long") { *Size = 8; *Align = 8; return true; }
-    if (T == "bool" || T == "uint8" || T == "unsigned char") { *Size = 1; *Align = 1; return true; }
+    if (T == "float" || T == "int" || T == "int32" || T == "uint32" || T == "unsigned int") { *Size = 4; *Align = 4; return true; }
+    if (T == "int64" || T == "long long" || T == "uint64" || T == "unsigned long long" || T == "double")
+    { *Size = 8; *Align = 8; return true; }
+    if (T == "int16" || T == "uint16" || T == "short" || T == "unsigned short") { *Size = 2; *Align = 2; return true; }
+    if (T == "bool" || T == "uint8" || T == "unsigned char" || T == "int8" || T == "signed char" || T == "char")
+    { *Size = 1; *Align = 1; return true; }
     if (T == "FName") { *Size = 8; *Align = 4; return true; }
     if (T == "FString" || T == "char *" || T == "char*") { *Size = 16; *Align = 8; return true; }
     if (T == "FText") { *Size = 24; *Align = 8; return true; }
@@ -2595,6 +3139,12 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             while (!RetType.empty() && (RetType.back() == ' ' || RetType.back() == '\t'))
                 RetType.pop_back();
         }
+        if (!RetType.empty() && RetType.back() == '&')
+        {
+            *Err = R.CppName + "::" + Fn.Name + " returns " + RetType + ": a reference return is refused until what it "
+                   "means to a C++ caller is specified; return a value or a pointer";
+            return false;
+        }
         if (!RetType.empty() && RetType != "void")
         {
             FPropertyDef PD;
@@ -2611,6 +3161,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         std::vector<FPropertyDef> Locals;
         ReadScratchAdded = false;
         ReadTmpCounter = 0;
+        RefAddr.clear();
+        RefAlias.clear();
         if (Fn.Body && !LowerBody(*Fn.Body, BP, Stmts, Locals, Err))
         {
             *Err = R.CppName + "::" + Fn.Name + ": " + *Err;
@@ -2754,6 +3306,14 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
 
     if (!LoadTables(IncludeDir, Err)) return false;
     if (!Collect(Err)) return false;
+    /* Before anything reads a type: a raw pointer is an int64 from here on (see IsRawPointer). */
+    for (const auto& Entry : Records)
+    {
+        if (!Entry.second.IsGenerated()) continue;
+        for (const Json* F : Entry.second.Fields) NormalizePointers(const_cast<Json&>(*F));
+        for (const auto& M : Entry.second.Methods) NormalizePointers(const_cast<Json&>(*M.second));
+        for (const auto& M : Entry.second.MethodDefs) NormalizePointers(const_cast<Json&>(*M.second));
+    }
 
     int32 Generated = 0;
     for (const auto& Entry : Records)
