@@ -40,19 +40,26 @@ const Json* Nth(const Json& N, size_t I)
     return (It == N.end() || It->size() <= I) ? nullptr : &(*It)[I];
 }
 
+std::string StripTypeKeywords(std::string T);
+
 std::string TypeOf(const Json& N)
 {
     auto It = N.find("type");
     return It == N.end() ? std::string() : It->value("qualType", std::string());
 }
 
-/* Stripping CXXConstructExpr drops any ctor args after the first; safe only because the
-   Types.h wrappers take a single literal. */
+/* A one-argument CXXConstructExpr is a wrapper (FString from a literal, a copy, a conversion)
+   and is looked through; one with several arguments is a struct literal and stays. */
 const Json* Strip(const Json* N)
 {
     while (N)
     {
         const std::string K = Kind(*N);
+        if (K == "CXXConstructExpr")
+        {
+            auto In = N->find("inner");
+            if (In != N->end() && In->size() > 1) return N;
+        }
         if (K != "ImplicitCastExpr" && K != "CStyleCastExpr" && K != "ParenExpr"
             && K != "ConstantExpr" && K != "ExprWithCleanups"
             && K != "CXXBindTemporaryExpr" && K != "MaterializeTemporaryExpr"
@@ -128,30 +135,22 @@ struct FCallIR;
 
 struct FArgIR
 {
-    enum EKind { Self, Int, Int64, Float, Bool, Str, Name, Text, Field, Local, LocalOut, Member, Call, NullObj } K = Self;
-    int32 I = 0;
+    enum EKind { Self, Int, Int64, Float, Bool, Byte, Str, Name, Text, Field, Local, LocalOut, Member, Call, NullObj, StructLit,
+                 ObjConst, SoftPath, DynCast, Index } K = Self;
+    int32 I = 0;            // Int / Byte: the value; StructLit: the struct's size
     int64 I64 = 0;
     float F = 0.0f;
     bool B = false;
     bool bWide = false;     // Str: emit EX_UnicodeStringConst
     std::string S;          // Str: the literal; Field/Local/LocalOut/Member: the property name
-    FIndex Owner;           // Field: declaring class; Member: the struct (locals are owned by the function, resolved at emit)
+    FIndex Owner;           // Field: declaring class; Member / StructLit: the struct; ObjConst / DynCast: the class (locals are owned by the function, resolved at emit)
     EExprToken LetOp = EX_Let;
     std::string InnerType;          // clang type of the expression this was lowered from
-    std::shared_ptr<FCallIR> Sub;
-    std::shared_ptr<FArgIR> Base;   // Member: the struct-valued expression
+    std::shared_ptr<FCallIR> Sub;   // Call: the call; StructLit: Args holds one value per reflected field, in order
+    std::shared_ptr<FArgIR> Base;   // Member: the struct-valued expression; Index: the array variable (Sub->Args[0] is the index)
 };
 
 enum EStrKind { SK_None, SK_Str, SK_Name, SK_Text, SK_Int, SK_Int64, SK_Float, SK_Bool, SK_Byte, SK_Object };
-
-EStrKind KindByName(const std::string& N)
-{
-    static const std::map<std::string, EStrKind> M = {
-        { "Str", SK_Str }, { "Name", SK_Name }, { "Text", SK_Text }, { "Int", SK_Int }, { "Int64", SK_Int64 },
-        { "Float", SK_Float }, { "Bool", SK_Bool }, { "Byte", SK_Byte }, { "Object", SK_Object } };
-    auto It = M.find(N);
-    return It == M.end() ? SK_None : It->second;
-}
 
 const char* TypeNameOf(EStrKind K)
 {
@@ -159,18 +158,81 @@ const char* TypeNameOf(EStrKind K)
     {
     case SK_Str: return "FString"; case SK_Name: return "FName"; case SK_Text: return "FText";
     case SK_Int: return "int"; case SK_Int64: return "int64"; case SK_Float: return "float";
-    case SK_Bool: return "bool"; case SK_Byte: return "uint8"; case SK_Object: return "UObject *";
+    case SK_Bool: return "bool"; case SK_Byte: return "uint8"; case SK_Object: return "class UObject*";
     default: return "";
     }
 }
 
-/* One row of UeApi/Conv.json: a Kismet Conv_XToY and the constants for its formatting parameters. */
+/* One row of UeApi/Conv.json: a Kismet Conv_XToY between two canonical type names, plus the
+   constants for its formatting parameters. */
 struct FConv
 {
-    EStrKind From = SK_None, To = SK_None;
+    std::string From, To;
     std::string Package, Class, Fn;
     std::vector<Json> Extra;
 };
+
+/* One row of UeApi/Ops.json: the Kismet function behind `Lhs <op> Rhs`. */
+struct FOpInfo
+{
+    std::string Op, Lhs, Rhs, Ret;
+    std::string Package, Class, Fn;
+    std::vector<Json> Extra;
+};
+
+/* UeApi/Types.json: what a native enum or ScriptStruct is called in its package, and its layout. */
+struct FEnumInfo
+{
+    std::string Package, UeName, Underlying, First;     // First: the enumerator a zero is written as
+};
+
+bool IsContainerType(const std::string& T)
+{
+    const std::string S = StripTypeKeywords(T);
+    return S.compare(0, 7, "TArray<") == 0 || S.compare(0, 5, "TSet<") == 0 || S.compare(0, 5, "TMap<") == 0;
+}
+
+/* "K, V" -> {"K", "V"} at top-level commas. */
+std::vector<std::string> SplitTemplateArgs(const std::string& S)
+{
+    std::vector<std::string> Out;
+    int32 Depth = 0;
+    size_t Start = 0;
+    for (size_t I = 0; I < S.size(); ++I)
+    {
+        if (S[I] == '<') ++Depth;
+        else if (S[I] == '>') --Depth;
+        else if (S[I] == ',' && Depth == 0) { Out.push_back(StripTypeKeywords(S.substr(Start, I - Start))); Start = I + 1; }
+    }
+    Out.push_back(StripTypeKeywords(S.substr(Start)));
+    for (std::string& A : Out) while (!A.empty() && A.front() == ' ') A.erase(A.begin());
+    return Out;
+}
+
+struct FStructInfo
+{
+    std::string Package, UeName;
+    int32 Size = 0, Align = 1;
+    bool bComplete = false;                                     // every reflected field is known, so a literal can be built
+    std::vector<std::pair<std::string, std::string>> Fields;    // (type, name) in property order
+};
+
+std::vector<Json> ExtraArgs(const Json& Row)
+{
+    std::vector<Json> Out;
+    auto It = Row.find("extra");
+    if (It != Row.end()) for (const Json& E : *It) Out.push_back(E);
+    return Out;
+}
+
+FArgIR ConstArg(const Json& E)
+{
+    FArgIR X;
+    if (E.is_boolean())         { X.K = FArgIR::Bool;  X.B = E.get<bool>(); }
+    else if (E.is_number_float()) { X.K = FArgIR::Float; X.F = E.get<float>(); }
+    else                        { X.K = FArgIR::Int;   X.I = E.get<int32>(); }
+    return X;
+}
 
 struct FCallIR
 {
@@ -234,6 +296,40 @@ bool EmitArg(FScript& S, const FArgIR& A, FIndex SelfExp, std::string* Err)
     case FArgIR::Int64: S.Int64Const(A.I64); return true;
     case FArgIR::Float: S.FloatConst(A.F); return true;
     case FArgIR::Bool:  A.B ? S.True() : S.False(); return true;
+    case FArgIR::Byte:  S.ByteConst(uint8(A.I)); return true;
+    case FArgIR::ObjConst: S.ObjectConst(A.Owner); return true;
+    case FArgIR::Index:
+    {
+        if (!A.Base || !A.Sub || A.Sub->Args.size() != 1) { if (Err) *Err = "internal: Index arg is incomplete"; return false; }
+        bool bOk = true;
+        std::string SubErr;
+        S.ArrayGetByRef([&](FScript& C) { bOk = bOk && EmitArg(C, *A.Base, SelfExp, &SubErr); },
+                        [&](FScript& C) { bOk = bOk && EmitArg(C, A.Sub->Args[0], SelfExp, &SubErr); });
+        if (!bOk && Err) *Err = SubErr;
+        return bOk;
+    }
+    case FArgIR::SoftPath: S.SoftObjectConst(A.S); return true;
+    case FArgIR::DynCast:
+    {
+        if (!A.Sub || A.Sub->Args.size() != 1) { if (Err) *Err = "internal: DynCast arg has no operand"; return false; }
+        bool bOk = true;
+        std::string SubErr;
+        S.DynamicCast(A.Owner, [&](FScript& C) { bOk = EmitArg(C, A.Sub->Args[0], SelfExp, &SubErr); });
+        if (!bOk && Err) *Err = SubErr;
+        return bOk;
+    }
+    case FArgIR::StructLit:
+    {
+        if (!A.Sub) { if (Err) *Err = "internal: StructLit arg has no members"; return false; }
+        bool bOk = true;
+        std::string SubErr;
+        S.StructConst(A.Owner, A.I, [&](FScript& C) {
+            for (const FArgIR& M : A.Sub->Args)
+                if (bOk) bOk = EmitArg(C, M, SelfExp, &SubErr);
+        });
+        if (!bOk && Err) *Err = SubErr;
+        return bOk;
+    }
     case FArgIR::Name:  S.NameConst(A.S); return true;
     case FArgIR::Text:  S.TextConst(A.S, A.bWide); return true;
     case FArgIR::Str:
@@ -436,7 +532,7 @@ private:
     bool LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR& Out, std::string* Err);
     bool LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     bool LowerArgRaw(const Json& N, const std::string& OuterType, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
-    bool ConvertArg(EStrKind To, FBlueprintClass& BP, FArgIR& Arg, std::string* Err);
+    bool ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgIR& Arg, std::string* Err);
     bool LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
 
     /* Post-pass over the IR that turns every `__Read*__(Addr)` sub-expression into a pair of
@@ -473,8 +569,20 @@ private:
     }
 
     Json Doc;
+    bool LoadTables(const std::string& IncludeDir, std::string* Err);
+    /* The name Conv.json / Ops.json / Types.json use for a clang type: keywords, references and
+       spelling variants dropped, an enum is its underlying byte, any object pointer is UObject. */
+    std::string Canon(std::string T) const;
+    bool ZeroArg(const std::string& Type, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
+    FIndex ClassImportOf(const FRecord& R, FBlueprintClass& BP) const;
+    bool LowerStructLiteral(const Json& CtorNode, const FStructInfo& SI, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     std::vector<FConv> Convs;
-    const FConv* FindConv(EStrKind From, EStrKind To) const;
+    std::vector<FOpInfo> Ops;
+    std::map<std::string, FEnumInfo> Enums;
+    std::map<std::string, FStructInfo> Structs;
+    std::map<std::string, int64> EnumValues;          // clang EnumConstantDecl id -> value
+    const FConv* FindConv(const std::string& From, const std::string& To) const;
+    const FOpInfo* FindOp(const std::string& Op, const std::string& Lhs, const std::string& Rhs) const;
     void ApplyConv(const FConv& C, FBlueprintClass& BP, FArgIR& Arg);
     std::string ModPackage;
     std::map<std::string, FRecord> Records;
@@ -499,12 +607,16 @@ void EmitStmts(const std::vector<FStmtIR>& Stmts, FScript& S, FIndex SelfExp)
         {
         case FStmtIR::Assign:
         {
-            /* Let's PropertyChain owner: the declaring class for a Field, the function for a local. */
-            const bool bLocalDest = St.Var.K == FArgIR::Local || St.Var.K == FArgIR::LocalOut;
-            const FIndex VarOwner = bLocalDest ? SelfExp : St.Var.Owner;
-            S.Let(St.Var.LetOp, St.Var.S, VarOwner,
-                  [St, SelfExp](FScript& V) { EmitArg(V, St.Var, SelfExp, nullptr); },
-                  [St, SelfExp](FScript& V) { EmitArg(V, St.Value, SelfExp, nullptr); });
+            /* Let's property path: the variable itself, or an array element as {element, array}; the
+               path's owner is the declaring class for a Field, the function for a local. */
+            const FArgIR& Top = St.Var.K == FArgIR::Index ? *St.Var.Base : St.Var;
+            const std::vector<std::string> Path = St.Var.K == FArgIR::Index
+                ? std::vector<std::string>{ Top.S, Top.S } : std::vector<std::string>{ Top.S };
+            const bool bLocalDest = Top.K == FArgIR::Local || Top.K == FArgIR::LocalOut;
+            const FIndex VarOwner = bLocalDest ? SelfExp : Top.Owner;
+            S.LetPath(St.Var.LetOp, Path, VarOwner,
+                      [St, SelfExp](FScript& V) { EmitArg(V, St.Var, SelfExp, nullptr); },
+                      [St, SelfExp](FScript& V) { EmitArg(V, St.Value, SelfExp, nullptr); });
             break;
         }
 
@@ -593,6 +705,17 @@ bool FCompiler::Collect(std::string* Err)
             return;
         }
         if (Kind(N) == "VarDecl" && Name(N) == "UeModPackage") FindLiteral(N, ModPackage);
+        if (Kind(N) == "EnumDecl")
+        {
+            int64 Next = 0;
+            ForEach(N, [&](const Json& C) {
+                if (Kind(C) != "EnumConstantDecl") return;
+                const Json* V = First(C);
+                if (V && V->contains("value")) Next = std::stoll((*V)["value"].get<std::string>());
+                EnumValues[C.value("id", std::string())] = Next++;
+            });
+            return;
+        }
         /* Out-of-line method definition: previousDecl points at the in-class decl, already collected. */
         if (Kind(N) == "CXXMethodDecl" && N.contains("previousDecl") && N.contains("inner"))
         {
@@ -609,6 +732,12 @@ bool FCompiler::Collect(std::string* Err)
 
         FRecord R;
         R.CppName = Ns + Name(N);
+        if (auto SI = Structs.find(Name(N)); Ns.empty() && SI != Structs.end())
+        {
+            R.UePackage = SI->second.Package;
+            R.UeName = SI->second.UeName;
+            R.bIsStruct = true;
+        }
         auto Bases = N.find("bases");
         if (Bases != N.end() && !Bases->empty())
             R.Base = (*Bases)[0]["type"].value("qualType", std::string());
@@ -708,9 +837,21 @@ uint32 ClassFlagsFor(const std::vector<std::string>& Ancestry)
     return Base | CLASS_HasInstancedReference;
 }
 
+bool TemplateArg(const std::string& T, const char* Tpl, std::string* Inner)
+{
+    const std::string S = StripTypeKeywords(T);
+    const size_t L = strlen(Tpl);
+    if (S.compare(0, L, Tpl) != 0 || S.size() < L + 2 || S[L] != '<' || S.back() != '>') return false;
+    *Inner = StripTypeKeywords(S.substr(L + 1, S.size() - L - 2));
+    return true;
+}
+
 EExprToken LetOpFor(const std::string& QualType)
 {
+    std::string Inner;
     if (QualType == "bool") return EX_LetBool;
+    if (TemplateArg(QualType, "TSubclassOf", &Inner)) return EX_LetObj;
+    if (IsContainerType(QualType)) return EX_Let;
     if (!QualType.empty() && QualType.back() == '*') return EX_LetObj;
     return EX_Let;
 }
@@ -780,7 +921,10 @@ EStrKind KindOfLowered(const FArgIR& A, const std::string& InnerType)
     case FArgIR::Int64: return SK_Int64;
     case FArgIR::Float: return SK_Float;
     case FArgIR::Bool:  return SK_Bool;
+    case FArgIR::Byte:  return SK_Byte;
     case FArgIR::Self:
+    case FArgIR::ObjConst:
+    case FArgIR::DynCast:
     case FArgIR::NullObj: return SK_Object;
     default: return StrKindOf(InnerType);
     }
@@ -796,45 +940,135 @@ void WrapInCall(FArgIR& Arg, FIndex Fn)
     Arg.Sub->Args.push_back(Inner);
 }
 
-const FConv* FCompiler::FindConv(EStrKind From, EStrKind To) const
+const FConv* FCompiler::FindConv(const std::string& From, const std::string& To) const
 {
     for (const FConv& C : Convs)
         if (C.From == From && C.To == To) return &C;
     return nullptr;
 }
 
+const FOpInfo* FCompiler::FindOp(const std::string& Op, const std::string& Lhs, const std::string& Rhs) const
+{
+    for (const FOpInfo& O : Ops)
+        if (O.Op == Op && O.Lhs == Lhs && O.Rhs == Rhs) return &O;
+    return nullptr;
+}
+
 void FCompiler::ApplyConv(const FConv& C, FBlueprintClass& BP, FArgIR& Arg)
 {
     WrapInCall(Arg, BP.EngineFunction(C.Package, C.Class, C.Fn));
-    for (const Json& E : C.Extra)
-    {
-        FArgIR X;
-        if (E.is_boolean()) { X.K = FArgIR::Bool; X.B = E.get<bool>(); }
-        else                { X.K = FArgIR::Int;  X.I = E.get<int32>(); }
-        Arg.Sub->Args.push_back(X);
-    }
-    Arg.InnerType = TypeNameOf(C.To);
+    for (const Json& E : C.Extra) Arg.Sub->Args.push_back(ConstArg(E));
+    Arg.InnerType = C.To;
 }
 
-/* Converts Arg (of kind KindOfLowered) to the slot's kind: a literal folds, else a Conv_XToY from
-   UeApi/Conv.json, else two of them through FString. */
-bool FCompiler::ConvertArg(EStrKind To, FBlueprintClass& BP, FArgIR& Arg, std::string* Err)
+std::string FCompiler::Canon(std::string T) const
 {
-    const EStrKind From = KindOfLowered(Arg, Arg.InnerType);
-    if (To == From || From == SK_None || To == SK_None || To == SK_Object) return true;
+    T = StripTypeKeywords(T);
+    while (!T.empty() && (T.back() == '&' || T.back() == ' ')) T.pop_back();
+    T = StripTypeKeywords(T);
+    const EStrKind K = StrKindOf(T);
+    if (K != SK_None) return TypeNameOf(K);
+    if (Enums.count(T)) return "uint8";
+    std::string Inner;
+    if (TemplateArg(T, "TSubclassOf", &Inner)) return TypeNameOf(SK_Object);
+    for (const char* Tpl : { "TArray", "TSet", "TMap" })
+        if (TemplateArg(T, Tpl, &Inner))
+        {
+            std::string Out = std::string(Tpl) + "<";
+            for (const std::string& A : SplitTemplateArgs(Inner)) Out += (Out.back() == '<' ? "" : ", ") + Canon(A);
+            return Out + ">";
+        }
+    return T;
+}
 
-    if (Arg.K == FArgIR::Str && !Arg.bWide && To == SK_Name) { Arg.K = FArgIR::Name; return true; }
-    if (Arg.K == FArgIR::Str && To == SK_Text) { Arg.K = FArgIR::Text; return true; }
-    if (Arg.K == FArgIR::Int && To == SK_Int64) { Arg.K = FArgIR::Int64; Arg.I64 = Arg.I; return true; }
-    if (Arg.K == FArgIR::Int && To == SK_Float) { Arg.K = FArgIR::Float; Arg.F = float(Arg.I); return true; }
-    if (Arg.K == FArgIR::Int && To == SK_Bool)  { Arg.K = FArgIR::Bool;  Arg.B = Arg.I != 0; return true; }
+/* Converts Arg to the slot's type: a literal folds, else a Conv_XToY from UeApi/Conv.json, else
+   two of them through FString. Two structs with no conversion are left alone (derived to base). */
+bool FCompiler::ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgIR& Arg, std::string* Err)
+{
+    const std::string To = Canon(ToType);
+    const EStrKind FromKind = KindOfLowered(Arg, Arg.InnerType);
+    const std::string From = FromKind != SK_None ? TypeNameOf(FromKind) : Canon(Arg.InnerType);
+    const EStrKind ToKind = StrKindOf(To);
+    if (To == From || From.empty() || To.empty() || ToKind == SK_Object) return true;
+
+    if (Arg.K == FArgIR::Str && !Arg.bWide && ToKind == SK_Name) { Arg.K = FArgIR::Name; return true; }
+    if (Arg.K == FArgIR::Str && ToKind == SK_Text) { Arg.K = FArgIR::Text; return true; }
+    if (Arg.K == FArgIR::Int && ToKind == SK_Int64) { Arg.K = FArgIR::Int64; Arg.I64 = Arg.I; return true; }
+    if (Arg.K == FArgIR::Int && ToKind == SK_Float) { Arg.K = FArgIR::Float; Arg.F = float(Arg.I); return true; }
+    if (Arg.K == FArgIR::Int && ToKind == SK_Bool)  { Arg.K = FArgIR::Bool;  Arg.B = Arg.I != 0; return true; }
+    if (Arg.K == FArgIR::Int && ToKind == SK_Byte)  { Arg.K = FArgIR::Byte; return true; }
+    if (To.compare(0, 5, "TSoft") == 0)
+    {
+        if (Arg.K == FArgIR::Str) { Arg.K = FArgIR::SoftPath; Arg.InnerType = To; return true; }
+        if (From.compare(0, 5, "TSoft") == 0) return true;
+    }
 
     if (const FConv* Direct = FindConv(From, To)) { ApplyConv(*Direct, BP, Arg); return true; }
-    const FConv* In  = FindConv(From, SK_Str);
-    const FConv* Out = FindConv(SK_Str, To);
+    const FConv* In  = FindConv(From, "FString");
+    const FConv* Out = FindConv("FString", To);
     if (In && Out) { ApplyConv(*In, BP, Arg); ApplyConv(*Out, BP, Arg); return true; }
-    *Err = std::string("no Kismet conversion from ") + Arg.InnerType + " to " + TypeNameOf(To);
+    if (Structs.count(From) && Structs.count(To)) return true;
+    *Err = "no Kismet conversion from " + From + " to " + To;
     return false;
+}
+
+bool FCompiler::ZeroArg(const std::string& Type, FBlueprintClass& BP, FArgIR& Out, std::string* Err)
+{
+    const std::string T = Canon(Type);
+    switch (StrKindOf(T))
+    {
+    case SK_Int:    Out.K = FArgIR::Int; return true;
+    case SK_Int64:  Out.K = FArgIR::Int64; return true;
+    case SK_Float:  Out.K = FArgIR::Float; return true;
+    case SK_Bool:   Out.K = FArgIR::Bool; return true;
+    case SK_Byte:   Out.K = FArgIR::Byte; return true;
+    case SK_Str:    Out.K = FArgIR::Str; return true;
+    case SK_Name:   Out.K = FArgIR::Name; Out.S = "None"; return true;
+    case SK_Text:   Out.K = FArgIR::Text; return true;
+    case SK_Object: Out.K = FArgIR::NullObj; return true;
+    default: break;
+    }
+    auto SI = Structs.find(T);
+    if (SI == Structs.end() || !SI->second.bComplete) { *Err = "no zero literal for " + Type; return false; }
+    Out.K = FArgIR::StructLit;
+    Out.Owner = BP.ScriptStruct(SI->second.Package, SI->second.UeName);
+    Out.I = SI->second.Size;
+    Out.InnerType = T;
+    Out.Sub = std::make_shared<FCallIR>();
+    for (const auto& F : SI->second.Fields)
+    {
+        FArgIR M;
+        if (!ZeroArg(F.first, BP, M, Err)) return false;
+        Out.Sub->Args.push_back(M);
+    }
+    return true;
+}
+
+/* `FVector(1, 2, 3)`: EX_StructConst wants one value per reflected field, in property order, so
+   only a struct whose every field is known can be written; argless means all zeros. */
+bool FCompiler::LowerStructLiteral(const Json& CtorNode, const FStructInfo& SI, FBlueprintClass& BP,
+                                   FArgIR& Out, std::string* Err)
+{
+    const std::string T = StripTypeKeywords(TypeOf(CtorNode));
+    if (!SI.bComplete) { *Err = "TODO: " + T + " has fields AssetGen cannot write; build it with a Kismet Make function"; return false; }
+    std::vector<const Json*> Args;
+    ForEach(CtorNode, [&](const Json& C) { Args.push_back(&C); });
+    if (Args.empty()) return ZeroArg(T, BP, Out, Err);
+    if (Args.size() != SI.Fields.size())
+    { *Err = T + " literal must give every field (" + std::to_string(SI.Fields.size()) + ")"; return false; }
+
+    Out.K = FArgIR::StructLit;
+    Out.Owner = BP.ScriptStruct(SI.Package, SI.UeName);
+    Out.I = SI.Size;
+    Out.InnerType = T;
+    Out.Sub = std::make_shared<FCallIR>();
+    for (const Json* A : Args)
+    {
+        FArgIR M;
+        if (!LowerArg(*A, BP, M, Err)) return false;
+        Out.Sub->Args.push_back(M);
+    }
+    return true;
 }
 
 bool FCompiler::LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& Out, std::string* Err)
@@ -850,7 +1084,8 @@ bool FCompiler::LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& 
         if (!ObjRaw) { *Err = "struct member access with no object: " + Name(MemberNode); return false; }
         Out.K = FArgIR::Member;
         Out.S = Name(MemberNode);
-        Out.Owner = BP.ScriptStruct(ModPackage + "/" + R->CppName, R->CppName);
+        Out.Owner = R->IsNative() ? BP.ScriptStruct(R->UePackage, R->UeName)
+                                  : BP.ScriptStruct(ModPackage + "/" + R->CppName, R->CppName);
         Out.LetOp = LetOpFor(TypeOf(MemberNode));
         Out.Base = std::make_shared<FArgIR>();
         return LowerArg(*ObjRaw, BP, *Out.Base, Err);
@@ -885,8 +1120,8 @@ bool FCompiler::LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, 
     const Json* N = Strip(&ArgNode);
     if (!N) { *Err = "empty argument expression"; return false; }
     if (!LowerArgRaw(*N, OuterType, BP, Out, Err)) return false;
-    Out.InnerType = TypeOf(*N);
-    return ConvertArg(StrKindOf(OuterType), BP, Out, Err);
+    if (Out.InnerType.empty()) Out.InnerType = TypeOf(*N);
+    return ConvertArg(OuterType, BP, Out, Err);
 }
 
 bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlueprintClass& BP,
@@ -898,6 +1133,11 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
     if (K == "MemberExpr") return LowerField(*N, BP, Out, Err);
     if (K == "CXXThisExpr") { Out.K = FArgIR::Self; return true; }
     if (K == "CXXNullPtrLiteralExpr") { Out.K = FArgIR::NullObj; return true; }
+    if (K == "CXXConstructExpr" || K == "CXXTemporaryObjectExpr")
+    {
+        auto SI = Structs.find(StripTypeKeywords(TypeOf(*N)));
+        if (SI != Structs.end()) return LowerStructLiteral(*N, SI->second, BP, Out, Err);
+    }
     if ((K == "CXXConstructExpr" || K == "CXXTemporaryObjectExpr")
         && (Slot == SK_Name || Slot == SK_Text || Slot == SK_Str))
     {
@@ -929,10 +1169,37 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         {
             const Json* Obj = First(*Callee);
             if (!Obj) { *Err = "conversion operator with no object"; return false; }
-            return LowerArg(*Obj, BP, Out, Err) && ConvertArg(StrKindOf(TypeOf(*N)), BP, Out, Err);
+            return LowerArg(*Obj, BP, Out, Err) && ConvertArg(TypeOf(*N), BP, Out, Err);
         }
         const Json* Obj = Callee ? Strip(First(*Callee)) : nullptr;
         if (!Obj) { *Err = "member call with no object"; return false; }
+        if (IsContainerType(TypeOf(*Obj)))
+        {
+            /* `Items.Add(x)` is KismetArrayLibrary::Array_Add(Items, x): the container variable is the
+               first argument, and the library's CustomThunks type themselves from that property. */
+            const std::string C = StripTypeKeywords(TypeOf(*Obj));
+            const char* Lib = C[1] == 'A' ? "KismetArrayLibrary" : C[1] == 'S' ? "BlueprintSetLibrary" : "BlueprintMapLibrary";
+            const std::string Prefix = C[1] == 'A' ? "Array_" : C[1] == 'S' ? "Set_" : "Map_";
+            std::string Method = Name(*Callee);
+            if (Method == "Num") Method = "Length";
+            FArgIR Target;
+            if (!LowerArg(*Obj, BP, Target, Err)) return false;
+            if (Target.K != FArgIR::Field && Target.K != FArgIR::Local && Target.K != FArgIR::LocalOut && Target.K != FArgIR::Member)
+            { *Err = "a container operation needs a variable, not a computed value: " + Method; return false; }
+            Out.K = FArgIR::Call;
+            Out.Sub = std::make_shared<FCallIR>();
+            Out.Sub->Fn = BP.EngineFunction("/Script/Engine", Lib, Prefix + Method);
+            Out.Sub->Args.push_back(Target);
+            bool bFirst = true, bOk = true;
+            ForEach(*N, [&](const Json& A) {
+                if (bFirst) { bFirst = false; return; }
+                if (!bOk) return;
+                FArgIR V;
+                bOk = LowerArg(A, BP, V, Err);
+                if (bOk) Out.Sub->Args.push_back(V);
+            });
+            return bOk;
+        }
         Out.K = FArgIR::Call;
         Out.Sub = std::make_shared<FCallIR>();
         if (!LowerCall(*N, BP, *Out.Sub, Err)) return false;
@@ -947,6 +1214,45 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             ? (*Callee)["referencedDecl"].value("name", std::string()) : std::string();
         const Json* Lhs = Nth(*N, 1);
         const Json* Rhs = Nth(*N, 2);
+        if (OpName == "operator[]" && Lhs && Rhs && IsContainerType(TypeOf(*Lhs)))
+        {
+            /* `Items[i]`: EX_ArrayGetByRef, an lvalue or rvalue of the element type. */
+            Out.K = FArgIR::Index;
+            Out.Base = std::make_shared<FArgIR>();
+            if (!LowerArg(*Lhs, BP, *Out.Base, Err)) return false;
+            if (Out.Base->K != FArgIR::Field && Out.Base->K != FArgIR::Local && Out.Base->K != FArgIR::LocalOut && Out.Base->K != FArgIR::Member)
+            { *Err = "indexing needs an array variable, not a computed value"; return false; }
+            Out.Sub = std::make_shared<FCallIR>();
+            FArgIR Idx;
+            if (!LowerArg(*Rhs, BP, Idx, Err)) return false;
+            Out.Sub->Args.push_back(Idx);
+            std::string Elem = TypeOf(*N);
+            while (!Elem.empty() && (Elem.back() == '&' || Elem.back() == ' ')) Elem.pop_back();
+            Out.S = Out.Base->S;
+            Out.Owner = Out.Base->Owner;
+            Out.LetOp = LetOpFor(Elem);
+            Out.InnerType = Elem;
+            return true;
+        }
+        if (Lhs && Rhs && OpName.compare(0, 8, "operator") == 0)
+        {
+            /* A Kismet operator over a struct, from UeApi/Ops.json. */
+            if (const FOpInfo* O = FindOp(OpName.substr(8), Canon(TypeOf(*Lhs)), Canon(TypeOf(*Rhs))))
+            {
+                Out.K = FArgIR::Call;
+                Out.Sub = std::make_shared<FCallIR>();
+                Out.Sub->Fn = BP.EngineFunction(O->Package, O->Class, O->Fn);
+                for (const Json* Side : { Lhs, Rhs })
+                {
+                    FArgIR A;
+                    if (!LowerArg(*Side, BP, A, Err)) return false;
+                    Out.Sub->Args.push_back(A);
+                }
+                for (const Json& E : O->Extra) Out.Sub->Args.push_back(ConstArg(E));
+                Out.InnerType = O->Ret;
+                return true;
+            }
+        }
         if (OpName != "operator+" || !Lhs || !Rhs || StrKindOf(TypeOf(*N)) != SK_Str)
         { *Err = "TODO: unimplemented operator overload " + OpName + " yielding " + TypeOf(*N); return false; }
 
@@ -957,7 +1263,7 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         for (const Json* Side : { Lhs, Rhs })
         {
             FArgIR A;
-            if (!LowerArg(*Side, BP, A, Err) || !ConvertArg(SK_Str, BP, A, Err)) return false;
+            if (!LowerArg(*Side, BP, A, Err) || !ConvertArg("FString", BP, A, Err)) return false;
             Out.Sub->Args.push_back(A);
         }
         return true;
@@ -970,6 +1276,14 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         /* A T& out-parm needs EX_LocalOutVariable so writes reach the caller's storage. */
         const Json& Ref = (*N)["referencedDecl"];
         const std::string RefKind = Ref.value("kind", std::string());
+        if (RefKind == "EnumConstantDecl")
+        {
+            auto V = EnumValues.find(Ref.value("id", std::string()));
+            if (V == EnumValues.end()) { *Err = "enum constant with no value: " + Name(Ref); return false; }
+            Out.K = FArgIR::Byte;
+            Out.I = int32(V->second);
+            return true;
+        }
         if (RefKind != "ParmVarDecl" && RefKind != "VarDecl")
         {
             *Err = "TODO: DeclRefExpr to " + RefKind;
@@ -986,6 +1300,31 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         const std::string CalleeName = (CalleeNode && Kind(*CalleeNode) == "DeclRefExpr")
             ? (*CalleeNode)["referencedDecl"].value("name", std::string())
             : std::string();
+        if (CalleeName == "StaticClass")
+        {
+            auto Owner = MethodOwner.find((*CalleeNode)["referencedDecl"].value("id", std::string()));
+            const FRecord* R = Owner == MethodOwner.end() ? nullptr : Find(Owner->second);
+            if (!R) { *Err = "StaticClass() on an unknown class"; return false; }
+            Out.K = FArgIR::ObjConst;
+            Out.Owner = ClassImportOf(*R, BP);
+            Out.InnerType = "UClass *";
+            return true;
+        }
+        if (CalleeName == "Cast")
+        {
+            std::string Target = StripTypeKeywords(TypeOf(*N));
+            while (!Target.empty() && (Target.back() == '*' || Target.back() == ' ')) Target.pop_back();
+            const FRecord* R = Find(Target);
+            const Json* Operand = Nth(*N, 1);
+            if (!R || R->bIsStruct || !Operand) { *Err = "Cast<> to an unknown class: " + Target; return false; }
+            Out.K = FArgIR::DynCast;
+            Out.Owner = ClassImportOf(*R, BP);
+            Out.Sub = std::make_shared<FCallIR>();
+            FArgIR A;
+            if (!LowerArg(*Operand, BP, A, Err)) return false;
+            Out.Sub->Args.push_back(A);
+            return true;
+        }
         if (CalleeName == "__ClassOf__")
         {
             /* `__ClassOf__(x)` lowers to Cur::GetParmClassName(<this function>, FName("x")); x is never
@@ -1052,8 +1391,12 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         /* Flavour is read from the UNSTRIPPED sides: clang's promotion cast carries the common type. */
         const std::string LhsTy = TypeOf(*LhsRaw), RhsTy = TypeOf(*RhsRaw);
         std::string Flavour;
+        const std::string LhsC = Canon(LhsTy), RhsC = Canon(RhsTy);
         if (IsObjectType(LhsTy) || IsObjectType(RhsTy))      Flavour = "ObjectObject";
+        else if (LhsC == "float" || RhsC == "float")         Flavour = "FloatFloat";
         else if (IsInt64Type(LhsTy) || IsInt64Type(RhsTy))   Flavour = "Int64Int64";
+        else if (LhsC == "uint8" && RhsC == "uint8")         Flavour = "ByteByte";
+        else if (LhsC == "bool" && RhsC == "bool")           Flavour = "BoolBool";
         else                                                 Flavour = "IntInt";
         const std::string MathFn = MathFuncFor(Op, Flavour);
         if (MathFn.empty())
@@ -1261,6 +1604,17 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 St.Var.LetOp = LetOpFor(TypeOf(*Lhs));
                 St.bAssignLocal = !bOut;
                 St.bAssignOutParm = bOut;
+                bOk = LowerArg(*Rhs, BP, St.Value, Err);
+            }
+            else if (LK == "CXXOperatorCallExpr")
+            {
+                /* `Items[i] = v`: the destination is an array element. */
+                St.K = FStmtIR::Assign;
+                if (!LowerArg(*Lhs, BP, St.Var, Err)) { bOk = false; return; }
+                if (St.Var.K != FArgIR::Index)
+                { *Err = "TODO: assignment to an operator call that is not an array element"; bOk = false; return; }
+                St.bAssignLocal = St.Var.Base->K == FArgIR::Local;
+                St.bAssignOutParm = St.Var.Base->K == FArgIR::LocalOut;
                 bOk = LowerArg(*Rhs, BP, St.Value, Err);
             }
             else
@@ -1537,10 +1891,53 @@ bool RejectNonZeroInitialiser(const Json& F, std::string* Err)
     return false;
 }
 
+FIndex FCompiler::ClassImportOf(const FRecord& R, FBlueprintClass& BP) const
+{
+    if (R.IsNative()) return BP.EngineClass(R.UePackage, R.UeName);
+    if (&R == Cur) return BP.ClassIndex();
+    return BP.EngineClass(ModPackage + "/" + R.CppName, R.CppName + "_C");
+}
+
 bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& PName, uint64 ExtraFlags,
                                const std::string& Where, FBlueprintClass& BP, FPropertyDef* Out, std::string* Err)
 {
     const std::string Type = StripTypeKeywords(QualType);
+    std::string Inner;
+    for (const char* Tpl : { "TArray", "TSet", "TMap" })
+    {
+        if (!TemplateArg(Type, Tpl, &Inner)) continue;
+        const std::vector<std::string> Args = SplitTemplateArgs(Inner);
+        std::vector<FPropertyDef> Parts;
+        for (const std::string& A : Args)
+        {
+            FPropertyDef E;
+            if (!TypeToProperty(A, PName, 0, Where + " element", BP, &E, Err)) return false;
+            Parts.push_back(E);
+        }
+        if (Tpl[1] == 'A')      *Out = ArrayParam(PName, Parts[0], ExtraFlags);
+        else if (Tpl[1] == 'S') *Out = SetParam(PName, Parts[0], ExtraFlags);
+        else if (Parts.size() == 2) *Out = MapParam(PName, Parts[0], Parts[1], ExtraFlags);
+        else { *Err = "TODO: unimplemented " + Where + ": " + QualType; return false; }
+        return true;
+    }
+    for (const char* Tpl : { "TSubclassOf", "TSoftObjectPtr", "TSoftClassPtr" })
+    {
+        if (!TemplateArg(Type, Tpl, &Inner)) continue;
+        const FRecord* IR = Find(Inner);
+        if (!IR || IR->bIsStruct) { *Err = "TODO: unimplemented " + Where + ": " + QualType; return false; }
+        const FIndex Meta = ClassImportOf(*IR, BP);
+        const FIndex ClassClass = BP.EngineClass("/Script/CoreUObject", "Class");
+        if (Tpl[1] == 'S' && Tpl[2] == 'u') *Out = ClassParam(PName, ClassClass, Meta, ExtraFlags);
+        else if (Tpl[5] == 'O')             *Out = SoftObjectParam(PName, Meta, ExtraFlags);
+        else                                *Out = SoftClassParam(PName, ClassClass, Meta, ExtraFlags);
+        return true;
+    }
+    if (Type == "UClass *" || Type == "UClass*")
+    {
+        *Out = ClassParam(PName, BP.EngineClass("/Script/CoreUObject", "Class"),
+                          BP.EngineClass("/Script/CoreUObject", "Object"), ExtraFlags);
+        return true;
+    }
     if (Type == "float") { *Out = FloatParam(PName, ExtraFlags); return true; }
     if (Type == "double") { *Out = DoubleParam(PName, ExtraFlags); return true; }
     if (Type == "int" || Type == "int32") { *Out = IntParam(PName, ExtraFlags); return true; }
@@ -1554,8 +1951,24 @@ bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& P
     { *Out = StringParam(PName, ExtraFlags); return true; }
     if (Type == "FName") { *Out = NameParam(PName, ExtraFlags); return true; }
     if (Type == "FText") { *Out = TextParam(PName, ExtraFlags); return true; }
+    if (auto E = Enums.find(Type); E != Enums.end())
+    {
+        if (E->second.Underlying != "uint8")
+        { *Err = "TODO: unimplemented " + Where + ": " + QualType + " (only a uint8 enum is a ByteProperty)"; return false; }
+        *Out = ByteParam(PName, ExtraFlags);
+        Out->Extra = BP.Enum(E->second.Package, E->second.UeName);
+        Out->StructName = E->second.UeName;
+        Out->EnumZero = E->second.UeName + "::" + E->second.First;
+        return true;
+    }
+    if (auto S = Structs.find(Type); S != Structs.end())
+    {
+        *Out = StructParam(PName, BP.ScriptStruct(S->second.Package, S->second.UeName),
+                           S->second.UeName, S->second.Size, ExtraFlags);
+        return true;
+    }
 
-    if (const FRecord* SR = Find(Type); SR && SR->bIsStruct)
+    if (const FRecord* SR = Find(Type); SR && SR->bIsStruct && !SR->IsNative())
     {
         int32 Size = 0, Align = 0;
         if (!StructLayout(*SR, &Size, &Align, Err)) return false;
@@ -1580,10 +1993,9 @@ bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& P
     }
     const FRecord* PR = ClassName.empty() ? nullptr : Find(ClassName);
     if (!PR || PR->bIsStruct) { *Err = "TODO: unimplemented " + Where + ": " + QualType; return false; }
-    const FIndex ClassImp = PR->IsNative()
-        ? BP.EngineClass(PR->UePackage, PR->UeName)
-        : BP.EngineClass(ModPackage + "/" + PR->CppName, PR->CppName + "_C");
-    *Out = ObjectParam(PName, ClassImp, ExtraFlags);
+    *Out = ObjectParam(PName, PR->IsNative() ? BP.EngineClass(PR->UePackage, PR->UeName)
+                                             : BP.EngineClass(ModPackage + "/" + PR->CppName, PR->CppName + "_C"),
+                       ExtraFlags);
     return true;
 }
 
@@ -1601,6 +2013,13 @@ bool FCompiler::LayoutOf(const std::string& QualType, int32* Size, int32* Align,
     if (T == "FString" || T == "char *" || T == "char*") { *Size = 16; *Align = 8; return true; }
     if (T == "FText") { *Size = 24; *Align = 8; return true; }
     if (!T.empty() && T.back() == '*') { *Size = 8; *Align = 8; return true; }
+    if (Enums.count(T)) { *Size = 1; *Align = 1; return true; }
+    std::string Inner;
+    if (TemplateArg(T, "TSubclassOf", &Inner)) { *Size = 8; *Align = 8; return true; }
+    if (TemplateArg(T, "TArray", &Inner)) { *Size = 16; *Align = 8; return true; }
+    if (TemplateArg(T, "TSet", &Inner) || TemplateArg(T, "TMap", &Inner)) { *Size = 80; *Align = 8; return true; }
+    if (TemplateArg(T, "TSoftObjectPtr", &Inner) || TemplateArg(T, "TSoftClassPtr", &Inner)) { *Size = 40; *Align = 8; return true; }
+    if (auto S = Structs.find(T); S != Structs.end()) { *Size = S->second.Size; *Align = S->second.Align; return true; }
     if (const FRecord* SR = Find(T); SR && SR->bIsStruct) return StructLayout(*SR, Size, Align, Err);
     *Err = "TODO: unimplemented struct member type: " + QualType;
     return false;
@@ -1801,6 +2220,41 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     return true;
 }
 
+bool FCompiler::LoadTables(const std::string& IncludeDir, std::string* Err)
+{
+    auto Load = [&](const char* File, Json* Out) {
+        *Out = Json::parse(ReadText(IncludeDir + "/" + File), nullptr, false);
+        if (Out->is_discarded()) { *Err = std::string("missing or invalid ") + IncludeDir + "/" + File + " (run genueapi.py)"; return false; }
+        return true;
+    };
+    Json ConvDoc, OpsDoc, TypesDoc;
+    if (!Load("Conv.json", &ConvDoc) || !Load("Ops.json", &OpsDoc) || !Load("Types.json", &TypesDoc)) return false;
+
+    for (const Json& Row : ConvDoc)
+        Convs.push_back({ Row.value("from", std::string()), Row.value("to", std::string()),
+                          Row.value("package", std::string()), Row.value("class", std::string()),
+                          Row.value("fn", std::string()), ExtraArgs(Row) });
+    for (const Json& Row : OpsDoc)
+        Ops.push_back({ Row.value("op", std::string()), Row.value("lhs", std::string()), Row.value("rhs", std::string()),
+                        Row.value("ret", std::string()), Row.value("package", std::string()),
+                        Row.value("class", std::string()), Row.value("fn", std::string()), ExtraArgs(Row) });
+    for (auto It = TypesDoc["enums"].begin(); It != TypesDoc["enums"].end(); ++It)
+        Enums[It.key()] = { It->value("package", std::string()), It->value("name", std::string()),
+                            It->value("underlying", std::string()), It->value("first", std::string()) };
+    for (auto It = TypesDoc["structs"].begin(); It != TypesDoc["structs"].end(); ++It)
+    {
+        FStructInfo S;
+        S.Package = It->value("package", std::string());
+        S.UeName = It->value("name", std::string());
+        S.Size = It->value("size", 0);
+        S.Align = It->value("align", 1);
+        S.bComplete = It->value("complete", false);
+        for (const Json& F : (*It)["fields"]) S.Fields.emplace_back(F[0].get<std::string>(), F[1].get<std::string>());
+        Structs[It.key()] = S;
+    }
+    return true;
+}
+
 bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir,
                     const std::string& OutDir, std::string* Err)
 {
@@ -1821,21 +2275,7 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     Doc = Json::parse(Text, nullptr, false);
     if (Doc.is_discarded()) { *Err = "could not parse clang's AST dump"; return false; }
 
-    const std::string ConvText = ReadText(IncludeDir + "/Conv.json");
-    const Json ConvDoc = Json::parse(ConvText, nullptr, false);
-    if (!ConvDoc.is_array()) { *Err = "missing or invalid " + IncludeDir + "/Conv.json (run genueapi.py)"; return false; }
-    for (const Json& Row : ConvDoc)
-    {
-        FConv C;
-        C.From = KindByName(Row.value("from", std::string()));
-        C.To = KindByName(Row.value("to", std::string()));
-        C.Package = Row.value("package", std::string());
-        C.Class = Row.value("class", std::string());
-        C.Fn = Row.value("fn", std::string());
-        for (const Json& E : Row["extra"]) C.Extra.push_back(E);
-        Convs.push_back(C);
-    }
-
+    if (!LoadTables(IncludeDir, Err)) return false;
     if (!Collect(Err)) return false;
 
     int32 Generated = 0;

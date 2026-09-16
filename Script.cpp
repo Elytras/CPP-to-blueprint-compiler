@@ -136,6 +136,21 @@ FPropertyDef ClassParam(const std::string& Name, FIndex UClassImp, FIndex MetaCl
                          UClassImp, "", MetaClass };
 }
 
+/* TSoftObjectPtr: FWeakObjectPtr + TagAtLastTest + FSoftObjectPath (FName + FString) = 40 bytes. */
+FPropertyDef SoftObjectParam(const std::string& Name, FIndex Class, uint64 ExtraFlags)
+{
+    return FPropertyDef{ "SoftObjectProperty", Name, RF_Public, 1, 40,
+                         CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, Class };
+}
+
+FPropertyDef SoftClassParam(const std::string& Name, FIndex ClassClass, FIndex MetaClass, uint64 ExtraFlags)
+{
+    FPropertyDef P{ "SoftClassProperty", Name, RF_Public, 1, 40,
+                    CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, ClassClass };
+    P.Extra2 = MetaClass;
+    return P;
+}
+
 FPropertyDef StructParam(const std::string& Name, FIndex Struct, const std::string& StructName,
                          int32 Size, uint64 ExtraFlags)
 {
@@ -150,6 +165,7 @@ void WriteZeroValueTag(FArc& Ar, const FPropertyDef& P)
         if (P.Type == "IntProperty" || P.Type == "FloatProperty" || P.Type == "StrProperty"
             || P.Type == "ObjectProperty" || P.Type == "ClassProperty" || P.Type == "UInt32Property")
             V.I32(0);
+        else if (P.Type == "SoftObjectProperty" || P.Type == "SoftClassProperty") { V.Name("None"); V.I32(0); }   // FSoftObjectPath: AssetPathName, SubPathString
         else if (P.Type == "Int64Property" || P.Type == "UInt64Property") V.I64(0);
         else if (P.Type == "DoubleProperty") { double Z = 0.0; V.Raw(&Z, 8); }
         else if (P.Type == "Int8Property") V.U8(0);
@@ -199,9 +215,9 @@ void WriteProperty(FArc& Ar, const FPropertyDef& P)
     Ar.Name("None");                    // RepNotifyFunc
     Ar.U8(0);                           // BlueprintReplicationCondition
 
-    if (P.Type == "ObjectProperty")
+    if (P.Type == "ObjectProperty" || P.Type == "SoftObjectProperty")
         Ar.Idx(P.Extra);                // PropertyClass
-    else if (P.Type == "ClassProperty")
+    else if (P.Type == "ClassProperty" || P.Type == "SoftClassProperty")
     {
         Ar.Idx(P.Extra);                // PropertyClass = UClass
         Ar.Idx(P.Extra2);               // MetaClass (the subclass filter)
@@ -353,6 +369,20 @@ void FScript::TextConst(const std::string& Value, bool bWide)
 void FScript::True() { Op(EX_True); }
 void FScript::False() { Op(EX_False); }
 void FScript::NoObject() { Op(EX_NoObject); }
+
+void FScript::SoftObjectConst(const std::string& Path)
+{
+    Op(EX_SoftObjectConst);
+    StringConst(Path);
+}
+
+void FScript::DynamicCast(FIndex Class, const std::function<void(FScript&)>& Expr)
+{
+    Op(EX_DynamicCast);
+    Ar.Idx(Class);
+    Memory += kMemObjectRef;
+    Expr(*this);
+}
 
 void FScript::ObjectConst(FIndex Object)
 {
