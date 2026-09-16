@@ -164,6 +164,24 @@ bool FindLiteral(const Json& N, std::string& Out)
 
 bool IsStaticDecl(const Json& Decl) { return Decl.value("storageClass", std::string()) == "static"; }
 
+/* UE_PURE: clang keeps [[gnu::pure]] as a PureAttr child, and copies it onto an out-of-line definition. */
+bool IsPureDecl(const Json& Decl)
+{
+    bool bPure = false;
+    ForEach(Decl, [&](const Json& C) { bPure = bPure || Kind(C) == "PureAttr"; });
+    return bPure;
+}
+
+std::vector<std::string> ParmNames(const Json& Decl)
+{
+    std::vector<std::string> Out;
+    ForEach(Decl, [&](const Json& C) { if (Kind(C) == "ParmVarDecl") Out.push_back(Name(C)); });
+    return Out;
+}
+
+/* WorldContextObject, WorldContext, Dumper-7's WorldContextObject_0: the parameter a Blueprint wires to self. */
+bool IsWcoName(const std::string& N) { return N.compare(0, 12, "WorldContext") == 0; }
+
 struct FRecord
 {
     std::string CppName;
@@ -653,6 +671,7 @@ private:
     std::map<std::string, std::string> Bare;          // unambiguous leaf name -> qualified name
     const FRecord* Cur = nullptr;                     // record Generate is working on
     std::set<std::string> CurrentOutParms;            // T& parm names of the function being lowered
+    std::string CurrentWco;                           // its WorldContext* parm when it is a static, else empty
     std::vector<FRegistryAsset> RegistryRows;
 
     /* Per-function state reset in Generate: whether this function needs the FDeref scratch
@@ -825,7 +844,9 @@ bool FCompiler::Collect(std::string* Err)
             }
             else if (Kind(C) == "CXXMethodDecl" && C.contains("name"))
             {
-                R.Methods[Name(C)] = &C;
+                /* genueapi's overload without the world context shares the name; the longer one is the UFunction. */
+                const Json*& Slot = R.Methods[Name(C)];
+                if (!Slot || ParmNames(C).size() > ParmNames(*Slot).size()) Slot = &C;
                 MethodOwner[C.value("id", std::string())] = R.CppName;
             }
             else if (Kind(C) == "FieldDecl" && C.contains("name"))
@@ -1483,6 +1504,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
     if (!Callee) { *Err = "call with no callee"; return false; }
 
     std::string DeclId, MethodName;
+    const Json* FullDecl = nullptr;     // the UFunction's own signature, whichever overload was called
     if (K == "CXXMemberCallExpr")
     {
         if (Kind(*Callee) != "MemberExpr") { *Err = "TODO: unimplemented callee " + Kind(*Callee); return false; }
@@ -1536,6 +1558,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
 
         auto Decl = R->Methods.find(MethodName);
         const bool bStatic = Decl != R->Methods.end() && IsStaticDecl(*Decl->second);
+        if (Decl != R->Methods.end()) FullDecl = Decl->second;
 
         if (!R->IsNative() && !bStatic) Out.VirtualName = MethodName;
 
@@ -1553,14 +1576,31 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
 
     /* inner[0] is the callee. */
     bool bFirst = true, bOk = true;
+    std::vector<bool> Defaulted;
     ForEach(CallExprNode, [&](const Json& C) {
         if (bFirst) { bFirst = false; return; }
         if (!bOk) return;
         FArgIR A;
         bOk = LowerArg(C, BP, A, Err);
         if (bOk) Out.Args.push_back(A);
+        Defaulted.push_back(Kind(C) == "CXXDefaultArgExpr");
     });
-    return bOk;
+    if (!bOk || !FullDecl) return bOk;
+
+    /* A world context the call leaves out - to its default, or through genueapi's overload without
+       it - is wired like the Blueprint editor wires the hidden pin: self, or the enclosing static's
+       own world context parameter, since a static's self is a CDO with no world. */
+    const std::vector<std::string> Parms = ParmNames(*FullDecl);
+    for (size_t I = 0; I < Parms.size(); ++I)
+    {
+        if (!IsWcoName(Parms[I])) continue;
+        FArgIR Wco;
+        if (!CurrentWco.empty()) { Wco.K = FArgIR::Local; Wco.S = CurrentWco; }
+        if (Out.Args.size() + 1 == Parms.size()) Out.Args.insert(Out.Args.begin() + I, Wco);
+        else if (I < Defaulted.size() && Defaulted[I]) Out.Args[I] = Wco;
+        break;
+    }
+    return true;
 }
 
 bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FStmtIR>& Out,
@@ -2248,6 +2288,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
 
         std::vector<FPropertyDef> Params;
         CurrentOutParms.clear();
+        CurrentWco.clear();
         bool bOk = true;
         ForEach(M, [&](const Json& C) {
             if (Kind(C) != "ParmVarDecl" || !bOk) return;
@@ -2269,6 +2310,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             { *Err = PErr; bOk = false; return; }
             Params.push_back(PD);
             if (bOutParm) CurrentOutParms.insert(PName);
+            if (IsStaticDecl(Decl) && CurrentWco.empty() && IsWcoName(PName)) CurrentWco = PName;
         });
         if (!bOk) return false;
 
@@ -2305,6 +2347,24 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             *Err = R.CppName + "::" + Entry.first + ": " + *Err;
             return false;
         }
+        /*
+        TODO (user-raised 2026-09-16, assetgen optimizer): an optimizer pass over Stmts, here,
+        where lowering and the read hoist are done and nothing is emitted yet. UE_PURE marks the
+        calls it may rewrite:
+        - drop a statement that only calls a pure function, if its arguments make no impure call;
+        - evaluate a pure call repeated with the same arguments once, into a temp local, if no
+          impure call and no write to an argument sits between the two (StringTest's
+          MakeKey(Caption, Count)); a pure getter may read state an impure call changes.
+        Nothing enforces BlueprintPure, and the dump marks functions pure that are not: a fresh
+        object per call (FSDJsonObject::CreateJSONObject), the wall clock (Now, UtcNow),
+        randomness (RandomInteger; RandomIntegerFromStream advances the stream's mutable Seed
+        through a const&). The pass treats a list of those as impure, or it merges two different
+        values into one and drops draws that move a random sequence.
+        The inlining / copy-propagation / constant-folding passes in TODO.md can share this
+        slot. Needs an FCallIR::bPure set in LowerCall beside bStatic and, for engine calls,
+        genueapi.py emitting UE_PURE: it reads only _classes.hpp, and the flags are in the
+        comment above each body in _functions.cpp.
+        */
         /* Locals follow ReturnValue in ChildProperties; the engine tells them apart by CPF_Parm. */
         for (const FPropertyDef& L : Locals) Params.push_back(L);
 
@@ -2315,9 +2375,11 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             : FIndex{};
 
         /* A static left FUNC_Event would be treated by the loader as an overridable entry point. */
-        const uint32 Flags = IsStaticDecl(Decl)
+        uint32 Flags = IsStaticDecl(Decl)
             ? uint32(FUNC_Static | FUNC_BlueprintCallable | FUNC_Public | FUNC_Final)
-            : 0u;
+            : FFunctionDef().FunctionFlags;
+        /* All 7229 BlueprintPure functions in the DRG dump are BlueprintCallable too. */
+        if (IsPureDecl(M)) Flags |= FUNC_BlueprintPure | FUNC_BlueprintCallable;
 
         BP.AddFunction(Entry.first, FindEvent(BP, R.CppName, Entry.first), Params,
                        [Stmts, bEndsWithReturn, bScratchNeeded, DerefStruct](FScript& S, FIndex SelfExp) {

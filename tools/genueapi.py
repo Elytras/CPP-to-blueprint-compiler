@@ -638,9 +638,16 @@ def main():
                 fields += 1
                 referenced.update(class_refs(ftype))
             for is_static, ret, fname, params in k.funcs:
-                args = ", ".join("%s %s" % (rewrite(t), n) for t, n in params)
-                body.append("    %s%s %s(%s);"
-                            % ("static " if is_static else "", rewrite(ret), fname, args))
+                # A Blueprint hides the world context pin and wires it to self; the overload without
+                # it is how a mod does the same, and AssetGen fills the argument back in.
+                variants = [params]
+                wco = [p for p in params if p[0] == "class UObject*" and p[1].startswith("WorldContext")]
+                if wco:
+                    variants.append([p for p in params if p is not wco[0]])
+                for plist in variants:
+                    args = ", ".join("%s %s" % (rewrite(t), n) for t, n in plist)
+                    body.append("    %s%s %s(%s);"
+                                % ("static " if is_static else "", rewrite(ret), fname, args))
                 funcs += 1
                 for t in [ret] + [t for t, _ in params]:
                     referenced.update(class_refs(t))
