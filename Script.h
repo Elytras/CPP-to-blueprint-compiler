@@ -56,6 +56,10 @@ FPropertyDef SetParam(const std::string& Name, const FPropertyDef& Element, uint
 FPropertyDef MapParam(const std::string& Name, const FPropertyDef& Key, const FPropertyDef& Value, uint64 ExtraFlags = 0);
 FPropertyDef StructParam(const std::string& Name, FIndex Struct, const std::string& StructName,
                          int32 Size, uint64 ExtraFlags = 0);
+/* TScriptInterface: object + interface pointer. Extra = the interface class. */
+FPropertyDef InterfaceParam(const std::string& Name, FIndex InterfaceClass, uint64 ExtraFlags = 0);
+/* An event dispatcher. Extra = its <Name>__DelegateSignature function. */
+FPropertyDef DispatcherParam(const std::string& Name, FIndex Signature, uint64 ExtraFlags = 0);
 
 void WriteProperty(FArc& Ar, const FPropertyDef& P);
 
@@ -93,6 +97,22 @@ public:
     void ObjectConst(FIndex Object);
     void SoftObjectConst(const std::string& Path);
     void DynamicCast(FIndex Class, const std::function<void(FScript&)>& Expr);
+    /* EX_ObjToInterfaceCast / EX_CrossInterfaceCast / EX_InterfaceToObjCast / EX_DynamicCast: class, then the value. */
+    void ClassCast(EExprToken Token, FIndex Class, const std::function<void(FScript&)>& Expr);
+    /* The object an EX_Context runs against, read out of an FScriptInterface. */
+    void InterfaceContext(const std::function<void(FScript&)>& InterfaceExpr);
+
+    /* A delegate bound to self's function by name, with no local. */
+    void InstanceDelegate(const std::string& FunctionName);
+    /* Dispatcher must leave MostRecentProperty on a multicast delegate property: EX_InstanceVariable,
+       or an EX_Context whose rvalue is that property. */
+    void AddMulticastDelegate(const std::function<void(FScript&)>& Dispatcher,
+                              const std::function<void(FScript&)>& Delegate);
+    void RemoveMulticastDelegate(const std::function<void(FScript&)>& Dispatcher,
+                                 const std::function<void(FScript&)>& Delegate);
+    void ClearMulticastDelegate(const std::function<void(FScript&)>& Dispatcher);
+    /* Follow with the dispatcher, one expression per signature parameter, then EndFunctionParms. */
+    void CallMulticastDelegate(FIndex Signature);
 
     /*
     Jump targets are MEMORY offsets, not storage offsets. Forward jump:
@@ -121,9 +141,11 @@ public:
                  const std::function<void(FScript&)>& Var,
                  const std::function<void(FScript&)>& Value);
 
-    /* The skip count is MEMORY bytes of ContextExpr, measured here. */
+    /* The skip count is MEMORY bytes of ContextExpr, measured here. RValue names the property
+       ContextExpr reads, which the VM zeroes when the object is null; a call leaves it empty. */
     void Context(const std::function<void(FScript&)>& ObjectExpr,
-                 const std::function<void(FScript&)>& ContextExpr);
+                 const std::function<void(FScript&)>& ContextExpr,
+                 const std::string& RValue = std::string(), FIndex RValueOwner = FIndex());
 
     void StructConst(FIndex Struct, int32 SerializedSize, const std::function<void(FScript&)>& Members);
 

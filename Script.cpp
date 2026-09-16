@@ -135,6 +135,22 @@ FPropertyDef StructParam(const std::string& Name, FIndex Struct, const std::stri
                          CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, Struct, StructName };
 }
 
+/* Measured on DRG (BP_PassedOut, ENE_Flea): 16 bytes, the interface class as the tail. */
+FPropertyDef InterfaceParam(const std::string& Name, FIndex InterfaceClass, uint64 ExtraFlags)
+{
+    return FPropertyDef{ "InterfaceProperty", Name, RF_Public, 1, 16,
+                         CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, InterfaceClass };
+}
+
+/* Measured on MOD_Proxy_SpawnEnemy: 16 bytes, flags Edit | BlueprintVisible | DisableEditOnInstance |
+   BlueprintAssignable | BlueprintCallable, the signature function as the tail. */
+FPropertyDef DispatcherParam(const std::string& Name, FIndex Signature, uint64 ExtraFlags)
+{
+    return FPropertyDef{ "MulticastInlineDelegateProperty", Name, RF_Public, 1, 16,
+                         CPF_Edit | CPF_BlueprintVisible | CPF_DisableEditOnInstance | CPF_BlueprintAssignable
+                         | CPF_BlueprintCallable | ExtraFlags, Signature };
+}
+
 bool IsAscii(const std::string& S)
 {
     return std::all_of(S.begin(), S.end(), [](char C) { return uint8(C) < 0x80; });
@@ -197,7 +213,7 @@ void WriteDefaultTag(FArc& Ar, const FPropertyDef& P)
             V.I32(bText ? 1 : 0);
             if (bText) WriteFStringValue(V, D.S);
         }
-        else if (P.Type == "ObjectProperty" || P.Type == "ClassProperty") V.I32(0);
+        else if (P.Type == "ObjectProperty" || P.Type == "ClassProperty" || P.Type == "InterfaceProperty") V.I32(0);
         else if (P.Type == "SoftObjectProperty" || P.Type == "SoftClassProperty") { V.Name("None"); V.I32(0); }   // FSoftObjectPath: AssetPathName, SubPathString
         else if (P.Type == "SetProperty" || P.Type == "MapProperty") { V.I32(0); V.I32(0); }   // removed count, count
         else if (P.Type == "ArrayProperty")
@@ -244,6 +260,10 @@ void WriteProperty(FArc& Ar, const FPropertyDef& P)
 
     if (P.Type == "ObjectProperty" || P.Type == "SoftObjectProperty")
         Ar.Idx(P.Extra);                // PropertyClass
+    else if (P.Type == "InterfaceProperty")
+        Ar.Idx(P.Extra);                // InterfaceClass
+    else if (P.Type == "MulticastInlineDelegateProperty")
+        Ar.Idx(P.Extra);                // SignatureFunction
     else if (P.Type == "ClassProperty" || P.Type == "SoftClassProperty")
     {
         Ar.Idx(P.Extra);                // PropertyClass = UClass
@@ -274,6 +294,56 @@ void WriteProperty(FArc& Ar, const FPropertyDef& P)
 }
 
 /* ---- bytecode ---- */
+
+void FScript::ClassCast(EExprToken Token, FIndex Class, const std::function<void(FScript&)>& Expr)
+{
+    Op(Token);
+    Ar.Idx(Class);
+    Memory += kMemObjectRef;
+    Expr(*this);
+}
+
+void FScript::InterfaceContext(const std::function<void(FScript&)>& InterfaceExpr)
+{
+    Op(EX_InterfaceContext);
+    InterfaceExpr(*this);
+}
+
+void FScript::InstanceDelegate(const std::string& FunctionName)
+{
+    Op(EX_InstanceDelegate);
+    Ar.Name(FunctionName);
+    Memory += kFNameSize;
+}
+
+void FScript::AddMulticastDelegate(const std::function<void(FScript&)>& Dispatcher,
+                                   const std::function<void(FScript&)>& Delegate)
+{
+    Op(EX_AddMulticastDelegate);
+    Dispatcher(*this);
+    Delegate(*this);
+}
+
+void FScript::RemoveMulticastDelegate(const std::function<void(FScript&)>& Dispatcher,
+                                      const std::function<void(FScript&)>& Delegate)
+{
+    Op(EX_RemoveMulticastDelegate);
+    Dispatcher(*this);
+    Delegate(*this);
+}
+
+void FScript::ClearMulticastDelegate(const std::function<void(FScript&)>& Dispatcher)
+{
+    Op(EX_ClearMulticastDelegate);
+    Dispatcher(*this);
+}
+
+void FScript::CallMulticastDelegate(FIndex Signature)
+{
+    Op(EX_CallMulticastDelegate);
+    Ar.Idx(Signature);
+    Memory += kMemObjectRef;
+}
 
 void FScript::Op(EExprToken Token)
 {
@@ -399,10 +469,7 @@ void FScript::SoftObjectConst(const std::string& Path)
 
 void FScript::DynamicCast(FIndex Class, const std::function<void(FScript&)>& Expr)
 {
-    Op(EX_DynamicCast);
-    Ar.Idx(Class);
-    Memory += kMemObjectRef;
-    Expr(*this);
+    ClassCast(EX_DynamicCast, Class, Expr);
 }
 
 void FScript::ObjectConst(FIndex Object)
@@ -478,7 +545,8 @@ void FScript::LetPath(EExprToken LetOp, const std::vector<std::string>& Path, FI
 }
 
 void FScript::Context(const std::function<void(FScript&)>& ObjectExpr,
-                      const std::function<void(FScript&)>& ContextExpr)
+                      const std::function<void(FScript&)>& ContextExpr,
+                      const std::string& RValue, FIndex RValueOwner)
 {
     Op(EX_Context);
     ObjectExpr(*this);
@@ -489,7 +557,8 @@ void FScript::Context(const std::function<void(FScript&)>& ObjectExpr,
 
     Ar.I32(Inner.MemorySize());
     Memory += 4;
-    NullFieldPath();                    // RValuePointer
+    if (RValue.empty()) NullFieldPath();    // RValuePointer
+    else FieldPath(RValue, RValueOwner);
     Ar.Raw(Inner.Bytes().data(), Inner.Bytes().size());
     Memory += Inner.MemorySize();
 }

@@ -36,14 +36,18 @@ public:
     /*
     `Super` is the engine UFunction being overridden, or null for a new method. Body receives the
     function's own export index (the FFieldPath owner for its params), filled in by Finish().
+    Returns that export index.
     */
-    void AddFunction(const std::string& Name, FIndex Super,
-                     const std::vector<FPropertyDef>& Params,
-                     const std::function<void(FScript&, FIndex)>& Body,
-                     uint32 FunctionFlags = 0);
+    FIndex AddFunction(const std::string& Name, FIndex Super,
+                       const std::vector<FPropertyDef>& Params,
+                       const std::function<void(FScript&, FIndex)>& Body,
+                       uint32 FunctionFlags = 0);
 
     /* One ChildProperties entry on the class; no CDO default is written. */
     void AddVariable(const FPropertyDef& Var);
+
+    /* An implemented interface: a UClass::Interfaces entry. Its functions are ordinary AddFunction()s. */
+    void AddInterface(FIndex InterfaceClass) { Interfaces.push_back(InterfaceClass); }
 
     void Finish();
 
@@ -75,6 +79,7 @@ private:
     std::vector<int32> CallImports;
     std::vector<FPending> Functions;
     std::vector<FPropertyDef> Vars;
+    std::vector<FIndex> Interfaces;
 
     int32 ClassRow = 0;
 };

@@ -116,10 +116,10 @@ FIndex FBlueprintClass::EngineFunction(const std::string& PackageName,
     return Imp(Row);
 }
 
-void FBlueprintClass::AddFunction(const std::string& Name, FIndex Super,
-                                  const std::vector<FPropertyDef>& Params,
-                                  const std::function<void(FScript&, FIndex)>& Body,
-                                  uint32 FunctionFlags)
+FIndex FBlueprintClass::AddFunction(const std::string& Name, FIndex Super,
+                                    const std::vector<FPropertyDef>& Params,
+                                    const std::function<void(FScript&, FIndex)>& Body,
+                                    uint32 FunctionFlags)
 {
     FFunctionDef Def;
     Def.Name = Name;
@@ -127,6 +127,7 @@ void FBlueprintClass::AddFunction(const std::string& Name, FIndex Super,
     Def.Params = Params;
     if (FunctionFlags != 0) Def.FunctionFlags = FunctionFlags;
     Functions.push_back(FPending{ Def, Body });
+    return Exp(2 + int32(Functions.size()) - 1);    // Finish() writes functions from row 2, in order
 }
 
 void FBlueprintClass::AddVariable(const FPropertyDef& Var)
@@ -183,9 +184,11 @@ void FBlueprintClass::Finish()
     Class.CreateBeforeCreate = { ParentIdx.V };
     for (int32 I = 0; I < NumFunctions; ++I)
         Class.CreateBeforeSer.push_back(Exp(RowFirstFunction + I).V);
-    for (const FPropertyDef& V : Vars)
-        if (V.Extra.V != 0)
+    for (const FPropertyDef& V : Vars)      // a dispatcher's Extra is a function listed above
+        if (V.Extra.V != 0 && std::find(Class.CreateBeforeSer.begin(), Class.CreateBeforeSer.end(), V.Extra.V) == Class.CreateBeforeSer.end())
             Class.CreateBeforeSer.push_back(V.Extra.V);
+    for (FIndex I : Interfaces) Class.CreateBeforeSer.push_back(I.V);  // as BP_SentryGun_MoveMarker lists Targetable
+    const std::vector<FIndex> ClassInterfaces = Interfaces;
     const std::vector<FPropertyDef> ClassVars = Vars;
     const bool bActor = bIsActor;
     const uint32 Flags = ClassFlags;
@@ -214,8 +217,9 @@ void FBlueprintClass::Finish()
         Ar.U32(Flags);                              // ClassFlags
         Ar.Idx(ObjectClass);                        // ClassWithin
         Ar.Name("Engine");                          // ClassConfigName
-        Ar.I32(0);                                  // implemented interfaces
         Ar.Idx(Null());                             // ClassGeneratedBy
+        Ar.I32(int32(ClassInterfaces.size()));      // Interfaces: class, PointerOffset, bImplementedByK2
+        for (FIndex I : ClassInterfaces) { Ar.Idx(I); Ar.I32(0); Ar.Bool(true); }
         Ar.Bool(false);                             // bDeprecatedForceScriptOrder
         Ar.Name("None");
         Ar.Bool(true);                              // bCooked
