@@ -1,4 +1,5 @@
 ﻿#pragma once
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -19,15 +20,12 @@ struct FPropertyDef
     FIndex Extra;                       // ObjectProperty/ClassProperty: PropertyClass. StructProperty: Struct. ByteProperty: Enum.
     std::string StructName;             // StructProperty: the struct's name, for the default-value tag
     FIndex Extra2;                      // ClassProperty: MetaClass (the subclass filter). Trailing so 7-/8-arg aggregate inits still land at Extra.
+    std::shared_ptr<FPropertyDef> Inner; // ArrayProperty only: FArrayProperty::Serialize writes Inner inline via SerializeSingleField.
 };
 
 FPropertyDef FloatParam(const std::string& Name, uint64 ExtraFlags = 0);
-FPropertyDef DoubleParam(const std::string& Name, uint64 ExtraFlags = 0);
 FPropertyDef IntParam(const std::string& Name, uint64 ExtraFlags = 0);
 FPropertyDef Int64Param(const std::string& Name, uint64 ExtraFlags = 0);
-FPropertyDef Int8Param(const std::string& Name, uint64 ExtraFlags = 0);
-FPropertyDef UInt32Param(const std::string& Name, uint64 ExtraFlags = 0);
-FPropertyDef UInt64Param(const std::string& Name, uint64 ExtraFlags = 0);
 FPropertyDef BoolParam(const std::string& Name, uint64 ExtraFlags = 0);
 FPropertyDef ByteParam(const std::string& Name, uint64 ExtraFlags = 0);
 FPropertyDef StringParam(const std::string& Name, uint64 ExtraFlags = 0);
@@ -39,6 +37,8 @@ FPropertyDef ClassParam(const std::string& Name, FIndex UClassImp, FIndex MetaCl
                         uint64 ExtraFlags = 0);
 FPropertyDef StructParam(const std::string& Name, FIndex Struct, const std::string& StructName,
                          int32 Size, uint64 ExtraFlags = 0);
+/* TArray<T>. ElementSize is sizeof(FScriptArray) = 16 (the outer TArray header); Inner keeps its own. */
+FPropertyDef ArrayParam(const std::string& Name, FPropertyDef Inner, uint64 ExtraFlags = 0);
 
 void WriteProperty(FArc& Ar, const FPropertyDef& P);
 

@@ -19,12 +19,6 @@ FPropertyDef FloatParam(const std::string& Name, uint64 ExtraFlags)
                          CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, Null() };
 }
 
-FPropertyDef DoubleParam(const std::string& Name, uint64 ExtraFlags)
-{
-    return FPropertyDef{ "DoubleProperty", Name, RF_Public, 1, 8,
-                         CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, Null() };
-}
-
 FPropertyDef IntParam(const std::string& Name, uint64 ExtraFlags)
 {
     return FPropertyDef{ "IntProperty", Name, RF_Public, 1, 4,
@@ -34,24 +28,6 @@ FPropertyDef IntParam(const std::string& Name, uint64 ExtraFlags)
 FPropertyDef Int64Param(const std::string& Name, uint64 ExtraFlags)
 {
     return FPropertyDef{ "Int64Property", Name, RF_Public, 1, 8,
-                         CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, Null() };
-}
-
-FPropertyDef Int8Param(const std::string& Name, uint64 ExtraFlags)
-{
-    return FPropertyDef{ "Int8Property", Name, RF_Public, 1, 1,
-                         CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, Null() };
-}
-
-FPropertyDef UInt32Param(const std::string& Name, uint64 ExtraFlags)
-{
-    return FPropertyDef{ "UInt32Property", Name, RF_Public, 1, 4,
-                         CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, Null() };
-}
-
-FPropertyDef UInt64Param(const std::string& Name, uint64 ExtraFlags)
-{
-    return FPropertyDef{ "UInt64Property", Name, RF_Public, 1, 8,
                          CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, Null() };
 }
 
@@ -107,16 +83,39 @@ FPropertyDef StructParam(const std::string& Name, FIndex Struct, const std::stri
                          CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, Struct, StructName };
 }
 
+FPropertyDef ArrayParam(const std::string& Name, FPropertyDef Inner, uint64 ExtraFlags)
+{
+    // Outer ElementSize = sizeof(FScriptArray) = 16. Inner keeps its own ElementSize.
+    // Inner keeps CPF_BlueprintVisible/ReadOnly but drops CPF_Parm (per real cooked layouts).
+    Inner.PropertyFlags &= ~uint64(CPF_Parm);
+    FPropertyDef Def{ "ArrayProperty", Name, RF_Public, 1, 16,
+                      CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, Null() };
+    Def.Inner = std::make_shared<FPropertyDef>(std::move(Inner));
+    return Def;
+}
+
 void WriteZeroValueTag(FArc& Ar, const FPropertyDef& P)
 {
     if (P.Type == "BoolProperty") { TagBool(Ar, P.Name, false); return; }
+    if (P.Type == "ArrayProperty")
+    {
+        // ArrayProperty has an extra `FName InnerType` in its tag header, so it can't share the
+        // generic Tag() path. Value payload is int32 Num = 0.
+        Ar.Name(P.Name);
+        Ar.Name("ArrayProperty");
+        Ar.I32(4);                          // Size
+        Ar.I32(0);                          // ArrayIndex
+        Ar.Name(P.Inner ? P.Inner->Type : std::string("None"));   // InnerType
+        Ar.U8(0);                           // HasPropertyGuid
+        Ar.I32(0);                          // Num
+        return;
+    }
     Tag(Ar, P.Name, P.Type, [&](FArc& V) {
         if (P.Type == "IntProperty" || P.Type == "FloatProperty" || P.Type == "StrProperty"
-            || P.Type == "ObjectProperty" || P.Type == "ClassProperty" || P.Type == "UInt32Property")
+            || P.Type == "ObjectProperty" || P.Type == "ClassProperty")
             V.I32(0);
-        else if (P.Type == "Int64Property" || P.Type == "UInt64Property") V.I64(0);
-        else if (P.Type == "DoubleProperty") { double Z = 0.0; V.Raw(&Z, 8); }
-        else if (P.Type == "ByteProperty" || P.Type == "Int8Property") V.U8(0);
+        else if (P.Type == "Int64Property") V.I64(0);
+        else if (P.Type == "ByteProperty") V.U8(0);
         else if (P.Type == "NameProperty") V.Name("None");
         else if (P.Type == "TextProperty") { V.U32(0); V.U8(0xFF); V.I32(0); }   // flags, ETextHistoryType::None, no invariant string
         else if (P.Type == "StructProperty") TagEnd(V);
@@ -158,8 +157,12 @@ void WriteProperty(FArc& Ar, const FPropertyDef& P)
     }
     else if (P.Type == "ByteProperty")
         Ar.Idx(P.Extra);                // Enum
-    // TODO: unimplemented tails - ArrayProperty (Inner), MapProperty, SetProperty,
-    // EnumProperty (Enum + UnderlyingProp), DelegateProperty (SignatureFunction).
+    else if (P.Type == "ArrayProperty")
+        // FArrayProperty::Serialize -> SerializeSingleField(Inner): writes Inner's TypeName then
+        // its full FField+FProperty+type-tail wire, which is exactly what WriteProperty emits.
+        WriteProperty(Ar, *P.Inner);
+    // TODO: unimplemented tails - MapProperty, SetProperty, EnumProperty (Enum + UnderlyingProp),
+    // DelegateProperty (SignatureFunction).
 }
 
 /* ---- bytecode ---- */

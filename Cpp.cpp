@@ -289,18 +289,19 @@ bool EmitArg(FScript& S, const FArgIR& A, FIndex SelfExp, std::string* Err)
         }
         if (A.Sub->Intrinsic == "__DerefReadI64__" || A.Sub->Intrinsic == "__DerefReadI32__"
             || A.Sub->Intrinsic == "__DerefReadF__" || A.Sub->Intrinsic == "__DerefReadU8__"
-            || A.Sub->Intrinsic == "__DerefReadStr__")
+            || A.Sub->Intrinsic == "__DerefReadStr__" || A.Sub->Intrinsic == "__DerefReadText__")
         {
             /* Hoisted Read: outer StructMember reads the view struct's TArray<T> at offset 0 out of
                the caller's FDeref __DerefScratch__ (Num=1, Data=<addr>). ArrayGetByRef then copies
                InnerProp.ElementSize bytes from Data[0] into the caller's dest. No class-owner check
                is involved (StructMemberContext + ArrayGetByRef are both guard-free). */
             const char* ViewField =
-                A.Sub->Intrinsic == "__DerefReadI64__" ? "NameHashes"     :
-                A.Sub->Intrinsic == "__DerefReadI32__" ? "Mapping"        :
-                A.Sub->Intrinsic == "__DerefReadF__"   ? "Data"           :
-                A.Sub->Intrinsic == "__DerefReadStr__" ? "AssetScanPaths" :
-                                                        "Kilobyte";
+                A.Sub->Intrinsic == "__DerefReadI64__"  ? "NameHashes"     :
+                A.Sub->Intrinsic == "__DerefReadI32__"  ? "Mapping"        :
+                A.Sub->Intrinsic == "__DerefReadF__"    ? "Data"           :
+                A.Sub->Intrinsic == "__DerefReadStr__"  ? "AssetScanPaths" :
+                A.Sub->Intrinsic == "__DerefReadText__" ? "Data"           :
+                                                         "Kilobyte";
             const FIndex ViewStruct = A.Sub->Extra;
             S.ArrayGetByRef(
                 [&](FScript& O)
@@ -396,18 +397,20 @@ static const FReadViewSpec kReadViews[] = {
     { "__ReadByte__",   "__DerefReadU8__",  "uint8",           "/Script/Engine", "BandwidthTestItem"            },
     { "__ReadObject__", "__DerefReadI64__", "class UObject *", "/Script/Engine", "MaterialCachedParameterEntry" },
     { "__ReadName__",   "__DerefReadI64__", "FName",           "/Script/Engine", "MaterialCachedParameterEntry" },
-    /* Wider/narrower variants that share a same-size view: CopySingleValue on the InnerProp only
-       cares about ElementSize (a memcpy), so the tmp's type just decides the FField class the
+    /* __ReadClass__ shares the int64 view: CopySingleValue on the InnerProp only cares about
+       ElementSize (an 8-byte memcpy), so the tmp's type just decides the FField class the
        assign lands in - which is what __ClassOf__(Out) checks against at each Get<T>PropertyByName. */
-    { "__ReadDouble__", "__DerefReadI64__", "double",          "/Script/Engine", "MaterialCachedParameterEntry" },
-    { "__ReadUInt64__", "__DerefReadI64__", "uint64",          "/Script/Engine", "MaterialCachedParameterEntry" },
-    { "__ReadUInt32__", "__DerefReadI32__", "uint32",          "/Script/Engine", "LODMappingData"               },
-    { "__ReadInt8__",   "__DerefReadU8__",  "int8",            "/Script/Engine", "BandwidthTestItem"            },
     { "__ReadClass__",  "__DerefReadI64__", "class UClass *",  "/Script/Engine", "MaterialCachedParameterEntry" },
     /* FString view: FStrProperty::CopySingleValue does a deep FString operator= (allocates a
        fresh TArray<TCHAR>), so ArrayGetByRef of the FString at *(FString*)Addr into an
        FString local produces an owned copy that DestroyStruct cleans up on return. */
     { "__ReadString__", "__DerefReadStr__", "FString",         "/Script/Engine", "AssetManagerSearchRules"      },
+    /* FText view: no engine ScriptStruct has TArray<FText> at offset 0, so ReadProperty.cpp
+       cooks its own FDerefTextView { TArray<FText> Data; } in the same package. Package path
+       is the ASSET path (<mod>/<asset>), matching how FDeref imports itself. Same deep-copy
+       pattern as FString - FTextProperty::CopySingleValue is an FText operator= that shares the
+       TSharedRef refcount, so DestroyStruct cleans up on return. */
+    { "__ReadText__",   "__DerefReadText__", "FText",           "/Game/_ElytrasMods/ReadProperty/FDerefTextView", "FDerefTextView" },
 };
 
 const FReadViewSpec* FindReadView(const std::string& Intrinsic)
@@ -1542,18 +1545,26 @@ bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& P
 {
     const std::string Type = StripTypeKeywords(QualType);
     if (Type == "float") { *Out = FloatParam(PName, ExtraFlags); return true; }
-    if (Type == "double") { *Out = DoubleParam(PName, ExtraFlags); return true; }
     if (Type == "int" || Type == "int32") { *Out = IntParam(PName, ExtraFlags); return true; }
     if (Type == "int64" || Type == "long long") { *Out = Int64Param(PName, ExtraFlags); return true; }
-    if (Type == "int8" || Type == "signed char") { *Out = Int8Param(PName, ExtraFlags); return true; }
-    if (Type == "uint32" || Type == "unsigned int") { *Out = UInt32Param(PName, ExtraFlags); return true; }
-    if (Type == "uint64" || Type == "unsigned long long") { *Out = UInt64Param(PName, ExtraFlags); return true; }
     if (Type == "bool") { *Out = BoolParam(PName, ExtraFlags); return true; }
     if (Type == "uint8" || Type == "unsigned char") { *Out = ByteParam(PName, ExtraFlags); return true; }
     if (Type == "char *" || Type == "char*" || Type == "FString")
     { *Out = StringParam(PName, ExtraFlags); return true; }
     if (Type == "FName") { *Out = NameParam(PName, ExtraFlags); return true; }
     if (Type == "FText") { *Out = TextParam(PName, ExtraFlags); return true; }
+
+    /* TArray<T>. Peel the inner type and recurse; the Inner keeps its own ElementSize while
+       the outer is sizeof(FScriptArray) = 16. */
+    if (Type.compare(0, 7, "TArray<") == 0 && !Type.empty() && Type.back() == '>')
+    {
+        const std::string InnerQual = Type.substr(7, Type.size() - 8);
+        FPropertyDef InnerPD;
+        if (!TypeToProperty(InnerQual, PName, 0, Where + " (TArray inner)", BP, &InnerPD, Err))
+            return false;
+        *Out = ArrayParam(PName, std::move(InnerPD), ExtraFlags);
+        return true;
+    }
 
     if (const FRecord* SR = Find(Type); SR && SR->bIsStruct)
     {
@@ -1590,16 +1601,13 @@ bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& P
 bool FCompiler::LayoutOf(const std::string& QualType, int32* Size, int32* Align, std::string* Err)
 {
     const std::string T = StripTypeKeywords(QualType);
-    if (T == "float" || T == "int" || T == "int32"
-        || T == "uint32" || T == "unsigned int") { *Size = 4; *Align = 4; return true; }
-    if (T == "int64" || T == "long long"
-        || T == "uint64" || T == "unsigned long long"
-        || T == "double") { *Size = 8; *Align = 8; return true; }
-    if (T == "bool" || T == "uint8" || T == "unsigned char"
-        || T == "int8" || T == "signed char") { *Size = 1; *Align = 1; return true; }
+    if (T == "float" || T == "int" || T == "int32") { *Size = 4; *Align = 4; return true; }
+    if (T == "int64" || T == "long long") { *Size = 8; *Align = 8; return true; }
+    if (T == "bool" || T == "uint8" || T == "unsigned char") { *Size = 1; *Align = 1; return true; }
     if (T == "FName") { *Size = 8; *Align = 4; return true; }
     if (T == "FString" || T == "char *" || T == "char*") { *Size = 16; *Align = 8; return true; }
     if (T == "FText") { *Size = 24; *Align = 8; return true; }
+    if (T.compare(0, 7, "TArray<") == 0) { *Size = 16; *Align = 8; return true; }
     if (!T.empty() && T.back() == '*') { *Size = 8; *Align = 8; return true; }
     if (const FRecord* SR = Find(T); SR && SR->bIsStruct) return StructLayout(*SR, Size, Align, Err);
     *Err = "TODO: unimplemented struct member type: " + QualType;
