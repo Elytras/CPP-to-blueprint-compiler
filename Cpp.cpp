@@ -1123,6 +1123,7 @@ std::string FCompiler::Canon(std::string T) const
 {
     T = StripTypeKeywords(T);
     while (!T.empty() && (T.back() == '&' || T.back() == ' ')) T.pop_back();
+    if (T.size() > 6 && T.compare(T.size() - 6, 6, "*const") == 0) T.erase(T.size() - 5);  // `const T&` of a pointer T
     T = StripTypeKeywords(T);
     const EStrKind K = StrKindOf(T);
     if (K != SK_None) return TypeNameOf(K);
