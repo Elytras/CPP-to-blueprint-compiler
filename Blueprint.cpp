@@ -82,6 +82,21 @@ FIndex FBlueprintClass::ScriptStruct(const std::string& PackageName, const std::
     return Imp(Row);
 }
 
+FIndex FBlueprintClass::Enum(const std::string& PackageName, const std::string& EnumName)
+{
+    const std::string Key = "enum:" + PackageName + "." + EnumName;
+    auto It = ImportCache.find(Key);
+    if (It != ImportCache.end()) return Imp(It->second);
+
+    const bool bBlueprint = PackageName.compare(0, 6, "/Game/") == 0;
+    const FIndex Outer = PackageImport(PackageName);
+    const int32 Row = P.AddImport({ bBlueprint ? "/Script/Engine" : "/Script/CoreUObject",
+                                    bBlueprint ? "UserDefinedEnum" : "Enum",
+                                    Outer, EnumName });
+    ImportCache.emplace(Key, Row);
+    return Imp(Row);
+}
+
 FIndex FBlueprintClass::EngineFunction(const std::string& PackageName,
                                        const std::string& OwningClass,
                                        const std::string& FunctionName)

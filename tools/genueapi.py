@@ -65,6 +65,13 @@ TEXT_TYPES = {
 }
 
 
+STRUCTS = {}     # cpp name -> Struct, filled by parse_structs before any class header is mapped
+ENUMS = {}       # cpp name -> Enum
+OUT_PTR = re.compile(r"^((?:struct\s+)?[A-Za-z_]\w*)\s*\*$")     # Dumper-7 spells a non-object out-parm as T*
+STRUCT_REF = re.compile(r"^(?:const\s+)?struct\s+(F\w+)\s*&?$")
+ENUM_REF = re.compile(r"^(?:const\s+)?(?:TEnumAsByte<)?(E\w+)>?\s*&?$")
+
+
 def map_type(raw):
     """The C++ spelling to emit, or a KINDS reason when AssetGen cannot compile such a value."""
     t = " ".join(raw.split())
@@ -75,7 +82,210 @@ def map_type(raw):
     m = PTR.match(t)
     if m:
         return "class %s*" % m.group(1)
+    m = OUT_PTR.match(t)
+    if m:
+        inner = map_type(m.group(1))
+        return "other" if inner == "void" else inner if inner in KINDS else inner + "&"
+    m = STRUCT_REF.match(t)
+    if m and m.group(1) in STRUCTS:
+        return m.group(1)
+    m = ENUM_REF.match(t)
+    if m and m.group(1) in ENUMS:
+        return m.group(1)
     return classify(t)
+
+
+class Struct(object):
+    def __init__(self, cpp, base, path, ue_name, size):
+        self.cpp, self.base, self.path, self.ue_name, self.size = cpp, base, path, ue_name, size
+        self.raw_fields = []     # (raw type, name) in offset order, own fields only
+        self.fields = []         # (mapped type, name), base first, filled by resolve_structs
+        self.complete = False    # every reflected field is emitted, so a constructor over all of them exists
+        self.pkg = path[len("/Script/"):]
+
+
+class Enum(object):
+    def __init__(self, cpp, pkg, underlying):
+        self.cpp, self.pkg, self.underlying = cpp, pkg, underlying
+        self.values = []
+
+
+ENUM_COMMENT = re.compile(r"^// Enum (\S+)\.(\w+)\s*$")
+ENUM_DECL = re.compile(r"^enum class (\w+) : (\w+)\s*$")
+ENUM_VALUE = re.compile(r"^\t(\w+)\s*=\s*(-?\d+),?\s*$")
+STRUCT_COMMENT = re.compile(r"^// ScriptStruct (\S+)\.(\w+)\s*$")
+STRUCT_SIZE = re.compile(r"^// 0x([0-9A-Fa-f]+) \(0x([0-9A-Fa-f]+) - 0x([0-9A-Fa-f]+)\)")
+STRUCT_DECL = re.compile(r"^struct (\w+)(?:\s+final)?(?:\s*:\s*public\s+(\w+))?\s*$")
+ALIGN16 = ("Quat", "Vector4", "Plane", "Matrix", "Transform")
+
+
+def parse_structs(path, pkg):
+    """Collects every native enum and ScriptStruct of one *_structs.hpp into ENUMS / STRUCTS."""
+    text = io.open(path, encoding="utf-8", errors="replace").read()
+    pending, size, cur_struct, cur_enum = None, 0, None, None
+    for line in text.splitlines():
+        m = ENUM_COMMENT.match(line)
+        if m:
+            pending = ("enum", m.group(1), m.group(2))
+            continue
+        m = STRUCT_COMMENT.match(line)
+        if m:
+            pending = ("struct", m.group(1), m.group(2))
+            continue
+        m = STRUCT_SIZE.match(line)
+        if m:
+            size = int(m.group(2), 16)
+            continue
+        m = ENUM_DECL.match(line)
+        if m:
+            cur_struct, cur_enum = None, None
+            if pending and pending[0] == "enum" and "/" not in pending[1]:
+                cur_enum = ENUMS[m.group(1)] = Enum(m.group(1), pkg, m.group(2))
+            pending = None
+            continue
+        m = STRUCT_DECL.match(line)
+        if m:
+            cur_struct, cur_enum = None, None
+            if pending and pending[0] == "struct" and pending[1].startswith("/Script/"):
+                cur_struct = STRUCTS[m.group(1)] = Struct(m.group(1), m.group(2) or "", pending[1], pending[2], size)
+            pending = None
+            continue
+        if line.startswith("};"):
+            cur_struct, cur_enum = None, None
+            continue
+        if cur_enum is not None:
+            m = ENUM_VALUE.match(line)
+            if m:
+                cur_enum.values.append((m.group(1), int(m.group(2))))
+        elif cur_struct is not None and "//" in line:
+            m = FIELD.match(line)
+            if m and not m.group(2).startswith(("Pad_", "BitPad_")):
+                cur_struct.raw_fields.append(("bool" if m.group(3) else m.group(1), m.group(2)))
+
+
+def resolve_structs():
+    """Second pass: map field types now that every struct and enum name is known."""
+    done = set()
+
+    def resolve(st):
+        if st.cpp in done:
+            return
+        done.add(st.cpp)
+        base = STRUCTS.get(st.base)
+        if base:
+            resolve(base)
+        own, complete = [], base.complete if base else True
+        for raw, name in st.raw_fields:
+            mapped = map_type(raw)
+            if mapped in KINDS or mapped == "void":
+                complete = False
+                continue
+            own.append((mapped, name))
+        st.fields = (base.fields if base else []) + own
+        st.complete = complete and bool(st.fields)
+
+    for st in list(STRUCTS.values()):
+        resolve(st)
+
+
+def struct_align(st):
+    if st.ue_name in ALIGN16:
+        return 16
+    if st.size % 8 == 0 and any(t in ("int64", "uint64", "double", "FString", "FText") or t.endswith("*")
+                                for t, _ in st.fields):
+        return 8
+    return 4 if st.size % 4 == 0 else 1
+
+
+def struct_deps(st):
+    """Struct names this one must be declared after."""
+    out = [st.base] if st.base in STRUCTS else []
+    out += [t for t, _ in st.fields if t in STRUCTS and t != st.cpp]
+    return out
+
+
+def emit_struct(st, conv_names):
+    body = ["struct %s%s" % (st.cpp, (" : public %s" % st.base) if st.base in STRUCTS else ""), "{"]
+    base = STRUCTS.get(st.base)
+    own = st.fields[len(base.fields):] if base else st.fields
+    for t, n in own:
+        body.append("    %s %s;" % (t, n))
+    body.append("")
+    body.append("    %s() = default;" % st.cpp)
+    if st.complete:
+        body.append("    %s(%s) {}" % (st.cpp, ", ".join("%s %s" % (t, n) for t, n in st.fields)))
+    if st.cpp in conv_names:
+        body.append("    UE_CONV_%s" % st.cpp)
+    body.append("};")
+    return "\n".join(body)
+
+
+def emit_enum(en):
+    width = max([len(n) for n, _ in en.values] + [1])
+    body = ["enum class %s : %s" % (en.cpp, en.underlying), "{"]
+    body += ["    %-*s = %d," % (width, n, v) for n, v in en.values]
+    body.append("};")
+    return "\n".join(body)
+
+
+OPS = {"Add": "+", "Subtract": "-", "Multiply": "*", "Divide": "/", "EqualEqual": "==", "NotEqual": "!=",
+       "Less": "<", "Greater": ">", "LessEqual": "<=", "GreaterEqual": ">="}
+OP_FN = re.compile(r"^(%s)_(\w+)$" % "|".join(OPS))
+
+
+def operator_extra(params):
+    return [(0.0001 if "Tolerance" in n else 0.0) if t == "float" else (False if t == "bool" else 0) for t, n in params]
+
+
+def operators(classes):
+    """(op, lhs, rhs) -> (ret, package, class, fn, extra) for every Kismet <Op>_<A><B> over a struct."""
+    found = {}
+    for k in sorted(classes, key=lambda k: (k.path != "/Script/Engine", k.path, k.cpp)):
+        if k.is_bp:
+            continue
+        for is_static, ret, fname, params in k.funcs:
+            m = OP_FN.match(fname)
+            if not (m and is_static and len(params) >= 2):
+                continue
+            lhs, rhs = params[0][0], params[1][0]
+            if lhs not in STRUCTS and rhs not in STRUCTS:
+                continue
+            found.setdefault((OPS[m.group(1)], lhs, rhs), (ret, k.path, k.ue_name, fname, operator_extra(params[2:])))
+    return found
+
+
+def write_operators(classes, out_dir):
+    ops = operators(classes)
+    by_pkg = {}
+    for (op, lhs, rhs), (ret, pkg, cls, fn, extra) in ops.items():
+        by_pkg.setdefault(pkg[len("/Script/"):], []).append("inline %s operator%s(const %s&, const %s&) { return {}; }"
+                                                              % (ret, op, lhs, rhs))
+    rows = []
+    for (op, lhs, rhs), (ret, pkg, cls, fn, extra) in sorted(ops.items()):
+        args = ", ".join(("true" if a else "false") if isinstance(a, bool) else repr(a) for a in extra)
+        rows.append('  {"op": "%s", "lhs": "%s", "rhs": "%s", "ret": "%s", "package": "%s", "class": "%s", "fn": "%s", "extra": [%s]}'
+                    % (op, lhs, rhs, ret, pkg, cls, fn, args))
+    io.open(os.path.join(out_dir, "Ops.json"), "w", encoding="utf-8", newline="\n").write("[\n" + ",\n".join(rows) + "\n]\n")
+    print("  operators: %d" % len(ops))
+    return by_pkg
+
+
+def write_types(out_dir):
+    rows = ['{', '  "enums": {']
+    ens = sorted(ENUMS.values(), key=lambda e: e.cpp)
+    rows += ['    "%s": {"package": "/Script/%s", "name": "%s", "underlying": "%s"}%s'
+             % (e.cpp, e.pkg, e.cpp, e.underlying, "," if i + 1 < len(ens) else "") for i, e in enumerate(ens)]
+    rows += ['  },', '  "structs": {']
+    sts = sorted(STRUCTS.values(), key=lambda t: t.cpp)
+    for i, st in enumerate(sts):
+        fields = ", ".join('["%s", "%s"]' % (t, n) for t, n in st.fields)
+        rows.append('    "%s": {"package": "%s", "name": "%s", "size": %d, "align": %d, "complete": %s, "fields": [%s]}%s'
+                    % (st.cpp, st.path, st.ue_name, st.size, struct_align(st), "true" if st.complete else "false",
+                       fields, "," if i + 1 < len(sts) else ""))
+    rows += ['  }', '}']
+    io.open(os.path.join(out_dir, "Types.json"), "w", encoding="utf-8", newline="\n").write("\n".join(rows) + "\n")
+    print("  types: %d enums, %d structs (%d complete)"
+          % (len(ENUMS), len(STRUCTS), sum(1 for t in STRUCTS.values() if t.complete)))
 
 
 def split_params(text):
@@ -181,8 +391,12 @@ def parse_header(path):
 
 
 CONV = re.compile(r"^Conv_(\w+)To(\w+)$")
-CONV_KINDS = {"FString": "Str", "FName": "Name", "FText": "Text", "int": "Int", "int64": "Int64",
-              "float": "Float", "bool": "Bool", "uint8": "Byte", "class UObject*": "Object"}
+CONV_SCALARS = ("FString", "FName", "FText", "int", "int64", "float", "bool", "uint8", "class UObject*")
+CONV_SKIP = ("Conv_RotatorToVector",)      # a rotator is not implicitly a direction
+
+
+def conv_kind(t):
+    return t if t in CONV_SCALARS or t in STRUCTS else None
 # Formatting parameters after the value take these; a Conv_ with any other extra parameter is skipped.
 CONV_DEFAULTS = {"bAlwaysSign": False, "bUseGrouping": False,
                  "MinimumIntegralDigits": 1, "MaximumIntegralDigits": 324}
@@ -200,7 +414,7 @@ def conversions(classes):
             if not (m and is_static and params):
                 continue
             src, dst = params[0][0], ret
-            if src not in CONV_KINDS or dst not in CONV_KINDS or src == dst:
+            if not conv_kind(src) or not conv_kind(dst) or src == dst or fname in CONV_SKIP:
                 continue
             if any(n not in CONV_DEFAULTS for _, n in params[1:]):
                 continue
@@ -215,7 +429,7 @@ def write_conversions(classes, out_dir):
     for (src, dst), (pkg, cls, fn, extra) in sorted(direct.items()):
         args = ", ".join(("true" if a else "false") if isinstance(a, bool) else str(a) for a in extra)
         table.append('  {"from": "%s", "to": "%s", "package": "%s", "class": "%s", "fn": "%s", "extra": [%s]},'
-                     % (CONV_KINDS[src], CONV_KINDS[dst], pkg, cls, fn, args))
+                     % (src, dst, pkg, cls, fn, args))
     table[-1] = table[-1].rstrip(",")
     table.append(']')
     io.open(os.path.join(out_dir, "Conv.json"), "w", encoding="utf-8", newline="\n").write("\n".join(table) + "\n")
@@ -224,29 +438,37 @@ def write_conversions(classes, out_dir):
     for (a, b) in direct:
         if b == "FString":
             reachable.update((a, d) for (s, d) in direct if s == "FString" and d != a)
+    targets = tuple(CONV_STRUCTS) + tuple(sorted(t for (_, t) in reachable if t in STRUCTS))
     out = ["#pragma once",
            "/* Every Kismet Conv_XToY, generated by AssetGen/tools/genueapi.py. Do not edit.",
            "   A struct converts from anything a Conv_ reaches (directly or via FString) with a",
            "   constructor, and to a scalar with an explicit operator: `int(Str)`. */",
            "class UObject;", ""]
-    for t in CONV_STRUCTS:
+    out += ["struct %s;" % t for t in sorted(set(t for pair in reachable for t in pair if t in STRUCTS))]
+    for t in targets:
         members = []
         for (src, dst) in sorted(reachable):
             if dst == t:
-                arg = ("const %s&" % src) if src in CONV_STRUCTS else src
+                arg = ("const %s&" % src) if (src in CONV_STRUCTS or src in STRUCTS) else src
                 members.append("    %s(%s) {}" % (t, arg))
-            elif src == t and dst not in CONV_STRUCTS:
+            elif src == t and dst not in CONV_STRUCTS and dst not in STRUCTS:
                 members.append("    explicit operator %s() const { return {}; }" % dst)
-        out.append("#define UE_CONV_%s \\\n%s" % (t, " \\\n".join(members)))
-        out.append("")
+        if members:
+            out.append("#define UE_CONV_%s \\\n%s" % (t, " \\\n".join(members)))
+            out.append("")
     io.open(os.path.join(out_dir, "Conv.h"), "w", encoding="utf-8-sig", newline="\n").write("\n".join(out))
     print("  conversions: %d direct, %d reachable" % (len(direct), len(reachable)))
+    return set(t for t in targets if t in STRUCTS)
 
 
 def main():
     if len(sys.argv) < 3:
         sys.exit(__doc__.strip().splitlines()[-1])
     sdk_dir, out_dir = sys.argv[1], sys.argv[2]
+
+    for name in sorted(f for f in os.listdir(sdk_dir) if f.endswith("_structs.hpp")):
+        parse_structs(os.path.join(sdk_dir, name), name[: -len("_structs.hpp")])
+    resolve_structs()
 
     headers = sorted(f for f in os.listdir(sdk_dir) if f.endswith("_classes.hpp"))
     classes, totals, pathless = [], dict((k, 0) for k in KINDS), 0
@@ -301,10 +523,24 @@ def main():
     for k in ordered:
         by_pkg.setdefault(k.header, []).append(k)
 
+    for st in STRUCTS.values():
+        by_pkg.setdefault(st.pkg, [])
+    for en in ENUMS.values():
+        by_pkg.setdefault(en.pkg, [])
+
     deps = {}
     for pkg, members in by_pkg.items():
         deps[pkg] = set(by_name[k.base].header for k in members
                         if k.base and by_name[k.base].header != pkg)
+    for st in STRUCTS.values():
+        deps[st.pkg].update(STRUCTS[d].pkg for d in struct_deps(st) if STRUCTS[d].pkg != st.pkg)
+        deps[st.pkg].update(ENUMS[t].pkg for t, _ in st.fields if t in ENUMS and ENUMS[t].pkg != st.pkg)
+    for k in ordered:
+        for t in [t for _, r, _, ps in k.funcs for t in [r] + [pt for pt, _ in ps]] + [t for t, _ in k.fields]:
+            if t in STRUCTS and STRUCTS[t].pkg != k.header:
+                deps[k.header].add(STRUCTS[t].pkg)
+            elif t in ENUMS and ENUMS[t].pkg != k.header:
+                deps[k.header].add(ENUMS[t].pkg)
 
     colour = dict((pkg, 0) for pkg in by_pkg)
 
@@ -324,6 +560,10 @@ def main():
     if not os.path.isdir(out_dir):
         os.makedirs(out_dir)
 
+    conv_structs = write_conversions(ordered, out_dir)
+    ops_by_pkg = write_operators(ordered, out_dir)
+    write_types(out_dir)
+
     def rewrite(ctype):
         m = PTR.match(ctype)
         target = by_name.get(m.group(1)) if m else None
@@ -334,6 +574,21 @@ def main():
         body, referenced = [], set()
         defined = set(k.cpp for k in members)
         ns_open = None
+        for en in sorted((e for e in ENUMS.values() if e.pkg == pkg), key=lambda e: e.cpp):
+            body.append(emit_enum(en) + "\n")
+        placed = set()
+
+        def place_struct(st):
+            if st.cpp in placed:
+                return
+            placed.add(st.cpp)
+            for d in struct_deps(st):
+                if STRUCTS[d].pkg == pkg:
+                    place_struct(STRUCTS[d])
+            body.append(emit_struct(st, conv_structs) + "\n")
+
+        for st in sorted((t for t in STRUCTS.values() if t.pkg == pkg), key=lambda t: t.cpp):
+            place_struct(st)
         for k in members:
             if k.ns != ns_open:
                 if ns_open:
@@ -366,6 +621,8 @@ def main():
             body.append("};\n")
         if ns_open:
             body.append("}   // namespace %s\n" % ns_open)
+
+        body += ops_by_pkg.get(pkg, [])
 
         # An ambiguous name gets no alias, so naming it bare fails to compile instead of resolving
         # to whichever asset was emitted last.
@@ -400,8 +657,6 @@ def main():
         if not os.path.isdir(os.path.dirname(dest)):
             os.makedirs(os.path.dirname(dest))
         io.open(dest, "w", encoding="utf-8-sig", newline="\n").write("\n".join(out))
-
-    write_conversions(ordered, out_dir)
 
     reach = ", ".join("%s %d" % (k, totals[k]) for k in KINDS if totals[k])
     umbrella = ["#pragma once",

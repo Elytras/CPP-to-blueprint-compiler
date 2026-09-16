@@ -17,6 +17,7 @@ public:
     FIndex PackageImport(const std::string& PackageName);
     FIndex EngineClass(const std::string& PackageName, const std::string& ClassName);
     FIndex ScriptStruct(const std::string& PackageName, const std::string& StructName);
+    FIndex Enum(const std::string& PackageName, const std::string& EnumName);
     FIndex EngineFunction(const std::string& PackageName, const std::string& OwningClass,
                           const std::string& FunctionName);
 
