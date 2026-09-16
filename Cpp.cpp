@@ -179,6 +179,7 @@ struct FCallIR
     FIndex Extra;
     FIndex Extra2;
     bool bScript = false;               // callee is Blueprint bytecode
+    bool bInstance = false;             // non-static method: needs the context object, not the class CDO
     FIndex Context;                     // CDO a static call runs against; null = self
     std::string VirtualName;            // a generated class's own instance method: EX_VirtualFunction resolves it by name at run time
     std::shared_ptr<FArgIR> Target;     // the object an instance call runs against; null = self
@@ -186,11 +187,13 @@ struct FCallIR
 };
 
 /* EX_CallMath calls UFunction::Func with the CALLER's frame, which is only correct for a native;
-   a bytecode callee must go through EX_FinalFunction (UFunction::Invoke builds its own frame). */
+   a bytecode callee must go through EX_FinalFunction (UFunction::Invoke builds its own frame).
+   EX_CallMath also runs on the function's outer-class CDO and ignores EX_Context, so it is only
+   right for a static: an instance native on it would run against e.g. Default__FSDGameState. */
 void EmitCallOp(FScript& S, const FCallIR& Call)
 {
     if (!Call.VirtualName.empty()) S.VirtualFunction(Call.VirtualName);
-    else if (Call.bScript) S.FinalFunction(Call.Fn);
+    else if (Call.bScript || Call.bInstance) S.FinalFunction(Call.Fn);
     else S.CallMath(Call.Fn);
 }
 
@@ -1148,6 +1151,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
                                                         : R->CppName + "_C";
         Out.Fn = BP.EngineFunction(CalleePackage, CalleeName, MethodName);
         Out.bScript = CalleePackage.compare(0, 6, "/Game/") == 0;
+        Out.bInstance = !bStatic;
         /* A Blueprint static needs the CDO context; EX_CallMath finds it itself for a native. */
         if (Out.bScript && bStatic)
             Out.Context = BP.ClassDefaultObject(CalleePackage, CalleeName);
