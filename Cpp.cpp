@@ -180,6 +180,8 @@ struct FCallIR
     FIndex Extra2;
     bool bScript = false;               // callee is Blueprint bytecode
     FIndex Context;                     // CDO a static call runs against; null = self
+    std::string VirtualName;            // a generated class's own instance method: EX_VirtualFunction resolves it by name at run time
+    std::shared_ptr<FArgIR> Target;     // the object an instance call runs against; null = self
     std::vector<FArgIR> Args;
 };
 
@@ -187,7 +189,8 @@ struct FCallIR
    a bytecode callee must go through EX_FinalFunction (UFunction::Invoke builds its own frame). */
 void EmitCallOp(FScript& S, const FCallIR& Call)
 {
-    if (Call.bScript) S.FinalFunction(Call.Fn);
+    if (!Call.VirtualName.empty()) S.VirtualFunction(Call.VirtualName);
+    else if (Call.bScript) S.FinalFunction(Call.Fn);
     else S.CallMath(Call.Fn);
 }
 
@@ -198,8 +201,6 @@ struct FStmtIR
     enum EKind
     {
         StaticCall,
-        TargetCall,     // call on the object another call produced
-        SelfCall,
         Assign,
         Decl,
         Return,
@@ -345,12 +346,12 @@ bool EmitArgs(FScript& S, const std::vector<FArgIR>& Args, FIndex SelfExp, std::
 bool EmitCall(FScript& S, const FCallIR& Call, FIndex SelfExp, std::string* Err)
 {
     /* A static call runs against its class's CDO via EX_Context; EX_CallMath finds the CDO itself. */
-    if (Call.Context.V != 0)
+    if (Call.Context.V != 0 || Call.Target)
     {
         bool bOk = true;
         std::string SubErr;
         S.Context(
-            [&](FScript& O) { O.ObjectConst(Call.Context); },
+            [&](FScript& O) { if (Call.Target) EmitArg(O, *Call.Target, SelfExp, &SubErr); else O.ObjectConst(Call.Context); },
             [&](FScript& C)
             {
                 EmitCallOp(C, Call);
@@ -442,18 +443,6 @@ void EmitStmts(const std::vector<FStmtIR>& Stmts, FScript& S, FIndex SelfExp)
     {
         switch (St.K)
         {
-        case FStmtIR::TargetCall:
-            S.Context(
-                [St, SelfExp](FScript& O) { EmitCall(O, St.Target, SelfExp, nullptr); },
-                [St, SelfExp](FScript& C) { C.FinalFunction(St.Call.Fn); EmitArgs(C, St.Call.Args, SelfExp, nullptr); C.EndFunctionParms(); });
-            break;
-
-        case FStmtIR::SelfCall:
-            S.FinalFunction(St.Call.Fn);
-            EmitArgs(S, St.Call.Args, SelfExp, nullptr);
-            S.EndFunctionParms();
-            break;
-
         case FStmtIR::Assign:
         {
             /* Let's PropertyChain owner: the declaring class for a Field, the function for a local. */
@@ -928,6 +917,14 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             if (!Obj) { *Err = "conversion operator with no object"; return false; }
             return LowerArg(*Obj, BP, Out, Err) && ConvertArg(StrKindOf(TypeOf(*N)), BP, Out, Err);
         }
+        const Json* Obj = Callee ? Strip(First(*Callee)) : nullptr;
+        if (!Obj) { *Err = "member call with no object"; return false; }
+        Out.K = FArgIR::Call;
+        Out.Sub = std::make_shared<FCallIR>();
+        if (!LowerCall(*N, BP, *Out.Sub, Err)) return false;
+        if (Kind(*Obj) == "CXXThisExpr") return true;
+        Out.Sub->Target = std::make_shared<FArgIR>();
+        return LowerArg(*Obj, BP, *Out.Sub->Target, Err);
     }
     if (K == "CXXOperatorCallExpr")
     {
@@ -1111,12 +1108,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         auto Decl = R->Methods.find(MethodName);
         const bool bStatic = Decl != R->Methods.end() && IsStaticDecl(*Decl->second);
 
-        if (!R->IsNative() && !bStatic)
-        {
-            *Err = "TODO: unimplemented instance-method call into a generated class: "
-                 + Owner->second + "::" + MethodName;
-            return false;
-        }
+        if (!R->IsNative() && !bStatic) Out.VirtualName = MethodName;
 
         const std::string CalleePackage = R->IsNative() ? R->UePackage
                                                         : ModPackage + "/" + R->CppName;
@@ -1186,26 +1178,11 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
         }
         if (K == "CXXMemberCallExpr")
         {
-            const Json* Member = Strip(First(*S));
-            const Json* Object = Member ? Strip(First(*Member)) : nullptr;
-            const std::string ObjKind = Object ? Kind(*Object) : "<none>";
-
-            if (ObjKind == "CXXThisExpr")
-            {
-                St.K = FStmtIR::SelfCall;
-                bOk = LowerCall(*S, BP, St.Call, Err);
-            }
-            else if (ObjKind == "CallExpr")
-            {
-                St.K = FStmtIR::TargetCall;
-                bOk = LowerCall(*Object, BP, St.Target, Err) && LowerCall(*S, BP, St.Call, Err);
-            }
-            else
-            {
-                *Err = "TODO: unimplemented call target " + ObjKind;
-                bOk = false;
-                return;
-            }
+            /* Same lowering as a call used for its value; the target rides in FCallIR::Target. */
+            FArgIR V;
+            St.K = FStmtIR::StaticCall;
+            bOk = LowerArgRaw(*S, TypeOf(*S), BP, V, Err);
+            if (bOk) St.Call = *V.Sub;
         }
         else if (K == "CallExpr")
         {
