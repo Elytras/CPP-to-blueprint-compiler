@@ -1907,6 +1907,24 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             *Err = R.CppName + "::" + Entry.first + ": " + *Err;
             return false;
         }
+        /*
+        TODO (user-raised 2026-09-16, assetgen optimizer): an optimizer pass over Stmts, here,
+        where lowering and the read hoist are done and nothing is emitted yet. UE_PURE marks the
+        calls it may rewrite:
+        - drop a statement that only calls a pure function, if its arguments make no impure call;
+        - evaluate a pure call repeated with the same arguments once, into a temp local, if no
+          impure call and no write to an argument sits between the two (StringTest's
+          MakeKey(Caption, Count)); a pure getter may read state an impure call changes.
+        Nothing enforces BlueprintPure, and the dump marks functions pure that are not: a fresh
+        object per call (FSDJsonObject::CreateJSONObject), the wall clock (Now, UtcNow),
+        randomness (RandomInteger; RandomIntegerFromStream advances the stream's mutable Seed
+        through a const&). The pass treats a list of those as impure, or it merges two different
+        values into one and drops draws that move a random sequence.
+        The inlining / copy-propagation / constant-folding passes in TODO.md can share this
+        slot. Needs an FCallIR::bPure set in LowerCall beside bStatic and, for engine calls,
+        genueapi.py emitting UE_PURE: it reads only _classes.hpp, and the flags are in the
+        comment above each body in _functions.cpp.
+        */
         /* Locals follow ReturnValue in ChildProperties; the engine tells them apart by CPF_Parm. */
         for (const FPropertyDef& L : Locals) Params.push_back(L);
 
