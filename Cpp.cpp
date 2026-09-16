@@ -687,6 +687,17 @@ private:
     std::map<std::string, std::string> RefAddr;     // VarDecl id -> pointee: `T& R = *P` keeps the address in an int64 local R
     std::map<std::string, Json> RefAlias;           // VarDecl id -> the variable `T& R = V` is another name for; a copy,
                                                     // since a for-init is lowered out of a temporary Json
+    /* A /Game struct the bytecode names only through a member (a view, `P->X`) is not kept loaded: the script
+       reference collector skips property operands (FArchive::operator<<(FField*&) does nothing), and only a
+       property's own type reaches UStruct::ScriptAndPropertyObjectReferences (UStruct::Link), which the GC
+       follows. An unused local of that type keeps it, unless a parm or local already has the type. */
+    std::map<int32, FPropertyDef> KeepLoaded;       // struct import -> its keep-alive local
+    void KeepStructLoaded(FIndex Struct, const std::string& Name, int32 Size)
+    {
+        FPropertyDef PD = StructParam("__Keep" + Name + "__", Struct, Name, Size, 0);
+        PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+        KeepLoaded.emplace(Struct.V, PD);
+    }
 
     /* Post-pass over the IR that turns every `__Read*__(Addr)` sub-expression into a pair of
        statements hoisted to the enclosing statement level:
@@ -1361,6 +1372,12 @@ bool FCompiler::LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& 
         const bool bArrow = MemberNode.value("isArrow", false);
         if (bArrow || IsDerefLvalue(*Bare))
         {
+            if (!R->IsNative())
+            {
+                int32 Size = 0, Align = 0;
+                if (!StructLayout(*R, &Size, &Align, Err)) return false;
+                KeepStructLoaded(Out.Owner, R->CppName, Size);
+            }
             FArgIR Addr;
             std::string Pointee;
             return (bArrow ? LowerArg(*ObjRaw, BP, Addr, Err) : LowerAddress(*Bare, BP, Addr, &Pointee, Err))
@@ -2612,6 +2629,8 @@ bool FCompiler::HoistReadCall(FArgIR& A, const FReadViewSpec& V, FBlueprintClass
     ReadTmp.Value.Sub = std::make_shared<FCallIR>();
     ReadTmp.Value.Sub->Intrinsic = V.DerefIntrinsic;
     ReadTmp.Value.Sub->Extra = BP.ScriptStruct(V.ViewStructPkg, V.ViewStructName);
+    /* ponytail: a mod-owned view is { TArray<T> Data; }, 16 bytes. */
+    if (std::strncmp(V.ViewStructPkg, "/Game/", 6) == 0) KeepStructLoaded(ReadTmp.Value.Sub->Extra, V.ViewStructName, 16);
     OutPre.push_back(ReadTmp);
 
     /* Replace the original read expression with LocalVariable(__DerefTmpN__). */
@@ -2701,6 +2720,7 @@ bool FCompiler::HoistRefAt(FArgIR& A, FBlueprintClass& BP, std::vector<FProperty
     A.Sub->Intrinsic = "__RefAtInline__";
     A.Sub->Extra = BP.ScriptStruct(V->ViewStructPkg, V->ViewStructName);
     A.Sub->View = ViewFieldOf(V->DerefIntrinsic);
+    if (std::strncmp(V->ViewStructPkg, "/Game/", 6) == 0) KeepStructLoaded(A.Sub->Extra, V->ViewStructName, 16);
     return true;
 }
 
@@ -3185,6 +3205,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         RefAddr.clear();
         RefAlias.clear();
         LoopDepth = 0;
+        KeepLoaded.clear();
         if (Fn.Body && !LowerBody(*Fn.Body, BP, Stmts, Locals, Err))
         {
             *Err = R.CppName + "::" + Fn.Name + ": " + *Err;
@@ -3213,6 +3234,12 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         genueapi.py emitting UE_PURE: it reads only _classes.hpp, and the flags are in the
         comment above each body in _functions.cpp.
         */
+        for (const auto& [Struct, Keep] : KeepLoaded)
+        {
+            auto Typed = [&](const FPropertyDef& P) { return P.Type == "StructProperty" && P.Extra.V == Struct; };
+            if (std::none_of(Params.begin(), Params.end(), Typed) && std::none_of(Locals.begin(), Locals.end(), Typed))
+                Locals.push_back(Keep);
+        }
         /* Locals follow ReturnValue in ChildProperties; the engine tells them apart by CPF_Parm. */
         for (const FPropertyDef& L : Locals) Params.push_back(L);
 
