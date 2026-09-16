@@ -26,14 +26,19 @@ struct FPropertyDef
 };
 
 FPropertyDef FloatParam(const std::string& Name, uint64 ExtraFlags = 0);
+FPropertyDef DoubleParam(const std::string& Name, uint64 ExtraFlags = 0);
 FPropertyDef IntParam(const std::string& Name, uint64 ExtraFlags = 0);
 FPropertyDef Int64Param(const std::string& Name, uint64 ExtraFlags = 0);
+FPropertyDef Int8Param(const std::string& Name, uint64 ExtraFlags = 0);
+FPropertyDef UInt32Param(const std::string& Name, uint64 ExtraFlags = 0);
+FPropertyDef UInt64Param(const std::string& Name, uint64 ExtraFlags = 0);
 FPropertyDef BoolParam(const std::string& Name, uint64 ExtraFlags = 0);
 FPropertyDef ByteParam(const std::string& Name, uint64 ExtraFlags = 0);
 FPropertyDef StringParam(const std::string& Name, uint64 ExtraFlags = 0);
 FPropertyDef NameParam(const std::string& Name, uint64 ExtraFlags = 0);
 FPropertyDef TextParam(const std::string& Name, uint64 ExtraFlags = 0);
 FPropertyDef ObjectParam(const std::string& Name, FIndex Class, uint64 ExtraFlags = 0);
+/* PropertyClass = UClass, MetaClass = the subclass filter (`class UClass *X` -> UObject). */
 FPropertyDef ClassParam(const std::string& Name, FIndex ClassClass, FIndex MetaClass, uint64 ExtraFlags = 0);
 FPropertyDef SoftObjectParam(const std::string& Name, FIndex Class, uint64 ExtraFlags = 0);
 FPropertyDef SoftClassParam(const std::string& Name, FIndex ClassClass, FIndex MetaClass, uint64 ExtraFlags = 0);
@@ -112,6 +117,15 @@ public:
                  const std::function<void(FScript&)>& ContextExpr);
 
     void StructConst(FIndex Struct, int32 SerializedSize, const std::function<void(FScript&)>& Members);
+
+    /* Bounds-checked array element deref, guard-free: writes InnerProp.ElementSize bytes from
+       (*ArrayExpr).Data[Index] to the caller's dest. The outer must set MostRecentProperty to an
+       FArrayProperty (StructMember of a TArray field, or LocalVariable of a TArray local). */
+    void ArrayGetByRef(const std::function<void(FScript&)>& ArrayExpr,
+                       const std::function<void(FScript&)>& IndexExpr);
+
+    void IntZero();
+    void IntOne();
 
     void CallMath(FIndex Function);
     void FinalFunction(FIndex Function);
