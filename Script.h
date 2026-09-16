@@ -16,8 +16,9 @@ struct FPropertyDef
     int32 ArrayDim = 1;
     int32 ElementSize = 0;
     uint64 PropertyFlags = 0;
-    FIndex Extra;                       // ObjectProperty: PropertyClass. StructProperty: Struct. ByteProperty: Enum.
+    FIndex Extra;                       // ObjectProperty / SoftObjectProperty: PropertyClass. StructProperty: Struct. ByteProperty: Enum.
     std::string StructName;             // StructProperty: the struct's name, for the default-value tag
+    FIndex Extra2;                      // ClassProperty / SoftClassProperty: MetaClass. Last, so the aggregate inits above it still line up.
 };
 
 FPropertyDef FloatParam(const std::string& Name, uint64 ExtraFlags = 0);
@@ -29,6 +30,9 @@ FPropertyDef StringParam(const std::string& Name, uint64 ExtraFlags = 0);
 FPropertyDef NameParam(const std::string& Name, uint64 ExtraFlags = 0);
 FPropertyDef TextParam(const std::string& Name, uint64 ExtraFlags = 0);
 FPropertyDef ObjectParam(const std::string& Name, FIndex Class, uint64 ExtraFlags = 0);
+FPropertyDef ClassParam(const std::string& Name, FIndex ClassClass, FIndex MetaClass, uint64 ExtraFlags = 0);
+FPropertyDef SoftObjectParam(const std::string& Name, FIndex Class, uint64 ExtraFlags = 0);
+FPropertyDef SoftClassParam(const std::string& Name, FIndex ClassClass, FIndex MetaClass, uint64 ExtraFlags = 0);
 FPropertyDef StructParam(const std::string& Name, FIndex Struct, const std::string& StructName,
                          int32 Size, uint64 ExtraFlags = 0);
 
@@ -66,6 +70,8 @@ public:
     void False();
     void NoObject();
     void ObjectConst(FIndex Object);
+    void SoftObjectConst(const std::string& Path);
+    void DynamicCast(FIndex Class, const std::function<void(FScript&)>& Expr);
 
     /*
     Jump targets are MEMORY offsets, not storage offsets. Forward jump:

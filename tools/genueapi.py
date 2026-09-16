@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """usage: genueapi.py <SDK dir> <output dir>      e.g. DrgMods/SDK/SDK  BpMods/UeApi"""
 import collections
 import io
@@ -14,6 +14,20 @@ CLASS = re.compile(r"^class\s+(?:\w+\([^)]*\)\s+)?((?:\w+::)?\w+)(?:\s+final)?"
 # /Game path is only present when the dump was taken with Dumper-7's FullAssetPaths=1.
 CLASS_COMMENT = re.compile(r"^// (\w+)\s+([\w/\.\-]+)\.(\w+)\s*$")
 PTR = re.compile(r"^(?:const\s+)?class\s+((?:\w+::)?\w+)\s*\*$")
+TPL = re.compile(r"^(?:const\s+)?(TSubclassOf|TSoftObjectPtr|TSoftClassPtr)<class\s+((?:\w+::)?\w+)>\s*&?$")
+
+
+def class_ref(t):
+    """The class a `class X*` or `TWrapper<class X>` spelling names, or None."""
+    m = PTR.match(t) or TPL.match(t)
+    return m.group(m.lastindex) if m else None
+TPL = re.compile(r"^(?:const\s+)?(TSubclassOf|TSoftObjectPtr|TSoftClassPtr)<class\s+((?:\w+::)?\w+)>\s*&?$")
+
+
+def class_ref(t):
+    """The class a `class X*` or `TWrapper<class X>` spelling names, or None."""
+    m = PTR.match(t) or TPL.match(t)
+    return m.group(m.lastindex) if m else None
 FIELD = re.compile(r"^\t([A-Za-z_][\w:<>,\*& ]*?)\s+([A-Za-z_]\w*)\s*(:\s*\d+)?;\s*//")
 INCLUDE = re.compile(r'^#include\s+"(\w+)_classes\.hpp"')
 
@@ -82,6 +96,9 @@ def map_type(raw):
     m = PTR.match(t)
     if m:
         return "class %s*" % m.group(1)
+    m = TPL.match(t)
+    if m:
+        return "%s<class %s>" % (m.group(1), m.group(2))
     m = OUT_PTR.match(t)
     if m:
         inner = map_type(m.group(1))
@@ -565,9 +582,11 @@ def main():
     write_types(out_dir)
 
     def rewrite(ctype):
-        m = PTR.match(ctype)
-        target = by_name.get(m.group(1)) if m else None
-        return "class %s*" % target.emit if target else ctype
+        target = by_name.get(class_ref(ctype) or "")
+        if not target:
+            return ctype
+        m = TPL.match(ctype)
+        return "%s<class %s>" % (m.group(1), target.emit) if m else "class %s*" % target.emit
 
     funcs, fields, aliased = 0, 0, 0
     for pkg, members in sorted(by_pkg.items()):
@@ -606,18 +625,16 @@ def main():
                     continue
                 body.append("    %s %s;" % (rewrite(ftype), fname))
                 fields += 1
-                m = PTR.match(ftype)
-                if m:
-                    referenced.add(m.group(1))
+                if class_ref(ftype):
+                    referenced.add(class_ref(ftype))
             for is_static, ret, fname, params in k.funcs:
                 args = ", ".join("%s %s" % (rewrite(t), n) for t, n in params)
                 body.append("    %s%s %s(%s);"
                             % ("static " if is_static else "", rewrite(ret), fname, args))
                 funcs += 1
                 for t in [ret] + [t for t, _ in params]:
-                    m = PTR.match(t)
-                    if m:
-                        referenced.add(m.group(1))
+                    if class_ref(t):
+                        referenced.add(class_ref(t))
             body.append("};\n")
         if ns_open:
             body.append("}   // namespace %s\n" % ns_open)

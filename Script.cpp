@@ -1,5 +1,7 @@
 ﻿#include "Script.h"
 
+#include <map>
+
 #include <cstring>
 
 namespace Uasset
@@ -86,7 +88,19 @@ void WriteZeroValueTag(FArc& Ar, const FPropertyDef& P)
         else if (P.Type == "ByteProperty") V.U8(0);
         else if (P.Type == "NameProperty") V.Name("None");
         else if (P.Type == "TextProperty") { V.U32(0); V.U8(0xFF); V.I32(0); }   // flags, ETextHistoryType::None, no invariant string
-        else if (P.Type == "StructProperty") TagEnd(V);
+        else if (P.Type == "StructProperty")
+        {
+            /* A struct with a native Serialize writes raw bytes, not tags; a zero of ElementSize
+               bytes is its default. Box / Box2D serialize IsValid as one byte, so they are shorter. */
+            static const std::map<std::string, int32> Native = {
+                { "Vector", 12 }, { "Vector2D", 8 }, { "Vector4", 16 }, { "Rotator", 12 }, { "Quat", 16 },
+                { "Plane", 16 }, { "Matrix", 64 }, { "Color", 4 }, { "LinearColor", 16 }, { "IntPoint", 8 },
+                { "IntVector", 12 }, { "Guid", 16 }, { "DateTime", 8 }, { "Timespan", 8 }, { "Box", 25 },
+                { "Box2D", 17 }, { "BoxSphereBounds", 28 }, { "FrameNumber", 4 } };
+            auto N = Native.find(P.StructName);
+            if (N == Native.end()) TagEnd(V);
+            else for (int32 i = 0; i < N->second; ++i) V.U8(0);
+        }
     }, P.StructName);
 }
 
