@@ -406,10 +406,11 @@ static const FReadViewSpec kReadViews[] = {
        FString local produces an owned copy that DestroyStruct cleans up on return. */
     { "__ReadString__", "__DerefReadStr__", "FString",         "/Script/Engine", "AssetManagerSearchRules"      },
     /* FText view: no engine ScriptStruct has TArray<FText> at offset 0, so ReadProperty.cpp
-       cooks its own FDerefTextView { TArray<FText> Data; } in the same package. Package path
-       is the ASSET path (<mod>/<asset>), matching how FDeref imports itself. Same deep-copy
-       pattern as FString - FTextProperty::CopySingleValue is an FText operator= that shares the
-       TSharedRef refcount, so DestroyStruct cleans up on return. */
+       declares its own FDerefTextView { TArray<FText> Data; } which AssetGen cooks as a sibling
+       .uasset in the ReadProperty mod folder. Blueprint.cpp:81 registers it on CallImports so
+       its script init preloads before any bytecode referencing it. Same deep-copy pattern as
+       FString: FTextProperty::CopySingleValue is an FText operator= that shares the TSharedRef
+       refcount, so DestroyStruct cleans up on return. */
     { "__ReadText__",   "__DerefReadText__", "FText",           "/Game/_ElytrasMods/ReadProperty/FDerefTextView", "FDerefTextView" },
 };
 
