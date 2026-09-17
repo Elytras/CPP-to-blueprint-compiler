@@ -717,6 +717,8 @@ private:
     bool Generate(const FRecord& R, const std::string& OutDir, std::string* Err);
     bool GenerateStruct(const FRecord& R, const std::string& OutDir, std::string* Err);
     bool GenerateEnum(const std::string& Name, const std::string& OutDir, std::string* Err);
+    /* A namespace-scope `UMyDef MD_Big = { .Health = 500 };`: an instance of a UE class as its own package. */
+    bool GenerateAsset(const Json& Var, const std::string& OutDir, std::string* Err);
     bool TypeToProperty(const std::string& QualType, const std::string& PName, uint64 ExtraFlags,
                         const std::string& Where, FBlueprintClass& BP, FPropertyDef* Out, std::string* Err);
     bool LayoutOf(const std::string& QualType, int32* Size, int32* Align, std::string* Err);
@@ -906,6 +908,7 @@ private:
     }
     std::string CurrentWco;                           // its WorldContext* parm when it is a static, else empty
     std::vector<FRegistryAsset> RegistryRows;
+    std::vector<const Json*> AssetDecls;        // namespace-scope variables brace-initialized, see GenerateAsset
     std::map<std::string, std::vector<std::pair<std::string, int64>>> ModEnums;  // UE_ENUM cooked here: enumerators
 
     /* Per-function state reset in Generate: whether this function needs the FDeref scratch
@@ -1243,6 +1246,7 @@ bool FCompiler::Collect(std::string* Err)
             return;
         }
         if (Kind(N) == "VarDecl" && Name(N) == "UeModPackage") FindLiteral(N, ModPackage);
+        if (Kind(N) == "VarDecl" && First(N) && Kind(*First(N)) == "InitListExpr") AssetDecls.push_back(&N);
         if (Kind(N) == "EnumDecl")
         {
             int64 Next = 0;
@@ -4638,9 +4642,9 @@ std::string StripTypeKeywords(std::string T)
 
 /* A member initializer becomes PD.Default, which the CDO / struct default instance writes. It must
    be a literal the member's own type can hold (optionally negated), nullptr, or an argless ctor. */
-bool LowerDefault(const Json& F, FPropertyDef& PD, std::string* Err)
+bool LowerDefault(const Json& F, FPropertyDef& PD, std::string* Err, const Json* Init = nullptr)
 {
-    const Json* Init = Strip(First(F));
+    Init = Strip(Init ? Init : First(F));
     if (!Init) return true;
     std::string K = Kind(*Init);
     const bool bNeg = K == "UnaryOperator" && Init->value("opcode", std::string()) == "-";
@@ -4968,6 +4972,61 @@ bool FCompiler::GenerateEnum(const std::string& Name, const std::string& OutDir,
     if (!P.Save(OutDir + "/" + Name, Err)) return false;
     RegistryRows.push_back({ PackageName, Name, "UserDefinedEnum" });
     printf("  %-14s -> %s.uasset  (enum, %d enumerators)\n", Name.c_str(), Name.c_str(), int32(ModEnums[Name].size()));
+    return true;
+}
+
+/* Measured on ED_Spider_Grunt. The initializer's semantic form lists the bases first, then every field in order,
+   so a designator is found by position. Only a field the braces name is written: the rest stay the CDO's. */
+bool FCompiler::GenerateAsset(const Json& Var, const std::string& OutDir, std::string* Err)
+{
+    const FRecord* R = Find(StripTypeKeywords(TypeOf(Var)));
+    if (!R || R->bIsStruct || (R->UeName.empty() && !R->IsGenerated())) return true;    // a plain C++ aggregate
+    Cur = nullptr;
+
+    const std::string AssetName = Name(Var);
+    const std::string PackageName = ModPackage + "/" + AssetName;
+    FPackage P(PackageName);
+    StampIdentity(P, PackageName);
+    FBlueprintClass BP(P, AssetName, "", "", false);
+
+    /* What clang writes for a member the braces leave out; an aggregate member (TArray) is a list of those. */
+    std::function<bool(const Json&)> Unset = [&](const Json& E) {
+        const std::string K = Kind(E);
+        if (K == "ImplicitValueInitExpr" || K == "CXXDefaultInitExpr") return true;
+        if (K == "CXXConstructExpr") return !First(E);
+        if (K != "InitListExpr") return false;
+        bool bAll = true;
+        ForEach(E, [&](const Json& C) { bAll = bAll && Unset(C); });
+        return bAll;
+    };
+    std::function<bool(const Json&, const FRecord&)> Fill = [&](const Json& List, const FRecord& Rec) {
+        size_t I = 0;
+        if (!Rec.Base.empty())
+        {
+            const FRecord* B = Find(Rec.Base);
+            const Json* Sub = Nth(List, I++);
+            if (B && Sub && Kind(*Sub) == "InitListExpr" && !Fill(*Sub, *B)) return false;
+        }
+        I += Rec.Interfaces.size();
+        for (const Json* F : Rec.Fields)
+        {
+            const Json* Init = Strip(Nth(List, I++));
+            if (!Init || Unset(*Init)) continue;
+            FPropertyDef PD;
+            if (!TypeToProperty(TypeOf(*F), Name(*F), 0, AssetName + "." + Name(*F), BP, &PD, Err)) return false;
+            if (!LowerDefault(*F, PD, Err, Init)) return false;
+            BP.AddVariable(PD);
+        }
+        return true;
+    };
+    if (!Fill(*First(Var), *R)) return false;
+
+    const std::string ClassPkg = R->IsNative() ? R->UePackage : ModPackage + "/" + R->CppName;
+    const std::string ClassName = R->IsNative() ? R->UeName : R->CppName + "_C";
+    BP.FinishAsset(BP.EngineClass(ClassPkg, ClassName), BP.ClassDefaultObject(ClassPkg, ClassName));
+    if (!P.Save(OutDir + "/" + AssetName, Err)) return false;
+    RegistryRows.push_back({ PackageName, AssetName, ClassName });
+    printf("  %-14s -> %s.uasset  (asset, a %s)\n", AssetName.c_str(), AssetName.c_str(), R->CppName.c_str());
     return true;
 }
 
@@ -5593,7 +5652,9 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         if (!GenerateEnum(Entry.first, OutDir, Err)) return false;
         ++Generated;
     }
-    if (Generated == 0) { *Err = "the source declares no UE_STRUCT, UE_ENUM or class deriving from a UE class"; return false; }
+    for (const Json* Var : AssetDecls)
+        if (!GenerateAsset(*Var, OutDir, Err)) return false;
+    if (Generated == 0 && RegistryRows.empty()) { *Err = "the source declares no UE_STRUCT, UE_ENUM or class deriving from a UE class"; return false; }
     if (!GenerateNestedWrappers(OutDir, Err)) return false;
 
     /* A cooked package carries no registry data; without the bake the classes are invisible to it. */

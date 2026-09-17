@@ -379,6 +379,31 @@ void FBlueprintClass::FinishStruct(const uint32 (&Guid)[4])
     P.AddExport(std::move(S));
 }
 
+/* Measured on DRG's ED_Spider_Grunt: one Public | Standalone | Transactional export, the class and its CDO
+   as serialize-before-create edges, only the tags that differ from the CDO, then the lazy-object guid flag. */
+void FBlueprintClass::FinishAsset(FIndex Class, FIndex ClassCdo)
+{
+    ClassRow = 0;
+
+    FExport A;
+    A.ClassIndex = Class;
+    A.TemplateIndex = ClassCdo;
+    A.ObjectName = ClassName;
+    A.ObjectFlags = RF_Public | RF_Standalone | RF_Transactional;
+    A.bIsAsset = true;
+    A.SerBeforeCreate = { Class.V, ClassCdo.V };
+    for (const FPropertyDef& V : Vars)
+        if (V.Extra.V != 0) A.CreateBeforeSer.push_back(V.Extra.V);      // a user-defined enum / struct the tag names
+
+    const std::vector<FPropertyDef> Set = Vars;
+    A.Serialize = [=](FArc& Ar) {
+        for (const FPropertyDef& V : Set) WriteDefaultTag(Ar, V);
+        TagEnd(Ar);
+        Ar.Bool(false);
+    };
+    P.AddExport(std::move(A));
+}
+
 /* Measured on DRG's ENU_TextCase: the tags (the editor's DisplayNameMap), no GUID, then UEnum::Names as
    (FName, int64) pairs ending in the _MAX entry, then CppForm 1 (Namespaced). Nothing outside WITH_EDITOR
    reads the names' shape, so they are the C++ ones rather than the editor's NewEnumeratorN.

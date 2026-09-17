@@ -63,6 +63,9 @@ public:
     /* Writes the package as one UserDefinedEnum export: <ClassName>::<Enumerator> = value, then <ClassName>_MAX. */
     void FinishEnum(const std::vector<std::pair<std::string, int64>>& Enumerators);
 
+    /* Writes the package as one instance of Class (a data asset): a tag per AddVariable(), each holding its Default. */
+    void FinishAsset(FIndex Class, FIndex ClassCdo);
+
     FIndex ClassIndex() const { return Exp(ClassRow); }
 
 private:
