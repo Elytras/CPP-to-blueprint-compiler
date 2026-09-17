@@ -213,6 +213,21 @@ def no_inline_ufunctions():
 
 
 no_inline_ufunctions()
+check('InlineTest', 'InPlace', lambda V: V * 3 + 1 + V + 1, [dict(V=v) for v in (-3, 0, 7)])
+
+
+def inline_in_place():
+    import re, subprocess
+    base = asset('InlineTest')
+    names = [e['name'] for e in dumpexp.load(base)[5]]
+    walk = lambda fn: subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'walkscript.py'),
+                                      base, str(names.index(fn))], capture_output=True, text=True).stdout
+    assert not re.search(r'__Inl\d+_A\b', walk('InPlace')), walk('InPlace')
+    assert re.search(r'__Inl\d+_A\b', walk('KeptLocal')), walk('KeptLocal')
+    print('ok  InlineTest: an argument read once goes in place, a late read keeps its local')
+
+
+inline_in_place()
 check('InlineTest', 'ConstThenVar', lambda V: 6 + V * 2 + clamp(V, 0, 5) + clamp(2, V, 9) + 4 + V - 1, [dict(V=v) for v in (-3, 0, 4, 12)])
 
 

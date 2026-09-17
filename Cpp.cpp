@@ -767,6 +767,8 @@ private:
     void NormalizePointers(Json& N) const;
     bool IsDerefLvalue(const Json& N) const;
     bool IsEagerSafe(const Json& N) const;
+    void ArgumentsInPlace(std::vector<FStmtIR>& Body, const std::vector<std::string>& Binds, const Json& Def,
+                          const std::vector<std::string>& BindIds, std::vector<FPropertyDef>& Locals);
     const FReadViewSpec* ViewFor(const std::string& Pointee) const;
     bool LowerAddress(const Json& Lvalue, FBlueprintClass& BP, FArgIR& Out, std::string* Pointee, std::string* Err);
     bool ReadThrough(FArgIR Addr, const std::string& Pointee, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
@@ -3823,6 +3825,149 @@ bool OnlyRead(const Json& N, const std::string& Id)
     return bOk;
 }
 
+/* Every reference to Id only reads it: a copy (LValueToRValue, a copy construction) or a const view. A mutating method,
+   a member access, `&`, or a non-const reference argument all fail. */
+bool OnlyReadValue(const Json& N, const std::string& Id)
+{
+    bool bOk = true;
+    std::function<void(const Json&, const Json*)> Walk = [&](const Json& X, const Json* Parent) {
+        if (!bOk || !X.is_object()) return;
+        if (Kind(X) == "DeclRefExpr" && X.contains("referencedDecl") && X["referencedDecl"].value("id", std::string()) == Id)
+        {
+            const std::string PK = Parent ? Kind(*Parent) : "";
+            const std::string Cast = Parent ? Parent->value("castKind", std::string()) : "";
+            const std::string To = Parent && Parent->contains("type") ? (*Parent)["type"].value("qualType", std::string()) : "";
+            bOk = (PK == "ImplicitCastExpr" && (Cast == "LValueToRValue" || (Cast == "NoOp" && To.compare(0, 6, "const ") == 0)))
+               || PK == "CXXConstructExpr";
+        }
+        ForEach(X, [&](const Json& C) { Walk(C, &X); });
+    };
+    Walk(N, nullptr);
+    return bOk;
+}
+
+namespace
+{
+/* How many times a statement list or expression names a variable, stores included. */
+int32 Mentions(const std::vector<FStmtIR>& Stmts, const std::string& Name);
+int32 Mentions(const FArgIR& A, const std::string& Name);
+int32 Mentions(const FCallIR& C, const std::string& Name)
+{
+    int32 N = (C.InlineResult == Name) + (C.View == Name) + (C.Inline ? Mentions(*C.Inline, Name) : 0) + (C.Target ? Mentions(*C.Target, Name) : 0);
+    for (const FArgIR& A : C.Args) N += Mentions(A, Name);
+    return N;
+}
+int32 Mentions(const FArgIR& A, const std::string& Name)
+{
+    return (A.S == Name) + (A.Sub ? Mentions(*A.Sub, Name) : 0) + (A.Base ? Mentions(*A.Base, Name) : 0);
+}
+int32 Mentions(const std::vector<FStmtIR>& Stmts, const std::string& Name)
+{
+    int32 N = 0;
+    for (const FStmtIR& St : Stmts)
+    {
+        N += Mentions(St.Target, Name) + Mentions(St.Call, Name) + Mentions(St.Var, Name);
+        for (const FArgIR* A : { &St.Value, &St.Cond, &St.SwitchValue }) N += Mentions(*A, Name);
+        for (const FArgIR& A : St.CaseTests) N += Mentions(A, Name);
+        for (const auto* L : { &St.Then, &St.Else, &St.Body, &St.Inc, &St.Trailer }) if (*L) N += Mentions(**L, Name);
+    }
+    return N;
+}
+
+/* The read of local Name that runs exactly once whenever A does: not under a branch's later operands, an inline
+   body, an object or struct base (which may need a variable), or a call's target. */
+FArgIR* FindPlainRead(FArgIR& A, const std::string& Name)
+{
+    if (A.K == FArgIR::Local && A.S == Name && !A.Base) return &A;
+    if (A.K != FArgIR::Call || !A.Sub || A.Sub->Inline) return nullptr;
+    const size_t Count = IsBranch(A.Sub->Intrinsic) ? std::min<size_t>(1, A.Sub->Args.size()) : A.Sub->Args.size();
+    for (size_t I = 0; I < Count; ++I)
+        if (FArgIR* F = FindPlainRead(A.Sub->Args[I], Name)) return F;
+    return nullptr;
+}
+
+bool Contains(const FArgIR& A, const FArgIR* M)
+{
+    if (&A == M) return true;
+    if (A.Base && Contains(*A.Base, M)) return true;
+    if (!A.Sub) return false;
+    if (A.Sub->Target && Contains(*A.Sub->Target, M)) return true;
+    return std::any_of(A.Sub->Args.begin(), A.Sub->Args.end(), [&](const FArgIR& X) { return Contains(X, M); });
+}
+
+/* Everything A evaluates besides the path down to M satisfies Pred. The calls on the path run after M. */
+bool OffPath(const FArgIR& A, const FArgIR* M, const std::function<bool(const FArgIR&)>& Pred)
+{
+    if (&A == M) return true;
+    if (!Contains(A, M)) return Pred(A);
+    if (A.Sub && A.Sub->Target && !OffPath(*A.Sub->Target, M, Pred)) return false;
+    if (A.Sub) for (const FArgIR& X : A.Sub->Args) if (!OffPath(X, M, Pred)) return false;
+    return true;
+}
+
+/* Reads no variable and calls only pure functions of such: nothing an argument's side effects could change. */
+bool ReadsNothing(const FArgIR& A)
+{
+    switch (A.K)
+    {
+    case FArgIR::Int: case FArgIR::Int64: case FArgIR::Float: case FArgIR::Bool: case FArgIR::Byte: case FArgIR::Str:
+    case FArgIR::Name: case FArgIR::Text: case FArgIR::Self: case FArgIR::NullObj: case FArgIR::ObjConst: case FArgIR::SoftPath:
+        return true;
+    case FArgIR::Call:
+        return A.Sub && A.Sub->bPure && A.Sub->Intrinsic.empty() && !A.Sub->Inline && (!A.Sub->Target || ReadsNothing(*A.Sub->Target))
+            && std::all_of(A.Sub->Args.begin(), A.Sub->Args.end(), ReadsNothing);
+    default:
+        return false;
+    }
+}
+}   // namespace
+
+/* `inline void Say(FString Msg) { Post(Msg); }`: the argument goes where Msg is read instead of into a local first.
+   Only for a parameter read once, by value, in the body's first statement, and only when running the argument there
+   instead of before the body cannot be seen: what that statement evaluates besides the path to the read is pure, and
+   when the argument itself acts, reads no variable either. Later parameters must have gone the same way, or their
+   arguments would now run first. Binds[i] is the local of the i-th bind statement at the front of Body. */
+void FCompiler::ArgumentsInPlace(std::vector<FStmtIR>& Body, const std::vector<std::string>& Binds, const Json& Def,
+                                 const std::vector<std::string>& BindIds, std::vector<FPropertyDef>& Locals)
+{
+    for (size_t K = Binds.size(); K-- > 0;)
+    {
+        if (Body.size() <= K + 1 || Body.size() - K - 1 < 1) return;
+        const std::string& Name = Binds[K];
+        FStmtIR& First = Body[K + 1];
+        if (!OnlyReadValue(Def, BindIds[K])) return;
+        const std::vector<FStmtIR> Rest(Body.begin() + K + 1, Body.end());
+        if (Mentions(Rest, Name) != 1) return;
+
+        FArgIR* Read = nullptr;
+        FArgIR* Scope = nullptr;
+        if (First.K == FStmtIR::StaticCall && !First.Target.Target && First.Target.Args.empty())
+        {
+            for (FArgIR& A : First.Call.Args) if (!Read && (Read = FindPlainRead(A, Name))) Scope = &A;
+        }
+        else if ((First.K == FStmtIR::Assign || First.K == FStmtIR::Decl || First.K == FStmtIR::Return) && !First.Var.Base)
+            Read = FindPlainRead(*(Scope = &First.Value), Name);
+        else if (First.K == FStmtIR::If)
+            Read = FindPlainRead(*(Scope = &First.Cond), Name);
+        if (!Read) return;
+
+        const FArgIR& Arg = Body[K].Value;
+        const bool bActs = CallsImpure(Arg);
+        const std::function<bool(const FArgIR&)> Pred = [&](const FArgIR& X) { return bActs ? ReadsNothing(X) : !CallsImpure(X); };
+        bool bOk = OffPath(*Scope, Read, Pred);
+        if (First.K == FStmtIR::StaticCall)
+        {
+            if (First.Call.Target) bOk = bOk && Pred(*First.Call.Target);
+            for (const FArgIR& A : First.Call.Args) if (&A != Scope) bOk = bOk && Pred(A);
+        }
+        if (!bOk) return;
+
+        *Read = Arg;
+        Body.erase(Body.begin() + K);
+        Locals.erase(std::remove_if(Locals.begin(), Locals.end(), [&](const FPropertyDef& L) { return L.Name == Name; }), Locals.end());
+    }
+}
+
 bool FCompiler::IsInlineMethod(const FRecord& R, const std::string& Method) const
 {
     auto Decl = R.Methods.find(Method);
@@ -3871,6 +4016,7 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
     /* Parameters, in order against the call's arguments (inner[0] is the callee). */
     std::vector<const Json*> Parms, Args;
     ForEach(Def, [&](const Json& C) { if (Kind(C) == "ParmVarDecl") Parms.push_back(&C); });
+    std::vector<std::string> Binds, BindIds;
     bool bFirst = true;
     ForEach(CallNode, [&](const Json& C) { if (bFirst) { bFirst = false; return; } Args.push_back(&C); });
     if (Args.size() != Parms.size()) { *Err = "inline call to " + Method + " with " + std::to_string(Args.size()) + " arguments"; return false; }
@@ -3902,6 +4048,8 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
         Bind.Var.LetOp = LetOpFor(Type);
         Bind.bAssignLocal = true;
         B.Body->push_back(std::move(Bind));
+        Binds.push_back(Local);
+        BindIds.push_back(Id);
         LocalRename[Id] = Local;
     }
 
@@ -3939,6 +4087,7 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
 
     /* A return that is the body's last statement already falls through to the end. */
     if (!B.Body->empty() && B.Body->back().K == FStmtIR::InlineReturn) B.Body->pop_back();
+    ArgumentsInPlace(*B.Body, Binds, Def, BindIds, Locals);
     Out.Intrinsic = "__Inline__";
     Out.Inline = Block;
     return true;
