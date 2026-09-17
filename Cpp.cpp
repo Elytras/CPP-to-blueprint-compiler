@@ -766,6 +766,7 @@ private:
     bool IsRawPointer(std::string QualType) const;
     void NormalizePointers(Json& N) const;
     bool IsDerefLvalue(const Json& N) const;
+    bool IsEagerSafe(const Json& N) const;
     const FReadViewSpec* ViewFor(const std::string& Pointee) const;
     bool LowerAddress(const Json& Lvalue, FBlueprintClass& BP, FArgIR& Out, std::string* Pointee, std::string* Err);
     bool ReadThrough(FArgIR Addr, const std::string& Pointee, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
@@ -1949,6 +1950,54 @@ bool FCompiler::HasDerefStruct(std::string* Err) const
     return false;
 }
 
+/* Whether evaluating N can neither fault nor do anything: then `L && N` may run both sides, as one BooleanAND.
+   Literals, locals, parameters and self's fields; arithmetic, comparisons and bitwise operators on those; division
+   only by a non-zero literal. Not a call, a dereference, `Obj->Field` (a null Obj logs Accessed None), an index, or
+   an address-holding reference local. */
+bool FCompiler::IsEagerSafe(const Json& N) const
+{
+    const std::string K = Kind(N);
+    auto Sub = [&](size_t I) { const Json* C = Nth(N, I); return C && IsEagerSafe(*C); };
+    if (K == "IntegerLiteral" || K == "FloatingLiteral" || K == "CXXBoolLiteralExpr" || K == "CXXNullPtrLiteralExpr") return true;
+    if (K == "ParenExpr") return Sub(0);
+    if (K == "ImplicitCastExpr")
+    {
+        const std::string Cast = N.value("castKind", std::string());
+        return Cast != "UserDefinedConversion" && Cast != "ConstructorConversion" && Sub(0);
+    }
+    if (K == "DeclRefExpr")
+    {
+        const Json& D = N["referencedDecl"];
+        const std::string DK = D.value("kind", std::string());
+        return DK == "EnumConstantDecl" || ((DK == "VarDecl" || DK == "ParmVarDecl") && !RefAddr.count(D.value("id", std::string())));
+    }
+    if (K == "MemberExpr")
+    {
+        const Json* Base = Strip(First(N));
+        if (!Base) return false;
+        if (N.value("isArrow", false)) return Kind(*Base) == "CXXThisExpr";
+        return Sub(0);
+    }
+    if (K == "UnaryOperator")
+    {
+        const std::string Op = N.value("opcode", std::string());
+        return (Op == "!" || Op == "-" || Op == "~" || Op == "+") && Sub(0);
+    }
+    if (K == "BinaryOperator")
+    {
+        static const std::set<std::string> Ops = { "==", "!=", "<", ">", "<=", ">=", "+", "-", "*", "&", "|", "^",
+                                                   "<<", ">>", "&&", "||" };
+        const std::string Op = N.value("opcode", std::string());
+        if (Op == "/" || Op == "%")
+        {
+            const Json* Rhs = Strip(Nth(N, 1));
+            return Rhs && Kind(*Rhs) == "IntegerLiteral" && Rhs->value("value", std::string("0")) != "0" && Sub(0);
+        }
+        return Ops.count(Op) && Sub(0) && Sub(1);
+    }
+    return false;
+}
+
 /* `*P`, `P[i]` on a raw pointer, `__PtrCast__<T&>(A)`, and a reference local that keeps an address. */
 bool FCompiler::IsDerefLvalue(const Json& N) const
 {
@@ -2707,14 +2756,22 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         if (Op == "&&" || Op == "||")
         {
             /* Short-circuit: the hoist pass turns this into `T = L; if (T) T = R;` (or `if (!T)`), so R's calls
-               and reads only run when C++ would run them. Never fold it into BooleanAND / BooleanOR, not even for a
-               pure R: those are ordinary calls whose operands are both evaluated first, and a pure R still faults
-               (`A && *A`, `X != 0 && 10 / X`, an out-of-range Get). FlowTest SafeRatio / EitherZero / WhileAnd
-               divide by zero in runscript if either side runs eagerly. */
+               and reads only run when C++ would run them. BooleanAND / BooleanOR evaluate both operands first, so
+               they are used only when IsEagerSafe proves R harmless: "pure" is not enough (`A && *A`,
+               `X != 0 && 10 / X`, an out-of-range Get). FlowTest SafeRatio / EitherZero / WhileAnd divide by zero
+               in runscript if the right side runs eagerly. */
             Out.K = FArgIR::Call;
             Out.InnerType = "bool";
             Out.Sub = std::make_shared<FCallIR>();
-            Out.Sub->Intrinsic = Op == "&&" ? "__AndAlso__" : "__OrElse__";
+            if (IsEagerSafe(*RhsRaw))
+            {
+                /* Nothing on the right can fault or act, so running it anyway is unobservable: one native call
+                   instead of a temp, a store and a jump. */
+                Out.Sub->Fn = BP.EngineFunction("/Script/Engine", "KismetMathLibrary", Op == "&&" ? "BooleanAND" : "BooleanOR");
+                Out.Sub->bScript = false;
+            }
+            else
+                Out.Sub->Intrinsic = Op == "&&" ? "__AndAlso__" : "__OrElse__";
             for (const Json* Side : { LhsRaw, RhsRaw })
             {
                 FArgIR A;
@@ -3502,6 +3559,17 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             const Json* Then = Nth(*S, 1);
             const Json* Else = Nth(*S, 2);
             if (!Cond || !Then) { *Err = "`if` with a missing condition or then-branch"; bOk = false; return; }
+
+            /* `if (A && B) S` with no else is `if (A) if (B) S`: two jumps, no temp, no call, whatever B is. With an
+               else, the else would be duplicated, so that one goes through the && lowering. */
+            if (const Json* And = Strip(Cond); !Else && Kind(*And) == "BinaryOperator" && And->value("opcode", std::string()) == "&&")
+            {
+                Json Inner = { {"kind", "IfStmt"}, {"inner", Json::array({ *Nth(*And, 1), *Then })} };
+                Json Outer = { {"kind", "IfStmt"}, {"inner", Json::array({ *Nth(*And, 0), Inner })} };
+                Json Wrap = { {"kind", "CompoundStmt"}, {"inner", Json::array({ Outer })} };
+                if (!LowerBody(Wrap, BP, Out, Locals, Err)) bOk = false;
+                return;
+            }
 
             St.K = FStmtIR::If;
             if (!LowerArg(*Cond, BP, St.Cond, Err)) { bOk = false; return; }

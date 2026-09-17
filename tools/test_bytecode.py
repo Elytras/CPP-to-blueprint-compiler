@@ -347,6 +347,14 @@ def optimizer():
     assert 'Multiply_IntInt' not in w and 'Add_IntInt' not in w and 'Kept' in w and 'RandomInteger' in w, w
     print('ok  OptTest: unused pure calls dropped, used ones kept')
     print('ok  OptTest.Locals: unread locals dropped, the property store and the impure call kept')
+    cdiv = lambda a, b: abs(a) // abs(b) * (1 if (a < 0) == (b < 0) else -1)
+    check('OptTest', 'Logic', lambda X, Y: (1 if X != 0 and cdiv(10, X) > 2 else 0) + (2 if X != 0 and Y != 0 else 0)
+          + (10 if X > 0 and cdiv(Y, 2) > 0 else 0) + (100 if X == 0 or Y == 0 else 0),
+          [dict(X=x, Y=y) for x in (0, 3, -4, 20) for y in (0, 1, 5)])
+    w = walk('Logic')
+    assert w.count('BooleanAND') == 1 and w.count('BooleanOR') == 1, w
+    assert '__Branch' not in w, w
+    print('ok  OptTest.Logic: harmless && / || fold into one call, a guard if nests')
 
 
 optimizer()
