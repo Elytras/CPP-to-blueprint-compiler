@@ -337,7 +337,7 @@ struct FCallIR
     bool bScript = false;               // callee is Blueprint bytecode
     bool bInstance = false;             // non-static method: needs the context object, not the class CDO
     FIndex Context;                     // CDO a static call runs against; null = self
-    bool bPure = false;                 // a function of its arguments (UE_PURE, a Kismet operator or conversion): see OptimizePure
+    bool bPure = false;                 // a function of its arguments (UE_PURE, a Kismet operator or conversion): see DropUnusedPure
     std::string VirtualName;            // a generated class's own instance method: EX_VirtualFunction resolves it by name at run time
     bool bLocalVirtual = false;         // ... as EX_LocalVirtualFunction: a script function that is no RPC
     std::string View;                   // __RefAtInline__: the TArray field of the view struct in Extra
@@ -782,8 +782,7 @@ private:
        The original sub-expression is replaced with LocalVariable(__DerefTmpN__). One
        __DerefScratch__ FDeref local is added per function on first use; the prologue seeds
        its Num=1 so ArrayGetByRef's bounds check passes. */
-    bool OptimizePure(std::vector<FStmtIR>& Stmts, FBlueprintClass& BP, std::vector<FPropertyDef>& Locals, std::string* Err);
-    int32 PureTmpCounter = 0;
+    void DropUnusedPure(std::vector<FStmtIR>& Stmts);
     bool HoistReadsInList(std::vector<FStmtIR>& Stmts, FBlueprintClass& BP,
                           std::vector<FPropertyDef>& Locals, std::string* Err);
     bool HoistReadsInStmt(FStmtIR& St, FBlueprintClass& BP,
@@ -2834,215 +2833,45 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
 
 namespace
 {
-/* What a pure call's value depends on, and whether evaluating an expression can change anything. */
-struct FPureFacts
+/* Whether evaluating an expression can change anything: a call that is not bPure, an intrinsic, a delegate. */
+bool CallsImpure(const FArgIR& A);
+bool CallsImpure(const FCallIR& C)
 {
-    bool bImpure = false;               // a call that is not bPure, an intrinsic, a delegate, a write
-    bool bReadsSelf = false;            // a property of self, or a method that may read one
-    std::set<std::string> Names;        // locals and properties it reads
-};
-
-void Facts(const FArgIR& A, FPureFacts& F);
-void Facts(const FCallIR& C, FPureFacts& F)
-{
-    if (!C.bPure || !C.Intrinsic.empty() || C.Inline) F.bImpure = true;
-    if (!C.VirtualName.empty() || C.bInstance) F.bReadsSelf = true;
-    if (C.Target) Facts(*C.Target, F);
-    for (const FArgIR& A : C.Args) Facts(A, F);
+    if (!C.bPure || !C.Intrinsic.empty() || C.Inline) return true;
+    if (C.Target && CallsImpure(*C.Target)) return true;
+    return std::any_of(C.Args.begin(), C.Args.end(), [](const FArgIR& A) { return CallsImpure(A); });
 }
-void Facts(const FArgIR& A, FPureFacts& F)
+bool CallsImpure(const FArgIR& A)
 {
     switch (A.K)
     {
-    case FArgIR::Local: case FArgIR::LocalOut: F.Names.insert(A.S); break;
-    case FArgIR::Field: F.Names.insert(A.S); if (!A.Base) F.bReadsSelf = true; break;
-    case FArgIR::Call: if (A.Sub) Facts(*A.Sub, F); else F.bImpure = true; return;
-    case FArgIR::Delegate: case FArgIR::InterfaceCtx: case FArgIR::LatentInfo: case FArgIR::StructLit: F.bImpure = true; break;
+    case FArgIR::Call: return !A.Sub || CallsImpure(*A.Sub);
+    case FArgIR::Delegate: case FArgIR::InterfaceCtx: case FArgIR::LatentInfo: case FArgIR::StructLit: return true;
     default: break;
     }
-    if (A.Base) Facts(*A.Base, F);
-    if (A.K == FArgIR::Index && A.Sub) for (const FArgIR& I : A.Sub->Args) Facts(I, F);
-}
-
-std::string KeyOf(const FArgIR& A);
-std::string KeyOf(const FCallIR& C)
-{
-    std::string K = "call " + std::to_string(C.Fn.V) + " " + C.VirtualName + " " + std::to_string(C.Context.V) + " ("
-                  + (C.Target ? KeyOf(*C.Target) : std::string("self"));
-    for (const FArgIR& A : C.Args) K += ", " + KeyOf(A);
-    return K + ")";
-}
-std::string KeyOf(const FArgIR& A)
-{
-    char Num[64];
-    snprintf(Num, sizeof(Num), "%d %lld %a %d", A.I, (long long)A.I64, double(A.F), int(A.B));
-    std::string K = std::to_string(int(A.K)) + "[" + Num + " " + A.S + " " + std::to_string(A.Owner.V) + " " + A.InnerType;
-    if (A.Sub) K += " " + KeyOf(*A.Sub);
-    if (A.Base) K += " of " + KeyOf(*A.Base);
-    return K + "]";
-}
-
-/* Offers each pure call in A with no impure argument to OnCall, outermost first; one OnCall replaces is not descended
-   into. Nodes on the way are copied, since lowering shares them between statements. */
-void VisitPure(FArgIR& A, const std::function<bool(FArgIR&)>& OnCall)
-{
-    if (A.K == FArgIR::Call && A.Sub)
-    {
-        FPureFacts F;
-        Facts(A, F);
-        if (!F.bImpure && A.Sub->Intrinsic.empty() && !A.InnerType.empty() && OnCall(A)) return;
-        A.Sub = std::make_shared<FCallIR>(*A.Sub);
-        if (A.Sub->Target) { A.Sub->Target = std::make_shared<FArgIR>(*A.Sub->Target); VisitPure(*A.Sub->Target, OnCall); }
-        for (FArgIR& Arg : A.Sub->Args) VisitPure(Arg, OnCall);
-        return;
-    }
-    if (A.Base) { A.Base = std::make_shared<FArgIR>(*A.Base); VisitPure(*A.Base, OnCall); }
-    if (A.K == FArgIR::Index && A.Sub)
-    {
-        A.Sub = std::make_shared<FCallIR>(*A.Sub);
-        for (FArgIR& Arg : A.Sub->Args) VisitPure(Arg, OnCall);
-    }
-}
-
-/* The variable a statement writes, root first; null when it is not a plain Local / Field path. */
-const FArgIR* WrittenRoot(const FArgIR& Var)
-{
-    const FArgIR* V = &Var;
-    while ((V->K == FArgIR::Index || V->K == FArgIR::Member) && V->Base) V = V->Base.get();
-    return V->K == FArgIR::Local || V->K == FArgIR::LocalOut || V->K == FArgIR::Field ? V : nullptr;
+    if (A.Base && CallsImpure(*A.Base)) return true;
+    return A.K == FArgIR::Index && A.Sub
+        && std::any_of(A.Sub->Args.begin(), A.Sub->Args.end(), [](const FArgIR& I) { return CallsImpure(I); });
 }
 }   // namespace
 
 /*
-The optimizer the TODO in Generate describes, as far as a straight run of statements: a StaticCall of a pure function
-whose arguments do nothing is dropped, and a pure call repeated with the same arguments is evaluated once. The value
-is kept in the variable the first call was assigned to whole, or in a new local computed just before it. A statement
-that calls anything impure, or is not a plain assignment / call / return / if, ends every reuse; a write to a property
-of self ends the ones that read self (a pure method may); a write to a local ends the ones that read it or keep their
-value in it. Nested bodies start over.
+Drops a statement that only calls a pure function whose arguments call nothing impure: its value is unused, so
+the call does nothing. Repeated pure calls are left alone; a C++ local already says "compute this once".
 */
-bool FCompiler::OptimizePure(std::vector<FStmtIR>& Stmts, FBlueprintClass& BP, std::vector<FPropertyDef>& Locals, std::string* Err)
+void FCompiler::DropUnusedPure(std::vector<FStmtIR>& Stmts)
 {
-    struct FSeen
-    {
-        std::string Key;
-        FPureFacts Facts;
-        size_t Stmt = 0;                    // where it is first computed
-        FArgIR Holder;                      // what holds its value, once a reuse needed one
-        bool bHeld = false;
-        bool bIntoVar = false;              // Stmts[Stmt] assigns exactly this call to a Local or a property of self
-    };
-    std::vector<FSeen> Seen;
     for (size_t I = 0; I < Stmts.size(); ++I)
     {
         for (auto* L : { &Stmts[I].Then, &Stmts[I].Else, &Stmts[I].Body, &Stmts[I].Inc, &Stmts[I].Trailer })
             if (*L)
             {
                 *L = std::make_shared<std::vector<FStmtIR>>(**L);
-                if (!OptimizePure(**L, BP, Locals, Err)) return false;
+                DropUnusedPure(**L);
             }
-        const FStmtIR::EKind SK = Stmts[I].K;
-        if (SK != FStmtIR::Assign && SK != FStmtIR::Decl && SK != FStmtIR::StaticCall && SK != FStmtIR::Return && SK != FStmtIR::If)
-        { Seen.clear(); continue; }
-
-        FPureFacts All;
-        if (SK == FStmtIR::StaticCall) Facts(Stmts[I].Call, All);
-        for (const FArgIR* A : { &Stmts[I].Value, &Stmts[I].Cond }) Facts(*A, All);
-        if (SK == FStmtIR::Assign) Facts(Stmts[I].Var, All);
-        if ((SK == FStmtIR::Assign || (SK == FStmtIR::Decl && Stmts[I].bHasValue)) && !WrittenRoot(Stmts[I].Var)) All.bImpure = true;
-        if (SK == FStmtIR::StaticCall && !All.bImpure)
-        {
-            Stmts.erase(Stmts.begin() + I);
-            --I;
-            continue;
-        }
-        if (All.bImpure) { Seen.clear(); continue; }
-
-        std::vector<std::pair<size_t, FStmtIR>> Inserts;
-        bool bFailed = false;
-        auto OnCall = [&](FArgIR& C) {
-            if (bFailed) return false;
-            const std::string Key = KeyOf(C);
-            auto It = std::find_if(Seen.begin(), Seen.end(), [&](const FSeen& S) { return S.Key == Key; });
-            if (It == Seen.end())
-            {
-                FSeen S;
-                S.Key = Key;
-                Facts(C, S.Facts);
-                S.Stmt = I;
-                const FStmtIR& Here = Stmts[I];
-                S.bIntoVar = (Here.K == FStmtIR::Assign || Here.K == FStmtIR::Decl) && &C == &Here.Value
-                          && (Here.Var.K == FArgIR::Local || (Here.Var.K == FArgIR::Field && !Here.Var.Base))
-                          && !S.Facts.Names.count(Here.Var.S);
-                Seen.push_back(std::move(S));
-                return false;
-            }
-            if (It->Stmt == I) return false;          // twice in one statement: left alone
-            if (!It->bHeld)
-            {
-                FStmtIR& First = Stmts[It->Stmt];
-                if (It->bIntoVar)
-                {
-                    It->Holder = First.Var;
-                    It->Holder.InnerType = C.InnerType;
-                }
-                else
-                {
-                    const std::string Tmp = "__Pure" + std::to_string(PureTmpCounter++) + "__";
-                    FPropertyDef PD;
-                    if (!TypeToProperty(C.InnerType, Tmp, 0, "a reused pure call", BP, &PD, Err)) { bFailed = true; return false; }
-                    PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
-                    Locals.push_back(PD);
-                    FStmtIR Compute;
-                    Compute.K = FStmtIR::Assign;
-                    Compute.Var.K = FArgIR::Local;
-                    Compute.Var.S = Tmp;
-                    Compute.Var.LetOp = LetOpFor(C.InnerType);
-                    Compute.Var.InnerType = C.InnerType;
-                    Compute.bAssignLocal = true;
-                    Compute.Value = C;
-                    It->Holder = Compute.Var;
-                    bool bDone = false;
-                    for (FArgIR* A : { &First.Value, &First.Cond })
-                        VisitPure(*A, [&](FArgIR& N) {
-                            if (bDone || KeyOf(N) != Key) return false;
-                            N = It->Holder;
-                            bDone = true;
-                            return true;
-                        });
-                    Inserts.emplace_back(It->Stmt, std::move(Compute));
-                    It->Facts.Names.insert(Tmp);
-                }
-                It->bHeld = true;
-            }
-            C = It->Holder;
-            return true;
-        };
-        for (FArgIR* A : { &Stmts[I].Value, &Stmts[I].Cond }) VisitPure(*A, OnCall);
-        if (bFailed) return false;
-
-        /* What this statement writes, after the reads above: the VM evaluates the value before the Let. */
-        const FStmtIR& Now = Stmts[I];
-        if (Now.K == FStmtIR::Assign || (Now.K == FStmtIR::Decl && Now.bHasValue))
-        {
-            const FArgIR* Root = WrittenRoot(Now.Var);
-            const bool bSelf = Root->K == FArgIR::Field;
-            Seen.erase(std::remove_if(Seen.begin(), Seen.end(), [&](const FSeen& S) {
-                if (S.Stmt == I && S.bIntoVar) return false;      // it just stored its value there
-                return S.Facts.Names.count(Root->S) || (bSelf && S.Facts.bReadsSelf)
-                    || (S.bHeld && S.Holder.S == Root->S) || (S.bIntoVar && !S.bHeld && Stmts[S.Stmt].Var.S == Root->S);
-            }), Seen.end());
-        }
-
-        std::sort(Inserts.begin(), Inserts.end(), [](const auto& A, const auto& B) { return A.first > B.first; });
-        for (auto& Insert : Inserts)
-        {
-            Stmts.insert(Stmts.begin() + Insert.first, std::move(Insert.second));
-            for (FSeen& S : Seen) if (S.Stmt >= Insert.first) ++S.Stmt;
-            ++I;
-        }
+        if (Stmts[I].K != FStmtIR::StaticCall) continue;
+        if (!CallsImpure(Stmts[I].Call)) Stmts.erase(Stmts.begin() + I--);
     }
-    return true;
 }
 
 /* A generated event's name, <Stem>_<N>: found by name on self, so not a function of the class or an ancestor. */
@@ -4739,30 +4568,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             *Err = R.CppName + "::" + Fn.Name + ": " + *Err;
             return false;
         }
-        if (!OptimizePure(Stmts, BP, Locals, Err))
-        {
-            *Err = R.CppName + "::" + Fn.Name + ": " + *Err;
-            return false;
-        }
-        /*
-        DONE in part (OptimizePure, below): the drop and the reuse, within a run of plain statements.
-        TODO (user-raised 2026-09-16, assetgen optimizer): an optimizer pass over Stmts, here,
-        where lowering and the read hoist are done and nothing is emitted yet. UE_PURE marks the
-        calls it may rewrite:
-        - drop a statement that only calls a pure function, if its arguments make no impure call;
-        - evaluate a pure call repeated with the same arguments once, into a temp local, if no
-          impure call and no write to an argument sits between the two (StringTest's
-          MakeKey(Caption, Count)); a pure getter may read state an impure call changes.
-        Nothing enforces BlueprintPure, and the dump marks functions pure that are not: a fresh
-        object per call (FSDJsonObject::CreateJSONObject), the wall clock (Now, UtcNow),
-        randomness (RandomInteger; RandomIntegerFromStream advances the stream's mutable Seed
-        through a const&). The pass treats a list of those as impure, or it merges two different
-        values into one and drops draws that move a random sequence.
-        The inlining / copy-propagation / constant-folding passes in TODO.md can share this
-        slot. Needs an FCallIR::bPure set in LowerCall beside bStatic and, for engine calls,
-        genueapi.py emitting UE_PURE: it reads only _classes.hpp, and the flags are in the
-        comment above each body in _functions.cpp.
-        */
+        DropUnusedPure(Stmts);
         for (const auto& [Struct, Keep] : KeepLoaded)
         {
             auto Typed = [&](const FPropertyDef& P) { return P.Type == "StructProperty" && P.Extra.V == Struct; };
