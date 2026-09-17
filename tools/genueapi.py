@@ -574,14 +574,23 @@ FUNC_BITS = {"Final": 0x1, "RequiredAPI": 0x2, "BlueprintAuthorityOnly": 0x4, "B
              "Const": 0x40000000, "NetValidate": 0x80000000}
 
 
+# BlueprintPure in the dump but not a function of its arguments: two calls must stay two calls, and a discarded one
+# may still move a random stream or build an object.
+IMPURE_PURE = re.compile(r"Random|Now$|Today$|Create|Construct|Spawn|^New|^Make.*Object|Seed")
+PURE = set()     # (class, function) of every BlueprintPure function, filled by write_events
+
+
 def write_events(sdk_dir, out_dir):
     """Events.json: "Package.Class.Function" -> EFunctionFlags of every BlueprintEvent, the functions a Blueprint
-    overrides or implements. The compiler copies part of these onto the override (KismetCompiler.cpp)."""
+    overrides or implements. The compiler copies part of these onto the override (KismetCompiler.cpp).
+    Also collects PURE."""
     rows = []
     for name in sorted(f for f in os.listdir(sdk_dir) if f.endswith("_functions.cpp")):
         text = io.open(os.path.join(sdk_dir, name), encoding="utf-8", errors="replace").read()
         for m in re.finditer(r"^// Function ([\w\.]+)\n// \(([^)]*)\)", text, re.M):
             names = m.group(2).split(", ")
+            if "BlueprintPure" in names:
+                PURE.add(tuple(m.group(1).split(".")[-2:]))
             if "BlueprintEvent" in names:
                 rows.append('  "%s": %d' % (m.group(1), sum(FUNC_BITS[n] for n in names)))
     io.open(os.path.join(out_dir, "Events.json"), "w", encoding="utf-8", newline="\n").write("{\n" + ",\n".join(rows) + "\n}\n")
@@ -796,10 +805,15 @@ def main():
                     if inner and "," not in inner and " " in inner:
                         variants += [(inner.rsplit(" ", 1)[0], [p for p in v if p is not dele[0]])
                                      for r, v in variants if r == "void" and not any(p[0] in latent for p in v)]
+                # UE_PURE lets AssetGen drop a discarded call and reuse a repeated one; a function that answers through
+                # a reference parameter is left unmarked.
+                pure = ((k.ue_name, fname) in PURE and not IMPURE_PURE.search(fname)
+                        and not any(t.endswith("&") and not t.startswith("const ") for t, _ in params))
                 for vret, plist in variants:
                     args = ", ".join("%s %s" % (rewrite(t), n) for t, n in plist)
-                    body.append("    %s%s %s(%s)%s;" % ("static " if is_static else "", rewrite(vret), fname, args,
-                                                         " const" if fname in k.const_funcs else ""))
+                    body.append("    %s%s%s %s(%s)%s;" % ("UE_PURE " if pure else "", "static " if is_static else "",
+                                                           rewrite(vret), fname, args,
+                                                           " const" if fname in k.const_funcs else ""))
                 funcs += 1
                 for t in [ret] + [t for t, _ in params]:
                     referenced.update(class_refs(t))

@@ -315,3 +315,21 @@ def nested():
 
 import subprocess
 nested()
+
+
+def optimizer():
+    def reuse(A, B):
+        z = (A + 1) * B
+        return A * B + (A * B + 2) + z + (1 if (A + 1) * B > 10 else 0)
+    check('OptTest', 'Reuse', reuse, [dict(A=a, B=b) for a, b in ((2, 3), (4, 5), (0, 0), (-3, 7))])
+    check('OptTest', 'Temp', lambda A, B: (A - B) * 3 + (A - B) * 5, [dict(A=a, B=b) for a, b in ((2, 3), (9, 1), (0, 0))])
+    base = asset('OptTest')
+    names = [e['name'] for e in dumpexp.load(base)[5]]
+    walk = lambda fn: subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'walkscript.py'),
+                                      base, str(names.index(fn))], capture_output=True, text=True).stdout
+    assert walk('Reuse').count('Multiply_IntInt') == 2 and 'Abs_Int' not in walk('Reuse'), walk('Reuse')
+    assert walk('Temp').count('Subtract_IntInt') == 1, walk('Temp')
+    print('ok  OptTest: pure calls dropped and reused')
+
+
+optimizer()
