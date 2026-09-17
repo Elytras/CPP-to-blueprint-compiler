@@ -399,6 +399,11 @@ def parse_field(cur, m, skipped):
         skipped[mapped if mapped in KINDS else "other"] += 1
         return
     cur.fields.append((mapped, fname))
+    # Dumper-7's flag comment: `Net` marks a replicated property; our fork appends `RepNotifyFunc=<Function>`.
+    flags = m.string[m.end():]
+    if re.search(r"\bNet\b", flags):
+        notify = re.search(r"RepNotifyFunc=(\w+)", flags)
+        cur.replicated[fname] = notify.group(1) if notify else ""
 
 
 class Klass(object):
@@ -415,6 +420,7 @@ class Klass(object):
         self.const_funcs = set()
         self.raw_funcs = []      # (return, name, params) as Dumper-7 spelled them, before any mapping
         self.fields = []
+        self.replicated = {}     # field -> its RepNotify function, "" when none (or the dump predates the name)
 
 
 def parse_header(path):
@@ -781,6 +787,10 @@ def main():
                 if fname in names:
                     continue
                 body.append("    %s %s;" % (rewrite(ftype), fname))
+                if fname in k.replicated:
+                    # What UE_REPLICATED_USING declares for a mod class: AssetGen wakes the actor before a set and
+                    # calls the RepNotify function after it, as the editor's Set node does.
+                    body.append('    static constexpr const char* %s__Replicated = "%s:";' % (fname, k.replicated[fname]))
                 fields += 1
                 referenced.update(class_refs(ftype))
             for is_static, ret, fname, params in k.funcs:

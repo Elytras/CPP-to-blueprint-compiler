@@ -238,6 +238,10 @@ def replication():
     begin = [(op, a) for op, a in ops if op in ('FinalFunction', 'LetBool', 'Let')]
     assert [x[0] for x in begin] == ['FinalFunction', 'LetBool', 'FinalFunction', 'Let', 'Let'], begin
     assert sum('FlushNetDormancy' in x[1] for x in begin) == 2, begin
+    # On another object: its FlushNetDormancy and OnRep; a native replicated property (Actor.bReplicateMovement) only wakes.
+    rows = [re.split(r'\s+', l.split(' mem ')[-1].strip(), maxsplit=2) for l in tool('walkscript.py', exports.index('SetOther')).splitlines() if ' mem ' in l]
+    seq = [(r[2] if r[1] == 'FinalFunction' else r[1]) for r in rows if len(r) > 1 and r[1] in ('FinalFunction', 'LetBool', 'Let', 'VirtualFunction')]
+    assert seq == ["imp[6]:Function'FlushNetDormancy'", 'LetBool', 'VirtualFunction', 'Let', "imp[6]:Function'FlushNetDormancy'", 'LetBool'], seq
     print('ok  ReplTest: replicated properties, RPC flags, OnRep after a set')
 
 

@@ -721,11 +721,14 @@ private:
                       FCallIR& Out, std::string* Err);
     std::map<std::string, const Json*> FreeInlines;                     // decl id -> an inline free function's definition
                                                                         // (a template's: each instantiation)
-    /* A variable of the class being generated that has a RepNotify function, or empty. */
-    std::string RepNotifyFor(const std::string& Field) const
+    /* The class a field access `Obj->Field` / `Field` reads from: Obj's static type, or the class being generated. */
+    const FRecord* RecordOfFieldAccess(const Json& MemberNode) const
     {
-        auto It = RepNotifyOf.find(Field);
-        return It == RepNotifyOf.end() ? std::string() : It->second;
+        const Json* Base = Strip(First(MemberNode));
+        if (!Base || Kind(*Base) == "CXXThisExpr") return Cur;
+        std::string T = StripTypeKeywords(TypeOf(*Base));
+        while (!T.empty() && (T.back() == '*' || T.back() == ' ')) T.pop_back();
+        return Find(T);
     }
     std::string LocalName(const Json& Decl) const
     {
@@ -832,9 +835,6 @@ private:
     std::map<std::string, int64> EnumValues;          // clang EnumConstantDecl id -> value
     std::map<std::string, uint32> EventFlags;         // UeApi/Events.json: "Package.Class.Function" -> EFunctionFlags
     std::map<std::string, FIndex> CurSignatures;      // Generate: dispatcher name -> its signature function export
-    std::map<std::string, std::string> RepNotifyOf;   // Generate: replicated variable -> its RepNotify function
-    std::set<std::string> ReplicatedOf;               // Generate: the replicated variables of the class and its mod ancestors
-    bool bCurIsActor = false;                         // Generate: the class derives from AActor
     const FConv* FindConv(const std::string& From, const std::string& To) const;
     const FOpInfo* FindOp(const std::string& Op, const std::string& Lhs, const std::string& Rhs) const;
     void ApplyConv(const FConv& C, FBlueprintClass& BP, FArgIR& Arg);
@@ -3203,8 +3203,9 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
         if (!S) return;
 
         FStmtIR St;
-        std::string CallRepNotify;                      // an assignment to a RepNotify variable of self
-        std::string SetOfSelf;                          // the property of self the statement assigns, if any
+        const FRecord* SetOn = nullptr;                 // an assignment to a property: the class it is read from,
+        std::string SetField;                           // the property,
+        std::shared_ptr<FArgIR> SetObject;              // and the object, null for self
         const std::string K = Kind(*S);
         if (K == "DeclStmt")
         {
@@ -3374,7 +3375,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             {
                 St.K = FStmtIR::Assign;
                 bOk = LowerField(*Lhs, BP, St.Var, Err) && LowerArg(*Rhs, BP, St.Value, Err);
-                if (bOk && !St.Var.Base) { CallRepNotify = RepNotifyFor(St.Var.S); SetOfSelf = St.Var.S; }
+                if (bOk) { SetOn = RecordOfFieldAccess(*Lhs); SetField = St.Var.S; SetObject = St.Var.Base; }
             }
             else if (LK == "DeclRefExpr")
             {
@@ -3403,8 +3404,8 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 if (bOk && St.Call.Args[0].K != FArgIR::Field && St.Call.Args[0].K != FArgIR::Local
                     && St.Call.Args[0].K != FArgIR::LocalOut && St.Call.Args[0].K != FArgIR::Member)
                 { *Err = "`[]` on a map needs a map variable, not a computed value"; bOk = false; }
-                if (bOk && St.Call.Args[0].K == FArgIR::Field && !St.Call.Args[0].Base)
-                { CallRepNotify = RepNotifyFor(St.Call.Args[0].S); SetOfSelf = St.Call.Args[0].S; }
+                if (bOk && St.Call.Args[0].K == FArgIR::Field && Strip(Nth(*Lhs, 1)) && Kind(*Strip(Nth(*Lhs, 1))) == "MemberExpr")
+                { SetOn = RecordOfFieldAccess(*Strip(Nth(*Lhs, 1))); SetField = St.Call.Args[0].S; SetObject = St.Call.Args[0].Base; }
             }
             else if (LK == "CXXOperatorCallExpr")
             {
@@ -3416,7 +3417,8 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 { const FArgIR Element = *St.Var.Base; St.Var = Element; }
                 if (St.Var.K != FArgIR::Index)
                 { *Err = "TODO: assignment to an operator call that is not an array element"; bOk = false; return; }
-                if (St.Var.Base->K == FArgIR::Field && !St.Var.Base->Base) { CallRepNotify = RepNotifyFor(St.Var.Base->S); SetOfSelf = St.Var.Base->S; }
+                if (St.Var.Base->K == FArgIR::Field && Strip(Nth(*Lhs, 1)) && Kind(*Strip(Nth(*Lhs, 1))) == "MemberExpr")
+                { SetOn = RecordOfFieldAccess(*Strip(Nth(*Lhs, 1))); SetField = St.Var.Base->S; SetObject = St.Var.Base->Base; }
                 St.bAssignLocal = St.Var.Base->K == FArgIR::Local;
                 St.bAssignOutParm = St.Var.Base->K == FArgIR::LocalOut;
                 bOk = LowerArg(*Rhs, BP, St.Value, Err);
@@ -3660,27 +3662,44 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             bOk = false;
             return;
         }
-        if (bOk && bCurIsActor && ReplicatedOf.count(SetOfSelf))
+        /* The editor's Set node on a replicated variable (FKCHandler_VariableSet::Transform): on an Actor it calls
+           FlushNetDormancy on the object first, or a dormant actor never sends the change; after the write it calls the
+           RepNotify function, but only for a property a Blueprint class declares (PropertyHasLocalRepNotify: native
+           ones are meant for clients). Its MarkPropertyDirtyFromRepIndex is left out: push model is compiled out of
+           DRG. The replicated properties of engine and game classes come from UeApi's `<Field>__Replicated`. */
+        std::string Notify;
+        bool bFlush = false;
+        if (bOk && SetOn)
         {
-            /* The editor's Set node on a replicated variable of an Actor wakes it first (FKCHandler_VariableSet::Transform
-               calls AActor::FlushNetDormancy before the write), or a dormant actor never sends the change. Its
-               MarkPropertyDirtyFromRepIndex after the write is left out: push model is compiled out of DRG. */
+            bool bActor = false;
+            for (const FRecord* A = SetOn; A; A = A->Base.empty() ? nullptr : Find(A->Base))
+                if (A->UeName == "Actor") bActor = true;
+            for (const FRecord* A = SetOn; A; A = A->Base.empty() ? nullptr : Find(A->Base))
+                if (auto Rep = A->Replicated.find(SetField); Rep != A->Replicated.end())
+                {
+                    bFlush = bActor;
+                    if (!A->IsNative() || A->UePackage.compare(0, 6, "/Game/") == 0) Notify = Rep->second.substr(0, Rep->second.find(':'));
+                    break;
+                }
+        }
+        if (bFlush)
+        {
             FStmtIR Flush;
             Flush.K = FStmtIR::StaticCall;
             Flush.Call.Fn = BP.EngineFunction("/Script/Engine", "Actor", "FlushNetDormancy");
             Flush.Call.bInstance = true;
+            Flush.Call.Target = SetObject;
             Out.push_back(std::move(Flush));
         }
         if (bOk) Out.push_back(St);
-        if (bOk && !CallRepNotify.empty())
+        if (!Notify.empty())
         {
-            /* The editor's Set node on a RepNotify variable calls the function after the write (K2Node_VariableSet),
-               so a listen-server host runs it too; clients run it when the value replicates. */
-            FStmtIR Notify;
-            Notify.K = FStmtIR::StaticCall;
-            Notify.Call.VirtualName = CallRepNotify;
-            Notify.Call.bLocalVirtual = true;       // validated as the class's own method
-            Out.push_back(std::move(Notify));
+            FStmtIR Call;
+            Call.K = FStmtIR::StaticCall;
+            Call.Call.VirtualName = Notify;
+            Call.Call.Target = SetObject;
+            Call.Call.bLocalVirtual = !SetObject;
+            Out.push_back(std::move(Call));
         }
     });
     return bOk;
@@ -4656,10 +4675,6 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         if (!A->UeName.empty()) Ancestry.push_back(A->UeName);
 
     const bool bIsActor = std::find(Ancestry.begin(), Ancestry.end(), "Actor") != Ancestry.end();
-    bCurIsActor = bIsActor;
-    ReplicatedOf.clear();
-    for (const FRecord* A = &R; A; A = A->Base.empty() ? nullptr : Find(A->Base))
-        for (const auto& [Var, Spec] : A->Replicated) ReplicatedOf.insert(Var);
     BP.SetIsActor(bIsActor);
     BP.SetClassFlags(ClassFlagsFor(Ancestry));
 
@@ -4709,7 +4724,6 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
        Measured on MOD_Proxy_SpawnEnemy: flags BlueprintEvent | BlueprintCallable | Delegate | Public, an
        empty body, listed in Children and FuncMap like any function. */
     CurSignatures.clear();
-    RepNotifyOf.clear();
     bool bReplicatesAnything = false;
     for (const Json* F : R.Fields)
     {
@@ -4767,7 +4781,6 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 { *Err = R.CppName + "::" + FieldName + ": its RepNotify " + Notify + " must be a method of the class taking no parameters"; return false; }
                 PD.PropertyFlags |= CPF_RepNotify;
                 PD.RepNotify = Notify;
-                RepNotifyOf[FieldName] = Notify;
             }
             static const char* const Conditions[] = { "None", "InitialOnly", "OwnerOnly", "SkipOwner", "SimulatedOnly",
                 "AutonomousOnly", "SimulatedOrPhysics", "InitialOrOwner", "Custom", "ReplayOrOwner", "ReplayOnly",
