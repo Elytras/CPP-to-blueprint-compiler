@@ -597,6 +597,34 @@ bool EmitArgs(FScript& S, const std::vector<FArgIR>& Args, FIndex SelfExp, std::
 bool EmitCall(FScript& S, const FCallIR& Call, FIndex SelfExp, std::string* Err)
 {
     if (Call.Intrinsic == "__AwaitPoint__") { S.ResumeSinks.push_back(Call.Resume); return true; }
+    if (Call.Intrinsic == "__Asm__")
+    {
+        if (Call.Args.empty() || Call.Args[0].K != FArgIR::Str)
+        { if (Err) *Err = "__Asm__: first argument must be a string literal of hex bytes"; return false; }
+        const std::string& Hex = Call.Args[0].S;
+        std::vector<uint8> Bytes;
+        Bytes.reserve(Hex.size() / 2);
+        auto Nib = [](char C) { return C <= '9' ? C - '0' : (C | 0x20) - 'a' + 10; };
+        int32 Half = -1;    // the high nibble waiting for its low nibble
+        for (char C : Hex)
+        {
+            if (C == ' ' || C == '\t' || C == '\n' || C == '\r' || C == ',' || C == '_') continue;
+            if (!std::isxdigit(uint8(C)))
+            { if (Err) *Err = std::string("__Asm__: not a hex character: '") + C + "'"; return false; }
+            if (Half < 0) Half = Nib(C);
+            else { Bytes.push_back(uint8((Half << 4) | Nib(C))); Half = -1; }
+        }
+        if (Half >= 0) { if (Err) *Err = "__Asm__: odd number of hex digits"; return false; }
+        int32 MemBytes = int32(Bytes.size());
+        if (Call.Args.size() >= 2)
+        {
+            if (Call.Args[1].K != FArgIR::Int)
+            { if (Err) *Err = "__Asm__: MemBytes must be an integer literal"; return false; }
+            MemBytes = Call.Args[1].I;
+        }
+        S.Raw(Bytes.data(), Bytes.size(), MemBytes);
+        return true;
+    }
     /* A dispatcher operation: Args[0] is the dispatcher, then the delegate or the broadcast's arguments. */
     const bool bAdd = Call.Intrinsic == "__AddDelegate__", bRemove = Call.Intrinsic == "__RemoveDelegate__";
     if (bAdd || bRemove || Call.Intrinsic == "__ClearDelegate__" || Call.Intrinsic == "__Broadcast__")
@@ -2937,6 +2965,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
             Out.Extra = BP.ScriptStruct("/Script/Engine", "ScreenMessageString");
         }
         else if (MethodName == "__RefAt__") {}   // resolved by HoistRefAt
+        else if (MethodName == "__Asm__") {}     // bytes and MemBytes ride in Out.Args
         else if (MethodName == "__Await__") return LowerAwait(CallExprNode, BP, Out, Err);
         else if (FindReadView(MethodName))
         {

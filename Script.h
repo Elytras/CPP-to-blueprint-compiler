@@ -78,6 +78,9 @@ public:
     explicit FScript(FPackage* InPkg) : Ar(InPkg) {}
 
     void Op(EExprToken Token);
+    /* Bytes appended verbatim; MemBytes is what jumps step over. The __Asm__ escape hatch is this
+       primitive with a hex-decoded buffer. */
+    void Raw(const void* Bytes, size_t StorageBytes, int32 MemBytes);
     void Self();
     void Nothing();
     void Return();

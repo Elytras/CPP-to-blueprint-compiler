@@ -357,6 +357,12 @@ void FScript::Op(EExprToken Token)
     Memory += 1;
 }
 
+void FScript::Raw(const void* Bytes, size_t StorageBytes, int32 MemBytes)
+{
+    Ar.Raw(Bytes, StorageBytes);
+    Memory += MemBytes;
+}
+
 void FScript::Self() { Op(EX_Self); }
 void FScript::Nothing() { Op(EX_Nothing); }
 void FScript::EndOfScript() { Op(EX_EndOfScript); }
