@@ -339,6 +339,7 @@ struct FCallIR
     FIndex Context;                     // CDO a static call runs against; null = self
     std::string VirtualName;            // a generated class's own instance method: EX_VirtualFunction resolves it by name at run time
     std::string View;                   // __RefAtInline__: the TArray field of the view struct in Extra
+    std::shared_ptr<int32> Resume;      // __AwaitPoint__: receives the ubergraph offset the awaited event re-enters at
     std::shared_ptr<FArgIR> Target;     // the object an instance call runs against; null = self
     std::vector<FArgIR> Args;
 };
@@ -580,6 +581,7 @@ bool EmitArgs(FScript& S, const std::vector<FArgIR>& Args, FIndex SelfExp, std::
 
 bool EmitCall(FScript& S, const FCallIR& Call, FIndex SelfExp, std::string* Err)
 {
+    if (Call.Intrinsic == "__AwaitPoint__") { S.ResumeSinks.push_back(Call.Resume); return true; }
     /* A dispatcher operation: Args[0] is the dispatcher, then the delegate or the broadcast's arguments. */
     const bool bAdd = Call.Intrinsic == "__AddDelegate__", bRemove = Call.Intrinsic == "__RemoveDelegate__";
     if (bAdd || bRemove || Call.Intrinsic == "__ClearDelegate__" || Call.Intrinsic == "__Broadcast__")
@@ -850,9 +852,18 @@ private:
     int32 LatentCount = 0;
     /* A generated event a latent call's completion delegate binds: it stores its parameter into the frame local
        the call's value is read from after the resume. */
-    struct FCompletion { std::string Event; FPropertyDef Parm; std::string Local; };
+    struct FCompletion
+    {
+        std::string Event;
+        std::vector<FPropertyDef> Parms;
+        std::string Local;                            // where Parms[0] is stored, or empty
+        std::shared_ptr<int32> Resume;                // an await's: the event then re-enters the ubergraph here
+    };
+    std::string FreshEventName(const std::string& Stem);
+    bool LowerAwait(const Json& CallNode, FBlueprintClass& BP, FCallIR& Out, std::string* Err);
     std::vector<FCompletion> Completions;             // the method being lowered's
     std::set<std::string> GeneratedEvents;            // the class's, so two never share a name
+    std::set<std::string> ActivatedActions;           // the method's variables an await already activated
     int32 SwitchDepth = 0;                            // LowerBody: the switches around it
 };
 
@@ -1064,11 +1075,13 @@ void EmitStmts(const std::vector<FStmtIR>& Stmts, FScript& S, FIndex SelfExp, FL
         }
         /* After a latent call this run of the ubergraph ends; the latent action re-enters right here. BP_LiftPod
            ends it with EX_PopExecutionFlow onto a pushed final return, which is the same thing. */
-        if (!S.LatentResumes.empty())
+        if (!S.LatentResumes.empty() || !S.ResumeSinks.empty())
         {
             S.Return();
             for (int32 At : S.LatentResumes) S.PatchJumpTarget(At, S.MemorySize());
+            for (const std::shared_ptr<int32>& Sink : S.ResumeSinks) *Sink = S.MemorySize();
             S.LatentResumes.clear();
+            S.ResumeSinks.clear();
         }
     }
 }
@@ -2570,6 +2583,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
             Out.Extra = BP.ScriptStruct("/Script/Engine", "ScreenMessageString");
         }
         else if (MethodName == "__RefAt__") {}   // resolved by HoistRefAt
+        else if (MethodName == "__Await__") return LowerAwait(CallExprNode, BP, Out, Err);
         else if (FindReadView(MethodName))
         {
             /* Placeholder: the hoist pass rewrites each __Read*__ call into two statements
@@ -2694,21 +2708,14 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         if (ResultAt < Parms.size())
         {
             /* The event is found by name on self, so it must not be a function of the class or an ancestor. */
-            auto Taken = [&](const std::string& E) {
-                if (GeneratedEvents.count(E)) return true;
-                for (const FRecord* A = Cur; A; A = A->Base.empty() ? nullptr : Find(A->Base))
-                    if (A->Methods.count(E)) return true;
-                return false;
-            };
-            std::string Event;
-            for (int32 N = 0; Taken(Event = CurFnName + "_" + Parms[ResultAt] + "_" + std::to_string(N)); ++N) {}
-            GeneratedEvents.insert(Event);
+            const std::string Event = FreshEventName(CurFnName + "_" + Parms[ResultAt]);
             FCompletion C;
             C.Event = Event;
             ResultLocal = "__Async" + std::to_string(ReadTmpCounter++) + "__";
             C.Local = ResultLocal;
             FPropertyDef Local;
-            if (!TypeToProperty(ResultType, "Value", 0, "the result of " + MethodName, BP, &C.Parm, Err)
+            C.Parms.emplace_back();
+            if (!TypeToProperty(ResultType, "Value", 0, "the result of " + MethodName, BP, &C.Parms[0], Err)
                 || !TypeToProperty(ResultType, ResultLocal, 0, "the result of " + MethodName, BP, &Local, Err)) return false;
             Local.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
             CurLocals->push_back(Local);
@@ -2737,6 +2744,101 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
             Out.InlineType = ResultType;
         }
     }
+    return true;
+}
+
+/* A generated event's name, <Stem>_<N>: found by name on self, so not a function of the class or an ancestor. */
+std::string FCompiler::FreshEventName(const std::string& Stem)
+{
+    auto Taken = [&](const std::string& E) {
+        if (GeneratedEvents.count(E)) return true;
+        for (const FRecord* A = Cur; A; A = A->Base.empty() ? nullptr : Find(A->Base))
+            if (A->Methods.count(E)) return true;
+        return false;
+    };
+    std::string Event;
+    for (int32 N = 0; Taken(Event = Stem + "_" + std::to_string(N)); ++N) {}
+    GeneratedEvents.insert(Event);
+    return Event;
+}
+
+/* UE_AWAIT(Obj->Dispatcher), UeMeta.h: bind a generated event, activate an async action, end the run. The event
+   stores the payload and re-enters the ubergraph after the await, as BP_LiftPod's OnCompleted_* do. */
+bool FCompiler::LowerAwait(const Json& CallNode, FBlueprintClass& BP, FCallIR& Out, std::string* Err)
+{
+    if (!LatentRefusal.empty()) { *Err = "UE_AWAIT: " + LatentRefusal; return false; }
+    const Json* Arg = Strip(Nth(CallNode, 1));
+    FArgIR Disp;
+    if (!Arg || !LowerArg(*Arg, BP, Disp, Err)) return false;
+    if (Disp.K != FArgIR::Field) { *Err = "UE_AWAIT takes a dispatcher property"; return false; }
+    if (Disp.Base && Disp.Base->K != FArgIR::Local && Disp.Base->K != FArgIR::Field && Disp.Base->K != FArgIR::Self)
+    { *Err = "UE_AWAIT: keep the object in a variable, it is used twice"; return false; }
+
+    const std::string SigType = StripTypeKeywords(TypeOf(*Arg));
+    const size_t Open = SigType.find('('), Close = SigType.rfind(")>");
+    if (Open == std::string::npos || Close == std::string::npos || Close < Open)
+    { *Err = "UE_AWAIT: cannot read the signature of " + SigType; return false; }
+    const std::string ParmList = SigType.substr(Open + 1, Close - Open - 1);
+
+    FCompletion C;
+    C.Event = FreshEventName(CurFnName + "_" + Disp.S);
+    C.Resume = std::make_shared<int32>(0);
+    if (!ParmList.empty() && ParmList != "void")
+        for (const std::string& T : SplitTemplateArgs(ParmList))
+        {
+            C.Parms.emplace_back();
+            if (!TypeToProperty(T, "Value" + std::to_string(C.Parms.size() - 1), 0, "UE_AWAIT on " + Disp.S, BP, &C.Parms.back(), Err))
+                return false;
+        }
+    const std::string ResultType = StripTypeKeywords(TypeOf(CallNode));
+    if (ResultType != "void")
+    {
+        C.Local = "__Await" + std::to_string(ReadTmpCounter++) + "__";
+        FPropertyDef Local;
+        if (!TypeToProperty(ResultType, C.Local, 0, "UE_AWAIT on " + Disp.S, BP, &Local, Err)) return false;
+        Local.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+        CurLocals->push_back(Local);
+    }
+
+    auto Body = std::make_shared<std::vector<FStmtIR>>();
+    auto Add = [&](FCallIR Call) { Body->emplace_back(); Body->back().K = FStmtIR::StaticCall; Body->back().Call = std::move(Call); };
+    FCallIR Bind;
+    Bind.Intrinsic = "__AddDelegate__";
+    Bind.Args.push_back(Disp);
+    Bind.Args.emplace_back();
+    Bind.Args.back().K = FArgIR::Delegate;
+    Bind.Args.back().S = C.Event;
+    Add(Bind);
+
+    /* K2Node_AsyncAction activates a UBlueprintAsyncActionBase once its outputs are bound. Only the first await on a
+       variable does: a second one waits on the action already running. */
+    std::string ObjType = StripTypeKeywords(TypeOf(*Strip(First(*Arg))));
+    while (!ObjType.empty() && (ObjType.back() == '*' || ObjType.back() == ' ')) ObjType.pop_back();
+    bool bAction = false;
+    for (const FRecord* A = Find(ObjType); A; A = A->Base.empty() ? nullptr : Find(A->Base))
+        if (A->UeName == "BlueprintAsyncActionBase") bAction = true;
+    if (bAction && ActivatedActions.insert(Disp.Base ? Disp.Base->S : std::string("this")).second)
+    {
+        FCallIR Activate;
+        Activate.Fn = BP.EngineFunction("/Script/Engine", "BlueprintAsyncActionBase", "Activate");
+        Activate.bInstance = true;
+        if (Disp.Base) Activate.Target = Disp.Base;
+        Add(Activate);
+    }
+    FCallIR Point;
+    Point.Intrinsic = "__AwaitPoint__";
+    Point.Resume = C.Resume;
+    Add(Point);
+
+    Completions.push_back(C);
+    bMadeLatentCall = true;
+    auto Block = std::make_shared<std::vector<FStmtIR>>(1);
+    (*Block)[0].K = FStmtIR::Block;
+    (*Block)[0].Body = Body;
+    Out.Intrinsic = "__Inline__";
+    Out.Inline = Block;
+    Out.InlineResult = C.Local;
+    Out.InlineType = ResultType;
     return true;
 }
 
@@ -4263,6 +4365,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         bMadeLatentCall = false;
         LatentCount = 0;
         Completions.clear();
+        ActivatedActions.clear();
         LatentRefusal = !bCanLatent ? "only an Actor or ActorComponent class has a world to resume in"
                       : IsStaticDecl(Decl) ? "a static function has no ubergraph to resume in"
                       : (!RetType.empty() && RetType != "void") || HasOutParm(Params)
@@ -4443,13 +4546,23 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         }
 
         /* Measured on BP_LiftPod's OnCompleted_*: BlueprintCallable | BlueprintEvent, storing its parameter into the
-           frame. A latent call's completion fires before the latent action resumes, so it does not re-enter. */
+           frame, then calling the ubergraph at the code after the await. A latent call's completion fires before
+           the latent action resumes, so that one only stores. */
         for (const FSegment& Seg : Segments)
             for (const FCompletion& C : Seg.Completions)
             {
-                const std::string To = Seg.Rename.at(C.Local), From = C.Parm.Name;
-                BP.AddFunction(C.Event, Null(), { C.Parm }, [To, From, Uber](FScript& S, FIndex SelfExp) {
-                    S.LetValueOnPersistentFrame(To, Uber, [&](FScript& V) { V.LocalVariable(From, SelfExp); });
+                const std::string To = C.Local.empty() ? std::string() : Seg.Rename.at(C.Local);
+                const std::string From = C.Parms.empty() ? std::string() : C.Parms[0].Name;
+                const std::shared_ptr<int32> Resume = C.Resume;
+                BP.AddFunction(C.Event, Null(), C.Parms, [To, From, Resume, Uber](FScript& S, FIndex SelfExp) {
+                    if (!To.empty())
+                        S.LetValueOnPersistentFrame(To, Uber, [&](FScript& V) { V.LocalVariable(From, SelfExp); });
+                    if (Resume)
+                    {
+                        S.LocalFinalFunction(Uber);
+                        S.IntConst(*Resume);
+                        S.EndFunctionParms();
+                    }
                     S.Return();
                     S.EndOfScript();
                 }, FUNC_BlueprintCallable | FUNC_BlueprintEvent);

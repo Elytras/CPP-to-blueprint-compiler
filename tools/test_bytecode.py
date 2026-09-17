@@ -272,3 +272,28 @@ def latent():
 
 
 latent()
+
+
+def awaits():
+    import re, subprocess
+    here, base = os.path.dirname(os.path.abspath(__file__)), asset('AsyncTest')
+    idx = {e['name']: i for i, e in enumerate(dumpexp.load(base)[5])}
+    tool = lambda t, i: subprocess.run([sys.executable, os.path.join(here, t), base, str(i)], capture_output=True, text=True).stdout
+    uber = tool('walkscript.py', idx['ExecuteUbergraph_AsyncTest'])
+    rows = re.findall(r'mem\s+(\d+)\s+disk\s+\d+ mem\s+\d+\s+(\S+)', uber)
+    # The download task is activated once, after its first bind; the montage proxy is not an async action.
+    assert uber.count("Function'Activate'") == 1, uber.count("Function'Activate'")
+    for ev, local in (('Download_OnSuccess_0', 'Download___Await0__'), ('Download_OnFail_0', 'Download___Await1__'),
+                      ('PlayThen_OnCompleted_0', 'PlayThen___Await0__')):
+        out = tool('walkscript.py', idx[ev])
+        assert 'FunctionFlags 0xc000000' in tool('dumpstruct.py', idx[ev]), ev
+        assert 'LetValueOnPersistentFrame ' + local in out, ev
+        # It re-enters right after the return that ends the awaiting run.
+        entry = int(re.search(r'IntConst\s+(\d+)', out).group(1))
+        at = [i for i, (m, op) in enumerate(rows) if int(m) == entry]
+        assert at and rows[at[0] - 2][1] == 'Return', (ev, entry)
+        assert 'InstanceDelegate     ' + ev in uber, ev
+    print('ok  AsyncTest: awaits bind, activate once, resume after the run')
+
+
+awaits()

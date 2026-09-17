@@ -131,6 +131,8 @@ public:
     int32 SkipOffsetConst(int32 MemTarget);
     /* Patch positions of latent calls' Linkage whose resume point is the end of the statement being emitted. */
     std::vector<int32> LatentResumes;
+    /* The same for an await: the event that resumes lives in another function, so the offset is stored, not patched. */
+    std::vector<std::shared_ptr<int32>> ResumeSinks;
 
     void FieldPath(const std::string& PropertyName, FIndex Owner);
     void FieldPath(const std::vector<std::string>& Path, FIndex Owner);     // innermost first: {"Items", "Items"} is an array's element
