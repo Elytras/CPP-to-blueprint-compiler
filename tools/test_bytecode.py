@@ -421,6 +421,16 @@ def optimizer():
     assert w.count('BooleanAND') == 1 and w.count('BooleanOR') == 1, w
     assert '__Branch' not in w, w
     print('ok  OptTest.Logic: harmless && / || fold into one call, a guard if nests')
+    check('OptTest', 'Raw', lambda X, Y: 1 if X != 0 and Y != 0 else 0, [dict(X=x, Y=y) for x in (0, 3) for y in (0, 5)])
+    w = walk('Raw')
+    assert 'Multiply_IntInt' in w and 'Add_IntInt' in w and 'BooleanAND' not in w, w
+    assert 'Abs_Int' in walk('RawPragma'), walk('RawPragma')
+    import re
+    fnflags = lambda fn: re.search(r'FunctionFlags (\S+)', subprocess.run(
+        [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dumpstruct.py'), base, str(names.index(fn))],
+        capture_output=True, text=True).stdout).group(1)
+    assert fnflags('RawPragma') == fnflags('Raw') == fnflags('Drop'), (fnflags('RawPragma'), fnflags('Drop'))
+    print('ok  OptTest.Raw: UE_NO_OPTIMIZE / #pragma clang optimize off keep what the optimizer drops')
 
 
 optimizer()

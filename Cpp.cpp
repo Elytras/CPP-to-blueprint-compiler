@@ -194,10 +194,19 @@ uint32 AccessFlagsOf(const Json& Decl)
     uint32 Flags = 0;
     ForEach(Decl, [&](const Json& C) {
         const std::string K = Kind(C);
-        if (K == "NoInlineAttr") Flags |= FUNC_BlueprintAuthorityOnly;
-        else if (K == "OptimizeNoneAttr") Flags |= FUNC_BlueprintCosmetic;
+        /* `#pragma clang optimize off` adds an implicit noinline beside its optnone: not a UE_AUTHORITY_ONLY. */
+        if (K == "NoInlineAttr" && !C.value("implicit", false)) Flags |= FUNC_BlueprintAuthorityOnly;
+        else if (K == "NoInstrumentFunctionAttr") Flags |= FUNC_BlueprintCosmetic;
     });
     return Flags;
+}
+
+/* UE_NO_OPTIMIZE, or an optimize-off pragma over the function: [[clang::optnone]], meaning what it says. */
+bool IsNoOptDecl(const Json& Decl)
+{
+    bool bNoOpt = false;
+    ForEach(Decl, [&](const Json& C) { bNoOpt = bNoOpt || Kind(C) == "OptimizeNoneAttr"; });
+    return bNoOpt;
 }
 
 /* UE_PURE: clang keeps [[gnu::pure]] as a PureAttr child, and copies it onto an out-of-line definition. */
@@ -930,6 +939,7 @@ private:
     const FRecord* Cur = nullptr;                     // record Generate is working on
     std::set<std::string> CurrentOutParms;            // T& parm names of the function being lowered
     bool bCurNet = false;                             // the function being lowered is an RPC
+    bool bCurNoOpt = false;                           // ... is UE_NO_OPTIMIZE: no drops, no && / || fold
     std::set<std::string> WarnedRefParms;             // its reference parameters already warned about
 
     /* A write through an RPC's reference parameter: the receiving side gets a copy of the argument, so the caller sees
@@ -2900,7 +2910,7 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             Out.K = FArgIR::Call;
             Out.InnerType = "bool";
             Out.Sub = std::make_shared<FCallIR>();
-            if (IsEagerSafe(*RhsRaw))
+            if (!bCurNoOpt && IsEagerSafe(*RhsRaw))
             {
                 /* Nothing on the right can fault or act, so running it anyway is unobservable: one native call
                    instead of a temp, a store and a jump. */
@@ -5443,6 +5453,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         KeepLoaded.clear();
         CurFnName = Fn.Name;
         bCurNet = (NetFlagsOf(Decl) | NetFlagsOf(M)) != 0;
+        bCurNoOpt = IsNoOptDecl(Decl) || IsNoOptDecl(M);
         WarnedRefParms.clear();
         bMadeLatentCall = false;
         LatentCount = 0;
@@ -5463,8 +5474,11 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             *Err = R.CppName + "::" + Fn.Name + ": " + *Err;
             return false;
         }
-        DropUnusedPure(Stmts);
-        DropUnusedLocals(Stmts, Locals);
+        if (!bCurNoOpt)
+        {
+            DropUnusedPure(Stmts);
+            DropUnusedLocals(Stmts, Locals);
+        }
         for (const auto& [Struct, Keep] : KeepLoaded)
         {
             auto Typed = [&](const FPropertyDef& P) { return P.Type == "StructProperty" && P.Extra.V == Struct; };
