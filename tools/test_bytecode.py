@@ -250,19 +250,24 @@ def latent():
     rows = re.findall(r'\+\s*(\d+) mem\s+(\d+)\s+disk\s+\d+ mem\s+\d+\s+(\S+)[ \t]*(.*)', tool('walkscript.py', idx['ExecuteUbergraph_LatentTest']))
     e = exports[idx['ExecuteUbergraph_LatentTest']]
     blob = ue[e['off'] - total: e['off'] - total + e['size']]
-    # Each latent call resumes right after the return that follows it; four calls, one in a loop.
+    # Each latent call resumes right after the return that follows it; six calls, one in a loop.
     links = [(struct.unpack_from('<i', blob, int(o) + 1)[0], i) for i, (o, m, op, _) in enumerate(rows) if op == 'SkipOffsetConst']
-    assert len(links) == 4, links
+    assert len(links) == 6, links
     for link, i in links:
         ret = next(r for r in rows[i:] if r[2] == 'Return')
         assert link == int(ret[1]) + 2, (link, ret)
-    # Each stub enters where its segment starts: ReceiveBeginPlay at the first statement after the computed jump.
-    entries = {fn: int(re.search(r'IntConst\s+(\d+)', tool('walkscript.py', idx[fn])).group(1)) for fn in ('ReceiveBeginPlay', 'ViaInline', 'Wait')}
-    assert entries['ReceiveBeginPlay'] == 10, entries
+    # Each stub enters where its segment starts, the first one right after the computed jump.
+    entries = {fn: int(re.search(r'IntConst\s+(\d+)', tool('walkscript.py', idx[fn])).group(1)) for fn in ('Load', 'ReceiveBeginPlay', 'ViaInline', 'Wait')}
+    assert min(entries.values()) == 10, entries
     starts = {int(m) for o, m, op, info in rows}
     assert all(v in starts for v in entries.values()), entries
     assert 'LetValueOnPersistentFrame Wait_Tag' in tool('walkscript.py', idx['Wait'])
     assert 'ExecuteUbergraph' not in tool('walkscript.py', idx['Plain'])
+    # A value-returning LoadAsset / LoadAssetClass binds a generated event that stores the payload into the frame.
+    for ev, local in (('Load_OnLoaded_0', 'Load___Async0__'), ('Load_OnLoaded_1', 'Load___Async1__')):
+        assert 'FunctionFlags 0xc000000' in tool('dumpstruct.py', idx[ev]), ev
+        assert 'LetValueOnPersistentFrame ' + local in tool('walkscript.py', idx[ev]), ev
+    assert 'InstanceDelegate     Load_OnLoaded_0' in tool('walkscript.py', idx['ExecuteUbergraph_LatentTest'])
     print('ok  LatentTest: ubergraph segments, resume linkage, stubs')
 
 

@@ -848,6 +848,11 @@ private:
     std::string LatentRefusal;                        // why that method cannot make a latent call, or empty
     bool bMadeLatentCall = false;                     // LowerCall: it made one, so it moves into the ubergraph
     int32 LatentCount = 0;
+    /* A generated event a latent call's completion delegate binds: it stores its parameter into the frame local
+       the call's value is read from after the resume. */
+    struct FCompletion { std::string Event; FPropertyDef Parm; std::string Local; };
+    std::vector<FCompletion> Completions;             // the method being lowered's
+    std::set<std::string> GeneratedEvents;            // the class's, so two never share a name
     int32 SwitchDepth = 0;                            // LowerBody: the switches around it
 };
 
@@ -2646,26 +2651,91 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
     const size_t Hidden = LatentAt < Parms.size() ? 1 : 0;
     if (Hidden && Out.Args.size() == Parms.size())
     { *Err = MethodName + ": leave the FLatentActionInfo argument out, the compiler supplies it"; return false; }
+    /* `auto Cls = LoadAssetClass(Soft)`: genueapi's overload that leaves out a one-parameter completion delegate
+       returns that parameter, where the UFunction returns nothing. clang's type drops the parameter's name. */
+    size_t ResultAt = Parms.size();
+    std::string ResultType;
+    if (Hidden && StripTypeKeywords(TypeOf(CallExprNode)) != "void")
+    {
+        size_t I = 0;
+        ForEach(*FullDecl, [&](const Json& C) {
+            if (Kind(C) != "ParmVarDecl") return;
+            const std::string T = StripTypeKeywords(TypeOf(C));
+            const size_t Open = T.find('('), Close = T.rfind(")>");
+            if (T.compare(0, 10, "TDelegate<") == 0 && Open != std::string::npos && Close != std::string::npos && Close > Open + 1)
+            { ResultAt = I; ResultType = T.substr(Open + 1, Close - Open - 1); }
+            ++I;
+        });
+        if (ResultAt == Parms.size()) { *Err = "internal: " + MethodName + " returns a value but has no completion delegate"; return false; }
+    }
+    const size_t Omitted = Hidden + (ResultAt < Parms.size() ? 1 : 0);
     for (size_t I = 0; I < Parms.size(); ++I)
     {
         if (!IsWcoName(Parms[I])) continue;
         FArgIR Wco;
         if (!CurrentWco.empty()) { Wco.K = FArgIR::Local; Wco.S = CurrentWco; }
-        if (Out.Args.size() + 1 + Hidden == Parms.size()) Out.Args.insert(Out.Args.begin() + I, Wco);
+        if (Out.Args.size() + 1 + Omitted == Parms.size()) Out.Args.insert(Out.Args.begin() + I, Wco);
         else if (I < Defaulted.size() && Defaulted[I]) Out.Args[I] = Wco;
         break;
     }
     if (Hidden)
     {
         if (!LatentRefusal.empty()) { *Err = "latent call " + MethodName + ": " + LatentRefusal; return false; }
+        std::vector<std::pair<size_t, FArgIR>> Fill;
         FArgIR L;
         L.K = FArgIR::LatentInfo;
         L.Owner = BP.ScriptStruct("/Script/Engine", "LatentActionInfo");
         L.S = "ExecuteUbergraph_" + Cur->CppName;
         /* The latent action manager keys pending actions by UUID per callback target: one per call site. */
         L.I = int32(std::hash<std::string>{}(Cur->CppName + "." + CurFnName + "#" + std::to_string(++LatentCount)));
-        Out.Args.insert(Out.Args.begin() + std::min(LatentAt, Out.Args.size()), L);
+        Fill.emplace_back(LatentAt, L);
+
+        std::string ResultLocal;
+        if (ResultAt < Parms.size())
+        {
+            /* The event is found by name on self, so it must not be a function of the class or an ancestor. */
+            auto Taken = [&](const std::string& E) {
+                if (GeneratedEvents.count(E)) return true;
+                for (const FRecord* A = Cur; A; A = A->Base.empty() ? nullptr : Find(A->Base))
+                    if (A->Methods.count(E)) return true;
+                return false;
+            };
+            std::string Event;
+            for (int32 N = 0; Taken(Event = CurFnName + "_" + Parms[ResultAt] + "_" + std::to_string(N)); ++N) {}
+            GeneratedEvents.insert(Event);
+            FCompletion C;
+            C.Event = Event;
+            ResultLocal = "__Async" + std::to_string(ReadTmpCounter++) + "__";
+            C.Local = ResultLocal;
+            FPropertyDef Local;
+            if (!TypeToProperty(ResultType, "Value", 0, "the result of " + MethodName, BP, &C.Parm, Err)
+                || !TypeToProperty(ResultType, ResultLocal, 0, "the result of " + MethodName, BP, &Local, Err)) return false;
+            Local.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+            CurLocals->push_back(Local);
+            Completions.push_back(C);
+            FArgIR D;
+            D.K = FArgIR::Delegate;
+            D.S = Event;
+            Fill.emplace_back(ResultAt, D);
+        }
+        std::sort(Fill.begin(), Fill.end(), [](const auto& A, const auto& B) { return A.first < B.first; });
+        for (const auto& [At, Arg] : Fill) Out.Args.insert(Out.Args.begin() + std::min(At, Out.Args.size()), Arg);
         bMadeLatentCall = true;
+
+        if (!ResultLocal.empty())
+        {
+            /* The call, then its value: the local the completion event filled in before the resume. */
+            auto Block = std::make_shared<std::vector<FStmtIR>>(1);
+            (*Block)[0].K = FStmtIR::Block;
+            (*Block)[0].Body = std::make_shared<std::vector<FStmtIR>>(1);
+            (*(*Block)[0].Body)[0].K = FStmtIR::StaticCall;
+            (*(*Block)[0].Body)[0].Call = Out;
+            Out = FCallIR();
+            Out.Intrinsic = "__Inline__";
+            Out.Inline = Block;
+            Out.InlineResult = ResultLocal;
+            Out.InlineType = ResultType;
+        }
     }
     return true;
 }
@@ -4135,8 +4205,10 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         std::vector<FStmtIR> Stmts;
         uint32 Flags = 0;
         std::map<std::string, std::string> Rename;
+        std::vector<FCompletion> Completions;
     };
     std::vector<FSegment> Segments;
+    GeneratedEvents.clear();
 
     for (const FMethod& Fn : Methods)
     {
@@ -4190,6 +4262,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         CurFnName = Fn.Name;
         bMadeLatentCall = false;
         LatentCount = 0;
+        Completions.clear();
         LatentRefusal = !bCanLatent ? "only an Actor or ActorComponent class has a world to resume in"
                       : IsStaticDecl(Decl) ? "a static function has no ubergraph to resume in"
                       : (!RetType.empty() && RetType != "void") || HasOutParm(Params)
@@ -4275,7 +4348,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         {
             if (bScratchNeeded)
             { *Err = R.CppName + "::" + Fn.Name + ": TODO: a pointer read in a function that makes a latent call"; return false; }
-            FSegment Seg{ Fn.Name, Super, {}, Locals, Stmts, Flags, {} };
+            FSegment Seg{ Fn.Name, Super, {}, Locals, Stmts, Flags, {}, Completions };
             Seg.Parms.assign(Params.begin(), Params.end() - Locals.size());
             Segments.push_back(std::move(Seg));
             continue;
@@ -4368,6 +4441,19 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 S.EndOfScript();
             }, Segments[I].Flags);
         }
+
+        /* Measured on BP_LiftPod's OnCompleted_*: BlueprintCallable | BlueprintEvent, storing its parameter into the
+           frame. A latent call's completion fires before the latent action resumes, so it does not re-enter. */
+        for (const FSegment& Seg : Segments)
+            for (const FCompletion& C : Seg.Completions)
+            {
+                const std::string To = Seg.Rename.at(C.Local), From = C.Parm.Name;
+                BP.AddFunction(C.Event, Null(), { C.Parm }, [To, From, Uber](FScript& S, FIndex SelfExp) {
+                    S.LetValueOnPersistentFrame(To, Uber, [&](FScript& V) { V.LocalVariable(From, SelfExp); });
+                    S.Return();
+                    S.EndOfScript();
+                }, FUNC_BlueprintCallable | FUNC_BlueprintEvent);
+            }
 
         /* Measured on BP_LiftPod: a transient FPointerToUberGraphFrame the class links by this name. */
         FPropertyDef FramePtr;

@@ -756,11 +756,20 @@ def main():
                     variants.append([p for p in params if p is not wco[0]])
                 # A latent function's FLatentActionInfo is the compiler's to fill in (the ubergraph resume point),
                 # so the overloads a mod calls leave it out; the full one stays as the UFunction's signature.
-                if any(t == "struct FLatentActionInfo" or t == "FLatentActionInfo" for t, _ in params):
-                    variants += [[p for p in v if p[0] not in ("struct FLatentActionInfo", "FLatentActionInfo")] for v in variants]
-                for plist in variants:
+                variants = [(ret, v) for v in variants]
+                latent = ("struct FLatentActionInfo", "FLatentActionInfo")
+                if any(t in latent for t, _ in params):
+                    variants += [(ret, [p for p in v if p[0] not in latent]) for _, v in variants]
+                    # `auto Cls = LoadAssetClass(Soft)`: a latent function's one-parameter completion delegate is
+                    # the compiler's too, and its parameter is what the call returns once it resumes.
+                    dele = [p for p in params if p[0].startswith("TDelegate<void(") and p[0].endswith(")>")]
+                    inner = dele[0][0][len("TDelegate<void("):-2] if len(dele) == 1 and ret == "void" else ""
+                    if inner and "," not in inner and " " in inner:
+                        variants += [(inner.rsplit(" ", 1)[0], [p for p in v if p is not dele[0]])
+                                     for r, v in variants if r == "void" and not any(p[0] in latent for p in v)]
+                for vret, plist in variants:
                     args = ", ".join("%s %s" % (rewrite(t), n) for t, n in plist)
-                    body.append("    %s%s %s(%s)%s;" % ("static " if is_static else "", rewrite(ret), fname, args,
+                    body.append("    %s%s %s(%s)%s;" % ("static " if is_static else "", rewrite(vret), fname, args,
                                                          " const" if fname in k.const_funcs else ""))
                 funcs += 1
                 for t in [ret] + [t for t, _ in params]:
