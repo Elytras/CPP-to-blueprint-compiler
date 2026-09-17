@@ -379,4 +379,42 @@ void FBlueprintClass::FinishStruct(const uint32 (&Guid)[4])
     P.AddExport(std::move(S));
 }
 
+/* Measured on DRG's ENU_TextCase: the tags (the editor's DisplayNameMap), no GUID, then UEnum::Names as
+   (FName, int64) pairs ending in the _MAX entry, then CppForm 1 (Namespaced). Nothing outside WITH_EDITOR
+   reads the names' shape, so they are the C++ ones rather than the editor's NewEnumeratorN.
+   ponytail: no DisplayNameMap; UEnum::GetDisplayNameTextByIndex falls back to the enumerator's own name. */
+void FBlueprintClass::FinishEnum(const std::vector<std::pair<std::string, int64>>& Enumerators)
+{
+    const FIndex EnumClass = EngineClass("/Script/Engine", "UserDefinedEnum");
+    const FIndex EnumCdo = ClassDefaultObject("/Script/Engine", "UserDefinedEnum");
+    ClassRow = 0;
+
+    FExport E;
+    E.ClassIndex = EnumClass;
+    E.TemplateIndex = EnumCdo;
+    E.ObjectName = ClassName;
+    E.ObjectFlags = RF_Public | RF_Standalone | RF_Transactional;
+    E.bIsAsset = true;
+    E.SerBeforeCreate = { EnumClass.V, EnumCdo.V };
+
+    int64 Max = 0;
+    for (const auto& En : Enumerators) Max = std::max(Max, En.second + 1);
+    const std::string Prefix = ClassName;
+    const auto Names = Enumerators;
+    E.Serialize = [=](FArc& Ar) {
+        TagEnd(Ar);
+        Ar.Bool(false);
+        Ar.I32(int32(Names.size() + 1));
+        for (const auto& [Name, Value] : Names)
+        {
+            Ar.Name(Prefix + "::" + Name);
+            Ar.I64(Value);
+        }
+        Ar.Name(Prefix + "::" + Prefix + "_MAX");
+        Ar.I64(Max);
+        Ar.U8(1);                                   // ECppForm::Namespaced
+    };
+    P.AddExport(std::move(E));
+}
+
 }   // namespace Uasset

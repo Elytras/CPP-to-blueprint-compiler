@@ -86,7 +86,7 @@ MATH = {
     'Percent_IntInt': lambda a, b: a - idiv(a, b) * b,
     'Less_IntInt': lambda a, b: a < b, 'Greater_IntInt': lambda a, b: a > b,
     'LessEqual_IntInt': lambda a, b: a <= b, 'GreaterEqual_IntInt': lambda a, b: a >= b,
-    'EqualEqual_IntInt': lambda a, b: a == b, 'NotEqual_IntInt': lambda a, b: a != b,
+    'EqualEqual_ByteByte': lambda a, b: a == b, 'EqualEqual_IntInt': lambda a, b: a == b, 'NotEqual_IntInt': lambda a, b: a != b,
     'Not_PreBool': lambda a: not a, 'BooleanAND': lambda a, b: a and b, 'BooleanOR': lambda a, b: a or b,
     'Add_FloatFloat': lambda a, b: a + b, 'Multiply_FloatFloat': lambda a, b: a * b,
     'Conv_IntToFloat': float, 'Not_Int': lambda a: ~a, 'Not_Int64': lambda a: ~a,

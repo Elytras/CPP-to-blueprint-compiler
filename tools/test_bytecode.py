@@ -228,6 +228,29 @@ def no_inline_ufunctions():
 
 
 no_inline_ufunctions()
+def mod_enum():
+    import re, struct, subprocess
+    here = os.path.dirname(os.path.abspath(__file__))
+    base = asset('TypesTest')
+    enum = os.path.join(os.path.dirname(base), 'EMood')
+    r = dumpexp.load(enum)
+    names, raw = r[3], r[1]
+    assert [e['name'] for e in r[5]] == ['EMood'] and "Class'UserDefinedEnum'" in r[4], r[4]
+    for n in ('EMood::Calm', 'EMood::Angry', 'EMood::Sleepy', 'EMood::EMood_MAX'):
+        assert n in names, names
+    count = struct.unpack_from('<i', raw, 12)[0]
+    pairs = [(names[struct.unpack_from('<i', raw, 16 + i * 16)[0]], struct.unpack_from('<q', raw, 24 + i * 16)[0]) for i in range(count)]
+    assert pairs == [('EMood::Calm', 0), ('EMood::Angry', 5), ('EMood::Sleepy', 6), ('EMood::EMood_MAX', 7)], pairs
+    exports = [e['name'] for e in dumpexp.load(base)[5]]
+    cls = subprocess.run([sys.executable, os.path.join(here, 'dumpstruct.py'), base, '0'], capture_output=True, text=True).stdout
+    assert re.search(r'ByteProperty Mood .*EMood', cls), cls
+    cdo = subprocess.run([sys.executable, os.path.join(here, 'dumptags.py'), base, str(exports.index('Default__TypesTest_C'))], capture_output=True, text=True).stdout
+    assert 'EMood::Angry' in cdo, cdo
+    print('ok  TypesTest: UE_ENUM cooks EMood with its C++ names and values; the default is its enumerator')
+
+
+mod_enum()
+check('TypesTest', 'MoodScore', lambda M: {0: 1, 5: 2, 6: 3}.get(M, 0), [dict(M=m) for m in (0, 5, 6, 7)])
 check('InlineTest', 'InPlace', lambda V: V * 3 + 1 + V + 1, [dict(V=v) for v in (-3, 0, 7)])
 
 

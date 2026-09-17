@@ -200,7 +200,7 @@ void WriteDefaultTag(FArc& Ar, const FPropertyDef& P)
         if (P.Type == "IntProperty") V.I32(int32(D.I));
         else if (P.Type == "FloatProperty") { const float F = float(D.F); V.Raw(&F, 4); }
         else if (P.Type == "Int64Property") V.I64(D.I);
-        else if (P.Type == "ByteProperty") { if (P.StructName.empty()) V.U8(uint8(D.I)); else V.Name(P.EnumZero); }   // an enum byte is its enumerator's name
+        else if (P.Type == "ByteProperty") { if (P.StructName.empty()) V.U8(uint8(D.I)); else V.Name(D.K == FDefaultValue::Str ? D.S : P.EnumZero); }   // an enum byte is its enumerator's name
         else if (P.Type == "StrProperty") WriteFStringValue(V, D.S);
         else if (P.Type == "NameProperty") V.Name(bSet ? D.S : std::string("None"));
         else if (P.Type == "TextProperty")

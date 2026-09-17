@@ -60,6 +60,9 @@ public:
     /* Writes the package as one UserDefinedStruct export whose members are the AddVariable()s. */
     void FinishStruct(const uint32 (&Guid)[4]);
 
+    /* Writes the package as one UserDefinedEnum export: <ClassName>::<Enumerator> = value, then <ClassName>_MAX. */
+    void FinishEnum(const std::vector<std::pair<std::string, int64>>& Enumerators);
+
     FIndex ClassIndex() const { return Exp(ClassRow); }
 
 private:

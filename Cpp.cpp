@@ -716,6 +716,7 @@ private:
     bool Collect(std::string* Err);
     bool Generate(const FRecord& R, const std::string& OutDir, std::string* Err);
     bool GenerateStruct(const FRecord& R, const std::string& OutDir, std::string* Err);
+    bool GenerateEnum(const std::string& Name, const std::string& OutDir, std::string* Err);
     bool TypeToProperty(const std::string& QualType, const std::string& PName, uint64 ExtraFlags,
                         const std::string& Where, FBlueprintClass& BP, FPropertyDef* Out, std::string* Err);
     bool LayoutOf(const std::string& QualType, int32* Size, int32* Align, std::string* Err);
@@ -904,6 +905,7 @@ private:
     }
     std::string CurrentWco;                           // its WorldContext* parm when it is a static, else empty
     std::vector<FRegistryAsset> RegistryRows;
+    std::map<std::string, std::vector<std::pair<std::string, int64>>> ModEnums;  // UE_ENUM cooked here: enumerators
 
     /* Per-function state reset in Generate: whether this function needs the FDeref scratch
        local (and its Num=1 prologue) and the counter that names each hoisted temp. */
@@ -1225,6 +1227,9 @@ bool FCompiler::Collect(std::string* Err)
 {
     bool bMetaOk = true;
     std::set<std::string> Ambiguous;
+    std::map<std::string, std::vector<std::pair<std::string, int64>>> EnumDecls;
+    std::map<std::string, std::string> EnumUnderlying;
+    std::vector<std::pair<std::string, std::string>> EnumMarks;      // enum, owning mod ("" for this one)
 
     /* UeApi headers put Blueprint classes in namespaces mirroring their /Game path. */
     std::function<void(const Json&, const std::string&)> Walk =
@@ -1240,12 +1245,24 @@ bool FCompiler::Collect(std::string* Err)
         if (Kind(N) == "EnumDecl")
         {
             int64 Next = 0;
+            auto& Mine = EnumDecls[Ns + N.value("name", std::string())];
+            Mine.clear();
             ForEach(N, [&](const Json& C) {
                 if (Kind(C) != "EnumConstantDecl") return;
                 const Json* V = First(C);
                 if (V && V->contains("value")) Next = std::stoll((*V)["value"].get<std::string>());
+                Mine.push_back({ Name(C), Next });
                 EnumValues[C.value("id", std::string())] = Next++;
             });
+            const Json& U = N.contains("fixedUnderlyingType") ? N["fixedUnderlyingType"] : Json::object();
+            EnumUnderlying[Ns + N.value("name", std::string())] = U.value("desugaredQualType", U.value("qualType", std::string()));
+            return;
+        }
+        if (Kind(N) == "VarDecl" && N.contains("name") && Name(N).size() > 8 && Name(N).compare(Name(N).size() - 8, 8, "__UeEnum") == 0)
+        {
+            std::string Owner;
+            FindLiteral(N, Owner);
+            EnumMarks.push_back({ Ns + Name(N).substr(0, Name(N).size() - 8), Owner });
             return;
         }
         /* Out-of-line method definition: previousDecl points at the in-class decl, already collected. */
@@ -1341,6 +1358,22 @@ bool FCompiler::Collect(std::string* Err)
     {
         *Err = "the source declares no UE_MOD_PACKAGE, so its classes have no /Game path";
         return false;
+    }
+
+    /* UE_ENUM / UE_ENUM_IN: a UserDefinedEnum at <owner>/<Name>, typed like UeApi's native enums. */
+    for (const auto& [Enum, Owner] : EnumMarks)
+    {
+        auto D = EnumDecls.find(Enum);
+        if (D == EnumDecls.end() || D->second.empty()) { *Err = "UE_ENUM(" + Enum + ") names no enum with enumerators"; return false; }
+        const std::string U = EnumUnderlying[Enum];
+        if (U != "unsigned char" && U != "uint8") { *Err = "UE_ENUM(" + Enum + "): a Blueprint enum is uint8, declare it `: uint8`"; return false; }
+        for (const auto& En : D->second)
+            if (En.second < 0 || En.second > 254) { *Err = "UE_ENUM(" + Enum + "): " + En.first + " must be 0..254 (255 is _MAX's)"; return false; }
+        const std::string Leaf = Enum.substr(Enum.rfind(':') == std::string::npos ? 0 : Enum.rfind(':') + 1);
+        std::string First = D->second.front().first;
+        for (const auto& En : D->second) if (En.second == 0) { First = En.first; break; }
+        Enums[Enum] = { (Owner.empty() ? ModPackage : Owner) + "/" + Leaf, Leaf, "uint8", First };
+        if (Owner.empty() || Owner == ModPackage) ModEnums[Leaf] = D->second;
     }
 
     for (auto& It : Records)
@@ -4616,6 +4649,13 @@ bool LowerDefault(const Json& F, FPropertyDef& PD, std::string* Err)
         else { D.K = Int != 0 ? FDefaultValue::Int : FDefaultValue::None; D.I = Int; }
         return true;
     }
+    if (!bNeg && K == "DeclRefExpr" && T == "ByteProperty" && !PD.StructName.empty()
+        && (*Init)["referencedDecl"].value("kind", std::string()) == "EnumConstantDecl")
+    {
+        D.S = PD.StructName + "::" + Name((*Init)["referencedDecl"]);
+        D.K = D.S == PD.EnumZero ? FDefaultValue::None : FDefaultValue::Str;
+        return true;
+    }
     if (!bNeg && K == "StringLiteral" && (T == "StrProperty" || T == "NameProperty" || T == "TextProperty"))
     {
         D.S = Unquote(Init->value("value", std::string()));
@@ -4883,6 +4923,19 @@ bool FCompiler::GenerateStruct(const FRecord& R, const std::string& OutDir, std:
 
 /* Each wrapper a container needed, into NestedPackage beside the mod's own folder. Two mods that need the same one
    cook identical packages at the same path. A wrapper's own member may need a deeper one. */
+bool FCompiler::GenerateEnum(const std::string& Name, const std::string& OutDir, std::string* Err)
+{
+    const std::string PackageName = ModPackage + "/" + Name;
+    FPackage P(PackageName);
+    StampIdentity(P, PackageName);
+    FBlueprintClass BP(P, Name, "", "", false);
+    BP.FinishEnum(ModEnums[Name]);
+    if (!P.Save(OutDir + "/" + Name, Err)) return false;
+    RegistryRows.push_back({ PackageName, Name, "UserDefinedEnum" });
+    printf("  %-14s -> %s.uasset  (enum, %d enumerators)\n", Name.c_str(), Name.c_str(), int32(ModEnums[Name].size()));
+    return true;
+}
+
 bool FCompiler::GenerateNestedWrappers(const std::string& OutDir, std::string* Err)
 {
     /* OutDir is Content/<ModPackage without /Game>; the wrappers go to Content/<NestedPackage without /Game>. */
@@ -5500,7 +5553,12 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         }
         ++Generated;
     }
-    if (Generated == 0) { *Err = "the source declares no UE_STRUCT and no class deriving from a UE class"; return false; }
+    for (const auto& Entry : ModEnums)
+    {
+        if (!GenerateEnum(Entry.first, OutDir, Err)) return false;
+        ++Generated;
+    }
+    if (Generated == 0) { *Err = "the source declares no UE_STRUCT, UE_ENUM or class deriving from a UE class"; return false; }
     if (!GenerateNestedWrappers(OutDir, Err)) return false;
 
     /* A cooked package carries no registry data; without the bake the classes are invisible to it. */
