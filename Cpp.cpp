@@ -338,6 +338,7 @@ struct FCallIR
     bool bInstance = false;             // non-static method: needs the context object, not the class CDO
     FIndex Context;                     // CDO a static call runs against; null = self
     std::string VirtualName;            // a generated class's own instance method: EX_VirtualFunction resolves it by name at run time
+    bool bLocalVirtual = false;         // ... as EX_LocalVirtualFunction: a script function that is no RPC
     std::string View;                   // __RefAtInline__: the TArray field of the view struct in Extra
     std::shared_ptr<int32> Resume;      // __AwaitPoint__: receives the ubergraph offset the awaited event re-enters at
     std::shared_ptr<FArgIR> Target;     // the object an instance call runs against; null = self
@@ -350,7 +351,8 @@ struct FCallIR
    right for a static: an instance native on it would run against e.g. Default__FSDGameState. */
 void EmitCallOp(FScript& S, const FCallIR& Call)
 {
-    if (!Call.VirtualName.empty()) S.VirtualFunction(Call.VirtualName);
+    if (!Call.VirtualName.empty() && Call.bLocalVirtual) S.LocalVirtualFunction(Call.VirtualName);
+    else if (!Call.VirtualName.empty()) S.VirtualFunction(Call.VirtualName);
     else if (Call.bScript || Call.bInstance) S.FinalFunction(Call.Fn);
     else S.CallMath(Call.Fn);
 }
@@ -2672,7 +2674,22 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
                                 R->CppName + "::" + MethodName, true, BP, Out, Err);
         }
 
-        if (!R->IsNative() && !bStatic) Out.VirtualName = MethodName;
+        if (!R->IsNative() && !bStatic)
+        {
+            Out.VirtualName = MethodName;
+            /* KismetCompilerVMBackend.cpp picks the local form unless the callee is native, a net function, authority
+               only or cosmetic. A method declared only by mod classes, without an RPC marker, is none of those; an
+               override of a native function keeps whatever flags it inherits, so it stays EX_VirtualFunction. */
+            bool bLocal = true;
+            for (const FRecord* A = R; A && bLocal; A = A->Base.empty() ? nullptr : Find(A->Base))
+            {
+                auto M = A->Methods.find(MethodName);
+                if (M == A->Methods.end()) continue;
+                if (A->IsNative() || NetFlagsOf(*M->second)) bLocal = false;
+                if (auto D = A->MethodDefs.find(MethodName); D != A->MethodDefs.end() && NetFlagsOf(*D->second)) bLocal = false;
+            }
+            Out.bLocalVirtual = bLocal;
+        }
 
         const std::string CalleePackage = R->IsNative() ? R->UePackage
                                                         : ModPackage + "/" + R->CppName;
@@ -3333,6 +3350,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             FStmtIR Notify;
             Notify.K = FStmtIR::StaticCall;
             Notify.Call.VirtualName = CallRepNotify;
+            Notify.Call.bLocalVirtual = true;       // validated as the class's own method
             Out.push_back(std::move(Notify));
         }
     });

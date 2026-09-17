@@ -177,6 +177,8 @@ public:
     void LetValueOnPersistentFrame(const std::string& PropertyName, FIndex UberGraph,
                                    const std::function<void(FScript&)>& Value);
     void VirtualFunction(const std::string& FunctionName);
+    /* The same, through ProcessLocalFunction: no UObject::CallFunction, so no RPC routing. */
+    void LocalVirtualFunction(const std::string& FunctionName);
 
     void Unimplemented(EExprToken Token, std::string* Err);
 

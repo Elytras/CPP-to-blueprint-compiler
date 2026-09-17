@@ -228,8 +228,10 @@ def replication():
     for fn, flags in (('ServerOpen', 0x82208c0), ('ClientPing', 0x9020840), ('MultiBoom', 0x8024840), ('OnRep_Open', 0x8020800)):
         assert 'FunctionFlags %#x' % flags in tool('dumpstruct.py', exports.index(fn)), fn
     ops = re.findall(r'\d  (\w+) +(\S*)', tool('walkscript.py', exports.index('ReceiveBeginPlay')))
-    calls = [a for op, a in ops if op == 'VirtualFunction']
-    assert calls == ['OnRep_Open', 'OnRep_Slots', 'ServerOpen', 'MultiBoom'], calls
+    calls = [(op, a) for op, a in ops if op in ('VirtualFunction', 'LocalVirtualFunction')]
+    # OnRep functions are ordinary script functions, called locally; an RPC goes through CallFunction's routing.
+    assert calls == [('LocalVirtualFunction', 'OnRep_Open'), ('LocalVirtualFunction', 'OnRep_Slots'),
+                     ('VirtualFunction', 'ServerOpen'), ('VirtualFunction', 'MultiBoom')], calls
     print('ok  ReplTest: replicated properties, RPC flags, OnRep after a set')
 
 

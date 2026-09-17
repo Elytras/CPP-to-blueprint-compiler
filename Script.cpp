@@ -635,6 +635,13 @@ void FScript::LetValueOnPersistentFrame(const std::string& PropertyName, FIndex 
     Value(*this);
 }
 
+void FScript::LocalVirtualFunction(const std::string& FunctionName)
+{
+    Op(EX_LocalVirtualFunction);
+    Ar.Name(FunctionName);
+    Memory += kFNameSize;
+}
+
 void FScript::VirtualFunction(const std::string& FunctionName)
 {
     Op(EX_VirtualFunction);
