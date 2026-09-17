@@ -93,7 +93,7 @@ MATH = {
     'Subtract_FloatFloat': lambda a, b: a - b, 'Divide_FloatFloat': lambda a, b: a / b,
     'Add_Int64Int64': lambda a, b: a + b, 'Subtract_Int64Int64': lambda a, b: a - b,
     'Less_FloatFloat': lambda a, b: a < b, 'Greater_FloatFloat': lambda a, b: a > b, 'Conv_ByteToInt': int, 'NotEqual_ByteByte': lambda a, b: a != b,
-    'NotEqual_Int64Int64': lambda a, b: a != b,
+    'NotEqual_Int64Int64': lambda a, b: a != b, 'NotEqual_NameName': lambda a, b: str(a).lower() != str(b).lower(),
     'InRange_IntInt': lambda v, lo, hi, imin, imax: (v >= lo if imin else v > lo) and (v <= hi if imax else v < hi),
 }
 

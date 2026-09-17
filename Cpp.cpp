@@ -392,7 +392,7 @@ struct FStmtIR
     std::vector<FArgIR> CaseTests;                  // Switch: per case, true when the value does NOT match
     int32 LabelId = -1;                             // Label: the case it marks; Switch: the default's label, or -1
     std::vector<int64> CaseValues;                  // Switch: each case's constant, in CaseTests order
-    int32 SwitchWidth = 4;                          // Switch: the value's size, 1 / 4 / 8
+    int32 SwitchWidth = 4;                          // Switch: the value's size, 1 / 4 / 8; 0 for an FName
     FArgIR SwitchValue;                             // Switch: the temp the value was stored in
     bool bAssignLocal = false;
     bool bAssignOutParm = false;
@@ -1019,7 +1019,7 @@ void EmitStmts(const std::vector<FStmtIR>& Stmts, FScript& S, FIndex SelfExp, FL
                 Max = *std::max_element(St.CaseValues.begin(), St.CaseValues.end());
             }
             const int64 Span = Max - Min + 1;
-            const bool bTable = St.SwitchWidth != 8 && NumCases >= 3 && Span <= int64(NumCases) * 2 && Span <= 1024;
+            const bool bTable = (St.SwitchWidth == 1 || St.SwitchWidth == 4) && NumCases >= 3 && Span <= int64(NumCases) * 2 && Span <= 1024;
 
             FLoopPatches Inner;
             std::vector<int32> LabelAt(NumCases + 1, -1);
@@ -3372,9 +3372,17 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             const Json* Body = Nth(*S, 1);
             if (!Cond || !Body || Kind(*Body) != "CompoundStmt") { *Err = "`switch` needs a braced body"; bOk = false; return; }
 
-            const int32 Width = SwitchWidth(TypeOf(*Strip(Cond)));
-            const std::string TempTy = Width == 1 ? "uint8" : Width == 8 ? "int64" : "int32";
-            const char* NotEqual = Width == 1 ? "NotEqual_ByteByte" : Width == 8 ? "NotEqual_Int64Int64" : "NotEqual_IntInt";
+            /* UE_NAME_SWITCH(N): the value is N itself, and each UE_NAME_CASE("Text") compares against FName Text. */
+            const Json* CondCall = Strip(Cond);
+            const Json* CondCallee = CondCall && Kind(*CondCall) == "CallExpr" ? Strip(First(*CondCall)) : nullptr;
+            const bool bName = CondCallee && Kind(*CondCallee) == "DeclRefExpr"
+                            && (*CondCallee)["referencedDecl"].value("name", std::string()) == "__NameSwitch__";
+            if (bName) Cond = Nth(*CondCall, 1);
+            if (!Cond) { *Err = "UE_NAME_SWITCH needs a name"; bOk = false; return; }
+            const int32 Width = bName ? 0 : SwitchWidth(TypeOf(*Strip(Cond)));
+            const std::string TempTy = bName ? "FName" : Width == 1 ? "uint8" : Width == 8 ? "int64" : "int32";
+            const char* NotEqual = bName ? "NotEqual_NameName" : Width == 1 ? "NotEqual_ByteByte"
+                                 : Width == 8 ? "NotEqual_Int64Int64" : "NotEqual_IntInt";
 
             const std::string Temp = "__Switch" + std::to_string(ReadTmpCounter++) + "__";
             FPropertyDef PD;
@@ -3418,7 +3426,12 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                     { *Err = "a `case` needs one constant value"; return false; }
                     FArgIR Const;
                     const int64 V = std::stoll((*Value)["value"].get<std::string>());
-                    if (Width == 1) { Const.K = FArgIR::Byte; Const.I = int32(V); }
+                    if (bName)
+                    {
+                        Const.K = FArgIR::Name;
+                        if (!FindLiteral(*Value, Const.S)) { *Err = "a case of UE_NAME_SWITCH needs UE_NAME_CASE(\"Text\")"; return false; }
+                    }
+                    else if (Width == 1) { Const.K = FArgIR::Byte; Const.I = int32(V); }
                     else if (Width == 8) { Const.K = FArgIR::Int64; Const.I64 = V; }
                     else { Const.K = FArgIR::Int; Const.I = int32(V); }
                     FArgIR Value0;
