@@ -180,6 +180,18 @@ uint32 NetFlagsOf(const Json& Decl)
     return Flags;
 }
 
+/* UE_AUTHORITY_ONLY / UE_COSMETIC, the same way: the VM skips the call where the flag says it should not run. */
+uint32 AccessFlagsOf(const Json& Decl)
+{
+    uint32 Flags = 0;
+    ForEach(Decl, [&](const Json& C) {
+        const std::string K = Kind(C);
+        if (K == "NoInlineAttr") Flags |= FUNC_BlueprintAuthorityOnly;
+        else if (K == "OptimizeNoneAttr") Flags |= FUNC_BlueprintCosmetic;
+    });
+    return Flags;
+}
+
 /* UE_PURE: clang keeps [[gnu::pure]] as a PureAttr child, and copies it onto an out-of-line definition. */
 bool IsPureDecl(const Json& Decl)
 {
@@ -874,6 +886,19 @@ private:
     std::map<std::string, std::string> Bare;          // unambiguous leaf name -> qualified name
     const FRecord* Cur = nullptr;                     // record Generate is working on
     std::set<std::string> CurrentOutParms;            // T& parm names of the function being lowered
+    bool bCurNet = false;                             // the function being lowered is an RPC
+    std::set<std::string> WarnedRefParms;             // its reference parameters already warned about
+
+    /* A write through an RPC's reference parameter: the receiving side gets a copy of the argument, so the caller sees
+       the change only when the call ran locally (a server calling its own Server RPC). Warned once per parameter. */
+    void WarnRpcRefWrite(const FArgIR& Written)
+    {
+        const FArgIR* Root = &Written;
+        while ((Root->K == FArgIR::Index || Root->K == FArgIR::Member) && Root->Base) Root = Root->Base.get();
+        if (!bCurNet || Root->K != FArgIR::LocalOut || !WarnedRefParms.insert(Root->S).second) return;
+        printf("  warning: %s::%s: modifying reference parameter %s of an RPC reaches the caller only when the call runs "
+               "locally; take it by value or const&\n", Cur ? Cur->CppName.c_str() : "", CurFnName.c_str(), Root->S.c_str());
+    }
     std::string CurrentWco;                           // its WorldContext* parm when it is a static, else empty
     std::vector<FRegistryAsset> RegistryRows;
 
@@ -2272,6 +2297,10 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             if (!LowerArg(*Obj, BP, Target, Err)) return false;
             if (Target.K != FArgIR::Field && Target.K != FArgIR::Local && Target.K != FArgIR::LocalOut && Target.K != FArgIR::Member)
             { *Err = "a container operation needs a variable, not a computed value: " + Method; return false; }
+            static const std::set<std::string> Reads = { "Length", "LastIndex", "IsValidIndex", "Contains", "Find", "Get",
+                                                         "Keys", "Values", "ToArray", "Identical", "Difference",
+                                                         "Intersection", "Union" };
+            if (!Reads.count(Method)) WarnRpcRefWrite(Target);
             Out.K = FArgIR::Call;
             Out.Sub = std::make_shared<FCallIR>();
             Out.Sub->Fn = BP.EngineFunction("/Script/Engine", Lib, Prefix + Method);
@@ -2834,8 +2863,9 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
             {
                 auto M = A->Methods.find(MethodName);
                 if (M == A->Methods.end()) continue;
-                if (A->IsNative() || NetFlagsOf(*M->second)) bLocal = false;
-                if (auto D = A->MethodDefs.find(MethodName); D != A->MethodDefs.end() && NetFlagsOf(*D->second)) bLocal = false;
+                if (A->IsNative() || NetFlagsOf(*M->second) || AccessFlagsOf(*M->second)) bLocal = false;
+                if (auto D = A->MethodDefs.find(MethodName); D != A->MethodDefs.end() && (NetFlagsOf(*D->second) || AccessFlagsOf(*D->second)))
+                    bLocal = false;
             }
             Out.bLocalVirtual = bLocal;
         }
@@ -3404,6 +3434,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 if (bOk && St.Call.Args[0].K != FArgIR::Field && St.Call.Args[0].K != FArgIR::Local
                     && St.Call.Args[0].K != FArgIR::LocalOut && St.Call.Args[0].K != FArgIR::Member)
                 { *Err = "`[]` on a map needs a map variable, not a computed value"; bOk = false; }
+                if (bOk) WarnRpcRefWrite(St.Call.Args[0]);
                 if (bOk && St.Call.Args[0].K == FArgIR::Field && Strip(Nth(*Lhs, 1)) && Kind(*Strip(Nth(*Lhs, 1))) == "MemberExpr")
                 { SetOn = RecordOfFieldAccess(*Strip(Nth(*Lhs, 1))); SetField = St.Call.Args[0].S; SetObject = St.Call.Args[0].Base; }
             }
@@ -3691,6 +3722,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             Flush.Call.Target = SetObject;
             Out.push_back(std::move(Flush));
         }
+        if (bOk && St.K == FStmtIR::Assign) WarnRpcRefWrite(St.Var);
         if (bOk) Out.push_back(St);
         if (!Notify.empty())
         {
@@ -4908,6 +4940,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         SwitchDepth = 0;
         KeepLoaded.clear();
         CurFnName = Fn.Name;
+        bCurNet = (NetFlagsOf(Decl) | NetFlagsOf(M)) != 0;
+        WarnedRefParms.clear();
         bMadeLatentCall = false;
         LatentCount = 0;
         Completions.clear();
@@ -4966,17 +5000,21 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         if (const uint32 Net = NetFlagsOf(Decl) | NetFlagsOf(M))
         {
             /* Measured on BP_LiftPod: Server_ButtonPressedAnim is Net | NetServer, Multi_ButtonPressedAnim
-               Net | NetMulticast; reliable adds NetReliable. A net function returns nothing and takes no out-parm,
+               Net | NetMulticast; reliable adds NetReliable. A net function returns nothing (a reference parameter arrives as a copy),
                and an override keeps its parent's net flags (UClass::SetUpRuntimeReplicationData checks). */
             if ((Net & (FUNC_NetServer | FUNC_NetClient | FUNC_NetMulticast)) == 0)
             { *Err = R.CppName + "::" + Fn.Name + ": UE_RELIABLE needs UE_SERVER, UE_CLIENT or UE_MULTICAST"; return false; }
             if (Super.V != 0) { *Err = R.CppName + "::" + Fn.Name + ": an override takes its parent's replication; drop the RPC marker"; return false; }
             if (!RetType.empty() && RetType != "void") { *Err = R.CppName + "::" + Fn.Name + ": an RPC returns void"; return false; }
-            if (HasOutParm(Params)) { *Err = R.CppName + "::" + Fn.Name + ": an RPC takes no reference parameters"; return false; }
             if (std::any_of(Params.begin(), Params.end(), [](const FPropertyDef& P) { return HoldsMapOrSet(P); }))
             { *Err = R.CppName + "::" + Fn.Name + ": an RPC parameter cannot be a TMap or TSet, which do not replicate"; return false; }
             Flags |= Net;
             bReplicatesAnything = true;
+        }
+        if (const uint32 Access = AccessFlagsOf(Decl) | AccessFlagsOf(M))
+        {
+            /* Where the call is skipped rather than refused: UObject::CallFunction / ProcessEvent check these. */
+            Flags |= Access;
         }
 
         if (bMadeLatentCall)

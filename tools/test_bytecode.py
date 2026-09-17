@@ -227,7 +227,8 @@ def replication():
                                       ('Aim', '0x10025', 'None', 3), ('Slots', '0x100010025', 'OnRep_Slots', 2),
                                       ('Local', '0x10005', 'None', 0)):
         assert re.search(r'Property %s .*flags=%s rep=0 notify=%s cond=%d' % (prop, flags, notify, cond), cls), prop
-    for fn, flags in (('ServerOpen', 0x82208c0), ('ClientPing', 0x9020840), ('MultiBoom', 0x8024840), ('OnRep_Open', 0x8020800)):
+    for fn, flags in (('ServerOpen', 0x82208c0), ('ClientPing', 0x9020840), ('MultiBoom', 0x8024840), ('OnRep_Open', 0x8020800),
+                      ('ServerBump', 0x8620840), ('AuthOnly', 0x8020804), ('Pretty', 0x8020808)):
         assert 'FunctionFlags %#x' % flags in tool('dumpstruct.py', exports.index(fn)), fn
     ops = re.findall(r'\d  (\w+) +(\S*)', tool('walkscript.py', exports.index('ReceiveBeginPlay')))
     calls = [(op, a) for op, a in ops if op in ('VirtualFunction', 'LocalVirtualFunction')]

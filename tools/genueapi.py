@@ -584,6 +584,9 @@ FUNC_BITS = {"Final": 0x1, "RequiredAPI": 0x2, "BlueprintAuthorityOnly": 0x4, "B
 # may still move a random stream or build an object.
 IMPURE_PURE = re.compile(r"Random|Now$|Today$|Create|Construct|Spawn|^New|^Make.*Object|Seed")
 PURE = set()     # (class, function) of every BlueprintPure function, filled by write_events
+MARKS = {}       # (class, function) -> "UE_SERVER UE_RELIABLE " and the like, filled by write_events
+MARK_OF = (("NetServer", "UE_SERVER"), ("NetClient", "UE_CLIENT"), ("NetMulticast", "UE_MULTICAST"),
+           ("NetReliable", "UE_RELIABLE"), ("BlueprintAuthorityOnly", "UE_AUTHORITY_ONLY"), ("BlueprintCosmetic", "UE_COSMETIC"))
 
 
 def write_events(sdk_dir, out_dir):
@@ -597,6 +600,9 @@ def write_events(sdk_dir, out_dir):
             names = m.group(2).split(", ")
             if "BlueprintPure" in names:
                 PURE.add(tuple(m.group(1).split(".")[-2:]))
+            marks = "".join(mark + " " for flag, mark in MARK_OF if flag in names)
+            if marks:
+                MARKS[tuple(m.group(1).split(".")[-2:])] = marks
             if "BlueprintEvent" in names:
                 rows.append('  "%s": %d' % (m.group(1), sum(FUNC_BITS[n] for n in names)))
     io.open(os.path.join(out_dir, "Events.json"), "w", encoding="utf-8", newline="\n").write("{\n" + ",\n".join(rows) + "\n}\n")
@@ -651,6 +657,11 @@ def main():
 
     headers = sorted(f for f in os.listdir(sdk_dir) if f.endswith("_classes.hpp"))
     classes, totals, pathless = [], dict((k, 0) for k in KINDS), 0
+    # The packages the mods next to UeApi cook (UE_MOD_PACKAGE), not the rest of /Game/_ElytrasMods.
+    mod_dir = os.path.dirname(os.path.abspath(out_dir))
+    own = ("/Game/_ElytrasMods/_NestedContainerStructs/",) + tuple(sorted(set(
+        m + "/" for f in os.listdir(mod_dir) if f.endswith((".cpp", ".h"))
+        for m in re.findall(r'UE_MOD_PACKAGE\("([^"]+)"', io.open(os.path.join(mod_dir, f), encoding="utf-8-sig").read()))))
     for name in headers:
         found, skipped, _ = parse_header(os.path.join(sdk_dir, name))
         if not found:
@@ -658,6 +669,8 @@ def main():
         for k in found:
             if not k.is_bp:
                 k.path = "/Script/" + name[: -len("_classes.hpp")]
+        # Our own cooked mods (ReadProperty, the tests) show up in a dump taken with them loaded; their C++ is the source.
+        found = [k for k in found if not k.path.startswith(own)]
         keep = [k for k in found if not k.is_bp or k.path.startswith("/")]
         pathless += len(found) - len(keep)
         classes.extend(keep)
@@ -821,7 +834,8 @@ def main():
                         and not any(t.endswith("&") and not t.startswith("const ") for t, _ in params))
                 for vret, plist in variants:
                     args = ", ".join("%s %s" % (rewrite(t), n) for t, n in plist)
-                    body.append("    %s%s%s %s(%s)%s;" % ("UE_PURE " if pure else "", "static " if is_static else "",
+                    body.append("    %s%s%s%s %s(%s)%s;" % (MARKS.get((k.ue_name, fname), ""),
+                                                             "UE_PURE " if pure else "", "static " if is_static else "",
                                                            rewrite(vret), fname, args,
                                                            " const" if fname in k.const_funcs else ""))
                 funcs += 1
