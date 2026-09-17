@@ -161,6 +161,10 @@ def main():
 
         if not os.path.isdir(stage_content):
             os.makedirs(stage_content)
+        if stale:
+            # An asset the sources no longer cook (a struct another mod now owns) must not stay in the pak.
+            for old in assets:
+                os.remove(old)
         ok = True
         for source in sources:
             if not stale or not source.endswith(".cpp"):
