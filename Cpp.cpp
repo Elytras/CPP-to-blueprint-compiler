@@ -2650,7 +2650,20 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         }
         return true;
     }
-    if (K == "IntegerLiteral") { Out.K = FArgIR::Int; Out.I = int32(std::stoll(N->value("value", std::string("0")))); return true; }
+    if (K == "IntegerLiteral")
+    {
+        /*
+        A literal wider than int32 must stay Int64 or the value truncates: the LoadLibrary
+        import walk's packed name constants (0x32336C656E72656B, "kernel32") compared as
+        0x6E72656B and matched nothing. Fill both fields and pick the width by magnitude,
+        the EnumConstantDecl path below does the same.
+        */
+        const int64 V = std::stoll(N->value("value", std::string("0")));
+        Out.I = int32(V);
+        Out.I64 = V;
+        Out.K = int64(Out.I) == V ? FArgIR::Int : FArgIR::Int64;
+        return true;
+    }
     if (K == "FloatingLiteral") { Out.K = FArgIR::Float; Out.F = std::stof(N->value("value", std::string("0"))); return true; }
     if (K == "CXXBoolLiteralExpr") { Out.K = FArgIR::Bool; Out.B = N->value("value", false); return true; }
     if (K == "DeclRefExpr")
