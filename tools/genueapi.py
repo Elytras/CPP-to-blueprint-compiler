@@ -754,6 +754,10 @@ def main():
                 wco = [p for p in params if p[0] == "class UObject*" and p[1].startswith("WorldContext")]
                 if wco:
                     variants.append([p for p in params if p is not wco[0]])
+                # A latent function's FLatentActionInfo is the compiler's to fill in (the ubergraph resume point),
+                # so the overloads a mod calls leave it out; the full one stays as the UFunction's signature.
+                if any(t == "struct FLatentActionInfo" or t == "FLatentActionInfo" for t, _ in params):
+                    variants += [[p for p in v if p[0] not in ("struct FLatentActionInfo", "FLatentActionInfo")] for v in variants]
                 for plist in variants:
                     args = ", ".join("%s %s" % (rewrite(t), n) for t, n in plist)
                     body.append("    %s%s %s(%s)%s;" % ("static " if is_static else "", rewrite(ret), fname, args,

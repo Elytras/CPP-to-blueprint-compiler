@@ -234,3 +234,36 @@ def replication():
 
 
 replication()
+
+
+def latent():
+    import re, struct, subprocess
+    here, base = os.path.dirname(os.path.abspath(__file__)), asset('LatentTest')
+    ua, ue, total, names, imports, exports = dumpexp.load(base)
+    idx = {e['name']: i for i, e in enumerate(exports)}
+    tool = lambda t, i: subprocess.run([sys.executable, os.path.join(here, t), base, str(i)], capture_output=True, text=True).stdout
+    assert 'UberGraphFunction [0] ObjectProperty size=4: index %d' % (idx['ExecuteUbergraph_LatentTest'] + 1) in tool('dumpstruct.py', 0)
+    assert re.search(r'StructProperty UberGraphFrame .*flags=0x202000', tool('dumpstruct.py', 0))
+    uber = tool('dumpstruct.py', idx['ExecuteUbergraph_LatentTest'])
+    for local in ('ReceiveBeginPlay_Local', 'ReceiveBeginPlay_I', 'ViaInline_Tag', 'Wait_Seconds', 'Wait_Tag'):
+        assert ' %s ' % local in uber, local
+    rows = re.findall(r'\+\s*(\d+) mem\s+(\d+)\s+disk\s+\d+ mem\s+\d+\s+(\S+)[ \t]*(.*)', tool('walkscript.py', idx['ExecuteUbergraph_LatentTest']))
+    e = exports[idx['ExecuteUbergraph_LatentTest']]
+    blob = ue[e['off'] - total: e['off'] - total + e['size']]
+    # Each latent call resumes right after the return that follows it; four calls, one in a loop.
+    links = [(struct.unpack_from('<i', blob, int(o) + 1)[0], i) for i, (o, m, op, _) in enumerate(rows) if op == 'SkipOffsetConst']
+    assert len(links) == 4, links
+    for link, i in links:
+        ret = next(r for r in rows[i:] if r[2] == 'Return')
+        assert link == int(ret[1]) + 2, (link, ret)
+    # Each stub enters where its segment starts: ReceiveBeginPlay at the first statement after the computed jump.
+    entries = {fn: int(re.search(r'IntConst\s+(\d+)', tool('walkscript.py', idx[fn])).group(1)) for fn in ('ReceiveBeginPlay', 'ViaInline', 'Wait')}
+    assert entries['ReceiveBeginPlay'] == 10, entries
+    starts = {int(m) for o, m, op, info in rows}
+    assert all(v in starts for v in entries.values()), entries
+    assert 'LetValueOnPersistentFrame Wait_Tag' in tool('walkscript.py', idx['Wait'])
+    assert 'ExecuteUbergraph' not in tool('walkscript.py', idx['Plain'])
+    print('ok  LatentTest: ubergraph segments, resume linkage, stubs')
+
+
+latent()

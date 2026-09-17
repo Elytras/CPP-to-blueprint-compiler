@@ -127,6 +127,10 @@ public:
     void ComputedJump(const std::function<void(FScript&)>& OffsetExpr);
     /* A raw int32 operand after an Op, to patch later through PatchJumpTarget. */
     void RawInt32(int32 Value);
+    /* EX_SkipOffsetConst: a MEMORY offset as a value (FLatentActionInfo::Linkage). Returns the patch position. */
+    int32 SkipOffsetConst(int32 MemTarget);
+    /* Patch positions of latent calls' Linkage whose resume point is the end of the statement being emitted. */
+    std::vector<int32> LatentResumes;
 
     void FieldPath(const std::string& PropertyName, FIndex Owner);
     void FieldPath(const std::vector<std::string>& Path, FIndex Owner);     // innermost first: {"Items", "Items"} is an array's element
@@ -167,6 +171,9 @@ public:
     void CallMath(FIndex Function);
     void FinalFunction(FIndex Function);
     void LocalFinalFunction(FIndex Function);
+    /* Writes Value into the ubergraph frame property PropertyName of UberGraph (an event stub copying a parm in). */
+    void LetValueOnPersistentFrame(const std::string& PropertyName, FIndex UberGraph,
+                                   const std::function<void(FScript&)>& Value);
     void VirtualFunction(const std::string& FunctionName);
 
     void Unimplemented(EExprToken Token, std::string* Err);

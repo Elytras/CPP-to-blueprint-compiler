@@ -192,6 +192,7 @@ void FBlueprintClass::Finish()
     const std::vector<FPropertyDef> ClassVars = Vars;
     const bool bActor = bIsActor;
     const uint32 Flags = ClassFlags;
+    const FIndex UberGraph = UberGraphFunction;
     /* UBlueprintGeneratedClass::GetLifetimeBlueprintReplicationList stops after this many CPF_Net properties: without
        the tag nothing the class declares replicates. Measured on BP_LiftPod: the first tag. */
     const int32 NumReplicated = int32(std::count_if(Vars.begin(), Vars.end(),
@@ -202,6 +203,10 @@ void FBlueprintClass::Finish()
         if (bActor)
             Tag(Ar, "SimpleConstructionScript", "ObjectProperty",
                 [=](FArc& V) { V.Idx(ScsIdx); });
+        /* Measured on BP_LiftPod, after SimpleConstructionScript. UBlueprintGeneratedClass::Link then finds the
+           UberGraphFrame property by name. */
+        if (UberGraph.V != 0)
+            Tag(Ar, "UberGraphFunction", "ObjectProperty", [=](FArc& V) { V.Idx(UberGraph); });
         TagEnd(Ar);
         Ar.Bool(false);
 

@@ -36,6 +36,8 @@ public:
     /* Replication: the CDO's bReplicates, set when the class replicates a variable or declares an RPC. The class's
        NumReplicatedProperties tag is counted from the CPF_Net variables. */
     void SetReplicates(bool bValue) { bReplicates = bValue; }
+    /* ExecuteUbergraph_<Class>: written as the class's UberGraphFunction tag. */
+    void SetUberGraphFunction(FIndex Function) { UberGraphFunction = Function; }
 
     /*
     `Super` is the engine UFunction being overridden, or null for a new method. Body receives the
@@ -73,6 +75,7 @@ private:
     bool bParentIsBlueprint = false;
     bool bIsActor = true;
     bool bReplicates = false;
+    FIndex UberGraphFunction;
     uint32 ClassFlags = 0x00840814;
 
     std::unordered_map<std::string, int32> ImportCache;

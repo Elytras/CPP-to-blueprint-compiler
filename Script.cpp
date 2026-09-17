@@ -421,6 +421,14 @@ void FScript::RawInt32(int32 Value)
     Memory += 4;
 }
 
+int32 FScript::SkipOffsetConst(int32 MemTarget)
+{
+    Op(EX_SkipOffsetConst);
+    const int32 PatchAt = int32(Ar.B.size());
+    RawInt32(MemTarget);
+    return PatchAt;
+}
+
 void FScript::PatchJumpTarget(int32 StorageOffset, int32 MemTarget)
 {
     const uint32 V = uint32(MemTarget);
@@ -617,6 +625,14 @@ void FScript::LocalFinalFunction(FIndex Function)
     Op(EX_LocalFinalFunction);
     Ar.Idx(Function);
     Memory += kMemObjectRef;
+}
+
+void FScript::LetValueOnPersistentFrame(const std::string& PropertyName, FIndex UberGraph,
+                                        const std::function<void(FScript&)>& Value)
+{
+    Op(EX_LetValueOnPersistentFrame);
+    FieldPath(PropertyName, UberGraph);
+    Value(*this);
 }
 
 void FScript::VirtualFunction(const std::string& FunctionName)

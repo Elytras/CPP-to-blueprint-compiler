@@ -223,7 +223,7 @@ struct FCallIR;
 struct FArgIR
 {
     enum EKind { Self, Int, Int64, Float, Bool, Byte, Str, Name, Text, Field, Local, LocalOut, Member, Call, NullObj, StructLit,
-                 ObjConst, SoftPath, DynCast, Index, Delegate, InterfaceCtx } K = Self;
+                 ObjConst, SoftPath, DynCast, Index, Delegate, InterfaceCtx, LatentInfo } K = Self;
     int32 I = 0;            // Int / Byte: the value; StructLit: the struct's size
     int64 I64 = 0;
     float F = 0.0f;
@@ -462,6 +462,16 @@ bool EmitArg(FScript& S, const FArgIR& A, FIndex SelfExp, std::string* Err)
         if (!bOk && Err) *Err = SubErr;
         return bOk;
     }
+    case FArgIR::LatentInfo:
+        /* Measured on BP_LiftPod's Delay calls: {Linkage, UUID, ExecuteUbergraph_<Class>, self}, serialized size 32.
+           Linkage is the resume point, the end of the statement, which EmitStmts patches in. */
+        S.StructConst(A.Owner, 32, [&](FScript& C) {
+            C.LatentResumes.push_back(C.SkipOffsetConst(0));
+            C.IntConst(A.I);
+            C.NameConst(A.S);
+            C.Self();
+        });
+        return true;
     case FArgIR::Name:  S.NameConst(A.S); return true;
     case FArgIR::Text:  S.TextConst(A.S, A.bWide); return true;
     case FArgIR::Str:
@@ -834,6 +844,10 @@ private:
     bool ReadScratchAdded = false;
     int32 ReadTmpCounter = 0;
     int32 LoopDepth = 0;                              // LowerBody: the loops around the statement being lowered
+    std::string CurFnName;                            // Generate: the method being lowered
+    std::string LatentRefusal;                        // why that method cannot make a latent call, or empty
+    bool bMadeLatentCall = false;                     // LowerCall: it made one, so it moves into the ubergraph
+    int32 LatentCount = 0;
     int32 SwitchDepth = 0;                            // LowerBody: the switches around it
 };
 
@@ -1043,8 +1057,54 @@ void EmitStmts(const std::vector<FStmtIR>& Stmts, FScript& S, FIndex SelfExp, FL
             if (Returns) Returns->push_back(S.Jump(0));
             break;
         }
+        /* After a latent call this run of the ubergraph ends; the latent action re-enters right here. BP_LiftPod
+           ends it with EX_PopExecutionFlow onto a pushed final return, which is the same thing. */
+        if (!S.LatentResumes.empty())
+        {
+            S.Return();
+            for (int32 At : S.LatentResumes) S.PatchJumpTarget(At, S.MemorySize());
+            S.LatentResumes.clear();
+        }
     }
 }
+
+/* Renames the locals a list of statements names (a latent function's, moving into the ubergraph frame). Lowered
+   trees share nodes, so each one is renamed once. */
+struct FLocalRenamer
+{
+    const std::map<std::string, std::string>& To;
+    std::set<const void*> Seen;
+
+    void Name(std::string& N) { if (auto It = To.find(N); It != To.end()) N = It->second; }
+    void Arg(FArgIR& A)
+    {
+        if (!Seen.insert(&A).second) return;
+        if (A.K == FArgIR::Local || A.K == FArgIR::LocalOut
+            || (A.K == FArgIR::Call && A.Sub && A.Sub->Intrinsic == "__RefAtInline__")) Name(A.S);
+        if (A.Sub) Call(*A.Sub);
+        if (A.Base) Arg(*A.Base);
+    }
+    void Call(FCallIR& C)
+    {
+        if (!Seen.insert(&C).second) return;
+        for (FArgIR& A : C.Args) Arg(A);
+        if (C.Target) Arg(*C.Target);
+        if (C.Inline) List(*C.Inline);
+        Name(C.InlineResult);
+    }
+    void List(std::vector<FStmtIR>& Stmts)
+    {
+        if (!Seen.insert(&Stmts).second) return;
+        for (FStmtIR& St : Stmts)
+        {
+            Call(St.Target);
+            Call(St.Call);
+            for (FArgIR* A : { &St.Var, &St.Value, &St.Cond, &St.SwitchValue }) Arg(*A);
+            for (FArgIR& A : St.CaseTests) Arg(A);
+            for (auto* L : { &St.Then, &St.Else, &St.Body, &St.Inc, &St.Trailer }) if (*L) List(**L);
+        }
+    }
+};
 
 /* A Blueprint UE_CLASS package must be the asset path (/Game/Mods/Lib/Lib), not its folder: the
    folder form names a package that does not exist, and the first symptom is a null UFunction at call time. */
@@ -2572,14 +2632,40 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
        it - is wired like the Blueprint editor wires the hidden pin: self, or the enclosing static's
        own world context parameter, since a static's self is a CDO with no world. */
     const std::vector<std::string> Parms = ParmNames(*FullDecl);
+    /* The mod never writes a latent call's FLatentActionInfo: genueapi's overloads leave it out, and it is filled in
+       here, after the world context. */
+    size_t LatentAt = Parms.size();
+    {
+        size_t I = 0;
+        ForEach(*FullDecl, [&](const Json& C) {
+            if (Kind(C) != "ParmVarDecl") return;
+            if (StripTypeKeywords(TypeOf(C)) == "FLatentActionInfo") LatentAt = I;
+            ++I;
+        });
+    }
+    const size_t Hidden = LatentAt < Parms.size() ? 1 : 0;
+    if (Hidden && Out.Args.size() == Parms.size())
+    { *Err = MethodName + ": leave the FLatentActionInfo argument out, the compiler supplies it"; return false; }
     for (size_t I = 0; I < Parms.size(); ++I)
     {
         if (!IsWcoName(Parms[I])) continue;
         FArgIR Wco;
         if (!CurrentWco.empty()) { Wco.K = FArgIR::Local; Wco.S = CurrentWco; }
-        if (Out.Args.size() + 1 == Parms.size()) Out.Args.insert(Out.Args.begin() + I, Wco);
+        if (Out.Args.size() + 1 + Hidden == Parms.size()) Out.Args.insert(Out.Args.begin() + I, Wco);
         else if (I < Defaulted.size() && Defaulted[I]) Out.Args[I] = Wco;
         break;
+    }
+    if (Hidden)
+    {
+        if (!LatentRefusal.empty()) { *Err = "latent call " + MethodName + ": " + LatentRefusal; return false; }
+        FArgIR L;
+        L.K = FArgIR::LatentInfo;
+        L.Owner = BP.ScriptStruct("/Script/Engine", "LatentActionInfo");
+        L.S = "ExecuteUbergraph_" + Cur->CppName;
+        /* The latent action manager keys pending actions by UUID per callback target: one per call site. */
+        L.I = int32(std::hash<std::string>{}(Cur->CppName + "." + CurFnName + "#" + std::to_string(++LatentCount)));
+        Out.Args.insert(Out.Args.begin() + std::min(LatentAt, Out.Args.size()), L);
+        bMadeLatentCall = true;
     }
     return true;
 }
@@ -4037,6 +4123,21 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         }
     }
 
+    /* A method that makes a latent call becomes a segment of ExecuteUbergraph_<Class> and keeps its name as a stub
+       event that jumps in, as the editor compiles an event graph. The latent action manager needs a world. */
+    const bool bCanLatent = std::find(Ancestry.begin(), Ancestry.end(), "Actor") != Ancestry.end()
+                         || std::find(Ancestry.begin(), Ancestry.end(), "ActorComponent") != Ancestry.end();
+    struct FSegment
+    {
+        std::string Name;
+        FIndex Super;
+        std::vector<FPropertyDef> Parms, Locals;
+        std::vector<FStmtIR> Stmts;
+        uint32 Flags = 0;
+        std::map<std::string, std::string> Rename;
+    };
+    std::vector<FSegment> Segments;
+
     for (const FMethod& Fn : Methods)
     {
         const Json& Decl = *Fn.Decl;
@@ -4086,6 +4187,14 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         LoopDepth = 0;
         SwitchDepth = 0;
         KeepLoaded.clear();
+        CurFnName = Fn.Name;
+        bMadeLatentCall = false;
+        LatentCount = 0;
+        LatentRefusal = !bCanLatent ? "only an Actor or ActorComponent class has a world to resume in"
+                      : IsStaticDecl(Decl) ? "a static function has no ubergraph to resume in"
+                      : (!RetType.empty() && RetType != "void") || HasOutParm(Params)
+                          ? "a function that resumes later returns nothing and takes no reference parameters"
+                      : "";
         if (Fn.Body && !LowerBody(*Fn.Body, BP, Stmts, Locals, Err))
         {
             *Err = R.CppName + "::" + Fn.Name + ": " + *Err;
@@ -4162,6 +4271,16 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             bReplicatesAnything = true;
         }
 
+        if (bMadeLatentCall)
+        {
+            if (bScratchNeeded)
+            { *Err = R.CppName + "::" + Fn.Name + ": TODO: a pointer read in a function that makes a latent call"; return false; }
+            FSegment Seg{ Fn.Name, Super, {}, Locals, Stmts, Flags, {} };
+            Seg.Parms.assign(Params.begin(), Params.end() - Locals.size());
+            Segments.push_back(std::move(Seg));
+            continue;
+        }
+
         BP.AddFunction(Fn.Name, Super, Params,
                        [Stmts, bEndsWithReturn, bScratchNeeded, DerefStruct](FScript& S, FIndex SelfExp) {
             if (bScratchNeeded)
@@ -4179,6 +4298,87 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             if (!bEndsWithReturn) S.Return();
             S.EndOfScript();
         }, Flags);
+    }
+
+    if (!Segments.empty())
+    {
+        const std::string UberName = "ExecuteUbergraph_" + R.CppName;
+        for (const FRecord* A = &R; A; A = A->Base.empty() ? nullptr : Find(A->Base))
+            if (A->Methods.count(UberName)) { *Err = A->CppName + " declares " + UberName + ", the ubergraph's own name"; return false; }
+
+        /* Every segment's parms and locals share the ubergraph frame: <Fn>_<Name>, numbered past a taken name. The
+           mod's own properties along the class chain are taken too, so a frame local never reads like one. */
+        std::set<std::string> Taken = { "EntryPoint", "UberGraphFrame" };
+        for (const FRecord* A = &R; A; A = A->Base.empty() ? nullptr : Find(A->Base))
+            for (const Json* F : A->Fields) Taken.insert(Name(*F));
+        auto Renamed = [](FPropertyDef P, const std::string& To) {
+            /* A container's inner properties carry the container's name. */
+            if (P.Inner) { P.Inner = std::make_shared<FPropertyDef>(*P.Inner); if (P.Inner->Name == P.Name) P.Inner->Name = To; }
+            if (P.Value) { P.Value = std::make_shared<FPropertyDef>(*P.Value); if (P.Value->Name == P.Name) P.Value->Name = To; }
+            P.Name = To;
+            P.PropertyFlags &= ~uint64(CPF_Parm | CPF_OutParm | CPF_ReferenceParm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+            return P;
+        };
+        /* Measured on ExecuteUbergraph_BP_LiftPod: EntryPoint is Parm | BlueprintVisible | BlueprintReadOnly. */
+        FPropertyDef Entry = IntParam("EntryPoint");
+        Entry.PropertyFlags = CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly;
+        std::vector<FPropertyDef> Frame{ Entry };
+        for (FSegment& Seg : Segments)
+        {
+            for (std::vector<FPropertyDef>* List : { &Seg.Parms, &Seg.Locals })
+                for (const FPropertyDef& P : *List)
+                {
+                    std::string To = Seg.Name + "_" + P.Name;
+                    for (int32 N = 2; Taken.count(To); ++N) To = Seg.Name + "_" + P.Name + "_" + std::to_string(N);
+                    Taken.insert(To);
+                    Seg.Rename[P.Name] = To;
+                    Frame.push_back(Renamed(P, To));
+                }
+            FLocalRenamer{ Seg.Rename }.List(Seg.Stmts);
+        }
+
+        /* Measured: a computed jump on EntryPoint, each event's code at the offset its stub passes. A segment ends in
+           a return where the editor pops back to its one pushed return. */
+        auto Entries = std::make_shared<std::vector<int32>>(Segments.size());
+        const FIndex Uber = BP.AddFunction(UberName, Null(), Frame, [Segments, Entries](FScript& S, FIndex SelfExp) {
+            S.ComputedJump([SelfExp](FScript& C) { C.LocalVariable("EntryPoint", SelfExp); });
+            for (size_t I = 0; I < Segments.size(); ++I)
+            {
+                (*Entries)[I] = S.MemorySize();
+                EmitStmts(Segments[I].Stmts, S, SelfExp);
+                S.Return();
+            }
+            S.EndOfScript();
+        }, FUNC_UbergraphFunction | FUNC_HasDefaults | FUNC_Final);
+
+        /* The stubs follow the ubergraph, so its body (and Entries) is written first. Measured on BP_LiftPod's
+           OnCompleted_*: each parm copied into the frame, then EX_LocalFinalFunction ExecuteUbergraph(offset). */
+        for (size_t I = 0; I < Segments.size(); ++I)
+        {
+            std::vector<std::pair<std::string, std::string>> Copies;
+            for (const FPropertyDef& P : Segments[I].Parms) Copies.emplace_back(P.Name, Segments[I].Rename.at(P.Name));
+            BP.AddFunction(Segments[I].Name, Segments[I].Super, Segments[I].Parms,
+                           [Copies, Uber, Entries, I](FScript& S, FIndex SelfExp) {
+                for (const auto& [From, To] : Copies)
+                    S.LetValueOnPersistentFrame(To, Uber, [&, From](FScript& V) { V.LocalVariable(From, SelfExp); });
+                S.LocalFinalFunction(Uber);
+                S.IntConst((*Entries)[I]);
+                S.EndFunctionParms();
+                S.Return();
+                S.EndOfScript();
+            }, Segments[I].Flags);
+        }
+
+        /* Measured on BP_LiftPod: a transient FPointerToUberGraphFrame the class links by this name. */
+        FPropertyDef FramePtr;
+        FramePtr.Type = "StructProperty";
+        FramePtr.Name = "UberGraphFrame";
+        FramePtr.ElementSize = 16;
+        FramePtr.PropertyFlags = CPF_Transient | CPF_DuplicateTransient;
+        FramePtr.Extra = BP.ScriptStruct("/Script/Engine", "PointerToUberGraphFrame");
+        FramePtr.StructName = "PointerToUberGraphFrame";
+        BP.AddVariable(FramePtr);
+        BP.SetUberGraphFunction(Uber);
     }
 
     if (bReplicatesAnything) BP.SetReplicates(true);
