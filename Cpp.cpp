@@ -1833,6 +1833,15 @@ bool IsTMapElement(const Json& N)
         && Map && TemplateArg(TypeOf(*Map), "TMap", &Inner);
 }
 
+/* A TMap or TSet anywhere in a property, a nested one's wrapper included: the engine replicates neither. */
+bool HoldsMapOrSet(const FPropertyDef& P)
+{
+    if (P.Type == "MapProperty" || P.Type == "SetProperty") return true;
+    if (P.Type == "StructProperty" && P.StructName.compare(0, 4, "FNC_") == 0
+        && (P.StructName.find("TMap") != std::string::npos || P.StructName.find("TSet") != std::string::npos)) return true;
+    return P.Inner && HoldsMapOrSet(*P.Inner);
+}
+
 /* A variable, a member of one, or a member of this: what `T& R` can be another name for. */
 bool IsAliasable(const Json& N)
 {
@@ -4730,6 +4739,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                function's name when it has one. */
             const std::string Notify = Rep->second.substr(0, Rep->second.find(':'));
             const std::string Cond = Rep->second.substr(Rep->second.find(':') + 1);
+            if (HoldsMapOrSet(PD)) { *Err = R.CppName + "::" + FieldName + ": a TMap or TSet does not replicate"; return false; }
             PD.PropertyFlags |= CPF_Net;
             if (!Notify.empty())
             {
@@ -4931,6 +4941,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             if (Super.V != 0) { *Err = R.CppName + "::" + Fn.Name + ": an override takes its parent's replication; drop the RPC marker"; return false; }
             if (!RetType.empty() && RetType != "void") { *Err = R.CppName + "::" + Fn.Name + ": an RPC returns void"; return false; }
             if (HasOutParm(Params)) { *Err = R.CppName + "::" + Fn.Name + ": an RPC takes no reference parameters"; return false; }
+            if (std::any_of(Params.begin(), Params.end(), [](const FPropertyDef& P) { return HoldsMapOrSet(P); }))
+            { *Err = R.CppName + "::" + Fn.Name + ": an RPC parameter cannot be a TMap or TSet, which do not replicate"; return false; }
             Flags |= Net;
             bReplicatesAnything = true;
         }
