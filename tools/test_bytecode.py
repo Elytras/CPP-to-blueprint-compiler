@@ -185,3 +185,29 @@ for stop in (0, 15, 1000):
         want = fn(range_self(Scores=m))
         assert got == want, 'BumpScores(%s, %s) = %r, want %r' % (m, stop, got, want)
 print('ok  RangeTest.BumpScores  (9 cases)')
+
+
+def clamp(v, lo, hi): return lo if v < lo else hi if v > hi else v
+def first_above(limit): return next((i for i in range(100) if i * i > limit), -1)
+def nest(v): return v * 4 + clamp(v, 0, 10)
+
+
+check('InlineTest', 'UseClamp', lambda V: clamp(V, -5, 5) + V * 2 + cdiv(V, 2), [dict(V=v) for v in (-9, -1, 0, 3, 7)])
+for v in (0, 2, -4):
+    fields = {}
+    got = run(asset('InlineTest'), 'UseBump', self_vars=fields, V=v)[0]
+    assert got == (v + 3 + v) * 100 + 2, ('UseBump', v, got)
+print('ok  InlineTest.UseBump  (3 cases)')
+check('InlineTest', 'UseLoop', lambda L: sum(first_above(L + i) for i in range(3)), [dict(L=l) for l in (0, 5, 50, 9990)])
+check('InlineTest', 'UseNest', lambda V: nest(V) + nest(V + 1), [dict(V=v) for v in (-2, 0, 4, 12)])
+check('InlineTest', 'InCond', lambda V: 1 if V * 2 > 10 and clamp(V, 0, 3) == 3 else 0, [dict(V=v) for v in (0, 5, 6, 9)])
+
+
+def no_inline_ufunctions():
+    exports = [e['name'] for e in dumpexp.load(asset('InlineTest'))[5]]
+    for name in ('Clamp', 'Half', 'Twice', 'Bump', 'FirstAbove', 'Nest'):
+        assert name not in exports, name + ' became a UFunction'
+    print('ok  InlineTest: no inline function is a UFunction')
+
+
+no_inline_ufunctions()

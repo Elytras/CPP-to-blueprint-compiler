@@ -308,8 +308,13 @@ FArgIR ConstArg(const Json& E)
     return X;
 }
 
+struct FStmtIR;
+
 struct FCallIR
 {
+    std::shared_ptr<std::vector<FStmtIR>> Inline;   // __Inline__: the expanded body, one Block statement
+    std::string InlineResult;                       // __Inline__: the local holding its return value, or empty
+    std::string InlineType;                         // __Inline__: that local's type
     FIndex Fn;                          // empty for intrinsics
     std::string Intrinsic;              // __NAME__ compiler intrinsic
     FIndex Extra;
@@ -350,6 +355,8 @@ struct FStmtIR
         Continue,
         Switch,
         Label,
+        Block,                                      // an inline function's body: Body, where InlineReturn jumps past
+        InlineReturn,
     } K = StaticCall;
 
     FCallIR Target;
@@ -676,6 +683,21 @@ private:
     bool LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR& Out, std::string* Err);
     bool LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vector<FStmtIR>& Out,
                        std::vector<FPropertyDef>& Locals, std::string* Err);
+
+    /* `inline` functions are the editor's macros: never a UFunction, their body is copied into each caller.
+       `inline` may sit on the declaration or on an out-of-line definition. */
+    bool IsInlineMethod(const FRecord& R, const std::string& Method) const;
+    bool ExpandInline(const Json& CallNode, const FRecord& R, const std::string& Method, FBlueprintClass& BP,
+                      FCallIR& Out, std::string* Err);
+    std::string LocalName(const Json& Decl) const
+    {
+        auto It = LocalRename.find(Decl.value("id", std::string()));
+        return It == LocalRename.end() ? Name(Decl) : It->second;
+    }
+    std::map<std::string, std::string> LocalRename;                     // decl id -> an inlined local's unique name
+    std::vector<std::pair<std::string, std::string>> InlineResults;     // per expansion in progress: result local, type
+    std::vector<std::string> InlineStack;                               // the inline functions being expanded
+    std::vector<FPropertyDef>* CurLocals = nullptr;                     // the function being lowered's locals
     bool LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     bool LowerArgRaw(const Json& N, const std::string& OuterType, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     bool ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgIR& Arg, std::string* Err);
@@ -796,7 +818,9 @@ struct FLoopPatches
     std::vector<int32> Breaks, Continues;
 };
 
-void EmitStmts(const std::vector<FStmtIR>& Stmts, FScript& S, FIndex SelfExp, FLoopPatches* Loop = nullptr)
+/* Returns: the innermost inline Block's forward jumps to its end. */
+void EmitStmts(const std::vector<FStmtIR>& Stmts, FScript& S, FIndex SelfExp, FLoopPatches* Loop = nullptr,
+               std::vector<int32>* Returns = nullptr)
 {
     for (const FStmtIR& St : Stmts)
     {
@@ -849,12 +873,12 @@ void EmitStmts(const std::vector<FStmtIR>& Stmts, FScript& S, FIndex SelfExp, FL
         {
             const int32 NotPatch = S.JumpIfNot(0,
                 [St, SelfExp](FScript& C) { EmitArg(C, St.Cond, SelfExp, nullptr); });
-            if (St.Then) EmitStmts(*St.Then, S, SelfExp, Loop);
+            if (St.Then) EmitStmts(*St.Then, S, SelfExp, Loop, Returns);
             if (St.Else && !St.Else->empty())
             {
                 const int32 EndPatch = S.Jump(0);
                 S.PatchJumpTarget(NotPatch, S.MemorySize());
-                EmitStmts(*St.Else, S, SelfExp, Loop);
+                EmitStmts(*St.Else, S, SelfExp, Loop, Returns);
                 S.PatchJumpTarget(EndPatch, S.MemorySize());
             }
             else
@@ -872,16 +896,16 @@ void EmitStmts(const std::vector<FStmtIR>& Stmts, FScript& S, FIndex SelfExp, FL
             const int32 Head = S.MemorySize();
             const int32 ExitPatch = S.JumpIfNot(0,
                 [St, SelfExp](FScript& C) { EmitArg(C, St.Cond, SelfExp, nullptr); });
-            if (St.Body) EmitStmts(*St.Body, S, SelfExp, &Inner);
+            if (St.Body) EmitStmts(*St.Body, S, SelfExp, &Inner, Returns);
             for (int32 P : Inner.Continues) S.PatchJumpTarget(P, S.MemorySize());
-            if (St.Inc) EmitStmts(*St.Inc, S, SelfExp, Loop);
+            if (St.Inc) EmitStmts(*St.Inc, S, SelfExp, Loop, Returns);
             S.Jump(Head);
             if (St.Trailer && !Inner.Breaks.empty())
             {
                 /* A `break` runs the trailer and falls into the exit; a failed condition skips it. */
                 for (int32 P : Inner.Breaks) S.PatchJumpTarget(P, S.MemorySize());
                 Inner.Breaks.clear();
-                EmitStmts(*St.Trailer, S, SelfExp, Loop);
+                EmitStmts(*St.Trailer, S, SelfExp, Loop, Returns);
             }
             S.PatchJumpTarget(ExitPatch, S.MemorySize());
             for (int32 P : Inner.Breaks) S.PatchJumpTarget(P, S.MemorySize());
@@ -961,7 +985,7 @@ void EmitStmts(const std::vector<FStmtIR>& Stmts, FScript& S, FIndex SelfExp, FL
             for (const FStmtIR& B : *St.Body)
             {
                 if (B.K == FStmtIR::Label) { LabelAt[B.LabelId] = S.MemorySize(); continue; }
-                EmitStmts({ B }, S, SelfExp, &Inner);
+                EmitStmts({ B }, S, SelfExp, &Inner, Returns);
             }
             const int32 End = S.MemorySize();
             const int32 MissTarget = St.LabelId >= 0 ? LabelAt[St.LabelId] : End;
@@ -979,6 +1003,19 @@ void EmitStmts(const std::vector<FStmtIR>& Stmts, FScript& S, FIndex SelfExp, FL
         }
 
         case FStmtIR::Label:
+            break;
+
+        case FStmtIR::Block:
+        {
+            /* A loop around the call site is not the inline body's: `break` cannot cross a function. */
+            std::vector<int32> Ends;
+            if (St.Body) EmitStmts(*St.Body, S, SelfExp, nullptr, &Ends);
+            for (int32 P : Ends) S.PatchJumpTarget(P, S.MemorySize());
+            break;
+        }
+
+        case FStmtIR::InlineReturn:
+            if (Returns) Returns->push_back(S.Jump(0));
             break;
         }
     }
@@ -1857,7 +1894,7 @@ bool FCompiler::LowerAddress(const Json& Lvalue, FBlueprintClass& BP, FArgIR& Ou
             *Pointee = A->second;
             Out = FArgIR();
             Out.K = FArgIR::Local;
-            Out.S = Ref.value("name", std::string());
+            Out.S = LocalName(Ref);
             Out.InnerType = "int64";
             return true;
         }
@@ -2150,7 +2187,7 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             std::string Pointee;
             return LowerAddress(*N, BP, Addr, &Pointee, Err) && ReadThrough(std::move(Addr), Pointee, BP, Out, Err);
         }
-        const std::string RefName = Ref.value("name", std::string());
+        const std::string RefName = LocalName(Ref);
         Out.K = CurrentOutParms.count(RefName) ? FArgIR::LocalOut : FArgIR::Local;
         Out.S = RefName;
         return true;
@@ -2464,6 +2501,8 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         auto Decl = R->Methods.find(MethodName);
         const bool bStatic = Decl != R->Methods.end() && IsStaticDecl(*Decl->second);
         if (Decl != R->Methods.end()) FullDecl = Decl->second;
+        if (!R->IsNative() && Decl != R->Methods.end() && IsInlineMethod(*R, MethodName))
+            return ExpandInline(CallExprNode, *R, MethodName, BP, Out, Err);
 
         if (!R->IsNative() && !bStatic) Out.VirtualName = MethodName;
 
@@ -2526,7 +2565,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             ForEach(*S, [&](const Json& D) {
                 if (!bOk || Kind(D) != "VarDecl") return;
                 bAny = true;
-                const std::string VarName = Name(D);
+                const std::string VarName = LocalName(D);
                 std::string VarType = TypeOf(D);
                 FStmtIR Ds;
                 const Json* RefInit = First(D) ? PeelLvalue(First(D)) : nullptr;
@@ -2594,10 +2633,12 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             St.K = FStmtIR::StaticCall;
             bOk = LowerArgRaw(*S, TypeOf(*S), BP, V, Err);
             if (bOk) St.Call = *V.Sub;
+            if (bOk && St.Call.Inline) { for (FStmtIR& B : *St.Call.Inline) Out.push_back(std::move(B)); return; }
         }
         else if (K == "CallExpr")
         {
             bOk = LowerCall(*S, BP, St.Call, Err);
+            if (bOk && St.Call.Inline) { for (FStmtIR& B : *St.Call.Inline) Out.push_back(std::move(B)); return; }
         }
         else if (K == "CompoundAssignOperator"
               || (K == "UnaryOperator" && (S->value("opcode", std::string()) == "++" || S->value("opcode", std::string()) == "--")))
@@ -2684,7 +2725,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 const std::string RefKind = Ref.value("kind", std::string());
                 if (RefKind != "ParmVarDecl" && RefKind != "VarDecl")
                 { *Err = "TODO: assignment to a DeclRefExpr of kind " + RefKind; bOk = false; return; }
-                const std::string RefName = Ref.value("name", std::string());
+                const std::string RefName = LocalName(Ref);
                 const bool bOut = CurrentOutParms.count(RefName) != 0;
                 St.K = FStmtIR::Assign;
                 St.Var.K = bOut ? FArgIR::LocalOut : FArgIR::Local;
@@ -2711,6 +2752,22 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 bOk = false;
                 return;
             }
+        }
+        else if (K == "ReturnStmt" && !InlineResults.empty())
+        {
+            /* In an inline body: store the value, then jump past the body. */
+            if (First(*S))
+            {
+                FStmtIR Store;
+                Store.K = FStmtIR::Assign;
+                Store.Var.K = FArgIR::Local;
+                Store.Var.S = InlineResults.back().first;
+                Store.Var.LetOp = LetOpFor(InlineResults.back().second);
+                Store.bAssignLocal = true;
+                if (!LowerArg(*First(*S), BP, Store.Value, Err)) { bOk = false; return; }
+                Out.push_back(std::move(Store));
+            }
+            St.K = FStmtIR::InlineReturn;
         }
         else if (K == "ReturnStmt")
         {
@@ -2918,6 +2975,120 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
         if (bOk) Out.push_back(St);
     });
     return bOk;
+}
+
+bool FCompiler::IsInlineMethod(const FRecord& R, const std::string& Method) const
+{
+    auto Decl = R.Methods.find(Method);
+    auto Def = R.MethodDefs.find(Method);
+    return (Decl != R.Methods.end() && Decl->second->value("inline", false))
+        || (Def != R.MethodDefs.end() && Def->second->value("inline", false));
+}
+
+/* The call becomes one Block statement in Out.Inline:
+       <each by-value parameter> = <its argument>;
+       <the body, locals renamed __Inl<N>_<name>, `return X` as `__Inl<N>_ReturnValue = X` + a jump to the end>
+   A reference parameter bound to a variable is another name for it; bound to anything else it is a copy.
+   Only calls on `this` (or a static) expand, since the body's `this` stays the caller's self. */
+bool FCompiler::ExpandInline(const Json& CallNode, const FRecord& R, const std::string& Method, FBlueprintClass& BP,
+                             FCallIR& Out, std::string* Err)
+{
+    if (!CurLocals) { *Err = "internal: an inline call outside a function body"; return false; }
+    if (std::find(InlineStack.begin(), InlineStack.end(), R.CppName + "::" + Method) != InlineStack.end())
+    { *Err = "inline function " + R.CppName + "::" + Method + " calls itself"; return false; }
+    if (Kind(CallNode) == "CXXMemberCallExpr")
+    {
+        const Json* Callee = Strip(First(CallNode));
+        const Json* Obj = Callee ? Strip(First(*Callee)) : nullptr;
+        if (!Obj || Kind(*Obj) != "CXXThisExpr")
+        { *Err = "TODO: inline function " + Method + " called on another object (only this)"; return false; }
+    }
+    auto DefIt = R.MethodDefs.find(Method);
+    const Json& Def = DefIt != R.MethodDefs.end() ? *DefIt->second : *R.Methods.at(Method);
+    const Json* Body = nullptr;
+    ForEach(Def, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Body = &C; });
+    if (!Body) { *Err = "inline function " + Method + " has no body"; return false; }
+
+    const std::string Prefix = "__Inl" + std::to_string(ReadTmpCounter++) + "_";
+    std::vector<FPropertyDef>& Locals = *CurLocals;
+    auto AddLocal = [&](const std::string& Name, const std::string& Type) {
+        FPropertyDef PD;
+        if (!TypeToProperty(Type, Name, 0, "inline " + Method, BP, &PD, Err)) return false;
+        PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+        Locals.push_back(PD);
+        return true;
+    };
+
+    auto Block = std::make_shared<std::vector<FStmtIR>>(1);
+    FStmtIR& B = (*Block)[0];
+    B.K = FStmtIR::Block;
+    B.Body = std::make_shared<std::vector<FStmtIR>>();
+
+    /* Parameters, in order against the call's arguments (inner[0] is the callee). */
+    std::vector<const Json*> Parms, Args;
+    ForEach(Def, [&](const Json& C) { if (Kind(C) == "ParmVarDecl") Parms.push_back(&C); });
+    bool bFirst = true;
+    ForEach(CallNode, [&](const Json& C) { if (bFirst) { bFirst = false; return; } Args.push_back(&C); });
+    if (Args.size() != Parms.size()) { *Err = "inline call to " + Method + " with " + std::to_string(Args.size()) + " arguments"; return false; }
+    for (size_t I = 0; I < Parms.size(); ++I)
+    {
+        const std::string Id = Parms[I]->value("id", std::string());
+        std::string Type = TypeOf(*Parms[I]);
+        const bool bRef = !Type.empty() && Type.back() == '&';
+        const Json* Bare = PeelLvalue(Args[I]);
+        if (bRef && Bare && IsAliasable(*Bare) && !IsDerefLvalue(*Bare)) { RefAlias[Id] = *Bare; continue; }
+        while (!Type.empty() && (Type.back() == '&' || Type.back() == ' ')) Type.pop_back();
+        Type = StripTypeKeywords(Type);
+        const std::string Local = Prefix + Name(*Parms[I]);
+        if (!AddLocal(Local, Type)) return false;
+        FStmtIR Bind;
+        Bind.K = FStmtIR::Assign;
+        Bind.Var.K = FArgIR::Local;
+        Bind.Var.S = Local;
+        Bind.Var.LetOp = LetOpFor(Type);
+        Bind.bAssignLocal = true;
+        if (!LowerArg(*Args[I], BP, Bind.Value, Err)) return false;
+        B.Body->push_back(std::move(Bind));
+        LocalRename[Id] = Local;
+    }
+
+    /* Every local the body declares gets the expansion's prefix. */
+    std::function<void(const Json&)> Rename = [&](const Json& N) {
+        if (!N.is_object()) return;
+        if ((Kind(N) == "VarDecl" || Kind(N) == "DecompositionDecl") && N.contains("name"))
+            LocalRename[N.value("id", std::string())] = Prefix + Name(N);
+        ForEach(N, Rename);
+    };
+    Rename(*Body);
+
+    std::string RetType = Def["type"].value("qualType", std::string());
+    RetType = RetType.substr(0, RetType.find('('));
+    while (!RetType.empty() && (RetType.back() == ' ' || RetType.back() == '&')) RetType.pop_back();
+    RetType = StripTypeKeywords(RetType);
+    const bool bValue = !RetType.empty() && RetType != "void";
+    if (bValue)
+    {
+        Out.InlineResult = Prefix + "ReturnValue";
+        Out.InlineType = RetType;
+        if (!AddLocal(Out.InlineResult, RetType)) return false;
+    }
+
+    InlineStack.push_back(R.CppName + "::" + Method);
+    InlineResults.emplace_back(Out.InlineResult, RetType);
+    const int32 SavedLoops = LoopDepth, SavedSwitches = SwitchDepth;
+    LoopDepth = SwitchDepth = 0;
+    const bool bOk = LowerBody(*Body, BP, *B.Body, Locals, Err);
+    LoopDepth = SavedLoops;
+    SwitchDepth = SavedSwitches;
+    InlineResults.pop_back();
+    InlineStack.pop_back();
+    if (!bOk) { *Err = "inline " + Method + ": " + *Err; return false; }
+
+    /* A return that is the body's last statement already falls through to the end. */
+    if (!B.Body->empty() && B.Body->back().K == FStmtIR::InlineReturn) B.Body->pop_back();
+    Out.Intrinsic = "__Inline__";
+    Out.Inline = Block;
+    return true;
 }
 
 /* A DeclRefExpr to a compiler-made local, for lowering synthetic statements through the ordinary paths. */
@@ -3164,6 +3335,23 @@ bool FCompiler::HoistReadsInArg(FArgIR& A, FBlueprintClass& BP,
         return HoistReadsInArg(A.Sub->Args[0], BP, Locals, OutPre, Err);
     if (A.K != FArgIR::Call || !A.Sub) return true;
     if (IsBranch(A.Sub->Intrinsic)) return HoistBranch(A, BP, Locals, OutPre, Err);
+    if (A.Sub->Intrinsic == "__Inline__")
+    {
+        /* The body runs as statements before the one that uses its value, which is then just the result local. */
+        if (A.Sub->InlineResult.empty()) { *Err = "a void inline function used as a value"; return false; }
+        for (FStmtIR& B : *A.Sub->Inline)
+        {
+            if (B.Body && !HoistReadsInList(*B.Body, BP, Locals, Err)) return false;
+            OutPre.push_back(std::move(B));
+        }
+        const std::string Result = A.Sub->InlineResult, Type = A.Sub->InlineType;
+        A = FArgIR();
+        A.K = FArgIR::Local;
+        A.S = Result;
+        A.LetOp = LetOpFor(Type);
+        A.InnerType = Type;
+        return true;
+    }
     if (A.Sub->Target && !HoistReadsInArg(*A.Sub->Target, BP, Locals, OutPre, Err)) return false;
 
     /* Post-order: inner reads hoist before the outer. That way the outer's Addr can reference
@@ -3310,7 +3498,8 @@ bool ContainsRead(const FArgIR& A)
     if (A.K == FArgIR::DynCast && A.Sub) return ContainsRead(A.Sub->Args[0]);
     if (A.K != FArgIR::Call || !A.Sub) return false;
     if (A.Sub->Target && ContainsRead(*A.Sub->Target)) return true;
-    if (FindReadView(A.Sub->Intrinsic) || A.Sub->Intrinsic == "__RefAt__" || IsBranch(A.Sub->Intrinsic)) return true;
+    if (FindReadView(A.Sub->Intrinsic) || A.Sub->Intrinsic == "__RefAt__" || IsBranch(A.Sub->Intrinsic)
+        || A.Sub->Intrinsic == "__Inline__") return true;
     if (IsReinterpret(A.Sub->Intrinsic) && A.Sub->Args.size() == 1 && !IsStored(A.Sub->Args[0])) return true;
     for (const FArgIR& CA : A.Sub->Args) if (ContainsRead(CA)) return true;
     return false;
@@ -3718,6 +3907,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     for (const auto& Entry : R.Methods)
     {
         FMethod Fn{ Entry.first, Entry.second, Entry.second, nullptr };
+        if (IsInlineMethod(R, Fn.Name)) continue;
         if ((Fn.Body = BodyOf(R, Fn.Name, Fn.Def))) Methods.push_back(Fn);
     }
     /* The editor compiles every Blueprint-implementable function of an implemented interface, a stub
@@ -3791,6 +3981,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         ReadTmpCounter = 0;
         RefAddr.clear();
         RefAlias.clear();
+        LocalRename.clear();
+        CurLocals = &Locals;
         LoopDepth = 0;
         SwitchDepth = 0;
         KeepLoaded.clear();
