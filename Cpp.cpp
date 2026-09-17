@@ -687,14 +687,17 @@ private:
     /* `inline` functions are the editor's macros: never a UFunction, their body is copied into each caller.
        `inline` may sit on the declaration or on an out-of-line definition. */
     bool IsInlineMethod(const FRecord& R, const std::string& Method) const;
-    bool ExpandInline(const Json& CallNode, const FRecord& R, const std::string& Method, FBlueprintClass& BP,
+    bool ExpandInline(const Json& CallNode, const Json& Def, const std::string& Method, bool bMethod, FBlueprintClass& BP,
                       FCallIR& Out, std::string* Err);
+    std::map<std::string, const Json*> FreeInlines;                     // decl id -> an inline free function's definition
+                                                                        // (a template's: each instantiation)
     std::string LocalName(const Json& Decl) const
     {
         auto It = LocalRename.find(Decl.value("id", std::string()));
         return It == LocalRename.end() ? Name(Decl) : It->second;
     }
     std::map<std::string, std::string> LocalRename;                     // decl id -> an inlined local's unique name
+    std::map<std::string, FArgIR> ParmConst;                            // decl id -> the constant an inlined parameter is
     std::vector<std::pair<std::string, std::string>> InlineResults;     // per expansion in progress: result local, type
     std::vector<std::string> InlineStack;                               // the inline functions being expanded
     std::vector<FPropertyDef>* CurLocals = nullptr;                     // the function being lowered's locals
@@ -2176,6 +2179,7 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         }
         /* A reference local (or a range-for binding) is the variable it names, or the value at the address it keeps. */
         if (auto A = RefAlias.find(Ref.value("id", std::string())); A != RefAlias.end()) return LowerArg(A->second, BP, Out, Err);
+        if (auto C = ParmConst.find(Ref.value("id", std::string())); C != ParmConst.end()) { Out = C->second; return true; }
         if (RefKind != "ParmVarDecl" && RefKind != "VarDecl")
         {
             *Err = "TODO: DeclRefExpr to " + RefKind;
@@ -2493,6 +2497,8 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
     }
     else
     {
+        if (auto Free = FreeInlines.find(DeclId); Free != FreeInlines.end())
+            return ExpandInline(CallExprNode, *Free->second, MethodName, false, BP, Out, Err);
         auto Owner = MethodOwner.find(DeclId);
         if (Owner == MethodOwner.end()) { *Err = "call to an unknown function: " + MethodName; return false; }
         const FRecord* R = Find(Owner->second);
@@ -2502,7 +2508,11 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         const bool bStatic = Decl != R->Methods.end() && IsStaticDecl(*Decl->second);
         if (Decl != R->Methods.end()) FullDecl = Decl->second;
         if (!R->IsNative() && Decl != R->Methods.end() && IsInlineMethod(*R, MethodName))
-            return ExpandInline(CallExprNode, *R, MethodName, BP, Out, Err);
+        {
+            auto DefIt = R->MethodDefs.find(MethodName);
+            return ExpandInline(CallExprNode, DefIt != R->MethodDefs.end() ? *DefIt->second : *Decl->second,
+                                R->CppName + "::" + MethodName, true, BP, Out, Err);
+        }
 
         if (!R->IsNative() && !bStatic) Out.VirtualName = MethodName;
 
@@ -2977,6 +2987,21 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
     return bOk;
 }
 
+/* Every use of the declaration Id in N is a plain read (an lvalue-to-rvalue conversion), so nothing writes it,
+   binds a reference to it or takes its address. */
+bool OnlyRead(const Json& N, const std::string& Id)
+{
+    bool bOk = true;
+    std::function<void(const Json&, const Json*)> Walk = [&](const Json& X, const Json* Parent) {
+        if (!bOk || !X.is_object()) return;
+        if (Kind(X) == "DeclRefExpr" && X.contains("referencedDecl") && X["referencedDecl"].value("id", std::string()) == Id)
+            bOk = Parent && Kind(*Parent) == "ImplicitCastExpr" && Parent->value("castKind", std::string()) == "LValueToRValue";
+        ForEach(X, [&](const Json& C) { Walk(C, &X); });
+    };
+    Walk(N, nullptr);
+    return bOk;
+}
+
 bool FCompiler::IsInlineMethod(const FRecord& R, const std::string& Method) const
 {
     auto Decl = R.Methods.find(Method);
@@ -2990,21 +3015,19 @@ bool FCompiler::IsInlineMethod(const FRecord& R, const std::string& Method) cons
        <the body, locals renamed __Inl<N>_<name>, `return X` as `__Inl<N>_ReturnValue = X` + a jump to the end>
    A reference parameter bound to a variable is another name for it; bound to anything else it is a copy.
    Only calls on `this` (or a static) expand, since the body's `this` stays the caller's self. */
-bool FCompiler::ExpandInline(const Json& CallNode, const FRecord& R, const std::string& Method, FBlueprintClass& BP,
+bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::string& Method, bool bMethod, FBlueprintClass& BP,
                              FCallIR& Out, std::string* Err)
 {
     if (!CurLocals) { *Err = "internal: an inline call outside a function body"; return false; }
-    if (std::find(InlineStack.begin(), InlineStack.end(), R.CppName + "::" + Method) != InlineStack.end())
-    { *Err = "inline function " + R.CppName + "::" + Method + " calls itself"; return false; }
-    if (Kind(CallNode) == "CXXMemberCallExpr")
+    if (std::find(InlineStack.begin(), InlineStack.end(), Method) != InlineStack.end())
+    { *Err = "inline function " + Method + " calls itself"; return false; }
+    if (bMethod && Kind(CallNode) == "CXXMemberCallExpr")
     {
         const Json* Callee = Strip(First(CallNode));
         const Json* Obj = Callee ? Strip(First(*Callee)) : nullptr;
         if (!Obj || Kind(*Obj) != "CXXThisExpr")
         { *Err = "TODO: inline function " + Method + " called on another object (only this)"; return false; }
     }
-    auto DefIt = R.MethodDefs.find(Method);
-    const Json& Def = DefIt != R.MethodDefs.end() ? *DefIt->second : *R.Methods.at(Method);
     const Json* Body = nullptr;
     ForEach(Def, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Body = &C; });
     if (!Body) { *Err = "inline function " + Method + " has no body"; return false; }
@@ -3036,18 +3059,27 @@ bool FCompiler::ExpandInline(const Json& CallNode, const FRecord& R, const std::
         std::string Type = TypeOf(*Parms[I]);
         const bool bRef = !Type.empty() && Type.back() == '&';
         const Json* Bare = PeelLvalue(Args[I]);
+        /* A previous expansion of the same function left its own binding for this parameter. */
+        RefAlias.erase(Id);
+        LocalRename.erase(Id);
+        ParmConst.erase(Id);
         if (bRef && Bare && IsAliasable(*Bare) && !IsDerefLvalue(*Bare)) { RefAlias[Id] = *Bare; continue; }
         while (!Type.empty() && (Type.back() == '&' || Type.back() == ' ')) Type.pop_back();
         Type = StripTypeKeywords(Type);
         const std::string Local = Prefix + Name(*Parms[I]);
-        if (!AddLocal(Local, Type)) return false;
         FStmtIR Bind;
+        if (!LowerArg(*Args[I], BP, Bind.Value, Err)) return false;
+        /* A constant the body only reads is used in place: no local, no copy. */
+        const FArgIR::EKind VK = Bind.Value.K;
+        const bool bConst = VK == FArgIR::Int || VK == FArgIR::Int64 || VK == FArgIR::Float || VK == FArgIR::Bool
+                         || VK == FArgIR::Byte || VK == FArgIR::Self || VK == FArgIR::NullObj || VK == FArgIR::ObjConst;
+        if (bConst && OnlyRead(*Body, Id)) { ParmConst[Id] = Bind.Value; continue; }
+        if (!AddLocal(Local, Type)) return false;
         Bind.K = FStmtIR::Assign;
         Bind.Var.K = FArgIR::Local;
         Bind.Var.S = Local;
         Bind.Var.LetOp = LetOpFor(Type);
         Bind.bAssignLocal = true;
-        if (!LowerArg(*Args[I], BP, Bind.Value, Err)) return false;
         B.Body->push_back(std::move(Bind));
         LocalRename[Id] = Local;
     }
@@ -3073,7 +3105,7 @@ bool FCompiler::ExpandInline(const Json& CallNode, const FRecord& R, const std::
         if (!AddLocal(Out.InlineResult, RetType)) return false;
     }
 
-    InlineStack.push_back(R.CppName + "::" + Method);
+    InlineStack.push_back(Method);
     InlineResults.emplace_back(Out.InlineResult, RetType);
     const int32 SavedLoops = LoopDepth, SavedSwitches = SwitchDepth;
     LoopDepth = SwitchDepth = 0;
@@ -3982,6 +4014,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         RefAddr.clear();
         RefAlias.clear();
         LocalRename.clear();
+        ParmConst.clear();
         CurLocals = &Locals;
         LoopDepth = 0;
         SwitchDepth = 0;
@@ -4135,6 +4168,27 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
 
     if (!LoadTables(IncludeDir, Err)) return false;
     if (!Collect(Err)) return false;
+    /* Inline free functions anywhere in the translation unit, a template's instantiations included: a call names
+       the instantiation's own FunctionDecl. Class bodies are skipped; their methods are the records'. */
+    std::function<void(Json&)> IndexInlines = [&](Json& N) {
+        if (!N.is_object()) return;
+        const std::string K = Kind(N);
+        if (K == "CXXRecordDecl") return;
+        if (K == "FunctionDecl" && N.value("inline", false))
+        {
+            bool bBody = false;
+            ForEach(N, [&](const Json& C) { if (Kind(C) == "CompoundStmt") bBody = true; });
+            if (bBody)
+            {
+                NormalizePointers(N);
+                FreeInlines[N.value("id", std::string())] = &N;
+            }
+            return;
+        }
+        auto It = N.find("inner");
+        if (It != N.end()) for (Json& C : *It) IndexInlines(C);
+    };
+    IndexInlines(Doc);
     /* Before anything reads a type: a raw pointer is an int64 from here on (see IsRawPointer). */
     for (const auto& Entry : Records)
     {

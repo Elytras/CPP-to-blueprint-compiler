@@ -211,3 +211,4 @@ def no_inline_ufunctions():
 
 
 no_inline_ufunctions()
+check('InlineTest', 'ConstThenVar', lambda V: 6 + V * 2 + clamp(V, 0, 5) + clamp(2, V, 9) + 4 + V - 1, [dict(V=v) for v in (-3, 0, 4, 12)])
