@@ -436,7 +436,9 @@ def parse_header(path):
 
 CONV = re.compile(r"^Conv_(\w+)To(\w+)$")
 CONV_SCALARS = ("FString", "FName", "FText", "int", "int64", "float", "bool", "uint8", "class UObject*")
-CONV_SKIP = ("Conv_RotatorToVector",)      # a rotator is not implicitly a direction
+# Conv_RotatorToVector: a rotator is not implicitly a direction. Conv_Int64ToString: only Modio has it;
+# the compiler goes through Conv_Int64ToText + Conv_TextToString instead.
+CONV_SKIP = ("Conv_RotatorToVector", "Conv_Int64ToString")
 
 
 def conv_kind(t):

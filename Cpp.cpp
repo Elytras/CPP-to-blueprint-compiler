@@ -1200,7 +1200,7 @@ std::string FCompiler::Canon(std::string T) const
 }
 
 /* Converts Arg to the slot's type: a literal folds, else a Conv_XToY from UeApi/Conv.json, else
-   two of them through FString. Two structs with no conversion are left alone (derived to base). */
+   two of them through FString or FText. Two structs with no conversion are left alone (derived to base). */
 bool FCompiler::ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgIR& Arg, std::string* Err)
 {
     const std::string To = Canon(ToType);
@@ -1290,9 +1290,12 @@ bool FCompiler::ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgI
     }
 
     if (const FConv* Direct = FindConv(From, To)) { ApplyConv(*Direct, BP, Arg); return true; }
-    const FConv* In  = FindConv(From, "FString");
-    const FConv* Out = FindConv("FString", To);
-    if (In && Out) { ApplyConv(*In, BP, Arg); ApplyConv(*Out, BP, Arg); return true; }
+    for (const char* Via : {"FString", "FText"})     // FText: int64 has no engine Conv_Int64ToString
+    {
+        const FConv* In  = FindConv(From, Via);
+        const FConv* Out = FindConv(Via, To);
+        if (In && Out) { ApplyConv(*In, BP, Arg); ApplyConv(*Out, BP, Arg); return true; }
+    }
     if (Structs.count(From) && Structs.count(To)) return true;
     *Err = "no Kismet conversion from " + From + " to " + To;
     return false;
