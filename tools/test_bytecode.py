@@ -234,6 +234,10 @@ def replication():
     # OnRep functions are ordinary script functions, called locally; an RPC goes through CallFunction's routing.
     assert calls == [('LocalVirtualFunction', 'OnRep_Open'), ('LocalVirtualFunction', 'OnRep_Slots'),
                      ('VirtualFunction', 'ServerOpen'), ('VirtualFunction', 'MultiBoom')], calls
+    # A set of a replicated variable wakes the actor first, as the editor's Set node does; Local is not replicated.
+    begin = [(op, a) for op, a in ops if op in ('FinalFunction', 'LetBool', 'Let')]
+    assert [x[0] for x in begin] == ['FinalFunction', 'LetBool', 'FinalFunction', 'Let', 'Let'], begin
+    assert sum('FlushNetDormancy' in x[1] for x in begin) == 2, begin
     print('ok  ReplTest: replicated properties, RPC flags, OnRep after a set')
 
 

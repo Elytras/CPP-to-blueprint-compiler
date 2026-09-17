@@ -833,6 +833,8 @@ private:
     std::map<std::string, uint32> EventFlags;         // UeApi/Events.json: "Package.Class.Function" -> EFunctionFlags
     std::map<std::string, FIndex> CurSignatures;      // Generate: dispatcher name -> its signature function export
     std::map<std::string, std::string> RepNotifyOf;   // Generate: replicated variable -> its RepNotify function
+    std::set<std::string> ReplicatedOf;               // Generate: the replicated variables of the class and its mod ancestors
+    bool bCurIsActor = false;                         // Generate: the class derives from AActor
     const FConv* FindConv(const std::string& From, const std::string& To) const;
     const FOpInfo* FindOp(const std::string& Op, const std::string& Lhs, const std::string& Rhs) const;
     void ApplyConv(const FConv& C, FBlueprintClass& BP, FArgIR& Arg);
@@ -3202,6 +3204,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
 
         FStmtIR St;
         std::string CallRepNotify;                      // an assignment to a RepNotify variable of self
+        std::string SetOfSelf;                          // the property of self the statement assigns, if any
         const std::string K = Kind(*S);
         if (K == "DeclStmt")
         {
@@ -3371,7 +3374,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             {
                 St.K = FStmtIR::Assign;
                 bOk = LowerField(*Lhs, BP, St.Var, Err) && LowerArg(*Rhs, BP, St.Value, Err);
-                if (bOk && !St.Var.Base) CallRepNotify = RepNotifyFor(St.Var.S);
+                if (bOk && !St.Var.Base) { CallRepNotify = RepNotifyFor(St.Var.S); SetOfSelf = St.Var.S; }
             }
             else if (LK == "DeclRefExpr")
             {
@@ -3400,7 +3403,8 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 if (bOk && St.Call.Args[0].K != FArgIR::Field && St.Call.Args[0].K != FArgIR::Local
                     && St.Call.Args[0].K != FArgIR::LocalOut && St.Call.Args[0].K != FArgIR::Member)
                 { *Err = "`[]` on a map needs a map variable, not a computed value"; bOk = false; }
-                if (bOk && St.Call.Args[0].K == FArgIR::Field && !St.Call.Args[0].Base) CallRepNotify = RepNotifyFor(St.Call.Args[0].S);
+                if (bOk && St.Call.Args[0].K == FArgIR::Field && !St.Call.Args[0].Base)
+                { CallRepNotify = RepNotifyFor(St.Call.Args[0].S); SetOfSelf = St.Call.Args[0].S; }
             }
             else if (LK == "CXXOperatorCallExpr")
             {
@@ -3412,7 +3416,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 { const FArgIR Element = *St.Var.Base; St.Var = Element; }
                 if (St.Var.K != FArgIR::Index)
                 { *Err = "TODO: assignment to an operator call that is not an array element"; bOk = false; return; }
-                if (St.Var.Base->K == FArgIR::Field && !St.Var.Base->Base) CallRepNotify = RepNotifyFor(St.Var.Base->S);
+                if (St.Var.Base->K == FArgIR::Field && !St.Var.Base->Base) { CallRepNotify = RepNotifyFor(St.Var.Base->S); SetOfSelf = St.Var.Base->S; }
                 St.bAssignLocal = St.Var.Base->K == FArgIR::Local;
                 St.bAssignOutParm = St.Var.Base->K == FArgIR::LocalOut;
                 bOk = LowerArg(*Rhs, BP, St.Value, Err);
@@ -3655,6 +3659,17 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             *Err = "TODO: unimplemented statement " + K;
             bOk = false;
             return;
+        }
+        if (bOk && bCurIsActor && ReplicatedOf.count(SetOfSelf))
+        {
+            /* The editor's Set node on a replicated variable of an Actor wakes it first (FKCHandler_VariableSet::Transform
+               calls AActor::FlushNetDormancy before the write), or a dormant actor never sends the change. Its
+               MarkPropertyDirtyFromRepIndex after the write is left out: push model is compiled out of DRG. */
+            FStmtIR Flush;
+            Flush.K = FStmtIR::StaticCall;
+            Flush.Call.Fn = BP.EngineFunction("/Script/Engine", "Actor", "FlushNetDormancy");
+            Flush.Call.bInstance = true;
+            Out.push_back(std::move(Flush));
         }
         if (bOk) Out.push_back(St);
         if (bOk && !CallRepNotify.empty())
@@ -4641,6 +4656,10 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         if (!A->UeName.empty()) Ancestry.push_back(A->UeName);
 
     const bool bIsActor = std::find(Ancestry.begin(), Ancestry.end(), "Actor") != Ancestry.end();
+    bCurIsActor = bIsActor;
+    ReplicatedOf.clear();
+    for (const FRecord* A = &R; A; A = A->Base.empty() ? nullptr : Find(A->Base))
+        for (const auto& [Var, Spec] : A->Replicated) ReplicatedOf.insert(Var);
     BP.SetIsActor(bIsActor);
     BP.SetClassFlags(ClassFlagsFor(Ancestry));
 
