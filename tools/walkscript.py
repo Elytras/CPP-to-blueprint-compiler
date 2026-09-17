@@ -105,7 +105,7 @@ class W:
         elif op == 0x61: info = s.name(); s.expr(); s.expr()
         elif op == 0x64: info = s.fieldpath(); s.expr()
         elif op == 0x69:
-            s.expr(); n = s.u16(); s.i32()
+            n = s.u16(); s.i32(); s.expr()   # count, end skip, index (ScriptSerialization.h)
             for _ in range(n): s.expr(); s.i32(); s.expr()
             s.expr()
         elif op == 0x6A:

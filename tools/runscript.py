@@ -42,7 +42,7 @@ class P(W):
         elif op == 0x35: n.val = struct.unpack_from('<q', s.b, s.o)[0]; s.raw(8)
         elif op == 0x4C: n.val = s.i32()
         elif op == 0x69:
-            k.append(s.node()); cnt = s.u16(); s.i32()
+            cnt = s.u16(); s.i32(); k.append(s.node())
             n.val = []
             for _ in range(cnt):
                 key = s.node(); s.i32(); n.val.append((key, s.node()))
