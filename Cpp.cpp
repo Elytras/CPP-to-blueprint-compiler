@@ -166,6 +166,20 @@ bool FindLiteral(const Json& N, std::string& Out)
 
 bool IsStaticDecl(const Json& Decl) { return Decl.value("storageClass", std::string()) == "static"; }
 
+/* UE_SERVER / UE_CLIENT / UE_MULTICAST / UE_RELIABLE, carried as attribute kinds (UeMeta.h). */
+uint32 NetFlagsOf(const Json& Decl)
+{
+    uint32 Flags = 0;
+    ForEach(Decl, [&](const Json& C) {
+        const std::string K = Kind(C);
+        if (K == "HotAttr") Flags |= FUNC_Net | FUNC_NetServer;
+        else if (K == "ColdAttr") Flags |= FUNC_Net | FUNC_NetClient;
+        else if (K == "FlattenAttr") Flags |= FUNC_Net | FUNC_NetMulticast;
+        else if (K == "NoDebugAttr") Flags |= FUNC_Net | FUNC_NetReliable;
+    });
+    return Flags;
+}
+
 /* UE_PURE: clang keeps [[gnu::pure]] as a PureAttr child, and copies it onto an out-of-line definition. */
 bool IsPureDecl(const Json& Decl)
 {
@@ -194,6 +208,7 @@ struct FRecord
     std::map<std::string, const Json*> MethodDefs;  // out-of-line definition (carries body/parms)
     std::vector<const Json*> Fields;
     std::vector<std::string> Interfaces;            // every base after the first
+    std::map<std::string, std::string> Replicated;  // UE_REPLICATED*: variable -> "Notify:Condition"
     bool bIsLocal = false;      // UePackage == ModPackage/CppName: cooked here, published at its /Game path
     bool bIsStruct = false;     // UE_STRUCT: cooked as a UserDefinedStruct asset
 
@@ -691,6 +706,12 @@ private:
                       FCallIR& Out, std::string* Err);
     std::map<std::string, const Json*> FreeInlines;                     // decl id -> an inline free function's definition
                                                                         // (a template's: each instantiation)
+    /* A variable of the class being generated that has a RepNotify function, or empty. */
+    std::string RepNotifyFor(const std::string& Field) const
+    {
+        auto It = RepNotifyOf.find(Field);
+        return It == RepNotifyOf.end() ? std::string() : It->second;
+    }
     std::string LocalName(const Json& Decl) const
     {
         auto It = LocalRename.find(Decl.value("id", std::string()));
@@ -794,6 +815,7 @@ private:
     std::map<std::string, int64> EnumValues;          // clang EnumConstantDecl id -> value
     std::map<std::string, uint32> EventFlags;         // UeApi/Events.json: "Package.Class.Function" -> EFunctionFlags
     std::map<std::string, FIndex> CurSignatures;      // Generate: dispatcher name -> its signature function export
+    std::map<std::string, std::string> RepNotifyOf;   // Generate: replicated variable -> its RepNotify function
     const FConv* FindConv(const std::string& From, const std::string& To) const;
     const FOpInfo* FindOp(const std::string& Op, const std::string& Lhs, const std::string& Rhs) const;
     void ApplyConv(const FConv& C, FBlueprintClass& BP, FArgIR& Arg);
@@ -1124,6 +1146,11 @@ bool FCompiler::Collect(std::string* Err)
                     R.UePackage = Owner + "/" + R.CppName;
                     R.UeName = R.CppName;
                 }
+            }
+            else if (Kind(C) == "VarDecl" && Name(C).size() > 12 && Name(C).compare(Name(C).size() - 12, 12, "__Replicated") == 0)
+            {
+                std::string Spec;
+                if (FindLiteral(C, Spec)) R.Replicated[Name(C).substr(0, Name(C).size() - 12)] = Spec;
             }
             else if (Kind(C) == "CXXMethodDecl" && C.contains("name"))
             {
@@ -2567,6 +2594,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
         if (!S) return;
 
         FStmtIR St;
+        std::string CallRepNotify;                      // an assignment to a RepNotify variable of self
         const std::string K = Kind(*S);
         if (K == "DeclStmt")
         {
@@ -2728,6 +2756,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             {
                 St.K = FStmtIR::Assign;
                 bOk = LowerField(*Lhs, BP, St.Var, Err) && LowerArg(*Rhs, BP, St.Value, Err);
+                if (bOk && !St.Var.Base) CallRepNotify = RepNotifyFor(St.Var.S);
             }
             else if (LK == "DeclRefExpr")
             {
@@ -2752,6 +2781,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 if (!LowerArg(*Lhs, BP, St.Var, Err)) { bOk = false; return; }
                 if (St.Var.K != FArgIR::Index)
                 { *Err = "TODO: assignment to an operator call that is not an array element"; bOk = false; return; }
+                if (St.Var.Base->K == FArgIR::Field && !St.Var.Base->Base) CallRepNotify = RepNotifyFor(St.Var.Base->S);
                 St.bAssignLocal = St.Var.Base->K == FArgIR::Local;
                 St.bAssignOutParm = St.Var.Base->K == FArgIR::LocalOut;
                 bOk = LowerArg(*Rhs, BP, St.Value, Err);
@@ -2983,6 +3013,15 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             return;
         }
         if (bOk) Out.push_back(St);
+        if (bOk && !CallRepNotify.empty())
+        {
+            /* The editor's Set node on a RepNotify variable calls the function after the write (K2Node_VariableSet),
+               so a listen-server host runs it too; clients run it when the value replicates. */
+            FStmtIR Notify;
+            Notify.K = FStmtIR::StaticCall;
+            Notify.Call.VirtualName = CallRepNotify;
+            Out.push_back(std::move(Notify));
+        }
     });
     return bOk;
 }
@@ -3891,6 +3930,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
        Measured on MOD_Proxy_SpawnEnemy: flags BlueprintEvent | BlueprintCallable | Delegate | Public, an
        empty body, listed in Children and FuncMap like any function. */
     CurSignatures.clear();
+    RepNotifyOf.clear();
+    bool bReplicatesAnything = false;
     for (const Json* F : R.Fields)
     {
         if (StripTypeKeywords(TypeOf(*F)).compare(0, 25, "TMulticastInlineDelegate<") != 0) continue;
@@ -3923,6 +3964,32 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         /* CPF_Parm would make it part of the call frame; CPF_BlueprintReadOnly would forbid assignment. */
         PD.PropertyFlags = (PD.PropertyFlags & ~uint64(CPF_Parm | CPF_BlueprintReadOnly))
                          | CPF_Edit | CPF_BlueprintVisible | CPF_DisableEditOnInstance;
+        if (auto Rep = R.Replicated.find(FieldName); Rep != R.Replicated.end())
+        {
+            /* Measured on BP_LiftPod.IsLaunchEnabled: the editor's flags plus CPF_Net, and CPF_RepNotify with the
+               function's name when it has one. */
+            const std::string Notify = Rep->second.substr(0, Rep->second.find(':'));
+            const std::string Cond = Rep->second.substr(Rep->second.find(':') + 1);
+            PD.PropertyFlags |= CPF_Net;
+            if (!Notify.empty())
+            {
+                auto M = R.Methods.find(Notify);
+                if (M == R.Methods.end() || !ParmNames(*M->second).empty())
+                { *Err = R.CppName + "::" + FieldName + ": its RepNotify " + Notify + " must be a method of the class taking no parameters"; return false; }
+                PD.PropertyFlags |= CPF_RepNotify;
+                PD.RepNotify = Notify;
+                RepNotifyOf[FieldName] = Notify;
+            }
+            static const char* const Conditions[] = { "None", "InitialOnly", "OwnerOnly", "SkipOwner", "SimulatedOnly",
+                "AutonomousOnly", "SimulatedOrPhysics", "InitialOrOwner", "Custom", "ReplayOrOwner", "ReplayOnly",
+                "SimulatedOnlyNoReplay", "SimulatedOrPhysicsNoReplay", "SkipReplay", "Never" };
+            const std::string C = Cond.compare(0, 5, "COND_") == 0 ? Cond.substr(5) : Cond;
+            const auto At = std::find_if(std::begin(Conditions), std::end(Conditions), [&](const char* N) { return C.empty() ? false : C == N; });
+            if (!C.empty() && At == std::end(Conditions))
+            { *Err = R.CppName + "::" + FieldName + ": unknown replication condition " + Cond; return false; }
+            PD.RepCondition = C.empty() ? 0 : uint8(At - std::begin(Conditions));
+            bReplicatesAnything = true;
+        }
         BP.AddVariable(PD);
     }
 
@@ -4081,6 +4148,19 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         /* ProcessEvent only lists a script function's out-parms for EX_LocalOutVariable when this is set
            (ScriptCore.cpp), and native code, delegates and interfaces all call through ProcessEvent. */
         if (HasOutParm(Params)) Flags |= FUNC_HasOutParms;
+        if (const uint32 Net = NetFlagsOf(Decl) | NetFlagsOf(M))
+        {
+            /* Measured on BP_LiftPod: Server_ButtonPressedAnim is Net | NetServer, Multi_ButtonPressedAnim
+               Net | NetMulticast; reliable adds NetReliable. A net function returns nothing and takes no out-parm,
+               and an override keeps its parent's net flags (UClass::SetUpRuntimeReplicationData checks). */
+            if ((Net & (FUNC_NetServer | FUNC_NetClient | FUNC_NetMulticast)) == 0)
+            { *Err = R.CppName + "::" + Fn.Name + ": UE_RELIABLE needs UE_SERVER, UE_CLIENT or UE_MULTICAST"; return false; }
+            if (Super.V != 0) { *Err = R.CppName + "::" + Fn.Name + ": an override takes its parent's replication; drop the RPC marker"; return false; }
+            if (!RetType.empty() && RetType != "void") { *Err = R.CppName + "::" + Fn.Name + ": an RPC returns void"; return false; }
+            if (HasOutParm(Params)) { *Err = R.CppName + "::" + Fn.Name + ": an RPC takes no reference parameters"; return false; }
+            Flags |= Net;
+            bReplicatesAnything = true;
+        }
 
         BP.AddFunction(Fn.Name, Super, Params,
                        [Stmts, bEndsWithReturn, bScratchNeeded, DerefStruct](FScript& S, FIndex SelfExp) {
@@ -4101,6 +4181,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         }, Flags);
     }
 
+    if (bReplicatesAnything) BP.SetReplicates(true);
     BP.Finish();
     if (!P.Save(OutDir + "/" + R.CppName, Err)) return false;
     RegistryRows.push_back({ PackageName, R.CppName + "_C", "BlueprintGeneratedClass" });

@@ -36,6 +36,8 @@ struct FPropertyDef
     std::shared_ptr<FPropertyDef> Inner;    // ArrayProperty / SetProperty: element; MapProperty: key
     std::shared_ptr<FPropertyDef> Value;    // MapProperty: value
     FDefaultValue Default;              // written into the CDO / struct default instance
+    std::string RepNotify;              // CPF_RepNotify: the function the client runs when the value arrives
+    uint8 RepCondition = 0;             // CPF_Net: ELifetimeCondition
 };
 
 FPropertyDef FloatParam(const std::string& Name, uint64 ExtraFlags = 0);

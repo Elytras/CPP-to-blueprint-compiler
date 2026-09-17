@@ -212,3 +212,25 @@ def no_inline_ufunctions():
 
 no_inline_ufunctions()
 check('InlineTest', 'ConstThenVar', lambda V: 6 + V * 2 + clamp(V, 0, 5) + clamp(2, V, 9) + 4 + V - 1, [dict(V=v) for v in (-3, 0, 4, 12)])
+
+
+def replication():
+    import re, subprocess
+    here, base = os.path.dirname(os.path.abspath(__file__)), asset('ReplTest')
+    exports = [e['name'] for e in dumpexp.load(base)[5]]
+    tool = lambda t, i: subprocess.run([sys.executable, os.path.join(here, t), base, str(i)], capture_output=True, text=True).stdout
+    cls = tool('dumpstruct.py', 0)
+    assert 'NumReplicatedProperties [0] IntProperty size=4: 4' in cls, cls
+    for prop, flags, notify, cond in (('Score', '0x10025', 'None', 0), ('bOpen', '0x100010025', 'OnRep_Open', 0),
+                                      ('Aim', '0x10025', 'None', 3), ('Slots', '0x100010025', 'OnRep_Slots', 2),
+                                      ('Local', '0x10005', 'None', 0)):
+        assert re.search(r'Property %s .*flags=%s rep=0 notify=%s cond=%d' % (prop, flags, notify, cond), cls), prop
+    for fn, flags in (('ServerOpen', 0x82208c0), ('ClientPing', 0x9020840), ('MultiBoom', 0x8024840), ('OnRep_Open', 0x8020800)):
+        assert 'FunctionFlags %#x' % flags in tool('dumpstruct.py', exports.index(fn)), fn
+    ops = re.findall(r'\d  (\w+) +(\S*)', tool('walkscript.py', exports.index('ReceiveBeginPlay')))
+    calls = [a for op, a in ops if op == 'VirtualFunction']
+    assert calls == ['OnRep_Open', 'OnRep_Slots', 'ServerOpen', 'MultiBoom'], calls
+    print('ok  ReplTest: replicated properties, RPC flags, OnRep after a set')
+
+
+replication()

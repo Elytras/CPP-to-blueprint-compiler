@@ -62,8 +62,7 @@ def script_of(base, function):
     for e in exports:
         if e['name'] != function: continue
         blob = ue[e['off'] - total: e['off'] - total + e['size']]
-        end = len(blob) - 12
-        for cand in range(4, end - 4):
+        for end, cand in ((len(blob) - t, c) for t in (12, 14) for c in range(4, len(blob) - t - 4)):   # 14: FUNC_Net
             if struct.unpack_from('<i', blob, cand)[0] != end - (cand + 4) or struct.unpack_from('<i', blob, cand - 4)[0] <= 0:
                 continue
             try:

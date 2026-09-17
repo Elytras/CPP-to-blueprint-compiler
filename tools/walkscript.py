@@ -126,10 +126,9 @@ def main():
     ua, ue, total, names, imports, exports = dumpexp.load(base)
     e = exports[idx]
     blob = ue[e['off'] - total: e['off'] - total + e['size']]
-    trailer = 12
-    script_end = len(blob) - trailer
     p = None
-    for cand in range(0, script_end - 4):
+    for trailer, cand in ((t, c) for t in (12, 14) for c in range(0, len(blob) - t - 4)):   # 14: FUNC_Net adds RepOffset
+        script_end = len(blob) - trailer
         if struct.unpack_from('<i', blob, cand)[0] == script_end - (cand + 4) and struct.unpack_from('<i', blob, cand - 4)[0] > 0:
             try:
                 t = W(blob, cand + 4, names, imports, exports)

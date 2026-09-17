@@ -254,9 +254,9 @@ void WriteProperty(FArc& Ar, const FPropertyDef& P)
     Ar.I32(P.ArrayDim);                 // FProperty::Serialize
     Ar.I32(P.ElementSize);
     Ar.Raw(&P.PropertyFlags, 8);
-    Ar.U16(0);                          // RepIndex
-    Ar.Name("None");                    // RepNotifyFunc
-    Ar.U8(0);                           // BlueprintReplicationCondition
+    Ar.U16(0);                          // RepIndex: UClass::SetUpRuntimeReplicationData numbers CPF_Net properties at load
+    Ar.Name(P.RepNotify.empty() ? std::string("None") : P.RepNotify);   // RepNotifyFunc
+    Ar.U8(P.RepCondition);              // BlueprintReplicationCondition
 
     if (P.Type == "ObjectProperty" || P.Type == "SoftObjectProperty")
         Ar.Idx(P.Extra);                // PropertyClass
@@ -671,6 +671,7 @@ int32 AddFunctionExport(FPackage& P, const FFunctionDef& Def, FIndex OwnerClass,
         Ar.Raw(Script.Bytes().data(), Script.Bytes().size());
 
         Ar.U32(Captured.FunctionFlags);
+        if (Captured.FunctionFlags & 0x40) Ar.U16(0);   // FUNC_Net: the unused RepOffset
         Ar.Idx(Null());                 // EventGraphFunction
         Ar.I32(0);                      // EventGraphCallOffset
     };

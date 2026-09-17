@@ -33,6 +33,10 @@ public:
     /* A cooked class stores the FULL EClassFlags set, mostly inherited from the native parent. */
     void SetClassFlags(uint32 Flags) { ClassFlags = Flags; }
 
+    /* Replication: the CDO's bReplicates, set when the class replicates a variable or declares an RPC. The class's
+       NumReplicatedProperties tag is counted from the CPF_Net variables. */
+    void SetReplicates(bool bValue) { bReplicates = bValue; }
+
     /*
     `Super` is the engine UFunction being overridden, or null for a new method. Body receives the
     function's own export index (the FFieldPath owner for its params), filled in by Finish().
@@ -68,6 +72,7 @@ private:
     std::string ParentPackage, ParentClass;
     bool bParentIsBlueprint = false;
     bool bIsActor = true;
+    bool bReplicates = false;
     uint32 ClassFlags = 0x00840814;
 
     std::unordered_map<std::string, int32> ImportCache;

@@ -192,7 +192,13 @@ void FBlueprintClass::Finish()
     const std::vector<FPropertyDef> ClassVars = Vars;
     const bool bActor = bIsActor;
     const uint32 Flags = ClassFlags;
+    /* UBlueprintGeneratedClass::GetLifetimeBlueprintReplicationList stops after this many CPF_Net properties: without
+       the tag nothing the class declares replicates. Measured on BP_LiftPod: the first tag. */
+    const int32 NumReplicated = int32(std::count_if(Vars.begin(), Vars.end(),
+                                                    [](const FPropertyDef& V) { return (V.PropertyFlags & CPF_Net) != 0; }));
     Class.Serialize = [=](FArc& Ar) {
+        if (NumReplicated > 0)
+            Tag(Ar, "NumReplicatedProperties", "IntProperty", [=](FArc& V) { V.I32(NumReplicated); });
         if (bActor)
             Tag(Ar, "SimpleConstructionScript", "ObjectProperty",
                 [=](FArc& V) { V.Idx(ScsIdx); });
@@ -241,7 +247,9 @@ void FBlueprintClass::Finish()
     const bool bOverridesTick = std::any_of(Functions.begin(), Functions.end(),
         [](const FPending& F) { return F.Def.Name == "ReceiveTick"; });
 
-    Cdo.Serialize = [bOverridesTick, ClassVars](FArc& Ar) {
+    const bool bCdoReplicates = bReplicates;
+    Cdo.Serialize = [bOverridesTick, ClassVars, bCdoReplicates](FArc& Ar) {
+        if (bCdoReplicates) TagBool(Ar, "bReplicates", true);
         if (bOverridesTick)
             Tag(Ar, "PrimaryActorTick", "StructProperty", [](FArc& V) {
                 TagBool(V, "bCanEverTick", true);
