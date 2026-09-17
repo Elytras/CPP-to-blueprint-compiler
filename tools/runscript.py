@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""usage: runscript.py <base-path-without-ext> <Function> [Parm=value ...]
+
+Runs one generated UFunction's bytecode offline, for the int / bool / float subset of Kismet:
+locals, jumps, the execution-flow stack, SwitchValue, KismetMathLibrary calls. Prints the
+ReturnValue. Anything outside the subset stops with `unsupported`, so a test that passes ran
+every instruction it reached. Parms not given start at 0, the way a frame zeroes them.
+
+As a module: run(base, function, **parms) -> (return value, locals)."""
+import struct, sys, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import dumpexp
+from walkscript import W
+
+FLOW_OPS = {6, 7, 0x4C, 0x4D, 0x4E, 0x4F}
+
+
+class Node:
+    def __init__(s, op, mem):
+        s.op, s.mem, s.kids, s.val = op, mem, [], None
+
+
+class P(W):
+    """walkscript's reader, building a tree instead of a log."""
+    def node(s):
+        mem = s.mem
+        op = s.u8()
+        n = Node(op, mem)
+        k = n.kids
+        if op in (0, 1, 0x48): n.val = s.fieldpath().split('@')[0]
+        elif op in (4, 0x4E, 0x4F): k.append(s.node())
+        elif op == 6: n.val = s.i32()
+        elif op == 7: n.val = s.i32(); k.append(s.node())
+        elif op in (0xB, 0x16, 0x17, 0x25, 0x26, 0x27, 0x28, 0x2A, 0x4D, 0x53): pass
+        elif op == 0xF: s.fieldpath(); k.append(s.node()); k.append(s.node())
+        elif op in (0x14, 0x5F): k.append(s.node()); k.append(s.node())
+        elif op in (0x1B, 0x45): n.val = s.name(); s.args(k)
+        elif op in (0x1C, 0x46, 0x68): n.val = s.ptr().split("'")[-2]; s.args(k)
+        elif op == 0x1D: n.val = s.i32()
+        elif op == 0x1E: n.val = struct.unpack_from('<f', s.b, s.o)[0]; s.raw(4)
+        elif op in (0x24, 0x2C): n.val = s.u8()
+        elif op == 0x35: n.val = struct.unpack_from('<q', s.b, s.o)[0]; s.raw(8)
+        elif op == 0x4C: n.val = s.i32()
+        elif op == 0x69:
+            k.append(s.node()); cnt = s.u16(); s.i32()
+            n.val = []
+            for _ in range(cnt):
+                key = s.node(); s.i32(); n.val.append((key, s.node()))
+            k.append(s.node())
+        else: raise SystemExit('unsupported op %02x at mem %d' % (op, mem))
+        return n
+
+    def args(s, out):
+        while True:
+            a = s.node()
+            if a.op == 0x16: return
+            out.append(a)
+
+
+def script_of(base, function):
+    ua, ue, total, names, imports, exports = dumpexp.load(base)
+    for e in exports:
+        if e['name'] != function: continue
+        blob = ue[e['off'] - total: e['off'] - total + e['size']]
+        end = len(blob) - 12
+        for cand in range(4, end - 4):
+            if struct.unpack_from('<i', blob, cand)[0] != end - (cand + 4) or struct.unpack_from('<i', blob, cand - 4)[0] <= 0:
+                continue
+            try:
+                t = P(blob, cand + 4, names, imports, exports)
+                stmts = []
+                while t.o < end: stmts.append(t.node())
+                if t.o == end: return stmts
+            except (Exception, SystemExit): pass
+        raise SystemExit('%s: no script found' % function)
+    raise SystemExit('%s: no such export' % function)
+
+
+def i32(v): return (v + 2**31) % 2**32 - 2**31
+def idiv(a, b): q = abs(a) // abs(b); return q if (a < 0) == (b < 0) else -q
+
+MATH = {
+    'Add_IntInt': lambda a, b: i32(a + b), 'Subtract_IntInt': lambda a, b: i32(a - b),
+    'Multiply_IntInt': lambda a, b: i32(a * b), 'Divide_IntInt': idiv,
+    'Percent_IntInt': lambda a, b: a - idiv(a, b) * b,
+    'Less_IntInt': lambda a, b: a < b, 'Greater_IntInt': lambda a, b: a > b,
+    'LessEqual_IntInt': lambda a, b: a <= b, 'GreaterEqual_IntInt': lambda a, b: a >= b,
+    'EqualEqual_IntInt': lambda a, b: a == b, 'NotEqual_IntInt': lambda a, b: a != b,
+    'Not_PreBool': lambda a: not a, 'BooleanAND': lambda a, b: a and b, 'BooleanOR': lambda a, b: a or b,
+    'Add_FloatFloat': lambda a, b: a + b, 'Multiply_FloatFloat': lambda a, b: a * b,
+    'Conv_IntToFloat': float,
+}
+
+
+def run(base, function, **parms):
+    stmts = script_of(base, function)
+    at = {n.mem: i for i, n in enumerate(stmts)}
+    env = dict(parms)
+    flow = []
+    self_vars = {}
+
+    def ev(n):
+        o = n.op
+        if o in (0, 0x48): return env.get(n.val, 0)
+        if o == 1: return self_vars.get(n.val, 0)
+        if o in (0x1D, 0x1E, 0x24, 0x2C, 0x35): return n.val
+        if o == 0x25: return 0
+        if o == 0x26: return 1
+        if o == 0x27: return True
+        if o == 0x28: return False
+        if o in (0x1C, 0x46, 0x68):
+            if n.val not in MATH: raise SystemExit('unsupported call ' + n.val)
+            return MATH[n.val](*[ev(a) for a in n.kids])
+        if o == 0x69:
+            v = ev(n.kids[0])
+            for key, res in n.val:
+                if ev(key) == v: return ev(res)
+            return ev(n.kids[1])
+        raise SystemExit('unsupported expression op %02x at mem %d' % (o, n.mem))
+
+    def store(dest, v):
+        if dest.op in (0, 0x48): env[dest.val] = v
+        elif dest.op == 1: self_vars[dest.val] = v
+        else: raise SystemExit('unsupported destination op %02x' % dest.op)
+
+    pc, steps = 0, 0
+    while True:
+        steps += 1
+        if steps > 1000000: raise SystemExit('runaway loop')
+        n = stmts[pc]
+        o = n.op
+        nxt = pc + 1
+        if o in (0xF, 0x14, 0x5F): store(n.kids[0], ev(n.kids[1]))
+        elif o == 6: nxt = at[n.val]
+        elif o == 7:
+            if not ev(n.kids[0]): nxt = at[n.val]
+        elif o == 0x4C: flow.append(n.val)
+        elif o == 0x4D:
+            if not flow: raise SystemExit('pop from an empty flow stack')
+            nxt = at[flow.pop()]
+        elif o == 0x4F:
+            if not ev(n.kids[0]):
+                if not flow: raise SystemExit('pop from an empty flow stack')
+                nxt = at[flow.pop()]
+        elif o == 0x4E: nxt = at[ev(n.kids[0])]
+        elif o == 4:
+            r = n.kids[0]
+            return (ev(r) if r.op != 0xB else None), env
+        elif o == 0xB: pass
+        elif o == 0x53: raise SystemExit('ran off the end of the script')
+        else: raise SystemExit('unsupported statement op %02x at mem %d' % (o, n.mem))
+        pc = nxt
+
+
+def main():
+    base, fn = sys.argv[1], sys.argv[2]
+    parms = {}
+    for a in sys.argv[3:]:
+        k, v = a.split('=', 1)
+        parms[k] = float(v) if '.' in v else int(v)
+    r, env = run(base, fn, **parms)
+    print(r)
+
+
+if __name__ == "__main__":
+    main()

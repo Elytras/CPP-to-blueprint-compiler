@@ -346,6 +346,8 @@ struct FStmtIR
         Return,
         If,
         While,
+        Break,
+        Continue,
     } K = StaticCall;
 
     FCallIR Target;
@@ -357,6 +359,7 @@ struct FStmtIR
     std::shared_ptr<std::vector<FStmtIR>> Then;
     std::shared_ptr<std::vector<FStmtIR>> Else;
     std::shared_ptr<std::vector<FStmtIR>> Body;
+    std::shared_ptr<std::vector<FStmtIR>> Inc;      // While: a `for` increment, where `continue` lands
     bool bAssignLocal = false;
     bool bAssignOutParm = false;
 };
@@ -774,7 +777,13 @@ private:
     int32 LoopDepth = 0;                              // LowerBody: the loops around the statement being lowered
 };
 
-void EmitStmts(const std::vector<FStmtIR>& Stmts, FScript& S, FIndex SelfExp)
+/* The innermost loop's forward jumps, patched once its exit / continue offsets are known. */
+struct FLoopPatches
+{
+    std::vector<int32> Breaks, Continues;
+};
+
+void EmitStmts(const std::vector<FStmtIR>& Stmts, FScript& S, FIndex SelfExp, FLoopPatches* Loop = nullptr)
 {
     for (const FStmtIR& St : Stmts)
     {
@@ -827,12 +836,12 @@ void EmitStmts(const std::vector<FStmtIR>& Stmts, FScript& S, FIndex SelfExp)
         {
             const int32 NotPatch = S.JumpIfNot(0,
                 [St, SelfExp](FScript& C) { EmitArg(C, St.Cond, SelfExp, nullptr); });
-            if (St.Then) EmitStmts(*St.Then, S, SelfExp);
+            if (St.Then) EmitStmts(*St.Then, S, SelfExp, Loop);
             if (St.Else && !St.Else->empty())
             {
                 const int32 EndPatch = S.Jump(0);
                 S.PatchJumpTarget(NotPatch, S.MemorySize());
-                EmitStmts(*St.Else, S, SelfExp);
+                EmitStmts(*St.Else, S, SelfExp, Loop);
                 S.PatchJumpTarget(EndPatch, S.MemorySize());
             }
             else
@@ -844,14 +853,25 @@ void EmitStmts(const std::vector<FStmtIR>& Stmts, FScript& S, FIndex SelfExp)
 
         case FStmtIR::While:
         {
+            /* `break` and `continue` are forward EX_Jumps patched here; no flow stack is involved, so a
+               `return` from inside the loop leaves nothing behind. */
+            FLoopPatches Inner;
             const int32 Head = S.MemorySize();
             const int32 ExitPatch = S.JumpIfNot(0,
                 [St, SelfExp](FScript& C) { EmitArg(C, St.Cond, SelfExp, nullptr); });
-            if (St.Body) EmitStmts(*St.Body, S, SelfExp);
+            if (St.Body) EmitStmts(*St.Body, S, SelfExp, &Inner);
+            for (int32 P : Inner.Continues) S.PatchJumpTarget(P, S.MemorySize());
+            if (St.Inc) EmitStmts(*St.Inc, S, SelfExp, Loop);
             S.Jump(Head);
             S.PatchJumpTarget(ExitPatch, S.MemorySize());
+            for (int32 P : Inner.Breaks) S.PatchJumpTarget(P, S.MemorySize());
             break;
         }
+
+        case FStmtIR::Break:
+        case FStmtIR::Continue:
+            if (Loop) (St.K == FStmtIR::Break ? Loop->Breaks : Loop->Continues).push_back(S.Jump(0));
+            break;
         }
     }
 }
@@ -2509,6 +2529,11 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             if (!LowerBranch(*Then, St.Then)) { bOk = false; return; }
             if (Else && !LowerBranch(*Else, St.Else)) { bOk = false; return; }
         }
+        else if (K == "BreakStmt" || K == "ContinueStmt")
+        {
+            if (LoopDepth == 0) { *Err = "`break` / `continue` outside a loop (no `switch` yet)"; bOk = false; return; }
+            St.K = K == "BreakStmt" ? FStmtIR::Break : FStmtIR::Continue;
+        }
         else if (K == "WhileStmt")
         {
             /* WhileStmt inner is [cond, body]. */
@@ -2555,18 +2580,16 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             if (!LowerArg(*Cond, BP, St.Cond, Err)) { bOk = false; return; }
             St.Body = std::make_shared<std::vector<FStmtIR>>();
 
-            Json BodyArr = Json::array();
-            if (Kind(*Body) == "CompoundStmt")
-            {
-                auto It = Body->find("inner");
-                if (It != Body->end()) for (const Json& C : *It) BodyArr.push_back(C);
-            }
-            else BodyArr.push_back(*Body);
-            if (Inc) BodyArr.push_back(*Inc);
-
-            Json WrapBody = { {"kind", "CompoundStmt"}, {"inner", BodyArr} };
+            Json WrapBody = Kind(*Body) == "CompoundStmt" ? *Body
+                          : Json{ {"kind", "CompoundStmt"}, {"inner", Json::array({*Body})} };
             ++LoopDepth;
             if (!LowerBody(WrapBody, BP, *St.Body, Locals, Err)) { bOk = false; return; }
+            if (Inc)
+            {
+                St.Inc = std::make_shared<std::vector<FStmtIR>>();
+                Json WrapInc = { {"kind", "CompoundStmt"}, {"inner", Json::array({*Inc})} };
+                if (!LowerBody(WrapInc, BP, *St.Inc, Locals, Err)) { bOk = false; return; }
+            }
             --LoopDepth;
         }
         else
@@ -2765,6 +2788,7 @@ bool FCompiler::HoistReadsInStmt(FStmtIR& St, FBlueprintClass& BP,
     if (St.Then) if (!HoistReadsInList(*St.Then, BP, Locals, Err)) return false;
     if (St.Else) if (!HoistReadsInList(*St.Else, BP, Locals, Err)) return false;
     if (St.Body) if (!HoistReadsInList(*St.Body, BP, Locals, Err)) return false;
+    if (St.Inc) if (!HoistReadsInList(*St.Inc, BP, Locals, Err)) return false;
 
     if (!HoistReadsInArg(St.Var,   BP, Locals, OutPre, Err)) return false;
     if (!HoistReadsInArg(St.Value, BP, Locals, OutPre, Err)) return false;

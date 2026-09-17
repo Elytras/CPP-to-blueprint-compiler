@@ -149,4 +149,5 @@ def main():
         print('  +%4d mem %4d  disk %3d mem %3d  %-22s %s' % (o, m, dsz, msz, nm, info))
     print('walked: disk %d (header %d)  mem %d (header %d)' % (w.o - (p + 4), storage, w.mem, bytecode))
 
-main()
+if __name__ == "__main__":
+    main()
