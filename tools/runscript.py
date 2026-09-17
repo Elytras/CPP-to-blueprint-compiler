@@ -7,7 +7,7 @@ ReturnValue. Anything outside the subset stops with `unsupported`, so a test tha
 every instruction it reached. Parms not given start at 0, the way a frame zeroes them.
 
 As a module: run(base, function, **parms) -> (return value, locals)."""
-import struct, sys, os
+import copy, struct, sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import dumpexp
 from walkscript import W
@@ -41,6 +41,8 @@ class P(W):
         elif op in (0x24, 0x2C): n.val = s.u8()
         elif op == 0x35: n.val = struct.unpack_from('<q', s.b, s.o)[0]; s.raw(8)
         elif op == 0x4C: n.val = s.i32()
+        elif op == 0x21: n.val = s.name()
+        elif op == 0x42: n.val = s.fieldpath().split('@')[0]; k.append(s.node())
         elif op == 0x69:
             cnt = s.u16(); s.i32(); k.append(s.node())
             n.val = []
@@ -97,14 +99,23 @@ MATH = {
 
 
 # Container library calls see their argument NODES, so an out-parm can be written. A TSet is a list of
-# unique values and a TMap a dict, both in insertion order.
+# unique values and a TMap a dict, both in insertion order. An unset container variable reads as 0 and is
+# created on first use; values are copied in, as the VM copies them.
+def _made(ev, store, node, empty):
+    v = ev(node)
+    if v == 0:
+        store(node, empty)
+        v = ev(node)                # the stored object, not the copy store() was handed
+    return v
+
+
 CONTAINERS = {
-    'Array_Length': lambda ev, store, a: len(ev(a[0])),
-    'Array_Add': lambda ev, store, a: (ev(a[0]).append(ev(a[1])), len(ev(a[0])) - 1)[1],
+    'Array_Length': lambda ev, store, a: len(_made(ev, store, a[0], [])),
+    'Array_Add': lambda ev, store, a: (_made(ev, store, a[0], []).append(copy.deepcopy(ev(a[1]))), len(ev(a[0])) - 1)[1],
     'Set_ToArray': lambda ev, store, a: store(a[1], list(ev(a[0]))),
     'Map_Keys': lambda ev, store, a: store(a[1], list(ev(a[0]).keys())),
-    'Map_Find': lambda ev, store, a: (store(a[2], ev(a[0]).get(ev(a[1]), 0)), ev(a[1]) in ev(a[0]))[1],
-    'Map_Add': lambda ev, store, a: ev(a[0]).__setitem__(ev(a[1]), ev(a[2])),
+    'Map_Find': lambda ev, store, a: (store(a[2], _made(ev, store, a[0], {}).get(ev(a[1]), 0)), ev(a[1]) in ev(a[0]))[1],
+    'Map_Add': lambda ev, store, a: _made(ev, store, a[0], {}).__setitem__(ev(a[1]), copy.deepcopy(ev(a[2]))),
 }
 
 
@@ -119,7 +130,8 @@ def run(base, function, self_vars=None, **parms):
         o = n.op
         if o in (0, 0x48): return env.get(n.val, 0)
         if o == 1: return self_vars.get(n.val, 0)
-        if o in (0x1D, 0x1E, 0x24, 0x2C, 0x35): return n.val
+        if o in (0x1D, 0x1E, 0x24, 0x2C, 0x35, 0x21): return n.val
+        if o == 0x42 and n.val == 'Value': return ev(n.kids[0])      # a nested container's wrapper is its Value
         if o == 0x25: return 0
         if o == 0x26: return 1
         if o == 0x27: return True
@@ -137,7 +149,9 @@ def run(base, function, self_vars=None, **parms):
         raise SystemExit('unsupported expression op %02x at mem %d' % (o, n.mem))
 
     def store(dest, v):
-        if dest.op in (0, 0x48): env[dest.val] = v
+        v = copy.deepcopy(v)
+        if dest.op == 0x42 and dest.val == 'Value': store(dest.kids[0], v)
+        elif dest.op in (0, 0x48): env[dest.val] = v
         elif dest.op == 1: self_vars[dest.val] = v
         elif dest.op == 0x6B: ev(dest.kids[0])[ev(dest.kids[1])] = v
         else: raise SystemExit('unsupported destination op %02x' % dest.op)

@@ -297,3 +297,19 @@ def awaits():
 
 
 awaits()
+
+
+def nested():
+    fields = {}
+    got = run(asset('NestedTest'), 'Build', self_vars=fields)[0]
+    # Found holds 2; Grid ends [[7], [1]] after Grid[1].Add(5), Grid[0][0] = 7 and Grid[1] = Row.
+    assert got == 2 + 2 + 7, got
+    assert fields == {'Groups': {'first': ['a', 'b']}, 'Grid': [[7], [1]]}, fields
+    out = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dumpstruct.py'),
+                          asset('NestedTest'), '0'], capture_output=True, text=True).stdout
+    assert "UserDefinedStruct'FNC_TArray_FName'" in out and "UserDefinedStruct'FNC_TArray_int'" in out, out
+    print('ok  NestedTest: containers inside containers through wrapper structs')
+
+
+import subprocess
+nested()

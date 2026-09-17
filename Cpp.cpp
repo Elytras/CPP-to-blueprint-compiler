@@ -832,6 +832,33 @@ private:
     const FOpInfo* FindOp(const std::string& Op, const std::string& Lhs, const std::string& Rhs) const;
     void ApplyConv(const FConv& C, FBlueprintClass& BP, FArgIR& Arg);
     std::string ModPackage;
+    /* A container inside a container: UE has no such property, so the inner one is the single member (Value) of a
+       wrapper struct, <wrapper name> -> the container type. The wrapper has the container's layout. */
+    std::map<std::string, std::string> NestedWrappers;
+    static constexpr const char* NestedPackage = "/Game/_ElytrasMods/_NestedContainerStructs";
+    std::string NestedWrapper(const std::string& ContainerType)
+    {
+        /* clang spells one type int or int32 depending on where it comes from: one wrapper for both. */
+        std::string Name = "FNC_", Word;
+        auto Flush = [&]() { Name += Word == "int32" ? "int" : Word == "long" ? "int64" : Word; Word.clear(); };
+        for (char C : StripTypeKeywords(ContainerType) + " ")
+            if (std::isalnum(uint8(C)) || C == '_') Word += C;
+            else
+            {
+                if (Word == "long" && Name.size() >= 5 && Name.compare(Name.size() - 5, 5, "int64") == 0) Word.clear();
+                Flush();
+                if (C == '<' || C == ',') Name += '_';
+                else if (C == '*') Name += "Ptr";
+            }
+        NestedWrappers.emplace(Name, StripTypeKeywords(ContainerType));
+        return Name;
+    }
+    FIndex NestedWrapperImport(const std::string& ContainerType, FBlueprintClass& BP)
+    {
+        const std::string Name = NestedWrapper(ContainerType);
+        return BP.ScriptStruct(std::string(NestedPackage) + "/" + Name, Name);
+    }
+    bool GenerateNestedWrappers(const std::string& OutDir, std::string* Err);
     std::map<std::string, FRecord> Records;
     std::map<std::string, std::string> MethodOwner;   // clang decl id -> owning record
     std::map<std::string, std::string> FieldOwner;    // clang decl id -> declaring record
@@ -2242,6 +2269,19 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             Out.Owner = Out.Base->Owner;
             Out.LetOp = LetOpFor(Elem);
             Out.InnerType = Elem;
+            if (IsContainerType(Elem))
+            {
+                /* An element that is itself a container is a wrapper struct: the container is its Value member, which
+                   leaves the FArrayProperty the Array_ functions and a further [] need. */
+                auto Element = std::make_shared<FArgIR>(Out);
+                Out = FArgIR();
+                Out.K = FArgIR::Member;
+                Out.S = "Value";
+                Out.Owner = NestedWrapperImport(Elem, BP);
+                Out.Base = Element;
+                Out.LetOp = Element->LetOp;
+                Out.InnerType = Elem;
+            }
             return true;
         }
         if (Lhs && Rhs && OpName.compare(0, 8, "operator") == 0)
@@ -3049,6 +3089,9 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 /* `Items[i] = v`: the destination is an array element. */
                 St.K = FStmtIR::Assign;
                 if (!LowerArg(*Lhs, BP, St.Var, Err)) { bOk = false; return; }
+                /* A nested container element is written whole: the wrapper has the container's layout. */
+                if (St.Var.K == FArgIR::Member && St.Var.S == "Value" && St.Var.Base && St.Var.Base->K == FArgIR::Index)
+                { const FArgIR Element = *St.Var.Base; St.Var = Element; }
                 if (St.Var.K != FArgIR::Index)
                 { *Err = "TODO: assignment to an operator call that is not an array element"; bOk = false; return; }
                 if (St.Var.Base->K == FArgIR::Field && !St.Var.Base->Base) CallRepNotify = RepNotifyFor(St.Var.Base->S);
@@ -3969,7 +4012,13 @@ bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& P
         for (const std::string& A : Args)
         {
             FPropertyDef E;
-            if (!TypeToProperty(A, PName, 0, Where + " element", BP, &E, Err)) return false;
+            if (IsContainerType(A))
+            {
+                int32 Size = 16, Align = 8;
+                if (!LayoutOf(A, &Size, &Align, Err)) return false;
+                E = StructParam(PName, NestedWrapperImport(A, BP), NestedWrapper(A), Size, 0);
+            }
+            else if (!TypeToProperty(A, PName, 0, Where + " element", BP, &E, Err)) return false;
             Parts.push_back(E);
         }
         if (Tpl[1] == 'A')      *Out = ArrayParam(PName, Parts[0], ExtraFlags);
@@ -4125,6 +4174,45 @@ bool FCompiler::GenerateStruct(const FRecord& R, const std::string& OutDir, std:
     RegistryRows.push_back({ PackageName, R.CppName, "UserDefinedStruct" });
     printf("  %-14s -> %s.uasset  (struct, %d members)\n", R.CppName.c_str(), R.CppName.c_str(),
            int32(R.Fields.size()));
+    return true;
+}
+
+/* Each wrapper a container needed, into NestedPackage beside the mod's own folder. Two mods that need the same one
+   cook identical packages at the same path. A wrapper's own member may need a deeper one. */
+bool FCompiler::GenerateNestedWrappers(const std::string& OutDir, std::string* Err)
+{
+    /* OutDir is Content/<ModPackage without /Game>; the wrappers go to Content/<NestedPackage without /Game>. */
+    std::filesystem::path Content(OutDir);
+    for (size_t At = ModPackage.find('/', 1); At != std::string::npos; At = ModPackage.find('/', At + 1))
+        Content = Content.parent_path();
+    const std::filesystem::path Dir = Content / std::string(NestedPackage).substr(6);
+    std::set<std::string> Done;
+    for (bool bMore = true; bMore;)
+    {
+        bMore = false;
+        const auto Pending = NestedWrappers;
+        for (const auto& [Name, Type] : Pending)
+        {
+            if (!Done.insert(Name).second) continue;
+            bMore = true;
+            const std::string PackageName = std::string(NestedPackage) + "/" + Name;
+            FPackage P(PackageName);
+            StampIdentity(P, PackageName);
+            FBlueprintClass BP(P, Name, "", "", false);
+            FPropertyDef PD;
+            if (!TypeToProperty(Type, "Value", 0, "nested container " + Type, BP, &PD, Err)) return false;
+            PD.PropertyFlags = CPF_Edit | CPF_BlueprintVisible;
+            BP.AddVariable(PD);
+            const uint32 H = StrCrc32(PackageName);
+            const uint32 Guid[4] = { ~H, H * 2654435761u, H ^ 0x9E3779B9u, H };
+            BP.FinishStruct(Guid);
+            std::error_code Ec;
+            std::filesystem::create_directories(Dir, Ec);
+            if (!P.Save((Dir / Name).string(), Err)) return false;
+            RegistryRows.push_back({ PackageName, Name, "UserDefinedStruct" });
+            printf("  %-14s -> %s/%s.uasset  (wraps %s)\n", "nested", std::string(NestedPackage).c_str(), Name.c_str(), Type.c_str());
+        }
+    }
     return true;
 }
 
@@ -4718,6 +4806,7 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         ++Generated;
     }
     if (Generated == 0) { *Err = "the source declares no UE_STRUCT and no class deriving from a UE class"; return false; }
+    if (!GenerateNestedWrappers(OutDir, Err)) return false;
 
     /* A cooked package carries no registry data; without the bake the classes are invisible to it. */
     if (!SaveAssetRegistry(RegistryRows, OutDir + "/AssetRegistry.bin", Err)) return false;
