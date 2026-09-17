@@ -1820,6 +1820,17 @@ bool IsTArrayElement(const Json& N)
         && Arr && TemplateArg(TypeOf(*Arr), "TArray", &Inner);
 }
 
+/* `Map[Key]` on a TMap: Map_Find for a read, Map_Add for a store. */
+bool IsTMapElement(const Json& N)
+{
+    if (Kind(N) != "CXXOperatorCallExpr") return false;
+    const Json* Callee = Strip(First(N));
+    const Json* Map = Nth(N, 1);
+    std::string Inner;
+    return Callee && Callee->contains("referencedDecl") && Name((*Callee)["referencedDecl"]) == "operator[]"
+        && Map && TemplateArg(TypeOf(*Map), "TMap", &Inner);
+}
+
 /* A variable, a member of one, or a member of this: what `T& R` can be another name for. */
 bool IsAliasable(const Json& N)
 {
@@ -2286,6 +2297,41 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             Out.K = FArgIR::InterfaceCtx;
             Out.Base = std::make_shared<FArgIR>();
             return LowerArg(*Lhs, BP, *Out.Base, Err);
+        }
+        if (IsTMapElement(*N) && Rhs)
+        {
+            /* `Map[Key]` read: Map_Find into a temp, which it resets to the value type's default for a missing key
+               (UBlueprintMapLibrary::GenericMap_Find), and the temp is the value. A store is Map_Add, in LowerBody. */
+            std::string Value = TypeOf(*N);
+            while (!Value.empty() && (Value.back() == '&' || Value.back() == ' ')) Value.pop_back();
+            Value = StripTypeKeywords(Value);
+            FArgIR Map, Key;
+            if (!LowerArg(*Lhs, BP, Map, Err) || !LowerArg(*Rhs, BP, Key, Err)) return false;
+            if (Map.K != FArgIR::Field && Map.K != FArgIR::Local && Map.K != FArgIR::LocalOut && Map.K != FArgIR::Member)
+            { *Err = "`[]` on a map needs a map variable, not a computed value"; return false; }
+            const std::string Tmp = "__MapGet" + std::to_string(ReadTmpCounter++) + "__";
+            FPropertyDef PD;
+            if (!TypeToProperty(Value, Tmp, 0, "a map element", BP, &PD, Err)) return false;
+            PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+            CurLocals->push_back(PD);
+            FArgIR Into;
+            Into.K = FArgIR::Local;
+            Into.S = Tmp;
+            auto Body = std::make_shared<std::vector<FStmtIR>>(1);
+            (*Body)[0].K = FStmtIR::StaticCall;
+            (*Body)[0].Call.Fn = BP.EngineFunction("/Script/Engine", "BlueprintMapLibrary", "Map_Find");
+            (*Body)[0].Call.Args = { Map, Key, Into };
+            auto Block = std::make_shared<std::vector<FStmtIR>>(1);
+            (*Block)[0].K = FStmtIR::Block;
+            (*Block)[0].Body = Body;
+            Out.K = FArgIR::Call;
+            Out.InnerType = Value;
+            Out.Sub = std::make_shared<FCallIR>();
+            Out.Sub->Intrinsic = "__Inline__";
+            Out.Sub->Inline = Block;
+            Out.Sub->InlineResult = Tmp;
+            Out.Sub->InlineType = Value;
+            return true;
         }
         if (OpName == "operator[]" && Lhs && Rhs && IsContainerType(TypeOf(*Lhs)))
         {
@@ -3260,6 +3306,12 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 bOk = LowerAddress(*Lhs, BP, Addr, &Pointee, Err) && RefThrough(std::move(Addr), Pointee, St.Var, Err)
                    && LowerArg(*Rhs, BP, St.Value, Err);
             }
+            else if (LK == "MemberExpr" && First(*Lhs) && IsTMapElement(*Strip(First(*Lhs))))
+            {
+                *Err = "`Map[Key].Member = v` would change a copy: read Map[Key] into a local, change it, store it back";
+                bOk = false;
+                return;
+            }
             else if (LK == "MemberExpr")
             {
                 St.K = FStmtIR::Assign;
@@ -3281,6 +3333,19 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 St.bAssignLocal = !bOut;
                 St.bAssignOutParm = bOut;
                 bOk = LowerArg(*Rhs, BP, St.Value, Err);
+            }
+            else if (IsTMapElement(*Lhs))
+            {
+                /* `Map[Key] = v`: Map_Add, which replaces the value of a key already there. */
+                St.K = FStmtIR::StaticCall;
+                St.Call.Fn = BP.EngineFunction("/Script/Engine", "BlueprintMapLibrary", "Map_Add");
+                St.Call.Args.resize(3);
+                bOk = LowerArg(*Nth(*Lhs, 1), BP, St.Call.Args[0], Err) && LowerArg(*Nth(*Lhs, 2), BP, St.Call.Args[1], Err)
+                   && LowerArg(*Rhs, BP, St.Call.Args[2], Err);
+                if (bOk && St.Call.Args[0].K != FArgIR::Field && St.Call.Args[0].K != FArgIR::Local
+                    && St.Call.Args[0].K != FArgIR::LocalOut && St.Call.Args[0].K != FArgIR::Member)
+                { *Err = "`[]` on a map needs a map variable, not a computed value"; bOk = false; }
+                if (bOk && St.Call.Args[0].K == FArgIR::Field && !St.Call.Args[0].Base) CallRepNotify = RepNotifyFor(St.Call.Args[0].S);
             }
             else if (LK == "CXXOperatorCallExpr")
             {

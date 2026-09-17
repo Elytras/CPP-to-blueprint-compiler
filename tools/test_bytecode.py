@@ -312,6 +312,7 @@ def nested():
     out = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dumpstruct.py'),
                           asset('NestedTest'), '0'], capture_output=True, text=True).stdout
     assert "UserDefinedStruct'FNC_TArray_FName'" in out and "UserDefinedStruct'FNC_TArray_int'" in out, out
+    check('NestedTest', 'MapIndex', lambda Seed: (Seed + 2) * 10 + 1, [dict(Seed=v) for v in (0, 5, -3)])
     print('ok  NestedTest: containers inside containers through wrapper structs')
 
 
