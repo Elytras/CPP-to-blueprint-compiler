@@ -2103,6 +2103,18 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
     if (K == "MemberExpr") return LowerField(*N, BP, Out, Err);
     if (K == "CXXThisExpr") { Out.K = FArgIR::Self; return true; }
     if (K == "CXXNullPtrLiteralExpr") { Out.K = FArgIR::NullObj; return true; }
+    if (K == "UnaryExprOrTypeTraitExpr" && (N->value("name", std::string()) == "sizeof" || N->value("name", std::string()) == "alignof"))
+    {
+        /* The game's layout, not the host compiler's: clang sizes the UeApi stand-ins, which are not the real types. */
+        const Json* Operand = First(*N);
+        const std::string T = N->contains("argType") ? (*N)["argType"].value("qualType", std::string())
+                            : Operand ? TypeOf(*Operand) : std::string();
+        int32 Size = 0, Align = 0;
+        if (!LayoutOf(T, &Size, &Align, Err)) { *Err = N->value("name", std::string()) + ": " + *Err; return false; }
+        Out.K = FArgIR::Int;
+        Out.I = N->value("name", std::string()) == "sizeof" ? Size : Align;
+        return true;
+    }
     if ((K == "CXXConstructExpr" || K == "CXXTemporaryObjectExpr")
         && StripTypeKeywords(TypeOf(*N)).compare(0, 10, "TDelegate<") == 0)
     {
