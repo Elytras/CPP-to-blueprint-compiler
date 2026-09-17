@@ -841,6 +841,8 @@ private:
        wrapper struct, <wrapper name> -> the container type. The wrapper has the container's layout. */
     std::map<std::string, std::string> NestedWrappers;
     static constexpr const char* NestedPackage = "/Game/_ElytrasMods/_NestedContainerStructs";
+    bool NestedWrapperOut(const std::string& ContainerType, size_t OutArg, const std::string& ResultType, FStmtIR Copy,
+                          FBlueprintClass& BP, FArgIR& Call, std::string* Err);
     std::string NestedWrapper(const std::string& ContainerType)
     {
         /* clang spells one type int or int32 depending on where it comes from: one wrapper for both. */
@@ -2264,13 +2266,31 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             Out.Sub->Fn = BP.EngineFunction("/Script/Engine", Lib, Prefix + Method);
             Out.Sub->Args.push_back(Target);
             bool bFirst = true, bOk = true;
+            std::string LastType;
             ForEach(*N, [&](const Json& A) {
                 if (bFirst) { bFirst = false; return; }
                 if (!bOk) return;
                 FArgIR V;
                 bOk = LowerArg(A, BP, V, Err);
                 if (bOk) Out.Sub->Args.push_back(V);
+                LastType = TypeOf(A);
             });
+            if (bOk && Out.Sub->Args.size() == 3 && ((Prefix == "Map_" && Method == "Find") || (Prefix == "Array_" && Method == "Get")))
+            {
+                while (!LastType.empty() && (LastType.back() == '&' || LastType.back() == ' ')) LastType.pop_back();
+                LastType = StripTypeKeywords(LastType);
+                if (IsContainerType(LastType))
+                {
+                    FArgIR Dest = Out.Sub->Args[2];
+                    FStmtIR Copy;
+                    Copy.K = FStmtIR::Assign;
+                    Copy.Var = Dest;
+                    Copy.Var.LetOp = LetOpFor(LastType);
+                    Copy.bAssignLocal = Dest.K == FArgIR::Local;
+                    Copy.bAssignOutParm = Dest.K == FArgIR::LocalOut;
+                    return NestedWrapperOut(LastType, 2, Prefix == "Map_" ? "bool" : "", std::move(Copy), BP, Out, Err);
+                }
+            }
             return bOk;
         }
         Out.K = FArgIR::Call;
@@ -2310,6 +2330,32 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             if (Map.K != FArgIR::Field && Map.K != FArgIR::Local && Map.K != FArgIR::LocalOut && Map.K != FArgIR::Member)
             { *Err = "`[]` on a map needs a map variable, not a computed value"; return false; }
             const std::string Tmp = "__MapGet" + std::to_string(ReadTmpCounter++) + "__";
+            if (IsContainerType(Value))
+            {
+                /* The value is copied out of a wrapper temp into Tmp, which is then the value. */
+                FPropertyDef Holder;
+                if (!TypeToProperty(Value, Tmp, 0, "a map element", BP, &Holder, Err)) return false;
+                Holder.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+                CurLocals->push_back(Holder);
+                Out.K = FArgIR::Call;
+                Out.Sub = std::make_shared<FCallIR>();
+                Out.Sub->Fn = BP.EngineFunction("/Script/Engine", "BlueprintMapLibrary", "Map_Find");
+                FArgIR Into;
+                Into.K = FArgIR::Local;
+                Into.S = Tmp;
+                Out.Sub->Args = { Map, Key, Into };
+                FStmtIR Copy;
+                Copy.K = FStmtIR::Assign;
+                Copy.Var = Into;
+                Copy.Var.LetOp = LetOpFor(Value);
+                Copy.bAssignLocal = true;
+                if (!NestedWrapperOut(Value, 2, "", std::move(Copy), BP, Out, Err)) return false;
+                Out.K = FArgIR::Call;
+                Out.InnerType = Value;
+                Out.Sub->InlineResult = Tmp;
+                Out.Sub->InlineType = Value;
+                return true;
+            }
             FPropertyDef PD;
             if (!TypeToProperty(Value, Tmp, 0, "a map element", BP, &PD, Err)) return false;
             PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
@@ -4274,6 +4320,76 @@ FIndex FCompiler::ClassImportOf(const FRecord& R, FBlueprintClass& BP) const
     if (R.IsNative()) return BP.EngineClass(R.UePackage, R.UeName);
     if (&R == Cur) return BP.ClassIndex();
     return BP.EngineClass(ModPackage + "/" + R.CppName, R.CppName + "_C");
+}
+
+/*
+execMap_Find and execArray_Get write their out value in place only when the variable's property class is the value
+property's; otherwise into a scratch that is thrown away. A nested container's value property is its wrapper struct,
+so Call's argument OutArg becomes a wrapper temp, and Copy (whose Var is the real destination) stores the temp's Value
+member after the call. Call becomes an __Inline__ block; its result, when ResultType is not empty, is the call's value.
+*/
+bool FCompiler::NestedWrapperOut(const std::string& ContainerType, size_t OutArg, const std::string& ResultType, FStmtIR Copy,
+                                 FBlueprintClass& BP, FArgIR& Call, std::string* Err)
+{
+    int32 Size = 16, Align = 8;
+    if (!LayoutOf(ContainerType, &Size, &Align, Err)) return false;
+    const FIndex Wrapper = NestedWrapperImport(ContainerType, BP);
+    const std::string Tmp = "__Wrap" + std::to_string(ReadTmpCounter++) + "__";
+    FPropertyDef W = StructParam(Tmp, Wrapper, NestedWrapper(ContainerType), Size, 0);
+    W.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+    CurLocals->push_back(W);
+
+    FArgIR TmpArg;
+    TmpArg.K = FArgIR::Local;
+    TmpArg.S = Tmp;
+    FCallIR Inner = *Call.Sub;
+    Inner.Args[OutArg] = TmpArg;
+
+    auto Body = std::make_shared<std::vector<FStmtIR>>();
+    std::string Result;
+    if (ResultType.empty())
+    {
+        Body->emplace_back();
+        Body->back().K = FStmtIR::StaticCall;
+        Body->back().Call = Inner;
+    }
+    else
+    {
+        Result = "__Found" + std::to_string(ReadTmpCounter++) + "__";
+        FPropertyDef R;
+        if (!TypeToProperty(ResultType, Result, 0, "a lookup result", BP, &R, Err)) return false;
+        R.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+        CurLocals->push_back(R);
+        Body->emplace_back();
+        Body->back().K = FStmtIR::Assign;
+        Body->back().Var.K = FArgIR::Local;
+        Body->back().Var.S = Result;
+        Body->back().Var.LetOp = LetOpFor(ResultType);
+        Body->back().bAssignLocal = true;
+        Body->back().Value.K = FArgIR::Call;
+        Body->back().Value.InnerType = ResultType;
+        Body->back().Value.Sub = std::make_shared<FCallIR>(Inner);
+    }
+    Copy.Value.K = FArgIR::Member;
+    Copy.Value.S = "Value";
+    Copy.Value.Owner = Wrapper;
+    Copy.Value.Base = std::make_shared<FArgIR>(TmpArg);
+    Copy.Value.LetOp = Copy.Var.LetOp;
+    Copy.Value.InnerType = ContainerType;
+    Body->push_back(std::move(Copy));
+
+    auto Block = std::make_shared<std::vector<FStmtIR>>(1);
+    (*Block)[0].K = FStmtIR::Block;
+    (*Block)[0].Body = Body;
+    Call = FArgIR();
+    Call.K = FArgIR::Call;
+    Call.InnerType = ResultType;
+    Call.Sub = std::make_shared<FCallIR>();
+    Call.Sub->Intrinsic = "__Inline__";
+    Call.Sub->Inline = Block;
+    Call.Sub->InlineResult = Result;
+    Call.Sub->InlineType = ResultType;
+    return true;
 }
 
 bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& PName, uint64 ExtraFlags,
