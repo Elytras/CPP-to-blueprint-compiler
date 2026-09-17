@@ -324,7 +324,11 @@ def optimizer():
     walk = lambda fn: subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'walkscript.py'),
                                       base, str(names.index(fn))], capture_output=True, text=True).stdout
     assert walk('Drop').count('Multiply_IntInt') == 2 and 'Abs_Int' not in walk('Drop'), walk('Drop')
+    check('OptTest', 'Locals', lambda A: A, [dict(A=a) for a in (0, 5, -2)])
+    w = walk('Locals')
+    assert 'Multiply_IntInt' not in w and 'Add_IntInt' not in w and 'Kept' in w and 'RandomInteger' in w, w
     print('ok  OptTest: unused pure calls dropped, used ones kept')
+    print('ok  OptTest.Locals: unread locals dropped, the property store and the impure call kept')
 
 
 optimizer()

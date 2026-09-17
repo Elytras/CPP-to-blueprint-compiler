@@ -783,6 +783,7 @@ private:
        __DerefScratch__ FDeref local is added per function on first use; the prologue seeds
        its Num=1 so ArrayGetByRef's bounds check passes. */
     void DropUnusedPure(std::vector<FStmtIR>& Stmts);
+    void DropUnusedLocals(std::vector<FStmtIR>& Stmts, std::vector<FPropertyDef>& Locals);
     bool HoistReadsInList(std::vector<FStmtIR>& Stmts, FBlueprintClass& BP,
                           std::vector<FPropertyDef>& Locals, std::string* Err);
     bool HoistReadsInStmt(FStmtIR& St, FBlueprintClass& BP,
@@ -2853,7 +2854,97 @@ bool CallsImpure(const FArgIR& A)
     return A.K == FArgIR::Index && A.Sub
         && std::any_of(A.Sub->Args.begin(), A.Sub->Args.end(), [](const FArgIR& I) { return CallsImpure(I); });
 }
+/* Every name a statement list may read. A whole-variable store to a Local (Assign / Decl) is the one mention that is
+   not a read; anything else that names it, an index store, an out-argument, a string an intrinsic carries, is. */
+void NamesRead(const FArgIR& A, std::set<std::string>& Out);
+void NamesRead(const std::vector<FStmtIR>& Stmts, std::set<std::string>& Out, bool bStoresRead = false);
+void NamesRead(const FCallIR& C, std::set<std::string>& Out)
+{
+    if (C.Inline) NamesRead(*C.Inline, Out, true);     // DropStores does not reach an expression's inline body
+    Out.insert(C.InlineResult);
+    Out.insert(C.View);
+    if (C.Target) NamesRead(*C.Target, Out);
+    for (const FArgIR& A : C.Args) NamesRead(A, Out);
+}
+void NamesRead(const FArgIR& A, std::set<std::string>& Out)
+{
+    Out.insert(A.S);
+    if (A.Sub) NamesRead(*A.Sub, Out);
+    if (A.Base) NamesRead(*A.Base, Out);
+}
+void NamesRead(const std::vector<FStmtIR>& Stmts, std::set<std::string>& Out, bool bStoresRead)
+{
+    for (const FStmtIR& St : Stmts)
+    {
+        NamesRead(St.Target, Out);
+        NamesRead(St.Call, Out);
+        if (bStoresRead || !((St.K == FStmtIR::Assign || St.K == FStmtIR::Decl) && St.Var.K == FArgIR::Local)) NamesRead(St.Var, Out);
+        for (const FArgIR* A : { &St.Value, &St.Cond, &St.SwitchValue }) NamesRead(*A, Out);
+        for (const FArgIR& A : St.CaseTests) NamesRead(A, Out);
+        for (const auto* L : { &St.Then, &St.Else, &St.Body, &St.Inc, &St.Trailer }) if (*L) NamesRead(**L, Out, bStoresRead);
+    }
+}
+
+/* Removes the stores to a local in Unread; a value that calls something impure keeps its call as a statement. */
+void DropStores(std::vector<FStmtIR>& Stmts, const std::set<std::string>& Unread)
+{
+    for (size_t I = 0; I < Stmts.size(); ++I)
+    {
+        FStmtIR& St = Stmts[I];
+        for (auto* L : { &St.Then, &St.Else, &St.Body, &St.Inc, &St.Trailer })
+            if (*L)
+            {
+                *L = std::make_shared<std::vector<FStmtIR>>(**L);
+                DropStores(**L, Unread);
+            }
+        if (!(St.K == FStmtIR::Assign || St.K == FStmtIR::Decl) || St.Var.K != FArgIR::Local || !Unread.count(St.Var.S)) continue;
+        if (!(St.K == FStmtIR::Decl && !St.bHasValue) && CallsImpure(St.Value))
+        {
+            if (St.Value.K != FArgIR::Call || !St.Value.Sub) continue;      // ponytail: kept whole; only a direct call is unwrapped
+            FStmtIR Call;
+            Call.K = FStmtIR::StaticCall;
+            Call.Call = *St.Value.Sub;
+            St = std::move(Call);
+            continue;
+        }
+        Stmts.erase(Stmts.begin() + I--);
+    }
+}
 }   // namespace
+
+/*
+A local nothing reads is not compiled: its stores go, and the property with them. Only locals; a store to a property
+of self or another object is never dropped, since something outside the function may read it.
+*/
+void FCompiler::DropUnusedLocals(std::vector<FStmtIR>& Stmts, std::vector<FPropertyDef>& Locals)
+{
+    for (;;)    // dropping `X = Y` can leave Y unread
+    {
+        std::set<std::string> Read;
+        NamesRead(Stmts, Read);
+        for (const FCompletion& C : Completions) Read.insert(C.Local);     // its event stores there
+        std::set<std::string> Unread;
+        for (const FPropertyDef& L : Locals) if (!Read.count(L.Name)) Unread.insert(L.Name);
+        if (Unread.empty()) return;
+        DropStores(Stmts, Unread);
+        auto Mentioned = [&](const FPropertyDef& L) {
+            if (!Unread.count(L.Name)) return true;
+            bool bStored = false;
+            std::function<void(const std::vector<FStmtIR>&)> Scan = [&](const std::vector<FStmtIR>& List) {
+                for (const FStmtIR& St : List)
+                {
+                    if (St.Var.K == FArgIR::Local && St.Var.S == L.Name) bStored = true;
+                    for (const auto* B : { &St.Then, &St.Else, &St.Body, &St.Inc, &St.Trailer }) if (*B) Scan(**B);
+                }
+            };
+            Scan(Stmts);
+            return bStored;     // an impure store kept whole still needs its property
+        };
+        const size_t Before = Locals.size();
+        Locals.erase(std::remove_if(Locals.begin(), Locals.end(), [&](const FPropertyDef& L) { return !Mentioned(L); }), Locals.end());
+        if (Locals.size() == Before) return;
+    }
+}
 
 /*
 Drops a statement that only calls a pure function whose arguments call nothing impure: its value is unused, so
@@ -4569,6 +4660,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             return false;
         }
         DropUnusedPure(Stmts);
+        DropUnusedLocals(Stmts, Locals);
         for (const auto& [Struct, Keep] : KeepLoaded)
         {
             auto Typed = [&](const FPropertyDef& P) { return P.Type == "StructProperty" && P.Extra.V == Struct; };
