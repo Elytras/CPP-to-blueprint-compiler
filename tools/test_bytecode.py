@@ -247,9 +247,22 @@ def mod_enum():
     cdo = subprocess.run([sys.executable, os.path.join(here, 'dumptags.py'), base, str(exports.index('Default__TypesTest_C'))], capture_output=True, text=True).stdout
     assert 'EMood::Angry' in cdo, cdo
     print('ok  TypesTest: UE_ENUM cooks EMood with its C++ names and values; the default is its enumerator')
+    for enum, pairs_want in (('ESpan', [('ESpan::Tiny', -3), ('ESpan::Wide', 70000), ('ESpan::Huge', 70001), ('ESpan::Vast', 70002), ('ESpan::ESpan_MAX', 70003)]),
+                             ('EAge', [('EAge::Epoch', 0), ('EAge::Eon', 5000000000), ('EAge::EAge_MAX', 5000000001)])):
+        r = dumpexp.load(os.path.join(os.path.dirname(base), enum))
+        names, raw = r[3], r[1]
+        count = struct.unpack_from('<i', raw, 12)[0]
+        got = [(names[struct.unpack_from('<i', raw, 16 + i * 16)[0]], struct.unpack_from('<q', raw, 24 + i * 16)[0]) for i in range(count)]
+        assert got == pairs_want, got
+    assert re.search(r'EnumProperty Span .*size=4 .*\n\s+IntProperty UnderlyingType .*size=4', cls), cls
+    assert re.search(r'EnumProperty Age .*size=8 .*\n\s+Int64Property UnderlyingType .*size=8', cls), cls
+    assert 'ESpan::Wide' in cdo and 'EAge::Eon' in cdo, cdo
+    print('ok  TypesTest: int32 / int64 enums cook as EnumProperty over Int / Int64Property')
 
 
 mod_enum()
+check('TypesTest', 'SpanScore', lambda S: {-3: 1, 70000: 2, 70001: 3, 70002: 4}.get(S, 0), [dict(S=s) for s in (-3, 70000, 70001, 70002, 5)])
+check('TypesTest', 'AgeOf', lambda A: 1 if A == 5000000000 else 2 if A == 0 else 0, [dict(A=a) for a in (0, 5000000000, 7)])
 check('TypesTest', 'MoodScore', lambda M: {0: 1, 5: 2, 6: 3}.get(M, 0), [dict(M=m) for m in (0, 5, 6, 7)])
 check('InlineTest', 'InPlace', lambda V: V * 3 + 1 + V + 1, [dict(V=v) for v in (-3, 0, 7)])
 

@@ -200,6 +200,7 @@ void WriteDefaultTag(FArc& Ar, const FPropertyDef& P)
         if (P.Type == "IntProperty") V.I32(int32(D.I));
         else if (P.Type == "FloatProperty") { const float F = float(D.F); V.Raw(&F, 4); }
         else if (P.Type == "Int64Property") V.I64(D.I);
+        else if (P.Type == "EnumProperty") V.Name(D.K == FDefaultValue::Str ? D.S : P.EnumZero);
         else if (P.Type == "ByteProperty") { if (P.StructName.empty()) V.U8(uint8(D.I)); else V.Name(D.K == FDefaultValue::Str ? D.S : P.EnumZero); }   // an enum byte is its enumerator's name
         else if (P.Type == "StrProperty") WriteFStringValue(V, D.S);
         else if (P.Type == "NameProperty") V.Name(bSet ? D.S : std::string("None"));
@@ -283,6 +284,11 @@ void WriteProperty(FArc& Ar, const FPropertyDef& P)
     }
     else if (P.Type == "ByteProperty")
         Ar.Idx(P.Extra);                // Enum
+    else if (P.Type == "EnumProperty")
+    {
+        Ar.Idx(P.Extra);                // Enum
+        WriteProperty(Ar, *P.Inner);    // UnderlyingProp, through SerializeSingleField
+    }
     else if (P.Type == "ArrayProperty" || P.Type == "SetProperty")
         WriteProperty(Ar, *P.Inner);    // SerializeSingleField: type name then the field
     else if (P.Type == "MapProperty")
@@ -290,7 +296,7 @@ void WriteProperty(FArc& Ar, const FPropertyDef& P)
         WriteProperty(Ar, *P.Inner);    // KeyProp
         WriteProperty(Ar, *P.Value);    // ValueProp
     }
-    // TODO: unimplemented tails - EnumProperty (Enum + UnderlyingProp), DelegateProperty (SignatureFunction).
+    // TODO: unimplemented tail - DelegateProperty (SignatureFunction).
 }
 
 /* ---- bytecode ---- */

@@ -849,6 +849,7 @@ private:
     std::map<std::string, FEnumInfo> Enums;
     std::map<std::string, FStructInfo> Structs;
     std::map<std::string, int64> EnumValues;          // clang EnumConstantDecl id -> value
+    std::map<std::string, int32> EnumConstWidth;      // clang EnumConstantDecl id -> its enum's size, 1 / 4 / 8
     std::map<std::string, uint32> EventFlags;         // UeApi/Events.json: "Package.Class.Function" -> EFunctionFlags
     std::map<std::string, FIndex> CurSignatures;      // Generate: dispatcher name -> its signature function export
     const FConv* FindConv(const std::string& From, const std::string& To) const;
@@ -1255,7 +1256,13 @@ bool FCompiler::Collect(std::string* Err)
                 EnumValues[C.value("id", std::string())] = Next++;
             });
             const Json& U = N.contains("fixedUnderlyingType") ? N["fixedUnderlyingType"] : Json::object();
-            EnumUnderlying[Ns + N.value("name", std::string())] = U.value("desugaredQualType", U.value("qualType", std::string()));
+            const std::string Under = U.value("desugaredQualType", U.value("qualType", std::string()));
+            const std::string Canon = Under == "unsigned char" || Under == "uint8" ? "uint8"
+                                    : Under == "int" || Under == "int32" ? "int32"
+                                    : Under == "long long" || Under == "int64" ? "int64" : Under;
+            EnumUnderlying[Ns + N.value("name", std::string())] = Canon;
+            const int32 Width = Under.empty() || Canon == "uint8" ? 1 : Canon == "int64" ? 8 : 4;
+            ForEach(N, [&](const Json& C) { if (Kind(C) == "EnumConstantDecl") EnumConstWidth[C.value("id", std::string())] = Width; });
             return;
         }
         if (Kind(N) == "VarDecl" && N.contains("name") && Name(N).size() > 8 && Name(N).compare(Name(N).size() - 8, 8, "__UeEnum") == 0)
@@ -1366,13 +1373,17 @@ bool FCompiler::Collect(std::string* Err)
         auto D = EnumDecls.find(Enum);
         if (D == EnumDecls.end() || D->second.empty()) { *Err = "UE_ENUM(" + Enum + ") names no enum with enumerators"; return false; }
         const std::string U = EnumUnderlying[Enum];
-        if (U != "unsigned char" && U != "uint8") { *Err = "UE_ENUM(" + Enum + "): a Blueprint enum is uint8, declare it `: uint8`"; return false; }
+        if (U != "uint8" && U != "int32" && U != "int64")
+        { *Err = "UE_ENUM(" + Enum + "): declare it `: uint8` (a Blueprint enum), `: int32` or `: int64`"; return false; }
+        const int64 Top = U == "uint8" ? 254 : U == "int32" ? int64(INT32_MAX) - 1 : INT64_MAX - 1;
+        const int64 Bottom = U == "uint8" ? 0 : U == "int32" ? int64(INT32_MIN) : INT64_MIN;
         for (const auto& En : D->second)
-            if (En.second < 0 || En.second > 254) { *Err = "UE_ENUM(" + Enum + "): " + En.first + " must be 0..254 (255 is _MAX's)"; return false; }
+            if (En.second < Bottom || En.second > Top)
+            { *Err = "UE_ENUM(" + Enum + "): " + En.first + " is out of range (the largest value is _MAX's)"; return false; }
         const std::string Leaf = Enum.substr(Enum.rfind(':') == std::string::npos ? 0 : Enum.rfind(':') + 1);
         std::string First = D->second.front().first;
         for (const auto& En : D->second) if (En.second == 0) { First = En.first; break; }
-        Enums[Enum] = { (Owner.empty() ? ModPackage : Owner) + "/" + Leaf, Leaf, "uint8", First };
+        Enums[Enum] = { (Owner.empty() ? ModPackage : Owner) + "/" + Leaf, Leaf, U, First };
         if (Owner.empty() || Owner == ModPackage) ModEnums[Leaf] = D->second;
     }
 
@@ -1585,7 +1596,8 @@ std::string FCompiler::Canon(std::string T) const
     T = StripTypeKeywords(T);
     const EStrKind K = StrKindOf(T);
     if (K != SK_None) return TypeNameOf(K);
-    if (Enums.count(T)) return "uint8";
+    if (auto E = Enums.find(T); E != Enums.end())
+        return E->second.Underlying == "int32" ? "int" : E->second.Underlying == "int64" ? "int64" : "uint8";
     std::string Inner;
     if (TemplateArg(T, "TSubclassOf", &Inner)) return TypeNameOf(SK_Object);
     for (const char* Tpl : { "TArray", "TSet", "TMap" })
@@ -2075,7 +2087,9 @@ const FReadViewSpec* FCompiler::ViewFor(const std::string& PointeeType) const
     else if (P == "float") Read = "__ReadFloat__";
     else if (P == "uint8" || P == "int8" || P == "unsigned char" || P == "signed char" || P == "char" || P == "bool")
         Read = "__ReadByte__";
-    else if (auto E = Enums.find(P); E != Enums.end() && E->second.Underlying == "uint8") Read = "__ReadByte__";
+    else if (auto E = Enums.find(P); E != Enums.end())
+        Read = E->second.Underlying == "uint8" ? "__ReadByte__" : E->second.Underlying == "int32" ? "__Read32__"
+             : E->second.Underlying == "int64" ? "__Read64__" : nullptr;
     else if (P == "FName") Read = "__ReadName__";
     else if (P == "FString") Read = "__ReadString__";
     else if (P == "FText") Read = "__ReadText__";
@@ -2599,8 +2613,11 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         {
             auto V = EnumValues.find(Ref.value("id", std::string()));
             if (V == EnumValues.end()) { *Err = "enum constant with no value: " + Name(Ref); return false; }
-            Out.K = FArgIR::Byte;
+            const auto W = EnumConstWidth.find(Ref.value("id", std::string()));
+            const int32 Width = W == EnumConstWidth.end() ? 1 : W->second;
+            Out.K = Width == 8 ? FArgIR::Int64 : Width == 4 ? FArgIR::Int : FArgIR::Byte;
             Out.I = int32(V->second);
+            Out.I64 = V->second;
             return true;
         }
         /* A reference local (or a range-for binding) is the variable it names, or the value at the address it keeps. */
@@ -3660,7 +3677,9 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                             && (*CondCallee)["referencedDecl"].value("name", std::string()) == "__NameSwitch__";
             if (bName) Cond = Nth(*CondCall, 1);
             if (!Cond) { *Err = "UE_NAME_SWITCH needs a name"; bOk = false; return; }
-            const int32 Width = bName ? 0 : SwitchWidth(TypeOf(*Strip(Cond)));
+            int32 Width = bName ? 0 : SwitchWidth(TypeOf(*Strip(Cond)));
+            if (auto E = bName ? Enums.end() : Enums.find(StripTypeKeywords(TypeOf(*Strip(Cond)))); E != Enums.end())
+                Width = E->second.Underlying == "int32" ? 4 : E->second.Underlying == "int64" ? 8 : 1;
             const std::string TempTy = bName ? "FName" : Width == 1 ? "uint8" : Width == 8 ? "int64" : "int32";
             const char* NotEqual = bName ? "NotEqual_NameName" : Width == 1 ? "NotEqual_ByteByte"
                                  : Width == 8 ? "NotEqual_Int64Int64" : "NotEqual_IntInt";
@@ -4649,7 +4668,7 @@ bool LowerDefault(const Json& F, FPropertyDef& PD, std::string* Err)
         else { D.K = Int != 0 ? FDefaultValue::Int : FDefaultValue::None; D.I = Int; }
         return true;
     }
-    if (!bNeg && K == "DeclRefExpr" && T == "ByteProperty" && !PD.StructName.empty()
+    if (!bNeg && K == "DeclRefExpr" && (T == "ByteProperty" || T == "EnumProperty") && !PD.StructName.empty()
         && (*Init)["referencedDecl"].value("kind", std::string()) == "EnumConstantDecl")
     {
         D.S = PD.StructName + "::" + Name((*Init)["referencedDecl"]);
@@ -4807,8 +4826,22 @@ bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& P
     if (Type == "FText") { *Out = TextParam(PName, ExtraFlags); return true; }
     if (auto E = Enums.find(Type); E != Enums.end())
     {
+        if (E->second.Underlying == "int32" || E->second.Underlying == "int64")
+        {
+            /* An EnumProperty over an Int/Int64Property, the way UHT reflects `enum class : int32`. No editor-made
+               Blueprint has one, but FEnumProperty takes any numeric underlying property and UEnum values are int64. */
+            const bool b64 = E->second.Underlying == "int64";
+            *Out = b64 ? Int64Param(PName, ExtraFlags) : IntParam(PName, ExtraFlags);
+            Out->Type = "EnumProperty";
+            Out->Extra = BP.Enum(E->second.Package, E->second.UeName);
+            Out->StructName = E->second.UeName;
+            Out->EnumZero = E->second.UeName + "::" + E->second.First;
+            Out->Inner = std::make_shared<FPropertyDef>(b64 ? Int64Param("UnderlyingType") : IntParam("UnderlyingType"));
+            Out->Inner->PropertyFlags = 0;
+            return true;
+        }
         if (E->second.Underlying != "uint8")
-        { *Err = "TODO: unimplemented " + Where + ": " + QualType + " (only a uint8 enum is a ByteProperty)"; return false; }
+        { *Err = "TODO: unimplemented " + Where + ": " + QualType + " (a uint8, int32 or int64 enum only)"; return false; }
         *Out = ByteParam(PName, ExtraFlags);
         Out->Extra = BP.Enum(E->second.Package, E->second.UeName);
         Out->StructName = E->second.UeName;
@@ -4866,6 +4899,8 @@ bool FCompiler::LayoutOf(const std::string& QualType, int32* Size, int32* Align,
     if (T == "FString" || T == "char *" || T == "char*") { *Size = 16; *Align = 8; return true; }
     if (T == "FText") { *Size = 24; *Align = 8; return true; }
     if (!T.empty() && T.back() == '*') { *Size = 8; *Align = 8; return true; }
+    if (auto E = Enums.find(T); E != Enums.end() && (E->second.Underlying == "int32" || E->second.Underlying == "int64"))
+    { *Size = *Align = E->second.Underlying == "int32" ? 4 : 8; return true; }
     if (Enums.count(T)) { *Size = 1; *Align = 1; return true; }
     std::string Inner;
     if (TemplateArg(T, "TSubclassOf", &Inner)) { *Size = 8; *Align = 8; return true; }
