@@ -806,8 +806,8 @@ def main():
                         variants += [(inner.rsplit(" ", 1)[0], [p for p in v if p is not dele[0]])
                                      for r, v in variants if r == "void" and not any(p[0] in latent for p in v)]
                 # UE_PURE lets AssetGen drop a discarded call and reuse a repeated one; a function that answers through
-                # a reference parameter is left unmarked.
-                pure = ((k.ue_name, fname) in PURE and not IMPURE_PURE.search(fname)
+                # a reference parameter (or returns void, so its answer can only be an out-parameter) is left unmarked.
+                pure = (ret != "void" and (k.ue_name, fname) in PURE and not IMPURE_PURE.search(fname)
                         and not any(t.endswith("&") and not t.startswith("const ") for t, _ in params))
                 for vret, plist in variants:
                     args = ", ".join("%s %s" % (rewrite(t), n) for t, n in plist)
