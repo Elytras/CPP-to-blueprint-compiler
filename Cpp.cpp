@@ -2707,7 +2707,10 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         if (Op == "&&" || Op == "||")
         {
             /* Short-circuit: the hoist pass turns this into `T = L; if (T) T = R;` (or `if (!T)`), so R's calls
-               and reads only run when C++ would run them. */
+               and reads only run when C++ would run them. Never fold it into BooleanAND / BooleanOR, not even for a
+               pure R: those are ordinary calls whose operands are both evaluated first, and a pure R still faults
+               (`A && *A`, `X != 0 && 10 / X`, an out-of-range Get). FlowTest SafeRatio / EitherZero / WhileAnd
+               divide by zero in runscript if either side runs eagerly. */
             Out.K = FArgIR::Call;
             Out.InnerType = "bool";
             Out.Sub = std::make_shared<FCallIR>();
