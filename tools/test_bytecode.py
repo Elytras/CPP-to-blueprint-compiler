@@ -331,3 +331,15 @@ def optimizer():
 
 
 optimizer()
+
+
+def member_address():
+    base = os.path.join(ROOT, 'CppTest', 'FSD', 'Content', '_ElytrasMods', 'CppTest', 'Test')
+    names = [e['name'] for e in dumpexp.load(base)[5]]
+    w = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'walkscript.py'),
+                        base, str(names.index('MemberAddress'))], capture_output=True, text=True).stdout
+    assert "Function'GetPropertyAddress'" in w and 'NameConst        Vtbl' in w, w
+    print('ok  CppTest.MemberAddress: &Member through ReadProperty::GetPropertyAddress')
+
+
+member_address()

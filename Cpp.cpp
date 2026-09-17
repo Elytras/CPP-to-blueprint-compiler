@@ -2054,6 +2054,36 @@ bool FCompiler::LowerAddress(const Json& Lvalue, FBlueprintClass& BP, FArgIR& Ou
         PlusOffset(std::move(Array), std::move(Offset));
         return true;
     }
+    if (K == "MemberExpr" && N->value("isArrow", false))
+    {
+        /* `&Obj->Member`: a cooked property carries no offset, so ReadProperty::GetPropertyAddress finds the property
+           by name on Obj's class at run time and adds its offset to Obj's address (0 when there is none). */
+        const Json* Base = Nth(*N, 0);
+        std::string ObjType = Base ? StripTypeKeywords(TypeOf(*Base)) : std::string();
+        while (!ObjType.empty() && (ObjType.back() == '*' || ObjType.back() == ' ')) ObjType.pop_back();
+        const FRecord* Owner = Find(ObjType);
+        if (!Owner || Owner->bIsStruct) { *Err = "TODO: the address of a member of " + ObjType + ", which is not an object class"; return false; }
+        const FRecord* Lib = Find("ReadProperty");
+        if (!Lib) { *Err = "`&Obj->Member` finds the member at run time through ReadProperty::GetPropertyAddress: include ReadProperty.h"; return false; }
+        FArgIR Obj;
+        if (!LowerArg(*Base, BP, Obj, Err)) return false;
+        const std::string Pkg = Lib->IsNative() ? Lib->UePackage : ModPackage + "/" + Lib->CppName;
+        const std::string Cls = Lib->IsNative() ? Lib->UeName : Lib->CppName + "_C";
+        Out = FArgIR();
+        Out.K = FArgIR::Call;
+        Out.InnerType = "int64";
+        Out.Sub = std::make_shared<FCallIR>();
+        Out.Sub->Fn = BP.EngineFunction(Pkg, Cls, "GetPropertyAddress");
+        Out.Sub->bScript = true;
+        Out.Sub->Context = BP.ClassDefaultObject(Pkg, Cls);
+        FArgIR Name, Wco;
+        Name.K = FArgIR::Name;
+        Name.S = N->value("name", std::string());
+        if (!CurrentWco.empty()) { Wco.K = FArgIR::Local; Wco.S = CurrentWco; }
+        Out.Sub->Args = { Obj, Name, Wco };
+        *Pointee = StripTypeKeywords(TypeOf(*N));
+        return true;
+    }
     *Err = "TODO: the address of " + (N ? K : std::string("nothing")) + ": a Blueprint variable has none the VM hands "
            "out; point into an object (`(uint8*)Obj`), a TArray element (`&Items[I]`) or memory through a pointer";
     return false;
