@@ -150,8 +150,8 @@ ENUM_DECL = re.compile(r"^enum class (\w+) : (\w+)\s*$")
 ENUM_VALUE = re.compile(r"^\t(\w+)\s*=\s*(-?\d+),?\s*$")
 STRUCT_COMMENT = re.compile(r"^// ScriptStruct (\S+)\.(\w+)\s*$")
 STRUCT_SIZE = re.compile(r"^// 0x([0-9A-Fa-f]+) \(0x([0-9A-Fa-f]+) - 0x([0-9A-Fa-f]+)\)")
-STRUCT_DECL = re.compile(r"^struct (\w+)(?:\s+final)?(?:\s*:\s*public\s+(\w+))?\s*$")
-ALIGN16 = ("Quat", "Vector4", "Plane", "Matrix", "Transform")
+# Dumper-7 writes alignas(N) when the struct's MinAlignment is more than its members give (FQuat, FPlane).
+STRUCT_DECL = re.compile(r"^struct (?:alignas\((0x[0-9A-Fa-f]+)\)\s+)?(\w+)(?:\s+final)?(?:\s*:\s*public\s+(\w+))?\s*$")
 
 
 def parse_structs(path, pkg):
@@ -182,7 +182,8 @@ def parse_structs(path, pkg):
         if m:
             cur_struct, cur_enum = None, None
             if pending and pending[0] == "struct" and pending[1].startswith("/Script/"):
-                cur_struct = STRUCTS[m.group(1)] = Struct(m.group(1), m.group(2) or "", pending[1], pending[2], size)
+                cur_struct = STRUCTS[m.group(2)] = Struct(m.group(2), m.group(3) or "", pending[1], pending[2], size)
+                cur_struct.explicit_align = int(m.group(1), 16) if m.group(1) else 1
             pending = None
             continue
         if line.startswith("};"):
@@ -223,13 +224,41 @@ def resolve_structs():
         resolve(st)
 
 
+ALIGN_BY_NAME = {"bool": 1, "uint8": 1, "int8": 1, "char": 1, "int16": 2, "uint16": 2, "wchar_t": 2,
+                 "int32": 4, "uint32": 4, "float": 4, "FName": 4, "TWeakObjectPtr": 4, "TLazyObjectPtr": 4,
+                 "int64": 8, "uint64": 8, "double": 8, "FString": 8, "FText": 8, "TArray": 8, "TSet": 8, "TMap": 8,
+                 "TSoftObjectPtr": 8, "TSoftClassPtr": 8, "TSubclassOf": 8, "TScriptInterface": 8, "TDelegate": 8,
+                 "TMulticastInlineDelegate": 8, "TMulticastSparseDelegate": 8, "TFieldPath": 8, "FScriptDelegate": 8}
+_ALIGN = {}
+
+
 def struct_align(st):
-    if st.ue_name in ALIGN16:
-        return 16
-    if st.size % 8 == 0 and any(t in ("int64", "uint64", "double", "FString", "FText") or t.endswith("*")
-                                for t, _ in st.fields):
-        return 8
-    return 4 if st.size % 4 == 0 else 1
+    """The struct's alignment as C++ lays out the dump: its largest member's (recursively), raised to an
+    explicit alignas. A member type this cannot read counts as 8, the most a dumped type needs short of alignas."""
+    if st.cpp in _ALIGN:
+        return _ALIGN[st.cpp]
+    _ALIGN[st.cpp] = 8                       # a cycle through a pointer cannot recurse; pointers are 8 anyway
+    align = getattr(st, "explicit_align", 1)
+    if st.base in STRUCTS:
+        align = max(align, struct_align(STRUCTS[st.base]))
+    for raw, _ in st.raw_fields:
+        t = re.sub(r"^(const|struct|class|enum)\s+", "", raw.strip())
+        if t.endswith("*") or t.endswith("&"):
+            a = 8
+        else:
+            head = re.match(r"\w+", t)
+            head = head.group(0) if head else t
+            if head in ALIGN_BY_NAME:
+                a = ALIGN_BY_NAME[head]
+            elif head in STRUCTS:
+                a = struct_align(STRUCTS[head])
+            elif head in ENUMS:
+                a = ALIGN_BY_NAME.get(ENUMS[head].underlying, 8)
+            else:
+                a = 8
+        align = max(align, a)
+    _ALIGN[st.cpp] = align
+    return align
 
 
 def struct_deps(st):
