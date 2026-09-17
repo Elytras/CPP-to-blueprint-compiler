@@ -4205,12 +4205,21 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                                                  [](FScript& S, FIndex) { S.Return(); S.EndOfScript(); }, Flags);
     }
 
+    /* A cooked property carries no offset: FProperty::SetupOffset lays ChildProperties out in order, so emitting them
+       by alignment, largest first, is the packing. Only the order moves; the bytecode names a property by path. */
+    std::vector<std::pair<int32, FPropertyDef>> ClassVars;
+    auto AddVariable = [&](const std::string& Type, const FPropertyDef& PD) {
+        int32 Size = 8, Align = 8;
+        std::string Ignored;
+        if (!LayoutOf(Type, &Size, &Align, &Ignored)) Align = 8;
+        ClassVars.emplace_back(Align, PD);
+    };
     for (const Json* F : R.Fields)
     {
         const std::string FieldName = Name(*F);
         if (auto Sig = CurSignatures.find(FieldName); Sig != CurSignatures.end())
         {
-            BP.AddVariable(DispatcherParam(FieldName, Sig->second));
+            AddVariable("", DispatcherParam(FieldName, Sig->second));
             continue;
         }
         FPropertyDef PD;
@@ -4248,8 +4257,10 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             PD.RepCondition = C.empty() ? 0 : uint8(At - std::begin(Conditions));
             bReplicatesAnything = true;
         }
-        BP.AddVariable(PD);
+        AddVariable(TypeOf(*F), PD);
     }
+    std::stable_sort(ClassVars.begin(), ClassVars.end(), [](const auto& A, const auto& B) { return A.first > B.first; });
+    for (const auto& V : ClassVars) BP.AddVariable(V.second);
 
     /* The OOL definition carries body/parms; only the in-class decl carries storageClass. */
     struct FMethod { std::string Name; const Json* Decl; const Json* Def; const Json* Body; };
