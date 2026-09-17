@@ -1038,46 +1038,62 @@ void EmitStmts(const std::vector<FStmtIR>& Stmts, FScript& S, FIndex SelfExp, FL
 
         case FStmtIR::Switch:
         {
-            /* Two dispatch shapes, then the body in order, so a case with no `break` falls through.
-               Dense (3+ cases, int32 / uint8, the range at most twice the case count): a bounds check, then
-               EX_ComputedJump to Table + (Value - Min) * 5, a table of 5-byte EX_Jumps, the way the ubergraph
-               entry dispatches. Otherwise a compare chain: one JumpIfNot(Value != Case) per case, straight to
-               its label. Either way a miss goes to `default`, or past the body. */
+            /* The case values split into runs, then the body in order, so a case with no `break` falls through.
+               A run of 3+ cases whose range is at most 4x its case count (int32 / uint8 only) is a jump table: a
+               bounds check that skips to the next run, then EX_ComputedJump to Table + (Value - Min) * 5, a table
+               of 5-byte EX_Jumps, the way the ubergraph entry dispatches. A 5-byte slot against a ~30-byte compare
+               keeps a hole-y table smaller than the chain. The other cases are one JumpIfNot(Value != Case) each,
+               straight to their label. A miss goes to `default`, or past the body.
+               ponytail: runs are tried in order, a binary search over their bounds if switches grow many runs. */
             const size_t NumCases = St.CaseTests.size();
-            int64 Min = 0, Max = -1;
-            if (!St.CaseValues.empty())
+            struct FRun { int64 Min, Max; std::vector<size_t> Cases; };
+            std::vector<FRun> Runs;
+            std::vector<size_t> Singles;
+            if (St.SwitchWidth == 1 || St.SwitchWidth == 4)
             {
-                Min = *std::min_element(St.CaseValues.begin(), St.CaseValues.end());
-                Max = *std::max_element(St.CaseValues.begin(), St.CaseValues.end());
+                std::vector<size_t> Order(NumCases);
+                for (size_t I = 0; I < NumCases; ++I) Order[I] = I;
+                std::sort(Order.begin(), Order.end(), [&](size_t L, size_t R) { return St.CaseValues[L] < St.CaseValues[R]; });
+                for (size_t I : Order)
+                {
+                    const int64 V = St.CaseValues[I];
+                    if (!Runs.empty() && V - Runs.back().Min + 1 <= int64(Runs.back().Cases.size() + 1) * 4 && V - Runs.back().Min < 1024)
+                    { Runs.back().Max = V; Runs.back().Cases.push_back(I); }
+                    else Runs.push_back({ V, V, { I } });
+                }
+                for (auto It = Runs.begin(); It != Runs.end();)
+                    if (It->Cases.size() < 3) { Singles.insert(Singles.end(), It->Cases.begin(), It->Cases.end()); It = Runs.erase(It); }
+                    else ++It;
+                std::sort(Singles.begin(), Singles.end());      // source order, as the chain always was
             }
-            const int64 Span = Max - Min + 1;
-            const bool bTable = (St.SwitchWidth == 1 || St.SwitchWidth == 4) && NumCases >= 3 && Span <= int64(NumCases) * 2 && Span <= 1024;
+            else
+                for (size_t I = 0; I < NumCases; ++I) Singles.push_back(I);
 
             FLoopPatches Inner;
             std::vector<int32> LabelAt(NumCases + 1, -1);
-            std::vector<int32> ToLabel;                 // chain: one patch per case
-            std::vector<int32> TableEntries;            // table: one patch per value in [Min, Max]
+            std::vector<std::pair<int32, size_t>> ToLabel;              // a patch, and the case it jumps to
+            std::vector<std::pair<int32, int64>> TableEntries;          // a table slot, and its value
             int32 Miss = 0;
-            if (bTable)
+            FArgIR Value = St.SwitchValue;
+            if (!Runs.empty() && St.SwitchWidth == 1)
             {
-                FArgIR Value = St.SwitchValue;
-                if (St.SwitchWidth == 1)
-                {
-                    FArgIR Byte = Value;
-                    Value = FArgIR();
-                    Value.K = FArgIR::Call;
-                    Value.Sub = std::make_shared<FCallIR>();
-                    Value.Sub->Fn = St.Call.Fn;         // Conv_ByteToInt, resolved when lowering
-                    Value.Sub->Args = { Byte };
-                }
-                auto Int = [](int64 V) { FArgIR A; A.K = FArgIR::Int; A.I = int32(V); return A; };
-                auto Bool = [](bool V) { FArgIR A; A.K = FArgIR::Bool; A.B = V; return A; };
+                FArgIR Byte = Value;
+                Value = FArgIR();
+                Value.K = FArgIR::Call;
+                Value.Sub = std::make_shared<FCallIR>();
+                Value.Sub->Fn = St.Call.Fn;             // Conv_ByteToInt, resolved when lowering
+                Value.Sub->Args = { Byte };
+            }
+            auto Int = [](int64 V) { FArgIR A; A.K = FArgIR::Int; A.I = int32(V); return A; };
+            auto Bool = [](bool V) { FArgIR A; A.K = FArgIR::Bool; A.B = V; return A; };
+            for (const FRun& Run : Runs)
+            {
                 FArgIR InRange;
                 InRange.K = FArgIR::Call;
                 InRange.Sub = std::make_shared<FCallIR>();
                 InRange.Sub->Fn = St.Call.Extra;        // InRange_IntInt
-                InRange.Sub->Args = { Value, Int(Min), Int(Max), Bool(true), Bool(true) };
-                Miss = S.JumpIfNot(0, [&InRange, SelfExp](FScript& C) { EmitArg(C, InRange, SelfExp, nullptr); });
+                InRange.Sub->Args = { Value, Int(Run.Min), Int(Run.Max), Bool(true), Bool(true) };
+                const int32 NextRun = S.JumpIfNot(0, [&InRange, SelfExp](FScript& C) { EmitArg(C, InRange, SelfExp, nullptr); });
 
                 /* Offset = Value * 5 + (Table - Min * 5); the constant is patched once the table's offset is known. */
                 int32 BaseAt = 0;
@@ -1092,15 +1108,16 @@ void EmitStmts(const std::vector<FStmtIR>& Stmts, FScript& S, FIndex SelfExp, FL
                     C.RawInt32(0);
                     C.EndFunctionParms();
                 });
-                S.PatchJumpTarget(BaseAt, int32(S.MemorySize() - Min * 5));
-                for (int64 V = Min; V <= Max; ++V) TableEntries.push_back(S.Jump(0));
+                S.PatchJumpTarget(BaseAt, int32(S.MemorySize() - Run.Min * 5));
+                for (int64 V = Run.Min; V <= Run.Max; ++V) TableEntries.push_back({ S.Jump(0), V });
+                S.PatchJumpTarget(NextRun, S.MemorySize());
             }
-            else
+            for (size_t I : Singles)
             {
-                for (const FArgIR& Test : St.CaseTests)
-                    ToLabel.push_back(S.JumpIfNot(0, [&Test, SelfExp](FScript& C) { EmitArg(C, Test, SelfExp, nullptr); }));
-                Miss = S.Jump(0);
+                const FArgIR& Test = St.CaseTests[I];
+                ToLabel.push_back({ S.JumpIfNot(0, [&Test, SelfExp](FScript& C) { EmitArg(C, Test, SelfExp, nullptr); }), I });
             }
+            Miss = S.Jump(0);
             for (const FStmtIR& B : *St.Body)
             {
                 if (B.K == FStmtIR::Label) { LabelAt[B.LabelId] = S.MemorySize(); continue; }
@@ -1109,12 +1126,11 @@ void EmitStmts(const std::vector<FStmtIR>& Stmts, FScript& S, FIndex SelfExp, FL
             const int32 End = S.MemorySize();
             const int32 MissTarget = St.LabelId >= 0 ? LabelAt[St.LabelId] : End;
             S.PatchJumpTarget(Miss, MissTarget);
-            for (size_t I = 0; I < ToLabel.size(); ++I) S.PatchJumpTarget(ToLabel[I], LabelAt[I]);
-            for (size_t I = 0; I < TableEntries.size(); ++I)
+            for (const auto& [Patch, Case] : ToLabel) S.PatchJumpTarget(Patch, LabelAt[Case]);
+            for (const auto& [Patch, V] : TableEntries)
             {
-                const int64 V = Min + int64(I);
                 const auto Hit = std::find(St.CaseValues.begin(), St.CaseValues.end(), V);
-                S.PatchJumpTarget(TableEntries[I], Hit == St.CaseValues.end() ? MissTarget : LabelAt[Hit - St.CaseValues.begin()]);
+                S.PatchJumpTarget(Patch, Hit == St.CaseValues.end() ? MissTarget : LabelAt[Hit - St.CaseValues.begin()]);
             }
             for (int32 P : Inner.Breaks) S.PatchJumpTarget(P, End);
             if (Loop) for (int32 P : Inner.Continues) Loop->Continues.push_back(P);

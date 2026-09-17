@@ -105,6 +105,21 @@ check('FlowTest', 'SwitchInLoop', switch_in_loop, [dict(Count=c) for c in (0, 1,
 check('FlowTest', 'ByteSwitch', lambda Mode: {2: 20, 255: 1}.get(Mode, 0), [dict(Mode=m) for m in (0, 2, 254, 255)])
 check('FlowTest', 'DenseHoles', lambda Code: {10: 1, 11: 2, 13: 4, 14: 5}.get(Code, -9), [dict(Code=c) for c in range(8, 17)])
 check('FlowTest', 'Negative', lambda Code: {-2: -20, -1: -10, 0: 0}.get(Code, 50), [dict(Code=c) for c in range(-4, 3)])
+CLUSTERS = {0: 1, 1: 2, 2: 3, 5: 6, 9: 10, 50: 500, 100: 1000, 103: 1003, 104: 1004, 110: 1010, 7000: 7}
+check('FlowTest', 'Clusters', lambda Code: CLUSTERS.get(Code, -1), [dict(Code=c) for c in list(CLUSTERS) + [-1, 3, 10, 11, 49, 99, 101, 111, 6999, 7001]])
+
+
+def clusters_shape():
+    import re, subprocess
+    base = asset('FlowTest')
+    names = [e['name'] for e in dumpexp.load(base)[5]]
+    w = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'walkscript.py'), base,
+                        str(names.index('Clusters'))], capture_output=True, text=True).stdout
+    assert w.count('ComputedJump') == 2 and w.count('InRange_IntInt') == 2 and w.count('NotEqual_IntInt') == 2, w
+    print('ok  FlowTest.Clusters: two tables behind range checks, the outliers compared')
+
+
+clusters_shape()
 check('FlowTest', 'DenseByte', lambda Mode: {0: 3, 1: 4, 2: 5}.get(Mode, 0), [dict(Mode=m) for m in (0, 1, 2, 3, 255)])
 
 
