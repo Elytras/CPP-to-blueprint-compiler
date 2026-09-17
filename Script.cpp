@@ -409,6 +409,18 @@ int32 FScript::JumpIfNot(int32 MemTarget, const std::function<void(FScript&)>& C
     return PatchAt;
 }
 
+void FScript::ComputedJump(const std::function<void(FScript&)>& OffsetExpr)
+{
+    Op(EX_ComputedJump);
+    OffsetExpr(*this);
+}
+
+void FScript::RawInt32(int32 Value)
+{
+    Ar.U32(uint32(Value));
+    Memory += 4;
+}
+
 void FScript::PatchJumpTarget(int32 StorageOffset, int32 MemTarget)
 {
     const uint32 V = uint32(MemTarget);

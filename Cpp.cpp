@@ -348,6 +348,8 @@ struct FStmtIR
         While,
         Break,
         Continue,
+        Switch,
+        Label,
     } K = StaticCall;
 
     FCallIR Target;
@@ -360,6 +362,11 @@ struct FStmtIR
     std::shared_ptr<std::vector<FStmtIR>> Else;
     std::shared_ptr<std::vector<FStmtIR>> Body;
     std::shared_ptr<std::vector<FStmtIR>> Inc;      // While: a `for` increment, where `continue` lands
+    std::vector<FArgIR> CaseTests;                  // Switch: per case, true when the value does NOT match
+    int32 LabelId = -1;                             // Label: the case it marks; Switch: the default's label, or -1
+    std::vector<int64> CaseValues;                  // Switch: each case's constant, in CaseTests order
+    int32 SwitchWidth = 4;                          // Switch: the value's size, 1 / 4 / 8
+    FArgIR SwitchValue;                             // Switch: the temp the value was stored in
     bool bAssignLocal = false;
     bool bAssignOutParm = false;
 };
@@ -724,6 +731,8 @@ private:
                        std::vector<FStmtIR>& OutPre, std::string* Err);
     bool HoistRefAt(FArgIR& A, FBlueprintClass& BP, std::vector<FPropertyDef>& Locals,
                     std::vector<FStmtIR>& OutPre, std::string* Err);
+    bool HoistBranch(FArgIR& A, FBlueprintClass& BP, std::vector<FPropertyDef>& Locals,
+                     std::vector<FStmtIR>& OutPre, std::string* Err);
 
     /* The native UFunction Method overrides, or null; InheritedFlags gets the flags it passes on, also
        for a method implementing an interface's function, which has no Super. */
@@ -775,6 +784,7 @@ private:
     bool ReadScratchAdded = false;
     int32 ReadTmpCounter = 0;
     int32 LoopDepth = 0;                              // LowerBody: the loops around the statement being lowered
+    int32 SwitchDepth = 0;                            // LowerBody: the switches around it
 };
 
 /* The innermost loop's forward jumps, patched once its exit / continue offsets are known. */
@@ -871,6 +881,94 @@ void EmitStmts(const std::vector<FStmtIR>& Stmts, FScript& S, FIndex SelfExp, FL
         case FStmtIR::Break:
         case FStmtIR::Continue:
             if (Loop) (St.K == FStmtIR::Break ? Loop->Breaks : Loop->Continues).push_back(S.Jump(0));
+            break;
+
+        case FStmtIR::Switch:
+        {
+            /* Two dispatch shapes, then the body in order, so a case with no `break` falls through.
+               Dense (3+ cases, int32 / uint8, the range at most twice the case count): a bounds check, then
+               EX_ComputedJump to Table + (Value - Min) * 5, a table of 5-byte EX_Jumps, the way the ubergraph
+               entry dispatches. Otherwise a compare chain: one JumpIfNot(Value != Case) per case, straight to
+               its label. Either way a miss goes to `default`, or past the body. */
+            const size_t NumCases = St.CaseTests.size();
+            int64 Min = 0, Max = -1;
+            if (!St.CaseValues.empty())
+            {
+                Min = *std::min_element(St.CaseValues.begin(), St.CaseValues.end());
+                Max = *std::max_element(St.CaseValues.begin(), St.CaseValues.end());
+            }
+            const int64 Span = Max - Min + 1;
+            const bool bTable = St.SwitchWidth != 8 && NumCases >= 3 && Span <= int64(NumCases) * 2 && Span <= 1024;
+
+            FLoopPatches Inner;
+            std::vector<int32> LabelAt(NumCases + 1, -1);
+            std::vector<int32> ToLabel;                 // chain: one patch per case
+            std::vector<int32> TableEntries;            // table: one patch per value in [Min, Max]
+            int32 Miss = 0;
+            if (bTable)
+            {
+                FArgIR Value = St.SwitchValue;
+                if (St.SwitchWidth == 1)
+                {
+                    FArgIR Byte = Value;
+                    Value = FArgIR();
+                    Value.K = FArgIR::Call;
+                    Value.Sub = std::make_shared<FCallIR>();
+                    Value.Sub->Fn = St.Call.Fn;         // Conv_ByteToInt, resolved when lowering
+                    Value.Sub->Args = { Byte };
+                }
+                auto Int = [](int64 V) { FArgIR A; A.K = FArgIR::Int; A.I = int32(V); return A; };
+                auto Bool = [](bool V) { FArgIR A; A.K = FArgIR::Bool; A.B = V; return A; };
+                FArgIR InRange;
+                InRange.K = FArgIR::Call;
+                InRange.Sub = std::make_shared<FCallIR>();
+                InRange.Sub->Fn = St.Call.Extra;        // InRange_IntInt
+                InRange.Sub->Args = { Value, Int(Min), Int(Max), Bool(true), Bool(true) };
+                Miss = S.JumpIfNot(0, [&InRange, SelfExp](FScript& C) { EmitArg(C, InRange, SelfExp, nullptr); });
+
+                /* Offset = Value * 5 + (Table - Min * 5); the constant is patched once the table's offset is known. */
+                int32 BaseAt = 0;
+                S.ComputedJump([&](FScript& C) {
+                    C.CallMath(St.Call.Extra2);         // Add_IntInt
+                    C.CallMath(St.Target.Fn);           // Multiply_IntInt
+                    EmitArg(C, Value, SelfExp, nullptr);
+                    C.IntConst(5);
+                    C.EndFunctionParms();
+                    C.Op(EX_IntConst);
+                    BaseAt = C.StorageSize();
+                    C.RawInt32(0);
+                    C.EndFunctionParms();
+                });
+                S.PatchJumpTarget(BaseAt, int32(S.MemorySize() - Min * 5));
+                for (int64 V = Min; V <= Max; ++V) TableEntries.push_back(S.Jump(0));
+            }
+            else
+            {
+                for (const FArgIR& Test : St.CaseTests)
+                    ToLabel.push_back(S.JumpIfNot(0, [&Test, SelfExp](FScript& C) { EmitArg(C, Test, SelfExp, nullptr); }));
+                Miss = S.Jump(0);
+            }
+            for (const FStmtIR& B : *St.Body)
+            {
+                if (B.K == FStmtIR::Label) { LabelAt[B.LabelId] = S.MemorySize(); continue; }
+                EmitStmts({ B }, S, SelfExp, &Inner);
+            }
+            const int32 End = S.MemorySize();
+            const int32 MissTarget = St.LabelId >= 0 ? LabelAt[St.LabelId] : End;
+            S.PatchJumpTarget(Miss, MissTarget);
+            for (size_t I = 0; I < ToLabel.size(); ++I) S.PatchJumpTarget(ToLabel[I], LabelAt[I]);
+            for (size_t I = 0; I < TableEntries.size(); ++I)
+            {
+                const int64 V = Min + int64(I);
+                const auto Hit = std::find(St.CaseValues.begin(), St.CaseValues.end(), V);
+                S.PatchJumpTarget(TableEntries[I], Hit == St.CaseValues.end() ? MissTarget : LabelAt[Hit - St.CaseValues.begin()]);
+            }
+            for (int32 P : Inner.Breaks) S.PatchJumpTarget(P, End);
+            if (Loop) for (int32 P : Inner.Continues) Loop->Continues.push_back(P);
+            break;
+        }
+
+        case FStmtIR::Label:
             break;
         }
     }
@@ -1115,6 +1213,8 @@ std::string MathFuncFor(const std::string& Op, const std::string& Flavour)
     if (Op == "+") return "Add_" + Flavour;
     if (Op == "-") return "Subtract_" + Flavour;
     if (Op == "*") return "Multiply_" + Flavour;
+    if (Op == "/") return "Divide_" + Flavour;
+    if (Op == "%") return Flavour == "Int64Int64" ? "" : "Percent_" + Flavour;     // no Percent_Int64Int64 in 4.27
     if (Op == "&") return "And_" + Flavour;
     if (Op == "|") return "Or_" + Flavour;
     if (Op == "^") return "Xor_" + Flavour;
@@ -1165,6 +1265,16 @@ EStrKind KindOfLowered(const FArgIR& A, const std::string& InnerType)
     case FArgIR::NullObj: return SK_Object;
     default: return StrKindOf(InnerType);
     }
+}
+
+/* A switch value's storage: 1 for uint8 / char / an enum Blueprint stores as a byte, 8 for int64, else 4. */
+int32 SwitchWidth(const std::string& ClangType)
+{
+    const std::string T = StripTypeKeywords(ClangType);
+    if (T == "uint8" || T == "unsigned char" || T == "char" || T == "int8" || T == "signed char" || T == "bool") return 1;
+    if (T.compare(0, 5, "enum ") == 0 || (T.size() > 1 && T[0] == 'E' && std::isupper((unsigned char)T[1]))) return 1;
+    if (T == "int64" || T == "long long" || T == "uint64" || T == "unsigned long long") return 8;
+    return 4;
 }
 
 void WrapInCall(FArgIR& Arg, FIndex Fn)
@@ -1544,6 +1654,11 @@ bool IsReinterpret(const std::string& Intrinsic)
 
 /* Whether an operand leaves MostRecentProperty and its storage behind, as a StructMember reinterpretation
    needs (ScriptCore.cpp execStructMemberContext); a call or a literal leaves neither. */
+bool IsBranch(const std::string& Intrinsic)
+{
+    return Intrinsic == "__AndAlso__" || Intrinsic == "__OrElse__" || Intrinsic == "__Select__";
+}
+
 bool IsStored(const FArgIR& A)
 {
     return A.K == FArgIR::Local || A.K == FArgIR::LocalOut || A.K == FArgIR::Field || A.K == FArgIR::Member
@@ -2131,9 +2246,37 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
     if (K == "UnaryOperator")
     {
         const std::string Op = N->value("opcode", std::string());
-        if (Op != "!") { *Err = "TODO: unimplemented unary operator " + Op; return false; }
         const Json* Operand = Nth(*N, 0);
-        if (!Operand) { *Err = "unary `!` with a missing operand"; return false; }
+        if (!Operand) { *Err = "unary `" + Op + "` with a missing operand"; return false; }
+        if (Op == "+") return LowerArg(*Operand, BP, Out, Err);
+        if (Op == "++" || Op == "--")
+        { *Err = "`" + Op + "` works as a statement (or a `for` increment), not inside an expression"; return false; }
+        if (Op == "-" || Op == "~")
+        {
+            /* A literal folds; otherwise 0 - X, or Kismet's bitwise Not_Int / Not_Int64. */
+            FArgIR A;
+            if (!LowerArg(*Operand, BP, A, Err)) return false;
+            const bool bFloat = Canon(TypeOf(*N)) == "float", bInt64 = IsInt64Type(TypeOf(*N));
+            if (Op == "-" && A.K == FArgIR::Int)   { Out = A; Out.I = int32(-int64(A.I)); return true; }
+            if (Op == "-" && A.K == FArgIR::Int64) { Out = A; Out.I64 = -A.I64; return true; }
+            if (Op == "-" && A.K == FArgIR::Float) { Out = A; Out.F = -A.F; return true; }
+            if (Op == "~" && bFloat) { *Err = "`~` on a float"; return false; }
+            Out.K = FArgIR::Call;
+            Out.Sub = std::make_shared<FCallIR>();
+            if (Op == "~")
+            {
+                Out.Sub->Fn = BP.EngineFunction("/Script/Engine", "KismetMathLibrary", bInt64 ? "Not_Int64" : "Not_Int");
+                Out.Sub->Args = { A };
+                return true;
+            }
+            FArgIR Zero;
+            Zero.K = bFloat ? FArgIR::Float : bInt64 ? FArgIR::Int64 : FArgIR::Int;
+            Out.Sub->Fn = BP.EngineFunction("/Script/Engine", "KismetMathLibrary",
+                                            bFloat ? "Subtract_FloatFloat" : bInt64 ? "Subtract_Int64Int64" : "Subtract_IntInt");
+            Out.Sub->Args = { Zero, A };
+            return true;
+        }
+        if (Op != "!") { *Err = "TODO: unimplemented unary operator " + Op; return false; }
 
         Out.K = FArgIR::Call;
         Out.Sub = std::make_shared<FCallIR>();
@@ -2184,6 +2327,22 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             Out = Math(Op == "+" ? "Add_Int64Int64" : "Subtract_Int64Int64", std::move(Ptr), std::move(Other));
             return true;
         }
+        if (Op == "&&" || Op == "||")
+        {
+            /* Short-circuit: the hoist pass turns this into `T = L; if (T) T = R;` (or `if (!T)`), so R's calls
+               and reads only run when C++ would run them. */
+            Out.K = FArgIR::Call;
+            Out.InnerType = "bool";
+            Out.Sub = std::make_shared<FCallIR>();
+            Out.Sub->Intrinsic = Op == "&&" ? "__AndAlso__" : "__OrElse__";
+            for (const Json* Side : { LhsRaw, RhsRaw })
+            {
+                FArgIR A;
+                if (!LowerArg(*Side, BP, A, Err) || !ConvertArg("bool", BP, A, Err)) return false;
+                Out.Sub->Args.push_back(std::move(A));
+            }
+            return true;
+        }
         /* Flavour is read from the UNSTRIPPED sides: clang's promotion cast carries the common type. */
         const std::string LhsTy = TypeOf(*LhsRaw), RhsTy = TypeOf(*RhsRaw);
         std::string Flavour;
@@ -2208,6 +2367,24 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         if (!LowerArg(*RhsRaw, BP, RA, Err)) return false;
         Out.Sub->Args.push_back(LA);
         Out.Sub->Args.push_back(RA);
+        return true;
+    }
+
+    if (K == "ConditionalOperator")
+    {
+        /* `C ? A : B`: the hoist pass turns this into `if (C) T = A; else T = B;`. */
+        Out.K = FArgIR::Call;
+        Out.InnerType = TypeOf(*N);
+        Out.Sub = std::make_shared<FCallIR>();
+        Out.Sub->Intrinsic = "__Select__";
+        for (size_t I = 0; I < 3; ++I)
+        {
+            const Json* Part = Nth(*N, I);
+            FArgIR A;
+            if (!Part || !LowerArg(*Part, BP, A, Err)) return false;
+            if (I == 0 && !ConvertArg("bool", BP, A, Err)) return false;
+            Out.Sub->Args.push_back(std::move(A));
+        }
         return true;
     }
 
@@ -2412,6 +2589,39 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
         {
             bOk = LowerCall(*S, BP, St.Call, Err);
         }
+        else if (K == "CompoundAssignOperator"
+              || (K == "UnaryOperator" && (S->value("opcode", std::string()) == "++" || S->value("opcode", std::string()) == "--")))
+        {
+            /* `X op= Y` / `++X` / `X--` as statements are `X = X op Y` / `X = X +- 1`. X is evaluated twice, which only
+               matters for a destination with side effects (`Items[Next()] += 1`). */
+            const std::string Op = S->value("opcode", std::string());
+            const bool bStep = K == "UnaryOperator";
+            const Json* Lhs = Nth(*S, 0);
+            if (!Lhs) { *Err = "`" + Op + "` with no destination"; bOk = false; return; }
+            const Json LhsType = Lhs->value("type", Json::object());
+            const bool bPointer = !PointeeOf(*Lhs).empty();
+            std::string OpType = bStep ? TypeOf(*Lhs) : S->value("computeLHSType", Json::object()).value("qualType", TypeOf(*Lhs));
+            if (bStep && !bPointer)
+            {
+                const std::string C = Canon(OpType);
+                OpType = C == "float" ? "float" : IsInt64Type(OpType) ? "int64" : "int";
+            }
+            Json Read = { {"kind", "ImplicitCastExpr"}, {"castKind", "LValueToRValue"}, {"type", LhsType}, {"inner", Json::array({*Lhs})} };
+            if (!bPointer && StripTypeKeywords(OpType) != StripTypeKeywords(TypeOf(*Lhs)))
+                Read = { {"kind", "ImplicitCastExpr"}, {"castKind", "IntegralCast"}, {"type", {{"qualType", OpType}}}, {"inner", Json::array({Read})} };
+            Json Rhs = bStep ? Json{ {"kind", "IntegerLiteral"}, {"type", {{"qualType", "int"}}}, {"value", "1"} } : *Nth(*S, 1);
+            if (bStep && !bPointer && OpType != "int")
+                Rhs = { {"kind", "ImplicitCastExpr"}, {"castKind", "IntegralCast"}, {"type", {{"qualType", OpType}}}, {"inner", Json::array({Rhs})} };
+            const std::string BinOp = bStep ? std::string(Op == "++" ? "+" : "-") : Op.substr(0, Op.size() - 1);
+            Json Value = { {"kind", "BinaryOperator"}, {"opcode", BinOp}, {"type", bPointer ? LhsType : Json{{"qualType", OpType}}},
+                           {"inner", Json::array({Read, Rhs})} };
+            if (!bPointer && StripTypeKeywords(OpType) != StripTypeKeywords(TypeOf(*Lhs)))
+                Value = { {"kind", "ImplicitCastExpr"}, {"castKind", "IntegralCast"}, {"type", LhsType}, {"inner", Json::array({Value})} };
+            Json Assign = { {"kind", "BinaryOperator"}, {"opcode", "="}, {"type", LhsType}, {"inner", Json::array({*Lhs, Value})} };
+            Json Wrap = { {"kind", "CompoundStmt"}, {"inner", Json::array({Assign})} };
+            bOk = LowerBody(Wrap, BP, Out, Locals, Err);
+            return;
+        }
         else if ((K == "BinaryOperator" && S->value("opcode", std::string()) == "=")
               || K == "CXXOperatorCallExpr")
         {
@@ -2531,8 +2741,100 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
         }
         else if (K == "BreakStmt" || K == "ContinueStmt")
         {
-            if (LoopDepth == 0) { *Err = "`break` / `continue` outside a loop (no `switch` yet)"; bOk = false; return; }
+            if (LoopDepth == 0 && (K == "ContinueStmt" || SwitchDepth == 0))
+            { *Err = K == "BreakStmt" ? "`break` outside a loop or switch" : "`continue` outside a loop"; bOk = false; return; }
             St.K = K == "BreakStmt" ? FStmtIR::Break : FStmtIR::Continue;
+        }
+        else if (K == "SwitchStmt")
+        {
+            /* SwitchStmt inner is [cond, body]. The value lands in a temp once. Each CaseStmt [ConstantExpr, sub]
+               or DefaultStmt [sub] becomes a Label followed by its first statement, so every label sits at the top
+               level of the body, where the emitter looks for them. The default gets the label after the cases. */
+            if (S->value("hasInit", false) || S->value("hasVar", false))
+            { *Err = "TODO: `switch` with an init-statement / condition-variable is not supported"; bOk = false; return; }
+            const Json* Cond = Nth(*S, 0);
+            const Json* Body = Nth(*S, 1);
+            if (!Cond || !Body || Kind(*Body) != "CompoundStmt") { *Err = "`switch` needs a braced body"; bOk = false; return; }
+
+            const int32 Width = SwitchWidth(TypeOf(*Strip(Cond)));
+            const std::string TempTy = Width == 1 ? "uint8" : Width == 8 ? "int64" : "int32";
+            const char* NotEqual = Width == 1 ? "NotEqual_ByteByte" : Width == 8 ? "NotEqual_Int64Int64" : "NotEqual_IntInt";
+
+            const std::string Temp = "__Switch" + std::to_string(ReadTmpCounter++) + "__";
+            FPropertyDef PD;
+            if (!TypeToProperty(TempTy, Temp, 0, "switch value", BP, &PD, Err)) { bOk = false; return; }
+            PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+            Locals.push_back(PD);
+            FStmtIR Store;
+            Store.K = FStmtIR::Assign;
+            Store.Var.K = FArgIR::Local;
+            Store.Var.S = Temp;
+            Store.Var.LetOp = LetOpFor(TempTy);
+            Store.bAssignLocal = true;
+            if (!LowerArg(*Cond, BP, Store.Value, Err)) { bOk = false; return; }
+            Out.push_back(Store);
+
+            St.K = FStmtIR::Switch;
+            St.Body = std::make_shared<std::vector<FStmtIR>>();
+            ++SwitchDepth;
+            std::function<bool(const Json&)> Flatten = [&](const Json& Node) -> bool
+            {
+                const Json* N = Strip(&Node);
+                const std::string NK = N ? Kind(*N) : std::string();
+                if (NK != "CaseStmt" && NK != "DefaultStmt")
+                {
+                    Json Wrap = { {"kind", "CompoundStmt"}, {"inner", Json::array({Node})} };
+                    return LowerBody(Wrap, BP, *St.Body, Locals, Err);
+                }
+                FStmtIR L;
+                L.K = FStmtIR::Label;
+                const Json* Sub = nullptr;
+                if (NK == "DefaultStmt")
+                {
+                    L.LabelId = -2;                         // numbered once every case is known
+                    Sub = Nth(*N, 0);
+                }
+                else
+                {
+                    const Json* Value = Nth(*N, 0);
+                    Sub = Nth(*N, 1);
+                    if (!Value || !Value->contains("value") || N->value("hasRange", false))
+                    { *Err = "a `case` needs one constant value"; return false; }
+                    FArgIR Const;
+                    const int64 V = std::stoll((*Value)["value"].get<std::string>());
+                    if (Width == 1) { Const.K = FArgIR::Byte; Const.I = int32(V); }
+                    else if (Width == 8) { Const.K = FArgIR::Int64; Const.I64 = V; }
+                    else { Const.K = FArgIR::Int; Const.I = int32(V); }
+                    FArgIR Value0;
+                    Value0.K = FArgIR::Local;
+                    Value0.S = Temp;
+                    FArgIR Test;
+                    Test.K = FArgIR::Call;
+                    Test.InnerType = "bool";
+                    Test.Sub = std::make_shared<FCallIR>();
+                    Test.Sub->Fn = BP.EngineFunction("/Script/Engine", "KismetMathLibrary", NotEqual);
+                    Test.Sub->Args = { Value0, Const };
+                    L.LabelId = int32(St.CaseTests.size());
+                    St.CaseTests.push_back(std::move(Test));
+                    St.CaseValues.push_back(V);
+                }
+                St.Body->push_back(L);
+                return !Sub || Flatten(*Sub);
+            };
+            ForEach(*Body, [&](const Json& C) { if (bOk && !Flatten(C)) bOk = false; });
+            --SwitchDepth;
+            if (!bOk) return;
+            for (FStmtIR& B : *St.Body)
+                if (B.K == FStmtIR::Label && B.LabelId == -2) B.LabelId = St.LabelId = int32(St.CaseTests.size());
+            /* The helpers a dense table needs, imported whether or not the emitter picks the table. ponytail: an
+               unused import is a name-map entry, not a load. */
+            St.SwitchWidth = Width;
+            St.SwitchValue.K = FArgIR::Local;
+            St.SwitchValue.S = Temp;
+            St.Call.Fn = BP.EngineFunction("/Script/Engine", "KismetMathLibrary", "Conv_ByteToInt");
+            St.Call.Extra = BP.EngineFunction("/Script/Engine", "KismetMathLibrary", "InRange_IntInt");
+            St.Call.Extra2 = BP.EngineFunction("/Script/Engine", "KismetMathLibrary", "Add_IntInt");
+            St.Target.Fn = BP.EngineFunction("/Script/Engine", "KismetMathLibrary", "Multiply_IntInt");
         }
         else if (K == "WhileStmt")
         {
@@ -2686,6 +2988,7 @@ bool FCompiler::HoistReadsInArg(FArgIR& A, FBlueprintClass& BP,
     if (A.K == FArgIR::DynCast && A.Sub)
         return HoistReadsInArg(A.Sub->Args[0], BP, Locals, OutPre, Err);
     if (A.K != FArgIR::Call || !A.Sub) return true;
+    if (IsBranch(A.Sub->Intrinsic)) return HoistBranch(A, BP, Locals, OutPre, Err);
     if (A.Sub->Target && !HoistReadsInArg(*A.Sub->Target, BP, Locals, OutPre, Err)) return false;
 
     /* Post-order: inner reads hoist before the outer. That way the outer's Addr can reference
@@ -2699,6 +3002,72 @@ bool FCompiler::HoistReadsInArg(FArgIR& A, FBlueprintClass& BP,
         return HoistRefAt(A, BP, Locals, OutPre, Err);
     if (IsReinterpret(A.Sub->Intrinsic) && A.Sub->Args.size() == 1)
         return HoistOperand(A.Sub->Args[0], BP, Locals, OutPre, Err);
+    return true;
+}
+
+FArgIR NotOf(FArgIR V, FBlueprintClass& BP)
+{
+    WrapInCall(V, BP.EngineFunction("/Script/Engine", "KismetMathLibrary", "Not_PreBool"));
+    V.InnerType = "bool";
+    return V;
+}
+
+/* `L && R`, `L || R`, `C ? A : B` as statements before the one that uses them, into a temp:
+       T = L;  if (T)  { <R's own hoists>; T = R; }        (|| tests !T)
+       if (C) { <A's hoists>; T = A; } else { <B's hoists>; T = B; }
+   The arms' hoisted reads land inside their branch, so they run only when the branch does. */
+bool FCompiler::HoistBranch(FArgIR& A, FBlueprintClass& BP, std::vector<FPropertyDef>& Locals,
+                            std::vector<FStmtIR>& OutPre, std::string* Err)
+{
+    const std::string Which = A.Sub->Intrinsic;
+    std::string Type = Which == "__Select__" ? A.InnerType : "bool";
+    while (!Type.empty() && (Type.back() == '&' || Type.back() == ' ')) Type.pop_back();
+    Type = StripTypeKeywords(Type);
+
+    const std::string Tmp = "__Branch" + std::to_string(ReadTmpCounter++) + "__";
+    FPropertyDef PD;
+    std::string PErr;
+    if (!TypeToProperty(Type, Tmp, 0, Tmp, BP, &PD, &PErr)) { *Err = "a branch's value: " + PErr; return false; }
+    PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+    Locals.push_back(PD);
+
+    FArgIR TmpRef;
+    TmpRef.K = FArgIR::Local;
+    TmpRef.S = Tmp;
+    TmpRef.LetOp = LetOpFor(Type);
+    TmpRef.InnerType = Type;
+    auto Store = [&](FArgIR V) {
+        FStmtIR St;
+        St.K = FStmtIR::Assign;
+        St.Var = TmpRef;
+        St.bAssignLocal = true;
+        St.Value = std::move(V);
+        return St;
+    };
+    auto Arm = [&](FArgIR V, std::shared_ptr<std::vector<FStmtIR>>& Into) {
+        Into = std::make_shared<std::vector<FStmtIR>>();
+        if (!HoistReadsInArg(V, BP, Locals, *Into, Err)) return false;
+        Into->push_back(Store(std::move(V)));
+        return true;
+    };
+
+    FArgIR Cond = std::move(A.Sub->Args[0]);
+    if (!HoistReadsInArg(Cond, BP, Locals, OutPre, Err)) return false;
+    FStmtIR If;
+    If.K = FStmtIR::If;
+    if (Which == "__Select__")
+    {
+        If.Cond = std::move(Cond);
+        if (!Arm(std::move(A.Sub->Args[1]), If.Then) || !Arm(std::move(A.Sub->Args[2]), If.Else)) return false;
+    }
+    else
+    {
+        OutPre.push_back(Store(std::move(Cond)));
+        If.Cond = Which == "__AndAlso__" ? TmpRef : NotOf(TmpRef, BP);
+        if (!Arm(std::move(A.Sub->Args[1]), If.Then)) return false;
+    }
+    OutPre.push_back(std::move(If));
+    A = TmpRef;
     return true;
 }
 
@@ -2766,7 +3135,7 @@ bool ContainsRead(const FArgIR& A)
     if (A.K == FArgIR::DynCast && A.Sub) return ContainsRead(A.Sub->Args[0]);
     if (A.K != FArgIR::Call || !A.Sub) return false;
     if (A.Sub->Target && ContainsRead(*A.Sub->Target)) return true;
-    if (FindReadView(A.Sub->Intrinsic) || A.Sub->Intrinsic == "__RefAt__") return true;
+    if (FindReadView(A.Sub->Intrinsic) || A.Sub->Intrinsic == "__RefAt__" || IsBranch(A.Sub->Intrinsic)) return true;
     if (IsReinterpret(A.Sub->Intrinsic) && A.Sub->Args.size() == 1 && !IsStored(A.Sub->Args[0])) return true;
     for (const FArgIR& CA : A.Sub->Args) if (ContainsRead(CA)) return true;
     return false;
@@ -2776,13 +3145,20 @@ bool FCompiler::HoistReadsInStmt(FStmtIR& St, FBlueprintClass& BP,
                                  std::vector<FPropertyDef>& Locals,
                                  std::vector<FStmtIR>& OutPre, std::string* Err)
 {
-    /* A while cond runs every iteration but our pre-stmts land outside the loop, so a stale
-       scratch would serve every check but the first. Force the user to lift it into the body. */
+    /* A while condition runs every iteration, but hoisted statements land before the loop. So a condition that
+       needs them becomes `while (true) { if (!Cond) break; ... }`, and they land inside. */
     if (St.K == FStmtIR::While && ContainsRead(St.Cond))
     {
-        *Err = "TODO: a `while` condition that reads memory or converts a computed pointer is hoisted out of the "
-               "loop and would be evaluated once; keep the value in a local the loop body updates";
-        return false;
+        FStmtIR Exit;
+        Exit.K = FStmtIR::If;
+        Exit.Cond = NotOf(std::move(St.Cond), BP);
+        Exit.Then = std::make_shared<std::vector<FStmtIR>>();
+        Exit.Then->emplace_back().K = FStmtIR::Break;
+        if (!St.Body) St.Body = std::make_shared<std::vector<FStmtIR>>();
+        St.Body->insert(St.Body->begin(), std::move(Exit));
+        St.Cond = FArgIR();
+        St.Cond.K = FArgIR::Bool;
+        St.Cond.B = true;
     }
 
     if (St.Then) if (!HoistReadsInList(*St.Then, BP, Locals, Err)) return false;
@@ -3240,6 +3616,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         RefAddr.clear();
         RefAlias.clear();
         LoopDepth = 0;
+        SwitchDepth = 0;
         KeepLoaded.clear();
         if (Fn.Body && !LowerBody(*Fn.Body, BP, Stmts, Locals, Err))
         {

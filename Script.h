@@ -121,6 +121,10 @@ public:
     int32 Jump(int32 MemTarget);
     int32 JumpIfNot(int32 MemTarget, const std::function<void(FScript&)>& Cond);
     void PatchJumpTarget(int32 StorageOffset, int32 MemTarget);
+    /* EX_ComputedJump: OffsetExpr yields the int32 MEMORY offset to continue at. */
+    void ComputedJump(const std::function<void(FScript&)>& OffsetExpr);
+    /* A raw int32 operand after an Op, to patch later through PatchJumpTarget. */
+    void RawInt32(int32 Value);
 
     void FieldPath(const std::string& PropertyName, FIndex Owner);
     void FieldPath(const std::vector<std::string>& Path, FIndex Owner);     // innermost first: {"Items", "Items"} is an array's element
