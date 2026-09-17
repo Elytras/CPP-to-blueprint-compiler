@@ -3107,7 +3107,9 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             /* clang groups comma-declared vars under one DeclStmt. */
             bool bAny = false;
             ForEach(*S, [&](const Json& D) {
-                if (!bOk || Kind(D) != "VarDecl") return;
+                const std::string DK = Kind(D);
+                if (DK == "TypeAliasDecl" || DK == "TypedefDecl" || DK == "UsingDecl") { bAny = true; return; }   // compile-time names only
+                if (!bOk || DK != "VarDecl") return;
                 bAny = true;
                 const std::string VarName = LocalName(D);
                 std::string VarType = TypeOf(D);
