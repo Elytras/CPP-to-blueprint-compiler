@@ -65,6 +65,20 @@ FIndex FBlueprintClass::ClassDefaultObject(const std::string& PackageName,
     return Idx;
 }
 
+FIndex FBlueprintClass::Asset(const std::string& ClassPackage, const std::string& ClassName_,
+                              const std::string& AssetPackage, const std::string& AssetName)
+{
+    const std::string Key = "asset:" + AssetPackage + "." + AssetName;
+    auto It = ImportCache.find(Key);
+    if (It != ImportCache.end()) return Imp(It->second);
+
+    EngineClass(ClassPackage, ClassName_);      // the linker resolves an import's class through its own import
+    const int32 Row = P.AddImport({ ClassPackage, ClassName_, PackageImport(AssetPackage), AssetName });
+    ImportCache.emplace(Key, Row);
+    CallImports.push_back(Imp(Row).V);
+    return Imp(Row);
+}
+
 FIndex FBlueprintClass::ScriptStruct(const std::string& PackageName, const std::string& StructName)
 {
     const std::string Key = "str:" + PackageName + "." + StructName;
@@ -247,6 +261,7 @@ void FBlueprintClass::Finish()
     Cdo.SerBeforeCreate = { Exp(RowClass).V, ParentCdo.V };
     if (bParentIsBlueprint)
         Cdo.CreateBeforeSer = { ParentIdx.V };
+    for (const FPropertyDef& V : Vars) DefaultRefs(V.Default, Cdo.CreateBeforeSer);     // as ED_Spider_Grunt lists its EnemyID
     // AActor defaults bCanEverTick to false; the BP compiler sets it on the CDO when ReceiveTick
     // is overridden (KismetCompiler.cpp, SetCanEverTick), else the actor loads and never ticks.
     const bool bOverridesTick = std::any_of(Functions.begin(), Functions.end(),
@@ -393,7 +408,10 @@ void FBlueprintClass::FinishAsset(FIndex Class, FIndex ClassCdo)
     A.bIsAsset = true;
     A.SerBeforeCreate = { Class.V, ClassCdo.V };
     for (const FPropertyDef& V : Vars)
+    {
         if (V.Extra.V != 0) A.CreateBeforeSer.push_back(V.Extra.V);      // a user-defined enum / struct the tag names
+        DefaultRefs(V.Default, A.CreateBeforeSer);
+    }
 
     const std::vector<FPropertyDef> Set = Vars;
     A.Serialize = [=](FArc& Ar) {

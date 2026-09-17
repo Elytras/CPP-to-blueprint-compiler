@@ -191,13 +191,22 @@ void WriteFStringValue(FArc& Ar, const std::string& Utf8)
 }
 }   // namespace
 
-void WriteDefaultTag(FArc& Ar, const FPropertyDef& P)
+void DefaultRefs(const FDefaultValue& D, std::vector<int32>& Out)
 {
-    const FDefaultValue& D = P.Default;
-    if (P.Type == "BoolProperty") { TagBool(Ar, P.Name, D.K != FDefaultValue::None && D.I != 0); return; }
+    if (D.K == FDefaultValue::Obj && D.Object.V != 0 && std::find(Out.begin(), Out.end(), D.Object.V) == Out.end())
+        Out.push_back(D.Object.V);
+    for (const FDefaultValue& Item : D.Items) DefaultRefs(Item, Out);
+}
+
+namespace
+{
+/* D as P's value, without a tag: a tag's payload, or one array element. */
+void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
+{
     const bool bSet = D.K != FDefaultValue::None;
-    Tag(Ar, P.Name, P.Type, [&](FArc& V) {
+    {
         if (P.Type == "IntProperty") V.I32(int32(D.I));
+        else if (P.Type == "BoolProperty") V.U8(bSet && D.I != 0 ? 1 : 0);     // an element; a bool member is its tag
         else if (P.Type == "FloatProperty") { const float F = float(D.F); V.Raw(&F, 4); }
         else if (P.Type == "Int64Property") V.I64(D.I);
         else if (P.Type == "EnumProperty") V.Name(D.K == FDefaultValue::Str ? D.S : P.EnumZero);
@@ -214,12 +223,23 @@ void WriteDefaultTag(FArc& Ar, const FPropertyDef& P)
             V.I32(bText ? 1 : 0);
             if (bText) WriteFStringValue(V, D.S);
         }
-        else if (P.Type == "ObjectProperty" || P.Type == "ClassProperty" || P.Type == "InterfaceProperty") V.I32(0);
+        else if (P.Type == "ObjectProperty") V.Idx(D.K == FDefaultValue::Obj ? D.Object : Null());
+        else if (P.Type == "ClassProperty" || P.Type == "InterfaceProperty") V.I32(0);
         else if (P.Type == "SoftObjectProperty" || P.Type == "SoftClassProperty") { V.Name("None"); V.I32(0); }   // FSoftObjectPath: AssetPathName, SubPathString
-        else if (P.Type == "SetProperty" || P.Type == "MapProperty") { V.I32(0); V.I32(0); }   // removed count, count
+        else if (P.Type == "SetProperty" || P.Type == "MapProperty")
+        {
+            /* Removed count, count, then the elements; a map's Items alternate key, value. */
+            const bool bMap = P.Type == "MapProperty" && P.Value;
+            V.I32(0);
+            V.I32(int32(D.Items.size() / (bMap ? 2 : 1)));
+            if (P.Inner)
+                for (size_t I = 0; I < D.Items.size(); ++I)
+                    WriteValue(V, bMap && I % 2 == 1 ? *P.Value : *P.Inner, D.Items[I]);
+        }
         else if (P.Type == "ArrayProperty")
         {
-            V.I32(0);
+            V.I32(int32(D.Items.size()));
+            if (P.Inner) for (const FDefaultValue& Item : D.Items) WriteValue(V, *P.Inner, Item);
             /* An array of structs carries an inner tag after the count, even when empty. */
             if (P.Inner && P.Inner->Type == "StructProperty")
             {
@@ -242,7 +262,15 @@ void WriteDefaultTag(FArc& Ar, const FPropertyDef& P)
             if (N == Native.end()) TagEnd(V);
             else for (int32 i = 0; i < N->second; ++i) V.U8(0);
         }
-    }, P.StructName);
+    }
+}
+}   // namespace
+
+void WriteDefaultTag(FArc& Ar, const FPropertyDef& P)
+{
+    const FDefaultValue& D = P.Default;
+    if (P.Type == "BoolProperty") { TagBool(Ar, P.Name, D.K != FDefaultValue::None && D.I != 0); return; }
+    Tag(Ar, P.Name, P.Type, [&](FArc& V) { WriteValue(V, P, D); }, P.StructName);
 }
 
 void WriteProperty(FArc& Ar, const FPropertyDef& P)

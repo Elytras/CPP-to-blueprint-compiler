@@ -164,6 +164,14 @@ bool FindLiteral(const Json& N, std::string& Out)
     return bFound;
 }
 
+/* A variable's braced initializer, or null. A temporary inside the braces (a container's list) wraps them in cleanups. */
+const Json* BracedInit(const Json& Var)
+{
+    const Json* I = First(Var);
+    if (I && Kind(*I) == "ExprWithCleanups") I = First(*I);
+    return I && Kind(*I) == "InitListExpr" ? I : nullptr;
+}
+
 bool IsStaticDecl(const Json& Decl) { return Decl.value("storageClass", std::string()) == "static"; }
 
 /* UE_SERVER / UE_CLIENT / UE_MULTICAST / UE_RELIABLE, carried as attribute kinds (UeMeta.h). */
@@ -937,6 +945,13 @@ private:
     std::string CurrentWco;                           // its WorldContext* parm when it is a static, else empty
     std::vector<FRegistryAsset> RegistryRows;
     std::vector<const Json*> AssetDecls;        // namespace-scope variables brace-initialized, see GenerateAsset
+    std::map<std::string, std::string> AssetPaths;  // UE_ASSET_AT: variable -> the /Game package of an asset cooked elsewhere
+    /* `&MD_Big`, where MD_Big is an asset of this mod or a UE_ASSET_AT: its import. False when N is anything else. */
+    bool AssetRef(const Json& N, FBlueprintClass& BP, FIndex* Out);
+    /* A member initializer becomes PD.Default, which the CDO / struct default instance / asset writes. It must be a
+       literal the member's own type can hold (optionally negated), nullptr, an argless ctor, `&Asset`, or a braced
+       list of those for a TArray / TSet, of { key, value } pairs for a TMap. Init overrides F's own initializer. */
+    bool LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& BP, std::string* Err, const Json* Init = nullptr);
     std::map<std::string, std::vector<std::pair<std::string, int64>>> ModEnums;  // UE_ENUM cooked here: enumerators
 
     /* Per-function state reset in Generate: whether this function needs the FDeref scratch
@@ -1274,7 +1289,12 @@ bool FCompiler::Collect(std::string* Err)
             return;
         }
         if (Kind(N) == "VarDecl" && Name(N) == "UeModPackage") FindLiteral(N, ModPackage);
-        if (Kind(N) == "VarDecl" && First(N) && Kind(*First(N)) == "InitListExpr") AssetDecls.push_back(&N);
+        if (Kind(N) == "VarDecl" && BracedInit(N)) AssetDecls.push_back(&N);
+        if (Kind(N) == "VarDecl" && Name(N).size() > 9 && Name(N).compare(Name(N).size() - 9, 9, "__UeAsset") == 0)
+        {
+            FindLiteral(N, AssetPaths[Name(N).substr(0, Name(N).size() - 9)]);
+            return;
+        }
         if (Kind(N) == "EnumDecl")
         {
             int64 Next = 0;
@@ -1840,16 +1860,13 @@ bool FCompiler::LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& 
         return LowerArg(*ObjRaw, BP, *Out.Base, Err);
     }
 
-    if (!R->IsNative() && R != Cur)
-    {
-        *Err = "TODO: a property declared on another generated class is not reachable yet: "
-             + Name(MemberNode);
-        return false;
-    }
-
+    /* A sibling class of this mod (a data asset's, a local parent's) is imported the way a UE_CLASS one from
+       another mod is. */
     Out.K = FArgIR::Field;
     Out.S = Name(MemberNode);
-    Out.Owner = R->IsNative() ? BP.PropertyOwner(R->UePackage, R->UeName) : BP.ClassIndex();
+    Out.Owner = R->IsNative() ? BP.PropertyOwner(R->UePackage, R->UeName)
+              : R == Cur      ? BP.ClassIndex()
+                              : BP.PropertyOwner(ModPackage + "/" + R->CppName, R->CppName + "_C");
     Out.LetOp = LetOpFor(TypeOf(MemberNode));
     const Json* Obj = Strip(ObjRaw);
     if (!Obj) { *Err = "property access with no object: " + Name(MemberNode); return false; }
@@ -2759,6 +2776,13 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         FArgIR Addr;
         std::string Pointee;
         return LowerAddress(*N, BP, Addr, &Pointee, Err) && ReadThrough(std::move(Addr), Pointee, BP, Out, Err);
+    }
+    if (FIndex Asset; AssetRef(*N, BP, &Asset))
+    {
+        Out.K = FArgIR::ObjConst;
+        Out.Owner = Asset;
+        Out.InnerType = TypeOf(*N);
+        return true;
     }
     if (K == "UnaryOperator" && N->value("opcode", std::string()) == "&")
     {
@@ -4669,13 +4693,66 @@ std::string StripTypeKeywords(std::string T)
     return T;
 }
 
-/* A member initializer becomes PD.Default, which the CDO / struct default instance writes. It must
-   be a literal the member's own type can hold (optionally negated), nullptr, or an argless ctor. */
-bool LowerDefault(const Json& F, FPropertyDef& PD, std::string* Err, const Json* Init = nullptr)
+bool FCompiler::AssetRef(const Json& N, FBlueprintClass& BP, FIndex* Out)
+{
+    if (Kind(N) != "UnaryOperator" || N.value("opcode", std::string()) != "&") return false;
+    const Json* Ref = Strip(First(N));
+    if (!Ref || Kind(*Ref) != "DeclRefExpr" || !Ref->contains("referencedDecl")) return false;
+    const Json& D = (*Ref)["referencedDecl"];
+    const FRecord* R = D.contains("type") ? Find(StripTypeKeywords(D["type"].value("qualType", std::string()))) : nullptr;
+    if (Kind(D) != "VarDecl" || !R || R->bIsStruct) return false;
+
+    std::string Package;
+    const std::string Var = Name(D);
+    if (auto At = AssetPaths.find(Var); At != AssetPaths.end()) Package = At->second;
+    else if (std::any_of(AssetDecls.begin(), AssetDecls.end(), [&](const Json* A) { return Name(*A) == Var; }))
+        Package = ModPackage + "/" + Var;
+    else return false;
+
+    const bool bNative = R->IsNative();
+    *Out = BP.Asset(bNative ? R->UePackage : ModPackage + "/" + R->CppName, bNative ? R->UeName : R->CppName + "_C",
+                    Package, Package.substr(Package.rfind('/') + 1));
+    return true;
+}
+
+bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& BP, std::string* Err, const Json* Init)
 {
     Init = Strip(Init ? Init : First(F));
     if (!Init) return true;
     std::string K = Kind(*Init);
+    const bool bMap = PD.Type == "MapProperty";
+    if ((PD.Type == "ArrayProperty" || PD.Type == "SetProperty" || bMap) && PD.Inner && First(*Init))
+    {
+        /* The container's initializer_list constructor: the braces are the InitListExpr under it. A map's
+           elements are TPair lists; Items then alternates key, value. */
+        const Json* List = Init;
+        while (List && Kind(*List) != "InitListExpr") List = First(*List);
+        const bool bStructs = PD.Inner->Type == "StructProperty" || (bMap && PD.Value && PD.Value->Type == "StructProperty");
+        if (!List || bStructs || (bMap && !PD.Value))
+        { *Err = "TODO: a container default is a braced list of literals or &Assets: " + Name(F); return false; }
+        bool bOk = true;
+        auto Add = [&](const FPropertyDef& Of, const Json* E) {
+            FPropertyDef Element = Of;
+            bOk = bOk && E && LowerDefault(F, Element, BP, Err, E);
+            PD.Default.Items.push_back(Element.Default);
+        };
+        ForEach(*List, [&](const Json& E) {
+            if (!bMap) { Add(*PD.Inner, &E); return; }
+            const Json* Pair = &E;
+            while (Pair && Kind(*Pair) != "InitListExpr") Pair = First(*Pair);
+            Add(*PD.Inner, Pair ? Nth(*Pair, 0) : nullptr);
+            Add(*PD.Value, Pair ? Nth(*Pair, 1) : nullptr);
+        });
+        if (!bOk && Err->empty()) *Err = "a TMap default is a list of { key, value } pairs: " + Name(F);
+        PD.Default.K = FDefaultValue::Array;
+        return bOk;
+    }
+    if (FIndex Asset; PD.Type == "ObjectProperty" && AssetRef(*Init, BP, &Asset))
+    {
+        PD.Default.K = FDefaultValue::Obj;
+        PD.Default.Object = Asset;
+        return true;
+    }
     const bool bNeg = K == "UnaryOperator" && Init->value("opcode", std::string()) == "-";
     if (bNeg)
     {
@@ -4974,7 +5051,7 @@ bool FCompiler::GenerateStruct(const FRecord& R, const std::string& OutDir, std:
     {
         FPropertyDef PD;
         if (!TypeToProperty(TypeOf(*F), Name(*F), 0, "member " + Name(*F), BP, &PD, Err)) return false;
-        if (!LowerDefault(*F, PD, Err)) return false;
+        if (!LowerDefault(*F, PD, BP, Err)) return false;
         PD.PropertyFlags = CPF_Edit | CPF_BlueprintVisible;
         BP.AddVariable(PD);
     }
@@ -5043,12 +5120,12 @@ bool FCompiler::GenerateAsset(const Json& Var, const std::string& OutDir, std::s
             if (!Init || Unset(*Init)) continue;
             FPropertyDef PD;
             if (!TypeToProperty(TypeOf(*F), Name(*F), 0, AssetName + "." + Name(*F), BP, &PD, Err)) return false;
-            if (!LowerDefault(*F, PD, Err, Init)) return false;
+            if (!LowerDefault(*F, PD, BP, Err, Init)) return false;
             BP.AddVariable(PD);
         }
         return true;
     };
-    if (!Fill(*First(Var), *R)) return false;
+    if (!Fill(*BracedInit(Var), *R)) return false;
 
     const std::string ClassPkg = R->IsNative() ? R->UePackage : ModPackage + "/" + R->CppName;
     const std::string ClassName = R->IsNative() ? R->UeName : R->CppName + "_C";
@@ -5205,7 +5282,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         std::string PErr;
         if (!TypeToProperty(TypeOf(*F), FieldName, 0, "property " + FieldName, BP, &PD, &PErr))
         { *Err = PErr; return false; }
-        if (!LowerDefault(*F, PD, Err)) return false;
+        if (!LowerDefault(*F, PD, BP, Err)) return false;
 
         /* CPF_Parm would make it part of the call frame; CPF_BlueprintReadOnly would forbid assignment. */
         PD.PropertyFlags = (PD.PropertyFlags & ~uint64(CPF_Parm | CPF_BlueprintReadOnly))

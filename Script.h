@@ -14,10 +14,12 @@ std::u16string Utf8To16(const std::string& Utf8);
 /* A member's literal initializer. None = the type's zero value. */
 struct FDefaultValue
 {
-    enum EKind { None, Int, Float, Bool, Str } K = None;
+    enum EKind { None, Int, Float, Bool, Str, Obj, Array } K = None;
     int64 I = 0;                        // Int, Bool
     double F = 0.0;                     // Float
     std::string S;                      // Str: UTF-8, for StrProperty / NameProperty / TextProperty
+    FIndex Object;                      // Obj: the asset an ObjectProperty points at
+    std::vector<FDefaultValue> Items;   // Array (also a set / map): one value per element, typed by the property's Inner; a map alternates key, value
 };
 
 /* One ChildProperties entry. ElementSize must equal the type's runtime size; the engine lays the struct out from it. */
@@ -67,6 +69,9 @@ void WriteProperty(FArc& Ar, const FPropertyDef& P);
 
 /* The property as a tagged-property entry holding P.Default (its zero value when unset). */
 void WriteDefaultTag(FArc& Ar, const FPropertyDef& P);
+
+/* Every object D points at, for the owning export's create-before-serialize edges. */
+void DefaultRefs(const FDefaultValue& D, std::vector<int32>& Out);
 
 /*
 Kismet bytecode buffer. MemorySize and StorageSize differ by design: a property reference is

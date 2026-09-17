@@ -27,6 +27,11 @@ public:
     /* The CDO as an EX_Context literal; recorded as a load dependency like a called function. */
     FIndex ClassDefaultObject(const std::string& PackageName, const std::string& ClassName);
 
+    /* An asset in another package (a data asset instance), as an object literal or a default's value. Recorded as a
+       load dependency of every function body, like the CDO. */
+    FIndex Asset(const std::string& ClassPackage, const std::string& ClassName_,
+                 const std::string& AssetPackage, const std::string& AssetName);
+
     /* Only an actor may have the SCS trio: USimpleConstructionScript casts the owner CDO to AActor. */
     void SetIsActor(bool bValue) { bIsActor = bValue; }
 
