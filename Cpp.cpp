@@ -199,6 +199,8 @@ struct FRecord
 
     bool IsNative() const { return !UePackage.empty() && !bIsLocal; }
     bool IsGenerated() const { return !IsNative() && (bIsStruct || !Base.empty()); }
+    /* A UserDefinedStruct: cooked here, or cooked by the mod its UE_STRUCT_IN names and imported. */
+    bool IsModStruct() const { return bIsStruct && (UePackage.empty() || UePackage.compare(0, 6, "/Game/") == 0); }
 };
 
 struct FCallIR;
@@ -948,6 +950,12 @@ bool FCompiler::Collect(std::string* Err)
             else if (Kind(C) == "VarDecl" && Name(C) == "UeStructMeta")
             {
                 R.bIsStruct = true;
+                std::string Owner;
+                if (FindLiteral(C, Owner))
+                {
+                    R.UePackage = Owner + "/" + R.CppName;
+                    R.UeName = R.CppName;
+                }
             }
             else if (Kind(C) == "CXXMethodDecl" && C.contains("name"))
             {
@@ -987,7 +995,7 @@ bool FCompiler::Collect(std::string* Err)
         FRecord& R = It.second;
         if (R.UePackage.empty()) continue;
         if (R.UePackage != ModPackage + "/" + R.CppName) continue;
-        if (R.UeName != R.CppName + "_C")
+        if (!R.bIsStruct && R.UeName != R.CppName + "_C")
         {
             *Err = "UE_CLASS on " + R.CppName + " says \"" + R.UeName
                  + "\", but cooking it here requires \"" + R.CppName + "_C\"";
@@ -1372,7 +1380,7 @@ bool FCompiler::LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& 
         const bool bArrow = MemberNode.value("isArrow", false);
         if (bArrow || IsDerefLvalue(*Bare))
         {
-            if (!R->IsNative())
+            if (R->IsModStruct())
             {
                 int32 Size = 0, Align = 0;
                 if (!StructLayout(*R, &Size, &Align, Err)) return false;
@@ -2912,11 +2920,11 @@ bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& P
         return true;
     }
 
-    if (const FRecord* SR = Find(Type); SR && SR->bIsStruct && !SR->IsNative())
+    if (const FRecord* SR = Find(Type); SR && SR->IsModStruct())
     {
         int32 Size = 0, Align = 0;
         if (!StructLayout(*SR, &Size, &Align, Err)) return false;
-        *Out = StructParam(PName, BP.ScriptStruct(ModPackage + "/" + SR->CppName, SR->CppName),
+        *Out = StructParam(PName, BP.ScriptStruct(SR->IsNative() ? SR->UePackage : ModPackage + "/" + SR->CppName, SR->CppName),
                            SR->CppName, Size, ExtraFlags);
         return true;
     }
@@ -3358,7 +3366,7 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     /* Before anything reads a type: a raw pointer is an int64 from here on (see IsRawPointer). */
     for (const auto& Entry : Records)
     {
-        if (!Entry.second.IsGenerated()) continue;
+        if (!Entry.second.IsGenerated() && !Entry.second.IsModStruct()) continue;
         for (const Json* F : Entry.second.Fields) NormalizePointers(const_cast<Json&>(*F));
         for (const auto& M : Entry.second.Methods) NormalizePointers(const_cast<Json&>(*M.second));
         for (const auto& M : Entry.second.MethodDefs) NormalizePointers(const_cast<Json&>(*M.second));
