@@ -33,7 +33,7 @@ class P(W):
         elif op == 7: n.val = s.i32(); k.append(s.node())
         elif op in (0xB, 0x16, 0x17, 0x25, 0x26, 0x27, 0x28, 0x2A, 0x4D, 0x53): pass
         elif op == 0xF: s.fieldpath(); k.append(s.node()); k.append(s.node())
-        elif op in (0x14, 0x5F): k.append(s.node()); k.append(s.node())
+        elif op in (0x14, 0x5F, 0x6B): k.append(s.node()); k.append(s.node())
         elif op in (0x1B, 0x45): n.val = s.name(); s.args(k)
         elif op in (0x1C, 0x46, 0x68): n.val = s.ptr().split("'")[-2]; s.args(k)
         elif op == 0x1D: n.val = s.i32()
@@ -97,12 +97,24 @@ MATH = {
 }
 
 
-def run(base, function, **parms):
+# Container library calls see their argument NODES, so an out-parm can be written. A TSet is a list of
+# unique values and a TMap a dict, both in insertion order.
+CONTAINERS = {
+    'Array_Length': lambda ev, store, a: len(ev(a[0])),
+    'Array_Add': lambda ev, store, a: (ev(a[0]).append(ev(a[1])), len(ev(a[0])) - 1)[1],
+    'Set_ToArray': lambda ev, store, a: store(a[1], list(ev(a[0]))),
+    'Map_Keys': lambda ev, store, a: store(a[1], list(ev(a[0]).keys())),
+    'Map_Find': lambda ev, store, a: (store(a[2], ev(a[0]).get(ev(a[1]), 0)), ev(a[1]) in ev(a[0]))[1],
+    'Map_Add': lambda ev, store, a: ev(a[0]).__setitem__(ev(a[1]), ev(a[2])),
+}
+
+
+def run(base, function, self_vars=None, **parms):
     stmts = script_of(base, function)
     at = {n.mem: i for i, n in enumerate(stmts)}
     env = dict(parms)
     flow = []
-    self_vars = {}
+    self_vars = self_vars if self_vars is not None else {}
 
     def ev(n):
         o = n.op
@@ -113,6 +125,8 @@ def run(base, function, **parms):
         if o == 0x26: return 1
         if o == 0x27: return True
         if o == 0x28: return False
+        if o == 0x6B: return ev(n.kids[0])[ev(n.kids[1])]
+        if o in (0x1C, 0x46, 0x68) and n.val in CONTAINERS: return CONTAINERS[n.val](ev, store, n.kids)
         if o in (0x1C, 0x46, 0x68):
             if n.val not in MATH: raise SystemExit('unsupported call ' + n.val)
             return MATH[n.val](*[ev(a) for a in n.kids])
@@ -126,6 +140,7 @@ def run(base, function, **parms):
     def store(dest, v):
         if dest.op in (0, 0x48): env[dest.val] = v
         elif dest.op == 1: self_vars[dest.val] = v
+        elif dest.op == 0x6B: ev(dest.kids[0])[ev(dest.kids[1])] = v
         else: raise SystemExit('unsupported destination op %02x' % dest.op)
 
     pc, steps = 0, 0
@@ -152,6 +167,7 @@ def run(base, function, **parms):
             r = n.kids[0]
             return (ev(r) if r.op != 0xB else None), env
         elif o == 0xB: pass
+        elif o in (0x1C, 0x46, 0x68): ev(n)
         elif o == 0x53: raise SystemExit('ran off the end of the script')
         else: raise SystemExit('unsupported statement op %02x at mem %d' % (o, n.mem))
         pc = nxt

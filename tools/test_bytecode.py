@@ -132,3 +132,56 @@ check('FlowTest', 'Pick', lambda X: X * 2 if X > 0 else (-1 if X < -5 else 7), [
 check('FlowTest', 'Compound', compound, [dict(N=n) for n in (0, 1, 5, 40)])
 check('FlowTest', 'FloatStep', lambda F: -(F + 1.5), [dict(F=f) for f in (0.0, 2.25, -1.5)])
 check('FlowTest', 'WhileAnd', while_and, [dict(Limit=l) for l in (0, 1, 50, 99, 150)])
+
+
+def range_self(**kw):
+    return dict(Items=list(kw.get('Items', [])), Seen=list(kw.get('Seen', [])), Scores=dict(kw.get('Scores', {})))
+
+
+def check_self(mod, fn, oracle, cases):
+    """Like check, but each case is the object's own fields; the oracle gets a copy."""
+    for fields in cases:
+        mine, theirs = range_self(**fields), range_self(**fields)
+        got = run(asset(mod), fn, self_vars=mine)[0]
+        want = oracle(theirs)
+        assert got == want, '%s.%s(%s) = %r, want %r' % (mod, fn, fields, got, want)
+    print('ok  %s.%s  (%d cases)' % (mod, fn, len(cases)))
+
+
+def double_in_place(f):
+    items = f['Items']
+    for i, x in enumerate(items):
+        if x < 0: continue
+        items[i] = x * 2
+        if items[i] > 100: break
+    s = 0
+    for x in items: s = s * 3 + x
+    return s
+
+
+def bump_scores(stop):
+    def o(f):
+        count = 0
+        for k in list(f['Scores']):
+            f['Scores'][k] += 10
+            count += 1
+            if f['Scores'][k] > stop: break
+        return sum(f['Scores'].values()) * 100 + count
+    return o
+
+
+arrays = [[], [1], [3, -1, 7], [60, 2, -5, 9], [1, 2, 3, 4, 5]]
+check_self('RangeTest', 'SumArray', lambda f: sum(f['Items']), [dict(Items=a) for a in arrays])
+check_self('RangeTest', 'DoubleInPlace', double_in_place, [dict(Items=a) for a in arrays])
+check_self('RangeTest', 'CopyDoesNotWrite', lambda f: len(f['Items']), [dict(Items=a) for a in arrays])
+check_self('RangeTest', 'NestedPairs', lambda f: sum(1 for a in f['Items'] for b in f['Items'] if a < b), [dict(Items=a) for a in arrays])
+check_self('RangeTest', 'SumSet', lambda f: sum(f['Seen']), [dict(Seen=a) for a in ([], [4], [1, 5, 9])])
+for stop in (0, 15, 1000):
+    fn = bump_scores(stop)
+    maps = [{}, {'a': 1}, {'a': 1, 'b': 20, 'c': 3}]
+    for m in maps:
+        mine = range_self(Scores=m)
+        got = run(asset('RangeTest'), 'BumpScores', self_vars=mine, Stop=stop)[0]
+        want = fn(range_self(Scores=m))
+        assert got == want, 'BumpScores(%s, %s) = %r, want %r' % (m, stop, got, want)
+print('ok  RangeTest.BumpScores  (9 cases)')

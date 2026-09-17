@@ -362,6 +362,7 @@ struct FStmtIR
     std::shared_ptr<std::vector<FStmtIR>> Else;
     std::shared_ptr<std::vector<FStmtIR>> Body;
     std::shared_ptr<std::vector<FStmtIR>> Inc;      // While: a `for` increment, where `continue` lands
+    std::shared_ptr<std::vector<FStmtIR>> Trailer;  // While: runs on `break` only, before leaving the loop
     std::vector<FArgIR> CaseTests;                  // Switch: per case, true when the value does NOT match
     int32 LabelId = -1;                             // Label: the case it marks; Switch: the default's label, or -1
     std::vector<int64> CaseValues;                  // Switch: each case's constant, in CaseTests order
@@ -673,6 +674,8 @@ private:
     bool LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FStmtIR>& Out,
                    std::vector<FPropertyDef>& Locals, std::string* Err);
     bool LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR& Out, std::string* Err);
+    bool LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vector<FStmtIR>& Out,
+                       std::vector<FPropertyDef>& Locals, std::string* Err);
     bool LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     bool LowerArgRaw(const Json& N, const std::string& OuterType, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     bool ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgIR& Arg, std::string* Err);
@@ -873,6 +876,13 @@ void EmitStmts(const std::vector<FStmtIR>& Stmts, FScript& S, FIndex SelfExp, FL
             for (int32 P : Inner.Continues) S.PatchJumpTarget(P, S.MemorySize());
             if (St.Inc) EmitStmts(*St.Inc, S, SelfExp, Loop);
             S.Jump(Head);
+            if (St.Trailer && !Inner.Breaks.empty())
+            {
+                /* A `break` runs the trailer and falls into the exit; a failed condition skips it. */
+                for (int32 P : Inner.Breaks) S.PatchJumpTarget(P, S.MemorySize());
+                Inner.Breaks.clear();
+                EmitStmts(*St.Trailer, S, SelfExp, Loop);
+            }
             S.PatchJumpTarget(ExitPatch, S.MemorySize());
             for (int32 P : Inner.Breaks) S.PatchJumpTarget(P, S.MemorySize());
             break;
@@ -2127,13 +2137,13 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             Out.I = int32(V->second);
             return true;
         }
+        /* A reference local (or a range-for binding) is the variable it names, or the value at the address it keeps. */
+        if (auto A = RefAlias.find(Ref.value("id", std::string())); A != RefAlias.end()) return LowerArg(A->second, BP, Out, Err);
         if (RefKind != "ParmVarDecl" && RefKind != "VarDecl")
         {
             *Err = "TODO: DeclRefExpr to " + RefKind;
             return false;
         }
-        /* A reference local is the variable it names, or the value at the address it keeps. */
-        if (auto A = RefAlias.find(Ref.value("id", std::string())); A != RefAlias.end()) return LowerArg(A->second, BP, Out, Err);
         if (IsDerefLvalue(*N))
         {
             FArgIR Addr;
@@ -2836,6 +2846,11 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             St.Call.Extra2 = BP.EngineFunction("/Script/Engine", "KismetMathLibrary", "Add_IntInt");
             St.Target.Fn = BP.EngineFunction("/Script/Engine", "KismetMathLibrary", "Multiply_IntInt");
         }
+        else if (K == "CXXForRangeStmt")
+        {
+            if (!LowerRangeFor(*S, BP, Out, Locals, Err)) { bOk = false; return; }
+            return;
+        }
         else if (K == "WhileStmt")
         {
             /* WhileStmt inner is [cond, body]. */
@@ -2903,6 +2918,166 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
         if (bOk) Out.push_back(St);
     });
     return bOk;
+}
+
+/* A DeclRefExpr to a compiler-made local, for lowering synthetic statements through the ordinary paths. */
+Json RefToLocal(const std::string& Name, const std::string& Type)
+{
+    return { {"kind", "DeclRefExpr"}, {"type", {{"qualType", Type}}},
+             {"referencedDecl", {{"kind", "VarDecl"}, {"name", Name}, {"id", "synthetic:" + Name}}} };
+}
+
+/* `for (Elem : Range)` over a TArray / TSet / TMap. CXXForRangeStmt inner is
+   [init, __range1, __begin1, __end1, cond, inc, loop variable, body].
+     TArray: in place, by index. `T& E` is another name for `Range[Idx]`, so writes land in the array;
+             a by-value `T E` is a copy made each iteration. The length is read once, as C++ reads end() once.
+     TSet:   over a Set_ToArray copy; elements are copies.
+     TMap:   over a Map_Keys copy, each value fetched with Map_Find. `auto [K, V]` binds K to a copy of the key and
+             V to a local; unless the binding is const, V goes back with Map_Add after each iteration, `break`
+             included, so the body can change values in place.
+   ponytail: TSet / TMap iterate a copy, not the sparse array in place; the in-place walk needs the container's
+   address, which a Blueprint variable does not have (ROADMAP.md, Phase 3). */
+bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vector<FStmtIR>& Out,
+                              std::vector<FPropertyDef>& Locals, std::string* Err)
+{
+    const Json* RangeStmt = Nth(ForNode, 1);
+    const Json* RangeDecl = RangeStmt ? First(*RangeStmt) : nullptr;
+    const Json* RangeExpr = RangeDecl ? First(*RangeDecl) : nullptr;
+    const Json* LoopStmt = Nth(ForNode, 6);
+    const Json* LoopDecl = LoopStmt ? First(*LoopStmt) : nullptr;
+    const Json* Body = Nth(ForNode, 7);
+    if (!RangeExpr || !LoopDecl || !Body) { *Err = "a range-for with a missing part"; return false; }
+    if (const Json* Init = Nth(ForNode, 0); Init && Init->is_object() && Init->contains("kind")) { *Err = "TODO: a range-for with an init-statement"; return false; }
+
+    std::string RangeTy = TypeOf(*RangeExpr);
+    while (!RangeTy.empty() && (RangeTy.back() == '&' || RangeTy.back() == ' ')) RangeTy.pop_back();
+    RangeTy = StripTypeKeywords(RangeTy);
+    if (!IsContainerType(RangeTy)) { *Err = "TODO: range-for over " + RangeTy + " (TArray, TSet and TMap only)"; return false; }
+    const char Which = RangeTy[1];                       // 'A'rray, 'S'et, 'M'ap
+    const size_t Open = RangeTy.find('<');
+    const std::vector<std::string> Args = SplitTemplateArgs(RangeTy.substr(Open + 1, RangeTy.rfind('>') - Open - 1));
+
+    const std::string N = std::to_string(ReadTmpCounter++);
+    auto AddLocal = [&](const std::string& Name, const std::string& Type) {
+        FPropertyDef PD;
+        if (!TypeToProperty(Type, Name, 0, "range-for", BP, &PD, Err)) return false;
+        PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+        Locals.push_back(PD);
+        return true;
+    };
+    auto LocalArg = [](const std::string& Name) { FArgIR A; A.K = FArgIR::Local; A.S = Name; return A; };
+    auto CallStmt = [&](const char* Lib, const char* Fn, std::vector<FArgIR> CallArgs) {
+        FStmtIR St;
+        St.K = FStmtIR::StaticCall;
+        St.Call.Fn = BP.EngineFunction("/Script/Engine", Lib, Fn);
+        St.Call.Args = std::move(CallArgs);
+        return St;
+    };
+    auto Math = [&](const char* Fn, FArgIR A, FArgIR B) {
+        FArgIR C;
+        C.K = FArgIR::Call;
+        C.Sub = std::make_shared<FCallIR>();
+        C.Sub->Fn = BP.EngineFunction("/Script/Engine", "KismetMathLibrary", Fn);
+        C.Sub->Args = { std::move(A), std::move(B) };
+        return C;
+    };
+    auto AssignStmt = [&](const std::string& Name, const std::string& Type, FArgIR Value) {
+        FStmtIR St;
+        St.K = FStmtIR::Assign;
+        St.Var = LocalArg(Name);
+        St.Var.LetOp = LetOpFor(Type);
+        St.bAssignLocal = true;
+        St.Value = std::move(Value);
+        return St;
+    };
+
+    FArgIR Range;
+    if (!LowerArg(*RangeExpr, BP, Range, Err)) return false;
+    if (Range.K != FArgIR::Field && Range.K != FArgIR::Local && Range.K != FArgIR::LocalOut && Range.K != FArgIR::Member)
+    { *Err = "range-for needs a container variable, not a computed value"; return false; }
+
+    /* The array walked by index: the container itself, or a copy of its elements / keys. */
+    Json IterJson = *RangeExpr;
+    std::string ElemTy = Args[0];
+    if (Which != 'A')
+    {
+        const std::string Copy = "__RangeCopy" + N + "__";
+        if (!AddLocal(Copy, "TArray<" + Args[0] + ">")) return false;
+        Out.push_back(Which == 'S' ? CallStmt("BlueprintSetLibrary", "Set_ToArray", { Range, LocalArg(Copy) })
+                                   : CallStmt("BlueprintMapLibrary", "Map_Keys", { Range, LocalArg(Copy) }));
+        IterJson = RefToLocal(Copy, "TArray<" + Args[0] + ">");
+    }
+    FArgIR Iter;
+    if (!LowerArg(IterJson, BP, Iter, Err)) return false;
+
+    const std::string Idx = "__RangeIdx" + N + "__", Len = "__RangeLen" + N + "__";
+    if (!AddLocal(Idx, "int32") || !AddLocal(Len, "int32")) return false;
+    FArgIR Zero;
+    Zero.K = FArgIR::Int;
+    Out.push_back(AssignStmt(Idx, "int32", Zero));
+    FArgIR Length;
+    Length.K = FArgIR::Call;
+    Length.Sub = std::make_shared<FCallIR>();
+    Length.Sub->Fn = BP.EngineFunction("/Script/Engine", "KismetArrayLibrary", "Array_Length");
+    Length.Sub->Args = { Iter };
+    Out.push_back(AssignStmt(Len, "int32", std::move(Length)));
+
+    FStmtIR Loop;
+    Loop.K = FStmtIR::While;
+    Loop.Cond = Math("Less_IntInt", LocalArg(Idx), LocalArg(Len));
+    Loop.Body = std::make_shared<std::vector<FStmtIR>>();
+    Loop.Inc = std::make_shared<std::vector<FStmtIR>>();
+    FArgIR One;
+    One.K = FArgIR::Int;
+    One.I = 1;
+
+    const Json Elem = { {"kind", "CXXOperatorCallExpr"}, {"type", {{"qualType", ElemTy}}},
+                        {"inner", Json::array({ Json{ {"kind", "DeclRefExpr"}, {"referencedDecl", {{"kind", "CXXMethodDecl"}, {"name", "operator[]"}}} },
+                                                IterJson, RefToLocal(Idx, "int32") })} };
+    ++LoopDepth;
+    if (Which != 'M')
+    {
+        if (Kind(*LoopDecl) != "VarDecl") { *Err = "TODO: a structured binding over a " + RangeTy; --LoopDepth; return false; }
+        std::string VarTy = TypeOf(*LoopDecl);
+        const bool bRef = !VarTy.empty() && VarTy.back() == '&';
+        if (bRef && Which == 'A') RefAlias[LoopDecl->value("id", std::string())] = Elem;
+        else
+        {
+            while (!VarTy.empty() && (VarTy.back() == '&' || VarTy.back() == ' ')) VarTy.pop_back();
+            Json Decl = *LoopDecl;
+            Decl["type"] = { {"qualType", StripTypeKeywords(VarTy)} };
+            Decl["inner"] = Json::array({ Elem });
+            Json Wrap = { {"kind", "CompoundStmt"}, {"inner", Json::array({ Json{ {"kind", "DeclStmt"}, {"inner", Json::array({ Decl })} } })} };
+            if (!LowerBody(Wrap, BP, *Loop.Body, Locals, Err)) { --LoopDepth; return false; }
+        }
+    }
+    else
+    {
+        if (Kind(*LoopDecl) != "DecompositionDecl") { *Err = "a TMap range-for binds `auto [Key, Value]`"; --LoopDepth; return false; }
+        std::vector<const Json*> Bindings;
+        ForEach(*LoopDecl, [&](const Json& C) { if (Kind(C) == "BindingDecl") Bindings.push_back(&C); });
+        if (Bindings.size() != 2) { *Err = "a TMap range-for binds exactly `auto [Key, Value]`"; --LoopDepth; return false; }
+        const std::string Key = "__RangeKey" + N + "__", Val = "__RangeVal" + N + "__";
+        if (!AddLocal(Key, Args[0]) || !AddLocal(Val, Args[1])) { --LoopDepth; return false; }
+        FArgIR KeyAt;
+        if (!LowerArg(Elem, BP, KeyAt, Err)) { --LoopDepth; return false; }
+        Loop.Body->push_back(AssignStmt(Key, Args[0], std::move(KeyAt)));
+        Loop.Body->push_back(CallStmt("BlueprintMapLibrary", "Map_Find", { Range, LocalArg(Key), LocalArg(Val) }));
+        RefAlias[Bindings[0]->value("id", std::string())] = RefToLocal(Key, Args[0]);
+        RefAlias[Bindings[1]->value("id", std::string())] = RefToLocal(Val, Args[1]);
+        if (StripTypeKeywords(TypeOf(*LoopDecl)) == TypeOf(*LoopDecl))       // no leading const
+        {
+            FStmtIR Back = CallStmt("BlueprintMapLibrary", "Map_Add", { Range, LocalArg(Key), LocalArg(Val) });
+            Loop.Inc->push_back(Back);
+            Loop.Trailer = std::make_shared<std::vector<FStmtIR>>(1, Back);
+        }
+    }
+    Json BodyWrap = Kind(*Body) == "CompoundStmt" ? *Body : Json{ {"kind", "CompoundStmt"}, {"inner", Json::array({ *Body })} };
+    if (!LowerBody(BodyWrap, BP, *Loop.Body, Locals, Err)) { --LoopDepth; return false; }
+    --LoopDepth;
+    Loop.Inc->push_back(AssignStmt(Idx, "int32", Math("Add_IntInt", LocalArg(Idx), One)));
+    Out.push_back(std::move(Loop));
+    return true;
 }
 
 bool FCompiler::HoistReadCall(FArgIR& A, const FReadViewSpec& V, FBlueprintClass& BP,
@@ -3165,6 +3340,7 @@ bool FCompiler::HoistReadsInStmt(FStmtIR& St, FBlueprintClass& BP,
     if (St.Else) if (!HoistReadsInList(*St.Else, BP, Locals, Err)) return false;
     if (St.Body) if (!HoistReadsInList(*St.Body, BP, Locals, Err)) return false;
     if (St.Inc) if (!HoistReadsInList(*St.Inc, BP, Locals, Err)) return false;
+    if (St.Trailer) if (!HoistReadsInList(*St.Trailer, BP, Locals, Err)) return false;
 
     if (!HoistReadsInArg(St.Var,   BP, Locals, OutPre, Err)) return false;
     if (!HoistReadsInArg(St.Value, BP, Locals, OutPre, Err)) return false;
