@@ -73,6 +73,17 @@ def transitive_needs(name, by_name, seen=None):
     return out
 
 
+def api_root(flag, config, bp):
+    """Where a `generate_api` mod's editor-side stubs go: the mod's own `generate_api: <path>`,
+    else the manifest's top-level `api_dir`, else the build tree. A path names the editor
+    project's Content folder (relative ones resolve against BpMods/), so a build updates the
+    project's API assets in place instead of leaving them to be copied by hand."""
+    root = flag if isinstance(flag, str) else config.get("api_dir")
+    if not root:
+        return os.path.join(bp, "out", "api", "Content")
+    return os.path.abspath(os.path.join(bp, os.path.expandvars(root)))
+
+
 def content_dir(stage_fsd, package):
     return os.path.join(stage_fsd, "Content", *package.replace("/Game/", "").split("/"))
 
@@ -196,7 +207,8 @@ def main():
 
         # `generate_api` writes the editor-side stub next to nothing else, so it has its own
         # staleness: turning the flag on for an already-built mod must still produce one.
-        api_content = (os.path.join(bp, "out", "api", "Content", *package.replace("/Game/", "").split("/"))
+        api_content = (os.path.join(api_root(mod.get("generate_api"), config, bp),
+                                    *package.replace("/Game/", "").split("/"))
                        if mod.get("generate_api") else None)
         api_missing = bool(api_content) and not staged_assets(api_content)
 
