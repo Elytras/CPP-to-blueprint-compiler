@@ -779,6 +779,10 @@ private:
     bool StructLayout(const FRecord& R, int32* Size, int32* Align, std::string* Err);
     bool LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FStmtIR>& Out,
                    std::vector<FPropertyDef>& Locals, std::string* Err);
+
+    /* A local this body declares, holds them all the uses of, and only ever reads: its constant initialiser can
+       stand in for every read (ParmConst), so neither the property nor its store is compiled. */
+    bool ReadOnlyLocal(const std::string& DeclId) const;
     bool LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR& Out, std::string* Err);
     bool LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vector<FStmtIR>& Out,
                        std::vector<FPropertyDef>& Locals, std::string* Err);
@@ -950,6 +954,7 @@ private:
     std::set<std::string> CurrentOutParms;            // T& parm names of the function being lowered
     bool bCurNet = false;                             // the function being lowered is an RPC
     bool bCurNoOpt = false;                           // ... is UE_NO_OPTIMIZE: no drops, no && / || fold
+    const Json* CurBody = nullptr;                    // the body LowerBody is walking: scope of the locals it declares
     std::set<std::string> WarnedRefParms;             // its reference parameters already warned about
 
     /* A write through an RPC's reference parameter: the receiving side gets a copy of the argument, so the caller sees
@@ -3215,6 +3220,37 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
 
 namespace
 {
+/*
+A constant worth using in place of a variable that holds it. Scalars only: their const opcode is smaller than the
+field path an EX_LocalVariable read carries and needs no property indirection at run time, while a string or a
+container const would be rebuilt (and reallocated) at every use, which is what the variable was saving.
+*/
+bool IsFoldableConst(const FArgIR& A)
+{
+    switch (A.K)
+    {
+    case FArgIR::Int: case FArgIR::Int64: case FArgIR::Float: case FArgIR::Bool:
+    case FArgIR::Byte: case FArgIR::Self: case FArgIR::NullObj: case FArgIR::ObjConst:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/*
+A value a statement may throw away. An unused statement value goes to the VM's 64-byte scratch buffer
+(ProcessLocalScriptFunction: "No POD struct can ever be stored in this buffer"), which is raw stack memory that
+nothing constructs, so only a trivially assignable type may land there; an FString or a container would be assigned
+over garbage. Every type below fits the buffer.
+*/
+bool IsDiscardable(const FPropertyDef& P)
+{
+    static const std::set<std::string> Simple = { "IntProperty", "Int64Property", "FloatProperty", "BoolProperty",
+                                                  "ByteProperty", "EnumProperty", "NameProperty", "ObjectProperty",
+                                                  "ClassProperty" };
+    return Simple.count(P.Type) != 0;
+}
+
 /* Whether evaluating an expression can change anything: a call that is not bPure, an intrinsic, a delegate. */
 bool CallsImpure(const FArgIR& A);
 bool CallsImpure(const FCallIR& C)
@@ -3266,8 +3302,9 @@ void NamesRead(const std::vector<FStmtIR>& Stmts, std::set<std::string>& Out, bo
     }
 }
 
-/* Removes the stores to a local in Unread; a value that calls something impure keeps its call as a statement. */
-void DropStores(std::vector<FStmtIR>& Stmts, const std::set<std::string>& Unread)
+/* Removes the stores to a local in Unread; a value that calls something impure keeps its call as a statement,
+   unless its result is one the VM cannot throw away (Constructed), in which case the whole store stays. */
+void DropStores(std::vector<FStmtIR>& Stmts, const std::set<std::string>& Unread, const std::set<std::string>& Constructed)
 {
     for (size_t I = 0; I < Stmts.size(); ++I)
     {
@@ -3276,12 +3313,13 @@ void DropStores(std::vector<FStmtIR>& Stmts, const std::set<std::string>& Unread
             if (*L)
             {
                 *L = std::make_shared<std::vector<FStmtIR>>(**L);
-                DropStores(**L, Unread);
+                DropStores(**L, Unread, Constructed);
             }
         if (!(St.K == FStmtIR::Assign || St.K == FStmtIR::Decl) || St.Var.K != FArgIR::Local || !Unread.count(St.Var.S)) continue;
         if (!(St.K == FStmtIR::Decl && !St.bHasValue) && CallsImpure(St.Value))
         {
             if (St.Value.K != FArgIR::Call || !St.Value.Sub) continue;      // ponytail: kept whole; only a direct call is unwrapped
+            if (Constructed.count(St.Var.S)) continue;                      // nowhere for the result to go but the local
             FStmtIR Call;
             Call.K = FStmtIR::StaticCall;
             Call.Call = *St.Value.Sub;
@@ -3299,6 +3337,8 @@ of self or another object is never dropped, since something outside the function
 */
 void FCompiler::DropUnusedLocals(std::vector<FStmtIR>& Stmts, std::vector<FPropertyDef>& Locals)
 {
+    std::set<std::string> Constructed;
+    for (const FPropertyDef& L : Locals) if (!IsDiscardable(L)) Constructed.insert(L.Name);
     for (;;)    // dropping `X = Y` can leave Y unread
     {
         std::set<std::string> Read;
@@ -3307,7 +3347,7 @@ void FCompiler::DropUnusedLocals(std::vector<FStmtIR>& Stmts, std::vector<FPrope
         std::set<std::string> Unread;
         for (const FPropertyDef& L : Locals) if (!Read.count(L.Name)) Unread.insert(L.Name);
         if (Unread.empty()) return;
-        DropStores(Stmts, Unread);
+        DropStores(Stmts, Unread, Constructed);
         auto Mentioned = [&](const FPropertyDef& L) {
             if (!Unread.count(L.Name)) return true;
             bool bStored = false;
@@ -3441,9 +3481,20 @@ bool FCompiler::LowerAwait(const Json& CallNode, FBlueprintClass& BP, FCallIR& O
     return true;
 }
 
+bool OnlyRead(const Json& N, const std::string& Id);
+int32 UsesOf(const Json& N, const std::string& Id);
+
+/*
+CurBody is this body, restored on the way out: C++ scoping puts every use of a local inside the body that
+declares it, so that is the whole scope ReadOnlyLocal has to read.
+*/
 bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FStmtIR>& Out,
                           std::vector<FPropertyDef>& Locals, std::string* Err)
 {
+    const Json* OuterBody = CurBody;
+    CurBody = &Body;
+    struct FRestore { const Json** Slot; const Json* Old; ~FRestore() { *Slot = Old; } } Restore{ &CurBody, OuterBody };
+
     bool bOk = true;
     ForEach(Body, [&](const Json& Raw) {
         if (!bOk) return;
@@ -3490,7 +3541,6 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 if (!TypeToProperty(VarType, VarName, 0, "local " + VarName, BP, &PD, Err))
                 { bOk = false; return; }
                 PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
-                Locals.push_back(PD);
 
                 Ds.K = FStmtIR::Decl;
                 Ds.Var.K = FArgIR::Local;
@@ -3503,6 +3553,17 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 {
                     Ds.bHasValue = true;
                     if (!LowerArg(*First(D), BP, Ds.Value, Err)) { bOk = false; return; }
+                    /* A constant nothing writes is used in place, the way an inlined parameter is (ExpandInline):
+                       the reads become the const and neither the property nor its store is compiled. A repeated
+                       expansion of the same inline function reaches this declaration again, so the binding a
+                       previous one left goes first. */
+                    const std::string DeclId = D.value("id", std::string());
+                    ParmConst.erase(DeclId);
+                    if (!bCurNoOpt && IsFoldableConst(Ds.Value) && ReadOnlyLocal(DeclId))
+                    {
+                        ParmConst[DeclId] = Ds.Value;
+                        return;
+                    }
                 }
                 else if (LoopDepth > 0 && !Ds.bHasValue)
                 {
@@ -3520,6 +3581,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                     Ds.Value.K = FArgIR::Local;
                     Ds.Value.S = Fresh;
                 }
+                Locals.push_back(PD);
                 Out.push_back(Ds);
             });
             if (!bAny && bOk) { *Err = "a declaration statement declares nothing usable"; bOk = false; }
@@ -3983,6 +4045,30 @@ bool OnlyRead(const Json& N, const std::string& Id)
     return bOk;
 }
 
+/* How many times N names the declaration Id. */
+int32 UsesOf(const Json& N, const std::string& Id)
+{
+    int32 Count = 0;
+    std::function<void(const Json&)> Walk = [&](const Json& X) {
+        if (!X.is_object()) return;
+        if (Kind(X) == "DeclRefExpr" && X.contains("referencedDecl") && X["referencedDecl"].value("id", std::string()) == Id)
+            ++Count;
+        ForEach(X, [&](const Json& C) { Walk(C); });
+    };
+    Walk(N);
+    return Count;
+}
+
+/*
+Folding a local into its uses needs all of them in hand: OnlyRead is vacuously true for a declaration whose uses
+are somewhere else, which is exactly a synthetic wrapper body (a `for` initialiser holds its counter alone, and the
+loop that increments it is a separate LowerBody). So the body must name the declaration at least once.
+*/
+bool FCompiler::ReadOnlyLocal(const std::string& DeclId) const
+{
+    return CurBody && UsesOf(*CurBody, DeclId) > 0 && OnlyRead(*CurBody, DeclId);
+}
+
 /* Every reference to Id only reads it: a copy (LValueToRValue, a copy construction) or a const view. A mutating method,
    a member access, `&`, or a non-const reference argument all fail. */
 bool OnlyReadValue(const Json& N, const std::string& Id)
@@ -4195,10 +4281,7 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
         FStmtIR Bind;
         if (!LowerArg(*Args[I], BP, Bind.Value, Err)) return false;
         /* A constant the body only reads is used in place: no local, no copy. */
-        const FArgIR::EKind VK = Bind.Value.K;
-        const bool bConst = VK == FArgIR::Int || VK == FArgIR::Int64 || VK == FArgIR::Float || VK == FArgIR::Bool
-                         || VK == FArgIR::Byte || VK == FArgIR::Self || VK == FArgIR::NullObj || VK == FArgIR::ObjConst;
-        if (bConst && OnlyRead(*Body, Id)) { ParmConst[Id] = Bind.Value; continue; }
+        if (IsFoldableConst(Bind.Value) && OnlyRead(*Body, Id)) { ParmConst[Id] = Bind.Value; continue; }
         if (!AddLocal(Local, Type)) return false;
         Bind.K = FStmtIR::Assign;
         Bind.Var.K = FArgIR::Local;

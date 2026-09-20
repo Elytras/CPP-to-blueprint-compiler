@@ -413,6 +413,10 @@ def optimizer():
     assert 'Multiply_IntInt' not in w and 'Add_IntInt' not in w and 'Kept' in w and 'RandomInteger' in w, w
     print('ok  OptTest: unused pure calls dropped, used ones kept')
     print('ok  OptTest.Locals: unread locals dropped, the property store and the impure call kept')
+    check('OptTest', 'Consts', lambda A: A * 3 + 3 + (10 + A), [dict(A=a) for a in (0, 4, -7)])
+    w = walk('Consts')
+    assert 'Three' not in w and 'Grows' in w, w
+    print('ok  OptTest.Consts: a read-only const local folds into its uses, a written one keeps its local')
     cdiv = lambda a, b: abs(a) // abs(b) * (1 if (a < 0) == (b < 0) else -1)
     check('OptTest', 'Logic', lambda X, Y: (1 if X != 0 and cdiv(10, X) > 2 else 0) + (2 if X != 0 and Y != 0 else 0)
           + (10 if X > 0 and cdiv(Y, 2) > 0 else 0) + (100 if X == 0 or Y == 0 else 0),
