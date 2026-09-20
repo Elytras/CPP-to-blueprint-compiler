@@ -91,15 +91,33 @@ def write_api_manifest(api_content):
         "".join(os.path.basename(f) + "\n" for f in sorted(staged_assets(api_content))))
 
 
-def api_root(mod, config, bp):
+API_UE_VERSION = "4.27"  # AssetGen writes UE4.27 packages; a UE5 project needs its own writer.
+
+
+def api_roots(mod, config, bp):
     """Where a `generate_api` mod's editor-side stubs go: its own `api_dir`, else the manifest's
-    top-level `api_dir` (the default for every mod), else the build tree. The path names an editor
-    project's Content folder (relative ones resolve against BpMods/), so a build updates that
-    project's API assets in place instead of leaving them to be copied by hand."""
-    root = mod.get("api_dir") or config.get("api_dir")
-    if not root:
-        return os.path.join(bp, "out", "api", "Content")
-    return os.path.abspath(os.path.join(bp, os.path.expandvars(root)))
+    top-level `api_dir` (the default for every mod), else the build tree. Each entry names an
+    editor project's Content folder (relative ones resolve against BpMods/), so a build updates
+    those projects' API assets in place instead of leaving them to be copied by hand.
+
+    An entry is a path, or a `{path: ..., ue: <version>}` mapping - several projects may want the
+    same library, and they need not run the same engine. Only 4.27 has a writer today, so a
+    version this build cannot produce is an error rather than a wrong package."""
+    spec = mod.get("api_dir") or config.get("api_dir")
+    if not spec:
+        return [os.path.join(bp, "out", "api", "Content")]
+
+    out = []
+    for entry in (spec if isinstance(spec, list) else [spec]):
+        path, ue = (entry, API_UE_VERSION) if not isinstance(entry, dict) else \
+                   (entry.get("path"), str(entry.get("ue", API_UE_VERSION)))
+        if not path:
+            sys.exit("mods.yaml: an `api_dir` entry has no `path`")
+        if ue != API_UE_VERSION:
+            sys.exit("mods.yaml: api_dir %s wants UE %s; assetgen writes %s only"
+                     % (path, ue, API_UE_VERSION))
+        out.append(os.path.abspath(os.path.join(bp, os.path.expandvars(path))))
+    return out
 
 
 def content_dir(stage_fsd, package):
@@ -225,10 +243,12 @@ def main():
 
         # `generate_api` writes the editor-side stub next to nothing else, so it has its own
         # staleness: turning the flag on for an already-built mod must still produce one.
-        api_content = (os.path.join(api_root(mod, config, bp),
-                                    *package.replace("/Game/", "").split("/"))
-                       if mod.get("generate_api") else None)
-        api_missing = bool(api_content) and not staged_assets(api_content)
+        # assetgen writes one `--api` dir; further ones are mirrors of it, filled after the compile.
+        api_contents = ([os.path.join(root, *package.replace("/Game/", "").split("/"))
+                         for root in api_roots(mod, config, bp)]
+                        if mod.get("generate_api") else [])
+        api_content = api_contents[0] if api_contents else None
+        api_missing = any(not staged_assets(d) for d in api_contents)
 
         stale = (force or not assets or api_missing
                  or max(newest(sources), toolchain_time) > oldest(assets))
@@ -238,16 +258,16 @@ def main():
             # An asset the sources no longer cook (a struct another mod now owns) must not stay in the pak.
             for old in assets:
                 os.remove(old)
-            if api_content:
-                if not os.path.isdir(api_content):
-                    os.makedirs(api_content)
+            for api_dir in api_contents:
+                if not os.path.isdir(api_dir):
+                    os.makedirs(api_dir)
                 else:
                     # A class the sources no longer expose to the API (now inline, actor-gated,
                     # or renamed) must not leave a stale stub the editor then loads and chokes on.
                     # Only ours go: `api_dir` usually points into a real project, where the same
                     # folder holds hand-made assets that must survive. The manifest is rewritten
                     # right after the compile, below.
-                    for old in api_manifest(api_content):
+                    for old in api_manifest(api_dir):
                         if os.path.exists(old):
                             os.remove(old)
             ok = True
@@ -265,15 +285,18 @@ def main():
                 print("%-16s FAILED" % name)
                 failed.append(name)
                 continue
-            if api_content:
-                write_api_manifest(api_content)
+            for api_dir in api_contents:
+                if api_dir != api_content:
+                    for f in staged_assets(api_content):
+                        shutil.copy2(f, os.path.join(api_dir, os.path.basename(f)))
+                write_api_manifest(api_dir)
             print("%-16s compiled -> %s" % (name, package))
             built.append(name)
 
-        if api_content:
+        for api_dir in api_contents:
             # relpath throws across drives - an `api_dir` on another one is perfectly normal.
-            shown = api_content if os.path.splitdrive(api_content)[0] != os.path.splitdrive(bp)[0] \
-                else os.path.relpath(api_content, bp)
+            shown = api_dir if os.path.splitdrive(api_dir)[0] != os.path.splitdrive(bp)[0] \
+                else os.path.relpath(api_dir, bp)
             print("%-16s api      -> %s" % (name, shown))
 
         records.append((mod, name, package, stage_fsd, stage_content, stale))
