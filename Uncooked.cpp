@@ -179,7 +179,8 @@ protected:
     }
 
     FIndex PackageImport(const std::string& Name);
-    FIndex Object(const std::string& Package, const std::string& ClassName, const std::string& ObjectName);
+    FIndex Object(const std::string& Package, const std::string& ClassName, const std::string& ObjectName,
+                  const std::string& ClassPackage = "/Script/CoreUObject");
     /* The same object as Source names it, re-imported here. False when its outer is not a plain
        package - a type that lives inside the mod's own package has no editor-side asset yet. */
     bool Remap(FIndex Src, FIndex& Out);
@@ -215,13 +216,13 @@ FIndex FEditorPackage::PackageImport(const std::string& Name)
 }
 
 FIndex FEditorPackage::Object(const std::string& Package, const std::string& ClassName,
-                          const std::string& ObjectName)
+                          const std::string& ObjectName, const std::string& ClassPackage)
 {
-    const std::string Key = Package + "|" + ClassName + "|" + ObjectName;
+    const std::string Key = ClassPackage + "|" + Package + "|" + ClassName + "|" + ObjectName;
     auto It = ImportCache.find(Key);
     if (It != ImportCache.end()) return Imp(It->second);
     const FIndex Outer = PackageImport(Package);
-    const int32 Row = P.AddImport({ "/Script/CoreUObject", ClassName, Outer, ObjectName });
+    const int32 Row = P.AddImport({ ClassPackage, ClassName, Outer, ObjectName });
     ImportCache.emplace(Key, Row);
     return Imp(Row);
 }
@@ -233,10 +234,10 @@ bool FEditorPackage::Remap(FIndex Src, FIndex& Out)
     if (!In) return false;
     const FImport* Outer = Source.ImportAt(In->Outer);
     if (!Outer || Outer->ClassName != "Package") return false;
-    /* A /Game type is another cooked asset of this mod - a UE_STRUCT or UE_ENUM. Those have no
-       uncooked counterpart yet, and an import of one would resolve to nothing in the editor. */
-    if (Outer->ObjectName.size() >= 6 && Outer->ObjectName.compare(0, 6, "/Game/") == 0) return false;
-    Out = Object(Outer->ObjectName, In->ClassName, In->ObjectName);
+    /* A /Game type is another of this mod's own assets - a UE_STRUCT / UE_ENUM. It now has an uncooked
+       stub emitted beside this one (same package path), so an import of it resolves in the editor: a
+       hard ref for a class variable's pin, a soft path (ObjectPath) for a struct member's VarDesc. */
+    Out = Object(Outer->ObjectName, In->ClassName, In->ObjectName, In->ClassPackage);
     return true;
 }
 
@@ -842,6 +843,54 @@ bool WriteApiStructAsset(const FApiStruct& Struct, const FPackage& Source, const
 {
     FApiStructWriter Writer(Struct, Source);
     return Writer.Write(OutDir, Err);
+}
+
+/* One UserDefinedEnum export. Measured against an editor-saved 4.27.2 UserDefinedEnum: tagged-props
+   terminator (the editor's DisplayNameMap stays empty and is rebuilt in PostLoad), a 4-byte zero
+   where the cooked writer drops a 1-byte bool, then UEnum::Names as (FName "<Enum>::<Entry>", int64)
+   pairs ending in the "<Enum>_MAX" sentinel, then ECppForm::Namespaced. */
+bool WriteApiEnumAsset(const FApiEnum& Enum, const std::string& OutDir, std::string* Err)
+{
+    FPackage P(Enum.PackageName);
+    const int32 EnginePkg = P.AddImport({ "/Script/CoreUObject", "Package", Null(), "/Script/Engine" });
+    const FIndex EnumClass = Imp(P.AddImport({ "/Script/CoreUObject", "Class", Imp(EnginePkg), "UserDefinedEnum" }));
+
+    uint32 PkgGuid[4];
+    MakeGuid(P.Name(), PkgGuid);
+    P.SetUncooked(true);
+    P.SetGuid(PkgGuid[0], PkgGuid[1], PkgGuid[2], PkgGuid[3]);
+
+    int64 Max = 0;
+    for (const auto& En : Enum.Entries) Max = std::max(Max, En.second + 1);
+    const std::string Prefix = Enum.EnumName;
+    const auto Entries = Enum.Entries;
+
+    FExport E;
+    E.ClassIndex = EnumClass;
+    E.OuterIndex = Null();
+    E.ObjectName = Enum.EnumName;
+    E.ObjectFlags = RF_Public | RF_Standalone | RF_Transactional;
+    E.bIsAsset = true;
+    E.Serialize = [=](FArc& Ar) {
+        TagEnd(Ar);
+        Ar.I32(0);
+        Ar.I32(int32(Entries.size() + 1));
+        for (const auto& [Name, Value] : Entries)
+        {
+            Ar.Name(Prefix + "::" + Name);
+            Ar.I64(Value);
+        }
+        Ar.Name(Prefix + "::" + Prefix + "_MAX");
+        Ar.I64(Max);
+        Ar.U8(1);                       // ECppForm::Namespaced
+    };
+    P.AddExport(std::move(E));
+
+    FRegistryObject Row;
+    Row.ObjectPath = Enum.EnumName;
+    Row.ClassName = "UserDefinedEnum";
+    P.SetRegistryObjects({ Row });
+    return P.Save(OutDir + "/" + Enum.EnumName, Err);
 }
 
 }   // namespace Uasset

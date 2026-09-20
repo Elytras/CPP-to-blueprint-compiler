@@ -5265,6 +5265,7 @@ bool FCompiler::GenerateEnum(const std::string& Name, const std::string& OutDir,
     FPackage P(PackageName);
     StampIdentity(P, PackageName);
     FBlueprintClass BP(P, Name, "", "", false);
+    if (!ApiDir.empty() && !BP.WriteApiEnum(ApiDir, ModEnums[Name], Err)) return false;
     BP.FinishEnum(ModEnums[Name]);
     if (!P.Save(OutDir + "/" + Name, Err)) return false;
     RegistryRows.push_back({ PackageName, Name, "UserDefinedEnum" });

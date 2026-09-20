@@ -10,6 +10,7 @@ graphs are therefore the payload: one function graph per callable, an entry node
 inputs and a result node holding the outputs, with no body between them.
 */
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "Package.h"
@@ -57,5 +58,17 @@ struct FApiStruct
 };
 
 bool WriteApiStructAsset(const FApiStruct& Struct, const FPackage& Source, const std::string& OutDir, std::string* Err);
+
+/* The editor-side half of a mod's UE_ENUM: an uncooked UserDefinedEnum. Enumerators are stored as
+   "<Enum>::<Entry>" (the C++ names, not the editor's NewEnumeratorN), ending in the "<Enum>_MAX"
+   sentinel - so a mod's own bytecode, which uses ordinals, and a consumer's editor pin agree. */
+struct FApiEnum
+{
+    std::string PackageName;                            // /Game/_ElytrasMods/StructTest/EMood
+    std::string EnumName;                               // EMood (the .uasset)
+    std::vector<std::pair<std::string, int64>> Entries; // enumerator name -> value, in declaration order
+};
+
+bool WriteApiEnumAsset(const FApiEnum& Enum, const std::string& OutDir, std::string* Err);
 
 }   // namespace Uasset

@@ -387,6 +387,17 @@ bool FBlueprintClass::WriteApiStruct(const std::string& OutDir, const uint32 (&G
     return WriteApiStructAsset(Api, P, OutDir, Err);
 }
 
+bool FBlueprintClass::WriteApiEnum(const std::string& OutDir,
+                                   const std::vector<std::pair<std::string, int64>>& Enumerators,
+                                   std::string* Err) const
+{
+    FApiEnum Api;
+    Api.EnumName = ClassName;
+    Api.PackageName = P.Name();
+    Api.Entries = Enumerators;
+    return WriteApiEnumAsset(Api, OutDir, Err);
+}
+
 void FBlueprintClass::FinishStruct(const uint32 (&Guid)[4])
 {
     const FIndex UdsClass = EngineClass("/Script/Engine", "UserDefinedStruct");
