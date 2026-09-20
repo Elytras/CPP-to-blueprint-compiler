@@ -239,15 +239,19 @@ void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
         else if (P.Type == "ArrayProperty")
         {
             V.I32(int32(D.Items.size()));
-            if (P.Inner) for (const FDefaultValue& Item : D.Items) WriteValue(V, *P.Inner, Item);
-            /* An array of structs carries an inner tag after the count, even when empty. */
+            /* An array of structs carries an inner tag between the count and the elements, even when
+               empty (FArrayProperty::SerializeItem; checked against an editor-saved array of two).
+               Its Size is the elements' byte count, so they are measured first. */
+            FArc Elements(V.Owner());
+            if (P.Inner) for (const FDefaultValue& Item : D.Items) WriteValue(Elements, *P.Inner, Item);
             if (P.Inner && P.Inner->Type == "StructProperty")
             {
-                V.Name(P.Name); V.Name("StructProperty"); V.I32(0); V.I32(0);
+                V.Name(P.Name); V.Name("StructProperty"); V.I32(int32(Elements.B.size())); V.I32(0);
                 V.Name(P.Inner->StructName);
                 for (int32 I = 0; I < 4; ++I) V.U32(0);
                 V.U8(0);
             }
+            V.Append(Elements);
         }
         else if (P.Type == "StructProperty")
         {
