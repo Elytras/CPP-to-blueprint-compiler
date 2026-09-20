@@ -1,5 +1,7 @@
 ﻿#include "Blueprint.h"
 
+#include "Uncooked.h"
+
 #include <algorithm>
 
 namespace Uasset
@@ -356,6 +358,25 @@ void FBlueprintClass::Finish()
 
 /* Measured on DRG's MM_ResourceInfo: Guid tag, empty UStruct body, StructFlags 0, then the default
    instance as a tag per member. */
+bool FBlueprintClass::WriteApi(const std::string& OutDir, std::string* Err) const
+{
+    FApiClass Api;
+    /* ClassName is the runtime "<Asset>_C"; the asset it belongs to drops that suffix. */
+    Api.AssetName = ClassName.size() > 2 && ClassName.compare(ClassName.size() - 2, 2, "_C") == 0
+                  ? ClassName.substr(0, ClassName.size() - 2) : ClassName;
+    Api.PackageName = P.Name().substr(0, P.Name().rfind('/'));
+    Api.ParentPackage = ParentPackage;
+    Api.ParentClass = ParentClass;
+    Api.bIsActor = bIsActor;
+    for (const FPending& Fn : Functions)
+        Api.Functions.push_back({ Fn.Def.Name, Fn.Def.Params, Fn.Def.FunctionFlags });
+    /* Only what the outside can see. The rest - the UberGraphFrame pointer above all - is
+       compiler plumbing that would show up as a broken variable in the editor. */
+    for (const FPropertyDef& Var : Vars)
+        if (Var.PropertyFlags & CPF_BlueprintVisible) Api.Variables.push_back(Var);
+    return WriteApiAsset(Api, P, OutDir, Err);
+}
+
 void FBlueprintClass::FinishStruct(const uint32 (&Guid)[4])
 {
     const FIndex UdsClass = EngineClass("/Script/Engine", "UserDefinedStruct");

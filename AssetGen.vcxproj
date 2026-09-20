@@ -78,6 +78,7 @@
     <ClInclude Include="Package.h" />
     <ClInclude Include="Registry.h" />
     <ClInclude Include="Script.h" />
+    <ClInclude Include="Uncooked.h" />
     <ClInclude Include="UeEnums.h" />
   </ItemGroup>
   <ItemGroup>
@@ -87,6 +88,7 @@
     <ClCompile Include="Package.cpp" />
     <ClCompile Include="Registry.cpp" />
     <ClCompile Include="Script.cpp" />
+    <ClCompile Include="Uncooked.cpp" />
   </ItemGroup>
   <!-- Mod sources and the generated UeApi headers live in BpMods\, outside this project: they are
        input to assetgen.exe and to clang, never compiled into the tool itself. -->

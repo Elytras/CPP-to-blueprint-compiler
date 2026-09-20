@@ -62,6 +62,10 @@ public:
 
     void Finish();
 
+    /* The editor-side stub of this class: <OutDir>/<asset>.uasset, signatures only (Uncooked.h).
+       Call after Finish(), while the cooked package still holds the imports the parameters name. */
+    bool WriteApi(const std::string& OutDir, std::string* Err) const;
+
     /* Writes the package as one UserDefinedStruct export whose members are the AddVariable()s. */
     void FinishStruct(const uint32 (&Guid)[4]);
 
