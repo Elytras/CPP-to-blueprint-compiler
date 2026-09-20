@@ -377,6 +377,16 @@ bool FBlueprintClass::WriteApi(const std::string& OutDir, std::string* Err) cons
     return WriteApiAsset(Api, P, OutDir, Err);
 }
 
+bool FBlueprintClass::WriteApiStruct(const std::string& OutDir, const uint32 (&Guid)[4], std::string* Err) const
+{
+    FApiStruct Api;
+    Api.StructName = ClassName;
+    Api.PackageName = P.Name();          // the cooked struct's own package path, reused for the stub
+    Api.Members = Vars;
+    for (int32 I = 0; I < 4; ++I) Api.Guid[I] = Guid[I];
+    return WriteApiStructAsset(Api, P, OutDir, Err);
+}
+
 void FBlueprintClass::FinishStruct(const uint32 (&Guid)[4])
 {
     const FIndex UdsClass = EngineClass("/Script/Engine", "UserDefinedStruct");

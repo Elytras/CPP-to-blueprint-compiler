@@ -2,9 +2,11 @@
 // K2Node_EditablePinBase.cpp, and checked against an editor-saved 4.27.2 Blueprint byte for byte.
 #include "Uncooked.h"
 
+#include <cctype>
 #include <cstdio>
 #include <map>
 #include <memory>
+#include <string>
 
 namespace Uasset
 {
@@ -166,17 +168,16 @@ void WriteNodeTail(FArc& Ar, int32 NodeExport, const std::vector<FPinDef>& Pins,
 
 /* ---- the writer ---- */
 
-class FApiWriter
+/* Shared editor-side package plumbing: the import table this stub builds, and the type mapping from
+   a cooked FPropertyDef (which carries FIndexes into the cooked Source package) to an editor pin. */
+class FEditorPackage
 {
-public:
-    FApiWriter(const FApiClass& InClass, const FPackage& InSource)
-        : Class(InClass), Source(InSource), P(InClass.PackageName + "/" + InClass.AssetName)
+protected:
+    FEditorPackage(const FPackage& InSource, std::string PkgPath)
+        : Source(InSource), P(std::move(PkgPath))
     {
     }
 
-    bool Write(const std::string& OutDir, std::string* Err);
-
-private:
     FIndex PackageImport(const std::string& Name);
     FIndex Object(const std::string& Package, const std::string& ClassName, const std::string& ObjectName);
     /* The same object as Source names it, re-imported here. False when its outer is not a plain
@@ -184,13 +185,26 @@ private:
     bool Remap(FIndex Src, FIndex& Out);
     bool PinTypeOf(const FPropertyDef& Prop, FPinType& Out);
 
-    const FApiClass& Class;
     const FPackage& Source;
     FPackage P;
     std::map<std::string, int32> ImportCache;
 };
 
-FIndex FApiWriter::PackageImport(const std::string& Name)
+class FApiWriter : public FEditorPackage
+{
+public:
+    FApiWriter(const FApiClass& InClass, const FPackage& InSource)
+        : FEditorPackage(InSource, InClass.PackageName + "/" + InClass.AssetName), Class(InClass)
+    {
+    }
+
+    bool Write(const std::string& OutDir, std::string* Err);
+
+private:
+    const FApiClass& Class;
+};
+
+FIndex FEditorPackage::PackageImport(const std::string& Name)
 {
     const std::string Key = "pkg|" + Name;
     auto It = ImportCache.find(Key);
@@ -200,7 +214,7 @@ FIndex FApiWriter::PackageImport(const std::string& Name)
     return Imp(Row);
 }
 
-FIndex FApiWriter::Object(const std::string& Package, const std::string& ClassName,
+FIndex FEditorPackage::Object(const std::string& Package, const std::string& ClassName,
                           const std::string& ObjectName)
 {
     const std::string Key = Package + "|" + ClassName + "|" + ObjectName;
@@ -212,7 +226,7 @@ FIndex FApiWriter::Object(const std::string& Package, const std::string& ClassNa
     return Imp(Row);
 }
 
-bool FApiWriter::Remap(FIndex Src, FIndex& Out)
+bool FEditorPackage::Remap(FIndex Src, FIndex& Out)
 {
     if (Src.V == 0) { Out = Null(); return true; }
     const FImport* In = Source.ImportAt(Src);
@@ -226,7 +240,7 @@ bool FApiWriter::Remap(FIndex Src, FIndex& Out)
     return true;
 }
 
-bool FApiWriter::PinTypeOf(const FPropertyDef& Prop, FPinType& Out)
+bool FEditorPackage::PinTypeOf(const FPropertyDef& Prop, FPinType& Out)
 {
     const std::string& T = Prop.Type;
     if (T == "BoolProperty") Out.Category = "bool";
@@ -609,12 +623,224 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
 
     return P.Save(OutDir + "/" + Class.AssetName, Err);
 }
+
+/* One StructVariableDescription the editor recompiles a member from. */
+struct FVarDesc
+{
+    std::string Name;            // GUID-suffixed compiled name (== the cooked layout's field name)
+    uint32 Guid[4] = { 0, 0, 0, 0 };
+    std::string Friendly;        // clean C++ field name, for the details panel
+    FPinType Type;
+    std::string SubObjPath;      // SoftObjectPath to the pin's SubCategoryObject, empty when none
+};
+
+/* The 32-hex tail of a compiled member name is the field's FGuid (FMemberVariableNameHelper::Generate
+   wrote <Friendly>_<UniqueId>_<Guid32hex>). Parse it back so VarGuid and VarName name the same GUID and
+   the editor's GetGuidFromName resolves the member; recover the clean friendly name from the middle. */
+bool GuidFromName(const std::string& Name, uint32 (&Out)[4], std::string& Friendly)
+{
+    if (Name.size() < 34 || Name[Name.size() - 33] != '_') return false;
+    const std::string Hex = Name.substr(Name.size() - 32);
+    for (char C : Hex) if (!std::isxdigit(static_cast<unsigned char>(C))) return false;
+    for (int32 I = 0; I < 4; ++I) Out[I] = uint32(std::stoul(Hex.substr(I * 8, 8), nullptr, 16));
+    const std::string Base = Name.substr(0, Name.size() - 33);      // drop "_<32hex>"
+    const size_t U = Base.rfind('_');                              // drop "_<UniqueId>"
+    Friendly = U != std::string::npos ? Base.substr(0, U) : Base;
+    return true;
+}
+
+/* FSoftObjectPath: an FName asset path plus an (always empty here) sub-path FString. */
+void WriteSoftObject(FArc& Ar, const std::string& Path)
+{
+    Ar.Name(Path.empty() ? "None" : Path);
+    Ar.I32(0);
+}
+
+/* FEdGraphTerminalType, the map value half, as tagged properties. All-None for a non-map pin. */
+void WriteTerminalType(FArc& Ar, const FPinType& T)
+{
+    const FPinType* V = (T.Container == 3 && T.ValueType) ? T.ValueType.get() : nullptr;
+    Tag(Ar, "TerminalCategory", "NameProperty", [&](FArc& E) { E.Name(V ? V->Category : "None"); });
+    Tag(Ar, "TerminalSubCategory", "NameProperty",
+        [&](FArc& E) { E.Name(V && !V->SubCategory.empty() ? V->SubCategory : "None"); });
+    Tag(Ar, "TerminalSubCategoryObject", "ObjectProperty",
+        [&](FArc& E) { E.Idx(V ? V->SubCategoryObject : Null()); });
+    TagBool(Ar, "bTerminalIsConst", V ? V->bIsConst : false);
+    TagBool(Ar, "bTerminalIsWeakPointer", false);
+    TagBool(Ar, "bTerminalIsUObjectWrapper", false);
+    TagEnd(Ar);
+}
+
+/* One array element. An array's struct elements serialize with no CDO to delta against, so every
+   field is written even at its default - the order and full set are what the editor reads back. */
+void WriteVarDesc(FArc& Ar, const FVarDesc& VD)
+{
+    Tag(Ar, "VarName", "NameProperty", [&](FArc& E) { E.Name(VD.Name); });
+    Tag(Ar, "VarGuid", "StructProperty", [&](FArc& E) { E.Raw(VD.Guid, 16); }, "Guid");
+    Tag(Ar, "FriendlyName", "StrProperty", [&](FArc& E) { E.Str(VD.Friendly); });
+    Tag(Ar, "DefaultValue", "StrProperty", [](FArc& E) { E.I32(0); });
+    Tag(Ar, "Category", "NameProperty", [&](FArc& E) { E.Name(VD.Type.Category); });
+    Tag(Ar, "SubCategory", "NameProperty",
+        [&](FArc& E) { E.Name(VD.Type.SubCategory.empty() ? "None" : VD.Type.SubCategory); });
+    Tag(Ar, "SubCategoryObject", "SoftObjectProperty", [&](FArc& E) { WriteSoftObject(E, VD.SubObjPath); });
+    Tag(Ar, "PinValueType", "StructProperty", [&](FArc& E) { WriteTerminalType(E, VD.Type); }, "EdGraphTerminalType");
+    Tag(Ar, "ContainerType", "EnumProperty", [&](FArc& E) {
+        static const char* const Kinds[] = { "None", "Array", "Set", "Map" };
+        E.Name(std::string("EPinContainerType::") + Kinds[VD.Type.Container & 3]);
+    }, "EPinContainerType");
+    TagBool(Ar, "bDontEditOnInstance", false);
+    TagBool(Ar, "bEnableSaveGame", false);
+    TagBool(Ar, "bEnableMultiLineText", false);
+    TagBool(Ar, "bEnable3dWidget", false);
+    Tag(Ar, "CurrentDefaultValue", "StrProperty", [](FArc& E) { E.I32(0); });
+    Tag(Ar, "ToolTip", "StrProperty", [](FArc& E) { E.I32(0); });
+    TagEnd(Ar);
+}
+
+/* Emits the two-export uncooked UserDefinedStruct: the compiled body (same GUID-suffixed member names
+   as the cooked asset, plus an EditorData tag) and the UserDefinedStructEditorData the editor rebuilds
+   from. Measured against an editor-saved 4.27.2 UserDefinedStruct. */
+class FApiStructWriter : public FEditorPackage
+{
+public:
+    FApiStructWriter(const FApiStruct& InStruct, const FPackage& InSource)
+        : FEditorPackage(InSource, InStruct.PackageName), Struct(InStruct)
+    {
+    }
+
+    bool Write(const std::string& OutDir, std::string* Err);
+
+private:
+    std::string ObjectPath(FIndex InP);
+    const FApiStruct& Struct;
+};
+
+/* A hard import in P resolved to its "<OuterPackage>.<Object>" path, for a soft reference. */
+std::string FApiStructWriter::ObjectPath(FIndex InP)
+{
+    if (InP.V == 0) return "";
+    const FImport* Im = P.ImportAt(InP);
+    if (!Im) return "";
+    const FImport* Outer = P.ImportAt(Im->Outer);
+    return (Outer ? Outer->ObjectName : "") + "." + Im->ObjectName;
+}
+
+bool FApiStructWriter::Write(const std::string& OutDir, std::string* Err)
+{
+    /* The editor recompiles the struct from the VarDescs, so the compiled body must hold exactly the
+       members the VarDescs do. A member skipped here (its type has no editor-side asset) is dropped
+       from both, or its compiled StructProperty would dangle and crash FStructProperty::LinkInternal. */
+    std::vector<FVarDesc> Descs;
+    std::vector<FPropertyDef> Members;
+    for (const FPropertyDef& M : Struct.Members)
+    {
+        FVarDesc VD;
+        VD.Name = M.Name;
+        if (!GuidFromName(M.Name, VD.Guid, VD.Friendly))
+        {
+            if (Err) *Err = Struct.StructName + ": member " + M.Name + " has no GUID suffix";
+            return false;
+        }
+        if (!PinTypeOf(M, VD.Type))
+        {
+            /* A member whose type is another mod's UE_STRUCT / UE_ENUM has no editor-side asset to
+               point a pin at yet (Remap rejects a /Game outer). Skip it with a note - the same gap
+               the class writer prints for such a variable - rather than emit a half-typed member. */
+            printf("  %-14s skipped member %s: type has no editor-side asset yet\n",
+                   Struct.StructName.c_str(), VD.Friendly.c_str());
+            continue;
+        }
+        VD.SubObjPath = ObjectPath(VD.Type.SubCategoryObject);
+        Descs.push_back(std::move(VD));
+        Members.push_back(M);
+    }
+    if (Descs.empty())
+    {
+        if (Err) *Err = Struct.StructName + ": no member has an editor-side type yet";
+        return false;
+    }
+
+    const FIndex ImpUds = Object("/Script/Engine", "Class", "UserDefinedStruct");
+    const FIndex ImpEditorData = Object("/Script/UnrealEd", "Class", "UserDefinedStructEditorData");
+
+    uint32 PkgGuid[4];
+    MakeGuid(P.Name(), PkgGuid);
+    P.SetUncooked(true);
+    P.SetGuid(PkgGuid[0], PkgGuid[1], PkgGuid[2], PkgGuid[3]);
+
+    const int32 ExStruct = 0, ExEditorData = 1;
+    uint32 StructGuid[4] = { Struct.Guid[0], Struct.Guid[1], Struct.Guid[2], Struct.Guid[3] };
+
+    FExport S;
+    S.ClassIndex = ImpUds;
+    S.OuterIndex = Null();
+    S.ObjectName = Struct.StructName;
+    S.ObjectFlags = RF_Public | RF_Standalone | RF_Transactional;
+    S.bIsAsset = true;
+    S.Serialize = [=](FArc& Ar) {
+        Tag(Ar, "EditorData", "ObjectProperty", [=](FArc& V) { V.Idx(Exp(ExEditorData)); });
+        Tag(Ar, "Guid", "StructProperty", [=](FArc& V) { V.Guid(StructGuid); }, "Guid");
+        TagEnd(Ar);
+        Ar.Bool(false);
+
+        Ar.Idx(Null());                         // SuperStruct
+        Ar.I32(0);                              // Children (empty UField array)
+        Ar.I32(int32(Members.size()));          // ChildProperties
+        for (const FPropertyDef& M : Members) WriteProperty(Ar, M, /*bUncooked=*/true);
+        Ar.I32(0);                              // bytecode size
+        Ar.I32(0);                              // bytecode storage
+        Ar.U32(0);                              // StructFlags
+        for (const FPropertyDef& M : Members) WriteDefaultTag(Ar, M);
+        TagEnd(Ar);
+    };
+    P.AddExport(std::move(S));
+
+    const std::vector<FVarDesc> VarDescs = Descs;
+    FExport ED;
+    ED.ClassIndex = ImpEditorData;
+    ED.OuterIndex = Exp(ExStruct);
+    ED.ObjectName = "UserDefinedStructEditorData_0";
+    ED.ObjectFlags = RF_Transactional;
+    ED.Serialize = [=](FArc& Ar) {
+        Tag(Ar, "UniqueNameId", "UInt32Property", [=](FArc& V) { V.U32(uint32(VarDescs.size())); });
+        Tag(Ar, "VariablesDescriptions", "ArrayProperty", [=](FArc& V) {
+            FArc Elements(V.Owner());
+            for (const FVarDesc& VD : VarDescs) WriteVarDesc(Elements, VD);
+            V.I32(int32(VarDescs.size()));
+            V.Name("VariablesDescriptions");
+            V.Name("StructProperty");
+            V.I32(int32(Elements.B.size()));
+            V.I32(0);                           // ArrayIndex
+            V.Name("StructVariableDescription");
+            for (int32 I = 0; I < 4; ++I) V.U32(0);     // StructGuid
+            V.U8(0);                            // HasPropertyGuid
+            V.Append(Elements);
+        }, "StructProperty");
+        TagEnd(Ar);
+        Ar.Bool(false);
+    };
+    P.AddExport(std::move(ED));
+
+    FRegistryObject Row;
+    Row.ObjectPath = Struct.StructName;
+    Row.ClassName = "UserDefinedStruct";
+    P.SetRegistryObjects({ Row });
+
+    return P.Save(OutDir + "/" + Struct.StructName, Err);
+}
 }   // namespace
 
 bool WriteApiAsset(const FApiClass& Class, const FPackage& Source, const std::string& OutDir,
                    std::string* Err)
 {
     FApiWriter Writer(Class, Source);
+    return Writer.Write(OutDir, Err);
+}
+
+bool WriteApiStructAsset(const FApiStruct& Struct, const FPackage& Source, const std::string& OutDir,
+                         std::string* Err)
+{
+    FApiStructWriter Writer(Struct, Source);
     return Writer.Write(OutDir, Err);
 }
 

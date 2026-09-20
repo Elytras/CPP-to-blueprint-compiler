@@ -69,6 +69,10 @@ public:
     /* Writes the package as one UserDefinedStruct export whose members are the AddVariable()s. */
     void FinishStruct(const uint32 (&Guid)[4]);
 
+    /* The editor-side stub of this struct: an uncooked UserDefinedStruct with the same GUID-suffixed
+       member names. Same Guid as FinishStruct so the cooked and editor assets share identity. */
+    bool WriteApiStruct(const std::string& OutDir, const uint32 (&Guid)[4], std::string* Err) const;
+
     /* Writes the package as one UserDefinedEnum export: <ClassName>::<Enumerator> = value, then <ClassName>_MAX. */
     void FinishEnum(const std::vector<std::pair<std::string, int64>>& Enumerators);
 

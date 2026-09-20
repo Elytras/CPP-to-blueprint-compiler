@@ -65,7 +65,9 @@ FPropertyDef InterfaceParam(const std::string& Name, FIndex InterfaceClass, uint
 /* An event dispatcher. Extra = its <Name>__DelegateSignature function. */
 FPropertyDef DispatcherParam(const std::string& Name, FIndex Signature, uint64 ExtraFlags = 0);
 
-void WriteProperty(FArc& Ar, const FPropertyDef& P);
+/* bUncooked=true adds the editor-only per-field metadata flag (FField::Serialize writes it when not
+   cooking); the cooked layout leaves it off. */
+void WriteProperty(FArc& Ar, const FPropertyDef& P, bool bUncooked = false);
 
 /* The property as a tagged-property entry holding P.Default (its zero value when unset). */
 void WriteDefaultTag(FArc& Ar, const FPropertyDef& P);

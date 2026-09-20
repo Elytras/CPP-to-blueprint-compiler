@@ -42,4 +42,20 @@ asset yet, so its function is skipped with a line on stdout rather than emitted 
 */
 bool WriteApiAsset(const FApiClass& Class, const FPackage& Source, const std::string& OutDir, std::string* Err);
 
+/*
+The editor-side half of a mod's UE_STRUCT: an uncooked UserDefinedStruct carrying the same
+GUID-suffixed compiled member names as the cooked asset, plus the UserDefinedStructEditorData the
+editor recompiles from. VarGuid in each StructVariableDescription is the 32-hex tail of the member
+name, so the editor's GetGuidFromName resolves the member to the same GUID our bytecode references.
+*/
+struct FApiStruct
+{
+    std::string PackageName;            // /Game/_ElytrasMods/StructTest/FStats  (same path the cooked asset uses)
+    std::string StructName;             // FStats (the .uasset)
+    std::vector<FPropertyDef> Members;  // GUID-suffixed compiled names, exactly as the cooked layout
+    uint32 Guid[4] = { 0, 0, 0, 0 };    // the struct Guid tag, matching the cooked FinishStruct
+};
+
+bool WriteApiStructAsset(const FApiStruct& Struct, const FPackage& Source, const std::string& OutDir, std::string* Err);
+
 }   // namespace Uasset

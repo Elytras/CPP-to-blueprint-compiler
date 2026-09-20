@@ -277,12 +277,15 @@ void WriteDefaultTag(FArc& Ar, const FPropertyDef& P)
     Tag(Ar, P.Name, P.Type, [&](FArc& V) { WriteValue(V, P, D); }, P.StructName);
 }
 
-void WriteProperty(FArc& Ar, const FPropertyDef& P)
+void WriteProperty(FArc& Ar, const FPropertyDef& P, bool bUncooked)
 {
     Ar.Name(P.Type);
 
     Ar.Name(P.Name);                    // FField::Serialize
     Ar.U32(P.ObjectFlags);
+    // An uncooked (editor) package serializes a per-field metadata map; a cooked one strips it
+    // (FField::Serialize gates it on !IsCooking). Every FField carries the flag, inner ones too.
+    if (bUncooked) Ar.Bool(false);      // bHasMetaData
 
     Ar.I32(P.ArrayDim);                 // FProperty::Serialize
     Ar.I32(P.ElementSize);
@@ -319,14 +322,14 @@ void WriteProperty(FArc& Ar, const FPropertyDef& P)
     else if (P.Type == "EnumProperty")
     {
         Ar.Idx(P.Extra);                // Enum
-        WriteProperty(Ar, *P.Inner);    // UnderlyingProp, through SerializeSingleField
+        WriteProperty(Ar, *P.Inner, bUncooked);    // UnderlyingProp, through SerializeSingleField
     }
     else if (P.Type == "ArrayProperty" || P.Type == "SetProperty")
-        WriteProperty(Ar, *P.Inner);    // SerializeSingleField: type name then the field
+        WriteProperty(Ar, *P.Inner, bUncooked);    // SerializeSingleField: type name then the field
     else if (P.Type == "MapProperty")
     {
-        WriteProperty(Ar, *P.Inner);    // KeyProp
-        WriteProperty(Ar, *P.Value);    // ValueProp
+        WriteProperty(Ar, *P.Inner, bUncooked);    // KeyProp
+        WriteProperty(Ar, *P.Value, bUncooked);    // ValueProp
     }
     // TODO: unimplemented tail - DelegateProperty (SignatureFunction).
 }

@@ -5245,6 +5245,10 @@ bool FCompiler::GenerateStruct(const FRecord& R, const std::string& OutDir, std:
 
     const uint32 H = StrCrc32(PackageName);
     const uint32 Guid[4] = { ~H, H * 2654435761u, H ^ 0x9E3779B9u, H };
+    /* The editor stub reads the members before FinishStruct consumes them; both share the same Guid,
+       so the cooked and uncooked assets carry identical member names and struct identity. */
+    if (!ApiDir.empty() && !IsInternalViewStruct(R.CppName) && !BP.WriteApiStruct(ApiDir, Guid, Err))
+        return false;
     BP.FinishStruct(Guid);
     if (!P.Save(OutDir + "/" + R.CppName, Err)) return false;
     RegistryRows.push_back({ PackageName, R.CppName, "UserDefinedStruct" });
