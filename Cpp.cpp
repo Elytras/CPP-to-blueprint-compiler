@@ -28,6 +28,30 @@ using Json = nlohmann::json;
 std::string Kind(const Json& N) { return N.value("kind", std::string()); }
 std::string Name(const Json& N) { return N.value("name", std::string()); }
 
+/* A UserDefinedStruct field's real FName is FMemberVariableNameHelper::Generate's output -
+   <Friendly>_<UniqueId>_<Guid32hex>. We mint it deterministically from (struct package, field) so
+   the cooked layout, every FFieldPath that references the field, and (later) the editor VarGuid all
+   spell the byte-identical name. Forcing the suffix on every mod-struct field keeps us off the
+   WITH_EDITOR authored-name fallback and matches what the editor itself would write. Native
+   ScriptStructs have no suffix, so they keep their plain C++ field names. */
+std::string ModFieldName(const std::string& StructPkg, const std::string& Field)
+{
+    const uint32 H = StrCrc32(StructPkg + "." + Field);
+    const uint32 G[4] = { ~H, H * 2654435761u, H ^ 0x9E3779B9u, H };
+    char Guid[33];
+    std::snprintf(Guid, sizeof Guid, "%08X%08X%08X%08X", G[0], G[1], G[2], G[3]);
+    return Field + "_" + std::to_string(H % 1000000u) + "_" + Guid;
+}
+
+/* FDeref and FDerefTextView are the compiler's own read-hoist plumbing: their fields are referenced
+   by fixed names from hardcoded emit sites (ViewFieldOf, the __DerefScratch__ prologue), never
+   through user field access, so they must keep their plain C++ names on both the cooked layout and
+   every reference. ponytail: explicit two-name list; extend if another internal view struct appears. */
+bool IsInternalViewStruct(const std::string& CppName)
+{
+    return CppName == "FDeref" || CppName == "FDerefTextView";
+}
+
 const Json* First(const Json& N)
 {
     auto It = N.find("inner");
@@ -1861,7 +1885,9 @@ bool FCompiler::LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& 
     {
         if (!ObjRaw) { *Err = "struct member access with no object: " + Name(MemberNode); return false; }
         Out.K = FArgIR::Member;
-        Out.S = Name(MemberNode);
+        Out.S = (R->IsNative() || IsInternalViewStruct(R->CppName))
+                    ? Name(MemberNode)
+                    : ModFieldName(ModPackage + "/" + R->CppName, Name(MemberNode));
         Out.Owner = R->IsNative() ? BP.ScriptStruct(R->UePackage, R->UeName)
                                   : BP.ScriptStruct(ModPackage + "/" + R->CppName, R->CppName);
         Out.LetOp = LetOpFor(TypeOf(MemberNode));
@@ -2953,6 +2979,29 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         else if (LhsC == "uint8" && RhsC == "uint8")         Flavour = "ByteByte";
         else if (LhsC == "bool" && RhsC == "bool")           Flavour = "BoolBool";
         else                                                 Flavour = "IntInt";
+        if (Op == "<<" || Op == ">>")
+        {
+            if (Kind(*RhsRaw) != "IntegerLiteral")
+            { *Err = "bit shift with a non-constant amount (Kismet has no shift op; use explicit multiply/divide)"; return false; }
+            const int N = std::stoi(RhsRaw->value("value", std::string("0")));
+            if (N < 0 || N > 63)
+            { *Err = "bit shift amount out of range: " + std::to_string(N); return false; }
+            const bool bWide = Flavour == "Int64Int64";
+            const std::string MathFn = (Op == "<<" ? "Multiply_" : "Divide_") + std::string(bWide ? "Int64Int64" : "IntInt");
+            Out.K = FArgIR::Call;
+            Out.Sub = std::make_shared<FCallIR>();
+            Out.Sub->Fn = BP.EngineFunction("/Script/Engine", "KismetMathLibrary", MathFn);
+            Out.Sub->bScript = false;
+            Out.Sub->bPure = true;
+            FArgIR LA, RA;
+            if (!LowerArg(*LhsRaw, BP, LA, Err)) return false;
+            RA.K = bWide ? FArgIR::Int64 : FArgIR::Int;
+            RA.I = int32(1LL << N);
+            RA.I64 = 1LL << N;
+            Out.Sub->Args.push_back(std::move(LA));
+            Out.Sub->Args.push_back(std::move(RA));
+            return true;
+        }
         const std::string MathFn = MathFuncFor(Op, Flavour);
         if (MathFn.empty())
         { *Err = "TODO: unimplemented binary operator " + Op + " on " + Flavour; return false; }
@@ -3069,7 +3118,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
             });
             Out.bPure = !bOutParm && (IsPureDecl(*Decl->second) || (Def != R->MethodDefs.end() && IsPureDecl(*Def->second)));
         }
-        if (!R->IsNative() && Decl != R->Methods.end() && IsInlineMethod(*R, MethodName))
+        if (Decl != R->Methods.end() && IsInlineMethod(*R, MethodName))
         {
             auto DefIt = R->MethodDefs.find(MethodName);
             return ExpandInline(CallExprNode, DefIt != R->MethodDefs.end() ? *DefIt->second : *Decl->second,
@@ -5186,7 +5235,9 @@ bool FCompiler::GenerateStruct(const FRecord& R, const std::string& OutDir, std:
     for (const Json* F : R.Fields)
     {
         FPropertyDef PD;
-        if (!TypeToProperty(TypeOf(*F), Name(*F), 0, "member " + Name(*F), BP, &PD, Err)) return false;
+        const std::string Field = IsInternalViewStruct(R.CppName) ? Name(*F)
+                                                                  : ModFieldName(PackageName, Name(*F));
+        if (!TypeToProperty(TypeOf(*F), Field, 0, "member " + Name(*F), BP, &PD, Err)) return false;
         if (!LowerDefault(*F, PD, BP, Err)) return false;
         PD.PropertyFlags = CPF_Edit | CPF_BlueprintVisible;
         BP.AddVariable(PD);
