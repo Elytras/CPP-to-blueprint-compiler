@@ -42,6 +42,8 @@ def load(base):
     for _ in range(icount):
         im.o += 8; cls = names[im.i32()]; im.o += 4
         outer = im.i32(); obj = names[im.i32()]; im.o += 4
+        # Uncooked: FObjectImport carries an editor-only PackageName FName (VER_UE4_NON_OUTER_PACKAGE_IMPORT).
+        if not (flags & 0x80000000): im.o += 8
         imports.append(f"{cls}'{obj}'")
     exports = []
     ex = R(ua, eoff)
@@ -52,6 +54,9 @@ def load(base):
         fl = ex.u32(); size, off = ex.i64(), ex.i64()
         ex.o += 12 + 20 + 8 + 4 + 16
         exports.append(dict(name=nm, cls=ci, super=si, tmpl=ti, outer=oi, flags=fl, size=size, off=off))
+    # An uncooked package is one file: payloads sit in the .uasset at absolute offsets, so hand
+    # callers the same (blob, base) pair a cooked pair gives them.
+    if not ue: ue, total = ua, 0
     return ua, ue, total, names, imports, exports
 
 def pidx(v, imports, exports):

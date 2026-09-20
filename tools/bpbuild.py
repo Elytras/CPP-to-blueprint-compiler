@@ -3,6 +3,7 @@
 import io
 import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -35,7 +36,9 @@ def mod_package(source):
 
 
 def order(mods):
-    """Declaration order, except that a mod listed in someone's `needs` is built first."""
+    """Declaration order, except that a mod listed in someone's `needs` is built first.
+    A `needs` cycle (two mods that embed each other) is not an error: compile is one pass and
+    pack another, so the cyclic edge is just broken here and both still compile before either paks."""
     by_name = dict((m["name"], m) for m in mods)
     out, state = [], {}
 
@@ -43,7 +46,7 @@ def order(mods):
         if state.get(name) == 2:
             return
         if state.get(name) == 1:
-            sys.exit("cycle in mods.yaml `needs`: %s" % " -> ".join(trail + [name]))
+            return  # back-edge (cycle) - break it; order among the pair doesn't matter to compile
         if name not in by_name:
             sys.exit("mods.yaml: `needs` names an unknown mod: %s" % name)
         state[name] = 1
@@ -55,6 +58,42 @@ def order(mods):
     for m in mods:
         place(m["name"], [])
     return out
+
+
+def transitive_needs(name, by_name, seen=None):
+    """Every mod reachable through `needs`, deepest first, each once. `seen` starts holding the
+    root so a `needs` cycle terminates and a mod never lists itself as its own embed dep."""
+    seen = {name} if seen is None else seen
+    out = []
+    for dep in by_name[name].get("needs") or []:
+        if dep in seen:
+            continue
+        seen.add(dep)
+        out += transitive_needs(dep, by_name, seen) + [dep]
+    return out
+
+
+def content_dir(stage_fsd, package):
+    return os.path.join(stage_fsd, "Content", *package.replace("/Game/", "").split("/"))
+
+
+def dep_stage(dep, by_name, bp):
+    """Where dep's cooked assets sit - the import path (its UE_MOD_PACKAGE) plus its build dir,
+    both known from the manifest, so nothing needs threading through the build loop."""
+    package = mod_package(os.path.join(bp, by_name[dep]["sources"][0]))
+    return content_dir(os.path.join(bp, "build", dep, "FSD"), package), package
+
+
+def embed_deps(dep_stages, stage_fsd):
+    """Copy each dep's staged assets into this mod's FSD tree so the pak is self-contained.
+    Clears each dest first so a renamed/dropped dep asset can't linger and ship stale."""
+    for content, package in dep_stages:
+        dest = content_dir(stage_fsd, package)
+        if os.path.isdir(dest):
+            shutil.rmtree(dest)
+        os.makedirs(dest)
+        for f in staged_assets(content):
+            shutil.copy2(f, os.path.join(dest, os.path.basename(f)))
 
 
 def staged_assets(stage_content):
@@ -132,8 +171,14 @@ def main():
     api_headers = [os.path.join(ue_api, f) for f in os.listdir(ue_api)] if os.path.isdir(ue_api) else []
     toolchain_time = max(newest(api_headers), newest([assetgen]))
 
+    by_name = dict((m["name"], m) for m in mods)
+
     built, packed, skipped, failed = [], [], [], []
     staged = []
+    records = []
+    # Phase 1 - compile every mod. `embed` bakes a dep's cooked assets into the dependent's pak, so
+    # all assets must exist before any pak; with mutual embed no build order puts both deps first,
+    # so compiling is a pass of its own, separate from packing (phase 2).
     for mod in order(mods):
         name = mod["name"]
         sources = [os.path.join(bp, s) for s in (mod.get("sources") or [])]
@@ -149,41 +194,70 @@ def main():
         assets = staged_assets(stage_content)
         staged.append((name, stage_content, package))
 
-        stale = force or not assets or max(newest(sources), toolchain_time) > oldest(assets)
+        # `generate_api` writes the editor-side stub next to nothing else, so it has its own
+        # staleness: turning the flag on for an already-built mod must still produce one.
+        api_content = (os.path.join(bp, "out", "api", "Content", *package.replace("/Game/", "").split("/"))
+                       if mod.get("generate_api") else None)
+        api_missing = bool(api_content) and not staged_assets(api_content)
+
+        stale = (force or not assets or api_missing
+                 or max(newest(sources), toolchain_time) > oldest(assets))
+        if stale:
+            if not os.path.isdir(stage_content):
+                os.makedirs(stage_content)
+            # An asset the sources no longer cook (a struct another mod now owns) must not stay in the pak.
+            for old in assets:
+                os.remove(old)
+            if api_content:
+                if not os.path.isdir(api_content):
+                    os.makedirs(api_content)
+                else:
+                    # A class the sources no longer expose to the API (now inline, actor-gated,
+                    # or renamed) must not leave a stale stub the editor then loads and chokes on.
+                    for old in staged_assets(api_content):
+                        os.remove(old)
+            ok = True
+            for source in sources:
+                if not source.endswith(".cpp"):
+                    continue
+                cmd = [assetgen, "compile", source, ue_api, stage_content]
+                if api_content:
+                    cmd += ["--api", api_content]
+                proc = subprocess.run(cmd)
+                if proc.returncode != 0:
+                    ok = False
+                    break
+            if not ok:
+                print("%-16s FAILED" % name)
+                failed.append(name)
+                continue
+            print("%-16s compiled -> %s" % (name, package))
+            built.append(name)
+
+        if api_content:
+            print("%-16s api      -> %s" % (name, os.path.relpath(api_content, bp)))
+
+        records.append((mod, name, package, stage_fsd, stage_content, stale))
+
+    # Phase 2 - pack. Every mod's assets now exist, so an `embed` mod can bake in its deps.
+    for mod, name, package, stage_fsd, stage_content, stale in records:
+        embed = bool(mod.get("embed"))
+        dep_stages = [dep_stage(d, by_name, bp) for d in transitive_needs(name, by_name)] if embed else []
+        dep_assets = [f for content, _p in dep_stages for f in staged_assets(content)]
+        assets = staged_assets(stage_content)
         pak = os.path.join(bp, "out", name + "_P.pak")
-        # After a --no-pak run the assets are fresh and the pak is not; judged on the assets alone the
-        # old pak would ship, and a mod calling a function it lacks crashes on the null UFunction.
-        unpacked = not no_pak and newest(assets) > newest([pak])
+        # A dep's assets are baked into this pak, so a change to one restales it; likewise our own
+        # assets after a --no-pak run. Judged on our sources alone the old pak would ship, and a mod
+        # calling a function it lacks crashes on the null UFunction.
+        unpacked = not no_pak and max(newest(assets), newest(dep_assets)) > newest([pak])
         if not stale and not unpacked:
             print("%-16s up to date" % name)
             skipped.append(name)
             continue
-
-        if not os.path.isdir(stage_content):
-            os.makedirs(stage_content)
-        if stale:
-            # An asset the sources no longer cook (a struct another mod now owns) must not stay in the pak.
-            for old in assets:
-                os.remove(old)
-        ok = True
-        for source in sources:
-            if not stale or not source.endswith(".cpp"):
-                continue
-            proc = subprocess.run([assetgen, "compile", source, ue_api, stage_content])
-            if proc.returncode != 0:
-                ok = False
-                break
-        if not ok:
-            print("%-16s FAILED" % name)
-            failed.append(name)
-            continue
-
-        if stale:
-            print("%-16s compiled -> %s" % (name, package))
-            built.append(name)
-
         if no_pak:
             continue
+        if embed:
+            embed_deps(dep_stages, stage_fsd)
         if not os.path.isdir(os.path.dirname(pak)):
             os.makedirs(os.path.dirname(pak))
         if run_unrealpak(stage_fsd, pak):
@@ -200,4 +274,5 @@ def main():
     return 1 if failed else 0
 
 
-sys.exit(main())
+if __name__ == "__main__":
+    sys.exit(main())
