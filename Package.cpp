@@ -14,6 +14,28 @@ constexpr int32 kLegacyFileVersion = -7;
 constexpr uint32 kPkgFilterEditorOnly = 0x80000000;
 constexpr int32 kImportEntrySize = 28;
 constexpr int32 kExportEntrySize = 104;
+/* Uncooked: FObjectImport grows an editor-only PackageName FName (VER_UE4_NON_OUTER_PACKAGE_IMPORT). */
+constexpr int32 kUncookedImportEntrySize = 36;
+
+/* Measured on a 4.27.2 editor-saved package. The editor refuses unversioned non-cooked content, and
+   a missing custom version reads as "oldest", which silently flips serializers onto legacy branches -
+   so the whole set is reproduced, not just the file version. */
+constexpr int32 kUncookedFileVersionUE4 = 522;
+constexpr int32 kUncookedLegacyUE3Version = 864;
+struct FCustomVersionEntry
+{
+    uint32 Guid[4];
+    int32 Version;
+};
+const FCustomVersionEntry kUncookedCustomVersions[] = {
+    { { 0x29E575DD, 0xE0A34627, 0x9D10D276, 0x232CDCEA }, 17 },
+    { { 0x375EC13C, 0x06E448FB, 0xB50084F0, 0x262A717E }, 4 },
+    { { 0x601D1886, 0xAC644F84, 0xAA16D3DE, 0x0DEAC7D6 }, 47 },
+    { { 0x9C54D522, 0xA8264FBE, 0x94210746, 0x61B482D0 }, 43 },
+    { { 0xB0D832E4, 0x1F894F0D, 0xACCF7EB7, 0x36FD4AA2 }, 10 },
+    { { 0xCFFC743F, 0x43B04480, 0x939114DF, 0x171D2073 }, 37 },
+    { { 0xE4B068ED, 0xF49442E9, 0xA231DA0B, 0x2E46BB41 }, 40 },
+};
 
 /* Deprecated = CRCTable_DEPRECATED (MSB-first 0x04C11DB7, used by Strihash); Reflected = CRCTablesSB8[0] (used by StrCrc32). */
 struct FCrcTables
@@ -46,6 +68,15 @@ std::string Lower(const std::string& S)
     std::string R = S;
     for (char& C : R) if (C >= 'A' && C <= 'Z') C = char(C - 'A' + 'a');
     return R;
+}
+
+std::string GuidString(const uint32 (&G)[4])
+{
+    static const char* const Hex = "0123456789ABCDEF";
+    std::string Out;
+    for (uint32 V : G)
+        for (int32 Shift = 28; Shift >= 0; Shift -= 4) Out.push_back(Hex[(V >> Shift) & 0xF]);
+    return Out;
 }
 
 void WriteFString(std::vector<uint8>& B, const std::string& S)
@@ -172,6 +203,13 @@ int32 FPackage::AddImport(const FImport& In)
     return int32(Imports.size()) - 1;
 }
 
+const FImport* FPackage::ImportAt(FIndex Idx) const
+{
+    if (Idx.V >= 0) return nullptr;
+    const size_t Row = size_t(-Idx.V - 1);
+    return Row < Imports.size() ? &Imports[Row] : nullptr;
+}
+
 int32 FPackage::AddExport(FExport&& In)
 {
     NameIndex(In.ObjectName);
@@ -247,9 +285,11 @@ bool FPackage::Save(const std::string& OutBaseNoExt, std::string* Err) const
         ImportTable.Name(I.ClassName);
         ImportTable.Idx(I.Outer);
         ImportTable.Name(I.ObjectName);
+        if (bUncooked) ImportTable.Name("None");    // PackageName: only set for a package override
     }
-    if (ImportTable.B.size() != size_t(kImportEntrySize) * Imports.size())
-        return Fail("import entry size drifted from 28 bytes");
+    const int32 ImportEntrySize = bUncooked ? kUncookedImportEntrySize : kImportEntrySize;
+    if (ImportTable.B.size() != size_t(ImportEntrySize) * Imports.size())
+        return Fail("import entry size drifted");
 
     // EDL table: one flat run of FPackageIndex; each export row gives its first index plus four per-phase counts.
     FArc PreloadDeps(Self);
@@ -281,7 +321,13 @@ bool FPackage::Save(const std::string& OutBaseNoExt, std::string* Err) const
         for (const std::vector<int32>* List : Phases)
             for (int32 V : *List) PreloadDeps.I32(V);
     }
-    const int32 PreloadCount = int32(PreloadDeps.B.size() / 4);
+    if (bUncooked)
+    {
+        // The editor writes no EDL table; the count is -1, not 0, and every export row says -1 too.
+        PreloadDeps.B.clear();
+        for (size_t I = 0; I < Exports.size(); ++I) { FirstDep[I] = -1; CreateBeforeCreate[I].clear(); }
+    }
+    const int32 PreloadCount = bUncooked ? -1 : int32(PreloadDeps.B.size() / 4);
 
     // The summary is written once with zero offsets to measure itself, then again for real.
     struct FOffsets
@@ -295,16 +341,22 @@ bool FPackage::Save(const std::string& OutBaseNoExt, std::string* Err) const
         FArc S(Self);
         S.U32(kPackageFileTag);
         S.I32(kLegacyFileVersion);
-        S.I32(0);                                   // LegacyUE3Version
-        S.I32(0);                                   // FileVersionUE4
+        S.I32(bUncooked ? kUncookedLegacyUE3Version : 0);
+        S.I32(bUncooked ? kUncookedFileVersionUE4 : 0);
         S.I32(0);                                   // FileVersionLicenseeUE4
-        S.I32(0);                                   // CustomVersion count
+        if (bUncooked)
+        {
+            S.I32(int32(sizeof(kUncookedCustomVersions) / sizeof(kUncookedCustomVersions[0])));
+            for (const FCustomVersionEntry& V : kUncookedCustomVersions) { S.Guid(V.Guid); S.I32(V.Version); }
+        }
+        else
+            S.I32(0);                               // CustomVersion count
         S.I32(O.TotalHeaderSize);
         S.Str("None");                              // FolderName
-        S.U32(kPkgFilterEditorOnly);
+        S.U32(bUncooked ? 0 : kPkgFilterEditorOnly);
         S.I32(int32(Names.size()));
         S.I32(O.NameOff);
-        // LocalizationId omitted: PKG_FilterEditorOnly.
+        if (bUncooked) S.Str(GuidString(PkgGuid));       // editor-only, dropped by PKG_FilterEditorOnly
         S.I32(0); S.I32(0);                         // GatherableTextData count/offset
         S.I32(int32(Exports.size()));
         S.I32(O.ExportOff);
@@ -315,13 +367,21 @@ bool FPackage::Save(const std::string& OutBaseNoExt, std::string* Err) const
         S.I32(0);                                   // SearchableNamesOffset
         S.I32(0);                                   // ThumbnailTableOffset
         S.Guid(PkgGuid);
-        // PersistentGuid omitted: PKG_FilterEditorOnly.
+        if (bUncooked) S.Guid(PkgGuid);             // PersistentGuid, editor-only
         S.I32(1);                                   // Generations count
         S.I32(int32(Exports.size()));
         S.I32(int32(Names.size()));
         for (int32 I = 0; I < 2; ++I)               // SavedByEngineVersion, CompatibleWithEngineVersion
         {
-            S.U16(0); S.U16(0); S.U16(0); S.U32(0); S.I32(0);
+            // A cooked package is unversioned throughout; the editor reads these and warns when a
+            // package claims a newer engine than its own, so an uncooked one names 4.27.
+            if (bUncooked)
+            {
+                S.U16(4); S.U16(27); S.U16(I == 0 ? 2 : 0);
+                S.U32(I == 0 ? 18319896u : 17155196u);
+                S.Str("++UE4+Release-4.27");
+            }
+            else { S.U16(0); S.U16(0); S.U16(0); S.U32(0); S.I32(0); }
         }
         S.U32(0);                                   // CompressionFlags
         S.I32(0);                                   // CompressedChunks
@@ -336,13 +396,49 @@ bool FPackage::Save(const std::string& OutBaseNoExt, std::string* Err) const
         return S.B;
     };
 
+    /*
+    Uncooked AssetRegistryData: an int64 pointing past the rows, then one row per object, then the
+    per-import "used in game" bit arrays the offset names. This is what the content browser reads
+    without loading the package, so an uncooked asset with an empty block shows up as nothing.
+    */
+    std::vector<uint8> RegistryRows;
+    std::vector<uint8> DepBlock;
+    if (bUncooked)
+    {
+        auto I32Into = [](std::vector<uint8>& B, int32 V) {
+            const uint8* P = reinterpret_cast<const uint8*>(&V);
+            B.insert(B.end(), P, P + 4);
+        };
+        I32Into(RegistryRows, int32(RegistryObjects.size()));
+        for (const FRegistryObject& Row : RegistryObjects)
+        {
+            WriteFString(RegistryRows, Row.ObjectPath);
+            WriteFString(RegistryRows, Row.ClassName);
+            I32Into(RegistryRows, int32(Row.Tags.size()));
+            for (const auto& Tag : Row.Tags)
+            {
+                WriteFString(RegistryRows, Tag.first);
+                WriteFString(RegistryRows, Tag.second);
+            }
+        }
+        // TBitArray: bit count, then one uint32 per 32 bits. Every import counts as used in game.
+        I32Into(DepBlock, int32(Imports.size()));
+        for (size_t Word = 0; Word * 32 < Imports.size(); ++Word)
+        {
+            const size_t Bits = Imports.size() - Word * 32;
+            I32Into(DepBlock, Bits >= 32 ? int32(0xFFFFFFFF) : int32((1u << Bits) - 1));
+        }
+        I32Into(DepBlock, 0);                       // SoftPackageUsedInGame: no soft references
+    }
+
     const int32 SummarySize = int32(WriteSummary(Off).size());
     Off.NameOff = SummarySize;
     Off.ImportOff = Off.NameOff + int32(NameTable.size());
     Off.ExportOff = Off.ImportOff + int32(ImportTable.B.size());
     Off.DependsOff = Off.ExportOff + kExportEntrySize * int32(Exports.size());
     Off.AssetRegistryOff = Off.DependsOff + 4 * int32(Exports.size());
-    Off.PreloadOff = Off.AssetRegistryOff + 4;
+    Off.PreloadOff = Off.AssetRegistryOff
+                   + (bUncooked ? 8 + int32(RegistryRows.size()) + int32(DepBlock.size()) : 4);
     Off.TotalHeaderSize = Off.PreloadOff + int32(PreloadDeps.B.size());
 
     int64 PayloadCursor = Off.TotalHeaderSize;
@@ -372,10 +468,10 @@ bool FPackage::Save(const std::string& OutBaseNoExt, std::string* Err) const
         ExportTable.Bool(false);                    // bNotAlwaysLoadedForEditorGame
         ExportTable.Bool(E.bIsAsset);
         ExportTable.I32(FirstDep[I]);
-        ExportTable.I32(int32(E.SerBeforeSer.size()));
-        ExportTable.I32(int32(E.CreateBeforeSer.size()));
-        ExportTable.I32(int32(E.SerBeforeCreate.size()));
-        ExportTable.I32(int32(CreateBeforeCreate[I].size()));
+        ExportTable.I32(bUncooked ? 0 : int32(E.SerBeforeSer.size()));
+        ExportTable.I32(bUncooked ? 0 : int32(E.CreateBeforeSer.size()));
+        ExportTable.I32(bUncooked ? 0 : int32(E.SerBeforeCreate.size()));
+        ExportTable.I32(bUncooked ? 0 : int32(CreateBeforeCreate[I].size()));
     }
     if (ExportTable.B.size() != size_t(kExportEntrySize) * Exports.size())
         return Fail("export entry size drifted from 104 bytes");
@@ -385,6 +481,14 @@ bool FPackage::Save(const std::string& OutBaseNoExt, std::string* Err) const
     Header.insert(Header.end(), ImportTable.B.begin(), ImportTable.B.end());
     Header.insert(Header.end(), ExportTable.B.begin(), ExportTable.B.end());
     for (size_t I = 0; I < Exports.size(); ++I) { const int32 Z = 0; Header.insert(Header.end(), (const uint8*)&Z, (const uint8*)&Z + 4); }
+    if (bUncooked)
+    {
+        const int64 DependencyDataOffset = int64(Off.AssetRegistryOff) + 8 + int64(RegistryRows.size());
+        Header.insert(Header.end(), (const uint8*)&DependencyDataOffset, (const uint8*)&DependencyDataOffset + 8);
+        Header.insert(Header.end(), RegistryRows.begin(), RegistryRows.end());
+        Header.insert(Header.end(), DepBlock.begin(), DepBlock.end());
+    }
+    else
     { const int32 Z = 0; Header.insert(Header.end(), (const uint8*)&Z, (const uint8*)&Z + 4); }   // AssetRegistry: no tags
     Header.insert(Header.end(), PreloadDeps.B.begin(), PreloadDeps.B.end());
     if (int32(Header.size()) != Off.TotalHeaderSize) return Fail("header size mismatch");
@@ -401,6 +505,12 @@ bool FPackage::Save(const std::string& OutBaseNoExt, std::string* Err) const
         fclose(F);
         return bOk;
     };
+    if (bUncooked)
+    {
+        Header.insert(Header.end(), Exp.begin(), Exp.end());
+        remove((OutBaseNoExt + ".uexp").c_str());   // a stale cooked pair next to it would shadow this
+        return Dump(OutBaseNoExt + ".uasset", Header) ? true : Fail("cannot write .uasset");
+    }
     if (!Dump(OutBaseNoExt + ".uasset", Header)) return Fail("cannot write .uasset");
     if (!Dump(OutBaseNoExt + ".uexp", Exp)) return Fail("cannot write .uexp");
     return true;

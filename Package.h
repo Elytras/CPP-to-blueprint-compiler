@@ -67,6 +67,15 @@ struct FImport
     std::string ObjectName;
 };
 
+/* One AssetRegistryData row: what the content browser shows without loading the package. Cooked
+   packages carry none (the registry is baked separately); an uncooked one must. */
+struct FRegistryObject
+{
+    std::string ObjectPath;      // the object's name within the package
+    std::string ClassName;
+    std::vector<std::pair<std::string, std::string>> Tags;
+};
+
 /*
 Serialize runs twice per Save (FName discovery, then real bytes) and must be deterministic.
 The four lists are EDL preload dependencies as raw FPackageIndex values.
@@ -97,6 +106,19 @@ public:
     void SetGuid(uint32 A, uint32 B, uint32 C, uint32 D) { PkgGuid[0] = A; PkgGuid[1] = B; PkgGuid[2] = C; PkgGuid[3] = D; }
     void SetPackageSource(uint32 S) { PackageSource = S; }
 
+    /*
+    Uncooked (editor) output instead of cooked: one versioned .uasset rather than an unversioned
+    .uasset/.uexp pair. The editor refuses unversioned content, so the summary carries UE4.27's
+    file version and custom-version set; imports grow an editor-only PackageName FName; the EDL
+    preload table is replaced by -1; and the AssetRegistryData block is written for real.
+    */
+    void SetUncooked(bool bValue) { bUncooked = bValue; }
+    void SetRegistryObjects(std::vector<FRegistryObject> Rows) { RegistryObjects = std::move(Rows); }
+
+    const std::string& Name() const { return PackageName; }
+    /* The import a negative FIndex names, or null for an export / null index. */
+    const FImport* ImportAt(FIndex Idx) const;
+
     bool Save(const std::string& OutBaseNoExt, std::string* Err) const;
 
 private:
@@ -112,6 +134,8 @@ private:
 
     uint32 PkgGuid[4] = { 0, 0, 0, 0 };
     uint32 PackageSource = 0;
+    bool bUncooked = false;
+    std::vector<FRegistryObject> RegistryObjects;
 };
 
 /* FName number convention: "SCS_Node_0" is base "SCS_Node" number 1. Trailing "_<digits>" only, no leading zeros. */
