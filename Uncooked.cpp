@@ -317,6 +317,10 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
     const FIndex ImpEntry = Object("/Script/BlueprintGraph", "Class", "K2Node_FunctionEntry");
     const FIndex ImpResult = Object("/Script/BlueprintGraph", "Class", "K2Node_FunctionResult");
     const FIndex ImpParent = Object(Class.ParentPackage, "Class", Class.ParentClass);
+    const FIndex ImpBpgc = Object("/Script/Engine", "Class", "BlueprintGeneratedClass");
+    const FIndex ImpObjectClass = Object("/Script/CoreUObject", "Class", "Object");
+    const FIndex ImpParentCdo = Object(Class.ParentPackage, Class.ParentClass,
+                                       "Default__" + Class.ParentClass, Class.ParentPackage);
 
     struct FGraph
     {
@@ -360,6 +364,12 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
         for (const FPropertyDef& Prop : Fn.Params)
         {
             if (!(Prop.PropertyFlags & CPF_Parm)) continue;
+            /* The editor owns this one. UK2Node_FunctionEntry::AllocateDefaultPins gives every
+               static function graph a hidden __WorldContext pin (and ensure()s that none exists),
+               and the compiler appends the matching parm last plus MD_WorldContext. Carrying our
+               own leaves a visible pin on every call node - and naming it __WorldContext trips the
+               ensure. It is last in the cooked signature too, so the layouts still line up. */
+            if ((Fn.Flags & FUNC_Static) && Prop.Name.compare(0, 12, "WorldContext") == 0) continue;
             FPinDef Pin;
             Pin.Name = Prop.Name;
             MakeGuid(Class.AssetName + "." + Fn.Name + "." + Prop.Name, Pin.Guid);
@@ -383,14 +393,17 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
     // Export rows, in the order the engine's own saves use: the Blueprint, then each graph with its nodes.
     const int32 ExBlueprint = 0;
     std::vector<int32> GraphExports;
+    int32 Next = 1;
+    for (const FGraph& G : Graphs)
     {
-        int32 Next = 1;
-        for (const FGraph& G : Graphs)
-        {
-            GraphExports.push_back(Next);
-            Next += G.ResultPins.size() > (G.bPure ? size_t(0) : size_t(1)) ? 3 : 2;
-        }
+        GraphExports.push_back(Next);
+        Next += G.ResultPins.size() > (G.bPure ? size_t(0) : size_t(1)) ? 3 : 2;
     }
+    /* FAssetTypeActions_Blueprint::OpenAssetEditor warns "derives from an invalid class" on a null
+       GeneratedClass, so the stub carries an empty one (compile-on-load fills it from the graphs)
+       plus its CDO - the editor's deferred loading needs the CDO export to exist. */
+    const int32 ExClass = Next;
+    const int32 ExCdo = Next + 1;
 
     /* Class variables: the same FEdGraphPinType, plus the flags that decide how the editor treats
        each one - visible/read-only, replicated, its RepNotify and condition. */
@@ -504,6 +517,7 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
                 V.U8(0);                        // HasPropertyGuid
                 V.Append(Elements);
             }, "StructProperty");
+        Tag(Ar, "GeneratedClass", "ObjectProperty", [=](FArc& V) { V.Idx(Exp(ExClass)); });
         TagBool(Ar, "bLegacyNeedToPurgeSkelRefs", false);
         Tag(Ar, "BlueprintGuid", "StructProperty", [=](FArc& V) { V.Raw(PkgGuid, 16); }, "Guid");
         TagEnd(Ar);
@@ -606,6 +620,42 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
         };
         P.AddExport(std::move(Result));
     }
+
+    FExport Generated;
+    Generated.ClassIndex = ImpBpgc;
+    Generated.SuperIndex = ImpParent;
+    Generated.ObjectName = ClassName;
+    Generated.ObjectFlags = RF_Public | RF_Transactional;
+    Generated.Serialize = [=](FArc& Ar) {
+        TagEnd(Ar);
+        Ar.Bool(false);
+
+        Ar.Idx(ImpParent);                          // SuperStruct
+        Ar.I32(0);                                  // Children
+        Ar.I32(0);                                  // ChildProperties
+        Ar.I32(0);                                  // script bytecode size
+        Ar.I32(0);                                  // script storage size
+
+        Ar.I32(0);                                  // FuncMap
+        Ar.U32(0x00040010);                         // CLASS_Parsed | CLASS_CompiledFromBlueprint
+        Ar.Idx(ImpObjectClass);                     // ClassWithin
+        Ar.Name("Engine");                          // ClassConfigName
+        Ar.Idx(Exp(ExBlueprint));                   // ClassGeneratedBy
+        Ar.I32(0);                                  // Interfaces
+        Ar.Bool(false);                             // bDeprecatedForceScriptOrder
+        Ar.Name("None");
+        Ar.Bool(false);                             // bCooked
+        Ar.Idx(Exp(ExCdo));                         // ClassDefaultObject
+    };
+    P.AddExport(std::move(Generated));
+
+    FExport Cdo;
+    Cdo.ClassIndex = Exp(ExClass);
+    Cdo.TemplateIndex = ImpParentCdo;
+    Cdo.ObjectName = "Default__" + ClassName;
+    Cdo.ObjectFlags = RF_Public | RF_ClassDefaultObject | RF_ArchetypeObject;
+    Cdo.Serialize = [](FArc& Ar) { TagEnd(Ar); };   // a CDO omits the lazy-object guid
+    P.AddExport(std::move(Cdo));
 
     /* Without registry rows the content browser sees a package with nothing in it. */
     FRegistryObject Row;
