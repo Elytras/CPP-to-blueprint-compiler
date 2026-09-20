@@ -764,7 +764,7 @@ class FCompiler
 {
 public:
     bool Run(const std::string& SourcePath, const std::string& IncludeDir,
-             const std::string& OutDir, std::string* Err);
+             const std::string& OutDir, const std::string& InApiDir, std::string* Err);
 
 private:
     bool Collect(std::string* Err);
@@ -916,6 +916,7 @@ private:
     const FOpInfo* FindOp(const std::string& Op, const std::string& Lhs, const std::string& Rhs) const;
     void ApplyConv(const FConv& C, FBlueprintClass& BP, FArgIR& Arg);
     std::string ModPackage;
+    std::string ApiDir;         // set by `--api`: where the uncooked editor-side stubs go
     std::string SourceDir;      // the compiled .cpp's folder: what __EmbedFile__ resolves a relative path against
     /* A container inside a container: UE has no such property, so the inner one is the single member (Value) of a
        wrapper struct, <wrapper name> -> the container type. The wrapper has the container's layout. */
@@ -5419,9 +5420,11 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         { *Err = PErr; return false; }
         if (!LowerDefault(*F, PD, BP, Err)) return false;
 
-        /* CPF_Parm would make it part of the call frame; CPF_BlueprintReadOnly would forbid assignment. */
+        /* CPF_Parm would make it part of the call frame; CPF_BlueprintReadOnly would forbid assignment -
+           except on a `const` field, where the source forbids it anyway, so the flag is the truth. */
         PD.PropertyFlags = (PD.PropertyFlags & ~uint64(CPF_Parm | CPF_BlueprintReadOnly))
                          | CPF_Edit | CPF_BlueprintVisible | CPF_DisableEditOnInstance;
+        if (TypeOf(*F).compare(0, 6, "const ") == 0) PD.PropertyFlags |= CPF_BlueprintReadOnly;
         if (auto Rep = R.Replicated.find(FieldName); Rep != R.Replicated.end())
         {
             /* Measured on BP_LiftPod.IsLaunchEnabled: the editor's flags plus CPF_Net, and CPF_RepNotify with the
@@ -5781,6 +5784,12 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     if (bReplicatesAnything) BP.SetReplicates(true);
     BP.Finish();
     if (!P.Save(OutDir + "/" + R.CppName, Err)) return false;
+    if (!ApiDir.empty() && !BP.WriteApi(ApiDir, Err))
+    {
+        /* A class with nothing callable is not a build failure; the mod simply has no API surface. */
+        printf("  %-14s -> no API asset: %s\n", R.CppName.c_str(), Err->c_str());
+        Err->clear();
+    }
     RegistryRows.push_back({ PackageName, R.CppName + "_C", "BlueprintGeneratedClass" });
     printf("  %-14s -> %s.uasset  (%s %s)\n", R.CppName.c_str(), R.CppName.c_str(),
            B->IsNative() ? "extends" : "extends BP", R.Base.c_str());
@@ -5825,8 +5834,9 @@ bool FCompiler::LoadTables(const std::string& IncludeDir, std::string* Err)
 }
 
 bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir,
-                    const std::string& OutDir, std::string* Err)
+                    const std::string& OutDir, const std::string& InApiDir, std::string* Err)
 {
+    ApiDir = InApiDir;
     SourceDir = std::filesystem::path(SourcePath).parent_path().string();
     const std::string AstPath = OutDir + "/ast.json";
     /* Both the UeApi dir and its parent are include paths, so "FSD.h" and "UeApi/FSD.h" both resolve. */
@@ -5914,10 +5924,10 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
 }   // namespace
 
 bool CompileToAssets(const std::string& SourcePath, const std::string& IncludeDir,
-                     const std::string& OutDir, std::string* Err)
+                     const std::string& OutDir, const std::string& ApiDir, std::string* Err)
 {
     FCompiler C;
-    return C.Run(SourcePath, IncludeDir, OutDir, Err);
+    return C.Run(SourcePath, IncludeDir, OutDir, ApiDir, Err);
 }
 
 }   // namespace Uasset

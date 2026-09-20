@@ -1,6 +1,6 @@
 ﻿/*
 usage: assetgen verify <out-dir> <reference-dir>     rebuilds Autosprint/InitCave and byte-diffs it against the cooked original
-       assetgen compile <source.cpp> <include-dir> <out-dir>
+       assetgen compile <source.cpp> <include-dir> <out-dir> [--api <api-dir>]
 */
 #include <cstdio>
 #include <string>
@@ -201,8 +201,12 @@ int main(int argc, char** argv)
 
     if (argc >= 5 && std::string(argv[1]) == "compile")
     {
+        std::string ApiDir;
+        for (int32 I = 5; I + 1 < argc; ++I)
+            if (std::string(argv[I]) == "--api") ApiDir = argv[I + 1];
+
         std::string Err;
-        if (CompileToAssets(argv[2], argv[3], argv[4], &Err)) return 0;
+        if (CompileToAssets(argv[2], argv[3], argv[4], ApiDir, &Err)) return 0;
         printf("  FAILED: %s\n", Err.c_str());
         return 1;
     }
