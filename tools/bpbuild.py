@@ -73,12 +73,30 @@ def transitive_needs(name, by_name, seen=None):
     return out
 
 
-def api_root(flag, config, bp):
-    """Where a `generate_api` mod's editor-side stubs go: the mod's own `generate_api: <path>`,
-    else the manifest's top-level `api_dir`, else the build tree. A path names the editor
-    project's Content folder (relative ones resolve against BpMods/), so a build updates the
+API_MANIFEST = ".assetgen"
+
+
+def api_manifest(api_content):
+    """The assets the last run generated into `api_content`, as absolute paths. Absent manifest
+    (a folder from before this existed, or a hand-populated one) means claim nothing."""
+    path = os.path.join(api_content, API_MANIFEST)
+    if not os.path.exists(path):
+        return []
+    names = io.open(path, encoding="utf-8").read().split()
+    return [os.path.join(api_content, n) for n in names]
+
+
+def write_api_manifest(api_content):
+    io.open(os.path.join(api_content, API_MANIFEST), "w", encoding="utf-8", newline="\n").write(
+        "".join(os.path.basename(f) + "\n" for f in sorted(staged_assets(api_content))))
+
+
+def api_root(mod, config, bp):
+    """Where a `generate_api` mod's editor-side stubs go: its own `api_dir`, else the manifest's
+    top-level `api_dir` (the default for every mod), else the build tree. The path names an editor
+    project's Content folder (relative ones resolve against BpMods/), so a build updates that
     project's API assets in place instead of leaving them to be copied by hand."""
-    root = flag if isinstance(flag, str) else config.get("api_dir")
+    root = mod.get("api_dir") or config.get("api_dir")
     if not root:
         return os.path.join(bp, "out", "api", "Content")
     return os.path.abspath(os.path.join(bp, os.path.expandvars(root)))
@@ -207,7 +225,7 @@ def main():
 
         # `generate_api` writes the editor-side stub next to nothing else, so it has its own
         # staleness: turning the flag on for an already-built mod must still produce one.
-        api_content = (os.path.join(api_root(mod.get("generate_api"), config, bp),
+        api_content = (os.path.join(api_root(mod, config, bp),
                                     *package.replace("/Game/", "").split("/"))
                        if mod.get("generate_api") else None)
         api_missing = bool(api_content) and not staged_assets(api_content)
@@ -226,8 +244,12 @@ def main():
                 else:
                     # A class the sources no longer expose to the API (now inline, actor-gated,
                     # or renamed) must not leave a stale stub the editor then loads and chokes on.
-                    for old in staged_assets(api_content):
-                        os.remove(old)
+                    # Only ours go: `api_dir` usually points into a real project, where the same
+                    # folder holds hand-made assets that must survive. The manifest is rewritten
+                    # right after the compile, below.
+                    for old in api_manifest(api_content):
+                        if os.path.exists(old):
+                            os.remove(old)
             ok = True
             for source in sources:
                 if not source.endswith(".cpp"):
@@ -243,11 +265,16 @@ def main():
                 print("%-16s FAILED" % name)
                 failed.append(name)
                 continue
+            if api_content:
+                write_api_manifest(api_content)
             print("%-16s compiled -> %s" % (name, package))
             built.append(name)
 
         if api_content:
-            print("%-16s api      -> %s" % (name, os.path.relpath(api_content, bp)))
+            # relpath throws across drives - an `api_dir` on another one is perfectly normal.
+            shown = api_content if os.path.splitdrive(api_content)[0] != os.path.splitdrive(bp)[0] \
+                else os.path.relpath(api_content, bp)
+            print("%-16s api      -> %s" % (name, shown))
 
         records.append((mod, name, package, stage_fsd, stage_content, stale))
 
