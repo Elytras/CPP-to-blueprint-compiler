@@ -164,6 +164,15 @@ bool FindLiteral(const Json& N, std::string& Out)
     return bFound;
 }
 
+/* Does this subtree call the named function? The call's own spelling, not a string. */
+bool CallsFunction(const Json& N, const char* Fn)
+{
+    if (Kind(N) == "DeclRefExpr" && N.contains("referencedDecl") && Name(N["referencedDecl"]) == Fn) return true;
+    bool bFound = false;
+    ForEach(N, [&](const Json& C) { if (!bFound) bFound = CallsFunction(C, Fn); });
+    return bFound;
+}
+
 /* A variable's braced initializer, or null. A temporary inside the braces (a container's list) wraps them in cleanups. */
 const Json* BracedInit(const Json& Var)
 {
@@ -903,6 +912,7 @@ private:
     const FOpInfo* FindOp(const std::string& Op, const std::string& Lhs, const std::string& Rhs) const;
     void ApplyConv(const FConv& C, FBlueprintClass& BP, FArgIR& Arg);
     std::string ModPackage;
+    std::string SourceDir;      // the compiled .cpp's folder: what __EmbedFile__ resolves a relative path against
     /* A container inside a container: UE has no such property, so the inner one is the single member (Value) of a
        wrapper struct, <wrapper name> -> the container type. The wrapper has the container's layout. */
     std::map<std::string, std::string> NestedWrappers;
@@ -4743,6 +4753,25 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
     Init = Strip(Init ? Init : First(F));
     if (!Init) return true;
     std::string K = Kind(*Init);
+
+    /* `TArray<uint8> Blob = __EmbedFile__("rel/path")`: the file's bytes, read here at build time and
+       written into the CDO one element per byte. The path is relative to the mod source being compiled. */
+    if (std::string Rel; PD.Type == "ArrayProperty" && CallsFunction(*Init, "__EmbedFile__"))
+    {
+        if (!PD.Inner || PD.Inner->Type != "ByteProperty" || !PD.Inner->StructName.empty())
+        { *Err = "__EmbedFile__ initialises a TArray<uint8>: " + Name(F); return false; }
+        if (!FindLiteral(*Init, Rel))
+        { *Err = "__EmbedFile__: the path must be a string literal: " + Name(F); return false; }
+        const std::string Path = (std::filesystem::path(SourceDir) / Rel).string();
+        const std::string Bytes = ReadText(Path);
+        if (Bytes.empty()) { *Err = "__EmbedFile__: cannot read (or empty): " + Path; return false; }
+        PD.Default.Items.reserve(Bytes.size());
+        for (char C : Bytes) { FDefaultValue B; B.K = FDefaultValue::Int; B.I = uint8(C); PD.Default.Items.push_back(B); }
+        PD.Default.K = FDefaultValue::Array;
+        printf("  %-14s -> %s  (%d byte%s)\n", "embed", Name(F).c_str(), int32(Bytes.size()), Bytes.size() == 1 ? "" : "s");
+        return true;
+    }
+
     const bool bMap = PD.Type == "MapProperty";
     if ((PD.Type == "ArrayProperty" || PD.Type == "SetProperty" || bMap) && PD.Inner && First(*Init))
     {
@@ -5715,6 +5744,7 @@ bool FCompiler::LoadTables(const std::string& IncludeDir, std::string* Err)
 bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir,
                     const std::string& OutDir, std::string* Err)
 {
+    SourceDir = std::filesystem::path(SourcePath).parent_path().string();
     const std::string AstPath = OutDir + "/ast.json";
     /* Both the UeApi dir and its parent are include paths, so "FSD.h" and "UeApi/FSD.h" both resolve. */
     const std::string Parent = std::filesystem::path(IncludeDir).parent_path().string();
