@@ -277,6 +277,12 @@ uint32 NetFlagsOf(const Json& Decl)
 }
 
 /* UE_AUTHORITY_ONLY / UE_COSMETIC, the same way: the VM skips the call where the flag says it should not run. */
+/* A method that overrides nothing. Measured on the DRG dump: a Blueprint-authored function is
+   (Public, BlueprintCallable, BlueprintEvent) - 4624 of them, CD2_Module_C's among them. Without BlueprintCallable
+   no Blueprint can place a call node, and the API stub, which lists what a Blueprint can call, left every plain
+   method out. FUNC_Event stays: it is what every mod was cooked and run with so far. */
+static const uint32 kPlainMethodFlags = FFunctionDef().FunctionFlags | FUNC_BlueprintCallable;
+
 uint32 AccessFlagsOf(const Json& Decl)
 {
     uint32 Flags = 0;
@@ -1772,7 +1778,9 @@ uint32 FCompiler::ModMethodFlags(const FRecord& Owner, const std::string& Method
     const Json& Def = DefIt != Owner.MethodDefs.end() ? *DefIt->second : Decl;
     uint32 Inherited = 0;
     FindEvent(BP, Owner.CppName, Method, &Inherited, /*bFlagsOnly=*/true);
-    uint32 Flags = Inherited ? Inherited & kOverrideInherits : FFunctionDef().FunctionFlags;
+    uint32 Flags = Inherited ? Inherited & kOverrideInherits : kPlainMethodFlags;
+    if (auto A = Owner.MethodAccess.find(Method); !Inherited && A != Owner.MethodAccess.end())
+        Flags = (Flags & ~uint32(FUNC_Public | FUNC_Protected | FUNC_Private)) | A->second;
     if (IsPureDecl(Def)) Flags |= FUNC_BlueprintPure | FUNC_BlueprintCallable;
     const std::string DeclType = TypeOf(Decl);
     if (DeclType.size() > 6 && DeclType.compare(DeclType.size() - 6, 6, " const") == 0) Flags |= FUNC_Const;
@@ -6690,7 +6698,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         const FIndex Super = FindEvent(BP, R.CppName, Fn.Name, &Inherited);
         uint32 Flags = Inherited ? Inherited & kOverrideInherits
                      : IsStaticDecl(Decl) ? uint32(FUNC_Static | FUNC_BlueprintCallable | FUNC_Public | FUNC_Final)
-                     : FFunctionDef().FunctionFlags;
+                     : kPlainMethodFlags;
         /* All 7229 BlueprintPure functions in the DRG dump are BlueprintCallable too. */
         /* Its own access specifier, where no parent decides. The editor refuses a call node it forbids; the VM checks
            nothing, and clang has already refused what C++ forbids. */

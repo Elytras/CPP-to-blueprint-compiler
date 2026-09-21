@@ -405,8 +405,10 @@ def api_stub():
     # UE_CATEGORY: once on Peek's entry node, once on the variable Charges; Plain follows UE_CATEGORY("") and has none.
     assert stub.count(name('Names|Test')) == 2, stub.count(name('Names|Test'))
     assert name('Peek') in stub and name('Charges') in stub and name('Plain') in stub
-    # A private field is left out, a const one is there (read-only), a function no Blueprint can call is not listed.
-    assert name('Seed') not in stub and name('Limit') in stub and name('Twice') not in stub
+    # A private field is left out, a const one is there (read-only). A plain method is listed - the private one too,
+    # its entry node saying FUNC_Private, which is how the editor keeps other Blueprints off it.
+    assert name('Seed') not in stub and name('Limit') in stub
+    assert name('Next') in stub and name('Step') in stub and name('Twice') in stub
     print('ok  NameTest: the API stub carries UE_CATEGORY and leaves a private field out')
 
 
@@ -455,8 +457,8 @@ def replication():
                                       ('Aim', '0x10025', 'None', 3), ('Slots', '0x100010025', 'OnRep_Slots', 2),
                                       ('Local', '0x10005', 'None', 0)):
         assert re.search(r'Property %s .*flags=%s rep=0 notify=%s cond=%d' % (prop, flags, notify, cond), cls), prop
-    for fn, flags in (('ServerOpen', 0x82208c0), ('ClientPing', 0x9020840), ('MultiBoom', 0x8024840), ('OnRep_Open', 0x8020800),
-                      ('ServerBump', 0x8620840), ('AuthOnly', 0x8020804), ('Pretty', 0x8020808)):
+    for fn, flags in (('ServerOpen', 0xc2208c0), ('ClientPing', 0xd020840), ('MultiBoom', 0xc024840), ('OnRep_Open', 0xc020800),
+                      ('ServerBump', 0xc620840), ('AuthOnly', 0xc020804), ('Pretty', 0xc020808)):
         assert 'FunctionFlags %#x' % flags in tool('dumpstruct.py', exports.index(fn)), fn
     ops = re.findall(r'\d  (\w+) +(\S*)', tool('walkscript.py', exports.index('ReceiveBeginPlay')))
     calls = [(op, a) for op, a in ops if op in ('VirtualFunction', 'LocalVirtualFunction')]
@@ -476,7 +478,7 @@ def replication():
     # A mod child's override of a mod parent's RPC: the parent's flags, and the parent's function as its super.
     kid = os.path.join(os.path.dirname(base), 'ReplKid')
     imports, kid_exports = dumpexp.load(kid)[4], dumpexp.load(kid)[5]
-    for fn, flags in (('ServerOpen', 0x82208c0), ('MultiBoom', 0x8024840), ('OnRep_Open', 0x8020800)):
+    for fn, flags in (('ServerOpen', 0xc2208c0), ('MultiBoom', 0xc024840), ('OnRep_Open', 0xc020800)):
         e = next(x for x in kid_exports if x['name'] == fn)
         out = subprocess.run([sys.executable, os.path.join(here, 'dumpstruct.py'), kid, str(kid_exports.index(e))], capture_output=True, text=True).stdout
         assert 'FunctionFlags %#x' % flags in out, (fn, out)
