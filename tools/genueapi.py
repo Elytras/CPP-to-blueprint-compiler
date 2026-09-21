@@ -277,8 +277,11 @@ def emit_struct(st, conv_names):
     own = st.fields[len(base.fields):] if base else st.fields
     for t, n in own:
         body.append("    %s %s;" % (t, n))
-    body.append("")
-    body.append("    %s() = default;" % st.cpp)
+    # C++20: any declared constructor, `= default` included, makes a struct no aggregate, and `{ .Time = 0.5f }`
+    # needs one. So a struct gets a default constructor only where its other constructors would take it away.
+    if st.complete or st.cpp in conv_names:
+        body.append("")
+        body.append("    %s() = default;" % st.cpp)
     if st.complete:
         body.append("    %s(%s) {}" % (st.cpp, ", ".join("%s %s" % (t, n) for t, n in st.fields)))
     if st.cpp in conv_names:

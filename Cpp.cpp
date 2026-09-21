@@ -866,6 +866,7 @@ private:
     std::map<std::string, const Json*> ConstVars;
     struct FConstVal { bool bFloat = false; double F = 0; int64 I = 0; double Num() const { return bFloat ? F : double(I); } };
     bool FoldConst(const Json& E, FConstVal& Out) const;
+    bool ConstToArg(const FConstVal& V, const std::string& Type, FArgIR& Out) const;
     std::map<std::string, const Json*> FreeInlines;                     // decl id -> an inline free function's definition
                                                                         // (a template's: each instantiation)
     /* The class a field access `Obj->Field` / `Field` reads from: Obj's static type, or the class being generated. */
@@ -2640,6 +2641,10 @@ bool FCompiler::LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, 
         return LowerAddress(*Bare, BP, Addr, &Pointee, Err) && RefThrough(std::move(Addr), Pointee, Out, Err)
             && ConvertArg(OuterType, BP, Out, Err);
     }
+    /* A consteval call: clang ran it and left the answer on the ConstantExpr around it, which Strip would drop. */
+    for (const Json* W = &ArgNode; W; W = Kind(*W) == "ImplicitCastExpr" || Kind(*W) == "ParenExpr" ? First(*W) : nullptr)
+        if (FConstVal V; Kind(*W) == "ConstantExpr" && W->contains("value") && FoldConst(ArgNode, V) && ConstToArg(V, OuterType, Out))
+            return true;
     const Json* N = Strip(&ArgNode);
     if (!N) { *Err = "empty argument expression"; return false; }
     if (!LowerArgRaw(*N, OuterType, BP, Out, Err)) return false;
@@ -2681,6 +2686,9 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         auto SI = Structs.find(StripTypeKeywords(TypeOf(*N)));
         if (SI != Structs.end()) return LowerStructLiteral(*N, SI->second, BP, Out, Err);
     }
+    /* `T()` of an aggregate - a struct with no constructor declared, which is what lets it take `{ .A = 1 }`. */
+    if (const FRecord* R = K == "CXXScalarValueInitExpr" ? Find(StripTypeKeywords(TypeOf(*N))) : nullptr; R && R->bIsStruct)
+        return LowerMakeStruct(R->CppName, nullptr, BP, Out, Err);
     if ((K == "CXXConstructExpr" || K == "CXXTemporaryObjectExpr")
         && (Slot == SK_Name || Slot == SK_Text || Slot == SK_Str))
     {
@@ -2979,16 +2987,9 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             if (const Json* Lit = Init ? Strip(Init) : nullptr; Lit && Kind(*Lit) == "StringLiteral") return LowerArg(*Lit, BP, Out, Err);
             FConstVal V;
             if (!Init || !FoldConst(*N, V))
-            { *Err = Name(Ref) + " is not a constant AssetGen can work out: literals, enum constants and arithmetic over them"; return false; }
-            const EStrKind VK = StrKindOf(Canon(TypeOf(*N)));
-            Out.K = VK == SK_Float ? FArgIR::Float : VK == SK_Bool ? FArgIR::Bool : VK == SK_Byte ? FArgIR::Byte
-                  : VK == SK_Int64 ? FArgIR::Int64 : FArgIR::Int;
-            if (VK != SK_Float && VK != SK_Bool && VK != SK_Byte && VK != SK_Int64 && VK != SK_Int)
+            { *Err = Name(Ref) + " is not a constant AssetGen can work out: literals, enum constants, consteval calls and arithmetic over them"; return false; }
+            if (!ConstToArg(V, TypeOf(*N), Out))
             { *Err = Name(Ref) + ": a constant of type " + TypeOf(*N) + " has no literal in Kismet"; return false; }
-            Out.F = float(V.Num());
-            Out.B = V.Num() != 0;
-            Out.I = int32(V.I);
-            Out.I64 = V.I;
             return true;
         }
         if (RefKind != "ParmVarDecl" && RefKind != "VarDecl")
@@ -3836,7 +3837,8 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             bool bAny = false;
             ForEach(*S, [&](const Json& D) {
                 const std::string DK = Kind(D);
-                if (DK == "TypeAliasDecl" || DK == "TypedefDecl" || DK == "UsingDecl") { bAny = true; return; }   // compile-time names only
+                if (DK == "TypeAliasDecl" || DK == "TypedefDecl" || DK == "UsingDecl" || DK == "UsingEnumDecl"
+                    || DK == "StaticAssertDecl") { bAny = true; return; }   // compile-time names only
                 if (!bOk || DK != "VarDecl") return;
                 bAny = true;
                 const std::string VarName = LocalName(D);
@@ -4246,6 +4248,15 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
         else if (K == "CXXForRangeStmt")
         {
             if (!LowerRangeFor(*S, BP, Out, Locals, Err)) { bOk = false; return; }
+            return;
+        }
+        else if (K == "AttributedStmt")
+        {
+            /* `[[likely]] return X;`: a hint to a compiler that is not this one. The statement is the last inner. */
+            const Json* Sub = nullptr;
+            ForEach(*S, [&](const Json& C) { Sub = &C; });
+            const Json Wrap = { {"kind", "CompoundStmt"}, {"inner", Json::array({ Sub ? *Sub : Json::object() })} };
+            if (!Sub || !LowerBody(Wrap, BP, Out, Locals, Err)) bOk = false;
             return;
         }
         else if (K == "CompoundStmt")
@@ -5280,6 +5291,16 @@ bool FCompiler::FoldConst(const Json& E, FConstVal& Out) const
     if (K == "IntegerLiteral") { Out = {}; Out.I = int64(std::strtoull(E.value("value", std::string("0")).c_str(), nullptr, 10)); return true; }
     if (K == "FloatingLiteral") { Out = {}; Out.bFloat = true; Out.F = std::strtod(E.value("value", std::string("0")).c_str(), nullptr); return true; }
     if (K == "CXXBoolLiteralExpr") { Out = {}; Out.I = E.value("value", false); return true; }
+    if (K == "ConstantExpr" && E.contains("value") && E["value"].is_string())
+    {
+        /* clang ran it: a consteval call (an immediate invocation is always wrapped so), whatever its body does. */
+        const std::string V = E["value"].get<std::string>();
+        Out = {};
+        if (V == "true" || V == "false") Out.I = V == "true";
+        else if (V.find_first_of(".eEn") != std::string::npos) { Out.bFloat = true; Out.F = std::strtod(V.c_str(), nullptr); }
+        else Out.I = std::strtoll(V.c_str(), nullptr, 10);
+        return Fit(Out);
+    }
     if (K == "ParenExpr" || K == "ConstantExpr" || K == "ExprWithCleanups")
         return First(E) && FoldConst(*First(E), Out);
     if (K == "ImplicitCastExpr" || K == "CStyleCastExpr" || K == "CXXStaticCastExpr" || K == "CXXFunctionalCastExpr")
@@ -5328,6 +5349,20 @@ bool FCompiler::FoldConst(const Json& E, FConstVal& Out) const
     else if (Op == ">>" && R.I >= 0 && R.I < 64) Out.I = L.I >> R.I;
     else return false;
     return Fit(Out);
+}
+
+bool FCompiler::ConstToArg(const FConstVal& V, const std::string& Type, FArgIR& Out) const
+{
+    const EStrKind VK = StrKindOf(Canon(Type));
+    if (VK != SK_Float && VK != SK_Bool && VK != SK_Byte && VK != SK_Int64 && VK != SK_Int) return false;
+    Out = FArgIR();
+    Out.K = VK == SK_Float ? FArgIR::Float : VK == SK_Bool ? FArgIR::Bool : VK == SK_Byte ? FArgIR::Byte
+          : VK == SK_Int64 ? FArgIR::Int64 : FArgIR::Int;
+    Out.F = float(V.Num());
+    Out.B = V.Num() != 0;
+    Out.I = int32(V.I);
+    Out.I64 = V.I;
+    return true;
 }
 
 bool FCompiler::AssetRef(const Json& N, FBlueprintClass& BP, FIndex* Out)
@@ -5480,8 +5515,9 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
         return true;
     }
     *Err = Name(F) + ": a default is a value known when the mod is built - a literal, a constant expression over "
-           "literals, enum constants and constexpr variables, a braced struct, or an &Asset. Anything computed when the "
-           "game runs belongs in the constructor-time event (ReceiveBeginPlay, UserConstructionScript)";
+           "literals, enum constants and constexpr variables, a braced struct, or an &Asset. A function call counts only "
+           "through `constexpr T k = F();` with F consteval, which clang runs itself. Anything computed when the game "
+           "runs belongs in ReceiveBeginPlay or UserConstructionScript";
     return false;
 }
 
@@ -6684,7 +6720,7 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     const std::string AstPath = OutDir + "/ast.json";
     /* Both the UeApi dir and its parent are include paths, so "FSD.h" and "UeApi/FSD.h" both resolve. */
     const std::string Parent = std::filesystem::path(IncludeDir).parent_path().string();
-    const std::string Cmd = "clang++ -std=c++17 -fsyntax-only -Xclang -ast-dump=json"
+    const std::string Cmd = "clang++ -std=c++20 -fsyntax-only -Xclang -ast-dump=json"
                             " \"" + SourcePath + "\" -I\"" + IncludeDir + "\" -I\"" + Parent
                           + "\" > \"" + AstPath + "\"";
     if (system(("\"" + Cmd + "\"").c_str()) != 0)

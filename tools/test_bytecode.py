@@ -313,13 +313,19 @@ def mod_enum():
     print('ok  TypesTest: int32 / int64 enums cook as EnumProperty over Int / Int64Property')
 
 
+def fnv(s):
+    h = 2166136261
+    for c in s.encode(): h = ((h ^ c) * 16777619) & 0xFFFFFFFF
+    return h & 0x7FFFFFFF
+
+
 def constants():
     import re, subprocess
     here = os.path.dirname(os.path.abspath(__file__))
     base = asset('TypesTest')
     exports = [e['name'] for e in dumpexp.load(base)[5]]
     cdo = subprocess.run([sys.executable, os.path.join(here, 'dumptags.py'), base, str(exports.index('Default__TypesTest_C'))], capture_output=True, text=True).stdout
-    for want in ('Budget [0] IntProperty size=4: 25', 'Reach [0] FloatProperty size=4: 125.0', 'Bits [0] IntProperty size=4: 236'):
+    for want in ('Seed [0] IntProperty size=4: %d' % fnv('types'), 'Budget [0] IntProperty size=4: 25', 'Reach [0] FloatProperty size=4: 125.0', 'Bits [0] IntProperty size=4: 236'):
         assert want in cdo, (want, cdo)
     print('ok  TypesTest: a member default is what its constant expression comes to')
     import struct
@@ -340,6 +346,7 @@ def constants():
 
 mod_enum()
 constants()
+check('TypesTest', 'Cpp20', lambda M, N: {0: N + N, 5: N + fnv('angry')}.get(M, fnv('types')), [dict(M=m, N=n) for m in (0, 5, 6) for n in (-2, 9)])
 check('TypesTest', 'ConstSum', lambda N: N * 3 + 12 + 19, [dict(N=n) for n in (-4, 0, 9)])
 check('TypesTest', 'HalfOf', lambda V: V * 0.5, [dict(V=v) for v in (-3.0, 0.0, 8.0)])
 check('TypesTest', 'SpanScore', lambda S: {-3: 1, 70000: 2, 70001: 3, 70002: 4}.get(S, 0), [dict(S=s) for s in (-3, 70000, 70001, 70002, 5)])
