@@ -101,6 +101,8 @@ def map_type(raw):
     if base in TEXT_TYPES:
         return TEXT_TYPES[base]
     m = PTR.match(t)
+    if m and "class " + m.group(1) in TEXT_TYPES:     # `class FString* Out`: text is no UObject, so Dumper-7 means an out-parm
+        return TEXT_TYPES["class " + m.group(1)] + "&"
     if m:
         return "class %s*" % m.group(1)
     m = TPL.match(t)
