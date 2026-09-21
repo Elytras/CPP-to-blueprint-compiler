@@ -196,6 +196,7 @@ void DefaultRefs(const FDefaultValue& D, std::vector<int32>& Out)
     if (D.K == FDefaultValue::Obj && D.Object.V != 0 && std::find(Out.begin(), Out.end(), D.Object.V) == Out.end())
         Out.push_back(D.Object.V);
     for (const FDefaultValue& Item : D.Items) DefaultRefs(Item, Out);
+    if (D.Members) for (const FPropertyDef& M : *D.Members) DefaultRefs(M.Default, Out);
 }
 
 namespace
@@ -266,11 +267,12 @@ void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
                 { "IntVector", 12 }, { "Guid", 16 }, { "DateTime", 8 }, { "Timespan", 8 }, { "Box", 25 },
                 { "Box2D", 17 }, { "BoxSphereBounds", 28 }, { "FrameNumber", 4 } };
             auto N = Native.find(P.StructName);
-            if (D.K == FDefaultValue::Struct && P.Members)
+            const auto& Members = D.Members ? D.Members : P.Members;     // an element of a container brings its own
+            if (D.K == FDefaultValue::Struct && Members)
             {
                 if (N == Native.end())
                 {
-                    for (const FPropertyDef& M : *P.Members) WriteDefaultTagInner(V, M);
+                    for (const FPropertyDef& M : *Members) WriteDefaultTagInner(V, M);
                     TagEnd(V);
                 }
                 else
@@ -278,7 +280,7 @@ void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
                     /* Raw, in declaration order, then zero-padded to the size the engine reads -
                        which also supplies Box's trailing IsValid byte. */
                     FArc Raw(V.Owner());
-                    for (const FPropertyDef& M : *P.Members) WriteValue(Raw, M, M.Default);
+                    for (const FPropertyDef& M : *Members) WriteValue(Raw, M, M.Default);
                     V.Append(Raw);
                     for (int32 i = int32(Raw.B.size()); i < N->second; ++i) V.U8(0);
                 }

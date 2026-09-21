@@ -313,7 +313,35 @@ def mod_enum():
     print('ok  TypesTest: int32 / int64 enums cook as EnumProperty over Int / Int64Property')
 
 
+def constants():
+    import re, subprocess
+    here = os.path.dirname(os.path.abspath(__file__))
+    base = asset('TypesTest')
+    exports = [e['name'] for e in dumpexp.load(base)[5]]
+    cdo = subprocess.run([sys.executable, os.path.join(here, 'dumptags.py'), base, str(exports.index('Default__TypesTest_C'))], capture_output=True, text=True).stdout
+    for want in ('Budget [0] IntProperty size=4: 25', 'Reach [0] FloatProperty size=4: 125.0', 'Bits [0] IntProperty size=4: 236'):
+        assert want in cdo, (want, cdo)
+    print('ok  TypesTest: a member default is what its constant expression comes to')
+    import struct
+    six, pair = struct.pack('<6f', 1, 2, 3, 4, 5, 6).hex(), struct.pack('<3f', 7, 8, 9).hex()
+    points = re.search(r'Points \[0\] ArrayProperty size=77 inner=StructProperty: (\w+)', cdo).group(1)   # count, inner tag (53), 2 x 12 raw
+    assert points.startswith('02000000') and points.endswith(six), points
+    assert re.search(r'Spans \[0\] ArrayProperty size=185 inner=StructProperty', cdo), cdo                 # 2 x (Min tag, Max tag, None) = 132
+    assert re.search(r'Spots \[0\] MapProperty size=28 .*: 0000000001000000\w{16}' + pair, cdo), cdo
+    print('ok  TypesTest: a container default holds struct elements, raw or tagged as the struct serializes')
+    base = asset('StringTest')
+    exports = [e['name'] for e in dumpexp.load(base)[5]]
+    walk = subprocess.run([sys.executable, os.path.join(here, 'walkscript.py'), base, str(exports.index('ReceiveBeginPlay'))], capture_output=True, text=True).stdout
+    flat = ' '.join(walk.split())
+    assert re.search(r"Concat_StrStr' .{0,60}?StringConst 'Kills: ' .{0,60}?Conv_IntToString'", flat), flat[-900:]
+    assert re.search(r"Concat_StrStr' .{0,60}?Conv_IntToString' .{0,160}?StringConst ' left'", flat), flat[-900:]
+    print('ok  StringTest: "lit" + N and N + "lit" are Concat_StrStr, not pointer arithmetic')
+
+
 mod_enum()
+constants()
+check('TypesTest', 'ConstSum', lambda N: N * 3 + 12 + 19, [dict(N=n) for n in (-4, 0, 9)])
+check('TypesTest', 'HalfOf', lambda V: V * 0.5, [dict(V=v) for v in (-3.0, 0.0, 8.0)])
 check('TypesTest', 'SpanScore', lambda S: {-3: 1, 70000: 2, 70001: 3, 70002: 4}.get(S, 0), [dict(S=s) for s in (-3, 70000, 70001, 70002, 5)])
 check('TypesTest', 'AgeOf', lambda A: 1 if A == 5000000000 else 2 if A == 0 else 0, [dict(A=a) for a in (0, 5000000000, 7)])
 check('TypesTest', 'MoodScore', lambda M: {0: 1, 5: 2, 6: 3}.get(M, 0), [dict(M=m) for m in (0, 5, 6, 7)])

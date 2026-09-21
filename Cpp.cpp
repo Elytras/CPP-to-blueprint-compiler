@@ -861,6 +861,11 @@ private:
     bool IsInlineMethod(const FRecord& R, const std::string& Method) const;
     bool ExpandInline(const Json& CallNode, const Json& Def, const std::string& Method, bool bMethod, FBlueprintClass& BP,
                       FCallIR& Out, std::string* Err);
+    /* A constant outside any function body, `constexpr int32 kMax = 40;` at namespace scope or static in a class:
+       decl id -> its VarDecl. It has no storage in a Blueprint, so a use is its value (FoldConst). */
+    std::map<std::string, const Json*> ConstVars;
+    struct FConstVal { bool bFloat = false; double F = 0; int64 I = 0; double Num() const { return bFloat ? F : double(I); } };
+    bool FoldConst(const Json& E, FConstVal& Out) const;
     std::map<std::string, const Json*> FreeInlines;                     // decl id -> an inline free function's definition
                                                                         // (a template's: each instantiation)
     /* The class a field access `Obj->Field` / `Field` reads from: Obj's static type, or the class being generated. */
@@ -2967,6 +2972,25 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         /* A reference local (or a range-for binding) is the variable it names, or the value at the address it keeps. */
         if (auto A = RefAlias.find(Ref.value("id", std::string())); A != RefAlias.end()) return LowerArg(A->second, BP, Out, Err);
         if (auto C = ParmConst.find(Ref.value("id", std::string())); C != ParmConst.end()) { Out = C->second; return true; }
+        if (auto G = ConstVars.find(Ref.value("id", std::string())); G != ConstVars.end())
+        {
+            /* No storage behind it in a Blueprint: the use is the value. */
+            const Json* Init = First(*G->second);
+            if (const Json* Lit = Init ? Strip(Init) : nullptr; Lit && Kind(*Lit) == "StringLiteral") return LowerArg(*Lit, BP, Out, Err);
+            FConstVal V;
+            if (!Init || !FoldConst(*N, V))
+            { *Err = Name(Ref) + " is not a constant AssetGen can work out: literals, enum constants and arithmetic over them"; return false; }
+            const EStrKind VK = StrKindOf(Canon(TypeOf(*N)));
+            Out.K = VK == SK_Float ? FArgIR::Float : VK == SK_Bool ? FArgIR::Bool : VK == SK_Byte ? FArgIR::Byte
+                  : VK == SK_Int64 ? FArgIR::Int64 : FArgIR::Int;
+            if (VK != SK_Float && VK != SK_Bool && VK != SK_Byte && VK != SK_Int64 && VK != SK_Int)
+            { *Err = Name(Ref) + ": a constant of type " + TypeOf(*N) + " has no literal in Kismet"; return false; }
+            Out.F = float(V.Num());
+            Out.B = V.Num() != 0;
+            Out.I = int32(V.I);
+            Out.I64 = V.I;
+            return true;
+        }
         if (RefKind != "ParmVarDecl" && RefKind != "VarDecl")
         {
             *Err = "TODO: DeclRefExpr to " + RefKind;
@@ -3139,6 +3163,24 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         const Json* LhsRaw = Nth(*N, 0);
         const Json* RhsRaw = Nth(*N, 1);
         if (!LhsRaw || !RhsRaw) { *Err = "binary operator with a missing side"; return false; }
+        /* `"Kills: " + N`: C++ reads an address N characters into the literal (clang warns, -Wstring-plus-int, and
+           compiles it), which nothing in a Blueprint could mean. It is the concat the author wrote. A float or an
+           object on the other side never gets here - clang refuses those, so they stay `FString("lit") + X`. */
+        if (const Json *L = Strip(LhsRaw), *R = Strip(RhsRaw); Op == "+" && L && R
+            && (Kind(*L) == "StringLiteral") != (Kind(*R) == "StringLiteral"))
+        {
+            Out.K = FArgIR::Call;
+            Out.InnerType = "FString";
+            Out.Sub = std::make_shared<FCallIR>();
+            Out.Sub->Fn = BP.EngineFunction("/Script/Engine", "KismetStringLibrary", "Concat_StrStr");
+            for (const Json* Side : { LhsRaw, RhsRaw })
+            {
+                FArgIR A;
+                if (!LowerArg(*Side, BP, A, Err) || !ConvertArg("FString", BP, A, Err)) return false;
+                Out.Sub->Args.push_back(A);
+            }
+            return true;
+        }
         /* Pointer arithmetic counts elements: P + N moves N * sizeof(*P) bytes, P - Q counts the elements between. */
         const std::string LP = PointeeOf(*LhsRaw), RP = PointeeOf(*RhsRaw);
         if ((Op == "+" || Op == "-") && (!LP.empty() || !RP.empty()))
@@ -5208,6 +5250,86 @@ std::string StripTypeKeywords(std::string T)
     return T;
 }
 
+/* The number a constant expression comes to: literals, enum constants, ConstVars, casts, and arithmetic over them,
+   each step rounded to the type clang gave it so `2 * 50.f` and `1 << 31` come out as C++ has them. False for
+   anything else (a call, sizeof, ?:) and for a division by zero.
+   ponytail: no comparisons, `&&`, `?:` or sizeof; add them when a mod writes one. */
+bool FCompiler::FoldConst(const Json& E, FConstVal& Out) const
+{
+    const std::string K = Kind(E);
+    const auto Fit = [&](FConstVal& V) {
+        std::string T = StripTypeKeywords(TypeOf(E));
+        if (auto En = Enums.find(T); En != Enums.end()) T = En->second.Underlying;
+        const bool bWantFloat = T == "float" || T == "double";
+        const bool bInt = T == "bool" || T == "int" || T == "int32" || T == "unsigned int" || T == "uint32" || T == "uint8"
+                       || T == "unsigned char" || T == "int8" || T == "signed char" || T == "short" || T == "unsigned short"
+                       || T == "int16" || T == "uint16" || IsInt64Type(T);
+        if (!bWantFloat && !bInt) return false;
+        if (bWantFloat) { V.F = T == "float" ? double(float(V.Num())) : V.Num(); V.bFloat = true; return true; }
+        V.I = V.bFloat ? int64(V.F) : V.I;
+        V.bFloat = false;
+        if (T == "bool") V.I = V.Num() != 0;
+        else if (T == "int" || T == "int32") V.I = int32(V.I);
+        else if (T == "unsigned int" || T == "uint32") V.I = uint32(V.I);
+        else if (T == "uint8" || T == "unsigned char") V.I = uint8(V.I);
+        else if (T == "int8" || T == "signed char") V.I = int8(V.I);
+        else if (T == "short" || T == "int16") V.I = int16(V.I);
+        else if (T == "unsigned short" || T == "uint16") V.I = uint16(V.I);
+        return true;
+    };
+    if (K == "IntegerLiteral") { Out = {}; Out.I = int64(std::strtoull(E.value("value", std::string("0")).c_str(), nullptr, 10)); return true; }
+    if (K == "FloatingLiteral") { Out = {}; Out.bFloat = true; Out.F = std::strtod(E.value("value", std::string("0")).c_str(), nullptr); return true; }
+    if (K == "CXXBoolLiteralExpr") { Out = {}; Out.I = E.value("value", false); return true; }
+    if (K == "ParenExpr" || K == "ConstantExpr" || K == "ExprWithCleanups")
+        return First(E) && FoldConst(*First(E), Out);
+    if (K == "ImplicitCastExpr" || K == "CStyleCastExpr" || K == "CXXStaticCastExpr" || K == "CXXFunctionalCastExpr")
+        return First(E) && FoldConst(*First(E), Out) && Fit(Out);
+    if (K == "DeclRefExpr" && E.contains("referencedDecl"))
+    {
+        const std::string Id = E["referencedDecl"].value("id", std::string());
+        if (auto V = EnumValues.find(Id); V != EnumValues.end()) { Out = {}; Out.I = V->second; return true; }
+        auto C = ConstVars.find(Id);
+        return C != ConstVars.end() && First(*C->second) && FoldConst(*First(*C->second), Out) && Fit(Out);
+    }
+    if (K == "UnaryOperator")
+    {
+        const std::string Op = E.value("opcode", std::string());
+        if (!First(E) || !FoldConst(*First(E), Out)) return false;
+        if (Op == "-") { Out.F = -Out.F; Out.I = -Out.I; }
+        else if (Op == "~" && !Out.bFloat) Out.I = ~Out.I;
+        else if (Op == "!") { Out.I = Out.Num() == 0; Out.bFloat = false; }
+        else if (Op != "+") return false;
+        return Fit(Out);
+    }
+    if (K != "BinaryOperator") return false;
+    const std::string Op = E.value("opcode", std::string());
+    FConstVal L, R;
+    if (!Nth(E, 0) || !Nth(E, 1) || !FoldConst(*Nth(E, 0), L) || !FoldConst(*Nth(E, 1), R)) return false;
+    Out = {};
+    if (L.bFloat || R.bFloat)
+    {
+        Out.bFloat = true;
+        if (Op == "+") Out.F = L.Num() + R.Num();
+        else if (Op == "-") Out.F = L.Num() - R.Num();
+        else if (Op == "*") Out.F = L.Num() * R.Num();
+        else if (Op == "/" && R.Num() != 0) Out.F = L.Num() / R.Num();
+        else return false;
+        return Fit(Out);
+    }
+    if (Op == "+") Out.I = L.I + R.I;
+    else if (Op == "-") Out.I = L.I - R.I;
+    else if (Op == "*") Out.I = L.I * R.I;
+    else if (Op == "/" && R.I != 0) Out.I = L.I / R.I;
+    else if (Op == "%" && R.I != 0) Out.I = L.I % R.I;
+    else if (Op == "&") Out.I = L.I & R.I;
+    else if (Op == "|") Out.I = L.I | R.I;
+    else if (Op == "^") Out.I = L.I ^ R.I;
+    else if (Op == "<<" && R.I >= 0 && R.I < 64) Out.I = int64(uint64(L.I) << R.I);
+    else if (Op == ">>" && R.I >= 0 && R.I < 64) Out.I = L.I >> R.I;
+    else return false;
+    return Fit(Out);
+}
+
 bool FCompiler::AssetRef(const Json& N, FBlueprintClass& BP, FIndex* Out)
 {
     if (Kind(N) != "UnaryOperator" || N.value("opcode", std::string()) != "&") return false;
@@ -5233,7 +5355,8 @@ bool FCompiler::AssetRef(const Json& N, FBlueprintClass& BP, FIndex* Out)
 bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& BP, std::string* Err, const Json* Init,
                              bool bKeepZero)
 {
-    Init = Strip(Init ? Init : First(F));
+    const Json* const Whole = Init ? Init : First(F);
+    Init = Strip(Whole);
     if (!Init) return true;
     std::string K = Kind(*Init);
 
@@ -5262,14 +5385,14 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
            elements are TPair lists; Items then alternates key, value. */
         const Json* List = Init;
         while (List && Kind(*List) != "InitListExpr") List = First(*List);
-        const bool bStructs = PD.Inner->Type == "StructProperty" || (bMap && PD.Value && PD.Value->Type == "StructProperty");
-        if (!List || bStructs || (bMap && !PD.Value))
-        { *Err = "TODO: a container default is a braced list of literals or &Assets: " + Name(F); return false; }
+        if (!List || (bMap && !PD.Value))
+        { *Err = Name(F) + ": a container default is a braced list, `= { 1, 2 }`, of values a lone member could take"; return false; }
         bool bOk = true;
         auto Add = [&](const FPropertyDef& Of, const Json* E) {
             FPropertyDef Element = Of;
             bOk = bOk && E && LowerDefault(F, Element, BP, Err, E);
             PD.Default.Items.push_back(Element.Default);
+            PD.Default.Items.back().Members = Element.Members;      // a struct element's members travel with it
         };
         ForEach(*List, [&](const Json& E) {
             if (!bMap) { Add(*PD.Inner, &E); return; }
@@ -5331,16 +5454,13 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
 
     FDefaultValue& D = PD.Default;
     const std::string& T = PD.Type;
-    const bool bNumber = K == "IntegerLiteral" || K == "FloatingLiteral" || K == "CXXBoolLiteralExpr";
-    if (bNumber && (T == "IntProperty" || T == "Int64Property" || T == "ByteProperty"
-                    || T == "FloatProperty" || T == "BoolProperty"))
+    /* A number is whatever the initializer comes to: `40`, `-1.5f`, `kMax * 2 + 1`, `1 << 3 | 2`. An enum-typed
+       byte keeps its named-constant path below. */
+    if (FConstVal V; (T == "IntProperty" || T == "Int64Property" || (T == "ByteProperty" && PD.StructName.empty())
+                      || T == "FloatProperty" || T == "BoolProperty") && FoldConst(*Whole, V))
     {
-        const std::string V = K == "CXXBoolLiteralExpr" ? std::string() : Init->value("value", std::string("0"));
-        double Num = K == "CXXBoolLiteralExpr" ? (Init->value("value", false) ? 1.0 : 0.0)
-                   : K == "FloatingLiteral"    ? std::strtod(V.c_str(), nullptr)
-                                               : double(std::strtoull(V.c_str(), nullptr, 10));
-        int64 Int = K == "IntegerLiteral" ? int64(std::strtoull(V.c_str(), nullptr, 10)) : int64(Num);
-        if (bNeg) { Num = -Num; Int = -Int; }
+        const double Num = V.Num();
+        const int64 Int = V.bFloat ? int64(V.F) : V.I;
         if (T == "FloatProperty") { D.K = bKeepZero || Num != 0.0 ? FDefaultValue::Float : FDefaultValue::None; D.F = Num; }
         else if (T == "BoolProperty") { D.K = bKeepZero || Num != 0.0 ? FDefaultValue::Bool : FDefaultValue::None; D.I = Num != 0.0; }
         else { D.K = bKeepZero || Int != 0 ? FDefaultValue::Int : FDefaultValue::None; D.I = Int; }
@@ -5359,7 +5479,9 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
         D.K = !bKeepZero && D.S.empty() ? FDefaultValue::None : FDefaultValue::Str;
         return true;
     }
-    *Err = "TODO: an initializer must be a literal of the member's own type: " + Name(F);
+    *Err = Name(F) + ": a default is a value known when the mod is built - a literal, a constant expression over "
+           "literals, enum constants and constexpr variables, a braced struct, or an &Asset. Anything computed when the "
+           "game runs belongs in the constructor-time event (ReceiveBeginPlay, UserConstructionScript)";
     return false;
 }
 
@@ -6580,6 +6702,15 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     if (!Collect(Err)) return false;
     /* Inline free functions anywhere in the translation unit, a template's instantiations included: a call names
        the instantiation's own FunctionDecl. Class bodies are skipped; their methods are the records'. */
+    std::function<void(const Json&)> IndexConsts = [&](const Json& N) {
+        const std::string K = Kind(N);
+        if (K == "VarDecl" && N.contains("init") && N.contains("id")
+            && (N.value("constexpr", false) || TypeOf(N).compare(0, 6, "const ") == 0))
+            ConstVars[N.value("id", std::string())] = &N;
+        if (K == "TranslationUnitDecl" || K == "NamespaceDecl" || K == "CXXRecordDecl" || K == "LinkageSpecDecl")
+            ForEach(N, IndexConsts);
+    };
+    IndexConsts(Doc);
     std::function<void(Json&)> IndexInlines = [&](Json& N) {
         if (!N.is_object()) return;
         const std::string K = Kind(N);

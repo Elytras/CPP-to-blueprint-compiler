@@ -21,6 +21,7 @@ struct FDefaultValue
     std::string S;                      // Str: UTF-8, for StrProperty / NameProperty / TextProperty
     FIndex Object;                      // Obj: the asset an ObjectProperty points at
     std::vector<FDefaultValue> Items;   // Array (also a set / map): one value per element, typed by the property's Inner; a map alternates key, value
+    std::shared_ptr<std::vector<struct FPropertyDef>> Members;  // Struct, as a container's element: its own members (a lone struct's are FPropertyDef::Members)
 };
 
 /* One ChildProperties entry. ElementSize must equal the type's runtime size; the engine lays the struct out from it. */
