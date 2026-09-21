@@ -339,6 +339,7 @@ def constants():
     exports = [e['name'] for e in dumpexp.load(base)[5]]
     tool = lambda t, i: subprocess.run([sys.executable, os.path.join(here, t), base, str(i)], capture_output=True, text=True).stdout
     assert re.search(r"ObjectProperty Aimed .*Class'Actor'", tool('dumpstruct.py', 0)), 'a `using` alias of a class is still an object reference'
+    assert re.search(r"ObjectProperty Spotted .*Class'Pawn'", tool('dumpstruct.py', 0)), 'and so is a class-scope one'
     forget = ' '.join(tool('walkscript.py', exports.index('Forget')).split())
     step = r' \+ *\d+ mem \d+ disk \d+ mem \d+ '
     assert re.search(r'InstanceVariable Health@\S+' + step + 'NoInterface', forget) and re.search(r'InstanceVariable Aimed@\S+' + step + 'NoObject', forget), forget

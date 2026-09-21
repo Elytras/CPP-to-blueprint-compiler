@@ -767,11 +767,27 @@ def main():
     ops_by_pkg = write_operators(ordered, out_dir)
     write_types(out_dir)
 
-    def rewrite(ctype):
+    def rewrite(ctype, short=None, me=None):
         def one(m):
             target = by_name.get(m.group(1))
+            if target and target.ns and (target is me or (short or {}).get(target.ue_name) == target.emit):
+                return target.ue_name               # a Blueprint class's own name, or a `using` the class opens with
             return "class %s" % target.emit if target else m.group(0)
         return CLASS_WORD.sub(one, ctype)
+
+    def short_names(k):
+        """A Blueprint class is named by its whole /Game path, which makes a signature unreadable. A class opens
+        with `using Leaf = Game::...::Leaf;` for each one its members name, where the leaf is free: one target
+        only, and not a member's name. Class scope, so nothing leaks into a namespace other headers share, and a
+        mod class deriving this one inherits the names."""
+        found = {}
+        for ctype in [f for f, _ in k.fields] + [x for _, ret, _, params in k.funcs for x in [ret] + [q for q, _ in params]]:
+            for c in class_refs(ctype):
+                target = by_name.get(c)
+                if target and target.ns and target is not k:
+                    found.setdefault(target.ue_name, set()).add(target.emit)
+        taken = set(n for _, n in k.fields) | set(f for _, _, f, _ in k.funcs) | {k.ue_name, k.cpp}
+        return dict((leaf, next(iter(e))) for leaf, e in found.items() if len(e) == 1 and leaf not in taken)
 
     funcs, fields, aliased = 0, 0, 0
     for pkg, members in sorted(by_pkg.items()):
@@ -804,11 +820,13 @@ def main():
             inherits = " : public %s" % base if base else ""
             body.append("class %s%s\n{\npublic:\n    UE_CLASS(\"%s\", \"%s\");"
                         % (k.ue_name if k.is_bp else k.cpp, inherits, k.path, k.ue_name))
+            short = short_names(k)
+            body += ["    using %s = %s;" % (leaf, short[leaf]) for leaf in sorted(short)]
             names = set(f for _, _, f, _ in k.funcs)
             for ftype, fname in k.fields:
                 if fname in names:
                     continue
-                body.append("    %s %s;" % (rewrite(ftype), fname))
+                body.append("    %s %s;" % (rewrite(ftype, short, k), fname))
                 if fname in k.replicated:
                     # What UE_REPLICATED_USING declares for a mod class: AssetGen wakes the actor before a set and
                     # calls the RepNotify function after it, as the editor's Set node does.
@@ -842,10 +860,10 @@ def main():
                 pure = (ret != "void" and (k.ue_name, fname) in PURE and not IMPURE_PURE.search(fname)
                         and not any(t.endswith("&") and not t.startswith("const ") for t, _ in params))
                 for vret, plist in variants:
-                    args = ", ".join("%s %s" % (rewrite(t), n) for t, n in plist)
+                    args = ", ".join("%s %s" % (rewrite(t, short, k), n) for t, n in plist)
                     body.append("    %s%s%s%s %s(%s)%s;" % (MARKS.get((k.ue_name, fname), ""),
                                                              "UE_PURE " if pure else "", "static " if is_static else "",
-                                                           rewrite(vret), fname, args,
+                                                           rewrite(vret, short, k), fname, args,
                                                            " const" if fname in k.const_funcs else ""))
                 funcs += 1
                 for t in [ret] + [t for t, _ in params]:

@@ -119,6 +119,32 @@ bool IsUnsetInit(const Json& E)
     return bAll;
 }
 
+/* Every type spelling under N with the aliases in scope written out. clang spells a use as the source did, and a
+   class-scope alias means what it says only inside that class and the ones deriving it - so it is expanded there,
+   once, before anything reads a type. A name already qualified (`A::Leaf`) is left alone. */
+void ExpandAliases(Json& N, const std::map<std::string, std::string>& InScope)
+{
+    if (!N.is_structured()) return;
+    auto T = N.is_object() ? N.find("type") : N.end();
+    if (T != N.end() && T->is_object() && T->contains("qualType"))
+    {
+        const std::string Q = (*T)["qualType"].get<std::string>();
+        std::string Out;
+        for (size_t I = 0; I < Q.size();)
+        {
+            if (!std::isalpha(uint8(Q[I])) && Q[I] != '_') { Out += Q[I++]; continue; }
+            size_t E = I;
+            while (E < Q.size() && (std::isalnum(uint8(Q[E])) || Q[E] == '_')) ++E;
+            const bool bQualified = I >= 2 && Q[I - 1] == ':' && Q[I - 2] == ':';
+            const auto A = bQualified ? InScope.end() : InScope.find(Q.substr(I, E - I));
+            Out += A == InScope.end() ? Q.substr(I, E - I) : A->second;
+            I = E;
+        }
+        if (Out != Q) (*T)["qualType"] = Out;
+    }
+    for (Json& C : N) ExpandAliases(C, InScope);
+}
+
 /* A CXXOperatorCallExpr whose callee is operator=: struct assignment, which clang does not spell
    as a BinaryOperator. The callee is the first inner node. */
 bool IsAssignOperatorCall(const Json& N)
@@ -301,6 +327,7 @@ struct FRecord
     std::vector<std::string> Interfaces;            // every base after the first
     std::map<std::string, std::string> Replicated;  // UE_REPLICATED*: variable -> "Notify:Condition"
     std::set<std::string> Components;               // UE_COMPONENT: variables that are also SCS nodes
+    std::map<std::string, std::string> TypeAliases; // `using Leaf = Game::...::Leaf;` in the class body
     const Json* Defaults = nullptr;                 // UE_DEFAULTS: the static-init block, never lowered
     bool bIsLocal = false;      // UePackage == ModPackage/CppName: cooked here, published at its /Game path
     bool bIsStruct = false;     // UE_STRUCT: cooked as a UserDefinedStruct asset
@@ -1568,7 +1595,15 @@ bool FCompiler::Collect(std::string* Err)
                 R.Fields.push_back(&C);
                 FieldOwner[C.value("id", std::string())] = R.CppName;
             }
+            else if ((Kind(C) == "TypeAliasDecl" || Kind(C) == "TypedefDecl") && C.contains("name"))
+                R.TypeAliases[Name(C)] = StripTypeKeywords(TypeOf(C));
         });
+        /* genueapi opens a Blueprint class with `using JSONValue_C = Game::...::JSONValue_C;` so its signatures stay
+           readable, and a mod class deriving it writes `JSONValue_C*` through the same names. The nearer one wins. */
+        std::map<std::string, std::string> InScope = R.TypeAliases;
+        for (const FRecord* A = R.Base.empty() ? nullptr : Find(R.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
+            InScope.insert(A->TypeAliases.begin(), A->TypeAliases.end());
+        if (!InScope.empty()) ExpandAliases(const_cast<Json&>(N), InScope);
         /* A leaf name claimed by a second class is withdrawn, not overwritten. */
         const std::string Leaf = Name(N);
         if (!Ns.empty() && !Ambiguous.count(Leaf))
@@ -5609,6 +5644,18 @@ bool FCompiler::NestedWrapperOut(const std::string& ContainerType, size_t OutArg
     return true;
 }
 
+/* A class the headers only forward-declare has no record, so nothing says what package to import it from. A
+   Blueprint class's header is named after it. */
+static std::string UnknownClass(const std::string& Where, const std::string& QualType, std::string Class)
+{
+    Class = StripTypeKeywords(Class);
+    const size_t Leaf = Class.rfind("::");
+    if (Class.size() > 2 && Class.compare(Class.size() - 2, 2, "_C") == 0)
+        return Where + ": " + Class + " is only forward-declared here - #include \"UeApi/Game/"
+             + Class.substr(Leaf == std::string::npos ? 0 : Leaf + 2) + ".h\"";
+    return "TODO: unimplemented " + Where + ": " + QualType;
+}
+
 bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& PName, uint64 ExtraFlags,
                                const std::string& Where, FBlueprintClass& BP, FPropertyDef* Out, std::string* Err)
 {
@@ -5640,7 +5687,7 @@ bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& P
     if (TemplateArg(Type, "TScriptInterface", &Inner))
     {
         const FRecord* IR = Find(Inner);
-        if (!IR || IR->bIsStruct) { *Err = "TODO: unimplemented " + Where + ": " + QualType; return false; }
+        if (!IR || IR->bIsStruct) { *Err = UnknownClass(Where, QualType, Inner); return false; }
         *Out = InterfaceParam(PName, ClassImportOf(*IR, BP), ExtraFlags);
         return true;
     }
@@ -5726,7 +5773,7 @@ bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& P
         return true;
     }
     const FRecord* PR = ClassName.empty() ? nullptr : Find(ClassName);
-    if (!PR || PR->bIsStruct) { *Err = "TODO: unimplemented " + Where + ": " + QualType; return false; }
+    if (!PR || PR->bIsStruct) { *Err = UnknownClass(Where, QualType, ClassName); return false; }
     *Out = ObjectParam(PName, PR->IsNative() ? BP.EngineClass(PR->UePackage, PR->UeName)
                                              : BP.EngineClass(ModPackage + "/" + PR->CppName, PR->CppName + "_C"),
                        ExtraFlags);
