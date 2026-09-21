@@ -371,6 +371,14 @@ void FScript::ClassCast(EExprToken Token, FIndex Class, const std::function<void
     Expr(*this);
 }
 
+void FScript::PrimitiveCast(ECastToken Cast, const std::function<void(FScript&)>& Expr)
+{
+    Op(EX_PrimitiveCast);
+    Ar.U8(uint8(Cast));
+    Memory += 1;
+    Expr(*this);
+}
+
 void FScript::InterfaceContext(const std::function<void(FScript&)>& InterfaceExpr)
 {
     Op(EX_InterfaceContext);

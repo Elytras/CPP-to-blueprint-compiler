@@ -490,6 +490,7 @@ const char* ViewFieldOf(const std::string& DerefIntrinsic)
 
 /* SelfExp: the enclosing function's export index, FFieldPath owner of its params and locals. */
 bool EmitArgs(FScript& S, const std::vector<FArgIR>& Args, FIndex SelfExp, std::string* Err);
+FArgIR NotOf(FArgIR V, FBlueprintClass& BP);
 
 bool EmitArg(FScript& S, const FArgIR& A, FIndex SelfExp, std::string* Err)
 {
@@ -519,7 +520,9 @@ bool EmitArg(FScript& S, const FArgIR& A, FIndex SelfExp, std::string* Err)
         if (!A.Sub || A.Sub->Args.size() != 1) { if (Err) *Err = "internal: DynCast arg has no operand"; return false; }
         bool bOk = true;
         std::string SubErr;
-        S.ClassCast(A.CastOp, A.Owner, [&](FScript& C) { bOk = EmitArg(C, A.Sub->Args[0], SelfExp, &SubErr); });
+        const auto Operand = [&](FScript& C) { bOk = EmitArg(C, A.Sub->Args[0], SelfExp, &SubErr); };
+        if (A.CastOp == EX_PrimitiveCast) S.PrimitiveCast(ECastToken(A.I), Operand);
+        else S.ClassCast(A.CastOp, A.Owner, Operand);
         if (!bOk && Err) *Err = SubErr;
         return bOk;
     }
@@ -1707,6 +1710,7 @@ EStrKind KindOfLowered(const FArgIR& A, const std::string& InnerType)
     case FArgIR::Bool:  return SK_Bool;
     case FArgIR::Byte:  return SK_Byte;
     case FArgIR::DynCast: return A.CastOp == EX_ObjToInterfaceCast || A.CastOp == EX_CrossInterfaceCast
+                              || A.CastOp == EX_PrimitiveCast
                                  ? StrKindOf(InnerType) : SK_Object;
     case FArgIR::Self:
     case FArgIR::ObjConst:
@@ -1824,6 +1828,20 @@ bool FCompiler::ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgI
         /* `if (Obj)` tests the object the way a Blueprint does, so a pending-kill object is false too. */
         WrapInCall(Arg, BP.EngineFunction("/Script/Engine", "KismetSystemLibrary", "IsValid"));
         Arg.InnerType = "bool";
+        return true;
+    }
+    if (std::string TestedIface; ToKind == SK_Bool && TemplateArg(From, "TScriptInterface", &TestedIface))
+    {
+        /* Measured on ENE_Flea's K2Node_DynamicCast_bSuccess: EX_PrimitiveCast CST_InterfaceToBool over the
+           interface value. execInterfaceToBool (ScriptCore.cpp) answers GetObject() != null. */
+        FArgIR Operand = Arg;
+        Arg = FArgIR();
+        Arg.K = FArgIR::DynCast;
+        Arg.CastOp = EX_PrimitiveCast;
+        Arg.I = CST_InterfaceToBool;
+        Arg.InnerType = "bool";
+        Arg.Sub = std::make_shared<FCallIR>();
+        Arg.Sub->Args.push_back(Operand);
         return true;
     }
     if (ToKind == SK_Bool && FromKind == SK_Int64)
@@ -2633,6 +2651,15 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         const Json* Lhs = Nth(*N, 1);
         const Json* Rhs = Nth(*N, 2);
         std::string Iface;
+        if ((OpName == "operator==" || OpName == "operator!=") && Lhs && Rhs
+            && TemplateArg(StripTypeKeywords(TypeOf(*Lhs)), "TScriptInterface", &Iface)
+            && Kind(*Strip(Rhs)) == "CXXNullPtrLiteralExpr")
+        {
+            /* `I != nullptr` is `bool(I)`, and `I == nullptr` its negation. */
+            if (!LowerArg(*Lhs, BP, Out, Err) || !ConvertArg("bool", BP, Out, Err)) return false;
+            if (OpName == "operator==") Out = NotOf(std::move(Out), BP);
+            return true;
+        }
         if (OpName == "operator->" && Lhs && TemplateArg(TypeOf(*Lhs), "TScriptInterface", &Iface))
         {
             /* `I->Fn()`: the call's object is EX_InterfaceContext(I). */

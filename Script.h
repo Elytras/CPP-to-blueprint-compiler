@@ -115,6 +115,8 @@ public:
     void DynamicCast(FIndex Class, const std::function<void(FScript&)>& Expr);
     /* EX_ObjToInterfaceCast / EX_CrossInterfaceCast / EX_InterfaceToObjCast / EX_DynamicCast: class, then the value. */
     void ClassCast(EExprToken Token, FIndex Class, const std::function<void(FScript&)>& Expr);
+    /* EX_PrimitiveCast: the ECastToken byte, then the value. */
+    void PrimitiveCast(ECastToken Cast, const std::function<void(FScript&)>& Expr);
     /* The object an EX_Context runs against, read out of an FScriptInterface. */
     void InterfaceContext(const std::function<void(FScript&)>& InterfaceExpr);
 
