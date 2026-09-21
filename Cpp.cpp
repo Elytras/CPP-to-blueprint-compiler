@@ -330,6 +330,11 @@ struct FRecord
     /* genueapi's `<X>__UeName`: the engine's name of a member or function Dumper-7 had to respell (`Name_0` is
        `Name`, `Audio_Flying` is `Audio Flying`). C++ keeps its spelling; everything cooked goes through UeNameOf. */
     std::map<std::string, std::string> UeNames;
+    /* The C++ access specifier, which is the editor's own: private is the class alone, protected its subclasses too.
+       A function carries it as a flag. A variable has private only, and only as editor metadata, so a private
+       field is simply left out of the API stub; a protected one stays visible, a subclass having a right to it. */
+    std::map<std::string, uint32> MethodAccess;     // method -> FUNC_Public / FUNC_Protected / FUNC_Private
+    std::set<std::string> PrivateFields;
     std::map<std::string, std::string> ScsNodes;    // `<X>__UeScsNode`: a game Blueprint's component -> its node's guid, 32 hex
     std::map<std::string, std::string> TypeAliases; // `using Leaf = Game::...::Leaf;` in the class body
     const Json* Defaults = nullptr;                 // UE_DEFAULTS: the static-init block, never lowered
@@ -1564,7 +1569,13 @@ bool FCompiler::Collect(std::string* Err)
                 else R.Interfaces.push_back(T);
             }
 
+        uint32 Access = N.value("tagUsed", std::string()) == "struct" ? FUNC_Public : FUNC_Private;
         ForEach(N, [&](const Json& C) {
+            if (Kind(C) == "AccessSpecDecl")
+            {
+                const std::string A = C.value("access", std::string());
+                Access = A == "public" ? FUNC_Public : A == "protected" ? FUNC_Protected : FUNC_Private;
+            }
             if (Kind(C) == "VarDecl" && Name(C) == "UeClassMeta")
             {
                 std::string Meta;
@@ -1624,11 +1635,13 @@ bool FCompiler::Collect(std::string* Err)
                 const Json*& Slot = R.Methods[Name(C)];
                 if (!Slot || ParmNames(C).size() > ParmNames(*Slot).size()) Slot = &C;
                 MethodOwner[C.value("id", std::string())] = R.CppName;
+                R.MethodAccess[Name(C)] = Access;
             }
             else if (Kind(C) == "FieldDecl" && C.contains("name"))
             {
                 R.Fields.push_back(&C);
                 FieldOwner[C.value("id", std::string())] = R.CppName;
+                if (Access == FUNC_Private) R.PrivateFields.insert(Name(C));
             }
             else if ((Kind(C) == "TypeAliasDecl" || Kind(C) == "TypedefDecl") && C.contains("name"))
                 R.TypeAliases[Name(C)] = StripTypeKeywords(TypeOf(C));
@@ -6376,6 +6389,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         PD.PropertyFlags = (PD.PropertyFlags & ~uint64(CPF_Parm | CPF_BlueprintReadOnly))
                          | CPF_Edit | CPF_BlueprintVisible | CPF_DisableEditOnInstance;
         if (TypeOf(*F).compare(0, 6, "const ") == 0) PD.PropertyFlags |= CPF_BlueprintReadOnly;
+        PD.bApiHidden = Decl.PrivateFields.count(Name(*F)) != 0;
         if (&Decl == &R && R.Components.count(FieldName))
         {
             if (!bIsActor) { *Err = R.CppName + "::" + FieldName + ": only an actor has a construction script"; return false; }
@@ -6668,6 +6682,10 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                      : IsStaticDecl(Decl) ? uint32(FUNC_Static | FUNC_BlueprintCallable | FUNC_Public | FUNC_Final)
                      : FFunctionDef().FunctionFlags;
         /* All 7229 BlueprintPure functions in the DRG dump are BlueprintCallable too. */
+        /* Its own access specifier, where no parent decides. The editor refuses a call node it forbids; the VM checks
+           nothing, and clang has already refused what C++ forbids. */
+        if (auto A = R.MethodAccess.find(Fn.Name); !Inherited && A != R.MethodAccess.end())
+            Flags = (Flags & ~uint32(FUNC_Public | FUNC_Protected | FUNC_Private)) | A->second;
         if (IsPureDecl(M)) Flags |= FUNC_BlueprintPure | FUNC_BlueprintCallable;
         const std::string DeclType = TypeOf(Decl);
         if (DeclType.size() > 6 && DeclType.compare(DeclType.size() - 6, 6, " const") == 0) Flags |= FUNC_Const;

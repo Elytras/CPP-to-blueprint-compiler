@@ -375,6 +375,17 @@ def engine_names():
     walk = tool('walkscript.py', exports.index('Next'))
     assert re.search(r"InstanceVariable\s+Index@imp\[\d+\]:Class'FSDSaveGame'", walk) and 'Index_0' not in walk, walk
     print('ok  NameTest: a member Dumper-7 respelled is cooked by the engine\'s name (tag and bytecode)')
+    # FUNC_Public 0x20000, FUNC_Private 0x40000, FUNC_Protected 0x80000: exactly the one the C++ specifier says.
+    for fn, want in (('Next', 0x20000), ('Step', 0x80000), ('Twice', 0x40000)):
+        flags = int(re.search(r'FunctionFlags (\S+)', tool('dumpstruct.py', exports.index(fn))).group(1), 16)
+        assert flags & 0xE0000 == want, (fn, hex(flags))
+    print('ok  NameTest: a function carries its C++ access specifier')
+    # CPF_BlueprintReadOnly 0x10 on the const member alone, and its initializer is the default.
+    props = tool('dumpstruct.py', exports.index('NameTest_C'))
+    flags = lambda name: int(re.search(r'Property %s .*? flags=(\S+)' % name, props).group(1), 16)
+    assert flags('Limit') & 0x10 and not flags('Seed') & 0x10, props
+    assert 'Limit [0] IntProperty size=4: 3' in cdo, cdo
+    print('ok  NameTest: a const member is BlueprintReadOnly')
 
 
 mod_enum()

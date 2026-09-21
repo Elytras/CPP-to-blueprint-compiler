@@ -621,7 +621,7 @@ bool FBlueprintClass::WriteApi(const std::string& OutDir, std::string* Err) cons
     /* Only what the outside can see. The rest - the UberGraphFrame pointer above all - is
        compiler plumbing that would show up as a broken variable in the editor. */
     for (const FPropertyDef& Var : Vars)
-        if (Var.PropertyFlags & CPF_BlueprintVisible) Api.Variables.push_back(Var);
+        if ((Var.PropertyFlags & CPF_BlueprintVisible) && !Var.bApiHidden) Api.Variables.push_back(Var);
     return WriteApiAsset(Api, P, OutDir, Err);
 }
 
