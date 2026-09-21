@@ -564,6 +564,7 @@ void FScript::TextConst(const std::string& Value, bool bWide)
 void FScript::True() { Op(EX_True); }
 void FScript::False() { Op(EX_False); }
 void FScript::NoObject() { Op(EX_NoObject); }
+void FScript::NoInterface() { Op(EX_NoInterface); }
 
 void FScript::SoftObjectConst(const std::string& Path)
 {

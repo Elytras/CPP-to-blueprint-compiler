@@ -111,6 +111,7 @@ public:
     void True();
     void False();
     void NoObject();
+    void NoInterface();
     void ObjectConst(FIndex Object);
     void SoftObjectConst(const std::string& Path);
     void DynamicCast(FIndex Class, const std::function<void(FScript&)>& Expr);

@@ -335,6 +335,14 @@ def constants():
     assert re.search(r'Spans \[0\] ArrayProperty size=185 inner=StructProperty', cdo), cdo                 # 2 x (Min tag, Max tag, None) = 132
     assert re.search(r'Spots \[0\] MapProperty size=28 .*: 0000000001000000\w{16}' + pair, cdo), cdo
     print('ok  TypesTest: a container default holds struct elements, raw or tagged as the struct serializes')
+    base = asset('TypesTest')
+    exports = [e['name'] for e in dumpexp.load(base)[5]]
+    tool = lambda t, i: subprocess.run([sys.executable, os.path.join(here, t), base, str(i)], capture_output=True, text=True).stdout
+    assert re.search(r"ObjectProperty Aimed .*Class'Actor'", tool('dumpstruct.py', 0)), 'a `using` alias of a class is still an object reference'
+    forget = ' '.join(tool('walkscript.py', exports.index('Forget')).split())
+    step = r' \+ *\d+ mem \d+ disk \d+ mem \d+ '
+    assert re.search(r'InstanceVariable Health@\S+' + step + 'NoInterface', forget) and re.search(r'InstanceVariable Aimed@\S+' + step + 'NoObject', forget), forget
+    print('ok  TypesTest: a class alias stays an object; nullptr is EX_NoInterface for an interface')
     base = asset('StringTest')
     exports = [e['name'] for e in dumpexp.load(base)[5]]
     walk = subprocess.run([sys.executable, os.path.join(here, 'walkscript.py'), base, str(exports.index('ReceiveBeginPlay'))], capture_output=True, text=True).stdout

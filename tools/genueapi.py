@@ -271,6 +271,12 @@ def struct_deps(st):
     return out
 
 
+def beside(pkg, target):
+    """target's header as pkg's header spells it: relative to its own folder ("../UeMeta" from Game/X), so a
+    header resolves with no include path at all - an editor's IntelliSense has none."""
+    return os.path.relpath(target, os.path.dirname(pkg) or ".").replace(os.sep, "/")
+
+
 def emit_struct(st, conv_names):
     body = ["struct %s%s" % (st.cpp, (" : public %s" % st.base) if st.base in STRUCTS else ""), "{"]
     base = STRUCTS.get(st.base)
@@ -865,8 +871,8 @@ def main():
                "",
                "A member is here if and only if AssetGen can compile a use of it.",
                "*/",
-               "#include \"UeMeta.h\""]
-        out += ["#include \"%s.h\"" % d for d in sorted(deps[pkg])]
+               "#include \"%s.h\"" % beside(pkg, "UeMeta")]
+        out += ["#include \"%s.h\"" % beside(pkg, d) for d in sorted(deps[pkg])]
         out += [""]
         fwd = {}
         for c in sorted(referenced - defined):

@@ -516,7 +516,7 @@ bool EmitArg(FScript& S, const FArgIR& A, FIndex SelfExp, std::string* Err)
     switch (A.K)
     {
     case FArgIR::Self:    S.Self(); return true;
-    case FArgIR::NullObj: S.NoObject(); return true;
+    case FArgIR::NullObj: if (A.CastOp == EX_NoInterface) S.NoInterface(); else S.NoObject(); return true;
     case FArgIR::Int:   S.IntConst(A.I); return true;
     case FArgIR::Int64: S.Int64Const(A.I64); return true;
     case FArgIR::Float: S.FloatConst(A.F); return true;
@@ -986,9 +986,11 @@ private:
         auto It = Records.find(CppName);
         if (It != Records.end()) return &It->second;
         auto B = Bare.find(CppName);
-        if (B == Bare.end()) return nullptr;
-        It = Records.find(B->second);
-        return It == Records.end() ? nullptr : &It->second;
+        if (B != Bare.end()) { It = Records.find(B->second); return It == Records.end() ? nullptr : &It->second; }
+        /* `using JSONValue_C = Game::_AssemblyStorm::Common::JSON::JSONValue_C;` - how a mod names a class two
+           packages both have, which the headers can give no short name. clang spells a use as the alias. */
+        auto A = Aliases.find(CppName);
+        return A == Aliases.end() || A->second == CppName ? nullptr : Find(A->second);
     }
 
     Json Doc;
@@ -1046,6 +1048,7 @@ private:
     std::map<std::string, std::string> MethodOwner;   // clang decl id -> owning record
     std::map<std::string, std::string> FieldOwner;    // clang decl id -> declaring record
     std::map<std::string, std::string> Bare;          // unambiguous leaf name -> qualified name
+    std::map<std::string, std::string> Aliases;       // a namespace-scope `using A = B;` / typedef: A -> B
     const FRecord* Cur = nullptr;                     // record Generate is working on
     std::set<std::string> CurrentOutParms;            // T& parm names of the function being lowered
     bool bCurNet = false;                             // the function being lowered is an RPC
@@ -1439,6 +1442,8 @@ bool FCompiler::Collect(std::string* Err)
             Walk(N, Ns + Name(N) + "::");
             return;
         }
+        if ((Kind(N) == "TypeAliasDecl" || Kind(N) == "TypedefDecl") && N.contains("name"))
+            Aliases[Ns + Name(N)] = Aliases[Name(N)] = StripTypeKeywords(TypeOf(N));
         if (Kind(N) == "VarDecl" && Name(N) == "UeModPackage") FindLiteral(N, ModPackage);
         if (Kind(N) == "VarDecl" && BracedInit(N)) AssetDecls.push_back(&N);
         if (Kind(N) == "VarDecl" && Name(N).size() > 9 && Name(N).compare(Name(N).size() - 9, 9, "__UeAsset") == 0)
@@ -1931,6 +1936,10 @@ bool FCompiler::ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgI
     if (TemplateArg(To, "TScriptInterface", &ToIface))
     {
         /* Measured on ENE_Flea: an object becomes an interface through EX_ObjToInterfaceCast. */
+        /* `nullptr` for an interface is EX_NoInterface, as the Kismet compiler writes a null interface literal
+           (KismetCompilerVMBackend.cpp:1025): EX_NoObject would set 8 of FScriptInterface's 16 bytes. It needs no
+           record of the interface, which a header may only have forward-declared. */
+        if (Arg.K == FArgIR::NullObj) { Arg.CastOp = EX_NoInterface; Arg.InnerType = To; return true; }
         const bool bFromIface = TemplateArg(From, "TScriptInterface", &FromIface);
         const FRecord* IR = Find(ToIface);
         if (!IR || (!bFromIface && FromKind != SK_Object)) { *Err = "no conversion from " + From + " to " + To; return false; }
@@ -2307,8 +2316,10 @@ bool FCompiler::IsRawPointer(std::string T) const
     if (!Pointee.empty() && Pointee.back() == '*') return true;
     /* A UObject class carries UE_CLASS or a base; FString, FName and the containers are plain C++ records. */
     if (const FRecord* R = Find(Pointee)) return R->bIsStruct || (R->UePackage.empty() && R->Base.empty());
-    /* ponytail: a class these headers only forward-declare is still an object when UE's prefix says so, so a
-       property of it stays a reference the GC sees; an undefined class without the prefix passes for raw. */
+    /* ponytail: a class these headers only forward-declare is still an object when UE's prefix - or a Blueprint
+       class's _C - says so, so a property of it stays a reference the GC sees (and an unknown one is refused, not
+       cooked as an int64); an undefined class with neither passes for raw. */
+    if (Pointee.size() > 2 && Pointee.compare(Pointee.size() - 2, 2, "_C") == 0) return false;
     return !(Pointee.size() > 1 && (Pointee[0] == 'U' || Pointee[0] == 'A') && std::isupper(uint8(Pointee[1])));
 }
 
