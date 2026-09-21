@@ -14,6 +14,28 @@ FBlueprintClass::FBlueprintClass(FPackage& InPkg, std::string InClassName,
 {
 }
 
+void ScsNodeGuid(const std::string& ClassName, const std::string& ComponentName, uint32 (&Out)[4])
+{
+    const std::string Seed = ClassName + ".scs." + ComponentName;
+    Out[0] = StrCrc32(Seed) | 1u;               // non-zero: a null GUID reads as "unset"
+    Out[1] = Strihash(Seed);
+    Out[2] = StrCrc32(Seed + "\x01");
+    Out[3] = Strihash(Seed + "\x02") | 1u;
+}
+
+FIndex FBlueprintClass::Subobject(const std::string& ClassPackage, const std::string& ClassName_,
+                                  FIndex Outer, const std::string& ObjectName)
+{
+    const std::string Key = "sub:" + std::to_string(Outer.V) + ":" + ObjectName;
+    auto It = ImportCache.find(Key);
+    if (It != ImportCache.end()) return Imp(It->second);
+
+    EngineClass(ClassPackage, ClassName_);      // the linker resolves an import's class through its own import
+    const int32 Row = P.AddImport({ ClassPackage, ClassName_, Outer, ObjectName });
+    ImportCache.emplace(Key, Row);
+    return Imp(Row);
+}
+
 FIndex FBlueprintClass::PackageImport(const std::string& PackageName)
 {
     const std::string Key = "pkg:" + PackageName;
@@ -157,6 +179,20 @@ void FBlueprintClass::AddComponent(const std::string& Name, FIndex ComponentClas
     Components.push_back(FComponent{ Name, ComponentClass, ComponentCdo, bIsSceneComponent, Defaults });
 }
 
+void FBlueprintClass::AddComponentOverride(const std::string& Name, FIndex ComponentClass, FIndex ParentTemplate,
+                                           FIndex OwnerClass, const uint32 (&AssociatedGuid)[4],
+                                           const std::vector<FPropertyDef>& Defaults)
+{
+    FComponentOverride O;
+    O.Name = Name;
+    O.Class = ComponentClass;
+    O.ParentTemplate = ParentTemplate;
+    O.OwnerClass = OwnerClass;
+    for (int32 I = 0; I < 4; ++I) O.Guid[I] = AssociatedGuid[I];
+    O.Defaults = Defaults;
+    ComponentOverrides.push_back(std::move(O));
+}
+
 void FBlueprintClass::Finish()
 {
     const std::string CDOName = "Default__" + ClassName;
@@ -184,6 +220,9 @@ void FBlueprintClass::Finish()
     /* Each UE_COMPONENT takes two rows, archetype then node, so the SCS lands after them all. */
     const int32 RowFirstComponent = RowScsNode + 1;
     const int32 RowScs = RowFirstComponent + 2 * int32(Components.size());
+    /* The handler, then one replacement archetype per overridden inherited component. */
+    const int32 RowIch = RowScs + 1;
+    const int32 RowFirstOverride = RowIch + 1;
     const FIndex ScsIdx = bIsActor ? Exp(RowScs) : Null();
     ClassRow = RowClass;
 
@@ -219,6 +258,7 @@ void FBlueprintClass::Finish()
     const FIndex UberGraph = UberGraphFunction;
     /* UBlueprintGeneratedClass::GetLifetimeBlueprintReplicationList stops after this many CPF_Net properties: without
        the tag nothing the class declares replicates. Measured on BP_LiftPod: the first tag. */
+    const int32 NumOverrides = int32(ComponentOverrides.size());
     const int32 NumReplicated = int32(std::count_if(Vars.begin(), Vars.end(),
                                                     [](const FPropertyDef& V) { return (V.PropertyFlags & CPF_Net) != 0; }));
     Class.Serialize = [=](FArc& Ar) {
@@ -231,6 +271,8 @@ void FBlueprintClass::Finish()
            UberGraphFrame property by name. */
         if (UberGraph.V != 0)
             Tag(Ar, "UberGraphFunction", "ObjectProperty", [=](FArc& V) { V.Idx(UberGraph); });
+        if (NumOverrides > 0)
+            Tag(Ar, "InheritableComponentHandler", "ObjectProperty", [=](FArc& V) { V.Idx(Exp(RowIch)); });
         TagEnd(Ar);
         Ar.Bool(false);
 
@@ -278,7 +320,8 @@ void FBlueprintClass::Finish()
         [](const FPending& F) { return F.Def.Name == "ReceiveTick"; });
 
     const bool bCdoReplicates = bReplicates;
-    Cdo.Serialize = [bOverridesTick, ClassVars, bCdoReplicates](FArc& Ar) {
+    const std::vector<FPropertyDef> Inherited = CdoDefaults;
+    Cdo.Serialize = [bOverridesTick, ClassVars, bCdoReplicates, Inherited](FArc& Ar) {
         if (bCdoReplicates) TagBool(Ar, "bReplicates", true);
         if (bOverridesTick)
             Tag(Ar, "PrimaryActorTick", "StructProperty", [](FArc& V) {
@@ -288,6 +331,9 @@ void FBlueprintClass::Finish()
         /* Only initialised members: an absent tag keeps the parent CDO's (zero) value. */
         for (const FPropertyDef& V : ClassVars)
             if (V.Default.K != FDefaultValue::None) WriteDefaultTag(Ar, V);
+        /* A property an ancestor declares: UE_DEFAULTS writes it here, where re-declaring the name
+           would instead shadow it with a second property of the same name on this class. */
+        for (const FPropertyDef& V : Inherited) WriteDefaultTag(Ar, V);
         TagEnd(Ar);                                 // a CDO omits the lazy-object guid
     };
     P.AddExport(std::move(Cdo));
@@ -380,10 +426,8 @@ void FBlueprintClass::Finish()
         };
         P.AddExport(std::move(Template));
 
-        /* Stable across rebuilds, and non-zero: the editor treats a null VariableGuid as unset. */
-        const std::string Seed = ClassName + ".scs." + C.Name;
-        const uint32 NodeGuid[4] = { StrCrc32(Seed) | 1u, Strihash(Seed), StrCrc32(Seed + "\x01"),
-                                     Strihash(Seed + "\x02") | 1u };
+        uint32 NodeGuid[4];
+        ScsNodeGuid(ClassName, C.Name, NodeGuid);
         const bool bAttached = C.bIsScene && int32(I) != FirstScene;
         const std::string ParentName = bAttached ? Components[size_t(FirstScene)].Name : std::string();
         const FIndex CompClass = C.Class;
@@ -446,6 +490,84 @@ void FBlueprintClass::Finish()
         Ar.Bool(false);
     };
     P.AddExport(std::move(Scs));
+
+    if (ComponentOverrides.empty()) return;
+
+    /*
+    The editor's "override an inherited component's defaults". UInheritableComponentHandler holds one
+    record per overridden component; USCS_Node::GetActualComponentTemplate walks this class and its
+    supers asking each handler for the parent node's FComponentKey, which matches on OwnerClass and
+    AssociatedGuid only. Each record's template is a component archetyped on the PARENT's template, so
+    its tags are exactly the deltas. CookedComponentInstancingData is left unwritten: the fast path
+    only runs when bHasValidCookedData, and ExecuteNodeOnActor falls back to the template object.
+    */
+    const FIndex IchClass = EngineClass("/Script/Engine", "InheritableComponentHandler");
+    const FIndex IchCdo = ClassDefaultObject("/Script/Engine", "InheritableComponentHandler");
+    const std::vector<FComponentOverride> Overrides = ComponentOverrides;
+
+    FExport Ich;
+    Ich.ClassIndex = IchClass;
+    Ich.TemplateIndex = IchCdo;
+    Ich.OuterIndex = Exp(RowClass);
+    Ich.ObjectName = "InheritableComponentHandler_0";
+    Ich.ObjectFlags = RF_Public | RF_Transactional;
+    Ich.SerBeforeCreate = { IchClass.V, IchCdo.V };
+    Ich.CreateBeforeCreate = { Exp(RowClass).V };
+    for (size_t I = 0; I < Overrides.size(); ++I)
+        Ich.CreateBeforeSer.push_back(Exp(RowFirstOverride + int32(I)).V);
+    Ich.Serialize = [=](FArc& Ar) {
+        Tag(Ar, "Records", "ArrayProperty", [=](FArc& V) {
+            /* An array of structs carries one inner FPropertyTag between the count and the elements,
+               whose Size is their byte count - a zero there runs the loader off the end. */
+            FArc Elements(V.Owner());
+            for (size_t I = 0; I < Overrides.size(); ++I)
+            {
+                const FComponentOverride& O = Overrides[I];
+                Tag(Elements, "ComponentClass", "ObjectProperty", [=](FArc& E) { E.Idx(O.Class); });
+                Tag(Elements, "ComponentTemplate", "ObjectProperty",
+                    [=](FArc& E) { E.Idx(Exp(RowFirstOverride + int32(I))); });
+                Tag(Elements, "ComponentKey", "StructProperty", [=](FArc& E) {
+                    Tag(E, "OwnerClass", "ObjectProperty", [=](FArc& K) { K.Idx(O.OwnerClass); });
+                    Tag(E, "SCSVariableName", "NameProperty", [=](FArc& K) { K.Name(O.Name); });
+                    Tag(E, "AssociatedGuid", "StructProperty", [=](FArc& K) { K.Raw(O.Guid, 16); }, "Guid");
+                    TagEnd(E);
+                }, "ComponentKey");
+                TagEnd(Elements);
+            }
+
+            V.I32(int32(Overrides.size()));
+            V.Name("Records");
+            V.Name("StructProperty");
+            V.I32(int32(Elements.B.size()));
+            V.I32(0);                       // ArrayIndex
+            V.Name("ComponentOverrideRecord");
+            for (int32 I = 0; I < 4; ++I) V.U32(0);      // StructGuid
+            V.U8(0);                        // HasPropertyGuid
+            V.Append(Elements);
+        }, "StructProperty");
+        TagEnd(Ar);
+        Ar.Bool(false);
+    };
+    P.AddExport(std::move(Ich));
+
+    for (const FComponentOverride& O : Overrides)
+    {
+        const std::vector<FPropertyDef> Defaults = O.Defaults;
+        FExport Template;
+        Template.ClassIndex = O.Class;
+        Template.TemplateIndex = O.ParentTemplate;
+        Template.OuterIndex = Exp(RowClass);
+        Template.ObjectName = O.Name + "_GEN_VARIABLE";
+        Template.ObjectFlags = RF_Public | RF_ArchetypeObject | RF_InheritableComponentTemplate;
+        Template.SerBeforeCreate = { O.Class.V, O.ParentTemplate.V };
+        Template.CreateBeforeCreate = { Exp(RowClass).V };
+        Template.Serialize = [Defaults](FArc& Ar) {
+            for (const FPropertyDef& V : Defaults) WriteDefaultTag(Ar, V);
+            TagEnd(Ar);
+            Ar.Bool(false);
+        };
+        P.AddExport(std::move(Template));
+    }
 }
 
 /* Measured on DRG's MM_ResourceInfo: Guid tag, empty UStruct body, StructFlags 0, then the default

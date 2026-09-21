@@ -8,6 +8,11 @@
 
 namespace Uasset
 {
+/* The VariableGuid an SCS node gets, by class and component name. An override record has to name the
+   parent node's GUID exactly (FComponentKey::Match compares only OwnerClass and AssociatedGuid), and
+   both sides derive it from the same seed rather than reading the parent asset back. */
+void ScsNodeGuid(const std::string& ClassName, const std::string& ComponentName, uint32 (&Out)[4]);
+
 class FBlueprintClass
 {
 public:
@@ -15,6 +20,10 @@ public:
                     std::string ParentPackage, std::string ParentClass, bool bParentIsBlueprint);
 
     FIndex PackageImport(const std::string& PackageName);
+    /* A subobject of some other class, e.g. an inherited component's <Name>_GEN_VARIABLE archetype:
+       an import whose outer is that class's import rather than a package. */
+    FIndex Subobject(const std::string& ClassPackage, const std::string& ClassName_, FIndex Outer,
+                     const std::string& ObjectName);
     FIndex EngineClass(const std::string& PackageName, const std::string& ClassName);
     FIndex ScriptStruct(const std::string& PackageName, const std::string& StructName);
     FIndex Enum(const std::string& PackageName, const std::string& EnumName);
@@ -68,6 +77,21 @@ public:
     */
     void AddComponent(const std::string& Name, FIndex ComponentClass, FIndex ComponentCdo,
                       bool bIsSceneComponent, const std::vector<FPropertyDef>& Defaults);
+
+    /*
+    An inherited component's defaults: one UInheritableComponentHandler record, which is how the
+    editor stores a child class's override of a parent's SCS component. The template is a fresh
+    component export archetyped on the parent's, so `Defaults` are its deltas.
+    USCS_Node::GetActualComponentTemplate finds it by FComponentKey, which matches on OwnerClass and
+    AssociatedGuid alone - so the GUID must be the parent SCS node's VariableGuid.
+    */
+    void AddComponentOverride(const std::string& Name, FIndex ComponentClass, FIndex ParentTemplate,
+                              FIndex OwnerClass, const uint32 (&AssociatedGuid)[4],
+                              const std::vector<FPropertyDef>& Defaults);
+
+    /* A tag on this class's CDO for a property an ancestor declares, which a member initializer
+       cannot express: declaring the name again would shadow it with a second property. */
+    void AddCdoDefault(const FPropertyDef& Var) { CdoDefaults.push_back(Var); }
 
     void Finish();
 
@@ -129,6 +153,16 @@ private:
         std::vector<FPropertyDef> Defaults;
     };
     std::vector<FComponent> Components;
+
+    struct FComponentOverride
+    {
+        std::string Name;
+        FIndex Class, ParentTemplate, OwnerClass;
+        uint32 Guid[4] = { 0, 0, 0, 0 };
+        std::vector<FPropertyDef> Defaults;
+    };
+    std::vector<FComponentOverride> ComponentOverrides;
+    std::vector<FPropertyDef> CdoDefaults;
 
     int32 ClassRow = 0;
 };

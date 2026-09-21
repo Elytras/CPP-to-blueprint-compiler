@@ -5474,9 +5474,16 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     statement that looks like it runs and does not is the worst possible failure here.
     */
     std::map<std::string, std::vector<FPropertyDef>> ComponentDefaults;
+    struct FOverride { const FRecord* Owner = nullptr; std::vector<FPropertyDef> Defaults; };
+    std::map<std::string, FOverride> ComponentOverrides;
+    std::vector<FPropertyDef> InheritedDefaults;
     if (R.Defaults)
     {
         const std::string Where = R.CppName + "::UE_DEFAULTS";
+        auto OwnerOf = [&](const Json& M) {
+            auto It = FieldOwner.find(M.value("referencedMemberDecl", std::string()));
+            return It == FieldOwner.end() ? std::string() : It->second;
+        };
         const Json* Body = nullptr;
         ForEach(*R.Defaults, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Body = &C; });
         bool bOk = true;
@@ -5491,20 +5498,38 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                     || !Lhs || Kind(*Lhs) != "MemberExpr" || !Rhs)
                 { *Err = Where + ": every statement is `Component->Field = value;`"; bOk = false; return; }
 
+                /* `Comp->Field` reaches through a component; a bare `Field` targets this class's
+                   own CDO. Which of the three destinations a statement means is decided by who
+                   DECLARES the member it names, so no Super:: spelling is needed. */
                 const Json* Owner = Strip(First(*Lhs));
-                const std::string CompName = Owner && Kind(*Owner) == "MemberExpr" ? Name(*Owner) : std::string();
-                if (!R.Components.count(CompName))
-                { *Err = Where + ": " + CompName + " is not a UE_COMPONENT of this class"
-                         + " (an inherited component or property is not settable here yet)"; bOk = false; return; }
+                const bool bThroughComponent = Owner && Kind(*Owner) == "MemberExpr";
+                const std::string CompName = bThroughComponent ? Name(*Owner) : std::string();
+                const std::string Declarer = OwnerOf(bThroughComponent ? *Owner : *Lhs);
+                const FRecord* DR = Declarer.empty() ? nullptr : Find(Declarer);
+                if (!DR)
+                { *Err = Where + ": cannot tell which class declares " + Name(*Lhs); bOk = false; return; }
+                if (bThroughComponent && !DR->Components.count(CompName))
+                { *Err = Where + ": " + CompName + " is not a UE_COMPONENT"; bOk = false; return; }
+                if (!bThroughComponent && DR == &R)
+                { *Err = Where + ": " + Name(*Lhs) + " is declared here - give it an initializer instead"; bOk = false; return; }
 
                 FPropertyDef PD;
                 if (!TypeToProperty(TypeOf(*Lhs), Name(*Lhs), 0, Where, BP, &PD, Err)) { bOk = false; return; }
-                /* Zero is a real value on an archetype: it deltas against the component CDO, where
-                   bVisible is already true, not against the type's zero as a class variable does. */
+                /* Zero is a real value here: an archetype deltas against the component CDO (where
+                   bVisible is already true) and an inherited property against the parent's CDO,
+                   not against the type's zero the way a fresh class variable does. */
                 if (!LowerDefault(*Lhs, PD, BP, Err, Rhs, /*bKeepZero=*/true)) { bOk = false; return; }
                 if (PD.Default.K == FDefaultValue::None)
-                { *Err = Where + ": " + CompName + "->" + Name(*Lhs) + " needs a literal value"; bOk = false; return; }
-                ComponentDefaults[CompName].push_back(PD);
+                { *Err = Where + ": " + Name(*Lhs) + " needs a literal value"; bOk = false; return; }
+
+                if (!bThroughComponent) { InheritedDefaults.push_back(PD); return; }
+                if (DR == &R) { ComponentDefaults[CompName].push_back(PD); return; }
+                if (DR->IsNative())
+                { *Err = Where + ": " + CompName + " belongs to " + DR->CppName
+                         + ", whose SCS node GUID only its own asset knows"; bOk = false; return; }
+                FOverride& O = ComponentOverrides[CompName];
+                O.Owner = DR;
+                O.Defaults.push_back(PD);
             });
         if (!bOk) return false;
     }
@@ -5589,6 +5614,33 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     }
     std::stable_sort(ClassVars.begin(), ClassVars.end(), [](const auto& A, const auto& B) { return A.first > B.first; });
     for (const auto& V : ClassVars) BP.AddVariable(V.second);
+
+    if (!ComponentDefaults.empty())
+    { *Err = R.CppName + "::UE_DEFAULTS: " + ComponentDefaults.begin()->first + " is not declared with UE_COMPONENT"; return false; }
+    for (const FPropertyDef& V : InheritedDefaults) BP.AddCdoDefault(V);
+    for (const auto& Entry : ComponentOverrides)
+    {
+        /* The parent's own archetype, imported as a subobject of its class, is the record's template:
+           the tags this class writes on top of it are exactly the overridden values. */
+        const FRecord& Owner = *Entry.second.Owner;
+        const Json* Field = nullptr;
+        for (const Json* PF : Owner.Fields) if (Name(*PF) == Entry.first) Field = PF;
+        const size_t Star = Field ? TypeOf(*Field).find('*') : std::string::npos;
+        const FRecord* CR = Star == std::string::npos ? nullptr
+                                                      : Find(StripTypeKeywords(TypeOf(*Field).substr(0, Star)));
+        if (!CR || !CR->IsNative())
+        { *Err = R.CppName + "::UE_DEFAULTS: cannot resolve the class of " + Entry.first; return false; }
+
+        const std::string OwnerPkg = Owner.IsNative() ? Owner.UePackage : ModPackage + "/" + Owner.CppName;
+        const std::string OwnerCls = Owner.IsNative() ? Owner.UeName : Owner.CppName + "_C";
+        uint32 NodeGuid[4];
+        ScsNodeGuid(OwnerCls, Entry.first, NodeGuid);
+        const FIndex OwnerClass = BP.EngineClass(OwnerPkg, OwnerCls);
+        BP.AddComponentOverride(Entry.first, BP.EngineClass(CR->UePackage, CR->UeName),
+                                BP.Subobject(CR->UePackage, CR->UeName, OwnerClass,
+                                             Entry.first + "_GEN_VARIABLE"),
+                                OwnerClass, NodeGuid, Entry.second.Defaults);
+    }
 
     /* The OOL definition carries body/parms; only the in-class decl carries storageClass. */
     struct FMethod { std::string Name; const Json* Decl; const Json* Def; const Json* Body; };
