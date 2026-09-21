@@ -107,6 +107,16 @@ void ForEach(const Json& N, const F& Fn)
     for (const Json& C : *It) Fn(C);
 }
 
+/* A CXXOperatorCallExpr whose callee is operator=: struct assignment, which clang does not spell
+   as a BinaryOperator. The callee is the first inner node. */
+bool IsAssignOperatorCall(const Json& N)
+{
+    const Json* Callee = Strip(First(N));
+    if (!Callee || Kind(*Callee) != "DeclRefExpr") return false;
+    auto Ref = Callee->find("referencedDecl");
+    return Ref != Callee->end() && Ref->value("name", std::string()) == "operator=";
+}
+
 /* A clang StringLiteral spelling (prefix, quotes, escapes) as UTF-8. clang escapes a narrow
    literal's non-ASCII bytes in octal, and a wide literal's code units in octal or hex. */
 std::string Unquote(std::string Spelling)
@@ -4969,6 +4979,39 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
     }
     if (!bNeg && (K == "CXXNullPtrLiteralExpr" || (K == "CXXConstructExpr" && !First(*Init)))) return true;
 
+    /* A struct value: `FFloatInterval(1, 5)` or `{1, 5}`, one argument per member in declaration
+       order. The members go on the property, each with its own default, and the writer turns them
+       into nested tags - or into raw bytes when the struct has a native Serialize. */
+    if (!bNeg && PD.Type == "StructProperty"
+        && (K == "CXXConstructExpr" || K == "CXXTemporaryObjectExpr" || K == "InitListExpr"))
+    {
+        const FRecord* SR = Find(StripTypeKeywords(TypeOf(*Init)));
+        if (!SR) { *Err = "unknown struct type in an initializer: " + TypeOf(*Init); return false; }
+        std::vector<const Json*> Args;
+        ForEach(*Init, [&](const Json& A) { if (Kind(A) != "CXXDefaultArgExpr") Args.push_back(&A); });
+        if (Args.size() != SR->Fields.size())
+        {
+            *Err = SR->CppName + " takes one value per member (" + std::to_string(SR->Fields.size())
+                 + "), in declaration order: " + Name(F);
+            return false;
+        }
+        auto Members = std::make_shared<std::vector<FPropertyDef>>();
+        for (size_t I = 0; I < Args.size(); ++I)
+        {
+            FPropertyDef MD;
+            const std::string MName = Name(*SR->Fields[I]);
+            if (!TypeToProperty(TypeOf(*SR->Fields[I]), MName, 0, "member " + MName + " of " + SR->CppName,
+                                BP, &MD, Err))
+                return false;
+            /* Every member is written, so a zero is a value here and not "leave it out". */
+            if (!LowerDefault(*SR->Fields[I], MD, BP, Err, Args[I], /*bKeepZero=*/true)) return false;
+            Members->push_back(MD);
+        }
+        PD.Members = Members;
+        PD.Default.K = FDefaultValue::Struct;
+        return true;
+    }
+
     FDefaultValue& D = PD.Default;
     const std::string& T = PD.Type;
     const bool bNumber = K == "IntegerLiteral" || K == "FloatingLiteral" || K == "CXXBoolLiteralExpr";
@@ -5567,13 +5610,19 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         if (Body)
             ForEach(*Body, [&](const Json& S) {
                 if (!bOk) return;
+                /* Assigning a struct is an operator call, not a BinaryOperator: its inner is the
+                   callee then the two operands, so both shapes are read the same way one index on. */
                 const Json* Assign = Strip(&S);
-                const Json* Lhs = Assign ? Strip(Nth(*Assign, 0)) : nullptr;
-                const Json* Rhs = Assign ? Nth(*Assign, 1) : nullptr;
-                if (!Assign || Kind(*Assign) != "BinaryOperator"
-                    || Assign->value("opcode", std::string()) != "="
-                    || !Lhs || Kind(*Lhs) != "MemberExpr" || !Rhs)
-                { *Err = Where + ": every statement is `Component->Field = value;`"; bOk = false; return; }
+                const std::string AK = Assign ? Kind(*Assign) : std::string();
+                const bool bOpCall = AK == "CXXOperatorCallExpr";
+                const size_t Base = bOpCall ? 1 : 0;
+                const Json* Lhs = Assign ? Strip(Nth(*Assign, Base)) : nullptr;
+                const Json* Rhs = Assign ? Nth(*Assign, Base + 1) : nullptr;
+                const bool bAssign = bOpCall ? IsAssignOperatorCall(*Assign)
+                                             : AK == "BinaryOperator"
+                                                   && Assign->value("opcode", std::string()) == "=";
+                if (!Assign || !bAssign || !Lhs || Kind(*Lhs) != "MemberExpr" || !Rhs)
+                { *Err = Where + ": every statement is `Field = value;` or `Component->Field = value;`"; bOk = false; return; }
 
                 /* `Comp->Field` reaches through a component; a bare `Field` targets this class's
                    own CDO. Which of the three destinations a statement means is decided by who

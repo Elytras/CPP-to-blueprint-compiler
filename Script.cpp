@@ -201,6 +201,9 @@ void DefaultRefs(const FDefaultValue& D, std::vector<int32>& Out)
 namespace
 {
 /* D as P's value, without a tag: a tag's payload, or one array element. */
+void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D);
+void WriteDefaultTagInner(FArc& Ar, const FPropertyDef& P);
+
 void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
 {
     const bool bSet = D.K != FDefaultValue::None;
@@ -263,10 +266,34 @@ void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
                 { "IntVector", 12 }, { "Guid", 16 }, { "DateTime", 8 }, { "Timespan", 8 }, { "Box", 25 },
                 { "Box2D", 17 }, { "BoxSphereBounds", 28 }, { "FrameNumber", 4 } };
             auto N = Native.find(P.StructName);
-            if (N == Native.end()) TagEnd(V);
+            if (D.K == FDefaultValue::Struct && P.Members)
+            {
+                if (N == Native.end())
+                {
+                    for (const FPropertyDef& M : *P.Members) WriteDefaultTagInner(V, M);
+                    TagEnd(V);
+                }
+                else
+                {
+                    /* Raw, in declaration order, then zero-padded to the size the engine reads -
+                       which also supplies Box's trailing IsValid byte. */
+                    FArc Raw(V.Owner());
+                    for (const FPropertyDef& M : *P.Members) WriteValue(Raw, M, M.Default);
+                    V.Append(Raw);
+                    for (int32 i = int32(Raw.B.size()); i < N->second; ++i) V.U8(0);
+                }
+            }
+            else if (N == Native.end()) TagEnd(V);
             else for (int32 i = 0; i < N->second; ++i) V.U8(0);
         }
     }
+}
+
+void WriteDefaultTagInner(FArc& Ar, const FPropertyDef& P)
+{
+    const FDefaultValue& D = P.Default;
+    if (P.Type == "BoolProperty") { TagBool(Ar, P.Name, D.K != FDefaultValue::None && D.I != 0); return; }
+    Tag(Ar, P.Name, P.Type, [&](FArc& V) { WriteValue(V, P, D); }, P.StructName);
 }
 }   // namespace
 

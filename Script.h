@@ -14,7 +14,7 @@ std::u16string Utf8To16(const std::string& Utf8);
 /* A member's literal initializer. None = the type's zero value. */
 struct FDefaultValue
 {
-    enum EKind { None, Int, Float, Bool, Str, Obj, Array } K = None;
+    enum EKind { None, Int, Float, Bool, Str, Obj, Array, Struct } K = None;
     int64 I = 0;                        // Int, Bool
     double F = 0.0;                     // Float
     std::string S;                      // Str: UTF-8, for StrProperty / NameProperty / TextProperty
@@ -35,6 +35,9 @@ struct FPropertyDef
     std::string StructName;             // StructProperty: the struct; ByteProperty: the enum; Array/Set/Map: inner type(s). For the default-value tag.
     FIndex Extra2;                      // ClassProperty / SoftClassProperty: MetaClass. Last, so the aggregate inits above it still line up.
     std::string EnumZero;               // ByteProperty with an enum: the enumerator the zero value is written as
+    /* StructProperty with a Struct default: one entry per member, each carrying its own Default.
+       A struct with a native Serialize writes them as raw bytes, any other as nested tags. */
+    std::shared_ptr<std::vector<FPropertyDef>> Members;
     std::shared_ptr<FPropertyDef> Inner;    // ArrayProperty / SetProperty: element; MapProperty: key
     std::shared_ptr<FPropertyDef> Value;    // MapProperty: value
     FDefaultValue Default;              // written into the CDO / struct default instance
