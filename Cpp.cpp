@@ -845,6 +845,24 @@ private:
     std::map<std::string, const Json*> FreeInlines;                     // decl id -> an inline free function's definition
                                                                         // (a template's: each instantiation)
     /* The class a field access `Obj->Field` / `Field` reads from: Obj's static type, or the class being generated. */
+    /* An interface and the interfaces it extends, nearest first. A native one has no base in UeApi. */
+    std::vector<const FRecord*> InterfaceChain(const FRecord* I) const
+    {
+        std::vector<const FRecord*> Out;
+        for (; I; I = I->Base.empty() ? nullptr : Find(I->Base)) Out.push_back(I);
+        return Out;
+    }
+    /* A mod interface's variable is a property of the class that implements the interface, the one class in
+       an ancestry that lists it (or an interface extending it): that class of C's, or null. */
+    const FRecord* InterfaceVarHolder(const FRecord& Iface, const FRecord* C) const
+    {
+        for (; C; C = C->Base.empty() ? nullptr : Find(C->Base))
+            for (const std::string& I : C->Interfaces)
+                for (const FRecord* Link : InterfaceChain(Find(I)))
+                    if (Link == &Iface) return C;
+        return nullptr;
+    }
+
     const FRecord* RecordOfFieldAccess(const Json& MemberNode) const
     {
         const Json* Base = Strip(First(MemberNode));
@@ -1995,6 +2013,19 @@ bool FCompiler::LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& 
                 && RefThrough(std::move(Addr), "int64", *Out.Base, Err);
         }
         return LowerArg(*ObjRaw, BP, *Out.Base, Err);
+    }
+
+    if (R->bIsInterface)
+    {
+        /* Kismet has no property on an interface class, so the object's own class says where it is. */
+        const FRecord* Holder = InterfaceVarHolder(*R, RecordOfFieldAccess(MemberNode));
+        if (!Holder)
+        {
+            *Err = Name(MemberNode) + " is a variable of the interface " + R->CppName + ", which holds no state itself: "
+                   "read it through an object of a class that implements " + R->CppName + ", not through the interface";
+            return false;
+        }
+        R = Holder;
     }
 
     /* A sibling class of this mod (a data asset's, a local parent's) is imported the way a UE_CLASS one from
@@ -4210,12 +4241,18 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             for (const FRecord* A = SetOn; A; A = A->Base.empty() ? nullptr : Find(A->Base))
                 if (A->UeName == "Actor") bActor = true;
             for (const FRecord* A = SetOn; A; A = A->Base.empty() ? nullptr : Find(A->Base))
-                if (auto Rep = A->Replicated.find(SetField); Rep != A->Replicated.end())
-                {
-                    bFlush = bActor;
-                    if (!A->IsNative() || A->UePackage.compare(0, 6, "/Game/") == 0) Notify = Rep->second.substr(0, Rep->second.find(':'));
-                    break;
-                }
+            {
+                /* The marker of a mod interface's variable sits on the interface the class implements. */
+                const FRecord* Marked = A->Replicated.count(SetField) ? A : nullptr;
+                for (const std::string& I : A->Interfaces)
+                    for (const FRecord* Link : InterfaceChain(Find(I)))
+                        if (!Marked && Link->bIsInterface && Link->Replicated.count(SetField)) Marked = Link;
+                if (!Marked) continue;
+                const std::string& Spec = Marked->Replicated.find(SetField)->second;
+                bFlush = bActor;
+                if (!A->IsNative() || A->UePackage.compare(0, 6, "/Game/") == 0) Notify = Spec.substr(0, Spec.find(':'));
+                break;
+            }
         }
         if (bFlush)
         {
@@ -5500,20 +5537,42 @@ bool FCompiler::GenerateInterface(const FRecord& R, const std::string& OutDir, s
     const std::string PackageName = ModPackage + "/" + R.CppName;
     FPackage P(PackageName);
     StampIdentity(P, PackageName);
-    FBlueprintClass BP(P, R.CppName + "_C", "/Script/CoreUObject", "Interface", false);
+
+    /* `class IChild : public IParent`: the editor never offers it for a Blueprint Interface, but a UClass has a
+       super like any other, and the runtime asks for nothing more. UClass::ImplementsInterface (Class.cpp:4649)
+       tests each Interfaces entry with IsChildOf - "SomeInterface might be a base interface of our implemented
+       interface" - so an implementing class lists the child alone, which is also all the Kismet compiler writes
+       (KismetCompiler.cpp:2420). One super, so one parent. */
+    if (!R.Interfaces.empty())
+    { *Err = R.CppName + ": an interface extends one interface at most, as a UClass has one super"; return false; }
+    const FRecord* Parent = R.Base.empty() ? nullptr : Find(R.Base);
+    if (!R.Base.empty() && (!Parent || Parent->bIsStruct || (Parent->IsNative() ? Parent->CppName[0] != 'I' : !Parent->bIsInterface)))
+    { *Err = R.CppName + " extends " + R.Base + ", which is not an interface"; return false; }
+    const bool bParentIsLocal = Parent && !Parent->IsNative();
+    const std::string ParentPkg = !Parent ? "/Script/CoreUObject" : bParentIsLocal ? ModPackage + "/" + Parent->CppName : Parent->UePackage;
+    FBlueprintClass BP(P, R.CppName + "_C", ParentPkg,
+                       !Parent ? "Interface" : bParentIsLocal ? Parent->CppName + "_C" : Parent->UeName,
+                       ParentPkg.compare(0, 6, "/Game/") == 0);
     BP.SetIsActor(false);
     BP.SetClassFlags(CLASS_Parsed | CLASS_Interface | CLASS_CompiledFromBlueprint);
 
-    if (!R.Fields.empty())
-    { *Err = R.CppName + ": an interface declares no variables, only functions"; return false; }
-    /* An interface extending another would need the parent's functions conformed into this class and
-       the child listed against both; refuse it rather than silently cook a UInterface-rooted class
-       that drops the parent. */
-    if (!R.Base.empty() || !R.Interfaces.empty())
-    { *Err = R.CppName + ": an interface extending another is not supported yet"; return false; }
+    /* A variable on an interface is this compiler's own idea, not the engine's: it becomes a property of every
+       class that implements the interface (Generate), so none is written here. What cannot move that way is
+       refused. */
+    for (const Json* F : R.Fields)
+    {
+        if (R.Components.count(Name(*F)))
+        { *Err = R.CppName + "::" + Name(*F) + ": an interface cannot declare a UE_COMPONENT"; return false; }
+        if (StripTypeKeywords(TypeOf(*F)).compare(0, 25, "TMulticastInlineDelegate<") == 0)
+        { *Err = R.CppName + "::" + Name(*F) + ": an interface cannot declare a UE_DISPATCHER"; return false; }
+    }
 
     for (const auto& Entry : R.Methods)
     {
+        /* A RepNotify of one of its variables is the implementing class's function, never called through the
+           interface. */
+        if (std::any_of(R.Replicated.begin(), R.Replicated.end(), [&](const auto& Rep) {
+                return Rep.second.substr(0, Rep.second.find(':')) == Entry.first; })) continue;
         std::vector<FPropertyDef> Params;
         if (!LowerParams(*Entry.second, Entry.first, BP, Params, Err)) return false;
 
@@ -5724,10 +5783,22 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         { *Err = R.CppName + " implements " + I + ", which is not an interface"; return false; }
         /* clang already rejects one listed twice; an ancestor's copy it only warns about. A native
            ancestor's interfaces are not in the dump, so only the mod's classes are checked. */
+        /* Through an interface that extends it as well: this class's empty stubs would otherwise override the
+           functions the ancestor implemented. */
         for (const FRecord* A = Find(R.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
             for (const std::string& Other : A->Interfaces)
-                if (Find(Other) == IR)
-                { *Err = R.CppName + " implements " + I + ", which its parent " + A->CppName + " already implements"; return false; }
+                for (const FRecord* Mine : InterfaceChain(IR))
+                    for (const FRecord* Theirs : InterfaceChain(Find(Other)))
+                        if (Mine == Theirs)
+                        { *Err = R.CppName + " implements " + I + ", which its parent " + A->CppName + " already implements"
+                                 + (Find(Other) == IR ? "" : " (through " + Other + ")"); return false; }
+        /* Two of its own that meet in one interface would declare that one's variables twice. */
+        for (const std::string& Other : R.Interfaces)
+            if (&Other < &I)
+                for (const FRecord* Mine : InterfaceChain(IR))
+                    for (const FRecord* Theirs : InterfaceChain(Find(Other)))
+                        if (Mine == Theirs)
+                        { *Err = R.CppName + " implements " + Other + " and " + I + ", which both extend " + Mine->CppName; return false; }
         BP.AddInterface(ClassImportOf(*IR, BP));
     }
 
@@ -5770,6 +5841,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     std::map<std::string, FOverride> ComponentOverrides;
     std::map<std::string, FOverride> SubobjectDefaults;
     std::vector<FPropertyDef> InheritedDefaults;
+    std::map<std::string, FPropertyDef> InterfaceVarDefaults;     // a default for a variable an implemented interface declares
     if (R.Defaults)
     {
         const std::string Where = R.CppName + "::UE_DEFAULTS";
@@ -5811,6 +5883,9 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 { *Err = Where + ": " + CompName + " is not a UE_COMPONENT"; bOk = false; return; }
                 if (!bThroughComponent && DR == &R)
                 { *Err = Where + ": " + Name(*Lhs) + " is declared here - give it an initializer instead"; bOk = false; return; }
+                /* An interface's variable is this class's own property when this class is the one implementing
+                   it; below a parent that does, it is one more inherited property. */
+                const bool bInterfaceVar = !bThroughComponent && DR->bIsInterface && InterfaceVarHolder(*DR, &R) == &R;
 
                 FPropertyDef PD;
                 if (!TypeToProperty(TypeOf(*Lhs), Name(*Lhs), 0, Where, BP, &PD, Err)) { bOk = false; return; }
@@ -5820,6 +5895,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 if (!LowerDefault(*Lhs, PD, BP, Err, Rhs, /*bKeepZero=*/true)) { bOk = false; return; }
                 if (PD.Default.K == FDefaultValue::None)
                 { *Err = Where + ": " + Name(*Lhs) + " needs a literal value"; bOk = false; return; }
+                if (bInterfaceVar) { InterfaceVarDefaults[Name(*Lhs)] = PD; return; }
 
                 if (!bThroughComponent) { InheritedDefaults.push_back(PD); return; }
                 if (DR == &R) { ComponentDefaults[CompName].push_back(PD); return; }
@@ -5848,10 +5924,26 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         if (!LayoutOf(Type, &Size, &Align, &Ignored)) Align = 8;
         ClassVars.emplace_back(Align, PD);
     };
-    for (const Json* F : R.Fields)
+    /* A variable declared on a mod interface is a property of each class that implements it - here, once, and
+       found by InterfaceVarHolder from this class's subclasses. Its markers are read off the interface. */
+    struct FOwnedField { const Json* F; const FRecord* Decl; };
+    std::vector<FOwnedField> OwnedFields;
+    for (const Json* F : R.Fields) OwnedFields.push_back({ F, &R });
+    for (const std::string& I : R.Interfaces)
+        for (const FRecord* Link : InterfaceChain(Find(I)))
+            if (Link->bIsInterface)
+                for (const Json* F : Link->Fields)
+                {
+                    if (std::any_of(OwnedFields.begin(), OwnedFields.end(), [&](const FOwnedField& O) { return Name(*O.F) == Name(*F); }))
+                    { *Err = R.CppName + ": the variable " + Name(*F) + " of the interface " + Link->CppName + " is declared twice"; return false; }
+                    OwnedFields.push_back({ F, Link });
+                }
+    for (const FOwnedField& Owned : OwnedFields)
     {
+        const Json* F = Owned.F;
+        const FRecord& Decl = *Owned.Decl;
         const std::string FieldName = Name(*F);
-        if (auto Sig = CurSignatures.find(FieldName); Sig != CurSignatures.end())
+        if (auto Sig = CurSignatures.find(FieldName); &Decl == &R && Sig != CurSignatures.end())
         {
             AddVariable("", DispatcherParam(FieldName, Sig->second));
             continue;
@@ -5861,13 +5953,20 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         if (!TypeToProperty(TypeOf(*F), FieldName, 0, "property " + FieldName, BP, &PD, &PErr))
         { *Err = PErr; return false; }
         if (!LowerDefault(*F, PD, BP, Err)) return false;
+        /* UE_DEFAULTS naming an interface's variable is this class's own default for it. */
+        if (auto Own = InterfaceVarDefaults.find(FieldName); Own != InterfaceVarDefaults.end())
+        {
+            PD.Default = Own->second.Default;
+            PD.Members = Own->second.Members;
+            InterfaceVarDefaults.erase(Own);
+        }
 
         /* CPF_Parm would make it part of the call frame; CPF_BlueprintReadOnly would forbid assignment -
            except on a `const` field, where the source forbids it anyway, so the flag is the truth. */
         PD.PropertyFlags = (PD.PropertyFlags & ~uint64(CPF_Parm | CPF_BlueprintReadOnly))
                          | CPF_Edit | CPF_BlueprintVisible | CPF_DisableEditOnInstance;
         if (TypeOf(*F).compare(0, 6, "const ") == 0) PD.PropertyFlags |= CPF_BlueprintReadOnly;
-        if (R.Components.count(FieldName))
+        if (&Decl == &R && R.Components.count(FieldName))
         {
             if (!bIsActor) { *Err = R.CppName + "::" + FieldName + ": only an actor has a construction script"; return false; }
             const size_t Star = TypeOf(*F).find('*');
@@ -5889,7 +5988,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                             ComponentDefaults[FieldName]);
             ComponentDefaults.erase(FieldName);
         }
-        if (auto Rep = R.Replicated.find(FieldName); Rep != R.Replicated.end())
+        if (auto Rep = Decl.Replicated.find(FieldName); Rep != Decl.Replicated.end())
         {
             /* Measured on BP_LiftPod.IsLaunchEnabled: the editor's flags plus CPF_Net, and CPF_RepNotify with the
                function's name when it has one. */
@@ -5899,8 +5998,12 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             PD.PropertyFlags |= CPF_Net;
             if (!Notify.empty())
             {
-                auto M = R.Methods.find(Notify);
-                if (M == R.Methods.end() || !ParmNames(*M->second).empty())
+                /* An interface variable's RepNotify is declared beside it; a class that leaves it out gets the
+                   empty stub every interface function gets. */
+                const Json* NotifyFn = nullptr;
+                if (auto M = R.Methods.find(Notify); M != R.Methods.end()) NotifyFn = M->second;
+                else if (auto D = Decl.Methods.find(Notify); D != Decl.Methods.end()) NotifyFn = D->second;
+                if (!NotifyFn || !ParmNames(*NotifyFn).empty())
                 { *Err = R.CppName + "::" + FieldName + ": its RepNotify " + Notify + " must be a method of the class taking no parameters"; return false; }
                 PD.PropertyFlags |= CPF_RepNotify;
                 PD.RepNotify = Notify;
@@ -5983,9 +6086,11 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
        returns a value has it too (Targetable::GetIsTargetable) and the editor implements it as a function
        graph. Only a native-only function lacks it, which UHT allows just under
        CannotImplementInterfaceInBlueprint (HeaderParser.cpp:7538). */
-    for (const std::string& I : R.Interfaces)
+    for (const std::string& Listed : R.Interfaces)
+    for (const FRecord* Link : InterfaceChain(Find(Listed)))        // the interfaces it extends are implemented too
     {
-        const FRecord& IR = *Find(I);
+        const FRecord& IR = *Link;
+        const std::string& I = IR.CppName;
         /* A mod's own interface needs none of the Events.json conformance check below: GenerateInterface
            emits every one of its functions as a BlueprintEvent, so all of them are implementable by
            construction. What it does share is the empty stub for one this class leaves out. */
