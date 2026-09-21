@@ -388,9 +388,32 @@ def engine_names():
     print('ok  NameTest: a const member is BlueprintReadOnly')
 
 
+def api_stub():
+    """The editor API stub (--api) of NameTest: what a Blueprint author sees of a mod class."""
+    import subprocess, tempfile
+    repo = os.path.normpath(os.path.join(ROOT, '..', '..'))
+    with tempfile.TemporaryDirectory() as tmp:
+        os.makedirs(os.path.join(tmp, 'cooked'))
+        os.makedirs(os.path.join(tmp, 'api'))
+        proc = subprocess.run([os.path.join(repo, 'x64', 'Release', 'assetgen.exe'), 'compile',
+                               os.path.join(repo, 'BpMods', 'NameTest.cpp'), os.path.join(repo, 'BpMods', 'UeApi'),
+                               os.path.join(tmp, 'cooked'), '--api', os.path.join(tmp, 'api')],
+                              capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        stub = open(os.path.join(tmp, 'api', 'NameTest.uasset'), 'rb').read()
+    name = lambda s: s.encode() + b'\x00'
+    # UE_CATEGORY: once on Peek's entry node, once on the variable Charges; Plain follows UE_CATEGORY("") and has none.
+    assert stub.count(name('Names|Test')) == 2, stub.count(name('Names|Test'))
+    assert name('Peek') in stub and name('Charges') in stub and name('Plain') in stub
+    # A private field is left out, a const one is there (read-only), a function no Blueprint can call is not listed.
+    assert name('Seed') not in stub and name('Limit') in stub and name('Twice') not in stub
+    print('ok  NameTest: the API stub carries UE_CATEGORY and leaves a private field out')
+
+
 mod_enum()
 constants()
 engine_names()
+api_stub()
 check('TypesTest', 'Cpp20', lambda M, N: {0: N + N, 5: N + fnv('angry')}.get(M, fnv('types')), [dict(M=m, N=n) for m in (0, 5, 6) for n in (-2, 9)])
 check('TypesTest', 'ConstSum', lambda N: N * 3 + 12 + 19, [dict(N=n) for n in (-4, 0, 9)])
 check('TypesTest', 'HalfOf', lambda V: V * 0.5, [dict(V=v) for v in (-3.0, 0.0, 8.0)])

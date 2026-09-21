@@ -334,6 +334,7 @@ struct FRecord
        A function carries it as a flag. A variable has private only, and only as editor metadata, so a private
        field is simply left out of the API stub; a protected one stays visible, a subclass having a right to it. */
     std::map<std::string, uint32> MethodAccess;     // method -> FUNC_Public / FUNC_Protected / FUNC_Private
+    std::map<std::string, std::string> Categories;  // method or field -> the UE_CATEGORY section it is declared in
     std::set<std::string> PrivateFields;
     std::map<std::string, std::string> ScsNodes;    // `<X>__UeScsNode`: a game Blueprint's component -> its node's guid, 32 hex
     std::map<std::string, std::string> TypeAliases; // `using Leaf = Game::...::Leaf;` in the class body
@@ -1570,7 +1571,15 @@ bool FCompiler::Collect(std::string* Err)
             }
 
         uint32 Access = N.value("tagUsed", std::string()) == "struct" ? FUNC_Public : FUNC_Private;
+        std::string Category;       // UE_CATEGORY is positional, like an access specifier
         ForEach(N, [&](const Json& C) {
+            if (Kind(C) == "VarDecl" && Name(C).compare(0, 12, "UeCategory__") == 0)
+            {
+                Category.clear();
+                FindLiteral(C, Category);
+            }
+            if (!Category.empty() && C.contains("name") && (Kind(C) == "CXXMethodDecl" || Kind(C) == "FieldDecl"))
+                R.Categories[Name(C)] = Category;
             if (Kind(C) == "AccessSpecDecl")
             {
                 const std::string A = C.value("access", std::string());
@@ -6390,6 +6399,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                          | CPF_Edit | CPF_BlueprintVisible | CPF_DisableEditOnInstance;
         if (TypeOf(*F).compare(0, 6, "const ") == 0) PD.PropertyFlags |= CPF_BlueprintReadOnly;
         PD.bApiHidden = Decl.PrivateFields.count(Name(*F)) != 0;
+        if (auto Cat = Decl.Categories.find(Name(*F)); Cat != Decl.Categories.end()) BP.ApiCategory[PD.Name] = Cat->second;
         if (&Decl == &R && R.Components.count(FieldName))
         {
             if (!bIsActor) { *Err = R.CppName + "::" + FieldName + ": only an actor has a construction script"; return false; }
@@ -6726,6 +6736,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             continue;
         }
 
+        if (auto Cat = R.Categories.find(Fn.Name); Cat != R.Categories.end()) BP.ApiCategory[UeNameOf(&R, Fn.Name)] = Cat->second;
         BP.AddFunction(UeNameOf(&R, Fn.Name), Super, Params,
                        [Stmts, bEndsWithReturn, bScratchNeeded, DerefStruct](FScript& S, FIndex SelfExp) {
             if (bScratchNeeded)

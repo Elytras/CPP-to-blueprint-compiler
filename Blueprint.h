@@ -1,4 +1,5 @@
 ﻿#pragma once
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -58,6 +59,9 @@ public:
     function's own export index (the FFieldPath owner for its params), filled in by Finish().
     Returns that export index.
     */
+    /* UE_CATEGORY: a function's or variable's editor category. Editor metadata, so only the API stub carries it. */
+    std::map<std::string, std::string> ApiCategory;
+
     FIndex AddFunction(const std::string& Name, FIndex Super,
                        const std::vector<FPropertyDef>& Params,
                        const std::function<void(FScript&, FIndex)>& Body,

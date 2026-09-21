@@ -9,6 +9,7 @@ so a hand-written BlueprintGeneratedClass would be thrown away and rebuilt from 
 graphs are therefore the payload: one function graph per callable, an entry node holding the
 inputs and a result node holding the outputs, with no body between them.
 */
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -32,6 +33,7 @@ struct FApiClass
     std::string ParentPackage, ParentClass;  // /Script/Engine, BlueprintFunctionLibrary
     std::vector<FApiFunction> Functions;
     std::vector<FPropertyDef> Variables;
+    std::map<std::string, std::string> Categories;   // function or variable -> its editor category, "A|B"
 };
 
 /*

@@ -51,6 +51,15 @@ void EmptyText(FArc& Ar)
     Ar.Bool(false);
 }
 
+/* A culture-invariant FText, as Script.cpp writes a text default: the flag, no history, "has a string", the string. */
+void WriteText(FArc& Ar, const std::string& S)
+{
+    Ar.U32(2);          // ETextFlag::CultureInvariant
+    Ar.U8(0xFF);
+    Ar.Bool(true);
+    Ar.Str(S);
+}
+
 void WritePinType(FArc& Ar, const FPinType& T)
 {
     Ar.Name(T.Category);
@@ -314,6 +323,7 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
     struct FGraph
     {
         std::string Name;
+        std::string Category;
         uint32 Flags = 0;
         bool bPure = false;
         std::vector<FPinDef> EntryPins, ResultPins;
@@ -327,6 +337,7 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
 
         FGraph G;
         G.Name = Fn.Name;
+        if (auto Cat = Class.Categories.find(Fn.Name); Cat != Class.Categories.end()) G.Category = Cat->second;
         G.Flags = Fn.Flags;
         /* A pure function draws without exec pins, so UE_PURE decides the node shape here and
            not just the flag: an entry node with a `then` pin would compile back as impure. */
@@ -403,6 +414,7 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
         uint64 Flags = 0;
         std::string RepNotify;
         std::string Default;
+        std::string Category;
         uint8 RepCondition = 0;
         uint32 Guid[4] = { 0, 0, 0, 0 };
     };
@@ -426,6 +438,7 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
         Var.RepNotify = Prop.RepNotify;
         Var.RepCondition = Prop.RepCondition;
         Var.Default = DefaultString(Prop);
+        if (auto Cat = Class.Categories.find(Prop.Name); Cat != Class.Categories.end()) Var.Category = Cat->second;
         MakeGuid(Class.AssetName + ".var." + Prop.Name, Var.Guid);
         Vars.push_back(std::move(Var));
     }
@@ -485,6 +498,8 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
                     Tag(Elements, "VarGuid", "StructProperty", [&](FArc& E) { E.Raw(Var.Guid, 16); }, "Guid");
                     Tag(Elements, "VarType", "StructProperty", [&](FArc& E) { WritePinType(E, Var.Type); },
                         "EdGraphPinType");
+                    if (!Var.Category.empty())      // FBPVariableDescription::Category
+                        Tag(Elements, "Category", "TextProperty", [&](FArc& E) { WriteText(E, Var.Category); });
                     Tag(Elements, "PropertyFlags", "UInt64Property", [&](FArc& E) { E.I64(int64(Var.Flags)); });
                     if (!Var.RepNotify.empty())
                         Tag(Elements, "RepNotifyFunc", "NameProperty", [&](FArc& E) { E.Name(Var.RepNotify); });
@@ -565,6 +580,7 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
         Entry.ObjectName = "K2Node_FunctionEntry_0";
         Entry.ObjectFlags = RF_Transactional;
         const std::string FnName = G.Name;
+        const std::string FnCategory = G.Category;
         Entry.Serialize = [=](FArc& Ar) {
             /* Not decoration: ConformFunctionNames renames a graph to its entry node's member name
                on load, so an entry without one turns every function into "None". */
@@ -572,6 +588,11 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
                 Tag(V, "MemberName", "NameProperty", [=](FArc& N) { N.Name(FnName); });
                 TagEnd(V);
             }, "MemberReference");
+            if (!FnCategory.empty())    // UK2Node_FunctionEntry::MetaData, an FKismetUserDeclaredFunctionMetadata
+                Tag(Ar, "MetaData", "StructProperty", [=](FArc& V) {
+                    Tag(V, "Category", "TextProperty", [=](FArc& T) { WriteText(T, FnCategory); });
+                    TagEnd(V);
+                }, "KismetUserDeclaredFunctionMetadata");
             Tag(Ar, "ExtraFlags", "IntProperty", [=](FArc& V) { V.I32(int32(EntryFlags)); });
             Tag(Ar, "NodePosX", "IntProperty", [](FArc& V) { V.I32(0); });
             Tag(Ar, "NodeGuid", "StructProperty", [=](FArc& V) { V.Raw(EntryGuid, 16); }, "Guid");
