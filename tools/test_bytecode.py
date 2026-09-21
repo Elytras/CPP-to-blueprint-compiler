@@ -335,6 +335,12 @@ inline_in_place()
 check('InlineTest', 'ConstThenVar', lambda V: 6 + V * 2 + clamp(V, 0, 5) + clamp(2, V, 9) + 4 + V - 1, [dict(V=v) for v in (-3, 0, 4, 12)])
 
 
+check('StructTest', 'MakeLocal', lambda K: K + K * 20 + 1000, [dict(K=k) for k in (0, 3, -2)])
+check('StructTest', 'MakeArgument', lambda K: K + 0 + K + 1, [dict(K=k) for k in (0, 5)])
+check('StructTest', 'MakeInLoop', lambda Rounds: max(Rounds, 0), [dict(Rounds=r) for r in (0, 1, 4)])
+check('StructTest', 'MakeNative', lambda D: D + 0.5, [dict(D=d) for d in (0.0, 4.0)])
+
+
 def replication():
     import re, subprocess
     here, base = os.path.dirname(os.path.abspath(__file__)), asset('ReplTest')

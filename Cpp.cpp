@@ -107,6 +107,18 @@ void ForEach(const Json& N, const F& Fn)
     for (const Json& C : *It) Fn(C);
 }
 
+/* What clang writes for a member the braces leave out; an aggregate member (a struct, a TArray) is a list of those. */
+bool IsUnsetInit(const Json& E)
+{
+    const std::string K = Kind(E);
+    if (K == "ImplicitValueInitExpr" || K == "CXXDefaultInitExpr") return true;
+    if (K == "CXXConstructExpr") return !First(E);
+    if (K != "InitListExpr") return false;
+    bool bAll = true;
+    ForEach(E, [&](const Json& C) { bAll = bAll && IsUnsetInit(C); });
+    return bAll;
+}
+
 /* A CXXOperatorCallExpr whose callee is operator=: struct assignment, which clang does not spell
    as a BinaryOperator. The callee is the first inner node. */
 bool IsAssignOperatorCall(const Json& N)
@@ -892,6 +904,7 @@ private:
     bool LowerArgRaw(const Json& N, const std::string& OuterType, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     bool ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgIR& Arg, std::string* Err);
     bool LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
+    bool LowerMakeStruct(const std::string& Type, const Json* List, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     bool LowerDispatcherCall(const Json& Call, const Json& Callee, const Json& Obj, FBlueprintClass& BP,
                              FArgIR& Out, std::string* Err);
     bool LowerDelegateValue(const Json& Obj, const Json& Fn, FArgIR& Out, std::string* Err);
@@ -1989,9 +2002,11 @@ bool FCompiler::LowerStructLiteral(const Json& CtorNode, const FStructInfo& SI, 
                                    FArgIR& Out, std::string* Err)
 {
     const std::string T = StripTypeKeywords(TypeOf(CtorNode));
-    if (!SI.bComplete) { *Err = "TODO: " + T + " has fields AssetGen cannot write; build it with a Kismet Make function"; return false; }
     std::vector<const Json*> Args;
     ForEach(CtorNode, [&](const Json& C) { Args.push_back(&C); });
+    /* EX_StructConst cannot say a field it cannot write, so `T()` of such a struct is a Make Struct with nothing set. */
+    if (!SI.bComplete && Args.empty()) return LowerMakeStruct(T, nullptr, BP, Out, Err);
+    if (!SI.bComplete) { *Err = T + " has fields AssetGen cannot write, so it takes no whole-struct literal: `" + T + " V = { .Field = value };`"; return false; }
     if (Args.empty()) return ZeroArg(T, BP, Out, Err);
     if (Args.size() != SI.Fields.size())
     { *Err = T + " literal must give every field (" + std::to_string(SI.Fields.size()) + ")"; return false; }
@@ -2007,6 +2022,62 @@ bool FCompiler::LowerStructLiteral(const Json& CtorNode, const FStructInfo& SI, 
         if (!LowerArg(*A, BP, M, Err)) return false;
         Out.Sub->Args.push_back(M);
     }
+    return true;
+}
+
+/* `T()` of a struct EX_StructConst cannot write whole (a third of the dump: weak pointers, delegates, bitfields), and
+   any braced aggregate, `T{ .Time = 0.5f }`. This is the editor's Make Struct node (FKCHandler_MakeStruct): a temp the
+   frame default-constructs, then one member store per value given. What the braces leave out keeps the struct's own
+   default, which EX_StructConst's zeros cannot say (FHitResult::Time is 1). List is the InitListExpr, one inner per
+   field in declaration order, or null for none given. */
+bool FCompiler::LowerMakeStruct(const std::string& Type, const Json* List, FBlueprintClass& BP, FArgIR& Out, std::string* Err)
+{
+    const FRecord* R = Find(Type);
+    if (!R || !R->bIsStruct) { *Err = "a braced value needs a struct type, not " + Type; return false; }
+    if (!CurLocals) { *Err = "internal: a struct value outside a function body"; return false; }
+
+    const std::string Tmp = "__Make" + std::to_string(ReadTmpCounter++) + "__";
+    FPropertyDef PD;
+    if (!TypeToProperty(Type, Tmp, 0, "a " + Type + " value", BP, &PD, Err)) return false;
+    PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+    CurLocals->push_back(PD);
+
+    const bool bPlainName = R->IsNative() || IsInternalViewStruct(R->CppName);
+    const FIndex Struct = R->IsNative() ? BP.ScriptStruct(R->UePackage, R->UeName)
+                                        : BP.ScriptStruct(ModPackage + "/" + R->CppName, R->CppName);
+    auto Body = std::make_shared<std::vector<FStmtIR>>();
+    size_t I = 0;
+    bool bOk = true;
+    if (List)
+        ForEach(*List, [&](const Json& Value) {
+            const size_t At = I++;
+            if (!bOk || IsUnsetInit(Value)) return;
+            if (At >= R->Fields.size()) { *Err = Type + " has no member for value " + std::to_string(At + 1); bOk = false; return; }
+            const Json& F = *R->Fields[At];
+            FStmtIR Set;
+            Set.K = FStmtIR::Assign;
+            Set.Var.K = FArgIR::Member;
+            Set.Var.S = bPlainName ? Name(F) : ModFieldName(ModPackage + "/" + R->CppName, Name(F));
+            Set.Var.Owner = Struct;
+            Set.Var.LetOp = LetOpFor(TypeOf(F));
+            Set.Var.Base = std::make_shared<FArgIR>();
+            Set.Var.Base->K = FArgIR::Local;
+            Set.Var.Base->S = Tmp;
+            bOk = LowerArg(Value, BP, Set.Value, Err);
+            if (bOk) Body->push_back(std::move(Set));
+        });
+    if (!bOk) return false;
+
+    auto Block = std::make_shared<std::vector<FStmtIR>>(1);
+    (*Block)[0].K = FStmtIR::Block;
+    (*Block)[0].Body = Body;
+    Out.K = FArgIR::Call;
+    Out.InnerType = Type;
+    Out.Sub = std::make_shared<FCallIR>();
+    Out.Sub->Intrinsic = "__Inline__";
+    Out.Sub->Inline = Block;
+    Out.Sub->InlineResult = Tmp;
+    Out.Sub->InlineType = Type;
     return true;
 }
 
@@ -3196,6 +3267,8 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         }
         return true;
     }
+
+    if (K == "InitListExpr") return LowerMakeStruct(StripTypeKeywords(TypeOf(*N)), N, BP, Out, Err);
 
     *Err = "TODO: unimplemented argument " + K;
     return false;
@@ -5705,16 +5778,7 @@ bool FCompiler::GenerateAsset(const Json& Var, const std::string& OutDir, std::s
     StampIdentity(P, PackageName);
     FBlueprintClass BP(P, AssetName, "", "", false);
 
-    /* What clang writes for a member the braces leave out; an aggregate member (TArray) is a list of those. */
-    std::function<bool(const Json&)> Unset = [&](const Json& E) {
-        const std::string K = Kind(E);
-        if (K == "ImplicitValueInitExpr" || K == "CXXDefaultInitExpr") return true;
-        if (K == "CXXConstructExpr") return !First(E);
-        if (K != "InitListExpr") return false;
-        bool bAll = true;
-        ForEach(E, [&](const Json& C) { bAll = bAll && Unset(C); });
-        return bAll;
-    };
+    const auto Unset = IsUnsetInit;
     std::function<bool(const Json&, const FRecord&)> Fill = [&](const Json& List, const FRecord& Rec) {
         size_t I = 0;
         if (!Rec.Base.empty())
