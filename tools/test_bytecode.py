@@ -364,6 +364,16 @@ def replication():
     assert seq == ["imp[6]:Function'FlushNetDormancy'", 'LetBool', 'VirtualFunction', 'Let', "imp[6]:Function'FlushNetDormancy'", 'LetBool'], seq
     print('ok  ReplTest: replicated properties, RPC flags, OnRep after a set')
 
+    # A mod child's override of a mod parent's RPC: the parent's flags, and the parent's function as its super.
+    kid = os.path.join(os.path.dirname(base), 'ReplKid')
+    imports, kid_exports = dumpexp.load(kid)[4], dumpexp.load(kid)[5]
+    for fn, flags in (('ServerOpen', 0x82208c0), ('MultiBoom', 0x8024840), ('OnRep_Open', 0x8020800)):
+        e = next(x for x in kid_exports if x['name'] == fn)
+        out = subprocess.run([sys.executable, os.path.join(here, 'dumpstruct.py'), kid, str(kid_exports.index(e))], capture_output=True, text=True).stdout
+        assert 'FunctionFlags %#x' % flags in out, (fn, out)
+        assert e['super'] < 0 and imports[-e['super'] - 1] == "Function'%s'" % fn, (fn, e['super'])
+    print("ok  ReplTest: an override of a mod parent's RPC keeps its net flags and names it as super")
+
 
 replication()
 

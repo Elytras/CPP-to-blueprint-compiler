@@ -215,6 +215,13 @@ const Json* BracedInit(const Json& Var)
     return I && Kind(*I) == "InitListExpr" ? I : nullptr;
 }
 
+/* What an override or an interface implementation takes of its parent's flags (KismetCompiler.cpp PrecompileFunction
+   and the event stubs; measured on BP_SentryGun_MoveMarker). */
+constexpr uint32 kOverrideInherits = FUNC_Exec | FUNC_Event | FUNC_BlueprintCallable | FUNC_BlueprintEvent
+                                   | FUNC_BlueprintAuthorityOnly | FUNC_BlueprintCosmetic | FUNC_Const
+                                   | FUNC_Public | FUNC_Protected | FUNC_Private | FUNC_BlueprintPure
+                                   | FUNC_Net | FUNC_NetReliable | FUNC_NetServer | FUNC_NetClient | FUNC_NetMulticast;
+
 bool IsStaticDecl(const Json& Decl) { return Decl.value("storageClass", std::string()) == "static"; }
 
 /* UE_SERVER / UE_CLIENT / UE_MULTICAST / UE_RELIABLE, carried as attribute kinds (UeMeta.h). */
@@ -949,8 +956,9 @@ private:
 
     /* The native UFunction Method overrides, or null; InheritedFlags gets the flags it passes on, also
        for a method implementing an interface's function, which has no Super. */
+    uint32 ModMethodFlags(const FRecord& Owner, const std::string& Method, FBlueprintClass& BP);
     FIndex FindEvent(FBlueprintClass& BP, const std::string& FromRecord, const std::string& Method,
-                     uint32* InheritedFlags);
+                     uint32* InheritedFlags, bool bFlagsOnly = false);
 
     /* Records are keyed by qualified name; Bare holds only leaf names exactly one class claims,
        so an ambiguous bare name fails instead of picking the last class collected. */
@@ -1594,7 +1602,7 @@ bool FCompiler::Collect(std::string* Err)
 }
 
 FIndex FCompiler::FindEvent(FBlueprintClass& BP, const std::string& FromRecord, const std::string& Method,
-                            uint32* InheritedFlags)
+                            uint32* InheritedFlags, bool bFlagsOnly)
 {
     /* Events.json keys a function by its package's last path segment, as Dumper-7's comments name it. */
     auto FlagsOf = [&](const FRecord& R) {
@@ -1602,12 +1610,22 @@ FIndex FCompiler::FindEvent(FBlueprintClass& BP, const std::string& FromRecord, 
         return It == EventFlags.end() ? uint32(0) : It->second;
     };
     *InheritedFlags = 0;
-    for (const FRecord* R = Find(FromRecord); R; R = R->Base.empty() ? nullptr : Find(R->Base))
+    const FRecord* Self = Find(FromRecord);
+    for (const FRecord* R = Self; R; R = R->Base.empty() ? nullptr : Find(R->Base))
     {
+        /* A mod ancestor's function is a super like a native one, and the nearest wins, as the Kismet compiler takes
+           ParentClass->FindFunctionByName. What matters most is its net flags: an override of an RPC is that RPC, and
+           a mismatch "will trigger an assert in Link()" (KismetCompiler.cpp:2019). An inline method is no UFunction. */
+        if (R != Self && !R->IsNative() && !R->bIsInterface)
+            if (auto M = R->Methods.find(Method); M != R->Methods.end() && !IsStaticDecl(*M->second) && !IsInlineMethod(*R, Method))
+            {
+                *InheritedFlags = ModMethodFlags(*R, Method, BP);
+                return bFlagsOnly ? Null() : BP.EngineFunction(ModPackage + "/" + R->CppName, R->CppName + "_C", Method);
+            }
         if (R->IsNative() && R->Methods.count(Method))
         {
             *InheritedFlags = FlagsOf(*R);
-            return BP.EngineFunction(R->UePackage, R->UeName, Method);
+            return bFlagsOnly ? Null() : BP.EngineFunction(R->UePackage, R->UeName, Method);
         }
         /* Measured on BP_SentryGun_MoveMarker: an interface implementation has no Super. */
         for (const std::string& I : R->Interfaces)
@@ -1618,6 +1636,22 @@ FIndex FCompiler::FindEvent(FBlueprintClass& BP, const std::string& FromRecord, 
             }
     }
     return Null();      // not an override
+}
+
+/* The flags Generate gives a mod class's own method, less the ones that depend on its parameters: what an
+   override of it inherits. Nothing is imported on the way. */
+uint32 FCompiler::ModMethodFlags(const FRecord& Owner, const std::string& Method, FBlueprintClass& BP)
+{
+    const Json& Decl = *Owner.Methods.at(Method);
+    const auto DefIt = Owner.MethodDefs.find(Method);
+    const Json& Def = DefIt != Owner.MethodDefs.end() ? *DefIt->second : Decl;
+    uint32 Inherited = 0;
+    FindEvent(BP, Owner.CppName, Method, &Inherited, /*bFlagsOnly=*/true);
+    uint32 Flags = Inherited ? Inherited & kOverrideInherits : FFunctionDef().FunctionFlags;
+    if (IsPureDecl(Def)) Flags |= FUNC_BlueprintPure | FUNC_BlueprintCallable;
+    const std::string DeclType = TypeOf(Decl);
+    if (DeclType.size() > 6 && DeclType.compare(DeclType.size() - 6, 6, " const") == 0) Flags |= FUNC_Const;
+    return Flags | NetFlagsOf(Decl) | NetFlagsOf(Def) | AccessFlagsOf(Decl) | AccessFlagsOf(Def);
 }
 
 /* Measured on shipped DRG classes: BP_JetBootsBurnTrigger (Actor) 0x00840814, BP_ThornsComponent
@@ -6241,11 +6275,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
            FUNC_Event would be treated by the loader as an overridable entry point. */
         uint32 Inherited = 0;
         const FIndex Super = FindEvent(BP, R.CppName, Fn.Name, &Inherited);
-        uint32 Flags = Inherited ? Inherited & (FUNC_Exec | FUNC_Event | FUNC_BlueprintCallable | FUNC_BlueprintEvent
-                                                | FUNC_BlueprintAuthorityOnly | FUNC_BlueprintCosmetic | FUNC_Const
-                                                | FUNC_Public | FUNC_Protected | FUNC_Private | FUNC_BlueprintPure
-                                                | FUNC_Net | FUNC_NetReliable | FUNC_NetServer | FUNC_NetClient
-                                                | FUNC_NetMulticast)
+        uint32 Flags = Inherited ? Inherited & kOverrideInherits
                      : IsStaticDecl(Decl) ? uint32(FUNC_Static | FUNC_BlueprintCallable | FUNC_Public | FUNC_Final)
                      : FFunctionDef().FunctionFlags;
         /* All 7229 BlueprintPure functions in the DRG dump are BlueprintCallable too. */
