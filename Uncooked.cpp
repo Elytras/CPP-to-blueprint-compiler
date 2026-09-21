@@ -296,20 +296,9 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
     const std::string ClassName = Class.AssetName + "_C";
     const bool bFunctionLibrary = Class.ParentClass == "BlueprintFunctionLibrary";
 
-    /*
-    An actor Blueprint is the one shape this cannot emit yet. UBlueprint::PostLoad gives every
-    actor a SimpleConstructionScript and asserts on a null GeneratedClass to outer it to, and a
-    hand-written empty generated class does not survive the editor's deferred CDO loading (its CDO
-    export never gets created, so the load ends in "CDO for class X did not load"). Emitting one
-    that does means emitting the whole compiled class, which is the cooked writer's job - see the
-    TODO in ROADMAP. Until then an actor mod ships without an editor-side stub rather than with
-    one that crashes the editor that opens it.
-    */
-    if (Class.bIsActor)
-    {
-        if (Err) *Err = Class.AssetName + " is actor-derived: an API asset needs a generated class the editor accepts (TODO)";
-        return false;
-    }
+    /* An actor needs nothing extra here: UBlueprint::PostLoad builds the SimpleConstructionScript,
+       its SCS_Node and the DefaultSceneRoot itself, once there is a GeneratedClass to outer them to
+       and a CDO export for the deferred loader. Both are emitted below. */
 
     const FIndex ImpBlueprint = Object("/Script/Engine", "Class", "Blueprint");
     const FIndex ImpEdGraph = Object("/Script/Engine", "Class", "EdGraph");

@@ -30,7 +30,6 @@ struct FApiClass
     std::string PackageName;                 // /Game/_ElytrasMods/ReadProperty
     std::string AssetName;                   // ReadProperty (the .uasset)
     std::string ParentPackage, ParentClass;  // /Script/Engine, BlueprintFunctionLibrary
-    bool bIsActor = false;
     std::vector<FApiFunction> Functions;
     std::vector<FPropertyDef> Variables;
 };

@@ -367,7 +367,6 @@ bool FBlueprintClass::WriteApi(const std::string& OutDir, std::string* Err) cons
     Api.PackageName = P.Name().substr(0, P.Name().rfind('/'));
     Api.ParentPackage = ParentPackage;
     Api.ParentClass = ParentClass;
-    Api.bIsActor = bIsActor;
     for (const FPending& Fn : Functions)
         Api.Functions.push_back({ Fn.Def.Name, Fn.Def.Params, Fn.Def.FunctionFlags });
     /* Only what the outside can see. The rest - the UberGraphFrame pointer above all - is
