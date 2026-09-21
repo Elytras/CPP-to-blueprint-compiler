@@ -201,10 +201,12 @@ VS_FILTERS = (("Mods", "5b1f0c4e-6a0d-4a57-9d0a-1c1f6e2a7b01"), ("Tests", "5b1f0
 
 
 def write_vs_filters(bp):
-    """BpMods.vcxproj lists its sources by wildcard, so a new mod needs no project edit - but Visual Studio gives a
-    wildcard FILTER entry to the first file it matches only. So the folders of the project tree are written out file
-    by file here, on every build, and only when the list changed (a rewrite makes Visual Studio reload the project)."""
-    if not os.path.exists(os.path.join(bp, "BpMods.vcxproj")):
+    """The project's file list and its folders (Mods / Tests / Helpers / UeApi), written from what is on disk, on
+    every build and only when it changed - a rewrite makes Visual Studio reload the project. Wildcards would need no
+    writing, but Visual Studio pairs a filter with an item by its Include STRING: a wildcard filter reaches the first
+    file only, and a named filter does not reach a wildcard item at all. So both files name every file."""
+    project = os.path.join(bp, "BpMods.vcxproj")
+    if not os.path.exists(project):
         return
     rows = []
     for f in sorted(os.listdir(bp), key=str.lower):
@@ -226,6 +228,15 @@ def write_vs_filters(bp):
     dest = os.path.join(bp, "BpMods.vcxproj.filters")
     if not os.path.exists(dest) or io.open(dest, encoding="utf-8").read() != text:
         io.open(dest, "w", encoding="utf-8", newline="\n").write(text)
+
+    # The same list, between the two marker comments of the project file.
+    begin, end = "<!-- items: begin (bpbuild.py) -->", "<!-- items: end -->"
+    old = io.open(project, encoding="utf-8", newline="").read()
+    if begin in old and end in old:
+        items = "".join('\n    <%s Include="%s" />' % (kind, name) for kind, name, _ in rows) + '\n    <None Include="mods.yaml" />\n    '
+        new = old[:old.index(begin) + len(begin)] + items + old[old.index(end):]
+        if new != old:
+            io.open(project, "w", encoding="utf-8", newline="").write(new)
 
 
 def main():
