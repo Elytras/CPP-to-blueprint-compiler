@@ -335,6 +335,14 @@ def constants():
     assert re.search(r'Spans \[0\] ArrayProperty size=185 inner=StructProperty', cdo), cdo                 # 2 x (Min tag, Max tag, None) = 132
     assert re.search(r'Spots \[0\] MapProperty size=28 .*: 0000000001000000\w{16}' + pair, cdo), cdo
     print('ok  TypesTest: a container default holds struct elements, raw or tagged as the struct serializes')
+    names = dumpexp.load(base)[3]
+    name_of = lambda hx: names[struct.unpack('<i', bytes.fromhex(hx[:8]))[0]]
+    by_mood = re.search(r'MoodNames \[0\] MapProperty size=56 key=ByteProperty value=NameProperty: 0{8}03000000(\w+)', cdo).group(1)
+    pairs = [(name_of(by_mood[i:i + 16]), name_of(by_mood[i + 16:i + 32])) for i in range(0, 96, 32)]
+    assert pairs == [('EMood::Calm', 'Calm'), ('EMood::Angry', 'Angry'), ('EMood::Sleepy', 'Sleepy')], pairs
+    by_name = re.search(r'MoodsByName \[0\] MapProperty size=62 key=StrProperty value=ByteProperty: 0{8}03000000(\w+)', cdo).group(1)
+    assert by_name.startswith('05000000' + b'Calm'.hex() + '00') and name_of(by_name[18:34]) == 'EMood::Calm', by_name
+    print('ok  TypesTest: UE_ENUM_MAP fills a map from the enum, either way round')
     base = asset('TypesTest')
     exports = [e['name'] for e in dumpexp.load(base)[5]]
     tool = lambda t, i: subprocess.run([sys.executable, os.path.join(here, t), base, str(i)], capture_output=True, text=True).stdout

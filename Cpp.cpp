@@ -1033,6 +1033,7 @@ private:
     std::map<std::string, FEnumInfo> Enums;
     std::map<std::string, FStructInfo> Structs;
     std::map<std::string, int64> EnumValues;          // clang EnumConstantDecl id -> value
+    std::map<std::string, std::vector<std::pair<std::string, int64>>> EnumDecls;   // C++ name -> its enumerators, in order
     std::map<std::string, int32> EnumConstWidth;      // clang EnumConstantDecl id -> its enum's size, 1 / 4 / 8
     std::map<std::string, uint32> EventFlags;         // UeApi/Events.json: "Package.Class.Function" -> EFunctionFlags
     std::map<std::string, FIndex> CurSignatures;      // Generate: dispatcher name -> its signature function export
@@ -1455,7 +1456,6 @@ bool FCompiler::Collect(std::string* Err)
 {
     bool bMetaOk = true;
     std::set<std::string> Ambiguous;
-    std::map<std::string, std::vector<std::pair<std::string, int64>>> EnumDecls;
     std::map<std::string, std::string> EnumUnderlying;
     std::vector<std::pair<std::string, std::string>> EnumMarks;      // enum, owning mod ("" for this one)
 
@@ -5460,6 +5460,32 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
     }
 
     const bool bMap = PD.Type == "MapProperty";
+    /* `= UE_ENUM_MAP(EMood)`: one pair per enumerator, whichever side of the map the enum is on. C++ has already
+       checked that the map is over that enum (the conversion operators in UeMeta.h), so the property says which. */
+    if (bMap && PD.Inner && PD.Value && CallsFunction(*Init, "__EnumMap__"))
+    {
+        const bool bEnumKey = !PD.Inner->StructName.empty();
+        const FPropertyDef& EnumSide = bEnumKey ? *PD.Inner : *PD.Value;
+        const std::vector<std::pair<std::string, int64>>* Names = nullptr;
+        for (const auto& E : EnumDecls)
+            if (E.first == EnumSide.StructName || (E.first.size() > EnumSide.StructName.size() + 2
+                && E.first.compare(E.first.size() - EnumSide.StructName.size() - 2, std::string::npos, "::" + EnumSide.StructName) == 0))
+                Names = &E.second;
+        if (!Names || EnumSide.StructName.empty()) { *Err = "UE_ENUM_MAP: " + Name(F) + " is not a map over an enum"; return false; }
+        for (const auto& Entry : *Names)
+        {
+            /* UHT's and the cooker's own closing enumerator is not one of the enum's values. */
+            if (Entry.first.size() > 4 && Entry.first.compare(Entry.first.size() - 4, 4, "_MAX") == 0) continue;
+            FDefaultValue Enum, Text;
+            Enum.K = Text.K = FDefaultValue::Str;
+            Enum.S = EnumSide.StructName + "::" + Entry.first;
+            Text.S = Entry.first;
+            PD.Default.Items.push_back(bEnumKey ? Enum : Text);
+            PD.Default.Items.push_back(bEnumKey ? Text : Enum);
+        }
+        PD.Default.K = FDefaultValue::Array;
+        return true;
+    }
     if ((PD.Type == "ArrayProperty" || PD.Type == "SetProperty" || bMap) && PD.Inner && First(*Init))
     {
         /* The container's initializer_list constructor: the braces are the InitListExpr under it. A map's
