@@ -151,6 +151,58 @@ check('FlowTest', 'FloatStep', lambda F: -(F + 1.5), [dict(F=f) for f in (0.0, 2
 check('FlowTest', 'WhileAnd', while_and, [dict(Limit=l) for l in (0, 1, 50, 99, 150)])
 
 
+def do_continue(Limit):
+    i = s = 0
+    while True:
+        i += 1
+        if i % 2 != 0:
+            if i > 9: break
+            s += i
+        if not i < Limit: break
+    return s * 100 + i
+
+
+def goto_out(Size, Want):
+    for y in range(Size):
+        for x in range(Size):
+            if x * y == Want: return y * 100 + x
+    return -2
+
+
+def if_init(V):
+    twice = V * 2
+    r = twice if twice > 10 else -twice
+    return r + cmod(V, 3) * 1000
+
+
+def switch_init(V):
+    k, m = V + 1, cmod(V, 4)
+    if k == 1: return 10
+    if k == 2: return 20 + k
+    return 300 + m if m == 3 else m
+
+
+def while_var(Start):
+    steps = 0
+    while Start - steps != 0:
+        left = Start - steps
+        steps += 1
+        if left < 0: break
+    return steps
+
+
+check('FlowTest', 'DoOnce', lambda Limit: max(Limit, 1), [dict(Limit=l) for l in (-3, 0, 1, 2, 9)])
+check('FlowTest', 'DoContinue', do_continue, [dict(Limit=l) for l in (0, 1, 2, 6, 7, 30)])
+check('FlowTest', 'GotoLoop', lambda N: sum(range(max(N, 0))), [dict(N=n) for n in (-1, 0, 1, 5, 40)])
+check('FlowTest', 'GotoOut', goto_out, [dict(Size=s, Want=w) for s in (0, 1, 4) for w in (0, 6, 7)])
+def first_square_above(floor): return next(n for n in range(1, 100) if n * n > floor)
+check('FlowTest', 'GotoInlined', lambda A, B: first_square_above(A) * 100 + first_square_above(B), [dict(A=a, B=b) for a, b in ((0, 0), (10, 50), (99, 3))])
+check('FlowTest', 'GotoRedeclares', lambda Rounds: 5 * max(Rounds, 1), [dict(Rounds=r) for r in (0, 1, 3)])
+check('FlowTest', 'IfInit', if_init, [dict(V=v) for v in (-4, 0, 3, 5, 6, 8)])
+check('FlowTest', 'SwitchInit', switch_init, [dict(V=v) for v in (-1, 0, 1, 2, 3, 7)])
+check('FlowTest', 'WhileVar', while_var, [dict(Start=s) for s in (-2, 0, 1, 5)])
+
+
 def range_self(**kw):
     return dict(Items=list(kw.get('Items', [])), Seen=list(kw.get('Seen', [])), Scores=dict(kw.get('Scores', {})))
 
@@ -189,6 +241,7 @@ def bump_scores(stop):
 
 arrays = [[], [1], [3, -1, 7], [60, 2, -5, 9], [1, 2, 3, 4, 5]]
 check_self('RangeTest', 'SumArray', lambda f: sum(f['Items']), [dict(Items=a) for a in arrays])
+check_self('RangeTest', 'SumScaled', lambda f: 3 * sum(f['Items']), [dict(Items=a) for a in arrays])
 check_self('RangeTest', 'DoubleInPlace', double_in_place, [dict(Items=a) for a in arrays])
 check_self('RangeTest', 'CopyDoesNotWrite', lambda f: len(f['Items']), [dict(Items=a) for a in arrays])
 check_self('RangeTest', 'NestedPairs', lambda f: sum(1 for a in f['Items'] for b in f['Items'] if a < b), [dict(Items=a) for a in arrays])

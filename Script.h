@@ -1,4 +1,5 @@
 ﻿#pragma once
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -146,6 +147,9 @@ public:
     std::vector<int32> LatentResumes;
     /* The same for an await: the event that resumes lives in another function, so the offset is stored, not patched. */
     std::vector<std::shared_ptr<int32>> ResumeSinks;
+    /* `goto`: where each label landed, and the forward jumps still waiting for theirs. */
+    std::map<int32, int32> GotoLabelAt;
+    std::vector<std::pair<int32, int32>> GotoPatches;       // {label, patch position}
 
     void FieldPath(const std::string& PropertyName, FIndex Owner);
     void FieldPath(const std::vector<std::string>& Path, FIndex Owner);     // innermost first: {"Items", "Items"} is an array's element

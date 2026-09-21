@@ -451,6 +451,8 @@ struct FStmtIR
         Label,
         Block,                                      // an inline function's body: Body, where InlineReturn jumps past
         InlineReturn,
+        Goto,                                       // LabelId: the GotoLabel it jumps to
+        GotoLabel,
     } K = StaticCall;
 
     FCallIR Target;
@@ -464,8 +466,10 @@ struct FStmtIR
     std::shared_ptr<std::vector<FStmtIR>> Body;
     std::shared_ptr<std::vector<FStmtIR>> Inc;      // While: a `for` increment, where `continue` lands
     std::shared_ptr<std::vector<FStmtIR>> Trailer;  // While: runs on `break` only, before leaving the loop
+    bool bPostTest = false;                         // While: `do {} while (Cond)`, the test after Body and Inc
     std::vector<FArgIR> CaseTests;                  // Switch: per case, true when the value does NOT match
-    int32 LabelId = -1;                             // Label: the case it marks; Switch: the default's label, or -1
+    int32 LabelId = -1;                             // Label: the case it marks; Switch: the default's label, or -1;
+                                                    // Goto / GotoLabel: the label, unique in the class
     std::vector<int64> CaseValues;                  // Switch: each case's constant, in CaseTests order
     int32 SwitchWidth = 4;                          // Switch: the value's size, 1 / 4 / 8; 0 for an FName
     FArgIR SwitchValue;                             // Switch: the temp the value was stored in
@@ -827,6 +831,8 @@ private:
     bool LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR& Out, std::string* Err);
     bool LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vector<FStmtIR>& Out,
                        std::vector<FPropertyDef>& Locals, std::string* Err);
+    bool LowerWithoutPrefix(const Json& Stmt, FBlueprintClass& BP, std::vector<FStmtIR>& Out,
+                            std::vector<FPropertyDef>& Locals, std::string* Err);
 
     /* `inline` functions are the editor's macros: never a UFunction, their body is copied into each caller.
        `inline` may sit on the declaration or on an out-of-line definition. */
@@ -1046,6 +1052,15 @@ private:
     std::set<std::string> GeneratedEvents;            // the class's, so two never share a name
     std::set<std::string> ActivatedActions;           // the method's variables an await already activated
     int32 SwitchDepth = 0;                            // LowerBody: the switches around it
+    std::map<std::string, int32> GotoLabels;          // the body being lowered's: clang LabelDecl id -> FStmtIR::LabelId
+    int32 NextGotoLabel = 0;                          // never reset: latent functions share one ubergraph script
+    bool bBodyHasGoto = false;                        // a goto can re-reach any declaration, as a loop does
+    int32 WriteBackDepth = 0;                         // LowerBody: the TMap range-fors around it that write the value back
+    int32 GotoLabelOf(const std::string& DeclId)
+    {
+        const auto It = GotoLabels.find(DeclId);
+        return It != GotoLabels.end() ? It->second : (GotoLabels[DeclId] = NextGotoLabel++);
+    }
 };
 
 /* The innermost loop's forward jumps, patched once its exit / continue offsets are known. */
@@ -1130,11 +1145,15 @@ void EmitStmts(const std::vector<FStmtIR>& Stmts, FScript& S, FIndex SelfExp, FL
                `return` from inside the loop leaves nothing behind. */
             FLoopPatches Inner;
             const int32 Head = S.MemorySize();
-            const int32 ExitPatch = S.JumpIfNot(0,
-                [St, SelfExp](FScript& C) { EmitArg(C, St.Cond, SelfExp, nullptr); });
+            int32 ExitPatch = -1;
+            auto Test = [&] {
+                ExitPatch = S.JumpIfNot(0, [St, SelfExp](FScript& C) { EmitArg(C, St.Cond, SelfExp, nullptr); });
+            };
+            if (!St.bPostTest) Test();
             if (St.Body) EmitStmts(*St.Body, S, SelfExp, &Inner, Returns);
             for (int32 P : Inner.Continues) S.PatchJumpTarget(P, S.MemorySize());
             if (St.Inc) EmitStmts(*St.Inc, S, SelfExp, Loop, Returns);
+            if (St.bPostTest) Test();               // do/while: `continue` lands on the test, as in C++
             S.Jump(Head);
             if (St.Trailer && !Inner.Breaks.empty())
             {
@@ -1268,6 +1287,22 @@ void EmitStmts(const std::vector<FStmtIR>& Stmts, FScript& S, FIndex SelfExp, FL
 
         case FStmtIR::InlineReturn:
             if (Returns) Returns->push_back(S.Jump(0));
+            break;
+
+        case FStmtIR::Goto:
+        {
+            /* The same patched EX_Jump `break` is: nothing sits on the flow stack, so a goto may leave any
+               number of loops. A label already emitted is a backward jump, known now. */
+            const auto At = S.GotoLabelAt.find(St.LabelId);
+            if (At != S.GotoLabelAt.end()) S.Jump(At->second);
+            else S.GotoPatches.push_back({ St.LabelId, S.Jump(0) });
+            break;
+        }
+
+        case FStmtIR::GotoLabel:
+            S.GotoLabelAt[St.LabelId] = S.MemorySize();
+            for (const auto& [Label, Patch] : S.GotoPatches)
+                if (Label == St.LabelId) S.PatchJumpTarget(Patch, S.MemorySize());
             break;
         }
         /* After a latent call this run of the ubergraph ends; the latent action re-enters right here. BP_LiftPod
@@ -3647,7 +3682,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                         return;
                     }
                 }
-                else if (LoopDepth > 0 && !Ds.bHasValue)
+                else if ((LoopDepth > 0 || bBodyHasGoto) && !Ds.bHasValue)
                 {
                     /* The frame initialises a local once, on entry, but C++ constructs it again each time a loop
                        reaches the declaration. A twin nothing writes keeps the entry value to copy back. */
@@ -3853,8 +3888,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             /* IfStmt inner is [cond, then, else?]; an init-stmt would prepend one. */
             if (S->value("hasInit", false) || S->value("hasVar", false))
             {
-                *Err = "TODO: `if` with an init-statement / condition-variable is not supported";
-                bOk = false;
+                if (!LowerWithoutPrefix(*S, BP, Out, Locals, Err)) bOk = false;
                 return;
             }
             const Json* Cond = Nth(*S, 0);
@@ -3899,7 +3933,10 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                or DefaultStmt [sub] becomes a Label followed by its first statement, so every label sits at the top
                level of the body, where the emitter looks for them. The default gets the label after the cases. */
             if (S->value("hasInit", false) || S->value("hasVar", false))
-            { *Err = "TODO: `switch` with an init-statement / condition-variable is not supported"; bOk = false; return; }
+            {
+                if (!LowerWithoutPrefix(*S, BP, Out, Locals, Err)) bOk = false;
+                return;
+            }
             const Json* Cond = Nth(*S, 0);
             const Json* Body = Nth(*S, 1);
             if (!Cond || !Body || Kind(*Body) != "CompoundStmt") { *Err = "`switch` needs a braced body"; bOk = false; return; }
@@ -4002,6 +4039,71 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
         else if (K == "CXXForRangeStmt")
         {
             if (!LowerRangeFor(*S, BP, Out, Locals, Err)) { bOk = false; return; }
+            return;
+        }
+        else if (K == "CompoundStmt")
+        {
+            /* A bare `{ ... }`: a Blueprint local has no scope to end, so its statements join this list. */
+            if (!LowerBody(*S, BP, Out, Locals, Err)) bOk = false;
+            return;
+        }
+        else if (K == "DoStmt")
+        {
+            /* DoStmt inner is [body, cond]: a While whose test follows the body. */
+            const Json* Body = Nth(*S, 0);
+            const Json* Cond = Nth(*S, 1);
+            if (!Cond || !Body) { *Err = "`do` with a missing body or condition"; bOk = false; return; }
+
+            St.K = FStmtIR::While;
+            St.bPostTest = true;
+            if (!LowerArg(*Cond, BP, St.Cond, Err)) { bOk = false; return; }
+            St.Body = std::make_shared<std::vector<FStmtIR>>();
+            Json Wrap = Kind(*Body) == "CompoundStmt" ? *Body
+                      : Json{ {"kind", "CompoundStmt"}, {"inner", Json::array({*Body})} };
+            ++LoopDepth;
+            if (!LowerBody(Wrap, BP, *St.Body, Locals, Err)) { bOk = false; return; }
+            --LoopDepth;
+        }
+        else if (K == "GotoStmt")
+        {
+            if (WriteBackDepth > 0)
+            {
+                *Err = "a goto inside a TMap range-for that writes its value back would skip the write: "
+                       "bind `const auto& [Key, Value]`, or leave with break";
+                bOk = false;
+                return;
+            }
+            St.K = FStmtIR::Goto;
+            St.LabelId = GotoLabelOf(S->value("targetLabelDeclId", std::string()));
+        }
+        else if (K == "LabelStmt")
+        {
+            /* LabelStmt inner is [the statement it marks]. */
+            St.K = FStmtIR::GotoLabel;
+            St.LabelId = GotoLabelOf(S->value("declId", std::string()));
+            Out.push_back(St);
+            if (const Json* Sub = First(*S))
+            {
+                Json Wrap = { {"kind", "CompoundStmt"}, {"inner", Json::array({*Sub})} };
+                if (!LowerBody(Wrap, BP, Out, Locals, Err)) bOk = false;
+            }
+            return;
+        }
+        else if (K == "WhileStmt" && S->value("hasVar", false))
+        {
+            /* `while (T V = Init) Body` is [var, cond, body], and V is made again each time round:
+               `while (true) { T V = Init; if (!V) break; Body }`. */
+            const Json* Var = Nth(*S, 0);
+            const Json* Cond = Nth(*S, 1);
+            const Json* Body = Nth(*S, 2);
+            if (!Var || !Cond || !Body) { *Err = "`while` with a missing condition or body"; bOk = false; return; }
+            Json Not = { {"kind", "UnaryOperator"}, {"opcode", "!"}, {"type", { {"qualType", "bool"} }}, {"inner", Json::array({*Cond})} };
+            Json Exit = { {"kind", "IfStmt"}, {"inner", Json::array({ Not, Json{ {"kind", "BreakStmt"} } })} };
+            Json True = { {"kind", "CXXBoolLiteralExpr"}, {"type", { {"qualType", "bool"} }}, {"value", true} };
+            Json Loop = { {"kind", "WhileStmt"},
+                          {"inner", Json::array({ True, Json{ {"kind", "CompoundStmt"}, {"inner", Json::array({ *Var, Exit, *Body })} } })} };
+            Json Wrap = { {"kind", "CompoundStmt"}, {"inner", Json::array({ Loop })} };
+            if (!LowerBody(Wrap, BP, Out, Locals, Err)) bOk = false;
             return;
         }
         else if (K == "WhileStmt")
@@ -4302,6 +4404,15 @@ bool FCompiler::IsInlineMethod(const FRecord& R, const std::string& Method) cons
         || (Def != R.MethodDefs.end() && Def->second->value("inline", false));
 }
 
+/* Whether a body holds a `goto`, which can run a declaration again the way a loop does. */
+bool HasGoto(const Json& N)
+{
+    if (Kind(N) == "GotoStmt") return true;
+    bool bFound = false;
+    ForEach(N, [&](const Json& C) { bFound = bFound || HasGoto(C); });
+    return bFound;
+}
+
 /* The call becomes one Block statement in Out.Inline:
        <each by-value parameter> = <its argument>;
        <the body, locals renamed __Inl<N>_<name>, `return X` as `__Inl<N>_ReturnValue = X` + a jump to the end>
@@ -4399,11 +4510,19 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
 
     InlineStack.push_back(Method);
     InlineResults.emplace_back(Out.InlineResult, RetType);
-    const int32 SavedLoops = LoopDepth, SavedSwitches = SwitchDepth;
-    LoopDepth = SwitchDepth = 0;
+    const int32 SavedLoops = LoopDepth, SavedSwitches = SwitchDepth, SavedWriteBacks = WriteBackDepth;
+    LoopDepth = SwitchDepth = WriteBackDepth = 0;
+    /* Each expansion lowers the body again, so its labels get ids of their own. */
+    std::map<std::string, int32> SavedLabels;
+    SavedLabels.swap(GotoLabels);
+    const bool bSavedHasGoto = bBodyHasGoto;
+    bBodyHasGoto = HasGoto(*Body);
     const bool bOk = LowerBody(*Body, BP, *B.Body, Locals, Err);
     LoopDepth = SavedLoops;
     SwitchDepth = SavedSwitches;
+    WriteBackDepth = SavedWriteBacks;
+    GotoLabels.swap(SavedLabels);
+    bBodyHasGoto = bSavedHasGoto;
     InlineResults.pop_back();
     InlineStack.pop_back();
     if (!bOk) { *Err = "inline " + Method + ": " + *Err; return false; }
@@ -4421,6 +4540,25 @@ Json RefToLocal(const std::string& Name, const std::string& Type)
 {
     return { {"kind", "DeclRefExpr"}, {"type", {{"qualType", Type}}},
              {"referencedDecl", {{"kind", "VarDecl"}, {"name", Name}, {"id", "synthetic:" + Name}}} };
+}
+
+/* `if (Init; Cond)`, `if (T V = Init)` and the same two on a `switch`: clang puts the init-statement and then the
+   condition variable's DeclStmt before the condition, which already reads V. Both run once, so they are lowered
+   as statements of their own and the rest as the plain statement; a Blueprint local has no scope to end. */
+bool FCompiler::LowerWithoutPrefix(const Json& Stmt, FBlueprintClass& BP, std::vector<FStmtIR>& Out,
+                                   std::vector<FPropertyDef>& Locals, std::string* Err)
+{
+    const size_t Skip = (Stmt.value("hasInit", false) ? 1 : 0) + (Stmt.value("hasVar", false) ? 1 : 0);
+    const Json& In = Stmt["inner"];
+    Json Seq = Json::array(), Rest = Json::array();
+    for (size_t I = 0; I < In.size(); ++I) (I < Skip ? Seq : Rest).push_back(In[I]);
+    Json Plain = Stmt;
+    Plain["hasInit"] = false;
+    Plain["hasVar"] = false;
+    Plain["inner"] = Rest;
+    Seq.push_back(Plain);
+    Json Wrap = { {"kind", "CompoundStmt"}, {"inner", Seq} };
+    return LowerBody(Wrap, BP, Out, Locals, Err);
 }
 
 /* `for (Elem : Range)` over a TArray / TSet / TMap. CXXForRangeStmt inner is
@@ -4443,7 +4581,12 @@ bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vec
     const Json* LoopDecl = LoopStmt ? First(*LoopStmt) : nullptr;
     const Json* Body = Nth(ForNode, 7);
     if (!RangeExpr || !LoopDecl || !Body) { *Err = "a range-for with a missing part"; return false; }
-    if (const Json* Init = Nth(ForNode, 0); Init && Init->is_object() && Init->contains("kind")) { *Err = "TODO: a range-for with an init-statement"; return false; }
+    if (const Json* Init = Nth(ForNode, 0); Init && Init->is_object() && Init->contains("kind"))
+    {
+        /* `for (Init; T E : Range)`: the init-statement runs once, before the loop. */
+        Json Wrap = { {"kind", "CompoundStmt"}, {"inner", Json::array({ *Init })} };
+        if (!LowerBody(Wrap, BP, Out, Locals, Err)) return false;
+    }
 
     std::string RangeTy = TypeOf(*RangeExpr);
     while (!RangeTy.empty() && (RangeTy.back() == '&' || RangeTy.back() == ' ')) RangeTy.pop_back();
@@ -4569,7 +4712,10 @@ bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vec
         }
     }
     Json BodyWrap = Kind(*Body) == "CompoundStmt" ? *Body : Json{ {"kind", "CompoundStmt"}, {"inner", Json::array({ *Body })} };
-    if (!LowerBody(BodyWrap, BP, *Loop.Body, Locals, Err)) { --LoopDepth; return false; }
+    if (Loop.Trailer) ++WriteBackDepth;
+    const bool bBodyOk = LowerBody(BodyWrap, BP, *Loop.Body, Locals, Err);
+    if (Loop.Trailer) --WriteBackDepth;
+    if (!bBodyOk) { --LoopDepth; return false; }
     --LoopDepth;
     Loop.Inc->push_back(AssignStmt(Idx, "int32", Math("Add_IntInt", LocalArg(Idx), One)));
     Out.push_back(std::move(Loop));
@@ -5911,6 +6057,9 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         CurLocals = &Locals;
         LoopDepth = 0;
         SwitchDepth = 0;
+        WriteBackDepth = 0;
+        GotoLabels.clear();
+        bBodyHasGoto = Fn.Body && HasGoto(*Fn.Body);
         KeepLoaded.clear();
         CurFnName = Fn.Name;
         bCurNet = (NetFlagsOf(Decl) | NetFlagsOf(M)) != 0;
