@@ -60,6 +60,15 @@ public:
     /* An implemented interface: a UClass::Interfaces entry. Its functions are ordinary AddFunction()s. */
     void AddInterface(FIndex InterfaceClass) { Interfaces.push_back(InterfaceClass); }
 
+    /*
+    One UE_COMPONENT: an SCS node plus the <Name>_GEN_VARIABLE archetype it instantiates. `Defaults`
+    are written as tagged properties on that archetype, so they delta against the component CDO -
+    the editor's per-component defaults, not the actor CDO's. The class variable of the same name is
+    an ordinary AddVariable(); USCS_Node::ExecuteNodeOnActor assigns the instance to it by name.
+    */
+    void AddComponent(const std::string& Name, FIndex ComponentClass, FIndex ComponentCdo,
+                      bool bIsSceneComponent, const std::vector<FPropertyDef>& Defaults);
+
     void Finish();
 
     /* The editor-side stub of this class: <OutDir>/<asset>.uasset, signatures only (Uncooked.h).
@@ -111,6 +120,15 @@ private:
     std::vector<FPending> Functions;
     std::vector<FPropertyDef> Vars;
     std::vector<FIndex> Interfaces;
+
+    struct FComponent
+    {
+        std::string Name;
+        FIndex Class, Cdo;
+        bool bIsScene = false;
+        std::vector<FPropertyDef> Defaults;
+    };
+    std::vector<FComponent> Components;
 
     int32 ClassRow = 0;
 };

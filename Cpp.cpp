@@ -271,6 +271,8 @@ struct FRecord
     std::vector<const Json*> Fields;
     std::vector<std::string> Interfaces;            // every base after the first
     std::map<std::string, std::string> Replicated;  // UE_REPLICATED*: variable -> "Notify:Condition"
+    std::set<std::string> Components;               // UE_COMPONENT: variables that are also SCS nodes
+    const Json* Defaults = nullptr;                 // UE_DEFAULTS: the static-init block, never lowered
     bool bIsLocal = false;      // UePackage == ModPackage/CppName: cooked here, published at its /Game path
     bool bIsStruct = false;     // UE_STRUCT: cooked as a UserDefinedStruct asset
 
@@ -1001,7 +1003,8 @@ private:
     /* A member initializer becomes PD.Default, which the CDO / struct default instance / asset writes. It must be a
        literal the member's own type can hold (optionally negated), nullptr, an argless ctor, `&Asset`, or a braced
        list of those for a TArray / TSet, of { key, value } pairs for a TMap. Init overrides F's own initializer. */
-    bool LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& BP, std::string* Err, const Json* Init = nullptr);
+    bool LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& BP, std::string* Err, const Json* Init = nullptr,
+                      bool bKeepZero = false);
     std::map<std::string, std::vector<std::pair<std::string, int64>>> ModEnums;  // UE_ENUM cooked here: enumerators
 
     /* Per-function state reset in Generate: whether this function needs the FDeref scratch
@@ -1435,6 +1438,16 @@ bool FCompiler::Collect(std::string* Err)
             {
                 std::string Spec;
                 if (FindLiteral(C, Spec)) R.Replicated[Name(C).substr(0, Name(C).size() - 12)] = Spec;
+            }
+            else if (Kind(C) == "VarDecl" && Name(C).size() > 13
+                     && Name(C).compare(Name(C).size() - 13, 13, "__UeComponent") == 0)
+            {
+                R.Components.insert(Name(C).substr(0, Name(C).size() - 13));
+            }
+            else if (Kind(C) == "CXXMethodDecl" && Name(C) == "UeDefaults__")
+            {
+                /* Not a UFunction: AssetGen reads its assignments as defaults, never lowers them. */
+                R.Defaults = &C;
             }
             else if (Kind(C) == "CXXMethodDecl" && C.contains("name"))
             {
@@ -4881,7 +4894,8 @@ bool FCompiler::AssetRef(const Json& N, FBlueprintClass& BP, FIndex* Out)
     return true;
 }
 
-bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& BP, std::string* Err, const Json* Init)
+bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& BP, std::string* Err, const Json* Init,
+                             bool bKeepZero)
 {
     Init = Strip(Init ? Init : First(F));
     if (!Init) return true;
@@ -4958,22 +4972,22 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
                                                : double(std::strtoull(V.c_str(), nullptr, 10));
         int64 Int = K == "IntegerLiteral" ? int64(std::strtoull(V.c_str(), nullptr, 10)) : int64(Num);
         if (bNeg) { Num = -Num; Int = -Int; }
-        if (T == "FloatProperty") { D.K = Num != 0.0 ? FDefaultValue::Float : FDefaultValue::None; D.F = Num; }
-        else if (T == "BoolProperty") { D.K = Num != 0.0 ? FDefaultValue::Bool : FDefaultValue::None; D.I = 1; }
-        else { D.K = Int != 0 ? FDefaultValue::Int : FDefaultValue::None; D.I = Int; }
+        if (T == "FloatProperty") { D.K = bKeepZero || Num != 0.0 ? FDefaultValue::Float : FDefaultValue::None; D.F = Num; }
+        else if (T == "BoolProperty") { D.K = bKeepZero || Num != 0.0 ? FDefaultValue::Bool : FDefaultValue::None; D.I = Num != 0.0; }
+        else { D.K = bKeepZero || Int != 0 ? FDefaultValue::Int : FDefaultValue::None; D.I = Int; }
         return true;
     }
     if (!bNeg && K == "DeclRefExpr" && (T == "ByteProperty" || T == "EnumProperty") && !PD.StructName.empty()
         && (*Init)["referencedDecl"].value("kind", std::string()) == "EnumConstantDecl")
     {
         D.S = PD.StructName + "::" + Name((*Init)["referencedDecl"]);
-        D.K = D.S == PD.EnumZero ? FDefaultValue::None : FDefaultValue::Str;
+        D.K = !bKeepZero && D.S == PD.EnumZero ? FDefaultValue::None : FDefaultValue::Str;
         return true;
     }
     if (!bNeg && K == "StringLiteral" && (T == "StrProperty" || T == "NameProperty" || T == "TextProperty"))
     {
         D.S = Unquote(Init->value("value", std::string()));
-        D.K = D.S.empty() ? FDefaultValue::None : FDefaultValue::Str;
+        D.K = !bKeepZero && D.S.empty() ? FDefaultValue::None : FDefaultValue::Str;
         return true;
     }
     *Err = "TODO: an initializer must be a literal of the member's own type: " + Name(F);
@@ -5453,6 +5467,48 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                                                  [](FScript& S, FIndex) { S.Return(); S.EndOfScript(); }, Flags);
     }
 
+    /*
+    UE_DEFAULTS: `Comp->Field = value;` per statement. The block is never lowered - each assignment
+    becomes one tagged property on that component's archetype, which is where the editor keeps a
+    per-component default. Anything else in there is refused rather than silently dropped, since a
+    statement that looks like it runs and does not is the worst possible failure here.
+    */
+    std::map<std::string, std::vector<FPropertyDef>> ComponentDefaults;
+    if (R.Defaults)
+    {
+        const std::string Where = R.CppName + "::UE_DEFAULTS";
+        const Json* Body = nullptr;
+        ForEach(*R.Defaults, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Body = &C; });
+        bool bOk = true;
+        if (Body)
+            ForEach(*Body, [&](const Json& S) {
+                if (!bOk) return;
+                const Json* Assign = Strip(&S);
+                const Json* Lhs = Assign ? Strip(Nth(*Assign, 0)) : nullptr;
+                const Json* Rhs = Assign ? Nth(*Assign, 1) : nullptr;
+                if (!Assign || Kind(*Assign) != "BinaryOperator"
+                    || Assign->value("opcode", std::string()) != "="
+                    || !Lhs || Kind(*Lhs) != "MemberExpr" || !Rhs)
+                { *Err = Where + ": every statement is `Component->Field = value;`"; bOk = false; return; }
+
+                const Json* Owner = Strip(First(*Lhs));
+                const std::string CompName = Owner && Kind(*Owner) == "MemberExpr" ? Name(*Owner) : std::string();
+                if (!R.Components.count(CompName))
+                { *Err = Where + ": " + CompName + " is not a UE_COMPONENT of this class"
+                         + " (an inherited component or property is not settable here yet)"; bOk = false; return; }
+
+                FPropertyDef PD;
+                if (!TypeToProperty(TypeOf(*Lhs), Name(*Lhs), 0, Where, BP, &PD, Err)) { bOk = false; return; }
+                /* Zero is a real value on an archetype: it deltas against the component CDO, where
+                   bVisible is already true, not against the type's zero as a class variable does. */
+                if (!LowerDefault(*Lhs, PD, BP, Err, Rhs, /*bKeepZero=*/true)) { bOk = false; return; }
+                if (PD.Default.K == FDefaultValue::None)
+                { *Err = Where + ": " + CompName + "->" + Name(*Lhs) + " needs a literal value"; bOk = false; return; }
+                ComponentDefaults[CompName].push_back(PD);
+            });
+        if (!bOk) return false;
+    }
+
     /* A cooked property carries no offset: FProperty::SetupOffset lays ChildProperties out in order, so emitting them
        by alignment, largest first, is the packing. Only the order moves; the bytecode names a property by path. */
     std::vector<std::pair<int32, FPropertyDef>> ClassVars;
@@ -5481,6 +5537,28 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         PD.PropertyFlags = (PD.PropertyFlags & ~uint64(CPF_Parm | CPF_BlueprintReadOnly))
                          | CPF_Edit | CPF_BlueprintVisible | CPF_DisableEditOnInstance;
         if (TypeOf(*F).compare(0, 6, "const ") == 0) PD.PropertyFlags |= CPF_BlueprintReadOnly;
+        if (R.Components.count(FieldName))
+        {
+            if (!bIsActor) { *Err = R.CppName + "::" + FieldName + ": only an actor has a construction script"; return false; }
+            const size_t Star = TypeOf(*F).find('*');
+            const FRecord* CR = Star == std::string::npos ? nullptr
+                                                          : Find(StripTypeKeywords(TypeOf(*F).substr(0, Star)));
+            if (!CR || !CR->IsNative())
+            { *Err = R.CppName + "::" + FieldName + ": a UE_COMPONENT names an engine component class"; return false; }
+            bool bIsScene = false, bIsComponent = false;
+            for (const FRecord* A = CR; A; A = A->Base.empty() ? nullptr : Find(A->Base))
+            {
+                bIsScene = bIsScene || A->UeName == "SceneComponent";
+                bIsComponent = bIsComponent || A->UeName == "ActorComponent";
+            }
+            if (!bIsComponent) { *Err = R.CppName + "::" + FieldName + ": " + CR->CppName + " is not a UActorComponent"; return false; }
+            /* The variable stays an ordinary ObjectProperty: ExecuteNodeOnActor finds it by name and
+               assigns the instance it built from the archetype. */
+            BP.AddComponent(FieldName, BP.EngineClass(CR->UePackage, CR->UeName),
+                            BP.ClassDefaultObject(CR->UePackage, CR->UeName), bIsScene,
+                            ComponentDefaults[FieldName]);
+            ComponentDefaults.erase(FieldName);
+        }
         if (auto Rep = R.Replicated.find(FieldName); Rep != R.Replicated.end())
         {
             /* Measured on BP_LiftPod.IsLaunchEnabled: the editor's flags plus CPF_Net, and CPF_RepNotify with the

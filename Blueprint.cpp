@@ -151,6 +151,12 @@ void FBlueprintClass::AddVariable(const FPropertyDef& Var)
     Vars.push_back(Var);
 }
 
+void FBlueprintClass::AddComponent(const std::string& Name, FIndex ComponentClass, FIndex ComponentCdo,
+                                   bool bIsSceneComponent, const std::vector<FPropertyDef>& Defaults)
+{
+    Components.push_back(FComponent{ Name, ComponentClass, ComponentCdo, bIsSceneComponent, Defaults });
+}
+
 void FBlueprintClass::Finish()
 {
     const std::string CDOName = "Default__" + ClassName;
@@ -175,7 +181,9 @@ void FBlueprintClass::Finish()
     const int32 RowFirstFunction = 2;
     const int32 RowRootTemplate = RowFirstFunction + int32(Functions.size());
     const int32 RowScsNode = RowRootTemplate + 1;
-    const int32 RowScs = RowScsNode + 1;
+    /* Each UE_COMPONENT takes two rows, archetype then node, so the SCS lands after them all. */
+    const int32 RowFirstComponent = RowScsNode + 1;
+    const int32 RowScs = RowFirstComponent + 2 * int32(Components.size());
     const FIndex ScsIdx = bIsActor ? Exp(RowScs) : Null();
     ClassRow = RowClass;
 
@@ -338,6 +346,75 @@ void FBlueprintClass::Finish()
     };
     P.AddExport(std::move(ScsNode));
 
+    /*
+    One archetype + one node per UE_COMPONENT, in declaration order. Measured on DRG's Ene_Butterfly:
+    the node carries ComponentClass / ComponentTemplate / VariableGuid / InternalVariableName, and a
+    node attached to something names it in ParentComponentOrVariableName with bIsParentComponentNative.
+    USimpleConstructionScript::ExecuteScriptOnActor walks RootNodes in order, passing a null parent
+    for the first scene component - which makes it the actor's root - and resolving a non-native
+    parent name through the class variable the earlier node already filled in. So a flat RootNodes
+    list with every later scene component parented to the first reproduces the editor's hierarchy.
+    */
+    const int32 FirstScene = int32(std::find_if(Components.begin(), Components.end(),
+                                                [](const FComponent& C) { return C.bIsScene; })
+                                   - Components.begin());
+    for (size_t I = 0; I < Components.size(); ++I)
+    {
+        const FComponent& C = Components[I];
+        const int32 RowTemplate = RowFirstComponent + 2 * int32(I);
+        const std::vector<FPropertyDef> Defaults = C.Defaults;
+
+        FExport Template;
+        Template.ClassIndex = C.Class;
+        Template.TemplateIndex = C.Cdo;
+        Template.OuterIndex = Exp(RowClass);
+        Template.ObjectName = C.Name + "_GEN_VARIABLE";
+        Template.ObjectFlags = RF_Public | RF_Transactional | RF_ArchetypeObject;
+        Template.SerBeforeSer = { Exp(RowClass).V };
+        Template.SerBeforeCreate = { C.Class.V, C.Cdo.V };
+        Template.CreateBeforeCreate = { Exp(RowClass).V };
+        Template.Serialize = [Defaults](FArc& Ar) {
+            for (const FPropertyDef& V : Defaults) WriteDefaultTag(Ar, V);
+            TagEnd(Ar);
+            Ar.Bool(false);
+        };
+        P.AddExport(std::move(Template));
+
+        /* Stable across rebuilds, and non-zero: the editor treats a null VariableGuid as unset. */
+        const std::string Seed = ClassName + ".scs." + C.Name;
+        const uint32 NodeGuid[4] = { StrCrc32(Seed) | 1u, Strihash(Seed), StrCrc32(Seed + "\x01"),
+                                     Strihash(Seed + "\x02") | 1u };
+        const bool bAttached = C.bIsScene && int32(I) != FirstScene;
+        const std::string ParentName = bAttached ? Components[size_t(FirstScene)].Name : std::string();
+        const FIndex CompClass = C.Class;
+        const std::string VarName = C.Name;
+
+        FExport Node;
+        Node.ClassIndex = ScsNodeClass;
+        Node.TemplateIndex = ScsNodeCdo;
+        Node.OuterIndex = Exp(RowScs);
+        Node.ObjectName = "SCS_Node_" + std::to_string(I + 1);
+        Node.ObjectFlags = RF_Transactional;
+        Node.CreateBeforeSer = { Exp(RowTemplate).V, CompClass.V };
+        Node.SerBeforeCreate = { ScsNodeClass.V, ScsNodeCdo.V };
+        Node.CreateBeforeCreate = { Exp(RowScs).V };
+        Node.Serialize = [=](FArc& Ar) {
+            Tag(Ar, "ComponentClass", "ObjectProperty", [=](FArc& V) { V.Idx(CompClass); });
+            Tag(Ar, "ComponentTemplate", "ObjectProperty", [=](FArc& V) { V.Idx(Exp(RowTemplate)); });
+            if (bAttached)
+            {
+                Tag(Ar, "ParentComponentOrVariableName", "NameProperty",
+                    [=](FArc& V) { V.Name(ParentName); });
+                TagBool(Ar, "bIsParentComponentNative", false);
+            }
+            Tag(Ar, "VariableGuid", "StructProperty", [=](FArc& V) { V.Raw(NodeGuid, 16); }, "Guid");
+            Tag(Ar, "InternalVariableName", "NameProperty", [=](FArc& V) { V.Name(VarName); });
+            TagEnd(Ar);
+            Ar.Bool(false);
+        };
+        P.AddExport(std::move(Node));
+    }
+
     FExport Scs;
     Scs.ClassIndex = ScsClass;
     Scs.TemplateIndex = ScsCdo;
@@ -345,9 +422,24 @@ void FBlueprintClass::Finish()
     Scs.ObjectName = "SimpleConstructionScript_0";
     Scs.ObjectFlags = RF_Transactional;
     Scs.CreateBeforeSer = { Exp(RowScsNode).V };
+    for (size_t I = 0; I < Components.size(); ++I)
+        Scs.CreateBeforeSer.push_back(Exp(RowFirstComponent + 2 * int32(I) + 1).V);
     Scs.SerBeforeCreate = { ScsClass.V, ScsCdo.V };
     Scs.CreateBeforeCreate = { Exp(RowClass).V };
+    const int32 NumComponents = int32(Components.size());
     Scs.Serialize = [=](FArc& Ar) {
+        /* DefaultSceneRoot stays declared but drops out of both lists once a component can be the
+           root, exactly as Ene_Butterfly saves it; with no components at all the lists are absent
+           and ExecuteScriptOnActor makes its own root. */
+        if (NumComponents > 0)
+        {
+            const auto Nodes = [=](FArc& V) {
+                V.I32(NumComponents);
+                for (int32 I = 0; I < NumComponents; ++I) V.Idx(Exp(RowFirstComponent + 2 * I + 1));
+            };
+            Tag(Ar, "RootNodes", "ArrayProperty", Nodes, "ObjectProperty");
+            Tag(Ar, "AllNodes", "ArrayProperty", Nodes, "ObjectProperty");
+        }
         Tag(Ar, "DefaultSceneRootNode", "ObjectProperty",
             [=](FArc& V) { V.Idx(Exp(RowScsNode)); });
         TagEnd(Ar);
