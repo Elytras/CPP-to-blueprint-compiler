@@ -275,9 +275,10 @@ struct FRecord
     const Json* Defaults = nullptr;                 // UE_DEFAULTS: the static-init block, never lowered
     bool bIsLocal = false;      // UePackage == ModPackage/CppName: cooked here, published at its /Game path
     bool bIsStruct = false;     // UE_STRUCT: cooked as a UserDefinedStruct asset
+    bool bIsInterface = false;  // UE_INTERFACE: cooked as a BPGC whose super is UInterface
 
     bool IsNative() const { return !UePackage.empty() && !bIsLocal; }
-    bool IsGenerated() const { return !IsNative() && (bIsStruct || !Base.empty()); }
+    bool IsGenerated() const { return !IsNative() && (bIsStruct || bIsInterface || !Base.empty()); }
     /* A UserDefinedStruct: cooked here, or cooked by the mod its UE_STRUCT_IN names and imported. */
     bool IsModStruct() const { return bIsStruct && (UePackage.empty() || UePackage.compare(0, 6, "/Game/") == 0); }
 };
@@ -796,6 +797,10 @@ private:
     bool Collect(std::string* Err);
     bool Generate(const FRecord& R, const std::string& OutDir, std::string* Err);
     bool GenerateStruct(const FRecord& R, const std::string& OutDir, std::string* Err);
+    bool GenerateInterface(const FRecord& R, const std::string& OutDir, std::string* Err);
+    /* Every T& parm is treated as an out-parm; the return value is the caller's to append. */
+    bool LowerParams(const Json& M, const std::string& Fn, FBlueprintClass& BP,
+                     std::vector<FPropertyDef>& Params, std::string* Err);
     bool GenerateEnum(const std::string& Name, const std::string& OutDir, std::string* Err);
     /* A namespace-scope `UMyDef MD_Big = { .Health = 500 };`: an instance of a UE class as its own package. */
     bool GenerateAsset(const Json& Var, const std::string& OutDir, std::string* Err);
@@ -1423,6 +1428,10 @@ bool FCompiler::Collect(std::string* Err)
                     }
                     BadClassMeta(R, Err, &bMetaOk);
                 }
+            }
+            else if (Kind(C) == "VarDecl" && Name(C) == "UeInterfaceMeta")
+            {
+                R.bIsInterface = true;
             }
             else if (Kind(C) == "VarDecl" && Name(C) == "UeStructMeta")
             {
@@ -5238,6 +5247,87 @@ bool FCompiler::StructLayout(const FRecord& R, int32* Size, int32* Align, std::s
     return true;
 }
 
+bool FCompiler::LowerParams(const Json& M, const std::string& Fn, FBlueprintClass& BP,
+                            std::vector<FPropertyDef>& Params, std::string* Err)
+{
+    CurrentOutParms.clear();
+    bool bOk = true;
+    ForEach(M, [&](const Json& C) {
+        if (Kind(C) != "ParmVarDecl" || !bOk) return;
+        std::string Type = TypeOf(C);
+        const std::string PName = Name(C);
+        bool bOutParm = false;
+        while (!Type.empty() && (Type.back() == '&' || Type.back() == ' ' || Type.back() == '\t'))
+        {
+            if (Type.back() == '&') bOutParm = true;
+            Type.pop_back();
+        }
+        FPropertyDef PD;
+        bOk = TypeToProperty(Type, PName, bOutParm ? uint64(CPF_OutParm | CPF_ReferenceParm) : 0,
+                             "parameter " + PName + " on " + Fn, BP, &PD, Err);
+        if (!bOk) return;
+        Params.push_back(PD);
+        if (bOutParm) CurrentOutParms.insert(PName);
+    });
+    return bOk;
+}
+
+/*
+A UE_INTERFACE: a BlueprintGeneratedClass whose super is UInterface, holding one empty UFunction per
+declared method. Measured on BPI_InputKeyHandler: ClassFlags CLASS_Parsed | CLASS_Interface |
+CLASS_CompiledFromBlueprint, no SCS, the CDO archetyped on Default__Interface. An interface declares
+no state, so there are no variables to carry.
+*/
+bool FCompiler::GenerateInterface(const FRecord& R, const std::string& OutDir, std::string* Err)
+{
+    Cur = &R;
+    const std::string PackageName = ModPackage + "/" + R.CppName;
+    FPackage P(PackageName);
+    StampIdentity(P, PackageName);
+    FBlueprintClass BP(P, R.CppName + "_C", "/Script/CoreUObject", "Interface", false);
+    BP.SetIsActor(false);
+    BP.SetClassFlags(CLASS_Parsed | CLASS_Interface | CLASS_CompiledFromBlueprint);
+
+    if (!R.Fields.empty())
+    { *Err = R.CppName + ": an interface declares no variables, only functions"; return false; }
+
+    for (const auto& Entry : R.Methods)
+    {
+        std::vector<FPropertyDef> Params;
+        if (!LowerParams(*Entry.second, Entry.first, BP, Params, Err)) return false;
+
+        const std::string FnQual = (*Entry.second)["type"].value("qualType", std::string());
+        const size_t LParen = FnQual.find('(');
+        std::string RetType = LParen == std::string::npos ? FnQual : FnQual.substr(0, LParen);
+        while (!RetType.empty() && (RetType.back() == ' ' || RetType.back() == '\t')) RetType.pop_back();
+        if (!RetType.empty() && RetType != "void")
+        {
+            FPropertyDef PD;
+            if (!TypeToProperty(RetType, "ReturnValue", CPF_ReturnParm | CPF_OutParm,
+                                "return type on " + Entry.first, BP, &PD, Err)) return false;
+            PD.PropertyFlags &= ~uint64(CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+            Params.push_back(PD);
+        }
+
+        /* `[I]` the flag set, not measured: the uncooked asset's field stream is not what dumpstruct
+           reads. An implementing class re-declares the function with its own flags anyway, and those
+           are the ones a caller dispatches through. */
+        const bool bOut = std::any_of(Params.begin(), Params.end(),
+                                      [](const FPropertyDef& P) { return (P.PropertyFlags & CPF_OutParm) != 0; });
+        BP.AddFunction(Entry.first, Null(), Params,
+                       [](FScript& S, FIndex) { S.Return(); S.EndOfScript(); },
+                       FUNC_Public | FUNC_BlueprintCallable | FUNC_BlueprintEvent
+                           | (bOut ? FUNC_HasOutParms : 0));
+    }
+
+    BP.Finish();
+    if (!P.Save(OutDir + "/" + R.CppName, Err)) return false;
+    RegistryRows.push_back({ PackageName, R.CppName, "BlueprintGeneratedClass" });
+    printf("  %-14s -> %s.uasset  (interface, %d functions)\n", R.CppName.c_str(), R.CppName.c_str(),
+           int32(R.Methods.size()));
+    return true;
+}
+
 bool FCompiler::GenerateStruct(const FRecord& R, const std::string& OutDir, std::string* Err)
 {
     Cur = &R;
@@ -5409,7 +5499,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     {
         const FRecord* IR = Find(I);
         if (!IR || IR->bIsStruct) { *Err = R.CppName + " implements an undeclared interface: " + I; return false; }
-        if (!IR->IsNative()) { *Err = "TODO: " + R.CppName + " implements " + I + ", an interface declared in the mod"; return false; }
+        if (!IR->IsNative() && !IR->bIsInterface)
+        { *Err = R.CppName + " implements " + I + ", which is not an interface"; return false; }
         /* clang already rejects one listed twice; an ancestor's copy it only warns about. A native
            ancestor's interfaces are not in the dump, so only the mod's classes are checked. */
         for (const FRecord* A = Find(R.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
@@ -5419,28 +5510,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         BP.AddInterface(ClassImportOf(*IR, BP));
     }
 
-    /* Every T& parm is treated as an out-parm. */
     auto LowerParams = [&](const Json& M, const std::string& Fn, std::vector<FPropertyDef>& Params) {
-        CurrentOutParms.clear();
-        bool bOk = true;
-        ForEach(M, [&](const Json& C) {
-            if (Kind(C) != "ParmVarDecl" || !bOk) return;
-            std::string Type = TypeOf(C);
-            const std::string PName = Name(C);
-            bool bOutParm = false;
-            while (!Type.empty() && (Type.back() == '&' || Type.back() == ' ' || Type.back() == '\t'))
-            {
-                if (Type.back() == '&') bOutParm = true;
-                Type.pop_back();
-            }
-            FPropertyDef PD;
-            bOk = TypeToProperty(Type, PName, bOutParm ? uint64(CPF_OutParm | CPF_ReferenceParm) : 0,
-                                 "parameter " + PName + " on " + Fn, BP, &PD, Err);
-            if (!bOk) return;
-            Params.push_back(PD);
-            if (bOutParm) CurrentOutParms.insert(PName);
-        });
-        return bOk;
+        return this->LowerParams(M, Fn, BP, Params, Err);
     };
     auto HasOutParm = [](const std::vector<FPropertyDef>& Params) {
         return std::any_of(Params.begin(), Params.end(),
@@ -5668,6 +5739,21 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     for (const std::string& I : R.Interfaces)
     {
         const FRecord& IR = *Find(I);
+        /* A mod's own interface needs none of the Events.json conformance check below: GenerateInterface
+           emits every one of its functions as a BlueprintEvent, so all of them are implementable by
+           construction. What it does share is the empty stub for one this class leaves out. */
+        if (IR.bIsInterface)
+        {
+            for (const auto& M : IR.Methods)
+            {
+                if (std::any_of(Methods.begin(), Methods.end(),
+                                [&](const FMethod& F) { return F.Name == M.first; })) continue;
+                FMethod Fn{ M.first, M.second, M.second, nullptr };
+                Fn.Body = BodyOf(IR, M.first, Fn.Def);
+                Methods.push_back(Fn);
+            }
+            continue;
+        }
         const std::string Prefix = IR.UePackage.substr(IR.UePackage.rfind('/') + 1) + "." + IR.UeName + ".";
         for (const auto& M : IR.Methods)
             if (M.first != "StaticClass" && !EventFlags.count(Prefix + M.first))     // StaticClass: UE_CLASS's
@@ -6078,7 +6164,9 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     {
         const FRecord& R = Entry.second;
         if (!R.IsGenerated()) continue;
-        if (!(R.bIsStruct ? GenerateStruct(R, OutDir, Err) : Generate(R, OutDir, Err)))
+        if (!(R.bIsStruct       ? GenerateStruct(R, OutDir, Err)
+              : R.bIsInterface  ? GenerateInterface(R, OutDir, Err)
+                                : Generate(R, OutDir, Err)))
         {
             /* Remove every generated asset; keep the AST for inspection. */
             for (const auto& Other : Records)
