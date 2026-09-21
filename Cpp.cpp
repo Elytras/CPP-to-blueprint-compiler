@@ -107,6 +107,44 @@ void ForEach(const Json& N, const F& Fn)
     for (const Json& C : *It) Fn(C);
 }
 
+/* What clang writes for a member the braces leave out; an aggregate member (a struct, a TArray) is a list of those. */
+bool IsUnsetInit(const Json& E)
+{
+    const std::string K = Kind(E);
+    if (K == "ImplicitValueInitExpr" || K == "CXXDefaultInitExpr") return true;
+    if (K == "CXXConstructExpr") return !First(E);
+    if (K != "InitListExpr") return false;
+    bool bAll = true;
+    ForEach(E, [&](const Json& C) { bAll = bAll && IsUnsetInit(C); });
+    return bAll;
+}
+
+/* Every type spelling under N with the aliases in scope written out. clang spells a use as the source did, and a
+   class-scope alias means what it says only inside that class and the ones deriving it - so it is expanded there,
+   once, before anything reads a type. A name already qualified (`A::Leaf`) is left alone. */
+void ExpandAliases(Json& N, const std::map<std::string, std::string>& InScope)
+{
+    if (!N.is_structured()) return;
+    auto T = N.is_object() ? N.find("type") : N.end();
+    if (T != N.end() && T->is_object() && T->contains("qualType"))
+    {
+        const std::string Q = (*T)["qualType"].get<std::string>();
+        std::string Out;
+        for (size_t I = 0; I < Q.size();)
+        {
+            if (!std::isalpha(uint8(Q[I])) && Q[I] != '_') { Out += Q[I++]; continue; }
+            size_t E = I;
+            while (E < Q.size() && (std::isalnum(uint8(Q[E])) || Q[E] == '_')) ++E;
+            const bool bQualified = I >= 2 && Q[I - 1] == ':' && Q[I - 2] == ':';
+            const auto A = bQualified ? InScope.end() : InScope.find(Q.substr(I, E - I));
+            Out += A == InScope.end() ? Q.substr(I, E - I) : A->second;
+            I = E;
+        }
+        if (Out != Q) (*T)["qualType"] = Out;
+    }
+    for (Json& C : N) ExpandAliases(C, InScope);
+}
+
 /* A CXXOperatorCallExpr whose callee is operator=: struct assignment, which clang does not spell
    as a BinaryOperator. The callee is the first inner node. */
 bool IsAssignOperatorCall(const Json& N)
@@ -215,6 +253,13 @@ const Json* BracedInit(const Json& Var)
     return I && Kind(*I) == "InitListExpr" ? I : nullptr;
 }
 
+/* What an override or an interface implementation takes of its parent's flags (KismetCompiler.cpp PrecompileFunction
+   and the event stubs; measured on BP_SentryGun_MoveMarker). */
+constexpr uint32 kOverrideInherits = FUNC_Exec | FUNC_Event | FUNC_BlueprintCallable | FUNC_BlueprintEvent
+                                   | FUNC_BlueprintAuthorityOnly | FUNC_BlueprintCosmetic | FUNC_Const
+                                   | FUNC_Public | FUNC_Protected | FUNC_Private | FUNC_BlueprintPure
+                                   | FUNC_Net | FUNC_NetReliable | FUNC_NetServer | FUNC_NetClient | FUNC_NetMulticast;
+
 bool IsStaticDecl(const Json& Decl) { return Decl.value("storageClass", std::string()) == "static"; }
 
 /* UE_SERVER / UE_CLIENT / UE_MULTICAST / UE_RELIABLE, carried as attribute kinds (UeMeta.h). */
@@ -282,6 +327,11 @@ struct FRecord
     std::vector<std::string> Interfaces;            // every base after the first
     std::map<std::string, std::string> Replicated;  // UE_REPLICATED*: variable -> "Notify:Condition"
     std::set<std::string> Components;               // UE_COMPONENT: variables that are also SCS nodes
+    /* genueapi's `<X>__UeName`: the engine's name of a member or function Dumper-7 had to respell (`Name_0` is
+       `Name`, `Audio_Flying` is `Audio Flying`). C++ keeps its spelling; everything cooked goes through UeNameOf. */
+    std::map<std::string, std::string> UeNames;
+    std::map<std::string, std::string> ScsNodes;    // `<X>__UeScsNode`: a game Blueprint's component -> its node's guid, 32 hex
+    std::map<std::string, std::string> TypeAliases; // `using Leaf = Game::...::Leaf;` in the class body
     const Json* Defaults = nullptr;                 // UE_DEFAULTS: the static-init block, never lowered
     bool bIsLocal = false;      // UePackage == ModPackage/CppName: cooked here, published at its /Game path
     bool bIsStruct = false;     // UE_STRUCT: cooked as a UserDefinedStruct asset
@@ -451,6 +501,8 @@ struct FStmtIR
         Label,
         Block,                                      // an inline function's body: Body, where InlineReturn jumps past
         InlineReturn,
+        Goto,                                       // LabelId: the GotoLabel it jumps to
+        GotoLabel,
     } K = StaticCall;
 
     FCallIR Target;
@@ -464,8 +516,10 @@ struct FStmtIR
     std::shared_ptr<std::vector<FStmtIR>> Body;
     std::shared_ptr<std::vector<FStmtIR>> Inc;      // While: a `for` increment, where `continue` lands
     std::shared_ptr<std::vector<FStmtIR>> Trailer;  // While: runs on `break` only, before leaving the loop
+    bool bPostTest = false;                         // While: `do {} while (Cond)`, the test after Body and Inc
     std::vector<FArgIR> CaseTests;                  // Switch: per case, true when the value does NOT match
-    int32 LabelId = -1;                             // Label: the case it marks; Switch: the default's label, or -1
+    int32 LabelId = -1;                             // Label: the case it marks; Switch: the default's label, or -1;
+                                                    // Goto / GotoLabel: the label, unique in the class
     std::vector<int64> CaseValues;                  // Switch: each case's constant, in CaseTests order
     int32 SwitchWidth = 4;                          // Switch: the value's size, 1 / 4 / 8; 0 for an FName
     FArgIR SwitchValue;                             // Switch: the temp the value was stored in
@@ -486,13 +540,14 @@ const char* ViewFieldOf(const std::string& DerefIntrinsic)
 
 /* SelfExp: the enclosing function's export index, FFieldPath owner of its params and locals. */
 bool EmitArgs(FScript& S, const std::vector<FArgIR>& Args, FIndex SelfExp, std::string* Err);
+FArgIR NotOf(FArgIR V, FBlueprintClass& BP);
 
 bool EmitArg(FScript& S, const FArgIR& A, FIndex SelfExp, std::string* Err)
 {
     switch (A.K)
     {
     case FArgIR::Self:    S.Self(); return true;
-    case FArgIR::NullObj: S.NoObject(); return true;
+    case FArgIR::NullObj: if (A.CastOp == EX_NoInterface) S.NoInterface(); else S.NoObject(); return true;
     case FArgIR::Int:   S.IntConst(A.I); return true;
     case FArgIR::Int64: S.Int64Const(A.I64); return true;
     case FArgIR::Float: S.FloatConst(A.F); return true;
@@ -515,7 +570,9 @@ bool EmitArg(FScript& S, const FArgIR& A, FIndex SelfExp, std::string* Err)
         if (!A.Sub || A.Sub->Args.size() != 1) { if (Err) *Err = "internal: DynCast arg has no operand"; return false; }
         bool bOk = true;
         std::string SubErr;
-        S.ClassCast(A.CastOp, A.Owner, [&](FScript& C) { bOk = EmitArg(C, A.Sub->Args[0], SelfExp, &SubErr); });
+        const auto Operand = [&](FScript& C) { bOk = EmitArg(C, A.Sub->Args[0], SelfExp, &SubErr); };
+        if (A.CastOp == EX_PrimitiveCast) S.PrimitiveCast(ECastToken(A.I), Operand);
+        else S.ClassCast(A.CastOp, A.Owner, Operand);
         if (!bOk && Err) *Err = SubErr;
         return bOk;
     }
@@ -827,15 +884,41 @@ private:
     bool LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR& Out, std::string* Err);
     bool LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vector<FStmtIR>& Out,
                        std::vector<FPropertyDef>& Locals, std::string* Err);
+    bool LowerWithoutPrefix(const Json& Stmt, FBlueprintClass& BP, std::vector<FStmtIR>& Out,
+                            std::vector<FPropertyDef>& Locals, std::string* Err);
 
     /* `inline` functions are the editor's macros: never a UFunction, their body is copied into each caller.
        `inline` may sit on the declaration or on an out-of-line definition. */
     bool IsInlineMethod(const FRecord& R, const std::string& Method) const;
     bool ExpandInline(const Json& CallNode, const Json& Def, const std::string& Method, bool bMethod, FBlueprintClass& BP,
                       FCallIR& Out, std::string* Err);
+    /* A constant outside any function body, `constexpr int32 kMax = 40;` at namespace scope or static in a class:
+       decl id -> its VarDecl. It has no storage in a Blueprint, so a use is its value (FoldConst). */
+    std::map<std::string, const Json*> ConstVars;
+    struct FConstVal { bool bFloat = false; double F = 0; int64 I = 0; double Num() const { return bFloat ? F : double(I); } };
+    bool FoldConst(const Json& E, FConstVal& Out) const;
+    bool ConstToArg(const FConstVal& V, const std::string& Type, FArgIR& Out) const;
     std::map<std::string, const Json*> FreeInlines;                     // decl id -> an inline free function's definition
                                                                         // (a template's: each instantiation)
     /* The class a field access `Obj->Field` / `Field` reads from: Obj's static type, or the class being generated. */
+    /* An interface and the interfaces it extends, nearest first. A native one has no base in UeApi. */
+    std::vector<const FRecord*> InterfaceChain(const FRecord* I) const
+    {
+        std::vector<const FRecord*> Out;
+        for (; I; I = I->Base.empty() ? nullptr : Find(I->Base)) Out.push_back(I);
+        return Out;
+    }
+    /* A mod interface's variable is a property of the class that implements the interface, the one class in
+       an ancestry that lists it (or an interface extending it): that class of C's, or null. */
+    const FRecord* InterfaceVarHolder(const FRecord& Iface, const FRecord* C) const
+    {
+        for (; C; C = C->Base.empty() ? nullptr : Find(C->Base))
+            for (const std::string& I : C->Interfaces)
+                for (const FRecord* Link : InterfaceChain(Find(I)))
+                    if (Link == &Iface) return C;
+        return nullptr;
+    }
+
     const FRecord* RecordOfFieldAccess(const Json& MemberNode) const
     {
         const Json* Base = Strip(First(MemberNode));
@@ -858,6 +941,7 @@ private:
     bool LowerArgRaw(const Json& N, const std::string& OuterType, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     bool ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgIR& Arg, std::string* Err);
     bool LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
+    bool LowerMakeStruct(const std::string& Type, const Json* List, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     bool LowerDispatcherCall(const Json& Call, const Json& Callee, const Json& Obj, FBlueprintClass& BP,
                              FArgIR& Out, std::string* Err);
     bool LowerDelegateValue(const Json& Obj, const Json& Fn, FArgIR& Out, std::string* Err);
@@ -922,19 +1006,43 @@ private:
 
     /* The native UFunction Method overrides, or null; InheritedFlags gets the flags it passes on, also
        for a method implementing an interface's function, which has no Super. */
+    uint32 ModMethodFlags(const FRecord& Owner, const std::string& Method, FBlueprintClass& BP);
     FIndex FindEvent(FBlueprintClass& BP, const std::string& FromRecord, const std::string& Method,
-                     uint32* InheritedFlags);
+                     uint32* InheritedFlags, bool bFlagsOnly = false);
 
     /* Records are keyed by qualified name; Bare holds only leaf names exactly one class claims,
        so an ambiguous bare name fails instead of picking the last class collected. */
+    /* The engine's name for the member or function C++ spells `Cpp`, as seen from R: R's own marker, else an
+       ancestor's or an interface's. A mod's own names have no marker and are their C++ spelling; Dumper-7 keeps a
+       spelling unique along a class chain, so the first marker found is the one. */
+    std::string UeNameOf(const FRecord* R, const std::string& Cpp, int Depth = 0) const
+    {
+        for (; R && Depth < 64; R = R->Base.empty() ? nullptr : Find(R->Base), ++Depth)
+        {
+            if (auto It = R->UeNames.find(Cpp); It != R->UeNames.end()) return It->second;
+            for (const std::string& I : R->Interfaces)
+                if (const FRecord* IR = Find(I); IR && IR != R)
+                    if (std::string Ue = UeNameOf(IR, Cpp, Depth + 1); Ue != Cpp) return Ue;
+        }
+        return Cpp;
+    }
+    /* And back, within one record: the C++ spelling of the function the engine calls `Ue`. */
+    static std::string CppNameOf(const FRecord& R, const std::string& Ue)
+    {
+        for (const auto& N : R.UeNames) if (N.second == Ue) return N.first;
+        return Ue;
+    }
+
     const FRecord* Find(const std::string& CppName) const
     {
         auto It = Records.find(CppName);
         if (It != Records.end()) return &It->second;
         auto B = Bare.find(CppName);
-        if (B == Bare.end()) return nullptr;
-        It = Records.find(B->second);
-        return It == Records.end() ? nullptr : &It->second;
+        if (B != Bare.end()) { It = Records.find(B->second); return It == Records.end() ? nullptr : &It->second; }
+        /* `using JSONValue_C = Game::_AssemblyStorm::Common::JSON::JSONValue_C;` - how a mod names a class two
+           packages both have, which the headers can give no short name. clang spells a use as the alias. */
+        auto A = Aliases.find(CppName);
+        return A == Aliases.end() || A->second == CppName ? nullptr : Find(A->second);
     }
 
     Json Doc;
@@ -950,6 +1058,7 @@ private:
     std::map<std::string, FEnumInfo> Enums;
     std::map<std::string, FStructInfo> Structs;
     std::map<std::string, int64> EnumValues;          // clang EnumConstantDecl id -> value
+    std::map<std::string, std::vector<std::pair<std::string, int64>>> EnumDecls;   // C++ name -> its enumerators, in order
     std::map<std::string, int32> EnumConstWidth;      // clang EnumConstantDecl id -> its enum's size, 1 / 4 / 8
     std::map<std::string, uint32> EventFlags;         // UeApi/Events.json: "Package.Class.Function" -> EFunctionFlags
     std::map<std::string, FIndex> CurSignatures;      // Generate: dispatcher name -> its signature function export
@@ -992,6 +1101,7 @@ private:
     std::map<std::string, std::string> MethodOwner;   // clang decl id -> owning record
     std::map<std::string, std::string> FieldOwner;    // clang decl id -> declaring record
     std::map<std::string, std::string> Bare;          // unambiguous leaf name -> qualified name
+    std::map<std::string, std::string> Aliases;       // a namespace-scope `using A = B;` / typedef: A -> B
     const FRecord* Cur = nullptr;                     // record Generate is working on
     std::set<std::string> CurrentOutParms;            // T& parm names of the function being lowered
     bool bCurNet = false;                             // the function being lowered is an RPC
@@ -1046,6 +1156,15 @@ private:
     std::set<std::string> GeneratedEvents;            // the class's, so two never share a name
     std::set<std::string> ActivatedActions;           // the method's variables an await already activated
     int32 SwitchDepth = 0;                            // LowerBody: the switches around it
+    std::map<std::string, int32> GotoLabels;          // the body being lowered's: clang LabelDecl id -> FStmtIR::LabelId
+    int32 NextGotoLabel = 0;                          // never reset: latent functions share one ubergraph script
+    bool bBodyHasGoto = false;                        // a goto can re-reach any declaration, as a loop does
+    int32 WriteBackDepth = 0;                         // LowerBody: the TMap range-fors around it that write the value back
+    int32 GotoLabelOf(const std::string& DeclId)
+    {
+        const auto It = GotoLabels.find(DeclId);
+        return It != GotoLabels.end() ? It->second : (GotoLabels[DeclId] = NextGotoLabel++);
+    }
 };
 
 /* The innermost loop's forward jumps, patched once its exit / continue offsets are known. */
@@ -1130,11 +1249,15 @@ void EmitStmts(const std::vector<FStmtIR>& Stmts, FScript& S, FIndex SelfExp, FL
                `return` from inside the loop leaves nothing behind. */
             FLoopPatches Inner;
             const int32 Head = S.MemorySize();
-            const int32 ExitPatch = S.JumpIfNot(0,
-                [St, SelfExp](FScript& C) { EmitArg(C, St.Cond, SelfExp, nullptr); });
+            int32 ExitPatch = -1;
+            auto Test = [&] {
+                ExitPatch = S.JumpIfNot(0, [St, SelfExp](FScript& C) { EmitArg(C, St.Cond, SelfExp, nullptr); });
+            };
+            if (!St.bPostTest) Test();
             if (St.Body) EmitStmts(*St.Body, S, SelfExp, &Inner, Returns);
             for (int32 P : Inner.Continues) S.PatchJumpTarget(P, S.MemorySize());
             if (St.Inc) EmitStmts(*St.Inc, S, SelfExp, Loop, Returns);
+            if (St.bPostTest) Test();               // do/while: `continue` lands on the test, as in C++
             S.Jump(Head);
             if (St.Trailer && !Inner.Breaks.empty())
             {
@@ -1269,6 +1392,22 @@ void EmitStmts(const std::vector<FStmtIR>& Stmts, FScript& S, FIndex SelfExp, FL
         case FStmtIR::InlineReturn:
             if (Returns) Returns->push_back(S.Jump(0));
             break;
+
+        case FStmtIR::Goto:
+        {
+            /* The same patched EX_Jump `break` is: nothing sits on the flow stack, so a goto may leave any
+               number of loops. A label already emitted is a backward jump, known now. */
+            const auto At = S.GotoLabelAt.find(St.LabelId);
+            if (At != S.GotoLabelAt.end()) S.Jump(At->second);
+            else S.GotoPatches.push_back({ St.LabelId, S.Jump(0) });
+            break;
+        }
+
+        case FStmtIR::GotoLabel:
+            S.GotoLabelAt[St.LabelId] = S.MemorySize();
+            for (const auto& [Label, Patch] : S.GotoPatches)
+                if (Label == St.LabelId) S.PatchJumpTarget(Patch, S.MemorySize());
+            break;
         }
         /* After a latent call this run of the ubergraph ends; the latent action re-enters right here. BP_LiftPod
            ends it with EX_PopExecutionFlow onto a pushed final return, which is the same thing. */
@@ -1342,7 +1481,6 @@ bool FCompiler::Collect(std::string* Err)
 {
     bool bMetaOk = true;
     std::set<std::string> Ambiguous;
-    std::map<std::string, std::vector<std::pair<std::string, int64>>> EnumDecls;
     std::map<std::string, std::string> EnumUnderlying;
     std::vector<std::pair<std::string, std::string>> EnumMarks;      // enum, owning mod ("" for this one)
 
@@ -1356,6 +1494,8 @@ bool FCompiler::Collect(std::string* Err)
             Walk(N, Ns + Name(N) + "::");
             return;
         }
+        if ((Kind(N) == "TypeAliasDecl" || Kind(N) == "TypedefDecl") && N.contains("name"))
+            Aliases[Ns + Name(N)] = Aliases[Name(N)] = StripTypeKeywords(TypeOf(N));
         if (Kind(N) == "VarDecl" && Name(N) == "UeModPackage") FindLiteral(N, ModPackage);
         if (Kind(N) == "VarDecl" && BracedInit(N)) AssetDecls.push_back(&N);
         if (Kind(N) == "VarDecl" && Name(N).size() > 9 && Name(N).compare(Name(N).size() - 9, 9, "__UeAsset") == 0)
@@ -1453,6 +1593,16 @@ bool FCompiler::Collect(std::string* Err)
                     R.UeName = R.CppName;
                 }
             }
+            else if (Kind(C) == "VarDecl" && Name(C).size() > 8 && Name(C).compare(Name(C).size() - 8, 8, "__UeName") == 0)
+            {
+                std::string Real;
+                if (FindLiteral(C, Real)) R.UeNames[Name(C).substr(0, Name(C).size() - 8)] = Real;
+            }
+            else if (Kind(C) == "VarDecl" && Name(C).size() > 11 && Name(C).compare(Name(C).size() - 11, 11, "__UeScsNode") == 0)
+            {
+                std::string Guid;
+                if (FindLiteral(C, Guid)) R.ScsNodes[Name(C).substr(0, Name(C).size() - 11)] = Guid;
+            }
             else if (Kind(C) == "VarDecl" && Name(C).size() > 12 && Name(C).compare(Name(C).size() - 12, 12, "__Replicated") == 0)
             {
                 std::string Spec;
@@ -1480,7 +1630,22 @@ bool FCompiler::Collect(std::string* Err)
                 R.Fields.push_back(&C);
                 FieldOwner[C.value("id", std::string())] = R.CppName;
             }
+            else if ((Kind(C) == "TypeAliasDecl" || Kind(C) == "TypedefDecl") && C.contains("name"))
+                R.TypeAliases[Name(C)] = StripTypeKeywords(TypeOf(C));
         });
+        /* A set is looked up in Replicated by the name it is cooked under, so the marker's C++ key follows. */
+        for (const auto& N2 : R.UeNames)
+            if (auto Rep = R.Replicated.find(N2.first); Rep != R.Replicated.end())
+            {
+                R.Replicated[N2.second] = Rep->second;
+                R.Replicated.erase(N2.first);
+            }
+        /* genueapi opens a Blueprint class with `using JSONValue_C = Game::...::JSONValue_C;` so its signatures stay
+           readable, and a mod class deriving it writes `JSONValue_C*` through the same names. The nearer one wins. */
+        std::map<std::string, std::string> InScope = R.TypeAliases;
+        for (const FRecord* A = R.Base.empty() ? nullptr : Find(R.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
+            InScope.insert(A->TypeAliases.begin(), A->TypeAliases.end());
+        if (!InScope.empty()) ExpandAliases(const_cast<Json&>(N), InScope);
         /* A leaf name claimed by a second class is withdrawn, not overwritten. */
         const std::string Leaf = Name(N);
         if (!Ns.empty() && !Ambiguous.count(Leaf))
@@ -1538,20 +1703,32 @@ bool FCompiler::Collect(std::string* Err)
 }
 
 FIndex FCompiler::FindEvent(FBlueprintClass& BP, const std::string& FromRecord, const std::string& Method,
-                            uint32* InheritedFlags)
+                            uint32* InheritedFlags, bool bFlagsOnly)
 {
     /* Events.json keys a function by its package's last path segment, as Dumper-7's comments name it. */
+    *InheritedFlags = 0;
+    const FRecord* Self = Find(FromRecord);
+    /* Events.json and the Super import know the function by the engine's name (`Set is Extruded`). */
+    const std::string UeMethod = UeNameOf(Self, Method);
     auto FlagsOf = [&](const FRecord& R) {
-        auto It = EventFlags.find(R.UePackage.substr(R.UePackage.rfind('/') + 1) + "." + R.UeName + "." + Method);
+        auto It = EventFlags.find(R.UePackage.substr(R.UePackage.rfind('/') + 1) + "." + R.UeName + "." + UeMethod);
         return It == EventFlags.end() ? uint32(0) : It->second;
     };
-    *InheritedFlags = 0;
-    for (const FRecord* R = Find(FromRecord); R; R = R->Base.empty() ? nullptr : Find(R->Base))
+    for (const FRecord* R = Self; R; R = R->Base.empty() ? nullptr : Find(R->Base))
     {
+        /* A mod ancestor's function is a super like a native one, and the nearest wins, as the Kismet compiler takes
+           ParentClass->FindFunctionByName. What matters most is its net flags: an override of an RPC is that RPC, and
+           a mismatch "will trigger an assert in Link()" (KismetCompiler.cpp:2019). An inline method is no UFunction. */
+        if (R != Self && !R->IsNative() && !R->bIsInterface)
+            if (auto M = R->Methods.find(Method); M != R->Methods.end() && !IsStaticDecl(*M->second) && !IsInlineMethod(*R, Method))
+            {
+                *InheritedFlags = ModMethodFlags(*R, Method, BP);
+                return bFlagsOnly ? Null() : BP.EngineFunction(ModPackage + "/" + R->CppName, R->CppName + "_C", UeMethod);
+            }
         if (R->IsNative() && R->Methods.count(Method))
         {
             *InheritedFlags = FlagsOf(*R);
-            return BP.EngineFunction(R->UePackage, R->UeName, Method);
+            return bFlagsOnly ? Null() : BP.EngineFunction(R->UePackage, R->UeName, UeMethod);
         }
         /* Measured on BP_SentryGun_MoveMarker: an interface implementation has no Super. */
         for (const std::string& I : R->Interfaces)
@@ -1562,6 +1739,22 @@ FIndex FCompiler::FindEvent(FBlueprintClass& BP, const std::string& FromRecord, 
             }
     }
     return Null();      // not an override
+}
+
+/* The flags Generate gives a mod class's own method, less the ones that depend on its parameters: what an
+   override of it inherits. Nothing is imported on the way. */
+uint32 FCompiler::ModMethodFlags(const FRecord& Owner, const std::string& Method, FBlueprintClass& BP)
+{
+    const Json& Decl = *Owner.Methods.at(Method);
+    const auto DefIt = Owner.MethodDefs.find(Method);
+    const Json& Def = DefIt != Owner.MethodDefs.end() ? *DefIt->second : Decl;
+    uint32 Inherited = 0;
+    FindEvent(BP, Owner.CppName, Method, &Inherited, /*bFlagsOnly=*/true);
+    uint32 Flags = Inherited ? Inherited & kOverrideInherits : FFunctionDef().FunctionFlags;
+    if (IsPureDecl(Def)) Flags |= FUNC_BlueprintPure | FUNC_BlueprintCallable;
+    const std::string DeclType = TypeOf(Decl);
+    if (DeclType.size() > 6 && DeclType.compare(DeclType.size() - 6, 6, " const") == 0) Flags |= FUNC_Const;
+    return Flags | NetFlagsOf(Decl) | NetFlagsOf(Def) | AccessFlagsOf(Decl) | AccessFlagsOf(Def);
 }
 
 /* Measured on shipped DRG classes: BP_JetBootsBurnTrigger (Actor) 0x00840814, BP_ThornsComponent
@@ -1672,6 +1865,7 @@ EStrKind KindOfLowered(const FArgIR& A, const std::string& InnerType)
     case FArgIR::Bool:  return SK_Bool;
     case FArgIR::Byte:  return SK_Byte;
     case FArgIR::DynCast: return A.CastOp == EX_ObjToInterfaceCast || A.CastOp == EX_CrossInterfaceCast
+                              || A.CastOp == EX_PrimitiveCast
                                  ? StrKindOf(InnerType) : SK_Object;
     case FArgIR::Self:
     case FArgIR::ObjConst:
@@ -1791,6 +1985,20 @@ bool FCompiler::ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgI
         Arg.InnerType = "bool";
         return true;
     }
+    if (std::string TestedIface; ToKind == SK_Bool && TemplateArg(From, "TScriptInterface", &TestedIface))
+    {
+        /* Measured on ENE_Flea's K2Node_DynamicCast_bSuccess: EX_PrimitiveCast CST_InterfaceToBool over the
+           interface value. execInterfaceToBool (ScriptCore.cpp) answers GetObject() != null. */
+        FArgIR Operand = Arg;
+        Arg = FArgIR();
+        Arg.K = FArgIR::DynCast;
+        Arg.CastOp = EX_PrimitiveCast;
+        Arg.I = CST_InterfaceToBool;
+        Arg.InnerType = "bool";
+        Arg.Sub = std::make_shared<FCallIR>();
+        Arg.Sub->Args.push_back(Operand);
+        return true;
+    }
     if (ToKind == SK_Bool && FromKind == SK_Int64)
     {
         WrapInCall(Arg, BP.EngineFunction("/Script/Engine", "KismetMathLibrary", "NotEqual_Int64Int64"));
@@ -1807,6 +2015,10 @@ bool FCompiler::ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgI
     if (TemplateArg(To, "TScriptInterface", &ToIface))
     {
         /* Measured on ENE_Flea: an object becomes an interface through EX_ObjToInterfaceCast. */
+        /* `nullptr` for an interface is EX_NoInterface, as the Kismet compiler writes a null interface literal
+           (KismetCompilerVMBackend.cpp:1025): EX_NoObject would set 8 of FScriptInterface's 16 bytes. It needs no
+           record of the interface, which a header may only have forward-declared. */
+        if (Arg.K == FArgIR::NullObj) { Arg.CastOp = EX_NoInterface; Arg.InnerType = To; return true; }
         const bool bFromIface = TemplateArg(From, "TScriptInterface", &FromIface);
         const FRecord* IR = Find(ToIface);
         if (!IR || (!bFromIface && FromKind != SK_Object)) { *Err = "no conversion from " + From + " to " + To; return false; }
@@ -1884,9 +2096,11 @@ bool FCompiler::LowerStructLiteral(const Json& CtorNode, const FStructInfo& SI, 
                                    FArgIR& Out, std::string* Err)
 {
     const std::string T = StripTypeKeywords(TypeOf(CtorNode));
-    if (!SI.bComplete) { *Err = "TODO: " + T + " has fields AssetGen cannot write; build it with a Kismet Make function"; return false; }
     std::vector<const Json*> Args;
     ForEach(CtorNode, [&](const Json& C) { Args.push_back(&C); });
+    /* EX_StructConst cannot say a field it cannot write, so `T()` of such a struct is a Make Struct with nothing set. */
+    if (!SI.bComplete && Args.empty()) return LowerMakeStruct(T, nullptr, BP, Out, Err);
+    if (!SI.bComplete) { *Err = T + " has fields AssetGen cannot write, so it takes no whole-struct literal: `" + T + " V = { .Field = value };`"; return false; }
     if (Args.empty()) return ZeroArg(T, BP, Out, Err);
     if (Args.size() != SI.Fields.size())
     { *Err = T + " literal must give every field (" + std::to_string(SI.Fields.size()) + ")"; return false; }
@@ -1905,6 +2119,62 @@ bool FCompiler::LowerStructLiteral(const Json& CtorNode, const FStructInfo& SI, 
     return true;
 }
 
+/* `T()` of a struct EX_StructConst cannot write whole (a third of the dump: weak pointers, delegates, bitfields), and
+   any braced aggregate, `T{ .Time = 0.5f }`. This is the editor's Make Struct node (FKCHandler_MakeStruct): a temp the
+   frame default-constructs, then one member store per value given. What the braces leave out keeps the struct's own
+   default, which EX_StructConst's zeros cannot say (FHitResult::Time is 1). List is the InitListExpr, one inner per
+   field in declaration order, or null for none given. */
+bool FCompiler::LowerMakeStruct(const std::string& Type, const Json* List, FBlueprintClass& BP, FArgIR& Out, std::string* Err)
+{
+    const FRecord* R = Find(Type);
+    if (!R || !R->bIsStruct) { *Err = "a braced value needs a struct type, not " + Type; return false; }
+    if (!CurLocals) { *Err = "internal: a struct value outside a function body"; return false; }
+
+    const std::string Tmp = "__Make" + std::to_string(ReadTmpCounter++) + "__";
+    FPropertyDef PD;
+    if (!TypeToProperty(Type, Tmp, 0, "a " + Type + " value", BP, &PD, Err)) return false;
+    PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+    CurLocals->push_back(PD);
+
+    const bool bPlainName = R->IsNative() || IsInternalViewStruct(R->CppName);
+    const FIndex Struct = R->IsNative() ? BP.ScriptStruct(R->UePackage, R->UeName)
+                                        : BP.ScriptStruct(ModPackage + "/" + R->CppName, R->CppName);
+    auto Body = std::make_shared<std::vector<FStmtIR>>();
+    size_t I = 0;
+    bool bOk = true;
+    if (List)
+        ForEach(*List, [&](const Json& Value) {
+            const size_t At = I++;
+            if (!bOk || IsUnsetInit(Value)) return;
+            if (At >= R->Fields.size()) { *Err = Type + " has no member for value " + std::to_string(At + 1); bOk = false; return; }
+            const Json& F = *R->Fields[At];
+            FStmtIR Set;
+            Set.K = FStmtIR::Assign;
+            Set.Var.K = FArgIR::Member;
+            Set.Var.S = bPlainName ? UeNameOf(R, Name(F)) : ModFieldName(ModPackage + "/" + R->CppName, Name(F));
+            Set.Var.Owner = Struct;
+            Set.Var.LetOp = LetOpFor(TypeOf(F));
+            Set.Var.Base = std::make_shared<FArgIR>();
+            Set.Var.Base->K = FArgIR::Local;
+            Set.Var.Base->S = Tmp;
+            bOk = LowerArg(Value, BP, Set.Value, Err);
+            if (bOk) Body->push_back(std::move(Set));
+        });
+    if (!bOk) return false;
+
+    auto Block = std::make_shared<std::vector<FStmtIR>>(1);
+    (*Block)[0].K = FStmtIR::Block;
+    (*Block)[0].Body = Body;
+    Out.K = FArgIR::Call;
+    Out.InnerType = Type;
+    Out.Sub = std::make_shared<FCallIR>();
+    Out.Sub->Intrinsic = "__Inline__";
+    Out.Sub->Inline = Block;
+    Out.Sub->InlineResult = Tmp;
+    Out.Sub->InlineType = Type;
+    return true;
+}
+
 bool FCompiler::LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& Out, std::string* Err)
 {
     auto It = FieldOwner.find(MemberNode.value("referencedMemberDecl", std::string()));
@@ -1918,7 +2188,7 @@ bool FCompiler::LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& 
         if (!ObjRaw) { *Err = "struct member access with no object: " + Name(MemberNode); return false; }
         Out.K = FArgIR::Member;
         Out.S = (R->IsNative() || IsInternalViewStruct(R->CppName))
-                    ? Name(MemberNode)
+                    ? UeNameOf(R, Name(MemberNode))
                     : ModFieldName(ModPackage + "/" + R->CppName, Name(MemberNode));
         Out.Owner = R->IsNative() ? BP.ScriptStruct(R->UePackage, R->UeName)
                                   : BP.ScriptStruct(ModPackage + "/" + R->CppName, R->CppName);
@@ -1944,10 +2214,23 @@ bool FCompiler::LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& 
         return LowerArg(*ObjRaw, BP, *Out.Base, Err);
     }
 
+    if (R->bIsInterface)
+    {
+        /* Kismet has no property on an interface class, so the object's own class says where it is. */
+        const FRecord* Holder = InterfaceVarHolder(*R, RecordOfFieldAccess(MemberNode));
+        if (!Holder)
+        {
+            *Err = Name(MemberNode) + " is a variable of the interface " + R->CppName + ", which holds no state itself: "
+                   "read it through an object of a class that implements " + R->CppName + ", not through the interface";
+            return false;
+        }
+        R = Holder;
+    }
+
     /* A sibling class of this mod (a data asset's, a local parent's) is imported the way a UE_CLASS one from
        another mod is. */
     Out.K = FArgIR::Field;
-    Out.S = Name(MemberNode);
+    Out.S = UeNameOf(R, Name(MemberNode));      // `Name_0` is the engine's `Name`: see FRecord::UeNames
     Out.Owner = R->IsNative() ? BP.PropertyOwner(R->UePackage, R->UeName)
               : R == Cur      ? BP.ClassIndex()
                               : BP.PropertyOwner(ModPackage + "/" + R->CppName, R->CppName + "_C");
@@ -1968,7 +2251,7 @@ bool FCompiler::LowerDelegateValue(const Json& Obj, const Json& Fn, FArgIR& Out,
     if (F && Kind(*F) == "UnaryOperator" && F->value("opcode", std::string()) == "&") F = Strip(First(*F));
     if (!F || Kind(*F) != "DeclRefExpr") { *Err = "a delegate binds `&Class::Function`"; return false; }
     Out.K = FArgIR::Delegate;
-    Out.S = (*F)["referencedDecl"].value("name", std::string());
+    Out.S = UeNameOf(Cur, (*F)["referencedDecl"].value("name", std::string()));     // found on self by name at run time
     return true;
 }
 
@@ -2112,8 +2395,10 @@ bool FCompiler::IsRawPointer(std::string T) const
     if (!Pointee.empty() && Pointee.back() == '*') return true;
     /* A UObject class carries UE_CLASS or a base; FString, FName and the containers are plain C++ records. */
     if (const FRecord* R = Find(Pointee)) return R->bIsStruct || (R->UePackage.empty() && R->Base.empty());
-    /* ponytail: a class these headers only forward-declare is still an object when UE's prefix says so, so a
-       property of it stays a reference the GC sees; an undefined class without the prefix passes for raw. */
+    /* ponytail: a class these headers only forward-declare is still an object when UE's prefix - or a Blueprint
+       class's _C - says so, so a property of it stays a reference the GC sees (and an unknown one is refused, not
+       cooked as an int64); an undefined class with neither passes for raw. */
+    if (Pointee.size() > 2 && Pointee.compare(Pointee.size() - 2, 2, "_C") == 0) return false;
     return !(Pointee.size() > 1 && (Pointee[0] == 'U' || Pointee[0] == 'A') && std::isupper(uint8(Pointee[1])));
 }
 
@@ -2374,7 +2659,7 @@ bool FCompiler::LowerAddress(const Json& Lvalue, FBlueprintClass& BP, FArgIR& Ou
         Out.Sub->Context = BP.ClassDefaultObject(Pkg, Cls);
         FArgIR Name, Wco;
         Name.K = FArgIR::Name;
-        Name.S = N->value("name", std::string());
+        Name.S = UeNameOf(Owner, N->value("name", std::string()));      // FindPropertyByName, at run time
         if (!CurrentWco.empty()) { Wco.K = FArgIR::Local; Wco.S = CurrentWco; }
         Out.Sub->Args = { Obj, Name, Wco };
         *Pointee = StripTypeKeywords(TypeOf(*N));
@@ -2446,6 +2731,10 @@ bool FCompiler::LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, 
         return LowerAddress(*Bare, BP, Addr, &Pointee, Err) && RefThrough(std::move(Addr), Pointee, Out, Err)
             && ConvertArg(OuterType, BP, Out, Err);
     }
+    /* A consteval call: clang ran it and left the answer on the ConstantExpr around it, which Strip would drop. */
+    for (const Json* W = &ArgNode; W; W = Kind(*W) == "ImplicitCastExpr" || Kind(*W) == "ParenExpr" ? First(*W) : nullptr)
+        if (FConstVal V; Kind(*W) == "ConstantExpr" && W->contains("value") && FoldConst(ArgNode, V) && ConstToArg(V, OuterType, Out))
+            return true;
     const Json* N = Strip(&ArgNode);
     if (!N) { *Err = "empty argument expression"; return false; }
     if (!LowerArgRaw(*N, OuterType, BP, Out, Err)) return false;
@@ -2487,6 +2776,9 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         auto SI = Structs.find(StripTypeKeywords(TypeOf(*N)));
         if (SI != Structs.end()) return LowerStructLiteral(*N, SI->second, BP, Out, Err);
     }
+    /* `T()` of an aggregate - a struct with no constructor declared, which is what lets it take `{ .A = 1 }`. */
+    if (const FRecord* R = K == "CXXScalarValueInitExpr" ? Find(StripTypeKeywords(TypeOf(*N))) : nullptr; R && R->bIsStruct)
+        return LowerMakeStruct(R->CppName, nullptr, BP, Out, Err);
     if ((K == "CXXConstructExpr" || K == "CXXTemporaryObjectExpr")
         && (Slot == SK_Name || Slot == SK_Text || Slot == SK_Str))
     {
@@ -2587,7 +2879,11 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         Out.Sub->Target = std::make_shared<FArgIR>();
         if (!LowerArg(*Obj, BP, *Out.Sub->Target, Err)) return false;
         /* Through an interface the implementation is found by name, as the Blueprint compiler calls it. */
-        if (Out.Sub->Target->K == FArgIR::InterfaceCtx) Out.Sub->VirtualName = Name(*Callee);
+        if (Out.Sub->Target->K == FArgIR::InterfaceCtx)
+        {
+            auto Owner = MethodOwner.find(Callee->value("referencedMemberDecl", std::string()));
+            Out.Sub->VirtualName = UeNameOf(Owner == MethodOwner.end() ? nullptr : Find(Owner->second), Name(*Callee));
+        }
         return true;
     }
     if (K == "CXXOperatorCallExpr")
@@ -2598,6 +2894,15 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         const Json* Lhs = Nth(*N, 1);
         const Json* Rhs = Nth(*N, 2);
         std::string Iface;
+        if ((OpName == "operator==" || OpName == "operator!=") && Lhs && Rhs
+            && TemplateArg(StripTypeKeywords(TypeOf(*Lhs)), "TScriptInterface", &Iface)
+            && Kind(*Strip(Rhs)) == "CXXNullPtrLiteralExpr")
+        {
+            /* `I != nullptr` is `bool(I)`, and `I == nullptr` its negation. */
+            if (!LowerArg(*Lhs, BP, Out, Err) || !ConvertArg("bool", BP, Out, Err)) return false;
+            if (OpName == "operator==") Out = NotOf(std::move(Out), BP);
+            return true;
+        }
         if (OpName == "operator->" && Lhs && TemplateArg(TypeOf(*Lhs), "TScriptInterface", &Iface))
         {
             /* `I->Fn()`: the call's object is EX_InterfaceContext(I). */
@@ -2769,6 +3074,18 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         /* A reference local (or a range-for binding) is the variable it names, or the value at the address it keeps. */
         if (auto A = RefAlias.find(Ref.value("id", std::string())); A != RefAlias.end()) return LowerArg(A->second, BP, Out, Err);
         if (auto C = ParmConst.find(Ref.value("id", std::string())); C != ParmConst.end()) { Out = C->second; return true; }
+        if (auto G = ConstVars.find(Ref.value("id", std::string())); G != ConstVars.end())
+        {
+            /* No storage behind it in a Blueprint: the use is the value. */
+            const Json* Init = First(*G->second);
+            if (const Json* Lit = Init ? Strip(Init) : nullptr; Lit && Kind(*Lit) == "StringLiteral") return LowerArg(*Lit, BP, Out, Err);
+            FConstVal V;
+            if (!Init || !FoldConst(*N, V))
+            { *Err = Name(Ref) + " is not a constant AssetGen can work out: literals, enum constants, consteval calls and arithmetic over them"; return false; }
+            if (!ConstToArg(V, TypeOf(*N), Out))
+            { *Err = Name(Ref) + ": a constant of type " + TypeOf(*N) + " has no literal in Kismet"; return false; }
+            return true;
+        }
         if (RefKind != "ParmVarDecl" && RefKind != "VarDecl")
         {
             *Err = "TODO: DeclRefExpr to " + RefKind;
@@ -2941,6 +3258,24 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         const Json* LhsRaw = Nth(*N, 0);
         const Json* RhsRaw = Nth(*N, 1);
         if (!LhsRaw || !RhsRaw) { *Err = "binary operator with a missing side"; return false; }
+        /* `"Kills: " + N`: C++ reads an address N characters into the literal (clang warns, -Wstring-plus-int, and
+           compiles it), which nothing in a Blueprint could mean. It is the concat the author wrote. A float or an
+           object on the other side never gets here - clang refuses those, so they stay `FString("lit") + X`. */
+        if (const Json *L = Strip(LhsRaw), *R = Strip(RhsRaw); Op == "+" && L && R
+            && (Kind(*L) == "StringLiteral") != (Kind(*R) == "StringLiteral"))
+        {
+            Out.K = FArgIR::Call;
+            Out.InnerType = "FString";
+            Out.Sub = std::make_shared<FCallIR>();
+            Out.Sub->Fn = BP.EngineFunction("/Script/Engine", "KismetStringLibrary", "Concat_StrStr");
+            for (const Json* Side : { LhsRaw, RhsRaw })
+            {
+                FArgIR A;
+                if (!LowerArg(*Side, BP, A, Err) || !ConvertArg("FString", BP, A, Err)) return false;
+                Out.Sub->Args.push_back(A);
+            }
+            return true;
+        }
         /* Pointer arithmetic counts elements: P + N moves N * sizeof(*P) bytes, P - Q counts the elements between. */
         const std::string LP = PointeeOf(*LhsRaw), RP = PointeeOf(*RhsRaw);
         if ((Op == "+" || Op == "-") && (!LP.empty() || !RP.empty()))
@@ -3070,6 +3405,8 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         return true;
     }
 
+    if (K == "InitListExpr") return LowerMakeStruct(StripTypeKeywords(TypeOf(*N)), N, BP, Out, Err);
+
     *Err = "TODO: unimplemented argument " + K;
     return false;
 }
@@ -3159,7 +3496,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
 
         if (!R->IsNative() && !bStatic)
         {
-            Out.VirtualName = MethodName;
+            Out.VirtualName = UeNameOf(R, MethodName);      // an override of `Set is Extruded` is found by that name
             /* KismetCompilerVMBackend.cpp picks the local form unless the callee is native, a net function, authority
                only or cosmetic. A method declared only by mod classes, without an RPC marker, is none of those; an
                override of a native function keeps whatever flags it inherits, so it stays EX_VirtualFunction. */
@@ -3179,7 +3516,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
                                                         : ModPackage + "/" + R->CppName;
         const std::string CalleeName    = R->IsNative() ? R->UeName
                                                         : R->CppName + "_C";
-        Out.Fn = BP.EngineFunction(CalleePackage, CalleeName, MethodName);
+        Out.Fn = BP.EngineFunction(CalleePackage, CalleeName, UeNameOf(R, MethodName));
         Out.bScript = CalleePackage.compare(0, 6, "/Game/") == 0;
         Out.bInstance = !bStatic;
         /* A Blueprint static needs the CDO context; EX_CallMath finds it itself for a native. */
@@ -3594,7 +3931,8 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             bool bAny = false;
             ForEach(*S, [&](const Json& D) {
                 const std::string DK = Kind(D);
-                if (DK == "TypeAliasDecl" || DK == "TypedefDecl" || DK == "UsingDecl") { bAny = true; return; }   // compile-time names only
+                if (DK == "TypeAliasDecl" || DK == "TypedefDecl" || DK == "UsingDecl" || DK == "UsingEnumDecl"
+                    || DK == "StaticAssertDecl") { bAny = true; return; }   // compile-time names only
                 if (!bOk || DK != "VarDecl") return;
                 bAny = true;
                 const std::string VarName = LocalName(D);
@@ -3647,7 +3985,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                         return;
                     }
                 }
-                else if (LoopDepth > 0 && !Ds.bHasValue)
+                else if ((LoopDepth > 0 || bBodyHasGoto) && !Ds.bHasValue)
                 {
                     /* The frame initialises a local once, on entry, but C++ constructs it again each time a loop
                        reaches the declaration. A twin nothing writes keeps the entry value to copy back. */
@@ -3853,8 +4191,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             /* IfStmt inner is [cond, then, else?]; an init-stmt would prepend one. */
             if (S->value("hasInit", false) || S->value("hasVar", false))
             {
-                *Err = "TODO: `if` with an init-statement / condition-variable is not supported";
-                bOk = false;
+                if (!LowerWithoutPrefix(*S, BP, Out, Locals, Err)) bOk = false;
                 return;
             }
             const Json* Cond = Nth(*S, 0);
@@ -3899,7 +4236,10 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                or DefaultStmt [sub] becomes a Label followed by its first statement, so every label sits at the top
                level of the body, where the emitter looks for them. The default gets the label after the cases. */
             if (S->value("hasInit", false) || S->value("hasVar", false))
-            { *Err = "TODO: `switch` with an init-statement / condition-variable is not supported"; bOk = false; return; }
+            {
+                if (!LowerWithoutPrefix(*S, BP, Out, Locals, Err)) bOk = false;
+                return;
+            }
             const Json* Cond = Nth(*S, 0);
             const Json* Body = Nth(*S, 1);
             if (!Cond || !Body || Kind(*Body) != "CompoundStmt") { *Err = "`switch` needs a braced body"; bOk = false; return; }
@@ -4004,6 +4344,80 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             if (!LowerRangeFor(*S, BP, Out, Locals, Err)) { bOk = false; return; }
             return;
         }
+        else if (K == "AttributedStmt")
+        {
+            /* `[[likely]] return X;`: a hint to a compiler that is not this one. The statement is the last inner. */
+            const Json* Sub = nullptr;
+            ForEach(*S, [&](const Json& C) { Sub = &C; });
+            const Json Wrap = { {"kind", "CompoundStmt"}, {"inner", Json::array({ Sub ? *Sub : Json::object() })} };
+            if (!Sub || !LowerBody(Wrap, BP, Out, Locals, Err)) bOk = false;
+            return;
+        }
+        else if (K == "CompoundStmt")
+        {
+            /* A bare `{ ... }`: a Blueprint local has no scope to end, so its statements join this list. */
+            if (!LowerBody(*S, BP, Out, Locals, Err)) bOk = false;
+            return;
+        }
+        else if (K == "DoStmt")
+        {
+            /* DoStmt inner is [body, cond]: a While whose test follows the body. */
+            const Json* Body = Nth(*S, 0);
+            const Json* Cond = Nth(*S, 1);
+            if (!Cond || !Body) { *Err = "`do` with a missing body or condition"; bOk = false; return; }
+
+            St.K = FStmtIR::While;
+            St.bPostTest = true;
+            if (!LowerArg(*Cond, BP, St.Cond, Err)) { bOk = false; return; }
+            St.Body = std::make_shared<std::vector<FStmtIR>>();
+            Json Wrap = Kind(*Body) == "CompoundStmt" ? *Body
+                      : Json{ {"kind", "CompoundStmt"}, {"inner", Json::array({*Body})} };
+            ++LoopDepth;
+            if (!LowerBody(Wrap, BP, *St.Body, Locals, Err)) { bOk = false; return; }
+            --LoopDepth;
+        }
+        else if (K == "GotoStmt")
+        {
+            if (WriteBackDepth > 0)
+            {
+                *Err = "a goto inside a TMap range-for that writes its value back would skip the write: "
+                       "bind `const auto& [Key, Value]`, or leave with break";
+                bOk = false;
+                return;
+            }
+            St.K = FStmtIR::Goto;
+            St.LabelId = GotoLabelOf(S->value("targetLabelDeclId", std::string()));
+        }
+        else if (K == "LabelStmt")
+        {
+            /* LabelStmt inner is [the statement it marks]. */
+            St.K = FStmtIR::GotoLabel;
+            St.LabelId = GotoLabelOf(S->value("declId", std::string()));
+            Out.push_back(St);
+            if (const Json* Sub = First(*S))
+            {
+                Json Wrap = { {"kind", "CompoundStmt"}, {"inner", Json::array({*Sub})} };
+                if (!LowerBody(Wrap, BP, Out, Locals, Err)) bOk = false;
+            }
+            return;
+        }
+        else if (K == "WhileStmt" && S->value("hasVar", false))
+        {
+            /* `while (T V = Init) Body` is [var, cond, body], and V is made again each time round:
+               `while (true) { T V = Init; if (!V) break; Body }`. */
+            const Json* Var = Nth(*S, 0);
+            const Json* Cond = Nth(*S, 1);
+            const Json* Body = Nth(*S, 2);
+            if (!Var || !Cond || !Body) { *Err = "`while` with a missing condition or body"; bOk = false; return; }
+            Json Not = { {"kind", "UnaryOperator"}, {"opcode", "!"}, {"type", { {"qualType", "bool"} }}, {"inner", Json::array({*Cond})} };
+            Json Exit = { {"kind", "IfStmt"}, {"inner", Json::array({ Not, Json{ {"kind", "BreakStmt"} } })} };
+            Json True = { {"kind", "CXXBoolLiteralExpr"}, {"type", { {"qualType", "bool"} }}, {"value", true} };
+            Json Loop = { {"kind", "WhileStmt"},
+                          {"inner", Json::array({ True, Json{ {"kind", "CompoundStmt"}, {"inner", Json::array({ *Var, Exit, *Body })} } })} };
+            Json Wrap = { {"kind", "CompoundStmt"}, {"inner", Json::array({ Loop })} };
+            if (!LowerBody(Wrap, BP, Out, Locals, Err)) bOk = false;
+            return;
+        }
         else if (K == "WhileStmt")
         {
             /* WhileStmt inner is [cond, body]. */
@@ -4081,12 +4495,18 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             for (const FRecord* A = SetOn; A; A = A->Base.empty() ? nullptr : Find(A->Base))
                 if (A->UeName == "Actor") bActor = true;
             for (const FRecord* A = SetOn; A; A = A->Base.empty() ? nullptr : Find(A->Base))
-                if (auto Rep = A->Replicated.find(SetField); Rep != A->Replicated.end())
-                {
-                    bFlush = bActor;
-                    if (!A->IsNative() || A->UePackage.compare(0, 6, "/Game/") == 0) Notify = Rep->second.substr(0, Rep->second.find(':'));
-                    break;
-                }
+            {
+                /* The marker of a mod interface's variable sits on the interface the class implements. */
+                const FRecord* Marked = A->Replicated.count(SetField) ? A : nullptr;
+                for (const std::string& I : A->Interfaces)
+                    for (const FRecord* Link : InterfaceChain(Find(I)))
+                        if (!Marked && Link->bIsInterface && Link->Replicated.count(SetField)) Marked = Link;
+                if (!Marked) continue;
+                const std::string& Spec = Marked->Replicated.find(SetField)->second;
+                bFlush = bActor;
+                if (!A->IsNative() || A->UePackage.compare(0, 6, "/Game/") == 0) Notify = Spec.substr(0, Spec.find(':'));
+                break;
+            }
         }
         if (bFlush)
         {
@@ -4302,6 +4722,15 @@ bool FCompiler::IsInlineMethod(const FRecord& R, const std::string& Method) cons
         || (Def != R.MethodDefs.end() && Def->second->value("inline", false));
 }
 
+/* Whether a body holds a `goto`, which can run a declaration again the way a loop does. */
+bool HasGoto(const Json& N)
+{
+    if (Kind(N) == "GotoStmt") return true;
+    bool bFound = false;
+    ForEach(N, [&](const Json& C) { bFound = bFound || HasGoto(C); });
+    return bFound;
+}
+
 /* The call becomes one Block statement in Out.Inline:
        <each by-value parameter> = <its argument>;
        <the body, locals renamed __Inl<N>_<name>, `return X` as `__Inl<N>_ReturnValue = X` + a jump to the end>
@@ -4399,11 +4828,19 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
 
     InlineStack.push_back(Method);
     InlineResults.emplace_back(Out.InlineResult, RetType);
-    const int32 SavedLoops = LoopDepth, SavedSwitches = SwitchDepth;
-    LoopDepth = SwitchDepth = 0;
+    const int32 SavedLoops = LoopDepth, SavedSwitches = SwitchDepth, SavedWriteBacks = WriteBackDepth;
+    LoopDepth = SwitchDepth = WriteBackDepth = 0;
+    /* Each expansion lowers the body again, so its labels get ids of their own. */
+    std::map<std::string, int32> SavedLabels;
+    SavedLabels.swap(GotoLabels);
+    const bool bSavedHasGoto = bBodyHasGoto;
+    bBodyHasGoto = HasGoto(*Body);
     const bool bOk = LowerBody(*Body, BP, *B.Body, Locals, Err);
     LoopDepth = SavedLoops;
     SwitchDepth = SavedSwitches;
+    WriteBackDepth = SavedWriteBacks;
+    GotoLabels.swap(SavedLabels);
+    bBodyHasGoto = bSavedHasGoto;
     InlineResults.pop_back();
     InlineStack.pop_back();
     if (!bOk) { *Err = "inline " + Method + ": " + *Err; return false; }
@@ -4421,6 +4858,25 @@ Json RefToLocal(const std::string& Name, const std::string& Type)
 {
     return { {"kind", "DeclRefExpr"}, {"type", {{"qualType", Type}}},
              {"referencedDecl", {{"kind", "VarDecl"}, {"name", Name}, {"id", "synthetic:" + Name}}} };
+}
+
+/* `if (Init; Cond)`, `if (T V = Init)` and the same two on a `switch`: clang puts the init-statement and then the
+   condition variable's DeclStmt before the condition, which already reads V. Both run once, so they are lowered
+   as statements of their own and the rest as the plain statement; a Blueprint local has no scope to end. */
+bool FCompiler::LowerWithoutPrefix(const Json& Stmt, FBlueprintClass& BP, std::vector<FStmtIR>& Out,
+                                   std::vector<FPropertyDef>& Locals, std::string* Err)
+{
+    const size_t Skip = (Stmt.value("hasInit", false) ? 1 : 0) + (Stmt.value("hasVar", false) ? 1 : 0);
+    const Json& In = Stmt["inner"];
+    Json Seq = Json::array(), Rest = Json::array();
+    for (size_t I = 0; I < In.size(); ++I) (I < Skip ? Seq : Rest).push_back(In[I]);
+    Json Plain = Stmt;
+    Plain["hasInit"] = false;
+    Plain["hasVar"] = false;
+    Plain["inner"] = Rest;
+    Seq.push_back(Plain);
+    Json Wrap = { {"kind", "CompoundStmt"}, {"inner", Seq} };
+    return LowerBody(Wrap, BP, Out, Locals, Err);
 }
 
 /* `for (Elem : Range)` over a TArray / TSet / TMap. CXXForRangeStmt inner is
@@ -4443,7 +4899,12 @@ bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vec
     const Json* LoopDecl = LoopStmt ? First(*LoopStmt) : nullptr;
     const Json* Body = Nth(ForNode, 7);
     if (!RangeExpr || !LoopDecl || !Body) { *Err = "a range-for with a missing part"; return false; }
-    if (const Json* Init = Nth(ForNode, 0); Init && Init->is_object() && Init->contains("kind")) { *Err = "TODO: a range-for with an init-statement"; return false; }
+    if (const Json* Init = Nth(ForNode, 0); Init && Init->is_object() && Init->contains("kind"))
+    {
+        /* `for (Init; T E : Range)`: the init-statement runs once, before the loop. */
+        Json Wrap = { {"kind", "CompoundStmt"}, {"inner", Json::array({ *Init })} };
+        if (!LowerBody(Wrap, BP, Out, Locals, Err)) return false;
+    }
 
     std::string RangeTy = TypeOf(*RangeExpr);
     while (!RangeTy.empty() && (RangeTy.back() == '&' || RangeTy.back() == ' ')) RangeTy.pop_back();
@@ -4569,7 +5030,10 @@ bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vec
         }
     }
     Json BodyWrap = Kind(*Body) == "CompoundStmt" ? *Body : Json{ {"kind", "CompoundStmt"}, {"inner", Json::array({ *Body })} };
-    if (!LowerBody(BodyWrap, BP, *Loop.Body, Locals, Err)) { --LoopDepth; return false; }
+    if (Loop.Trailer) ++WriteBackDepth;
+    const bool bBodyOk = LowerBody(BodyWrap, BP, *Loop.Body, Locals, Err);
+    if (Loop.Trailer) --WriteBackDepth;
+    if (!bBodyOk) { --LoopDepth; return false; }
     --LoopDepth;
     Loop.Inc->push_back(AssignStmt(Idx, "int32", Math("Add_IntInt", LocalArg(Idx), One)));
     Out.push_back(std::move(Loop));
@@ -4891,6 +5355,110 @@ std::string StripTypeKeywords(std::string T)
     return T;
 }
 
+/* The number a constant expression comes to: literals, enum constants, ConstVars, casts, and arithmetic over them,
+   each step rounded to the type clang gave it so `2 * 50.f` and `1 << 31` come out as C++ has them. False for
+   anything else (a call, sizeof, ?:) and for a division by zero.
+   ponytail: no comparisons, `&&`, `?:` or sizeof; add them when a mod writes one. */
+bool FCompiler::FoldConst(const Json& E, FConstVal& Out) const
+{
+    const std::string K = Kind(E);
+    const auto Fit = [&](FConstVal& V) {
+        std::string T = StripTypeKeywords(TypeOf(E));
+        if (auto En = Enums.find(T); En != Enums.end()) T = En->second.Underlying;
+        const bool bWantFloat = T == "float" || T == "double";
+        const bool bInt = T == "bool" || T == "int" || T == "int32" || T == "unsigned int" || T == "uint32" || T == "uint8"
+                       || T == "unsigned char" || T == "int8" || T == "signed char" || T == "short" || T == "unsigned short"
+                       || T == "int16" || T == "uint16" || IsInt64Type(T);
+        if (!bWantFloat && !bInt) return false;
+        if (bWantFloat) { V.F = T == "float" ? double(float(V.Num())) : V.Num(); V.bFloat = true; return true; }
+        V.I = V.bFloat ? int64(V.F) : V.I;
+        V.bFloat = false;
+        if (T == "bool") V.I = V.Num() != 0;
+        else if (T == "int" || T == "int32") V.I = int32(V.I);
+        else if (T == "unsigned int" || T == "uint32") V.I = uint32(V.I);
+        else if (T == "uint8" || T == "unsigned char") V.I = uint8(V.I);
+        else if (T == "int8" || T == "signed char") V.I = int8(V.I);
+        else if (T == "short" || T == "int16") V.I = int16(V.I);
+        else if (T == "unsigned short" || T == "uint16") V.I = uint16(V.I);
+        return true;
+    };
+    if (K == "IntegerLiteral") { Out = {}; Out.I = int64(std::strtoull(E.value("value", std::string("0")).c_str(), nullptr, 10)); return true; }
+    if (K == "FloatingLiteral") { Out = {}; Out.bFloat = true; Out.F = std::strtod(E.value("value", std::string("0")).c_str(), nullptr); return true; }
+    if (K == "CXXBoolLiteralExpr") { Out = {}; Out.I = E.value("value", false); return true; }
+    if (K == "ConstantExpr" && E.contains("value") && E["value"].is_string())
+    {
+        /* clang ran it: a consteval call (an immediate invocation is always wrapped so), whatever its body does. */
+        const std::string V = E["value"].get<std::string>();
+        Out = {};
+        if (V == "true" || V == "false") Out.I = V == "true";
+        else if (V.find_first_of(".eEn") != std::string::npos) { Out.bFloat = true; Out.F = std::strtod(V.c_str(), nullptr); }
+        else Out.I = std::strtoll(V.c_str(), nullptr, 10);
+        return Fit(Out);
+    }
+    if (K == "ParenExpr" || K == "ConstantExpr" || K == "ExprWithCleanups")
+        return First(E) && FoldConst(*First(E), Out);
+    if (K == "ImplicitCastExpr" || K == "CStyleCastExpr" || K == "CXXStaticCastExpr" || K == "CXXFunctionalCastExpr")
+        return First(E) && FoldConst(*First(E), Out) && Fit(Out);
+    if (K == "DeclRefExpr" && E.contains("referencedDecl"))
+    {
+        const std::string Id = E["referencedDecl"].value("id", std::string());
+        if (auto V = EnumValues.find(Id); V != EnumValues.end()) { Out = {}; Out.I = V->second; return true; }
+        auto C = ConstVars.find(Id);
+        return C != ConstVars.end() && First(*C->second) && FoldConst(*First(*C->second), Out) && Fit(Out);
+    }
+    if (K == "UnaryOperator")
+    {
+        const std::string Op = E.value("opcode", std::string());
+        if (!First(E) || !FoldConst(*First(E), Out)) return false;
+        if (Op == "-") { Out.F = -Out.F; Out.I = -Out.I; }
+        else if (Op == "~" && !Out.bFloat) Out.I = ~Out.I;
+        else if (Op == "!") { Out.I = Out.Num() == 0; Out.bFloat = false; }
+        else if (Op != "+") return false;
+        return Fit(Out);
+    }
+    if (K != "BinaryOperator") return false;
+    const std::string Op = E.value("opcode", std::string());
+    FConstVal L, R;
+    if (!Nth(E, 0) || !Nth(E, 1) || !FoldConst(*Nth(E, 0), L) || !FoldConst(*Nth(E, 1), R)) return false;
+    Out = {};
+    if (L.bFloat || R.bFloat)
+    {
+        Out.bFloat = true;
+        if (Op == "+") Out.F = L.Num() + R.Num();
+        else if (Op == "-") Out.F = L.Num() - R.Num();
+        else if (Op == "*") Out.F = L.Num() * R.Num();
+        else if (Op == "/" && R.Num() != 0) Out.F = L.Num() / R.Num();
+        else return false;
+        return Fit(Out);
+    }
+    if (Op == "+") Out.I = L.I + R.I;
+    else if (Op == "-") Out.I = L.I - R.I;
+    else if (Op == "*") Out.I = L.I * R.I;
+    else if (Op == "/" && R.I != 0) Out.I = L.I / R.I;
+    else if (Op == "%" && R.I != 0) Out.I = L.I % R.I;
+    else if (Op == "&") Out.I = L.I & R.I;
+    else if (Op == "|") Out.I = L.I | R.I;
+    else if (Op == "^") Out.I = L.I ^ R.I;
+    else if (Op == "<<" && R.I >= 0 && R.I < 64) Out.I = int64(uint64(L.I) << R.I);
+    else if (Op == ">>" && R.I >= 0 && R.I < 64) Out.I = L.I >> R.I;
+    else return false;
+    return Fit(Out);
+}
+
+bool FCompiler::ConstToArg(const FConstVal& V, const std::string& Type, FArgIR& Out) const
+{
+    const EStrKind VK = StrKindOf(Canon(Type));
+    if (VK != SK_Float && VK != SK_Bool && VK != SK_Byte && VK != SK_Int64 && VK != SK_Int) return false;
+    Out = FArgIR();
+    Out.K = VK == SK_Float ? FArgIR::Float : VK == SK_Bool ? FArgIR::Bool : VK == SK_Byte ? FArgIR::Byte
+          : VK == SK_Int64 ? FArgIR::Int64 : FArgIR::Int;
+    Out.F = float(V.Num());
+    Out.B = V.Num() != 0;
+    Out.I = int32(V.I);
+    Out.I64 = V.I;
+    return true;
+}
+
 bool FCompiler::AssetRef(const Json& N, FBlueprintClass& BP, FIndex* Out)
 {
     if (Kind(N) != "UnaryOperator" || N.value("opcode", std::string()) != "&") return false;
@@ -4916,7 +5484,8 @@ bool FCompiler::AssetRef(const Json& N, FBlueprintClass& BP, FIndex* Out)
 bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& BP, std::string* Err, const Json* Init,
                              bool bKeepZero)
 {
-    Init = Strip(Init ? Init : First(F));
+    const Json* const Whole = Init ? Init : First(F);
+    Init = Strip(Whole);
     if (!Init) return true;
     std::string K = Kind(*Init);
 
@@ -4939,20 +5508,53 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
     }
 
     const bool bMap = PD.Type == "MapProperty";
+    /* `= UE_ENUM_MAP(EMood)`: one pair per enumerator, whichever side of the map the enum is on. C++ has already
+       checked that the map is over that enum (the conversion operators in UeMeta.h), so the property says which. */
+    if (bMap && PD.Inner && PD.Value && CallsFunction(*Init, "__EnumMap__"))
+    {
+        const bool bEnumKey = !PD.Inner->StructName.empty();
+        const FPropertyDef& EnumSide = bEnumKey ? *PD.Inner : *PD.Value;
+        /* StructName is the engine's name (`TextureGroup`); the declaration is found by the C++ one (`ETextureGroup`). */
+        std::string CppEnum = EnumSide.StructName;
+        for (const auto& E : Enums) if (E.second.UeName == EnumSide.StructName) CppEnum = E.first;
+        const std::vector<std::pair<std::string, int64>>* Names = nullptr;
+        for (const auto& E : EnumDecls)
+            if (E.first == CppEnum || (E.first.size() > CppEnum.size() + 2
+                && E.first.compare(E.first.size() - CppEnum.size() - 2, std::string::npos, "::" + CppEnum) == 0))
+                Names = &E.second;
+        if (!Names || EnumSide.StructName.empty()) { *Err = "UE_ENUM_MAP: " + Name(F) + " is not a map over an enum"; return false; }
+        for (const auto& Entry : *Names)
+        {
+            /* UHT's and the cooker's own closing enumerator is not one of the enum's values. */
+            /* `PF_MAX_0` is Dumper-7's spelling of a PF_MAX that collided. */
+            std::string Closer = Entry.first;
+            while (!Closer.empty() && std::isdigit(uint8(Closer.back()))) Closer.pop_back();
+            if (Closer.size() > 5 && Closer.back() == '_' && Closer.compare(Closer.size() - 5, 5, "_MAX_") == 0) continue;
+            if (Entry.first.size() > 4 && Entry.first.compare(Entry.first.size() - 4, 4, "_MAX") == 0) continue;
+            FDefaultValue Enum, Text;
+            Enum.K = Text.K = FDefaultValue::Str;
+            Enum.S = EnumSide.StructName + "::" + Entry.first;
+            Text.S = Entry.first;
+            PD.Default.Items.push_back(bEnumKey ? Enum : Text);
+            PD.Default.Items.push_back(bEnumKey ? Text : Enum);
+        }
+        PD.Default.K = FDefaultValue::Array;
+        return true;
+    }
     if ((PD.Type == "ArrayProperty" || PD.Type == "SetProperty" || bMap) && PD.Inner && First(*Init))
     {
         /* The container's initializer_list constructor: the braces are the InitListExpr under it. A map's
            elements are TPair lists; Items then alternates key, value. */
         const Json* List = Init;
         while (List && Kind(*List) != "InitListExpr") List = First(*List);
-        const bool bStructs = PD.Inner->Type == "StructProperty" || (bMap && PD.Value && PD.Value->Type == "StructProperty");
-        if (!List || bStructs || (bMap && !PD.Value))
-        { *Err = "TODO: a container default is a braced list of literals or &Assets: " + Name(F); return false; }
+        if (!List || (bMap && !PD.Value))
+        { *Err = Name(F) + ": a container default is a braced list, `= { 1, 2 }`, of values a lone member could take"; return false; }
         bool bOk = true;
         auto Add = [&](const FPropertyDef& Of, const Json* E) {
             FPropertyDef Element = Of;
             bOk = bOk && E && LowerDefault(F, Element, BP, Err, E);
             PD.Default.Items.push_back(Element.Default);
+            PD.Default.Items.back().Members = Element.Members;      // a struct element's members travel with it
         };
         ForEach(*List, [&](const Json& E) {
             if (!bMap) { Add(*PD.Inner, &E); return; }
@@ -4999,7 +5601,7 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
         for (size_t I = 0; I < Args.size(); ++I)
         {
             FPropertyDef MD;
-            const std::string MName = Name(*SR->Fields[I]);
+            const std::string MName = UeNameOf(SR, Name(*SR->Fields[I]));
             if (!TypeToProperty(TypeOf(*SR->Fields[I]), MName, 0, "member " + MName + " of " + SR->CppName,
                                 BP, &MD, Err))
                 return false;
@@ -5014,16 +5616,13 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
 
     FDefaultValue& D = PD.Default;
     const std::string& T = PD.Type;
-    const bool bNumber = K == "IntegerLiteral" || K == "FloatingLiteral" || K == "CXXBoolLiteralExpr";
-    if (bNumber && (T == "IntProperty" || T == "Int64Property" || T == "ByteProperty"
-                    || T == "FloatProperty" || T == "BoolProperty"))
+    /* A number is whatever the initializer comes to: `40`, `-1.5f`, `kMax * 2 + 1`, `1 << 3 | 2`. An enum-typed
+       byte keeps its named-constant path below. */
+    if (FConstVal V; (T == "IntProperty" || T == "Int64Property" || (T == "ByteProperty" && PD.StructName.empty())
+                      || T == "FloatProperty" || T == "BoolProperty") && FoldConst(*Whole, V))
     {
-        const std::string V = K == "CXXBoolLiteralExpr" ? std::string() : Init->value("value", std::string("0"));
-        double Num = K == "CXXBoolLiteralExpr" ? (Init->value("value", false) ? 1.0 : 0.0)
-                   : K == "FloatingLiteral"    ? std::strtod(V.c_str(), nullptr)
-                                               : double(std::strtoull(V.c_str(), nullptr, 10));
-        int64 Int = K == "IntegerLiteral" ? int64(std::strtoull(V.c_str(), nullptr, 10)) : int64(Num);
-        if (bNeg) { Num = -Num; Int = -Int; }
+        const double Num = V.Num();
+        const int64 Int = V.bFloat ? int64(V.F) : V.I;
         if (T == "FloatProperty") { D.K = bKeepZero || Num != 0.0 ? FDefaultValue::Float : FDefaultValue::None; D.F = Num; }
         else if (T == "BoolProperty") { D.K = bKeepZero || Num != 0.0 ? FDefaultValue::Bool : FDefaultValue::None; D.I = Num != 0.0; }
         else { D.K = bKeepZero || Int != 0 ? FDefaultValue::Int : FDefaultValue::None; D.I = Int; }
@@ -5042,7 +5641,10 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
         D.K = !bKeepZero && D.S.empty() ? FDefaultValue::None : FDefaultValue::Str;
         return true;
     }
-    *Err = "TODO: an initializer must be a literal of the member's own type: " + Name(F);
+    *Err = Name(F) + ": a default is a value known when the mod is built - a literal, a constant expression over "
+           "literals, enum constants and constexpr variables, a braced struct, or an &Asset. A function call counts only "
+           "through `constexpr T k = F();` with F consteval, which clang runs itself. Anything computed when the game "
+           "runs belongs in ReceiveBeginPlay or UserConstructionScript";
     return false;
 }
 
@@ -5123,6 +5725,18 @@ bool FCompiler::NestedWrapperOut(const std::string& ContainerType, size_t OutArg
     return true;
 }
 
+/* A class the headers only forward-declare has no record, so nothing says what package to import it from. A
+   Blueprint class's header is named after it. */
+static std::string UnknownClass(const std::string& Where, const std::string& QualType, std::string Class)
+{
+    Class = StripTypeKeywords(Class);
+    const size_t Leaf = Class.rfind("::");
+    if (Class.size() > 2 && Class.compare(Class.size() - 2, 2, "_C") == 0)
+        return Where + ": " + Class + " is only forward-declared here - #include \"UeApi/Game/"
+             + Class.substr(Leaf == std::string::npos ? 0 : Leaf + 2) + ".h\"";
+    return "TODO: unimplemented " + Where + ": " + QualType;
+}
+
 bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& PName, uint64 ExtraFlags,
                                const std::string& Where, FBlueprintClass& BP, FPropertyDef* Out, std::string* Err)
 {
@@ -5154,7 +5768,7 @@ bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& P
     if (TemplateArg(Type, "TScriptInterface", &Inner))
     {
         const FRecord* IR = Find(Inner);
-        if (!IR || IR->bIsStruct) { *Err = "TODO: unimplemented " + Where + ": " + QualType; return false; }
+        if (!IR || IR->bIsStruct) { *Err = UnknownClass(Where, QualType, Inner); return false; }
         *Out = InterfaceParam(PName, ClassImportOf(*IR, BP), ExtraFlags);
         return true;
     }
@@ -5240,7 +5854,7 @@ bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& P
         return true;
     }
     const FRecord* PR = ClassName.empty() ? nullptr : Find(ClassName);
-    if (!PR || PR->bIsStruct) { *Err = "TODO: unimplemented " + Where + ": " + QualType; return false; }
+    if (!PR || PR->bIsStruct) { *Err = UnknownClass(Where, QualType, ClassName); return false; }
     *Out = ObjectParam(PName, PR->IsNative() ? BP.EngineClass(PR->UePackage, PR->UeName)
                                              : BP.EngineClass(ModPackage + "/" + PR->CppName, PR->CppName + "_C"),
                        ExtraFlags);
@@ -5327,20 +5941,42 @@ bool FCompiler::GenerateInterface(const FRecord& R, const std::string& OutDir, s
     const std::string PackageName = ModPackage + "/" + R.CppName;
     FPackage P(PackageName);
     StampIdentity(P, PackageName);
-    FBlueprintClass BP(P, R.CppName + "_C", "/Script/CoreUObject", "Interface", false);
+
+    /* `class IChild : public IParent`: the editor never offers it for a Blueprint Interface, but a UClass has a
+       super like any other, and the runtime asks for nothing more. UClass::ImplementsInterface (Class.cpp:4649)
+       tests each Interfaces entry with IsChildOf - "SomeInterface might be a base interface of our implemented
+       interface" - so an implementing class lists the child alone, which is also all the Kismet compiler writes
+       (KismetCompiler.cpp:2420). One super, so one parent. */
+    if (!R.Interfaces.empty())
+    { *Err = R.CppName + ": an interface extends one interface at most, as a UClass has one super"; return false; }
+    const FRecord* Parent = R.Base.empty() ? nullptr : Find(R.Base);
+    if (!R.Base.empty() && (!Parent || Parent->bIsStruct || (Parent->IsNative() ? Parent->CppName[0] != 'I' : !Parent->bIsInterface)))
+    { *Err = R.CppName + " extends " + R.Base + ", which is not an interface"; return false; }
+    const bool bParentIsLocal = Parent && !Parent->IsNative();
+    const std::string ParentPkg = !Parent ? "/Script/CoreUObject" : bParentIsLocal ? ModPackage + "/" + Parent->CppName : Parent->UePackage;
+    FBlueprintClass BP(P, R.CppName + "_C", ParentPkg,
+                       !Parent ? "Interface" : bParentIsLocal ? Parent->CppName + "_C" : Parent->UeName,
+                       ParentPkg.compare(0, 6, "/Game/") == 0);
     BP.SetIsActor(false);
     BP.SetClassFlags(CLASS_Parsed | CLASS_Interface | CLASS_CompiledFromBlueprint);
 
-    if (!R.Fields.empty())
-    { *Err = R.CppName + ": an interface declares no variables, only functions"; return false; }
-    /* An interface extending another would need the parent's functions conformed into this class and
-       the child listed against both; refuse it rather than silently cook a UInterface-rooted class
-       that drops the parent. */
-    if (!R.Base.empty() || !R.Interfaces.empty())
-    { *Err = R.CppName + ": an interface extending another is not supported yet"; return false; }
+    /* A variable on an interface is this compiler's own idea, not the engine's: it becomes a property of every
+       class that implements the interface (Generate), so none is written here. What cannot move that way is
+       refused. */
+    for (const Json* F : R.Fields)
+    {
+        if (R.Components.count(Name(*F)))
+        { *Err = R.CppName + "::" + Name(*F) + ": an interface cannot declare a UE_COMPONENT"; return false; }
+        if (StripTypeKeywords(TypeOf(*F)).compare(0, 25, "TMulticastInlineDelegate<") == 0)
+        { *Err = R.CppName + "::" + Name(*F) + ": an interface cannot declare a UE_DISPATCHER"; return false; }
+    }
 
     for (const auto& Entry : R.Methods)
     {
+        /* A RepNotify of one of its variables is the implementing class's function, never called through the
+           interface. */
+        if (std::any_of(R.Replicated.begin(), R.Replicated.end(), [&](const auto& Rep) {
+                return Rep.second.substr(0, Rep.second.find(':')) == Entry.first; })) continue;
         std::vector<FPropertyDef> Params;
         if (!LowerParams(*Entry.second, Entry.first, BP, Params, Err)) return false;
 
@@ -5439,16 +6075,7 @@ bool FCompiler::GenerateAsset(const Json& Var, const std::string& OutDir, std::s
     StampIdentity(P, PackageName);
     FBlueprintClass BP(P, AssetName, "", "", false);
 
-    /* What clang writes for a member the braces leave out; an aggregate member (TArray) is a list of those. */
-    std::function<bool(const Json&)> Unset = [&](const Json& E) {
-        const std::string K = Kind(E);
-        if (K == "ImplicitValueInitExpr" || K == "CXXDefaultInitExpr") return true;
-        if (K == "CXXConstructExpr") return !First(E);
-        if (K != "InitListExpr") return false;
-        bool bAll = true;
-        ForEach(E, [&](const Json& C) { bAll = bAll && Unset(C); });
-        return bAll;
-    };
+    const auto Unset = IsUnsetInit;
     std::function<bool(const Json&, const FRecord&)> Fill = [&](const Json& List, const FRecord& Rec) {
         size_t I = 0;
         if (!Rec.Base.empty())
@@ -5463,7 +6090,7 @@ bool FCompiler::GenerateAsset(const Json& Var, const std::string& OutDir, std::s
             const Json* Init = Strip(Nth(List, I++));
             if (!Init || Unset(*Init)) continue;
             FPropertyDef PD;
-            if (!TypeToProperty(TypeOf(*F), Name(*F), 0, AssetName + "." + Name(*F), BP, &PD, Err)) return false;
+            if (!TypeToProperty(TypeOf(*F), UeNameOf(&Rec, Name(*F)), 0, AssetName + "." + Name(*F), BP, &PD, Err)) return false;
             if (!LowerDefault(*F, PD, BP, Err, Init)) return false;
             BP.AddVariable(PD);
         }
@@ -5551,10 +6178,22 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         { *Err = R.CppName + " implements " + I + ", which is not an interface"; return false; }
         /* clang already rejects one listed twice; an ancestor's copy it only warns about. A native
            ancestor's interfaces are not in the dump, so only the mod's classes are checked. */
+        /* Through an interface that extends it as well: this class's empty stubs would otherwise override the
+           functions the ancestor implemented. */
         for (const FRecord* A = Find(R.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
             for (const std::string& Other : A->Interfaces)
-                if (Find(Other) == IR)
-                { *Err = R.CppName + " implements " + I + ", which its parent " + A->CppName + " already implements"; return false; }
+                for (const FRecord* Mine : InterfaceChain(IR))
+                    for (const FRecord* Theirs : InterfaceChain(Find(Other)))
+                        if (Mine == Theirs)
+                        { *Err = R.CppName + " implements " + I + ", which its parent " + A->CppName + " already implements"
+                                 + (Find(Other) == IR ? "" : " (through " + Other + ")"); return false; }
+        /* Two of its own that meet in one interface would declare that one's variables twice. */
+        for (const std::string& Other : R.Interfaces)
+            if (&Other < &I)
+                for (const FRecord* Mine : InterfaceChain(IR))
+                    for (const FRecord* Theirs : InterfaceChain(Find(Other)))
+                        if (Mine == Theirs)
+                        { *Err = R.CppName + " implements " + Other + " and " + I + ", which both extend " + Mine->CppName; return false; }
         BP.AddInterface(ClassImportOf(*IR, BP));
     }
 
@@ -5597,6 +6236,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     std::map<std::string, FOverride> ComponentOverrides;
     std::map<std::string, FOverride> SubobjectDefaults;
     std::vector<FPropertyDef> InheritedDefaults;
+    std::map<std::string, FPropertyDef> InterfaceVarDefaults;     // a default for a variable an implemented interface declares
     if (R.Defaults)
     {
         const std::string Where = R.CppName + "::UE_DEFAULTS";
@@ -5638,21 +6278,40 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 { *Err = Where + ": " + CompName + " is not a UE_COMPONENT"; bOk = false; return; }
                 if (!bThroughComponent && DR == &R)
                 { *Err = Where + ": " + Name(*Lhs) + " is declared here - give it an initializer instead"; bOk = false; return; }
+                /* An interface's variable is this class's own property when this class is the one implementing
+                   it; below a parent that does, it is one more inherited property. */
+                const bool bInterfaceVar = !bThroughComponent && DR->bIsInterface && InterfaceVarHolder(*DR, &R) == &R;
 
                 FPropertyDef PD;
-                if (!TypeToProperty(TypeOf(*Lhs), Name(*Lhs), 0, Where, BP, &PD, Err)) { bOk = false; return; }
+                /* The tag is read back by the engine's name of the member, which its declarer's header knows. */
+                const std::string LhsDeclarer = OwnerOf(*Lhs);
+                const std::string TagName = UeNameOf(LhsDeclarer.empty() ? DR : Find(LhsDeclarer), Name(*Lhs));
+                if (!TypeToProperty(TypeOf(*Lhs), TagName, 0, Where, BP, &PD, Err)) { bOk = false; return; }
                 /* Zero is a real value here: an archetype deltas against the component CDO (where
                    bVisible is already true) and an inherited property against the parent's CDO,
                    not against the type's zero the way a fresh class variable does. */
                 if (!LowerDefault(*Lhs, PD, BP, Err, Rhs, /*bKeepZero=*/true)) { bOk = false; return; }
                 if (PD.Default.K == FDefaultValue::None)
                 { *Err = Where + ": " + Name(*Lhs) + " needs a literal value"; bOk = false; return; }
+                if (bInterfaceVar) { InterfaceVarDefaults[Name(*Lhs)] = PD; return; }
 
                 if (!bThroughComponent) { InheritedDefaults.push_back(PD); return; }
                 if (DR == &R) { ComponentDefaults[CompName].push_back(PD); return; }
                 /* A native parent's component is a default subobject, not an SCS node: it is
                    overridden by an export under this class's CDO, with no handler involved. */
-                if (DR->IsNative())
+                /* A game Blueprint's component is an SCS node too, and overriding it takes the node's guid, which only
+                   a dump can say (`<Comp>__UeScsNode`, from the Dumper-7 fork's `ScsNode=`). Without it the default
+                   subobject path below would cook an export the engine never looks at - so that is refused. */
+                const bool bBlueprintParent = DR->IsNative() && DR->UeName.size() > 2
+                                              && DR->UeName.compare(DR->UeName.size() - 2, 2, "_C") == 0;
+                if (bBlueprintParent && !DR->ScsNodes.count(CompName))
+                {
+                    *Err = Where + ": " + CompName + " is a component of the Blueprint " + DR->UeName + ", and its header does "
+                           "not say which SCS node it is - re-dump the game with the Dumper-7 fork (ScsNode=) and regenerate UeApi";
+                    bOk = false;
+                    return;
+                }
+                if (DR->IsNative() && !bBlueprintParent)
                 {
                     FOverride& Sub = SubobjectDefaults[CompName];
                     Sub.Owner = DR;
@@ -5675,10 +6334,26 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         if (!LayoutOf(Type, &Size, &Align, &Ignored)) Align = 8;
         ClassVars.emplace_back(Align, PD);
     };
-    for (const Json* F : R.Fields)
+    /* A variable declared on a mod interface is a property of each class that implements it - here, once, and
+       found by InterfaceVarHolder from this class's subclasses. Its markers are read off the interface. */
+    struct FOwnedField { const Json* F; const FRecord* Decl; };
+    std::vector<FOwnedField> OwnedFields;
+    for (const Json* F : R.Fields) OwnedFields.push_back({ F, &R });
+    for (const std::string& I : R.Interfaces)
+        for (const FRecord* Link : InterfaceChain(Find(I)))
+            if (Link->bIsInterface)
+                for (const Json* F : Link->Fields)
+                {
+                    if (std::any_of(OwnedFields.begin(), OwnedFields.end(), [&](const FOwnedField& O) { return Name(*O.F) == Name(*F); }))
+                    { *Err = R.CppName + ": the variable " + Name(*F) + " of the interface " + Link->CppName + " is declared twice"; return false; }
+                    OwnedFields.push_back({ F, Link });
+                }
+    for (const FOwnedField& Owned : OwnedFields)
     {
+        const Json* F = Owned.F;
+        const FRecord& Decl = *Owned.Decl;
         const std::string FieldName = Name(*F);
-        if (auto Sig = CurSignatures.find(FieldName); Sig != CurSignatures.end())
+        if (auto Sig = CurSignatures.find(FieldName); &Decl == &R && Sig != CurSignatures.end())
         {
             AddVariable("", DispatcherParam(FieldName, Sig->second));
             continue;
@@ -5688,13 +6363,20 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         if (!TypeToProperty(TypeOf(*F), FieldName, 0, "property " + FieldName, BP, &PD, &PErr))
         { *Err = PErr; return false; }
         if (!LowerDefault(*F, PD, BP, Err)) return false;
+        /* UE_DEFAULTS naming an interface's variable is this class's own default for it. */
+        if (auto Own = InterfaceVarDefaults.find(FieldName); Own != InterfaceVarDefaults.end())
+        {
+            PD.Default = Own->second.Default;
+            PD.Members = Own->second.Members;
+            InterfaceVarDefaults.erase(Own);
+        }
 
         /* CPF_Parm would make it part of the call frame; CPF_BlueprintReadOnly would forbid assignment -
            except on a `const` field, where the source forbids it anyway, so the flag is the truth. */
         PD.PropertyFlags = (PD.PropertyFlags & ~uint64(CPF_Parm | CPF_BlueprintReadOnly))
                          | CPF_Edit | CPF_BlueprintVisible | CPF_DisableEditOnInstance;
         if (TypeOf(*F).compare(0, 6, "const ") == 0) PD.PropertyFlags |= CPF_BlueprintReadOnly;
-        if (R.Components.count(FieldName))
+        if (&Decl == &R && R.Components.count(FieldName))
         {
             if (!bIsActor) { *Err = R.CppName + "::" + FieldName + ": only an actor has a construction script"; return false; }
             const size_t Star = TypeOf(*F).find('*');
@@ -5716,7 +6398,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                             ComponentDefaults[FieldName]);
             ComponentDefaults.erase(FieldName);
         }
-        if (auto Rep = R.Replicated.find(FieldName); Rep != R.Replicated.end())
+        if (auto Rep = Decl.Replicated.find(FieldName); Rep != Decl.Replicated.end())
         {
             /* Measured on BP_LiftPod.IsLaunchEnabled: the editor's flags plus CPF_Net, and CPF_RepNotify with the
                function's name when it has one. */
@@ -5726,8 +6408,12 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             PD.PropertyFlags |= CPF_Net;
             if (!Notify.empty())
             {
-                auto M = R.Methods.find(Notify);
-                if (M == R.Methods.end() || !ParmNames(*M->second).empty())
+                /* An interface variable's RepNotify is declared beside it; a class that leaves it out gets the
+                   empty stub every interface function gets. */
+                const Json* NotifyFn = nullptr;
+                if (auto M = R.Methods.find(Notify); M != R.Methods.end()) NotifyFn = M->second;
+                else if (auto D = Decl.Methods.find(Notify); D != Decl.Methods.end()) NotifyFn = D->second;
+                if (!NotifyFn || !ParmNames(*NotifyFn).empty())
                 { *Err = R.CppName + "::" + FieldName + ": its RepNotify " + Notify + " must be a method of the class taking no parameters"; return false; }
                 PD.PropertyFlags |= CPF_RepNotify;
                 PD.RepNotify = Notify;
@@ -5778,12 +6464,22 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
 
         const std::string OwnerPkg = Owner.IsNative() ? Owner.UePackage : ModPackage + "/" + Owner.CppName;
         const std::string OwnerCls = Owner.IsNative() ? Owner.UeName : Owner.CppName + "_C";
-        uint32 NodeGuid[4];
-        ScsNodeGuid(OwnerCls, Entry.first, NodeGuid);
+        uint32 NodeGuid[4] = {};
+        const std::string VarName = UeNameOf(&Owner, Entry.first);      // the node's name: `Audio Flying`, spaces and all
+        if (auto Node = Owner.ScsNodes.find(Entry.first); Node != Owner.ScsNodes.end())
+        {
+            /* The guid's 16 bytes as the engine holds them, which is four little-endian words on disk as well. */
+            if (Node->second.size() != 32)
+            { *Err = R.CppName + "::UE_DEFAULTS: " + Entry.first + "__UeScsNode is not 32 hex digits"; return false; }
+            for (int B = 0; B < 16; ++B)
+                NodeGuid[B / 4] |= uint32(std::stoul(Node->second.substr(size_t(B) * 2, 2), nullptr, 16)) << (8 * (B % 4));
+        }
+        else
+            ScsNodeGuid(OwnerCls, Entry.first, NodeGuid);
         const FIndex OwnerClass = BP.EngineClass(OwnerPkg, OwnerCls);
-        BP.AddComponentOverride(Entry.first, BP.EngineClass(CR->UePackage, CR->UeName),
+        BP.AddComponentOverride(VarName, BP.EngineClass(CR->UePackage, CR->UeName),
                                 BP.Subobject(CR->UePackage, CR->UeName, OwnerClass,
-                                             Entry.first + "_GEN_VARIABLE"),
+                                             VarName + "_GEN_VARIABLE"),
                                 OwnerClass, NodeGuid, Entry.second.Defaults);
     }
 
@@ -5810,9 +6506,11 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
        returns a value has it too (Targetable::GetIsTargetable) and the editor implements it as a function
        graph. Only a native-only function lacks it, which UHT allows just under
        CannotImplementInterfaceInBlueprint (HeaderParser.cpp:7538). */
-    for (const std::string& I : R.Interfaces)
+    for (const std::string& Listed : R.Interfaces)
+    for (const FRecord* Link : InterfaceChain(Find(Listed)))        // the interfaces it extends are implemented too
     {
-        const FRecord& IR = *Find(I);
+        const FRecord& IR = *Link;
+        const std::string& I = IR.CppName;
         /* A mod's own interface needs none of the Events.json conformance check below: GenerateInterface
            emits every one of its functions as a BlueprintEvent, so all of them are implementable by
            construction. What it does share is the empty stub for one this class leaves out. */
@@ -5830,12 +6528,12 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         }
         const std::string Prefix = IR.UePackage.substr(IR.UePackage.rfind('/') + 1) + "." + IR.UeName + ".";
         for (const auto& M : IR.Methods)
-            if (M.first != "StaticClass" && !EventFlags.count(Prefix + M.first))     // StaticClass: UE_CLASS's
+            if (M.first != "StaticClass" && !EventFlags.count(Prefix + UeNameOf(&IR, M.first)))     // StaticClass: UE_CLASS's
             { *Err = I + "::" + M.first + " is native only (not a BlueprintNativeEvent or BlueprintImplementableEvent), "
                      "so a Blueprint cannot implement " + I; return false; }
         for (auto It = EventFlags.lower_bound(Prefix); It != EventFlags.end() && It->first.compare(0, Prefix.size(), Prefix) == 0; ++It)
         {
-            const std::string Name_ = It->first.substr(Prefix.size());
+            const std::string Name_ = CppNameOf(IR, It->first.substr(Prefix.size()));     // the table is in engine names
             if (std::any_of(Methods.begin(), Methods.end(), [&](const FMethod& F) { return F.Name == Name_; })) continue;
             auto Decl = IR.Methods.find(Name_);
             if (Decl == IR.Methods.end())
@@ -5847,9 +6545,13 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     }
 
     /* A method that makes a latent call becomes a segment of ExecuteUbergraph_<Class> and keeps its name as a stub
-       event that jumps in, as the editor compiles an event graph. The latent action manager needs a world. */
-    const bool bCanLatent = std::find(Ancestry.begin(), Ancestry.end(), "Actor") != Ancestry.end()
-                         || std::find(Ancestry.begin(), Ancestry.end(), "ActorComponent") != Ancestry.end();
+       event that jumps in, as the editor compiles an event graph. Any class can: every BPGC object gets a persistent
+       frame (FObjectInitializer::PostConstructInit), and UWorld::Tick resumes every object's actions
+       (ProcessLatentActions(nullptr), LevelTick.cpp:1539), not only an actor's. What the call needs is a world, and
+       these find their own; any other object has one only through its Outer (UObject::GetWorld, Obj.cpp:846). The
+       editor hides Delay there for that reason alone (EdGraphSchema_K2.cpp:846, ImplementsGetWorld). */
+    const bool bHasOwnWorld = std::any_of(Ancestry.begin(), Ancestry.end(), [](const std::string& A) {
+        return A == "Actor" || A == "ActorComponent" || A == "UserWidget" || A == "GameInstance" || A == "Subsystem"; });
     struct FSegment
     {
         std::string Name;
@@ -5911,6 +6613,9 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         CurLocals = &Locals;
         LoopDepth = 0;
         SwitchDepth = 0;
+        WriteBackDepth = 0;
+        GotoLabels.clear();
+        bBodyHasGoto = Fn.Body && HasGoto(*Fn.Body);
         KeepLoaded.clear();
         CurFnName = Fn.Name;
         bCurNet = (NetFlagsOf(Decl) | NetFlagsOf(M)) != 0;
@@ -5920,8 +6625,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         LatentCount = 0;
         Completions.clear();
         ActivatedActions.clear();
-        LatentRefusal = !bCanLatent ? "only an Actor or ActorComponent class has a world to resume in"
-                      : IsStaticDecl(Decl) ? "a static function has no ubergraph to resume in"
+        LatentRefusal = IsStaticDecl(Decl) ? "a static function has no object whose ubergraph frame could keep its locals"
                       : (!RetType.empty() && RetType != "void") || HasOutParm(Params)
                           ? "a function that resumes later returns nothing and takes no reference parameters"
                       : "";
@@ -5960,11 +6664,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
            FUNC_Event would be treated by the loader as an overridable entry point. */
         uint32 Inherited = 0;
         const FIndex Super = FindEvent(BP, R.CppName, Fn.Name, &Inherited);
-        uint32 Flags = Inherited ? Inherited & (FUNC_Exec | FUNC_Event | FUNC_BlueprintCallable | FUNC_BlueprintEvent
-                                                | FUNC_BlueprintAuthorityOnly | FUNC_BlueprintCosmetic | FUNC_Const
-                                                | FUNC_Public | FUNC_Protected | FUNC_Private | FUNC_BlueprintPure
-                                                | FUNC_Net | FUNC_NetReliable | FUNC_NetServer | FUNC_NetClient
-                                                | FUNC_NetMulticast)
+        uint32 Flags = Inherited ? Inherited & kOverrideInherits
                      : IsStaticDecl(Decl) ? uint32(FUNC_Static | FUNC_BlueprintCallable | FUNC_Public | FUNC_Final)
                      : FFunctionDef().FunctionFlags;
         /* All 7229 BlueprintPure functions in the DRG dump are BlueprintCallable too. */
@@ -5996,6 +6696,10 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
 
         if (bMadeLatentCall)
         {
+            if (!bHasOwnWorld)
+                printf("  warning: %s::%s waits, and an object of this class finds its world only through its Outer: make "
+                       "it with an actor or component as Outer, or the call does nothing and the function never resumes\n",
+                       R.CppName.c_str(), Fn.Name.c_str());
             if (bScratchNeeded)
             { *Err = R.CppName + "::" + Fn.Name + ": TODO: a pointer read in a function that makes a latent call"; return false; }
             FSegment Seg{ Fn.Name, Super, {}, Locals, Stmts, Flags, {}, Completions };
@@ -6004,7 +6708,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             continue;
         }
 
-        BP.AddFunction(Fn.Name, Super, Params,
+        BP.AddFunction(UeNameOf(&R, Fn.Name), Super, Params,
                        [Stmts, bEndsWithReturn, bScratchNeeded, DerefStruct](FScript& S, FIndex SelfExp) {
             if (bScratchNeeded)
             {
@@ -6080,7 +6784,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         {
             std::vector<std::pair<std::string, std::string>> Copies;
             for (const FPropertyDef& P : Segments[I].Parms) Copies.emplace_back(P.Name, Segments[I].Rename.at(P.Name));
-            BP.AddFunction(Segments[I].Name, Segments[I].Super, Segments[I].Parms,
+            BP.AddFunction(UeNameOf(&R, Segments[I].Name), Segments[I].Super, Segments[I].Parms,
                            [Copies, Uber, Entries, I](FScript& S, FIndex SelfExp) {
                 for (const auto& [From, To] : Copies)
                     S.LetValueOnPersistentFrame(To, Uber, [&, From](FScript& V) { V.LocalVariable(From, SelfExp); });
@@ -6187,7 +6891,7 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     const std::string AstPath = OutDir + "/ast.json";
     /* Both the UeApi dir and its parent are include paths, so "FSD.h" and "UeApi/FSD.h" both resolve. */
     const std::string Parent = std::filesystem::path(IncludeDir).parent_path().string();
-    const std::string Cmd = "clang++ -std=c++17 -fsyntax-only -Xclang -ast-dump=json"
+    const std::string Cmd = "clang++ -std=c++20 -fsyntax-only -Xclang -ast-dump=json"
                             " \"" + SourcePath + "\" -I\"" + IncludeDir + "\" -I\"" + Parent
                           + "\" > \"" + AstPath + "\"";
     if (system(("\"" + Cmd + "\"").c_str()) != 0)
@@ -6205,6 +6909,15 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     if (!Collect(Err)) return false;
     /* Inline free functions anywhere in the translation unit, a template's instantiations included: a call names
        the instantiation's own FunctionDecl. Class bodies are skipped; their methods are the records'. */
+    std::function<void(const Json&)> IndexConsts = [&](const Json& N) {
+        const std::string K = Kind(N);
+        if (K == "VarDecl" && N.contains("init") && N.contains("id")
+            && (N.value("constexpr", false) || TypeOf(N).compare(0, 6, "const ") == 0))
+            ConstVars[N.value("id", std::string())] = &N;
+        if (K == "TranslationUnitDecl" || K == "NamespaceDecl" || K == "CXXRecordDecl" || K == "LinkageSpecDecl")
+            ForEach(N, IndexConsts);
+    };
+    IndexConsts(Doc);
     std::function<void(Json&)> IndexInlines = [&](Json& N) {
         if (!N.is_object()) return;
         const std::string K = Kind(N);

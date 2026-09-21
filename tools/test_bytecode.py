@@ -151,6 +151,58 @@ check('FlowTest', 'FloatStep', lambda F: -(F + 1.5), [dict(F=f) for f in (0.0, 2
 check('FlowTest', 'WhileAnd', while_and, [dict(Limit=l) for l in (0, 1, 50, 99, 150)])
 
 
+def do_continue(Limit):
+    i = s = 0
+    while True:
+        i += 1
+        if i % 2 != 0:
+            if i > 9: break
+            s += i
+        if not i < Limit: break
+    return s * 100 + i
+
+
+def goto_out(Size, Want):
+    for y in range(Size):
+        for x in range(Size):
+            if x * y == Want: return y * 100 + x
+    return -2
+
+
+def if_init(V):
+    twice = V * 2
+    r = twice if twice > 10 else -twice
+    return r + cmod(V, 3) * 1000
+
+
+def switch_init(V):
+    k, m = V + 1, cmod(V, 4)
+    if k == 1: return 10
+    if k == 2: return 20 + k
+    return 300 + m if m == 3 else m
+
+
+def while_var(Start):
+    steps = 0
+    while Start - steps != 0:
+        left = Start - steps
+        steps += 1
+        if left < 0: break
+    return steps
+
+
+check('FlowTest', 'DoOnce', lambda Limit: max(Limit, 1), [dict(Limit=l) for l in (-3, 0, 1, 2, 9)])
+check('FlowTest', 'DoContinue', do_continue, [dict(Limit=l) for l in (0, 1, 2, 6, 7, 30)])
+check('FlowTest', 'GotoLoop', lambda N: sum(range(max(N, 0))), [dict(N=n) for n in (-1, 0, 1, 5, 40)])
+check('FlowTest', 'GotoOut', goto_out, [dict(Size=s, Want=w) for s in (0, 1, 4) for w in (0, 6, 7)])
+def first_square_above(floor): return next(n for n in range(1, 100) if n * n > floor)
+check('FlowTest', 'GotoInlined', lambda A, B: first_square_above(A) * 100 + first_square_above(B), [dict(A=a, B=b) for a, b in ((0, 0), (10, 50), (99, 3))])
+check('FlowTest', 'GotoRedeclares', lambda Rounds: 5 * max(Rounds, 1), [dict(Rounds=r) for r in (0, 1, 3)])
+check('FlowTest', 'IfInit', if_init, [dict(V=v) for v in (-4, 0, 3, 5, 6, 8)])
+check('FlowTest', 'SwitchInit', switch_init, [dict(V=v) for v in (-1, 0, 1, 2, 3, 7)])
+check('FlowTest', 'WhileVar', while_var, [dict(Start=s) for s in (-2, 0, 1, 5)])
+
+
 def range_self(**kw):
     return dict(Items=list(kw.get('Items', [])), Seen=list(kw.get('Seen', [])), Scores=dict(kw.get('Scores', {})))
 
@@ -189,6 +241,7 @@ def bump_scores(stop):
 
 arrays = [[], [1], [3, -1, 7], [60, 2, -5, 9], [1, 2, 3, 4, 5]]
 check_self('RangeTest', 'SumArray', lambda f: sum(f['Items']), [dict(Items=a) for a in arrays])
+check_self('RangeTest', 'SumScaled', lambda f: 3 * sum(f['Items']), [dict(Items=a) for a in arrays])
 check_self('RangeTest', 'DoubleInPlace', double_in_place, [dict(Items=a) for a in arrays])
 check_self('RangeTest', 'CopyDoesNotWrite', lambda f: len(f['Items']), [dict(Items=a) for a in arrays])
 check_self('RangeTest', 'NestedPairs', lambda f: sum(1 for a in f['Items'] for b in f['Items'] if a < b), [dict(Items=a) for a in arrays])
@@ -260,7 +313,76 @@ def mod_enum():
     print('ok  TypesTest: int32 / int64 enums cook as EnumProperty over Int / Int64Property')
 
 
+def fnv(s):
+    h = 2166136261
+    for c in s.encode(): h = ((h ^ c) * 16777619) & 0xFFFFFFFF
+    return h & 0x7FFFFFFF
+
+
+def constants():
+    import re, subprocess
+    here = os.path.dirname(os.path.abspath(__file__))
+    base = asset('TypesTest')
+    exports = [e['name'] for e in dumpexp.load(base)[5]]
+    cdo = subprocess.run([sys.executable, os.path.join(here, 'dumptags.py'), base, str(exports.index('Default__TypesTest_C'))], capture_output=True, text=True).stdout
+    for want in ('Seed [0] IntProperty size=4: %d' % fnv('types'), 'Budget [0] IntProperty size=4: 25', 'Reach [0] FloatProperty size=4: 125.0', 'Bits [0] IntProperty size=4: 236'):
+        assert want in cdo, (want, cdo)
+    print('ok  TypesTest: a member default is what its constant expression comes to')
+    import struct
+    six, pair = struct.pack('<6f', 1, 2, 3, 4, 5, 6).hex(), struct.pack('<3f', 7, 8, 9).hex()
+    points = re.search(r'Points \[0\] ArrayProperty size=77 inner=StructProperty: (\w+)', cdo).group(1)   # count, inner tag (53), 2 x 12 raw
+    assert points.startswith('02000000') and points.endswith(six), points
+    assert re.search(r'Spans \[0\] ArrayProperty size=185 inner=StructProperty', cdo), cdo                 # 2 x (Min tag, Max tag, None) = 132
+    assert re.search(r'Spots \[0\] MapProperty size=28 .*: 0000000001000000\w{16}' + pair, cdo), cdo
+    print('ok  TypesTest: a container default holds struct elements, raw or tagged as the struct serializes')
+    names = dumpexp.load(base)[3]
+    name_of = lambda hx: names[struct.unpack('<i', bytes.fromhex(hx[:8]))[0]]
+    by_mood = re.search(r'MoodNames \[0\] MapProperty size=56 key=ByteProperty value=NameProperty: 0{8}03000000(\w+)', cdo).group(1)
+    pairs = [(name_of(by_mood[i:i + 16]), name_of(by_mood[i + 16:i + 32])) for i in range(0, 96, 32)]
+    assert pairs == [('EMood::Calm', 'Calm'), ('EMood::Angry', 'Angry'), ('EMood::Sleepy', 'Sleepy')], pairs
+    by_name = re.search(r'MoodsByName \[0\] MapProperty size=62 key=StrProperty value=ByteProperty: 0{8}03000000(\w+)', cdo).group(1)
+    assert by_name.startswith('05000000' + b'Calm'.hex() + '00') and name_of(by_name[18:34]) == 'EMood::Calm', by_name
+    print('ok  TypesTest: UE_ENUM_MAP fills a map from the enum, either way round')
+    base = asset('TypesTest')
+    exports = [e['name'] for e in dumpexp.load(base)[5]]
+    tool = lambda t, i: subprocess.run([sys.executable, os.path.join(here, t), base, str(i)], capture_output=True, text=True).stdout
+    assert re.search(r"ObjectProperty Aimed .*Class'Actor'", tool('dumpstruct.py', 0)), 'a `using` alias of a class is still an object reference'
+    assert re.search(r"ObjectProperty Spotted .*Class'Pawn'", tool('dumpstruct.py', 0)), 'and so is a class-scope one'
+    forget = ' '.join(tool('walkscript.py', exports.index('Forget')).split())
+    step = r' \+ *\d+ mem \d+ disk \d+ mem \d+ '
+    assert re.search(r'InstanceVariable Health@\S+' + step + 'NoInterface', forget) and re.search(r'InstanceVariable Aimed@\S+' + step + 'NoObject', forget), forget
+    print('ok  TypesTest: a class alias stays an object; nullptr is EX_NoInterface for an interface')
+    base = asset('StringTest')
+    exports = [e['name'] for e in dumpexp.load(base)[5]]
+    walk = subprocess.run([sys.executable, os.path.join(here, 'walkscript.py'), base, str(exports.index('ReceiveBeginPlay'))], capture_output=True, text=True).stdout
+    flat = ' '.join(walk.split())
+    assert re.search(r"Concat_StrStr' .{0,60}?StringConst 'Kills: ' .{0,60}?Conv_IntToString'", flat), flat[-900:]
+    assert re.search(r"Concat_StrStr' .{0,60}?Conv_IntToString' .{0,160}?StringConst ' left'", flat), flat[-900:]
+    print('ok  StringTest: "lit" + N and N + "lit" are Concat_StrStr, not pointer arithmetic')
+
+
+def engine_names():
+    import re, subprocess
+    here = os.path.dirname(os.path.abspath(__file__))
+    base = asset('NameTest')
+    loaded = dumpexp.load(base)
+    exports = [e['name'] for e in loaded[5]]
+    tool = lambda t, i: subprocess.run([sys.executable, os.path.join(here, t), base, str(i)], capture_output=True, text=True).stdout
+    cdo = tool('dumptags.py', exports.index('Default__NameTest_C'))
+    assert 'Index [0] IntProperty size=4: 7' in cdo and re.search(r"Name \[0\] StrProperty size=\d+: 'Karl'", cdo), cdo
+    # SplitName would have made FName(Index, 1) of the C++ spelling: neither it nor the spelling may be in the package.
+    assert 'Index_0' not in loaded[3] and 'Name_0' not in loaded[3], [n for n in loaded[3] if n.endswith('_0')]
+    walk = tool('walkscript.py', exports.index('Next'))
+    assert re.search(r"InstanceVariable\s+Index@imp\[\d+\]:Class'FSDSaveGame'", walk) and 'Index_0' not in walk, walk
+    print('ok  NameTest: a member Dumper-7 respelled is cooked by the engine\'s name (tag and bytecode)')
+
+
 mod_enum()
+constants()
+engine_names()
+check('TypesTest', 'Cpp20', lambda M, N: {0: N + N, 5: N + fnv('angry')}.get(M, fnv('types')), [dict(M=m, N=n) for m in (0, 5, 6) for n in (-2, 9)])
+check('TypesTest', 'ConstSum', lambda N: N * 3 + 12 + 19, [dict(N=n) for n in (-4, 0, 9)])
+check('TypesTest', 'HalfOf', lambda V: V * 0.5, [dict(V=v) for v in (-3.0, 0.0, 8.0)])
 check('TypesTest', 'SpanScore', lambda S: {-3: 1, 70000: 2, 70001: 3, 70002: 4}.get(S, 0), [dict(S=s) for s in (-3, 70000, 70001, 70002, 5)])
 check('TypesTest', 'AgeOf', lambda A: 1 if A == 5000000000 else 2 if A == 0 else 0, [dict(A=a) for a in (0, 5000000000, 7)])
 check('TypesTest', 'MoodScore', lambda M: {0: 1, 5: 2, 6: 3}.get(M, 0), [dict(M=m) for m in (0, 5, 6, 7)])
@@ -280,6 +402,12 @@ def inline_in_place():
 
 inline_in_place()
 check('InlineTest', 'ConstThenVar', lambda V: 6 + V * 2 + clamp(V, 0, 5) + clamp(2, V, 9) + 4 + V - 1, [dict(V=v) for v in (-3, 0, 4, 12)])
+
+
+check('StructTest', 'MakeLocal', lambda K: K + K * 20 + 1000, [dict(K=k) for k in (0, 3, -2)])
+check('StructTest', 'MakeArgument', lambda K: K + 0 + K + 1, [dict(K=k) for k in (0, 5)])
+check('StructTest', 'MakeInLoop', lambda Rounds: max(Rounds, 0), [dict(Rounds=r) for r in (0, 1, 4)])
+check('StructTest', 'MakeNative', lambda D: D + 0.5, [dict(D=d) for d in (0.0, 4.0)])
 
 
 def replication():
@@ -310,6 +438,16 @@ def replication():
     seq = [(r[2] if r[1] == 'FinalFunction' else r[1]) for r in rows if len(r) > 1 and r[1] in ('FinalFunction', 'LetBool', 'Let', 'VirtualFunction')]
     assert seq == ["imp[6]:Function'FlushNetDormancy'", 'LetBool', 'VirtualFunction', 'Let', "imp[6]:Function'FlushNetDormancy'", 'LetBool'], seq
     print('ok  ReplTest: replicated properties, RPC flags, OnRep after a set')
+
+    # A mod child's override of a mod parent's RPC: the parent's flags, and the parent's function as its super.
+    kid = os.path.join(os.path.dirname(base), 'ReplKid')
+    imports, kid_exports = dumpexp.load(kid)[4], dumpexp.load(kid)[5]
+    for fn, flags in (('ServerOpen', 0x82208c0), ('MultiBoom', 0x8024840), ('OnRep_Open', 0x8020800)):
+        e = next(x for x in kid_exports if x['name'] == fn)
+        out = subprocess.run([sys.executable, os.path.join(here, 'dumpstruct.py'), kid, str(kid_exports.index(e))], capture_output=True, text=True).stdout
+        assert 'FunctionFlags %#x' % flags in out, (fn, out)
+        assert e['super'] < 0 and imports[-e['super'] - 1] == "Function'%s'" % fn, (fn, e['super'])
+    print("ok  ReplTest: an override of a mod parent's RPC keeps its net flags and names it as super")
 
 
 replication()
@@ -348,6 +486,13 @@ def latent():
         assert 'LetValueOnPersistentFrame ' + local in tool('walkscript.py', idx[ev]), ev
     assert 'InstanceDelegate     Load_OnLoaded_0' in tool('walkscript.py', idx['ExecuteUbergraph_LatentTest'])
     print('ok  LatentTest: ubergraph segments, resume linkage, stubs')
+    # A plain UObject waits the same way: its own ubergraph, the Delay on Self, a stub that jumps in.
+    base = os.path.join(os.path.dirname(base), 'LatentJob')
+    names = [e['name'] for e in dumpexp.load(base)[5]]
+    assert names == ['LatentJob_C', 'Default__LatentJob_C', 'ExecuteUbergraph_LatentJob', 'Run'], names
+    tool = lambda t, i: subprocess.run([sys.executable, os.path.join(here, t), base, str(i)], capture_output=True, text=True).stdout
+    assert re.search(r"Function'Delay'\s+.*Self", tool('walkscript.py', 2)) and 'LetValueOnPersistentFrame Run_Seconds' in tool('walkscript.py', 3)
+    print('ok  LatentTest: a UObject class makes a latent call too')
 
 
 latent()

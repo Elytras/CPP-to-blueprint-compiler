@@ -1,4 +1,5 @@
 ﻿#pragma once
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -20,6 +21,7 @@ struct FDefaultValue
     std::string S;                      // Str: UTF-8, for StrProperty / NameProperty / TextProperty
     FIndex Object;                      // Obj: the asset an ObjectProperty points at
     std::vector<FDefaultValue> Items;   // Array (also a set / map): one value per element, typed by the property's Inner; a map alternates key, value
+    std::shared_ptr<std::vector<struct FPropertyDef>> Members;  // Struct, as a container's element: its own members (a lone struct's are FPropertyDef::Members)
 };
 
 /* One ChildProperties entry. ElementSize must equal the type's runtime size; the engine lays the struct out from it. */
@@ -109,11 +111,14 @@ public:
     void True();
     void False();
     void NoObject();
+    void NoInterface();
     void ObjectConst(FIndex Object);
     void SoftObjectConst(const std::string& Path);
     void DynamicCast(FIndex Class, const std::function<void(FScript&)>& Expr);
     /* EX_ObjToInterfaceCast / EX_CrossInterfaceCast / EX_InterfaceToObjCast / EX_DynamicCast: class, then the value. */
     void ClassCast(EExprToken Token, FIndex Class, const std::function<void(FScript&)>& Expr);
+    /* EX_PrimitiveCast: the ECastToken byte, then the value. */
+    void PrimitiveCast(ECastToken Cast, const std::function<void(FScript&)>& Expr);
     /* The object an EX_Context runs against, read out of an FScriptInterface. */
     void InterfaceContext(const std::function<void(FScript&)>& InterfaceExpr);
 
@@ -146,6 +151,9 @@ public:
     std::vector<int32> LatentResumes;
     /* The same for an await: the event that resumes lives in another function, so the offset is stored, not patched. */
     std::vector<std::shared_ptr<int32>> ResumeSinks;
+    /* `goto`: where each label landed, and the forward jumps still waiting for theirs. */
+    std::map<int32, int32> GotoLabelAt;
+    std::vector<std::pair<int32, int32>> GotoPatches;       // {label, patch position}
 
     void FieldPath(const std::string& PropertyName, FIndex Owner);
     void FieldPath(const std::vector<std::string>& Path, FIndex Owner);     // innermost first: {"Items", "Items"} is an array's element

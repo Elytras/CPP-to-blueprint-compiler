@@ -77,6 +77,17 @@ def script_of(base, function):
     raise SystemExit('%s: no such export' % function)
 
 
+def params_of(base, function):
+    """The function's parameters in order, the return value left out, read off dumpstruct.py's property lines."""
+    import os, re, subprocess
+    exports = dumpexp.load(base)[5]
+    idx = next(i for i, e in enumerate(exports) if e['name'] == function)
+    out = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dumpstruct.py'), base, str(idx)],
+                         capture_output=True, text=True).stdout
+    found = re.findall(r'^\s+\w+Property (\w+) .*? flags=(0x[0-9a-fA-F]+)', out, re.M)
+    return [name for name, flags in found if int(flags, 16) & 0x80 and not int(flags, 16) & 0x400]
+
+
 def i32(v): return (v + 2**31) % 2**32 - 2**31
 def idiv(a, b): q = abs(a) // abs(b); return q if (a < 0) == (b < 0) else -q
 
@@ -87,6 +98,7 @@ MATH = {
     'Less_IntInt': lambda a, b: a < b, 'Greater_IntInt': lambda a, b: a > b,
     'LessEqual_IntInt': lambda a, b: a <= b, 'GreaterEqual_IntInt': lambda a, b: a >= b,
     'EqualEqual_ByteByte': lambda a, b: a == b, 'EqualEqual_IntInt': lambda a, b: a == b, 'NotEqual_IntInt': lambda a, b: a != b,
+    'Conv_IntToBool': lambda a: a != 0,
     'Not_PreBool': lambda a: not a, 'BooleanAND': lambda a, b: a and b, 'BooleanOR': lambda a, b: a or b,
     'Add_FloatFloat': lambda a, b: a + b, 'Multiply_FloatFloat': lambda a, b: a * b,
     'Conv_IntToFloat': float, 'Not_Int': lambda a: ~a, 'Not_Int64': lambda a: ~a,
@@ -132,11 +144,16 @@ def run(base, function, self_vars=None, **parms):
         if o == 1: return self_vars.get(n.val, 0)
         if o in (0x1D, 0x1E, 0x24, 0x2C, 0x35, 0x21): return n.val
         if o == 0x42 and n.val == 'Value': return ev(n.kids[0])      # a nested container's wrapper is its Value
+        if o == 0x42:                                                # a struct is a dict; an unset member reads 0
+            s = ev(n.kids[0])
+            return s.get(n.val, 0) if isinstance(s, dict) else 0
         if o == 0x25: return 0
         if o == 0x26: return 1
         if o == 0x27: return True
         if o == 0x28: return False
         if o == 0x6B: return ev(n.kids[0])[ev(n.kids[1])]
+        if o in (0x1B, 0x45):                                        # the class's own function, by name: a frame of its own
+            return run(base, n.val, self_vars, **dict(zip(params_of(base, n.val), [copy.deepcopy(ev(a)) for a in n.kids])))[0]
         if o in (0x1C, 0x46, 0x68) and n.val in CONTAINERS: return CONTAINERS[n.val](ev, store, n.kids)
         if o in (0x1C, 0x46, 0x68):
             if n.val not in MATH: raise SystemExit('unsupported call ' + n.val)
@@ -151,6 +168,7 @@ def run(base, function, self_vars=None, **parms):
     def store(dest, v):
         v = copy.deepcopy(v)
         if dest.op == 0x42 and dest.val == 'Value': store(dest.kids[0], v)
+        elif dest.op == 0x42: _made(ev, store, dest.kids[0], {})[dest.val] = v
         elif dest.op in (0, 0x48): env[dest.val] = v
         elif dest.op == 1: self_vars[dest.val] = v
         elif dest.op == 0x6B: ev(dest.kids[0])[ev(dest.kids[1])] = v
@@ -180,7 +198,7 @@ def run(base, function, self_vars=None, **parms):
             r = n.kids[0]
             return (ev(r) if r.op != 0xB else None), env
         elif o == 0xB: pass
-        elif o in (0x1C, 0x46, 0x68): ev(n)
+        elif o in (0x1B, 0x45, 0x1C, 0x46, 0x68): ev(n)
         elif o == 0x53: raise SystemExit('ran off the end of the script')
         else: raise SystemExit('unsupported statement op %02x at mem %d' % (o, n.mem))
         pc = nxt
