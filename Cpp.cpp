@@ -6381,9 +6381,13 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     }
 
     /* A method that makes a latent call becomes a segment of ExecuteUbergraph_<Class> and keeps its name as a stub
-       event that jumps in, as the editor compiles an event graph. The latent action manager needs a world. */
-    const bool bCanLatent = std::find(Ancestry.begin(), Ancestry.end(), "Actor") != Ancestry.end()
-                         || std::find(Ancestry.begin(), Ancestry.end(), "ActorComponent") != Ancestry.end();
+       event that jumps in, as the editor compiles an event graph. Any class can: every BPGC object gets a persistent
+       frame (FObjectInitializer::PostConstructInit), and UWorld::Tick resumes every object's actions
+       (ProcessLatentActions(nullptr), LevelTick.cpp:1539), not only an actor's. What the call needs is a world, and
+       these find their own; any other object has one only through its Outer (UObject::GetWorld, Obj.cpp:846). The
+       editor hides Delay there for that reason alone (EdGraphSchema_K2.cpp:846, ImplementsGetWorld). */
+    const bool bHasOwnWorld = std::any_of(Ancestry.begin(), Ancestry.end(), [](const std::string& A) {
+        return A == "Actor" || A == "ActorComponent" || A == "UserWidget" || A == "GameInstance" || A == "Subsystem"; });
     struct FSegment
     {
         std::string Name;
@@ -6457,8 +6461,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         LatentCount = 0;
         Completions.clear();
         ActivatedActions.clear();
-        LatentRefusal = !bCanLatent ? "only an Actor or ActorComponent class has a world to resume in"
-                      : IsStaticDecl(Decl) ? "a static function has no ubergraph to resume in"
+        LatentRefusal = IsStaticDecl(Decl) ? "a static function has no object whose ubergraph frame could keep its locals"
                       : (!RetType.empty() && RetType != "void") || HasOutParm(Params)
                           ? "a function that resumes later returns nothing and takes no reference parameters"
                       : "";
@@ -6529,6 +6532,10 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
 
         if (bMadeLatentCall)
         {
+            if (!bHasOwnWorld)
+                printf("  warning: %s::%s waits, and an object of this class finds its world only through its Outer: make "
+                       "it with an actor or component as Outer, or the call does nothing and the function never resumes\n",
+                       R.CppName.c_str(), Fn.Name.c_str());
             if (bScratchNeeded)
             { *Err = R.CppName + "::" + Fn.Name + ": TODO: a pointer read in a function that makes a latent call"; return false; }
             FSegment Seg{ Fn.Name, Super, {}, Locals, Stmts, Flags, {}, Completions };

@@ -452,6 +452,13 @@ def latent():
         assert 'LetValueOnPersistentFrame ' + local in tool('walkscript.py', idx[ev]), ev
     assert 'InstanceDelegate     Load_OnLoaded_0' in tool('walkscript.py', idx['ExecuteUbergraph_LatentTest'])
     print('ok  LatentTest: ubergraph segments, resume linkage, stubs')
+    # A plain UObject waits the same way: its own ubergraph, the Delay on Self, a stub that jumps in.
+    base = os.path.join(os.path.dirname(base), 'LatentJob')
+    names = [e['name'] for e in dumpexp.load(base)[5]]
+    assert names == ['LatentJob_C', 'Default__LatentJob_C', 'ExecuteUbergraph_LatentJob', 'Run'], names
+    tool = lambda t, i: subprocess.run([sys.executable, os.path.join(here, t), base, str(i)], capture_output=True, text=True).stdout
+    assert re.search(r"Function'Delay'\s+.*Self", tool('walkscript.py', 2)) and 'LetValueOnPersistentFrame Run_Seconds' in tool('walkscript.py', 3)
+    print('ok  LatentTest: a UObject class makes a latent call too')
 
 
 latent()
