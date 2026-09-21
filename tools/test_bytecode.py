@@ -388,6 +388,23 @@ def engine_names():
     print('ok  NameTest: a const member is BlueprintReadOnly')
 
 
+def parent_call():
+    """`SuperBase::Bump(...)` inside the override of Bump: the parent's function, called final - not Bump by name."""
+    import subprocess
+    here = os.path.dirname(os.path.abspath(__file__))
+    base = os.path.join(os.path.dirname(asset('SuperTest')), 'SuperTest')
+    exports = [e['name'] for e in dumpexp.load(base)[5]]
+    walk = lambda fn: subprocess.run([sys.executable, os.path.join(here, 'walkscript.py'), base, str(exports.index(fn))],
+                                     capture_output=True, text=True).stdout
+    for fn in ('Bump', 'ReceiveBeginPlay'):
+        w = walk(fn)
+        assert "FinalFunction" in w and "Function'%s'" % fn in w, w
+        assert 'VirtualFunction' not in w, w     # LocalVirtualFunction too: either would re-enter this override
+    # An unqualified call of a method this class does not redeclare stays a call by name, so a subclass can override it.
+    assert 'VirtualFunction' in walk('Thrice') and 'FinalFunction' not in walk('Thrice'), walk('Thrice')
+    print('ok  SuperTest: Base::Method() is a final call on the parent\'s function')
+
+
 def api_stub():
     """The editor API stub (--api) of NameTest: what a Blueprint author sees of a mod class."""
     import subprocess, tempfile
@@ -415,6 +432,7 @@ def api_stub():
 mod_enum()
 constants()
 engine_names()
+parent_call()
 api_stub()
 check('TypesTest', 'Cpp20', lambda M, N: {0: N + N, 5: N + fnv('angry')}.get(M, fnv('types')), [dict(M=m, N=n) for m in (0, 5, 6) for n in (-2, 9)])
 check('TypesTest', 'ConstSum', lambda N: N * 3 + 12 + 19, [dict(N=n) for n in (-4, 0, 9)])

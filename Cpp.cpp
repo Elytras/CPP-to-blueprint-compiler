@@ -3524,7 +3524,22 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
                                 R->CppName + "::" + MethodName, true, BP, Out, Err);
         }
 
-        if (!R->IsNative() && !bStatic)
+        /* `Base::Method()` on this, from a class that declares Method itself. C++ name hiding leaves only the qualified
+           spelling to reach the ancestor's (clang's JSON drops the qualifier, the referenced decl's owner keeps it), and
+           it means THAT implementation: the editor's "call to parent function", EX_FinalFunction on the parent's own
+           UFunction (K2Node_CallParentFunction) - which Out.Fn below already is. By name the call would come straight
+           back to the override making it, forever: a shipping build has no script recursion guard. A native ancestor's
+           takes the final form anyway. */
+        bool bParentCall = false;
+        if (Cur && R != Cur && Kind(CallExprNode) == "CXXMemberCallExpr")
+        {
+            const Json* Callee = Strip(First(CallExprNode));
+            const Json* Obj = Callee ? Strip(First(*Callee)) : nullptr;
+            if (Obj && Kind(*Obj) == "CXXThisExpr")
+                for (const FRecord* A = Cur; A && A != R && !bParentCall; A = A->Base.empty() ? nullptr : Find(A->Base))
+                    bParentCall = A->Methods.count(MethodName) != 0;
+        }
+        if (!R->IsNative() && !bStatic && !bParentCall)
         {
             Out.VirtualName = UeNameOf(R, MethodName);      // an override of `Set is Extruded` is found by that name
             /* KismetCompilerVMBackend.cpp picks the local form unless the callee is native, a net function, authority
