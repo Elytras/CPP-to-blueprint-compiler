@@ -2,6 +2,7 @@
 """usage: genueapi.py <SDK dir> <output dir>      e.g. DrgMods/SDK/SDK  BpMods/UeApi"""
 import collections
 import io
+import json
 import os
 import re
 import sys
@@ -176,6 +177,7 @@ def parse_structs(path, pkg):
             cur_struct, cur_enum = None, None
             if pending and pending[0] == "enum" and "/" not in pending[1]:
                 cur_enum = ENUMS[m.group(1)] = Enum(m.group(1), pkg, m.group(2))
+                cur_enum.ue_name = pending[2]     # `TextureGroup`, where Dumper-7 says ETextureGroup
             pending = None
             continue
         m = STRUCT_DECL.match(line)
@@ -350,7 +352,7 @@ def write_types(out_dir):
     rows = ['{', '  "enums": {']
     ens = sorted(ENUMS.values(), key=lambda e: e.cpp)
     rows += ['    "%s": {"package": "/Script/%s", "name": "%s", "underlying": "%s", "first": "%s"}%s'
-             % (e.cpp, e.pkg, e.cpp, e.underlying, e.values[0][0] if e.values else "", "," if i + 1 < len(ens) else "")
+             % (e.cpp, e.pkg, e.ue_name, e.underlying, e.values[0][0] if e.values else "", "," if i + 1 < len(ens) else "")
              for i, e in enumerate(ens)]
     rows += ['  },', '  "structs": {']
     sts = sorted(STRUCTS.values(), key=lambda t: t.cpp)
@@ -399,20 +401,100 @@ def parse_params(text):
     return out
 
 
+# ---- engine names --------------------------------------------------------------------------------------------
+# Dumper-7 respells what C++ cannot say. A member that collides with an inherited one gets a tail (a Blueprint
+# class's `Name` is `Name_0`, the SDK's UObject having a Name; `UberGraphFrame_<Class>`), a character C++ has no use
+# for becomes `_` (`Audio Flying` -> `Audio_Flying`), a leading digit becomes a word (`3P_MugScale` ->
+# `ThreeP_MugScale`). The engine knows a property or a function by its own name only, and a real name may end in
+# `_<digits>` too (`Tier_1`, `Banner_16_9`), so no rule can undo the respelling. A header says the real name beside
+# the member it differs for:
+#     static constexpr const char* Name_0__UeName = "Name";
+# and AssetGen cooks through it. Members: the dump's GObjects-Dump-WithProperties.txt lists every class with its
+# properties, offset first. Functions: <Pkg>_functions.cpp names the real one above each wrapper.
+DUMP_PROPERTY = re.compile(r"^\[([0-9A-Fa-f]{8})\] \{0x[0-9A-Fa-f]+\}     (\S+) (.*)$")     # test first: an object line matches too
+DUMP_OBJECT = re.compile(r"^\[[0-9A-Fa-f]{8}\] \{0x[0-9A-Fa-f]+\} (\S+) (.*)$")
+FIELD_OFFSET = re.compile(r"^\s*0x([0-9A-Fa-f]+)\(0x[0-9A-Fa-f]+\)\(")
+REAL_FIELDS = {}     # "<class path>.<class name>" -> {offset: [property names, in the dump's order]}
+REAL_FUNCS = {}      # (SDK file stem, Dumper-7's class spelling, its function spelling) -> the engine's function name
+NUMBER_WORDS = ("Zero", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine")
+
+
+def read_real_fields(sdk_dir):
+    path = os.path.join(sdk_dir, "..", "..", "GObjects-Dump-WithProperties.txt")
+    if not os.path.exists(path):
+        print("  no %s: a member Dumper-7 respelled will be cooked by its C++ name" % os.path.normpath(path))
+        return
+    cur = None
+    for line in io.open(path, encoding="utf-8", errors="replace"):
+        if not line.startswith("["):
+            continue
+        m = DUMP_PROPERTY.match(line)
+        if m:
+            if cur is not None:
+                cur.setdefault(int(m.group(1), 16), []).append(m.group(3).rstrip("\r\n"))
+            continue
+        m = DUMP_OBJECT.match(line)
+        cur = REAL_FIELDS.setdefault(m.group(2).rstrip("\r\n"), {}) if m and m.group(1).endswith("Class") else None
+
+
+def dumper_spelling(real):
+    """MakeNameValid (Dumper-7 UnrealTypes.cpp), then the fork's strip of a Blueprint field's `_<n>_<guid>` tail."""
+    if real and real[0] in "0123456789":
+        real = NUMBER_WORDS[int(real[0])] + real[1:]
+    valid = "".join(c if ("a" + c).isidentifier() else "_" for c in real)
+    return re.sub(r"_\d+_[0-9A-Fa-f]{32}$", "", {"bool": "Bool", "NULL": "NULLL"}.get(valid, valid))
+
+
+def real_field(k, fname):
+    """The engine's name of member `fname` of k, or None where it is the C++ spelling (or cannot be told)."""
+    at = k.offsets.get(fname)
+    names = REAL_FIELDS.get(k.path + "." + k.ue_name, {}).get(at[0] if at else -1, [])
+    real = names[at[1]] if at and at[1] < len(names) else None
+    if not real or real == fname:
+        return None
+    # The offset is the join; this is its control. A name the respelling rules do not explain means the SDK and the
+    # object dump are not of one run, and then no name is better than a wrong one.
+    stem = dumper_spelling(real)
+    if fname != stem and not fname.startswith(stem + "_"):
+        UNEXPLAINED.append("%s.%s <- %s" % (k.ue_name, fname, real))
+        return None
+    return real
+
+
+UNEXPLAINED = []
+
+
+def c_literal(s):
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
 def parse_field(cur, m, skipped):
     raw, fname, bits = m.group(1), m.group(2), m.group(3)
     if fname.startswith(("Pad_", "BitPad_")):
         return
+    flags = m.string[m.end():]
+    # The SDK's own view of UObject / UStruct / UClass (Index, Class, Name, Outer ...): no FProperty stands behind
+    # one, so bytecode cannot name it.
+    if "NOT AUTO-GENERATED PROPERTY" in flags:
+        return
+    off = FIELD_OFFSET.match(flags)
+    if off:
+        # Bitfield bools share a byte: the ordinal among the members at one offset tells them apart.
+        at = int(off.group(1), 16)
+        cur.offsets[fname] = (at, sum(1 for o, _ in cur.offsets.values() if o == at))
     mapped = "bool" if bits else map_type(raw)
     if mapped in KINDS or mapped == "void":
         skipped[mapped if mapped in KINDS else "other"] += 1
         return
     cur.fields.append((mapped, fname))
-    # Dumper-7's flag comment: `Net` marks a replicated property; our fork appends `RepNotifyFunc=<Function>`.
-    flags = m.string[m.end():]
+    # Dumper-7's flag comment: `Net` marks a replicated property; our fork appends `RepNotifyFunc=<Function>` (the
+    # engine's name, which may hold a space) and, for a Blueprint component variable, `ScsNode=<guid>`.
     if re.search(r"\bNet\b", flags):
-        notify = re.search(r"RepNotifyFunc=(\w+)", flags)
+        notify = re.search(r"RepNotifyFunc=(.+?)(?:, ScsNode=|\)\s*$)", flags)
         cur.replicated[fname] = notify.group(1) if notify else ""
+    node = re.search(r"ScsNode=([0-9a-f]{32})", flags)
+    if node:
+        cur.scs_nodes[fname] = node.group(1)
 
 
 class Klass(object):
@@ -430,6 +512,9 @@ class Klass(object):
         self.raw_funcs = []      # (return, name, params) as Dumper-7 spelled them, before any mapping
         self.fields = []
         self.replicated = {}     # field -> its RepNotify function, "" when none (or the dump predates the name)
+        self.offsets = {}        # field -> (offset, ordinal among the members at that offset): the join to REAL_FIELDS
+        self.scs_nodes = {}      # component variable -> its SCS node's VariableGuid, 32 hex digits
+        self.stem = ""           # the SDK file it came from: <stem>_classes.hpp pairs with <stem>_functions.cpp
 
 
 def parse_header(path):
@@ -605,15 +690,20 @@ def write_events(sdk_dir, out_dir):
     rows = []
     for name in sorted(f for f in os.listdir(sdk_dir) if f.endswith("_functions.cpp")):
         text = io.open(os.path.join(sdk_dir, name), encoding="utf-8", errors="replace").read()
-        for m in re.finditer(r"^// Function ([\w\.]+)\n// \(([^)]*)\)", text, re.M):
-            names = m.group(2).split(", ")
+        stem = name[: -len("_functions.cpp")]
+        # "// Function Pkg.Class.Real Name", its flags, an optional parameter block, then the wrapper Dumper-7 spelled.
+        # The real name is everything after the second dot: it may hold spaces, and dots of its own.
+        for m in re.finditer(r"^// Function ([^.\n]+)\.([^.\n]+)\.([^\n]+)\n// \(([^)]*)\)\n(?:(?://[^\n]*)?\n)*"
+                             r"[^\n(]*?((?:\w+::)*\w+)::(\w+)\(", text, re.M):
+            pkg, cls, real, names = m.group(1), m.group(2), m.group(3).rstrip(), m.group(4).split(", ")
+            REAL_FUNCS[(stem, m.group(5), m.group(6))] = real
             if "BlueprintPure" in names:
-                PURE.add(tuple(m.group(1).split(".")[-2:]))
+                PURE.add((cls, real))
             marks = "".join(mark + " " for flag, mark in MARK_OF if flag in names)
             if marks:
-                MARKS[tuple(m.group(1).split(".")[-2:])] = marks
+                MARKS[(cls, real)] = marks
             if "BlueprintEvent" in names:
-                rows.append('  "%s": %d' % (m.group(1), sum(FUNC_BITS[n] for n in names)))
+                rows.append('  %s: %d' % (json.dumps("%s.%s.%s" % (pkg, cls, real)), sum(FUNC_BITS[n] for n in names)))
     io.open(os.path.join(out_dir, "Events.json"), "w", encoding="utf-8", newline="\n").write("{\n" + ",\n".join(rows) + "\n}\n")
     print("  events: %d" % len(rows))
 
@@ -671,11 +761,13 @@ def main():
     own = ("/Game/_ElytrasMods/_NestedContainerStructs/",) + tuple(sorted(set(
         m + "/" for f in os.listdir(mod_dir) if f.endswith((".cpp", ".h"))
         for m in re.findall(r'UE_MOD_PACKAGE\("([^"]+)"', io.open(os.path.join(mod_dir, f), encoding="utf-8-sig").read()))))
+    read_real_fields(sdk_dir)
     for name in headers:
         found, skipped, _ = parse_header(os.path.join(sdk_dir, name))
         if not found:
             continue
         for k in found:
+            k.stem = name[: -len("_classes.hpp")]
             if not k.is_bp:
                 k.path = "/Script/" + name[: -len("_classes.hpp")]
         # Our own cooked mods (ReadProperty, the tests) show up in a dump taken with them loaded; their C++ is the source.
@@ -789,7 +881,15 @@ def main():
         taken = set(n for _, n in k.fields) | set(f for _, _, f, _ in k.funcs) | {k.ue_name, k.cpp}
         return dict((leaf, next(iter(e))) for leaf, e in found.items() if len(e) == 1 and leaf not in taken)
 
-    funcs, fields, aliased = 0, 0, 0
+    # `namespace A { namespace B {`, not C++17's `namespace A::B {`: an editor parsing at an older standard (a Visual
+    # Studio project's default) takes the short form for an error and then knows none of the classes.
+    def ns_begin(ns):
+        return "namespace " + " { namespace ".join(ns.split("::")) + " {"
+
+    def ns_end(ns):
+        return "}" * (ns.count("::") + 1) + "   // namespace " + ns
+
+    funcs, fields, aliased, renamed, not_ufunctions = 0, 0, 0, 0, []
     for pkg, members in sorted(by_pkg.items()):
         body, referenced = [], set()
         defined = set(k.cpp for k in members)
@@ -812,9 +912,9 @@ def main():
         for k in members:
             if k.ns != ns_open:
                 if ns_open:
-                    body.append("}   // namespace %s\n" % ns_open)
+                    body.append(ns_end(ns_open) + "\n")
                 if k.ns:
-                    body.append("namespace %s {\n" % k.ns)
+                    body.append(ns_begin(k.ns) + "\n")
                 ns_open = k.ns
             base = by_name[k.base].emit if k.base else ""
             inherits = " : public %s" % base if base else ""
@@ -827,6 +927,13 @@ def main():
                 if fname in names:
                     continue
                 body.append("    %s %s;" % (rewrite(ftype, short, k), fname))
+                real = real_field(k, fname)
+                if real:
+                    body.append('    static constexpr const char* %s__UeName = "%s";' % (fname, c_literal(real)))
+                    renamed += 1
+                if fname in k.scs_nodes:
+                    # The key a child Blueprint overrides this component's template by (FComponentKey::AssociatedGuid).
+                    body.append('    static constexpr const char* %s__UeScsNode = "%s";' % (fname, k.scs_nodes[fname]))
                 if fname in k.replicated:
                     # What UE_REPLICATED_USING declares for a mod class: AssetGen wakes the actor before a set and
                     # calls the RepNotify function after it, as the editor's Set node does.
@@ -836,6 +943,12 @@ def main():
             for is_static, ret, fname, params in k.funcs:
                 if is_container_method(k, fname):
                     continue
+                # No "// Function" stands above it: one of the SDK's own helpers (IsA, GetFunction ...), not a UFunction.
+                real_fn = REAL_FUNCS.get((k.stem, k.cpp, fname))
+                if real_fn is None and REAL_FUNCS:
+                    not_ufunctions.append("%s::%s" % (k.ue_name, fname))
+                    continue
+                real_fn = real_fn or fname
                 # A Blueprint hides the world context pin and wires it to self; the overload without
                 # it is how a mod does the same, and AssetGen fills the argument back in.
                 variants = [params]
@@ -857,20 +970,23 @@ def main():
                                      for r, v in variants if r == "void" and not any(p[0] in latent for p in v)]
                 # UE_PURE lets AssetGen drop a discarded call and reuse a repeated one; a function that answers through
                 # a reference parameter (or returns void, so its answer can only be an out-parameter) is left unmarked.
-                pure = (ret != "void" and (k.ue_name, fname) in PURE and not IMPURE_PURE.search(fname)
+                pure = (ret != "void" and (k.ue_name, real_fn) in PURE and not IMPURE_PURE.search(fname)
                         and not any(t.endswith("&") and not t.startswith("const ") for t, _ in params))
                 for vret, plist in variants:
                     args = ", ".join("%s %s" % (rewrite(t, short, k), n) for t, n in plist)
-                    body.append("    %s%s%s%s %s(%s)%s;" % (MARKS.get((k.ue_name, fname), ""),
+                    body.append("    %s%s%s%s %s(%s)%s;" % (MARKS.get((k.ue_name, real_fn), ""),
                                                              "UE_PURE " if pure else "", "static " if is_static else "",
                                                            rewrite(vret, short, k), fname, args,
                                                            " const" if fname in k.const_funcs else ""))
+                if real_fn != fname:
+                    body.append('    static constexpr const char* %s__UeName = "%s";' % (fname, c_literal(real_fn)))
+                    renamed += 1
                 funcs += 1
                 for t in [ret] + [t for t, _ in params]:
                     referenced.update(class_refs(t))
             body.append("};\n")
         if ns_open:
-            body.append("}   // namespace %s\n" % ns_open)
+            body.append(ns_end(ns_open) + "\n")
 
         body += ops_by_pkg.get(pkg, [])
 
@@ -899,7 +1015,7 @@ def main():
                 fwd.setdefault(target.ns, []).append(target.ue_name if target.is_bp else target.cpp)
         for ns in sorted(fwd):
             decls = ["class %s;" % n for n in fwd[ns]]
-            out += ["namespace %s { %s }" % (ns, " ".join(decls))] if ns else decls
+            out += ["%s %s %s" % (ns_begin(ns), " ".join(decls), "}" * (ns.count("::") + 1))] if ns else decls
         if fwd:
             out += [""]
         out += body
@@ -938,6 +1054,12 @@ def main():
     print("UeApi: %d classes, %d functions, %d properties, %d headers"
           % (len(ordered), funcs, fields, len(by_pkg)))
     print("  blueprint classes: %d, of which %d reachable unqualified" % (len(bp), aliased))
+    print("  respelled by Dumper-7 and named back (__UeName): %d" % renamed)
+    if UNEXPLAINED:
+        print("  NOT named back, the respelling rules do not explain them (is the object dump of the same run?): %d, e.g. %s"
+              % (len(UNEXPLAINED), "; ".join(UNEXPLAINED[:5])))
+    if not_ufunctions:
+        print("  SDK helpers left out, no UFunction behind them: %d (%s ...)" % (len(not_ufunctions), ", ".join(not_ufunctions[:4])))
     print("  out of reach: " + reach)
     if pathless:
         print("  blueprint classes dropped for want of a /Game path: %d"

@@ -361,8 +361,25 @@ def constants():
     print('ok  StringTest: "lit" + N and N + "lit" are Concat_StrStr, not pointer arithmetic')
 
 
+def engine_names():
+    import re, subprocess
+    here = os.path.dirname(os.path.abspath(__file__))
+    base = asset('NameTest')
+    loaded = dumpexp.load(base)
+    exports = [e['name'] for e in loaded[5]]
+    tool = lambda t, i: subprocess.run([sys.executable, os.path.join(here, t), base, str(i)], capture_output=True, text=True).stdout
+    cdo = tool('dumptags.py', exports.index('Default__NameTest_C'))
+    assert 'Index [0] IntProperty size=4: 7' in cdo and re.search(r"Name \[0\] StrProperty size=\d+: 'Karl'", cdo), cdo
+    # SplitName would have made FName(Index, 1) of the C++ spelling: neither it nor the spelling may be in the package.
+    assert 'Index_0' not in loaded[3] and 'Name_0' not in loaded[3], [n for n in loaded[3] if n.endswith('_0')]
+    walk = tool('walkscript.py', exports.index('Next'))
+    assert re.search(r"InstanceVariable\s+Index@imp\[\d+\]:Class'FSDSaveGame'", walk) and 'Index_0' not in walk, walk
+    print('ok  NameTest: a member Dumper-7 respelled is cooked by the engine\'s name (tag and bytecode)')
+
+
 mod_enum()
 constants()
+engine_names()
 check('TypesTest', 'Cpp20', lambda M, N: {0: N + N, 5: N + fnv('angry')}.get(M, fnv('types')), [dict(M=m, N=n) for m in (0, 5, 6) for n in (-2, 9)])
 check('TypesTest', 'ConstSum', lambda N: N * 3 + 12 + 19, [dict(N=n) for n in (-4, 0, 9)])
 check('TypesTest', 'HalfOf', lambda V: V * 0.5, [dict(V=v) for v in (-3.0, 0.0, 8.0)])

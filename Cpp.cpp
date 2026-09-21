@@ -327,6 +327,10 @@ struct FRecord
     std::vector<std::string> Interfaces;            // every base after the first
     std::map<std::string, std::string> Replicated;  // UE_REPLICATED*: variable -> "Notify:Condition"
     std::set<std::string> Components;               // UE_COMPONENT: variables that are also SCS nodes
+    /* genueapi's `<X>__UeName`: the engine's name of a member or function Dumper-7 had to respell (`Name_0` is
+       `Name`, `Audio_Flying` is `Audio Flying`). C++ keeps its spelling; everything cooked goes through UeNameOf. */
+    std::map<std::string, std::string> UeNames;
+    std::map<std::string, std::string> ScsNodes;    // `<X>__UeScsNode`: a game Blueprint's component -> its node's guid, 32 hex
     std::map<std::string, std::string> TypeAliases; // `using Leaf = Game::...::Leaf;` in the class body
     const Json* Defaults = nullptr;                 // UE_DEFAULTS: the static-init block, never lowered
     bool bIsLocal = false;      // UePackage == ModPackage/CppName: cooked here, published at its /Game path
@@ -1008,6 +1012,27 @@ private:
 
     /* Records are keyed by qualified name; Bare holds only leaf names exactly one class claims,
        so an ambiguous bare name fails instead of picking the last class collected. */
+    /* The engine's name for the member or function C++ spells `Cpp`, as seen from R: R's own marker, else an
+       ancestor's or an interface's. A mod's own names have no marker and are their C++ spelling; Dumper-7 keeps a
+       spelling unique along a class chain, so the first marker found is the one. */
+    std::string UeNameOf(const FRecord* R, const std::string& Cpp, int Depth = 0) const
+    {
+        for (; R && Depth < 64; R = R->Base.empty() ? nullptr : Find(R->Base), ++Depth)
+        {
+            if (auto It = R->UeNames.find(Cpp); It != R->UeNames.end()) return It->second;
+            for (const std::string& I : R->Interfaces)
+                if (const FRecord* IR = Find(I); IR && IR != R)
+                    if (std::string Ue = UeNameOf(IR, Cpp, Depth + 1); Ue != Cpp) return Ue;
+        }
+        return Cpp;
+    }
+    /* And back, within one record: the C++ spelling of the function the engine calls `Ue`. */
+    static std::string CppNameOf(const FRecord& R, const std::string& Ue)
+    {
+        for (const auto& N : R.UeNames) if (N.second == Ue) return N.first;
+        return Ue;
+    }
+
     const FRecord* Find(const std::string& CppName) const
     {
         auto It = Records.find(CppName);
@@ -1568,6 +1593,16 @@ bool FCompiler::Collect(std::string* Err)
                     R.UeName = R.CppName;
                 }
             }
+            else if (Kind(C) == "VarDecl" && Name(C).size() > 8 && Name(C).compare(Name(C).size() - 8, 8, "__UeName") == 0)
+            {
+                std::string Real;
+                if (FindLiteral(C, Real)) R.UeNames[Name(C).substr(0, Name(C).size() - 8)] = Real;
+            }
+            else if (Kind(C) == "VarDecl" && Name(C).size() > 11 && Name(C).compare(Name(C).size() - 11, 11, "__UeScsNode") == 0)
+            {
+                std::string Guid;
+                if (FindLiteral(C, Guid)) R.ScsNodes[Name(C).substr(0, Name(C).size() - 11)] = Guid;
+            }
             else if (Kind(C) == "VarDecl" && Name(C).size() > 12 && Name(C).compare(Name(C).size() - 12, 12, "__Replicated") == 0)
             {
                 std::string Spec;
@@ -1598,6 +1633,13 @@ bool FCompiler::Collect(std::string* Err)
             else if ((Kind(C) == "TypeAliasDecl" || Kind(C) == "TypedefDecl") && C.contains("name"))
                 R.TypeAliases[Name(C)] = StripTypeKeywords(TypeOf(C));
         });
+        /* A set is looked up in Replicated by the name it is cooked under, so the marker's C++ key follows. */
+        for (const auto& N2 : R.UeNames)
+            if (auto Rep = R.Replicated.find(N2.first); Rep != R.Replicated.end())
+            {
+                R.Replicated[N2.second] = Rep->second;
+                R.Replicated.erase(N2.first);
+            }
         /* genueapi opens a Blueprint class with `using JSONValue_C = Game::...::JSONValue_C;` so its signatures stay
            readable, and a mod class deriving it writes `JSONValue_C*` through the same names. The nearer one wins. */
         std::map<std::string, std::string> InScope = R.TypeAliases;
@@ -1664,12 +1706,14 @@ FIndex FCompiler::FindEvent(FBlueprintClass& BP, const std::string& FromRecord, 
                             uint32* InheritedFlags, bool bFlagsOnly)
 {
     /* Events.json keys a function by its package's last path segment, as Dumper-7's comments name it. */
-    auto FlagsOf = [&](const FRecord& R) {
-        auto It = EventFlags.find(R.UePackage.substr(R.UePackage.rfind('/') + 1) + "." + R.UeName + "." + Method);
-        return It == EventFlags.end() ? uint32(0) : It->second;
-    };
     *InheritedFlags = 0;
     const FRecord* Self = Find(FromRecord);
+    /* Events.json and the Super import know the function by the engine's name (`Set is Extruded`). */
+    const std::string UeMethod = UeNameOf(Self, Method);
+    auto FlagsOf = [&](const FRecord& R) {
+        auto It = EventFlags.find(R.UePackage.substr(R.UePackage.rfind('/') + 1) + "." + R.UeName + "." + UeMethod);
+        return It == EventFlags.end() ? uint32(0) : It->second;
+    };
     for (const FRecord* R = Self; R; R = R->Base.empty() ? nullptr : Find(R->Base))
     {
         /* A mod ancestor's function is a super like a native one, and the nearest wins, as the Kismet compiler takes
@@ -1679,12 +1723,12 @@ FIndex FCompiler::FindEvent(FBlueprintClass& BP, const std::string& FromRecord, 
             if (auto M = R->Methods.find(Method); M != R->Methods.end() && !IsStaticDecl(*M->second) && !IsInlineMethod(*R, Method))
             {
                 *InheritedFlags = ModMethodFlags(*R, Method, BP);
-                return bFlagsOnly ? Null() : BP.EngineFunction(ModPackage + "/" + R->CppName, R->CppName + "_C", Method);
+                return bFlagsOnly ? Null() : BP.EngineFunction(ModPackage + "/" + R->CppName, R->CppName + "_C", UeMethod);
             }
         if (R->IsNative() && R->Methods.count(Method))
         {
             *InheritedFlags = FlagsOf(*R);
-            return bFlagsOnly ? Null() : BP.EngineFunction(R->UePackage, R->UeName, Method);
+            return bFlagsOnly ? Null() : BP.EngineFunction(R->UePackage, R->UeName, UeMethod);
         }
         /* Measured on BP_SentryGun_MoveMarker: an interface implementation has no Super. */
         for (const std::string& I : R->Interfaces)
@@ -2107,7 +2151,7 @@ bool FCompiler::LowerMakeStruct(const std::string& Type, const Json* List, FBlue
             FStmtIR Set;
             Set.K = FStmtIR::Assign;
             Set.Var.K = FArgIR::Member;
-            Set.Var.S = bPlainName ? Name(F) : ModFieldName(ModPackage + "/" + R->CppName, Name(F));
+            Set.Var.S = bPlainName ? UeNameOf(R, Name(F)) : ModFieldName(ModPackage + "/" + R->CppName, Name(F));
             Set.Var.Owner = Struct;
             Set.Var.LetOp = LetOpFor(TypeOf(F));
             Set.Var.Base = std::make_shared<FArgIR>();
@@ -2144,7 +2188,7 @@ bool FCompiler::LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& 
         if (!ObjRaw) { *Err = "struct member access with no object: " + Name(MemberNode); return false; }
         Out.K = FArgIR::Member;
         Out.S = (R->IsNative() || IsInternalViewStruct(R->CppName))
-                    ? Name(MemberNode)
+                    ? UeNameOf(R, Name(MemberNode))
                     : ModFieldName(ModPackage + "/" + R->CppName, Name(MemberNode));
         Out.Owner = R->IsNative() ? BP.ScriptStruct(R->UePackage, R->UeName)
                                   : BP.ScriptStruct(ModPackage + "/" + R->CppName, R->CppName);
@@ -2186,7 +2230,7 @@ bool FCompiler::LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& 
     /* A sibling class of this mod (a data asset's, a local parent's) is imported the way a UE_CLASS one from
        another mod is. */
     Out.K = FArgIR::Field;
-    Out.S = Name(MemberNode);
+    Out.S = UeNameOf(R, Name(MemberNode));      // `Name_0` is the engine's `Name`: see FRecord::UeNames
     Out.Owner = R->IsNative() ? BP.PropertyOwner(R->UePackage, R->UeName)
               : R == Cur      ? BP.ClassIndex()
                               : BP.PropertyOwner(ModPackage + "/" + R->CppName, R->CppName + "_C");
@@ -2207,7 +2251,7 @@ bool FCompiler::LowerDelegateValue(const Json& Obj, const Json& Fn, FArgIR& Out,
     if (F && Kind(*F) == "UnaryOperator" && F->value("opcode", std::string()) == "&") F = Strip(First(*F));
     if (!F || Kind(*F) != "DeclRefExpr") { *Err = "a delegate binds `&Class::Function`"; return false; }
     Out.K = FArgIR::Delegate;
-    Out.S = (*F)["referencedDecl"].value("name", std::string());
+    Out.S = UeNameOf(Cur, (*F)["referencedDecl"].value("name", std::string()));     // found on self by name at run time
     return true;
 }
 
@@ -2615,7 +2659,7 @@ bool FCompiler::LowerAddress(const Json& Lvalue, FBlueprintClass& BP, FArgIR& Ou
         Out.Sub->Context = BP.ClassDefaultObject(Pkg, Cls);
         FArgIR Name, Wco;
         Name.K = FArgIR::Name;
-        Name.S = N->value("name", std::string());
+        Name.S = UeNameOf(Owner, N->value("name", std::string()));      // FindPropertyByName, at run time
         if (!CurrentWco.empty()) { Wco.K = FArgIR::Local; Wco.S = CurrentWco; }
         Out.Sub->Args = { Obj, Name, Wco };
         *Pointee = StripTypeKeywords(TypeOf(*N));
@@ -2835,7 +2879,11 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         Out.Sub->Target = std::make_shared<FArgIR>();
         if (!LowerArg(*Obj, BP, *Out.Sub->Target, Err)) return false;
         /* Through an interface the implementation is found by name, as the Blueprint compiler calls it. */
-        if (Out.Sub->Target->K == FArgIR::InterfaceCtx) Out.Sub->VirtualName = Name(*Callee);
+        if (Out.Sub->Target->K == FArgIR::InterfaceCtx)
+        {
+            auto Owner = MethodOwner.find(Callee->value("referencedMemberDecl", std::string()));
+            Out.Sub->VirtualName = UeNameOf(Owner == MethodOwner.end() ? nullptr : Find(Owner->second), Name(*Callee));
+        }
         return true;
     }
     if (K == "CXXOperatorCallExpr")
@@ -3448,7 +3496,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
 
         if (!R->IsNative() && !bStatic)
         {
-            Out.VirtualName = MethodName;
+            Out.VirtualName = UeNameOf(R, MethodName);      // an override of `Set is Extruded` is found by that name
             /* KismetCompilerVMBackend.cpp picks the local form unless the callee is native, a net function, authority
                only or cosmetic. A method declared only by mod classes, without an RPC marker, is none of those; an
                override of a native function keeps whatever flags it inherits, so it stays EX_VirtualFunction. */
@@ -3468,7 +3516,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
                                                         : ModPackage + "/" + R->CppName;
         const std::string CalleeName    = R->IsNative() ? R->UeName
                                                         : R->CppName + "_C";
-        Out.Fn = BP.EngineFunction(CalleePackage, CalleeName, MethodName);
+        Out.Fn = BP.EngineFunction(CalleePackage, CalleeName, UeNameOf(R, MethodName));
         Out.bScript = CalleePackage.compare(0, 6, "/Game/") == 0;
         Out.bInstance = !bStatic;
         /* A Blueprint static needs the CDO context; EX_CallMath finds it itself for a native. */
@@ -5466,15 +5514,22 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
     {
         const bool bEnumKey = !PD.Inner->StructName.empty();
         const FPropertyDef& EnumSide = bEnumKey ? *PD.Inner : *PD.Value;
+        /* StructName is the engine's name (`TextureGroup`); the declaration is found by the C++ one (`ETextureGroup`). */
+        std::string CppEnum = EnumSide.StructName;
+        for (const auto& E : Enums) if (E.second.UeName == EnumSide.StructName) CppEnum = E.first;
         const std::vector<std::pair<std::string, int64>>* Names = nullptr;
         for (const auto& E : EnumDecls)
-            if (E.first == EnumSide.StructName || (E.first.size() > EnumSide.StructName.size() + 2
-                && E.first.compare(E.first.size() - EnumSide.StructName.size() - 2, std::string::npos, "::" + EnumSide.StructName) == 0))
+            if (E.first == CppEnum || (E.first.size() > CppEnum.size() + 2
+                && E.first.compare(E.first.size() - CppEnum.size() - 2, std::string::npos, "::" + CppEnum) == 0))
                 Names = &E.second;
         if (!Names || EnumSide.StructName.empty()) { *Err = "UE_ENUM_MAP: " + Name(F) + " is not a map over an enum"; return false; }
         for (const auto& Entry : *Names)
         {
             /* UHT's and the cooker's own closing enumerator is not one of the enum's values. */
+            /* `PF_MAX_0` is Dumper-7's spelling of a PF_MAX that collided. */
+            std::string Closer = Entry.first;
+            while (!Closer.empty() && std::isdigit(uint8(Closer.back()))) Closer.pop_back();
+            if (Closer.size() > 5 && Closer.back() == '_' && Closer.compare(Closer.size() - 5, 5, "_MAX_") == 0) continue;
             if (Entry.first.size() > 4 && Entry.first.compare(Entry.first.size() - 4, 4, "_MAX") == 0) continue;
             FDefaultValue Enum, Text;
             Enum.K = Text.K = FDefaultValue::Str;
@@ -5546,7 +5601,7 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
         for (size_t I = 0; I < Args.size(); ++I)
         {
             FPropertyDef MD;
-            const std::string MName = Name(*SR->Fields[I]);
+            const std::string MName = UeNameOf(SR, Name(*SR->Fields[I]));
             if (!TypeToProperty(TypeOf(*SR->Fields[I]), MName, 0, "member " + MName + " of " + SR->CppName,
                                 BP, &MD, Err))
                 return false;
@@ -6035,7 +6090,7 @@ bool FCompiler::GenerateAsset(const Json& Var, const std::string& OutDir, std::s
             const Json* Init = Strip(Nth(List, I++));
             if (!Init || Unset(*Init)) continue;
             FPropertyDef PD;
-            if (!TypeToProperty(TypeOf(*F), Name(*F), 0, AssetName + "." + Name(*F), BP, &PD, Err)) return false;
+            if (!TypeToProperty(TypeOf(*F), UeNameOf(&Rec, Name(*F)), 0, AssetName + "." + Name(*F), BP, &PD, Err)) return false;
             if (!LowerDefault(*F, PD, BP, Err, Init)) return false;
             BP.AddVariable(PD);
         }
@@ -6228,7 +6283,10 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 const bool bInterfaceVar = !bThroughComponent && DR->bIsInterface && InterfaceVarHolder(*DR, &R) == &R;
 
                 FPropertyDef PD;
-                if (!TypeToProperty(TypeOf(*Lhs), Name(*Lhs), 0, Where, BP, &PD, Err)) { bOk = false; return; }
+                /* The tag is read back by the engine's name of the member, which its declarer's header knows. */
+                const std::string LhsDeclarer = OwnerOf(*Lhs);
+                const std::string TagName = UeNameOf(LhsDeclarer.empty() ? DR : Find(LhsDeclarer), Name(*Lhs));
+                if (!TypeToProperty(TypeOf(*Lhs), TagName, 0, Where, BP, &PD, Err)) { bOk = false; return; }
                 /* Zero is a real value here: an archetype deltas against the component CDO (where
                    bVisible is already true) and an inherited property against the parent's CDO,
                    not against the type's zero the way a fresh class variable does. */
@@ -6241,7 +6299,19 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 if (DR == &R) { ComponentDefaults[CompName].push_back(PD); return; }
                 /* A native parent's component is a default subobject, not an SCS node: it is
                    overridden by an export under this class's CDO, with no handler involved. */
-                if (DR->IsNative())
+                /* A game Blueprint's component is an SCS node too, and overriding it takes the node's guid, which only
+                   a dump can say (`<Comp>__UeScsNode`, from the Dumper-7 fork's `ScsNode=`). Without it the default
+                   subobject path below would cook an export the engine never looks at - so that is refused. */
+                const bool bBlueprintParent = DR->IsNative() && DR->UeName.size() > 2
+                                              && DR->UeName.compare(DR->UeName.size() - 2, 2, "_C") == 0;
+                if (bBlueprintParent && !DR->ScsNodes.count(CompName))
+                {
+                    *Err = Where + ": " + CompName + " is a component of the Blueprint " + DR->UeName + ", and its header does "
+                           "not say which SCS node it is - re-dump the game with the Dumper-7 fork (ScsNode=) and regenerate UeApi";
+                    bOk = false;
+                    return;
+                }
+                if (DR->IsNative() && !bBlueprintParent)
                 {
                     FOverride& Sub = SubobjectDefaults[CompName];
                     Sub.Owner = DR;
@@ -6394,12 +6464,22 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
 
         const std::string OwnerPkg = Owner.IsNative() ? Owner.UePackage : ModPackage + "/" + Owner.CppName;
         const std::string OwnerCls = Owner.IsNative() ? Owner.UeName : Owner.CppName + "_C";
-        uint32 NodeGuid[4];
-        ScsNodeGuid(OwnerCls, Entry.first, NodeGuid);
+        uint32 NodeGuid[4] = {};
+        const std::string VarName = UeNameOf(&Owner, Entry.first);      // the node's name: `Audio Flying`, spaces and all
+        if (auto Node = Owner.ScsNodes.find(Entry.first); Node != Owner.ScsNodes.end())
+        {
+            /* The guid's 16 bytes as the engine holds them, which is four little-endian words on disk as well. */
+            if (Node->second.size() != 32)
+            { *Err = R.CppName + "::UE_DEFAULTS: " + Entry.first + "__UeScsNode is not 32 hex digits"; return false; }
+            for (int B = 0; B < 16; ++B)
+                NodeGuid[B / 4] |= uint32(std::stoul(Node->second.substr(size_t(B) * 2, 2), nullptr, 16)) << (8 * (B % 4));
+        }
+        else
+            ScsNodeGuid(OwnerCls, Entry.first, NodeGuid);
         const FIndex OwnerClass = BP.EngineClass(OwnerPkg, OwnerCls);
-        BP.AddComponentOverride(Entry.first, BP.EngineClass(CR->UePackage, CR->UeName),
+        BP.AddComponentOverride(VarName, BP.EngineClass(CR->UePackage, CR->UeName),
                                 BP.Subobject(CR->UePackage, CR->UeName, OwnerClass,
-                                             Entry.first + "_GEN_VARIABLE"),
+                                             VarName + "_GEN_VARIABLE"),
                                 OwnerClass, NodeGuid, Entry.second.Defaults);
     }
 
@@ -6448,12 +6528,12 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         }
         const std::string Prefix = IR.UePackage.substr(IR.UePackage.rfind('/') + 1) + "." + IR.UeName + ".";
         for (const auto& M : IR.Methods)
-            if (M.first != "StaticClass" && !EventFlags.count(Prefix + M.first))     // StaticClass: UE_CLASS's
+            if (M.first != "StaticClass" && !EventFlags.count(Prefix + UeNameOf(&IR, M.first)))     // StaticClass: UE_CLASS's
             { *Err = I + "::" + M.first + " is native only (not a BlueprintNativeEvent or BlueprintImplementableEvent), "
                      "so a Blueprint cannot implement " + I; return false; }
         for (auto It = EventFlags.lower_bound(Prefix); It != EventFlags.end() && It->first.compare(0, Prefix.size(), Prefix) == 0; ++It)
         {
-            const std::string Name_ = It->first.substr(Prefix.size());
+            const std::string Name_ = CppNameOf(IR, It->first.substr(Prefix.size()));     // the table is in engine names
             if (std::any_of(Methods.begin(), Methods.end(), [&](const FMethod& F) { return F.Name == Name_; })) continue;
             auto Decl = IR.Methods.find(Name_);
             if (Decl == IR.Methods.end())
@@ -6628,7 +6708,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             continue;
         }
 
-        BP.AddFunction(Fn.Name, Super, Params,
+        BP.AddFunction(UeNameOf(&R, Fn.Name), Super, Params,
                        [Stmts, bEndsWithReturn, bScratchNeeded, DerefStruct](FScript& S, FIndex SelfExp) {
             if (bScratchNeeded)
             {
@@ -6704,7 +6784,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         {
             std::vector<std::pair<std::string, std::string>> Copies;
             for (const FPropertyDef& P : Segments[I].Parms) Copies.emplace_back(P.Name, Segments[I].Rename.at(P.Name));
-            BP.AddFunction(Segments[I].Name, Segments[I].Super, Segments[I].Parms,
+            BP.AddFunction(UeNameOf(&R, Segments[I].Name), Segments[I].Super, Segments[I].Parms,
                            [Copies, Uber, Entries, I](FScript& S, FIndex SelfExp) {
                 for (const auto& [From, To] : Copies)
                     S.LetValueOnPersistentFrame(To, Uber, [&, From](FScript& V) { V.LocalVariable(From, SelfExp); });
