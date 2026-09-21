@@ -5290,6 +5290,11 @@ bool FCompiler::GenerateInterface(const FRecord& R, const std::string& OutDir, s
 
     if (!R.Fields.empty())
     { *Err = R.CppName + ": an interface declares no variables, only functions"; return false; }
+    /* An interface extending another would need the parent's functions conformed into this class and
+       the child listed against both; refuse it rather than silently cook a UInterface-rooted class
+       that drops the parent. */
+    if (!R.Base.empty() || !R.Interfaces.empty())
+    { *Err = R.CppName + ": an interface extending another is not supported yet"; return false; }
 
     for (const auto& Entry : R.Methods)
     {
@@ -5547,6 +5552,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     std::map<std::string, std::vector<FPropertyDef>> ComponentDefaults;
     struct FOverride { const FRecord* Owner = nullptr; std::vector<FPropertyDef> Defaults; };
     std::map<std::string, FOverride> ComponentOverrides;
+    std::map<std::string, FOverride> SubobjectDefaults;
     std::vector<FPropertyDef> InheritedDefaults;
     if (R.Defaults)
     {
@@ -5579,7 +5585,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 const FRecord* DR = Declarer.empty() ? nullptr : Find(Declarer);
                 if (!DR)
                 { *Err = Where + ": cannot tell which class declares " + Name(*Lhs); bOk = false; return; }
-                if (bThroughComponent && !DR->Components.count(CompName))
+                if (bThroughComponent && !DR->Components.count(CompName) && !DR->IsNative())
                 { *Err = Where + ": " + CompName + " is not a UE_COMPONENT"; bOk = false; return; }
                 if (!bThroughComponent && DR == &R)
                 { *Err = Where + ": " + Name(*Lhs) + " is declared here - give it an initializer instead"; bOk = false; return; }
@@ -5595,9 +5601,15 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
 
                 if (!bThroughComponent) { InheritedDefaults.push_back(PD); return; }
                 if (DR == &R) { ComponentDefaults[CompName].push_back(PD); return; }
+                /* A native parent's component is a default subobject, not an SCS node: it is
+                   overridden by an export under this class's CDO, with no handler involved. */
                 if (DR->IsNative())
-                { *Err = Where + ": " + CompName + " belongs to " + DR->CppName
-                         + ", whose SCS node GUID only its own asset knows"; bOk = false; return; }
+                {
+                    FOverride& Sub = SubobjectDefaults[CompName];
+                    Sub.Owner = DR;
+                    Sub.Defaults.push_back(PD);
+                    return;
+                }
                 FOverride& O = ComponentOverrides[CompName];
                 O.Owner = DR;
                 O.Defaults.push_back(PD);
@@ -5689,16 +5701,29 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     if (!ComponentDefaults.empty())
     { *Err = R.CppName + "::UE_DEFAULTS: " + ComponentDefaults.begin()->first + " is not declared with UE_COMPONENT"; return false; }
     for (const FPropertyDef& V : InheritedDefaults) BP.AddCdoDefault(V);
+    /* Resolving the component class from the declaring record's own field, the same walk the
+       UE_COMPONENT registration does - a native subobject has no marker to read it off. */
+    auto ComponentClassOf = [&](const FRecord& Owner, const std::string& Field) -> const FRecord* {
+        const Json* F = nullptr;
+        for (const Json* PF : Owner.Fields) if (Name(*PF) == Field) F = PF;
+        const size_t Star = F ? TypeOf(*F).find('*') : std::string::npos;
+        return Star == std::string::npos ? nullptr
+                                         : Find(StripTypeKeywords(TypeOf(*F).substr(0, Star)));
+    };
+    for (const auto& Entry : SubobjectDefaults)
+    {
+        const FRecord* CR = ComponentClassOf(*Entry.second.Owner, Entry.first);
+        if (!CR || !CR->IsNative())
+        { *Err = R.CppName + "::UE_DEFAULTS: cannot resolve the class of " + Entry.first; return false; }
+        BP.AddSubobjectOverride(Entry.first, BP.EngineClass(CR->UePackage, CR->UeName),
+                                Entry.second.Defaults);
+    }
     for (const auto& Entry : ComponentOverrides)
     {
         /* The parent's own archetype, imported as a subobject of its class, is the record's template:
            the tags this class writes on top of it are exactly the overridden values. */
         const FRecord& Owner = *Entry.second.Owner;
-        const Json* Field = nullptr;
-        for (const Json* PF : Owner.Fields) if (Name(*PF) == Entry.first) Field = PF;
-        const size_t Star = Field ? TypeOf(*Field).find('*') : std::string::npos;
-        const FRecord* CR = Star == std::string::npos ? nullptr
-                                                      : Find(StripTypeKeywords(TypeOf(*Field).substr(0, Star)));
+        const FRecord* CR = ComponentClassOf(Owner, Entry.first);
         if (!CR || !CR->IsNative())
         { *Err = R.CppName + "::UE_DEFAULTS: cannot resolve the class of " + Entry.first; return false; }
 

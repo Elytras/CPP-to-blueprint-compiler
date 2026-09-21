@@ -179,6 +179,12 @@ void FBlueprintClass::AddComponent(const std::string& Name, FIndex ComponentClas
     Components.push_back(FComponent{ Name, ComponentClass, ComponentCdo, bIsSceneComponent, Defaults });
 }
 
+void FBlueprintClass::AddSubobjectOverride(const std::string& Name, FIndex ComponentClass,
+                                           const std::vector<FPropertyDef>& Defaults)
+{
+    SubobjectOverrides.push_back(FSubobjectOverride{ Name, ComponentClass, Defaults });
+}
+
 void FBlueprintClass::AddComponentOverride(const std::string& Name, FIndex ComponentClass, FIndex ParentTemplate,
                                            FIndex OwnerClass, const uint32 (&AssociatedGuid)[4],
                                            const std::vector<FPropertyDef>& Defaults)
@@ -215,7 +221,10 @@ void FBlueprintClass::Finish()
     const int32 RowClass = 0;
     const int32 RowCdo = 1;
     const int32 RowFirstFunction = 2;
-    const int32 RowRootTemplate = RowFirstFunction + int32(Functions.size());
+    /* A native parent's overridden subobjects sit right after the functions, before anything the
+       actor shape adds, so a non-actor class reaches them too. */
+    const int32 RowFirstSubobject = RowFirstFunction + int32(Functions.size());
+    const int32 RowRootTemplate = RowFirstSubobject + int32(SubobjectOverrides.size());
     const int32 RowScsNode = RowRootTemplate + 1;
     /* Each UE_COMPONENT takes two rows, archetype then node, so the SCS lands after them all. */
     const int32 RowFirstComponent = RowScsNode + 1;
@@ -321,7 +330,10 @@ void FBlueprintClass::Finish()
 
     const bool bCdoReplicates = bReplicates;
     const std::vector<FPropertyDef> Inherited = CdoDefaults;
-    Cdo.Serialize = [bOverridesTick, ClassVars, bCdoReplicates, Inherited](FArc& Ar) {
+    std::vector<std::string> SubobjectNames;
+    for (const FSubobjectOverride& O : SubobjectOverrides) SubobjectNames.push_back(O.Name);
+    for (size_t I = 0; I < SubobjectOverrides.size(); ++I) Cdo.CreateBeforeSer.push_back(Exp(RowFirstSubobject + int32(I)).V);
+    Cdo.Serialize = [=](FArc& Ar) {
         if (bCdoReplicates) TagBool(Ar, "bReplicates", true);
         if (bOverridesTick)
             Tag(Ar, "PrimaryActorTick", "StructProperty", [](FArc& V) {
@@ -334,6 +346,11 @@ void FBlueprintClass::Finish()
         /* A property an ancestor declares: UE_DEFAULTS writes it here, where re-declaring the name
            would instead shadow it with a second property of the same name on this class. */
         for (const FPropertyDef& V : Inherited) WriteDefaultTag(Ar, V);
+        /* Each overridden native subobject is reachable from the CDO by its own name, as
+           Default__Ene_Butterfly_C points at its HealthComponent export. */
+        for (size_t I = 0; I < SubobjectNames.size(); ++I)
+            Tag(Ar, SubobjectNames[I], "ObjectProperty",
+                [=](FArc& V) { V.Idx(Exp(RowFirstSubobject + int32(I))); });
         TagEnd(Ar);                                 // a CDO omits the lazy-object guid
     };
     P.AddExport(std::move(Cdo));
@@ -349,6 +366,24 @@ void FBlueprintClass::Finish()
         const auto& Body = Functions[I].Body;
         AddFunctionExport(P, Functions[I].Def, Exp(RowClass), FunctionClass, FunctionCdo,
                           [Body, SelfExp](FScript& S) { Body(S, SelfExp); }, Refs);
+    }
+
+    for (const FSubobjectOverride& O : SubobjectOverrides)
+    {
+        const std::vector<FPropertyDef> Defaults = O.Defaults;
+        FExport Sub;
+        Sub.ClassIndex = O.Class;
+        Sub.OuterIndex = Exp(RowCdo);
+        Sub.ObjectName = O.Name;
+        Sub.ObjectFlags = RF_Public | RF_Transactional | RF_ArchetypeObject | RF_DefaultSubObject;
+        Sub.SerBeforeCreate = { O.Class.V };
+        Sub.CreateBeforeCreate = { Exp(RowCdo).V };
+        Sub.Serialize = [Defaults](FArc& Ar) {
+            for (const FPropertyDef& V : Defaults) WriteDefaultTag(Ar, V);
+            TagEnd(Ar);
+            Ar.Bool(false);
+        };
+        P.AddExport(std::move(Sub));
     }
 
     if (!bIsActor) return;

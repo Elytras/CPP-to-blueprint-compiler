@@ -89,6 +89,16 @@ public:
                               FIndex OwnerClass, const uint32 (&AssociatedGuid)[4],
                               const std::vector<FPropertyDef>& Defaults);
 
+    /*
+    An override of a NATIVE parent's default subobject - its components, which are not SCS nodes and
+    so have nothing to do with the handler above. Measured on Ene_Butterfly: one export named exactly
+    as the subobject, outered to THIS class's CDO, flags Public|Transactional|ArchetypeObject|
+    DefaultSubObject and a null template (the engine resolves the archetype through the parent CDO's
+    subobject of the same name), plus an ObjectProperty tag of that name on the CDO.
+    */
+    void AddSubobjectOverride(const std::string& Name, FIndex ComponentClass,
+                              const std::vector<FPropertyDef>& Defaults);
+
     /* A tag on this class's CDO for a property an ancestor declares, which a member initializer
        cannot express: declaring the name again would shadow it with a second property. */
     void AddCdoDefault(const FPropertyDef& Var) { CdoDefaults.push_back(Var); }
@@ -163,6 +173,14 @@ private:
     };
     std::vector<FComponentOverride> ComponentOverrides;
     std::vector<FPropertyDef> CdoDefaults;
+
+    struct FSubobjectOverride
+    {
+        std::string Name;
+        FIndex Class;
+        std::vector<FPropertyDef> Defaults;
+    };
+    std::vector<FSubobjectOverride> SubobjectOverrides;
 
     int32 ClassRow = 0;
 };
