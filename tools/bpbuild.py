@@ -196,6 +196,38 @@ def check_mod_imports(staged, mod_packages):
     return not bad
 
 
+VS_FILTERS = (("Mods", "5b1f0c4e-6a0d-4a57-9d0a-1c1f6e2a7b01"), ("Tests", "5b1f0c4e-6a0d-4a57-9d0a-1c1f6e2a7b02"),
+              ("Helpers", "5b1f0c4e-6a0d-4a57-9d0a-1c1f6e2a7b03"), ("UeApi", "5b1f0c4e-6a0d-4a57-9d0a-1c1f6e2a7b04"))
+
+
+def write_vs_filters(bp):
+    """BpMods.vcxproj lists its sources by wildcard, so a new mod needs no project edit - but Visual Studio gives a
+    wildcard FILTER entry to the first file it matches only. So the folders of the project tree are written out file
+    by file here, on every build, and only when the list changed (a rewrite makes Visual Studio reload the project)."""
+    if not os.path.exists(os.path.join(bp, "BpMods.vcxproj")):
+        return
+    rows = []
+    for f in sorted(os.listdir(bp), key=str.lower):
+        if f.endswith(".cpp"):
+            rows.append(("ClCompile", f, "Tests" if f.endswith("Test.cpp") else "Mods"))
+        elif f.endswith(".h"):
+            rows.append(("ClInclude", f, "Helpers"))
+    api = os.path.join(bp, "UeApi")
+    for f in sorted(os.listdir(api), key=str.lower) if os.path.isdir(api) else []:
+        if f.endswith(".h"):
+            rows.append(("ClInclude", "UeApi\\" + f, "UeApi"))
+    text = ('<?xml version="1.0" encoding="utf-8"?>\n'
+            '<!-- Written by AssetGen/tools/bpbuild.py on every build. Do not edit. -->\n'
+            '<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">\n  <ItemGroup>\n'
+            + "".join('    <Filter Include="%s"><UniqueIdentifier>{%s}</UniqueIdentifier></Filter>\n' % f for f in VS_FILTERS)
+            + '  </ItemGroup>\n  <ItemGroup>\n'
+            + "".join('    <%s Include="%s"><Filter>%s</Filter></%s>\n' % (kind, name, folder, kind) for kind, name, folder in rows)
+            + '    <None Include="mods.yaml" />\n  </ItemGroup>\n</Project>\n')
+    dest = os.path.join(bp, "BpMods.vcxproj.filters")
+    if not os.path.exists(dest) or io.open(dest, encoding="utf-8").read() != text:
+        io.open(dest, "w", encoding="utf-8", newline="\n").write(text)
+
+
 def main():
     if len(sys.argv) < 4:
         sys.exit(__doc__.strip().splitlines()[-1])
@@ -205,6 +237,7 @@ def main():
     no_pak = "--no-pak" in sys.argv[4:]
 
     bp = os.path.join(repo, "BpMods")
+    write_vs_filters(bp)
     manifest = os.path.join(bp, "mods.yaml")
     if not os.path.exists(manifest):
         sys.exit("no manifest at %s" % manifest)
