@@ -160,6 +160,7 @@ check('FlowTest', 'PostInc', lambda X: X * 100 + X + 1, [dict(X=x) for x in (-1,
 check('FlowTest', 'PreInc', lambda X: (X + 1) * 101, [dict(X=x) for x in (-1, 0, 5)])
 check('FlowTest', 'UpdateChain', lambda X: (1 + X) * 11, [dict(X=x) for x in (-1, 0, 4)])
 check('FlowTest', 'OrAssign', lambda N: 11 if N > 0 else 0, [dict(N=n) for n in (-1, 0, 3)])
+check('FlowTest', 'TemplateMember', lambda X: X * 6, [dict(X=x) for x in (-2, 0, 7)])
 check('FlowTest', 'SafeRatio', lambda X: X != 0 and cdiv(10, X) > 2, [dict(X=x) for x in (-2, 0, 1, 3, 4)])
 check('FlowTest', 'EitherZero', lambda X, Y: X == 0 or cdiv(100, X) == Y, [dict(X=x, Y=y) for x in (0, 10, 3) for y in (0, 10, 33)])
 check('FlowTest', 'Pick', lambda X: X * 2 if X > 0 else (-1 if X < -5 else 7), [dict(X=x) for x in (-9, -5, 0, 4)])

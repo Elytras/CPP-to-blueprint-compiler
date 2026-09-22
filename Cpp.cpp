@@ -914,6 +914,8 @@ private:
     bool ConstToArg(const FConstVal& V, const std::string& Type, FArgIR& Out) const;
     std::map<std::string, const Json*> FreeInlines;                     // decl id -> an inline free function's definition
                                                                         // (a template's: each instantiation)
+    std::map<std::string, const Json*> MemberTemplates;                 // decl id -> a member template's instantiation,
+                                                                        // expanded inline like an inline method
     /* The class a field access `Obj->Field` / `Field` reads from: Obj's static type, or the class being generated. */
     /* An interface and the interfaces it extends, nearest first. A native one has no base in UeApi. */
     std::vector<const FRecord*> InterfaceChain(const FRecord* I) const
@@ -3680,6 +3682,8 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
     {
         if (auto Free = FreeInlines.find(DeclId); Free != FreeInlines.end())
             return ExpandInline(CallExprNode, *Free->second, MethodName, false, BP, Out, Err);
+        if (auto Tm = MemberTemplates.find(DeclId); Tm != MemberTemplates.end())
+            return ExpandInline(CallExprNode, *Tm->second, MethodName + "<" + DeclId + ">", true, BP, Out, Err);
         auto Owner = MethodOwner.find(DeclId);
         if (Owner == MethodOwner.end()) { *Err = "call to an unknown function: " + MethodName; return false; }
         const FRecord* R = Find(Owner->second);
@@ -7163,7 +7167,26 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     std::function<void(Json&)> IndexInlines = [&](Json& N) {
         if (!N.is_object()) return;
         const std::string K = Kind(N);
-        if (K == "CXXRecordDecl") return;
+        if (K == "CXXRecordDecl")
+        {
+            /* Class bodies are the records', except member templates: no UFunction per instantiation, so each
+               one a call names is inlined. The dependent pattern sits beside them and no call names it. */
+            ForEach(N, [&](const Json& C) {
+                if (Kind(C) == "CXXRecordDecl") IndexInlines(const_cast<Json&>(C));
+                if (Kind(C) != "FunctionTemplateDecl") return;
+                for (Json& M : const_cast<Json&>(C)["inner"])
+                {
+                    bool bBody = false;
+                    ForEach(M, [&](const Json& B) { bBody = bBody || Kind(B) == "CompoundStmt"; });
+                    if (Kind(M) == "CXXMethodDecl" && bBody)
+                    {
+                        NormalizePointers(M);
+                        MemberTemplates[M.value("id", std::string())] = &M;
+                    }
+                }
+            });
+            return;
+        }
         if (K == "FunctionDecl" && N.value("inline", false))
         {
             bool bBody = false;
