@@ -412,6 +412,20 @@ def parent_call():
     print('ok  SuperTest: Base::Method() is a final call on the parent\'s function')
 
 
+def typed_outer():
+    """GetTypedOuter<T> / GetOutermostTypedOuter<T>: a loop of GetOuterObject + DynamicCast, no function of their own."""
+    import subprocess
+    here, base = os.path.dirname(os.path.abspath(__file__)), asset('SpawnTest')
+    exports = [e['name'] for e in dumpexp.load(base)[5]]
+    for fn in ('OwningActor', 'LevelOf'):
+        w = subprocess.run([sys.executable, os.path.join(here, 'walkscript.py'), base, str(exports.index(fn))],
+                           capture_output=True, text=True).stdout
+        assert "Function'GetOuterObject'" in w and 'DynamicCast' in w and 'JumpIfNot' in w, w
+        assert 'GetTypedOuter' not in w and 'GetOutermostTypedOuter' not in w, w
+    assert not any(n in exports for n in ('GetTypedOuter', 'GetOutermostTypedOuter')), exports
+    print('ok  SpawnTest: GetTypedOuter / GetOutermostTypedOuter inline to an outer walk')
+
+
 def api_stub():
     """The editor API stub (--api) of NameTest: what a Blueprint author sees of a mod class."""
     import subprocess, tempfile
@@ -440,6 +454,7 @@ mod_enum()
 constants()
 engine_names()
 parent_call()
+typed_outer()
 api_stub()
 check('TypesTest', 'Cpp20', lambda M, N: {0: N + N, 5: N + fnv('angry')}.get(M, fnv('types')), [dict(M=m, N=n) for m in (0, 5, 6) for n in (-2, 9)])
 check('TypesTest', 'ConstSum', lambda N: N * 3 + 12 + 19, [dict(N=n) for n in (-4, 0, 9)])
