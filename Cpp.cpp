@@ -2879,6 +2879,21 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         {
             const Json* Obj = First(*Callee);
             if (!Obj) { *Err = "conversion operator with no object"; return false; }
+            if (Canon(TypeOf(*Obj)) == "FName" && Canon(TypeOf(*N)) == "bool")
+            {
+                /* `if (Name)`: Kismet has no Conv_NameToBool, so it is Name != None. */
+                FArgIR Lhs, None;
+                if (!LowerArg(*Obj, BP, Lhs, Err)) return false;
+                None.K = FArgIR::Name;
+                None.S = "None";
+                Out.K = FArgIR::Call;
+                Out.Sub = std::make_shared<FCallIR>();
+                Out.Sub->Fn = BP.EngineFunction("/Script/Engine", "KismetMathLibrary", "NotEqual_NameName");
+                Out.Sub->bPure = true;
+                Out.Sub->Args = { Lhs, None };
+                Out.InnerType = "bool";
+                return true;
+            }
             return LowerArg(*Obj, BP, Out, Err) && ConvertArg(TypeOf(*N), BP, Out, Err);
         }
         const Json* Obj = Callee ? Strip(First(*Callee)) : nullptr;

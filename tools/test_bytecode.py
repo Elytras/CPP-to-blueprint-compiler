@@ -98,6 +98,7 @@ def switch_in_loop(Count):
 
 check('FlowTest', 'Classify', classify, [dict(Code=c) for c in range(-2, 8)])
 check('FlowTest', 'NoDefault', no_default, [dict(Code=c) for c in (-1, 0, 1, 9, 10)])
+check('FlowTest', 'NameSet', lambda N: 2 if N.lower() == 'none' else 1, [dict(N=n) for n in ('None', 'IntProperty', 'x')])
 check('FlowTest', 'NameKind', lambda Kind: {'intproperty': 1, 'floatproperty': 2, 'doubleproperty': 2, 'structproperty': 3}.get(Kind.lower(), 0),
       [dict(Kind=k) for k in ('IntProperty', 'intproperty', 'FloatProperty', 'DoubleProperty', 'StructProperty', 'None', 'Int')])
 check('FlowTest', 'DefaultFirst', default_first, [dict(Code=c) for c in (0, 4, 5, 6, 7)])
