@@ -7141,7 +7141,8 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     const std::string AstPath = OutDir + "/ast.json";
     /* Both the UeApi dir and its parent are include paths, so "FSD.h" and "UeApi/FSD.h" both resolve. */
     const std::string Parent = std::filesystem::path(IncludeDir).parent_path().string();
-    const std::string Cmd = "clang++ -std=c++20 -fsyntax-only -Xclang -ast-dump=json"
+    /* -Wno-string-plus-int: `"lit" + N` is a Concat_StrStr here, not pointer arithmetic. */
+    const std::string Cmd = "clang++ -std=c++20 -Wno-string-plus-int -fsyntax-only -Xclang -ast-dump=json"
                             " \"" + SourcePath + "\" -I\"" + IncludeDir + "\" -I\"" + Parent
                           + "\" > \"" + AstPath + "\"";
     if (system(("\"" + Cmd + "\"").c_str()) != 0)
