@@ -5355,7 +5355,11 @@ bool FCompiler::HoistReadsInArg(FArgIR& A, FBlueprintClass& BP,
                                 std::vector<FPropertyDef>& Locals,
                                 std::vector<FStmtIR>& OutPre, std::string* Err)
 {
-    if ((A.K == FArgIR::Member || A.K == FArgIR::Field || A.K == FArgIR::InterfaceCtx) && A.Base)
+    /* `GetLoc().X`: EX_StructMemberContext steps its base with no result buffer and offsets into the storage the
+       base leaves behind. A call leaves none, and a native one writes its return value through that null. */
+    if (A.K == FArgIR::Member && A.Base)
+        return HoistReadsInArg(*A.Base, BP, Locals, OutPre, Err) && HoistOperand(*A.Base, BP, Locals, OutPre, Err);
+    if ((A.K == FArgIR::Field || A.K == FArgIR::InterfaceCtx) && A.Base)
         return HoistReadsInArg(*A.Base, BP, Locals, OutPre, Err);
     if (A.K == FArgIR::Index && A.Base && A.Sub && A.Sub->Args.size() == 1)
         return HoistReadsInArg(*A.Base, BP, Locals, OutPre, Err) && HoistReadsInArg(A.Sub->Args[0], BP, Locals, OutPre, Err);

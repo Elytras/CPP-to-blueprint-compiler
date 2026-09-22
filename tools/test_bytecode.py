@@ -130,6 +130,12 @@ def update_once():
                         str(names.index('BumpSlot'))], capture_output=True, text=True).stdout
     assert w.count('NextSlot') == 1 and w.count('ArrayGetByRef') == 2, w
     print('ok  FlowTest.BumpSlot: Slots[NextSlot()] += By calls NextSlot once')
+    w = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'walkscript.py'), base,
+                        str(names.index('CallMember'))], capture_output=True, text=True).stdout
+    ctx = [l for l in w.splitlines() if 'StructMemberContext' in l or 'FinalFunction' in l or 'LocalVariable' in l]
+    assert 'FinalFunction' not in ''.join(l for l in ctx if 'StructMemberContext' in l) and 'Let' in w, w
+    assert not any('StructMemberContext' in a and 'FinalFunction' in b for a, b in zip(ctx, ctx[1:])), w
+    print('ok  FlowTest.CallMember: a returned struct is stored before StructMemberContext reads it')
 
 
 update_once()
