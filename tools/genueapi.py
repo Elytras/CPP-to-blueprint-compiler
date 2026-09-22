@@ -328,9 +328,12 @@ def operators(classes):
             if not (m and is_static and len(params) >= 2):
                 continue
             lhs, rhs = params[0][0], params[1][0]
-            if lhs not in STRUCTS and rhs not in STRUCTS:
+            if lhs not in STRUCTS and rhs not in STRUCTS and lhs not in CONV_STRUCTS:
                 continue
-            found.setdefault((OPS[m.group(1)], lhs, rhs), (ret, k.path, k.ue_name, fname, operator_extra(params[2:])))
+            key, row = (OPS[m.group(1)], lhs, rhs), (ret, k.path, k.ue_name, fname, operator_extra(params[2:]))
+            # FString has both StrStr and StriStri; `==` on names/paths wants the case-insensitive one.
+            if key not in found or ("_Stri" in fname and "_Stri" not in found[key][3]):
+                found[key] = row
     return found
 
 
