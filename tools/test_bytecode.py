@@ -380,13 +380,16 @@ def engine_names():
         flags = int(re.search(r'FunctionFlags (\S+)', tool('dumpstruct.py', exports.index(fn))).group(1), 16)
         assert flags & 0xE0000 == want, (fn, hex(flags))
     print('ok  NameTest: a function carries its C++ access specifier')
-    # GetOuter() / GetName() / GetClass() are the library statics, the object as the first argument.
+    # GetOuter() is a read of OuterPrivate (ArrayGetByRef through the FDeref scratch, address = self + 0x20), no call;
+    # GetName() / GetClass() are the library statics, the object as the first argument.
     w = tool('walkscript.py', exports.index('Whose'))
-    assert "Function'GetOuterObject'" in w and w.count("Function'GetObjectName'") == 1 and 'GetOuter' not in w.replace('GetOuterObject', ''), w
+    assert w.count('ArrayGetByRef') == 1 and "Function'GetOuterObject'" not in w and 'GetOuter' not in w, w
+    assert b'\x35' + (0x20).to_bytes(8, 'little') in open(base + '.uexp', 'rb').read()     # EX_Int64Const (0x35) 0x20: OuterPrivate
+    assert w.count("Function'GetObjectName'") == 1, w
     assert "FinalFunction" in w and "Function'GetName'" in w, w   # UFSDSaveGame's own GetName hides the forwarder
     w = tool('walkscript.py', exports.index('SameKind'))
     assert w.count("Function'GetObjectClass'") == 2 and "LocalVariable" in w and 'Self' in w, w
-    print('ok  NameTest: Obj->GetOuter() / GetName() / GetClass() forward to the Kismet library')
+    print('ok  NameTest: Obj->GetOuter() reads OuterPrivate; GetName() / GetClass() forward to the Kismet library')
     # CPF_BlueprintReadOnly 0x10 on the const member alone, and its initializer is the default.
     props = tool('dumpstruct.py', exports.index('NameTest_C'))
     flags = lambda name: int(re.search(r'Property %s .*? flags=(\S+)' % name, props).group(1), 16)
@@ -420,7 +423,7 @@ def typed_outer():
     for fn in ('OwningActor', 'LevelOf'):
         w = subprocess.run([sys.executable, os.path.join(here, 'walkscript.py'), base, str(exports.index(fn))],
                            capture_output=True, text=True).stdout
-        assert "Function'GetOuterObject'" in w and 'DynamicCast' in w and 'JumpIfNot' in w, w
+        assert 'ArrayGetByRef' in w and "Function'GetOuterObject'" not in w and 'DynamicCast' in w and 'JumpIfNot' in w, w
         assert 'GetTypedOuter' not in w and 'GetOutermostTypedOuter' not in w, w
     assert not any(n in exports for n in ('GetTypedOuter', 'GetOutermostTypedOuter')), exports
     print('ok  SpawnTest: GetTypedOuter / GetOutermostTypedOuter inline to an outer walk')

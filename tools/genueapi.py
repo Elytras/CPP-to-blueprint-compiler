@@ -408,7 +408,7 @@ def parse_params(text):
 # compiler reads (`X__UeForward`), the static library function that does it - the object goes first among its
 # arguments, as the editor's node takes it on its target pin. Any object, `this` included.
 UOBJECT_FORWARDS = (
-    ("class UObject*", "GetOuter", "UKismetSystemLibrary::GetOuterObject"),
+    ("class UObject*", "GetOuter", "UObject_GetOuter"),       # a free inline function: the read below, no engine call
     ("class UClass*", "GetClass", "UGameplayStatics::GetObjectClass"),
     ("FString", "GetName", "UKismetSystemLibrary::GetObjectName"),
 )
@@ -931,6 +931,15 @@ def main():
                 ns_open = k.ns
             base = by_name[k.base].emit if k.base else ""
             inherits = " : public %s" % base if base else ""
+            if k.cpp == "UObject":
+                body.append("/* Obj->GetOuter() is OuterPrivate read straight off the object - UObject on UE 4.27 x64: vtable 0x0, ObjectFlags")
+                body.append("   0x8, InternalIndex 0xC, ClassPrivate 0x10, NamePrivate 0x18, OuterPrivate 0x20 (the dump's Basic.hpp says so) -")
+                body.append("   through the read intrinsics: one ArrayGetByRef, no engine call. As in C++, Obj must not be null (a read at")
+                body.append("   0x20 is a crash), and as with any pointer read the mod declares FDeref (Intrin.h) and the function is not")
+                body.append("   latent. UKismetSystemLibrary::GetOuterObject is the engine call it replaces, null-safe, if either bites. */")
+                body.append("int64 __AddrOf__(class UObject *Ref);")
+                body.append("class UObject *__ReadObject__(int64 Addr);")
+                body.append("inline class UObject *UObject_GetOuter(class UObject *Obj) { return __ReadObject__(__AddrOf__(Obj) + 0x20); }\n")
             body.append("class %s%s\n{\npublic:\n    UE_CLASS(\"%s\", \"%s\");"
                         % (k.ue_name if k.is_bp else k.cpp, inherits, k.path, k.ue_name))
             short = short_names(k)
@@ -998,8 +1007,8 @@ def main():
                 for t in [ret] + [t for t, _ in params]:
                     referenced.update(class_refs(t))
             if k.cpp == "UObject":
-                body.append("    /* C++ has these, the reflection does not: each is the Kismet library call the marker names,")
-                body.append("       this object its first argument. Any object, not only this. */")
+                body.append("    /* C++ has these, the reflection does not: each is what the marker names - a Kismet library static or")
+                body.append("       a free inline function - with this object as the first argument. Any object, not only this. */")
                 for ret, name, target in UOBJECT_FORWARDS:
                     body.append("    %s %s();" % (ret, name))
                     body.append('    static constexpr const char* %s__UeForward = "%s";' % (name, target))

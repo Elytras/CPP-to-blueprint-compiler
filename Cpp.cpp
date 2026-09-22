@@ -474,6 +474,7 @@ struct FCallIR
     FIndex Extra2;
     bool bScript = false;               // callee is Blueprint bytecode
     bool bInstance = false;             // non-static method: needs the context object, not the class CDO
+    bool bReceiverIsArg = false;        // a forwarded UObject helper (Obj->GetOuter()): Obj is already the first argument, no EX_Context
     FIndex Context;                     // CDO a static call runs against; null = self
     bool bPure = false;                 // a function of its arguments (UE_PURE, a Kismet operator or conversion): see DropUnusedPure
     std::string VirtualName;            // a generated class's own instance method: EX_VirtualFunction resolves it by name at run time
@@ -904,7 +905,7 @@ private:
        `inline` may sit on the declaration or on an out-of-line definition. */
     bool IsInlineMethod(const FRecord& R, const std::string& Method) const;
     bool ExpandInline(const Json& CallNode, const Json& Def, const std::string& Method, bool bMethod, FBlueprintClass& BP,
-                      FCallIR& Out, std::string* Err);
+                      FCallIR& Out, std::string* Err, const Json* Receiver = nullptr);
     /* A constant outside any function body, `constexpr int32 kMax = 40;` at namespace scope or static in a class:
        decl id -> its VarDecl. It has no storage in a Blueprint, so a use is its value (FoldConst). */
     std::map<std::string, const Json*> ConstVars;
@@ -2911,7 +2912,7 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         Out.K = FArgIR::Call;
         Out.Sub = std::make_shared<FCallIR>();
         if (!LowerCall(*N, BP, *Out.Sub, Err)) return false;
-        if (Kind(*Obj) == "CXXThisExpr") return true;
+        if (Kind(*Obj) == "CXXThisExpr" || Out.Sub->bReceiverIsArg) return true;
         Out.Sub->Target = std::make_shared<FArgIR>();
         if (!LowerArg(*Obj, BP, *Out.Sub->Target, Err)) return false;
         /* Through an interface the implementation is found by name, as the Blueprint compiler calls it. */
@@ -3517,16 +3518,26 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
            that static's: its declaration, purity, flags and world-context wiring. */
         if (auto Fw = R->Forwards.find(MethodName); Decl != R->Methods.end() && Fw != R->Forwards.end())
         {
+            if (K == "CXXMemberCallExpr") Receiver = Strip(First(*Callee));
+            if (!Receiver) { *Err = MethodName + "(): TODO: only a call on an object (`Obj->" + MethodName + "()`)"; return false; }
+            /* No `::`: a free inline function (UObject_GetOuter), expanded here with the object as its first argument. */
+            if (Fw->second.find("::") == std::string::npos)
+            {
+                const Json* Def = nullptr;
+                for (const auto& [Id, N] : FreeInlines) if (Name(*N) == Fw->second) { Def = N; break; }
+                if (!Def) { *Err = MethodName + "() is " + Fw->second + ", which is not declared here: include its UeApi header"; return false; }
+                Out.bReceiverIsArg = true;
+                return ExpandInline(CallExprNode, *Def, Fw->second, false, BP, Out, Err, Receiver);
+            }
             const size_t Sep = Fw->second.rfind("::");
             const FRecord* Lib = Sep == std::string::npos ? nullptr : Find(Fw->second.substr(0, Sep));
             const std::string Target = Sep == std::string::npos ? std::string() : Fw->second.substr(Sep + 2);
             if (!Lib || !Lib->Methods.count(Target))
             { *Err = MethodName + "() is " + Fw->second + ", which is not declared here: include its UeApi header"; return false; }
-            if (K == "CXXMemberCallExpr") Receiver = Strip(First(*Callee));
-            if (!Receiver) { *Err = MethodName + "(): TODO: only a call on an object (`Obj->" + MethodName + "()`)"; return false; }
             R = Lib;
             MethodName = Target;
             Decl = R->Methods.find(MethodName);
+            Out.bReceiverIsArg = true;
         }
         const bool bStatic = Decl != R->Methods.end() && IsStaticDecl(*Decl->second);
         if (Decl != R->Methods.end()) FullDecl = Decl->second;
@@ -4812,7 +4823,7 @@ bool HasGoto(const Json& N)
    A reference parameter bound to a variable is another name for it; bound to anything else it is a copy.
    Only calls on `this` (or a static) expand, since the body's `this` stays the caller's self. */
 bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::string& Method, bool bMethod, FBlueprintClass& BP,
-                             FCallIR& Out, std::string* Err)
+                             FCallIR& Out, std::string* Err, const Json* Receiver)
 {
     if (!CurLocals) { *Err = "internal: an inline call outside a function body"; return false; }
     if (std::find(InlineStack.begin(), InlineStack.end(), Method) != InlineStack.end())
@@ -4848,6 +4859,7 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
     ForEach(Def, [&](const Json& C) { if (Kind(C) == "ParmVarDecl") Parms.push_back(&C); });
     std::vector<std::string> Binds, BindIds;
     bool bFirst = true;
+    if (Receiver) Args.push_back(Receiver);     // a forwarded method: the object is the free function's first parameter
     ForEach(CallNode, [&](const Json& C) { if (bFirst) { bFirst = false; return; } Args.push_back(&C); });
     if (Args.size() != Parms.size()) { *Err = "inline call to " + Method + " with " + std::to_string(Args.size()) + " arguments"; return false; }
     for (size_t I = 0; I < Parms.size(); ++I)
