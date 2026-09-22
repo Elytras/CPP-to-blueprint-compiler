@@ -336,6 +336,7 @@ struct FRecord
     /* genueapi's `<X>__UeName`: the engine's name of a member or function Dumper-7 had to respell (`Name_0` is
        `Name`, `Audio_Flying` is `Audio Flying`). C++ keeps its spelling; everything cooked goes through UeNameOf. */
     std::map<std::string, std::string> UeNames;
+    std::map<std::string, std::string> Forwards;    // method -> "ULibrary::Static" that does it, the object first (UObject::GetOuter)
     /* The C++ access specifier, which is the editor's own: private is the class alone, protected its subclasses too.
        A function carries it as a flag. A variable has private only, and only as editor metadata, so a private
        field is simply left out of the API stub; a protected one stays visible, a subclass having a right to it. */
@@ -1619,6 +1620,11 @@ bool FCompiler::Collect(std::string* Err)
                     R.UeName = R.CppName;
                 }
             }
+            else if (Kind(C) == "VarDecl" && Name(C).size() > 11 && Name(C).compare(Name(C).size() - 11, 11, "__UeForward") == 0)
+            {
+                std::string Target;
+                if (FindLiteral(C, Target)) R.Forwards[Name(C).substr(0, Name(C).size() - 11)] = Target;
+            }
             else if (Kind(C) == "VarDecl" && Name(C).size() > 8 && Name(C).compare(Name(C).size() - 8, 8, "__UeName") == 0)
             {
                 std::string Real;
@@ -1753,7 +1759,7 @@ FIndex FCompiler::FindEvent(FBlueprintClass& BP, const std::string& FromRecord, 
                 *InheritedFlags = ModMethodFlags(*R, Method, BP);
                 return bFlagsOnly ? Null() : BP.EngineFunction(ModPackage + "/" + R->CppName, R->CppName + "_C", UeMethod);
             }
-        if (R->IsNative() && R->Methods.count(Method))
+        if (R->IsNative() && R->Methods.count(Method) && !R->Forwards.count(Method))   // a forwarder is no UFunction to override
         {
             *InheritedFlags = FlagsOf(*R);
             return bFlagsOnly ? Null() : BP.EngineFunction(R->UePackage, R->UeName, UeMethod);
@@ -3449,6 +3455,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
 
     std::string DeclId, MethodName;
     const Json* FullDecl = nullptr;     // the UFunction's own signature, whichever overload was called
+    const Json* Receiver = nullptr;     // a forwarded method's object, first among the arguments (UObject::GetOuter)
     if (K == "CXXMemberCallExpr")
     {
         if (Kind(*Callee) != "MemberExpr") { *Err = "TODO: unimplemented callee " + Kind(*Callee); return false; }
@@ -3505,6 +3512,22 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         if (!R) { *Err = "call to a function on an unknown class: " + Owner->second; return false; }
 
         auto Decl = R->Methods.find(MethodName);
+        /* `Obj->GetOuter()`: no UFunction of Object. The header forwards it to the static that does it
+           (`UKismetSystemLibrary::GetOuterObject`), and Obj goes first among the arguments. From here on the call IS
+           that static's: its declaration, purity, flags and world-context wiring. */
+        if (auto Fw = R->Forwards.find(MethodName); Decl != R->Methods.end() && Fw != R->Forwards.end())
+        {
+            const size_t Sep = Fw->second.rfind("::");
+            const FRecord* Lib = Sep == std::string::npos ? nullptr : Find(Fw->second.substr(0, Sep));
+            const std::string Target = Sep == std::string::npos ? std::string() : Fw->second.substr(Sep + 2);
+            if (!Lib || !Lib->Methods.count(Target))
+            { *Err = MethodName + "() is " + Fw->second + ", which is not declared here: include its UeApi header"; return false; }
+            if (K == "CXXMemberCallExpr") Receiver = Strip(First(*Callee));
+            if (!Receiver) { *Err = MethodName + "(): TODO: only a call on an object (`Obj->" + MethodName + "()`)"; return false; }
+            R = Lib;
+            MethodName = Target;
+            Decl = R->Methods.find(MethodName);
+        }
         const bool bStatic = Decl != R->Methods.end() && IsStaticDecl(*Decl->second);
         if (Decl != R->Methods.end()) FullDecl = Decl->second;
         if (Decl != R->Methods.end())
@@ -3572,6 +3595,13 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
     /* inner[0] is the callee. */
     bool bFirst = true, bOk = true;
     std::vector<bool> Defaulted;
+    if (Receiver)
+    {
+        FArgIR A;
+        bOk = LowerArg(*Receiver, BP, A, Err);
+        if (bOk) Out.Args.push_back(A);
+        Defaulted.push_back(false);
+    }
     ForEach(CallExprNode, [&](const Json& C) {
         if (bFirst) { bFirst = false; return; }
         if (!bOk) return;

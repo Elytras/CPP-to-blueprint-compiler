@@ -403,6 +403,17 @@ def parse_params(text):
     return out
 
 
+# ---- forwarders ----------------------------------------------------------------------------------------------
+# What UObject has in C++ but not as a UFunction. The header declares each as a method and names, in a marker the
+# compiler reads (`X__UeForward`), the static library function that does it - the object goes first among its
+# arguments, as the editor's node takes it on its target pin. Any object, `this` included.
+UOBJECT_FORWARDS = (
+    ("class UObject*", "GetOuter", "UKismetSystemLibrary::GetOuterObject"),
+    ("class UClass*", "GetClass", "UGameplayStatics::GetObjectClass"),
+    ("FString", "GetName", "UKismetSystemLibrary::GetObjectName"),
+)
+
+
 # ---- engine names --------------------------------------------------------------------------------------------
 # Dumper-7 respells what C++ cannot say. A member that collides with an inherited one gets a tail (a Blueprint
 # class's `Name` is `Name_0`, the SDK's UObject having a Name; `UberGraphFrame_<Class>`), a character C++ has no use
@@ -986,6 +997,12 @@ def main():
                 funcs += 1
                 for t in [ret] + [t for t, _ in params]:
                     referenced.update(class_refs(t))
+            if k.cpp == "UObject":
+                body.append("    /* C++ has these, the reflection does not: each is the Kismet library call the marker names,")
+                body.append("       this object its first argument. Any object, not only this. */")
+                for ret, name, target in UOBJECT_FORWARDS:
+                    body.append("    %s %s();" % (ret, name))
+                    body.append('    static constexpr const char* %s__UeForward = "%s";' % (name, target))
             body.append("};\n")
         if ns_open:
             body.append(ns_end(ns_open) + "\n")

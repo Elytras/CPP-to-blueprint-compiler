@@ -380,6 +380,13 @@ def engine_names():
         flags = int(re.search(r'FunctionFlags (\S+)', tool('dumpstruct.py', exports.index(fn))).group(1), 16)
         assert flags & 0xE0000 == want, (fn, hex(flags))
     print('ok  NameTest: a function carries its C++ access specifier')
+    # GetOuter() / GetName() / GetClass() are the library statics, the object as the first argument.
+    w = tool('walkscript.py', exports.index('Whose'))
+    assert "Function'GetOuterObject'" in w and w.count("Function'GetObjectName'") == 1 and 'GetOuter' not in w.replace('GetOuterObject', ''), w
+    assert "FinalFunction" in w and "Function'GetName'" in w, w   # UFSDSaveGame's own GetName hides the forwarder
+    w = tool('walkscript.py', exports.index('SameKind'))
+    assert w.count("Function'GetObjectClass'") == 2 and "LocalVariable" in w and 'Self' in w, w
+    print('ok  NameTest: Obj->GetOuter() / GetName() / GetClass() forward to the Kismet library')
     # CPF_BlueprintReadOnly 0x10 on the const member alone, and its initializer is the default.
     props = tool('dumpstruct.py', exports.index('NameTest_C'))
     flags = lambda name: int(re.search(r'Property %s .*? flags=(\S+)' % name, props).group(1), 16)
