@@ -1018,6 +1018,15 @@ private:
     bool HoistBranch(FArgIR& A, FBlueprintClass& BP, std::vector<FPropertyDef>& Locals,
                      std::vector<FStmtIR>& OutPre, std::string* Err);
 
+    /* `X op= Y`, `++X`, `X--`: DesugarUpdate rewrites one into a CompoundStmt of plain `=`, evaluating X's
+       side effects once (StabilizeLvalue / HoistExpr park them in synthetic locals first). With Result, the
+       block also leaves the expression's value in a local named there. */
+    bool DesugarUpdate(const Json& S, Json& Wrap, std::string* Result, std::string* Err);
+    Json StabilizeLvalue(const Json& N, Json& Pre);
+    Json HoistExpr(const Json& N, Json& Pre);
+    Json SynthLocal(const std::string& Type, const Json& Init, Json& Pre);
+    bool LowerUpdateValue(const Json& N, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
+
     /* The native UFunction Method overrides, or null; InheritedFlags gets the flags it passes on, also
        for a method implementing an interface's function, which has no Super. */
     uint32 ModMethodFlags(const FRecord& Owner, const std::string& Method, FBlueprintClass& BP);
@@ -3276,8 +3285,7 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         const Json* Operand = Nth(*N, 0);
         if (!Operand) { *Err = "unary `" + Op + "` with a missing operand"; return false; }
         if (Op == "+") return LowerArg(*Operand, BP, Out, Err);
-        if (Op == "++" || Op == "--")
-        { *Err = "`" + Op + "` works as a statement (or a `for` increment), not inside an expression"; return false; }
+        if (Op == "++" || Op == "--") return LowerUpdateValue(*N, BP, Out, Err);
         if (Op == "-" || Op == "~")
         {
             /* A literal folds; otherwise 0 - X, or Kismet's bitwise Not_Int / Not_Int64. */
@@ -3469,9 +3477,148 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
     }
 
     if (K == "InitListExpr") return LowerMakeStruct(StripTypeKeywords(TypeOf(*N)), N, BP, Out, Err);
+    if (K == "CompoundAssignOperator") return LowerUpdateValue(*N, BP, Out, Err);
 
     *Err = "TODO: unimplemented argument " + K;
     return false;
+}
+
+/* True when evaluating N twice is the same as once: names, literals, member reads and arithmetic, no call or store. */
+static bool IsSideEffectFree(const Json& N)
+{
+    const std::string K = Kind(N);
+    const std::string Op = N.value("opcode", std::string());
+    if (K == "BinaryOperator")
+    {
+        if (Op == "=") return false;
+    }
+    else if (K == "UnaryOperator")
+    {
+        if (Op == "++" || Op == "--") return false;
+    }
+    else if (K != "DeclRefExpr" && K != "CXXThisExpr" && K != "MemberExpr" && K != "ImplicitCastExpr"
+          && K != "ParenExpr" && K != "ConstantExpr" && K != "CStyleCastExpr" && K != "CXXStaticCastExpr"
+          && K != "IntegerLiteral" && K != "FloatingLiteral" && K != "CXXBoolLiteralExpr"
+          && K != "CharacterLiteral" && K != "StringLiteral" && K != "CXXNullPtrLiteralExpr")
+        return false;
+    bool bFree = true;
+    ForEach(N, [&](const Json& C) { bFree = bFree && IsSideEffectFree(C); });
+    return bFree;
+}
+
+/* A fresh local initialised from Init, declared into Pre; returns an rvalue read of it. */
+Json FCompiler::SynthLocal(const std::string& Type, const Json& Init, Json& Pre)
+{
+    const int32 N = ReadTmpCounter++;
+    const std::string Id = "upd" + std::to_string(N), LocalN = "__Upd" + std::to_string(N) + "__";
+    const Json T = { { "qualType", Type } };
+    Pre.push_back({ { "kind", "DeclStmt" }, { "inner", Json::array({
+        { { "kind", "VarDecl" }, { "id", Id }, { "name", LocalN }, { "type", T }, { "init", "c" }, { "inner", Json::array({ Init }) } } }) } });
+    const Json Ref = { { "kind", "DeclRefExpr" }, { "type", T }, { "valueCategory", "lvalue" },
+                       { "referencedDecl", { { "id", Id }, { "kind", "VarDecl" }, { "name", LocalN }, { "type", T } } } };
+    return { { "kind", "ImplicitCastExpr" }, { "castKind", "LValueToRValue" }, { "type", T }, { "valueCategory", "prvalue" },
+             { "inner", Json::array({ Ref }) } };
+}
+
+/* An rvalue N, parked in a local unless reading it again is harmless. */
+Json FCompiler::HoistExpr(const Json& N, Json& Pre)
+{
+    if (IsSideEffectFree(N)) return N;
+    return SynthLocal(StripTypeKeywords(TypeOf(N)), N, Pre);
+}
+
+/* The same place as lvalue N, with whatever locates it (an index, a pointer from a call) evaluated into Pre
+   once. The place itself is not copied: the store has to land in it. */
+Json FCompiler::StabilizeLvalue(const Json& N, Json& Pre)
+{
+    if (IsSideEffectFree(N)) return N;
+    const std::string K = Kind(N);
+    Json Out = N;
+    if (K == "ParenExpr" || (K == "ImplicitCastExpr" && N.value("castKind", std::string()) == "NoOp")
+        || (K == "MemberExpr" && !N.value("isArrow", false)))
+        Out["inner"][0] = StabilizeLvalue(N["inner"][0], Pre);
+    else if (K == "MemberExpr" || (K == "UnaryOperator" && N.value("opcode", std::string()) == "*"))
+        Out["inner"][0] = HoistExpr(N["inner"][0], Pre);                  // `P->X`, `*P`: the pointer is a value
+    else if ((IsTArrayElement(N) || IsTMapElement(N)) && N["inner"].size() == 3)
+    {
+        Out["inner"][1] = StabilizeLvalue(N["inner"][1], Pre);           // the container is a place too
+        Out["inner"][2] = HoistExpr(N["inner"][2], Pre);
+    }
+    // ponytail: anything else (a call returning T&) is left to evaluate twice; a pointer local fixes it if one shows up.
+    return Out;
+}
+
+bool FCompiler::DesugarUpdate(const Json& S, Json& Wrap, std::string* Result, std::string* Err)
+{
+    const std::string K = Kind(S);
+    const std::string Op = S.value("opcode", std::string());
+    const bool bStep = K == "UnaryOperator";
+    const Json* Orig = Nth(S, 0);
+    if (!Orig || (!bStep && !Nth(S, 1))) { *Err = "`" + Op + "` with no destination"; return false; }
+
+    /* X is located once. C++17 sequences Y before X in `X op= Y`, so a Y that must not move past X's side
+       effects goes first. */
+    Json Pre = Json::array(), LhsPre = Json::array();
+    const Json LhsNode = StabilizeLvalue(*Orig, LhsPre);
+    Json Rhs = bStep ? Json{ {"kind", "IntegerLiteral"}, {"type", {{"qualType", "int"}}}, {"value", "1"} } : *Nth(S, 1);
+    if (!LhsPre.empty()) Rhs = HoistExpr(Rhs, Pre);
+    for (Json& D : LhsPre) Pre.push_back(std::move(D));
+    const Json* Lhs = &LhsNode;
+
+    const Json LhsType = Lhs->value("type", Json::object());
+    const bool bPointer = !PointeeOf(*Lhs).empty();
+    std::string OpType = bStep ? TypeOf(*Lhs) : S.value("computeLHSType", Json::object()).value("qualType", TypeOf(*Lhs));
+    if (bStep && !bPointer)
+    {
+        const std::string C = Canon(OpType);
+        OpType = C == "float" ? "float" : IsInt64Type(OpType) ? "int64" : "int";
+    }
+    Json Read = { {"kind", "ImplicitCastExpr"}, {"castKind", "LValueToRValue"}, {"type", LhsType}, {"inner", Json::array({*Lhs})} };
+    const Json PlainRead = Read;
+    if (!bPointer && StripTypeKeywords(OpType) != StripTypeKeywords(TypeOf(*Lhs)))
+        Read = { {"kind", "ImplicitCastExpr"}, {"castKind", "IntegralCast"}, {"type", {{"qualType", OpType}}}, {"inner", Json::array({Read})} };
+    if (bStep && !bPointer && OpType != "int")
+        Rhs = { {"kind", "ImplicitCastExpr"}, {"castKind", "IntegralCast"}, {"type", {{"qualType", OpType}}}, {"inner", Json::array({Rhs})} };
+    const std::string BinOp = bStep ? std::string(Op == "++" ? "+" : "-") : Op.substr(0, Op.size() - 1);
+    Json Value = { {"kind", "BinaryOperator"}, {"opcode", BinOp}, {"type", bPointer ? LhsType : Json{{"qualType", OpType}}},
+                   {"inner", Json::array({Read, Rhs})} };
+    if (!bPointer && StripTypeKeywords(OpType) != StripTypeKeywords(TypeOf(*Lhs)))
+        Value = { {"kind", "ImplicitCastExpr"}, {"castKind", "IntegralCast"}, {"type", LhsType}, {"inner", Json::array({Value})} };
+
+    /* The value of `X--` is X before the store; of `++X` and `X op= Y`, X after it. */
+    const bool bPostfix = bStep && S.value("isPostfix", false);
+    const std::string ValueType = StripTypeKeywords(TypeOf(*Lhs));
+    auto KeepResult = [&]() {
+        const Json ResRef = SynthLocal(ValueType, PlainRead, Pre);
+        *Result = ResRef["inner"][0]["referencedDecl"].value("name", std::string());
+    };
+    if (Result && bPostfix) KeepResult();
+    Pre.push_back({ {"kind", "BinaryOperator"}, {"opcode", "="}, {"type", LhsType}, {"inner", Json::array({*Lhs, Value})} });
+    if (Result && !bPostfix) KeepResult();
+    Wrap = { {"kind", "CompoundStmt"}, {"inner", std::move(Pre)} };
+    return true;
+}
+
+/* `return Any |= Bad;`, `Items[I++]`: the update's statements run first, inline, and its value is a local. */
+bool FCompiler::LowerUpdateValue(const Json& N, FBlueprintClass& BP, FArgIR& Out, std::string* Err)
+{
+    if (!CurLocals) { *Err = "internal: an update expression outside a function body"; return false; }
+    Json Wrap;
+    std::string Result;
+    auto Body = std::make_shared<std::vector<FStmtIR>>();
+    if (!DesugarUpdate(N, Wrap, &Result, Err) || !LowerBody(Wrap, BP, *Body, *CurLocals, Err)) return false;
+    const std::string Type = StripTypeKeywords(TypeOf(*Nth(N, 0)));
+    auto Block = std::make_shared<std::vector<FStmtIR>>(1);
+    (*Block)[0].K = FStmtIR::Block;
+    (*Block)[0].Body = Body;
+    Out.K = FArgIR::Call;
+    Out.InnerType = Type;
+    Out.Sub = std::make_shared<FCallIR>();
+    Out.Sub->Intrinsic = "__Inline__";
+    Out.Sub->Inline = Block;
+    Out.Sub->InlineResult = Result;
+    Out.Sub->InlineType = Type;
+    return true;
 }
 
 bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR& Out, std::string* Err)
@@ -4136,34 +4283,9 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
         else if (K == "CompoundAssignOperator"
               || (K == "UnaryOperator" && (S->value("opcode", std::string()) == "++" || S->value("opcode", std::string()) == "--")))
         {
-            /* `X op= Y` / `++X` / `X--` as statements are `X = X op Y` / `X = X +- 1`. X is evaluated twice, which only
-               matters for a destination with side effects (`Items[Next()] += 1`). */
-            const std::string Op = S->value("opcode", std::string());
-            const bool bStep = K == "UnaryOperator";
-            const Json* Lhs = Nth(*S, 0);
-            if (!Lhs) { *Err = "`" + Op + "` with no destination"; bOk = false; return; }
-            const Json LhsType = Lhs->value("type", Json::object());
-            const bool bPointer = !PointeeOf(*Lhs).empty();
-            std::string OpType = bStep ? TypeOf(*Lhs) : S->value("computeLHSType", Json::object()).value("qualType", TypeOf(*Lhs));
-            if (bStep && !bPointer)
-            {
-                const std::string C = Canon(OpType);
-                OpType = C == "float" ? "float" : IsInt64Type(OpType) ? "int64" : "int";
-            }
-            Json Read = { {"kind", "ImplicitCastExpr"}, {"castKind", "LValueToRValue"}, {"type", LhsType}, {"inner", Json::array({*Lhs})} };
-            if (!bPointer && StripTypeKeywords(OpType) != StripTypeKeywords(TypeOf(*Lhs)))
-                Read = { {"kind", "ImplicitCastExpr"}, {"castKind", "IntegralCast"}, {"type", {{"qualType", OpType}}}, {"inner", Json::array({Read})} };
-            Json Rhs = bStep ? Json{ {"kind", "IntegerLiteral"}, {"type", {{"qualType", "int"}}}, {"value", "1"} } : *Nth(*S, 1);
-            if (bStep && !bPointer && OpType != "int")
-                Rhs = { {"kind", "ImplicitCastExpr"}, {"castKind", "IntegralCast"}, {"type", {{"qualType", OpType}}}, {"inner", Json::array({Rhs})} };
-            const std::string BinOp = bStep ? std::string(Op == "++" ? "+" : "-") : Op.substr(0, Op.size() - 1);
-            Json Value = { {"kind", "BinaryOperator"}, {"opcode", BinOp}, {"type", bPointer ? LhsType : Json{{"qualType", OpType}}},
-                           {"inner", Json::array({Read, Rhs})} };
-            if (!bPointer && StripTypeKeywords(OpType) != StripTypeKeywords(TypeOf(*Lhs)))
-                Value = { {"kind", "ImplicitCastExpr"}, {"castKind", "IntegralCast"}, {"type", LhsType}, {"inner", Json::array({Value})} };
-            Json Assign = { {"kind", "BinaryOperator"}, {"opcode", "="}, {"type", LhsType}, {"inner", Json::array({*Lhs, Value})} };
-            Json Wrap = { {"kind", "CompoundStmt"}, {"inner", Json::array({Assign})} };
-            bOk = LowerBody(Wrap, BP, Out, Locals, Err);
+            /* `X op= Y` / `++X` / `X--` as statements are `X = X op Y` / `X = X +- 1`, X located once. */
+            Json Wrap;
+            bOk = DesugarUpdate(*S, Wrap, nullptr, Err) && LowerBody(Wrap, BP, Out, Locals, Err);
             return;
         }
         else if ((K == "BinaryOperator" && S->value("opcode", std::string()) == "=")

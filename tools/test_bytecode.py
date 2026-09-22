@@ -120,6 +120,19 @@ def clusters_shape():
 
 
 clusters_shape()
+
+
+def update_once():
+    import subprocess
+    base = asset('FlowTest')
+    names = [e['name'] for e in dumpexp.load(base)[5]]
+    w = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'walkscript.py'), base,
+                        str(names.index('BumpSlot'))], capture_output=True, text=True).stdout
+    assert w.count('NextSlot') == 1 and w.count('ArrayGetByRef') == 2, w
+    print('ok  FlowTest.BumpSlot: Slots[NextSlot()] += By calls NextSlot once')
+
+
+update_once()
 check('FlowTest', 'DenseByte', lambda Mode: {0: 3, 1: 4, 2: 5}.get(Mode, 0), [dict(Mode=m) for m in (0, 1, 2, 3, 255)])
 
 
@@ -143,6 +156,10 @@ def while_and(Limit):
 
 check('FlowTest', 'Arith', lambda A, B: cdiv(A, B) + cmod(A, B) * 10 + A + ~B,
       [dict(A=a, B=b) for a in (-7, 0, 7, 100) for b in (-3, 1, 3)])
+check('FlowTest', 'PostInc', lambda X: X * 100 + X + 1, [dict(X=x) for x in (-1, 0, 5)])
+check('FlowTest', 'PreInc', lambda X: (X + 1) * 101, [dict(X=x) for x in (-1, 0, 5)])
+check('FlowTest', 'UpdateChain', lambda X: (1 + X) * 11, [dict(X=x) for x in (-1, 0, 4)])
+check('FlowTest', 'OrAssign', lambda N: 11 if N > 0 else 0, [dict(N=n) for n in (-1, 0, 3)])
 check('FlowTest', 'SafeRatio', lambda X: X != 0 and cdiv(10, X) > 2, [dict(X=x) for x in (-2, 0, 1, 3, 4)])
 check('FlowTest', 'EitherZero', lambda X, Y: X == 0 or cdiv(100, X) == Y, [dict(X=x, Y=y) for x in (0, 10, 3) for y in (0, 10, 33)])
 check('FlowTest', 'Pick', lambda X: X * 2 if X > 0 else (-1 if X < -5 else 7), [dict(X=x) for x in (-9, -5, 0, 4)])
