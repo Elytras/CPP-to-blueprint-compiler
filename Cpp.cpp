@@ -1111,6 +1111,12 @@ private:
         return BP.ScriptStruct(std::string(NestedPackage) + "/" + Name, Name);
     }
     bool GenerateNestedWrappers(const std::string& OutDir, std::string* Err);
+    /* The read-hoist scratch, synthesized on first deref rather than copied into every mod source.
+       It is kept out of Records so the cook loop cannot reach it: whether a deref happened is only
+       known once lowering has run, so GenerateDerefStruct cooks it afterwards. */
+    mutable Json    DerefAst;        // owns the three FieldDecl nodes SynthDeref.Fields point into
+    mutable FRecord SynthDeref;
+    mutable bool    bSynthDeref = false;
     std::map<std::string, FRecord> Records;
     std::map<std::string, std::string> MethodOwner;   // clang decl id -> owning record
     std::map<std::string, std::string> FieldOwner;    // clang decl id -> declaring record
@@ -2459,13 +2465,33 @@ void FCompiler::NormalizePointers(Json& N) const
     for (Json& C : N) NormalizePointers(C);
 }
 
+/* The TArray-shaped scratch every read through a pointer assembles into (see BpMods/Intrin.h).
+   Its layout is fixed by the engine's TArray, not by the mod, and a mod reaches a deref without
+   ever asking for one - `Obj->GetOuter()` lowers to a read of OuterPrivate - so requiring the
+   source to declare it was a copy-paste tax with one correct answer. A mod that declares its own
+   FDeref still wins: Find sees it first and nothing is synthesized. */
 bool FCompiler::HasDerefStruct(std::string* Err) const
 {
+    (void)Err;
     const FRecord* D = Find("FDeref");
     if (D && D->bIsStruct && !D->IsNative()) return true;
-    *Err = "memory through a pointer needs this mod to declare "
-           "`struct FDeref { UE_STRUCT; int64 Data; int32 Num; int32 Max; };` (as ReadProperty.cpp does)";
-    return false;
+    if (bSynthDeref) return true;
+
+    DerefAst = Json::array();
+    for (const auto& [Field, Type] : { std::pair<const char*, const char*>{ "Data", "int64" },
+                                       { "Num", "int32" }, { "Max", "int32" } })
+        DerefAst.push_back(Json{ { "kind", "FieldDecl" }, { "name", Field },
+                                 { "type", Json{ { "qualType", Type } } } });
+
+    SynthDeref = FRecord();
+    SynthDeref.CppName   = "FDeref";
+    SynthDeref.UeName    = "FDeref";
+    SynthDeref.UePackage = ModPackage + "/FDeref";
+    SynthDeref.bIsStruct = true;
+    SynthDeref.bIsLocal  = true;
+    for (const Json& F : DerefAst) SynthDeref.Fields.push_back(&F);
+    bSynthDeref = true;
+    return true;
 }
 
 /* Whether evaluating N can neither fault nor do anything: then `L && N` may run both sides, as one BooleanAND.
@@ -7056,6 +7082,13 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
                         remove((OutDir + "/" + Other.first + Ext).c_str());
             return false;
         }
+        ++Generated;
+    }
+    /* After the loop, not in it: lowering is what discovers the deref, and the mod's own
+       FDeref (if it declared one) was cooked above as an ordinary record. */
+    if (bSynthDeref)
+    {
+        if (!GenerateStruct(SynthDeref, OutDir, Err)) return false;
         ++Generated;
     }
     for (const auto& Entry : ModEnums)
