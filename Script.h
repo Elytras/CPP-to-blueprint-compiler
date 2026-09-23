@@ -156,6 +156,9 @@ public:
     int32 Jump(int32 MemTarget);
     int32 JumpIfNot(int32 MemTarget, const std::function<void(FScript&)>& Cond);
     void PatchJumpTarget(int32 StorageOffset, int32 MemTarget);
+    /* Once every target is patched: a jump that lands on an EX_Jump goes straight to where that one goes. Only
+       operands change, so no offset moves. */
+    void ThreadJumps();
     /* EX_ComputedJump: OffsetExpr yields the int32 MEMORY offset to continue at. */
     void ComputedJump(const std::function<void(FScript&)>& OffsetExpr);
     /* A raw int32 operand after an Op, to patch later through PatchJumpTarget. */
@@ -225,6 +228,8 @@ public:
 private:
     FArc Ar;
     int32 Memory = 0;
+    std::vector<int32> JumpOperands;            // every Jump / JumpIfNot operand, by storage offset
+    std::map<int32, int32> PlainJumpAt;         // an EX_Jump's memory offset -> its operand's storage offset
 };
 
 /* Super is the overridden engine UFunction (what makes e.g. ReceiveTick an event), or null. */
