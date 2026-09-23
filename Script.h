@@ -1,6 +1,7 @@
 ﻿#pragma once
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -11,6 +12,12 @@ namespace Uasset
 {
 bool IsAscii(const std::string& S);
 std::u16string Utf8To16(const std::string& Utf8);
+
+struct FFieldRef
+{
+    std::string Name;
+    FIndex Owner;
+};
 
 /* A member's literal initializer. None = the type's zero value. */
 struct FDefaultValue
@@ -175,11 +182,11 @@ public:
                  const std::function<void(FScript&)>& Var,
                  const std::function<void(FScript&)>& Value);
 
-    /* The skip count is MEMORY bytes of ContextExpr, measured here. RValue names the property
-       ContextExpr reads, which the VM zeroes when the object is null; a call leaves it empty. */
+    /* The skip count is MEMORY bytes of ContextExpr, measured here. RValue is the property
+       ContextExpr reads, which the VM zeroes when the object is null. */
     void Context(const std::function<void(FScript&)>& ObjectExpr,
                  const std::function<void(FScript&)>& ContextExpr,
-                 const std::string& RValue = std::string(), FIndex RValueOwner = FIndex());
+                 const std::optional<FFieldRef>& RValue = std::nullopt);
 
     void StructConst(FIndex Struct, int32 SerializedSize, const std::function<void(FScript&)>& Members);
 

@@ -637,7 +637,7 @@ bool EmitArg(FScript& S, const FArgIR& A, FIndex SelfExp, std::string* Err)
         bool bOk = true;
         std::string SubErr;
         S.Context([&](FScript& O) { bOk = EmitArg(O, *A.Base, SelfExp, &SubErr); },
-                  [&](FScript& C) { C.InstanceVariable(A.S, A.Owner); }, A.S, A.Owner);
+                  [&](FScript& C) { C.InstanceVariable(A.S, A.Owner); }, FFieldRef{ A.S, A.Owner });
         if (!bOk && Err) *Err = SubErr;
         return bOk;
     }
@@ -873,7 +873,7 @@ class FCompiler
 {
 public:
     bool Run(const std::string& SourcePath, const std::string& IncludeDir,
-             const std::string& OutDir, const std::string& InApiDir, std::string* Err);
+             const std::string& OutDir, const std::optional<std::string>& InApiDir, std::string* Err);
 
 private:
     bool Collect(std::string* Err);
@@ -1098,7 +1098,7 @@ private:
     const FOpInfo* FindOp(const std::string& Op, const std::string& Lhs, const std::string& Rhs) const;
     void ApplyConv(const FConv& C, FBlueprintClass& BP, FArgIR& Arg);
     std::string ModPackage;
-    std::string ApiDir;         // set by `--api`: where the uncooked editor-side stubs go
+    std::optional<std::string> ApiDir;      // `--api`: where the uncooked editor-side stubs go
     std::string SourceDir;      // the compiled .cpp's folder: what __EmbedFile__ resolves a relative path against
     /* A container inside a container: UE has no such property, so the inner one is the single member (Value) of a
        wrapper struct, <wrapper name> -> the container type. The wrapper has the container's layout. */
@@ -6568,7 +6568,7 @@ bool FCompiler::GenerateStruct(const FRecord& R, const std::string& OutDir, std:
     const uint32 Guid[4] = { ~H, H * 2654435761u, H ^ 0x9E3779B9u, H };
     /* The editor stub reads the members before FinishStruct consumes them; both share the same Guid,
        so the cooked and uncooked assets carry identical member names and struct identity. */
-    if (!ApiDir.empty() && !IsInternalViewStruct(R.CppName) && !BP.WriteApiStruct(ApiDir, Guid, Err))
+    if (ApiDir && !IsInternalViewStruct(R.CppName) && !BP.WriteApiStruct(*ApiDir, Guid, Err))
         return false;
     BP.FinishStruct(Guid);
     if (!P.Save(OutDir + "/" + R.CppName, Err)) return false;
@@ -6586,7 +6586,7 @@ bool FCompiler::GenerateEnum(const std::string& Name, const std::string& OutDir,
     FPackage P(PackageName);
     StampIdentity(P, PackageName);
     FBlueprintClass BP(P, Name, "", "", false);
-    if (!ApiDir.empty() && !BP.WriteApiEnum(ApiDir, ModEnums[Name], Err)) return false;
+    if (ApiDir && !BP.WriteApiEnum(*ApiDir, ModEnums[Name], Err)) return false;
     BP.FinishEnum(ModEnums[Name]);
     if (!P.Save(OutDir + "/" + Name, Err)) return false;
     RegistryRows.push_back({ PackageName, Name, "UserDefinedEnum" });
@@ -7376,7 +7376,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     if (bReplicatesAnything) BP.SetReplicates(true);
     BP.Finish();
     if (!P.Save(OutDir + "/" + R.CppName, Err)) return false;
-    if (!ApiDir.empty() && !BP.WriteApi(ApiDir, Err))
+    if (ApiDir && !BP.WriteApi(*ApiDir, Err))
     {
         /* A class with nothing callable is not a build failure; the mod simply has no API surface. */
         printf("  %-14s -> no API asset: %s\n", R.CppName.c_str(), Err->c_str());
@@ -7426,7 +7426,7 @@ bool FCompiler::LoadTables(const std::string& IncludeDir, std::string* Err)
 }
 
 bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir,
-                    const std::string& OutDir, const std::string& InApiDir, std::string* Err)
+                    const std::string& OutDir, const std::optional<std::string>& InApiDir, std::string* Err)
 {
     ApiDir = InApiDir;
     SourceDir = std::filesystem::path(SourcePath).parent_path().string();
@@ -7557,7 +7557,7 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
 }   // namespace
 
 bool CompileToAssets(const std::string& SourcePath, const std::string& IncludeDir,
-                     const std::string& OutDir, const std::string& ApiDir, std::string* Err)
+                     const std::string& OutDir, const std::optional<std::string>& ApiDir, std::string* Err)
 {
     FCompiler C;
     return C.Run(SourcePath, IncludeDir, OutDir, ApiDir, Err);
