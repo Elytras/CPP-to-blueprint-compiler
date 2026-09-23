@@ -10,7 +10,14 @@
 
 namespace Uasset
 {
-bool IsAscii(const std::string& S);
+/*
+Every std::string here is UTF-8: clang's JSON dump spells a mod's literals that way. UE writes a string
+in one of two widths - 8-bit (an FString with positive length, EX_StringConst) only when every char is
+ASCII, else UTF-16 (negative length, EX_UnicodeStringConst). The 8-bit form is read back as Latin-1, so
+UTF-8 bytes past 0x7F written there come out garbled. The FString writer and both string-constant
+emitters ask this to pick the width, and convert with Utf8To16 when it says no.
+*/
+bool IsAscii(const std::string& Utf8);
 std::u16string Utf8To16(const std::string& Utf8);
 
 struct FFieldRef
