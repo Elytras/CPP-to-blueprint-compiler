@@ -6638,7 +6638,9 @@ bool FCompiler::GenerateAsset(const Json& Var, const std::string& OutDir, std::s
 
     const std::string ClassPkg = R->IsNative() ? R->UePackage : ModPackage + "/" + R->CppName;
     const std::string ClassName = R->IsNative() ? R->UeName : R->CppName + "_C";
-    BP.FinishAsset(BP.EngineClass(ClassPkg, ClassName), BP.ClassDefaultObject(ClassPkg, ClassName));
+    /* The CDO's import first, as MSVC evaluates call arguments (right to left); clang goes left to right. */
+    const FIndex Cdo = BP.ClassDefaultObject(ClassPkg, ClassName);
+    BP.FinishAsset(BP.EngineClass(ClassPkg, ClassName), Cdo);
     if (!P.Save(OutDir + "/" + AssetName, Err)) return false;
     RegistryRows.push_back({ PackageName, AssetName, ClassName });
     printf("  %-14s -> %s.uasset  (asset, a %s)\n", AssetName.c_str(), AssetName.c_str(), R->CppName.c_str());
