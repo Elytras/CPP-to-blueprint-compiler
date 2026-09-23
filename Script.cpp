@@ -151,9 +151,9 @@ FPropertyDef DispatcherParam(const std::string& Name, FIndex Signature, uint64 E
                          | CPF_BlueprintCallable | ExtraFlags, Signature };
 }
 
-bool IsAscii(const std::string& S)
+bool IsAscii(const std::string& Utf8)
 {
-    return std::all_of(S.begin(), S.end(), [](char C) { return uint8(C) < 0x80; });
+    return std::all_of(Utf8.begin(), Utf8.end(), [](char C) { return uint8(C) < 0x80; });
 }
 
 std::u16string Utf8To16(const std::string& Utf8)
