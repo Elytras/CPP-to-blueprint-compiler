@@ -16,7 +16,7 @@ The only target so far is Deep Rock Galactic (UE 4.27, cooked, unversioned, tagg
 | LLVM `clang++` on `PATH` | AssetGen parses your source with clang's JSON AST dump |
 | Python 3 + `pyyaml` | `tools/bpbuild.py`, the multi-mod build driver |
 | UE 4.27 `UnrealPak.exe` (optional) | packs the result; set `UNREALPAK=<path>` if it isn't at the default Epic install path |
-| The game SDK headers (`UeApi/`) | what your mod `#include`s. Get them from the companion SDK repo, or generate your own with `tools/genueapi.py` |
+| The game SDK headers (`UeApi/`) | what your mod `#include`s. Get them from [DRG-Blueprint-Cpp-SDK](https://github.com/Elytras/DRG-Blueprint-Cpp-SDK), or generate your own with `tools/genueapi.py` |
 
 ## Build
 
@@ -65,7 +65,7 @@ mods:
 1. Dump the game with the [Dumper-7 fork](https://github.com/Elytras/Dumper-7) with `FullAssetPaths=1`
    in `Dumper-7.ini`. Upstream Dumper-7 doesn't write the package paths genueapi reads.
 2. `python tools/genueapi.py <dump>\SDK\SDK <UeApi dir>`
-3. Copy the hand-written `UeMeta.h` and `Types.h` from the SDK repo into `<UeApi dir>`.
+3. Copy the hand-written `UeMeta.h` and `Types.h` from [the SDK repo](https://github.com/Elytras/DRG-Blueprint-Cpp-SDK/tree/main/UeApi) into `<UeApi dir>`.
 
 ## Reporting bugs
 
