@@ -7612,7 +7612,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
 
         if (auto Cat = R.Categories.find(Fn.Name); Cat != R.Categories.end()) BP.ApiCategory[UeNameOf(&R, Fn.Name)] = Cat->second;
         BP.AddFunction(UeNameOf(&R, Fn.Name), Super, Params,
-                       [Stmts, bEndsWithReturn, bScratchNeeded, DerefStruct](FScript& S, FIndex SelfExp) {
+                       [Stmts, bEndsWithReturn, bScratchNeeded, DerefStruct, bOpt = !bCurNoOpt](FScript& S, FIndex SelfExp) {
             if (bScratchNeeded)
             {
                 /* Prime __DerefScratch__.Num = 1 so the ArrayGetByRef bounds check (0 <= idx < Num)
@@ -7626,6 +7626,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             }
             EmitStmts(Stmts, S, SelfExp);
             if (!bEndsWithReturn) S.Return();
+            if (bOpt) S.ThreadJumps();
             S.EndOfScript();
         }, Flags);
     }
