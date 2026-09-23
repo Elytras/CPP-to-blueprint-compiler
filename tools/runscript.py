@@ -130,6 +130,9 @@ CONTAINERS = {
     'Map_Keys': lambda ev, store, a: store(a[1], list(ev(a[0]).keys())),
     'Map_Find': lambda ev, store, a: (store(a[2], _made(ev, store, a[0], {}).get(ev(a[1]), 0)), ev(a[1]) in ev(a[0]))[1],
     'Map_Add': lambda ev, store, a: _made(ev, store, a[0], {}).__setitem__(ev(a[1]), copy.deepcopy(ev(a[2]))),
+    'Array_Clear': lambda ev, store, a: store(a[0], []),
+    'Set_Clear': lambda ev, store, a: store(a[0], []),
+    'Map_Clear': lambda ev, store, a: store(a[0], {}),
 }
 
 

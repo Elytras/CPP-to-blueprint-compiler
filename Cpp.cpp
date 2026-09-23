@@ -1005,7 +1005,7 @@ private:
        its Num=1 so ArrayGetByRef's bounds check passes. */
     void DropUnusedPure(std::vector<FStmtIR>& Stmts);
     void DropUnusedLocals(std::vector<FStmtIR>& Stmts, std::vector<FPropertyDef>& Locals);
-    void CoalesceTemps(std::vector<FStmtIR>& Stmts, std::vector<FPropertyDef>& Locals);
+    void CoalesceTemps(std::vector<FStmtIR>& Stmts, std::vector<FPropertyDef>& Locals, FBlueprintClass& BP);
     bool HoistReadsInList(std::vector<FStmtIR>& Stmts, FBlueprintClass& BP,
                           std::vector<FPropertyDef>& Locals, std::string* Err);
     bool HoistReadsInStmt(FStmtIR& St, FBlueprintClass& BP,
@@ -1197,6 +1197,7 @@ private:
     std::map<std::string, int32> GotoLabels;          // the body being lowered's: clang LabelDecl id -> FStmtIR::LabelId
     int32 NextGotoLabel = 0;                          // never reset: latent functions share one ubergraph script
     bool bBodyHasGoto = false;                        // a goto can re-reach any declaration, as a loop does
+    int32 ReEntered = 0;                              // inline expansions under a caller's loop or goto: their bodies run again
     int32 WriteBackDepth = 0;                         // LowerBody: the TMap range-fors around it that write the value back
     int32 GotoLabelOf(const std::string& DeclId)
     {
@@ -4137,13 +4138,41 @@ packed like registers: statements are numbered in emission order, each temp span
 temps of one layout whose spans do not overlap share a property.
 
 That is sound because a compiler temp is always written before it is read within its span, on every path: it is
-stored by the statement hoisted right before its reader, or at the top of the inline block it belongs to. The
-exceptions stay out: a declaration without an initializer (it reads as the frame's zero, a container as empty),
-the zero-kept __Fresh twins, and the scratch the pointer reads name implicitly. A loop repeats its body, so a temp
+stored by the statement hoisted right before its reader, or at the top of the inline block it belongs to. A
+declaration without an initializer is the exception: it reads as the frame's zero, a container as empty. It joins
+a shared slot only when it can be reset to that at the declaration (ZeroOf, ClearFn), and every such occupant of a
+shared slot is, the first one too, which a loop may bring back round after a later one. Kept out: those of any
+other type, __Make (a braced struct relies on the frame's default members), the zero-kept __Fresh twins, and the
+scratch the pointer reads name implicitly. A loop repeats its body, so a temp
 mentioned in its condition, increment or break trailer, or both inside and outside it, spans the whole loop.
 Not run with a goto (any label re-enters) or a latent call (the ubergraph frame outlives the call).
 */
-void FCompiler::CoalesceTemps(std::vector<FStmtIR>& Stmts, std::vector<FPropertyDef>& Locals)
+/* What a declaration without an initializer resets a shared temp to, so it still reads as the frame's zero: a
+   constant for a scalar or pointer, `ClearFn` for a container. False for a struct (EX_StructConst cannot say every
+   default) and the rest, which then keep a property of their own. */
+static bool ZeroOf(const FPropertyDef& P, FArgIR& Out)
+{
+    Out = FArgIR();
+    if (P.Type == "IntProperty") Out.K = FArgIR::Int;
+    else if (P.Type == "Int64Property") Out.K = FArgIR::Int64;
+    else if (P.Type == "FloatProperty") Out.K = FArgIR::Float;
+    else if (P.Type == "BoolProperty") Out.K = FArgIR::Bool;
+    else if (P.Type == "ByteProperty") Out.K = FArgIR::Byte;
+    else if (P.Type == "NameProperty") { Out.K = FArgIR::Name; Out.S = "None"; }
+    else if (P.Type == "StrProperty") Out.K = FArgIR::Str;
+    else if (P.Type == "ObjectProperty" || P.Type == "ClassProperty") Out.K = FArgIR::NullObj;
+    else return false;
+    return true;
+}
+static const char* ClearFn(const FPropertyDef& P, const char** Lib)
+{
+    if (P.Type == "ArrayProperty") { *Lib = "KismetArrayLibrary"; return "Array_Clear"; }
+    if (P.Type == "SetProperty") { *Lib = "BlueprintSetLibrary"; return "Set_Clear"; }
+    if (P.Type == "MapProperty") { *Lib = "BlueprintMapLibrary"; return "Map_Clear"; }
+    return nullptr;
+}
+
+void FCompiler::CoalesceTemps(std::vector<FStmtIR>& Stmts, std::vector<FPropertyDef>& Locals, FBlueprintClass& BP)
 {
     static const char* const kPooled[] = { "__Inl", "__DerefTmp", "__MapGet", "__Upd", "__PtrTmp", "__Switch" };
     auto Pooled = [](const std::string& N) {
@@ -4222,7 +4251,12 @@ void FCompiler::CoalesceTemps(std::vector<FStmtIR>& Stmts, std::vector<FProperty
     std::vector<const FPropertyDef*> Cands;
     for (const FPropertyDef& L : Locals)
         if (Pooled(L.Name) && L.Name.compare(0, 7, "__Fresh") != 0)
-            if (auto S = Spans.find(L.Name); S != Spans.end() && !S->second.bOut && S->second.Last >= 0) Cands.push_back(&L);
+            if (auto S = Spans.find(L.Name); S != Spans.end() && S->second.Last >= 0)
+            {
+                FArgIR Zero;
+                const char* Lib = nullptr;
+                if (!S->second.bOut || ZeroOf(L, Zero) || ClearFn(L, &Lib)) Cands.push_back(&L);
+            }
     std::sort(Cands.begin(), Cands.end(), [&](const FPropertyDef* A, const FPropertyDef* B) { return Spans[A->Name].First < Spans[B->Name].First; });
     struct FSlot { std::string Name; int32 End; };
     std::map<std::string, std::vector<FSlot>> Slots;
@@ -4237,6 +4271,12 @@ void FCompiler::CoalesceTemps(std::vector<FStmtIR>& Stmts, std::vector<FProperty
         It->End = S.Last;
     }
     if (Rename.empty()) return;
+
+    /* The no-initializer declarations in a slot shared with anything are reset where they stand. */
+    std::set<std::string> Shared;
+    for (const auto& [From, To] : Rename) { Shared.insert(From); Shared.insert(To); }
+    std::map<std::string, const FPropertyDef*> Resets;
+    for (const FPropertyDef* L : Cands) if (Spans[L->Name].bOut && Shared.count(L->Name)) Resets[L->Name] = L;
 
     std::function<void(std::vector<FStmtIR>&)> RWalk;
     std::function<void(FArgIR&)> RArg;
@@ -4255,6 +4295,22 @@ void FCompiler::CoalesceTemps(std::vector<FStmtIR>& Stmts, std::vector<FProperty
     RWalk = [&](std::vector<FStmtIR>& List) {
         for (FStmtIR& St : List)
         {
+            if (auto R = St.K == FStmtIR::Decl && !St.bHasValue ? Resets.find(St.Var.S) : Resets.end(); R != Resets.end())
+            {
+                const char* Lib = nullptr;
+                if (const char* Fn = ClearFn(*R->second, &Lib))
+                {
+                    FArgIR Var = St.Var;
+                    St = FStmtIR();
+                    St.K = FStmtIR::StaticCall;
+                    St.Call.Fn = BP.EngineFunction("/Script/Engine", Lib, Fn);
+                    St.Call.Args = { Var };
+                }
+                else
+                {
+                    St.bHasValue = ZeroOf(*R->second, St.Value);
+                }
+            }
             RCall(St.Target);
             RCall(St.Call);
             for (FArgIR* A : { &St.Var, &St.Value, &St.Cond, &St.SwitchValue }) RArg(*A);
@@ -4465,7 +4521,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                         return;
                     }
                 }
-                else if ((LoopDepth > 0 || bBodyHasGoto) && !Ds.bHasValue)
+                else if ((LoopDepth > 0 || bBodyHasGoto || ReEntered > 0) && !Ds.bHasValue)
                 {
                     /* The frame initialises a local once, on entry, but C++ constructs it again each time a loop
                        reaches the declaration. A twin nothing writes keeps the entry value to copy back. */
@@ -5297,6 +5353,10 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
     InlineStack.push_back(Method);
     InlineResults.emplace_back(Out.InlineResult, RetType);
     const int32 SavedLoops = LoopDepth, SavedSwitches = SwitchDepth, SavedWriteBacks = WriteBackDepth;
+    /* The body's break / continue are its own, so the caller's loops are not LoopDepth here; but the body still runs
+       once per trip round them, and a declaration in it must start fresh each time (the __Fresh twin below). */
+    const int32 SavedReEntered = ReEntered;
+    ReEntered += (SavedLoops > 0 || bBodyHasGoto) ? 1 : 0;
     LoopDepth = SwitchDepth = WriteBackDepth = 0;
     /* Each expansion lowers the body again, so its labels get ids of their own. */
     std::map<std::string, int32> SavedLabels;
@@ -5305,6 +5365,7 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
     bBodyHasGoto = HasGoto(*Body);
     const bool bOk = LowerBody(*Body, BP, *B.Body, Locals, Err);
     LoopDepth = SavedLoops;
+    ReEntered = SavedReEntered;
     SwitchDepth = SavedSwitches;
     WriteBackDepth = SavedWriteBacks;
     GotoLabels.swap(SavedLabels);
@@ -7088,6 +7149,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         LoopDepth = 0;
         SwitchDepth = 0;
         WriteBackDepth = 0;
+        ReEntered = 0;
         GotoLabels.clear();
         bBodyHasGoto = Fn.Body && HasGoto(*Fn.Body);
         KeepLoaded.clear();
@@ -7117,7 +7179,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         {
             DropUnusedPure(Stmts);
             DropUnusedLocals(Stmts, Locals);
-            if (!bBodyHasGoto && !bMadeLatentCall) CoalesceTemps(Stmts, Locals);
+            if (!bBodyHasGoto && !bMadeLatentCall) CoalesceTemps(Stmts, Locals, BP);
         }
         for (const auto& [Struct, Keep] : KeepLoaded)
         {
