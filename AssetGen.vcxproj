@@ -80,11 +80,13 @@
     <ClInclude Include="Script.h" />
     <ClInclude Include="Uncooked.h" />
     <ClInclude Include="UeEnums.h" />
+    <ClInclude Include="Verify.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Blueprint.cpp" />
     <ClCompile Include="Cpp.cpp" />
     <ClCompile Include="Main.cpp" />
+    <ClCompile Include="Verify.cpp" />
     <ClCompile Include="Package.cpp" />
     <ClCompile Include="Registry.cpp" />
     <ClCompile Include="Script.cpp" />
