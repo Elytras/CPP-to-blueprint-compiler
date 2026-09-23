@@ -813,8 +813,8 @@ void StampIdentity(FPackage& P, const std::string& PackageName)
 std::string ReadText(const std::string& Path)
 {
     std::string Out;
-    FILE* F = nullptr;
-    if (fopen_s(&F, Path.c_str(), "rb") != 0 || !F) return Out;
+    FILE* F = fopen(Path.c_str(), "rb");
+    if (!F) return Out;
     char Buf[16384];
     size_t N;
     while ((N = fread(Buf, 1, sizeof Buf, F)) > 0) Out.append(Buf, N);
@@ -7434,13 +7434,39 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     std::error_code TmpEc;
     const std::string AstPath = (std::filesystem::temp_directory_path(TmpEc)
                                  / (std::filesystem::path(SourcePath).stem().string() + ".assetgen-ast.json")).string();
-    /* Both the UeApi dir and its parent are include paths, so "FSD.h" and "UeApi/FSD.h" both resolve. */
-    const std::string Parent = std::filesystem::path(IncludeDir).parent_path().string();
+    /* Both the UeApi dir and its parent are include paths, so "FSD.h" and "UeApi/FSD.h" both resolve. Absolute
+       first: a relative "UeApi" has an empty parent, and -I"" swallows the next argument. */
+    const std::string Parent = std::filesystem::absolute(IncludeDir, TmpEc).parent_path().string();
     /* -Wno-string-plus-int: `"lit" + N` is a Concat_StrStr here, not pointer arithmetic. */
-    const std::string Cmd = "clang++ -std=c++20 -Wno-string-plus-int -fsyntax-only -Xclang -ast-dump=json"
-                            " \"" + SourcePath + "\" -I\"" + IncludeDir + "\" -I\"" + Parent
-                          + "\" > \"" + AstPath + "\"";
+    std::string Cmd = "clang++ -std=c++20 -Wno-string-plus-int -fsyntax-only -Xclang -ast-dump=json";
+#ifndef _WIN32
+    /* Parse with the game's ABI, not the host's: on x86-64 Linux size_t is `unsigned long`, so sizeof has no
+       Kismet conversion. The msvc target finds no C++ headers here and the SDK needs only <initializer_list>,
+       so hand clang a stand-in (it checks only the two-pointer layout). */
+    const std::filesystem::path ShimDir = std::filesystem::temp_directory_path(TmpEc) / "assetgen-include";
+    std::filesystem::create_directories(ShimDir, TmpEc);
+    std::ofstream(ShimDir / "initializer_list", std::ios::binary | std::ios::trunc)
+        << "#pragma once\n"
+           "namespace std {\n"
+           "template <class E> class initializer_list {\n"
+           "    const E* First = nullptr;\n"
+           "    const E* Last = nullptr;\n"
+           "public:\n"
+           "    constexpr initializer_list() noexcept = default;\n"
+           "    constexpr const E* begin() const noexcept { return First; }\n"
+           "    constexpr const E* end() const noexcept { return Last; }\n"
+           "    constexpr decltype(sizeof 0) size() const noexcept { return Last - First; }\n"
+           "};\n"
+           "}\n";
+    Cmd += " --target=x86_64-pc-windows-msvc -isystem \"" + ShimDir.string() + "\"";
+#endif
+    Cmd += " \"" + SourcePath + "\" -I\"" + IncludeDir + "\" -I\"" + Parent + "\" > \"" + AstPath + "\"";
+#ifdef _WIN32
+    /* cmd /c strips the first and last quote of a line that starts with one, so wrap it in a spare pair. */
     if (system(("\"" + Cmd + "\"").c_str()) != 0)
+#else
+    if (system(Cmd.c_str()) != 0)
+#endif
     {
         *Err = "clang rejected " + SourcePath + " (diagnostics above)";
         return false;

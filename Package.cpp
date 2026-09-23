@@ -499,8 +499,8 @@ bool FPackage::Save(const std::string& OutBaseNoExt, std::string* Err) const
     Exp.insert(Exp.end(), (const uint8*)&Tail, (const uint8*)&Tail + 4);
 
     auto Dump = [&](const std::string& Path, const std::vector<uint8>& Bytes) {
-        FILE* F = nullptr;
-        if (fopen_s(&F, Path.c_str(), "wb") != 0 || !F) return false;
+        FILE* F = fopen(Path.c_str(), "wb");
+        if (!F) return false;
         const bool bOk = fwrite(Bytes.data(), 1, Bytes.size(), F) == Bytes.size();
         fclose(F);
         return bOk;

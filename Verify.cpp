@@ -132,8 +132,8 @@ void BuildInitCave(FPackage& P, const std::string& ParentPkg, const std::string&
 std::vector<uint8> ReadFile(const std::string& Path)
 {
     std::vector<uint8> Out;
-    FILE* F = nullptr;
-    if (fopen_s(&F, Path.c_str(), "rb") != 0 || !F) return Out;
+    FILE* F = fopen(Path.c_str(), "rb");
+    if (!F) return Out;
     fseek(F, 0, SEEK_END);
     Out.resize(size_t(ftell(F)));
     fseek(F, 0, SEEK_SET);

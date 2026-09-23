@@ -148,8 +148,8 @@ bool SaveAssetRegistry(const std::vector<FRegistryAsset>& Assets, const std::str
     WriteEmptyStore(File);
     File.insert(File.end(), Body.B.begin(), Body.B.end());
 
-    FILE* F = nullptr;
-    if (fopen_s(&F, OutPath.c_str(), "wb") != 0 || !F) return Fail("cannot write AssetRegistry.bin");
+    FILE* F = fopen(OutPath.c_str(), "wb");
+    if (!F) return Fail("cannot write AssetRegistry.bin");
     const bool bOk = fwrite(File.data(), 1, File.size(), F) == File.size();
     fclose(F);
     return bOk ? true : Fail("short write on AssetRegistry.bin");
