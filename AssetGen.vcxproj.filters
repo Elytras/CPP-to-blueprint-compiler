@@ -32,6 +32,9 @@
     <ClInclude Include="UeEnums.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="Verify.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Blueprint.cpp">
@@ -53,6 +56,9 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="Uncooked.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Verify.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
