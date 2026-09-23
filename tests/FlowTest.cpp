@@ -356,6 +356,27 @@ public:
     return Steps;
   }
 
+  /* `if (C) break;` where C comes to a constant: taken every time, or never. */
+  static inline int32 StopBelow(int32 Max) {
+    int32 N = 0;
+    while (true) {
+      N += 1;
+      if (Max < 3) break;
+      if (N >= 10) break;
+    }
+    return N;
+  }
+  int32 ConstBreak(int32 X) {
+    const int32 Lim = 1;
+    int32 N = 0;
+    for (int32 I = 0; I < 5; ++I) {
+      if (Lim > 3) break;
+      if (2 < 1) continue;
+      N += 1;
+    }
+    return StopBelow(1) * 100 + StopBelow(5) * 10 + N;
+  }
+
   /* UE_NAME_SWITCH: a comparison per case, case-insensitive as FName is. */
   /* FName converts to bool as Name != None. */
   int32 NameSet(FName N) { bool B = static_cast<bool>(N); if (N) return B ? 1 : 9; return !N ? 2 : 9; }

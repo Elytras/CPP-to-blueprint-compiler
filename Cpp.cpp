@@ -5304,22 +5304,30 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
     if (Receiver) Args.push_back(Receiver);     // a forwarded method: the object is the free function's first parameter
     ForEach(CallNode, [&](const Json& C) { if (bFirst) { bFirst = false; return; } Args.push_back(&C); });
     if (Args.size() != Parms.size()) { *Err = "inline call to " + Method + " with " + std::to_string(Args.size()) + " arguments"; return false; }
+    /* Every argument is lowered before any parameter is bound: an argument can expand this same function again
+       (`Twice(Twice(V))`), and that expansion binds the parameters for itself. */
+    auto Aliased = [&](size_t I) {
+        const std::string Type = TypeOf(*Parms[I]);
+        const Json* Bare = PeelLvalue(Args[I]);
+        return !Type.empty() && Type.back() == '&' && Bare && IsAliasable(*Bare) && !IsDerefLvalue(*Bare) ? Bare : nullptr;
+    };
+    std::vector<FArgIR> Values(Parms.size());
+    for (size_t I = 0; I < Parms.size(); ++I)
+        if (!Aliased(I) && !LowerArg(*Args[I], BP, Values[I], Err)) return false;
     for (size_t I = 0; I < Parms.size(); ++I)
     {
         const std::string Id = Parms[I]->value("id", std::string());
         std::string Type = TypeOf(*Parms[I]);
-        const bool bRef = !Type.empty() && Type.back() == '&';
-        const Json* Bare = PeelLvalue(Args[I]);
         /* A previous expansion of the same function left its own binding for this parameter. */
         RefAlias.erase(Id);
         LocalRename.erase(Id);
         ParmConst.erase(Id);
-        if (bRef && Bare && IsAliasable(*Bare) && !IsDerefLvalue(*Bare)) { RefAlias[Id] = *Bare; continue; }
+        if (const Json* Bare = Aliased(I)) { RefAlias[Id] = *Bare; continue; }
         while (!Type.empty() && (Type.back() == '&' || Type.back() == ' ')) Type.pop_back();
         Type = StripTypeKeywords(Type);
         const std::string Local = Prefix + Name(*Parms[I]);
         FStmtIR Bind;
-        if (!LowerArg(*Args[I], BP, Bind.Value, Err)) return false;
+        Bind.Value = std::move(Values[I]);
         /* A constant the body only reads is used in place: no local, no copy. */
         if (IsFoldableConst(Bind.Value) && OnlyRead(*Body, Id)) { ParmConst[Id] = Bind.Value; continue; }
         if (!AddLocal(Local, Type)) return false;

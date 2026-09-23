@@ -222,6 +222,7 @@ check('FlowTest', 'FreshInLoop', lambda N: 200 * max(N, 0), [dict(N=n) for n in 
 check('FlowTest', 'SafeRatio', lambda X: X != 0 and cdiv(10, X) > 2, [dict(X=x) for x in (-2, 0, 1, 3, 4)])
 check('FlowTest', 'EitherZero', lambda X, Y: X == 0 or cdiv(100, X) == Y, [dict(X=x, Y=y) for x in (0, 10, 3) for y in (0, 10, 33)])
 check('FlowTest', 'Pick', lambda X: X * 2 if X > 0 else (-1 if X < -5 else 7), [dict(X=x) for x in (-9, -5, 0, 4)])
+check('FlowTest', 'ConstBreak', lambda X: 205, [dict(X=0)])
 check('FlowTest', 'Compound', compound, [dict(N=n) for n in (0, 1, 5, 40)])
 check('FlowTest', 'FloatStep', lambda F: -(F + 1.5), [dict(F=f) for f in (0.0, 2.25, -1.5)])
 check('FlowTest', 'WhileAnd', while_and, [dict(Limit=l) for l in (0, 1, 50, 99, 150)])
@@ -346,6 +347,8 @@ for v in (0, 2, -4):
 print('ok  InlineTest.UseBump  (3 cases)')
 check('InlineTest', 'UseLoop', lambda L: sum(first_above(L + i) for i in range(3)), [dict(L=l) for l in (0, 5, 50, 9990)])
 check('InlineTest', 'UseNest', lambda V: nest(V) + nest(V + 1), [dict(V=v) for v in (-2, 0, 4, 12)])
+check('InlineTest', 'TwiceTwice', lambda V: 4 * V + 12, [dict(V=v) for v in (-2, 0, 5)])
+check('InlineTest', 'ClampInArg', lambda V: max(4, clamp(V, 0, 10)), [dict(V=v) for v in (-3, 2, 6, 15)])
 check('InlineTest', 'InCond', lambda V: 1 if V * 2 > 10 and clamp(V, 0, 3) == 3 else 0, [dict(V=v) for v in (0, 5, 6, 9)])
 
 

@@ -46,6 +46,11 @@ public:
 
   int32 UseNest(int32 V) { return Nest(V) + Nest(V + 1); }
 
+  /* A call nested in an argument of the same function binds its parameters first: the outer call's own binding
+     must win, and one it already made must survive. */
+  int32 TwiceTwice(int32 V) { return Twice(Twice(V)) + Twice(Twice(3)); }
+  int32 ClampInArg(int32 V) { return Clamp(4, Clamp(V, 0, 10), 8); }
+
   inline int32 Dec(int32 N) {
     N -= 1;
     return N;
