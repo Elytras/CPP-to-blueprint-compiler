@@ -7395,6 +7395,82 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     return true;
 }
 
+/* Builds the DOM of clang's AST dump as it streams in, without what nothing reads: source locations (all but the
+   range's begin offset and token length, see NamedQualifier), mangled names and a record's definitionData are most of
+   the dump, and building them was most of a compile. */
+class FAstSax : public nlohmann::json_sax<Json>
+{
+public:
+    explicit FAstSax(Json& InRoot) : Root(InRoot) {}
+    bool null() override { return Value(nullptr); }
+    bool boolean(bool V) override { return Value(V); }
+    bool number_integer(number_integer_t V) override { return Value(V); }
+    bool number_unsigned(number_unsigned_t V) override { return Value(V); }
+    bool number_float(number_float_t V, const string_t&) override { return Value(V); }
+    bool string(string_t& V) override { return Value(std::move(V)); }
+    bool binary(binary_t& V) override { return Value(std::move(V)); }
+    bool start_object(size_t) override { return Open(Json::value_t::object); }
+    bool start_array(size_t) override { return Open(Json::value_t::array); }
+    bool end_object() override { return Close(); }
+    bool end_array() override { return Close(); }
+    bool key(string_t& K) override
+    {
+        if (Skipped) return true;
+        bSkipNext = K == "loc" || K == "end" || K == "file" || K == "line" || K == "col" || K == "includedFrom"
+                 || K == "spellingLoc" || K == "expansionLoc" || K == "isMacroArgExpansion" || K == "mangledName"
+                 || K == "definitionData";
+        if (!bSkipNext) Slot = &(*Stack.back())[std::move(K)];
+        return true;
+    }
+    bool parse_error(size_t, const std::string&, const nlohmann::detail::exception&) override { return false; }
+
+private:
+    Json& Root;
+    std::vector<Json*> Stack;       // the open objects and arrays being filled
+    Json* Slot = nullptr;           // the object member the last key named
+    int32 Skipped = 0;              // depth inside a dropped object or array
+    bool bSkipNext = false;         // the next value is a dropped key's
+
+    Json* Place(Json&& V)
+    {
+        if (Stack.empty()) return &(Root = std::move(V));
+        if (Stack.back()->is_array()) { Stack.back()->push_back(std::move(V)); return &Stack.back()->back(); }
+        return &(*Slot = std::move(V));
+    }
+    bool Value(Json&& V)
+    {
+        if (!Skipped && !bSkipNext) Place(std::move(V));
+        bSkipNext = false;
+        return true;
+    }
+    bool Open(Json::value_t T)
+    {
+        if (Skipped || bSkipNext) ++Skipped;
+        else Stack.push_back(Place(Json(T)));
+        bSkipNext = false;
+        return true;
+    }
+    bool Close()
+    {
+        if (Skipped) --Skipped;
+        else Stack.pop_back();
+        return true;
+    }
+};
+
+/* Parses clang's AST dump at Path. */
+bool ParseAst(const std::string& Path, Json* Out, std::string* Err)
+{
+    std::vector<char> Buf(1 << 20);
+    std::ifstream In;
+    In.rdbuf()->pubsetbuf(Buf.data(), Buf.size());
+    In.open(Path, std::ios::binary);
+    if (!In || In.peek() == std::ifstream::traits_type::eof()) { *Err = "clang produced no AST at " + Path; return false; }
+    FAstSax Sax(*Out);
+    if (!Json::sax_parse(In, &Sax)) { *Err = "could not parse clang's AST dump"; return false; }
+    return true;
+}
+
 bool FCompiler::LoadTables(const std::string& IncludeDir, std::string* Err)
 {
     auto Load = [&](const char* File, Json* Out) {
@@ -7478,11 +7554,7 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         *Err = "clang rejected " + SourcePath + " (diagnostics above)";
         return false;
     }
-
-    const std::string Text = ReadText(AstPath);
-    if (Text.empty()) { *Err = "clang produced no AST at " + AstPath; return false; }
-    Doc = Json::parse(Text, nullptr, false);
-    if (Doc.is_discarded()) { *Err = "could not parse clang's AST dump"; return false; }
+    if (!ParseAst(AstPath, &Doc, Err)) return false;
 
     if (!LoadTables(IncludeDir, Err)) return false;
     if (!Collect(Err)) return false;
@@ -7592,8 +7664,9 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
 bool CompileToAssets(const std::string& SourcePath, const std::string& IncludeDir,
                      const std::string& OutDir, const std::optional<std::string>& ApiDir, std::string* Err)
 {
-    FCompiler C;
-    return C.Run(SourcePath, IncludeDir, OutDir, ApiDir, Err);
+    /* Never freed: the process ends right after, and tearing the AST down node by node takes longer than exiting. */
+    FCompiler* C = new FCompiler;
+    return C->Run(SourcePath, IncludeDir, OutDir, ApiDir, Err);
 }
 
 }   // namespace Uasset
