@@ -7855,9 +7855,9 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     return true;
 }
 
-/* Builds the DOM of clang's AST dump as it streams in, without what nothing reads: source locations (all but the
-   range's begin offset and token length, see NamedQualifier), mangled names and a record's definitionData are most of
-   the dump, and building them was most of a compile. */
+/* Builds the DOM of clang's AST dump as it streams in, without what nothing reads: source locations (all but a
+   DeclRefExpr's range begin offset and token length, see NamedQualifier), mangled names, a record's definitionData and
+   a few flags are most of the dump, and building them was most of a compile. A key read later must not be in key(). */
 class FAstSax : public nlohmann::json_sax<Json>
 {
 public:
@@ -7867,7 +7867,11 @@ public:
     bool number_integer(number_integer_t V) override { return Value(V); }
     bool number_unsigned(number_unsigned_t V) override { return Value(V); }
     bool number_float(number_float_t V, const string_t&) override { return Value(V); }
-    bool string(string_t& V) override { return Value(std::move(V)); }
+    bool string(string_t& V) override
+    {
+        if (bKindNext && !Skipped) DeclRef.back() = V == "DeclRefExpr";   // clang writes "kind" before "range"
+        return Value(std::move(V));
+    }
     bool binary(binary_t& V) override { return Value(std::move(V)); }
     bool start_object(size_t) override { return Open(Json::value_t::object); }
     bool start_array(size_t) override { return Open(Json::value_t::array); }
@@ -7878,7 +7882,9 @@ public:
         if (Skipped) return true;
         bSkipNext = K == "loc" || K == "end" || K == "file" || K == "line" || K == "col" || K == "includedFrom"
                  || K == "spellingLoc" || K == "expansionLoc" || K == "isMacroArgExpansion" || K == "mangledName"
-                 || K == "definitionData";
+                 || K == "definitionData" || K == "isImplicit" || K == "isUsed" || K == "isReferenced"
+                 || K == "typeAliasDeclId" || (K == "range" && !DeclRef.back());
+        bKindNext = K == "kind";
         if (!bSkipNext) Slot = &(*Stack.back())[std::move(K)];
         return true;
     }
@@ -7887,9 +7893,11 @@ public:
 private:
     Json& Root;
     std::vector<Json*> Stack;       // the open objects and arrays being filled
+    std::vector<bool> DeclRef;      // per open object or array: a DeclRefExpr, whose range is kept
     Json* Slot = nullptr;           // the object member the last key named
     int32 Skipped = 0;              // depth inside a dropped object or array
     bool bSkipNext = false;         // the next value is a dropped key's
+    bool bKindNext = false;         // ... or "kind"'s
 
     Json* Place(Json&& V)
     {
@@ -7900,20 +7908,20 @@ private:
     bool Value(Json&& V)
     {
         if (!Skipped && !bSkipNext) Place(std::move(V));
-        bSkipNext = false;
+        bSkipNext = bKindNext = false;
         return true;
     }
     bool Open(Json::value_t T)
     {
         if (Skipped || bSkipNext) ++Skipped;
-        else Stack.push_back(Place(Json(T)));
-        bSkipNext = false;
+        else { Stack.push_back(Place(Json(T))); DeclRef.push_back(false); }
+        bSkipNext = bKindNext = false;
         return true;
     }
     bool Close()
     {
         if (Skipped) --Skipped;
-        else Stack.pop_back();
+        else { Stack.pop_back(); DeclRef.pop_back(); }
         return true;
     }
 };
