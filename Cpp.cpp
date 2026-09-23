@@ -3924,8 +3924,12 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         L.K = FArgIR::LatentInfo;
         L.Owner = BP.ScriptStruct("/Script/Engine", "LatentActionInfo");
         L.S = "ExecuteUbergraph_" + Cur->CppName;
-        /* The latent action manager keys pending actions by UUID per callback target: one per call site. */
-        L.I = int32(std::hash<std::string>{}(Cur->CppName + "." + CurFnName + "#" + std::to_string(++LatentCount)));
+        /* The latent action manager keys pending actions by UUID per callback target: one per call site. FNV-1a 64,
+           what MSVC's std::hash<std::string> is: libstdc++'s differs, and the asset should not depend on the host. */
+        uint64 Uuid = 14695981039346656037ull;
+        for (const char Ch : Cur->CppName + "." + CurFnName + "#" + std::to_string(++LatentCount))
+            Uuid = (Uuid ^ uint8(Ch)) * 1099511628211ull;
+        L.I = int32(Uuid);
         Fill.emplace_back(LatentAt, L);
 
         std::string ResultLocal;
@@ -4257,7 +4261,8 @@ void FCompiler::CoalesceTemps(std::vector<FStmtIR>& Stmts, std::vector<FProperty
                 const char* Lib = nullptr;
                 if (!S->second.bOut || ZeroOf(L, Zero) || ClearFn(L, &Lib)) Cands.push_back(&L);
             }
-    std::sort(Cands.begin(), Cands.end(), [&](const FPropertyDef* A, const FPropertyDef* B) { return Spans[A->Name].First < Spans[B->Name].First; });
+    /* Stable: spans can start together, and std::sort orders ties differently under MSVC and libstdc++. */
+    std::stable_sort(Cands.begin(), Cands.end(), [&](const FPropertyDef* A, const FPropertyDef* B) { return Spans[A->Name].First < Spans[B->Name].First; });
     struct FSlot { std::string Name; int32 End; };
     std::map<std::string, std::vector<FSlot>> Slots;
     std::map<std::string, std::string> Rename;
