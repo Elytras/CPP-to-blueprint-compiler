@@ -79,3 +79,7 @@ generated `.uasset`/`.uexp`. An issue that can't be reproduced can't be fixed.
 table / serialized bytes), `walkscript.py` (a function's bytecode, expression by expression),
 `dumptags.py`, `dumpstruct.py`, `dumpedl.py`, `dumpar.py` (AssetRegistry.bin), and `runscript.py`
 (an offline Kismet interpreter).
+
+## License
+
+GPL-3.0, see `LICENSE`.
