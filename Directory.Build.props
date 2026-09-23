@@ -1,0 +1,6 @@
+<Project>
+  <!-- ponytail: kept out of AssetGen.vcxproj so the sources stay a byte-identical mirror of ue-mods/AssetGen. -->
+  <PropertyGroup Label="Vcpkg">
+    <VcpkgEnableManifest>true</VcpkgEnableManifest>
+  </PropertyGroup>
+</Project>

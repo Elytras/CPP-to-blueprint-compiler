@@ -1,0 +1,7 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "assetgen",
+  "version-string": "0.1.0",
+  "dependencies": [ "nlohmann-json" ],
+  "builtin-baseline": "4db164a3fa24910f1a13f21348e2510eb1f78605"
+}

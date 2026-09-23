@@ -1,0 +1,131 @@
+name: Compiler bug
+description: assetgen rejected valid code, crashed, or produced an asset that is wrong in game or in the editor.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Every field below is something needed to reproduce the problem locally. An issue that cannot be
+        reproduced cannot be fixed, so please fill in all the required ones.
+
+        **Before filing:** build the latest `main` and try again - the bug may already be fixed.
+
+  - type: dropdown
+    id: stage
+    attributes:
+      label: Where does it go wrong?
+      options:
+        - clang rejects the source (error printed before "FAILED")
+        - assetgen prints FAILED / TODO / an error
+        - assetgen.exe crashes or hangs
+        - bpbuild.py errors (mods.yaml, staging, UnrealPak)
+        - The game crashes or logs an error loading the asset
+        - The asset loads but behaves wrong at runtime
+        - The UE editor rejects the generated API stubs (generate_api)
+    validations:
+      required: true
+
+  - type: input
+    id: assetgen-version
+    attributes:
+      label: AssetGen commit
+      description: Output of `git rev-parse --short HEAD` in your AssetGen checkout.
+      placeholder: e.g. 30f00f2
+    validations:
+      required: true
+
+  - type: input
+    id: sdk-version
+    attributes:
+      label: SDK / UeApi
+      description: >
+        Which UeApi headers you compile against: the SDK repo commit, or "own dump" plus the game
+        build it was dumped from. Say whether you edited any UeApi file by hand.
+      placeholder: e.g. DrgCppSdk@1a2b3c4, unmodified
+    validations:
+      required: true
+
+  - type: input
+    id: game-version
+    attributes:
+      label: Game version
+      description: The build you load the mod in (shown on the DRG title screen). "n/a" for compile-time problems.
+      placeholder: e.g. DRG 1.39.xxxxxx, Steam, no other mods
+    validations:
+      required: true
+
+  - type: input
+    id: clang-version
+    attributes:
+      label: clang version
+      description: First line of `clang++ --version`.
+      placeholder: e.g. clang version 19.1.0
+    validations:
+      required: true
+
+  - type: textarea
+    id: command
+    attributes:
+      label: Command
+      description: The exact command you ran (`assetgen compile ...` or `bpbuild.py ...`), plus your `mods.yaml` entry if you used bpbuild.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: source
+    attributes:
+      label: Minimal source
+      description: >
+        The smallest .cpp that still shows the problem - cut everything else. Include any of your own
+        headers it includes. If it is too large to paste, attach it as a .zip below instead.
+      render: cpp
+    validations:
+      required: true
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Full compiler output
+      description: Everything assetgen / bpbuild printed, unedited - including the TODO lines.
+      render: text
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected vs. actual
+      description: What you expected the mod to do, and what happened instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: game-log
+    attributes:
+      label: Game log / crash report (runtime problems)
+      description: >
+        For load failures or wrong runtime behavior: the relevant part of
+        `%LOCALAPPDATA%\FSD\Saved\Logs\FSD.log` (search for your package name, "LogLinker", "LogScript",
+        "LogUObjectGlobals" and "Error"), or the crash report's callstack. Leave empty for compile-time problems.
+      render: text
+
+  - type: textarea
+    id: attachments
+    attributes:
+      label: Attachments
+      description: >
+        For anything that compiled: zip and drop the generated `.uasset` + `.uexp` (and the `_P.pak` if you
+        have it) here - most runtime bugs are diagnosed from the bytes. Optionally add
+        `python tools/walkscript.py <asset without extension> <export index>` output for the function
+        that misbehaves.
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checklist
+      options:
+        - label: I reproduced this on the latest `main`.
+          required: true
+        - label: The source above is cut down to the minimum that still fails.
+          required: true
