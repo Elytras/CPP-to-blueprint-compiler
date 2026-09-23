@@ -651,7 +651,7 @@ void FScript::LetPath(EExprToken LetOp, const std::vector<std::string>& Path, FI
 
 void FScript::Context(const std::function<void(FScript&)>& ObjectExpr,
                       const std::function<void(FScript&)>& ContextExpr,
-                      const std::string& RValue, FIndex RValueOwner)
+                      const std::optional<FFieldRef>& RValue)
 {
     Op(EX_Context);
     ObjectExpr(*this);
@@ -662,8 +662,8 @@ void FScript::Context(const std::function<void(FScript&)>& ObjectExpr,
 
     Ar.I32(Inner.MemorySize());
     Memory += 4;
-    if (RValue.empty()) NullFieldPath();    // RValuePointer
-    else FieldPath(RValue, RValueOwner);
+    if (RValue) FieldPath(RValue->Name, RValue->Owner);    // RValuePointer
+    else NullFieldPath();
     Ar.Raw(Inner.Bytes().data(), Inner.Bytes().size());
     Memory += Inner.MemorySize();
 }

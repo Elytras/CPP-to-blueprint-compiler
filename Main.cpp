@@ -201,7 +201,7 @@ int main(int argc, char** argv)
 
     if (argc >= 5 && std::string(argv[1]) == "compile")
     {
-        std::string ApiDir;
+        std::optional<std::string> ApiDir;
         for (int32 I = 5; I + 1 < argc; ++I)
             if (std::string(argv[I]) == "--api") ApiDir = argv[I + 1];
 
