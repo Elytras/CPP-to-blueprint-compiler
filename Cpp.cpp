@@ -1011,6 +1011,7 @@ private:
        its Num=1 so ArrayGetByRef's bounds check passes. */
     void DropUnusedPure(std::vector<FStmtIR>& Stmts);
     void PruneConstBranches(std::vector<FStmtIR>& Stmts);
+    void ForwardSingleUse(std::vector<FStmtIR>& Stmts, const std::vector<FStmtIR>& All);
     void DropUnusedLocals(std::vector<FStmtIR>& Stmts, std::vector<FPropertyDef>& Locals);
     void CoalesceTemps(std::vector<FStmtIR>& Stmts, std::vector<FPropertyDef>& Locals, FBlueprintClass& BP);
     bool HoistReadsInList(std::vector<FStmtIR>& Stmts, FBlueprintClass& BP,
@@ -5373,6 +5374,60 @@ void FCompiler::ArgumentsInPlace(std::vector<FStmtIR>& Body, const std::vector<s
     }
 }
 
+/*
+`T = E; <S reads T>`, T read nowhere else: E goes where S reads T, and T is gone (DropUnusedLocals takes the property).
+The same conditions as ArgumentsInPlace: the read runs exactly once whenever S does, and running E there instead of
+one statement earlier cannot be seen: what S evaluates before the read is pure, and reads no variable when E acts (a
+call with an out parameter is never pure, so it acts).
+*/
+void FCompiler::ForwardSingleUse(std::vector<FStmtIR>& Stmts, const std::vector<FStmtIR>& All)
+{
+    for (size_t I = 0; I < Stmts.size(); ++I)
+    {
+        for (auto* L : { &Stmts[I].Then, &Stmts[I].Else, &Stmts[I].Body, &Stmts[I].Inc, &Stmts[I].Trailer })
+            if (*L)
+            {
+                *L = std::make_shared<std::vector<FStmtIR>>(**L);
+                ForwardSingleUse(**L, All);
+            }
+        while (I + 1 < Stmts.size())
+        {
+            const FStmtIR& Def = Stmts[I];
+            FStmtIR& Next = Stmts[I + 1];
+            const std::string& Name = Def.Var.S;
+            if (!((Def.K == FStmtIR::Decl && Def.bHasValue) || (Def.K == FStmtIR::Assign && Def.bAssignLocal))
+                || Def.Var.K != FArgIR::Local || Def.Var.Base || !CurLocals
+                || std::none_of(CurLocals->begin(), CurLocals->end(), [&](const FPropertyDef& L) { return L.Name == Name; })
+                || Mentions(All, Name) != 2 || Mentions(Def.Value, Name) != 0)
+                break;
+            FArgIR* Read = nullptr;
+            FArgIR* Scope = nullptr;
+            if (Next.K == FStmtIR::StaticCall && !Next.Target.Target && Next.Target.Args.empty())
+            {
+                for (FArgIR& A : Next.Call.Args) if (!Read && (Read = FindPlainRead(A, Name))) Scope = &A;
+            }
+            else if ((Next.K == FStmtIR::Assign || Next.K == FStmtIR::Decl || Next.K == FStmtIR::Return) && !Next.Var.Base)
+                Read = FindPlainRead(*(Scope = &Next.Value), Name);
+            else if (Next.K == FStmtIR::If)
+                Read = FindPlainRead(*(Scope = &Next.Cond), Name);
+            if (!Read) break;
+
+            const FArgIR& E = Def.Value;
+            const bool bActs = CallsImpure(E);
+            const std::function<bool(const FArgIR&)> Pred = [&](const FArgIR& X) { return bActs ? ReadsNothing(X) : !CallsImpure(X); };
+            bool bOk = OffPath(*Scope, Read, Pred);
+            if (Next.K == FStmtIR::StaticCall)
+            {
+                if (Next.Call.Target) bOk = bOk && Pred(*Next.Call.Target);
+                for (const FArgIR& A : Next.Call.Args) if (&A != Scope) bOk = bOk && Pred(A);
+            }
+            if (!bOk) break;
+            *Read = E;
+            Stmts.erase(Stmts.begin() + I);
+        }
+    }
+}
+
 bool FCompiler::IsInlineMethod(const FRecord& R, const std::string& Method) const
 {
     auto Decl = R.Methods.find(Method);
@@ -7482,6 +7537,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         if (!bCurNoOpt)
         {
             PruneConstBranches(Stmts);
+            if (!bBodyHasGoto && !bMadeLatentCall) ForwardSingleUse(Stmts, Stmts);
             DropUnusedPure(Stmts);
             DropUnusedLocals(Stmts, Locals);
             if (!bBodyHasGoto && !bMadeLatentCall) CoalesceTemps(Stmts, Locals, BP);
