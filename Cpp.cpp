@@ -2484,7 +2484,7 @@ void FCompiler::NormalizePointers(Json& N) const
     for (Json& C : N) NormalizePointers(C);
 }
 
-/* The TArray-shaped scratch every read through a pointer assembles into (see BpMods/Intrin.h).
+/* The TArray-shaped scratch every read through a pointer assembles into (see include/Intrin.h).
    Its layout is fixed by the engine's TArray, not by the mod, and a mod reaches a deref without
    ever asking for one - `Obj->GetOuter()` lowers to a read of OuterPrivate - so requiring the
    source to declare it was a copy-paste tax with one correct answer. A mod that declares its own

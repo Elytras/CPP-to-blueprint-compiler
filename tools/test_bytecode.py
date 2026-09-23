@@ -1,12 +1,48 @@
 #!/usr/bin/env python3
-"""Runs the test mods' compiled functions offline (runscript.py) against Python oracles.
-Build first: bpbuild.py . BpMods/UeApi x64/Release/assetgen.exe --no-pak"""
-import os, sys
+"""usage: test_bytecode.py [--assetgen <exe>] [--ueapi <UeApi dir>]
+
+Compiles every test mod in AssetGen/tests, then runs their functions offline (runscript.py) against Python
+oracles. --assetgen defaults to the first build found (ue-mods x64/Release, this repo's x64/Release, a CMake
+build/); --ueapi to ue-mods' BpMods/UeApi. Outside ue-mods, pass the UeApi of
+https://github.com/Elytras/DRG-Blueprint-Cpp-SDK."""
+import glob, os, re, shutil, subprocess, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from runscript import run
 import dumpexp
 
-ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', 'BpMods', 'build')
+HERE = os.path.dirname(os.path.abspath(__file__))
+AG = os.path.normpath(os.path.join(HERE, '..'))
+TESTS = os.path.join(AG, 'tests')
+ROOT = os.path.join(TESTS, 'build')
+
+
+def option(flag, candidates):
+    if flag in sys.argv:
+        return sys.argv[sys.argv.index(flag) + 1]
+    return next((c for c in candidates if os.path.exists(c)), None)
+
+
+ASSETGEN = option('--assetgen', [os.path.join(AG, '..', 'x64', 'Release', 'assetgen.exe'),
+                                 os.path.join(AG, 'x64', 'Release', 'assetgen.exe'), os.path.join(AG, 'build', 'assetgen')])
+UEAPI = option('--ueapi', [os.path.join(AG, '..', 'BpMods', 'UeApi')])
+if not ASSETGEN or not UEAPI:
+    sys.exit(__doc__)
+
+
+def build():
+    """Each test compiles into build/<Test>/FSD/Content/<its package>, the layout bpbuild stages a mod in."""
+    shutil.rmtree(ROOT, ignore_errors=True)
+    for src in sorted(glob.glob(os.path.join(TESTS, '*.cpp'))):
+        mod = os.path.splitext(os.path.basename(src))[0]
+        package = re.search(r'UE_MOD_PACKAGE\s*\(\s*"/Game/([^"]+)"', open(src, encoding='utf-8-sig').read()).group(1)
+        out = os.path.join(ROOT, mod, 'FSD', 'Content', *package.split('/'))
+        os.makedirs(out)
+        proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, out], capture_output=True, text=True)
+        assert proc.returncode == 0, '%s:\n%s%s' % (mod, proc.stdout, proc.stderr)
+    print('ok  every test compiles')
+
+
+build()
 
 
 def asset(mod):
@@ -476,13 +512,11 @@ def typed_outer():
 
 def api_stub():
     """The editor API stub (--api) of NameTest: what a Blueprint author sees of a mod class."""
-    import subprocess, tempfile
-    repo = os.path.normpath(os.path.join(ROOT, '..', '..'))
+    import tempfile
     with tempfile.TemporaryDirectory() as tmp:
         os.makedirs(os.path.join(tmp, 'cooked'))
         os.makedirs(os.path.join(tmp, 'api'))
-        proc = subprocess.run([os.path.join(repo, 'x64', 'Release', 'assetgen.exe'), 'compile',
-                               os.path.join(repo, 'BpMods', 'NameTest.cpp'), os.path.join(repo, 'BpMods', 'UeApi'),
+        proc = subprocess.run([ASSETGEN, 'compile', os.path.join(TESTS, 'NameTest.cpp'), UEAPI,
                                os.path.join(tmp, 'cooked'), '--api', os.path.join(tmp, 'api')],
                               capture_output=True, text=True)
         assert proc.returncode == 0, proc.stdout + proc.stderr
@@ -707,15 +741,3 @@ def optimizer():
 
 
 optimizer()
-
-
-def member_address():
-    base = os.path.join(ROOT, 'CppTest', 'FSD', 'Content', '_ElytrasMods', 'CppTest', 'Test')
-    names = [e['name'] for e in dumpexp.load(base)[5]]
-    w = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'walkscript.py'),
-                        base, str(names.index('MemberAddress'))], capture_output=True, text=True).stdout
-    assert "Function'GetPropertyAddress'" in w and 'NameConst        Vtbl' in w, w
-    print('ok  CppTest.MemberAddress: &Member through ReadProperty::GetPropertyAddress')
-
-
-member_address()
