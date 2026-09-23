@@ -1012,6 +1012,8 @@ private:
     void DropUnusedPure(std::vector<FStmtIR>& Stmts);
     void PruneConstBranches(std::vector<FStmtIR>& Stmts);
     void ForwardSingleUse(std::vector<FStmtIR>& Stmts, const std::vector<FStmtIR>& All);
+    void FlattenBlocks(std::vector<FStmtIR>& Stmts);
+    void DropOverwritten(std::vector<FStmtIR>& Stmts);
     void DropUnusedLocals(std::vector<FStmtIR>& Stmts, std::vector<FPropertyDef>& Locals);
     void CoalesceTemps(std::vector<FStmtIR>& Stmts, std::vector<FPropertyDef>& Locals, FBlueprintClass& BP);
     bool HoistReadsInList(std::vector<FStmtIR>& Stmts, FBlueprintClass& BP,
@@ -1216,6 +1218,19 @@ private:
     }
 };
 
+/* Whether running Stmts never falls off their end: the last one returns or jumps away (Return only, with
+   bReturnOnly), itself or in both branches of an `if`. */
+bool NeverFallsThrough(const std::vector<FStmtIR>& Stmts, bool bReturnOnly = false)
+{
+    if (Stmts.empty()) return false;
+    const FStmtIR& St = Stmts.back();
+    if (St.K == FStmtIR::Return) return true;
+    if (St.K == FStmtIR::If && !St.bJumpOut)
+        return St.Then && St.Else && NeverFallsThrough(*St.Then, bReturnOnly) && NeverFallsThrough(*St.Else, bReturnOnly);
+    return !bReturnOnly && (St.K == FStmtIR::Break || St.K == FStmtIR::Continue || St.K == FStmtIR::Goto
+                            || St.K == FStmtIR::InlineReturn);
+}
+
 /* The innermost loop's forward jumps, patched once its exit / continue offsets are known. */
 struct FLoopPatches
 {
@@ -1287,10 +1302,11 @@ void EmitStmts(const std::vector<FStmtIR>& Stmts, FScript& S, FIndex SelfExp, FL
             if (St.Then) EmitStmts(*St.Then, S, SelfExp, Loop, Returns);
             if (St.Else && !St.Else->empty())
             {
-                const int32 EndPatch = S.Jump(0);
+                /* A branch that returns or jumps away needs no jump over the else. */
+                const int32 EndPatch = St.Then && NeverFallsThrough(*St.Then) ? -1 : S.Jump(0);
                 S.PatchJumpTarget(NotPatch, S.MemorySize());
                 EmitStmts(*St.Else, S, SelfExp, Loop, Returns);
-                S.PatchJumpTarget(EndPatch, S.MemorySize());
+                if (EndPatch >= 0) S.PatchJumpTarget(EndPatch, S.MemorySize());
             }
             else
             {
@@ -5382,24 +5398,25 @@ call with an out parameter is never pure, so it acts).
 */
 void FCompiler::ForwardSingleUse(std::vector<FStmtIR>& Stmts, const std::vector<FStmtIR>& All)
 {
-    for (size_t I = 0; I < Stmts.size(); ++I)
-    {
-        for (auto* L : { &Stmts[I].Then, &Stmts[I].Else, &Stmts[I].Body, &Stmts[I].Inc, &Stmts[I].Trailer })
+    for (FStmtIR& St : Stmts)
+        for (auto* L : { &St.Then, &St.Else, &St.Body, &St.Inc, &St.Trailer })
             if (*L)
             {
                 *L = std::make_shared<std::vector<FStmtIR>>(**L);
                 ForwardSingleUse(**L, All);
             }
-        while (I + 1 < Stmts.size())
+    /* Last to first, so `A = ..; B = ..; S(A, B)` forwards B, then A into what S has become. */
+    for (size_t I = Stmts.size(); I-- > 1;)
+    {
         {
-            const FStmtIR& Def = Stmts[I];
-            FStmtIR& Next = Stmts[I + 1];
+            const FStmtIR& Def = Stmts[I - 1];
+            FStmtIR& Next = Stmts[I];
             const std::string& Name = Def.Var.S;
             if (!((Def.K == FStmtIR::Decl && Def.bHasValue) || (Def.K == FStmtIR::Assign && Def.bAssignLocal))
                 || Def.Var.K != FArgIR::Local || Def.Var.Base || !CurLocals
                 || std::none_of(CurLocals->begin(), CurLocals->end(), [&](const FPropertyDef& L) { return L.Name == Name; })
                 || Mentions(All, Name) != 2 || Mentions(Def.Value, Name) != 0)
-                break;
+                continue;
             FArgIR* Read = nullptr;
             FArgIR* Scope = nullptr;
             if (Next.K == FStmtIR::StaticCall && !Next.Target.Target && Next.Target.Args.empty())
@@ -5410,7 +5427,7 @@ void FCompiler::ForwardSingleUse(std::vector<FStmtIR>& Stmts, const std::vector<
                 Read = FindPlainRead(*(Scope = &Next.Value), Name);
             else if (Next.K == FStmtIR::If)
                 Read = FindPlainRead(*(Scope = &Next.Cond), Name);
-            if (!Read) break;
+            if (!Read) continue;
 
             const FArgIR& E = Def.Value;
             const bool bActs = CallsImpure(E);
@@ -5421,10 +5438,76 @@ void FCompiler::ForwardSingleUse(std::vector<FStmtIR>& Stmts, const std::vector<
                 if (Next.Call.Target) bOk = bOk && Pred(*Next.Call.Target);
                 for (const FArgIR& A : Next.Call.Args) if (&A != Scope) bOk = bOk && Pred(A);
             }
-            if (!bOk) break;
+            if (!bOk) continue;
             *Read = E;
-            Stmts.erase(Stmts.begin() + I);
+            Stmts.erase(Stmts.begin() + (I - 1));
         }
+    }
+}
+
+/* An inline body with no early return is just its statements: no jump lands past it, and a break in it would have
+   been refused. Spliced into the list around it, its result local meets its use (ForwardSingleUse). */
+static bool HasInlineReturn(const std::vector<FStmtIR>& Stmts)
+{
+    for (const FStmtIR& St : Stmts)
+    {
+        if (St.K == FStmtIR::InlineReturn) return true;
+        if (St.K != FStmtIR::Block)
+            for (const auto* L : { &St.Then, &St.Else, &St.Body, &St.Inc, &St.Trailer })
+                if (*L && HasInlineReturn(**L)) return true;
+    }
+    return false;
+}
+
+void FCompiler::FlattenBlocks(std::vector<FStmtIR>& Stmts)
+{
+    for (size_t I = 0; I < Stmts.size(); ++I)
+    {
+        FStmtIR& St = Stmts[I];
+        for (auto* L : { &St.Then, &St.Else, &St.Body, &St.Inc, &St.Trailer })
+            if (*L)
+            {
+                *L = std::make_shared<std::vector<FStmtIR>>(**L);
+                FlattenBlocks(**L);
+            }
+        if (St.K != FStmtIR::Block || (St.Body && HasInlineReturn(*St.Body))) continue;
+        const std::vector<FStmtIR> Body = St.Body ? *St.Body : std::vector<FStmtIR>();
+        Stmts.erase(Stmts.begin() + I);
+        Stmts.insert(Stmts.begin() + I, Body.begin(), Body.end());
+        I += Body.size();
+        --I;
+    }
+}
+
+/* Whether the first thing Stmts does to local Name, on every path, is store a whole new value that does not read it. */
+static bool StoresFirst(const std::vector<FStmtIR>& Stmts, const std::string& Name)
+{
+    if (Stmts.empty()) return false;
+    const FStmtIR& St = Stmts.front();
+    if ((St.K == FStmtIR::Assign || (St.K == FStmtIR::Decl && St.bHasValue)) && St.Var.K == FArgIR::Local && !St.Var.Base
+        && St.Var.S == Name)
+        return Mentions(St.Value, Name) == 0;
+    return St.K == FStmtIR::If && !St.bJumpOut && Mentions(St.Cond, Name) == 0 && St.Then && St.Else
+        && StoresFirst(*St.Then, Name) && StoresFirst(*St.Else, Name);
+}
+
+/* `int32 R = 0; if (C) R = 1; else R = 2;`: a store to a local that the next statement overwrites on every path before
+   reading it does nothing, unless its value calls something that acts. */
+void FCompiler::DropOverwritten(std::vector<FStmtIR>& Stmts)
+{
+    for (size_t I = 0; I < Stmts.size(); ++I)
+    {
+        FStmtIR& St = Stmts[I];
+        for (auto* L : { &St.Then, &St.Else, &St.Body, &St.Inc, &St.Trailer })
+            if (*L)
+            {
+                *L = std::make_shared<std::vector<FStmtIR>>(**L);
+                DropOverwritten(**L);
+            }
+        if ((St.K == FStmtIR::Assign || (St.K == FStmtIR::Decl && St.bHasValue)) && St.Var.K == FArgIR::Local && !St.Var.Base
+            && !CallsImpure(St.Value) && I + 1 < Stmts.size()
+            && StoresFirst(std::vector<FStmtIR>(Stmts.begin() + I + 1, Stmts.begin() + I + 2), St.Var.S))
+            Stmts.erase(Stmts.begin() + I--);
     }
 }
 
@@ -6133,6 +6216,23 @@ bool FCompiler::HoistReadsInList(std::vector<FStmtIR>& Stmts, FBlueprintClass& B
     for (FStmtIR& St : Stmts)
     {
         std::vector<FStmtIR> Pre;
+        /* `return C ? A : B;` is `if (C) return A; else return B;`: no temp to store the value in first. */
+        if (!bCurNoOpt && St.K == FStmtIR::Return && St.bHasValue && St.Value.K == FArgIR::Call && St.Value.Sub
+            && St.Value.Sub->Intrinsic == "__Select__" && St.Value.Sub->Args.size() == 3)
+        {
+            FStmtIR If;
+            If.K = FStmtIR::If;
+            If.Cond = St.Value.Sub->Args[0];
+            FStmtIR Taken = St, Other = St;
+            Taken.Value = St.Value.Sub->Args[1];
+            Other.Value = St.Value.Sub->Args[2];
+            If.Then = std::make_shared<std::vector<FStmtIR>>(1, std::move(Taken));
+            If.Else = std::make_shared<std::vector<FStmtIR>>(1, std::move(Other));
+            if (!HoistReadsInStmt(If, BP, Locals, Pre, Err)) return false;
+            for (FStmtIR& P : Pre) Out.push_back(std::move(P));
+            Out.push_back(std::move(If));
+            continue;
+        }
         /* `X = C ? A : B` (or && / ||) into a local: the branches store into X itself, when nothing in them reads X. */
         const auto Dest = std::find_if(Locals.begin(), Locals.end(), [&](const FPropertyDef& L) { return L.Name == St.Var.S; });
         if (!bCurNoOpt && (St.K == FStmtIR::Assign || (St.K == FStmtIR::Decl && St.bHasValue)) && St.Var.K == FArgIR::Local
@@ -7537,7 +7637,12 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         if (!bCurNoOpt)
         {
             PruneConstBranches(Stmts);
-            if (!bBodyHasGoto && !bMadeLatentCall) ForwardSingleUse(Stmts, Stmts);
+            if (!bBodyHasGoto && !bMadeLatentCall)
+            {
+                FlattenBlocks(Stmts);
+                DropOverwritten(Stmts);
+                ForwardSingleUse(Stmts, Stmts);
+            }
             DropUnusedPure(Stmts);
             DropUnusedLocals(Stmts, Locals);
             if (!bBodyHasGoto && !bMadeLatentCall) CoalesceTemps(Stmts, Locals, BP);
@@ -7551,7 +7656,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         /* Locals follow ReturnValue in ChildProperties; the engine tells them apart by CPF_Parm. */
         for (const FPropertyDef& L : Locals) Params.push_back(L);
 
-        const bool bEndsWithReturn = !Stmts.empty() && Stmts.back().K == FStmtIR::Return;
+        const bool bEndsWithReturn = NeverFallsThrough(Stmts, true);
         const bool bScratchNeeded = ReadScratchAdded;
         const FIndex DerefStruct = bScratchNeeded
             ? BP.ScriptStruct(ModPackage + "/FDeref", "FDeref")
