@@ -132,6 +132,10 @@ def update_once():
     assert w.count('NextSlot') == 1 and w.count('ArrayGetByRef') == 2, w
     print('ok  FlowTest.BumpSlot: Slots[NextSlot()] += By calls NextSlot once')
     w = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'walkscript.py'), base,
+                        str(names.index('ConstexprPick'))], capture_output=True, text=True).stdout
+    assert 'JumpIfNot' not in w, w
+    print('ok  FlowTest.ConstexprPick: if constexpr keeps one branch, no jump over a constant')
+    w = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'walkscript.py'), base,
                         str(names.index('CallMember'))], capture_output=True, text=True).stdout
     ctx = [l for l in w.splitlines() if 'StructMemberContext' in l or 'FinalFunction' in l or 'LocalVariable' in l]
     assert 'FinalFunction' not in ''.join(l for l in ctx if 'StructMemberContext' in l) and 'Let' in w, w
@@ -168,6 +172,7 @@ check('FlowTest', 'PreInc', lambda X: (X + 1) * 101, [dict(X=x) for x in (-1, 0,
 check('FlowTest', 'UpdateChain', lambda X: (1 + X) * 11, [dict(X=x) for x in (-1, 0, 4)])
 check('FlowTest', 'OrAssign', lambda N: 11 if N > 0 else 0, [dict(N=n) for n in (-1, 0, 3)])
 check('FlowTest', 'TemplateMember', lambda X: X * 6, [dict(X=x) for x in (-2, 0, 7)])
+check('FlowTest', 'ConstexprPick', lambda: 84, [dict()])
 check('FlowTest', 'SafeRatio', lambda X: X != 0 and cdiv(10, X) > 2, [dict(X=x) for x in (-2, 0, 1, 3, 4)])
 check('FlowTest', 'EitherZero', lambda X, Y: X == 0 or cdiv(100, X) == Y, [dict(X=x, Y=y) for x in (0, 10, 3) for y in (0, 10, 33)])
 check('FlowTest', 'Pick', lambda X: X * 2 if X > 0 else (-1 if X < -5 else 7), [dict(X=x) for x in (-9, -5, 0, 4)])
@@ -452,6 +457,11 @@ def typed_outer():
         assert 'GetTypedOuter' not in w and 'GetOutermostTypedOuter' not in w, w
     assert not any(n in exports for n in ('GetTypedOuter', 'GetOutermostTypedOuter')), exports
     print('ok  SpawnTest: GetTypedOuter / GetOutermostTypedOuter inline to an outer walk')
+    for fn, cls in (('OwnClass', 'SpawnTest_C'), ('MakeProbe', 'USpawnProbe_C')):
+        w = subprocess.run([sys.executable, os.path.join(here, 'walkscript.py'), base, str(exports.index(fn))],
+                           capture_output=True, text=True).stdout
+        assert cls in w and "Class'Actor'" not in w and "Class'Object'" not in w, (fn, w)
+    print('ok  SpawnTest: X::StaticClass() and NewObject<T> name the mod class, not the native one it inherits from')
 
 
 def api_stub():

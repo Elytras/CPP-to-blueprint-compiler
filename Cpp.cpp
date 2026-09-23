@@ -8,6 +8,7 @@
 #include <set>
 #include <map>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <vector>
@@ -1028,6 +1029,11 @@ private:
     Json HoistExpr(const Json& N, Json& Pre);
     Json SynthLocal(const std::string& Type, const Json& Init, Json& Pre);
     bool LowerUpdateValue(const Json& N, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
+
+    /* `X::StaticClass()`: the record X names, read back from the mod's sources (clang's JSON keeps no qualifier). */
+    const FRecord* NamedQualifier(const Json& Ref) const;
+    bool IsSubclassOf(const FRecord& Child, const FRecord& Parent) const;
+    mutable std::vector<std::string> SourceTexts;                       // the mod directory's .h/.cpp, read on demand
 
     /* The native UFunction Method overrides, or null; InheritedFlags gets the flags it passes on, also
        for a method implementing an interface's function, which has no Super. */
@@ -3199,8 +3205,15 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             : std::string();
         if (CalleeName == "StaticClass")
         {
+            /* StaticClass is declared once, by UE_CLASS on a native class, so the decl names AActor for every mod
+               actor that inherits it. The class meant is the qualifier (`AMine::StaticClass()`), else the class a
+               TSubclassOf<X> slot around it asks for (NewObject<T>'s default argument), when that is more derived. */
             auto Owner = MethodOwner.find((*CalleeNode)["referencedDecl"].value("id", std::string()));
             const FRecord* R = Owner == MethodOwner.end() ? nullptr : Find(Owner->second);
+            std::string Slot;
+            if (const FRecord* Q = NamedQualifier(*CalleeNode)) R = Q;
+            else if (TemplateArg(StripTypeKeywords(OuterType), "TSubclassOf", &Slot))
+                if (const FRecord* S = Find(StripTypeKeywords(Slot)); S && R && S != R && IsSubclassOf(*S, *R)) R = S;
             if (!R) { *Err = "StaticClass() on an unknown class"; return false; }
             Out.K = FArgIR::ObjConst;
             Out.Owner = ClassImportOf(*R, BP);
@@ -3498,6 +3511,47 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
 
     *Err = "TODO: unimplemented argument " + K;
     return false;
+}
+
+bool FCompiler::IsSubclassOf(const FRecord& Child, const FRecord& Parent) const
+{
+    for (const FRecord* A = &Child; A; A = A->Base.empty() ? nullptr : Find(A->Base))
+        if (A == &Parent) return true;
+    return false;
+}
+
+/* The qualifier token is where a qualified DeclRefExpr's range begins; the JSON gives its byte offset and length but
+   not its file (that is only written when it changes, and Json's sorted keys lose the order). So each of the mod's own
+   sources is tried at that offset, and a hit counts only when `<Record>::StaticClass` is what is written there.
+   ponytail: a namespace-qualified `Ns::X::StaticClass()` begins at Ns and falls back to the declaring class. */
+const FRecord* FCompiler::NamedQualifier(const Json& Ref) const
+{
+    const Json Begin = Ref.value("range", Json::object()).value("begin", Json::object());
+    if (!Begin.contains("offset") || !Begin.contains("tokLen")) return nullptr;
+    const size_t Off = Begin["offset"].get<size_t>(), Len = Begin["tokLen"].get<size_t>();
+    if (SourceTexts.empty())
+    {
+        std::error_code Ec;
+        for (const auto& E : std::filesystem::directory_iterator(SourceDir, Ec))
+        {
+            const std::string Ext = E.path().extension().string();
+            if (!E.is_regular_file() || (Ext != ".h" && Ext != ".hpp" && Ext != ".cpp")) continue;
+            std::ifstream F(E.path(), std::ios::binary);
+            SourceTexts.emplace_back(std::istreambuf_iterator<char>(F), std::istreambuf_iterator<char>());
+        }
+    }
+    for (const std::string& T : SourceTexts)
+    {
+        if (Off + Len > T.size()) continue;
+        size_t P = Off + Len;
+        while (P < T.size() && (T[P] == ' ' || T[P] == '\t')) ++P;
+        if (T.compare(P, 2, "::") != 0) continue;
+        P += 2;
+        while (P < T.size() && (T[P] == ' ' || T[P] == '\t')) ++P;
+        if (T.compare(P, 11, "StaticClass") != 0) continue;
+        if (const FRecord* R = Find(T.substr(Off, Len))) return R;
+    }
+    return nullptr;
 }
 
 /* True when evaluating N twice is the same as once: names, literals, member reads and arithmetic, no call or store. */
@@ -4451,6 +4505,18 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             const Json* Then = Nth(*S, 1);
             const Json* Else = Nth(*S, 2);
             if (!Cond || !Then) { *Err = "`if` with a missing condition or then-branch"; bOk = false; return; }
+
+            /* `if constexpr`: clang has chosen, and an instantiation leaves the discarded branch empty. Only the kept
+               one is lowered, so no `JumpIfNot False` chain is left behind (MakeValue<T>'s six-way dispatch). */
+            if (FConstVal V; S->value("isConstexpr", false) && FoldConst(*Cond, V))
+            {
+                if (const Json* Kept = V.Num() != 0 ? Then : Else)
+                {
+                    Json Wrap = Kind(*Kept) == "CompoundStmt" ? *Kept : Json{ {"kind", "CompoundStmt"}, {"inner", Json::array({ *Kept })} };
+                    if (!LowerBody(Wrap, BP, Out, Locals, Err)) bOk = false;
+                }
+                return;
+            }
 
             /* `if (A && B) S` with no else is `if (A) if (B) S`: two jumps, no temp, no call, whatever B is. With an
                else, the else would be duplicated, so that one goes through the && lowering. */
