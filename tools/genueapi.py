@@ -94,6 +94,12 @@ ENUM_REF = re.compile(r"^(?:const\s+)?(?:TEnumAsByte<)?(E\w+)>?\s*&?$")
 def map_type(raw):
     """The C++ spelling to emit, or a KINDS reason when AssetGen cannot compile such a value."""
     t = " ".join(raw.split())
+    # Dumper-7's parameter spellings (CppGenerator.cpp GenerateFunctionInHeader): `T&` is a ReferenceParm, the callee
+    # writing through it (`TArray<FString>& Errors`), whatever T is; `const T&` a by-value in-parm of a move type;
+    # `T*` on a non-object an OutParm. The reference stays a reference - AssetGen passes such an argument by address.
+    if t.endswith("&") and not t.startswith("const "):
+        inner = map_type(t[:-1].rstrip())
+        return inner if inner in KINDS or inner == "void" else inner + "&"
     base = t[6:] if t.startswith("const ") else t          # `const int32&`: a by-value scalar to the caller
     base = base[:-1].rstrip() if base.endswith("&") else base
     if base in SCALARS:
