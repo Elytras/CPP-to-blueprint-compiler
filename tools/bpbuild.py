@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""usage: bpbuild.py <repo root> <UeApi dir> <assetgen.exe> [--force] [--no-pak]"""
+"""usage: bpbuild.py <mods dir (holds mods.yaml) or a parent with BpMods/> <UeApi dir> <assetgen.exe> [--force] [--no-pak]"""
 import io
 import os
 import re
@@ -14,7 +14,7 @@ from dumpexp import load as load_package
 
 MOD_PACKAGE = re.compile(r'UE_MOD_PACKAGE\s*\(\s*"([^"]+)"')
 
-UNREALPAK = r"C:\Program Files\Epic Games\UE_4.27\Engine\Binaries\Win64\UnrealPak.exe"
+UNREALPAK = os.environ.get("UNREALPAK") or r"C:\Program Files\Epic Games\UE_4.27\Engine\Binaries\Win64\UnrealPak.exe"
 
 
 def newest(paths):
@@ -247,7 +247,7 @@ def main():
     force = "--force" in sys.argv[4:]
     no_pak = "--no-pak" in sys.argv[4:]
 
-    bp = os.path.join(repo, "BpMods")
+    bp = repo if os.path.exists(os.path.join(repo, "mods.yaml")) else os.path.join(repo, "BpMods")
     write_vs_filters(bp)
     manifest = os.path.join(bp, "mods.yaml")
     if not os.path.exists(manifest):
