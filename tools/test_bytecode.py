@@ -124,7 +124,7 @@ clusters_shape()
 
 
 def update_once():
-    import subprocess
+    import re, subprocess
     base = asset('FlowTest')
     names = [e['name'] for e in dumpexp.load(base)[5]]
     w = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'walkscript.py'), base,
@@ -135,6 +135,11 @@ def update_once():
                         str(names.index('ConstexprPick'))], capture_output=True, text=True).stdout
     assert 'JumpIfNot' not in w, w
     print('ok  FlowTest.ConstexprPick: if constexpr keeps one branch, no jump over a constant')
+    w = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'walkscript.py'), base,
+                        str(names.index('CoalesceLoop'))], capture_output=True, text=True).stdout
+    rets = set(re.findall(r'(__Inl\d+_ReturnValue)@', w))
+    assert len(rets) == 2, (rets, w)     # four expansions share two: only the pair in one statement is live together
+    print('ok  FlowTest.CoalesceLoop: inline temps share a property only where their spans do not overlap')
     w = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'walkscript.py'), base,
                         str(names.index('CallMember'))], capture_output=True, text=True).stdout
     ctx = [l for l in w.splitlines() if 'StructMemberContext' in l or 'FinalFunction' in l or 'LocalVariable' in l]
@@ -173,6 +178,9 @@ check('FlowTest', 'UpdateChain', lambda X: (1 + X) * 11, [dict(X=x) for x in (-1
 check('FlowTest', 'OrAssign', lambda N: 11 if N > 0 else 0, [dict(N=n) for n in (-1, 0, 3)])
 check('FlowTest', 'TemplateMember', lambda X: X * 6, [dict(X=x) for x in (-2, 0, 7)])
 check('FlowTest', 'ConstexprPick', lambda: 84, [dict()])
+check('FlowTest', 'CoalesceLoop', lambda N: sum((2 * i + 1) + (2 * (i + 1) + 1) for i in range(2 * N + 1)) * 1000 + 2 * N + 1,
+      [dict(N=n) for n in (-1, 0, 1, 3)])
+check('FlowTest', 'LoopInline', lambda N: max(N, 0) ** 2 * 100 + max(2 * N + 1, 0) ** 2, [dict(N=n) for n in (-3, 0, 1, 4)])
 check('FlowTest', 'SafeRatio', lambda X: X != 0 and cdiv(10, X) > 2, [dict(X=x) for x in (-2, 0, 1, 3, 4)])
 check('FlowTest', 'EitherZero', lambda X, Y: X == 0 or cdiv(100, X) == Y, [dict(X=x, Y=y) for x in (0, 10, 3) for y in (0, 10, 33)])
 check('FlowTest', 'Pick', lambda X: X * 2 if X > 0 else (-1 if X < -5 else 7), [dict(X=x) for x in (-9, -5, 0, 4)])

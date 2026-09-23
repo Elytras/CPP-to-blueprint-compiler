@@ -1005,6 +1005,7 @@ private:
        its Num=1 so ArrayGetByRef's bounds check passes. */
     void DropUnusedPure(std::vector<FStmtIR>& Stmts);
     void DropUnusedLocals(std::vector<FStmtIR>& Stmts, std::vector<FPropertyDef>& Locals);
+    void CoalesceTemps(std::vector<FStmtIR>& Stmts, std::vector<FPropertyDef>& Locals);
     bool HoistReadsInList(std::vector<FStmtIR>& Stmts, FBlueprintClass& BP,
                           std::vector<FPropertyDef>& Locals, std::string* Err);
     bool HoistReadsInStmt(FStmtIR& St, FBlueprintClass& BP,
@@ -4118,6 +4119,153 @@ void FCompiler::DropUnusedLocals(std::vector<FStmtIR>& Stmts, std::vector<FPrope
     }
 }
 
+/* Two property definitions a frame lays out identically, whatever they are called. */
+static std::string PropKey(const FPropertyDef& P)
+{
+    std::string K = P.Type + "|" + std::to_string(P.ArrayDim) + "|" + std::to_string(P.ElementSize) + "|" + std::to_string(P.PropertyFlags)
+                  + "|" + std::to_string(P.Extra.V) + "|" + std::to_string(P.Extra2.V) + "|" + P.StructName + "|" + P.EnumZero;
+    if (P.Inner) K += "<" + PropKey(*P.Inner) + ">";
+    if (P.Value) K += "<" + PropKey(*P.Value) + ">";
+    if (P.Members) for (const FPropertyDef& M : *P.Members) K += "{" + PropKey(M) + "}";
+    return K;
+}
+
+/*
+Every inline expansion, pointer read and hoisted operand mints a local of its own, so a function built from a few
+helpers ends up with hundreds of properties in its frame. Here, once the body is final, the compiler's temps are
+packed like registers: statements are numbered in emission order, each temp spans its first to last mention, and
+temps of one layout whose spans do not overlap share a property.
+
+That is sound because a compiler temp is always written before it is read within its span, on every path: it is
+stored by the statement hoisted right before its reader, or at the top of the inline block it belongs to. The
+exceptions stay out: a declaration without an initializer (it reads as the frame's zero, a container as empty),
+the zero-kept __Fresh twins, and the scratch the pointer reads name implicitly. A loop repeats its body, so a temp
+mentioned in its condition, increment or break trailer, or both inside and outside it, spans the whole loop.
+Not run with a goto (any label re-enters) or a latent call (the ubergraph frame outlives the call).
+*/
+void FCompiler::CoalesceTemps(std::vector<FStmtIR>& Stmts, std::vector<FPropertyDef>& Locals)
+{
+    static const char* const kPooled[] = { "__Inl", "__DerefTmp", "__MapGet", "__Upd", "__PtrTmp", "__Switch" };
+    auto Pooled = [](const std::string& N) {
+        for (const char* P : kPooled) if (N.compare(0, strlen(P), P) == 0) return true;
+        return false;
+    };
+    struct FSpan { int32 First = INT32_MAX, Last = -1; bool bOut = false; };
+    std::map<std::string, FSpan> Spans;
+    struct FLoop { int32 Start, End; std::set<std::string> Head; };
+    std::vector<FLoop> Loops;
+    int32 Pos = 0;
+    auto Touch = [&](const std::string& N) {
+        if (N.empty()) return;
+        FSpan& S = Spans[N];
+        S.First = std::min(S.First, Pos);
+        S.Last = std::max(S.Last, Pos);
+    };
+
+    /* An expression's own mentions, at Pos; an __Inline__ body inside it was walked (and numbered) before it. */
+    std::function<void(const std::vector<FStmtIR>&)> Walk;
+    std::function<void(const FArgIR&, bool)> Arg;
+    std::function<void(const FCallIR&, bool)> Call = [&](const FCallIR& C, bool bBodies) {
+        if (bBodies && C.Inline) Walk(*C.Inline);
+        if (!bBodies) Touch(C.InlineResult);
+        if (C.Target) Arg(*C.Target, bBodies);
+        for (const FArgIR& A : C.Args) Arg(A, bBodies);
+    };
+    Arg = [&](const FArgIR& A, bool bBodies) {
+        if (!bBodies && (A.K == FArgIR::Local || A.K == FArgIR::LocalOut)) Touch(A.S);
+        if (A.Sub) Call(*A.Sub, bBodies);
+        if (A.Base) Arg(*A.Base, bBodies);
+    };
+    auto Own = [&](const FStmtIR& St, bool bBodies) {
+        Call(St.Target, bBodies);
+        Call(St.Call, bBodies);
+        for (const FArgIR* A : { &St.Var, &St.Value, &St.Cond, &St.SwitchValue }) Arg(*A, bBodies);
+        for (const FArgIR& A : St.CaseTests) Arg(A, bBodies);
+    };
+    /* A loop's head (condition, increment, break trailer) is recorded by diffing the span map around its walk. */
+    auto Snapshot = [&]() { std::map<std::string, int32> M; for (auto& [N, S] : Spans) M[N] = S.Last; return M; };
+    auto Mark = [&](const std::map<std::string, int32>& Old, std::set<std::string>& Head) {
+        for (auto& [N, S] : Spans) if (auto It = Old.find(N); It == Old.end() || It->second != S.Last) Head.insert(N);
+    };
+    Walk = [&](const std::vector<FStmtIR>& List) {
+        for (const FStmtIR& St : List)
+        {
+            if (St.K != FStmtIR::While)
+            {
+                Own(St, true);
+                ++Pos;
+                if (St.K == FStmtIR::Decl && !St.bHasValue && Spans.find(St.Var.S) == Spans.end()) Spans[St.Var.S].bOut = true;
+                Own(St, false);
+                for (const auto* L : { &St.Then, &St.Else, &St.Body }) if (*L) Walk(**L);
+                continue;
+            }
+            FLoop Loop{ ++Pos, 0, {} };
+            { auto Old = Snapshot(); Own(St, true); ++Pos; Own(St, false); Mark(Old, Loop.Head); }
+            if (St.Body) Walk(*St.Body);
+            for (const auto* L : { &St.Inc, &St.Trailer })
+                if (*L) { auto Old = Snapshot(); ++Pos; Walk(**L); Mark(Old, Loop.Head); }
+            Loop.End = ++Pos;
+            Loops.push_back(std::move(Loop));   // an inner loop ends, so lands here, before the one around it
+        }
+    };
+    Walk(Stmts);
+
+    for (const FLoop& L : Loops)
+        for (auto& [N, S] : Spans)
+            if (L.Head.count(N) || (S.First < L.Start && S.Last >= L.Start) || (S.First <= L.End && S.Last > L.End))
+            {
+                S.First = std::min(S.First, L.Start);
+                S.Last = std::max(S.Last, L.End);
+            }
+
+    /* Greedy interval colouring per layout, in order of first mention. */
+    std::vector<const FPropertyDef*> Cands;
+    for (const FPropertyDef& L : Locals)
+        if (Pooled(L.Name) && L.Name.compare(0, 7, "__Fresh") != 0)
+            if (auto S = Spans.find(L.Name); S != Spans.end() && !S->second.bOut && S->second.Last >= 0) Cands.push_back(&L);
+    std::sort(Cands.begin(), Cands.end(), [&](const FPropertyDef* A, const FPropertyDef* B) { return Spans[A->Name].First < Spans[B->Name].First; });
+    struct FSlot { std::string Name; int32 End; };
+    std::map<std::string, std::vector<FSlot>> Slots;
+    std::map<std::string, std::string> Rename;
+    for (const FPropertyDef* L : Cands)
+    {
+        const FSpan& S = Spans[L->Name];
+        std::vector<FSlot>& Free = Slots[PropKey(*L)];
+        auto It = std::find_if(Free.begin(), Free.end(), [&](const FSlot& F) { return F.End < S.First; });
+        if (It == Free.end()) { Free.push_back({ L->Name, S.Last }); continue; }
+        Rename[L->Name] = It->Name;
+        It->End = S.Last;
+    }
+    if (Rename.empty()) return;
+
+    std::function<void(std::vector<FStmtIR>&)> RWalk;
+    std::function<void(FArgIR&)> RArg;
+    std::function<void(FCallIR&)> RCall = [&](FCallIR& C) {
+        if (auto R = Rename.find(C.InlineResult); R != Rename.end()) C.InlineResult = R->second;
+        if (C.Inline) RWalk(*C.Inline);
+        if (C.Target) RArg(*C.Target);
+        for (FArgIR& A : C.Args) RArg(A);
+    };
+    RArg = [&](FArgIR& A) {
+        if (A.K == FArgIR::Local || A.K == FArgIR::LocalOut)
+            if (auto R = Rename.find(A.S); R != Rename.end()) A.S = R->second;
+        if (A.Sub) RCall(*A.Sub);
+        if (A.Base) RArg(*A.Base);
+    };
+    RWalk = [&](std::vector<FStmtIR>& List) {
+        for (FStmtIR& St : List)
+        {
+            RCall(St.Target);
+            RCall(St.Call);
+            for (FArgIR* A : { &St.Var, &St.Value, &St.Cond, &St.SwitchValue }) RArg(*A);
+            for (FArgIR& A : St.CaseTests) RArg(A);
+            for (auto* L : { &St.Then, &St.Else, &St.Body, &St.Inc, &St.Trailer }) if (*L) RWalk(**L);
+        }
+    };
+    RWalk(Stmts);
+    Locals.erase(std::remove_if(Locals.begin(), Locals.end(), [&](const FPropertyDef& L) { return Rename.count(L.Name) != 0; }), Locals.end());
+}
+
 /*
 Drops a statement that only calls a pure function whose arguments call nothing impure: its value is unused, so
 the call does nothing. Repeated pure calls are left alone; a C++ local already says "compute this once".
@@ -6969,6 +7117,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         {
             DropUnusedPure(Stmts);
             DropUnusedLocals(Stmts, Locals);
+            if (!bBodyHasGoto && !bMadeLatentCall) CoalesceTemps(Stmts, Locals);
         }
         for (const auto& [Struct, Keep] : KeepLoaded)
         {
