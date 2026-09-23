@@ -7219,7 +7219,10 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
 {
     ApiDir = InApiDir;
     SourceDir = std::filesystem::path(SourcePath).parent_path().string();
-    const std::string AstPath = OutDir + "/ast.json";
+    /* In %TEMP%, not OutDir: bpbuild paks OutDir's whole tree, and a failed compile keeps the dump (hundreds of MB). */
+    std::error_code TmpEc;
+    const std::string AstPath = (std::filesystem::temp_directory_path(TmpEc)
+                                 / (std::filesystem::path(SourcePath).stem().string() + ".assetgen-ast.json")).string();
     /* Both the UeApi dir and its parent are include paths, so "FSD.h" and "UeApi/FSD.h" both resolve. */
     const std::string Parent = std::filesystem::path(IncludeDir).parent_path().string();
     /* -Wno-string-plus-int: `"lit" + N` is a Concat_StrStr here, not pointer arithmetic. */

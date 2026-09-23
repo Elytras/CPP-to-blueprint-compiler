@@ -297,11 +297,11 @@ def main():
         stale = (force or not assets or api_missing
                  or max(newest(sources), toolchain_time) > oldest(assets))
         if stale:
-            if not os.path.isdir(stage_content):
-                os.makedirs(stage_content)
-            # An asset the sources no longer cook (a struct another mod now owns) must not stay in the pak.
-            for old in assets:
-                os.remove(old)
+            # The pak takes the whole FSD tree, so the whole Content tree goes, not just this package's folder:
+            # an asset the sources no longer cook (a struct another mod now owns), a folder left by an earlier
+            # UE_MOD_PACKAGE, a failed compile's leftovers. Embedded deps are copied back in at pack time.
+            shutil.rmtree(os.path.join(stage_fsd, "Content"), ignore_errors=True)
+            os.makedirs(stage_content)
             for api_dir in api_contents:
                 if not os.path.isdir(api_dir):
                     os.makedirs(api_dir)
