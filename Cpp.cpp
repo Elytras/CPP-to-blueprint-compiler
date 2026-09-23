@@ -813,8 +813,8 @@ void StampIdentity(FPackage& P, const std::string& PackageName)
 std::string ReadText(const std::string& Path)
 {
     std::string Out;
-    FILE* F = nullptr;
-    if (fopen_s(&F, Path.c_str(), "rb") != 0 || !F) return Out;
+    FILE* F = fopen(Path.c_str(), "rb");
+    if (!F) return Out;
     char Buf[16384];
     size_t N;
     while ((N = fread(Buf, 1, sizeof Buf, F)) > 0) Out.append(Buf, N);
@@ -3924,8 +3924,12 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         L.K = FArgIR::LatentInfo;
         L.Owner = BP.ScriptStruct("/Script/Engine", "LatentActionInfo");
         L.S = "ExecuteUbergraph_" + Cur->CppName;
-        /* The latent action manager keys pending actions by UUID per callback target: one per call site. */
-        L.I = int32(std::hash<std::string>{}(Cur->CppName + "." + CurFnName + "#" + std::to_string(++LatentCount)));
+        /* The latent action manager keys pending actions by UUID per callback target: one per call site. FNV-1a 64,
+           what MSVC's std::hash<std::string> is: libstdc++'s differs, and the asset should not depend on the host. */
+        uint64 Uuid = 14695981039346656037ull;
+        for (const char Ch : Cur->CppName + "." + CurFnName + "#" + std::to_string(++LatentCount))
+            Uuid = (Uuid ^ uint8(Ch)) * 1099511628211ull;
+        L.I = int32(Uuid);
         Fill.emplace_back(LatentAt, L);
 
         std::string ResultLocal;
@@ -4257,7 +4261,8 @@ void FCompiler::CoalesceTemps(std::vector<FStmtIR>& Stmts, std::vector<FProperty
                 const char* Lib = nullptr;
                 if (!S->second.bOut || ZeroOf(L, Zero) || ClearFn(L, &Lib)) Cands.push_back(&L);
             }
-    std::sort(Cands.begin(), Cands.end(), [&](const FPropertyDef* A, const FPropertyDef* B) { return Spans[A->Name].First < Spans[B->Name].First; });
+    /* Stable: spans can start together, and std::sort orders ties differently under MSVC and libstdc++. */
+    std::stable_sort(Cands.begin(), Cands.end(), [&](const FPropertyDef* A, const FPropertyDef* B) { return Spans[A->Name].First < Spans[B->Name].First; });
     struct FSlot { std::string Name; int32 End; };
     std::map<std::string, std::vector<FSlot>> Slots;
     std::map<std::string, std::string> Rename;
@@ -6633,7 +6638,9 @@ bool FCompiler::GenerateAsset(const Json& Var, const std::string& OutDir, std::s
 
     const std::string ClassPkg = R->IsNative() ? R->UePackage : ModPackage + "/" + R->CppName;
     const std::string ClassName = R->IsNative() ? R->UeName : R->CppName + "_C";
-    BP.FinishAsset(BP.EngineClass(ClassPkg, ClassName), BP.ClassDefaultObject(ClassPkg, ClassName));
+    /* The CDO's import first, as MSVC evaluates call arguments (right to left); clang goes left to right. */
+    const FIndex Cdo = BP.ClassDefaultObject(ClassPkg, ClassName);
+    BP.FinishAsset(BP.EngineClass(ClassPkg, ClassName), Cdo);
     if (!P.Save(OutDir + "/" + AssetName, Err)) return false;
     RegistryRows.push_back({ PackageName, AssetName, ClassName });
     printf("  %-14s -> %s.uasset  (asset, a %s)\n", AssetName.c_str(), AssetName.c_str(), R->CppName.c_str());
@@ -7434,13 +7441,39 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     std::error_code TmpEc;
     const std::string AstPath = (std::filesystem::temp_directory_path(TmpEc)
                                  / (std::filesystem::path(SourcePath).stem().string() + ".assetgen-ast.json")).string();
-    /* Both the UeApi dir and its parent are include paths, so "FSD.h" and "UeApi/FSD.h" both resolve. */
-    const std::string Parent = std::filesystem::path(IncludeDir).parent_path().string();
+    /* Both the UeApi dir and its parent are include paths, so "FSD.h" and "UeApi/FSD.h" both resolve. Absolute
+       first: a relative "UeApi" has an empty parent, and -I"" swallows the next argument. */
+    const std::string Parent = std::filesystem::absolute(IncludeDir, TmpEc).parent_path().string();
     /* -Wno-string-plus-int: `"lit" + N` is a Concat_StrStr here, not pointer arithmetic. */
-    const std::string Cmd = "clang++ -std=c++20 -Wno-string-plus-int -fsyntax-only -Xclang -ast-dump=json"
-                            " \"" + SourcePath + "\" -I\"" + IncludeDir + "\" -I\"" + Parent
-                          + "\" > \"" + AstPath + "\"";
+    std::string Cmd = "clang++ -std=c++20 -Wno-string-plus-int -fsyntax-only -Xclang -ast-dump=json";
+#ifndef _WIN32
+    /* Parse with the game's ABI, not the host's: on x86-64 Linux size_t is `unsigned long`, so sizeof has no
+       Kismet conversion. The msvc target finds no C++ headers here and the SDK needs only <initializer_list>,
+       so hand clang a stand-in (it checks only the two-pointer layout). */
+    const std::filesystem::path ShimDir = std::filesystem::temp_directory_path(TmpEc) / "assetgen-include";
+    std::filesystem::create_directories(ShimDir, TmpEc);
+    std::ofstream(ShimDir / "initializer_list", std::ios::binary | std::ios::trunc)
+        << "#pragma once\n"
+           "namespace std {\n"
+           "template <class E> class initializer_list {\n"
+           "    const E* First = nullptr;\n"
+           "    const E* Last = nullptr;\n"
+           "public:\n"
+           "    constexpr initializer_list() noexcept = default;\n"
+           "    constexpr const E* begin() const noexcept { return First; }\n"
+           "    constexpr const E* end() const noexcept { return Last; }\n"
+           "    constexpr decltype(sizeof 0) size() const noexcept { return Last - First; }\n"
+           "};\n"
+           "}\n";
+    Cmd += " --target=x86_64-pc-windows-msvc -isystem \"" + ShimDir.string() + "\"";
+#endif
+    Cmd += " \"" + SourcePath + "\" -I\"" + IncludeDir + "\" -I\"" + Parent + "\" > \"" + AstPath + "\"";
+#ifdef _WIN32
+    /* cmd /c strips the first and last quote of a line that starts with one, so wrap it in a spare pair. */
     if (system(("\"" + Cmd + "\"").c_str()) != 0)
+#else
+    if (system(Cmd.c_str()) != 0)
+#endif
     {
         *Err = "clang rejected " + SourcePath + " (diagnostics above)";
         return false;

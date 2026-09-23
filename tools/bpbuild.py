@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""usage: bpbuild.py <mods dir (holds mods.yaml) or a parent with BpMods/> <UeApi dir> <assetgen.exe> [--force] [--no-pak]"""
+"""usage: bpbuild.py <mods dir (holds mods.yaml) or a parent with BpMods/> <UeApi dir> <assetgen executable> [--force] [--no-pak]"""
 import io
 import os
 import re
@@ -14,7 +14,9 @@ from dumpexp import load as load_package
 
 MOD_PACKAGE = re.compile(r'UE_MOD_PACKAGE\s*\(\s*"([^"]+)"')
 
-UNREALPAK = os.environ.get("UNREALPAK") or r"C:\Program Files\Epic Games\UE_4.27\Engine\Binaries\Win64\UnrealPak.exe"
+# Off Windows there is no default install: a Linux UnrealPak on PATH, or UNREALPAK=<a script running UnrealPak.exe under Wine>.
+UNREALPAK = os.environ.get("UNREALPAK") or (r"C:\Program Files\Epic Games\UE_4.27\Engine\Binaries\Win64\UnrealPak.exe"
+                                            if os.name == "nt" else shutil.which("UnrealPak") or "UnrealPak")
 
 
 def newest(paths):
@@ -157,7 +159,7 @@ def run_unrealpak(fsd_dir, pak_path):
 
     response = os.path.join(os.path.dirname(fsd_dir), "autogen.txt")
     io.open(response, "w", encoding="utf-8", newline="\n").write(
-        '"%s\\*.*" "..\\..\\..\\FSD\\*.*"\n' % fsd_dir)
+        '"%s" "..\\..\\..\\FSD\\*.*"\n' % os.path.join(fsd_dir, "*.*"))
 
     cmd = [UNREALPAK, pak_path, "-platform=Windows", "-create=" + response, "-compress"]
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
