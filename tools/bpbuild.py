@@ -216,6 +216,12 @@ def write_vs_filters(bp):
             rows.append(("ClCompile", f, "Tests" if f.endswith("Test.cpp") else "Mods"))
         elif f.endswith(".h"):
             rows.append(("ClInclude", f, "Helpers"))
+    # The compiler's own test mods and the headers any mod may include live beside it, in AssetGen.
+    for sub, kind, ext, folder in (("tests", "ClCompile", ".cpp", "Tests"), ("include", "ClInclude", ".h", "Helpers")):
+        d = os.path.join(bp, "..", "AssetGen", sub)
+        for f in sorted(os.listdir(d), key=str.lower) if os.path.isdir(d) else []:
+            if f.endswith(ext):
+                rows.append((kind, "..\\AssetGen\\%s\\%s" % (sub, f), folder))
     api = os.path.join(bp, "UeApi")
     for f in sorted(os.listdir(api), key=str.lower) if os.path.isdir(api) else []:
         if f.endswith(".h"):
