@@ -17,7 +17,7 @@ body:
       options:
         - clang rejects the source (error printed before "FAILED")
         - assetgen prints FAILED / TODO / an error
-        - assetgen.exe crashes or hangs
+        - assetgen crashes or hangs
         - bpbuild.py errors (mods.yaml, staging, UnrealPak)
         - The game crashes or logs an error loading the asset
         - The asset loads but behaves wrong at runtime
@@ -60,6 +60,17 @@ body:
       label: clang version
       description: First line of `clang++ --version`.
       placeholder: e.g. clang version 19.1.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: host
+    attributes:
+      label: Built on
+      description: The OS assetgen ran on (not the game's).
+      options:
+        - Windows (AssetGen.sln)
+        - Linux (CMake)
     validations:
       required: true
 
@@ -106,7 +117,8 @@ body:
       label: Game log / crash report (runtime problems)
       description: >
         For load failures or wrong runtime behavior: the relevant part of
-        `%LOCALAPPDATA%\FSD\Saved\Logs\FSD.log` (search for your package name, "LogLinker", "LogScript",
+        `%LOCALAPPDATA%\FSD\Saved\Logs\FSD.log`, under Proton
+        `steamapps/compatdata/548430/pfx/drive_c/users/steamuser/AppData/Local/FSD/Saved/Logs/FSD.log` (search for your package name, "LogLinker", "LogScript",
         "LogUObjectGlobals" and "Error"), or the crash report's callstack. Leave empty for compile-time problems.
       render: text
 

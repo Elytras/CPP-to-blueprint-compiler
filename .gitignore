@@ -3,3 +3,4 @@ x64/
 vcpkg_installed/
 __pycache__/
 *.user
+build/
