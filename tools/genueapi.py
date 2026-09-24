@@ -1,5 +1,8 @@
 ﻿#!/usr/bin/env python3
-"""usage: genueapi.py <SDK dir> <output dir>      e.g. DrgMods/SDK/SDK  BpMods/UeApi"""
+"""usage: genueapi.py <SDK dir> <output dir>      e.g. C:/Dumper-7/<version>-FSD/SDK/SDK  BpMods/UeApi
+
+The SDK dir must sit in its Dumper-7 dump, two levels under GObjects-Dump-WithProperties.txt (see read_real_fields);
+a copy elsewhere (DrgMods/SDK/SDK) has no object dump beside it."""
 import collections
 import io
 import json
@@ -444,8 +447,9 @@ NUMBER_WORDS = ("Zero", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "
 def read_real_fields(sdk_dir):
     path = os.path.join(sdk_dir, "..", "..", "GObjects-Dump-WithProperties.txt")
     if not os.path.exists(path):
-        print("  no %s: a member Dumper-7 respelled will be cooked by its C++ name" % os.path.normpath(path))
-        return
+        # Without it every respelled member (UFSDSaveGame's Index_0) cooks by its C++ name, which the engine does not
+        # know: its default and its reads are lost in game, silently. So no UeApi rather than that one.
+        sys.exit("no %s: run genueapi on the SDK inside its Dumper-7 dump, not a copy of it" % os.path.normpath(path))
     cur = None
     for line in io.open(path, encoding="utf-8", errors="replace"):
         if not line.startswith("["):
