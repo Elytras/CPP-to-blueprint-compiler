@@ -130,19 +130,26 @@ def dep_stage(dep, by_name, bp):
     """Where dep's cooked assets sit - the import path (its UE_MOD_PACKAGE) plus its build dir,
     both known from the manifest, so nothing needs threading through the build loop."""
     package = mod_package(os.path.join(bp, by_name[dep]["sources"][0]))
-    return content_dir(os.path.join(bp, "build", dep, "FSD"), package), package
+    fsd = os.path.join(bp, "build", dep, "FSD")
+    return content_dir(fsd, package), package, fsd
 
 
-def embed_deps(dep_stages, stage_fsd):
-    """Copy each dep's staged assets into this mod's FSD tree so the pak is self-contained.
-    Clears each dest first so a renamed/dropped dep asset can't linger and ship stale."""
-    for content, package in dep_stages:
+def embed_deps(dep_stages, stage_fsd, assetgen):
+    """Copy each dep's staged assets into this mod's FSD tree so the pak is self-contained, and its
+    registry rows into the pak's one FSD/AssetRegistry.bin. Clears each dest first so a
+    renamed/dropped dep asset can't linger and ship stale."""
+    for content, package, fsd in dep_stages:
         dest = content_dir(stage_fsd, package)
         if os.path.isdir(dest):
             shutil.rmtree(dest)
         os.makedirs(dest)
         for f in staged_assets(content):
             shutil.copy2(f, os.path.join(dest, os.path.basename(f)))
+        registry = os.path.join(fsd, "AssetRegistry.bin")
+        if os.path.exists(registry) and subprocess.run(
+                [assetgen, "registry", os.path.join(stage_fsd, "AssetRegistry.bin"), registry]).returncode != 0:
+            return False
+    return True
 
 
 def staged_assets(stage_content):
@@ -309,6 +316,8 @@ def main():
             # an asset the sources no longer cook (a struct another mod now owns), a folder left by an earlier
             # UE_MOD_PACKAGE, a failed compile's leftovers. Embedded deps are copied back in at pack time.
             shutil.rmtree(os.path.join(stage_fsd, "Content"), ignore_errors=True)
+            if os.path.exists(os.path.join(stage_fsd, "AssetRegistry.bin")):
+                os.remove(os.path.join(stage_fsd, "AssetRegistry.bin"))    # the compiles below refill it
             os.makedirs(stage_content)
             for api_dir in api_contents:
                 if not os.path.isdir(api_dir):
@@ -357,7 +366,7 @@ def main():
     for mod, name, package, stage_fsd, stage_content, stale in records:
         embed = bool(mod.get("embed"))
         dep_stages = [dep_stage(d, by_name, bp) for d in transitive_needs(name, by_name)] if embed else []
-        dep_assets = [f for content, _p in dep_stages for f in staged_assets(content)]
+        dep_assets = [f for content, _p, _f in dep_stages for f in staged_assets(content)]
         assets = staged_assets(stage_content)
         pak = os.path.join(bp, "out", name + "_P.pak")
         # A dep's assets are baked into this pak, so a change to one restales it; likewise our own
@@ -370,8 +379,9 @@ def main():
             continue
         if no_pak:
             continue
-        if embed:
-            embed_deps(dep_stages, stage_fsd)
+        if embed and not embed_deps(dep_stages, stage_fsd, assetgen):
+            failed.append(name)
+            continue
         if not os.path.isdir(os.path.dirname(pak)):
             os.makedirs(os.path.dirname(pak))
         if run_unrealpak(stage_fsd, pak):

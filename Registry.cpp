@@ -1,6 +1,8 @@
 ﻿#include "Registry.h"
 
 #include <cstdio>
+#include <cstring>
+#include <set>
 #include <unordered_map>
 
 #include "Package.h"
@@ -153,6 +155,94 @@ bool SaveAssetRegistry(const std::vector<FRegistryAsset>& Assets, const std::str
     const bool bOk = fwrite(File.data(), 1, File.size(), F) == File.size();
     fclose(F);
     return bOk ? true : Fail("short write on AssetRegistry.bin");
+}
+
+bool LoadAssetRegistry(const std::string& Path, std::vector<FRegistryAsset>& Out, std::string* Err)
+{
+    auto Fail = [&](const char* Msg) { if (Err) *Err = Path + ": " + Msg; return false; };
+    FILE* F = fopen(Path.c_str(), "rb");
+    if (!F) return Fail("cannot read");
+    std::vector<uint8> B;
+    uint8 Chunk[65536];
+    for (size_t N; (N = fread(Chunk, 1, sizeof(Chunk), F)) > 0;) B.insert(B.end(), Chunk, Chunk + N);
+    fclose(F);
+
+    size_t At = 0;
+    bool bOk = true;
+    auto Take = [&](void* P, size_t Size) {
+        if (!bOk || At + Size > B.size()) { bOk = false; return; }
+        memcpy(P, B.data() + At, Size);
+        At += Size;
+    };
+    auto U32 = [&] { uint32 V = 0; Take(&V, 4); return V; };
+    auto U64 = [&] { uint64 V = 0; Take(&V, 8); return V; };
+
+    for (uint32 V : kVersionGuid) if (U32() != V) return Fail("not an AssetRegistry.bin");
+    if (int32(U32()) != kVersionFixedTags) return Fail("not a UE 4.27 AssetRegistry.bin");
+
+    std::vector<std::string> Names(U32());
+    if (!Names.empty())
+    {
+        U32();                                                  // string bytes: the headers say each length
+        U64();                                                  // hash algorithm
+        for (size_t I = 0; I < Names.size(); ++I) U64();        // hashes
+        std::vector<uint32> Lengths;
+        for (size_t I = 0; I < Names.size(); ++I)
+        {
+            uint8 H[2] = {};
+            Take(H, 2);
+            if (H[0] & 0x80) return Fail("a UTF-16 name, which assetgen never writes");
+            Lengths.push_back(uint32(H[0]) << 8 | H[1]);
+        }
+        for (size_t I = 0; I < Names.size() && bOk; ++I)
+        {
+            Names[I].resize(Lengths[I]);
+            Take(&Names[I][0], Lengths[I]);
+        }
+    }
+
+    if (U32() != kStoreBeginMagic) return Fail("a malformed tag store");
+    for (int32 I = 0; I <= kStoreViewCount; ++I)                // the views, then the FText block
+        if (U32() != 0) return Fail("asset tags - not a registry assetgen wrote, so not one it can merge");
+    if (U32() != kStoreEndMagic) return Fail("a malformed tag store");
+
+    auto Name = [&]() -> std::string {
+        const uint32 Index = U32();
+        const uint32 Base = Index & ~kNumberedNameBit;
+        if (!bOk || Base >= Names.size()) { bOk = false; return std::string(); }
+        return Index & kNumberedNameBit ? Names[Base] + "_" + std::to_string(int64(U32()) - 1) : Names[Base];
+    };
+    const uint32 Count = U32();
+    for (uint32 I = 0; I < Count && bOk; ++I)
+    {
+        FRegistryAsset A;
+        Name();                                                 // ObjectPath and PackagePath: derived from the rest
+        Name();
+        A.AssetClass = Name();
+        A.PackageName = Name();
+        A.AssetName = Name();
+        if (U64() != 0 || U32() != 0 || U32() != 0) return Fail("asset tags, bundles or chunks, which assetgen never writes");
+        A.PackageFlags = U32();
+        Out.push_back(A);
+    }
+    return bOk ? true : Fail("truncated");
+}
+
+bool MergeAssetRegistry(const std::vector<FRegistryAsset>& Assets, const std::string& Path, std::string* Err)
+{
+    std::vector<FRegistryAsset> Rows;
+    if (FILE* F = fopen(Path.c_str(), "rb"))
+    {
+        fclose(F);
+        if (!LoadAssetRegistry(Path, Rows, Err)) return false;
+    }
+    std::set<std::string> Replaced;
+    for (const FRegistryAsset& A : Assets) Replaced.insert(Lower(A.PackageName));
+    std::vector<FRegistryAsset> Kept;
+    for (const FRegistryAsset& A : Rows)
+        if (!Replaced.count(Lower(A.PackageName))) Kept.push_back(A);
+    Kept.insert(Kept.end(), Assets.begin(), Assets.end());
+    return SaveAssetRegistry(Kept, Path, Err);
 }
 
 }   // namespace Uasset

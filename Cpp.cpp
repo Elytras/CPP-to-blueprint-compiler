@@ -7652,9 +7652,21 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     if (Generated == 0 && RegistryRows.empty()) { *Err = "the source declares no UE_STRUCT, UE_ENUM or class deriving from a UE class"; return false; }
     if (!GenerateNestedWrappers(OutDir, Err)) return false;
 
-    /* A cooked package carries no registry data; without the bake the classes are invisible to it. */
-    if (!SaveAssetRegistry(RegistryRows, OutDir + "/AssetRegistry.bin", Err)) return false;
-    printf("  %-14s -> AssetRegistry.bin  (%d asset%s)\n", "registry",
+    /* A cooked package carries no registry data; without the bake the classes are invisible to it. A pak keeps its
+       one registry beside its Content folder, FSD/AssetRegistry.bin, as the game's own pak and every editor-cooked
+       mod pak do. So an OutDir of <root>/Content/<package path> (bpbuild's) puts it in <root>, merged with what other
+       compiles into the same pak put there; any other OutDir gets its own. */
+    std::string RegistryDir = OutDir;
+    while (!RegistryDir.empty() && (RegistryDir.back() == '/' || RegistryDir.back() == '\\')) RegistryDir.pop_back();
+    for (char& C : RegistryDir) if (C == '\\') C = '/';
+    const std::string Tail = ModPackage.compare(0, 6, "/Game/") == 0 ? "/Content/" + ModPackage.substr(6) : std::string();
+    if (!Tail.empty() && RegistryDir.size() > Tail.size()
+        && Lower(RegistryDir.substr(RegistryDir.size() - Tail.size())) == Lower(Tail))
+        RegistryDir.resize(RegistryDir.size() - Tail.size());
+    else
+        RegistryDir = OutDir;
+    if (!MergeAssetRegistry(RegistryRows, RegistryDir + "/AssetRegistry.bin", Err)) return false;
+    printf("  %-14s -> %s/AssetRegistry.bin  (%d asset%s)\n", "registry", RegistryDir == OutDir ? "." : RegistryDir.c_str(),
            int32(RegistryRows.size()), RegistryRows.size() == 1 ? "" : "s");
 
     remove(AstPath.c_str());        // kept only on failure

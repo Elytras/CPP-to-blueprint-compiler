@@ -93,6 +93,34 @@ def ref(base, index):
     return import_paths(base)[-index - 1] if index < 0 else exports_of(base)[index - 1]
 
 
+def registry_of(mod):
+    """A pak's one AssetRegistry.bin sits beside its Content folder, as the game's FSD/AssetRegistry.bin does."""
+    return os.path.join(ROOT, mod, 'FSD', 'AssetRegistry.bin')
+
+
+def registry_rows(path):
+    return set(re.findall(r'^\s+(/Game/\S+)\s+(\S+)$', subprocess.run(
+        [sys.executable, os.path.join(HERE, 'dumpar.py'), path], capture_output=True, text=True).stdout, re.M))
+
+
+def registry_layout():
+    """Each test's registry is FSD/AssetRegistry.bin, none sits in a package folder, and `assetgen registry`
+    folds several into one - what bpbuild does for an embedded dependency - replacing a package it already has."""
+    import tempfile
+    for mod in os.listdir(ROOT):
+        assert os.path.exists(registry_of(mod)), mod
+        assert not glob.glob(os.path.join(ROOT, mod, 'FSD', 'Content', '**', 'AssetRegistry.bin'), recursive=True), mod
+    a, b = registry_rows(registry_of('AssetTest')), registry_rows(registry_of('IfaceTest'))
+    assert a and b and not a & b, (a, b)
+    with tempfile.TemporaryDirectory() as tmp:
+        merged = os.path.join(tmp, 'AssetRegistry.bin')
+        for twice in range(2):
+            proc = subprocess.run([ASSETGEN, 'registry', merged, registry_of('AssetTest'), registry_of('IfaceTest')],
+                                  capture_output=True, text=True)
+            assert proc.returncode == 0 and registry_rows(merged) == a | b, (proc.stdout, registry_rows(merged))
+    print('ok  every registry is FSD/AssetRegistry.bin; `assetgen registry` merges them, once per package')
+
+
 def export_index(base, name):
     return exports_of(base).index(name)
 
@@ -175,6 +203,7 @@ def nested(Size):
 
 
 sweep()
+registry_layout()
 check('FlowTest', 'SumSkipping', sum_skipping, [dict(Count=c, Skip=k) for c in (0, 1, 5, 10, 20) for k in (-1, 0, 3, 9)])
 check('FlowTest', 'FirstOver', first_over, [dict(Limit=l) for l in (0, 1, 5, 99, 100)])
 check('FlowTest', 'Nested', nested, [dict(Size=s) for s in (0, 1, 2, 4, 7)])
@@ -1245,7 +1274,7 @@ def static_assets():
                  r'InstanceVariable\s+Count@'):
         assert re.search(want, w), (want, w)
     print('ok  AssetTest: a function body reaches an asset by reference')
-    ar = subprocess.run([sys.executable, os.path.join(HERE, 'dumpar.py'), os.path.join(folder, 'AssetRegistry.bin')], capture_output=True, text=True).stdout
+    ar = subprocess.run([sys.executable, os.path.join(HERE, 'dumpar.py'), registry_of('AssetTest')], capture_output=True, text=True).stdout
     assert set(re.findall(r'^\s+(/Game/\S+)\s+(\S+)$', ar, re.M)) == {
         (MOD + 'AssetUser.AssetUser_C', 'BlueprintGeneratedClass'), (MOD + 'UMoodDef.UMoodDef_C', 'BlueprintGeneratedClass'),
         (MOD + 'EMood.EMood', 'UserDefinedEnum'), (MOD + 'MD_Plain.MD_Plain', 'UMoodDef_C'), (MOD + 'MD_Calm.MD_Calm', 'UMoodDef_C'),
