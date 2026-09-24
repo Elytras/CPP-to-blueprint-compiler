@@ -112,6 +112,11 @@ Under Proton the game reads paks from
 2. `python tools/genueapi.py <dump>/SDK/SDK <UeApi dir>`. This step runs on Linux too, from the dump's folder
    on the Windows drive or a copy of it.
 3. Copy the hand-written `UeMeta.h` and `Types.h` from [the SDK repo](https://github.com/Elytras/DRG-Blueprint-Cpp-SDK/tree/main/UeApi) into `<UeApi dir>`.
+4. Optionally, `UeAssets/`, every game asset named by its path (`&UeAssets::USoundWave::Game::Audio::...::Name`):
+   extract `FSD/AssetRegistry.bin` from the game's pak
+   (`UnrealPak <pak> -Extract <dir> -Filter=*AssetRegistry.bin`), then
+   `python tools/genueassets.py <dir>/FSD/AssetRegistry.bin <UeApi dir> <UeAssets dir>`. Put `UeAssets/` beside
+   `UeApi/` so a mod can `#include "UeAssets/USoundWave.h"`.
 
 ## Tests
 
@@ -135,8 +140,8 @@ generated `.uasset`/`.uexp`. An issue that can't be reproduced can't be fixed.
 
 `tools/` also holds the inspection scripts used while developing the writer: `dumpexp.py` (export
 table / serialized bytes), `walkscript.py` (a function's bytecode, expression by expression),
-`dumptags.py`, `dumpstruct.py`, `dumpedl.py`, `dumpar.py` (AssetRegistry.bin), and `runscript.py`
-(an offline Kismet interpreter).
+`dumptags.py`, `dumpstruct.py`, `dumpedl.py`, `dumpar.py` (an AssetRegistry.bin, assetgen's or the game's), and
+`runscript.py` (an offline Kismet interpreter).
 
 ## License
 
