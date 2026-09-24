@@ -1162,7 +1162,8 @@ private:
     std::string CurrentWco;                           // its WorldContext* parm when it is a static, else empty
     std::vector<FRegistryAsset> RegistryRows;
     std::vector<const Json*> AssetDecls;        // namespace-scope variables brace-initialized, see GenerateAsset
-    std::map<std::string, std::string> AssetPaths;  // UE_ASSET_AT: variable -> the /Game package of an asset cooked elsewhere
+    std::map<std::string, std::string> AssetPaths;  // UE_ASSET_AT: Ns::variable -> the path of an asset cooked elsewhere
+    std::map<std::string, std::string> VarScope;    // a namespace-scope variable's decl id -> its namespace, "A::B::"
     /* `&MD_Big`, where MD_Big is an asset of this mod or a UE_ASSET_AT: its import. False when N is anything else. */
     bool AssetRef(const Json& N, FBlueprintClass& BP, FIndex* Out);
     /* A member initializer becomes PD.Default, which the CDO / struct default instance / asset writes. It must be a
@@ -1539,9 +1540,10 @@ bool FCompiler::Collect(std::string* Err)
             Aliases[Ns + Name(N)] = Aliases[Name(N)] = StripTypeKeywords(TypeOf(N));
         if (Kind(N) == "VarDecl" && Name(N) == "UeModPackage") FindLiteral(N, ModPackage);
         if (Kind(N) == "VarDecl" && BracedInit(N)) AssetDecls.push_back(&N);
+        if (Kind(N) == "VarDecl" && !Ns.empty()) VarScope[N.value("id", std::string())] = Ns;
         if (Kind(N) == "VarDecl" && Name(N).size() > 9 && Name(N).compare(Name(N).size() - 9, 9, "__UeAsset") == 0)
         {
-            FindLiteral(N, AssetPaths[Name(N).substr(0, Name(N).size() - 9)]);
+            FindLiteral(N, AssetPaths[Ns + Name(N).substr(0, Name(N).size() - 9)]);
             return;
         }
         if (Kind(N) == "EnumDecl")
@@ -6062,19 +6064,30 @@ bool FCompiler::AssetRef(const Json& N, FBlueprintClass& BP, FIndex* Out)
     const Json* Ref = Strip(First(N));
     if (!Ref || Kind(*Ref) != "DeclRefExpr" || !Ref->contains("referencedDecl")) return false;
     const Json& D = (*Ref)["referencedDecl"];
-    const FRecord* R = D.contains("type") ? Find(StripTypeKeywords(D["type"].value("qualType", std::string()))) : nullptr;
+    /* The desugared type: UeAssets headers spell theirs `::USoundWave`, since the namespace shadows the class. */
+    const Json& T = D.contains("type") ? D["type"] : Json::object();
+    const FRecord* R = Find(StripTypeKeywords(T.value("desugaredQualType", T.value("qualType", std::string()))));
     if (Kind(D) != "VarDecl" || !R || R->bIsStruct) return false;
 
     std::string Package;
     const std::string Var = Name(D);
-    if (auto At = AssetPaths.find(Var); At != AssetPaths.end()) Package = At->second;
+    const auto Scope = VarScope.find(D.value("id", std::string()));
+    if (auto At = AssetPaths.find((Scope == VarScope.end() ? std::string() : Scope->second) + Var); At != AssetPaths.end())
+        Package = At->second;
     else if (std::any_of(AssetDecls.begin(), AssetDecls.end(), [&](const Json* A) { return Name(*A) == Var; }))
         Package = ModPackage + "/" + Var;
     else return false;
 
+    /* "/Game/Dir/Pkg.Object" names an object other than the package's namesake; "/Game/Dir/Pkg" means Pkg.Pkg. */
+    std::string Object = Package.substr(Package.rfind('/') + 1);
+    if (const size_t Dot = Object.find('.'); Dot != std::string::npos)
+    {
+        Package.resize(Package.size() - (Object.size() - Dot));
+        Object = Object.substr(Dot + 1);
+    }
     const bool bNative = R->IsNative();
     *Out = BP.Asset(bNative ? R->UePackage : ModPackage + "/" + R->CppName, bNative ? R->UeName : R->CppName + "_C",
-                    Package, Package.substr(Package.rfind('/') + 1));
+                    Package, Object);
     return true;
 }
 
