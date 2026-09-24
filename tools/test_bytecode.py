@@ -23,7 +23,7 @@ ROOT = os.path.join(TESTS, 'build')
 
 def option(flag, candidates):
     if flag in sys.argv:
-        return sys.argv[sys.argv.index(flag) + 1]
+        return os.path.abspath(sys.argv[sys.argv.index(flag) + 1])   # Windows won't run a relative x64/Release/assetgen.exe
     return next((c for c in candidates if os.path.exists(c)), None)
 
 
