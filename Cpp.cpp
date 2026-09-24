@@ -5470,7 +5470,8 @@ bool FCompiler::LowerWithoutPrefix(const Json& Stmt, FBlueprintClass& BP, std::v
      TSet:   over a Set_ToArray copy; elements are copies.
      TMap:   over a Map_Keys copy, each value fetched with Map_Find. `auto [K, V]` binds K to a copy of the key and
              V to a local. `auto& [K, V]` writes V back with Map_Add after each iteration, `break` included, so the
-             body changes values in place; `auto [K, V]` is a copy, as in C++, and writes nothing back.
+             body changes values in place - unless the body only reads V (`V->X = 1` included: that writes the
+             object, not the map); `auto [K, V]` is a copy, as in C++, and writes nothing back.
    ponytail: TSet / TMap iterate a copy, not the sparse array in place; the in-place walk needs the container's
    address, which a Blueprint variable does not have (ROADMAP.md, Phase 3). */
 bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vector<FStmtIR>& Out,
@@ -5607,7 +5608,8 @@ bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vec
         RefAlias[Bindings[0]->value("id", std::string())] = RefToLocal(Key, Args[0]);
         RefAlias[Bindings[1]->value("id", std::string())] = RefToLocal(Val, Args[1]);
         const std::string PairTy = TypeOf(*LoopDecl);
-        if (!PairTy.empty() && PairTy.back() == '&' && StripTypeKeywords(PairTy) == PairTy)   // `auto& [K, V]`
+        const bool bByRef = !PairTy.empty() && PairTy.back() == '&' && StripTypeKeywords(PairTy) == PairTy;   // `auto& [K, V]`
+        if (bByRef && !OnlyRead(*Body, Bindings[1]->value("id", std::string())))
         {
             FStmtIR Back = CallStmt("BlueprintMapLibrary", "Map_Add", { Range, LocalArg(Key), LocalArg(Val) });
             Loop.Inc->push_back(Back);

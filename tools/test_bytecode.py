@@ -415,6 +415,18 @@ for stop in (0, 15, 1000):
         want = fn(theirs)
         assert (got, mine) == (want, theirs), 'BumpScores(%s, %s) = %r %r, want %r %r' % (m, stop, got, mine, want, theirs)
 print('ok  RangeTest.BumpScores  (9 cases)')
+for m in ({}, {'a': {'X': 1, 'Y': 2}}, {'a': {'X': -1, 'Y': 0}, 'b': {'X': 5, 'Y': 7}}):
+    f = dict(Spots={k: dict(v) for k, v in m.items()})
+    got = run(asset('RangeTest'), 'ShiftSpots', self_vars=f)[0]
+    want = {k: dict(v, X=v['X'] + 1) for k, v in m.items()}
+    assert (got, f['Spots']) == (sum(v['X'] * 10 + v['Y'] for v in want.values()), want), (m, got, f)
+print('ok  RangeTest.ShiftSpots: a struct value changed through `.` goes back to the map')
+for hits in ((), (0,), (4, -1)):
+    peers = {'p%d' % i: Obj('RangeTest_C', Hits=h) for i, h in enumerate(hits)}
+    vm = VM(asset('RangeTest'), Peers=dict(peers))
+    vm.call('PokePeers')
+    assert vm.self.vars['Peers'] == peers and [p.vars['Hits'] for p in peers.values()] == [h + 1 for h in hits], hits
+print('ok  RangeTest.PokePeers: `Peer->Hits += 1` writes each object, the map keeps its pointers')
 
 
 def range_members():

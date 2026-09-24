@@ -9,6 +9,9 @@ class RangeTest : public AActor {
   TArray<int32> Items;
   TSet<int32> Seen;
   TMap<FName, int32> Scores;
+  TMap<FName, FIntPoint> Spots;
+  TMap<FName, RangeTest *> Peers;
+  int32 Hits;
 
 public:
   int32 SumArray() {
@@ -67,5 +70,18 @@ public:
     int32 Total = 0;
     for (const auto &[Key, Value] : Scores) Total += Value;
     return Total * 100 + Count;
+  }
+
+  /* `Spot.X += 1` writes the value itself, so it goes back to the map; `Spot->X` would write an object instead. */
+  int32 ShiftSpots() {
+    for (auto &[Key, Spot] : Spots) Spot.X += 1;
+    int32 Sum = 0;
+    for (const auto &[Key, Spot] : Spots) Sum += Spot.X * 10 + Spot.Y;
+    return Sum;
+  }
+
+  /* `Peer->Hits += 1` writes the object; the pointer the map holds is unchanged, so nothing goes back. */
+  void PokePeers() {
+    for (auto &[Key, Peer] : Peers) Peer->Hits += 1;
   }
 };
