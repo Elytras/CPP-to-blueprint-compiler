@@ -476,8 +476,11 @@ void FScript::ByteConst(uint8 Value)
 
 int32 FScript::Jump(int32 MemTarget)
 {
+    const int32 At = Memory;
     Op(EX_Jump);
     const int32 PatchAt = int32(Ar.B.size());
+    JumpOperands.push_back(PatchAt);
+    PlainJumpAt[At] = PatchAt;
     Ar.U32(uint32(MemTarget));
     Memory += 4;
     return PatchAt;
@@ -487,6 +490,7 @@ int32 FScript::JumpIfNot(int32 MemTarget, const std::function<void(FScript&)>& C
 {
     Op(EX_JumpIfNot);
     const int32 PatchAt = int32(Ar.B.size());
+    JumpOperands.push_back(PatchAt);
     Ar.U32(uint32(MemTarget));
     Memory += 4;
     Cond(*this);
@@ -520,6 +524,24 @@ void FScript::PatchJumpTarget(int32 StorageOffset, int32 MemTarget)
     Ar.B[StorageOffset + 1] = uint8(V >> 8);
     Ar.B[StorageOffset + 2] = uint8(V >> 16);
     Ar.B[StorageOffset + 3] = uint8(V >> 24);
+}
+
+void FScript::ThreadJumps()
+{
+    auto Read = [&](int32 At) {
+        return int32(uint32(Ar.B[At]) | uint32(Ar.B[At + 1]) << 8 | uint32(Ar.B[At + 2]) << 16 | uint32(Ar.B[At + 3]) << 24);
+    };
+    for (const int32 At : JumpOperands)
+    {
+        int32 Target = Read(At);
+        for (int32 Hops = 0; Hops < 16; ++Hops)       // a cycle of jumps is an infinite loop either way
+        {
+            const auto Next = PlainJumpAt.find(Target);
+            if (Next == PlainJumpAt.end() || Next->second == At) break;
+            Target = Read(Next->second);
+        }
+        PatchJumpTarget(At, Target);
+    }
 }
 
 void FScript::FloatConst(float Value)

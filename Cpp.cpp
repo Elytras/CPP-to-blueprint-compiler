@@ -534,6 +534,9 @@ struct FStmtIR
     std::shared_ptr<std::vector<FStmtIR>> Inc;      // While: a `for` increment, where `continue` lands
     std::shared_ptr<std::vector<FStmtIR>> Trailer;  // While: runs on `break` only, before leaving the loop
     bool bPostTest = false;                         // While: `do {} while (Cond)`, the test after Body and Inc
+    bool bConstCond = false;                        // While: Cond is a constant (PruneConstBranches), so no test is emitted
+    bool bJumpOut = false;                          // If: Then is one break / continue, taken when Cond is FALSE: a
+                                                    // single JumpIfNot straight to where it goes
     std::vector<FArgIR> CaseTests;                  // Switch: per case, true when the value does NOT match
     int32 LabelId = -1;                             // Label: the case it marks; Switch: the default's label, or -1;
                                                     // Goto / GotoLabel: the label, unique in the class
@@ -914,6 +917,7 @@ private:
     std::map<std::string, const Json*> ConstVars;
     struct FConstVal { bool bFloat = false; double F = 0; int64 I = 0; double Num() const { return bFloat ? F : double(I); } };
     bool FoldConst(const Json& E, FConstVal& Out) const;
+    bool FreeNegation(const Json& C, Json& Out) const;
     bool ConstToArg(const FConstVal& V, const std::string& Type, FArgIR& Out) const;
     std::map<std::string, const Json*> FreeInlines;                     // decl id -> an inline free function's definition
                                                                         // (a template's: each instantiation)
@@ -1006,6 +1010,10 @@ private:
        __DerefScratch__ FDeref local is added per function on first use; the prologue seeds
        its Num=1 so ArrayGetByRef's bounds check passes. */
     void DropUnusedPure(std::vector<FStmtIR>& Stmts);
+    void PruneConstBranches(std::vector<FStmtIR>& Stmts);
+    void ForwardSingleUse(std::vector<FStmtIR>& Stmts, const std::vector<FStmtIR>& All);
+    void FlattenBlocks(std::vector<FStmtIR>& Stmts);
+    void DropOverwritten(std::vector<FStmtIR>& Stmts);
     void DropUnusedLocals(std::vector<FStmtIR>& Stmts, std::vector<FPropertyDef>& Locals);
     void CoalesceTemps(std::vector<FStmtIR>& Stmts, std::vector<FPropertyDef>& Locals, FBlueprintClass& BP);
     bool HoistReadsInList(std::vector<FStmtIR>& Stmts, FBlueprintClass& BP,
@@ -1022,7 +1030,8 @@ private:
     bool HoistRefAt(FArgIR& A, FBlueprintClass& BP, std::vector<FPropertyDef>& Locals,
                     std::vector<FStmtIR>& OutPre, std::string* Err);
     bool HoistBranch(FArgIR& A, FBlueprintClass& BP, std::vector<FPropertyDef>& Locals,
-                     std::vector<FStmtIR>& OutPre, std::string* Err);
+                     std::vector<FStmtIR>& OutPre, std::string* Err, const FArgIR* Dest = nullptr,
+                     const FPropertyDef* DestProp = nullptr);
 
     /* `X op= Y`, `++X`, `X--`: DesugarUpdate rewrites one into a CompoundStmt of plain `=`, evaluating X's
        side effects once (StabilizeLvalue / HoistExpr park them in synthetic locals first). With Result, the
@@ -1209,6 +1218,19 @@ private:
     }
 };
 
+/* Whether running Stmts never falls off their end: the last one returns or jumps away (Return only, with
+   bReturnOnly), itself or in both branches of an `if`. */
+bool NeverFallsThrough(const std::vector<FStmtIR>& Stmts, bool bReturnOnly = false)
+{
+    if (Stmts.empty()) return false;
+    const FStmtIR& St = Stmts.back();
+    if (St.K == FStmtIR::Return) return true;
+    if (St.K == FStmtIR::If && !St.bJumpOut)
+        return St.Then && St.Else && NeverFallsThrough(*St.Then, bReturnOnly) && NeverFallsThrough(*St.Else, bReturnOnly);
+    return !bReturnOnly && (St.K == FStmtIR::Break || St.K == FStmtIR::Continue || St.K == FStmtIR::Goto
+                            || St.K == FStmtIR::InlineReturn);
+}
+
 /* The innermost loop's forward jumps, patched once its exit / continue offsets are known. */
 struct FLoopPatches
 {
@@ -1268,15 +1290,23 @@ void EmitStmts(const std::vector<FStmtIR>& Stmts, FScript& S, FIndex SelfExp, FL
 
         case FStmtIR::If:
         {
+            if (St.bJumpOut)
+            {
+                const int32 Out = S.JumpIfNot(0, [St, SelfExp](FScript& C) { EmitArg(C, St.Cond, SelfExp, nullptr); });
+                if (Loop) ((*St.Then)[0].K == FStmtIR::Break ? Loop->Breaks : Loop->Continues).push_back(Out);
+                else S.PatchJumpTarget(Out, S.MemorySize());
+                break;
+            }
             const int32 NotPatch = S.JumpIfNot(0,
                 [St, SelfExp](FScript& C) { EmitArg(C, St.Cond, SelfExp, nullptr); });
             if (St.Then) EmitStmts(*St.Then, S, SelfExp, Loop, Returns);
             if (St.Else && !St.Else->empty())
             {
-                const int32 EndPatch = S.Jump(0);
+                /* A branch that returns or jumps away needs no jump over the else. */
+                const int32 EndPatch = St.Then && NeverFallsThrough(*St.Then) ? -1 : S.Jump(0);
                 S.PatchJumpTarget(NotPatch, S.MemorySize());
                 EmitStmts(*St.Else, S, SelfExp, Loop, Returns);
-                S.PatchJumpTarget(EndPatch, S.MemorySize());
+                if (EndPatch >= 0) S.PatchJumpTarget(EndPatch, S.MemorySize());
             }
             else
             {
@@ -1295,12 +1325,12 @@ void EmitStmts(const std::vector<FStmtIR>& Stmts, FScript& S, FIndex SelfExp, FL
             auto Test = [&] {
                 ExitPatch = S.JumpIfNot(0, [St, SelfExp](FScript& C) { EmitArg(C, St.Cond, SelfExp, nullptr); });
             };
-            if (!St.bPostTest) Test();
+            if (!St.bPostTest && !St.bConstCond) Test();
             if (St.Body) EmitStmts(*St.Body, S, SelfExp, &Inner, Returns);
             for (int32 P : Inner.Continues) S.PatchJumpTarget(P, S.MemorySize());
             if (St.Inc) EmitStmts(*St.Inc, S, SelfExp, Loop, Returns);
-            if (St.bPostTest) Test();               // do/while: `continue` lands on the test, as in C++
-            S.Jump(Head);
+            if (St.bPostTest && !St.bConstCond) Test();     // do/while: `continue` lands on the test, as in C++
+            if (!St.bConstCond || St.Cond.B) S.Jump(Head);  // `do {} while (false)` runs once
             if (St.Trailer && !Inner.Breaks.empty())
             {
                 /* A `break` runs the trailer and falls into the exit; a failed condition skips it. */
@@ -1308,7 +1338,7 @@ void EmitStmts(const std::vector<FStmtIR>& Stmts, FScript& S, FIndex SelfExp, FL
                 Inner.Breaks.clear();
                 EmitStmts(*St.Trailer, S, SelfExp, Loop, Returns);
             }
-            S.PatchJumpTarget(ExitPatch, S.MemorySize());
+            if (ExitPatch >= 0) S.PatchJumpTarget(ExitPatch, S.MemorySize());
             for (int32 P : Inner.Breaks) S.PatchJumpTarget(P, S.MemorySize());
             break;
         }
@@ -2828,6 +2858,10 @@ bool FCompiler::LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, 
             return true;
     const Json* N = Strip(&ArgNode);
     if (!N) { *Err = "empty argument expression"; return false; }
+    /* Arithmetic, a comparison or logic over constants is the constant it comes to: no Kismet call left to run. */
+    if (const std::string K = Kind(*N); !bCurNoOpt && (K == "BinaryOperator" || K == "ConditionalOperator"
+        || (K == "UnaryOperator" && N->value("opcode", std::string()).find_first_of("&*+") == std::string::npos)))
+        if (FConstVal V; FoldConst(ArgNode, V) && ConstToArg(V, OuterType, Out)) return true;
     if (!LowerArgRaw(*N, OuterType, BP, Out, Err)) return false;
     if (Out.InnerType.empty()) Out.InnerType = TypeOf(*N);
     return ConvertArg(OuterType, BP, Out, Err);
@@ -3355,6 +3389,8 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             return true;
         }
         if (Op != "!") { *Err = "TODO: unimplemented unary operator " + Op; return false; }
+        /* `!(A < B)` is `A >= B` and `!!X` is X: no Not_PreBool call. */
+        if (Json Neg; !bCurNoOpt && FreeNegation(*Operand, Neg)) return LowerArg(Neg, BP, Out, Err);
 
         Out.K = FArgIR::Call;
         Out.Sub = std::make_shared<FCallIR>();
@@ -3486,6 +3522,25 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         const std::string MathFn = MathFuncFor(Op, Flavour);
         if (MathFn.empty())
         { *Err = "TODO: unimplemented binary operator " + Op + " on " + Flavour; return false; }
+        /* `X + 0`, `X * 1` and the like are X. A float keeps its + and - (-0.0f + 0 is +0.0f). */
+        if (!bCurNoOpt && (Flavour == "IntInt" || Flavour == "Int64Int64" || Flavour == "FloatFloat"))
+        {
+            const bool bInt = Flavour != "FloatFloat";
+            auto Is = [&](const Json* Side, double Want) {
+                FConstVal V;
+                return FoldConst(*Side, V) && V.Num() == Want;
+            };
+            const Json* Kept = (Op == "*" && Is(RhsRaw, 1)) || (Op == "/" && Is(RhsRaw, 1)) ? LhsRaw
+                             : Op == "*" && Is(LhsRaw, 1) ? RhsRaw
+                             : bInt && (Op == "+" || Op == "-" || Op == "|" || Op == "^") && Is(RhsRaw, 0) ? LhsRaw
+                             : bInt && (Op == "+" || Op == "|" || Op == "^") && Is(LhsRaw, 0) ? RhsRaw : nullptr;
+            if (Kept)
+            {
+                if (!LowerArg(*Kept, BP, Out, Err)) return false;
+                Out.InnerType = TypeOf(*N);
+                return true;
+            }
+        }
 
         Out.K = FArgIR::Call;
         Out.Sub = std::make_shared<FCallIR>();
@@ -4357,6 +4412,56 @@ void FCompiler::DropUnusedPure(std::vector<FStmtIR>& Stmts)
     }
 }
 
+/* Whether a jump from outside Stmts could land inside them: a switch case or a goto label. */
+static bool HasLabel(const std::vector<FStmtIR>& Stmts)
+{
+    for (const FStmtIR& St : Stmts)
+    {
+        if (St.K == FStmtIR::Label || St.K == FStmtIR::GotoLabel) return true;
+        for (const auto* L : { &St.Then, &St.Else, &St.Body, &St.Inc, &St.Trailer })
+            if (*L && HasLabel(**L)) return true;
+    }
+    return false;
+}
+
+/*
+A condition that came to a constant decides at compile time: an `if` is the branch it takes, a `while (false)` is
+nothing, and a `while (true)` or `do {} while (false)` needs no test. Code that a label makes reachable stays.
+*/
+void FCompiler::PruneConstBranches(std::vector<FStmtIR>& Stmts)
+{
+    for (size_t I = 0; I < Stmts.size(); ++I)
+    {
+        FStmtIR& St = Stmts[I];
+        for (auto* L : { &St.Then, &St.Else, &St.Body, &St.Inc, &St.Trailer })
+            if (*L)
+            {
+                *L = std::make_shared<std::vector<FStmtIR>>(**L);
+                PruneConstBranches(**L);
+            }
+        if (St.Cond.K != FArgIR::Bool) continue;
+        if (St.K == FStmtIR::If)
+        {
+            /* A jump-out `if` holds `!C`, and its break / continue is taken when that is false. */
+            const bool bThen = St.bJumpOut ? !St.Cond.B : St.Cond.B;
+            const auto Taken = bThen ? St.Then : St.Else, Dropped = bThen ? St.Else : St.Then;
+            if (Dropped && HasLabel(*Dropped)) continue;
+            const std::vector<FStmtIR> Keep = Taken ? *Taken : std::vector<FStmtIR>();
+            Stmts.erase(Stmts.begin() + I);
+            Stmts.insert(Stmts.begin() + I, Keep.begin(), Keep.end());
+            I += Keep.size();
+            --I;
+        }
+        else if (St.K == FStmtIR::While && !St.Cond.B && !St.bPostTest)
+        {
+            if (St.Body && HasLabel(*St.Body)) continue;
+            Stmts.erase(Stmts.begin() + I--);
+        }
+        else if (St.K == FStmtIR::While && (St.Cond.B || !St.Trailer))
+            St.bConstCond = true;
+    }
+}
+
 /* A generated event's name, <Stem>_<N>: found by name on self, so not a function of the class or an ancestor. */
 std::string FCompiler::FreshEventName(const std::string& Stem)
 {
@@ -4749,8 +4854,27 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 return;
             }
 
+            /* A negation is a Kismet call (Not_PreBool) that the jumps can absorb. `if (C) break;` jumps straight out
+               on `!C` when that is free (FreeNegation), `if (A || B) break;` is two of those, and `if (!X) A else B`
+               is `if (X) B else A`. */
+            const Json* Lone = Kind(*Then) == "CompoundStmt" && Then->contains("inner") && (*Then)["inner"].size() == 1
+                             ? Nth(*Then, 0) : Then;
+            const bool bLoneJump = !bCurNoOpt && !Else && Lone && (Kind(*Lone) == "BreakStmt" || Kind(*Lone) == "ContinueStmt");
+            const Json* C = Strip(Cond);
+            if (bLoneJump && Kind(*C) == "BinaryOperator" && C->value("opcode", std::string()) == "||")
+            {
+                Json Wrap = { {"kind", "CompoundStmt"}, {"inner", Json::array({
+                    { {"kind", "IfStmt"}, {"inner", Json::array({ *Nth(*C, 0), *Lone })} },
+                    { {"kind", "IfStmt"}, {"inner", Json::array({ *Nth(*C, 1), *Lone })} } })} };
+                if (!LowerBody(Wrap, BP, Out, Locals, Err)) bOk = false;
+                return;
+            }
+            Json Neg;
+            const bool bSwap = !bCurNoOpt && Kind(*C) == "UnaryOperator" && C->value("opcode", std::string()) == "!"
+                            && First(*C) && !FreeNegation(*First(*C), Neg);
             St.K = FStmtIR::If;
-            if (!LowerArg(*Cond, BP, St.Cond, Err)) { bOk = false; return; }
+            St.bJumpOut = bLoneJump && FreeNegation(*Cond, Neg);
+            if (!LowerArg(St.bJumpOut ? Neg : bSwap ? *First(*C) : *Cond, BP, St.Cond, Err)) { bOk = false; return; }
 
             /* A single-statement branch is wrapped in a synthetic CompoundStmt. */
             auto LowerBranch = [&](const Json& Branch, std::shared_ptr<std::vector<FStmtIR>>& OutBody) -> bool
@@ -4760,8 +4884,10 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 Json Wrap = { {"kind", "CompoundStmt"}, {"inner", Json::array({Branch})} };
                 return LowerBody(Wrap, BP, *OutBody, Locals, Err);
             };
-            if (!LowerBranch(*Then, St.Then)) { bOk = false; return; }
-            if (Else && !LowerBranch(*Else, St.Else)) { bOk = false; return; }
+            const bool bFlip = bSwap && !St.bJumpOut;
+            if (!LowerBranch(*Then, bFlip ? St.Else : St.Then)) { bOk = false; return; }
+            if (Else && !LowerBranch(*Else, bFlip ? St.Then : St.Else)) { bOk = false; return; }
+            if (!St.Then) St.Then = std::make_shared<std::vector<FStmtIR>>();
         }
         else if (K == "BreakStmt" || K == "ContinueStmt")
         {
@@ -5078,17 +5204,24 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
 }
 
 /* Every use of the declaration Id in N is a plain read (an lvalue-to-rvalue conversion), so nothing writes it,
-   binds a reference to it or takes its address. */
+   binds a reference to it or takes its address. `C ? A : B` over two lvalues is an lvalue itself, converted as a
+   whole: A and B are read when it is. */
 bool OnlyRead(const Json& N, const std::string& Id)
 {
     bool bOk = true;
-    std::function<void(const Json&, const Json*)> Walk = [&](const Json& X, const Json* Parent) {
+    std::function<void(const Json&, bool)> Walk = [&](const Json& X, bool bRead) {
         if (!bOk || !X.is_object()) return;
-        if (Kind(X) == "DeclRefExpr" && X.contains("referencedDecl") && X["referencedDecl"].value("id", std::string()) == Id)
-            bOk = Parent && Kind(*Parent) == "ImplicitCastExpr" && Parent->value("castKind", std::string()) == "LValueToRValue";
-        ForEach(X, [&](const Json& C) { Walk(C, &X); });
+        const std::string K = Kind(X);
+        if (K == "DeclRefExpr" && X.contains("referencedDecl") && X["referencedDecl"].value("id", std::string()) == Id)
+            bOk = bRead;
+        const bool bToRvalue = K == "ImplicitCastExpr" && X.value("castKind", std::string()) == "LValueToRValue";
+        int32 I = 0;
+        ForEach(X, [&](const Json& C) {
+            const bool bBranch = K == "ConditionalOperator" && I++ > 0;
+            Walk(C, bToRvalue || (bRead && (bBranch || K == "ParenExpr")));
+        });
     };
-    Walk(N, nullptr);
+    Walk(N, false);
     return bOk;
 }
 
@@ -5259,6 +5392,127 @@ void FCompiler::ArgumentsInPlace(std::vector<FStmtIR>& Body, const std::vector<s
     }
 }
 
+/*
+`T = E; <S reads T>`, T read nowhere else: E goes where S reads T, and T is gone (DropUnusedLocals takes the property).
+The same conditions as ArgumentsInPlace: the read runs exactly once whenever S does, and running E there instead of
+one statement earlier cannot be seen: what S evaluates before the read is pure, and reads no variable when E acts (a
+call with an out parameter is never pure, so it acts).
+*/
+void FCompiler::ForwardSingleUse(std::vector<FStmtIR>& Stmts, const std::vector<FStmtIR>& All)
+{
+    for (FStmtIR& St : Stmts)
+        for (auto* L : { &St.Then, &St.Else, &St.Body, &St.Inc, &St.Trailer })
+            if (*L)
+            {
+                *L = std::make_shared<std::vector<FStmtIR>>(**L);
+                ForwardSingleUse(**L, All);
+            }
+    /* Last to first, so `A = ..; B = ..; S(A, B)` forwards B, then A into what S has become. */
+    for (size_t I = Stmts.size(); I-- > 1;)
+    {
+        {
+            const FStmtIR& Def = Stmts[I - 1];
+            FStmtIR& Next = Stmts[I];
+            const std::string& Name = Def.Var.S;
+            if (!((Def.K == FStmtIR::Decl && Def.bHasValue) || (Def.K == FStmtIR::Assign && Def.bAssignLocal))
+                || Def.Var.K != FArgIR::Local || Def.Var.Base || !CurLocals
+                || std::none_of(CurLocals->begin(), CurLocals->end(), [&](const FPropertyDef& L) { return L.Name == Name; })
+                || Mentions(All, Name) != 2 || Mentions(Def.Value, Name) != 0)
+                continue;
+            FArgIR* Read = nullptr;
+            FArgIR* Scope = nullptr;
+            if (Next.K == FStmtIR::StaticCall && !Next.Target.Target && Next.Target.Args.empty())
+            {
+                for (FArgIR& A : Next.Call.Args) if (!Read && (Read = FindPlainRead(A, Name))) Scope = &A;
+            }
+            else if ((Next.K == FStmtIR::Assign || Next.K == FStmtIR::Decl || Next.K == FStmtIR::Return) && !Next.Var.Base)
+                Read = FindPlainRead(*(Scope = &Next.Value), Name);
+            else if (Next.K == FStmtIR::If)
+                Read = FindPlainRead(*(Scope = &Next.Cond), Name);
+            if (!Read) continue;
+
+            const FArgIR& E = Def.Value;
+            const bool bActs = CallsImpure(E);
+            const std::function<bool(const FArgIR&)> Pred = [&](const FArgIR& X) { return bActs ? ReadsNothing(X) : !CallsImpure(X); };
+            bool bOk = OffPath(*Scope, Read, Pred);
+            if (Next.K == FStmtIR::StaticCall)
+            {
+                if (Next.Call.Target) bOk = bOk && Pred(*Next.Call.Target);
+                for (const FArgIR& A : Next.Call.Args) if (&A != Scope) bOk = bOk && Pred(A);
+            }
+            if (!bOk) continue;
+            *Read = E;
+            Stmts.erase(Stmts.begin() + (I - 1));
+        }
+    }
+}
+
+/* An inline body with no early return is just its statements: no jump lands past it, and a break in it would have
+   been refused. Spliced into the list around it, its result local meets its use (ForwardSingleUse). */
+static bool HasInlineReturn(const std::vector<FStmtIR>& Stmts)
+{
+    for (const FStmtIR& St : Stmts)
+    {
+        if (St.K == FStmtIR::InlineReturn) return true;
+        if (St.K != FStmtIR::Block)
+            for (const auto* L : { &St.Then, &St.Else, &St.Body, &St.Inc, &St.Trailer })
+                if (*L && HasInlineReturn(**L)) return true;
+    }
+    return false;
+}
+
+void FCompiler::FlattenBlocks(std::vector<FStmtIR>& Stmts)
+{
+    for (size_t I = 0; I < Stmts.size(); ++I)
+    {
+        FStmtIR& St = Stmts[I];
+        for (auto* L : { &St.Then, &St.Else, &St.Body, &St.Inc, &St.Trailer })
+            if (*L)
+            {
+                *L = std::make_shared<std::vector<FStmtIR>>(**L);
+                FlattenBlocks(**L);
+            }
+        if (St.K != FStmtIR::Block || (St.Body && HasInlineReturn(*St.Body))) continue;
+        const std::vector<FStmtIR> Body = St.Body ? *St.Body : std::vector<FStmtIR>();
+        Stmts.erase(Stmts.begin() + I);
+        Stmts.insert(Stmts.begin() + I, Body.begin(), Body.end());
+        I += Body.size();
+        --I;
+    }
+}
+
+/* Whether the first thing Stmts does to local Name, on every path, is store a whole new value that does not read it. */
+static bool StoresFirst(const std::vector<FStmtIR>& Stmts, const std::string& Name)
+{
+    if (Stmts.empty()) return false;
+    const FStmtIR& St = Stmts.front();
+    if ((St.K == FStmtIR::Assign || (St.K == FStmtIR::Decl && St.bHasValue)) && St.Var.K == FArgIR::Local && !St.Var.Base
+        && St.Var.S == Name)
+        return Mentions(St.Value, Name) == 0;
+    return St.K == FStmtIR::If && !St.bJumpOut && Mentions(St.Cond, Name) == 0 && St.Then && St.Else
+        && StoresFirst(*St.Then, Name) && StoresFirst(*St.Else, Name);
+}
+
+/* `int32 R = 0; if (C) R = 1; else R = 2;`: a store to a local that the next statement overwrites on every path before
+   reading it does nothing, unless its value calls something that acts. */
+void FCompiler::DropOverwritten(std::vector<FStmtIR>& Stmts)
+{
+    for (size_t I = 0; I < Stmts.size(); ++I)
+    {
+        FStmtIR& St = Stmts[I];
+        for (auto* L : { &St.Then, &St.Else, &St.Body, &St.Inc, &St.Trailer })
+            if (*L)
+            {
+                *L = std::make_shared<std::vector<FStmtIR>>(**L);
+                DropOverwritten(**L);
+            }
+        if ((St.K == FStmtIR::Assign || (St.K == FStmtIR::Decl && St.bHasValue)) && St.Var.K == FArgIR::Local && !St.Var.Base
+            && !CallsImpure(St.Value) && I + 1 < Stmts.size()
+            && StoresFirst(std::vector<FStmtIR>(Stmts.begin() + I + 1, Stmts.begin() + I + 2), St.Var.S))
+            Stmts.erase(Stmts.begin() + I--);
+    }
+}
+
 bool FCompiler::IsInlineMethod(const FRecord& R, const std::string& Method) const
 {
     auto Decl = R.Methods.find(Method);
@@ -5337,6 +5591,15 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
     for (size_t I = 0; I < Parms.size(); ++I)
         if (const Json* Index = ElemIndex(I)) { if (!LowerArg(*Index, BP, Values[I], Err)) return false; }
         else if (!Aliased(I) && !LowerArg(*Args[I], BP, Values[I], Err)) return false;
+    /* The caller's own variable can stand in for a parameter the body only reads, as a constant does, when nothing
+       could change it before the body is done: no argument stores anything, and no parameter is a reference, the
+       only way the body could reach a caller's local. */
+    bool bVarsInPlace = !bCurNoOpt;
+    for (size_t I = 0; I < Parms.size(); ++I)
+    {
+        const std::string T = TypeOf(*Parms[I]);
+        bVarsInPlace = bVarsInPlace && (T.empty() || T.back() != '&') && IsSideEffectFree(*Args[I]);
+    }
     for (size_t I = 0; I < Parms.size(); ++I)
     {
         const std::string Id = Parms[I]->value("id", std::string());
@@ -5374,6 +5637,9 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
         Bind.Value = std::move(Values[I]);
         /* A constant the body only reads is used in place: no local, no copy. */
         if (IsFoldableConst(Bind.Value) && OnlyRead(*Body, Id)) { ParmConst[Id] = Bind.Value; continue; }
+        if (bVarsInPlace && (Bind.Value.K == FArgIR::Local || Bind.Value.K == FArgIR::LocalOut)
+            && Canon(Bind.Value.InnerType) == Canon(Type) && OnlyRead(*Body, Id))
+        { ParmConst[Id] = Bind.Value; continue; }
         if (!AddLocal(Local, Type)) return false;
         Bind.K = FStmtIR::Assign;
         Bind.Var.K = FArgIR::Local;
@@ -5762,7 +6028,8 @@ FArgIR NotOf(FArgIR V, FBlueprintClass& BP)
        if (C) { <A's hoists>; T = A; } else { <B's hoists>; T = B; }
    The arms' hoisted reads land inside their branch, so they run only when the branch does. */
 bool FCompiler::HoistBranch(FArgIR& A, FBlueprintClass& BP, std::vector<FPropertyDef>& Locals,
-                            std::vector<FStmtIR>& OutPre, std::string* Err)
+                            std::vector<FStmtIR>& OutPre, std::string* Err, const FArgIR* Dest,
+                            const FPropertyDef* DestProp)
 {
     const std::string Which = A.Sub->Intrinsic;
     std::string Type = Which == "__Select__" ? A.InnerType : "bool";
@@ -5774,13 +6041,16 @@ bool FCompiler::HoistBranch(FArgIR& A, FBlueprintClass& BP, std::vector<FPropert
     std::string PErr;
     if (!TypeToProperty(Type, Tmp, 0, Tmp, BP, &PD, &PErr)) { *Err = "a branch's value: " + PErr; return false; }
     PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
-    Locals.push_back(PD);
+    /* Dest: a local of the same layout the value is headed for anyway, which the branches then store into. */
+    const bool bIntoDest = Dest && DestProp && PropKey(*DestProp) == PropKey(PD);
+    if (!bIntoDest) Locals.push_back(PD);
 
     FArgIR TmpRef;
     TmpRef.K = FArgIR::Local;
     TmpRef.S = Tmp;
     TmpRef.LetOp = LetOpFor(Type);
     TmpRef.InnerType = Type;
+    if (bIntoDest) TmpRef = *Dest;
     auto Store = [&](FArgIR V) {
         FStmtIR St;
         St.K = FStmtIR::Assign;
@@ -5791,7 +6061,13 @@ bool FCompiler::HoistBranch(FArgIR& A, FBlueprintClass& BP, std::vector<FPropert
     };
     auto Arm = [&](FArgIR V, std::shared_ptr<std::vector<FStmtIR>>& Into) {
         Into = std::make_shared<std::vector<FStmtIR>>();
-        if (!HoistReadsInArg(V, BP, Locals, *Into, Err)) return false;
+        if (!bCurNoOpt && V.K == FArgIR::Call && V.Sub && IsBranch(V.Sub->Intrinsic))
+        {
+            /* A branch in a branch stores straight into this one's temp, not a temp of its own that is then copied. */
+            if (!HoistBranch(V, BP, Locals, *Into, Err, &TmpRef, &PD)) return false;
+            if (V.K == FArgIR::Local && V.S == TmpRef.S) return true;
+        }
+        else if (!HoistReadsInArg(V, BP, Locals, *Into, Err)) return false;
         Into->push_back(Store(std::move(V)));
         return true;
     };
@@ -5808,8 +6084,11 @@ bool FCompiler::HoistBranch(FArgIR& A, FBlueprintClass& BP, std::vector<FPropert
     else
     {
         OutPre.push_back(Store(std::move(Cond)));
-        If.Cond = Which == "__AndAlso__" ? TmpRef : NotOf(TmpRef, BP);
-        if (!Arm(std::move(A.Sub->Args[1]), If.Then)) return false;
+        /* `||` runs R when T is false: as the else of `if (T)`, which costs a jump where `if (!T)` costs a call. */
+        const bool bElse = Which != "__AndAlso__" && !bCurNoOpt;
+        If.Cond = Which == "__AndAlso__" || bElse ? TmpRef : NotOf(TmpRef, BP);
+        if (!Arm(std::move(A.Sub->Args[1]), bElse ? If.Else : If.Then)) return false;
+        if (bElse) If.Then = std::make_shared<std::vector<FStmtIR>>();
     }
     OutPre.push_back(std::move(If));
     A = TmpRef;
@@ -5897,7 +6176,8 @@ bool FCompiler::HoistReadsInStmt(FStmtIR& St, FBlueprintClass& BP,
     {
         FStmtIR Exit;
         Exit.K = FStmtIR::If;
-        Exit.Cond = NotOf(std::move(St.Cond), BP);
+        Exit.bJumpOut = !bCurNoOpt;
+        Exit.Cond = bCurNoOpt ? NotOf(std::move(St.Cond), BP) : std::move(St.Cond);
         Exit.Then = std::make_shared<std::vector<FStmtIR>>();
         Exit.Then->emplace_back().K = FStmtIR::Break;
         if (!St.Body) St.Body = std::make_shared<std::vector<FStmtIR>>();
@@ -5938,6 +6218,35 @@ bool FCompiler::HoistReadsInList(std::vector<FStmtIR>& Stmts, FBlueprintClass& B
     for (FStmtIR& St : Stmts)
     {
         std::vector<FStmtIR> Pre;
+        /* `return C ? A : B;` is `if (C) return A; else return B;`: no temp to store the value in first. */
+        if (!bCurNoOpt && St.K == FStmtIR::Return && St.bHasValue && St.Value.K == FArgIR::Call && St.Value.Sub
+            && St.Value.Sub->Intrinsic == "__Select__" && St.Value.Sub->Args.size() == 3)
+        {
+            FStmtIR If;
+            If.K = FStmtIR::If;
+            If.Cond = St.Value.Sub->Args[0];
+            FStmtIR Taken = St, Other = St;
+            Taken.Value = St.Value.Sub->Args[1];
+            Other.Value = St.Value.Sub->Args[2];
+            If.Then = std::make_shared<std::vector<FStmtIR>>(1, std::move(Taken));
+            If.Else = std::make_shared<std::vector<FStmtIR>>(1, std::move(Other));
+            if (!HoistReadsInStmt(If, BP, Locals, Pre, Err)) return false;
+            for (FStmtIR& P : Pre) Out.push_back(std::move(P));
+            Out.push_back(std::move(If));
+            continue;
+        }
+        /* `X = C ? A : B` (or && / ||) into a local: the branches store into X itself, when nothing in them reads X. */
+        const auto Dest = std::find_if(Locals.begin(), Locals.end(), [&](const FPropertyDef& L) { return L.Name == St.Var.S; });
+        if (!bCurNoOpt && (St.K == FStmtIR::Assign || (St.K == FStmtIR::Decl && St.bHasValue)) && St.Var.K == FArgIR::Local
+            && !St.Var.Base && St.Value.K == FArgIR::Call && St.Value.Sub && IsBranch(St.Value.Sub->Intrinsic)
+            && Dest != Locals.end() && Mentions(St.Value, St.Var.S) == 0)
+        {
+            const FPropertyDef DestProp = *Dest;
+            if (!HoistBranch(St.Value, BP, Locals, Pre, Err, &St.Var, &DestProp)) return false;
+            for (FStmtIR& P : Pre) Out.push_back(std::move(P));
+            if (St.Value.K != FArgIR::Local || St.Value.S != St.Var.S) Out.push_back(std::move(St));
+            continue;
+        }
         if (!HoistReadsInStmt(St, BP, Locals, Pre, Err)) return false;
         for (FStmtIR& P : Pre) Out.push_back(std::move(P));
         Out.push_back(std::move(St));
@@ -5954,10 +6263,11 @@ std::string StripTypeKeywords(std::string T)
     return T;
 }
 
-/* The number a constant expression comes to: literals, enum constants, ConstVars, casts, and arithmetic over them,
-   each step rounded to the type clang gave it so `2 * 50.f` and `1 << 31` come out as C++ has them. False for
-   anything else (a call, sizeof, ?:) and for a division by zero.
-   ponytail: no comparisons, `&&`, `?:` or sizeof; add them when a mod writes one. */
+/* The number a constant expression comes to: literals, enum constants, ConstVars, the constants inlined parameters
+   and read-only locals stand for (ParmConst), casts, and arithmetic, comparisons, `&&`, `||` and `?:` over them, each
+   step rounded to the type clang gave it so `2 * 50.f` and `1 << 31` come out as C++ has them. `false && X`,
+   `true || X` and `?:` need only the side C++ evaluates. False for anything else (a call, sizeof) and for a division
+   by zero. */
 bool FCompiler::FoldConst(const Json& E, FConstVal& Out) const
 {
     const std::string K = Kind(E);
@@ -6002,6 +6312,17 @@ bool FCompiler::FoldConst(const Json& E, FConstVal& Out) const
     {
         const std::string Id = E["referencedDecl"].value("id", std::string());
         if (auto V = EnumValues.find(Id); V != EnumValues.end()) { Out = {}; Out.I = V->second; return true; }
+        if (auto P = ParmConst.find(Id); P != ParmConst.end())
+        {
+            const FArgIR& A = P->second;
+            Out = {};
+            if (A.K == FArgIR::Int || A.K == FArgIR::Byte) Out.I = A.I;
+            else if (A.K == FArgIR::Int64) Out.I = A.I64;
+            else if (A.K == FArgIR::Bool) Out.I = A.B;
+            else if (A.K == FArgIR::Float) { Out.bFloat = true; Out.F = A.F; }
+            else return false;
+            return Fit(Out);
+        }
         auto C = ConstVars.find(Id);
         return C != ConstVars.end() && First(*C->second) && FoldConst(*First(*C->second), Out) && Fit(Out);
     }
@@ -6015,11 +6336,37 @@ bool FCompiler::FoldConst(const Json& E, FConstVal& Out) const
         else if (Op != "+") return false;
         return Fit(Out);
     }
+    if (K == "ConditionalOperator")
+    {
+        FConstVal C;
+        const Json* Taken = Nth(E, 0) && FoldConst(*Nth(E, 0), C) ? Nth(E, C.Num() != 0 ? 1 : 2) : nullptr;
+        return Taken && FoldConst(*Taken, Out) && Fit(Out);
+    }
     if (K != "BinaryOperator") return false;
     const std::string Op = E.value("opcode", std::string());
     FConstVal L, R;
+    if (Op == "&&" || Op == "||")
+    {
+        if (!Nth(E, 0) || !FoldConst(*Nth(E, 0), L)) return false;
+        const bool bDecided = (L.Num() != 0) == (Op == "||");     // the right side never runs
+        if (!bDecided && (!Nth(E, 1) || !FoldConst(*Nth(E, 1), R))) return false;
+        Out = {};
+        Out.I = bDecided ? Op == "||" : R.Num() != 0;
+        return Fit(Out);
+    }
     if (!Nth(E, 0) || !Nth(E, 1) || !FoldConst(*Nth(E, 0), L) || !FoldConst(*Nth(E, 1), R)) return false;
     Out = {};
+    if (Op == "<" || Op == ">" || Op == "<=" || Op == ">=" || Op == "==" || Op == "!=")
+    {
+        /* Both sides already have their common type; a uint64 beyond INT64_MAX would compare as negative. */
+        const std::string T = TypeOf(*Nth(E, 0));
+        if (IsInt64Type(T) && (T.find("unsigned") != std::string::npos || T.find("uint64") != std::string::npos)) return false;
+        const int32 Cmp = L.bFloat || R.bFloat ? (L.Num() < R.Num() ? -1 : L.Num() > R.Num() ? 1 : L.Num() == R.Num() ? 0 : 2)
+                                               : (L.I < R.I ? -1 : L.I > R.I ? 1 : 0);
+        Out.I = Op == "<" ? Cmp == -1 : Op == ">" ? Cmp == 1 : Op == "<=" ? Cmp == -1 || Cmp == 0
+              : Op == ">=" ? Cmp == 1 || Cmp == 0 : Op == "==" ? Cmp == 0 : Cmp != 0;
+        return Fit(Out);
+    }
     if (L.bFloat || R.bFloat)
     {
         Out.bFloat = true;
@@ -6042,6 +6389,27 @@ bool FCompiler::FoldConst(const Json& E, FConstVal& Out) const
     else if (Op == ">>" && R.I >= 0 && R.I < 64) Out.I = L.I >> R.I;
     else return false;
     return Fit(Out);
+}
+
+/* `!C` with no Not_PreBool call, where there is such a thing: `!!X` is X, and a comparison turns round (`<` and `>=`,
+   `==` and `!=`); `<` and the like only over integers, since a NaN is neither `A < B` nor `A >= B`. */
+bool FCompiler::FreeNegation(const Json& C, Json& Out) const
+{
+    const Json* N = Strip(&C);
+    if (!N) return false;
+    const std::string K = Kind(*N), Op = N->value("opcode", std::string());
+    if (K == "UnaryOperator" && Op == "!" && First(*N)) { Out = *First(*N); return true; }
+    static const std::map<std::string, std::string> Inverse = {
+        { "<", ">=" }, { ">=", "<" }, { ">", "<=" }, { "<=", ">" }, { "==", "!=" }, { "!=", "==" } };
+    const auto It = Inverse.find(Op);
+    if (K != "BinaryOperator" || It == Inverse.end() || !Nth(*N, 0) || !Nth(*N, 1)) return false;
+    auto Ordered = [&](const std::string& T) {
+        return Canon(T) != "float" && StripTypeKeywords(T) != "double" && !IsObjectType(T);
+    };
+    if (Op != "==" && Op != "!=" && (!Ordered(TypeOf(*Nth(*N, 0))) || !Ordered(TypeOf(*Nth(*N, 1))))) return false;
+    Out = *N;
+    Out["opcode"] = It->second;
+    return true;
 }
 
 bool FCompiler::ConstToArg(const FConstVal& V, const std::string& Type, FArgIR& Out) const
@@ -7270,6 +7638,13 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         }
         if (!bCurNoOpt)
         {
+            PruneConstBranches(Stmts);
+            if (!bBodyHasGoto && !bMadeLatentCall)
+            {
+                FlattenBlocks(Stmts);
+                DropOverwritten(Stmts);
+                ForwardSingleUse(Stmts, Stmts);
+            }
             DropUnusedPure(Stmts);
             DropUnusedLocals(Stmts, Locals);
             if (!bBodyHasGoto && !bMadeLatentCall) CoalesceTemps(Stmts, Locals, BP);
@@ -7283,7 +7658,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         /* Locals follow ReturnValue in ChildProperties; the engine tells them apart by CPF_Parm. */
         for (const FPropertyDef& L : Locals) Params.push_back(L);
 
-        const bool bEndsWithReturn = !Stmts.empty() && Stmts.back().K == FStmtIR::Return;
+        const bool bEndsWithReturn = NeverFallsThrough(Stmts, true);
         const bool bScratchNeeded = ReadScratchAdded;
         const FIndex DerefStruct = bScratchNeeded
             ? BP.ScriptStruct(ModPackage + "/FDeref", "FDeref")
@@ -7344,7 +7719,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
 
         if (auto Cat = R.Categories.find(Fn.Name); Cat != R.Categories.end()) BP.ApiCategory[UeNameOf(&R, Fn.Name)] = Cat->second;
         BP.AddFunction(UeNameOf(&R, Fn.Name), Super, Params,
-                       [Stmts, bEndsWithReturn, bScratchNeeded, DerefStruct](FScript& S, FIndex SelfExp) {
+                       [Stmts, bEndsWithReturn, bScratchNeeded, DerefStruct, bOpt = !bCurNoOpt](FScript& S, FIndex SelfExp) {
             if (bScratchNeeded)
             {
                 /* Prime __DerefScratch__.Num = 1 so the ArrayGetByRef bounds check (0 <= idx < Num)
@@ -7358,6 +7733,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             }
             EmitStmts(Stmts, S, SelfExp);
             if (!bEndsWithReturn) S.Return();
+            if (bOpt) S.ThreadJumps();
             S.EndOfScript();
         }, Flags);
     }
@@ -7481,6 +7857,90 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     return true;
 }
 
+/* Builds the DOM of clang's AST dump as it streams in, without what nothing reads: source locations (all but a
+   DeclRefExpr's range begin offset and token length, see NamedQualifier), mangled names, a record's definitionData and
+   a few flags are most of the dump, and building them was most of a compile. A key read later must not be in key(). */
+class FAstSax : public nlohmann::json_sax<Json>
+{
+public:
+    explicit FAstSax(Json& InRoot) : Root(InRoot) {}
+    bool null() override { return Value(nullptr); }
+    bool boolean(bool V) override { return Value(V); }
+    bool number_integer(number_integer_t V) override { return Value(V); }
+    bool number_unsigned(number_unsigned_t V) override { return Value(V); }
+    bool number_float(number_float_t V, const string_t&) override { return Value(V); }
+    bool string(string_t& V) override
+    {
+        if (bKindNext && !Skipped) DeclRef.back() = V == "DeclRefExpr";   // clang writes "kind" before "range"
+        return Value(std::move(V));
+    }
+    bool binary(binary_t& V) override { return Value(std::move(V)); }
+    bool start_object(size_t) override { return Open(Json::value_t::object); }
+    bool start_array(size_t) override { return Open(Json::value_t::array); }
+    bool end_object() override { return Close(); }
+    bool end_array() override { return Close(); }
+    bool key(string_t& K) override
+    {
+        if (Skipped) return true;
+        bSkipNext = K == "loc" || K == "end" || K == "file" || K == "line" || K == "col" || K == "includedFrom"
+                 || K == "spellingLoc" || K == "expansionLoc" || K == "isMacroArgExpansion" || K == "mangledName"
+                 || K == "definitionData" || K == "isImplicit" || K == "isUsed" || K == "isReferenced"
+                 || K == "typeAliasDeclId" || (K == "range" && !DeclRef.back());
+        bKindNext = K == "kind";
+        if (!bSkipNext) Slot = &(*Stack.back())[std::move(K)];
+        return true;
+    }
+    bool parse_error(size_t, const std::string&, const nlohmann::detail::exception&) override { return false; }
+
+private:
+    Json& Root;
+    std::vector<Json*> Stack;       // the open objects and arrays being filled
+    std::vector<bool> DeclRef;      // per open object or array: a DeclRefExpr, whose range is kept
+    Json* Slot = nullptr;           // the object member the last key named
+    int32 Skipped = 0;              // depth inside a dropped object or array
+    bool bSkipNext = false;         // the next value is a dropped key's
+    bool bKindNext = false;         // ... or "kind"'s
+
+    Json* Place(Json&& V)
+    {
+        if (Stack.empty()) return &(Root = std::move(V));
+        if (Stack.back()->is_array()) { Stack.back()->push_back(std::move(V)); return &Stack.back()->back(); }
+        return &(*Slot = std::move(V));
+    }
+    bool Value(Json&& V)
+    {
+        if (!Skipped && !bSkipNext) Place(std::move(V));
+        bSkipNext = bKindNext = false;
+        return true;
+    }
+    bool Open(Json::value_t T)
+    {
+        if (Skipped || bSkipNext) ++Skipped;
+        else { Stack.push_back(Place(Json(T))); DeclRef.push_back(false); }
+        bSkipNext = bKindNext = false;
+        return true;
+    }
+    bool Close()
+    {
+        if (Skipped) --Skipped;
+        else { Stack.pop_back(); DeclRef.pop_back(); }
+        return true;
+    }
+};
+
+/* Parses clang's AST dump at Path. */
+bool ParseAst(const std::string& Path, Json* Out, std::string* Err)
+{
+    std::vector<char> Buf(1 << 20);
+    std::ifstream In;
+    In.rdbuf()->pubsetbuf(Buf.data(), Buf.size());
+    In.open(Path, std::ios::binary);
+    if (!In || In.peek() == std::ifstream::traits_type::eof()) { *Err = "clang produced no AST at " + Path; return false; }
+    FAstSax Sax(*Out);
+    if (!Json::sax_parse(In, &Sax)) { *Err = "could not parse clang's AST dump"; return false; }
+    return true;
+}
+
 bool FCompiler::LoadTables(const std::string& IncludeDir, std::string* Err)
 {
     auto Load = [&](const char* File, Json* Out) {
@@ -7564,11 +8024,7 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         *Err = "clang rejected " + SourcePath + " (diagnostics above)";
         return false;
     }
-
-    const std::string Text = ReadText(AstPath);
-    if (Text.empty()) { *Err = "clang produced no AST at " + AstPath; return false; }
-    Doc = Json::parse(Text, nullptr, false);
-    if (Doc.is_discarded()) { *Err = "could not parse clang's AST dump"; return false; }
+    if (!ParseAst(AstPath, &Doc, Err)) return false;
 
     if (!LoadTables(IncludeDir, Err)) return false;
     if (!Collect(Err)) return false;
@@ -7690,8 +8146,9 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
 bool CompileToAssets(const std::string& SourcePath, const std::string& IncludeDir,
                      const std::string& OutDir, const std::optional<std::string>& ApiDir, std::string* Err)
 {
-    FCompiler C;
-    return C.Run(SourcePath, IncludeDir, OutDir, ApiDir, Err);
+    /* Never freed: the process ends right after, and tearing the AST down node by node takes longer than exiting. */
+    FCompiler* C = new FCompiler;
+    return C->Run(SourcePath, IncludeDir, OutDir, ApiDir, Err);
 }
 
 }   // namespace Uasset
