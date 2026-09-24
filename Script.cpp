@@ -229,7 +229,8 @@ void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
         }
         else if (P.Type == "ObjectProperty") V.Idx(D.K == FDefaultValue::Obj ? D.Object : Null());
         else if (P.Type == "ClassProperty" || P.Type == "InterfaceProperty") V.I32(0);
-        else if (P.Type == "SoftObjectProperty" || P.Type == "SoftClassProperty") { V.Name("None"); V.I32(0); }   // FSoftObjectPath: AssetPathName, SubPathString
+        else if (P.Type == "SoftObjectProperty" || P.Type == "SoftClassProperty")    // FSoftObjectPath: AssetPathName, SubPathString
+        { V.Name(D.K == FDefaultValue::Str && !D.S.empty() ? D.S : std::string("None")); V.I32(0); }
         else if (P.Type == "SetProperty" || P.Type == "MapProperty")
         {
             /* Removed count, count, then the elements; a map's Items alternate key, value. */

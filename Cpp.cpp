@@ -1173,6 +1173,12 @@ private:
     std::vector<const Json*> AssetDecls;        // namespace-scope variables brace-initialized, see GenerateAsset
     std::map<std::string, std::string> AssetPaths;  // UE_ASSET_AT: Ns::variable -> the path of an asset cooked elsewhere
     std::map<std::string, std::string> VarScope;    // a namespace-scope variable's decl id -> its namespace, "A::B::"
+    std::map<std::string, const Json*> NsVars;      // a namespace-scope variable's decl id -> the decl
+    std::map<std::string, const Json*> NsVarNamed;  // Ns::variable -> the decl
+    std::set<std::string> AssetAlls;                // UE_ASSET_ALL: Ns::All
+    std::map<std::string, FRecord> Globals;         // Ns::variable a function uses -> the class holding it, see LowerGlobal
+    std::map<std::string, Json> GlobalAst;          // an All's member: its default assembled from the UE_ASSET_ATs
+    bool LowerGlobal(const Json& Decl, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     /* `&MD_Big`, where MD_Big is an asset of this mod or a UE_ASSET_AT: its import. False when N is anything else. */
     bool AssetRef(const Json& N, FBlueprintClass& BP, FIndex* Out);
     /* A member initializer becomes PD.Default, which the CDO / struct default instance / asset writes. It must be a
@@ -1571,6 +1577,12 @@ bool FCompiler::Collect(std::string* Err)
         if (Kind(N) == "VarDecl" && Name(N) == "UeModPackage") FindLiteral(N, ModPackage);
         if (Kind(N) == "VarDecl" && BracedInit(N)) AssetDecls.push_back(&N);
         if (Kind(N) == "VarDecl" && !Ns.empty()) VarScope[N.value("id", std::string())] = Ns;
+        if (Kind(N) == "VarDecl") NsVars[N.value("id", std::string())] = NsVarNamed[Ns + Name(N)] = &N;
+        if (Kind(N) == "VarDecl" && Name(N).size() > 12 && Name(N).compare(Name(N).size() - 12, 12, "__UeAssetAll") == 0)
+        {
+            AssetAlls.insert(Ns + Name(N).substr(0, Name(N).size() - 12));
+            return;
+        }
         if (Kind(N) == "VarDecl" && Name(N).size() > 9 && Name(N).compare(Name(N).size() - 9, 9, "__UeAsset") == 0)
         {
             FindLiteral(N, AssetPaths[Ns + Name(N).substr(0, Name(N).size() - 9)]);
@@ -3231,6 +3243,7 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             *Err = "TODO: DeclRefExpr to " + RefKind;
             return false;
         }
+        if (auto G = NsVars.find(Ref.value("id", std::string())); G != NsVars.end()) return LowerGlobal(*G->second, BP, Out, Err);
         if (IsDerefLvalue(*N))
         {
             FArgIR Addr;
@@ -4738,6 +4751,12 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 St.K = FStmtIR::Assign;
                 bOk = LowerField(*Lhs, BP, St.Var, Err) && LowerArg(*Rhs, BP, St.Value, Err);
                 if (bOk) { SetOn = RecordOfFieldAccess(*Lhs); SetField = St.Var.S; SetObject = St.Var.Base; }
+            }
+            else if (LK == "DeclRefExpr" && NsVars.count((*Lhs)["referencedDecl"].value("id", std::string())))
+            {
+                St.K = FStmtIR::Assign;     // a global: its generated class's default object, see LowerGlobal
+                bOk = LowerGlobal(*NsVars[(*Lhs)["referencedDecl"].value("id", std::string())], BP, St.Var, Err)
+                   && LowerArg(*Rhs, BP, St.Value, Err);
             }
             else if (LK == "DeclRefExpr")
             {
@@ -6426,6 +6445,66 @@ bool FCompiler::ConstToArg(const FConstVal& V, const std::string& Type, FArgIR& 
     return true;
 }
 
+/*
+A namespace-scope variable. A Blueprint has no globals, so each one a function uses lives in the default object of a
+class generated for it: <Ns>__<Name> in the mod's package, with one member of the variable's name and type whose
+default is the initializer. Every class of every source in the mod reads and writes that one object, and two sources
+using the same variable write the same package. UE_ASSET_ALL's All is one too: its default lists every UE_ASSET_AT
+declared under its namespace whose class is All's element class or derives from it.
+*/
+bool FCompiler::LowerGlobal(const Json& Decl, FBlueprintClass& BP, FArgIR& Out, std::string* Err)
+{
+    const auto Scope = VarScope.find(Decl.value("id", std::string()));
+    const std::string Ns = Scope == VarScope.end() ? std::string() : Scope->second;
+    const Json& T = Decl.contains("type") ? Decl["type"] : Json::object();     // desugared: UeAssets spell `::USoundWave`
+    const std::string Qual = Ns + Name(Decl), Type = StripTypeKeywords(T.value("desugaredQualType", T.value("qualType", std::string())));
+    if (const FRecord *R = Find(Type), *UObj = Find("UObject"); R && UObj && (R == UObj || IsSubclassOf(*R, *UObj)))
+    { *Err = Qual + " is an asset, not a value: point at it with &" + Name(Decl); return false; }
+    if (!Globals.count(Qual))
+    {
+        FRecord G;
+        for (size_t At = 0; At < Qual.size(); ++At)
+            if (Qual.compare(At, 2, "::") == 0) { G.CppName += "__"; ++At; }
+            else G.CppName += Qual[At];
+        G.Base = "UObject";
+        if (AssetAlls.count(Qual))
+        {
+            std::string Elem;
+            const FRecord* Of = TemplateArg(Type, "TArray", &Elem) && TemplateArg(StripTypeKeywords(Elem), "TSoftObjectPtr", &Elem)
+                              ? Find(StripTypeKeywords(Elem)) : nullptr;
+            if (!Of) { *Err = Qual + ": UE_ASSET_ALL's All is a TArray<TSoftObjectPtr<a class>>"; return false; }
+            Json List = { { "kind", "InitListExpr" }, { "inner", Json::array() } };
+            for (const auto& [Key, Path] : AssetPaths)
+            {
+                if (Key.compare(0, Ns.size(), Ns) != 0 || !NsVarNamed.count(Key)) continue;
+                const Json& KT = (*NsVarNamed[Key]).contains("type") ? (*NsVarNamed[Key])["type"] : Json::object();
+                const FRecord* R = Find(StripTypeKeywords(KT.value("desugaredQualType", KT.value("qualType", std::string()))));
+                if (R && (R == Of || IsSubclassOf(*R, *Of)))
+                    List["inner"].push_back(Json{ { "kind", "StringLiteral" }, { "value", "\"" + Path + "\"" } });
+            }
+            Json& F = GlobalAst[Qual] = Json{ { "kind", "FieldDecl" }, { "name", Name(Decl) }, { "type", Json{ { "qualType", Type } } } };
+            if (!List["inner"].empty()) F["inner"] = Json::array({ List });
+            G.Fields.push_back(&F);
+        }
+        else if (!First(Decl) && Decl.value("storageClass", std::string()) == "extern")
+        { *Err = Qual + " is declared extern but not defined in this source; a mod's global is defined where it is used"; return false; }
+        else G.Fields.push_back(&Decl);
+        Globals[Qual] = G;
+    }
+    const FRecord& G = Globals[Qual];
+    const std::string Package = ModPackage + "/" + G.CppName;
+    Out = FArgIR();
+    Out.K = FArgIR::Field;
+    Out.S = Name(Decl);
+    Out.Owner = BP.PropertyOwner(Package, G.CppName + "_C");
+    Out.LetOp = LetOpFor(TypeOf(Decl));
+    Out.Base = std::make_shared<FArgIR>();
+    Out.Base->K = FArgIR::ObjConst;
+    Out.Base->Owner = BP.Asset(Package, G.CppName + "_C", Package, "Default__" + G.CppName + "_C");
+    Out.Base->InnerType = "UObject *";
+    return true;
+}
+
 bool FCompiler::AssetRef(const Json& N, FBlueprintClass& BP, FIndex* Out)
 {
     if (Kind(N) != "UnaryOperator" || N.value("opcode", std::string()) != "&") return false;
@@ -6549,6 +6628,14 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
     {
         PD.Default.K = FDefaultValue::Obj;
         PD.Default.Object = Asset;
+        return true;
+    }
+    /* A soft pointer's default is its path, "/Game/Dir/Pkg" meaning Pkg.Pkg as UE_ASSET_AT's does. */
+    if (std::string Path; (PD.Type == "SoftObjectProperty" || PD.Type == "SoftClassProperty") && FindLiteral(*Init, Path))
+    {
+        if (!Path.empty() && Path.find('.', Path.rfind('/') + 1) == std::string::npos) Path += "." + Path.substr(Path.rfind('/') + 1);
+        PD.Default.K = !bKeepZero && Path.empty() ? FDefaultValue::None : FDefaultValue::Str;
+        PD.Default.S = Path;
         return true;
     }
     const bool bNeg = K == "UnaryOperator" && Init->value("opcode", std::string()) == "-";
@@ -8109,6 +8196,11 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     if (bSynthDeref)
     {
         if (!GenerateStruct(SynthDeref, OutDir, Err)) return false;
+        ++Generated;
+    }
+    for (const auto& Entry : Globals)       // what the lowering above found used; see LowerGlobal
+    {
+        if (!Generate(Entry.second, OutDir, Err)) return false;
         ++Generated;
     }
     for (const auto& Entry : ModEnums)

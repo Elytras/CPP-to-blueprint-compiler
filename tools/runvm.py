@@ -62,9 +62,10 @@ class Obj:
 class VM:
     """One cooked class run the way the VM would, for what runscript cannot: latent calls, the ubergraph's persistent
     frame, delegate binds, calls and sets on other objects. Engine calls are logged as (name, context, args) and
-    answered by `natives`; a test fires the recorded latent actions / broadcasts the bound delegates itself."""
-    def __init__(s, base, natives=None, isa=None, **self_vars):
-        s.base, s.natives = base, dict(natives or {})
+    answered by `natives`; a test fires the recorded latent actions / broadcasts the bound delegates itself. `objects`
+    are what an ObjectConst names, by object name (a global's Default__<Ns>__<Name>_C); two VMs sharing one see one."""
+    def __init__(s, base, natives=None, isa=None, objects=None, **self_vars):
+        s.base, s.natives, s.objects = base, dict(natives or {}), objects if objects is not None else {}
         s.exports = {e['name'] for e in dumpexp.load(base)[5]}
         s.self = Obj(os.path.basename(base) + '_C', **self_vars)
         s.frames, s.latent, s.binds, s.log, s.scripts, s.mem = {}, [], [], [], {}, {}
@@ -94,7 +95,8 @@ class VM:
             if o == 1: return ctx.vars.get(n.val, 0)
             if o == 0x17: return me
             if o == 0x2A: return None
-            if o in (0x1D, 0x1E, 0x24, 0x2C, 0x35, 0x21, 0x5B, 0x20): return n.val
+            if o == 0x20: return s.objects.get(n.val, n.val)
+            if o in (0x1D, 0x1E, 0x1F, 0x24, 0x2C, 0x35, 0x21, 0x5B): return n.val
             if o == 0x4B: return ('delegate', n.val, me)                   # EX_InstanceDelegate binds Stack.Object
             if o in (0x25, 0x26): return o - 0x25
             if o in (0x27, 0x28): return o == 0x27
