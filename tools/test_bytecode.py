@@ -343,6 +343,9 @@ check('FlowTest', 'SafeRatio', lambda X: X != 0 and cdiv(10, X) > 2, [dict(X=x) 
 check('FlowTest', 'EitherZero', lambda X, Y: X == 0 or cdiv(100, X) == Y, [dict(X=x, Y=y) for x in (0, 10, 3) for y in (0, 10, 33)])
 check('FlowTest', 'Pick', lambda X: X * 2 if X > 0 else (-1 if X < -5 else 7), [dict(X=x) for x in (-9, -5, 0, 4)])
 check('FlowTest', 'ConstBreak', lambda X: 205, [dict(X=0)])
+vm = VM(asset('FlowTest'))
+assert [vm.call('UseDefault', X=x) for x in (-2, 0, 5)] == [(x * 3 + x * 10 + (x + 7) * 1000) for x in (-2, 0, 5)]
+print('ok  FlowTest.UseDefault: a defaulted argument is the parameter\'s default, to a method and inlined')
 check('FlowTest', 'Compound', compound, [dict(N=n) for n in (0, 1, 5, 40)])
 check('FlowTest', 'WhileAnd', while_and, [dict(Limit=l) for l in (0, 1, 50, 99, 150)])
 

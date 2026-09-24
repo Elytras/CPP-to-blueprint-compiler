@@ -3780,6 +3780,19 @@ bool FCompiler::LowerUpdateValue(const Json& N, FBlueprintClass& BP, FArgIR& Out
     return true;
 }
 
+/* What a defaulted argument stands for. clang 18 writes the CXXDefaultArgExpr with no child, and the default is the
+   parameter's own initialiser (instantiated, in a template's instantiation); a newer clang nests it in the node. */
+const Json* DefaultedArg(const Json& Arg, const Json* Parm)
+{
+    if (Kind(Arg) != "CXXDefaultArgExpr" || First(Arg) || !Parm) return &Arg;
+    const Json* Init = nullptr;
+    ForEach(*Parm, [&](const Json& C) {
+        const std::string K = Kind(C);
+        if (!Init && (K.size() < 4 || K.compare(K.size() - 4, 4, "Attr") != 0)) Init = &C;
+    });
+    return Init ? Init : &Arg;
+}
+
 bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR& Out, std::string* Err)
 {
     const std::string K = Kind(CallExprNode);
@@ -3947,11 +3960,17 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         if (bOk) Out.Args.push_back(A);
         Defaulted.push_back(false);
     }
+    /* The called declaration's parameters, for a defaulted argument: FullDecl, when it has the call's arity. */
+    std::vector<const Json*> CalledParms;
+    if (FullDecl) ForEach(*FullDecl, [&](const Json& C) { if (Kind(C) == "ParmVarDecl") CalledParms.push_back(&C); });
+    if (CalledParms.size() != (Receiver ? 1u : 0u) + (CallExprNode.contains("inner") ? CallExprNode["inner"].size() - 1 : 0u))
+        CalledParms.clear();
     ForEach(CallExprNode, [&](const Json& C) {
         if (bFirst) { bFirst = false; return; }
         if (!bOk) return;
         FArgIR A;
-        bOk = LowerArg(C, BP, A, Err);
+        const size_t I = Defaulted.size();
+        bOk = LowerArg(*DefaultedArg(C, I < CalledParms.size() ? CalledParms[I] : nullptr), BP, A, Err);
         if (bOk) Out.Args.push_back(A);
         Defaulted.push_back(Kind(C) == "CXXDefaultArgExpr");
     });
@@ -5601,6 +5620,7 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
     if (Receiver) Args.push_back(Receiver);     // a forwarded method: the object is the free function's first parameter
     ForEach(CallNode, [&](const Json& C) { if (bFirst) { bFirst = false; return; } Args.push_back(&C); });
     if (Args.size() != Parms.size()) { *Err = "inline call to " + Method + " with " + std::to_string(Args.size()) + " arguments"; return false; }
+    for (size_t I = 0; I < Args.size(); ++I) Args[I] = DefaultedArg(*Args[I], Parms[I]);
     /* Every argument is lowered before any parameter is bound: an argument can expand this same function again
        (`Twice(Twice(V))`), and that expansion binds the parameters for itself. */
     auto Aliased = [&](size_t I) -> const Json* {
