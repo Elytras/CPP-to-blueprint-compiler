@@ -4442,7 +4442,9 @@ void FCompiler::PruneConstBranches(std::vector<FStmtIR>& Stmts)
         if (St.Cond.K != FArgIR::Bool) continue;
         if (St.K == FStmtIR::If)
         {
-            const auto Taken = St.Cond.B ? St.Then : St.Else, Dropped = St.Cond.B ? St.Else : St.Then;
+            /* A jump-out `if` holds `!C`, and its break / continue is taken when that is false. */
+            const bool bThen = St.bJumpOut ? !St.Cond.B : St.Cond.B;
+            const auto Taken = bThen ? St.Then : St.Else, Dropped = bThen ? St.Else : St.Then;
             if (Dropped && HasLabel(*Dropped)) continue;
             const std::vector<FStmtIR> Keep = Taken ? *Taken : std::vector<FStmtIR>();
             Stmts.erase(Stmts.begin() + I);
