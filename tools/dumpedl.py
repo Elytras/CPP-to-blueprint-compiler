@@ -32,11 +32,13 @@ class Reader(object):
         return s
 
 
-def main():
-    if len(sys.argv) < 2:
-        sys.exit(__doc__.strip().splitlines()[-1])
-    data = io.open(sys.argv[1], "rb").read()
+def engine_version(r):
+    r.p += 3 * 2 + 4                                # major, minor, patch, changelist
+    r.fstring()                                     # branch: empty in AssetGen's, "++UE4+Release-4.27" in an editor cook
 
+
+def read_tables(data):
+    """A cooked .uasset's name map, imports as (class name, object name), exports and preload dependencies."""
     # UE4.27 PackageFileSummary.cpp, PKG_FilterEditorOnly form (no LocalizationId / PersistentGuid).
     r = Reader(data, 4)                             # magic
     r.i32()                                         # LegacyFileVersion
@@ -59,15 +61,18 @@ def main():
     r.p += 16                                       # package Guid
     for _ in range(r.i32()):                        # generations
         r.i32(); r.i32()
-    r.p += 2 * 14                                   # SavedBy / CompatibleWith engine versions
+    engine_version(r)                               # SavedByEngineVersion
+    engine_version(r)                               # CompatibleWithEngineVersion
     r.i32()                                         # CompressionFlags
     r.i32()                                         # CompressedChunks
     r.i32()                                         # PackageSource
-    r.i32()                                         # AdditionalPackagesToCook
+    for _ in range(r.i32()):                        # AdditionalPackagesToCook
+        r.fstring()
     r.i32()                                         # AssetRegistryOffset
     r.i64()                                         # BulkDataStartOffset
     r.i32()                                         # WorldTileInfoDataOffset
-    r.i32()                                         # ChunkIDs
+    chunks = r.i32()                                # ChunkIDs
+    r.p += 4 * chunks
     preload_count, preload_off = r.i32(), r.i32()
 
     names = []
@@ -89,39 +94,48 @@ def main():
         im.i32()                                    # OuterIndex
         imports.append((cls, name_at(im)))
 
-    exports, dep_meta = [], []
+    exports = []
     ex = Reader(data, export_off)
     for _ in range(export_count):
-        ex.i32(); ex.i32(); ex.i32(); ex.i32()      # class/super/template/outer
+        cls = ex.i32()
+        ex.i32(); ex.i32()                          # super / template
+        outer = ex.i32()
         obj = name_at(ex)
         ex.i32()                                    # ObjectFlags
         ex.i64(); ex.i64()                          # SerialSize / SerialOffset
-        ex.p += 3 * 4 + 16 + 4 + 2 * 4              # flags, guid, package flags, two bools
+        ex.p += 3 * 4 + 16 + 4 + 4                  # forced / not-for-client / -server, guid, package flags, bool
+        is_asset = ex.i32() != 0
         first = ex.i32()
         counts = (ex.i32(), ex.i32(), ex.i32(), ex.i32())
-        exports.append(obj)
-        dep_meta.append((first, counts))
+        exports.append({"class": cls, "outer": outer, "name": obj, "is_asset": is_asset, "first": first, "counts": counts})
 
-    total = preload_count
-    deps = list(struct.unpack_from("<%di" % total, data, preload_off)) if total else []
+    deps = list(struct.unpack_from("<%di" % preload_count, data, preload_off)) if preload_count else []
+    return names, imports, exports, deps
+
+
+def main():
+    if len(sys.argv) < 2:
+        sys.exit(__doc__.strip().splitlines()[-1])
+    _names, imports, exports, deps = read_tables(io.open(sys.argv[1], "rb").read())
+    total = len(deps)
 
     def label(v):
         if v == 0:
             return "null"
         if v > 0:
             i = v - 1
-            return "exp:%s" % (exports[i] if i < len(exports) else "?%d" % v)
+            return "exp:%s" % (exports[i]["name"] if i < len(exports) else "?%d" % v)
         i = -v - 1
         if i >= len(imports):
             return "imp:?%d" % v
         return "imp:%s(%s)" % (imports[i][1], imports[i][0])
 
     print("%s  (%d exports, %d imports, %d preload entries)"
-          % (sys.argv[1], export_count, import_count, total))
+          % (sys.argv[1], len(exports), len(imports), total))
     phases = ["SerBeforeSer", "CreateBeforeSer", "SerBeforeCreate", "CreateBeforeCre"]
-    for i, obj in enumerate(exports):
-        first, counts = dep_meta[i]
-        print("\n[%d] %s" % (i, obj))
+    for i, e in enumerate(exports):
+        first, counts = e["first"], e["counts"]
+        print("\n[%d] %s" % (i, e["name"]))
         if first < 0:
             print("      (no preload dependencies)")
             continue
@@ -133,4 +147,5 @@ def main():
             at += count
 
 
-main()
+if __name__ == "__main__":
+    main()

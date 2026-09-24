@@ -1311,7 +1311,20 @@ def ue_assets():
         ed = int(re.search(r'Ed \[0\] ObjectProperty size=4: index (-?\d+)', cdo).group(1))
         assert ref(user, ed) == '/Game/_ElytrasMods/AssetTest/ED_AssetTest.ED_AssetTest', cdo
         assert global_default(tmp, 'UeAssets__UEnemyDescriptor__All', 'All') == ['/Game/_ElytrasMods/AssetTest/ED_AssetTest.ED_AssetTest']
-    print('ok  genueassets: a header per class names each asset by its path, and a mod reaches one, or All, through it')
+        # --pak: a pak with no registry of its own (mint's) names its assets from each .uasset's export table. IfaceTest's
+        # registry has no enemy descriptor, so ED_AssetTest can only come from AssetTest's cooked folder.
+        for paks, has in (([], False), (['--pak', os.path.join(ROOT, 'AssetTest')], True)):
+            out = os.path.join(tmp, 'UeAssetsPak%d' % len(paks))
+            proc = subprocess.run([sys.executable, os.path.join(HERE, 'genueassets.py'), registry_of('IfaceTest'), UEAPI, out]
+                                  + paks, capture_output=True, text=True)
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+            h = os.path.join(out, 'UEnemyDescriptor.h')
+            assert os.path.exists(h) == has, os.listdir(out)
+            assert not os.path.exists(os.path.join(out, 'UBlueprintGeneratedClass.h')), os.listdir(out)
+        assert 'UE_ASSET_AT(::UEnemyDescriptor, ED_AssetTest, "/Game/_ElytrasMods/AssetTest/ED_AssetTest");' in \
+            open(h, encoding='utf-8-sig').read()
+    print('ok  genueassets: a header per class names each asset by its path, and a mod reaches one, or All, through it;'
+          ' --pak adds a pak\'s assets from their own headers')
 
 
 def global_default(folder, cls, member):
