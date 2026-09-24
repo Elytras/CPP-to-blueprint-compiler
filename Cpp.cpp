@@ -12,6 +12,13 @@
 #include <memory>
 #include <string>
 #include <vector>
+#ifdef _WIN32
+#include <process.h>
+static int ProcessId() { return _getpid(); }
+#else
+#include <unistd.h>
+static int ProcessId() { return getpid(); }
+#endif
 
 #include <nlohmann/json.hpp>
 
@@ -8070,10 +8077,12 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
 {
     ApiDir = InApiDir;
     SourceDir = std::filesystem::path(SourcePath).parent_path().string();
-    /* In %TEMP%, not OutDir: bpbuild paks OutDir's whole tree, and a failed compile keeps the dump (hundreds of MB). */
+    /* In %TEMP%, not OutDir: bpbuild paks OutDir's whole tree, and a failed compile keeps the dump (hundreds of MB).
+       Named per process: bpbuild and the tests compile the same sources, and at once they overwrote each other's. */
     std::error_code TmpEc;
     const std::string AstPath = (std::filesystem::temp_directory_path(TmpEc)
-                                 / (std::filesystem::path(SourcePath).stem().string() + ".assetgen-ast.json")).string();
+                                 / (std::filesystem::path(SourcePath).stem().string() + "." + std::to_string(ProcessId())
+                                    + ".assetgen-ast.json")).string();
     /* Both the UeApi dir and its parent are include paths, so "FSD.h" and "UeApi/FSD.h" both resolve. Absolute
        first: a relative "UeApi" has an empty parent, and -I"" swallows the next argument. */
     const std::string Parent = std::filesystem::absolute(IncludeDir, TmpEc).parent_path().string();
