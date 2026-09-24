@@ -6,7 +6,9 @@ UE_MOD_PACKAGE("/Game/_ElytrasMods/InlineTest");
 
 /* inline functions: expanded at each call, never a UFunction. */
 class InlineTest : public AActor {
-  int32 Counter;
+  int32         Counter;
+  int32         Calls;
+  TArray<int32> Arr;
 
 public:
   inline int32 Clamp(int32 V, int32 Lo, int32 Hi); // inline on the declaration, body below
@@ -77,6 +79,34 @@ public:
     if (Twice(V) > 10 && Clamp(V, 0, 3) == 3)
       return 1;
     return 0;
+  }
+
+  /* A by-value parameter is the argument's value at the call, though the body changes what it was read from. */
+  int32 LateMember() {
+    int32 R = Late(Counter);
+    return R * 100 + Counter;
+  }
+
+  /* A T& parameter bound to an element is that element, its index computed once, at the call. */
+  int32 NextIdx() {
+    Calls += 1;
+    return 0;
+  }
+  int32 BumpElem(int32 By) {
+    Arr.Add(10);
+    Bump(Arr[NextIdx()], By);
+    return Arr[0] * 100 + Calls * 10 + Counter;
+  }
+
+  /* do/while runs its body before the first test, when the test is an inline call too; continue goes to the test. */
+  int32 DoInline(int32 N) {
+    int32 I = 0;
+    do {
+      I++;
+      if (I == 2)
+        continue;
+    } while (Twice(I) < N);
+    return I;
   }
 };
 

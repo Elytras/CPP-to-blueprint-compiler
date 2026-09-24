@@ -67,6 +67,7 @@ const Json* Nth(const Json& N, size_t I)
 
 std::string StripTypeKeywords(std::string T);
 const Json* PeelLvalue(const Json* N);
+Json RefToLocal(const std::string& Name, const std::string& Type);
 
 std::string TypeOf(const Json& N)
 {
@@ -345,6 +346,7 @@ struct FRecord
     std::map<std::string, std::string> Categories;  // method or field -> the UE_CATEGORY section it is declared in
     std::set<std::string> PrivateFields;
     std::map<std::string, std::string> ScsNodes;    // `<X>__UeScsNode`: a game Blueprint's component -> its node's guid, 32 hex
+    std::map<std::string, std::string> Subobjects;  // `<X>__UeSubobject`: a native component -> "<name> <class path>" on this CDO
     std::map<std::string, std::string> TypeAliases; // `using Leaf = Game::...::Leaf;` in the class body
     const Json* Defaults = nullptr;                 // UE_DEFAULTS: the static-init block, never lowered
     bool bIsLocal = false;      // UePackage == ModPackage/CppName: cooked here, published at its /Game path
@@ -1655,6 +1657,11 @@ bool FCompiler::Collect(std::string* Err)
             {
                 std::string Real;
                 if (FindLiteral(C, Real)) R.UeNames[Name(C).substr(0, Name(C).size() - 8)] = Real;
+            }
+            else if (Kind(C) == "VarDecl" && Name(C).size() > 13 && Name(C).compare(Name(C).size() - 13, 13, "__UeSubobject") == 0)
+            {
+                std::string Sub;
+                if (FindLiteral(C, Sub)) R.Subobjects[Name(C).substr(0, Name(C).size() - 13)] = Sub;
             }
             else if (Kind(C) == "VarDecl" && Name(C).size() > 11 && Name(C).compare(Name(C).size() - 11, 11, "__UeScsNode") == 0)
             {
@@ -3336,8 +3343,10 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
                 Out.Sub->Args = { A };
                 return true;
             }
+            /* -0.0 - F is -F for every F; 0.0 - F would make -(+0.0) +0.0. */
             FArgIR Zero;
             Zero.K = bFloat ? FArgIR::Float : bInt64 ? FArgIR::Int64 : FArgIR::Int;
+            Zero.F = -0.0f;
             Out.Sub->Fn = BP.EngineFunction("/Script/Engine", "KismetMathLibrary",
                                             bFloat ? "Subtract_FloatFloat" : bInt64 ? "Subtract_Int64Int64" : "Subtract_IntInt");
             Out.Sub->Args = { Zero, A };
@@ -3445,7 +3454,7 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         const std::string LhsC = Canon(LhsTy), RhsC = Canon(RhsTy);
         if (IsObjectType(LhsTy) || IsObjectType(RhsTy))      Flavour = "ObjectObject";
         else if (LhsC == "float" || RhsC == "float")         Flavour = "FloatFloat";
-        else if (IsInt64Type(LhsTy) || IsInt64Type(RhsTy))   Flavour = "Int64Int64";
+        else if (IsInt64Type(LhsC) || IsInt64Type(RhsC))     Flavour = "Int64Int64";   // Canon: an int64-backed enum too
         else if (LhsC == "uint8" && RhsC == "uint8")         Flavour = "ByteByte";
         else if (LhsC == "bool" && RhsC == "bool")           Flavour = "BoolBool";
         else                                                 Flavour = "IntInt";
@@ -4797,7 +4806,13 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             Store.Var.S = Temp;
             Store.Var.LetOp = LetOpFor(TempTy);
             Store.bAssignLocal = true;
-            if (!LowerArg(*Cond, BP, Store.Value, Err)) { bOk = false; return; }
+            /* A byte-sized value is stored as the byte it is. The widening to int around it (C++'s promotion, or a cast)
+               would evaluate a 4-byte result into the 1-byte temp: EX_Let evaluates straight into the variable. */
+            const Json* Stored = Cond;
+            while (Width == 1 && First(*Stored) && (Kind(*Stored) == "ParenExpr"
+                   || (Stored->value("castKind", std::string()) == "IntegralCast" && SwitchWidth(TypeOf(*First(*Stored))) == 1)))
+                Stored = First(*Stored);
+            if (!LowerArg(*Stored, BP, Store.Value, Err)) { bOk = false; return; }
             Out.push_back(Store);
 
             St.K = FStmtIR::Switch;
@@ -5306,14 +5321,20 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
     if (Args.size() != Parms.size()) { *Err = "inline call to " + Method + " with " + std::to_string(Args.size()) + " arguments"; return false; }
     /* Every argument is lowered before any parameter is bound: an argument can expand this same function again
        (`Twice(Twice(V))`), and that expansion binds the parameters for itself. */
-    auto Aliased = [&](size_t I) {
+    auto Aliased = [&](size_t I) -> const Json* {
         const std::string Type = TypeOf(*Parms[I]);
         const Json* Bare = PeelLvalue(Args[I]);
-        return !Type.empty() && Type.back() == '&' && Bare && IsAliasable(*Bare) && !IsDerefLvalue(*Bare) ? Bare : nullptr;
+        if (Type.empty() || Type.back() != '&' || !Bare || IsDerefLvalue(*Bare)) return nullptr;
+        if (IsAliasable(*Bare)) return Bare;
+        const Json* Arr = IsTArrayElement(*Bare) ? PeelLvalue(Nth(*Bare, 1)) : nullptr;
+        return Arr && IsAliasable(*Arr) && Nth(*Bare, 2) ? Bare : nullptr;
     };
+    /* `Arr[I]`: the element is the one I names at the call, so the index is what gets lowered, into Values. */
+    auto ElemIndex = [&](size_t I) { const Json* A = Aliased(I); return A && IsTArrayElement(*A) ? Nth(*A, 2) : nullptr; };
     std::vector<FArgIR> Values(Parms.size());
     for (size_t I = 0; I < Parms.size(); ++I)
-        if (!Aliased(I) && !LowerArg(*Args[I], BP, Values[I], Err)) return false;
+        if (const Json* Index = ElemIndex(I)) { if (!LowerArg(*Index, BP, Values[I], Err)) return false; }
+        else if (!Aliased(I) && !LowerArg(*Args[I], BP, Values[I], Err)) return false;
     for (size_t I = 0; I < Parms.size(); ++I)
     {
         const std::string Id = Parms[I]->value("id", std::string());
@@ -5322,10 +5343,31 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
         RefAlias.erase(Id);
         LocalRename.erase(Id);
         ParmConst.erase(Id);
-        if (const Json* Bare = Aliased(I)) { RefAlias[Id] = *Bare; continue; }
         while (!Type.empty() && (Type.back() == '&' || Type.back() == ' ')) Type.pop_back();
         Type = StripTypeKeywords(Type);
         const std::string Local = Prefix + Name(*Parms[I]);
+        if (ElemIndex(I))
+        {
+            /* `T& V` bound to `Arr[I]` is Arr[the index at the call]: a computed index goes to a local once. */
+            Json Elem = *Aliased(I);
+            if (!IsFoldableConst(Values[I]))
+            {
+                const std::string Idx = Local + "Idx";
+                if (!AddLocal(Idx, "int32")) return false;
+                FStmtIR Bind;
+                Bind.K = FStmtIR::Assign;
+                Bind.Var.K = FArgIR::Local;
+                Bind.Var.S = Idx;
+                Bind.Var.LetOp = LetOpFor("int32");
+                Bind.bAssignLocal = true;
+                Bind.Value = std::move(Values[I]);
+                B.Body->push_back(std::move(Bind));
+                Elem["inner"][2] = RefToLocal(Idx, "int32");
+            }
+            RefAlias[Id] = std::move(Elem);
+            continue;
+        }
+        if (const Json* Bare = Aliased(I)) { RefAlias[Id] = *Bare; continue; }
         FStmtIR Bind;
         Bind.Value = std::move(Values[I]);
         /* A constant the body only reads is used in place: no local, no copy. */
@@ -5427,8 +5469,8 @@ bool FCompiler::LowerWithoutPrefix(const Json& Stmt, FBlueprintClass& BP, std::v
              a by-value `T E` is a copy made each iteration. The length is read once, as C++ reads end() once.
      TSet:   over a Set_ToArray copy; elements are copies.
      TMap:   over a Map_Keys copy, each value fetched with Map_Find. `auto [K, V]` binds K to a copy of the key and
-             V to a local; unless the binding is const, V goes back with Map_Add after each iteration, `break`
-             included, so the body can change values in place.
+             V to a local. `auto& [K, V]` writes V back with Map_Add after each iteration, `break` included, so the
+             body changes values in place; `auto [K, V]` is a copy, as in C++, and writes nothing back.
    ponytail: TSet / TMap iterate a copy, not the sparse array in place; the in-place walk needs the container's
    address, which a Blueprint variable does not have (ROADMAP.md, Phase 3). */
 bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vector<FStmtIR>& Out,
@@ -5564,7 +5606,8 @@ bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vec
         Loop.Body->push_back(CallStmt("BlueprintMapLibrary", "Map_Find", { Range, LocalArg(Key), LocalArg(Val) }));
         RefAlias[Bindings[0]->value("id", std::string())] = RefToLocal(Key, Args[0]);
         RefAlias[Bindings[1]->value("id", std::string())] = RefToLocal(Val, Args[1]);
-        if (StripTypeKeywords(TypeOf(*LoopDecl)) == TypeOf(*LoopDecl))       // no leading const
+        const std::string PairTy = TypeOf(*LoopDecl);
+        if (!PairTy.empty() && PairTy.back() == '&' && StripTypeKeywords(PairTy) == PairTy)   // `auto& [K, V]`
         {
             FStmtIR Back = CallStmt("BlueprintMapLibrary", "Map_Add", { Range, LocalArg(Key), LocalArg(Val) });
             Loop.Inc->push_back(Back);
@@ -5846,7 +5889,7 @@ bool FCompiler::HoistReadsInStmt(FStmtIR& St, FBlueprintClass& BP,
 {
     /* A while condition runs every iteration, but hoisted statements land before the loop. So a condition that
        needs them becomes `while (true) { if (!Cond) break; ... }`, and they land inside. */
-    if (St.K == FStmtIR::While && ContainsRead(St.Cond))
+    if (St.K == FStmtIR::While && !St.bPostTest && ContainsRead(St.Cond))
     {
         FStmtIR Exit;
         Exit.K = FStmtIR::If;
@@ -5865,6 +5908,12 @@ bool FCompiler::HoistReadsInStmt(FStmtIR& St, FBlueprintClass& BP,
     if (St.Body) if (!HoistReadsInList(*St.Body, BP, Locals, Err)) return false;
     if (St.Inc) if (!HoistReadsInList(*St.Inc, BP, Locals, Err)) return false;
     if (St.Trailer) if (!HoistReadsInList(*St.Trailer, BP, Locals, Err)) return false;
+    if (St.K == FStmtIR::While && St.bPostTest && ContainsRead(St.Cond))
+    {
+        /* do/while: the test follows Inc, which `continue` lands on too, so what it needs is computed there. */
+        if (!St.Inc) St.Inc = std::make_shared<std::vector<FStmtIR>>();
+        if (!HoistReadsInArg(St.Cond, BP, Locals, *St.Inc, Err)) return false;
+    }
 
     if (!HoistReadsInArg(St.Var,   BP, Locals, OutPre, Err)) return false;
     if (!HoistReadsInArg(St.Value, BP, Locals, OutPre, Err)) return false;
@@ -6995,12 +7044,26 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         return Star == std::string::npos ? nullptr
                                          : Find(StripTypeKeywords(TypeOf(*F).substr(0, Star)));
     };
+    /* The override is an export of the parent CDO's subobject's own name and exact class, or FLinkerLoad::CreateExport
+       makes a new component beside it. Neither is the member's: ACharacter's CapsuleComponent is CollisionCylinder, and
+       a subclass can swap the class (APlayerCharacter's CharMoveComp). The nearest engine class's CDO says which. */
+    const FRecord* EngineParent = Find(R.Base);
+    while (EngineParent && EngineParent->UePackage.compare(0, 8, "/Script/") != 0) EngineParent = Find(EngineParent->Base);
     for (const auto& Entry : SubobjectDefaults)
     {
-        const FRecord* CR = ComponentClassOf(*Entry.second.Owner, Entry.first);
-        if (!CR || !CR->IsNative())
-        { *Err = R.CppName + "::UE_DEFAULTS: cannot resolve the class of " + Entry.first; return false; }
-        BP.AddSubobjectOverride(Entry.first, BP.EngineClass(CR->UePackage, CR->UeName),
+        const std::string* Sub = nullptr;
+        if (EngineParent)
+            if (auto It = EngineParent->Subobjects.find(Entry.first); It != EngineParent->Subobjects.end()) Sub = &It->second;
+        const size_t Space = Sub ? Sub->find(' ') : std::string::npos;
+        const size_t Dot = Sub ? Sub->rfind('.') : std::string::npos;
+        if (Space == std::string::npos || Dot == std::string::npos || Dot < Space)
+        {
+            *Err = R.CppName + "::UE_DEFAULTS: UeApi does not say which default subobject " + Entry.first + " is on "
+                   + (EngineParent ? EngineParent->UeName : R.Base) + " - regenerate it with genueapi, which reads that off the object dump";
+            return false;
+        }
+        BP.AddSubobjectOverride(Sub->substr(0, Space), UeNameOf(Entry.second.Owner, Entry.first),
+                                BP.EngineClass(Sub->substr(Space + 1, Dot - Space - 1), Sub->substr(Dot + 1)),
                                 Entry.second.Defaults);
     }
     for (const auto& Entry : ComponentOverrides)

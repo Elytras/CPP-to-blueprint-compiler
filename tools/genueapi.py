@@ -441,6 +441,8 @@ DUMP_OBJECT = re.compile(r"^\[[0-9A-Fa-f]{8}\] \{0x[0-9A-Fa-f]+\} (\S+) (.*)$")
 FIELD_OFFSET = re.compile(r"^\s*0x([0-9A-Fa-f]+)\(0x[0-9A-Fa-f]+\)\(")
 REAL_FIELDS = {}     # "<class path>.<class name>" -> {offset: [property names, in the dump's order]}
 REAL_FUNCS = {}      # (SDK file stem, Dumper-7's class spelling, its function spelling) -> the engine's function name
+SUBOBJECTS = {}      # "<class path>.<class name>" -> [(subobject name, its class's name)] on that class's CDO
+DUMP_SUBOBJECT = re.compile(r"^(/Script/[^.]+)\.Default__([^.:]+)\.([^.:]+)$")
 NUMBER_WORDS = ("Zero", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine")
 
 
@@ -461,6 +463,9 @@ def read_real_fields(sdk_dir):
             continue
         m = DUMP_OBJECT.match(line)
         cur = REAL_FIELDS.setdefault(m.group(2).rstrip("\r\n"), {}) if m and m.group(1).endswith("Class") else None
+        sub = DUMP_SUBOBJECT.match(m.group(2).rstrip("\r\n")) if m else None
+        if sub:
+            SUBOBJECTS.setdefault(sub.group(1) + "." + sub.group(2), []).append((sub.group(3), m.group(1)))
 
 
 def dumper_spelling(real):
@@ -488,6 +493,37 @@ def real_field(k, fname):
 
 
 UNEXPLAINED = []
+
+
+def map_subobjects(classes, by_name):
+    """k.subobjects: each component member of native class k, its own or inherited -> "<name> <class path>" of the
+    default subobject it points at on k's CDO. A native parent's component is overridden by an export of exactly that
+    name and class (FLinkerLoad::CreateExport), which the member names neither of: ACharacter's CapsuleComponent is
+    Default__Character.CollisionCylinder, and APlayerCharacter's CharMoveComp is a PlayerMovementComponent. The dump
+    has no values, so a member is joined to the one subobject whose class is a kind of its type; one that two fit
+    (AActor's RootComponent) is left out unless one of them has its name."""
+    native = dict((k.ue_name, k) for k in classes if not k.is_bp)
+
+    def isa(k, cpp):
+        while k is not None and k.cpp != cpp:
+            k = by_name.get(k.base)
+        return k is not None
+
+    for k in classes:
+        k.subobjects = {}
+        subs = [] if k.is_bp else [(n, native[c]) for n, c in SUBOBJECTS.get(k.path + "." + k.ue_name, ()) if c in native]
+        o = k
+        while subs and o is not None:
+            for ftype, fname in o.fields:
+                t = re.match(r"(?:class)?(\w+)\*$", ftype.replace(" ", ""))
+                if not t or fname in k.subobjects:
+                    continue
+                fits = [(n, c) for n, c in subs if isa(c, t.group(1))]
+                if len(fits) > 1:
+                    fits = [(n, c) for n, c in fits if n == (real_field(o, fname) or fname)]
+                if len(fits) == 1:
+                    k.subobjects[fname] = "%s %s.%s" % (fits[0][0], fits[0][1].path, fits[0][1].ue_name)
+            o = by_name.get(o.base)
 
 
 def c_literal(s):
@@ -820,6 +856,7 @@ def main():
     unique = set(n for n, c in name_count.items() if c == 1)
 
     by_name = dict((k.cpp, k) for k in classes)
+    map_subobjects(classes, by_name)
     ordered, seen = [], set()
 
     def place(k):
@@ -975,6 +1012,9 @@ def main():
                     body.append('    static constexpr const char* %s__Replicated = "%s:";' % (fname, k.replicated[fname]))
                 fields += 1
                 referenced.update(class_refs(ftype))
+            for fname in sorted(k.subobjects):
+                # Which default subobject the member is, per class: a subclass can give it another class.
+                body.append('    static constexpr const char* %s__UeSubobject = "%s";' % (fname, k.subobjects[fname]))
             for is_static, ret, fname, params in k.funcs:
                 if is_container_method(k, fname):
                     continue

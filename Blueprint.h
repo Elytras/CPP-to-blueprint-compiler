@@ -100,7 +100,7 @@ public:
     DefaultSubObject and a null template (the engine resolves the archetype through the parent CDO's
     subobject of the same name), plus an ObjectProperty tag of that name on the CDO.
     */
-    void AddSubobjectOverride(const std::string& Name, FIndex ComponentClass,
+    void AddSubobjectOverride(const std::string& Name, const std::string& Property, FIndex ComponentClass,
                               const std::vector<FPropertyDef>& Defaults);
 
     /* A tag on this class's CDO for a property an ancestor declares, which a member initializer
@@ -180,7 +180,8 @@ private:
 
     struct FSubobjectOverride
     {
-        std::string Name;
+        std::string Name;          // the subobject's, which the export takes
+        std::string Property;      // the CDO's property that points at it
         FIndex Class;
         std::vector<FPropertyDef> Defaults;
     };

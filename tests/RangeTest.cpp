@@ -58,13 +58,14 @@ public:
 
   int32 BumpScores(int32 Stop) {
     int32 Count = 0;
-    for (auto [Key, Value] : Scores) {
+    for (auto &[Key, Value] : Scores) {
       Value += 10;
       Count++;
       if (Value > Stop) break;
     }
+    for (auto [Key, Value] : Scores) Value += 1000; // a copy: the map keeps its values
     int32 Total = 0;
-    for (const auto [Key, Value] : Scores) Total += Value;
+    for (const auto &[Key, Value] : Scores) Total += Value;
     return Total * 100 + Count;
   }
 };

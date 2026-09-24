@@ -28,13 +28,15 @@ class SpawnTest : public AActor {
 
 public:
   void ReceiveBeginPlay() {
+    if (Tag == 7) // the twin: FinishSpawning runs its BeginPlay, which would spawn a twin of its own
+      return;
     FTransform Where = FVector(0.0f, 0.0f, 100.0f);
     Spawned = SpawnActor<AActor>(AActor::StaticClass(), Where, this);
     SpawnTest *Twin = SpawnActorDeferred<SpawnTest>(SpawnTest::StaticClass(), Where);
     Twin->Tag = 7;
     FinishSpawning(Twin, Where);
-    Made = NewObject<UObject>(this);
-    Widget = CreateWidget<UUserWidget>(nullptr, UUserWidget::StaticClass());
+    Made = NewObject<USpawnProbe>(this);
+    Widget = CreateWidget<UUserWidget>(nullptr, UUserWidget::StaticClass()); // abstract: null in game, the call is the test
     Part = AddComponentByType<USceneComponent>(this);
     AttachToComponent(Part, K2_GetRootComponent());
     USceneComponent *Late = AddComponentDeferred<USceneComponent>(this);
