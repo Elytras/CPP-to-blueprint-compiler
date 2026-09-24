@@ -62,6 +62,9 @@ class Hello : public AActor {
 };
 ```
 
+A variable outside any class, such as `int32 Total = 0;` at namespace scope, is shared by every class that uses
+it. The compiler keeps it in the default object of a class it generates for that variable.
+
 Several mods, only rebuilding what changed, packed into paks:
 
 ```
@@ -116,7 +119,8 @@ Under Proton the game reads paks from
    extract `FSD/AssetRegistry.bin` from the game's pak
    (`UnrealPak <pak> -Extract <dir> -Filter=*AssetRegistry.bin`), then
    `python tools/genueassets.py <dir>/FSD/AssetRegistry.bin <UeApi dir> <UeAssets dir>`. Put `UeAssets/` beside
-   `UeApi/` so a mod can `#include "UeAssets/USoundWave.h"`.
+   `UeApi/` so a mod can `#include "UeAssets/USoundWave.h"`. `UeAssets::USoundWave::All` is every one of them,
+   as soft pointers.
 
 ## Tests
 
