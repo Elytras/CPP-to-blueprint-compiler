@@ -68,6 +68,9 @@ class TypesTest : public AActor, public ITargetable {
 public:
   int32 ConstSum(int32 N) { return N * kStep + kSlots + kMask; }
   float HalfOf(float V) { return V * kHalf; }
+  /* Signed >> floors: -3 >> 1 is -2, where a plain divide by 2 gives -1. */
+  int32 ShrBy(int32 X, int32 M) { return M == 1 ? X >> 1 : M == 4 ? X >> 4 : X >> 31; }
+  int64 Shr64(int64 X, int32 M) { return M == 1 ? X >> 1 : X >> 63; }
 
   /* A null interface is EX_NoInterface: EX_NoObject would set half of the 16 bytes. */
   void Forget() {
