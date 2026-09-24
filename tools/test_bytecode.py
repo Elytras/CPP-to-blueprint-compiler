@@ -1255,6 +1255,10 @@ def static_assets():
     cdo = {k: bytes.fromhex(v.split()[-1]) if k != 'Picked' else int(v.split()[-1]) for k, v in tags_of('AssetUser', exports_of(user).index('Default__AssetUser_C')).items()}
     assert ref(user, cdo['Picked']) == MOD + 'MD_Big.MD_Big', cdo
     assert objs('AssetUser', cdo['Enemies'].hex()) == ['/Game/Enemies/Spider/Grunt/ED_Spider_Grunt.ED_Spider_Grunt', MOD + 'ED_AssetTest.ED_AssetTest'], cdo
+    # One name in two namespaces is two assets; a Package.Object path imports that object from that package.
+    assert objs('AssetUser', cdo['Picks'].hex()) == [
+        '/Game/Enemies/Spider/Grunt/ED_Spider_Grunt.ED_Spider_Grunt', '/Game/Enemies/Spider/Exploder/ED_Spider_Exploder.ED_Spider_Exploder',
+        '/Game/Art/Environments/Holiday_GreatEggHunt/SK_greatEggHunt_bunnyPlush.SK_GreatEggHunt_BunnyPlush'], cdo
     tags = struct.unpack_from('<6i', cdo['Tags'])                                    # removed, count, (FName) x 2
     assert tags[:2] == (0, 2) and [names[tags[2]], names[tags[4]]] == ['big', 'calm'], tags
     m = struct.unpack_from('<8i', cdo['ByName'])                                     # removed, count, (FName, object) x 2
@@ -1282,6 +1286,32 @@ def static_assets():
     print('ok  AssetTest: the asset registry lists every asset with its class')
 
 
+def ue_assets():
+    """genueassets names each asset a registry lists by its content path, one header per class; a mod reaching one
+    through that header imports exactly that object. The registry here is AssetTest's, the game's in real use."""
+    import tempfile
+    with tempfile.TemporaryDirectory(dir=TESTS) as tmp:
+        out = os.path.join(tmp, 'UeAssets')
+        proc = subprocess.run([sys.executable, os.path.join(HERE, 'genueassets.py'), registry_of('AssetTest'), UEAPI, out],
+                              capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        h = open(os.path.join(out, 'UEnemyDescriptor.h'), encoding='utf-8-sig').read()
+        assert 'UE_ASSET_AT(::UEnemyDescriptor, ED_AssetTest, "/Game/_ElytrasMods/AssetTest/ED_AssetTest");' in h, h
+        assert not os.path.exists(os.path.join(out, 'UBlueprintGeneratedClass.h')), os.listdir(out)
+        with open(os.path.join(tmp, 'UeAssetsUser.cpp'), 'w') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeAssets/UEnemyDescriptor.h"\n'
+                    'UE_MOD_PACKAGE("/Game/_ElytrasMods/UeAssetsUser");\n'
+                    'class UeAssetsUser : public AActor {\npublic:\n'
+                    '  UEnemyDescriptor *Ed = &UeAssets::UEnemyDescriptor::Game::_ElytrasMods::AssetTest::ED_AssetTest;\n};\n')
+        proc = subprocess.run([ASSETGEN, 'compile', os.path.join(tmp, 'UeAssetsUser.cpp'), UEAPI, tmp], capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        user = os.path.join(tmp, 'UeAssetsUser')
+        cdo = dump('dumptags.py', user, exports_of(user).index('Default__UeAssetsUser_C'))
+        ed = int(re.search(r'Ed \[0\] ObjectProperty size=4: index (-?\d+)', cdo).group(1))
+        assert ref(user, ed) == '/Game/_ElytrasMods/AssetTest/ED_AssetTest.ED_AssetTest', cdo
+    print('ok  genueassets: a header per class names each asset by its path, and a mod reaches one through it')
+
+
 interfaces()
 interface_bodies()
 interface_calls()
@@ -1291,6 +1321,7 @@ engine_names()
 object_forwards()
 api_stub()
 static_assets()
+ue_assets()
 
 
 # ---- ReplTest, LatentTest, AsyncTest, SpawnTest

@@ -41,10 +41,22 @@ UE_ASSET_AT(UEnemyDescriptor, ED_Spider_Grunt, "/Game/Enemies/Spider/Grunt/ED_Sp
 UEnemyDescriptor ED_AssetTest = {.VeteranClasses = {&ED_Spider_Grunt}, .SpawnSpread = 250.0f, .IdealSpawnSize = 4,
                                  .CanBeUsedForConstantPressure = true};
 
+/* Named in a namespace, as the UeAssets headers do - there the class is `::UEnemyDescriptor`, since the namespace
+   named after it hides it - so one name can mean two assets. A path can name an object that is not its package's
+   namesake, here a mesh spelled otherwise than its package. */
+namespace UeAssets::UEnemyDescriptor::Game::Enemies::Spider {
+namespace Grunt { UE_ASSET_AT(::UEnemyDescriptor, Spider, "/Game/Enemies/Spider/Grunt/ED_Spider_Grunt"); }
+namespace Exploder { UE_ASSET_AT(::UEnemyDescriptor, Spider, "/Game/Enemies/Spider/Exploder/ED_Spider_Exploder"); }
+}
+UE_ASSET_AT(USkeletalMesh, BunnyPlush,
+            "/Game/Art/Environments/Holiday_GreatEggHunt/SK_greatEggHunt_bunnyPlush.SK_GreatEggHunt_BunnyPlush");
+
 class AssetUser : public AActor {
 public:
   UMoodDef                   *Picked = &MD_Big;
   TArray<UEnemyDescriptor *>  Enemies = {&ED_Spider_Grunt, &ED_AssetTest};
+  TArray<UObject *>           Picks = {&UeAssets::UEnemyDescriptor::Game::Enemies::Spider::Grunt::Spider,
+                                       &UeAssets::UEnemyDescriptor::Game::Enemies::Spider::Exploder::Spider, &BunnyPlush};
   TSet<FName>                 Tags = {"big", "calm"};
   TMap<FName, UMoodDef *>     ByName = {{"big", &MD_Big}, {"calm", &MD_Calm}};
   TMap<int32, float>          Scale = {{1, 0.5f}, {2, -2.0f}};
