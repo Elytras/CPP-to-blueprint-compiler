@@ -3524,19 +3524,37 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             if (N < 0 || N > 63)
             { *Err = "bit shift amount out of range: " + std::to_string(N); return false; }
             const bool bWide = Flavour == "Int64Int64";
-            const std::string MathFn = (Op == "<<" ? "Multiply_" : "Divide_") + std::string(bWide ? "Int64Int64" : "IntInt");
-            Out.K = FArgIR::Call;
-            Out.Sub = std::make_shared<FCallIR>();
-            Out.Sub->Fn = BP.EngineFunction("/Script/Engine", "KismetMathLibrary", MathFn);
-            Out.Sub->bScript = false;
-            Out.Sub->bPure = true;
-            FArgIR LA, RA;
+            const std::string Suffix = bWide ? "Int64Int64" : "IntInt";
+            auto Const = [&](int64 V) {
+                FArgIR C;
+                C.K = bWide ? FArgIR::Int64 : FArgIR::Int;
+                C.I = int32(V);
+                C.I64 = V;
+                return C;
+            };
+            auto Math = [&](const std::string& Fn, FArgIR A, FArgIR B) {
+                FArgIR C;
+                C.K = FArgIR::Call;
+                C.Sub = std::make_shared<FCallIR>();
+                C.Sub->Fn = BP.EngineFunction("/Script/Engine", "KismetMathLibrary", Fn + Suffix);
+                C.Sub->bScript = false;
+                C.Sub->bPure = true;
+                C.Sub->Args = { std::move(A), std::move(B) };
+                return C;
+            };
+            FArgIR LA;
             if (!LowerArg(*LhsRaw, BP, LA, Err)) return false;
-            RA.K = bWide ? FArgIR::Int64 : FArgIR::Int;
-            RA.I = int32(1LL << N);
-            RA.I64 = 1LL << N;
-            Out.Sub->Args.push_back(std::move(LA));
-            Out.Sub->Args.push_back(std::move(RA));
+            const std::string LhsBare = StripTypeKeywords(LhsTy);
+            const bool bSigned = LhsBare.find("unsigned") == std::string::npos && LhsBare.compare(0, 4, "uint") != 0;
+            if (Op == ">>" && bSigned && N > 0)
+            {
+                /* Signed >> floors, Divide truncates toward zero (-3 >> 1 is -2, -3 / 2 is -1): clearing the low
+                   N bits first makes the division exact. At N = width-1 the divisor wraps to MIN, which negates. */
+                Out = Math("Divide_", Math("And_", std::move(LA), Const(~((1LL << N) - 1))), Const(1LL << N));
+                if (N == (bWide ? 63 : 31)) Out = Math("Multiply_", std::move(Out), Const(-1));
+                return true;
+            }
+            Out = Math(Op == "<<" ? "Multiply_" : "Divide_", std::move(LA), Const(1LL << N));
             return true;
         }
         const std::string MathFn = MathFuncFor(Op, Flavour);
