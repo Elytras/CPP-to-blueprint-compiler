@@ -63,13 +63,6 @@ const FCrcTables& Crc()
     return Tables;
 }
 
-std::string Lower(const std::string& S)
-{
-    std::string R = S;
-    for (char& C : R) if (C >= 'A' && C <= 'Z') C = char(C - 'A' + 'a');
-    return R;
-}
-
 std::string GuidString(const uint32 (&G)[4])
 {
     static const char* const Hex = "0123456789ABCDEF";
@@ -88,6 +81,13 @@ void WriteFString(std::vector<uint8>& B, const std::string& S)
     B.push_back(0);
 }
 }   // namespace
+
+std::string Lower(const std::string& S)
+{
+    std::string R = S;
+    for (char& C : R) if (C >= 'A' && C <= 'Z') C = char(C - 'A' + 'a');
+    return R;
+}
 
 void SplitName(const std::string& S, std::string& OutBase, int32& OutNumber)
 {

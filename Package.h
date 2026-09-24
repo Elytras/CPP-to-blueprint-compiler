@@ -138,6 +138,9 @@ private:
     std::vector<FRegistryObject> RegistryObjects;
 };
 
+/* ASCII lowercase: FName and package-name comparisons are case-insensitive. */
+std::string Lower(const std::string& S);
+
 /* FName number convention: "SCS_Node_0" is base "SCS_Node" number 1. Trailing "_<digits>" only, no leading zeros. */
 void SplitName(const std::string& S, std::string& OutBase, int32& OutNumber);
 

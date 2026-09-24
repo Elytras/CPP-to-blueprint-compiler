@@ -179,10 +179,10 @@ void FBlueprintClass::AddComponent(const std::string& Name, FIndex ComponentClas
     Components.push_back(FComponent{ Name, ComponentClass, ComponentCdo, bIsSceneComponent, Defaults });
 }
 
-void FBlueprintClass::AddSubobjectOverride(const std::string& Name, FIndex ComponentClass,
+void FBlueprintClass::AddSubobjectOverride(const std::string& Name, const std::string& Property, FIndex ComponentClass,
                                            const std::vector<FPropertyDef>& Defaults)
 {
-    SubobjectOverrides.push_back(FSubobjectOverride{ Name, ComponentClass, Defaults });
+    SubobjectOverrides.push_back(FSubobjectOverride{ Name, Property, ComponentClass, Defaults });
 }
 
 void FBlueprintClass::AddComponentOverride(const std::string& Name, FIndex ComponentClass, FIndex ParentTemplate,
@@ -331,7 +331,7 @@ void FBlueprintClass::Finish()
     const bool bCdoReplicates = bReplicates;
     const std::vector<FPropertyDef> Inherited = CdoDefaults;
     std::vector<std::string> SubobjectNames;
-    for (const FSubobjectOverride& O : SubobjectOverrides) SubobjectNames.push_back(O.Name);
+    for (const FSubobjectOverride& O : SubobjectOverrides) SubobjectNames.push_back(O.Property);
     for (size_t I = 0; I < SubobjectOverrides.size(); ++I) Cdo.CreateBeforeSer.push_back(Exp(RowFirstSubobject + int32(I)).V);
     Cdo.Serialize = [=](FArc& Ar) {
         if (bCdoReplicates) TagBool(Ar, "bReplicates", true);
@@ -346,7 +346,7 @@ void FBlueprintClass::Finish()
         /* A property an ancestor declares: UE_DEFAULTS writes it here, where re-declaring the name
            would instead shadow it with a second property of the same name on this class. */
         for (const FPropertyDef& V : Inherited) WriteDefaultTag(Ar, V);
-        /* Each overridden native subobject is reachable from the CDO by its own name, as
+        /* Each overridden native subobject is reachable from the CDO through its property, as
            Default__Ene_Butterfly_C points at its HealthComponent export. */
         for (size_t I = 0; I < SubobjectNames.size(); ++I)
             Tag(Ar, SubobjectNames[I], "ObjectProperty",
@@ -429,12 +429,13 @@ void FBlueprintClass::Finish()
 
     /*
     One archetype + one node per UE_COMPONENT, in declaration order. Measured on DRG's Ene_Butterfly:
-    the node carries ComponentClass / ComponentTemplate / VariableGuid / InternalVariableName, and a
-    node attached to something names it in ParentComponentOrVariableName with bIsParentComponentNative.
+    the node carries ComponentClass / ComponentTemplate / VariableGuid / InternalVariableName.
     USimpleConstructionScript::ExecuteScriptOnActor walks RootNodes in order, passing a null parent
-    for the first scene component - which makes it the actor's root - and resolving a non-native
-    parent name through the class variable the earlier node already filled in. So a flat RootNodes
-    list with every later scene component parented to the first reproduces the editor's hierarchy.
+    for the first scene component, which makes it the actor's root, and USCS_Node::ExecuteNodeOnActor
+    attaches each of a node's ChildNodes to it. So every later scene component is a child of the first.
+    Not a root node naming it in ParentComponentOrVariableName: the SCS's PostLoad
+    (FixupRootNodeParentReferences, cooked builds too) looks such a name up only among native components
+    and ancestor Blueprints' nodes, and clears it when the parent is a node of this same SCS.
     */
     const int32 FirstScene = int32(std::find_if(Components.begin(), Components.end(),
                                                 [](const FComponent& C) { return C.bIsScene; })
@@ -463,8 +464,10 @@ void FBlueprintClass::Finish()
 
         uint32 NodeGuid[4];
         ScsNodeGuid(ClassName, C.Name, NodeGuid);
-        const bool bAttached = C.bIsScene && int32(I) != FirstScene;
-        const std::string ParentName = bAttached ? Components[size_t(FirstScene)].Name : std::string();
+        const bool bParent = int32(I) == FirstScene;
+        std::vector<FIndex> Children;
+        for (size_t J = 0; bParent && J < Components.size(); ++J)
+            if (Components[J].bIsScene && J != I) Children.push_back(Exp(RowFirstComponent + 2 * int32(J) + 1));
         const FIndex CompClass = C.Class;
         const std::string VarName = C.Name;
 
@@ -475,17 +478,17 @@ void FBlueprintClass::Finish()
         Node.ObjectName = "SCS_Node_" + std::to_string(I + 1);
         Node.ObjectFlags = RF_Transactional;
         Node.CreateBeforeSer = { Exp(RowTemplate).V, CompClass.V };
+        for (const FIndex& Child : Children) Node.CreateBeforeSer.push_back(Child.V);
         Node.SerBeforeCreate = { ScsNodeClass.V, ScsNodeCdo.V };
         Node.CreateBeforeCreate = { Exp(RowScs).V };
         Node.Serialize = [=](FArc& Ar) {
             Tag(Ar, "ComponentClass", "ObjectProperty", [=](FArc& V) { V.Idx(CompClass); });
             Tag(Ar, "ComponentTemplate", "ObjectProperty", [=](FArc& V) { V.Idx(Exp(RowTemplate)); });
-            if (bAttached)
-            {
-                Tag(Ar, "ParentComponentOrVariableName", "NameProperty",
-                    [=](FArc& V) { V.Name(ParentName); });
-                TagBool(Ar, "bIsParentComponentNative", false);
-            }
+            if (!Children.empty())
+                Tag(Ar, "ChildNodes", "ArrayProperty", [=](FArc& V) {
+                    V.I32(int32(Children.size()));
+                    for (const FIndex& Child : Children) V.Idx(Child);
+                }, "ObjectProperty");
             Tag(Ar, "VariableGuid", "StructProperty", [=](FArc& V) { V.Raw(NodeGuid, 16); }, "Guid");
             Tag(Ar, "InternalVariableName", "NameProperty", [=](FArc& V) { V.Name(VarName); });
             TagEnd(Ar);
@@ -506,18 +509,23 @@ void FBlueprintClass::Finish()
     Scs.SerBeforeCreate = { ScsClass.V, ScsCdo.V };
     Scs.CreateBeforeCreate = { Exp(RowClass).V };
     const int32 NumComponents = int32(Components.size());
+    std::vector<FIndex> Roots;                 // everything but the first scene component's children
+    for (size_t I = 0; I < Components.size(); ++I)
+        if (!Components[I].bIsScene || int32(I) == FirstScene) Roots.push_back(Exp(RowFirstComponent + 2 * int32(I) + 1));
     Scs.Serialize = [=](FArc& Ar) {
         /* DefaultSceneRoot stays declared but drops out of both lists once a component can be the
            root, exactly as Ene_Butterfly saves it; with no components at all the lists are absent
            and ExecuteScriptOnActor makes its own root. */
         if (NumComponents > 0)
         {
-            const auto Nodes = [=](FArc& V) {
+            Tag(Ar, "RootNodes", "ArrayProperty", [=](FArc& V) {
+                V.I32(int32(Roots.size()));
+                for (const FIndex& Root : Roots) V.Idx(Root);
+            }, "ObjectProperty");
+            Tag(Ar, "AllNodes", "ArrayProperty", [=](FArc& V) {
                 V.I32(NumComponents);
                 for (int32 I = 0; I < NumComponents; ++I) V.Idx(Exp(RowFirstComponent + 2 * I + 1));
-            };
-            Tag(Ar, "RootNodes", "ArrayProperty", Nodes, "ObjectProperty");
-            Tag(Ar, "AllNodes", "ArrayProperty", Nodes, "ObjectProperty");
+            }, "ObjectProperty");
         }
         Tag(Ar, "DefaultSceneRootNode", "ObjectProperty",
             [=](FArc& V) { V.Idx(Exp(RowScsNode)); });

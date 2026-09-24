@@ -31,7 +31,14 @@ class P(W):
         elif op in (4, 0x4E, 0x4F): k.append(s.node())
         elif op == 6: n.val = s.i32()
         elif op == 7: n.val = s.i32(); k.append(s.node())
-        elif op in (0xB, 0x16, 0x17, 0x25, 0x26, 0x27, 0x28, 0x2A, 0x4D, 0x53): pass
+        elif op in (0xB, 0x16, 0x17, 0x25, 0x26, 0x27, 0x28, 0x2A, 0x2D, 0x4D, 0x53): pass
+        elif op == 0x1F: n.val = s.cstr()
+        elif op == 0x29:                                             # TextConst: its source string stands for the text
+            n.val = s.u8()
+            if n.val == 1: k.extend(s.node() for _ in range(3))
+            elif n.val in (2, 3): k.append(s.node())
+            elif n.val != 0: raise SystemExit('unsupported text literal type %d at mem %d' % (n.val, mem))
+        elif op in (0x19, 0x1A): k.append(s.node()); s.i32(); s.fieldpath(); k.append(s.node())
         elif op == 0xF: s.fieldpath(); k.append(s.node()); k.append(s.node())
         elif op in (0x14, 0x5F, 0x6B): k.append(s.node()); k.append(s.node())
         elif op in (0x1B, 0x45): n.val = s.name(); s.args(k)
@@ -88,6 +95,26 @@ def params_of(base, function):
     return [name for name, flags in found if int(flags, 16) & 0x80 and not int(flags, 16) & 0x400]
 
 
+def props_of(base, function, _cache={}):
+    """The function's own properties (parms and locals), name -> FProperty class, off dumpstruct.py's top-level lines."""
+    import os, re, subprocess
+    if (base, function) not in _cache:
+        exports = dumpexp.load(base)[5]
+        idx = next(i for i, e in enumerate(exports) if e['name'] == function)
+        out = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dumpstruct.py'), base, str(idx)],
+                             capture_output=True, text=True).stdout
+        _cache[base, function] = dict((n, t) for t, n in re.findall(r'^  (\w+Property) (\w+) ', out, re.M))
+    return _cache[base, function]
+
+
+# A native writes its whole return type through RESULT_PARAM, so these put 4 bytes wherever they are evaluated into.
+INT32_RESULT = {'Add_IntInt', 'Subtract_IntInt', 'Multiply_IntInt', 'Divide_IntInt', 'Percent_IntInt', 'Not_Int', 'Or_IntInt',
+                'And_IntInt', 'Xor_IntInt', 'Conv_BoolToInt', 'Conv_ByteToInt', 'Conv_Int64ToInt'}
+# The operands that leave Stack.MostRecentPropertyAddress, which StructMemberContext and ArrayGetByRef offset into:
+# a call evaluated into nothing leaves none (and a native writes its result through a null RESULT_PARAM).
+ADDRESSABLE = {0, 1, 0x48, 0x42, 0x6B}
+
+
 def i32(v): return (v + 2**31) % 2**32 - 2**31
 def idiv(a, b): q = abs(a) // abs(b); return q if (a < 0) == (b < 0) else -q
 
@@ -109,7 +136,43 @@ MATH = {
     'Or_IntInt': lambda a, b: int(a) | int(b), 'And_IntInt': lambda a, b: int(a) & int(b), 'Xor_IntInt': lambda a, b: int(a) ^ int(b),
     'Conv_BoolToInt': int, 'Multiply_Int64Int64': lambda a, b: a * b, 'Conv_IntToInt64': int, 'Conv_Int64ToInt': lambda a: i32(a),
     'InRange_IntInt': lambda v, lo, hi, imin, imax: (v >= lo if imin else v > lo) and (v <= hi if imax else v < hi),
+    'Abs_Int': lambda a: i32(abs(a)), 'RandomInteger': lambda a: 0,     # RandomInteger: a stand-in; CALLS shows it ran
 }
+CALLS = []     # every library call run, as (name, args): a test can see an impure or kept call happen
+# A native int32 / uint8 parameter receives the low bytes of whatever the VM copies into it, so a wider value
+# handed to an _IntInt / _ByteByte function is truncated, as it is in the engine.
+for _k, _f in list(MATH.items()):
+    if _k.endswith('_IntInt'): MATH[_k] = (lambda f: lambda *a: f(*[i32(x) for x in a]))(_f)
+    elif _k.endswith('_ByteByte'): MATH[_k] = (lambda f: lambda *a: f(*[x & 0xFF for x in a]))(_f)
+
+
+def sanitize_float(v):
+    t = ('%f' % (v or 0.0)).rstrip('0')
+    return t + '0' if t.endswith('.') else t
+
+
+def atoi(t):
+    import re
+    m = re.match(r'\s*[+-]?\d+', t)
+    return i32(int(m.group())) if m else 0
+
+
+def int64_to_text(v, sign, grouping, lo, hi):
+    t = ('{:,}' if grouping else '{}').format(abs(v)).rjust(lo, '0')
+    return ('-' if v < 0 else '+' if sign else '') + t
+
+
+# Strings, names and texts are Python str (FName and FString == compare case-insensitively). Objects: SELF is the
+# running object, None is null. A few engine calls the test mods make are stubbed: MESSAGES collects PostGameMessage.
+SELF, GAME_STATE, MESSAGES = 'Self', 'GameState', []
+MATH.update({
+    'Concat_StrStr': lambda a, b: a + b, 'EqualEqual_StriStri': lambda a, b: a.lower() == b.lower(),
+    'Conv_IntToString': str, 'Conv_FloatToString': sanitize_float, 'Conv_BoolToString': lambda b: 'true' if b else 'false',
+    'Conv_StringToInt': atoi, 'Conv_Int64ToText': int64_to_text, 'Conv_ObjectToString': lambda o: str(o) if o else 'None',
+    'Conv_StringToName': str, 'Conv_NameToString': str, 'Conv_NameToText': str, 'Conv_StringToText': str, 'Conv_TextToString': str,
+    'EqualEqual_ObjectObject': lambda a, b: a == b, 'NotEqual_ObjectObject': lambda a, b: a != b, 'IsValid': bool,
+    'GetFSDGameState': lambda world: GAME_STATE, 'PostGameMessage': MESSAGES.append, 'GetTickableWhenPaused': lambda: False,
+})
 
 
 # Container library calls see their argument NODES, so an out-parm can be written. A TSet is a list of
@@ -142,9 +205,20 @@ def run(base, function, self_vars=None, **parms):
     env = dict(parms)
     flow = []
     self_vars = self_vars if self_vars is not None else {}
+    types = props_of(base, function)
+
+    def addressable(n):
+        if n.op in (0x42, 0x6B) and n.kids[0].op not in ADDRESSABLE:
+            raise SystemExit('op %02x at mem %d reads through op %02x, which leaves no address' % (n.op, n.mem, n.kids[0].op))
+
+    def fits(dest, v):
+        wide = v.op == 0x1D or v.op in (0x1C, 0x46, 0x68) and v.val in INT32_RESULT or v.op in (0, 0x48) and types.get(v.val) == 'IntProperty'
+        if wide and types.get(dest) == 'ByteProperty':
+            raise SystemExit('an int32 evaluated into the 1-byte %s at mem %d' % (dest, v.mem))
 
     def ev(n):
         o = n.op
+        addressable(n)
         if o in (0, 0x48): return env.get(n.val, 0)
         if o == 1: return self_vars.get(n.val, 0)
         if o in (0x1D, 0x1E, 0x24, 0x2C, 0x35, 0x21): return n.val
@@ -152,6 +226,13 @@ def run(base, function, self_vars=None, **parms):
         if o == 0x42:                                                # a struct is a dict; an unset member reads 0
             s = ev(n.kids[0])
             return s.get(n.val, 0) if isinstance(s, dict) else 0
+        if o == 0x1F: return n.val
+        if o == 0x29: return ev(n.kids[0]) if n.kids else ''
+        if o == 0x17: return SELF
+        if o in (0x2A, 0x2D): return None
+        if o in (0x19, 0x1A):                                        # a native call on another object; null skips it
+            if n.kids[1].op != 0x1C: raise SystemExit('unsupported context expression op %02x' % n.kids[1].op)
+            return ev(n.kids[1]) if ev(n.kids[0]) else 0
         if o == 0x25: return 0
         if o == 0x26: return 1
         if o == 0x27: return True
@@ -162,7 +243,9 @@ def run(base, function, self_vars=None, **parms):
         if o in (0x1C, 0x46, 0x68) and n.val in CONTAINERS: return CONTAINERS[n.val](ev, store, n.kids)
         if o in (0x1C, 0x46, 0x68):
             if n.val not in MATH: raise SystemExit('unsupported call ' + n.val)
-            return MATH[n.val](*[ev(a) for a in n.kids])
+            args = [ev(a) for a in n.kids]
+            CALLS.append((n.val, tuple(args)))
+            return MATH[n.val](*args)
         if o == 0x69:
             v = ev(n.kids[0])
             for key, res in n.val:
@@ -172,6 +255,7 @@ def run(base, function, self_vars=None, **parms):
 
     def store(dest, v):
         v = copy.deepcopy(v)
+        addressable(dest)
         if dest.op == 0x42 and dest.val == 'Value': store(dest.kids[0], v)
         elif dest.op == 0x42: _made(ev, store, dest.kids[0], {})[dest.val] = v
         elif dest.op in (0, 0x48): env[dest.val] = v
@@ -186,7 +270,9 @@ def run(base, function, self_vars=None, **parms):
         n = stmts[pc]
         o = n.op
         nxt = pc + 1
-        if o in (0xF, 0x14, 0x5F): store(n.kids[0], ev(n.kids[1]))
+        if o in (0xF, 0x14, 0x5F):
+            if n.kids[0].op in (0, 0x48): fits(n.kids[0].val, n.kids[1])
+            store(n.kids[0], ev(n.kids[1]))
         elif o == 6: nxt = at[n.val]
         elif o == 7:
             if not ev(n.kids[0]): nxt = at[n.val]
@@ -201,9 +287,10 @@ def run(base, function, self_vars=None, **parms):
         elif o == 0x4E: nxt = at[ev(n.kids[0])]
         elif o == 4:
             r = n.kids[0]
+            if r.op != 0xB: fits('ReturnValue', r)
             return (ev(r) if r.op != 0xB else None), env
         elif o == 0xB: pass
-        elif o in (0x1B, 0x45, 0x1C, 0x46, 0x68): ev(n)
+        elif o in (0x1B, 0x45, 0x1C, 0x46, 0x68, 0x19, 0x1A): ev(n)
         elif o == 0x53: raise SystemExit('ran off the end of the script')
         else: raise SystemExit('unsupported statement op %02x at mem %d' % (o, n.mem))
         pc = nxt
