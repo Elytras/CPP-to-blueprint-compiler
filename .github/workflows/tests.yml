@@ -1,0 +1,49 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The tests compile against the vanilla game SDK, which lives in its own repo.
+      - uses: actions/checkout@v4
+        with:
+          repository: Elytras/DRG-Blueprint-Cpp-SDK
+          path: sdk
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq cmake clang nlohmann-json3-dev
+          cmake -B build
+          cmake --build build -j
+          echo "ASSETGEN=build/assetgen" >> "$GITHUB_ENV"
+
+      - uses: microsoft/setup-msbuild@v2
+        if: runner.os == 'Windows'
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg" integrate install
+          msbuild AssetGen.sln -m -p:Configuration=Release -p:Platform=x64
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          "ASSETGEN=x64\Release\assetgen.exe" >> $env:GITHUB_ENV
+
+      - name: Test
+        shell: bash
+        run: |
+          clang++ --version
+          "$(command -v python3 || command -v python)" tools/test_bytecode.py --assetgen "$ASSETGEN" --ueapi sdk/UeApi

@@ -113,6 +113,18 @@ Under Proton the game reads paks from
    on the Windows drive or a copy of it.
 3. Copy the hand-written `UeMeta.h` and `Types.h` from [the SDK repo](https://github.com/Elytras/DRG-Blueprint-Cpp-SDK/tree/main/UeApi) into `<UeApi dir>`.
 
+## Tests
+
+```
+python tools/test_bytecode.py [--assetgen <assetgen binary>] [--ueapi <UeApi dir>]
+```
+
+compiles every mod in `tests/` and checks what a mod can observe: return values and side effects (run offline
+through `tools/runscript.py` / `tools/runvm.py`), and what the engine sees (exports, flags, property types,
+defaults, the registry). It never checks the exact bytecode, so an optimization that keeps the behaviour passes.
+CI runs it on Linux and Windows against the [SDK repo](https://github.com/Elytras/DRG-Blueprint-Cpp-SDK) on
+every push and pull request.
+
 ## Reporting bugs
 
 Use the **Compiler bug** issue form. It asks for everything needed to reproduce the bug: the AssetGen
