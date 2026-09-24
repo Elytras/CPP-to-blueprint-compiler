@@ -1302,14 +1302,55 @@ def ue_assets():
             f.write('#include "UeApi/Types.h"\n#include "UeAssets/UEnemyDescriptor.h"\n'
                     'UE_MOD_PACKAGE("/Game/_ElytrasMods/UeAssetsUser");\n'
                     'class UeAssetsUser : public AActor {\npublic:\n'
-                    '  UEnemyDescriptor *Ed = &UeAssets::UEnemyDescriptor::Game::_ElytrasMods::AssetTest::ED_AssetTest;\n};\n')
+                    '  UEnemyDescriptor *Ed = &UeAssets::UEnemyDescriptor::Game::_ElytrasMods::AssetTest::ED_AssetTest;\n'
+                    '  int32 Count() { return UeAssets::UEnemyDescriptor::All.Num(); }\n};\n')
         proc = subprocess.run([ASSETGEN, 'compile', os.path.join(tmp, 'UeAssetsUser.cpp'), UEAPI, tmp], capture_output=True, text=True)
         assert proc.returncode == 0, proc.stdout + proc.stderr
         user = os.path.join(tmp, 'UeAssetsUser')
         cdo = dump('dumptags.py', user, exports_of(user).index('Default__UeAssetsUser_C'))
         ed = int(re.search(r'Ed \[0\] ObjectProperty size=4: index (-?\d+)', cdo).group(1))
         assert ref(user, ed) == '/Game/_ElytrasMods/AssetTest/ED_AssetTest.ED_AssetTest', cdo
-    print('ok  genueassets: a header per class names each asset by its path, and a mod reaches one through it')
+        assert global_default(tmp, 'UeAssets__UEnemyDescriptor__All', 'All') == ['/Game/_ElytrasMods/AssetTest/ED_AssetTest.ED_AssetTest']
+    print('ok  genueassets: a header per class names each asset by its path, and a mod reaches one, or All, through it')
+
+
+def global_default(folder, cls, member):
+    """The default a generated global class holds: a soft path (list) decoded from its FName indices, else the tag."""
+    import struct
+    base = os.path.join(folder, cls)
+    tags = dump('dumptags.py', base, exports_of(base).index('Default__%s_C' % cls))
+    m = re.search(r'^  %s \[0\] (\w+) size=\d+( inner=\w+)?: (.*)$' % member, tags, re.M)
+    if not m: return None
+    if 'SoftObjectProperty' not in m.group(0): return m.group(3)
+    names, raw = dumpexp.load(base)[3], bytes.fromhex(m.group(3))
+    one = m.group(1) == 'SoftObjectProperty'                                # a lone FSoftObjectPath: FName, sub-path
+    at = [0] if one else range(4, 4 + 12 * struct.unpack_from('<i', raw)[0], 12)
+    paths = [names[struct.unpack_from('<i', raw, o)[0]] for o in at]
+    return paths[0] if one else paths
+
+
+def globals_():
+    """GlobalTest: each namespace-scope variable a function uses is the one member of a class generated for it,
+    <Ns>__<Name>, whose default object holds the initializer. Every class of the mod reads and writes that one object.
+    UE_ASSET_ALL's All lists, as soft paths, the UE_ASSET_ATs under its namespace whose class is its element class."""
+    folder = os.path.dirname(asset('GlobalTest'))
+    assert global_default(folder, 'Counter', 'Counter') == '5'
+    assert global_default(folder, 'Greeting', 'Greeting') == "'hi'"
+    assert global_default(folder, 'Tally__Hits', 'Hits') is None           # zero, as a C++ global with no initializer
+    picks = global_default(folder, 'Picks__All', 'All')
+    assert sorted(picks) == ['/Game/Enemies/Spider/Exploder/ED_Spider_Exploder.ED_Spider_Exploder',
+                             '/Game/Enemies/Spider/Grunt/ED_Spider_Grunt.ED_Spider_Grunt'], picks   # not the texture
+    web = '/Game/LevelElements/RoomObjects/Hazards/StickySpiderWeb/T_StickySpiderWeb_Corner'
+    assert global_default(folder, 'GlobalTest', 'WebIcon') == web + '.T_StickySpiderWeb_Corner'
+    print('ok  GlobalTest: each global is its own class\'s default, its initializer; All is its namespace\'s assets of its class')
+    # Run: the default objects as their cooked defaults say, shared by both classes.
+    objs = {'Default__Counter_C': Obj('Counter_C', Counter=5), 'Default__Greeting_C': Obj('Greeting_C', Greeting='hi'),
+            'Default__Tally__Hits_C': Obj('Tally__Hits_C'), 'Default__Picks__All_C': Obj('Picks__All_C', All=list(picks))}
+    vm, peer = VM(asset('GlobalTest'), objects=objs), VM(os.path.join(folder, 'GlobalPeer'), objects=objs)
+    assert [vm.call('Bump', 2), vm.call('Bump', 3), peer.call('Read')] == [7, 10, 1002]
+    assert [vm.call('Take'), vm.call('Take'), peer.call('Read')] == [10, 11, 1202]     # Counter++ is the value before
+    assert vm.call('Greet') == 'hi!' and vm.call('PickCount') == 2 and vm.call('FirstPick') == picks[0]
+    print('ok  GlobalTest: both classes read and write the one object: =, op=, ++ and a postfix value')
 
 
 interfaces()
@@ -1322,6 +1363,7 @@ object_forwards()
 api_stub()
 static_assets()
 ue_assets()
+globals_()
 
 
 # ---- ReplTest, LatentTest, AsyncTest, SpawnTest
