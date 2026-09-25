@@ -36,6 +36,8 @@ class StructTest : public AActor {
   TSet<int32> Seen;
   TSet<int32> Fresh;
   TMap<int32, int32> Scores;
+  /* A designated default may leave members out: each takes zero, or its own default. */
+  FNested Deep = { .Inner = { .Time = 1.5f }, .Stamp = 7 };
 
 public:
   /*

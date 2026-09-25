@@ -8,7 +8,7 @@ function a call reaches). Never the bytecode's shape: an optimization that keeps
 
 --assetgen defaults to the first build found (ue-mods x64/Release, this repo's x64/Release, a CMake build/);
 --ueapi to ue-mods' BpMods/UeApi. Outside ue-mods, pass the UeApi of https://github.com/Elytras/DRG-Blueprint-Cpp-SDK."""
-import copy, glob, os, re, shutil, subprocess, sys
+import copy, glob, itertools, os, re, shutil, subprocess, sys
 os.environ['PYTHONIOENCODING'] = 'utf-8'   # the dump tools print non-ASCII names; read back as UTF-8, not the code page
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import runscript
@@ -1183,6 +1183,13 @@ def struct_behaviour():
                              'Moody': {'Mood': 0, 'Level': 2}}, base_names(f)
     assert runscript.MESSAGES == [], runscript.MESSAGES
     print('ok  StructTest.ReceiveBeginPlay: member stores, whole-struct copies, nested members')
+    base = asset('StructTest')
+    lines = dump('dumptags.py', base, [e['name'] for e in dumpexp.load(base)[5]].index('Default__StructTest_C')).split('\n')
+    at = next(i for i, l in enumerate(lines) if l.startswith('  Deep [0] StructProperty'))
+    deep = [l.strip() for l in itertools.takewhile(lambda l: l.startswith('    '), lines[at + 1:]) if 'StructProperty' not in l]
+    assert deep == ['Kills [0] IntProperty size=4: 0', 'Time [0] FloatProperty size=4: 1.5', 'Alive [0] BoolProperty size=0 value=0:',
+                    'Owner [0] ObjectProperty size=4: index 0', 'Stamp [0] Int64Property size=8: 7'], deep
+    print('ok  StructTest: a designated member default gives the members it leaves out zero')
 
 
 def pointer_behaviour():

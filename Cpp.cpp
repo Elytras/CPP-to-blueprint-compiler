@@ -7069,7 +7069,9 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
         Init = Strip(First(*Init));
         K = Init ? Kind(*Init) : std::string();
     }
-    if (!bNeg && (K == "CXXNullPtrLiteralExpr" || (K == "CXXConstructExpr" && !First(*Init)))) return true;
+    /* A member `{ .Q = 9 }` leaves unwritten (with no default of its own) is ImplicitValueInitExpr: zero. */
+    if (!bNeg && (K == "CXXNullPtrLiteralExpr" || K == "ImplicitValueInitExpr" || (K == "CXXConstructExpr" && !First(*Init))))
+        return true;
 
     /* A struct value: `FFloatInterval(1, 5)` or `{1, 5}`, one argument per member in declaration
        order. The members go on the property, each with its own default, and the writer turns them
@@ -7095,8 +7097,10 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
             if (!TypeToProperty(TypeOf(*SR->Fields[I]), MName, 0, "member " + MName + " of " + SR->CppName,
                                 BP, &MD, Err))
                 return false;
-            /* Every member is written, so a zero is a value here and not "leave it out". */
-            if (!LowerDefault(*SR->Fields[I], MD, BP, Err, Args[I], /*bKeepZero=*/true)) return false;
+            /* Every member is written, so a zero is a value here and not "leave it out". One the braces leave out
+               but that has a default of its own (CXXDefaultInitExpr) takes that default, as in C++. */
+            const Json* A = Kind(*Args[I]) == "CXXDefaultInitExpr" ? nullptr : Args[I];
+            if (!LowerDefault(*SR->Fields[I], MD, BP, Err, A, /*bKeepZero=*/true)) return false;
             Members->push_back(MD);
         }
         PD.Members = Members;
