@@ -1007,6 +1007,9 @@ def types_behaviour():
     below = [f32(v) for v in (0.99999994, 7.9999995, -0.99999994, 3.9999998, 2.75, -2.75, 0.0, -1e9)]
     check('TypesTest', 'TruncOf', lambda X, M: int(X * 2 if M == 2 else X), [dict(X=x, M=m) for x in below for m in (0, 1, 2)])
     check('TypesTest', 'Trunc64Of', lambda X: int(X), [dict(X=x) for x in below + [f32(5e9), f32(-7.5e12)]])
+    s32 = lambda v: (v + 2**31) % 2**32 - 2**31
+    check('TypesTest', 'NarrowOf', lambda X, Y, M: [X & 0xFF, Y & 0xFF, s32(Y)][M],
+          [dict(X=x, Y=y, M=m) for x, y in zip(EDGE, (511, -1, 2**32 + 5, -2**63, 2**63 - 1, 300, 5000000000)) for m in range(3)])
     # Constants of an enum with no fixed type keep their value (they were bytes: 1000 read back as 232).
     check('TypesTest', 'AnonConst', lambda X, M: [min(X, 1000), wrap(X - 5), wrap(X * 70000), int(X == 70000), 1000][M],
           [dict(X=x, M=m) for x in EDGE + (500, 999, 1000, 1001, 5000, 69999, 70000) for m in range(5)])
@@ -1156,11 +1159,30 @@ def pointer_behaviour():
         runscript.MESSAGES.clear()
         run(asset('PointerTest'), 'Check', self_vars=f, bOk=ok, What='x')
         assert f == {'Failures': 2 if ok else 3} and runscript.MESSAGES == ([] if ok else ['PointerTest FAILED: x']), (ok, f)
+    # A byte read through int8* / signed char* sign-extends; through uint8* it does not.
+    addr, sb = 0x7FF600001000, lambda b: b - 256 if b > 127 else b
+    for pair in ((0xFF, 0xFF), (0x80, 0x7F), (0x05, 0xFE), (0x7F, 0x80), (0, 0)):
+        runscript.MEM.update({addr: pair[0], addr + 1: pair[1]})
+        got = [run(asset('PointerTest'), 'SignedByteMix', P=addr)[0], run(asset('PointerTest'), 'SignedByteNegative', P=addr)[0]]
+        got += [run(asset('PointerTest'), fn, P=addr, I=i)[0] for fn in ('SignedCharAt', 'UnsignedByteAt') for i in (0, 1)]
+        got += [run(asset('PointerTest'), fn, P=addr)[0] for fn in ('SignedByteAsUnsigned', 'SignedByteIsMax')]
+        want = [sb(pair[0]) * 3 + sb(pair[1]), sb(pair[0]) < 0, sb(pair[0]), sb(pair[1]), pair[0], pair[1]]
+        want += [pair[0] * 1000 + pair[1], pair[0] == 255]
+        assert got == want, (pair, got, want)
+    runscript.MEM.clear()
+    # Kismet has no unsigned int32: a uint32 read would widen and compare as signed, so it is refused.
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, 'ReadU32.cpp'), 'w') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/ReadU32");\n'
+                    'class ReadU32 : public AActor {\npublic:\n  int64 Get(uint32 *P) { return *P; }\n};\n')
+        proc = subprocess.run([ASSETGEN, 'compile', os.path.join(tmp, 'ReadU32.cpp'), UEAPI, tmp], capture_output=True, text=True)
+        assert proc.returncode != 0 and 'reading a uint32 through a pointer' in proc.stdout, proc.stdout
     # The synthesized read scratch is cooked beside the class, and the class imports it.
     d = dumpexp.load(os.path.join(os.path.dirname(asset('PointerTest')), 'FDeref'))
     assert [e['name'] for e in d[5]] == ['FDeref'] and "Class'UserDefinedStruct'" in d[4], d[4]
     assert "UserDefinedStruct'FDeref'" in dumpexp.load(asset('PointerTest'))[4]
-    print('ok  PointerTest: Advance, Bump (out-parm), Check; FDeref synthesized')
+    print('ok  PointerTest: Advance, Bump (out-parm), Check, signed byte reads, uint32 reads refused; FDeref synthesized')
 
 
 mod_enum()

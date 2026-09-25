@@ -139,7 +139,7 @@ MATH = {
     'Conv_IntToFloat': float, 'Not_Int': lambda a: ~a, 'Not_Int64': lambda a: ~a,
     'Subtract_FloatFloat': lambda a, b: a - b, 'Divide_FloatFloat': lambda a, b: a / b,
     'Add_Int64Int64': lambda a, b: a + b, 'Subtract_Int64Int64': lambda a, b: a - b,
-    'Less_FloatFloat': lambda a, b: a < b, 'Greater_FloatFloat': lambda a, b: a > b, 'Conv_ByteToInt': int, 'NotEqual_ByteByte': lambda a, b: a != b,
+    'Less_FloatFloat': lambda a, b: a < b, 'Greater_FloatFloat': lambda a, b: a > b, 'Conv_ByteToInt': int, 'Conv_IntToByte': lambda a: int(a) & 0xFF, 'Conv_Int64ToByte': lambda a: int(a) & 0xFF, 'NotEqual_ByteByte': lambda a, b: a != b,
     'NotEqual_Int64Int64': lambda a, b: a != b, 'EqualEqual_Int64Int64': lambda a, b: a == b, 'NotEqual_NameName': lambda a, b: str(a).lower() != str(b).lower(),
     'EqualEqual_NameName': lambda a, b: str(a).lower() == str(b).lower(),
     'Or_IntInt': lambda a, b: int(a) | int(b), 'And_IntInt': lambda a, b: int(a) & int(b), 'Xor_IntInt': lambda a, b: int(a) ^ int(b),
@@ -150,6 +150,21 @@ MATH = {
     'Abs_Int': lambda a: i32(abs(a)), 'RandomInteger': lambda a: 0,     # RandomInteger: a stand-in; CALLS shows it ran
 }
 CALLS = []     # every library call run, as (name, args): a test can see an impure or kept call happen
+# The process memory a raw pointer reads and writes, address -> byte (unset bytes read 0). A deref is an
+# ArrayGetByRef of a view struct's TArray field over the FDeref scratch; the field decides the element's size
+# and signedness, as the engine's TArray<uint8> / <int32> / <int64> does.
+MEM = {}
+VIEWS = {'Kilobyte': (1, False), 'Mapping': (4, True), 'NameHashes': (8, True)}
+
+
+def mem_read(addr, size, signed):
+    return int.from_bytes(bytes(MEM.get(addr + i, 0) for i in range(size)), 'little', signed=signed)
+
+
+def mem_write(addr, size, v):
+    for i, b in enumerate((int(v) & ((1 << 8 * size) - 1)).to_bytes(size, 'little')): MEM[addr + i] = b
+
+
 # A native int32 / uint8 parameter receives the low bytes of whatever the VM copies into it, so a wider value
 # handed to an _IntInt / _ByteByte function is truncated, as it is in the engine.
 for _k, _f in list(MATH.items()):
@@ -273,6 +288,9 @@ def run(base, function, self_vars=None, **parms):
         if o == 0x26: return 1
         if o == 0x27: return True
         if o == 0x28: return False
+        if o == 0x6B and n.kids[0].op == 0x42 and n.kids[0].val in VIEWS:
+            size, signed = VIEWS[n.kids[0].val]
+            return mem_read(ev(n.kids[0].kids[0])['Data'] + ev(n.kids[1]) * size, size, signed)
         if o == 0x6B: return ev(n.kids[0])[ev(n.kids[1])]
         if o in (0x1B, 0x45):                                        # the class's own function, by name: a frame of its own
             names = params_of(base, n.val)
@@ -307,6 +325,7 @@ def run(base, function, self_vars=None, **parms):
         elif dest.op == 0x42: _made(ev, store, dest.kids[0], {})[dest.val] = v
         elif dest.op in (0, 0x48): env[dest.val] = v
         elif dest.op == 1: self_vars[dest.val] = v
+        elif dest.op == 0x6B and dest.kids[0].op == 0x42 and dest.kids[0].val in VIEWS: locate(dest)(v)
         elif dest.op == 0x6B: ev(dest.kids[0])[ev(dest.kids[1])] = v
         else: raise SystemExit('unsupported destination op %02x' % dest.op)
 
@@ -318,6 +337,10 @@ def run(base, function, self_vars=None, **parms):
         if dest.op == 0x42:
             s = _made(ev, store, dest.kids[0], {})
             return lambda v: s.__setitem__(dest.val, copy.deepcopy(v))
+        if dest.op == 0x6B and dest.kids[0].op == 0x42 and dest.kids[0].val in VIEWS:
+            size = VIEWS[dest.kids[0].val][0]
+            at = ev(dest.kids[0].kids[0])['Data'] + ev(dest.kids[1]) * size
+            return lambda v: mem_write(at, size, v)
         if dest.op == 0x6B:
             arr, i = ev(dest.kids[0]), ev(dest.kids[1])
             return lambda v: arr.__setitem__(i, copy.deepcopy(v))

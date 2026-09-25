@@ -2713,13 +2713,32 @@ bool FCompiler::ReadThrough(FArgIR Addr, const std::string& Pointee, FBlueprintC
 {
     const FReadViewSpec* V = ViewFor(Pointee);
     if (!V) { *Err = "TODO: a whole " + Pointee + " through a pointer; P->Member reaches its members"; return false; }
+    const std::string P = StripTypeKeywords(Pointee);
+    /* The int32 view would read it signed: 0xFFFFFFFF would widen and compare as -1. */
+    if (P == "uint32" || P == "unsigned int")
+    { *Err = "TODO: reading a uint32 through a pointer (Kismet has no unsigned 32-bit int); read it as int32 or int64"; return false; }
     Out = FArgIR();
     Out.K = FArgIR::Call;
     Out.InnerType = V->ResultType;
     Out.Sub = std::make_shared<FCallIR>();
     Out.Sub->Intrinsic = V->Intrinsic;
     Out.Sub->Args.push_back(std::move(Addr));
-    if (StripTypeKeywords(Pointee) != "bool") return true;
+    if (P == "int8" || P == "signed char" || P == "char")
+    {
+        /* The byte view reads unsigned; (B ^ 0x80) - 0x80 is the sign-extended int C++ promotes the byte to. */
+        WrapInCall(Out, BP.EngineFunction("/Script/Engine", "KismetMathLibrary", "Conv_ByteToInt"));
+        for (const char* Fn : { "Xor_IntInt", "Subtract_IntInt" })
+        {
+            WrapInCall(Out, BP.EngineFunction("/Script/Engine", "KismetMathLibrary", Fn));
+            FArgIR Bias;
+            Bias.K = FArgIR::Int;
+            Bias.I = 0x80;
+            Out.Sub->Args.push_back(Bias);
+        }
+        Out.InnerType = "int32";
+        return true;
+    }
+    if (P != "bool") return true;
     WrapInCall(Out, BP.EngineFunction("/Script/Engine", "KismetMathLibrary", "NotEqual_ByteByte"));
     FArgIR Zero;
     Zero.K = FArgIR::Byte;
@@ -2937,6 +2956,19 @@ bool FCompiler::LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, 
         if (FConstVal V; FoldConst(ArgNode, V) && ConstToArg(V, OuterType, Out)) return true;
     if (!LowerArgRaw(*N, OuterType, BP, Out, Err)) return false;
     if (Out.InnerType.empty()) Out.InnerType = TypeOf(*N);
+    /* Strip looked through the casts, but an explicit narrowing inside a wider slot (`(uint8)*P + 1`
+       of a sign-extended byte, `(uint8)X` returned as int) still wraps, innermost first. */
+    std::vector<std::string> Narrowings;
+    for (const Json* W = &ArgNode; W && W != N; W = First(*W))
+        if (const std::string K = Kind(*W); K == "CStyleCastExpr" || K == "CXXStaticCastExpr" || K == "CXXFunctionalCastExpr")
+            Narrowings.push_back(TypeOf(*W));
+    for (auto It = Narrowings.rbegin(); It != Narrowings.rend(); ++It)
+    {
+        const EStrKind From = KindOfLowered(Out, Out.InnerType), To = StrKindOf(Canon(*It));
+        if (((To == SK_Byte && (From == SK_Int || From == SK_Int64)) || (To == SK_Int && From == SK_Int64))
+            && !ConvertArg(*It, BP, Out, Err))
+            return false;
+    }
     return ConvertArg(OuterType, BP, Out, Err);
 }
 

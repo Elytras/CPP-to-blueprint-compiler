@@ -84,6 +84,8 @@ public:
     return M == 0 ? (int32)X : M == 1 ? N : static_cast<int32>(X * 2);
   }
   int64 Trunc64Of(float X) { return (int64)X; }
+  /* An explicit narrowing cast wraps even when the slot around it is wide again (511 -> 255, 2^32+5 -> 5). */
+  int64 NarrowOf(int32 X, int64 Y, int32 M) { return M == 0 ? (uint8)X : M == 1 ? (uint8)Y + 0 : (int32)Y; }
   int32 AnonConst(int32 X, int32 M) {
     int32 V = kCap;
     return M == 0 ? (X > kCap ? kCap : X) : M == 1 ? X + kDebt : M == 2 ? X * LooseBig : M == 3 ? X == LooseBig : V;
