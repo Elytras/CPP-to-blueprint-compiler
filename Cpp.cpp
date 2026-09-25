@@ -2164,6 +2164,7 @@ bool FCompiler::ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgI
     if (Arg.K == FArgIR::Int && ToKind == SK_Int64) { Arg.K = FArgIR::Int64; Arg.I64 = Arg.I; return true; }
     if (Arg.K == FArgIR::Int && ToKind == SK_Float) { Arg.K = FArgIR::Float; Arg.F = float(Arg.I); return true; }
     if (Arg.K == FArgIR::Int && ToKind == SK_Bool)  { Arg.K = FArgIR::Bool;  Arg.B = Arg.I != 0; return true; }
+    if (Arg.K == FArgIR::Float && ToKind == SK_Bool) { Arg.K = FArgIR::Bool; Arg.B = Arg.F != 0; return true; }
     if (Arg.K == FArgIR::Int && ToKind == SK_Byte)  { Arg.K = FArgIR::Byte; return true; }
     if (To.compare(0, 5, "TSoft") == 0)
     {
@@ -6360,10 +6361,11 @@ bool FCompiler::FoldConst(const Json& E, FConstVal& Out) const
                        || T == "int16" || T == "uint16" || IsInt64Type(T);
         if (!bWantFloat && !bInt) return false;
         if (bWantFloat) { V.F = T == "float" ? double(float(V.Num())) : V.Num(); V.bFloat = true; return true; }
+        /* A float goes to bool by comparing with zero, not by truncating (0.5f is true). */
+        if (T == "bool") { V.I = V.Num() != 0; V.bFloat = false; return true; }
         V.I = V.bFloat ? int64(V.F) : V.I;
         V.bFloat = false;
-        if (T == "bool") V.I = V.Num() != 0;
-        else if (T == "int" || T == "int32") V.I = int32(V.I);
+        if (T == "int" || T == "int32") V.I = int32(V.I);
         else if (T == "unsigned int" || T == "uint32") V.I = uint32(V.I);
         else if (T == "uint8" || T == "unsigned char") V.I = uint8(V.I);
         else if (T == "int8" || T == "signed char") V.I = int8(V.I);
