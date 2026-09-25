@@ -33,6 +33,10 @@ class P(W):
         elif op == 7: n.val = s.i32(); k.append(s.node())
         elif op in (0xB, 0x16, 0x17, 0x25, 0x26, 0x27, 0x28, 0x2A, 0x2D, 0x4D, 0x53): pass
         elif op == 0x1F: n.val = s.cstr()
+        elif op == 0x34:                                             # UnicodeStringConst: UTF-16 up to a 0 unit
+            st = s.o
+            while s.b[s.o] or s.b[s.o + 1]: s.o += 2
+            n.val = s.b[st:s.o].decode('utf-16-le'); s.raw(2); s.mem += s.o - 2 - st
         elif op == 0x29:                                             # TextConst: its source string stands for the text
             n.val = s.u8()
             if n.val == 1: k.extend(s.node() for _ in range(3))
@@ -137,6 +141,7 @@ MATH = {
     'Add_Int64Int64': lambda a, b: a + b, 'Subtract_Int64Int64': lambda a, b: a - b,
     'Less_FloatFloat': lambda a, b: a < b, 'Greater_FloatFloat': lambda a, b: a > b, 'Conv_ByteToInt': int, 'NotEqual_ByteByte': lambda a, b: a != b,
     'NotEqual_Int64Int64': lambda a, b: a != b, 'EqualEqual_Int64Int64': lambda a, b: a == b, 'NotEqual_NameName': lambda a, b: str(a).lower() != str(b).lower(),
+    'EqualEqual_NameName': lambda a, b: str(a).lower() == str(b).lower(),
     'Or_IntInt': lambda a, b: int(a) | int(b), 'And_IntInt': lambda a, b: int(a) & int(b), 'Xor_IntInt': lambda a, b: int(a) ^ int(b),
     'Divide_Int64Int64': idiv, 'And_Int64Int64': lambda a, b: int(a) & int(b),
     'FTrunc': lambda a: i32(int(a)), 'FTrunc64': int,     # FMath::TruncToInt: toward zero, as C++ converts
@@ -257,7 +262,7 @@ def run(base, function, self_vars=None, **parms):
         if o == 0x42:                                                # a struct is a dict; an unset member reads 0
             s = ev(n.kids[0])
             return s.get(n.val, 0) if isinstance(s, dict) else 0
-        if o == 0x1F: return n.val
+        if o in (0x1F, 0x34): return n.val
         if o == 0x29: return ev(n.kids[0]) if n.kids else ''
         if o == 0x17: return SELF
         if o in (0x2A, 0x2D): return None
