@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""usage: test_bytecode.py [--assetgen <exe>] [--ueapi <UeApi dir>]
+"""usage: test_bytecode.py [--assetgen <exe>] [--ueapi <UeApi dir>] [--cases <file>]
 
 Compiles every test mod in AssetGen/tests, then checks what a mod can observe: its functions run offline
 (runscript.py, runvm.py for latent / delegate / cross-object code) against Python oracles, return values and member
@@ -7,7 +7,8 @@ writes both, and what the engine reads off the cooked assets (flags, property ty
 function a call reaches). Never the bytecode's shape: an optimization that keeps the behaviour must pass.
 
 --assetgen defaults to the first build found (ue-mods x64/Release, this repo's x64/Release, a CMake build/);
---ueapi to ue-mods' BpMods/UeApi. Outside ue-mods, pass the UeApi of https://github.com/Elytras/DRG-Blueprint-Cpp-SDK."""
+--ueapi to ue-mods' BpMods/UeApi. Outside ue-mods, pass the UeApi of https://github.com/Elytras/DRG-Blueprint-Cpp-SDK.
+--cases also writes each offline run as a JSON case, which ue-mods' `bpcheck` command replays in the running game."""
 import copy, glob, itertools, os, re, shutil, subprocess, sys
 os.environ['PYTHONIOENCODING'] = 'utf-8'   # the dump tools print non-ASCII names; read back as UTF-8, not the code page
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -53,6 +54,58 @@ def build():
 
 
 build()
+
+
+# --cases <file>: also write every run() below as a case for BpMods' `bpcheck` command, which replays it in the game
+# (the same call on the same members) and compares what comes back. A case the game cannot mean the same way says why
+# in 'skip': raw memory (runscript's MEM stands in for this process's), a stand-in call, a value JSON cannot carry.
+if '--cases' in sys.argv:
+    import atexit, json, math
+    CASES, MATH0, RAW = [], set(runscript.MATH), [False]
+    STANDINS = {'RandomInteger', 'GetFSDGameState', 'Conv_ObjectToString'}   # the game answers these differently
+
+    def _noting_raw(f):
+        def g(*a):
+            RAW[0] = True
+            return f(*a)
+        return g
+    runscript.mem_read, runscript.mem_write = _noting_raw(runscript.mem_read), _noting_raw(runscript.mem_write)
+
+    def _plain(v):
+        """v as JSON; a dict whose keys are not all strings (a map's) as {"__pairs__": [[k, v], ...]}."""
+        if isinstance(v, runscript.Holey): raise ValueError('a map with free slots')
+        if isinstance(v, float) and not math.isfinite(v): raise ValueError('a non-finite float')
+        if v is None or isinstance(v, (bool, int, float, str)): return v
+        if isinstance(v, (list, tuple)): return [_plain(x) for x in v]
+        if isinstance(v, dict):
+            if all(isinstance(k, str) for k in v): return {k: _plain(x) for k, x in v.items()}
+            return {'__pairs__': [[_plain(k), _plain(x)] for k, x in v.items()]}
+        raise ValueError('a ' + type(v).__name__)
+
+    def _recording(real):
+        def run(base, function, self_vars=None, **parms):
+            mine = self_vars if self_vars is not None else {}
+            where = base.replace(os.sep, '/').split('/FSD/Content/')
+            case = {'mod': os.path.basename(where[0]), 'class': '/Game/' + where[-1], 'fn': function}
+            try: case.update(args=_plain(parms), self=_plain(mine))
+            except ValueError as e: case['skip'] = str(e)
+            RAW[0], first = False, len(runscript.CALLS)
+            ret, env = real(base, function, mine, **parms)
+            try: case.update(ret=_plain(ret), after=_plain(mine))
+            except ValueError as e: case.setdefault('skip', str(e))
+            case['env'] = {}
+            for k, v in env.items():
+                try: case['env'][k] = _plain(v)
+                except ValueError: pass
+            called = {c[0] for c in runscript.CALLS[first:]}
+            odd = sorted(called & STANDINS | called - MATH0)
+            if RAW[0]: case['skip'] = 'raw memory'
+            elif odd: case.setdefault('skip', 'stand-in ' + ', '.join(odd))
+            CASES.append(case)
+            return ret, env
+        return run
+    run = _recording(run)
+    atexit.register(lambda: json.dump(CASES, open(option('--cases', []), 'w', encoding='utf-8')))
 
 
 def asset(mod):
