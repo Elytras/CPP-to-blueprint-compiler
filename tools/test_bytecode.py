@@ -579,6 +579,11 @@ def inline_regressions():
     check('InlineTest', 'PickOverloads', lambda V, B: i32((100 if B else 200) + (V + 1) * 1000 + (V + 1) * 3 * 10),
           [dict(V=v, B=b) for v in (-5, 0, 7, 2**20) for b in (True, False)])
     print('ok  InlineTest: LateMember, BumpElem, DoInline and PickOverloads run as C++ does')
+    Ls = [dict(L=l) for l in (-2, 0, 1, 3, 5, 9)]
+    check('InlineTest', 'WhileFresh', lambda L: max(0, L - 1), Ls)
+    check('InlineTest', 'ForFresh', lambda L: sum(range(L - 1)), Ls)
+    check('InlineTest', 'DoFresh', lambda L: max(1, L - 1), Ls)
+    print('ok  InlineTest: an inline in a loop test makes its locals afresh on every trip')
 
 
 def inline_mixed_overloads():
