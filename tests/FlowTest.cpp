@@ -461,6 +461,16 @@ public:
     return I + R;
   }
 
+  /* A `for` may leave out any part; no condition is `true`, and `continue` still reaches the increment. */
+  int32 ForParts(int32 N) {
+    int32 I = 0, S = 0, T = 0;
+    for (; I < N; I++) {}
+    for (int32 J = 0; J < N;) { ++J; ++T; }
+    for (int32 J = 0;; ++J) { if (J >= N) break; if (J == 1) continue; S += J; }
+    for (;;) { if (T <= 0) break; --T; S += 1000; }
+    return I + S * 10;
+  }
+
   /* UE_NAME_SWITCH: a comparison per case, case-insensitive as FName is. */
   /* FName converts to bool as Name != None. */
   int32 NameSet(FName N) { bool B = static_cast<bool>(N); if (N) return B ? 1 : 9; return !N ? 2 : 9; }

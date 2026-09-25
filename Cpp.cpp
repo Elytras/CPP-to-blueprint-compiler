@@ -5440,16 +5440,17 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
         else if (K == "ForStmt")
         {
             /* Desugars to `{ init; while (cond) { body; inc; } }`. ForStmt inner is
-               [init, condVar, cond, inc, body] with absent parts kept as inline JSON nulls. */
+               [init, condVar, cond, inc, body], clang writing an absent part as {}. No condition is `true`. */
             auto AtOr = [&](size_t I) -> const Json* {
                 const Json* P = Nth(*S, I);
-                return (P && !P->is_null()) ? P : nullptr;
+                return (P && !P->is_null() && !P->empty()) ? P : nullptr;
             };
+            const Json True = { {"kind", "CXXBoolLiteralExpr"}, {"type", { {"qualType", "bool"} }}, {"value", true} };
             const Json* Init = AtOr(0);
-            const Json* Cond = AtOr(2);
+            const Json* Cond = AtOr(2) ? AtOr(2) : &True;
             const Json* Inc = AtOr(3);
             const Json* Body = AtOr(4);
-            if (!Cond || !Body) { *Err = "TODO: `for` needs a condition and a body"; bOk = false; return; }
+            if (!Body) { *Err = "`for` with no body"; bOk = false; return; }
 
             if (Init)
             {
