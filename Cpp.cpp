@@ -3717,6 +3717,41 @@ static bool IsFixedValue(const Json& N)
     return K == "CXXThisExpr" || K.find("Literal") != std::string::npos;
 }
 
+/* IsSideEffectFree, also allowing TArray element reads. */
+static bool IsPlainRead(const Json& N)
+{
+    if (IsTArrayElement(N) && N["inner"].size() == 3)
+        return IsPlainRead(N["inner"][1]) && IsPlainRead(N["inner"][2]);
+    if (!N.contains("inner")) return IsSideEffectFree(N);
+    Json Node = N;
+    Node.erase("inner");
+    bool bFree = IsSideEffectFree(Node);
+    ForEach(N, [&](const Json& C) { bFree = bFree && IsPlainRead(C); });
+    return bFree;
+}
+
+/* What locates lvalue N (a pointer, an index, a key): bReads when any of it can change, bActs when any of it has
+   side effects. A variable named directly is located by nothing; a TArray element always reads the array's storage,
+   which a resize moves. */
+static void Locators(const Json& N, bool& bReads, bool& bActs)
+{
+    const std::string K = Kind(N);
+    auto Value = [&](const Json& V) { bReads = bReads || !IsFixedValue(V); bActs = bActs || !IsPlainRead(V); };
+    if (K == "ParenExpr" || (K == "ImplicitCastExpr" && N.value("castKind", std::string()) == "NoOp")
+        || (K == "MemberExpr" && !N.value("isArrow", false)))
+        Locators(N["inner"][0], bReads, bActs);
+    else if (K == "MemberExpr" || (K == "UnaryOperator" && N.value("opcode", std::string()) == "*"))
+        Value(N["inner"][0]);
+    else if ((IsTArrayElement(N) || IsTMapElement(N)) && N["inner"].size() == 3)
+    {
+        bReads = bReads || IsTArrayElement(N);
+        Locators(N["inner"][1], bReads, bActs);
+        Value(N["inner"][2]);
+    }
+    else if (K != "DeclRefExpr")
+        bReads = bActs = true;
+}
+
 /* A fresh local initialised from Init, declared into Pre; returns an rvalue read of it. */
 Json FCompiler::SynthLocal(const std::string& Type, const Json& Init, Json& Pre)
 {
@@ -3769,12 +3804,14 @@ bool FCompiler::DesugarUpdate(const Json& S, Json& Wrap, std::string* Result, st
     const Json* Orig = Nth(S, 0);
     if (!Orig || (!bStep && !Nth(S, 1))) { *Err = "`" + Op + "` with no destination"; return false; }
 
-    /* X is located once. C++17 sequences Y before X in `X op= Y`, so a Y that must not move past X's side
-       effects goes first. */
+    /* X is located once. C++17 sequences Y before X in `X op= Y`, so a Y that must not move past what locates X
+       (its side effects, or an index Y changes) goes first. */
     Json Pre = Json::array(), LhsPre = Json::array();
     const Json LhsNode = StabilizeLvalue(*Orig, LhsPre);
     Json Rhs = bStep ? Json{ {"kind", "IntegerLiteral"}, {"type", {{"qualType", "int"}}}, {"value", "1"} } : *Nth(S, 1);
-    if (!LhsPre.empty()) Rhs = HoistExpr(Rhs, Pre);
+    bool bLocReads = false, bLocActs = false;
+    Locators(*Orig, bLocReads, bLocActs);
+    if (bLocReads && (bLocActs || !IsPlainRead(Rhs))) Rhs = HoistExpr(Rhs, Pre, true);
     for (Json& D : LhsPre) Pre.push_back(std::move(D));
     const Json* Lhs = &LhsNode;
 
@@ -4822,6 +4859,20 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 auto A = RefAlias.find((*Lhs)["referencedDecl"].value("id", std::string()));
                 if (A == RefAlias.end()) break;
                 Lhs = Strip(&A->second);
+            }
+            /* C++17 sequences the right side of `=` before the left, but the engine locates a Let's destination
+               (its object, array and index) first, and a map store takes its key first. So a value that must not
+               move past what locates the destination goes into a local first. */
+            bool bLocReads = false, bLocActs = false;
+            Locators(*Lhs, bLocReads, bLocActs);
+            Json Parked;
+            if (bLocReads && !IsFixedValue(*Rhs) && (bLocActs || !IsPlainRead(*Rhs)))
+            {
+                Json Pre = Json::array();
+                Parked = SynthLocal(StripTypeKeywords(TypeOf(*Rhs)), *Rhs, Pre);
+                const Json Wrap = { { "kind", "CompoundStmt" }, { "inner", std::move(Pre) } };
+                if (!LowerBody(Wrap, BP, Out, Locals, Err)) { bOk = false; return; }
+                Rhs = &Parked;
             }
             const std::string LK = Kind(*Lhs);
             if (IsDerefLvalue(*Lhs))

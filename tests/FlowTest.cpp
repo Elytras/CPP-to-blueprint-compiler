@@ -184,6 +184,21 @@ public:
   int32 NextSlot() { return Cursor++; }
   void BumpSlot(int32 By) { Slots[NextSlot()] += By; }
 
+  /* C++17 sequences the right side of `=` / `op=` before the left: the value is taken before the destination's
+     index, key or object is. */
+  TMap<int32, int32> SlotMap;
+  FlowTest *Peer;
+  FlowTest *Spare;
+  void StoreSlot() { Slots[NextSlot()] = NextSlot(); }
+  void StoreSlotMap() { SlotMap[NextSlot()] = NextSlot(); }
+  int32 StorePostInc(int32 I) { Slots[I++] = I; return I; }
+  void StoreAtCursor() { Slots[Cursor] = NextSlot(); }
+  void BumpAtCursor(int32 By) { Slots[Cursor] += NextSlot() + By; }
+  FlowTest *GetPeer() { return Peer; }
+  int32 SwapPeer() { Peer = Spare; return 5; }
+  void StorePeer() { GetPeer()->Cursor = SwapPeer(); }
+  void StorePeerField() { Peer->Cursor = SwapPeer(); }
+
   /* Member templates have no UFunction per instantiation: each one a call names is inlined. */
   template <class T> requires(sizeof(T) <= 8) T Scaled(T V) { return V * T(3) + T(Cursor); }
   int32 TemplateMember(int32 X) { int64 Wide = Scaled<int64>(X); return Scaled(X) + int32(Wide); }

@@ -137,10 +137,22 @@ class VM:
                 if obj is not None: store(dest.kids[1], v, obj)
             else: raise SystemExit('vm: unsupported destination %02x' % dest.op)
 
+        def locate(dest, ctx=me):
+            # execLet steps the destination (a context's object, an array and its index) before the value.
+            if dest.op == 0x19:
+                obj = ev(dest.kids[0], ctx)
+                return lambda v: obj is not None and store(dest.kids[1], v, obj)
+            if dest.op == 0x6B:
+                arr, i = ev(dest.kids[0], ctx), ev(dest.kids[1], ctx)
+                return lambda v: (arr.__setitem__(i, v), s.log.append(('set', ctx, dest.kids[0].val)))
+            st = ev(dest.kids[0], ctx) if dest.op == 0x42 else None
+            if isinstance(st, dict): return lambda v: st.__setitem__(dest.val, v)
+            return lambda v: store(dest, v, ctx)
+
         pc = 0
         for _ in range(100000):
             n = stmts[pc]; o = n.op; pc += 1
-            if o in (0xF, 0x14, 0x5F): store(n.kids[0], ev(n.kids[1]))
+            if o in (0xF, 0x14, 0x5F): locate(n.kids[0])(ev(n.kids[1]))
             elif o == 0x64:                                 # LetValueOnPersistentFrame: into the ubergraph's frame
                 assert n.owner.split(':')[-1].startswith('ExecuteUbergraph_'), n.owner
                 s.frames.setdefault(id(me), {})[n.val] = ev(n.kids[0])

@@ -281,6 +281,19 @@ def run(base, function, self_vars=None, **parms):
         elif dest.op == 0x6B: ev(dest.kids[0])[ev(dest.kids[1])] = v
         else: raise SystemExit('unsupported destination op %02x' % dest.op)
 
+    def locate(dest):
+        # UObject::execLet steps the destination (its struct, array and index) before the value: evaluate those now,
+        # return what stores into the place they found.
+        addressable(dest)
+        if dest.op == 0x42 and dest.val == 'Value': return locate(dest.kids[0])
+        if dest.op == 0x42:
+            s = _made(ev, store, dest.kids[0], {})
+            return lambda v: s.__setitem__(dest.val, copy.deepcopy(v))
+        if dest.op == 0x6B:
+            arr, i = ev(dest.kids[0]), ev(dest.kids[1])
+            return lambda v: arr.__setitem__(i, copy.deepcopy(v))
+        return lambda v: store(dest, v)
+
     pc, steps = 0, 0
     while True:
         steps += 1
@@ -290,7 +303,7 @@ def run(base, function, self_vars=None, **parms):
         nxt = pc + 1
         if o in (0xF, 0x14, 0x5F):
             if n.kids[0].op in (0, 0x48): fits(n.kids[0].val, n.kids[1])
-            store(n.kids[0], ev(n.kids[1]))
+            locate(n.kids[0])(ev(n.kids[1]))
         elif o == 6: nxt = at[n.val]
         elif o == 7:
             if not ev(n.kids[0]): nxt = at[n.val]
