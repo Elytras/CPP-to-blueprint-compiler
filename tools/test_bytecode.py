@@ -79,9 +79,10 @@ def exports_of(base):
     return [e['name'] for e in dumpexp.load(base)[5]]
 
 
-def import_paths(base):
+def import_paths(base, classes=False):
     """Each import as its full path, /Game/Pkg.Class_C:Function. dumpexp keeps Class'Name' only, and one package
-    can import two objects of one name (SuperTest: SuperBase_C:Bump for the parent call, its own SuperTest_C:Bump)."""
+    can import two objects of one name (SuperTest: SuperBase_C:Bump for the parent call, its own SuperTest_C:Bump).
+    With `classes`, (path, the ClassPackage.ClassName the linker checks the object against) pairs."""
     import struct
     ua, names = open(base + '.uasset', 'rb').read(), dumpexp.load(base)[3]
     r = dumpexp.R(ua, 4)                                        # the summary, as dumpexp.load walks it
@@ -102,7 +103,7 @@ def import_paths(base):
         name = names[obj] + ('_%d' % (num - 1) if num else '')
         if outer == 0: return name
         return path(-outer - 1) + ('.' if rows[-outer - 1][4] == 0 else ':') + name
-    return [path(i) for i in range(count)]
+    return [(path(i), names[rows[i][0]] + '.' + names[rows[i][2]]) if classes else path(i) for i in range(count)]
 
 
 def ref(base, index):
@@ -1849,6 +1850,31 @@ def ue_assets():
           ' --pak adds a pak\'s assets from their own headers')
 
 
+def asset_elsewhere():
+    """A UE_ASSET_AT into another mod, of a class declared in a header both mods include. Unpinned, each mod cooks its
+    own copy of the class and the asset is an instance of the other copy, so in game the reference loads as null
+    (BpMods' OffsetsData, 2026-09-18): refused. Pinned with UE_CLASS, the import names the owner's class."""
+    import tempfile
+    top = ('class UOtherDef : public UPrimaryDataAsset {\npublic:\n%s  int32 N = 1;\n};\n'
+           'UE_ASSET_AT(UOtherDef, OtherData, "/Game/_ElytrasMods/Other/OtherData");\n')
+    refused('AssetElsewhere', '  UOtherDef *Picked = &OtherData;\n',
+            'OtherData at /Game/_ElytrasMods/Other/OtherData is a UOtherDef, which this mod cooks its own copy of, so it '
+            'would load as null: name the class\'s owner where it is declared, e.g. '
+            'UE_CLASS("/Game/_ElytrasMods/Other/UOtherDef", "UOtherDef_C")', top=top % '')
+    with tempfile.TemporaryDirectory(dir=TESTS) as tmp:
+        with open(os.path.join(tmp, 'AssetPinned.cpp'), 'w') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/AssetPinned");\n'
+                    + top % '  UE_CLASS("/Game/_ElytrasMods/Other/UOtherDef", "UOtherDef_C");\n'
+                    + 'class AssetPinned : public AActor {\npublic:\n  UOtherDef *Picked = &OtherData;\n};\n')
+        proc = subprocess.run([ASSETGEN, 'compile', os.path.join(tmp, 'AssetPinned.cpp'), UEAPI, tmp], capture_output=True, encoding='utf-8')
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert not os.path.exists(os.path.join(tmp, 'UOtherDef.uasset')), os.listdir(tmp)
+        imports = dict(import_paths(os.path.join(tmp, 'AssetPinned'), classes=True))
+        assert imports['/Game/_ElytrasMods/Other/OtherData.OtherData'] == '/Game/_ElytrasMods/Other/UOtherDef.UOtherDef_C', imports
+    print("ok  AssetTest: another mod's asset of a class this mod would cook is refused; with the class pinned to its "
+          "owner, the import names the owner's class")
+
+
 def global_default(folder, cls, member):
     """The default a generated global class holds: a soft path (list) decoded from its FName indices, else the tag."""
     import struct
@@ -1898,6 +1924,7 @@ object_forwards()
 api_stub()
 static_assets()
 ue_assets()
+asset_elsewhere()
 globals_()
 
 

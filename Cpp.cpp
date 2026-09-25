@@ -8855,9 +8855,11 @@ public:
            range's end is kept only then, for a qualifier written in a macro (NamedQualifier). */
         const bool bMacroEnd = K == "end" && Stack.back()->is_object() && Stack.back()->contains("begin")
                             && (*Stack.back())["begin"].contains("spellingLoc");
+        /* A variable's use flags stay: Run refuses a used UE_ASSET_AT that cannot load. "kind" comes before them. */
         bSkipNext = K == "loc" || (K == "end" && !bMacroEnd) || K == "file" || K == "line" || K == "col" || K == "includedFrom"
                  || K == "expansionLoc" || K == "isMacroArgExpansion" || K == "mangledName"
-                 || K == "definitionData" || K == "isImplicit" || K == "isUsed" || K == "isReferenced"
+                 || K == "definitionData" || K == "isImplicit"
+                 || ((K == "isUsed" || K == "isReferenced") && Stack.back()->value("kind", std::string()) != "VarDecl")
                  || K == "typeAliasDeclId" || (K == "range" && !DeclRef.back());
         bKindNext = K == "kind";
         if (!bSkipNext) Slot = &(*Stack.back())[std::move(K)];
@@ -9070,6 +9072,24 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         if (R.IsGenerated())
             if (const auto [At, bNew] = Cooked.emplace(Lower(PackageOf(R)), Cpp); !bNew)
             { *Err = Cpp + " and " + At->second + " would both be cooked as " + PackageOf(R); return false; }
+
+    /* A UE_ASSET_AT whose class this mod cooks: the asset is an instance of the copy its own mod cooked, so the
+       import's class check fails in game and the reference loads as null. Pinning the class to its owner with
+       UE_CLASS makes every other mod import it instead. */
+    for (const auto& [Qual, Path] : AssetPaths)
+    {
+        const auto D = NsVarNamed.find(Qual);
+        if (D == NsVarNamed.end() || !(D->second->value("isUsed", false) || D->second->value("isReferenced", false))) continue;
+        if (std::any_of(AssetDecls.begin(), AssetDecls.end(), [&](const Json* A) { return Name(*A) == LeafOf(Qual); })) continue;
+        const Json& T = D->second->contains("type") ? (*D->second)["type"] : Json::object();
+        const FRecord* R = Find(StripTypeKeywords(T.value("desugaredQualType", T.value("qualType", std::string()))));
+        if (!R || R->bIsStruct || !R->IsGenerated()) continue;
+        const std::string Leaf = LeafOf(R->CppName);
+        *Err = Qual + " at " + Path + " is a " + R->CppName + ", which this mod cooks its own copy of, so it would load as null: "
+               "name the class's owner where it is declared, e.g. UE_CLASS(\"" + Path.substr(0, Path.rfind('/') + 1) + Leaf
+             + "\", \"" + Leaf + "_C\")";
+        return false;
+    }
 
     int32 Generated = 0;
     for (const auto& Entry : Records)
