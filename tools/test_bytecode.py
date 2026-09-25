@@ -1005,6 +1005,8 @@ def types_behaviour():
     # int64 -> float keeps only the low 32 bits (UE 4.27 has no int64 -> float): 2**32 + 5 is 5.
     check('TypesTest', 'I64ToFloat', lambda X: float(wrap(X)), [dict(X=x) for x in (0, -3, 7, -2**31, 2**32 + 5, -2**32 - 7)])
     check('TypesTest', 'TruncViaI64', lambda G: float(int(G)), [dict(G=g) for g in (0.0, 2.75, -2.75, 1e6 + 0.5)])
+    check('TypesTest', 'AllOnes', lambda: -1, [dict()])
+    check('TypesTest', 'Huge', lambda: float('inf'), [dict()])
     check('TypesTest', 'ShiftByLL', lambda X, M: wrap(X << 2) if M == 0 else X >> (1 if M == 1 else 3),
           [dict(X=x, M=m) for x in EDGE + (-8, -7, -1) for m in (0, 1, 2)])
     import struct

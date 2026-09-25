@@ -3324,15 +3324,17 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         A literal wider than int32 must stay Int64 or the value truncates: the LoadLibrary
         import walk's packed name constants (0x32336C656E72656B, "kernel32") compared as
         0x6E72656B and matched nothing. Fill both fields and pick the width by magnitude,
-        the EnumConstantDecl path below does the same.
+        the EnumConstantDecl path below does the same. A uint64 literal past int64 keeps its bits, as the cast to
+        a Blueprint type (none is unsigned 64) does in C++: (int64)18446744073709551615ULL is -1.
         */
-        const int64 V = std::stoll(N->value("value", std::string("0")));
+        const int64 V = int64(std::strtoull(N->value("value", std::string("0")).c_str(), nullptr, 10));
         Out.I = int32(V);
         Out.I64 = V;
         Out.K = int64(Out.I) == V ? FArgIR::Int : FArgIR::Int64;
         return true;
     }
-    if (K == "FloatingLiteral") { Out.K = FArgIR::Float; Out.F = std::stof(N->value("value", std::string("0"))); return true; }
+    /* strtof, not stof: a double literal past float's range is inf, as (float)1e39 is in C++, not an exception. */
+    if (K == "FloatingLiteral") { Out.K = FArgIR::Float; Out.F = std::strtof(N->value("value", std::string("0")).c_str(), nullptr); return true; }
     if (K == "CXXBoolLiteralExpr") { Out.K = FArgIR::Bool; Out.B = N->value("value", false); return true; }
     if (K == "DeclRefExpr")
     {
