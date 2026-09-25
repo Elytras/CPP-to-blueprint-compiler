@@ -135,6 +135,7 @@ MATH = {
     'NotEqual_Int64Int64': lambda a, b: a != b, 'EqualEqual_Int64Int64': lambda a, b: a == b, 'NotEqual_NameName': lambda a, b: str(a).lower() != str(b).lower(),
     'Or_IntInt': lambda a, b: int(a) | int(b), 'And_IntInt': lambda a, b: int(a) & int(b), 'Xor_IntInt': lambda a, b: int(a) ^ int(b),
     'Divide_Int64Int64': idiv, 'And_Int64Int64': lambda a, b: int(a) & int(b),
+    'FTrunc': lambda a: i32(int(a)), 'FTrunc64': int,     # FMath::TruncToInt: toward zero, as C++ converts
     'Conv_BoolToInt': int, 'Multiply_Int64Int64': lambda a, b: a * b, 'Conv_IntToInt64': int, 'Conv_Int64ToInt': lambda a: i32(a),
     'InRange_IntInt': lambda v, lo, hi, imin, imax: (v >= lo if imin else v > lo) and (v <= hi if imax else v < hi),
     'Abs_Int': lambda a: i32(abs(a)), 'RandomInteger': lambda a: 0,     # RandomInteger: a stand-in; CALLS shows it ran

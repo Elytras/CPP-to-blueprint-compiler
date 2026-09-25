@@ -71,6 +71,12 @@ public:
   /* Signed >> floors: -3 >> 1 is -2, where a plain divide by 2 gives -1. */
   int32 ShrBy(int32 X, int32 M) { return M == 1 ? X >> 1 : M == 4 ? X >> 4 : X >> 31; }
   int64 Shr64(int64 X, int32 M) { return M == 1 ? X >> 1 : X >> 63; }
+  /* A float becomes an integer truncated toward zero, not printed to 6 decimals first (0.99999994f is 0). */
+  int32 TruncOf(float X, int32 M) {
+    int32 N = X;
+    return M == 0 ? (int32)X : M == 1 ? N : static_cast<int32>(X * 2);
+  }
+  int64 Trunc64Of(float X) { return (int64)X; }
 
   /* A null interface is EX_NoInterface: EX_NoObject would set half of the 16 bytes. */
   void Forget() {

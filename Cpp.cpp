@@ -2166,9 +2166,20 @@ bool FCompiler::ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgI
         if (From.compare(0, 5, "TSoft") == 0) return true;
     }
 
+    /* C++ truncates a float toward zero: FTrunc/FTrunc64 (FMath::TruncToInt, the Blueprint autocast). Conv.json
+       has no such row, and the FString round trip prints 6 decimals first, making 0.99999994f 1. */
+    if (FromKind == SK_Float && (ToKind == SK_Int || ToKind == SK_Int64))
+    {
+        WrapInCall(Arg, BP.EngineFunction("/Script/Engine", "KismetMathLibrary", ToKind == SK_Int ? "FTrunc" : "FTrunc64"));
+        Arg.InnerType = To;
+        return true;
+    }
+
     if (const FConv* Direct = FindConv(From, To)) { ApplyConv(*Direct, BP, Arg); return true; }
+    const auto IsNumber = [](EStrKind K) { return K == SK_Int || K == SK_Int64 || K == SK_Float || K == SK_Bool || K == SK_Byte; };
     for (const char* Via : {"FString", "FText"})     // FText: int64 has no engine Conv_Int64ToString
     {
+        if (IsNumber(FromKind) && IsNumber(ToKind)) break;     // text would round or reject what C++ converts exactly
         const FConv* In  = FindConv(From, Via);
         const FConv* Out = FindConv(Via, To);
         if (In && Out) { ApplyConv(*In, BP, Arg); ApplyConv(*Out, BP, Arg); return true; }
