@@ -281,6 +281,44 @@ def flow_members():
     print('ok  FlowTest: BeginPlay, BumpSlot, NextSlot, TemplateMember and local Totals, on the members')
 
 
+def assign_order():
+    """C++17 sequences the right side of `=` / `op=` before the left, and the engine's Let locates its destination
+    (object, array, index) before the value: what the value runs must not move past what locates the store."""
+    from runscript import i32
+    base = asset('FlowTest')
+    for cur in (0, 1, 2):
+        me = dict(Slots=[9] * 4, Cursor=cur)
+        run(base, 'StoreSlot', self_vars=me)
+        want = [9] * 4
+        want[cur + 1] = cur
+        assert me == dict(Slots=want, Cursor=cur + 2), ('StoreSlot', cur, me)
+    for cur in (0, 1, 2**31 - 1):
+        me = dict(SlotMap={}, Cursor=cur)
+        run(base, 'StoreSlotMap', self_vars=me)
+        assert me == dict(SlotMap={i32(cur + 1): cur}, Cursor=i32(cur + 2)), ('StoreSlotMap', cur, me)
+    for i in (0, 1, 2):
+        me = dict(Slots=[9] * 4)
+        assert run(base, 'StorePostInc', self_vars=me, I=i)[0] == i + 1 and me['Slots'][i] == i, ('StorePostInc', i, me)
+    for cur in (0, 1, 2):
+        me = dict(Slots=[10, 20, 30, 40], Cursor=cur)
+        run(base, 'StoreAtCursor', self_vars=me)
+        want = [10, 20, 30, 40]
+        want[cur + 1] = cur
+        assert me == dict(Slots=want, Cursor=cur + 1), ('StoreAtCursor', cur, me)
+        me = dict(Slots=[10, 20, 30, 40], Cursor=cur)
+        run(base, 'BumpAtCursor', self_vars=me, By=100)
+        want = [10, 20, 30, 40]
+        want[cur + 1] += cur + 100
+        assert me == dict(Slots=want, Cursor=cur + 1), ('BumpAtCursor', cur, me)
+    for fn in ('StorePeer', 'StorePeerField'):
+        vm = VM(base)
+        near, far = vm.new(Cursor=0), vm.new(Cursor=0)
+        vm.self.vars.update(Peer=near, Spare=far)
+        vm.call(fn)
+        assert near.vars['Cursor'] == 0 and far.vars['Cursor'] == 5 and vm.self.vars['Peer'] is far, (fn, near.vars, far.vars)
+    print('ok  FlowTest: `=` / `op=` take the value before locating the destination\'s index, key or object')
+
+
 def call_member():
     """A member of a returned struct: Translation.Y of the transform GetTransform returns."""
     import runscript
@@ -403,6 +441,7 @@ check('FlowTest', 'IfInit', if_init, [dict(V=v) for v in (-4, 0, 3, 5, 6, 8)])
 check('FlowTest', 'SwitchInit', switch_init, [dict(V=v) for v in (-1, 0, 1, 2, 3, 7)])
 check('FlowTest', 'WhileVar', while_var, [dict(Start=s) for s in (-2, 0, 1, 5)])
 flow_members()
+assign_order()
 call_member()
 float_step()
 flow_exports()
