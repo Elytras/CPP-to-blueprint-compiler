@@ -1428,15 +1428,17 @@ def parent_call():
         def ReceiveBeginPlay(s): s.Count = 1
         def Bump(s, By): s.Count += By; return s.Count
         def Twice(s, By): return s.Bump(By) + s.Bump(By)
+        TwiceInline = Twice
 
     class Test(Base):
         def ReceiveBeginPlay(s): Base.ReceiveBeginPlay(s); s.Count += 10
         def Bump(s, By): return Base.Bump(s, By * 2)
         def Thrice(s, By): return s.Twice(By) + s.Bump(By)
+        def ViaInline(s, By): return s.TwiceInline(By)
 
     n = 0
     for chain, model in (([base], Base), ([test, base], Test)):
-        for fn, args in (('ReceiveBeginPlay', {}), ('Bump', {'By': 3}), ('Twice', {'By': 2}), ('Thrice', {'By': 1})):
+        for fn, args in (('ReceiveBeginPlay', {}), ('Bump', {'By': 3}), ('Twice', {'By': 2}), ('Thrice', {'By': 1}), ('ViaInline', {'By': 2})):
             if not hasattr(model, fn): continue
             for count in (0, 5):
                 fields, obj = {'Count': count}, model(count)

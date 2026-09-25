@@ -4143,13 +4143,19 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
            UFunction (K2Node_CallParentFunction) - which Out.Fn below already is. By name the call would come straight
            back to the override making it, forever: a shipping build has no script recursion guard. A native ancestor's
            takes the final form anyway. */
+        /* The class the call is written in: an inline method expanded into a subclass keeps its own class's view, so
+           PBase::Twice's `Speak()` stays a call by name in Kid, not Kid's call to its parent's Speak. */
+        const FRecord* Written = Cur;
+        if (!InlineStack.empty())
+            if (auto O = MethodOwner.find(InlineStack.back()->value("id", std::string())); O != MethodOwner.end())
+                Written = Find(O->second);
         bool bParentCall = false;
-        if (Cur && R != Cur && Kind(CallExprNode) == "CXXMemberCallExpr")
+        if (Written && R != Written && Kind(CallExprNode) == "CXXMemberCallExpr")
         {
             const Json* Callee = Strip(First(CallExprNode));
             const Json* Obj = Callee ? Strip(First(*Callee)) : nullptr;
             if (Obj && Kind(*Obj) == "CXXThisExpr")
-                for (const FRecord* A = Cur; A && A != R && !bParentCall; A = A->Base.empty() ? nullptr : Find(A->Base))
+                for (const FRecord* A = Written; A && A != R && !bParentCall; A = A->Base.empty() ? nullptr : Find(A->Base))
                     bParentCall = A->Methods.count(MethodName) != 0;
         }
         if (!R->IsNative() && !bStatic && !bParentCall)
