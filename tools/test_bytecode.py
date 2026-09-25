@@ -560,7 +560,7 @@ def inline_statics():
 
 def no_inline_ufunctions():
     exports = [e['name'] for e in dumpexp.load(asset('InlineTest'))[5]]
-    for name in ('Clamp', 'Half', 'Twice', 'Bump', 'FirstAbove', 'Nest', 'Dec', 'Plus1', 'Late', 'SDouble', 'SPred'):
+    for name in ('Clamp', 'Half', 'Twice', 'Bump', 'FirstAbove', 'Nest', 'Dec', 'Plus1', 'Late', 'SDouble', 'SPred', 'Pick'):
         assert name not in exports, name + ' became a UFunction'
     print('ok  InlineTest: no inline function is a UFunction')
 
@@ -576,13 +576,41 @@ def inline_regressions():
         got = run(asset('InlineTest'), 'BumpElem', self_vars=f, By=by)[0]
         assert got == (10 + by) * 100 + 10 + 6 and f == dict(Counter=6, Calls=1, Arr=[10 + by]), (by, got, f)
     check('InlineTest', 'DoInline', lambda N: next(i for i in range(1, 100) if 2 * i >= N), [dict(N=n) for n in (-3, 0, 1, 2, 4, 5, 12)])
-    print('ok  InlineTest: LateMember, BumpElem and DoInline run as C++ does')
+    check('InlineTest', 'PickOverloads', lambda V, B: i32((100 if B else 200) + (V + 1) * 1000 + (V + 1) * 3 * 10),
+          [dict(V=v, B=b) for v in (-5, 0, 7, 2**20) for b in (True, False)])
+    print('ok  InlineTest: LateMember, BumpElem, DoInline and PickOverloads run as C++ does')
+
+
+def inline_mixed_overloads():
+    """A call to the non-inline overload of a name Generate skips as inline is refused: it once compiled to a call to a
+    UFunction that was never made, fatal at run time. An inline overload beside the UFunction one still runs."""
+    import tempfile
+    head = '#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\nclass %s : public AActor {\npublic:\n'
+    mods = {'MixShort': ('  int32 Get(int32 A) { return A + 7; }\n  inline int32 Get(int32 A, int32 B) { return A * B; }\n'
+                         '  int32 CallShort(int32 V) { return Get(V); }\n};\n'),
+            'MixLong': ('  int32 Get(int32 A, int32 B) { return A * B; }\n  int32 Get(int32 A);\n'
+                        '  int32 CallLong(int32 V) { return Get(V, 3); }\n};\ninline int32 MixLong::Get(int32 A) { return A + 1; }\n'),
+            'MixOk': ('  int32 Get(int32 A, int32 B) { return A * B; }\n  inline int32 Get(int32 A) { return A + 1; }\n'
+                      '  int32 Both(int32 V) { return Get(V) * 10 + Get(V, 2); }\n};\n')}
+    with tempfile.TemporaryDirectory() as tmp:
+        for mod, body in mods.items():
+            with open(os.path.join(tmp, mod + '.cpp'), 'w') as f:
+                f.write(head % (mod, mod) + body)
+            proc = subprocess.run([ASSETGEN, 'compile', os.path.join(tmp, mod + '.cpp'), UEAPI, tmp], capture_output=True, text=True)
+            if mod == 'MixOk':
+                assert proc.returncode == 0, proc.stdout + proc.stderr
+                for v in (-3, 0, 5):
+                    assert run(os.path.join(tmp, mod), 'Both', V=v)[0] == (v + 1) * 10 + v * 2, v
+            else:
+                assert proc.returncode != 0 and 'may not mix inline and non-inline' in proc.stdout, (mod, proc.stdout)
+    print('ok  InlineTest: an overload set mixing inline and non-inline is refused where it would call no UFunction')
 
 
 inline_members()
 inline_statics()
 no_inline_ufunctions()
 inline_regressions()
+inline_mixed_overloads()
 
 
 # ---- OptTest
