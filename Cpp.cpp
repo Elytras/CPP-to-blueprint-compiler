@@ -2530,6 +2530,15 @@ bool IsTMapElement(const Json& N)
         && Map && TemplateArg(TypeOf(*Map), "TMap", &Inner);
 }
 
+/* The map element a place stands on: `Map[Key]` itself, or a member chain on it (`Map[Key].A.B`). Map_Find copies
+   the value out, so a store or a reference through it would change the copy. */
+const Json* MapElementUnder(const Json& N)
+{
+    const Json* P = PeelLvalue(&N);
+    while (P && Kind(*P) == "MemberExpr" && !P->value("isArrow", false) && First(*P)) P = PeelLvalue(First(*P));
+    return P && IsTMapElement(*P) ? P : nullptr;
+}
+
 /* A TMap or TSet anywhere in a property, a nested one's wrapper included: the engine replicates neither. */
 bool HoldsMapOrSet(const FPropertyDef& P)
 {
@@ -2559,12 +2568,12 @@ bool IsMutableRef(const std::string& T)
     return T.size() > 1 && T.back() == '&' && T[T.size() - 2] != '&' && T.compare(0, 6, "const ") != 0;
 }
 
-/* A UFunction's `T&` bound to what Blueprint has no reference to: a map element (Map_Find copies it out), or whichever
-   of two variables `C ? X : Y` picks. The call gets a copy, stored back after it (LowerCopyBack). */
+/* A UFunction's `T&` bound to what Blueprint has no reference to: a map element or a member of one (Map_Find copies
+   it out), or whichever of two variables `C ? X : Y` picks. The call gets a copy, stored back after it (LowerCopyBack). */
 bool IsUnreferenceable(const Json& Parm, const Json& Arg)
 {
     const Json* Bare = PeelLvalue(&Arg);
-    return IsMutableRef(TypeOf(Parm)) && Bare && (IsTMapElement(*Bare) || Kind(*Bare) == "ConditionalOperator");
+    return IsMutableRef(TypeOf(Parm)) && Bare && (MapElementUnder(*Bare) || Kind(*Bare) == "ConditionalOperator");
 }
 
 /* The intrinsics that read their operand's storage through a StructMember donor field. */
@@ -3922,6 +3931,16 @@ Json FCompiler::SynthLocal(const std::string& Type, const Json& Init, Json& Pre)
              { "inner", Json::array({ Ref }) } };
 }
 
+/* A read of lvalue L, and `To = From`: statements the desugarings build. */
+static Json ReadOf(const Json& L)
+{
+    return { {"kind", "ImplicitCastExpr"}, {"castKind", "LValueToRValue"}, {"type", L.value("type", Json::object())}, {"inner", Json::array({L})} };
+}
+static Json AssignOf(const Json& To, const Json& From)
+{
+    return { {"kind", "BinaryOperator"}, {"opcode", "="}, {"type", To.value("type", Json::object())}, {"inner", Json::array({To, From})} };
+}
+
 /* An rvalue N, parked in a local unless reading it again is harmless. bPin also parks a variable, which code
    run in between may reassign. */
 Json FCompiler::HoistExpr(const Json& N, Json& Pre, bool bPin)
@@ -4038,9 +4057,6 @@ bool FCompiler::LowerCopyBack(const Json& Call, const std::vector<std::pair<cons
 {
     if (!CurLocals) { *Err = "internal: a call outside a function body"; return false; }
     Json Pre = Json::array(), Back = Json::array(), Again = Call;
-    auto Rvalue = [](const Json& L) {
-        return Json{ {"kind", "ImplicitCastExpr"}, {"castKind", "LValueToRValue"}, {"type", L["type"]}, {"inner", Json::array({L})} };
-    };
     for (const auto& [Arg, Parm] : Refs)
     {
         size_t At = 1;
@@ -4062,14 +4078,13 @@ bool FCompiler::LowerCopyBack(const Json& Call, const std::vector<std::pair<cons
             Place["inner"][2] = StabilizeLvalue(Bare["inner"][2], Pre, true);
         }
         else Place = StabilizeLvalue(Bare, Pre, true);
-        const Json Copy = SynthLocal(StripTypeKeywords(TypeOf(Bare)), Rvalue(Place), Pre);
-        auto Store = [&](const Json& To) {
-            return Json{ {"kind", "BinaryOperator"}, {"opcode", "="}, {"type", To["type"]}, {"inner", Json::array({To, Copy})} };
-        };
-        Back.push_back(bSel ? Json{ {"kind", "IfStmt"}, {"inner", Json::array({Place["inner"][0], Store(Place["inner"][1]), Store(Place["inner"][2])})} }
-                            : Store(Place));
+        const Json Copy = SynthLocal(StripTypeKeywords(TypeOf(Bare)), ReadOf(Place), Pre);
+        Back.push_back(bSel ? Json{ {"kind", "IfStmt"}, {"inner", Json::array({Place["inner"][0], AssignOf(Place["inner"][1], Copy),
+                                                                                 AssignOf(Place["inner"][2], Copy)})} }
+                            : AssignOf(Place, Copy));
         Again["inner"][At] = Copy["inner"][0];      // the local itself, which the call takes by reference
-        const std::string What = IsTMapElement(Bare) ? "a map element" : bSel ? "`C ? X : Y`" : "another object's member";
+        const std::string What = IsTMapElement(Bare) ? "a map element" : MapElementUnder(Bare) ? "a map element's member"
+                               : bSel ? "`C ? X : Y`" : "another object's member";
         char Line[512];
         snprintf(Line, sizeof(Line), "  warning: %s::%s: %s's reference parameter %s is bound to %s: Blueprint has no reference "
                  "to it, so %s gets a copy, stored back after the call\n", Cur ? Cur->CppName.c_str() : "", CurFnName.c_str(),
@@ -5131,10 +5146,24 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 bOk = LowerAddress(*Lhs, BP, Addr, &Pointee, Err) && RefThrough(std::move(Addr), Pointee, St.Var, Err)
                    && LowerArg(*Rhs, BP, St.Value, Err);
             }
-            else if (LK == "MemberExpr" && First(*Lhs) && IsTMapElement(*Strip(First(*Lhs))))
+            else if (const Json* Elem = LK == "MemberExpr" ? MapElementUnder(*Lhs) : nullptr)
             {
-                *Err = "`Map[Key].Member = v` would change a copy: read Map[Key] into a local, change it, store it back";
-                bOk = false;
+                /* `Map[Key].A.B = v`: Map_Find copies the value out, so the store is `T E = Map[Key]; E.A.B = v;
+                   Map[Key] = E;`, v first as C++17 sequences it, and the key once. */
+                Json Pre = Json::array();
+                const Json Value = HoistExpr(*Rhs, Pre);
+                const Json Place = StabilizeLvalue(*Elem, Pre);
+                const Json E = SynthLocal(StripTypeKeywords(TypeOf(*Elem)), ReadOf(Place), Pre);
+                std::function<Json(const Json&)> Reroot = [&](const Json& N) {
+                    if (&N == Elem) return Json(E["inner"][0]);
+                    Json Up = N;
+                    Up["inner"][0] = Reroot(N["inner"][0]);
+                    return Up;
+                };
+                Pre.push_back(AssignOf(Reroot(*Lhs), Value));
+                Pre.push_back(AssignOf(Place, E));
+                const Json Wrap = { { "kind", "CompoundStmt" }, { "inner", std::move(Pre) } };
+                bOk = LowerBody(Wrap, BP, Out, Locals, Err);
                 return;
             }
             else if (LK == "MemberExpr")

@@ -36,6 +36,8 @@ class StructTest : public AActor {
   TSet<int32> Seen;
   TSet<int32> Fresh;
   TMap<int32, int32> Scores;
+  TMap<int32, FNested> Table;
+  int32 Keys;
   /* A designated default may leave members out: each takes zero, or its own default. */
   FNested Deep = { .Inner = { .Time = 1.5f }, .Stamp = 7 };
 
@@ -80,6 +82,16 @@ public:
   int32 RangeCopyToRef(int32 K) {
     for (FStats S : Many) SetKills(K, S);
     return Many[0].Kills;
+  }
+
+  /* A map element is Map_Find's copy, so a store through its members, or a reference to one, reads it, changes it and
+     stores it back, the key evaluated once. */
+  int32 NextKey() { Keys += 1; return 1; }
+  int32 MapMemberStore(int32 K) {
+    Table[NextKey()].Inner.Kills = K;
+    Table[1].Stamp += 4;
+    AddTo(Table[1].Inner.Kills, 10);
+    return Table[1].Inner.Kills;
   }
 
   float MakeNative(float D) {

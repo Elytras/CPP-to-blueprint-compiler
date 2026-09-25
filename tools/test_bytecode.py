@@ -1217,6 +1217,13 @@ def struct_behaviour():
             assert (got, f) == (want, after), (fn, k, got, f)
             n += 1
     print('ok  StructTest: a local copy bound to a written reference leaves its source alone  (%d cases)' % n)
+    for k in (-7, 0, 2**31 - 1):
+        f = {'Table': {1: {}}, 'Keys': 0}
+        got = run(asset('StructTest'), 'MapMemberStore', self_vars=f, K=k)[0]
+        assert got == i32(k + 10) and f['Keys'] == 1 and list(f['Table']) == [1] \
+            and base_names(f['Table'][1]) == {'Inner': {'Kills': i32(k + 10)}, 'Stamp': 4}, (k, got, f)
+    assert "StructTest::MapMemberStore: AddTo's reference parameter V is bound to a map element's member" in LOGS['StructTest']
+    print("ok  StructTest: a store through a map element's members, or a reference to one, reaches the map, its key found once")
     f = {}
     runscript.MESSAGES.clear()
     run(asset('StructTest'), 'ReceiveBeginPlay', self_vars=f)
