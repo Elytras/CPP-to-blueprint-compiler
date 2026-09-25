@@ -2206,6 +2206,16 @@ bool FCompiler::ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgI
     if (const FConv *In = FindConv(From, "int"), *Out = FindConv("int", To);
         In && Out && (FromNum == SK_Byte || FromNum == SK_Bool) && ToKind == SK_Int64)
     { ApplyConv(*In, BP, Arg); ApplyConv(*Out, BP, Arg); return true; }
+    /* UE 4.27 Blueprint has no int64 -> float at all (UE5 has Conv_Int64ToDouble, its reals being double), so the value
+       passes through int32: only the low 32 bits survive, where C++ would round the whole value. */
+    if (const FConv *In = FindConv(From, "int"), *Out = FindConv("int", To); In && Out && FromNum == SK_Int64 && ToKind == SK_Float)
+    {
+        printf("  warning: %s::%s: int64 -> float goes through int32 (UE 4.27 has no int64 -> float), so a value outside "
+               "int32's range wraps\n", Cur ? Cur->CppName.c_str() : "", CurFnName.c_str());
+        ApplyConv(*In, BP, Arg);
+        ApplyConv(*Out, BP, Arg);
+        return true;
+    }
     const auto IsNumber = [](EStrKind K) { return K == SK_Int || K == SK_Int64 || K == SK_Float || K == SK_Bool || K == SK_Byte; };
     for (const char* Via : {"FString", "FText"})     // FText: int64 has no engine Conv_Int64ToString
     {
