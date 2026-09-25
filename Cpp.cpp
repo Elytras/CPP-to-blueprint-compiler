@@ -489,6 +489,7 @@ struct FCallIR
     bool bReceiverIsArg = false;        // a forwarded UObject helper (Obj->GetOuter()): Obj is already the first argument, no EX_Context
     FIndex Context;                     // CDO a static call runs against; null = self
     bool bPure = false;                 // a function of its arguments (UE_PURE, a Kismet operator or conversion): see DropUnusedPure
+    uint64 WrittenArgs = ~uint64(0);    // bit I: argument I must stay its own variable, which the callee may write: see ContainerWrites
     std::string VirtualName;            // a generated class's own instance method: EX_VirtualFunction resolves it by name at run time
     bool bLocalVirtual = false;         // ... as EX_LocalVirtualFunction: a script function that is no RPC
     std::string View;                   // __RefAtInline__: the TArray field of the view struct in Extra
@@ -2520,6 +2521,27 @@ bool IsBranch(const std::string& Intrinsic)
     return Intrinsic == "__AndAlso__" || Intrinsic == "__OrElse__" || Intrinsic == "__Select__";
 }
 
+/* The arguments a Kismet container function writes, as FCallIR::WrittenArgs (the container is argument 0): the
+   container of a mutator, each out parameter, and a same-typed input it reads in place while writing (Append's source,
+   Union's sets: `A.Append(A)` would read what it grows). Any other function may write all of them. */
+uint64 ContainerWrites(const std::string& Fn)
+{
+    static const std::map<std::string, uint64> Writes = {
+        { "Array_Add", 1 }, { "Array_AddUnique", 1 }, { "Array_Append", 3 }, { "Array_Clear", 1 }, { "Array_Contains", 0 },
+        { "Array_Find", 0 }, { "Array_Get", 4 }, { "Array_Identical", 0 }, { "Array_Insert", 1 }, { "Array_IsValidIndex", 0 },
+        { "Array_LastIndex", 0 }, { "Array_Length", 0 }, { "Array_Random", 6 }, { "Array_RandomFromStream", 14 },
+        { "Array_Remove", 1 }, { "Array_RemoveItem", 1 }, { "Array_Resize", 1 }, { "Array_Reverse", 1 }, { "Array_Set", 1 },
+        { "Array_Shuffle", 1 }, { "Array_Swap", 1 },
+        { "Set_Add", 1 }, { "Set_AddItems", 1 }, { "Set_Clear", 1 }, { "Set_Contains", 0 }, { "Set_Difference", 7 },
+        { "Set_Intersection", 7 }, { "Set_Length", 0 }, { "Set_Remove", 1 }, { "Set_RemoveItems", 1 }, { "Set_ToArray", 2 },
+        { "Set_Union", 7 },
+        { "Map_Add", 1 }, { "Map_Clear", 1 }, { "Map_Contains", 0 }, { "Map_Find", 4 }, { "Map_Keys", 2 }, { "Map_Length", 0 },
+        { "Map_Remove", 1 }, { "Map_Values", 2 },
+    };
+    auto W = Writes.find(Fn);
+    return W == Writes.end() ? ~uint64(0) : W->second;
+}
+
 bool IsStored(const FArgIR& A)
 {
     return A.K == FArgIR::Local || A.K == FArgIR::LocalOut || A.K == FArgIR::Field || A.K == FArgIR::Member
@@ -3026,6 +3048,7 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             Out.K = FArgIR::Call;
             Out.Sub = std::make_shared<FCallIR>();
             Out.Sub->Fn = BP.EngineFunction("/Script/Engine", Lib, Prefix + Method);
+            Out.Sub->WrittenArgs = ContainerWrites(Prefix + Method);
             Out.Sub->Args.push_back(Target);
             bool bFirst = true, bOk = true;
             std::string LastType;
@@ -3115,6 +3138,7 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
                 Out.K = FArgIR::Call;
                 Out.Sub = std::make_shared<FCallIR>();
                 Out.Sub->Fn = BP.EngineFunction("/Script/Engine", "BlueprintMapLibrary", "Map_Find");
+                Out.Sub->WrittenArgs = ContainerWrites("Map_Find");
                 FArgIR Into;
                 Into.K = FArgIR::Local;
                 Into.S = Tmp;
@@ -3141,6 +3165,7 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             auto Body = std::make_shared<std::vector<FStmtIR>>(1);
             (*Body)[0].K = FStmtIR::StaticCall;
             (*Body)[0].Call.Fn = BP.EngineFunction("/Script/Engine", "BlueprintMapLibrary", "Map_Find");
+            (*Body)[0].Call.WrittenArgs = ContainerWrites("Map_Find");
             (*Body)[0].Call.Args = { Map, Key, Into };
             auto Block = std::make_shared<std::vector<FStmtIR>>(1);
             (*Block)[0].K = FStmtIR::Block;
@@ -3987,6 +4012,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
                 const std::string T = TypeOf(C);
                 if (Kind(C) == "ParmVarDecl" && !T.empty() && T.back() == '&' && T.compare(0, 6, "const ") != 0) bOutParm = true;
             });
+            Out.WrittenArgs = bOutParm ? ~uint64(0) : 0;
             Out.bPure = !bOutParm && (IsPureDecl(*Decl->second) || (Def != R->MethodDefs.end() && IsPureDecl(*Def->second)));
         }
         /* The overload called, by its decl id: same-name inline overloads are all legal, none is a UFunction. */
@@ -4922,6 +4948,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 /* `Map[Key] = v`: Map_Add, which replaces the value of a key already there. */
                 St.K = FStmtIR::StaticCall;
                 St.Call.Fn = BP.EngineFunction("/Script/Engine", "BlueprintMapLibrary", "Map_Add");
+                St.Call.WrittenArgs = ContainerWrites("Map_Add");
                 St.Call.Args.resize(3);
                 bOk = LowerArg(*Nth(*Lhs, 1), BP, St.Call.Args[0], Err) && LowerArg(*Nth(*Lhs, 2), BP, St.Call.Args[1], Err)
                    && LowerArg(*Rhs, BP, St.Call.Args[2], Err);
@@ -5501,15 +5528,22 @@ int32 Mentions(const std::vector<FStmtIR>& Stmts, const std::string& Name)
     return N;
 }
 
-/* The read of local Name that runs exactly once whenever A does: not under a branch's later operands, an inline
-   body, an object or struct base (which may need a variable), or a call's target. */
-FArgIR* FindPlainRead(FArgIR& A, const std::string& Name)
+/* C may bind argument I to a reference it writes: a T& parameter, a container method's array or out value. */
+bool MayWriteArg(const FCallIR& C, size_t I)
 {
-    if (A.K == FArgIR::Local && A.S == Name && !A.Base) return &A;
+    return !C.bPure && !IsBranch(C.Intrinsic) && (I >= 64 || (C.WrittenArgs >> I & 1));
+}
+
+/* The read of local Name that runs exactly once whenever A does: not under a branch's later operands, an inline
+   body, an object or struct base (which may need a variable), or a call's target. Nor an argument bRefSlot says may
+   be written: the variable is the argument there, and another in its place would take the write. */
+FArgIR* FindPlainRead(FArgIR& A, const std::string& Name, bool bRefSlot = false)
+{
+    if (A.K == FArgIR::Local && A.S == Name && !A.Base) return bRefSlot ? nullptr : &A;
     if (A.K != FArgIR::Call || !A.Sub || A.Sub->Inline) return nullptr;
     const size_t Count = IsBranch(A.Sub->Intrinsic) ? std::min<size_t>(1, A.Sub->Args.size()) : A.Sub->Args.size();
     for (size_t I = 0; I < Count; ++I)
-        if (FArgIR* F = FindPlainRead(A.Sub->Args[I], Name)) return F;
+        if (FArgIR* F = FindPlainRead(A.Sub->Args[I], Name, MayWriteArg(*A.Sub, I))) return F;
     return nullptr;
 }
 
@@ -5570,7 +5604,8 @@ void FCompiler::ArgumentsInPlace(std::vector<FStmtIR>& Body, const std::vector<s
         FArgIR* Scope = nullptr;
         if (First.K == FStmtIR::StaticCall && !First.Target.Target && First.Target.Args.empty())
         {
-            for (FArgIR& A : First.Call.Args) if (!Read && (Read = FindPlainRead(A, Name))) Scope = &A;
+            for (size_t I = 0; I < First.Call.Args.size() && !Read; ++I)
+                if ((Read = FindPlainRead(First.Call.Args[I], Name, MayWriteArg(First.Call, I)))) Scope = &First.Call.Args[I];
         }
         else if ((First.K == FStmtIR::Assign || First.K == FStmtIR::Decl || First.K == FStmtIR::Return) && !First.Var.Base)
             Read = FindPlainRead(*(Scope = &First.Value), Name);
@@ -5626,7 +5661,8 @@ void FCompiler::ForwardSingleUse(std::vector<FStmtIR>& Stmts, const std::vector<
             FArgIR* Scope = nullptr;
             if (Next.K == FStmtIR::StaticCall && !Next.Target.Target && Next.Target.Args.empty())
             {
-                for (FArgIR& A : Next.Call.Args) if (!Read && (Read = FindPlainRead(A, Name))) Scope = &A;
+                for (size_t I = 0; I < Next.Call.Args.size() && !Read; ++I)
+                    if ((Read = FindPlainRead(Next.Call.Args[I], Name, MayWriteArg(Next.Call, I)))) Scope = &Next.Call.Args[I];
             }
             else if ((Next.K == FStmtIR::Assign || Next.K == FStmtIR::Decl || Next.K == FStmtIR::Return) && !Next.Var.Base)
                 Read = FindPlainRead(*(Scope = &Next.Value), Name);
@@ -5998,6 +6034,7 @@ bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vec
         FStmtIR St;
         St.K = FStmtIR::StaticCall;
         St.Call.Fn = BP.EngineFunction("/Script/Engine", Lib, Fn);
+        St.Call.WrittenArgs = ContainerWrites(Fn);
         St.Call.Args = std::move(CallArgs);
         return St;
     };
@@ -6047,6 +6084,7 @@ bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vec
     Length.K = FArgIR::Call;
     Length.Sub = std::make_shared<FCallIR>();
     Length.Sub->Fn = BP.EngineFunction("/Script/Engine", "KismetArrayLibrary", "Array_Length");
+    Length.Sub->WrittenArgs = ContainerWrites("Array_Length");
     Length.Sub->Args = { Iter };
     Out.push_back(AssignStmt(Len, "int32", std::move(Length)));
 
