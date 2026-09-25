@@ -913,6 +913,7 @@ private:
     bool LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR& Out, std::string* Err);
     bool LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vector<FStmtIR>& Out,
                        std::vector<FPropertyDef>& Locals, std::string* Err);
+    bool Reaches(const Json& N, const std::string& Target, std::set<std::string>& Seen, bool bWrites) const;
     bool LowerWithoutPrefix(const Json& Stmt, FBlueprintClass& BP, std::vector<FStmtIR>& Out,
                             std::vector<FPropertyDef>& Locals, std::string* Err);
 
@@ -5938,6 +5939,79 @@ bool FCompiler::LowerWithoutPrefix(const Json& Stmt, FBlueprintClass& BP, std::v
     return LowerBody(Wrap, BP, Out, Locals, Err);
 }
 
+/* Whether a use under P only reads what it names: a copy, a const view (a const method's object included),
+   or an rvalue. */
+static bool IsReadUse(const Json* P)
+{
+    const std::string PK = P ? Kind(*P) : "", Cast = P ? P->value("castKind", std::string()) : "", To = P ? TypeOf(*P) : "";
+    return (PK == "ImplicitCastExpr" && (Cast == "LValueToRValue" || (Cast == "NoOp" && To.compare(0, 6, "const ") == 0)))
+        || PK == "CXXConstructExpr";
+}
+
+/* Whether N can touch the variable whose decl id is Target: it names it, names a reference bound to it, or calls a
+   method (on any object: the field is the same one) whose body does. With bWrites only a use that may write it
+   counts. Seen stops the walk going round a recursion. */
+bool FCompiler::Reaches(const Json& N, const std::string& Target, std::set<std::string>& Seen, bool bWrites) const
+{
+    bool bHit = false;
+    std::function<void(const Json&, const Json*)> Walk = [&](const Json& X, const Json* P) {
+        if (bHit || !X.is_object()) return;
+        const std::string K = Kind(X);
+        bool bNames = K == "MemberExpr" && X.value("referencedMemberDecl", std::string()) == Target;
+        if (K == "DeclRefExpr" && X.contains("referencedDecl"))
+        {
+            const std::string Id = X["referencedDecl"].value("id", std::string());
+            std::set<std::string> Via = Seen;
+            auto A = RefAlias.find(Id);
+            bNames = Id == Target || (A != RefAlias.end() && Reaches(A->second, Target, Via, false));
+        }
+        if (bNames && (!bWrites || !IsReadUse(P))) { bHit = true; return; }
+        const Json* Callee = K == "CXXMemberCallExpr" ? Strip(First(X)) : nullptr;
+        if (Callee && Kind(*Callee) == "MemberExpr" && Seen.insert(Callee->value("referencedMemberDecl", std::string())).second)
+        {
+            const std::string Id = Callee->value("referencedMemberDecl", std::string()), Fn = Callee->value("name", std::string());
+            auto Owner = MethodOwner.find(Id);
+            if (const FRecord* R = Owner == MethodOwner.end() ? nullptr : Find(Owner->second))
+            {
+                const Json* Def = nullptr;
+                if (auto I = R->Inlines.find(Id); I != R->Inlines.end()) Def = I->second;
+                else if (auto D = R->MethodDefs.find(Fn); D != R->MethodDefs.end()) Def = D->second;
+                else if (auto M = R->Methods.find(Fn); M != R->Methods.end()) Def = M->second;
+                if (Def) ForEach(*Def, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Walk(C, nullptr); });
+            }
+        }
+        ForEach(X, [&](const Json& C) { Walk(C, &X); });
+    };
+    Walk(N, nullptr);
+    return bHit;
+}
+
+/* Every use of Id in N, or of a field of it, reads it or is the destination of `=`, `op=`, `++` or `--`. */
+static bool ReadOrStored(const Json& N, const std::string& Id)
+{
+    bool bOk = true;
+    std::function<bool(const Json&)> Named = [&](const Json& X) {
+        if (Kind(X) == "DeclRefExpr") return X.contains("referencedDecl") && X["referencedDecl"].value("id", std::string()) == Id;
+        return Kind(X) == "MemberExpr" && !X.value("isArrow", false) && First(X) && Named(*First(X));
+    };
+    std::function<void(const Json&, const Json*)> Walk = [&](const Json& X, const Json* P) {
+        if (!bOk || !X.is_object()) return;
+        if (Named(X) && !(P && Kind(*P) == "MemberExpr" && !P->value("isArrow", false)))   // `V.A.B`: judge the whole
+        {
+            const std::string PK = P ? Kind(*P) : "", Op = P ? P->value("opcode", std::string()) : "";
+            const Json* Callee = PK == "CXXOperatorCallExpr" ? Strip(First(*P)) : nullptr;
+            bOk = IsReadUse(P)
+               || (P && &X == First(*P) && ((PK == "BinaryOperator" && Op == "=") || PK == "CompoundAssignOperator"
+                                       || (PK == "UnaryOperator" && (Op == "++" || Op == "--"))))
+               || (Callee && &X == Nth(*P, 1) && Callee->contains("referencedDecl")
+                   && Name((*Callee)["referencedDecl"]) == "operator=");
+        }
+        ForEach(X, [&](const Json& C) { Walk(C, &X); });
+    };
+    Walk(N, nullptr);
+    return bOk;
+}
+
 /* `for (Elem : Range)` over a TArray / TSet / TMap. CXXForRangeStmt inner is
    [init, __range1, __begin1, __end1, cond, inc, loop variable, body].
      TArray: in place, by index. `T& E` is another name for `Range[Idx]`, so writes land in the array;
@@ -5946,7 +6020,8 @@ bool FCompiler::LowerWithoutPrefix(const Json& Stmt, FBlueprintClass& BP, std::v
      TMap:   over a Map_Keys copy, each value fetched with Map_Find. `auto [K, V]` binds K to a copy of the key and
              V to a local. `auto& [K, V]` writes V back with Map_Add after each iteration, `break` included, so the
              body changes values in place - unless the body only reads V (`V->X = 1` included: that writes the
-             object, not the map); `auto [K, V]` is a copy, as in C++, and writes nothing back.
+             object, not the map); `auto [K, V]` is a copy, as in C++, and writes nothing back. Where the copy could
+             go stale (below) a reference V is `Range[K]` instead.
    ponytail: TSet / TMap iterate a copy, not the sparse array in place; the in-place walk needs the container's
    address, which a Blueprint variable does not have (ROADMAP.md, Phase 3). */
 bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vector<FStmtIR>& Out,
@@ -6086,30 +6161,59 @@ bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vec
         ForEach(*LoopDecl, [&](const Json& C) { if (Kind(C) == "BindingDecl") Bindings.push_back(&C); });
         if (Bindings.size() != 2) { *Err = "a TMap range-for binds exactly `auto [Key, Value]`"; --LoopDepth; return false; }
         const std::string Key = "__RangeKey" + N + "__", Val = "__RangeVal" + N + "__";
-        if (!AddLocal(Key, Args[0]) || !AddLocal(Val, Args[1])) { --LoopDepth; return false; }
+        if (!AddLocal(Key, Args[0])) { --LoopDepth; return false; }
         FArgIR KeyAt;
         if (!LowerArg(Elem, BP, KeyAt, Err)) { --LoopDepth; return false; }
         Loop.Body->push_back(AssignStmt(Key, Args[0], std::move(KeyAt)));
-        FStmtIR Find = CallStmt("BlueprintMapLibrary", "Map_Find", { Range, LocalArg(Key), LocalArg(Val) });
-        if (IsContainerType(StripTypeKeywords(Args[1])))
-        {
-            /* A nested container value is a wrapper struct: Map_Find fills a wrapper temp, then Val is its Value. */
-            FArgIR Call;
-            Call.K = FArgIR::Call;
-            Call.Sub = std::make_shared<FCallIR>(Find.Call);
-            if (!NestedWrapperOut(Args[1], 2, "", AssignStmt(Val, Args[1], FArgIR()), BP, Call, Err)) { --LoopDepth; return false; }
-            Find = Call.Sub->Inline->front();
-        }
-        Loop.Body->push_back(std::move(Find));
         RefAlias[Bindings[0]->value("id", std::string())] = RefToLocal(Key, Args[0]);
-        RefAlias[Bindings[1]->value("id", std::string())] = RefToLocal(Val, Args[1]);
         const std::string PairTy = TypeOf(*LoopDecl);
+        const std::string ValId = Bindings[1]->value("id", std::string());
+        /* A reference V is the element itself. A copy of it goes stale when the body writes V and can also reach
+           the map (names it, or calls a method that does), or writes the map and reads V; V is `Range[Key]` there
+           instead: each read a Map_Find, each store a Map_Add. */
+        const Json* Root = Strip(RangeExpr);
+        std::set<std::string> Seen;
+        while (Root && Kind(*Root) == "DeclRefExpr" && RefAlias.count((*Root)["referencedDecl"].value("id", std::string())))
+            Root = Strip(&RefAlias.at((*Root)["referencedDecl"].value("id", std::string())));
+        const std::string RootId = !Root ? std::string() : Kind(*Root) == "MemberExpr" ? Root->value("referencedMemberDecl", std::string())
+                                 : Kind(*Root) == "DeclRefExpr" ? (*Root)["referencedDecl"].value("id", std::string()) : std::string();
         const bool bByRef = !PairTy.empty() && PairTy.back() == '&' && StripTypeKeywords(PairTy) == PairTy;   // `auto& [K, V]`
-        if (bByRef && !OnlyRead(*Body, Bindings[1]->value("id", std::string())))
+        const bool bWritesV = bByRef && !OnlyRead(*Body, ValId);
+        if (!PairTy.empty() && PairTy.back() == '&' && !RootId.empty() && Reaches(*Body, RootId, Seen, !bWritesV))
         {
-            FStmtIR Back = CallStmt("BlueprintMapLibrary", "Map_Add", { Range, LocalArg(Key), LocalArg(Val) });
-            Loop.Inc->push_back(Back);
-            Loop.Trailer = std::make_shared<std::vector<FStmtIR>>(1, Back);
+            if (bByRef && !ReadOrStored(*Body, ValId))
+            {
+                const std::string Map = Kind(*Root) == "MemberExpr" ? Root->value("name", std::string()) : Name((*Root)["referencedDecl"]);
+                *Err = "TODO: `for (auto& [" + Name(*Bindings[0]) + ", " + Name(*Bindings[1]) + "] : " + Map + ")` whose body also uses "
+                     + Map + ": " + Name(*Bindings[1]) + " may only be read or assigned there (or use Find / Add)";
+                --LoopDepth;
+                return false;
+            }
+            RefAlias[ValId] = { {"kind", "CXXOperatorCallExpr"}, {"type", {{"qualType", Args[1]}}}, {"valueCategory", "lvalue"},
+                                {"inner", Json::array({ Json{ {"kind", "DeclRefExpr"}, {"referencedDecl", {{"kind", "CXXMethodDecl"}, {"name", "operator[]"}}} },
+                                                        *RangeExpr, RefToLocal(Key, Args[0]) })} };
+        }
+        else
+        {
+            if (!AddLocal(Val, Args[1])) { --LoopDepth; return false; }
+            FStmtIR Find = CallStmt("BlueprintMapLibrary", "Map_Find", { Range, LocalArg(Key), LocalArg(Val) });
+            if (IsContainerType(StripTypeKeywords(Args[1])))
+            {
+                /* A nested container value is a wrapper struct: Map_Find fills a wrapper temp, then Val is its Value. */
+                FArgIR Call;
+                Call.K = FArgIR::Call;
+                Call.Sub = std::make_shared<FCallIR>(Find.Call);
+                if (!NestedWrapperOut(Args[1], 2, "", AssignStmt(Val, Args[1], FArgIR()), BP, Call, Err)) { --LoopDepth; return false; }
+                Find = Call.Sub->Inline->front();
+            }
+            Loop.Body->push_back(std::move(Find));
+            RefAlias[ValId] = RefToLocal(Val, Args[1]);
+            if (bWritesV)
+            {
+                FStmtIR Back = CallStmt("BlueprintMapLibrary", "Map_Add", { Range, LocalArg(Key), LocalArg(Val) });
+                Loop.Inc->push_back(Back);
+                Loop.Trailer = std::make_shared<std::vector<FStmtIR>>(1, Back);
+            }
         }
     }
     Json BodyWrap = Kind(*Body) == "CompoundStmt" ? *Body : Json{ {"kind", "CompoundStmt"}, {"inner", Json::array({ *Body })} };
