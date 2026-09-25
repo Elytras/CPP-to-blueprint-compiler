@@ -607,6 +607,27 @@ for fn, oracle in (('BumpScoresUntil', bump_until), ('CapScores', cap_scores), (
             assert (got, mine) == (want, theirs), '%s(%s, %s) = %r %r, want %r %r' % (fn, m, stop, got, mine, want, theirs)
             n += 1
 print('ok  RangeTest: a return from a reference TMap loop writes the changed value back  (%d cases)' % n)
+
+
+def seen_in_body(f, d):
+    s = 0
+    for k in f['Scores']:
+        f['Scores'][k] = i32(f['Scores'][k] + d)
+        s = i32(s + f['Scores'][k])
+        f['Scores'][k] = i32(i32(f['Scores'][k] * 2) + 1)
+        s = i32(s + i32(f['Scores'][k] * 100))
+    return s
+
+
+n = 0
+for d in (0, 2, -7, 2**31 - 1):
+    for m in ({}, {'a': 30}, {'a': 1, 'b': 20, 'c': 3}):
+        mine, theirs = range_self(Scores=m), range_self(Scores=m)
+        got = run(asset('RangeTest'), 'SeenInBody', self_vars=mine, D=d)[0]
+        want = seen_in_body(theirs, d)
+        assert (got, mine) == (want, theirs), ('SeenInBody', m, d, got, mine, want, theirs)
+        n += 1
+print("ok  RangeTest.SeenInBody: `auto& [K, V]` is the map's own value, a write through either name read through the other  (%d cases)" % n)
 for m in ({}, {'a': {'X': 1, 'Y': 2}}, {'a': {'X': -1, 'Y': 0}, 'b': {'X': 5, 'Y': 7}}):
     f = dict(Spots={k: dict(v) for k, v in m.items()})
     got = run(asset('RangeTest'), 'ShiftSpots', self_vars=f)[0]

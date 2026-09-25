@@ -106,6 +106,21 @@ public:
   }
   int32 BumpScoresInlined(int32 Stop) { return BumpScoresInline(Stop) * 2 + 1; }
 
+  /* `auto&` names the map's own value: the body reads a write through it from the map, a store to the map is what it
+     holds next, and a reference to it writes the map. */
+  void AddOne(int32 &V) { V += 1; }
+  int32 SeenInBody(int32 D) {
+    int32 Sum = 0;
+    for (auto &[Key, Value] : Scores) {
+      Value += D;
+      Sum += Scores[Key];
+      Scores[Key] = Value * 2;
+      AddOne(Value);
+      Sum += Value * 100;
+    }
+    return Sum;
+  }
+
   /* `Spot.X += 1` writes the value itself, so it goes back to the map; `Spot->X` would write an object instead. */
   int32 ShiftSpots() {
     for (auto &[Key, Spot] : Spots) Spot.X += 1;

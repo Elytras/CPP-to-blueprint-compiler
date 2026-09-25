@@ -1018,6 +1018,22 @@ private:
     std::map<std::string, std::string> RefAddr;     // VarDecl id -> pointee: `T& R = *P` keeps the address in an int64 local R
     std::map<std::string, Json> RefAlias;           // VarDecl id -> the variable `T& R = V` is another name for; a copy,
                                                     // since a for-init is lowered out of a temporary Json
+    /* N with the variable at its root (under parentheses and `.` members) replaced by what RefAlias names, so a place
+       reached through a reference (`auto& [K, V]`'s V is `Map[K]`) is judged as what it is. */
+    Json Unalias(const Json& N) const
+    {
+        const std::string K = Kind(N);
+        if ((K == "ParenExpr" || K == "ExprWithCleanups" || (K == "ImplicitCastExpr" && N.value("castKind", std::string()) == "NoOp")
+             || (K == "MemberExpr" && !N.value("isArrow", false))) && First(N))
+        {
+            Json Out = N;
+            Out["inner"][0] = Unalias(N["inner"][0]);
+            return Out;
+        }
+        if (K == "DeclRefExpr")
+            if (auto A = RefAlias.find(N["referencedDecl"].value("id", std::string())); A != RefAlias.end()) return Unalias(A->second);
+        return N;
+    }
     /* A /Game struct the bytecode names only through a member (a view, `P->X`) is not kept loaded: the script
        reference collector skips property operands (FArchive::operator<<(FField*&) does nothing), and only a
        property's own type reaches UStruct::ScriptAndPropertyObjectReferences (UStruct::Link), which the GC
@@ -4083,7 +4099,8 @@ bool FCompiler::LowerCopyBack(const Json& Call, const std::vector<std::pair<cons
                                                                                  AssignOf(Place["inner"][2], Copy)})} }
                             : AssignOf(Place, Copy));
         Again["inner"][At] = Copy["inner"][0];      // the local itself, which the call takes by reference
-        const std::string What = IsTMapElement(Bare) ? "a map element" : MapElementUnder(Bare) ? "a map element's member"
+        const Json Seen = Unalias(Bare);
+        const std::string What = IsTMapElement(*PeelLvalue(&Seen)) ? "a map element" : MapElementUnder(Seen) ? "a map element's member"
                                : bSel ? "`C ? X : Y`" : "another object's member";
         char Line[512];
         snprintf(Line, sizeof(Line), "  warning: %s::%s: %s's reference parameter %s is bound to %s: Blueprint has no reference "
@@ -4296,7 +4313,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         CalledParms.clear();
     std::vector<std::pair<const Json*, std::string>> CopyBacks;
     for (size_t I = Receiver ? 1 : 0, At = 1; I < CalledParms.size(); ++I, ++At)
-        if (IsUnreferenceable(*CalledParms[I], CallExprNode["inner"][At]))
+        if (IsUnreferenceable(*CalledParms[I], Unalias(CallExprNode["inner"][At])))
             CopyBacks.emplace_back(&CallExprNode["inner"][At], Name(*CalledParms[I]));
     if (!CopyBacks.empty()) return LowerCopyBack(CallExprNode, CopyBacks, MethodName, BP, Out, Err);
 
@@ -5138,6 +5155,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 Rhs = &Parked;
             }
             const std::string LK = Kind(*Lhs);
+            const Json Rooted = LK == "MemberExpr" ? Unalias(*Lhs) : Json();
             if (IsDerefLvalue(*Lhs))
             {
                 FArgIR Addr;
@@ -5146,10 +5164,10 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 bOk = LowerAddress(*Lhs, BP, Addr, &Pointee, Err) && RefThrough(std::move(Addr), Pointee, St.Var, Err)
                    && LowerArg(*Rhs, BP, St.Value, Err);
             }
-            else if (const Json* Elem = LK == "MemberExpr" ? MapElementUnder(*Lhs) : nullptr)
+            else if (const Json* Elem = LK == "MemberExpr" ? MapElementUnder(Rooted) : nullptr)
             {
-                /* `Map[Key].A.B = v`: Map_Find copies the value out, so the store is `T E = Map[Key]; E.A.B = v;
-                   Map[Key] = E;`, v first as C++17 sequences it, and the key once. */
+                /* `Map[Key].A.B = v` (or `V.A.B = v`, V an `auto& [K, V]`): Map_Find copies the value out, so the store
+                   is `T E = Map[Key]; E.A.B = v; Map[Key] = E;`, v first as C++17 sequences it, and the key once. */
                 Json Pre = Json::array();
                 const Json Value = HoistExpr(*Rhs, Pre);
                 const Json Place = StabilizeLvalue(*Elem, Pre);
@@ -5160,7 +5178,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                     Up["inner"][0] = Reroot(N["inner"][0]);
                     return Up;
                 };
-                Pre.push_back(AssignOf(Reroot(*Lhs), Value));
+                Pre.push_back(AssignOf(Reroot(Rooted), Value));
                 Pre.push_back(AssignOf(Place, E));
                 const Json Wrap = { { "kind", "CompoundStmt" }, { "inner", std::move(Pre) } };
                 bOk = LowerBody(Wrap, BP, Out, Locals, Err);
@@ -6092,7 +6110,7 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
         const std::string Type = TypeOf(*Parms[I]);
         const Json* Bare = PeelLvalue(Args[I]);
         if (Type.empty() || Type.back() != '&' || !Bare || IsDerefLvalue(*Bare)) return nullptr;
-        if (IsAliasable(*Bare)) return Bare;
+        if (IsAliasable(*Bare) || IsAliasable(Unalias(*Bare))) return Bare;
         const Json* Arr = IsTArrayElement(*Bare) ? PeelLvalue(Nth(*Bare, 1)) : nullptr;
         return Arr && IsAliasable(*Arr) && Nth(*Bare, 2) ? Bare : nullptr;
     };
@@ -6404,30 +6422,42 @@ bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vec
         ForEach(*LoopDecl, [&](const Json& C) { if (Kind(C) == "BindingDecl") Bindings.push_back(&C); });
         if (Bindings.size() != 2) { *Err = "a TMap range-for binds exactly `auto [Key, Value]`"; --LoopDepth; return false; }
         const std::string Key = "__RangeKey" + N + "__", Val = "__RangeVal" + N + "__";
-        if (!AddLocal(Key, Args[0]) || !AddLocal(Val, Args[1])) { --LoopDepth; return false; }
+        if (!AddLocal(Key, Args[0])) { --LoopDepth; return false; }
         FArgIR KeyAt;
         if (!LowerArg(Elem, BP, KeyAt, Err)) { --LoopDepth; return false; }
         Loop.Body->push_back(AssignStmt(Key, Args[0], std::move(KeyAt)));
-        FStmtIR Find = CallStmt("BlueprintMapLibrary", "Map_Find", { Range, LocalArg(Key), LocalArg(Val) });
-        if (IsContainerType(StripTypeKeywords(Args[1])))
-        {
-            /* A nested container value is a wrapper struct: Map_Find fills a wrapper temp, then Val is its Value. */
-            FArgIR Call;
-            Call.K = FArgIR::Call;
-            Call.Sub = std::make_shared<FCallIR>(Find.Call);
-            if (!NestedWrapperOut(Args[1], 2, "", AssignStmt(Val, Args[1], FArgIR()), BP, Call, Err)) { --LoopDepth; return false; }
-            Find = Call.Sub->Inline->front();
-        }
-        Loop.Body->push_back(std::move(Find));
         RefAlias[Bindings[0]->value("id", std::string())] = RefToLocal(Key, Args[0]);
-        RefAlias[Bindings[1]->value("id", std::string())] = RefToLocal(Val, Args[1]);
         const std::string PairTy = TypeOf(*LoopDecl);
         const bool bByRef = !PairTy.empty() && PairTy.back() == '&' && StripTypeKeywords(PairTy) == PairTy;   // `auto& [K, V]`
-        if (bByRef && !OnlyRead(*Body, Bindings[1]->value("id", std::string())))
+        /* `auto& [K, V]` names the map's own value: V is `Map[K]`, each read a Map_Find and each store a Map_Add, so
+           a write through either name is what the other reads next. A container value stays a copy written back at
+           the end of each pass (below): every operation on it through the map would copy it whole. */
+        if (bByRef && !IsContainerType(StripTypeKeywords(Args[1])))
+            RefAlias[Bindings[1]->value("id", std::string())] =
+                { {"kind", "CXXOperatorCallExpr"}, {"type", {{"qualType", Args[1]}}},
+                  {"inner", Json::array({ Json{ {"kind", "DeclRefExpr"}, {"referencedDecl", {{"kind", "CXXMethodDecl"}, {"name", "operator[]"}}} },
+                                          *RangeExpr, RefToLocal(Key, Args[0]) })} };
+        else
         {
-            FStmtIR Back = CallStmt("BlueprintMapLibrary", "Map_Add", { Range, LocalArg(Key), LocalArg(Val) });
-            Loop.Inc->push_back(Back);
-            Loop.Trailer = std::make_shared<std::vector<FStmtIR>>(1, Back);
+            if (!AddLocal(Val, Args[1])) { --LoopDepth; return false; }
+            FStmtIR Find = CallStmt("BlueprintMapLibrary", "Map_Find", { Range, LocalArg(Key), LocalArg(Val) });
+            if (IsContainerType(StripTypeKeywords(Args[1])))
+            {
+                /* A nested container value is a wrapper struct: Map_Find fills a wrapper temp, then Val is its Value. */
+                FArgIR Call;
+                Call.K = FArgIR::Call;
+                Call.Sub = std::make_shared<FCallIR>(Find.Call);
+                if (!NestedWrapperOut(Args[1], 2, "", AssignStmt(Val, Args[1], FArgIR()), BP, Call, Err)) { --LoopDepth; return false; }
+                Find = Call.Sub->Inline->front();
+            }
+            Loop.Body->push_back(std::move(Find));
+            RefAlias[Bindings[1]->value("id", std::string())] = RefToLocal(Val, Args[1]);
+            if (bByRef && !OnlyRead(*Body, Bindings[1]->value("id", std::string())))
+            {
+                FStmtIR Back = CallStmt("BlueprintMapLibrary", "Map_Add", { Range, LocalArg(Key), LocalArg(Val) });
+                Loop.Inc->push_back(Back);
+                Loop.Trailer = std::make_shared<std::vector<FStmtIR>>(1, Back);
+            }
         }
     }
     Json BodyWrap = Kind(*Body) == "CompoundStmt" ? *Body : Json{ {"kind", "CompoundStmt"}, {"inner", Json::array({ *Body })} };
