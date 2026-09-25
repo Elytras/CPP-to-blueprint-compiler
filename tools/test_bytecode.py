@@ -701,6 +701,12 @@ def const_sees_store(f):
     return s
 
 
+def add_grown(f, k):
+    f['Lists'][k].append(k)                 # Grow(K), the argument, first
+    f['Lists'][k].append(len(f['Lists'][k]))
+    return len(f['Lists'][k]) * 100 + f['Lists'][k][-1]
+
+
 def nudge_spots(f, by):
     s = 0
     for p in f['Spots'].values():
@@ -729,6 +735,7 @@ n = 0
 for fn, oracle, parms, cases in (
         ('ListsInPlace', lists_in_place, [dict(D=d) for d in (0, 3, -2)], [dict(Lists=m) for m in ({}, {1: []}, {1: [5], 4: [2, 9]})]),
         ('ConstSeesStore', const_sees_store, [{}], [dict(Lists=m) for m in ({}, {3: []}, {1: [5], 4: [2, 9]})]),
+        ('AddGrown', add_grown, [dict(K=4)], [dict(Lists=m) for m in ({4: []}, {1: [5], 4: [2, 9]})]),
         ('NudgeSpots', nudge_spots, [dict(By=b) for b in (0, 3)],
          [dict(Spots=m) for m in ({}, {'a': {'X': 1, 'Y': 2}, 'b': {'X': -5, 'Y': 7}})]),
         ('DropNegatives', drop_negatives, [{}], [dict(Scores=m) for m in ({}, {'a': -1}, {'a': 1, 'b': -20, 'c': 3, 'd': -4})])):
@@ -751,7 +758,8 @@ mine['Lists'] = runscript.Holey({1: [5], 4: [2, 9]}, (1,))
 assert (run(asset('RangeTest'), 'ListsInPlace', self_vars=mine, D=3)[0], mine) == (lists_in_place(theirs, 3), theirs), mine
 # V is the value itself, so a T& binds it: no copy, and no warning that there is one.
 assert 'Blueprint has no reference to it' not in LOGS['RangeTest'], LOGS['RangeTest']
-print("ok  RangeTest: `auto& [K, V]` over a TMap walks its slots in place, a container value and a T& to V included  (%d cases)" % (n + 1))
+print("ok  RangeTest: `auto& [K, V]` over a TMap walks its slots in place, a container value and a T& to V included;"
+      " `Lists[K].Add(X)` runs on a copy stored back, X first  (%d cases)" % (n + 1))
 
 
 def range_members():

@@ -179,32 +179,40 @@ public:
     }
   }
 
-  /* A container value is the map's own too: V.Add changes the array `Lists[K]` reads, and a store to `Lists[K]` is what
-     V holds next. */
+  /* A container value is the map's own too: V.Add changes the array `Lists[K]` reads, and `Lists[K].Add` is what V
+     holds next. */
   int32 ListsInPlace(int32 D) {
     int32 Sum = 0;
     for (auto &[K, V] : Lists) {
       V.Add(K * D);
-      TArray<int32> More = Lists[K];
-      Sum += More.Num();
-      More.Add(7);
-      Lists[K] = More;
+      Sum += Lists[K].Num();
+      Lists[K].Add(7);
       for (int32 &X : V) X += 1;
       Sum += V.Num() * 10 + V[V.Num() - 1] * 100;
     }
     return Sum;
   }
 
-  /* `const auto&` names the value where it lives as well: a store through the map is what it reads. */
+  /* `const auto&` names the value where it lives as well: a change through the map is what it reads. */
   int32 ConstSeesStore() {
     int32 Sum = 0;
     for (const auto &[K, V] : Lists) {
-      TArray<int32> More = V;
-      More.Add(1);
-      Lists[K] = More;
+      Lists[K].Add(1);
       Sum += V.Num();
     }
     return Sum;
+  }
+
+  /* `Lists[K].Add(X)` runs on a copy stored back, and X, which C++ evaluates after locating `Lists[K]`, still runs
+     first: the element it changes is the one Add appends to. */
+  int32 Grow(int32 K) {
+    Lists[K].Add(K);
+    return Lists[K].Num();
+  }
+  int32 AddGrown(int32 K) {
+    Lists[K].Add(Grow(K));
+    TArray<int32> L = Lists[K];
+    return L.Num() * 100 + L[L.Num() - 1];
   }
 
   /* A T& binds the value itself, so there is no copy to warn about. */

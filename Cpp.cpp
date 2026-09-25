@@ -2582,6 +2582,15 @@ const Json* MapElementUnder(const Json& N)
     return P && IsTMapElement(*P) ? P : nullptr;
 }
 
+/* The container library functions that leave their container as it was. */
+bool IsContainerRead(const std::string& Method)
+{
+    static const std::set<std::string> Reads = { "Length", "LastIndex", "IsValidIndex", "Contains", "Find", "Get",
+                                                 "Keys", "Values", "ToArray", "Identical", "Difference",
+                                                 "Intersection", "Union" };
+    return Reads.count(Method) != 0;
+}
+
 /* A TMap or TSet anywhere in a property, a nested one's wrapper included: the engine replicates neither. */
 bool HoldsMapOrSet(const FPropertyDef& P)
 {
@@ -3235,14 +3244,18 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             const std::string Prefix = C[1] == 'A' ? "Array_" : C[1] == 'S' ? "Set_" : "Map_";
             std::string Method = Name(*Callee);
             if (Method == "Num") Method = "Length";
+            /* `Map[K].Add(X)`: Blueprint has no reference to a map element, so the call runs on a copy. */
+            if (MapElementUnder(Unalias(*Obj)))
+            {
+                Out.K = FArgIR::Call;
+                Out.Sub = std::make_shared<FCallIR>();
+                return LowerCopyBack(*N, { { First(*Callee), "" } }, Method, BP, *Out.Sub, Err);
+            }
             FArgIR Target;
             if (!LowerArg(*Obj, BP, Target, Err)) return false;
             if (Target.K != FArgIR::Field && Target.K != FArgIR::Local && Target.K != FArgIR::LocalOut && Target.K != FArgIR::Member)
             { *Err = "a container operation needs a variable, not a computed value: " + Method; return false; }
-            static const std::set<std::string> Reads = { "Length", "LastIndex", "IsValidIndex", "Contains", "Find", "Get",
-                                                         "Keys", "Values", "ToArray", "Identical", "Difference",
-                                                         "Intersection", "Union" };
-            if (!Reads.count(Method)) WarnRpcRefWrite(Target);
+            if (!IsContainerRead(Method)) WarnRpcRefWrite(Target);
             Out.K = FArgIR::Call;
             Out.Sub = std::make_shared<FCallIR>();
             Out.Sub->Fn = BP.EngineFunction("/Script/Engine", Lib, Prefix + Method);
@@ -4142,7 +4155,10 @@ bool FCompiler::LowerUpdateValue(const Json& N, FBlueprintClass& BP, FArgIR& Out
    whichever variable `C ? X : Y` picks. So the call is sugar for
        <what locates the place: key, condition, object, pinned>  T Copy = <the place>;  <the call on Copy>;  <the place> = Copy;
    the place fixed before the call, as a reference is bound. A copy is not a reference, though: code that reads the
-   place while the call runs sees it unchanged, hence the warning. */
+   place while the call runs sees it unchanged, hence the warning.
+   An empty parameter name is the receiver of a container method, `Map[K].Add(X)`: the library function runs no code
+   of the mod's, so nothing can tell the copy from the place and there is no warning. What C++ evaluates between
+   locating the place and the call, the arguments, goes before the copy; a method that only reads stores nothing. */
 bool FCompiler::LowerCopyBack(const Json& Call, const std::vector<std::pair<const Json*, std::string>>& Refs,
                               const std::string& Method, FBlueprintClass& BP, FCallIR& Out, std::string* Err)
 {
@@ -4150,9 +4166,12 @@ bool FCompiler::LowerCopyBack(const Json& Call, const std::vector<std::pair<cons
     Json Pre = Json::array(), Back = Json::array(), Again = Call;
     for (const auto& [Arg, Parm] : Refs)
     {
+        const bool bReceiver = Parm.empty();
         size_t At = 1;
-        while (At < Call["inner"].size() && &Call["inner"][At] != Arg) ++At;
-        if (At == Call["inner"].size()) { *Err = "internal: " + Method + "'s argument for " + Parm + " is not in the call"; return false; }
+        while (!bReceiver && At < Call["inner"].size() && &Call["inner"][At] != Arg) ++At;
+        if (bReceiver ? !First(Call) || Kind(*First(Call)) != "MemberExpr" || First(*First(Call)) != Arg : At == Call["inner"].size())
+        { *Err = "internal: " + Method + "'s " + (bReceiver ? "object" : "argument for " + Parm) + " is not in the call"; return false; }
+        Json& Slot = bReceiver ? Again["inner"][0]["inner"][0] : Again["inner"][At];
         const Json& Bare = *PeelLvalue(Arg);
         const bool bSel = Kind(Bare) == "ConditionalOperator";
         Json Place = Bare;
@@ -4169,11 +4188,20 @@ bool FCompiler::LowerCopyBack(const Json& Call, const std::vector<std::pair<cons
             Place["inner"][2] = StabilizeLvalue(Bare["inner"][2], Pre, true);
         }
         else Place = StabilizeLvalue(Bare, Pre, true);
+        if (bReceiver)
+            for (size_t I = 1; I < Again["inner"].size(); ++I)
+            {
+                // ponytail: a value only; an argument bound to a place (`T&`) is left where it is.
+                Json& A = Kind(Again["inner"][I]) == "MaterializeTemporaryExpr" ? Again["inner"][I]["inner"][0] : Again["inner"][I];
+                if (A.value("valueCategory", std::string()) == "prvalue" && Kind(A) != "CXXDefaultArgExpr") A = HoistExpr(A, Pre);
+            }
         const Json Copy = SynthLocal(StripTypeKeywords(TypeOf(Bare)), ReadOf(Place), Pre);
-        Back.push_back(bSel ? Json{ {"kind", "IfStmt"}, {"inner", Json::array({Place["inner"][0], AssignOf(Place["inner"][1], Copy),
-                                                                                 AssignOf(Place["inner"][2], Copy)})} }
-                            : AssignOf(Place, Copy));
-        Again["inner"][At] = Copy["inner"][0];      // the local itself, which the call takes by reference
+        if (!bReceiver || !IsContainerRead(Method))
+            Back.push_back(bSel ? Json{ {"kind", "IfStmt"}, {"inner", Json::array({Place["inner"][0], AssignOf(Place["inner"][1], Copy),
+                                                                                     AssignOf(Place["inner"][2], Copy)})} }
+                                : AssignOf(Place, Copy));
+        Slot = Copy["inner"][0];      // the local itself, which the call takes by reference
+        if (bReceiver) continue;
         const Json Seen = Unalias(Bare);
         const std::string What = IsTMapElement(*PeelLvalue(&Seen)) ? "a map element" : MapElementUnder(Seen) ? "a map element's member"
                                : bSel ? "`C ? X : Y`" : "that expression";
