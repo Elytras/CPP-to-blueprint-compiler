@@ -24,7 +24,8 @@ int main(int argc, char** argv)
             if (std::string(argv[I]) == "--api") ApiDir = argv[I + 1];
 
         std::string Err;
-        if (CompileToAssets(argv[2], argv[3], argv[4], ApiDir, &Err)) return 0;
+        try { if (CompileToAssets(argv[2], argv[3], argv[4], ApiDir, &Err)) return 0; }
+        catch (const std::exception& E) { Err = std::string("internal error: ") + E.what(); }   // not a silent 0xC0000409
         printf("  FAILED: %s\n", Err.c_str());
         return 1;
     }

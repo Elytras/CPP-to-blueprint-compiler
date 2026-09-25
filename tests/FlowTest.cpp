@@ -445,6 +445,38 @@ public:
   static inline int32 Offset(int32 X, int32 By = 7) { return X + By; }
   int32 UseDefault(int32 X) { return Times(X) + Times(X, 10) + Offset(X) * 1000; }
 
+  /* An rvalue bound to a script function's const&: the VM steps it with no result buffer, so it needs a local. */
+  int32 RefSum(const int32& A) { return A + 1; }
+  int32 RefRvalue(int32 X) { return RefSum(4) + RefSum(X * 2) + RefSum(X); }
+
+  /* The empty statement is nothing: a loop with no body, [[fallthrough]], a label on nothing. */
+  int32 Empty(int32 N) {
+    int32 I = 0, R = 0;
+    while (++I < N)
+      ;
+    switch (N) { case 1: R += 10; [[fallthrough]]; case 2: R += 20; break; default: break; }
+    if (N < 0) goto Done;
+    R += 100;
+  Done: ;
+    return I + R;
+  }
+
+  /* A `for` may leave out any part; no condition is `true`, and `continue` still reaches the increment. */
+  int32 ForParts(int32 N) {
+    int32 I = 0, S = 0, T = 0;
+    for (; I < N; I++) {}
+    for (int32 J = 0; J < N;) { ++J; ++T; }
+    for (int32 J = 0;; ++J) { if (J >= N) break; if (J == 1) continue; S += J; }
+    for (;;) { if (T <= 0) break; --T; S += 1000; }
+    return I + S * 10;
+  }
+  /* A `for` condition may declare a variable: it is made again, and tested, each time round. */
+  int32 ForCondVar(int32 N) {
+    int32 S = 0;
+    for (int32 I = 0; int32 L = N - I; ++I) { if (L == 2) continue; S += L; }
+    return S;
+  }
+
   /* UE_NAME_SWITCH: a comparison per case, case-insensitive as FName is. */
   /* FName converts to bool as Name != None. */
   int32 NameSet(FName N) { bool B = static_cast<bool>(N); if (N) return B ? 1 : 9; return !N ? 2 : 9; }

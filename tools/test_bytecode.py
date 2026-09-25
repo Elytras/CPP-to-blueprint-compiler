@@ -8,7 +8,8 @@ function a call reaches). Never the bytecode's shape: an optimization that keeps
 
 --assetgen defaults to the first build found (ue-mods x64/Release, this repo's x64/Release, a CMake build/);
 --ueapi to ue-mods' BpMods/UeApi. Outside ue-mods, pass the UeApi of https://github.com/Elytras/DRG-Blueprint-Cpp-SDK."""
-import copy, glob, os, re, shutil, subprocess, sys
+import copy, glob, itertools, os, re, shutil, subprocess, sys
+os.environ['PYTHONIOENCODING'] = 'utf-8'   # the dump tools print non-ASCII names; read back as UTF-8, not the code page
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import runscript
 from runscript import run, i32
@@ -34,6 +35,9 @@ if not ASSETGEN or not UEAPI:
     sys.exit(__doc__)
 
 
+LOGS = {}      # what each test's compile printed
+
+
 def build():
     """Each test compiles into build/<Test>/FSD/Content/<its package>, the layout bpbuild stages a mod in."""
     shutil.rmtree(ROOT, ignore_errors=True)
@@ -42,8 +46,9 @@ def build():
         package = re.search(r'UE_MOD_PACKAGE\s*\(\s*"/Game/([^"]+)"', open(src, encoding='utf-8-sig').read()).group(1)
         out = os.path.join(ROOT, mod, 'FSD', 'Content', *package.split('/'))
         os.makedirs(out)
-        proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, out], capture_output=True, text=True)
+        proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, out], capture_output=True, encoding='utf-8')
         assert proc.returncode == 0, '%s:\n%s%s' % (mod, proc.stdout, proc.stderr)
+        LOGS[mod] = proc.stdout
     print('ok  every test compiles')
 
 
@@ -54,8 +59,20 @@ def asset(mod):
     return os.path.join(ROOT, mod, 'FSD', 'Content', '_ElytrasMods', mod, mod)
 
 
+def refused(mod, body, why, top=''):
+    """A mod (the class body given, `top` before the class) the compiler must refuse, saying why."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, mod + '.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\n%s'
+                    'class %s : public AActor {\npublic:\n%s};\n' % (mod, top, mod, body))
+        proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, tmp], capture_output=True, encoding='utf-8')
+        assert proc.returncode != 0 and why in proc.stdout, (mod, proc.stdout)
+
+
 def dump(t, base, i):
-    return subprocess.run([sys.executable, os.path.join(HERE, t), base, str(i)], capture_output=True, text=True).stdout
+    return subprocess.run([sys.executable, os.path.join(HERE, t), base, str(i)], capture_output=True, encoding='utf-8').stdout
 
 
 def exports_of(base):
@@ -100,7 +117,7 @@ def registry_of(mod):
 
 def registry_rows(path):
     return set(re.findall(r'^\s+(/Game/\S+)\s+(\S+)$', subprocess.run(
-        [sys.executable, os.path.join(HERE, 'dumpar.py'), path], capture_output=True, text=True).stdout, re.M))
+        [sys.executable, os.path.join(HERE, 'dumpar.py'), path], capture_output=True, encoding='utf-8').stdout, re.M))
 
 
 def registry_layout():
@@ -116,7 +133,7 @@ def registry_layout():
         merged = os.path.join(tmp, 'AssetRegistry.bin')
         for twice in range(2):
             proc = subprocess.run([ASSETGEN, 'registry', merged, registry_of('AssetTest'), registry_of('IfaceTest')],
-                                  capture_output=True, text=True)
+                                  capture_output=True, encoding='utf-8')
             assert proc.returncode == 0 and registry_rows(merged) == a | b, (proc.stdout, registry_rows(merged))
     print('ok  every registry is FSD/AssetRegistry.bin; `assetgen registry` merges them, once per package')
 
@@ -137,12 +154,12 @@ def registry_non_ascii():
         rows = lambda path: [(r['object_path'], r['package_path'], r['asset_class'], r['package_name'], r['asset_name'])
                              for r in dumpar.read(path)[2]]
         for twice in range(2):
-            proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, tmp], capture_output=True, text=True)
+            proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, tmp], capture_output=True, encoding='utf-8')
             assert proc.returncode == 0, proc.stdout + proc.stderr
             assert rows(os.path.join(tmp, 'AssetRegistry.bin')) == want, rows(os.path.join(tmp, 'AssetRegistry.bin'))
         merged = os.path.join(tmp, 'Merged.bin')
         proc = subprocess.run([ASSETGEN, 'registry', merged, os.path.join(tmp, 'AssetRegistry.bin'), registry_of('AssetTest')],
-                              capture_output=True, text=True)
+                              capture_output=True, encoding='utf-8')
         assert proc.returncode == 0 and set(want) <= set(rows(merged)), (proc.stdout, rows(merged))
     print('ok  a non-ASCII asset name reads back from the registry as written, and merges')
 
@@ -161,7 +178,7 @@ def sweep():
         exports = dumpexp.load(base)[5]
         for i in range(len(exports)):
             out = subprocess.run([sys.executable, os.path.join(here, 'walkscript.py'), base, str(i)],
-                                 capture_output=True, text=True).stdout
+                                 capture_output=True, encoding='utf-8').stdout
             m = re.search(r'walked: disk (\d+) \(header (\d+)\)  mem (\d+) \(header (\d+)\)', out)
             if not m: continue
             assert m.group(1) == m.group(2) and m.group(3) == m.group(4), '%s export %d: %s' % (base, i, m.group(0))
@@ -447,6 +464,10 @@ check('FlowTest', 'ConstBreak', lambda X: 205, [dict(X=0)])
 vm = VM(asset('FlowTest'))
 assert [vm.call('UseDefault', X=x) for x in (-2, 0, 5)] == [(x * 3 + x * 10 + (x + 7) * 1000) for x in (-2, 0, 5)]
 print('ok  FlowTest.UseDefault: a defaulted argument is the parameter\'s default, to a method and inlined')
+check('FlowTest', 'RefRvalue', lambda X: 5 + (2 * X + 1) + (X + 1), [dict(X=x) for x in (-4, 0, 9)])   # runvm refuses a non-variable
+check('FlowTest', 'Empty', lambda N: max(N, 1) + {1: 30, 2: 20}.get(N, 0) + (100 if N >= 0 else 0), [dict(N=n) for n in (-3, 0, 1, 2, 5)])
+check('FlowTest', 'ForParts', lambda N: max(N, 0) + 10 * (sum(j for j in range(N) if j != 1) + 1000 * max(N, 0)), [dict(N=n) for n in (-2, 0, 1, 2, 6)])
+check('FlowTest', 'ForCondVar', lambda N: sum(l for l in range(1, N + 1) if l != 2), [dict(N=n) for n in (0, 1, 2, 5)])
 check('FlowTest', 'Compound', compound, [dict(N=n) for n in (0, 1, 5, 40)])
 check('FlowTest', 'WhileAnd', while_and, [dict(Limit=l) for l in (0, 1, 50, 99, 150)])
 
@@ -586,6 +607,27 @@ for fn, oracle in (('BumpScoresUntil', bump_until), ('CapScores', cap_scores), (
             assert (got, mine) == (want, theirs), '%s(%s, %s) = %r %r, want %r %r' % (fn, m, stop, got, mine, want, theirs)
             n += 1
 print('ok  RangeTest: a return from a reference TMap loop writes the changed value back  (%d cases)' % n)
+
+
+def seen_in_body(f, d):
+    s = 0
+    for k in f['Scores']:
+        f['Scores'][k] = i32(f['Scores'][k] + d)
+        s = i32(s + f['Scores'][k])
+        f['Scores'][k] = i32(i32(f['Scores'][k] * 2) + 1)
+        s = i32(s + i32(f['Scores'][k] * 100))
+    return s
+
+
+n = 0
+for d in (0, 2, -7, 2**31 - 1):
+    for m in ({}, {'a': 30}, {'a': 1, 'b': 20, 'c': 3}):
+        mine, theirs = range_self(Scores=m), range_self(Scores=m)
+        got = run(asset('RangeTest'), 'SeenInBody', self_vars=mine, D=d)[0]
+        want = seen_in_body(theirs, d)
+        assert (got, mine) == (want, theirs), ('SeenInBody', m, d, got, mine, want, theirs)
+        n += 1
+print("ok  RangeTest.SeenInBody: `auto& [K, V]` is the map's own value, a write through either name read through the other  (%d cases)" % n)
 for m in ({}, {'a': {'X': 1, 'Y': 2}}, {'a': {'X': -1, 'Y': 0}, 'b': {'X': 5, 'Y': 7}}):
     f = dict(Spots={k: dict(v) for k, v in m.items()})
     got = run(asset('RangeTest'), 'ShiftSpots', self_vars=f)[0]
@@ -742,7 +784,7 @@ def inline_mixed_overloads():
         for mod, body in mods.items():
             with open(os.path.join(tmp, mod + '.cpp'), 'w') as f:
                 f.write(head % (mod, mod) + body)
-            proc = subprocess.run([ASSETGEN, 'compile', os.path.join(tmp, mod + '.cpp'), UEAPI, tmp], capture_output=True, text=True)
+            proc = subprocess.run([ASSETGEN, 'compile', os.path.join(tmp, mod + '.cpp'), UEAPI, tmp], capture_output=True, encoding='utf-8')
             if mod == 'MixOk':
                 assert proc.returncode == 0, proc.stdout + proc.stderr
                 for v in (-3, 0, 5):
@@ -752,11 +794,57 @@ def inline_mixed_overloads():
     print('ok  InlineTest: an overload set mixing inline and non-inline is refused where it would call no UFunction')
 
 
+def copy_back():
+    """A written T& bound to what Blueprint has no reference to (a map element, `C ? X : Y`) gets a copy, stored back
+    after the call into the place picked at the call, and a warning says it is a copy."""
+    t = asset('InlineTest')
+    for c in (0, 5):
+        for k in (1, 2):
+            f, m = dict(Counter=c), {1: 10, 2: 20}
+            m[k] += 8
+            got = run(t, 'RefMap', self_vars=f, K=k)[0]
+            assert got == m[1] * 100 + m[2] and f == dict(Counter=c + 1), ('RefMap', k, c, got, f)
+        for sel in (True, False):
+            f = dict(Counter=c)
+            got = run(t, 'RefSel', self_vars=f, C=sel)[0]
+            assert got == (1602 if sel else 117) and f == dict(Counter=c + 1), ('RefSel', sel, c, got, f)
+        for by in (-3, 4):
+            vm = VM(t, Counter=c, Calls=7)
+            got = vm.call('RefObj', By=by)
+            assert got == (7 + by) * 10 + c + 1 and vm.self.vars == dict(Counter=c + 1, Calls=7 + by), ('RefObj', by, c, got, vm.self.vars)
+    # An inline's T& bound to `O->A` is A itself, through O pinned at the call: no copy, so no warning.
+    vm = VM(t, Calls=7)
+    assert vm.call('RefObjLive') == 12 and vm.self.vars == dict(Calls=12), vm.self.vars
+    for by in (-3, 4):
+        vm = VM(t, Counter=5, Calls=0, Arr=[])
+        got = vm.call('RefDeep', By=by)
+        assert got == (10 + by) * 100 + 10 + 6 and vm.self.vars == dict(Counter=6, Calls=1, Arr=[10 + by]), ('RefDeep', by, got, vm.self.vars)
+    assert 'InlineTest::RefObj' not in LOGS['InlineTest'] and 'InlineTest::RefDeep' not in LOGS['InlineTest'], LOGS['InlineTest']
+    f = dict(Key=9)
+    got = run(t, 'RefPinned', self_vars=f)[0]
+    assert got == 15 * 1000000 + 15 * 10000 + 40 * 100 + 3 and f == dict(Key=5), ('RefPinned', got, f)
+    for fn, callee, what in (('RefMap', 'Add5', 'a map element'), ('RefMap', 'InlineTest::Bump', 'a map element'),
+                             ('RefSel', 'Add5', '`C ? X : Y`'), ('RefSel', 'InlineTest::Bump', '`C ? X : Y`'),
+                             ('RefPinned', 'AddKey', 'a map element')):
+        line = "warning: InlineTest::%s: %s's reference parameter V is bound to %s" % (fn, callee, what)
+        assert line in LOGS['InlineTest'], (line, LOGS['InlineTest'])
+    # Both sides of `C ? X : Y` are located before the call, so one found by a call, which C++ runs only when picked, is refused.
+    refused('RefSelCall', '  void Add5(int32& V) { V += 5; }\n  int32 K() { return 1; }\n'
+            '  int32 F(bool C) { TMap<int32, int32> M; int32 X = 1; Add5(C ? M[K()] : X); return X; }\n', 'found by a call')
+    print('ok  InlineTest: a written reference bound to a map element or `C ? X : Y` is copied in and back, and warned; '
+          'an inline one bound to `O->A` is A itself')
+
+
 inline_members()
 inline_statics()
 no_inline_ufunctions()
 inline_regressions()
 inline_mixed_overloads()
+copy_back()
+# A mod class's asset is named after it, so a namespaced one is refused by name, not as an unwritable `Ns::X.uasset`.
+refused('NsClass', '  int32 F() { return 1; }\n', 'Ns::UThing: a mod class, struct or interface cannot be declared in a namespace',
+        top='namespace Ns { class UThing : public UObject { public: int32 X; }; }\n')
+print('ok  a mod class in a namespace is refused, naming it')
 
 
 # ---- OptTest
@@ -931,9 +1019,9 @@ def mod_enum():
     pairs = [(names[struct.unpack_from('<i', raw, 16 + i * 16)[0]], struct.unpack_from('<q', raw, 24 + i * 16)[0]) for i in range(count)]
     assert pairs == [('EMood::Calm', 0), ('EMood::Angry', 5), ('EMood::Sleepy', 6), ('EMood::EMood_MAX', 7)], pairs
     exports = [e['name'] for e in dumpexp.load(base)[5]]
-    cls = subprocess.run([sys.executable, os.path.join(here, 'dumpstruct.py'), base, '0'], capture_output=True, text=True).stdout
+    cls = subprocess.run([sys.executable, os.path.join(here, 'dumpstruct.py'), base, '0'], capture_output=True, encoding='utf-8').stdout
     assert re.search(r'ByteProperty Mood .*EMood', cls), cls
-    cdo = subprocess.run([sys.executable, os.path.join(here, 'dumptags.py'), base, str(exports.index('Default__TypesTest_C'))], capture_output=True, text=True).stdout
+    cdo = subprocess.run([sys.executable, os.path.join(here, 'dumptags.py'), base, str(exports.index('Default__TypesTest_C'))], capture_output=True, encoding='utf-8').stdout
     assert 'EMood::Angry' in cdo, cdo
     print('ok  TypesTest: UE_ENUM cooks EMood with its C++ names and values; the default is its enumerator')
     for enum, pairs_want in (('ESpan', [('ESpan::Tiny', -3), ('ESpan::Wide', 70000), ('ESpan::Huge', 70001), ('ESpan::Vast', 70002), ('ESpan::ESpan_MAX', 70003)]),
@@ -960,7 +1048,7 @@ def constants():
     here = os.path.dirname(os.path.abspath(__file__))
     base = asset('TypesTest')
     exports = [e['name'] for e in dumpexp.load(base)[5]]
-    cdo = subprocess.run([sys.executable, os.path.join(here, 'dumptags.py'), base, str(exports.index('Default__TypesTest_C'))], capture_output=True, text=True).stdout
+    cdo = subprocess.run([sys.executable, os.path.join(here, 'dumptags.py'), base, str(exports.index('Default__TypesTest_C'))], capture_output=True, encoding='utf-8').stdout
     for want in ('Seed [0] IntProperty size=4: %d' % fnv('types'), 'Budget [0] IntProperty size=4: 25', 'Reach [0] FloatProperty size=4: 125.0', 'Bits [0] IntProperty size=4: 236',
                  'Halfway [0] BoolProperty size=0 value=1'):
         assert want in cdo, (want, cdo)
@@ -981,7 +1069,7 @@ def constants():
     print('ok  TypesTest: UE_ENUM_MAP fills a map from the enum, either way round')
     base = asset('TypesTest')
     exports = [e['name'] for e in dumpexp.load(base)[5]]
-    tool = lambda t, i: subprocess.run([sys.executable, os.path.join(here, t), base, str(i)], capture_output=True, text=True).stdout
+    tool = lambda t, i: subprocess.run([sys.executable, os.path.join(here, t), base, str(i)], capture_output=True, encoding='utf-8').stdout
     assert re.search(r"ObjectProperty Aimed .*Class'Actor'", tool('dumpstruct.py', 0)), 'a `using` alias of a class is still an object reference'
     assert re.search(r"ObjectProperty Spotted .*Class'Pawn'", tool('dumpstruct.py', 0)), 'and so is a class-scope one'
     forget = ' '.join(tool('walkscript.py', exports.index('Forget')).split())
@@ -1000,6 +1088,12 @@ def types_behaviour():
           [dict(X=x, M=m) for x in EDGE + (-3, -1, -17) for m in (1, 4, 31)])
     check('TypesTest', 'Shr64', lambda X, M: X >> (1 if M == 1 else 63),
           [dict(X=x, M=m) for x in (-2**63, -3, -1, 0, 5, 2**63 - 1) for m in (1, 63)])
+    # int64 -> float keeps only the low 32 bits (UE 4.27 has no int64 -> float): 2**32 + 5 is 5.
+    check('TypesTest', 'I64ToFloat', lambda X: float(wrap(X)), [dict(X=x) for x in (0, -3, 7, -2**31, 2**32 + 5, -2**32 - 7)])
+    check('TypesTest', 'TruncViaI64', lambda G: float(int(G)), [dict(G=g) for g in (0.0, 2.75, -2.75, 1e6 + 0.5)])
+    check('TypesTest', 'AllOnes', lambda: -1, [dict()])
+    check('TypesTest', 'Huge', lambda: float('inf'), [dict()])
+    check('TypesTest', 'PlusChar', lambda X: wrap(X + 128), [dict(X=x) for x in EDGE])
     check('TypesTest', 'ShiftByLL', lambda X, M: wrap(X << 2) if M == 0 else X >> (1 if M == 1 else 3),
           [dict(X=x, M=m) for x in EDGE + (-8, -7, -1) for m in (0, 1, 2)])
     import struct
@@ -1059,7 +1153,7 @@ def types_behaviour():
     # The class implements ITargetable, and each interface function it leaves out exists and returns the zero value,
     # so a call through the interface finds the Blueprint function rather than the interface's native one.
     here = os.path.dirname(os.path.abspath(__file__))
-    cls = subprocess.run([sys.executable, os.path.join(here, 'dumpstruct.py'), asset('TypesTest'), '0'], capture_output=True, text=True).stdout
+    cls = subprocess.run([sys.executable, os.path.join(here, 'dumpstruct.py'), asset('TypesTest'), '0'], capture_output=True, encoding='utf-8').stdout
     assert re.search(r"""Interfaces \[\("imp\[\d+\]:Class'Targetable'", 0, 1\)\]""", cls), cls
     for fn in ('GetTargetCenterMass', 'GetTargetHealthComponent', 'ShowDamageEffects'):
         assert run(asset('TypesTest'), fn)[0] is None, fn
@@ -1073,7 +1167,7 @@ def types_defaults():
     here, base = os.path.dirname(os.path.abspath(__file__)), asset('TypesTest')
     names, exports = dumpexp.load(base)[3], [e['name'] for e in dumpexp.load(base)[5]]
     cdo = subprocess.run([sys.executable, os.path.join(here, 'dumptags.py'), base, str(exports.index('Default__TypesTest_C'))],
-                         capture_output=True, text=True).stdout
+                         capture_output=True, encoding='utf-8').stdout
     raw = bytes.fromhex(re.search(r'Spans \[0\] ArrayProperty size=\d+ inner=StructProperty: (\w+)', cdo).group(1))
     o, spans = 4 + 49, []                                  # count, then the inner tag (name, type, size, index, struct, guid)
     for _ in range(struct.unpack_from('<i', raw, 0)[0]):
@@ -1153,6 +1247,13 @@ def struct_behaviour():
             assert (got, f) == (want, after), (fn, k, got, f)
             n += 1
     print('ok  StructTest: a local copy bound to a written reference leaves its source alone  (%d cases)' % n)
+    for k in (-7, 0, 2**31 - 1):
+        f = {'Table': {1: {}}, 'Keys': 0}
+        got = run(asset('StructTest'), 'MapMemberStore', self_vars=f, K=k)[0]
+        assert got == i32(k + 10) and f['Keys'] == 1 and list(f['Table']) == [1] \
+            and base_names(f['Table'][1]) == {'Inner': {'Kills': i32(k + 10)}, 'Stamp': 4}, (k, got, f)
+    assert "StructTest::MapMemberStore: AddTo's reference parameter V is bound to a map element's member" in LOGS['StructTest']
+    print("ok  StructTest: a store through a map element's members, or a reference to one, reaches the map, its key found once")
     f = {}
     runscript.MESSAGES.clear()
     run(asset('StructTest'), 'ReceiveBeginPlay', self_vars=f)
@@ -1161,6 +1262,13 @@ def struct_behaviour():
                              'Moody': {'Mood': 0, 'Level': 2}}, base_names(f)
     assert runscript.MESSAGES == [], runscript.MESSAGES
     print('ok  StructTest.ReceiveBeginPlay: member stores, whole-struct copies, nested members')
+    base = asset('StructTest')
+    lines = dump('dumptags.py', base, [e['name'] for e in dumpexp.load(base)[5]].index('Default__StructTest_C')).split('\n')
+    at = next(i for i, l in enumerate(lines) if l.startswith('  Deep [0] StructProperty'))
+    deep = [l.strip() for l in itertools.takewhile(lambda l: l.startswith('    '), lines[at + 1:]) if 'StructProperty' not in l]
+    assert deep == ['Kills [0] IntProperty size=4: 0', 'Time [0] FloatProperty size=4: 1.5', 'Alive [0] BoolProperty size=0 value=0:',
+                    'Owner [0] ObjectProperty size=4: index 0', 'Stamp [0] Int64Property size=8: 7'], deep
+    print('ok  StructTest: a designated member default gives the members it leaves out zero')
 
 
 def pointer_behaviour():
@@ -1185,19 +1293,21 @@ def pointer_behaviour():
         want += [pair[0] * 1000 + pair[1], pair[0] == 255]
         assert got == want, (pair, got, want)
     runscript.MEM.clear()
+    # An intrinsic whose value goes nowhere is no call (it was an EX_CallMath on null, which crashes the VM).
+    assert run(asset('PointerTest'), 'DiscardedIntrinsics', P=addr, N='x')[0] == 3
     # Kismet has no unsigned int32: a uint32 read would widen and compare as signed, so it is refused.
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
         with open(os.path.join(tmp, 'ReadU32.cpp'), 'w') as f:
             f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/ReadU32");\n'
                     'class ReadU32 : public AActor {\npublic:\n  int64 Get(uint32 *P) { return *P; }\n};\n')
-        proc = subprocess.run([ASSETGEN, 'compile', os.path.join(tmp, 'ReadU32.cpp'), UEAPI, tmp], capture_output=True, text=True)
+        proc = subprocess.run([ASSETGEN, 'compile', os.path.join(tmp, 'ReadU32.cpp'), UEAPI, tmp], capture_output=True, encoding='utf-8')
         assert proc.returncode != 0 and 'reading a uint32 through a pointer' in proc.stdout, proc.stdout
     # The synthesized read scratch is cooked beside the class, and the class imports it.
     d = dumpexp.load(os.path.join(os.path.dirname(asset('PointerTest')), 'FDeref'))
     assert [e['name'] for e in d[5]] == ['FDeref'] and "Class'UserDefinedStruct'" in d[4], d[4]
     assert "UserDefinedStruct'FDeref'" in dumpexp.load(asset('PointerTest'))[4]
-    print('ok  PointerTest: Advance, Bump (out-parm), Check, signed byte reads, uint32 reads refused; FDeref synthesized')
+    print('ok  PointerTest: Advance, Bump (out-parm), Check, signed byte reads, discarded intrinsics, uint32 reads refused; FDeref synthesized')
 
 
 mod_enum()
@@ -1394,15 +1504,17 @@ def parent_call():
         def ReceiveBeginPlay(s): s.Count = 1
         def Bump(s, By): s.Count += By; return s.Count
         def Twice(s, By): return s.Bump(By) + s.Bump(By)
+        TwiceInline = Twice
 
     class Test(Base):
         def ReceiveBeginPlay(s): Base.ReceiveBeginPlay(s); s.Count += 10
         def Bump(s, By): return Base.Bump(s, By * 2)
         def Thrice(s, By): return s.Twice(By) + s.Bump(By)
+        def ViaInline(s, By): return s.TwiceInline(By)
 
     n = 0
     for chain, model in (([base], Base), ([test, base], Test)):
-        for fn, args in (('ReceiveBeginPlay', {}), ('Bump', {'By': 3}), ('Twice', {'By': 2}), ('Thrice', {'By': 1})):
+        for fn, args in (('ReceiveBeginPlay', {}), ('Bump', {'By': 3}), ('Twice', {'By': 2}), ('Thrice', {'By': 1}), ('ViaInline', {'By': 2})):
             if not hasattr(model, fn): continue
             for count in (0, 5):
                 fields, obj = {'Count': count}, model(count)
@@ -1485,7 +1597,7 @@ def api_stub():
         os.makedirs(os.path.join(tmp, 'cooked'))
         os.makedirs(os.path.join(tmp, 'api'))
         proc = subprocess.run([ASSETGEN, 'compile', os.path.join(TESTS, 'NameTest.cpp'), UEAPI,
-                               os.path.join(tmp, 'cooked'), '--api', os.path.join(tmp, 'api')], capture_output=True, text=True)
+                               os.path.join(tmp, 'cooked'), '--api', os.path.join(tmp, 'api')], capture_output=True, encoding='utf-8')
         assert proc.returncode == 0, proc.stdout + proc.stderr
         base = os.path.join(tmp, 'api', 'NameTest')
         ua, ue, total, names, imports, exports = dumpexp.load(base)
@@ -1583,7 +1695,7 @@ def static_assets():
                  r'InstanceVariable\s+Count@'):
         assert re.search(want, w), (want, w)
     print('ok  AssetTest: a function body reaches an asset by reference')
-    ar = subprocess.run([sys.executable, os.path.join(HERE, 'dumpar.py'), registry_of('AssetTest')], capture_output=True, text=True).stdout
+    ar = subprocess.run([sys.executable, os.path.join(HERE, 'dumpar.py'), registry_of('AssetTest')], capture_output=True, encoding='utf-8').stdout
     assert set(re.findall(r'^\s+(/Game/\S+)\s+(\S+)$', ar, re.M)) == {
         (MOD + 'AssetUser.AssetUser_C', 'BlueprintGeneratedClass'), (MOD + 'UMoodDef.UMoodDef_C', 'BlueprintGeneratedClass'),
         (MOD + 'EMood.EMood', 'UserDefinedEnum'), (MOD + 'MD_Plain.MD_Plain', 'UMoodDef_C'), (MOD + 'MD_Calm.MD_Calm', 'UMoodDef_C'),
@@ -1598,7 +1710,7 @@ def ue_assets():
     with tempfile.TemporaryDirectory(dir=TESTS) as tmp:
         out = os.path.join(tmp, 'UeAssets')
         proc = subprocess.run([sys.executable, os.path.join(HERE, 'genueassets.py'), registry_of('AssetTest'), UEAPI, out],
-                              capture_output=True, text=True)
+                              capture_output=True, encoding='utf-8')
         assert proc.returncode == 0, proc.stdout + proc.stderr
         h = open(os.path.join(out, 'UEnemyDescriptor.h'), encoding='utf-8-sig').read()
         assert 'UE_ASSET_AT(::UEnemyDescriptor, ED_AssetTest, "/Game/_ElytrasMods/AssetTest/ED_AssetTest");' in h, h
@@ -1609,7 +1721,7 @@ def ue_assets():
                     'class UeAssetsUser : public AActor {\npublic:\n'
                     '  UEnemyDescriptor *Ed = &UeAssets::UEnemyDescriptor::Game::_ElytrasMods::AssetTest::ED_AssetTest;\n'
                     '  int32 Count() { return UeAssets::UEnemyDescriptor::All.Num(); }\n};\n')
-        proc = subprocess.run([ASSETGEN, 'compile', os.path.join(tmp, 'UeAssetsUser.cpp'), UEAPI, tmp], capture_output=True, text=True)
+        proc = subprocess.run([ASSETGEN, 'compile', os.path.join(tmp, 'UeAssetsUser.cpp'), UEAPI, tmp], capture_output=True, encoding='utf-8')
         assert proc.returncode == 0, proc.stdout + proc.stderr
         user = os.path.join(tmp, 'UeAssetsUser')
         cdo = dump('dumptags.py', user, exports_of(user).index('Default__UeAssetsUser_C'))
@@ -1621,7 +1733,7 @@ def ue_assets():
         for paks, has in (([], False), (['--pak', os.path.join(ROOT, 'AssetTest')], True)):
             out = os.path.join(tmp, 'UeAssetsPak%d' % len(paks))
             proc = subprocess.run([sys.executable, os.path.join(HERE, 'genueassets.py'), registry_of('IfaceTest'), UEAPI, out]
-                                  + paks, capture_output=True, text=True)
+                                  + paks, capture_output=True, encoding='utf-8')
             assert proc.returncode == 0, proc.stdout + proc.stderr
             h = os.path.join(out, 'UEnemyDescriptor.h')
             assert os.path.exists(h) == has, os.listdir(out)
@@ -1690,7 +1802,7 @@ def replication():
     import re, subprocess
     here, base = os.path.dirname(os.path.abspath(__file__)), asset('ReplTest')
     exports = [e['name'] for e in dumpexp.load(base)[5]]
-    tool = lambda t, i: subprocess.run([sys.executable, os.path.join(here, t), base, str(i)], capture_output=True, text=True).stdout
+    tool = lambda t, i: subprocess.run([sys.executable, os.path.join(here, t), base, str(i)], capture_output=True, encoding='utf-8').stdout
     cls = tool('dumpstruct.py', 0)
     assert 'NumReplicatedProperties [0] IntProperty size=4: 4' in cls, cls
     for prop, flags, notify, cond in (('Score', '0x10025', 'None', 0), ('bOpen', '0x100010025', 'OnRep_Open', 0),
@@ -1707,7 +1819,7 @@ def replication():
     imports, kid_exports = dumpexp.load(kid)[4], dumpexp.load(kid)[5]
     for fn, flags in (('ServerOpen', 0xc2208c0), ('MultiBoom', 0xc024840), ('OnRep_Open', 0xc020800)):
         e = next(x for x in kid_exports if x['name'] == fn)
-        out = subprocess.run([sys.executable, os.path.join(here, 'dumpstruct.py'), kid, str(kid_exports.index(e))], capture_output=True, text=True).stdout
+        out = subprocess.run([sys.executable, os.path.join(here, 'dumpstruct.py'), kid, str(kid_exports.index(e))], capture_output=True, encoding='utf-8').stdout
         assert 'FunctionFlags %#x' % flags in out, (fn, out)
         assert e['super'] < 0 and imports[-e['super'] - 1] == "Function'%s'" % fn, (fn, e['super'])
     print("ok  ReplTest: an override of a mod parent's RPC keeps its net flags and names it as super")
@@ -1832,7 +1944,11 @@ def delegate_targets():
             try: [walk(n) for n in vm.script(fn)[0]]
             except SystemExit: pass
         assert names and all(f in vm.exports and len(vm.script(f)[2]) == 1 for f in names), (mod, names)
-    print('ok  AsyncTest / LatentTest: every delegate bound by name is a one-parameter function of the class')
+    # An inline method is no UFunction: binding one would name a function the class does not have.
+    refused('DispInline', '  UE_DISPATCHER(OnHit, int32 Points);\n  int32 Got = 0;\n'
+            '  inline void Handle(int32 Points) { Got += Points; }\n  void F() { OnHit.Add(this, &DispInline::Handle); }\n',
+            'a delegate cannot bind Handle')
+    print('ok  AsyncTest / LatentTest: every delegate bound by name is a one-parameter function of the class; not an inline one')
 
 
 def repl_runs():
@@ -1861,6 +1977,9 @@ def repl_runs():
         vm = VM(asset('ReplTest'))
         vm.call(fn, **parms)
         assert vm.self.vars == want, (fn, vm.self.vars)
+    vm = VM(asset('ReplTest'), Calls=0, Notified=0)
+    vm.call('SetViaCall')
+    assert vm.self.vars == dict(Calls=2, bOpen=True, Notified=1, Score=9), vm.self.vars
     assert run(asset('ReplTest'), 'ServerBump', Count=41)[1]['Count'] == 42
     kid = VM(os.path.join(os.path.dirname(asset('ReplTest')), 'ReplKid'))
     for fn, parms, seen in (('ServerOpen', dict(bValue=True), 7), ('ServerOpen', dict(bValue=False), 8),
@@ -1921,6 +2040,7 @@ def spawn_runs():
     vm.call('ReceiveBeginPlay', on=twin)
     assert len(vm.log) == log, vm.log[log:]
     assert vm.call('OwnClass') == 'SpawnTest_C'
+    assert vm.call('OwnClassByMacro') == 'SpawnTest_C'
     probe = vm.call('MakeProbe')
     assert (probe.cls, probe.vars['args']) == ('USpawnProbe_C', ('USpawnProbe_C', me)), probe.vars
     print('ok  SpawnTest: spawn / construct / add-component calls, their classes and the deferred-set order')
@@ -1931,7 +2051,7 @@ def spawn_relative():
     (the qualifier is read back from the mod's sources, which a bare path's empty parent once hid)."""
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
-        proc = subprocess.run([ASSETGEN, 'compile', 'SpawnTest.cpp', UEAPI, tmp], capture_output=True, text=True, cwd=TESTS)
+        proc = subprocess.run([ASSETGEN, 'compile', 'SpawnTest.cpp', UEAPI, tmp], capture_output=True, encoding='utf-8', cwd=TESTS)
         assert proc.returncode == 0, proc.stdout + proc.stderr
         assert VM(os.path.join(tmp, 'SpawnTest'), {}).call('OwnClass') == 'SpawnTest_C'
     print('ok  SpawnTest: a bare relative source path finds X::StaticClass() qualifiers')

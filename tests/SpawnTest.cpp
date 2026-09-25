@@ -4,6 +4,9 @@
 
 UE_MOD_PACKAGE("/Game/_ElytrasMods/SpawnTest");
 
+/* A qualifier inside a macro: clang gives where the argument is written, and StaticClass in the body. */
+#define CLASS_OF(X) X::StaticClass()
+
 /* GetTypedOuter reads OuterPrivate; a mod reading memory declares the compiler's scratch (Intrin.h). */
 struct FDeref {
   UE_STRUCT;
@@ -47,6 +50,7 @@ public:
 
   /* StaticClass is declared once, on the native class; the one meant is the qualifier / NewObject's T. */
   UClass *OwnClass() { return SpawnTest::StaticClass(); }
+  UClass *OwnClassByMacro() { return CLASS_OF(SpawnTest); }
   UObject *MakeProbe() { return NewObject<USpawnProbe>(this); }
 
   /* The outer walks: an actor's nearest and farthest outer of a kind. */

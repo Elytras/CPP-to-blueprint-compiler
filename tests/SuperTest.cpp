@@ -18,6 +18,8 @@ public:
     return Count;
   }
   int32 Twice(int32 By) { return Bump(By) + Bump(By); }
+  /* Expanded where it is called, SuperTest too: its Bump is still a call by name there, reaching SuperTest's. */
+  inline int32 TwiceInline(int32 By) { return Bump(By) + Bump(By); }
 };
 
 class SuperTest : public SuperBase {
@@ -29,4 +31,5 @@ public:
   int32 Bump(int32 By) { return SuperBase::Bump(By * 2); }
   /* Twice is inherited and not redeclared here, so this is an ordinary call by name: a subclass's would run. */
   int32 Thrice(int32 By) { return Twice(By) + Bump(By); }
+  int32 ViaInline(int32 By) { return TwiceInline(By); }
 };

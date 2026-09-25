@@ -116,6 +116,11 @@ class VM:
             if o == 0x6B: return ev(n.kids[0])[ev(n.kids[1])]
             name = n.val
             if o in (0x1B, 0x45, 0x1C, 0x46, 0x68) and name in s.exports and (ctx is me or ctx.cls == s.self.cls):
+                # A reference argument is stepped with no result buffer (ProcessScriptFunction): it must be a variable.
+                for parm, a in zip(s.script(name)[2], n.kids):
+                    if parm in runscript.params_of(s.base, name, 0x100) and a.op not in runscript.ADDRESSABLE \
+                            and not (a.op in (0x19, 0x1A) and a.kids[1].op in runscript.ADDRESSABLE):
+                        raise SystemExit('vm: %s: reference parameter %s gets a non-variable (op %02x), which crashes the VM' % (name, parm, a.op))
                 return s.call(name, *[ev(a) for a in n.kids], on=ctx)
             if o in (0x1B, 0x45, 0x1C, 0x46, 0x68):
                 if name in runscript.CONTAINERS: return runscript.CONTAINERS[name](ev, store, n.kids)

@@ -82,6 +82,14 @@ std::string TypeOf(const Json& N)
     return It == N.end() ? std::string() : It->value("qualType", std::string());
 }
 
+/* A CharacterLiteral's value is its code unit; a plain char is signed (clang for MSVC), so '\xff' is -1. */
+int64 CharValue(const Json& N)
+{
+    const int64 V = N.value("value", int64(0));
+    const std::string T = StripTypeKeywords(TypeOf(N));
+    return T == "char" || T == "signed char" ? int64(int8(V)) : V;
+}
+
 /* A one-argument CXXConstructExpr is a wrapper (FString from a literal, a copy, a conversion)
    and is looked through; one with several arguments is a struct literal and stays. */
 const Json* Strip(const Json* N)
@@ -491,6 +499,7 @@ struct FCallIR
     FIndex Context;                     // CDO a static call runs against; null = self
     bool bPure = false;                 // a function of its arguments (UE_PURE, a Kismet operator or conversion): see DropUnusedPure
     uint64 WrittenArgs = ~uint64(0);    // bit I: argument I must stay its own variable, which the callee may write: see ContainerWrites
+    std::vector<std::string> RefParms;  // a script callee's: per argument, the type of the reference parameter it binds, else "": see HoistCallArgs
     std::string VirtualName;            // a generated class's own instance method: EX_VirtualFunction resolves it by name at run time
     bool bLocalVirtual = false;         // ... as EX_LocalVirtualFunction: a script function that is no RPC
     std::string View;                   // __RefAtInline__: the TArray field of the view struct in Extra
@@ -796,6 +805,16 @@ bool EmitCall(FScript& S, const FCallIR& Call, FIndex SelfExp, std::string* Err)
         return bOk;
     }
 
+    /* Any other intrinsic has a value and no UFunction (`__AddrOf__`, `__NameIndex__`, a pointer read). As a statement,
+       an unused local's store or a discarded call, the value goes nowhere, and an EX_CallMath would call null. A call
+       among its arguments still runs. */
+    if (!Call.Intrinsic.empty() && !Call.Fn.V)
+    {
+        for (const FArgIR& A : Call.Args)
+            if (A.K == FArgIR::Call && A.Sub && A.Sub->Intrinsic.empty() && !EmitCall(S, *A.Sub, SelfExp, Err)) return false;
+        return true;
+    }
+
     /* A static call runs against its class's CDO via EX_Context; EX_CallMath finds the CDO itself. */
     if (Call.Context.V != 0 || Call.Target)
     {
@@ -1009,6 +1028,22 @@ private:
     std::map<std::string, std::string> RefAddr;     // VarDecl id -> pointee: `T& R = *P` keeps the address in an int64 local R
     std::map<std::string, Json> RefAlias;           // VarDecl id -> the variable `T& R = V` is another name for; a copy,
                                                     // since a for-init is lowered out of a temporary Json
+    /* N with the variable at its root (under parentheses and `.` members) replaced by what RefAlias names, so a place
+       reached through a reference (`auto& [K, V]`'s V is `Map[K]`) is judged as what it is. */
+    Json Unalias(const Json& N) const
+    {
+        const std::string K = Kind(N);
+        if ((K == "ParenExpr" || K == "ExprWithCleanups" || (K == "ImplicitCastExpr" && N.value("castKind", std::string()) == "NoOp")
+             || (K == "MemberExpr" && !N.value("isArrow", false))) && First(N))
+        {
+            Json Out = N;
+            Out["inner"][0] = Unalias(N["inner"][0]);
+            return Out;
+        }
+        if (K == "DeclRefExpr")
+            if (auto A = RefAlias.find(N["referencedDecl"].value("id", std::string())); A != RefAlias.end()) return Unalias(A->second);
+        return N;
+    }
     /* A /Game struct the bytecode names only through a member (a view, `P->X`) is not kept loaded: the script
        reference collector skips property operands (FArchive::operator<<(FField*&) does nothing), and only a
        property's own type reaches UStruct::ScriptAndPropertyObjectReferences (UStruct::Link), which the GC
@@ -1060,6 +1095,11 @@ private:
     Json HoistExpr(const Json& N, Json& Pre, bool bPin = false);
     Json SynthLocal(const std::string& Type, const Json& Init, Json& Pre);
     bool LowerUpdateValue(const Json& N, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
+    /* A written `T&` bound to what the call cannot reach by reference (Refs: each such argument in Call, and its
+       parameter's name) gets a hidden local instead, stored back after the call. */
+    bool LowerCopyBack(const Json& Call, const std::vector<std::pair<const Json*, std::string>>& Refs,
+                       const std::string& Method, FBlueprintClass& BP, FCallIR& Out, std::string* Err);
+    std::set<std::string> WarnedCopies;
 
     /* `X::StaticClass()`: the record X names, read back from the mod's sources (clang's JSON keeps no qualifier). */
     const FRecord* NamedQualifier(const Json& Ref) const;
@@ -2206,6 +2246,16 @@ bool FCompiler::ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgI
     if (const FConv *In = FindConv(From, "int"), *Out = FindConv("int", To);
         In && Out && (FromNum == SK_Byte || FromNum == SK_Bool) && ToKind == SK_Int64)
     { ApplyConv(*In, BP, Arg); ApplyConv(*Out, BP, Arg); return true; }
+    /* UE 4.27 Blueprint has no int64 -> float at all (UE5 has Conv_Int64ToDouble, its reals being double), so the value
+       passes through int32: only the low 32 bits survive, where C++ would round the whole value. */
+    if (const FConv *In = FindConv(From, "int"), *Out = FindConv("int", To); In && Out && FromNum == SK_Int64 && ToKind == SK_Float)
+    {
+        printf("  warning: %s::%s: int64 -> float goes through int32 (UE 4.27 has no int64 -> float), so a value outside "
+               "int32's range wraps\n", Cur ? Cur->CppName.c_str() : "", CurFnName.c_str());
+        ApplyConv(*In, BP, Arg);
+        ApplyConv(*Out, BP, Arg);
+        return true;
+    }
     const auto IsNumber = [](EStrKind K) { return K == SK_Int || K == SK_Int64 || K == SK_Float || K == SK_Bool || K == SK_Byte; };
     for (const char* Via : {"FString", "FText"})     // FText: int64 has no engine Conv_Int64ToString
     {
@@ -2411,6 +2461,10 @@ bool FCompiler::LowerDelegateValue(const Json& Obj, const Json& Fn, FArgIR& Out,
     if (!O || Kind(*O) != "CXXThisExpr") { *Err = "TODO: a delegate can only bind a function of `this`"; return false; }
     if (F && Kind(*F) == "UnaryOperator" && F->value("opcode", std::string()) == "&") F = Strip(First(*F));
     if (!F || Kind(*F) != "DeclRefExpr") { *Err = "a delegate binds `&Class::Function`"; return false; }
+    const Json& Ref = (*F)["referencedDecl"];
+    auto Owner = MethodOwner.find(Ref.value("id", std::string()));
+    if (const FRecord* R = Owner != MethodOwner.end() ? Find(Owner->second) : nullptr; R && IsInlineMethod(*R, Name(Ref)))
+    { *Err = "a delegate cannot bind " + Name(Ref) + ": an inline function is expanded where it is called, no UFunction (drop `inline`)"; return false; }
     Out.K = FArgIR::Delegate;
     Out.S = UeNameOf(Cur, (*F)["referencedDecl"].value("name", std::string()));     // found on self by name at run time
     return true;
@@ -2502,6 +2556,15 @@ bool IsTMapElement(const Json& N)
         && Map && TemplateArg(TypeOf(*Map), "TMap", &Inner);
 }
 
+/* The map element a place stands on: `Map[Key]` itself, or a member chain on it (`Map[Key].A.B`). Map_Find copies
+   the value out, so a store or a reference through it would change the copy. */
+const Json* MapElementUnder(const Json& N)
+{
+    const Json* P = PeelLvalue(&N);
+    while (P && Kind(*P) == "MemberExpr" && !P->value("isArrow", false) && First(*P)) P = PeelLvalue(First(*P));
+    return P && IsTMapElement(*P) ? P : nullptr;
+}
+
 /* A TMap or TSet anywhere in a property, a nested one's wrapper included: the engine replicates neither. */
 bool HoldsMapOrSet(const FPropertyDef& P)
 {
@@ -2523,6 +2586,32 @@ bool IsAliasable(const Json& N)
     const Json* Base = PeelLvalue(First(N));
     if (Kind(*Base) == "CXXThisExpr") return true;
     return !N.value("isArrow", false) && IsAliasable(*Base);
+}
+
+/* A place a reference can name once what locates it is fixed (StabilizeLvalue): a member of an object (`O->A`), an
+   element of an array (`Arr[F()]`), a member of either (`O->S.X`), down from a variable or an object. */
+bool IsPinnable(const Json& N)
+{
+    const Json* P = PeelLvalue(&N);
+    if (Kind(*P) == "MemberExpr" && First(*P))
+        return P->value("isArrow", false) || IsAliasable(*PeelLvalue(First(*P))) || IsPinnable(*First(*P));
+    if (IsTArrayElement(*P) && Nth(*P, 2))
+        return IsAliasable(*PeelLvalue(Nth(*P, 1))) || IsPinnable(*Nth(*P, 1));
+    return false;
+}
+
+/* A reference the callee may write: `T&`, not `const T&` or `T&&`. */
+bool IsMutableRef(const std::string& T)
+{
+    return T.size() > 1 && T.back() == '&' && T[T.size() - 2] != '&' && T.compare(0, 6, "const ") != 0;
+}
+
+/* A UFunction's `T&` bound to what Blueprint has no reference to: a map element or a member of one (Map_Find copies
+   it out), or whichever of two variables `C ? X : Y` picks. The call gets a copy, stored back after it (LowerCopyBack). */
+bool IsUnreferenceable(const Json& Parm, const Json& Arg)
+{
+    const Json* Bare = PeelLvalue(&Arg);
+    return IsMutableRef(TypeOf(Parm)) && Bare && (MapElementUnder(*Bare) || Kind(*Bare) == "ConditionalOperator");
 }
 
 /* The intrinsics that read their operand's storage through a StructMember donor field. */
@@ -3313,15 +3402,18 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         A literal wider than int32 must stay Int64 or the value truncates: the LoadLibrary
         import walk's packed name constants (0x32336C656E72656B, "kernel32") compared as
         0x6E72656B and matched nothing. Fill both fields and pick the width by magnitude,
-        the EnumConstantDecl path below does the same.
+        the EnumConstantDecl path below does the same. A uint64 literal past int64 keeps its bits, as the cast to
+        a Blueprint type (none is unsigned 64) does in C++: (int64)18446744073709551615ULL is -1.
         */
-        const int64 V = std::stoll(N->value("value", std::string("0")));
+        const int64 V = int64(std::strtoull(N->value("value", std::string("0")).c_str(), nullptr, 10));
         Out.I = int32(V);
         Out.I64 = V;
         Out.K = int64(Out.I) == V ? FArgIR::Int : FArgIR::Int64;
         return true;
     }
-    if (K == "FloatingLiteral") { Out.K = FArgIR::Float; Out.F = std::stof(N->value("value", std::string("0"))); return true; }
+    if (K == "CharacterLiteral") { Out.K = FArgIR::Int; Out.I = int32(CharValue(*N)); Out.I64 = Out.I; return true; }
+    /* strtof, not stof: a double literal past float's range is inf, as (float)1e39 is in C++, not an exception. */
+    if (K == "FloatingLiteral") { Out.K = FArgIR::Float; Out.F = std::strtof(N->value("value", std::string("0")).c_str(), nullptr); return true; }
     if (K == "CXXBoolLiteralExpr") { Out.K = FArgIR::Bool; Out.B = N->value("value", false); return true; }
     if (K == "DeclRefExpr")
     {
@@ -3739,10 +3831,20 @@ bool FCompiler::IsSubclassOf(const FRecord& Child, const FRecord& Parent) const
 /* The qualifier token is where a qualified DeclRefExpr's range begins; the JSON gives its byte offset and length but
    not its file (that is only written when it changes, and Json's sorted keys lose the order). So each of the mod's own
    sources is tried at that offset, and a hit counts only when `<Record>::StaticClass` is what is written there.
-   ponytail: a namespace-qualified `Ns::X::StaticClass()` begins at Ns and falls back to the declaring class. */
+   In a macro (`#define CLS(X) X::StaticClass()`) the range has spelling locations instead: the qualifier where the
+   argument is written, StaticClass in the macro's body, which has to be `::StaticClass` then.
+   ponytail: a namespace-qualified `Ns::X::StaticClass()` begins at Ns and falls back to the declaring class; so does
+   a macro defined outside the mod's own sources (a UeApi header). */
 const FRecord* FCompiler::NamedQualifier(const Json& Ref) const
 {
-    const Json Begin = Ref.value("range", Json::object()).value("begin", Json::object());
+    const Json Range = Ref.value("range", Json::object());
+    Json Begin = Range.value("begin", Json::object()), End;
+    if (Begin.contains("spellingLoc"))
+    {
+        End = Range.value("end", Json::object()).value("spellingLoc", Json::object());
+        Begin = Begin["spellingLoc"];
+        if (!End.contains("offset")) return nullptr;
+    }
     if (!Begin.contains("offset") || !Begin.contains("tokLen")) return nullptr;
     const size_t Off = Begin["offset"].get<size_t>(), Len = Begin["tokLen"].get<size_t>();
     if (SourceTexts.empty())
@@ -3756,17 +3858,33 @@ const FRecord* FCompiler::NamedQualifier(const Json& Ref) const
             SourceTexts.emplace_back(std::istreambuf_iterator<char>(F), std::istreambuf_iterator<char>());
         }
     }
-    for (const std::string& T : SourceTexts)
+    if (End.is_null())
     {
-        if (Off + Len > T.size()) continue;
-        size_t P = Off + Len;
-        while (P < T.size() && (T[P] == ' ' || T[P] == '\t')) ++P;
-        if (T.compare(P, 2, "::") != 0) continue;
-        P += 2;
-        while (P < T.size() && (T[P] == ' ' || T[P] == '\t')) ++P;
-        if (T.compare(P, 11, "StaticClass") != 0) continue;
-        if (const FRecord* R = Find(T.substr(Off, Len))) return R;
+        for (const std::string& T : SourceTexts)
+        {
+            if (Off + Len > T.size()) continue;
+            size_t P = Off + Len;
+            while (P < T.size() && (T[P] == ' ' || T[P] == '\t')) ++P;
+            if (T.compare(P, 2, "::") != 0) continue;
+            P += 2;
+            while (P < T.size() && (T[P] == ' ' || T[P] == '\t')) ++P;
+            if (T.compare(P, 11, "StaticClass") != 0) continue;
+            if (const FRecord* R = Find(T.substr(Off, Len))) return R;
+        }
+        return nullptr;
     }
+    /* In a macro: its body has `::StaticClass` at End, and the qualifier is the whole identifier at Off. */
+    const size_t At = End["offset"].get<size_t>();
+    const bool bBody = std::any_of(SourceTexts.begin(), SourceTexts.end(), [&](const std::string& T) {
+        size_t P = At;
+        if (P + 11 > T.size() || T.compare(P, 11, "StaticClass") != 0) return false;
+        while (P > 0 && (T[P - 1] == ' ' || T[P - 1] == '\t')) --P;
+        return P >= 2 && T.compare(P - 2, 2, "::") == 0;
+    });
+    auto Ident = [](char C) { return std::isalnum(uint8(C)) || C == '_'; };
+    for (const std::string& T : SourceTexts)
+        if (bBody && Off + Len <= T.size() && (Off == 0 || !Ident(T[Off - 1])) && (Off + Len == T.size() || !Ident(T[Off + Len])))
+            if (const FRecord* R = Find(T.substr(Off, Len))) return R;
     return nullptr;
 }
 
@@ -3849,6 +3967,16 @@ Json FCompiler::SynthLocal(const std::string& Type, const Json& Init, Json& Pre)
                        { "referencedDecl", { { "id", Id }, { "kind", "VarDecl" }, { "name", LocalN }, { "type", T } } } };
     return { { "kind", "ImplicitCastExpr" }, { "castKind", "LValueToRValue" }, { "type", T }, { "valueCategory", "prvalue" },
              { "inner", Json::array({ Ref }) } };
+}
+
+/* A read of lvalue L, and `To = From`: statements the desugarings build. */
+static Json ReadOf(const Json& L)
+{
+    return { {"kind", "ImplicitCastExpr"}, {"castKind", "LValueToRValue"}, {"type", L.value("type", Json::object())}, {"inner", Json::array({L})} };
+}
+static Json AssignOf(const Json& To, const Json& From)
+{
+    return { {"kind", "BinaryOperator"}, {"opcode", "="}, {"type", To.value("type", Json::object())}, {"inner", Json::array({To, From})} };
 }
 
 /* An rvalue N, parked in a local unless reading it again is harmless. bPin also parks a variable, which code
@@ -3953,6 +4081,69 @@ bool FCompiler::LowerUpdateValue(const Json& N, FBlueprintClass& BP, FArgIR& Out
     Out.Sub->Inline = Block;
     Out.Sub->InlineResult = Result;
     Out.Sub->InlineType = Type;
+    return true;
+}
+
+/* `Add5(M[1])`, `Add5(C ? X : Y)`: Blueprint has no reference to a map element (Map_Find copies it out) or to
+   whichever variable `C ? X : Y` picks. So the call is sugar for
+       <what locates the place: key, condition, object, pinned>  T Copy = <the place>;  <the call on Copy>;  <the place> = Copy;
+   the place fixed before the call, as a reference is bound. A copy is not a reference, though: code that reads the
+   place while the call runs sees it unchanged, hence the warning. */
+bool FCompiler::LowerCopyBack(const Json& Call, const std::vector<std::pair<const Json*, std::string>>& Refs,
+                              const std::string& Method, FBlueprintClass& BP, FCallIR& Out, std::string* Err)
+{
+    if (!CurLocals) { *Err = "internal: a call outside a function body"; return false; }
+    Json Pre = Json::array(), Back = Json::array(), Again = Call;
+    for (const auto& [Arg, Parm] : Refs)
+    {
+        size_t At = 1;
+        while (At < Call["inner"].size() && &Call["inner"][At] != Arg) ++At;
+        if (At == Call["inner"].size()) { *Err = "internal: " + Method + "'s argument for " + Parm + " is not in the call"; return false; }
+        const Json& Bare = *PeelLvalue(Arg);
+        const bool bSel = Kind(Bare) == "ConditionalOperator";
+        Json Place = Bare;
+        if (bSel)
+        {
+            /* Both sides are located up front, so neither may act: only the picked one would, in C++. */
+            bool bReads = false, bActs = false;
+            Locators(Bare["inner"][1], bReads, bActs);
+            Locators(Bare["inner"][2], bReads, bActs);
+            if (bActs)
+            { *Err = Method + ": TODO: its reference parameter " + Parm + " is bound to `C ? X : Y` where X or Y is found by a call"; return false; }
+            Place["inner"][0] = HoistExpr(Bare["inner"][0], Pre, true);
+            Place["inner"][1] = StabilizeLvalue(Bare["inner"][1], Pre, true);
+            Place["inner"][2] = StabilizeLvalue(Bare["inner"][2], Pre, true);
+        }
+        else Place = StabilizeLvalue(Bare, Pre, true);
+        const Json Copy = SynthLocal(StripTypeKeywords(TypeOf(Bare)), ReadOf(Place), Pre);
+        Back.push_back(bSel ? Json{ {"kind", "IfStmt"}, {"inner", Json::array({Place["inner"][0], AssignOf(Place["inner"][1], Copy),
+                                                                                 AssignOf(Place["inner"][2], Copy)})} }
+                            : AssignOf(Place, Copy));
+        Again["inner"][At] = Copy["inner"][0];      // the local itself, which the call takes by reference
+        const Json Seen = Unalias(Bare);
+        const std::string What = IsTMapElement(*PeelLvalue(&Seen)) ? "a map element" : MapElementUnder(Seen) ? "a map element's member"
+                               : bSel ? "`C ? X : Y`" : "that expression";
+        char Line[512];
+        snprintf(Line, sizeof(Line), "  warning: %s::%s: %s's reference parameter %s is bound to %s: Blueprint has no reference "
+                 "to it, so %s gets a copy, stored back after the call\n", Cur ? Cur->CppName.c_str() : "", CurFnName.c_str(),
+                 Method.c_str(), Parm.c_str(), What.c_str(), Parm.c_str());
+        if (WarnedCopies.insert(Line).second) fputs(Line, stdout);
+    }
+    const std::string Type = StripTypeKeywords(TypeOf(Call));
+    std::string Result;
+    if (Type.empty() || Type == "void") Pre.push_back(Again);
+    else Result = SynthLocal(Type, Again, Pre)["inner"][0]["referencedDecl"].value("name", std::string());
+    for (Json& B : Back) Pre.push_back(std::move(B));
+    const Json Wrap = { {"kind", "CompoundStmt"}, {"inner", std::move(Pre)} };
+    auto Body = std::make_shared<std::vector<FStmtIR>>();
+    if (!LowerBody(Wrap, BP, *Body, *CurLocals, Err)) return false;
+    Out = FCallIR();
+    Out.Intrinsic = "__Inline__";
+    Out.Inline = std::make_shared<std::vector<FStmtIR>>(1);
+    (*Out.Inline)[0].K = FStmtIR::Block;
+    (*Out.Inline)[0].Body = Body;
+    Out.InlineResult = Result;
+    if (!Result.empty()) Out.InlineType = Type;
     return true;
 }
 
@@ -4091,13 +4282,19 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
            UFunction (K2Node_CallParentFunction) - which Out.Fn below already is. By name the call would come straight
            back to the override making it, forever: a shipping build has no script recursion guard. A native ancestor's
            takes the final form anyway. */
+        /* The class the call is written in: an inline method expanded into a subclass keeps its own class's view, so
+           PBase::Twice's `Speak()` stays a call by name in Kid, not Kid's call to its parent's Speak. */
+        const FRecord* Written = Cur;
+        if (!InlineStack.empty())
+            if (auto O = MethodOwner.find(InlineStack.back()->value("id", std::string())); O != MethodOwner.end())
+                Written = Find(O->second);
         bool bParentCall = false;
-        if (Cur && R != Cur && Kind(CallExprNode) == "CXXMemberCallExpr")
+        if (Written && R != Written && Kind(CallExprNode) == "CXXMemberCallExpr")
         {
             const Json* Callee = Strip(First(CallExprNode));
             const Json* Obj = Callee ? Strip(First(*Callee)) : nullptr;
             if (Obj && Kind(*Obj) == "CXXThisExpr")
-                for (const FRecord* A = Cur; A && A != R && !bParentCall; A = A->Base.empty() ? nullptr : Find(A->Base))
+                for (const FRecord* A = Written; A && A != R && !bParentCall; A = A->Base.empty() ? nullptr : Find(A->Base))
                     bParentCall = A->Methods.count(MethodName) != 0;
         }
         if (!R->IsNative() && !bStatic && !bParentCall)
@@ -4130,6 +4327,17 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
             Out.Context = BP.ClassDefaultObject(CalleePackage, CalleeName);
     }
 
+    /* The called declaration's parameters, for a defaulted argument: FullDecl, when it has the call's arity. */
+    std::vector<const Json*> CalledParms;
+    if (FullDecl) ForEach(*FullDecl, [&](const Json& C) { if (Kind(C) == "ParmVarDecl") CalledParms.push_back(&C); });
+    if (CalledParms.size() != (Receiver ? 1u : 0u) + (CallExprNode.contains("inner") ? CallExprNode["inner"].size() - 1 : 0u))
+        CalledParms.clear();
+    std::vector<std::pair<const Json*, std::string>> CopyBacks;
+    for (size_t I = Receiver ? 1 : 0, At = 1; I < CalledParms.size(); ++I, ++At)
+        if (IsUnreferenceable(*CalledParms[I], Unalias(CallExprNode["inner"][At])))
+            CopyBacks.emplace_back(&CallExprNode["inner"][At], Name(*CalledParms[I]));
+    if (!CopyBacks.empty()) return LowerCopyBack(CallExprNode, CopyBacks, MethodName, BP, Out, Err);
+
     /* inner[0] is the callee. */
     bool bFirst = true, bOk = true;
     std::vector<bool> Defaulted;
@@ -4140,11 +4348,6 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         if (bOk) Out.Args.push_back(A);
         Defaulted.push_back(false);
     }
-    /* The called declaration's parameters, for a defaulted argument: FullDecl, when it has the call's arity. */
-    std::vector<const Json*> CalledParms;
-    if (FullDecl) ForEach(*FullDecl, [&](const Json& C) { if (Kind(C) == "ParmVarDecl") CalledParms.push_back(&C); });
-    if (CalledParms.size() != (Receiver ? 1u : 0u) + (CallExprNode.contains("inner") ? CallExprNode["inner"].size() - 1 : 0u))
-        CalledParms.clear();
     ForEach(CallExprNode, [&](const Json& C) {
         if (bFirst) { bFirst = false; return; }
         if (!bOk) return;
@@ -4200,6 +4403,18 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         if (Out.Args.size() + 1 + Omitted == Parms.size()) Out.Args.insert(Out.Args.begin() + I, Wco);
         else if (I < Defaulted.size() && Defaulted[I]) Out.Args[I] = Wco;
         break;
+    }
+    /* A reference parameter, const or not, is CPF_OutParm, and a script callee steps its argument with no result
+       buffer to take the address (ProcessScriptFunction): HoistCallArgs gives an rvalue there a local to live in. */
+    if (Out.bScript && !Hidden && Out.Args.size() == Parms.size())
+    {
+        ForEach(*FullDecl, [&](const Json& C) {
+            if (Kind(C) != "ParmVarDecl") return;
+            std::string T = TypeOf(C);
+            const bool bRef = !T.empty() && T.back() == '&';
+            while (!T.empty() && (T.back() == '&' || T.back() == ' ')) T.pop_back();
+            Out.RefParms.push_back(bRef ? StripTypeKeywords(T) : std::string());
+        });
     }
     if (Hidden)
     {
@@ -4961,6 +5176,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 Rhs = &Parked;
             }
             const std::string LK = Kind(*Lhs);
+            const Json Rooted = LK == "MemberExpr" ? Unalias(*Lhs) : Json();
             if (IsDerefLvalue(*Lhs))
             {
                 FArgIR Addr;
@@ -4969,10 +5185,24 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 bOk = LowerAddress(*Lhs, BP, Addr, &Pointee, Err) && RefThrough(std::move(Addr), Pointee, St.Var, Err)
                    && LowerArg(*Rhs, BP, St.Value, Err);
             }
-            else if (LK == "MemberExpr" && First(*Lhs) && IsTMapElement(*Strip(First(*Lhs))))
+            else if (const Json* Elem = LK == "MemberExpr" ? MapElementUnder(Rooted) : nullptr)
             {
-                *Err = "`Map[Key].Member = v` would change a copy: read Map[Key] into a local, change it, store it back";
-                bOk = false;
+                /* `Map[Key].A.B = v` (or `V.A.B = v`, V an `auto& [K, V]`): Map_Find copies the value out, so the store
+                   is `T E = Map[Key]; E.A.B = v; Map[Key] = E;`, v first as C++17 sequences it, and the key once. */
+                Json Pre = Json::array();
+                const Json Value = HoistExpr(*Rhs, Pre);
+                const Json Place = StabilizeLvalue(*Elem, Pre);
+                const Json E = SynthLocal(StripTypeKeywords(TypeOf(*Elem)), ReadOf(Place), Pre);
+                std::function<Json(const Json&)> Reroot = [&](const Json& N) {
+                    if (&N == Elem) return Json(E["inner"][0]);
+                    Json Up = N;
+                    Up["inner"][0] = Reroot(N["inner"][0]);
+                    return Up;
+                };
+                Pre.push_back(AssignOf(Reroot(Rooted), Value));
+                Pre.push_back(AssignOf(Place, E));
+                const Json Wrap = { { "kind", "CompoundStmt" }, { "inner", std::move(Pre) } };
+                bOk = LowerBody(Wrap, BP, Out, Locals, Err);
                 return;
             }
             else if (LK == "MemberExpr")
@@ -5315,6 +5545,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             if (!Sub || !LowerBody(Wrap, BP, Out, Locals, Err)) bOk = false;
             return;
         }
+        else if (K == "NullStmt") return;   // `while (C);`, `[[fallthrough]];`, `Label: ;`
         else if (K == "CompoundStmt")
         {
             /* A bare `{ ... }`: a Blueprint local has no scope to end, so its statements join this list. */
@@ -5405,16 +5636,30 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
         else if (K == "ForStmt")
         {
             /* Desugars to `{ init; while (cond) { body; inc; } }`. ForStmt inner is
-               [init, condVar, cond, inc, body] with absent parts kept as inline JSON nulls. */
+               [init, condVar, cond, inc, body], clang writing an absent part as {}. No condition is `true`. */
             auto AtOr = [&](size_t I) -> const Json* {
                 const Json* P = Nth(*S, I);
-                return (P && !P->is_null()) ? P : nullptr;
+                return (P && !P->is_null() && !P->empty()) ? P : nullptr;
             };
+            const Json True = { {"kind", "CXXBoolLiteralExpr"}, {"type", { {"qualType", "bool"} }}, {"value", true} };
             const Json* Init = AtOr(0);
-            const Json* Cond = AtOr(2);
+            const Json* Cond = AtOr(2) ? AtOr(2) : &True;
             const Json* Inc = AtOr(3);
             const Json* Body = AtOr(4);
-            if (!Cond || !Body) { *Err = "TODO: `for` needs a condition and a body"; bOk = false; return; }
+            if (!Body) { *Err = "`for` with no body"; bOk = false; return; }
+            if (const Json* Var = AtOr(1))
+            {
+                /* `for (Init; T V = E; Inc) Body`: V is made again each time round, as in
+                   `for (Init;; Inc) { T V = E; if (!V) break; Body }`, where a `continue` still reaches Inc. */
+                Json Not = { {"kind", "UnaryOperator"}, {"opcode", "!"}, {"type", { {"qualType", "bool"} }}, {"inner", Json::array({*Cond})} };
+                Json Exit = { {"kind", "IfStmt"}, {"inner", Json::array({ Not, Json{ {"kind", "BreakStmt"} } })} };
+                Json Loop = *S;
+                Loop["inner"][1] = Loop["inner"][2] = Json::object();
+                Loop["inner"][4] = { {"kind", "CompoundStmt"}, {"inner", Json::array({ *Var, Exit, *Body })} };
+                Json Wrap = { {"kind", "CompoundStmt"}, {"inner", Json::array({ Loop })} };
+                if (!LowerBody(Wrap, BP, Out, Locals, Err)) bOk = false;
+                return;
+            }
 
             if (Init)
             {
@@ -5470,6 +5715,10 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 break;
             }
         }
+        /* The flush, the write and the notify each name the object: one that is computed (`Me()->Score = 9`) goes into a
+           local once. SetObject is the write's own Base, so all three see the local. A parked right side is already out. */
+        if (bOk && (bFlush || !Notify.empty()) && SetObject && !IsStored(*SetObject)
+            && !HoistOperand(*SetObject, BP, Locals, Out, Err)) { bOk = false; return; }
         if (bFlush)
         {
             FStmtIR Flush;
@@ -5833,7 +6082,8 @@ bool HasGoto(const Json& N)
 /* The call becomes one Block statement in Out.Inline:
        <each by-value parameter> = <its argument>;
        <the body, locals renamed __Inl<N>_<name>, `return X` as `__Inl<N>_ReturnValue = X` + a jump to the end>
-   A reference parameter bound to a variable is another name for it; bound to anything else it is a copy.
+   A reference parameter bound to a place (a variable, `O->A`, `Arr[I]`) is another name for it; bound to a map element
+   or `C ? X : Y`, a copy stored back after the body when the body writes it; bound to a value, a copy.
    Only calls on `this` (or a static) expand, since the body's `this` stays the caller's self. */
 bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::string& Method, bool bMethod, FBlueprintClass& BP,
                              FCallIR& Out, std::string* Err, const Json* Receiver)
@@ -5876,22 +6126,37 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
     ForEach(CallNode, [&](const Json& C) { if (bFirst) { bFirst = false; return; } Args.push_back(&C); });
     if (Args.size() != Parms.size()) { *Err = "inline call to " + Method + " with " + std::to_string(Args.size()) + " arguments"; return false; }
     for (size_t I = 0; I < Args.size(); ++I) Args[I] = DefaultedArg(*Args[I], Parms[I]);
-    /* Every argument is lowered before any parameter is bound: an argument can expand this same function again
-       (`Twice(Twice(V))`), and that expansion binds the parameters for itself. */
+    /* A reference parameter is another name for a variable, or for a place under an object or an index (`O->A`,
+       `Arr[F()]`, `O->S.X`) fixed at the call, as binding a reference fixes it. */
     auto Aliased = [&](size_t I) -> const Json* {
         const std::string Type = TypeOf(*Parms[I]);
         const Json* Bare = PeelLvalue(Args[I]);
         if (Type.empty() || Type.back() != '&' || !Bare || IsDerefLvalue(*Bare)) return nullptr;
-        if (IsAliasable(*Bare)) return Bare;
-        const Json* Arr = IsTArrayElement(*Bare) ? PeelLvalue(Nth(*Bare, 1)) : nullptr;
-        return Arr && IsAliasable(*Arr) && Nth(*Bare, 2) ? Bare : nullptr;
+        return IsAliasable(*Bare) || IsAliasable(Unalias(*Bare)) || IsPinnable(*Bare) ? Bare : nullptr;
     };
-    /* `Arr[I]`: the element is the one I names at the call, so the index is what gets lowered, into Values. */
-    auto ElemIndex = [&](size_t I) { const Json* A = Aliased(I); return A && IsTArrayElement(*A) ? Nth(*A, 2) : nullptr; };
-    std::vector<FArgIR> Values(Parms.size());
+    /* A reference the body writes, bound to what it cannot name (a map element, `C ? X : Y`), gets a copy stored back
+       after the body. */
+    std::vector<std::pair<const Json*, std::string>> CopyBacks;
     for (size_t I = 0; I < Parms.size(); ++I)
-        if (const Json* Index = ElemIndex(I)) { if (!LowerArg(*Index, BP, Values[I], Err)) return false; }
-        else if (!Aliased(I) && !LowerArg(*Args[I], BP, Values[I], Err)) return false;
+        if (const Json* Bare = PeelLvalue(Args[I]); IsMutableRef(TypeOf(*Parms[I])) && Bare && !Aliased(I) && !IsDerefLvalue(*Bare)
+            && !OnlyRead(*Body, Parms[I]->value("id", std::string())))
+            CopyBacks.emplace_back(Args[I], Name(*Parms[I]));
+    if (!CopyBacks.empty()) return LowerCopyBack(CallNode, CopyBacks, Method, BP, Out, Err);
+    /* Every argument is lowered before any parameter is bound: an argument can expand this same function again
+       (`Twice(Twice(V))`), and that expansion binds the parameters for itself. For a reference, that is what fixes
+       its place: the object and the index, into locals (Pins). */
+    std::vector<FArgIR> Values(Parms.size());
+    std::vector<Json> Places(Parms.size());
+    std::vector<std::vector<FStmtIR>> Pins(Parms.size());
+    for (size_t I = 0; I < Parms.size(); ++I)
+        if (const Json* A = Aliased(I))
+        {
+            Json Pre = Json::array();
+            Places[I] = StabilizeLvalue(*A, Pre, true);
+            const Json Wrap = { {"kind", "CompoundStmt"}, {"inner", std::move(Pre)} };
+            if (!LowerBody(Wrap, BP, Pins[I], Locals, Err)) return false;
+        }
+        else if (!LowerArg(*Args[I], BP, Values[I], Err)) return false;
     /* The caller's own variable can stand in for a parameter the body only reads, as a constant does, when nothing
        could change it before the body is done: no argument stores anything, and no parameter is a reference, the
        only way the body could reach a caller's local. */
@@ -5912,28 +6177,12 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
         while (!Type.empty() && (Type.back() == '&' || Type.back() == ' ')) Type.pop_back();
         Type = StripTypeKeywords(Type);
         const std::string Local = Prefix + Name(*Parms[I]);
-        if (ElemIndex(I))
+        if (Aliased(I))
         {
-            /* `T& V` bound to `Arr[I]` is Arr[the index at the call]: a computed index goes to a local once. */
-            Json Elem = *Aliased(I);
-            if (!IsFoldableConst(Values[I]))
-            {
-                const std::string Idx = Local + "Idx";
-                if (!AddLocal(Idx, "int32")) return false;
-                FStmtIR Bind;
-                Bind.K = FStmtIR::Assign;
-                Bind.Var.K = FArgIR::Local;
-                Bind.Var.S = Idx;
-                Bind.Var.LetOp = LetOpFor("int32");
-                Bind.bAssignLocal = true;
-                Bind.Value = std::move(Values[I]);
-                B.Body->push_back(std::move(Bind));
-                Elem["inner"][2] = RefToLocal(Idx, "int32");
-            }
-            RefAlias[Id] = std::move(Elem);
+            for (FStmtIR& P : Pins[I]) B.Body->push_back(std::move(P));
+            RefAlias[Id] = std::move(Places[I]);
             continue;
         }
-        if (const Json* Bare = Aliased(I)) { RefAlias[Id] = *Bare; continue; }
         FStmtIR Bind;
         Bind.Value = std::move(Values[I]);
         /* A constant the body only reads is used in place: no local, no copy. */
@@ -6185,30 +6434,42 @@ bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vec
         ForEach(*LoopDecl, [&](const Json& C) { if (Kind(C) == "BindingDecl") Bindings.push_back(&C); });
         if (Bindings.size() != 2) { *Err = "a TMap range-for binds exactly `auto [Key, Value]`"; --LoopDepth; return false; }
         const std::string Key = "__RangeKey" + N + "__", Val = "__RangeVal" + N + "__";
-        if (!AddLocal(Key, Args[0]) || !AddLocal(Val, Args[1])) { --LoopDepth; return false; }
+        if (!AddLocal(Key, Args[0])) { --LoopDepth; return false; }
         FArgIR KeyAt;
         if (!LowerArg(Elem, BP, KeyAt, Err)) { --LoopDepth; return false; }
         Loop.Body->push_back(AssignStmt(Key, Args[0], std::move(KeyAt)));
-        FStmtIR Find = CallStmt("BlueprintMapLibrary", "Map_Find", { Range, LocalArg(Key), LocalArg(Val) });
-        if (IsContainerType(StripTypeKeywords(Args[1])))
-        {
-            /* A nested container value is a wrapper struct: Map_Find fills a wrapper temp, then Val is its Value. */
-            FArgIR Call;
-            Call.K = FArgIR::Call;
-            Call.Sub = std::make_shared<FCallIR>(Find.Call);
-            if (!NestedWrapperOut(Args[1], 2, "", AssignStmt(Val, Args[1], FArgIR()), BP, Call, Err)) { --LoopDepth; return false; }
-            Find = Call.Sub->Inline->front();
-        }
-        Loop.Body->push_back(std::move(Find));
         RefAlias[Bindings[0]->value("id", std::string())] = RefToLocal(Key, Args[0]);
-        RefAlias[Bindings[1]->value("id", std::string())] = RefToLocal(Val, Args[1]);
         const std::string PairTy = TypeOf(*LoopDecl);
         const bool bByRef = !PairTy.empty() && PairTy.back() == '&' && StripTypeKeywords(PairTy) == PairTy;   // `auto& [K, V]`
-        if (bByRef && !OnlyRead(*Body, Bindings[1]->value("id", std::string())))
+        /* `auto& [K, V]` names the map's own value: V is `Map[K]`, each read a Map_Find and each store a Map_Add, so
+           a write through either name is what the other reads next. A container value stays a copy written back at
+           the end of each pass (below): every operation on it through the map would copy it whole. */
+        if (bByRef && !IsContainerType(StripTypeKeywords(Args[1])))
+            RefAlias[Bindings[1]->value("id", std::string())] =
+                { {"kind", "CXXOperatorCallExpr"}, {"type", {{"qualType", Args[1]}}},
+                  {"inner", Json::array({ Json{ {"kind", "DeclRefExpr"}, {"referencedDecl", {{"kind", "CXXMethodDecl"}, {"name", "operator[]"}}} },
+                                          *RangeExpr, RefToLocal(Key, Args[0]) })} };
+        else
         {
-            FStmtIR Back = CallStmt("BlueprintMapLibrary", "Map_Add", { Range, LocalArg(Key), LocalArg(Val) });
-            Loop.Inc->push_back(Back);
-            Loop.Trailer = std::make_shared<std::vector<FStmtIR>>(1, Back);
+            if (!AddLocal(Val, Args[1])) { --LoopDepth; return false; }
+            FStmtIR Find = CallStmt("BlueprintMapLibrary", "Map_Find", { Range, LocalArg(Key), LocalArg(Val) });
+            if (IsContainerType(StripTypeKeywords(Args[1])))
+            {
+                /* A nested container value is a wrapper struct: Map_Find fills a wrapper temp, then Val is its Value. */
+                FArgIR Call;
+                Call.K = FArgIR::Call;
+                Call.Sub = std::make_shared<FCallIR>(Find.Call);
+                if (!NestedWrapperOut(Args[1], 2, "", AssignStmt(Val, Args[1], FArgIR()), BP, Call, Err)) { --LoopDepth; return false; }
+                Find = Call.Sub->Inline->front();
+            }
+            Loop.Body->push_back(std::move(Find));
+            RefAlias[Bindings[1]->value("id", std::string())] = RefToLocal(Val, Args[1]);
+            if (bByRef && !OnlyRead(*Body, Bindings[1]->value("id", std::string())))
+            {
+                FStmtIR Back = CallStmt("BlueprintMapLibrary", "Map_Add", { Range, LocalArg(Key), LocalArg(Val) });
+                Loop.Inc->push_back(Back);
+                Loop.Trailer = std::make_shared<std::vector<FStmtIR>>(1, Back);
+            }
         }
     }
     Json BodyWrap = Kind(*Body) == "CompoundStmt" ? *Body : Json{ {"kind", "CompoundStmt"}, {"inner", Json::array({ *Body })} };
@@ -6531,6 +6792,15 @@ bool FCompiler::HoistCallArgs(FCallIR& C, FBlueprintClass& BP, std::vector<FProp
         if (!HoistReadsInArg(C.Args[I], BP, Locals, OutPre, Err)) return false;
         if (I == 0 && C.bOnArg0 && !PinHolder(C.Args[0], C.Args.data() + 1, C.Args.size() - 1, BP, Locals, OutPre, Err))
             return false;
+        /* An rvalue bound to a script callee's reference parameter: EX_IntConst and the like would write their value
+           through the null result pointer the VM steps an out parameter with, so it goes into a local first. */
+        // ponytail: the local is made after the object is pinned, so an argument that changes the call's object runs
+        // first; PinObject would need to see these hoists to fix that, if a mod ever does it.
+        if (I < C.RefParms.size() && !C.RefParms[I].empty() && !IsStored(C.Args[I]))
+        {
+            if (C.Args[I].InnerType.empty()) C.Args[I].InnerType = C.RefParms[I];
+            if (!HoistOperand(C.Args[I], BP, Locals, OutPre, Err)) return false;
+        }
     }
     return true;
 }
@@ -6663,6 +6933,7 @@ bool FCompiler::FoldConst(const Json& E, FConstVal& Out) const
         return true;
     };
     if (K == "IntegerLiteral") { Out = {}; Out.I = int64(std::strtoull(E.value("value", std::string("0")).c_str(), nullptr, 10)); return true; }
+    if (K == "CharacterLiteral") { Out = {}; Out.I = CharValue(E); return true; }
     if (K == "FloatingLiteral") { Out = {}; Out.bFloat = true; Out.F = std::strtod(E.value("value", std::string("0")).c_str(), nullptr); return true; }
     if (K == "CXXBoolLiteralExpr") { Out = {}; Out.I = E.value("value", false); return true; }
     if (K == "ConstantExpr" && E.contains("value") && E["value"].is_string())
@@ -7019,7 +7290,9 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
         Init = Strip(First(*Init));
         K = Init ? Kind(*Init) : std::string();
     }
-    if (!bNeg && (K == "CXXNullPtrLiteralExpr" || (K == "CXXConstructExpr" && !First(*Init)))) return true;
+    /* A member `{ .Q = 9 }` leaves unwritten (with no default of its own) is ImplicitValueInitExpr: zero. */
+    if (!bNeg && (K == "CXXNullPtrLiteralExpr" || K == "ImplicitValueInitExpr" || (K == "CXXConstructExpr" && !First(*Init))))
+        return true;
 
     /* A struct value: `FFloatInterval(1, 5)` or `{1, 5}`, one argument per member in declaration
        order. The members go on the property, each with its own default, and the writer turns them
@@ -7045,8 +7318,10 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
             if (!TypeToProperty(TypeOf(*SR->Fields[I]), MName, 0, "member " + MName + " of " + SR->CppName,
                                 BP, &MD, Err))
                 return false;
-            /* Every member is written, so a zero is a value here and not "leave it out". */
-            if (!LowerDefault(*SR->Fields[I], MD, BP, Err, Args[I], /*bKeepZero=*/true)) return false;
+            /* Every member is written, so a zero is a value here and not "leave it out". One the braces leave out
+               but that has a default of its own (CXXDefaultInitExpr) takes that default, as in C++. */
+            const Json* A = Kind(*Args[I]) == "CXXDefaultInitExpr" ? nullptr : Args[I];
+            if (!LowerDefault(*SR->Fields[I], MD, BP, Err, A, /*bKeepZero=*/true)) return false;
             Members->push_back(MD);
         }
         PD.Members = Members;
@@ -8322,7 +8597,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
 }
 
 /* Builds the DOM of clang's AST dump as it streams in, without what nothing reads: source locations (all but a
-   DeclRefExpr's range begin offset and token length, see NamedQualifier), mangled names, a record's definitionData and
+   DeclRefExpr's range begin offset and token length, and its end's in a macro, see NamedQualifier), mangled names, a record's definitionData and
    a few flags are most of the dump, and building them was most of a compile. A key read later must not be in key(). */
 class FAstSax : public nlohmann::json_sax<Json>
 {
@@ -8346,8 +8621,12 @@ public:
     bool key(string_t& K) override
     {
         if (Skipped) return true;
-        bSkipNext = K == "loc" || K == "end" || K == "file" || K == "line" || K == "col" || K == "includedFrom"
-                 || K == "spellingLoc" || K == "expansionLoc" || K == "isMacroArgExpansion" || K == "mangledName"
+        /* A spellingLoc only gets here inside a DeclRefExpr's range (every other loc and range is skipped whole); the
+           range's end is kept only then, for a qualifier written in a macro (NamedQualifier). */
+        const bool bMacroEnd = K == "end" && Stack.back()->is_object() && Stack.back()->contains("begin")
+                            && (*Stack.back())["begin"].contains("spellingLoc");
+        bSkipNext = K == "loc" || (K == "end" && !bMacroEnd) || K == "file" || K == "line" || K == "col" || K == "includedFrom"
+                 || K == "expansionLoc" || K == "isMacroArgExpansion" || K == "mangledName"
                  || K == "definitionData" || K == "isImplicit" || K == "isUsed" || K == "isReferenced"
                  || K == "typeAliasDeclId" || (K == "range" && !DeclRef.back());
         bKindNext = K == "kind";
@@ -8553,6 +8832,17 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         for (const auto& M : Entry.second.MethodDefs) NormalizePointers(const_cast<Json&>(*M.second));
         for (const auto& M : Entry.second.Inlines) NormalizePointers(const_cast<Json&>(*M.second));
     }
+
+    /* ponytail: every UE name of a mod class (its package, _C, CDO, registry row) is its C++ name, so a namespaced one
+       would be written as `Ns::X.uasset`, which Windows refuses. Supporting it needs its own asset name (`Ns__X`, as a
+       global's class has, or a folder per namespace) in each of those places. */
+    for (const auto& Entry : Records)
+        if (Entry.second.IsGenerated() && Entry.second.CppName.find("::") != std::string::npos)
+        {
+            *Err = Entry.second.CppName + ": a mod class, struct or interface cannot be declared in a namespace yet "
+                   "(its asset is named after it)";
+            return false;
+        }
 
     int32 Generated = 0;
     for (const auto& Entry : Records)

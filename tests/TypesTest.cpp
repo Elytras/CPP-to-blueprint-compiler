@@ -76,6 +76,14 @@ public:
   /* Signed >> floors: -3 >> 1 is -2, where a plain divide by 2 gives -1. */
   int32 ShrBy(int32 X, int32 M) { return M == 1 ? X >> 1 : M == 4 ? X >> 4 : X >> 31; }
   int64 Shr64(int64 X, int32 M) { return M == 1 ? X >> 1 : X >> 63; }
+  /* int64 -> float: UE 4.27 has none, so it goes through int32 (and warns). */
+  float I64ToFloat(int64 X) { return (float)X; }
+  float TruncViaI64(float G) { return (float)(int64)G; }
+  /* Literals past Blueprint's types: a uint64 one keeps its bits (-1), a double past float's range is inf. */
+  int64 AllOnes() { return (int64)18446744073709551615ULL; }
+  float Huge() { return (float)1e39; }
+  /* A character literal is its code unit; a plain char is signed, so '\xff' is -1. */
+  int32 PlusChar(int32 X) { return X + 'A' + ('a' - 'A') * 2 + '\xff'; }
   /* A shift has the promoted LHS type: `int >> 1LL` is int32 math. */
   int32 ShiftByLL(int32 X, int32 M) { if (M == 0) return X << 2LL; if (M == 1) return X >> 1LL; X >>= 3LL; return X; }
   /* A float becomes an integer truncated toward zero, not printed to 6 decimals first (0.99999994f is 0). */

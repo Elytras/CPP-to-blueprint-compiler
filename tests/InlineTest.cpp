@@ -8,6 +8,7 @@ UE_MOD_PACKAGE("/Game/_ElytrasMods/InlineTest");
 class InlineTest : public AActor {
   int32         Counter;
   int32         Calls;
+  int32         Key;
   TArray<int32> Arr;
 
 public:
@@ -96,6 +97,61 @@ public:
     Arr.Add(10);
     Bump(Arr[NextIdx()], By);
     return Arr[0] * 100 + Calls * 10 + Counter;
+  }
+
+  /* A written T& bound to what Blueprint has no reference to (a map element, `C ? X : Y`, another object's member) gets
+     a copy, stored back after the call into the place picked at the call. */
+  void  Add5(int32 &V) { V += 5; }
+  int32 AddKey(int32 &V) {
+    V += 5;
+    Key += 1;
+    return V;
+  }
+  int32 RefMap(int32 K) {
+    TMap<int32, int32> M;
+    M.Add(1, 10);
+    M.Add(2, 20);
+    Add5(M[K]);
+    Bump(M[K], 3);
+    return M[1] * 100 + M[2];
+  }
+  int32 RefSel(bool C) {
+    int32 X = 1, Y = 2;
+    Add5(C ? X : Y);
+    Bump(C ? X : Y, 10);
+    return X * 100 + Y;
+  }
+  int32 RefObj(int32 By) {
+    InlineTest *O = this;
+    Bump(O->Calls, By);
+    return Calls * 10 + Counter;
+  }
+  /* An inline's `T&` bound to `O->A` is A itself, not a copy: the body reads its own write back through O. */
+  inline int32 AddRead(int32 &V, InlineTest *O) {
+    V += 5;
+    return O->Calls;
+  }
+  int32 RefObjLive() {
+    InlineTest *O = this;
+    return AddRead(O->Calls, O);
+  }
+  /* Deeper under an object: O and the index are fixed at the call. */
+  int32 RefDeep(int32 By) {
+    InlineTest *O = this;
+    Arr.Add(10);
+    Bump(O->Arr[NextIdx()], By);
+    return Arr[0] * 100 + Calls * 10 + Counter;
+  }
+  int32 RefPinned() {
+    TMap<int32, int32> M;
+    M.Add(0, 10);
+    M.Add(1, 20);
+    Key     = 0;
+    int32 R = AddKey(M[Key]); // back into M[0], though AddKey moved Key
+    int32 N = 0;
+    while (AddKey(M[1]) < 40) // in and back on every trip
+      N++;
+    return R * 1000000 + M[0] * 10000 + M[1] * 100 + N;
   }
 
   /* do/while runs its body before the first test, when the test is an inline call too; continue goes to the test. */
