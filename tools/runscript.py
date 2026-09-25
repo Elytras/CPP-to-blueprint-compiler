@@ -136,7 +136,6 @@ MATH = {
     'Add_Int64Int64': lambda a, b: a + b, 'Subtract_Int64Int64': lambda a, b: a - b,
     'Less_FloatFloat': lambda a, b: a < b, 'Greater_FloatFloat': lambda a, b: a > b, 'Conv_ByteToInt': int, 'NotEqual_ByteByte': lambda a, b: a != b,
     'NotEqual_Int64Int64': lambda a, b: a != b, 'EqualEqual_Int64Int64': lambda a, b: a == b, 'NotEqual_NameName': lambda a, b: str(a).lower() != str(b).lower(),
-    'EqualEqual_NameName': lambda a, b: str(a).lower() == str(b).lower(),
     'Or_IntInt': lambda a, b: int(a) | int(b), 'And_IntInt': lambda a, b: int(a) & int(b), 'Xor_IntInt': lambda a, b: int(a) ^ int(b),
     'Divide_Int64Int64': idiv, 'And_Int64Int64': lambda a, b: int(a) & int(b),
     'FTrunc': lambda a: i32(int(a)), 'FTrunc64': int,     # FMath::TruncToInt: toward zero, as C++ converts
@@ -197,7 +196,6 @@ CONTAINERS = {
     'Array_Add': lambda ev, store, a: (_made(ev, store, a[0], []).append(copy.deepcopy(ev(a[1]))), len(ev(a[0])) - 1)[1],
     'Set_ToArray': lambda ev, store, a: store(a[1], list(ev(a[0]))),
     'Map_Keys': lambda ev, store, a: store(a[1], list(ev(a[0]).keys())),
-    'Map_Length': lambda ev, store, a: len(_made(ev, store, a[0], {})),
     'Map_Find': lambda ev, store, a: (store(a[2], _made(ev, store, a[0], {}).get(ev(a[1]), 0)), ev(a[1]) in ev(a[0]))[1],
     'Map_Add': lambda ev, store, a: _made(ev, store, a[0], {}).__setitem__(ev(a[1]), copy.deepcopy(ev(a[2]))),
     'Array_Clear': lambda ev, store, a: store(a[0], []),
