@@ -8655,6 +8655,17 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         for (const auto& M : Entry.second.Inlines) NormalizePointers(const_cast<Json&>(*M.second));
     }
 
+    /* ponytail: every UE name of a mod class (its package, _C, CDO, registry row) is its C++ name, so a namespaced one
+       would be written as `Ns::X.uasset`, which Windows refuses. Supporting it needs its own asset name (`Ns__X`, as a
+       global's class has, or a folder per namespace) in each of those places. */
+    for (const auto& Entry : Records)
+        if (Entry.second.IsGenerated() && Entry.second.CppName.find("::") != std::string::npos)
+        {
+            *Err = Entry.second.CppName + ": a mod class, struct or interface cannot be declared in a namespace yet "
+                   "(its asset is named after it)";
+            return false;
+        }
+
     int32 Generated = 0;
     for (const auto& Entry : Records)
     {

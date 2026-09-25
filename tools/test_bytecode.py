@@ -55,14 +55,14 @@ def asset(mod):
     return os.path.join(ROOT, mod, 'FSD', 'Content', '_ElytrasMods', mod, mod)
 
 
-def refused(mod, body, why):
-    """A mod (the class body given) the compiler must refuse, saying why."""
+def refused(mod, body, why, top=''):
+    """A mod (the class body given, `top` before the class) the compiler must refuse, saying why."""
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
         src = os.path.join(tmp, mod + '.cpp')
         with open(src, 'w', encoding='utf-8') as f:
-            f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\n'
-                    'class %s : public AActor {\npublic:\n%s};\n' % (mod, mod, body))
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\n%s'
+                    'class %s : public AActor {\npublic:\n%s};\n' % (mod, top, mod, body))
         proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, tmp], capture_output=True, encoding='utf-8')
         assert proc.returncode != 0 and why in proc.stdout, (mod, proc.stdout)
 
@@ -774,6 +774,10 @@ inline_statics()
 no_inline_ufunctions()
 inline_regressions()
 inline_mixed_overloads()
+# A mod class's asset is named after it, so a namespaced one is refused by name, not as an unwritable `Ns::X.uasset`.
+refused('NsClass', '  int32 F() { return 1; }\n', 'Ns::UThing: a mod class, struct or interface cannot be declared in a namespace',
+        top='namespace Ns { class UThing : public UObject { public: int32 X; }; }\n')
+print('ok  a mod class in a namespace is refused, naming it')
 
 
 # ---- OptTest
