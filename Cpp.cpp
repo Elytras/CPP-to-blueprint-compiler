@@ -545,7 +545,7 @@ struct FStmtIR
     bool bJumpOut = false;                          // If: Then is one break / continue, taken when Cond is FALSE: a
                                                     // single JumpIfNot straight to where it goes
     std::vector<FArgIR> CaseTests;                  // Switch: per case, true when the value does NOT match
-    int32 LabelId = -1;                             // Label: the case it marks; Switch: the default's label, or -1;
+    int32 LabelId = -1;                             // Label: the case it marks, -1 if no value can; Switch: the default's label, or -1;
                                                     // Goto / GotoLabel: the label, unique in the class
     std::vector<int64> CaseValues;                  // Switch: each case's constant, in CaseTests order
     int32 SwitchWidth = 4;                          // Switch: the value's size, 1 / 4 / 8; 0 for an FName
@@ -1446,7 +1446,7 @@ void EmitStmts(const std::vector<FStmtIR>& Stmts, FScript& S, FIndex SelfExp, FL
             Miss = S.Jump(0);
             for (const FStmtIR& B : *St.Body)
             {
-                if (B.K == FStmtIR::Label) { LabelAt[B.LabelId] = S.MemorySize(); continue; }
+                if (B.K == FStmtIR::Label) { if (B.LabelId >= 0) LabelAt[B.LabelId] = S.MemorySize(); continue; }
                 EmitStmts({ B }, S, SelfExp, &Inner, Returns);
             }
             const int32 End = S.MemorySize();
@@ -5032,6 +5032,10 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             const std::string TempTy = bName ? "FName" : Width == 1 ? "uint8" : Width == 8 ? "int64" : "int32";
             const char* NotEqual = bName ? "NotEqual_NameName" : Width == 1 ? "NotEqual_ByteByte"
                                  : Width == 8 ? "NotEqual_Int64Int64" : "NotEqual_IntInt";
+            /* The promoted value of a byte is 0..255 (-128..127 signed): a case outside that never matches, and its
+               ByteConst would wrap onto one that does. */
+            const std::string ByteTy = Width == 1 ? StripTypeKeywords(TypeOf(*Strip(Cond))) : std::string();
+            const bool bSignedByte = ByteTy == "int8" || ByteTy == "signed char" || ByteTy == "char";
 
             const std::string Temp = "__Switch" + std::to_string(ReadTmpCounter++) + "__";
             FPropertyDef PD;
@@ -5086,7 +5090,16 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                         Const.K = FArgIR::Name;
                         if (!FindLiteral(*Value, Const.S)) { *Err = "a case of UE_NAME_SWITCH needs UE_NAME_CASE(\"Text\")"; return false; }
                     }
-                    else if (Width == 1) { Const.K = FArgIR::Byte; Const.I = int32(V); }
+                    else if (Width == 1)
+                    {
+                        if (V < (bSignedByte ? -128 : 0) || V > (bSignedByte ? 127 : 255))
+                        {
+                            L.LabelId = -1;                 // reached only by falling through
+                            St.Body->push_back(L);
+                            return !Sub || Flatten(*Sub);
+                        }
+                        Const.K = FArgIR::Byte; Const.I = int32(V);
+                    }
                     else if (Width == 8) { Const.K = FArgIR::Int64; Const.I64 = V; }
                     else { Const.K = FArgIR::Int; Const.I = int32(V); }
                     FArgIR Value0;
