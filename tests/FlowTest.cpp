@@ -470,6 +470,12 @@ public:
     for (;;) { if (T <= 0) break; --T; S += 1000; }
     return I + S * 10;
   }
+  /* A `for` condition may declare a variable: it is made again, and tested, each time round. */
+  int32 ForCondVar(int32 N) {
+    int32 S = 0;
+    for (int32 I = 0; int32 L = N - I; ++I) { if (L == 2) continue; S += L; }
+    return S;
+  }
 
   /* UE_NAME_SWITCH: a comparison per case, case-insensitive as FName is. */
   /* FName converts to bool as Name != None. */

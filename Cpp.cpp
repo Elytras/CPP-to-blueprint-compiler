@@ -5455,6 +5455,19 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             const Json* Inc = AtOr(3);
             const Json* Body = AtOr(4);
             if (!Body) { *Err = "`for` with no body"; bOk = false; return; }
+            if (const Json* Var = AtOr(1))
+            {
+                /* `for (Init; T V = E; Inc) Body`: V is made again each time round, as in
+                   `for (Init;; Inc) { T V = E; if (!V) break; Body }`, where a `continue` still reaches Inc. */
+                Json Not = { {"kind", "UnaryOperator"}, {"opcode", "!"}, {"type", { {"qualType", "bool"} }}, {"inner", Json::array({*Cond})} };
+                Json Exit = { {"kind", "IfStmt"}, {"inner", Json::array({ Not, Json{ {"kind", "BreakStmt"} } })} };
+                Json Loop = *S;
+                Loop["inner"][1] = Loop["inner"][2] = Json::object();
+                Loop["inner"][4] = { {"kind", "CompoundStmt"}, {"inner", Json::array({ *Var, Exit, *Body })} };
+                Json Wrap = { {"kind", "CompoundStmt"}, {"inner", Json::array({ Loop })} };
+                if (!LowerBody(Wrap, BP, Out, Locals, Err)) bOk = false;
+                return;
+            }
 
             if (Init)
             {

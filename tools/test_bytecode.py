@@ -463,6 +463,7 @@ print('ok  FlowTest.UseDefault: a defaulted argument is the parameter\'s default
 check('FlowTest', 'RefRvalue', lambda X: 5 + (2 * X + 1) + (X + 1), [dict(X=x) for x in (-4, 0, 9)])   # runvm refuses a non-variable
 check('FlowTest', 'Empty', lambda N: max(N, 1) + {1: 30, 2: 20}.get(N, 0) + (100 if N >= 0 else 0), [dict(N=n) for n in (-3, 0, 1, 2, 5)])
 check('FlowTest', 'ForParts', lambda N: max(N, 0) + 10 * (sum(j for j in range(N) if j != 1) + 1000 * max(N, 0)), [dict(N=n) for n in (-2, 0, 1, 2, 6)])
+check('FlowTest', 'ForCondVar', lambda N: sum(l for l in range(1, N + 1) if l != 2), [dict(N=n) for n in (0, 1, 2, 5)])
 check('FlowTest', 'Compound', compound, [dict(N=n) for n in (0, 1, 5, 40)])
 check('FlowTest', 'WhileAnd', while_and, [dict(Limit=l) for l in (0, 1, 50, 99, 150)])
 
