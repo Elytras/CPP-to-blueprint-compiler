@@ -8107,9 +8107,10 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
                     const std::string& OutDir, const std::optional<std::string>& InApiDir, std::string* Err)
 {
     ApiDir = InApiDir;
-    SourceDir = std::filesystem::path(SourcePath).parent_path().string();
     /* In %TEMP%, not OutDir: bpbuild paks OutDir's whole tree, and a failed compile keeps the dump (hundreds of MB). */
     std::error_code TmpEc;
+    /* Absolute: a bare "Mod.cpp" has an empty parent, and NamedQualifier cannot list "". */
+    SourceDir = std::filesystem::absolute(SourcePath, TmpEc).parent_path().string();
     const std::string AstPath = (std::filesystem::temp_directory_path(TmpEc)
                                  / (std::filesystem::path(SourcePath).stem().string() + ".assetgen-ast.json")).string();
     /* Both the UeApi dir and its parent are include paths, so "FSD.h" and "UeApi/FSD.h" both resolve. Absolute

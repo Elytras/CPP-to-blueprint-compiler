@@ -1615,6 +1615,17 @@ def spawn_runs():
     print('ok  SpawnTest: spawn / construct / add-component calls, their classes and the deferred-set order')
 
 
+def spawn_relative():
+    """Compiled from its own folder as a bare "SpawnTest.cpp": `SpawnTest::StaticClass()` still names the mod class
+    (the qualifier is read back from the mod's sources, which a bare path's empty parent once hid)."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        proc = subprocess.run([ASSETGEN, 'compile', 'SpawnTest.cpp', UEAPI, tmp], capture_output=True, text=True, cwd=TESTS)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert VM(os.path.join(tmp, 'SpawnTest'), {}).call('OwnClass') == 'SpawnTest_C'
+    print('ok  SpawnTest: a bare relative source path finds X::StaticClass() qualifiers')
+
+
 def outer_runs():
     """GetTypedOuter / GetOutermostTypedOuter over a faked outer chain: nearest / farthest outer of the kind, the
     object itself never a candidate, null when there is none; and no function of their own."""
@@ -1669,4 +1680,5 @@ latent_links()
 await_runs()
 delegate_targets()
 spawn_runs()
+spawn_relative()
 outer_runs()
