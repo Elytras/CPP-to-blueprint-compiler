@@ -5349,6 +5349,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             if (!Sub || !LowerBody(Wrap, BP, Out, Locals, Err)) bOk = false;
             return;
         }
+        else if (K == "NullStmt") return;   // `while (C);`, `[[fallthrough]];`, `Label: ;`
         else if (K == "CompoundStmt")
         {
             /* A bare `{ ... }`: a Blueprint local has no scope to end, so its statements join this list. */

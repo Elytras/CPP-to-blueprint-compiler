@@ -449,6 +449,18 @@ public:
   int32 RefSum(const int32& A) { return A + 1; }
   int32 RefRvalue(int32 X) { return RefSum(4) + RefSum(X * 2) + RefSum(X); }
 
+  /* The empty statement is nothing: a loop with no body, [[fallthrough]], a label on nothing. */
+  int32 Empty(int32 N) {
+    int32 I = 0, R = 0;
+    while (++I < N)
+      ;
+    switch (N) { case 1: R += 10; [[fallthrough]]; case 2: R += 20; break; default: break; }
+    if (N < 0) goto Done;
+    R += 100;
+  Done: ;
+    return I + R;
+  }
+
   /* UE_NAME_SWITCH: a comparison per case, case-insensitive as FName is. */
   /* FName converts to bool as Name != None. */
   int32 NameSet(FName N) { bool B = static_cast<bool>(N); if (N) return B ? 1 : 9; return !N ? 2 : 9; }
