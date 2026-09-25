@@ -1603,6 +1603,8 @@ bool FCompiler::Collect(std::string* Err)
             ForEach(N, [&](const Json& C) {
                 if (Kind(C) != "EnumConstantDecl") return;
                 const Json* V = First(C);
+                /* Values past int's range are converted to the enum's wider type around the ConstantExpr. */
+                while (V && !V->contains("value") && Kind(*V) == "ImplicitCastExpr") V = First(*V);
                 if (V && V->contains("value")) Next = std::stoll((*V)["value"].get<std::string>());
                 Mine.push_back({ Name(C), Next });
                 EnumValues[C.value("id", std::string())] = Next++;
@@ -1613,7 +1615,10 @@ bool FCompiler::Collect(std::string* Err)
                                     : Under == "int" || Under == "int32" ? "int32"
                                     : Under == "long long" || Under == "int64" ? "int64" : Under;
             EnumUnderlying[Ns + N.value("name", std::string())] = Canon;
-            const int32 Width = Under.empty() || Canon == "uint8" ? 1 : Canon == "int64" ? 8 : 4;
+            /* No fixed type (a mod's own `enum { kMax = 1000 };`): C++ makes it int, or wider if a value needs it. */
+            bool bWide = false;
+            for (const auto& En : Mine) bWide |= En.second < INT32_MIN || En.second > INT32_MAX;
+            const int32 Width = Under.empty() ? (bWide ? 8 : 4) : Canon == "uint8" ? 1 : Canon == "int64" ? 8 : 4;
             ForEach(N, [&](const Json& C) { if (Kind(C) == "EnumConstantDecl") EnumConstWidth[C.value("id", std::string())] = Width; });
             return;
         }

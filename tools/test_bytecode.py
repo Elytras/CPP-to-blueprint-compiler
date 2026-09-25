@@ -782,6 +782,10 @@ def types_behaviour():
     below = [f32(v) for v in (0.99999994, 7.9999995, -0.99999994, 3.9999998, 2.75, -2.75, 0.0, -1e9)]
     check('TypesTest', 'TruncOf', lambda X, M: int(X * 2 if M == 2 else X), [dict(X=x, M=m) for x in below for m in (0, 1, 2)])
     check('TypesTest', 'Trunc64Of', lambda X: int(X), [dict(X=x) for x in below + [f32(5e9), f32(-7.5e12)]])
+    # Constants of an enum with no fixed type keep their value (they were bytes: 1000 read back as 232).
+    check('TypesTest', 'AnonConst', lambda X, M: [min(X, 1000), wrap(X - 5), wrap(X * 70000), int(X == 70000), 1000][M],
+          [dict(X=x, M=m) for x in EDGE + (500, 999, 1000, 1001, 5000, 69999, 70000) for m in range(5)])
+    check('TypesTest', 'WideConst', lambda X: X + 5000000000, [dict(X=x) for x in (-5000000000, -1, 0, 7, 1 << 32)])
     # An int64 enum compares as int64: a value sharing only Eon's / Epoch's low 32 bits is neither.
     check('TypesTest', 'AgeOf', lambda A: 1 if A == 5000000000 else 2 if A == 0 else 0,
           [dict(A=a) for a in (0, 5000000000, 7, 5000000001, 5000000000 & 0xFFFFFFFF, 1 << 32, -(1 << 32))])
