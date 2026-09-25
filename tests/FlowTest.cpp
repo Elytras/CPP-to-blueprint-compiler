@@ -445,6 +445,10 @@ public:
   static inline int32 Offset(int32 X, int32 By = 7) { return X + By; }
   int32 UseDefault(int32 X) { return Times(X) + Times(X, 10) + Offset(X) * 1000; }
 
+  /* An rvalue bound to a script function's const&: the VM steps it with no result buffer, so it needs a local. */
+  int32 RefSum(const int32& A) { return A + 1; }
+  int32 RefRvalue(int32 X) { return RefSum(4) + RefSum(X * 2) + RefSum(X); }
+
   /* UE_NAME_SWITCH: a comparison per case, case-insensitive as FName is. */
   /* FName converts to bool as Name != None. */
   int32 NameSet(FName N) { bool B = static_cast<bool>(N); if (N) return B ? 1 : 9; return !N ? 2 : 9; }

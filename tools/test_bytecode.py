@@ -447,6 +447,7 @@ check('FlowTest', 'ConstBreak', lambda X: 205, [dict(X=0)])
 vm = VM(asset('FlowTest'))
 assert [vm.call('UseDefault', X=x) for x in (-2, 0, 5)] == [(x * 3 + x * 10 + (x + 7) * 1000) for x in (-2, 0, 5)]
 print('ok  FlowTest.UseDefault: a defaulted argument is the parameter\'s default, to a method and inlined')
+check('FlowTest', 'RefRvalue', lambda X: 5 + (2 * X + 1) + (X + 1), [dict(X=x) for x in (-4, 0, 9)])   # runvm refuses a non-variable
 check('FlowTest', 'Compound', compound, [dict(N=n) for n in (0, 1, 5, 40)])
 check('FlowTest', 'WhileAnd', while_and, [dict(Limit=l) for l in (0, 1, 50, 99, 150)])
 

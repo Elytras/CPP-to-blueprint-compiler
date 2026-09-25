@@ -296,8 +296,13 @@ def run(base, function, self_vars=None, **parms):
         if o == 0x6B: return ev(n.kids[0])[ev(n.kids[1])]
         if o in (0x1B, 0x45):                                        # the class's own function, by name: a frame of its own
             names = params_of(base, n.val)
-            r, callee = run(base, n.val, self_vars, **dict(zip(names, [copy.deepcopy(ev(a)) for a in n.kids])))
             outs = params_of(base, n.val, 0x100)
+            # The VM steps a reference argument with no result buffer (ProcessScriptFunction), so a constant or a
+            # call there writes through null in game: it must be a variable.
+            for name, a in zip(names, n.kids):
+                if name in outs and a.op not in ADDRESSABLE and not (a.op in (0x19, 0x1A) and a.kids[1].op in ADDRESSABLE):
+                    raise SystemExit('%s: reference parameter %s gets a non-variable (op %02x), which crashes the VM' % (n.val, name, a.op))
+            r, callee = run(base, n.val, self_vars, **dict(zip(names, [copy.deepcopy(ev(a)) for a in n.kids])))
             for name, a in zip(names, n.kids):                       # a reference parameter is its argument's variable
                 if name in outs and a.op in ADDRESSABLE: store(a, callee.get(name, 0))
             return r

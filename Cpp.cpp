@@ -491,6 +491,7 @@ struct FCallIR
     FIndex Context;                     // CDO a static call runs against; null = self
     bool bPure = false;                 // a function of its arguments (UE_PURE, a Kismet operator or conversion): see DropUnusedPure
     uint64 WrittenArgs = ~uint64(0);    // bit I: argument I must stay its own variable, which the callee may write: see ContainerWrites
+    std::vector<std::string> RefParms;  // a script callee's: per argument, the type of the reference parameter it binds, else "": see HoistCallArgs
     std::string VirtualName;            // a generated class's own instance method: EX_VirtualFunction resolves it by name at run time
     bool bLocalVirtual = false;         // ... as EX_LocalVirtualFunction: a script function that is no RPC
     std::string View;                   // __RefAtInline__: the TArray field of the view struct in Extra
@@ -4211,6 +4212,18 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         else if (I < Defaulted.size() && Defaulted[I]) Out.Args[I] = Wco;
         break;
     }
+    /* A reference parameter, const or not, is CPF_OutParm, and a script callee steps its argument with no result
+       buffer to take the address (ProcessScriptFunction): HoistCallArgs gives an rvalue there a local to live in. */
+    if (Out.bScript && !Hidden && Out.Args.size() == Parms.size())
+    {
+        ForEach(*FullDecl, [&](const Json& C) {
+            if (Kind(C) != "ParmVarDecl") return;
+            std::string T = TypeOf(C);
+            const bool bRef = !T.empty() && T.back() == '&';
+            while (!T.empty() && (T.back() == '&' || T.back() == ' ')) T.pop_back();
+            Out.RefParms.push_back(bRef ? StripTypeKeywords(T) : std::string());
+        });
+    }
     if (Hidden)
     {
         if (!LatentRefusal.empty()) { *Err = "latent call " + MethodName + ": " + LatentRefusal; return false; }
@@ -6541,6 +6554,15 @@ bool FCompiler::HoistCallArgs(FCallIR& C, FBlueprintClass& BP, std::vector<FProp
         if (!HoistReadsInArg(C.Args[I], BP, Locals, OutPre, Err)) return false;
         if (I == 0 && C.bOnArg0 && !PinHolder(C.Args[0], C.Args.data() + 1, C.Args.size() - 1, BP, Locals, OutPre, Err))
             return false;
+        /* An rvalue bound to a script callee's reference parameter: EX_IntConst and the like would write their value
+           through the null result pointer the VM steps an out parameter with, so it goes into a local first. */
+        // ponytail: the local is made after the object is pinned, so an argument that changes the call's object runs
+        // first; PinObject would need to see these hoists to fix that, if a mod ever does it.
+        if (I < C.RefParms.size() && !C.RefParms[I].empty() && !IsStored(C.Args[I]))
+        {
+            if (C.Args[I].InnerType.empty()) C.Args[I].InnerType = C.RefParms[I];
+            if (!HoistOperand(C.Args[I], BP, Locals, OutPre, Err)) return false;
+        }
     }
     return true;
 }
