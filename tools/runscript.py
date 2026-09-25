@@ -95,7 +95,7 @@ def params_of(base, function, flag=0x80):
     exports = dumpexp.load(base)[5]
     idx = next(i for i, e in enumerate(exports) if e['name'] == function)
     out = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dumpstruct.py'), base, str(idx)],
-                         capture_output=True, text=True).stdout
+                         capture_output=True, encoding='utf-8').stdout
     found = re.findall(r'^\s+\w+Property (\w+) .*? flags=(0x[0-9a-fA-F]+)', out, re.M)
     return [name for name, flags in found if int(flags, 16) & flag and not int(flags, 16) & 0x400]
 
@@ -107,7 +107,7 @@ def props_of(base, function, _cache={}):
         exports = dumpexp.load(base)[5]
         idx = next(i for i, e in enumerate(exports) if e['name'] == function)
         out = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dumpstruct.py'), base, str(idx)],
-                             capture_output=True, text=True).stdout
+                             capture_output=True, encoding='utf-8').stdout
         _cache[base, function] = dict((n, t) for t, n in re.findall(r'^  (\w+Property) (\w+) ', out, re.M))
     return _cache[base, function]
 
