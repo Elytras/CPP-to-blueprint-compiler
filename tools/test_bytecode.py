@@ -121,6 +121,32 @@ def registry_layout():
     print('ok  every registry is FSD/AssetRegistry.bin; `assetgen registry` merges them, once per package')
 
 
+def registry_non_ascii():
+    """A non-ASCII class name reaches the registry as the loader reads it - UTF-16, since ANSI widens byte by byte -
+    and a recompile and `assetgen registry` merge it back. The package path's odd length puts the UTF-16 package name
+    on an odd offset, so its alignment pad is read too."""
+    import tempfile
+    import dumpar
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, 'Umlaut.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/Umlaute");\n'
+                    'class Größe : public AActor {\npublic:\n  int32 Get() { return 1; }\n};\n')
+        want = [('/Game/_ElytrasMods/Umlaute/Größe.Größe_C', '/Game/_ElytrasMods/Umlaute', 'BlueprintGeneratedClass',
+                 '/Game/_ElytrasMods/Umlaute/Größe', 'Größe_C')]
+        rows = lambda path: [(r['object_path'], r['package_path'], r['asset_class'], r['package_name'], r['asset_name'])
+                             for r in dumpar.read(path)[2]]
+        for twice in range(2):
+            proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, tmp], capture_output=True, text=True)
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+            assert rows(os.path.join(tmp, 'AssetRegistry.bin')) == want, rows(os.path.join(tmp, 'AssetRegistry.bin'))
+        merged = os.path.join(tmp, 'Merged.bin')
+        proc = subprocess.run([ASSETGEN, 'registry', merged, os.path.join(tmp, 'AssetRegistry.bin'), registry_of('AssetTest')],
+                              capture_output=True, text=True)
+        assert proc.returncode == 0 and set(want) <= set(rows(merged)), (proc.stdout, rows(merged))
+    print('ok  a non-ASCII asset name reads back from the registry as written, and merges')
+
+
 def export_index(base, name):
     return exports_of(base).index(name)
 
@@ -204,6 +230,7 @@ def nested(Size):
 
 sweep()
 registry_layout()
+registry_non_ascii()
 check('FlowTest', 'SumSkipping', sum_skipping, [dict(Count=c, Skip=k) for c in (0, 1, 5, 10, 20) for k in (-1, 0, 3, 9)])
 check('FlowTest', 'FirstOver', first_over, [dict(Limit=l) for l in (0, 1, 5, 99, 100)])
 check('FlowTest', 'Nested', nested, [dict(Size=s) for s in (0, 1, 2, 4, 7)])
@@ -1016,6 +1043,11 @@ def string_behaviour():
     import runscript
     check('StringTest', 'MakeKey', lambda Prefix, Index: Prefix + '_' + str(Index),
           [dict(Prefix=p, Index=i) for p in ('', 'Abc') for i in (-5, 0, 42, 2**31 - 1)])
+    base = asset('StringTest')
+    cdo = dump('dumptags.py', base, [e['name'] for e in dumpexp.load(base)[5]].index('Default__StringTest_C'))
+    assert 'Umlaut [0] NameProperty size=8: Größe' in cdo, cdo
+    check('StringTest', 'IsUmlaut', lambda S: S.lower() == 'größe', [dict(S=s) for s in ('Größe', 'GRößE', 'Grösse', '')])
+    print('ok  StringTest: a non-ASCII FName reads back as written, in the CDO and the bytecode')
 
     class Trace(dict):
         """The object's fields, recording every store in order."""

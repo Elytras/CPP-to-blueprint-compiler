@@ -96,7 +96,7 @@ class VM:
             if o == 0x17: return me
             if o == 0x2A: return None
             if o == 0x20: return s.objects.get(n.val, n.val)
-            if o in (0x1D, 0x1E, 0x1F, 0x24, 0x2C, 0x35, 0x21, 0x5B): return n.val
+            if o in (0x1D, 0x1E, 0x1F, 0x34, 0x24, 0x2C, 0x35, 0x21, 0x5B): return n.val
             if o == 0x4B: return ('delegate', n.val, me)                   # EX_InstanceDelegate binds Stack.Object
             if o in (0x25, 0x26): return o - 0x25
             if o in (0x27, 0x28): return o == 0x27

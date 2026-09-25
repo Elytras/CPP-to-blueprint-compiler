@@ -11,6 +11,7 @@ class StringTest : public AActor {
   int32 Count;
   float Ratio;
   int64 Big;
+  FName Umlaut = "Größe";
 
 public:
   void ReceiveBeginPlay() {
@@ -40,4 +41,11 @@ public:
   }
 
   UE_PURE FName MakeKey(FText Prefix, int32 Index) { return Prefix + "_" + Index; }
+
+  /* A non-ASCII FName literal names the same FName as the string converted at run time. */
+  bool IsUmlaut(FString S) {
+    FName FromString = S;
+    FName Literal = "Größe";
+    return FromString == Literal;
+  }
 };

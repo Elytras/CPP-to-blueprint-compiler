@@ -1,5 +1,6 @@
 ﻿// Layout transcribed from UE4.27 PackageFileSummary.cpp / LinkerSave.cpp / UnrealNames.cpp.
 #include "Package.h"
+#include "Script.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -72,12 +73,22 @@ std::string GuidString(const uint32 (&G)[4])
     return Out;
 }
 
+/* Positive length = ANSI, read back as Latin-1; anything non-ASCII goes out as UTF-16 with a negative length. */
 void WriteFString(std::vector<uint8>& B, const std::string& S)
 {
-    const int32 Len = int32(S.size()) + 1;
+    const bool bWide = !IsAscii(S);
+    const std::u16string W = bWide ? Utf8To16(S) : std::u16string();
+    const int32 Len = bWide ? -int32(W.size() + 1) : int32(S.size()) + 1;
     const uint8* P = reinterpret_cast<const uint8*>(&Len);
     B.insert(B.end(), P, P + 4);
-    B.insert(B.end(), S.begin(), S.end());
+    if (!bWide)
+    {
+        B.insert(B.end(), S.begin(), S.end());
+        B.push_back(0);
+        return;
+    }
+    for (char16_t C : W) { B.push_back(uint8(C & 0xFF)); B.push_back(uint8(C >> 8)); }
+    B.push_back(0);
     B.push_back(0);
 }
 }   // namespace
@@ -106,13 +117,17 @@ void SplitName(const std::string& S, std::string& OutBase, int32& OutNumber)
     OutNumber = std::stoi(Digits) + 1;                       // stored number is one-based
 }
 
+/* A non-ASCII string is stored (and so hashed) as WIDECHARs; the WIDECHAR Strihash takes both bytes of each. */
 uint32 Strihash(const std::string& S)
 {
+    const bool bWide = !IsAscii(S);
+    const std::u16string W = bWide ? Utf8To16(S) : std::u16string(S.begin(), S.end());
     uint32 Hash = 0;
-    for (char Ch : S)
+    for (char16_t Ch : W)
     {
-        const uint8 B = uint8((Ch >= 'a' && Ch <= 'z') ? Ch - 'a' + 'A' : Ch);
-        Hash = ((Hash >> 8) & 0x00FFFFFFu) ^ Crc().Deprecated[(Hash ^ B) & 0xFFu];
+        const uint32 U = (Ch >= u'a' && Ch <= u'z') ? Ch - u'a' + u'A' : Ch;
+        Hash = ((Hash >> 8) & 0x00FFFFFFu) ^ Crc().Deprecated[(Hash ^ U) & 0xFFu];
+        if (bWide) Hash = ((Hash >> 8) & 0x00FFFFFFu) ^ Crc().Deprecated[(Hash ^ (U >> 8)) & 0xFFu];
     }
     return Hash;
 }
@@ -120,9 +135,9 @@ uint32 Strihash(const std::string& S)
 uint32 StrCrc32(const std::string& S)
 {
     uint32 C = 0xFFFFFFFFu;
-    for (char Ch : S)
+    for (char16_t Ch : IsAscii(S) ? std::u16string(S.begin(), S.end()) : Utf8To16(S))
     {
-        const uint32 W = uint8(Ch);   // hashes all four bytes of the widened TCHAR
+        const uint32 W = Ch;   // hashes all four bytes of the widened TCHAR
         for (int32 Shift : { 0, 8, 16, 24 })
             C = (C >> 8) ^ Crc().Reflected[(C ^ ((W >> Shift) & 0xFFu)) & 0xFFu];
     }

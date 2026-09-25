@@ -6,6 +6,7 @@
 #include <unordered_map>
 
 #include "Package.h"
+#include "Script.h"
 
 namespace Uasset
 {
@@ -76,7 +77,28 @@ std::string PackagePathOf(const std::string& PackageName)
     return Slash == std::string::npos ? PackageName : PackageName.substr(0, Slash);
 }
 
-/* Archive-form name batch (UnrealNames.cpp): strings packed with no alignment padding. */
+std::string Utf16To8(const std::u16string& W)
+{
+    std::string S;
+    for (size_t I = 0; I < W.size(); ++I)
+    {
+        uint32 Cp = W[I];
+        if (Cp >= 0xD800 && Cp < 0xDC00 && I + 1 < W.size()) Cp = 0x10000 + ((Cp - 0xD800) << 10) + (W[++I] - 0xDC00);
+        if (Cp < 0x80) S.push_back(char(Cp));
+        else if (Cp < 0x800) { S.push_back(char(0xC0 | Cp >> 6)); S.push_back(char(0x80 | (Cp & 0x3F))); }
+        else if (Cp < 0x10000) { S.push_back(char(0xE0 | Cp >> 12)); S.push_back(char(0x80 | (Cp >> 6 & 0x3F))); S.push_back(char(0x80 | (Cp & 0x3F))); }
+        else
+        {
+            S.push_back(char(0xF0 | Cp >> 18)); S.push_back(char(0x80 | (Cp >> 12 & 0x3F)));
+            S.push_back(char(0x80 | (Cp >> 6 & 0x3F))); S.push_back(char(0x80 | (Cp & 0x3F)));
+        }
+    }
+    return S;
+}
+
+/* Archive-form name batch (UnrealNames.cpp). An ANSI name is read back as Latin-1, so a non-ASCII one goes out as
+   UTF-16: header high bit set, length in UTF-16 units, and a pad byte first when it would start at an odd offset
+   (the loader aligns its string pointer to a UTF16CHAR before reading one). */
 void WriteNameBatch(const std::vector<std::string>& Names, std::vector<uint8>& Out)
 {
     FBin Batch;
@@ -87,19 +109,31 @@ void WriteNameBatch(const std::vector<std::string>& Names, std::vector<uint8>& O
         return;
     }
 
-    uint32 StringBytes = 0;
-    for (const std::string& S : Names) StringBytes += uint32(S.size());
-    Batch.U32(StringBytes);
+    FBin Strings;
+    std::vector<uint32> Headers;
+    for (const std::string& S : Names)
+    {
+        if (IsAscii(S))
+        {
+            Headers.push_back(uint32(S.size()));
+            Strings.Raw(S.data(), S.size());
+            continue;
+        }
+        const std::u16string W = Utf8To16(S);
+        Headers.push_back(0x8000 | uint32(W.size()));
+        if (Strings.B.size() & 1) Strings.U8(0);
+        Strings.Raw(W.data(), W.size() * 2);
+    }
+    Batch.U32(uint32(Strings.B.size()));
     Batch.U64(kUnusableHashVersion);
 
     for (size_t I = 0; I < Names.size(); ++I) Batch.U64(0);     // hashes, ignored per the version
-    for (const std::string& S : Names)
+    for (uint32 H : Headers)
     {
-        const uint32 Len = uint32(S.size());
-        Batch.U8(uint8(Len >> 8));                              // high bit set would mean UTF-16
-        Batch.U8(uint8(Len & 0xFF));
+        Batch.U8(uint8(H >> 8));
+        Batch.U8(uint8(H & 0xFF));
     }
-    for (const std::string& S : Names) Batch.Raw(S.data(), S.size());
+    Batch.Raw(Strings.B.data(), Strings.B.size());
 
     Out.insert(Out.end(), Batch.B.begin(), Batch.B.end());
 }
@@ -186,18 +220,27 @@ bool LoadAssetRegistry(const std::string& Path, std::vector<FRegistryAsset>& Out
         U32();                                                  // string bytes: the headers say each length
         U64();                                                  // hash algorithm
         for (size_t I = 0; I < Names.size(); ++I) U64();        // hashes
-        std::vector<uint32> Lengths;
+        std::vector<uint32> Headers;
         for (size_t I = 0; I < Names.size(); ++I)
         {
             uint8 H[2] = {};
             Take(H, 2);
-            if (H[0] & 0x80) return Fail("a UTF-16 name, which assetgen never writes");
-            Lengths.push_back(uint32(H[0]) << 8 | H[1]);
+            Headers.push_back(uint32(H[0]) << 8 | H[1]);
         }
+        const size_t StringsAt = At;
         for (size_t I = 0; I < Names.size() && bOk; ++I)
         {
-            Names[I].resize(Lengths[I]);
-            Take(&Names[I][0], Lengths[I]);
+            const uint32 Len = Headers[I] & 0x7FFF;
+            if (!(Headers[I] & 0x8000))
+            {
+                Names[I].resize(Len);
+                Take(&Names[I][0], Len);
+                continue;
+            }
+            if ((At - StringsAt) & 1) ++At;                     // the writer's alignment pad
+            std::u16string W(Len, u'\0');
+            Take(&W[0], Len * 2);
+            Names[I] = Utf16To8(W);
         }
     }
 
