@@ -362,6 +362,7 @@ struct FRecord
     std::map<std::string, const Json*> Inlines;     // decl id (in-class or out-of-line) -> an inline method's
                                                     // definition: by id, as Methods keeps one overload per name
     std::vector<const Json*> Fields;
+    std::vector<const Json*> Ctors;                 // CXXConstructorDecls: their parameter names place a value's arguments
     std::vector<std::string> Interfaces;            // every base after the first
     std::map<std::string, std::string> Replicated;  // UE_REPLICATED*: variable -> "Notify:Condition"
     std::set<std::string> Components;               // UE_COMPONENT: variables that are also SCS nodes
@@ -1120,6 +1121,7 @@ private:
     const FRecord* NamedQualifier(const Json& Ref) const;
     bool IsSubclassOf(const FRecord& Child, const FRecord& Parent) const;
     uint32 NativeTail(const FRecord* Component) const;
+    std::vector<const Json*> StructArgs(const Json& Value, const FRecord* R, const std::vector<std::string>& Fields) const;
     mutable std::vector<std::string> SourceTexts;                       // the mod directory's .h/.cpp, read on demand
 
     /* The native UFunction Method overrides, or null; InheritedFlags gets the flags it passes on, also
@@ -1865,6 +1867,8 @@ bool FCompiler::Collect(std::string* Err)
                 R.MethodAccess[Name(C)] = Access;
                 if (C.value("inline", false)) R.Inlines[C.value("id", std::string())] = &C;
             }
+            else if (Kind(C) == "CXXConstructorDecl")
+                R.Ctors.push_back(&C);
             else if (Kind(C) == "FieldDecl" && C.contains("name"))
             {
                 R.Fields.push_back(&C);
@@ -2375,8 +2379,9 @@ bool FCompiler::LowerStructLiteral(const Json& CtorNode, const FStructInfo& SI, 
                                    FArgIR& Out, std::string* Err)
 {
     const std::string T = StripTypeKeywords(TypeOf(CtorNode));
-    std::vector<const Json*> Args;
-    ForEach(CtorNode, [&](const Json& C) { Args.push_back(&C); });
+    std::vector<std::string> Names;
+    for (const auto& F : SI.Fields) Names.push_back(F.second);
+    const std::vector<const Json*> Args = StructArgs(CtorNode, Find(T), Names);
     /* EX_StructConst cannot say a field it cannot write, so `T()` of such a struct is a Make Struct with nothing set. */
     if (!SI.bComplete && Args.empty()) return LowerMakeStruct(T, nullptr, BP, Out, Err);
     if (!SI.bComplete) { *Err = T + " has fields AssetGen cannot write, so it takes no whole-struct literal: `" + T + " V = { .Field = value };`"; return false; }
@@ -4286,16 +4291,43 @@ bool FCompiler::LowerCopyBack(const Json& Call, const std::vector<std::pair<cons
 }
 
 /* What a defaulted argument stands for. clang 18 writes the CXXDefaultArgExpr with no child, and the default is the
-   parameter's own initialiser (instantiated, in a template's instantiation); a newer clang nests it in the node. */
+   parameter's own initialiser (instantiated, in a template's instantiation); a newer clang nests it in the node.
+   Either way the answer is the default itself, so a caller sees the same node from both. */
 const Json* DefaultedArg(const Json& Arg, const Json* Parm)
 {
-    if (Kind(Arg) != "CXXDefaultArgExpr" || First(Arg) || !Parm) return &Arg;
+    if (Kind(Arg) != "CXXDefaultArgExpr") return &Arg;
+    if (const Json* Nested = First(Arg)) return Nested;
+    if (!Parm) return &Arg;
     const Json* Init = nullptr;
     ForEach(*Parm, [&](const Json& C) {
         const std::string K = Kind(C);
         if (!Init && (K.size() < 4 || K.compare(K.size() - 4, 4, "Attr") != 0)) Init = &C;
     });
     return Init ? Init : &Arg;
+}
+
+/* A struct value's arguments in the order of `Fields`. A constructor call puts each argument on the member its parameter
+   is named after, a defaulted one being that parameter's default: the stub may take them in the engine's C++ order
+   (`FColor(R, G, B, A = 255)`) while the members keep the reflected one (B, G, R, A). Braces, and a constructor whose
+   parameters do not all name members, go by position. */
+std::vector<const Json*> FCompiler::StructArgs(const Json& Value, const FRecord* R, const std::vector<std::string>& Fields) const
+{
+    std::vector<const Json*> Args;
+    ForEach(Value, [&](const Json& A) { Args.push_back(&A); });
+    const Json* Ctor = nullptr;
+    if (R && Kind(Value) != "InitListExpr")
+        for (const Json* C : R->Ctors) if (!Args.empty() && ParmNames(*C).size() == Args.size()) Ctor = C;
+    if (!Ctor || Args.size() != Fields.size()) return Args;
+    std::vector<const Json*> Parms;
+    ForEach(*Ctor, [&](const Json& C) { if (Kind(C) == "ParmVarDecl") Parms.push_back(&C); });
+    std::vector<const Json*> Out(Fields.size(), nullptr);
+    for (size_t I = 0; I < Args.size(); ++I)
+    {
+        const auto At = std::find(Fields.begin(), Fields.end(), Name(*Parms[I]));
+        if (At == Fields.end() || Out[size_t(At - Fields.begin())]) return Args;
+        Out[size_t(At - Fields.begin())] = DefaultedArg(*Args[I], Parms[I]);
+    }
+    return Out;
 }
 
 bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR& Out, std::string* Err)
@@ -7561,8 +7593,9 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
     {
         const FRecord* SR = Find(StripTypeKeywords(TypeOf(*Init)));
         if (!SR) { *Err = "unknown struct type in an initializer: " + TypeOf(*Init); return false; }
-        std::vector<const Json*> Args;
-        ForEach(*Init, [&](const Json& A) { if (Kind(A) != "CXXDefaultArgExpr") Args.push_back(&A); });
+        std::vector<std::string> Names;
+        for (const Json* SF : SR->Fields) Names.push_back(Name(*SF));
+        const std::vector<const Json*> Args = StructArgs(*Init, SR, Names);
         if (Args.size() != SR->Fields.size())
         {
             *Err = SR->CppName + " takes one value per member (" + std::to_string(SR->Fields.size())

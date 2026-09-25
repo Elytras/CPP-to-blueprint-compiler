@@ -1115,6 +1115,8 @@ def comp_test():
     for t in (0, 41):
         fields = dict(Ticks=t)
         assert run(base, 'ReceiveBeginPlay', self_vars=fields)[0] is None and fields == dict(Ticks=t + 1), fields
+    orange = VM(base).call('Orange')     # an EX_StructConst lists the members in their reflected order: B, G, R, A
+    assert orange == [0, 128, 255, 255], orange
     # The engine dispatches it: an override of Actor's BlueprintImplementableEvent, not final.
     fn = dump('dumpstruct.py', base, export_index(base, 'ReceiveBeginPlay'))
     flags = int(re.search(r'FunctionFlags (\S+)', fn).group(1), 16)
@@ -1126,7 +1128,7 @@ def comp_test():
     tags = lambda name: dump('dumptags.py', base, export_index(base, name))
     assert 'bVisible [0] BoolProperty size=0 value=0' in tags('Mesh_GEN_VARIABLE')
     lamp = tags('Lamp_GEN_VARIABLE')
-    assert 'Intensity [0] FloatProperty size=4: 1500.0' in lamp and 'LightColor [0] StructProperty size=4 struct=Color: ff8000ff' in lamp, lamp
+    assert 'Intensity [0] FloatProperty size=4: 1500.0' in lamp and 'LightColor [0] StructProperty size=4 struct=Color: 0080ffff' in lamp, lamp
     assert 'RelativeScale3D [0] StructProperty size=12 struct=Vector: 000000400000004000004040' in tags('Root_GEN_VARIABLE')
     print('ok  CompTest: BeginPlay override, component variables and archetype defaults')
 

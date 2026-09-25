@@ -20,14 +20,16 @@ class CompTest : public AActor {
   UE_DEFAULTS {
     Mesh->bVisible = false;
     Lamp->Intensity = 1500.0f;
-    /* A struct value is one argument per member, in DECLARATION order - which is also the order
-       genueapi gives the stub constructor, so the header's parameter names are the truth (FColor
-       is B, G, R, A). A struct with a native Serialize, like these two, writes raw bytes rather
-       than nested tags. */
+    /* A constructor's argument lands on the member its parameter is named after, so the stub's
+       parameter names are the truth: FColor takes R, G, B, A like the engine's C++ constructor,
+       though its members are B, G, R, A in memory. A struct with a native Serialize, like these
+       two, writes raw bytes rather than nested tags. */
     Root->RelativeScale3D = FVector(2.0f, 2.0f, 3.0f);
-    Lamp->LightColor = FColor(255, 128, 0, 255);
+    Lamp->LightColor = FColor(255, 128, 0);     // orange; A defaults to 255
   }
 
 public:
   void ReceiveBeginPlay() { Ticks = Ticks + 1; }
+  // The same constructor in a body: the struct constant's members still go by parameter name.
+  FColor Orange() { return FColor(255, 128, 0); }
 };

@@ -37,6 +37,9 @@ def split_args(text):
     return [a.strip() for a in split_params(text)]
 FIELD = re.compile(r"^\t([A-Za-z_][\w:<>,\*& ()\"]*?)\s+([A-Za-z_]\w*)\s*(:\s*\d+)?;\s*//")
 NO_STRUCT_LITERAL = ("TDelegate<", "TMulticast", "TScriptInterface<")    # EX_StructConst has no zero for these
+# The engine's C++ constructor where it takes the members in another order than the reflected one (FColor's are B, G,
+# R, A in memory). The stub takes them the C++ way, and AssetGen puts each argument on the member its parameter names.
+CTOR_PARAMS = {"FColor": ("uint8 R", "uint8 G", "uint8 B", "uint8 A = 255")}
 INCLUDE = re.compile(r'^#include\s+"(\w+)_classes\.hpp"')
 
 SCALARS = {
@@ -302,7 +305,8 @@ def emit_struct(st, conv_names):
         body.append("")
         body.append("    %s() = default;" % st.cpp)
     if st.complete:
-        body.append("    %s(%s) {}" % (st.cpp, ", ".join("%s %s" % (t, n) for t, n in st.fields)))
+        params = CTOR_PARAMS.get(st.cpp) or ["%s %s" % (t, n) for t, n in st.fields]
+        body.append("    %s(%s) {}" % (st.cpp, ", ".join(params)))
     if st.cpp in conv_names:
         body.append("    UE_CONV_%s" % st.cpp)
     body.append("};")
