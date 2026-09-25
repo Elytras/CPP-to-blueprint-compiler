@@ -778,6 +778,8 @@ def types_behaviour():
           [dict(X=x, M=m) for x in EDGE + (-3, -1, -17) for m in (1, 4, 31)])
     check('TypesTest', 'Shr64', lambda X, M: X >> (1 if M == 1 else 63),
           [dict(X=x, M=m) for x in (-2**63, -3, -1, 0, 5, 2**63 - 1) for m in (1, 63)])
+    check('TypesTest', 'ShiftByLL', lambda X, M: wrap(X << 2) if M == 0 else X >> (1 if M == 1 else 3),
+          [dict(X=x, M=m) for x in EDGE + (-8, -7, -1) for m in (0, 1, 2)])
     import struct
     f32 = lambda v: struct.unpack('<f', struct.pack('<f', v))[0]
     below = [f32(v) for v in (0.99999994, 7.9999995, -0.99999994, 3.9999998, 2.75, -2.75, 0.0, -1e9)]

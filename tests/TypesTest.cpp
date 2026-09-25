@@ -76,6 +76,8 @@ public:
   /* Signed >> floors: -3 >> 1 is -2, where a plain divide by 2 gives -1. */
   int32 ShrBy(int32 X, int32 M) { return M == 1 ? X >> 1 : M == 4 ? X >> 4 : X >> 31; }
   int64 Shr64(int64 X, int32 M) { return M == 1 ? X >> 1 : X >> 63; }
+  /* A shift has the promoted LHS type: `int >> 1LL` is int32 math. */
+  int32 ShiftByLL(int32 X, int32 M) { if (M == 0) return X << 2LL; if (M == 1) return X >> 1LL; X >>= 3LL; return X; }
   /* A float becomes an integer truncated toward zero, not printed to 6 decimals first (0.99999994f is 0). */
   int32 TruncOf(float X, int32 M) {
     int32 N = X;

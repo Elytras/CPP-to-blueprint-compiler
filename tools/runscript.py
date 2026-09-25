@@ -110,6 +110,9 @@ def props_of(base, function, _cache={}):
 # A native writes its whole return type through RESULT_PARAM, so these put 4 bytes wherever they are evaluated into.
 INT32_RESULT = {'Add_IntInt', 'Subtract_IntInt', 'Multiply_IntInt', 'Divide_IntInt', 'Percent_IntInt', 'Not_Int', 'Or_IntInt',
                 'And_IntInt', 'Xor_IntInt', 'Conv_BoolToInt', 'Conv_ByteToInt', 'Conv_Int64ToInt'}
+# ...and these 8 bytes; an int64 parameter starts at 0 and takes only the 4 bytes an int32 operand copies in.
+INT64_RESULT = {'Conv_IntToInt64', 'FTrunc64', 'Not_Int64'} | {op + '_Int64Int64' for op in
+                ('Add', 'Subtract', 'Multiply', 'Divide', 'Percent', 'And', 'Or', 'Xor')}
 # The operands that leave Stack.MostRecentPropertyAddress, which StructMemberContext and ArrayGetByRef offset into:
 # a call evaluated into nothing leaves none (and a native writes its result through a null RESULT_PARAM).
 ADDRESSABLE = {0, 1, 0x48, 0x42, 0x6B}
@@ -213,10 +216,14 @@ def run(base, function, self_vars=None, **parms):
         if n.op in (0x42, 0x6B) and n.kids[0].op not in ADDRESSABLE:
             raise SystemExit('op %02x at mem %d reads through op %02x, which leaves no address' % (n.op, n.mem, n.kids[0].op))
 
+    def is32(v):
+        return v.op == 0x1D or v.op in (0x1C, 0x46, 0x68) and v.val in INT32_RESULT or v.op in (0, 0x48) and types.get(v.val) == 'IntProperty'
+
     def fits(dest, v):
-        wide = v.op == 0x1D or v.op in (0x1C, 0x46, 0x68) and v.val in INT32_RESULT or v.op in (0, 0x48) and types.get(v.val) == 'IntProperty'
-        if wide and types.get(dest) == 'ByteProperty':
+        if is32(v) and types.get(dest) == 'ByteProperty':
             raise SystemExit('an int32 evaluated into the 1-byte %s at mem %d' % (dest, v.mem))
+        if v.op in (0x1C, 0x46, 0x68) and v.val in INT64_RESULT and types.get(dest) in ('IntProperty', 'ByteProperty'):
+            raise SystemExit('an int64 evaluated into the %s %s at mem %d' % (types[dest], dest, v.mem))
 
     def ev(n):
         o = n.op
@@ -246,6 +253,8 @@ def run(base, function, self_vars=None, **parms):
         if o in (0x1C, 0x46, 0x68):
             if n.val not in MATH: raise SystemExit('unsupported call ' + n.val)
             args = [ev(a) for a in n.kids]
+            if n.val.endswith('_Int64Int64'):
+                args = [v & 0xFFFFFFFF if is32(a) else v for a, v in zip(n.kids, args)]
             CALLS.append((n.val, tuple(args)))
             return MATH[n.val](*args)
         if o == 0x69:
