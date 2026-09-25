@@ -778,6 +778,16 @@ inline_mixed_overloads()
 refused('NsClass', '  int32 F() { return 1; }\n', 'Ns::UThing: a mod class, struct or interface cannot be declared in a namespace',
         top='namespace Ns { class UThing : public UObject { public: int32 X; }; }\n')
 print('ok  a mod class in a namespace is refused, naming it')
+# A written reference needs a place Blueprint can name: bound to a map element, `C ? X : Y` or (inline) another
+# object's member, the write would land in a copy, so each is refused.
+ADD5, BUMP = '  void Add5(int32& V) { V += 5; }\n', '  int32 A = 1;\n  inline void Bump(int32& V) { V += 5; }\n'
+for mod, body, why in (('RefMap', ADD5 + '  int32 F() { TMap<int32, int32> M; M.Add(1, 10); Add5(M[1]); return M[1]; }\n', 'bound to a map element'),
+                       ('RefSel', ADD5 + '  int32 F(bool C) { int32 X = 1, Y = 2; Add5(C ? X : Y); return X + Y; }\n', 'bound to `C ? X : Y`'),
+                       ('InlMap', BUMP + '  int32 F() { TMap<int32, int32> M; M.Add(1, 10); Bump(M[1]); return M[1]; }\n', 'no variable it can name'),
+                       ('InlSel', BUMP + '  int32 F(bool C) { int32 X = 1, Y = 2; Bump(C ? X : Y); return X + Y; }\n', 'no variable it can name'),
+                       ('InlObj', BUMP + '  int32 F() { InlObj* O = this; Bump(O->A); return A; }\n', 'no variable it can name')):
+    refused(mod, body, why)
+print('ok  a written reference bound to a map element, `C ? X : Y` or another object\'s member is refused')
 
 
 # ---- OptTest

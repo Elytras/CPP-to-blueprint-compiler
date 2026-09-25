@@ -2548,6 +2548,21 @@ bool IsAliasable(const Json& N)
     return !N.value("isArrow", false) && IsAliasable(*Base);
 }
 
+/* A reference the callee may write: `T&`, not `const T&` or `T&&`. */
+bool IsMutableRef(const std::string& T)
+{
+    return T.size() > 1 && T.back() == '&' && T[T.size() - 2] != '&' && T.compare(0, 6, "const ") != 0;
+}
+
+/* What a UFunction's `T&` cannot be bound to: Blueprint has no reference to a map element (Map_Find copies it out)
+   nor to whichever of two variables `C ? X : Y` picks, so the call would write a copy. Null when it can be. */
+const char* UnboundRef(const Json& Parm, const Json& Arg)
+{
+    const Json* Bare = PeelLvalue(&Arg);
+    if (!IsMutableRef(TypeOf(Parm)) || !Bare) return nullptr;
+    return IsTMapElement(*Bare) ? "a map element" : Kind(*Bare) == "ConditionalOperator" ? "`C ? X : Y`" : nullptr;
+}
+
 /* The intrinsics that read their operand's storage through a StructMember donor field. */
 bool IsReinterpret(const std::string& Intrinsic)
 {
@@ -4208,6 +4223,13 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         if (!bOk) return;
         FArgIR A;
         const size_t I = Defaulted.size();
+        if (const char* What = I < CalledParms.size() ? UnboundRef(*CalledParms[I], C) : nullptr)
+        {
+            *Err = MethodName + ": its reference parameter " + Name(*CalledParms[I]) + " is bound to " + What + ", which "
+                   "Blueprint cannot pass by reference, so the call would write a copy: pass a local, then store it back";
+            bOk = false;
+            return;
+        }
         bOk = LowerArg(*DefaultedArg(C, I < CalledParms.size() ? CalledParms[I] : nullptr), BP, A, Err);
         if (bOk) Out.Args.push_back(A);
         Defaulted.push_back(Kind(C) == "CXXDefaultArgExpr");
@@ -5977,6 +5999,17 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
     };
     /* `Arr[I]`: the element is the one I names at the call, so the index is what gets lowered, into Values. */
     auto ElemIndex = [&](size_t I) { const Json* A = Aliased(I); return A && IsTArrayElement(*A) ? Nth(*A, 2) : nullptr; };
+    /* A reference the body writes, bound to what it cannot name, would be a copy taking the write.
+       ponytail: another object's member could be named through its object pinned in a local, as a computed index is. */
+    for (size_t I = 0; I < Parms.size(); ++I)
+        if (const Json* Bare = PeelLvalue(Args[I]); IsMutableRef(TypeOf(*Parms[I])) && Bare && !Aliased(I) && !IsDerefLvalue(*Bare)
+            && !OnlyRead(*Body, Parms[I]->value("id", std::string())))
+        {
+            *Err = "inline " + Method + ": its reference parameter " + Name(*Parms[I]) + " is written, but the argument is "
+                   "no variable it can name (a map element, `C ? X : Y`, another object's member), so the write would "
+                   "change a copy: pass a local, then store it back";
+            return false;
+        }
     std::vector<FArgIR> Values(Parms.size());
     for (size_t I = 0; I < Parms.size(); ++I)
         if (const Json* Index = ElemIndex(I)) { if (!LowerArg(*Index, BP, Values[I], Err)) return false; }
