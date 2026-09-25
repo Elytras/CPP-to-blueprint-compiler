@@ -8,7 +8,7 @@ function a call reaches). Never the bytecode's shape: an optimization that keeps
 
 --assetgen defaults to the first build found (ue-mods x64/Release, this repo's x64/Release, a CMake build/);
 --ueapi to ue-mods' BpMods/UeApi. Outside ue-mods, pass the UeApi of https://github.com/Elytras/DRG-Blueprint-Cpp-SDK."""
-import glob, os, re, shutil, subprocess, sys
+import copy, glob, os, re, shutil, subprocess, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import runscript
 from runscript import run, i32
@@ -1047,6 +1047,26 @@ def struct_behaviour():
     check('StructTest', 'MakeLocal', lambda K: wrap(K + wrap(K * 2) * 10 + 1000), [dict(K=k) for k in (0, 3, -2, 2**30)])
     check('StructTest', 'MakeArgument', lambda K: wrap(K + wrap(K + 1)), [dict(K=k) for k in (0, 5, -1, 2**31 - 1)])
     check('StructTest', 'MakeInLoop', lambda Rounds: max(Rounds, 0), [dict(Rounds=r) for r in (-3, 0, 1, 2, 4)])
+    # A copy passed where a reference is written (T& parameter, Array_Add, Array_Get's / Map_Find's out item, a by-value
+    # range-for variable, a same-typed input Append / Union read in place): the write lands in the copy, never in the
+    # variable it was copied from.
+    n = 0
+    for k in (-7, 0, 5, 2**31 - 1):
+        for fn, fields, want, after in (
+                ('CopyToRef', {'Stats': {kills: 3}}, 3, {'Stats': {kills: 3}}),
+                ('MemberCopyToRef', {'Stats': {kills: 3}}, 3, {'Stats': {kills: 3}}),
+                ('ArgCopyToRef', {}, k, {}),
+                ('ArrayCopyAdd', {'Counts': [1, 2]}, 2, {'Counts': [1, 2]}),
+                ('ArrayGetIntoCopy', {'Stats': {kills: 3}, 'Counts': [9]}, 3, {'Stats': {kills: 3}, 'Counts': [9]}),
+                ('RangeCopyToRef', {'Many': [{kills: 1}, {kills: 2}]}, 1, {'Many': [{kills: 1}, {kills: 2}]}),
+                ('MapFindIntoCopy', {'Scores': {1: 40}}, k, {'Scores': {1: 40}}),
+                ('ArrayAppendCopy', {'Counts': [1, 2]}, i32(k + 4), {'Counts': [1, 2, 1, 2]}),
+                ('SetUnionCopy', {'Seen': [1, 2], 'Fresh': [2, 3]}, i32(k + 3), {'Seen': [2, 3, 1], 'Fresh': [2, 3]})):
+            f = copy.deepcopy(fields)
+            got = run(asset('StructTest'), fn, self_vars=f, K=k)[0]
+            assert (got, f) == (want, after), (fn, k, got, f)
+            n += 1
+    print('ok  StructTest: a local copy bound to a written reference leaves its source alone  (%d cases)' % n)
     f = {}
     runscript.MESSAGES.clear()
     run(asset('StructTest'), 'ReceiveBeginPlay', self_vars=f)
@@ -1248,7 +1268,7 @@ def run_as(chain, fn, fields, **parms):
                     finals[fname] = os.path.join(os.path.dirname(chain[0]), pkg.split('.')[0].rsplit('/', 1)[1])
     saved = runscript.run, runscript.params_of, dict(runscript.MATH)
     runscript.run = lambda base, f, self_vars=None, **p: saved[0](owner(f), f, self_vars, **p)
-    runscript.params_of = lambda base, f: saved[1](owner(f), f)
+    runscript.params_of = lambda base, f, *flag: saved[1](owner(f), f, *flag)
     for f, target in finals.items():
         runscript.MATH[f] = (lambda t, f: lambda *a: saved[0](t, f, fields, **dict(zip(saved[1](t, f), a)))[0])(target, f)
     try:

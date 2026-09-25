@@ -84,15 +84,16 @@ def script_of(base, function):
     raise SystemExit('%s: no such export' % function)
 
 
-def params_of(base, function):
-    """The function's parameters in order, the return value left out, read off dumpstruct.py's property lines."""
+def params_of(base, function, flag=0x80):
+    """The function's parameters in order, the return value left out, read off dumpstruct.py's property lines.
+    flag=0x100 (CPF_OutParm): only its reference parameters."""
     import os, re, subprocess
     exports = dumpexp.load(base)[5]
     idx = next(i for i, e in enumerate(exports) if e['name'] == function)
     out = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dumpstruct.py'), base, str(idx)],
                          capture_output=True, text=True).stdout
     found = re.findall(r'^\s+\w+Property (\w+) .*? flags=(0x[0-9a-fA-F]+)', out, re.M)
-    return [name for name, flags in found if int(flags, 16) & 0x80 and not int(flags, 16) & 0x400]
+    return [name for name, flags in found if int(flags, 16) & flag and not int(flags, 16) & 0x400]
 
 
 def props_of(base, function, _cache={}):
@@ -191,9 +192,27 @@ def _made(ev, store, node, empty):
     return v
 
 
+def _append(ev, store, a):
+    target, source = _made(ev, store, a[0], []), _made(ev, store, a[1], [])
+    if source is target:            # GenericArray_Append rereads the source's length as it grows it: past the end
+        raise RuntimeError('Array_Append of an array onto itself')
+    target.extend(copy.deepcopy(source))
+
+
+def _union(ev, store, a):
+    sets = [_made(ev, store, x, []) for x in a[:3]]
+    sets[2].clear()                 # GenericSet_Union empties Result first, so an input that is Result reads empty
+    for v in sets[0] + sets[1]:
+        if v not in sets[2]: sets[2].append(copy.deepcopy(v))
+
+
 CONTAINERS = {
     'Array_Length': lambda ev, store, a: len(_made(ev, store, a[0], [])),
+    'Set_Length': lambda ev, store, a: len(_made(ev, store, a[0], [])),
     'Array_Add': lambda ev, store, a: (_made(ev, store, a[0], []).append(copy.deepcopy(ev(a[1]))), len(ev(a[0])) - 1)[1],
+    'Array_Get': lambda ev, store, a: store(a[2], copy.deepcopy(ev(a[0])[ev(a[1])])),
+    'Array_Append': _append,
+    'Set_Union': _union,
     'Set_ToArray': lambda ev, store, a: store(a[1], list(ev(a[0]))),
     'Map_Keys': lambda ev, store, a: store(a[1], list(ev(a[0]).keys())),
     'Map_Find': lambda ev, store, a: (store(a[2], _made(ev, store, a[0], {}).get(ev(a[1]), 0)), ev(a[1]) in ev(a[0]))[1],
@@ -251,7 +270,12 @@ def run(base, function, self_vars=None, **parms):
         if o == 0x28: return False
         if o == 0x6B: return ev(n.kids[0])[ev(n.kids[1])]
         if o in (0x1B, 0x45):                                        # the class's own function, by name: a frame of its own
-            return run(base, n.val, self_vars, **dict(zip(params_of(base, n.val), [copy.deepcopy(ev(a)) for a in n.kids])))[0]
+            names = params_of(base, n.val)
+            r, callee = run(base, n.val, self_vars, **dict(zip(names, [copy.deepcopy(ev(a)) for a in n.kids])))
+            outs = params_of(base, n.val, 0x100)
+            for name, a in zip(names, n.kids):                       # a reference parameter is its argument's variable
+                if name in outs and a.op in ADDRESSABLE: store(a, callee.get(name, 0))
+            return r
         if o in (0x1C, 0x46, 0x68) and n.val == 'Map_Find' and n.kids[2].op in (0, 0x48) and types.get(n.kids[2].val) in BARE_CONTAINERS:
             # execMap_Find writes in place only into the map's value property class, and a container value is its
             # wrapper StructProperty: a bare container local is left as it was.
