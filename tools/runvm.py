@@ -19,7 +19,7 @@ def _ref(s):
 def _node(s):
     """runscript's parser plus what latent / async / spawn bodies use. Nodes runscript already read keep its val."""
     op, mem = s.b[s.o], s.mem
-    if op not in (0, 0x48, 0x19, 0x1C, 0x20, 0x2E, 0x2F, 0x30, 0x46, 0x4B, 0x5B, 0x5C, 0x64, 0x68):
+    if op not in (0, 0x48, 0x19, 0x1C, 0x20, 0x2E, 0x2F, 0x30, 0x46, 0x4B, 0x5B, 0x5C, 0x63, 0x64, 0x68):
         return _parse(s)
     s.u8()
     n = Node(op, mem)
@@ -27,6 +27,7 @@ def _node(s):
     if op == 0x19: n.kids.append(s.node()); s.i32(); s.fieldpath(); n.kids.append(s.node())
     elif op in (0x20, 0x2E, 0x2F): n.val = _ref(s)
     elif op in (0x1C, 0x46, 0x68): n.val = _ref(s); s.args(n.kids)          # an export callee has no quotes
+    elif op == 0x63: n.val = _ref(s); s.args(n.kids)                        # the signature, the dispatcher, its args
     elif op == 0x4B: n.val = s.name()
     elif op == 0x5B: n.val = s.i32()
     elif op == 0x5C: n.kids += [s.node(), s.node()]
@@ -96,7 +97,7 @@ class VM:
             if o == 0x17: return me
             if o == 0x2A: return None
             if o == 0x20: return s.objects.get(n.val, n.val)
-            if o in (0x1D, 0x1E, 0x1F, 0x24, 0x2C, 0x35, 0x21, 0x5B): return n.val
+            if o in (0x1D, 0x1E, 0x1F, 0x34, 0x24, 0x2C, 0x35, 0x21, 0x5B): return n.val
             if o == 0x4B: return ('delegate', n.val, me)                   # EX_InstanceDelegate binds Stack.Object
             if o in (0x25, 0x26): return o - 0x25
             if o in (0x27, 0x28): return o == 0x27
@@ -137,10 +138,22 @@ class VM:
                 if obj is not None: store(dest.kids[1], v, obj)
             else: raise SystemExit('vm: unsupported destination %02x' % dest.op)
 
+        def locate(dest, ctx=me):
+            # execLet steps the destination (a context's object, an array and its index) before the value.
+            if dest.op == 0x19:
+                obj = ev(dest.kids[0], ctx)
+                return lambda v: obj is not None and store(dest.kids[1], v, obj)
+            if dest.op == 0x6B:
+                arr, i = ev(dest.kids[0], ctx), ev(dest.kids[1], ctx)
+                return lambda v: (arr.__setitem__(i, v), s.log.append(('set', ctx, dest.kids[0].val)))
+            st = ev(dest.kids[0], ctx) if dest.op == 0x42 else None
+            if isinstance(st, dict): return lambda v: st.__setitem__(dest.val, v)
+            return lambda v: store(dest, v, ctx)
+
         pc = 0
         for _ in range(100000):
             n = stmts[pc]; o = n.op; pc += 1
-            if o in (0xF, 0x14, 0x5F): store(n.kids[0], ev(n.kids[1]))
+            if o in (0xF, 0x14, 0x5F): locate(n.kids[0])(ev(n.kids[1]))
             elif o == 0x64:                                 # LetValueOnPersistentFrame: into the ubergraph's frame
                 assert n.owner.split(':')[-1].startswith('ExecuteUbergraph_'), n.owner
                 s.frames.setdefault(id(me), {})[n.val] = ev(n.kids[0])
@@ -149,6 +162,12 @@ class VM:
                 obj, prop = (ev(t.kids[0]), t.kids[1].val) if t.op == 0x19 else (me, t.val)
                 _, dfn, dobj = ev(n.kids[1])
                 s.binds.append((obj, prop, dfn, dobj))
+            elif o == 0x63:                                 # CallMulticastDelegate: the dispatcher, then its arguments
+                t = n.kids[0]
+                obj, prop = (ev(t.kids[0]), t.kids[1].val) if t.op == 0x19 else (me, t.val)
+                vals = [ev(a) for a in n.kids[1:]]
+                for bobj, bprop, dfn, dobj in list(s.binds):
+                    if bobj is obj and bprop == prop: s.call(dfn, *vals, on=dobj)
             elif o == 6: pc = at[n.val]
             elif o == 7:
                 if not ev(n.kids[0]): pc = at[n.val]

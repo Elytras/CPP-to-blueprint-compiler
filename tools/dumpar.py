@@ -52,9 +52,10 @@ def read_name_batch(r):
         wide = h[0] & 0x80
         length = ((h[0] & 0x7F) << 8) | h[1]
         size = length * (2 if wide else 1)
+        at += wide and at & 1                   # the loader aligns a UTF-16 name to 2 bytes
         raw = strings[at:at + size]
         at += size
-        names.append(raw.decode("utf-16-le" if wide else "ascii"))
+        names.append(raw.decode("utf-16-le" if wide else "latin-1"))   # ANSI widens byte by byte, as the loader does
     if at != len(strings):
         sys.exit("name batch: %d string bytes unread" % (len(strings) - at))
     return names

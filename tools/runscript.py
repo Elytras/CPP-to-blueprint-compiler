@@ -33,6 +33,10 @@ class P(W):
         elif op == 7: n.val = s.i32(); k.append(s.node())
         elif op in (0xB, 0x16, 0x17, 0x25, 0x26, 0x27, 0x28, 0x2A, 0x2D, 0x4D, 0x53): pass
         elif op == 0x1F: n.val = s.cstr()
+        elif op == 0x34:                                             # UnicodeStringConst: UTF-16 up to a 0 unit
+            st = s.o
+            while s.b[s.o] or s.b[s.o + 1]: s.o += 2
+            n.val = s.b[st:s.o].decode('utf-16-le'); s.raw(2); s.mem += s.o - 2 - st
         elif op == 0x29:                                             # TextConst: its source string stands for the text
             n.val = s.u8()
             if n.val == 1: k.extend(s.node() for _ in range(3))
@@ -84,15 +88,16 @@ def script_of(base, function):
     raise SystemExit('%s: no such export' % function)
 
 
-def params_of(base, function):
-    """The function's parameters in order, the return value left out, read off dumpstruct.py's property lines."""
+def params_of(base, function, flag=0x80):
+    """The function's parameters in order, the return value left out, read off dumpstruct.py's property lines.
+    flag=0x100 (CPF_OutParm): only its reference parameters."""
     import os, re, subprocess
     exports = dumpexp.load(base)[5]
     idx = next(i for i, e in enumerate(exports) if e['name'] == function)
     out = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dumpstruct.py'), base, str(idx)],
                          capture_output=True, text=True).stdout
     found = re.findall(r'^\s+\w+Property (\w+) .*? flags=(0x[0-9a-fA-F]+)', out, re.M)
-    return [name for name, flags in found if int(flags, 16) & 0x80 and not int(flags, 16) & 0x400]
+    return [name for name, flags in found if int(flags, 16) & flag and not int(flags, 16) & 0x400]
 
 
 def props_of(base, function, _cache={}):
@@ -110,6 +115,9 @@ def props_of(base, function, _cache={}):
 # A native writes its whole return type through RESULT_PARAM, so these put 4 bytes wherever they are evaluated into.
 INT32_RESULT = {'Add_IntInt', 'Subtract_IntInt', 'Multiply_IntInt', 'Divide_IntInt', 'Percent_IntInt', 'Not_Int', 'Or_IntInt',
                 'And_IntInt', 'Xor_IntInt', 'Conv_BoolToInt', 'Conv_ByteToInt', 'Conv_Int64ToInt'}
+# ...and these 8 bytes; an int64 parameter starts at 0 and takes only the 4 bytes an int32 operand copies in.
+INT64_RESULT = {'Conv_IntToInt64', 'FTrunc64', 'Not_Int64'} | {op + '_Int64Int64' for op in
+                ('Add', 'Subtract', 'Multiply', 'Divide', 'Percent', 'And', 'Or', 'Xor')}
 # The operands that leave Stack.MostRecentPropertyAddress, which StructMemberContext and ArrayGetByRef offset into:
 # a call evaluated into nothing leaves none (and a native writes its result through a null RESULT_PARAM).
 ADDRESSABLE = {0, 1, 0x48, 0x42, 0x6B}
@@ -131,14 +139,34 @@ MATH = {
     'Conv_IntToFloat': float, 'Not_Int': lambda a: ~a, 'Not_Int64': lambda a: ~a,
     'Subtract_FloatFloat': lambda a, b: a - b, 'Divide_FloatFloat': lambda a, b: a / b,
     'Add_Int64Int64': lambda a, b: a + b, 'Subtract_Int64Int64': lambda a, b: a - b,
-    'Less_FloatFloat': lambda a, b: a < b, 'Greater_FloatFloat': lambda a, b: a > b, 'Conv_ByteToInt': int, 'NotEqual_ByteByte': lambda a, b: a != b,
+    'Less_FloatFloat': lambda a, b: a < b, 'Greater_FloatFloat': lambda a, b: a > b, 'NotEqual_FloatFloat': lambda a, b: a != b,
+    'Conv_ByteToInt': lambda a: int(a) & 0xFF, 'NotEqual_ByteByte': lambda a, b: a != b,
+    'Conv_IntToByte': lambda a: int(a) & 0xFF, 'Conv_Int64ToByte': lambda a: int(a) & 0xFF, 'Conv_BoolToByte': int,
     'NotEqual_Int64Int64': lambda a, b: a != b, 'EqualEqual_Int64Int64': lambda a, b: a == b, 'NotEqual_NameName': lambda a, b: str(a).lower() != str(b).lower(),
+    'EqualEqual_NameName': lambda a, b: str(a).lower() == str(b).lower(),
     'Or_IntInt': lambda a, b: int(a) | int(b), 'And_IntInt': lambda a, b: int(a) & int(b), 'Xor_IntInt': lambda a, b: int(a) ^ int(b),
+    'Divide_Int64Int64': idiv, 'And_Int64Int64': lambda a, b: int(a) & int(b),
+    'FTrunc': lambda a: i32(int(a)), 'FTrunc64': int,     # FMath::TruncToInt: toward zero, as C++ converts
     'Conv_BoolToInt': int, 'Multiply_Int64Int64': lambda a, b: a * b, 'Conv_IntToInt64': int, 'Conv_Int64ToInt': lambda a: i32(a),
     'InRange_IntInt': lambda v, lo, hi, imin, imax: (v >= lo if imin else v > lo) and (v <= hi if imax else v < hi),
     'Abs_Int': lambda a: i32(abs(a)), 'RandomInteger': lambda a: 0,     # RandomInteger: a stand-in; CALLS shows it ran
 }
 CALLS = []     # every library call run, as (name, args): a test can see an impure or kept call happen
+# The process memory a raw pointer reads and writes, address -> byte (unset bytes read 0). A deref is an
+# ArrayGetByRef of a view struct's TArray field over the FDeref scratch; the field decides the element's size
+# and signedness, as the engine's TArray<uint8> / <int32> / <int64> does.
+MEM = {}
+VIEWS = {'Kilobyte': (1, False), 'Mapping': (4, True), 'NameHashes': (8, True)}
+
+
+def mem_read(addr, size, signed):
+    return int.from_bytes(bytes(MEM.get(addr + i, 0) for i in range(size)), 'little', signed=signed)
+
+
+def mem_write(addr, size, v):
+    for i, b in enumerate((int(v) & ((1 << 8 * size) - 1)).to_bytes(size, 'little')): MEM[addr + i] = b
+
+
 # A native int32 / uint8 parameter receives the low bytes of whatever the VM copies into it, so a wider value
 # handed to an _IntInt / _ByteByte function is truncated, as it is in the engine.
 for _k, _f in list(MATH.items()):
@@ -186,9 +214,27 @@ def _made(ev, store, node, empty):
     return v
 
 
+def _append(ev, store, a):
+    target, source = _made(ev, store, a[0], []), _made(ev, store, a[1], [])
+    if source is target:            # GenericArray_Append rereads the source's length as it grows it: past the end
+        raise RuntimeError('Array_Append of an array onto itself')
+    target.extend(copy.deepcopy(source))
+
+
+def _union(ev, store, a):
+    sets = [_made(ev, store, x, []) for x in a[:3]]
+    sets[2].clear()                 # GenericSet_Union empties Result first, so an input that is Result reads empty
+    for v in sets[0] + sets[1]:
+        if v not in sets[2]: sets[2].append(copy.deepcopy(v))
+
+
 CONTAINERS = {
     'Array_Length': lambda ev, store, a: len(_made(ev, store, a[0], [])),
+    'Set_Length': lambda ev, store, a: len(_made(ev, store, a[0], [])),
     'Array_Add': lambda ev, store, a: (_made(ev, store, a[0], []).append(copy.deepcopy(ev(a[1]))), len(ev(a[0])) - 1)[1],
+    'Array_Get': lambda ev, store, a: store(a[2], copy.deepcopy(ev(a[0])[ev(a[1])])),
+    'Array_Append': _append,
+    'Set_Union': _union,
     'Set_ToArray': lambda ev, store, a: store(a[1], list(ev(a[0]))),
     'Map_Keys': lambda ev, store, a: store(a[1], list(ev(a[0]).keys())),
     'Map_Find': lambda ev, store, a: (store(a[2], _made(ev, store, a[0], {}).get(ev(a[1]), 0)), ev(a[1]) in ev(a[0]))[1],
@@ -197,6 +243,9 @@ CONTAINERS = {
     'Set_Clear': lambda ev, store, a: store(a[0], []),
     'Map_Clear': lambda ev, store, a: store(a[0], {}),
 }
+
+# No map value is one of these: a container inside a map is the Value of a wrapper struct.
+BARE_CONTAINERS = {'ArrayProperty', 'SetProperty', 'MapProperty'}
 
 
 def run(base, function, self_vars=None, **parms):
@@ -211,10 +260,14 @@ def run(base, function, self_vars=None, **parms):
         if n.op in (0x42, 0x6B) and n.kids[0].op not in ADDRESSABLE:
             raise SystemExit('op %02x at mem %d reads through op %02x, which leaves no address' % (n.op, n.mem, n.kids[0].op))
 
+    def is32(v):
+        return v.op == 0x1D or v.op in (0x1C, 0x46, 0x68) and v.val in INT32_RESULT or v.op in (0, 0x48) and types.get(v.val) == 'IntProperty'
+
     def fits(dest, v):
-        wide = v.op == 0x1D or v.op in (0x1C, 0x46, 0x68) and v.val in INT32_RESULT or v.op in (0, 0x48) and types.get(v.val) == 'IntProperty'
-        if wide and types.get(dest) == 'ByteProperty':
+        if is32(v) and types.get(dest) == 'ByteProperty':
             raise SystemExit('an int32 evaluated into the 1-byte %s at mem %d' % (dest, v.mem))
+        if v.op in (0x1C, 0x46, 0x68) and v.val in INT64_RESULT and types.get(dest) in ('IntProperty', 'ByteProperty'):
+            raise SystemExit('an int64 evaluated into the %s %s at mem %d' % (types[dest], dest, v.mem))
 
     def ev(n):
         o = n.op
@@ -226,7 +279,7 @@ def run(base, function, self_vars=None, **parms):
         if o == 0x42:                                                # a struct is a dict; an unset member reads 0
             s = ev(n.kids[0])
             return s.get(n.val, 0) if isinstance(s, dict) else 0
-        if o == 0x1F: return n.val
+        if o in (0x1F, 0x34): return n.val
         if o == 0x29: return ev(n.kids[0]) if n.kids else ''
         if o == 0x17: return SELF
         if o in (0x2A, 0x2D): return None
@@ -237,13 +290,27 @@ def run(base, function, self_vars=None, **parms):
         if o == 0x26: return 1
         if o == 0x27: return True
         if o == 0x28: return False
+        if o == 0x6B and n.kids[0].op == 0x42 and n.kids[0].val in VIEWS:
+            size, signed = VIEWS[n.kids[0].val]
+            return mem_read(ev(n.kids[0].kids[0])['Data'] + ev(n.kids[1]) * size, size, signed)
         if o == 0x6B: return ev(n.kids[0])[ev(n.kids[1])]
         if o in (0x1B, 0x45):                                        # the class's own function, by name: a frame of its own
-            return run(base, n.val, self_vars, **dict(zip(params_of(base, n.val), [copy.deepcopy(ev(a)) for a in n.kids])))[0]
+            names = params_of(base, n.val)
+            r, callee = run(base, n.val, self_vars, **dict(zip(names, [copy.deepcopy(ev(a)) for a in n.kids])))
+            outs = params_of(base, n.val, 0x100)
+            for name, a in zip(names, n.kids):                       # a reference parameter is its argument's variable
+                if name in outs and a.op in ADDRESSABLE: store(a, callee.get(name, 0))
+            return r
+        if o in (0x1C, 0x46, 0x68) and n.val == 'Map_Find' and n.kids[2].op in (0, 0x48) and types.get(n.kids[2].val) in BARE_CONTAINERS:
+            # execMap_Find writes in place only into the map's value property class, and a container value is its
+            # wrapper StructProperty: a bare container local is left as it was.
+            return CONTAINERS[n.val](ev, lambda d, v: d is n.kids[2] or store(d, v), n.kids)
         if o in (0x1C, 0x46, 0x68) and n.val in CONTAINERS: return CONTAINERS[n.val](ev, store, n.kids)
         if o in (0x1C, 0x46, 0x68):
             if n.val not in MATH: raise SystemExit('unsupported call ' + n.val)
             args = [ev(a) for a in n.kids]
+            if n.val.endswith('_Int64Int64'):
+                args = [v & 0xFFFFFFFF if is32(a) else v for a, v in zip(n.kids, args)]
             CALLS.append((n.val, tuple(args)))
             return MATH[n.val](*args)
         if o == 0x69:
@@ -260,8 +327,26 @@ def run(base, function, self_vars=None, **parms):
         elif dest.op == 0x42: _made(ev, store, dest.kids[0], {})[dest.val] = v
         elif dest.op in (0, 0x48): env[dest.val] = v
         elif dest.op == 1: self_vars[dest.val] = v
+        elif dest.op == 0x6B and dest.kids[0].op == 0x42 and dest.kids[0].val in VIEWS: locate(dest)(v)
         elif dest.op == 0x6B: ev(dest.kids[0])[ev(dest.kids[1])] = v
         else: raise SystemExit('unsupported destination op %02x' % dest.op)
+
+    def locate(dest):
+        # UObject::execLet steps the destination (its struct, array and index) before the value: evaluate those now,
+        # return what stores into the place they found.
+        addressable(dest)
+        if dest.op == 0x42 and dest.val == 'Value': return locate(dest.kids[0])
+        if dest.op == 0x42:
+            s = _made(ev, store, dest.kids[0], {})
+            return lambda v: s.__setitem__(dest.val, copy.deepcopy(v))
+        if dest.op == 0x6B and dest.kids[0].op == 0x42 and dest.kids[0].val in VIEWS:
+            size = VIEWS[dest.kids[0].val][0]
+            at = ev(dest.kids[0].kids[0])['Data'] + ev(dest.kids[1]) * size
+            return lambda v: mem_write(at, size, v)
+        if dest.op == 0x6B:
+            arr, i = ev(dest.kids[0]), ev(dest.kids[1])
+            return lambda v: arr.__setitem__(i, copy.deepcopy(v))
+        return lambda v: store(dest, v)
 
     pc, steps = 0, 0
     while True:
@@ -272,7 +357,7 @@ def run(base, function, self_vars=None, **parms):
         nxt = pc + 1
         if o in (0xF, 0x14, 0x5F):
             if n.kids[0].op in (0, 0x48): fits(n.kids[0].val, n.kids[1])
-            store(n.kids[0], ev(n.kids[1]))
+            locate(n.kids[0])(ev(n.kids[1]))
         elif o == 6: nxt = at[n.val]
         elif o == 7:
             if not ev(n.kids[0]): nxt = at[n.val]

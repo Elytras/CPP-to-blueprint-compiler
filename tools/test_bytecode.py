@@ -8,7 +8,7 @@ function a call reaches). Never the bytecode's shape: an optimization that keeps
 
 --assetgen defaults to the first build found (ue-mods x64/Release, this repo's x64/Release, a CMake build/);
 --ueapi to ue-mods' BpMods/UeApi. Outside ue-mods, pass the UeApi of https://github.com/Elytras/DRG-Blueprint-Cpp-SDK."""
-import glob, os, re, shutil, subprocess, sys
+import copy, glob, os, re, shutil, subprocess, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import runscript
 from runscript import run, i32
@@ -121,6 +121,32 @@ def registry_layout():
     print('ok  every registry is FSD/AssetRegistry.bin; `assetgen registry` merges them, once per package')
 
 
+def registry_non_ascii():
+    """A non-ASCII class name reaches the registry as the loader reads it - UTF-16, since ANSI widens byte by byte -
+    and a recompile and `assetgen registry` merge it back. The package path's odd length puts the UTF-16 package name
+    on an odd offset, so its alignment pad is read too."""
+    import tempfile
+    import dumpar
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, 'Umlaut.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/Umlaute");\n'
+                    'class Größe : public AActor {\npublic:\n  int32 Get() { return 1; }\n};\n')
+        want = [('/Game/_ElytrasMods/Umlaute/Größe.Größe_C', '/Game/_ElytrasMods/Umlaute', 'BlueprintGeneratedClass',
+                 '/Game/_ElytrasMods/Umlaute/Größe', 'Größe_C')]
+        rows = lambda path: [(r['object_path'], r['package_path'], r['asset_class'], r['package_name'], r['asset_name'])
+                             for r in dumpar.read(path)[2]]
+        for twice in range(2):
+            proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, tmp], capture_output=True, text=True)
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+            assert rows(os.path.join(tmp, 'AssetRegistry.bin')) == want, rows(os.path.join(tmp, 'AssetRegistry.bin'))
+        merged = os.path.join(tmp, 'Merged.bin')
+        proc = subprocess.run([ASSETGEN, 'registry', merged, os.path.join(tmp, 'AssetRegistry.bin'), registry_of('AssetTest')],
+                              capture_output=True, text=True)
+        assert proc.returncode == 0 and set(want) <= set(rows(merged)), (proc.stdout, rows(merged))
+    print('ok  a non-ASCII asset name reads back from the registry as written, and merges')
+
+
 def export_index(base, name):
     return exports_of(base).index(name)
 
@@ -204,6 +230,7 @@ def nested(Size):
 
 sweep()
 registry_layout()
+registry_non_ascii()
 check('FlowTest', 'SumSkipping', sum_skipping, [dict(Count=c, Skip=k) for c in (0, 1, 5, 10, 20) for k in (-1, 0, 3, 9)])
 check('FlowTest', 'FirstOver', first_over, [dict(Limit=l) for l in (0, 1, 5, 99, 100)])
 check('FlowTest', 'Nested', nested, [dict(Size=s) for s in (0, 1, 2, 4, 7)])
@@ -240,6 +267,7 @@ check('FlowTest', 'NameKind', lambda Kind: {'intproperty': 1, 'floatproperty': 2
 check('FlowTest', 'DefaultFirst', default_first, [dict(Code=c) for c in (0, 4, 5, 6, 7)])
 check('FlowTest', 'SwitchInLoop', switch_in_loop, [dict(Count=c) for c in (0, 1, 2, 3, 7, 30)])
 check('FlowTest', 'ByteSwitch', lambda Mode: {2: 20, 255: 1}.get(Mode, 0), [dict(Mode=m) for m in (0, 2, 254, 255)])
+check('FlowTest', 'ByteSwitchStray', lambda Mode: 1 if Mode == 7 else 0, [dict(Mode=m) for m in (0, 7, 44, 255)])
 check('FlowTest', 'DenseHoles', lambda Code: {10: 1, 11: 2, 13: 4, 14: 5}.get(Code, -9), [dict(Code=c) for c in range(8, 17)])
 check('FlowTest', 'Negative', lambda Code: {-2: -20, -1: -10, 0: 0}.get(Code, 50), [dict(Code=c) for c in range(-4, 3)])
 
@@ -278,6 +306,79 @@ def flow_members():
         me = dict(Total=777, Cursor=5, Slots=[1])
         assert run(base, fn, self_vars=me, N=3)[0] == want and me == dict(Total=777, Cursor=5, Slots=[1]), (fn, me)
     print('ok  FlowTest: BeginPlay, BumpSlot, NextSlot, TemplateMember and local Totals, on the members')
+
+
+def assign_order():
+    """C++17 sequences the right side of `=` / `op=` before the left, and the engine's Let locates its destination
+    (object, array, index) before the value: what the value runs must not move past what locates the store."""
+    from runscript import i32
+    base = asset('FlowTest')
+    for cur in (0, 1, 2):
+        me = dict(Slots=[9] * 4, Cursor=cur)
+        run(base, 'StoreSlot', self_vars=me)
+        want = [9] * 4
+        want[cur + 1] = cur
+        assert me == dict(Slots=want, Cursor=cur + 2), ('StoreSlot', cur, me)
+    for cur in (0, 1, 2**31 - 1):
+        me = dict(SlotMap={}, Cursor=cur)
+        run(base, 'StoreSlotMap', self_vars=me)
+        assert me == dict(SlotMap={i32(cur + 1): cur}, Cursor=i32(cur + 2)), ('StoreSlotMap', cur, me)
+    for i in (0, 1, 2):
+        me = dict(Slots=[9] * 4)
+        assert run(base, 'StorePostInc', self_vars=me, I=i)[0] == i + 1 and me['Slots'][i] == i, ('StorePostInc', i, me)
+    for cur in (0, 1, 2):
+        me = dict(Slots=[10, 20, 30, 40], Cursor=cur)
+        run(base, 'StoreAtCursor', self_vars=me)
+        want = [10, 20, 30, 40]
+        want[cur + 1] = cur
+        assert me == dict(Slots=want, Cursor=cur + 1), ('StoreAtCursor', cur, me)
+        me = dict(Slots=[10, 20, 30, 40], Cursor=cur)
+        run(base, 'BumpAtCursor', self_vars=me, By=100)
+        want = [10, 20, 30, 40]
+        want[cur + 1] += cur + 100
+        assert me == dict(Slots=want, Cursor=cur + 1), ('BumpAtCursor', cur, me)
+    for fn in ('StorePeer', 'StorePeerField'):
+        vm = VM(base)
+        near, far = vm.new(Cursor=0), vm.new(Cursor=0)
+        vm.self.vars.update(Peer=near, Spare=far)
+        vm.call(fn)
+        assert near.vars['Cursor'] == 0 and far.vars['Cursor'] == 5 and vm.self.vars['Peer'] is far, (fn, near.vars, far.vars)
+    print('ok  FlowTest: `=` / `op=` take the value before locating the destination\'s index, key or object')
+
+
+def call_object_order():
+    """C++17 sequences a call's object (and E1 of E1[E2]) before the arguments: what an argument hoists (an inline
+    body, a && / ?: arm) must not run before the object is taken."""
+    base = asset('FlowTest')
+    for fn, args, cursor, ret in (('CallPeerInline', {}, 5, None), ('CallPeerBranch', dict(C=True), 5, None),
+                                  ('CallPeerBranch', dict(C=False), 1, None), ('CallPeerField', {}, 5, None),
+                                  ('PeerPlus', {}, 3, 8), ('PeerSlot', {}, 3, 10), ('StorePeerSlot', {}, 3, None)):
+        vm = VM(base)
+        near, far = vm.new(Cursor=3, Slots=[10, 11]), vm.new(Cursor=4, Slots=[20, 21])
+        vm.self.vars.update(Peer=near, Spare=far)
+        got = vm.call(fn, **args)
+        swapped = fn != 'CallPeerBranch' or args['C']
+        assert (got == ret and near.vars['Cursor'] == cursor and far.vars['Cursor'] == 4
+                and near.vars['Slots'] == ([7, 11] if fn == 'StorePeerSlot' else [10, 11]) and far.vars['Slots'] == [20, 21]
+                and vm.self.vars['Peer'] is (far if swapped else near)), (fn, args, got, near.vars, far.vars)
+    print('ok  FlowTest: a call\'s object is taken before what its arguments hoist  (7 cases)')
+    # ... and the object holding the container or dispatcher a Kismet call works on (its argument 0).
+    for fn, args, slots, smap, cursor, ret in (
+            ('AddPeerSlot', {}, [10, 11, 5], {5: 1}, 3, None), ('AddPeerSlotBranch', dict(C=True), [10, 11, 5], {5: 1}, 3, None),
+            ('AddPeerSlotBranch', dict(C=False), [10, 11, 1], {5: 1}, 3, None), ('AddPeerSlotRaw', {}, [10, 11, 5], {5: 1}, 3, None),
+            ('AddPeerMap', {}, [10, 11], {5: 7}, 3, None), ('PeerMapAt', {}, [10, 11], {5: 1}, 3, 1),
+            ('StorePeerMap', {}, [10, 11], {5: 7}, 3, None), ('FirePeer', {}, [10, 11], {5: 1}, 5, None)):
+        vm = VM(base)
+        near = vm.new(Cursor=3, Slots=[10, 11], SlotMap={5: 1})
+        far = vm.new(Cursor=4, Slots=[20, 21], SlotMap={5: 9})
+        vm.self.vars.update(Peer=near, Spare=far)
+        vm.binds += [(near, 'OnPeerHit', 'SetCursor', near), (far, 'OnPeerHit', 'SetCursor', far)]
+        got = vm.call(fn, **args)
+        swapped = fn != 'AddPeerSlotBranch' or args['C']
+        assert (got == ret and near.vars == dict(Cursor=cursor, Slots=slots, SlotMap=smap)
+                and far.vars == dict(Cursor=4, Slots=[20, 21], SlotMap={5: 9})
+                and vm.self.vars['Peer'] is (far if swapped else near)), (fn, args, got, near.vars, far.vars)
+    print('ok  FlowTest: a container or dispatcher call\'s object is taken before what its arguments hoist  (8 cases)')
 
 
 def call_member():
@@ -343,6 +444,9 @@ check('FlowTest', 'SafeRatio', lambda X: X != 0 and cdiv(10, X) > 2, [dict(X=x) 
 check('FlowTest', 'EitherZero', lambda X, Y: X == 0 or cdiv(100, X) == Y, [dict(X=x, Y=y) for x in (0, 10, 3) for y in (0, 10, 33)])
 check('FlowTest', 'Pick', lambda X: X * 2 if X > 0 else (-1 if X < -5 else 7), [dict(X=x) for x in (-9, -5, 0, 4)])
 check('FlowTest', 'ConstBreak', lambda X: 205, [dict(X=0)])
+vm = VM(asset('FlowTest'))
+assert [vm.call('UseDefault', X=x) for x in (-2, 0, 5)] == [(x * 3 + x * 10 + (x + 7) * 1000) for x in (-2, 0, 5)]
+print('ok  FlowTest.UseDefault: a defaulted argument is the parameter\'s default, to a method and inlined')
 check('FlowTest', 'Compound', compound, [dict(N=n) for n in (0, 1, 5, 40)])
 check('FlowTest', 'WhileAnd', while_and, [dict(Limit=l) for l in (0, 1, 50, 99, 150)])
 
@@ -393,11 +497,14 @@ check('FlowTest', 'GotoLoop', lambda N: sum(range(max(N, 0))), [dict(N=n) for n 
 check('FlowTest', 'GotoOut', goto_out, [dict(Size=s, Want=w) for s in (0, 1, 4) for w in (0, 6, 7)])
 def first_square_above(floor): return next(n for n in range(1, 100) if n * n > floor)
 check('FlowTest', 'GotoInlined', lambda A, B: first_square_above(A) * 100 + first_square_above(B), [dict(A=a, B=b) for a, b in ((0, 0), (10, 50), (99, 3))])
+check('FlowTest', 'GotoInlinedLive', lambda N: 3 * N * 3 + 3, [dict(N=n) for n in (-4, 0, 1, 5)])
 check('FlowTest', 'GotoRedeclares', lambda Rounds: 5 * max(Rounds, 1), [dict(Rounds=r) for r in (0, 1, 3)])
 check('FlowTest', 'IfInit', if_init, [dict(V=v) for v in (-4, 0, 3, 5, 6, 8)])
 check('FlowTest', 'SwitchInit', switch_init, [dict(V=v) for v in (-1, 0, 1, 2, 3, 7)])
 check('FlowTest', 'WhileVar', while_var, [dict(Start=s) for s in (-2, 0, 1, 5)])
 flow_members()
+assign_order()
+call_object_order()
 call_member()
 float_step()
 flow_exports()
@@ -444,6 +551,41 @@ for stop in (0, 15, 1000):
         want = fn(theirs)
         assert (got, mine) == (want, theirs), 'BumpScores(%s, %s) = %r %r, want %r %r' % (m, stop, got, mine, want, theirs)
 print('ok  RangeTest.BumpScores  (9 cases)')
+
+
+def bump_until(f, stop):
+    for k in f['Scores']:
+        f['Scores'][k] += 10
+        for i in range(2):
+            if f['Scores'][k] + i > stop: return f['Scores'][k] * 10 + i
+    return -1
+
+
+def cap_scores(f, cap):
+    for k in f['Scores']:
+        f['Scores'][k] += 1
+        if f['Scores'][k] > cap:
+            f['Scores'][k] = cap
+            return None
+
+
+def bump_inlined(f, stop):
+    for k in f['Scores']:
+        f['Scores'][k] += 1
+        if f['Scores'][k] > stop: return f['Scores'][k] * 2 + 1
+    return -1 * 2 + 1
+
+
+n = 0
+for fn, oracle in (('BumpScoresUntil', bump_until), ('CapScores', cap_scores), ('BumpScoresInlined', bump_inlined)):
+    for stop in (-100, 0, 5, 15, 25, 1000):
+        for m in ({}, {'a': 1}, {'a': 1, 'b': 20, 'c': 3}, {'a': -50, 'b': 6}):
+            mine, theirs = range_self(Scores=m), range_self(Scores=m)
+            got = run(asset('RangeTest'), fn, self_vars=mine, **{'Cap' if fn == 'CapScores' else 'Stop': stop})[0]
+            want = oracle(theirs, stop)
+            assert (got, mine) == (want, theirs), '%s(%s, %s) = %r %r, want %r %r' % (fn, m, stop, got, mine, want, theirs)
+            n += 1
+print('ok  RangeTest: a return from a reference TMap loop writes the changed value back  (%d cases)' % n)
 for m in ({}, {'a': {'X': 1, 'Y': 2}}, {'a': {'X': -1, 'Y': 0}, 'b': {'X': 5, 'Y': 7}}):
     f = dict(Spots={k: dict(v) for k, v in m.items()})
     got = run(asset('RangeTest'), 'ShiftSpots', self_vars=f)[0]
@@ -456,6 +598,45 @@ for hits in ((), (0,), (4, -1)):
     vm.call('PokePeers')
     assert vm.self.vars['Peers'] == peers and [p.vars['Hits'] for p in peers.values()] == [h + 1 for h in hits], hits
 print('ok  RangeTest.PokePeers: `Peer->Hits += 1` writes each object, the map keeps its pointers')
+for items, scores in (([], {}), ([1, 2, 3], {'a': 5}), ([4, -7], {'a': 1, 'b': -2})):
+    def peers():
+        return (Obj('RangeTest_C', Items=list(items), Scores=dict(scores)),
+                Obj('RangeTest_C', Items=[100, 200, 300, 400], Scores={'a': 50, 'z': 9}))
+    near, far = peers()
+    vm = VM(asset('RangeTest'), Near=near, Far=far, Picks=0)
+    want = 0
+    for x in items: want = want * 10 + x
+    assert vm.call('SumPicked') == want * 100 + 1, (items, vm.self.vars['Picks'])
+    for fn, field, change in (('DoublePicked', 'Items', lambda: [x * 2 for x in items]),
+                              ('BumpPicked', 'Scores', lambda: {k: v + 1 for k, v in scores.items()})):
+        near, far = peers()
+        vm = VM(asset('RangeTest'), Near=near, Far=far, Picks=0)
+        vm.call(fn)
+        got = (near.vars['Items'], near.vars['Scores'], far.vars, vm.self.vars['Picks'])
+        want = dict(Items=list(items), Scores=dict(scores))
+        want[field] = change()
+        assert got == (want['Items'], want['Scores'], peers()[1].vars, 1), (fn, items, scores, got)
+print('ok  RangeTest: a range expression with a call is evaluated once  (9 cases)')
+for items, scores in (([], {}), ([1, 2, 3], {'a': 5, 'b': 7}), ([4, -7], {'b': -2})):
+    def peers():
+        return (Obj('RangeTest_C', Items=list(items), Scores=dict(scores)),
+                Obj('RangeTest_C', Items=[100, 200, 300, 400], Scores={'z': 9}))
+    near, far = peers()
+    vm = VM(asset('RangeTest'), Near=near, Far=far, Cur=near)
+    want = 0
+    for x in items + items: want = want * 10 + x
+    got = vm.call('SumReseat')
+    assert got == want, ('SumReseat', items, got, want)
+    for fn, field, change in (('DoubleReseat', 'Items', lambda: [x * 2 for x in items]),
+                              ('BumpReseat', 'Scores', lambda: {k: v + 1 for k, v in scores.items()})):
+        near, far = peers()
+        vm = VM(asset('RangeTest'), Near=near, Far=far, Cur=near)
+        vm.call(fn)
+        got = (near.vars['Items'], near.vars['Scores'], far.vars)
+        want = dict(Items=list(items), Scores=dict(scores))
+        want[field] = change()
+        assert got == (want['Items'], want['Scores'], peers()[1].vars), (fn, items, scores, got)
+print('ok  RangeTest: a pointer reseated in a range-for body leaves the range where it was  (9 cases)')
 
 
 def range_members():
@@ -520,7 +701,7 @@ def inline_statics():
 
 def no_inline_ufunctions():
     exports = [e['name'] for e in dumpexp.load(asset('InlineTest'))[5]]
-    for name in ('Clamp', 'Half', 'Twice', 'Bump', 'FirstAbove', 'Nest', 'Dec', 'Plus1', 'Late', 'SDouble', 'SPred'):
+    for name in ('Clamp', 'Half', 'Twice', 'Bump', 'FirstAbove', 'Nest', 'Dec', 'Plus1', 'Late', 'SDouble', 'SPred', 'Pick'):
         assert name not in exports, name + ' became a UFunction'
     print('ok  InlineTest: no inline function is a UFunction')
 
@@ -536,13 +717,46 @@ def inline_regressions():
         got = run(asset('InlineTest'), 'BumpElem', self_vars=f, By=by)[0]
         assert got == (10 + by) * 100 + 10 + 6 and f == dict(Counter=6, Calls=1, Arr=[10 + by]), (by, got, f)
     check('InlineTest', 'DoInline', lambda N: next(i for i in range(1, 100) if 2 * i >= N), [dict(N=n) for n in (-3, 0, 1, 2, 4, 5, 12)])
-    print('ok  InlineTest: LateMember, BumpElem and DoInline run as C++ does')
+    check('InlineTest', 'PickOverloads', lambda V, B: i32((100 if B else 200) + (V + 1) * 1000 + (V + 1) * 3 * 10),
+          [dict(V=v, B=b) for v in (-5, 0, 7, 2**20) for b in (True, False)])
+    print('ok  InlineTest: LateMember, BumpElem, DoInline and PickOverloads run as C++ does')
+    Ls = [dict(L=l) for l in (-2, 0, 1, 3, 5, 9)]
+    check('InlineTest', 'WhileFresh', lambda L: max(0, L - 1), Ls)
+    check('InlineTest', 'ForFresh', lambda L: sum(range(L - 1)), Ls)
+    check('InlineTest', 'DoFresh', lambda L: max(1, L - 1), Ls)
+    print('ok  InlineTest: an inline in a loop test makes its locals afresh on every trip')
+
+
+def inline_mixed_overloads():
+    """A call to the non-inline overload of a name Generate skips as inline is refused: it once compiled to a call to a
+    UFunction that was never made, fatal at run time. An inline overload beside the UFunction one still runs."""
+    import tempfile
+    head = '#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\nclass %s : public AActor {\npublic:\n'
+    mods = {'MixShort': ('  int32 Get(int32 A) { return A + 7; }\n  inline int32 Get(int32 A, int32 B) { return A * B; }\n'
+                         '  int32 CallShort(int32 V) { return Get(V); }\n};\n'),
+            'MixLong': ('  int32 Get(int32 A, int32 B) { return A * B; }\n  int32 Get(int32 A);\n'
+                        '  int32 CallLong(int32 V) { return Get(V, 3); }\n};\ninline int32 MixLong::Get(int32 A) { return A + 1; }\n'),
+            'MixOk': ('  int32 Get(int32 A, int32 B) { return A * B; }\n  inline int32 Get(int32 A) { return A + 1; }\n'
+                      '  int32 Both(int32 V) { return Get(V) * 10 + Get(V, 2); }\n};\n')}
+    with tempfile.TemporaryDirectory() as tmp:
+        for mod, body in mods.items():
+            with open(os.path.join(tmp, mod + '.cpp'), 'w') as f:
+                f.write(head % (mod, mod) + body)
+            proc = subprocess.run([ASSETGEN, 'compile', os.path.join(tmp, mod + '.cpp'), UEAPI, tmp], capture_output=True, text=True)
+            if mod == 'MixOk':
+                assert proc.returncode == 0, proc.stdout + proc.stderr
+                for v in (-3, 0, 5):
+                    assert run(os.path.join(tmp, mod), 'Both', V=v)[0] == (v + 1) * 10 + v * 2, v
+            else:
+                assert proc.returncode != 0 and 'may not mix inline and non-inline' in proc.stdout, (mod, proc.stdout)
+    print('ok  InlineTest: an overload set mixing inline and non-inline is refused where it would call no UFunction')
 
 
 inline_members()
 inline_statics()
 no_inline_ufunctions()
 inline_regressions()
+inline_mixed_overloads()
 
 
 # ---- OptTest
@@ -616,6 +830,16 @@ def map_index_members():
     print('ok  NestedTest.MapIndex: Counts[a] ends at Seed + 2, other keys untouched')
 
 
+def nested_map_range():
+    for start in ({}, {1: [5, 6], 2: [7]}, {3: [], 9: [1, 2, 3, 4]}):
+        fields = {'Buckets': {k: list(v) for k, v in start.items()}}
+        got = run(asset('NestedTest'), 'CountBuckets', self_vars=fields)[0]
+        assert got == sum(len(v) * 10 + k for k, v in start.items()) and fields == {'Buckets': start}, (start, got, fields)
+        run(asset('NestedTest'), 'AppendZeroBuckets', self_vars=fields)
+        assert fields == {'Buckets': {k: v + [0] for k, v in start.items()}}, (start, fields)
+    print('ok  NestedTest: a range-for over a map of arrays reads and writes back each array')
+
+
 def nested_find_types():
     """execMap_Find writes its out-parm in place only when that property's class matches the map's value property
     (ScriptCore / KismetArrayLibrary): so every Map_Find on Groups must write a FNC_TArray_FName-typed local."""
@@ -633,6 +857,7 @@ def nested_find_types():
 
 nested_containers()
 map_index_members()
+nested_map_range()
 nested_find_types()
 
 
@@ -736,7 +961,8 @@ def constants():
     base = asset('TypesTest')
     exports = [e['name'] for e in dumpexp.load(base)[5]]
     cdo = subprocess.run([sys.executable, os.path.join(here, 'dumptags.py'), base, str(exports.index('Default__TypesTest_C'))], capture_output=True, text=True).stdout
-    for want in ('Seed [0] IntProperty size=4: %d' % fnv('types'), 'Budget [0] IntProperty size=4: 25', 'Reach [0] FloatProperty size=4: 125.0', 'Bits [0] IntProperty size=4: 236'):
+    for want in ('Seed [0] IntProperty size=4: %d' % fnv('types'), 'Budget [0] IntProperty size=4: 25', 'Reach [0] FloatProperty size=4: 125.0', 'Bits [0] IntProperty size=4: 236',
+                 'Halfway [0] BoolProperty size=0 value=1'):
         assert want in cdo, (want, cdo)
     print('ok  TypesTest: a member default is what its constant expression comes to')
     import struct
@@ -770,9 +996,44 @@ def types_behaviour():
           [dict(M=m, N=n) for m in (0, 1, 4, 5, 6, 7, 255) for n in EDGE])
     check('TypesTest', 'ConstSum', lambda N: wrap(N * 3 + 31), [dict(N=n) for n in EDGE])
     check('TypesTest', 'HalfOf', lambda V: V * 0.5, [dict(V=v) for v in (-3.0, 0.0, 8.0, -0.25)])
+    check('TypesTest', 'ShrBy', lambda X, M: X >> (M if M in (1, 4) else 31),   # Python >> floors, as C++'s does
+          [dict(X=x, M=m) for x in EDGE + (-3, -1, -17) for m in (1, 4, 31)])
+    check('TypesTest', 'Shr64', lambda X, M: X >> (1 if M == 1 else 63),
+          [dict(X=x, M=m) for x in (-2**63, -3, -1, 0, 5, 2**63 - 1) for m in (1, 63)])
+    check('TypesTest', 'ShiftByLL', lambda X, M: wrap(X << 2) if M == 0 else X >> (1 if M == 1 else 3),
+          [dict(X=x, M=m) for x in EDGE + (-8, -7, -1) for m in (0, 1, 2)])
+    import struct
+    f32 = lambda v: struct.unpack('<f', struct.pack('<f', v))[0]
+    below = [f32(v) for v in (0.99999994, 7.9999995, -0.99999994, 3.9999998, 2.75, -2.75, 0.0, -1e9)]
+    check('TypesTest', 'TruncOf', lambda X, M: int(X * 2 if M == 2 else X), [dict(X=x, M=m) for x in below for m in (0, 1, 2)])
+    check('TypesTest', 'Trunc64Of', lambda X: int(X), [dict(X=x) for x in below + [f32(5e9), f32(-7.5e12)]])
+    s32 = lambda v: (v + 2**31) % 2**32 - 2**31
+    check('TypesTest', 'NarrowOf', lambda X, Y, M: [X & 0xFF, Y & 0xFF, s32(Y)][M],
+          [dict(X=x, Y=y, M=m) for x, y in zip(EDGE, (511, -1, 2**32 + 5, -2**63, 2**63 - 1, 300, 5000000000)) for m in range(3)])
+    # Constants of an enum with no fixed type keep their value (they were bytes: 1000 read back as 232).
+    check('TypesTest', 'AnonConst', lambda X, M: [min(X, 1000), wrap(X - 5), wrap(X * 70000), int(X == 70000), 1000][M],
+          [dict(X=x, M=m) for x in EDGE + (500, 999, 1000, 1001, 5000, 69999, 70000) for m in range(5)])
+    check('TypesTest', 'WideConst', lambda X: X + 5000000000, [dict(X=x) for x in (-5000000000, -1, 0, 7, 1 << 32)])
+    # A constant float is true when nonzero (0.5f truncated to 0 first and folded to false).
+    check('TypesTest', 'FloatTruth', lambda X, M: [0, int(X > 0), 7, 1][M], [dict(X=x, M=m) for x in EDGE for m in range(4)])
     # An int64 enum compares as int64: a value sharing only Eon's / Epoch's low 32 bits is neither.
     check('TypesTest', 'AgeOf', lambda A: 1 if A == 5000000000 else 2 if A == 0 else 0,
           [dict(A=a) for a in (0, 5000000000, 7, 5000000001, 5000000000 & 0xFFFFFFFF, 1 << 32, -(1 << 32))])
+    # A value-changing cast inside a chain of casts: bool, uint8, int32 from int64, int32 from float.
+    nan, floats = float('nan'), (0.0, -0.0, 0.5, -0.25, 2.75, -2.75, 255.9, 300.5, -1.5)
+    ints = EDGE + (-1, 255, 256, 300)
+    check('TypesTest', 'CastBool', lambda F, X: wrap((F != 0) + X), [dict(F=f, X=x) for f in floats + (nan,) for x in (1, 2**31 - 1)])
+    check('TypesTest', 'CastBoolK', lambda X: wrap(1 + X), [dict(X=x) for x in EDGE])
+    check('TypesTest', 'CastBoolInt', lambda V, X: wrap((V != 0) + X), [dict(V=v, X=x) for v in ints for x in (1, -2**31)])
+    check('TypesTest', 'CastBoolEnum', lambda M, X: wrap((M != 0) + X), [dict(M=m, X=x) for m in (0, 5, 6, 255) for x in (1, 2**31 - 1)])
+    for fn in ('CastByte', 'CastByteStatic'):
+        check('TypesTest', fn, lambda V, X: wrap((V & 0xFF) + X), [dict(V=v, X=x) for v in ints for x in (0, 2**31 - 1)])
+    check('TypesTest', 'CastByteK', lambda X: wrap(44 + X), [dict(X=x) for x in EDGE])
+    check('TypesTest', 'CastInt64', lambda V: wrap(V), [dict(V=v) for v in (7, -1, 2**31, -2**31 - 1, 5000000001, -(2**40) - 5)])
+    check('TypesTest', 'CastWide', lambda V: V & 0xFF, [dict(V=v) for v in ints])
+    check('TypesTest', 'CastTrunc', lambda F: float(int(F)), [dict(F=f) for f in floats])
+    check('TypesTest', 'CastChain', lambda F, X: wrap((int(F) & 0xFF) + X), [dict(F=f, X=x) for f in floats for x in (0, 2**31 - 1)])
+    check('TypesTest', 'CastTest', lambda F: F != 0, [dict(F=f) for f in floats + (nan,)])
     # Past the switch, `M == Mood ? 10 : 0` / `S == Span ? 10 : 0` read the member.
     for mood in (0, 5, 7):
         for m in (0, 1, 4, 5, 6, 7, 255):
@@ -836,6 +1097,11 @@ def string_behaviour():
     import runscript
     check('StringTest', 'MakeKey', lambda Prefix, Index: Prefix + '_' + str(Index),
           [dict(Prefix=p, Index=i) for p in ('', 'Abc') for i in (-5, 0, 42, 2**31 - 1)])
+    base = asset('StringTest')
+    cdo = dump('dumptags.py', base, [e['name'] for e in dumpexp.load(base)[5]].index('Default__StringTest_C'))
+    assert 'Umlaut [0] NameProperty size=8: Größe' in cdo, cdo
+    check('StringTest', 'IsUmlaut', lambda S: S.lower() == 'größe', [dict(S=s) for s in ('Größe', 'GRößE', 'Grösse', '')])
+    print('ok  StringTest: a non-ASCII FName reads back as written, in the CDO and the bytecode')
 
     class Trace(dict):
         """The object's fields, recording every store in order."""
@@ -867,6 +1133,26 @@ def struct_behaviour():
     check('StructTest', 'MakeLocal', lambda K: wrap(K + wrap(K * 2) * 10 + 1000), [dict(K=k) for k in (0, 3, -2, 2**30)])
     check('StructTest', 'MakeArgument', lambda K: wrap(K + wrap(K + 1)), [dict(K=k) for k in (0, 5, -1, 2**31 - 1)])
     check('StructTest', 'MakeInLoop', lambda Rounds: max(Rounds, 0), [dict(Rounds=r) for r in (-3, 0, 1, 2, 4)])
+    # A copy passed where a reference is written (T& parameter, Array_Add, Array_Get's / Map_Find's out item, a by-value
+    # range-for variable, a same-typed input Append / Union read in place): the write lands in the copy, never in the
+    # variable it was copied from.
+    n = 0
+    for k in (-7, 0, 5, 2**31 - 1):
+        for fn, fields, want, after in (
+                ('CopyToRef', {'Stats': {kills: 3}}, 3, {'Stats': {kills: 3}}),
+                ('MemberCopyToRef', {'Stats': {kills: 3}}, 3, {'Stats': {kills: 3}}),
+                ('ArgCopyToRef', {}, k, {}),
+                ('ArrayCopyAdd', {'Counts': [1, 2]}, 2, {'Counts': [1, 2]}),
+                ('ArrayGetIntoCopy', {'Stats': {kills: 3}, 'Counts': [9]}, 3, {'Stats': {kills: 3}, 'Counts': [9]}),
+                ('RangeCopyToRef', {'Many': [{kills: 1}, {kills: 2}]}, 1, {'Many': [{kills: 1}, {kills: 2}]}),
+                ('MapFindIntoCopy', {'Scores': {1: 40}}, k, {'Scores': {1: 40}}),
+                ('ArrayAppendCopy', {'Counts': [1, 2]}, i32(k + 4), {'Counts': [1, 2, 1, 2]}),
+                ('SetUnionCopy', {'Seen': [1, 2], 'Fresh': [2, 3]}, i32(k + 3), {'Seen': [2, 3, 1], 'Fresh': [2, 3]})):
+            f = copy.deepcopy(fields)
+            got = run(asset('StructTest'), fn, self_vars=f, K=k)[0]
+            assert (got, f) == (want, after), (fn, k, got, f)
+            n += 1
+    print('ok  StructTest: a local copy bound to a written reference leaves its source alone  (%d cases)' % n)
     f = {}
     runscript.MESSAGES.clear()
     run(asset('StructTest'), 'ReceiveBeginPlay', self_vars=f)
@@ -888,11 +1174,30 @@ def pointer_behaviour():
         runscript.MESSAGES.clear()
         run(asset('PointerTest'), 'Check', self_vars=f, bOk=ok, What='x')
         assert f == {'Failures': 2 if ok else 3} and runscript.MESSAGES == ([] if ok else ['PointerTest FAILED: x']), (ok, f)
+    # A byte read through int8* / signed char* sign-extends; through uint8* it does not.
+    addr, sb = 0x7FF600001000, lambda b: b - 256 if b > 127 else b
+    for pair in ((0xFF, 0xFF), (0x80, 0x7F), (0x05, 0xFE), (0x7F, 0x80), (0, 0)):
+        runscript.MEM.update({addr: pair[0], addr + 1: pair[1]})
+        got = [run(asset('PointerTest'), 'SignedByteMix', P=addr)[0], run(asset('PointerTest'), 'SignedByteNegative', P=addr)[0]]
+        got += [run(asset('PointerTest'), fn, P=addr, I=i)[0] for fn in ('SignedCharAt', 'UnsignedByteAt') for i in (0, 1)]
+        got += [run(asset('PointerTest'), fn, P=addr)[0] for fn in ('SignedByteAsUnsigned', 'SignedByteIsMax')]
+        want = [sb(pair[0]) * 3 + sb(pair[1]), sb(pair[0]) < 0, sb(pair[0]), sb(pair[1]), pair[0], pair[1]]
+        want += [pair[0] * 1000 + pair[1], pair[0] == 255]
+        assert got == want, (pair, got, want)
+    runscript.MEM.clear()
+    # Kismet has no unsigned int32: a uint32 read would widen and compare as signed, so it is refused.
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, 'ReadU32.cpp'), 'w') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/ReadU32");\n'
+                    'class ReadU32 : public AActor {\npublic:\n  int64 Get(uint32 *P) { return *P; }\n};\n')
+        proc = subprocess.run([ASSETGEN, 'compile', os.path.join(tmp, 'ReadU32.cpp'), UEAPI, tmp], capture_output=True, text=True)
+        assert proc.returncode != 0 and 'reading a uint32 through a pointer' in proc.stdout, proc.stdout
     # The synthesized read scratch is cooked beside the class, and the class imports it.
     d = dumpexp.load(os.path.join(os.path.dirname(asset('PointerTest')), 'FDeref'))
     assert [e['name'] for e in d[5]] == ['FDeref'] and "Class'UserDefinedStruct'" in d[4], d[4]
     assert "UserDefinedStruct'FDeref'" in dumpexp.load(asset('PointerTest'))[4]
-    print('ok  PointerTest: Advance, Bump (out-parm), Check; FDeref synthesized')
+    print('ok  PointerTest: Advance, Bump (out-parm), Check, signed byte reads, uint32 reads refused; FDeref synthesized')
 
 
 mod_enum()
@@ -1068,7 +1373,7 @@ def run_as(chain, fn, fields, **parms):
                     finals[fname] = os.path.join(os.path.dirname(chain[0]), pkg.split('.')[0].rsplit('/', 1)[1])
     saved = runscript.run, runscript.params_of, dict(runscript.MATH)
     runscript.run = lambda base, f, self_vars=None, **p: saved[0](owner(f), f, self_vars, **p)
-    runscript.params_of = lambda base, f: saved[1](owner(f), f)
+    runscript.params_of = lambda base, f, *flag: saved[1](owner(f), f, *flag)
     for f, target in finals.items():
         runscript.MATH[f] = (lambda t, f: lambda *a: saved[0](t, f, fields, **dict(zip(saved[1](t, f), a)))[0])(target, f)
     try:
@@ -1311,7 +1616,20 @@ def ue_assets():
         ed = int(re.search(r'Ed \[0\] ObjectProperty size=4: index (-?\d+)', cdo).group(1))
         assert ref(user, ed) == '/Game/_ElytrasMods/AssetTest/ED_AssetTest.ED_AssetTest', cdo
         assert global_default(tmp, 'UeAssets__UEnemyDescriptor__All', 'All') == ['/Game/_ElytrasMods/AssetTest/ED_AssetTest.ED_AssetTest']
-    print('ok  genueassets: a header per class names each asset by its path, and a mod reaches one, or All, through it')
+        # --pak: a pak with no registry of its own (mint's) names its assets from each .uasset's export table. IfaceTest's
+        # registry has no enemy descriptor, so ED_AssetTest can only come from AssetTest's cooked folder.
+        for paks, has in (([], False), (['--pak', os.path.join(ROOT, 'AssetTest')], True)):
+            out = os.path.join(tmp, 'UeAssetsPak%d' % len(paks))
+            proc = subprocess.run([sys.executable, os.path.join(HERE, 'genueassets.py'), registry_of('IfaceTest'), UEAPI, out]
+                                  + paks, capture_output=True, text=True)
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+            h = os.path.join(out, 'UEnemyDescriptor.h')
+            assert os.path.exists(h) == has, os.listdir(out)
+            assert not os.path.exists(os.path.join(out, 'UBlueprintGeneratedClass.h')), os.listdir(out)
+        assert 'UE_ASSET_AT(::UEnemyDescriptor, ED_AssetTest, "/Game/_ElytrasMods/AssetTest/ED_AssetTest");' in \
+            open(h, encoding='utf-8-sig').read()
+    print('ok  genueassets: a header per class names each asset by its path, and a mod reaches one, or All, through it;'
+          ' --pak adds a pak\'s assets from their own headers')
 
 
 def global_default(folder, cls, member):
@@ -1608,6 +1926,17 @@ def spawn_runs():
     print('ok  SpawnTest: spawn / construct / add-component calls, their classes and the deferred-set order')
 
 
+def spawn_relative():
+    """Compiled from its own folder as a bare "SpawnTest.cpp": `SpawnTest::StaticClass()` still names the mod class
+    (the qualifier is read back from the mod's sources, which a bare path's empty parent once hid)."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        proc = subprocess.run([ASSETGEN, 'compile', 'SpawnTest.cpp', UEAPI, tmp], capture_output=True, text=True, cwd=TESTS)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert VM(os.path.join(tmp, 'SpawnTest'), {}).call('OwnClass') == 'SpawnTest_C'
+    print('ok  SpawnTest: a bare relative source path finds X::StaticClass() qualifiers')
+
+
 def outer_runs():
     """GetTypedOuter / GetOutermostTypedOuter over a faked outer chain: nearest / farthest outer of the kind, the
     object itself never a candidate, null when there is none; and no function of their own."""
@@ -1662,4 +1991,5 @@ latent_links()
 await_runs()
 delegate_targets()
 spawn_runs()
+spawn_relative()
 outer_runs()

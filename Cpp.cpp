@@ -12,6 +12,13 @@
 #include <memory>
 #include <string>
 #include <vector>
+#ifdef _WIN32
+#include <process.h>
+static int ProcessId() { return _getpid(); }
+#else
+#include <unistd.h>
+static int ProcessId() { return getpid(); }
+#endif
 
 #include <nlohmann/json.hpp>
 
@@ -331,6 +338,8 @@ struct FRecord
     std::string Base;
     std::map<std::string, const Json*> Methods;     // in-class decl (carries storageClass)
     std::map<std::string, const Json*> MethodDefs;  // out-of-line definition (carries body/parms)
+    std::map<std::string, const Json*> Inlines;     // decl id (in-class or out-of-line) -> an inline method's
+                                                    // definition: by id, as Methods keeps one overload per name
     std::vector<const Json*> Fields;
     std::vector<std::string> Interfaces;            // every base after the first
     std::map<std::string, std::string> Replicated;  // UE_REPLICATED*: variable -> "Notify:Condition"
@@ -478,8 +487,10 @@ struct FCallIR
     bool bScript = false;               // callee is Blueprint bytecode
     bool bInstance = false;             // non-static method: needs the context object, not the class CDO
     bool bReceiverIsArg = false;        // a forwarded UObject helper (Obj->GetOuter()): Obj is already the first argument, no EX_Context
+    bool bOnArg0 = false;               // Args[0] is the container or dispatcher worked on: the object holding it goes first
     FIndex Context;                     // CDO a static call runs against; null = self
     bool bPure = false;                 // a function of its arguments (UE_PURE, a Kismet operator or conversion): see DropUnusedPure
+    uint64 WrittenArgs = ~uint64(0);    // bit I: argument I must stay its own variable, which the callee may write: see ContainerWrites
     std::string VirtualName;            // a generated class's own instance method: EX_VirtualFunction resolves it by name at run time
     bool bLocalVirtual = false;         // ... as EX_LocalVirtualFunction: a script function that is no RPC
     std::string View;                   // __RefAtInline__: the TArray field of the view struct in Extra
@@ -538,7 +549,7 @@ struct FStmtIR
     bool bJumpOut = false;                          // If: Then is one break / continue, taken when Cond is FALSE: a
                                                     // single JumpIfNot straight to where it goes
     std::vector<FArgIR> CaseTests;                  // Switch: per case, true when the value does NOT match
-    int32 LabelId = -1;                             // Label: the case it marks; Switch: the default's label, or -1;
+    int32 LabelId = -1;                             // Label: the case it marks, -1 if no value can; Switch: the default's label, or -1;
                                                     // Goto / GotoLabel: the label, unique in the class
     std::vector<int64> CaseValues;                  // Switch: each case's constant, in CaseTests order
     int32 SwitchWidth = 4;                          // Switch: the value's size, 1 / 4 / 8; 0 for an FName
@@ -917,6 +928,7 @@ private:
     std::map<std::string, const Json*> ConstVars;
     struct FConstVal { bool bFloat = false; double F = 0; int64 I = 0; double Num() const { return bFloat ? F : double(I); } };
     bool FoldConst(const Json& E, FConstVal& Out) const;
+    const Json* ValueCastBelow(const Json& N) const;
     bool FreeNegation(const Json& C, Json& Out) const;
     bool ConstToArg(const FConstVal& V, const std::string& Type, FArgIR& Out) const;
     std::map<std::string, const Json*> FreeInlines;                     // decl id -> an inline free function's definition
@@ -958,7 +970,8 @@ private:
     std::map<std::string, std::string> LocalRename;                     // decl id -> an inlined local's unique name
     std::map<std::string, FArgIR> ParmConst;                            // decl id -> the constant an inlined parameter is
     std::vector<std::pair<std::string, std::string>> InlineResults;     // per expansion in progress: result local, type
-    std::vector<std::string> InlineStack;                               // the inline functions being expanded
+    std::vector<const Json*> InlineStack;                               // the inline functions being expanded (their
+                                                                        // definitions: overloads share a name)
     std::vector<FPropertyDef>* CurLocals = nullptr;                     // the function being lowered's locals
     bool LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     bool LowerArgRaw(const Json& N, const std::string& OuterType, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
@@ -984,7 +997,13 @@ private:
     bool RefThrough(FArgIR Addr, const std::string& Pointee, FArgIR& Out, std::string* Err);
     bool ScaleIndex(const Json& IndexNode, const std::string& Pointee, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     bool HoistOperand(FArgIR& Operand, FBlueprintClass& BP, std::vector<FPropertyDef>& Locals,
-                      std::vector<FStmtIR>& OutPre, std::string* Err);
+                      std::vector<FStmtIR>& OutPre, std::string* Err, bool bAlways = false);
+    bool PinObject(FArgIR& Obj, const FArgIR* After, size_t NumAfter, FBlueprintClass& BP,
+                   std::vector<FPropertyDef>& Locals, std::vector<FStmtIR>& OutPre, std::string* Err);
+    bool PinHolder(FArgIR& Place, const FArgIR* After, size_t NumAfter, FBlueprintClass& BP,
+                   std::vector<FPropertyDef>& Locals, std::vector<FStmtIR>& OutPre, std::string* Err);
+    bool HoistCallArgs(FCallIR& C, FBlueprintClass& BP, std::vector<FPropertyDef>& Locals,
+                       std::vector<FStmtIR>& OutPre, std::string* Err);
     bool HasDerefStruct(std::string* Err) const;
     bool LowerPtrCastSource(const Json& Call, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     std::map<std::string, std::string> RefAddr;     // VarDecl id -> pointee: `T& R = *P` keeps the address in an int64 local R
@@ -1037,8 +1056,8 @@ private:
        side effects once (StabilizeLvalue / HoistExpr park them in synthetic locals first). With Result, the
        block also leaves the expression's value in a local named there. */
     bool DesugarUpdate(const Json& S, Json& Wrap, std::string* Result, std::string* Err);
-    Json StabilizeLvalue(const Json& N, Json& Pre);
-    Json HoistExpr(const Json& N, Json& Pre);
+    Json StabilizeLvalue(const Json& N, Json& Pre, bool bPin = false);
+    Json HoistExpr(const Json& N, Json& Pre, bool bPin = false);
     Json SynthLocal(const std::string& Type, const Json& Init, Json& Pre);
     bool LowerUpdateValue(const Json& N, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
 
@@ -1215,8 +1234,9 @@ private:
     std::map<std::string, int32> GotoLabels;          // the body being lowered's: clang LabelDecl id -> FStmtIR::LabelId
     int32 NextGotoLabel = 0;                          // never reset: latent functions share one ubergraph script
     bool bBodyHasGoto = false;                        // a goto can re-reach any declaration, as a loop does
+    bool bFnHasGoto = false;                          // the method or anything inlined into it has one: never restored
     int32 ReEntered = 0;                              // inline expansions under a caller's loop or goto: their bodies run again
-    int32 WriteBackDepth = 0;                         // LowerBody: the TMap range-fors around it that write the value back
+    std::vector<FStmtIR> WriteBacks;                  // LowerBody: the Map_Add of each TMap range-for around it, innermost last
     int32 GotoLabelOf(const std::string& DeclId)
     {
         const auto It = GotoLabels.find(DeclId);
@@ -1438,7 +1458,7 @@ void EmitStmts(const std::vector<FStmtIR>& Stmts, FScript& S, FIndex SelfExp, FL
             Miss = S.Jump(0);
             for (const FStmtIR& B : *St.Body)
             {
-                if (B.K == FStmtIR::Label) { LabelAt[B.LabelId] = S.MemorySize(); continue; }
+                if (B.K == FStmtIR::Label) { if (B.LabelId >= 0) LabelAt[B.LabelId] = S.MemorySize(); continue; }
                 EmitStmts({ B }, S, SelfExp, &Inner, Returns);
             }
             const int32 End = S.MemorySize();
@@ -1596,6 +1616,8 @@ bool FCompiler::Collect(std::string* Err)
             ForEach(N, [&](const Json& C) {
                 if (Kind(C) != "EnumConstantDecl") return;
                 const Json* V = First(C);
+                /* Values past int's range are converted to the enum's wider type around the ConstantExpr. */
+                while (V && !V->contains("value") && Kind(*V) == "ImplicitCastExpr") V = First(*V);
                 if (V && V->contains("value")) Next = std::stoll((*V)["value"].get<std::string>());
                 Mine.push_back({ Name(C), Next });
                 EnumValues[C.value("id", std::string())] = Next++;
@@ -1606,7 +1628,10 @@ bool FCompiler::Collect(std::string* Err)
                                     : Under == "int" || Under == "int32" ? "int32"
                                     : Under == "long long" || Under == "int64" ? "int64" : Under;
             EnumUnderlying[Ns + N.value("name", std::string())] = Canon;
-            const int32 Width = Under.empty() || Canon == "uint8" ? 1 : Canon == "int64" ? 8 : 4;
+            /* No fixed type (a mod's own `enum { kMax = 1000 };`): C++ makes it int, or wider if a value needs it. */
+            bool bWide = false;
+            for (const auto& En : Mine) bWide |= En.second < INT32_MIN || En.second > INT32_MAX;
+            const int32 Width = Under.empty() ? (bWide ? 8 : 4) : Canon == "uint8" ? 1 : Canon == "int64" ? 8 : 4;
             ForEach(N, [&](const Json& C) { if (Kind(C) == "EnumConstantDecl") EnumConstWidth[C.value("id", std::string())] = Width; });
             return;
         }
@@ -1627,6 +1652,8 @@ bool FCompiler::Collect(std::string* Err)
             if (RecIt == Records.end()) return;
             RecIt->second.MethodDefs[Name(N)] = &N;
             MethodOwner[N.value("id", std::string())] = OwnerIt->second;
+            auto& Inlines = RecIt->second.Inlines;
+            if (N.value("inline", false) || Inlines.count(PrevId)) Inlines[PrevId] = Inlines[N.value("id", std::string())] = &N;
             return;
         }
         if (Kind(N) != "CXXRecordDecl" || !N.contains("name") || !N.contains("inner")) return;
@@ -1734,6 +1761,7 @@ bool FCompiler::Collect(std::string* Err)
                 if (!Slot || ParmNames(C).size() > ParmNames(*Slot).size()) Slot = &C;
                 MethodOwner[C.value("id", std::string())] = R.CppName;
                 R.MethodAccess[Name(C)] = Access;
+                if (C.value("inline", false)) R.Inlines[C.value("id", std::string())] = &C;
             }
             else if (Kind(C) == "FieldDecl" && C.contains("name"))
             {
@@ -2112,11 +2140,15 @@ bool FCompiler::ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgI
         Arg.Sub->Args.push_back(Operand);
         return true;
     }
-    if (ToKind == SK_Bool && FromKind == SK_Int64)
+    /* No Conv_ row turns an int64, a float or a byte (an enum's too) into a bool: C++ tests it against zero, and so
+       does this. A NaN is true, as NotEqual_FloatFloat answers. */
+    const EStrKind FromNum = StrKindOf(From);
+    if (ToKind == SK_Bool && (FromNum == SK_Int64 || (FromNum == SK_Float && Arg.K != FArgIR::Float) || FromNum == SK_Byte))
     {
-        WrapInCall(Arg, BP.EngineFunction("/Script/Engine", "KismetMathLibrary", "NotEqual_Int64Int64"));
+        WrapInCall(Arg, BP.EngineFunction("/Script/Engine", "KismetMathLibrary", FromNum == SK_Int64 ? "NotEqual_Int64Int64"
+                                          : FromNum == SK_Float ? "NotEqual_FloatFloat" : "NotEqual_ByteByte"));
         FArgIR Zero;
-        Zero.K = FArgIR::Int64;
+        Zero.K = FromNum == SK_Int64 ? FArgIR::Int64 : FromNum == SK_Float ? FArgIR::Float : FArgIR::Byte;
         Arg.Sub->Args.push_back(Zero);
         Arg.InnerType = "bool";
         return true;
@@ -2152,6 +2184,7 @@ bool FCompiler::ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgI
     if (Arg.K == FArgIR::Int && ToKind == SK_Int64) { Arg.K = FArgIR::Int64; Arg.I64 = Arg.I; return true; }
     if (Arg.K == FArgIR::Int && ToKind == SK_Float) { Arg.K = FArgIR::Float; Arg.F = float(Arg.I); return true; }
     if (Arg.K == FArgIR::Int && ToKind == SK_Bool)  { Arg.K = FArgIR::Bool;  Arg.B = Arg.I != 0; return true; }
+    if (Arg.K == FArgIR::Float && ToKind == SK_Bool) { Arg.K = FArgIR::Bool; Arg.B = Arg.F != 0; return true; }
     if (Arg.K == FArgIR::Int && ToKind == SK_Byte)  { Arg.K = FArgIR::Byte; return true; }
     if (To.compare(0, 5, "TSoft") == 0)
     {
@@ -2159,9 +2192,24 @@ bool FCompiler::ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgI
         if (From.compare(0, 5, "TSoft") == 0) return true;
     }
 
+    /* C++ truncates a float toward zero: FTrunc/FTrunc64 (FMath::TruncToInt, the Blueprint autocast). Conv.json
+       has no such row, and the FString round trip prints 6 decimals first, making 0.99999994f 1. */
+    if (FromKind == SK_Float && (ToKind == SK_Int || ToKind == SK_Int64))
+    {
+        WrapInCall(Arg, BP.EngineFunction("/Script/Engine", "KismetMathLibrary", ToKind == SK_Int ? "FTrunc" : "FTrunc64"));
+        Arg.InnerType = To;
+        return true;
+    }
+
     if (const FConv* Direct = FindConv(From, To)) { ApplyConv(*Direct, BP, Arg); return true; }
+    /* A uint8 or a bool has no Conv_ row to int64, but int32 holds every value it can be. */
+    if (const FConv *In = FindConv(From, "int"), *Out = FindConv("int", To);
+        In && Out && (FromNum == SK_Byte || FromNum == SK_Bool) && ToKind == SK_Int64)
+    { ApplyConv(*In, BP, Arg); ApplyConv(*Out, BP, Arg); return true; }
+    const auto IsNumber = [](EStrKind K) { return K == SK_Int || K == SK_Int64 || K == SK_Float || K == SK_Bool || K == SK_Byte; };
     for (const char* Via : {"FString", "FText"})     // FText: int64 has no engine Conv_Int64ToString
     {
+        if (IsNumber(FromKind) && IsNumber(ToKind)) break;     // text would round or reject what C++ converts exactly
         const FConv* In  = FindConv(From, Via);
         const FConv* Out = FindConv(Via, To);
         if (In && Out) { ApplyConv(*In, BP, Arg); ApplyConv(*Out, BP, Arg); return true; }
@@ -2381,6 +2429,7 @@ bool FCompiler::LowerDispatcherCall(const Json& Call, const Json& Callee, const 
     Out.K = FArgIR::Call;
     Out.Sub = std::make_shared<FCallIR>();
     FCallIR& C = *Out.Sub;
+    C.bOnArg0 = true;
     C.Args.emplace_back();
     if (!LowerArg(Obj, BP, C.Args[0], Err)) return false;
     if (C.Args[0].K != FArgIR::Field) { *Err = "a dispatcher must be a property: " + Method; return false; }
@@ -2487,6 +2536,27 @@ bool IsReinterpret(const std::string& Intrinsic)
 bool IsBranch(const std::string& Intrinsic)
 {
     return Intrinsic == "__AndAlso__" || Intrinsic == "__OrElse__" || Intrinsic == "__Select__";
+}
+
+/* The arguments a Kismet container function writes, as FCallIR::WrittenArgs (the container is argument 0): the
+   container of a mutator, each out parameter, and a same-typed input it reads in place while writing (Append's source,
+   Union's sets: `A.Append(A)` would read what it grows). Any other function may write all of them. */
+uint64 ContainerWrites(const std::string& Fn)
+{
+    static const std::map<std::string, uint64> Writes = {
+        { "Array_Add", 1 }, { "Array_AddUnique", 1 }, { "Array_Append", 3 }, { "Array_Clear", 1 }, { "Array_Contains", 0 },
+        { "Array_Find", 0 }, { "Array_Get", 4 }, { "Array_Identical", 0 }, { "Array_Insert", 1 }, { "Array_IsValidIndex", 0 },
+        { "Array_LastIndex", 0 }, { "Array_Length", 0 }, { "Array_Random", 6 }, { "Array_RandomFromStream", 14 },
+        { "Array_Remove", 1 }, { "Array_RemoveItem", 1 }, { "Array_Resize", 1 }, { "Array_Reverse", 1 }, { "Array_Set", 1 },
+        { "Array_Shuffle", 1 }, { "Array_Swap", 1 },
+        { "Set_Add", 1 }, { "Set_AddItems", 1 }, { "Set_Clear", 1 }, { "Set_Contains", 0 }, { "Set_Difference", 7 },
+        { "Set_Intersection", 7 }, { "Set_Length", 0 }, { "Set_Remove", 1 }, { "Set_RemoveItems", 1 }, { "Set_ToArray", 2 },
+        { "Set_Union", 7 },
+        { "Map_Add", 1 }, { "Map_Clear", 1 }, { "Map_Contains", 0 }, { "Map_Find", 4 }, { "Map_Keys", 2 }, { "Map_Length", 0 },
+        { "Map_Remove", 1 }, { "Map_Values", 2 },
+    };
+    auto W = Writes.find(Fn);
+    return W == Writes.end() ? ~uint64(0) : W->second;
 }
 
 bool IsStored(const FArgIR& A)
@@ -2652,13 +2722,32 @@ bool FCompiler::ReadThrough(FArgIR Addr, const std::string& Pointee, FBlueprintC
 {
     const FReadViewSpec* V = ViewFor(Pointee);
     if (!V) { *Err = "TODO: a whole " + Pointee + " through a pointer; P->Member reaches its members"; return false; }
+    const std::string P = StripTypeKeywords(Pointee);
+    /* The int32 view would read it signed: 0xFFFFFFFF would widen and compare as -1. */
+    if (P == "uint32" || P == "unsigned int")
+    { *Err = "TODO: reading a uint32 through a pointer (Kismet has no unsigned 32-bit int); read it as int32 or int64"; return false; }
     Out = FArgIR();
     Out.K = FArgIR::Call;
     Out.InnerType = V->ResultType;
     Out.Sub = std::make_shared<FCallIR>();
     Out.Sub->Intrinsic = V->Intrinsic;
     Out.Sub->Args.push_back(std::move(Addr));
-    if (StripTypeKeywords(Pointee) != "bool") return true;
+    if (P == "int8" || P == "signed char" || P == "char")
+    {
+        /* The byte view reads unsigned; (B ^ 0x80) - 0x80 is the sign-extended int C++ promotes the byte to. */
+        WrapInCall(Out, BP.EngineFunction("/Script/Engine", "KismetMathLibrary", "Conv_ByteToInt"));
+        for (const char* Fn : { "Xor_IntInt", "Subtract_IntInt" })
+        {
+            WrapInCall(Out, BP.EngineFunction("/Script/Engine", "KismetMathLibrary", Fn));
+            FArgIR Bias;
+            Bias.K = FArgIR::Int;
+            Bias.I = 0x80;
+            Out.Sub->Args.push_back(Bias);
+        }
+        Out.InnerType = "int32";
+        return true;
+    }
+    if (P != "bool") return true;
     WrapInCall(Out, BP.EngineFunction("/Script/Engine", "KismetMathLibrary", "NotEqual_ByteByte"));
     FArgIR Zero;
     Zero.K = FArgIR::Byte;
@@ -2823,9 +2912,9 @@ bool FCompiler::LowerPtrCastSource(const Json& Call, FBlueprintClass& BP, FArgIR
 /* The operand of a StructMember reinterpretation (__AddrOf__, __AsObject__, __NameIndex__) that is not stored
    anywhere goes into a temp first: EX_StructMemberContext reads the storage the operand leaves behind. */
 bool FCompiler::HoistOperand(FArgIR& Operand, FBlueprintClass& BP, std::vector<FPropertyDef>& Locals,
-                             std::vector<FStmtIR>& OutPre, std::string* Err)
+                             std::vector<FStmtIR>& OutPre, std::string* Err, bool bAlways)
 {
-    if (IsStored(Operand)) return true;
+    if (!bAlways && IsStored(Operand)) return true;
     const std::string Type = Operand.K == FArgIR::Int64 ? std::string("int64")
                            : Operand.K == FArgIR::Self ? std::string("class UObject *") : Operand.InnerType;
     const std::string Tmp = "__PtrTmp" + std::to_string(ReadTmpCounter++) + "__";
@@ -2868,6 +2957,14 @@ bool FCompiler::LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, 
     for (const Json* W = &ArgNode; W; W = Kind(*W) == "ImplicitCastExpr" || Kind(*W) == "ParenExpr" ? First(*W) : nullptr)
         if (FConstVal V; Kind(*W) == "ConstantExpr" && W->contains("value") && FoldConst(ArgNode, V) && ConstToArg(V, OuterType, Out))
             return true;
+    /* Strip peels every cast, but one that changes the value - to bool, to a narrower integer, float to integer - must
+       still happen: `(uint8)V + X` wraps V, `(bool)F + X` adds 0 or 1. The value is lowered as that cast's type, and
+       only then converted to the slot's. Over constants FoldConst runs the whole chain. */
+    if (const Json* Cut = ValueCastBelow(ArgNode))
+    {
+        if (FConstVal V; FoldConst(ArgNode, V) && ConstToArg(V, OuterType, Out)) return true;
+        return LowerArg(*Cut, BP, Out, Err) && ConvertArg(OuterType, BP, Out, Err);
+    }
     const Json* N = Strip(&ArgNode);
     if (!N) { *Err = "empty argument expression"; return false; }
     /* Arithmetic, a comparison or logic over constants is the constant it comes to: no Kismet call left to run. */
@@ -2876,6 +2973,19 @@ bool FCompiler::LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, 
         if (FConstVal V; FoldConst(ArgNode, V) && ConstToArg(V, OuterType, Out)) return true;
     if (!LowerArgRaw(*N, OuterType, BP, Out, Err)) return false;
     if (Out.InnerType.empty()) Out.InnerType = TypeOf(*N);
+    /* Strip looked through the casts, but an explicit narrowing inside a wider slot (`(uint8)*P + 1`
+       of a sign-extended byte, `(uint8)X` returned as int) still wraps, innermost first. */
+    std::vector<std::string> Narrowings;
+    for (const Json* W = &ArgNode; W && W != N; W = First(*W))
+        if (const std::string K = Kind(*W); K == "CStyleCastExpr" || K == "CXXStaticCastExpr" || K == "CXXFunctionalCastExpr")
+            Narrowings.push_back(TypeOf(*W));
+    for (auto It = Narrowings.rbegin(); It != Narrowings.rend(); ++It)
+    {
+        const EStrKind From = KindOfLowered(Out, Out.InnerType), To = StrKindOf(Canon(*It));
+        if (((To == SK_Byte && (From == SK_Int || From == SK_Int64)) || (To == SK_Int && From == SK_Int64))
+            && !ConvertArg(*It, BP, Out, Err))
+            return false;
+    }
     return ConvertArg(OuterType, BP, Out, Err);
 }
 
@@ -2995,6 +3105,8 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             Out.K = FArgIR::Call;
             Out.Sub = std::make_shared<FCallIR>();
             Out.Sub->Fn = BP.EngineFunction("/Script/Engine", Lib, Prefix + Method);
+            Out.Sub->WrittenArgs = ContainerWrites(Prefix + Method);
+            Out.Sub->bOnArg0 = true;
             Out.Sub->Args.push_back(Target);
             bool bFirst = true, bOk = true;
             std::string LastType;
@@ -3084,6 +3196,8 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
                 Out.K = FArgIR::Call;
                 Out.Sub = std::make_shared<FCallIR>();
                 Out.Sub->Fn = BP.EngineFunction("/Script/Engine", "BlueprintMapLibrary", "Map_Find");
+                Out.Sub->WrittenArgs = ContainerWrites("Map_Find");
+                Out.Sub->bOnArg0 = true;
                 FArgIR Into;
                 Into.K = FArgIR::Local;
                 Into.S = Tmp;
@@ -3110,6 +3224,8 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             auto Body = std::make_shared<std::vector<FStmtIR>>(1);
             (*Body)[0].K = FStmtIR::StaticCall;
             (*Body)[0].Call.Fn = BP.EngineFunction("/Script/Engine", "BlueprintMapLibrary", "Map_Find");
+            (*Body)[0].Call.WrittenArgs = ContainerWrites("Map_Find");
+            (*Body)[0].Call.bOnArg0 = true;
             (*Body)[0].Call.Args = { Map, Key, Into };
             auto Block = std::make_shared<std::vector<FStmtIR>>(1);
             (*Block)[0].K = FStmtIR::Block;
@@ -3513,23 +3629,42 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         {
             if (Kind(*RhsRaw) != "IntegerLiteral")
             { *Err = "bit shift with a non-constant amount (Kismet has no shift op; use explicit multiply/divide)"; return false; }
+            /* A shift has the promoted LHS type (no usual arithmetic conversions): `int >> 1LL` is int32 math. */
+            const bool bWide = IsInt64Type(LhsC);
             const int N = std::stoi(RhsRaw->value("value", std::string("0")));
-            if (N < 0 || N > 63)
+            if (N < 0 || N > (bWide ? 63 : 31))
             { *Err = "bit shift amount out of range: " + std::to_string(N); return false; }
-            const bool bWide = Flavour == "Int64Int64";
-            const std::string MathFn = (Op == "<<" ? "Multiply_" : "Divide_") + std::string(bWide ? "Int64Int64" : "IntInt");
-            Out.K = FArgIR::Call;
-            Out.Sub = std::make_shared<FCallIR>();
-            Out.Sub->Fn = BP.EngineFunction("/Script/Engine", "KismetMathLibrary", MathFn);
-            Out.Sub->bScript = false;
-            Out.Sub->bPure = true;
-            FArgIR LA, RA;
+            const std::string Suffix = bWide ? "Int64Int64" : "IntInt";
+            auto Const = [&](int64 V) {
+                FArgIR C;
+                C.K = bWide ? FArgIR::Int64 : FArgIR::Int;
+                C.I = int32(V);
+                C.I64 = V;
+                return C;
+            };
+            auto Math = [&](const std::string& Fn, FArgIR A, FArgIR B) {
+                FArgIR C;
+                C.K = FArgIR::Call;
+                C.Sub = std::make_shared<FCallIR>();
+                C.Sub->Fn = BP.EngineFunction("/Script/Engine", "KismetMathLibrary", Fn + Suffix);
+                C.Sub->bScript = false;
+                C.Sub->bPure = true;
+                C.Sub->Args = { std::move(A), std::move(B) };
+                return C;
+            };
+            FArgIR LA;
             if (!LowerArg(*LhsRaw, BP, LA, Err)) return false;
-            RA.K = bWide ? FArgIR::Int64 : FArgIR::Int;
-            RA.I = int32(1LL << N);
-            RA.I64 = 1LL << N;
-            Out.Sub->Args.push_back(std::move(LA));
-            Out.Sub->Args.push_back(std::move(RA));
+            const std::string LhsBare = StripTypeKeywords(LhsTy);
+            const bool bSigned = LhsBare.find("unsigned") == std::string::npos && LhsBare.compare(0, 4, "uint") != 0;
+            if (Op == ">>" && bSigned && N > 0)
+            {
+                /* Signed >> floors, Divide truncates toward zero (-3 >> 1 is -2, -3 / 2 is -1): clearing the low
+                   N bits first makes the division exact. At N = width-1 the divisor wraps to MIN, which negates. */
+                Out = Math("Divide_", Math("And_", std::move(LA), Const(~((1LL << N) - 1))), Const(1LL << N));
+                if (N == (bWide ? 63 : 31)) Out = Math("Multiply_", std::move(Out), Const(-1));
+                return true;
+            }
+            Out = Math(Op == "<<" ? "Multiply_" : "Divide_", std::move(LA), Const(1LL << N));
             return true;
         }
         const std::string MathFn = MathFuncFor(Op, Flavour);
@@ -3658,6 +3793,50 @@ static bool IsSideEffectFree(const Json& N)
     return bFree;
 }
 
+/* True for `this` and literals: nothing the code in between runs can change them. */
+static bool IsFixedValue(const Json& N)
+{
+    const std::string K = Kind(N);
+    if (K == "ParenExpr" || K == "ImplicitCastExpr" || K == "CStyleCastExpr" || K == "CXXStaticCastExpr" || K == "ConstantExpr")
+        return N.contains("inner") && N["inner"].size() == 1 && IsFixedValue(N["inner"][0]);
+    return K == "CXXThisExpr" || K.find("Literal") != std::string::npos;
+}
+
+/* IsSideEffectFree, also allowing TArray element reads. */
+static bool IsPlainRead(const Json& N)
+{
+    if (IsTArrayElement(N) && N["inner"].size() == 3)
+        return IsPlainRead(N["inner"][1]) && IsPlainRead(N["inner"][2]);
+    if (!N.contains("inner")) return IsSideEffectFree(N);
+    Json Node = N;
+    Node.erase("inner");
+    bool bFree = IsSideEffectFree(Node);
+    ForEach(N, [&](const Json& C) { bFree = bFree && IsPlainRead(C); });
+    return bFree;
+}
+
+/* What locates lvalue N (a pointer, an index, a key): bReads when any of it can change, bActs when any of it has
+   side effects. A variable named directly is located by nothing; a TArray element always reads the array's storage,
+   which a resize moves. */
+static void Locators(const Json& N, bool& bReads, bool& bActs)
+{
+    const std::string K = Kind(N);
+    auto Value = [&](const Json& V) { bReads = bReads || !IsFixedValue(V); bActs = bActs || !IsPlainRead(V); };
+    if (K == "ParenExpr" || (K == "ImplicitCastExpr" && N.value("castKind", std::string()) == "NoOp")
+        || (K == "MemberExpr" && !N.value("isArrow", false)))
+        Locators(N["inner"][0], bReads, bActs);
+    else if (K == "MemberExpr" || (K == "UnaryOperator" && N.value("opcode", std::string()) == "*"))
+        Value(N["inner"][0]);
+    else if ((IsTArrayElement(N) || IsTMapElement(N)) && N["inner"].size() == 3)
+    {
+        bReads = bReads || IsTArrayElement(N);
+        Locators(N["inner"][1], bReads, bActs);
+        Value(N["inner"][2]);
+    }
+    else if (K != "DeclRefExpr")
+        bReads = bActs = true;
+}
+
 /* A fresh local initialised from Init, declared into Pre; returns an rvalue read of it. */
 Json FCompiler::SynthLocal(const std::string& Type, const Json& Init, Json& Pre)
 {
@@ -3672,29 +3851,31 @@ Json FCompiler::SynthLocal(const std::string& Type, const Json& Init, Json& Pre)
              { "inner", Json::array({ Ref }) } };
 }
 
-/* An rvalue N, parked in a local unless reading it again is harmless. */
-Json FCompiler::HoistExpr(const Json& N, Json& Pre)
+/* An rvalue N, parked in a local unless reading it again is harmless. bPin also parks a variable, which code
+   run in between may reassign. */
+Json FCompiler::HoistExpr(const Json& N, Json& Pre, bool bPin)
 {
-    if (IsSideEffectFree(N)) return N;
+    if (bPin ? IsFixedValue(N) : IsSideEffectFree(N)) return N;
     return SynthLocal(StripTypeKeywords(TypeOf(N)), N, Pre);
 }
 
 /* The same place as lvalue N, with whatever locates it (an index, a pointer from a call) evaluated into Pre
-   once. The place itself is not copied: the store has to land in it. */
-Json FCompiler::StabilizeLvalue(const Json& N, Json& Pre)
+   once. The place itself is not copied: the store has to land in it. bPin fixes the place for a stretch of
+   code that may reassign what locates it (`P = Q` in a range-for body), not just for side effects. */
+Json FCompiler::StabilizeLvalue(const Json& N, Json& Pre, bool bPin)
 {
-    if (IsSideEffectFree(N)) return N;
+    if (!bPin && IsSideEffectFree(N)) return N;
     const std::string K = Kind(N);
     Json Out = N;
     if (K == "ParenExpr" || (K == "ImplicitCastExpr" && N.value("castKind", std::string()) == "NoOp")
         || (K == "MemberExpr" && !N.value("isArrow", false)))
-        Out["inner"][0] = StabilizeLvalue(N["inner"][0], Pre);
+        Out["inner"][0] = StabilizeLvalue(N["inner"][0], Pre, bPin);
     else if (K == "MemberExpr" || (K == "UnaryOperator" && N.value("opcode", std::string()) == "*"))
-        Out["inner"][0] = HoistExpr(N["inner"][0], Pre);                  // `P->X`, `*P`: the pointer is a value
+        Out["inner"][0] = HoistExpr(N["inner"][0], Pre, bPin);            // `P->X`, `*P`: the pointer is a value
     else if ((IsTArrayElement(N) || IsTMapElement(N)) && N["inner"].size() == 3)
     {
-        Out["inner"][1] = StabilizeLvalue(N["inner"][1], Pre);           // the container is a place too
-        Out["inner"][2] = HoistExpr(N["inner"][2], Pre);
+        Out["inner"][1] = StabilizeLvalue(N["inner"][1], Pre, bPin);     // the container is a place too
+        Out["inner"][2] = HoistExpr(N["inner"][2], Pre, bPin);
     }
     // ponytail: anything else (a call returning T&) is left to evaluate twice; a pointer local fixes it if one shows up.
     return Out;
@@ -3708,12 +3889,14 @@ bool FCompiler::DesugarUpdate(const Json& S, Json& Wrap, std::string* Result, st
     const Json* Orig = Nth(S, 0);
     if (!Orig || (!bStep && !Nth(S, 1))) { *Err = "`" + Op + "` with no destination"; return false; }
 
-    /* X is located once. C++17 sequences Y before X in `X op= Y`, so a Y that must not move past X's side
-       effects goes first. */
+    /* X is located once. C++17 sequences Y before X in `X op= Y`, so a Y that must not move past what locates X
+       (its side effects, or an index Y changes) goes first. */
     Json Pre = Json::array(), LhsPre = Json::array();
     const Json LhsNode = StabilizeLvalue(*Orig, LhsPre);
     Json Rhs = bStep ? Json{ {"kind", "IntegerLiteral"}, {"type", {{"qualType", "int"}}}, {"value", "1"} } : *Nth(S, 1);
-    if (!LhsPre.empty()) Rhs = HoistExpr(Rhs, Pre);
+    bool bLocReads = false, bLocActs = false;
+    Locators(*Orig, bLocReads, bLocActs);
+    if (bLocReads && (bLocActs || !IsPlainRead(Rhs))) Rhs = HoistExpr(Rhs, Pre, true);
     for (Json& D : LhsPre) Pre.push_back(std::move(D));
     const Json* Lhs = &LhsNode;
 
@@ -3771,6 +3954,19 @@ bool FCompiler::LowerUpdateValue(const Json& N, FBlueprintClass& BP, FArgIR& Out
     Out.Sub->InlineResult = Result;
     Out.Sub->InlineType = Type;
     return true;
+}
+
+/* What a defaulted argument stands for. clang 18 writes the CXXDefaultArgExpr with no child, and the default is the
+   parameter's own initialiser (instantiated, in a template's instantiation); a newer clang nests it in the node. */
+const Json* DefaultedArg(const Json& Arg, const Json* Parm)
+{
+    if (Kind(Arg) != "CXXDefaultArgExpr" || First(Arg) || !Parm) return &Arg;
+    const Json* Init = nullptr;
+    ForEach(*Parm, [&](const Json& C) {
+        const std::string K = Kind(C);
+        if (!Init && (K.size() < 4 || K.compare(K.size() - 4, 4, "Attr") != 0)) Init = &C;
+    });
+    return Init ? Init : &Arg;
 }
 
 bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR& Out, std::string* Err)
@@ -3876,13 +4072,17 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
                 const std::string T = TypeOf(C);
                 if (Kind(C) == "ParmVarDecl" && !T.empty() && T.back() == '&' && T.compare(0, 6, "const ") != 0) bOutParm = true;
             });
+            Out.WrittenArgs = bOutParm ? ~uint64(0) : 0;
             Out.bPure = !bOutParm && (IsPureDecl(*Decl->second) || (Def != R->MethodDefs.end() && IsPureDecl(*Def->second)));
         }
+        /* The overload called, by its decl id: same-name inline overloads are all legal, none is a UFunction. */
+        if (auto Inl = R->Inlines.find(DeclId); Inl != R->Inlines.end())
+            return ExpandInline(CallExprNode, *Inl->second, R->CppName + "::" + MethodName, true, BP, Out, Err);
+        /* A non-inline overload of a name Generate skips as inline (it goes by name): there is no UFunction to call. */
         if (Decl != R->Methods.end() && IsInlineMethod(*R, MethodName))
         {
-            auto DefIt = R->MethodDefs.find(MethodName);
-            return ExpandInline(CallExprNode, DefIt != R->MethodDefs.end() ? *DefIt->second : *Decl->second,
-                                R->CppName + "::" + MethodName, true, BP, Out, Err);
+            *Err = R->CppName + "::" + MethodName + ": TODO: an overload set may not mix inline and non-inline functions";
+            return false;
         }
 
         /* `Base::Method()` on this, from a class that declares Method itself. C++ name hiding leaves only the qualified
@@ -3940,11 +4140,17 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         if (bOk) Out.Args.push_back(A);
         Defaulted.push_back(false);
     }
+    /* The called declaration's parameters, for a defaulted argument: FullDecl, when it has the call's arity. */
+    std::vector<const Json*> CalledParms;
+    if (FullDecl) ForEach(*FullDecl, [&](const Json& C) { if (Kind(C) == "ParmVarDecl") CalledParms.push_back(&C); });
+    if (CalledParms.size() != (Receiver ? 1u : 0u) + (CallExprNode.contains("inner") ? CallExprNode["inner"].size() - 1 : 0u))
+        CalledParms.clear();
     ForEach(CallExprNode, [&](const Json& C) {
         if (bFirst) { bFirst = false; return; }
         if (!bOk) return;
         FArgIR A;
-        bOk = LowerArg(C, BP, A, Err);
+        const size_t I = Defaulted.size();
+        bOk = LowerArg(*DefaultedArg(C, I < CalledParms.size() ? CalledParms[I] : nullptr), BP, A, Err);
         if (bOk) Out.Args.push_back(A);
         Defaulted.push_back(Kind(C) == "CXXDefaultArgExpr");
     });
@@ -4595,6 +4801,15 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
         std::string SetField;                           // the property,
         std::shared_ptr<FArgIR> SetObject;              // and the object, null for self
         const std::string K = Kind(*S);
+        /* A loop's condition runs on every trip too, so an inline expanded in it re-enters (the __Fresh twin);
+           it is not LoopDepth, which would let a break / continue there through. */
+        auto LowerCond = [&](const Json& Cond) -> bool {
+            ++ReEntered;
+            const bool bCondOk = LowerArg(Cond, BP, St.Cond, Err);
+            --ReEntered;
+            if (!bCondOk) bOk = false;
+            return bCondOk;
+        };
         if (K == "DeclStmt")
         {
             /* clang groups comma-declared vars under one DeclStmt. */
@@ -4731,6 +4946,20 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 if (A == RefAlias.end()) break;
                 Lhs = Strip(&A->second);
             }
+            /* C++17 sequences the right side of `=` before the left, but the engine locates a Let's destination
+               (its object, array and index) first, and a map store takes its key first. So a value that must not
+               move past what locates the destination goes into a local first. */
+            bool bLocReads = false, bLocActs = false;
+            Locators(*Lhs, bLocReads, bLocActs);
+            Json Parked;
+            if (bLocReads && !IsFixedValue(*Rhs) && (bLocActs || !IsPlainRead(*Rhs)))
+            {
+                Json Pre = Json::array();
+                Parked = SynthLocal(StripTypeKeywords(TypeOf(*Rhs)), *Rhs, Pre);
+                const Json Wrap = { { "kind", "CompoundStmt" }, { "inner", std::move(Pre) } };
+                if (!LowerBody(Wrap, BP, Out, Locals, Err)) { bOk = false; return; }
+                Rhs = &Parked;
+            }
             const std::string LK = Kind(*Lhs);
             if (IsDerefLvalue(*Lhs))
             {
@@ -4779,6 +5008,8 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 /* `Map[Key] = v`: Map_Add, which replaces the value of a key already there. */
                 St.K = FStmtIR::StaticCall;
                 St.Call.Fn = BP.EngineFunction("/Script/Engine", "BlueprintMapLibrary", "Map_Add");
+                St.Call.WrittenArgs = ContainerWrites("Map_Add");
+                St.Call.bOnArg0 = true;
                 St.Call.Args.resize(3);
                 bOk = LowerArg(*Nth(*Lhs, 1), BP, St.Call.Args[0], Err) && LowerArg(*Nth(*Lhs, 2), BP, St.Call.Args[1], Err)
                    && LowerArg(*Rhs, BP, St.Call.Args[2], Err);
@@ -4826,6 +5057,8 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 if (!LowerArg(*First(*S), BP, Store.Value, Err)) { bOk = false; return; }
                 Out.push_back(std::move(Store));
             }
+            /* Leaving the body's by-reference TMap range-fors: their values go back first. */
+            Out.insert(Out.end(), WriteBacks.rbegin(), WriteBacks.rend());
             St.K = FStmtIR::InlineReturn;
         }
         else if (K == "ReturnStmt")
@@ -4835,6 +5068,32 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             {
                 St.bHasValue = true;
                 bOk = LowerArg(*First(*S), BP, St.Value, Err);
+            }
+            /* Leaving by-reference TMap range-fors: the value is taken first (it may still change theirs), then each
+               loop's value goes back into its map, innermost first. */
+            if (bOk && !WriteBacks.empty())
+            {
+                const std::string RetTy = St.bHasValue ? StripTypeKeywords(TypeOf(*First(*S))) : std::string();
+                if (!RetTy.empty() && RetTy != "void")
+                {
+                    const std::string Temp = "__Ret" + std::to_string(ReadTmpCounter++) + "__";
+                    FPropertyDef PD;
+                    if (!TypeToProperty(RetTy, Temp, 0, "return value", BP, &PD, Err)) { bOk = false; return; }
+                    PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+                    Locals.push_back(PD);
+                    FStmtIR Store;
+                    Store.K = FStmtIR::Assign;
+                    Store.Var.K = FArgIR::Local;
+                    Store.Var.S = Temp;
+                    Store.Var.LetOp = LetOpFor(RetTy);
+                    Store.bAssignLocal = true;
+                    Store.Value = std::move(St.Value);
+                    Out.push_back(std::move(Store));
+                    St.Value = FArgIR();
+                    St.Value.K = FArgIR::Local;
+                    St.Value.S = Temp;
+                }
+                Out.insert(Out.end(), WriteBacks.rbegin(), WriteBacks.rend());
             }
         }
         else if (K == "IfStmt")
@@ -4941,6 +5200,10 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             const std::string TempTy = bName ? "FName" : Width == 1 ? "uint8" : Width == 8 ? "int64" : "int32";
             const char* NotEqual = bName ? "NotEqual_NameName" : Width == 1 ? "NotEqual_ByteByte"
                                  : Width == 8 ? "NotEqual_Int64Int64" : "NotEqual_IntInt";
+            /* The promoted value of a byte is 0..255 (-128..127 signed): a case outside that never matches, and its
+               ByteConst would wrap onto one that does. */
+            const std::string ByteTy = Width == 1 ? StripTypeKeywords(TypeOf(*Strip(Cond))) : std::string();
+            const bool bSignedByte = ByteTy == "int8" || ByteTy == "signed char" || ByteTy == "char";
 
             const std::string Temp = "__Switch" + std::to_string(ReadTmpCounter++) + "__";
             FPropertyDef PD;
@@ -4995,7 +5258,16 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                         Const.K = FArgIR::Name;
                         if (!FindLiteral(*Value, Const.S)) { *Err = "a case of UE_NAME_SWITCH needs UE_NAME_CASE(\"Text\")"; return false; }
                     }
-                    else if (Width == 1) { Const.K = FArgIR::Byte; Const.I = int32(V); }
+                    else if (Width == 1)
+                    {
+                        if (V < (bSignedByte ? -128 : 0) || V > (bSignedByte ? 127 : 255))
+                        {
+                            L.LabelId = -1;                 // reached only by falling through
+                            St.Body->push_back(L);
+                            return !Sub || Flatten(*Sub);
+                        }
+                        Const.K = FArgIR::Byte; Const.I = int32(V);
+                    }
                     else if (Width == 8) { Const.K = FArgIR::Int64; Const.I64 = V; }
                     else { Const.K = FArgIR::Int; Const.I = int32(V); }
                     FArgIR Value0;
@@ -5058,7 +5330,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
 
             St.K = FStmtIR::While;
             St.bPostTest = true;
-            if (!LowerArg(*Cond, BP, St.Cond, Err)) { bOk = false; return; }
+            if (!LowerCond(*Cond)) return;
             St.Body = std::make_shared<std::vector<FStmtIR>>();
             Json Wrap = Kind(*Body) == "CompoundStmt" ? *Body
                       : Json{ {"kind", "CompoundStmt"}, {"inner", Json::array({*Body})} };
@@ -5068,7 +5340,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
         }
         else if (K == "GotoStmt")
         {
-            if (WriteBackDepth > 0)
+            if (!WriteBacks.empty())
             {
                 *Err = "a goto inside a TMap range-for that writes its value back would skip the write: "
                        "bind `const auto& [Key, Value]`, or leave with break";
@@ -5116,7 +5388,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             if (!Cond || !Body) { *Err = "`while` with a missing condition or body"; bOk = false; return; }
 
             St.K = FStmtIR::While;
-            if (!LowerArg(*Cond, BP, St.Cond, Err)) { bOk = false; return; }
+            if (!LowerCond(*Cond)) return;
             St.Body = std::make_shared<std::vector<FStmtIR>>();
             ++LoopDepth;
             if (Kind(*Body) == "CompoundStmt")
@@ -5151,7 +5423,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             }
 
             St.K = FStmtIR::While;
-            if (!LowerArg(*Cond, BP, St.Cond, Err)) { bOk = false; return; }
+            if (!LowerCond(*Cond)) return;
             St.Body = std::make_shared<std::vector<FStmtIR>>();
 
             Json WrapBody = Kind(*Body) == "CompoundStmt" ? *Body
@@ -5317,15 +5589,22 @@ int32 Mentions(const std::vector<FStmtIR>& Stmts, const std::string& Name)
     return N;
 }
 
-/* The read of local Name that runs exactly once whenever A does: not under a branch's later operands, an inline
-   body, an object or struct base (which may need a variable), or a call's target. */
-FArgIR* FindPlainRead(FArgIR& A, const std::string& Name)
+/* C may bind argument I to a reference it writes: a T& parameter, a container method's array or out value. */
+bool MayWriteArg(const FCallIR& C, size_t I)
 {
-    if (A.K == FArgIR::Local && A.S == Name && !A.Base) return &A;
+    return !C.bPure && !IsBranch(C.Intrinsic) && (I >= 64 || (C.WrittenArgs >> I & 1));
+}
+
+/* The read of local Name that runs exactly once whenever A does: not under a branch's later operands, an inline
+   body, an object or struct base (which may need a variable), or a call's target. Nor an argument bRefSlot says may
+   be written: the variable is the argument there, and another in its place would take the write. */
+FArgIR* FindPlainRead(FArgIR& A, const std::string& Name, bool bRefSlot = false)
+{
+    if (A.K == FArgIR::Local && A.S == Name && !A.Base) return bRefSlot ? nullptr : &A;
     if (A.K != FArgIR::Call || !A.Sub || A.Sub->Inline) return nullptr;
     const size_t Count = IsBranch(A.Sub->Intrinsic) ? std::min<size_t>(1, A.Sub->Args.size()) : A.Sub->Args.size();
     for (size_t I = 0; I < Count; ++I)
-        if (FArgIR* F = FindPlainRead(A.Sub->Args[I], Name)) return F;
+        if (FArgIR* F = FindPlainRead(A.Sub->Args[I], Name, MayWriteArg(*A.Sub, I))) return F;
     return nullptr;
 }
 
@@ -5386,7 +5665,8 @@ void FCompiler::ArgumentsInPlace(std::vector<FStmtIR>& Body, const std::vector<s
         FArgIR* Scope = nullptr;
         if (First.K == FStmtIR::StaticCall && !First.Target.Target && First.Target.Args.empty())
         {
-            for (FArgIR& A : First.Call.Args) if (!Read && (Read = FindPlainRead(A, Name))) Scope = &A;
+            for (size_t I = 0; I < First.Call.Args.size() && !Read; ++I)
+                if ((Read = FindPlainRead(First.Call.Args[I], Name, MayWriteArg(First.Call, I)))) Scope = &First.Call.Args[I];
         }
         else if ((First.K == FStmtIR::Assign || First.K == FStmtIR::Decl || First.K == FStmtIR::Return) && !First.Var.Base)
             Read = FindPlainRead(*(Scope = &First.Value), Name);
@@ -5442,7 +5722,8 @@ void FCompiler::ForwardSingleUse(std::vector<FStmtIR>& Stmts, const std::vector<
             FArgIR* Scope = nullptr;
             if (Next.K == FStmtIR::StaticCall && !Next.Target.Target && Next.Target.Args.empty())
             {
-                for (FArgIR& A : Next.Call.Args) if (!Read && (Read = FindPlainRead(A, Name))) Scope = &A;
+                for (size_t I = 0; I < Next.Call.Args.size() && !Read; ++I)
+                    if ((Read = FindPlainRead(Next.Call.Args[I], Name, MayWriteArg(Next.Call, I)))) Scope = &Next.Call.Args[I];
             }
             else if ((Next.K == FStmtIR::Assign || Next.K == FStmtIR::Decl || Next.K == FStmtIR::Return) && !Next.Var.Base)
                 Read = FindPlainRead(*(Scope = &Next.Value), Name);
@@ -5558,7 +5839,7 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
                              FCallIR& Out, std::string* Err, const Json* Receiver)
 {
     if (!CurLocals) { *Err = "internal: an inline call outside a function body"; return false; }
-    if (std::find(InlineStack.begin(), InlineStack.end(), Method) != InlineStack.end())
+    if (std::find(InlineStack.begin(), InlineStack.end(), &Def) != InlineStack.end())
     { *Err = "inline function " + Method + " calls itself"; return false; }
     if (bMethod && Kind(CallNode) == "CXXMemberCallExpr")
     {
@@ -5594,6 +5875,7 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
     if (Receiver) Args.push_back(Receiver);     // a forwarded method: the object is the free function's first parameter
     ForEach(CallNode, [&](const Json& C) { if (bFirst) { bFirst = false; return; } Args.push_back(&C); });
     if (Args.size() != Parms.size()) { *Err = "inline call to " + Method + " with " + std::to_string(Args.size()) + " arguments"; return false; }
+    for (size_t I = 0; I < Args.size(); ++I) Args[I] = DefaultedArg(*Args[I], Parms[I]);
     /* Every argument is lowered before any parameter is bound: an argument can expand this same function again
        (`Twice(Twice(V))`), and that expansion binds the parameters for itself. */
     auto Aliased = [&](size_t I) -> const Json* {
@@ -5692,24 +5974,27 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
         if (!AddLocal(Out.InlineResult, RetType)) return false;
     }
 
-    InlineStack.push_back(Method);
+    InlineStack.push_back(&Def);
     InlineResults.emplace_back(Out.InlineResult, RetType);
-    const int32 SavedLoops = LoopDepth, SavedSwitches = SwitchDepth, SavedWriteBacks = WriteBackDepth;
+    const int32 SavedLoops = LoopDepth, SavedSwitches = SwitchDepth;
+    std::vector<FStmtIR> SavedWriteBacks;
+    SavedWriteBacks.swap(WriteBacks);
     /* The body's break / continue are its own, so the caller's loops are not LoopDepth here; but the body still runs
        once per trip round them, and a declaration in it must start fresh each time (the __Fresh twin below). */
     const int32 SavedReEntered = ReEntered;
     ReEntered += (SavedLoops > 0 || bBodyHasGoto) ? 1 : 0;
-    LoopDepth = SwitchDepth = WriteBackDepth = 0;
+    LoopDepth = SwitchDepth = 0;
     /* Each expansion lowers the body again, so its labels get ids of their own. */
     std::map<std::string, int32> SavedLabels;
     SavedLabels.swap(GotoLabels);
     const bool bSavedHasGoto = bBodyHasGoto;
     bBodyHasGoto = HasGoto(*Body);
+    bFnHasGoto |= bBodyHasGoto;
     const bool bOk = LowerBody(*Body, BP, *B.Body, Locals, Err);
     LoopDepth = SavedLoops;
     ReEntered = SavedReEntered;
     SwitchDepth = SavedSwitches;
-    WriteBackDepth = SavedWriteBacks;
+    WriteBacks.swap(SavedWriteBacks);
     GotoLabels.swap(SavedLabels);
     bBodyHasGoto = bSavedHasGoto;
     InlineResults.pop_back();
@@ -5778,6 +6063,17 @@ bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vec
         if (!LowerBody(Wrap, BP, Out, Locals, Err)) return false;
     }
 
+    /* C++ binds the range once: whatever locates it (`Pick()->Items`, `Cur->Items` with `Cur = Next` in the
+       body) is evaluated into a local up front. */
+    Json RangePre = Json::array();
+    const Json StableRange = StabilizeLvalue(*RangeExpr, RangePre, true);
+    if (!RangePre.empty())
+    {
+        Json Wrap = { {"kind", "CompoundStmt"}, {"inner", std::move(RangePre)} };
+        if (!LowerBody(Wrap, BP, Out, Locals, Err)) return false;
+    }
+    RangeExpr = &StableRange;
+
     std::string RangeTy = TypeOf(*RangeExpr);
     while (!RangeTy.empty() && (RangeTy.back() == '&' || RangeTy.back() == ' ')) RangeTy.pop_back();
     RangeTy = StripTypeKeywords(RangeTy);
@@ -5799,6 +6095,7 @@ bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vec
         FStmtIR St;
         St.K = FStmtIR::StaticCall;
         St.Call.Fn = BP.EngineFunction("/Script/Engine", Lib, Fn);
+        St.Call.WrittenArgs = ContainerWrites(Fn);
         St.Call.Args = std::move(CallArgs);
         return St;
     };
@@ -5848,6 +6145,7 @@ bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vec
     Length.K = FArgIR::Call;
     Length.Sub = std::make_shared<FCallIR>();
     Length.Sub->Fn = BP.EngineFunction("/Script/Engine", "KismetArrayLibrary", "Array_Length");
+    Length.Sub->WrittenArgs = ContainerWrites("Array_Length");
     Length.Sub->Args = { Iter };
     Out.push_back(AssignStmt(Len, "int32", std::move(Length)));
 
@@ -5891,7 +6189,17 @@ bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vec
         FArgIR KeyAt;
         if (!LowerArg(Elem, BP, KeyAt, Err)) { --LoopDepth; return false; }
         Loop.Body->push_back(AssignStmt(Key, Args[0], std::move(KeyAt)));
-        Loop.Body->push_back(CallStmt("BlueprintMapLibrary", "Map_Find", { Range, LocalArg(Key), LocalArg(Val) }));
+        FStmtIR Find = CallStmt("BlueprintMapLibrary", "Map_Find", { Range, LocalArg(Key), LocalArg(Val) });
+        if (IsContainerType(StripTypeKeywords(Args[1])))
+        {
+            /* A nested container value is a wrapper struct: Map_Find fills a wrapper temp, then Val is its Value. */
+            FArgIR Call;
+            Call.K = FArgIR::Call;
+            Call.Sub = std::make_shared<FCallIR>(Find.Call);
+            if (!NestedWrapperOut(Args[1], 2, "", AssignStmt(Val, Args[1], FArgIR()), BP, Call, Err)) { --LoopDepth; return false; }
+            Find = Call.Sub->Inline->front();
+        }
+        Loop.Body->push_back(std::move(Find));
         RefAlias[Bindings[0]->value("id", std::string())] = RefToLocal(Key, Args[0]);
         RefAlias[Bindings[1]->value("id", std::string())] = RefToLocal(Val, Args[1]);
         const std::string PairTy = TypeOf(*LoopDecl);
@@ -5904,9 +6212,9 @@ bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vec
         }
     }
     Json BodyWrap = Kind(*Body) == "CompoundStmt" ? *Body : Json{ {"kind", "CompoundStmt"}, {"inner", Json::array({ *Body })} };
-    if (Loop.Trailer) ++WriteBackDepth;
+    if (Loop.Trailer) WriteBacks.push_back(Loop.Trailer->front());
     const bool bBodyOk = LowerBody(BodyWrap, BP, *Loop.Body, Locals, Err);
-    if (Loop.Trailer) --WriteBackDepth;
+    if (Loop.Trailer) WriteBacks.pop_back();
     if (!bBodyOk) { --LoopDepth; return false; }
     --LoopDepth;
     Loop.Inc->push_back(AssignStmt(Idx, "int32", Math("Add_IntInt", LocalArg(Idx), One)));
@@ -5997,7 +6305,12 @@ bool FCompiler::HoistReadsInArg(FArgIR& A, FBlueprintClass& BP,
     if ((A.K == FArgIR::Field || A.K == FArgIR::InterfaceCtx) && A.Base)
         return HoistReadsInArg(*A.Base, BP, Locals, OutPre, Err);
     if (A.K == FArgIR::Index && A.Base && A.Sub && A.Sub->Args.size() == 1)
-        return HoistReadsInArg(*A.Base, BP, Locals, OutPre, Err) && HoistReadsInArg(A.Sub->Args[0], BP, Locals, OutPre, Err);
+    {
+        if (!HoistReadsInArg(*A.Base, BP, Locals, OutPre, Err)) return false;
+        /* `GetCur()->Items[Swap()]`: E1 is sequenced before E2, so the object holding the array is pinned too. */
+        return PinHolder(*A.Base, &A.Sub->Args[0], 1, BP, Locals, OutPre, Err)
+            && HoistReadsInArg(A.Sub->Args[0], BP, Locals, OutPre, Err);
+    }
     if (A.K == FArgIR::DynCast && A.Sub)
         return HoistReadsInArg(A.Sub->Args[0], BP, Locals, OutPre, Err);
     if (A.K != FArgIR::Call || !A.Sub) return true;
@@ -6020,11 +6333,12 @@ bool FCompiler::HoistReadsInArg(FArgIR& A, FBlueprintClass& BP,
         return true;
     }
     if (A.Sub->Target && !HoistReadsInArg(*A.Sub->Target, BP, Locals, OutPre, Err)) return false;
+    if (A.Sub->Target && !PinObject(*A.Sub->Target, A.Sub->Args.data(), A.Sub->Args.size(), BP, Locals, OutPre, Err))
+        return false;
 
     /* Post-order: inner reads hoist before the outer. That way the outer's Addr can reference
        an already-materialised inner temp. */
-    for (FArgIR& CA : A.Sub->Args)
-        if (!HoistReadsInArg(CA, BP, Locals, OutPre, Err)) return false;
+    if (!HoistCallArgs(*A.Sub, BP, Locals, OutPre, Err)) return false;
 
     if (const FReadViewSpec* V = FindReadView(A.Sub->Intrinsic))
         return HoistReadCall(A, *V, BP, Locals, OutPre, Err);
@@ -6185,6 +6499,42 @@ bool ContainsRead(const FArgIR& A)
     return false;
 }
 
+/* C++17 evaluates a call's object before its arguments, but what the arguments hoist (inline bodies, && / ?: arms,
+   reads) runs ahead of the whole statement. So an object that could be different by then goes into a temp first. */
+bool FCompiler::PinObject(FArgIR& Obj, const FArgIR* After, size_t NumAfter, FBlueprintClass& BP,
+                          std::vector<FPropertyDef>& Locals, std::vector<FStmtIR>& OutPre, std::string* Err)
+{
+    if (std::none_of(After, After + NumAfter, [](const FArgIR& A) { return ContainsRead(A); })) return true;
+    if (Obj.K == FArgIR::InterfaceCtx && Obj.Base) return PinObject(*Obj.Base, After, NumAfter, BP, Locals, OutPre, Err);
+    if (Obj.K == FArgIR::Self || Obj.K == FArgIR::ObjConst || Obj.K == FArgIR::NullObj) return true;
+    if (Obj.K == FArgIR::Local && std::none_of(After, After + NumAfter, [&](const FArgIR& A) { return Mentions(A, Obj.S) > 0; }))
+        return true;
+    return HoistOperand(Obj, BP, Locals, OutPre, Err, true);
+}
+
+/* A field's storage is found through the object holding it, so that object is what gets pinned. */
+bool FCompiler::PinHolder(FArgIR& Place, const FArgIR* After, size_t NumAfter, FBlueprintClass& BP,
+                          std::vector<FPropertyDef>& Locals, std::vector<FStmtIR>& OutPre, std::string* Err)
+{
+    FArgIR* P = &Place;
+    while ((P->K == FArgIR::Member || P->K == FArgIR::Index) && P->Base) P = P->Base.get();
+    return P->K != FArgIR::Field || !P->Base || PinObject(*P->Base, After, NumAfter, BP, Locals, OutPre, Err);
+}
+
+/* `GetCur()->Items.Add(Swap())`, `GetCur()->Map[Swap()]`, `GetCur()->OnHit.Broadcast(Swap())`: the container or
+   dispatcher is argument 0, and as the call's object it is evaluated before the rest. */
+bool FCompiler::HoistCallArgs(FCallIR& C, FBlueprintClass& BP, std::vector<FPropertyDef>& Locals,
+                              std::vector<FStmtIR>& OutPre, std::string* Err)
+{
+    for (size_t I = 0; I < C.Args.size(); ++I)
+    {
+        if (!HoistReadsInArg(C.Args[I], BP, Locals, OutPre, Err)) return false;
+        if (I == 0 && C.bOnArg0 && !PinHolder(C.Args[0], C.Args.data() + 1, C.Args.size() - 1, BP, Locals, OutPre, Err))
+            return false;
+    }
+    return true;
+}
+
 bool FCompiler::HoistReadsInStmt(FStmtIR& St, FBlueprintClass& BP,
                                  std::vector<FPropertyDef>& Locals,
                                  std::vector<FStmtIR>& OutPre, std::string* Err)
@@ -6222,8 +6572,9 @@ bool FCompiler::HoistReadsInStmt(FStmtIR& St, FBlueprintClass& BP,
     if (!HoistReadsInArg(St.Value, BP, Locals, OutPre, Err)) return false;
     if (!HoistReadsInArg(St.Cond,  BP, Locals, OutPre, Err)) return false;
     if (St.Call.Target && !HoistReadsInArg(*St.Call.Target, BP, Locals, OutPre, Err)) return false;
-    for (FArgIR& CA : St.Call.Args)
-        if (!HoistReadsInArg(CA, BP, Locals, OutPre, Err)) return false;
+    if (St.Call.Target && !PinObject(*St.Call.Target, St.Call.Args.data(), St.Call.Args.size(), BP, Locals, OutPre, Err))
+        return false;
+    if (!HoistCallArgs(St.Call, BP, Locals, OutPre, Err)) return false;
     for (FArgIR& CA : St.Target.Args)
         if (!HoistReadsInArg(CA, BP, Locals, OutPre, Err)) return false;
     return true;
@@ -6299,10 +6650,11 @@ bool FCompiler::FoldConst(const Json& E, FConstVal& Out) const
                        || T == "int16" || T == "uint16" || IsInt64Type(T);
         if (!bWantFloat && !bInt) return false;
         if (bWantFloat) { V.F = T == "float" ? double(float(V.Num())) : V.Num(); V.bFloat = true; return true; }
+        /* A float goes to bool by comparing with zero, not by truncating (0.5f is true). */
+        if (T == "bool") { V.I = V.Num() != 0; V.bFloat = false; return true; }
         V.I = V.bFloat ? int64(V.F) : V.I;
         V.bFloat = false;
-        if (T == "bool") V.I = V.Num() != 0;
-        else if (T == "int" || T == "int32") V.I = int32(V.I);
+        if (T == "int" || T == "int32") V.I = int32(V.I);
         else if (T == "unsigned int" || T == "uint32") V.I = uint32(V.I);
         else if (T == "uint8" || T == "unsigned char") V.I = uint8(V.I);
         else if (T == "int8" || T == "signed char") V.I = int8(V.I);
@@ -6408,6 +6760,29 @@ bool FCompiler::FoldConst(const Json& E, FConstVal& Out) const
     else if (Op == ">>" && R.I >= 0 && R.I < 64) Out.I = L.I >> R.I;
     else return false;
     return Fit(Out);
+}
+
+/* The outermost cast below N, among those Strip peels off it, that changes the value it passes on: to bool, float to
+   int32 / int64, or an integer to a narrower one (int64 to int32, either to uint8). Only between Blueprint's own
+   types, which ConvertArg can convert; a widening or same-size cast keeps every value, so the chain skips it. */
+const Json* FCompiler::ValueCastBelow(const Json& N) const
+{
+    const Json* Leaf = Strip(&N);
+    if (Leaf == &N) return nullptr;
+    for (const Json* C = First(N); C && C != Leaf; C = First(*C))
+    {
+        const std::string K = Kind(*C), Cast = C->value("castKind", std::string());
+        if (K != "ImplicitCastExpr" && K != "CStyleCastExpr" && K != "CXXStaticCastExpr" && K != "CXXFunctionalCastExpr") continue;
+        const Json* From = First(*C);
+        if (!From) continue;
+        const EStrKind FK = StrKindOf(Canon(TypeOf(*From))), TK = StrKindOf(Canon(TypeOf(*C)));
+        const bool bNumber = FK == SK_Int || FK == SK_Int64 || FK == SK_Float || FK == SK_Byte;
+        if ((Cast == "FloatingToBoolean" || Cast == "IntegralToBoolean") && TK == SK_Bool && bNumber) return C;
+        if (Cast == "FloatingToIntegral" && FK == SK_Float && (TK == SK_Int || TK == SK_Int64)) return C;
+        if (Cast == "IntegralCast" && ((TK == SK_Byte && (FK == SK_Int || FK == SK_Int64)) || (TK == SK_Int && FK == SK_Int64)))
+            return C;
+    }
+    return nullptr;
 }
 
 /* `!C` with no Not_PreBool call, where there is such a thing: `!!X` is X, and a comparison turns round (`<` and `>=`,
@@ -7696,10 +8071,11 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         CurLocals = &Locals;
         LoopDepth = 0;
         SwitchDepth = 0;
-        WriteBackDepth = 0;
+        WriteBacks.clear();
         ReEntered = 0;
         GotoLabels.clear();
         bBodyHasGoto = Fn.Body && HasGoto(*Fn.Body);
+        bFnHasGoto = bBodyHasGoto;
         KeepLoaded.clear();
         CurFnName = Fn.Name;
         bCurNet = (NetFlagsOf(Decl) | NetFlagsOf(M)) != 0;
@@ -7726,7 +8102,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         if (!bCurNoOpt)
         {
             PruneConstBranches(Stmts);
-            if (!bBodyHasGoto && !bMadeLatentCall)
+            /* An inlined body's label re-enters the caller's statements too, and these passes see only While loops. */
+            if (!bFnHasGoto && !bMadeLatentCall)
             {
                 FlattenBlocks(Stmts);
                 DropOverwritten(Stmts);
@@ -7734,7 +8111,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             }
             DropUnusedPure(Stmts);
             DropUnusedLocals(Stmts, Locals);
-            if (!bBodyHasGoto && !bMadeLatentCall) CoalesceTemps(Stmts, Locals, BP);
+            if (!bFnHasGoto && !bMadeLatentCall) CoalesceTemps(Stmts, Locals, BP);
         }
         for (const auto& [Struct, Keep] : KeepLoaded)
         {
@@ -8069,11 +8446,14 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
                     const std::string& OutDir, const std::optional<std::string>& InApiDir, std::string* Err)
 {
     ApiDir = InApiDir;
-    SourceDir = std::filesystem::path(SourcePath).parent_path().string();
-    /* In %TEMP%, not OutDir: bpbuild paks OutDir's whole tree, and a failed compile keeps the dump (hundreds of MB). */
+    /* In %TEMP%, not OutDir: bpbuild paks OutDir's whole tree, and a failed compile keeps the dump (hundreds of MB).
+       Named per process: bpbuild and the tests compile the same sources, and at once they overwrote each other's. */
     std::error_code TmpEc;
+    /* Absolute: a bare "Mod.cpp" has an empty parent, and NamedQualifier cannot list "". */
+    SourceDir = std::filesystem::absolute(SourcePath, TmpEc).parent_path().string();
     const std::string AstPath = (std::filesystem::temp_directory_path(TmpEc)
-                                 / (std::filesystem::path(SourcePath).stem().string() + ".assetgen-ast.json")).string();
+                                 / (std::filesystem::path(SourcePath).stem().string() + "." + std::to_string(ProcessId())
+                                    + ".assetgen-ast.json")).string();
     /* Both the UeApi dir and its parent are include paths, so "FSD.h" and "UeApi/FSD.h" both resolve. Absolute
        first: a relative "UeApi" has an empty parent, and -I"" swallows the next argument. */
     const std::string Parent = std::filesystem::absolute(IncludeDir, TmpEc).parent_path().string();
@@ -8171,6 +8551,7 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         for (const Json* F : Entry.second.Fields) NormalizePointers(const_cast<Json&>(*F));
         for (const auto& M : Entry.second.Methods) NormalizePointers(const_cast<Json&>(*M.second));
         for (const auto& M : Entry.second.MethodDefs) NormalizePointers(const_cast<Json&>(*M.second));
+        for (const auto& M : Entry.second.Inlines) NormalizePointers(const_cast<Json&>(*M.second));
     }
 
     int32 Generated = 0;

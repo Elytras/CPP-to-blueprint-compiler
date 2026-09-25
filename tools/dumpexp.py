@@ -15,6 +15,8 @@ class R:
     def fstr(s):
         n = s.i32()
         if n == 0: return ""
+        if n < 0:                                   # UTF-16, as FString reads a negative length
+            t = s.b[s.o:s.o - 2 * n - 2].decode('utf-16-le', 'replace'); s.o -= 2 * n; return t
         t = s.b[s.o:s.o + n - 1].decode('latin-1', 'replace'); s.o += n; return t
 
 def load(base):

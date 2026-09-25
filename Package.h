@@ -37,7 +37,7 @@ public:
     void Idx(FIndex V) { I32(V.V); }
     void Raw(const void* P, size_t N);
 
-    void Str(const std::string& S);                            // FString: length incl. null, ANSI bytes, null
+    void Str(const std::string& S);                            // FString: length incl. null, ANSI or (negative) UTF-16, null
     void Name(const std::string& S, int32 Number = 0);         // FName: table index + number; registers S with the package
     void Guid(const uint32 (&G)[4]);
     void Append(const FArc& Other) { Raw(Other.B.data(), Other.B.size()); }

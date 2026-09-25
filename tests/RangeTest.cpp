@@ -12,6 +12,10 @@ class RangeTest : public AActor {
   TMap<FName, FIntPoint> Spots;
   TMap<FName, RangeTest *> Peers;
   int32 Hits;
+  RangeTest *Near;
+  RangeTest *Far;
+  RangeTest *Cur;
+  int32 Picks;
 
 public:
   int32 SumArray() {
@@ -72,6 +76,36 @@ public:
     return Total * 100 + Count;
   }
 
+  /* A return from inside a reference loop, or from a loop nested in it, still writes back the value it changed. */
+  int32 BumpScoresUntil(int32 Stop) {
+    for (auto &[Key, Value] : Scores) {
+      Value += 10;
+      for (int32 I = 0; I < 2; I++)
+        if (Value + I > Stop) return Value * 10 + I;
+    }
+    return -1;
+  }
+
+  void CapScores(int32 Cap) {
+    for (auto &[Key, Value] : Scores) {
+      Value += 1;
+      if (Value > Cap) {
+        Value = Cap;
+        return;
+      }
+    }
+  }
+
+  /* The same from an inline body: its return leaves the body, not the caller. */
+  inline int32 BumpScoresInline(int32 Stop) {
+    for (auto &[Key, Value] : Scores) {
+      Value += 1;
+      if (Value > Stop) return Value;
+    }
+    return -1;
+  }
+  int32 BumpScoresInlined(int32 Stop) { return BumpScoresInline(Stop) * 2 + 1; }
+
   /* `Spot.X += 1` writes the value itself, so it goes back to the map; `Spot->X` would write an object instead. */
   int32 ShiftSpots() {
     for (auto &[Key, Spot] : Spots) Spot.X += 1;
@@ -83,5 +117,49 @@ public:
   /* `Peer->Hits += 1` writes the object; the pointer the map holds is unchanged, so nothing goes back. */
   void PokePeers() {
     for (auto &[Key, Peer] : Peers) Peer->Hits += 1;
+  }
+
+  /* The range is bound once: PickPeer() runs one time, and the whole walk is over Near's containers. */
+  RangeTest *PickPeer() {
+    Picks++;
+    return Picks == 1 ? Near : Far;
+  }
+  int32 SumPicked() {
+    int32 Sum = 0;
+    for (int32 X : PickPeer()->Items) Sum = Sum * 10 + X;
+    return Sum * 100 + Picks;
+  }
+  void DoublePicked() {
+    for (int32 &X : PickPeer()->Items) X *= 2;
+  }
+  void BumpPicked() {
+    for (auto &[Key, Value] : PickPeer()->Scores) Value += 1;
+  }
+
+  /* Reseating the pointer in the body does not move the walk: the range stays Cur's containers at loop entry. */
+  int32 SumReseat() {
+    int32 Sum = 0;
+    for (int32 X : Cur->Items) {
+      Cur = Far;
+      Sum = Sum * 10 + X;
+    }
+    RangeTest *P = Near;
+    for (int32 X : P->Items) {
+      P = Far;
+      Sum = Sum * 10 + X;
+    }
+    return Sum;
+  }
+  void DoubleReseat() {
+    for (int32 &X : Cur->Items) {
+      Cur = Far;
+      X *= 2;
+    }
+  }
+  void BumpReseat() {
+    for (auto &[Key, Value] : Cur->Scores) {
+      Cur = Far;
+      Value += 1;
+    }
   }
 };

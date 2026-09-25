@@ -18,6 +18,10 @@ UE_ENUM(EAge);
 constexpr int32 kStep = 3;
 constexpr float kHalf = 1 / 2.f;
 const int32 kMask = 1 << 4 | kStep;
+/* No fixed type: int-sized (or wider when a value needs it), not a byte. */
+enum { kCap = 1000, kDebt = -5 };
+enum ELoose { LooseBig = 70000 };
+enum { kFar = 5000000000 };
 
 /* C++20. consteval: clang runs it and AssetGen reads the answer off the AST, so its body can be anything at all.
    A concept and an `auto` parameter cost nothing either: clang instantiates, AssetGen splices the instantiation. */
@@ -42,6 +46,7 @@ class TypesTest : public AActor, public ITargetable {
   static constexpr int32 kSlots = kStep * 4;
   int32 Budget = kSlots * 2 + 1;
   float Reach = kHalf * 300 - 25;
+  bool Halfway = kHalf;        // a float is true when nonzero: 0.5f is true
   int32 Bits = ~kMask & 0xFF;
   UE_DISPATCHER(OnScored, int32 Points, AActor *By);
   TScriptInterface<IHealth> Health;
@@ -68,6 +73,28 @@ class TypesTest : public AActor, public ITargetable {
 public:
   int32 ConstSum(int32 N) { return N * kStep + kSlots + kMask; }
   float HalfOf(float V) { return V * kHalf; }
+  /* Signed >> floors: -3 >> 1 is -2, where a plain divide by 2 gives -1. */
+  int32 ShrBy(int32 X, int32 M) { return M == 1 ? X >> 1 : M == 4 ? X >> 4 : X >> 31; }
+  int64 Shr64(int64 X, int32 M) { return M == 1 ? X >> 1 : X >> 63; }
+  /* A shift has the promoted LHS type: `int >> 1LL` is int32 math. */
+  int32 ShiftByLL(int32 X, int32 M) { if (M == 0) return X << 2LL; if (M == 1) return X >> 1LL; X >>= 3LL; return X; }
+  /* A float becomes an integer truncated toward zero, not printed to 6 decimals first (0.99999994f is 0). */
+  int32 TruncOf(float X, int32 M) {
+    int32 N = X;
+    return M == 0 ? (int32)X : M == 1 ? N : static_cast<int32>(X * 2);
+  }
+  int64 Trunc64Of(float X) { return (int64)X; }
+  /* An explicit narrowing cast wraps even when the slot around it is wide again (511 -> 255, 2^32+5 -> 5). */
+  int64 NarrowOf(int32 X, int64 Y, int32 M) { return M == 0 ? (uint8)X : M == 1 ? (uint8)Y + 0 : (int32)Y; }
+  int32 AnonConst(int32 X, int32 M) {
+    int32 V = kCap;
+    return M == 0 ? (X > kCap ? kCap : X) : M == 1 ? X + kDebt : M == 2 ? X * LooseBig : M == 3 ? X == LooseBig : V;
+  }
+  int64 WideConst(int64 X) { return X + kFar; }
+  /* A constant float is true when nonzero, not when it truncates to nonzero (0.5f and 0.25f are true). */
+  int32 FloatTruth(int32 X, int32 M) {
+    return M == 0 ? !kHalf : M == 1 ? kHalf && X > 0 : M == 2 ? (kHalf ? 7 : 9) : (bool)0.25f + 0;
+  }
 
   /* A null interface is EX_NoInterface: EX_NoObject would set half of the 16 bytes. */
   void Forget() {
@@ -103,6 +130,21 @@ public:
     }
     return S == Span ? 10 : 0;
   }
+
+  /* A cast that changes the value still happens inside a chain of casts: to bool, to a narrower integer, float to
+     integer. `(bool)F + X` adds 0 or 1, not F truncated; `(uint8)V + X` wraps V. */
+  int32 CastBool(float F, int32 X) { return (bool)F + X; }
+  int32 CastBoolK(int32 X) { return (bool)0.25f + X; }
+  int32 CastBoolInt(int32 V, int32 X) { return bool(V) + X; }
+  int32 CastBoolEnum(EMood M, int32 X) { return (bool)M + X; }
+  int32 CastByte(int32 V, int32 X) { return (uint8)V + X; }
+  int32 CastByteStatic(int32 V, int32 X) { return static_cast<uint8>(V) + X; }
+  int32 CastByteK(int32 X) { return (uint8)300 + X; }
+  int64 CastInt64(int64 V) { return (int32)V; }
+  int64 CastWide(int32 V) { return (uint8)V; }
+  float CastTrunc(float F) { return (int32)F; }
+  int32 CastChain(float F, int32 X) { return (uint8)(int32)F + X; }
+  bool CastTest(float F) { return F; }
 
   int32 AgeOf(EAge A) { return A == EAge::Eon ? 1 : A == EAge::Epoch ? 2 : 0; }
 

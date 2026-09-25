@@ -24,6 +24,15 @@ class PointerTest : public AActor {
   /* A T& parameter stays an out-parm. */
   void Bump(int32 &Value) { Value = Value + 1; }
 
+  /* int8 and signed char are signed: a 0x80..0xFF byte reads as a negative int, a uint8 as 128..255. */
+  int32 SignedByteMix(int8 *P) { return *P * 3 + P[1]; }
+  int32 SignedCharAt(signed char *P, int32 I) { return P[I]; }
+  bool SignedByteNegative(int8 *P) { return *P < 0; }
+  int32 UnsignedByteAt(uint8 *P, int32 I) { return P[I]; }
+  /* (uint8) of a signed byte read is 128..255 again, inside an int expression too. */
+  int32 SignedByteAsUnsigned(int8 *P) { return (uint8)*P * 1000 + static_cast<uint8>(P[1]); }
+  bool SignedByteIsMax(int8 *P) { return (uint8)*P == 255; }
+
 public:
   void ReceiveBeginPlay() {
     TArray<int32> Items;

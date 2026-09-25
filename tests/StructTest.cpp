@@ -31,6 +31,11 @@ class StructTest : public AActor {
   FStats Stats;
   FNested Nested;
   FMoody Moody;
+  TArray<int32> Counts;
+  TArray<FStats> Many;
+  TSet<int32> Seen;
+  TSet<int32> Fresh;
+  TMap<int32, int32> Scores;
 
 public:
   /*
@@ -56,6 +61,23 @@ public:
       S.Alive = true;
     }
     return Sum;
+  }
+
+  /* A local copy handed to what writes through a reference: the variable it was copied from keeps its value. */
+  void SetKills(int32 K, FStats &S) { S.Kills = K; }
+  void AddTo(int32 &V, int32 By) { V = V + By; }
+  int32 CopyToRef(int32 K) { FStats T = Stats; SetKills(K, T); return Stats.Kills; }
+  int32 MemberCopyToRef(int32 K) { int32 T = Stats.Kills; AddTo(T, K); return Stats.Kills; }
+  int32 ArgCopyToRef(int32 K) { int32 T = K; AddTo(T, 100); return K; }
+  int32 ArrayCopyAdd(int32 K) { TArray<int32> T = Counts; T.Add(K); return Counts.Num(); }
+  int32 ArrayGetIntoCopy(int32 K) { int32 T = Stats.Kills; Counts.Get(0, T); return Stats.Kills; }
+  /* A container function's out value, and a source it reads in place while writing another argument. */
+  int32 MapFindIntoCopy(int32 K) { int32 T = K; Scores.Find(1, T); return K; }
+  int32 ArrayAppendCopy(int32 K) { TArray<int32> T = Counts; Counts.Append(T); return Counts.Num() + K; }
+  int32 SetUnionCopy(int32 K) { TSet<int32> T = Seen; Fresh.Union(T, Seen); return Seen.Num() + K; }
+  int32 RangeCopyToRef(int32 K) {
+    for (FStats S : Many) SetKills(K, S);
+    return Many[0].Kills;
   }
 
   float MakeNative(float D) {

@@ -130,6 +130,17 @@ public:
     }
     return 0;
   }
+  /* Mode promotes to 0..255: these three cases never match, and the first two are reached only by falling through. */
+  int32 ByteSwitchStray(uint8 Mode) {
+    int32 R = 0;
+    switch (Mode) {
+    case -1: R += 100;
+    case 256: R += 10;
+    case 7: R += 1; break;
+    case 300: return 9;
+    }
+    return R;
+  }
   int32 DenseHoles(int32 Code) {
     switch (Code) {
     case 10: return 1;
@@ -172,6 +183,42 @@ public:
   int32 Cursor = 0;
   int32 NextSlot() { return Cursor++; }
   void BumpSlot(int32 By) { Slots[NextSlot()] += By; }
+
+  /* C++17 sequences the right side of `=` / `op=` before the left: the value is taken before the destination's
+     index, key or object is. */
+  TMap<int32, int32> SlotMap;
+  FlowTest *Peer;
+  FlowTest *Spare;
+  void StoreSlot() { Slots[NextSlot()] = NextSlot(); }
+  void StoreSlotMap() { SlotMap[NextSlot()] = NextSlot(); }
+  int32 StorePostInc(int32 I) { Slots[I++] = I; return I; }
+  void StoreAtCursor() { Slots[Cursor] = NextSlot(); }
+  void BumpAtCursor(int32 By) { Slots[Cursor] += NextSlot() + By; }
+  FlowTest *GetPeer() { return Peer; }
+  int32 SwapPeer() { Peer = Spare; return 5; }
+  void StorePeer() { GetPeer()->Cursor = SwapPeer(); }
+  void StorePeerField() { Peer->Cursor = SwapPeer(); }
+
+  /* C++17 sequences a call's object before its arguments, and E1 before E2 in E1[E2]: the peer is taken before an
+     inline body or a && / ?: arm in the argument swaps it. */
+  inline int32 SwapPeerInline() { Peer = Spare; return 5; }
+  void SetCursor(int32 V) { Cursor = V; }
+  int32 CursorPlus(int32 V) { return Cursor + V; }
+  void CallPeerInline() { GetPeer()->SetCursor(SwapPeerInline()); }
+  void CallPeerBranch(bool C) { GetPeer()->SetCursor(C && SwapPeer() == 5 ? 5 : 1); }
+  void CallPeerField() { Peer->SetCursor(SwapPeerInline()); }
+  int32 PeerPlus() { return GetPeer()->CursorPlus(SwapPeerInline()); }
+  int32 PeerSlot() { return GetPeer()->Slots[SwapPeerInline() - 5]; }
+  void StorePeerSlot() { GetPeer()->Slots[SwapPeerInline() - 5] = 7; }
+  /* ... and the object holding a container or dispatcher the call works on (argument 0 of the Kismet call). */
+  UE_DISPATCHER(OnPeerHit, int32 Points);
+  void AddPeerSlot() { GetPeer()->Slots.Add(SwapPeerInline()); }
+  void AddPeerSlotBranch(bool C) { GetPeer()->Slots.Add(C && SwapPeer() == 5 ? 5 : 1); }
+  UE_NO_OPTIMIZE void AddPeerSlotRaw() { GetPeer()->Slots.Add(SwapPeerInline()); }
+  void AddPeerMap() { GetPeer()->SlotMap.Add(SwapPeerInline(), 7); }
+  int32 PeerMapAt() { return GetPeer()->SlotMap[SwapPeerInline()]; }
+  void StorePeerMap() { GetPeer()->SlotMap[SwapPeerInline()] = 7; }
+  void FirePeer() { GetPeer()->OnPeerHit.Broadcast(SwapPeerInline()); }
 
   /* Member templates have no UFunction per instantiation: each one a call names is inlined. */
   template <class T> requires(sizeof(T) <= 8) T Scaled(T V) { return V * T(3) + T(Cursor); }
@@ -305,6 +352,22 @@ public:
 
   int32 GotoInlined(int32 A, int32 B) { return FirstSquareAbove(A) * 100 + FirstSquareAbove(B); }
 
+  /* An inline body's goto loop, with a temp in it and a value live across it: the two keep their own slots. */
+  inline int32 GotoLoopKeeps(int32 N) {
+    int32 Base = N * 3;
+    int32 Sum = 0;
+    int32 I = 0;
+  again:
+    Sum += Base;
+    int32 Twice = Sum * 2;
+    Sum = Twice - Sum + Twice * 0 + I;
+    I += 1;
+    if (I < 3) goto again;
+    return Sum;
+  }
+
+  int32 GotoInlinedLive(int32 N) { return GotoLoopKeeps(N); }
+
   /* A declaration a goto reaches again is constructed again, as one in a loop is. */
   int32 GotoRedeclares(int32 Rounds) {
     int32 Round = 0;
@@ -376,6 +439,11 @@ public:
     }
     return StopBelow(1) * 100 + StopBelow(5) * 10 + N;
   }
+
+  /* A defaulted argument, to a method and to an inline function: clang 18 writes the CXXDefaultArgExpr empty. */
+  int32 Times(int32 X, int32 By = 3) { return X * By; }
+  static inline int32 Offset(int32 X, int32 By = 7) { return X + By; }
+  int32 UseDefault(int32 X) { return Times(X) + Times(X, 10) + Offset(X) * 1000; }
 
   /* UE_NAME_SWITCH: a comparison per case, case-insensitive as FName is. */
   /* FName converts to bool as Name != None. */

@@ -108,6 +108,40 @@ public:
     } while (Twice(I) < N);
     return I;
   }
+
+  /* A local an inline declares is made again at each call, also when the call is a loop's test. */
+  inline int32 FreshCount(int32 V) {
+    TArray<int32> A;
+    A.Add(V);
+    return A.Num();
+  }
+  int32 WhileFresh(int32 L) {
+    int32 I = 0, T = 0;
+    while (FreshCount(I) + I < L) {
+      I++;
+      T += 1;
+    }
+    return T;
+  }
+  int32 ForFresh(int32 L) {
+    int32 T = 0;
+    for (int32 I = 0; FreshCount(I) + I < L; I++)
+      T += I;
+    return T;
+  }
+  int32 DoFresh(int32 L) {
+    int32 I = 0;
+    do {
+      I++;
+    } while (FreshCount(I) + I < L);
+    return I;
+  }
+
+  /* Same-name overloads: each call expands the one C++ picks, and one may call another. */
+  inline int32 Pick(int32 V) { return V + 1; }
+  inline int32 Pick(bool B) { return B ? 100 : 200; }
+  inline int32 Pick(int32 A, int32 B); // body below
+  int32        PickOverloads(int32 V, bool B) { return Pick(B) + Pick(V) * 1000 + Pick(V, 3) * 10; }
 };
 
 int32 InlineTest::Clamp(int32 V, int32 Lo, int32 Hi) {
@@ -121,3 +155,5 @@ int32 InlineTest::Clamp(int32 V, int32 Lo, int32 Hi) {
 inline int32 InlineTest::Half(int32 V) { return V / 2; }
 
 inline int32 InlineTest::SPred(int32 V) { return V - 1; }
+
+int32 InlineTest::Pick(int32 A, int32 B) { return Pick(A) * B; }
