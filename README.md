@@ -65,6 +65,26 @@ class Hello : public AActor {
 A variable outside any class, such as `int32 Total = 0;` at namespace scope, is shared by every class that uses
 it. The compiler keeps it in the default object of a class it generates for that variable.
 
+A namespace is a folder. A class, struct, interface, enum or asset in `namespace Weapons` is written to
+`/Game/_MyMods/Hello/Weapons/`. A namespace that starts at `Game` is a `/Game` path of its own. The SDK puts every
+game Blueprint in the namespace of its folder, so a class that extends one can sit beside it:
+
+```cpp
+#include "UeApi/Game/WPN_GrapplingGun_C.h"
+
+namespace Game::WeaponsNTools::GrapplingGun {
+class WPN_GrapplingGun_Long : public WPN_GrapplingGun_C {   // /Game/WeaponsNTools/GrapplingGun/WPN_GrapplingGun_Long
+  int32 Pulls = 0;
+};
+}
+```
+
+A package outside the mod's own is written under the `Content` folder that the out dir is in, so compile into
+`<root>/Content/<package path>`, as bpbuild does.
+
+Some C++ has no exact Blueprint equivalent, such as a reference to a map element. AssetGen compiles the closest
+equivalent and prints a `warning:` that says what differs. It refuses only what it can't compile faithfully.
+
 Several mods, only rebuilding what changed, packed into paks:
 
 ```
@@ -120,7 +140,8 @@ Under Proton the game reads paks from
    (`UnrealPak <pak> -Extract <dir> -Filter=*AssetRegistry.bin`), then
    `python tools/genueassets.py <dir>/FSD/AssetRegistry.bin <UeApi dir> <UeAssets dir>`. Put `UeAssets/` beside
    `UeApi/` so a mod can `#include "UeAssets/USoundWave.h"`. `UeAssets::USoundWave::All` is every one of them,
-   as soft pointers.
+   as soft pointers. A mod pak has no registry: add `--pak <pak or its extracted folder>` (repeatable) to name its
+   assets from their own headers. They replace the game's at the same path, as the pak does in game.
 
 ## Tests
 
