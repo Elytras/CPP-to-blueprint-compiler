@@ -11,6 +11,7 @@ class RangeTest : public AActor {
   TMap<FName, int32> Scores;
   TMap<FName, FIntPoint> Spots;
   TMap<FName, RangeTest *> Peers;
+  TMap<int32, TArray<int32>> Lists;
   int32 Hits;
   RangeTest *Near;
   RangeTest *Far;
@@ -176,5 +177,69 @@ public:
       Cur = Far;
       Value += 1;
     }
+  }
+
+  /* A container value is the map's own too: V.Add changes the array `Lists[K]` reads, and `Lists[K].Add` is what V
+     holds next. */
+  int32 ListsInPlace(int32 D) {
+    int32 Sum = 0;
+    for (auto &[K, V] : Lists) {
+      V.Add(K * D);
+      Sum += Lists[K].Num();
+      Lists[K].Add(7);
+      for (int32 &X : V) X += 1;
+      Sum += V.Num() * 10 + V[V.Num() - 1] * 100;
+    }
+    return Sum;
+  }
+
+  /* `const auto&` names the value where it lives as well: a change through the map is what it reads. */
+  int32 ConstSeesStore() {
+    int32 Sum = 0;
+    for (const auto &[K, V] : Lists) {
+      Lists[K].Add(1);
+      Sum += V.Num();
+    }
+    return Sum;
+  }
+
+  /* `Lists[K].Add(X)` runs on a copy stored back, and X, which C++ evaluates after locating `Lists[K]`, still runs
+     first: the element it changes is the one Add appends to. */
+  int32 Grow(int32 K) {
+    Lists[K].Add(K);
+    return Lists[K].Num();
+  }
+  int32 AddGrown(int32 K) {
+    Lists[K].Add(Grow(K));
+    TArray<int32> L = Lists[K];
+    return L.Num() * 100 + L[L.Num() - 1];
+  }
+
+  /* A T& binds the value itself, so there is no copy to warn about. */
+  void Nudge(FIntPoint &P, int32 By) {
+    P.X += By;
+    P.Y -= By;
+  }
+  int32 NudgeSpots(int32 By) {
+    int32 Sum = 0;
+    for (auto &[Key, Spot] : Spots) {
+      Nudge(Spot, By);
+      Sum += Spots[Key].X * 10 + Spot.Y;
+    }
+    return Sum;
+  }
+
+  /* Removing from the map it walks would move the walk under it: this loop walks a copy of the keys instead. */
+  int32 DropNegatives() {
+    int32 Kept = 0;
+    for (auto &[Key, Value] : Scores) {
+      if (Value < 0) {
+        Scores.Remove(Key);
+        continue;
+      }
+      Value += 1;
+      Kept++;
+    }
+    return Kept;
   }
 };

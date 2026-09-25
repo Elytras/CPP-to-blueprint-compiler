@@ -228,8 +228,41 @@ def _union(ev, store, a):
         if v not in sets[2]: sets[2].append(copy.deepcopy(v))
 
 
+class Slot:
+    """A TMap element in the compiler's __Slots__ view of the map's storage: its Key, and its Value, which is the map's
+    own, so a store through it changes the map."""
+    def __init__(s, m, k): s.m, s.k = m, k
+    def __getitem__(s, f):
+        if f not in ('Key', 'Value'): raise SystemExit('a read of map slot member ' + f)
+        return s.k if f == 'Key' else s.m[s.k]
+    def __setitem__(s, f, v):
+        if f != 'Value': raise SystemExit('a store to map slot member ' + f)
+        s.m[s.k] = v
+
+
+class Free:
+    """A free slot of a map's sparse array: the memory of an element it lost. Reading or writing it is a bug."""
+    def __getitem__(s, f): raise SystemExit('a read of a free map slot')
+    def __setitem__(s, f, v): raise SystemExit('a store to a free map slot')
+
+
+class Holey(dict):
+    """A map that lost elements: its sparse array has free slots at the indices `holes`. A copy is packed, as
+    FMapProperty::CopyValuesInternal packs one."""
+    def __init__(s, items, holes): super().__init__(items); s.holes = holes
+    def __deepcopy__(s, memo): return copy.deepcopy(dict(s), memo)
+
+
+def slots_of(m):
+    """The __Slots__ view of a map: its elements in order, with a Holey one's free slots among them."""
+    slots = [Slot(m, k) for k in m] if isinstance(m, dict) else []
+    for i in sorted(getattr(m, 'holes', ())): slots.insert(i, Free())
+    return slots
+
+
 CONTAINERS = {
     'Array_Length': lambda ev, store, a: len(_made(ev, store, a[0], [])),
+    'Map_Length': lambda ev, store, a: len(_made(ev, store, a[0], {})),
     'Set_Length': lambda ev, store, a: len(_made(ev, store, a[0], [])),
     'Array_Add': lambda ev, store, a: (_made(ev, store, a[0], []).append(copy.deepcopy(ev(a[1]))), len(ev(a[0])) - 1)[1],
     'Array_Get': lambda ev, store, a: store(a[2], copy.deepcopy(ev(a[0])[ev(a[1])])),
@@ -239,6 +272,7 @@ CONTAINERS = {
     'Map_Keys': lambda ev, store, a: store(a[1], list(ev(a[0]).keys())),
     'Map_Find': lambda ev, store, a: (store(a[2], _made(ev, store, a[0], {}).get(ev(a[1]), 0)), ev(a[1]) in ev(a[0]))[1],
     'Map_Add': lambda ev, store, a: _made(ev, store, a[0], {}).__setitem__(ev(a[1]), copy.deepcopy(ev(a[2]))),
+    'Map_Remove': lambda ev, store, a: _made(ev, store, a[0], {}).pop(ev(a[1]), None) is not None,
     'Array_Clear': lambda ev, store, a: store(a[0], []),
     'Set_Clear': lambda ev, store, a: store(a[0], []),
     'Map_Clear': lambda ev, store, a: store(a[0], {}),
@@ -275,10 +309,12 @@ def run(base, function, self_vars=None, **parms):
         if o in (0, 0x48): return env.get(n.val, 0)
         if o == 1: return self_vars.get(n.val, 0)
         if o in (0x1D, 0x1E, 0x24, 0x2C, 0x35, 0x21): return n.val
-        if o == 0x42 and n.val == 'Value': return ev(n.kids[0])      # a nested container's wrapper is its Value
-        if o == 0x42:                                                # a struct is a dict; an unset member reads 0
+        if o == 0x42:
             s = ev(n.kids[0])
-            return s.get(n.val, 0) if isinstance(s, dict) else 0
+            if isinstance(s, (Slot, Free)): return s[n.val]
+            if n.val == 'Value': return s                            # a nested container's wrapper is its Value
+            if n.val == '__Slots__': return slots_of(s)
+            return s.get(n.val, 0) if isinstance(s, dict) else 0     # a struct is a dict; an unset member reads 0
         if o in (0x1F, 0x34): return n.val
         if o == 0x29: return ev(n.kids[0]) if n.kids else ''
         if o == 0x17: return SELF
@@ -328,7 +364,8 @@ def run(base, function, self_vars=None, **parms):
     def store(dest, v):
         v = copy.deepcopy(v)
         addressable(dest)
-        if dest.op == 0x42 and dest.val == 'Value': store(dest.kids[0], v)
+        if dest.op == 0x42 and isinstance(ev(dest.kids[0]), (Slot, Free)): ev(dest.kids[0])[dest.val] = v
+        elif dest.op == 0x42 and dest.val == 'Value': store(dest.kids[0], v)
         elif dest.op == 0x42: _made(ev, store, dest.kids[0], {})[dest.val] = v
         elif dest.op in (0, 0x48): env[dest.val] = v
         elif dest.op == 1: self_vars[dest.val] = v
@@ -340,6 +377,9 @@ def run(base, function, self_vars=None, **parms):
         # UObject::execLet steps the destination (its struct, array and index) before the value: evaluate those now,
         # return what stores into the place they found.
         addressable(dest)
+        if dest.op == 0x42 and isinstance(ev(dest.kids[0]), (Slot, Free)):
+            slot = ev(dest.kids[0])
+            return lambda v: slot.__setitem__(dest.val, copy.deepcopy(v))
         if dest.op == 0x42 and dest.val == 'Value': return locate(dest.kids[0])
         if dest.op == 0x42:
             s = _made(ev, store, dest.kids[0], {})
