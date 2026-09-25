@@ -1040,8 +1040,8 @@ private:
        side effects once (StabilizeLvalue / HoistExpr park them in synthetic locals first). With Result, the
        block also leaves the expression's value in a local named there. */
     bool DesugarUpdate(const Json& S, Json& Wrap, std::string* Result, std::string* Err);
-    Json StabilizeLvalue(const Json& N, Json& Pre);
-    Json HoistExpr(const Json& N, Json& Pre);
+    Json StabilizeLvalue(const Json& N, Json& Pre, bool bPin = false);
+    Json HoistExpr(const Json& N, Json& Pre, bool bPin = false);
     Json SynthLocal(const std::string& Type, const Json& Init, Json& Pre);
     bool LowerUpdateValue(const Json& N, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
 
@@ -3701,6 +3701,15 @@ static bool IsSideEffectFree(const Json& N)
     return bFree;
 }
 
+/* True for `this` and literals: nothing the code in between runs can change them. */
+static bool IsFixedValue(const Json& N)
+{
+    const std::string K = Kind(N);
+    if (K == "ParenExpr" || K == "ImplicitCastExpr" || K == "CStyleCastExpr" || K == "CXXStaticCastExpr" || K == "ConstantExpr")
+        return N.contains("inner") && N["inner"].size() == 1 && IsFixedValue(N["inner"][0]);
+    return K == "CXXThisExpr" || K.find("Literal") != std::string::npos;
+}
+
 /* A fresh local initialised from Init, declared into Pre; returns an rvalue read of it. */
 Json FCompiler::SynthLocal(const std::string& Type, const Json& Init, Json& Pre)
 {
@@ -3715,29 +3724,31 @@ Json FCompiler::SynthLocal(const std::string& Type, const Json& Init, Json& Pre)
              { "inner", Json::array({ Ref }) } };
 }
 
-/* An rvalue N, parked in a local unless reading it again is harmless. */
-Json FCompiler::HoistExpr(const Json& N, Json& Pre)
+/* An rvalue N, parked in a local unless reading it again is harmless. bPin also parks a variable, which code
+   run in between may reassign. */
+Json FCompiler::HoistExpr(const Json& N, Json& Pre, bool bPin)
 {
-    if (IsSideEffectFree(N)) return N;
+    if (bPin ? IsFixedValue(N) : IsSideEffectFree(N)) return N;
     return SynthLocal(StripTypeKeywords(TypeOf(N)), N, Pre);
 }
 
 /* The same place as lvalue N, with whatever locates it (an index, a pointer from a call) evaluated into Pre
-   once. The place itself is not copied: the store has to land in it. */
-Json FCompiler::StabilizeLvalue(const Json& N, Json& Pre)
+   once. The place itself is not copied: the store has to land in it. bPin fixes the place for a stretch of
+   code that may reassign what locates it (`P = Q` in a range-for body), not just for side effects. */
+Json FCompiler::StabilizeLvalue(const Json& N, Json& Pre, bool bPin)
 {
-    if (IsSideEffectFree(N)) return N;
+    if (!bPin && IsSideEffectFree(N)) return N;
     const std::string K = Kind(N);
     Json Out = N;
     if (K == "ParenExpr" || (K == "ImplicitCastExpr" && N.value("castKind", std::string()) == "NoOp")
         || (K == "MemberExpr" && !N.value("isArrow", false)))
-        Out["inner"][0] = StabilizeLvalue(N["inner"][0], Pre);
+        Out["inner"][0] = StabilizeLvalue(N["inner"][0], Pre, bPin);
     else if (K == "MemberExpr" || (K == "UnaryOperator" && N.value("opcode", std::string()) == "*"))
-        Out["inner"][0] = HoistExpr(N["inner"][0], Pre);                  // `P->X`, `*P`: the pointer is a value
+        Out["inner"][0] = HoistExpr(N["inner"][0], Pre, bPin);            // `P->X`, `*P`: the pointer is a value
     else if ((IsTArrayElement(N) || IsTMapElement(N)) && N["inner"].size() == 3)
     {
-        Out["inner"][1] = StabilizeLvalue(N["inner"][1], Pre);           // the container is a place too
-        Out["inner"][2] = HoistExpr(N["inner"][2], Pre);
+        Out["inner"][1] = StabilizeLvalue(N["inner"][1], Pre, bPin);     // the container is a place too
+        Out["inner"][2] = HoistExpr(N["inner"][2], Pre, bPin);
     }
     // ponytail: anything else (a call returning T&) is left to evaluate twice; a pointer local fixes it if one shows up.
     return Out;
@@ -5896,6 +5907,17 @@ bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vec
         Json Wrap = { {"kind", "CompoundStmt"}, {"inner", Json::array({ *Init })} };
         if (!LowerBody(Wrap, BP, Out, Locals, Err)) return false;
     }
+
+    /* C++ binds the range once: whatever locates it (`Pick()->Items`, `Cur->Items` with `Cur = Next` in the
+       body) is evaluated into a local up front. */
+    Json RangePre = Json::array();
+    const Json StableRange = StabilizeLvalue(*RangeExpr, RangePre, true);
+    if (!RangePre.empty())
+    {
+        Json Wrap = { {"kind", "CompoundStmt"}, {"inner", std::move(RangePre)} };
+        if (!LowerBody(Wrap, BP, Out, Locals, Err)) return false;
+    }
+    RangeExpr = &StableRange;
 
     std::string RangeTy = TypeOf(*RangeExpr);
     while (!RangeTy.empty() && (RangeTy.back() == '&' || RangeTy.back() == ' ')) RangeTy.pop_back();
