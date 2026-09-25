@@ -82,6 +82,14 @@ std::string TypeOf(const Json& N)
     return It == N.end() ? std::string() : It->value("qualType", std::string());
 }
 
+/* A CharacterLiteral's value is its code unit; a plain char is signed (clang for MSVC), so '\xff' is -1. */
+int64 CharValue(const Json& N)
+{
+    const int64 V = N.value("value", int64(0));
+    const std::string T = StripTypeKeywords(TypeOf(N));
+    return T == "char" || T == "signed char" ? int64(int8(V)) : V;
+}
+
 /* A one-argument CXXConstructExpr is a wrapper (FString from a literal, a copy, a conversion)
    and is looked through; one with several arguments is a struct literal and stays. */
 const Json* Strip(const Json* N)
@@ -3333,6 +3341,7 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         Out.K = int64(Out.I) == V ? FArgIR::Int : FArgIR::Int64;
         return true;
     }
+    if (K == "CharacterLiteral") { Out.K = FArgIR::Int; Out.I = int32(CharValue(*N)); Out.I64 = Out.I; return true; }
     /* strtof, not stof: a double literal past float's range is inf, as (float)1e39 is in C++, not an exception. */
     if (K == "FloatingLiteral") { Out.K = FArgIR::Float; Out.F = std::strtof(N->value("value", std::string("0")).c_str(), nullptr); return true; }
     if (K == "CXXBoolLiteralExpr") { Out.K = FArgIR::Bool; Out.B = N->value("value", false); return true; }
@@ -6697,6 +6706,7 @@ bool FCompiler::FoldConst(const Json& E, FConstVal& Out) const
         return true;
     };
     if (K == "IntegerLiteral") { Out = {}; Out.I = int64(std::strtoull(E.value("value", std::string("0")).c_str(), nullptr, 10)); return true; }
+    if (K == "CharacterLiteral") { Out = {}; Out.I = CharValue(E); return true; }
     if (K == "FloatingLiteral") { Out = {}; Out.bFloat = true; Out.F = std::strtod(E.value("value", std::string("0")).c_str(), nullptr); return true; }
     if (K == "CXXBoolLiteralExpr") { Out = {}; Out.I = E.value("value", false); return true; }
     if (K == "ConstantExpr" && E.contains("value") && E["value"].is_string())

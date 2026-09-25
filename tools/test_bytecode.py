@@ -1007,6 +1007,7 @@ def types_behaviour():
     check('TypesTest', 'TruncViaI64', lambda G: float(int(G)), [dict(G=g) for g in (0.0, 2.75, -2.75, 1e6 + 0.5)])
     check('TypesTest', 'AllOnes', lambda: -1, [dict()])
     check('TypesTest', 'Huge', lambda: float('inf'), [dict()])
+    check('TypesTest', 'PlusChar', lambda X: wrap(X + 128), [dict(X=x) for x in EDGE])
     check('TypesTest', 'ShiftByLL', lambda X, M: wrap(X << 2) if M == 0 else X >> (1 if M == 1 else 3),
           [dict(X=x, M=m) for x in EDGE + (-8, -7, -1) for m in (0, 1, 2)])
     import struct
