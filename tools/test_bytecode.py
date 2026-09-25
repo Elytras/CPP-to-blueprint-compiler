@@ -795,8 +795,8 @@ def inline_mixed_overloads():
 
 
 def copy_back():
-    """A written T& bound to what Blueprint has no reference to (a map element, `C ? X : Y`, another object's member)
-    gets a copy, stored back after the call into the place picked at the call, and a warning says it is a copy."""
+    """A written T& bound to what Blueprint has no reference to (a map element, `C ? X : Y`) gets a copy, stored back
+    after the call into the place picked at the call, and a warning says it is a copy."""
     t = asset('InlineTest')
     for c in (0, 5):
         for k in (1, 2):
@@ -812,18 +812,27 @@ def copy_back():
             vm = VM(t, Counter=c, Calls=7)
             got = vm.call('RefObj', By=by)
             assert got == (7 + by) * 10 + c + 1 and vm.self.vars == dict(Counter=c + 1, Calls=7 + by), ('RefObj', by, c, got, vm.self.vars)
+    # An inline's T& bound to `O->A` is A itself, through O pinned at the call: no copy, so no warning.
+    vm = VM(t, Calls=7)
+    assert vm.call('RefObjLive') == 12 and vm.self.vars == dict(Calls=12), vm.self.vars
+    for by in (-3, 4):
+        vm = VM(t, Counter=5, Calls=0, Arr=[])
+        got = vm.call('RefDeep', By=by)
+        assert got == (10 + by) * 100 + 10 + 6 and vm.self.vars == dict(Counter=6, Calls=1, Arr=[10 + by]), ('RefDeep', by, got, vm.self.vars)
+    assert 'InlineTest::RefObj' not in LOGS['InlineTest'] and 'InlineTest::RefDeep' not in LOGS['InlineTest'], LOGS['InlineTest']
     f = dict(Key=9)
     got = run(t, 'RefPinned', self_vars=f)[0]
     assert got == 15 * 1000000 + 15 * 10000 + 40 * 100 + 3 and f == dict(Key=5), ('RefPinned', got, f)
     for fn, callee, what in (('RefMap', 'Add5', 'a map element'), ('RefMap', 'InlineTest::Bump', 'a map element'),
                              ('RefSel', 'Add5', '`C ? X : Y`'), ('RefSel', 'InlineTest::Bump', '`C ? X : Y`'),
-                             ('RefObj', 'InlineTest::Bump', "another object's member"), ('RefPinned', 'AddKey', 'a map element')):
+                             ('RefPinned', 'AddKey', 'a map element')):
         line = "warning: InlineTest::%s: %s's reference parameter V is bound to %s" % (fn, callee, what)
         assert line in LOGS['InlineTest'], (line, LOGS['InlineTest'])
     # Both sides of `C ? X : Y` are located before the call, so one found by a call, which C++ runs only when picked, is refused.
     refused('RefSelCall', '  void Add5(int32& V) { V += 5; }\n  int32 K() { return 1; }\n'
             '  int32 F(bool C) { TMap<int32, int32> M; int32 X = 1; Add5(C ? M[K()] : X); return X; }\n', 'found by a call')
-    print('ok  InlineTest: a written reference bound to a map element, `C ? X : Y` or another object\'s member is copied in and back, and warned')
+    print('ok  InlineTest: a written reference bound to a map element or `C ? X : Y` is copied in and back, and warned; '
+          'an inline one bound to `O->A` is A itself')
 
 
 inline_members()

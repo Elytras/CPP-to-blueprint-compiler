@@ -126,6 +126,22 @@ public:
     Bump(O->Calls, By);
     return Calls * 10 + Counter;
   }
+  /* An inline's `T&` bound to `O->A` is A itself, not a copy: the body reads its own write back through O. */
+  inline int32 AddRead(int32 &V, InlineTest *O) {
+    V += 5;
+    return O->Calls;
+  }
+  int32 RefObjLive() {
+    InlineTest *O = this;
+    return AddRead(O->Calls, O);
+  }
+  /* Deeper under an object: O and the index are fixed at the call. */
+  int32 RefDeep(int32 By) {
+    InlineTest *O = this;
+    Arr.Add(10);
+    Bump(O->Arr[NextIdx()], By);
+    return Arr[0] * 100 + Calls * 10 + Counter;
+  }
   int32 RefPinned() {
     TMap<int32, int32> M;
     M.Add(0, 10);

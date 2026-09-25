@@ -2578,6 +2578,18 @@ bool IsAliasable(const Json& N)
     return !N.value("isArrow", false) && IsAliasable(*Base);
 }
 
+/* A place a reference can name once what locates it is fixed (StabilizeLvalue): a member of an object (`O->A`), an
+   element of an array (`Arr[F()]`), a member of either (`O->S.X`), down from a variable or an object. */
+bool IsPinnable(const Json& N)
+{
+    const Json* P = PeelLvalue(&N);
+    if (Kind(*P) == "MemberExpr" && First(*P))
+        return P->value("isArrow", false) || IsAliasable(*PeelLvalue(First(*P))) || IsPinnable(*First(*P));
+    if (IsTArrayElement(*P) && Nth(*P, 2))
+        return IsAliasable(*PeelLvalue(Nth(*P, 1))) || IsPinnable(*Nth(*P, 1));
+    return false;
+}
+
 /* A reference the callee may write: `T&`, not `const T&` or `T&&`. */
 bool IsMutableRef(const std::string& T)
 {
@@ -4062,9 +4074,8 @@ bool FCompiler::LowerUpdateValue(const Json& N, FBlueprintClass& BP, FArgIR& Out
     return true;
 }
 
-/* `Add5(M[1])`, `Add5(C ? X : Y)`, an inline `Bump(O->A)`: Blueprint has no reference to a map element (Map_Find
-   copies it out) or to whichever variable `C ? X : Y` picks, and an inline body names another object's member only
-   through a copy. So the call is sugar for
+/* `Add5(M[1])`, `Add5(C ? X : Y)`: Blueprint has no reference to a map element (Map_Find copies it out) or to
+   whichever variable `C ? X : Y` picks. So the call is sugar for
        <what locates the place: key, condition, object, pinned>  T Copy = <the place>;  <the call on Copy>;  <the place> = Copy;
    the place fixed before the call, as a reference is bound. A copy is not a reference, though: code that reads the
    place while the call runs sees it unchanged, hence the warning. */
@@ -4101,7 +4112,7 @@ bool FCompiler::LowerCopyBack(const Json& Call, const std::vector<std::pair<cons
         Again["inner"][At] = Copy["inner"][0];      // the local itself, which the call takes by reference
         const Json Seen = Unalias(Bare);
         const std::string What = IsTMapElement(*PeelLvalue(&Seen)) ? "a map element" : MapElementUnder(Seen) ? "a map element's member"
-                               : bSel ? "`C ? X : Y`" : "another object's member";
+                               : bSel ? "`C ? X : Y`" : "that expression";
         char Line[512];
         snprintf(Line, sizeof(Line), "  warning: %s::%s: %s's reference parameter %s is bound to %s: Blueprint has no reference "
                  "to it, so %s gets a copy, stored back after the call\n", Cur ? Cur->CppName.c_str() : "", CurFnName.c_str(),
@@ -6061,7 +6072,8 @@ bool HasGoto(const Json& N)
 /* The call becomes one Block statement in Out.Inline:
        <each by-value parameter> = <its argument>;
        <the body, locals renamed __Inl<N>_<name>, `return X` as `__Inl<N>_ReturnValue = X` + a jump to the end>
-   A reference parameter bound to a variable is another name for it; bound to anything else it is a copy.
+   A reference parameter bound to a place (a variable, `O->A`, `Arr[I]`) is another name for it; bound to a map element
+   or `C ? X : Y`, a copy stored back after the body when the body writes it; bound to a value, a copy.
    Only calls on `this` (or a static) expand, since the body's `this` stays the caller's self. */
 bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::string& Method, bool bMethod, FBlueprintClass& BP,
                              FCallIR& Out, std::string* Err, const Json* Receiver)
@@ -6104,31 +6116,37 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
     ForEach(CallNode, [&](const Json& C) { if (bFirst) { bFirst = false; return; } Args.push_back(&C); });
     if (Args.size() != Parms.size()) { *Err = "inline call to " + Method + " with " + std::to_string(Args.size()) + " arguments"; return false; }
     for (size_t I = 0; I < Args.size(); ++I) Args[I] = DefaultedArg(*Args[I], Parms[I]);
-    /* Every argument is lowered before any parameter is bound: an argument can expand this same function again
-       (`Twice(Twice(V))`), and that expansion binds the parameters for itself. */
+    /* A reference parameter is another name for a variable, or for a place under an object or an index (`O->A`,
+       `Arr[F()]`, `O->S.X`) fixed at the call, as binding a reference fixes it. */
     auto Aliased = [&](size_t I) -> const Json* {
         const std::string Type = TypeOf(*Parms[I]);
         const Json* Bare = PeelLvalue(Args[I]);
         if (Type.empty() || Type.back() != '&' || !Bare || IsDerefLvalue(*Bare)) return nullptr;
-        if (IsAliasable(*Bare) || IsAliasable(Unalias(*Bare))) return Bare;
-        const Json* Arr = IsTArrayElement(*Bare) ? PeelLvalue(Nth(*Bare, 1)) : nullptr;
-        return Arr && IsAliasable(*Arr) && Nth(*Bare, 2) ? Bare : nullptr;
+        return IsAliasable(*Bare) || IsAliasable(Unalias(*Bare)) || IsPinnable(*Bare) ? Bare : nullptr;
     };
-    /* `Arr[I]`: the element is the one I names at the call, so the index is what gets lowered, into Values. */
-    auto ElemIndex = [&](size_t I) { const Json* A = Aliased(I); return A && IsTArrayElement(*A) ? Nth(*A, 2) : nullptr; };
-    /* A reference the body writes, bound to what it cannot name (a map element, `C ? X : Y`, another object's member),
-       gets a copy stored back after the body.
-       ponytail: another object's member could be named through its object pinned in a local, as a computed index is. */
+    /* A reference the body writes, bound to what it cannot name (a map element, `C ? X : Y`), gets a copy stored back
+       after the body. */
     std::vector<std::pair<const Json*, std::string>> CopyBacks;
     for (size_t I = 0; I < Parms.size(); ++I)
         if (const Json* Bare = PeelLvalue(Args[I]); IsMutableRef(TypeOf(*Parms[I])) && Bare && !Aliased(I) && !IsDerefLvalue(*Bare)
             && !OnlyRead(*Body, Parms[I]->value("id", std::string())))
             CopyBacks.emplace_back(Args[I], Name(*Parms[I]));
     if (!CopyBacks.empty()) return LowerCopyBack(CallNode, CopyBacks, Method, BP, Out, Err);
+    /* Every argument is lowered before any parameter is bound: an argument can expand this same function again
+       (`Twice(Twice(V))`), and that expansion binds the parameters for itself. For a reference, that is what fixes
+       its place: the object and the index, into locals (Pins). */
     std::vector<FArgIR> Values(Parms.size());
+    std::vector<Json> Places(Parms.size());
+    std::vector<std::vector<FStmtIR>> Pins(Parms.size());
     for (size_t I = 0; I < Parms.size(); ++I)
-        if (const Json* Index = ElemIndex(I)) { if (!LowerArg(*Index, BP, Values[I], Err)) return false; }
-        else if (!Aliased(I) && !LowerArg(*Args[I], BP, Values[I], Err)) return false;
+        if (const Json* A = Aliased(I))
+        {
+            Json Pre = Json::array();
+            Places[I] = StabilizeLvalue(*A, Pre, true);
+            const Json Wrap = { {"kind", "CompoundStmt"}, {"inner", std::move(Pre)} };
+            if (!LowerBody(Wrap, BP, Pins[I], Locals, Err)) return false;
+        }
+        else if (!LowerArg(*Args[I], BP, Values[I], Err)) return false;
     /* The caller's own variable can stand in for a parameter the body only reads, as a constant does, when nothing
        could change it before the body is done: no argument stores anything, and no parameter is a reference, the
        only way the body could reach a caller's local. */
@@ -6149,28 +6167,12 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
         while (!Type.empty() && (Type.back() == '&' || Type.back() == ' ')) Type.pop_back();
         Type = StripTypeKeywords(Type);
         const std::string Local = Prefix + Name(*Parms[I]);
-        if (ElemIndex(I))
+        if (Aliased(I))
         {
-            /* `T& V` bound to `Arr[I]` is Arr[the index at the call]: a computed index goes to a local once. */
-            Json Elem = *Aliased(I);
-            if (!IsFoldableConst(Values[I]))
-            {
-                const std::string Idx = Local + "Idx";
-                if (!AddLocal(Idx, "int32")) return false;
-                FStmtIR Bind;
-                Bind.K = FStmtIR::Assign;
-                Bind.Var.K = FArgIR::Local;
-                Bind.Var.S = Idx;
-                Bind.Var.LetOp = LetOpFor("int32");
-                Bind.bAssignLocal = true;
-                Bind.Value = std::move(Values[I]);
-                B.Body->push_back(std::move(Bind));
-                Elem["inner"][2] = RefToLocal(Idx, "int32");
-            }
-            RefAlias[Id] = std::move(Elem);
+            for (FStmtIR& P : Pins[I]) B.Body->push_back(std::move(P));
+            RefAlias[Id] = std::move(Places[I]);
             continue;
         }
-        if (const Json* Bare = Aliased(I)) { RefAlias[Id] = *Bare; continue; }
         FStmtIR Bind;
         Bind.Value = std::move(Values[I]);
         /* A constant the body only reads is used in place: no local, no copy. */
