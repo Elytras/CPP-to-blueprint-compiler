@@ -18,6 +18,10 @@ UE_ENUM(EAge);
 constexpr int32 kStep = 3;
 constexpr float kHalf = 1 / 2.f;
 const int32 kMask = 1 << 4 | kStep;
+/* No fixed type: int-sized (or wider when a value needs it), not a byte. */
+enum { kCap = 1000, kDebt = -5 };
+enum ELoose { LooseBig = 70000 };
+enum { kFar = 5000000000 };
 
 /* C++20. consteval: clang runs it and AssetGen reads the answer off the AST, so its body can be anything at all.
    A concept and an `auto` parameter cost nothing either: clang instantiates, AssetGen splices the instantiation. */
@@ -77,6 +81,11 @@ public:
     return M == 0 ? (int32)X : M == 1 ? N : static_cast<int32>(X * 2);
   }
   int64 Trunc64Of(float X) { return (int64)X; }
+  int32 AnonConst(int32 X, int32 M) {
+    int32 V = kCap;
+    return M == 0 ? (X > kCap ? kCap : X) : M == 1 ? X + kDebt : M == 2 ? X * LooseBig : M == 3 ? X == LooseBig : V;
+  }
+  int64 WideConst(int64 X) { return X + kFar; }
 
   /* A null interface is EX_NoInterface: EX_NoObject would set half of the 16 bytes. */
   void Forget() {
