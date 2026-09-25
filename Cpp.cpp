@@ -1,6 +1,7 @@
 ﻿#include "Cpp.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -10,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 #ifdef _WIN32
@@ -8315,6 +8317,71 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 O.Defaults.push_back(PD);
             });
         if (!bOk) return false;
+    }
+
+    /* The first scene component is the actor's root, and the engine puts it at the spawn transform: it never reads the
+       root's RelativeLocation or RelativeRotation, and reads its RelativeScale3D for a C++ SpawnActor but not for
+       Blueprint's Spawn Actor node (USCS_Node::ExecuteNodeOnActor, bIsDefaultTransform). So a plain SceneComponent root
+       hands its offset and scale to the components attached to it, composed as FTransform composes them - the scales
+       multiply, and a child's offset grows with the root's scale and adds the root's offset - and keeps neither. A root
+       that draws something itself would need its own scale, and a rotation would have to turn every child's offset,
+       so those are only warned about. ponytail: rotation is not folded; fold it with FQuat math if a mod needs it. */
+    {
+        auto IsScene = [&](const FRecord* C) {
+            for (; C; C = C->Base.empty() ? nullptr : Find(C->Base)) if (C->UeName == "SceneComponent") return true;
+            return false;
+        };
+        std::vector<std::pair<std::string, const FRecord*>> Scene;     // this class's scene components, the root first
+        for (const Json* F : R.Fields)
+        {
+            const size_t Star = TypeOf(*F).find('*');
+            const FRecord* CR = Star == std::string::npos ? nullptr : Find(StripTypeKeywords(TypeOf(*F).substr(0, Star)));
+            if (R.Components.count(Name(*F)) && IsScene(CR)) Scene.emplace_back(Name(*F), CR);
+        }
+        /* A component's vector default: X, Y, Z (Or each, when it has none), and the def to write another like it. */
+        struct FVec { std::array<double, 3> V; std::optional<FPropertyDef> Def; };
+        auto Read = [](const std::vector<FPropertyDef>& Defs, const char* Prop, double Or) {
+            FVec Out{ { Or, Or, Or }, std::nullopt };
+            for (const FPropertyDef& D : Defs)
+                if (D.Name == Prop) { Out.Def = D; for (int32 I = 0; I < 3; ++I) Out.V[I] = (*D.Members)[I].Default.F; }
+            return Out;
+        };
+        auto Drop = [](std::vector<FPropertyDef>& Defs, const std::string& Prop) {
+            Defs.erase(std::remove_if(Defs.begin(), Defs.end(), [&](const FPropertyDef& D) { return D.Name == Prop; }), Defs.end());
+        };
+        auto Write = [&](std::vector<FPropertyDef>& Defs, FPropertyDef Like, const std::array<double, 3>& V) {
+            Drop(Defs, Like.Name);
+            Like.Members = std::make_shared<std::vector<FPropertyDef>>(*Like.Members);     // its own, not the root's
+            for (int32 I = 0; I < 3; ++I) (*Like.Members)[I].Default.F = V[I];
+            Defs.push_back(Like);
+        };
+        if (!Scene.empty())
+        {
+            std::vector<FPropertyDef>& RootDefs = ComponentDefaults[Scene[0].first];
+            const FVec Lr = Read(RootDefs, "RelativeLocation", 0), Sr = Read(RootDefs, "RelativeScale3D", 1);
+            const bool bPlain = Scene[0].second->UeName == "SceneComponent";
+            std::string Lost = Read(RootDefs, "RelativeRotation", 0).Def ? "RelativeRotation" : "";
+            if (!bPlain && Lr.Def) Lost += (Lost.empty() ? "" : ", ") + std::string("RelativeLocation");
+            if (!bPlain && Sr.Def) Lost += (Lost.empty() ? "" : ", ") + std::string("RelativeScale3D");
+            if (!Lost.empty())
+                printf("  warning: %s::UE_DEFAULTS: %s is the actor's root, which the engine puts at the spawn transform, so its "
+                       "%s is not applied. A USceneComponent root passes its location and scale on to the components attached "
+                       "to it; rotate those instead.\n", R.CppName.c_str(), Scene[0].first.c_str(), Lost.c_str());
+            if (bPlain && (Lr.Def || Sr.Def))
+            {
+                for (size_t C = 1; C < Scene.size(); ++C)
+                {
+                    std::vector<FPropertyDef>& Defs = ComponentDefaults[Scene[C].first];
+                    const FVec Lc = Read(Defs, "RelativeLocation", 0), Sc = Read(Defs, "RelativeScale3D", 1);
+                    std::array<double, 3> L, S;
+                    for (int32 I = 0; I < 3; ++I) { L[I] = Sr.V[I] * Lc.V[I] + Lr.V[I]; S[I] = Sr.V[I] * Sc.V[I]; }
+                    if (Lc.Def || Lr.Def) Write(Defs, Lc.Def ? *Lc.Def : *Lr.Def, L);
+                    if (Sc.Def || Sr.Def) Write(Defs, Sc.Def ? *Sc.Def : *Sr.Def, S);
+                }
+                Drop(RootDefs, "RelativeLocation");
+                Drop(RootDefs, "RelativeScale3D");
+            }
+        }
     }
 
     /* A cooked property carries no offset: FProperty::SetupOffset lays ChildProperties out in order, so emitting them

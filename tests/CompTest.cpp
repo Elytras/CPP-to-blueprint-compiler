@@ -20,11 +20,16 @@ class CompTest : public AActor {
   UE_DEFAULTS {
     Mesh->bVisible = false;
     Lamp->Intensity = 1500.0f;
+    /* The engine puts the root at the spawn transform and never applies its own location or
+       scale, so AssetGen moves them onto the components attached to it: Mesh ends up at
+       (10, 0, 0) scaled (2, 2, 3), and Lamp's offset grows with the root's scale, to (10, 0, 150). */
+    Root->RelativeLocation = FVector(10.0f, 0.0f, 0.0f);
+    Root->RelativeScale3D = FVector(2.0f, 2.0f, 3.0f);
+    Lamp->RelativeLocation = FVector(0.0f, 0.0f, 50.0f);
     /* A constructor's argument lands on the member its parameter is named after, so the stub's
        parameter names are the truth: FColor takes R, G, B, A like the engine's C++ constructor,
-       though its members are B, G, R, A in memory. A struct with a native Serialize, like these
-       two, writes raw bytes rather than nested tags. */
-    Root->RelativeScale3D = FVector(2.0f, 2.0f, 3.0f);
+       though its members are B, G, R, A in memory. A struct with a native Serialize, like FColor
+       and FVector, writes raw bytes rather than nested tags. */
     Lamp->LightColor = FColor(255, 128, 0);     // orange; A defaults to 255
   }
 

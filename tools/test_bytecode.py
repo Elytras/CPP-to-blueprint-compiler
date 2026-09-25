@@ -1129,7 +1129,13 @@ def comp_test():
     assert 'bVisible [0] BoolProperty size=0 value=0' in tags('Mesh_GEN_VARIABLE')
     lamp = tags('Lamp_GEN_VARIABLE')
     assert 'Intensity [0] FloatProperty size=4: 1500.0' in lamp and 'LightColor [0] StructProperty size=4 struct=Color: 0080ffff' in lamp, lamp
-    assert 'RelativeScale3D [0] StructProperty size=12 struct=Vector: 000000400000004000004040' in tags('Root_GEN_VARIABLE')
+    # The root's own location and scale moved onto the components attached to it: (10, 0, 0) and (2, 2, 3) on Mesh,
+    # and Lamp's (0, 0, 50) scaled by the root's and offset by it, to (10, 0, 150).
+    root, mesh = tags('Root_GEN_VARIABLE'), tags('Mesh_GEN_VARIABLE')
+    assert 'Relative' not in root, root
+    for t, loc in ((mesh, '000020410000000000000000'), (lamp, '000020410000000000001643')):
+        assert ('RelativeLocation [0] StructProperty size=12 struct=Vector: ' + loc in t
+                and 'RelativeScale3D [0] StructProperty size=12 struct=Vector: 000000400000004000004040' in t), t
     print('ok  CompTest: BeginPlay override, component variables and archetype defaults')
 
 
