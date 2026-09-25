@@ -55,6 +55,18 @@ def asset(mod):
     return os.path.join(ROOT, mod, 'FSD', 'Content', '_ElytrasMods', mod, mod)
 
 
+def refused(mod, body, why):
+    """A mod (the class body given) the compiler must refuse, saying why."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, mod + '.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\n'
+                    'class %s : public AActor {\npublic:\n%s};\n' % (mod, mod, body))
+        proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, tmp], capture_output=True, encoding='utf-8')
+        assert proc.returncode != 0 and why in proc.stdout, (mod, proc.stdout)
+
+
 def dump(t, base, i):
     return subprocess.run([sys.executable, os.path.join(HERE, t), base, str(i)], capture_output=True, encoding='utf-8').stdout
 
@@ -1842,7 +1854,11 @@ def delegate_targets():
             try: [walk(n) for n in vm.script(fn)[0]]
             except SystemExit: pass
         assert names and all(f in vm.exports and len(vm.script(f)[2]) == 1 for f in names), (mod, names)
-    print('ok  AsyncTest / LatentTest: every delegate bound by name is a one-parameter function of the class')
+    # An inline method is no UFunction: binding one would name a function the class does not have.
+    refused('DispInline', '  UE_DISPATCHER(OnHit, int32 Points);\n  int32 Got = 0;\n'
+            '  inline void Handle(int32 Points) { Got += Points; }\n  void F() { OnHit.Add(this, &DispInline::Handle); }\n',
+            'a delegate cannot bind Handle')
+    print('ok  AsyncTest / LatentTest: every delegate bound by name is a one-parameter function of the class; not an inline one')
 
 
 def repl_runs():

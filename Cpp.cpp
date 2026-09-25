@@ -2430,6 +2430,10 @@ bool FCompiler::LowerDelegateValue(const Json& Obj, const Json& Fn, FArgIR& Out,
     if (!O || Kind(*O) != "CXXThisExpr") { *Err = "TODO: a delegate can only bind a function of `this`"; return false; }
     if (F && Kind(*F) == "UnaryOperator" && F->value("opcode", std::string()) == "&") F = Strip(First(*F));
     if (!F || Kind(*F) != "DeclRefExpr") { *Err = "a delegate binds `&Class::Function`"; return false; }
+    const Json& Ref = (*F)["referencedDecl"];
+    auto Owner = MethodOwner.find(Ref.value("id", std::string()));
+    if (const FRecord* R = Owner != MethodOwner.end() ? Find(Owner->second) : nullptr; R && IsInlineMethod(*R, Name(Ref)))
+    { *Err = "a delegate cannot bind " + Name(Ref) + ": an inline function is expanded where it is called, no UFunction (drop `inline`)"; return false; }
     Out.K = FArgIR::Delegate;
     Out.S = UeNameOf(Cur, (*F)["referencedDecl"].value("name", std::string()));     // found on self by name at run time
     return true;
