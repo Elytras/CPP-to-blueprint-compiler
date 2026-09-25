@@ -1222,6 +1222,7 @@ private:
     std::map<std::string, int32> GotoLabels;          // the body being lowered's: clang LabelDecl id -> FStmtIR::LabelId
     int32 NextGotoLabel = 0;                          // never reset: latent functions share one ubergraph script
     bool bBodyHasGoto = false;                        // a goto can re-reach any declaration, as a loop does
+    bool bFnHasGoto = false;                          // the method or anything inlined into it has one: never restored
     int32 ReEntered = 0;                              // inline expansions under a caller's loop or goto: their bodies run again
     int32 WriteBackDepth = 0;                         // LowerBody: the TMap range-fors around it that write the value back
     int32 GotoLabelOf(const std::string& DeclId)
@@ -5768,6 +5769,7 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
     SavedLabels.swap(GotoLabels);
     const bool bSavedHasGoto = bBodyHasGoto;
     bBodyHasGoto = HasGoto(*Body);
+    bFnHasGoto |= bBodyHasGoto;
     const bool bOk = LowerBody(*Body, BP, *B.Body, Locals, Err);
     LoopDepth = SavedLoops;
     ReEntered = SavedReEntered;
@@ -7764,6 +7766,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         ReEntered = 0;
         GotoLabels.clear();
         bBodyHasGoto = Fn.Body && HasGoto(*Fn.Body);
+        bFnHasGoto = bBodyHasGoto;
         KeepLoaded.clear();
         CurFnName = Fn.Name;
         bCurNet = (NetFlagsOf(Decl) | NetFlagsOf(M)) != 0;
@@ -7790,7 +7793,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         if (!bCurNoOpt)
         {
             PruneConstBranches(Stmts);
-            if (!bBodyHasGoto && !bMadeLatentCall)
+            /* An inlined body's label re-enters the caller's statements too, and these passes see only While loops. */
+            if (!bFnHasGoto && !bMadeLatentCall)
             {
                 FlattenBlocks(Stmts);
                 DropOverwritten(Stmts);
@@ -7798,7 +7802,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             }
             DropUnusedPure(Stmts);
             DropUnusedLocals(Stmts, Locals);
-            if (!bBodyHasGoto && !bMadeLatentCall) CoalesceTemps(Stmts, Locals, BP);
+            if (!bFnHasGoto && !bMadeLatentCall) CoalesceTemps(Stmts, Locals, BP);
         }
         for (const auto& [Struct, Keep] : KeepLoaded)
         {

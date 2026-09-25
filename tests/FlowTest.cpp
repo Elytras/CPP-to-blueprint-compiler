@@ -305,6 +305,22 @@ public:
 
   int32 GotoInlined(int32 A, int32 B) { return FirstSquareAbove(A) * 100 + FirstSquareAbove(B); }
 
+  /* An inline body's goto loop, with a temp in it and a value live across it: the two keep their own slots. */
+  inline int32 GotoLoopKeeps(int32 N) {
+    int32 Base = N * 3;
+    int32 Sum = 0;
+    int32 I = 0;
+  again:
+    Sum += Base;
+    int32 Twice = Sum * 2;
+    Sum = Twice - Sum + Twice * 0 + I;
+    I += 1;
+    if (I < 3) goto again;
+    return Sum;
+  }
+
+  int32 GotoInlinedLive(int32 N) { return GotoLoopKeeps(N); }
+
   /* A declaration a goto reaches again is constructed again, as one in a loop is. */
   int32 GotoRedeclares(int32 Rounds) {
     int32 Round = 0;
