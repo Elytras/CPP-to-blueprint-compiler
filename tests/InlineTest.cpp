@@ -108,6 +108,12 @@ public:
     } while (Twice(I) < N);
     return I;
   }
+
+  /* Same-name overloads: each call expands the one C++ picks, and one may call another. */
+  inline int32 Pick(int32 V) { return V + 1; }
+  inline int32 Pick(bool B) { return B ? 100 : 200; }
+  inline int32 Pick(int32 A, int32 B); // body below
+  int32        PickOverloads(int32 V, bool B) { return Pick(B) + Pick(V) * 1000 + Pick(V, 3) * 10; }
 };
 
 int32 InlineTest::Clamp(int32 V, int32 Lo, int32 Hi) {
@@ -121,3 +127,5 @@ int32 InlineTest::Clamp(int32 V, int32 Lo, int32 Hi) {
 inline int32 InlineTest::Half(int32 V) { return V / 2; }
 
 inline int32 InlineTest::SPred(int32 V) { return V - 1; }
+
+int32 InlineTest::Pick(int32 A, int32 B) { return Pick(A) * B; }

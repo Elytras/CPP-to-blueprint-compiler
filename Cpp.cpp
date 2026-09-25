@@ -331,6 +331,8 @@ struct FRecord
     std::string Base;
     std::map<std::string, const Json*> Methods;     // in-class decl (carries storageClass)
     std::map<std::string, const Json*> MethodDefs;  // out-of-line definition (carries body/parms)
+    std::map<std::string, const Json*> Inlines;     // decl id (in-class or out-of-line) -> an inline method's
+                                                    // definition: by id, as Methods keeps one overload per name
     std::vector<const Json*> Fields;
     std::vector<std::string> Interfaces;            // every base after the first
     std::map<std::string, std::string> Replicated;  // UE_REPLICATED*: variable -> "Notify:Condition"
@@ -958,7 +960,8 @@ private:
     std::map<std::string, std::string> LocalRename;                     // decl id -> an inlined local's unique name
     std::map<std::string, FArgIR> ParmConst;                            // decl id -> the constant an inlined parameter is
     std::vector<std::pair<std::string, std::string>> InlineResults;     // per expansion in progress: result local, type
-    std::vector<std::string> InlineStack;                               // the inline functions being expanded
+    std::vector<const Json*> InlineStack;                               // the inline functions being expanded (their
+                                                                        // definitions: overloads share a name)
     std::vector<FPropertyDef>* CurLocals = nullptr;                     // the function being lowered's locals
     bool LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     bool LowerArgRaw(const Json& N, const std::string& OuterType, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
@@ -1633,6 +1636,8 @@ bool FCompiler::Collect(std::string* Err)
             if (RecIt == Records.end()) return;
             RecIt->second.MethodDefs[Name(N)] = &N;
             MethodOwner[N.value("id", std::string())] = OwnerIt->second;
+            auto& Inlines = RecIt->second.Inlines;
+            if (N.value("inline", false) || Inlines.count(PrevId)) Inlines[PrevId] = Inlines[N.value("id", std::string())] = &N;
             return;
         }
         if (Kind(N) != "CXXRecordDecl" || !N.contains("name") || !N.contains("inner")) return;
@@ -1740,6 +1745,7 @@ bool FCompiler::Collect(std::string* Err)
                 if (!Slot || ParmNames(C).size() > ParmNames(*Slot).size()) Slot = &C;
                 MethodOwner[C.value("id", std::string())] = R.CppName;
                 R.MethodAccess[Name(C)] = Access;
+                if (C.value("inline", false)) R.Inlines[C.value("id", std::string())] = &C;
             }
             else if (Kind(C) == "FieldDecl" && C.contains("name"))
             {
@@ -3928,11 +3934,14 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
             });
             Out.bPure = !bOutParm && (IsPureDecl(*Decl->second) || (Def != R->MethodDefs.end() && IsPureDecl(*Def->second)));
         }
+        /* The overload called, by its decl id: same-name inline overloads are all legal, none is a UFunction. */
+        if (auto Inl = R->Inlines.find(DeclId); Inl != R->Inlines.end())
+            return ExpandInline(CallExprNode, *Inl->second, R->CppName + "::" + MethodName, true, BP, Out, Err);
+        /* A non-inline overload of a name Generate skips as inline (it goes by name): there is no UFunction to call. */
         if (Decl != R->Methods.end() && IsInlineMethod(*R, MethodName))
         {
-            auto DefIt = R->MethodDefs.find(MethodName);
-            return ExpandInline(CallExprNode, DefIt != R->MethodDefs.end() ? *DefIt->second : *Decl->second,
-                                R->CppName + "::" + MethodName, true, BP, Out, Err);
+            *Err = R->CppName + "::" + MethodName + ": TODO: an overload set may not mix inline and non-inline functions";
+            return false;
         }
 
         /* `Base::Method()` on this, from a class that declares Method itself. C++ name hiding leaves only the qualified
@@ -5655,7 +5664,7 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
                              FCallIR& Out, std::string* Err, const Json* Receiver)
 {
     if (!CurLocals) { *Err = "internal: an inline call outside a function body"; return false; }
-    if (std::find(InlineStack.begin(), InlineStack.end(), Method) != InlineStack.end())
+    if (std::find(InlineStack.begin(), InlineStack.end(), &Def) != InlineStack.end())
     { *Err = "inline function " + Method + " calls itself"; return false; }
     if (bMethod && Kind(CallNode) == "CXXMemberCallExpr")
     {
@@ -5790,7 +5799,7 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
         if (!AddLocal(Out.InlineResult, RetType)) return false;
     }
 
-    InlineStack.push_back(Method);
+    InlineStack.push_back(&Def);
     InlineResults.emplace_back(Out.InlineResult, RetType);
     const int32 SavedLoops = LoopDepth, SavedSwitches = SwitchDepth;
     std::vector<FStmtIR> SavedWriteBacks;
@@ -8276,6 +8285,7 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         for (const Json* F : Entry.second.Fields) NormalizePointers(const_cast<Json&>(*F));
         for (const auto& M : Entry.second.Methods) NormalizePointers(const_cast<Json&>(*M.second));
         for (const auto& M : Entry.second.MethodDefs) NormalizePointers(const_cast<Json&>(*M.second));
+        for (const auto& M : Entry.second.Inlines) NormalizePointers(const_cast<Json&>(*M.second));
     }
 
     int32 Generated = 0;
