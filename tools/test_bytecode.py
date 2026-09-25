@@ -35,6 +35,9 @@ if not ASSETGEN or not UEAPI:
     sys.exit(__doc__)
 
 
+LOGS = {}      # what each test's compile printed
+
+
 def build():
     """Each test compiles into build/<Test>/FSD/Content/<its package>, the layout bpbuild stages a mod in."""
     shutil.rmtree(ROOT, ignore_errors=True)
@@ -45,6 +48,7 @@ def build():
         os.makedirs(out)
         proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, out], capture_output=True, encoding='utf-8')
         assert proc.returncode == 0, '%s:\n%s%s' % (mod, proc.stdout, proc.stderr)
+        LOGS[mod] = proc.stdout
     print('ok  every test compiles')
 
 
@@ -769,25 +773,48 @@ def inline_mixed_overloads():
     print('ok  InlineTest: an overload set mixing inline and non-inline is refused where it would call no UFunction')
 
 
+def copy_back():
+    """A written T& bound to what Blueprint has no reference to (a map element, `C ? X : Y`, another object's member)
+    gets a copy, stored back after the call into the place picked at the call, and a warning says it is a copy."""
+    t = asset('InlineTest')
+    for c in (0, 5):
+        for k in (1, 2):
+            f, m = dict(Counter=c), {1: 10, 2: 20}
+            m[k] += 8
+            got = run(t, 'RefMap', self_vars=f, K=k)[0]
+            assert got == m[1] * 100 + m[2] and f == dict(Counter=c + 1), ('RefMap', k, c, got, f)
+        for sel in (True, False):
+            f = dict(Counter=c)
+            got = run(t, 'RefSel', self_vars=f, C=sel)[0]
+            assert got == (1602 if sel else 117) and f == dict(Counter=c + 1), ('RefSel', sel, c, got, f)
+        for by in (-3, 4):
+            vm = VM(t, Counter=c, Calls=7)
+            got = vm.call('RefObj', By=by)
+            assert got == (7 + by) * 10 + c + 1 and vm.self.vars == dict(Counter=c + 1, Calls=7 + by), ('RefObj', by, c, got, vm.self.vars)
+    f = dict(Key=9)
+    got = run(t, 'RefPinned', self_vars=f)[0]
+    assert got == 15 * 1000000 + 15 * 10000 + 40 * 100 + 3 and f == dict(Key=5), ('RefPinned', got, f)
+    for fn, callee, what in (('RefMap', 'Add5', 'a map element'), ('RefMap', 'InlineTest::Bump', 'a map element'),
+                             ('RefSel', 'Add5', '`C ? X : Y`'), ('RefSel', 'InlineTest::Bump', '`C ? X : Y`'),
+                             ('RefObj', 'InlineTest::Bump', "another object's member"), ('RefPinned', 'AddKey', 'a map element')):
+        line = "warning: InlineTest::%s: %s's reference parameter V is bound to %s" % (fn, callee, what)
+        assert line in LOGS['InlineTest'], (line, LOGS['InlineTest'])
+    # Both sides of `C ? X : Y` are located before the call, so one found by a call, which C++ runs only when picked, is refused.
+    refused('RefSelCall', '  void Add5(int32& V) { V += 5; }\n  int32 K() { return 1; }\n'
+            '  int32 F(bool C) { TMap<int32, int32> M; int32 X = 1; Add5(C ? M[K()] : X); return X; }\n', 'found by a call')
+    print('ok  InlineTest: a written reference bound to a map element, `C ? X : Y` or another object\'s member is copied in and back, and warned')
+
+
 inline_members()
 inline_statics()
 no_inline_ufunctions()
 inline_regressions()
 inline_mixed_overloads()
+copy_back()
 # A mod class's asset is named after it, so a namespaced one is refused by name, not as an unwritable `Ns::X.uasset`.
 refused('NsClass', '  int32 F() { return 1; }\n', 'Ns::UThing: a mod class, struct or interface cannot be declared in a namespace',
         top='namespace Ns { class UThing : public UObject { public: int32 X; }; }\n')
 print('ok  a mod class in a namespace is refused, naming it')
-# A written reference needs a place Blueprint can name: bound to a map element, `C ? X : Y` or (inline) another
-# object's member, the write would land in a copy, so each is refused.
-ADD5, BUMP = '  void Add5(int32& V) { V += 5; }\n', '  int32 A = 1;\n  inline void Bump(int32& V) { V += 5; }\n'
-for mod, body, why in (('RefMap', ADD5 + '  int32 F() { TMap<int32, int32> M; M.Add(1, 10); Add5(M[1]); return M[1]; }\n', 'bound to a map element'),
-                       ('RefSel', ADD5 + '  int32 F(bool C) { int32 X = 1, Y = 2; Add5(C ? X : Y); return X + Y; }\n', 'bound to `C ? X : Y`'),
-                       ('InlMap', BUMP + '  int32 F() { TMap<int32, int32> M; M.Add(1, 10); Bump(M[1]); return M[1]; }\n', 'no variable it can name'),
-                       ('InlSel', BUMP + '  int32 F(bool C) { int32 X = 1, Y = 2; Bump(C ? X : Y); return X + Y; }\n', 'no variable it can name'),
-                       ('InlObj', BUMP + '  int32 F() { InlObj* O = this; Bump(O->A); return A; }\n', 'no variable it can name')):
-    refused(mod, body, why)
-print('ok  a written reference bound to a map element, `C ? X : Y` or another object\'s member is refused')
 
 
 # ---- OptTest

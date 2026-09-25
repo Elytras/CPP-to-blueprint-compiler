@@ -1069,6 +1069,11 @@ private:
     Json HoistExpr(const Json& N, Json& Pre, bool bPin = false);
     Json SynthLocal(const std::string& Type, const Json& Init, Json& Pre);
     bool LowerUpdateValue(const Json& N, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
+    /* A written `T&` bound to what the call cannot reach by reference (Refs: each such argument in Call, and its
+       parameter's name) gets a hidden local instead, stored back after the call. */
+    bool LowerCopyBack(const Json& Call, const std::vector<std::pair<const Json*, std::string>>& Refs,
+                       const std::string& Method, FBlueprintClass& BP, FCallIR& Out, std::string* Err);
+    std::set<std::string> WarnedCopies;
 
     /* `X::StaticClass()`: the record X names, read back from the mod's sources (clang's JSON keeps no qualifier). */
     const FRecord* NamedQualifier(const Json& Ref) const;
@@ -2554,13 +2559,12 @@ bool IsMutableRef(const std::string& T)
     return T.size() > 1 && T.back() == '&' && T[T.size() - 2] != '&' && T.compare(0, 6, "const ") != 0;
 }
 
-/* What a UFunction's `T&` cannot be bound to: Blueprint has no reference to a map element (Map_Find copies it out)
-   nor to whichever of two variables `C ? X : Y` picks, so the call would write a copy. Null when it can be. */
-const char* UnboundRef(const Json& Parm, const Json& Arg)
+/* A UFunction's `T&` bound to what Blueprint has no reference to: a map element (Map_Find copies it out), or whichever
+   of two variables `C ? X : Y` picks. The call gets a copy, stored back after it (LowerCopyBack). */
+bool IsUnreferenceable(const Json& Parm, const Json& Arg)
 {
     const Json* Bare = PeelLvalue(&Arg);
-    if (!IsMutableRef(TypeOf(Parm)) || !Bare) return nullptr;
-    return IsTMapElement(*Bare) ? "a map element" : Kind(*Bare) == "ConditionalOperator" ? "`C ? X : Y`" : nullptr;
+    return IsMutableRef(TypeOf(Parm)) && Bare && (IsTMapElement(*Bare) || Kind(*Bare) == "ConditionalOperator");
 }
 
 /* The intrinsics that read their operand's storage through a StructMember donor field. */
@@ -4023,6 +4027,73 @@ bool FCompiler::LowerUpdateValue(const Json& N, FBlueprintClass& BP, FArgIR& Out
     return true;
 }
 
+/* `Add5(M[1])`, `Add5(C ? X : Y)`, an inline `Bump(O->A)`: Blueprint has no reference to a map element (Map_Find
+   copies it out) or to whichever variable `C ? X : Y` picks, and an inline body names another object's member only
+   through a copy. So the call is sugar for
+       <what locates the place: key, condition, object, pinned>  T Copy = <the place>;  <the call on Copy>;  <the place> = Copy;
+   the place fixed before the call, as a reference is bound. A copy is not a reference, though: code that reads the
+   place while the call runs sees it unchanged, hence the warning. */
+bool FCompiler::LowerCopyBack(const Json& Call, const std::vector<std::pair<const Json*, std::string>>& Refs,
+                              const std::string& Method, FBlueprintClass& BP, FCallIR& Out, std::string* Err)
+{
+    if (!CurLocals) { *Err = "internal: a call outside a function body"; return false; }
+    Json Pre = Json::array(), Back = Json::array(), Again = Call;
+    auto Rvalue = [](const Json& L) {
+        return Json{ {"kind", "ImplicitCastExpr"}, {"castKind", "LValueToRValue"}, {"type", L["type"]}, {"inner", Json::array({L})} };
+    };
+    for (const auto& [Arg, Parm] : Refs)
+    {
+        size_t At = 1;
+        while (At < Call["inner"].size() && &Call["inner"][At] != Arg) ++At;
+        if (At == Call["inner"].size()) { *Err = "internal: " + Method + "'s argument for " + Parm + " is not in the call"; return false; }
+        const Json& Bare = *PeelLvalue(Arg);
+        const bool bSel = Kind(Bare) == "ConditionalOperator";
+        Json Place = Bare;
+        if (bSel)
+        {
+            /* Both sides are located up front, so neither may act: only the picked one would, in C++. */
+            bool bReads = false, bActs = false;
+            Locators(Bare["inner"][1], bReads, bActs);
+            Locators(Bare["inner"][2], bReads, bActs);
+            if (bActs)
+            { *Err = Method + ": TODO: its reference parameter " + Parm + " is bound to `C ? X : Y` where X or Y is found by a call"; return false; }
+            Place["inner"][0] = HoistExpr(Bare["inner"][0], Pre, true);
+            Place["inner"][1] = StabilizeLvalue(Bare["inner"][1], Pre, true);
+            Place["inner"][2] = StabilizeLvalue(Bare["inner"][2], Pre, true);
+        }
+        else Place = StabilizeLvalue(Bare, Pre, true);
+        const Json Copy = SynthLocal(StripTypeKeywords(TypeOf(Bare)), Rvalue(Place), Pre);
+        auto Store = [&](const Json& To) {
+            return Json{ {"kind", "BinaryOperator"}, {"opcode", "="}, {"type", To["type"]}, {"inner", Json::array({To, Copy})} };
+        };
+        Back.push_back(bSel ? Json{ {"kind", "IfStmt"}, {"inner", Json::array({Place["inner"][0], Store(Place["inner"][1]), Store(Place["inner"][2])})} }
+                            : Store(Place));
+        Again["inner"][At] = Copy["inner"][0];      // the local itself, which the call takes by reference
+        const std::string What = IsTMapElement(Bare) ? "a map element" : bSel ? "`C ? X : Y`" : "another object's member";
+        char Line[512];
+        snprintf(Line, sizeof(Line), "  warning: %s::%s: %s's reference parameter %s is bound to %s: Blueprint has no reference "
+                 "to it, so %s gets a copy, stored back after the call\n", Cur ? Cur->CppName.c_str() : "", CurFnName.c_str(),
+                 Method.c_str(), Parm.c_str(), What.c_str(), Parm.c_str());
+        if (WarnedCopies.insert(Line).second) fputs(Line, stdout);
+    }
+    const std::string Type = StripTypeKeywords(TypeOf(Call));
+    std::string Result;
+    if (Type.empty() || Type == "void") Pre.push_back(Again);
+    else Result = SynthLocal(Type, Again, Pre)["inner"][0]["referencedDecl"].value("name", std::string());
+    for (Json& B : Back) Pre.push_back(std::move(B));
+    const Json Wrap = { {"kind", "CompoundStmt"}, {"inner", std::move(Pre)} };
+    auto Body = std::make_shared<std::vector<FStmtIR>>();
+    if (!LowerBody(Wrap, BP, *Body, *CurLocals, Err)) return false;
+    Out = FCallIR();
+    Out.Intrinsic = "__Inline__";
+    Out.Inline = std::make_shared<std::vector<FStmtIR>>(1);
+    (*Out.Inline)[0].K = FStmtIR::Block;
+    (*Out.Inline)[0].Body = Body;
+    Out.InlineResult = Result;
+    if (!Result.empty()) Out.InlineType = Type;
+    return true;
+}
+
 /* What a defaulted argument stands for. clang 18 writes the CXXDefaultArgExpr with no child, and the default is the
    parameter's own initialiser (instantiated, in a template's instantiation); a newer clang nests it in the node. */
 const Json* DefaultedArg(const Json& Arg, const Json* Parm)
@@ -4203,6 +4274,17 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
             Out.Context = BP.ClassDefaultObject(CalleePackage, CalleeName);
     }
 
+    /* The called declaration's parameters, for a defaulted argument: FullDecl, when it has the call's arity. */
+    std::vector<const Json*> CalledParms;
+    if (FullDecl) ForEach(*FullDecl, [&](const Json& C) { if (Kind(C) == "ParmVarDecl") CalledParms.push_back(&C); });
+    if (CalledParms.size() != (Receiver ? 1u : 0u) + (CallExprNode.contains("inner") ? CallExprNode["inner"].size() - 1 : 0u))
+        CalledParms.clear();
+    std::vector<std::pair<const Json*, std::string>> CopyBacks;
+    for (size_t I = Receiver ? 1 : 0, At = 1; I < CalledParms.size(); ++I, ++At)
+        if (IsUnreferenceable(*CalledParms[I], CallExprNode["inner"][At]))
+            CopyBacks.emplace_back(&CallExprNode["inner"][At], Name(*CalledParms[I]));
+    if (!CopyBacks.empty()) return LowerCopyBack(CallExprNode, CopyBacks, MethodName, BP, Out, Err);
+
     /* inner[0] is the callee. */
     bool bFirst = true, bOk = true;
     std::vector<bool> Defaulted;
@@ -4213,23 +4295,11 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         if (bOk) Out.Args.push_back(A);
         Defaulted.push_back(false);
     }
-    /* The called declaration's parameters, for a defaulted argument: FullDecl, when it has the call's arity. */
-    std::vector<const Json*> CalledParms;
-    if (FullDecl) ForEach(*FullDecl, [&](const Json& C) { if (Kind(C) == "ParmVarDecl") CalledParms.push_back(&C); });
-    if (CalledParms.size() != (Receiver ? 1u : 0u) + (CallExprNode.contains("inner") ? CallExprNode["inner"].size() - 1 : 0u))
-        CalledParms.clear();
     ForEach(CallExprNode, [&](const Json& C) {
         if (bFirst) { bFirst = false; return; }
         if (!bOk) return;
         FArgIR A;
         const size_t I = Defaulted.size();
-        if (const char* What = I < CalledParms.size() ? UnboundRef(*CalledParms[I], C) : nullptr)
-        {
-            *Err = MethodName + ": its reference parameter " + Name(*CalledParms[I]) + " is bound to " + What + ", which "
-                   "Blueprint cannot pass by reference, so the call would write a copy: pass a local, then store it back";
-            bOk = false;
-            return;
-        }
         bOk = LowerArg(*DefaultedArg(C, I < CalledParms.size() ? CalledParms[I] : nullptr), BP, A, Err);
         if (bOk) Out.Args.push_back(A);
         Defaulted.push_back(Kind(C) == "CXXDefaultArgExpr");
@@ -5999,17 +6069,15 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
     };
     /* `Arr[I]`: the element is the one I names at the call, so the index is what gets lowered, into Values. */
     auto ElemIndex = [&](size_t I) { const Json* A = Aliased(I); return A && IsTArrayElement(*A) ? Nth(*A, 2) : nullptr; };
-    /* A reference the body writes, bound to what it cannot name, would be a copy taking the write.
+    /* A reference the body writes, bound to what it cannot name (a map element, `C ? X : Y`, another object's member),
+       gets a copy stored back after the body.
        ponytail: another object's member could be named through its object pinned in a local, as a computed index is. */
+    std::vector<std::pair<const Json*, std::string>> CopyBacks;
     for (size_t I = 0; I < Parms.size(); ++I)
         if (const Json* Bare = PeelLvalue(Args[I]); IsMutableRef(TypeOf(*Parms[I])) && Bare && !Aliased(I) && !IsDerefLvalue(*Bare)
             && !OnlyRead(*Body, Parms[I]->value("id", std::string())))
-        {
-            *Err = "inline " + Method + ": its reference parameter " + Name(*Parms[I]) + " is written, but the argument is "
-                   "no variable it can name (a map element, `C ? X : Y`, another object's member), so the write would "
-                   "change a copy: pass a local, then store it back";
-            return false;
-        }
+            CopyBacks.emplace_back(Args[I], Name(*Parms[I]));
+    if (!CopyBacks.empty()) return LowerCopyBack(CallNode, CopyBacks, Method, BP, Out, Err);
     std::vector<FArgIR> Values(Parms.size());
     for (size_t I = 0; I < Parms.size(); ++I)
         if (const Json* Index = ElemIndex(I)) { if (!LowerArg(*Index, BP, Values[I], Err)) return false; }
