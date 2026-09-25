@@ -3537,10 +3537,11 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         {
             if (Kind(*RhsRaw) != "IntegerLiteral")
             { *Err = "bit shift with a non-constant amount (Kismet has no shift op; use explicit multiply/divide)"; return false; }
+            /* A shift has the promoted LHS type (no usual arithmetic conversions): `int >> 1LL` is int32 math. */
+            const bool bWide = IsInt64Type(LhsC);
             const int N = std::stoi(RhsRaw->value("value", std::string("0")));
-            if (N < 0 || N > 63)
+            if (N < 0 || N > (bWide ? 63 : 31))
             { *Err = "bit shift amount out of range: " + std::to_string(N); return false; }
-            const bool bWide = Flavour == "Int64Int64";
             const std::string Suffix = bWide ? "Int64Int64" : "IntInt";
             auto Const = [&](int64 V) {
                 FArgIR C;
