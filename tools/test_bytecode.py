@@ -496,6 +496,45 @@ for hits in ((), (0,), (4, -1)):
     vm.call('PokePeers')
     assert vm.self.vars['Peers'] == peers and [p.vars['Hits'] for p in peers.values()] == [h + 1 for h in hits], hits
 print('ok  RangeTest.PokePeers: `Peer->Hits += 1` writes each object, the map keeps its pointers')
+for items, scores in (([], {}), ([1, 2, 3], {'a': 5}), ([4, -7], {'a': 1, 'b': -2})):
+    def peers():
+        return (Obj('RangeTest_C', Items=list(items), Scores=dict(scores)),
+                Obj('RangeTest_C', Items=[100, 200, 300, 400], Scores={'a': 50, 'z': 9}))
+    near, far = peers()
+    vm = VM(asset('RangeTest'), Near=near, Far=far, Picks=0)
+    want = 0
+    for x in items: want = want * 10 + x
+    assert vm.call('SumPicked') == want * 100 + 1, (items, vm.self.vars['Picks'])
+    for fn, field, change in (('DoublePicked', 'Items', lambda: [x * 2 for x in items]),
+                              ('BumpPicked', 'Scores', lambda: {k: v + 1 for k, v in scores.items()})):
+        near, far = peers()
+        vm = VM(asset('RangeTest'), Near=near, Far=far, Picks=0)
+        vm.call(fn)
+        got = (near.vars['Items'], near.vars['Scores'], far.vars, vm.self.vars['Picks'])
+        want = dict(Items=list(items), Scores=dict(scores))
+        want[field] = change()
+        assert got == (want['Items'], want['Scores'], peers()[1].vars, 1), (fn, items, scores, got)
+print('ok  RangeTest: a range expression with a call is evaluated once  (9 cases)')
+for items, scores in (([], {}), ([1, 2, 3], {'a': 5, 'b': 7}), ([4, -7], {'b': -2})):
+    def peers():
+        return (Obj('RangeTest_C', Items=list(items), Scores=dict(scores)),
+                Obj('RangeTest_C', Items=[100, 200, 300, 400], Scores={'z': 9}))
+    near, far = peers()
+    vm = VM(asset('RangeTest'), Near=near, Far=far, Cur=near)
+    want = 0
+    for x in items + items: want = want * 10 + x
+    got = vm.call('SumReseat')
+    assert got == want, ('SumReseat', items, got, want)
+    for fn, field, change in (('DoubleReseat', 'Items', lambda: [x * 2 for x in items]),
+                              ('BumpReseat', 'Scores', lambda: {k: v + 1 for k, v in scores.items()})):
+        near, far = peers()
+        vm = VM(asset('RangeTest'), Near=near, Far=far, Cur=near)
+        vm.call(fn)
+        got = (near.vars['Items'], near.vars['Scores'], far.vars)
+        want = dict(Items=list(items), Scores=dict(scores))
+        want[field] = change()
+        assert got == (want['Items'], want['Scores'], peers()[1].vars), (fn, items, scores, got)
+print('ok  RangeTest: a pointer reseated in a range-for body leaves the range where it was  (9 cases)')
 
 
 def range_members():
