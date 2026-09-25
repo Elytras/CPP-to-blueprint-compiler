@@ -199,6 +199,27 @@ public:
   void StorePeer() { GetPeer()->Cursor = SwapPeer(); }
   void StorePeerField() { Peer->Cursor = SwapPeer(); }
 
+  /* C++17 sequences a call's object before its arguments, and E1 before E2 in E1[E2]: the peer is taken before an
+     inline body or a && / ?: arm in the argument swaps it. */
+  inline int32 SwapPeerInline() { Peer = Spare; return 5; }
+  void SetCursor(int32 V) { Cursor = V; }
+  int32 CursorPlus(int32 V) { return Cursor + V; }
+  void CallPeerInline() { GetPeer()->SetCursor(SwapPeerInline()); }
+  void CallPeerBranch(bool C) { GetPeer()->SetCursor(C && SwapPeer() == 5 ? 5 : 1); }
+  void CallPeerField() { Peer->SetCursor(SwapPeerInline()); }
+  int32 PeerPlus() { return GetPeer()->CursorPlus(SwapPeerInline()); }
+  int32 PeerSlot() { return GetPeer()->Slots[SwapPeerInline() - 5]; }
+  void StorePeerSlot() { GetPeer()->Slots[SwapPeerInline() - 5] = 7; }
+  /* ... and the object holding a container or dispatcher the call works on (argument 0 of the Kismet call). */
+  UE_DISPATCHER(OnPeerHit, int32 Points);
+  void AddPeerSlot() { GetPeer()->Slots.Add(SwapPeerInline()); }
+  void AddPeerSlotBranch(bool C) { GetPeer()->Slots.Add(C && SwapPeer() == 5 ? 5 : 1); }
+  UE_NO_OPTIMIZE void AddPeerSlotRaw() { GetPeer()->Slots.Add(SwapPeerInline()); }
+  void AddPeerMap() { GetPeer()->SlotMap.Add(SwapPeerInline(), 7); }
+  int32 PeerMapAt() { return GetPeer()->SlotMap[SwapPeerInline()]; }
+  void StorePeerMap() { GetPeer()->SlotMap[SwapPeerInline()] = 7; }
+  void FirePeer() { GetPeer()->OnPeerHit.Broadcast(SwapPeerInline()); }
+
   /* Member templates have no UFunction per instantiation: each one a call names is inlined. */
   template <class T> requires(sizeof(T) <= 8) T Scaled(T V) { return V * T(3) + T(Cursor); }
   int32 TemplateMember(int32 X) { int64 Wide = Scaled<int64>(X); return Scaled(X) + int32(Wide); }

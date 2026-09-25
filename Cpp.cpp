@@ -487,6 +487,7 @@ struct FCallIR
     bool bScript = false;               // callee is Blueprint bytecode
     bool bInstance = false;             // non-static method: needs the context object, not the class CDO
     bool bReceiverIsArg = false;        // a forwarded UObject helper (Obj->GetOuter()): Obj is already the first argument, no EX_Context
+    bool bOnArg0 = false;               // Args[0] is the container or dispatcher worked on: the object holding it goes first
     FIndex Context;                     // CDO a static call runs against; null = self
     bool bPure = false;                 // a function of its arguments (UE_PURE, a Kismet operator or conversion): see DropUnusedPure
     uint64 WrittenArgs = ~uint64(0);    // bit I: argument I must stay its own variable, which the callee may write: see ContainerWrites
@@ -995,7 +996,13 @@ private:
     bool RefThrough(FArgIR Addr, const std::string& Pointee, FArgIR& Out, std::string* Err);
     bool ScaleIndex(const Json& IndexNode, const std::string& Pointee, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     bool HoistOperand(FArgIR& Operand, FBlueprintClass& BP, std::vector<FPropertyDef>& Locals,
-                      std::vector<FStmtIR>& OutPre, std::string* Err);
+                      std::vector<FStmtIR>& OutPre, std::string* Err, bool bAlways = false);
+    bool PinObject(FArgIR& Obj, const FArgIR* After, size_t NumAfter, FBlueprintClass& BP,
+                   std::vector<FPropertyDef>& Locals, std::vector<FStmtIR>& OutPre, std::string* Err);
+    bool PinHolder(FArgIR& Place, const FArgIR* After, size_t NumAfter, FBlueprintClass& BP,
+                   std::vector<FPropertyDef>& Locals, std::vector<FStmtIR>& OutPre, std::string* Err);
+    bool HoistCallArgs(FCallIR& C, FBlueprintClass& BP, std::vector<FPropertyDef>& Locals,
+                       std::vector<FStmtIR>& OutPre, std::string* Err);
     bool HasDerefStruct(std::string* Err) const;
     bool LowerPtrCastSource(const Json& Call, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     std::map<std::string, std::string> RefAddr;     // VarDecl id -> pointee: `T& R = *P` keeps the address in an int64 local R
@@ -2413,6 +2420,7 @@ bool FCompiler::LowerDispatcherCall(const Json& Call, const Json& Callee, const 
     Out.K = FArgIR::Call;
     Out.Sub = std::make_shared<FCallIR>();
     FCallIR& C = *Out.Sub;
+    C.bOnArg0 = true;
     C.Args.emplace_back();
     if (!LowerArg(Obj, BP, C.Args[0], Err)) return false;
     if (C.Args[0].K != FArgIR::Field) { *Err = "a dispatcher must be a property: " + Method; return false; }
@@ -2876,9 +2884,9 @@ bool FCompiler::LowerPtrCastSource(const Json& Call, FBlueprintClass& BP, FArgIR
 /* The operand of a StructMember reinterpretation (__AddrOf__, __AsObject__, __NameIndex__) that is not stored
    anywhere goes into a temp first: EX_StructMemberContext reads the storage the operand leaves behind. */
 bool FCompiler::HoistOperand(FArgIR& Operand, FBlueprintClass& BP, std::vector<FPropertyDef>& Locals,
-                             std::vector<FStmtIR>& OutPre, std::string* Err)
+                             std::vector<FStmtIR>& OutPre, std::string* Err, bool bAlways)
 {
-    if (IsStored(Operand)) return true;
+    if (!bAlways && IsStored(Operand)) return true;
     const std::string Type = Operand.K == FArgIR::Int64 ? std::string("int64")
                            : Operand.K == FArgIR::Self ? std::string("class UObject *") : Operand.InnerType;
     const std::string Tmp = "__PtrTmp" + std::to_string(ReadTmpCounter++) + "__";
@@ -3049,6 +3057,7 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             Out.Sub = std::make_shared<FCallIR>();
             Out.Sub->Fn = BP.EngineFunction("/Script/Engine", Lib, Prefix + Method);
             Out.Sub->WrittenArgs = ContainerWrites(Prefix + Method);
+            Out.Sub->bOnArg0 = true;
             Out.Sub->Args.push_back(Target);
             bool bFirst = true, bOk = true;
             std::string LastType;
@@ -3139,6 +3148,7 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
                 Out.Sub = std::make_shared<FCallIR>();
                 Out.Sub->Fn = BP.EngineFunction("/Script/Engine", "BlueprintMapLibrary", "Map_Find");
                 Out.Sub->WrittenArgs = ContainerWrites("Map_Find");
+                Out.Sub->bOnArg0 = true;
                 FArgIR Into;
                 Into.K = FArgIR::Local;
                 Into.S = Tmp;
@@ -3166,6 +3176,7 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             (*Body)[0].K = FStmtIR::StaticCall;
             (*Body)[0].Call.Fn = BP.EngineFunction("/Script/Engine", "BlueprintMapLibrary", "Map_Find");
             (*Body)[0].Call.WrittenArgs = ContainerWrites("Map_Find");
+            (*Body)[0].Call.bOnArg0 = true;
             (*Body)[0].Call.Args = { Map, Key, Into };
             auto Block = std::make_shared<std::vector<FStmtIR>>(1);
             (*Block)[0].K = FStmtIR::Block;
@@ -4949,6 +4960,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 St.K = FStmtIR::StaticCall;
                 St.Call.Fn = BP.EngineFunction("/Script/Engine", "BlueprintMapLibrary", "Map_Add");
                 St.Call.WrittenArgs = ContainerWrites("Map_Add");
+                St.Call.bOnArg0 = true;
                 St.Call.Args.resize(3);
                 bOk = LowerArg(*Nth(*Lhs, 1), BP, St.Call.Args[0], Err) && LowerArg(*Nth(*Lhs, 2), BP, St.Call.Args[1], Err)
                    && LowerArg(*Rhs, BP, St.Call.Args[2], Err);
@@ -6244,7 +6256,12 @@ bool FCompiler::HoistReadsInArg(FArgIR& A, FBlueprintClass& BP,
     if ((A.K == FArgIR::Field || A.K == FArgIR::InterfaceCtx) && A.Base)
         return HoistReadsInArg(*A.Base, BP, Locals, OutPre, Err);
     if (A.K == FArgIR::Index && A.Base && A.Sub && A.Sub->Args.size() == 1)
-        return HoistReadsInArg(*A.Base, BP, Locals, OutPre, Err) && HoistReadsInArg(A.Sub->Args[0], BP, Locals, OutPre, Err);
+    {
+        if (!HoistReadsInArg(*A.Base, BP, Locals, OutPre, Err)) return false;
+        /* `GetCur()->Items[Swap()]`: E1 is sequenced before E2, so the object holding the array is pinned too. */
+        return PinHolder(*A.Base, &A.Sub->Args[0], 1, BP, Locals, OutPre, Err)
+            && HoistReadsInArg(A.Sub->Args[0], BP, Locals, OutPre, Err);
+    }
     if (A.K == FArgIR::DynCast && A.Sub)
         return HoistReadsInArg(A.Sub->Args[0], BP, Locals, OutPre, Err);
     if (A.K != FArgIR::Call || !A.Sub) return true;
@@ -6267,11 +6284,12 @@ bool FCompiler::HoistReadsInArg(FArgIR& A, FBlueprintClass& BP,
         return true;
     }
     if (A.Sub->Target && !HoistReadsInArg(*A.Sub->Target, BP, Locals, OutPre, Err)) return false;
+    if (A.Sub->Target && !PinObject(*A.Sub->Target, A.Sub->Args.data(), A.Sub->Args.size(), BP, Locals, OutPre, Err))
+        return false;
 
     /* Post-order: inner reads hoist before the outer. That way the outer's Addr can reference
        an already-materialised inner temp. */
-    for (FArgIR& CA : A.Sub->Args)
-        if (!HoistReadsInArg(CA, BP, Locals, OutPre, Err)) return false;
+    if (!HoistCallArgs(*A.Sub, BP, Locals, OutPre, Err)) return false;
 
     if (const FReadViewSpec* V = FindReadView(A.Sub->Intrinsic))
         return HoistReadCall(A, *V, BP, Locals, OutPre, Err);
@@ -6432,6 +6450,42 @@ bool ContainsRead(const FArgIR& A)
     return false;
 }
 
+/* C++17 evaluates a call's object before its arguments, but what the arguments hoist (inline bodies, && / ?: arms,
+   reads) runs ahead of the whole statement. So an object that could be different by then goes into a temp first. */
+bool FCompiler::PinObject(FArgIR& Obj, const FArgIR* After, size_t NumAfter, FBlueprintClass& BP,
+                          std::vector<FPropertyDef>& Locals, std::vector<FStmtIR>& OutPre, std::string* Err)
+{
+    if (std::none_of(After, After + NumAfter, [](const FArgIR& A) { return ContainsRead(A); })) return true;
+    if (Obj.K == FArgIR::InterfaceCtx && Obj.Base) return PinObject(*Obj.Base, After, NumAfter, BP, Locals, OutPre, Err);
+    if (Obj.K == FArgIR::Self || Obj.K == FArgIR::ObjConst || Obj.K == FArgIR::NullObj) return true;
+    if (Obj.K == FArgIR::Local && std::none_of(After, After + NumAfter, [&](const FArgIR& A) { return Mentions(A, Obj.S) > 0; }))
+        return true;
+    return HoistOperand(Obj, BP, Locals, OutPre, Err, true);
+}
+
+/* A field's storage is found through the object holding it, so that object is what gets pinned. */
+bool FCompiler::PinHolder(FArgIR& Place, const FArgIR* After, size_t NumAfter, FBlueprintClass& BP,
+                          std::vector<FPropertyDef>& Locals, std::vector<FStmtIR>& OutPre, std::string* Err)
+{
+    FArgIR* P = &Place;
+    while ((P->K == FArgIR::Member || P->K == FArgIR::Index) && P->Base) P = P->Base.get();
+    return P->K != FArgIR::Field || !P->Base || PinObject(*P->Base, After, NumAfter, BP, Locals, OutPre, Err);
+}
+
+/* `GetCur()->Items.Add(Swap())`, `GetCur()->Map[Swap()]`, `GetCur()->OnHit.Broadcast(Swap())`: the container or
+   dispatcher is argument 0, and as the call's object it is evaluated before the rest. */
+bool FCompiler::HoistCallArgs(FCallIR& C, FBlueprintClass& BP, std::vector<FPropertyDef>& Locals,
+                              std::vector<FStmtIR>& OutPre, std::string* Err)
+{
+    for (size_t I = 0; I < C.Args.size(); ++I)
+    {
+        if (!HoistReadsInArg(C.Args[I], BP, Locals, OutPre, Err)) return false;
+        if (I == 0 && C.bOnArg0 && !PinHolder(C.Args[0], C.Args.data() + 1, C.Args.size() - 1, BP, Locals, OutPre, Err))
+            return false;
+    }
+    return true;
+}
+
 bool FCompiler::HoistReadsInStmt(FStmtIR& St, FBlueprintClass& BP,
                                  std::vector<FPropertyDef>& Locals,
                                  std::vector<FStmtIR>& OutPre, std::string* Err)
@@ -6469,8 +6523,9 @@ bool FCompiler::HoistReadsInStmt(FStmtIR& St, FBlueprintClass& BP,
     if (!HoistReadsInArg(St.Value, BP, Locals, OutPre, Err)) return false;
     if (!HoistReadsInArg(St.Cond,  BP, Locals, OutPre, Err)) return false;
     if (St.Call.Target && !HoistReadsInArg(*St.Call.Target, BP, Locals, OutPre, Err)) return false;
-    for (FArgIR& CA : St.Call.Args)
-        if (!HoistReadsInArg(CA, BP, Locals, OutPre, Err)) return false;
+    if (St.Call.Target && !PinObject(*St.Call.Target, St.Call.Args.data(), St.Call.Args.size(), BP, Locals, OutPre, Err))
+        return false;
+    if (!HoistCallArgs(St.Call, BP, Locals, OutPre, Err)) return false;
     for (FArgIR& CA : St.Target.Args)
         if (!HoistReadsInArg(CA, BP, Locals, OutPre, Err)) return false;
     return true;

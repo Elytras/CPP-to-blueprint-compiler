@@ -346,6 +346,41 @@ def assign_order():
     print('ok  FlowTest: `=` / `op=` take the value before locating the destination\'s index, key or object')
 
 
+def call_object_order():
+    """C++17 sequences a call's object (and E1 of E1[E2]) before the arguments: what an argument hoists (an inline
+    body, a && / ?: arm) must not run before the object is taken."""
+    base = asset('FlowTest')
+    for fn, args, cursor, ret in (('CallPeerInline', {}, 5, None), ('CallPeerBranch', dict(C=True), 5, None),
+                                  ('CallPeerBranch', dict(C=False), 1, None), ('CallPeerField', {}, 5, None),
+                                  ('PeerPlus', {}, 3, 8), ('PeerSlot', {}, 3, 10), ('StorePeerSlot', {}, 3, None)):
+        vm = VM(base)
+        near, far = vm.new(Cursor=3, Slots=[10, 11]), vm.new(Cursor=4, Slots=[20, 21])
+        vm.self.vars.update(Peer=near, Spare=far)
+        got = vm.call(fn, **args)
+        swapped = fn != 'CallPeerBranch' or args['C']
+        assert (got == ret and near.vars['Cursor'] == cursor and far.vars['Cursor'] == 4
+                and near.vars['Slots'] == ([7, 11] if fn == 'StorePeerSlot' else [10, 11]) and far.vars['Slots'] == [20, 21]
+                and vm.self.vars['Peer'] is (far if swapped else near)), (fn, args, got, near.vars, far.vars)
+    print('ok  FlowTest: a call\'s object is taken before what its arguments hoist  (7 cases)')
+    # ... and the object holding the container or dispatcher a Kismet call works on (its argument 0).
+    for fn, args, slots, smap, cursor, ret in (
+            ('AddPeerSlot', {}, [10, 11, 5], {5: 1}, 3, None), ('AddPeerSlotBranch', dict(C=True), [10, 11, 5], {5: 1}, 3, None),
+            ('AddPeerSlotBranch', dict(C=False), [10, 11, 1], {5: 1}, 3, None), ('AddPeerSlotRaw', {}, [10, 11, 5], {5: 1}, 3, None),
+            ('AddPeerMap', {}, [10, 11], {5: 7}, 3, None), ('PeerMapAt', {}, [10, 11], {5: 1}, 3, 1),
+            ('StorePeerMap', {}, [10, 11], {5: 7}, 3, None), ('FirePeer', {}, [10, 11], {5: 1}, 5, None)):
+        vm = VM(base)
+        near = vm.new(Cursor=3, Slots=[10, 11], SlotMap={5: 1})
+        far = vm.new(Cursor=4, Slots=[20, 21], SlotMap={5: 9})
+        vm.self.vars.update(Peer=near, Spare=far)
+        vm.binds += [(near, 'OnPeerHit', 'SetCursor', near), (far, 'OnPeerHit', 'SetCursor', far)]
+        got = vm.call(fn, **args)
+        swapped = fn != 'AddPeerSlotBranch' or args['C']
+        assert (got == ret and near.vars == dict(Cursor=cursor, Slots=slots, SlotMap=smap)
+                and far.vars == dict(Cursor=4, Slots=[20, 21], SlotMap={5: 9})
+                and vm.self.vars['Peer'] is (far if swapped else near)), (fn, args, got, near.vars, far.vars)
+    print('ok  FlowTest: a container or dispatcher call\'s object is taken before what its arguments hoist  (8 cases)')
+
+
 def call_member():
     """A member of a returned struct: Translation.Y of the transform GetTransform returns."""
     import runscript
@@ -469,6 +504,7 @@ check('FlowTest', 'SwitchInit', switch_init, [dict(V=v) for v in (-1, 0, 1, 2, 3
 check('FlowTest', 'WhileVar', while_var, [dict(Start=s) for s in (-2, 0, 1, 5)])
 flow_members()
 assign_order()
+call_object_order()
 call_member()
 float_step()
 flow_exports()
