@@ -203,6 +203,9 @@ CONTAINERS = {
     'Map_Clear': lambda ev, store, a: store(a[0], {}),
 }
 
+# No map value is one of these: a container inside a map is the Value of a wrapper struct.
+BARE_CONTAINERS = {'ArrayProperty', 'SetProperty', 'MapProperty'}
+
 
 def run(base, function, self_vars=None, **parms):
     stmts = script_of(base, function)
@@ -249,6 +252,10 @@ def run(base, function, self_vars=None, **parms):
         if o == 0x6B: return ev(n.kids[0])[ev(n.kids[1])]
         if o in (0x1B, 0x45):                                        # the class's own function, by name: a frame of its own
             return run(base, n.val, self_vars, **dict(zip(params_of(base, n.val), [copy.deepcopy(ev(a)) for a in n.kids])))[0]
+        if o in (0x1C, 0x46, 0x68) and n.val == 'Map_Find' and n.kids[2].op in (0, 0x48) and types.get(n.kids[2].val) in BARE_CONTAINERS:
+            # execMap_Find writes in place only into the map's value property class, and a container value is its
+            # wrapper StructProperty: a bare container local is left as it was.
+            return CONTAINERS[n.val](ev, lambda d, v: d is n.kids[2] or store(d, v), n.kids)
         if o in (0x1C, 0x46, 0x68) and n.val in CONTAINERS: return CONTAINERS[n.val](ev, store, n.kids)
         if o in (0x1C, 0x46, 0x68):
             if n.val not in MATH: raise SystemExit('unsupported call ' + n.val)

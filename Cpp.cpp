@@ -6017,7 +6017,17 @@ bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vec
         FArgIR KeyAt;
         if (!LowerArg(Elem, BP, KeyAt, Err)) { --LoopDepth; return false; }
         Loop.Body->push_back(AssignStmt(Key, Args[0], std::move(KeyAt)));
-        Loop.Body->push_back(CallStmt("BlueprintMapLibrary", "Map_Find", { Range, LocalArg(Key), LocalArg(Val) }));
+        FStmtIR Find = CallStmt("BlueprintMapLibrary", "Map_Find", { Range, LocalArg(Key), LocalArg(Val) });
+        if (IsContainerType(StripTypeKeywords(Args[1])))
+        {
+            /* A nested container value is a wrapper struct: Map_Find fills a wrapper temp, then Val is its Value. */
+            FArgIR Call;
+            Call.K = FArgIR::Call;
+            Call.Sub = std::make_shared<FCallIR>(Find.Call);
+            if (!NestedWrapperOut(Args[1], 2, "", AssignStmt(Val, Args[1], FArgIR()), BP, Call, Err)) { --LoopDepth; return false; }
+            Find = Call.Sub->Inline->front();
+        }
+        Loop.Body->push_back(std::move(Find));
         RefAlias[Bindings[0]->value("id", std::string())] = RefToLocal(Key, Args[0]);
         RefAlias[Bindings[1]->value("id", std::string())] = RefToLocal(Val, Args[1]);
         const std::string PairTy = TypeOf(*LoopDecl);

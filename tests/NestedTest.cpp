@@ -33,6 +33,17 @@ public:
     return Total + Grid[0][0];
   }
 
+  TMap<int32, TArray<int32>> Buckets;
+  /* A range-for over a map of containers reads each value, and `auto&` writes it back. */
+  int32 CountBuckets() {
+    int32 Sum = 0;
+    for (const auto &[Key, Bucket] : Buckets) Sum += Bucket.Num() * 10 + Key;
+    return Sum;
+  }
+  void AppendZeroBuckets() {
+    for (auto &[Key, Bucket] : Buckets) Bucket.Add(0);
+  }
+
   TMap<FName, int32> Counts;
   /* Map[Key]: a read is Find (0 for a missing key), a store is Add, `+=` / `++` both. */
   int32 MapIndex(int32 Seed) {

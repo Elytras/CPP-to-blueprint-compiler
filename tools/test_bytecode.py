@@ -689,6 +689,16 @@ def map_index_members():
     print('ok  NestedTest.MapIndex: Counts[a] ends at Seed + 2, other keys untouched')
 
 
+def nested_map_range():
+    for start in ({}, {1: [5, 6], 2: [7]}, {3: [], 9: [1, 2, 3, 4]}):
+        fields = {'Buckets': {k: list(v) for k, v in start.items()}}
+        got = run(asset('NestedTest'), 'CountBuckets', self_vars=fields)[0]
+        assert got == sum(len(v) * 10 + k for k, v in start.items()) and fields == {'Buckets': start}, (start, got, fields)
+        run(asset('NestedTest'), 'AppendZeroBuckets', self_vars=fields)
+        assert fields == {'Buckets': {k: v + [0] for k, v in start.items()}}, (start, fields)
+    print('ok  NestedTest: a range-for over a map of arrays reads and writes back each array')
+
+
 def nested_find_types():
     """execMap_Find writes its out-parm in place only when that property's class matches the map's value property
     (ScriptCore / KismetArrayLibrary): so every Map_Find on Groups must write a FNC_TArray_FName-typed local."""
@@ -706,6 +716,7 @@ def nested_find_types():
 
 nested_containers()
 map_index_members()
+nested_map_range()
 nested_find_types()
 
 
