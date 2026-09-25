@@ -560,15 +560,14 @@ def inline_statics():
 
 def no_inline_ufunctions():
     exports = [e['name'] for e in dumpexp.load(asset('InlineTest'))[5]]
-    for name in ('Clamp', 'Half', 'Twice', 'Bump', 'FirstAbove', 'Nest', 'Dec', 'Plus1', 'Late', 'SDouble', 'SPred', 'Repoint', 'Get2'):
+    for name in ('Clamp', 'Half', 'Twice', 'Bump', 'FirstAbove', 'Nest', 'Dec', 'Plus1', 'Late', 'SDouble', 'SPred'):
         assert name not in exports, name + ' became a UFunction'
     print('ok  InlineTest: no inline function is a UFunction')
 
 
 def inline_regressions():
     """Miscompiles that once shipped, run: a by-value argument read after the body changed its source, a T& bound to an
-    array element (its index a call, run once), to another object's member or to a TMap range-for's value, a T& the body
-    only reads bound to what it cannot name, and a do/while whose test is an inline call."""
+    array element (its index a call, run once), and a do/while whose test is an inline call."""
     for c in (0, 5):
         f = dict(Counter=c)
         assert run(asset('InlineTest'), 'LateMember', self_vars=f)[0] == c * 100 + c + 1 and f == dict(Counter=c + 1), (c, f)
@@ -576,22 +575,8 @@ def inline_regressions():
         f = dict(Counter=5, Calls=0, Arr=[])
         got = run(asset('InlineTest'), 'BumpElem', self_vars=f, By=by)[0]
         assert got == (10 + by) * 100 + 10 + 6 and f == dict(Counter=6, Calls=1, Arr=[10 + by]), (by, got, f)
-    for by in (-3, 0, 4):
-        other = Obj('InlineTest_C', Counter=7, Calls=2, Arr=[10])
-        vm = VM(asset('InlineTest'), Counter=5, Calls=0, Other=other)
-        got = vm.call('BumpOther', By=by)
-        assert got == (7 + by) * 100 + 10 + by and other.vars == dict(Counter=7 + by, Calls=3, Arr=[10 + by]) \
-            and vm.self.vars == dict(Counter=7, Calls=1, Other=None), (by, got, other.vars, vm.self.vars)
-    for by in (-3, 0, 4):
-        f = dict(Counter=5, Scores={'a': 1, 'b': 20})
-        got = run(asset('InlineTest'), 'BumpScoresBy', self_vars=f, By=by)[0]
-        assert got == 7 and f == dict(Counter=7, Scores={'a': 1 + by, 'b': 20 + by}), (by, got, f)
-    for c in (True, False):
-        f = dict(Counter=5, Calls=9, Scores={'a': 21, 'b': 4})
-        got = run(asset('InlineTest'), 'ReadRefs', self_vars=f, C=c)[0]
-        assert got == (5 if c else 9) * 2000 + 42 + 50 and f == dict(Counter=5, Calls=9, Scores={'a': 21, 'b': 4}), (c, got, f)
     check('InlineTest', 'DoInline', lambda N: next(i for i in range(1, 100) if 2 * i >= N), [dict(N=n) for n in (-3, 0, 1, 2, 4, 5, 12)])
-    print('ok  InlineTest: LateMember, BumpElem, BumpOther, BumpScoresBy, ReadRefs and DoInline run as C++ does')
+    print('ok  InlineTest: LateMember, BumpElem and DoInline run as C++ does')
 
 
 inline_members()

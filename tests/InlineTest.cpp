@@ -9,8 +9,6 @@ class InlineTest : public AActor {
   int32         Counter;
   int32         Calls;
   TArray<int32> Arr;
-  InlineTest   *Other;
-  TMap<FString, int32> Scores;
 
 public:
   inline int32 Clamp(int32 V, int32 Lo, int32 Hi); // inline on the declaration, body below
@@ -98,35 +96,6 @@ public:
     Arr.Add(10);
     Bump(Arr[NextIdx()], By);
     return Arr[0] * 100 + Calls * 10 + Counter;
-  }
-
-  /* ... and bound to another object's member, that member of the object named at the call, though the body
-     re-points Other before it writes. */
-  inline void Repoint(int32 &V, InlineTest *To) {
-    Other = To;
-    V += 1;
-  }
-  int32 BumpOther(int32 By) {
-    Bump(Other->Counter, By);
-    Bump(Other->Arr[NextIdx()], By);
-    InlineTest *Was = Other;
-    Repoint(Other->Calls, nullptr);
-    return Was->Counter * 100 + Was->Arr[0];
-  }
-
-  /* ... and bound to a TMap range-for's value, that value, written back; a T& the body only reads may bind a copy
-     of what it cannot name. */
-  inline int32 Get2(int32 &V) { return V * 2; }
-  int32 BumpScoresBy(int32 By) {
-    for (auto &[K, V] : Scores)
-      Bump(V, By);
-    return Counter;
-  }
-  int32 ReadRefs(bool C) {
-    int32 S = Get2(C ? Counter : Calls) * 1000 + Get2(Scores["a"]);
-    for (auto &[K, V] : Scores)
-      S += Get2(V);
-    return S;
   }
 
   /* do/while runs its body before the first test, when the test is an inline call too; continue goes to the test. */

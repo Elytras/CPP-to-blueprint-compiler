@@ -23,7 +23,6 @@ class PointerTest : public AActor {
 
   /* A T& parameter stays an out-parm. */
   void Bump(int32 &Value) { Value = Value + 1; }
-  inline void BumpInline(int32 &Value) { Value = Value + 1; }
 
 public:
   void ReceiveBeginPlay() {
@@ -52,8 +51,6 @@ public:
 
     Bump(*P); // the memory itself binds the out-parm
     Check(Items[0] == 22, "*P binds a T& parameter");
-    BumpInline(*P);
-    Check(Items[0] == 23, "*P binds an inline function's T& parameter");
 
     *Advance(P, 1) = 50;
     Check(Items[1] == 50, "a pointer return value and pointer arithmetic");

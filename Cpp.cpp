@@ -5649,7 +5649,7 @@ bool HasGoto(const Json& N)
 /* The call becomes one Block statement in Out.Inline:
        <each by-value parameter> = <its argument>;
        <the body, locals renamed __Inl<N>_<name>, `return X` as `__Inl<N>_ReturnValue = X` + a jump to the end>
-   A reference parameter is another name for the lvalue it binds; one bound to a temporary, or read only, may be a copy.
+   A reference parameter bound to a variable is another name for it; bound to anything else it is a copy.
    Only calls on `this` (or a static) expand, since the body's `this` stays the caller's self. */
 bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::string& Method, bool bMethod, FBlueprintClass& BP,
                              FCallIR& Out, std::string* Err, const Json* Receiver)
@@ -5694,73 +5694,20 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
     for (size_t I = 0; I < Args.size(); ++I) Args[I] = DefaultedArg(*Args[I], Parms[I]);
     /* Every argument is lowered before any parameter is bound: an argument can expand this same function again
        (`Twice(Twice(V))`), and that expansion binds the parameters for itself. */
-    /* A reference parameter names the storage its argument does, pinned at the call so every use in the body reaches
-       the same place: a pointer an arrow goes through and a computed TArray index go to locals once, and memory
-       through a pointer binds by address, as `T& R = *P` does. Anything else is a copy, if the body only reads it. */
-    struct FPin { bool bRef = false, bAddr = false; Json Lv; std::string Pointee; FArgIR Addr;
-                  std::vector<std::tuple<std::string, std::string, FArgIR>> Temps; };
-    /* A variable, or a name another reference already stands for (a TMap range-for's `auto& [K, V]`). */
-    auto Named = [&](const Json& N) {
-        return IsAliasable(N) || (Kind(N) == "DeclRefExpr" && RefAlias.count(N["referencedDecl"].value("id", std::string())));
-    };
-    std::function<bool(const Json&)> Pinnable = [&](const Json& E) {
-        const Json* N = PeelLvalue(&E);
-        if (Named(*N)) return true;
-        if (IsTArrayElement(*N)) return Nth(*N, 2) && Pinnable(*Nth(*N, 1));
-        if (Kind(*N) != "MemberExpr" || !First(*N)) return false;
-        return N->value("isArrow", false) || Pinnable(*First(*N));
-    };
-    std::function<bool(Json&, FPin&, const std::string&)> PinLv = [&](Json& E, FPin& P, const std::string& Local) {
-        Json* N = &E;
-        while (PeelLvalue(N) != N) N = &(*N)["inner"][0];
-        if (Named(*N)) return true;
-        auto Hoist = [&](Json& Slot, const std::string& Type) {
-            FArgIR V;
-            if (!LowerArg(Slot, BP, V, Err)) return false;
-            if (IsFoldableConst(V)) return true;
-            const std::string T = Local + "__Pin" + std::to_string(P.Temps.size());
-            if (!AddLocal(T, Type)) return false;
-            P.Temps.emplace_back(T, Type, std::move(V));
-            Slot = RefToLocal(T, Type);
-            return true;
-        };
-        if (IsTArrayElement(*N)) return PinLv((*N)["inner"][1], P, Local) && Hoist((*N)["inner"][2], "int32");
-        if (!N->value("isArrow", false)) return PinLv((*N)["inner"][0], P, Local);
-        return Hoist((*N)["inner"][0], StripTypeKeywords(TypeOf((*N)["inner"][0])));
-    };
-    std::vector<FPin> Pins(Parms.size());
-    std::vector<FArgIR> Values(Parms.size());
-    for (size_t I = 0; I < Parms.size(); ++I)
-    {
+    auto Aliased = [&](size_t I) -> const Json* {
         const std::string Type = TypeOf(*Parms[I]);
         const Json* Bare = PeelLvalue(Args[I]);
-        FPin& P = Pins[I];
-        if (!Type.empty() && Type.back() == '&' && Bare)
-        {
-            if (IsDerefLvalue(*Bare))
-            {
-                P.bRef = P.bAddr = true;
-                if (!LowerAddress(*Bare, BP, P.Addr, &P.Pointee, Err)) return false;
-                continue;
-            }
-            if (Pinnable(*Bare))
-            {
-                P.bRef = true;
-                P.Lv = *Bare;
-                if (!PinLv(P.Lv, P, Prefix + Name(*Parms[I]))) return false;
-                continue;
-            }
-            /* A copy is only wrong when the body can write through the reference. */
-            if (Bare->value("valueCategory", std::string()) == "lvalue" && Type.compare(0, 6, "const ") != 0
-                && !OnlyReadValue(Def, Parms[I]->value("id", std::string())))
-            {
-                *Err = "inline " + Method + ": reference parameter " + Name(*Parms[I]) + " bound to a " + Kind(*Bare)
-                     + ", which it cannot name (a variable, a member, an element or memory through a pointer); bind a variable";
-                return false;
-            }
-        }
-        if (!LowerArg(*Args[I], BP, Values[I], Err)) return false;
-    }
+        if (Type.empty() || Type.back() != '&' || !Bare || IsDerefLvalue(*Bare)) return nullptr;
+        if (IsAliasable(*Bare)) return Bare;
+        const Json* Arr = IsTArrayElement(*Bare) ? PeelLvalue(Nth(*Bare, 1)) : nullptr;
+        return Arr && IsAliasable(*Arr) && Nth(*Bare, 2) ? Bare : nullptr;
+    };
+    /* `Arr[I]`: the element is the one I names at the call, so the index is what gets lowered, into Values. */
+    auto ElemIndex = [&](size_t I) { const Json* A = Aliased(I); return A && IsTArrayElement(*A) ? Nth(*A, 2) : nullptr; };
+    std::vector<FArgIR> Values(Parms.size());
+    for (size_t I = 0; I < Parms.size(); ++I)
+        if (const Json* Index = ElemIndex(I)) { if (!LowerArg(*Index, BP, Values[I], Err)) return false; }
+        else if (!Aliased(I) && !LowerArg(*Args[I], BP, Values[I], Err)) return false;
     /* The caller's own variable can stand in for a parameter the body only reads, as a constant does, when nothing
        could change it before the body is done: no argument stores anything, and no parameter is a reference, the
        only way the body could reach a caller's local. */
@@ -5770,17 +5717,6 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
         const std::string T = TypeOf(*Parms[I]);
         bVarsInPlace = bVarsInPlace && (T.empty() || T.back() != '&') && IsSideEffectFree(*Args[I]);
     }
-    auto Store = [](const std::string& Name, const std::string& Type, FArgIR Value) {
-        FStmtIR St;
-        St.K = FStmtIR::Assign;
-        St.Var.K = FArgIR::Local;
-        St.Var.S = Name;
-        St.Var.LetOp = LetOpFor(Type);
-        St.bAssignLocal = true;
-        St.Value = std::move(Value);
-        return St;
-    };
-    std::vector<FStmtIR> PinStores;
     for (size_t I = 0; I < Parms.size(); ++I)
     {
         const std::string Id = Parms[I]->value("id", std::string());
@@ -5789,20 +5725,31 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
         RefAlias.erase(Id);
         LocalRename.erase(Id);
         ParmConst.erase(Id);
-        RefAddr.erase(Id);
         while (!Type.empty() && (Type.back() == '&' || Type.back() == ' ')) Type.pop_back();
         Type = StripTypeKeywords(Type);
         const std::string Local = Prefix + Name(*Parms[I]);
-        if (FPin& P = Pins[I]; P.bRef)
+        if (ElemIndex(I))
         {
-            for (auto& [T, TT, V] : P.Temps) PinStores.push_back(Store(T, TT, std::move(V)));
-            if (!P.bAddr) { RefAlias[Id] = std::move(P.Lv); continue; }
-            if (!AddLocal(Local, "int64")) return false;
-            PinStores.push_back(Store(Local, "int64", std::move(P.Addr)));
-            RefAddr[Id] = P.Pointee;
-            LocalRename[Id] = Local;
+            /* `T& V` bound to `Arr[I]` is Arr[the index at the call]: a computed index goes to a local once. */
+            Json Elem = *Aliased(I);
+            if (!IsFoldableConst(Values[I]))
+            {
+                const std::string Idx = Local + "Idx";
+                if (!AddLocal(Idx, "int32")) return false;
+                FStmtIR Bind;
+                Bind.K = FStmtIR::Assign;
+                Bind.Var.K = FArgIR::Local;
+                Bind.Var.S = Idx;
+                Bind.Var.LetOp = LetOpFor("int32");
+                Bind.bAssignLocal = true;
+                Bind.Value = std::move(Values[I]);
+                B.Body->push_back(std::move(Bind));
+                Elem["inner"][2] = RefToLocal(Idx, "int32");
+            }
+            RefAlias[Id] = std::move(Elem);
             continue;
         }
+        if (const Json* Bare = Aliased(I)) { RefAlias[Id] = *Bare; continue; }
         FStmtIR Bind;
         Bind.Value = std::move(Values[I]);
         /* A constant the body only reads is used in place: no local, no copy. */
@@ -5821,8 +5768,6 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
         BindIds.push_back(Id);
         LocalRename[Id] = Local;
     }
-    /* After the by-value binds, which ArgumentsInPlace expects to lead the block; C++ leaves argument order open. */
-    for (FStmtIR& St : PinStores) B.Body->push_back(std::move(St));
 
     /* Every local the body declares gets the expansion's prefix. */
     std::function<void(const Json&)> Rename = [&](const Json& N) {
