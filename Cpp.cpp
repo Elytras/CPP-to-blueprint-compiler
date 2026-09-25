@@ -1217,7 +1217,7 @@ private:
     bool bBodyHasGoto = false;                        // a goto can re-reach any declaration, as a loop does
     bool bFnHasGoto = false;                          // the method or anything inlined into it has one: never restored
     int32 ReEntered = 0;                              // inline expansions under a caller's loop or goto: their bodies run again
-    int32 WriteBackDepth = 0;                         // LowerBody: the TMap range-fors around it that write the value back
+    std::vector<FStmtIR> WriteBacks;                  // LowerBody: the Map_Add of each TMap range-for around it, innermost last
     int32 GotoLabelOf(const std::string& DeclId)
     {
         const auto It = GotoLabels.find(DeclId);
@@ -4882,6 +4882,8 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 if (!LowerArg(*First(*S), BP, Store.Value, Err)) { bOk = false; return; }
                 Out.push_back(std::move(Store));
             }
+            /* Leaving the body's by-reference TMap range-fors: their values go back first. */
+            Out.insert(Out.end(), WriteBacks.rbegin(), WriteBacks.rend());
             St.K = FStmtIR::InlineReturn;
         }
         else if (K == "ReturnStmt")
@@ -4891,6 +4893,32 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             {
                 St.bHasValue = true;
                 bOk = LowerArg(*First(*S), BP, St.Value, Err);
+            }
+            /* Leaving by-reference TMap range-fors: the value is taken first (it may still change theirs), then each
+               loop's value goes back into its map, innermost first. */
+            if (bOk && !WriteBacks.empty())
+            {
+                const std::string RetTy = St.bHasValue ? StripTypeKeywords(TypeOf(*First(*S))) : std::string();
+                if (!RetTy.empty() && RetTy != "void")
+                {
+                    const std::string Temp = "__Ret" + std::to_string(ReadTmpCounter++) + "__";
+                    FPropertyDef PD;
+                    if (!TypeToProperty(RetTy, Temp, 0, "return value", BP, &PD, Err)) { bOk = false; return; }
+                    PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+                    Locals.push_back(PD);
+                    FStmtIR Store;
+                    Store.K = FStmtIR::Assign;
+                    Store.Var.K = FArgIR::Local;
+                    Store.Var.S = Temp;
+                    Store.Var.LetOp = LetOpFor(RetTy);
+                    Store.bAssignLocal = true;
+                    Store.Value = std::move(St.Value);
+                    Out.push_back(std::move(Store));
+                    St.Value = FArgIR();
+                    St.Value.K = FArgIR::Local;
+                    St.Value.S = Temp;
+                }
+                Out.insert(Out.end(), WriteBacks.rbegin(), WriteBacks.rend());
             }
         }
         else if (K == "IfStmt")
@@ -5124,7 +5152,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
         }
         else if (K == "GotoStmt")
         {
-            if (WriteBackDepth > 0)
+            if (!WriteBacks.empty())
             {
                 *Err = "a goto inside a TMap range-for that writes its value back would skip the write: "
                        "bind `const auto& [Key, Value]`, or leave with break";
@@ -5751,12 +5779,14 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
 
     InlineStack.push_back(Method);
     InlineResults.emplace_back(Out.InlineResult, RetType);
-    const int32 SavedLoops = LoopDepth, SavedSwitches = SwitchDepth, SavedWriteBacks = WriteBackDepth;
+    const int32 SavedLoops = LoopDepth, SavedSwitches = SwitchDepth;
+    std::vector<FStmtIR> SavedWriteBacks;
+    SavedWriteBacks.swap(WriteBacks);
     /* The body's break / continue are its own, so the caller's loops are not LoopDepth here; but the body still runs
        once per trip round them, and a declaration in it must start fresh each time (the __Fresh twin below). */
     const int32 SavedReEntered = ReEntered;
     ReEntered += (SavedLoops > 0 || bBodyHasGoto) ? 1 : 0;
-    LoopDepth = SwitchDepth = WriteBackDepth = 0;
+    LoopDepth = SwitchDepth = 0;
     /* Each expansion lowers the body again, so its labels get ids of their own. */
     std::map<std::string, int32> SavedLabels;
     SavedLabels.swap(GotoLabels);
@@ -5767,7 +5797,7 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
     LoopDepth = SavedLoops;
     ReEntered = SavedReEntered;
     SwitchDepth = SavedSwitches;
-    WriteBackDepth = SavedWriteBacks;
+    WriteBacks.swap(SavedWriteBacks);
     GotoLabels.swap(SavedLabels);
     bBodyHasGoto = bSavedHasGoto;
     InlineResults.pop_back();
@@ -5962,9 +5992,9 @@ bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vec
         }
     }
     Json BodyWrap = Kind(*Body) == "CompoundStmt" ? *Body : Json{ {"kind", "CompoundStmt"}, {"inner", Json::array({ *Body })} };
-    if (Loop.Trailer) ++WriteBackDepth;
+    if (Loop.Trailer) WriteBacks.push_back(Loop.Trailer->front());
     const bool bBodyOk = LowerBody(BodyWrap, BP, *Loop.Body, Locals, Err);
-    if (Loop.Trailer) --WriteBackDepth;
+    if (Loop.Trailer) WriteBacks.pop_back();
     if (!bBodyOk) { --LoopDepth; return false; }
     --LoopDepth;
     Loop.Inc->push_back(AssignStmt(Idx, "int32", Math("Add_IntInt", LocalArg(Idx), One)));
@@ -7755,7 +7785,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         CurLocals = &Locals;
         LoopDepth = 0;
         SwitchDepth = 0;
-        WriteBackDepth = 0;
+        WriteBacks.clear();
         ReEntered = 0;
         GotoLabels.clear();
         bBodyHasGoto = Fn.Body && HasGoto(*Fn.Body);

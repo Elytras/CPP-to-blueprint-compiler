@@ -448,6 +448,41 @@ for stop in (0, 15, 1000):
         want = fn(theirs)
         assert (got, mine) == (want, theirs), 'BumpScores(%s, %s) = %r %r, want %r %r' % (m, stop, got, mine, want, theirs)
 print('ok  RangeTest.BumpScores  (9 cases)')
+
+
+def bump_until(f, stop):
+    for k in f['Scores']:
+        f['Scores'][k] += 10
+        for i in range(2):
+            if f['Scores'][k] + i > stop: return f['Scores'][k] * 10 + i
+    return -1
+
+
+def cap_scores(f, cap):
+    for k in f['Scores']:
+        f['Scores'][k] += 1
+        if f['Scores'][k] > cap:
+            f['Scores'][k] = cap
+            return None
+
+
+def bump_inlined(f, stop):
+    for k in f['Scores']:
+        f['Scores'][k] += 1
+        if f['Scores'][k] > stop: return f['Scores'][k] * 2 + 1
+    return -1 * 2 + 1
+
+
+n = 0
+for fn, oracle in (('BumpScoresUntil', bump_until), ('CapScores', cap_scores), ('BumpScoresInlined', bump_inlined)):
+    for stop in (-100, 0, 5, 15, 25, 1000):
+        for m in ({}, {'a': 1}, {'a': 1, 'b': 20, 'c': 3}, {'a': -50, 'b': 6}):
+            mine, theirs = range_self(Scores=m), range_self(Scores=m)
+            got = run(asset('RangeTest'), fn, self_vars=mine, **{'Cap' if fn == 'CapScores' else 'Stop': stop})[0]
+            want = oracle(theirs, stop)
+            assert (got, mine) == (want, theirs), '%s(%s, %s) = %r %r, want %r %r' % (fn, m, stop, got, mine, want, theirs)
+            n += 1
+print('ok  RangeTest: a return from a reference TMap loop writes the changed value back  (%d cases)' % n)
 for m in ({}, {'a': {'X': 1, 'Y': 2}}, {'a': {'X': -1, 'Y': 0}, 'b': {'X': 5, 'Y': 7}}):
     f = dict(Spots={k: dict(v) for k, v in m.items()})
     got = run(asset('RangeTest'), 'ShiftSpots', self_vars=f)[0]
