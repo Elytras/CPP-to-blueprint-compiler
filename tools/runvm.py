@@ -19,7 +19,7 @@ def _ref(s):
 def _node(s):
     """runscript's parser plus what latent / async / spawn bodies use. Nodes runscript already read keep its val."""
     op, mem = s.b[s.o], s.mem
-    if op not in (0, 0x48, 0x19, 0x1C, 0x20, 0x2E, 0x2F, 0x30, 0x46, 0x4B, 0x5B, 0x5C, 0x64, 0x68):
+    if op not in (0, 0x48, 0x19, 0x1C, 0x20, 0x2E, 0x2F, 0x30, 0x46, 0x4B, 0x5B, 0x5C, 0x63, 0x64, 0x68):
         return _parse(s)
     s.u8()
     n = Node(op, mem)
@@ -27,6 +27,7 @@ def _node(s):
     if op == 0x19: n.kids.append(s.node()); s.i32(); s.fieldpath(); n.kids.append(s.node())
     elif op in (0x20, 0x2E, 0x2F): n.val = _ref(s)
     elif op in (0x1C, 0x46, 0x68): n.val = _ref(s); s.args(n.kids)          # an export callee has no quotes
+    elif op == 0x63: n.val = _ref(s); s.args(n.kids)                        # the signature, the dispatcher, its args
     elif op == 0x4B: n.val = s.name()
     elif op == 0x5B: n.val = s.i32()
     elif op == 0x5C: n.kids += [s.node(), s.node()]
@@ -161,6 +162,12 @@ class VM:
                 obj, prop = (ev(t.kids[0]), t.kids[1].val) if t.op == 0x19 else (me, t.val)
                 _, dfn, dobj = ev(n.kids[1])
                 s.binds.append((obj, prop, dfn, dobj))
+            elif o == 0x63:                                 # CallMulticastDelegate: the dispatcher, then its arguments
+                t = n.kids[0]
+                obj, prop = (ev(t.kids[0]), t.kids[1].val) if t.op == 0x19 else (me, t.val)
+                vals = [ev(a) for a in n.kids[1:]]
+                for bobj, bprop, dfn, dobj in list(s.binds):
+                    if bobj is obj and bprop == prop: s.call(dfn, *vals, on=dobj)
             elif o == 6: pc = at[n.val]
             elif o == 7:
                 if not ev(n.kids[0]): pc = at[n.val]
