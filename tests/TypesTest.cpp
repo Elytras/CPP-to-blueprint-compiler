@@ -46,6 +46,7 @@ class TypesTest : public AActor, public ITargetable {
   static constexpr int32 kSlots = kStep * 4;
   int32 Budget = kSlots * 2 + 1;
   float Reach = kHalf * 300 - 25;
+  bool Halfway = kHalf;        // a float is true when nonzero: 0.5f is true
   int32 Bits = ~kMask & 0xFF;
   UE_DISPATCHER(OnScored, int32 Points, AActor *By);
   TScriptInterface<IHealth> Health;
@@ -86,6 +87,10 @@ public:
     return M == 0 ? (X > kCap ? kCap : X) : M == 1 ? X + kDebt : M == 2 ? X * LooseBig : M == 3 ? X == LooseBig : V;
   }
   int64 WideConst(int64 X) { return X + kFar; }
+  /* A constant float is true when nonzero, not when it truncates to nonzero (0.5f and 0.25f are true). */
+  int32 FloatTruth(int32 X, int32 M) {
+    return M == 0 ? !kHalf : M == 1 ? kHalf && X > 0 : M == 2 ? (kHalf ? 7 : 9) : (bool)0.25f + 0;
+  }
 
   /* A null interface is EX_NoInterface: EX_NoObject would set half of the 16 bytes. */
   void Forget() {

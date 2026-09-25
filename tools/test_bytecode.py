@@ -739,7 +739,8 @@ def constants():
     base = asset('TypesTest')
     exports = [e['name'] for e in dumpexp.load(base)[5]]
     cdo = subprocess.run([sys.executable, os.path.join(here, 'dumptags.py'), base, str(exports.index('Default__TypesTest_C'))], capture_output=True, text=True).stdout
-    for want in ('Seed [0] IntProperty size=4: %d' % fnv('types'), 'Budget [0] IntProperty size=4: 25', 'Reach [0] FloatProperty size=4: 125.0', 'Bits [0] IntProperty size=4: 236'):
+    for want in ('Seed [0] IntProperty size=4: %d' % fnv('types'), 'Budget [0] IntProperty size=4: 25', 'Reach [0] FloatProperty size=4: 125.0', 'Bits [0] IntProperty size=4: 236',
+                 'Halfway [0] BoolProperty size=0 value=1'):
         assert want in cdo, (want, cdo)
     print('ok  TypesTest: a member default is what its constant expression comes to')
     import struct
@@ -786,6 +787,8 @@ def types_behaviour():
     check('TypesTest', 'AnonConst', lambda X, M: [min(X, 1000), wrap(X - 5), wrap(X * 70000), int(X == 70000), 1000][M],
           [dict(X=x, M=m) for x in EDGE + (500, 999, 1000, 1001, 5000, 69999, 70000) for m in range(5)])
     check('TypesTest', 'WideConst', lambda X: X + 5000000000, [dict(X=x) for x in (-5000000000, -1, 0, 7, 1 << 32)])
+    # A constant float is true when nonzero (0.5f truncated to 0 first and folded to false).
+    check('TypesTest', 'FloatTruth', lambda X, M: [0, int(X > 0), 7, 1][M], [dict(X=x, M=m) for x in EDGE for m in range(4)])
     # An int64 enum compares as int64: a value sharing only Eon's / Epoch's low 32 bits is neither.
     check('TypesTest', 'AgeOf', lambda A: 1 if A == 5000000000 else 2 if A == 0 else 0,
           [dict(A=a) for a in (0, 5000000000, 7, 5000000001, 5000000000 & 0xFFFFFFFF, 1 << 32, -(1 << 32))])
