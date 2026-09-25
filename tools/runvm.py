@@ -109,6 +109,8 @@ class VM:
                 return None if obj is None else ev(n.kids[1], obj)
             if o == 0x42:                                   # a struct member; raw-pointer reads land here too
                 base = ev(n.kids[0])
+                if isinstance(base, (runscript.Slot, runscript.Free)): return base[n.val]
+                if n.val == '__Slots__': return runscript.slots_of(base)
                 if isinstance(base, Obj): s.mem[base.addr] = base; return base.addr     # an object slot as an int64
                 if isinstance(base, dict) and n.val not in base and 'Data' in base:      # an array view of an address:
                     return [s.mem[base['Data'] - 0x20].outer]                          # UObjectBase::OuterPrivate
@@ -136,7 +138,7 @@ class VM:
             elif dest.op == 1: ctx.vars[dest.val] = v; s.log.append(('set', ctx, dest.val))
             elif dest.op == 0x6B: ev(dest.kids[0])[ev(dest.kids[1])] = v; s.log.append(('set', ctx, dest.kids[0].val))
             elif dest.op == 0x42:
-                if not isinstance(ev(dest.kids[0]), dict): store(dest.kids[0], {})
+                if not isinstance(ev(dest.kids[0]), (dict, runscript.Slot, runscript.Free)): store(dest.kids[0], {})
                 ev(dest.kids[0])[dest.val] = v
             elif dest.op == 0x19:
                 obj = ev(dest.kids[0])
@@ -152,7 +154,7 @@ class VM:
                 arr, i = ev(dest.kids[0], ctx), ev(dest.kids[1], ctx)
                 return lambda v: (arr.__setitem__(i, v), s.log.append(('set', ctx, dest.kids[0].val)))
             st = ev(dest.kids[0], ctx) if dest.op == 0x42 else None
-            if isinstance(st, dict): return lambda v: st.__setitem__(dest.val, v)
+            if isinstance(st, (dict, runscript.Slot, runscript.Free)): return lambda v: st.__setitem__(dest.val, v)
             return lambda v: store(dest, v, ctx)
 
         pc = 0

@@ -11,6 +11,7 @@ class RangeTest : public AActor {
   TMap<FName, int32> Scores;
   TMap<FName, FIntPoint> Spots;
   TMap<FName, RangeTest *> Peers;
+  TMap<int32, TArray<int32>> Lists;
   int32 Hits;
   RangeTest *Near;
   RangeTest *Far;
@@ -176,5 +177,61 @@ public:
       Cur = Far;
       Value += 1;
     }
+  }
+
+  /* A container value is the map's own too: V.Add changes the array `Lists[K]` reads, and a store to `Lists[K]` is what
+     V holds next. */
+  int32 ListsInPlace(int32 D) {
+    int32 Sum = 0;
+    for (auto &[K, V] : Lists) {
+      V.Add(K * D);
+      TArray<int32> More = Lists[K];
+      Sum += More.Num();
+      More.Add(7);
+      Lists[K] = More;
+      for (int32 &X : V) X += 1;
+      Sum += V.Num() * 10 + V[V.Num() - 1] * 100;
+    }
+    return Sum;
+  }
+
+  /* `const auto&` names the value where it lives as well: a store through the map is what it reads. */
+  int32 ConstSeesStore() {
+    int32 Sum = 0;
+    for (const auto &[K, V] : Lists) {
+      TArray<int32> More = V;
+      More.Add(1);
+      Lists[K] = More;
+      Sum += V.Num();
+    }
+    return Sum;
+  }
+
+  /* A T& binds the value itself, so there is no copy to warn about. */
+  void Nudge(FIntPoint &P, int32 By) {
+    P.X += By;
+    P.Y -= By;
+  }
+  int32 NudgeSpots(int32 By) {
+    int32 Sum = 0;
+    for (auto &[Key, Spot] : Spots) {
+      Nudge(Spot, By);
+      Sum += Spots[Key].X * 10 + Spot.Y;
+    }
+    return Sum;
+  }
+
+  /* Removing from the map it walks would move the walk under it: this loop walks a copy of the keys instead. */
+  int32 DropNegatives() {
+    int32 Kept = 0;
+    for (auto &[Key, Value] : Scores) {
+      if (Value < 0) {
+        Scores.Remove(Key);
+        continue;
+      }
+      Value += 1;
+      Kept++;
+    }
+    return Kept;
   }
 };

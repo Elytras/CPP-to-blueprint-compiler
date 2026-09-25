@@ -681,6 +681,79 @@ for items, scores in (([], {}), ([1, 2, 3], {'a': 5, 'b': 7}), ([4, -7], {'b': -
 print('ok  RangeTest: a pointer reseated in a range-for body leaves the range where it was  (9 cases)')
 
 
+def lists_in_place(f, d):
+    s = 0
+    for k in f['Lists']:
+        f['Lists'][k].append(i32(k * d))
+        more = list(f['Lists'][k])
+        s = i32(s + len(more))
+        f['Lists'][k] = v = more + [7]
+        v[:] = [i32(x + 1) for x in v]
+        s = i32(s + len(v) * 10 + i32(v[-1] * 100))
+    return s
+
+
+def const_sees_store(f):
+    s = 0
+    for k in f['Lists']:
+        f['Lists'][k] = f['Lists'][k] + [1]
+        s += len(f['Lists'][k])
+    return s
+
+
+def nudge_spots(f, by):
+    s = 0
+    for p in f['Spots'].values():
+        p['X'], p['Y'] = i32(p['X'] + by), i32(p['Y'] - by)
+        s = i32(s + i32(p['X'] * 10) + p['Y'])
+    return s
+
+
+def drop_negatives(f):
+    kept = 0
+    for k in list(f['Scores']):
+        if f['Scores'][k] < 0:
+            del f['Scores'][k]
+            continue
+        f['Scores'][k] = i32(f['Scores'][k] + 1)
+        kept += 1
+    return kept
+
+
+def walk_self(**kw):
+    return dict(Scores=copy.deepcopy(kw.get('Scores', {})), Lists=copy.deepcopy(kw.get('Lists', {})),
+                Spots=copy.deepcopy(kw.get('Spots', {})))
+
+
+n = 0
+for fn, oracle, parms, cases in (
+        ('ListsInPlace', lists_in_place, [dict(D=d) for d in (0, 3, -2)], [dict(Lists=m) for m in ({}, {1: []}, {1: [5], 4: [2, 9]})]),
+        ('ConstSeesStore', const_sees_store, [{}], [dict(Lists=m) for m in ({}, {3: []}, {1: [5], 4: [2, 9]})]),
+        ('NudgeSpots', nudge_spots, [dict(By=b) for b in (0, 3)],
+         [dict(Spots=m) for m in ({}, {'a': {'X': 1, 'Y': 2}, 'b': {'X': -5, 'Y': 7}})]),
+        ('DropNegatives', drop_negatives, [{}], [dict(Scores=m) for m in ({}, {'a': -1}, {'a': 1, 'b': -20, 'c': 3, 'd': -4})])):
+    for p in parms:
+        for c in cases:
+            mine, theirs = walk_self(**c), walk_self(**c)
+            got = run(asset('RangeTest'), fn, self_vars=mine, **p)[0]
+            want = oracle(theirs, *p.values())
+            assert (got, mine) == (want, theirs), (fn, c, p, got, mine, want, theirs)
+            n += 1
+# A map that lost elements has free slots in its sparse array: the walk packs it first, and never reads one.
+for m, holes in (({'a': 1, 'b': 20, 'c': 3}, (0, 2)), ({'a': 5}, (1,)), ({}, (0,))):
+    mine, theirs = range_self(), range_self(Scores=m)
+    mine['Scores'] = runscript.Holey(m, holes)
+    got = run(asset('RangeTest'), 'SeenInBody', self_vars=mine, D=2)[0]
+    assert (got, mine) == (seen_in_body(theirs, 2), theirs), (m, holes, got, mine)
+    n += 1
+mine, theirs = walk_self(), walk_self(Lists={1: [5], 4: [2, 9]})
+mine['Lists'] = runscript.Holey({1: [5], 4: [2, 9]}, (1,))
+assert (run(asset('RangeTest'), 'ListsInPlace', self_vars=mine, D=3)[0], mine) == (lists_in_place(theirs, 3), theirs), mine
+# V is the value itself, so a T& binds it: no copy, and no warning that there is one.
+assert 'Blueprint has no reference to it' not in LOGS['RangeTest'], LOGS['RangeTest']
+print("ok  RangeTest: `auto& [K, V]` over a TMap walks its slots in place, a container value and a T& to V included  (%d cases)" % (n + 1))
+
+
 def range_members():
     """Range-for side effects on the members: a by-value loop variable writes nothing, a reference one writes
     exactly the elements the loop reached."""
