@@ -1119,6 +1119,7 @@ private:
     /* `X::StaticClass()`: the record X names, read back from the mod's sources (clang's JSON keeps no qualifier). */
     const FRecord* NamedQualifier(const Json& Ref) const;
     bool IsSubclassOf(const FRecord& Child, const FRecord& Parent) const;
+    uint32 NativeTail(const FRecord* Component) const;
     mutable std::vector<std::string> SourceTexts;                       // the mod directory's .h/.cpp, read on demand
 
     /* The native UFunction Method overrides, or null; InheritedFlags gets the flags it passes on, also
@@ -3937,6 +3938,17 @@ bool FCompiler::IsSubclassOf(const FRecord& Child, const FRecord& Parent) const
     for (const FRecord* A = &Child; A; A = A->Base.empty() ? nullptr : Find(A->Base))
         if (A == &Parent) return true;
     return false;
+}
+
+/* The bytes a component class's native Serialize reads after UObject's part, zero for an empty default. Read off the
+   4.27 source: UStaticMeshComponent::Serialize always does `Ar << LODData`, an int32 count; the Actor, Scene and
+   Primitive components and the light components read nothing more from an unversioned package. Without the count the
+   engine read the next export as LODData, and CompTest's Mesh failed to load with a fatal error (DRG, 2026-09-25). */
+uint32 FCompiler::NativeTail(const FRecord* Component) const
+{
+    for (const FRecord* A = Component; A; A = A->Base.empty() ? nullptr : Find(A->Base))
+        if (A->UeName == "StaticMeshComponent") return 4;
+    return 0;
 }
 
 /* The qualifier token is where a qualified DeclRefExpr's range begins; the JSON gives its byte offset and length but
@@ -8344,7 +8356,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                assigns the instance it built from the archetype. */
             BP.AddComponent(FieldName, BP.EngineClass(CR->UePackage, CR->UeName),
                             BP.ClassDefaultObject(CR->UePackage, CR->UeName), bIsScene,
-                            ComponentDefaults[FieldName]);
+                            ComponentDefaults[FieldName], NativeTail(CR));
             ComponentDefaults.erase(FieldName);
         }
         if (auto Rep = Decl.Replicated.find(FieldName); Rep != Decl.Replicated.end())
@@ -8414,7 +8426,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         }
         BP.AddSubobjectOverride(Sub->substr(0, Space), UeNameOf(Entry.second.Owner, Entry.first),
                                 BP.EngineClass(Sub->substr(Space + 1, Dot - Space - 1), Sub->substr(Dot + 1)),
-                                Entry.second.Defaults);
+                                Entry.second.Defaults, NativeTail(Find("U" + Sub->substr(Dot + 1))));
     }
     for (const auto& Entry : ComponentOverrides)
     {
@@ -8442,7 +8454,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         BP.AddComponentOverride(VarName, BP.EngineClass(CR->UePackage, CR->UeName),
                                 BP.Subobject(CR->UePackage, CR->UeName, OwnerClass,
                                              VarName + "_GEN_VARIABLE"),
-                                OwnerClass, NodeGuid, Entry.second.Defaults);
+                                OwnerClass, NodeGuid, Entry.second.Defaults, NativeTail(CR));
     }
 
     /* The OOL definition carries body/parms; only the in-class decl carries storageClass. */
