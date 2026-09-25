@@ -83,6 +83,18 @@ std::string TypeOf(const Json& N)
     return It == N.end() ? std::string() : It->value("qualType", std::string());
 }
 
+/* A namespace is a folder: `A::B::X` is <Package>/A/B/X. One that starts at Game is a /Game path of its own, `Game::A::X`
+   being /Game/A/X, which is where genueapi puts a game Blueprint's class too. */
+std::string PathIn(const std::string& Package, const std::string& Qualified)
+{
+    std::string P = Qualified.compare(0, 6, "Game::") == 0 ? "/" + Qualified : Package + "/" + Qualified;
+    for (size_t At; (At = P.find("::")) != std::string::npos;) P.replace(At, 2, "/");
+    return P;
+}
+
+/* `A::B::X` is X. */
+std::string LeafOf(const std::string& Qualified) { return Qualified.substr(Qualified.rfind(':') + 1); }
+
 /* A CharacterLiteral's value is its code unit; a plain char is signed (clang for MSVC), so '\xff' is -1. */
 int64 CharValue(const Json& N)
 {
@@ -1150,6 +1162,38 @@ private:
         auto A = Aliases.find(CppName);
         return A == Aliases.end() || A->second == CppName ? nullptr : Find(A->second);
     }
+    /* A record's package and UClass / UScriptStruct name. A mod's own is cooked where its namespace says (PathIn),
+       named after its leaf, a class with _C; the engine's and the game's carry theirs in UE_CLASS. */
+    std::string PackageOf(const FRecord& R) const { return R.UePackage.empty() ? PathIn(ModPackage, R.CppName) : R.UePackage; }
+    std::string ClassOf(const FRecord& R) const
+    {
+        return !R.UePackage.empty() ? R.UeName : LeafOf(R.CppName) + (R.bIsStruct ? "" : "_C");
+    }
+    /* OutDir holds UE_MOD_PACKAGE, and is <Content>/<that path without /Game>, as bpbuild stages a mod. A package under
+       the mod's is saved under OutDir, any other /Game one under Content. The log names the first relative to OutDir. */
+    std::filesystem::path ContentDir(const std::string& OutDir) const
+    {
+        std::filesystem::path Content(OutDir);
+        for (size_t At = ModPackage.find('/', 1); At != std::string::npos; At = ModPackage.find('/', At + 1))
+            Content = Content.parent_path();
+        return Content;
+    }
+    std::string Shown(const std::string& Package) const
+    {
+        return Package.compare(0, ModPackage.size() + 1, ModPackage + "/") == 0 ? Package.substr(ModPackage.size() + 1) : Package;
+    }
+    std::filesystem::path FileOf(const std::string& OutDir, const std::string& Package) const
+    {
+        const std::string In = Shown(Package);
+        return In != Package ? std::filesystem::path(OutDir) / In : ContentDir(OutDir) / Package.substr(6);
+    }
+    bool SavePackage(FPackage& P, const std::string& OutDir, const std::string& Package, std::string* Err) const
+    {
+        const std::filesystem::path File = FileOf(OutDir, Package);
+        std::error_code Ec;
+        std::filesystem::create_directories(File.parent_path(), Ec);
+        return P.Save(File.string(), Err);
+    }
 
     Json Doc;
     bool LoadTables(const std::string& IncludeDir, std::string* Err);
@@ -1772,8 +1816,8 @@ bool FCompiler::Collect(std::string* Err)
                 std::string Owner;
                 if (FindLiteral(C, Owner))
                 {
-                    R.UePackage = Owner + "/" + R.CppName;
-                    R.UeName = R.CppName;
+                    R.UePackage = PathIn(Owner, R.CppName);
+                    R.UeName = LeafOf(R.CppName);
                 }
             }
             else if (Kind(C) == "VarDecl" && Name(C).size() > 11 && Name(C).compare(Name(C).size() - 11, 11, "__UeForward") == 0)
@@ -1862,7 +1906,10 @@ bool FCompiler::Collect(std::string* Err)
         return false;
     }
 
-    /* UE_ENUM / UE_ENUM_IN: a UserDefinedEnum at <owner>/<Name>, typed like UeApi's native enums. */
+    /* UE_ENUM / UE_ENUM_IN: a UserDefinedEnum at <owner>/<Name>, typed like UeApi's native enums. clang spells a use
+       inside the enum's namespace as written, `EKind`, so a leaf no other one shares names it too, as Bare does a class. */
+    std::map<std::string, int32> Leaves;
+    for (const auto& Mark : EnumMarks) ++Leaves[LeafOf(Mark.first)];
     for (const auto& [Enum, Owner] : EnumMarks)
     {
         auto D = EnumDecls.find(Enum);
@@ -1875,22 +1922,23 @@ bool FCompiler::Collect(std::string* Err)
         for (const auto& En : D->second)
             if (En.second < Bottom || En.second > Top)
             { *Err = "UE_ENUM(" + Enum + "): " + En.first + " is out of range (the largest value is _MAX's)"; return false; }
-        const std::string Leaf = Enum.substr(Enum.rfind(':') == std::string::npos ? 0 : Enum.rfind(':') + 1);
+        const std::string Leaf = LeafOf(Enum);
         std::string First = D->second.front().first;
         for (const auto& En : D->second) if (En.second == 0) { First = En.first; break; }
-        Enums[Enum] = { (Owner.empty() ? ModPackage : Owner) + "/" + Leaf, Leaf, U, First };
-        if (Owner.empty() || Owner == ModPackage) ModEnums[Leaf] = D->second;
+        Enums[Enum] = { PathIn(Owner.empty() ? ModPackage : Owner, Enum), Leaf, U, First };
+        if (Leaf != Enum && Leaves[Leaf] == 1) Enums.emplace(Leaf, Enums[Enum]);
+        if (Owner.empty() || Owner == ModPackage) ModEnums[Enum] = D->second;
     }
 
     for (auto& It : Records)
     {
         FRecord& R = It.second;
         if (R.UePackage.empty()) continue;
-        if (R.UePackage != ModPackage + "/" + R.CppName) continue;
-        if (!R.bIsStruct && R.UeName != R.CppName + "_C")
+        if (R.UePackage != PathIn(ModPackage, R.CppName)) continue;
+        if (!R.bIsStruct && R.UeName != LeafOf(R.CppName) + "_C")
         {
             *Err = "UE_CLASS on " + R.CppName + " says \"" + R.UeName
-                 + "\", but cooking it here requires \"" + R.CppName + "_C\"";
+                 + "\", but cooking it here requires \"" + LeafOf(R.CppName) + "_C\"";
             return false;
         }
         R.bIsLocal = true;
@@ -1919,7 +1967,7 @@ FIndex FCompiler::FindEvent(FBlueprintClass& BP, const std::string& FromRecord, 
             if (auto M = R->Methods.find(Method); M != R->Methods.end() && !IsStaticDecl(*M->second) && !IsInlineMethod(*R, Method))
             {
                 *InheritedFlags = ModMethodFlags(*R, Method, BP);
-                return bFlagsOnly ? Null() : BP.EngineFunction(ModPackage + "/" + R->CppName, R->CppName + "_C", UeMethod);
+                return bFlagsOnly ? Null() : BP.EngineFunction(PackageOf(*R), ClassOf(*R), UeMethod);
             }
         if (R->IsNative() && R->Methods.count(Method) && !R->Forwards.count(Method))   // a forwarder is no UFunction to override
         {
@@ -2133,6 +2181,8 @@ std::string FCompiler::Canon(std::string T) const
             for (const std::string& A : SplitTemplateArgs(Inner)) Out += (Out.back() == '<' ? "" : ", ") + Canon(A);
             return Out + ">";
         }
+    /* clang spells a class as written, `FAmmo` inside its namespace and `Weapons::FAmmo` outside. */
+    if (const FRecord* R = Find(T)) return R->CppName;
     return T;
 }
 
@@ -2365,8 +2415,7 @@ bool FCompiler::LowerMakeStruct(const std::string& Type, const Json* List, FBlue
     CurLocals->push_back(PD);
 
     const bool bPlainName = R->IsNative() || IsInternalViewStruct(R->CppName);
-    const FIndex Struct = R->IsNative() ? BP.ScriptStruct(R->UePackage, R->UeName)
-                                        : BP.ScriptStruct(ModPackage + "/" + R->CppName, R->CppName);
+    const FIndex Struct = BP.ScriptStruct(PackageOf(*R), ClassOf(*R));
     auto Body = std::make_shared<std::vector<FStmtIR>>();
     size_t I = 0;
     bool bOk = true;
@@ -2379,7 +2428,7 @@ bool FCompiler::LowerMakeStruct(const std::string& Type, const Json* List, FBlue
             FStmtIR Set;
             Set.K = FStmtIR::Assign;
             Set.Var.K = FArgIR::Member;
-            Set.Var.S = bPlainName ? UeNameOf(R, Name(F)) : ModFieldName(ModPackage + "/" + R->CppName, Name(F));
+            Set.Var.S = bPlainName ? UeNameOf(R, Name(F)) : ModFieldName(PackageOf(*R), Name(F));
             Set.Var.Owner = Struct;
             Set.Var.LetOp = LetOpFor(TypeOf(F));
             Set.Var.Base = std::make_shared<FArgIR>();
@@ -2417,9 +2466,8 @@ bool FCompiler::LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& 
         Out.K = FArgIR::Member;
         Out.S = (R->IsNative() || IsInternalViewStruct(R->CppName))
                     ? UeNameOf(R, Name(MemberNode))
-                    : ModFieldName(ModPackage + "/" + R->CppName, Name(MemberNode));
-        Out.Owner = R->IsNative() ? BP.ScriptStruct(R->UePackage, R->UeName)
-                                  : BP.ScriptStruct(ModPackage + "/" + R->CppName, R->CppName);
+                    : ModFieldName(PackageOf(*R), Name(MemberNode));
+        Out.Owner = BP.ScriptStruct(PackageOf(*R), ClassOf(*R));
         Out.LetOp = LetOpFor(TypeOf(MemberNode));
         Out.Base = std::make_shared<FArgIR>();
         /* `P->X` and `(*P).X`: StructMember offsets into the memory P points at. The base is only offset into,
@@ -2432,7 +2480,7 @@ bool FCompiler::LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& 
             {
                 int32 Size = 0, Align = 0;
                 if (!StructLayout(*R, &Size, &Align, Err)) return false;
-                KeepStructLoaded(Out.Owner, R->CppName, Size);
+                KeepStructLoaded(Out.Owner, ClassOf(*R), Size);
             }
             FArgIR Addr;
             std::string Pointee;
@@ -2459,9 +2507,7 @@ bool FCompiler::LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& 
        another mod is. */
     Out.K = FArgIR::Field;
     Out.S = UeNameOf(R, Name(MemberNode));      // `Name_0` is the engine's `Name`: see FRecord::UeNames
-    Out.Owner = R->IsNative() ? BP.PropertyOwner(R->UePackage, R->UeName)
-              : R == Cur      ? BP.ClassIndex()
-                              : BP.PropertyOwner(ModPackage + "/" + R->CppName, R->CppName + "_C");
+    Out.Owner = !R->IsNative() && R == Cur ? BP.ClassIndex() : BP.PropertyOwner(PackageOf(*R), ClassOf(*R));
     Out.LetOp = LetOpFor(TypeOf(MemberNode));
     const Json* Obj = Strip(ObjRaw);
     if (!Obj) { *Err = "property access with no object: " + Name(MemberNode); return false; }
@@ -3020,8 +3066,7 @@ bool FCompiler::LowerAddress(const Json& Lvalue, FBlueprintClass& BP, FArgIR& Ou
         if (!Lib) { *Err = "`&Obj->Member` finds the member at run time through ReadProperty::GetPropertyAddress: include ReadProperty.h"; return false; }
         FArgIR Obj;
         if (!LowerArg(*Base, BP, Obj, Err)) return false;
-        const std::string Pkg = Lib->IsNative() ? Lib->UePackage : ModPackage + "/" + Lib->CppName;
-        const std::string Cls = Lib->IsNative() ? Lib->UeName : Lib->CppName + "_C";
+        const std::string Pkg = PackageOf(*Lib), Cls = ClassOf(*Lib);
         Out = FArgIR();
         Out.K = FArgIR::Call;
         Out.InnerType = "int64";
@@ -3583,8 +3628,7 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             if (!Cur)
             { *Err = "__ClassOf__: no enclosing class in scope"; return false; }
 
-            const std::string CalleePkg = ModPackage + "/" + Cur->CppName;
-            const std::string CalleeCls = Cur->CppName + "_C";
+            const std::string CalleePkg = PackageOf(*Cur), CalleeCls = ClassOf(*Cur);
             Out.K = FArgIR::Call;
             Out.Sub = std::make_shared<FCallIR>();
             Out.Sub->Fn = BP.EngineFunction(CalleePkg, CalleeCls, "GetParmClassName");
@@ -4397,10 +4441,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
             Out.bLocalVirtual = bLocal;
         }
 
-        const std::string CalleePackage = R->IsNative() ? R->UePackage
-                                                        : ModPackage + "/" + R->CppName;
-        const std::string CalleeName    = R->IsNative() ? R->UeName
-                                                        : R->CppName + "_C";
+        const std::string CalleePackage = PackageOf(*R), CalleeName = ClassOf(*R);
         Out.Fn = BP.EngineFunction(CalleePackage, CalleeName, UeNameOf(R, MethodName));
         Out.bScript = CalleePackage.compare(0, 6, "/Game/") == 0;
         Out.bInstance = !bStatic;
@@ -7372,10 +7413,11 @@ bool FCompiler::AssetRef(const Json& N, FBlueprintClass& BP, FIndex* Out)
     std::string Package;
     const std::string Var = Name(D);
     const auto Scope = VarScope.find(D.value("id", std::string()));
-    if (auto At = AssetPaths.find((Scope == VarScope.end() ? std::string() : Scope->second) + Var); At != AssetPaths.end())
+    const std::string Qual = (Scope == VarScope.end() ? std::string() : Scope->second) + Var;
+    if (auto At = AssetPaths.find(Qual); At != AssetPaths.end())
         Package = At->second;
     else if (std::any_of(AssetDecls.begin(), AssetDecls.end(), [&](const Json* A) { return Name(*A) == Var; }))
-        Package = ModPackage + "/" + Var;
+        Package = PathIn(ModPackage, Qual);
     else return false;
 
     /* "/Game/Dir/Pkg.Object" names an object other than the package's namesake; "/Game/Dir/Pkg" means Pkg.Pkg. */
@@ -7385,9 +7427,7 @@ bool FCompiler::AssetRef(const Json& N, FBlueprintClass& BP, FIndex* Out)
         Package.resize(Package.size() - (Object.size() - Dot));
         Object = Object.substr(Dot + 1);
     }
-    const bool bNative = R->IsNative();
-    *Out = BP.Asset(bNative ? R->UePackage : ModPackage + "/" + R->CppName, bNative ? R->UeName : R->CppName + "_C",
-                    Package, Object);
+    *Out = BP.Asset(PackageOf(*R), ClassOf(*R), Package, Object);
     return true;
 }
 
@@ -7572,9 +7612,8 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
 
 FIndex FCompiler::ClassImportOf(const FRecord& R, FBlueprintClass& BP) const
 {
-    if (R.IsNative()) return BP.EngineClass(R.UePackage, R.UeName);
-    if (&R == Cur) return BP.ClassIndex();
-    return BP.EngineClass(ModPackage + "/" + R.CppName, R.CppName + "_C");
+    if (!R.IsNative() && &R == Cur) return BP.ClassIndex();
+    return BP.EngineClass(PackageOf(R), ClassOf(R));
 }
 
 /*
@@ -7756,8 +7795,7 @@ bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& P
     {
         int32 Size = 0, Align = 0;
         if (!StructLayout(*SR, &Size, &Align, Err)) return false;
-        *Out = StructParam(PName, BP.ScriptStruct(SR->IsNative() ? SR->UePackage : ModPackage + "/" + SR->CppName, SR->CppName),
-                           SR->CppName, Size, ExtraFlags);
+        *Out = StructParam(PName, BP.ScriptStruct(PackageOf(*SR), ClassOf(*SR)), ClassOf(*SR), Size, ExtraFlags);
         return true;
     }
 
@@ -7777,9 +7815,7 @@ bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& P
     }
     const FRecord* PR = ClassName.empty() ? nullptr : Find(ClassName);
     if (!PR || PR->bIsStruct) { *Err = UnknownClass(Where, QualType, ClassName); return false; }
-    *Out = ObjectParam(PName, PR->IsNative() ? BP.EngineClass(PR->UePackage, PR->UeName)
-                                             : BP.EngineClass(ModPackage + "/" + PR->CppName, PR->CppName + "_C"),
-                       ExtraFlags);
+    *Out = ObjectParam(PName, BP.EngineClass(PackageOf(*PR), ClassOf(*PR)), ExtraFlags);
     return true;
 }
 
@@ -7860,7 +7896,7 @@ no state, so there are no variables to carry.
 bool FCompiler::GenerateInterface(const FRecord& R, const std::string& OutDir, std::string* Err)
 {
     Cur = &R;
-    const std::string PackageName = ModPackage + "/" + R.CppName;
+    const std::string PackageName = PackageOf(R);
     FPackage P(PackageName);
     StampIdentity(P, PackageName);
 
@@ -7874,11 +7910,8 @@ bool FCompiler::GenerateInterface(const FRecord& R, const std::string& OutDir, s
     const FRecord* Parent = R.Base.empty() ? nullptr : Find(R.Base);
     if (!R.Base.empty() && (!Parent || Parent->bIsStruct || (Parent->IsNative() ? Parent->CppName[0] != 'I' : !Parent->bIsInterface)))
     { *Err = R.CppName + " extends " + R.Base + ", which is not an interface"; return false; }
-    const bool bParentIsLocal = Parent && !Parent->IsNative();
-    const std::string ParentPkg = !Parent ? "/Script/CoreUObject" : bParentIsLocal ? ModPackage + "/" + Parent->CppName : Parent->UePackage;
-    FBlueprintClass BP(P, R.CppName + "_C", ParentPkg,
-                       !Parent ? "Interface" : bParentIsLocal ? Parent->CppName + "_C" : Parent->UeName,
-                       ParentPkg.compare(0, 6, "/Game/") == 0);
+    const std::string ParentPkg = !Parent ? "/Script/CoreUObject" : PackageOf(*Parent);
+    FBlueprintClass BP(P, ClassOf(R), ParentPkg, !Parent ? "Interface" : ClassOf(*Parent), ParentPkg.compare(0, 6, "/Game/") == 0);
     BP.SetIsActor(false);
     BP.SetClassFlags(CLASS_Parsed | CLASS_Interface | CLASS_CompiledFromBlueprint);
 
@@ -7927,9 +7960,9 @@ bool FCompiler::GenerateInterface(const FRecord& R, const std::string& OutDir, s
     }
 
     BP.Finish();
-    if (!P.Save(OutDir + "/" + R.CppName, Err)) return false;
-    RegistryRows.push_back({ PackageName, R.CppName, "BlueprintGeneratedClass" });
-    printf("  %-14s -> %s.uasset  (interface, %d functions)\n", R.CppName.c_str(), R.CppName.c_str(),
+    if (!SavePackage(P, OutDir, PackageName, Err)) return false;
+    RegistryRows.push_back({ PackageName, LeafOf(R.CppName), "BlueprintGeneratedClass" });
+    printf("  %-14s -> %s.uasset  (interface, %d functions)\n", R.CppName.c_str(), Shown(PackageName).c_str(),
            int32(R.Methods.size()));
     return true;
 }
@@ -7937,10 +7970,10 @@ bool FCompiler::GenerateInterface(const FRecord& R, const std::string& OutDir, s
 bool FCompiler::GenerateStruct(const FRecord& R, const std::string& OutDir, std::string* Err)
 {
     Cur = &R;
-    const std::string PackageName = ModPackage + "/" + R.CppName;
+    const std::string PackageName = PackageOf(R);
     FPackage P(PackageName);
     StampIdentity(P, PackageName);
-    FBlueprintClass BP(P, R.CppName, "", "", false);
+    FBlueprintClass BP(P, ClassOf(R), "", "", false);
 
     for (const Json* F : R.Fields)
     {
@@ -7960,26 +7993,26 @@ bool FCompiler::GenerateStruct(const FRecord& R, const std::string& OutDir, std:
     if (ApiDir && !IsInternalViewStruct(R.CppName) && !BP.WriteApiStruct(*ApiDir, Guid, Err))
         return false;
     BP.FinishStruct(Guid);
-    if (!P.Save(OutDir + "/" + R.CppName, Err)) return false;
-    RegistryRows.push_back({ PackageName, R.CppName, "UserDefinedStruct" });
-    printf("  %-14s -> %s.uasset  (struct, %d members)\n", R.CppName.c_str(), R.CppName.c_str(),
+    if (!SavePackage(P, OutDir, PackageName, Err)) return false;
+    RegistryRows.push_back({ PackageName, ClassOf(R), "UserDefinedStruct" });
+    printf("  %-14s -> %s.uasset  (struct, %d members)\n", R.CppName.c_str(), Shown(PackageName).c_str(),
            int32(R.Fields.size()));
     return true;
 }
 
 /* Each wrapper a container needed, into NestedPackage beside the mod's own folder. Two mods that need the same one
    cook identical packages at the same path. A wrapper's own member may need a deeper one. */
-bool FCompiler::GenerateEnum(const std::string& Name, const std::string& OutDir, std::string* Err)
+bool FCompiler::GenerateEnum(const std::string& Enum, const std::string& OutDir, std::string* Err)
 {
-    const std::string PackageName = ModPackage + "/" + Name;
+    const std::string PackageName = PathIn(ModPackage, Enum), Name = LeafOf(Enum);
     FPackage P(PackageName);
     StampIdentity(P, PackageName);
     FBlueprintClass BP(P, Name, "", "", false);
-    if (ApiDir && !BP.WriteApiEnum(*ApiDir, ModEnums[Name], Err)) return false;
-    BP.FinishEnum(ModEnums[Name]);
-    if (!P.Save(OutDir + "/" + Name, Err)) return false;
+    if (ApiDir && !BP.WriteApiEnum(*ApiDir, ModEnums[Enum], Err)) return false;
+    BP.FinishEnum(ModEnums[Enum]);
+    if (!SavePackage(P, OutDir, PackageName, Err)) return false;
     RegistryRows.push_back({ PackageName, Name, "UserDefinedEnum" });
-    printf("  %-14s -> %s.uasset  (enum, %d enumerators)\n", Name.c_str(), Name.c_str(), int32(ModEnums[Name].size()));
+    printf("  %-14s -> %s.uasset  (enum, %d enumerators)\n", Enum.c_str(), Shown(PackageName).c_str(), int32(ModEnums[Enum].size()));
     return true;
 }
 
@@ -7991,8 +8024,9 @@ bool FCompiler::GenerateAsset(const Json& Var, const std::string& OutDir, std::s
     if (!R || R->bIsStruct || (R->UeName.empty() && !R->IsGenerated())) return true;    // a plain C++ aggregate
     Cur = nullptr;
 
+    const auto Scope = VarScope.find(Var.value("id", std::string()));
     const std::string AssetName = Name(Var);
-    const std::string PackageName = ModPackage + "/" + AssetName;
+    const std::string PackageName = PathIn(ModPackage, (Scope == VarScope.end() ? std::string() : Scope->second) + AssetName);
     FPackage P(PackageName);
     StampIdentity(P, PackageName);
     FBlueprintClass BP(P, AssetName, "", "", false);
@@ -8020,24 +8054,18 @@ bool FCompiler::GenerateAsset(const Json& Var, const std::string& OutDir, std::s
     };
     if (!Fill(*BracedInit(Var), *R)) return false;
 
-    const std::string ClassPkg = R->IsNative() ? R->UePackage : ModPackage + "/" + R->CppName;
-    const std::string ClassName = R->IsNative() ? R->UeName : R->CppName + "_C";
+    const std::string ClassPkg = PackageOf(*R), ClassName = ClassOf(*R);
     /* The CDO's import first, as MSVC evaluates call arguments (right to left); clang goes left to right. */
     const FIndex Cdo = BP.ClassDefaultObject(ClassPkg, ClassName);
     BP.FinishAsset(BP.EngineClass(ClassPkg, ClassName), Cdo);
-    if (!P.Save(OutDir + "/" + AssetName, Err)) return false;
+    if (!SavePackage(P, OutDir, PackageName, Err)) return false;
     RegistryRows.push_back({ PackageName, AssetName, ClassName });
-    printf("  %-14s -> %s.uasset  (asset, a %s)\n", AssetName.c_str(), AssetName.c_str(), R->CppName.c_str());
+    printf("  %-14s -> %s.uasset  (asset, a %s)\n", AssetName.c_str(), Shown(PackageName).c_str(), R->CppName.c_str());
     return true;
 }
 
 bool FCompiler::GenerateNestedWrappers(const std::string& OutDir, std::string* Err)
 {
-    /* OutDir is Content/<ModPackage without /Game>; the wrappers go to Content/<NestedPackage without /Game>. */
-    std::filesystem::path Content(OutDir);
-    for (size_t At = ModPackage.find('/', 1); At != std::string::npos; At = ModPackage.find('/', At + 1))
-        Content = Content.parent_path();
-    const std::filesystem::path Dir = Content / std::string(NestedPackage).substr(6);
     std::set<std::string> Done;
     for (bool bMore = true; bMore;)
     {
@@ -8058,9 +8086,7 @@ bool FCompiler::GenerateNestedWrappers(const std::string& OutDir, std::string* E
             const uint32 H = StrCrc32(PackageName);
             const uint32 Guid[4] = { ~H, H * 2654435761u, H ^ 0x9E3779B9u, H };
             BP.FinishStruct(Guid);
-            std::error_code Ec;
-            std::filesystem::create_directories(Dir, Ec);
-            if (!P.Save((Dir / Name).string(), Err)) return false;
+            if (!SavePackage(P, OutDir, PackageName, Err)) return false;
             RegistryRows.push_back({ PackageName, Name, "UserDefinedStruct" });
             printf("  %-14s -> %s/%s.uasset  (wraps %s)\n", "nested", std::string(NestedPackage).c_str(), Name.c_str(), Type.c_str());
         }
@@ -8074,17 +8100,14 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     if (!B) { *Err = R.CppName + " derives from an undeclared class: " + R.Base; return false; }
     Cur = &R;
 
-    const std::string PackageName = ModPackage + "/" + R.CppName;
+    const std::string PackageName = PackageOf(R);
     FPackage P(PackageName);
     StampIdentity(P, PackageName);
 
-    /* Parent-is-local decides the spelling; parent-is-Blueprint (/Game) decides the CDO's
-       create-before-serialize edge onto it (measured on BP_ThornsComponent). */
-    const bool bParentIsLocal = !B->IsNative();
-    const std::string ParentPkg = bParentIsLocal ? ModPackage + "/" + B->CppName : B->UePackage;
-    FBlueprintClass BP(P, R.CppName + "_C", ParentPkg,
-                       bParentIsLocal ? B->CppName + "_C" : B->UeName,
-                       ParentPkg.compare(0, 6, "/Game/") == 0);
+    /* Parent-is-Blueprint (/Game) decides the CDO's create-before-serialize edge onto it (measured on
+       BP_ThornsComponent). */
+    const std::string ParentPkg = PackageOf(*B);
+    FBlueprintClass BP(P, ClassOf(R), ParentPkg, ClassOf(*B), ParentPkg.compare(0, 6, "/Game/") == 0);
 
     std::vector<std::string> Ancestry;
     for (const FRecord* A = &R; A; A = A->Base.empty() ? nullptr : Find(A->Base))
@@ -8402,8 +8425,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         if (!CR || !CR->IsNative())
         { *Err = R.CppName + "::UE_DEFAULTS: cannot resolve the class of " + Entry.first; return false; }
 
-        const std::string OwnerPkg = Owner.IsNative() ? Owner.UePackage : ModPackage + "/" + Owner.CppName;
-        const std::string OwnerCls = Owner.IsNative() ? Owner.UeName : Owner.CppName + "_C";
+        const std::string OwnerPkg = PackageOf(Owner), OwnerCls = ClassOf(Owner);
         uint32 NodeGuid[4] = {};
         const std::string VarName = UeNameOf(&Owner, Entry.first);      // the node's name: `Audio Flying`, spaces and all
         if (auto Node = Owner.ScsNodes.find(Entry.first); Node != Owner.ScsNodes.end())
@@ -8791,15 +8813,15 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
 
     if (bReplicatesAnything) BP.SetReplicates(true);
     BP.Finish();
-    if (!P.Save(OutDir + "/" + R.CppName, Err)) return false;
+    if (!SavePackage(P, OutDir, PackageName, Err)) return false;
     if (ApiDir && !BP.WriteApi(*ApiDir, Err))
     {
         /* A class with nothing callable is not a build failure; the mod simply has no API surface. */
         printf("  %-14s -> no API asset: %s\n", R.CppName.c_str(), Err->c_str());
         Err->clear();
     }
-    RegistryRows.push_back({ PackageName, R.CppName + "_C", "BlueprintGeneratedClass" });
-    printf("  %-14s -> %s.uasset  (%s %s)\n", R.CppName.c_str(), R.CppName.c_str(),
+    RegistryRows.push_back({ PackageName, ClassOf(R), "BlueprintGeneratedClass" });
+    printf("  %-14s -> %s.uasset  (%s %s)\n", R.CppName.c_str(), Shown(PackageName).c_str(),
            B->IsNative() ? "extends" : "extends BP", R.Base.c_str());
     return true;
 }
@@ -9041,16 +9063,13 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         for (const auto& M : Entry.second.Inlines) NormalizePointers(const_cast<Json&>(*M.second));
     }
 
-    /* ponytail: every UE name of a mod class (its package, _C, CDO, registry row) is its C++ name, so a namespaced one
-       would be written as `Ns::X.uasset`, which Windows refuses. Supporting it needs its own asset name (`Ns__X`, as a
-       global's class has, or a folder per namespace) in each of those places. */
-    for (const auto& Entry : Records)
-        if (Entry.second.IsGenerated() && Entry.second.CppName.find("::") != std::string::npos)
-        {
-            *Err = Entry.second.CppName + ": a mod class, struct or interface cannot be declared in a namespace yet "
-                   "(its asset is named after it)";
-            return false;
-        }
+    /* A namespace is a folder (PathIn), so `Game::<the mod's own path>::X` is X's package, and a package name is
+       case-blind. */
+    std::map<std::string, std::string> Cooked;
+    for (const auto& [Cpp, R] : Records)
+        if (R.IsGenerated())
+            if (const auto [At, bNew] = Cooked.emplace(Lower(PackageOf(R)), Cpp); !bNew)
+            { *Err = Cpp + " and " + At->second + " would both be cooked as " + PackageOf(R); return false; }
 
     int32 Generated = 0;
     for (const auto& Entry : Records)
@@ -9065,7 +9084,7 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
             for (const auto& Other : Records)
                 if (Other.second.IsGenerated())
                     for (const char* Ext : { ".uasset", ".uexp" })
-                        remove((OutDir + "/" + Other.first + Ext).c_str());
+                        remove((FileOf(OutDir, PackageOf(Other.second)).string() + Ext).c_str());
             return false;
         }
         ++Generated;

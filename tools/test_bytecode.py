@@ -922,10 +922,34 @@ no_inline_ufunctions()
 inline_regressions()
 inline_mixed_overloads()
 copy_back()
-# A mod class's asset is named after it, so a namespaced one is refused by name, not as an unwritable `Ns::X.uasset`.
-refused('NsClass', '  int32 F() { return 1; }\n', 'Ns::UThing: a mod class, struct or interface cannot be declared in a namespace',
-        top='namespace Ns { class UThing : public UObject { public: int32 X; }; }\n')
-print('ok  a mod class in a namespace is refused, naming it')
+
+
+# ---- NsTest
+
+def namespaces():
+    """A namespace is the asset's folder: one under the mod's package, or a /Game path itself when it starts at Game.
+    What names a namespaced class - a child, a call, a property's type, the registry - names that path."""
+    content, mine = os.path.join(ROOT, 'NsTest', 'FSD', 'Content'), '/Game/_ElytrasMods/NsTest'
+    base = lambda package: os.path.join(content, *package[len('/Game/'):].split('/'))
+    where = {mine + '/NsTest', mine + '/Weapons/Rifle', mine + '/Weapons/ITrigger', mine + '/Weapons/FAmmo',
+             mine + '/Weapons/EKind', '/Game/NsTestAbs/Pistol'}
+    for package in where:
+        assert os.path.exists(base(package) + '.uasset'), package
+    rows = registry_rows(registry_of('NsTest'))
+    assert {path.rsplit('.', 1)[0] for path, _ in rows} == where, rows
+    pistol, ns = import_paths(base('/Game/NsTestAbs/Pistol')), import_paths(base(mine + '/NsTest'))
+    assert mine + '/Weapons/Rifle.Rifle_C:Pull' in pistol, pistol          # the parent's Pull, in the parent's folder
+    for want in (mine + '/Weapons/Rifle.Rifle_C:Load', '/Game/NsTestAbs/Pistol.Pistol_C:Pull', mine + '/Weapons/FAmmo.FAmmo'):
+        assert want in ns, (want, ns)
+    assert run(base(mine + '/Weapons/Rifle'), 'Pull', self_vars=dict(Shots=5), Times=3)[0] == 8
+    # `Game::<the mod's own path>::X` and a plain X are one package.
+    refused('NsTwice', '  int32 F() { return 1; }\n', 'would both be cooked as /Game/_ElytrasMods/NsTwice/NsTwice',
+            top='namespace Game::_ElytrasMods::NsTwice { class NsTwice : public AActor { public: int32 X; }; }\n')
+    print("ok  NsTest: a namespace is the asset's folder, under the mod's or a /Game path of its own; a child, a call, "
+          "a type and the registry name it there, and two names for one package are refused")
+
+
+namespaces()
 
 
 # ---- OptTest
