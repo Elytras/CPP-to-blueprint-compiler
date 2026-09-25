@@ -1016,6 +1016,21 @@ def types_behaviour():
     # An int64 enum compares as int64: a value sharing only Eon's / Epoch's low 32 bits is neither.
     check('TypesTest', 'AgeOf', lambda A: 1 if A == 5000000000 else 2 if A == 0 else 0,
           [dict(A=a) for a in (0, 5000000000, 7, 5000000001, 5000000000 & 0xFFFFFFFF, 1 << 32, -(1 << 32))])
+    # A value-changing cast inside a chain of casts: bool, uint8, int32 from int64, int32 from float.
+    nan, floats = float('nan'), (0.0, -0.0, 0.5, -0.25, 2.75, -2.75, 255.9, 300.5, -1.5)
+    ints = EDGE + (-1, 255, 256, 300)
+    check('TypesTest', 'CastBool', lambda F, X: wrap((F != 0) + X), [dict(F=f, X=x) for f in floats + (nan,) for x in (1, 2**31 - 1)])
+    check('TypesTest', 'CastBoolK', lambda X: wrap(1 + X), [dict(X=x) for x in EDGE])
+    check('TypesTest', 'CastBoolInt', lambda V, X: wrap((V != 0) + X), [dict(V=v, X=x) for v in ints for x in (1, -2**31)])
+    check('TypesTest', 'CastBoolEnum', lambda M, X: wrap((M != 0) + X), [dict(M=m, X=x) for m in (0, 5, 6, 255) for x in (1, 2**31 - 1)])
+    for fn in ('CastByte', 'CastByteStatic'):
+        check('TypesTest', fn, lambda V, X: wrap((V & 0xFF) + X), [dict(V=v, X=x) for v in ints for x in (0, 2**31 - 1)])
+    check('TypesTest', 'CastByteK', lambda X: wrap(44 + X), [dict(X=x) for x in EDGE])
+    check('TypesTest', 'CastInt64', lambda V: wrap(V), [dict(V=v) for v in (7, -1, 2**31, -2**31 - 1, 5000000001, -(2**40) - 5)])
+    check('TypesTest', 'CastWide', lambda V: V & 0xFF, [dict(V=v) for v in ints])
+    check('TypesTest', 'CastTrunc', lambda F: float(int(F)), [dict(F=f) for f in floats])
+    check('TypesTest', 'CastChain', lambda F, X: wrap((int(F) & 0xFF) + X), [dict(F=f, X=x) for f in floats for x in (0, 2**31 - 1)])
+    check('TypesTest', 'CastTest', lambda F: F != 0, [dict(F=f) for f in floats + (nan,)])
     # Past the switch, `M == Mood ? 10 : 0` / `S == Span ? 10 : 0` read the member.
     for mood in (0, 5, 7):
         for m in (0, 1, 4, 5, 6, 7, 255):

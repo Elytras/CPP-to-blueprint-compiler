@@ -129,6 +129,21 @@ public:
     return S == Span ? 10 : 0;
   }
 
+  /* A cast that changes the value still happens inside a chain of casts: to bool, to a narrower integer, float to
+     integer. `(bool)F + X` adds 0 or 1, not F truncated; `(uint8)V + X` wraps V. */
+  int32 CastBool(float F, int32 X) { return (bool)F + X; }
+  int32 CastBoolK(int32 X) { return (bool)0.25f + X; }
+  int32 CastBoolInt(int32 V, int32 X) { return bool(V) + X; }
+  int32 CastBoolEnum(EMood M, int32 X) { return (bool)M + X; }
+  int32 CastByte(int32 V, int32 X) { return (uint8)V + X; }
+  int32 CastByteStatic(int32 V, int32 X) { return static_cast<uint8>(V) + X; }
+  int32 CastByteK(int32 X) { return (uint8)300 + X; }
+  int64 CastInt64(int64 V) { return (int32)V; }
+  int64 CastWide(int32 V) { return (uint8)V; }
+  float CastTrunc(float F) { return (int32)F; }
+  int32 CastChain(float F, int32 X) { return (uint8)(int32)F + X; }
+  bool CastTest(float F) { return F; }
+
   int32 AgeOf(EAge A) { return A == EAge::Eon ? 1 : A == EAge::Epoch ? 2 : 0; }
 
   void ReceiveBeginPlay() {
