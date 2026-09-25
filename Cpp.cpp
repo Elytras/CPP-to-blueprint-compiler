@@ -928,6 +928,7 @@ private:
     std::map<std::string, const Json*> ConstVars;
     struct FConstVal { bool bFloat = false; double F = 0; int64 I = 0; double Num() const { return bFloat ? F : double(I); } };
     bool FoldConst(const Json& E, FConstVal& Out) const;
+    const Json* ValueCastBelow(const Json& N) const;
     bool FreeNegation(const Json& C, Json& Out) const;
     bool ConstToArg(const FConstVal& V, const std::string& Type, FArgIR& Out) const;
     std::map<std::string, const Json*> FreeInlines;                     // decl id -> an inline free function's definition
@@ -2139,11 +2140,15 @@ bool FCompiler::ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgI
         Arg.Sub->Args.push_back(Operand);
         return true;
     }
-    if (ToKind == SK_Bool && FromKind == SK_Int64)
+    /* No Conv_ row turns an int64, a float or a byte (an enum's too) into a bool: C++ tests it against zero, and so
+       does this. A NaN is true, as NotEqual_FloatFloat answers. */
+    const EStrKind FromNum = StrKindOf(From);
+    if (ToKind == SK_Bool && (FromNum == SK_Int64 || (FromNum == SK_Float && Arg.K != FArgIR::Float) || FromNum == SK_Byte))
     {
-        WrapInCall(Arg, BP.EngineFunction("/Script/Engine", "KismetMathLibrary", "NotEqual_Int64Int64"));
+        WrapInCall(Arg, BP.EngineFunction("/Script/Engine", "KismetMathLibrary", FromNum == SK_Int64 ? "NotEqual_Int64Int64"
+                                          : FromNum == SK_Float ? "NotEqual_FloatFloat" : "NotEqual_ByteByte"));
         FArgIR Zero;
-        Zero.K = FArgIR::Int64;
+        Zero.K = FromNum == SK_Int64 ? FArgIR::Int64 : FromNum == SK_Float ? FArgIR::Float : FArgIR::Byte;
         Arg.Sub->Args.push_back(Zero);
         Arg.InnerType = "bool";
         return true;
@@ -2197,6 +2202,10 @@ bool FCompiler::ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgI
     }
 
     if (const FConv* Direct = FindConv(From, To)) { ApplyConv(*Direct, BP, Arg); return true; }
+    /* A uint8 or a bool has no Conv_ row to int64, but int32 holds every value it can be. */
+    if (const FConv *In = FindConv(From, "int"), *Out = FindConv("int", To);
+        In && Out && (FromNum == SK_Byte || FromNum == SK_Bool) && ToKind == SK_Int64)
+    { ApplyConv(*In, BP, Arg); ApplyConv(*Out, BP, Arg); return true; }
     const auto IsNumber = [](EStrKind K) { return K == SK_Int || K == SK_Int64 || K == SK_Float || K == SK_Bool || K == SK_Byte; };
     for (const char* Via : {"FString", "FText"})     // FText: int64 has no engine Conv_Int64ToString
     {
@@ -2948,6 +2957,14 @@ bool FCompiler::LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, 
     for (const Json* W = &ArgNode; W; W = Kind(*W) == "ImplicitCastExpr" || Kind(*W) == "ParenExpr" ? First(*W) : nullptr)
         if (FConstVal V; Kind(*W) == "ConstantExpr" && W->contains("value") && FoldConst(ArgNode, V) && ConstToArg(V, OuterType, Out))
             return true;
+    /* Strip peels every cast, but one that changes the value - to bool, to a narrower integer, float to integer - must
+       still happen: `(uint8)V + X` wraps V, `(bool)F + X` adds 0 or 1. The value is lowered as that cast's type, and
+       only then converted to the slot's. Over constants FoldConst runs the whole chain. */
+    if (const Json* Cut = ValueCastBelow(ArgNode))
+    {
+        if (FConstVal V; FoldConst(ArgNode, V) && ConstToArg(V, OuterType, Out)) return true;
+        return LowerArg(*Cut, BP, Out, Err) && ConvertArg(OuterType, BP, Out, Err);
+    }
     const Json* N = Strip(&ArgNode);
     if (!N) { *Err = "empty argument expression"; return false; }
     /* Arithmetic, a comparison or logic over constants is the constant it comes to: no Kismet call left to run. */
@@ -6743,6 +6760,29 @@ bool FCompiler::FoldConst(const Json& E, FConstVal& Out) const
     else if (Op == ">>" && R.I >= 0 && R.I < 64) Out.I = L.I >> R.I;
     else return false;
     return Fit(Out);
+}
+
+/* The outermost cast below N, among those Strip peels off it, that changes the value it passes on: to bool, float to
+   int32 / int64, or an integer to a narrower one (int64 to int32, either to uint8). Only between Blueprint's own
+   types, which ConvertArg can convert; a widening or same-size cast keeps every value, so the chain skips it. */
+const Json* FCompiler::ValueCastBelow(const Json& N) const
+{
+    const Json* Leaf = Strip(&N);
+    if (Leaf == &N) return nullptr;
+    for (const Json* C = First(N); C && C != Leaf; C = First(*C))
+    {
+        const std::string K = Kind(*C), Cast = C->value("castKind", std::string());
+        if (K != "ImplicitCastExpr" && K != "CStyleCastExpr" && K != "CXXStaticCastExpr" && K != "CXXFunctionalCastExpr") continue;
+        const Json* From = First(*C);
+        if (!From) continue;
+        const EStrKind FK = StrKindOf(Canon(TypeOf(*From))), TK = StrKindOf(Canon(TypeOf(*C)));
+        const bool bNumber = FK == SK_Int || FK == SK_Int64 || FK == SK_Float || FK == SK_Byte;
+        if ((Cast == "FloatingToBoolean" || Cast == "IntegralToBoolean") && TK == SK_Bool && bNumber) return C;
+        if (Cast == "FloatingToIntegral" && FK == SK_Float && (TK == SK_Int || TK == SK_Int64)) return C;
+        if (Cast == "IntegralCast" && ((TK == SK_Byte && (FK == SK_Int || FK == SK_Int64)) || (TK == SK_Int && FK == SK_Int64)))
+            return C;
+    }
+    return nullptr;
 }
 
 /* `!C` with no Not_PreBool call, where there is such a thing: `!!X` is X, and a comparison turns round (`<` and `>=`,
