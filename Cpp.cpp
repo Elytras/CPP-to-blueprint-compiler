@@ -805,6 +805,16 @@ bool EmitCall(FScript& S, const FCallIR& Call, FIndex SelfExp, std::string* Err)
         return bOk;
     }
 
+    /* Any other intrinsic has a value and no UFunction (`__AddrOf__`, `__NameIndex__`, a pointer read). As a statement,
+       an unused local's store or a discarded call, the value goes nowhere, and an EX_CallMath would call null. A call
+       among its arguments still runs. */
+    if (!Call.Intrinsic.empty() && !Call.Fn.V)
+    {
+        for (const FArgIR& A : Call.Args)
+            if (A.K == FArgIR::Call && A.Sub && A.Sub->Intrinsic.empty() && !EmitCall(S, *A.Sub, SelfExp, Err)) return false;
+        return true;
+    }
+
     /* A static call runs against its class's CDO via EX_Context; EX_CallMath finds the CDO itself. */
     if (Call.Context.V != 0 || Call.Target)
     {

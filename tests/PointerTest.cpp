@@ -33,6 +33,17 @@ class PointerTest : public AActor {
   int32 SignedByteAsUnsigned(int8 *P) { return (uint8)*P * 1000 + static_cast<uint8>(P[1]); }
   bool SignedByteIsMax(int8 *P) { return (uint8)*P == 255; }
 
+  /* An intrinsic whose value goes nowhere, stored in a local nothing reads or discarded, is no call at all: it has no
+     UFunction, and an EX_CallMath on null would crash the VM. */
+  int32 DiscardedIntrinsics(int64 P, FName N) {
+    int32 I = __NameIndex__(N);
+    int64 A = __AddrOf__(this);
+    int32 V = __Read32__(P);
+    __NameIndex__(N);
+    __Read32__(P);
+    return 3;
+  }
+
 public:
   void ReceiveBeginPlay() {
     TArray<int32> Items;

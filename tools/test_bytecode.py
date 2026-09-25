@@ -1293,6 +1293,8 @@ def pointer_behaviour():
         want += [pair[0] * 1000 + pair[1], pair[0] == 255]
         assert got == want, (pair, got, want)
     runscript.MEM.clear()
+    # An intrinsic whose value goes nowhere is no call (it was an EX_CallMath on null, which crashes the VM).
+    assert run(asset('PointerTest'), 'DiscardedIntrinsics', P=addr, N='x')[0] == 3
     # Kismet has no unsigned int32: a uint32 read would widen and compare as signed, so it is refused.
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
@@ -1305,7 +1307,7 @@ def pointer_behaviour():
     d = dumpexp.load(os.path.join(os.path.dirname(asset('PointerTest')), 'FDeref'))
     assert [e['name'] for e in d[5]] == ['FDeref'] and "Class'UserDefinedStruct'" in d[4], d[4]
     assert "UserDefinedStruct'FDeref'" in dumpexp.load(asset('PointerTest'))[4]
-    print('ok  PointerTest: Advance, Bump (out-parm), Check, signed byte reads, uint32 reads refused; FDeref synthesized')
+    print('ok  PointerTest: Advance, Bump (out-parm), Check, signed byte reads, discarded intrinsics, uint32 reads refused; FDeref synthesized')
 
 
 mod_enum()
