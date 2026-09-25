@@ -4667,6 +4667,15 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
         std::string SetField;                           // the property,
         std::shared_ptr<FArgIR> SetObject;              // and the object, null for self
         const std::string K = Kind(*S);
+        /* A loop's condition runs on every trip too, so an inline expanded in it re-enters (the __Fresh twin);
+           it is not LoopDepth, which would let a break / continue there through. */
+        auto LowerCond = [&](const Json& Cond) -> bool {
+            ++ReEntered;
+            const bool bCondOk = LowerArg(Cond, BP, St.Cond, Err);
+            --ReEntered;
+            if (!bCondOk) bOk = false;
+            return bCondOk;
+        };
         if (K == "DeclStmt")
         {
             /* clang groups comma-declared vars under one DeclStmt. */
@@ -5171,7 +5180,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
 
             St.K = FStmtIR::While;
             St.bPostTest = true;
-            if (!LowerArg(*Cond, BP, St.Cond, Err)) { bOk = false; return; }
+            if (!LowerCond(*Cond)) return;
             St.Body = std::make_shared<std::vector<FStmtIR>>();
             Json Wrap = Kind(*Body) == "CompoundStmt" ? *Body
                       : Json{ {"kind", "CompoundStmt"}, {"inner", Json::array({*Body})} };
@@ -5229,7 +5238,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             if (!Cond || !Body) { *Err = "`while` with a missing condition or body"; bOk = false; return; }
 
             St.K = FStmtIR::While;
-            if (!LowerArg(*Cond, BP, St.Cond, Err)) { bOk = false; return; }
+            if (!LowerCond(*Cond)) return;
             St.Body = std::make_shared<std::vector<FStmtIR>>();
             ++LoopDepth;
             if (Kind(*Body) == "CompoundStmt")
@@ -5264,7 +5273,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             }
 
             St.K = FStmtIR::While;
-            if (!LowerArg(*Cond, BP, St.Cond, Err)) { bOk = false; return; }
+            if (!LowerCond(*Cond)) return;
             St.Body = std::make_shared<std::vector<FStmtIR>>();
 
             Json WrapBody = Kind(*Body) == "CompoundStmt" ? *Body
