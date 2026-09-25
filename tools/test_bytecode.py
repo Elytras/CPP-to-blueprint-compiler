@@ -1958,6 +1958,7 @@ def spawn_runs():
     vm.call('ReceiveBeginPlay', on=twin)
     assert len(vm.log) == log, vm.log[log:]
     assert vm.call('OwnClass') == 'SpawnTest_C'
+    assert vm.call('OwnClassByMacro') == 'SpawnTest_C'
     probe = vm.call('MakeProbe')
     assert (probe.cls, probe.vars['args']) == ('USpawnProbe_C', ('USpawnProbe_C', me)), probe.vars
     print('ok  SpawnTest: spawn / construct / add-component calls, their classes and the deferred-set order')

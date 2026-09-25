@@ -3765,10 +3765,20 @@ bool FCompiler::IsSubclassOf(const FRecord& Child, const FRecord& Parent) const
 /* The qualifier token is where a qualified DeclRefExpr's range begins; the JSON gives its byte offset and length but
    not its file (that is only written when it changes, and Json's sorted keys lose the order). So each of the mod's own
    sources is tried at that offset, and a hit counts only when `<Record>::StaticClass` is what is written there.
-   ponytail: a namespace-qualified `Ns::X::StaticClass()` begins at Ns and falls back to the declaring class. */
+   In a macro (`#define CLS(X) X::StaticClass()`) the range has spelling locations instead: the qualifier where the
+   argument is written, StaticClass in the macro's body, which has to be `::StaticClass` then.
+   ponytail: a namespace-qualified `Ns::X::StaticClass()` begins at Ns and falls back to the declaring class; so does
+   a macro defined outside the mod's own sources (a UeApi header). */
 const FRecord* FCompiler::NamedQualifier(const Json& Ref) const
 {
-    const Json Begin = Ref.value("range", Json::object()).value("begin", Json::object());
+    const Json Range = Ref.value("range", Json::object());
+    Json Begin = Range.value("begin", Json::object()), End;
+    if (Begin.contains("spellingLoc"))
+    {
+        End = Range.value("end", Json::object()).value("spellingLoc", Json::object());
+        Begin = Begin["spellingLoc"];
+        if (!End.contains("offset")) return nullptr;
+    }
     if (!Begin.contains("offset") || !Begin.contains("tokLen")) return nullptr;
     const size_t Off = Begin["offset"].get<size_t>(), Len = Begin["tokLen"].get<size_t>();
     if (SourceTexts.empty())
@@ -3782,17 +3792,33 @@ const FRecord* FCompiler::NamedQualifier(const Json& Ref) const
             SourceTexts.emplace_back(std::istreambuf_iterator<char>(F), std::istreambuf_iterator<char>());
         }
     }
-    for (const std::string& T : SourceTexts)
+    if (End.is_null())
     {
-        if (Off + Len > T.size()) continue;
-        size_t P = Off + Len;
-        while (P < T.size() && (T[P] == ' ' || T[P] == '\t')) ++P;
-        if (T.compare(P, 2, "::") != 0) continue;
-        P += 2;
-        while (P < T.size() && (T[P] == ' ' || T[P] == '\t')) ++P;
-        if (T.compare(P, 11, "StaticClass") != 0) continue;
-        if (const FRecord* R = Find(T.substr(Off, Len))) return R;
+        for (const std::string& T : SourceTexts)
+        {
+            if (Off + Len > T.size()) continue;
+            size_t P = Off + Len;
+            while (P < T.size() && (T[P] == ' ' || T[P] == '\t')) ++P;
+            if (T.compare(P, 2, "::") != 0) continue;
+            P += 2;
+            while (P < T.size() && (T[P] == ' ' || T[P] == '\t')) ++P;
+            if (T.compare(P, 11, "StaticClass") != 0) continue;
+            if (const FRecord* R = Find(T.substr(Off, Len))) return R;
+        }
+        return nullptr;
     }
+    /* In a macro: its body has `::StaticClass` at End, and the qualifier is the whole identifier at Off. */
+    const size_t At = End["offset"].get<size_t>();
+    const bool bBody = std::any_of(SourceTexts.begin(), SourceTexts.end(), [&](const std::string& T) {
+        size_t P = At;
+        if (P + 11 > T.size() || T.compare(P, 11, "StaticClass") != 0) return false;
+        while (P > 0 && (T[P - 1] == ' ' || T[P - 1] == '\t')) --P;
+        return P >= 2 && T.compare(P - 2, 2, "::") == 0;
+    });
+    auto Ident = [](char C) { return std::isalnum(uint8(C)) || C == '_'; };
+    for (const std::string& T : SourceTexts)
+        if (bBody && Off + Len <= T.size() && (Off == 0 || !Ident(T[Off - 1])) && (Off + Len == T.size() || !Ident(T[Off + Len])))
+            if (const FRecord* R = Find(T.substr(Off, Len))) return R;
     return nullptr;
 }
 
@@ -8393,7 +8419,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
 }
 
 /* Builds the DOM of clang's AST dump as it streams in, without what nothing reads: source locations (all but a
-   DeclRefExpr's range begin offset and token length, see NamedQualifier), mangled names, a record's definitionData and
+   DeclRefExpr's range begin offset and token length, and its end's in a macro, see NamedQualifier), mangled names, a record's definitionData and
    a few flags are most of the dump, and building them was most of a compile. A key read later must not be in key(). */
 class FAstSax : public nlohmann::json_sax<Json>
 {
@@ -8417,8 +8443,12 @@ public:
     bool key(string_t& K) override
     {
         if (Skipped) return true;
-        bSkipNext = K == "loc" || K == "end" || K == "file" || K == "line" || K == "col" || K == "includedFrom"
-                 || K == "spellingLoc" || K == "expansionLoc" || K == "isMacroArgExpansion" || K == "mangledName"
+        /* A spellingLoc only gets here inside a DeclRefExpr's range (every other loc and range is skipped whole); the
+           range's end is kept only then, for a qualifier written in a macro (NamedQualifier). */
+        const bool bMacroEnd = K == "end" && Stack.back()->is_object() && Stack.back()->contains("begin")
+                            && (*Stack.back())["begin"].contains("spellingLoc");
+        bSkipNext = K == "loc" || (K == "end" && !bMacroEnd) || K == "file" || K == "line" || K == "col" || K == "includedFrom"
+                 || K == "expansionLoc" || K == "isMacroArgExpansion" || K == "mangledName"
                  || K == "definitionData" || K == "isImplicit" || K == "isUsed" || K == "isReferenced"
                  || K == "typeAliasDeclId" || (K == "range" && !DeclRef.back());
         bKindNext = K == "kind";
