@@ -130,6 +130,17 @@ public:
     }
     return 0;
   }
+  /* Mode promotes to 0..255: these three cases never match, and the first two are reached only by falling through. */
+  int32 ByteSwitchStray(uint8 Mode) {
+    int32 R = 0;
+    switch (Mode) {
+    case -1: R += 100;
+    case 256: R += 10;
+    case 7: R += 1; break;
+    case 300: return 9;
+    }
+    return R;
+  }
   int32 DenseHoles(int32 Code) {
     switch (Code) {
     case 10: return 1;
