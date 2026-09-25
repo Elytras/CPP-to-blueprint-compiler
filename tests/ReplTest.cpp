@@ -41,6 +41,11 @@ public:
     Other->Local = 2;
     bReplicateMovement = true;
   }
+
+  int32 Calls;
+  /* A replicated write names its object for the wake, the write and the OnRep: a computed one is evaluated once. */
+  ReplTest *Me() { ++Calls; return this; }
+  void SetViaCall() { Me()->bOpen = true; Me()->Score = 9; }
 };
 
 void ReplTest::ServerOpen(bool bValue) { bOpen = bValue; }

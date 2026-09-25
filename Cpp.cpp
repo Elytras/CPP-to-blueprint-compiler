@@ -5523,6 +5523,10 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 break;
             }
         }
+        /* The flush, the write and the notify each name the object: one that is computed (`Me()->Score = 9`) goes into a
+           local once. SetObject is the write's own Base, so all three see the local. A parked right side is already out. */
+        if (bOk && (bFlush || !Notify.empty()) && SetObject && !IsStored(*SetObject)
+            && !HoistOperand(*SetObject, BP, Locals, Out, Err)) { bOk = false; return; }
         if (bFlush)
         {
             FStmtIR Flush;

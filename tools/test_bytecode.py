@@ -1895,6 +1895,9 @@ def repl_runs():
         vm = VM(asset('ReplTest'))
         vm.call(fn, **parms)
         assert vm.self.vars == want, (fn, vm.self.vars)
+    vm = VM(asset('ReplTest'), Calls=0, Notified=0)
+    vm.call('SetViaCall')
+    assert vm.self.vars == dict(Calls=2, bOpen=True, Notified=1, Score=9), vm.self.vars
     assert run(asset('ReplTest'), 'ServerBump', Count=41)[1]['Count'] == 42
     kid = VM(os.path.join(os.path.dirname(asset('ReplTest')), 'ReplKid'))
     for fn, parms, seen in (('ServerOpen', dict(bValue=True), 7), ('ServerOpen', dict(bValue=False), 8),
