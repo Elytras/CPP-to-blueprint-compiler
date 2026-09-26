@@ -1144,7 +1144,18 @@ def comp_test():
         assert ('RelativeLocation [0] StructProperty size=12 struct=Vector: ' + loc in t
                 and 'RelativeRotation [0] StructProperty size=12 struct=Rotator: ' + rot in t
                 and 'RelativeScale3D [0] StructProperty size=12 struct=Vector: 000000400000004000004040' in t), t
-    print('ok  CompTest: BeginPlay override, component variables and archetype defaults')
+    # After its tags' None and UObject's HasGuid, an archetype carries what its class's native Serialize reads. Rocks's
+    # 32 bytes are the ones DRG's one cooked ISM archetype (BP_SpacerigTrashCompactor) ends in; Grass adds the
+    # hierarchical one's empty ClusterTree.
+    ua, ue, total, names, imports, exports = dumpexp.load(base)
+    end = names.index('None').to_bytes(4, 'little') + bytes(8)
+    ism = '00000000' '01000000' '4000000000000000' '0400000000000000' '0000000000000000'
+    for name, tail in (('Root', ''), ('Lamp', ''), ('Mesh', '00000000'), ('Rocks', ism), ('Grass', ism + '4000000000000000')):
+        e = next(e for e in exports if e['name'] == name + '_GEN_VARIABLE')
+        p = ue[e['off'] - total: e['off'] - total + e['size']]
+        assert p.endswith(end + bytes.fromhex(tail)), (name, p[-48:].hex())
+    refused('ModelComp', '  UE_COMPONENT(UModelComponent, Bsp);\n', 'cannot be a component template')
+    print('ok  CompTest: BeginPlay override, component variables, archetype defaults and native tails')
 
 
 def scs_tree(base):
@@ -1171,7 +1182,8 @@ def comp_attachment():
     (bIsParentComponentNative) or names an ANCESTOR Blueprint's node via ParentComponentOwnerClassName; so a node
     parented to a sibling in the same SCS must be one of that node's ChildNodes."""
     children, roots, tags = scs_tree(asset('CompTest'))
-    assert roots == ['Root'] and children == {'DefaultSceneRoot': [], 'Root': ['Mesh', 'Lamp'], 'Mesh': [], 'Lamp': []}, (roots, children)
+    assert roots == ['Root'] and children == {'DefaultSceneRoot': [], 'Root': ['Mesh', 'Lamp', 'Rocks', 'Grass'], 'Mesh': [],
+                                              'Lamp': [], 'Rocks': [], 'Grass': []}, (roots, children)
     assert not any('ParentComponentOrVariableName' in t for t in tags.values()), tags
     print('ok  CompTest: Mesh and Lamp stay attached to Root after a cooked load')
 
@@ -1841,6 +1853,12 @@ def static_assets():
     ed = tags_of('ED_AssetTest')
     assert objs('ED_AssetTest', ed['VeteranClasses'].split()[-1]) == ['/Game/Enemies/Spider/Grunt/ED_Spider_Grunt.ED_Spider_Grunt'], ed
     assert ed['SpawnSpread'].endswith(': 250.0') and ed['IdealSpawnSize'].endswith(': 4') and 'value=1' in ed['CanBeUsedForConstantPressure'], ed
+    # A soft class is tagged SoftObjectProperty, as the cook tags ED_Spider_Grunt's own EnemyClass: a tag naming
+    # SoftClassProperty is dropped at load as a type mismatch. The value is the path (an FName) and an empty sub-path.
+    assert ed['EnemyClass'].startswith('SoftObjectProperty size=12:'), ed['EnemyClass']
+    soft = struct.unpack('<3i', bytes.fromhex(ed['EnemyClass'].split()[-1]))
+    assert dumpexp.load(base('ED_AssetTest'))[3][soft[0]] == '/Game/Enemies/Spider/Grunt/ENE_Spider_Grunt_Normal.ENE_Spider_Grunt_Normal_C' \
+        and soft[1:] == (0, 0), soft
     print('ok  AssetTest: each declared object is an asset of its class with the members its braces name')
     # AssetUser's defaults: a pointer, an array, a set and two maps, object elements by package path.
     user = base('AssetUser')

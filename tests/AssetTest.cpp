@@ -36,9 +36,11 @@ UMoodDef MD_Plain = {};
 UMoodDef MD_Calm  = {.Count = 0, .Mood = EMood::Calm}; // an explicit zero is written, not dropped
 UMoodDef MD_Big   = {.Health = -500.5f, .Title = "Big", .Tag = "big", .bBig = true, .Next = &MD_Calm, .Waves = {3, 5, 8}};
 
-/* A native class works the same way, and so does pointing at the game's own assets. */
+/* A native class works the same way, and so does pointing at the game's own assets. EnemyClass is a TSoftClassPtr,
+   which the engine tags as a SoftObjectProperty. */
 UE_ASSET_AT(UEnemyDescriptor, ED_Spider_Grunt, "/Game/Enemies/Spider/Grunt/ED_Spider_Grunt");
-UEnemyDescriptor ED_AssetTest = {.VeteranClasses = {&ED_Spider_Grunt}, .SpawnSpread = 250.0f, .IdealSpawnSize = 4,
+UEnemyDescriptor ED_AssetTest = {.EnemyClass = "/Game/Enemies/Spider/Grunt/ENE_Spider_Grunt_Normal.ENE_Spider_Grunt_Normal_C",
+                                 .VeteranClasses = {&ED_Spider_Grunt}, .SpawnSpread = 250.0f, .IdealSpawnSize = 4,
                                  .CanBeUsedForConstantPressure = true};
 
 /* Named in a namespace, as the UeAssets headers do - there the class is `::UEnemyDescriptor`, since the namespace

@@ -78,11 +78,12 @@ public:
     are written as tagged properties on that archetype, so they delta against the component CDO -
     the editor's per-component defaults, not the actor CDO's. The class variable of the same name is
     an ordinary AddVariable(); USCS_Node::ExecuteNodeOnActor assigns the instance to it by name.
-    `NativeTail` is how many zero bytes the class's native Serialize reads after UObject's part
-    (FCompiler::NativeTail); the component overrides below take the same.
+    `NativeTail` is what the class's native Serialize reads after UObject's part (FCompiler::NativeTail);
+    the component overrides below take the same.
     */
     void AddComponent(const std::string& Name, FIndex ComponentClass, FIndex ComponentCdo,
-                      bool bIsSceneComponent, const std::vector<FPropertyDef>& Defaults, uint32 NativeTail = 0);
+                      bool bIsSceneComponent, const std::vector<FPropertyDef>& Defaults,
+                      const std::vector<uint8>& NativeTail = {});
 
     /*
     An inherited component's defaults: one UInheritableComponentHandler record, which is how the
@@ -93,7 +94,7 @@ public:
     */
     void AddComponentOverride(const std::string& Name, FIndex ComponentClass, FIndex ParentTemplate,
                               FIndex OwnerClass, const uint32 (&AssociatedGuid)[4],
-                              const std::vector<FPropertyDef>& Defaults, uint32 NativeTail = 0);
+                              const std::vector<FPropertyDef>& Defaults, const std::vector<uint8>& NativeTail = {});
 
     /*
     An override of a NATIVE parent's default subobject - its components, which are not SCS nodes and
@@ -103,7 +104,7 @@ public:
     subobject of the same name), plus an ObjectProperty tag of that name on the CDO.
     */
     void AddSubobjectOverride(const std::string& Name, const std::string& Property, FIndex ComponentClass,
-                              const std::vector<FPropertyDef>& Defaults, uint32 NativeTail = 0);
+                              const std::vector<FPropertyDef>& Defaults, const std::vector<uint8>& NativeTail = {});
 
     /* A tag on this class's CDO for a property an ancestor declares, which a member initializer
        cannot express: declaring the name again would shadow it with a second property. */
@@ -167,7 +168,7 @@ private:
         FIndex Class, Cdo;
         bool bIsScene = false;
         std::vector<FPropertyDef> Defaults;
-        uint32 NativeTail = 0;
+        std::vector<uint8> NativeTail;
     };
     std::vector<FComponent> Components;
 
@@ -177,7 +178,7 @@ private:
         FIndex Class, ParentTemplate, OwnerClass;
         uint32 Guid[4] = { 0, 0, 0, 0 };
         std::vector<FPropertyDef> Defaults;
-        uint32 NativeTail = 0;
+        std::vector<uint8> NativeTail;
     };
     std::vector<FComponentOverride> ComponentOverrides;
     std::vector<FPropertyDef> CdoDefaults;
@@ -188,7 +189,7 @@ private:
         std::string Property;      // the CDO's property that points at it
         FIndex Class;
         std::vector<FPropertyDef> Defaults;
-        uint32 NativeTail = 0;
+        std::vector<uint8> NativeTail;
     };
     std::vector<FSubobjectOverride> SubobjectOverrides;
 

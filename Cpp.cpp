@@ -1134,7 +1134,7 @@ private:
     /* `X::StaticClass()`: the record X names, read back from the mod's sources (clang's JSON keeps no qualifier). */
     const FRecord* NamedQualifier(const Json& Ref) const;
     bool IsSubclassOf(const FRecord& Child, const FRecord& Parent) const;
-    uint32 NativeTail(const FRecord* Component) const;
+    std::vector<uint8> NativeTail(const FRecord* Component) const;
     std::vector<const Json*> StructArgs(const Json& Value, const FRecord* R, const std::vector<std::string>& Fields) const;
     mutable std::vector<std::string> SourceTexts;                       // the mod directory's .h/.cpp, read on demand
 
@@ -4007,15 +4007,35 @@ bool FCompiler::IsSubclassOf(const FRecord& Child, const FRecord& Parent) const
     return false;
 }
 
-/* The bytes a component class's native Serialize reads after UObject's part, zero for an empty default. Read off the
-   4.27 source: UStaticMeshComponent::Serialize always does `Ar << LODData`, an int32 count; the Actor, Scene and
-   Primitive components and the light components read nothing more from an unversioned package. Without the count the
-   engine read the next export as LODData, and CompTest's Mesh failed to load with a fatal error (DRG, 2026-09-25). */
-uint32 FCompiler::NativeTail(const FRecord* Component) const
+/* What a component class's native Serialize reads after UObject's part, for an archetype with no instance data: each
+   class of the chain reads its own after its parent's. Every engine component Serialize override was read in the 4.27
+   source (2026-09-26); these are the ones that read anything from an unversioned cooked package:
+   - UStaticMeshComponent: `Ar << LODData`, an empty array's int32 count. Without it CompTest's Mesh read the next
+     export as LODData and failed to load with a fatal error (DRG, 2026-09-25).
+   - UInstancedStaticMeshComponent: bCooked, then PerInstanceSMData and PerInstanceSMCustomData as BulkSerialize
+     writes them (element size, count: 64 per FMatrix, 4 per float), then, cooked, a uint64 RenderDataSizeBytes the
+     cooker leaves 0 on an archetype. The one ISM archetype in DRG's pak ends in exactly these 32 bytes, LODData first.
+   - UHierarchicalInstancedStaticMeshComponent: its ClusterTree, BulkSerialize again (64 per FClusterNode).
+   - USkyAtmosphereComponent: bStaticLightingBuiltGUID, an FGuid.
+   - UAtmosphericFogComponent: three empty bulk-data headers (flags, count, size on disk, offset), then CounterVal.
+   Too little or too much is fatal alike: the loader checks each export's size ("Serial size mismatch"). */
+std::vector<uint8> FCompiler::NativeTail(const FRecord* Component) const
 {
-    for (const FRecord* A = Component; A; A = A->Base.empty() ? nullptr : Find(A->Base))
-        if (A->UeName == "StaticMeshComponent") return 4;
-    return 0;
+    std::vector<const FRecord*> Chain;
+    for (const FRecord* A = Component; A; A = A->Base.empty() ? nullptr : Find(A->Base)) Chain.insert(Chain.begin(), A);
+    std::vector<uint8> Tail;
+    auto I32 = [&](std::initializer_list<int32> Vs) {
+        for (int32 V : Vs) for (int32 Shift = 0; Shift < 32; Shift += 8) Tail.push_back(uint8(V >> Shift));
+    };
+    for (const FRecord* A : Chain)
+    {
+        if (A->UeName == "StaticMeshComponent") I32({ 0 });
+        else if (A->UeName == "InstancedStaticMeshComponent") I32({ 1, 64, 0, 4, 0, 0, 0 });
+        else if (A->UeName == "HierarchicalInstancedStaticMeshComponent") I32({ 64, 0 });
+        else if (A->UeName == "SkyAtmosphereComponent") Tail.resize(Tail.size() + 16);
+        else if (A->UeName == "AtmosphericFogComponent") Tail.resize(Tail.size() + 3 * 20 + 4);
+    }
+    return Tail;
 }
 
 /* The qualifier token is where a qualified DeclRefExpr's range begins; the JSON gives its byte offset and length but
@@ -8573,6 +8593,9 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             {
                 bIsScene = bIsScene || A->UeName == "SceneComponent";
                 bIsComponent = bIsComponent || A->UeName == "ActorComponent";
+                /* A level's BSP: its Serialize reads a UModel, and PostLoad checks one is there. */
+                if (A->UeName == "ModelComponent")
+                { *Err = R.CppName + "::" + FieldName + ": a UModelComponent belongs to a level's BSP and cannot be a component template"; return false; }
             }
             if (!bIsComponent) { *Err = R.CppName + "::" + FieldName + ": " + CR->CppName + " is not a UActorComponent"; return false; }
             /* The variable stays an ordinary ObjectProperty: ExecuteNodeOnActor finds it by name and

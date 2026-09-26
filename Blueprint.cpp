@@ -173,29 +173,30 @@ void FBlueprintClass::AddVariable(const FPropertyDef& Var)
     Vars.push_back(Var);
 }
 
-/* A component export's end: the tags' None, UObject's HasGuid, then what the class's native Serialize reads, zeroed. */
-static void EndComponent(FArc& Ar, uint32 NativeTail)
+/* A component export's end: the tags' None, UObject's HasGuid, then what the class's native Serialize reads. */
+static void EndComponent(FArc& Ar, const std::vector<uint8>& NativeTail)
 {
     TagEnd(Ar);
     Ar.Bool(false);
-    for (uint32 I = 0; I < NativeTail; ++I) Ar.U8(0);
+    Ar.Raw(NativeTail.data(), NativeTail.size());
 }
 
 void FBlueprintClass::AddComponent(const std::string& Name, FIndex ComponentClass, FIndex ComponentCdo,
-                                   bool bIsSceneComponent, const std::vector<FPropertyDef>& Defaults, uint32 NativeTail)
+                                   bool bIsSceneComponent, const std::vector<FPropertyDef>& Defaults,
+                                   const std::vector<uint8>& NativeTail)
 {
     Components.push_back(FComponent{ Name, ComponentClass, ComponentCdo, bIsSceneComponent, Defaults, NativeTail });
 }
 
 void FBlueprintClass::AddSubobjectOverride(const std::string& Name, const std::string& Property, FIndex ComponentClass,
-                                           const std::vector<FPropertyDef>& Defaults, uint32 NativeTail)
+                                           const std::vector<FPropertyDef>& Defaults, const std::vector<uint8>& NativeTail)
 {
     SubobjectOverrides.push_back(FSubobjectOverride{ Name, Property, ComponentClass, Defaults, NativeTail });
 }
 
 void FBlueprintClass::AddComponentOverride(const std::string& Name, FIndex ComponentClass, FIndex ParentTemplate,
                                            FIndex OwnerClass, const uint32 (&AssociatedGuid)[4],
-                                           const std::vector<FPropertyDef>& Defaults, uint32 NativeTail)
+                                           const std::vector<FPropertyDef>& Defaults, const std::vector<uint8>& NativeTail)
 {
     FComponentOverride O;
     O.Name = Name;
