@@ -433,6 +433,7 @@ struct FConv
     std::string From, To;
     std::string Package, Class, Fn;
     std::vector<Json> Extra;
+    std::vector<size_t> Refs;       // the const reference parameters, which the native reads by address: see HoistCallArgs
 };
 
 /* One row of UeApi/Ops.json: the Kismet function behind `Lhs <op> Rhs`. */
@@ -441,6 +442,7 @@ struct FOpInfo
     std::string Op, Lhs, Rhs, Ret;
     std::string Package, Class, Fn;
     std::vector<Json> Extra;
+    std::vector<size_t> Refs;
 };
 
 /* UeApi/Types.json: what a native enum or ScriptStruct is called in its package, and its layout. */
@@ -488,6 +490,14 @@ std::vector<Json> ExtraArgs(const Json& Row)
     return Out;
 }
 
+std::vector<size_t> RefArgs(const Json& Row)
+{
+    std::vector<size_t> Out;
+    auto It = Row.find("refs");
+    if (It != Row.end()) for (const Json& E : *It) Out.push_back(E.get<size_t>());
+    return Out;
+}
+
 FArgIR ConstArg(const Json& E)
 {
     FArgIR X;
@@ -515,7 +525,8 @@ struct FCallIR
     FIndex Context;                     // CDO a static call runs against; null = self
     bool bPure = false;                 // a function of its arguments (UE_PURE, a Kismet operator or conversion): see DropUnusedPure
     uint64 WrittenArgs = ~uint64(0);    // bit I: argument I must stay its own variable, which the callee may write: see ContainerWrites
-    std::vector<std::string> RefParms;  // a script callee's: per argument, the type of the reference parameter it binds, else "": see HoistCallArgs
+    std::vector<std::string> RefParms;  // per argument, the type of the reference parameter it binds, else "": see HoistCallArgs
+    bool bRefsTakeConst = false;        // a native's P_GET_PROPERTY_REF: a constant there goes through the thunk's own buffer
     std::string VirtualName;            // a generated class's own instance method: EX_VirtualFunction resolves it by name at run time
     bool bLocalVirtual = false;         // ... as EX_LocalVirtualFunction: a script function that is no RPC
     std::string View;                   // __RefAtInline__: the TArray field of the view struct in Extra
@@ -2166,6 +2177,13 @@ void FCompiler::ApplyConv(const FConv& C, FBlueprintClass& BP, FArgIR& Arg)
 {
     WrapInCall(Arg, BP.EngineFunction(C.Package, C.Class, C.Fn));
     for (const Json& E : C.Extra) Arg.Sub->Args.push_back(ConstArg(E));
+    for (const size_t At : C.Refs)
+        if (At < Arg.Sub->Args.size())
+        {
+            Arg.Sub->RefParms.resize(Arg.Sub->Args.size());
+            Arg.Sub->RefParms[At] = At == 0 ? C.From : Arg.Sub->Args[At].InnerType;
+        }
+    Arg.Sub->bRefsTakeConst = true;
     Arg.InnerType = C.To;
 }
 
@@ -2582,6 +2600,20 @@ bool FCompiler::LowerDispatcherCall(const Json& Call, const Json& Callee, const 
         C.Args.emplace_back();
         if (!LowerArg(*A, BP, C.Args.back(), Err)) return false;
     }
+    /* A reference parameter of the signature is an out parm, which execCallMulticastDelegate steps with a null result
+       pointer and copies from the address the argument left: HoistCallArgs gives anything but a variable a local. */
+    if (auto M = Cur->Methods.find(Name(Obj) + "__DelegateSignature"); M != Cur->Methods.end())
+    {
+        C.RefParms.emplace_back();
+        ForEach(*M->second, [&](const Json& P) {
+            if (Kind(P) != "ParmVarDecl") return;
+            std::string T = TypeOf(P);
+            const bool bRef = !T.empty() && T.back() == '&';
+            while (!T.empty() && (T.back() == '&' || T.back() == ' ')) T.pop_back();
+            C.RefParms.push_back(bRef ? StripTypeKeywords(T) : std::string());
+        });
+        if (C.RefParms.size() != C.Args.size()) C.RefParms.clear();
+    }
     return true;
 }
 
@@ -2733,6 +2765,22 @@ bool IsStored(const FArgIR& A)
 {
     return A.K == FArgIR::Local || A.K == FArgIR::LocalOut || A.K == FArgIR::Field || A.K == FArgIR::Member
         || A.K == FArgIR::Index || (A.K == FArgIR::Call && A.Sub && A.Sub->Intrinsic == "__RefAtInline__");
+}
+
+/* An operand whose opcode writes its value and steps nothing that could leave Stack.MostRecentPropertyAddress. */
+bool IsVmConstant(const FArgIR& A)
+{
+    switch (A.K)
+    {
+    case FArgIR::Self: case FArgIR::Int: case FArgIR::Int64: case FArgIR::Float: case FArgIR::Bool: case FArgIR::Byte:
+    case FArgIR::Str: case FArgIR::Name: case FArgIR::Text: case FArgIR::NullObj: case FArgIR::ObjConst:
+    case FArgIR::SoftPath: case FArgIR::Delegate:
+        return true;
+    case FArgIR::StructLit:     // execStructConst steps each member into the struct: constants only
+        return A.Sub && std::all_of(A.Sub->Args.begin(), A.Sub->Args.end(), [](const FArgIR& M) { return IsVmConstant(M); });
+    default:
+        return false;
+    }
 }
 
 bool FCompiler::IsRawPointer(std::string T) const
@@ -3315,6 +3363,7 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             Out.Sub->WrittenArgs = ContainerWrites(Prefix + Method);
             Out.Sub->bOnArg0 = true;
             Out.Sub->Args.push_back(Target);
+            Out.Sub->RefParms.emplace_back();
             bool bFirst = true, bOk = true;
             std::string LastType;
             ForEach(*N, [&](const Json& A) {
@@ -3324,6 +3373,12 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
                 bOk = LowerArg(A, BP, V, Err);
                 if (bOk) Out.Sub->Args.push_back(V);
                 LastType = TypeOf(A);
+                /* A container argument (Append's source, Union's sets) is stepped with no result buffer and read where
+                   it lies (execArray_Append), so one a call computes needs a local; an item goes into the thunk's own
+                   storage (StepCompiledIn<FProperty>(StorageSpace)), whatever evaluates it. */
+                std::string T = LastType;
+                while (!T.empty() && (T.back() == '&' || T.back() == ' ')) T.pop_back();
+                Out.Sub->RefParms.push_back(IsContainerType(T) ? StripTypeKeywords(T) : std::string());
             });
             if (bOk && Out.Sub->Args.size() == 3 && ((Prefix == "Map_" && Method == "Find") || (Prefix == "Array_" && Method == "Get")))
             {
@@ -3495,6 +3550,10 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
                     Out.Sub->Args.push_back(A);
                 }
                 for (const Json& E : O->Extra) Out.Sub->Args.push_back(ConstArg(E));
+                Out.Sub->RefParms.resize(Out.Sub->Args.size());
+                for (const size_t At : O->Refs)
+                    if (At < 2) Out.Sub->RefParms[At] = At == 0 ? O->Lhs : O->Rhs;
+                Out.Sub->bRefsTakeConst = true;
                 Out.InnerType = O->Ret;
                 return true;
             }
@@ -4573,10 +4632,15 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         else if (I < Defaulted.size() && Defaulted[I]) Out.Args[I] = Wco;
         break;
     }
-    /* A reference parameter, const or not, is CPF_OutParm, and a script callee steps its argument with no result
-       buffer to take the address (ProcessScriptFunction): HoistCallArgs gives an rvalue there a local to live in. */
-    if (Out.bScript && !Hidden && Out.Args.size() == Parms.size())
-    {
+    /* A reference parameter, const or not, is CPF_OutParm. A script callee steps its argument with no result buffer to
+       take the address (ProcessScriptFunction), and a native reads it through Stack.MostRecentPropertyAddress whenever
+       the argument left one (P_GET_PROPERTY_REF), which a nested call does - the address of whatever ITS arguments read
+       last. HoistCallArgs gives such an argument a local to live in. genueapi keeps a native's const reference
+       parameters `const T&` for this (Dumper-7's flags; its spelling alone cannot tell one from a by-value string). */
+    auto FillRefParms = [&] {
+        if (Out.Args.size() != Parms.size()) return;
+        Out.RefParms.clear();
+        Out.bRefsTakeConst = !Out.bScript;
         ForEach(*FullDecl, [&](const Json& C) {
             if (Kind(C) != "ParmVarDecl") return;
             std::string T = TypeOf(C);
@@ -4584,7 +4648,8 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
             while (!T.empty() && (T.back() == '&' || T.back() == ' ')) T.pop_back();
             Out.RefParms.push_back(bRef ? StripTypeKeywords(T) : std::string());
         });
-    }
+    };
+    if (!Hidden) FillRefParms();
     if (Hidden)
     {
         if (!LatentRefusal.empty()) { *Err = "latent call " + MethodName + ": " + LatentRefusal; return false; }
@@ -4624,6 +4689,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         }
         std::sort(Fill.begin(), Fill.end(), [](const auto& A, const auto& B) { return A.first < B.first; });
         for (const auto& [At, Arg] : Fill) Out.Args.insert(Out.Args.begin() + std::min(At, Out.Args.size()), Arg);
+        FillRefParms();
         bMadeLatentCall = true;
 
         if (!ResultLocal.empty())
@@ -6017,22 +6083,27 @@ int32 Mentions(const std::vector<FStmtIR>& Stmts, const std::string& Name)
     return N;
 }
 
-/* C may bind argument I to a reference it writes: a T& parameter, a container method's array or out value. */
-bool MayWriteArg(const FCallIR& C, size_t I)
+/* C may bind argument I to a reference: one it writes (a T& parameter, a container method's array or out value), or
+   one it reads where the argument lies (RefParms), which must stay a variable unless Value, what would go there
+   instead, is a constant a native reads from its own buffer (see HoistCallArgs). */
+bool MayWriteArg(const FCallIR& C, size_t I, const FArgIR* Value = nullptr)
 {
+    if (I < C.RefParms.size() && !C.RefParms[I].empty() && !(Value && C.bRefsTakeConst && IsVmConstant(*Value)))
+        return true;
     return !C.bPure && !IsBranch(C.Intrinsic) && (I >= 64 || (C.WrittenArgs >> I & 1));
 }
 
 /* The read of local Name that runs exactly once whenever A does: not under a branch's later operands, an inline
    body, an object or struct base (which may need a variable), or a call's target. Nor an argument bRefSlot says may
-   be written: the variable is the argument there, and another in its place would take the write. */
-FArgIR* FindPlainRead(FArgIR& A, const std::string& Name, bool bRefSlot = false)
+   be written: the variable is the argument there, and another in its place would take the write. Value: what is to
+   replace the read. */
+FArgIR* FindPlainRead(FArgIR& A, const std::string& Name, const FArgIR* Value, bool bRefSlot = false)
 {
     if (A.K == FArgIR::Local && A.S == Name && !A.Base) return bRefSlot ? nullptr : &A;
     if (A.K != FArgIR::Call || !A.Sub || A.Sub->Inline) return nullptr;
     const size_t Count = IsBranch(A.Sub->Intrinsic) ? std::min<size_t>(1, A.Sub->Args.size()) : A.Sub->Args.size();
     for (size_t I = 0; I < Count; ++I)
-        if (FArgIR* F = FindPlainRead(A.Sub->Args[I], Name, MayWriteArg(*A.Sub, I))) return F;
+        if (FArgIR* F = FindPlainRead(A.Sub->Args[I], Name, Value, MayWriteArg(*A.Sub, I, Value))) return F;
     return nullptr;
 }
 
@@ -6089,20 +6160,21 @@ void FCompiler::ArgumentsInPlace(std::vector<FStmtIR>& Body, const std::vector<s
         const std::vector<FStmtIR> Rest(Body.begin() + K + 1, Body.end());
         if (Mentions(Rest, Name) != 1) return;
 
+        const FArgIR& Arg = Body[K].Value;
         FArgIR* Read = nullptr;
         FArgIR* Scope = nullptr;
         if (First.K == FStmtIR::StaticCall && !First.Target.Target && First.Target.Args.empty())
         {
             for (size_t I = 0; I < First.Call.Args.size() && !Read; ++I)
-                if ((Read = FindPlainRead(First.Call.Args[I], Name, MayWriteArg(First.Call, I)))) Scope = &First.Call.Args[I];
+                if ((Read = FindPlainRead(First.Call.Args[I], Name, &Arg, MayWriteArg(First.Call, I, &Arg))))
+                    Scope = &First.Call.Args[I];
         }
         else if ((First.K == FStmtIR::Assign || First.K == FStmtIR::Decl || First.K == FStmtIR::Return) && !First.Var.Base)
-            Read = FindPlainRead(*(Scope = &First.Value), Name);
+            Read = FindPlainRead(*(Scope = &First.Value), Name, &Arg);
         else if (First.K == FStmtIR::If)
-            Read = FindPlainRead(*(Scope = &First.Cond), Name);
+            Read = FindPlainRead(*(Scope = &First.Cond), Name, &Arg);
         if (!Read) return;
 
-        const FArgIR& Arg = Body[K].Value;
         const bool bActs = CallsImpure(Arg);
         const std::function<bool(const FArgIR&)> Pred = [&](const FArgIR& X) { return bActs ? ReadsNothing(X) : !CallsImpure(X); };
         bool bOk = OffPath(*Scope, Read, Pred);
@@ -6146,20 +6218,21 @@ void FCompiler::ForwardSingleUse(std::vector<FStmtIR>& Stmts, const std::vector<
                 || std::none_of(CurLocals->begin(), CurLocals->end(), [&](const FPropertyDef& L) { return L.Name == Name; })
                 || Mentions(All, Name) != 2 || Mentions(Def.Value, Name) != 0)
                 continue;
+            const FArgIR& E = Def.Value;
             FArgIR* Read = nullptr;
             FArgIR* Scope = nullptr;
             if (Next.K == FStmtIR::StaticCall && !Next.Target.Target && Next.Target.Args.empty())
             {
                 for (size_t I = 0; I < Next.Call.Args.size() && !Read; ++I)
-                    if ((Read = FindPlainRead(Next.Call.Args[I], Name, MayWriteArg(Next.Call, I)))) Scope = &Next.Call.Args[I];
+                    if ((Read = FindPlainRead(Next.Call.Args[I], Name, &E, MayWriteArg(Next.Call, I, &E))))
+                        Scope = &Next.Call.Args[I];
             }
             else if ((Next.K == FStmtIR::Assign || Next.K == FStmtIR::Decl || Next.K == FStmtIR::Return) && !Next.Var.Base)
-                Read = FindPlainRead(*(Scope = &Next.Value), Name);
+                Read = FindPlainRead(*(Scope = &Next.Value), Name, &E);
             else if (Next.K == FStmtIR::If)
-                Read = FindPlainRead(*(Scope = &Next.Cond), Name);
+                Read = FindPlainRead(*(Scope = &Next.Cond), Name, &E);
             if (!Read) continue;
 
-            const FArgIR& E = Def.Value;
             const bool bActs = CallsImpure(E);
             const std::function<bool(const FArgIR&)> Pred = [&](const FArgIR& X) { return bActs ? ReadsNothing(X) : !CallsImpure(X); };
             bool bOk = OffPath(*Scope, Read, Pred);
@@ -7086,11 +7159,15 @@ bool FCompiler::HoistCallArgs(FCallIR& C, FBlueprintClass& BP, std::vector<FProp
         if (!HoistReadsInArg(C.Args[I], BP, Locals, OutPre, Err)) return false;
         if (I == 0 && C.bOnArg0 && !PinHolder(C.Args[0], C.Args.data() + 1, C.Args.size() - 1, BP, Locals, OutPre, Err))
             return false;
-        /* An rvalue bound to a script callee's reference parameter: EX_IntConst and the like would write their value
-           through the null result pointer the VM steps an out parameter with, so it goes into a local first. */
+        /* An rvalue bound to a reference parameter goes into a local first. A script callee (and a container thunk)
+           steps it with a null result pointer, which EX_IntConst and the like would write through; a native's
+           P_GET_PROPERTY_REF reads the address the argument left, and a call or a cast leaves the address of what ITS
+           operands read (execStructMemberContext's rule, one level up). A constant leaves none, so a native reads it
+           from its own buffer: it stays as it is there. */
         // ponytail: the local is made after the object is pinned, so an argument that changes the call's object runs
         // first; PinObject would need to see these hoists to fix that, if a mod ever does it.
-        if (I < C.RefParms.size() && !C.RefParms[I].empty() && !IsStored(C.Args[I]))
+        if (I < C.RefParms.size() && !C.RefParms[I].empty() && !IsStored(C.Args[I])
+            && !(C.bRefsTakeConst && IsVmConstant(C.Args[I])))
         {
             if (C.Args[I].InnerType.empty()) C.Args[I].InnerType = C.RefParms[I];
             if (!HoistOperand(C.Args[I], BP, Locals, OutPre, Err)) return false;
@@ -9043,11 +9120,11 @@ bool FCompiler::LoadTables(const std::string& IncludeDir, std::string* Err)
     for (const Json& Row : ConvDoc)
         Convs.push_back({ Row.value("from", std::string()), Row.value("to", std::string()),
                           Row.value("package", std::string()), Row.value("class", std::string()),
-                          Row.value("fn", std::string()), ExtraArgs(Row) });
+                          Row.value("fn", std::string()), ExtraArgs(Row), RefArgs(Row) });
     for (const Json& Row : OpsDoc)
         Ops.push_back({ Row.value("op", std::string()), Row.value("lhs", std::string()), Row.value("rhs", std::string()),
                         Row.value("ret", std::string()), Row.value("package", std::string()),
-                        Row.value("class", std::string()), Row.value("fn", std::string()), ExtraArgs(Row) });
+                        Row.value("class", std::string()), Row.value("fn", std::string()), ExtraArgs(Row), RefArgs(Row) });
     for (auto It = TypesDoc["enums"].begin(); It != TypesDoc["enums"].end(); ++It)
         Enums[It.key()] = { It->value("package", std::string()), It->value("name", std::string()),
                             It->value("underlying", std::string()), It->value("first", std::string()) };

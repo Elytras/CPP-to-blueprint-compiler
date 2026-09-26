@@ -125,6 +125,7 @@ class VM:
                         raise SystemExit('vm: %s: reference parameter %s gets a non-variable (op %02x), which crashes the VM' % (name, parm, a.op))
                 return s.call(name, *[ev(a) for a in n.kids], on=ctx)
             if o in (0x1B, 0x45, 0x1C, 0x46, 0x68):
+                runscript.native_refs(n)
                 if name in runscript.CONTAINERS: return runscript.CONTAINERS[name](ev, store, n.kids)
                 if name in runscript.MATH: return runscript.MATH[name](*[ev(a) for a in n.kids])
                 vals = [ev(a) for a in n.kids]

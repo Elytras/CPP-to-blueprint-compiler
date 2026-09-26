@@ -1408,7 +1408,8 @@ def struct_behaviour():
                 ('RangeCopyToRef', {'Many': [{kills: 1}, {kills: 2}]}, 1, {'Many': [{kills: 1}, {kills: 2}]}),
                 ('MapFindIntoCopy', {'Scores': {1: 40}}, k, {'Scores': {1: 40}}),
                 ('ArrayAppendCopy', {'Counts': [1, 2]}, i32(k + 4), {'Counts': [1, 2, 1, 2]}),
-                ('SetUnionCopy', {'Seen': [1, 2], 'Fresh': [2, 3]}, i32(k + 3), {'Seen': [2, 3, 1], 'Fresh': [2, 3]})):
+                ('SetUnionCopy', {'Seen': [1, 2], 'Fresh': [2, 3]}, i32(k + 3), {'Seen': [2, 3, 1], 'Fresh': [2, 3]}),
+                ('AppendComputed', {'Counts': [1, 2]}, i32(k + 6), {'Counts': [1, 2, 1, 2, 1, 2]})):
             f = copy.deepcopy(fields)
             got = run(asset('StructTest'), fn, self_vars=f, K=k)[0]
             assert (got, f) == (want, after), (fn, k, got, f)
