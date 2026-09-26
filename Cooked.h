@@ -62,6 +62,10 @@ public:
 
     /* "Base" or "Base_<n>", as FName::ToString spells a numbered name. */
     std::string NameOf(const FNameRef& N) const;
+    /* Whether N is the plain name S (no number), compared as FName compares: case-insensitively. */
+    bool Is(const FNameRef& N, const char* S) const;
+    /* The name of the class an export or import index names: an import's ObjectName, or an export's own. */
+    std::string ClassNameOf(int32 Index) const;
 
     uint32 PackageFlags = 0;
     uint32 Guid[4] = { 0, 0, 0, 0 };
@@ -72,9 +76,34 @@ public:
     std::vector<int32> PreloadDependencies;
 };
 
+/*
+One FPropertyTag and its value, the way UStruct::SerializeTaggedProperties writes them (4.27 PropertyTag.cpp). The
+value stays raw bytes, and the tag's Size is its length. The type's own fields exist only when Type has no number.
+*/
+struct FTag
+{
+    FNameRef Name, Type;
+    int32 ArrayIndex = 0;
+    FNameRef StructName;                        // StructProperty, with its guid
+    uint32 StructGuid[4] = { 0, 0, 0, 0 };
+    uint8 BoolVal = 0;                          // BoolProperty: the value itself, with no payload
+    FNameRef EnumName;                          // ByteProperty (None for a plain byte), EnumProperty
+    FNameRef InnerType, ValueType;              // ArrayProperty and SetProperty: the inner; MapProperty: both
+    uint8 HasPropertyGuid = 0;
+    uint32 PropertyGuid[4] = { 0, 0, 0, 0 };
+    std::vector<uint8> Value;
+};
+
+/* A tag list starting at At, through its terminating None; At ends just past it. False if the bytes there are not
+   one: an out-of-range name, a size running past the end, or no None before the end. */
+bool ReadTags(const FCookedPackage& P, const std::vector<uint8>& Bytes, size_t& At, std::vector<FTag>& Out);
+/* The tags and the None that ends them. */
+void WriteTags(const FCookedPackage& P, const std::vector<FTag>& Tags, std::vector<uint8>& Out);
+
 /* The gate before any edit is trusted: every cooked package under Dir read and written back in memory, with a report
    of what was refused, what came back different, and whether AssetGen's name hashes and name order match the cook's.
-   0 when every package comes back byte-identical. */
+   Each export's tagged properties go through ReadTags / WriteTags on the way. 0 when every package comes back
+   byte-identical. */
 int RoundTrip(const std::string& Dir);
 
 }   // namespace Uasset

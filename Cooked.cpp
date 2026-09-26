@@ -102,12 +102,106 @@ bool WriteAll(const std::filesystem::path& Path, const std::vector<uint8>& Bytes
     std::ofstream F(Path, std::ios::binary | std::ios::trunc);
     return F && F.write(reinterpret_cast<const char*>(Bytes.data()), std::streamsize(Bytes.size()));
 }
+
+/* The name-map rows of the names a tag's layout turns on; -1 for one the package does not have. */
+struct FTagTypes
+{
+    int32 None = -1, Struct = -1, Bool = -1, Byte = -1, Enum = -1, Array = -1, Set = -1, Map = -1;
+
+    explicit FTagTypes(const FCookedPackage& P)
+    {
+        const std::pair<const char*, int32*> Wanted[] = { { "none", &None }, { "structproperty", &Struct },
+            { "boolproperty", &Bool }, { "byteproperty", &Byte }, { "enumproperty", &Enum }, { "arrayproperty", &Array },
+            { "setproperty", &Set }, { "mapproperty", &Map } };
+        for (int32 I = 0; I < int32(P.Names.size()); ++I)
+        {
+            const std::string L = Lower(P.Names[size_t(I)].Text);
+            for (const auto& [Text, Slot] : Wanted)
+                if (*Slot < 0 && L == Text) *Slot = I;
+        }
+    }
+};
 }   // namespace
 
 std::string FCookedPackage::NameOf(const FNameRef& N) const
 {
     const std::string Base = N.Index >= 0 && size_t(N.Index) < Names.size() ? Names[size_t(N.Index)].Text : "?";
     return N.Number ? Base + "_" + std::to_string(N.Number - 1) : Base;
+}
+
+bool FCookedPackage::Is(const FNameRef& N, const char* S) const
+{
+    return N.Number == 0 && N.Index >= 0 && size_t(N.Index) < Names.size() && Lower(Names[size_t(N.Index)].Text) == Lower(S);
+}
+
+std::string FCookedPackage::ClassNameOf(int32 Index) const
+{
+    if (Index < 0 && size_t(-int64(Index)) <= Imports.size()) return NameOf(Imports[size_t(-int64(Index) - 1)].ObjectName);
+    if (Index > 0 && size_t(Index) <= Exports.size()) return NameOf(Exports[size_t(Index - 1)].ObjectName);
+    return "(null)";
+}
+
+bool ReadTags(const FCookedPackage& P, const std::vector<uint8>& Bytes, size_t& At, std::vector<FTag>& Out)
+{
+    const FTagTypes T(P);
+    FReader R(Bytes);
+    R.P = At;
+    auto Valid = [&](const FNameRef& N) { return N.Index >= 0 && size_t(N.Index) < P.Names.size() && N.Number >= 0; };
+    Out.clear();
+    for (;;)
+    {
+        FTag Tag;
+        Tag.Name = R.Name();
+        if (R.bBad || !Valid(Tag.Name)) return false;
+        if (Tag.Name.Index == T.None && Tag.Name.Number == 0) { At = R.P; return true; }
+        Tag.Type = R.Name();
+        const int32 Size = R.I32();
+        Tag.ArrayIndex = R.I32();
+        if (Tag.Type.Number == 0)
+        {
+            const int32 Type = Tag.Type.Index;
+            if (Type == T.Struct) { Tag.StructName = R.Name(); R.Guid(Tag.StructGuid); }
+            else if (Type == T.Bool) Tag.BoolVal = R.Get<uint8>();
+            else if (Type == T.Byte || Type == T.Enum) Tag.EnumName = R.Name();
+            else if (Type == T.Array || Type == T.Set) Tag.InnerType = R.Name();
+            else if (Type == T.Map) { Tag.InnerType = R.Name(); Tag.ValueType = R.Name(); }
+        }
+        Tag.HasPropertyGuid = R.Get<uint8>();
+        if (Tag.HasPropertyGuid) R.Guid(Tag.PropertyGuid);
+        if (R.bBad || Size < 0 || size_t(Size) > Bytes.size() - R.P || !Valid(Tag.Type) || !Valid(Tag.StructName)
+            || !Valid(Tag.EnumName) || !Valid(Tag.InnerType) || !Valid(Tag.ValueType))
+            return false;
+        Tag.Value.assign(Bytes.begin() + std::ptrdiff_t(R.P), Bytes.begin() + std::ptrdiff_t(R.P + size_t(Size)));
+        R.P += size_t(Size);
+        Out.push_back(std::move(Tag));
+    }
+}
+
+void WriteTags(const FCookedPackage& P, const std::vector<FTag>& Tags, std::vector<uint8>& Out)
+{
+    const FTagTypes T(P);
+    FArc Ar(nullptr);
+    for (const FTag& Tag : Tags)
+    {
+        PutName(Ar, Tag.Name);
+        PutName(Ar, Tag.Type);
+        Ar.I32(int32(Tag.Value.size()));
+        Ar.I32(Tag.ArrayIndex);
+        if (Tag.Type.Number == 0)
+        {
+            const int32 Type = Tag.Type.Index;
+            if (Type == T.Struct) { PutName(Ar, Tag.StructName); Ar.Guid(Tag.StructGuid); }
+            else if (Type == T.Bool) Ar.U8(Tag.BoolVal);
+            else if (Type == T.Byte || Type == T.Enum) PutName(Ar, Tag.EnumName);
+            else if (Type == T.Array || Type == T.Set) PutName(Ar, Tag.InnerType);
+            else if (Type == T.Map) { PutName(Ar, Tag.InnerType); PutName(Ar, Tag.ValueType); }
+        }
+        Ar.U8(Tag.HasPropertyGuid);
+        if (Tag.HasPropertyGuid) Ar.Guid(Tag.PropertyGuid);
+        Ar.Raw(Tag.Value.data(), Tag.Value.size());
+    }
+    PutName(Ar, FNameRef{ T.None, 0 });
+    Out.insert(Out.end(), Ar.B.begin(), Ar.B.end());
 }
 
 bool FCookedPackage::Load(const std::string& HeaderPath, std::string* Err)
@@ -368,8 +462,9 @@ bool FCookedPackage::Save(const std::string& HeaderPath, std::string* Err) const
 
 int RoundTrip(const std::string& Dir)
 {
-    size_t Packages = 0, Identical = 0, NamesTotal = 0, HashMismatch = 0, Unsorted = 0;
+    size_t Packages = 0, Identical = 0, NamesTotal = 0, HashMismatch = 0, Unsorted = 0, ExportsTotal = 0, Tagged = 0;
     std::map<std::string, std::pair<size_t, std::string>> Refused;      // reason -> count, first path
+    std::map<std::string, size_t> Untagged, TagTypes;                   // exports with no tag list by class; tags by type
     std::vector<std::string> Differ;
     std::error_code Ec;
     for (auto It = std::filesystem::recursive_directory_iterator(std::filesystem::u8path(Dir), Ec);
@@ -403,6 +498,21 @@ int RoundTrip(const std::string& Dir)
         Unsorted += !std::is_sorted(P.Names.begin(), P.Names.end(),
                                     [](const FCookedName& A, const FCookedName& B) { return Lower(A.Text) < Lower(B.Text); });
 
+        /* Each export's tag list goes through ReadTags / WriteTags; what follows its None stays as it was. */
+        for (FCookedExport& E : P.Exports)
+        {
+            ++ExportsTotal;
+            size_t At = 0;
+            std::vector<FTag> Tags;
+            if (!ReadTags(P, E.Payload, At, Tags)) { ++Untagged[P.ClassNameOf(E.Class)]; continue; }
+            ++Tagged;
+            for (const FTag& Tag : Tags) ++TagTypes[P.NameOf(Tag.Type)];
+            std::vector<uint8> Again;
+            WriteTags(P, Tags, Again);
+            Again.insert(Again.end(), E.Payload.begin() + std::ptrdiff_t(At), E.Payload.end());
+            E.Payload = std::move(Again);
+        }
+
         std::vector<uint8> Header2, Exp2;
         P.Write(Header2, Exp2);
         if (Header2 == Header && Exp2 == Exp) { ++Identical; continue; }
@@ -425,6 +535,17 @@ int RoundTrip(const std::string& Dir)
     for (size_t I = 0; I < Differ.size() && I < 20; ++I) printf("  differs: %s\n", Differ[I].c_str());
     printf("  name maps in AssetGen's order: %zu of %zu read; stored name hashes AssetGen computes too: %zu of %zu\n",
            Packages - RefusedCount - Unsorted, Packages - RefusedCount, NamesTotal - HashMismatch, NamesTotal);
+    auto Top = [](const std::map<std::string, size_t>& Counts, size_t N) {
+        std::vector<std::pair<size_t, std::string>> Sorted;
+        for (const auto& [Key, Count] : Counts) Sorted.emplace_back(Count, Key);
+        std::sort(Sorted.rbegin(), Sorted.rend());
+        std::string Out;
+        for (size_t I = 0; I < Sorted.size() && I < N; ++I) Out += (I ? ", " : "") + Sorted[I].second + " x" + std::to_string(Sorted[I].first);
+        return Out + (Sorted.size() > N ? ", ..." : "");
+    };
+    printf("  tagged properties read and written back on %zu of %zu exports; no tag list: %s\n", Tagged, ExportsTotal,
+           Untagged.empty() ? "none" : Top(Untagged, 12).c_str());
+    printf("  tag types: %s\n", Top(TagTypes, 40).c_str());
     return Packages && Identical == Packages ? 0 : 1;
 }
 
