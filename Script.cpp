@@ -319,6 +319,18 @@ int32 NativeStructSize(const std::string& StructName)
     return N == Native.end() ? 0 : N->second;
 }
 
+bool NativeUnwritten(const std::string& StructName)
+{
+    // ponytail: the census's list; a native struct the pak holds no value of is not in it
+    static const char* const Unwritten[] = {
+        "GameplayTagContainer", "SoftObjectPath", "SoftClassPath", "PerPlatformFloat", "PerPlatformInt", "RichCurveKey",
+        "KeyHandleMap", "FontData", "FontCharacter", "ColorMaterialInput", "ScalarMaterialInput", "VectorMaterialInput",
+        "MaterialAttributesInput", "NiagaraVariable", "NiagaraVariableBase", "NiagaraVariableWithOffset",
+        "MovieSceneFloatChannel", "MovieSceneFrameRange", "MovieSceneEvaluationFieldEntityTree",
+        "SkeletalMeshSamplingLODBuiltData", "LevelSequenceObjectReferenceMap", "UniqueNetIdRepl", "ModioUIColorRef" };
+    return std::find(std::begin(Unwritten), std::end(Unwritten), StructName) != std::end(Unwritten);
+}
+
 int32 FixedValueSize(const FPropertyDef& P)
 {
     const std::string& T = P.Type;

@@ -7720,6 +7720,12 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
     Init = Strip(Whole);
     if (!Init) return true;
     std::string K = Kind(*Init);
+    if (PD.Type == "StructProperty" && NativeUnwritten(PD.StructName))
+    {
+        *Err = Name(F) + ": the engine reads a " + PD.StructName + " value in its own binary form, which AssetGen does not "
+             "write yet; leave the value out";
+        return false;
+    }
 
     /* `TArray<uint8> Blob = __EmbedFile__("rel/path")`: the file's bytes, read here at build time and
        written into the CDO one element per byte. The path is relative to the mod source being compiled. */
@@ -8264,6 +8270,13 @@ bool FCompiler::GenerateStruct(const FRecord& R, const std::string& OutDir, std:
         const std::string Field = IsInternalViewStruct(R.CppName) ? Name(*F)
                                                                   : ModFieldName(PackageName, Name(*F));
         if (!TypeToProperty(TypeOf(*F), Field, 0, "member " + Name(*F), BP, &PD, Err)) return false;
+        /* The struct's default instance carries every member's value, so a member no value can be written for is none. */
+        if (PD.Type == "StructProperty" && NativeUnwritten(PD.StructName))
+        {
+            *Err = R.CppName + "::" + Name(*F) + ": the engine reads a " + PD.StructName + " value in its own binary form, "
+                   "which AssetGen does not write yet, and a UE_STRUCT's defaults hold every member's";
+            return false;
+        }
         if (!LowerDefault(*F, PD, BP, Err)) return false;
         PD.PropertyFlags = CPF_Edit | CPF_BlueprintVisible;
         BP.AddVariable(PD);

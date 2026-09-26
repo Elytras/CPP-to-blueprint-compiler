@@ -98,6 +98,9 @@ int32 NativeStructSize(const std::string& StructName);
 /* The bytes WriteDefaultValue writes for P whatever the value, or 0 when that depends on the value (a string, a text, a
    soft path, a struct written as tags, a container). */
 int32 FixedValueSize(const FPropertyDef& P);
+/* Whether the engine serializes StructName natively in a form WriteValue does not write (it writes tags for it): each
+   one the S38 value gate met in the pak's values. The engine misreads any value of one AssetGen writes. */
+bool NativeUnwritten(const std::string& StructName);
 
 /* Every object D points at, for the owning export's create-before-serialize edges. */
 void DefaultRefs(const FDefaultValue& D, std::vector<int32>& Out);
