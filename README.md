@@ -130,8 +130,11 @@ Under Proton the game reads paks from
 
 ## Generating the SDK yourself
 
-1. Dump the game with the [Dumper-7 fork](https://github.com/Elytras/Dumper-7) with `FullAssetPaths=1`
-   in `Dumper-7.ini`. Upstream Dumper-7 doesn't write the package paths genueapi reads. (soon will)
+1. Dump the game with the [Dumper-7 fork](https://github.com/Elytras/Dumper-7), with `FullAssetPaths=1`
+   in `Dumper-7.ini`. The fork writes three things genueapi reads that upstream Dumper-7 doesn't: each Blueprint's
+   package path (`FullAssetPaths`), a Blueprint component's SCS node (`ScsNode=`, needed to set a default on a
+   component a game Blueprint declares) and a replicated property's RepNotify function (`RepNotifyFunc=`, which a
+   set calls, as the editor's Set node does). The last two are always on.
 2. `python tools/genueapi.py <dump>/SDK/SDK <UeApi dir>`. This step runs on Linux too, from the dump's folder
    on the Windows drive or a copy of it.
 3. Copy the hand-written `UeMeta.h` and `Types.h` from [the SDK repo](https://github.com/Elytras/DRG-Blueprint-Cpp-SDK/tree/main/UeApi) into `<UeApi dir>`.
