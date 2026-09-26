@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -8399,10 +8400,11 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     /* The first scene component is the actor's root, and the engine puts it at the spawn transform: it never reads the
        root's RelativeLocation or RelativeRotation, and reads its RelativeScale3D for a C++ SpawnActor but not for
        Blueprint's Spawn Actor node (USCS_Node::ExecuteNodeOnActor, bIsDefaultTransform). So a plain SceneComponent root
-       hands its offset and scale to the components attached to it, composed as FTransform composes them - the scales
-       multiply, and a child's offset grows with the root's scale and adds the root's offset - and keeps neither. A root
-       that draws something itself would need its own scale, and a rotation would have to turn every child's offset,
-       so those are only warned about. ponytail: rotation is not folded; fold it with FQuat math if a mod needs it. */
+       hands its transform to the components attached to it, composed as FTransform::Multiply composes a child with its
+       parent - the rotations multiply (root first), the scales multiply, and a child's offset grows with the root's
+       scale, turns with its rotation and adds its offset - and keeps none of it. A root that draws something itself
+       would need its own, so that is only warned about. ponytail: a negative scale takes FTransform's matrix path
+       and an absolute child ignores its parent; neither is special-cased here. */
     {
         auto IsScene = [&](const FRecord* C) {
             for (; C; C = C->Base.empty() ? nullptr : Find(C->Base)) if (C->UeName == "SceneComponent") return true;
@@ -8432,30 +8434,74 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             for (int32 I = 0; I < 3; ++I) (*Like.Members)[I].Default.F = V[I];
             Defs.push_back(Like);
         };
+        /* FRotator::Quaternion, FQuat::operator* (B turns first), FQuat::RotateVector and FQuat::Rotator, as UE 4.27
+           writes them. A rotator is Pitch, Yaw, Roll in degrees; a quaternion X, Y, Z, W. */
+        using FQ = std::array<double, 4>;
+        const double Pi = 3.14159265358979323846;
+        auto ToQuat = [&](const std::array<double, 3>& Rot) {
+            double S[3], C[3];
+            for (int32 I = 0; I < 3; ++I) { S[I] = std::sin(std::fmod(Rot[I], 360.0) * Pi / 360); C[I] = std::cos(std::fmod(Rot[I], 360.0) * Pi / 360); }
+            const double SP = S[0], SY = S[1], SR = S[2], CP = C[0], CY = C[1], CR = C[2];
+            return FQ{ CR * SP * SY - SR * CP * CY, -CR * SP * CY - SR * CP * SY, CR * CP * SY - SR * SP * CY, CR * CP * CY + SR * SP * SY };
+        };
+        auto Mul = [](const FQ& A, const FQ& B) {
+            return FQ{ A[3] * B[0] + A[0] * B[3] + A[1] * B[2] - A[2] * B[1], A[3] * B[1] - A[0] * B[2] + A[1] * B[3] + A[2] * B[0],
+                       A[3] * B[2] + A[0] * B[1] - A[1] * B[0] + A[2] * B[3], A[3] * B[3] - A[0] * B[0] - A[1] * B[1] - A[2] * B[2] };
+        };
+        auto Cross = [](const std::array<double, 3>& A, const std::array<double, 3>& B) {
+            return std::array<double, 3>{ A[1] * B[2] - A[2] * B[1], A[2] * B[0] - A[0] * B[2], A[0] * B[1] - A[1] * B[0] };
+        };
+        auto Rotate = [&](const FQ& Q, const std::array<double, 3>& V) {
+            std::array<double, 3> T = Cross({ Q[0], Q[1], Q[2] }, V), Out;
+            for (double& X : T) X *= 2;
+            const std::array<double, 3> QT = Cross({ Q[0], Q[1], Q[2] }, T);
+            for (int32 I = 0; I < 3; ++I) Out[I] = V[I] + Q[3] * T[I] + QT[I];
+            return Out;
+        };
+        auto ToRotator = [&](const FQ& Q) {
+            const double X = Q[0], Y = Q[1], Z = Q[2], W = Q[3], Test = Z * X - W * Y, Deg = 180 / Pi;
+            const double Yaw = std::atan2(2 * (W * Z + X * Y), 1 - 2 * (Y * Y + Z * Z)) * Deg;
+            auto Normalize = [](double A) { A = std::fmod(A, 360.0); if (A < 0) A += 360; return A > 180 ? A - 360 : A; };
+            std::array<double, 3> Out;
+            if (Test < -0.4999995) Out = { -90, Yaw, Normalize(-Yaw - 2 * std::atan2(X, W) * Deg) };
+            else if (Test > 0.4999995) Out = { 90, Yaw, Normalize(Yaw - 2 * std::atan2(X, W) * Deg) };
+            else Out = { std::asin(2 * Test) * Deg, Yaw, std::atan2(-2 * (W * X + Y * Z), 1 - 2 * (X * X + Y * Y)) * Deg };
+            for (double& A : Out) A += 0.0;     // no -0 in the cooked float
+            return Out;
+        };
         if (!Scene.empty())
         {
             std::vector<FPropertyDef>& RootDefs = ComponentDefaults[Scene[0].first];
-            const FVec Lr = Read(RootDefs, "RelativeLocation", 0), Sr = Read(RootDefs, "RelativeScale3D", 1);
+            const FVec Lr = Read(RootDefs, "RelativeLocation", 0), Rr = Read(RootDefs, "RelativeRotation", 0),
+                       Sr = Read(RootDefs, "RelativeScale3D", 1);
             const bool bPlain = Scene[0].second->UeName == "SceneComponent";
-            std::string Lost = Read(RootDefs, "RelativeRotation", 0).Def ? "RelativeRotation" : "";
-            if (!bPlain && Lr.Def) Lost += (Lost.empty() ? "" : ", ") + std::string("RelativeLocation");
-            if (!bPlain && Sr.Def) Lost += (Lost.empty() ? "" : ", ") + std::string("RelativeScale3D");
+            std::string Lost;
+            auto Lose = [&](const FVec& V, const char* Prop) { if (!bPlain && V.Def) Lost += (Lost.empty() ? "" : ", ") + std::string(Prop); };
+            Lose(Lr, "RelativeLocation");
+            Lose(Rr, "RelativeRotation");
+            Lose(Sr, "RelativeScale3D");
             if (!Lost.empty())
                 printf("  warning: %s::UE_DEFAULTS: %s is the actor's root, which the engine puts at the spawn transform, so its "
-                       "%s is not applied. A USceneComponent root passes its location and scale on to the components attached "
-                       "to it; rotate those instead.\n", R.CppName.c_str(), Scene[0].first.c_str(), Lost.c_str());
-            if (bPlain && (Lr.Def || Sr.Def))
+                       "%s is not applied. A USceneComponent root passes its transform on to the components attached "
+                       "to it.\n", R.CppName.c_str(), Scene[0].first.c_str(), Lost.c_str());
+            if (bPlain && (Lr.Def || Rr.Def || Sr.Def))
             {
+                const FQ Qr = ToQuat(Rr.V);
                 for (size_t C = 1; C < Scene.size(); ++C)
                 {
                     std::vector<FPropertyDef>& Defs = ComponentDefaults[Scene[C].first];
-                    const FVec Lc = Read(Defs, "RelativeLocation", 0), Sc = Read(Defs, "RelativeScale3D", 1);
+                    const FVec Lc = Read(Defs, "RelativeLocation", 0), Rc = Read(Defs, "RelativeRotation", 0),
+                               Sc = Read(Defs, "RelativeScale3D", 1);
                     std::array<double, 3> L, S;
-                    for (int32 I = 0; I < 3; ++I) { L[I] = Sr.V[I] * Lc.V[I] + Lr.V[I]; S[I] = Sr.V[I] * Sc.V[I]; }
+                    for (int32 I = 0; I < 3; ++I) { L[I] = Sr.V[I] * Lc.V[I]; S[I] = Sr.V[I] * Sc.V[I]; }
+                    L = Rotate(Qr, L);
+                    for (int32 I = 0; I < 3; ++I) L[I] += Lr.V[I];
                     if (Lc.Def || Lr.Def) Write(Defs, Lc.Def ? *Lc.Def : *Lr.Def, L);
+                    if (Rc.Def || Rr.Def) Write(Defs, Rc.Def ? *Rc.Def : *Rr.Def, ToRotator(Mul(Qr, ToQuat(Rc.V))));
                     if (Sc.Def || Sr.Def) Write(Defs, Sc.Def ? *Sc.Def : *Sr.Def, S);
                 }
                 Drop(RootDefs, "RelativeLocation");
+                Drop(RootDefs, "RelativeRotation");
                 Drop(RootDefs, "RelativeScale3D");
             }
         }
