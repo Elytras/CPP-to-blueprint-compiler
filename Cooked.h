@@ -72,8 +72,8 @@ public:
     FNameRef NameRef(const std::string& S);
     /* Whether N is the FName S spells (the same number, the base compared case-insensitively). */
     bool SameName(const FNameRef& N, const std::string& S) const;
-    /* The export row of a top-level object (outer null) named ObjectName, or -1. */
-    int32 FindExport(const std::string& ObjectName) const;
+    /* The export row of the object named ObjectName in Outer (an FPackageIndex; 0 = top level), or -1. */
+    int32 FindExport(const std::string& ObjectName, int32 Outer = 0) const;
     /* The FPackageIndex of the import (ClassPackage, ClassName, Outer, ObjectName), appended when there is none. */
     int32 Import(const std::string& ClassPackage, const std::string& ClassName, int32 Outer, const std::string& ObjectName);
     /* Dep (an FPackageIndex) created before export row Export is serialized - the edge the cook gives an object that

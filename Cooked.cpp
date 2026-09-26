@@ -161,10 +161,10 @@ bool FCookedPackage::SameName(const FNameRef& N, const std::string& S) const
     return N.Number == Number && N.Index >= 0 && size_t(N.Index) < Names.size() && Lower(Names[size_t(N.Index)].Text) == Lower(Base);
 }
 
-int32 FCookedPackage::FindExport(const std::string& ObjectName) const
+int32 FCookedPackage::FindExport(const std::string& ObjectName, int32 Outer) const
 {
     for (size_t I = 0; I < Exports.size(); ++I)
-        if (Exports[I].Outer == 0 && SameName(Exports[I].ObjectName, ObjectName)) return int32(I);
+        if (Exports[I].Outer == Outer && SameName(Exports[I].ObjectName, ObjectName)) return int32(I);
     return -1;
 }
 

@@ -8312,8 +8312,16 @@ bool FCompiler::GenerateEdit(const std::string& Key, const Json& Var, std::strin
 
 /*
 S38 - UE_PATCH: a class that edits the game Blueprint it derives from, in that Blueprint's own package. Its UE_DEFAULTS
-assignments become tags of the Blueprint's default object; a member of any class above it can be named. Nothing else
-of a patch is cooked yet, so a member, a method or a component's default is refused rather than silently dropped.
+assignments become tags of the Blueprint's default object; a member of any class above it can be named. `Comp->Field`
+edits a component, in the export the engine builds that component from:
+  - a native class's component: the default subobject under the default object, named as UeApi's `__UeSubobject` says
+    (not always the member's name: ASpiderEnemy's `temperature` is the subobject Temperature);
+  - a Blueprint's own SCS component: its template, `<Var>_GEN_VARIABLE` in the class;
+  - a parent Blueprint's SCS component this one overrides: the override record's template, also `<Var>_GEN_VARIABLE`
+    in the class. One it does not override yet has no such export, and adding the record is not built.
+None of them is instanced from cooked data (bCookBlueprintComponentTemplateData is off in DRG, and false by default),
+so the tags are all the engine reads. Nothing else of a patch is cooked yet: a member or a method is refused rather
+than silently dropped.
 */
 bool FCompiler::GeneratePatch(const FRecord& R, std::string* Err)
 {
@@ -8334,31 +8342,61 @@ bool FCompiler::GeneratePatch(const FRecord& R, std::string* Err)
     if (!Body) { *Err = Where + ": nothing to edit - a patch's defaults go in UE_DEFAULTS { Field = value; }"; return false; }
     Cur = nullptr;
 
-    const std::string Package = PackageOf(*B), Cdo = "Default__" + ClassOf(*B);
+    const std::string Package = PackageOf(*B), Class = ClassOf(*B), Cdo = "Default__" + Class;
+    const FRecord* Engine = B;      // the nearest native ancestor: its UeApi names each default subobject
+    while (Engine && PackageOf(*Engine).compare(0, 8, "/Script/") != 0) Engine = Engine->Base.empty() ? nullptr : Find(Engine->Base);
     FPackage Scratch(Package);
-    FBlueprintClass BP(Scratch, ClassOf(*B), "", "", false);
-    std::vector<FPropertyDef> Defs;
+    FBlueprintClass BP(Scratch, Class, "", "", false);
+    std::map<std::string, std::vector<FPropertyDef>> Objects;      // an export, as ApplyEdit names it -> its tags
+    auto DeclarerOf = [&](const Json& M) {
+        const auto Owner = FieldOwner.find(M.value("referencedMemberDecl", std::string()));
+        return Owner == FieldOwner.end() ? nullptr : Find(Owner->second);
+    };
     bool bOk = true;
     ForEach(*Body, [&](const Json& S) {
         if (!bOk) return;
         const Json *Lhs = nullptr, *Rhs = nullptr, *Through = nullptr;
         if (!DefaultAssignment(S, Lhs, Rhs, Through))
-        { *Err = Where + ": every statement is `Field = value;`"; bOk = false; return; }
+        { *Err = Where + ": every statement is `Field = value;` or `Component->Field = value;`"; bOk = false; return; }
+        std::string Object = Cdo;
         if (Through)
-        { *Err = Where + ": " + Name(*Through) + "->" + Name(*Lhs) + ": a component's defaults are not patched yet"; bOk = false; return; }
-        const auto Owner = FieldOwner.find(Lhs->value("referencedMemberDecl", std::string()));
-        const FRecord* DR = Owner == FieldOwner.end() ? nullptr : Find(Owner->second);
+        {
+            const std::string Comp = Name(*Through);
+            const FRecord* CR = DeclarerOf(*Through);
+            if (!CR) { *Err = Where + ": cannot tell which class declares " + Comp; bOk = false; return; }
+            if (PackageOf(*CR).compare(0, 6, "/Game/") == 0)
+            {
+                if (!CR->ScsNodes.count(Comp))
+                { *Err = Where + ": " + Comp + " is not one of " + CR->UeName + "'s components (UeApi gives it no SCS node)"; bOk = false; return; }
+                Object = Class + ":" + UeNameOf(CR, Comp) + "_GEN_VARIABLE";
+            }
+            else
+            {
+                const auto Sub = Engine ? Engine->Subobjects.find(Comp) : std::map<std::string, std::string>::const_iterator();
+                if (!Engine || Sub == Engine->Subobjects.end())
+                {
+                    *Err = Where + ": UeApi does not say which default subobject " + Comp + " is - regenerate it with genueapi, "
+                           "which reads that off the object dump";
+                    bOk = false;
+                    return;
+                }
+                Object = Cdo + ":" + Sub->second.substr(0, Sub->second.find(' '));
+            }
+        }
+        const FRecord* DR = DeclarerOf(*Lhs);
         if (!DR) { *Err = Where + ": cannot tell which class declares " + Name(*Lhs); bOk = false; return; }
         FPropertyDef PD;
         /* Zero is a real value: it replaces the Blueprint's own, which need not be zero. */
         bOk = TypeToProperty(TypeOf(*Lhs), UeNameOf(DR, Name(*Lhs)), 0, Where, BP, &PD, Err)
               && LowerDefault(*Lhs, PD, BP, Err, Rhs, /*bKeepZero=*/true);
         if (bOk && PD.Default.K == FDefaultValue::None) { *Err = Where + ": " + Name(*Lhs) + " needs a literal value"; bOk = false; }
-        if (bOk) Defs.push_back(PD);
+        if (bOk) Objects[Object].push_back(PD);
     });
     if (!bOk) return false;
-    if (Defs.empty()) { *Err = Where + ": UE_DEFAULTS assigns nothing"; return false; }
-    return ApplyEdit(Package, Cdo, Defs, Scratch, Where, Err);
+    if (Objects.empty()) { *Err = Where + ": UE_DEFAULTS assigns nothing"; return false; }
+    for (const auto& [Object, Defs] : Objects)
+        if (!ApplyEdit(Package, Object, Defs, Scratch, Where, Err)) return false;
+    return true;
 }
 
 /*
@@ -8392,8 +8430,22 @@ bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object,
         Slot = Edited.emplace(Lower(Package), std::move(E)).first;
     }
     FCookedPackage& P = Slot->second.P;
-    const int32 Export = P.FindExport(Object);
-    if (Export < 0) { *Err = Where + ": " + Package + " holds no " + Object; return false; }
+    /* Object is a path of names from the package down, `:`-separated: `Default__X_C:HealthComponent`. */
+    int32 Export = -1;
+    for (size_t From = 0, Colon = 0; Colon != std::string::npos; From = Colon + 1)
+    {
+        Colon = Object.find(':', From);
+        Export = P.FindExport(Object.substr(From, Colon == std::string::npos ? std::string::npos : Colon - From), Export + 1);
+        if (Export < 0) break;
+    }
+    if (Export < 0)
+    {
+        *Err = Where + ": " + Package + " holds no " + Object;
+        if (Object.size() > 13 && Object.compare(Object.size() - 13, 13, "_GEN_VARIABLE") == 0)
+            *Err += " - the class does not override that inherited component. Patch the Blueprint that declares it instead "
+                    "(every child that does not override it changes too); adding an override record here is not built yet";
+        return false;
+    }
 
     /* From's imports, made again in P: once each, the outer first. From has no exports - every object a default can
        name is an import (AssetRef). */

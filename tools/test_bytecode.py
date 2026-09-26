@@ -2070,6 +2070,43 @@ def edits():
             assert proc.returncode != 0 and why in proc.stdout, (name, proc.stdout)
     print('ok  EditTest: an edit of a mod\'s own asset, a patch of a native class or with a method, and no --game are refused')
 
+    # A component's defaults. CompTest stands in for a game Blueprint, declared as UeApi declares one, and Lamp for one of
+    # its own SCS components: the patch lands in the Lamp's template. A parent Blueprint's component the class does not
+    # override has no template in its package, and a member UeApi gives no SCS node is not a component: both refused.
+    comp_game = os.path.join(ROOT, 'CompTest', 'FSD', 'Content')
+    decl = ('#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/LampEdit");\n'
+            'class Parent : public AActor {\npublic:\n  UE_CLASS("/Game/Fake/Parent", "Parent_C");\n  class USceneComponent* Ghost;\n'
+            '  static constexpr const char* Ghost__UeScsNode = "00000000000000000000000000000000";\n};\n'
+            'class CompTest : public Parent {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/CompTest/CompTest", "CompTest_C");\n'
+            '  class UPointLightComponent* Lamp;\n'
+            '  static constexpr const char* Lamp__UeScsNode = "00000000000000000000000000000000";\n'
+            '  class USceneComponent* Loose;\n};\n'
+            'class LampTweaks : public CompTest {\n  UE_PATCH;\n  UE_DEFAULTS { %s }\n};\n')
+    for body, why in (('Lamp->Intensity = 5000.0f; Lamp->AttenuationRadius = 900.0f;', None),
+                      ('Ghost->bVisible = false;', 'does not override that inherited component'),
+                      ('Loose->bVisible = false;', 'is not one of CompTest_C\'s components')):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'LampEdit.cpp')
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(decl % body)
+            out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'LampEdit')
+            os.makedirs(out)
+            proc = subprocess.run([ASSETGEN, 'compile', path, UEAPI, out, '--game', comp_game], capture_output=True, encoding='utf-8')
+            if why:
+                assert proc.returncode != 0 and why in proc.stdout, (body, proc.stdout)
+                continue
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+            a = os.path.join(comp_game, '_ElytrasMods', 'CompTest', 'CompTest')
+            b = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'CompTest', 'CompTest')
+            la, lb = dumpexp.load(a), dumpexp.load(b)
+            lamp = [e['name'] for e in la[5]].index('Lamp_GEN_VARIABLE')
+            before, after = tags(a, lamp), tags(b, lamp)
+            assert list(after) == list(before) + ['AttenuationRadius'], (list(before), list(after))    # Intensity replaced in place
+            assert after['Intensity'].endswith(': 5000.0') and after['AttenuationRadius'].endswith(': 900.0'), after
+            assert all(i == lamp or blob(la, x) == blob(lb, y) for i, (x, y) in enumerate(zip(la[5], lb[5]))), 'another export changed'
+    print('ok  EditTest: UE_PATCH edits a Blueprint\'s own component in its SCS template; an inherited one without an '
+          'override record, and a member that is no component, are refused')
+
 
 def game_edits():
     """S38 on the game's own packages (--game): ED_Spider_Grunt and the grunt Blueprint's class defaults, edited as
@@ -2089,7 +2126,10 @@ def game_edits():
                     'UE_ASSET_AT(UEnemyDescriptor, ED_Spider_Grunt, "/Game/Enemies/Spider/Grunt/ED_Spider_Grunt");\n'
                     'UE_ASSET_EDIT(ED_Spider_Grunt) {.SpawnSpread = 800.0f, .IdealSpawnSize = 12};\n'
                     'class GruntTweaks : public ENE_Spider_Grunt_Normal_C {\n  UE_PATCH;\n'
-                    '  UE_DEFAULTS { CustomTimeDilation = 0.5f; }\n};\n')
+                    '  UE_DEFAULTS {\n    CustomTimeDilation = 0.5f;\n'
+                    '    HealthComponent->MaxHealth = 180.0f;\n'       # a native class's component: its default subobject
+                    '    MeleeAttack->CenterOnTarget = true;\n'       # the Blueprint's own SCS component: its template
+                    '    enemy->mixerName = "Grunty";\n  }\n};\n')    # a parent's component it overrides: the record's template
         out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'GameEdit')
         os.makedirs(out)
         proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, out, '--game', GAME], capture_output=True, encoding='utf-8')
@@ -2106,12 +2146,25 @@ def game_edits():
 
         a, b = game('Enemies/Spider/Grunt/ENE_Spider_Grunt_Normal'), edited('Enemies/Spider/Grunt/ENE_Spider_Grunt_Normal')
         la, lb = dumpexp.load(a), dumpexp.load(b)
-        cdo = [e['name'] for e in la[5]].index('Default__ENE_Spider_Grunt_Normal_C')
-        before, after = tags(a, cdo), tags(b, cdo)
-        assert list(after) == list(before) + ['CustomTimeDilation'] and after['CustomTimeDilation'].endswith(': 0.5'), after
-        assert all(i == cdo or blob(la, x) == blob(lb, y) for i, (x, y) in enumerate(zip(la[5], lb[5]))), 'another export changed'
+        names = [e['name'] for e in la[5]]
+        added = {'Default__ENE_Spider_Grunt_Normal_C': ('CustomTimeDilation', ': 0.5'), 'HealthComponent': ('MaxHealth', ': 180.0'),
+                 'MeleeAttack_GEN_VARIABLE': ('CenterOnTarget', 'value=1:'), 'Enemy_GEN_VARIABLE': ('mixerName', ": 'Grunty'")}
+        for name, (tag, value) in added.items():
+            before, after = tags(a, names.index(name)), tags(b, names.index(name))
+            assert list(after) == list(before) + [tag] and after[tag].rstrip().endswith(value), (name, list(before), after)
+        assert all(x['name'] in added or blob(la, x) == blob(lb, y) for x, y in zip(la[5], lb[5])), 'another export changed'
         assert lb[3][:len(la[3])] == la[3] and lb[4] == la[4], 'a name or an import moved'
-    print('ok  S38 on the game: ED_Spider_Grunt and the grunt Blueprint\'s defaults edited, the rest the cook\'s bytes')
+
+        # The grunt's Sphere is its parent's component, which it does not override: no template to edit.
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\n#include "UeApi/FSD.h"\n'
+                    '#include "UeApi/Game/ENE_Spider_Grunt_Normal_C.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/GameEdit");\n'
+                    'class GruntTweaks : public ENE_Spider_Grunt_Normal_C {\n  UE_PATCH;\n'
+                    '  UE_DEFAULTS { Sphere->SphereRadius = 10.0f; }\n};\n')
+        proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, out, '--game', GAME], capture_output=True, encoding='utf-8')
+        assert proc.returncode != 0 and 'does not override that inherited component' in proc.stdout, proc.stdout
+    print('ok  S38 on the game: ED_Spider_Grunt, the grunt Blueprint\'s defaults and three kinds of its components edited, '
+          'the rest the cook\'s bytes')
 
 
 interfaces()
