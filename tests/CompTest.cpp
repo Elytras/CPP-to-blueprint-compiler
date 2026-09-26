@@ -14,6 +14,9 @@ class CompTest : public AActor {
   UE_COMPONENT(USceneComponent, Root);
   UE_COMPONENT(UStaticMeshComponent, Mesh);
   UE_COMPONENT(UPointLightComponent, Lamp);
+  /* Instanced meshes: their native Serialize reads more after the tags than a static mesh's LODData count. */
+  UE_COMPONENT(UInstancedStaticMeshComponent, Rocks);
+  UE_COMPONENT(UHierarchicalInstancedStaticMeshComponent, Grass);
 
   int32 Ticks = 0;
 
