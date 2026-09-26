@@ -118,6 +118,28 @@ void WriteTags(const FCookedPackage& P, const std::vector<FTag>& Tags, std::vect
    payload does not start with a tag list. */
 bool SetTags(FCookedPackage& P, int32 Export, const std::vector<FTag>& Tags, std::string* Err);
 
+/*
+Where a cooked UFunction's payload keeps each part, as UObject / UStruct / UFunction::Serialize write it after the tag
+list: the lazy-object guid, SuperStruct, Children, ChildProperties (a count, then each FProperty through
+SerializeSingleField), the script (BytecodeBufferSize, SerializedScriptSize, the bytes), FunctionFlags, RepOffset
+(FUNC_Net only), EventGraphFunction and EventGraphCallOffset. Offsets into the payload.
+*/
+struct FFunctionLayout
+{
+    size_t Super = 0, Properties = 0, Script = 0, Flags = 0;
+    uint32 FunctionFlags = 0;
+    struct FField                               // one of ChildProperties: its bytes, and the head that says what it is
+    {
+        size_t Begin = 0, End = 0;
+        FNameRef Type, Name;
+        int32 ElementSize = 0;
+        uint64 PropertyFlags = 0;
+    };
+    std::vector<FField> Fields;
+};
+/* False unless the payload is exactly that, every property of a type the reader knows. */
+bool ReadFunctionLayout(const FCookedPackage& P, const std::vector<uint8>& Payload, FFunctionLayout& Out);
+
 /* The gate before any edit is trusted: every cooked package under Dir read and written back in memory, with a report
    of what was refused, what came back different, and whether AssetGen's name hashes and name order match the cook's.
    Each export's tagged properties go through ReadTags / WriteTags on the way. 0 when every package comes back

@@ -152,6 +152,8 @@ void FArc::Raw(const void* P, size_t N)
     B.insert(B.end(), Bytes, Bytes + N);
 }
 
+void FArc::Idx(FIndex V) { I32(Pkg && Pkg->RemapIndex ? Pkg->RemapIndex(V).V : V.V); }
+
 void FArc::Str(const std::string& S) { WriteFString(B, S); }
 
 void FArc::Name(const std::string& S, int32 Number)

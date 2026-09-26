@@ -980,6 +980,7 @@ private:
     /* S38: UE_ASSET_EDIT and UE_PATCH, the game's own packages with only the named tags changed. */
     bool GenerateEdit(const std::string& Key, const Json& Var, std::string* Err);
     bool GeneratePatch(const FRecord& R, std::string* Err);
+    bool PatchDefaults(const FRecord& Bp, const Json& Body, const std::string& Where, std::string* Err);
     bool ApplyEdit(const std::string& Package, const std::string& Object, std::vector<FPropertyDef> Defs,
                    const FPackage& From, const std::string& Where, std::string* Err);
     bool SaveEdits(const std::string& OutDir, std::string* Err);
@@ -987,6 +988,9 @@ private:
                        std::vector<FPropertyDef>& Out, std::string* Err);
     struct FEdited { std::string Package, Ext; FCookedPackage P; std::vector<std::string> Objects; };
     std::map<std::string, FEdited> Edited;                  // lowercased package name -> the game's package, edited
+    FEdited* LoadEdited(const std::string& Package, const std::string& Where, std::string* Err);
+    bool TransplantFunctions(const FRecord& R, const FRecord& B, const FPackage& Scratch, FIndex ScratchClass,
+                             std::string* Err);
     std::map<std::string, const Json*> EditTargets;         // UE_ASSET_EDIT: Ns + its number -> `&Asset`'s variable
     std::vector<std::pair<std::string, const Json*>> Edits; // ... -> the braced variable holding the edit
     bool GenerateStruct(const FRecord& R, const std::string& OutDir, std::string* Err);
@@ -8320,8 +8324,8 @@ edits a component, in the export the engine builds that component from:
   - a parent Blueprint's SCS component this one overrides: the override record's template, also `<Var>_GEN_VARIABLE`
     in the class. One it does not override yet has no such export, and adding the record is not built.
 None of them is instanced from cooked data (bCookBlueprintComponentTemplateData is off in DRG, and false by default),
-so the tags are all the engine reads. Nothing else of a patch is cooked yet: a member or a method is refused rather
-than silently dropped.
+so the tags are all the engine reads. A method replaces the Blueprint's function of the same name (TransplantFunctions).
+A member or an interface of the patch's own is refused rather than silently dropped.
 */
 bool FCompiler::GeneratePatch(const FRecord& R, std::string* Err)
 {
@@ -8335,11 +8339,25 @@ bool FCompiler::GeneratePatch(const FRecord& R, std::string* Err)
     }
     const bool bMethods = std::any_of(R.Methods.begin(), R.Methods.end(),
                                       [](const auto& M) { return !M.second->value("isImplicit", false); });
-    if (!R.Fields.empty() || bMethods || !R.Interfaces.empty())
-    { *Err = Where + ": a patch only edits its parent's defaults, in UE_DEFAULTS; members and functions are not built yet"; return false; }
+    if (!R.Fields.empty() || !R.Interfaces.empty())
+    { *Err = Where + ": a patch edits its parent's defaults and replaces its functions; a member or an interface of its own is not built yet"; return false; }
     const Json* Body = nullptr;
     if (R.Defaults) ForEach(*R.Defaults, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Body = &C; });
-    if (!Body) { *Err = Where + ": nothing to edit - a patch's defaults go in UE_DEFAULTS { Field = value; }"; return false; }
+    if (!Body && !bMethods)
+    {
+        *Err = Where + ": nothing to edit - a patch's defaults go in UE_DEFAULTS { Field = value; }, and its methods replace "
+               "the Blueprint's functions of the same name";
+        return false;
+    }
+    /* The defaults first: the functions' names are written against the table the tags leave. */
+    if (Body && !PatchDefaults(*B, *Body, Where, Err)) return false;
+    return !bMethods || Generate(R, std::string(), Err);
+}
+
+/* The patch's UE_DEFAULTS, as tags of the Blueprint Bp's own package. */
+bool FCompiler::PatchDefaults(const FRecord& Bp, const Json& Body, const std::string& Where, std::string* Err)
+{
+    const FRecord* B = &Bp;
     Cur = nullptr;
 
     const std::string Package = PackageOf(*B), Class = ClassOf(*B), Cdo = "Default__" + Class;
@@ -8353,7 +8371,7 @@ bool FCompiler::GeneratePatch(const FRecord& R, std::string* Err)
         return Owner == FieldOwner.end() ? nullptr : Find(Owner->second);
     };
     bool bOk = true;
-    ForEach(*Body, [&](const Json& S) {
+    ForEach(Body, [&](const Json& S) {
         if (!bOk) return;
         const Json *Lhs = nullptr, *Rhs = nullptr, *Through = nullptr;
         if (!DefaultAssignment(S, Lhs, Rhs, Through))
@@ -8399,6 +8417,59 @@ bool FCompiler::GeneratePatch(const FRecord& R, std::string* Err)
     return true;
 }
 
+/* The game's Package, read from GameDir the first time an edit names it; SaveEdits writes it once every edit is in. */
+FCompiler::FEdited* FCompiler::LoadEdited(const std::string& Package, const std::string& Where, std::string* Err)
+{
+    if (auto Slot = Edited.find(Lower(Package)); Slot != Edited.end()) return &Slot->second;
+    if (GameDir.empty())
+    {
+        *Err = Where + ": an edit starts from the game's own package: pass the folder /Game is in (assetgen compile --game "
+               "<extracted pak>/FSD/Content; bpbuild: game_content in mods.yaml)";
+        return nullptr;
+    }
+    if (Package.compare(0, 6, "/Game/") != 0) { *Err = Where + ": " + Package + " is not a /Game package"; return nullptr; }
+    FEdited E;
+    E.Package = Package;
+    const std::string Base = (std::filesystem::u8path(GameDir) / std::filesystem::u8path(Package.substr(6))).u8string();
+    for (const char* Ext : { ".uasset", ".umap" })
+        if (std::filesystem::exists(std::filesystem::u8path(Base + Ext))) { E.Ext = Ext; break; }
+    if (E.Ext.empty()) { *Err = Where + ": " + Package + " is not in " + GameDir; return nullptr; }
+    std::string LoadErr;
+    if (!E.P.Load(Base + E.Ext, &LoadErr)) { *Err = Where + ": " + Package + ": " + LoadErr; return nullptr; }
+    return &Edited.emplace(Lower(Package), std::move(E)).first->second;
+}
+
+/* From's import Index as an FPackageIndex of P, the cooked package named Package. An object inside P is its export: a
+   patch's function names its own class, other functions of it, its default object. Anything else is an import of P,
+   found or appended after its outers. 0, with Err set, for an object of P that P does not hold. */
+static int32 ImportInto(FCookedPackage& P, const std::string& Package, const FPackage& From, int32 Index,
+                        std::map<int32, int32>& Moved, std::string* Err)
+{
+    if (Index >= 0) return 0;
+    if (const auto It = Moved.find(Index); It != Moved.end()) return It->second;
+    std::vector<const FImport*> Chain;                              // the object first, its package last
+    for (int32 I = Index; I < 0; I = From.ImportAt(FIndex{ I })->Outer.V) Chain.push_back(From.ImportAt(FIndex{ I }));
+    int32 Out = 0;
+    if (Lower(Chain.back()->ObjectName) == Lower(Package))
+    {
+        if (Chain.size() == 1) { *Err = "a reference to " + Package + " itself"; return 0; }
+        for (size_t K = Chain.size() - 1; K-- > 0;)
+        {
+            const int32 E = P.FindExport(Chain[K]->ObjectName, Out);
+            if (E < 0) { *Err = Package + " holds no " + Chain[K]->ObjectName; return 0; }
+            Out = E + 1;
+        }
+    }
+    else
+    {
+        const FImport* Im = Chain.front();
+        const int32 Outer = Im->Outer.V ? ImportInto(P, Package, From, Im->Outer.V, Moved, Err) : 0;
+        if (Im->Outer.V && !Outer) return 0;
+        Out = P.Import(Im->ClassPackage, Im->ClassName, Outer, Im->ObjectName);
+    }
+    return Moved[Index] = Out;
+}
+
 /*
 Defs, lowered against From (a scratch package, whose imports their objects are), into the tags of Object in the game's
 Package: read from GameDir the first time, saved by SaveEdits once every edit is in. A tag replaces the one of its name
@@ -8409,27 +8480,9 @@ too. Everything else is the game's, byte for byte.
 bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object, std::vector<FPropertyDef> Defs,
                           const FPackage& From, const std::string& Where, std::string* Err)
 {
-    auto Slot = Edited.find(Lower(Package));
-    if (Slot == Edited.end())
-    {
-        if (GameDir.empty())
-        {
-            *Err = Where + ": an edit starts from the game's own package: pass the folder /Game is in (assetgen compile --game "
-                   "<extracted pak>/FSD/Content; bpbuild: game_content in mods.yaml)";
-            return false;
-        }
-        if (Package.compare(0, 6, "/Game/") != 0) { *Err = Where + ": " + Package + " is not a /Game package"; return false; }
-        FEdited E;
-        E.Package = Package;
-        const std::string Base = (std::filesystem::u8path(GameDir) / std::filesystem::u8path(Package.substr(6))).u8string();
-        for (const char* Ext : { ".uasset", ".umap" })
-            if (std::filesystem::exists(std::filesystem::u8path(Base + Ext))) { E.Ext = Ext; break; }
-        if (E.Ext.empty()) { *Err = Where + ": " + Package + " is not in " + GameDir; return false; }
-        std::string LoadErr;
-        if (!E.P.Load(Base + E.Ext, &LoadErr)) { *Err = Where + ": " + Package + ": " + LoadErr; return false; }
-        Slot = Edited.emplace(Lower(Package), std::move(E)).first;
-    }
-    FCookedPackage& P = Slot->second.P;
+    FEdited* Ed = LoadEdited(Package, Where, Err);
+    if (!Ed) return false;
+    FCookedPackage& P = Ed->P;
     /* Object is a path of names from the package down, `:`-separated: `Default__X_C:HealthComponent`. */
     int32 Export = -1;
     for (size_t From = 0, Colon = 0; Colon != std::string::npos; From = Colon + 1)
@@ -8447,16 +8500,10 @@ bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object,
         return false;
     }
 
-    /* From's imports, made again in P: once each, the outer first. From has no exports - every object a default can
-       name is an import (AssetRef). */
+    /* From's imports, made again in P. From has no exports - every object a default can name is an import (AssetRef). */
     std::map<int32, int32> Moved;
-    std::function<int32(int32)> Move = [&](int32 Index) -> int32 {
-        if (Index >= 0) return 0;
-        if (const auto It = Moved.find(Index); It != Moved.end()) return It->second;
-        const FImport* Im = From.ImportAt(FIndex{ Index });
-        const int32 Outer = Im->Outer.V ? Move(Im->Outer.V) : 0;
-        return Moved[Index] = P.Import(Im->ClassPackage, Im->ClassName, Outer, Im->ObjectName);
-    };
+    std::string MoveErr;
+    auto Move = [&](int32 Index) { return ImportInto(P, Package, From, Index, Moved, &MoveErr); };
     /* A deep copy on the way: members and elements are shared_ptrs a type's other properties may hold too. */
     std::vector<int32> Deps;
     std::function<void(FPropertyDef&)> MoveDef;
@@ -8486,6 +8533,7 @@ bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object,
         if (Named && (Named->ClassName == "UserDefinedStruct" || Named->ClassName == "UserDefinedEnum"))
             Deps.push_back(Move(D.Extra.V));
     }
+    if (!MoveErr.empty()) { *Err = Where + ": " + MoveErr; return false; }
 
     /* The tags, written against P's names (a name P lacks is appended), then read back as P's own. */
     std::vector<std::string> Texts;
@@ -8501,7 +8549,166 @@ bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object,
     if (!ReadTags(P, Ar.B, End, Tags) || End != Ar.B.size()) { *Err = Where + ": internal: the edit's tags do not read back"; return false; }
     if (!SetTags(P, Export, Tags, Err)) { *Err = Where + ": " + *Err; return false; }
     for (int32 Dep : Deps) P.CreateBeforeSerialize(Export, Dep);
-    Slot->second.Objects.push_back(Object + " (" + std::to_string(Tags.size()) + (Tags.size() == 1 ? " tag)" : " tags)"));
+    Ed->Objects.push_back(Object + " (" + std::to_string(Tags.size()) + (Tags.size() == 1 ? " tag)" : " tags)"));
+    return true;
+}
+
+/*
+S38 - a patch's methods, compiled by Generate as a scratch child class of the Blueprint B (each an override of B's
+function), written over B's own functions in B's package. The export row stays, so the class's function list, its
+FuncMap and every caller reach the same object. So do the function's SuperStruct and FunctionFlags: its place in the
+class chain, and what callers and the replication layer expect of it. The rest is the new function's: its properties
+(the parameters, then its locals) and its script. The event-graph link goes, since the body no longer jumps into the
+ubergraph. The payload is written with the cooked package's names, a missing one appended, and every object index
+remapped: the scratch class, its default object and its functions to B's; an object inside B's package to its export;
+anything else to an import of it, found or appended.
+*/
+bool FCompiler::TransplantFunctions(const FRecord& R, const FRecord& B, const FPackage& Scratch, FIndex ScratchClass,
+                                    std::string* Err)
+{
+    const std::string Where = R.CppName + " (UE_PATCH)";
+    const std::string Package = PackageOf(B), Class = ClassOf(B);
+    FEdited* Ed = LoadEdited(Package, Where, Err);
+    if (!Ed) return false;
+    FCookedPackage& P = Ed->P;
+    const int32 ClassExport = P.FindExport(Class);
+    if (ClassExport < 0) { *Err = Where + ": " + Package + " holds no " + Class; return false; }
+    const std::vector<FExport>& Rows = Scratch.ExportRows();
+    auto IsFunction = [&](const FExport& F) {       // not the SCS root an actor class gets beside them
+        const FImport* Of = Scratch.ImportAt(F.ClassIndex);
+        return F.OuterIndex.V == ScratchClass.V && Of && Of->ObjectName == "Function";
+    };
+
+    for (const FExport& F : Rows)
+    {
+        if (!IsFunction(F)) continue;
+        const int32 Fn = P.FindExport(F.ObjectName, ClassExport + 1);
+        if (Fn < 0 || P.ClassNameOf(P.Exports[size_t(Fn)].Class) != "Function")
+        {
+            *Err = Where + "::" + F.ObjectName + ": " + Class + " has no function of that name of its own. A patch replaces a "
+                   "function its Blueprint defines (one it inherits is patched in the Blueprint that defines it); adding one "
+                   "is not built yet";
+            return false;
+        }
+    }
+
+    /* Pass one: the imports the functions name. Each is made P's before the writer seeds its names from P, since an
+       import adds its names to P's table. */
+    std::map<int32, int32> Moved;
+    std::string Bad;
+    {
+        std::set<int32> Named;
+        FPackage Probe(Package);
+        Probe.RemapIndex = [&](FIndex V) { if (V.V < 0) Named.insert(V.V); return V; };
+        for (const FExport& F : Rows)
+            if (IsFunction(F))
+            {
+                FArc Ar(&Probe);
+                F.Serialize(Ar);
+                for (int32 Dep : F.CreateBeforeSer) if (Dep < 0) Named.insert(Dep);
+            }
+        for (int32 I : Named)
+            if (!ImportInto(P, Package, Scratch, I, Moved, &Bad)) { *Err = Where + ": " + Bad; return false; }
+    }
+
+    /* Pass two, for real. */
+    int32 Replacing = 0;                    // the cooked function being written, as an FPackageIndex
+    bool bInBody = false;
+    FPackage Sink(Package);
+    {
+        std::vector<std::string> Texts;
+        for (const FCookedName& N : P.Names) Texts.push_back(N.Text);
+        Sink.SeedNames(Texts);
+    }
+    Sink.RemapIndex = [&](FIndex V) -> FIndex {
+        if (V.V < 0)
+        {
+            const int32 To = Moved.at(V.V);
+            /* The function being replaced, named as an import, is `Parent::Method()` from inside its own new body. */
+            if (bInBody && To == Replacing && Bad.empty())
+                Bad = "calls the function it replaces (" + Class + "::" + P.NameOf(P.Exports[size_t(To - 1)].ObjectName)
+                      + "); keeping the game's body under another name to call is not built yet";
+            return FIndex{ To };
+        }
+        if (V.V == 0) return V;
+        /* The scratch class is B's class, its default object B's, a function of it B's function of that name. */
+        const FExport& X = Rows[size_t(V.V - 1)];
+        std::string Name = X.ObjectName;
+        int32 Outer = 0;
+        if (V.V == ScratchClass.V) Name = Class;
+        else if (X.OuterIndex.V == 0 && X.ObjectName.compare(0, 9, "Default__") == 0) Name = "Default__" + Class;
+        else if (IsFunction(X)) Outer = ClassExport + 1;
+        else { if (Bad.empty()) Bad = "uses " + X.ObjectName + ", which a patch does not cook"; return Null(); }
+        const int32 E = P.FindExport(Name, Outer);
+        if (E < 0 && Bad.empty()) Bad = Package + " holds no " + Name;
+        return FIndex{ E + 1 };
+    };
+
+    for (const FExport& F : Rows)
+    {
+        if (!IsFunction(F)) continue;
+        const int32 Fn = P.FindExport(F.ObjectName, ClassExport + 1);
+        FFunctionLayout Old, New;
+        if (!ReadFunctionLayout(P, P.Exports[size_t(Fn)].Payload, Old))
+        { *Err = Where + "::" + F.ObjectName + ": the game's function does not read as a cooked UFunction"; return false; }
+
+        Replacing = Fn + 1;
+        FArc Ar(&Sink);
+        bInBody = true;
+        F.Serialize(Ar);
+        bInBody = false;
+        for (int32 Dep : F.CreateBeforeSer)
+            if (const FIndex To = Sink.RemapIndex(FIndex{ Dep }); To.V != 0 && To.V != Replacing) P.CreateBeforeSerialize(Fn, To.V);
+        if (!Bad.empty()) { *Err = Where + "::" + F.ObjectName + ": " + Bad; return false; }
+        for (size_t I = P.Names.size(); I < Sink.NameTable().size(); ++I) P.Names.push_back({ Sink.NameTable()[I] });
+        if (!ReadFunctionLayout(P, Ar.B, New))
+        { *Err = Where + "::" + F.ObjectName + ": internal: the compiled function does not read back"; return false; }
+
+        /* The parameters stay the game's, byte for byte: every caller was cooked against them, and UeApi's `T&` cannot
+           tell a Blueprint output pin (Parm | OutParm) from an in-out reference (+ ReferenceParm). So the method's must
+           be the same list: in order, the same property class, name, size and direction. Only the locals are ours. */
+        const std::vector<uint8>& Vanilla = P.Exports[size_t(Fn)].Payload;
+        using FField = FFunctionLayout::FField;
+        auto ParmsOf = [](const FFunctionLayout& L, bool bParm) {
+            std::vector<const FField*> Out;
+            for (const FField& Fd : L.Fields) if (((Fd.PropertyFlags & CPF_Parm) != 0) == bParm) Out.push_back(&Fd);
+            return Out;
+        };
+        const std::vector<const FField*> Theirs = ParmsOf(Old, true), Ours = ParmsOf(New, true), Locals = ParmsOf(New, false);
+        auto Listed = [&](const std::vector<const FField*>& List) {
+            std::string S;
+            for (const FField* Fd : List)
+                S += (S.empty() ? "" : ", ") + P.NameOf(Fd->Type) + " " + P.NameOf(Fd->Name)
+                     + (Fd->PropertyFlags & CPF_ReturnParm ? " (return)" : Fd->PropertyFlags & CPF_OutParm ? " (out)" : "");
+            return "(" + S + ")";
+        };
+        constexpr uint64 kDirection = CPF_Parm | CPF_OutParm | CPF_ReturnParm;
+        bool bSame = Theirs.size() == Ours.size();
+        for (size_t I = 0; bSame && I < Theirs.size(); ++I)
+            bSame = Lower(P.NameOf(Theirs[I]->Type)) == Lower(P.NameOf(Ours[I]->Type))
+                    && Lower(P.NameOf(Theirs[I]->Name)) == Lower(P.NameOf(Ours[I]->Name))
+                    && Theirs[I]->ElementSize == Ours[I]->ElementSize
+                    && (Theirs[I]->PropertyFlags & kDirection) == (Ours[I]->PropertyFlags & kDirection);
+        if (!bSame)
+        {
+            *Err = Where + "::" + F.ObjectName + ": its parameters " + Listed(Ours) + " are not the game function's "
+                   + Listed(Theirs) + "; a replacement takes the same ones, in the same order";
+            return false;
+        }
+
+        std::vector<uint8> Out(Ar.B.begin(), Ar.B.begin() + std::ptrdiff_t(New.Properties));
+        std::memcpy(Out.data() + New.Super, Vanilla.data() + Old.Super, 4);                  // SuperStruct
+        const int32 Count = int32(Theirs.size() + Locals.size());
+        Out.insert(Out.end(), reinterpret_cast<const uint8*>(&Count), reinterpret_cast<const uint8*>(&Count) + 4);
+        for (const FField* Parm : Theirs) Out.insert(Out.end(), Vanilla.begin() + std::ptrdiff_t(Parm->Begin), Vanilla.begin() + std::ptrdiff_t(Parm->End));
+        for (const FField* Local : Locals) Out.insert(Out.end(), Ar.B.begin() + std::ptrdiff_t(Local->Begin), Ar.B.begin() + std::ptrdiff_t(Local->End));
+        Out.insert(Out.end(), Ar.B.begin() + std::ptrdiff_t(New.Script), Ar.B.begin() + std::ptrdiff_t(New.Flags));      // the script
+        const size_t Kept = 4 + ((Old.FunctionFlags & 0x40) ? 2 : 0);                      // FunctionFlags, RepOffset
+        Out.insert(Out.end(), Vanilla.begin() + std::ptrdiff_t(Old.Flags), Vanilla.begin() + std::ptrdiff_t(Old.Flags + Kept));
+        Out.resize(Out.size() + 8, 0);                                                      // no event-graph link
+        P.Exports[size_t(Fn)].Payload = std::move(Out);
+        Ed->Objects.push_back(Class + "::" + F.ObjectName + " (replaced)");
+    }
     return true;
 }
 
@@ -8642,7 +8849,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     std::map<std::string, FOverride> SubobjectDefaults;
     std::vector<FPropertyDef> InheritedDefaults;
     std::map<std::string, FPropertyDef> InterfaceVarDefaults;     // a default for a variable an implemented interface declares
-    if (R.Defaults)
+    if (R.Defaults && !R.bIsPatch)      // a patch's defaults are tags of the game's own package (GeneratePatch)
     {
         const std::string Where = R.CppName + "::UE_DEFAULTS";
         auto OwnerOf = [&](const Json& M) {
@@ -9247,7 +9454,9 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         }
 
         if (auto Cat = R.Categories.find(Fn.Name); Cat != R.Categories.end()) BP.ApiCategory[UeNameOf(&R, Fn.Name)] = Cat->second;
-        BP.AddFunction(UeNameOf(&R, Fn.Name), Super, Params,
+        /* A patch's method is written over the function it overrides (TransplantFunctions), which keeps its own super:
+           naming it here would make the function its own parent. */
+        BP.AddFunction(UeNameOf(&R, Fn.Name), R.bIsPatch ? Null() : Super, Params,
                        [Stmts, bEndsWithReturn, bScratchNeeded, DerefStruct, bOpt = !bCurNoOpt](FScript& S, FIndex SelfExp) {
             if (bScratchNeeded)
             {
@@ -9267,6 +9476,12 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         }, Flags);
     }
 
+    if (!Segments.empty() && R.bIsPatch)
+    {
+        *Err = R.CppName + " (UE_PATCH)::" + Segments.front().Name + ": a patched function that waits (a latent call) needs "
+               "an ubergraph of its own in the game's class; not built yet";
+        return false;
+    }
     if (!Segments.empty())
     {
         const std::string UberName = "ExecuteUbergraph_" + R.CppName;
@@ -9373,6 +9588,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
 
     if (bReplicatesAnything) BP.SetReplicates(true);
     BP.Finish();
+    if (R.bIsPatch) return TransplantFunctions(R, *B, P, BP.ClassIndex(), Err);
     if (!SavePackage(P, OutDir, PackageName, Err)) return false;
     if (ApiDir && !BP.WriteApi(*ApiDir, Err))
     {

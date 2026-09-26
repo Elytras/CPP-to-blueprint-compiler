@@ -230,6 +230,78 @@ bool SetTags(FCookedPackage& P, int32 Export, const std::vector<FTag>& Tags, std
     return true;
 }
 
+namespace
+{
+/* Past one field as SerializeSingleField writes it in a cooked package, and WriteProperty does: its class name, then
+   FField::Serialize (Name, FlagsPrivate; no metadata when cooked), FProperty::Serialize (ArrayDim, ElementSize,
+   PropertyFlags, RepIndex, RepNotifyFunc, BlueprintReplicationCondition), then the class's own fields (4.27
+   PropertyBaseObject / PropertyStruct / EnumProperty / PropertyBool / containers / delegates / FieldPathProperty.cpp).
+   False on a class it does not know. */
+bool SkipProperty(const FCookedPackage& P, FReader& R, int Depth = 0)
+{
+    const std::string T = Lower(P.NameOf(R.Name()));
+    R.Name(); R.U32();
+    R.I32(); R.I32(); R.I64(); R.U16(); R.Name(); R.Get<uint8>();
+    if (Depth > 8 || R.bBad) return false;
+    static const char* const kNothing[] = { "int8property", "int16property", "intproperty", "int64property", "uint16property",
+        "uint32property", "uint64property", "floatproperty", "doubleproperty", "strproperty", "nameproperty", "textproperty" };
+    static const char* const kOneObject[] = { "objectproperty", "weakobjectproperty", "lazyobjectproperty", "softobjectproperty",
+        "interfaceproperty", "structproperty", "byteproperty", "delegateproperty", "multicastinlinedelegateproperty",
+        "multicastsparsedelegateproperty" };
+    auto In = [&](const auto& List) { return std::any_of(std::begin(List), std::end(List), [&](const char* S) { return T == S; }); };
+    if (In(kNothing)) return true;
+    if (In(kOneObject)) { R.I32(); return !R.bBad; }
+    if (T == "classproperty" || T == "softclassproperty") { R.I32(); R.I32(); return !R.bBad; }       // + MetaClass
+    if (T == "boolproperty") { uint8 Bits[6]; R.Raw(Bits, 6); return !R.bBad; }    // FieldSize .. NativeBool
+    if (T == "fieldpathproperty") { R.Name(); return !R.bBad; }                     // PropertyClass, by name
+    if (T == "enumproperty") { R.I32(); return SkipProperty(P, R, Depth + 1); }     // Enum, then UnderlyingProp
+    if (T == "arrayproperty" || T == "setproperty") return SkipProperty(P, R, Depth + 1);
+    if (T == "mapproperty") return SkipProperty(P, R, Depth + 1) && SkipProperty(P, R, Depth + 1);
+    return false;
+}
+}   // namespace
+
+bool ReadFunctionLayout(const FCookedPackage& P, const std::vector<uint8>& Payload, FFunctionLayout& Out)
+{
+    std::vector<FTag> Tags;
+    size_t At = 0;
+    if (!ReadTags(P, Payload, At, Tags)) return false;
+    FReader R(Payload);
+    R.P = At;
+    uint32 Guid[4];
+    if (R.Bool()) R.Guid(Guid);                 // the lazy-object guid, when there is one
+    Out.Super = R.P;
+    R.I32(); R.I32();                           // SuperStruct, Children
+    Out.Properties = R.P;
+    const int32 Count = R.I32();
+    Out.Fields.clear();
+    for (int32 I = 0; I < Count; ++I)
+    {
+        FFunctionLayout::FField F;
+        F.Begin = R.P;
+        if (R.bBad || !SkipProperty(P, R)) return false;
+        F.End = R.P;
+        FReader Head(Payload);                  // class name, Name, FlagsPrivate, ArrayDim, ElementSize, PropertyFlags
+        Head.P = F.Begin;
+        F.Type = Head.Name();
+        F.Name = Head.Name();
+        Head.U32(); Head.I32();
+        F.ElementSize = Head.I32();
+        F.PropertyFlags = uint64(Head.I64());
+        Out.Fields.push_back(F);
+    }
+    Out.Script = R.P;
+    R.I32();                                    // BytecodeBufferSize, the in-memory size
+    const int32 Stored = R.I32();               // SerializedScriptSize
+    if (R.bBad || Stored < 0 || size_t(Stored) > Payload.size() - R.P) return false;
+    R.P += size_t(Stored);
+    Out.Flags = R.P;
+    Out.FunctionFlags = R.U32();
+    if (Out.FunctionFlags & 0x40) R.U16();      // FUNC_Net: RepOffset
+    R.I32(); R.I32();                           // EventGraphFunction, EventGraphCallOffset
+    return !R.bBad && R.P == Payload.size();
+}
+
 bool ReadTags(const FCookedPackage& P, const std::vector<uint8>& Bytes, size_t& At, std::vector<FTag>& Out)
 {
     const FTagTypes T(P);
@@ -554,6 +626,8 @@ int RoundTrip(const std::string& Dir)
     size_t Packages = 0, Identical = 0, NamesTotal = 0, HashMismatch = 0, Unsorted = 0, ExportsTotal = 0, Tagged = 0;
     std::map<std::string, std::pair<size_t, std::string>> Refused;      // reason -> count, first path
     std::map<std::string, size_t> Untagged, TagTypes;                   // exports with no tag list by class; tags by type
+    size_t Functions = 0, FunctionsRead = 0;
+    std::string FirstUnread;                                            // the first function ReadFunctionLayout refused
     std::vector<std::string> Differ;
     std::error_code Ec;
     for (auto It = std::filesystem::recursive_directory_iterator(std::filesystem::u8path(Dir), Ec);
@@ -591,6 +665,13 @@ int RoundTrip(const std::string& Dir)
         for (FCookedExport& E : P.Exports)
         {
             ++ExportsTotal;
+            if (P.ClassNameOf(E.Class) == "Function")
+            {
+                FFunctionLayout Layout;
+                ++Functions;
+                if (ReadFunctionLayout(P, E.Payload, Layout)) ++FunctionsRead;
+                else if (FirstUnread.empty()) FirstUnread = Shown + ":" + P.NameOf(E.ObjectName);
+            }
             size_t At = 0;
             std::vector<FTag> Tags;
             if (!ReadTags(P, E.Payload, At, Tags)) { ++Untagged[P.ClassNameOf(E.Class)]; continue; }
@@ -635,6 +716,8 @@ int RoundTrip(const std::string& Dir)
     printf("  tagged properties read and written back on %zu of %zu exports; no tag list: %s\n", Tagged, ExportsTotal,
            Untagged.empty() ? "none" : Top(Untagged, 12).c_str());
     printf("  tag types: %s\n", Top(TagTypes, 40).c_str());
+    printf("  functions whose payload reads exactly (ReadFunctionLayout): %zu of %zu%s%s\n", FunctionsRead, Functions,
+           FirstUnread.empty() ? "" : "; first unread: ", FirstUnread.c_str());
     return Packages && Identical == Packages ? 0 : 1;
 }
 
