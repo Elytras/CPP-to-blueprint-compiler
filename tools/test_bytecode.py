@@ -185,10 +185,11 @@ def registry_rows(path):
 
 def registry_layout():
     """Each test's registry is FSD/AssetRegistry.bin, none sits in a package folder, and `assetgen registry`
-    folds several into one - what bpbuild does for an embedded dependency - replacing a package it already has."""
+    folds several into one - what bpbuild does for an embedded dependency - replacing a package it already has.
+    EditTest only edits, and a pak with no rows carries no registry: mounted at startup it would replace the game's."""
     import tempfile
     for mod in os.listdir(ROOT):
-        assert os.path.exists(registry_of(mod)), mod
+        assert os.path.exists(registry_of(mod)) == (mod != 'EditTest'), mod
         assert not glob.glob(os.path.join(ROOT, mod, 'FSD', 'Content', '**', 'AssetRegistry.bin'), recursive=True), mod
     a, b = registry_rows(registry_of('AssetTest')), registry_rows(registry_of('IfaceTest'))
     assert a and b and not a & b, (a, b)

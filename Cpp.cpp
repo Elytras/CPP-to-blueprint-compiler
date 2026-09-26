@@ -9921,7 +9921,16 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     /* A cooked package carries no registry data; without the bake the classes are invisible to it. A pak keeps its
        one registry beside its Content folder, FSD/AssetRegistry.bin, as the game's own pak and every editor-cooked
        mod pak do. So an OutDir of <root>/Content/<package path> (bpbuild's) puts it in <root>, merged with what other
-       compiles into the same pak put there; any other OutDir gets its own. */
+       compiles into the same pak put there; any other OutDir gets its own.
+       A compile with no rows (an edit-only one) writes none: a cooked game loads exactly one registry,
+       ProjectDir()/AssetRegistry.bin (AssetRegistry.cpp:198), and an empty one in a pak mounted at startup would
+       replace the game's. A registry another compile already put there is left as it is. */
+    if (RegistryRows.empty())
+    {
+        printf("  %-14s -> none (no assets of its own)\n", "registry");
+        remove(AstPath.c_str());
+        return true;
+    }
     std::string RegistryDir = OutDir;
     while (!RegistryDir.empty() && (RegistryDir.back() == '/' || RegistryDir.back() == '\\')) RegistryDir.pop_back();
     for (char& C : RegistryDir) if (C == '\\') C = '/';
