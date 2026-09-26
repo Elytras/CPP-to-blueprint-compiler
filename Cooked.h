@@ -122,6 +122,33 @@ void WriteTags(const FCookedPackage& P, const std::vector<FTag>& Tags, std::vect
 bool SetTags(FCookedPackage& P, int32 Export, const std::vector<FTag>& Tags, std::string* Err);
 
 /*
+S38: one step of a path into a tag's value, for an edit of part of it. A struct member is the tag of its name in the
+struct's tag list or, in a struct the engine serializes natively (FVector's three floats), Size bytes at Offset of the
+StructSize the struct takes. An element is a TArray's Element'th, found by walking the ones before it: each
+ElementSize bytes, or when that is 0, an FString, a soft path or a tag list as ElementKind says. An array of structs
+carries an inner tag before its elements, whose Size counts them.
+*/
+struct FValueStep
+{
+    std::string Member;                         // a struct member, by its tag's name (the engine's spelling)
+    int32 Offset = -1, Size = 0, StructSize = 0;
+    int32 Element = -1;
+    int32 ElementSize = 0;
+    enum EElementKind : uint8 { Fixed, String, SoftPath, Tags } ElementKind = Fixed;
+    bool bStructElements = false;
+    bool IsTaggedMember() const { return Element < 0 && Offset < 0; }
+};
+
+/* S38: a value written at the end of Path, in the tag Root (array index 0) of export row Export; the rest of the tag's
+   value stays the game's, byte for byte. Fresh[K] is the tag holding only the path below step K (Fresh[0] the root
+   tag, Fresh[K] the member Path[K-1] names): it stands in for a tag the value lacks, a member the object takes from
+   its archetype, and is empty where the path below cannot be written that way (through a native struct or an
+   element). When Path ends at a member of a struct written as tags, the new value is Fresh.back(); otherwise it is
+   Leaf, the value's bytes. False, saying why, when the value is not what the path expects. */
+bool SetTagPath(FCookedPackage& P, int32 Export, const std::string& Root, const std::vector<FValueStep>& Path,
+                const std::vector<std::vector<uint8>>& Fresh, const std::vector<uint8>& Leaf, std::string* Err);
+
+/*
 Where a cooked UStruct's payload keeps each part, as UObject / UStruct::Serialize write it after the tag list: the
 lazy-object guid, SuperStruct, Children (a count, then each index: RemoveUField_Next), ChildProperties (a count, then
 each FProperty through SerializeSingleField) and the script (BytecodeBufferSize, SerializedScriptSize, the bytes).

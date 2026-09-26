@@ -260,18 +260,11 @@ void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
         }
         else if (P.Type == "StructProperty")
         {
-            /* A struct with a native Serialize writes raw bytes, not tags; a zero of ElementSize
-               bytes is its default. Box / Box2D serialize IsValid as one byte, so they are shorter. */
-            static const std::map<std::string, int32> Native = {
-                { "Vector", 12 }, { "Vector2D", 8 }, { "Vector4", 16 }, { "Rotator", 12 }, { "Quat", 16 },
-                { "Plane", 16 }, { "Matrix", 64 }, { "Color", 4 }, { "LinearColor", 16 }, { "IntPoint", 8 },
-                { "IntVector", 12 }, { "Guid", 16 }, { "DateTime", 8 }, { "Timespan", 8 }, { "Box", 25 },
-                { "Box2D", 17 }, { "BoxSphereBounds", 28 }, { "FrameNumber", 4 } };
-            auto N = Native.find(P.StructName);
+            const int32 Native = NativeStructSize(P.StructName);
             const auto& Members = D.Members ? D.Members : P.Members;     // an element of a container brings its own
             if (D.K == FDefaultValue::Struct && Members)
             {
-                if (N == Native.end())
+                if (!Native)
                 {
                     for (const FPropertyDef& M : *Members) WriteDefaultTagInner(V, M);
                     TagEnd(V);
@@ -283,11 +276,11 @@ void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
                     FArc Raw(V.Owner());
                     for (const FPropertyDef& M : *Members) WriteValue(Raw, M, M.Default);
                     V.Append(Raw);
-                    for (int32 i = int32(Raw.B.size()); i < N->second; ++i) V.U8(0);
+                    for (int32 i = int32(Raw.B.size()); i < Native; ++i) V.U8(0);
                 }
             }
-            else if (N == Native.end()) TagEnd(V);
-            else for (int32 i = 0; i < N->second; ++i) V.U8(0);
+            else if (!Native) TagEnd(V);
+            else for (int32 i = 0; i < Native; ++i) V.U8(0);
         }
     }
 }
@@ -305,6 +298,36 @@ void WriteDefaultTag(FArc& Ar, const FPropertyDef& P)
     const FDefaultValue& D = P.Default;
     if (P.Type == "BoolProperty") { TagBool(Ar, P.Name, D.K != FDefaultValue::None && D.I != 0); return; }
     Tag(Ar, P.Name, P.Type, [&](FArc& V) { WriteValue(V, P, D); }, P.StructName);
+}
+
+void WriteDefaultValue(FArc& Ar, const FPropertyDef& P)
+{
+    WriteValue(Ar, P, P.Default);
+}
+
+int32 NativeStructSize(const std::string& StructName)
+{
+    /* A struct with a native Serialize writes raw bytes, not tags; a zero of this many bytes is its default. Box /
+       Box2D serialize IsValid as one byte, so they are shorter than in memory. */
+    static const std::map<std::string, int32> Native = {
+        { "Vector", 12 }, { "Vector2D", 8 }, { "Vector4", 16 }, { "Rotator", 12 }, { "Quat", 16 },
+        { "Plane", 16 }, { "Matrix", 64 }, { "Color", 4 }, { "LinearColor", 16 }, { "IntPoint", 8 },
+        { "IntVector", 12 }, { "Guid", 16 }, { "DateTime", 8 }, { "Timespan", 8 }, { "Box", 25 },
+        { "Box2D", 17 }, { "BoxSphereBounds", 28 }, { "FrameNumber", 4 } };
+    const auto N = Native.find(StructName);
+    return N == Native.end() ? 0 : N->second;
+}
+
+int32 FixedValueSize(const FPropertyDef& P)
+{
+    const std::string& T = P.Type;
+    if (T == "BoolProperty") return 1;
+    if (T == "IntProperty" || T == "FloatProperty" || T == "ObjectProperty" || T == "ClassProperty" || T == "InterfaceProperty")
+        return 4;
+    if (T == "Int64Property" || T == "EnumProperty" || T == "NameProperty") return 8;
+    if (T == "ByteProperty") return P.StructName.empty() ? 1 : 8;
+    if (T == "StructProperty") return NativeStructSize(P.StructName);
+    return 0;
 }
 
 void WriteProperty(FArc& Ar, const FPropertyDef& P, bool bUncooked)

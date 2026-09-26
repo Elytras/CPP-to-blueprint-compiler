@@ -221,6 +221,160 @@ void FCookedPackage::CreateBeforeSerialize(int32 Export, int32 Dep)
         if (&O != &E && O.FirstExportDependency >= At) ++O.FirstExportDependency;
 }
 
+namespace
+{
+/* E's payload with its tag list, which ended at At, replaced by List. */
+void PutTags(const FCookedPackage& P, FCookedExport& E, const std::vector<FTag>& List, size_t At)
+{
+    std::vector<uint8> Payload;
+    WriteTags(P, List, Payload);
+    Payload.insert(Payload.end(), E.Payload.begin() + std::ptrdiff_t(At), E.Payload.end());
+    E.Payload = std::move(Payload);
+}
+
+/* The tag of List named Name (compared as FName compares) with array index Index, or List.end(). */
+std::vector<FTag>::iterator FindTag(const FCookedPackage& P, std::vector<FTag>& List, const std::string& Name, int32 Index = 0)
+{
+    const std::string Want = Lower(Name);
+    return std::find_if(List.begin(), List.end(),
+                        [&](const FTag& T) { return T.ArrayIndex == Index && Lower(P.NameOf(T.Name)) == Want; });
+}
+
+/* The one tag Bytes, a list of one, holds. */
+bool OneTag(const FCookedPackage& P, const std::vector<uint8>& Bytes, FTag& Out)
+{
+    std::vector<FTag> List;
+    size_t At = 0;
+    if (Bytes.empty() || !ReadTags(P, Bytes, At, List) || List.size() != 1 || At != Bytes.size()) return false;
+    Out = std::move(List[0]);
+    return true;
+}
+
+/* Whether tag T holds the kind of value step S walks into: a struct for a member, an array for an element. */
+bool Holds(const FCookedPackage& P, const FTag& T, const FValueStep& S)
+{
+    return P.Is(T.Type, S.Element >= 0 ? "ArrayProperty" : "StructProperty");
+}
+
+/* Past one element of the array step S walks, at At. */
+bool SkipElement(const FCookedPackage& P, const std::vector<uint8>& B, size_t& At, const FValueStep& S)
+{
+    if (S.ElementKind == FValueStep::Tags)
+    {
+        std::vector<FTag> Tags;
+        return ReadTags(P, B, At, Tags);
+    }
+    FReader R(B);
+    R.P = At;
+    if (S.ElementKind == FValueStep::Fixed)
+    {
+        if (S.ElementSize <= 0 || size_t(S.ElementSize) > B.size() - At) return false;
+        R.P += size_t(S.ElementSize);
+    }
+    else
+    {
+        if (S.ElementKind == FValueStep::SoftPath) R.Name();       // AssetPathName, then SubPathString
+        R.Str();
+    }
+    At = R.P;
+    return !R.bBad;
+}
+
+/* The value written at the end of Path[I..] into Value, the value of Where (a tag's or an element's), the rest of it
+   kept. Why says what failed. */
+bool Splice(const FCookedPackage& P, std::vector<uint8>& Value, const std::vector<FValueStep>& Path, size_t I,
+            const std::vector<std::vector<uint8>>& Fresh, const std::vector<uint8>& Leaf, const std::string& Where,
+            std::string& Why)
+{
+    const FValueStep& S = Path[I];
+    const bool bLast = I + 1 == Path.size();
+    std::vector<uint8> Sub;                                         // the part the step reaches, made the new value
+    auto Into = [&](const std::string& Here) {
+        if (bLast) { Sub = Leaf; return true; }
+        return Splice(P, Sub, Path, I + 1, Fresh, Leaf, Here, Why);
+    };
+    if (S.Element >= 0)
+    {
+        FReader R(Value);
+        const int32 Count = R.I32();
+        size_t InnerSize = 0;
+        if (S.bStructElements)      // the inner tag: Name, Type, Size (the elements' bytes), ArrayIndex, StructName, guids
+        {
+            R.Name(); R.Name();
+            InnerSize = R.P;
+            R.I32(); R.I32(); R.Name();
+            uint32 Guid[4];
+            R.Guid(Guid);
+            if (R.Get<uint8>()) R.Guid(Guid);
+        }
+        if (R.bBad || Count < 0) { Why = Where + " does not read as an array"; return false; }
+        const size_t First = R.P;
+        size_t At = First, Begin = 0, End = 0;
+        for (int32 K = 0; K < Count; ++K)
+        {
+            if (K == S.Element) Begin = At;
+            if (!SkipElement(P, Value, At, S))
+            { Why = Where + "'s element " + std::to_string(K) + " does not read as the type UeApi gives it"; return false; }
+            if (K == S.Element) End = At;
+        }
+        if (At != Value.size()) { Why = Where + " has bytes past its elements: not the type UeApi gives it"; return false; }
+        if (S.Element >= Count)
+        { Why = Where + " has " + std::to_string(Count) + (Count == 1 ? " element" : " elements"); return false; }
+        Sub.assign(Value.begin() + std::ptrdiff_t(Begin), Value.begin() + std::ptrdiff_t(End));
+        if (!Into(Where + "[" + std::to_string(S.Element) + "]")) return false;
+        Value.erase(Value.begin() + std::ptrdiff_t(Begin), Value.begin() + std::ptrdiff_t(End));
+        Value.insert(Value.begin() + std::ptrdiff_t(Begin), Sub.begin(), Sub.end());
+        if (S.bStructElements)
+        {
+            const int32 Size = int32(Value.size() - First);
+            std::memcpy(Value.data() + InnerSize, &Size, 4);
+        }
+        return true;
+    }
+    const std::string Here = Where + "." + S.Member;
+    if (S.Offset >= 0)
+    {
+        if (Value.size() != size_t(S.StructSize) || size_t(S.Offset) + size_t(S.Size) > Value.size())
+        { Why = Where + " is not the " + std::to_string(S.StructSize) + " bytes its struct is written as"; return false; }
+        Sub.assign(Value.begin() + S.Offset, Value.begin() + S.Offset + S.Size);
+        if (!Into(Here)) return false;
+        if (Sub.size() != size_t(S.Size))
+        { Why = "internal: " + Here + "'s new value is " + std::to_string(Sub.size()) + " bytes, not " + std::to_string(S.Size); return false; }
+        std::copy(Sub.begin(), Sub.end(), Value.begin() + S.Offset);
+        return true;
+    }
+    std::vector<FTag> Tags;
+    size_t At = 0;
+    if (!ReadTags(P, Value, At, Tags) || At != Value.size()) { Why = Where + " is not a struct written as tags"; return false; }
+    const auto Same = FindTag(P, Tags, S.Member);
+    if (bLast || Same == Tags.end())
+    {
+        /* The member's new tag - or, for one the value lacks, a tag holding only the rest of the path: the member is its
+           struct's default there, which the engine fills in before reading the tags. */
+        FTag New;
+        if (!OneTag(P, Fresh[I + 1], New))
+        {
+            Why = Here + " is not in the game's value (it is the default), and the path below it goes through a native "
+                  "struct or an element, whose other parts are unknown here: assign the whole of " + Here;
+            return false;
+        }
+        if (Same != Tags.end()) *Same = std::move(New);
+        else Tags.push_back(std::move(New));
+    }
+    else
+    {
+        if (!Holds(P, *Same, Path[I + 1]))
+        { Why = Here + " is a " + P.NameOf(Same->Type) + " in the game's package, not what UeApi gives it"; return false; }
+        Sub = std::move(Same->Value);
+        if (!Into(Here)) return false;
+        Same->Value = std::move(Sub);
+    }
+    Value.clear();
+    WriteTags(P, Tags, Value);
+    return true;
+}
+}   // namespace
+
 bool SetTags(FCookedPackage& P, int32 Export, const std::vector<FTag>& Tags, std::string* Err)
 {
     FCookedExport& E = P.Exports[size_t(Export)];
@@ -233,17 +387,43 @@ bool SetTags(FCookedPackage& P, int32 Export, const std::vector<FTag>& Tags, std
     }
     for (const FTag& Tag : Tags)
     {
-        const std::string Name = Lower(P.NameOf(Tag.Name));
-        auto Same = std::find_if(List.begin(), List.end(), [&](const FTag& Old) {
-            return Old.ArrayIndex == Tag.ArrayIndex && Lower(P.NameOf(Old.Name)) == Name;
-        });
+        const auto Same = FindTag(P, List, P.NameOf(Tag.Name), Tag.ArrayIndex);
         if (Same != List.end()) *Same = Tag;
         else List.push_back(Tag);
     }
-    std::vector<uint8> Payload;
-    WriteTags(P, List, Payload);
-    Payload.insert(Payload.end(), E.Payload.begin() + std::ptrdiff_t(At), E.Payload.end());
-    E.Payload = std::move(Payload);
+    PutTags(P, E, List, At);
+    return true;
+}
+
+bool SetTagPath(FCookedPackage& P, int32 Export, const std::string& Root, const std::vector<FValueStep>& Path,
+                const std::vector<std::vector<uint8>>& Fresh, const std::vector<uint8>& Leaf, std::string* Err)
+{
+    FCookedExport& E = P.Exports[size_t(Export)];
+    const std::string Object = P.NameOf(E.ObjectName);
+    std::vector<FTag> List;
+    size_t At = 0;
+    if (!ReadTags(P, E.Payload, At, List)) { *Err = Object + "'s payload does not start with a tag list"; return false; }
+    if (Path.empty() || Fresh.size() != Path.size() + 1) { *Err = "internal: SetTagPath takes a path and its fresh tags"; return false; }
+    const auto Same = FindTag(P, List, Root);
+    if (Same == List.end())
+    {
+        FTag New;
+        if (!OneTag(P, Fresh[0], New))
+        {
+            *Err = Root + " is not set on " + Object + " (it takes the archetype's), and the path goes through a native "
+                   "struct or an element, whose other parts are unknown here: assign the whole of " + Root;
+            return false;
+        }
+        List.push_back(std::move(New));
+    }
+    else
+    {
+        if (!Holds(P, *Same, Path[0]))
+        { *Err = Root + " is a " + P.NameOf(Same->Type) + " on " + Object + ", not what UeApi gives it"; return false; }
+        std::string Why;
+        if (!Splice(P, Same->Value, Path, 0, Fresh, Leaf, Root, Why)) { *Err = Object + "'s " + Why; return false; }
+    }
+    PutTags(P, E, List, At);
     return true;
 }
 

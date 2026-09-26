@@ -91,6 +91,13 @@ void WriteProperty(FArc& Ar, const FPropertyDef& P, bool bUncooked = false);
 
 /* The property as a tagged-property entry holding P.Default (its zero value when unset). */
 void WriteDefaultTag(FArc& Ar, const FPropertyDef& P);
+/* P.Default alone, as a tag's value or a container element holds it: no tag around it. */
+void WriteDefaultValue(FArc& Ar, const FPropertyDef& P);
+/* The bytes a struct the engine serializes natively takes (FVector's three floats: 12), or 0 for one written as tags. */
+int32 NativeStructSize(const std::string& StructName);
+/* The bytes WriteDefaultValue writes for P whatever the value, or 0 when that depends on the value (a string, a text, a
+   soft path, a struct written as tags, a container). */
+int32 FixedValueSize(const FPropertyDef& P);
 
 /* Every object D points at, for the owning export's create-before-serialize edges. */
 void DefaultRefs(const FDefaultValue& D, std::vector<int32>& Out);

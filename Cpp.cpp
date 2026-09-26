@@ -202,11 +202,17 @@ bool IsAssignOperatorCall(const Json& N)
     return Ref != Callee->end() && Ref->value("name", std::string()) == "operator=";
 }
 
-/* One UE_DEFAULTS statement, `Field = value;` or `Component->Field = value;`: the field's MemberExpr, the value, and
-   the component's MemberExpr it reaches through (null for none). False for any other statement. Assigning a struct is
-   an operator call, not a BinaryOperator: its inner is the callee then the two operands, so both shapes are read the
-   same way one index on. */
-bool DefaultAssignment(const Json& S, const Json*& Lhs, const Json*& Rhs, const Json*& Through)
+bool IsIndexOperatorCall(const Json& N)
+{
+    const Json* Callee = Strip(First(N));
+    if (!Callee || Kind(*Callee) != "DeclRefExpr") return false;
+    auto Ref = Callee->find("referencedDecl");
+    return Ref != Callee->end() && Ref->value("name", std::string()) == "operator[]";
+}
+
+/* An assignment statement's two sides. Assigning a struct is an operator call, not a BinaryOperator: its inner is the
+   callee then the two operands, so both shapes are read the same way one index on. */
+bool AssignmentSides(const Json& S, const Json*& Lhs, const Json*& Rhs)
 {
     const Json* Assign = Strip(&S);
     const std::string AK = Assign ? Kind(*Assign) : std::string();
@@ -216,10 +222,65 @@ bool DefaultAssignment(const Json& S, const Json*& Lhs, const Json*& Rhs, const 
     Rhs = Assign ? Nth(*Assign, Base + 1) : nullptr;
     const bool bAssign = bOpCall ? IsAssignOperatorCall(*Assign)
                                  : AK == "BinaryOperator" && Assign->value("opcode", std::string()) == "=";
-    if (!Assign || !bAssign || !Lhs || Kind(*Lhs) != "MemberExpr" || !Rhs) return false;
+    return Assign && bAssign && Lhs && Rhs;
+}
+
+/* One UE_DEFAULTS statement, `Field = value;` or `Component->Field = value;`: the field's MemberExpr, the value, and
+   the component's MemberExpr it reaches through (null for none). False for any other statement. */
+bool DefaultAssignment(const Json& S, const Json*& Lhs, const Json*& Rhs, const Json*& Through)
+{
+    if (!AssignmentSides(S, Lhs, Rhs) || Kind(*Lhs) != "MemberExpr") return false;
     const Json* Owner = Strip(First(*Lhs));
     Through = Owner && Kind(*Owner) == "MemberExpr" ? Owner : nullptr;
     return true;
+}
+
+/* A patch's UE_DEFAULTS statement, which may also assign part of a member's value: DefaultAssignment's `Field` or
+   `Component->Field`, then any `.Member` and `[i]` into it (`PrimaryActorTick.bCanEverTick = v`, `Spans[1].Max = v`).
+   Root is the field's MemberExpr, Steps each `.Member`'s MemberExpr or `[i]`'s operator call, from the root out. */
+bool DefaultPath(const Json& S, const Json*& Root, const Json*& Rhs, const Json*& Through, std::vector<const Json*>& Steps)
+{
+    const Json* E = nullptr;
+    if (!AssignmentSides(S, E, Rhs)) return false;
+    Steps.clear();
+    for (;;)
+    {
+        const std::string K = Kind(*E);
+        const Json* Next = K == "MemberExpr" && !E->value("isArrow", false) ? Strip(First(*E))
+                         : K == "CXXOperatorCallExpr" && IsIndexOperatorCall(*E) ? Strip(Nth(*E, 1)) : nullptr;
+        if (!Next) break;
+        Steps.insert(Steps.begin(), E);
+        E = Next;
+    }
+    if (Kind(*E) != "MemberExpr") return false;
+    Root = E;
+    const Json* Owner = Strip(First(*E));
+    Through = Owner && Kind(*Owner) == "MemberExpr" ? Owner : nullptr;
+    return true;
+}
+
+/* A UE_ASSET_EDITS statement: `Asset.Member = value`, then any `.Member` and `[i]` into the member's value. Asset is
+   the DeclRefExpr naming the asset's variable, Root the member's MemberExpr, Steps as DefaultPath's. */
+bool AssetPath(const Json& S, const Json*& Asset, const Json*& Root, const Json*& Rhs, std::vector<const Json*>& Steps)
+{
+    const Json* E = nullptr;
+    if (!AssignmentSides(S, E, Rhs)) return false;
+    Steps.clear();
+    for (;;)
+    {
+        const std::string K = Kind(*E);
+        const Json* Next = K == "MemberExpr" ? Strip(First(*E))
+                         : K == "CXXOperatorCallExpr" && IsIndexOperatorCall(*E) ? Strip(Nth(*E, 1)) : nullptr;
+        if (!Next) return false;
+        if (K == "MemberExpr" && Kind(*Next) == "DeclRefExpr")
+        {
+            Asset = Next;
+            Root = E;
+            return true;
+        }
+        Steps.insert(Steps.begin(), E);
+        E = Next;
+    }
 }
 
 /* A clang StringLiteral spelling (prefix, quotes, escapes) as UTF-8. clang escapes a narrow
@@ -981,7 +1042,17 @@ private:
     bool GenerateEdit(const std::string& Key, const Json& Var, std::string* Err);
     bool GeneratePatch(const FRecord& R, std::string* Err);
     bool PatchDefaults(const FRecord& Bp, const Json& Body, const std::string& Where, std::string* Err);
-    bool ApplyEdit(const std::string& Package, const std::string& Object, std::vector<FPropertyDef> Defs,
+    /* One assignment of an edit: to a member (Path empty, Chain the member alone), or to part of its value - Chain
+       then holds the member and the def each step of Path reaches, the last the value written. The last carries the
+       value either way. */
+    struct FEditDef { std::vector<FPropertyDef> Chain; std::vector<FValueStep> Path; };
+    bool EditStep(const Json& Step, const FPropertyDef& Parent, const std::string& Where, FBlueprintClass& BP,
+                  FValueStep& Out, FPropertyDef& Reached, std::string* Err);
+    bool EditAssignment(const Json& Root, const FRecord& Declarer, const std::vector<const Json*>& Steps, const Json* Rhs,
+                        const std::string& Where, FBlueprintClass& BP, FEditDef& Out, std::string* Err);
+    bool GenerateAssetEdits(const Json& Block, std::string* Err);
+    std::vector<const Json*> AssetEditBlocks;               // UE_ASSET_EDITS: each block's function
+    bool ApplyEdit(const std::string& Package, const std::string& Object, std::vector<FEditDef> Edits,
                    const FPackage& From, const std::string& Where, std::string* Err);
     bool SaveEdits(const std::string& OutDir, std::string* Err);
     bool BracedMembers(const Json& List, const FRecord& Rec, const std::string& Where, FBlueprintClass& BP, bool bKeepZero,
@@ -1775,6 +1846,11 @@ bool FCompiler::Collect(std::string* Err)
         if (Kind(N) == "VarDecl" && Name(N).compare(0, 8, "UeEdit__") == 0)
         {
             Edits.emplace_back(Ns + Name(N).substr(8), &N);
+            return;
+        }
+        if (Kind(N) == "FunctionDecl" && Name(N).compare(0, 14, "UeAssetEdits__") == 0)
+        {
+            AssetEditBlocks.push_back(&N);
             return;
         }
         if (Kind(N) == "VarDecl" && BracedInit(N)) AssetDecls.push_back(&N);
@@ -8312,7 +8388,9 @@ bool FCompiler::GenerateEdit(const std::string& Key, const Json& Var, std::strin
     /* An explicit zero is written: the asset's own value is what it replaces, not the class default. */
     if (!BracedMembers(*BracedInit(Var), *R, Qual, BP, /*bKeepZero=*/true, Defs, Err)) return false;
     if (Defs.empty()) { *Err = Where + ": the braces name no member"; return false; }
-    return ApplyEdit(Package, Object, Defs, Scratch, Where, Err);
+    std::vector<FEditDef> Edits;
+    for (FPropertyDef& D : Defs) Edits.push_back({ { std::move(D) }, {} });
+    return ApplyEdit(Package, Object, std::move(Edits), Scratch, Where, Err);
 }
 
 /*
@@ -8366,7 +8444,7 @@ bool FCompiler::PatchDefaults(const FRecord& Bp, const Json& Body, const std::st
     while (Engine && PackageOf(*Engine).compare(0, 8, "/Script/") != 0) Engine = Engine->Base.empty() ? nullptr : Find(Engine->Base);
     FPackage Scratch(Package);
     FBlueprintClass BP(Scratch, Class, "", "", false);
-    std::map<std::string, std::vector<FPropertyDef>> Objects;      // an export, as ApplyEdit names it -> its tags
+    std::map<std::string, std::vector<FEditDef>> Objects;          // an export, as ApplyEdit names it -> its assignments
     auto DeclarerOf = [&](const Json& M) {
         const auto Owner = FieldOwner.find(M.value("referencedMemberDecl", std::string()));
         return Owner == FieldOwner.end() ? nullptr : Find(Owner->second);
@@ -8375,8 +8453,14 @@ bool FCompiler::PatchDefaults(const FRecord& Bp, const Json& Body, const std::st
     ForEach(Body, [&](const Json& S) {
         if (!bOk) return;
         const Json *Lhs = nullptr, *Rhs = nullptr, *Through = nullptr;
-        if (!DefaultAssignment(S, Lhs, Rhs, Through))
-        { *Err = Where + ": every statement is `Field = value;` or `Component->Field = value;`"; bOk = false; return; }
+        std::vector<const Json*> Steps;
+        if (!DefaultPath(S, Lhs, Rhs, Through, Steps))
+        {
+            *Err = Where + ": every statement is `Field = value;` or `Component->Field = value;`, or assigns part of one: "
+                   "`Field.Member = value;`, `Field[2] = value;`";
+            bOk = false;
+            return;
+        }
         std::string Object = Cdo;
         if (Through)
         {
@@ -8404,17 +8488,159 @@ bool FCompiler::PatchDefaults(const FRecord& Bp, const Json& Body, const std::st
         }
         const FRecord* DR = DeclarerOf(*Lhs);
         if (!DR) { *Err = Where + ": cannot tell which class declares " + Name(*Lhs); bOk = false; return; }
-        FPropertyDef PD;
-        /* Zero is a real value: it replaces the Blueprint's own, which need not be zero. */
-        bOk = TypeToProperty(TypeOf(*Lhs), UeNameOf(DR, Name(*Lhs)), 0, Where, BP, &PD, Err)
-              && LowerDefault(*Lhs, PD, BP, Err, Rhs, /*bKeepZero=*/true);
-        if (bOk && PD.Default.K == FDefaultValue::None) { *Err = Where + ": " + Name(*Lhs) + " needs a literal value"; bOk = false; }
-        if (bOk) Objects[Object].push_back(PD);
+        FEditDef Edit;
+        bOk = EditAssignment(*Lhs, *DR, Steps, Rhs, Where, BP, Edit, Err);
+        if (bOk) Objects[Object].push_back(std::move(Edit));
     });
     if (!bOk) return false;
     if (Objects.empty()) { *Err = Where + ": UE_DEFAULTS assigns nothing"; return false; }
-    for (const auto& [Object, Defs] : Objects)
-        if (!ApplyEdit(Package, Object, Defs, Scratch, Where, Err)) return false;
+    for (const auto& [Object, Edits] : Objects)
+        if (!ApplyEdit(Package, Object, Edits, Scratch, Where, Err)) return false;
+    return true;
+}
+
+/* S38: one assignment of an edit, `Root<Steps> = Rhs`: the member Root names (Declarer's), each step's def down the
+   path, and the value lowered against the last. Zero is a real value here: it replaces the game's own, which need not
+   be zero. */
+bool FCompiler::EditAssignment(const Json& Root, const FRecord& Declarer, const std::vector<const Json*>& Steps,
+                               const Json* Rhs, const std::string& Where, FBlueprintClass& BP, FEditDef& Out, std::string* Err)
+{
+    Out.Chain.emplace_back();
+    if (!TypeToProperty(TypeOf(Root), UeNameOf(&Declarer, Name(Root)), 0, Where, BP, &Out.Chain.back(), Err)) return false;
+    std::string Path = Name(Root);
+    for (const Json* Step : Steps)
+    {
+        FConstVal I;
+        const Json* Index = Kind(*Step) == "MemberExpr" ? nullptr : Nth(*Step, 2);
+        Path += Index ? "[" + (FoldConst(*Index, I) ? std::to_string(I.I) : std::string("...")) + "]" : "." + Name(*Step);
+        FPropertyDef Reached;
+        if (!EditStep(*Step, Out.Chain.back(), Where + ": " + Path, BP, Out.Path.emplace_back(), Reached, Err)) return false;
+        Out.Chain.push_back(std::move(Reached));
+    }
+    if (!LowerDefault(Steps.empty() ? Root : *Steps.back(), Out.Chain.back(), BP, Err, Rhs, /*bKeepZero=*/true)) return false;
+    if (Out.Chain.back().Default.K == FDefaultValue::None) { *Err = Where + ": " + Path + " needs a literal value"; return false; }
+    return true;
+}
+
+/*
+S38 - UE_ASSET_EDITS { Asset.Member = value; Asset.Array[1].Field = value; ... }: assignments to assets the game holds
+(UE_ASSET_AT), each written into its asset's package as UE_ASSET_EDIT's braces are; a path changes only the part of the
+member's value it names (ApplyEdit). Statements run in order, each asset's in one pass.
+*/
+bool FCompiler::GenerateAssetEdits(const Json& Block, std::string* Err)
+{
+    const std::string Where = "UE_ASSET_EDITS";
+    const Json* Body = nullptr;
+    ForEach(Block, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Body = &C; });
+    if (!Body) { *Err = Where + ": write it as `UE_ASSET_EDITS { Asset.Member = value; }`"; return false; }
+    Cur = nullptr;
+    struct FTarget
+    {
+        std::string Package, Object;
+        std::unique_ptr<FPackage> Scratch;
+        std::unique_ptr<FBlueprintClass> BP;
+        std::vector<FEditDef> Edits;
+    };
+    std::map<std::string, FTarget> Targets;         // the asset's qualified name -> its package and assignments
+    std::vector<std::string> Order;
+    bool bOk = true;
+    ForEach(*Body, [&](const Json& S) {
+        if (!bOk) return;
+        const Json *Asset = nullptr, *Root = nullptr, *Rhs = nullptr;
+        std::vector<const Json*> Steps;
+        if (!AssetPath(S, Asset, Root, Rhs, Steps) || !Asset->contains("referencedDecl"))
+        {
+            *Err = Where + ": every statement assigns an asset's member, or part of one: `Asset.Member = value;`, "
+                   "`Asset.Member[2].Field = value;`";
+            bOk = false;
+            return;
+        }
+        const Json& D = (*Asset)["referencedDecl"];
+        const auto Scope = VarScope.find(D.value("id", std::string()));
+        const std::string Qual = (Scope == VarScope.end() ? std::string() : Scope->second) + Name(D);
+        const auto At = AssetPaths.find(Qual);
+        if (At == AssetPaths.end())
+        {
+            *Err = Where + ": " + Qual + " is not a UE_ASSET_AT (every asset in UeAssets/ is one); a mod's own asset "
+                   "takes its values where it is declared";
+            bOk = false;
+            return;
+        }
+        FTarget& T = Targets[Qual];
+        if (!T.Scratch)
+        {
+            T.Package = At->second;
+            T.Object = SplitAssetPath(T.Package);
+            T.Scratch = std::make_unique<FPackage>(T.Package);
+            T.BP = std::make_unique<FBlueprintClass>(*T.Scratch, T.Object, "", "", false);
+            Order.push_back(Qual);
+        }
+        const auto Owner = FieldOwner.find(Root->value("referencedMemberDecl", std::string()));
+        const FRecord* DR = Owner == FieldOwner.end() ? nullptr : Find(Owner->second);
+        if (!DR) { *Err = Where + ": cannot tell which class declares " + Name(*Root); bOk = false; return; }
+        bOk = EditAssignment(*Root, *DR, Steps, Rhs, Where + " " + Qual, *T.BP, T.Edits.emplace_back(), Err);
+    });
+    if (!bOk) return false;
+    if (Order.empty()) { *Err = Where + ": the block assigns nothing"; return false; }
+    for (const std::string& Qual : Order)
+    {
+        FTarget& T = Targets[Qual];
+        if (!ApplyEdit(T.Package, T.Object, std::move(T.Edits), *T.Scratch, Where + " " + Qual, Err)) return false;
+    }
+    return true;
+}
+
+/* S38: one step of a UE_DEFAULTS path into the value Parent is the def of: a `.Member` MemberExpr, or a TArray's
+   `[i]` call. Out says where the step lands in the cooked bytes, Reached is the def of what it reaches. */
+bool FCompiler::EditStep(const Json& Step, const FPropertyDef& Parent, const std::string& Where, FBlueprintClass& BP,
+                         FValueStep& Out, FPropertyDef& Reached, std::string* Err)
+{
+    if (Kind(Step) == "MemberExpr")
+    {
+        const auto Owner = FieldOwner.find(Step.value("referencedMemberDecl", std::string()));
+        const FRecord* SR = Owner == FieldOwner.end() ? nullptr : Find(Owner->second);
+        if (!SR || Parent.Type != "StructProperty") { *Err = Where + ": cannot tell which struct declares " + Name(Step); return false; }
+        Out.Member = UeNameOf(SR, Name(Step));
+        if (!TypeToProperty(TypeOf(Step), Out.Member, 0, Where, BP, &Reached, Err)) return false;
+        const int32 Native = NativeStructSize(Parent.StructName);
+        if (!Native) return true;
+        /* A native struct's bytes are its members' in declaration order, each of a fixed size. */
+        int32 At = 0;
+        for (const Json* F : SR->Fields)
+        {
+            FPropertyDef M;
+            if (!TypeToProperty(TypeOf(*F), UeNameOf(SR, Name(*F)), 0, Where, BP, &M, Err)) return false;
+            const int32 Size = FixedValueSize(M);
+            if (!Size) { *Err = Where + ": " + SR->CppName + "::" + Name(*F) + " is not a fixed size, so its bytes cannot be found"; return false; }
+            if (Name(*F) == Name(Step)) { Out.Offset = At; Out.Size = Size; }
+            At += Size;
+        }
+        if (!SR->Base.empty() || Out.Offset < 0 || At > Native)
+        { *Err = Where + ": UeApi's " + SR->CppName + " is not laid out the way the engine writes it"; return false; }
+        Out.StructSize = Native;
+        return true;
+    }
+    if (Parent.Type != "ArrayProperty" || !Parent.Inner)
+    {
+        *Err = Where + ": only a TArray's element can be assigned on its own; assign the whole "
+             + std::string(Parent.Type == "MapProperty" ? "map" : Parent.Type == "SetProperty" ? "set" : "value");
+        return false;
+    }
+    FConstVal V;
+    const Json* Index = Nth(Step, 2);
+    if (!Index || !FoldConst(*Index, V) || V.bFloat || V.I < 0 || V.I > 0x7FFFFFFF)
+    { *Err = Where + ": an element's index is a constant, 0 or more"; return false; }
+    Out.Element = int32(V.I);
+    Reached = *Parent.Inner;
+    Out.bStructElements = Reached.Type == "StructProperty";
+    Out.ElementSize = FixedValueSize(Reached);
+    if (!Out.ElementSize)
+    {
+        if (Reached.Type == "StrProperty") Out.ElementKind = FValueStep::String;
+        else if (Reached.Type == "SoftObjectProperty" || Reached.Type == "SoftClassProperty") Out.ElementKind = FValueStep::SoftPath;
+        else if (Reached.Type == "StructProperty") Out.ElementKind = FValueStep::Tags;
+        else { *Err = Where + ": an element of a TArray of " + Reached.Type + " cannot be assigned on its own yet; assign the whole array"; return false; }
+    }
     return true;
 }
 
@@ -8472,13 +8698,14 @@ static int32 ImportInto(FCookedPackage& P, const std::string& Package, const FPa
 }
 
 /*
-Defs, lowered against From (a scratch package, whose imports their objects are), into the tags of Object in the game's
-Package: read from GameDir the first time, saved by SaveEdits once every edit is in. A tag replaces the one of its name
-or is appended. An object a tag points at becomes an import of the package, found or appended, and one the object is
-created before being serialized - the edge the cook gives such a reference; a user-defined struct or enum a tag names
-too. Everything else is the game's, byte for byte.
+Edits, lowered against From (a scratch package, whose imports their objects are), into the tags of Object in the game's
+Package: read from GameDir the first time, saved by SaveEdits once every edit is in. A member's tag replaces the one of
+its name or is appended; an assignment to part of a member's value (a path) changes that part of the tag's value and
+keeps the rest (SetTagPath). An object a tag points at becomes an import of the package, found or appended, and one the
+object is created before being serialized - the edge the cook gives such a reference; a user-defined struct or enum a
+tag names too. Everything else is the game's, byte for byte.
 */
-bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object, std::vector<FPropertyDef> Defs,
+bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object, std::vector<FEditDef> Edits,
                           const FPackage& From, const std::string& Where, std::string* Err)
 {
     FEdited* Ed = LoadEdited(Package, Where, Err);
@@ -8527,30 +8754,67 @@ bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object,
             if (*Sub) { *Sub = std::make_shared<FPropertyDef>(**Sub); MoveDef(**Sub); }
         MoveValue(D.Default);
     };
-    for (FPropertyDef& D : Defs)
-    {
-        MoveDef(D);
-        const FImport* Named = From.ImportAt(D.Extra);
-        if (Named && (Named->ClassName == "UserDefinedStruct" || Named->ClassName == "UserDefinedEnum"))
-            Deps.push_back(Move(D.Extra.V));
-    }
+    for (FEditDef& E : Edits)
+        for (FPropertyDef& D : E.Chain)
+        {
+            MoveDef(D);
+            const FImport* Named = From.ImportAt(D.Extra);
+            if (Named && (Named->ClassName == "UserDefinedStruct" || Named->ClassName == "UserDefinedEnum"))
+                Deps.push_back(Move(D.Extra.V));
+        }
     if (!MoveErr.empty()) { *Err = Where + ": " + MoveErr; return false; }
 
-    /* The tags, written against P's names (a name P lacks is appended), then read back as P's own. */
+    /* Each assignment's bytes, written against P's names (a name P lacks is appended), then read back as P's own.
+       Fresh[K] is the tag holding only the path below step K, for each K it can be one (every step on is a member of a
+       struct written as tags): Fresh[0] the member's own tag, whole when there is no path. Leaf is the value's bytes
+       when the path ends in a native struct or at an element. */
     std::vector<std::string> Texts;
     for (const FCookedName& N : P.Names) Texts.push_back(N.Text);
     FPackage Sink(Package);
     Sink.SeedNames(Texts);
-    FArc Ar(&Sink);
-    for (const FPropertyDef& D : Defs) WriteDefaultTag(Ar, D);
-    TagEnd(Ar);
+    auto Bytes = [&](const auto& Write) { FArc Ar(&Sink); Write(Ar); return Ar.B; };
+    std::vector<std::vector<std::vector<uint8>>> Fresh(Edits.size());
+    std::vector<std::vector<uint8>> Leaf(Edits.size());
+    for (size_t I = 0; I < Edits.size(); ++I)
+    {
+        const FEditDef& E = Edits[I];
+        const size_t N = E.Path.size();
+        Fresh[I].resize(N + 1);
+        FPropertyDef Tree = E.Chain[N];
+        for (size_t K = N + 1; K-- > 0;)
+        {
+            if (K < N)
+            {
+                if (!E.Path[K].IsTaggedMember()) break;
+                FPropertyDef Up = E.Chain[K];
+                Up.Members = std::make_shared<std::vector<FPropertyDef>>(1, Tree);
+                Up.Default = FDefaultValue{};
+                Up.Default.K = FDefaultValue::Struct;
+                Tree = std::move(Up);
+            }
+            if (K == 0 || E.Path[K - 1].IsTaggedMember())
+                Fresh[I][K] = Bytes([&](FArc& Ar) { WriteDefaultTag(Ar, Tree); TagEnd(Ar); });
+        }
+        if (N && !E.Path.back().IsTaggedMember()) Leaf[I] = Bytes([&](FArc& Ar) { WriteDefaultValue(Ar, E.Chain[N]); });
+    }
     for (size_t I = P.Names.size(); I < Sink.NameTable().size(); ++I) P.Names.push_back({ Sink.NameTable()[I] });
-    std::vector<FTag> Tags;
-    size_t End = 0;
-    if (!ReadTags(P, Ar.B, End, Tags) || End != Ar.B.size()) { *Err = Where + ": internal: the edit's tags do not read back"; return false; }
-    if (!SetTags(P, Export, Tags, Err)) { *Err = Where + ": " + *Err; return false; }
+
+    /* In statement order, so a later assignment lands on what an earlier one wrote. */
+    for (size_t I = 0; I < Edits.size(); ++I)
+    {
+        if (Edits[I].Path.empty())
+        {
+            std::vector<FTag> Tags;
+            size_t End = 0;
+            if (!ReadTags(P, Fresh[I][0], End, Tags) || End != Fresh[I][0].size() || Tags.size() != 1)
+            { *Err = Where + ": internal: the edit's tag does not read back"; return false; }
+            if (!SetTags(P, Export, Tags, Err)) { *Err = Where + ": " + *Err; return false; }
+        }
+        else if (!SetTagPath(P, Export, Edits[I].Chain[0].Name, Edits[I].Path, Fresh[I], Leaf[I], Err))
+        { *Err = Where + ": " + *Err; return false; }
+    }
     for (int32 Dep : Deps) P.CreateBeforeSerialize(Export, Dep);
-    Ed->Objects.push_back(Object + " (" + std::to_string(Tags.size()) + (Tags.size() == 1 ? " tag)" : " tags)"));
+    Ed->Objects.push_back(Object + " (" + std::to_string(Edits.size()) + (Edits.size() == 1 ? " assignment)" : " assignments)"));
     return true;
 }
 
@@ -10036,6 +10300,8 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         if (!GenerateAsset(*Var, OutDir, Err)) return false;
     for (const auto& [Key, Var] : Edits)
         if (!GenerateEdit(Key, *Var, Err)) return false;
+    for (const Json* Block : AssetEditBlocks)
+        if (!GenerateAssetEdits(*Block, Err)) return false;
     for (const auto& Entry : Records)
         if (Entry.second.bIsPatch && !GeneratePatch(Entry.second, Err)) return false;
     if (!SaveEdits(OutDir, Err)) return false;

@@ -2190,6 +2190,97 @@ def edits():
           'parameters are refused')
 
 
+def path_edits():
+    """S38: a patch's UE_DEFAULTS path assigns part of a member's value on TypesTest's default object - a native
+    struct's member inside an element (Points[1].Y), a member of a struct written as tags inside one (Spans[0].Max), a
+    whole element (Spans[1]) - and the rest of each value stays the cook's bytes. A member the default object has no
+    value of takes only a path of members of structs written as tags (Home is native); an index past the end is
+    refused."""
+    import struct, tempfile
+    from dumptags import tags as read_tags
+    a = os.path.join(ROOT, 'TypesTest', 'FSD', 'Content', '_ElytrasMods', 'TypesTest', 'TypesTest')
+    decl = ('#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/PathEdit");\n'
+            'class TypesTest : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/TypesTest/TypesTest", "TypesTest_C");\n'
+            '  FVector Home;\n  TArray<FVector> Points;\n  TArray<FFloatInterval> Spans;\n};\n'
+            'class Tweaks : public TypesTest {\n  UE_PATCH;\n  UE_DEFAULTS { %s }\n};\n')
+    blob = lambda l, e: l[1][e['off'] - l[2]:e['off'] - l[2] + e['size']]
+
+    def value(base, name):
+        """The default object's tag `name`: its value's bytes, and the package's names."""
+        l = dumpexp.load(base)
+        text = dump('dumptags.py', base, [e['name'] for e in l[5]].index('Default__TypesTest_C'))
+        return bytes.fromhex(re.search(r'^  %s \[0\] \w+ size=\d+[^:]*: ([0-9a-f]*)$' % name, text, re.M).group(1)), l[3]
+
+    def spans(base):
+        """Spans' elements, each its members' values: after the count, the inner tag (49 bytes), then tag lists."""
+        b, names = value(base, 'Spans')
+        at, out = 4 + 49, []
+        for _ in range(struct.unpack_from('<i', b)[0]):
+            lines = []
+            at = read_tags(b, at, len(b), names, 0, lines)
+            out.append([l.split(': ')[-1] for l in lines])
+        assert at == len(b) and struct.unpack_from('<i', b, 4 + 16)[0] == len(b) - 4 - 49, (at, len(b))    # the inner tag's Size
+        return out
+
+    points = lambda base: struct.unpack_from('<6f', value(base, 'Points')[0], 4 + 49)
+    assert points(a) == (1, 2, 3, 4, 5, 6) and spans(a) == [['1.0', '5.0'], ['-2.0', '2.0']], (points(a), spans(a))
+    for body, why in (('Points[1].Y = 50.0f; Spans[0].Max = 9.0f; Spans[1] = FFloatInterval{3.0f, 4.0f};', None),
+                      ('Home.Z = 1.0f;', 'Home is not set on Default__TypesTest_C'),
+                      ('Points[2].X = 1.0f;', 'Points has 2 elements')):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'PathEdit.cpp')
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(decl % body)
+            out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'PathEdit')
+            os.makedirs(out)
+            proc = subprocess.run([ASSETGEN, 'compile', path, UEAPI, out, '--game', os.path.join(ROOT, 'TypesTest', 'FSD', 'Content')],
+                                  capture_output=True, encoding='utf-8')
+            if why:
+                assert proc.returncode != 0 and why in proc.stdout, (body, proc.stdout)
+                continue
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+            b = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'TypesTest', 'TypesTest')
+            assert points(b) == (1, 2, 3, 4, 50, 6) and spans(b) == [['1.0', '9.0'], ['3.0', '4.0']], (points(b), spans(b))
+            la, lb = dumpexp.load(a), dumpexp.load(b)
+            cdo = [e['name'] for e in la[5]].index('Default__TypesTest_C')
+            other = lambda base: [l for l in dump('dumptags.py', base, cdo).splitlines() if not l.startswith(('  Points ', '  Spans '))]
+            assert other(a) == other(b), 'another tag changed'
+            assert all(i == cdo or blob(la, x) == blob(lb, y) for i, (x, y) in enumerate(zip(la[5], lb[5]))), 'another export changed'
+            proc = subprocess.run([ASSETGEN, 'roundtrip', tmp], capture_output=True, encoding='utf-8')
+            assert proc.returncode == 0, proc.stdout
+    print('ok  EditTest: a UE_DEFAULTS path assigns part of a value - a native struct\'s member, a tagged one\'s, an '
+          'element - keeping the rest of it; a native member with no value, and an index past the end, are refused')
+
+    # UE_ASSET_EDITS: the same paths into a data asset, AssetTest's ED_AssetTest. The element's new object is one the
+    # package does not import yet; a whole member beside it.
+    a = os.path.join(ROOT, 'AssetTest', 'FSD', 'Content', '_ElytrasMods', 'AssetTest', 'ED_AssetTest')
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, 'AssetEdits.cpp')
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/AssetEdits");\n'
+                    'UE_ASSET_AT(UEnemyDescriptor, ED_Spider_Exploder, "/Game/Enemies/Spider/Exploder/ED_Spider_Exploder");\n'
+                    'UE_ASSET_AT(UEnemyDescriptor, ED_AssetTest, "/Game/_ElytrasMods/AssetTest/ED_AssetTest");\n'
+                    'UE_ASSET_EDITS {\n  ED_AssetTest.VeteranClasses[0] = &ED_Spider_Exploder;\n  ED_AssetTest.IdealSpawnSize = 9;\n}\n')
+        out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'AssetEdits')
+        os.makedirs(out)
+        proc = subprocess.run([ASSETGEN, 'compile', path, UEAPI, out, '--game', os.path.join(ROOT, 'AssetTest', 'FSD', 'Content')],
+                              capture_output=True, encoding='utf-8')
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        b = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'AssetTest', 'ED_AssetTest')
+        la, lb = dumpexp.load(a), dumpexp.load(b)
+        assert lb[4][:len(la[4])] == la[4] and [i for i in lb[4][len(la[4]):] if 'Exploder' in i], lb[4]     # appended
+        exploder = -1 - lb[4].index(next(i for i in lb[4][len(la[4]):] if i.endswith("'ED_Spider_Exploder'")))
+        before, after = dump('dumptags.py', a, 0).splitlines(), dump('dumptags.py', b, 0).splitlines()
+        changed = [(x.split(':')[0].strip(), y.split(': ')[-1]) for x, y in zip(before, after) if x != y]
+        assert len(before) == len(after) and changed == [
+            ('VeteranClasses [0] ArrayProperty size=8 inner=ObjectProperty', (struct.pack('<ii', 1, exploder)).hex()),
+            ('IdealSpawnSize [0] IntProperty size=4', '9')], changed
+        proc = subprocess.run([ASSETGEN, 'roundtrip', tmp], capture_output=True, encoding='utf-8')
+        assert proc.returncode == 0, proc.stdout
+    print('ok  EditTest: UE_ASSET_EDITS assigns a data asset\'s members and parts of them by path, an element\'s new '
+          'object imported')
+
+
 def game_edits():
     """S38 on the game's own packages (--game): ED_Spider_Grunt and the grunt Blueprint's class defaults, edited as
     BpMods' GruntTweaks does. Only the named tags differ from the cook's; every other export is its bytes."""
@@ -2257,8 +2348,64 @@ def game_edits():
                     '  UE_DEFAULTS { Sphere->SphereRadius = 10.0f; }\n};\n')
         proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, out, '--game', GAME], capture_output=True, encoding='utf-8')
         assert proc.returncode != 0 and 'does not override that inherited component' in proc.stdout, proc.stdout
+
+    # Paths into the grunt's values: PrimaryActorTick, which its default object has no value of, becomes a tag holding
+    # only bCanEverTick (the engine fills the rest in from the parent's); one element of MeleeAttack's Montages; one
+    # element of an array inside SimpleArmorDamage's ArmorBreakEffects struct. Both objects are imports already.
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, 'GamePaths.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\n#include "UeApi/FSD.h"\n'
+                    '#include "UeApi/Game/ENE_Spider_Grunt_Normal_C.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/GamePaths");\n'
+                    'UE_ASSET_AT(UAnimMontage, ANIM_Spider_Grunt_Attack_I, "/Game/Enemies/Spider/Animation/ANIM_Spider_Grunt_Attack_I");\n'
+                    'UE_ASSET_AT(UParticleSystem, P_SpiderGrunt_Armor_Debris, '
+                    '"/Game/Enemies/Spider/Particles/P_SpiderGrunt_Armor_Debris");\n'
+                    'class GruntPaths : public ENE_Spider_Grunt_Normal_C {\n  UE_PATCH;\n  UE_DEFAULTS {\n'
+                    '    PrimaryActorTick.bCanEverTick = true;\n'
+                    '    MeleeAttack->Montages[0] = &ANIM_Spider_Grunt_Attack_I;\n'
+                    '    SimpleArmorDamage->ArmorBreakEffects.DissolveParticles[0] = &P_SpiderGrunt_Armor_Debris;\n  }\n};\n'
+                    'UE_ASSET_AT(UEnemyDescriptor, ED_Spider_Grunt, "/Game/Enemies/Spider/Grunt/ED_Spider_Grunt");\n'
+                    'UE_ASSET_EDITS { ED_Spider_Grunt.SpawnRarityModifiers[1].Rarity = 2.0f; }\n')
+        out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'GamePaths')
+        os.makedirs(out)
+        proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, out, '--game', GAME], capture_output=True, encoding='utf-8')
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        a, b = game('Enemies/Spider/Grunt/ENE_Spider_Grunt_Normal'), os.path.join(tmp, 'FSD', 'Content', 'Enemies', 'Spider', 'Grunt', 'ENE_Spider_Grunt_Normal')
+        la, lb = dumpexp.load(a), dumpexp.load(b)
+        assert lb[4] == la[4], 'an import was added'
+        cdo, melee, armor = (names.index(n) for n in ('Default__ENE_Spider_Grunt_Normal_C', 'MeleeAttack_GEN_VARIABLE',
+                                                        'SimpleArmorDamage_GEN_VARIABLE'))
+        before, after = dump('dumptags.py', a, cdo).splitlines(), dump('dumptags.py', b, cdo).splitlines()
+        assert after[:len(before)] == before and [l.split(' size=')[0] for l in after[len(before):]] == \
+            ['  PrimaryActorTick [0] StructProperty', '    bCanEverTick [0] BoolProperty'] and after[-1].endswith('value=1: '), after
+        assert tags(a, melee)['Montages'].endswith(': 02000000fffffffffeffffff'), tags(a, melee)
+        assert tags(b, melee)['Montages'].endswith(': 02000000fefffffffeffffff'), tags(b, melee)     # -1 -> -2, Attack_I
+        before, after = dump('dumptags.py', a, armor).splitlines(), dump('dumptags.py', b, armor).splitlines()
+        changed = [(x.strip(), y.strip()) for x, y in zip(before, after) if x != y]
+        assert len(before) == len(after) and [(x.split(':')[0], y.split(':')[0]) for x, y in changed[:1]] == \
+            [('ArmorBreakEffects [0] StructProperty size=90 struct=ArmorDamageEffects',) * 2] and changed[1:] == \
+            [('DissolveParticles [0] ArrayProperty size=8 inner=ObjectProperty: 01000000b4ffffff',       # its nested line:
+              'DissolveParticles [0] ArrayProperty size=8 inner=ObjectProperty: 01000000b3ffffff')], changed   # -76 -> -77
+        assert all(i in (cdo, melee, armor) or blob(la, x) == blob(lb, y) for i, (x, y) in enumerate(zip(la[5], lb[5]))), 'another export changed'
+
+        # UE_ASSET_EDITS on ED_Spider_Grunt: Rarity in one element of SpawnRarityModifiers, each element a tag list
+        # after the array's inner tag. (The game's own values there are uninitialized memory from its cook: kept.)
+        import struct
+        from dumptags import tags as read_tags
+        def rarities(base):
+            b, at, out = bytes.fromhex(tags(base, 0)['SpawnRarityModifiers'].split(': ')[-1]), 4 + 49, []
+            for _ in range(struct.unpack_from('<i', b)[0]):
+                out.append([])
+                at = read_tags(b, at, len(b), dumpexp.load(base)[3], 0, out[-1])
+            return out
+        ra = rarities(game('Enemies/Spider/Grunt/ED_Spider_Grunt'))
+        rb = rarities(os.path.join(tmp, 'FSD', 'Content', 'Enemies', 'Spider', 'Grunt', 'ED_Spider_Grunt'))
+        assert len(ra) == 4 and rb[:1] + rb[2:] == ra[:1] + ra[2:] and rb[1][0] == ra[1][0] \
+            and rb[1][1] == 'Rarity [0] FloatProperty size=4: 2.0' and ra[1][1] != rb[1][1], (ra, rb)
+        proc = subprocess.run([ASSETGEN, 'roundtrip', tmp], capture_output=True, encoding='utf-8')
+        assert proc.returncode == 0, proc.stdout
     print('ok  S38 on the game: ED_Spider_Grunt, the grunt Blueprint\'s defaults, three kinds of its components, and one '
-          'function replaced around the game\'s body, kept; the rest the cook\'s bytes')
+          'function replaced around the game\'s body, kept; paths into four of its values; the rest the cook\'s bytes')
 
 
 def edit_staleness():
@@ -2305,6 +2452,7 @@ ue_assets()
 asset_elsewhere()
 globals_()
 edits()
+path_edits()
 game_edits()
 edit_staleness()
 
