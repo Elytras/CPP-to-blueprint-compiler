@@ -1,0 +1,80 @@
+﻿#pragma once
+/*
+S38: a cooked UE4.27 package read into its tables and written back. An export's payload stays the bytes it was cooked
+with; an edit replaces one, and Write lays the header and the payloads out again around it.
+
+The layout is the one every package in FSD-WindowsNoEditor.pak has (52,645 surveyed, 2026-09-26): unversioned,
+PKG_FilterEditorOnly, one generation, no engine version, and the name map, imports, exports, depends, asset registry
+and preload dependencies back to back after the summary, with the payloads in export order in the .uexp. Anything
+else is refused with its reason rather than read loosely.
+*/
+#include <string>
+#include <vector>
+
+#include "SharedLib/core/Types.h"
+
+namespace Uasset
+{
+/* An FName as a package stores it: a name-map row and a number, one-based (0 = no number). */
+struct FNameRef
+{
+    int32 Index = 0;
+    int32 Number = 0;
+};
+
+struct FCookedName
+{
+    std::string Text;                           // UTF-8
+    uint16 NonCaseHash = 0, CaseHash = 0;       // as read; Write computes its own
+};
+
+struct FCookedImport
+{
+    FNameRef ClassPackage, ClassName;
+    int32 Outer = 0;                            // FPackageIndex
+    FNameRef ObjectName;
+};
+
+struct FCookedExport
+{
+    int32 Class = 0, Super = 0, Template = 0, Outer = 0;
+    FNameRef ObjectName;
+    uint32 ObjectFlags = 0;
+    bool bForcedExport = false, bNotForClient = false, bNotForServer = false;
+    uint32 PackageGuid[4] = { 0, 0, 0, 0 };
+    uint32 PackageFlags = 0;
+    bool bNotAlwaysLoadedForEditorGame = false, bIsAsset = false;
+    /* EDL: where this export's run starts in PreloadDependencies (-1 = none), then the four phase counts in order. */
+    int32 FirstExportDependency = -1;
+    int32 SerBeforeSer = 0, CreateBeforeSer = 0, SerBeforeCreate = 0, CreateBeforeCreate = 0;
+    std::vector<int32> Depends;                 // its DependsMap row: empty in every cooked package seen
+    std::vector<uint8> Payload;                 // its bytes in the .uexp
+};
+
+class FCookedPackage
+{
+public:
+    /* The header (.uasset or .umap) and the .uexp beside it. */
+    bool Load(const std::string& HeaderPath, std::string* Err);
+    bool Read(const std::vector<uint8>& Header, const std::vector<uint8>& Exp, std::string* Err);
+    void Write(std::vector<uint8>& Header, std::vector<uint8>& Exp) const;
+    bool Save(const std::string& HeaderPath, std::string* Err) const;
+
+    /* "Base" or "Base_<n>", as FName::ToString spells a numbered name. */
+    std::string NameOf(const FNameRef& N) const;
+
+    uint32 PackageFlags = 0;
+    uint32 Guid[4] = { 0, 0, 0, 0 };
+    uint32 PackageSource = 0;
+    std::vector<FCookedName> Names;
+    std::vector<FCookedImport> Imports;
+    std::vector<FCookedExport> Exports;
+    std::vector<int32> PreloadDependencies;
+};
+
+/* The gate before any edit is trusted: every cooked package under Dir read and written back in memory, with a report
+   of what was refused, what came back different, and whether AssetGen's name hashes and name order match the cook's.
+   0 when every package comes back byte-identical. */
+int RoundTrip(const std::string& Dir);
+
+}   // namespace Uasset
