@@ -105,7 +105,8 @@ public:
 
     /* S38: write against a cooked package's name table instead. Its names keep their rows, a name it lacks is
        appended, and indices are final from the start - so an FArc over this package writes bytes that package can
-       read. Not for Save. NameTable() is the table after, the appended names last. */
+       read. Not for Save. NameTable() is the table after, the appended names last. A cooked table can hold one name
+       in two cases ("ID" and "Id"); a name takes the row spelled exactly like it, else the first of its case twins. */
     void SeedNames(const std::vector<std::string>& Existing);
     const std::vector<std::string>& NameTable() const { return Names; }
     /* S38: each FPackageIndex an FArc over this package writes goes through RemapIndex when it is set, so an export
@@ -140,6 +141,7 @@ private:
 
     mutable std::vector<std::string> Names;
     mutable std::unordered_map<std::string, int32> NameLookup;   // lowercased -> row
+    std::unordered_map<std::string, int32> ExactNames;           // SeedNames: each spelling -> its row
     mutable bool bNamesFinal = false;
     bool bAppendNames = false;                                   // SeedNames
 

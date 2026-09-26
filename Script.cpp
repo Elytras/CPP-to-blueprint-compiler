@@ -308,12 +308,13 @@ void WriteDefaultValue(FArc& Ar, const FPropertyDef& P)
 int32 NativeStructSize(const std::string& StructName)
 {
     /* A struct with a native Serialize writes raw bytes, not tags; a zero of this many bytes is its default. Box /
-       Box2D serialize IsValid as one byte, so they are shorter than in memory. */
+       Box2D serialize IsValid as one byte, so they are shorter than in memory. BoxSphereBounds is not one: the pak's
+       2,270 values of it are tag lists (the S38 value gate). */
     static const std::map<std::string, int32> Native = {
         { "Vector", 12 }, { "Vector2D", 8 }, { "Vector4", 16 }, { "Rotator", 12 }, { "Quat", 16 },
         { "Plane", 16 }, { "Matrix", 64 }, { "Color", 4 }, { "LinearColor", 16 }, { "IntPoint", 8 },
         { "IntVector", 12 }, { "Guid", 16 }, { "DateTime", 8 }, { "Timespan", 8 }, { "Box", 25 },
-        { "Box2D", 17 }, { "BoxSphereBounds", 28 }, { "FrameNumber", 4 } };
+        { "Box2D", 17 }, { "FrameNumber", 4 } };
     const auto N = Native.find(StructName);
     return N == Native.end() ? 0 : N->second;
 }

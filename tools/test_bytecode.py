@@ -56,10 +56,11 @@ def build():
         LOGS[mod] = proc.stdout
     print('ok  every test compiles')
     # The reader behind S38 refuses any layout the game's own 52,645 cooked packages do not share, and writes each one
-    # back byte for byte: so every package here must come back unchanged, name order and hashes included.
+    # back byte for byte: so every package here must come back unchanged, name order and hashes included. Each tag's
+    # value is read into the model and encoded again, which must give the same bytes.
     proc = subprocess.run([ASSETGEN, 'roundtrip', ROOT], capture_output=True, encoding='utf-8')
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    print('ok  every package reads back and writes out byte for byte (assetgen roundtrip)')
+    print('ok  every package reads back and writes out byte for byte, and every tag value re-encodes (assetgen roundtrip)')
 
 
 build()

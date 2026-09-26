@@ -253,11 +253,14 @@ int32 FPackage::NameIndex(const std::string& S)
     SplitName(S, Base, Number);
 
     const std::string Key = Lower(Base);
+    if (bAppendNames)
+        if (auto Exact = ExactNames.find(Base); Exact != ExactNames.end()) return Exact->second;
     auto It = NameLookup.find(Key);
     if (It != NameLookup.end()) return It->second;
     if (bAppendNames)
     {
         NameLookup.emplace(Key, int32(Names.size()));
+        ExactNames.emplace(Base, int32(Names.size()));
         Names.push_back(Base);
         return int32(Names.size()) - 1;
     }
@@ -273,7 +276,12 @@ void FPackage::SeedNames(const std::vector<std::string>& Existing)
 {
     Names = Existing;
     NameLookup.clear();
-    for (int32 I = 0; I < int32(Names.size()); ++I) NameLookup.emplace(Lower(Names[size_t(I)]), I);     // the first of a case pair
+    ExactNames.clear();
+    for (int32 I = 0; I < int32(Names.size()); ++I)
+    {
+        NameLookup.emplace(Lower(Names[size_t(I)]), I);     // the first of a case pair
+        ExactNames.emplace(Names[size_t(I)], I);
+    }
     bNamesFinal = bAppendNames = true;
 }
 

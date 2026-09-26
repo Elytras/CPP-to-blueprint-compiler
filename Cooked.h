@@ -68,7 +68,8 @@ public:
     std::string ClassNameOf(int32 Index) const;
 
     /* S38 edits. Every index the package already uses stays valid: a name or an import it lacks is appended. */
-    /* S as an FName of this package ("Base_<n>" split off as FName does), appended if the table lacks it. */
+    /* S as an FName of this package ("Base_<n>" split off as FName does): the row spelled like it, else the first
+       spelled like it but for case, else appended. */
     FNameRef NameRef(const std::string& S);
     /* Whether N is the FName S spells (the same number, the base compared case-insensitively). */
     bool SameName(const FNameRef& N, const std::string& S) const;
@@ -148,6 +149,14 @@ struct FValueStep
 bool SetTagPath(FCookedPackage& P, int32 Export, const std::string& Root, const std::vector<FValueStep>& Path,
                 const std::vector<std::vector<uint8>>& Fresh, const std::vector<uint8>& Leaf, std::string* Err);
 
+/* S38: Tag's value read into AssetGen's own value model, typed off the tag alone: the FPropertyDef WriteDefaultTag
+   takes (Name, Type, StructName as Tag() writes it, Inner / Value), the value in its Default, a struct's members in
+   Default.Members. A natively serialized struct's members are its bytes in 4-byte chunks. False, saying why, for a
+   value the model cannot hold as the cook wrote it: a localized text, an FString in a form the encoder does not
+   write, a set of structs whose struct no tag names, a type the encoder has no case for, ... */
+struct FPropertyDef;
+bool ReadTagValue(const FCookedPackage& P, const FTag& Tag, FPropertyDef& Out, std::string* Why);
+
 /*
 Where a cooked UStruct's payload keeps each part, as UObject / UStruct::Serialize write it after the tag list: the
 lazy-object guid, SuperStruct, Children (a count, then each index: RemoveUField_Next), ChildProperties (a count, then
@@ -197,8 +206,10 @@ bool AddClassFunction(FCookedPackage& P, int32 Class, int32 Function, FNameRef N
 
 /* The gate before any edit is trusted: every cooked package under Dir read and written back in memory, with a report
    of what was refused, what came back different, and whether AssetGen's name hashes and name order match the cook's.
-   Each export's tagged properties go through ReadTags / WriteTags on the way. 0 when every package comes back
-   byte-identical. */
+   Each export's tagged properties go through ReadTags / WriteTags on the way, and each tag's value through
+   ReadTagValue and WriteDefaultTag, AssetGen's own encoder, against the package's name table. 0 when every package
+   comes back byte-identical and no value the model holds comes back different; a value it cannot hold, or one whose
+   tag alone differs (a C array's index, a user-defined struct's guid), is counted with its reason. */
 int RoundTrip(const std::string& Dir);
 
 }   // namespace Uasset

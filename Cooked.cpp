@@ -147,8 +147,13 @@ FNameRef FCookedPackage::NameRef(const std::string& S)
     int32 Number = 0;
     SplitName(S, Base, Number);
     const std::string L = Lower(Base);
+    int32 Twin = -1;                                                    // the first spelled like it but for case
     for (int32 I = 0; I < int32(Names.size()); ++I)
-        if (Lower(Names[size_t(I)].Text) == L) return { I, Number };
+    {
+        if (Names[size_t(I)].Text == Base) return { I, Number };
+        if (Twin < 0 && Lower(Names[size_t(I)].Text) == L) Twin = I;
+    }
+    if (Twin >= 0) return { Twin, Number };
     Names.push_back({ Base });
     return { int32(Names.size()) - 1, Number };
 }
@@ -890,6 +895,228 @@ bool FCookedPackage::Save(const std::string& HeaderPath, std::string* Err) const
     return true;
 }
 
+namespace
+{
+/* An FString at R in a form the encoder writes (WriteFStringValue): 0 for empty, ASCII as 8-bit, anything else as
+   UTF-16, each counting its terminator. */
+bool ReadEncodedString(FReader& R, std::string& Out, std::string& Why)
+{
+    const size_t At = R.P;
+    const int32 Len = R.I32();
+    R.P = At;
+    Out = R.Str();
+    if (R.bBad) { Why = "an FString past its value's end"; return false; }
+    if (Len == 1 || Len == -1) { Why = "an empty FString written with its terminator (the encoder writes length 0)"; return false; }
+    if (Len > 0 && (!IsAscii(Out) || R.B[R.P - 1] != 0)) { Why = "an 8-bit FString of bytes past 0x7F (the encoder writes UTF-16)"; return false; }
+    if (Len < 0 && IsAscii(Out)) { Why = "a UTF-16 FString of ASCII (the encoder writes 8-bit)"; return false; }
+    return true;
+}
+
+/* An FText in a form the encoder writes: culture-invariant (flags 2, no history, the string), or empty (all 0). */
+bool ReadEncodedText(FReader& R, std::string& Out, std::string& Why)
+{
+    const uint32 Flags = R.U32();
+    const int8 History = R.Get<int8>();
+    if (History != -1)
+    { Why = "a text of history " + std::to_string(History) + " (the encoder writes culture-invariant literals)"; return false; }
+    const int32 bInvariant = R.I32();
+    Out.clear();
+    if (bInvariant && !ReadEncodedString(R, Out, Why)) return false;
+    if (!(Flags == 2 && bInvariant == 1 && !Out.empty()) && !(Flags == 0 && bInvariant == 0))
+    { Why = "a culture-invariant text with flags " + std::to_string(Flags) + (Out.empty() ? " and no string" : ""); return false; }
+    return !R.bBad;
+}
+
+/* One value of the type T names, at R, into D. T's own fields the tag does not give (a container element's struct
+   or enum) are filled in on the way. */
+bool ReadValueOf(const FCookedPackage& P, FReader& R, FPropertyDef& T, FDefaultValue& D, std::string& Why)
+{
+    const std::string& Ty = T.Type;
+    if (Ty == "IntProperty") { D.K = FDefaultValue::Int; D.I = R.I32(); }
+    else if (Ty == "Int64Property") { D.K = FDefaultValue::Int; D.I = R.I64(); }
+    else if (Ty == "FloatProperty") { D.K = FDefaultValue::Float; D.F = R.Get<float>(); }
+    else if (Ty == "BoolProperty")
+    {
+        D.K = FDefaultValue::Bool;
+        D.I = R.Get<uint8>();
+        if (D.I > 1) { Why = "a bool element other than 0 or 1"; return false; }
+    }
+    else if (Ty == "ByteProperty" && T.StructName.empty()) { D.K = FDefaultValue::Int; D.I = R.Get<uint8>(); }
+    else if (Ty == "ByteProperty" || Ty == "EnumProperty" || Ty == "NameProperty") { D.K = FDefaultValue::Str; D.S = P.NameOf(R.Name()); }
+    else if (Ty == "ObjectProperty") { D.K = FDefaultValue::Obj; D.Object = FIndex{ R.I32() }; }
+    else if (Ty == "InterfaceProperty")
+    {
+        if (R.I32() != 0) { Why = "an interface value that is not null (the encoder writes null)"; return false; }
+    }
+    else if (Ty == "StrProperty")
+    {
+        if (!ReadEncodedString(R, D.S, Why)) return false;
+        D.K = FDefaultValue::Str;
+    }
+    else if (Ty == "TextProperty")
+    {
+        if (!ReadEncodedText(R, D.S, Why)) return false;
+        D.K = FDefaultValue::Str;
+    }
+    else if (Ty == "SoftObjectProperty")                           // FSoftObjectPath: AssetPathName, SubPathString
+    {
+        D.S = P.NameOf(R.Name());
+        std::string Sub;
+        if (!ReadEncodedString(R, Sub, Why)) return false;
+        if (!Sub.empty()) { Why = "a soft path with a sub-path (the encoder writes none)"; return false; }
+        if (D.S == "None") D.S.clear();
+        D.K = FDefaultValue::Str;
+    }
+    else if (Ty == "StructProperty")
+    {
+        auto Members = std::make_shared<std::vector<FPropertyDef>>();
+        if (const int32 Native = NativeStructSize(T.StructName))
+        {
+            /* The struct's bytes as they are: 4-byte chunks, then single bytes, which WriteValue writes back raw. */
+            for (int32 At = 0; At < Native;)
+            {
+                FPropertyDef& C = Members->emplace_back();
+                C.Default.K = FDefaultValue::Int;
+                if (Native - At >= 4) { C.Type = "IntProperty"; C.Default.I = R.I32(); At += 4; }
+                else { C.Type = "ByteProperty"; C.Default.I = R.Get<uint8>(); ++At; }
+            }
+        }
+        else
+        {
+            std::vector<FTag> Tags;
+            size_t At = R.P;
+            if (!ReadTags(P, R.B, At, Tags))
+            {
+                Why = T.StructName.empty() ? "a struct in a map or set that is no tag list (written natively; no tag names it)"
+                                           : "a " + T.StructName + " written natively, which the encoder's table lacks";
+                return false;
+            }
+            R.P = At;
+            for (const FTag& M : Tags)
+            {
+                /* The encoder writes a member's tag with index 0 and no guids: anything else changes the struct's bytes. */
+                if (M.ArrayIndex) { Why = "a struct member of a C array (the encoder writes each at index 0)"; return false; }
+                if (M.HasPropertyGuid) { Why = "a struct member with a property guid"; return false; }
+                if (std::any_of(std::begin(M.StructGuid), std::end(M.StructGuid), [](uint32 G) { return G != 0; }))
+                { Why = "a struct member of a struct with a guid (a user-defined struct)"; return false; }
+                std::string W;
+                if (!ReadTagValue(P, M, Members->emplace_back(), &W)) { Why = W; return false; }
+            }
+        }
+        D.K = FDefaultValue::Struct;
+        D.Members = std::move(Members);
+    }
+    else if (Ty == "ArrayProperty")
+    {
+        const int32 Count = R.I32();
+        FPropertyDef& In = *T.Inner;
+        if (In.Type == "StructProperty")
+        {
+            /* The inner tag: the array's name, StructProperty, the elements' bytes, index 0, the struct and its guid. */
+            const std::string Name = P.NameOf(R.Name()), Type = P.NameOf(R.Name());
+            R.I32();
+            const int32 Index = R.I32();
+            In.StructName = P.NameOf(R.Name());
+            uint32 Guid[4];
+            R.Guid(Guid);
+            if (R.Get<uint8>() || Index || Name != T.Name || Type != "StructProperty")
+            { Why = "an array's inner tag in a form the encoder does not write"; return false; }
+            if (Guid[0] | Guid[1] | Guid[2] | Guid[3]) { Why = "an array of a struct with a guid (a user-defined struct)"; return false; }
+        }
+        else if (In.Type == "ByteProperty")                         // plain bytes, or an enum's names: the size says which
+        {
+            const size_t Left = R.B.size() - std::min(R.P, R.B.size());
+            if (Count >= 0 && Left == size_t(Count)) In.StructName.clear();
+            else if (Count >= 0 && Left == size_t(Count) * 8) In.StructName = "?";
+            else { Why = "a byte array that is neither plain bytes nor names"; return false; }
+        }
+        if (Count < 0 || R.bBad) { Why = "an array count past its value"; return false; }
+        for (int32 I = 0; I < Count; ++I)
+            if (!ReadValueOf(P, R, In, D.Items.emplace_back(), Why)) return false;
+        D.K = FDefaultValue::Array;
+    }
+    else if (Ty == "SetProperty" || Ty == "MapProperty")
+    {
+        const bool bMap = Ty == "MapProperty";
+        const std::string What = bMap ? "map" : "set";
+        FPropertyDef* Sides[2] = { T.Inner.get(), bMap ? T.Value.get() : nullptr };
+        /* No tag names a set's or a map's struct: one is read as a tag list, which an unnamed struct is written as. */
+        if (R.I32() != 0) { Why = "a " + What + " with removed elements"; return false; }
+        const int32 Count = R.I32();
+        if (Count < 0 || R.bBad) { Why = "a " + What + " count past its value"; return false; }
+        /* Nor whether a byte side is an enum's names (8 bytes each) or plain bytes: the bytes left say, when the other
+           side is of a fixed size. */
+        FPropertyDef* Byte = nullptr;
+        int32 Bytes = 0, Rest = 0;                  // the byte sides; the other side's fixed size, or -1
+        for (FPropertyDef* S : Sides)
+        {
+            if (!S) continue;
+            if (S->Type == "ByteProperty") { Byte = S; ++Bytes; }
+            else Rest = FixedValueSize(*S) ? Rest + FixedValueSize(*S) : -1;
+        }
+        if (Bytes && Count)
+        {
+            const size_t Left = R.B.size() - R.P;
+            if (Bytes > 1 || Rest < 0) { Why = "a " + What + " of bytes (no tag says whether they are an enum's)"; return false; }
+            if (Left == size_t(Count) * (Rest + 1)) Byte->StructName.clear();
+            else if (Left == size_t(Count) * (Rest + 8)) Byte->StructName = "?";
+            else { Why = "a " + What + " of bytes that are neither plain bytes nor names"; return false; }
+        }
+        for (int32 I = 0; I < Count; ++I)
+            for (FPropertyDef* S : Sides)
+                if (S && !ReadValueOf(P, R, *S, D.Items.emplace_back(), Why)) return false;
+        D.K = FDefaultValue::Array;
+    }
+    else { Why = "a " + Ty + " value, which the encoder has no case for"; return false; }
+    if (R.bBad) { Why = "a " + (Ty == "StructProperty" ? T.StructName : Ty) + " value that runs past its tag"; return false; }
+    return true;
+}
+}   // namespace
+
+bool ReadTagValue(const FCookedPackage& P, const FTag& Tag, FPropertyDef& Out, std::string* Why)
+{
+    Out = FPropertyDef{};
+    Out.Name = P.NameOf(Tag.Name);
+    Out.Type = P.NameOf(Tag.Type);
+    const std::string& Ty = Out.Type;
+    if (Ty == "StructProperty") Out.StructName = P.NameOf(Tag.StructName);
+    else if (Ty == "ByteProperty" || Ty == "EnumProperty")
+    {
+        Out.StructName = P.NameOf(Tag.EnumName);
+        if (Out.StructName == "None") Out.StructName.clear();
+    }
+    else if (Ty == "ArrayProperty" || Ty == "SetProperty" || Ty == "MapProperty")
+    {
+        Out.Inner = std::make_shared<FPropertyDef>();
+        Out.Inner->Type = Out.StructName = P.NameOf(Tag.InnerType);
+        if (Ty == "MapProperty")
+        {
+            Out.Value = std::make_shared<FPropertyDef>();
+            Out.Value->Type = P.NameOf(Tag.ValueType);
+            Out.StructName += "," + Out.Value->Type;
+        }
+    }
+    if (Ty == "BoolProperty")
+    {
+        Out.Default.K = FDefaultValue::Bool;
+        Out.Default.I = Tag.BoolVal;
+        if (Tag.Value.empty() && Tag.BoolVal <= 1) return true;
+        *Why = "a bool tag with a value, or other than 0 or 1";
+        return false;
+    }
+    FReader R(Tag.Value);
+    std::string W;
+    if (!ReadValueOf(P, R, Out, Out.Default, W)) { *Why = W; return false; }
+    if (R.P != Tag.Value.size())
+    {
+        *Why = Ty != "StructProperty" ? "a " + Ty + " value shorter than its tag"
+             : "a " + Out.StructName + " of " + std::to_string(Tag.Value.size()) + " bytes, not the " + std::to_string(R.P)
+               + " the encoder writes";
+        return false;
+    }
+    return true;
+}
+
 int RoundTrip(const std::string& Dir)
 {
     size_t Packages = 0, Identical = 0, NamesTotal = 0, HashMismatch = 0, Unsorted = 0, ExportsTotal = 0, Tagged = 0;
@@ -898,6 +1125,15 @@ int RoundTrip(const std::string& Dir)
     size_t Functions = 0, FunctionsRead = 0, Classes = 0, ClassesRead = 0;
     std::string FirstUnread, FirstUnreadClass;                          // the first function / class the readers refused
     std::vector<std::string> Differ;
+    /* The value gate: each tag's value read into the model (ReadTagValue) and written again by WriteDefaultTag. */
+    size_t ValuesSame = 0;
+    std::map<std::string, std::pair<size_t, std::string>> ValuesUnread, HeaderGaps;   // reason -> count, first tag
+    std::map<std::string, size_t> DifferTypes;
+    std::vector<std::string> ValueDiffers;
+    auto Note = [](std::map<std::string, std::pair<size_t, std::string>>& Map, const std::string& Key, const std::string& Where) {
+        auto& Slot = Map[Key];
+        if (!Slot.first++) Slot.second = Where;
+    };
     std::error_code Ec;
     for (auto It = std::filesystem::recursive_directory_iterator(std::filesystem::u8path(Dir), Ec);
          !Ec && It != std::filesystem::recursive_directory_iterator(); It.increment(Ec))
@@ -930,6 +1166,12 @@ int RoundTrip(const std::string& Dir)
         Unsorted += !std::is_sorted(P.Names.begin(), P.Names.end(),
                                     [](const FCookedName& A, const FCookedName& B) { return Lower(A.Text) < Lower(B.Text); });
 
+        /* The encoder writes against this package's own name table, as an edit does. */
+        FPackage Sink(Shown);
+        std::vector<std::string> Texts;
+        for (const FCookedName& N : P.Names) Texts.push_back(N.Text);
+        Sink.SeedNames(Texts);
+
         /* Each export's tag list goes through ReadTags / WriteTags; what follows its None stays as it was. */
         for (FCookedExport& E : P.Exports)
         {
@@ -953,7 +1195,44 @@ int RoundTrip(const std::string& Dir)
             std::vector<FTag> Tags;
             if (!ReadTags(P, E.Payload, At, Tags)) { ++Untagged[P.ClassNameOf(E.Class)]; continue; }
             ++Tagged;
-            for (const FTag& Tag : Tags) ++TagTypes[P.NameOf(Tag.Type)];
+            for (const FTag& Tag : Tags)
+            {
+                const std::string Type = P.NameOf(Tag.Type), Where = Shown + ":" + P.NameOf(E.ObjectName) + "." + P.NameOf(Tag.Name);
+                ++TagTypes[Type];
+                FPropertyDef Def;
+                std::string Why;
+                if (!ReadTagValue(P, Tag, Def, &Why)) { Note(ValuesUnread, Why, Where); continue; }
+                FArc Ar(&Sink);
+                WriteDefaultTag(Ar, Def);
+                TagEnd(Ar);
+                size_t Back = 0;
+                std::vector<FTag> Written;
+                std::vector<uint8> Cooked, Encoded;
+                WriteTags(P, { Tag }, Cooked);
+                const bool bRead = Sink.NameTable().size() == P.Names.size() && ReadTags(P, Ar.B, Back, Written) && Written.size() == 1;
+                if (Sink.NameTable().size() != P.Names.size()) Sink.SeedNames(Texts);     // the next tag starts clean
+                if (bRead && Ar.B == Cooked) { ++ValuesSame; continue; }
+                if (bRead && Written[0].Value == Tag.Value)
+                {
+                    const auto Zero = [](const uint32 (&G)[4]) { return !(G[0] | G[1] | G[2] | G[3]); };
+                    Note(HeaderGaps, Tag.ArrayIndex ? "an element of a C array (the encoder writes index 0)"
+                                     : !Zero(Tag.StructGuid) ? "a struct with a guid (a user-defined struct; the encoder writes none)"
+                                     : Tag.HasPropertyGuid ? "a property guid (the encoder writes none)"
+                                     : "a name spelled with another case", Where);
+                    continue;
+                }
+                ++DifferTypes[Type];
+                if (ValueDiffers.size() < 24)
+                {
+                    size_t At = 0;
+                    const std::vector<uint8>& Mine = bRead ? Written[0].Value : Ar.B;
+                    while (At < Mine.size() && At < Tag.Value.size() && Mine[At] == Tag.Value[At]) ++At;
+                    char Tail[96];
+                    snprintf(Tail, sizeof Tail, " (%s: %s at 0x%zx, sizes %zu vs %zu)", Type.c_str(),
+                             bRead ? "its value differs" : "a name the table lacks", At, Mine.size(), Tag.Value.size());
+                    ValueDiffers.push_back(Where + Tail);
+                }
+            }
             std::vector<uint8> Again;
             WriteTags(P, Tags, Again);
             Again.insert(Again.end(), E.Payload.begin() + std::ptrdiff_t(At), E.Payload.end());
@@ -993,11 +1272,24 @@ int RoundTrip(const std::string& Dir)
     printf("  tagged properties read and written back on %zu of %zu exports; no tag list: %s\n", Tagged, ExportsTotal,
            Untagged.empty() ? "none" : Top(Untagged, 12).c_str());
     printf("  tag types: %s\n", Top(TagTypes, 40).c_str());
+    size_t Unread = 0, Gaps = 0, Differs = 0;
+    for (const auto& R : ValuesUnread) Unread += R.second.first;
+    for (const auto& R : HeaderGaps) Gaps += R.second.first;
+    for (const auto& D : DifferTypes) Differs += D.second;
+    printf("  tag values the encoder writes back as cooked: %zu; the value only, not its tag: %zu; differ: %zu; not read into "
+           "the model: %zu\n", ValuesSame, Gaps, Differs, Unread);
+    for (const auto& [Why, Slot] : HeaderGaps) printf("    tag differs x%zu: %s  (first: %s)\n", Slot.first, Why.c_str(), Slot.second.c_str());
+    if (Differs) printf("    differ by type: %s\n", Top(DifferTypes, 20).c_str());
+    for (const std::string& D : ValueDiffers) printf("    differs: %s\n", D.c_str());
+    std::vector<std::pair<size_t, std::string>> Reasons;
+    for (const auto& [Why, Slot] : ValuesUnread) Reasons.emplace_back(Slot.first, Why + "  (first: " + Slot.second + ")");
+    std::sort(Reasons.rbegin(), Reasons.rend());
+    for (const auto& [Count, Why] : Reasons) printf("    unread x%zu: %s\n", Count, Why.c_str());
     printf("  functions whose payload reads exactly (ReadFunctionLayout): %zu of %zu%s%s\n", FunctionsRead, Functions,
            FirstUnread.empty() ? "" : "; first unread: ", FirstUnread.c_str());
     printf("  classes whose payload reads exactly (ReadClassLayout): %zu of %zu%s%s\n", ClassesRead, Classes,
            FirstUnreadClass.empty() ? "" : "; first unread: ", FirstUnreadClass.c_str());
-    return Packages && Identical == Packages ? 0 : 1;
+    return Packages && Identical == Packages && !Differs ? 0 : 1;
 }
 
 }   // namespace Uasset
