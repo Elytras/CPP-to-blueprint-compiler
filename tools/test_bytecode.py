@@ -2261,6 +2261,37 @@ def game_edits():
           'function replaced around the game\'s body, kept; the rest the cook\'s bytes')
 
 
+def edit_staleness():
+    """bpbuild counts a game package a mod's compile edited among its outputs: found in the staged Content tree outside
+    the mod's own folder, with a copy in game_content (an embedded dep's folder has none). A newer game copy, from a
+    re-extract after a game update, restales the mod, so an edit of the old package does not ship."""
+    import tempfile
+    sys.path.insert(0, HERE)
+    import bpbuild
+    with tempfile.TemporaryDirectory() as tmp:
+        stage_fsd = os.path.join(tmp, 'build', 'Mod', 'FSD')
+        own = os.path.join(stage_fsd, 'Content', '_ElytrasMods', 'Mod')
+        game = os.path.join(tmp, 'game')
+        def touch(p, t=None):
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            open(p, 'wb').close()
+            if t: os.utime(p, (t, t))
+        touch(os.path.join(own, 'Mod.uasset'))
+        touch(os.path.join(own + 'Two', 'Other.uasset'))                       # shares the prefix, not the folder
+        touch(os.path.join(stage_fsd, 'Content', '_ElytrasMods', 'Dep', 'Dep.uasset'))
+        touch(os.path.join(stage_fsd, 'Content', 'Enemies', 'Grunt', 'G.uasset'), 1000)
+        touch(os.path.join(game, 'Enemies', 'Grunt', 'G.uasset'), 500)
+        touch(os.path.join(game, '_ElytrasMods', 'ModTwo', 'Other.uasset'), 500)
+        edits = lambda: bpbuild.staged_edits(stage_fsd, own, game)
+        assert sorted(os.path.basename(s) for s, _g in edits()) == ['G.uasset', 'Other.uasset'], edits()
+        assert bpbuild.staged_edits(stage_fsd, own, None) == []
+        newer = lambda: any(os.path.getmtime(g) > os.path.getmtime(s) for s, g in edits())
+        assert not newer()
+        os.utime(os.path.join(game, 'Enemies', 'Grunt', 'G.uasset'), (2000, 2000))
+        assert newer()
+    print('ok  bpbuild: an edited game package is a mod\'s output, restaled by a newer game copy; an embedded dep is not one')
+
+
 interfaces()
 interface_bodies()
 interface_calls()
@@ -2275,6 +2306,7 @@ asset_elsewhere()
 globals_()
 edits()
 game_edits()
+edit_staleness()
 
 
 # ---- ReplTest, LatentTest, AsyncTest, SpawnTest

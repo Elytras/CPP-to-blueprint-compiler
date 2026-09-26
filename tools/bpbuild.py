@@ -159,6 +159,28 @@ def staged_assets(stage_content):
             if f.endswith(".uasset") or f.endswith(".uexp")]
 
 
+def staged_edits(stage_fsd, stage_content, game_dir):
+    """The game's packages a mod's compile edited, each as (its staged copy, the game's own): every cooked file in the
+    staged Content tree, outside the mod's own folder, that game_content holds too. An embedded dep's folder is no
+    game package, so it is not one."""
+    if not game_dir:
+        return []
+    content = os.path.join(stage_fsd, "Content")
+    own = os.path.normcase(os.path.abspath(stage_content))
+    out = []
+    for root, _dirs, files in os.walk(content):
+        here = os.path.normcase(os.path.abspath(root))
+        if here == own or here.startswith(own + os.sep):
+            continue
+        for f in files:
+            if f.endswith((".uasset", ".uexp", ".umap")):
+                staged = os.path.join(root, f)
+                game = os.path.join(game_dir, os.path.relpath(staged, content))
+                if os.path.exists(game):
+                    out.append((staged, game))
+    return out
+
+
 def run_unrealpak(fsd_dir, pak_path):
     if not os.path.exists(UNREALPAK):
         print("  UnrealPak not found at %s - skipping the pak." % UNREALPAK)
@@ -314,8 +336,13 @@ def main():
         api_content = api_contents[0] if api_contents else None
         api_missing = any(not staged_assets(d) for d in api_contents)
 
-        stale = (force or not assets or api_missing
-                 or max(newest(sources), toolchain_time) > oldest(assets))
+        # An edit's output is the game's package, edited: it is stale when the game's copy is newer (a re-extract
+        # after a game update), or an edit of the old package would ship over the new one.
+        edits = staged_edits(stage_fsd, stage_content, game_dir)
+        outputs = assets + [s for s, _g in edits]
+        stale = (force or not outputs or api_missing
+                 or max(newest(sources), toolchain_time) > oldest(outputs)
+                 or any(os.path.getmtime(g) > os.path.getmtime(s) for s, g in edits))
         if stale:
             # The pak takes the whole FSD tree, so the whole Content tree goes, not just this package's folder:
             # an asset the sources no longer cook (a struct another mod now owns), a folder left by an earlier
@@ -374,7 +401,7 @@ def main():
         embed = bool(mod.get("embed"))
         dep_stages = [dep_stage(d, by_name, bp) for d in transitive_needs(name, by_name)] if embed else []
         dep_assets = [f for content, _p, _f in dep_stages for f in staged_assets(content)]
-        assets = staged_assets(stage_content)
+        assets = staged_assets(stage_content) + [s for s, _g in staged_edits(stage_fsd, stage_content, game_dir)]
         pak = os.path.join(bp, "out", name + "_P.pak")
         # A dep's assets are baked into this pak, so a change to one restales it; likewise our own
         # assets after a --no-pak run. Judged on our sources alone the old pak would ship, and a mod
