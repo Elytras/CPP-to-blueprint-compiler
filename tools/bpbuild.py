@@ -274,6 +274,11 @@ def main():
         print("mods.yaml lists no mods.")
         return 0
 
+    # UE_ASSET_EDIT / UE_PATCH start from the game's own packages: the /Game folder of the extracted game pak.
+    # ponytail: a mod's staleness does not see this tree (300k files); after re-extracting an updated game, --force.
+    game = config.get("game_content")
+    game_dir = os.path.abspath(os.path.join(bp, os.path.expandvars(game))) if game else None
+
     api_headers = [os.path.join(ue_api, f) for f in os.listdir(ue_api)] if os.path.isdir(ue_api) else []
     toolchain_time = max(newest(api_headers), newest([assetgen]))
 
@@ -338,6 +343,8 @@ def main():
                 cmd = [assetgen, "compile", source, ue_api, stage_content]
                 if api_content:
                     cmd += ["--api", api_content]
+                if game_dir:
+                    cmd += ["--game", game_dir]
                 proc = subprocess.run(cmd)
                 if proc.returncode != 0:
                     ok = False
