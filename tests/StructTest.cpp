@@ -79,6 +79,9 @@ public:
   int32 MapFindIntoCopy(int32 K) { int32 T = K; Scores.Find(1, T); return K; }
   int32 ArrayAppendCopy(int32 K) { TArray<int32> T = Counts; Counts.Append(T); return Counts.Num() + K; }
   int32 SetUnionCopy(int32 K) { TSet<int32> T = Seen; Fresh.Union(T, Seen); return Seen.Num() + K; }
+  /* Append reads its source where it lies (execArray_Append steps it into no buffer), so a computed one gets a local. */
+  TArray<int32> Twice() { TArray<int32> T = Counts; T.Append(Counts); return T; }
+  int32 AppendComputed(int32 K) { Counts.Append(Twice()); return Counts.Num() + K; }
   int32 RangeCopyToRef(int32 K) {
     for (FStats S : Many) SetKills(K, S);
     return Many[0].Kills;

@@ -1,6 +1,8 @@
 ﻿#include "Cpp.h"
 
 #include <algorithm>
+#include <array>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -10,6 +12,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 #ifdef _WIN32
@@ -362,6 +365,7 @@ struct FRecord
     std::map<std::string, const Json*> Inlines;     // decl id (in-class or out-of-line) -> an inline method's
                                                     // definition: by id, as Methods keeps one overload per name
     std::vector<const Json*> Fields;
+    std::vector<const Json*> Ctors;                 // CXXConstructorDecls: their parameter names place a value's arguments
     std::vector<std::string> Interfaces;            // every base after the first
     std::map<std::string, std::string> Replicated;  // UE_REPLICATED*: variable -> "Notify:Condition"
     std::set<std::string> Components;               // UE_COMPONENT: variables that are also SCS nodes
@@ -430,6 +434,7 @@ struct FConv
     std::string From, To;
     std::string Package, Class, Fn;
     std::vector<Json> Extra;
+    std::vector<size_t> Refs;       // the const reference parameters, which the native reads by address: see HoistCallArgs
 };
 
 /* One row of UeApi/Ops.json: the Kismet function behind `Lhs <op> Rhs`. */
@@ -438,6 +443,7 @@ struct FOpInfo
     std::string Op, Lhs, Rhs, Ret;
     std::string Package, Class, Fn;
     std::vector<Json> Extra;
+    std::vector<size_t> Refs;
 };
 
 /* UeApi/Types.json: what a native enum or ScriptStruct is called in its package, and its layout. */
@@ -485,6 +491,14 @@ std::vector<Json> ExtraArgs(const Json& Row)
     return Out;
 }
 
+std::vector<size_t> RefArgs(const Json& Row)
+{
+    std::vector<size_t> Out;
+    auto It = Row.find("refs");
+    if (It != Row.end()) for (const Json& E : *It) Out.push_back(E.get<size_t>());
+    return Out;
+}
+
 FArgIR ConstArg(const Json& E)
 {
     FArgIR X;
@@ -512,7 +526,8 @@ struct FCallIR
     FIndex Context;                     // CDO a static call runs against; null = self
     bool bPure = false;                 // a function of its arguments (UE_PURE, a Kismet operator or conversion): see DropUnusedPure
     uint64 WrittenArgs = ~uint64(0);    // bit I: argument I must stay its own variable, which the callee may write: see ContainerWrites
-    std::vector<std::string> RefParms;  // a script callee's: per argument, the type of the reference parameter it binds, else "": see HoistCallArgs
+    std::vector<std::string> RefParms;  // per argument, the type of the reference parameter it binds, else "": see HoistCallArgs
+    bool bRefsTakeConst = false;        // a native's P_GET_PROPERTY_REF: a constant there goes through the thunk's own buffer
     std::string VirtualName;            // a generated class's own instance method: EX_VirtualFunction resolves it by name at run time
     bool bLocalVirtual = false;         // ... as EX_LocalVirtualFunction: a script function that is no RPC
     std::string View;                   // __RefAtInline__: the TArray field of the view struct in Extra
@@ -1119,6 +1134,8 @@ private:
     /* `X::StaticClass()`: the record X names, read back from the mod's sources (clang's JSON keeps no qualifier). */
     const FRecord* NamedQualifier(const Json& Ref) const;
     bool IsSubclassOf(const FRecord& Child, const FRecord& Parent) const;
+    std::vector<uint8> NativeTail(const FRecord* Component) const;
+    std::vector<const Json*> StructArgs(const Json& Value, const FRecord* R, const std::vector<std::string>& Fields) const;
     mutable std::vector<std::string> SourceTexts;                       // the mod directory's .h/.cpp, read on demand
 
     /* The native UFunction Method overrides, or null; InheritedFlags gets the flags it passes on, also
@@ -1864,6 +1881,8 @@ bool FCompiler::Collect(std::string* Err)
                 R.MethodAccess[Name(C)] = Access;
                 if (C.value("inline", false)) R.Inlines[C.value("id", std::string())] = &C;
             }
+            else if (Kind(C) == "CXXConstructorDecl")
+                R.Ctors.push_back(&C);
             else if (Kind(C) == "FieldDecl" && C.contains("name"))
             {
                 R.Fields.push_back(&C);
@@ -2159,6 +2178,13 @@ void FCompiler::ApplyConv(const FConv& C, FBlueprintClass& BP, FArgIR& Arg)
 {
     WrapInCall(Arg, BP.EngineFunction(C.Package, C.Class, C.Fn));
     for (const Json& E : C.Extra) Arg.Sub->Args.push_back(ConstArg(E));
+    for (const size_t At : C.Refs)
+        if (At < Arg.Sub->Args.size())
+        {
+            Arg.Sub->RefParms.resize(Arg.Sub->Args.size());
+            Arg.Sub->RefParms[At] = At == 0 ? C.From : Arg.Sub->Args[At].InnerType;
+        }
+    Arg.Sub->bRefsTakeConst = true;
     Arg.InnerType = C.To;
 }
 
@@ -2374,8 +2400,9 @@ bool FCompiler::LowerStructLiteral(const Json& CtorNode, const FStructInfo& SI, 
                                    FArgIR& Out, std::string* Err)
 {
     const std::string T = StripTypeKeywords(TypeOf(CtorNode));
-    std::vector<const Json*> Args;
-    ForEach(CtorNode, [&](const Json& C) { Args.push_back(&C); });
+    std::vector<std::string> Names;
+    for (const auto& F : SI.Fields) Names.push_back(F.second);
+    const std::vector<const Json*> Args = StructArgs(CtorNode, Find(T), Names);
     /* EX_StructConst cannot say a field it cannot write, so `T()` of such a struct is a Make Struct with nothing set. */
     if (!SI.bComplete && Args.empty()) return LowerMakeStruct(T, nullptr, BP, Out, Err);
     if (!SI.bComplete) { *Err = T + " has fields AssetGen cannot write, so it takes no whole-struct literal: `" + T + " V = { .Field = value };`"; return false; }
@@ -2574,6 +2601,20 @@ bool FCompiler::LowerDispatcherCall(const Json& Call, const Json& Callee, const 
         C.Args.emplace_back();
         if (!LowerArg(*A, BP, C.Args.back(), Err)) return false;
     }
+    /* A reference parameter of the signature is an out parm, which execCallMulticastDelegate steps with a null result
+       pointer and copies from the address the argument left: HoistCallArgs gives anything but a variable a local. */
+    if (auto M = Cur->Methods.find(Name(Obj) + "__DelegateSignature"); M != Cur->Methods.end())
+    {
+        C.RefParms.emplace_back();
+        ForEach(*M->second, [&](const Json& P) {
+            if (Kind(P) != "ParmVarDecl") return;
+            std::string T = TypeOf(P);
+            const bool bRef = !T.empty() && T.back() == '&';
+            while (!T.empty() && (T.back() == '&' || T.back() == ' ')) T.pop_back();
+            C.RefParms.push_back(bRef ? StripTypeKeywords(T) : std::string());
+        });
+        if (C.RefParms.size() != C.Args.size()) C.RefParms.clear();
+    }
     return true;
 }
 
@@ -2725,6 +2766,22 @@ bool IsStored(const FArgIR& A)
 {
     return A.K == FArgIR::Local || A.K == FArgIR::LocalOut || A.K == FArgIR::Field || A.K == FArgIR::Member
         || A.K == FArgIR::Index || (A.K == FArgIR::Call && A.Sub && A.Sub->Intrinsic == "__RefAtInline__");
+}
+
+/* An operand whose opcode writes its value and steps nothing that could leave Stack.MostRecentPropertyAddress. */
+bool IsVmConstant(const FArgIR& A)
+{
+    switch (A.K)
+    {
+    case FArgIR::Self: case FArgIR::Int: case FArgIR::Int64: case FArgIR::Float: case FArgIR::Bool: case FArgIR::Byte:
+    case FArgIR::Str: case FArgIR::Name: case FArgIR::Text: case FArgIR::NullObj: case FArgIR::ObjConst:
+    case FArgIR::SoftPath: case FArgIR::Delegate:
+        return true;
+    case FArgIR::StructLit:     // execStructConst steps each member into the struct: constants only
+        return A.Sub && std::all_of(A.Sub->Args.begin(), A.Sub->Args.end(), [](const FArgIR& M) { return IsVmConstant(M); });
+    default:
+        return false;
+    }
 }
 
 bool FCompiler::IsRawPointer(std::string T) const
@@ -3307,6 +3364,7 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             Out.Sub->WrittenArgs = ContainerWrites(Prefix + Method);
             Out.Sub->bOnArg0 = true;
             Out.Sub->Args.push_back(Target);
+            Out.Sub->RefParms.emplace_back();
             bool bFirst = true, bOk = true;
             std::string LastType;
             ForEach(*N, [&](const Json& A) {
@@ -3316,6 +3374,12 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
                 bOk = LowerArg(A, BP, V, Err);
                 if (bOk) Out.Sub->Args.push_back(V);
                 LastType = TypeOf(A);
+                /* A container argument (Append's source, Union's sets) is stepped with no result buffer and read where
+                   it lies (execArray_Append), so one a call computes needs a local; an item goes into the thunk's own
+                   storage (StepCompiledIn<FProperty>(StorageSpace)), whatever evaluates it. */
+                std::string T = LastType;
+                while (!T.empty() && (T.back() == '&' || T.back() == ' ')) T.pop_back();
+                Out.Sub->RefParms.push_back(IsContainerType(T) ? StripTypeKeywords(T) : std::string());
             });
             if (bOk && Out.Sub->Args.size() == 3 && ((Prefix == "Map_" && Method == "Find") || (Prefix == "Array_" && Method == "Get")))
             {
@@ -3487,6 +3551,10 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
                     Out.Sub->Args.push_back(A);
                 }
                 for (const Json& E : O->Extra) Out.Sub->Args.push_back(ConstArg(E));
+                Out.Sub->RefParms.resize(Out.Sub->Args.size());
+                for (const size_t At : O->Refs)
+                    if (At < 2) Out.Sub->RefParms[At] = At == 0 ? O->Lhs : O->Rhs;
+                Out.Sub->bRefsTakeConst = true;
                 Out.InnerType = O->Ret;
                 return true;
             }
@@ -3939,6 +4007,37 @@ bool FCompiler::IsSubclassOf(const FRecord& Child, const FRecord& Parent) const
     return false;
 }
 
+/* What a component class's native Serialize reads after UObject's part, for an archetype with no instance data: each
+   class of the chain reads its own after its parent's. Every engine component Serialize override was read in the 4.27
+   source (2026-09-26); these are the ones that read anything from an unversioned cooked package:
+   - UStaticMeshComponent: `Ar << LODData`, an empty array's int32 count. Without it CompTest's Mesh read the next
+     export as LODData and failed to load with a fatal error (DRG, 2026-09-25).
+   - UInstancedStaticMeshComponent: bCooked, then PerInstanceSMData and PerInstanceSMCustomData as BulkSerialize
+     writes them (element size, count: 64 per FMatrix, 4 per float), then, cooked, a uint64 RenderDataSizeBytes the
+     cooker leaves 0 on an archetype. The one ISM archetype in DRG's pak ends in exactly these 32 bytes, LODData first.
+   - UHierarchicalInstancedStaticMeshComponent: its ClusterTree, BulkSerialize again (64 per FClusterNode).
+   - USkyAtmosphereComponent: bStaticLightingBuiltGUID, an FGuid.
+   - UAtmosphericFogComponent: three empty bulk-data headers (flags, count, size on disk, offset), then CounterVal.
+   Too little or too much is fatal alike: the loader checks each export's size ("Serial size mismatch"). */
+std::vector<uint8> FCompiler::NativeTail(const FRecord* Component) const
+{
+    std::vector<const FRecord*> Chain;
+    for (const FRecord* A = Component; A; A = A->Base.empty() ? nullptr : Find(A->Base)) Chain.insert(Chain.begin(), A);
+    std::vector<uint8> Tail;
+    auto I32 = [&](std::initializer_list<int32> Vs) {
+        for (int32 V : Vs) for (int32 Shift = 0; Shift < 32; Shift += 8) Tail.push_back(uint8(V >> Shift));
+    };
+    for (const FRecord* A : Chain)
+    {
+        if (A->UeName == "StaticMeshComponent") I32({ 0 });
+        else if (A->UeName == "InstancedStaticMeshComponent") I32({ 1, 64, 0, 4, 0, 0, 0 });
+        else if (A->UeName == "HierarchicalInstancedStaticMeshComponent") I32({ 64, 0 });
+        else if (A->UeName == "SkyAtmosphereComponent") Tail.resize(Tail.size() + 16);
+        else if (A->UeName == "AtmosphericFogComponent") Tail.resize(Tail.size() + 3 * 20 + 4);
+    }
+    return Tail;
+}
+
 /* The qualifier token is where a qualified DeclRefExpr's range begins; the JSON gives its byte offset and length but
    not its file (that is only written when it changes, and Json's sorted keys lose the order). So each of the mod's own
    sources is tried at that offset, and a hit counts only when `<Record>::StaticClass` is what is written there.
@@ -4274,16 +4373,43 @@ bool FCompiler::LowerCopyBack(const Json& Call, const std::vector<std::pair<cons
 }
 
 /* What a defaulted argument stands for. clang 18 writes the CXXDefaultArgExpr with no child, and the default is the
-   parameter's own initialiser (instantiated, in a template's instantiation); a newer clang nests it in the node. */
+   parameter's own initialiser (instantiated, in a template's instantiation); a newer clang nests it in the node.
+   Either way the answer is the default itself, so a caller sees the same node from both. */
 const Json* DefaultedArg(const Json& Arg, const Json* Parm)
 {
-    if (Kind(Arg) != "CXXDefaultArgExpr" || First(Arg) || !Parm) return &Arg;
+    if (Kind(Arg) != "CXXDefaultArgExpr") return &Arg;
+    if (const Json* Nested = First(Arg)) return Nested;
+    if (!Parm) return &Arg;
     const Json* Init = nullptr;
     ForEach(*Parm, [&](const Json& C) {
         const std::string K = Kind(C);
         if (!Init && (K.size() < 4 || K.compare(K.size() - 4, 4, "Attr") != 0)) Init = &C;
     });
     return Init ? Init : &Arg;
+}
+
+/* A struct value's arguments in the order of `Fields`. A constructor call puts each argument on the member its parameter
+   is named after, a defaulted one being that parameter's default: the stub may take them in the engine's C++ order
+   (`FColor(R, G, B, A = 255)`) while the members keep the reflected one (B, G, R, A). Braces, and a constructor whose
+   parameters do not all name members, go by position. */
+std::vector<const Json*> FCompiler::StructArgs(const Json& Value, const FRecord* R, const std::vector<std::string>& Fields) const
+{
+    std::vector<const Json*> Args;
+    ForEach(Value, [&](const Json& A) { Args.push_back(&A); });
+    const Json* Ctor = nullptr;
+    if (R && Kind(Value) != "InitListExpr")
+        for (const Json* C : R->Ctors) if (!Args.empty() && ParmNames(*C).size() == Args.size()) Ctor = C;
+    if (!Ctor || Args.size() != Fields.size()) return Args;
+    std::vector<const Json*> Parms;
+    ForEach(*Ctor, [&](const Json& C) { if (Kind(C) == "ParmVarDecl") Parms.push_back(&C); });
+    std::vector<const Json*> Out(Fields.size(), nullptr);
+    for (size_t I = 0; I < Args.size(); ++I)
+    {
+        const auto At = std::find(Fields.begin(), Fields.end(), Name(*Parms[I]));
+        if (At == Fields.end() || Out[size_t(At - Fields.begin())]) return Args;
+        Out[size_t(At - Fields.begin())] = DefaultedArg(*Args[I], Parms[I]);
+    }
+    return Out;
 }
 
 bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR& Out, std::string* Err)
@@ -4527,10 +4653,15 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         else if (I < Defaulted.size() && Defaulted[I]) Out.Args[I] = Wco;
         break;
     }
-    /* A reference parameter, const or not, is CPF_OutParm, and a script callee steps its argument with no result
-       buffer to take the address (ProcessScriptFunction): HoistCallArgs gives an rvalue there a local to live in. */
-    if (Out.bScript && !Hidden && Out.Args.size() == Parms.size())
-    {
+    /* A reference parameter, const or not, is CPF_OutParm. A script callee steps its argument with no result buffer to
+       take the address (ProcessScriptFunction), and a native reads it through Stack.MostRecentPropertyAddress whenever
+       the argument left one (P_GET_PROPERTY_REF), which a nested call does - the address of whatever ITS arguments read
+       last. HoistCallArgs gives such an argument a local to live in. genueapi keeps a native's const reference
+       parameters `const T&` for this (Dumper-7's flags; its spelling alone cannot tell one from a by-value string). */
+    auto FillRefParms = [&] {
+        if (Out.Args.size() != Parms.size()) return;
+        Out.RefParms.clear();
+        Out.bRefsTakeConst = !Out.bScript;
         ForEach(*FullDecl, [&](const Json& C) {
             if (Kind(C) != "ParmVarDecl") return;
             std::string T = TypeOf(C);
@@ -4538,7 +4669,8 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
             while (!T.empty() && (T.back() == '&' || T.back() == ' ')) T.pop_back();
             Out.RefParms.push_back(bRef ? StripTypeKeywords(T) : std::string());
         });
-    }
+    };
+    if (!Hidden) FillRefParms();
     if (Hidden)
     {
         if (!LatentRefusal.empty()) { *Err = "latent call " + MethodName + ": " + LatentRefusal; return false; }
@@ -4578,6 +4710,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         }
         std::sort(Fill.begin(), Fill.end(), [](const auto& A, const auto& B) { return A.first < B.first; });
         for (const auto& [At, Arg] : Fill) Out.Args.insert(Out.Args.begin() + std::min(At, Out.Args.size()), Arg);
+        FillRefParms();
         bMadeLatentCall = true;
 
         if (!ResultLocal.empty())
@@ -5971,22 +6104,27 @@ int32 Mentions(const std::vector<FStmtIR>& Stmts, const std::string& Name)
     return N;
 }
 
-/* C may bind argument I to a reference it writes: a T& parameter, a container method's array or out value. */
-bool MayWriteArg(const FCallIR& C, size_t I)
+/* C may bind argument I to a reference: one it writes (a T& parameter, a container method's array or out value), or
+   one it reads where the argument lies (RefParms), which must stay a variable unless Value, what would go there
+   instead, is a constant a native reads from its own buffer (see HoistCallArgs). */
+bool MayWriteArg(const FCallIR& C, size_t I, const FArgIR* Value = nullptr)
 {
+    if (I < C.RefParms.size() && !C.RefParms[I].empty() && !(Value && C.bRefsTakeConst && IsVmConstant(*Value)))
+        return true;
     return !C.bPure && !IsBranch(C.Intrinsic) && (I >= 64 || (C.WrittenArgs >> I & 1));
 }
 
 /* The read of local Name that runs exactly once whenever A does: not under a branch's later operands, an inline
    body, an object or struct base (which may need a variable), or a call's target. Nor an argument bRefSlot says may
-   be written: the variable is the argument there, and another in its place would take the write. */
-FArgIR* FindPlainRead(FArgIR& A, const std::string& Name, bool bRefSlot = false)
+   be written: the variable is the argument there, and another in its place would take the write. Value: what is to
+   replace the read. */
+FArgIR* FindPlainRead(FArgIR& A, const std::string& Name, const FArgIR* Value, bool bRefSlot = false)
 {
     if (A.K == FArgIR::Local && A.S == Name && !A.Base) return bRefSlot ? nullptr : &A;
     if (A.K != FArgIR::Call || !A.Sub || A.Sub->Inline) return nullptr;
     const size_t Count = IsBranch(A.Sub->Intrinsic) ? std::min<size_t>(1, A.Sub->Args.size()) : A.Sub->Args.size();
     for (size_t I = 0; I < Count; ++I)
-        if (FArgIR* F = FindPlainRead(A.Sub->Args[I], Name, MayWriteArg(*A.Sub, I))) return F;
+        if (FArgIR* F = FindPlainRead(A.Sub->Args[I], Name, Value, MayWriteArg(*A.Sub, I, Value))) return F;
     return nullptr;
 }
 
@@ -6043,20 +6181,21 @@ void FCompiler::ArgumentsInPlace(std::vector<FStmtIR>& Body, const std::vector<s
         const std::vector<FStmtIR> Rest(Body.begin() + K + 1, Body.end());
         if (Mentions(Rest, Name) != 1) return;
 
+        const FArgIR& Arg = Body[K].Value;
         FArgIR* Read = nullptr;
         FArgIR* Scope = nullptr;
         if (First.K == FStmtIR::StaticCall && !First.Target.Target && First.Target.Args.empty())
         {
             for (size_t I = 0; I < First.Call.Args.size() && !Read; ++I)
-                if ((Read = FindPlainRead(First.Call.Args[I], Name, MayWriteArg(First.Call, I)))) Scope = &First.Call.Args[I];
+                if ((Read = FindPlainRead(First.Call.Args[I], Name, &Arg, MayWriteArg(First.Call, I, &Arg))))
+                    Scope = &First.Call.Args[I];
         }
         else if ((First.K == FStmtIR::Assign || First.K == FStmtIR::Decl || First.K == FStmtIR::Return) && !First.Var.Base)
-            Read = FindPlainRead(*(Scope = &First.Value), Name);
+            Read = FindPlainRead(*(Scope = &First.Value), Name, &Arg);
         else if (First.K == FStmtIR::If)
-            Read = FindPlainRead(*(Scope = &First.Cond), Name);
+            Read = FindPlainRead(*(Scope = &First.Cond), Name, &Arg);
         if (!Read) return;
 
-        const FArgIR& Arg = Body[K].Value;
         const bool bActs = CallsImpure(Arg);
         const std::function<bool(const FArgIR&)> Pred = [&](const FArgIR& X) { return bActs ? ReadsNothing(X) : !CallsImpure(X); };
         bool bOk = OffPath(*Scope, Read, Pred);
@@ -6100,20 +6239,21 @@ void FCompiler::ForwardSingleUse(std::vector<FStmtIR>& Stmts, const std::vector<
                 || std::none_of(CurLocals->begin(), CurLocals->end(), [&](const FPropertyDef& L) { return L.Name == Name; })
                 || Mentions(All, Name) != 2 || Mentions(Def.Value, Name) != 0)
                 continue;
+            const FArgIR& E = Def.Value;
             FArgIR* Read = nullptr;
             FArgIR* Scope = nullptr;
             if (Next.K == FStmtIR::StaticCall && !Next.Target.Target && Next.Target.Args.empty())
             {
                 for (size_t I = 0; I < Next.Call.Args.size() && !Read; ++I)
-                    if ((Read = FindPlainRead(Next.Call.Args[I], Name, MayWriteArg(Next.Call, I)))) Scope = &Next.Call.Args[I];
+                    if ((Read = FindPlainRead(Next.Call.Args[I], Name, &E, MayWriteArg(Next.Call, I, &E))))
+                        Scope = &Next.Call.Args[I];
             }
             else if ((Next.K == FStmtIR::Assign || Next.K == FStmtIR::Decl || Next.K == FStmtIR::Return) && !Next.Var.Base)
-                Read = FindPlainRead(*(Scope = &Next.Value), Name);
+                Read = FindPlainRead(*(Scope = &Next.Value), Name, &E);
             else if (Next.K == FStmtIR::If)
-                Read = FindPlainRead(*(Scope = &Next.Cond), Name);
+                Read = FindPlainRead(*(Scope = &Next.Cond), Name, &E);
             if (!Read) continue;
 
-            const FArgIR& E = Def.Value;
             const bool bActs = CallsImpure(E);
             const std::function<bool(const FArgIR&)> Pred = [&](const FArgIR& X) { return bActs ? ReadsNothing(X) : !CallsImpure(X); };
             bool bOk = OffPath(*Scope, Read, Pred);
@@ -7040,11 +7180,15 @@ bool FCompiler::HoistCallArgs(FCallIR& C, FBlueprintClass& BP, std::vector<FProp
         if (!HoistReadsInArg(C.Args[I], BP, Locals, OutPre, Err)) return false;
         if (I == 0 && C.bOnArg0 && !PinHolder(C.Args[0], C.Args.data() + 1, C.Args.size() - 1, BP, Locals, OutPre, Err))
             return false;
-        /* An rvalue bound to a script callee's reference parameter: EX_IntConst and the like would write their value
-           through the null result pointer the VM steps an out parameter with, so it goes into a local first. */
+        /* An rvalue bound to a reference parameter goes into a local first. A script callee (and a container thunk)
+           steps it with a null result pointer, which EX_IntConst and the like would write through; a native's
+           P_GET_PROPERTY_REF reads the address the argument left, and a call or a cast leaves the address of what ITS
+           operands read (execStructMemberContext's rule, one level up). A constant leaves none, so a native reads it
+           from its own buffer: it stays as it is there. */
         // ponytail: the local is made after the object is pinned, so an argument that changes the call's object runs
         // first; PinObject would need to see these hoists to fix that, if a mod ever does it.
-        if (I < C.RefParms.size() && !C.RefParms[I].empty() && !IsStored(C.Args[I]))
+        if (I < C.RefParms.size() && !C.RefParms[I].empty() && !IsStored(C.Args[I])
+            && !(C.bRefsTakeConst && IsVmConstant(C.Args[I])))
         {
             if (C.Args[I].InnerType.empty()) C.Args[I].InnerType = C.RefParms[I];
             if (!HoistOperand(C.Args[I], BP, Locals, OutPre, Err)) return false;
@@ -7549,8 +7693,9 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
     {
         const FRecord* SR = Find(StripTypeKeywords(TypeOf(*Init)));
         if (!SR) { *Err = "unknown struct type in an initializer: " + TypeOf(*Init); return false; }
-        std::vector<const Json*> Args;
-        ForEach(*Init, [&](const Json& A) { if (Kind(A) != "CXXDefaultArgExpr") Args.push_back(&A); });
+        std::vector<std::string> Names;
+        for (const Json* SF : SR->Fields) Names.push_back(Name(*SF));
+        const std::vector<const Json*> Args = StructArgs(*Init, SR, Names);
         if (Args.size() != SR->Fields.size())
         {
             *Err = SR->CppName + " takes one value per member (" + std::to_string(SR->Fields.size())
@@ -8272,6 +8417,116 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         if (!bOk) return false;
     }
 
+    /* The first scene component is the actor's root, and the engine puts it at the spawn transform: it never reads the
+       root's RelativeLocation or RelativeRotation, and reads its RelativeScale3D for a C++ SpawnActor but not for
+       Blueprint's Spawn Actor node (USCS_Node::ExecuteNodeOnActor, bIsDefaultTransform). So a plain SceneComponent root
+       hands its transform to the components attached to it, composed as FTransform::Multiply composes a child with its
+       parent - the rotations multiply (root first), the scales multiply, and a child's offset grows with the root's
+       scale, turns with its rotation and adds its offset - and keeps none of it. A root that draws something itself
+       would need its own, so that is only warned about. ponytail: a negative scale takes FTransform's matrix path
+       and an absolute child ignores its parent; neither is special-cased here. */
+    {
+        auto IsScene = [&](const FRecord* C) {
+            for (; C; C = C->Base.empty() ? nullptr : Find(C->Base)) if (C->UeName == "SceneComponent") return true;
+            return false;
+        };
+        std::vector<std::pair<std::string, const FRecord*>> Scene;     // this class's scene components, the root first
+        for (const Json* F : R.Fields)
+        {
+            const size_t Star = TypeOf(*F).find('*');
+            const FRecord* CR = Star == std::string::npos ? nullptr : Find(StripTypeKeywords(TypeOf(*F).substr(0, Star)));
+            if (R.Components.count(Name(*F)) && IsScene(CR)) Scene.emplace_back(Name(*F), CR);
+        }
+        /* A component's vector default: X, Y, Z (Or each, when it has none), and the def to write another like it. */
+        struct FVec { std::array<double, 3> V; std::optional<FPropertyDef> Def; };
+        auto Read = [](const std::vector<FPropertyDef>& Defs, const char* Prop, double Or) {
+            FVec Out{ { Or, Or, Or }, std::nullopt };
+            for (const FPropertyDef& D : Defs)
+                if (D.Name == Prop) { Out.Def = D; for (int32 I = 0; I < 3; ++I) Out.V[I] = (*D.Members)[I].Default.F; }
+            return Out;
+        };
+        auto Drop = [](std::vector<FPropertyDef>& Defs, const std::string& Prop) {
+            Defs.erase(std::remove_if(Defs.begin(), Defs.end(), [&](const FPropertyDef& D) { return D.Name == Prop; }), Defs.end());
+        };
+        auto Write = [&](std::vector<FPropertyDef>& Defs, FPropertyDef Like, const std::array<double, 3>& V) {
+            Drop(Defs, Like.Name);
+            Like.Members = std::make_shared<std::vector<FPropertyDef>>(*Like.Members);     // its own, not the root's
+            for (int32 I = 0; I < 3; ++I) (*Like.Members)[I].Default.F = V[I];
+            Defs.push_back(Like);
+        };
+        /* FRotator::Quaternion, FQuat::operator* (B turns first), FQuat::RotateVector and FQuat::Rotator, as UE 4.27
+           writes them. A rotator is Pitch, Yaw, Roll in degrees; a quaternion X, Y, Z, W. */
+        using FQ = std::array<double, 4>;
+        const double Pi = 3.14159265358979323846;
+        auto ToQuat = [&](const std::array<double, 3>& Rot) {
+            double S[3], C[3];
+            for (int32 I = 0; I < 3; ++I) { S[I] = std::sin(std::fmod(Rot[I], 360.0) * Pi / 360); C[I] = std::cos(std::fmod(Rot[I], 360.0) * Pi / 360); }
+            const double SP = S[0], SY = S[1], SR = S[2], CP = C[0], CY = C[1], CR = C[2];
+            return FQ{ CR * SP * SY - SR * CP * CY, -CR * SP * CY - SR * CP * SY, CR * CP * SY - SR * SP * CY, CR * CP * CY + SR * SP * SY };
+        };
+        auto Mul = [](const FQ& A, const FQ& B) {
+            return FQ{ A[3] * B[0] + A[0] * B[3] + A[1] * B[2] - A[2] * B[1], A[3] * B[1] - A[0] * B[2] + A[1] * B[3] + A[2] * B[0],
+                       A[3] * B[2] + A[0] * B[1] - A[1] * B[0] + A[2] * B[3], A[3] * B[3] - A[0] * B[0] - A[1] * B[1] - A[2] * B[2] };
+        };
+        auto Cross = [](const std::array<double, 3>& A, const std::array<double, 3>& B) {
+            return std::array<double, 3>{ A[1] * B[2] - A[2] * B[1], A[2] * B[0] - A[0] * B[2], A[0] * B[1] - A[1] * B[0] };
+        };
+        auto Rotate = [&](const FQ& Q, const std::array<double, 3>& V) {
+            std::array<double, 3> T = Cross({ Q[0], Q[1], Q[2] }, V), Out;
+            for (double& X : T) X *= 2;
+            const std::array<double, 3> QT = Cross({ Q[0], Q[1], Q[2] }, T);
+            for (int32 I = 0; I < 3; ++I) Out[I] = V[I] + Q[3] * T[I] + QT[I];
+            return Out;
+        };
+        auto ToRotator = [&](const FQ& Q) {
+            const double X = Q[0], Y = Q[1], Z = Q[2], W = Q[3], Test = Z * X - W * Y, Deg = 180 / Pi;
+            const double Yaw = std::atan2(2 * (W * Z + X * Y), 1 - 2 * (Y * Y + Z * Z)) * Deg;
+            auto Normalize = [](double A) { A = std::fmod(A, 360.0); if (A < 0) A += 360; return A > 180 ? A - 360 : A; };
+            std::array<double, 3> Out;
+            if (Test < -0.4999995) Out = { -90, Yaw, Normalize(-Yaw - 2 * std::atan2(X, W) * Deg) };
+            else if (Test > 0.4999995) Out = { 90, Yaw, Normalize(Yaw - 2 * std::atan2(X, W) * Deg) };
+            else Out = { std::asin(2 * Test) * Deg, Yaw, std::atan2(-2 * (W * X + Y * Z), 1 - 2 * (X * X + Y * Y)) * Deg };
+            for (double& A : Out) A += 0.0;     // no -0 in the cooked float
+            return Out;
+        };
+        if (!Scene.empty())
+        {
+            std::vector<FPropertyDef>& RootDefs = ComponentDefaults[Scene[0].first];
+            const FVec Lr = Read(RootDefs, "RelativeLocation", 0), Rr = Read(RootDefs, "RelativeRotation", 0),
+                       Sr = Read(RootDefs, "RelativeScale3D", 1);
+            const bool bPlain = Scene[0].second->UeName == "SceneComponent";
+            std::string Lost;
+            auto Lose = [&](const FVec& V, const char* Prop) { if (!bPlain && V.Def) Lost += (Lost.empty() ? "" : ", ") + std::string(Prop); };
+            Lose(Lr, "RelativeLocation");
+            Lose(Rr, "RelativeRotation");
+            Lose(Sr, "RelativeScale3D");
+            if (!Lost.empty())
+                printf("  warning: %s::UE_DEFAULTS: %s is the actor's root, which the engine puts at the spawn transform, so its "
+                       "%s is not applied. A USceneComponent root passes its transform on to the components attached "
+                       "to it.\n", R.CppName.c_str(), Scene[0].first.c_str(), Lost.c_str());
+            if (bPlain && (Lr.Def || Rr.Def || Sr.Def))
+            {
+                const FQ Qr = ToQuat(Rr.V);
+                for (size_t C = 1; C < Scene.size(); ++C)
+                {
+                    std::vector<FPropertyDef>& Defs = ComponentDefaults[Scene[C].first];
+                    const FVec Lc = Read(Defs, "RelativeLocation", 0), Rc = Read(Defs, "RelativeRotation", 0),
+                               Sc = Read(Defs, "RelativeScale3D", 1);
+                    std::array<double, 3> L, S;
+                    for (int32 I = 0; I < 3; ++I) { L[I] = Sr.V[I] * Lc.V[I]; S[I] = Sr.V[I] * Sc.V[I]; }
+                    L = Rotate(Qr, L);
+                    for (int32 I = 0; I < 3; ++I) L[I] += Lr.V[I];
+                    if (Lc.Def || Lr.Def) Write(Defs, Lc.Def ? *Lc.Def : *Lr.Def, L);
+                    if (Rc.Def || Rr.Def) Write(Defs, Rc.Def ? *Rc.Def : *Rr.Def, ToRotator(Mul(Qr, ToQuat(Rc.V))));
+                    if (Sc.Def || Sr.Def) Write(Defs, Sc.Def ? *Sc.Def : *Sr.Def, S);
+                }
+                Drop(RootDefs, "RelativeLocation");
+                Drop(RootDefs, "RelativeRotation");
+                Drop(RootDefs, "RelativeScale3D");
+            }
+        }
+    }
+
     /* A cooked property carries no offset: FProperty::SetupOffset lays ChildProperties out in order, so emitting them
        by alignment, largest first, is the packing. Only the order moves; the bytecode names a property by path. */
     std::vector<std::pair<int32, FPropertyDef>> ClassVars;
@@ -8338,13 +8593,16 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             {
                 bIsScene = bIsScene || A->UeName == "SceneComponent";
                 bIsComponent = bIsComponent || A->UeName == "ActorComponent";
+                /* A level's BSP: its Serialize reads a UModel, and PostLoad checks one is there. */
+                if (A->UeName == "ModelComponent")
+                { *Err = R.CppName + "::" + FieldName + ": a UModelComponent belongs to a level's BSP and cannot be a component template"; return false; }
             }
             if (!bIsComponent) { *Err = R.CppName + "::" + FieldName + ": " + CR->CppName + " is not a UActorComponent"; return false; }
             /* The variable stays an ordinary ObjectProperty: ExecuteNodeOnActor finds it by name and
                assigns the instance it built from the archetype. */
             BP.AddComponent(FieldName, BP.EngineClass(CR->UePackage, CR->UeName),
                             BP.ClassDefaultObject(CR->UePackage, CR->UeName), bIsScene,
-                            ComponentDefaults[FieldName]);
+                            ComponentDefaults[FieldName], NativeTail(CR));
             ComponentDefaults.erase(FieldName);
         }
         if (auto Rep = Decl.Replicated.find(FieldName); Rep != Decl.Replicated.end())
@@ -8414,7 +8672,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         }
         BP.AddSubobjectOverride(Sub->substr(0, Space), UeNameOf(Entry.second.Owner, Entry.first),
                                 BP.EngineClass(Sub->substr(Space + 1, Dot - Space - 1), Sub->substr(Dot + 1)),
-                                Entry.second.Defaults);
+                                Entry.second.Defaults, NativeTail(Find("U" + Sub->substr(Dot + 1))));
     }
     for (const auto& Entry : ComponentOverrides)
     {
@@ -8442,7 +8700,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         BP.AddComponentOverride(VarName, BP.EngineClass(CR->UePackage, CR->UeName),
                                 BP.Subobject(CR->UePackage, CR->UeName, OwnerClass,
                                              VarName + "_GEN_VARIABLE"),
-                                OwnerClass, NodeGuid, Entry.second.Defaults);
+                                OwnerClass, NodeGuid, Entry.second.Defaults, NativeTail(CR));
     }
 
     /* The OOL definition carries body/parms; only the in-class decl carries storageClass. */
@@ -8855,9 +9113,11 @@ public:
            range's end is kept only then, for a qualifier written in a macro (NamedQualifier). */
         const bool bMacroEnd = K == "end" && Stack.back()->is_object() && Stack.back()->contains("begin")
                             && (*Stack.back())["begin"].contains("spellingLoc");
+        /* A variable's use flags stay: Run refuses a used UE_ASSET_AT that cannot load. "kind" comes before them. */
         bSkipNext = K == "loc" || (K == "end" && !bMacroEnd) || K == "file" || K == "line" || K == "col" || K == "includedFrom"
                  || K == "expansionLoc" || K == "isMacroArgExpansion" || K == "mangledName"
-                 || K == "definitionData" || K == "isImplicit" || K == "isUsed" || K == "isReferenced"
+                 || K == "definitionData" || K == "isImplicit"
+                 || ((K == "isUsed" || K == "isReferenced") && Stack.back()->value("kind", std::string()) != "VarDecl")
                  || K == "typeAliasDeclId" || (K == "range" && !DeclRef.back());
         bKindNext = K == "kind";
         if (!bSkipNext) Slot = &(*Stack.back())[std::move(K)];
@@ -8929,11 +9189,11 @@ bool FCompiler::LoadTables(const std::string& IncludeDir, std::string* Err)
     for (const Json& Row : ConvDoc)
         Convs.push_back({ Row.value("from", std::string()), Row.value("to", std::string()),
                           Row.value("package", std::string()), Row.value("class", std::string()),
-                          Row.value("fn", std::string()), ExtraArgs(Row) });
+                          Row.value("fn", std::string()), ExtraArgs(Row), RefArgs(Row) });
     for (const Json& Row : OpsDoc)
         Ops.push_back({ Row.value("op", std::string()), Row.value("lhs", std::string()), Row.value("rhs", std::string()),
                         Row.value("ret", std::string()), Row.value("package", std::string()),
-                        Row.value("class", std::string()), Row.value("fn", std::string()), ExtraArgs(Row) });
+                        Row.value("class", std::string()), Row.value("fn", std::string()), ExtraArgs(Row), RefArgs(Row) });
     for (auto It = TypesDoc["enums"].begin(); It != TypesDoc["enums"].end(); ++It)
         Enums[It.key()] = { It->value("package", std::string()), It->value("name", std::string()),
                             It->value("underlying", std::string()), It->value("first", std::string()) };
@@ -9070,6 +9330,24 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         if (R.IsGenerated())
             if (const auto [At, bNew] = Cooked.emplace(Lower(PackageOf(R)), Cpp); !bNew)
             { *Err = Cpp + " and " + At->second + " would both be cooked as " + PackageOf(R); return false; }
+
+    /* A UE_ASSET_AT whose class this mod cooks: the asset is an instance of the copy its own mod cooked, so the
+       import's class check fails in game and the reference loads as null. Pinning the class to its owner with
+       UE_CLASS makes every other mod import it instead. */
+    for (const auto& [Qual, Path] : AssetPaths)
+    {
+        const auto D = NsVarNamed.find(Qual);
+        if (D == NsVarNamed.end() || !(D->second->value("isUsed", false) || D->second->value("isReferenced", false))) continue;
+        if (std::any_of(AssetDecls.begin(), AssetDecls.end(), [&](const Json* A) { return Name(*A) == LeafOf(Qual); })) continue;
+        const Json& T = D->second->contains("type") ? (*D->second)["type"] : Json::object();
+        const FRecord* R = Find(StripTypeKeywords(T.value("desugaredQualType", T.value("qualType", std::string()))));
+        if (!R || R->bIsStruct || !R->IsGenerated()) continue;
+        const std::string Leaf = LeafOf(R->CppName);
+        *Err = Qual + " at " + Path + " is a " + R->CppName + ", which this mod cooks its own copy of, so it would load as null: "
+               "name the class's owner where it is declared, e.g. UE_CLASS(\"" + Path.substr(0, Path.rfind('/') + 1) + Leaf
+             + "\", \"" + Leaf + "_C\")";
+        return false;
+    }
 
     int32 Generated = 0;
     for (const auto& Entry : Records)

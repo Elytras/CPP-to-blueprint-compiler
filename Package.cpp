@@ -178,6 +178,17 @@ void TagBool(FArc& Ar, const std::string& Name, bool Value)
     Ar.U8(0);                                     // HasPropertyGuid
 }
 
+/* The type a tag names is the property's GetID(), not its class: FObjectPropertyBase::GetID is ObjectProperty for
+   a class or weak property too, and FSoftObjectProperty's is SoftObjectProperty for a soft class (4.27
+   PropertyBaseObject.cpp, PropertySoftObjectPtr.cpp). A tag naming the class instead is skipped at load as a type
+   mismatch, value and all. A container's inner types are GetID()s the same way. */
+static std::string TagId(const std::string& Type)
+{
+    if (Type == "ClassProperty" || Type == "WeakObjectProperty") return "ObjectProperty";
+    if (Type == "SoftClassProperty") return "SoftObjectProperty";
+    return Type;
+}
+
 void Tag(FArc& Ar, const std::string& Name, const std::string& Type,
          const std::function<void(FArc&)>& Value, const std::string& StructName)
 {
@@ -185,7 +196,7 @@ void Tag(FArc& Ar, const std::string& Name, const std::string& Type,
     Value(Scratch);
 
     Ar.Name(Name);
-    Ar.Name(Type);
+    Ar.Name(TagId(Type));
     Ar.I32(int32(Scratch.B.size()));
     Ar.I32(0);                                    // ArrayIndex
     if (Type == "StructProperty")
@@ -196,12 +207,12 @@ void Tag(FArc& Ar, const std::string& Name, const std::string& Type,
     else if (Type == "ByteProperty" || Type == "EnumProperty")
         Ar.Name(StructName.empty() ? "None" : StructName);          // EnumName
     else if (Type == "ArrayProperty" || Type == "SetProperty")
-        Ar.Name(StructName);                                        // InnerType
+        Ar.Name(TagId(StructName));                                 // InnerType
     else if (Type == "MapProperty")
     {
         const size_t Comma = StructName.find(',');                  // "InnerType,ValueType"
-        Ar.Name(StructName.substr(0, Comma));
-        Ar.Name(StructName.substr(Comma + 1));
+        Ar.Name(TagId(StructName.substr(0, Comma)));
+        Ar.Name(TagId(StructName.substr(Comma + 1)));
     }
     Ar.U8(0);                                     // HasPropertyGuid
     Ar.Append(Scratch);

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""usage: test_bytecode.py [--assetgen <exe>] [--ueapi <UeApi dir>]
+"""usage: test_bytecode.py [--assetgen <exe>] [--ueapi <UeApi dir>] [--cases <file>]
 
 Compiles every test mod in AssetGen/tests, then checks what a mod can observe: its functions run offline
 (runscript.py, runvm.py for latent / delegate / cross-object code) against Python oracles, return values and member
@@ -7,7 +7,8 @@ writes both, and what the engine reads off the cooked assets (flags, property ty
 function a call reaches). Never the bytecode's shape: an optimization that keeps the behaviour must pass.
 
 --assetgen defaults to the first build found (ue-mods x64/Release, this repo's x64/Release, a CMake build/);
---ueapi to ue-mods' BpMods/UeApi. Outside ue-mods, pass the UeApi of https://github.com/Elytras/DRG-Blueprint-Cpp-SDK."""
+--ueapi to ue-mods' BpMods/UeApi. Outside ue-mods, pass the UeApi of https://github.com/Elytras/DRG-Blueprint-Cpp-SDK.
+--cases also writes each offline run as a JSON case, which ue-mods' `bpcheck` command replays in the running game."""
 import copy, glob, itertools, os, re, shutil, subprocess, sys
 os.environ['PYTHONIOENCODING'] = 'utf-8'   # the dump tools print non-ASCII names; read back as UTF-8, not the code page
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -55,6 +56,58 @@ def build():
 build()
 
 
+# --cases <file>: also write every run() below as a case for BpMods' `bpcheck` command, which replays it in the game
+# (the same call on the same members) and compares what comes back. A case the game cannot mean the same way says why
+# in 'skip': raw memory (runscript's MEM stands in for this process's), a stand-in call, a value JSON cannot carry.
+if '--cases' in sys.argv:
+    import atexit, json, math
+    CASES, MATH0, RAW = [], set(runscript.MATH), [False]
+    STANDINS = {'RandomInteger', 'GetFSDGameState', 'Conv_ObjectToString'}   # the game answers these differently
+
+    def _noting_raw(f):
+        def g(*a):
+            RAW[0] = True
+            return f(*a)
+        return g
+    runscript.mem_read, runscript.mem_write = _noting_raw(runscript.mem_read), _noting_raw(runscript.mem_write)
+
+    def _plain(v):
+        """v as JSON; a dict whose keys are not all strings (a map's) as {"__pairs__": [[k, v], ...]}."""
+        if isinstance(v, runscript.Holey): raise ValueError('a map with free slots')
+        if isinstance(v, float) and not math.isfinite(v): raise ValueError('a non-finite float')
+        if v is None or isinstance(v, (bool, int, float, str)): return v
+        if isinstance(v, (list, tuple)): return [_plain(x) for x in v]
+        if isinstance(v, dict):
+            if all(isinstance(k, str) for k in v): return {k: _plain(x) for k, x in v.items()}
+            return {'__pairs__': [[_plain(k), _plain(x)] for k, x in v.items()]}
+        raise ValueError('a ' + type(v).__name__)
+
+    def _recording(real):
+        def run(base, function, self_vars=None, **parms):
+            mine = self_vars if self_vars is not None else {}
+            where = base.replace(os.sep, '/').split('/FSD/Content/')
+            case = {'mod': os.path.basename(where[0]), 'class': '/Game/' + where[-1], 'fn': function}
+            try: case.update(args=_plain(parms), self=_plain(mine))
+            except ValueError as e: case['skip'] = str(e)
+            RAW[0], first = False, len(runscript.CALLS)
+            ret, env = real(base, function, mine, **parms)
+            try: case.update(ret=_plain(ret), after=_plain(mine))
+            except ValueError as e: case.setdefault('skip', str(e))
+            case['env'] = {}
+            for k, v in env.items():
+                try: case['env'][k] = _plain(v)
+                except ValueError: pass
+            called = {c[0] for c in runscript.CALLS[first:]}
+            odd = sorted(called & STANDINS | called - MATH0)
+            if RAW[0]: case['skip'] = 'raw memory'
+            elif odd: case.setdefault('skip', 'stand-in ' + ', '.join(odd))
+            CASES.append(case)
+            return ret, env
+        return run
+    run = _recording(run)
+    atexit.register(lambda: json.dump(CASES, open(option('--cases', []), 'w', encoding='utf-8')))
+
+
 def asset(mod):
     return os.path.join(ROOT, mod, 'FSD', 'Content', '_ElytrasMods', mod, mod)
 
@@ -79,9 +132,10 @@ def exports_of(base):
     return [e['name'] for e in dumpexp.load(base)[5]]
 
 
-def import_paths(base):
+def import_paths(base, classes=False):
     """Each import as its full path, /Game/Pkg.Class_C:Function. dumpexp keeps Class'Name' only, and one package
-    can import two objects of one name (SuperTest: SuperBase_C:Bump for the parent call, its own SuperTest_C:Bump)."""
+    can import two objects of one name (SuperTest: SuperBase_C:Bump for the parent call, its own SuperTest_C:Bump).
+    With `classes`, (path, the ClassPackage.ClassName the linker checks the object against) pairs."""
     import struct
     ua, names = open(base + '.uasset', 'rb').read(), dumpexp.load(base)[3]
     r = dumpexp.R(ua, 4)                                        # the summary, as dumpexp.load walks it
@@ -102,7 +156,7 @@ def import_paths(base):
         name = names[obj] + ('_%d' % (num - 1) if num else '')
         if outer == 0: return name
         return path(-outer - 1) + ('.' if rows[-outer - 1][4] == 0 else ':') + name
-    return [path(i) for i in range(count)]
+    return [(path(i), names[rows[i][0]] + '.' + names[rows[i][2]]) if classes else path(i) for i in range(count)]
 
 
 def ref(base, index):
@@ -1061,6 +1115,8 @@ def comp_test():
     for t in (0, 41):
         fields = dict(Ticks=t)
         assert run(base, 'ReceiveBeginPlay', self_vars=fields)[0] is None and fields == dict(Ticks=t + 1), fields
+    orange = VM(base).call('Orange')     # an EX_StructConst lists the members in their reflected order: B, G, R, A
+    assert orange == [0, 128, 255, 255], orange
     # The engine dispatches it: an override of Actor's BlueprintImplementableEvent, not final.
     fn = dump('dumpstruct.py', base, export_index(base, 'ReceiveBeginPlay'))
     flags = int(re.search(r'FunctionFlags (\S+)', fn).group(1), 16)
@@ -1072,9 +1128,29 @@ def comp_test():
     tags = lambda name: dump('dumptags.py', base, export_index(base, name))
     assert 'bVisible [0] BoolProperty size=0 value=0' in tags('Mesh_GEN_VARIABLE')
     lamp = tags('Lamp_GEN_VARIABLE')
-    assert 'Intensity [0] FloatProperty size=4: 1500.0' in lamp and 'LightColor [0] StructProperty size=4 struct=Color: ff8000ff' in lamp, lamp
-    assert 'RelativeScale3D [0] StructProperty size=12 struct=Vector: 000000400000004000004040' in tags('Root_GEN_VARIABLE')
-    print('ok  CompTest: BeginPlay override, component variables and archetype defaults')
+    assert 'Intensity [0] FloatProperty size=4: 1500.0' in lamp and 'LightColor [0] StructProperty size=4 struct=Color: 0080ffff' in lamp, lamp
+    # The root's own transform moved onto the components attached to it: (10, 0, 0), yaw 90 and (2, 2, 3) on Mesh, whose
+    # roll 90 composes to (0, 90, 90); Lamp's (5, 0, 50) scaled by the root's, turned by its yaw and offset by it, to
+    # (10, 10, 150), at yaw 90.
+    root, mesh = tags('Root_GEN_VARIABLE'), tags('Mesh_GEN_VARIABLE')
+    assert 'Relative' not in root, root
+    for t, loc, rot in ((mesh, '000020410000000000000000', '000000000000b4420000b442'),
+                        (lamp, '000020410000204100001643', '000000000000b44200000000')):
+        assert ('RelativeLocation [0] StructProperty size=12 struct=Vector: ' + loc in t
+                and 'RelativeRotation [0] StructProperty size=12 struct=Rotator: ' + rot in t
+                and 'RelativeScale3D [0] StructProperty size=12 struct=Vector: 000000400000004000004040' in t), t
+    # After its tags' None and UObject's HasGuid, an archetype carries what its class's native Serialize reads. Rocks's
+    # 32 bytes are the ones DRG's one cooked ISM archetype (BP_SpacerigTrashCompactor) ends in; Grass adds the
+    # hierarchical one's empty ClusterTree.
+    ua, ue, total, names, imports, exports = dumpexp.load(base)
+    end = names.index('None').to_bytes(4, 'little') + bytes(8)
+    ism = '00000000' '01000000' '4000000000000000' '0400000000000000' '0000000000000000'
+    for name, tail in (('Root', ''), ('Lamp', ''), ('Mesh', '00000000'), ('Rocks', ism), ('Grass', ism + '4000000000000000')):
+        e = next(e for e in exports if e['name'] == name + '_GEN_VARIABLE')
+        p = ue[e['off'] - total: e['off'] - total + e['size']]
+        assert p.endswith(end + bytes.fromhex(tail)), (name, p[-48:].hex())
+    refused('ModelComp', '  UE_COMPONENT(UModelComponent, Bsp);\n', 'cannot be a component template')
+    print('ok  CompTest: BeginPlay override, component variables, archetype defaults and native tails')
 
 
 def scs_tree(base):
@@ -1101,7 +1177,8 @@ def comp_attachment():
     (bIsParentComponentNative) or names an ANCESTOR Blueprint's node via ParentComponentOwnerClassName; so a node
     parented to a sibling in the same SCS must be one of that node's ChildNodes."""
     children, roots, tags = scs_tree(asset('CompTest'))
-    assert roots == ['Root'] and children == {'DefaultSceneRoot': [], 'Root': ['Mesh', 'Lamp'], 'Mesh': [], 'Lamp': []}, (roots, children)
+    assert roots == ['Root'] and children == {'DefaultSceneRoot': [], 'Root': ['Mesh', 'Lamp', 'Rocks', 'Grass'], 'Mesh': [],
+                                              'Lamp': [], 'Rocks': [], 'Grass': []}, (roots, children)
     assert not any('ParentComponentOrVariableName' in t for t in tags.values()), tags
     print('ok  CompTest: Mesh and Lamp stay attached to Root after a cooked load')
 
@@ -1346,7 +1423,8 @@ def struct_behaviour():
                 ('RangeCopyToRef', {'Many': [{kills: 1}, {kills: 2}]}, 1, {'Many': [{kills: 1}, {kills: 2}]}),
                 ('MapFindIntoCopy', {'Scores': {1: 40}}, k, {'Scores': {1: 40}}),
                 ('ArrayAppendCopy', {'Counts': [1, 2]}, i32(k + 4), {'Counts': [1, 2, 1, 2]}),
-                ('SetUnionCopy', {'Seen': [1, 2], 'Fresh': [2, 3]}, i32(k + 3), {'Seen': [2, 3, 1], 'Fresh': [2, 3]})):
+                ('SetUnionCopy', {'Seen': [1, 2], 'Fresh': [2, 3]}, i32(k + 3), {'Seen': [2, 3, 1], 'Fresh': [2, 3]}),
+                ('AppendComputed', {'Counts': [1, 2]}, i32(k + 6), {'Counts': [1, 2, 1, 2, 1, 2]})):
             f = copy.deepcopy(fields)
             got = run(asset('StructTest'), fn, self_vars=f, K=k)[0]
             assert (got, f) == (want, after), (fn, k, got, f)
@@ -1770,6 +1848,12 @@ def static_assets():
     ed = tags_of('ED_AssetTest')
     assert objs('ED_AssetTest', ed['VeteranClasses'].split()[-1]) == ['/Game/Enemies/Spider/Grunt/ED_Spider_Grunt.ED_Spider_Grunt'], ed
     assert ed['SpawnSpread'].endswith(': 250.0') and ed['IdealSpawnSize'].endswith(': 4') and 'value=1' in ed['CanBeUsedForConstantPressure'], ed
+    # A soft class is tagged SoftObjectProperty, as the cook tags ED_Spider_Grunt's own EnemyClass: a tag naming
+    # SoftClassProperty is dropped at load as a type mismatch. The value is the path (an FName) and an empty sub-path.
+    assert ed['EnemyClass'].startswith('SoftObjectProperty size=12:'), ed['EnemyClass']
+    soft = struct.unpack('<3i', bytes.fromhex(ed['EnemyClass'].split()[-1]))
+    assert dumpexp.load(base('ED_AssetTest'))[3][soft[0]] == '/Game/Enemies/Spider/Grunt/ENE_Spider_Grunt_Normal.ENE_Spider_Grunt_Normal_C' \
+        and soft[1:] == (0, 0), soft
     print('ok  AssetTest: each declared object is an asset of its class with the members its braces name')
     # AssetUser's defaults: a pointer, an array, a set and two maps, object elements by package path.
     user = base('AssetUser')
@@ -1849,6 +1933,31 @@ def ue_assets():
           ' --pak adds a pak\'s assets from their own headers')
 
 
+def asset_elsewhere():
+    """A UE_ASSET_AT into another mod, of a class declared in a header both mods include. Unpinned, each mod cooks its
+    own copy of the class and the asset is an instance of the other copy, so in game the reference loads as null
+    (BpMods' OffsetsData, 2026-09-18): refused. Pinned with UE_CLASS, the import names the owner's class."""
+    import tempfile
+    top = ('class UOtherDef : public UPrimaryDataAsset {\npublic:\n%s  int32 N = 1;\n};\n'
+           'UE_ASSET_AT(UOtherDef, OtherData, "/Game/_ElytrasMods/Other/OtherData");\n')
+    refused('AssetElsewhere', '  UOtherDef *Picked = &OtherData;\n',
+            'OtherData at /Game/_ElytrasMods/Other/OtherData is a UOtherDef, which this mod cooks its own copy of, so it '
+            'would load as null: name the class\'s owner where it is declared, e.g. '
+            'UE_CLASS("/Game/_ElytrasMods/Other/UOtherDef", "UOtherDef_C")', top=top % '')
+    with tempfile.TemporaryDirectory(dir=TESTS) as tmp:
+        with open(os.path.join(tmp, 'AssetPinned.cpp'), 'w') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/AssetPinned");\n'
+                    + top % '  UE_CLASS("/Game/_ElytrasMods/Other/UOtherDef", "UOtherDef_C");\n'
+                    + 'class AssetPinned : public AActor {\npublic:\n  UOtherDef *Picked = &OtherData;\n};\n')
+        proc = subprocess.run([ASSETGEN, 'compile', os.path.join(tmp, 'AssetPinned.cpp'), UEAPI, tmp], capture_output=True, encoding='utf-8')
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert not os.path.exists(os.path.join(tmp, 'UOtherDef.uasset')), os.listdir(tmp)
+        imports = dict(import_paths(os.path.join(tmp, 'AssetPinned'), classes=True))
+        assert imports['/Game/_ElytrasMods/Other/OtherData.OtherData'] == '/Game/_ElytrasMods/Other/UOtherDef.UOtherDef_C', imports
+    print("ok  AssetTest: another mod's asset of a class this mod would cook is refused; with the class pinned to its "
+          "owner, the import names the owner's class")
+
+
 def global_default(folder, cls, member):
     """The default a generated global class holds: a soft path (list) decoded from its FName indices, else the tag."""
     import struct
@@ -1898,6 +2007,7 @@ object_forwards()
 api_stub()
 static_assets()
 ue_assets()
+asset_elsewhere()
 globals_()
 
 

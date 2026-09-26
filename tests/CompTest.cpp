@@ -14,20 +14,33 @@ class CompTest : public AActor {
   UE_COMPONENT(USceneComponent, Root);
   UE_COMPONENT(UStaticMeshComponent, Mesh);
   UE_COMPONENT(UPointLightComponent, Lamp);
+  /* Instanced meshes: their native Serialize reads more after the tags than a static mesh's LODData count. */
+  UE_COMPONENT(UInstancedStaticMeshComponent, Rocks);
+  UE_COMPONENT(UHierarchicalInstancedStaticMeshComponent, Grass);
 
   int32 Ticks = 0;
 
   UE_DEFAULTS {
     Mesh->bVisible = false;
     Lamp->Intensity = 1500.0f;
-    /* A struct value is one argument per member, in DECLARATION order - which is also the order
-       genueapi gives the stub constructor, so the header's parameter names are the truth (FColor
-       is B, G, R, A). A struct with a native Serialize, like these two, writes raw bytes rather
-       than nested tags. */
+    /* The engine puts the root at the spawn transform and never applies its own transform, so
+       AssetGen moves it onto the components attached to it: Mesh ends up at (10, 0, 0) scaled
+       (2, 2, 3), its roll turned by the root's yaw to (0, 90, 90); Lamp's offset grows with the
+       root's scale to (10, 0, 150), turns with its yaw to (0, 10, 150), and moves to (10, 10, 150). */
+    Root->RelativeLocation = FVector(10.0f, 0.0f, 0.0f);
+    Root->RelativeRotation = FRotator(0.0f, 90.0f, 0.0f);
     Root->RelativeScale3D = FVector(2.0f, 2.0f, 3.0f);
-    Lamp->LightColor = FColor(255, 128, 0, 255);
+    Lamp->RelativeLocation = FVector(5.0f, 0.0f, 50.0f);
+    Mesh->RelativeRotation = FRotator(0.0f, 0.0f, 90.0f);
+    /* A constructor's argument lands on the member its parameter is named after, so the stub's
+       parameter names are the truth: FColor takes R, G, B, A like the engine's C++ constructor,
+       though its members are B, G, R, A in memory. A struct with a native Serialize, like FColor
+       and FVector, writes raw bytes rather than nested tags. */
+    Lamp->LightColor = FColor(255, 128, 0);     // orange; A defaults to 255
   }
 
 public:
   void ReceiveBeginPlay() { Ticks = Ticks + 1; }
+  // The same constructor in a body: the struct constant's members still go by parameter name.
+  FColor Orange() { return FColor(255, 128, 0); }
 };

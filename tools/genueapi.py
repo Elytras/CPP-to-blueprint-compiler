@@ -37,6 +37,9 @@ def split_args(text):
     return [a.strip() for a in split_params(text)]
 FIELD = re.compile(r"^\t([A-Za-z_][\w:<>,\*& ()\"]*?)\s+([A-Za-z_]\w*)\s*(:\s*\d+)?;\s*//")
 NO_STRUCT_LITERAL = ("TDelegate<", "TMulticast", "TScriptInterface<")    # EX_StructConst has no zero for these
+# The engine's C++ constructor where it takes the members in another order than the reflected one (FColor's are B, G,
+# R, A in memory). The stub takes them the C++ way, and AssetGen puts each argument on the member its parameter names.
+CTOR_PARAMS = {"FColor": ("uint8 R", "uint8 G", "uint8 B", "uint8 A = 255")}
 INCLUDE = re.compile(r'^#include\s+"(\w+)_classes\.hpp"')
 
 SCALARS = {
@@ -302,7 +305,8 @@ def emit_struct(st, conv_names):
         body.append("")
         body.append("    %s() = default;" % st.cpp)
     if st.complete:
-        body.append("    %s(%s) {}" % (st.cpp, ", ".join("%s %s" % (t, n) for t, n in st.fields)))
+        params = CTOR_PARAMS.get(st.cpp) or ["%s %s" % (t, n) for t, n in st.fields]
+        body.append("    %s(%s) {}" % (st.cpp, ", ".join(params)))
     if st.cpp in conv_names:
         body.append("    UE_CONV_%s" % st.cpp)
     body.append("};")
@@ -339,7 +343,8 @@ def operators(classes):
             lhs, rhs = params[0][0], params[1][0]
             if lhs not in STRUCTS and rhs not in STRUCTS and lhs not in CONV_STRUCTS:
                 continue
-            key, row = (OPS[m.group(1)], lhs, rhs), (ret, k.path, k.ue_name, fname, operator_extra(params[2:]))
+            key, row = (OPS[m.group(1)], lhs, rhs), (ret, k.path, k.ue_name, fname, operator_extra(params[2:]),
+                                                     ref_positions(k.ue_name, fname, params))
             # FString has both StrStr and StriStri; `==` on names/paths wants the case-insensitive one.
             if key not in found or ("_Stri" in fname and "_Stri" not in found[key][3]):
                 found[key] = row
@@ -349,14 +354,14 @@ def operators(classes):
 def write_operators(classes, out_dir):
     ops = operators(classes)
     by_pkg = {}
-    for (op, lhs, rhs), (ret, pkg, cls, fn, extra) in ops.items():
+    for (op, lhs, rhs), (ret, pkg, cls, fn, extra, refs) in ops.items():
         by_pkg.setdefault(pkg[len("/Script/"):], []).append("inline %s operator%s(const %s&, const %s&) { return {}; }"
                                                               % (ret, op, lhs, rhs))
     rows = []
-    for (op, lhs, rhs), (ret, pkg, cls, fn, extra) in sorted(ops.items()):
+    for (op, lhs, rhs), (ret, pkg, cls, fn, extra, refs) in sorted(ops.items()):
         args = ", ".join(("true" if a else "false") if isinstance(a, bool) else repr(a) for a in extra)
-        rows.append('  {"op": "%s", "lhs": "%s", "rhs": "%s", "ret": "%s", "package": "%s", "class": "%s", "fn": "%s", "extra": [%s]}'
-                    % (op, lhs, rhs, ret, pkg, cls, fn, args))
+        rows.append('  {"op": "%s", "lhs": "%s", "rhs": "%s", "ret": "%s", "package": "%s", "class": "%s", "fn": "%s", "extra": [%s], "refs": %s}'
+                    % (op, lhs, rhs, ret, pkg, cls, fn, args, json.dumps(refs)))
     io.open(os.path.join(out_dir, "Ops.json"), "w", encoding="utf-8", newline="\n").write("[\n" + ",\n".join(rows) + "\n]\n")
     print("  operators: %d" % len(ops))
     return by_pkg
@@ -466,6 +471,50 @@ def read_real_fields(sdk_dir):
         sub = DUMP_SUBOBJECT.match(m.group(2).rstrip("\r\n")) if m else None
         if sub:
             SUBOBJECTS.setdefault(sub.group(1) + "." + sub.group(2), []).append((sub.group(3), m.group(1)))
+
+
+# A native reads a const reference parameter (ConstParm + ReferenceParm) by address: P_GET_PROPERTY_REF takes
+# Stack.MostRecentPropertyAddress whenever the argument left one, and a nested call leaves the address of whatever
+# ITS arguments read last (`Conv_TextToString(Conv_Int64ToText(Big))` read the int64 as an FText and crashed DRG). So
+# such a parameter stays `const T&` in the header, and AssetGen gives a computed argument a local of its own first.
+# Dumper-7 spells a by-value move type `const T&` too; only the flag comment in <Pkg>_parameters.hpp tells them apart.
+PARAM_FUNC = re.compile(r"^// Function \S+\.(\w+)\.(.+)$")
+PARAM_LINE = re.compile(r"^\t(.+?)\s+(\w+)(?:\[\w+\])?;\s+// 0x\w+\(0x\w+\)\((.*)\)\s*$")
+REF_PARMS = {}       # (class, engine function name) -> {parameter spellings that are const references}
+
+
+def read_ref_parms(sdk_dir):
+    for name in os.listdir(sdk_dir):
+        if not name.endswith("_parameters.hpp"):
+            continue
+        cur = None
+        for line in io.open(os.path.join(sdk_dir, name), encoding="utf-8", errors="replace"):
+            line = line.rstrip("\r\n")
+            m = PARAM_FUNC.match(line)
+            if m:
+                cur = (m.group(1), m.group(2).rstrip())
+                continue
+            if line.startswith("};"):
+                cur = None
+                continue
+            p = PARAM_LINE.match(line) if cur else None
+            if p:
+                flags = p.group(3).split(", ")
+                if "ReferenceParm" in flags and "ConstParm" in flags and "ReturnParm" not in flags:
+                    REF_PARMS.setdefault(cur, set()).add(p.group(2))
+
+
+def const_ref(t):
+    """The spelling of a const reference parameter of mapped type t. An object pointer, a class or soft reference and
+    a delegate stay as they are: none is a place a call's value could be read from in its stead."""
+    if t.endswith(("&", "*")) or t.startswith(("TDelegate<", "TMulticast", "TSubclassOf<", "TSoft", "TScriptInterface<")):
+        return t
+    return "const %s&" % t
+
+
+def ref_positions(cls, fn, params):
+    refs = REF_PARMS.get((cls, fn), ())
+    return [i for i, (t, n) in enumerate(params) if n in refs and const_ref(t) != t]
 
 
 def dumper_spelling(real):
@@ -656,17 +705,17 @@ def conversions(classes):
             if any(n not in CONV_DEFAULTS for _, n in params[1:]):
                 continue
             extra = [CONV_DEFAULTS[n] for _, n in params[1:]]
-            found.setdefault((src, dst), (k.path, k.ue_name, fname, extra))
+            found.setdefault((src, dst), (k.path, k.ue_name, fname, extra, ref_positions(k.ue_name, fname, params)))
     return found
 
 
 def write_conversions(classes, out_dir):
     direct = conversions(classes)
     table = ['[']
-    for (src, dst), (pkg, cls, fn, extra) in sorted(direct.items()):
+    for (src, dst), (pkg, cls, fn, extra, refs) in sorted(direct.items()):
         args = ", ".join(("true" if a else "false") if isinstance(a, bool) else str(a) for a in extra)
-        table.append('  {"from": "%s", "to": "%s", "package": "%s", "class": "%s", "fn": "%s", "extra": [%s]},'
-                     % (src, dst, pkg, cls, fn, args))
+        table.append('  {"from": "%s", "to": "%s", "package": "%s", "class": "%s", "fn": "%s", "extra": [%s], "refs": %s},'
+                     % (src, dst, pkg, cls, fn, args, json.dumps(refs)))
     table[-1] = table[-1].rstrip(",")
     table.append(']')
     io.open(os.path.join(out_dir, "Conv.json"), "w", encoding="utf-8", newline="\n").write("\n".join(table) + "\n")
@@ -824,6 +873,7 @@ def main():
         m + "/" for f in os.listdir(mod_dir) if f.endswith((".cpp", ".h"))
         for m in re.findall(r'UE_MOD_PACKAGE\("([^"]+)"', io.open(os.path.join(mod_dir, f), encoding="utf-8-sig").read()))))
     read_real_fields(sdk_dir)
+    read_ref_parms(sdk_dir)
     for name in headers:
         found, skipped, _ = parse_header(os.path.join(sdk_dir, name))
         if not found:
@@ -952,7 +1002,7 @@ def main():
     def ns_end(ns):
         return "}" * (ns.count("::") + 1) + "   // namespace " + ns
 
-    funcs, fields, aliased, renamed, not_ufunctions = 0, 0, 0, 0, []
+    funcs, fields, aliased, renamed, not_ufunctions, const_refs = 0, 0, 0, 0, [], 0
     for pkg, members in sorted(by_pkg.items()):
         body, referenced = [], set()
         defined = set(k.cpp for k in members)
@@ -1047,6 +1097,9 @@ def main():
                 # a reference parameter (or returns void, so its answer can only be an out-parameter) is left unmarked.
                 pure = (ret != "void" and (k.ue_name, real_fn) in PURE and not IMPURE_PURE.search(fname)
                         and not any(t.endswith("&") and not t.startswith("const ") for t, _ in params))
+                refs = REF_PARMS.get((k.ue_name, real_fn), ())
+                variants = [(r, [(const_ref(t) if n in refs else t, n) for t, n in v]) for r, v in variants]
+                const_refs += sum(1 for t, n in params if n in refs and const_ref(t) != t)
                 for vret, plist in variants:
                     args = ", ".join("%s %s" % (rewrite(t, short, k), n) for t, n in plist)
                     body.append("    %s%s%s%s %s(%s)%s;" % (MARKS.get((k.ue_name, real_fn), ""),
@@ -1136,6 +1189,7 @@ def main():
           % (len(ordered), funcs, fields, len(by_pkg)))
     print("  blueprint classes: %d, of which %d reachable unqualified" % (len(bp), aliased))
     print("  respelled by Dumper-7 and named back (__UeName): %d" % renamed)
+    print("  const reference parameters, read by address (const T&): %d" % const_refs)
     if UNEXPLAINED:
         print("  NOT named back, the respelling rules do not explain them (is the object dump of the same run?): %d, e.g. %s"
               % (len(UNEXPLAINED), "; ".join(UNEXPLAINED[:5])))

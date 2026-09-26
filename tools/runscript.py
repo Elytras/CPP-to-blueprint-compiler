@@ -121,6 +121,23 @@ INT64_RESULT = {'Conv_IntToInt64', 'FTrunc64', 'Not_Int64'} | {op + '_Int64Int64
 # The operands that leave Stack.MostRecentPropertyAddress, which StructMemberContext and ArrayGetByRef offset into:
 # a call evaluated into nothing leaves none (and a native writes its result through a null RESULT_PARAM).
 ADDRESSABLE = {0, 1, 0x48, 0x42, 0x6B}
+# The arguments a native reads by address: a const reference parameter (P_GET_PROPERTY_REF takes the address the
+# argument left) and a container library's containers (stepped into no buffer, then read where they lie). A call or a
+# cast there leaves the address of whatever ITS operands read last, and the native reads that - an int64 as an FText
+# crashed DRG. A constant leaves none, so a UHT thunk reads its own buffer. Any other container function: the container.
+NATIVE_REFS = {'Conv_TextToString': (0,), 'Array_Append': (0, 1), 'Array_Identical': (0, 1), 'Set_AddItems': (0, 1),
+               'Set_RemoveItems': (0, 1), 'Set_Difference': (0, 1, 2), 'Set_Intersection': (0, 1, 2),
+               'Set_Union': (0, 1, 2), 'Set_ToArray': (0, 1), 'Map_Keys': (0, 1), 'Map_Values': (0, 1)}
+CONSTS = {0x17, 0x1D, 0x1E, 0x1F, 0x21, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2A, 0x2C, 0x2D, 0x34, 0x35}
+
+
+def native_refs(n):
+    refs = NATIVE_REFS.get(n.val, (0,) if n.val.startswith(('Array_', 'Set_', 'Map_')) else ())
+    for i in refs:
+        a = n.kids[i] if i < len(n.kids) else None
+        if a is not None and a.op not in ADDRESSABLE | CONSTS and not (a.op in (0x19, 0x1A) and a.kids[1].op in ADDRESSABLE):
+            raise SystemExit('%s reads argument %d by address, and op %02x at mem %d leaves the address of what it read'
+                             % (n.val, i, a.op, a.mem))
 
 
 def i32(v): return (v + 2**31) % 2**32 - 2**31
@@ -342,6 +359,7 @@ def run(base, function, self_vars=None, **parms):
             for name, a in zip(names, n.kids):                       # a reference parameter is its argument's variable
                 if name in outs and a.op in ADDRESSABLE: store(a, callee.get(name, 0))
             return r
+        if o in (0x1C, 0x46, 0x68): native_refs(n)
         if o in (0x1C, 0x46, 0x68) and n.val == 'Map_Find' and n.kids[2].op in (0, 0x48) and types.get(n.kids[2].val) in BARE_CONTAINERS:
             # execMap_Find writes in place only into the map's value property class, and a container value is its
             # wrapper StructProperty: a bare container local is left as it was.
