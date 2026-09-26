@@ -2056,8 +2056,6 @@ def edits():
              ['--game', game_dir]),
             ('EditNative', 'class Tweaks : public AActor {\n  UE_PATCH;\n  UE_DEFAULTS { bHidden = true; }\n};\n',
              'a patch derives from the game Blueprint it edits', ['--game', game_dir]),
-            ('EditMethod', 'class Tweaks : public UMoodDef {\n  UE_PATCH;\n  void Poke() {}\n  UE_DEFAULTS { Count = 1; }\n};\n',
-             'has no function of that name of its own', ['--game', game_dir]),
             ('EditMember', 'class Tweaks : public UMoodDef {\n  UE_PATCH;\n  int32 Extra;\n  UE_DEFAULTS { Count = 1; }\n};\n',
              'a member or an interface of its own is not built yet', ['--game', game_dir]),
             ('EditNoGame', 'class Tweaks : public UMoodDef {\n  UE_PATCH;\n  UE_DEFAULTS { Count = 1; }\n};\n',
@@ -2071,8 +2069,8 @@ def edits():
                         '  UE_CLASS("/Game/_ElytrasMods/AssetTest/UMoodDef", "UMoodDef_C");\n  int32 Count;\n};\n%s' % (name, src))
             proc = subprocess.run([ASSETGEN, 'compile', path, UEAPI, tmp] + flags, capture_output=True, encoding='utf-8')
             assert proc.returncode != 0 and why in proc.stdout, (name, proc.stdout)
-    print('ok  EditTest: an edit of a mod\'s own asset, a patch of a native class, with a method its Blueprint lacks or a '
-          'member of its own, and no --game are refused')
+    print('ok  EditTest: an edit of a mod\'s own asset, a patch of a native class, a patch with a member of its own, and '
+          'no --game are refused')
 
     # A component's defaults. CompTest stands in for a game Blueprint, declared as UeApi declares one, and Lamp for one of
     # its own SCS components: the patch lands in the Lamp's template. A parent Blueprint's component the class does not
@@ -2112,16 +2110,20 @@ def edits():
           'override record, and a member that is no component, are refused')
 
     # A method replaces the Blueprint's function of that name: CompTest's ReceiveBeginPlay (Ticks + 1) becomes Ticks + 5,
-    # run offline. A function the class does not define, other parameters than the game's, and a call to the replaced
-    # function (the game's body is not kept) are refused.
+    # run offline. `CompTest::ReceiveBeginPlay()` in it runs the game's body, kept beside it. A method the Blueprint
+    # lacks is added to it: a helper, or an override of what it inherits (AActor's ReceiveTick). A function the class's
+    # declaration has but its package lacks, and other parameters than the game's, are refused.
     decl = ('#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/FnEdit");\n'
             'class CompTest : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/CompTest/CompTest", "CompTest_C");\n'
             '  int32 Ticks;\n  void ReceiveBeginPlay();\n  void Nope();\n};\n'
             'class Tweaks : public CompTest {\n  UE_PATCH;\n  %s\n};\n')
-    for body, why in (('void ReceiveBeginPlay() { int32 Step = 5; Ticks = Ticks + Step; }', None),
-                      ('void Nope() { Ticks = 1; }', 'has no function of that name of its own'),
-                      ('void ReceiveBeginPlay(int32 X) { Ticks = X; }', 'are not the game function\'s'),
-                      ('void ReceiveBeginPlay() { CompTest::ReceiveBeginPlay(); }', 'calls the function it replaces')):
+    for body, why, ticks, new in (
+            ('void ReceiveBeginPlay() { int32 Step = 5; Ticks = Ticks + Step; }', None, 6, []),
+            ('void ReceiveBeginPlay() { CompTest::ReceiveBeginPlay(); Ticks = Ticks + 5; }', None, 7, ['ReceiveBeginPlay__Vanilla']),
+            ('void ReceiveBeginPlay() { Ticks = Twice(Ticks) + 5; }\n  int32 Twice(int32 X) { return X * 2; }\n'
+             '  void ReceiveTick(float DeltaSeconds) { Ticks = Ticks + 1; }', None, 7, ['Twice', 'ReceiveTick']),
+            ('void Nope() { Ticks = 1; }', 'has no function of that name of its own', 0, []),
+            ('void ReceiveBeginPlay(int32 X) { Ticks = X; }', 'are not the game function\'s', 0, [])):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, 'FnEdit.cpp')
             with open(path, 'w', encoding='utf-8') as f:
@@ -2135,16 +2137,57 @@ def edits():
             assert proc.returncode == 0, proc.stdout + proc.stderr
             a = os.path.join(comp_game, '_ElytrasMods', 'CompTest', 'CompTest')
             b = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'CompTest', 'CompTest')
-            for base, ticks in ((a, 2), (b, 6)):
+            for base, want in ((a, 2), (b, ticks)):
                 me = {'Ticks': 1}
                 run(base, 'ReceiveBeginPlay', self_vars=me)
-                assert me == {'Ticks': ticks}, (base, me)
+                assert me == {'Ticks': want}, (base, me)
             la, lb = dumpexp.load(a), dumpexp.load(b)
-            assert all(x['name'] == 'ReceiveBeginPlay' or blob(la, x) == blob(lb, y) for x, y in zip(la[5], lb[5])), 'another export changed'
+            assert sorted(e['name'] for e in lb[5][len(la[5]):]) == sorted(new), [e['name'] for e in lb[5]]
+            if 'ReceiveBeginPlay__Vanilla' in new:                  # the game's body, kept for the Parent:: call
+                me = {'Ticks': 1}
+                run(b, 'ReceiveBeginPlay__Vanilla', self_vars=me)
+                assert me == {'Ticks': 2}, me
+            if 'ReceiveTick' in new:                                # an override of AActor's event, which it names
+                me = {'Ticks': 1}
+                run(b, 'ReceiveTick', self_vars=me, DeltaSeconds=0.5)
+                assert me == {'Ticks': 2}, me
+                tick = dump('dumpstruct.py', b, [e['name'] for e in lb[5]].index('ReceiveTick'))
+                assert re.search(r"^SuperStruct imp\[\d+\]:Function'ReceiveTick'$", tick, re.M), tick
+            assert all(x['name'] == 'ReceiveBeginPlay' or new and x['name'] == 'CompTest_C' or blob(la, x) == blob(lb, y)
+                       for x, y in zip(la[5], lb[5])), 'another export changed'
             proc = subprocess.run([ASSETGEN, 'roundtrip', tmp], capture_output=True, encoding='utf-8')
-            assert proc.returncode == 0 and 'functions whose payload reads exactly (ReadFunctionLayout): 2 of 2' in proc.stdout, proc.stdout
-    print('ok  EditTest: a UE_PATCH method replaces the Blueprint\'s function of that name; one it lacks, other parameters '
-          'and a call to the replaced body are refused')
+            assert proc.returncode == 0, proc.stdout
+            n = 2 + len(new)
+            assert 'functions whose payload reads exactly (ReadFunctionLayout): %d of %d' % (n, n) in proc.stdout, proc.stdout
+            assert 'classes whose payload reads exactly (ReadClassLayout): 1 of 1' in proc.stdout, proc.stdout
+    # An RPC's game body is kept as a plain function: with its net flags it would be a net field of its own, shifting
+    # the class's RPCs against the game's, and a call to it would be routed again. The replacement keeps them.
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, 'RpcEdit.cpp')
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/RpcEdit");\n'
+                    'class ReplTest : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/ReplTest/ReplTest", "ReplTest_C");\n'
+                    '  int32 Local;\n  UE_CLIENT void ClientPing(int32 Seq);\n};\n'
+                    'class Tweaks : public ReplTest {\n  UE_PATCH;\n'
+                    '  void ClientPing(int32 Seq) { ReplTest::ClientPing(Seq); Local = Local + 1; }\n};\n')
+        out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'RpcEdit')
+        os.makedirs(out)
+        proc = subprocess.run([ASSETGEN, 'compile', path, UEAPI, out, '--game', os.path.join(ROOT, 'ReplTest', 'FSD', 'Content')],
+                              capture_output=True, encoding='utf-8')
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        b = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'ReplTest', 'ReplTest')
+        me = {}
+        run(b, 'ClientPing', self_vars=me, Seq=5)
+        assert me == {'Local': 6}, me
+        names = [e['name'] for e in dumpexp.load(b)[5]]
+        flags = lambda fn: int(re.search(r'^FunctionFlags (0x[0-9a-f]+)$', dump('dumpstruct.py', b, names.index(fn)), re.M).group(1), 16)
+        assert flags('ClientPing') & 0x01000040 == 0x01000040 and flags('ClientPing__Vanilla') & 0x01000040 == 0, \
+            (hex(flags('ClientPing')), hex(flags('ClientPing__Vanilla')))       # FUNC_Net | FUNC_NetClient
+        proc = subprocess.run([ASSETGEN, 'roundtrip', tmp], capture_output=True, encoding='utf-8')
+        assert proc.returncode == 0 and 'classes whose payload reads exactly (ReadClassLayout): 1 of 1' in proc.stdout, proc.stdout
+    print('ok  EditTest: a UE_PATCH method replaces the Blueprint\'s function of that name, Parent:: reaching the game\'s body '
+          '(an RPC\'s as a plain function), or is added to it (a helper, an override); a stale declaration and other '
+          'parameters are refused')
 
 
 def game_edits():
@@ -2169,7 +2212,9 @@ def game_edits():
                     '    HealthComponent->MaxHealth = 180.0f;\n'       # a native class's component: its default subobject
                     '    MeleeAttack->CenterOnTarget = true;\n'       # the Blueprint's own SCS component: its template
                     '    enemy->mixerName = "Grunty";\n  }\n'         # a parent's component it overrides: the record's template
-                    '  void GetEnemySpawnedCount(int& SpawnCount) { int Base = 40; SpawnCount = Base + 2; }\n};\n')
+                    '  void GetEnemySpawnedCount(int& SpawnCount) {\n'
+                    '    ENE_Spider_Grunt_Normal_C::GetEnemySpawnedCount(SpawnCount);\n'   # the game's body, kept
+                    '    SpawnCount = SpawnCount + 41;\n  }\n};\n')
         out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'GameEdit')
         os.makedirs(out)
         proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, out, '--game', GAME], capture_output=True, encoding='utf-8')
@@ -2192,11 +2237,14 @@ def game_edits():
         for name, (tag, value) in added.items():
             before, after = tags(a, names.index(name)), tags(b, names.index(name))
             assert list(after) == list(before) + [tag] and after[tag].rstrip().endswith(value), (name, list(before), after)
-        assert all(x['name'] in added or x['name'] == 'GetEnemySpawnedCount' or blob(la, x) == blob(lb, y)
+        assert all(x['name'] in added or x['name'] in ('GetEnemySpawnedCount', 'ENE_Spider_Grunt_Normal_C') or blob(la, x) == blob(lb, y)
                    for x, y in zip(la[5], lb[5])), 'another export changed'
-        assert lb[3][:len(la[3])] == la[3] and lb[4] == la[4], 'a name or an import moved'
-        # The replaced function: the game's (sets 1), then the patch's (42); its parameter stays the game's output pin.
+        assert [e['name'] for e in lb[5][len(la[5]):]] == ['GetEnemySpawnedCount__Vanilla'], [e['name'] for e in lb[5]]
+        assert lb[3][:len(la[3])] == la[3] and lb[4][:len(la[4])] == la[4], 'a name or an import moved'   # + Add_IntInt's
+        # The replaced function: the game's (sets 1), then the patch's, which calls the game's body, kept, and adds 41.
+        # Its parameter stays the game's output pin.
         assert run(a, 'GetEnemySpawnedCount')[1] == {'SpawnCount': 1} and run(b, 'GetEnemySpawnedCount')[1] == {'SpawnCount': 42}
+        assert run(b, 'GetEnemySpawnedCount__Vanilla')[1] == {'SpawnCount': 1}
         fn = names.index('GetEnemySpawnedCount')
         parm = lambda base: re.search(r'^  IntProperty SpawnCount .*$', dump('dumpstruct.py', base, fn), re.M).group(0)
         assert parm(a) == parm(b) and 'flags=0x180 ' in parm(b), (parm(a), parm(b))
@@ -2209,8 +2257,8 @@ def game_edits():
                     '  UE_DEFAULTS { Sphere->SphereRadius = 10.0f; }\n};\n')
         proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, out, '--game', GAME], capture_output=True, encoding='utf-8')
         assert proc.returncode != 0 and 'does not override that inherited component' in proc.stdout, proc.stdout
-    print('ok  S38 on the game: ED_Spider_Grunt, the grunt Blueprint\'s defaults, three kinds of its components and one '
-          'function edited, the rest the cook\'s bytes')
+    print('ok  S38 on the game: ED_Spider_Grunt, the grunt Blueprint\'s defaults, three kinds of its components, and one '
+          'function replaced around the game\'s body, kept; the rest the cook\'s bytes')
 
 
 interfaces()

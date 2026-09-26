@@ -182,6 +182,23 @@ int32 FCookedPackage::Import(const std::string& ClassPackage, const std::string&
     return -int32(Imports.size());
 }
 
+int32 FCookedPackage::CopyExport(int32 From, FNameRef Name)
+{
+    FCookedExport E = Exports[size_t(From)];
+    E.ObjectName = Name;
+    const int32 Self = int32(Exports.size()) + 1;
+    if (E.FirstExportDependency >= 0)
+    {
+        const auto Run = PreloadDependencies.begin() + E.FirstExportDependency;
+        std::vector<int32> Deps(Run, Run + (E.SerBeforeSer + E.CreateBeforeSer + E.SerBeforeCreate + E.CreateBeforeCreate));
+        for (int32& D : Deps) if (D == From + 1) D = Self;
+        E.FirstExportDependency = int32(PreloadDependencies.size());
+        PreloadDependencies.insert(PreloadDependencies.end(), Deps.begin(), Deps.end());
+    }
+    Exports.push_back(std::move(E));
+    return Self;
+}
+
 void FCookedPackage::CreateBeforeSerialize(int32 Export, int32 Dep)
 {
     FCookedExport& E = Exports[size_t(Export)];
@@ -261,23 +278,35 @@ bool SkipProperty(const FCookedPackage& P, FReader& R, int Depth = 0)
 }
 }   // namespace
 
-bool ReadFunctionLayout(const FCookedPackage& P, const std::vector<uint8>& Payload, FFunctionLayout& Out)
+namespace
+{
+/* A count of Size-byte items at R, if that many fit in what is left. */
+bool CountFits(FReader& R, int32 Count, size_t Size)
+{
+    return !R.bBad && Count >= 0 && size_t(Count) <= (R.B.size() - R.P) / Size;
+}
+
+bool ReadStructHead(const FCookedPackage& P, const std::vector<uint8>& Payload, FReader& R, FStructLayout& Out)
 {
     std::vector<FTag> Tags;
     size_t At = 0;
     if (!ReadTags(P, Payload, At, Tags)) return false;
-    FReader R(Payload);
     R.P = At;
     uint32 Guid[4];
     if (R.Bool()) R.Guid(Guid);                 // the lazy-object guid, when there is one
     Out.Super = R.P;
-    R.I32(); R.I32();                           // SuperStruct, Children
+    R.I32();                                    // SuperStruct
+    Out.Children = R.P;
+    const int32 Children = R.I32();
+    if (!CountFits(R, Children, 4)) return false;
+    Out.ChildIndices.clear();
+    for (int32 I = 0; I < Children; ++I) Out.ChildIndices.push_back(R.I32());
     Out.Properties = R.P;
     const int32 Count = R.I32();
     Out.Fields.clear();
     for (int32 I = 0; I < Count; ++I)
     {
-        FFunctionLayout::FField F;
+        FStructLayout::FField F;
         F.Begin = R.P;
         if (R.bBad || !SkipProperty(P, R)) return false;
         F.End = R.P;
@@ -295,11 +324,71 @@ bool ReadFunctionLayout(const FCookedPackage& P, const std::vector<uint8>& Paylo
     const int32 Stored = R.I32();               // SerializedScriptSize
     if (R.bBad || Stored < 0 || size_t(Stored) > Payload.size() - R.P) return false;
     R.P += size_t(Stored);
-    Out.Flags = R.P;
+    Out.Tail = R.P;
+    return true;
+}
+}   // namespace
+
+bool ReadFunctionLayout(const FCookedPackage& P, const std::vector<uint8>& Payload, FFunctionLayout& Out)
+{
+    FReader R(Payload);
+    if (!ReadStructHead(P, Payload, R, Out)) return false;
+    Out.Flags = Out.Tail;
     Out.FunctionFlags = R.U32();
     if (Out.FunctionFlags & 0x40) R.U16();      // FUNC_Net: RepOffset
     R.I32(); R.I32();                           // EventGraphFunction, EventGraphCallOffset
     return !R.bBad && R.P == Payload.size();
+}
+
+bool ReadClassLayout(const FCookedPackage& P, const std::vector<uint8>& Payload, FClassLayout& Out)
+{
+    FReader R(Payload);
+    if (!ReadStructHead(P, Payload, R, Out)) return false;
+    Out.FuncMap = Out.Tail;
+    const int32 Count = R.I32();
+    if (!CountFits(R, Count, 12)) return false;
+    Out.Functions.clear();
+    for (int32 I = 0; I < Count; ++I)
+    {
+        const FNameRef Name = R.Name();
+        Out.Functions.emplace_back(Name, R.I32());
+    }
+    Out.AfterFuncMap = R.P;
+    Out.ClassFlags = R.U32();
+    R.I32();                                    // ClassWithin
+    R.Name();                                   // ClassConfigName
+    R.I32();                                    // ClassGeneratedBy
+    const int32 Interfaces = R.I32();
+    if (!CountFits(R, Interfaces, 12)) return false;
+    R.P += size_t(Interfaces) * 12;             // each: Class, PointerOffset, bImplementedByK2
+    R.Bool();                                   // bDeprecatedForceScriptOrder
+    R.Name();                                   // a dummy name
+    R.Bool();                                   // bCooked
+    Out.DefaultObject = R.I32();
+    return !R.bBad && R.P == Payload.size();
+}
+
+bool AddClassFunction(FCookedPackage& P, int32 Class, int32 Function, FNameRef Name, std::string* Err)
+{
+    FClassLayout L;
+    if (!ReadClassLayout(P, P.Exports[size_t(Class)].Payload, L))
+    {
+        *Err = P.NameOf(P.Exports[size_t(Class)].ObjectName) + "'s payload does not read as a cooked class";
+        return false;
+    }
+    std::vector<uint8>& B = P.Exports[size_t(Class)].Payload;
+    auto Insert = [&](size_t At, std::initializer_list<int32> Values) {
+        std::vector<uint8> Bytes(Values.size() * 4);
+        std::memcpy(Bytes.data(), Values.begin(), Bytes.size());
+        B.insert(B.begin() + std::ptrdiff_t(At), Bytes.begin(), Bytes.end());
+    };
+    auto Count = [&](size_t At, size_t N) { const int32 V = int32(N); std::memcpy(B.data() + At, &V, 4); };
+    Insert(L.AfterFuncMap, { Name.Index, Name.Number, Function });     // FuncMap first: it lies past Children
+    Count(L.FuncMap, L.Functions.size() + 1);
+    Insert(L.Properties, { Function });                                 // the last of Children
+    Count(L.Children, L.ChildIndices.size() + 1);
+    P.CreateBeforeSerialize(Class, Function);
+    return true;
 }
 
 bool ReadTags(const FCookedPackage& P, const std::vector<uint8>& Bytes, size_t& At, std::vector<FTag>& Out)
@@ -626,8 +715,8 @@ int RoundTrip(const std::string& Dir)
     size_t Packages = 0, Identical = 0, NamesTotal = 0, HashMismatch = 0, Unsorted = 0, ExportsTotal = 0, Tagged = 0;
     std::map<std::string, std::pair<size_t, std::string>> Refused;      // reason -> count, first path
     std::map<std::string, size_t> Untagged, TagTypes;                   // exports with no tag list by class; tags by type
-    size_t Functions = 0, FunctionsRead = 0;
-    std::string FirstUnread;                                            // the first function ReadFunctionLayout refused
+    size_t Functions = 0, FunctionsRead = 0, Classes = 0, ClassesRead = 0;
+    std::string FirstUnread, FirstUnreadClass;                          // the first function / class the readers refused
     std::vector<std::string> Differ;
     std::error_code Ec;
     for (auto It = std::filesystem::recursive_directory_iterator(std::filesystem::u8path(Dir), Ec);
@@ -665,12 +754,20 @@ int RoundTrip(const std::string& Dir)
         for (FCookedExport& E : P.Exports)
         {
             ++ExportsTotal;
-            if (P.ClassNameOf(E.Class) == "Function")
+            const std::string Of = P.ClassNameOf(E.Class);
+            if (Of == "Function")
             {
                 FFunctionLayout Layout;
                 ++Functions;
                 if (ReadFunctionLayout(P, E.Payload, Layout)) ++FunctionsRead;
                 else if (FirstUnread.empty()) FirstUnread = Shown + ":" + P.NameOf(E.ObjectName);
+            }
+            else if (Of.size() > 14 && Of.compare(Of.size() - 14, 14, "GeneratedClass") == 0)
+            {
+                FClassLayout Layout;
+                ++Classes;
+                if (ReadClassLayout(P, E.Payload, Layout)) ++ClassesRead;
+                else if (FirstUnreadClass.empty()) FirstUnreadClass = Shown + ":" + P.NameOf(E.ObjectName) + " (" + Of + ")";
             }
             size_t At = 0;
             std::vector<FTag> Tags;
@@ -718,6 +815,8 @@ int RoundTrip(const std::string& Dir)
     printf("  tag types: %s\n", Top(TagTypes, 40).c_str());
     printf("  functions whose payload reads exactly (ReadFunctionLayout): %zu of %zu%s%s\n", FunctionsRead, Functions,
            FirstUnread.empty() ? "" : "; first unread: ", FirstUnread.c_str());
+    printf("  classes whose payload reads exactly (ReadClassLayout): %zu of %zu%s%s\n", ClassesRead, Classes,
+           FirstUnreadClass.empty() ? "" : "; first unread: ", FirstUnreadClass.c_str());
     return Packages && Identical == Packages ? 0 : 1;
 }
 

@@ -79,6 +79,9 @@ public:
     /* Dep (an FPackageIndex) created before export row Export is serialized - the edge the cook gives an object that
        export's tags reference. Nothing when Dep is already one of its dependencies. */
     void CreateBeforeSerialize(int32 Export, int32 Dep);
+    /* A copy of export row From named Name, appended with its payload and its dependency run (one on From itself
+       becomes one on the copy). The copy's FPackageIndex. */
+    int32 CopyExport(int32 From, FNameRef Name);
 
     uint32 PackageFlags = 0;
     uint32 Guid[4] = { 0, 0, 0, 0 };
@@ -119,15 +122,15 @@ void WriteTags(const FCookedPackage& P, const std::vector<FTag>& Tags, std::vect
 bool SetTags(FCookedPackage& P, int32 Export, const std::vector<FTag>& Tags, std::string* Err);
 
 /*
-Where a cooked UFunction's payload keeps each part, as UObject / UStruct / UFunction::Serialize write it after the tag
-list: the lazy-object guid, SuperStruct, Children, ChildProperties (a count, then each FProperty through
-SerializeSingleField), the script (BytecodeBufferSize, SerializedScriptSize, the bytes), FunctionFlags, RepOffset
-(FUNC_Net only), EventGraphFunction and EventGraphCallOffset. Offsets into the payload.
+Where a cooked UStruct's payload keeps each part, as UObject / UStruct::Serialize write it after the tag list: the
+lazy-object guid, SuperStruct, Children (a count, then each index: RemoveUField_Next), ChildProperties (a count, then
+each FProperty through SerializeSingleField) and the script (BytecodeBufferSize, SerializedScriptSize, the bytes).
+Offsets into the payload; Tail is just past the script, where the UFunction's or UClass's own fields start.
 */
-struct FFunctionLayout
+struct FStructLayout
 {
-    size_t Super = 0, Properties = 0, Script = 0, Flags = 0;
-    uint32 FunctionFlags = 0;
+    size_t Super = 0, Children = 0, Properties = 0, Script = 0, Tail = 0;
+    std::vector<int32> ChildIndices;
     struct FField                               // one of ChildProperties: its bytes, and the head that says what it is
     {
         size_t Begin = 0, End = 0;
@@ -137,8 +140,33 @@ struct FFunctionLayout
     };
     std::vector<FField> Fields;
 };
+
+/* A UFunction's tail (UFunction::Serialize): FunctionFlags, RepOffset (FUNC_Net only), EventGraphFunction and
+   EventGraphCallOffset. Flags is Tail. */
+struct FFunctionLayout : FStructLayout
+{
+    size_t Flags = 0;
+    uint32 FunctionFlags = 0;
+};
 /* False unless the payload is exactly that, every property of a type the reader knows. */
 bool ReadFunctionLayout(const FCookedPackage& P, const std::vector<uint8>& Payload, FFunctionLayout& Out);
+
+/* A UClass's tail (4.27 UClass::Serialize): FuncMap (a count, then each name and function), ClassFlags, ClassWithin,
+   ClassConfigName, ClassGeneratedBy, Interfaces (a count, then each class, pointer offset and bImplementedByK2),
+   bDeprecatedForceScriptOrder, a dummy name, bCooked and the class default object. FuncMap is Tail. */
+struct FClassLayout : FStructLayout
+{
+    size_t FuncMap = 0, AfterFuncMap = 0;
+    std::vector<std::pair<FNameRef, int32>> Functions;
+    uint32 ClassFlags = 0;
+    int32 DefaultObject = 0;
+};
+bool ReadClassLayout(const FCookedPackage& P, const std::vector<uint8>& Payload, FClassLayout& Out);
+
+/* S38: Function (an FPackageIndex, an export of Class's) added to class export row Class's Children and FuncMap under
+   Name, and created before the class is serialized, as the cook orders a class's own functions. False, saying why,
+   when the class's payload does not read. */
+bool AddClassFunction(FCookedPackage& P, int32 Class, int32 Function, FNameRef Name, std::string* Err);
 
 /* The gate before any edit is trusted: every cooked package under Dir read and written back in memory, with a report
    of what was refused, what came back different, and whether AssetGen's name hashes and name order match the cook's.

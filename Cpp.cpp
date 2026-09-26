@@ -991,6 +991,7 @@ private:
     FEdited* LoadEdited(const std::string& Package, const std::string& Where, std::string* Err);
     bool TransplantFunctions(const FRecord& R, const FRecord& B, const FPackage& Scratch, FIndex ScratchClass,
                              std::string* Err);
+    std::map<std::string, FIndex> PatchSupers;              // "Patch::Method" -> what it would override, in its scratch
     std::map<std::string, const Json*> EditTargets;         // UE_ASSET_EDIT: Ns + its number -> `&Asset`'s variable
     std::vector<std::pair<std::string, const Json*>> Edits; // ... -> the braced variable holding the edit
     bool GenerateStruct(const FRecord& R, const std::string& OutDir, std::string* Err);
@@ -8561,7 +8562,9 @@ class chain, and what callers and the replication layer expect of it. The rest i
 (the parameters, then its locals) and its script. The event-graph link goes, since the body no longer jumps into the
 ubergraph. The payload is written with the cooked package's names, a missing one appended, and every object index
 remapped: the scratch class, its default object and its functions to B's; an object inside B's package to its export;
-anything else to an import of it, found or appended.
+anything else to an import of it, found or appended. A replaced function that a body calls as `Parent::Method()` keeps
+the game's body in a copy of its export, which that call reaches instead (a UFunction links itself as it loads,
+Class.cpp:1881, so the copy needs only its row, its dependencies and its place in the class's Children and FuncMap).
 */
 bool FCompiler::TransplantFunctions(const FRecord& R, const FRecord& B, const FPackage& Scratch, FIndex ScratchClass,
                                     std::string* Err)
@@ -8579,41 +8582,141 @@ bool FCompiler::TransplantFunctions(const FRecord& R, const FRecord& B, const FP
         return F.OuterIndex.V == ScratchClass.V && Of && Of->ObjectName == "Function";
     };
 
+    /* What a method would override (Generate wrote none into the scratch), and whether that is an object of B's own. */
+    auto SuperOf = [&](const FExport& F) {
+        const auto It = PatchSupers.find(R.CppName + "::" + F.ObjectName);
+        return It != PatchSupers.end() ? It->second : FIndex{};
+    };
+    auto PackageOfImport = [&](FIndex I) {
+        while (Scratch.ImportAt(I)->Outer.V < 0) I = Scratch.ImportAt(I)->Outer;
+        return Lower(Scratch.ImportAt(I)->ObjectName);
+    };
+    auto InB = [&](FIndex I) { return I.V < 0 && PackageOfImport(I) == Lower(Package); };
+    /* The scratch names objects of its own package (its class, a function of it) as imports too, as every compile
+       does (a dependency on a method it calls by name); here they are B's, found by name once the added rows exist. */
+    const std::string Own = Lower(PackageOf(R)), ScratchName = Rows[size_t(ScratchClass.V - 1)].ObjectName;
+    auto IsOwn = [&](FIndex I) { return I.V < 0 && PackageOfImport(I) == Own; };
+    auto OwnInB = [&](FIndex I) -> int32 {
+        const FImport* Im = Scratch.ImportAt(I);
+        const FImport* Outer = Scratch.ImportAt(Im->Outer);
+        if (Outer->Outer.V == 0)                                    // in the package itself: the class, its default
+        {
+            if (Im->ObjectName == ScratchName) return ClassExport + 1;
+            if (Im->ObjectName == "Default__" + ScratchName) return P.FindExport("Default__" + Class) + 1;
+        }
+        else if (Outer->ObjectName == ScratchName && Scratch.ImportAt(Outer->Outer)->Outer.V == 0)
+            return P.FindExport(Im->ObjectName, ClassExport + 1) + 1;  // a function of the class
+        return 0;
+    };
+
+    /* A method replaces B's function of its name. Where B has none it is added to B: a new function, or an override of
+       one B inherits (from a parent Blueprint, or native). */
+    std::set<std::string> Added;            // lowercased
     for (const FExport& F : Rows)
     {
         if (!IsFunction(F)) continue;
         const int32 Fn = P.FindExport(F.ObjectName, ClassExport + 1);
-        if (Fn < 0 || P.ClassNameOf(P.Exports[size_t(Fn)].Class) != "Function")
+        if (Fn >= 0 && P.ClassNameOf(P.Exports[size_t(Fn)].Class) == "Function") continue;
+        if (Fn >= 0)
         {
-            *Err = Where + "::" + F.ObjectName + ": " + Class + " has no function of that name of its own. A patch replaces a "
-                   "function its Blueprint defines (one it inherits is patched in the Blueprint that defines it); adding one "
-                   "is not built yet";
+            *Err = Where + "::" + F.ObjectName + ": " + Class + "'s " + F.ObjectName + " is a "
+                   + P.ClassNameOf(P.Exports[size_t(Fn)].Class) + ", not a function";
             return false;
         }
+        if (InB(SuperOf(F)))
+        {
+            *Err = Where + "::" + F.ObjectName + ": " + Class + " has no function of that name of its own, though its "
+                   "declaration has one: the declaration is not the game's";
+            return false;
+        }
+        Added.insert(Lower(F.ObjectName));
     }
 
     /* Pass one: the imports the functions name. Each is made P's before the writer seeds its names from P, since an
-       import adds its names to P's table. */
+       import adds its names to P's table. An added function's row and dependencies are written too, not kept. */
     std::map<int32, int32> Moved;
+    std::set<int32> InBodies;               // the imports the payloads name, as against only their dependencies
     std::string Bad;
     {
         std::set<int32> Named;
         FPackage Probe(Package);
-        Probe.RemapIndex = [&](FIndex V) { if (V.V < 0) Named.insert(V.V); return V; };
+        Probe.RemapIndex = [&](FIndex V) { if (V.V < 0) InBodies.insert(V.V); return V; };
         for (const FExport& F : Rows)
             if (IsFunction(F))
             {
                 FArc Ar(&Probe);
                 F.Serialize(Ar);
                 for (int32 Dep : F.CreateBeforeSer) if (Dep < 0) Named.insert(Dep);
+                if (!Added.count(Lower(F.ObjectName))) continue;
+                for (const std::vector<int32>* List : { &F.SerBeforeSer, &F.SerBeforeCreate, &F.CreateBeforeCreate })
+                    for (int32 Dep : *List) if (Dep < 0) Named.insert(Dep);
+                for (const FIndex I : { F.ClassIndex, F.TemplateIndex, SuperOf(F) }) if (I.V < 0) Named.insert(I.V);
             }
+        Named.insert(InBodies.begin(), InBodies.end());
         for (int32 I : Named)
-            if (!ImportInto(P, Package, Scratch, I, Moved, &Bad)) { *Err = Where + ": " + Bad; return false; }
+            if (!IsOwn(FIndex{ I }) && !ImportInto(P, Package, Scratch, I, Moved, &Bad)) { *Err = Where + ": " + Bad; return false; }
+    }
+
+    /* `Parent::Method()` names a function of B's that the patch replaces: it calls the game's body, kept as a copy
+       beside it (<Method>__Vanilla) and listed in the class as any function of it is. The copy overrides nothing. A
+       dependency alone is no call: a scratch function depends on the function it would override. */
+    std::map<int32, int32> Kept;            // a replaced function's FPackageIndex -> its copy's
+    for (const int32 From : InBodies)
+    {
+        if (IsOwn(FIndex{ From })) continue;
+        const int32 To = Moved.at(From);
+        if (To <= 0 || Kept.count(To)) continue;
+        const std::string Name = P.NameOf(P.Exports[size_t(To - 1)].ObjectName);
+        if (P.Exports[size_t(To - 1)].Outer != ClassExport + 1 || P.ClassNameOf(P.Exports[size_t(To - 1)].Class) != "Function"
+            || std::none_of(Rows.begin(), Rows.end(), [&](const FExport& F) { return IsFunction(F) && Lower(F.ObjectName) == Lower(Name); }))
+            continue;
+        FFunctionLayout L;
+        if (!ReadFunctionLayout(P, P.Exports[size_t(To - 1)].Payload, L))
+        { *Err = Where + "::" + Name + ": the game's function does not read as a cooked UFunction"; return false; }
+        const std::string CopyName = Name + "__Vanilla";
+        if (P.FindExport(CopyName, ClassExport + 1) >= 0)
+        { *Err = Where + ": " + Class + " already holds a " + CopyName + " (patched before?)"; return false; }
+        const FNameRef CopyRef = P.NameRef(CopyName);
+        const int32 Copy = P.CopyExport(To - 1, CopyRef);
+        FCookedExport& C = P.Exports[size_t(Copy - 1)];
+        std::memset(C.Payload.data() + L.Super, 0, 4);         // SuperStruct
+        C.Super = 0;
+        /* An RPC's copy is a plain function. With FUNC_Net and no super it would be a net field of the class's own
+           (Class.cpp:4189), shifting the RPC indices against the game's, and a call to it would be routed again
+           (CallFunction's call space). Parent:: means the body, run where the RPC already arrived. */
+        if (L.FunctionFlags & FUNC_Net)
+        {
+            const uint32 Plain = L.FunctionFlags & ~uint32(FUNC_Net | FUNC_NetReliable | FUNC_NetServer | FUNC_NetClient
+                                                            | FUNC_NetMulticast | FUNC_NetValidate);
+            std::memcpy(C.Payload.data() + L.Flags, &Plain, 4);
+            C.Payload.erase(C.Payload.begin() + std::ptrdiff_t(L.Flags + 4), C.Payload.begin() + std::ptrdiff_t(L.Flags + 6));   // RepOffset
+        }
+        if (!AddClassFunction(P, ClassExport, Copy, CopyRef, &Bad)) { *Err = Where + ": " + Bad; return false; }
+        Kept[To] = Copy;
+        Ed->Objects.push_back(Class + "::" + CopyName + " (the game's " + Name + ", kept)");
+    }
+
+    /* An added function's row, before pass two: a method calling it by index finds it there. Its payload and its
+       dependencies are pass two's. */
+    for (const FExport& F : Rows)
+    {
+        if (!IsFunction(F) || !Added.count(Lower(F.ObjectName))) continue;
+        FCookedExport E;
+        E.Class = Moved.at(F.ClassIndex.V);
+        E.Template = Moved.at(F.TemplateIndex.V);
+        E.Outer = ClassExport + 1;
+        const FIndex Super = SuperOf(F);
+        E.Super = Super.V < 0 ? Moved.at(Super.V) : 0;
+        E.ObjectName = P.NameRef(F.ObjectName);
+        E.ObjectFlags = F.ObjectFlags;
+        P.Exports.push_back(std::move(E));
+        if (!AddClassFunction(P, ClassExport, int32(P.Exports.size()), P.Exports.back().ObjectName, &Bad))
+        { *Err = Where + ": " + Bad; return false; }
+        Ed->Objects.push_back(Class + "::" + F.ObjectName + (Super.V < 0 ? " (added, an override)" : " (added)"));
     }
 
     /* Pass two, for real. */
     int32 Replacing = 0;                    // the cooked function being written, as an FPackageIndex
-    bool bInBody = false;
     FPackage Sink(Package);
     {
         std::vector<std::string> Texts;
@@ -8621,14 +8724,18 @@ bool FCompiler::TransplantFunctions(const FRecord& R, const FRecord& B, const FP
         Sink.SeedNames(Texts);
     }
     Sink.RemapIndex = [&](FIndex V) -> FIndex {
+        if (IsOwn(V))
+        {
+            if (Scratch.ImportAt(V)->Outer.V == 0) return Null();      // the package itself: a dependency, at most
+            const int32 E = OwnInB(V);
+            if (E <= 0 && Bad.empty()) Bad = "names " + Scratch.ImportAt(V)->ObjectName + " of its own, which " + Class + " does not hold";
+            return FIndex{ E };
+        }
         if (V.V < 0)
         {
             const int32 To = Moved.at(V.V);
-            /* The function being replaced, named as an import, is `Parent::Method()` from inside its own new body. */
-            if (bInBody && To == Replacing && Bad.empty())
-                Bad = "calls the function it replaces (" + Class + "::" + P.NameOf(P.Exports[size_t(To - 1)].ObjectName)
-                      + "); keeping the game's body under another name to call is not built yet";
-            return FIndex{ To };
+            const auto K = Kept.find(To);
+            return FIndex{ K != Kept.end() ? K->second : To };
         }
         if (V.V == 0) return V;
         /* The scratch class is B's class, its default object B's, a function of it B's function of that name. */
@@ -8648,21 +8755,38 @@ bool FCompiler::TransplantFunctions(const FRecord& R, const FRecord& B, const FP
     {
         if (!IsFunction(F)) continue;
         const int32 Fn = P.FindExport(F.ObjectName, ClassExport + 1);
+        const bool bAdded = Added.count(Lower(F.ObjectName)) != 0;
         FFunctionLayout Old, New;
-        if (!ReadFunctionLayout(P, P.Exports[size_t(Fn)].Payload, Old))
+        if (!bAdded && !ReadFunctionLayout(P, P.Exports[size_t(Fn)].Payload, Old))
         { *Err = Where + "::" + F.ObjectName + ": the game's function does not read as a cooked UFunction"; return false; }
 
         Replacing = Fn + 1;
         FArc Ar(&Sink);
-        bInBody = true;
         F.Serialize(Ar);
-        bInBody = false;
-        for (int32 Dep : F.CreateBeforeSer)
-            if (const FIndex To = Sink.RemapIndex(FIndex{ Dep }); To.V != 0 && To.V != Replacing) P.CreateBeforeSerialize(Fn, To.V);
+        if (bAdded)                         // its own run, at the end: the four phases in order
+        {
+            FCookedExport& E = P.Exports[size_t(Fn)];
+            E.FirstExportDependency = int32(P.PreloadDependencies.size());
+            int32* const Counts[] = { &E.SerBeforeSer, &E.CreateBeforeSer, &E.SerBeforeCreate, &E.CreateBeforeCreate };
+            const std::vector<int32>* const Lists[] = { &F.SerBeforeSer, &F.CreateBeforeSer, &F.SerBeforeCreate, &F.CreateBeforeCreate };
+            for (size_t K = 0; K < 4; ++K)
+                for (int32 Dep : *Lists[K])
+                    if (const FIndex To = Sink.RemapIndex(FIndex{ Dep }); To.V != 0) { P.PreloadDependencies.push_back(To.V); ++*Counts[K]; }
+        }
+        else
+            for (int32 Dep : F.CreateBeforeSer)
+                if (const FIndex To = Sink.RemapIndex(FIndex{ Dep }); To.V != 0 && To.V != Replacing) P.CreateBeforeSerialize(Fn, To.V);
         if (!Bad.empty()) { *Err = Where + "::" + F.ObjectName + ": " + Bad; return false; }
         for (size_t I = P.Names.size(); I < Sink.NameTable().size(); ++I) P.Names.push_back({ Sink.NameTable()[I] });
         if (!ReadFunctionLayout(P, Ar.B, New))
         { *Err = Where + "::" + F.ObjectName + ": internal: the compiled function does not read back"; return false; }
+        if (bAdded)                         // all of it the method's, and the function it overrides, if any
+        {
+            std::vector<uint8> Out = Ar.B;
+            std::memcpy(Out.data() + New.Super, &P.Exports[size_t(Fn)].Super, 4);
+            P.Exports[size_t(Fn)].Payload = std::move(Out);
+            continue;
+        }
 
         /* The parameters stay the game's, byte for byte: every caller was cooked against them, and UeApi's `T&` cannot
            tell a Blueprint output pin (Parm | OutParm) from an in-out reference (+ ReferenceParm). So the method's must
@@ -8703,8 +8827,8 @@ bool FCompiler::TransplantFunctions(const FRecord& R, const FRecord& B, const FP
         for (const FField* Parm : Theirs) Out.insert(Out.end(), Vanilla.begin() + std::ptrdiff_t(Parm->Begin), Vanilla.begin() + std::ptrdiff_t(Parm->End));
         for (const FField* Local : Locals) Out.insert(Out.end(), Ar.B.begin() + std::ptrdiff_t(Local->Begin), Ar.B.begin() + std::ptrdiff_t(Local->End));
         Out.insert(Out.end(), Ar.B.begin() + std::ptrdiff_t(New.Script), Ar.B.begin() + std::ptrdiff_t(New.Flags));      // the script
-        const size_t Kept = 4 + ((Old.FunctionFlags & 0x40) ? 2 : 0);                      // FunctionFlags, RepOffset
-        Out.insert(Out.end(), Vanilla.begin() + std::ptrdiff_t(Old.Flags), Vanilla.begin() + std::ptrdiff_t(Old.Flags + Kept));
+        const size_t FlagBytes = 4 + ((Old.FunctionFlags & FUNC_Net) ? 2 : 0);             // FunctionFlags, RepOffset
+        Out.insert(Out.end(), Vanilla.begin() + std::ptrdiff_t(Old.Flags), Vanilla.begin() + std::ptrdiff_t(Old.Flags + FlagBytes));
         Out.resize(Out.size() + 8, 0);                                                      // no event-graph link
         P.Exports[size_t(Fn)].Payload = std::move(Out);
         Ed->Objects.push_back(Class + "::" + F.ObjectName + " (replaced)");
@@ -9455,7 +9579,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
 
         if (auto Cat = R.Categories.find(Fn.Name); Cat != R.Categories.end()) BP.ApiCategory[UeNameOf(&R, Fn.Name)] = Cat->second;
         /* A patch's method is written over the function it overrides (TransplantFunctions), which keeps its own super:
-           naming it here would make the function its own parent. */
+           naming it here would make the function its own parent. One B lacks is added with this super. */
+        if (R.bIsPatch) PatchSupers[R.CppName + "::" + UeNameOf(&R, Fn.Name)] = Super;
         BP.AddFunction(UeNameOf(&R, Fn.Name), R.bIsPatch ? Null() : Super, Params,
                        [Stmts, bEndsWithReturn, bScratchNeeded, DerefStruct, bOpt = !bCurNoOpt](FScript& S, FIndex SelfExp) {
             if (bScratchNeeded)
