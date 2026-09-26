@@ -1848,6 +1848,12 @@ def static_assets():
     ed = tags_of('ED_AssetTest')
     assert objs('ED_AssetTest', ed['VeteranClasses'].split()[-1]) == ['/Game/Enemies/Spider/Grunt/ED_Spider_Grunt.ED_Spider_Grunt'], ed
     assert ed['SpawnSpread'].endswith(': 250.0') and ed['IdealSpawnSize'].endswith(': 4') and 'value=1' in ed['CanBeUsedForConstantPressure'], ed
+    # A soft class is tagged SoftObjectProperty, as the cook tags ED_Spider_Grunt's own EnemyClass: a tag naming
+    # SoftClassProperty is dropped at load as a type mismatch. The value is the path (an FName) and an empty sub-path.
+    assert ed['EnemyClass'].startswith('SoftObjectProperty size=12:'), ed['EnemyClass']
+    soft = struct.unpack('<3i', bytes.fromhex(ed['EnemyClass'].split()[-1]))
+    assert dumpexp.load(base('ED_AssetTest'))[3][soft[0]] == '/Game/Enemies/Spider/Grunt/ENE_Spider_Grunt_Normal.ENE_Spider_Grunt_Normal_C' \
+        and soft[1:] == (0, 0), soft
     print('ok  AssetTest: each declared object is an asset of its class with the members its braces name')
     # AssetUser's defaults: a pointer, an array, a set and two maps, object elements by package path.
     user = base('AssetUser')
