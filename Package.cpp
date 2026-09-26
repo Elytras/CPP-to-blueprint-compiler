@@ -253,12 +253,26 @@ int32 FPackage::NameIndex(const std::string& S)
     const std::string Key = Lower(Base);
     auto It = NameLookup.find(Key);
     if (It != NameLookup.end()) return It->second;
+    if (bAppendNames)
+    {
+        NameLookup.emplace(Key, int32(Names.size()));
+        Names.push_back(Base);
+        return int32(Names.size()) - 1;
+    }
 
     // Pass one returns 0 for everything; every FName is 8 bytes regardless, so sizes still line up.
     if (bNamesFinal) return 0;
     NameLookup.emplace(Key, 0);
     Names.push_back(Base);
     return 0;
+}
+
+void FPackage::SeedNames(const std::vector<std::string>& Existing)
+{
+    Names = Existing;
+    NameLookup.clear();
+    for (int32 I = 0; I < int32(Names.size()); ++I) NameLookup.emplace(Lower(Names[size_t(I)]), I);     // the first of a case pair
+    bNamesFinal = bAppendNames = true;
 }
 
 bool FPackage::Save(const std::string& OutBaseNoExt, std::string* Err) const

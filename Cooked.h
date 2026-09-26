@@ -67,6 +67,19 @@ public:
     /* The name of the class an export or import index names: an import's ObjectName, or an export's own. */
     std::string ClassNameOf(int32 Index) const;
 
+    /* S38 edits. Every index the package already uses stays valid: a name or an import it lacks is appended. */
+    /* S as an FName of this package ("Base_<n>" split off as FName does), appended if the table lacks it. */
+    FNameRef NameRef(const std::string& S);
+    /* Whether N is the FName S spells (the same number, the base compared case-insensitively). */
+    bool SameName(const FNameRef& N, const std::string& S) const;
+    /* The export row of a top-level object (outer null) named ObjectName, or -1. */
+    int32 FindExport(const std::string& ObjectName) const;
+    /* The FPackageIndex of the import (ClassPackage, ClassName, Outer, ObjectName), appended when there is none. */
+    int32 Import(const std::string& ClassPackage, const std::string& ClassName, int32 Outer, const std::string& ObjectName);
+    /* Dep (an FPackageIndex) created before export row Export is serialized - the edge the cook gives an object that
+       export's tags reference. Nothing when Dep is already one of its dependencies. */
+    void CreateBeforeSerialize(int32 Export, int32 Dep);
+
     uint32 PackageFlags = 0;
     uint32 Guid[4] = { 0, 0, 0, 0 };
     uint32 PackageSource = 0;
@@ -99,6 +112,11 @@ struct FTag
 bool ReadTags(const FCookedPackage& P, const std::vector<uint8>& Bytes, size_t& At, std::vector<FTag>& Out);
 /* The tags and the None that ends them. */
 void WriteTags(const FCookedPackage& P, const std::vector<FTag>& Tags, std::vector<uint8>& Out);
+
+/* S38: Tags into the tag list export row Export's payload starts with, each replacing the tag of its name and array
+   index or appended after the rest; what follows the list's None stays as it was. False, saying why, when the
+   payload does not start with a tag list. */
+bool SetTags(FCookedPackage& P, int32 Export, const std::vector<FTag>& Tags, std::string* Err);
 
 /* The gate before any edit is trusted: every cooked package under Dir read and written back in memory, with a report
    of what was refused, what came back different, and whether AssetGen's name hashes and name order match the cook's.

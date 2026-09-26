@@ -26,6 +26,7 @@ static int ProcessId() { return getpid(); }
 #include <nlohmann/json.hpp>
 
 #include "Blueprint.h"
+#include "Cooked.h"
 #include "Package.h"
 #include "Registry.h"
 #include "Script.h"
@@ -180,12 +181,45 @@ void ExpandAliases(Json& N, const std::map<std::string, std::string>& InScope)
 
 /* A CXXOperatorCallExpr whose callee is operator=: struct assignment, which clang does not spell
    as a BinaryOperator. The callee is the first inner node. */
+/* A UE_ASSET_AT path: "/Game/Dir/Pkg.Object" names an object other than the package's namesake, "/Game/Dir/Pkg" means
+   Pkg.Pkg. Path becomes the package; the object's name is returned. */
+std::string SplitAssetPath(std::string& Path)
+{
+    std::string Object = Path.substr(Path.rfind('/') + 1);
+    if (const size_t Dot = Object.find('.'); Dot != std::string::npos)
+    {
+        Path.resize(Path.size() - (Object.size() - Dot));
+        Object = Object.substr(Dot + 1);
+    }
+    return Object;
+}
+
 bool IsAssignOperatorCall(const Json& N)
 {
     const Json* Callee = Strip(First(N));
     if (!Callee || Kind(*Callee) != "DeclRefExpr") return false;
     auto Ref = Callee->find("referencedDecl");
     return Ref != Callee->end() && Ref->value("name", std::string()) == "operator=";
+}
+
+/* One UE_DEFAULTS statement, `Field = value;` or `Component->Field = value;`: the field's MemberExpr, the value, and
+   the component's MemberExpr it reaches through (null for none). False for any other statement. Assigning a struct is
+   an operator call, not a BinaryOperator: its inner is the callee then the two operands, so both shapes are read the
+   same way one index on. */
+bool DefaultAssignment(const Json& S, const Json*& Lhs, const Json*& Rhs, const Json*& Through)
+{
+    const Json* Assign = Strip(&S);
+    const std::string AK = Assign ? Kind(*Assign) : std::string();
+    const bool bOpCall = AK == "CXXOperatorCallExpr";
+    const size_t Base = bOpCall ? 1 : 0;
+    Lhs = Assign ? Strip(Nth(*Assign, Base)) : nullptr;
+    Rhs = Assign ? Nth(*Assign, Base + 1) : nullptr;
+    const bool bAssign = bOpCall ? IsAssignOperatorCall(*Assign)
+                                 : AK == "BinaryOperator" && Assign->value("opcode", std::string()) == "=";
+    if (!Assign || !bAssign || !Lhs || Kind(*Lhs) != "MemberExpr" || !Rhs) return false;
+    const Json* Owner = Strip(First(*Lhs));
+    Through = Owner && Kind(*Owner) == "MemberExpr" ? Owner : nullptr;
+    return true;
 }
 
 /* A clang StringLiteral spelling (prefix, quotes, escapes) as UTF-8. clang escapes a narrow
@@ -386,9 +420,10 @@ struct FRecord
     bool bIsLocal = false;      // UePackage == ModPackage/CppName: cooked here, published at its /Game path
     bool bIsStruct = false;     // UE_STRUCT: cooked as a UserDefinedStruct asset
     bool bIsInterface = false;  // UE_INTERFACE: cooked as a BPGC whose super is UInterface
+    bool bIsPatch = false;      // UE_PATCH: not a class of its own; its UE_DEFAULTS edit its parent's, in the parent's package
 
     bool IsNative() const { return !UePackage.empty() && !bIsLocal; }
-    bool IsGenerated() const { return !IsNative() && (bIsStruct || bIsInterface || !Base.empty()); }
+    bool IsGenerated() const { return !IsNative() && !bIsPatch && (bIsStruct || bIsInterface || !Base.empty()); }
     /* A UserDefinedStruct: cooked here, or cooked by the mod its UE_STRUCT_IN names and imported. */
     bool IsModStruct() const { return bIsStruct && (UePackage.empty() || UePackage.compare(0, 6, "/Game/") == 0); }
 };
@@ -937,10 +972,23 @@ class FCompiler
 public:
     bool Run(const std::string& SourcePath, const std::string& IncludeDir,
              const std::string& OutDir, const std::optional<std::string>& InApiDir, std::string* Err);
+    std::string GameDir;        // `--game`: the folder /Game is in, in the extracted game pak - what an edit reads
 
 private:
     bool Collect(std::string* Err);
     bool Generate(const FRecord& R, const std::string& OutDir, std::string* Err);
+    /* S38: UE_ASSET_EDIT and UE_PATCH, the game's own packages with only the named tags changed. */
+    bool GenerateEdit(const std::string& Key, const Json& Var, std::string* Err);
+    bool GeneratePatch(const FRecord& R, std::string* Err);
+    bool ApplyEdit(const std::string& Package, const std::string& Object, std::vector<FPropertyDef> Defs,
+                   const FPackage& From, const std::string& Where, std::string* Err);
+    bool SaveEdits(const std::string& OutDir, std::string* Err);
+    bool BracedMembers(const Json& List, const FRecord& Rec, const std::string& Where, FBlueprintClass& BP, bool bKeepZero,
+                       std::vector<FPropertyDef>& Out, std::string* Err);
+    struct FEdited { std::string Package, Ext; FCookedPackage P; std::vector<std::string> Objects; };
+    std::map<std::string, FEdited> Edited;                  // lowercased package name -> the game's package, edited
+    std::map<std::string, const Json*> EditTargets;         // UE_ASSET_EDIT: Ns + its number -> `&Asset`'s variable
+    std::vector<std::pair<std::string, const Json*>> Edits; // ... -> the braced variable holding the edit
     bool GenerateStruct(const FRecord& R, const std::string& OutDir, std::string* Err);
     bool GenerateInterface(const FRecord& R, const std::string& OutDir, std::string* Err);
     /* Every T& parm is treated as an out-parm; the return value is the caller's to append. */
@@ -1713,6 +1761,17 @@ bool FCompiler::Collect(std::string* Err)
         if ((Kind(N) == "TypeAliasDecl" || Kind(N) == "TypedefDecl") && N.contains("name"))
             Aliases[Ns + Name(N)] = Aliases[Name(N)] = StripTypeKeywords(TypeOf(N));
         if (Kind(N) == "VarDecl" && Name(N) == "UeModPackage") FindLiteral(N, ModPackage);
+        /* UE_ASSET_EDIT: a pointer naming the target, then the braced variable holding the edit, one number between them. */
+        if (Kind(N) == "VarDecl" && Name(N).compare(0, 10, "UeEditOf__") == 0)
+        {
+            EditTargets[Ns + Name(N).substr(10)] = &N;
+            return;
+        }
+        if (Kind(N) == "VarDecl" && Name(N).compare(0, 8, "UeEdit__") == 0)
+        {
+            Edits.emplace_back(Ns + Name(N).substr(8), &N);
+            return;
+        }
         if (Kind(N) == "VarDecl" && BracedInit(N)) AssetDecls.push_back(&N);
         if (Kind(N) == "VarDecl" && !Ns.empty()) VarScope[N.value("id", std::string())] = Ns;
         if (Kind(N) == "VarDecl") NsVars[N.value("id", std::string())] = NsVarNamed[Ns + Name(N)] = &N;
@@ -1826,6 +1885,10 @@ bool FCompiler::Collect(std::string* Err)
             else if (Kind(C) == "VarDecl" && Name(C) == "UeInterfaceMeta")
             {
                 R.bIsInterface = true;
+            }
+            else if (Kind(C) == "VarDecl" && Name(C) == "UePatchMeta")
+            {
+                R.bIsPatch = true;
             }
             else if (Kind(C) == "VarDecl" && Name(C) == "UeStructMeta")
             {
@@ -7564,13 +7627,7 @@ bool FCompiler::AssetRef(const Json& N, FBlueprintClass& BP, FIndex* Out)
         Package = PathIn(ModPackage, Qual);
     else return false;
 
-    /* "/Game/Dir/Pkg.Object" names an object other than the package's namesake; "/Game/Dir/Pkg" means Pkg.Pkg. */
-    std::string Object = Package.substr(Package.rfind('/') + 1);
-    if (const size_t Dot = Object.find('.'); Dot != std::string::npos)
-    {
-        Package.resize(Package.size() - (Object.size() - Dot));
-        Object = Object.substr(Dot + 1);
-    }
+    const std::string Object = SplitAssetPath(Package);
     *Out = BP.Asset(PackageOf(*R), ClassOf(*R), Package, Object);
     return true;
 }
@@ -8161,8 +8218,33 @@ bool FCompiler::GenerateEnum(const std::string& Enum, const std::string& OutDir,
     return true;
 }
 
-/* Measured on ED_Spider_Grunt. The initializer's semantic form lists the bases first, then every field in order,
-   so a designator is found by position. Only a field the braces name is written: the rest stay the CDO's. */
+/* The members a braced initializer of a Rec names, typed and lowered, in order. Measured on ED_Spider_Grunt: the
+   semantic form lists the bases first, then every field in order, so a designator is found by position. A member
+   the braces leave out is skipped. */
+bool FCompiler::BracedMembers(const Json& List, const FRecord& Rec, const std::string& Where, FBlueprintClass& BP,
+                              bool bKeepZero, std::vector<FPropertyDef>& Out, std::string* Err)
+{
+    size_t I = 0;
+    if (!Rec.Base.empty())
+    {
+        const FRecord* B = Find(Rec.Base);
+        const Json* Sub = Nth(List, I++);
+        if (B && Sub && Kind(*Sub) == "InitListExpr" && !BracedMembers(*Sub, *B, Where, BP, bKeepZero, Out, Err)) return false;
+    }
+    I += Rec.Interfaces.size();
+    for (const Json* F : Rec.Fields)
+    {
+        const Json* Init = Strip(Nth(List, I++));
+        if (!Init || IsUnsetInit(*Init)) continue;
+        FPropertyDef PD;
+        if (!TypeToProperty(TypeOf(*F), UeNameOf(&Rec, Name(*F)), 0, Where + "." + Name(*F), BP, &PD, Err)) return false;
+        if (!LowerDefault(*F, PD, BP, Err, Init, bKeepZero)) return false;
+        Out.push_back(PD);
+    }
+    return true;
+}
+
+/* Only a field the braces name is written: the rest stay the CDO's. */
 bool FCompiler::GenerateAsset(const Json& Var, const std::string& OutDir, std::string* Err)
 {
     const FRecord* R = Find(StripTypeKeywords(TypeOf(Var)));
@@ -8176,28 +8258,9 @@ bool FCompiler::GenerateAsset(const Json& Var, const std::string& OutDir, std::s
     StampIdentity(P, PackageName);
     FBlueprintClass BP(P, AssetName, "", "", false);
 
-    const auto Unset = IsUnsetInit;
-    std::function<bool(const Json&, const FRecord&)> Fill = [&](const Json& List, const FRecord& Rec) {
-        size_t I = 0;
-        if (!Rec.Base.empty())
-        {
-            const FRecord* B = Find(Rec.Base);
-            const Json* Sub = Nth(List, I++);
-            if (B && Sub && Kind(*Sub) == "InitListExpr" && !Fill(*Sub, *B)) return false;
-        }
-        I += Rec.Interfaces.size();
-        for (const Json* F : Rec.Fields)
-        {
-            const Json* Init = Strip(Nth(List, I++));
-            if (!Init || Unset(*Init)) continue;
-            FPropertyDef PD;
-            if (!TypeToProperty(TypeOf(*F), UeNameOf(&Rec, Name(*F)), 0, AssetName + "." + Name(*F), BP, &PD, Err)) return false;
-            if (!LowerDefault(*F, PD, BP, Err, Init)) return false;
-            BP.AddVariable(PD);
-        }
-        return true;
-    };
-    if (!Fill(*BracedInit(Var), *R)) return false;
+    std::vector<FPropertyDef> Set;
+    if (!BracedMembers(*BracedInit(Var), *R, AssetName, BP, false, Set, Err)) return false;
+    for (const FPropertyDef& PD : Set) BP.AddVariable(PD);
 
     const std::string ClassPkg = PackageOf(*R), ClassName = ClassOf(*R);
     /* The CDO's import first, as MSVC evaluates call arguments (right to left); clang goes left to right. */
@@ -8206,6 +8269,204 @@ bool FCompiler::GenerateAsset(const Json& Var, const std::string& OutDir, std::s
     if (!SavePackage(P, OutDir, PackageName, Err)) return false;
     RegistryRows.push_back({ PackageName, AssetName, ClassName });
     printf("  %-14s -> %s.uasset  (asset, a %s)\n", AssetName.c_str(), Shown(PackageName).c_str(), R->CppName.c_str());
+    return true;
+}
+
+/*
+S38 - UE_ASSET_EDIT(Asset) { .Member = value, ... }: the members the braces name, written into Asset's own package as
+the game cooked it. The target is a UE_ASSET_AT; a mod's own asset takes its values where it is declared.
+*/
+bool FCompiler::GenerateEdit(const std::string& Key, const Json& Var, std::string* Err)
+{
+    const auto Of = EditTargets.find(Key);
+    std::function<const Json*(const Json&)> RefIn = [&](const Json& N) -> const Json* {
+        if (Kind(N) == "DeclRefExpr" && N.contains("referencedDecl")) return &N;
+        const Json* Found = nullptr;
+        ForEach(N, [&](const Json& C) { if (!Found) Found = RefIn(C); });
+        return Found;
+    };
+    const Json* Ref = Of == EditTargets.end() ? nullptr : RefIn(*Of->second);
+    if (!Ref || !BracedInit(Var)) { *Err = "UE_ASSET_EDIT: write it as `UE_ASSET_EDIT(Asset) { .Member = value };`"; return false; }
+    const Json& D = (*Ref)["referencedDecl"];
+    const auto Scope = VarScope.find(D.value("id", std::string()));
+    const std::string Qual = (Scope == VarScope.end() ? std::string() : Scope->second) + Name(D);
+    const std::string Where = "UE_ASSET_EDIT(" + Qual + ")";
+    const auto At = AssetPaths.find(Qual);
+    if (At == AssetPaths.end())
+    { *Err = Where + ": the target is a UE_ASSET_AT (every asset in UeAssets/ is one); a mod's own asset takes its values where it is declared"; return false; }
+    const Json& T = D.contains("type") ? D["type"] : Json::object();
+    const FRecord* R = Find(StripTypeKeywords(T.value("desugaredQualType", T.value("qualType", std::string()))));
+    if (!R || R->bIsStruct) { *Err = Where + ": cannot tell the asset's class"; return false; }
+    Cur = nullptr;
+
+    std::string Package = At->second;
+    const std::string Object = SplitAssetPath(Package);
+    FPackage Scratch(Package);
+    FBlueprintClass BP(Scratch, Object, "", "", false);
+    std::vector<FPropertyDef> Defs;
+    /* An explicit zero is written: the asset's own value is what it replaces, not the class default. */
+    if (!BracedMembers(*BracedInit(Var), *R, Qual, BP, /*bKeepZero=*/true, Defs, Err)) return false;
+    if (Defs.empty()) { *Err = Where + ": the braces name no member"; return false; }
+    return ApplyEdit(Package, Object, Defs, Scratch, Where, Err);
+}
+
+/*
+S38 - UE_PATCH: a class that edits the game Blueprint it derives from, in that Blueprint's own package. Its UE_DEFAULTS
+assignments become tags of the Blueprint's default object; a member of any class above it can be named. Nothing else
+of a patch is cooked yet, so a member, a method or a component's default is refused rather than silently dropped.
+*/
+bool FCompiler::GeneratePatch(const FRecord& R, std::string* Err)
+{
+    const std::string Where = R.CppName + " (UE_PATCH)";
+    const FRecord* B = R.Base.empty() ? nullptr : Find(R.Base);
+    if (!B || !B->IsNative() || PackageOf(*B).compare(0, 6, "/Game/") != 0)
+    {
+        *Err = Where + ": a patch derives from the game Blueprint it edits (a class in a /Game package); a native class's "
+               "defaults come from its C++ constructor, not from a package";
+        return false;
+    }
+    const bool bMethods = std::any_of(R.Methods.begin(), R.Methods.end(),
+                                      [](const auto& M) { return !M.second->value("isImplicit", false); });
+    if (!R.Fields.empty() || bMethods || !R.Interfaces.empty())
+    { *Err = Where + ": a patch only edits its parent's defaults, in UE_DEFAULTS; members and functions are not built yet"; return false; }
+    const Json* Body = nullptr;
+    if (R.Defaults) ForEach(*R.Defaults, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Body = &C; });
+    if (!Body) { *Err = Where + ": nothing to edit - a patch's defaults go in UE_DEFAULTS { Field = value; }"; return false; }
+    Cur = nullptr;
+
+    const std::string Package = PackageOf(*B), Cdo = "Default__" + ClassOf(*B);
+    FPackage Scratch(Package);
+    FBlueprintClass BP(Scratch, ClassOf(*B), "", "", false);
+    std::vector<FPropertyDef> Defs;
+    bool bOk = true;
+    ForEach(*Body, [&](const Json& S) {
+        if (!bOk) return;
+        const Json *Lhs = nullptr, *Rhs = nullptr, *Through = nullptr;
+        if (!DefaultAssignment(S, Lhs, Rhs, Through))
+        { *Err = Where + ": every statement is `Field = value;`"; bOk = false; return; }
+        if (Through)
+        { *Err = Where + ": " + Name(*Through) + "->" + Name(*Lhs) + ": a component's defaults are not patched yet"; bOk = false; return; }
+        const auto Owner = FieldOwner.find(Lhs->value("referencedMemberDecl", std::string()));
+        const FRecord* DR = Owner == FieldOwner.end() ? nullptr : Find(Owner->second);
+        if (!DR) { *Err = Where + ": cannot tell which class declares " + Name(*Lhs); bOk = false; return; }
+        FPropertyDef PD;
+        /* Zero is a real value: it replaces the Blueprint's own, which need not be zero. */
+        bOk = TypeToProperty(TypeOf(*Lhs), UeNameOf(DR, Name(*Lhs)), 0, Where, BP, &PD, Err)
+              && LowerDefault(*Lhs, PD, BP, Err, Rhs, /*bKeepZero=*/true);
+        if (bOk && PD.Default.K == FDefaultValue::None) { *Err = Where + ": " + Name(*Lhs) + " needs a literal value"; bOk = false; }
+        if (bOk) Defs.push_back(PD);
+    });
+    if (!bOk) return false;
+    if (Defs.empty()) { *Err = Where + ": UE_DEFAULTS assigns nothing"; return false; }
+    return ApplyEdit(Package, Cdo, Defs, Scratch, Where, Err);
+}
+
+/*
+Defs, lowered against From (a scratch package, whose imports their objects are), into the tags of Object in the game's
+Package: read from GameDir the first time, saved by SaveEdits once every edit is in. A tag replaces the one of its name
+or is appended. An object a tag points at becomes an import of the package, found or appended, and one the object is
+created before being serialized - the edge the cook gives such a reference; a user-defined struct or enum a tag names
+too. Everything else is the game's, byte for byte.
+*/
+bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object, std::vector<FPropertyDef> Defs,
+                          const FPackage& From, const std::string& Where, std::string* Err)
+{
+    auto Slot = Edited.find(Lower(Package));
+    if (Slot == Edited.end())
+    {
+        if (GameDir.empty())
+        {
+            *Err = Where + ": an edit starts from the game's own package: pass the folder /Game is in (assetgen compile --game "
+                   "<extracted pak>/FSD/Content; bpbuild: game_content in mods.yaml)";
+            return false;
+        }
+        if (Package.compare(0, 6, "/Game/") != 0) { *Err = Where + ": " + Package + " is not a /Game package"; return false; }
+        FEdited E;
+        E.Package = Package;
+        const std::string Base = (std::filesystem::u8path(GameDir) / std::filesystem::u8path(Package.substr(6))).u8string();
+        for (const char* Ext : { ".uasset", ".umap" })
+            if (std::filesystem::exists(std::filesystem::u8path(Base + Ext))) { E.Ext = Ext; break; }
+        if (E.Ext.empty()) { *Err = Where + ": " + Package + " is not in " + GameDir; return false; }
+        std::string LoadErr;
+        if (!E.P.Load(Base + E.Ext, &LoadErr)) { *Err = Where + ": " + Package + ": " + LoadErr; return false; }
+        Slot = Edited.emplace(Lower(Package), std::move(E)).first;
+    }
+    FCookedPackage& P = Slot->second.P;
+    const int32 Export = P.FindExport(Object);
+    if (Export < 0) { *Err = Where + ": " + Package + " holds no " + Object; return false; }
+
+    /* From's imports, made again in P: once each, the outer first. From has no exports - every object a default can
+       name is an import (AssetRef). */
+    std::map<int32, int32> Moved;
+    std::function<int32(int32)> Move = [&](int32 Index) -> int32 {
+        if (Index >= 0) return 0;
+        if (const auto It = Moved.find(Index); It != Moved.end()) return It->second;
+        const FImport* Im = From.ImportAt(FIndex{ Index });
+        const int32 Outer = Im->Outer.V ? Move(Im->Outer.V) : 0;
+        return Moved[Index] = P.Import(Im->ClassPackage, Im->ClassName, Outer, Im->ObjectName);
+    };
+    /* A deep copy on the way: members and elements are shared_ptrs a type's other properties may hold too. */
+    std::vector<int32> Deps;
+    std::function<void(FPropertyDef&)> MoveDef;
+    std::function<void(FDefaultValue&)> MoveValue = [&](FDefaultValue& V) {
+        if (V.K == FDefaultValue::Obj && V.Object.V != 0) Deps.push_back(V.Object.V = Move(V.Object.V));
+        for (FDefaultValue& Item : V.Items) MoveValue(Item);
+        if (V.Members)
+        {
+            V.Members = std::make_shared<std::vector<FPropertyDef>>(*V.Members);
+            for (FPropertyDef& M : *V.Members) MoveDef(M);
+        }
+    };
+    MoveDef = [&](FPropertyDef& D) {
+        if (D.Members)
+        {
+            D.Members = std::make_shared<std::vector<FPropertyDef>>(*D.Members);
+            for (FPropertyDef& M : *D.Members) MoveDef(M);
+        }
+        for (std::shared_ptr<FPropertyDef>* Sub : { &D.Inner, &D.Value })
+            if (*Sub) { *Sub = std::make_shared<FPropertyDef>(**Sub); MoveDef(**Sub); }
+        MoveValue(D.Default);
+    };
+    for (FPropertyDef& D : Defs)
+    {
+        MoveDef(D);
+        const FImport* Named = From.ImportAt(D.Extra);
+        if (Named && (Named->ClassName == "UserDefinedStruct" || Named->ClassName == "UserDefinedEnum"))
+            Deps.push_back(Move(D.Extra.V));
+    }
+
+    /* The tags, written against P's names (a name P lacks is appended), then read back as P's own. */
+    std::vector<std::string> Texts;
+    for (const FCookedName& N : P.Names) Texts.push_back(N.Text);
+    FPackage Sink(Package);
+    Sink.SeedNames(Texts);
+    FArc Ar(&Sink);
+    for (const FPropertyDef& D : Defs) WriteDefaultTag(Ar, D);
+    TagEnd(Ar);
+    for (size_t I = P.Names.size(); I < Sink.NameTable().size(); ++I) P.Names.push_back({ Sink.NameTable()[I] });
+    std::vector<FTag> Tags;
+    size_t End = 0;
+    if (!ReadTags(P, Ar.B, End, Tags) || End != Ar.B.size()) { *Err = Where + ": internal: the edit's tags do not read back"; return false; }
+    if (!SetTags(P, Export, Tags, Err)) { *Err = Where + ": " + *Err; return false; }
+    for (int32 Dep : Deps) P.CreateBeforeSerialize(Export, Dep);
+    Slot->second.Objects.push_back(Object + " (" + std::to_string(Tags.size()) + (Tags.size() == 1 ? " tag)" : " tags)"));
+    return true;
+}
+
+/* The edited packages, each at its own /Game path under the Content folder OutDir is in: the mod pak's copy is the one
+   the game loads. */
+bool FCompiler::SaveEdits(const std::string& OutDir, std::string* Err)
+{
+    for (auto& [Key, E] : Edited)
+    {
+        const std::filesystem::path File = FileOf(OutDir, E.Package);
+        std::error_code Ec;
+        std::filesystem::create_directories(File.parent_path(), Ec);
+        if (!E.P.Save(File.u8string() + E.Ext, Err)) return false;
+        std::string Objects;
+        for (const std::string& O : E.Objects) Objects += (Objects.empty() ? "" : ", ") + O;
+        printf("  %-14s -> %s%s  (the game's, edited: %s)\n", "edit", Shown(E.Package).c_str(), E.Ext.c_str(), Objects.c_str());
+    }
     return true;
 }
 
@@ -8342,25 +8603,14 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         if (Body)
             ForEach(*Body, [&](const Json& S) {
                 if (!bOk) return;
-                /* Assigning a struct is an operator call, not a BinaryOperator: its inner is the
-                   callee then the two operands, so both shapes are read the same way one index on. */
-                const Json* Assign = Strip(&S);
-                const std::string AK = Assign ? Kind(*Assign) : std::string();
-                const bool bOpCall = AK == "CXXOperatorCallExpr";
-                const size_t Base = bOpCall ? 1 : 0;
-                const Json* Lhs = Assign ? Strip(Nth(*Assign, Base)) : nullptr;
-                const Json* Rhs = Assign ? Nth(*Assign, Base + 1) : nullptr;
-                const bool bAssign = bOpCall ? IsAssignOperatorCall(*Assign)
-                                             : AK == "BinaryOperator"
-                                                   && Assign->value("opcode", std::string()) == "=";
-                if (!Assign || !bAssign || !Lhs || Kind(*Lhs) != "MemberExpr" || !Rhs)
+                const Json *Lhs = nullptr, *Rhs = nullptr, *Owner = nullptr;
+                if (!DefaultAssignment(S, Lhs, Rhs, Owner))
                 { *Err = Where + ": every statement is `Field = value;` or `Component->Field = value;`"; bOk = false; return; }
 
                 /* `Comp->Field` reaches through a component; a bare `Field` targets this class's
                    own CDO. Which of the three destinations a statement means is decided by who
                    DECLARES the member it names, so no Super:: spelling is needed. */
-                const Json* Owner = Strip(First(*Lhs));
-                const bool bThroughComponent = Owner && Kind(*Owner) == "MemberExpr";
+                const bool bThroughComponent = Owner != nullptr;
                 const std::string CompName = bThroughComponent ? Name(*Owner) : std::string();
                 const std::string Declarer = OwnerOf(bThroughComponent ? *Owner : *Lhs);
                 const FRecord* DR = Declarer.empty() ? nullptr : Find(Declarer);
@@ -9391,7 +9641,13 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     }
     for (const Json* Var : AssetDecls)
         if (!GenerateAsset(*Var, OutDir, Err)) return false;
-    if (Generated == 0 && RegistryRows.empty()) { *Err = "the source declares no UE_STRUCT, UE_ENUM or class deriving from a UE class"; return false; }
+    for (const auto& [Key, Var] : Edits)
+        if (!GenerateEdit(Key, *Var, Err)) return false;
+    for (const auto& Entry : Records)
+        if (Entry.second.bIsPatch && !GeneratePatch(Entry.second, Err)) return false;
+    if (!SaveEdits(OutDir, Err)) return false;
+    if (Generated == 0 && RegistryRows.empty() && Edited.empty())
+    { *Err = "the source declares no UE_STRUCT, UE_ENUM, class deriving from a UE class, asset or edit"; return false; }
     if (!GenerateNestedWrappers(OutDir, Err)) return false;
 
     /* A cooked package carries no registry data; without the bake the classes are invisible to it. A pak keeps its
@@ -9417,10 +9673,12 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
 }   // namespace
 
 bool CompileToAssets(const std::string& SourcePath, const std::string& IncludeDir,
-                     const std::string& OutDir, const std::optional<std::string>& ApiDir, std::string* Err)
+                     const std::string& OutDir, const std::optional<std::string>& ApiDir, const std::string& GameDir,
+                     std::string* Err)
 {
     /* Never freed: the process ends right after, and tearing the AST down node by node takes longer than exiting. */
     FCompiler* C = new FCompiler;
+    C->GameDir = GameDir;
     return C->Run(SourcePath, IncludeDir, OutDir, ApiDir, Err);
 }
 

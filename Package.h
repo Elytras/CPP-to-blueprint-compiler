@@ -103,6 +103,12 @@ public:
     /* Pass one registers and returns 0; pass two resolves to the sorted table index. */
     int32 NameIndex(const std::string& S);
 
+    /* S38: write against a cooked package's name table instead. Its names keep their rows, a name it lacks is
+       appended, and indices are final from the start - so an FArc over this package writes bytes that package can
+       read. Not for Save. NameTable() is the table after, the appended names last. */
+    void SeedNames(const std::vector<std::string>& Existing);
+    const std::vector<std::string>& NameTable() const { return Names; }
+
     void SetGuid(uint32 A, uint32 B, uint32 C, uint32 D) { PkgGuid[0] = A; PkgGuid[1] = B; PkgGuid[2] = C; PkgGuid[3] = D; }
     void SetPackageSource(uint32 S) { PackageSource = S; }
 
@@ -131,6 +137,7 @@ private:
     mutable std::vector<std::string> Names;
     mutable std::unordered_map<std::string, int32> NameLookup;   // lowercased -> row
     mutable bool bNamesFinal = false;
+    bool bAppendNames = false;                                   // SeedNames
 
     uint32 PkgGuid[4] = { 0, 0, 0, 0 };
     uint32 PackageSource = 0;

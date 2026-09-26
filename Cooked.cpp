@@ -141,6 +141,95 @@ std::string FCookedPackage::ClassNameOf(int32 Index) const
     return "(null)";
 }
 
+FNameRef FCookedPackage::NameRef(const std::string& S)
+{
+    std::string Base;
+    int32 Number = 0;
+    SplitName(S, Base, Number);
+    const std::string L = Lower(Base);
+    for (int32 I = 0; I < int32(Names.size()); ++I)
+        if (Lower(Names[size_t(I)].Text) == L) return { I, Number };
+    Names.push_back({ Base });
+    return { int32(Names.size()) - 1, Number };
+}
+
+bool FCookedPackage::SameName(const FNameRef& N, const std::string& S) const
+{
+    std::string Base;
+    int32 Number = 0;
+    SplitName(S, Base, Number);
+    return N.Number == Number && N.Index >= 0 && size_t(N.Index) < Names.size() && Lower(Names[size_t(N.Index)].Text) == Lower(Base);
+}
+
+int32 FCookedPackage::FindExport(const std::string& ObjectName) const
+{
+    for (size_t I = 0; I < Exports.size(); ++I)
+        if (Exports[I].Outer == 0 && SameName(Exports[I].ObjectName, ObjectName)) return int32(I);
+    return -1;
+}
+
+int32 FCookedPackage::Import(const std::string& ClassPackage, const std::string& ClassName, int32 Outer,
+                             const std::string& ObjectName)
+{
+    for (size_t I = 0; I < Imports.size(); ++I)
+    {
+        const FCookedImport& Im = Imports[I];
+        if (Im.Outer == Outer && SameName(Im.ObjectName, ObjectName) && SameName(Im.ClassName, ClassName)
+            && SameName(Im.ClassPackage, ClassPackage))
+            return -int32(I) - 1;
+    }
+    Imports.push_back({ NameRef(ClassPackage), NameRef(ClassName), Outer, NameRef(ObjectName) });
+    return -int32(Imports.size());
+}
+
+void FCookedPackage::CreateBeforeSerialize(int32 Export, int32 Dep)
+{
+    FCookedExport& E = Exports[size_t(Export)];
+    if (E.FirstExportDependency < 0)
+    {
+        /* A run of its own at the end: the engine reads each export's run from its own offset, in any order. */
+        E.FirstExportDependency = int32(PreloadDependencies.size());
+        PreloadDependencies.push_back(Dep);
+        E.CreateBeforeSer = 1;
+        return;
+    }
+    const auto Run = PreloadDependencies.begin() + E.FirstExportDependency;
+    if (std::find(Run, Run + (E.SerBeforeSer + E.CreateBeforeSer + E.SerBeforeCreate + E.CreateBeforeCreate), Dep)
+        != Run + (E.SerBeforeSer + E.CreateBeforeSer + E.SerBeforeCreate + E.CreateBeforeCreate))
+        return;
+    const int32 At = E.FirstExportDependency + E.SerBeforeSer + E.CreateBeforeSer;     // the end of its create-before-serialize
+    PreloadDependencies.insert(PreloadDependencies.begin() + At, Dep);
+    ++E.CreateBeforeSer;
+    for (FCookedExport& O : Exports)
+        if (&O != &E && O.FirstExportDependency >= At) ++O.FirstExportDependency;
+}
+
+bool SetTags(FCookedPackage& P, int32 Export, const std::vector<FTag>& Tags, std::string* Err)
+{
+    FCookedExport& E = P.Exports[size_t(Export)];
+    std::vector<FTag> List;
+    size_t At = 0;
+    if (!ReadTags(P, E.Payload, At, List))
+    {
+        *Err = P.NameOf(E.ObjectName) + "'s payload does not start with a tag list";
+        return false;
+    }
+    for (const FTag& Tag : Tags)
+    {
+        const std::string Name = Lower(P.NameOf(Tag.Name));
+        auto Same = std::find_if(List.begin(), List.end(), [&](const FTag& Old) {
+            return Old.ArrayIndex == Tag.ArrayIndex && Lower(P.NameOf(Old.Name)) == Name;
+        });
+        if (Same != List.end()) *Same = Tag;
+        else List.push_back(Tag);
+    }
+    std::vector<uint8> Payload;
+    WriteTags(P, List, Payload);
+    Payload.insert(Payload.end(), E.Payload.begin() + std::ptrdiff_t(At), E.Payload.end());
+    E.Payload = std::move(Payload);
+    return true;
+}
+
 bool ReadTags(const FCookedPackage& P, const std::vector<uint8>& Bytes, size_t& At, std::vector<FTag>& Out)
 {
     const FTagTypes T(P);
