@@ -85,6 +85,11 @@ A package outside the mod's own is written under the `Content` folder that the o
 Some C++ has no exact Blueprint equivalent, such as a reference to a map element. AssetGen compiles the closest
 equivalent and prints a `warning:` that says what differs. It refuses only what it can't compile faithfully.
 
+Kismet's `Conv_` functions are C++ conversions. `FString Label = Count;` and `FName Key = Label + Count;` convert
+implicitly, and so does an object or class where a soft pointer is wanted: `Kinds.Contains(Item->GetClass())` on a
+`TArray<TSoftClassPtr<AItem>>`. Text to a number, or a soft pointer back to its object, takes a cast: `int(Label)`,
+`(AItem *)Soft`. The second is null until the asset is loaded.
+
 Several mods, only rebuilding what changed, packed into paks:
 
 ```
