@@ -2200,6 +2200,31 @@ def edits():
           '(an RPC\'s as a plain function), or is added to it (a helper, an override); a stale declaration and other '
           'parameters are refused')
 
+    # A namespace-scope variable a patch's method uses is the one member of a class of its own (LowerGlobal), cooked into
+    # the mod's package as a class's global is: the patched function reads and writes that class's default object.
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, 'GlobalEdit.cpp')
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/GlobalEdit");\n'
+                    'class CompTest : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/CompTest/CompTest", "CompTest_C");\n'
+                    '  int32 Ticks;\n  void ReceiveBeginPlay();\n};\n'
+                    'int32 Step = 5;\n'
+                    'class Tweaks : public CompTest {\n  UE_PATCH;\n'
+                    '  void ReceiveBeginPlay() { Ticks = Ticks + Step; Step = Step + 1; }\n};\n')
+        out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'GlobalEdit')
+        os.makedirs(out)
+        proc = subprocess.run([ASSETGEN, 'compile', path, UEAPI, out, '--game', comp_game], capture_output=True, encoding='utf-8')
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert os.path.exists(os.path.join(out, 'Step.uasset')), 'the global\'s class was not cooked: %s' % os.listdir(out)
+        assert global_default(out, 'Step', 'Step') == '5'
+        step = Obj('Step_C', Step=5)
+        vm = VM(os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'CompTest', 'CompTest'),
+                objects={'Default__Step_C': step}, Ticks=1)
+        vm.call('ReceiveBeginPlay')
+        assert vm.self.vars == {'Ticks': 6} and step.vars == {'Step': 6}, (vm.self.vars, step.vars)
+    print('ok  EditTest: a namespace-scope variable a UE_PATCH method uses has its class cooked, whose default object the '
+          'patched function reads and writes')
+
 
 def path_edits():
     """S38: a patch's UE_DEFAULTS path assigns part of a member's value on TypesTest's default object - a native

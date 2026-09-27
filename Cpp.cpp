@@ -10287,7 +10287,11 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         }
         ++Generated;
     }
-    /* After the loop, not in it: lowering is what discovers the deref, and the mod's own
+    /* The patches here, not after the edits: lowering a patch's methods discovers what the loops below cook, as the
+       classes' lowering does (a global's class, the deref, a slot struct). */
+    for (const auto& Entry : Records)
+        if (Entry.second.bIsPatch && !GeneratePatch(Entry.second, Err)) return false;
+    /* After the loops, not in them: lowering is what discovers the deref, and the mod's own
        FDeref (if it declared one) was cooked above as an ordinary record. */
     if (bSynthDeref)
     {
@@ -10315,8 +10319,6 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         if (!GenerateEdit(Key, *Var, Err)) return false;
     for (const Json* Block : AssetEditBlocks)
         if (!GenerateAssetEdits(*Block, Err)) return false;
-    for (const auto& Entry : Records)
-        if (Entry.second.bIsPatch && !GeneratePatch(Entry.second, Err)) return false;
     if (!SaveEdits(OutDir, Err)) return false;
     if (Generated == 0 && RegistryRows.empty() && Edited.empty())
     { *Err = "the source declares no UE_STRUCT, UE_ENUM, class deriving from a UE class, asset or edit"; return false; }
