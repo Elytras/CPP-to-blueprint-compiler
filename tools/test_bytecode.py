@@ -2116,6 +2116,26 @@ def latent_links():
     print('ok  LatentTest: each latent call resumes a statement of its own ubergraph, under a UUID of its own')
 
 
+def static_locals():
+    """A static local lives in the ubergraph's frame, one per object: its initializer runs on the object's first call
+    only, and one with none starts at the frame's zero, which a loop round it does not reset. Anywhere else it is
+    refused, an inline function's too; a static constant needs no frame (LatentTest.Plain, in latent_runs)."""
+    vm = VM(asset('LatentTest'), {'Delay': latent_call})
+    for stage, want in ((4, 1502), (50, 1604)):          # Count = 4 + 10 once, then kept; Seen counts every round
+        vm.self.vars['Stage'] = stage
+        vm.call('Counted')
+        vm.fire()
+        assert vm.self.vars['Calls'] == want, (stage, vm.self.vars)
+    other = vm.new(Stage=7)                               # another object: a frame, and statics, of its own
+    vm.call('Counted', on=other)
+    vm.fire()
+    assert other.vars['Calls'] == 1802 and vm.self.vars['Calls'] == 1604, (other.vars, vm.self.vars)
+    refused('StaticPlain', '  int32 N;\n  void F() { static int32 Count = N; ++Count; N = Count; }\n', 'lives in the ubergraph')
+    refused('StaticInline', '  inline void Bump() { static int32 Count = 0; ++Count; }\n'
+            '  void F() { Bump(); UKismetSystemLibrary::Delay(1.0f); }\n', 'each expansion would keep its own')
+    print('ok  LatentTest.Counted: a static is initialized once per object and kept in its frame; refused outside one')
+
+
 def await_runs():
     """AsyncTest with its proxies faked: what is bound to which dispatcher, when Activate runs, what a broadcast does."""
     made, activated = [], []
@@ -2323,6 +2343,7 @@ uber_frames()
 latent_flags()
 latent_runs()
 latent_links()
+static_locals()
 await_runs()
 delegate_targets()
 spawn_runs()

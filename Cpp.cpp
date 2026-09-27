@@ -1333,6 +1333,7 @@ private:
     std::string CurFnName;                            // Generate: the method being lowered
     std::string LatentRefusal;                        // why that method cannot make a latent call, or empty
     bool bMadeLatentCall = false;                     // LowerCall: it made one, so it moves into the ubergraph
+    std::string StaticLocal;                          // LowerBody: a static it keeps in the ubergraph's frame, or empty
     int32 LatentCount = 0;
     /* A generated event a latent call's completion delegate binds: it stores its parameter into the frame local
        the call's value is read from after the resume. */
@@ -5325,6 +5326,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 const Json* Init = Ds.bHasValue ? nullptr : Strip(First(D));
                 /* `FStats S;` carries an implicit argless CXXConstructExpr: no initialiser. */
                 if (Init && Kind(*Init) == "CXXConstructExpr" && !First(*Init)) Init = nullptr;
+                const std::string DeclId = D.value("id", std::string());
                 if (Init)
                 {
                     Ds.bHasValue = true;
@@ -5333,7 +5335,6 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                        the reads become the const and neither the property nor its store is compiled. A repeated
                        expansion of the same inline function reaches this declaration again, so the binding a
                        previous one left goes first. */
-                    const std::string DeclId = D.value("id", std::string());
                     ParmConst.erase(DeclId);
                     if (!bCurNoOpt && IsFoldableConst(Ds.Value) && ReadOnlyLocal(DeclId))
                     {
@@ -5341,7 +5342,48 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                         return;
                     }
                 }
-                else if ((LoopDepth > 0 || bBodyHasGoto || ReEntered > 0) && !Ds.bHasValue)
+                /* A static keeps its value from one call to the next, and the one frame that outlives a call is the
+                   ubergraph's, one per object: a latent function's locals live there, so a static is one of them
+                   (Generate refuses it in any other function, once the body shows whether it waits). Its initialiser
+                   runs once, `if (!__Once<N>) { X = Init; __Once<N> = true; }`, the flag false and X zero as the
+                   frame starts. A Blueprint local has no scope, so another local named X would be this same property
+                   and reset it: the static takes a name no C++ local can have. One that holds a constant nothing
+                   writes is that constant, kept or not. */
+                if (IsStaticDecl(D) && !(Ds.bHasValue && IsFoldableConst(Ds.Value) && ReadOnlyLocal(DeclId)))
+                {
+                    if (!InlineStack.empty())
+                    { *Err = "static " + Name(D) + " in an inline function: each expansion would keep its own"; bOk = false; return; }
+                    if (StaticLocal.empty()) StaticLocal = Name(D);
+                    const std::string N = std::to_string(ReadTmpCounter++);
+                    const std::string Kept = "__Static" + N + "_" + Name(D), Flag = "__Once" + N;
+                    LocalRename[DeclId] = Kept;
+                    Ds.Var.S = Kept;
+                    FPropertyDef KeptPD;
+                    if (!TypeToProperty(VarType, Kept, 0, "static " + Name(D), BP, &KeptPD, Err)) { bOk = false; return; }
+                    KeptPD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+                    Locals.push_back(KeptPD);
+                    if (!Ds.bHasValue) return;
+                    FPropertyDef FlagPD;
+                    if (!TypeToProperty("bool", Flag, 0, "static " + Name(D), BP, &FlagPD, Err)) { bOk = false; return; }
+                    FlagPD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+                    Locals.push_back(FlagPD);
+                    FStmtIR Once, Set;
+                    Once.K = FStmtIR::If;
+                    Once.Cond.K = FArgIR::Local;
+                    Once.Cond.S = Flag;
+                    Once.Cond = NotOf(Once.Cond, BP);
+                    Set.K = FStmtIR::Assign;
+                    Set.Var.K = FArgIR::Local;
+                    Set.Var.S = Flag;
+                    Set.Var.LetOp = LetOpFor("bool");
+                    Set.bAssignLocal = true;
+                    Set.Value.K = FArgIR::Bool;
+                    Set.Value.B = true;
+                    Once.Then = std::make_shared<std::vector<FStmtIR>>(std::vector<FStmtIR>{ Ds, Set });
+                    Out.push_back(std::move(Once));
+                    return;
+                }
+                if ((LoopDepth > 0 || bBodyHasGoto || ReEntered > 0) && !Ds.bHasValue)
                 {
                     /* The frame initialises a local once, on entry, but C++ constructs it again each time a loop
                        reaches the declaration. A twin nothing writes keeps the entry value to copy back. */
@@ -8845,6 +8887,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         bCurNoOpt = IsNoOptDecl(Decl) || IsNoOptDecl(M);
         WarnedRefParms.clear();
         bMadeLatentCall = false;
+        StaticLocal.clear();
         LatentCount = 0;
         Completions.clear();
         ActivatedActions.clear();
@@ -8855,6 +8898,12 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         if (Fn.Body && !LowerBody(*Fn.Body, BP, Stmts, Locals, Err))
         {
             *Err = R.CppName + "::" + Fn.Name + ": " + *Err;
+            return false;
+        }
+        if (!StaticLocal.empty() && !bMadeLatentCall)
+        {
+            *Err = R.CppName + "::" + Fn.Name + ": static " + StaticLocal + " lives in the ubergraph's frame, which only a "
+                   "function that makes a latent call runs in; make " + StaticLocal + " a member";
             return false;
         }
         if (!HoistReadsInList(Stmts, BP, Locals, Err))
