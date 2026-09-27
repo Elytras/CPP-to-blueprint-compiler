@@ -2161,17 +2161,29 @@ void WrapInCall(FArgIR& Arg, FIndex Fn)
     Arg.Sub->Args.push_back(Inner);
 }
 
+/* Conv.json and Ops.json name a soft pointer by its template over UObject, the type Kismet's functions take: any soft
+   pointer passes for it, whatever class it is of (genueapi's conv_kind). */
+std::string SoftKey(const std::string& T)
+{
+    std::string Of;
+    for (const char* Tpl : { "TSoftObjectPtr", "TSoftClassPtr" })
+        if (TemplateArg(T, Tpl, &Of)) return std::string(Tpl) + "<UObject>";
+    return T;
+}
+
 const FConv* FCompiler::FindConv(const std::string& From, const std::string& To) const
 {
+    const std::string F = SoftKey(From), T = SoftKey(To);
     for (const FConv& C : Convs)
-        if (C.From == From && C.To == To) return &C;
+        if (C.From == F && C.To == T) return &C;
     return nullptr;
 }
 
 const FOpInfo* FCompiler::FindOp(const std::string& Op, const std::string& Lhs, const std::string& Rhs) const
 {
+    const std::string L = SoftKey(Lhs), R = SoftKey(Rhs);
     for (const FOpInfo& O : Ops)
-        if (O.Op == Op && O.Lhs == Lhs && O.Rhs == Rhs) return &O;
+        if (O.Op == Op && O.Lhs == L && O.Rhs == R) return &O;
     return nullptr;
 }
 
@@ -2287,6 +2299,11 @@ bool FCompiler::ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgI
         Arg.InnerType = "bool";
         return true;
     }
+
+    /* `(AItem *)Soft`: the object or class a soft pointer names, null unless it is loaded (Conv_SoftObjectReferenceToObject,
+       Conv_SoftClassReferenceToClass). An object or class to a soft pointer is a Conv_ row too, found below. */
+    if (ToKind == SK_Object && From.compare(0, 5, "TSoft") == 0)
+        if (const FConv* C = FindConv(From, To)) { ApplyConv(*C, BP, Arg); return true; }
 
     if (To == From || From.empty() || To.empty() || ToKind == SK_Object) return true;
 
@@ -3227,15 +3244,18 @@ bool FCompiler::LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, 
     if (!LowerArgRaw(*N, OuterType, BP, Out, Err)) return false;
     if (Out.InnerType.empty()) Out.InnerType = TypeOf(*N);
     /* Strip looked through the casts, but an explicit narrowing inside a wider slot (`(uint8)*P + 1`
-       of a sign-extended byte, `(uint8)X` returned as int) still wraps, innermost first. */
+       of a sign-extended byte, `(uint8)X` returned as int) still wraps, innermost first. So does a soft pointer made on
+       the way: `FString(TSoftClassPtr<AItem>(Cls))` is the class's path, where Cls to FString would be its name. */
     std::vector<std::string> Narrowings;
     for (const Json* W = &ArgNode; W && W != N; W = First(*W))
-        if (const std::string K = Kind(*W); K == "CStyleCastExpr" || K == "CXXStaticCastExpr" || K == "CXXFunctionalCastExpr")
+        if (const std::string K = Kind(*W); K == "CStyleCastExpr" || K == "CXXStaticCastExpr" || K == "CXXFunctionalCastExpr"
+            || (K == "CXXConstructExpr" && StripTypeKeywords(TypeOf(*W)).compare(0, 5, "TSoft") == 0))
             Narrowings.push_back(TypeOf(*W));
     for (auto It = Narrowings.rbegin(); It != Narrowings.rend(); ++It)
     {
         const EStrKind From = KindOfLowered(Out, Out.InnerType), To = StrKindOf(Canon(*It));
-        if (((To == SK_Byte && (From == SK_Int || From == SK_Int64)) || (To == SK_Int && From == SK_Int64))
+        const bool bSoft = Canon(*It).compare(0, 5, "TSoft") == 0 && Canon(Out.InnerType).compare(0, 5, "TSoft") != 0;
+        if ((bSoft || (To == SK_Byte && (From == SK_Int || From == SK_Int64)) || (To == SK_Int && From == SK_Int64))
             && !ConvertArg(*It, BP, Out, Err))
             return false;
     }

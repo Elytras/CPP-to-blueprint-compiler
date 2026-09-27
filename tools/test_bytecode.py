@@ -2011,6 +2011,41 @@ asset_elsewhere()
 globals_()
 
 
+# ---- SoftTest
+
+def soft_conversions():
+    """SoftTest: Kismet's soft reference conversions as C++ ones, run offline. A soft pointer is its path here, a class
+    its path too; runvm refuses a call where a Conv_ reads its argument by address (native_refs), so Contains seeing
+    the class also says it was put in a variable first."""
+    A, B, C = '/Game/A/BP_A.BP_A_C', '/Game/B/BP_B.BP_B_C', '/Game/C/BP_C.BP_C_C'
+    assert 'Conv_ClassToSoftClassReference' in runscript.NATIVE_REFS     # the control: the refusal is armed
+    loaded = {}
+    natives = {'GetObjectClass': lambda vm, ctx, o: o.cls if isinstance(o, Obj) else None,
+               'Conv_ClassToSoftClassReference': lambda vm, ctx, c: c or '',
+               'Conv_SoftClassReferenceToClass': lambda vm, ctx, s: s or None,
+               'Conv_SoftClassReferenceToString': lambda vm, ctx, s: s,
+               'Conv_ObjectToSoftObjectReference': lambda vm, ctx, o: o.vars['Path'] if isinstance(o, Obj) else '',
+               'Conv_SoftObjectReferenceToObject': lambda vm, ctx, s: loaded.get(s),
+               'Conv_SoftObjectReferenceToString': lambda vm, ctx, s: s,
+               'EqualEqual_SoftClassReference': lambda vm, ctx, a, b: a.lower() == b.lower(),
+               'NotEqual_SoftClassReference': lambda vm, ctx, a, b: a.lower() != b.lower(),
+               'Array_Contains': lambda vm, ctx, arr, x: x in arr}      # where runscript's CONTAINERS lacks it
+    vm = VM(asset('SoftTest'), natives, Kinds=[A, B], Kind=A)
+    assert [vm.call('KnowsClassOf', Obj(c)) for c in (A, B, C)] == [True, True, False]
+    thing = Obj('Actor', Path='/Game/Maps/Cave.Cave:PersistentLevel.Thing_1')
+    vm.call('Remember', thing)
+    assert vm.self.vars['Seen'] == thing.vars['Path'] and vm.call('SeenPath') == thing.vars['Path'], vm.self.vars
+    assert vm.call('Recall') is None                      # not loaded: null, as SoftObject.Get() answers
+    loaded[thing.vars['Path']] = thing
+    assert vm.call('Recall') is thing and vm.call('KindClass') == A
+    assert vm.call('ClassPathOf', Obj(B)) == B            # the path, not Conv_ObjectToString's name
+    assert (vm.call('SameKind', A), vm.call('SameKind', B), vm.call('OtherKind', B)) == (True, False, True)
+    print('ok  SoftTest: an object or class becomes a soft pointer, a soft pointer its path or (cast) its object')
+
+
+soft_conversions()
+
+
 # ---- ReplTest, LatentTest, AsyncTest, SpawnTest
 
 def replication():

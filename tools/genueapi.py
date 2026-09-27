@@ -331,7 +331,8 @@ def operator_extra(params):
 
 
 def operators(classes):
-    """(op, lhs, rhs) -> (ret, package, class, fn, extra) for every Kismet <Op>_<A><B> over a struct."""
+    """(op, lhs, rhs) -> (ret, package, class, fn, extra) for every Kismet <Op>_<A><B> over a struct or a soft pointer
+    (EqualEqual_SoftObjectReference: any two compare, by path)."""
     found = {}
     for k in sorted(classes, key=lambda k: (k.path != "/Script/Engine", k.path, k.cpp)):
         if k.is_bp:
@@ -341,7 +342,9 @@ def operators(classes):
             if not (m and is_static and len(params) >= 2):
                 continue
             lhs, rhs = params[0][0], params[1][0]
-            if lhs not in STRUCTS and rhs not in STRUCTS and lhs not in CONV_STRUCTS:
+            if soft_template(conv_kind(lhs) or "") and conv_kind(lhs) == conv_kind(rhs):
+                lhs, rhs = conv_kind(lhs), conv_kind(rhs)
+            elif lhs not in STRUCTS and rhs not in STRUCTS and lhs not in CONV_STRUCTS:
                 continue
             key, row = (OPS[m.group(1)], lhs, rhs), (ret, k.path, k.ue_name, fname, operator_extra(params[2:]),
                                                      ref_positions(k.ue_name, fname, params))
@@ -355,8 +358,11 @@ def write_operators(classes, out_dir):
     ops = operators(classes)
     by_pkg = {}
     for (op, lhs, rhs), (ret, pkg, cls, fn, extra, refs) in ops.items():
-        by_pkg.setdefault(pkg[len("/Script/"):], []).append("inline %s operator%s(const %s&, const %s&) { return {}; }"
-                                                              % (ret, op, lhs, rhs))
+        tpl = soft_template(lhs)
+        decl = ("template <class A, class B> inline %s operator%s(const %s<A>&, const %s<B>&) { return {}; }"
+                % (ret, op, tpl, tpl)) if tpl else \
+            "inline %s operator%s(const %s&, const %s&) { return {}; }" % (ret, op, lhs, rhs)
+        by_pkg.setdefault(pkg[len("/Script/"):], []).append(decl)
     rows = []
     for (op, lhs, rhs), (ret, pkg, cls, fn, extra, refs) in sorted(ops.items()):
         args = ", ".join(("true" if a else "false") if isinstance(a, bool) else repr(a) for a in extra)
@@ -505,9 +511,10 @@ def read_ref_parms(sdk_dir):
 
 
 def const_ref(t):
-    """The spelling of a const reference parameter of mapped type t. An object pointer, a class or soft reference and
-    a delegate stay as they are: none is a place a call's value could be read from in its stead."""
-    if t.endswith(("&", "*")) or t.startswith(("TDelegate<", "TMulticast", "TSubclassOf<", "TSoft", "TScriptInterface<")):
+    """The spelling of a const reference parameter of mapped type t. An object pointer and a delegate stay as they are:
+    neither is a place a call's value could be read from in its stead. A class, soft or interface reference is: IDA shows
+    execConv_ClassToSoftClassReference and execConv_SoftClassReferenceToString reading Stack.MostRecentPropertyAddress."""
+    if t.endswith(("&", "*")) or t.startswith(("TDelegate<", "TMulticast")):
         return t
     return "const %s&" % t
 
@@ -678,14 +685,38 @@ CONV = re.compile(r"^Conv_(\w+)To(\w+)$")
 CONV_SCALARS = ("FString", "FName", "FText", "int", "int64", "float", "bool", "uint8", "class UObject*")
 # Conv_RotatorToVector: a rotator is not implicitly a direction. Conv_Int64ToString: only Modio has it;
 # the compiler goes through Conv_Int64ToText + Conv_TextToString instead.
+# The filters below leave out the rest of 4.27's Conv_s, each for a reason: Conv_FloatToText's RoundingMode has no default
+# (float reaches FText through FString); Conv_StringToVector / Rotator / Vector2D / Color parse into an out-parameter
+# and a validity flag; Conv_InterfaceToObject is `I.GetObject()`, EX_InterfaceToObjCast with no call; an enum is its
+# integer already (Conv_HandKeypointToInt32); Conv_MatineeCameraShake is a downcast, Cast<>'s.
 CONV_SKIP = ("Conv_RotatorToVector", "Conv_Int64ToString")
+# A soft reference converts to and from what it points at whatever its class, as Kismet's Conv_s take the widest: Conv.json
+# and Ops.json name it by its template over UObject, the compiler's SoftKey. A class reference is an object there.
+SOFT = {"TSoftObjectPtr": "TSoftObjectPtr<UObject>", "TSoftClassPtr": "TSoftClassPtr<UObject>"}
 
 
 def conv_kind(t):
-    return t if t in CONV_SCALARS or t in STRUCTS else None
-# Formatting parameters after the value take these; a Conv_ with any other extra parameter is skipped.
+    """The name Conv.json gives a Conv_'s value or result of mapped type t, as the compiler's Canon names a value's
+    type; None where AssetGen converts no such value."""
+    if t in CONV_SCALARS or t in STRUCTS:
+        return t
+    if t.startswith("TSubclassOf<"):
+        return "class UObject*"
+    tpl = t.split("<", 1)[0]
+    return SOFT[tpl] if tpl in SOFT and t != tpl else None
+
+
+def soft_template(kind):
+    """The template a soft key names ("TSoftObjectPtr<UObject>" -> "TSoftObjectPtr"), else None."""
+    tpl = kind.split("<", 1)[0]
+    return tpl if SOFT.get(tpl) == kind else None
+
+
+# Formatting parameters after the value take these (the engine's defaults, but no digit grouping); a Conv_ with any
+# other extra parameter is skipped.
 CONV_DEFAULTS = {"bAlwaysSign": False, "bUseGrouping": False,
-                 "MinimumIntegralDigits": 1, "MaximumIntegralDigits": 324}
+                 "MinimumIntegralDigits": 1, "MaximumIntegralDigits": 324,
+                 "InUseSRGB": True, "Z": 0.0, "bForceSignDisplay": False}
 CONV_STRUCTS = ("FString", "FName", "FText")
 
 
@@ -699,14 +730,36 @@ def conversions(classes):
             m = CONV.match(fname)
             if not (m and is_static and params):
                 continue
-            src, dst = params[0][0], ret
-            if not conv_kind(src) or not conv_kind(dst) or src == dst or fname in CONV_SKIP:
+            src, dst = conv_kind(params[0][0]), conv_kind(ret)
+            if not src or not dst or src == dst or fname in CONV_SKIP:
                 continue
             if any(n not in CONV_DEFAULTS for _, n in params[1:]):
                 continue
             extra = [CONV_DEFAULTS[n] for _, n in params[1:]]
             found.setdefault((src, dst), (k.path, k.ue_name, fname, extra, ref_positions(k.ue_name, fname, params)))
     return found
+
+
+def conv_members(t, src, dst):
+    """What template or struct t declares for the conversion src -> dst: its converting constructor when t is dst, its
+    explicit operator when t is src and dst a scalar. A soft pointer's own class parameter is T, as Types.h names it."""
+    tpl, from_tpl = soft_template(dst), soft_template(src)
+    if dst == t:
+        name = tpl or t
+        if src == "class UObject*" and tpl == "TSoftObjectPtr":
+            return ["%s(T *) {}" % name]
+        if src == "class UObject*" and tpl == "TSoftClassPtr":
+            return ["%s(class UClass *) {}" % name, "template <class U> %s(const TSubclassOf<U> &) {}" % name]
+        if from_tpl:
+            return ["template <class U> %s(const %s<U> &) {}" % (name, from_tpl)]
+        return ["%s(%s) {}" % (name, ("const %s&" % src) if (src in CONV_STRUCTS or src in STRUCTS) else src)]
+    if src == t and dst not in CONV_STRUCTS and dst not in STRUCTS:
+        if from_tpl and dst == "class UObject*":
+            # Explicit, as UE's own Get(): the object if it is loaded, else null, which an implicit one would hide.
+            return ["explicit operator %s *() const { return {}; }" % ("T" if from_tpl == "TSoftObjectPtr" else "class UClass")]
+        if not from_tpl:     # a soft reference's path read as a number means nothing
+            return ["explicit operator %s() const { return {}; }" % dst]
+    return []
 
 
 def write_conversions(classes, out_dir):
@@ -724,23 +777,21 @@ def write_conversions(classes, out_dir):
     for (a, b) in direct:       # two steps through FString or FText, as the compiler's ConvertArg tries them
         if b in ("FString", "FText"):
             reachable.update((a, d) for (s, d) in direct if s == b and d != a)
-    targets = tuple(CONV_STRUCTS) + tuple(sorted(t for (_, t) in reachable if t in STRUCTS))
+    softs = sorted(set(k for pair in reachable for k in pair if soft_template(k)))
+    targets = tuple(CONV_STRUCTS) + tuple(sorted(set(t for (_, t) in reachable if t in STRUCTS))) + tuple(softs)
     out = ["#pragma once",
            "/* Every Kismet Conv_XToY, generated by AssetGen/tools/genueapi.py. Do not edit.",
-           "   A struct converts from anything a Conv_ reaches (directly or via FString) with a",
-           "   constructor, and to a scalar with an explicit operator: `int(Str)`. */",
-           "class UObject;", ""]
+           "   A struct or soft pointer converts from anything a Conv_ reaches (directly or via FString)",
+           "   with a constructor, and to a scalar or an object with an explicit operator: `int(Str)`,",
+           "   `(AItem *)Soft`. */",
+           "class UObject;", "class UClass;",
+           "template <class T> struct TSubclassOf;"]
+    out += ["template <class T> struct %s;" % soft_template(k) for k in softs] + [""]
     out += ["struct %s;" % t for t in sorted(set(t for pair in reachable for t in pair if t in STRUCTS))]
     for t in targets:
-        members = []
-        for (src, dst) in sorted(reachable):
-            if dst == t:
-                arg = ("const %s&" % src) if (src in CONV_STRUCTS or src in STRUCTS) else src
-                members.append("    %s(%s) {}" % (t, arg))
-            elif src == t and dst not in CONV_STRUCTS and dst not in STRUCTS:
-                members.append("    explicit operator %s() const { return {}; }" % dst)
+        members = [m for (src, dst) in sorted(reachable) for m in conv_members(t, src, dst)]
         if members:
-            out.append("#define UE_CONV_%s \\\n%s" % (t, " \\\n".join(members)))
+            out.append("#define UE_CONV_%s \\\n%s" % (soft_template(t) or t, " \\\n".join("    " + m for m in members)))
             out.append("")
     io.open(os.path.join(out_dir, "Conv.h"), "w", encoding="utf-8-sig", newline="\n").write("\n".join(out))
     print("  conversions: %d direct, %d reachable" % (len(direct), len(reachable)))
