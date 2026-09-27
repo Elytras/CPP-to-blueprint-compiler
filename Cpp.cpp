@@ -10136,14 +10136,16 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
                     const std::string& OutDir, const std::optional<std::string>& InApiDir, std::string* Err)
 {
     ApiDir = InApiDir;
-    /* In %TEMP%, not OutDir: bpbuild paks OutDir's whole tree, and a failed compile keeps the dump (hundreds of MB).
-       Named per process: bpbuild and the tests compile the same sources, and at once they overwrote each other's. */
+    /* In %TEMP%, not OutDir: bpbuild paks OutDir's whole tree. Named per process: bpbuild and the tests compile the
+       same sources, and at once they overwrote each other's. Removed however Run returns: a dump is hundreds of MB,
+       no later run overwrites it, and every refusal the tests expect is a failed compile. */
     std::error_code TmpEc;
     /* Absolute: a bare "Mod.cpp" has an empty parent, and NamedQualifier cannot list "". */
     SourceDir = std::filesystem::absolute(SourcePath, TmpEc).parent_path().string();
     const std::string AstPath = (std::filesystem::temp_directory_path(TmpEc)
                                  / (std::filesystem::path(SourcePath).stem().string() + "." + std::to_string(ProcessId())
                                     + ".assetgen-ast.json")).string();
+    struct FRemoveAst { const std::string& Path; ~FRemoveAst() { remove(Path.c_str()); } } RemoveAst{ AstPath };
     /* Both the UeApi dir and its parent are include paths, so "FSD.h" and "UeApi/FSD.h" both resolve. Absolute
        first: a relative "UeApi" has an empty parent, and -I"" swallows the next argument. */
     const std::string Parent = std::filesystem::absolute(IncludeDir, TmpEc).parent_path().string();
@@ -10279,7 +10281,7 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
               : R.bIsInterface  ? GenerateInterface(R, OutDir, Err)
                                 : Generate(R, OutDir, Err)))
         {
-            /* Remove every generated asset; keep the AST for inspection. */
+            /* Remove every generated asset. */
             for (const auto& Other : Records)
                 if (Other.second.IsGenerated())
                     for (const char* Ext : { ".uasset", ".uexp" })
@@ -10350,8 +10352,6 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     if (!MergeAssetRegistry(RegistryRows, RegistryDir + "/AssetRegistry.bin", Err)) return false;
     printf("  %-14s -> %s/AssetRegistry.bin  (%d asset%s)\n", "registry", RegistryDir == OutDir ? "." : RegistryDir.c_str(),
            int32(RegistryRows.size()), RegistryRows.size() == 1 ? "" : "s");
-
-    remove(AstPath.c_str());        // kept only on failure
     return true;
 }
 }   // namespace
