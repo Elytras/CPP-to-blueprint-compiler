@@ -1016,6 +1016,15 @@ private:
     std::map<std::string, const Json*> MutableStatics;
     bool LowerInlineVar(const Json& Var, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     bool LowerContainerLiteral(const Json& List, const std::string& Type, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
+    /* The braced list of the inline variable E names (`kPrimes`, `this->kPrimes`), else null; and its elements as VM
+       constants of type Elem, false when one is not. A range-for and Contains over one make no array. */
+    const Json* InlineListOf(const Json* E) const;
+    bool InlineConsts(const Json& Items, const std::string& Elem, FBlueprintClass& BP, std::vector<FArgIR>* Out);
+    /* A == B for a type whose Kismet == is its property's Identical, what Array_Contains compares with; false for text
+       and structs, whose == differs (a vector's takes a tolerance). */
+    bool ExactEqual(const std::string& Type, FArgIR A, FArgIR B, FBlueprintClass& BP, FArgIR& Out) const;
+    bool LowerInlineContains(const Json& Item, const std::string& Elem, const std::vector<FArgIR>& Consts, FBlueprintClass& BP,
+                             FArgIR& Out, std::string* Err);
     /* Why a use of the static variable Id cannot compile (a write, or a static that is not const), or empty. */
     std::string StaticRefusal(const std::string& Id, bool bWrite) const
     {
@@ -2929,6 +2938,119 @@ bool IsVmConstant(const FArgIR& A)
     }
 }
 
+const Json* FCompiler::InlineListOf(const Json* E) const
+{
+    const Json* Named = Strip(E);
+    const Json* Base = Named && Kind(*Named) == "MemberExpr" ? Strip(First(*Named)) : nullptr;
+    const std::string Id = !Named ? "" : Kind(*Named) == "DeclRefExpr" ? (*Named)["referencedDecl"].value("id", std::string())
+                         : Base && Kind(*Base) == "CXXThisExpr" ? Named->value("referencedMemberDecl", std::string()) : "";
+    const auto Var = ConstVars.find(Id);
+    const Json* Items = Var != ConstVars.end() ? First(*Var->second) : nullptr;
+    while (Items && Kind(*Items) != "InitListExpr") Items = First(*Items);
+    return Items;
+}
+
+bool FCompiler::InlineConsts(const Json& Items, const std::string& Elem, FBlueprintClass& BP, std::vector<FArgIR>* Out)
+{
+    bool bOk = true;
+    ForEach(Items, [&](const Json& E) {
+        FArgIR& A = Out->emplace_back();
+        FConstVal V;
+        std::string Ignored;
+        bOk = bOk && ((FoldConst(E, V) && ConstToArg(V, Elem, A)) || (LowerArg(E, BP, A, &Ignored) && IsVmConstant(A)));
+    });
+    return bOk && !Out->empty();
+}
+
+bool FCompiler::ExactEqual(const std::string& Type, FArgIR A, FArgIR B, FBlueprintClass& BP, FArgIR& Out) const
+{
+    const std::string T = Canon(Type);
+    Out = FArgIR();
+    Out.K = FArgIR::Call;
+    Out.InnerType = "bool";
+    Out.Sub = std::make_shared<FCallIR>();
+    Out.Sub->bPure = true;
+    Out.Sub->Args = { std::move(A), std::move(B) };
+    if (T == "FName" || T == "FString" || T.compare(0, 5, "TSoft") == 0)
+    {
+        const FOpInfo* O = FindOp("==", T, T);
+        if (!O) return false;
+        Out.Sub->Fn = BP.EngineFunction(O->Package, O->Class, O->Fn);
+        Out.Sub->RefParms.resize(2);
+        for (const size_t At : O->Refs)
+            if (At < 2) Out.Sub->RefParms[At] = At == 0 ? O->Lhs : O->Rhs;
+        Out.Sub->bRefsTakeConst = true;
+        return true;
+    }
+    const char* Flavour = IsObjectType(T) ? "ObjectObject" : T == "float" ? "FloatFloat" : T == "int64" ? "Int64Int64"
+                        : T == "uint8" ? "ByteByte" : T == "bool" ? "BoolBool" : T == "int" ? "IntInt" : nullptr;
+    if (!Flavour) return false;
+    Out.Sub->Fn = BP.EngineFunction("/Script/Engine", "KismetMathLibrary", std::string("EqualEqual_") + Flavour);
+    Out.Sub->bScript = false;
+    return true;
+}
+
+/* `kKinds.Contains(X)` over an inline list of constants makes no array: X once, into a local, then R = X == A,
+   R = R || X == B, ... one statement each, so a long list nests nothing. BooleanOR runs every comparison, which is
+   harmless: each compares a local with a constant. */
+bool FCompiler::LowerInlineContains(const Json& Item, const std::string& Elem, const std::vector<FArgIR>& Consts,
+                                    FBlueprintClass& BP, FArgIR& Out, std::string* Err)
+{
+    if (!CurLocals) { *Err = "internal: Contains outside a function body"; return false; }
+    const std::string N = std::to_string(ReadTmpCounter++), X = "__ContainsItem" + N + "__", R = "__Contains" + N + "__";
+    for (const auto& [Name, Type] : { std::pair<std::string, std::string>{ X, Elem }, { R, "bool" } })
+    {
+        FPropertyDef PD;
+        if (!TypeToProperty(Type, Name, 0, "Contains", BP, &PD, Err)) return false;
+        PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+        CurLocals->push_back(PD);
+    }
+    auto Local = [](const std::string& Name) { FArgIR A; A.K = FArgIR::Local; A.S = Name; return A; };
+    auto Assign = [&](const std::string& Name, const std::string& Type, FArgIR Value) {
+        FStmtIR St;
+        St.K = FStmtIR::Assign;
+        St.Var = Local(Name);
+        St.Var.LetOp = LetOpFor(Type);
+        St.bAssignLocal = true;
+        St.Value = std::move(Value);
+        return St;
+    };
+    FArgIR Value;
+    if (!LowerArg(Item, BP, Value, Err)) return false;
+    auto Body = std::make_shared<std::vector<FStmtIR>>();
+    Body->push_back(Assign(X, Elem, std::move(Value)));
+    for (size_t I = 0; I < Consts.size(); ++I)
+    {
+        FArgIR Eq;
+        if (!ExactEqual(Elem, Local(X), Consts[I], BP, Eq)) { *Err = "internal: no exact == for " + Elem; return false; }
+        if (I > 0)
+        {
+            FArgIR Or;
+            Or.K = FArgIR::Call;
+            Or.InnerType = "bool";
+            Or.Sub = std::make_shared<FCallIR>();
+            Or.Sub->Fn = BP.EngineFunction("/Script/Engine", "KismetMathLibrary", "BooleanOR");
+            Or.Sub->bScript = false;
+            Or.Sub->bPure = true;
+            Or.Sub->Args = { Local(R), std::move(Eq) };
+            Eq = std::move(Or);
+        }
+        Body->push_back(Assign(R, "bool", std::move(Eq)));
+    }
+
+    auto Block = std::make_shared<std::vector<FStmtIR>>(1);
+    (*Block)[0].K = FStmtIR::Block;
+    (*Block)[0].Body = Body;
+    Out.K = FArgIR::Call;
+    Out.InnerType = "bool";
+    Out.Sub = std::make_shared<FCallIR>();
+    Out.Sub->Intrinsic = "__Inline__";
+    Out.Sub->Inline = Block;
+    Out.Sub->InlineResult = R;
+    Out.Sub->InlineType = "bool";
+    return true;
+}
+
 bool FCompiler::IsRawPointer(std::string T) const
 {
     T = StripTypeKeywords(T);
@@ -3508,6 +3630,16 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             const std::string Prefix = C[1] == 'A' ? "Array_" : C[1] == 'S' ? "Set_" : "Map_";
             std::string Method = Name(*Callee);
             if (Method == "Num") Method = "Length";
+            if (Method == "Contains" && Prefix != "Map_" && !bCurNoOpt)
+            {
+                std::string Elem;
+                std::vector<FArgIR> Consts;
+                FArgIR Probe;
+                const Json* Items = InlineListOf(Obj);
+                if (Items && Nth(*N, 1) && TemplateArg(C, Prefix == "Array_" ? "TArray" : "TSet", &Elem)
+                    && ExactEqual(Elem, {}, {}, BP, Probe) && InlineConsts(*Items, Elem, BP, &Consts))
+                    return LowerInlineContains(*Nth(*N, 1), Elem, Consts, BP, Out, Err);
+            }
             /* `Map[K].Add(X)`: Blueprint has no reference to a map element, so the call runs on a copy. */
             if (MapElementUnder(Unalias(*Obj)))
             {
@@ -6861,26 +6993,14 @@ bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vec
        the index, which must be a variable (execSwitchValue compares the cases with it where it lies). Every element is a
        case of its own, as one that falls through to the default throws a script exception first, a logged warning. */
     // ponytail: pass I compares I + 1 cases, N^2/2 in all; past 16 elements the Make Array walk below costs less.
-    const Json* Named = Strip(RangeExpr);
-    const Json* Base = Named && Kind(*Named) == "MemberExpr" ? Strip(First(*Named)) : nullptr;
-    const std::string NamedId = !Named ? "" : Kind(*Named) == "DeclRefExpr" ? (*Named)["referencedDecl"].value("id", std::string())
-                              : Base && Kind(*Base) == "CXXThisExpr" ? Named->value("referencedMemberDecl", std::string()) : "";
-    const auto InlineVar = ConstVars.find(NamedId);
-    const Json* Items = InlineVar != ConstVars.end() ? First(*InlineVar->second) : nullptr;
-    while (Items && Kind(*Items) != "InitListExpr") Items = First(*Items);
+    const Json* Items = InlineListOf(RangeExpr);
     std::string LoopTy = TypeOf(*LoopDecl);
     while (!LoopTy.empty() && (LoopTy.back() == '&' || LoopTy.back() == ' ')) LoopTy.pop_back();
     if (LoopTy.size() > 6 && LoopTy.compare(LoopTy.size() - 6, 6, " const") == 0) LoopTy.erase(LoopTy.size() - 6);  // `auto`: `int const &`
     std::vector<FArgIR> Consts;
-    bool bConsts = Which == 'A' && Items && Kind(*LoopDecl) == "VarDecl" && Canon(LoopTy) == Canon(Args[0]);
-    if (bConsts)
-        ForEach(*Items, [&](const Json& E) {
-            FArgIR& A = Consts.emplace_back();
-            FConstVal V;
-            std::string Ignored;
-            bConsts = bConsts && ((FoldConst(E, V) && ConstToArg(V, Args[0], A)) || (LowerArg(E, BP, A, &Ignored) && IsVmConstant(A)));
-        });
-    if (bConsts && !Consts.empty() && Consts.size() <= 16)
+    const bool bConsts = Which == 'A' && Items && Kind(*LoopDecl) == "VarDecl" && Canon(LoopTy) == Canon(Args[0])
+                      && InlineConsts(*Items, Args[0], BP, &Consts);
+    if (bConsts && Consts.size() <= 16)
     {
         const std::string Idx = "__RangeIdx" + N + "__", Var = "__RangeVar" + N + "__";
         if (!AddLocal(Idx, "int32") || !AddLocal(Var, Args[0])) return false;

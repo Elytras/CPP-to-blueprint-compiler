@@ -2058,10 +2058,12 @@ def soft_conversions():
                'Conv_SoftObjectReferenceToObject': lambda vm, ctx, s: loaded.get(s),
                'Conv_SoftObjectReferenceToString': lambda vm, ctx, s: s,
                'EqualEqual_SoftClassReference': lambda vm, ctx, a, b: a.lower() == b.lower(),
-               'NotEqual_SoftClassReference': lambda vm, ctx, a, b: a.lower() != b.lower(),
-               'Array_Contains': lambda vm, ctx, arr, x: x in arr}      # where runscript's CONTAINERS lacks it
-    vm = VM(asset('SoftTest'), natives, Kinds=[A, B], Kind=A)
+               'NotEqual_SoftClassReference': lambda vm, ctx, a, b: a.lower() != b.lower()}
+    vm = VM(asset('SoftTest'), natives, Kinds=[A, B], Kind=A, Draws=0)
     assert [vm.call('KnowsClassOf', Obj(c)) for c in (A, B, C)] == [True, True, False]
+    assert [vm.call('KnowsInline', Obj(c)) for c in (A, B, C)] == [True, True, False]
+    assert [vm.call('DrawIsPrime') for _ in range(7)] == [False, True, True, False, True, False, True]
+    assert vm.self.vars['Draws'] == 7, vm.self.vars       # the item ran once per Contains, not once per element
     thing = Obj('Actor', Path='/Game/Maps/Cave.Cave:PersistentLevel.Thing_1')
     vm.call('Remember', thing)
     assert vm.self.vars['Seen'] == thing.vars['Path'] and vm.call('SeenPath') == thing.vars['Path'], vm.self.vars
@@ -2071,6 +2073,7 @@ def soft_conversions():
     assert vm.call('ClassPathOf', Obj(B)) == B            # the path, not Conv_ObjectToString's name
     assert (vm.call('SameKind', A), vm.call('SameKind', B), vm.call('OtherKind', B)) == (True, False, True)
     print('ok  SoftTest: an object or class becomes a soft pointer, a soft pointer its path or (cast) its object')
+    print('ok  SoftTest: Contains on an inline list of constants runs its item once and compares it with each')
 
 
 soft_conversions()

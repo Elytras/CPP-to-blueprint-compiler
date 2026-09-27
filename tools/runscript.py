@@ -131,7 +131,8 @@ ADDRESSABLE = {0, 1, 0x48, 0x42, 0x6B}
 # The arguments a native reads by address: a const reference parameter (P_GET_PROPERTY_REF takes the address the
 # argument left) and a container library's containers (stepped into no buffer, then read where they lie). A call or a
 # cast there leaves the address of whatever ITS operands read last, and the native reads that - an int64 as an FText
-# crashed DRG. A constant leaves none, so a UHT thunk reads its own buffer. Any other container function: the container.
+# crashed DRG. A constant leaves none, so a UHT thunk reads its own buffer, and so does a SoftObjectConst of a literal
+# path (execSoftObjectConst steps the path into a local). Any other container function: the container.
 NATIVE_REFS = {'Conv_TextToString': (0,), 'Array_Append': (0, 1), 'Array_Identical': (0, 1), 'Set_AddItems': (0, 1),
                'Set_RemoveItems': (0, 1), 'Set_Difference': (0, 1, 2), 'Set_Intersection': (0, 1, 2),
                'Set_Union': (0, 1, 2), 'Set_ToArray': (0, 1), 'Map_Keys': (0, 1), 'Map_Values': (0, 1),
@@ -148,7 +149,8 @@ def native_refs(n):
     refs = NATIVE_REFS.get(n.val, (0,) if n.val.startswith(('Array_', 'Set_', 'Map_')) else ())
     for i in refs:
         a = n.kids[i] if i < len(n.kids) else None
-        if a is not None and a.op not in ADDRESSABLE | CONSTS and not (a.op in (0x19, 0x1A) and a.kids[1].op in ADDRESSABLE):
+        if a is not None and a.op not in ADDRESSABLE | CONSTS and not (a.op in (0x19, 0x1A) and a.kids[1].op in ADDRESSABLE) \
+                and not (a.op == 0x67 and a.kids[0].op in CONSTS):
             raise SystemExit('%s reads argument %d by address, and op %02x at mem %d leaves the address of what it read'
                              % (n.val, i, a.op, a.mem))
 
