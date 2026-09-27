@@ -8429,8 +8429,9 @@ bool FCompiler::GeneratePatch(const FRecord& R, std::string* Err)
                "defaults come from its C++ constructor, not from a package";
         return false;
     }
-    const bool bMethods = std::any_of(R.Methods.begin(), R.Methods.end(),
-                                      [](const auto& M) { return !M.second->value("isImplicit", false); });
+    /* Every one the patch declares: clang declares an implicit operator= up front only in a class with a virtual, and
+       no UeApi class has one. */
+    const bool bMethods = !R.Methods.empty();
     if (!R.Fields.empty() || !R.Interfaces.empty())
     { *Err = Where + ": a patch edits its parent's defaults and replaces its functions; a member or an interface of its own is not built yet"; return false; }
     const Json* Body = nullptr;
