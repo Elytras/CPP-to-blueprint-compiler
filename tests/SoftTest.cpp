@@ -30,4 +30,17 @@ public:
 
   bool SameKind(TSoftClassPtr<AActor> Other) { return Kind == Other; }
   bool OtherKind(TSoftClassPtr<AActor> Other) { return Kind != Other; }
+
+  /* Contains on an inline list of constants makes no array: the item goes into a variable once, then one == per
+     element. Draw counts how often the item runs. */
+  static inline const TArray<TSoftClassPtr<AActor>> kKinds  = {"/Game/A/BP_A.BP_A_C", "/Game/B/BP_B.BP_B_C"};
+  static inline const TArray<int32>                 kPrimes = {2, 3, 5, 7};
+  int32                                             Draws   = 0;
+
+  bool  KnowsInline(AActor *A) { return kKinds.Contains(A->GetClass()); }
+  int32 Draw() {
+    Draws += 1;
+    return Draws;
+  }
+  bool DrawIsPrime() { return kPrimes.Contains(Draw()); }
 };

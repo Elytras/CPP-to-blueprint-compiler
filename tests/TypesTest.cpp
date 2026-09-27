@@ -45,6 +45,14 @@ class TypesTest : public AActor, public ITargetable {
   int32 Seed = kSeed;
   static constexpr int32 kSlots = kStep * 4;
   int32 Budget = kSlots * 2 + 1;
+  /* Inline class variables: no property, no default in the CDO, each use the initializer; a container's is a Make Array. */
+  static inline const float kHold = kHalf + 0.25f;
+  static inline const FName kTag = "types";
+  static inline const TArray<int32> kPrimes = {2, 3, 5, 7, kSlots - 1};
+  static inline const TSet<FName> kMoods = {"calm", "angry"};
+  static inline const TMap<int32, float> kRates = {{1, 0.5f}, {kStep, kHold * 4}};
+  static inline const TArray<TSoftClassPtr<AActor>> kKinds = {"/Game/A/BP_A.BP_A_C", "/Game/B/BP_B.BP_B_C"};
+  static inline const TArray<int32> kRolls = {UKismetMathLibrary::RandomInteger(5), UKismetMathLibrary::RandomInteger(7)};
   float Reach = kHalf * 300 - 25;
   bool Halfway = kHalf;        // a float is true when nonzero: 0.5f is true
   int32 Bits = ~kMask & 0xFF;
@@ -73,6 +81,20 @@ class TypesTest : public AActor, public ITargetable {
 public:
   int32 ConstSum(int32 N) { return N * kStep + kSlots + kMask; }
   float HalfOf(float V) { return V * kHalf; }
+  float HoldFor(int32 N) { return N * kHold; }
+  FName TagOf() { return this->kTag; }
+  int32 PrimeAt(int32 I) { return kPrimes[I] + kPrimes.Num(); }
+  bool IsPrime(int32 N) { return kPrimes.Contains(N); }
+  int32 PrimeSum() { int32 T = 0; for (int32 P : kPrimes) T += P; return T; }
+  /* A range-for over an inline array of constants makes no array; over any other, the array is made once. */
+  int32 PrimeFold() { int32 T = 0; for (const auto &P : this->kPrimes) T = T * 3 + P; return T; }
+  int32 FirstPrimeOver(int32 N) { for (int32 P : kPrimes) { if (P <= N) continue; return P; } return -1; }
+  int32 RollSum() { int32 T = 0; for (int32 R : kRolls) T += R + 1; return T; }
+  int32 LocalList(int32 I) { TArray<int32> L = {4, 5, 6}; return L[I] + L.Num(); }
+  int32 PrimesBelow(int32 N) { int32 C = 0; for (int32 I = 0; I < kPrimes.Num(); ++I) if (kPrimes[I] < N) ++C; return C; }
+  bool IsMood(FName M) { return this->kMoods.Contains(M); }
+  float RateOf(int32 K) { return kRates.Contains(K) ? kRates[K] : -1.0f; }
+  int32 KindCount() { return kKinds.Num(); }
   /* Signed >> floors: -3 >> 1 is -2, where a plain divide by 2 gives -1. */
   int32 ShrBy(int32 X, int32 M) { return M == 1 ? X >> 1 : M == 4 ? X >> 4 : X >> 31; }
   int64 Shr64(int64 X, int32 M) { return M == 1 ? X >> 1 : X >> 63; }
