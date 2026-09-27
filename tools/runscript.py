@@ -31,7 +31,7 @@ class P(W):
         elif op in (4, 0x4E, 0x4F): k.append(s.node())
         elif op == 6: n.val = s.i32()
         elif op == 7: n.val = s.i32(); k.append(s.node())
-        elif op in (0xB, 0x16, 0x17, 0x25, 0x26, 0x27, 0x28, 0x2A, 0x2D, 0x4D, 0x53): pass
+        elif op in (0xB, 0x16, 0x17, 0x25, 0x26, 0x27, 0x28, 0x2A, 0x2D, 0x32, 0x3A, 0x3C, 0x4D, 0x53): pass
         elif op == 0x1F: n.val = s.cstr()
         elif op == 0x34:                                             # UnicodeStringConst: UTF-16 up to a 0 unit
             st = s.o
@@ -46,6 +46,11 @@ class P(W):
         elif op == 0xF: s.fieldpath(); k.append(s.node()); k.append(s.node())
         elif op in (0x14, 0x5F, 0x6B): k.append(s.node()); k.append(s.node())
         elif op in (0x1B, 0x45): n.val = s.name(); s.args(k)
+        elif op in (0x31, 0x39, 0x3B):                               # SetArray / SetSet / SetMap: the variable, a set's
+            k.append(s.node())                                       # or map's count, the elements up to the End op
+            if op != 0x31: n.val = s.i32()
+            s.args(k, op + 1)
+        elif op == 0x67: k.append(s.node())                          # SoftObjectConst: its path string
         elif op in (0x1C, 0x46, 0x68): n.val = s.ptr().split("'")[-2]; s.args(k)
         elif op == 0x1D: n.val = s.i32()
         elif op == 0x1E: n.val = struct.unpack_from('<f', s.b, s.o)[0]; s.raw(4)
@@ -54,19 +59,21 @@ class P(W):
         elif op == 0x4C: n.val = s.i32()
         elif op == 0x21: n.val = s.name()
         elif op == 0x42: n.val = s.fieldpath().split('@')[0]; k.append(s.node())
-        elif op == 0x69:
-            cnt = s.u16(); s.i32(); k.append(s.node())
+        elif op == 0x69:                                             # SwitchValue: each skip is where the VM goes on
+            cnt = s.u16(); end = s.i32(); k.append(s.node())
             n.val = []
             for _ in range(cnt):
-                key = s.node(); s.i32(); n.val.append((key, s.node()))
+                key = s.node(); nxt = s.i32(); n.val.append((key, s.node()))
+                if nxt != s.mem: raise SystemExit('SwitchValue at mem %d: a case skips to %d, not %d' % (mem, nxt, s.mem))
             k.append(s.node())
+            if end != s.mem: raise SystemExit('SwitchValue at mem %d skips to %d, not %d' % (mem, end, s.mem))
         else: raise SystemExit('unsupported op %02x at mem %d' % (op, mem))
         return n
 
-    def args(s, out):
+    def args(s, out, end=0x16):
         while True:
             a = s.node()
-            if a.op == 0x16: return
+            if a.op == end: return
             out.append(a)
 
 
@@ -251,6 +258,13 @@ def _union(ev, store, a):
         if v not in sets[2]: sets[2].append(copy.deepcopy(v))
 
 
+def _has(c, v):
+    """Contains: an FName or FString compares case-insensitively, as its == does (and a cooked name that differs
+    from an earlier one only in case is that one's entry)."""
+    low = lambda x: x.lower() if isinstance(x, str) else x
+    return low(v) in map(low, c)
+
+
 class Slot:
     """A TMap element in the compiler's __Slots__ view of the map's storage: its Key, and its Value, which is the map's
     own, so a store through it changes the map."""
@@ -299,6 +313,9 @@ CONTAINERS = {
     'Array_Clear': lambda ev, store, a: store(a[0], []),
     'Set_Clear': lambda ev, store, a: store(a[0], []),
     'Map_Clear': lambda ev, store, a: store(a[0], {}),
+    'Array_Contains': lambda ev, store, a: _has(_made(ev, store, a[0], []), ev(a[1])),
+    'Set_Contains': lambda ev, store, a: _has(_made(ev, store, a[0], []), ev(a[1])),
+    'Map_Contains': lambda ev, store, a: _has(_made(ev, store, a[0], {}), ev(a[1])),
 }
 
 # No map value is one of these: a container inside a map is the Value of a wrapper struct.
@@ -339,6 +356,7 @@ def run(base, function, self_vars=None, **parms):
             if n.val == '__Slots__': return slots_of(s)
             return s.get(n.val, 0) if isinstance(s, dict) else 0     # a struct is a dict; an unset member reads 0
         if o in (0x1F, 0x34): return n.val
+        if o == 0x67: return ev(n.kids[0])
         if o == 0x29: return ev(n.kids[0]) if n.kids else ''
         if o == 0x17: return SELF
         if o in (0x2A, 0x2D): return None
@@ -379,10 +397,14 @@ def run(base, function, self_vars=None, **parms):
             CALLS.append((n.val, tuple(args)))
             return MATH[n.val](*args)
         if o == 0x69:
+            # execSwitchValue compares the cases with the index where it lies, so the index is a variable; and no case
+            # matching throws a script exception (a logged warning) before the default runs.
+            if n.kids[0].op not in ADDRESSABLE:
+                raise SystemExit('SwitchValue at mem %d: its index (op %02x) leaves no address' % (n.mem, n.kids[0].op))
             v = ev(n.kids[0])
             for key, res in n.val:
                 if ev(key) == v: return ev(res)
-            return ev(n.kids[1])
+            raise SystemExit('SwitchValue at mem %d: no case is %r, a script exception in game' % (n.mem, v))
         raise SystemExit('unsupported expression op %02x at mem %d' % (o, n.mem))
 
     def store(dest, v):
@@ -444,6 +466,12 @@ def run(base, function, self_vars=None, **parms):
             if r.op != 0xB: fits('ReturnValue', r)
             return (ev(r) if r.op != 0xB else None), env
         elif o == 0xB: pass
+        elif o in (0x31, 0x39, 0x3B):                                # empties the variable, then adds each element
+            elems = [ev(e) for e in n.kids[1:]]
+            if o != 0x31 and n.val != len(elems) // (2 if o == 0x3B else 1):
+                raise SystemExit('op %02x at mem %d says %d elements and has %d' % (o, n.mem, n.val, len(elems)))
+            v = dict(zip(elems[::2], elems[1::2])) if o == 0x3B else [e for i, e in enumerate(elems) if o == 0x31 or e not in elems[:i]]
+            store(n.kids[0], v)
         elif o in (0x1B, 0x45, 0x1C, 0x46, 0x68, 0x19, 0x1A): ev(n)
         elif o == 0x53: raise SystemExit('ran off the end of the script')
         else: raise SystemExit('unsupported statement op %02x at mem %d' % (o, n.mem))

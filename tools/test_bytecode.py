@@ -1258,6 +1258,18 @@ def constants():
     step = r' \+ *\d+ mem \d+ disk \d+ mem \d+ '
     assert re.search(r'InstanceVariable Health@\S+' + step + 'NoInterface', forget) and re.search(r'InstanceVariable Aimed@\S+' + step + 'NoObject', forget), forget
     print('ok  TypesTest: a class alias stays an object; nullptr is EX_NoInterface for an interface')
+    cls = tool('dumpstruct.py', 0)
+    for var in ('kHold', 'kTag', 'kPrimes', 'kMoods', 'kRates', 'kKinds'):
+        assert var not in cls and var not in cdo, var
+    print('ok  TypesTest: an inline class variable cooks no property and no default')
+    for fn in ('PrimeSum', 'PrimeFold', 'FirstPrimeOver'):
+        assert 'ArrayProperty' not in tool('dumpstruct.py', exports.index(fn)), fn
+    print('ok  TypesTest: a range-for over an inline array of constants makes no array')
+    refused('StaticVar', '  static inline float Loose = 0.25f;\n  float Get() { return Loose; }\n', 'no static storage')
+    refused('StaticVar', '  static inline float Loose = 0.25f;\n  void Set() { Loose = 1; }\n', 'no static storage')
+    refused('StaticVar', '  static inline const float kHold = 0.5f;\n  StaticVar *Me() { return this; }\n'
+            '  float Get() { return Me()->kHold; }\n', 'is static: name it without the object')
+    print('ok  a static that is not const, and an inline variable read through a call, are refused')
 
 
 def types_behaviour():
@@ -1266,6 +1278,24 @@ def types_behaviour():
           [dict(M=m, N=n) for m in (0, 1, 4, 5, 6, 7, 255) for n in EDGE])
     check('TypesTest', 'ConstSum', lambda N: wrap(N * 3 + 31), [dict(N=n) for n in EDGE])
     check('TypesTest', 'HalfOf', lambda V: V * 0.5, [dict(V=v) for v in (-3.0, 0.0, 8.0, -0.25)])
+    # Inline class variables: each use is the initializer, a container one made where it is used.
+    primes = [2, 3, 5, 7, 11]
+    check('TypesTest', 'HoldFor', lambda N: N * 0.75, [dict(N=n) for n in (-3, 0, 4)])
+    check('TypesTest', 'TagOf', lambda: 'types', [dict()])
+    check('TypesTest', 'PrimeAt', lambda I: primes[I] + 5, [dict(I=i) for i in range(5)])
+    check('TypesTest', 'IsPrime', lambda N: N in primes, [dict(N=n) for n in range(13)])
+    check('TypesTest', 'PrimeSum', lambda: 28, [dict()])
+    check('TypesTest', 'PrimesBelow', lambda N: sum(p < N for p in primes), [dict(N=n) for n in (0, 3, 6, 12)])
+    check('TypesTest', 'IsMood', lambda M: M in ('calm', 'angry'), [dict(M=m) for m in ('calm', 'angry', 'sleepy')])
+    check('TypesTest', 'RateOf', lambda K: {1: 0.5, 3: 3.0}.get(K, -1.0), [dict(K=k) for k in (0, 1, 2, 3)])
+    check('TypesTest', 'KindCount', lambda: 2, [dict()])
+    check('TypesTest', 'PrimeFold', lambda: (((2 * 3 + 3) * 3 + 5) * 3 + 7) * 3 + 11, [dict()])       # in order
+    check('TypesTest', 'FirstPrimeOver', lambda N: next((p for p in primes if p > N), -1), [dict(N=n) for n in (-5, 2, 4, 10, 11, 20)])
+    del runscript.CALLS[:]
+    check('TypesTest', 'RollSum', lambda: 2, [dict()])            # the stand-in RandomInteger is 0
+    assert [c[0] for c in runscript.CALLS].count('RandomInteger') == 2, runscript.CALLS
+    print('ok  TypesTest.RollSum: an inline array of calls is made once for the loop, not once a pass')
+    check('TypesTest', 'LocalList', lambda I: [4, 5, 6][I] + 3, [dict(I=i) for i in range(3)])
     check('TypesTest', 'ShrBy', lambda X, M: X >> (M if M in (1, 4) else 31),   # Python >> floors, as C++'s does
           [dict(X=x, M=m) for x in EDGE + (-3, -1, -17) for m in (1, 4, 31)])
     check('TypesTest', 'Shr64', lambda X, M: X >> (1 if M == 1 else 63),
