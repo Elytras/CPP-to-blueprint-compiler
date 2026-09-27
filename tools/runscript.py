@@ -127,7 +127,13 @@ ADDRESSABLE = {0, 1, 0x48, 0x42, 0x6B}
 # crashed DRG. A constant leaves none, so a UHT thunk reads its own buffer. Any other container function: the container.
 NATIVE_REFS = {'Conv_TextToString': (0,), 'Array_Append': (0, 1), 'Array_Identical': (0, 1), 'Set_AddItems': (0, 1),
                'Set_RemoveItems': (0, 1), 'Set_Difference': (0, 1, 2), 'Set_Intersection': (0, 1, 2),
-               'Set_Union': (0, 1, 2), 'Set_ToArray': (0, 1), 'Map_Keys': (0, 1), 'Map_Values': (0, 1)}
+               'Set_Union': (0, 1, 2), 'Set_ToArray': (0, 1), 'Map_Keys': (0, 1), 'Map_Values': (0, 1),
+               # Seen in IDA for the class ones and SoftObjectReferenceToObject; the soft-object ones are the same UHT thunk
+               'Conv_ClassToSoftClassReference': (0,), 'Conv_SoftClassReferenceToClass': (0,),
+               'Conv_SoftClassReferenceToString': (0,), 'Conv_SoftObjectReferenceToObject': (0,),
+               'Conv_SoftObjectReferenceToString': (0,), 'EqualEqual_SoftClassReference': (0, 1),
+               'NotEqual_SoftClassReference': (0, 1), 'EqualEqual_SoftObjectReference': (0, 1),
+               'NotEqual_SoftObjectReference': (0, 1)}
 CONSTS = {0x17, 0x1D, 0x1E, 0x1F, 0x21, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2A, 0x2C, 0x2D, 0x34, 0x35}
 
 

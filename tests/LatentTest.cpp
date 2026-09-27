@@ -62,5 +62,30 @@ public:
   }
   TSoftObjectPtr<UObject> Icon;
 
-  void Plain() { Stage = 5; }
+  /* Statics live in the ubergraph's frame, a set per object: Count's initialiser runs on the object's first call only,
+     and Seen, which has none, starts at the frame's zero and is not made again by the loop round it. The first block's
+     Count is a local of its own, which must not reset the static. */
+  int32 Calls;
+  void Counted() {
+    int32 Rounds;
+    {
+      int32 Count = Stage;
+      Rounds = Count - Stage;
+    }
+    static int32 Count = Stage + 10;
+    ++Count;
+    for (int32 I = 0; I < 2; ++I) {
+      static int32 Seen;
+      ++Seen;
+      Rounds = Seen;
+    }
+    UKismetSystemLibrary::Delay(0.1f);
+    Calls = Count * 100 + Rounds;
+  }
+
+  /* No latent call, so no frame to keep a static in; a constant one needs none. */
+  void Plain() {
+    static constexpr int32 kFive = 5;
+    Stage = kFive;
+  }
 };

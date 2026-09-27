@@ -1333,6 +1333,7 @@ private:
     std::string CurFnName;                            // Generate: the method being lowered
     std::string LatentRefusal;                        // why that method cannot make a latent call, or empty
     bool bMadeLatentCall = false;                     // LowerCall: it made one, so it moves into the ubergraph
+    std::string StaticLocal;                          // LowerBody: a static it keeps in the ubergraph's frame, or empty
     int32 LatentCount = 0;
     /* A generated event a latent call's completion delegate binds: it stores its parameter into the frame local
        the call's value is read from after the resume. */
@@ -2160,17 +2161,29 @@ void WrapInCall(FArgIR& Arg, FIndex Fn)
     Arg.Sub->Args.push_back(Inner);
 }
 
+/* Conv.json and Ops.json name a soft pointer by its template over UObject, the type Kismet's functions take: any soft
+   pointer passes for it, whatever class it is of (genueapi's conv_kind). */
+std::string SoftKey(const std::string& T)
+{
+    std::string Of;
+    for (const char* Tpl : { "TSoftObjectPtr", "TSoftClassPtr" })
+        if (TemplateArg(T, Tpl, &Of)) return std::string(Tpl) + "<UObject>";
+    return T;
+}
+
 const FConv* FCompiler::FindConv(const std::string& From, const std::string& To) const
 {
+    const std::string F = SoftKey(From), T = SoftKey(To);
     for (const FConv& C : Convs)
-        if (C.From == From && C.To == To) return &C;
+        if (C.From == F && C.To == T) return &C;
     return nullptr;
 }
 
 const FOpInfo* FCompiler::FindOp(const std::string& Op, const std::string& Lhs, const std::string& Rhs) const
 {
+    const std::string L = SoftKey(Lhs), R = SoftKey(Rhs);
     for (const FOpInfo& O : Ops)
-        if (O.Op == Op && O.Lhs == Lhs && O.Rhs == Rhs) return &O;
+        if (O.Op == Op && O.Lhs == L && O.Rhs == R) return &O;
     return nullptr;
 }
 
@@ -2286,6 +2299,11 @@ bool FCompiler::ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgI
         Arg.InnerType = "bool";
         return true;
     }
+
+    /* `(AItem *)Soft`: the object or class a soft pointer names, null unless it is loaded (Conv_SoftObjectReferenceToObject,
+       Conv_SoftClassReferenceToClass). An object or class to a soft pointer is a Conv_ row too, found below. */
+    if (ToKind == SK_Object && From.compare(0, 5, "TSoft") == 0)
+        if (const FConv* C = FindConv(From, To)) { ApplyConv(*C, BP, Arg); return true; }
 
     if (To == From || From.empty() || To.empty() || ToKind == SK_Object) return true;
 
@@ -3226,15 +3244,18 @@ bool FCompiler::LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, 
     if (!LowerArgRaw(*N, OuterType, BP, Out, Err)) return false;
     if (Out.InnerType.empty()) Out.InnerType = TypeOf(*N);
     /* Strip looked through the casts, but an explicit narrowing inside a wider slot (`(uint8)*P + 1`
-       of a sign-extended byte, `(uint8)X` returned as int) still wraps, innermost first. */
+       of a sign-extended byte, `(uint8)X` returned as int) still wraps, innermost first. So does a soft pointer made on
+       the way: `FString(TSoftClassPtr<AItem>(Cls))` is the class's path, where Cls to FString would be its name. */
     std::vector<std::string> Narrowings;
     for (const Json* W = &ArgNode; W && W != N; W = First(*W))
-        if (const std::string K = Kind(*W); K == "CStyleCastExpr" || K == "CXXStaticCastExpr" || K == "CXXFunctionalCastExpr")
+        if (const std::string K = Kind(*W); K == "CStyleCastExpr" || K == "CXXStaticCastExpr" || K == "CXXFunctionalCastExpr"
+            || (K == "CXXConstructExpr" && StripTypeKeywords(TypeOf(*W)).compare(0, 5, "TSoft") == 0))
             Narrowings.push_back(TypeOf(*W));
     for (auto It = Narrowings.rbegin(); It != Narrowings.rend(); ++It)
     {
         const EStrKind From = KindOfLowered(Out, Out.InnerType), To = StrKindOf(Canon(*It));
-        if (((To == SK_Byte && (From == SK_Int || From == SK_Int64)) || (To == SK_Int && From == SK_Int64))
+        const bool bSoft = Canon(*It).compare(0, 5, "TSoft") == 0 && Canon(Out.InnerType).compare(0, 5, "TSoft") != 0;
+        if ((bSoft || (To == SK_Byte && (From == SK_Int || From == SK_Int64)) || (To == SK_Int && From == SK_Int64))
             && !ConvertArg(*It, BP, Out, Err))
             return false;
     }
@@ -5325,6 +5346,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 const Json* Init = Ds.bHasValue ? nullptr : Strip(First(D));
                 /* `FStats S;` carries an implicit argless CXXConstructExpr: no initialiser. */
                 if (Init && Kind(*Init) == "CXXConstructExpr" && !First(*Init)) Init = nullptr;
+                const std::string DeclId = D.value("id", std::string());
                 if (Init)
                 {
                     Ds.bHasValue = true;
@@ -5333,7 +5355,6 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                        the reads become the const and neither the property nor its store is compiled. A repeated
                        expansion of the same inline function reaches this declaration again, so the binding a
                        previous one left goes first. */
-                    const std::string DeclId = D.value("id", std::string());
                     ParmConst.erase(DeclId);
                     if (!bCurNoOpt && IsFoldableConst(Ds.Value) && ReadOnlyLocal(DeclId))
                     {
@@ -5341,7 +5362,48 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                         return;
                     }
                 }
-                else if ((LoopDepth > 0 || bBodyHasGoto || ReEntered > 0) && !Ds.bHasValue)
+                /* A static keeps its value from one call to the next, and the one frame that outlives a call is the
+                   ubergraph's, one per object: a latent function's locals live there, so a static is one of them
+                   (Generate refuses it in any other function, once the body shows whether it waits). Its initialiser
+                   runs once, `if (!__Once<N>) { X = Init; __Once<N> = true; }`, the flag false and X zero as the
+                   frame starts. A Blueprint local has no scope, so another local named X would be this same property
+                   and reset it: the static takes a name no C++ local can have. One that holds a constant nothing
+                   writes is that constant, kept or not. */
+                if (IsStaticDecl(D) && !(Ds.bHasValue && IsFoldableConst(Ds.Value) && ReadOnlyLocal(DeclId)))
+                {
+                    if (!InlineStack.empty())
+                    { *Err = "static " + Name(D) + " in an inline function: each expansion would keep its own"; bOk = false; return; }
+                    if (StaticLocal.empty()) StaticLocal = Name(D);
+                    const std::string N = std::to_string(ReadTmpCounter++);
+                    const std::string Kept = "__Static" + N + "_" + Name(D), Flag = "__Once" + N;
+                    LocalRename[DeclId] = Kept;
+                    Ds.Var.S = Kept;
+                    FPropertyDef KeptPD;
+                    if (!TypeToProperty(VarType, Kept, 0, "static " + Name(D), BP, &KeptPD, Err)) { bOk = false; return; }
+                    KeptPD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+                    Locals.push_back(KeptPD);
+                    if (!Ds.bHasValue) return;
+                    FPropertyDef FlagPD;
+                    if (!TypeToProperty("bool", Flag, 0, "static " + Name(D), BP, &FlagPD, Err)) { bOk = false; return; }
+                    FlagPD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+                    Locals.push_back(FlagPD);
+                    FStmtIR Once, Set;
+                    Once.K = FStmtIR::If;
+                    Once.Cond.K = FArgIR::Local;
+                    Once.Cond.S = Flag;
+                    Once.Cond = NotOf(Once.Cond, BP);
+                    Set.K = FStmtIR::Assign;
+                    Set.Var.K = FArgIR::Local;
+                    Set.Var.S = Flag;
+                    Set.Var.LetOp = LetOpFor("bool");
+                    Set.bAssignLocal = true;
+                    Set.Value.K = FArgIR::Bool;
+                    Set.Value.B = true;
+                    Once.Then = std::make_shared<std::vector<FStmtIR>>(std::vector<FStmtIR>{ Ds, Set });
+                    Out.push_back(std::move(Once));
+                    return;
+                }
+                if ((LoopDepth > 0 || bBodyHasGoto || ReEntered > 0) && !Ds.bHasValue)
                 {
                     /* The frame initialises a local once, on entry, but C++ constructs it again each time a loop
                        reaches the declaration. A twin nothing writes keeps the entry value to copy back. */
@@ -8845,6 +8907,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         bCurNoOpt = IsNoOptDecl(Decl) || IsNoOptDecl(M);
         WarnedRefParms.clear();
         bMadeLatentCall = false;
+        StaticLocal.clear();
         LatentCount = 0;
         Completions.clear();
         ActivatedActions.clear();
@@ -8855,6 +8918,12 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         if (Fn.Body && !LowerBody(*Fn.Body, BP, Stmts, Locals, Err))
         {
             *Err = R.CppName + "::" + Fn.Name + ": " + *Err;
+            return false;
+        }
+        if (!StaticLocal.empty() && !bMadeLatentCall)
+        {
+            *Err = R.CppName + "::" + Fn.Name + ": static " + StaticLocal + " lives in the ubergraph's frame, which only a "
+                   "function that makes a latent call runs in; make " + StaticLocal + " a member";
             return false;
         }
         if (!HoistReadsInList(Stmts, BP, Locals, Err))
@@ -9215,14 +9284,16 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
                     const std::string& OutDir, const std::optional<std::string>& InApiDir, std::string* Err)
 {
     ApiDir = InApiDir;
-    /* In %TEMP%, not OutDir: bpbuild paks OutDir's whole tree, and a failed compile keeps the dump (hundreds of MB).
-       Named per process: bpbuild and the tests compile the same sources, and at once they overwrote each other's. */
+    /* In %TEMP%, not OutDir: bpbuild paks OutDir's whole tree. Named per process: bpbuild and the tests compile the
+       same sources, and at once they overwrote each other's. Removed however Run returns: a dump is hundreds of MB,
+       no later run overwrites it, and every refusal the tests expect is a failed compile. */
     std::error_code TmpEc;
     /* Absolute: a bare "Mod.cpp" has an empty parent, and NamedQualifier cannot list "". */
     SourceDir = std::filesystem::absolute(SourcePath, TmpEc).parent_path().string();
     const std::string AstPath = (std::filesystem::temp_directory_path(TmpEc)
                                  / (std::filesystem::path(SourcePath).stem().string() + "." + std::to_string(ProcessId())
                                     + ".assetgen-ast.json")).string();
+    struct FRemoveAst { const std::string& Path; ~FRemoveAst() { remove(Path.c_str()); } } RemoveAst{ AstPath };
     /* Both the UeApi dir and its parent are include paths, so "FSD.h" and "UeApi/FSD.h" both resolve. Absolute
        first: a relative "UeApi" has an empty parent, and -I"" swallows the next argument. */
     const std::string Parent = std::filesystem::absolute(IncludeDir, TmpEc).parent_path().string();
@@ -9358,7 +9429,7 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
               : R.bIsInterface  ? GenerateInterface(R, OutDir, Err)
                                 : Generate(R, OutDir, Err)))
         {
-            /* Remove every generated asset; keep the AST for inspection. */
+            /* Remove every generated asset. */
             for (const auto& Other : Records)
                 if (Other.second.IsGenerated())
                     for (const char* Ext : { ".uasset", ".uexp" })
@@ -9410,8 +9481,6 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     if (!MergeAssetRegistry(RegistryRows, RegistryDir + "/AssetRegistry.bin", Err)) return false;
     printf("  %-14s -> %s/AssetRegistry.bin  (%d asset%s)\n", "registry", RegistryDir == OutDir ? "." : RegistryDir.c_str(),
            int32(RegistryRows.size()), RegistryRows.size() == 1 ? "" : "s");
-
-    remove(AstPath.c_str());        // kept only on failure
     return true;
 }
 }   // namespace
