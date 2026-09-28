@@ -19,7 +19,7 @@ no DLL.
 
 ```
 HelloWorld.cpp + UeApi/ ──assetgen compile──► HelloWorld.uasset/.uexp, ... + AssetRegistry.bin
-mods.yaml ──tools/bpbuild.py + UnrealPak──► out/HelloWorld_P.pak ──► FSD/Mods/HelloWorld/ ──► the game
+mods.yaml ──tools/bpbuild.py + UnrealPak──► out/HelloWorld_P.pak ──► the game
 ```
 
 Each piece of C++ becomes the Blueprint construct the editor would have made:
@@ -72,8 +72,8 @@ The source is C++, but what runs is a Blueprint. These are the differences that 
 
 ## Your first mod
 
-This section builds [examples/HelloWorld.cpp](examples/HelloWorld.cpp), the smallest mod that runs on its own,
-packs it and installs it.
+This section builds [examples/HelloWorld.cpp](examples/HelloWorld.cpp), the smallest mod that runs on its own, and
+packs it into a pak.
 
 ### Get the compiler and the SDK
 
@@ -137,7 +137,7 @@ private:
   inline void Say(FString Msg) { UGameFunctionLibrary::GetFSDGameState(this)->PostGameMessage(Msg); }
 };
 
-/* DRG's mod support spawns every mounted mod's InitSpacerig in the Space Rig and its InitCave in a mission. Both
+/* The game spawns a mod's InitSpacerig in the Space Rig and its InitCave in a mission. Both
    are empty, so whichever one the game spawns runs HelloWorld's ReceiveBeginPlay. */
 class InitSpacerig : public HelloWorld {};
 class InitCave : public HelloWorld {};
@@ -149,8 +149,8 @@ What each part does:
   `FSD.h` for the game's.
 - `UE_MOD_PACKAGE` names the `/Game` folder the source is cooked into. `HelloWorld` becomes the Blueprint class
   `HelloWorld_C` at `/Game/_AssetGenExamples/HelloWorld/HelloWorld`, with Actor as its parent. When you start a mod of
-  your own, change this line to a folder of its own, such as `/Game/_MyMods/<Mod>`: two mounted mods with one folder
-  hold packages at the same paths, `InitSpacerig` included, and only the higher-priority pak's copy is read.
+  your own, change this line to a folder of its own, such as `/Game/_MyMods/<Mod>`: two mods with one folder hold
+  packages at the same paths, `InitSpacerig` included, and only one of them is read.
 - `Count` and `Goal` are Blueprint variables, and their initializers are their defaults.
 - `ReceiveBeginPlay` has the name of Actor's BeginPlay event, so it is this class's Event BeginPlay, and the engine
   calls it.
@@ -161,8 +161,8 @@ What each part does:
   game state's `PostGameMessage`, because Print String shows nothing in the retail game.
 - `FString("HelloWorld counted to ") + Count` turns `Count` into a string with Blueprint's ToString node and joins the
   two with the Append node.
-- A pak only adds classes, so something has to spawn one before any code runs: DRG's mod support spawns every mounted
-  mod's `InitSpacerig` in the Space Rig and its `InitCave` in a mission. Declared as empty subclasses of `HelloWorld`,
+- A pak only adds classes, so something has to spawn one before any code runs: the game spawns a mod's
+  `InitSpacerig` in the Space Rig and its `InitCave` in a mission. Declared as empty subclasses of `HelloWorld`,
   with exactly those names, they run its `ReceiveBeginPlay` in both places.
 
 ### Compile it once
@@ -234,31 +234,16 @@ and the `UNREALPAK` variable points it elsewhere. The README's *Packing on Linux
 bpbuild prints `UnrealPak not found at <path> - skipping the pak.` and counts the mod as failed. A second run with
 nothing changed prints `HelloWorld       up to date`. [Building mods](#building-mods) covers the rest of `mods.yaml`.
 
-### Install it
-
-Put the pak in a folder of its own under `FSD/Mods/`, in the game's install folder:
-
-```
-steamapps/common/Deep Rock Galactic/FSD/Mods/HelloWorld/HelloWorld_P.pak
-```
-
-This is DRG's folder for mods under development. Keep one pak per folder: the game mounts only the first one it finds.
-Start the game through Steam, signed in, without `-disablemodding`. The game registers each subfolder of `FSD/Mods/`
-as a mod and mounts its pak unless you switch the mod off on the modding tab of the Esc menu. After each rebuild, quit
-the game, copy the new pak over the old one and start the game again. This route was read from the game's executable.
-[Installing and running](#installing-and-running) says what has been confirmed, covers the other routes, and says
-what to check when nothing happens.
-
 ### What you should see
+
+Install `HelloWorld_P.pak` the way you install any DRG mod.
 
 Enter the Space Rig. The game spawns `InitSpacerig`, and its `ReceiveBeginPlay` posts `Hello from AssetGen`, then
 `HelloWorld counted to 1`, `2` and `3`, two seconds apart. A mission spawns `InitCave`, which does the same. Look for
 the messages in the chat feed, the most likely place; where the game shows posted messages has not been checked.
 
-If nothing appears, look in the game's logs in `FSD/Saved/Logs/` for the mount's own lines, such as
-`No pakfiles found for: ...` or `Failed to mount pak file: ...`.
-
-From here, [Writing mods](#writing-mods) goes through what a mod can do, one topic at a time, and
+If nothing appears, [Running in the game](#running-in-the-game) says what to check. From here,
+[Writing mods](#writing-mods) goes through what a mod can do, one topic at a time, and
 [examples/WaitForPlayer.cpp](examples/WaitForPlayer.cpp) shows how a mod finds the player.
 
 ## Writing mods
@@ -1117,8 +1102,8 @@ mod shares in one fixed folder (see [Containers](REFERENCE.md#containers)).
 ### The asset registry
 
 A cooked package carries no asset-registry data of its own. So every compile also writes rows into an
-`AssetRegistry.bin` for everything it cooked, each with its class. DRG's mod support loads the registry it finds in a
-mod's pak and hands it to the engine's asset registry (see [Installing and running](#installing-and-running)).
+`AssetRegistry.bin` for everything it cooked, each with its class, and bpbuild packs it with the mod so that the
+game's asset registry lists the mod's assets.
 
 - When the out dir ends in `/Content/<package path without /Game>` (compared ignoring case), the registry goes to
   `<root>/AssetRegistry.bin`, beside `Content`, which is where a cooked pak keeps it. Any other out dir gets its own
@@ -1290,23 +1275,14 @@ under the same mount point.
   listed in each stub folder's `.assetgen` file; a folder without that file is left alone. After compiling, it rewrites
   the list from every `.uasset` and `.uexp` in the folder, not only the stubs it wrote. A hand-made asset kept beside
   the stubs is therefore listed after one build and deleted by the next recompile.
-- **bpbuild installs nothing.** It stops at `out/<name>_P.pak`. [Installing and running](#installing-and-running) says
-  where the pak goes.
+- **bpbuild installs nothing.** It stops at `out/<name>_P.pak`; install the pak as you install any DRG mod.
 
-## Installing and running
-
-This section says how the game starts a mod's code, where to put the pak, and what to check when nothing happens.
-
-What it says about the game was read from the game's executable. An AssetGen mod shaped like HelloWorld has run in
-game and posted its messages, but the route it was installed by was not recorded, so no route below is confirmed.
-*(inferred)* marks a step deduced rather than read.
-
-### How a mod's code starts
+## Running in the game
 
 A pak only adds classes. Nothing runs until something creates an instance of one. DRG mods handle this with two actor
-classes in the mod's folder, named `InitSpacerig` and `InitCave`: the game spawns every mounted mod's `InitSpacerig` in
-the Space Rig and its `InitCave` in a mission. Declare both as empty subclasses of your main actor, so that whichever
-one the game spawns runs its `ReceiveBeginPlay`:
+classes in the mod's folder, named `InitSpacerig` and `InitCave`: the game spawns a mod's `InitSpacerig` in the Space
+Rig and its `InitCave` in a mission. Declare both as empty subclasses of your main actor, so that whichever one the
+game spawns runs its `ReceiveBeginPlay`:
 
 ```cpp
 class Greeter : public AActor {
@@ -1320,70 +1296,20 @@ class InitSpacerig : public Greeter {};   // spawned in the Space Rig
 class InitCave : public Greeter {};       // spawned in a mission
 ```
 
-This is what [examples/HelloWorld.cpp](examples/HelloWorld.cpp) does, and it is the convention of DRG's modding
-community, which is why the SDK gives these class names no global alias. When the game's mod support mounts a mod's
-pak, it records every package whose path contains `InitSpacerig` or `InitCave`, so the class must be named exactly
-that, in a folder at any depth. It also loads the pak's `AssetRegistry.bin`, which is why bpbuild puts one in every
-pak. Later it spawns every mounted mod's `InitSpacerig_C` in the Space Rig and `InitCave_C` in a mission, and
-broadcasts `UUGCRegistry::OnBlueprintsSpawned`.
-
-### Installing a mod
-
-**The local mod folder.** DRG looks for mods under development in `FSD/Mods/`, and this is the route by which the game
-itself spawns a mod's `InitSpacerig` and `InitCave`, so it is the most likely way in.
-
-1. Build the pak. bpbuild writes `out/<name>_P.pak`.
-2. Create a folder for the mod in `FSD/Mods/` under the game's install folder, for example
-   `steamapps/common/Deep Rock Galactic/FSD/Mods/HelloWorld/`, and copy the pak into it. Keep one pak per folder: the
-   game mounts only the first `*.pak` it finds there, and logs `Multiple pakfiles found, only mounting: ...` if there
-   are more. The game creates `FSD/Mods/` itself, with a `README.txt` in it, so the folder may already exist.
-3. Start the game through Steam, signed in, without `-disablemodding`. With that switch, the mod support's startup
-   clears its saved on/off switches and returns early, so it never reads the local folder *(inferred)*. The startup
-   also runs only when the online subsystem reports you as logged in *(inferred)*.
-4. The game registers each subfolder of `FSD/Mods/` as a mod named after the folder and mounts its pak, unless the mod
-   is switched off (its entry under `[/Script/FSD.UserGeneratedContent]` in the game's config is false); the list is
-   on the modding tab of the Esc menu.
-5. Visit the Space Rig for `InitSpacerig`, or start a mission for `InitCave`.
-
-To replace the pak, quit the game, copy the new pak over the old one and start the game again. The pak is mounted at
-startup, and a running game keeps its mounted paks open *(inferred)*, so a copy made while it runs may fail. The mod
-registry also has functions that unmount sandbox mods, which local mods are, and unverified ones; when the game calls
-them, for example on joining another player's session, was not traced.
-
-**A mod manager.** A manager such as mint merges the mods it manages into one `mods_P.pak` under `FSD/Content/Paks/`
-and takes over loading them. How it starts a mod's `InitSpacerig` and `InitCave` is outside AssetGen and has not been
-checked.
-
-**Directly in `FSD/Content/Paks/`.** When the game starts, the engine mounts every `.pak` under `FSD/Content/Paks/`
-(subfolders included) and `FSD/Saved/Paks/`, and where two mounted paks hold the same file, the one with the higher
-priority wins. The game's own `FSD-WindowsNoEditor.pak` gets 4, any other pak under `Content/` gets 3 and a pak under
-`Saved/Paks/` gets 1, and a name ending in `_P.pak` adds 100. So a pak needs the `_P` suffix to replace a game file.
-A mod's own new files collide with nothing, and for them the suffix matters only against other mods. DRG's own mod
-support mounts a local mod's pak with priority 99 plus the number of mods registered before it, which outranks the
-game's pak with or without the suffix. bpbuild names every pak `<name>_P.pak`. Which of two `_P` paks in one folder
-wins a collision between them has not been checked.
-
-The lists of classes to spawn, though, are filled only when the game's mod support mounts a pak. Nothing found in the
-game spawns an `InitCave` from a pak that the engine mounted, so expect the classes to load and nothing to start them.
-Such a pak also carries `FSD/AssetRegistry.bin` at the same path as the game's own registry, with a higher priority,
-and it has not been tested whether the game then reads the mod's few rows in place of its own. Keep the pak out of
-this folder while it sits in `FSD/Mods/`, too: the engine would mount the second copy as well, and the priorities
-above then decide which copy's files are read.
+This is what [examples/HelloWorld.cpp](examples/HelloWorld.cpp) does. The class must be named exactly `InitSpacerig` or
+`InitCave`, in a folder at any depth. So many mods declare classes of these names that the SDK gives them no global
+alias. The pak's `AssetRegistry.bin`, which bpbuild puts in every pak, is loaded with it.
 
 ### When nothing happens
 
 Make the mod show that it ran. Print String shows nothing in the shipped game, so post a message through the game
-state's `PostGameMessage` in `ReceiveBeginPlay`, as HelloWorld does. Then check, in order:
+state's `PostGameMessage` in `ReceiveBeginPlay`, as HelloWorld does. Then check:
 
 - **The pak's contents.** The pak holds what bpbuild staged in `build/<name>/FSD`. Look there for the `InitSpacerig` and
   `InitCave` packages in the mod's folder, and run `python tools/dumpar.py build/<name>/FSD/AssetRegistry.bin` to list
   the registry's rows (see [Testing and inspecting](#testing-and-inspecting)).
-- **The install.** One pak in its own folder under `FSD/Mods/`, the game started through Steam without
-  `-disablemodding`, the mod switched on in the modding tab, and the game restarted after the last copy.
 - **The game's log.** It is `FSD/Saved/Logs/FSD.log`; an earlier run's log is kept beside it as
-  `FSD-backup-<time>.log`. Search it for the mount's own lines: `No pakfiles found for: ...` and ` - PakFile: ...` at
-  the `Log` verbosity, `Invalid pak file: ...` and `Failed to mount pak file: ...` at `Error`. The spawn step logs
-  nothing: its `Trying to spawn` and `Spawned` texts are built and thrown away in the shipping game.
+  `FSD-backup-<time>.log`. Search it for your mod's folder. The spawn itself logs nothing.
 
 ## The SDK
 
@@ -2038,5 +1964,5 @@ write once and the method to paste.
 - **Packing on Linux.** bpbuild needs UE 4.27's UnrealPak: a native Linux build on `PATH`, or the Windows
   `UnrealPak.exe` under Wine, named by the `UNREALPAK` variable as the README shows. See
   [Building mods](#building-mods).
-- **The game under Proton.** The install folder is the same as on Windows, `steamapps/common/Deep Rock Galactic/FSD/`,
-  so a mod goes in its own folder under `FSD/Mods/`. See [Installing and running](#installing-and-running).
+- **The game under Proton.** It reads paks from the same folders as on Windows, under
+  `steamapps/common/Deep Rock Galactic/FSD/`.

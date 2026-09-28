@@ -74,7 +74,7 @@ public:
   }
 };
 
-/* DRG's mod support spawns every mounted mod's InitSpacerig in the Space Rig and its InitCave in a mission. Both are
+/* The game spawns a mod's InitSpacerig in the Space Rig and its InitCave in a mission. Both are
    empty, so whichever one the game spawns runs BeaconMod's ReceiveBeginPlay. */
 class InitSpacerig : public BeaconMod {};
 class InitCave : public BeaconMod {};

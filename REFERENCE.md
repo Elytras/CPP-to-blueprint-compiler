@@ -264,7 +264,7 @@ Notes:
 - A child changes an inherited default, including one of a component that a game Blueprint parent adds, in
   `UE_DEFAULTS`. See [Class defaults](#class-defaults).
 - The game starts a mod through its classes named `InitCave` and `InitSpacerig`. See
-  [Installing and running](GUIDE.md#installing-and-running) and [examples/HelloWorld.cpp](examples/HelloWorld.cpp).
+  [Running in the game](GUIDE.md#running-in-the-game) and [examples/HelloWorld.cpp](examples/HelloWorld.cpp).
 
 ### Parent classes
 
@@ -5110,7 +5110,7 @@ listed here is refused with "unimplemented intrinsic".
 | `GetTypedOuter<T>(Obj)` | The nearest outer of Obj that is a T, or null. | [Working with other objects](#working-with-other-objects) |
 | `if (Obj)`, `!Obj` | Is Valid: false for null and for an object that is being destroyed. | [Working with other objects](#working-with-other-objects) |
 | `if (X)` on a value that is not a bool | An int32 goes through ToBool (integer), a float, int64 or byte is compared with zero, and an FName is tested against None. | [Statements and control flow](#statements-and-control-flow) |
-| `InitCave`, `InitSpacerig` | The class names DRG's mod support spawns from a mounted mod: InitSpacerig in the Space Rig, InitCave in a mission. | [Installing and running](GUIDE.md#installing-and-running) |
+| `InitCave`, `InitSpacerig` | The class names the game spawns from a mod: InitSpacerig in the Space Rig, InitCave in a mission. | [Running in the game](GUIDE.md#running-in-the-game) |
 | `inline` functions and templates | Expanded at each call like an editor macro, with no Blueprint function of its own. A free function or template must be `inline`. | [Inline functions and templates](#inline-functions-and-templates) |
 | `(int64)Obj`, `(uint8 *)Obj` | The object's address, as an int64 or as a pointer. | [Pointers and memory](#pointers-and-memory) |
 | Lambdas, function pointers, operator overloads | Refused, all three: a Blueprint has no lambda, no function pointer and no operator of a mod's own. Write an inline function, or pass `{this, &C::F}` as a delegate. | [Functions](#functions) |

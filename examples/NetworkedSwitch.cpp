@@ -113,6 +113,6 @@ public:
   }
 };
 
-/* DRG's mod support spawns InitSpacerig in the Space Rig and InitCave in a mission. Both are NetworkedSwitch. */
+/* The game spawns a mod's InitSpacerig in the Space Rig and its InitCave in a mission. Both are NetworkedSwitch. */
 class InitSpacerig : public NetworkedSwitch {};
 class InitCave : public NetworkedSwitch {};

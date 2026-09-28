@@ -37,7 +37,7 @@ private:
   inline void Say(FString Msg) { UGameFunctionLibrary::GetFSDGameState(this)->PostGameMessage(Msg); }
 };
 
-/* DRG's mod support spawns every mounted mod's InitSpacerig in the Space Rig and its InitCave in a mission. Both
+/* The game spawns a mod's InitSpacerig in the Space Rig and its InitCave in a mission. Both
    are empty, so whichever one the game spawns runs HelloWorld's ReceiveBeginPlay. */
 class InitSpacerig : public HelloWorld {};
 class InitCave : public HelloWorld {};

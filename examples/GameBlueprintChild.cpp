@@ -73,7 +73,7 @@ public:
   }
 };
 
-/* DRG's mod support spawns InitSpacerig in the Space Rig and InitCave in a mission. Both are empty, so whichever
+/* The game spawns a mod's InitSpacerig in the Space Rig and its InitCave in a mission. Both are empty, so whichever
    one the game spawns runs GameBlueprintChild's ReceiveBeginPlay. */
 class InitSpacerig : public GameBlueprintChild {};
 class InitCave : public GameBlueprintChild {};

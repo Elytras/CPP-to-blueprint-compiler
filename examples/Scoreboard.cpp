@@ -109,6 +109,6 @@ private:
   inline void Say(FString Msg) { UGameFunctionLibrary::GetFSDGameState(this)->PostGameMessage(Msg); }
 };
 
-/* DRG's mod support spawns InitSpacerig in the Space Rig and InitCave in a mission. Both are the Scoreboard. */
+/* The game spawns a mod's InitSpacerig in the Space Rig and its InitCave in a mission. Both are the Scoreboard. */
 class InitSpacerig : public Scoreboard {};
 class InitCave : public Scoreboard {};
