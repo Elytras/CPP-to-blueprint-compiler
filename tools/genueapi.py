@@ -437,6 +437,55 @@ UOBJECT_FORWARDS = (
 )
 
 
+# ---- subsystem getters ---------------------------------------------------------------------------------------
+# The editor's Get <X> node (K2Node_GetSubsystem, K2Node_GetEngineSubsystem ...) is a call to the
+# USubsystemBlueprintLibrary getter for X's kind with X as its class, the result pin retyped to X: no cast node. A class
+# under a kind gets the same as `static X* Get(...)`, one overload per getter of its kind, taking the getter's other
+# parameters. A context object is `WorldContextObject = nullptr`, which AssetGen makes the caller's self, the node's
+# hidden pin. The kinds are the library's own - a getter is a static returning K* that takes TSubclassOf<K> - so an
+# engine with another (UE5's GetAudioEngineSubsystem) needs nothing here.
+def subsystem_kinds(by_name):
+    """kind class -> [(getter, its parameters, the TSubclassOf's index among them)]"""
+    lib = by_name.get("USubsystemBlueprintLibrary")
+    kinds = {}
+    for is_static, ret, fname, params in lib.funcs if lib else ():
+        m = PTR.match(ret)
+        cls = [i for i, (t, _) in enumerate(params) if m and t == "TSubclassOf<class %s>" % m.group(1)]
+        if is_static and len(cls) == 1:
+            kinds.setdefault(m.group(1), []).append((fname, params, cls[0]))
+    return kinds
+
+
+def subsystem_get(k, by_name, kinds, rewrite):
+    """X::Get: its declarations in the class, and its definitions, which go after the package's classes (Engine.h can
+    declare USubsystemBlueprintLibrary after a subsystem of its own). None for a kind itself, or where a Get would hide
+    a UFunction of that name."""
+    kind, names = by_name.get(k.base), set(f for _, _, f, _ in k.funcs)
+    while kind and kind.cpp not in kinds:
+        names.update(f for _, _, f, _ in kind.funcs)
+        kind = by_name.get(kind.base)
+    if not kind or "Get" in names:
+        return [], []
+    # A Blueprint's whole path only where the definition starts, at global scope: inside `namespace Game::Game::X` (or
+    # after `X::Get(`, in X's scope) `Game::` names the inner Game. There X is X's own name.
+    me = k.ue_name if k.is_bp else k.cpp
+    decls, defs = [], []
+    for getter, params, cls in kinds[kind.cpp]:
+        own, args = [], []
+        for i, (t, n) in enumerate(params):
+            if i == cls:
+                args.append("%s::StaticClass()" % me)
+                continue
+            n = "WorldContextObject" if t == "class UObject*" else n
+            own.append("%s %s" % (rewrite(t), n))
+            args.append(n)
+        default = " = nullptr" if own and own[-1].endswith(" WorldContextObject") else ""
+        decls.append("    static %s* Get(%s%s);" % (me, ", ".join(own), default))
+        defs.append("inline %s* %s::Get(%s) { return (%s*)USubsystemBlueprintLibrary::%s(%s); }"
+                    % (k.emit, k.emit, ", ".join(own), me, getter, ", ".join(args)))
+    return decls, defs
+
+
 # ---- engine names --------------------------------------------------------------------------------------------
 # Dumper-7 respells what C++ cannot say. A member that collides with an inherited one gets a tail (a Blueprint
 # class's `Name` is `Name_0`, the SDK's UObject having a Name; `UberGraphFrame_<Class>`), a character C++ has no use
@@ -1053,9 +1102,10 @@ def main():
     def ns_end(ns):
         return "}" * (ns.count("::") + 1) + "   // namespace " + ns
 
-    funcs, fields, aliased, renamed, not_ufunctions, const_refs = 0, 0, 0, 0, [], 0
+    funcs, fields, aliased, renamed, not_ufunctions, const_refs, getters = 0, 0, 0, 0, [], 0, 0
+    kinds = subsystem_kinds(by_name)
     for pkg, members in sorted(by_pkg.items()):
-        body, referenced = [], set()
+        body, referenced, get_defs = [], set(), []
         defined = set(k.cpp for k in members)
         ns_open = None
         for en in sorted((e for e in ENUMS.values() if e.pkg == pkg), key=lambda e: e.cpp):
@@ -1169,9 +1219,16 @@ def main():
                 for ret, name, target in UOBJECT_FORWARDS:
                     body.append("    %s %s();" % (ret, name))
                     body.append('    static constexpr const char* %s__UeForward = "%s";' % (name, target))
+            decls, defs = subsystem_get(k, by_name, kinds, rewrite)
+            body += decls
+            get_defs += defs
+            getters += bool(decls)
             body.append("};\n")
         if ns_open:
             body.append(ns_end(ns_open) + "\n")
+        if get_defs:
+            body += ["/* Each subsystem's Get: the USubsystemBlueprintLibrary getter for its kind, as the editor's Get node. */"]
+            body += get_defs + [""]
 
         body += ops_by_pkg.get(pkg, [])
 
@@ -1241,6 +1298,7 @@ def main():
     print("  blueprint classes: %d, of which %d reachable unqualified" % (len(bp), aliased))
     print("  respelled by Dumper-7 and named back (__UeName): %d" % renamed)
     print("  const reference parameters, read by address (const T&): %d" % const_refs)
+    print("  subsystems with a static Get (%s): %d" % (", ".join(sorted(kinds)) or "no USubsystemBlueprintLibrary", getters))
     if UNEXPLAINED:
         print("  NOT named back, the respelling rules do not explain them (is the object dump of the same run?): %d, e.g. %s"
               % (len(UNEXPLAINED), "; ".join(UNEXPLAINED[:5])))

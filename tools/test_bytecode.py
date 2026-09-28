@@ -2079,6 +2079,30 @@ def soft_conversions():
 soft_conversions()
 
 
+# ---- SubsystemTest
+
+def subsystem_gets():
+    """SubsystemTest: X::Get() is one call of the library getter for X's kind with X's class, as the editor's Get node
+    makes it, and answers what that call does: no cast after it. A world context left out is self, or a static's own
+    world context. The fake getters answer with what they were asked."""
+    natives = dict((g, lambda vm, ctx, *a: a) for g in ('GetEngineSubsystem', 'GetGameInstanceSubsystem', 'GetWorldSubsystem'))
+    vm = VM(asset('SubsystemTest'), natives)
+    other, ctx = Obj('Actor'), Obj('Actor')
+    for fn, args, getter, want in (('Engine', (), 'GetEngineSubsystem', ('UGCSubsystem',)),
+                                   ('GameInstance', (), 'GetGameInstanceSubsystem', (vm.self, 'DamageSubsystem')),
+                                   ('World', (), 'GetWorldSubsystem', (vm.self, 'TracerManager')),
+                                   ('OtherWorld', (other,), 'GetWorldSubsystem', (other, 'TracerManager')),
+                                   ('FromStatic', (ctx,), 'GetWorldSubsystem', (ctx, 'TracerManager')),
+                                   ('Blueprint', (), 'GetWorldSubsystem', (vm.self, 'BP_TracerManager_C'))):
+        del vm.log[:]
+        got = vm.call(fn, *args)
+        assert [(n, list(a)) for n, _, a in vm.log] == [(getter, list(want))] and tuple(got) == want, (fn, vm.log, got)
+    print('ok  SubsystemTest: Get and GetSubsystem<T> reach the getter for their kind, the world context defaulting to self')
+
+
+subsystem_gets()
+
+
 # ---- ReplTest, LatentTest, AsyncTest, SpawnTest
 
 def replication():
