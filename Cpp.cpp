@@ -705,6 +705,7 @@ const char* ViewFieldOf(const std::string& DerefIntrinsic)
 /* SelfExp: the enclosing function's export index, FFieldPath owner of its params and locals. */
 bool EmitArgs(FScript& S, const std::vector<FArgIR>& Args, FIndex SelfExp, std::string* Err);
 FArgIR NotOf(FArgIR V, FBlueprintClass& BP);
+namespace { bool CallsImpure(const FArgIR& A); }
 
 bool EmitArg(FScript& S, const FArgIR& A, FIndex SelfExp, std::string* Err)
 {
@@ -4286,6 +4287,32 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             if (!LowerArg(bPtrLeft ? *LhsRaw : *RhsRaw, BP, Ptr, Err)
                 || !ScaleIndex(bPtrLeft ? *RhsRaw : *LhsRaw, bPtrLeft ? LP : RP, BP, Other, Err)) return false;
             Out = Math(Op == "+" ? "Add_Int64Int64" : "Subtract_Int64Int64", std::move(Ptr), std::move(Other));
+            return true;
+        }
+        /* `A | B`, `A & B`, `A ^ B` over bools: C++ promotes both sides to int and the result back, four native calls
+           (Conv_BoolToInt twice, Or_IntInt, Conv_IntToBool). BooleanOR / BooleanAND / BooleanXOR is one, and runs both
+           sides as `|` does. A constant side decides it or drops out: `X | true` is true when X only reads. */
+        auto BoolSide = [this](const Json* S) -> const Json* {
+            const Json* In = S && Kind(*S) == "ImplicitCastExpr" && S->value("castKind", std::string()) == "IntegralCast" ? First(*S) : nullptr;
+            return In && Canon(TypeOf(*In)) == "bool" ? In : nullptr;
+        };
+        if (const Json *LB = BoolSide(LhsRaw), *RB = BoolSide(RhsRaw); !bCurNoOpt && LB && RB && (Op == "|" || Op == "&" || Op == "^"))
+        {
+            FArgIR L, R;
+            if (!LowerArg(*LB, BP, L, Err) || !LowerArg(*RB, BP, R, Err)) return false;
+            if (L.K == FArgIR::Bool) std::swap(L, R);
+            const FArgIR* Decided = R.K != FArgIR::Bool ? nullptr
+                                  : (Op == "|" && !R.B) || (Op == "&" && R.B) || (Op == "^" && !R.B) ? &L
+                                  : Op != "^" && !CallsImpure(L) ? &R : nullptr;
+            if (Decided) { Out = *Decided; Out.InnerType = "bool"; return true; }
+            Out = FArgIR();
+            Out.K = FArgIR::Call;
+            Out.InnerType = "bool";
+            Out.Sub = std::make_shared<FCallIR>();
+            Out.Sub->Fn = BP.EngineFunction("/Script/Engine", "KismetMathLibrary",
+                                            Op == "|" ? "BooleanOR" : Op == "&" ? "BooleanAND" : "BooleanXOR");
+            Out.Sub->bPure = true;
+            Out.Sub->Args = { std::move(L), std::move(R) };
             return true;
         }
         if (Op == "&&" || Op == "||")

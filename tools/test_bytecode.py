@@ -1039,6 +1039,17 @@ def opt_locals():
     print('ok  OptTest.Locals: Kept written, RandomInteger(A) called once')
 
 
+def opt_bools():
+    """Bool `|` / `&` / `^` give C++'s values; both sides of `Bump(A) | Bump(B)` run, whatever A is, and a constant
+    side that decides the value still leaves a side that acts to run (`Bump(B) | true`)."""
+    for a, b in itertools.product((False, True), repeat=2):
+        me = dict(Calls=0)
+        got = run(asset('OptTest'), 'Bools', self_vars=me, A=a, B=b)[0]
+        want = int(a or b) + 2 * int(a and b) + 4 * int(a != b) + 8 + 16 * int(b) + 32 * int(a or b) + 64 + 128 * 3
+        assert got == want and me == dict(Calls=3), (a, b, got, want, me)
+    print('ok  OptTest.Bools: bool | & ^ and their constant sides, both sides run')
+
+
 def opt_raw():
     """UE_NO_OPTIMIZE / #pragma clang optimize off: what the source says runs, unused pure calls and the
     short-circuit included (an execution trace, not the layout)."""
@@ -1062,6 +1073,7 @@ def opt_flags():
 
 
 opt_locals()
+opt_bools()
 opt_raw()
 opt_flags()
 

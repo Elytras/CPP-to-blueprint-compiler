@@ -171,6 +171,7 @@ MATH = {
     'EqualEqual_ByteByte': lambda a, b: a == b, 'EqualEqual_IntInt': lambda a, b: a == b, 'NotEqual_IntInt': lambda a, b: a != b,
     'Conv_IntToBool': lambda a: a != 0,
     'Not_PreBool': lambda a: not a, 'BooleanAND': lambda a, b: a and b, 'BooleanOR': lambda a, b: a or b,
+    'BooleanXOR': lambda a, b: bool(a) != bool(b),
     'Add_FloatFloat': lambda a, b: a + b, 'Multiply_FloatFloat': lambda a, b: a * b,
     'Conv_IntToFloat': float, 'Not_Int': lambda a: ~a, 'Not_Int64': lambda a: ~a,
     'Subtract_FloatFloat': lambda a, b: a - b, 'Divide_FloatFloat': lambda a, b: a / b,

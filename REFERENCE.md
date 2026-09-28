@@ -1360,7 +1360,7 @@ Notes:
 | You write | What it does | Status |
 |---|---|---|
 | `(A & 0xFF) \| (B ^ 1)` | The Bitwise AND, OR and XOR nodes (And_IntInt, Or_IntInt, Xor_IntInt, or the Int64Int64 versions). | Yes |
-| `Any \|= Hit` on bools | The bools are promoted to int as in C++ (Conv_BoolToInt), and the result is converted back when it lands in a bool (Conv_IntToBool). | Yes |
+| `Any \|= Hit`, `A & B`, `A ^ B` on bools | The OR, AND and XOR Boolean nodes (BooleanOR, BooleanAND, BooleanXOR). Both sides run, as in C++. A constant side decides the value or drops out, but a side that calls something still runs. Under UE_NO_OPTIMIZE the bools are promoted to int as in C++ (Conv_BoolToInt) and the result converted back (Conv_IntToBool). | Yes |
 | `~B & 0xFF` | `~` is the Bitwise NOT node (Not_Int, Not_Int64). | Yes |
 | `Hi << 16` | Kismet has no shift node. `X << N` is a multiply by 2^N, which wraps as a shift does. | Yes |
 | `X >> 1` | Clears the low N bits and then divides, so it floors as C++ does: -3 >> 1 is -2 and -7 >> 1 is -4. A uint8 is promoted to int first, so 255 >> 1 is 127. | Yes |

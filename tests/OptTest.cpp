@@ -50,6 +50,26 @@ public:
     return R;
   }
 
+  /* Bool `|` / `&` / `^`: one BooleanOR / BooleanAND / BooleanXOR, which runs both sides as C++ does; a constant side
+     decides it or drops out. */
+  int32 Calls;
+  bool Bump(bool V) {
+    Calls += 1;
+    return V;
+  }
+  int32 Bools(bool A, bool B) {
+    bool Any = A;
+    Any |= B;
+    bool All = A & B;
+    bool One = A ^ B;
+    bool Stuck = A | true;
+    bool Same = B & true;
+    bool Both = Bump(A) | Bump(B);
+    bool Kept = Bump(B) | true; // true, but Bump still runs
+    return int32(Any) + 2 * int32(All) + 4 * int32(One) + 8 * int32(Stuck) + 16 * int32(Same) + 32 * int32(Both) +
+           64 * int32(Kept) + 128 * Calls;
+  }
+
   /* UE_NO_OPTIMIZE: the unused pure call, the unread local and the branch all stay. */
   UE_NO_OPTIMIZE int32 Raw(int32 X, int32 Y) {
     UKismetMathLibrary::Multiply_IntInt(X, Y);
