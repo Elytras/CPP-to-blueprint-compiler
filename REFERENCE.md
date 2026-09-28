@@ -1808,9 +1808,9 @@ Notes:
 
 ## The optimizer
 
-AssetGen optimizes each function's bytecode. It folds constants, drops work whose result nothing uses and lets
-temporaries share variables. None of this changes what a function does, and a store to a member or to another object
-is never removed. The rule to remember: mark a method UE_PURE only when calling it has no side effects, because a
+AssetGen optimizes each function's bytecode. It folds constants, drops work whose result nothing uses, lets locals
+share variables and turns the bool an inline function returns into a jump. None of this changes what a function does,
+and a store to a member or to another object is never removed. The rule to remember: mark a method UE_PURE only when calling it has no side effects, because a
 pure call whose result is unused is dropped.
 
 ### Constant folding
@@ -1860,6 +1860,8 @@ stays what C++ says.
 | `int32 Unused = A * 3;` | A local that nothing reads is removed, with its stores. | Yes |
 | `int32 Rolled = UKismetMathLibrary::RandomInteger(A);` | The unread local goes, but an impure initializer still runs as a call. | Yes |
 | `return X + A * B;` after `int32 X = A * B;` | A repeated pure call is not reused: it is evaluated each time it appears. To compute it once, keep the result in a local and read the local. | Not yet |
+| `if (IsReady(Item))` over an inline bool function whose returns are all constants | Each `return true` and `return false` jumps straight to the branch it picks: no bool is stored and then tested. | Yes |
+| `Scale(Value, Tick())` into `inline int32 Scale(int32 V, int32 By)` | A parameter the body only reads is the caller's local variable itself, not a copy, while nothing can change that variable during the call. Another argument that writes it, or a reference parameter bound to it, keeps the copy. | Yes |
 
 ```cpp
 int32 Drops(int32 A) {
@@ -1872,8 +1874,10 @@ int32 Drops(int32 A) {
 
 Notes:
 
-- A store that the next statement overwrites on every path is dropped, a temp read once in the next statement is
-  folded into it, and compiler temps share variables once their lifetimes end.
+- A store that the next statement overwrites on every path is dropped. A local read once is folded into the statement
+  that reads it, also past stores to other locals in between when neither can see the move. Locals, the function's
+  own included, share variables once their lifetimes end, and a copy from a local that ends there into one that
+  starts there goes.
 - "Pure" means a Kismet operator or conversion, an engine BlueprintPure function without out parameters (Random*,
   Now, Create*, Spawn* and similar are excluded), or a mod method marked UE_PURE with no non-const reference parameters. A
   UE_PURE method called only for its side effects, with its result unused, is dropped. Do not mark such a method
