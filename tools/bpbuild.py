@@ -143,8 +143,10 @@ def embed_deps(dep_stages, stage_fsd, assetgen):
         if os.path.isdir(dest):
             shutil.rmtree(dest)
         os.makedirs(dest)
-        for f in staged_assets(content):
-            shutil.copy2(f, os.path.join(dest, os.path.basename(f)))
+        for f in cooked_assets(content):
+            to = os.path.join(dest, os.path.relpath(f, content))
+            os.makedirs(os.path.dirname(to), exist_ok=True)
+            shutil.copy2(f, to)
         registry = os.path.join(fsd, "AssetRegistry.bin")
         if os.path.exists(registry) and subprocess.run(
                 [assetgen, "registry", os.path.join(stage_fsd, "AssetRegistry.bin"), registry]).returncode != 0:
@@ -157,6 +159,13 @@ def staged_assets(stage_content):
         return []
     return [os.path.join(stage_content, f) for f in os.listdir(stage_content)
             if f.endswith(".uasset") or f.endswith(".uexp")]
+
+
+def cooked_assets(stage_content):
+    """Every package a compile staged in a mod's folder, its subfolders included, since a namespace is a folder.
+    An `api_dir` keeps to staged_assets: it can share its folders with a project's hand-made assets."""
+    return [os.path.join(root, f) for root, _dirs, files in os.walk(stage_content)
+            for f in files if f.endswith(".uasset") or f.endswith(".uexp")]
 
 
 def run_unrealpak(fsd_dir, pak_path):
@@ -180,17 +189,17 @@ def run_unrealpak(fsd_dir, pak_path):
 def check_mod_imports(staged, mod_packages):
     """A generated asset is <mod package>/<class>; a UE_CLASS naming the folder instead writes an
     import that loads fine and resolves to null, first seen as a null UFunction inside the VM."""
+    def packages(content):
+        return sorted(os.path.relpath(f, content).replace(os.sep, "/")
+                      for f in cooked_assets(content) if f.endswith(".uasset"))
+
     produced = set()
     for _mod, content, package in staged:
-        for f in os.listdir(content):
-            if f.endswith(".uasset"):
-                produced.add(package + "/" + f[:-len(".uasset")])
+        produced.update(package + "/" + f[:-len(".uasset")] for f in packages(content))
 
     bad = []
     for _mod, content, _package in staged:
-        for f in sorted(os.listdir(content)):
-            if not f.endswith(".uasset"):
-                continue
+        for f in packages(content):
             base = os.path.join(content, f[:-len(".uasset")])
             imports = load_package(base)[4]
             for entry in imports:
@@ -297,7 +306,7 @@ def main():
         package = mod_package(sources[0])
         stage_fsd = os.path.join(bp, "build", name, "FSD")
         stage_content = os.path.join(stage_fsd, "Content", *package.replace("/Game/", "").split("/"))
-        assets = staged_assets(stage_content)
+        assets = cooked_assets(stage_content)
         staged.append((name, stage_content, package))
 
         # `generate_api` writes the editor-side stub next to nothing else, so it has its own
@@ -366,8 +375,8 @@ def main():
     for mod, name, package, stage_fsd, stage_content, stale in records:
         embed = bool(mod.get("embed"))
         dep_stages = [dep_stage(d, by_name, bp) for d in transitive_needs(name, by_name)] if embed else []
-        dep_assets = [f for content, _p, _f in dep_stages for f in staged_assets(content)]
-        assets = staged_assets(stage_content)
+        dep_assets = [f for content, _p, _f in dep_stages for f in cooked_assets(content)]
+        assets = cooked_assets(stage_content)
         pak = os.path.join(bp, "out", name + "_P.pak")
         # A dep's assets are baked into this pak, so a change to one restales it; likewise our own
         # assets after a --no-pak run. Judged on our sources alone the old pak would ship, and a mod
