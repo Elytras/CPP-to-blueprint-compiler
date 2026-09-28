@@ -85,6 +85,33 @@ public:
     return T * 1000000 + B * 10000 + U * 100 + D;
   }
 
+  /* An inline's parameter is the caller's local itself only while nothing can change the local: a call that does not
+     name it (Tick) cannot, a reference parameter bound to it can (AddTo's Acc), and so can another argument that writes
+     it (Bumped). C++ leaves the order of Order's arguments open, so Order only has to agree with OrderRaw. */
+  inline int32 Pair(int32 A, int32 B) { return A * 1000 + B; }
+  inline int32 AddTo(int32 V, int32 &Acc) {
+    Acc += V;
+    return V * 1000 + Acc;
+  }
+  int32 Bumped(int32 &V) {
+    V += 1;
+    return V;
+  }
+  int32 InPlace(int32 X) {
+    int32 L = X;
+    int32 P = Pair(L, Tick());
+    int32 Q = AddTo(L, L);
+    return P + Q * 3;
+  }
+  int32 Order(int32 X) {
+    int32 L = X;
+    return Pair(L, Bumped(L));
+  }
+  UE_NO_OPTIMIZE int32 OrderRaw(int32 X) {
+    int32 L = X;
+    return Pair(L, Bumped(L));
+  }
+
   /* UE_NO_OPTIMIZE: the unused pure call, the unread local and the branch all stay. */
   UE_NO_OPTIMIZE int32 Raw(int32 X, int32 Y) {
     UKismetMathLibrary::Multiply_IntInt(X, Y);

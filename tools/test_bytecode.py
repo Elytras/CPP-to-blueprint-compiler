@@ -1060,6 +1060,19 @@ def opt_forward():
     print('ok  OptTest.Forward: a value moves to its one read, never past a store that reads what it changes')
 
 
+def opt_in_place():
+    """An inline's parameter is the caller's local only while nothing can change it: AddTo's V is L before Acc, bound to
+    L, adds to it; Order, whose other argument writes L, agrees with its unoptimized twin, in an order C++ allows."""
+    for x, c in itertools.product((0, 4, -3), (0, 2)):
+        me = dict(Calls=c)
+        got = run(asset('OptTest'), 'InPlace', self_vars=me, X=x)[0]
+        want = x * 1000 + c + 1 + 3 * (x * 1000 + 2 * x)
+        assert got == want and me == dict(Calls=c + 1), (x, c, got, want, me)
+        order, raw = (run(asset('OptTest'), f, X=x)[0] for f in ('Order', 'OrderRaw'))
+        assert order == raw and order in (x * 1000 + x + 1, (x + 1) * 1000 + x + 1), (x, order, raw)
+    print("ok  OptTest.InPlace / Order: a caller's local stands in for a parameter only while nothing can change it")
+
+
 def opt_raw():
     """UE_NO_OPTIMIZE / #pragma clang optimize off: what the source says runs, unused pure calls and the
     short-circuit included (an execution trace, not the layout)."""
@@ -1085,6 +1098,7 @@ def opt_flags():
 opt_locals()
 opt_bools()
 opt_forward()
+opt_in_place()
 opt_raw()
 opt_flags()
 

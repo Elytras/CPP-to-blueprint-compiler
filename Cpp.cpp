@@ -7017,14 +7017,31 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
         }
         else if (WcoDefault[I]) { if (!CurrentWco.empty()) { Values[I].K = FArgIR::Local; Values[I].S = CurrentWco; } }
         else if (!LowerArg(*Args[I], BP, Values[I], Err)) return false;
-    /* The caller's own variable can stand in for a parameter the body only reads, as a constant does, when nothing
-       could change it before the body is done: no argument stores anything, and no parameter is a reference, the
-       only way the body could reach a caller's local. */
+    /* The caller's own local can stand in for a parameter the body only reads, as a constant does, when nothing could
+       change it before the body is done: no other argument that names it runs anything or may store to it (a frame
+       local has no address, so one that does not name it cannot), and no mutable reference parameter is bound to
+       anything that names it, the only way the body could reach a caller's local. A reference the caller holds (an
+       outer inline's alias) may name anything, so one bound to a reference parameter keeps every local out. The
+       caller's own reference parameter (LocalOut) never stands in: it may be an object's property the body writes. */
     bool bVarsInPlace = !bCurNoOpt;
+    std::set<std::string> RefBound;
+    std::function<void(const Json&)> NamedIn = [&](const Json& N) {
+        if (Kind(N) == "DeclRefExpr" && N.contains("referencedDecl")) RefBound.insert(N["referencedDecl"].value("id", std::string()));
+        ForEach(N, NamedIn);
+    };
+    for (size_t I = 0; I < Parms.size(); ++I)
+        if (IsMutableRef(TypeOf(*Parms[I]))) NamedIn(*Args[I]);
+    for (const std::string& Id : RefBound) bVarsInPlace = bVarsInPlace && !RefAlias.count(Id);
+    std::vector<bool> InPlace(Parms.size());
     for (size_t I = 0; I < Parms.size(); ++I)
     {
-        const std::string T = TypeOf(*Parms[I]);
-        bVarsInPlace = bVarsInPlace && (T.empty() || T.back() != '&') && IsSideEffectFree(*Args[I]);
+        const Json* D = Strip(Args[I]);
+        const std::string Id = D && Kind(*D) == "DeclRefExpr" ? (*D)["referencedDecl"].value("id", std::string()) : std::string();
+        const FArgIR& X = Values[I];
+        InPlace[I] = bVarsInPlace && !Id.empty() && !RefBound.count(Id) && !RefAlias.count(Id) && X.K == FArgIR::Local && !X.Base;
+        for (size_t J = 0; J < Parms.size() && InPlace[I]; ++J)
+            InPlace[I] = J == I || (Mentions(Pins[J], X.S) == 0 && !MayStore(Values[J], X.S)
+                                    && (Mentions(Values[J], X.S) == 0 || !CallsImpure(Values[J])));
     }
     for (size_t I = 0; I < Parms.size(); ++I)
     {
@@ -7047,8 +7064,7 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
         Bind.Value = std::move(Values[I]);
         /* A constant the body only reads is used in place: no local, no copy. */
         if (IsFoldableConst(Bind.Value) && OnlyRead(*Body, Id)) { ParmConst[Id] = Bind.Value; continue; }
-        if (bVarsInPlace && (Bind.Value.K == FArgIR::Local || Bind.Value.K == FArgIR::LocalOut)
-            && Canon(Bind.Value.InnerType) == Canon(Type) && OnlyRead(*Body, Id))
+        if (InPlace[I] && Canon(Bind.Value.InnerType) == Canon(Type) && (OnlyRead(*Body, Id) || OnlyReadValue(*Body, Id)))
         { ParmConst[Id] = Bind.Value; continue; }
         if (!AddLocal(Local, Type)) return false;
         Bind.K = FStmtIR::Assign;
