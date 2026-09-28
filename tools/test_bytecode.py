@@ -1513,12 +1513,13 @@ def types_behaviour():
     assert f == {'Health': None, 'Aimed': None}, f
     print('ok  TypesTest: ReceiveEndPlay, HandleScored and Forget write their members')
     # The class implements ITargetable, and each interface function it leaves out exists and returns the zero value,
-    # so a call through the interface finds the Blueprint function rather than the interface's native one.
+    # so a call through the interface finds the Blueprint function rather than the interface's native one. It returns
+    # a value of its own: runscript's None is `Return Nothing`, which leaves a script caller's destination as it was.
     here = os.path.dirname(os.path.abspath(__file__))
     cls = subprocess.run([sys.executable, os.path.join(here, 'dumpstruct.py'), asset('TypesTest'), '0'], capture_output=True, encoding='utf-8').stdout
     assert re.search(r"""Interfaces \[\("imp\[\d+\]:Class'Targetable'", 0, 1\)\]""", cls), cls
-    for fn in ('GetTargetCenterMass', 'GetTargetHealthComponent', 'ShowDamageEffects'):
-        assert run(asset('TypesTest'), fn)[0] is None, fn
+    for fn, zero in (('GetTargetCenterMass', 0), ('GetTargetHealthComponent', 0), ('ShowDamageEffects', None)):
+        assert run(asset('TypesTest'), fn)[0] == zero, fn
     print('ok  TypesTest: implements Targetable; the functions it leaves out return zero')
 
 
@@ -1747,7 +1748,7 @@ def interfaces():
 def interface_bodies():
     """IfaceTest: implementations and stubs, run offline - return values and the fields they write."""
     b = lambda a: os.path.join(os.path.dirname(asset('IfaceTest')), a)
-    zero = (None, 0)                     # a bare return: the caller reads the frame's zeroed ReturnValue
+    zero = (0,)                          # a zeroed local; None, a bare return, leaves a script caller's destination as it was
     assert run(b('Turret'), 'GetPriority')[0] == 7
     for a, fn, parms, before, after in (('Turret', 'OnTargeted', {'By': 'x'}, {'Hits': 5}, {'Hits': 6}),
                                         ('Beacon', 'Mark', {'Count': 4}, {'Marks': 12}, {'Marks': 16}),
@@ -1915,6 +1916,23 @@ def parent_call():
     flags = lambda b, fn: re.search(r'FunctionFlags (\S+)', dump('dumpstruct.py', b, exports_of(b).index(fn))).group(1)
     assert flags(test, 'Bump') == flags(base, 'Bump') and flags(test, 'ReceiveBeginPlay') == flags(base, 'ReceiveBeginPlay') == '0x8080800'
     print('ok  SuperTest: Base::Method() is the parent\'s body, expanded or a final call; overrides bind to it')
+
+
+def pure_virtual():
+    """SuperTest's PureBase: `= 0` cooks an empty function returning the default, which a subclass's version names as
+    its super and a call by name on an object without one finds; a class clang calls abstract is cooked Abstract."""
+    folder = os.path.dirname(asset('SuperTest'))
+    pb, pm, pk = (os.path.join(folder, c) for c in ('PureBase', 'PureMid', 'PureKid'))
+    assert run(pb, 'Pure', V=5)[0] == 0 and {'Pure', 'Touch'} <= set(exports_of(pb)), exports_of(pb)
+    assert run_as([pk, pm, pb], 'UsePure', {}, V=4) == 70 and run_as([pm, pb], 'UsePure', {}, V=4) == 0
+    for b, fn in ((pk, 'Pure'), (pm, 'Touch')):
+        e = dumpexp.load(b)[5][exports_of(b).index(fn)]
+        assert ref(b, e['super']) == '/Game/_ElytrasMods/SuperTest/PureBase.PureBase_C:' + fn, (b, fn, e['super'])
+    abstract = lambda b: int(re.search(r'ClassFlags (\S+)', dump('dumpstruct.py', b, 0)).group(1), 16) & 0x1
+    assert abstract(pb) and abstract(pm) and not abstract(pk) and not abstract(os.path.join(folder, 'SuperBase'))
+    pl = os.path.join(folder, 'PokeLess')       # an interface's `= 0` it leaves out: a stub, not Abstract
+    assert not abstract(pl) and run(pl, 'Poke')[0] == 0
+    print('ok  SuperTest: `= 0` is an empty function a subclass overrides; a class left abstract is cooked Abstract')
 
 
 def engine_names():
@@ -2652,6 +2670,7 @@ interface_bodies()
 interface_calls()
 inherited_defaults()
 parent_call()
+pure_virtual()
 engine_names()
 object_forwards()
 api_stub()

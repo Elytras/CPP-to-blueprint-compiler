@@ -2100,7 +2100,7 @@ bool FCompiler::Collect(std::string* Err)
                 /* Not a UFunction: AssetGen reads its assignments as defaults, never lowers them. */
                 R.Defaults = &C;
             }
-            else if (Kind(C) == "CXXMethodDecl" && C.contains("name"))
+            else if (Kind(C) == "CXXMethodDecl" && C.contains("name") && !C.value("isImplicit", false))
             {
                 /* genueapi's overload without the world context shares the name; the longer one is the UFunction. */
                 const Json*& Slot = R.Methods[Name(C)];
@@ -9215,8 +9215,7 @@ bool FCompiler::GeneratePatch(const FRecord& R, std::string* Err)
                "defaults come from its C++ constructor, not from a package";
         return false;
     }
-    /* Every one the patch declares: clang declares an implicit operator= up front only in a class with a virtual, and
-       no UeApi class has one. */
+    /* Every one the patch declares: Collect leaves out the implicit ones. */
     const bool bMethods = !R.Methods.empty();
     if (!R.Fields.empty() || !R.Interfaces.empty())
     { *Err = Where + ": a patch edits its parent's defaults and replaces its functions; a member or an interface of its own is not built yet"; return false; }
@@ -9968,7 +9967,15 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
 
     const bool bIsActor = std::find(Ancestry.begin(), Ancestry.end(), "Actor") != Ancestry.end();
     BP.SetIsActor(bIsActor);
-    BP.SetClassFlags(ClassFlagsFor(Ancestry));
+    /* Abstract: the nearest declaration of some method along the class chain is `= 0`. SpawnActor and CreateWidget
+       refuse the class, as they do one the editor marks Generate Abstract Class. An interface's `= 0` does not count,
+       since an implementer that leaves it out gets a stub, and clang's own isAbstract never reaches here (FAstSax). */
+    bool bAbstract = false;
+    std::set<std::string> Nearest;
+    for (const FRecord* A = &R; A; A = A->Base.empty() ? nullptr : Find(A->Base))
+        for (const auto& [Method, Decl] : A->Methods)
+            if (Nearest.insert(Method).second && Decl->value("pure", false)) bAbstract = true;
+    BP.SetClassFlags(ClassFlagsFor(Ancestry) | (bAbstract ? uint32(CLASS_Abstract) : 0u));
 
     for (const std::string& I : R.Interfaces)
     {
@@ -10423,7 +10430,9 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                        "function of that name; rename this one";
                 return false;
             }
-        if ((Fn.Body = BodyOf(R, Fn.Name, Fn.Def))) Methods.push_back(Fn);
+        /* `= 0` with no body anywhere is an empty function, like an interface's stub below: a subclass's version needs
+           it as its super, and a call by name on an object without one would not find a function (a Fatal). */
+        if ((Fn.Body = BodyOf(R, Fn.Name, Fn.Def)) || Fn.Decl->value("pure", false)) Methods.push_back(Fn);
     }
     /* The editor compiles every Blueprint-implementable function of an implemented interface, a stub
        where the Blueprint has none (KismetCompiler.cpp MergeUbergraphPagesIn, ConformImplementedInterfaces);
@@ -10564,6 +10573,22 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         {
             *Err = R.CppName + "::" + Fn.Name + ": " + *Err;
             return false;
+        }
+        /* A stub returns the default. A script caller's destination is the return parameter itself (ScriptCore.cpp
+           ProcessScriptFunction: RetVal->PropAddr = RESULT_PARAM), so Return Nothing would leave its old value there. A
+           local is zeroed and constructed on every call, the value the editor's unlinked result pin gives. */
+        if (!Fn.Body && !RetType.empty() && RetType != "void")
+        {
+            FPropertyDef PD;
+            if (!TypeToProperty(RetType, "__Default", 0, "return type on " + Fn.Name, BP, &PD, Err)) return false;
+            PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+            Locals.push_back(PD);
+            FStmtIR Ret;
+            Ret.K = FStmtIR::Return;
+            Ret.bHasValue = true;
+            Ret.Value.K = FArgIR::Local;
+            Ret.Value.S = PD.Name;
+            Stmts.push_back(std::move(Ret));
         }
         if (!StaticLocal.empty() && !bMadeLatentCall)
         {
@@ -10845,10 +10870,11 @@ public:
            range's end is kept only then, for a qualifier written in a macro (NamedQualifier). */
         const bool bMacroEnd = K == "end" && Stack.back()->is_object() && Stack.back()->contains("begin")
                             && (*Stack.back())["begin"].contains("spellingLoc");
-        /* A variable's use flags stay: Run refuses a used UE_ASSET_AT that cannot load. "kind" comes before them. */
+        /* A variable's use flags stay: Run refuses a used UE_ASSET_AT that cannot load. A method's isImplicit stays: the
+           operator= clang declares up front in a class with a virtual is no Blueprint function. "kind" comes before them. */
         bSkipNext = K == "loc" || (K == "end" && !bMacroEnd) || K == "file" || K == "line" || K == "col" || K == "includedFrom"
-                 || K == "expansionLoc" || K == "isMacroArgExpansion" || K == "mangledName"
-                 || K == "definitionData" || K == "isImplicit"
+                 || K == "expansionLoc" || K == "isMacroArgExpansion" || K == "mangledName" || K == "definitionData"
+                 || (K == "isImplicit" && Stack.back()->value("kind", std::string()) != "CXXMethodDecl")
                  || ((K == "isUsed" || K == "isReferenced") && Stack.back()->value("kind", std::string()) != "VarDecl")
                  || K == "typeAliasDeclId" || (K == "range" && !DeclRef.back());
         bKindNext = K == "kind";

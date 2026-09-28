@@ -1930,11 +1930,12 @@ written inside the class does not make a method inline. Only the `inline` keywor
 | `UE_PURE static int32 Clamp01(int32 V)` | A pure static function. | Yes |
 | `virtual int32 Priority()` | `virtual` is accepted and changes nothing. Every mod method is already called by name, and the most derived version runs. | Yes |
 | `virtual int32 Step() final` | No subclass has a Step of its own: the function is cooked Final, and calls to it are direct, as in a `final` class. A subclass method named Step is refused. C++ allows `final` only on a virtual method. | Yes |
+| `virtual int32 Score() = 0;` | An empty function that returns the default: 0, false, None or empty. A subclass's Score overrides it and names it as its super. A class that declares one, or inherits one with no version of its own, is cooked Abstract, which SpawnActor and CreateWidget refuse, as they refuse a class the editor marks Generate Abstract Class. `NewObject` and `AddComponentByClass` do not check the flag in a game, so a call to Score on such an object gets the default. | Yes |
 | `public:` / `protected:` / `private:` | Become the function's Public, Protected or Private flag, which the editor honours; see [Classes and variables](#classes-and-variables). | Yes |
 | `UE_CATEGORY("Teleporter\|Setup");` | The category of the members that follow, written into the editor API stub; see [Classes and variables](#classes-and-variables). | Yes |
 | `UE_AUTHORITY_ONLY` / `UE_COSMETIC` | The editor's Authority Only and Cosmetic function flags; see [RPCs](#rpcs). | Yes |
 | `generate_api: true` in `mods.yaml` | Writes an editor stub of the class, so a Blueprint made in the editor can place call nodes for its functions; see [Editor API stubs](GUIDE.md#editor-api-stubs). | Yes |
-| `int32 Undef(int32 X);` with no body anywhere | Not refused. No function is cooked, but a call to it still compiles to a call by name of a function the class does not have. Give every method a body. | Not yet |
+| `int32 Undef(int32 X);` with no body anywhere | Not refused. No function is cooked, but a call to it still compiles to a call by name of a function the class does not have. Give every method a body, or make it `virtual ... = 0` for an empty one. | Not yet |
 | `AMyActor() { Charges = 5; }` | A constructor body is silently ignored: it makes no function and no default. Use a member initializer or UE_DEFAULTS, and do runtime setup in ReceiveBeginPlay; see [Class defaults](#class-defaults). | Not yet |
 | `int32 Sum() const { ... }` inside a UE_STRUCT | A struct holds no functions. A non-inline struct method is not refused and compiles to a call that cannot work; an inline one is refused (`called on another object`). Write a free inline function that takes the struct: `inline int32 SumOf(const FPair &P)`. | Not yet |
 
@@ -3988,6 +3989,7 @@ Notes:
 |---|---|---|
 | `class IAimable { public: UE_INTERFACE; void OnAimed(AActor *By); int32 GetPriority(); };` | A Blueprint Interface asset, cooked at `<UE_MOD_PACKAGE>/IAimable` as class IAimable_C, with one empty function per method. Functions can return values and take reference (out) parameters. | Yes |
 | `class Turret : public AActor, public IAimable` | Implements it as for a game interface: matched by name, with stubs for the functions left out. There is no Events.json check, because every function of a mod interface can be implemented. | Yes |
+| `virtual int32 GetPriority() = 0;` on the interface | The same as a declaration without a body. A class that leaves it out gets the empty stub and is not cooked Abstract. | Yes |
 | `int32 GetPriority() { return 1; }` on the interface | A default implementation. A class that leaves the function out gets this body, with `this` being that class, instead of an empty stub. Blueprint Interface functions have no bodies in the editor. | Yes |
 | `class IMarkable : public IAimable { public: UE_INTERFACE; ... };` | An interface that extends one other. A class that lists IMarkable alone implements both: a cast to either succeeds, and it gets stubs for the parent's functions it leaves out. | Yes |
 | `class IPriorityTarget : public ITargetable { public: UE_INTERFACE; ... };` | A mod interface that extends a game interface (FSD's Targetable). An implementer gets the game interface's functions too, checked against Events.json. | Yes |
@@ -5178,6 +5180,7 @@ listed here is refused with "unimplemented intrinsic".
 | `#pragma clang optimize off` | The functions up to `#pragma clang optimize on` compile as written, as with UE_NO_OPTIMIZE. | [The optimizer](#the-optimizer) |
 | `__PtrCast__<To>(Value)` | Reinterprets between objects, int64 addresses, pointers and references, at compile time. | [Intrinsics](#intrinsics) |
 | `public:`, `protected:`, `private:` | The function access in the cooked class. A private variable is left out of the editor API stub. A `class` starts private. | [Classes and variables](#classes-and-variables) |
+| pure virtual, `virtual T F() = 0` | An empty function returning the default. A class left with one it has no version of is cooked Abstract, which SpawnActor and CreateWidget refuse. | [Functions](#functions) |
 | `__Read32__(Addr)` | Reads an int32 at an int64 address, or at the address a pointer holds. | [Intrinsics](#intrinsics) |
 | `__Read64__(Addr)` | Reads an int64 at an address or pointer. | [Intrinsics](#intrinsics) |
 | `__ReadByte__(Addr)` | Reads a uint8 at an address or pointer. | [Intrinsics](#intrinsics) |
@@ -5241,7 +5244,7 @@ listed here is refused with "unimplemented intrinsic".
 | `UeAssets::<Class>::All` | Every game asset of that class, as soft pointers. | [Game assets](#game-assets) |
 | `UeAssets::<Class>::Game::...::<Name>` | A game asset by its content path, for `&` to point at. | [Game assets](#game-assets) |
 | `using FTarget = AActor;` | An alias of a class. A variable of it is still an object reference. | [Classes and variables](#classes-and-variables) |
-| `virtual` | Accepted and ignored: every mod method is called by name, so the most derived one runs. With `final`, see `final`. | [Functions](#functions) |
+| `virtual` | Accepted and ignored: every mod method is called by name, so the most derived one runs. With `final`, see `final`; with `= 0`, see pure virtual. | [Functions](#functions) |
 | `WorldContextObject` argument left out | Filled with self, as the editor's hidden pin is; in a static function, with its own world context parameter. An inline helper's own WorldContext parameter left at its default gets the same. | [Calling engine and game functions](#calling-engine-and-game-functions) |
 
 ## Diagnostics
