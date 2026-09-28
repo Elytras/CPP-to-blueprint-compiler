@@ -251,6 +251,7 @@ starts private.
 | `class Helper { ... };` | A class with no base is plain C++. Nothing is cooked for it. | Yes |
 | `class X : public ANotIncluded {};` | Refused by clang, "expected class name", when no included header declares the base. Include the SDK header that declares it. | Refused |
 | `class InitCave : public Hello {};` | A child of another class of the mod. A parent in the same source is used from there. A parent pinned with `UE_CLASS` to another mod is imported from that mod. | Yes |
+| `class Turret final : public AActor { ... };` | A class with no subclass. Its functions are cooked Final, which the editor does not let a Blueprint override, and a call to one of them reaches that function directly instead of by name; on `this` the body is usually copied in. See [Calling your own functions](#calling-your-own-functions). | Yes |
 | `class WPN_GrapplingGun_Long : public WPN_GrapplingGun_C` | A child of one of the game's Blueprint classes. Include the parent's `UeApi/Game/` header and derive from it; the parent is imported from the game. Put the child in the parent's `Game::` namespace to cook it beside the parent (see [Mod sources and packages](#mod-sources-and-packages)). | Yes |
 
 Notes:
@@ -1809,7 +1810,8 @@ Notes:
 ## The optimizer
 
 AssetGen optimizes each function's bytecode. It folds constants, drops work whose result nothing uses, lets locals
-share variables and turns the bool an inline function returns into a jump. None of this changes what a function does,
+share variables, copies in the calls whose one body it knows and turns the bool an inline function returns into a
+jump. None of this changes what a function does,
 and a store to a member or to another object is never removed. The rule to remember: mark a method UE_PURE only when calling it has no side effects, because a
 pure call whose result is unused is dropped.
 
@@ -1862,6 +1864,7 @@ stays what C++ says.
 | `return X + A * B;` after `int32 X = A * B;` | A repeated pure call is not reused: it is evaluated each time it appears. To compute it once, keep the result in a local and read the local. | Not yet |
 | `if (IsReady(Item))` over an inline bool function whose returns are all constants | Each `return true` and `return false` jumps straight to the branch it picks: no bool is stored and then tested. | Yes |
 | `Scale(Value, Tick())` into `inline int32 Scale(int32 V, int32 By)` | A parameter the body only reads is the caller's local variable itself, not a copy, while nothing can change that variable during the call. Another argument that writes it, or a reference parameter bound to it, keeps the copy. | Yes |
+| `Bump(V)` in a `final` class or to a `final` method, `Base::Bump(V)`, or a static of a class this source cooks | The call: the body is copied in, as an inline function's is. See [Calling your own functions](#calling-your-own-functions). | Yes |
 
 ```cpp
 int32 Drops(int32 A) {
@@ -1904,8 +1907,9 @@ int32 RawPragma(int32 X) { UKismetMathLibrary::Abs_Int(X); return X; }
 Notes:
 
 - `if constexpr` and consteval are still decided at build time, since clang itself evaluates them.
-- Only the bytecode changes. The function's flags, as the engine sees them, are those of an optimized function, and
-  the pragma does not make a function UE_AUTHORITY_ONLY.
+- Only the bytecode changes. The function's flags, as the engine sees them, are those of an optimized function.
+- A call to or from such a function is never copied in (see
+  [Calling your own functions](#calling-your-own-functions)).
 - UeMeta.h also documents `#pragma optimize("", off)`. Only the `#pragma clang optimize off` spelling has been checked.
 
 ## Functions
@@ -1925,6 +1929,7 @@ written inside the class does not make a method inline. Only the `inline` keywor
 | `UE_PURE int32 Doubled() const` | A pure function: the editor draws it as a node without exec pins. Each C++ call runs once, where it is written. An editor pure node, by contrast, runs again for each use. | Yes |
 | `UE_PURE static int32 Clamp01(int32 V)` | A pure static function. | Yes |
 | `virtual int32 Priority()` | `virtual` is accepted and changes nothing. Every mod method is already called by name, and the most derived version runs. | Yes |
+| `virtual int32 Step() final` | No subclass has a Step of its own: the function is cooked Final, and calls to it are direct, as in a `final` class. A subclass method named Step is refused. C++ allows `final` only on a virtual method. | Yes |
 | `public:` / `protected:` / `private:` | Become the function's Public, Protected or Private flag, which the editor honours; see [Classes and variables](#classes-and-variables). | Yes |
 | `UE_CATEGORY("Teleporter\|Setup");` | The category of the members that follow, written into the editor API stub; see [Classes and variables](#classes-and-variables). | Yes |
 | `UE_AUTHORITY_ONLY` / `UE_COSMETIC` | The editor's Authority Only and Cosmetic function flags; see [RPCs](#rpcs). | Yes |
@@ -1966,6 +1971,10 @@ Notes:
 | `Peer->Bump(1)` | Runs on that object and reaches the most derived version for its class. | Yes |
 | `Fact(V - 1)` inside `Fact` | Recursion. Each call gets its own frame, as a recursive Blueprint function does. Mutual recursion works the same way. | Yes |
 | `Other->Twice(3)` where `Twice` is inline | Refused; see the inline table below. | Not yet |
+| `Bump(By)` in a `final` class, or to a `final` method | Reaches that one function directly, the editor's call to a function no Blueprint can override, instead of by name. The body is copied into the caller, as an inline function's is, and the function is still cooked for every other caller: the editor, delegates, timers, other mods. | Yes |
+| `Twice(V)`, a static of a class this source cooks | Its body is copied in the same way. | Yes |
+| `Peer->Bump(1)` in a `final` class | Direct, but not copied in: the body would need Peer as its `this`. | Yes |
+| `[[gnu::noinline]] int32 Kept(int32 V)` | Calls to Kept stay calls, wherever they could be copied in. | Yes |
 
 ```cpp
 int32 N;
@@ -1974,6 +1983,20 @@ int32 Bump(int32 By) { N += By; return N; }
 int32 Twice(int32 By) { return Bump(By) + this->Bump(By); }   // calls by name
 void Sync() { Peer->Bump(1); }                                // runs on Peer
 int32 Fact(int32 V) { return V <= 1 ? 1 : V * Fact(V - 1); }  // recursion
+```
+
+In a `final` class the same calls are direct, and those on `this` are copied in:
+
+```cpp
+class Counter final : public AActor {
+public:
+  int32 N;
+  int32 Bump(int32 By) { N += By; return N; }
+  int32 Twice(int32 By) { return Bump(By) + Bump(By); }         // both copied in
+  int32 Fact(int32 V) { return V <= 1 ? 1 : V * Fact(V - 1); }  // stays a call
+  [[gnu::noinline]] int32 Kept(int32 V) { return V + 1; }
+  int32 UseKept(int32 V) { return Kept(V); }                    // stays a call
+};
 ```
 
 Notes:
@@ -1989,6 +2012,18 @@ Notes:
   crashes the game.
 - Recursion through `inline` functions is refused; see
   [Inline functions and templates](#inline-functions-and-templates).
+- A function is never copied into itself, so a recursive call stays a call. In mutual recursion one copy is made, and
+  its call back stays a call.
+- These are never copied in: a function that waits (Delay, UE_AWAIT) or contains a goto; an RPC, an authority-only or
+  cosmetic function; an override of an engine function; UE_NO_OPTIMIZE on the function or on the caller; a class
+  another mod cooks (UE_CLASS).
+- Copying makes the caller bigger. A large function called in many places may be worth `[[gnu::noinline]]`.
+- A function that native code intercepts by name, such as an empty one a DLL or script mod hooks to read its
+  arguments, must be `[[gnu::noinline]]`: a copied call runs the body in place and never reaches the hook.
+- Inside a copied static, an engine call that leaves out its world context gets what the call passed for the static's
+  own WorldContextObject parameter, as it would in the static's own function. A static without that parameter gets
+  the caller's context instead of the class default object, so such a call works in the copy where the function's own
+  would find no world.
 
 ### Parameters and return values
 
@@ -2388,6 +2423,9 @@ public:
 Notes:
 
 - Inside an inline body, `Base::Method()` is judged from the class the body is written in.
+- A parent this source cooks has its body copied in, as a `final` method's is (see
+  [Calling your own functions](#calling-your-own-functions)). An override of an engine event, such as
+  ReceiveBeginPlay above, stays a call.
 
 ## Inline functions and templates
 
@@ -2432,6 +2470,8 @@ Notes:
 - A `T&` parameter of an inline function is another name for the place it is bound to; see
   [Functions](#functions) for reference parameters and copy-back.
 - `Objects.h` already defines `AttachToComponent`, so do not use that name for a helper of your own when you include it.
+- AssetGen also copies in, by itself, calls bound by `final`, `Base::Method()` calls and statics of the classes the
+  source cooks; see [Calling your own functions](#calling-your-own-functions).
 - A refusal of a call to a free function without `inline` names the calling function, not the definition.
 
 ### World context in inline helpers
@@ -5100,6 +5140,7 @@ listed here is refused with "unimplemented intrinsic".
 | `ExecuteUbergraph_<Class>` | The name of the event graph that holds the methods that wait. A method of that name is refused when the class has one. | [Latent calls](#latent-calls) |
 | `FDeref` | The scratch struct that every read and write through a pointer goes through. AssetGen creates it when the mod declares none. | [Pointers and memory](#pointers-and-memory) |
 | `FDerefTextView` | The struct that an FText read or write through a pointer imports, from a path the compiler fixes. A helper mod you supply cooks it. | [Pointers and memory](#pointers-and-memory) |
+| `final` | On a class or a virtual method: no subclass has a version of its own. The functions are cooked Final, and calls to them are direct and, on `this`, copied in. | [Calling your own functions](#calling-your-own-functions) |
 | `FinishComponent(Owner, Component)` | Registers a component that AddComponentDeferred held back. | [Components](#components) |
 | `FinishSpawning(Actor, Transform)` | Finishes an actor that SpawnActorDeferred began: its construction script and BeginPlay run. | [Creating objects](#creating-objects) |
 | `FKey{"F5"}` | A key for the player controller's key queries, such as IsInputKeyDown. Write it with braces: `FKey("F5")` is refused today. | [Timers and input](#timers-and-input) |
@@ -5127,6 +5168,7 @@ listed here is refused with "unimplemented intrinsic".
 | Namespace-scope variable, `int32 Total = 0;` | One value shared by every class of the source, kept in the default object of a class the compiler generates. | [Global variables](#global-variables) |
 | `__NameSwitch__` | What UE_NAME_SWITCH expands to. Write UE_NAME_SWITCH. | [Statements and control flow](#statements-and-control-flow) |
 | `NewObject<T>(Outer)` | Construct Object from Class: an object that is neither an actor nor a component. The Outer gives it its world. | [Creating objects](#creating-objects) |
+| `[[gnu::noinline]]`, `__attribute__((noinline))` | Calls to the function stay calls: AssetGen never copies its body in. | [Calling your own functions](#calling-your-own-functions) |
 | Number conversions, `float F = Count;`, `int32(F)` | Convert as C++ converts, through Blueprint's conversion nodes. | [Literals and conversions](#literals-and-conversions) |
 | `Obj == nullptr` | A plain compare with None: an object that is being destroyed is still not null. | [Working with other objects](#working-with-other-objects) |
 | `&Obj->Member` | The member's address, found at run time by `ReadProperty::GetPropertyAddress`, which you supply. | [Pointers and memory](#pointers-and-memory) |
@@ -5199,7 +5241,7 @@ listed here is refused with "unimplemented intrinsic".
 | `UeAssets::<Class>::All` | Every game asset of that class, as soft pointers. | [Game assets](#game-assets) |
 | `UeAssets::<Class>::Game::...::<Name>` | A game asset by its content path, for `&` to point at. | [Game assets](#game-assets) |
 | `using FTarget = AActor;` | An alias of a class. A variable of it is still an object reference. | [Classes and variables](#classes-and-variables) |
-| `virtual` | Accepted and ignored: every mod method is called by name, so the most derived one runs. | [Functions](#functions) |
+| `virtual` | Accepted and ignored: every mod method is called by name, so the most derived one runs. With `final`, see `final`. | [Functions](#functions) |
 | `WorldContextObject` argument left out | Filled with self, as the editor's hidden pin is; in a static function, with its own world context parameter. An inline helper's own WorldContext parameter left at its default gets the same. | [Calling engine and game functions](#calling-engine-and-game-functions) |
 
 ## Diagnostics
@@ -5526,6 +5568,11 @@ and where the feature is described. In each group, the messages you are most lik
   overload with the most parameters. When that overload is inline, the class makes no Blueprint function for the name,
   so the call finds no function. Calling an inline overload beside a non-inline one with more parameters works. Fix:
   give the inline and non-inline functions different names, or make every overload of the name inline. See
+  [Functions](#functions).
+- `<Class>::<Method>: <Base>::<Method> is final, so no subclass may have a function of that name; rename this one`: a
+  subclass declares a method with the name of an ancestor's `final` one and other parameters, `int32 Step(int32 By)`
+  under `virtual int32 Step() final`. C++ lets it hide the parent's, but a Blueprint finds functions by name, and the
+  same parameters are already refused by clang. Fix: rename the subclass's method, or drop `final`. See
   [Functions](#functions).
 - `inline function <Class>::<Method> calls itself`: recursion through inline functions, direct or through another
   inline function. Each call copies the body in, so the copying never ends. One overload calling another is fine. Fix:

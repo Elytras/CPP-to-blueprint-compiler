@@ -416,11 +416,18 @@ uint32 AccessFlagsOf(const Json& Decl)
     uint32 Flags = 0;
     ForEach(Decl, [&](const Json& C) {
         const std::string K = Kind(C);
-        /* `#pragma clang optimize off` adds an implicit noinline beside its optnone: not a UE_AUTHORITY_ONLY. */
-        if (K == "NoInlineAttr" && !C.value("implicit", false)) Flags |= FUNC_BlueprintAuthorityOnly;
+        if (K == "NoStackProtectorAttr") Flags |= FUNC_BlueprintAuthorityOnly;
         else if (K == "NoInstrumentFunctionAttr") Flags |= FUNC_BlueprintCosmetic;
     });
     return Flags;
+}
+
+/* An attribute clang put on the declaration: `final` (FinalAttr), `noinline` in any spelling (NoInlineAttr). */
+bool HasAttr(const Json& Decl, const char* AttrKind)
+{
+    bool bHas = false;
+    ForEach(Decl, [&](const Json& C) { bHas = bHas || Kind(C) == AttrKind; });
+    return bHas;
 }
 
 /* UE_NO_OPTIMIZE, or an optimize-off pragma over the function: [[clang::optnone]], meaning what it says. */
@@ -477,7 +484,9 @@ struct FRecord
     std::map<std::string, std::string> ScsNodes;    // `<X>__UeScsNode`: a game Blueprint's component -> its node's guid, 32 hex
     std::map<std::string, std::string> Subobjects;  // `<X>__UeSubobject`: a native component -> "<name> <class path>" on this CDO
     std::map<std::string, std::string> TypeAliases; // `using Leaf = Game::...::Leaf;` in the class body
+    std::set<std::string> FinalMethods;             // `virtual T F() final`: no subclass has an F of its own
     const Json* Defaults = nullptr;                 // UE_DEFAULTS: the static-init block, never lowered
+    bool bFinal = false;        // `class X final`: X has no subclass
     bool bIsLocal = false;      // UePackage == ModPackage/CppName: cooked here, published at its /Game path
     bool bIsStruct = false;     // UE_STRUCT: cooked as a UserDefinedStruct asset
     bool bIsInterface = false;  // UE_INTERFACE: cooked as a BPGC whose super is UInterface
@@ -625,7 +634,7 @@ struct FCallIR
     std::vector<std::string> RefParms;  // per argument, the type of the reference parameter it binds, else "": see HoistCallArgs
     bool bRefsTakeConst = false;        // a native's P_GET_PROPERTY_REF: a constant there goes through the thunk's own buffer
     std::string VirtualName;            // a generated class's own instance method: EX_VirtualFunction resolves it by name at run time
-    bool bLocalVirtual = false;         // ... as EX_LocalVirtualFunction: a script function that is no RPC
+    bool bLocal = false;                // EX_LocalVirtualFunction / EX_LocalFinalFunction: a script function that is no RPC
     std::string View;                   // __RefAtInline__: the TArray field of the view struct in Extra
     std::shared_ptr<int32> Resume;      // __AwaitPoint__: receives the ubergraph offset the awaited event re-enters at
     std::shared_ptr<FArgIR> Target;     // the object an instance call runs against; null = self
@@ -638,8 +647,9 @@ struct FCallIR
    right for a static: an instance native on it would run against e.g. Default__FSDGameState. */
 void EmitCallOp(FScript& S, const FCallIR& Call)
 {
-    if (!Call.VirtualName.empty() && Call.bLocalVirtual) S.LocalVirtualFunction(Call.VirtualName);
+    if (!Call.VirtualName.empty() && Call.bLocal) S.LocalVirtualFunction(Call.VirtualName);
     else if (!Call.VirtualName.empty()) S.VirtualFunction(Call.VirtualName);
+    else if (Call.bLocal) S.LocalFinalFunction(Call.Fn);
     else if (Call.bScript || Call.bInstance) S.FinalFunction(Call.Fn);
     else S.CallMath(Call.Fn);
 }
@@ -1131,7 +1141,15 @@ private:
        `inline` may sit on the declaration or on an out-of-line definition. */
     bool IsInlineMethod(const FRecord& R, const std::string& Method) const;
     bool ExpandInline(const Json& CallNode, const Json& Def, const std::string& Method, bool bMethod, FBlueprintClass& BP,
-                      FCallIR& Out, std::string* Err, const Json* Receiver = nullptr);
+                      FCallIR& Out, std::string* Err, const Json* Receiver = nullptr, bool bStaticCall = false);
+    /* `final`: the class holding the version of Method a call by name reaches on every object of class Of or below,
+       the nearest declaration from Of up that is a Blueprint function, when no subclass can bring its own: Of is
+       final, or that declaration is. Null when one could. */
+    const FRecord* FinalOwner(const FRecord* Of, const std::string& Method) const;
+    /* The definition a call (Call, to the declaration clang picked, Picked) to In's Method may be expanded from in
+       place of the call, or null. See LowerCall. */
+    const Json* Expandable(const FRecord& In, const std::string& Method, const Json& Call, const Json* Picked) const;
+    bool ResumesLater(const Json& N, std::set<const Json*>& Seen) const;
     /* A constant outside any function body, `constexpr int32 kMax = 40;` at namespace scope or static in a class, and an
        inline class variable, `static inline const TArray<FName> Tags = {...};`: decl id -> its VarDecl. It has no
        storage in a Blueprint, so nothing is cooked for it and a use is its value (LowerInlineVar). */
@@ -1519,6 +1537,7 @@ private:
     int32 ReadTmpCounter = 0;
     int32 LoopDepth = 0;                              // LowerBody: the loops around the statement being lowered
     std::string CurFnName;                            // Generate: the method being lowered
+    const Json* CurFnDef = nullptr;                   // ... its definition, which a call from it never expands
     std::string LatentRefusal;                        // why that method cannot make a latent call, or empty
     bool bMadeLatentCall = false;                     // LowerCall: it made one, so it moves into the ubergraph
     std::string StaticLocal;                          // LowerBody: a static it keeps in the ubergraph's frame, or empty
@@ -2089,6 +2108,7 @@ bool FCompiler::Collect(std::string* Err)
                 MethodOwner[C.value("id", std::string())] = R.CppName;
                 R.MethodAccess[Name(C)] = Access;
                 if (C.value("inline", false)) R.Inlines[C.value("id", std::string())] = &C;
+                if (HasAttr(C, "FinalAttr")) R.FinalMethods.insert(Name(C));
             }
             else if (Kind(C) == "CXXConstructorDecl")
                 R.Ctors.push_back(&C);
@@ -2100,6 +2120,8 @@ bool FCompiler::Collect(std::string* Err)
             }
             else if ((Kind(C) == "TypeAliasDecl" || Kind(C) == "TypedefDecl") && C.contains("name"))
                 R.TypeAliases[Name(C)] = StripTypeKeywords(TypeOf(C));
+            else if (Kind(C) == "FinalAttr")
+                R.bFinal = true;
         });
         /* A set is looked up in Replicated by the name it is cooked under, so the marker's C++ key follows. */
         for (const auto& N2 : R.UeNames)
@@ -5008,26 +5030,43 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
                 for (const FRecord* A = Written; A && A != R && !bParentCall; A = A->Base.empty() ? nullptr : Find(A->Base))
                     bParentCall = A->Methods.count(MethodName) != 0;
         }
-        if (!R->IsNative() && !bStatic && !bParentCall)
+        /* `final` (FinalOwner): the one version of the method every object the call can run on reaches, called as
+           that function instead of by name. On `this` the class asked is the one being compiled, not the one the call
+           is written in, since a call by name from an inherited body reaches the object's version; on another object,
+           the object's type. */
+        const Json* On = K == "CXXMemberCallExpr" ? Strip(First(*Callee)) : nullptr;
+        const bool bOnThis = !On || Kind(*On) == "CXXThisExpr";
+        const FRecord* Bound = nullptr;
+        if (!R->IsNative() && !bStatic && !bParentCall && !Out.bReceiverIsArg)
         {
-            Out.VirtualName = UeNameOf(R, MethodName);      // an override of `Set is Extruded` is found by that name
-            /* KismetCompilerVMBackend.cpp picks the local form unless the callee is native, a net function, authority
-               only or cosmetic. A method declared only by mod classes, without an RPC marker, is none of those; an
-               override of a native function keeps whatever flags it inherits, so it stays EX_VirtualFunction. */
-            bool bLocal = true;
-            for (const FRecord* A = R; A && bLocal; A = A->Base.empty() ? nullptr : Find(A->Base))
-            {
-                auto M = A->Methods.find(MethodName);
-                if (M == A->Methods.end()) continue;
-                if (A->IsNative() || NetFlagsOf(*M->second) || AccessFlagsOf(*M->second)) bLocal = false;
-                if (auto D = A->MethodDefs.find(MethodName); D != A->MethodDefs.end() && (NetFlagsOf(*D->second) || AccessFlagsOf(*D->second)))
-                    bLocal = false;
-            }
-            Out.bLocalVirtual = bLocal;
+            std::string Of = bOnThis ? std::string() : StripTypeKeywords(TypeOf(*On));
+            while (!Of.empty() && (Of.back() == '*' || Of.back() == ' ')) Of.pop_back();
+            if ((Bound = FinalOwner(bOnThis ? Cur : Find(Of), MethodName)) && Bound->IsNative()) Bound = nullptr;
         }
+        const FRecord* Called = Bound ? Bound : R;
+        /* KismetCompilerVMBackend.cpp picks the local form unless the callee is native, a net function, authority
+           only or cosmetic. A method declared only by mod classes, without an RPC marker, is none of those; an
+           override of a native function keeps whatever flags it inherits, so it stays EX_VirtualFunction. */
+        bool bLocal = true;
+        for (const FRecord* A = Called; A && bLocal; A = A->Base.empty() ? nullptr : Find(A->Base))
+        {
+            auto M = A->Methods.find(MethodName);
+            if (M == A->Methods.end()) continue;
+            if (A->IsNative() || NetFlagsOf(*M->second) || AccessFlagsOf(*M->second)) bLocal = false;
+            if (auto D = A->MethodDefs.find(MethodName); D != A->MethodDefs.end() && (NetFlagsOf(*D->second) || AccessFlagsOf(*D->second)))
+                bLocal = false;
+        }
+        if (!R->IsNative() && !bStatic && !bParentCall && !Bound)
+            Out.VirtualName = UeNameOf(R, MethodName);      // an override of `Set is Extruded` is found by that name
+        Out.bLocal = (!Out.VirtualName.empty() || Bound) && bLocal;
+        /* A call whose one body is known here - bound on `this`, a parent's, or a static of this mod - is that body,
+           expanded in place. The function stays, for delegates, timers, other mods and the editor. */
+        if (const FRecord* In = bStatic || bParentCall ? R : Bound; In && bOnThis && !Out.bReceiverIsArg && CurLocals)
+            if (const Json* Def = Expandable(*In, MethodName, CallExprNode, FullDecl))
+                return ExpandInline(CallExprNode, *Def, In->CppName + "::" + MethodName, true, BP, Out, Err, nullptr, bStatic);
 
-        const std::string CalleePackage = PackageOf(*R), CalleeName = ClassOf(*R);
-        Out.Fn = BP.EngineFunction(CalleePackage, CalleeName, UeNameOf(R, MethodName));
+        const std::string CalleePackage = PackageOf(*Called), CalleeName = ClassOf(*Called);
+        Out.Fn = BP.EngineFunction(CalleePackage, CalleeName, UeNameOf(Called, MethodName));
         Out.bScript = CalleePackage.compare(0, 6, "/Game/") == 0;
         Out.bInstance = !bStatic;
         /* A Blueprint static needs the CDO context; EX_CallMath finds it itself for a native. */
@@ -6528,7 +6567,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             Call.K = FStmtIR::StaticCall;
             Call.Call.VirtualName = Notify;
             Call.Call.Target = SetObject;
-            Call.Call.bLocalVirtual = !SetObject;
+            Call.Call.bLocal = !SetObject;
             Out.push_back(std::move(Call));
         }
     });
@@ -7066,6 +7105,87 @@ bool HasGoto(const Json& N)
     return bFound;
 }
 
+const FRecord* FCompiler::FinalOwner(const FRecord* Of, const std::string& Method) const
+{
+    for (const FRecord* A = Of; A; A = A->Base.empty() ? nullptr : Find(A->Base))
+        if (auto M = A->Methods.find(Method); M != A->Methods.end() && !IsInlineMethod(*A, Method))
+            return (Of->bFinal || A->FinalMethods.count(Method)) && !IsStaticDecl(*M->second) ? A : nullptr;
+    return nullptr;
+}
+
+/* Every call whose body is known here expands, unless: the function is not a Blueprint function of this mod with a
+   body; it or an ancestor's version is an RPC, authority only or cosmetic, or overrides an engine function (the
+   engine's routing must see the call); it is noinline or UE_NO_OPTIMIZE, or the caller is UE_NO_OPTIMIZE; it is
+   the function being compiled or expanded already (recursion stays a call); it makes a latent call or an await,
+   which would move the caller into the ubergraph, or holds a goto, which turns the caller's optimizer off; or the
+   call does not match it, an overload's or another class's version with other parameters. */
+const Json* FCompiler::Expandable(const FRecord& In, const std::string& Method, const Json& Call, const Json* Picked) const
+{
+    auto Decl = In.Methods.find(Method);
+    if (bCurNoOpt || !In.IsGenerated() || In.bIsStruct || In.bIsInterface || Decl == In.Methods.end() || IsInlineMethod(In, Method))
+        return nullptr;
+    auto DefIt = In.MethodDefs.find(Method);
+    const Json* Def = DefIt != In.MethodDefs.end() ? DefIt->second : Decl->second;
+    const Json* Body = nullptr;
+    ForEach(*Def, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Body = &C; });
+    if (!Body || Def == CurFnDef || std::find(InlineStack.begin(), InlineStack.end(), Def) != InlineStack.end()) return nullptr;
+    for (const Json* D : { Decl->second, Def })
+        if (HasAttr(*D, "NoInlineAttr") || IsNoOptDecl(*D)) return nullptr;
+    for (const FRecord* A = &In; A; A = A->Base.empty() ? nullptr : Find(A->Base))
+    {
+        auto M = A->Methods.find(Method);
+        if (M == A->Methods.end()) continue;
+        if (A->IsNative() || NetFlagsOf(*M->second) || AccessFlagsOf(*M->second)) return nullptr;
+        if (auto D = A->MethodDefs.find(Method); D != A->MethodDefs.end() && (NetFlagsOf(*D->second) || AccessFlagsOf(*D->second)))
+            return nullptr;
+    }
+    auto Types = [](const Json& D) {
+        std::vector<std::string> T;
+        ForEach(D, [&](const Json& C) { if (Kind(C) == "ParmVarDecl") T.push_back(TypeOf(C)); });
+        return T;
+    };
+    if (Types(*Def).size() + 1 != (Call.contains("inner") ? Call["inner"].size() : 0)) return nullptr;
+    if (Picked && Picked != Decl->second && Types(*Picked) != Types(*Decl->second)) return nullptr;
+    std::set<const Json*> Seen;
+    return HasGoto(*Body) || ResumesLater(*Body, Seen) ? nullptr : Def;
+}
+
+/* Whether running N makes a latent call or an await of its own, itself or in an inline body it always expands: a call
+   to a function with an FLatentActionInfo parameter (genueapi's overload leaves it out, the UFunction, the longest
+   overload, has it) or to __Await__. A call to a Blueprint function of the mod does not: it returns at its first. */
+bool FCompiler::ResumesLater(const Json& N, std::set<const Json*>& Seen) const
+{
+    const std::string K = Kind(N);
+    if (const Json* Callee = K == "CallExpr" || K == "CXXMemberCallExpr" ? Strip(First(N)) : nullptr)
+    {
+        const bool bMember = Kind(*Callee) == "MemberExpr", bRef = Kind(*Callee) == "DeclRefExpr";
+        const Json* Ref = bRef && Callee->contains("referencedDecl") ? &(*Callee)["referencedDecl"] : nullptr;
+        const std::string Id = bMember ? Callee->value("referencedMemberDecl", std::string()) : Ref ? Ref->value("id", std::string()) : "";
+        const std::string Fn = bMember ? Name(*Callee) : Ref ? Name(*Ref) : "";
+        if (Fn == "__Await__") return true;
+        const Json* Always = nullptr;
+        if (auto F = FreeInlines.find(Id); F != FreeInlines.end()) Always = F->second;
+        else if (auto T = MemberTemplates.find(Id); T != MemberTemplates.end()) Always = T->second;
+        else if (auto O = MethodOwner.find(Id); O != MethodOwner.end())
+            if (const FRecord* R = Find(O->second))
+            {
+                if (auto I = R->Inlines.find(Id); I != R->Inlines.end()) Always = I->second;
+                else if (auto M = R->Methods.find(Fn); M != R->Methods.end())
+                {
+                    bool bLatent = false;
+                    ForEach(*M->second, [&](const Json& C) {
+                        bLatent = bLatent || (Kind(C) == "ParmVarDecl" && StripTypeKeywords(TypeOf(C)) == "FLatentActionInfo");
+                    });
+                    if (bLatent) return true;
+                }
+            }
+        if (Always && Seen.insert(Always).second && ResumesLater(*Always, Seen)) return true;
+    }
+    bool bFound = false;
+    ForEach(N, [&](const Json& C) { bFound = bFound || ResumesLater(C, Seen); });
+    return bFound;
+}
+
 /* The call becomes one Block statement in Out.Inline:
        <each by-value parameter> = <its argument>;
        <the body, locals renamed __Inl<N>_<name>, `return X` as `__Inl<N>_ReturnValue = X` + a jump to the end>
@@ -7073,7 +7193,7 @@ bool HasGoto(const Json& N)
    or `C ? X : Y`, a copy stored back after the body when the body writes it; bound to a value, a copy.
    Only calls on `this` (or a static) expand, since the body's `this` stays the caller's self. */
 bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::string& Method, bool bMethod, FBlueprintClass& BP,
-                             FCallIR& Out, std::string* Err, const Json* Receiver)
+                             FCallIR& Out, std::string* Err, const Json* Receiver, bool bStaticCall)
 {
     if (!CurLocals) { *Err = "internal: an inline call outside a function body"; return false; }
     if (std::find(InlineStack.begin(), InlineStack.end(), &Def) != InlineStack.end())
@@ -7231,6 +7351,22 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
         if (!AddLocal(Out.InlineResult, RetType)) return false;
     }
 
+    /* In place of a call to a static Blueprint function, a world context the body's calls leave out is the function's
+       own parameter, as its own compile wires it (Generate): what the call passed for it. An inline function's is the
+       caller's, as documented. */
+    std::string Wco = CurrentWco;
+    for (size_t I = 0; I < Parms.size() && bStaticCall; ++I)
+    {
+        if (!IsWcoName(Name(*Parms[I]))) continue;
+        const std::string Id = Parms[I]->value("id", std::string());
+        if (const auto L = LocalRename.find(Id); L != LocalRename.end()) Wco = L->second;
+        else if (const auto C = ParmConst.find(Id); C != ParmConst.end() && (C->second.K == FArgIR::Local || C->second.K == FArgIR::Self))
+            Wco = C->second.K == FArgIR::Local ? C->second.S : std::string();
+        break;
+    }
+    const std::string SavedWco = CurrentWco;
+    CurrentWco = Wco;
+
     InlineStack.push_back(&Def);
     InlineResults.emplace_back(Out.InlineResult, RetType);
     const int32 SavedLoops = LoopDepth, SavedSwitches = SwitchDepth;
@@ -7248,6 +7384,7 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
     bBodyHasGoto = HasGoto(*Body);
     bFnHasGoto |= bBodyHasGoto;
     const bool bOk = LowerBody(*Body, BP, *B.Body, Locals, Err);
+    CurrentWco = SavedWco;
     LoopDepth = SavedLoops;
     ReEntered = SavedReEntered;
     SwitchDepth = SavedSwitches;
@@ -10277,6 +10414,15 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     {
         FMethod Fn{ Entry.first, Entry.second, Entry.second, nullptr };
         if (IsInlineMethod(R, Fn.Name)) continue;
+        /* clang refuses an override of a final method, not one of the same name with other parameters, which a Blueprint
+           would still take for its override: calls by name would reach it, calls bound to the final one would not. */
+        for (const FRecord* A = R.Base.empty() ? nullptr : Find(R.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
+            if (A->FinalMethods.count(Fn.Name))
+            {
+                *Err = R.CppName + "::" + Fn.Name + ": " + A->CppName + "::" + Fn.Name + " is final, so no subclass may have a "
+                       "function of that name; rename this one";
+                return false;
+            }
         if ((Fn.Body = BodyOf(R, Fn.Name, Fn.Def))) Methods.push_back(Fn);
     }
     /* The editor compiles every Blueprint-implementable function of an implemented interface, a stub
@@ -10401,6 +10547,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         bFnHasGoto = bBodyHasGoto;
         KeepLoaded.clear();
         CurFnName = Fn.Name;
+        CurFnDef = Fn.Def;
         bCurNet = (NetFlagsOf(Decl) | NetFlagsOf(M)) != 0;
         bCurNoOpt = IsNoOptDecl(Decl) || IsNoOptDecl(M);
         WarnedRefParms.clear();
@@ -10470,6 +10617,10 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         uint32 Flags = Inherited ? Inherited & kOverrideInherits
                      : IsStaticDecl(Decl) ? uint32(FUNC_Static | FUNC_BlueprintCallable | FUNC_Public | FUNC_Final)
                      : kPlainMethodFlags;
+        /* `final`, the class or the method: no subclass has a version of its own, and calls are bound to this one
+           (LowerCall). Without BlueprintEvent the editor offers no override either (CanKismetOverrideFunction). */
+        if (!Inherited && !IsStaticDecl(Decl) && (R.bFinal || R.FinalMethods.count(Fn.Name)))
+            Flags = (Flags & ~uint32(FUNC_BlueprintEvent)) | FUNC_Final;
         /* All 7229 BlueprintPure functions in the DRG dump are BlueprintCallable too. */
         /* Its own access specifier, where no parent decides. The editor refuses a call node it forbids; the VM checks
            nothing, and clang has already refused what C++ forbids. */

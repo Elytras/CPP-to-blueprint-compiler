@@ -1124,6 +1124,86 @@ opt_raw()
 opt_flags()
 
 
+# ---- FinalTest
+
+def calls_in(base, fn):
+    """(callee, op) of each call to a script function fn's script makes, the call inside a context included."""
+    out = []
+
+    def walk(n):
+        if n.op in (0x1B, 0x1C, 0x45, 0x46): out.append((n.val, n.op))
+        for k in n.kids: walk(k)
+    for n in runscript.script_of(base, fn): walk(n)
+    return out
+
+
+def final_calls():
+    """`final`: a call whose body is known here runs that body in place, and the function stays for other callers.
+    Recursion, noinline, UE_NO_OPTIMIZE, a body that resumes later and a call on another object stay calls, reaching
+    the one function they are bound to (EX_LocalFinalFunction), not a function found by name."""
+    base = asset('FinalTest')
+    fact = lambda v: 1 if v <= 1 else v * fact(v - 1)
+    for c in (0, 5):
+        for v in (-3, 0, 7):
+            f = dict(Counter=c)
+            got = run(base, 'UseBump', self_vars=f, V=v)[0]
+            assert got == (c + v) * 100 + c + 2 * v and f == dict(Counter=c + 2 * v), ('UseBump', c, v, got, f)
+    check('FinalTest', 'Fact', lambda V: fact(V), [dict(V=v) for v in (-2, 0, 1, 5, 10)])
+    check('FinalTest', 'Parity', lambda N: 2 if N % 2 == 0 else 1, [dict(N=n) for n in (0, 1, 2, 5, 8)])
+    check('FinalTest', 'UseAround', lambda A: (A - 1) * 1000 + A + 1, [dict(A=a) for a in (-5, 0, 9)])
+    check('FinalTest', 'UseKept', lambda V: (V + 1) * 10 + V * 2, [dict(V=v) for v in (-5, 0, 9)])
+    check('FinalTest', 'UseTwice', lambda V: V * 2 + (V + 1) * 2, [dict(V=v) for v in (-5, 0, 9)])
+    reached = lambda fn: {name for name, op in calls_in(base, fn) if name in exports_of(base) and op == 0x46}
+    assert not reached('UseBump') and not reached('UseAround') and not reached('UseTwice'), 'an expandable call stayed a call'
+    for fn, want in (('Fact', {'Fact'}), ('UseKept', {'Kept', 'KeptRaw'}), ('CallsWait', {'Wait'}), ('PeerBump', {'Bump'})):
+        assert reached(fn) == want, (fn, calls_in(base, fn))
+    for fn in ('Bump', 'Around', 'Twice', 'IsEven', 'IsOdd', 'Wait'):
+        assert fn in exports_of(base), fn + ' is no function any more'
+    vm = VM(base, Counter=0, Peer=None)
+    assert vm.call('PeerBump', By=3) == -1
+    peer = vm.new(Counter=10)
+    vm.self.vars['Peer'] = peer
+    assert vm.call('PeerBump', By=3) == 13 and peer.vars['Counter'] == 13 and vm.self.vars['Counter'] == 0, vm.self.vars
+    print('ok  FinalTest: expanded calls run their body; recursion, noinline, UE_NO_OPTIMIZE, latent and Peer calls stay bound calls')
+
+    folder = os.path.dirname(base)
+    fb, fk, fw = (os.path.join(folder, c) for c in ('FinalBase', 'FinalKid', 'FinalWorld'))
+    for c in (0, 4):
+        for k in (0, 1, 3):
+            f = dict(N=c)
+            got = run(fb, 'Loop', self_vars=f, K=k)[0]
+            assert got == k * c + k * (k + 1) // 2 and f == dict(N=c + k), ('Loop', c, k, got, f)
+    assert run(fk, 'Use')[0] == 101 and not calls_in(fk, 'Use') and not calls_in(fb, 'Loop'), (calls_in(fk, 'Use'), calls_in(fb, 'Loop'))
+    print("ok  FinalBase / FinalKid: a final method's calls expand beside a subclass; an inherited body's call reaches FinalKid's Hook")
+
+    vm = VM(fw, {'GetPlayerPawn': lambda vm, ctx, wco, i: wco})
+    other = Obj('Other_C')
+    assert vm.call('Ask', Other=other) is other and vm.call('Mine') is vm.self and vm.call('PawnOf', WorldContextObject=other) is other
+    assert vm.call('ViaNoContext') is vm.self and not calls_in(fw, 'ViaNoContext')
+    print("ok  FinalWorld: an expanded static's calls get the world context the caller passed it, or the caller's own")
+
+    flags = lambda b, fn: int(re.search(r'FunctionFlags (\S+)', dump('dumpstruct.py', b, export_index(b, fn))).group(1), 16)
+    for b, fn in ((base, 'Bump'), (base, 'Kept'), (fb, 'Step'), (fk, 'Use')):
+        assert flags(b, fn) & 0x1 and not flags(b, fn) & 0x8000000, (fn, hex(flags(b, fn)))      # Final, no BlueprintEvent
+    assert flags(fb, 'Loop') & 0x8000000 and not flags(fb, 'Loop') & 0x1, hex(flags(fb, 'Loop'))
+    assert not flags(base, 'Kept') & 0x4, hex(flags(base, 'Kept'))                                # noinline is not authority only
+    print('ok  FinalTest: a final function is Final and not BlueprintEvent; noinline sets no flag')
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, 'FinalHide.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/FinalHide");\n'
+                    'class FinalHideBase : public AActor {\npublic:\n  virtual int32 F() final { return 1; }\n};\n'
+                    'class FinalHide : public FinalHideBase {\npublic:\n  int32 F(int32 X) { return X; }\n};\n')
+        proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, tmp], capture_output=True, encoding='utf-8')
+        assert proc.returncode != 0 and 'FinalHideBase::F is final' in proc.stdout, proc.stdout
+    print("ok  FinalTest: a subclass function of a final method's name is refused")
+
+
+final_calls()
+
+
 # ---- NestedTest
 
 def nested_containers():
@@ -1787,8 +1867,9 @@ def run_as(chain, fn, fields, **parms):
 
 
 def parent_call():
-    """SuperTest: `SuperBase::X()` in an override runs the parent's X once (final on SuperBase_C's function - by name
-    it would re-enter the override, forever); an unqualified inherited call still dispatches to the most derived."""
+    """SuperTest: `SuperBase::X()` in an override runs the parent's X once (its body expanded in place, or final on
+    SuperBase_C's function - by name it would re-enter the override, forever); an unqualified inherited call still
+    dispatches to the most derived."""
     folder = os.path.dirname(asset('SuperTest'))
     test, base = os.path.join(folder, 'SuperTest'), os.path.join(folder, 'SuperBase')
 
@@ -1816,9 +1897,11 @@ def parent_call():
                 n += 1
     print('ok  SuperTest: parent calls, overrides and inherited calls run as in C++  (%d cases)' % n)
     paths = import_paths(test)
-    for fn in ('Bump', 'ReceiveBeginPlay'):
+    # A parent's body known here is expanded in place; one that overrides an engine event stays a final call.
+    for fn, expanded in (('Bump', True), ('ReceiveBeginPlay', False)):
         w = dump('walkscript.py', test, exports_of(test).index(fn))
-        assert '/Game/_ElytrasMods/SuperTest/SuperBase.SuperBase_C:' + fn in [paths[int(i)] for i in re.findall(r'FinalFunction\s+imp\[(\d+)\]', w)], w
+        finals = [paths[int(i)] for i in re.findall(r'FinalFunction\s+imp\[(\d+)\]', w)]
+        assert ('/Game/_ElytrasMods/SuperTest/SuperBase.SuperBase_C:' + fn not in finals) == expanded, w
         assert not re.search(r'VirtualFunction\s+%s\b' % fn, w), w
     w = dump('walkscript.py', test, exports_of(test).index('Thrice'))
     assert re.search(r'VirtualFunction\s+Twice\b', w) and re.search(r'VirtualFunction\s+Bump\b', w), w
@@ -1831,7 +1914,7 @@ def parent_call():
         assert (ref(b, e['super']) if e['super'] else None) == parent, (b, fn, e['super'])
     flags = lambda b, fn: re.search(r'FunctionFlags (\S+)', dump('dumpstruct.py', b, exports_of(b).index(fn))).group(1)
     assert flags(test, 'Bump') == flags(base, 'Bump') and flags(test, 'ReceiveBeginPlay') == flags(base, 'ReceiveBeginPlay') == '0x8080800'
-    print('ok  SuperTest: Base::Method() is a final call on the parent\'s function; overrides bind to it')
+    print('ok  SuperTest: Base::Method() is the parent\'s body, expanded or a final call; overrides bind to it')
 
 
 def engine_names():

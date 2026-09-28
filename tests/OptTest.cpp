@@ -174,7 +174,7 @@ public:
   }
 
 #pragma clang optimize off
-  /* The pragma is the same attribute; its implicit noinline is not UE_AUTHORITY_ONLY. */
+  /* The pragma is the same attribute, with an implicit noinline beside it that sets no flag. */
   int32 RawPragma(int32 X) {
     UKismetMathLibrary::Abs_Int(X);
     return X;
