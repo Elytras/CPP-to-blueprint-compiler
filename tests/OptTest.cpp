@@ -70,6 +70,21 @@ public:
            64 * int32(Kept) + 128 * Calls;
   }
 
+  /* ForwardSingleUse moves a value to its one read past stores to other locals (U past D), but never a call past a
+     store that reads what the call changes: B is the Calls that the first Tick left. */
+  int32 Tick() {
+    Calls += 1;
+    return Calls;
+  }
+  int32 Forward(int32 A) {
+    int32 T = Tick();
+    int32 B = Calls;
+    int32 C = A * 2;
+    int32 U = Tick();
+    int32 D = C + 1;
+    return T * 1000000 + B * 10000 + U * 100 + D;
+  }
+
   /* UE_NO_OPTIMIZE: the unused pure call, the unread local and the branch all stay. */
   UE_NO_OPTIMIZE int32 Raw(int32 X, int32 Y) {
     UKismetMathLibrary::Multiply_IntInt(X, Y);

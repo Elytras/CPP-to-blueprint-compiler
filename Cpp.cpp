@@ -6592,16 +6592,18 @@ int32 Mentions(const FArgIR& A, const std::string& Name)
 {
     return (A.S == Name) + (A.Sub ? Mentions(*A.Sub, Name) : 0) + (A.Base ? Mentions(*A.Base, Name) : 0);
 }
+int32 Mentions(const FStmtIR& St, const std::string& Name)
+{
+    int32 N = Mentions(St.Target, Name) + Mentions(St.Call, Name) + Mentions(St.Var, Name);
+    for (const FArgIR* A : { &St.Value, &St.Cond, &St.SwitchValue }) N += Mentions(*A, Name);
+    for (const FArgIR& A : St.CaseTests) N += Mentions(A, Name);
+    for (const auto* L : { &St.Then, &St.Else, &St.Body, &St.Inc, &St.Trailer }) if (*L) N += Mentions(**L, Name);
+    return N;
+}
 int32 Mentions(const std::vector<FStmtIR>& Stmts, const std::string& Name)
 {
     int32 N = 0;
-    for (const FStmtIR& St : Stmts)
-    {
-        N += Mentions(St.Target, Name) + Mentions(St.Call, Name) + Mentions(St.Var, Name);
-        for (const FArgIR* A : { &St.Value, &St.Cond, &St.SwitchValue }) N += Mentions(*A, Name);
-        for (const FArgIR& A : St.CaseTests) N += Mentions(A, Name);
-        for (const auto* L : { &St.Then, &St.Else, &St.Body, &St.Inc, &St.Trailer }) if (*L) N += Mentions(**L, Name);
-    }
+    for (const FStmtIR& St : Stmts) N += Mentions(St, Name);
     return N;
 }
 
@@ -6648,19 +6650,94 @@ bool OffPath(const FArgIR& A, const FArgIR* M, const std::function<bool(const FA
     return true;
 }
 
-/* Reads no variable and calls only pure functions of such: nothing an argument's side effects could change. */
-bool ReadsNothing(const FArgIR& A)
+/* Whether evaluating A may store to local Name: an argument its call may write, or anything an inline body in it names. */
+bool MayStore(const FArgIR& A, const std::string& Name);
+bool MayStore(const FCallIR& C, const std::string& Name)
 {
-    switch (A.K)
+    if ((C.Inline && Mentions(*C.Inline, Name) != 0) || C.InlineResult == Name) return true;
+    if (C.Target && MayStore(*C.Target, Name)) return true;
+    for (size_t I = 0; I < C.Args.size(); ++I)
+        if ((MayWriteArg(C, I) && Mentions(C.Args[I], Name) != 0) || MayStore(C.Args[I], Name)) return true;
+    return false;
+}
+bool MayStore(const FArgIR& A, const std::string& Name)
+{
+    return (A.Sub && MayStore(*A.Sub, Name)) || (A.Base && MayStore(*A.Base, Name));
+}
+
+/* Whether X comes to the same value before E runs as after it: constants, the pointer self or a fixed object is, locals
+   E cannot store to, elements and struct members of those, and pure functions of such values. Not an object's property,
+   a reference parameter (the caller's variable, perhaps an object's), nor a pure call on an object (a getter): E may
+   change those. */
+bool Unaffected(const FArgIR& X, const FArgIR& E)
+{
+    auto Value = [&](const FArgIR& A) {
+        return A.K != FArgIR::Self && A.K != FArgIR::ObjConst && !IsObjectType(A.InnerType) && Unaffected(A, E);
+    };
+    switch (X.K)
     {
     case FArgIR::Int: case FArgIR::Int64: case FArgIR::Float: case FArgIR::Bool: case FArgIR::Byte: case FArgIR::Str:
     case FArgIR::Name: case FArgIR::Text: case FArgIR::Self: case FArgIR::NullObj: case FArgIR::ObjConst: case FArgIR::SoftPath:
         return true;
+    case FArgIR::Local:
+        return !X.Base && !MayStore(E, X.S);
+    case FArgIR::Member:
+        return X.Base && Unaffected(*X.Base, E);
+    case FArgIR::Index:
+        return X.Base && X.Base->K == FArgIR::Local && !X.Base->Base && !MayStore(E, X.Base->S) && X.Sub
+            && std::all_of(X.Sub->Args.begin(), X.Sub->Args.end(), [&](const FArgIR& A) { return Unaffected(A, E); });
     case FArgIR::Call:
-        return A.Sub && A.Sub->bPure && A.Sub->Intrinsic.empty() && !A.Sub->Inline && (!A.Sub->Target || ReadsNothing(*A.Sub->Target))
-            && std::all_of(A.Sub->Args.begin(), A.Sub->Args.end(), ReadsNothing);
+        return X.Sub && X.Sub->bPure && X.Sub->Intrinsic.empty() && !X.Sub->Inline && !X.Sub->Target
+            && std::all_of(X.Sub->Args.begin(), X.Sub->Args.end(), Value);
     default:
         return false;
+    }
+}
+
+/* What may run before E instead of after it: nothing that acts, and when E acts, nothing that reads what E could
+   change. */
+bool MayRunFirst(const FArgIR& X, const FArgIR& E, bool bActs)
+{
+    return !CallsImpure(X) && (!bActs || Unaffected(X, E));
+}
+
+/* Whether E reads something it does not name: a pointer read reads the scratch an earlier statement pointed; an inline
+   body is statements of its own. */
+bool HidesReads(const FArgIR& E)
+{
+    if (E.Base && HidesReads(*E.Base)) return true;
+    if (!E.Sub) return false;
+    if (!E.Sub->Intrinsic.empty() || E.Sub->Inline || (E.Sub->Target && HidesReads(*E.Sub->Target))) return true;
+    return std::any_of(E.Sub->Args.begin(), E.Sub->Args.end(), HidesReads);
+}
+
+/* Whether `T = E` may move past S to a read of T after it: S stores to a local of the frame, or to a struct member of
+   one, that E neither names nor may store to, and runs nothing; when E acts, S also reads nothing E could change. */
+bool MayPass(const FStmtIR& S, const FArgIR& E, bool bActs)
+{
+    if (!(S.K == FStmtIR::Assign || (S.K == FStmtIR::Decl && S.bHasValue)) || HidesReads(E)) return false;
+    const FArgIR* Root = &S.Var;
+    while (Root->K == FArgIR::Member && Root->Base) Root = Root->Base.get();
+    if (Root->K != FArgIR::Local || Root->Base || Mentions(E, Root->S) != 0 || MayStore(E, Root->S)) return false;
+    return MayRunFirst(S.Value, E, bActs);
+}
+
+/* A store's destination, which EX_Let locates before it evaluates the value: whether it is the same place with E run
+   after it. Nothing in it acts, and when E acts, E cannot move it: a local, a property of self, of a fixed object or of
+   the object in a local E cannot store to, or a struct member of such. A pointer's place (__RefAtInline__) reads only its
+   scratch, which E does not name. */
+bool PlaceWaits(const FArgIR& P, const FArgIR& E, bool bActs)
+{
+    if (P.K == FArgIR::Call && P.Sub && P.Sub->Intrinsic == "__RefAtInline__") return Mentions(E, P.S) == 0 && !MayStore(E, P.S);
+    if (CallsImpure(P)) return false;
+    if (!bActs) return true;
+    switch (P.K)
+    {
+    case FArgIR::Local: return !P.Base;
+    case FArgIR::Field: return !P.Base || P.Base->K == FArgIR::Self || P.Base->K == FArgIR::ObjConst
+                             || (P.Base->K == FArgIR::Local && !P.Base->Base && !MayStore(E, P.Base->S));
+    case FArgIR::Member: return P.Base && PlaceWaits(*P.Base, E, true);
+    default: return false;
     }
 }
 }   // namespace
@@ -6698,7 +6775,7 @@ void FCompiler::ArgumentsInPlace(std::vector<FStmtIR>& Body, const std::vector<s
         if (!Read) return;
 
         const bool bActs = CallsImpure(Arg);
-        const std::function<bool(const FArgIR&)> Pred = [&](const FArgIR& X) { return bActs ? ReadsNothing(X) : !CallsImpure(X); };
+        const std::function<bool(const FArgIR&)> Pred = [&](const FArgIR& X) { return MayRunFirst(X, Arg, bActs); };
         bool bOk = OffPath(*Scope, Read, Pred);
         if (First.K == FStmtIR::StaticCall)
         {
@@ -6716,8 +6793,10 @@ void FCompiler::ArgumentsInPlace(std::vector<FStmtIR>& Body, const std::vector<s
 /*
 `T = E; <S reads T>`, T read nowhere else: E goes where S reads T, and T is gone (DropUnusedLocals takes the property).
 The same conditions as ArgumentsInPlace: the read runs exactly once whenever S does, and running E there instead of
-one statement earlier cannot be seen: what S evaluates before the read is pure, and reads no variable when E acts (a
-call with an out parameter is never pure, so it acts).
+where it was cannot be seen. What S evaluates before the read, its destination included, runs nothing, and when E acts
+(a call with an out parameter is never pure, so it acts), reads nothing E could change. S need not be the next
+statement: E moves past stores to frame locals that it does not read and that run nothing (MayPass), which is what
+a pointer store puts between a value and its use (`__Upd = V; Scratch.Num = 1; Scratch.Data = P; *view = __Upd`).
 */
 void FCompiler::ForwardSingleUse(std::vector<FStmtIR>& Stmts, const std::vector<FStmtIR>& All)
 {
@@ -6729,44 +6808,46 @@ void FCompiler::ForwardSingleUse(std::vector<FStmtIR>& Stmts, const std::vector<
                 ForwardSingleUse(**L, All);
             }
     /* Last to first, so `A = ..; B = ..; S(A, B)` forwards B, then A into what S has become. */
-    for (size_t I = Stmts.size(); I-- > 1;)
+    for (size_t D = Stmts.size(); D-- > 0;)
     {
+        const FStmtIR& Def = Stmts[D];
+        const std::string& Name = Def.Var.S;
+        if (!((Def.K == FStmtIR::Decl && Def.bHasValue) || (Def.K == FStmtIR::Assign && Def.bAssignLocal))
+            || Def.Var.K != FArgIR::Local || Def.Var.Base || !CurLocals
+            || std::none_of(CurLocals->begin(), CurLocals->end(), [&](const FPropertyDef& L) { return L.Name == Name; })
+            || Mentions(All, Name) != 2 || Mentions(Def.Value, Name) != 0)
+            continue;
+        const FArgIR& E = Def.Value;
+        const bool bActs = CallsImpure(E);
+        size_t U = D + 1;
+        while (U < Stmts.size() && Mentions(Stmts[U], Name) == 0 && MayPass(Stmts[U], E, bActs)) ++U;
+        if (U == Stmts.size()) continue;
+        FStmtIR& Next = Stmts[U];
+        FArgIR* Read = nullptr;
+        FArgIR* Scope = nullptr;
+        if (Next.K == FStmtIR::StaticCall && !Next.Target.Target && Next.Target.Args.empty())
         {
-            const FStmtIR& Def = Stmts[I - 1];
-            FStmtIR& Next = Stmts[I];
-            const std::string& Name = Def.Var.S;
-            if (!((Def.K == FStmtIR::Decl && Def.bHasValue) || (Def.K == FStmtIR::Assign && Def.bAssignLocal))
-                || Def.Var.K != FArgIR::Local || Def.Var.Base || !CurLocals
-                || std::none_of(CurLocals->begin(), CurLocals->end(), [&](const FPropertyDef& L) { return L.Name == Name; })
-                || Mentions(All, Name) != 2 || Mentions(Def.Value, Name) != 0)
-                continue;
-            const FArgIR& E = Def.Value;
-            FArgIR* Read = nullptr;
-            FArgIR* Scope = nullptr;
-            if (Next.K == FStmtIR::StaticCall && !Next.Target.Target && Next.Target.Args.empty())
-            {
-                for (size_t I = 0; I < Next.Call.Args.size() && !Read; ++I)
-                    if ((Read = FindPlainRead(Next.Call.Args[I], Name, &E, MayWriteArg(Next.Call, I, &E))))
-                        Scope = &Next.Call.Args[I];
-            }
-            else if ((Next.K == FStmtIR::Assign || Next.K == FStmtIR::Decl || Next.K == FStmtIR::Return) && !Next.Var.Base)
-                Read = FindPlainRead(*(Scope = &Next.Value), Name, &E);
-            else if (Next.K == FStmtIR::If)
-                Read = FindPlainRead(*(Scope = &Next.Cond), Name, &E);
-            if (!Read) continue;
-
-            const bool bActs = CallsImpure(E);
-            const std::function<bool(const FArgIR&)> Pred = [&](const FArgIR& X) { return bActs ? ReadsNothing(X) : !CallsImpure(X); };
-            bool bOk = OffPath(*Scope, Read, Pred);
-            if (Next.K == FStmtIR::StaticCall)
-            {
-                if (Next.Call.Target) bOk = bOk && Pred(*Next.Call.Target);
-                for (const FArgIR& A : Next.Call.Args) if (&A != Scope) bOk = bOk && Pred(A);
-            }
-            if (!bOk) continue;
-            *Read = E;
-            Stmts.erase(Stmts.begin() + (I - 1));
+            for (size_t I = 0; I < Next.Call.Args.size() && !Read; ++I)
+                if ((Read = FindPlainRead(Next.Call.Args[I], Name, &E, MayWriteArg(Next.Call, I, &E))))
+                    Scope = &Next.Call.Args[I];
         }
+        else if ((Next.K == FStmtIR::Assign || Next.K == FStmtIR::Decl || Next.K == FStmtIR::Return)
+                 && (!Next.Var.Base || PlaceWaits(Next.Var, E, bActs)))
+            Read = FindPlainRead(*(Scope = &Next.Value), Name, &E);
+        else if (Next.K == FStmtIR::If)
+            Read = FindPlainRead(*(Scope = &Next.Cond), Name, &E);
+        if (!Read) continue;
+
+        const std::function<bool(const FArgIR&)> Pred = [&](const FArgIR& X) { return MayRunFirst(X, E, bActs); };
+        bool bOk = OffPath(*Scope, Read, Pred);
+        if (Next.K == FStmtIR::StaticCall)
+        {
+            if (Next.Call.Target) bOk = bOk && Pred(*Next.Call.Target);
+            for (const FArgIR& A : Next.Call.Args) if (&A != Scope) bOk = bOk && Pred(A);
+        }
+        if (!bOk) continue;
+        *Read = E;
+        Stmts.erase(Stmts.begin() + D);
     }
 }
 

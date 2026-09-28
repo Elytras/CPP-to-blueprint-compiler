@@ -1050,6 +1050,16 @@ def opt_bools():
     print('ok  OptTest.Bools: bool | & ^ and their constant sides, both sides run')
 
 
+def opt_forward():
+    """A value moves to its one read, never past a store that reads what it changes: B is the Calls the first Tick left."""
+    for a, c in itertools.product((0, 3, -4), (0, 5)):
+        me = dict(Calls=c)
+        got = run(asset('OptTest'), 'Forward', self_vars=me, A=a)[0]
+        want = (c + 1) * 1000000 + (c + 1) * 10000 + (c + 2) * 100 + 2 * a + 1
+        assert got == want and me == dict(Calls=c + 2), (a, c, got, want, me)
+    print('ok  OptTest.Forward: a value moves to its one read, never past a store that reads what it changes')
+
+
 def opt_raw():
     """UE_NO_OPTIMIZE / #pragma clang optimize off: what the source says runs, unused pure calls and the
     short-circuit included (an execution trace, not the layout)."""
@@ -1074,6 +1084,7 @@ def opt_flags():
 
 opt_locals()
 opt_bools()
+opt_forward()
 opt_raw()
 opt_flags()
 
