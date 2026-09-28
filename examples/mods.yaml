@@ -1,0 +1,28 @@
+# Builds every example. From the AssetGen folder: python tools/bpbuild.py examples <UeApi dir> <assetgen>
+# The paks land in examples/out/, and --no-pak compiles without packing.
+mods:
+  - name: HelloWorld
+    sources: [HelloWorld.cpp]
+  - name: WaitForPlayer
+    sources: [WaitForPlayer.cpp]
+  - name: Beacon
+    sources: [Beacon.cpp, ../include/Objects.h]
+  - name: Scoreboard
+    sources: [Scoreboard.cpp]
+  - name: NetworkedSwitch
+    sources: [NetworkedSwitch.cpp, ../include/Objects.h]
+  - name: EnemyInfo
+    sources: [EnemyInfo.cpp]
+  - name: GameBlueprintChild
+    sources: [GameBlueprintChild.cpp, ../include/Objects.h]
+  - name: AwaitEvents
+    sources: [AwaitEvents.cpp]
+  - name: MemoryRead
+    sources: [MemoryRead.cpp, ../include/Intrin.h]
+  - name: MathLib
+    sources: [MathLib.cpp, MathLib.h]
+    generate_api: true
+  - name: LibraryUser
+    sources: [LibraryUser.cpp, MathLib.h]
+    needs: [MathLib]
+    embed: true

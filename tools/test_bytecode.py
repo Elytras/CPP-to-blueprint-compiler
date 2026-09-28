@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """usage: test_bytecode.py [--assetgen <exe>] [--ueapi <UeApi dir>] [--cases <file>]
 
-Compiles every test mod in AssetGen/tests, then checks what a mod can observe: its functions run offline
-(runscript.py, runvm.py for latent / delegate / cross-object code) against Python oracles, return values and member
-writes both, and what the engine reads off the cooked assets (flags, property types, defaults, references, which
-function a call reaches). Never the bytecode's shape: an optimization that keeps the behaviour must pass.
+Compiles every test mod in AssetGen/tests and every example mod in AssetGen/examples, then checks what a mod can
+observe: its functions run offline (runscript.py, runvm.py for latent / delegate / cross-object code) against Python
+oracles, return values and member writes both, and what the engine reads off the cooked assets (flags, property types,
+defaults, references, which function a call reaches). Never the bytecode's shape: an optimization that keeps the behaviour must pass.
 
 --assetgen defaults to the first build found (ue-mods x64/Release, this repo's x64/Release, a CMake build/);
 --ueapi to ue-mods' BpMods/UeApi. Outside ue-mods, pass the UeApi of https://github.com/Elytras/DRG-Blueprint-Cpp-SDK.
@@ -40,9 +40,10 @@ LOGS = {}      # what each test's compile printed
 
 
 def build():
-    """Each test compiles into build/<Test>/FSD/Content/<its package>, the layout bpbuild stages a mod in."""
+    """Each test compiles into build/<Test>/FSD/Content/<its package>, the layout bpbuild stages a mod in. The examples
+    the docs point at compile the same way, so one the compiler stops accepting fails here rather than for a reader."""
     shutil.rmtree(ROOT, ignore_errors=True)
-    for src in sorted(glob.glob(os.path.join(TESTS, '*.cpp'))):
+    for src in sorted(glob.glob(os.path.join(TESTS, '*.cpp'))) + sorted(glob.glob(os.path.join(AG, 'examples', '*.cpp'))):
         mod = os.path.splitext(os.path.basename(src))[0]
         package = re.search(r'UE_MOD_PACKAGE\s*\(\s*"/Game/([^"]+)"', open(src, encoding='utf-8-sig').read()).group(1)
         out = os.path.join(ROOT, mod, 'FSD', 'Content', *package.split('/'))
@@ -50,7 +51,7 @@ def build():
         proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, out], capture_output=True, encoding='utf-8')
         assert proc.returncode == 0, '%s:\n%s%s' % (mod, proc.stdout, proc.stderr)
         LOGS[mod] = proc.stdout
-    print('ok  every test compiles')
+    print('ok  every test and example compiles')
 
 
 build()
