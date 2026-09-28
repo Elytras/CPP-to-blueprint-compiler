@@ -1287,6 +1287,7 @@ private:
     void DropOverwritten(std::vector<FStmtIR>& Stmts);
     void DropUnusedLocals(std::vector<FStmtIR>& Stmts, std::vector<FPropertyDef>& Locals);
     void CoalesceTemps(std::vector<FStmtIR>& Stmts, std::vector<FPropertyDef>& Locals, FBlueprintClass& BP);
+    void ThreadBranches(std::vector<FStmtIR>& Stmts, const std::vector<FStmtIR>& All, std::vector<FPropertyDef>& Locals);
     bool HoistReadsInList(std::vector<FStmtIR>& Stmts, FBlueprintClass& BP,
                           std::vector<FPropertyDef>& Locals, std::string* Err);
     bool HoistReadsInStmt(FStmtIR& St, FBlueprintClass& BP,
@@ -5367,7 +5368,8 @@ shared slot is, the first one too, which a loop may bring back round after a lat
 other type, __Make (a braced struct relies on the frame's default members), the zero-kept __Fresh twins, and the
 scratch the pointer reads name implicitly. A loop repeats its body, so a temp
 mentioned in its condition, increment or break trailer, or both inside and outside it, spans the whole loop.
-Not run with a goto (any label re-enters) or a latent call (the ubergraph frame outlives the call).
+Not run with a source goto (any label re-enters) or a latent call (the ubergraph frame outlives the call); the jumps
+ThreadBranches makes only go forward, out of a body into the code after it.
 */
 /* What a declaration without an initializer resets a shared temp to, so it still reads as the frame's zero: a
    constant for a scalar or pointer, `ClearFn` for a container. False for a struct (EX_StructConst cannot say every
@@ -6905,6 +6907,113 @@ void FCompiler::FlattenBlocks(std::vector<FStmtIR>& Stmts)
         Stmts.insert(Stmts.begin() + I, Body.begin(), Body.end());
         I += Body.size();
         --I;
+    }
+}
+
+/*
+`if (Found(X))` over an inline bool function whose every return is a constant: each `return true` / `return false`
+jumps straight to the branch it picks, where it stored the value for the `if` to test. The body's own end, a constant
+too, falls into its branch, laid out first; the other follows behind a jump, and goes when no return picks it. A branch
+that is a lone `return` of a constant or a variable is copied to the returns that pick it. Only forward jumps, into
+code after the body: what CoalesceTemps then sees of each local's span is still where it is live.
+*/
+void FCompiler::ThreadBranches(std::vector<FStmtIR>& Stmts, const std::vector<FStmtIR>& All, std::vector<FPropertyDef>& Locals)
+{
+    for (size_t I = 0; I < Stmts.size(); ++I)
+    {
+        for (auto* L : { &Stmts[I].Then, &Stmts[I].Else, &Stmts[I].Body, &Stmts[I].Inc, &Stmts[I].Trailer })
+            if (*L)
+            {
+                *L = std::make_shared<std::vector<FStmtIR>>(**L);
+                ThreadBranches(**L, All, Locals);
+            }
+        if (Stmts[I].K != FStmtIR::Block || !Stmts[I].Body || Stmts[I].Body->empty() || I + 1 == Stmts.size()) continue;
+        const FStmtIR If = Stmts[I + 1];
+        if (If.K != FStmtIR::If || If.bJumpOut || If.Cond.K != FArgIR::Local || If.Cond.Base
+            || (If.Then && HasLabel(*If.Then)) || (If.Else && HasLabel(*If.Else)))
+            continue;
+        const std::string R = If.Cond.S;
+        auto Store = [&](const FStmtIR& St) {
+            return St.K == FStmtIR::Assign && St.Var.K == FArgIR::Local && !St.Var.Base && St.Var.S == R && St.Value.K == FArgIR::Bool;
+        };
+        /* Every return of this body (not of an inline inside it) right after a constant store to R. */
+        int32 Stores = 0;
+        std::function<bool(const std::vector<FStmtIR>&)> Exits = [&](const std::vector<FStmtIR>& List) {
+            for (size_t K = 0; K < List.size(); ++K)
+            {
+                if (List[K].K == FStmtIR::InlineReturn && (K == 0 || !Store(List[K - 1]))) return false;
+                Stores += List[K].K == FStmtIR::InlineReturn;
+                if (List[K].K != FStmtIR::Block)
+                    for (const auto* L : { &List[K].Then, &List[K].Else, &List[K].Body, &List[K].Inc, &List[K].Trailer })
+                        if (*L && !Exits(**L)) return false;
+            }
+            return true;
+        };
+        std::vector<FStmtIR>& Body = *Stmts[I].Body;
+        if (!Store(Body.back()) || !Exits(Body) || Mentions(Body, R) != Stores + 1 || Mentions(All, R) != Stores + 2) continue;
+
+        const bool bEnd = Body.back().Value.B;
+        auto Branch = [&](bool C) { return C ? If.Then : If.Else; };
+        auto Lone = [&](bool C) {
+            const auto B = Branch(C);
+            return B && B->size() == 1 && (*B)[0].K == FStmtIR::Return
+                && (!(*B)[0].bHasValue || IsVmConstant((*B)[0].Value) || ((*B)[0].Value.K == FArgIR::Local && !(*B)[0].Value.Base));
+        };
+        int32 Label[2] = { -1, -1 };
+        std::function<void(std::vector<FStmtIR>&)> Rewrite = [&](std::vector<FStmtIR>& List) {
+            for (size_t K = 0; K < List.size(); ++K)
+            {
+                if (List[K].K == FStmtIR::InlineReturn)
+                {
+                    const bool C = List[K - 1].Value.B;
+                    FStmtIR Jump;
+                    if (Lone(C)) Jump = (*Branch(C))[0];
+                    else
+                    {
+                        if (Label[C] < 0) Label[C] = NextGotoLabel++;
+                        Jump.K = FStmtIR::Goto;
+                        Jump.LabelId = Label[C];
+                    }
+                    List.erase(List.begin() + K - 1);
+                    List[--K] = std::move(Jump);
+                    continue;
+                }
+                if (List[K].K != FStmtIR::Block)
+                    for (auto* L : { &List[K].Then, &List[K].Else, &List[K].Body, &List[K].Inc, &List[K].Trailer })
+                        if (*L)
+                        {
+                            *L = std::make_shared<std::vector<FStmtIR>>(**L);
+                            Rewrite(**L);
+                        }
+            }
+        };
+        Body.pop_back();
+        Rewrite(Body);
+
+        /* The branch the end falls into, then the other one if a return jumps there. */
+        std::vector<FStmtIR> Seq;
+        auto Mark = [](int32 Id) { FStmtIR L; L.K = FStmtIR::GotoLabel; L.LabelId = Id; return L; };
+        auto Lay = [&](bool C) {
+            if (Label[C] >= 0) Seq.push_back(Mark(Label[C]));
+            if (const auto B = Branch(C)) Seq.insert(Seq.end(), B->begin(), B->end());
+        };
+        Lay(bEnd);
+        if (Label[!bEnd] >= 0)
+        {
+            int32 End = -1;
+            if (!NeverFallsThrough(Seq))
+            {
+                FStmtIR Over;
+                Over.K = FStmtIR::Goto;
+                Over.LabelId = End = NextGotoLabel++;
+                Seq.push_back(std::move(Over));
+            }
+            Lay(!bEnd);
+            if (End >= 0) Seq.push_back(Mark(End));
+        }
+        Stmts.erase(Stmts.begin() + I + 1);
+        Stmts.insert(Stmts.begin() + I + 1, Seq.begin(), Seq.end());     // walked next, for a pattern of their own
+        Locals.erase(std::remove_if(Locals.begin(), Locals.end(), [&](const FPropertyDef& L) { return L.Name == R; }), Locals.end());
     }
 }
 
@@ -10332,7 +10441,11 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             }
             DropUnusedPure(Stmts);
             DropUnusedLocals(Stmts, Locals);
-            if (!bFnHasGoto && !bMadeLatentCall) CoalesceTemps(Stmts, Locals, BP);
+            if (!bFnHasGoto && !bMadeLatentCall)
+            {
+                ThreadBranches(Stmts, Stmts, Locals);
+                CoalesceTemps(Stmts, Locals, BP);
+            }
         }
         for (const auto& [Struct, Keep] : KeepLoaded)
         {

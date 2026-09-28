@@ -136,6 +136,36 @@ public:
     return Had * 10 + Second.Num();
   }
 
+  /* An `if` over an inline bool function whose returns are all constants: each return goes straight to the branch it
+     picks, out of the loop too, and a branch that is a lone `return R` is copied to it. */
+  inline bool IsSquare(int32 V) {
+    for (int32 I = 0; I <= V; ++I)
+      if (I * I == V)
+        return true;
+    return false;
+  }
+  inline bool SquarePair(int32 V) {
+    if (!IsSquare(V))
+      return false;
+    if (IsSquare(V + 1))
+      return true;
+    return false;
+  }
+  int32 Threads(int32 V) {
+    int32 R = 0;
+    if (IsSquare(V))
+      R += 1;
+    if (!IsSquare(V + 1))
+      R += 2;
+    else
+      R += 4;
+    if (SquarePair(V))
+      R += 8;
+    if (IsSquare(V * 2))
+      return R;
+    return R + 16;
+  }
+
   /* UE_NO_OPTIMIZE: the unused pure call, the unread local and the branch all stay. */
   UE_NO_OPTIMIZE int32 Raw(int32 X, int32 Y) {
     UKismetMathLibrary::Multiply_IntInt(X, Y);

@@ -1082,6 +1082,16 @@ def opt_slots():
     print('ok  OptTest.Slots / Arrays: locals sharing a property keep their values; an array declared bare starts empty')
 
 
+def opt_threads():
+    """An `if` over an inline bool function takes the branch each return picks, from inside its loop too."""
+    sq = lambda v: v >= 0 and int(v ** 0.5) ** 2 == v
+    for v in (-1, 0, 1, 2, 3, 4, 8, 9, 15, 18, 24, 25):
+        r = int(sq(v)) + (4 if sq(v + 1) else 2) + 8 * int(sq(v) and sq(v + 1))
+        want = r if sq(2 * v) else r + 16
+        assert run(asset('OptTest'), 'Threads', V=v)[0] == want, (v, want)
+    print('ok  OptTest.Threads: an if over an inline bool function takes the branch each return picks')
+
+
 def opt_raw():
     """UE_NO_OPTIMIZE / #pragma clang optimize off: what the source says runs, unused pure calls and the
     short-circuit included (an execution trace, not the layout)."""
@@ -1109,6 +1119,7 @@ opt_bools()
 opt_forward()
 opt_in_place()
 opt_slots()
+opt_threads()
 opt_raw()
 opt_flags()
 
