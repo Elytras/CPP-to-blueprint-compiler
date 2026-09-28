@@ -6728,6 +6728,10 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
     if (Receiver) Args.push_back(Receiver);     // a forwarded method: the object is the free function's first parameter
     ForEach(CallNode, [&](const Json& C) { if (bFirst) { bFirst = false; return; } Args.push_back(&C); });
     if (Args.size() != Parms.size()) { *Err = "inline call to " + Method + " with " + std::to_string(Args.size()) + " arguments"; return false; }
+    /* A world context left to its default (`UObject* WorldContextObject = nullptr`) is the caller's, as for a
+       UFunction (LowerCall): the editor wires the hidden pin to self. */
+    std::vector<bool> WcoDefault(Args.size());
+    for (size_t I = 0; I < Args.size(); ++I) WcoDefault[I] = Kind(*Args[I]) == "CXXDefaultArgExpr" && IsWcoName(Name(*Parms[I]));
     for (size_t I = 0; I < Args.size(); ++I) Args[I] = DefaultedArg(*Args[I], Parms[I]);
     /* A reference parameter is another name for a variable, or for a place under an object or an index (`O->A`,
        `Arr[F()]`, `O->S.X`) fixed at the call, as binding a reference fixes it. */
@@ -6759,6 +6763,7 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
             const Json Wrap = { {"kind", "CompoundStmt"}, {"inner", std::move(Pre)} };
             if (!LowerBody(Wrap, BP, Pins[I], Locals, Err)) return false;
         }
+        else if (WcoDefault[I]) { if (!CurrentWco.empty()) { Values[I].K = FArgIR::Local; Values[I].S = CurrentWco; } }
         else if (!LowerArg(*Args[I], BP, Values[I], Err)) return false;
     /* The caller's own variable can stand in for a parameter the body only reads, as a constant does, when nothing
        could change it before the body is done: no argument stores anything, and no parameter is a reference, the
