@@ -112,6 +112,30 @@ public:
     return Pair(L, Bumped(L));
   }
 
+  /* Locals whose spans do not overlap share a property: Sq and After, I and Copy, but not Total, which the loop reads
+     round. A copy whose source is read again (Copy) keeps its own, and an array declared without a value starts empty
+     in a shared property too (Second). */
+  int32 Slots(int32 N) {
+    int32 Total = 0;
+    for (int32 I = 0; I < N; ++I) {
+      int32 Sq = I * I;
+      Total += Sq + Sq / 2;
+    }
+    int32 After = Total * 2;
+    int32 Copy  = After;
+    Copy += 1;
+    return Copy * 1000 + After + Total;
+  }
+  int32 Arrays(int32 N) {
+    TArray<int32> First;
+    First.Add(N);
+    First.Add(N + 1);
+    int32         Had = First.Num();
+    TArray<int32> Second;
+    Second.Add(N);
+    return Had * 10 + Second.Num();
+  }
+
   /* UE_NO_OPTIMIZE: the unused pure call, the unread local and the branch all stay. */
   UE_NO_OPTIMIZE int32 Raw(int32 X, int32 Y) {
     UKismetMathLibrary::Multiply_IntInt(X, Y);

@@ -5351,13 +5351,17 @@ static std::string PropKey(const FPropertyDef& P)
 
 /*
 Every inline expansion, pointer read and hoisted operand mints a local of its own, so a function built from a few
-helpers ends up with hundreds of properties in its frame. Here, once the body is final, the compiler's temps are
-packed like registers: statements are numbered in emission order, each temp spans its first to last mention, and
-temps of one layout whose spans do not overlap share a property.
+helpers ends up with hundreds of properties in its frame. Here, once the body is final, the compiler's temps and the
+function's own locals are packed like registers: statements are numbered in emission order, each spans its first to
+last mention, and those of one layout whose spans do not overlap share a property. A copy `A = B` that is B's last
+mention and A's first shares too, which leaves it copying a property onto itself, so it goes: the value an inline
+body returns, a switch's subject, `T X = Inline()`.
 
 That is sound because a compiler temp is always written before it is read within its span, on every path: it is
-stored by the statement hoisted right before its reader, or at the top of the inline block it belongs to. A
-declaration without an initializer is the exception: it reads as the frame's zero, a container as empty. It joins
+stored by the statement hoisted right before its reader, or at the top of the inline block it belongs to. A local
+the source declares is too, since C++ scopes it: its declaration comes first, and one in a loop is made fresh each
+round (its __Fresh twin). A declaration without an initializer is the exception: it reads as the frame's zero, a
+container as empty. It joins
 a shared slot only when it can be reset to that at the declaration (ZeroOf, ClearFn), and every such occupant of a
 shared slot is, the first one too, which a loop may bring back round after a later one. Kept out: those of any
 other type, __Make (a braced struct relies on the frame's default members), the zero-kept __Fresh twins, and the
@@ -5389,6 +5393,12 @@ static const char* ClearFn(const FPropertyDef& P, const char** Lib)
     if (P.Type == "MapProperty") { *Lib = "BlueprintMapLibrary"; return "Map_Clear"; }
     return nullptr;
 }
+/* `A = B`, both whole locals. */
+static bool IsLocalCopy(const FStmtIR& St)
+{
+    return (St.K == FStmtIR::Assign || (St.K == FStmtIR::Decl && St.bHasValue)) && St.Var.K == FArgIR::Local && !St.Var.Base
+        && St.Value.K == FArgIR::Local && !St.Value.Base;
+}
 
 void FCompiler::CoalesceTemps(std::vector<FStmtIR>& Stmts, std::vector<FPropertyDef>& Locals, FBlueprintClass& BP)
 {
@@ -5401,6 +5411,7 @@ void FCompiler::CoalesceTemps(std::vector<FStmtIR>& Stmts, std::vector<FProperty
     std::map<std::string, FSpan> Spans;
     struct FLoop { int32 Start, End; std::set<std::string> Head; };
     std::vector<FLoop> Loops;
+    std::map<int32, std::pair<std::string, std::string>> Copies;    // position -> {A, B} of `A = B` there
     int32 Pos = 0;
     auto Touch = [&](const std::string& N) {
         if (N.empty()) return;
@@ -5442,6 +5453,7 @@ void FCompiler::CoalesceTemps(std::vector<FStmtIR>& Stmts, std::vector<FProperty
                 Own(St, true);
                 ++Pos;
                 if (St.K == FStmtIR::Decl && !St.bHasValue && Spans.find(St.Var.S) == Spans.end()) Spans[St.Var.S].bOut = true;
+                if (IsLocalCopy(St)) Copies[Pos] = { St.Var.S, St.Value.S };
                 Own(St, false);
                 for (const auto* L : { &St.Then, &St.Else, &St.Body }) if (*L) Walk(**L);
                 continue;
@@ -5468,7 +5480,7 @@ void FCompiler::CoalesceTemps(std::vector<FStmtIR>& Stmts, std::vector<FProperty
     /* Greedy interval colouring per layout, in order of first mention. */
     std::vector<const FPropertyDef*> Cands;
     for (const FPropertyDef& L : Locals)
-        if (Pooled(L.Name) && L.Name.compare(0, 7, "__Fresh") != 0)
+        if ((Pooled(L.Name) || L.Name.compare(0, 2, "__") != 0) && L.Name.compare(0, 7, "__Fresh") != 0)
             if (auto S = Spans.find(L.Name); S != Spans.end() && S->second.Last >= 0)
             {
                 FArgIR Zero;
@@ -5479,15 +5491,24 @@ void FCompiler::CoalesceTemps(std::vector<FStmtIR>& Stmts, std::vector<FProperty
     std::stable_sort(Cands.begin(), Cands.end(), [&](const FPropertyDef* A, const FPropertyDef* B) { return Spans[A->Name].First < Spans[B->Name].First; });
     struct FSlot { std::string Name; int32 End; };
     std::map<std::string, std::vector<FSlot>> Slots;
+    std::map<std::string, std::pair<std::string, size_t>> SlotOf;    // name -> its layout and slot there
     std::map<std::string, std::string> Rename;
     for (const FPropertyDef* L : Cands)
     {
         const FSpan& S = Spans[L->Name];
-        std::vector<FSlot>& Free = Slots[PropKey(*L)];
-        auto It = std::find_if(Free.begin(), Free.end(), [&](const FSlot& F) { return F.End < S.First; });
-        if (It == Free.end()) { Free.push_back({ L->Name, S.Last }); continue; }
-        Rename[L->Name] = It->Name;
-        It->End = S.Last;
+        const std::string Key = PropKey(*L);
+        std::vector<FSlot>& Free = Slots[Key];
+        /* `A = B` that starts A's span where B's ends: A takes B's property, and the copy is a no-op (dropped below). */
+        size_t At = Free.size();
+        if (auto C = Copies.find(S.First); C != Copies.end() && C->second.first == L->Name)
+            if (auto B = SlotOf.find(C->second.second); B != SlotOf.end() && B->second.first == Key && Free[B->second.second].End == S.First)
+                At = B->second.second;
+        if (At == Free.size())
+            At = std::find_if(Free.begin(), Free.end(), [&](const FSlot& F) { return F.End < S.First; }) - Free.begin();
+        SlotOf[L->Name] = { Key, At };
+        if (At == Free.size()) { Free.push_back({ L->Name, S.Last }); continue; }
+        Rename[L->Name] = Free[At].Name;
+        Free[At].End = S.Last;
     }
     if (Rename.empty()) return;
 
@@ -5512,8 +5533,9 @@ void FCompiler::CoalesceTemps(std::vector<FStmtIR>& Stmts, std::vector<FProperty
         if (A.Base) RArg(*A.Base);
     };
     RWalk = [&](std::vector<FStmtIR>& List) {
-        for (FStmtIR& St : List)
+        for (size_t I = 0; I < List.size(); ++I)
         {
+            FStmtIR& St = List[I];
             if (auto R = St.K == FStmtIR::Decl && !St.bHasValue ? Resets.find(St.Var.S) : Resets.end(); R != Resets.end())
             {
                 const char* Lib = nullptr;
@@ -5535,6 +5557,7 @@ void FCompiler::CoalesceTemps(std::vector<FStmtIR>& Stmts, std::vector<FProperty
             for (FArgIR* A : { &St.Var, &St.Value, &St.Cond, &St.SwitchValue }) RArg(*A);
             for (FArgIR& A : St.CaseTests) RArg(A);
             for (auto* L : { &St.Then, &St.Else, &St.Body, &St.Inc, &St.Trailer }) if (*L) RWalk(**L);
+            if (IsLocalCopy(St) && St.Var.S == St.Value.S) List.erase(List.begin() + I--);
         }
     };
     RWalk(Stmts);

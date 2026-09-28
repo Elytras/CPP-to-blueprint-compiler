@@ -1073,6 +1073,15 @@ def opt_in_place():
     print("ok  OptTest.InPlace / Order: a caller's local stands in for a parameter only while nothing can change it")
 
 
+def opt_slots():
+    """Locals sharing a property keep their values, and an array declared without a value starts empty."""
+    for n in (0, 1, 4, 7):
+        total = sum(i * i + i * i // 2 for i in range(n))
+        assert run(asset('OptTest'), 'Slots', N=n)[0] == (2 * total + 1) * 1000 + 3 * total, n
+        assert run(asset('OptTest'), 'Arrays', N=n)[0] == 21, n
+    print('ok  OptTest.Slots / Arrays: locals sharing a property keep their values; an array declared bare starts empty')
+
+
 def opt_raw():
     """UE_NO_OPTIMIZE / #pragma clang optimize off: what the source says runs, unused pure calls and the
     short-circuit included (an execution trace, not the layout)."""
@@ -1099,6 +1108,7 @@ opt_locals()
 opt_bools()
 opt_forward()
 opt_in_place()
+opt_slots()
 opt_raw()
 opt_flags()
 
