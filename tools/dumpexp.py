@@ -19,6 +19,9 @@ class R:
             t = s.b[s.o:s.o - 2 * n - 2].decode('utf-16-le', 'replace'); s.o -= 2 * n; return t
         t = s.b[s.o:s.o + n - 1].decode('latin-1', 'replace'); s.o += n; return t
 
+class Imp(str):
+    """An import as the dumps print it, Class'Name'; .outer is its outer's FPackageIndex."""
+
 def load(base):
     ua = open(base + ".uasset", "rb").read()
     try: ue = open(base + ".uexp", "rb").read()
@@ -46,7 +49,7 @@ def load(base):
         outer = im.i32(); obj = names[im.i32()]; im.o += 4
         # Uncooked: FObjectImport carries an editor-only PackageName FName (VER_UE4_NON_OUTER_PACKAGE_IMPORT).
         if not (flags & 0x80000000): im.o += 8
-        imports.append(f"{cls}'{obj}'")
+        imports.append(Imp(f"{cls}'{obj}'")); imports[-1].outer = outer
     exports = []
     ex = R(ua, eoff)
     for _ in range(ecount):

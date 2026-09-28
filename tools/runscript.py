@@ -22,6 +22,12 @@ class Node:
 
 class P(W):
     """walkscript's reader, building a tree instead of a log."""
+    def of_own_class(s, p):
+        """imp[i]: a function of this package's own class, which a compile names as an import (a call bound to it)."""
+        i = int(p[4:p.index(']')])
+        outer = getattr(s.imports[i], 'outer', 0) if i < len(s.imports) else 0
+        return outer < 0 and s.imports[-outer - 1].split("'")[-2] in {e['name'] for e in s.exports}
+
     def node(s):
         mem = s.mem
         op = s.u8()
@@ -53,8 +59,8 @@ class P(W):
         elif op == 0x67: k.append(s.node())                          # SoftObjectConst: its path string
         elif op in (0x1C, 0x46, 0x68):
             p = s.ptr()                                              # exp[i]:Name, or imp[i]:Class'Name'
-            n.own = p.startswith('exp[')
-            n.val = p.split(':', 1)[1] if n.own else p.split("'")[-2]
+            n.own = p.startswith('exp[') or s.of_own_class(p)
+            n.val = p.split(':', 1)[1] if p.startswith('exp[') else p.split("'")[-2]
             s.args(k)
         elif op == 0x1D: n.val = s.i32()
         elif op == 0x1E: n.val = struct.unpack_from('<f', s.b, s.o)[0]; s.raw(4)
