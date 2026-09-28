@@ -1,11 +1,13 @@
 ﻿/*
 usage: assetgen verify <out-dir> <reference-dir>     rebuilds Autosprint/InitCave and byte-diffs it against the cooked original
-       assetgen compile <source.cpp> <include-dir> <out-dir> [--api <api-dir>]
+       assetgen compile <source.cpp> <include-dir> <out-dir> [--api <api-dir>] [--game <folder /Game is in>]
        assetgen registry <out AssetRegistry.bin> <AssetRegistry.bin>...   merges registries assetgen wrote into one
+       assetgen roundtrip <dir>      reads every cooked package under dir and writes it back in memory: the S38 gate
 */
 #include <cstdio>
 #include <string>
 
+#include "Cooked.h"
 #include "Cpp.h"
 #include "Registry.h"
 #include "Verify.h"
@@ -20,11 +22,13 @@ int main(int argc, char** argv)
     if (argc >= 5 && std::string(argv[1]) == "compile")
     {
         std::optional<std::string> ApiDir;
+        std::string GameDir;        // where UE_ASSET_EDIT / UE_PATCH read the game's packages: <extracted pak>/FSD/Content
         for (int I = 5; I + 1 < argc; ++I)
             if (std::string(argv[I]) == "--api") ApiDir = argv[I + 1];
+            else if (std::string(argv[I]) == "--game") GameDir = argv[I + 1];
 
         std::string Err;
-        try { if (CompileToAssets(argv[2], argv[3], argv[4], ApiDir, &Err)) return 0; }
+        try { if (CompileToAssets(argv[2], argv[3], argv[4], ApiDir, GameDir, &Err)) return 0; }
         catch (const std::exception& E) { Err = std::string("internal error: ") + E.what(); }   // not a silent 0xC0000409
         printf("  FAILED: %s\n", Err.c_str());
         return 1;
@@ -46,8 +50,12 @@ int main(int argc, char** argv)
         return 0;
     }
 
+    if (argc >= 3 && std::string(argv[1]) == "roundtrip")
+        return RoundTrip(argv[2]);
+
     printf("usage: assetgen verify <out-dir> <reference-dir>\n"
-           "       assetgen compile <source.cpp> <include-dir> <out-dir> [--api <api-dir>]\n"
-           "       assetgen registry <out AssetRegistry.bin> <AssetRegistry.bin>...\n");
+           "       assetgen compile <source.cpp> <include-dir> <out-dir> [--api <api-dir>] [--game <folder /Game is in>]\n"
+           "       assetgen registry <out AssetRegistry.bin> <AssetRegistry.bin>...\n"
+           "       assetgen roundtrip <dir>\n");
     return 2;
 }

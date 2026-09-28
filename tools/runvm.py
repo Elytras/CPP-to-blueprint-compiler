@@ -19,14 +19,13 @@ def _ref(s):
 def _node(s):
     """runscript's parser plus what latent / async / spawn bodies use. Nodes runscript already read keep its val."""
     op, mem = s.b[s.o], s.mem
-    if op not in (0, 0x48, 0x19, 0x1C, 0x20, 0x2E, 0x2F, 0x30, 0x46, 0x4B, 0x5B, 0x5C, 0x63, 0x64, 0x68):
-        return _parse(s)
+    if op not in (0, 0x48, 0x19, 0x20, 0x2E, 0x2F, 0x30, 0x4B, 0x5B, 0x5C, 0x63, 0x64):
+        return _parse(s)                                                     # final calls too: runscript marks an export callee own
     s.u8()
     n = Node(op, mem)
     if op in (0, 0x48, 0x64): n.val, n.owner = s.fieldpath().split('@')
     if op == 0x19: n.kids.append(s.node()); s.i32(); s.fieldpath(); n.kids.append(s.node())
     elif op in (0x20, 0x2E, 0x2F): n.val = _ref(s)
-    elif op in (0x1C, 0x46, 0x68): n.val = _ref(s); s.args(n.kids)          # an export callee has no quotes
     elif op == 0x63: n.val = _ref(s); s.args(n.kids)                        # the signature, the dispatcher, its args
     elif op == 0x4B: n.val = s.name()
     elif op == 0x5B: n.val = s.i32()

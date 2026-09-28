@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""usage: test_bytecode.py [--assetgen <exe>] [--ueapi <UeApi dir>] [--cases <file>]
+"""usage: test_bytecode.py [--assetgen <exe>] [--ueapi <UeApi dir>] [--cases <file>] [--game <folder /Game is in>]
 
 Compiles every test mod in AssetGen/tests and every example mod in AssetGen/examples, then checks what a mod can
 observe: its functions run offline (runscript.py, runvm.py for latent / delegate / cross-object code) against Python
@@ -8,7 +8,8 @@ defaults, references, which function a call reaches). Never the bytecode's shape
 
 --assetgen defaults to the first build found (ue-mods x64/Release, this repo's x64/Release, a CMake build/);
 --ueapi to ue-mods' BpMods/UeApi. Outside ue-mods, pass the UeApi of https://github.com/Elytras/DRG-Blueprint-Cpp-SDK.
---cases also writes each offline run as a JSON case, which ue-mods' `bpcheck` command replays in the running game."""
+--cases also writes each offline run as a JSON case, which ue-mods' `bpcheck` command replays in the running game.
+--game (the extracted game pak's FSD/Content) adds the S38 edits of the game's own packages; without it they are skipped."""
 import copy, glob, itertools, os, re, shutil, subprocess, sys
 os.environ['PYTHONIOENCODING'] = 'utf-8'   # the dump tools print non-ASCII names; read back as UTF-8, not the code page
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -32,6 +33,7 @@ def option(flag, candidates):
 ASSETGEN = option('--assetgen', [os.path.join(AG, '..', 'x64', 'Release', 'assetgen.exe'),
                                  os.path.join(AG, 'x64', 'Release', 'assetgen.exe'), os.path.join(AG, 'build', 'assetgen')])
 UEAPI = option('--ueapi', [os.path.join(AG, '..', 'BpMods', 'UeApi')])
+GAME = option('--game', [])
 if not ASSETGEN or not UEAPI:
     sys.exit(__doc__)
 
@@ -48,10 +50,18 @@ def build():
         package = re.search(r'UE_MOD_PACKAGE\s*\(\s*"/Game/([^"]+)"', open(src, encoding='utf-8-sig').read()).group(1)
         out = os.path.join(ROOT, mod, 'FSD', 'Content', *package.split('/'))
         os.makedirs(out)
-        proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, out], capture_output=True, encoding='utf-8')
+        # EditTest edits AssetTest's cooked assets as if they were the game's (sorted, AssetTest compiles first).
+        game = ['--game', os.path.join(ROOT, 'AssetTest', 'FSD', 'Content')] if mod == 'EditTest' else []
+        proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, out] + game, capture_output=True, encoding='utf-8')
         assert proc.returncode == 0, '%s:\n%s%s' % (mod, proc.stdout, proc.stderr)
         LOGS[mod] = proc.stdout
     print('ok  every test and example compiles')
+    # The reader behind S38 refuses any layout the game's own 52,645 cooked packages do not share, and writes each one
+    # back byte for byte: so every package here must come back unchanged, name order and hashes included. Each tag's
+    # value is read into the model and encoded again, which must give the same bytes.
+    proc = subprocess.run([ASSETGEN, 'roundtrip', ROOT], capture_output=True, encoding='utf-8')
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    print('ok  every package reads back and writes out byte for byte, and every tag value re-encodes (assetgen roundtrip)')
 
 
 build()
@@ -177,10 +187,11 @@ def registry_rows(path):
 
 def registry_layout():
     """Each test's registry is FSD/AssetRegistry.bin, none sits in a package folder, and `assetgen registry`
-    folds several into one - what bpbuild does for an embedded dependency - replacing a package it already has."""
+    folds several into one - what bpbuild does for an embedded dependency - replacing a package it already has.
+    EditTest only edits, and a pak with no rows carries no registry: mounted at startup it would replace the game's."""
     import tempfile
     for mod in os.listdir(ROOT):
-        assert os.path.exists(registry_of(mod)), mod
+        assert os.path.exists(registry_of(mod)) == (mod != 'EditTest'), mod
         assert not glob.glob(os.path.join(ROOT, mod, 'FSD', 'Content', '**', 'AssetRegistry.bin'), recursive=True), mod
     a, b = registry_rows(registry_of('AssetTest')), registry_rows(registry_of('IfaceTest'))
     assert a and b and not a & b, (a, b)
@@ -1400,6 +1411,15 @@ def types_defaults():
     print('ok  TypesTest: Spans, MoodsByName and Spots defaults hold every element')
 
 
+def native_struct_values():
+    """A struct the engine reads in its own binary form, which WriteValue does not write (it writes tags), gets no
+    value: not as a default, and not as a UE_STRUCT member, whose default instance holds every member's."""
+    refused('NativeDefault', '  FGameplayTagContainer Tags = {};\n', 'GameplayTagContainer value in its own binary form')
+    refused('NativeMember', '  int32 X = 0;\n', "a UE_STRUCT's defaults hold every member's",
+            top='struct FTagHolder {\n  UE_STRUCT;\n  FGameplayTagContainer Tags;\n};\n')
+    print('ok  a GameplayTagContainer value is refused, as a default and as a UE_STRUCT member')
+
+
 def string_behaviour():
     import runscript
     check('StringTest', 'MakeKey', lambda Prefix, Index: Prefix + '_' + str(Index),
@@ -1528,6 +1548,7 @@ mod_enum()
 constants()
 types_behaviour()
 types_defaults()
+native_struct_values()
 string_behaviour()
 struct_behaviour()
 check('StructTest', 'MakeNative', lambda D: D + 0.5, [dict(D=d) for d in (0.0, 4.0)])
@@ -2028,6 +2049,463 @@ def globals_():
     print('ok  GlobalTest: both classes read and write the one object: =, op=, ++ and a postfix value')
 
 
+def edits():
+    """EditTest (S38): UE_ASSET_EDIT and UE_PATCH rewrite AssetTest's cooked packages in place. Only the named tags
+    change (replaced where they were, or appended); every name and import the package had keeps its index, a new one
+    is appended; an object a new tag points at is created before the edited object is serialized. The build's
+    roundtrip gate has already read every edited package back."""
+    import struct
+    game = lambda p: os.path.join(ROOT, 'AssetTest', 'FSD', 'Content', '_ElytrasMods', 'AssetTest', p)
+    edited = lambda p: os.path.join(ROOT, 'EditTest', 'FSD', 'Content', '_ElytrasMods', 'AssetTest', p)
+    tag_line = re.compile(r'^  (\w+) \[0\] (\w+ size=\d+[^:]*: ?.*)$', re.M)
+    tags = lambda base, i: {m.group(1): m.group(2) for m in tag_line.finditer(dump('dumptags.py', base, i))}
+
+    a, b = game('ED_AssetTest'), edited('ED_AssetTest')
+    before, after = tags(a, 0), tags(b, 0)
+    assert list(after) == list(before) + ['EnemySignificance'], (list(before), list(after))     # replaced in place, one appended
+    assert after['SpawnSpread'].endswith(': 800.0') and 'value=0' in after['CanBeUsedForConstantPressure'], after
+    assert after['EnemySignificance'] == 'ByteProperty size=8 enum=EEnemySignificance: EEnemySignificance::Critical', after
+    for same in ('EnemyClass', 'IdealSpawnSize'):
+        assert after[same] == before[same], (same, before[same], after[same])
+    la, lb = dumpexp.load(a), dumpexp.load(b)
+    assert lb[3][:len(la[3])] == la[3] and lb[4][:len(la[4])] == la[4], 'a name or an import moved'
+    raw = bytes.fromhex(after['VeteranClasses'].split()[-1])
+    vets = struct.unpack_from('<%di' % struct.unpack_from('<i', raw)[0], raw, 4)
+    paths = [ref(b, v) for v in vets]
+    assert paths == ['/Game/Enemies/Spider/Grunt/ED_Spider_Grunt.ED_Spider_Grunt',
+                     '/Game/Enemies/Spider/Exploder/ED_Spider_Exploder.ED_Spider_Exploder'], paths
+    assert -vets[1] - 1 >= len(la[4]), 'the Exploder was not a new import'
+    assert vets[1] in dumpexp.preload(b)[0][1], dumpexp.preload(b)[0]                # create before serialize
+    print('ok  EditTest: UE_ASSET_EDIT replaces and adds tags of a cooked asset, appending what the package lacks')
+
+    a, b = game('UMoodDef'), edited('UMoodDef')
+    ea, eb = dumpexp.load(a)[5], dumpexp.load(b)[5]
+    cdo = [e['name'] for e in ea].index('Default__UMoodDef_C')
+    before, after = tags(a, cdo), tags(b, cdo)
+    assert list(after) == list(before) + ['Tag'], (list(before), list(after))
+    assert after['Health'].endswith(': 42.0') and after['Count'].endswith(': 0') and after['Tag'].endswith(': tweaked'), after
+    assert after['Title'] == before['Title'] and after['Mood'] == before['Mood'], after
+    ua, ub = dumpexp.load(a), dumpexp.load(b)
+    blob = lambda l, e: l[1][e['off'] - l[2]:e['off'] - l[2] + e['size']]
+    for i, (x, y) in enumerate(zip(ea, eb)):
+        assert i == cdo or blob(ua, x) == blob(ub, y), 'export %s changed' % x['name']     # the class, its functions: the game's
+    print('ok  EditTest: UE_PATCH edits a Blueprint class\'s default object, and nothing else of its package')
+
+    import tempfile
+    game_dir = os.path.join(ROOT, 'AssetTest', 'FSD', 'Content')
+    for name, src, why, flags in (
+            ('EditOwn', 'UMoodDef MD = {.Count = 1};\nUE_ASSET_EDIT(MD) {.Count = 2};\n', 'the target is a UE_ASSET_AT',
+             ['--game', game_dir]),
+            ('EditNative', 'class Tweaks : public AActor {\n  UE_PATCH;\n  UE_DEFAULTS { bHidden = true; }\n};\n',
+             'a patch derives from the game Blueprint it edits', ['--game', game_dir]),
+            ('EditMember', 'class Tweaks : public UMoodDef {\n  UE_PATCH;\n  int32 Extra;\n  UE_DEFAULTS { Count = 1; }\n};\n',
+             'a member or an interface of its own is not built yet', ['--game', game_dir]),
+            ('EditNoGame', 'class Tweaks : public UMoodDef {\n  UE_PATCH;\n  UE_DEFAULTS { Count = 1; }\n};\n',
+             'pass the folder /Game is in', [])):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, name + '.cpp')
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write('#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\n#include "UeApi/FSD.h"\n'
+                        'UE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\n'
+                        'class UMoodDef : public UPrimaryDataAsset {\npublic:\n'
+                        '  UE_CLASS("/Game/_ElytrasMods/AssetTest/UMoodDef", "UMoodDef_C");\n  int32 Count;\n};\n%s' % (name, src))
+            proc = subprocess.run([ASSETGEN, 'compile', path, UEAPI, tmp] + flags, capture_output=True, encoding='utf-8')
+            assert proc.returncode != 0 and why in proc.stdout, (name, proc.stdout)
+    print('ok  EditTest: an edit of a mod\'s own asset, a patch of a native class, a patch with a member of its own, and '
+          'no --game are refused')
+
+    # A component's defaults. CompTest stands in for a game Blueprint, declared as UeApi declares one, and Lamp for one of
+    # its own SCS components: the patch lands in the Lamp's template. A parent Blueprint's component the class does not
+    # override has no template in its package, and a member UeApi gives no SCS node is not a component: both refused.
+    comp_game = os.path.join(ROOT, 'CompTest', 'FSD', 'Content')
+    decl = ('#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/LampEdit");\n'
+            'class Parent : public AActor {\npublic:\n  UE_CLASS("/Game/Fake/Parent", "Parent_C");\n  class USceneComponent* Ghost;\n'
+            '  static constexpr const char* Ghost__UeScsNode = "00000000000000000000000000000000";\n};\n'
+            'class CompTest : public Parent {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/CompTest/CompTest", "CompTest_C");\n'
+            '  class UPointLightComponent* Lamp;\n'
+            '  static constexpr const char* Lamp__UeScsNode = "00000000000000000000000000000000";\n'
+            '  class USceneComponent* Loose;\n};\n'
+            'class LampTweaks : public CompTest {\n  UE_PATCH;\n  UE_DEFAULTS { %s }\n};\n')
+    for body, why in (('Lamp->Intensity = 5000.0f; Lamp->AttenuationRadius = 900.0f;', None),
+                      ('Ghost->bVisible = false;', 'does not override that inherited component'),
+                      ('Loose->bVisible = false;', 'is not one of CompTest_C\'s components')):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'LampEdit.cpp')
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(decl % body)
+            out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'LampEdit')
+            os.makedirs(out)
+            proc = subprocess.run([ASSETGEN, 'compile', path, UEAPI, out, '--game', comp_game], capture_output=True, encoding='utf-8')
+            if why:
+                assert proc.returncode != 0 and why in proc.stdout, (body, proc.stdout)
+                continue
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+            a = os.path.join(comp_game, '_ElytrasMods', 'CompTest', 'CompTest')
+            b = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'CompTest', 'CompTest')
+            la, lb = dumpexp.load(a), dumpexp.load(b)
+            lamp = [e['name'] for e in la[5]].index('Lamp_GEN_VARIABLE')
+            before, after = tags(a, lamp), tags(b, lamp)
+            assert list(after) == list(before) + ['AttenuationRadius'], (list(before), list(after))    # Intensity replaced in place
+            assert after['Intensity'].endswith(': 5000.0') and after['AttenuationRadius'].endswith(': 900.0'), after
+            assert all(i == lamp or blob(la, x) == blob(lb, y) for i, (x, y) in enumerate(zip(la[5], lb[5]))), 'another export changed'
+    print('ok  EditTest: UE_PATCH edits a Blueprint\'s own component in its SCS template; an inherited one without an '
+          'override record, and a member that is no component, are refused')
+
+    # A method replaces the Blueprint's function of that name: CompTest's ReceiveBeginPlay (Ticks + 1) becomes Ticks + 5,
+    # run offline. `CompTest::ReceiveBeginPlay()` in it runs the game's body, kept beside it. A method the Blueprint
+    # lacks is added to it: a helper, or an override of what it inherits (AActor's ReceiveTick). A function the class's
+    # declaration has but its package lacks, and other parameters than the game's, are refused.
+    decl = ('#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/FnEdit");\n'
+            'class CompTest : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/CompTest/CompTest", "CompTest_C");\n'
+            '  int32 Ticks;\n  void ReceiveBeginPlay();\n  void Nope();\n};\n'
+            'class Tweaks : public CompTest {\n  UE_PATCH;\n  %s\n};\n')
+    for body, why, ticks, new in (
+            ('void ReceiveBeginPlay() { int32 Step = 5; Ticks = Ticks + Step; }', None, 6, []),
+            ('void ReceiveBeginPlay() { CompTest::ReceiveBeginPlay(); Ticks = Ticks + 5; }', None, 7, ['ReceiveBeginPlay__Vanilla']),
+            ('void ReceiveBeginPlay() { Ticks = Twice(Ticks) + 5; }\n  int32 Twice(int32 X) { return X * 2; }\n'
+             '  void ReceiveTick(float DeltaSeconds) { Ticks = Ticks + 1; }', None, 7, ['Twice', 'ReceiveTick']),
+            ('void Nope() { Ticks = 1; }', 'has no function of that name of its own', 0, []),
+            ('void ReceiveBeginPlay(int32 X) { Ticks = X; }', 'are not the game function\'s', 0, [])):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'FnEdit.cpp')
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(decl % body)
+            out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'FnEdit')
+            os.makedirs(out)
+            proc = subprocess.run([ASSETGEN, 'compile', path, UEAPI, out, '--game', comp_game], capture_output=True, encoding='utf-8')
+            if why:
+                assert proc.returncode != 0 and why in proc.stdout, (body, proc.stdout)
+                continue
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+            a = os.path.join(comp_game, '_ElytrasMods', 'CompTest', 'CompTest')
+            b = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'CompTest', 'CompTest')
+            for base, want in ((a, 2), (b, ticks)):
+                me = {'Ticks': 1}
+                run(base, 'ReceiveBeginPlay', self_vars=me)
+                assert me == {'Ticks': want}, (base, me)
+            la, lb = dumpexp.load(a), dumpexp.load(b)
+            assert sorted(e['name'] for e in lb[5][len(la[5]):]) == sorted(new), [e['name'] for e in lb[5]]
+            if 'ReceiveBeginPlay__Vanilla' in new:                  # the game's body, kept for the Parent:: call
+                me = {'Ticks': 1}
+                run(b, 'ReceiveBeginPlay__Vanilla', self_vars=me)
+                assert me == {'Ticks': 2}, me
+            if 'ReceiveTick' in new:                                # an override of AActor's event, which it names
+                me = {'Ticks': 1}
+                run(b, 'ReceiveTick', self_vars=me, DeltaSeconds=0.5)
+                assert me == {'Ticks': 2}, me
+                tick = dump('dumpstruct.py', b, [e['name'] for e in lb[5]].index('ReceiveTick'))
+                assert re.search(r"^SuperStruct imp\[\d+\]:Function'ReceiveTick'$", tick, re.M), tick
+            assert all(x['name'] == 'ReceiveBeginPlay' or new and x['name'] == 'CompTest_C' or blob(la, x) == blob(lb, y)
+                       for x, y in zip(la[5], lb[5])), 'another export changed'
+            proc = subprocess.run([ASSETGEN, 'roundtrip', tmp], capture_output=True, encoding='utf-8')
+            assert proc.returncode == 0, proc.stdout
+            n = 2 + len(new)
+            assert 'functions whose payload reads exactly (ReadFunctionLayout): %d of %d' % (n, n) in proc.stdout, proc.stdout
+            assert 'classes whose payload reads exactly (ReadClassLayout): 1 of 1' in proc.stdout, proc.stdout
+    # An RPC's game body is kept as a plain function: with its net flags it would be a net field of its own, shifting
+    # the class's RPCs against the game's, and a call to it would be routed again. The replacement keeps them.
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, 'RpcEdit.cpp')
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/RpcEdit");\n'
+                    'class ReplTest : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/ReplTest/ReplTest", "ReplTest_C");\n'
+                    '  int32 Local;\n  UE_CLIENT void ClientPing(int32 Seq);\n};\n'
+                    'class Tweaks : public ReplTest {\n  UE_PATCH;\n'
+                    '  void ClientPing(int32 Seq) { ReplTest::ClientPing(Seq); Local = Local + 1; }\n};\n')
+        out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'RpcEdit')
+        os.makedirs(out)
+        proc = subprocess.run([ASSETGEN, 'compile', path, UEAPI, out, '--game', os.path.join(ROOT, 'ReplTest', 'FSD', 'Content')],
+                              capture_output=True, encoding='utf-8')
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        b = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'ReplTest', 'ReplTest')
+        me = {}
+        run(b, 'ClientPing', self_vars=me, Seq=5)
+        assert me == {'Local': 6}, me
+        names = [e['name'] for e in dumpexp.load(b)[5]]
+        flags = lambda fn: int(re.search(r'^FunctionFlags (0x[0-9a-f]+)$', dump('dumpstruct.py', b, names.index(fn)), re.M).group(1), 16)
+        assert flags('ClientPing') & 0x01000040 == 0x01000040 and flags('ClientPing__Vanilla') & 0x01000040 == 0, \
+            (hex(flags('ClientPing')), hex(flags('ClientPing__Vanilla')))       # FUNC_Net | FUNC_NetClient
+        proc = subprocess.run([ASSETGEN, 'roundtrip', tmp], capture_output=True, encoding='utf-8')
+        assert proc.returncode == 0 and 'classes whose payload reads exactly (ReadClassLayout): 1 of 1' in proc.stdout, proc.stdout
+    print('ok  EditTest: a UE_PATCH method replaces the Blueprint\'s function of that name, Parent:: reaching the game\'s body '
+          '(an RPC\'s as a plain function), or is added to it (a helper, an override); a stale declaration and other '
+          'parameters are refused')
+
+    # A namespace-scope variable a patch's method uses is the one member of a class of its own (LowerGlobal), cooked into
+    # the mod's package as a class's global is: the patched function reads and writes that class's default object.
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, 'GlobalEdit.cpp')
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/GlobalEdit");\n'
+                    'class CompTest : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/CompTest/CompTest", "CompTest_C");\n'
+                    '  int32 Ticks;\n  void ReceiveBeginPlay();\n};\n'
+                    'int32 Step = 5;\n'
+                    'class Tweaks : public CompTest {\n  UE_PATCH;\n'
+                    '  void ReceiveBeginPlay() { Ticks = Ticks + Step; Step = Step + 1; }\n};\n')
+        out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'GlobalEdit')
+        os.makedirs(out)
+        proc = subprocess.run([ASSETGEN, 'compile', path, UEAPI, out, '--game', comp_game], capture_output=True, encoding='utf-8')
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert os.path.exists(os.path.join(out, 'Step.uasset')), 'the global\'s class was not cooked: %s' % os.listdir(out)
+        assert global_default(out, 'Step', 'Step') == '5'
+        step = Obj('Step_C', Step=5)
+        vm = VM(os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'CompTest', 'CompTest'),
+                objects={'Default__Step_C': step}, Ticks=1)
+        vm.call('ReceiveBeginPlay')
+        assert vm.self.vars == {'Ticks': 6} and step.vars == {'Step': 6}, (vm.self.vars, step.vars)
+    print('ok  EditTest: a namespace-scope variable a UE_PATCH method uses has its class cooked, whose default object the '
+          'patched function reads and writes')
+
+
+def path_edits():
+    """S38: a patch's UE_DEFAULTS path assigns part of a member's value on TypesTest's default object - a native
+    struct's member inside an element (Points[1].Y), a member of a struct written as tags inside one (Spans[0].Max), a
+    whole element (Spans[1]) - and the rest of each value stays the cook's bytes. A member the default object has no
+    value of takes only a path of members of structs written as tags (Home is native); an index past the end is
+    refused."""
+    import struct, tempfile
+    from dumptags import tags as read_tags
+    a = os.path.join(ROOT, 'TypesTest', 'FSD', 'Content', '_ElytrasMods', 'TypesTest', 'TypesTest')
+    decl = ('#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/PathEdit");\n'
+            'class TypesTest : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/TypesTest/TypesTest", "TypesTest_C");\n'
+            '  FVector Home;\n  TArray<FVector> Points;\n  TArray<FFloatInterval> Spans;\n};\n'
+            'class Tweaks : public TypesTest {\n  UE_PATCH;\n  UE_DEFAULTS { %s }\n};\n')
+    blob = lambda l, e: l[1][e['off'] - l[2]:e['off'] - l[2] + e['size']]
+
+    def value(base, name):
+        """The default object's tag `name`: its value's bytes, and the package's names."""
+        l = dumpexp.load(base)
+        text = dump('dumptags.py', base, [e['name'] for e in l[5]].index('Default__TypesTest_C'))
+        return bytes.fromhex(re.search(r'^  %s \[0\] \w+ size=\d+[^:]*: ([0-9a-f]*)$' % name, text, re.M).group(1)), l[3]
+
+    def spans(base):
+        """Spans' elements, each its members' values: after the count, the inner tag (49 bytes), then tag lists."""
+        b, names = value(base, 'Spans')
+        at, out = 4 + 49, []
+        for _ in range(struct.unpack_from('<i', b)[0]):
+            lines = []
+            at = read_tags(b, at, len(b), names, 0, lines)
+            out.append([l.split(': ')[-1] for l in lines])
+        assert at == len(b) and struct.unpack_from('<i', b, 4 + 16)[0] == len(b) - 4 - 49, (at, len(b))    # the inner tag's Size
+        return out
+
+    points = lambda base: struct.unpack_from('<6f', value(base, 'Points')[0], 4 + 49)
+    assert points(a) == (1, 2, 3, 4, 5, 6) and spans(a) == [['1.0', '5.0'], ['-2.0', '2.0']], (points(a), spans(a))
+    for body, why in (('Points[1].Y = 50.0f; Spans[0].Max = 9.0f; Spans[1] = FFloatInterval{3.0f, 4.0f};', None),
+                      ('Home.Z = 1.0f;', 'Home is not set on Default__TypesTest_C'),
+                      ('Points[2].X = 1.0f;', 'Points has 2 elements')):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'PathEdit.cpp')
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(decl % body)
+            out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'PathEdit')
+            os.makedirs(out)
+            proc = subprocess.run([ASSETGEN, 'compile', path, UEAPI, out, '--game', os.path.join(ROOT, 'TypesTest', 'FSD', 'Content')],
+                                  capture_output=True, encoding='utf-8')
+            if why:
+                assert proc.returncode != 0 and why in proc.stdout, (body, proc.stdout)
+                continue
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+            b = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'TypesTest', 'TypesTest')
+            assert points(b) == (1, 2, 3, 4, 50, 6) and spans(b) == [['1.0', '9.0'], ['3.0', '4.0']], (points(b), spans(b))
+            la, lb = dumpexp.load(a), dumpexp.load(b)
+            cdo = [e['name'] for e in la[5]].index('Default__TypesTest_C')
+            other = lambda base: [l for l in dump('dumptags.py', base, cdo).splitlines() if not l.startswith(('  Points ', '  Spans '))]
+            assert other(a) == other(b), 'another tag changed'
+            assert all(i == cdo or blob(la, x) == blob(lb, y) for i, (x, y) in enumerate(zip(la[5], lb[5]))), 'another export changed'
+            proc = subprocess.run([ASSETGEN, 'roundtrip', tmp], capture_output=True, encoding='utf-8')
+            assert proc.returncode == 0, proc.stdout
+    print('ok  EditTest: a UE_DEFAULTS path assigns part of a value - a native struct\'s member, a tagged one\'s, an '
+          'element - keeping the rest of it; a native member with no value, and an index past the end, are refused')
+
+    # UE_ASSET_EDITS: the same paths into a data asset, AssetTest's ED_AssetTest. The element's new object is one the
+    # package does not import yet; a whole member beside it.
+    a = os.path.join(ROOT, 'AssetTest', 'FSD', 'Content', '_ElytrasMods', 'AssetTest', 'ED_AssetTest')
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, 'AssetEdits.cpp')
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/AssetEdits");\n'
+                    'UE_ASSET_AT(UEnemyDescriptor, ED_Spider_Exploder, "/Game/Enemies/Spider/Exploder/ED_Spider_Exploder");\n'
+                    'UE_ASSET_AT(UEnemyDescriptor, ED_AssetTest, "/Game/_ElytrasMods/AssetTest/ED_AssetTest");\n'
+                    'UE_ASSET_EDITS {\n  ED_AssetTest.VeteranClasses[0] = &ED_Spider_Exploder;\n  ED_AssetTest.IdealSpawnSize = 9;\n}\n')
+        out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'AssetEdits')
+        os.makedirs(out)
+        proc = subprocess.run([ASSETGEN, 'compile', path, UEAPI, out, '--game', os.path.join(ROOT, 'AssetTest', 'FSD', 'Content')],
+                              capture_output=True, encoding='utf-8')
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        b = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'AssetTest', 'ED_AssetTest')
+        la, lb = dumpexp.load(a), dumpexp.load(b)
+        assert lb[4][:len(la[4])] == la[4] and [i for i in lb[4][len(la[4]):] if 'Exploder' in i], lb[4]     # appended
+        exploder = -1 - lb[4].index(next(i for i in lb[4][len(la[4]):] if i.endswith("'ED_Spider_Exploder'")))
+        before, after = dump('dumptags.py', a, 0).splitlines(), dump('dumptags.py', b, 0).splitlines()
+        changed = [(x.split(':')[0].strip(), y.split(': ')[-1]) for x, y in zip(before, after) if x != y]
+        assert len(before) == len(after) and changed == [
+            ('VeteranClasses [0] ArrayProperty size=8 inner=ObjectProperty', (struct.pack('<ii', 1, exploder)).hex()),
+            ('IdealSpawnSize [0] IntProperty size=4', '9')], changed
+        proc = subprocess.run([ASSETGEN, 'roundtrip', tmp], capture_output=True, encoding='utf-8')
+        assert proc.returncode == 0, proc.stdout
+    print('ok  EditTest: UE_ASSET_EDITS assigns a data asset\'s members and parts of them by path, an element\'s new '
+          'object imported')
+
+
+def game_edits():
+    """S38 on the game's own packages (--game): ED_Spider_Grunt and the grunt Blueprint's class defaults, edited as
+    BpMods' GruntTweaks does. Only the named tags differ from the cook's; every other export is its bytes."""
+    if not GAME or not os.path.exists(os.path.join(UEAPI, 'Game', 'ENE_Spider_Grunt_Normal_C.h')):
+        print('--  S38 on the game\'s own packages: skipped (needs --game <extracted pak>/FSD/Content and UeApi/Game)')
+        return
+    import tempfile
+    tag_line = re.compile(r'^  (\w+) \[0\] (\w+ size=\d+[^:]*: ?.*)$', re.M)
+    tags = lambda base, i: {m.group(1): m.group(2) for m in tag_line.finditer(dump('dumptags.py', base, i))}
+    blob = lambda l, e: l[1][e['off'] - l[2]:e['off'] - l[2] + e['size']]
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, 'GameEdit.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\n#include "UeApi/FSD.h"\n'
+                    '#include "UeApi/Game/ENE_Spider_Grunt_Normal_C.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/GameEdit");\n'
+                    'UE_ASSET_AT(UEnemyDescriptor, ED_Spider_Grunt, "/Game/Enemies/Spider/Grunt/ED_Spider_Grunt");\n'
+                    'UE_ASSET_EDIT(ED_Spider_Grunt) {.SpawnSpread = 800.0f, .IdealSpawnSize = 12};\n'
+                    'class GruntTweaks : public ENE_Spider_Grunt_Normal_C {\n  UE_PATCH;\n'
+                    '  UE_DEFAULTS {\n    CustomTimeDilation = 0.5f;\n'
+                    '    HealthComponent->MaxHealth = 180.0f;\n'       # a native class's component: its default subobject
+                    '    MeleeAttack->CenterOnTarget = true;\n'       # the Blueprint's own SCS component: its template
+                    '    enemy->mixerName = "Grunty";\n  }\n'         # a parent's component it overrides: the record's template
+                    '  void GetEnemySpawnedCount(int& SpawnCount) {\n'
+                    '    ENE_Spider_Grunt_Normal_C::GetEnemySpawnedCount(SpawnCount);\n'   # the game's body, kept
+                    '    SpawnCount = SpawnCount + 41;\n  }\n};\n')
+        out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'GameEdit')
+        os.makedirs(out)
+        proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, out, '--game', GAME], capture_output=True, encoding='utf-8')
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        proc = subprocess.run([ASSETGEN, 'roundtrip', tmp], capture_output=True, encoding='utf-8')
+        assert proc.returncode == 0, proc.stdout
+        game = lambda p: os.path.join(GAME, *p.split('/'))
+        edited = lambda p: os.path.join(tmp, 'FSD', 'Content', *p.split('/'))
+
+        a, b = game('Enemies/Spider/Grunt/ED_Spider_Grunt'), edited('Enemies/Spider/Grunt/ED_Spider_Grunt')
+        before, after = tags(a, 0), tags(b, 0)
+        assert list(after) == list(before) and {k for k in before if before[k] != after[k]} == {'SpawnSpread', 'IdealSpawnSize'}, after
+        assert after['SpawnSpread'].endswith(': 800.0') and after['IdealSpawnSize'].endswith(': 12'), after
+
+        a, b = game('Enemies/Spider/Grunt/ENE_Spider_Grunt_Normal'), edited('Enemies/Spider/Grunt/ENE_Spider_Grunt_Normal')
+        la, lb = dumpexp.load(a), dumpexp.load(b)
+        names = [e['name'] for e in la[5]]
+        added = {'Default__ENE_Spider_Grunt_Normal_C': ('CustomTimeDilation', ': 0.5'), 'HealthComponent': ('MaxHealth', ': 180.0'),
+                 'MeleeAttack_GEN_VARIABLE': ('CenterOnTarget', 'value=1:'), 'Enemy_GEN_VARIABLE': ('mixerName', ": 'Grunty'")}
+        for name, (tag, value) in added.items():
+            before, after = tags(a, names.index(name)), tags(b, names.index(name))
+            assert list(after) == list(before) + [tag] and after[tag].rstrip().endswith(value), (name, list(before), after)
+        assert all(x['name'] in added or x['name'] in ('GetEnemySpawnedCount', 'ENE_Spider_Grunt_Normal_C') or blob(la, x) == blob(lb, y)
+                   for x, y in zip(la[5], lb[5])), 'another export changed'
+        assert [e['name'] for e in lb[5][len(la[5]):]] == ['GetEnemySpawnedCount__Vanilla'], [e['name'] for e in lb[5]]
+        assert lb[3][:len(la[3])] == la[3] and lb[4][:len(la[4])] == la[4], 'a name or an import moved'   # + Add_IntInt's
+        # The replaced function: the game's (sets 1), then the patch's, which calls the game's body, kept, and adds 41.
+        # Its parameter stays the game's output pin.
+        assert run(a, 'GetEnemySpawnedCount')[1] == {'SpawnCount': 1} and run(b, 'GetEnemySpawnedCount')[1] == {'SpawnCount': 42}
+        assert run(b, 'GetEnemySpawnedCount__Vanilla')[1] == {'SpawnCount': 1}
+        fn = names.index('GetEnemySpawnedCount')
+        parm = lambda base: re.search(r'^  IntProperty SpawnCount .*$', dump('dumpstruct.py', base, fn), re.M).group(0)
+        assert parm(a) == parm(b) and 'flags=0x180 ' in parm(b), (parm(a), parm(b))
+
+        # The grunt's Sphere is its parent's component, which it does not override: no template to edit.
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\n#include "UeApi/FSD.h"\n'
+                    '#include "UeApi/Game/ENE_Spider_Grunt_Normal_C.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/GameEdit");\n'
+                    'class GruntTweaks : public ENE_Spider_Grunt_Normal_C {\n  UE_PATCH;\n'
+                    '  UE_DEFAULTS { Sphere->SphereRadius = 10.0f; }\n};\n')
+        proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, out, '--game', GAME], capture_output=True, encoding='utf-8')
+        assert proc.returncode != 0 and 'does not override that inherited component' in proc.stdout, proc.stdout
+
+    # Paths into the grunt's values: PrimaryActorTick, which its default object has no value of, becomes a tag holding
+    # only bCanEverTick (the engine fills the rest in from the parent's); one element of MeleeAttack's Montages; one
+    # element of an array inside SimpleArmorDamage's ArmorBreakEffects struct. Both objects are imports already.
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, 'GamePaths.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\n#include "UeApi/FSD.h"\n'
+                    '#include "UeApi/Game/ENE_Spider_Grunt_Normal_C.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/GamePaths");\n'
+                    'UE_ASSET_AT(UAnimMontage, ANIM_Spider_Grunt_Attack_I, "/Game/Enemies/Spider/Animation/ANIM_Spider_Grunt_Attack_I");\n'
+                    'UE_ASSET_AT(UParticleSystem, P_SpiderGrunt_Armor_Debris, '
+                    '"/Game/Enemies/Spider/Particles/P_SpiderGrunt_Armor_Debris");\n'
+                    'class GruntPaths : public ENE_Spider_Grunt_Normal_C {\n  UE_PATCH;\n  UE_DEFAULTS {\n'
+                    '    PrimaryActorTick.bCanEverTick = true;\n'
+                    '    MeleeAttack->Montages[0] = &ANIM_Spider_Grunt_Attack_I;\n'
+                    '    SimpleArmorDamage->ArmorBreakEffects.DissolveParticles[0] = &P_SpiderGrunt_Armor_Debris;\n  }\n};\n'
+                    'UE_ASSET_AT(UEnemyDescriptor, ED_Spider_Grunt, "/Game/Enemies/Spider/Grunt/ED_Spider_Grunt");\n'
+                    'UE_ASSET_EDITS { ED_Spider_Grunt.SpawnRarityModifiers[1].Rarity = 2.0f; }\n')
+        out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'GamePaths')
+        os.makedirs(out)
+        proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, out, '--game', GAME], capture_output=True, encoding='utf-8')
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        a, b = game('Enemies/Spider/Grunt/ENE_Spider_Grunt_Normal'), os.path.join(tmp, 'FSD', 'Content', 'Enemies', 'Spider', 'Grunt', 'ENE_Spider_Grunt_Normal')
+        la, lb = dumpexp.load(a), dumpexp.load(b)
+        assert lb[4] == la[4], 'an import was added'
+        cdo, melee, armor = (names.index(n) for n in ('Default__ENE_Spider_Grunt_Normal_C', 'MeleeAttack_GEN_VARIABLE',
+                                                        'SimpleArmorDamage_GEN_VARIABLE'))
+        before, after = dump('dumptags.py', a, cdo).splitlines(), dump('dumptags.py', b, cdo).splitlines()
+        assert after[:len(before)] == before and [l.split(' size=')[0] for l in after[len(before):]] == \
+            ['  PrimaryActorTick [0] StructProperty', '    bCanEverTick [0] BoolProperty'] and after[-1].endswith('value=1: '), after
+        assert tags(a, melee)['Montages'].endswith(': 02000000fffffffffeffffff'), tags(a, melee)
+        assert tags(b, melee)['Montages'].endswith(': 02000000fefffffffeffffff'), tags(b, melee)     # -1 -> -2, Attack_I
+        before, after = dump('dumptags.py', a, armor).splitlines(), dump('dumptags.py', b, armor).splitlines()
+        changed = [(x.strip(), y.strip()) for x, y in zip(before, after) if x != y]
+        assert len(before) == len(after) and [(x.split(':')[0], y.split(':')[0]) for x, y in changed[:1]] == \
+            [('ArmorBreakEffects [0] StructProperty size=90 struct=ArmorDamageEffects',) * 2] and changed[1:] == \
+            [('DissolveParticles [0] ArrayProperty size=8 inner=ObjectProperty: 01000000b4ffffff',       # its nested line:
+              'DissolveParticles [0] ArrayProperty size=8 inner=ObjectProperty: 01000000b3ffffff')], changed   # -76 -> -77
+        assert all(i in (cdo, melee, armor) or blob(la, x) == blob(lb, y) for i, (x, y) in enumerate(zip(la[5], lb[5]))), 'another export changed'
+
+        # UE_ASSET_EDITS on ED_Spider_Grunt: Rarity in one element of SpawnRarityModifiers, each element a tag list
+        # after the array's inner tag. (The game's own values there are uninitialized memory from its cook: kept.)
+        import struct
+        from dumptags import tags as read_tags
+        def rarities(base):
+            b, at, out = bytes.fromhex(tags(base, 0)['SpawnRarityModifiers'].split(': ')[-1]), 4 + 49, []
+            for _ in range(struct.unpack_from('<i', b)[0]):
+                out.append([])
+                at = read_tags(b, at, len(b), dumpexp.load(base)[3], 0, out[-1])
+            return out
+        ra = rarities(game('Enemies/Spider/Grunt/ED_Spider_Grunt'))
+        rb = rarities(os.path.join(tmp, 'FSD', 'Content', 'Enemies', 'Spider', 'Grunt', 'ED_Spider_Grunt'))
+        assert len(ra) == 4 and rb[:1] + rb[2:] == ra[:1] + ra[2:] and rb[1][0] == ra[1][0] \
+            and rb[1][1] == 'Rarity [0] FloatProperty size=4: 2.0' and ra[1][1] != rb[1][1], (ra, rb)
+        proc = subprocess.run([ASSETGEN, 'roundtrip', tmp], capture_output=True, encoding='utf-8')
+        assert proc.returncode == 0, proc.stdout
+    print('ok  S38 on the game: ED_Spider_Grunt, the grunt Blueprint\'s defaults, three kinds of its components, and one '
+          'function replaced around the game\'s body, kept; paths into four of its values; the rest the cook\'s bytes')
+
+
+def edit_staleness():
+    """bpbuild counts a game package a mod's compile edited among its outputs: found in the staged Content tree outside
+    the mod's own folder, with a copy in game_content (an embedded dep's folder has none). A newer game copy, from a
+    re-extract after a game update, restales the mod, so an edit of the old package does not ship."""
+    import tempfile
+    sys.path.insert(0, HERE)
+    import bpbuild
+    with tempfile.TemporaryDirectory() as tmp:
+        stage_fsd = os.path.join(tmp, 'build', 'Mod', 'FSD')
+        own = os.path.join(stage_fsd, 'Content', '_ElytrasMods', 'Mod')
+        game = os.path.join(tmp, 'game')
+        def touch(p, t=None):
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            open(p, 'wb').close()
+            if t: os.utime(p, (t, t))
+        touch(os.path.join(own, 'Mod.uasset'))
+        touch(os.path.join(own + 'Two', 'Other.uasset'))                       # shares the prefix, not the folder
+        touch(os.path.join(stage_fsd, 'Content', '_ElytrasMods', 'Dep', 'Dep.uasset'))
+        touch(os.path.join(stage_fsd, 'Content', 'Enemies', 'Grunt', 'G.uasset'), 1000)
+        touch(os.path.join(game, 'Enemies', 'Grunt', 'G.uasset'), 500)
+        touch(os.path.join(game, '_ElytrasMods', 'ModTwo', 'Other.uasset'), 500)
+        edits = lambda: bpbuild.staged_edits(stage_fsd, own, game)
+        assert sorted(os.path.basename(s) for s, _g in edits()) == ['G.uasset', 'Other.uasset'], edits()
+        assert bpbuild.staged_edits(stage_fsd, own, None) == []
+        newer = lambda: any(os.path.getmtime(g) > os.path.getmtime(s) for s, g in edits())
+        assert not newer()
+        os.utime(os.path.join(game, 'Enemies', 'Grunt', 'G.uasset'), (2000, 2000))
+        assert newer()
+    print('ok  bpbuild: an edited game package is a mod\'s output, restaled by a newer game copy; an embedded dep is not one')
+
+
 interfaces()
 interface_bodies()
 interface_calls()
@@ -2040,6 +2518,10 @@ static_assets()
 ue_assets()
 asset_elsewhere()
 globals_()
+edits()
+path_edits()
+game_edits()
+edit_staleness()
 
 
 # ---- SoftTest

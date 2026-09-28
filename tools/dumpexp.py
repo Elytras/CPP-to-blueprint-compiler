@@ -61,6 +61,39 @@ def load(base):
     if not ue: ue, total = ua, 0
     return ua, ue, total, names, imports, exports
 
+def preload(base):
+    """Each export's EDL preload dependencies, as FPackageIndex lists: serialize-before-serialize, create-before-
+    serialize, serialize-before-create, create-before-create. A cooked package only (the summary walk of Cooked.cpp)."""
+    ua = open(base + ".uasset", "rb").read()
+    r = R(ua, 8)                                # past the tag and LegacyFileVersion (-7)
+    def skip(size):                             # a counted array of fixed-size rows. Not `r.o += size * r.i32()`:
+        n = r.i32(); r.o += size * n            # that reads r.o first, and drops the count's own 4 bytes
+    r.o += 12                                  # LegacyUE3Version, FileVersionUE4, licensee
+    skip(20)                                    # custom versions
+    r.i32(); r.fstr(); r.u32()                  # TotalHeaderSize, FolderName, PackageFlags
+    r.o += 16                                   # names, gatherable text
+    ecount, eoff = r.i32(), r.i32()
+    r.o += 8 + 4 + 8 + 4 + 4 + 16               # imports, depends, soft package references, searchable names, thumbnails, guid
+    skip(8)                                     # generations
+    for _ in range(2):                          # saved-by and compatible-with engine versions
+        r.o += 10; r.fstr()
+    r.u32(); skip(16)                           # compression flags, compressed chunks
+    r.u32()                                     # PackageSource
+    for _ in range(r.i32()): r.fstr()           # additional packages to cook
+    r.i32(); r.i64(); r.i32()                   # asset registry, bulk data start, world tile info
+    skip(4)                                     # chunk ids
+    count, off = r.i32(), r.i32()
+    deps = struct.unpack_from('<%di' % count, ua, off)
+    out = []
+    for k in range(ecount):
+        first, *counts = struct.unpack_from('<5i', ua, eoff + 104 * k + 84)
+        lists, at = [], first
+        for n in counts:
+            lists.append(list(deps[at:at + n]) if first >= 0 else [])
+            at += n
+        out.append(lists)
+    return out
+
 def pidx(v, imports, exports):
     if v == 0: return "null"
     if v < 0:

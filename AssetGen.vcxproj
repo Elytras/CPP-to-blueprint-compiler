@@ -74,6 +74,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="Blueprint.h" />
+    <ClInclude Include="Cooked.h" />
     <ClInclude Include="Cpp.h" />
     <ClInclude Include="Package.h" />
     <ClInclude Include="Registry.h" />
@@ -84,6 +85,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Blueprint.cpp" />
+    <ClCompile Include="Cooked.cpp" />
     <ClCompile Include="Cpp.cpp" />
     <ClCompile Include="Main.cpp" />
     <ClCompile Include="Verify.cpp" />

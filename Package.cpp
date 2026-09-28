@@ -152,6 +152,8 @@ void FArc::Raw(const void* P, size_t N)
     B.insert(B.end(), Bytes, Bytes + N);
 }
 
+void FArc::Idx(FIndex V) { I32(Pkg && Pkg->RemapIndex ? Pkg->RemapIndex(V).V : V.V); }
+
 void FArc::Str(const std::string& S) { WriteFString(B, S); }
 
 void FArc::Name(const std::string& S, int32 Number)
@@ -251,14 +253,36 @@ int32 FPackage::NameIndex(const std::string& S)
     SplitName(S, Base, Number);
 
     const std::string Key = Lower(Base);
+    if (bAppendNames)
+        if (auto Exact = ExactNames.find(Base); Exact != ExactNames.end()) return Exact->second;
     auto It = NameLookup.find(Key);
     if (It != NameLookup.end()) return It->second;
+    if (bAppendNames)
+    {
+        NameLookup.emplace(Key, int32(Names.size()));
+        ExactNames.emplace(Base, int32(Names.size()));
+        Names.push_back(Base);
+        return int32(Names.size()) - 1;
+    }
 
     // Pass one returns 0 for everything; every FName is 8 bytes regardless, so sizes still line up.
     if (bNamesFinal) return 0;
     NameLookup.emplace(Key, 0);
     Names.push_back(Base);
     return 0;
+}
+
+void FPackage::SeedNames(const std::vector<std::string>& Existing)
+{
+    Names = Existing;
+    NameLookup.clear();
+    ExactNames.clear();
+    for (int32 I = 0; I < int32(Names.size()); ++I)
+    {
+        NameLookup.emplace(Lower(Names[size_t(I)]), I);     // the first of a case pair
+        ExactNames.emplace(Names[size_t(I)], I);
+    }
+    bNamesFinal = bAppendNames = true;
 }
 
 bool FPackage::Save(const std::string& OutBaseNoExt, std::string* Err) const

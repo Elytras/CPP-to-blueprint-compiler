@@ -26,6 +26,7 @@ static int ProcessId() { return getpid(); }
 #include <nlohmann/json.hpp>
 
 #include "Blueprint.h"
+#include "Cooked.h"
 #include "Package.h"
 #include "Registry.h"
 #include "Script.h"
@@ -180,12 +181,106 @@ void ExpandAliases(Json& N, const std::map<std::string, std::string>& InScope)
 
 /* A CXXOperatorCallExpr whose callee is operator=: struct assignment, which clang does not spell
    as a BinaryOperator. The callee is the first inner node. */
+/* A UE_ASSET_AT path: "/Game/Dir/Pkg.Object" names an object other than the package's namesake, "/Game/Dir/Pkg" means
+   Pkg.Pkg. Path becomes the package; the object's name is returned. */
+std::string SplitAssetPath(std::string& Path)
+{
+    std::string Object = Path.substr(Path.rfind('/') + 1);
+    if (const size_t Dot = Object.find('.'); Dot != std::string::npos)
+    {
+        Path.resize(Path.size() - (Object.size() - Dot));
+        Object = Object.substr(Dot + 1);
+    }
+    return Object;
+}
+
 bool IsAssignOperatorCall(const Json& N)
 {
     const Json* Callee = Strip(First(N));
     if (!Callee || Kind(*Callee) != "DeclRefExpr") return false;
     auto Ref = Callee->find("referencedDecl");
     return Ref != Callee->end() && Ref->value("name", std::string()) == "operator=";
+}
+
+bool IsIndexOperatorCall(const Json& N)
+{
+    const Json* Callee = Strip(First(N));
+    if (!Callee || Kind(*Callee) != "DeclRefExpr") return false;
+    auto Ref = Callee->find("referencedDecl");
+    return Ref != Callee->end() && Ref->value("name", std::string()) == "operator[]";
+}
+
+/* An assignment statement's two sides. Assigning a struct is an operator call, not a BinaryOperator: its inner is the
+   callee then the two operands, so both shapes are read the same way one index on. */
+bool AssignmentSides(const Json& S, const Json*& Lhs, const Json*& Rhs)
+{
+    const Json* Assign = Strip(&S);
+    const std::string AK = Assign ? Kind(*Assign) : std::string();
+    const bool bOpCall = AK == "CXXOperatorCallExpr";
+    const size_t Base = bOpCall ? 1 : 0;
+    Lhs = Assign ? Strip(Nth(*Assign, Base)) : nullptr;
+    Rhs = Assign ? Nth(*Assign, Base + 1) : nullptr;
+    const bool bAssign = bOpCall ? IsAssignOperatorCall(*Assign)
+                                 : AK == "BinaryOperator" && Assign->value("opcode", std::string()) == "=";
+    return Assign && bAssign && Lhs && Rhs;
+}
+
+/* One UE_DEFAULTS statement, `Field = value;` or `Component->Field = value;`: the field's MemberExpr, the value, and
+   the component's MemberExpr it reaches through (null for none). False for any other statement. */
+bool DefaultAssignment(const Json& S, const Json*& Lhs, const Json*& Rhs, const Json*& Through)
+{
+    if (!AssignmentSides(S, Lhs, Rhs) || Kind(*Lhs) != "MemberExpr") return false;
+    const Json* Owner = Strip(First(*Lhs));
+    Through = Owner && Kind(*Owner) == "MemberExpr" ? Owner : nullptr;
+    return true;
+}
+
+/* A patch's UE_DEFAULTS statement, which may also assign part of a member's value: DefaultAssignment's `Field` or
+   `Component->Field`, then any `.Member` and `[i]` into it (`PrimaryActorTick.bCanEverTick = v`, `Spans[1].Max = v`).
+   Root is the field's MemberExpr, Steps each `.Member`'s MemberExpr or `[i]`'s operator call, from the root out. */
+bool DefaultPath(const Json& S, const Json*& Root, const Json*& Rhs, const Json*& Through, std::vector<const Json*>& Steps)
+{
+    const Json* E = nullptr;
+    if (!AssignmentSides(S, E, Rhs)) return false;
+    Steps.clear();
+    for (;;)
+    {
+        const std::string K = Kind(*E);
+        const Json* Next = K == "MemberExpr" && !E->value("isArrow", false) ? Strip(First(*E))
+                         : K == "CXXOperatorCallExpr" && IsIndexOperatorCall(*E) ? Strip(Nth(*E, 1)) : nullptr;
+        if (!Next) break;
+        Steps.insert(Steps.begin(), E);
+        E = Next;
+    }
+    if (Kind(*E) != "MemberExpr") return false;
+    Root = E;
+    const Json* Owner = Strip(First(*E));
+    Through = Owner && Kind(*Owner) == "MemberExpr" ? Owner : nullptr;
+    return true;
+}
+
+/* A UE_ASSET_EDITS statement: `Asset.Member = value`, then any `.Member` and `[i]` into the member's value. Asset is
+   the DeclRefExpr naming the asset's variable, Root the member's MemberExpr, Steps as DefaultPath's. */
+bool AssetPath(const Json& S, const Json*& Asset, const Json*& Root, const Json*& Rhs, std::vector<const Json*>& Steps)
+{
+    const Json* E = nullptr;
+    if (!AssignmentSides(S, E, Rhs)) return false;
+    Steps.clear();
+    for (;;)
+    {
+        const std::string K = Kind(*E);
+        const Json* Next = K == "MemberExpr" ? Strip(First(*E))
+                         : K == "CXXOperatorCallExpr" && IsIndexOperatorCall(*E) ? Strip(Nth(*E, 1)) : nullptr;
+        if (!Next) return false;
+        if (K == "MemberExpr" && Kind(*Next) == "DeclRefExpr")
+        {
+            Asset = Next;
+            Root = E;
+            return true;
+        }
+        Steps.insert(Steps.begin(), E);
+        E = Next;
+    }
 }
 
 /* A clang StringLiteral spelling (prefix, quotes, escapes) as UTF-8. clang escapes a narrow
@@ -386,9 +481,10 @@ struct FRecord
     bool bIsLocal = false;      // UePackage == ModPackage/CppName: cooked here, published at its /Game path
     bool bIsStruct = false;     // UE_STRUCT: cooked as a UserDefinedStruct asset
     bool bIsInterface = false;  // UE_INTERFACE: cooked as a BPGC whose super is UInterface
+    bool bIsPatch = false;      // UE_PATCH: not a class of its own; its UE_DEFAULTS edit its parent's, in the parent's package
 
     bool IsNative() const { return !UePackage.empty() && !bIsLocal; }
-    bool IsGenerated() const { return !IsNative() && (bIsStruct || bIsInterface || !Base.empty()); }
+    bool IsGenerated() const { return !IsNative() && !bIsPatch && (bIsStruct || bIsInterface || !Base.empty()); }
     /* A UserDefinedStruct: cooked here, or cooked by the mod its UE_STRUCT_IN names and imported. */
     bool IsModStruct() const { return bIsStruct && (UePackage.empty() || UePackage.compare(0, 6, "/Game/") == 0); }
 };
@@ -973,10 +1069,38 @@ class FCompiler
 public:
     bool Run(const std::string& SourcePath, const std::string& IncludeDir,
              const std::string& OutDir, const std::optional<std::string>& InApiDir, std::string* Err);
+    std::string GameDir;        // `--game`: the folder /Game is in, in the extracted game pak - what an edit reads
 
 private:
     bool Collect(std::string* Err);
     bool Generate(const FRecord& R, const std::string& OutDir, std::string* Err);
+    /* S38: UE_ASSET_EDIT and UE_PATCH, the game's own packages with only the named tags changed. */
+    bool GenerateEdit(const std::string& Key, const Json& Var, std::string* Err);
+    bool GeneratePatch(const FRecord& R, std::string* Err);
+    bool PatchDefaults(const FRecord& Bp, const Json& Body, const std::string& Where, std::string* Err);
+    /* One assignment of an edit: to a member (Path empty, Chain the member alone), or to part of its value - Chain
+       then holds the member and the def each step of Path reaches, the last the value written. The last carries the
+       value either way. */
+    struct FEditDef { std::vector<FPropertyDef> Chain; std::vector<FValueStep> Path; };
+    bool EditStep(const Json& Step, const FPropertyDef& Parent, const std::string& Where, FBlueprintClass& BP,
+                  FValueStep& Out, FPropertyDef& Reached, std::string* Err);
+    bool EditAssignment(const Json& Root, const FRecord& Declarer, const std::vector<const Json*>& Steps, const Json* Rhs,
+                        const std::string& Where, FBlueprintClass& BP, FEditDef& Out, std::string* Err);
+    bool GenerateAssetEdits(const Json& Block, std::string* Err);
+    std::vector<const Json*> AssetEditBlocks;               // UE_ASSET_EDITS: each block's function
+    bool ApplyEdit(const std::string& Package, const std::string& Object, std::vector<FEditDef> Edits,
+                   const FPackage& From, const std::string& Where, std::string* Err);
+    bool SaveEdits(const std::string& OutDir, std::string* Err);
+    bool BracedMembers(const Json& List, const FRecord& Rec, const std::string& Where, FBlueprintClass& BP, bool bKeepZero,
+                       std::vector<FPropertyDef>& Out, std::string* Err);
+    struct FEdited { std::string Package, Ext; FCookedPackage P; std::vector<std::string> Objects; };
+    std::map<std::string, FEdited> Edited;                  // lowercased package name -> the game's package, edited
+    FEdited* LoadEdited(const std::string& Package, const std::string& Where, std::string* Err);
+    bool TransplantFunctions(const FRecord& R, const FRecord& B, const FPackage& Scratch, FIndex ScratchClass,
+                             std::string* Err);
+    std::map<std::string, FIndex> PatchSupers;              // "Patch::Method" -> what it would override, in its scratch
+    std::map<std::string, const Json*> EditTargets;         // UE_ASSET_EDIT: Ns + its number -> `&Asset`'s variable
+    std::vector<std::pair<std::string, const Json*>> Edits; // ... -> the braced variable holding the edit
     bool GenerateStruct(const FRecord& R, const std::string& OutDir, std::string* Err);
     bool GenerateInterface(const FRecord& R, const std::string& OutDir, std::string* Err);
     /* Every T& parm is treated as an out-parm; the return value is the caller's to append. */
@@ -1776,6 +1900,22 @@ bool FCompiler::Collect(std::string* Err)
         if ((Kind(N) == "TypeAliasDecl" || Kind(N) == "TypedefDecl") && N.contains("name"))
             Aliases[Ns + Name(N)] = Aliases[Name(N)] = StripTypeKeywords(TypeOf(N));
         if (Kind(N) == "VarDecl" && Name(N) == "UeModPackage") FindLiteral(N, ModPackage);
+        /* UE_ASSET_EDIT: a pointer naming the target, then the braced variable holding the edit, one number between them. */
+        if (Kind(N) == "VarDecl" && Name(N).compare(0, 10, "UeEditOf__") == 0)
+        {
+            EditTargets[Ns + Name(N).substr(10)] = &N;
+            return;
+        }
+        if (Kind(N) == "VarDecl" && Name(N).compare(0, 8, "UeEdit__") == 0)
+        {
+            Edits.emplace_back(Ns + Name(N).substr(8), &N);
+            return;
+        }
+        if (Kind(N) == "FunctionDecl" && Name(N).compare(0, 14, "UeAssetEdits__") == 0)
+        {
+            AssetEditBlocks.push_back(&N);
+            return;
+        }
         if (Kind(N) == "VarDecl" && BracedInit(N)) AssetDecls.push_back(&N);
         if (Kind(N) == "VarDecl" && !Ns.empty()) VarScope[N.value("id", std::string())] = Ns;
         if (Kind(N) == "VarDecl") NsVars[N.value("id", std::string())] = NsVarNamed[Ns + Name(N)] = &N;
@@ -1889,6 +2029,10 @@ bool FCompiler::Collect(std::string* Err)
             else if (Kind(C) == "VarDecl" && Name(C) == "UeInterfaceMeta")
             {
                 R.bIsInterface = true;
+            }
+            else if (Kind(C) == "VarDecl" && Name(C) == "UePatchMeta")
+            {
+                R.bIsPatch = true;
             }
             else if (Kind(C) == "VarDecl" && Name(C) == "UeStructMeta")
             {
@@ -7957,13 +8101,7 @@ bool FCompiler::AssetRef(const Json& N, FBlueprintClass& BP, FIndex* Out)
         Package = PathIn(ModPackage, Qual);
     else return false;
 
-    /* "/Game/Dir/Pkg.Object" names an object other than the package's namesake; "/Game/Dir/Pkg" means Pkg.Pkg. */
-    std::string Object = Package.substr(Package.rfind('/') + 1);
-    if (const size_t Dot = Object.find('.'); Dot != std::string::npos)
-    {
-        Package.resize(Package.size() - (Object.size() - Dot));
-        Object = Object.substr(Dot + 1);
-    }
+    const std::string Object = SplitAssetPath(Package);
     *Out = BP.Asset(PackageOf(*R), ClassOf(*R), Package, Object);
     return true;
 }
@@ -7975,6 +8113,12 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
     Init = Strip(Whole);
     if (!Init) return true;
     std::string K = Kind(*Init);
+    if (PD.Type == "StructProperty" && NativeUnwritten(PD.StructName))
+    {
+        *Err = Name(F) + ": the engine reads a " + PD.StructName + " value in its own binary form, which AssetGen does not "
+             "write yet; leave the value out";
+        return false;
+    }
 
     /* `TArray<uint8> Blob = __EmbedFile__("rel/path")`: the file's bytes, read here at build time and
        written into the CDO one element per byte. The path is relative to the mod source being compiled. */
@@ -8519,6 +8663,13 @@ bool FCompiler::GenerateStruct(const FRecord& R, const std::string& OutDir, std:
         const std::string Field = IsInternalViewStruct(R.CppName) ? Name(*F)
                                                                   : ModFieldName(PackageName, Name(*F));
         if (!TypeToProperty(TypeOf(*F), Field, 0, "member " + Name(*F), BP, &PD, Err)) return false;
+        /* The struct's default instance carries every member's value, so a member no value can be written for is none. */
+        if (PD.Type == "StructProperty" && NativeUnwritten(PD.StructName))
+        {
+            *Err = R.CppName + "::" + Name(*F) + ": the engine reads a " + PD.StructName + " value in its own binary form, "
+                   "which AssetGen does not write yet, and a UE_STRUCT's defaults hold every member's";
+            return false;
+        }
         if (!LowerDefault(*F, PD, BP, Err)) return false;
         PD.PropertyFlags = CPF_Edit | CPF_BlueprintVisible;
         BP.AddVariable(PD);
@@ -8554,8 +8705,33 @@ bool FCompiler::GenerateEnum(const std::string& Enum, const std::string& OutDir,
     return true;
 }
 
-/* Measured on ED_Spider_Grunt. The initializer's semantic form lists the bases first, then every field in order,
-   so a designator is found by position. Only a field the braces name is written: the rest stay the CDO's. */
+/* The members a braced initializer of a Rec names, typed and lowered, in order. Measured on ED_Spider_Grunt: the
+   semantic form lists the bases first, then every field in order, so a designator is found by position. A member
+   the braces leave out is skipped. */
+bool FCompiler::BracedMembers(const Json& List, const FRecord& Rec, const std::string& Where, FBlueprintClass& BP,
+                              bool bKeepZero, std::vector<FPropertyDef>& Out, std::string* Err)
+{
+    size_t I = 0;
+    if (!Rec.Base.empty())
+    {
+        const FRecord* B = Find(Rec.Base);
+        const Json* Sub = Nth(List, I++);
+        if (B && Sub && Kind(*Sub) == "InitListExpr" && !BracedMembers(*Sub, *B, Where, BP, bKeepZero, Out, Err)) return false;
+    }
+    I += Rec.Interfaces.size();
+    for (const Json* F : Rec.Fields)
+    {
+        const Json* Init = Strip(Nth(List, I++));
+        if (!Init || IsUnsetInit(*Init)) continue;
+        FPropertyDef PD;
+        if (!TypeToProperty(TypeOf(*F), UeNameOf(&Rec, Name(*F)), 0, Where + "." + Name(*F), BP, &PD, Err)) return false;
+        if (!LowerDefault(*F, PD, BP, Err, Init, bKeepZero)) return false;
+        Out.push_back(PD);
+    }
+    return true;
+}
+
+/* Only a field the braces name is written: the rest stay the CDO's. */
 bool FCompiler::GenerateAsset(const Json& Var, const std::string& OutDir, std::string* Err)
 {
     const FRecord* R = Find(StripTypeKeywords(TypeOf(Var)));
@@ -8569,28 +8745,9 @@ bool FCompiler::GenerateAsset(const Json& Var, const std::string& OutDir, std::s
     StampIdentity(P, PackageName);
     FBlueprintClass BP(P, AssetName, "", "", false);
 
-    const auto Unset = IsUnsetInit;
-    std::function<bool(const Json&, const FRecord&)> Fill = [&](const Json& List, const FRecord& Rec) {
-        size_t I = 0;
-        if (!Rec.Base.empty())
-        {
-            const FRecord* B = Find(Rec.Base);
-            const Json* Sub = Nth(List, I++);
-            if (B && Sub && Kind(*Sub) == "InitListExpr" && !Fill(*Sub, *B)) return false;
-        }
-        I += Rec.Interfaces.size();
-        for (const Json* F : Rec.Fields)
-        {
-            const Json* Init = Strip(Nth(List, I++));
-            if (!Init || Unset(*Init)) continue;
-            FPropertyDef PD;
-            if (!TypeToProperty(TypeOf(*F), UeNameOf(&Rec, Name(*F)), 0, AssetName + "." + Name(*F), BP, &PD, Err)) return false;
-            if (!LowerDefault(*F, PD, BP, Err, Init)) return false;
-            BP.AddVariable(PD);
-        }
-        return true;
-    };
-    if (!Fill(*BracedInit(Var), *R)) return false;
+    std::vector<FPropertyDef> Set;
+    if (!BracedMembers(*BracedInit(Var), *R, AssetName, BP, false, Set, Err)) return false;
+    for (const FPropertyDef& PD : Set) BP.AddVariable(PD);
 
     const std::string ClassPkg = PackageOf(*R), ClassName = ClassOf(*R);
     /* The CDO's import first, as MSVC evaluates call arguments (right to left); clang goes left to right. */
@@ -8599,6 +8756,771 @@ bool FCompiler::GenerateAsset(const Json& Var, const std::string& OutDir, std::s
     if (!SavePackage(P, OutDir, PackageName, Err)) return false;
     RegistryRows.push_back({ PackageName, AssetName, ClassName });
     printf("  %-14s -> %s.uasset  (asset, a %s)\n", AssetName.c_str(), Shown(PackageName).c_str(), R->CppName.c_str());
+    return true;
+}
+
+/*
+S38 - UE_ASSET_EDIT(Asset) { .Member = value, ... }: the members the braces name, written into Asset's own package as
+the game cooked it. The target is a UE_ASSET_AT; a mod's own asset takes its values where it is declared.
+*/
+bool FCompiler::GenerateEdit(const std::string& Key, const Json& Var, std::string* Err)
+{
+    const auto Of = EditTargets.find(Key);
+    std::function<const Json*(const Json&)> RefIn = [&](const Json& N) -> const Json* {
+        if (Kind(N) == "DeclRefExpr" && N.contains("referencedDecl")) return &N;
+        const Json* Found = nullptr;
+        ForEach(N, [&](const Json& C) { if (!Found) Found = RefIn(C); });
+        return Found;
+    };
+    const Json* Ref = Of == EditTargets.end() ? nullptr : RefIn(*Of->second);
+    if (!Ref || !BracedInit(Var)) { *Err = "UE_ASSET_EDIT: write it as `UE_ASSET_EDIT(Asset) { .Member = value };`"; return false; }
+    const Json& D = (*Ref)["referencedDecl"];
+    const auto Scope = VarScope.find(D.value("id", std::string()));
+    const std::string Qual = (Scope == VarScope.end() ? std::string() : Scope->second) + Name(D);
+    const std::string Where = "UE_ASSET_EDIT(" + Qual + ")";
+    const auto At = AssetPaths.find(Qual);
+    if (At == AssetPaths.end())
+    { *Err = Where + ": the target is a UE_ASSET_AT (every asset in UeAssets/ is one); a mod's own asset takes its values where it is declared"; return false; }
+    const Json& T = D.contains("type") ? D["type"] : Json::object();
+    const FRecord* R = Find(StripTypeKeywords(T.value("desugaredQualType", T.value("qualType", std::string()))));
+    if (!R || R->bIsStruct) { *Err = Where + ": cannot tell the asset's class"; return false; }
+    Cur = nullptr;
+
+    std::string Package = At->second;
+    const std::string Object = SplitAssetPath(Package);
+    FPackage Scratch(Package);
+    FBlueprintClass BP(Scratch, Object, "", "", false);
+    std::vector<FPropertyDef> Defs;
+    /* An explicit zero is written: the asset's own value is what it replaces, not the class default. */
+    if (!BracedMembers(*BracedInit(Var), *R, Qual, BP, /*bKeepZero=*/true, Defs, Err)) return false;
+    if (Defs.empty()) { *Err = Where + ": the braces name no member"; return false; }
+    std::vector<FEditDef> Edits;
+    for (FPropertyDef& D : Defs) Edits.push_back({ { std::move(D) }, {} });
+    return ApplyEdit(Package, Object, std::move(Edits), Scratch, Where, Err);
+}
+
+/*
+S38 - UE_PATCH: a class that edits the game Blueprint it derives from, in that Blueprint's own package. Its UE_DEFAULTS
+assignments become tags of the Blueprint's default object; a member of any class above it can be named. `Comp->Field`
+edits a component, in the export the engine builds that component from:
+  - a native class's component: the default subobject under the default object, named as UeApi's `__UeSubobject` says
+    (not always the member's name: ASpiderEnemy's `temperature` is the subobject Temperature);
+  - a Blueprint's own SCS component: its template, `<Var>_GEN_VARIABLE` in the class;
+  - a parent Blueprint's SCS component this one overrides: the override record's template, also `<Var>_GEN_VARIABLE`
+    in the class. One it does not override yet has no such export, and adding the record is not built.
+None of them is instanced from cooked data (bCookBlueprintComponentTemplateData is off in DRG, and false by default),
+so the tags are all the engine reads. A method replaces the Blueprint's function of the same name (TransplantFunctions).
+A member or an interface of the patch's own is refused rather than silently dropped.
+*/
+bool FCompiler::GeneratePatch(const FRecord& R, std::string* Err)
+{
+    const std::string Where = R.CppName + " (UE_PATCH)";
+    const FRecord* B = R.Base.empty() ? nullptr : Find(R.Base);
+    if (!B || !B->IsNative() || PackageOf(*B).compare(0, 6, "/Game/") != 0)
+    {
+        *Err = Where + ": a patch derives from the game Blueprint it edits (a class in a /Game package); a native class's "
+               "defaults come from its C++ constructor, not from a package";
+        return false;
+    }
+    /* Every one the patch declares: clang declares an implicit operator= up front only in a class with a virtual, and
+       no UeApi class has one. */
+    const bool bMethods = !R.Methods.empty();
+    if (!R.Fields.empty() || !R.Interfaces.empty())
+    { *Err = Where + ": a patch edits its parent's defaults and replaces its functions; a member or an interface of its own is not built yet"; return false; }
+    const Json* Body = nullptr;
+    if (R.Defaults) ForEach(*R.Defaults, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Body = &C; });
+    if (!Body && !bMethods)
+    {
+        *Err = Where + ": nothing to edit - a patch's defaults go in UE_DEFAULTS { Field = value; }, and its methods replace "
+               "the Blueprint's functions of the same name";
+        return false;
+    }
+    /* The defaults first: the functions' names are written against the table the tags leave. */
+    if (Body && !PatchDefaults(*B, *Body, Where, Err)) return false;
+    return !bMethods || Generate(R, std::string(), Err);
+}
+
+/* The patch's UE_DEFAULTS, as tags of the Blueprint Bp's own package. */
+bool FCompiler::PatchDefaults(const FRecord& Bp, const Json& Body, const std::string& Where, std::string* Err)
+{
+    const FRecord* B = &Bp;
+    Cur = nullptr;
+
+    const std::string Package = PackageOf(*B), Class = ClassOf(*B), Cdo = "Default__" + Class;
+    const FRecord* Engine = B;      // the nearest native ancestor: its UeApi names each default subobject
+    while (Engine && PackageOf(*Engine).compare(0, 8, "/Script/") != 0) Engine = Engine->Base.empty() ? nullptr : Find(Engine->Base);
+    FPackage Scratch(Package);
+    FBlueprintClass BP(Scratch, Class, "", "", false);
+    std::map<std::string, std::vector<FEditDef>> Objects;          // an export, as ApplyEdit names it -> its assignments
+    auto DeclarerOf = [&](const Json& M) {
+        const auto Owner = FieldOwner.find(M.value("referencedMemberDecl", std::string()));
+        return Owner == FieldOwner.end() ? nullptr : Find(Owner->second);
+    };
+    bool bOk = true;
+    ForEach(Body, [&](const Json& S) {
+        if (!bOk) return;
+        const Json *Lhs = nullptr, *Rhs = nullptr, *Through = nullptr;
+        std::vector<const Json*> Steps;
+        if (!DefaultPath(S, Lhs, Rhs, Through, Steps))
+        {
+            *Err = Where + ": every statement is `Field = value;` or `Component->Field = value;`, or assigns part of one: "
+                   "`Field.Member = value;`, `Field[2] = value;`";
+            bOk = false;
+            return;
+        }
+        std::string Object = Cdo;
+        if (Through)
+        {
+            const std::string Comp = Name(*Through);
+            const FRecord* CR = DeclarerOf(*Through);
+            if (!CR) { *Err = Where + ": cannot tell which class declares " + Comp; bOk = false; return; }
+            if (PackageOf(*CR).compare(0, 6, "/Game/") == 0)
+            {
+                if (!CR->ScsNodes.count(Comp))
+                { *Err = Where + ": " + Comp + " is not one of " + CR->UeName + "'s components (UeApi gives it no SCS node)"; bOk = false; return; }
+                Object = Class + ":" + UeNameOf(CR, Comp) + "_GEN_VARIABLE";
+            }
+            else
+            {
+                const auto Sub = Engine ? Engine->Subobjects.find(Comp) : std::map<std::string, std::string>::const_iterator();
+                if (!Engine || Sub == Engine->Subobjects.end())
+                {
+                    *Err = Where + ": UeApi does not say which default subobject " + Comp + " is - regenerate it with genueapi, "
+                           "which reads that off the object dump";
+                    bOk = false;
+                    return;
+                }
+                Object = Cdo + ":" + Sub->second.substr(0, Sub->second.find(' '));
+            }
+        }
+        const FRecord* DR = DeclarerOf(*Lhs);
+        if (!DR) { *Err = Where + ": cannot tell which class declares " + Name(*Lhs); bOk = false; return; }
+        FEditDef Edit;
+        bOk = EditAssignment(*Lhs, *DR, Steps, Rhs, Where, BP, Edit, Err);
+        if (bOk) Objects[Object].push_back(std::move(Edit));
+    });
+    if (!bOk) return false;
+    if (Objects.empty()) { *Err = Where + ": UE_DEFAULTS assigns nothing"; return false; }
+    for (const auto& [Object, Edits] : Objects)
+        if (!ApplyEdit(Package, Object, Edits, Scratch, Where, Err)) return false;
+    return true;
+}
+
+/* S38: one assignment of an edit, `Root<Steps> = Rhs`: the member Root names (Declarer's), each step's def down the
+   path, and the value lowered against the last. Zero is a real value here: it replaces the game's own, which need not
+   be zero. */
+bool FCompiler::EditAssignment(const Json& Root, const FRecord& Declarer, const std::vector<const Json*>& Steps,
+                               const Json* Rhs, const std::string& Where, FBlueprintClass& BP, FEditDef& Out, std::string* Err)
+{
+    Out.Chain.emplace_back();
+    if (!TypeToProperty(TypeOf(Root), UeNameOf(&Declarer, Name(Root)), 0, Where, BP, &Out.Chain.back(), Err)) return false;
+    std::string Path = Name(Root);
+    for (const Json* Step : Steps)
+    {
+        FConstVal I;
+        const Json* Index = Kind(*Step) == "MemberExpr" ? nullptr : Nth(*Step, 2);
+        Path += Index ? "[" + (FoldConst(*Index, I) ? std::to_string(I.I) : std::string("...")) + "]" : "." + Name(*Step);
+        FPropertyDef Reached;
+        if (!EditStep(*Step, Out.Chain.back(), Where + ": " + Path, BP, Out.Path.emplace_back(), Reached, Err)) return false;
+        Out.Chain.push_back(std::move(Reached));
+    }
+    if (!LowerDefault(Steps.empty() ? Root : *Steps.back(), Out.Chain.back(), BP, Err, Rhs, /*bKeepZero=*/true)) return false;
+    if (Out.Chain.back().Default.K == FDefaultValue::None) { *Err = Where + ": " + Path + " needs a literal value"; return false; }
+    return true;
+}
+
+/*
+S38 - UE_ASSET_EDITS { Asset.Member = value; Asset.Array[1].Field = value; ... }: assignments to assets the game holds
+(UE_ASSET_AT), each written into its asset's package as UE_ASSET_EDIT's braces are; a path changes only the part of the
+member's value it names (ApplyEdit). Statements run in order, each asset's in one pass.
+*/
+bool FCompiler::GenerateAssetEdits(const Json& Block, std::string* Err)
+{
+    const std::string Where = "UE_ASSET_EDITS";
+    const Json* Body = nullptr;
+    ForEach(Block, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Body = &C; });
+    if (!Body) { *Err = Where + ": write it as `UE_ASSET_EDITS { Asset.Member = value; }`"; return false; }
+    Cur = nullptr;
+    struct FTarget
+    {
+        std::string Package, Object;
+        std::unique_ptr<FPackage> Scratch;
+        std::unique_ptr<FBlueprintClass> BP;
+        std::vector<FEditDef> Edits;
+    };
+    std::map<std::string, FTarget> Targets;         // the asset's qualified name -> its package and assignments
+    std::vector<std::string> Order;
+    bool bOk = true;
+    ForEach(*Body, [&](const Json& S) {
+        if (!bOk) return;
+        const Json *Asset = nullptr, *Root = nullptr, *Rhs = nullptr;
+        std::vector<const Json*> Steps;
+        if (!AssetPath(S, Asset, Root, Rhs, Steps) || !Asset->contains("referencedDecl"))
+        {
+            *Err = Where + ": every statement assigns an asset's member, or part of one: `Asset.Member = value;`, "
+                   "`Asset.Member[2].Field = value;`";
+            bOk = false;
+            return;
+        }
+        const Json& D = (*Asset)["referencedDecl"];
+        const auto Scope = VarScope.find(D.value("id", std::string()));
+        const std::string Qual = (Scope == VarScope.end() ? std::string() : Scope->second) + Name(D);
+        const auto At = AssetPaths.find(Qual);
+        if (At == AssetPaths.end())
+        {
+            *Err = Where + ": " + Qual + " is not a UE_ASSET_AT (every asset in UeAssets/ is one); a mod's own asset "
+                   "takes its values where it is declared";
+            bOk = false;
+            return;
+        }
+        FTarget& T = Targets[Qual];
+        if (!T.Scratch)
+        {
+            T.Package = At->second;
+            T.Object = SplitAssetPath(T.Package);
+            T.Scratch = std::make_unique<FPackage>(T.Package);
+            T.BP = std::make_unique<FBlueprintClass>(*T.Scratch, T.Object, "", "", false);
+            Order.push_back(Qual);
+        }
+        const auto Owner = FieldOwner.find(Root->value("referencedMemberDecl", std::string()));
+        const FRecord* DR = Owner == FieldOwner.end() ? nullptr : Find(Owner->second);
+        if (!DR) { *Err = Where + ": cannot tell which class declares " + Name(*Root); bOk = false; return; }
+        bOk = EditAssignment(*Root, *DR, Steps, Rhs, Where + " " + Qual, *T.BP, T.Edits.emplace_back(), Err);
+    });
+    if (!bOk) return false;
+    if (Order.empty()) { *Err = Where + ": the block assigns nothing"; return false; }
+    for (const std::string& Qual : Order)
+    {
+        FTarget& T = Targets[Qual];
+        if (!ApplyEdit(T.Package, T.Object, std::move(T.Edits), *T.Scratch, Where + " " + Qual, Err)) return false;
+    }
+    return true;
+}
+
+/* S38: one step of a UE_DEFAULTS path into the value Parent is the def of: a `.Member` MemberExpr, or a TArray's
+   `[i]` call. Out says where the step lands in the cooked bytes, Reached is the def of what it reaches. */
+bool FCompiler::EditStep(const Json& Step, const FPropertyDef& Parent, const std::string& Where, FBlueprintClass& BP,
+                         FValueStep& Out, FPropertyDef& Reached, std::string* Err)
+{
+    if (Kind(Step) == "MemberExpr")
+    {
+        const auto Owner = FieldOwner.find(Step.value("referencedMemberDecl", std::string()));
+        const FRecord* SR = Owner == FieldOwner.end() ? nullptr : Find(Owner->second);
+        if (!SR || Parent.Type != "StructProperty") { *Err = Where + ": cannot tell which struct declares " + Name(Step); return false; }
+        Out.Member = UeNameOf(SR, Name(Step));
+        if (!TypeToProperty(TypeOf(Step), Out.Member, 0, Where, BP, &Reached, Err)) return false;
+        const int32 Native = NativeStructSize(Parent.StructName);
+        if (!Native) return true;
+        /* A native struct's bytes are its members' in declaration order, each of a fixed size. */
+        int32 At = 0;
+        for (const Json* F : SR->Fields)
+        {
+            FPropertyDef M;
+            if (!TypeToProperty(TypeOf(*F), UeNameOf(SR, Name(*F)), 0, Where, BP, &M, Err)) return false;
+            const int32 Size = FixedValueSize(M);
+            if (!Size) { *Err = Where + ": " + SR->CppName + "::" + Name(*F) + " is not a fixed size, so its bytes cannot be found"; return false; }
+            if (Name(*F) == Name(Step)) { Out.Offset = At; Out.Size = Size; }
+            At += Size;
+        }
+        if (!SR->Base.empty() || Out.Offset < 0 || At > Native)
+        { *Err = Where + ": UeApi's " + SR->CppName + " is not laid out the way the engine writes it"; return false; }
+        Out.StructSize = Native;
+        return true;
+    }
+    if (Parent.Type != "ArrayProperty" || !Parent.Inner)
+    {
+        *Err = Where + ": only a TArray's element can be assigned on its own; assign the whole "
+             + std::string(Parent.Type == "MapProperty" ? "map" : Parent.Type == "SetProperty" ? "set" : "value");
+        return false;
+    }
+    FConstVal V;
+    const Json* Index = Nth(Step, 2);
+    if (!Index || !FoldConst(*Index, V) || V.bFloat || V.I < 0 || V.I > 0x7FFFFFFF)
+    { *Err = Where + ": an element's index is a constant, 0 or more"; return false; }
+    Out.Element = int32(V.I);
+    Reached = *Parent.Inner;
+    Out.bStructElements = Reached.Type == "StructProperty";
+    Out.ElementSize = FixedValueSize(Reached);
+    if (!Out.ElementSize)
+    {
+        if (Reached.Type == "StrProperty") Out.ElementKind = FValueStep::String;
+        else if (Reached.Type == "SoftObjectProperty" || Reached.Type == "SoftClassProperty") Out.ElementKind = FValueStep::SoftPath;
+        else if (Reached.Type == "StructProperty") Out.ElementKind = FValueStep::Tags;
+        else { *Err = Where + ": an element of a TArray of " + Reached.Type + " cannot be assigned on its own yet; assign the whole array"; return false; }
+    }
+    return true;
+}
+
+/* The game's Package, read from GameDir the first time an edit names it; SaveEdits writes it once every edit is in. */
+FCompiler::FEdited* FCompiler::LoadEdited(const std::string& Package, const std::string& Where, std::string* Err)
+{
+    if (auto Slot = Edited.find(Lower(Package)); Slot != Edited.end()) return &Slot->second;
+    if (GameDir.empty())
+    {
+        *Err = Where + ": an edit starts from the game's own package: pass the folder /Game is in (assetgen compile --game "
+               "<extracted pak>/FSD/Content; bpbuild: game_content in mods.yaml)";
+        return nullptr;
+    }
+    if (Package.compare(0, 6, "/Game/") != 0) { *Err = Where + ": " + Package + " is not a /Game package"; return nullptr; }
+    FEdited E;
+    E.Package = Package;
+    const std::string Base = (std::filesystem::u8path(GameDir) / std::filesystem::u8path(Package.substr(6))).u8string();
+    for (const char* Ext : { ".uasset", ".umap" })
+        if (std::filesystem::exists(std::filesystem::u8path(Base + Ext))) { E.Ext = Ext; break; }
+    if (E.Ext.empty()) { *Err = Where + ": " + Package + " is not in " + GameDir; return nullptr; }
+    std::string LoadErr;
+    if (!E.P.Load(Base + E.Ext, &LoadErr)) { *Err = Where + ": " + Package + ": " + LoadErr; return nullptr; }
+    return &Edited.emplace(Lower(Package), std::move(E)).first->second;
+}
+
+/* From's import Index as an FPackageIndex of P, the cooked package named Package. An object inside P is its export: a
+   patch's function names its own class, other functions of it, its default object. Anything else is an import of P,
+   found or appended after its outers. 0, with Err set, for an object of P that P does not hold. */
+static int32 ImportInto(FCookedPackage& P, const std::string& Package, const FPackage& From, int32 Index,
+                        std::map<int32, int32>& Moved, std::string* Err)
+{
+    if (Index >= 0) return 0;
+    if (const auto It = Moved.find(Index); It != Moved.end()) return It->second;
+    std::vector<const FImport*> Chain;                              // the object first, its package last
+    for (int32 I = Index; I < 0; I = From.ImportAt(FIndex{ I })->Outer.V) Chain.push_back(From.ImportAt(FIndex{ I }));
+    int32 Out = 0;
+    if (Lower(Chain.back()->ObjectName) == Lower(Package))
+    {
+        if (Chain.size() == 1) { *Err = "a reference to " + Package + " itself"; return 0; }
+        for (size_t K = Chain.size() - 1; K-- > 0;)
+        {
+            const int32 E = P.FindExport(Chain[K]->ObjectName, Out);
+            if (E < 0) { *Err = Package + " holds no " + Chain[K]->ObjectName; return 0; }
+            Out = E + 1;
+        }
+    }
+    else
+    {
+        const FImport* Im = Chain.front();
+        const int32 Outer = Im->Outer.V ? ImportInto(P, Package, From, Im->Outer.V, Moved, Err) : 0;
+        if (Im->Outer.V && !Outer) return 0;
+        Out = P.Import(Im->ClassPackage, Im->ClassName, Outer, Im->ObjectName);
+    }
+    return Moved[Index] = Out;
+}
+
+/*
+Edits, lowered against From (a scratch package, whose imports their objects are), into the tags of Object in the game's
+Package: read from GameDir the first time, saved by SaveEdits once every edit is in. A member's tag replaces the one of
+its name or is appended; an assignment to part of a member's value (a path) changes that part of the tag's value and
+keeps the rest (SetTagPath). An object a tag points at becomes an import of the package, found or appended, and one the
+object is created before being serialized - the edge the cook gives such a reference; a user-defined struct or enum a
+tag names too. Everything else is the game's, byte for byte.
+*/
+bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object, std::vector<FEditDef> Edits,
+                          const FPackage& From, const std::string& Where, std::string* Err)
+{
+    FEdited* Ed = LoadEdited(Package, Where, Err);
+    if (!Ed) return false;
+    FCookedPackage& P = Ed->P;
+    /* Object is a path of names from the package down, `:`-separated: `Default__X_C:HealthComponent`. */
+    int32 Export = -1;
+    for (size_t From = 0, Colon = 0; Colon != std::string::npos; From = Colon + 1)
+    {
+        Colon = Object.find(':', From);
+        Export = P.FindExport(Object.substr(From, Colon == std::string::npos ? std::string::npos : Colon - From), Export + 1);
+        if (Export < 0) break;
+    }
+    if (Export < 0)
+    {
+        *Err = Where + ": " + Package + " holds no " + Object;
+        if (Object.size() > 13 && Object.compare(Object.size() - 13, 13, "_GEN_VARIABLE") == 0)
+            *Err += " - the class does not override that inherited component. Patch the Blueprint that declares it instead "
+                    "(every child that does not override it changes too); adding an override record here is not built yet";
+        return false;
+    }
+
+    /* From's imports, made again in P. From has no exports - every object a default can name is an import (AssetRef). */
+    std::map<int32, int32> Moved;
+    std::string MoveErr;
+    auto Move = [&](int32 Index) { return ImportInto(P, Package, From, Index, Moved, &MoveErr); };
+    /* A deep copy on the way: members and elements are shared_ptrs a type's other properties may hold too. */
+    std::vector<int32> Deps;
+    std::function<void(FPropertyDef&)> MoveDef;
+    std::function<void(FDefaultValue&)> MoveValue = [&](FDefaultValue& V) {
+        if (V.K == FDefaultValue::Obj && V.Object.V != 0) Deps.push_back(V.Object.V = Move(V.Object.V));
+        for (FDefaultValue& Item : V.Items) MoveValue(Item);
+        if (V.Members)
+        {
+            V.Members = std::make_shared<std::vector<FPropertyDef>>(*V.Members);
+            for (FPropertyDef& M : *V.Members) MoveDef(M);
+        }
+    };
+    MoveDef = [&](FPropertyDef& D) {
+        if (D.Members)
+        {
+            D.Members = std::make_shared<std::vector<FPropertyDef>>(*D.Members);
+            for (FPropertyDef& M : *D.Members) MoveDef(M);
+        }
+        for (std::shared_ptr<FPropertyDef>* Sub : { &D.Inner, &D.Value })
+            if (*Sub) { *Sub = std::make_shared<FPropertyDef>(**Sub); MoveDef(**Sub); }
+        MoveValue(D.Default);
+    };
+    for (FEditDef& E : Edits)
+        for (FPropertyDef& D : E.Chain)
+        {
+            MoveDef(D);
+            const FImport* Named = From.ImportAt(D.Extra);
+            if (Named && (Named->ClassName == "UserDefinedStruct" || Named->ClassName == "UserDefinedEnum"))
+                Deps.push_back(Move(D.Extra.V));
+        }
+    if (!MoveErr.empty()) { *Err = Where + ": " + MoveErr; return false; }
+
+    /* Each assignment's bytes, written against P's names (a name P lacks is appended), then read back as P's own.
+       Fresh[K] is the tag holding only the path below step K, for each K it can be one (every step on is a member of a
+       struct written as tags): Fresh[0] the member's own tag, whole when there is no path. Leaf is the value's bytes
+       when the path ends in a native struct or at an element. */
+    std::vector<std::string> Texts;
+    for (const FCookedName& N : P.Names) Texts.push_back(N.Text);
+    FPackage Sink(Package);
+    Sink.SeedNames(Texts);
+    auto Bytes = [&](const auto& Write) { FArc Ar(&Sink); Write(Ar); return Ar.B; };
+    std::vector<std::vector<std::vector<uint8>>> Fresh(Edits.size());
+    std::vector<std::vector<uint8>> Leaf(Edits.size());
+    for (size_t I = 0; I < Edits.size(); ++I)
+    {
+        const FEditDef& E = Edits[I];
+        const size_t N = E.Path.size();
+        Fresh[I].resize(N + 1);
+        FPropertyDef Tree = E.Chain[N];
+        for (size_t K = N + 1; K-- > 0;)
+        {
+            if (K < N)
+            {
+                if (!E.Path[K].IsTaggedMember()) break;
+                FPropertyDef Up = E.Chain[K];
+                Up.Members = std::make_shared<std::vector<FPropertyDef>>(1, Tree);
+                Up.Default = FDefaultValue{};
+                Up.Default.K = FDefaultValue::Struct;
+                Tree = std::move(Up);
+            }
+            if (K == 0 || E.Path[K - 1].IsTaggedMember())
+                Fresh[I][K] = Bytes([&](FArc& Ar) { WriteDefaultTag(Ar, Tree); TagEnd(Ar); });
+        }
+        if (N && !E.Path.back().IsTaggedMember()) Leaf[I] = Bytes([&](FArc& Ar) { WriteDefaultValue(Ar, E.Chain[N]); });
+    }
+    for (size_t I = P.Names.size(); I < Sink.NameTable().size(); ++I) P.Names.push_back({ Sink.NameTable()[I] });
+
+    /* In statement order, so a later assignment lands on what an earlier one wrote. */
+    for (size_t I = 0; I < Edits.size(); ++I)
+    {
+        if (Edits[I].Path.empty())
+        {
+            std::vector<FTag> Tags;
+            size_t End = 0;
+            if (!ReadTags(P, Fresh[I][0], End, Tags) || End != Fresh[I][0].size() || Tags.size() != 1)
+            { *Err = Where + ": internal: the edit's tag does not read back"; return false; }
+            if (!SetTags(P, Export, Tags, Err)) { *Err = Where + ": " + *Err; return false; }
+        }
+        else if (!SetTagPath(P, Export, Edits[I].Chain[0].Name, Edits[I].Path, Fresh[I], Leaf[I], Err))
+        { *Err = Where + ": " + *Err; return false; }
+    }
+    for (int32 Dep : Deps) P.CreateBeforeSerialize(Export, Dep);
+    Ed->Objects.push_back(Object + " (" + std::to_string(Edits.size()) + (Edits.size() == 1 ? " assignment)" : " assignments)"));
+    return true;
+}
+
+/*
+S38 - a patch's methods, compiled by Generate as a scratch child class of the Blueprint B (each an override of B's
+function), written over B's own functions in B's package. The export row stays, so the class's function list, its
+FuncMap and every caller reach the same object. So do the function's SuperStruct and FunctionFlags: its place in the
+class chain, and what callers and the replication layer expect of it. The rest is the new function's: its properties
+(the parameters, then its locals) and its script. The event-graph link goes, since the body no longer jumps into the
+ubergraph. The payload is written with the cooked package's names, a missing one appended, and every object index
+remapped: the scratch class, its default object and its functions to B's; an object inside B's package to its export;
+anything else to an import of it, found or appended. A replaced function that a body calls as `Parent::Method()` keeps
+the game's body in a copy of its export, which that call reaches instead (a UFunction links itself as it loads,
+Class.cpp:1881, so the copy needs only its row, its dependencies and its place in the class's Children and FuncMap).
+*/
+bool FCompiler::TransplantFunctions(const FRecord& R, const FRecord& B, const FPackage& Scratch, FIndex ScratchClass,
+                                    std::string* Err)
+{
+    const std::string Where = R.CppName + " (UE_PATCH)";
+    const std::string Package = PackageOf(B), Class = ClassOf(B);
+    FEdited* Ed = LoadEdited(Package, Where, Err);
+    if (!Ed) return false;
+    FCookedPackage& P = Ed->P;
+    const int32 ClassExport = P.FindExport(Class);
+    if (ClassExport < 0) { *Err = Where + ": " + Package + " holds no " + Class; return false; }
+    const std::vector<FExport>& Rows = Scratch.ExportRows();
+    auto IsFunction = [&](const FExport& F) {       // not the SCS root an actor class gets beside them
+        const FImport* Of = Scratch.ImportAt(F.ClassIndex);
+        return F.OuterIndex.V == ScratchClass.V && Of && Of->ObjectName == "Function";
+    };
+
+    /* What a method would override (Generate wrote none into the scratch), and whether that is an object of B's own. */
+    auto SuperOf = [&](const FExport& F) {
+        const auto It = PatchSupers.find(R.CppName + "::" + F.ObjectName);
+        return It != PatchSupers.end() ? It->second : FIndex{};
+    };
+    auto PackageOfImport = [&](FIndex I) {
+        while (Scratch.ImportAt(I)->Outer.V < 0) I = Scratch.ImportAt(I)->Outer;
+        return Lower(Scratch.ImportAt(I)->ObjectName);
+    };
+    auto InB = [&](FIndex I) { return I.V < 0 && PackageOfImport(I) == Lower(Package); };
+    /* The scratch names objects of its own package (its class, a function of it) as imports too, as every compile
+       does (a dependency on a method it calls by name); here they are B's, found by name once the added rows exist. */
+    const std::string Own = Lower(PackageOf(R)), ScratchName = Rows[size_t(ScratchClass.V - 1)].ObjectName;
+    auto IsOwn = [&](FIndex I) { return I.V < 0 && PackageOfImport(I) == Own; };
+    auto OwnInB = [&](FIndex I) -> int32 {
+        const FImport* Im = Scratch.ImportAt(I);
+        const FImport* Outer = Scratch.ImportAt(Im->Outer);
+        if (Outer->Outer.V == 0)                                    // in the package itself: the class, its default
+        {
+            if (Im->ObjectName == ScratchName) return ClassExport + 1;
+            if (Im->ObjectName == "Default__" + ScratchName) return P.FindExport("Default__" + Class) + 1;
+        }
+        else if (Outer->ObjectName == ScratchName && Scratch.ImportAt(Outer->Outer)->Outer.V == 0)
+            return P.FindExport(Im->ObjectName, ClassExport + 1) + 1;  // a function of the class
+        return 0;
+    };
+
+    /* A method replaces B's function of its name. Where B has none it is added to B: a new function, or an override of
+       one B inherits (from a parent Blueprint, or native). */
+    std::set<std::string> Added;            // lowercased
+    for (const FExport& F : Rows)
+    {
+        if (!IsFunction(F)) continue;
+        const int32 Fn = P.FindExport(F.ObjectName, ClassExport + 1);
+        if (Fn >= 0 && P.ClassNameOf(P.Exports[size_t(Fn)].Class) == "Function") continue;
+        if (Fn >= 0)
+        {
+            *Err = Where + "::" + F.ObjectName + ": " + Class + "'s " + F.ObjectName + " is a "
+                   + P.ClassNameOf(P.Exports[size_t(Fn)].Class) + ", not a function";
+            return false;
+        }
+        if (InB(SuperOf(F)))
+        {
+            *Err = Where + "::" + F.ObjectName + ": " + Class + " has no function of that name of its own, though its "
+                   "declaration has one: the declaration is not the game's";
+            return false;
+        }
+        Added.insert(Lower(F.ObjectName));
+    }
+
+    /* Pass one: the imports the functions name. Each is made P's before the writer seeds its names from P, since an
+       import adds its names to P's table. An added function's row and dependencies are written too, not kept. */
+    std::map<int32, int32> Moved;
+    std::set<int32> InBodies;               // the imports the payloads name, as against only their dependencies
+    std::string Bad;
+    {
+        std::set<int32> Named;
+        FPackage Probe(Package);
+        Probe.RemapIndex = [&](FIndex V) { if (V.V < 0) InBodies.insert(V.V); return V; };
+        for (const FExport& F : Rows)
+            if (IsFunction(F))
+            {
+                FArc Ar(&Probe);
+                F.Serialize(Ar);
+                for (int32 Dep : F.CreateBeforeSer) if (Dep < 0) Named.insert(Dep);
+                if (!Added.count(Lower(F.ObjectName))) continue;
+                for (const std::vector<int32>* List : { &F.SerBeforeSer, &F.SerBeforeCreate, &F.CreateBeforeCreate })
+                    for (int32 Dep : *List) if (Dep < 0) Named.insert(Dep);
+                for (const FIndex I : { F.ClassIndex, F.TemplateIndex, SuperOf(F) }) if (I.V < 0) Named.insert(I.V);
+            }
+        Named.insert(InBodies.begin(), InBodies.end());
+        for (int32 I : Named)
+            if (!IsOwn(FIndex{ I }) && !ImportInto(P, Package, Scratch, I, Moved, &Bad)) { *Err = Where + ": " + Bad; return false; }
+    }
+
+    /* `Parent::Method()` names a function of B's that the patch replaces: it calls the game's body, kept as a copy
+       beside it (<Method>__Vanilla) and listed in the class as any function of it is. The copy overrides nothing. A
+       dependency alone is no call: a scratch function depends on the function it would override. */
+    std::map<int32, int32> Kept;            // a replaced function's FPackageIndex -> its copy's
+    for (const int32 From : InBodies)
+    {
+        if (IsOwn(FIndex{ From })) continue;
+        const int32 To = Moved.at(From);
+        if (To <= 0 || Kept.count(To)) continue;
+        const std::string Name = P.NameOf(P.Exports[size_t(To - 1)].ObjectName);
+        if (P.Exports[size_t(To - 1)].Outer != ClassExport + 1 || P.ClassNameOf(P.Exports[size_t(To - 1)].Class) != "Function"
+            || std::none_of(Rows.begin(), Rows.end(), [&](const FExport& F) { return IsFunction(F) && Lower(F.ObjectName) == Lower(Name); }))
+            continue;
+        FFunctionLayout L;
+        if (!ReadFunctionLayout(P, P.Exports[size_t(To - 1)].Payload, L))
+        { *Err = Where + "::" + Name + ": the game's function does not read as a cooked UFunction"; return false; }
+        const std::string CopyName = Name + "__Vanilla";
+        if (P.FindExport(CopyName, ClassExport + 1) >= 0)
+        { *Err = Where + ": " + Class + " already holds a " + CopyName + " (patched before?)"; return false; }
+        const FNameRef CopyRef = P.NameRef(CopyName);
+        const int32 Copy = P.CopyExport(To - 1, CopyRef);
+        FCookedExport& C = P.Exports[size_t(Copy - 1)];
+        std::memset(C.Payload.data() + L.Super, 0, 4);         // SuperStruct
+        C.Super = 0;
+        /* An RPC's copy is a plain function. With FUNC_Net and no super it would be a net field of the class's own
+           (Class.cpp:4189), shifting the RPC indices against the game's, and a call to it would be routed again
+           (CallFunction's call space). Parent:: means the body, run where the RPC already arrived. */
+        if (L.FunctionFlags & FUNC_Net)
+        {
+            const uint32 Plain = L.FunctionFlags & ~uint32(FUNC_Net | FUNC_NetReliable | FUNC_NetServer | FUNC_NetClient
+                                                            | FUNC_NetMulticast | FUNC_NetValidate);
+            std::memcpy(C.Payload.data() + L.Flags, &Plain, 4);
+            C.Payload.erase(C.Payload.begin() + std::ptrdiff_t(L.Flags + 4), C.Payload.begin() + std::ptrdiff_t(L.Flags + 6));   // RepOffset
+        }
+        if (!AddClassFunction(P, ClassExport, Copy, CopyRef, &Bad)) { *Err = Where + ": " + Bad; return false; }
+        Kept[To] = Copy;
+        Ed->Objects.push_back(Class + "::" + CopyName + " (the game's " + Name + ", kept)");
+    }
+
+    /* An added function's row, before pass two: a method calling it by index finds it there. Its payload and its
+       dependencies are pass two's. */
+    for (const FExport& F : Rows)
+    {
+        if (!IsFunction(F) || !Added.count(Lower(F.ObjectName))) continue;
+        FCookedExport E;
+        E.Class = Moved.at(F.ClassIndex.V);
+        E.Template = Moved.at(F.TemplateIndex.V);
+        E.Outer = ClassExport + 1;
+        const FIndex Super = SuperOf(F);
+        E.Super = Super.V < 0 ? Moved.at(Super.V) : 0;
+        E.ObjectName = P.NameRef(F.ObjectName);
+        E.ObjectFlags = F.ObjectFlags;
+        P.Exports.push_back(std::move(E));
+        if (!AddClassFunction(P, ClassExport, int32(P.Exports.size()), P.Exports.back().ObjectName, &Bad))
+        { *Err = Where + ": " + Bad; return false; }
+        Ed->Objects.push_back(Class + "::" + F.ObjectName + (Super.V < 0 ? " (added, an override)" : " (added)"));
+    }
+
+    /* Pass two, for real. */
+    int32 Replacing = 0;                    // the cooked function being written, as an FPackageIndex
+    FPackage Sink(Package);
+    {
+        std::vector<std::string> Texts;
+        for (const FCookedName& N : P.Names) Texts.push_back(N.Text);
+        Sink.SeedNames(Texts);
+    }
+    Sink.RemapIndex = [&](FIndex V) -> FIndex {
+        if (IsOwn(V))
+        {
+            if (Scratch.ImportAt(V)->Outer.V == 0) return Null();      // the package itself: a dependency, at most
+            const int32 E = OwnInB(V);
+            if (E <= 0 && Bad.empty()) Bad = "names " + Scratch.ImportAt(V)->ObjectName + " of its own, which " + Class + " does not hold";
+            return FIndex{ E };
+        }
+        if (V.V < 0)
+        {
+            const int32 To = Moved.at(V.V);
+            const auto K = Kept.find(To);
+            return FIndex{ K != Kept.end() ? K->second : To };
+        }
+        if (V.V == 0) return V;
+        /* The scratch class is B's class, its default object B's, a function of it B's function of that name. */
+        const FExport& X = Rows[size_t(V.V - 1)];
+        std::string Name = X.ObjectName;
+        int32 Outer = 0;
+        if (V.V == ScratchClass.V) Name = Class;
+        else if (X.OuterIndex.V == 0 && X.ObjectName.compare(0, 9, "Default__") == 0) Name = "Default__" + Class;
+        else if (IsFunction(X)) Outer = ClassExport + 1;
+        else { if (Bad.empty()) Bad = "uses " + X.ObjectName + ", which a patch does not cook"; return Null(); }
+        const int32 E = P.FindExport(Name, Outer);
+        if (E < 0 && Bad.empty()) Bad = Package + " holds no " + Name;
+        return FIndex{ E + 1 };
+    };
+
+    for (const FExport& F : Rows)
+    {
+        if (!IsFunction(F)) continue;
+        const int32 Fn = P.FindExport(F.ObjectName, ClassExport + 1);
+        const bool bAdded = Added.count(Lower(F.ObjectName)) != 0;
+        FFunctionLayout Old, New;
+        if (!bAdded && !ReadFunctionLayout(P, P.Exports[size_t(Fn)].Payload, Old))
+        { *Err = Where + "::" + F.ObjectName + ": the game's function does not read as a cooked UFunction"; return false; }
+
+        Replacing = Fn + 1;
+        FArc Ar(&Sink);
+        F.Serialize(Ar);
+        if (bAdded)                         // its own run, at the end: the four phases in order
+        {
+            FCookedExport& E = P.Exports[size_t(Fn)];
+            E.FirstExportDependency = int32(P.PreloadDependencies.size());
+            int32* const Counts[] = { &E.SerBeforeSer, &E.CreateBeforeSer, &E.SerBeforeCreate, &E.CreateBeforeCreate };
+            const std::vector<int32>* const Lists[] = { &F.SerBeforeSer, &F.CreateBeforeSer, &F.SerBeforeCreate, &F.CreateBeforeCreate };
+            for (size_t K = 0; K < 4; ++K)
+                for (int32 Dep : *Lists[K])
+                    if (const FIndex To = Sink.RemapIndex(FIndex{ Dep }); To.V != 0) { P.PreloadDependencies.push_back(To.V); ++*Counts[K]; }
+        }
+        else
+            for (int32 Dep : F.CreateBeforeSer)
+                if (const FIndex To = Sink.RemapIndex(FIndex{ Dep }); To.V != 0 && To.V != Replacing) P.CreateBeforeSerialize(Fn, To.V);
+        if (!Bad.empty()) { *Err = Where + "::" + F.ObjectName + ": " + Bad; return false; }
+        for (size_t I = P.Names.size(); I < Sink.NameTable().size(); ++I) P.Names.push_back({ Sink.NameTable()[I] });
+        if (!ReadFunctionLayout(P, Ar.B, New))
+        { *Err = Where + "::" + F.ObjectName + ": internal: the compiled function does not read back"; return false; }
+        if (bAdded)                         // all of it the method's, and the function it overrides, if any
+        {
+            std::vector<uint8> Out = Ar.B;
+            std::memcpy(Out.data() + New.Super, &P.Exports[size_t(Fn)].Super, 4);
+            P.Exports[size_t(Fn)].Payload = std::move(Out);
+            continue;
+        }
+
+        /* The parameters stay the game's, byte for byte: every caller was cooked against them, and UeApi's `T&` cannot
+           tell a Blueprint output pin (Parm | OutParm) from an in-out reference (+ ReferenceParm). So the method's must
+           be the same list: in order, the same property class, name, size and direction. Only the locals are ours. */
+        const std::vector<uint8>& Vanilla = P.Exports[size_t(Fn)].Payload;
+        using FField = FFunctionLayout::FField;
+        auto ParmsOf = [](const FFunctionLayout& L, bool bParm) {
+            std::vector<const FField*> Out;
+            for (const FField& Fd : L.Fields) if (((Fd.PropertyFlags & CPF_Parm) != 0) == bParm) Out.push_back(&Fd);
+            return Out;
+        };
+        const std::vector<const FField*> Theirs = ParmsOf(Old, true), Ours = ParmsOf(New, true), Locals = ParmsOf(New, false);
+        auto Listed = [&](const std::vector<const FField*>& List) {
+            std::string S;
+            for (const FField* Fd : List)
+                S += (S.empty() ? "" : ", ") + P.NameOf(Fd->Type) + " " + P.NameOf(Fd->Name)
+                     + (Fd->PropertyFlags & CPF_ReturnParm ? " (return)" : Fd->PropertyFlags & CPF_OutParm ? " (out)" : "");
+            return "(" + S + ")";
+        };
+        constexpr uint64 kDirection = CPF_Parm | CPF_OutParm | CPF_ReturnParm;
+        bool bSame = Theirs.size() == Ours.size();
+        for (size_t I = 0; bSame && I < Theirs.size(); ++I)
+            bSame = Lower(P.NameOf(Theirs[I]->Type)) == Lower(P.NameOf(Ours[I]->Type))
+                    && Lower(P.NameOf(Theirs[I]->Name)) == Lower(P.NameOf(Ours[I]->Name))
+                    && Theirs[I]->ElementSize == Ours[I]->ElementSize
+                    && (Theirs[I]->PropertyFlags & kDirection) == (Ours[I]->PropertyFlags & kDirection);
+        if (!bSame)
+        {
+            *Err = Where + "::" + F.ObjectName + ": its parameters " + Listed(Ours) + " are not the game function's "
+                   + Listed(Theirs) + "; a replacement takes the same ones, in the same order";
+            return false;
+        }
+
+        std::vector<uint8> Out(Ar.B.begin(), Ar.B.begin() + std::ptrdiff_t(New.Properties));
+        std::memcpy(Out.data() + New.Super, Vanilla.data() + Old.Super, 4);                  // SuperStruct
+        const int32 Count = int32(Theirs.size() + Locals.size());
+        Out.insert(Out.end(), reinterpret_cast<const uint8*>(&Count), reinterpret_cast<const uint8*>(&Count) + 4);
+        for (const FField* Parm : Theirs) Out.insert(Out.end(), Vanilla.begin() + std::ptrdiff_t(Parm->Begin), Vanilla.begin() + std::ptrdiff_t(Parm->End));
+        for (const FField* Local : Locals) Out.insert(Out.end(), Ar.B.begin() + std::ptrdiff_t(Local->Begin), Ar.B.begin() + std::ptrdiff_t(Local->End));
+        Out.insert(Out.end(), Ar.B.begin() + std::ptrdiff_t(New.Script), Ar.B.begin() + std::ptrdiff_t(New.Flags));      // the script
+        const size_t FlagBytes = 4 + ((Old.FunctionFlags & FUNC_Net) ? 2 : 0);             // FunctionFlags, RepOffset
+        Out.insert(Out.end(), Vanilla.begin() + std::ptrdiff_t(Old.Flags), Vanilla.begin() + std::ptrdiff_t(Old.Flags + FlagBytes));
+        Out.resize(Out.size() + 8, 0);                                                      // no event-graph link
+        P.Exports[size_t(Fn)].Payload = std::move(Out);
+        Ed->Objects.push_back(Class + "::" + F.ObjectName + " (replaced)");
+    }
+    return true;
+}
+
+/* The edited packages, each at its own /Game path under the Content folder OutDir is in: the mod pak's copy is the one
+   the game loads. */
+bool FCompiler::SaveEdits(const std::string& OutDir, std::string* Err)
+{
+    for (auto& [Key, E] : Edited)
+    {
+        const std::filesystem::path File = FileOf(OutDir, E.Package);
+        std::error_code Ec;
+        std::filesystem::create_directories(File.parent_path(), Ec);
+        if (!E.P.Save(File.u8string() + E.Ext, Err)) return false;
+        std::string Objects;
+        for (const std::string& O : E.Objects) Objects += (Objects.empty() ? "" : ", ") + O;
+        printf("  %-14s -> %s%s  (the game's, edited: %s)\n", "edit", Shown(E.Package).c_str(), E.Ext.c_str(), Objects.c_str());
+    }
     return true;
 }
 
@@ -8722,7 +9644,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     std::map<std::string, FOverride> SubobjectDefaults;
     std::vector<FPropertyDef> InheritedDefaults;
     std::map<std::string, FPropertyDef> InterfaceVarDefaults;     // a default for a variable an implemented interface declares
-    if (R.Defaults)
+    if (R.Defaults && !R.bIsPatch)      // a patch's defaults are tags of the game's own package (GeneratePatch)
     {
         const std::string Where = R.CppName + "::UE_DEFAULTS";
         auto OwnerOf = [&](const Json& M) {
@@ -8735,25 +9657,14 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         if (Body)
             ForEach(*Body, [&](const Json& S) {
                 if (!bOk) return;
-                /* Assigning a struct is an operator call, not a BinaryOperator: its inner is the
-                   callee then the two operands, so both shapes are read the same way one index on. */
-                const Json* Assign = Strip(&S);
-                const std::string AK = Assign ? Kind(*Assign) : std::string();
-                const bool bOpCall = AK == "CXXOperatorCallExpr";
-                const size_t Base = bOpCall ? 1 : 0;
-                const Json* Lhs = Assign ? Strip(Nth(*Assign, Base)) : nullptr;
-                const Json* Rhs = Assign ? Nth(*Assign, Base + 1) : nullptr;
-                const bool bAssign = bOpCall ? IsAssignOperatorCall(*Assign)
-                                             : AK == "BinaryOperator"
-                                                   && Assign->value("opcode", std::string()) == "=";
-                if (!Assign || !bAssign || !Lhs || Kind(*Lhs) != "MemberExpr" || !Rhs)
+                const Json *Lhs = nullptr, *Rhs = nullptr, *Owner = nullptr;
+                if (!DefaultAssignment(S, Lhs, Rhs, Owner))
                 { *Err = Where + ": every statement is `Field = value;` or `Component->Field = value;`"; bOk = false; return; }
 
                 /* `Comp->Field` reaches through a component; a bare `Field` targets this class's
                    own CDO. Which of the three destinations a statement means is decided by who
                    DECLARES the member it names, so no Super:: spelling is needed. */
-                const Json* Owner = Strip(First(*Lhs));
-                const bool bThroughComponent = Owner && Kind(*Owner) == "MemberExpr";
+                const bool bThroughComponent = Owner != nullptr;
                 const std::string CompName = bThroughComponent ? Name(*Owner) : std::string();
                 const std::string Declarer = OwnerOf(bThroughComponent ? *Owner : *Lhs);
                 const FRecord* DR = Declarer.empty() ? nullptr : Find(Declarer);
@@ -9345,7 +10256,10 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         }
 
         if (auto Cat = R.Categories.find(Fn.Name); Cat != R.Categories.end()) BP.ApiCategory[UeNameOf(&R, Fn.Name)] = Cat->second;
-        BP.AddFunction(UeNameOf(&R, Fn.Name), Super, Params,
+        /* A patch's method is written over the function it overrides (TransplantFunctions), which keeps its own super:
+           naming it here would make the function its own parent. One B lacks is added with this super. */
+        if (R.bIsPatch) PatchSupers[R.CppName + "::" + UeNameOf(&R, Fn.Name)] = Super;
+        BP.AddFunction(UeNameOf(&R, Fn.Name), R.bIsPatch ? Null() : Super, Params,
                        [Stmts, bEndsWithReturn, bScratchNeeded, DerefStruct, bOpt = !bCurNoOpt](FScript& S, FIndex SelfExp) {
             if (bScratchNeeded)
             {
@@ -9365,6 +10279,12 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         }, Flags);
     }
 
+    if (!Segments.empty() && R.bIsPatch)
+    {
+        *Err = R.CppName + " (UE_PATCH)::" + Segments.front().Name + ": a patched function that waits (a latent call) needs "
+               "an ubergraph of its own in the game's class; not built yet";
+        return false;
+    }
     if (!Segments.empty())
     {
         const std::string UberName = "ExecuteUbergraph_" + R.CppName;
@@ -9471,6 +10391,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
 
     if (bReplicatesAnything) BP.SetReplicates(true);
     BP.Finish();
+    if (R.bIsPatch) return TransplantFunctions(R, *B, P, BP.ClassIndex(), Err);
     if (!SavePackage(P, OutDir, PackageName, Err)) return false;
     if (ApiDir && !BP.WriteApi(*ApiDir, Err))
     {
@@ -9771,7 +10692,11 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         }
         ++Generated;
     }
-    /* After the loop, not in it: lowering is what discovers the deref, and the mod's own
+    /* The patches here, not after the edits: lowering a patch's methods discovers what the loops below cook, as the
+       classes' lowering does (a global's class, the deref, a slot struct). */
+    for (const auto& Entry : Records)
+        if (Entry.second.bIsPatch && !GeneratePatch(Entry.second, Err)) return false;
+    /* After the loops, not in them: lowering is what discovers the deref, and the mod's own
        FDeref (if it declared one) was cooked above as an ordinary record. */
     if (bSynthDeref)
     {
@@ -9795,13 +10720,28 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     }
     for (const Json* Var : AssetDecls)
         if (!GenerateAsset(*Var, OutDir, Err)) return false;
-    if (Generated == 0 && RegistryRows.empty()) { *Err = "the source declares no UE_STRUCT, UE_ENUM or class deriving from a UE class"; return false; }
+    for (const auto& [Key, Var] : Edits)
+        if (!GenerateEdit(Key, *Var, Err)) return false;
+    for (const Json* Block : AssetEditBlocks)
+        if (!GenerateAssetEdits(*Block, Err)) return false;
+    if (!SaveEdits(OutDir, Err)) return false;
+    if (Generated == 0 && RegistryRows.empty() && Edited.empty())
+    { *Err = "the source declares no UE_STRUCT, UE_ENUM, class deriving from a UE class, asset or edit"; return false; }
     if (!GenerateNestedWrappers(OutDir, Err)) return false;
 
     /* A cooked package carries no registry data; without the bake the classes are invisible to it. A pak keeps its
        one registry beside its Content folder, FSD/AssetRegistry.bin, as the game's own pak and every editor-cooked
        mod pak do. So an OutDir of <root>/Content/<package path> (bpbuild's) puts it in <root>, merged with what other
-       compiles into the same pak put there; any other OutDir gets its own. */
+       compiles into the same pak put there; any other OutDir gets its own.
+       A compile with no rows (an edit-only one) writes none: a cooked game loads exactly one registry,
+       ProjectDir()/AssetRegistry.bin (AssetRegistry.cpp:198), and an empty one in a pak mounted at startup would
+       replace the game's. A registry another compile already put there is left as it is. */
+    if (RegistryRows.empty())
+    {
+        printf("  %-14s -> none (no assets of its own)\n", "registry");
+        remove(AstPath.c_str());
+        return true;
+    }
     std::string RegistryDir = OutDir;
     while (!RegistryDir.empty() && (RegistryDir.back() == '/' || RegistryDir.back() == '\\')) RegistryDir.pop_back();
     for (char& C : RegistryDir) if (C == '\\') C = '/';
@@ -9819,10 +10759,12 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
 }   // namespace
 
 bool CompileToAssets(const std::string& SourcePath, const std::string& IncludeDir,
-                     const std::string& OutDir, const std::optional<std::string>& ApiDir, std::string* Err)
+                     const std::string& OutDir, const std::optional<std::string>& ApiDir, const std::string& GameDir,
+                     std::string* Err)
 {
     /* Never freed: the process ends right after, and tearing the AST down node by node takes longer than exiting. */
     FCompiler* C = new FCompiler;
+    C->GameDir = GameDir;
     return C->Run(SourcePath, IncludeDir, OutDir, ApiDir, Err);
 }
 

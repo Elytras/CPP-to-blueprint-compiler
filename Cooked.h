@@ -1,0 +1,215 @@
+﻿#pragma once
+/*
+S38: a cooked UE4.27 package read into its tables and written back. An export's payload stays the bytes it was cooked
+with; an edit replaces one, and Write lays the header and the payloads out again around it.
+
+The layout is the one every package in FSD-WindowsNoEditor.pak has (52,645 surveyed, 2026-09-26): unversioned,
+PKG_FilterEditorOnly, one generation, no engine version, and the name map, imports, exports, depends, asset registry
+and preload dependencies back to back after the summary, with the payloads in export order in the .uexp. Anything
+else is refused with its reason rather than read loosely.
+*/
+#include <string>
+#include <vector>
+
+#include "SharedLib/core/Types.h"
+
+namespace Uasset
+{
+/* An FName as a package stores it: a name-map row and a number, one-based (0 = no number). */
+struct FNameRef
+{
+    int32 Index = 0;
+    int32 Number = 0;
+};
+
+struct FCookedName
+{
+    std::string Text;                           // UTF-8
+    uint16 NonCaseHash = 0, CaseHash = 0;       // as read; Write computes its own
+};
+
+struct FCookedImport
+{
+    FNameRef ClassPackage, ClassName;
+    int32 Outer = 0;                            // FPackageIndex
+    FNameRef ObjectName;
+};
+
+struct FCookedExport
+{
+    int32 Class = 0, Super = 0, Template = 0, Outer = 0;
+    FNameRef ObjectName;
+    uint32 ObjectFlags = 0;
+    bool bForcedExport = false, bNotForClient = false, bNotForServer = false;
+    uint32 PackageGuid[4] = { 0, 0, 0, 0 };
+    uint32 PackageFlags = 0;
+    bool bNotAlwaysLoadedForEditorGame = false, bIsAsset = false;
+    /* EDL: where this export's run starts in PreloadDependencies (-1 = none), then the four phase counts in order. */
+    int32 FirstExportDependency = -1;
+    int32 SerBeforeSer = 0, CreateBeforeSer = 0, SerBeforeCreate = 0, CreateBeforeCreate = 0;
+    std::vector<int32> Depends;                 // its DependsMap row: empty in every cooked package seen
+    std::vector<uint8> Payload;                 // its bytes in the .uexp
+};
+
+class FCookedPackage
+{
+public:
+    /* The header (.uasset or .umap) and the .uexp beside it. */
+    bool Load(const std::string& HeaderPath, std::string* Err);
+    bool Read(const std::vector<uint8>& Header, const std::vector<uint8>& Exp, std::string* Err);
+    void Write(std::vector<uint8>& Header, std::vector<uint8>& Exp) const;
+    bool Save(const std::string& HeaderPath, std::string* Err) const;
+
+    /* "Base" or "Base_<n>", as FName::ToString spells a numbered name. */
+    std::string NameOf(const FNameRef& N) const;
+    /* Whether N is the plain name S (no number), compared as FName compares: case-insensitively. */
+    bool Is(const FNameRef& N, const char* S) const;
+    /* The name of the class an export or import index names: an import's ObjectName, or an export's own. */
+    std::string ClassNameOf(int32 Index) const;
+
+    /* S38 edits. Every index the package already uses stays valid: a name or an import it lacks is appended. */
+    /* S as an FName of this package ("Base_<n>" split off as FName does): the row spelled like it, else the first
+       spelled like it but for case, else appended. */
+    FNameRef NameRef(const std::string& S);
+    /* Whether N is the FName S spells (the same number, the base compared case-insensitively). */
+    bool SameName(const FNameRef& N, const std::string& S) const;
+    /* The export row of the object named ObjectName in Outer (an FPackageIndex; 0 = top level), or -1. */
+    int32 FindExport(const std::string& ObjectName, int32 Outer = 0) const;
+    /* The FPackageIndex of the import (ClassPackage, ClassName, Outer, ObjectName), appended when there is none. */
+    int32 Import(const std::string& ClassPackage, const std::string& ClassName, int32 Outer, const std::string& ObjectName);
+    /* Dep (an FPackageIndex) created before export row Export is serialized - the edge the cook gives an object that
+       export's tags reference. Nothing when Dep is already one of its dependencies. */
+    void CreateBeforeSerialize(int32 Export, int32 Dep);
+    /* A copy of export row From named Name, appended with its payload and its dependency run (one on From itself
+       becomes one on the copy). The copy's FPackageIndex. */
+    int32 CopyExport(int32 From, FNameRef Name);
+
+    uint32 PackageFlags = 0;
+    uint32 Guid[4] = { 0, 0, 0, 0 };
+    uint32 PackageSource = 0;
+    std::vector<FCookedName> Names;
+    std::vector<FCookedImport> Imports;
+    std::vector<FCookedExport> Exports;
+    std::vector<int32> PreloadDependencies;
+};
+
+/*
+One FPropertyTag and its value, the way UStruct::SerializeTaggedProperties writes them (4.27 PropertyTag.cpp). The
+value stays raw bytes, and the tag's Size is its length. The type's own fields exist only when Type has no number.
+*/
+struct FTag
+{
+    FNameRef Name, Type;
+    int32 ArrayIndex = 0;
+    FNameRef StructName;                        // StructProperty, with its guid
+    uint32 StructGuid[4] = { 0, 0, 0, 0 };
+    uint8 BoolVal = 0;                          // BoolProperty: the value itself, with no payload
+    FNameRef EnumName;                          // ByteProperty (None for a plain byte), EnumProperty
+    FNameRef InnerType, ValueType;              // ArrayProperty and SetProperty: the inner; MapProperty: both
+    uint8 HasPropertyGuid = 0;
+    uint32 PropertyGuid[4] = { 0, 0, 0, 0 };
+    std::vector<uint8> Value;
+};
+
+/* A tag list starting at At, through its terminating None; At ends just past it. False if the bytes there are not
+   one: an out-of-range name, a size running past the end, or no None before the end. */
+bool ReadTags(const FCookedPackage& P, const std::vector<uint8>& Bytes, size_t& At, std::vector<FTag>& Out);
+/* The tags and the None that ends them. */
+void WriteTags(const FCookedPackage& P, const std::vector<FTag>& Tags, std::vector<uint8>& Out);
+
+/* S38: Tags into the tag list export row Export's payload starts with, each replacing the tag of its name and array
+   index or appended after the rest; what follows the list's None stays as it was. False, saying why, when the
+   payload does not start with a tag list. */
+bool SetTags(FCookedPackage& P, int32 Export, const std::vector<FTag>& Tags, std::string* Err);
+
+/*
+S38: one step of a path into a tag's value, for an edit of part of it. A struct member is the tag of its name in the
+struct's tag list or, in a struct the engine serializes natively (FVector's three floats), Size bytes at Offset of the
+StructSize the struct takes. An element is a TArray's Element'th, found by walking the ones before it: each
+ElementSize bytes, or when that is 0, an FString, a soft path or a tag list as ElementKind says. An array of structs
+carries an inner tag before its elements, whose Size counts them.
+*/
+struct FValueStep
+{
+    std::string Member;                         // a struct member, by its tag's name (the engine's spelling)
+    int32 Offset = -1, Size = 0, StructSize = 0;
+    int32 Element = -1;
+    int32 ElementSize = 0;
+    enum EElementKind : uint8 { Fixed, String, SoftPath, Tags } ElementKind = Fixed;
+    bool bStructElements = false;
+    bool IsTaggedMember() const { return Element < 0 && Offset < 0; }
+};
+
+/* S38: a value written at the end of Path, in the tag Root (array index 0) of export row Export; the rest of the tag's
+   value stays the game's, byte for byte. Fresh[K] is the tag holding only the path below step K (Fresh[0] the root
+   tag, Fresh[K] the member Path[K-1] names): it stands in for a tag the value lacks, a member the object takes from
+   its archetype, and is empty where the path below cannot be written that way (through a native struct or an
+   element). When Path ends at a member of a struct written as tags, the new value is Fresh.back(); otherwise it is
+   Leaf, the value's bytes. False, saying why, when the value is not what the path expects. */
+bool SetTagPath(FCookedPackage& P, int32 Export, const std::string& Root, const std::vector<FValueStep>& Path,
+                const std::vector<std::vector<uint8>>& Fresh, const std::vector<uint8>& Leaf, std::string* Err);
+
+/* S38: Tag's value read into AssetGen's own value model, typed off the tag alone: the FPropertyDef WriteDefaultTag
+   takes (Name, Type, StructName as Tag() writes it, Inner / Value), the value in its Default, a struct's members in
+   Default.Members. A natively serialized struct's members are its bytes in 4-byte chunks. False, saying why, for a
+   value the model cannot hold as the cook wrote it: a localized text, an FString in a form the encoder does not
+   write, a set of structs whose struct no tag names, a type the encoder has no case for, ... */
+struct FPropertyDef;
+bool ReadTagValue(const FCookedPackage& P, const FTag& Tag, FPropertyDef& Out, std::string* Why);
+
+/*
+Where a cooked UStruct's payload keeps each part, as UObject / UStruct::Serialize write it after the tag list: the
+lazy-object guid, SuperStruct, Children (a count, then each index: RemoveUField_Next), ChildProperties (a count, then
+each FProperty through SerializeSingleField) and the script (BytecodeBufferSize, SerializedScriptSize, the bytes).
+Offsets into the payload; Tail is just past the script, where the UFunction's or UClass's own fields start.
+*/
+struct FStructLayout
+{
+    size_t Super = 0, Children = 0, Properties = 0, Script = 0, Tail = 0;
+    std::vector<int32> ChildIndices;
+    struct FField                               // one of ChildProperties: its bytes, and the head that says what it is
+    {
+        size_t Begin = 0, End = 0;
+        FNameRef Type, Name;
+        int32 ElementSize = 0;
+        uint64 PropertyFlags = 0;
+    };
+    std::vector<FField> Fields;
+};
+
+/* A UFunction's tail (UFunction::Serialize): FunctionFlags, RepOffset (FUNC_Net only), EventGraphFunction and
+   EventGraphCallOffset. Flags is Tail. */
+struct FFunctionLayout : FStructLayout
+{
+    size_t Flags = 0;
+    uint32 FunctionFlags = 0;
+};
+/* False unless the payload is exactly that, every property of a type the reader knows. */
+bool ReadFunctionLayout(const FCookedPackage& P, const std::vector<uint8>& Payload, FFunctionLayout& Out);
+
+/* A UClass's tail (4.27 UClass::Serialize): FuncMap (a count, then each name and function), ClassFlags, ClassWithin,
+   ClassConfigName, ClassGeneratedBy, Interfaces (a count, then each class, pointer offset and bImplementedByK2),
+   bDeprecatedForceScriptOrder, a dummy name, bCooked and the class default object. FuncMap is Tail. */
+struct FClassLayout : FStructLayout
+{
+    size_t FuncMap = 0, AfterFuncMap = 0;
+    std::vector<std::pair<FNameRef, int32>> Functions;
+    uint32 ClassFlags = 0;
+    int32 DefaultObject = 0;
+};
+bool ReadClassLayout(const FCookedPackage& P, const std::vector<uint8>& Payload, FClassLayout& Out);
+
+/* S38: Function (an FPackageIndex, an export of Class's) added to class export row Class's Children and FuncMap under
+   Name, and created before the class is serialized, as the cook orders a class's own functions. False, saying why,
+   when the class's payload does not read. */
+bool AddClassFunction(FCookedPackage& P, int32 Class, int32 Function, FNameRef Name, std::string* Err);
+
+/* The gate before any edit is trusted: every cooked package under Dir read and written back in memory, with a report
+   of what was refused, what came back different, and whether AssetGen's name hashes and name order match the cook's.
+   Each export's tagged properties go through ReadTags / WriteTags on the way, and each tag's value through
+   ReadTagValue and WriteDefaultTag, AssetGen's own encoder, against the package's name table. 0 when every package
+   comes back byte-identical and no value the model holds comes back different; a value it cannot hold, or one whose
+   tag alone differs (a C array's index, a user-defined struct's guid), is counted with its reason. */
+int RoundTrip(const std::string& Dir);
+
+}   // namespace Uasset

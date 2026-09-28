@@ -17,7 +17,7 @@ FLOW_OPS = {6, 7, 0x4C, 0x4D, 0x4E, 0x4F}
 
 class Node:
     def __init__(s, op, mem):
-        s.op, s.mem, s.kids, s.val = op, mem, [], None
+        s.op, s.mem, s.kids, s.val, s.own = op, mem, [], None, False
 
 
 class P(W):
@@ -51,7 +51,11 @@ class P(W):
             if op != 0x31: n.val = s.i32()
             s.args(k, op + 1)
         elif op == 0x67: k.append(s.node())                          # SoftObjectConst: its path string
-        elif op in (0x1C, 0x46, 0x68): n.val = s.ptr().split("'")[-2]; s.args(k)
+        elif op in (0x1C, 0x46, 0x68):
+            p = s.ptr()                                              # exp[i]:Name, or imp[i]:Class'Name'
+            n.own = p.startswith('exp[')
+            n.val = p.split(':', 1)[1] if n.own else p.split("'")[-2]
+            s.args(k)
         elif op == 0x1D: n.val = s.i32()
         elif op == 0x1E: n.val = struct.unpack_from('<f', s.b, s.o)[0]; s.raw(4)
         elif op in (0x24, 0x2C): n.val = s.u8()
@@ -373,7 +377,7 @@ def run(base, function, self_vars=None, **parms):
             size, signed = VIEWS[n.kids[0].val]
             return mem_read(ev(n.kids[0].kids[0])['Data'] + ev(n.kids[1]) * size, size, signed)
         if o == 0x6B: return ev(n.kids[0])[ev(n.kids[1])]
-        if o in (0x1B, 0x45):                                        # the class's own function, by name: a frame of its own
+        if o in (0x1B, 0x45) or n.own:                               # the class's own function: a frame of its own
             names = params_of(base, n.val)
             outs = params_of(base, n.val, 0x100)
             # The VM steps a reference argument with no result buffer (ProcessScriptFunction), so a constant or a
@@ -392,7 +396,7 @@ def run(base, function, self_vars=None, **parms):
             return CONTAINERS[n.val](ev, lambda d, v: d is n.kids[2] or store(d, v), n.kids)
         if o in (0x1C, 0x46, 0x68) and n.val in CONTAINERS: return CONTAINERS[n.val](ev, store, n.kids)
         if o in (0x1C, 0x46, 0x68):
-            if n.val not in MATH: raise SystemExit('unsupported call ' + n.val)
+            if n.val not in MATH: raise SystemExit('unsupported call %s (in %s of %s)' % (n.val, function, base))
             args = [ev(a) for a in n.kids]
             if n.val.endswith('_Int64Int64'):
                 args = [v & 0xFFFFFFFF if is32(a) else v for a, v in zip(n.kids, args)]
