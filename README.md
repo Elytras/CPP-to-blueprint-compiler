@@ -7,9 +7,14 @@ the editor, and you don't ship a DLL.
 
 The only target so far is Deep Rock Galactic (UE 4.27, cooked, unversioned, tagged properties).
 
+Start with [GUIDE.md](GUIDE.md): how your C++ maps onto Blueprint, a first mod, and a tour of what a mod can do.
+[REFERENCE.md](REFERENCE.md) lists every construct the compiler accepts, warns about or refuses, and every message it
+prints. [examples/](examples/) holds complete mods that build as they are.
+
 ## Requirements
 
-AssetGen builds and runs on Windows and on Linux; both write byte-identical assets.
+AssetGen builds and runs on Windows and on Linux, and is meant to write the same bytes on both
+([Reproducible output](GUIDE.md#reproducible-output) says what has been compared).
 
 | What | Windows | Linux |
 | --- | --- | --- |
@@ -109,6 +114,9 @@ mods:
     embed: true                # optional: also pack the needed mods' assets into this pak
 ```
 
+`generate_api` and `api_dir` also write editor stubs of a mod's API; [Building mods](GUIDE.md#building-mods) lists
+every key. `python tools/bpbuild.py examples <UeApi dir> <path to assetgen>` builds the examples.
+
 ### Packing on Linux
 
 A native Linux UnrealPak (from a source-built UE 4.27) goes on `PATH` or in `UNREALPAK`. Otherwise run the
@@ -157,9 +165,9 @@ Under Proton the game reads paks from
 python tools/test_bytecode.py [--assetgen <assetgen binary>] [--ueapi <UeApi dir>]
 ```
 
-compiles every mod in `tests/` and checks what a mod can observe: return values and side effects (run offline
-through `tools/runscript.py` / `tools/runvm.py`), and what the engine sees (exports, flags, property types,
-defaults, the registry). It never checks the exact bytecode, so an optimization that keeps the behaviour passes.
+compiles every mod in `tests/` and `examples/` and checks what a mod can observe: return values and side effects
+(run offline through `tools/runscript.py` / `tools/runvm.py`), and what the engine sees (exports, flags, property
+types, defaults, the registry). It never checks the exact bytecode, so an optimization that keeps the behaviour passes.
 CI runs it on Linux and Windows against the [SDK repo](https://github.com/Elytras/DRG-Blueprint-Cpp-SDK) on
 every push and pull request.
 
