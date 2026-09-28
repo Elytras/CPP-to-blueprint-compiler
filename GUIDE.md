@@ -389,14 +389,10 @@ node: the object if it is a `T`, else null. Math is in `UKismetMathLibrary` (`Cl
 
 Reading another object's property is the Get node with a Target: `Me->HealthComponent->GetHealth()`. Unlike C++, a
 read or a call through a null object does not crash: the game logs `Accessed None`, and a value reads as zero.
-`if (Obj)` is the IsValid node, which is also false for an object that is being destroyed. A subsystem comes from
-`USubsystemBlueprintLibrary`, the editor's Get node for it:
-`(UTracerManager *)USubsystemBlueprintLibrary::GetWorldSubsystem(this, UTracerManager::StaticClass())`. Pass `this`
-yourself, since the compiler fills in only a parameter named `WorldContext...`, and call `GetGameInstanceSubsystem` or
-`GetEngineSubsystem` for the other kinds. An SDK you generate yourself (see [The SDK](#the-sdk)) also gives each
-subsystem class a typed static `Get()`, such as `UTracerManager::Get()`, and adds `GetSubsystem<UTracerManager>()`.
-The published SDK does not have them yet, and clang rejects the calls with `no member named 'Get'` and
-`use of undeclared identifier 'GetSubsystem'`.
+`if (Obj)` is the IsValid node, which is also false for an object that is being destroyed. A subsystem is its class's
+static `Get()`, the editor's Get node for it: `UTracerManager::Get()`, or `GetSubsystem<UTracerManager>()`. Left out,
+the world context is `this`. See [Working with other objects](REFERENCE.md#working-with-other-objects) for the kinds
+and for spelling the getter by hand.
 
 ```cpp
 void ReceiveBeginPlay() {
