@@ -3173,11 +3173,11 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `UDamageSubsystem::Get()`, `UUGCSubsystem::Get()` | The editor's Get <Subsystem> node. In headers generated with the current genueapi, every subsystem class has a static `Get`, which calls `USubsystemBlueprintLibrary`'s getter for the class's kind (engine, game instance or world) and returns the subsystem already typed. The SDK repo's headers do not have `Get` or `GetSubsystem` yet: until they are regenerated, write the getter by hand as shown below. | Yes |
+| `UDamageSubsystem::Get()`, `UUGCSubsystem::Get()` | The editor's Get <Subsystem> node. Every subsystem class in the SDK has a static `Get`, which calls `USubsystemBlueprintLibrary`'s getter for the class's kind (engine, game instance or world) and returns the subsystem already typed. | Yes |
 | `GetSubsystem<UTracerManager>()` | The same as `UTracerManager::Get()`. | Yes |
 | `UTracerManager::Get(Other)` | The world or game instance subsystem of `Other`'s world or game instance. Left out, the context is `this`, or a static function's own `WorldContext...` parameter. An engine subsystem's `Get` takes no argument, because there is one engine. | Yes |
 | `BP_TracerManager_C::Get()` | A subsystem the game implements as a Blueprint, for its Blueprint variables. DRG has two: `BP_TracerManager_C` (world) and `BP_FadeScreenSubSystem_C` (game instance), each in its `UeApi/Game` header. | Yes |
-| `(UTracerManager *)USubsystemBlueprintLibrary::GetWorldSubsystem(this, UTracerManager::StaticClass())` | What `Get` expands to, written by hand, for SDK headers that have no `Get`. The C-style cast compiles to nothing. | Yes |
+| `(UTracerManager *)USubsystemBlueprintLibrary::GetWorldSubsystem(this, UTracerManager::StaticClass())` | What `Get` expands to, written by hand. The C-style cast compiles to nothing. | Yes |
 
 ```cpp
 #include "UeApi/SimpleUGC.h"
@@ -3194,7 +3194,7 @@ public:
 };
 ```
 
-Without `Get` in the headers:
+The same by hand, as `Get` expands it:
 
 ```cpp
 #include "UeApi/SimpleUGC.h"
@@ -3214,9 +3214,9 @@ Notes:
 
 - DRG has 48 subsystem classes with a `Get`: 8 engine, 20 game instance and 20 world subsystems. None is a local
   player subsystem.
-- SDK headers from an older genueapi, the SDK repo's current headers among them, have neither `Get` nor
-  `GetSubsystem`: clang says "no member named 'Get'" or "use of undeclared identifier 'GetSubsystem'". Regenerate
-  them ([The SDK](GUIDE.md#the-sdk)), or call the library getter by hand as above.
+- An SDK generated before subsystems got `Get` has neither `Get` nor `GetSubsystem`: clang says "no member named
+  'Get'" or "use of undeclared identifier 'GetSubsystem'". Update the SDK ([The SDK](GUIDE.md#the-sdk)), or call the
+  library getter by hand as above.
 - Pass the context to `GetWorldSubsystem` and `GetGameInstanceSubsystem` yourself. Their parameter is named
   `contextObject`, not `WorldContext...`, so it is not filled in. `Cast<T>` in place of the C-style cast also works,
   but adds a run-time cast.
@@ -5106,7 +5106,7 @@ listed here is refused with "unimplemented intrinsic".
 | `GetOuter()` | The object's outer, read from memory. Not on a null object, and not in a function that waits. | [Working with other objects](#working-with-other-objects) |
 | `GetOutermostTypedOuter<T>(Obj)` | The farthest outer of Obj that is a T, or null. | [Working with other objects](#working-with-other-objects) |
 | `GetParmClassName` | The method that `__ClassOf__` calls on the class that uses it. You define it, with exactly two parameters. | [Intrinsics](#intrinsics) |
-| `GetSubsystem<T>()` | The same as `T::Get()`. In SDK headers from the current genueapi; the published SDK does not have it yet. | [Working with other objects](#working-with-other-objects) |
+| `GetSubsystem<T>()` | The same as `T::Get()`. | [Working with other objects](#working-with-other-objects) |
 | `GetTypedOuter<T>(Obj)` | The nearest outer of Obj that is a T, or null. | [Working with other objects](#working-with-other-objects) |
 | `if (Obj)`, `!Obj` | Is Valid: false for null and for an object that is being destroyed. | [Working with other objects](#working-with-other-objects) |
 | `if (X)` on a value that is not a bool | An int32 goes through ToBool (integer), a float, int64 or byte is compared with zero, and an FName is tested against None. | [Statements and control flow](#statements-and-control-flow) |
@@ -5153,7 +5153,7 @@ listed here is refused with "unimplemented intrinsic".
 | `static_cast<T *>(Obj)` | No node: the reference passes through unchecked. Use `Cast<T>` when the object may not be a T. | [Types](#types) |
 | String `+`, `FString("Kills: ") + Count` | Append: each operand becomes a string, and the result converts to the destination type. | [Strings and text](#strings-and-text) |
 | String conversions, `FString S = Count;`, `int(Label)` | Numbers, names, texts and objects convert to strings implicitly. Text parses to a number only with an explicit cast. | [Strings and text](#strings-and-text) |
-| `<Subsystem>::Get()` | A subsystem, as the editor's Get node gives it. `Get(Other)` asks Other's world. In SDK headers from the current genueapi; the published SDK does not have it yet. | [Working with other objects](#working-with-other-objects) |
+| `<Subsystem>::Get()` | A subsystem, as the editor's Get node gives it. `Get(Other)` asks Other's world. | [Working with other objects](#working-with-other-objects) |
 | `Super::Method()` | Not a name C++ knows. Write the parent class: `Base::Method()`. | [Overrides and parent calls](#overrides-and-parent-calls) |
 | `T &` parameter | A pass-by-reference pin: the callee's writes reach the caller. Bound to a map element or to `C ? X : Y`, it gets a copy stored back after the call, with a warning. | [Functions](#functions) |
 | `TDelegate<...>`, `{this, &C::F}` | A method of `this` passed as a delegate argument (Create Event), such as to a timer. | [Event dispatchers](#event-dispatchers), [Timers and input](#timers-and-input) |
