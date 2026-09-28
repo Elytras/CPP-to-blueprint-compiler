@@ -2114,6 +2114,47 @@ Notes:
 - A `static inline` member such as `AddOne` is expanded into each caller. The cooked library does not export it, so a
   Blueprint made in the editor cannot call it.
 
+### Free functions
+
+A Blueprint has no free functions. One that is not `inline` is a static of `BPL_<source>`, a function library the
+compiler generates for each source file and cooks in the mod's package: `BPL_MyMod` for `MyMod.cpp`. A call is a call
+to that static on the library's default object, as to a static of a library you write yourself.
+
+| You write | What it does | Status |
+|---|---|---|
+| `int32 Twice(int32 V) { ... }` at namespace scope | A static of the source's library. Only the free functions a call reaches are compiled, and those they call in turn. | Yes |
+| `namespace Util { int32 Twice(int32 V) { ... } }` | `Util__Twice` in the library, beside a `Twice` of another namespace. | Yes |
+| `int32 Fact(int32 N) { return N <= 1 ? 1 : N * Fact(N - 1); }` | A library function may call itself and other free functions. | Yes |
+| `APawn *FirstPawn() { return UGameplayStatics::GetPlayerPawn(0); }` | Each library function has a hidden world context, as a function of the editor's function library does. A call fills it in with its `this`, or with its own world context in a static, so an engine call in the body finds the caller's world. | Yes |
+| `APawn *FirstPawn(UObject *WorldContextObject = nullptr)` | A world context parameter you write replaces the hidden one; see [World context in inline helpers](#world-context-in-inline-helpers). | Yes |
+| `int32 Ov(int32 V)` beside `int32 Ov(float V)`, neither `inline`, both called | Refused where the second is called (`is overloaded`): a library has one function per name. Rename one, or make it `inline`. An inline overload beside a non-inline one is fine. | Refused |
+| A free function that calls Delay or UE_AWAIT | Refused (`a free function is one unless it is inline`): a static has no object to keep a waiting function's locals. Make the helper `inline`, so that it expands into the method that waits; see [Latent calls](#latent-calls). | Refused |
+| `int32 Helper(int32 V);` declared here and defined in another source | Refused at the call (`call to an unknown function: Helper`). A free function's body must be in the source that calls it, or in a header that source includes. To share one between mods, write a function library class. | Refused |
+
+```cpp
+int32 Twice(int32 V) { return V * 2; }
+namespace Util {
+int32 Clamp(int32 V, int32 Lo = 0, int32 Hi = 10) { return V < Lo ? Lo : V > Hi ? Hi : V; }
+}
+APawn *FirstPawn() { return UGameplayStatics::GetPlayerPawn(0); }   // gets the caller's world context
+
+class AMyActor : public AActor {
+public:
+  int32 Use(int32 V) { return Twice(V) + Util::Clamp(V); }   // BPL_MyMod: Twice, Util__Clamp
+  APawn *Mine() { return FirstPawn(); }                       // passes this
+};
+```
+
+Notes:
+
+- The library is per source, not per mod: each source of a mod is compiled on its own, so a mod with two sources has
+  two libraries, each holding what its own source calls. A function both call is in both.
+- In the editor API stub the library is a Blueprint Function Library, its functions callable from Blueprints made
+  in the editor.
+- An error in a library function's body is prefixed `BPL_<source>::<Name>: `, the name as the library spells it
+  (`Util__Twice`).
+- Do not name a class of your own `BPL_<source>`.
+
 ### Overloading
 
 A Blueprint class has one function per name. Overloads work when they are all `inline`, or when the one non-inline
@@ -2138,7 +2179,7 @@ int32 Use(int32 V) { return Pick(V) + Pick(true) + Get(V) + Get(V, 2); }
 
 | You write | What it does | Status |
 |---|---|---|
-| `auto L = [X](int32 Y) { return X + Y; };` | Refused, as are an immediately invoked lambda and a lambda passed to an inline template, each with its own `unimplemented` message. Write an inline method or a free inline function. | Refused |
+| `auto L = [X](int32 Y) { return X + Y; };` | Refused, as are an immediately invoked lambda and a lambda passed to an inline template, each with its own `unimplemented` message. Write an inline method or a free function. | Refused |
 | `auto *P = &Inc1; return P(X);` | Refused (`unimplemented local`): a Blueprint has no function pointers. To call a function later, bind it to a dispatcher or pass it as a delegate (`{this, &AMine::Handle}`); see [Event dispatchers](#event-dispatchers). | Refused |
 | `inline FPairX operator+(FPairX L, FPairX R)` | Refused where it is used (`unimplemented operator overload`). Only the engine's operators that UeApi lists, and string `+`, are lowered. Write a named inline function. | Refused |
 
@@ -2234,7 +2275,7 @@ Notes:
 | `A + B`, `A < B`, `Dir * 2.0f` | Operators on numbers and vectors need no written call: they become the math library's operator functions; see [Operators](#operators). | Yes |
 | `S == "x"` on an FString | Ignores case, as FString's `==` does in UE C++; see [Strings and text](#strings-and-text). | Yes |
 | `FMath::Clamp(V, 0, 10)` | clang error `use of undeclared identifier 'FMath'`: FMath is not part of the reflected API, so UeApi does not declare it. Use UKismetMathLibrary. | Refused |
-| `std::min(A, B)`, `std::sqrt(X)`, `__builtin_sqrtf(X)` | Refused, even with `#include <algorithm>` or `<cmath>` (`call to an unknown function`): a mod has no C++ standard library to call into. Use UKismetMathLibrary, or write the helper as an inline function. | Refused |
+| `std::sqrt(X)`, `__builtin_sqrtf(X)`, `std::clamp(V, Lo, Hi)` | Refused, even with `#include <cmath>` or `<algorithm>`: a mod has no C++ standard library to call into. A template a header defines whole, such as `std::min`, is expanded like any template where clang finds that header. Use UKismetMathLibrary, or write the helper yourself. | Refused |
 | `if constexpr (__is_same(T, int32))`, `static_assert(__is_same(int32, int))` | clang's type-trait builtins work in place of `<type_traits>` where clang decides them at build time. | Yes |
 | `bool B = __is_same(A, B);`, `if (__is_same(A, B))`, `return __is_same(A, B) ? 1 : 0;` | Refused ("unimplemented argument TypeTraitExpr"), even in a `constexpr bool` local. Put the test in `if constexpr`. | Not yet |
 
@@ -2388,21 +2429,21 @@ Notes:
 ## Inline functions and templates
 
 `inline` is the editor's macro: the body is copied into each call, and no function exists at run time. A template is
-always expanded this way. The rule to remember: an inline method expands only on `this`. For a helper that takes an
-object, write a free inline function.
+always expanded this way, `inline` or not. The rule to remember: an inline method expands only on `this`. For a helper
+that takes an object, write a free function.
 
 ### Inline functions
 
 | You write | What it does | Status |
 |---|---|---|
 | `inline int32 Clamp(int32 V, int32 Lo, int32 Hi) { ... }` | Never a Blueprint function. Each call copies the body into the caller, like an editor macro, with its own locals, and `return` jumps to the end of the copy. Loops, switch, goto, nested inline calls and early returns all work. | Yes |
-| `inline` on the declaration, or only on the out-of-line definition | Either one makes the method inline. | Yes |
+| `inline` on the declaration, or only on the out-of-line definition | Either one makes the method or free function inline. | Yes |
 | `Late(Counter)` | Each argument is evaluated once, before the body runs. A by-value parameter keeps the argument's value at the call, even if the body changes what it was read from. A constant or read-only argument is used in place, without a copy. | Yes |
 | `inline bool AttachTo(USceneComponent *Child, USceneComponent *Parent)` at namespace scope | A free inline function, expanded at every call. A free function can act on any object; an inline method expands only on `this`. | Yes |
-| `int32 Helper(int32 X) { ... }` at namespace scope, without `inline` | Refused at the call: `call to an unknown function: Helper`. A Blueprint has no free functions. Add `inline`, or make it a static of a function library class. | Refused |
+| `int32 Helper(int32 X) { ... }` at namespace scope, without `inline` | Not expanded: a Blueprint function of the library generated for the source, called on its default object; see [Free functions](#free-functions). | Yes |
 | `static inline int32 AddOne(int32 V)` in a library class | Expanded at the call, from its own class or from any class that includes the header, in any mod. The library does not export it. | Yes |
 | `Bump(By)` inside an inline body that a subclass expands | A call on `this` goes by name, so the object's most derived method runs, including an override compiled later. | Yes |
-| `Other->Twice(3)` where `Twice` is an inline method | Refused: `called on another object (only this)`, because `this` in the body stays the caller's self. Make the method non-inline, or write a free inline function that takes the object. | Not yet |
+| `Other->Twice(3)` where `Twice` is an inline method | Refused: `called on another object (only this)`, because `this` in the body stays the caller's self. Make the method non-inline, or write a free function that takes the object. | Not yet |
 | An inline function that calls itself, directly or through another inline | Refused (`calls itself`): the expansion would never end. Make it non-inline; a Blueprint function may recurse. One overload calling another is fine. | Refused |
 | `inline int32 Nope(int32 X);` with no body | Refused at the call (`has no body`). clang also warns with `-Wundefined-inline`. | Refused |
 | `OnHit.Add(this, &AMine::Handle)` where `Handle` is inline | Refused: a delegate binds a function by name, and an inline function is none. Drop `inline`; see [Event dispatchers](#event-dispatchers). | Refused |
@@ -2428,7 +2469,6 @@ Notes:
 - A `T&` parameter of an inline function is another name for the place it is bound to; see
   [Functions](#functions) for reference parameters and copy-back.
 - `Objects.h` already defines `AttachToComponent`, so do not use that name for a helper of your own when you include it.
-- A refusal of a call to a free function without `inline` names the calling function, not the definition.
 
 ### World context in inline helpers
 
@@ -2453,11 +2493,11 @@ public:
 
 Notes:
 
-- This holds for inline methods, free inline functions and static inline members of a library.
+- This holds for inline methods, free functions, inline or not, and static inline members of a library.
 - Only the name is checked (`WorldContextObject`, `WorldContext`, `WorldContextObject_0`...), not the type. Any written
   default is replaced, not only `nullptr`.
-- A static member can call only a free inline function or a static inline member. An inline method needs an object,
-  and clang enforces that.
+- A static member can call a free function or a static inline member, but not an inline method: that needs an
+  object, and clang enforces it.
 - Older AssetGen builds passed the written default (null) instead.
 
 ### Templates
@@ -2465,10 +2505,9 @@ Notes:
 | You write | What it does | Status |
 |---|---|---|
 | `SpawnActor<AActor>(AActor::StaticClass(), Where)` from `Objects.h` | Each instantiation clang makes is expanded at its call like any inline function. No function exists per instantiation; see [Creating objects](#creating-objects). | Yes |
-| `template <class T> inline T Max2(T A, T B)` | A free function template needs `inline`. | Yes |
-| `template <class T> T Max2(T A, T B)` without `inline` | Refused at the call: `call to an unknown function: Max2`. Add `inline`. | Refused |
+| `template <class T> T Max2(T A, T B)`, `inline` or not | A free function template is expanded at each call, like a member template. | Yes |
 | `template <class T> int32 WidthOf()` in a class | A member template is expanded at its call, with or without `inline`. No Blueprint function is made, and only calls on `this` expand. | Yes |
-| `inline auto TwiceN(Number auto V)`, or `int32 AutoP(auto V)` in a class | An `auto` parameter makes the function a template, expanded at each call. A free one needs `inline`. | Yes |
+| `auto TwiceN(Number auto V)`, or `int32 AutoP(auto V)` in a class | An `auto` parameter makes the function a template, expanded at each call. | Yes |
 | `template <class T> concept Number = requires(T A) { A + A; };` | Concepts and requires-clauses are checked by clang and cost nothing at run time. A wrong type is a "constraints not satisfied" error on the calling line. | Yes |
 | `template <class... T> inline int32 Fwd(T... V) { return Sum2(V...); }` | Pack expansion into a call works. | Yes |
 | `sizeof...(V)` | Refused: `unimplemented argument SizeOfPackExpr`. | Not yet |
@@ -2503,7 +2542,7 @@ Notes:
 |---|---|---|
 | `constexpr int32 SqM(int32 X) const` in a class | An ordinary Blueprint function that runs in the game; `constexpr` changes nothing. Mark it `inline` to expand it at calls, or `consteval` to run it at build time. | Yes |
 | `inline constexpr int32 Sq(int32 X)` at namespace scope | Expanded like any inline function and computed in the game. | Yes |
-| `constexpr int32 Sq(int32 X)` at namespace scope, without `inline` | Refused at the call: `call to an unknown function: Sq`. AssetGen does not run a plain constexpr call at build time. Add `inline`, or use `consteval`. | Refused |
+| `constexpr int32 Sq(int32 X)` at namespace scope, without `inline` | A Blueprint function of the source's library, computed in the game like any [free function](#free-functions): AssetGen does not run a plain constexpr call at build time. Use `consteval` for that. | Yes |
 | `consteval int32 Fnv(const char *S)` | clang runs the call while compiling, and only the answer reaches the Blueprint; see [Constants](#constants). | Yes |
 | `int32 K = Sq(3);` as a member initializer, with a plain constexpr `Sq` | Refused (`a default is a value known when the mod is built`), and so is a consteval `Sq` called there directly. A default reaches a function call only through a constant: `static constexpr int32 kSq = Sq(3);` with `Sq` a consteval function at namespace scope, then `int32 K = kSq;`. See [Constants](#constants). | Refused |
 
@@ -5111,7 +5150,8 @@ listed here is refused with "unimplemented intrinsic".
 | `if (Obj)`, `!Obj` | Is Valid: false for null and for an object that is being destroyed. | [Working with other objects](#working-with-other-objects) |
 | `if (X)` on a value that is not a bool | An int32 goes through ToBool (integer), a float, int64 or byte is compared with zero, and an FName is tested against None. | [Statements and control flow](#statements-and-control-flow) |
 | `InitCave`, `InitSpacerig` | The class names the game spawns from a mod: InitSpacerig in the Space Rig, InitCave in a mission. | [Running in the game](GUIDE.md#running-in-the-game) |
-| `inline` functions and templates | Expanded at each call like an editor macro, with no Blueprint function of its own. A free function or template must be `inline`. | [Inline functions and templates](#inline-functions-and-templates) |
+| `inline` functions and templates | Expanded at each call like an editor macro, with no Blueprint function of its own. A template is expanded, `inline` or not. | [Inline functions and templates](#inline-functions-and-templates) |
+| Free function, `int32 Twice(int32 V) { ... }` | Without `inline`, a Blueprint function of `BPL_<source>`, the function library the compiler generates for the source. | [Free functions](#free-functions) |
 | `(int64)Obj`, `(uint8 *)Obj` | The object's address, as an int64 or as a pointer. | [Pointers and memory](#pointers-and-memory) |
 | Lambdas, function pointers, operator overloads | Refused, all three: a Blueprint has no lambda, no function pointer and no operator of a mod's own. Write an inline function, or pass `{this, &C::F}` as a delegate. | [Functions](#functions) |
 | LoadAsset, `UKismetSystemLibrary::LoadAsset(Soft)`, `LoadAssetClass(Soft)` | Async Load Asset and Async Load Class Asset: the function waits, and the call's value is what loaded, or null. | [Latent calls](#latent-calls) |
@@ -5206,9 +5246,10 @@ When AssetGen refuses a source, it prints one line, and `assetgen compile` exits
   FAILED: <message>
 ```
 
-A refusal raised inside a function starts with `<Class>::<Function>: `. One raised inside an inline function's body
-adds `inline <Class>::<Method>: ` after that, or `inline <Function>: ` for a free inline function, so the prefix names
-the function the problem is in. A refusal about a class's variables, or about the source as a whole, has no prefix.
+A refusal raised inside a function starts with `<Class>::<Function>: `, and inside a free function that is not inline
+with `BPL_<source>::<Function>: `. One raised inside an inline function's body adds `inline <Class>::<Method>: ` after
+that, or `inline <Function>: ` for a free inline function, so the prefix names the function the problem is in. A
+refusal about a class's variables, or about the source as a whole, has no prefix.
 The compile stops at the first refusal: fix it and compile again to see the next one.
 
 A warning does not stop the compile:
@@ -5486,13 +5527,16 @@ and where the feature is described. In each group, the messages you are most lik
 
 ### Functions and inline functions
 
-- `call to an unknown function: <Name>`: a call to a function AssetGen has no body for. It compiles methods of classes
-  and free functions marked `inline`, so the usual cause is a free function or function template without `inline`, a
-  plain `constexpr` free function, or a standard library function such as `std::min`, `sqrtf` or `__builtin_sqrtf`.
-  The message names the caller, not the definition. Fix: mark a free function `inline`, or make it a static method of a
-  UBlueprintFunctionLibrary class. For math, call the UKismetMathLibrary statics. To compute a value when the mod is
-  built, use `consteval`. See [Inline functions and templates](#inline-functions-and-templates) and
-  [Calling engine and game functions](#calling-engine-and-game-functions).
+- `call to an unknown function: <Name>`: a call to a function AssetGen has no body for. The usual cause is a free
+  function declared in this source and defined in another, or a C runtime function such as `sqrtf` or
+  `__builtin_sqrtf`, which `std::sqrt` calls too. The message names the caller, not the definition. Fix: define the
+  free function in the source that calls it or in a header it includes; to share one between mods, make it a static
+  method of a UBlueprintFunctionLibrary class. For math, call the UKismetMathLibrary statics. See
+  [Free functions](#free-functions) and [Calling engine and game functions](#calling-engine-and-game-functions).
+- `<Name> is overloaded, and a function library has one function per name: give each non-inline overload a name of
+  its own, or make all but one inline`: a source calls two free functions of one name, neither `inline`, and each would
+  be a Blueprint function of the source's library, which keeps one per name. Fix: rename one, or mark it `inline`. See
+  [Free functions](#free-functions).
 - `use of undeclared identifier 'FMath'`: clang's message. UE's native FMath is not part of the reflected API, and a
   mod has no C++ standard library to call. Fix: call UKismetMathLibrary, as in
   `UKismetMathLibrary::Clamp(V, 0, 10)`. See [Calling engine and game functions](#calling-engine-and-game-functions).
@@ -5512,8 +5556,8 @@ and where the feature is described. In each group, the messages you are most lik
   `if (C) Add5(M[K()]); else Add5(X);`. See [Functions](#functions).
 - `TODO: inline function <Class>::<Method> called on another object (only this)`: an inline method called on another
   object, `Other->Twice(3)`, or an inline method of a UE_STRUCT. An inline body runs with the caller's `this`. Fix: drop
-  `inline`, so that the method is a Blueprint function any object can run, or write a free inline function that takes
-  the object as a parameter. See [Inline functions and templates](#inline-functions-and-templates).
+  `inline`, so that the method is a Blueprint function any object can run, or write a free function that takes the
+  object as a parameter. See [Inline functions and templates](#inline-functions-and-templates).
 - `<Class>::<Function> returns <Type>: a reference return is refused until what it means to a C++ caller is specified;
   return a value or a pointer`: Not yet. A method that returns `T&`, such as `int32 &Slot(int32 I)` or
   `int32 &Get(int32 *P) { return *P; }`. Fix: return a value, or a pointer. See [Functions](#functions).
@@ -5543,7 +5587,7 @@ and where the feature is described. In each group, the messages you are most lik
   `TODO: unimplemented operator overload operator() yielding <Type>` and `TODO: unimplemented argument LambdaExpr`: a
   lambda in a local, called in place, or passed as an argument. A function pointer in a local gives
   `TODO: unimplemented local <Name>: <Type> (*)(<Parms>)`. A Blueprint has neither. Fix: write an inline method or a
-  free inline function. To call something later, bind a method to a dispatcher or a delegate parameter,
+  free function. To call something later, bind a method to a dispatcher or a delegate parameter,
   `{ this, &AMine::Handle }`. See [Functions](#functions).
 - `TODO: unimplemented argument <Kind>`: an expression with no Blueprint form, named by clang's kind, such as
   `CXXNewExpr` for `new`. Fix: create objects with the helpers in `Objects.h`, such as `NewObject<T>` and
@@ -5753,7 +5797,8 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   parameters by value, and keep results in member variables. See [Latent calls](#latent-calls).
 - `latent call <Callee>: a static function has no object whose ubergraph frame could keep its locals`: a latent call,
   or UE_AWAIT (`UE_AWAIT: a static function ...`), in a static function. Fix: make it a non-static method. See
-  [Latent calls](#latent-calls).
+  [Latent calls](#latent-calls). In a free function that is not inline the message ends `, and a free function is one
+  unless it is inline`. Fix: mark the helper `inline`, so that it expands into the method that waits.
 - `<Callee>: leave the FLatentActionInfo argument out, the compiler supplies it`: a latent call given its
   FLatentActionInfo, as in `UKismetSystemLibrary::Delay(this, 1.0f, Info);`. Fix: call the overload without it,
   `UKismetSystemLibrary::Delay(1.0f);`. Only the form with the world context is caught: `Delay(1.0f, Info)` compiles
