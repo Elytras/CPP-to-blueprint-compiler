@@ -10331,7 +10331,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             }
             static const char* const Conditions[] = { "None", "InitialOnly", "OwnerOnly", "SkipOwner", "SimulatedOnly",
                 "AutonomousOnly", "SimulatedOrPhysics", "InitialOrOwner", "Custom", "ReplayOrOwner", "ReplayOnly",
-                "SimulatedOnlyNoReplay", "SimulatedOrPhysicsNoReplay", "SkipReplay", "Never" };
+                "SimulatedOnlyNoReplay", "SimulatedOrPhysicsNoReplay", "SkipReplay", "", "Never" };   // 14 is unused: COND_Never is 15 (CoreNetTypes.h 26)
             const std::string C = Cond.compare(0, 5, "COND_") == 0 ? Cond.substr(5) : Cond;
             const auto At = std::find_if(std::begin(Conditions), std::end(Conditions), [&](const char* N) { return C.empty() ? false : C == N; });
             if (!C.empty() && At == std::end(Conditions))
@@ -10664,6 +10664,13 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                and an override keeps its parent's net flags (UClass::SetUpRuntimeReplicationData checks). */
             if ((Net & (FUNC_NetServer | FUNC_NetClient | FUNC_NetMulticast)) == 0)
             { *Err = R.CppName + "::" + Fn.Name + ": UE_RELIABLE needs UE_SERVER, UE_CLIENT or UE_MULTICAST"; return false; }
+            /* The sender routes by one direction (Multicast, then Client, then Server: AActor::GetFunctionCallspace), the
+               receiver accepts by its own flags, so two directions send one way and are dropped the other. */
+            if ((Net & FUNC_NetMulticast) && (Net & (FUNC_NetServer | FUNC_NetClient)))
+            { *Err = R.CppName + "::" + Fn.Name + ": an RPC goes one way: UE_MULTICAST with UE_SERVER or UE_CLIENT"; return false; }
+            /* A static function's callspace comes from GetGlobalFunctionCallspace, which never answers Remote: it is never sent. */
+            if (IsStaticDecl(Decl))
+            { *Err = R.CppName + "::" + Fn.Name + ": a static function cannot be an RPC, it is never sent"; return false; }
             if (Super.V != 0) { *Err = R.CppName + "::" + Fn.Name + ": an override takes its parent's replication; drop the RPC marker"; return false; }
             if (!RetType.empty() && RetType != "void") { *Err = R.CppName + "::" + Fn.Name + ": an RPC returns void"; return false; }
             if (std::any_of(Params.begin(), Params.end(), [](const FPropertyDef& P) { return HoldsMapOrSet(P); }))

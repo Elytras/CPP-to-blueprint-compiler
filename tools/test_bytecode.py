@@ -6010,8 +6010,8 @@ def repl_refusals():
     no-parameter method of the class, the only kind the Kismet compiler keeps (KismetCompiler.cpp 2531-2545); a
     condition must be an ELifetimeCondition; an RPC needs a direction, returns nothing (RepLayout.cpp 6119 never
     sends a return value) and an override keeps its parent's net flags (Class.cpp 4189-4190). UE_SERVER with
-    UE_CLIENT never compiles (clang: 'cold' and 'hot' attributes are not compatible), where UE_MULTICAST with
-    either does (RpcTwoWays, pending)."""
+    UE_CLIENT never compiles (clang: 'cold' and 'hot' attributes are not compatible); UE_MULTICAST with either is
+    refused by rpc_one_way."""
     refused('ReplSetVar', '  UE_REPLICATED(TSet<int32>, Seen);\n', 'ReplSetVar::Seen: a TMap or TSet does not replicate')
     refused('ReplNestedSet', '  UE_REPLICATED(TArray<TSet<int32>>, Seen);\n', 'ReplNestedSet::Seen: a TMap or TSet does not replicate')
     refused('ReplMapVar', '  using FIntMap = TMap<int32, int32>;\n  UE_REPLICATED(FIntMap, M);\n', 'ReplMapVar::M: a TMap or TSet does not replicate')
@@ -6032,12 +6032,13 @@ def repl_refusals():
 
 
 def repl_never():
-    base = pending_asset('ReplNever')
+    base = asset('ReplNever')
     pkg = invariants.Package(base)
     got = {p.name: (p.cond, p.flags & 0x20) for p in pkg.struct(pkg.find('ReplNever_C')).props}
     assert got == {'Hidden': (15, 0x20), 'NoReplay': (13, 0x20), 'Shown': (0, 0x20)}, \
         'Hidden cooks condition %d, want COND_Never 15: %s' % (got.get('Hidden', (None,))[0], got)
     keeps_invariants(base)
+    print('ok  ReplNever: UE_REPLICATED_IF(..., Never) is COND_Never 15 (CoreNetTypes.h 26), not the undefined 14')
 
 
 def repl_inline_notify():
@@ -6092,32 +6093,15 @@ def repl_object():
     assert not any('ReplComponentCtl' in l for l in warned), warned                 # a component does replicate
 
 
-def rpc_two_ways():
-    """Refused naming Also or Wide; or each stays an RPC with one direction (the sender routes by one only), and the
-    compiler says which marker it dropped - a direction dropped silently is the gap itself."""
-    base = refused_naming('RpcTwoWays', 'Also', 'Wide')
-    if base is None: return
-    pkg = invariants.Package(base)
-    for fn in ('Also', 'Wide'):
-        f = pkg.struct(pkg.find(fn)).function_flags
-        assert f & 0x40 and bin(f & NET_DIRECTIONS).count('1') == 1, '%s cooks FunctionFlags %#x: two net directions' % (fn, f)
-    keeps_invariants(base)
-    warned = [l for l in compile_log('RpcTwoWays').splitlines() if 'warning:' in l]
-    assert all(any(re.search(r'\bRpcTwoWays::%s\b' % fn, l) for l in warned) for fn in ('Also', 'Wide')), \
-        'Also and Wide keep one direction with no word which marker was dropped: %s' % warned
-
-
-def rpc_static():
-    """Refused naming S; or S is cooked as an RPC the engine routes: FUNC_Net without FUNC_Static (a static function's
-    callspace is never Remote), and Call reaches it through CallFunction's routing. Dropping the RPC is no fix."""
-    base = refused_naming('RpcStatic', 'S')
-    if base is None: return
-    pkg = invariants.Package(base)
-    f = pkg.struct(pkg.find('S')).function_flags
-    assert f & 0x2040 == 0x40, 'S cooks FunctionFlags %#x: FUNC_Net | FUNC_Static, never sent' % f
-    keeps_invariants(base)
-    calls = [op for op, name in called(pkg, pkg.find('Call')) if name == 'S']
-    assert calls and all(op in (0x1B, 0x1C) for op in calls), calls
+def rpc_one_way():
+    """An RPC goes one way: the sender routes by one direction (AActor::GetFunctionCallspace), the receiver accepts by
+    its own flags, so Multicast with Server or Client is refused (Server with Client never parses: clang refuses
+    [[gnu::hot]] with [[gnu::cold]]). A static function's callspace comes from GetGlobalFunctionCallspace, which never
+    answers Remote, so a static RPC is refused too."""
+    refused('RpcTwoWays', '  int32 N;\n  UE_MULTICAST UE_SERVER void Also() { N = 2; }\n', 'RpcTwoWays::Also: an RPC goes one way')
+    refused('RpcTwoWaysClient', '  int32 N;\n  UE_MULTICAST UE_CLIENT void Wide() { N = 3; }\n', 'RpcTwoWaysClient::Wide: an RPC goes one way')
+    refused('RpcStatic', '  UE_SERVER static void S(int32 X) {}\n  void Call() { S(3); }\n', 'RpcStatic::S: a static function cannot be an RPC')
+    print('ok  RPC refusals: Multicast with Server or Client, and an RPC marker on a static method')
 
 
 def rpc_inline():
@@ -6144,7 +6128,8 @@ repl_conditions()
 repl_refusals()
 pending('RepNotifyRet: a RepNotify that returns a value is refused (RepLayout passes the shadow value as its parms)',
         lambda: refused('RepNotifyRet', '  UE_REPLICATED_USING(int32, N, OnRep_N);\n  int32 OnRep_N() { return N; }\n', 'OnRep_N'))
-pending('ReplNever: UE_REPLICATED_IF(..., Never) is COND_Never 15 (CoreNetTypes.h 26), not the undefined 14', repl_never)
+repl_never()
+rpc_one_way()
 pending('ReplInlineNotify: an inline RepNotify is refused, or cooked as a function of the class', repl_inline_notify)
 pending('ReplHiddenMap: a replicated struct holding a TMap is refused like a TMap variable', repl_unreplicable('ReplHiddenMap', 'Bag'))
 pending('ReplHiddenIface: a replicated TScriptInterface is refused (FInterfaceProperty sends nothing)', repl_unreplicable('ReplHiddenIface', 'Target'))
@@ -6154,8 +6139,6 @@ pending('ReplIfaceNest: a replicated struct holding an array of TScriptInterface
         repl_unreplicable('ReplIfaceNest', 'Nest'))
 pending('StructRepl: UE_REPLICATED on a UE_STRUCT member warns that it has no effect', struct_repl)
 pending('ReplObject: replication on a class that is no actor or component warns (or is refused)', repl_object)
-pending('RpcTwoWays: UE_MULTICAST with UE_SERVER / UE_CLIENT is refused, or cooks one direction', rpc_two_ways)
-pending('RpcStatic: an RPC marker on a static method is refused, or cooks a routed non-static RPC', rpc_static)
 pending('RpcInline: a net / authority-only / cosmetic marker on an inline method is refused, warned, or cooks a routed call', rpc_inline)
 
 

@@ -1879,7 +1879,6 @@ each topic.
   struct. See [Replication](REFERENCE.md#replication).
 - An RPC, authority-only or cosmetic marker on an `inline` method. The marker is ignored, and the call runs locally.
   See [RPCs](REFERENCE.md#rpcs).
-- An RPC marker on a static method. Expect it to run locally, never over the network. See [RPCs](REFERENCE.md#rpcs).
 - An engine or game static marked authority-only or cosmetic, such as `UGameplayStatics::ApplyDamage` or
   `UGameplayStatics::PlaySound2D`. The editor's node skips an authority-only function on a client and a cosmetic one
   on a dedicated server; AssetGen's call runs both on every machine. Guard such a call with `HasAuthority()` or

@@ -127,7 +127,7 @@ const char* LifetimeCondition(uint8 Value)
         "COND_None", "COND_InitialOnly", "COND_OwnerOnly", "COND_SkipOwner", "COND_SimulatedOnly",
         "COND_AutonomousOnly", "COND_SimulatedOrPhysics", "COND_InitialOrOwner", "COND_Custom",
         "COND_ReplayOrOwner", "COND_ReplayOnly", "COND_SimulatedOnlyNoReplay",
-        "COND_SimulatedOrPhysicsNoReplay", "COND_SkipReplay", "COND_Never" };
+        "COND_SimulatedOrPhysicsNoReplay", "COND_SkipReplay", "COND_None", "COND_Never" };   // 14 is unused
     return Value < sizeof(Names) / sizeof(Names[0]) ? Names[Value] : "COND_None";
 }
 

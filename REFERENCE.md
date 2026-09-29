@@ -4243,7 +4243,8 @@ put these markers only on an ordinary method with a body, neither `inline` nor `
 | `UE_SERVER void ServerBump(int32 &Count) { Count += 1; }` | Warns once per parameter it writes: "reaches the caller only when the call runs locally". The receiving machine works on a copy, so the caller sees the write only when the call ran locally, as when the server calls its own Server RPC. Take the parameter by value or `const &`. | Warns |
 | `UE_SERVER void ServerSync(TMap<FName, int32> Scores) { Kept = Scores; }` | Refused: "an RPC parameter cannot be a TMap or TSet". The engine sends nothing for either, so the argument would arrive empty. Pass two arrays, keys and values. | Refused |
 | `UE_SERVER inline void ServerPing() { Pings += 1; }` | Not caught. An inline method is expanded at each call and is no Blueprint function, so the marker has no effect and the call runs locally as plain code. The same holds for `UE_AUTHORITY_ONLY` and `UE_COSMETIC`. Drop `inline`. The marker goes first: `inline UE_SERVER void` does not parse. | Not yet |
-| `UE_SERVER static void S(int32 X) { }` | Not caught. It compiles into a static function that carries the Server flags, and the engine routes a static function without looking at them, so expect it to run locally, never over the network. Unreal's own C++ refuses a static RPC. Use a member function. | Not yet |
+| `UE_SERVER static void S(int32 X) { }` | Refused: "a static function cannot be an RPC". The engine routes a static function without looking at its net flags, so it would run locally and never be sent. Use a member function. | Refused |
+| `UE_MULTICAST UE_SERVER void Also() { }` | Refused: "an RPC goes one way". The sender picks one direction and the receiver checks its own, so a second marker would drop the call on one side. `UE_MULTICAST UE_CLIENT` is refused the same way. | Refused |
 
 ```cpp
 class Door : public AActor {
