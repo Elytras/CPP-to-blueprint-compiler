@@ -129,6 +129,117 @@ def props_of(base, function, _cache={}):
     return _cache[base, function]
 
 
+# ProcessScriptFunction zeroes the frame, then runs InitializeValue on each local from Function->FirstPropertyToInit on
+# (ScriptCore.cpp 825, 910), which UFunction::Link finds only under FUNC_HasDefaults (Class.cpp 5652). A local of a
+# UserDefinedStruct then holds the struct's default instance (UUserDefinedStruct::InitializeStruct): its Data stream,
+# read over each member's own default - a nested struct member's being its own struct's default instance.
+FUNC_HasDefaults, FUNC_UbergraphFunction = 0x800000, 0x8000
+# What InitializeValue leaves in a local of these engine structs, which have no STRUCT_ZeroConstructor (Property.cpp's
+# TStructOpsTypeTraits): FTransform() is the identity, FQuat's W starts at one, FHitResult::Init sets Time 1
+# (EngineTypes.h:2074). A member left out reads zero.
+NATIVE_CTORS = {'Transform': {'Rotation': {'W': 1.0}, 'Scale3D': {'X': 1.0, 'Y': 1.0, 'Z': 1.0}},
+                'Quat': {'W': 1.0}, 'HitResult': {'Time': 1.0}}
+
+
+class Unconstructed:
+    """An FText local of a function without FUNC_HasDefaults: the frame leaves it zeroed, a null TextData that any read
+    dereferences (FText has no TIsZeroConstructType). A store over it is fine - FText's assignment takes a null
+    reference - so only a read stops the run."""
+    def __init__(s, what): s.what = what
+    def __deepcopy__(s, memo): return s
+
+
+def frame_defaults(base, function, _cache={}):
+    """name -> value of the locals a frame of `function` starts with that are not zero: each UserDefinedStruct local
+    whose default instance is not, when the function is FUNC_HasDefaults (not the ubergraph: its persistent frame is
+    runvm's). Zero members are left out, as a missing one reads zero; an enum or engine-struct member is not decoded."""
+    if (base, function) not in _cache:
+        import invariants
+        pkg = invariants.load(base)
+        i = pkg.find(function)
+        st = pkg.struct(i) if i is not None else None
+        flags, out = getattr(st, 'function_flags', 0), {}
+        if flags & FUNC_HasDefaults and not flags & FUNC_UbergraphFunction:
+            for p in st.props:
+                v = None if p.flags & 0x80 else _initialized(pkg, p)
+                if v: out[p.name] = v
+                if p.type == 'TextProperty' and not p.flags & 0x80: out[p.name] = ''
+        elif st is not None and not flags & FUNC_UbergraphFunction:
+            for p in st.props:
+                if p.type == 'TextProperty' and not p.flags & 0x80: out[p.name] = Unconstructed('FText ' + p.name)
+        _cache[base, function] = out
+    return copy.deepcopy(_cache[base, function])
+
+
+def _initialized(pkg, p, depth=0):
+    """What InitializeValue leaves in property p of package pkg when it is of a UserDefinedStruct type: the non-zero
+    members of the struct's default instance. None (zero) for any other type."""
+    if p.type == 'StructProperty' and p.ref < 0 and pkg.path(p.ref).startswith('/Script/'):
+        return copy.deepcopy(NATIVE_CTORS.get(pkg.obj(p.ref)['name']))
+    try: at = pkg.resolve(p.ref) if p.type == 'StructProperty' and depth < 8 else None
+    except Exception: at = None
+    if not at or at[0].class_of(at[1] + 1) != 'UserDefinedStruct': return None
+    sp, k = at
+    st = sp.struct(k)
+    v = {q.name: d for q in st.props for d in [_initialized(sp, q, depth + 1)] if d}
+    _load_tags(sp, k, getattr(st, 'defaults', []), sp, st, v, depth)
+    return v
+
+
+def _load_tags(pkg, i, tags, sp, st, v, depth):
+    """Tags of export i of pkg loaded over v, a value of struct st (of package sp). A tag reaches its member by FName,
+    else by authored name (UUserDefinedStruct::CustomFindProperty); a value not decoded leaves the member as it was."""
+    authored = lambda n: n[:-33][:n[:-33].rfind('_')] if len(n) > 35 and n[:-33].rfind('_') > 0 else n
+    for t in tags:
+        q = next((q for q in st.props if q.name.lower() == t['name'].lower()), None) or \
+            next((q for q in st.props if authored(q.name).lower() == t['name'].lower()), None)
+        decoded, x = _tag_value(pkg, i, t, sp, q, v.get(q.name) if q else None, depth) if q else (False, None)
+        if decoded and x not in (0, None, '', 'None', [], {}): v[q.name] = x
+        elif decoded: v.pop(q.name, None)
+
+
+def _tag_value(pkg, i, t, sp, q, before, depth):
+    """(decoded, value) of one tagged value of property q: ints, floats, bools, names, strings, a UserDefinedStruct
+    (loaded over what the member held), an array of those."""
+    ty, b = t['type'], bytes(t['value'])
+    if ty in ('IntProperty', 'Int64Property', 'Int16Property', 'Int8Property'): return True, int.from_bytes(b, 'little', signed=True)
+    if ty in ('UInt16Property', 'UInt32Property', 'UInt64Property'): return True, int.from_bytes(b, 'little')
+    if ty == 'ByteProperty' and t['enum'] == 'None': return True, b[0]
+    if ty in ('FloatProperty', 'DoubleProperty'): return True, struct.unpack('<f' if len(b) == 4 else '<d', b)[0]
+    if ty == 'BoolProperty': return True, bool(t['bool'])
+    if ty == 'NameProperty': return True, _name(pkg, b, 0)
+    if ty == 'StrProperty': return True, _fstring(b, 0)[0]
+    if ty == 'StructProperty' and q.type == 'StructProperty':
+        try: at = sp.resolve(q.ref)
+        except Exception: at = None
+        if not at or at[0].class_of(at[1] + 1) != 'UserDefinedStruct': return False, None
+        v = copy.deepcopy(before) if isinstance(before, dict) else (_initialized(sp, q, depth + 1) or {})
+        _load_tags(pkg, i, pkg.tags(i, t['at']), at[0], at[0].struct(at[1]), v, depth + 1)
+        return True, v
+    if ty == 'ArrayProperty' and q.type == 'ArrayProperty':
+        e, n, o = q.subs[0], struct.unpack_from('<i', b, 0)[0], 4
+        size = {'IntProperty': 4, 'FloatProperty': 4, 'Int64Property': 8, 'NameProperty': 8, 'BoolProperty': 1}.get(e.type)
+        if size:
+            fmt = {'IntProperty': '<i', 'FloatProperty': '<f', 'Int64Property': '<q', 'BoolProperty': '<?'}.get(e.type)
+            return True, [struct.unpack_from(fmt, b, o + k * size)[0] if fmt else _name(pkg, b, o + k * size) for k in range(n)]
+        if e.type == 'StrProperty':
+            out = []
+            for _ in range(n): s, o = _fstring(b, o); out.append(s)
+            return True, out
+    return False, None
+
+
+def _name(pkg, b, o):
+    i, num = struct.unpack_from('<ii', b, o)
+    return pkg.names[i] + ('_%d' % (num - 1) if num else '')
+
+
+def _fstring(b, o):
+    n = struct.unpack_from('<i', b, o)[0]
+    if n >= 0: return b[o + 4:o + 3 + n].decode('latin-1') if n else '', o + 4 + n
+    return b[o + 4:o + 2 - 2 * n].decode('utf-16-le'), o + 4 - 2 * n
+
+
 # A native writes its whole return type through RESULT_PARAM, so these put 4 bytes wherever they are evaluated into.
 INT32_RESULT = {'Add_IntInt', 'Subtract_IntInt', 'Multiply_IntInt', 'Divide_IntInt', 'Percent_IntInt', 'Not_Int', 'Or_IntInt',
                 'And_IntInt', 'Xor_IntInt', 'Conv_BoolToInt', 'Conv_ByteToInt', 'Conv_Int64ToInt'}
@@ -338,7 +449,7 @@ BARE_CONTAINERS = {'ArrayProperty', 'SetProperty', 'MapProperty'}
 def run(base, function, self_vars=None, **parms):
     stmts = script_of(base, function)
     at = {n.mem: i for i, n in enumerate(stmts)}
-    env = dict(parms)
+    env = {**frame_defaults(base, function), **parms}
     flow = []
     self_vars = self_vars if self_vars is not None else {}
     types = props_of(base, function)
@@ -359,7 +470,10 @@ def run(base, function, self_vars=None, **parms):
     def ev(n):
         o = n.op
         addressable(n)
-        if o in (0, 0x48): return env.get(n.val, 0)
+        if o in (0, 0x48):
+            if isinstance(env.get(n.val), Unconstructed):
+                raise SystemExit('%s read at mem %d, never constructed: %s lacks FUNC_HasDefaults' % (env[n.val].what, n.mem, function))
+            return env.get(n.val, 0)
         if o == 1: return self_vars.get(n.val, 0)
         if o in (0x1D, 0x1E, 0x24, 0x2C, 0x35, 0x21): return n.val
         if o == 0x42:
