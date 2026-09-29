@@ -135,6 +135,53 @@ def refused(mod, body, why, top=''):
         assert proc.returncode != 0 and why in proc.stdout, (mod, proc.stdout)
 
 
+# ---- Known gaps: what AssetGen does not do yet, as tests that fail today. A pending test has its mod in tests/pending;
+# a rule of invariants.py the suite's own packages still break is listed in KNOWN_RULES with where it is tracked. Each
+# prints as `gap` while it fails, and the run fails the day one passes, until it moves in with the others.
+
+PENDING = os.path.join(TESTS, 'pending')
+GAPS, FIXED, REFUSALS = [], [], {}
+KNOWN_RULES = {}
+
+
+def pending_asset(mod, cls=None):
+    """tests/pending/<mod>.cpp compiled into build/_pending/<mod>, and the base path of its class `cls` (default: the
+    mod's own). A refusal raises, carrying the compiler's reason, so the gap reads as what the compiler said."""
+    src = os.path.join(PENDING, mod + '.cpp')
+    package = re.search(r'UE_MOD_PACKAGE\s*\(\s*"/Game/([^"]+)"', open(src, encoding='utf-8-sig').read()).group(1)
+    out = os.path.join(ROOT, '_pending', mod, 'FSD', 'Content', *package.split('/'))
+    if mod not in REFUSALS:
+        os.makedirs(out, exist_ok=True)
+        proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, out], capture_output=True, encoding='utf-8')
+        failed = re.findall(r'(?m)^\s*FAILED: (.*)$', proc.stdout)
+        REFUSALS[mod] = (failed or [proc.stdout.strip() or 'exit %d' % proc.returncode])[0] if proc.returncode else None
+    if REFUSALS[mod]: raise AssertionError('refused: ' + REFUSALS[mod])
+    return os.path.join(out, cls or mod)
+
+
+def keeps_invariants(base):
+    """The package at base breaks none of invariants.py's rules but the known ones; a pending mod that compiles is checked
+    by them too."""
+    import invariants
+    found = [f for f in invariants.check(invariants.Package(base)) if f[0] not in KNOWN_RULES]
+    assert not found, '%s breaks %s' % (os.path.basename(base), '; '.join('%s %s: %s' % f for f in found[:3]))
+
+
+def pending(name, test):
+    """A test of something AssetGen does not do yet. It fails today - refused, or compiled but not behaving as the
+    engine needs - and prints as a known gap. The day it passes, the feature has landed and the run fails until the
+    test moves in with the others (its mod to tests/, its check above): a gap never closes unnoticed, and none is
+    reported open that is closed."""
+    try:
+        test()
+    except (Exception, SystemExit) as e:        # runscript stops on an op it cannot run with SystemExit
+        GAPS.append(name)
+        why = str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__
+        print('gap %s: %s' % (name, why[:200]))
+        return
+    FIXED.append(name)
+    print('FIXED %s: it passes now; move it out of tests/pending' % name)
+
 def dump(t, base, i):
     return subprocess.run([sys.executable, os.path.join(HERE, t), base, str(i)], capture_output=True, encoding='utf-8').stdout
 
@@ -247,8 +294,17 @@ def sweep():
         print('ok  the %d rules of invariants.py hold on the game\'s own packages' % len(invariants.RULES))
     bases = invariants.packages([ROOT])
     found = [(os.path.relpath(b, ROOT), *f) for b in bases for f in invariants.check(invariants.Package(b))]
+    for rule, why in KNOWN_RULES.items():
+        mine = [f for f in found if f[1] == rule]
+        if mine:
+            GAPS.append('sweep ' + rule)
+            print('gap sweep %s: %d findings (%s), e.g. %s' % (rule, len(mine), why, '%s  %s %s: %s' % mine[0]))
+        else:
+            FIXED.append('sweep ' + rule)
+            print('FIXED sweep %s: no package breaks it now; take it out of KNOWN_RULES' % rule)
+    found = [f for f in found if f[1] not in KNOWN_RULES]
     assert not found, '\n'.join('%s  %s %s: %s' % f for f in found[:30])
-    print('ok  %d packages keep the %d engine invariants of invariants.py' % (len(bases), len(invariants.RULES)))
+    print('ok  %d packages keep the %d engine invariants of invariants.py' % (len(bases), len(invariants.RULES) - len(KNOWN_RULES)))
 
 
 def check(mod, fn, oracle, cases):
@@ -3084,45 +3140,5 @@ spawn_relative()
 outer_runs()
 
 
-# ---- Pending: tests of what AssetGen does not do yet, one mod each in tests/pending
-
-PENDING = os.path.join(TESTS, 'pending')
-GAPS, FIXED, REFUSALS = [], [], {}
-
-
-def pending_asset(mod, cls=None):
-    """tests/pending/<mod>.cpp compiled into build/_pending/<mod>, and the base path of its class `cls` (default: the
-    mod's own). A refusal raises, carrying the compiler's reason, so the gap reads as what the compiler said."""
-    src = os.path.join(PENDING, mod + '.cpp')
-    package = re.search(r'UE_MOD_PACKAGE\s*\(\s*"/Game/([^"]+)"', open(src, encoding='utf-8-sig').read()).group(1)
-    out = os.path.join(ROOT, '_pending', mod, 'FSD', 'Content', *package.split('/'))
-    if mod not in REFUSALS:
-        os.makedirs(out, exist_ok=True)
-        proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, out], capture_output=True, encoding='utf-8')
-        failed = re.findall(r'(?m)^\s*FAILED: (.*)$', proc.stdout)
-        REFUSALS[mod] = (failed or [proc.stdout.strip() or 'exit %d' % proc.returncode])[0] if proc.returncode else None
-    if REFUSALS[mod]: raise AssertionError('refused: ' + REFUSALS[mod])
-    return os.path.join(out, cls or mod)
-
-
-def keeps_invariants(base):
-    """The package at base breaks none of invariants.py's rules; a pending mod that compiles is checked by them too."""
-    import invariants
-    found = invariants.check(invariants.Package(base))
-    assert not found, '%s breaks %s' % (os.path.basename(base), '; '.join('%s %s: %s' % f for f in found[:3]))
-
-
-def pending(name, test):
-    """A test of something AssetGen does not do yet. It fails today - refused, or compiled but not behaving as the
-    engine needs - and prints as a known gap. The day it passes, the feature has landed and the run fails until the
-    test moves in with the others (its mod to tests/, its check above): a gap never closes unnoticed, and none is
-    reported open that is closed."""
-    try:
-        test()
-    except (Exception, SystemExit) as e:        # runscript stops on an op it cannot run with SystemExit
-        GAPS.append(name)
-        why = str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__
-        print('gap %s: %s' % (name, why[:200]))
-        return
-    FIXED.append(name)
-    print('FIXED %s: it passes now; move it out of tests/pending' % name)
+print('ok  %d known gaps, each a failing test of something AssetGen does not do yet' % len(GAPS))
+assert not FIXED, 'these pass now, move them in with the others: ' + ', '.join(FIXED)
