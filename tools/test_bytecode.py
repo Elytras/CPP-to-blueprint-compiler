@@ -240,6 +240,7 @@ def sweep():
     --game, the same rules first run on every 9th package of the game's own content: a rule Epic's cooked Blueprints
     break is a wrong rule, not a finding."""
     import invariants
+    invariants.GAME_CONTENT[:] = [GAME] if GAME else []
     if GAME:
         found = [(b, *f) for b in invariants.packages([GAME], 9) for f in invariants.check(invariants.Package(b))]
         assert not found, 'a rule the game breaks:\n' + '\n'.join('%s  %s %s: %s' % f for f in found[:30])

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""usage: invariants.py <dir or base>... [--sample N] [--only RULE,...] [--list]
+"""usage: invariants.py <dir or base>... [--sample N] [--only RULE,...] [--game <FSD/Content>] [--list]
 
 Checks what UE 4.27 relies on when it loads and runs a cooked Blueprint class, on every package under each dir: the
 rules below, each citing the engine source that makes it one. test_bytecode.py runs them over every suite package.
@@ -157,6 +157,25 @@ class Package:
     def package_name(s):
         return '/Game/' + s.base.replace(os.sep, '/').split('/Content/')[-1]
 
+    def resolve(s, idx):
+        """(Package, export index) of the object an FPackageIndex names: an export of this package, or a /Game import
+        found in the Content folder this package sits in, else in GAME_CONTENT (--game). None for a /Script import, or a
+        package not found."""
+        if idx > 0: return s, idx - 1
+        if idx == 0: return None
+        top = idx
+        while s.obj(top)['outer']: top = s.obj(top)['outer']
+        name = s.obj(top)['name']
+        if not name.startswith('/Game/'): return None
+        here = s.base.replace(os.sep, '/')
+        for root in [here[:here.rindex('/Content/') + len('/Content')]] + GAME_CONTENT:
+            if not os.path.exists(root + name[len('/Game'):] + '.uasset'): continue
+            other = load(root + name[len('/Game'):])
+            want = s.path(idx).lower()
+            k = next((k for k in range(len(other.exports)) if other.path(k + 1).lower() == want), None)
+            return (other, k) if k is not None else None
+        return None
+
     def blob(s, i):
         e = s.exports[i]
         return s.ue[e['off'] - s.total: e['off'] - s.total + e['size']]
@@ -271,6 +290,17 @@ class Package:
 
 class TagList(list):
     end = 0
+
+
+GAME_CONTENT = []           # the game's own FSD/Content folders, where Package.resolve looks for a /Game import last
+_LOADED = {}
+
+
+def load(base):
+    """Package(base), read once per process: rules that follow a parent class into its own package share it."""
+    key = os.path.normcase(os.path.abspath(base))
+    if key not in _LOADED: _LOADED[key] = Package(base)
+    return _LOADED[key]
 
 
 # ---- the rules. Each takes (pkg) and yields (export index, message); RULES maps its name to it.
@@ -476,11 +506,12 @@ def main():
     if '--list' in args:
         for name, fn in RULES.items(): print('%-28s %s' % (name, (fn.__doc__ or '').strip().split('\n')[0]))
         return
-    for flag in ('--sample', '--only'):
+    for flag in ('--sample', '--only', '--game'):
         if flag in args:
             i = args.index(flag)
             if flag == '--sample': sample = int(args[i + 1])
-            else: only = set(args[i + 1].split(','))
+            elif flag == '--only': only = set(args[i + 1].split(','))
+            else: GAME_CONTENT.append(args[i + 1])
             del args[i:i + 2]
     bad, n, hits = 0, 0, {}
     for base in packages(args, sample):
