@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""usage: invariants.py <dir or base>... [--sample N] [--only RULE,...] [--game <FSD/Content>] [--list]
+"""usage: invariants.py <dir or base>... [--sample N] [--only RULE,...] [--game <FSD/Content>] [--ueapi <UeApi>]
+                        [--sdk <Dumper-7 dump>] [--list]
 
 Checks what UE 4.27 relies on when it loads and runs a cooked Blueprint class, on every package under each dir: the
 rules below, each citing the engine source that makes it one. test_bytecode.py runs them over every suite package.
@@ -293,6 +294,12 @@ class TagList(list):
 
 
 GAME_CONTENT = []           # the game's own FSD/Content folders, where Package.resolve looks for a /Game import last
+# What the rules know of the engine's own classes, which no cooked package carries: the mod API headers (UeApi) and a
+# Dumper-7 dump of the game (its SDK/SDK and GObjects-Dump-WithProperties.txt). Read at import, from the environment
+# test_bytecode.py sets (--ueapi, --sdk) or the flags below; a rule that needs a missing one skips the native part.
+UEAPI_DIR = os.environ.get('INVARIANTS_UEAPI') or os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                                                '..', '..', 'BpMods', 'UeApi'))
+SDK_DUMP = os.environ.get('INVARIANTS_SDK') or None
 _LOADED = {}
 
 
@@ -506,12 +513,12 @@ def main():
     if '--list' in args:
         for name, fn in RULES.items(): print('%-28s %s' % (name, (fn.__doc__ or '').strip().split('\n')[0]))
         return
-    for flag in ('--sample', '--only', '--game'):
+    for flag in ('--sample', '--only', '--game', '--ueapi', '--sdk'):
         if flag in args:
             i = args.index(flag)
             if flag == '--sample': sample = int(args[i + 1])
             elif flag == '--only': only = set(args[i + 1].split(','))
-            else: GAME_CONTENT.append(args[i + 1])
+            elif flag == '--game': GAME_CONTENT.append(args[i + 1])
             del args[i:i + 2]
     bad, n, hits = 0, 0, {}
     for base in packages(args, sample):
@@ -526,5 +533,12 @@ def main():
     sys.exit(1 if bad or hits else 0)
 
 
-if __name__ == '__main__':
-    main()
+if __name__ != '__main__':
+    import invariant_rules      # noqa: F401 - every area's rules register themselves (invariant_rules/__init__.py)
+else:
+    # --ueapi / --sdk reach the rules through the environment they read at import; then the module is imported under
+    # its own name, so the rules register in the same RULES main() walks (not a second copy in __main__).
+    for flag, var in (('--ueapi', 'INVARIANTS_UEAPI'), ('--sdk', 'INVARIANTS_SDK')):
+        if flag in sys.argv: os.environ[var] = sys.argv[sys.argv.index(flag) + 1]
+    import invariants
+    invariants.main()
