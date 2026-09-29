@@ -3501,15 +3501,19 @@ def name_case_twins():
 
 
 def name_too_long():
-    """NameTooLong: an FName literal of 1100 characters has no cooked form (a name-map entry is at most NAME_SIZE
-    units, NUL included), so it is refused, saying it is too long."""
-    try:
-        b = pending_asset('NameTooLong')
-    except AssertionError as e:
-        assert re.search(r'(?i)too long|longer than|NAME_SIZE|\b102[34]\b', str(e)), e
-        return
-    longest = max(abs(n) for n, _ in tables.raw_tables(invariants.Package(b)).names_raw)
-    raise AssertionError('cooked, its longest name-map entry %d units (NAME_SIZE is 1024)' % longest)
+    """An FName literal of 1100 characters has no cooked form: the loader reads a name-map entry into a NAME_SIZE
+    buffer, NUL included (NameTypes.h 36), and a longer one misreads every later name (UnrealNames.cpp 2657-2672). It
+    is refused, saying it is too long; 1023 characters, the most an FName holds, still cooks."""
+    body = '  bool F() { return FName("%s") == FName("A"); }\n'
+    refused('NameTooLong', body % ('x' * 1100), 'is too long: 1100 characters')
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, 'NameAtLimit.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/NameAtLimit");\n'
+                    'class NameAtLimit : public AActor {\npublic:\n%s};\n' % (body % ('x' * 1023)))
+        proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, tmp], capture_output=True, encoding='utf-8')
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+    print('ok  NameTooLong: an FName over 1023 characters is refused as too long; one of 1023 cooks')
 
 
 def mutated(tmp, base, patch):
@@ -3651,7 +3655,7 @@ pending('AbstractComp: a component of an abstract mod class is refused, naming i
         lambda: refused('AbstractComp', '  UE_COMPONENT(UPureComp, Comp);\n', 'abstract', top=ABSTRACT_COMP))
 pending('NameCaseTwins: two methods whose names differ only in case are refused, or cooked under names FName tells apart',
         name_case_twins)
-pending('NameTooLong: an FName literal longer than NAME_SIZE is refused', name_too_long)
+name_too_long()
 tables_rules_fire()
 
 

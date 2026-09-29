@@ -5623,6 +5623,9 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
 
 ### Components, defaults, assets and other objects
 
+- `the name '<start>...' is too long: <N> characters, where an FName holds at most 1023 (NAME_SIZE)`: a name in the
+  package, usually an `FName("...")` literal, is 1024 characters or longer. The engine stops reading the package's
+  names at such an entry and misreads every later one. Fix: shorten it; keep long text in an FString.
 - `<Class>::UE_DEFAULTS: <Member> is declared here - give it an initializer instead`: UE_DEFAULTS assigns a variable
   that the same class declares, as in `int32 Health; UE_DEFAULTS { Health = 100; }`. Fix: give the variable its value
   where it is declared, `int32 Health = 100;`. UE_DEFAULTS is for inherited variables and for components. See

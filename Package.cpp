@@ -299,6 +299,19 @@ bool FPackage::Save(const std::string& OutBaseNoExt, std::string* Err) const
         E.Serialize(Discard);
     }
 
+    /* The loader reads each name-map entry into a NAME_SIZE buffer, the NUL included (NameTypes.h 36), and stops at a
+       longer one with "String is too long", misreading every later name (UnrealNames.cpp 2657-2672). */
+    for (const std::string& N : Names)
+    {
+        const size_t Chars = std::count_if(N.begin(), N.end(), [](char C) { return (uint8(C) & 0xC0) != 0x80; });
+        if (Chars >= 1024)
+        {
+            if (Err) *Err = "the name '" + N.substr(0, 32) + "...' is too long: " + std::to_string(Chars)
+                          + " characters, where an FName holds at most 1023 (NAME_SIZE)";
+            return false;
+        }
+    }
+
     // The name table is stored sorted case-insensitively; indices follow that order.
     std::sort(Self->Names.begin(), Self->Names.end(),
               [](const std::string& A, const std::string& B) { return Lower(A) < Lower(B); });
