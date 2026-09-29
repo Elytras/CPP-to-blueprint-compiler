@@ -926,6 +926,7 @@ number constants, not a Blueprint type.
 | `enum class ESpan : int32 { Tiny = -3, Wide = 70000 };` `UE_ENUM(ESpan);` | An int32 or int64 enum is cooked the same way with its wide values. A variable of it holds the full width, as UHT reflects a native `enum class : int32`. | Yes |
 | `enum class EBad : int16 { A, B };` `UE_ENUM(EBad);` | Refused (`declare it : uint8 (a Blueprint enum), : int32 or : int64`), even if no variable uses it. An enum with no fixed type is refused too. | Refused |
 | `enum class EO : uint8 { A = 255 };` `UE_ENUM(EO);` | Refused (`A is out of range`): `_MAX` needs the next value, so a uint8 enum's largest value is 254. | Refused |
+| `enum class EGear : uint8 { Low, High, EGear_MAX };` | The UE C++ idiom: a declared `EGear_MAX` one past the largest value is the closing `_MAX` itself, not a second entry. Any other value for it is refused. | Yes |
 | `UE_ENUM(EMissing);` | Refused (`names no enum with enumerators`). | Refused |
 | `UE_ENUM_IN(ESystems, "/Game/_MyMods/Shared");` | For an enum in a header several mods include. Only the source whose `UE_MOD_PACKAGE` is exactly that path cooks it; every other mod imports it from there. `UE_STRUCT_IN` does the same for structs: [Structs](#structs). | Yes |
 | `ELocal L;` with no `UE_ENUM` on `ELocal` | Refused (`unimplemented property L: ELocal`). The enum's constants still fold to numbers, `(int32)ELocal::B`, but it is not a Blueprint type. Add `UE_ENUM`. | Refused |
@@ -5427,6 +5428,9 @@ and where the feature is described. In each group, the messages you are most lik
 - `UE_ENUM(<Enum>): <Enumerator> is out of range (the largest value is _MAX's)`: the cooked enum adds `<Enum>_MAX`
   one past the largest value, and that would not fit, as with `A = 255` in a uint8 enum. Fix: keep every value at most
   254 in a uint8 enum, and one below the type's maximum in an int32 or int64 enum. See [Enums](#enums).
+- `UE_ENUM(<Enum>): <Enum>_MAX is the sentinel the engine adds, one past the largest value; leave it out or give it
+  that value`: the enum declares its own `_MAX` with another value, as in `{ A, B, EGear_MAX = 7 }`. Fix: drop the
+  explicit value, or the enumerator. See [Enums](#enums).
 - `<Class>::<Function>: TODO: unimplemented intrinsic __EnumMap__`: Not yet. UE_ENUM_MAP in a function body is
   refused. It works only as a member default. Fix: keep the table in a member,
   `TMap<EMood, FName> Names = UE_ENUM_MAP(EMood);`, and read the member. See [Enums](#enums).

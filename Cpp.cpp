@@ -2167,6 +2167,19 @@ bool FCompiler::Collect(std::string* Err)
         const std::string U = EnumUnderlying[Enum];
         if (U != "uint8" && U != "int32" && U != "int64")
         { *Err = "UE_ENUM(" + Enum + "): declare it `: uint8` (a Blueprint enum), `: int32` or `: int64`"; return false; }
+        /* The UE C++ idiom `..., EGear_MAX }` declares the sentinel the writer adds anyway: one past the largest value,
+           under the same FName. Kept, it would be a second entry of that name; so it is the sentinel, or refused. */
+        const std::string MaxName = LeafOf(Enum) + "_MAX";
+        if (auto M = std::find_if(D->second.begin(), D->second.end(), [&](const auto& En) { return En.first == MaxName; });
+            M != D->second.end())
+        {
+            int64 Largest = INT64_MIN;
+            for (const auto& En : D->second) if (En.first != MaxName) Largest = std::max(Largest, En.second);
+            if (D->second.size() == 1 || M->second != Largest + 1)
+            { *Err = "UE_ENUM(" + Enum + "): " + MaxName + " is the sentinel the engine adds, one past the largest value; "
+                     "leave it out or give it that value"; return false; }
+            D->second.erase(M);
+        }
         const int64 Top = U == "uint8" ? 254 : U == "int32" ? int64(INT32_MAX) - 1 : INT64_MAX - 1;
         const int64 Bottom = U == "uint8" ? 0 : U == "int32" ? int64(INT32_MIN) : INT64_MIN;
         for (const auto& En : D->second)

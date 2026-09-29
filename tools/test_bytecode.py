@@ -5877,11 +5877,9 @@ def uds_local_init():
 
 
 def enum_max_dup():
-    try:
-        base = pending_asset('EnumMaxDup')
-    except AssertionError as e:                     # refusing the declared _MAX, naming it, is a fix as well
-        assert 'EMaxDupGear_MAX' in str(e), e
-        return
+    """A declared <Enum>_MAX, the UE C++ idiom, is the sentinel itself: one entry of that name, the largest; any other
+    value for it is refused."""
+    base = asset('EnumMaxDup')
     entries, form = enum_entries(os.path.join(os.path.dirname(base), 'EMaxDupGear'))
     names = [n.lower() for n, _ in entries]
     assert len(set(names)) == len(names), 'an entry named twice: %s' % entries
@@ -5890,6 +5888,9 @@ def enum_max_dup():
     assert entries[:2] == [('EMaxDupGear::Low', 0), ('EMaxDupGear::High', 1)], entries
     keeps_invariants(os.path.join(os.path.dirname(base), 'EMaxDupGear'))
     keeps_invariants(base)
+    refused('EnumMaxOff', '  int32 N = 0;\n', 'EMaxOff_MAX is the sentinel the engine adds',
+            top='enum class EMaxOff : uint8 { A, B, EMaxOff_MAX = 7 };\nUE_ENUM(EMaxOff);\n')
+    print('ok  EnumMaxDup: a declared <Enum>_MAX is the sentinel, one entry of its name; another value for it is refused')
 
 
 def enum_game_name_clash():
@@ -5925,7 +5926,7 @@ enum_net_store()
 enum_refusals()
 pending('UdsLocalInit: a function with a UE_STRUCT local whose defaults are not zero is FUNC_HasDefaults, so the frame '
         'starts the local at the struct defaults', uds_local_init)
-pending('EnumMaxDup: a declared <Enum>_MAX is not a second entry beside the added sentinel', enum_max_dup)
+enum_max_dup()
 pending('EnumNativeClash: a UE_ENUM sharing a game enum\'s enumerator names is refused or warned about', enum_game_name_clash)
 pending('EnumNamesAcrossMods: no enumerator name is cooked by two of the mods (EMood)', enum_names_across_mods)
 
