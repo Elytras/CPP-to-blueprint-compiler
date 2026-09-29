@@ -235,22 +235,19 @@ def export_index(base, name):
 
 
 def sweep():
-    """Every function of every built mod decodes to exactly its header's storage and memory sizes."""
-    import glob, re, subprocess
-    here = os.path.dirname(os.path.abspath(__file__))
-    n = 0
-    for ua in glob.glob(os.path.join(ROOT, '*', 'FSD', 'Content', '**', '*.uasset'), recursive=True):
-        base = ua[:-len('.uasset')]
-        exports = dumpexp.load(base)[5]
-        for i in range(len(exports)):
-            out = subprocess.run([sys.executable, os.path.join(here, 'walkscript.py'), base, str(i)],
-                                 capture_output=True, encoding='utf-8').stdout
-            m = re.search(r'walked: disk (\d+) \(header (\d+)\)  mem (\d+) \(header (\d+)\)', out)
-            if not m: continue
-            assert m.group(1) == m.group(2) and m.group(3) == m.group(4), '%s export %d: %s' % (base, i, m.group(0))
-            assert 'loader would STOP' not in out, '%s export %d stops early' % (base, i)
-            n += 1
-    print('ok  %d functions decode to their header sizes' % n)
+    """Every package built above keeps each engine invariant of invariants.py, whose rules cite the engine source that
+    makes them one: every function decodes to exactly its header's sizes, every jump lands on a statement, ... With
+    --game, the same rules first run on every 9th package of the game's own content: a rule Epic's cooked Blueprints
+    break is a wrong rule, not a finding."""
+    import invariants
+    if GAME:
+        found = [(b, *f) for b in invariants.packages([GAME], 9) for f in invariants.check(invariants.Package(b))]
+        assert not found, 'a rule the game breaks:\n' + '\n'.join('%s  %s %s: %s' % f for f in found[:30])
+        print('ok  the %d rules of invariants.py hold on the game\'s own packages' % len(invariants.RULES))
+    bases = invariants.packages([ROOT])
+    found = [(os.path.relpath(b, ROOT), *f) for b in bases for f in invariants.check(invariants.Package(b))]
+    assert not found, '\n'.join('%s  %s %s: %s' % f for f in found[:30])
+    print('ok  %d packages keep the %d engine invariants of invariants.py' % (len(bases), len(invariants.RULES)))
 
 
 def check(mod, fn, oracle, cases):
@@ -3084,3 +3081,47 @@ delegate_targets()
 spawn_runs()
 spawn_relative()
 outer_runs()
+
+
+# ---- Pending: tests of what AssetGen does not do yet, one mod each in tests/pending
+
+PENDING = os.path.join(TESTS, 'pending')
+GAPS, FIXED, REFUSALS = [], [], {}
+
+
+def pending_asset(mod, cls=None):
+    """tests/pending/<mod>.cpp compiled into build/_pending/<mod>, and the base path of its class `cls` (default: the
+    mod's own). A refusal raises, carrying the compiler's reason, so the gap reads as what the compiler said."""
+    src = os.path.join(PENDING, mod + '.cpp')
+    package = re.search(r'UE_MOD_PACKAGE\s*\(\s*"/Game/([^"]+)"', open(src, encoding='utf-8-sig').read()).group(1)
+    out = os.path.join(ROOT, '_pending', mod, 'FSD', 'Content', *package.split('/'))
+    if mod not in REFUSALS:
+        os.makedirs(out, exist_ok=True)
+        proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, out], capture_output=True, encoding='utf-8')
+        failed = re.findall(r'(?m)^\s*FAILED: (.*)$', proc.stdout)
+        REFUSALS[mod] = (failed or [proc.stdout.strip() or 'exit %d' % proc.returncode])[0] if proc.returncode else None
+    if REFUSALS[mod]: raise AssertionError('refused: ' + REFUSALS[mod])
+    return os.path.join(out, cls or mod)
+
+
+def keeps_invariants(base):
+    """The package at base breaks none of invariants.py's rules; a pending mod that compiles is checked by them too."""
+    import invariants
+    found = invariants.check(invariants.Package(base))
+    assert not found, '%s breaks %s' % (os.path.basename(base), '; '.join('%s %s: %s' % f for f in found[:3]))
+
+
+def pending(name, test):
+    """A test of something AssetGen does not do yet. It fails today - refused, or compiled but not behaving as the
+    engine needs - and prints as a known gap. The day it passes, the feature has landed and the run fails until the
+    test moves in with the others (its mod to tests/, its check above): a gap never closes unnoticed, and none is
+    reported open that is closed."""
+    try:
+        test()
+    except (Exception, SystemExit) as e:        # runscript stops on an op it cannot run with SystemExit
+        GAPS.append(name)
+        why = str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__
+        print('gap %s: %s' % (name, why[:200]))
+        return
+    FIXED.append(name)
+    print('FIXED %s: it passes now; move it out of tests/pending' % name)
