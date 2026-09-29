@@ -4070,7 +4070,8 @@ together.
 | `UE_REPLICATED(TSet<int32>, Ids);` | Refused: "a TMap or TSet does not replicate". The engine replicates neither, so the variable would never leave the server. A `TMap` or `TSet` inside a replicated array is refused too. Replicate two arrays, keys and values, and rebuild the map in the OnRep. | Refused |
 | `UE_REPLICATED(TMap<FName, int32>, Scores);` | Never reaches AssetGen. The comma in `TMap<FName, int32>` splits the macro argument, and clang stops with "too many arguments provided to function-like macro invocation". A type alias for the map is no way around it: through an alias declared in the class, the variable is refused as above ("a TMap or TSet does not replicate"), and an alias at namespace scope of a container or value type is refused as a variable's type ("unimplemented property"). | Refused |
 | `void OnRep_Ammo(int32 OldAmmo)` | Refused: the RepNotify "must be a method of the class taking no parameters". A Blueprint RepNotify takes none, so C++'s previous-value form has no equivalent. The same message appears when no method of that name exists. Keep the previous value in a member and compare it in the OnRep. | Refused |
-| `inline void OnRep_Ammo()` | Not caught: it compiles with no diagnostic. An inline method is no Blueprint function, so the class has no `OnRep_Ammo`, yet the variable names it and every assignment calls it by name. A call by name to a function that does not exist is a fatal error in the engine. Drop `inline`. | Not yet |
+| `int32 OnRep_Ammo()` | Refused: the RepNotify "must return void". The engine calls it with no room for a result. | Refused |
+| `inline void OnRep_Ammo()` | Refused: the RepNotify "is inline, so no function of the class". An inline method is no Blueprint function, so a client would never find the OnRep. Drop `inline`. | Refused |
 | `UE_REPLICATED(int32, A);` in a `UE_STRUCT` | Ignored without a diagnostic: `A` is a plain struct member. UE has no per-member replication for a struct. Replicate the class variable that holds the struct, which replicates it as a whole. | Not yet |
 
 ```cpp
@@ -5832,6 +5833,10 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   `UE_SERVER void ServerBump(int32 &Count) { Count += 1; }`. The remote side gets a copy. The build goes on. Fix: take
   the parameter by value or by `const&`, and send a result back another way, such as a Client RPC or a replicated
   variable. See [RPCs](#rpcs).
+- `<Class>::<Function>: an RPC goes one way: UE_MULTICAST with UE_SERVER or UE_CLIENT`: two direction markers on one
+  function. The sender picks one direction and the receiver checks its own. Fix: keep one marker. See [RPCs](#rpcs).
+- `<Class>::<Function>: a static function cannot be an RPC, it is never sent`: `UE_SERVER static void S();`. The
+  engine routes a static function locally. Fix: make it a member function. See [RPCs](#rpcs).
 - `<Class>::<Function>: an RPC returns void`: `UE_SERVER int32 Fire();` with a body. Fix: return void, and send a
   result back with another RPC or a replicated variable. See [RPCs](#rpcs).
 - `<Class>::<Member>: its RepNotify <Notify> must be a method of the class taking no parameters`:
@@ -5839,6 +5844,11 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   parameters. Fix: declare `void OnRep_Health();` on the class. For a variable declared on a mod interface, a
   declaration on the interface also satisfies the check; each implementing class still gets the RepNotify as its own
   function. See [Replication](#replication).
+- `<Class>::<Member>: its RepNotify <Notify> must return void`: `int32 OnRep_Health()`. The engine calls the OnRep
+  with no room for a result. Fix: return void. See [Replication](#replication).
+- `<Class>::<Member>: its RepNotify <Notify> is inline, so no function of the class: drop inline`:
+  `inline void OnRep_Health()`. An inline method is expanded where it is called and is no Blueprint function, so a
+  client would never find it. Fix: declare it without `inline`. See [Replication](#replication).
 - `<Class>::<Member>: unknown replication condition <Condition>`: a condition name that is not an ELifetimeCondition,
   as in `UE_REPLICATED_IF(FVector, Aim, OwnersOnly);`. Fix: use one of None, InitialOnly, OwnerOnly, SkipOwner,
   SimulatedOnly, AutonomousOnly, SimulatedOrPhysics, InitialOrOwner, Custom, ReplayOrOwner, ReplayOnly,

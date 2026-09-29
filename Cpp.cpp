@@ -10326,6 +10326,12 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 else if (auto D = Decl.Methods.find(Notify); D != Decl.Methods.end()) NotifyFn = D->second;
                 if (!NotifyFn || !ParmNames(*NotifyFn).empty())
                 { *Err = R.CppName + "::" + FieldName + ": its RepNotify " + Notify + " must be a method of the class taking no parameters"; return false; }
+                /* RepLayout calls it through ProcessEvent with no room for a result; an inline method is no UFunction
+                   at all, so a client's RepLayout would never find it and the OnRep would never run there. */
+                if ((*NotifyFn)["type"].value("qualType", std::string()).rfind("void", 0) != 0)
+                { *Err = R.CppName + "::" + FieldName + ": its RepNotify " + Notify + " must return void"; return false; }
+                if (IsInlineMethod(R, Notify))
+                { *Err = R.CppName + "::" + FieldName + ": its RepNotify " + Notify + " is inline, so no function of the class: drop inline"; return false; }
                 PD.PropertyFlags |= CPF_RepNotify;
                 PD.RepNotify = Notify;
             }

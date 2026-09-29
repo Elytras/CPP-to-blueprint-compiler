@@ -6041,17 +6041,13 @@ def repl_never():
     print('ok  ReplNever: UE_REPLICATED_IF(..., Never) is COND_Never 15 (CoreNetTypes.h 26), not the undefined 14')
 
 
-def repl_inline_notify():
-    base = refused_naming('ReplInlineNotify', 'OnRep_Ammo')
-    if base is None: return
-    pkg = invariants.Package(base)
-    fm = dict(pkg.struct(pkg.find('ReplInlineNotify_C')).func_map)
-    assert 'OnRep_Ammo' in fm and pkg.class_of(fm['OnRep_Ammo']) == 'Function', \
-        'Ammo names RepNotify OnRep_Ammo, no function of the class (FuncMap %s); Fire calls it by name' % sorted(fm)
-    keeps_invariants(base)
-    vm = VM(base, Seen=0)
-    vm.call('Fire')
-    assert vm.self.vars == dict(Ammo=3, Seen=1), vm.self.vars
+def repl_notify_refusals():
+    """A RepNotify returns void (RepLayout calls it with no room for a result), and is a function of the class: an
+    inline method is none, so a client's RepLayout would never find it."""
+    refused('RepNotifyRet', '  UE_REPLICATED_USING(int32, N, OnRep_N);\n  int32 OnRep_N() { return N; }\n', 'OnRep_N must return void')
+    refused('ReplInlineNotify', '  UE_REPLICATED_USING(int32, Ammo, OnRep_Ammo);\n  int32 Seen;\n'
+            '  inline void OnRep_Ammo() { Seen += 1; }\n  void Fire() { Ammo = 3; }\n', 'OnRep_Ammo is inline')
+    print('ok  RepNotify refusals: one that returns a value, an inline one')
 
 
 def repl_unreplicable(mod, member):
@@ -6126,11 +6122,9 @@ def rpc_inline():
 
 repl_conditions()
 repl_refusals()
-pending('RepNotifyRet: a RepNotify that returns a value is refused (RepLayout passes the shadow value as its parms)',
-        lambda: refused('RepNotifyRet', '  UE_REPLICATED_USING(int32, N, OnRep_N);\n  int32 OnRep_N() { return N; }\n', 'OnRep_N'))
+repl_notify_refusals()
 repl_never()
 rpc_one_way()
-pending('ReplInlineNotify: an inline RepNotify is refused, or cooked as a function of the class', repl_inline_notify)
 pending('ReplHiddenMap: a replicated struct holding a TMap is refused like a TMap variable', repl_unreplicable('ReplHiddenMap', 'Bag'))
 pending('ReplHiddenIface: a replicated TScriptInterface is refused (FInterfaceProperty sends nothing)', repl_unreplicable('ReplHiddenIface', 'Target'))
 pending('ReplHiddenRpc: an RPC parameter struct holding a TMap is refused like a TMap parameter', repl_unreplicable('ReplHiddenRpc', 'Send'))
