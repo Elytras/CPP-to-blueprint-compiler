@@ -10147,8 +10147,11 @@ bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& P
     }
     if (Type == "UClass *" || Type == "UClass*")
     {
-        *Out = ClassParam(PName, BP.EngineClass("/Script/CoreUObject", "Class"),
-                          BP.EngineClass("/Script/CoreUObject", "Object"), ExtraFlags);
+        /* Two statements: as two arguments of one call, the compiler picks which import is added first. Object goes
+           first, the order the MSVC build has always written (it evaluates arguments right to left). */
+        const FIndex UObjectImp = BP.EngineClass("/Script/CoreUObject", "Object");
+        const FIndex UClassImp = BP.EngineClass("/Script/CoreUObject", "Class");
+        *Out = ClassParam(PName, UClassImp, UObjectImp, ExtraFlags);
         return true;
     }
     if (Type == "float") { *Out = FloatParam(PName, ExtraFlags); return true; }
