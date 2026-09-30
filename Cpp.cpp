@@ -5954,7 +5954,21 @@ bool FCompiler::LowerAwait(const Json& CallNode, FBlueprintClass& BP, FCallIR& O
     }
 
     auto Body = std::make_shared<std::vector<FStmtIR>>();
-    auto Add = [&](FCallIR Call) { Body->emplace_back(); Body->back().K = FStmtIR::StaticCall; Body->back().Call = std::move(Call); };
+    /* The editor's async node tests the proxy with IsValid and binds its dispatchers and calls Activate on the true
+       branch only (K2Node_BaseAsyncTask.cpp 393-408, 440-448): through a None object each would be an 'Accessed None'
+       script warning (ScriptCore.cpp 2904-2937) that binds nothing (3085-3101). The run ends at the await either way. */
+    auto Binds = Body;
+    if (Disp.Base && Disp.Base->K != FArgIR::Self)
+    {
+        FStmtIR Gate;
+        Gate.K = FStmtIR::If;
+        Gate.Cond = *Disp.Base;
+        WrapInCall(Gate.Cond, BP.EngineFunction("/Script/Engine", "KismetSystemLibrary", "IsValid"));
+        Gate.Cond.InnerType = "bool";
+        Gate.Then = Binds = std::make_shared<std::vector<FStmtIR>>();
+        Body->push_back(std::move(Gate));
+    }
+    auto Add = [&](FCallIR Call) { Binds->emplace_back(); Binds->back().K = FStmtIR::StaticCall; Binds->back().Call = std::move(Call); };
     FCallIR Bind;
     Bind.Intrinsic = "__AddDelegate__";
     Bind.Args.push_back(Disp);
@@ -5981,7 +5995,9 @@ bool FCompiler::LowerAwait(const Json& CallNode, FBlueprintClass& BP, FCallIR& O
     FCallIR Point;
     Point.Intrinsic = "__AwaitPoint__";
     Point.Resume = C.Resume;
-    Add(Point);
+    Body->emplace_back();
+    Body->back().K = FStmtIR::StaticCall;
+    Body->back().Call = std::move(Point);
 
     Completions.push_back(C);
     bMadeLatentCall = true;

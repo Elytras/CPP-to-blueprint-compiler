@@ -156,7 +156,6 @@ KNOWN_RULES = {     # sweep rules the suite's own packages still break, each wit
     'export_archetype': 'native default-subobject overrides have a null TemplateIndex',
     'import_chains': 'packages import themselves (their own package, class and functions)',
     'instanced_refs_flagged': 'no property ever gets CPF_InstancedReference / CPF_ContainsInstancedReference',
-    'latent_async_proxy_validated': 'the async proxy is bound and activated with no IsValid gate',
     'latent_proxy_frame_held': 'AsyncTest.Play keeps its montage callback proxy only in a local of a function that '
                                'does not wait',
     'native_out_arrays_emptied': "a native's out TArray is not emptied before the call, so Set_ToArray appends",
@@ -6250,22 +6249,21 @@ def await_null_proxy():
     and Activate (K2Node_BaseAsyncTask.cpp 393-408), where binding through a None context logs an Accessed None
     script warning per bind and per Activate (ScriptCore.cpp 2904-2937). Nothing after the await runs either way.
     (DownloadImage itself never returns None; a factory such as CreateMoveToProxyObject does, with no pawn.) The same
-    mod with a real task binds, activates and resumes, so the gap is the missing test and nothing else."""
-    def check():
-        made, activated, natives = await_fakes()
-        vm = VM(pending_asset('AwaitNullProxy'), natives)
-        vm.call('Download', 'u')
-        once_ok = len(activated) == 1 and activated[0][0] is made[-1] and 'OnSuccess' in activated[0][1]
-        vm.broadcast(made[-1], 'OnSuccess', 'tex')
-        assert once_ok and vm.self.vars == dict(Image='tex') and not vm.accessed_none, (activated, vm.self.vars)
-        made, activated, natives = await_fakes()
-        natives['DownloadImage'] = lambda vm, ctx, *a: None
-        vm = VM(pending_asset('AwaitNullProxy'), natives)
-        vm.call('Download', '')
-        assert not activated and 'Image' not in vm.self.vars and not vm.binds, (activated, vm.self.vars, vm.binds)
-        assert not vm.accessed_none, 'the None proxy is bound / activated through a warning context: Accessed None ' \
-                                     'at %s' % vm.accessed_none
-    pending('AwaitNullProxy.Download: a None async proxy skips its binds and Activate, as IsValid gates them', check)
+    mod with a real task binds, activates and resumes, so the None case is the IsValid test and nothing else."""
+    made, activated, natives = await_fakes()
+    vm = VM(asset('AwaitNullProxy'), natives)
+    vm.call('Download', 'u')
+    once_ok = len(activated) == 1 and activated[0][0] is made[-1] and 'OnSuccess' in activated[0][1]
+    vm.broadcast(made[-1], 'OnSuccess', 'tex')
+    assert once_ok and vm.self.vars == dict(Image='tex') and not vm.accessed_none, (activated, vm.self.vars)
+    made, activated, natives = await_fakes()
+    natives['DownloadImage'] = lambda vm, ctx, *a: None
+    vm = VM(asset('AwaitNullProxy'), natives)
+    vm.call('Download', '')
+    assert not activated and 'Image' not in vm.self.vars and not vm.binds, (activated, vm.self.vars, vm.binds)
+    assert not vm.accessed_none, 'the None proxy is bound / activated through a warning context: Accessed None ' \
+                                 'at %s' % vm.accessed_none
+    print('ok  AwaitNullProxy.Download: a None async proxy skips its binds and Activate, as IsValid gates them')
 
 
 def proxy_frame_held():
