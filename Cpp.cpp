@@ -12869,8 +12869,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
 }
 
 /* The keys FAstSax drops wherever they stand: source locations, mangled names, a record's definitionData, a type
-   alias's typeAliasDeclId. FAstSax::key asks this, and a filter that throws these members away before the parser
-   lexes them must ask this same function, so the two cannot disagree.
+   alias's typeAliasDeclId. FDumpFilter throws these members away before the parser lexes them, and FAstSax::key asks
+   this same function, so the two cannot disagree.
    The contract: a key goes here only if FAstSax drops it in every context. A key it drops only in some (range, end,
    isImplicit, isUsed, isReferenced) stays in key()'s own rules, which see the tree built so far; the filter passes
    those through. A key that anything reads later is in neither. */
@@ -12879,6 +12879,118 @@ bool DroppedAstKey(const std::string& K)
     return K == "loc" || K == "file" || K == "line" || K == "col" || K == "includedFrom" || K == "expansionLoc"
         || K == "isMacroArgExpansion" || K == "mangledName" || K == "definitionData" || K == "typeAliasDeclId";
 }
+
+/* Throws away, before nlohmann lexes it, what FAstSax would throw away after: the whitespace between tokens and every
+   object member whose key is a DroppedAstKey, whatever its value. In an FSD.h mod's dump that is seven bytes in eight,
+   and lexing them was most of the parser's time. What is left parses to the same DOM (DESIGN.md, "Why output stays
+   byte-identical"): a kept string or number is copied byte for byte and never decoded, so nlohmann types and checks
+   it as before, and the keys FAstSax keeps or drops by context (range, end, isImplicit, isUsed, isReferenced) pass
+   through for it to decide.
+   Feed takes the dump in pieces cut anywhere, inside a token too: the state carries over to the next call. The values
+   it skips are not checked, which is safe only because clang's JSON writer never writes a malformed one. */
+class FDumpFilter
+{
+public:
+    /* The most one Feed of N bytes can write: the room its Dst needs. Every byte written stands for one read in the
+       same call, but for the comma held back before a kept key and the key itself, which an earlier call may have
+       read: a cut between a key and its colon writes the comma, both quotes and the key on reading the colon. */
+    size_t MaxOut(size_t N) const { return N + Key.size() + 4; }
+
+    /* Writes the filtered form of [P, P + N) at Dst, which has room for MaxOut(N) bytes, and returns its new end. */
+    char* Feed(const char* P, const size_t N, char* Dst)
+    {
+        for (const char* const E = P + N; P < E;)
+        {
+            const char C = *P;
+            switch (State)
+            {
+            case EState::Token:
+                ++P;
+                if (IsSpace(C)) break;
+                if (C == '"' && bKeyNext) { State = EState::Key; Key.clear(); bKeyNext = bEscaped = false; break; }
+                if (C == '"') { State = EState::String; bEscaped = false; }
+                else if (C == '{' || C == '[') { Open.push_back({ C == '{', false }); bKeyNext = C == '{'; }
+                else if ((C == '}' || C == ']') && !Open.empty()) { Open.pop_back(); bKeyNext = false; }
+                /* A comma between members waits for the next key kept: every member after it may be dropped. An
+                   array's elements never are, so its commas pass. */
+                else if (C == ',' && !Open.empty() && Open.back().bObject) { bKeyNext = true; break; }
+                *Dst++ = C;
+                break;
+            case EState::String:            // copied as it is, escapes and all
+            {
+                const char* const S = P;
+                while (P < E && !EndsString(*P++, EState::Token)) {}
+                std::memcpy(Dst, S, size_t(P - S));
+                Dst += P - S;
+                break;
+            }
+            case EState::Key:               // read whole before a byte of it is written: it may be dropped
+            {
+                const char* const S = P;
+                while (P < E && !EndsString(*P++, EState::Colon)) {}
+                Key.append(S, size_t(P - S));
+                break;
+            }
+            case EState::Colon:
+                ++P;
+                if (IsSpace(C)) break;
+                Key.pop_back();             // its closing quote
+                if (C == ':' && DroppedAstKey(Key)) { State = EState::SkipValue; break; }
+                if (Open.back().bAny) *Dst++ = ',';
+                Open.back().bAny = true;
+                *Dst++ = '"';
+                std::memcpy(Dst, Key.data(), Key.size());
+                Dst += Key.size();
+                *Dst++ = '"';
+                *Dst++ = C;                 // the colon, or what the parser will refuse
+                State = EState::Token;
+                break;
+            case EState::SkipValue:
+                if (IsSpace(C)) ++P;
+                else if (C == '{' || C == '[') { ++P; Depth = 1; State = EState::SkipNested; }
+                else if (C == '"') { ++P; Depth = 0; bEscaped = false; State = EState::SkipString; }
+                else State = EState::SkipScalar;
+                break;
+            case EState::SkipNested:        // a bracket inside one of its strings does not count
+                while (P < E)
+                {
+                    const char D = *P++;
+                    if (D == '"') { bEscaped = false; State = EState::SkipString; break; }
+                    if (D == '{' || D == '[') ++Depth;
+                    else if ((D == '}' || D == ']') && --Depth == 0) { State = EState::Token; break; }
+                }
+                break;
+            case EState::SkipString:
+                while (P < E && !EndsString(*P++, Depth ? EState::SkipNested : EState::Token)) {}
+                break;
+            case EState::SkipScalar:        // a number, true, false or null ends where what follows it starts
+                if (C == ',' || C == '}' || C == ']' || IsSpace(C)) State = EState::Token;
+                else ++P;
+                break;
+            }
+        }
+        return Dst;
+    }
+
+private:
+    enum class EState : uint8 { Token, String, Key, Colon, SkipValue, SkipNested, SkipString, SkipScalar };
+    struct FOpen { bool bObject, bAny; };   // an open object or array; for an object, whether a member was written yet
+    EState State = EState::Token;
+    std::vector<FOpen> Open;
+    std::string Key;                        // the key being read, then with its closing quote until the colon
+    int32 Depth = 0;                        // inside a dropped object or array
+    bool bKeyNext = false;                  // the next string is a key of the innermost object
+    bool bEscaped = false;                  // the last byte of the string being read was an unescaped backslash
+
+    static bool IsSpace(char C) { return C == ' ' || C == '\n' || C == '\r' || C == '\t'; }
+    bool EndsString(char C, EState Then)
+    {
+        if (bEscaped) bEscaped = false;
+        else if (C == '\\') bEscaped = true;
+        else if (C == '"') { State = Then; return true; }
+        return false;
+    }
+};
 
 /* Builds the DOM of clang's AST dump as it streams in, without what nothing reads: source locations (all but a
    DeclRefExpr's or MemberExpr's range begin offset and token length, and its end's in a macro, see NamedQualifier and
@@ -12959,20 +13071,30 @@ private:
     }
 };
 
+/* Where FAstSource takes the dump from, a chunk at a time and in order: clang's pipe (FDumpStream), or astcheck's
+   copy in memory, cut to whatever sizes it tests. */
+class IDumpChunks
+{
+public:
+    virtual ~IDumpChunks() = default;
+    /* The next chunk, never empty, or false once the dump has ended. */
+    virtual bool Next(std::string& Chunk) = 0;
+};
+
 /* Reads clang's pipe on a thread of its own and hands the dump to the parser in chunks, in order. On one thread clang
    and FAstSax took turns: _popen's pipe holds 1 KB and fread keeps reading until it has filled the whole request, so
    clang sat on a full pipe while FAstSax parsed a MB, and FAstSax sat idle while clang wrote the next one. The queue is
    capped: a parser slower than clang would otherwise hold most of the dump, and the suite runs 8 compiles at once. */
-class FDumpStream
+class FDumpStream : public IDumpChunks
 {
 public:
     explicit FDumpStream(FILE* InPipe) : Pipe(InPipe), Buf(ChunkBytes), Reader([this] { ReadPipe(); }) {}
-    ~FDumpStream() { Stop(); }      // a parse that throws must not destroy a joinable thread (std::terminate)
+    ~FDumpStream() override { Stop(); }     // a parse that throws must not destroy a joinable thread (std::terminate)
     FDumpStream(const FDumpStream&) = delete;
     FDumpStream& operator=(const FDumpStream&) = delete;
 
     /* On the parser's thread: the next chunk, or false once the dump has ended. */
-    bool Next(std::string& Chunk)
+    bool Next(std::string& Chunk) override
     {
         std::unique_lock<std::mutex> Lock(Mutex);
         Changed.wait(Lock, [&] { return !Queue.empty() || bEnd; });
@@ -13038,7 +13160,7 @@ private:
             }
             catch (...)
             {
-                /* The parser takes what is queued, then the end, so its parse fails; ParseClangAst rethrows this. */
+                /* The parser takes what is queued, then the end, so its parse fails; RunClang rethrows this. */
                 std::lock_guard<std::mutex> Lock(Mutex);
                 ReaderError = std::current_exception();
                 bEnd = bDrain = true;
@@ -13051,33 +13173,72 @@ private:
     }
 };
 
-/* Runs clang (Cmd writes the AST dump to stdout) and parses the dump as it streams in through a pipe. The dump is
-   hundreds of MB: written to a file and read back, it was most of a compile's disk traffic, and several compiles at
-   once (the test suites of parallel sessions) held the disk at its limit with the CPU mostly idle. FDumpStream drains
-   the pipe on a second thread, so clang writes the dump while FAstSax parses it instead of the two taking turns. */
-bool ParseClangAst(const std::string& Cmd, const std::string& SourcePath, Json* Out, std::string* Err)
+/* What the parser reads: the dump's chunks in order, each through FDumpFilter first unless bFilter is off (the
+   fallback's way). Cur holds the current chunk's bytes as filtered, and Pos the parser's place in them. */
+class FAstSource
 {
-    struct FAstSource
+public:
+    std::string Cur;
+    size_t Pos = 0;
+
+    FAstSource(IDumpChunks& InChunks, bool bInFilter) : Chunks(InChunks), bFilter(bInFilter) {}
+
+    /* Moves on to the next chunk, or returns false at the end of the dump. A chunk the filter emptied (whitespace and
+       dropped members only) is passed over: FAstSourceIt would read an empty Cur as the end. */
+    bool Next()
     {
-        FDumpStream& Stream;
-        std::string Cur;
-        size_t Pos = 0;
-        bool Next() { Pos = 0; return Stream.Next(Cur); }
-    };
-    /* One char at a time for nlohmann's iterator input; a null source is the end. */
-    struct FAstSourceIt
-    {
-        using iterator_category = std::input_iterator_tag;
-        using value_type = char;
-        using difference_type = std::ptrdiff_t;
-        using pointer = const char*;
-        using reference = const char&;
-        FAstSource* S = nullptr;
-        reference operator*() const { return S->Cur[S->Pos]; }
-        FAstSourceIt& operator++() { if (++S->Pos == S->Cur.size() && !S->Next()) S = nullptr; return *this; }
-        bool operator==(const FAstSourceIt& O) const { return S == O.S; }
-        bool operator!=(const FAstSourceIt& O) const { return S != O.S; }
-    };
+        Pos = 0;
+        while (bFilter ? Chunks.Next(Raw) : Chunks.Next(Cur))
+        {
+            if (bFilter)
+            {
+                /* Sized for the most Feed can write, which can be more than it reads (see MaxOut). */
+                Cur.resize(Filter.MaxOut(Raw.size()));
+                Cur.resize(size_t(Filter.Feed(Raw.data(), Raw.size(), Cur.data()) - Cur.data()));
+            }
+            if (!Cur.empty()) return true;
+        }
+        Cur.clear();
+        return false;
+    }
+
+private:
+    IDumpChunks& Chunks;
+    const bool bFilter;
+    FDumpFilter Filter;
+    std::string Raw;                // the chunk being filtered into Cur
+};
+
+/* One char at a time for nlohmann's iterator input; a null source is the end. */
+struct FAstSourceIt
+{
+    using iterator_category = std::input_iterator_tag;
+    using value_type = char;
+    using difference_type = std::ptrdiff_t;
+    using pointer = const char*;
+    using reference = const char&;
+    FAstSource* S = nullptr;
+    reference operator*() const { return S->Cur[S->Pos]; }
+    FAstSourceIt& operator++() { if (++S->Pos == S->Cur.size() && !S->Next()) S = nullptr; return *this; }
+    bool operator==(const FAstSourceIt& O) const { return S == O.S; }
+    bool operator!=(const FAstSourceIt& O) const { return S != O.S; }
+};
+
+/* Builds the DOM of the dump Src reads into Out (FAstSax); false if the dump is not JSON. */
+bool ParseAst(FAstSource& Src, Json* Out)
+{
+    FAstSax Sax(*Out);
+    return Src.Next() && Json::sax_parse(FAstSourceIt{ &Src }, FAstSourceIt{}, &Sax);
+}
+
+/* Runs clang's command Cmd, which writes the AST dump to stdout, and hands the dump to Read as it streams in through a
+   pipe. The dump is hundreds of MB: written to a file and read back, it was most of a compile's disk traffic, and
+   several compiles at once (the test suites of parallel sessions) held the disk at its limit with the CPU mostly idle.
+   FDumpStream drains the pipe on a second thread, so clang writes the dump while Read works on it instead of the two
+   taking turns. False, with Err, if clang did not run, rejected the source or wrote nothing. */
+bool RunClang(const std::string& Cmd, const std::string& SourcePath, const std::function<void(IDumpChunks&)>& Read,
+              std::string* Err)
+{
 #ifdef _WIN32
     /* cmd /c strips the first and last quote of a line that starts with one, so wrap it in a spare pair. */
     FILE* Pipe = _popen(("\"" + Cmd + "\"").c_str(), "rb");
@@ -13085,17 +13246,14 @@ bool ParseClangAst(const std::string& Cmd, const std::string& SourcePath, Json* 
     FILE* Pipe = popen(Cmd.c_str(), "r");
 #endif
     if (!Pipe) { *Err = "could not run clang"; return false; }
-    bool bParsed = false;
     uint64 Total = 0;
-    /* Any exception, the reader's or the parse's, waits until the pipe is closed: thrown past pclose, it would leave
-       clang behind. */
+    /* Any exception, the reader's or Read's, waits until the pipe is closed: thrown past pclose, it would leave clang
+       behind. */
     std::exception_ptr Error;
     try
     {
         FDumpStream Stream(Pipe);
-        FAstSource Src{ Stream };
-        FAstSax Sax(*Out);
-        bParsed = Src.Next() && Json::sax_parse(FAstSourceIt{ &Src }, FAstSourceIt{}, &Sax);
+        Read(Stream);
         Stream.Stop();
         Stream.RethrowReaderError();
         Total = Stream.Total();
@@ -13111,8 +13269,27 @@ bool ParseClangAst(const std::string& Cmd, const std::string& SourcePath, Json* 
     if (Error) std::rethrow_exception(Error);
     if (Status != 0) { *Err = "clang rejected " + SourcePath + " (diagnostics above)"; return false; }
     if (Total == 0) { *Err = "clang produced no AST for " + SourcePath; return false; }
-    if (!bParsed) { *Err = "could not parse clang's AST dump"; return false; }
     return true;
+}
+
+/* Parses the AST dump clang's command Cmd writes, filtered by FDumpFilter unless bFilter is off. A filtered dump that
+   does not parse is read again unfiltered, which costs one more clang run: a filter bug then costs time, not the
+   compile. Only a failure the parse notices gets that far, never clang's own (RunClang reports those first), and a
+   filter bug that still parsed would build a different tree: catching that is astcheck's job. */
+bool ParseClangAst(const std::string& Cmd, const std::string& SourcePath, Json* Out, std::string* Err,
+                   bool bFilter = true)
+{
+    bool bParsed = false;
+    const auto Parse = [&](IDumpChunks& Chunks) {
+        FAstSource Src(Chunks, bFilter);
+        bParsed = ParseAst(Src, Out);
+    };
+    if (!RunClang(Cmd, SourcePath, Parse, Err)) return false;
+    if (bParsed) return true;
+    if (!bFilter) { *Err = "could not parse clang's AST dump"; return false; }
+    fprintf(stderr, "assetgen: the filtered AST dump did not parse; reading it again unfiltered\n");
+    *Out = Json();
+    return ParseClangAst(Cmd, SourcePath, Out, Err, false);
 }
 
 bool FCompiler::LoadTables(const std::string& IncludeDir, std::string* Err)
