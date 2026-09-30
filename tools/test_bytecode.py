@@ -5338,15 +5338,10 @@ def comp_tick():
     print('ok  CompTick: a class with its own ReceiveTick can ever tick, one without cannot (and the examples)')
 
 
-comp_tick()
-
-
-# ---- Pending: what AssetGen does not do yet
-
 def comp_tick_component():
     """A component Blueprint with its own ReceiveTick registers its tick: its CDO's PrimaryComponentTick.bCanEverTick
     is set (UActorComponent's is false), and the ReceiveTick it ships runs."""
-    b = pending_asset('CompTickComponent')
+    b = asset('CompTickComponent')
     p, ci = class_pkg(b)
     cdo = p.struct(ci).cdo - 1
     t = p.tag(cdo, 'PrimaryComponentTick')
@@ -5355,7 +5350,14 @@ def comp_tick_component():
     run(b, 'ReceiveTick', self_vars=fields, DeltaSeconds=0.25)
     assert fields == {'N': 3}, fields
     keeps_invariants(b)
+    print('ok  CompTickComponent: a component Blueprint with its own ReceiveTick sets PrimaryComponentTick.bCanEverTick')
 
+
+comp_tick()
+comp_tick_component()
+
+
+# ---- Pending: what AssetGen does not do yet
 
 def comp_tick_patch():
     """A UE_PATCH that adds ReceiveTick to a Blueprint whose parent is AActor (CompTest, standing in for a game
@@ -5462,7 +5464,6 @@ def comp_attach_inherited():
         keeps_invariants(os.path.join(folder, cls))
 
 
-pending('CompTickComponent: a component Blueprint with ReceiveTick sets PrimaryComponentTick.bCanEverTick', comp_tick_component)
 pending('CompTickPatch: a patch that adds ReceiveTick sets the CDO\'s PrimaryActorTick.bCanEverTick', comp_tick_patch)
 pending('CompRootKeep: a subclass\'s first scene component attaches to the inherited root and keeps its transform', comp_root_keep)
 pending('CompOverrideChain: an override template is archetyped on the nearest ancestor\'s override', comp_override_chain)

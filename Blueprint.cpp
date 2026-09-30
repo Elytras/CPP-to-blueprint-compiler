@@ -333,10 +333,14 @@ void FBlueprintClass::Finish()
     if (bParentIsBlueprint)
         Cdo.CreateBeforeSer = { ParentIdx.V };
     for (const FPropertyDef& V : Vars) DefaultRefs(V.Default, Cdo.CreateBeforeSer);     // as ED_Spider_Grunt lists its EnemyID
-    // AActor defaults bCanEverTick to false; the BP compiler sets it on the CDO when ReceiveTick
-    // is overridden (KismetCompiler.cpp, SetCanEverTick), else the actor loads and never ticks.
-    const bool bOverridesTick = std::any_of(Functions.begin(), Functions.end(),
+    // AActor and UActorComponent default bCanEverTick to false; the BP compiler sets it on the CDO's
+    // tick function - an actor's PrimaryActorTick, a component's PrimaryComponentTick - when ReceiveTick
+    // is overridden (KismetCompiler.cpp:4738-4800, SetCanEverTick), else the object loads and never
+    // ticks (Actor.cpp:914-925, ActorComponent.cpp:1038-1046). Any other class has no tick function.
+    const bool bOverridesTick = (bIsActor || bIsComponent) && std::any_of(Functions.begin(), Functions.end(),
         [](const FPending& F) { return F.Def.Name == "ReceiveTick"; });
+    const char* const TickProperty = bIsActor ? "PrimaryActorTick" : "PrimaryComponentTick";
+    const char* const TickStruct = bIsActor ? "ActorTickFunction" : "ActorComponentTickFunction";
 
     const bool bCdoReplicates = bReplicates;
     const std::vector<FPropertyDef> Inherited = CdoDefaults;
@@ -346,10 +350,10 @@ void FBlueprintClass::Finish()
     Cdo.Serialize = [=](FArc& Ar) {
         if (bCdoReplicates) TagBool(Ar, "bReplicates", true);
         if (bOverridesTick)
-            Tag(Ar, "PrimaryActorTick", "StructProperty", [](FArc& V) {
+            Tag(Ar, TickProperty, "StructProperty", [](FArc& V) {
                 TagBool(V, "bCanEverTick", true);
                 TagEnd(V);
-            }, "ActorTickFunction");
+            }, TickStruct);
         /* Only initialised members: an absent tag keeps the parent CDO's (zero) value. */
         for (const FPropertyDef& V : ClassVars)
             if (V.Default.K != FDefaultValue::None) WriteDefaultTag(Ar, V);

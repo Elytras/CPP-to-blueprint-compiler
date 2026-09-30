@@ -10321,6 +10321,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
 
     const bool bIsActor = std::find(Ancestry.begin(), Ancestry.end(), "Actor") != Ancestry.end();
     BP.SetIsActor(bIsActor);
+    BP.SetIsComponent(std::find(Ancestry.begin(), Ancestry.end(), "ActorComponent") != Ancestry.end());
     /* Abstract: the nearest declaration of some method along the class chain is `= 0`. SpawnActor and CreateWidget
        refuse the class, as they do one the editor marks Generate Abstract Class. An interface's `= 0` does not count,
        since an implementer that leaves it out gets a stub, and clang's own isAbstract never reaches here (FAstSax). */

@@ -276,8 +276,8 @@ Notes:
 | `: public UBlueprintFunctionLibrary` | A Blueprint Function Library, a class of static functions. See [Functions](#functions). | Yes |
 | `: public UPrimaryDataAsset`, `: public UDataAsset` | A data asset class. Its instances are braced variables at namespace scope; see [Data assets](#data-assets). | Yes |
 | `: public USaveGame`, `: public UFSDSaveGame` | A save game class. | Yes |
-| `: public UActorComponent`, `: public USceneComponent` | A component Blueprint, with the component class flags. Add one to an actor at run time with `AddComponentByType<T>(Owner)`, the editor's Add Component by Class node. Its own events to override are `ReceiveBeginPlay` and `ReceiveEndPlay`. It cannot be a `UE_COMPONENT` of a mod actor, which takes engine component classes only; see [Components](#components). | Yes |
-| `void ReceiveTick(float DeltaSeconds)` in a component class | Not yet: it compiles with no warning and never ticks. The compiler turns on an actor's tick flag, which a component does not have, and setting `PrimaryComponentTick` in `UE_DEFAULTS` is refused. Call a method of the component from its owner's `ReceiveTick` instead. | Not yet |
+| `: public UActorComponent`, `: public USceneComponent` | A component Blueprint, with the component class flags. Add one to an actor at run time with `AddComponentByType<T>(Owner)`, the editor's Add Component by Class node. Its own events to override are `ReceiveBeginPlay`, `ReceiveEndPlay` and `ReceiveTick`. It cannot be a `UE_COMPONENT` of a mod actor, which takes engine component classes only; see [Components](#components). | Yes |
+| `void ReceiveTick(float DeltaSeconds)` in a component class | Turns the component's ticking on: it sets `PrimaryComponentTick.bCanEverTick` on the class default object, as the editor's compiler does. UActorComponent leaves it off. | Yes |
 | `: public UUserWidget` | A widget with logic and no layout. `CreateWidget<T>` makes one. Its events, such as `Construct`, are overrides. `Tick` runs only if `bHasScriptImplementedTick` is set in `UE_DEFAULTS`, which the editor's widget compiler would do. | Yes |
 | a designer layout (a widget tree) for a mod widget | Not yet, and nothing warns. A mod widget has no widget tree, so it shows nothing of its own. For visible UI, create one of the game's widget Blueprints. | Not yet |
 
@@ -2344,7 +2344,7 @@ the function it replaces is refused.
 | You write | What it does | Status |
 |---|---|---|
 | `void ReceiveBeginPlay() { ... }` | Overrides the parent's event, like adding the event node in the editor. The engine calls it. | Yes |
-| `void ReceiveTick(float DeltaSeconds)` | Also turns ticking on for the actor: it sets `PrimaryActorTick.bCanEverTick` on the class default object, as the editor's compiler does. AActor leaves ticking off by default. | Yes |
+| `void ReceiveTick(float DeltaSeconds)` | Also turns ticking on: it sets `PrimaryActorTick.bCanEverTick` on an actor's class default object, `PrimaryComponentTick.bCanEverTick` on a component's, as the editor's compiler does. AActor and UActorComponent leave ticking off by default. | Yes |
 | `void OnJumped() { ACharacter::OnJumped(); ... }` | Overrides a BlueprintNativeEvent (an event with a C++ default). The Blueprint version replaces the default, and the parent call runs it. | Yes |
 | `bool CanJumpInternal() const` | An override copies its parent's access, event, net, authority, cosmetic, const and pure flags, whatever section it is written in. It drops Native, because the Blueprint version is script. | Yes |
 | A class in `namespace Game::...` deriving a game Blueprint, redefining one of its functions | An override the game's code reaches by name, with the parent function's flags; see [examples/GameBlueprintChild.cpp](examples/GameBlueprintChild.cpp). | Yes |
@@ -2384,8 +2384,6 @@ Notes:
   native and no Blueprint event, so no function replaces it". C++ and calls bound to it keep running the engine's.
   An override of a function of another mod's class (from a `UE_CLASS` header) gets plain flags, not the parent's.
 - An event override is not BlueprintCallable, so the editor API stub leaves it out.
-- Only an actor's tick is switched on. A `UActorComponent` subclass that overrides ReceiveTick gets no component tick
-  setting, and whether it ticks is untested.
 
 ### Overriding your own parent's methods
 

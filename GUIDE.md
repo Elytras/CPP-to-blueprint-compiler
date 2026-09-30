@@ -320,7 +320,7 @@ call, but it cannot be bound to a dispatcher, called on another object or called
 
 An event is a method named after an event the parent class exposes, such as `ReceiveBeginPlay`, `ReceiveTick` or
 `ReceiveActorBeginOverlap`. The engine calls it as it calls the event node you add in the editor, and overriding
-`ReceiveTick` also turns ticking on for the actor. Inside an override, `Base::Method()` runs the parent's version, the
+`ReceiveTick` also turns ticking on for the actor or component. Inside an override, `Base::Method()` runs the parent's version, the
 editor's Add call to parent function; C++ has no `Super`, so name the class you derive from. Every other call to a
 method goes by name, so the most derived override runs, also when the parent's own code makes the call. A `final`
 class or method has no override, so its calls go straight to the one function, and on `this` its body is copied in.
@@ -1866,8 +1866,6 @@ each topic.
 - `Weapons::Turret::StaticClass()` for a mod class in a namespace. It names the engine class that Turret inherits
   `StaticClass` from. Write `Turret::StaticClass()` inside the namespace, or let a `TSubclassOf<Weapons::Turret>`
   parameter, such as SpawnActor's, supply the class. See [Creating objects](REFERENCE.md#creating-objects).
-- `ReceiveTick` on a mod component class. It compiles and never ticks. Call a method of the component from its owner's
-  `ReceiveTick`. See [Classes and variables](REFERENCE.md#classes-and-variables).
 - A mod widget class. It has no designer layout, so it shows nothing of its own. For visible UI, create one of the
   game's widget Blueprints. See [Classes and variables](REFERENCE.md#classes-and-variables).
 - An RPC, authority-only or cosmetic marker on an `inline` method. The marker is ignored, and the call runs locally.
