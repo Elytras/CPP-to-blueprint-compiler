@@ -1872,8 +1872,6 @@ each topic.
   `ReceiveTick`. See [Classes and variables](REFERENCE.md#classes-and-variables).
 - A mod widget class. It has no designer layout, so it shows nothing of its own. For visible UI, create one of the
   game's widget Blueprints. See [Classes and variables](REFERENCE.md#classes-and-variables).
-- `UE_REPLICATED` on a member of a `UE_STRUCT`. The marker is ignored. Replicate the class variable that holds the
-  struct. See [Replication](REFERENCE.md#replication).
 - An RPC, authority-only or cosmetic marker on an `inline` method. The marker is ignored, and the call runs locally.
   See [RPCs](REFERENCE.md#rpcs).
 - An engine or game static marked authority-only or cosmetic, such as `UGameplayStatics::ApplyDamage` or

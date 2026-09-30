@@ -2199,6 +2199,14 @@ bool FCompiler::Collect(std::string* Err)
     for (auto& It : Records)
     {
         FRecord& R = It.second;
+        /* Only the replicating class's own CPF_Net properties enter its replication list; a struct variable is sent
+           whole, so a marker on one of its members has no effect. */
+        if (R.bIsStruct && !R.Replicated.empty() && !R.IsNative())
+        {
+            *Err = R.CppName + "::" + R.Replicated.begin()->first + ": UE_REPLICATED on a struct member has no effect: a "
+                   "struct replicates whole, through the class variable that holds it; drop the marker";
+            return false;
+        }
         if (R.UePackage.empty()) continue;
         if (R.UePackage != PathIn(ModPackage, R.CppName)) continue;
         if (!R.bIsStruct && R.UeName != LeafOf(R.CppName) + "_C")
@@ -10607,6 +10615,17 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
        editor hides Delay there for that reason alone (EdGraphSchema_K2.cpp:846, ImplementsGetWorld). */
     const bool bHasOwnWorld = std::any_of(Ancestry.begin(), Ancestry.end(), [](const std::string& A) {
         return A == "Actor" || A == "ActorComponent" || A == "UserWidget" || A == "GameInstance" || A == "Subsystem"; });
+    /* Only an actor or a component replicates: UObject's GetLifetimeReplicatedProps lists nothing of a Blueprint's and
+       its GetFunctionCallspace runs every RPC locally. An interface declares them for the classes implementing it. */
+    if (!R.bIsInterface && std::none_of(Ancestry.begin(), Ancestry.end(), [](const std::string& A) {
+            return A == "Actor" || A == "ActorComponent"; }))
+    {
+        std::string What = R.Replicated.empty() ? std::string() : "the replicated variable " + R.Replicated.begin()->first;
+        for (const FMethod& Fn : Methods)
+            if (What.empty() && (NetFlagsOf(*Fn.Decl) | NetFlagsOf(*Fn.Def))) What = "the RPC " + Fn.Name;
+        if (!What.empty())
+        { *Err = R.CppName + ": " + What + " does nothing, since only an actor or an actor component replicates"; return false; }
+    }
     struct FSegment
     {
         std::string Name;

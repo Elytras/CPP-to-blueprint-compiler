@@ -6044,28 +6044,6 @@ def repl_unreplicable(mod, member):
     return test
 
 
-def struct_repl():
-    base = refused_naming('StructRepl', 'FReplHp::A')
-    if base is None: return
-    hp = invariants.Package(os.path.join(os.path.dirname(base), 'FReplHp'))
-    a = next(p for p in hp.struct(hp.find('FReplHp')).props if p.name.startswith('A_'))
-    assert not a.flags & 0x20 and a.notify == 'None', (hex(a.flags), a.notify)      # a struct member is never CPF_Net
-    assert re.search(r'warning: .*FReplHp::A\b', compile_log('StructRepl')), \
-        'UE_REPLICATED on FReplHp::A has no effect and the compiler says nothing'
-
-
-def repl_object():
-    try:
-        base = pending_asset('ReplObject')
-    except AssertionError as e:
-        assert re.search(r'\bReplObject\b', str(e)), str(e)
-        return
-    warned = [l for l in compile_log('ReplObject').splitlines() if 'warning:' in l]
-    assert any(re.search(r'\bReplObject\b', l) for l in warned), \
-        'ReplObject (a UObject) replicates A and has RPC S, with no word that neither does anything there'
-    assert not any('ReplComponentCtl' in l for l in warned), warned                 # a component does replicate
-
-
 def rpc_one_way():
     """An RPC goes one way: the sender routes by one direction (AActor::GetFunctionCallspace), the receiver accepts by
     its own flags, so Multicast with Server or Client is refused (Server with Client never parses: clang refuses
@@ -6108,8 +6086,23 @@ pending('ReplHiddenRpc: an RPC parameter struct holding a TMap is refused like a
 pending('ReplIfaceRpc: an RPC TScriptInterface parameter is refused (FInterfaceProperty sends nothing)', repl_unreplicable('ReplIfaceRpc', 'S'))
 pending('ReplIfaceNest: a replicated struct holding an array of TScriptInterface is refused (sent member by member, the interfaces as nothing)',
         repl_unreplicable('ReplIfaceNest', 'Nest'))
-pending('StructRepl: UE_REPLICATED on a UE_STRUCT member warns that it has no effect', struct_repl)
-pending('ReplObject: replication on a class that is no actor or component warns (or is refused)', repl_object)
+# A struct is sent whole, through the class variable holding it; a UObject lists no replicated variables and runs
+# every RPC locally. A component replicates, so ReplComponentCtl compiles.
+refused('StructRepl', '  UE_REPLICATED(FReplHp, Hp);\n', 'FReplHp::A: UE_REPLICATED on a struct member has no effect',
+        top='struct FReplHp {\n  UE_STRUCT;\n  UE_REPLICATED(int32, A);\n  int32 B;\n};\n')
+REPL_OBJ = '  UE_REPLICATED(int32, A);\n\npublic:\n  UE_SERVER void S() { A = 1; }\n};\n'
+refused('ReplObjectHost', '', 'ReplObject: the replicated variable A does nothing',
+        top='class ReplObject : public UObject {\n' + REPL_OBJ)
+refused('ReplObjectRpc', '', 'ReplRpcObject: the RPC S does nothing',
+        top='class ReplRpcObject : public UObject {\npublic:\n  UE_SERVER void S() {}\n};\n')
+with tempfile.TemporaryDirectory() as _tmp:
+    _src = os.path.join(_tmp, 'ReplComponentCtl.cpp')
+    with open(_src, 'w', encoding='utf-8') as _f:
+        _f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/ReplComponentCtl");\n'
+                 'class ReplComponentCtl : public UActorComponent {\n' + REPL_OBJ)
+    _proc = subprocess.run([ASSETGEN, 'compile', _src, UEAPI, _tmp], capture_output=True, encoding='utf-8')
+    assert _proc.returncode == 0, _proc.stdout + _proc.stderr
+print('ok  replication refusals: UE_REPLICATED on a struct member, replication on a UObject (a component compiles)')
 pending('RpcInline: a net / authority-only / cosmetic marker on an inline method is refused, warned, or cooks a routed call', rpc_inline)
 
 

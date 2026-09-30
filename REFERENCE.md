@@ -4074,7 +4074,7 @@ together.
 | `void OnRep_Ammo(int32 OldAmmo)` | Refused: the RepNotify "must be a method of the class taking no parameters". A Blueprint RepNotify takes none, so C++'s previous-value form has no equivalent. The same message appears when no method of that name exists. Keep the previous value in a member and compare it in the OnRep. | Refused |
 | `int32 OnRep_Ammo()` | Refused: the RepNotify "must return void". The engine calls it with no room for a result. | Refused |
 | `inline void OnRep_Ammo()` | Refused: the RepNotify "is inline, so no function of the class". An inline method is no Blueprint function, so a client would never find the OnRep. Drop `inline`. | Refused |
-| `UE_REPLICATED(int32, A);` in a `UE_STRUCT` | Ignored without a diagnostic: `A` is a plain struct member. UE has no per-member replication for a struct. Replicate the class variable that holds the struct, which replicates it as a whole. | Not yet |
+| `UE_REPLICATED(int32, A);` in a `UE_STRUCT` | Refused: "UE_REPLICATED on a struct member has no effect". UE has no per-member replication for a struct. Replicate the class variable that holds the struct, which replicates it as a whole. | Refused |
 
 ```cpp
 class Door : public AActor {
@@ -4101,7 +4101,8 @@ Notes:
   `SimulatedOnlyNoReplay`, `SimulatedOrPhysicsNoReplay`, `SkipReplay` and `Never`.
 - The OnRep is an ordinary method of the class with no parameters: in the class body without `inline`, or defined
   outside the class.
-- Only actors, and components of a replicating actor, replicate. On any other class, `bReplicates` does nothing.
+- Only actors, and components of a replicating actor, replicate. On any other class, `bReplicates` does nothing, and
+  a replicated variable or an RPC is refused ("does nothing, since only an actor or an actor component replicates").
 - `SetReplicates(true)`, called on the server, turns replication on at run time.
 
 ### Writing replicated variables
