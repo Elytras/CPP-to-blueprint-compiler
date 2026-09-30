@@ -469,7 +469,7 @@ struct FRecord
     std::vector<const Json*> AllMethods;            // every in-class method decl, overloads included, in order
     std::vector<const Json*> Fields;
     std::vector<const Json*> Ctors;                 // CXXConstructorDecls: their parameter names place a value's arguments
-    std::vector<std::string> Interfaces;            // every base after the first
+    std::vector<std::string> Interfaces;            // every base after the first; a native class's from UeNativeInterfaces
     std::string Tail;                               // genueapi's UeClassTail: "<ScriptInherit flags> <ClassWithin> <ConfigName>"
     std::map<std::string, std::string> Replicated;  // UE_REPLICATED*: variable -> "Notify:Condition"
     std::set<std::string> Components;               // UE_COMPONENT: variables that are also SCS nodes
@@ -2111,6 +2111,18 @@ bool FCompiler::Collect(std::string* Err)
             else if (Kind(C) == "VarDecl" && Name(C) == "UeClassTail")
             {
                 FindLiteral(C, R.Tail);
+            }
+            else if (Kind(C) == "VarDecl" && Name(C) == "UeNativeInterfaces")
+            {
+                /* The native interfaces a native class implements, which the dump does not list: genueapi takes them
+                   from the game's Blueprints that override one's function. */
+                std::string List;
+                if (FindLiteral(C, List))
+                    for (size_t At = 0, End; At < List.size(); At = End + 1)
+                    {
+                        End = std::min(List.find(' ', At), List.size());
+                        if (End > At) R.Interfaces.push_back(List.substr(At, End - At));
+                    }
             }
             else if (Kind(C) == "VarDecl" && Name(C) == "UeStructMeta")
             {
@@ -10415,7 +10427,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         if (!IR->IsNative() && !IR->bIsInterface)
         { *Err = R.CppName + " implements " + I + ", which is not an interface"; return false; }
         /* clang already rejects one listed twice; an ancestor's copy it only warns about. A native
-           ancestor's interfaces are not in the dump, so only the mod's classes are checked. */
+           ancestor's interfaces are not in the dump: only those UeNativeInterfaces names are checked. */
         /* Through an interface that extends it as well: this class's empty stubs would otherwise override the
            functions the ancestor implemented. */
         for (const FRecord* A = Find(R.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))

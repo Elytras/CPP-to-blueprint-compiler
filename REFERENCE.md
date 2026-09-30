@@ -3992,8 +3992,10 @@ Notes:
 - An empty stub stands in for every function left out, including those along the chain of an interface that extends
   another. Without it, a call through the interface would reach the interface's own function.
 - The native-only message names the first such function in alphabetical order.
-- The already-implemented check sees only mod ancestors. A native parent that already implements the interface is not
-  detected.
+- The already-implemented check sees mod ancestors, and native ones only for the interfaces UeApi lists on them
+  (`UeNativeInterfaces`): the dump lists no class's interfaces, so genueapi takes, with `--game`, those a game
+  Blueprint shows by overriding one's function. A method named like a function of such an interface is an override of
+  it, as `OnMessageAI` (ITriggerAI) is in an `AWoodLouse` child: its parameters must match.
 - For some of these base lists clang also prints a harmless warning, "direct base 'IAimable' is inaccessible due to
   ambiguity".
 
@@ -5845,7 +5847,8 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   `TScriptInterface<IMarkable>`. Fix: reach it on `this` in an implementing class, or through a pointer typed as that
   class, `Cast<Beacon>(Obj)->Marks`. See [Interfaces](#interfaces).
 - `<Class> implements <Interface>, which its parent <Ancestor> already implements (through <Other>)`: a class lists an
-  interface that a mod parent already implements, directly or through an interface that extends it. The
+  interface that a parent already implements (a mod one, or a native one UeApi lists it on), directly or through an
+  interface that extends it. The
   ` (through <Other>)` part appears only in the second case. Fix: drop the interface from the child and override its
   functions as ordinary methods. See [Interfaces](#interfaces).
 - `<Class> implements <Other> and <Interface>, which both extend <Common>`: two listed interfaces share a link in their

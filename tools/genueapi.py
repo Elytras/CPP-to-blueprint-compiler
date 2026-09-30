@@ -3,7 +3,7 @@
        e.g. C:/Dumper-7/<version>-FSD/SDK/SDK  BpMods/UeApi  --game D:/DRGExtract/FSD-WindowsNoEditor/FSD/Content
 
 --game reads the game's cooked Blueprints for what the dump does not carry: each game Blueprint class's tail
-(UeClassTail).
+(UeClassTail) and the native interfaces a native class implements (UeNativeInterfaces, see native_interfaces).
 
 The SDK dir must sit in its Dumper-7 dump, two levels under GObjects-Dump-WithProperties.txt (see read_real_fields);
 a copy elsewhere (DrgMods/SDK/SDK) has no object dump beside it."""
@@ -969,9 +969,11 @@ DEFAULT_TAIL = (0, OBJECT_PATH, "Engine")   # UObject's: Object.h:57-60
 
 def scan_game(content):
     """What the game's cooked Blueprints show that the dump does not: {class path: (its ScriptInherit ClassFlags,
-    ClassWithin, ClassConfigName, super path)}."""
+    ClassWithin, ClassConfigName, super path)}, and each (class path, interface path) where a function of the class
+    has a native interface's function as its super. An implementation of an interface of the class's own list has no
+    super (measured on BP_SentryGun_MoveMarker), so such a pair is an interface a native ancestor implements."""
     import invariants
-    classes = {}
+    classes, overrides = {}, set()
     for base in invariants.packages([content]):
         p = invariants.Package(base)
         for i, e in enumerate(p.exports):
@@ -981,8 +983,12 @@ def scan_game(content):
                 if st is not None and hasattr(st, "class_flags"):
                     classes[p.path(i + 1)] = (st.class_flags & SCRIPT_INHERIT, p.path(st.within) if st.within else OBJECT_PATH,
                                               st.config, p.path(e["super"]))
-    print("  game Blueprints scanned: %d classes" % len(classes))
-    return classes
+            elif kind == "Function" and e["super"] < 0:
+                sup = p.path(e["super"])
+                if sup.startswith("/Script/") and ":" in sup:
+                    overrides.add((p.path(e["outer"]), sup.split(":")[0]))
+    print("  game Blueprints scanned: %d classes, %d native-super functions" % (len(classes), len(overrides)))
+    return classes, overrides
 
 
 def class_tails(classes, by_name, game):
@@ -1021,6 +1027,35 @@ def class_tails(classes, by_name, game):
         if t != tail(by_name.get(k.base) if k.base else None):
             out[k.cpp] = "0x%08x %s %s" % t
     print("  class tails: %d classes" % len(out))
+    return out
+
+
+def native_interfaces(classes, by_name, game, overrides):
+    """{native class: [interface C++ names]}: for each game Blueprint function whose super is a native interface's
+    function, the interface goes on the Blueprint's nearest native ancestor, unless one of its ancestors has it. The
+    dump lists no class's interfaces; the Kismet compiler finds such a super through the parent's Interfaces
+    (UClass::FindFunctionByName, Class.cpp:5281-5323)."""
+    by_path = dict((k.path + "." + k.ue_name, k) for k in classes)
+    found = {}
+    for cls, iface in overrides:
+        i = by_path.get(iface)
+        if not i or i.is_bp or i.base or not i.cpp.startswith("I"):
+            continue
+        for _ in range(64):
+            if cls is None or cls.startswith("/Script/"):
+                break
+            cls = game.get(cls, (0, 0, 0, None))[3]
+        if cls in by_path:
+            found.setdefault(by_path[cls].cpp, set()).add(i.cpp)
+    out = {}
+    for cpp, ifaces in found.items():
+        up, inherited = by_name[cpp].base, set()
+        while up:
+            inherited |= found.get(up, set())
+            up = by_name[up].base if up in by_name else None
+        if ifaces - inherited:
+            out[cpp] = sorted(ifaces - inherited)
+    print("  native interfaces: %d classes" % len(out))
     return out
 
 
@@ -1118,8 +1153,9 @@ def main():
 
     by_name = dict((k.cpp, k) for k in classes)
     map_subobjects(classes, by_name)
-    game = scan_game(game_dir) if game_dir else {}
+    game, overrides = scan_game(game_dir) if game_dir else ({}, set())
     tails = class_tails(classes, by_name, game)
+    ifaces = native_interfaces(classes, by_name, game, overrides)
     ordered, seen = [], set()
 
     def place(k):
@@ -1261,6 +1297,8 @@ def main():
             body += ["    using %s = %s;" % (leaf, short[leaf]) for leaf in sorted(short)]
             if k.cpp in tails:
                 body.append('    static constexpr const char* UeClassTail = "%s";' % tails[k.cpp])
+            if k.cpp in ifaces:
+                body.append('    static constexpr const char* UeNativeInterfaces = "%s";' % " ".join(ifaces[k.cpp]))
             names = set(f for _, _, f, _ in k.funcs)
             for ftype, fname in k.fields:
                 if fname in names:

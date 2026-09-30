@@ -3964,7 +3964,7 @@ def func_qualified_call():
 def func_ancestor_iface():
     """FuncAncestorIface: OnMessageAI on an AWoodLouse child replaces /Script/FSD.TriggerAI:OnMessageAI - linked as its
     super with the interface function's inherited flags and parameters - and runs as written."""
-    base = pending_asset('FuncAncestorIface')
+    base = asset('FuncAncestorIface')
     pkg = invariants.Package(base)
     fi = pkg.find('OnMessageAI')
     me = {}
@@ -3982,12 +3982,12 @@ print('ok  FuncLocalDefaults: FText / FTransform / FHitResult / defaulted-struct
 func_cosmetic_static()
 print('ok  FuncCosmeticStatic: ApplyDamage / PlaySound2D keep their callspace routing (not EX_CallMath)')
 pending('FuncQualifiedCall: Parent::Fn() is bound to the parent\'s function, not dispatched by name', func_qualified_call)
-pending('FuncAncestorIface: an override of a native ancestor\'s interface function links it as super (TriggerAI:OnMessageAI)',
-        func_ancestor_iface)
-pending('FuncAncestorParams: an override of a native ancestor\'s interface function with other parameters is refused',
-        lambda: refused('FuncAncestorParams', '', 'OnMessageAI',
-                        top='class AncestorLouse : public AWoodLouse {\npublic:\n  int32 Seen;\n'
-                            '  void OnMessageAI(int32 TriggerName) { Seen = TriggerName; }\n};\n'))
+func_ancestor_iface()
+print('ok  FuncAncestorIface: an override of a native ancestor\'s interface function links it as super (TriggerAI:OnMessageAI)')
+refused('FuncAncestorParams', '', 'OnMessageAI',
+        top='class AncestorLouse : public AWoodLouse {\npublic:\n  int32 Seen;\n'
+            '  void OnMessageAI(int32 TriggerName) { Seen = TriggerName; }\n};\n')
+print('ok  FuncAncestorParams: an override of a native ancestor\'s interface function with other parameters is refused')
 # An override or an interface implementation keeps the parameters of the function it replaces: a caller lays them out
 # for that one (ProcessEvent, an interface's Execute_, a received RPC) and ProcessEvent copies them into this one's
 # frame (ScriptCore.cpp:1958-2016). Only a Blueprint event is replaced at all: C++ and bound calls keep a native one.
