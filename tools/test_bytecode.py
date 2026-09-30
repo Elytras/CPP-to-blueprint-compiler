@@ -6109,8 +6109,8 @@ def says(mod, what, *patterns):
 
 def latent_refusals():
     """What a function that waits cannot be, each refused with its reason: a static (no object, so no frame to keep its
-    locals in), one that returns a value or takes a reference (its caller is gone when it resumes), one that passes
-    its own FLatentActionInfo (the compiler writes the one the latent action manager resumes through), a class that
+    locals in), one that returns a value or takes a non-const reference (its caller is gone when it resumes), one that
+    passes its own FLatentActionInfo (the compiler writes the one the latent action manager resumes through), a class that
     declares its ubergraph's name (FindFunction would find that one, LatentActionManager.cpp 214-221), and a patched
     game class (whose ubergraph is the game's)."""
     umg = '#include "UeApi/UMG.h"\n'
@@ -6119,11 +6119,11 @@ def latent_refusals():
     refused('WaitStaticAwait', '  static void F() {%s UE_AWAIT(T->OnSuccess); }\n' % download,
             'no object whose ubergraph frame', top=umg)
     refused('WaitValue', '  int32 F() { UKismetSystemLibrary::Delay(1.0f); return 1; }\n',
-            'returns nothing and takes no reference')
+            'returns nothing and takes no non-const reference')
     refused('WaitRef', '  void F(int32& Out) { UKismetSystemLibrary::Delay(1.0f); Out = 1; }\n',
-            'returns nothing and takes no reference')
+            'returns nothing and takes no non-const reference')
     refused('WaitAwaitValue', '  int32 F() {%s UE_AWAIT(T->OnSuccess); return 1; }\n' % download,
-            'returns nothing and takes no reference', top=umg)
+            'returns nothing and takes no non-const reference', top=umg)
     refused('WaitInfo', '  void F() { FLatentActionInfo I; UKismetSystemLibrary::Delay(this, 1.0f, I); }\n',
             'leave the FLatentActionInfo argument out')
     refused('WaitUberName', '  void ExecuteUbergraph_WaitUberName(int32 EntryPoint) {}\n'
