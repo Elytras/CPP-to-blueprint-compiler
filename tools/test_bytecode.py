@@ -155,7 +155,6 @@ KNOWN_RULES = {     # sweep rules the suite's own packages still break, each wit
     'edl_super_serialized': "an override's /Game parent function is created, never serialized, before the override",
     'export_archetype': 'native default-subobject overrides have a null TemplateIndex',
     'import_chains': 'packages import themselves (their own package, class and functions)',
-    'instanced_refs_flagged': 'no property ever gets CPF_InstancedReference / CPF_ContainsInstancedReference',
     'latent_async_proxy_validated': 'the async proxy is bound and activated with no IsValid gate',
     'latent_proxy_frame_held': 'AsyncTest.Play keeps its montage callback proxy only in a local of a function that '
                                'does not wait',
@@ -3751,9 +3750,9 @@ def instanced_refs():
     CPF_InstancedReference; an array, map or struct member holding one is CPF_ContainsInstancedReference; the class is
     CLASS_HasInstancedReference (KismetCompilerMisc.cpp:948-952, 974-977, 1215-1218, 1254-1257;
     KismetCompiler.cpp:2521-2529). Instancing walks only flagged members (Class.cpp:2152-2163)."""
-    base = pending_asset('InstancedRefs')
+    base = asset('InstancedRefs')
     pkg, i, st = class_tail(base)
-    part = class_tail(pending_asset('InstancedRefs', 'RefPart'))[2]
+    part = class_tail(os.path.join(os.path.dirname(base), 'RefPart'))[2]
     assert part.class_flags & 0x200000, 'RefPart ClassFlags %#x lack DefaultToInstanced' % part.class_flags
     props = {p.name: p for p in st.props}
     need = [('Root', props['Root'].flags, 0x80000), ('Spare', props['Spare'].flags, 0x80000),
@@ -3765,6 +3764,8 @@ def instanced_refs():
     assert st.class_flags & 0x800000, hex(st.class_flags)
     keeps_invariants(base)
     assert run(base, 'CountPieces', self_vars={'Pieces': ['a', 'b', 'c']})[0] == 3
+    print('ok  InstancedRefs: component references are flagged instanced, their containers and HitResult contain one, '
+          'the class HasInstancedReference')
 
 
 def run_fname(chain, fn, fields, **parms):
@@ -3842,7 +3843,7 @@ for _name, (_parent, _bits, _within, _config) in TAIL_META.items():
     pending('ClassTailMeta %s: %s\'s tail (flags %#x, within %s, config %s)' % (_name, _parent.split('.')[-1], _bits,
                                                                                _within.split('.')[-1], _config), tail_meta(_name))
 pending('OverrideTest Walker: ClassConfigName Game, ACharacter\'s', walker_config)
-pending('InstancedRefs: component references flagged instanced, the class HasInstancedReference', instanced_refs)
+instanced_refs()
 for _mod, (_src, _member, _oracle, _what) in SHADOWS.items():
     refused_or_distinct(_mod, _src, _member, _oracle)
 print('ok  member names: one per FName, overloads and case twins included, none reused from an ancestor (%d cases)'

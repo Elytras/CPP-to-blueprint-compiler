@@ -1137,6 +1137,7 @@ private:
     bool GenerateAsset(const Json& Var, const std::string& OutDir, std::string* Err);
     bool TypeToProperty(const std::string& QualType, const std::string& PName, uint64 ExtraFlags,
                         const std::string& Where, FBlueprintClass& BP, FPropertyDef* Out, std::string* Err);
+    void FlagInstancing(const std::string& QualType, FPropertyDef& PD) const;
     bool LayoutOf(const std::string& QualType, int32* Size, int32* Align, std::string* Err);
     bool NeedsResultLocal(const std::string& Type, int32 Depth = 0);
     bool StructLayout(const FRecord& R, int32* Size, int32* Align, std::string* Err);
@@ -9247,6 +9248,69 @@ bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& P
     return true;
 }
 
+/*
+The instancing flags the editor's compiler gives a property of this type (CreatePropertyOnScope, KismetCompilerMisc.cpp
+948-952, 974-977, 1215-1218, 1254-1257): an object or soft object reference to a DefaultToInstanced class - every
+component and widget, native or a mod's - is CPF_InstancedReference; a struct of a STRUCT_HasInstancedReference struct,
+and an array, set or map whose element, key or value carries either flag, CPF_ContainsInstancedReference. Instancing
+walks only flagged properties (UObjectGlobals.cpp 2874-2886 -> Class.cpp 2152-2163), so an unflagged member of a spawned
+actor or a duplicate keeps pointing at its archetype's component. PD is TypeToProperty's for QualType; its element and
+value become its own copies. A mod struct is not flagged: a UserDefinedStruct is cooked with StructFlags 0.
+*/
+void FCompiler::FlagInstancing(const std::string& QualType, FPropertyDef& PD) const
+{
+    /* Native classes declared DefaultToInstanced, which CLASS_Inherit passes to every subclass (UE 4.27's UCLASS
+       specifiers), and two FSD classes every game property of which is instanced: DTI_ROOTS in invariant_rules/class_tail.py. */
+    static const std::set<std::string> DefaultToInstanced = {
+        "/Script/Engine.ActorComponent", "/Script/UMG.Visual", "/Script/UMG.SlateAccessibleWidgetData",
+        "/Script/Engine.NavAreaBase", "/Script/NavigationSystem.NavArea", "/Script/Engine.Distribution",
+        "/Script/Engine.AssetUserData", "/Script/Engine.LevelActorContainer",
+        "/Script/LevelSequence.LevelSequenceBurnInInitSettings", "/Script/LevelSequence.LevelSequenceBurnInOptions",
+        "/Script/MovieScene.MovieScene", "/Script/MovieScene.MovieSceneBindingOverrides", "/Script/MovieScene.MovieSceneFolder",
+        "/Script/MovieScene.MovieSceneSection", "/Script/MovieScene.MovieSceneTrack",
+        "/Script/FSD.CarvedResourceCreator", "/Script/FSD.ProjectileAttack" };
+    /* Native structs with STRUCT_HasInstancedReference: every game property of these types carries
+       CPF_ContainsInstancedReference, and none of another native struct type does (INSTANCED_STRUCTS, measured). */
+    static const std::set<std::string> InstancedStructs = {
+        "/Script/Engine.HitResult", "/Script/AnimGraphRuntime.AnimNode_CopyPoseFromMesh", "/Script/FSD.BossFight",
+        "/Script/FSD.ClaimableRewardEntry", "/Script/FSD.ClaimableRewardView", "/Script/FSD.DamageData",
+        "/Script/FSD.EscortMuleExtractorSlot", "/Script/FSD.HolidayMeshItems", "/Script/FSD.MasteryItem",
+        "/Script/FSD.SeasonLevel", "/Script/FSD.TextCounterEntry", "/Script/FSD.VanityNode" };
+    const std::string Type = StripTypeKeywords(QualType);
+    std::string Inner;
+    for (const char* Tpl : { "TArray", "TSet", "TMap" })
+    {
+        if (!TemplateArg(Type, Tpl, &Inner)) continue;
+        const std::vector<std::string> Args = SplitTemplateArgs(Inner);
+        std::shared_ptr<FPropertyDef>* Parts[] = { &PD.Inner, &PD.Value };
+        for (size_t I = 0; I < Args.size() && I < 2; ++I)
+        {
+            if (!*Parts[I] || IsContainerType(Args[I])) continue;      // a nested container is a wrapper struct of the mod's
+            *Parts[I] = std::make_shared<FPropertyDef>(**Parts[I]);
+            FlagInstancing(Args[I], **Parts[I]);
+            if ((*Parts[I])->PropertyFlags & (CPF_InstancedReference | CPF_ContainsInstancedReference))
+                PD.PropertyFlags |= CPF_ContainsInstancedReference;
+        }
+        return;
+    }
+    if (PD.Type == "StructProperty")
+    {
+        if (auto S = Structs.find(Type); S != Structs.end() && InstancedStructs.count(S->second.Package + "." + S->second.UeName))
+            PD.PropertyFlags |= CPF_ContainsInstancedReference;
+        return;
+    }
+    if (PD.Type != "ObjectProperty" && PD.Type != "SoftObjectProperty") return;
+    const size_t Star = Type.find('*');
+    std::string ClassName = Star == std::string::npos ? std::string() : StripTypeKeywords(Type.substr(0, Star));
+    if (TemplateArg(Type, "TSoftObjectPtr", &Inner)) ClassName = Inner;
+    for (const FRecord* A = ClassName.empty() ? nullptr : Find(ClassName); A; A = A->Base.empty() ? nullptr : Find(A->Base))
+        if (A->IsNative() && DefaultToInstanced.count(A->UePackage + "." + A->UeName))
+        {
+            PD.PropertyFlags |= CPF_InstancedReference;
+            return;
+        }
+}
+
 bool FCompiler::LayoutOf(const std::string& QualType, int32* Size, int32* Align, std::string* Err)
 {
     const std::string T = StripTypeKeywords(QualType);
@@ -10670,6 +10734,10 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         PD.PropertyFlags = (PD.PropertyFlags & ~uint64(CPF_Parm | CPF_BlueprintReadOnly))
                          | CPF_Edit | CPF_BlueprintVisible | CPF_DisableEditOnInstance;
         if (TypeOf(*F).compare(0, 6, "const ") == 0) PD.PropertyFlags |= CPF_BlueprintReadOnly;
+        /* A member that refers to a component or holds one is instanced, and then so is the class, or instancing never
+           looks at it (KismetCompiler.cpp 2521-2529). */
+        FlagInstancing(TypeOf(*F), PD);
+        if (PD.PropertyFlags & (CPF_InstancedReference | CPF_ContainsInstancedReference)) BP.AddClassFlags(CLASS_HasInstancedReference);
         PD.bApiHidden = Decl.PrivateFields.count(Name(*F)) != 0;
         if (auto Cat = Decl.Categories.find(Name(*F)); Cat != Decl.Categories.end()) BP.ApiCategory[PD.Name] = Cat->second;
         if (&Decl == &R && R.Components.count(FieldName))
