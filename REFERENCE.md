@@ -1933,7 +1933,7 @@ written inside the class does not make a method inline. Only the `inline` keywor
 | `UE_PURE static int32 Clamp01(int32 V)` | A pure static function. | Yes |
 | `virtual int32 Priority()` | `virtual` is accepted and changes nothing. Every mod method is already called by name, and the most derived version runs. | Yes |
 | `virtual int32 Step() final` | No subclass has a Step of its own: the function is cooked Final, and calls to it are direct, as in a `final` class. A subclass method named Step is refused. C++ allows `final` only on a virtual method. | Yes |
-| `virtual int32 Score() = 0;` | An empty function that returns the default: 0, false, None or empty. A subclass's Score overrides it and names it as its super. A class that declares one, or inherits one with no version of its own, is cooked Abstract, which SpawnActor and CreateWidget refuse, as they refuse a class the editor marks Generate Abstract Class. `NewObject` and `AddComponentByClass` do not check the flag in a game, so a call to Score on such an object gets the default. | Yes |
+| `virtual int32 Score() = 0;` | An empty function that returns the default: 0, false, None or empty. A subclass's Score overrides it and names it as its super. A class that declares one, or inherits one with no version of its own, is cooked Abstract, which SpawnActor and CreateWidget refuse, as they refuse a class the editor marks Generate Abstract Class. `NewObject` and `AddComponentByClass` do not check the flag in a game, so a call to Score on such an object gets the default. A `SpawnActor` or `NewObject` that names such a class warns ([Objects and widgets](#objects-and-widgets)). | Yes |
 | `public:` / `protected:` / `private:` | Become the function's Public, Protected or Private flag, which the editor honours; see [Classes and variables](#classes-and-variables). | Yes |
 | `UE_CATEGORY("Teleporter\|Setup");` | The category of the members that follow, written into the editor API stub; see [Classes and variables](#classes-and-variables). | Yes |
 | `UE_AUTHORITY_ONLY` / `UE_COSMETIC` | The editor's Authority Only and Cosmetic function flags; see [RPCs](#rpcs). | Yes |
@@ -2888,6 +2888,8 @@ Notes:
 | `NewObject<UObject>(this, Kind)` | The class picked at run time, as a `TSubclassOf<T>`. | Yes |
 | `CreateWidget<UUserWidget>(PlayerController, HudClass)` | The Create Widget node (`UWidgetBlueprintLibrary::Create`), with the calling object as world context. The owning player may be null. | Yes |
 | `NewObject<AActor>(this)`, `SpawnActor<UObject>(UObject::StaticClass(), Where)` | Refused by clang on the calling line: "no matching function", then a note naming the constraint `T` fails. `SpawnActor` and `SpawnActorDeferred` take an actor class, `AddComponentByType` and `AddComponentDeferred` a component class, `CreateWidget` a widget class, and `NewObject` any other class. | Refused |
+| `SpawnActor<AShape>(AShape::StaticClass(), Where)`, `NewObject<USpec>(this)`, where the class has a `= 0` method left | Warns: "is an abstract class". SpawnActor makes no actor of an abstract class and returns None. SpawnObject makes one in a Shipping game and asserts in a Development one; the editor's Construct Object node refuses the class. Only a class the call names is checked (`X::StaticClass()`, or `NewObject`'s default); one picked at run time is not. | Warns |
+| `NewObject<UProbe>(nullptr)` | Warns: "SpawnObject with no Outer (None) makes nothing and returns None". Pass the object that owns it, such as `this`. | Warns |
 
 ```cpp
 #include "../include/Objects.h"
@@ -5671,6 +5673,13 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   returns None); spawn in ReceiveBeginPlay`: `SpawnActor<T>` or a deferred spawn written in UserConstructionScript.
   Fix: spawn in ReceiveBeginPlay. A helper of the class the construction script calls warns instead: `warning:
   <Class>::<Helper> spawns an actor and UserConstructionScript calls it`, since it may run elsewhere too.
+- `warning: <Class>::<Function>: <Target> is an abstract class (a method of it is `= 0`), ...`: `SpawnActor<T>`,
+  `SpawnActorDeferred<T>` or `NewObject<T>` of a class with a pure virtual left, named by the call (`X::StaticClass()`
+  or `NewObject`'s default). SpawnActor makes no actor of it and returns None; SpawnObject makes one in a Shipping
+  game and asserts in a Development one. The build goes on. Fix: spawn or construct a subclass that defines every
+  `= 0` method. See [Objects and widgets](#objects-and-widgets).
+- `warning: <Class>::<Function>: SpawnObject with no Outer (None) makes nothing and returns None`: `NewObject<T>(nullptr)`.
+  The build goes on. Fix: pass the object that owns it, such as `this`. See [Objects and widgets](#objects-and-widgets).
 - `<Function>: AddComponent looks up a component template by name, and a mod class has no component templates, so it
   returns None; add one by class with AddComponentByClass`: `AddComponent(FName("X"), ...)`. Fix: use
   `AddComponentByClass`, or `AddComponentByType<T>(Owner)`. See [Components](#components).

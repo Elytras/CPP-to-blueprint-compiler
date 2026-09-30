@@ -5,10 +5,10 @@ SpawnActor refuses an abstract class with a warning and returns None (LevelActor
 function then reads as Accessed None. SpawnObject creates an abstract class quietly in a Shipping game such as DRG
 and asserts in a Development one (UObjectGlobals.cpp 2362), and with a null Outer it logs and returns None
 (GameplayStatics.cpp 606-627). The editor's nodes refuse the first two outright when the class is picked on the node
-(K2Node_GenericCreateObject.cpp 13-64). Pending: all three compile without a word; the compiler should warn (or
-refuse) at each call, naming it.
+(K2Node_GenericCreateObject.cpp 13-64). All three compile, each with a warning naming the function that makes the call:
+the class reaches the engine call through the helpers' TSubclassOf parameter, so the compiler knows it there.
 */
-#include "../../include/Objects.h"
+#include "../include/Objects.h"
 
 #include "UeApi/FSD.h"
 

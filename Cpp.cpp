@@ -557,6 +557,7 @@ struct FArgIR
     std::shared_ptr<FCallIR> Sub;   // Call: the call; StructLit: Args holds one value per reflected field, in order
     std::shared_ptr<FArgIR> Base;   // Member: the struct-valued expression; Index: the array variable (Sub->Args[0] is the index);
                                     // Field: the object, when not self; InterfaceCtx: the interface value
+    const FRecord* Class = nullptr; // ObjConst of `X::StaticClass()`: X, for what a spawn or construct is asked to make
 };
 
 enum EStrKind { SK_None, SK_Str, SK_Name, SK_Text, SK_Int, SK_Int64, SK_Float, SK_Bool, SK_Byte, SK_Object };
@@ -1395,10 +1396,14 @@ private:
     std::set<std::string> WarnedNoWorld;        // Class::Function that passed self as a world context without a world
     std::set<std::string> UcsReached;           // the class's functions UserConstructionScript runs, itself included
     std::set<std::string> WarnedUcsSpawn;
+    std::set<std::string> WarnedMakes;          // Class::Function what: a spawn or construct the engine will not make
+    std::map<std::string, const FRecord*> LocalClass;   // an inline parameter's local -> the X::StaticClass() it holds
 
     /* `X::StaticClass()`: the record X names, read back from the mod's sources (clang's JSON keeps no qualifier). */
     const FRecord* NamedQualifier(const Json& Ref) const;
     bool IsSubclassOf(const FRecord& Child, const FRecord& Parent) const;
+    /* The nearest declaration of some method along R's chain is `= 0`: the class Generate cooks CLASS_Abstract. */
+    bool IsAbstract(const FRecord& R) const;
     std::vector<uint8> NativeTail(const FRecord* Component) const;
     std::vector<const Json*> StructArgs(const Json& Value, const FRecord* R, const std::vector<std::string>& Fields) const;
     mutable std::vector<std::string> SourceTexts;                       // the mod directory's .h/.cpp, read on demand
@@ -4303,6 +4308,7 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             Out.K = FArgIR::ObjConst;
             Out.Owner = ClassImportOf(*R, BP);
             Out.InnerType = "UClass *";
+            Out.Class = R;
             return true;
         }
         if (CalleeName == "Cast")
@@ -4683,6 +4689,15 @@ bool FCompiler::IsSubclassOf(const FRecord& Child, const FRecord& Parent) const
 {
     for (const FRecord* A = &Child; A; A = A->Base.empty() ? nullptr : Find(A->Base))
         if (A == &Parent) return true;
+    return false;
+}
+
+bool FCompiler::IsAbstract(const FRecord& R) const
+{
+    std::set<std::string> Nearest;
+    for (const FRecord* A = &R; A; A = A->Base.empty() ? nullptr : Find(A->Base))
+        for (const auto& [Method, Decl] : A->Methods)
+            if (Nearest.insert(Method).second && Decl->value("pure", false)) return true;
     return false;
 }
 
@@ -5409,6 +5424,27 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
                    Cur->CppName.c_str(), CurFnName.c_str(), MethodName.c_str());
         break;
     }
+    /* What the engine will not make, when the call names the class (`X::StaticClass()`, through an inline helper's
+       parameter too): SpawnActor of an abstract class returns None (LevelActor.cpp 338-342), and SpawnObject makes one
+       only in a Shipping game, asserting in a Development one (UObjectGlobals.cpp 2362; the editor's Construct Object
+       node refuses the class, K2Node_GenericCreateObject.cpp 13-64). SpawnObject with no Outer returns None
+       (GameplayStatics.cpp 606-627). Each is a warning at the function, as the value may be read nowhere. */
+    const bool bSpawns = MethodName == "BeginDeferredActorSpawnFromClass" || MethodName == "BeginSpawningActorFromClass";
+    if ((bSpawns || MethodName == "SpawnObject") && Cur && Out.Args.size() == Parms.size())
+        for (size_t I = 0; I < Parms.size(); ++I)
+        {
+            const FArgIR& A = Out.Args[I];
+            const std::string Where = Cur->CppName + "::" + CurFnName;
+            const auto Held = A.K == FArgIR::Local ? LocalClass.find(A.S) : LocalClass.end();
+            const FRecord* Named = A.K == FArgIR::ObjConst ? A.Class : Held != LocalClass.end() ? Held->second : nullptr;
+            if (Named && IsAbstract(*Named) && WarnedMakes.insert(Where + " " + Named->CppName).second)
+                printf("  warning: %s: %s is an abstract class (a method of it is `= 0`), %s\n", Where.c_str(),
+                       Named->CppName.c_str(), bSpawns ? "and the engine spawns no actor of one: the spawn returns None"
+                       : "which SpawnObject makes only in a Shipping game (a Development one asserts): construct a subclass");
+            if (!bSpawns && Parms[I].compare(0, 5, "Outer") == 0 && A.K == FArgIR::NullObj && WarnedMakes.insert(Where + " Outer").second)
+                printf("  warning: %s: SpawnObject with no Outer (None) makes nothing and returns None: pass the object "
+                       "that owns it, such as this\n", Where.c_str());
+        }
     /* A reference parameter, const or not, is CPF_OutParm. A script callee steps its argument with no result buffer to
        take the address (ProcessScriptFunction), and a native reads it through Stack.MostRecentPropertyAddress whenever
        the argument left one (P_GET_PROPERTY_REF), which a nested call does - the address of whatever ITS arguments read
@@ -7665,6 +7701,9 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
         if (InPlace[I] && Canon(Bind.Value.InnerType) == Canon(Type) && (OnlyRead(*Body, Id) || OnlyReadValue(*Body, Id)))
         { ParmConst[Id] = Bind.Value; continue; }
         if (!AddLocal(Local, Type)) return false;
+        /* The class a spawn or construct in the body is asked to make (LowerCall), when nothing there can change it. */
+        if (Bind.Value.Class && OnlyReadValue(*Body, Id)) LocalClass[Local] = Bind.Value.Class;
+        else LocalClass.erase(Local);
         Bind.K = FStmtIR::Assign;
         Bind.Var.K = FArgIR::Local;
         Bind.Var.S = Local;

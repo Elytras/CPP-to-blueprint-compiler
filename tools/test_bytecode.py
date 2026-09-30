@@ -6327,14 +6327,13 @@ def deferred_left():
 def spawn_abstract():
     """SpawnActor of an abstract class returns None (LevelActor.cpp 333-347); SpawnObject of one makes it quietly in
     Shipping and asserts in Development (UObjectGlobals.cpp 2362); SpawnObject with no Outer returns None
-    (GameplayStatics.cpp 606-627). Each call should be warned about (or refused) at the function that makes it; the
-    abstract ones saying so (the word, not the class name, which has it too)."""
-    pending('SpawnAbstract.SpawnShape: spawning an abstract actor class warns',
-            says('SpawnAbstract', 'at SpawnShape', r'SpawnAbstract::SpawnShape\b', r'\babstract\b'))
-    pending('SpawnAbstract.MakeSpec: constructing an abstract object class warns',
-            says('SpawnAbstract', 'at MakeSpec', r'SpawnAbstract::MakeSpec\b', r'\babstract\b'))
-    pending('SpawnAbstract.MakeOuterless: constructing with no Outer warns',
-            says('SpawnAbstract', 'at MakeOuterless', r'SpawnAbstract::MakeOuterless\b', r'\bouter\b|\bNone\b'))
+    (GameplayStatics.cpp 606-627). Each call is warned about at the function that makes it; the abstract ones saying
+    so (the word, not the class name, which has it too)."""
+    log = LOGS['SpawnAbstract']
+    for fn, what in (('SpawnShape', r'\babstract\b'), ('MakeSpec', r'\babstract\b'), ('MakeOuterless', r'\bouter\b|\bNone\b')):
+        assert said(log, r'SpawnAbstract::%s\b' % fn, what), 'nothing said at %s: %s' % (fn, ' | '.join(log.strip().splitlines()))
+    print('ok  SpawnAbstract: spawning an abstract actor class, constructing an abstract object class and constructing '
+          'with no Outer each warn at the function')
 
 
 def wait_hold():
