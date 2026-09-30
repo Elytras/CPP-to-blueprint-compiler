@@ -43,20 +43,32 @@ if not ASSETGEN or not UEAPI:
 
 
 LOGS = {}      # what each test's compile printed
+WORKERS = max(1, (os.cpu_count() or 2) // 2)    # a compile or a rule run is one busy core; leave the rest to the machine
+
+
+def parallel(fn, items):
+    """fn over items on WORKERS threads, results in items' order. Each fn runs a subprocess, which frees the GIL."""
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(WORKERS) as pool:
+        return list(pool.map(fn, items))
 
 
 def build():
     """Each test compiles into build/<Test>/FSD/Content/<its package>, the layout bpbuild stages a mod in. The examples
     the docs point at compile the same way, so one the compiler stops accepting fails here rather than for a reader."""
     shutil.rmtree(ROOT, ignore_errors=True)
-    for src in sorted(glob.glob(os.path.join(TESTS, '*.cpp'))) + sorted(glob.glob(os.path.join(AG, 'examples', '*.cpp'))):
+
+    def compile_mod(src):
         mod = os.path.splitext(os.path.basename(src))[0]
         package = re.search(r'UE_MOD_PACKAGE\s*\(\s*"/Game/([^"]+)"', open(src, encoding='utf-8-sig').read()).group(1)
         out = os.path.join(ROOT, mod, 'FSD', 'Content', *package.split('/'))
         os.makedirs(out)
-        # EditTest edits AssetTest's cooked assets as if they were the game's (sorted, AssetTest compiles first).
         game = ['--game', os.path.join(ROOT, 'AssetTest', 'FSD', 'Content')] if mod == 'EditTest' else []
-        proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, out] + game, capture_output=True, encoding='utf-8')
+        return mod, subprocess.run([ASSETGEN, 'compile', src, UEAPI, out] + game, capture_output=True, encoding='utf-8')
+    srcs = sorted(glob.glob(os.path.join(TESTS, '*.cpp'))) + sorted(glob.glob(os.path.join(AG, 'examples', '*.cpp')))
+    # EditTest edits AssetTest's cooked assets as if they were the game's, so it compiles once AssetTest has.
+    edits = [s for s in srcs if os.path.basename(s) == 'EditTest.cpp']
+    for mod, proc in parallel(compile_mod, [s for s in srcs if s not in edits]) + [compile_mod(s) for s in edits]:
         assert proc.returncode == 0, '%s:\n%s%s' % (mod, proc.stdout, proc.stderr)
         LOGS[mod] = proc.stdout
     print('ok  every test and example compiles')
@@ -286,6 +298,26 @@ def export_index(base, name):
     return exports_of(base).index(name)
 
 
+def game_findings(bases):
+    """invariants.check over the game's packages, in WORKERS shards run by invariants.py --json (a process each: the
+    rules are pure Python, one core per process). Sorted, so the first ones reported do not depend on the shards."""
+    import json, tempfile
+
+    def shard(part):
+        with tempfile.NamedTemporaryFile('w', suffix='.txt', delete=False, encoding='utf-8') as f:
+            f.write('\n'.join(part))
+        try:
+            proc = subprocess.run([sys.executable, os.path.join(HERE, 'invariants.py'), '--json', '--from', f.name,
+                                   '--game', GAME], capture_output=True, encoding='utf-8')
+        finally:
+            os.remove(f.name)
+        lines = proc.stdout.splitlines()
+        # every package of the shard read, or the shard's silence would pass for a clean one
+        assert lines[-1:] == ['done %d' % len(part)], 'invariants.py stopped on a game shard:\n' + proc.stdout[-2000:] + proc.stderr[-3000:]
+        return [tuple(json.loads(l)) for l in lines[:-1]]
+    return sorted(f for part in parallel(shard, [bases[i::WORKERS] for i in range(WORKERS)]) for f in part)
+
+
 def sweep():
     """Every package built above keeps each engine invariant of invariants.py, whose rules cite the engine source that
     makes them one: every function decodes to exactly its header's sizes, every jump lands on a statement, ... With
@@ -294,7 +326,7 @@ def sweep():
     import invariants
     invariants.GAME_CONTENT[:] = [GAME] if GAME else []
     if GAME:
-        found = [(b, *f) for b in invariants.packages([GAME], 9) for f in invariants.check(invariants.Package(b))]
+        found = game_findings(invariants.packages([GAME], 9))
         assert not found, 'a rule the game breaks:\n' + '\n'.join('%s  %s %s: %s' % f for f in found[:30])
         print('ok  the %d rules of invariants.py hold on the game\'s own packages' % len(invariants.RULES))
     bases = invariants.packages([ROOT])

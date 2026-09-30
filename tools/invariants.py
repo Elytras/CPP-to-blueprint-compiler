@@ -8,7 +8,7 @@ Pointed at the game's own extracted content (D:/DRGExtract/FSD-WindowsNoEditor/F
 Epic's cooked Blueprints break is a wrong rule, not a finding. --sample N checks every Nth package there.
 
 As a module: Package(base) is one cooked package read into tables, check(pkg) -> [(rule, export, message)]."""
-import glob, os, struct, sys
+import glob, json, os, struct, sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import dumpexp
 from walkscript import W
@@ -513,22 +513,34 @@ def main():
     if '--list' in args:
         for name, fn in RULES.items(): print('%-28s %s' % (name, (fn.__doc__ or '').strip().split('\n')[0]))
         return
-    for flag in ('--sample', '--only', '--game', '--ueapi', '--sdk'):
+    # --json: every finding as a JSON [base, rule, export, message] line, then `done <packages>` - test_bytecode.py's sweep runs
+    # shards of the game's packages this way, one process per core. --from: a file of package bases, one per line.
+    as_json = '--json' in args
+    if as_json: args.remove('--json')
+    for flag in ('--sample', '--only', '--game', '--ueapi', '--sdk', '--from'):
         if flag in args:
             i = args.index(flag)
             if flag == '--sample': sample = int(args[i + 1])
             elif flag == '--only': only = set(args[i + 1].split(','))
             elif flag == '--game': GAME_CONTENT.append(args[i + 1])
+            elif flag == '--from': args += open(args[i + 1], encoding='utf-8').read().splitlines()
             del args[i:i + 2]
     bad, n, hits = 0, 0, {}
     for base in packages(args, sample):
         try: pkg = Package(base)
         except Exception as e:
-            print('UNREADABLE %s: %s' % (base, e)); bad += 1; continue
+            if as_json: print(json.dumps([base, 'unreadable', '-', str(e)]))
+            else: print('UNREADABLE %s: %s' % (base, e))
+            bad += 1
+            continue
         n += 1
         for rule_name, export, msg in check(pkg, only):
             hits[rule_name] = hits.get(rule_name, 0) + 1
-            if hits[rule_name] <= 20: print('%s  %s  %s: %s' % (rule_name, base, export, msg))
+            if as_json: print(json.dumps([base, rule_name, export, msg]))
+            elif hits[rule_name] <= 20: print('%s  %s  %s: %s' % (rule_name, base, export, msg))
+    if as_json:
+        print('done %d' % (n + bad))
+        return
     print('%d packages, %d unreadable; findings by rule: %s' % (n, bad, hits or 'none'))
     sys.exit(1 if bad or hits else 0)
 
