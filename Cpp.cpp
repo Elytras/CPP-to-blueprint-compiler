@@ -586,8 +586,25 @@ struct FStructInfo
     std::string Package, UeName;
     int32 Size = 0, Align = 1;
     bool bComplete = false;                                     // every reflected field is known, so a literal can be built
-    std::vector<std::pair<std::string, std::string>> Fields;    // (type, name) in property order
+    std::vector<std::pair<std::string, std::string>> Fields;    // (type, name) in C++ order, the super's members first
+    /* Types.json's "link", where it is not Fields: the members EX_StructConst writes, in PropertyLink order - the
+       struct's own, then its super's - and no Transient one (ScriptCore.cpp 3376-3405, Class.cpp 944-982). A UeApi
+       older than it has none, and a literal then takes Fields as they are. */
+    std::optional<std::vector<std::string>> Link;
 };
+
+bool IsVmConstant(const FArgIR& A);
+
+/* Each index into SI.Fields EX_StructConst writes, in the order it writes them. */
+std::vector<size_t> StructConstOrder(const FStructInfo& SI)
+{
+    std::vector<size_t> Out;
+    if (!SI.Link) { for (size_t I = 0; I < SI.Fields.size(); ++I) Out.push_back(I); return Out; }
+    for (const std::string& N : *SI.Link)
+        for (size_t I = 0; I < SI.Fields.size(); ++I)
+            if (SI.Fields[I].second == N) { Out.push_back(I); break; }
+    return Out;
+}
 
 std::vector<Json> ExtraArgs(const Json& Row)
 {
@@ -2754,17 +2771,19 @@ bool FCompiler::ZeroArg(const std::string& Type, FBlueprintClass& BP, FArgIR& Ou
     Out.I = SI->second.Size;
     Out.InnerType = T;
     Out.Sub = std::make_shared<FCallIR>();
-    for (const auto& F : SI->second.Fields)
+    for (size_t I : StructConstOrder(SI->second))
     {
         FArgIR M;
-        if (!ZeroArg(F.first, BP, M, Err)) return false;
+        if (!ZeroArg(SI->second.Fields[I].first, BP, M, Err)) return false;
         Out.Sub->Args.push_back(M);
     }
     return true;
 }
 
 /* `FVector(1, 2, 3)`: EX_StructConst wants one value per reflected field, in property order, so
-   only a struct whose every field is known can be written; argless means all zeros. */
+   only a struct whose every field is known can be written; argless means all zeros. The arguments come in C++'s order
+   (a super's members first) and go out in PropertyLink's (StructConstOrder); one for a Transient member has nowhere to
+   go, execStructConst skipping that member, so a constant there is dropped with a warning and anything else refused. */
 bool FCompiler::LowerStructLiteral(const Json& CtorNode, const FStructInfo& SI, FBlueprintClass& BP,
                                    FArgIR& Out, std::string* Err)
 {
@@ -2784,12 +2803,21 @@ bool FCompiler::LowerStructLiteral(const Json& CtorNode, const FStructInfo& SI, 
     Out.I = SI.Size;
     Out.InnerType = T;
     Out.Sub = std::make_shared<FCallIR>();
-    for (const Json* A : Args)
+    std::vector<FArgIR> Given(Args.size());
+    for (size_t I = 0; I < Args.size(); ++I)
+        if (!LowerArg(*Args[I], BP, Given[I], Err)) return false;
+    const std::vector<size_t> Order = StructConstOrder(SI);
+    for (size_t I = 0; I < Given.size(); ++I)
     {
-        FArgIR M;
-        if (!LowerArg(*A, BP, M, Err)) return false;
-        Out.Sub->Args.push_back(M);
+        if (std::find(Order.begin(), Order.end(), I) != Order.end()) continue;
+        const std::string& Member = SI.Fields[I].second;
+        if (!IsVmConstant(Given[I]))
+        { *Err = T + "::" + Member + " is Transient, which a struct literal cannot set: give it a constant, or set the member "
+                 "after"; return false; }
+        printf("  warning: %s::%s: %s::%s is Transient, which a struct literal does not set (execStructConst skips it): "
+               "the value given for it is dropped\n", Cur ? Cur->CppName.c_str() : "", CurFnName.c_str(), T.c_str(), Member.c_str());
     }
+    for (size_t I : Order) Out.Sub->Args.push_back(Given[I]);
     return true;
 }
 
@@ -11423,6 +11451,7 @@ bool FCompiler::LoadTables(const std::string& IncludeDir, std::string* Err)
         S.Align = It->value("align", 1);
         S.bComplete = It->value("complete", false);
         for (const Json& F : (*It)["fields"]) S.Fields.emplace_back(F[0].get<std::string>(), F[1].get<std::string>());
+        if (It->contains("link")) S.Link = (*It)["link"].get<std::vector<std::string>>();
         Structs[It.key()] = S;
     }
     return true;

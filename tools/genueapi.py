@@ -148,8 +148,9 @@ def map_type(raw):
 class Struct(object):
     def __init__(self, cpp, base, path, ue_name, size):
         self.cpp, self.base, self.path, self.ue_name, self.size = cpp, base, path, ue_name, size
-        self.raw_fields = []     # (raw type, name) in offset order, own fields only
+        self.raw_fields = []     # (raw type, name, CPF_Transient) in offset order, own fields only
         self.fields = []         # (mapped type, name), base first, filled by resolve_structs
+        self.link = []           # the names EX_StructConst writes, in PropertyLink order: see resolve_structs
         self.complete = False    # every reflected field is emitted, so a constructor over all of them exists
         self.pkg = path[len("/Script/"):]
 
@@ -167,6 +168,7 @@ STRUCT_COMMENT = re.compile(r"^// ScriptStruct (\S+)\.(\w+)\s*$")
 STRUCT_SIZE = re.compile(r"^// 0x([0-9A-Fa-f]+) \(0x([0-9A-Fa-f]+) - 0x([0-9A-Fa-f]+)\)")
 # Dumper-7 writes alignas(N) when the struct's MinAlignment is more than its members give (FQuat, FPlane).
 STRUCT_DECL = re.compile(r"^struct (?:alignas\((0x[0-9A-Fa-f]+)\)\s+)?(\w+)(?:\s+final)?(?:\s*:\s*public\s+(\w+))?\s*$")
+TRANSIENT = re.compile(r"[(,]\s*Transient\s*[,)]")     # CPF_Transient, not DuplicateTransient / TextExportTransient
 
 
 def parse_structs(path, pkg):
@@ -212,11 +214,16 @@ def parse_structs(path, pkg):
         elif cur_struct is not None and "//" in line:
             m = FIELD.match(line)
             if m and not m.group(2).startswith(("Pad_", "BitPad_")):
-                cur_struct.raw_fields.append(("bool" if m.group(3) else m.group(1), m.group(2)))
+                # The flag comment, `(Edit, Transient, ...)`, or a bitfield's `(BitIndex: .., PropSize: .. (flags))`.
+                transient = bool(TRANSIENT.search(line[line.index("//"):]))
+                cur_struct.raw_fields.append(("bool" if m.group(3) else m.group(1), m.group(2), transient))
 
 
 def resolve_structs():
-    """Second pass: map field types now that every struct and enum name is known."""
+    """Second pass: map field types now that every struct and enum name is known. `fields` are C++'s order, the super's
+    members first, which the stub's constructor takes; `link` is what EX_StructConst writes: UStruct::Link fills
+    PropertyLink from TFieldIterator(this), the struct's own properties and then each super's (Class.cpp 944-982), and
+    execStructConst skips a Transient one (ScriptCore.cpp 3376-3405)."""
     done = set()
 
     def resolve(st):
@@ -226,14 +233,17 @@ def resolve_structs():
         base = STRUCTS.get(st.base)
         if base:
             resolve(base)
-        own, complete = [], base.complete if base else True
-        for raw, name in st.raw_fields:
+        own, link, complete = [], [], base.complete if base else True
+        for raw, name, transient in st.raw_fields:
             mapped = map_type(raw)
             if mapped in KINDS or mapped == "void" or any(s in mapped for s in NO_STRUCT_LITERAL):
                 complete = False
                 continue
             own.append((mapped, name))
+            if not transient:
+                link.append(name)
         st.fields = (base.fields if base else []) + own
+        st.link = link + (base.link if base else [])
         st.complete = complete and bool(st.fields)
 
     for st in list(STRUCTS.values()):
@@ -257,7 +267,7 @@ def struct_align(st):
     align = getattr(st, "explicit_align", 1)
     if st.base in STRUCTS:
         align = max(align, struct_align(STRUCTS[st.base]))
-    for raw, _ in st.raw_fields:
+    for raw, _, _ in st.raw_fields:
         t = re.sub(r"^(const|struct|class|enum)\s+", "", raw.strip())
         if t.endswith("*") or t.endswith("&"):
             a = 8
@@ -383,9 +393,13 @@ def write_types(out_dir):
     sts = sorted(STRUCTS.values(), key=lambda t: t.cpp)
     for i, st in enumerate(sts):
         fields = ", ".join('["%s", "%s"]' % (t, n) for t, n in st.fields)
-        rows.append('    "%s": {"package": "%s", "name": "%s", "size": %d, "align": %d, "complete": %s, "fields": [%s]}%s'
+        # A literal's member order where it is not `fields`': a struct with a super and members of its own, or one with
+        # a Transient member. Only a complete struct takes a literal at all.
+        link = ', "link": [%s]' % ", ".join('"%s"' % n for n in st.link) \
+            if st.complete and st.link != [n for _, n in st.fields] else ""
+        rows.append('    "%s": {"package": "%s", "name": "%s", "size": %d, "align": %d, "complete": %s, "fields": [%s]%s}%s'
                     % (st.cpp, st.path, st.ue_name, st.size, struct_align(st), "true" if st.complete else "false",
-                       fields, "," if i + 1 < len(sts) else ""))
+                       fields, link, "," if i + 1 < len(sts) else ""))
     rows += ['  }', '}']
     io.open(os.path.join(out_dir, "Types.json"), "w", encoding="utf-8", newline="\n").write("\n".join(rows) + "\n")
     print("  types: %d enums, %d structs (%d complete)"

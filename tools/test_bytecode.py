@@ -4483,7 +4483,7 @@ def derived_literal(fn, struct):
     """A native struct literal's members follow PropertyLink - the struct's own first, then its super's - and leave out
     Transient ones (ScriptCore.cpp 3376-3405; Class.cpp 944-982)."""
     vmsem_dump_has(struct)
-    vmsem_holds(pending_asset('DerivedLiteral'), 'struct_const_members', fn=fn)
+    vmsem_holds(asset('DerivedLiteral'), 'struct_const_members', fn=fn)
 
 
 ctx_null_call()
@@ -4497,12 +4497,12 @@ local_ctor_flags()
 print('ok  LocalCtorFlags: FUNC_HasDefaults on a function with an FHitResult / FTransform / FText / TMap local')
 iface_cast_slot()
 print('ok  IfaceCastSlot: Cast<IHealth> takes the object out of its 16-byte interface value')
-pending('DerivedLiteral: a derived struct literal lists its own members before its super\'s',
-        lambda: derived_literal('Angle', '/Script/Engine.LightmassDirectionalLightSettings'))
-pending('DerivedLiteral: a struct literal leaves out Transient members',
-        lambda: derived_literal('Output', '/Script/Engine.MaterialAttributesInput'))
-pending('DerivedLiteral: FTimerHandle() writes no member (Handle is Transient)',
-        lambda: derived_literal('ResetHandle', '/Script/Engine.TimerHandle'))
+derived_literal('Angle', '/Script/Engine.LightmassDirectionalLightSettings')
+derived_literal('Output', '/Script/Engine.MaterialAttributesInput')
+assert 'FMaterialAttributesInput::PropertyConnectedBitmask is Transient' in LOGS['DerivedLiteral'], LOGS['DerivedLiteral']
+derived_literal('ResetHandle', '/Script/Engine.TimerHandle')
+print("ok  DerivedLiteral: a derived struct literal lists its own members before its super's, and leaves out Transient "
+      "ones (a value given for one is warned about); FTimerHandle() writes no member")
 
 
 # ---- UBER: ubergraphs along a class chain, their frames and names, latent resumes, awaits in overrides
