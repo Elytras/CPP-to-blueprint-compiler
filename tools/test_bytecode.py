@@ -154,7 +154,6 @@ KNOWN_RULES = {     # sweep rules the suite's own packages still break, each wit
     'edl_property_types': 'UDS/UDE property types are never serialized before what they type',
     'edl_super_serialized': "an override's /Game parent function is created, never serialized, before the override",
     'export_archetype': 'native default-subobject overrides have a null TemplateIndex',
-    'import_chains': 'packages import themselves (their own package, class and functions)',
     'instanced_refs_flagged': 'no property ever gets CPF_InstancedReference / CPF_ContainsInstancedReference',
     'latent_async_proxy_validated': 'the async proxy is bound and activated with no IsValid gate',
     'latent_proxy_frame_held': 'AsyncTest.Play keeps its montage callback proxy only in a local of a function that '
@@ -3421,7 +3420,7 @@ def subobject_chain():
 def self_ref_import():
     """SelfRefImport: a member of the mod's own class and a call to its own function on another instance reference
     this package's exports, never an import of the package itself."""
-    b = pending_asset('SelfRefImport')
+    b = asset('SelfRefImport')
     own = '/game/_elytrasmods/selfrefimport/selfrefimport'
     selfs = [p for p in import_paths(b) if p.lower() == own or p.lower().startswith(own + '.')]
     assert not selfs, 'imports of itself: %s' % selfs
@@ -3429,6 +3428,7 @@ def self_ref_import():
     peer = next(p for p in pkg.struct(pkg.find('SelfRefImport_C')).props if p.name == 'Peer')
     assert peer.ref > 0 and pkg.exports[peer.ref - 1]['name'] == 'SelfRefImport_C', pkg.path(peer.ref)
     keeps_invariants(b)
+    print('ok  SelfRefImport: its own class and function are named as its exports, never through an import of itself')
 
 
 ABSTRACT_CLASS = 'class UPureDef : public UPrimaryDataAsset {\npublic:\n  virtual int32 Pure() = 0;\n};\n'
@@ -3608,7 +3608,7 @@ name_suffix()
 pending("OverrideTest Walker: a default-subobject override names its parent CDO's subobject as its archetype", subobject_template)
 pending("SubobjectChain: an override's archetype is the same-named subobject of the parent CDO, a /Game one serialized before create",
         subobject_chain)
-pending('SelfRefImport: a package refers to its own objects as exports, never through an import of itself', self_ref_import)
+self_ref_import()
 abstract_instances()
 pending('AbstractComp: a component of an abstract mod class is refused, naming it abstract',
         lambda: refused('AbstractComp', '  UE_COMPONENT(UPureComp, Comp);\n', 'abstract', top=ABSTRACT_COMP))

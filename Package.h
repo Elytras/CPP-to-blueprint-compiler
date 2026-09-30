@@ -149,6 +149,12 @@ private:
     uint32 PackageSource = 0;
     bool bUncooked = false;
     std::vector<FRegistryObject> RegistryObjects;
+
+    /* While Save runs: each import row's FPackageIndex as written (FoldOwnImports). Empty otherwise. */
+    mutable std::vector<int32> ImportFold;
+    void FoldOwnImports() const;
+    /* The FPackageIndex V is written as: through RemapIndex, then onto the import rows Save keeps. */
+    FIndex Written(FIndex V) const;
 };
 
 /* ASCII lowercase: FName and package-name comparisons are case-insensitive. */
