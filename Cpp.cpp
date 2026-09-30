@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <iterator>
 #include <set>
 #include <map>
 #include <filesystem>
@@ -15,13 +16,6 @@
 #include <optional>
 #include <string>
 #include <vector>
-#ifdef _WIN32
-#include <process.h>
-static int ProcessId() { return _getpid(); }
-#else
-#include <unistd.h>
-static int ProcessId() { return getpid(); }
-#endif
 
 #include <nlohmann/json.hpp>
 
@@ -11378,16 +11372,51 @@ private:
     }
 };
 
-/* Parses clang's AST dump at Path. */
-bool ParseAst(const std::string& Path, Json* Out, std::string* Err)
+/* Runs clang (Cmd writes the AST dump to stdout) and parses the dump as it streams in through a pipe. The dump is
+   hundreds of MB: written to a file and read back, it was most of a compile's disk traffic, and several compiles at
+   once (the test suites of parallel sessions) held the disk at its limit with the CPU mostly idle. */
+bool ParseClangAst(const std::string& Cmd, const std::string& SourcePath, Json* Out, std::string* Err)
 {
-    std::vector<char> Buf(1 << 20);
-    std::ifstream In;
-    In.rdbuf()->pubsetbuf(Buf.data(), Buf.size());
-    In.open(Path, std::ios::binary);
-    if (!In || In.peek() == std::ifstream::traits_type::eof()) { *Err = "clang produced no AST at " + Path; return false; }
+    struct FPipe
+    {
+        FILE* F;
+        std::vector<char> Buf = std::vector<char>(1 << 20);
+        size_t Pos = 0, End = 0;
+        bool Fill() { Pos = 0; End = fread(Buf.data(), 1, Buf.size(), F); return End != 0; }
+    };
+    /* One char at a time for nlohmann's iterator input; a null pipe is the end. */
+    struct FPipeIt
+    {
+        using iterator_category = std::input_iterator_tag;
+        using value_type = char;
+        using difference_type = std::ptrdiff_t;
+        using pointer = const char*;
+        using reference = const char&;
+        FPipe* P = nullptr;
+        reference operator*() const { return P->Buf[P->Pos]; }
+        FPipeIt& operator++() { if (++P->Pos == P->End && !P->Fill()) P = nullptr; return *this; }
+        bool operator==(const FPipeIt& O) const { return P == O.P; }
+        bool operator!=(const FPipeIt& O) const { return P != O.P; }
+    };
+#ifdef _WIN32
+    /* cmd /c strips the first and last quote of a line that starts with one, so wrap it in a spare pair. */
+    FPipe Pipe{ _popen(("\"" + Cmd + "\"").c_str(), "rb") };
+#else
+    FPipe Pipe{ popen(Cmd.c_str(), "r") };
+#endif
+    if (!Pipe.F) { *Err = "could not run clang"; return false; }
+    const bool bAny = Pipe.Fill();
     FAstSax Sax(*Out);
-    if (!Json::sax_parse(In, &Sax)) { *Err = "could not parse clang's AST dump"; return false; }
+    const bool bParsed = bAny && Json::sax_parse(FPipeIt{ &Pipe }, FPipeIt{}, &Sax);
+    while (Pipe.Fill()) {}      // a parse that stopped early: clang waits on a full pipe, and closing it waits on clang
+#ifdef _WIN32
+    const int Status = _pclose(Pipe.F);
+#else
+    const int Status = pclose(Pipe.F);
+#endif
+    if (Status != 0) { *Err = "clang rejected " + SourcePath + " (diagnostics above)"; return false; }
+    if (!bAny) { *Err = "clang produced no AST for " + SourcePath; return false; }
+    if (!bParsed) { *Err = "could not parse clang's AST dump"; return false; }
     return true;
 }
 
@@ -11432,16 +11461,9 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
                     const std::string& OutDir, const std::optional<std::string>& InApiDir, std::string* Err)
 {
     ApiDir = InApiDir;
-    /* In %TEMP%, not OutDir: bpbuild paks OutDir's whole tree. Named per process: bpbuild and the tests compile the
-       same sources, and at once they overwrote each other's. Removed however Run returns: a dump is hundreds of MB,
-       no later run overwrites it, and every refusal the tests expect is a failed compile. */
     std::error_code TmpEc;
     /* Absolute: a bare "Mod.cpp" has an empty parent, and NamedQualifier cannot list "". */
     SourceDir = std::filesystem::absolute(SourcePath, TmpEc).parent_path().string();
-    const std::string AstPath = (std::filesystem::temp_directory_path(TmpEc)
-                                 / (std::filesystem::path(SourcePath).stem().string() + "." + std::to_string(ProcessId())
-                                    + ".assetgen-ast.json")).string();
-    struct FRemoveAst { const std::string& Path; ~FRemoveAst() { remove(Path.c_str()); } } RemoveAst{ AstPath };
     /* Both the UeApi dir and its parent are include paths, so "FSD.h" and "UeApi/FSD.h" both resolve. Absolute
        first: a relative "UeApi" has an empty parent, and -I"" swallows the next argument. */
     const std::string Parent = std::filesystem::absolute(IncludeDir, TmpEc).parent_path().string();
@@ -11468,18 +11490,8 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
            "}\n";
     Cmd += " --target=x86_64-pc-windows-msvc -isystem \"" + ShimDir.string() + "\"";
 #endif
-    Cmd += " \"" + SourcePath + "\" -I\"" + IncludeDir + "\" -I\"" + Parent + "\" > \"" + AstPath + "\"";
-#ifdef _WIN32
-    /* cmd /c strips the first and last quote of a line that starts with one, so wrap it in a spare pair. */
-    if (system(("\"" + Cmd + "\"").c_str()) != 0)
-#else
-    if (system(Cmd.c_str()) != 0)
-#endif
-    {
-        *Err = "clang rejected " + SourcePath + " (diagnostics above)";
-        return false;
-    }
-    if (!ParseAst(AstPath, &Doc, Err)) return false;
+    Cmd += " \"" + SourcePath + "\" -I\"" + IncludeDir + "\" -I\"" + Parent + "\"";
+    if (!ParseClangAst(Cmd, SourcePath, &Doc, Err)) return false;
 
     if (!LoadTables(IncludeDir, Err)) return false;
     if (!Collect(Err)) return false;
@@ -11635,7 +11647,6 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     if (RegistryRows.empty())
     {
         printf("  %-14s -> none (no assets of its own)\n", "registry");
-        remove(AstPath.c_str());
         return true;
     }
     std::string RegistryDir = OutDir;
