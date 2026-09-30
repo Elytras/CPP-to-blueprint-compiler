@@ -3605,6 +3605,11 @@ Notes:
 - Add never calls `Activate()`. For a UBlueprintAsyncActionBase such as UAsyncTaskDownloadImage, call `Activate()`
   yourself after binding, as the editor's node does. Once the binding method returns, nothing in your code refers to a
   proxy kept only in a local, so keep it in a member variable as above.
+- The montage proxy and the widget animation proxy (`CreateProxyObjectForPlayMontage`,
+  `CreatePlayAnimationProxyObject`, `CreatePlayAnimationTimeRangeProxyObject`) are kept alive by nothing but the
+  variable that holds them. Put in a local of a method that does not wait, the compiler also stores it into a hidden
+  transient member of the class, `<Method>_<Local>`, so it outlives the call as the editor's event graph keeps it;
+  a later call of the method replaces it there.
 - To continue a function when a dispatcher next fires, instead of binding a handler, use `UE_AWAIT`: see
   [Waiting on events](#waiting-on-events). [examples/AwaitEvents.cpp](examples/AwaitEvents.cpp) uses UE_AWAIT and
   contrasts it with the callback style in a comment.

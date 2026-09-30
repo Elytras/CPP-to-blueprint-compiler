@@ -638,6 +638,7 @@ struct FCallIR
     bool bLocal = false;                // EX_LocalVirtualFunction / EX_LocalFinalFunction: a script function that is no RPC
     std::string View;                   // __RefAtInline__: the TArray field of the view struct in Extra
     std::shared_ptr<int32> Resume;      // __AwaitPoint__: receives the ubergraph offset the awaited event re-enters at
+    bool bFrameHeld = false;            // a factory whose proxy only a persistent frame keeps alive: see HeldProxies
     std::shared_ptr<FArgIR> Target;     // the object an instance call runs against; null = self
     std::vector<FArgIR> Args;
 };
@@ -5271,6 +5272,12 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         Out.Fn = BP.EngineFunction(CalleePackage, CalleeName, UeNameOf(Called, MethodName));
         Out.bScript = CalleePackage.compare(0, 6, "/Game/") == 0;
         Out.bInstance = !bStatic;
+        /* Each makes its proxy with NewObject, flags it RF_StrongRefOnFrame and roots it nowhere else
+           (PlayMontageCallbackProxy.cpp 15-23, the anim instance's delegates reaching it weakly, 56-63;
+           Animation/WidgetAnimationPlayCallbackProxy.cpp 10-24): only the frame that holds it keeps it alive. */
+        static const std::set<std::string> FrameHeld = {
+            "CreateProxyObjectForPlayMontage", "CreatePlayAnimationProxyObject", "CreatePlayAnimationTimeRangeProxyObject" };
+        Out.bFrameHeld = bStatic && Called->IsNative() && FrameHeld.count(MethodName) != 0;
         /* A Blueprint static needs the CDO context; EX_CallMath finds it itself for a native, but never asks the
            callspace an authority-only or cosmetic one has (KismetCompilerVMBackend.cpp 1222-1231): that one is called
            through CallFunction on the CDO, as the editor calls it. */
@@ -11335,6 +11342,12 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     };
     std::vector<FSegment> Segments;
     GeneratedEvents.clear();
+    /* The transient members that keep a frame-held callback proxy alive past a function that does not wait (below),
+       named past the mod's own properties along the class chain. */
+    std::vector<FPropertyDef> HeldProxies;
+    std::set<std::string> TakenMembers;
+    for (const FRecord* A = &R; A; A = A->Base.empty() ? nullptr : Find(A->Base))
+        for (const Json* F : A->Fields) TakenMembers.insert(Name(*F));
 
     for (const FMethod& Fn : Methods)
     {
@@ -11455,6 +11468,39 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             *Err = R.CppName + "::" + Fn.Name + ": " + *Err;
             return false;
         }
+        /* The editor places a frame-held proxy's node (bFrameHeld) in the event graph, whose persistent frame the GC
+           reads through the class (BlueprintGeneratedClass.cpp 1683-1713) and where a reference to an
+           RF_StrongRefOnFrame object is strong (UObjectGlobals.cpp 3460-3483). A local of a function that does not
+           wait dies with the call, after which a collection takes the proxy and its dispatchers never fire; so it is
+           stored into a transient member too, one per local, as the editor's frame keeps one per node. A waiting
+           function's locals are the frame's already. */
+        if (!bMadeLatentCall && !R.bIsPatch)
+            ForEachStmt(Stmts, [&](std::vector<FStmtIR>& List, size_t I) {
+                const FStmtIR& St = List[I];
+                if ((St.K != FStmtIR::Decl && St.K != FStmtIR::Assign) || St.Var.K != FArgIR::Local
+                    || St.Value.K != FArgIR::Call || !St.Value.Sub || !St.Value.Sub->bFrameHeld) return;
+                const auto Local = std::find_if(Locals.begin(), Locals.end(), [&](const FPropertyDef& L) { return L.Name == St.Var.S; });
+                if (Local == Locals.end()) return;
+                std::string To = Fn.Name + "_" + St.Var.S;
+                for (int32 N = 2; TakenMembers.count(To); ++N) To = Fn.Name + "_" + St.Var.S + "_" + std::to_string(N);
+                TakenMembers.insert(To);
+                FPropertyDef Held = *Local;
+                Held.Name = To;
+                Held.PropertyFlags = (Held.PropertyFlags & ~uint64(CPF_Parm | CPF_OutParm | CPF_BlueprintVisible | CPF_BlueprintReadOnly))
+                                   | CPF_Transient | CPF_DuplicateTransient;
+                Held.bApiHidden = true;
+                HeldProxies.push_back(Held);
+                FStmtIR Keep;
+                Keep.K = FStmtIR::Assign;
+                Keep.Var.K = FArgIR::Field;
+                Keep.Var.S = To;
+                Keep.Var.Owner = BP.ClassIndex();
+                Keep.Var.LetOp = St.Var.LetOp;
+                Keep.Value.K = FArgIR::Local;
+                Keep.Value.S = St.Var.S;
+                Keep.Value.LetOp = St.Var.LetOp;
+                List.insert(List.begin() + I + 1, std::move(Keep));
+            });
         if (!bCurNoOpt)
         {
             PruneConstBranches(Stmts);
@@ -11614,6 +11660,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         }, Flags);
     }
 
+    for (const FPropertyDef& Held : HeldProxies) BP.AddVariable(Held);
     if (!Segments.empty() && R.bIsPatch)
     {
         *Err = R.CppName + " (UE_PATCH)::" + Segments.front().Name + ": a patched function that waits (a latent call) needs "

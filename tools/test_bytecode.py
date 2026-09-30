@@ -156,8 +156,6 @@ KNOWN_RULES = {     # sweep rules the suite's own packages still break, each wit
     'export_archetype': 'native default-subobject overrides have a null TemplateIndex',
     'import_chains': 'packages import themselves (their own package, class and functions)',
     'instanced_refs_flagged': 'no property ever gets CPF_InstancedReference / CPF_ContainsInstancedReference',
-    'latent_proxy_frame_held': 'AsyncTest.Play keeps its montage callback proxy only in a local of a function that '
-                               'does not wait',
     'native_out_arrays_emptied': "a native's out TArray is not emptied before the call, so Set_ToArray appends",
     'typing_callmath_callee': 'container-library CustomThunks (Array_* / Set_* / Map_*) are emitted as EX_CallMath, '
                               'not inside an EX_Context on the library default object',
@@ -6283,41 +6281,45 @@ def proxy_frame_held():
     RF_StrongRefOnFrame and roots it nowhere else, PlayMontageCallbackProxy.cpp 15-23; the anim instance's delegates
     reach it weakly, 56-63) must be stored where the garbage collector sees it: a member, or a local of the ubergraph,
     whose frame the class reports (BlueprintGeneratedClass.cpp 1683-1713). ProxyLocalHeld.Play binds its proxy in a
-    plain function and keeps it in that function's local: after Play returns nothing references it, a GC collects it,
-    and Done never runs. A 'warning:' at ProxyLocalHeld::Play about its proxy is the other way to close this. (The
-    suite's AsyncTest.Play is the same case; latent_proxy_frame_held finds it there.)"""
+    plain function, whose local dies with the call: the compiler stores it into a transient member too, so after Play
+    returns the object still references it and a GC leaves it for Done. (The suite's AsyncTest.Play is the same case;
+    latent_proxy_frame_held checks it there.)"""
     import invariants
+    base = asset('ProxyLocalHeld')
+    pkg = invariants.Package(base)
+    local = lambda n: n.op == 0x00 and ('.'.join(n.ops[0][1]), n.ops[0][2])
 
-    def check():
-        base = pending_asset('ProxyLocalHeld')
-        if said(latent_compile_log(os.path.join(PENDING, 'ProxyLocalHeld.cpp'))[1], r'ProxyLocalHeld::Play\b', r'\bproxy\b'):
-            return
-        pkg = invariants.Package(base)
-        local = lambda n: n.op == 0x00 and ('.'.join(n.ops[0][1]), n.ops[0][2])
-
-        def holder(i, dest):
-            """Where a Let's destination keeps the proxy: a member, the ubergraph's frame, or a plain local - unless
-            that local is copied on into a member or the frame in the same function."""
-            if dest.op == 0x01: return 'a member'
-            if dest.op != 0x00: return 'op %02x' % dest.op
-            owner = dest.ops[0][2]
-            st = pkg.struct(owner - 1) if owner > 0 else None
-            if st and st.function_flags & 0x8000: return 'the frame'
-            for n in invariants.statements(pkg, i)[0]:
-                if (n.op in (0x0F, 0x5F) and n.kids[0].op == 0x01 and local(n.kids[1]) == local(dest)) or \
-                        (n.op == 0x64 and local(n.kids[0]) == local(dest)):
-                    return 'a member' if n.op != 0x64 else 'the frame'
-            return 'a local of ' + pkg.path(owner)
-        factory = lambda n: n.op in (0x1B, 0x1C, 0x45, 0x46, 0x68) and n.ops[0][0] == 'obj' \
-            and (pkg.path(n.ops[0][1]) or '').endswith(':CreateProxyObjectForPlayMontage')
-        held = []
-        for i, st in invariants.functions(pkg):
-            for n in invariants.statements(pkg, i)[0]:
-                if n.op in (0x0F, 0x5F) and factory(n.kids[1]): held.append(holder(i, n.kids[0]))
-                elif n.op == 0x64 and factory(n.kids[0]): held.append('the frame')
-        assert len(held) == 1, held
-        assert held[0] in ('a member', 'the frame'), 'the montage proxy is kept in %s' % held[0]
-    pending('ProxyLocalHeld.Play: a callback proxy bound in a plain function is kept where the GC sees it', check)
+    def holder(i, dest):
+        """Where a Let's destination keeps the proxy: a member, the ubergraph's frame, or a plain local - unless
+        that local is copied on into a member or the frame in the same function."""
+        if dest.op == 0x01: return 'a member'
+        if dest.op != 0x00: return 'op %02x' % dest.op
+        owner = dest.ops[0][2]
+        st = pkg.struct(owner - 1) if owner > 0 else None
+        if st and st.function_flags & 0x8000: return 'the frame'
+        for n in invariants.statements(pkg, i)[0]:
+            if (n.op in (0x0F, 0x5F) and n.kids[0].op == 0x01 and local(n.kids[1]) == local(dest)) or \
+                    (n.op == 0x64 and local(n.kids[0]) == local(dest)):
+                return 'a member' if n.op != 0x64 else 'the frame'
+        return 'a local of ' + pkg.path(owner)
+    factory = lambda n: n.op in (0x1B, 0x1C, 0x45, 0x46, 0x68) and n.ops[0][0] == 'obj' \
+        and (pkg.path(n.ops[0][1]) or '').endswith(':CreateProxyObjectForPlayMontage')
+    held = []
+    for i, st in invariants.functions(pkg):
+        for n in invariants.statements(pkg, i)[0]:
+            if n.op in (0x0F, 0x5F) and factory(n.kids[1]): held.append(holder(i, n.kids[0]))
+            elif n.op == 0x64 and factory(n.kids[0]): held.append('the frame')
+    assert len(held) == 1, held
+    assert held[0] in ('a member', 'the frame'), 'the montage proxy is kept in %s' % held[0]
+    made = []
+    vm = VM(base, {'CreateProxyObjectForPlayMontage': lambda vm, ctx, *a: made.append(Obj('PlayMontageCallbackProxy')) or made[-1]},
+            Mesh='mesh', Montage='montage', Last='None')
+    vm.call('Play')
+    assert any(v is made[-1] for v in vm.self.vars.values()), 'nothing of the object holds the proxy: %s' % vm.self.vars
+    vm.broadcast(made[-1], 'OnCompleted', 'End')
+    assert vm.self.vars['Last'] == 'End', vm.self.vars
+    keeps_invariants(base)
+    print('ok  ProxyLocalHeld.Play: a callback proxy bound in a plain function is kept in a member, where the GC sees it')
 
 
 def deferred_left():
