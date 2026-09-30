@@ -240,9 +240,12 @@ void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
         { V.Name(D.K == FDefaultValue::Str && !D.S.empty() ? D.S : std::string("None")); V.I32(0); }
         else if (P.Type == "SetProperty" || P.Type == "MapProperty")
         {
-            /* Removed count, count, then the elements; a map's Items alternate key, value. */
+            /* The removed elements (a map's keys), then the count and the elements; a map's Items alternate key, value.
+               Only an inherited one has any to remove: the loader reads it over the parent's value (PropertySet.cpp
+               285-358, PropertyMap.cpp 316-400), a class's own over an empty one. */
             const bool bMap = P.Type == "MapProperty" && P.Value;
-            V.I32(0);
+            V.I32(int32(D.Removed.size()));
+            if (P.Inner) for (const FDefaultValue& Gone : D.Removed) WriteValue(V, *P.Inner, Gone);
             V.I32(int32(D.Items.size() / (bMap ? 2 : 1)));
             if (P.Inner)
                 for (size_t I = 0; I < D.Items.size(); ++I)

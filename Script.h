@@ -36,6 +36,7 @@ struct FDefaultValue
     FIndex Object;                      // Obj: the asset an ObjectProperty points at
     std::vector<FDefaultValue> Items;   // Array (also a set / map): one value per element, typed by the property's Inner; a map alternates key, value
     std::shared_ptr<std::vector<struct FPropertyDef>> Members;  // Struct, as a container's element: its own members (a lone struct's are FPropertyDef::Members)
+    std::vector<FDefaultValue> Removed; // a set / map read over the parent's value: its elements (a map's keys) taken out first
 };
 
 /* One ChildProperties entry. ElementSize must equal the type's runtime size; the engine lays the struct out from it. */

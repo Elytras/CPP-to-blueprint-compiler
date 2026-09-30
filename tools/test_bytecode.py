@@ -5634,24 +5634,6 @@ def prop_enum_casts():
     print('ok  an out-of-range enum default is refused: static_cast, C cast, constexpr, UE_DEFAULTS on a native member')
 
 
-prop_text_defaults()
-prop_flag_predicates()
-prop_hash_keys()
-prop_enum_casts()
-
-
-# -- pending
-
-for _mod, _body in (('PropSetBool', '  TSet<bool> Flags;\n'), ('PropMapBool', '  TMap<bool, int32> ByFlag;\n'),
-                    ('PropSetText', '  TSet<FText> Labels;\n'), ('PropMapText', '  TMap<FText, int32> ByLabel;\n'),
-                    ('PropSetHit', '  TSet<FHitResult> Hits;\n'), ('PropSetRotator', '  TSet<FRotator> Turns;\n'),
-                    ('PropSetBoolLocal', '  int32 F() { TSet<bool> S; S.Add(true); return S.Num(); }\n'),
-                    ('PropSetBoolParam', '  int32 F(TSet<bool> S) { return S.Num(); }\n')):
-    refused(_mod, _body, 'cannot hash, and the engine hashes each one')
-print('ok  a set element / map key that cannot hash is refused: bool, FText, a native struct without GetTypeHash; as '
-      'a variable, a local and a parameter')
-
-
 def fname_at(names, raw, o):
     import struct
     i, n = struct.unpack_from('<ii', raw, o)
@@ -5685,7 +5667,7 @@ def prop_set_delta():
     {a: 1, c: 3} become {2, 3} and {a: 5, b: 2}, read as the loader reads the child's tag on top of the parent CDO's
     loaded value (see loaded_container). Any encoding that loads that value passes."""
     import invariants
-    base = pending_asset('PropSetDelta')
+    base = asset('PropSetDelta')
     parent = invariants.Package(os.path.join(os.path.dirname(base), 'PropSetBase'))
     child = invariants.Package(base)
     pc, cc = parent.find('Default__PropSetBase_C'), child.find('Default__PropSetDelta_C')
@@ -5694,9 +5676,27 @@ def prop_set_delta():
     assert ids == {2, 3}, 'PropSetDelta loads Ids = %s, the source says {2, 3}' % sorted(ids)
     assert score == {'a': 5, 'b': 2}, 'PropSetDelta loads Score = %s, the source says {a: 5, b: 2}' % score
     keeps_invariants(base)
+    print('ok  PropSetDelta: an inherited TSet / TMap default lists the parent\'s elements it drops as removed, and loads '
+          'as its own value, not the union')
 
 
-pending('PropSetDelta: an inherited TSet / TMap default lists the parent\'s elements it drops as removed', prop_set_delta)
+prop_text_defaults()
+prop_flag_predicates()
+prop_hash_keys()
+prop_enum_casts()
+prop_set_delta()
+
+
+# -- pending
+
+for _mod, _body in (('PropSetBool', '  TSet<bool> Flags;\n'), ('PropMapBool', '  TMap<bool, int32> ByFlag;\n'),
+                    ('PropSetText', '  TSet<FText> Labels;\n'), ('PropMapText', '  TMap<FText, int32> ByLabel;\n'),
+                    ('PropSetHit', '  TSet<FHitResult> Hits;\n'), ('PropSetRotator', '  TSet<FRotator> Turns;\n'),
+                    ('PropSetBoolLocal', '  int32 F() { TSet<bool> S; S.Add(true); return S.Num(); }\n'),
+                    ('PropSetBoolParam', '  int32 F(TSet<bool> S) { return S.Num(); }\n')):
+    refused(_mod, _body, 'cannot hash, and the engine hashes each one')
+print('ok  a set element / map key that cannot hash is refused: bool, FText, a native struct without GetTypeHash; as '
+      'a variable, a local and a parameter')
 
 
 def prop_enum_class():
@@ -6337,16 +6337,19 @@ def deferred_left():
 
 
 def spawn_abstract():
-    """SpawnActor of an abstract class returns None (LevelActor.cpp 333-347); SpawnObject of one makes it quietly in
-    Shipping and asserts in Development (UObjectGlobals.cpp 2362); SpawnObject with no Outer returns None
-    (GameplayStatics.cpp 606-627). Each call should be warned about (or refused) at the function that makes it; the
-    abstract ones saying so (the word, not the class name, which has it too)."""
-    pending('SpawnAbstract.SpawnShape: spawning an abstract actor class warns',
-            says('SpawnAbstract', 'at SpawnShape', r'SpawnAbstract::SpawnShape\b', r'\babstract\b'))
-    pending('SpawnAbstract.MakeSpec: constructing an abstract object class warns',
-            says('SpawnAbstract', 'at MakeSpec', r'SpawnAbstract::MakeSpec\b', r'\babstract\b'))
-    pending('SpawnAbstract.MakeOuterless: constructing with no Outer warns',
-            says('SpawnAbstract', 'at MakeOuterless', r'SpawnAbstract::MakeOuterless\b', r'\bouter\b|\bNone\b'))
+    """SpawnActor of an abstract class returns None (LevelActor.cpp 333-347); SpawnObject with no Outer returns None
+    (GameplayStatics.cpp 606-627). Each call is warned about at the function that makes it; the abstract one saying so
+    (the word, not the class name, which has it too). SpawnObject of an abstract class is refused: it makes one quietly
+    in Shipping and asserts in Development (UObjectGlobals.cpp 2362), which uber_spawn_class_operands holds every
+    package to, and the editor's Construct Object node refuses the class (K2Node_GenericCreateObject.cpp 13-64)."""
+    log = LOGS['SpawnAbstract']
+    for fn, what in (('SpawnShape', r'\babstract\b'), ('MakeOuterless', r'\bouter\b|\bNone\b')):
+        assert said(log, r'SpawnAbstract::%s\b' % fn, what), 'nothing said at %s: %s' % (fn, ' | '.join(log.strip().splitlines()))
+    refused('SpawnAbstractSpec', '  void MakeSpec() { NewObject<UAbstractSpec>(this); }\n',
+            'MakeSpec: UAbstractSpec is an abstract class',
+            OBJECTS + 'class UAbstractSpec : public UObject {\npublic:\n  virtual int32 N() = 0;\n};\n')
+    print('ok  SpawnAbstract: spawning an abstract actor class and constructing with no Outer each warn at the '
+          'function; constructing an abstract object class is refused')
 
 
 def wait_hold():
@@ -6389,12 +6392,9 @@ COOKED_RULES = {'cooked_instancing_flags', 'cooked_instancing_scopes', 'cooked_t
 
 def pinned_elsewhere(f):
     """A finding a pending test below pins, which the behaviour checks leave to it:
-    - EditKeptLocals: a kept game body (<Fn>__Vanilla) whose local operands still name the replaced function's
-      properties (local_operands; and, once PRELOAD's rules are in, edl_payload_created on the same operand owner);
     - EditAddTick: a ReceiveTick a patch adds to a class that cannot tick (COMP's receive_tick_sets_can_ever_tick,
       once merged)."""
-    return f[0] in ('local_operands', 'edl_payload_created') and f[1].endswith('__Vanilla') \
-        or f[0] == 'receive_tick_sets_can_ever_tick'
+    return f[0] == 'receive_tick_sets_can_ever_tick'
 
 
 def compile_edit(tmp, mod, src, game):
@@ -6604,13 +6604,13 @@ def edit_invariants_game():
 
 def kept_body_locals():
     """A kept game body (<Fn>__Vanilla, a byte copy of the replaced function) reads its parameters through its own
-    properties. The copy keeps the original's bytecode, whose EX_LocalVariable / EX_LocalOutVariable operands name the
-    replaced function's properties (the operand's FFieldPath owner is resolved as written, FieldPath.cpp:256-270). An
-    out parameter is then never found: the copy's frame records each out parameter under the copy's own property
-    (ScriptCore.cpp:851-906, the list null-terminated), and execLocalOutVariable walks it for the replaced function's,
-    off its end (2170-2185, checkSlow only): the Parent:: call crashes the game. GruntKeep (GetEnemySpawnedCount(int&
-    SpawnCount), --game) and RpcKeep (ClientPing(int32 Seq)) keep bodies that read a parameter; local_operands must find
-    nothing on either."""
+    properties. The copy keeps the original's bytecode, whose EX_LocalVariable / EX_LocalOutVariable operands must be
+    re-owned: left naming the replaced function's properties (the operand's FFieldPath owner is resolved as written,
+    FieldPath.cpp:256-270), an out parameter is never found - the copy's frame records each out parameter under the
+    copy's own property (ScriptCore.cpp:851-906, the list null-terminated), and execLocalOutVariable walks it for the
+    replaced function's, off its end (2170-2185, checkSlow only): the Parent:: call crashes the game. GruntKeep
+    (GetEnemySpawnedCount(int& SpawnCount), --game) and RpcKeep (ClientPing(int32 Seq)) keep bodies that read a
+    parameter; local_operands must find nothing on either."""
     cases = [('RpcKeep', os.path.join(ROOT, 'ReplTest', 'FSD', 'Content'), '_ElytrasMods/ReplTest/ReplTest', RPC_KEEP)]
     if GAME and os.path.exists(os.path.join(UEAPI, 'Game', 'ENE_Spider_Grunt_Normal_C.h')):
         cases.insert(0, ('GruntKeep', GAME, GRUNT_PKGS[1], GRUNT + GRUNT_KEEP))
@@ -6750,34 +6750,35 @@ def edit_cooked_unlisted(mod, header, rel, member, template, body):
     return test
 
 
-def edit_cooked_pending():
+def edit_cooked_unlisted_cases():
     if not GAME or not os.path.exists(os.path.join(UEAPI, 'Game', 'PRJ_NormalBlasterShot_C.h')):
         print('--  S38 edits of components with cooked instancing data: skipped (needs --game and UeApi/Game)')
         return
-    pending('EditCookedScs: a patch of an SCS template property its valid cooked data does not list lists it, clears '
-            'bHasValidCookedData, or is refused',
-            edit_cooked_unlisted('EditCookedScs', 'PRJ_NormalBlasterShot_C.h', BLASTER, 'SourceRadius', 'PointLight_GEN_VARIABLE',
-                                 'class EditCookedScs : public PRJ_NormalBlasterShot_C {\n  UE_PATCH;\n'
-                                 '  UE_DEFAULTS { PointLight->SourceRadius = 12.0f; }\n};\n'))
-    pending('EditCookedIch: a patch of an override record\'s template property its valid cooked data does not list lists '
-            'it, clears bHasValidCookedData, or is refused',
-            edit_cooked_unlisted('EditCookedIch', 'PRJ_PatrolBotLaser_Flying_C.h',
-                                 'Enemies/RivalTech/PatrolBot/Projectiles/PRJ_PatrolBotLaser_Flying', 'bReceivesDecals',
-                                 'Body_GEN_VARIABLE',
-                                 'class EditCookedIch : public PRJ_PatrolBotLaser_Flying_C {\n  UE_PATCH;\n'
-                                 '  UE_DEFAULTS { Body->bReceivesDecals = false; }\n};\n'))
+    edit_cooked_unlisted('EditCookedScs', 'PRJ_NormalBlasterShot_C.h', BLASTER, 'SourceRadius', 'PointLight_GEN_VARIABLE',
+                         'class EditCookedScs : public PRJ_NormalBlasterShot_C {\n  UE_PATCH;\n'
+                         '  UE_DEFAULTS { PointLight->SourceRadius = 12.0f; }\n};\n')()
+    print('ok  EditCookedScs: a patch of an SCS template property its valid cooked data does not list leaves '
+          'no stale cooked data')
+    edit_cooked_unlisted('EditCookedIch', 'PRJ_PatrolBotLaser_Flying_C.h',
+                         'Enemies/RivalTech/PatrolBot/Projectiles/PRJ_PatrolBotLaser_Flying', 'bReceivesDecals',
+                         'Body_GEN_VARIABLE',
+                         'class EditCookedIch : public PRJ_PatrolBotLaser_Flying_C {\n  UE_PATCH;\n'
+                         '  UE_DEFAULTS { Body->bReceivesDecals = false; }\n};\n')()
+    print('ok  EditCookedIch: a patch of an override record\'s template property its valid cooked data does not list '
+          'leaves no stale cooked data')
 
 
 if not globals().get('EDITS_EXPLORE'):     # set by the dev loop's exploration driver, which reuses the cases above
     edit_invariants_suite()
     edit_invariants_game()
-    pending('EditKeptLocals: a kept game body (<Fn>__Vanilla) reads its parameters through its own properties, not the '
-            'replaced function\'s (an out parameter\'s is never found: the Parent:: call crashes)', kept_body_locals)
+    kept_body_locals()
+    print('ok  S38: a kept game body (<Fn>__Vanilla) reads its parameters, an out parameter included, through its own '
+          'properties, not the replaced function\'s')
     pending('EditAddTick: a ReceiveTick a patch adds to a Blueprint that cannot tick sets PrimaryActorTick.bCanEverTick '
             'on its CDO, or is refused', added_tick_can_tick)
     edit_listed_component()
     edit_bound_names()
-    edit_cooked_pending()
+    edit_cooked_unlisted_cases()
 
 
 print('ok  %d known gaps, each a failing test of something AssetGen does not do yet' % len(GAPS))

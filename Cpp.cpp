@@ -235,6 +235,45 @@ bool DefaultAssignment(const Json& S, const Json*& Lhs, const Json*& Rhs, const 
     return true;
 }
 
+/* An inherited set's or map's default P, made what the editor saves (PropertySet.cpp 359-429, PropertyMap.cpp
+   400-472) against Parent, the parent CDO's value it loads over: the parent's elements (a map's keys) P lacks as
+   removed, and of P's own only those the parent lacks (a map's pairs whose key it lacks or maps elsewhere). Elements
+   compare as the engine reads them, by their bytes: a name by its row in a scratch table, which a name spelled in
+   another case shares, as FName's comparison ignores case. */
+void DiffAgainstParent(FPropertyDef& P, const FDefaultValue& Parent)
+{
+    if (!P.Inner) return;
+    const bool bMap = P.Type == "MapProperty" && P.Value;
+    const size_t Step = bMap ? 2 : 1;
+    FPackage Scratch("/Scratch");
+    Scratch.SeedNames({});
+    auto Bytes = [&](const FPropertyDef& Of, const FDefaultValue& V) {
+        FPropertyDef E = Of;
+        E.Default = V;
+        FArc A(&Scratch);
+        WriteDefaultValue(A, E);
+        return A.B;
+    };
+    auto Find = [&](const std::vector<FDefaultValue>& In, const FDefaultValue& Key) -> const FDefaultValue* {
+        for (size_t I = 0; I + Step <= In.size(); I += Step)
+            if (Bytes(*P.Inner, In[I]) == Bytes(*P.Inner, Key)) return &In[I];
+        return nullptr;
+    };
+    FDefaultValue& Mine = P.Default;
+    Mine.Removed.clear();
+    for (size_t I = 0; I + Step <= Parent.Items.size(); I += Step)
+        if (!Find(Mine.Items, Parent.Items[I])) Mine.Removed.push_back(Parent.Items[I]);
+    std::vector<FDefaultValue> Differs;
+    for (size_t I = 0; I + Step <= Mine.Items.size(); I += Step)
+    {
+        const FDefaultValue* Had = Find(Parent.Items, Mine.Items[I]);
+        if (Had && (!bMap || Bytes(*P.Value, Had[1]) == Bytes(*P.Value, Mine.Items[I + 1]))) continue;
+        Differs.insert(Differs.end(), Mine.Items.begin() + std::ptrdiff_t(I), Mine.Items.begin() + std::ptrdiff_t(I + Step));
+    }
+    Mine.Items = std::move(Differs);
+    Mine.K = FDefaultValue::Array;
+}
+
 /* A patch's UE_DEFAULTS statement, which may also assign part of a member's value: DefaultAssignment's `Field` or
    `Component->Field`, then any `.Member` and `[i]` into it (`PrimaryActorTick.bCanEverTick = v`, `Spans[1].Max = v`).
    Root is the field's MemberExpr, Steps each `.Member`'s MemberExpr or `[i]`'s operator call, from the root out. */
@@ -518,6 +557,7 @@ struct FArgIR
     std::shared_ptr<FCallIR> Sub;   // Call: the call; StructLit: Args holds one value per reflected field, in order
     std::shared_ptr<FArgIR> Base;   // Member: the struct-valued expression; Index: the array variable (Sub->Args[0] is the index);
                                     // Field: the object, when not self; InterfaceCtx: the interface value
+    const FRecord* Class = nullptr; // ObjConst of `X::StaticClass()`: X, for what a spawn or construct is asked to make
 };
 
 enum EStrKind { SK_None, SK_Str, SK_Name, SK_Text, SK_Int, SK_Int64, SK_Float, SK_Bool, SK_Byte, SK_Object };
@@ -1363,6 +1403,8 @@ private:
     std::set<std::string> WarnedNoWorld;        // Class::Function that passed self as a world context without a world
     std::set<std::string> UcsReached;           // the class's functions UserConstructionScript runs, itself included
     std::set<std::string> WarnedUcsSpawn;
+    std::set<std::string> WarnedMakes;          // Class::Function what: a spawn or construct the engine will not make
+    std::map<std::string, const FRecord*> LocalClass;   // an inline parameter's local -> the X::StaticClass() it holds
 
     /* `X::StaticClass()`: the record X names, read back from the mod's sources (clang's JSON keeps no qualifier). */
     const FRecord* NamedQualifier(const Json& Ref) const;
@@ -1370,6 +1412,8 @@ private:
     const FRecord* MemberQualifier(const Json& Member) const;
     const std::vector<std::string>& ModSources() const;
     bool IsSubclassOf(const FRecord& Child, const FRecord& Parent) const;
+    /* The nearest declaration of some method along R's chain is `= 0`: the class Generate cooks CLASS_Abstract. */
+    bool IsAbstract(const FRecord& R) const;
     std::vector<uint8> NativeTail(const FRecord* Component) const;
     std::vector<const Json*> StructArgs(const Json& Value, const FRecord* R, const std::vector<std::string>& Fields) const;
     mutable std::vector<std::string> SourceTexts;                       // the mod directory's .h/.cpp, read on demand
@@ -4360,6 +4404,7 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             Out.K = FArgIR::ObjConst;
             Out.Owner = ClassImportOf(*R, BP);
             Out.InnerType = "UClass *";
+            Out.Class = R;
             return true;
         }
         if (CalleeName == "Cast")
@@ -4740,6 +4785,15 @@ bool FCompiler::IsSubclassOf(const FRecord& Child, const FRecord& Parent) const
 {
     for (const FRecord* A = &Child; A; A = A->Base.empty() ? nullptr : Find(A->Base))
         if (A == &Parent) return true;
+    return false;
+}
+
+bool FCompiler::IsAbstract(const FRecord& R) const
+{
+    std::set<std::string> Nearest;
+    for (const FRecord* A = &R; A; A = A->Base.empty() ? nullptr : Find(A->Base))
+        for (const auto& [Method, Decl] : A->Methods)
+            if (Nearest.insert(Method).second && Decl->value("pure", false)) return true;
     return false;
 }
 
@@ -5525,6 +5579,34 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
                    Cur->CppName.c_str(), CurFnName.c_str(), MethodName.c_str());
         break;
     }
+    /* What the engine will not make, when the call names the class (`X::StaticClass()`, through an inline helper's
+       parameter too). SpawnActor of an abstract class returns None (LevelActor.cpp 338-342), and SpawnObject with no
+       Outer returns None (GameplayStatics.cpp 606-627): each a warning at the function, as the value may be read
+       nowhere. SpawnObject of an abstract class is refused: it ends in NewObject, whose allocation holds that "it is
+       illegal to create an abstract class" - asserting in a Development game, compiled out of a Shipping one, which
+       makes it (UObjectGlobals.cpp 2362) - and the editor's Construct Object node refuses the class
+       (K2Node_GenericCreateObject.cpp 13-64). */
+    const bool bSpawns = MethodName == "BeginDeferredActorSpawnFromClass" || MethodName == "BeginSpawningActorFromClass";
+    if ((bSpawns || MethodName == "SpawnObject") && Cur && Out.Args.size() == Parms.size())
+        for (size_t I = 0; I < Parms.size(); ++I)
+        {
+            const FArgIR& A = Out.Args[I];
+            const std::string Where = Cur->CppName + "::" + CurFnName;
+            const auto Held = A.K == FArgIR::Local ? LocalClass.find(A.S) : LocalClass.end();
+            const FRecord* Named = A.K == FArgIR::ObjConst ? A.Class : Held != LocalClass.end() ? Held->second : nullptr;
+            if (Named && IsAbstract(*Named) && !bSpawns)
+            {
+                *Err = CurFnName + ": " + Named->CppName + " is an abstract class (a method of it is `= 0`), which the engine "
+                       "may not construct (a Development game asserts): construct a subclass";
+                return false;
+            }
+            if (Named && IsAbstract(*Named) && WarnedMakes.insert(Where + " " + Named->CppName).second)
+                printf("  warning: %s: %s is an abstract class (a method of it is `= 0`), and the engine spawns no actor "
+                       "of one: the spawn returns None\n", Where.c_str(), Named->CppName.c_str());
+            if (!bSpawns && Parms[I].compare(0, 5, "Outer") == 0 && A.K == FArgIR::NullObj && WarnedMakes.insert(Where + " Outer").second)
+                printf("  warning: %s: SpawnObject with no Outer (None) makes nothing and returns None: pass the object "
+                       "that owns it, such as this\n", Where.c_str());
+        }
     /* A reference parameter, const or not, is CPF_OutParm. A script callee steps its argument with no result buffer to
        take the address (ProcessScriptFunction), and a native reads it through Stack.MostRecentPropertyAddress whenever
        the argument left one (P_GET_PROPERTY_REF), which a nested call does - the address of whatever ITS arguments read
@@ -8330,6 +8412,9 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
         if (InPlace[I] && Canon(Bind.Value.InnerType) == Canon(Type) && (OnlyRead(*Body, Id) || OnlyReadValue(*Body, Id)))
         { ParmConst[Id] = Bind.Value; continue; }
         if (!AddLocal(Local, Type)) return false;
+        /* The class a spawn or construct in the body is asked to make (LowerCall), when nothing there can change it. */
+        if (Bind.Value.Class && OnlyReadValue(*Body, Id)) LocalClass[Local] = Bind.Value.Class;
+        else LocalClass.erase(Local);
         Bind.K = FStmtIR::Assign;
         Bind.Var.K = FArgIR::Local;
         Bind.Var.S = Local;
@@ -10614,6 +10699,112 @@ static int32 ImportInto(FCookedPackage& P, const std::string& Package, const FPa
 }
 
 /*
+An edit of export row Template, when it is a component template whose SCS node or override record carries valid cooked
+instancing data. A spawned actor builds such a component on the fast path: NewObject of the template's class, then only
+the properties the data's ChangedPropertyList names serialized over it from the template (SCS_Node.cpp:90-95,
+ActorConstruction.cpp:1013-1089, BlueprintGeneratedClass.cpp:1912-1953). The cooker scopes a root entry to the
+template's class, lists a struct member by member and an array element by element (BlueprintEditorUtils.cpp:9904-9988,
+10005). Edited is the tags the edit wrote, or null when it wrote part of one (a member, an element). The data stays
+valid when each is a whole property, not a struct or an array, that a root entry names at its array index; otherwise
+the edit would never reach a spawned component, so the data stops being valid (bHasValidCookedData false) and the node
+or record takes the slow path, which duplicates the whole template (SCS_Node.cpp:97-99). Each one dropped is named in
+Dropped. False, saying why, when the data does not read as tags.
+*/
+static bool DropStaleCookedData(FCookedPackage& P, int32 Template, const std::vector<FTag>* Edited,
+                                std::vector<std::string>& Dropped, std::string* Err)
+{
+    const int32 Class = P.Exports[size_t(Template)].Class;
+    auto Int = [](const FTag& T) { int32 V = 0; if (T.Value.size() >= 4) std::memcpy(&V, T.Value.data(), 4); return V; };
+    /* Data is one CookedComponentInstancingData's value, a tag list; bDropped when it was valid and is not now. */
+    auto Drop = [&](std::vector<uint8>& Data, bool& bDropped) {
+        std::vector<FTag> Tags;
+        size_t At = 0;
+        if (!ReadTags(P, Data, At, Tags)) return false;
+        FTag* Valid = nullptr;
+        const FTag* List = nullptr;
+        for (FTag& T : Tags)
+            if (P.Is(T.Name, "bHasValidCookedData")) Valid = &T;
+            else if (P.Is(T.Name, "ChangedPropertyList")) List = &T;
+        if (!Valid || !Valid->BoolVal) return true;
+        std::set<std::pair<std::string, int32>> Roots;
+        if (List && Int(*List) > 0)
+        {
+            size_t E = 4 + 49;          // the count, then an array of structs' inner tag
+            for (int32 I = 0; I < Int(*List); ++I)
+            {
+                std::vector<FTag> Entry;
+                if (!ReadTags(P, List->Value, E, Entry)) return false;
+                std::string Name;
+                int32 Index = 0, Scope = 0;     // a tag the struct's default (0, null) leaves out
+                for (const FTag& F : Entry)
+                    if (P.Is(F.Name, "PropertyName") && F.Value.size() >= 8)
+                    {
+                        FNameRef N;
+                        std::memcpy(&N.Index, F.Value.data(), 4);
+                        std::memcpy(&N.Number, F.Value.data() + 4, 4);
+                        Name = P.NameOf(N);
+                    }
+                    else if (P.Is(F.Name, "ArrayIndex")) Index = Int(F);
+                    else if (P.Is(F.Name, "PropertyScope")) Scope = Int(F);
+                if (Scope == Class) Roots.insert({ Lower(Name), Index });
+            }
+        }
+        if (Edited && std::all_of(Edited->begin(), Edited->end(), [&](const FTag& T) {
+                return !P.Is(T.Type, "StructProperty") && !P.Is(T.Type, "ArrayProperty")
+                    && Roots.count({ Lower(P.NameOf(T.Name)), T.ArrayIndex }) != 0; }))
+            return true;
+        Valid->BoolVal = 0;
+        Data.clear();
+        WriteTags(P, Tags, Data);
+        bDropped = true;
+        return true;
+    };
+    for (int32 K = 0; K < int32(P.Exports.size()); ++K)
+    {
+        const std::string Kind = P.ClassNameOf(P.Exports[size_t(K)].Class);
+        if (Kind != "SCS_Node" && Kind != "InheritableComponentHandler") continue;
+        std::vector<FTag> Tags;
+        size_t At = 0;
+        if (!ReadTags(P, P.Exports[size_t(K)].Payload, At, Tags)) continue;
+        const std::string Where = P.NameOf(P.Exports[size_t(K)].ObjectName);
+        for (FTag& T : Tags)
+        {
+            bool bDropped = false;
+            if (Kind == "SCS_Node" && P.Is(T.Name, "CookedComponentInstancingData"))
+            {
+                const auto Tmpl = std::find_if(Tags.begin(), Tags.end(), [&](const FTag& X) { return P.Is(X.Name, "ComponentTemplate"); });
+                if (Tmpl == Tags.end() || Int(*Tmpl) != Template + 1) continue;
+                if (!Drop(T.Value, bDropped)) { *Err = Where + "'s cooked instancing data does not read as tags"; return false; }
+            }
+            else if (Kind == "InheritableComponentHandler" && P.Is(T.Name, "Records") && Int(T) > 0)
+            {
+                /* An array of FComponentOverrideRecord: the count, the inner tag, each record's tag list. A bool's value
+                   is in its tag, so a record keeps its size and the inner tag its Size. */
+                std::vector<uint8> Out(T.Value.begin(), T.Value.begin() + std::min<size_t>(T.Value.size(), 4 + 49));
+                size_t E = 4 + 49;
+                for (int32 I = 0; I < Int(T); ++I)
+                {
+                    std::vector<FTag> Rec;
+                    if (!ReadTags(P, T.Value, E, Rec)) { *Err = Where + "'s Records do not read as tags"; return false; }
+                    const auto Tmpl = std::find_if(Rec.begin(), Rec.end(), [&](const FTag& X) { return P.Is(X.Name, "ComponentTemplate"); });
+                    for (FTag& R : Rec)
+                        if (Tmpl != Rec.end() && Int(*Tmpl) == Template + 1 && P.Is(R.Name, "CookedComponentInstancingData")
+                            && !Drop(R.Value, bDropped))
+                        { *Err = Where + "'s cooked instancing data does not read as tags"; return false; }
+                    WriteTags(P, Rec, Out);
+                }
+                if (Out.size() != T.Value.size()) { *Err = Where + ": internal: a record changed size"; return false; }
+                T.Value = std::move(Out);
+            }
+            if (!bDropped) continue;
+            if (!SetTags(P, K, { T }, Err)) return false;
+            Dropped.push_back(Where);
+        }
+    }
+    return true;
+}
+
+/*
 Edits, lowered against From (a scratch package, whose imports their objects are), into the tags of Object in the game's
 Package: read from GameDir the first time, saved by SaveEdits once every edit is in. A member's tag replaces the one of
 its name or is appended; an assignment to part of a member's value (a path) changes that part of the tag's value and
@@ -10716,6 +10907,8 @@ bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object,
     for (size_t I = P.Names.size(); I < Sink.NameTable().size(); ++I) P.Names.push_back({ Sink.NameTable()[I] });
 
     /* In statement order, so a later assignment lands on what an earlier one wrote. */
+    std::vector<FTag> Written;
+    bool bWhole = true;
     for (size_t I = 0; I < Edits.size(); ++I)
     {
         if (Edits[I].Path.empty())
@@ -10725,13 +10918,103 @@ bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object,
             if (!ReadTags(P, Fresh[I][0], End, Tags) || End != Fresh[I][0].size() || Tags.size() != 1)
             { *Err = Where + ": internal: the edit's tag does not read back"; return false; }
             if (!SetTags(P, Export, Tags, Err)) { *Err = Where + ": " + *Err; return false; }
+            Written.push_back(Tags[0]);
         }
         else if (!SetTagPath(P, Export, Edits[I].Chain[0].Name, Edits[I].Path, Fresh[I], Leaf[I], Err))
         { *Err = Where + ": " + *Err; return false; }
+        else bWhole = false;
     }
     for (int32 Dep : Deps) P.CreateBeforeSerialize(Export, Dep);
+    std::vector<std::string> Dropped;
+    if (!DropStaleCookedData(P, Export, bWhole ? &Written : nullptr, Dropped, Err)) { *Err = Where + ": " + *Err; return false; }
     Ed->Objects.push_back(Object + " (" + std::to_string(Edits.size()) + (Edits.size() == 1 ? " assignment)" : " assignments)"));
+    for (const std::string& D : Dropped)
+        Ed->Objects.push_back(D + " (its cooked instancing data for " + Object + " no longer valid: it did not list the edit)");
     return true;
+}
+
+/* Each FFieldPath operand of a cooked script, B[Begin, End) being its serialized bytes: Visit gets the offset of the
+   operand's owner, an FPackageIndex after its name segments. The grammar is the loader's (ScriptSerialization.h, UE
+   4.27), as tools/walkscript.py reads it. False when the bytes do not read as that grammar. */
+static bool ForEachFieldPath(const std::vector<uint8>& B, size_t Begin, size_t End, const std::function<void(size_t)>& Visit)
+{
+    size_t O = Begin;
+    bool bOk = true;
+    auto Skip = [&](size_t N) { if (O + N > End) bOk = false; O += N; };
+    auto Path = [&] {
+        int32 Segments = -1;
+        if (O + 4 <= End) std::memcpy(&Segments, &B[O], 4);
+        Skip(4);
+        if (Segments < 0) { bOk = false; return; }
+        Skip(size_t(Segments) * 8);
+        if (bOk && O + 4 <= End) Visit(O);
+        Skip(4);
+    };
+    std::function<uint8()> Expr;
+    auto Until = [&](uint8 Term) { while (bOk && Expr() != Term) {} };
+    Expr = [&]() -> uint8 {
+        if (!bOk || O >= End) { bOk = false; return 0xFF; }
+        const uint8 Op = B[O++];
+        switch (Op)
+        {
+        case 0x00: case 0x01: case 0x02: case 0x33: case 0x48: case 0x6C: Path(); break;      // variables, PropertyConst
+        case 0x04: case 0x4E: case 0x4F: case 0x51: case 0x67: case 0x6D: Expr(); break;
+        case 0x06: case 0x1D: case 0x1E: case 0x20: case 0x4C: case 0x5B: Skip(4); break;
+        case 0x07: case 0x18: Skip(4); Expr(); break;
+        case 0x09: Skip(3); Expr(); break;                                                      // EX_Assert
+        case 0x0B: case 0x15: case 0x16: case 0x17: case 0x25: case 0x26: case 0x27: case 0x28: case 0x2A: case 0x2D:
+        case 0x30: case 0x32: case 0x3A: case 0x3C: case 0x3E: case 0x40: case 0x4D: case 0x50: case 0x53: case 0x5A:
+        case 0x5E: case 0x66: case 0x6A: break;                     // no operand (EX_InstrumentationEvent's is not on disk)
+        case 0x0F: Path(); Expr(); Expr(); break;                                               // EX_Let
+        case 0x14: case 0x43: case 0x44: case 0x5C: case 0x5F: case 0x60: case 0x62: case 0x6B: Expr(); Expr(); break;
+        case 0x13: case 0x2E: case 0x52: case 0x54: case 0x55: Skip(4); Expr(); break;         // casts: a class, then the value
+        case 0x12: case 0x19: case 0x1A: Expr(); Skip(4); Path(); Expr(); break;               // contexts
+        case 0x1B: case 0x45: Skip(8); Until(0x16); break;                                      // calls by name
+        case 0x1C: case 0x46: case 0x68: Skip(4); Until(0x16); break;                           // calls by pointer
+        case 0x63: Skip(4); Expr(); Until(0x16); break;
+        case 0x1F: while (O < End && B[O]) ++O; Skip(1); break;
+        case 0x34: while (O + 1 < End && (B[O] || B[O + 1])) O += 2; Skip(2); break;
+        case 0x21: case 0x4B: Skip(8); break;
+        case 0x22: case 0x23: Skip(12); break;
+        case 0x2B: Skip(40); break;
+        case 0x24: case 0x2C: Skip(1); break;
+        case 0x29:                                                                              // EX_TextConst
+        {
+            const uint8 Type = O < End ? B[O] : 0xFF;
+            Skip(1);
+            if (Type == 1) { Expr(); Expr(); Expr(); }                                          // localized
+            else if (Type == 2 || Type == 3) Expr();                                            // invariant, literal
+            else if (Type == 4) { Skip(4); Expr(); Expr(); }                                    // string table
+            break;
+        }
+        case 0x2F: Skip(8); Until(0x30); break;
+        case 0x31: Expr(); Until(0x32); break;
+        case 0x35: case 0x36: Skip(8); break;
+        case 0x38: Skip(1); Expr(); break;
+        case 0x39: Expr(); Skip(4); Until(0x3A); break;
+        case 0x3B: Expr(); Skip(4); Until(0x3C); break;
+        case 0x3D: Path(); Skip(4); Until(0x3E); break;
+        case 0x3F: Path(); Path(); Skip(4); Until(0x40); break;
+        case 0x65: Path(); Skip(4); Until(0x66); break;
+        case 0x42: case 0x64: Path(); Expr(); break;
+        case 0x5D: Expr(); break;
+        case 0x61: Skip(8); Expr(); Expr(); break;
+        case 0x69:                                                                              // EX_SwitchValue
+        {
+            uint16 Cases = 0;
+            if (O + 2 <= End) std::memcpy(&Cases, &B[O], 2);
+            Skip(6);
+            Expr();
+            for (uint16 I = 0; I < Cases && bOk; ++I) { Expr(); Skip(4); Expr(); }
+            Expr();
+            break;
+        }
+        default: bOk = false;
+        }
+        return Op;
+    };
+    while (bOk && O < End) Expr();
+    return bOk && O == End;
 }
 
 /*
@@ -10861,6 +11144,18 @@ bool FCompiler::TransplantFunctions(const FRecord& R, const FRecord& B, const FP
         FCookedExport& C = P.Exports[size_t(Copy - 1)];
         std::memset(C.Payload.data() + L.Super, 0, 4);         // SuperStruct
         C.Super = 0;
+        /* The copy's script still names the game function's properties: each local and parameter operand is an
+           FFieldPath whose owner is the function it was cooked in, resolved as written (FieldPath.cpp:256-270). That
+           function now holds the method's locals, and the copy's frame lists each out parameter under the copy's own
+           property (ScriptCore.cpp:851-906), so execLocalOutVariable would walk off the list looking for the game
+           function's (2170-2185): the Parent:: call crashes. The copy holds the same properties, so each operand owned
+           by the game's function is owned by the copy. */
+        const bool bScriptReads = ForEachFieldPath(C.Payload, L.Script + 8, L.Tail, [&](size_t At) {
+            int32 Owner = 0;
+            std::memcpy(&Owner, C.Payload.data() + At, 4);
+            if (Owner == To) std::memcpy(C.Payload.data() + At, &Copy, 4);
+        });
+        if (!bScriptReads) { *Err = Where + "::" + Name + ": the game's script does not read as UE 4.27 bytecode"; return false; }
         /* Nothing overrides the copy, and Parent:: calls it by pointer, which the editor does only for a final function.
            An RPC's copy is a plain function. With FUNC_Net and no super it would be a net field of the class's own
            (Class.cpp:4189), shifting the RPC indices against the game's, and a call to it would be routed again
@@ -11219,6 +11514,35 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 { *Err = Where + ": " + Name(*Lhs) + " needs a literal value"; bOk = false; return; }
                 if (bInterfaceVar) { InterfaceVarDefaults[Name(*Lhs)] = PD; return; }
 
+                /* An inherited set or map loads over the parent CDO's value (PropertySet.cpp 285-358, PropertyMap.cpp
+                   316-400: copied in, the listed removals taken out, the rest added), so written whole it would load as
+                   the union of both; DiffAgainstParent writes it as the editor does. The parent's value is the nearest
+                   UE_DEFAULTS up the chain that sets the member, else its initializer where it is declared. A native
+                   class on the way holds one no header says, and there it stays whole. */
+                if (!bThroughComponent && (PD.Type == "SetProperty" || PD.Type == "MapProperty"))
+                {
+                    const std::string Id = Lhs->value("referencedMemberDecl", std::string());
+                    FPropertyDef Parent = PD;
+                    Parent.Default = FDefaultValue();
+                    for (const FRecord* C = Find(R.Base); C && !C->IsNative(); C = C->Base.empty() ? nullptr : Find(C->Base))
+                    {
+                        const Json *Set = nullptr, *Value = nullptr, *Its = nullptr;
+                        if (C->Defaults) ForEach(*C->Defaults, [&](const Json& B) { if (Kind(B) == "CompoundStmt") Its = &B; });
+                        if (Its)
+                            ForEach(*Its, [&](const Json& S2) {
+                                const Json *L = nullptr, *V = nullptr, *Through = nullptr;
+                                if (DefaultAssignment(S2, L, V, Through) && !Through && L->value("referencedMemberDecl", std::string()) == Id)
+                                { Set = L; Value = V; }
+                            });
+                        const Json* Declared = nullptr;
+                        for (const Json* F : C->Fields) if (F->value("id", std::string()) == Id) Declared = F;
+                        if (!Set && !Declared) continue;
+                        if (!(Set ? LowerDefault(*Set, Parent, BP, Err, Value, /*bKeepZero=*/true) : LowerDefault(*Declared, Parent, BP, Err)))
+                        { bOk = false; return; }
+                        DiffAgainstParent(PD, Parent.Default);
+                        break;
+                    }
+                }
                 if (!bThroughComponent) { InheritedDefaults.push_back(PD); return; }
                 if (DR == &R) { ComponentDefaults[CompName].push_back(PD); return; }
                 /* A native parent's component is a default subobject, not an SCS node: it is
