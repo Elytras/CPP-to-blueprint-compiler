@@ -23,7 +23,10 @@ if(NOT nlohmann_json_FOUND)
   FetchContent_MakeAvailable(nlohmann_json)
 endif()
 
+# Cpp.cpp reads clang's AST dump on a second thread; glibc before 2.34 needs libpthread linked for std::thread.
+find_package(Threads REQUIRED)
+
 add_executable(assetgen
   Blueprint.cpp Cpp.cpp Main.cpp Package.cpp Registry.cpp Script.cpp Uncooked.cpp Verify.cpp)
 target_include_directories(assetgen PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(assetgen PRIVATE nlohmann_json::nlohmann_json)
+target_link_libraries(assetgen PRIVATE nlohmann_json::nlohmann_json Threads::Threads)
