@@ -3,9 +3,12 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <exception>
 #include <functional>
 #include <iterator>
 #include <set>
@@ -13,8 +16,10 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -12921,50 +12926,158 @@ private:
     }
 };
 
+/* Reads clang's pipe on a thread of its own and hands the dump to the parser in chunks, in order. On one thread clang
+   and FAstSax took turns: _popen's pipe holds 1 KB and fread keeps reading until it has filled the whole request, so
+   clang sat on a full pipe while FAstSax parsed a MB, and FAstSax sat idle while clang wrote the next one. The queue is
+   capped: a parser slower than clang would otherwise hold most of the dump, and the suite runs 8 compiles at once. */
+class FDumpStream
+{
+public:
+    explicit FDumpStream(FILE* InPipe) : Pipe(InPipe), Buf(ChunkBytes), Reader([this] { ReadPipe(); }) {}
+    ~FDumpStream() { Stop(); }      // a parse that throws must not destroy a joinable thread (std::terminate)
+    FDumpStream(const FDumpStream&) = delete;
+    FDumpStream& operator=(const FDumpStream&) = delete;
+
+    /* On the parser's thread: the next chunk, or false once the dump has ended. */
+    bool Next(std::string& Chunk)
+    {
+        std::unique_lock<std::mutex> Lock(Mutex);
+        Changed.wait(Lock, [&] { return !Queue.empty() || bEnd; });
+        if (Queue.empty()) return false;
+        Chunk = std::move(Queue.front());
+        Queue.pop_front();
+        Queued -= Chunk.size();
+        Changed.notify_all();
+        return true;
+    }
+
+    /* Drops what is queued and waits for the reader, which reads the rest of the pipe without keeping it: after a parse
+       that stopped early clang still has output to write, and pclose waits for clang to exit. */
+    void Stop() noexcept
+    {
+        {
+            std::lock_guard<std::mutex> Lock(Mutex);
+            bStop = true;
+            Queue.clear();
+            Queued = 0;
+        }
+        Changed.notify_all();
+        if (Reader.joinable()) Reader.join();
+    }
+
+    /* After Stop: the reader's own failure (a chunk it could not allocate), which cut the dump short. */
+    void RethrowReaderError() const { if (ReaderError) std::rethrow_exception(ReaderError); }
+
+    uint64 Total() const { std::lock_guard<std::mutex> Lock(Mutex); return TotalRead; }
+
+private:
+    static constexpr size_t ChunkBytes = 256 << 10;
+    static constexpr size_t MaxQueued = 8 << 20;
+
+    FILE* Pipe;
+    std::vector<char> Buf;                  // the reader's; a chunk is a copy, so it can go on reading
+    mutable std::mutex Mutex;
+    std::condition_variable Changed;        // a chunk queued or taken, the end, a stop
+    std::deque<std::string> Queue;
+    size_t Queued = 0;                      // bytes in Queue
+    uint64 TotalRead = 0;                   // bytes read from the pipe, kept or not
+    bool bEnd = false;                      // nothing more will be queued
+    bool bStop = false;
+    std::exception_ptr ReaderError;
+    std::thread Reader;                     // last: it starts once the members above are built
+
+    void ReadPipe()
+    {
+        bool bDrain = false;                // stopped, or failed: read on until clang closes the pipe, keep nothing
+        for (size_t N; (N = fread(Buf.data(), 1, Buf.size(), Pipe)) != 0;)
+        {
+            try
+            {
+                std::string Chunk;
+                if (!bDrain) Chunk.assign(Buf.data(), N);
+                std::unique_lock<std::mutex> Lock(Mutex);
+                TotalRead += N;
+                if (!bDrain) Changed.wait(Lock, [&] { return bStop || Queued < MaxQueued; });
+                if (bDrain || bStop) { bDrain = true; continue; }
+                Queue.push_back(std::move(Chunk));
+                Queued += N;
+                Changed.notify_all();
+            }
+            catch (...)
+            {
+                /* The parser takes what is queued, then the end, so its parse fails; ParseClangAst rethrows this. */
+                std::lock_guard<std::mutex> Lock(Mutex);
+                ReaderError = std::current_exception();
+                bEnd = bDrain = true;
+                Changed.notify_all();
+            }
+        }
+        std::lock_guard<std::mutex> Lock(Mutex);
+        bEnd = true;
+        Changed.notify_all();
+    }
+};
+
 /* Runs clang (Cmd writes the AST dump to stdout) and parses the dump as it streams in through a pipe. The dump is
    hundreds of MB: written to a file and read back, it was most of a compile's disk traffic, and several compiles at
-   once (the test suites of parallel sessions) held the disk at its limit with the CPU mostly idle. */
+   once (the test suites of parallel sessions) held the disk at its limit with the CPU mostly idle. FDumpStream drains
+   the pipe on a second thread, so clang writes the dump while FAstSax parses it instead of the two taking turns. */
 bool ParseClangAst(const std::string& Cmd, const std::string& SourcePath, Json* Out, std::string* Err)
 {
-    struct FPipe
+    struct FAstSource
     {
-        FILE* F;
-        std::vector<char> Buf = std::vector<char>(1 << 20);
-        size_t Pos = 0, End = 0;
-        bool Fill() { Pos = 0; End = fread(Buf.data(), 1, Buf.size(), F); return End != 0; }
+        FDumpStream& Stream;
+        std::string Cur;
+        size_t Pos = 0;
+        bool Next() { Pos = 0; return Stream.Next(Cur); }
     };
-    /* One char at a time for nlohmann's iterator input; a null pipe is the end. */
-    struct FPipeIt
+    /* One char at a time for nlohmann's iterator input; a null source is the end. */
+    struct FAstSourceIt
     {
         using iterator_category = std::input_iterator_tag;
         using value_type = char;
         using difference_type = std::ptrdiff_t;
         using pointer = const char*;
         using reference = const char&;
-        FPipe* P = nullptr;
-        reference operator*() const { return P->Buf[P->Pos]; }
-        FPipeIt& operator++() { if (++P->Pos == P->End && !P->Fill()) P = nullptr; return *this; }
-        bool operator==(const FPipeIt& O) const { return P == O.P; }
-        bool operator!=(const FPipeIt& O) const { return P != O.P; }
+        FAstSource* S = nullptr;
+        reference operator*() const { return S->Cur[S->Pos]; }
+        FAstSourceIt& operator++() { if (++S->Pos == S->Cur.size() && !S->Next()) S = nullptr; return *this; }
+        bool operator==(const FAstSourceIt& O) const { return S == O.S; }
+        bool operator!=(const FAstSourceIt& O) const { return S != O.S; }
     };
 #ifdef _WIN32
     /* cmd /c strips the first and last quote of a line that starts with one, so wrap it in a spare pair. */
-    FPipe Pipe{ _popen(("\"" + Cmd + "\"").c_str(), "rb") };
+    FILE* Pipe = _popen(("\"" + Cmd + "\"").c_str(), "rb");
 #else
-    FPipe Pipe{ popen(Cmd.c_str(), "r") };
+    FILE* Pipe = popen(Cmd.c_str(), "r");
 #endif
-    if (!Pipe.F) { *Err = "could not run clang"; return false; }
-    const bool bAny = Pipe.Fill();
-    FAstSax Sax(*Out);
-    const bool bParsed = bAny && Json::sax_parse(FPipeIt{ &Pipe }, FPipeIt{}, &Sax);
-    while (Pipe.Fill()) {}      // a parse that stopped early: clang waits on a full pipe, and closing it waits on clang
+    if (!Pipe) { *Err = "could not run clang"; return false; }
+    bool bParsed = false;
+    uint64 Total = 0;
+    /* Any exception, the reader's or the parse's, waits until the pipe is closed: thrown past pclose, it would leave
+       clang behind. */
+    std::exception_ptr Error;
+    try
+    {
+        FDumpStream Stream(Pipe);
+        FAstSource Src{ Stream };
+        FAstSax Sax(*Out);
+        bParsed = Src.Next() && Json::sax_parse(FAstSourceIt{ &Src }, FAstSourceIt{}, &Sax);
+        Stream.Stop();
+        Stream.RethrowReaderError();
+        Total = Stream.Total();
+    }
+    catch (...) { Error = std::current_exception(); }
+    /* Already at its end, unless the reader thread never started: clang would wait on a full pipe, and pclose on clang. */
+    for (char Rest[4096]; fread(Rest, 1, sizeof Rest, Pipe) != 0;) {}
 #ifdef _WIN32
-    const int Status = _pclose(Pipe.F);
+    const int Status = _pclose(Pipe);
 #else
-    const int Status = pclose(Pipe.F);
+    const int Status = pclose(Pipe);
 #endif
+    if (Error) std::rethrow_exception(Error);
     if (Status != 0) { *Err = "clang rejected " + SourcePath + " (diagnostics above)"; return false; }
-    if (!bAny) { *Err = "clang produced no AST for " + SourcePath; return false; }
+    if (Total == 0) { *Err = "clang produced no AST for " + SourcePath; return false; }
     if (!bParsed) { *Err = "could not parse clang's AST dump"; return false; }
     return true;
 }
