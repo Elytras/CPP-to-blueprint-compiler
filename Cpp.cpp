@@ -10805,8 +10805,26 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         else
             ScsNodeGuid(OwnerCls, Entry.first, NodeGuid);
         const FIndex OwnerClass = BP.EngineClass(OwnerPkg, OwnerCls);
+        /* The template's archetype is the NEAREST ancestor's template of its name: a mod class between this one and
+           Owner whose UE_DEFAULTS reach through the component has a record of its own, whose template GetArchetype
+           finds first (UObjectArchetype.cpp 83-108) and the loader builds this one from (AsyncLoading.cpp 2954-2964).
+           Archetyped on Owner's instead, a value only the class between sets would be lost here. */
+        auto Overrides = [&](const FRecord& A) {
+            const Json* Body = nullptr;
+            if (A.Defaults && !A.bIsPatch) ForEach(*A.Defaults, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Body = &C; });
+            bool bHit = false;
+            if (Body)
+                ForEach(*Body, [&](const Json& S) {
+                    const Json *Lhs = nullptr, *Rhs = nullptr, *Through = nullptr;
+                    bHit = bHit || (DefaultAssignment(S, Lhs, Rhs, Through) && Through && Name(*Through) == Entry.first);
+                });
+            return bHit;
+        };
+        FIndex ArchetypeClass = OwnerClass;
+        for (const FRecord* A = Find(R.Base); A && A != &Owner; A = A->Base.empty() ? nullptr : Find(A->Base))
+            if (Overrides(*A)) { ArchetypeClass = BP.EngineClass(PackageOf(*A), ClassOf(*A)); break; }
         BP.AddComponentOverride(VarName, BP.EngineClass(CR->UePackage, CR->UeName),
-                                BP.Subobject(CR->UePackage, CR->UeName, OwnerClass,
+                                BP.Subobject(CR->UePackage, CR->UeName, ArchetypeClass,
                                              VarName + "_GEN_VARIABLE"),
                                 OwnerClass, NodeGuid, Entry.second.Defaults, NativeTail(CR));
     }

@@ -5374,9 +5374,26 @@ def comp_tick_patch():
     print('ok  CompTickPatch: a patch that adds ReceiveTick sets the CDO\'s PrimaryActorTick.bCanEverTick, and it runs')
 
 
+def comp_override_chain():
+    """Three levels of one component's defaults fold as C++ constructors do: the grandchild's Lamp has ChainMid's
+    Intensity 250 and its own bVisible false, its override template archetyped on ChainMid's (the nearest one, which
+    GetArchetype finds by name) and built after it."""
+    folder = os.path.dirname(asset('CompOverrideChain'))
+    p, ci = class_pkg(os.path.join(folder, 'CompOverrideChain'))
+    lamp = template(p, ci, 'Lamp')
+    got = effective(p, lamp, 'Intensity'), effective(p, lamp, 'bVisible')
+    assert got == (250.0, 0), 'CompOverrideChain\'s Lamp loads Intensity, bVisible %s, want (250.0, 0)' % (got,)
+    e = p.exports[lamp]
+    assert p.path(e['tmpl']) == '/Game/_ElytrasMods/CompOverrideChain/ChainMid.ChainMid_C:Lamp_GEN_VARIABLE', p.path(e['tmpl'])
+    assert e['tmpl'] in e['deps'][2], e['deps']
+    for cls in ('CompOverrideChain', 'ChainMid', 'ChainBase'): keeps_invariants(os.path.join(folder, cls))
+    print('ok  CompOverrideChain: an override template is archetyped on the nearest ancestor\'s override, and loads its values')
+
+
 comp_tick()
 comp_tick_component()
 comp_tick_patch()
+comp_override_chain()
 
 
 # ---- Pending: what AssetGen does not do yet
@@ -5435,21 +5452,6 @@ def comp_root_keep():
     for cls in ('CompRootKeep', 'RigChar', 'RigSpot', 'RigBase'): keeps_invariants(os.path.join(folder, cls))
 
 
-def comp_override_chain():
-    """Three levels of one component's defaults fold as C++ constructors do: the grandchild's Lamp has ChainMid's
-    Intensity 250 and its own bVisible false, its override template archetyped on ChainMid's (the nearest one, which
-    GetArchetype finds by name) and built after it."""
-    folder = os.path.dirname(pending_asset('CompOverrideChain'))
-    p, ci = class_pkg(os.path.join(folder, 'CompOverrideChain'))
-    lamp = template(p, ci, 'Lamp')
-    got = effective(p, lamp, 'Intensity'), effective(p, lamp, 'bVisible')
-    assert got == (250.0, 0), 'CompOverrideChain\'s Lamp loads Intensity, bVisible %s, want (250.0, 0)' % (got,)
-    e = p.exports[lamp]
-    assert p.path(e['tmpl']) == '/Game/_ElytrasMods/CompOverrideChain/ChainMid.ChainMid_C:Lamp_GEN_VARIABLE', p.path(e['tmpl'])
-    assert e['tmpl'] in e['deps'][2], e['deps']
-    for cls in ('CompOverrideChain', 'ChainMid', 'ChainBase'): keeps_invariants(os.path.join(folder, cls))
-
-
 def comp_attach_inherited():
     """SetupAttachment in UE_DEFAULTS attaches an own component to an inherited one: the root node names the parent
     Blueprint's node and its class, or the native default subobject (CharacterMesh0 for ACharacter's Mesh)."""
@@ -5465,7 +5467,6 @@ def comp_attach_inherited():
 
 
 pending('CompRootKeep: a subclass\'s first scene component attaches to the inherited root and keeps its transform', comp_root_keep)
-pending('CompOverrideChain: an override template is archetyped on the nearest ancestor\'s override', comp_override_chain)
 pending('CompAttachInherited: an own component attached to an inherited Blueprint or native component', comp_attach_inherited)
 
 
