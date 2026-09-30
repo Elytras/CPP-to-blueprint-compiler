@@ -2405,6 +2405,8 @@ Notes:
 |---|---|---|
 | `SuperBase::ReceiveBeginPlay();` inside an override | Runs the parent's own implementation once and comes back: the editor's "Add call to parent function". Write the class you derive from; C++ has no `Super`. | Yes |
 | `AActor::ReceiveBeginPlay();` | Calls the engine's function. For a BlueprintImplementableEvent it does nothing, because there is no parent body. For a BlueprintNativeEvent it runs the C++ default. | Yes |
+| `SuperBase::Twice(1)` in a class that does not declare Twice | SuperBase's Twice, its body copied in: C++ runs that function without dispatch, so an object of a subclass that overrides Twice does not reach its own. | Yes |
+| The same call to a function whose body cannot be copied in: authority-only, cosmetic, an RPC, `noinline`, or one that waits | A call by name, with a warning: an object of a subclass that overrides the function runs its override. Blueprint calls a parent's function without dispatch only from a class that overrides it. Declare the method in your class too; then `Base::Method()` anywhere in the class runs Base's alone. | Warns |
 | `Other->SuperBase::Bump(1)` | Not what C++ does. The qualifier is recognised only on `this`, so this is a call by name that reaches Other's most derived Bump. | Not yet |
 
 ```cpp
@@ -5591,6 +5593,12 @@ and where the feature is described. In each group, the messages you are most lik
 - `only virtual member functions can be marked 'override'`: clang's message, for `override` on an event override,
   `void ReceiveTick(float DeltaSeconds) override`. UeApi declares engine functions non-virtual. Fix: leave `override`
   off. The name alone makes the override. See [Overrides and parent calls](#overrides-and-parent-calls).
+- `warning: <Class>::<Function>: <Base>::<Method>() is a call by name, which on an object of a subclass that
+  overrides <Method> runs that override; to run <Base>'s alone, call it from an override of <Method> in <Class>`:
+  a qualified call from a class that does not declare the method, to one whose body cannot be copied in
+  (authority-only, cosmetic, an RPC, `noinline`, one that waits). Fix: declare the method in the class, calling
+  `<Base>::<Method>()`; the qualified call then runs Base's function alone. See
+  [Calling the parent](#calling-the-parent).
 - `warning: <Class>::<Function>: <Callee>'s reference parameter <Parm> is bound to <What>: Blueprint has no reference
   to it, so <Parm> gets a copy, stored back after the call`: a `T&` parameter is bound to a place Blueprint cannot pass
   by reference. `<What>` is `a map element` (`Add5(M[K])`), `a map element's member`, `` `C ? X : Y` `` or

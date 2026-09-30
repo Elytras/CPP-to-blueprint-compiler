@@ -1364,6 +1364,9 @@ private:
 
     /* `X::StaticClass()`: the record X names, read back from the mod's sources (clang's JSON keeps no qualifier). */
     const FRecord* NamedQualifier(const Json& Ref) const;
+    /* `Base::Method()` on this: the record the qualifier names, read back the same way, else null. */
+    const FRecord* MemberQualifier(const Json& Member) const;
+    const std::vector<std::string>& ModSources() const;
     bool IsSubclassOf(const FRecord& Child, const FRecord& Parent) const;
     std::vector<uint8> NativeTail(const FRecord* Component) const;
     std::vector<const Json*> StructArgs(const Json& Value, const FRecord* R, const std::vector<std::string>& Fields) const;
@@ -4766,6 +4769,23 @@ std::vector<uint8> FCompiler::NativeTail(const FRecord* Component) const
     return Tail;
 }
 
+/* The mod directory's .h / .cpp sources, read on the first call. */
+const std::vector<std::string>& FCompiler::ModSources() const
+{
+    if (SourceTexts.empty())
+    {
+        std::error_code Ec;
+        for (const auto& E : std::filesystem::directory_iterator(SourceDir, Ec))
+        {
+            const std::string Ext = E.path().extension().string();
+            if (!E.is_regular_file() || (Ext != ".h" && Ext != ".hpp" && Ext != ".cpp")) continue;
+            std::ifstream F(E.path(), std::ios::binary);
+            SourceTexts.emplace_back(std::istreambuf_iterator<char>(F), std::istreambuf_iterator<char>());
+        }
+    }
+    return SourceTexts;
+}
+
 /* The qualifier token is where a qualified DeclRefExpr's range begins; the JSON gives its byte offset and length but
    not its file (that is only written when it changes, and Json's sorted keys lose the order). So each of the mod's own
    sources is tried at that offset, and a hit counts only when `<Record>::StaticClass` is what is written there.
@@ -4785,17 +4805,7 @@ const FRecord* FCompiler::NamedQualifier(const Json& Ref) const
     }
     if (!Begin.contains("offset") || !Begin.contains("tokLen")) return nullptr;
     const size_t Off = Begin["offset"].get<size_t>(), Len = Begin["tokLen"].get<size_t>();
-    if (SourceTexts.empty())
-    {
-        std::error_code Ec;
-        for (const auto& E : std::filesystem::directory_iterator(SourceDir, Ec))
-        {
-            const std::string Ext = E.path().extension().string();
-            if (!E.is_regular_file() || (Ext != ".h" && Ext != ".hpp" && Ext != ".cpp")) continue;
-            std::ifstream F(E.path(), std::ios::binary);
-            SourceTexts.emplace_back(std::istreambuf_iterator<char>(F), std::istreambuf_iterator<char>());
-        }
-    }
+    ModSources();
     if (End.is_null())
     {
         for (const std::string& T : SourceTexts)
@@ -4823,6 +4833,32 @@ const FRecord* FCompiler::NamedQualifier(const Json& Ref) const
     for (const std::string& T : SourceTexts)
         if (bBody && Off + Len <= T.size() && (Off == 0 || !Ident(T[Off - 1])) && (Off + Len == T.size() || !Ident(T[Off + Len])))
             if (const FRecord* R = Find(T.substr(Off, Len))) return R;
+    return nullptr;
+}
+
+/* A MemberExpr on an implicit this begins at its qualifier when it has one and at the member's own name when not
+   (clang's MemberExpr::getBeginLoc), so `QcParent::Plain()` is told from `Plain()` by what is written where its range
+   begins: `<Record>::<member>`, tried in each of the mod's sources as NamedQualifier does.
+   ponytail: `this->QcParent::Plain()` begins at `this` and a qualifier written in a macro has spelling locations; both
+   read as unqualified, a call by name. */
+const FRecord* FCompiler::MemberQualifier(const Json& Member) const
+{
+    const Json Begin = Member.value("range", Json::object()).value("begin", Json::object());
+    if (!Begin.contains("offset") || !Begin.contains("tokLen")) return nullptr;
+    const size_t Off = Begin["offset"].get<size_t>(), Len = Begin["tokLen"].get<size_t>();
+    const std::string Method = Member.value("name", std::string());
+    for (const std::string& T : ModSources())
+    {
+        if (Off + Len > T.size()) continue;
+        size_t P = Off + Len;
+        while (P < T.size() && (T[P] == ' ' || T[P] == '\t')) ++P;
+        if (T.compare(P, 2, "::") != 0) continue;
+        P += 2;
+        while (P < T.size() && (T[P] == ' ' || T[P] == '\t')) ++P;
+        if (T.compare(P, Method.size(), Method) != 0) continue;
+        if (P + Method.size() < T.size() && (std::isalnum(uint8(T[P + Method.size()])) || T[P + Method.size()] == '_')) continue;
+        if (const FRecord* R = Find(T.substr(Off, Len))) return R;
+    }
     return nullptr;
 }
 
@@ -5310,14 +5346,17 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         if (!InlineStack.empty())
             if (auto O = MethodOwner.find(InlineStack.back()->value("id", std::string())); O != MethodOwner.end())
                 Written = Find(O->second);
-        bool bParentCall = false;
+        bool bParentCall = false, bQualified = false;
         if (Written && R != Written && Kind(CallExprNode) == "CXXMemberCallExpr")
         {
             const Json* Callee = Strip(First(CallExprNode));
             const Json* Obj = Callee ? Strip(First(*Callee)) : nullptr;
             if (Obj && Kind(*Obj) == "CXXThisExpr")
+            {
                 for (const FRecord* A = Written; A && A != R && !bParentCall; A = A->Base.empty() ? nullptr : Find(A->Base))
                     bParentCall = A->Methods.count(MethodName) != 0;
+                bQualified = !bParentCall && !R->IsNative() && MemberQualifier(*Callee);
+            }
         }
         /* `final` (FinalOwner): the one version of the method every object the call can run on reaches, called as
            that function instead of by name. On `this` the class asked is the one being compiled, not the one the call
@@ -5353,6 +5392,21 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         if (const FRecord* In = bStatic || bParentCall ? R : Bound; In && bOnThis && !Out.bReceiverIsArg && CurLocals)
             if (const Json* Def = Expandable(*In, MethodName, CallExprNode, FullDecl))
                 return ExpandInline(CallExprNode, *Def, In->CppName + "::" + MethodName, true, BP, Out, Err, nullptr, bStatic);
+        /* `QcParent::Plain()` from a class that does not declare Plain: C++ runs QcParent's without dispatch, where by
+           name an object of a subclass that overrides Plain runs its own. Its body copied in is exactly that. A call
+           bound to it is not a Blueprint's: the editor calls a parent's function without dispatch only from an override
+           of it (K2Node_CallParentFunction), and binds no other call to a function a subclass can override (the
+           call_opcode_flags rule); so one that cannot be copied in (authority-only, an RPC, noinline) stays a call by
+           name, with a warning. */
+        if (bQualified && Bound != R)
+        {
+            if (const Json* Def = bOnThis && !Out.bReceiverIsArg && CurLocals ? Expandable(*R, MethodName, CallExprNode, FullDecl) : nullptr)
+                return ExpandInline(CallExprNode, *Def, R->CppName + "::" + MethodName, true, BP, Out, Err);
+            printf("  warning: %s::%s: %s::%s() is a call by name, which on an object of a subclass that overrides %s runs "
+                   "that override; to run %s's alone, call it from an override of %s in %s\n", Cur->CppName.c_str(),
+                   CurFnName.c_str(), R->CppName.c_str(), MethodName.c_str(), MethodName.c_str(), R->CppName.c_str(),
+                   MethodName.c_str(), Written->CppName.c_str());
+        }
 
         const std::string CalleePackage = PackageOf(*Called), CalleeName = ClassOf(*Called);
         Out.Fn = BP.EngineFunction(CalleePackage, CalleeName, UeNameOf(Called, MethodName));
@@ -11465,7 +11519,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
 }
 
 /* Builds the DOM of clang's AST dump as it streams in, without what nothing reads: source locations (all but a
-   DeclRefExpr's range begin offset and token length, and its end's in a macro, see NamedQualifier), mangled names, a record's definitionData and
+   DeclRefExpr's or MemberExpr's range begin offset and token length, and its end's in a macro, see NamedQualifier and
+   MemberQualifier), mangled names, a record's definitionData and
    a few flags are most of the dump, and building them was most of a compile. A key read later must not be in key(). */
 class FAstSax : public nlohmann::json_sax<Json>
 {
@@ -11478,7 +11533,7 @@ public:
     bool number_float(number_float_t V, const string_t&) override { return Value(V); }
     bool string(string_t& V) override
     {
-        if (bKindNext && !Skipped) DeclRef.back() = V == "DeclRefExpr";   // clang writes "kind" before "range"
+        if (bKindNext && !Skipped) DeclRef.back() = V == "DeclRefExpr" || V == "MemberExpr";   // "kind" comes before "range"
         return Value(std::move(V));
     }
     bool binary(binary_t& V) override { return Value(std::move(V)); }
@@ -11489,7 +11544,7 @@ public:
     bool key(string_t& K) override
     {
         if (Skipped) return true;
-        /* A spellingLoc only gets here inside a DeclRefExpr's range (every other loc and range is skipped whole); the
+        /* A spellingLoc only gets here inside a DeclRefExpr's or MemberExpr's range (every other loc and range is skipped whole); the
            range's end is kept only then, for a qualifier written in a macro (NamedQualifier). */
         const bool bMacroEnd = K == "end" && Stack.back()->is_object() && Stack.back()->contains("begin")
                             && (*Stack.back())["begin"].contains("spellingLoc");
