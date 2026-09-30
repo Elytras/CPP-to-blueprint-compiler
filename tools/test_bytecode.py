@@ -150,7 +150,6 @@ KNOWN_RULES = {     # sweep rules the suite's own packages still break, each wit
                                  'guessed from ancestry) instead of taken from the parent',
     'edl_class_closure': "a BPGC's UberGraphFunction and InheritableComponentHandler are not serialized before the class",
     'edl_create_prereqs': 'a native default-subobject override export has TemplateIndex 0',
-    'edl_payload_created': 'objects named only in payloads are in no preload list, so they can resolve to null',
     'edl_property_types': 'UDS/UDE property types are never serialized before what they type',
     'edl_super_serialized': "an override's /Game parent function is created, never serialized, before the override",
     'export_archetype': 'native default-subobject overrides have a null TemplateIndex',
@@ -3167,8 +3166,8 @@ outer_runs()
 # A cooked package tells the event-driven loader, per export, what must be created or serialized before the export is
 # created or serialized (AsyncLoading.cpp 2447-2499). The edl_* rules read that graph and ask what the loader fetches
 # with bCheckSerialized, and what a payload names, is ordered before it: they hold on every package of the game's own
-# content. PreloadChain is what AssetGen orders today; each pending mod below carries a kind of dependency it does not
-# order yet, and its test asserts the order the engine needs.
+# content. Each mod below carries a kind of dependency, and its test asserts the order the engine needs; a pending one
+# is a kind AssetGen does not order yet.
 
 import invariants
 from invariant_rules import preload as EDL
@@ -3211,6 +3210,28 @@ def preload_chain():
 preload_chain()
 
 
+def preload_refs():
+    """PreloadRefs' payloads name UPreloadProbe_C as NewObject's class constant (Make) and as Probe's property class,
+    OnPing's signature as Broadcast's target (Ping), and the engine cylinder as Mesh's template default. Each is created
+    before the export naming it is serialized, or it loads as null: the writer lists every object a payload names, as
+    the cook's DependsMap does. First, that each payload does name what the source says it does."""
+    base = asset('PreloadRefs')
+    pkg = invariants.Package(base)
+
+    def named(export):
+        return {pkg.path(r) for _, r in EDL.edl_payload_refs(pkg, pkg.find(export)) if EDL.edl_in_range(pkg, r)}
+    probe = '/Game/_ElytrasMods/PreloadRefs/UPreloadProbe.UPreloadProbe_C'
+    for export, want in (('Make', probe), ('PreloadRefs_C', probe),
+                         ('Ping', '/Game/_ElytrasMods/PreloadRefs/PreloadRefs.PreloadRefs_C:OnPing__DelegateSignature'),
+                         ('Mesh_GEN_VARIABLE', '/Engine/BasicShapes/Cylinder.Cylinder')):
+        assert want in named(export), '%s does not name %s: %s' % (export, want, sorted(named(export)))
+    keeps_edl(base, ['edl_payload_created'])
+
+
+preload_refs()
+print("ok  PreloadRefs: a class constant, a property's class, a Broadcast target and a template default are created first")
+
+
 # ---- Pending: the preload dependencies AssetGen leaves out
 
 def preload_override():
@@ -3251,24 +3272,6 @@ def preload_types():
     members: each owner is serialized after the type it links against."""
     base = pending_asset('PreloadTypes')
     keeps_edl(base, ['edl_property_types'])
-
-
-def preload_refs():
-    """PreloadRefs' payloads name UPreloadProbe_C as NewObject's class constant (Make) and as Probe's property class,
-    OnPing's signature as Broadcast's target (Ping), and the engine cylinder as Mesh's template default. Each is created
-    before the export naming it is serialized, or it loads as null. The class orders Probe's class today; Make, Ping
-    and the template order nothing they name. First, that each payload does name what the source says it does."""
-    base = pending_asset('PreloadRefs')
-    pkg = invariants.Package(base)
-
-    def named(export):
-        return {pkg.path(r) for _, r in EDL.edl_payload_refs(pkg, pkg.find(export)) if EDL.edl_in_range(pkg, r)}
-    probe = '/Game/_ElytrasMods/PreloadRefs/UPreloadProbe.UPreloadProbe_C'
-    for export, want in (('Make', probe), ('PreloadRefs_C', probe),
-                         ('Ping', '/Game/_ElytrasMods/PreloadRefs/PreloadRefs.PreloadRefs_C:OnPing__DelegateSignature'),
-                         ('Mesh_GEN_VARIABLE', '/Engine/BasicShapes/Cylinder.Cylinder')):
-        assert want in named(export), '%s does not name %s: %s' % (export, want, sorted(named(export)))
-    keeps_edl(base, ['edl_payload_created'])
 
 
 def preload_ich():
@@ -3327,7 +3330,6 @@ pending('PreloadOverride: an override is serialized after its Blueprint parent f
 pending('PreloadUber: the class is serialized after its ubergraph function', preload_uber_class)
 pending('PreloadUber: a function that enters the ubergraph has it created before it is serialized', preload_uber_calls)
 pending('PreloadTypes: a user-defined struct or enum is serialized before the class, function or struct typed by it', preload_types)
-pending('PreloadRefs: every object a payload names is created before the payload is serialized', preload_refs)
 pending('PreloadIch: the class is serialized after its InheritableComponentHandler', preload_ich)
 pending('PreloadDso: a restated native subobject has its archetype as TemplateIndex', preload_dso)
 pending('PreloadDso: a child\'s subobject override is archetyped on the parent\'s, serialized before it and the child class',

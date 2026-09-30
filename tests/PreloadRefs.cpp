@@ -4,7 +4,7 @@
 #include "UeApi/FSD.h"
 #include "UeAssets/UStaticMesh.h"
 
-#include "../../include/Objects.h" // NewObject, by its path from this file
+#include "../include/Objects.h" // NewObject, by its path from this file
 
 UE_MOD_PACKAGE("/Game/_ElytrasMods/PreloadRefs");
 
@@ -12,7 +12,7 @@ UE_MOD_PACKAGE("/Game/_ElytrasMods/PreloadRefs");
 Objects a payload names: a mod class as a bytecode constant (NewObject's class in Make) and as a property's class
 (Probe), a dispatcher's signature as the target of its Broadcast (Ping), and an engine mesh as a component template's
 default. While an export is serialized the loader resolves each as whatever is already created, so each must be
-created first. The class orders Probe's class; Make, Ping and the template order nothing they name.
+created first: every export lists what its payload names as create-before-serialize, as the cook's DependsMap does.
 */
 class UPreloadProbe : public UObject {
 public:
