@@ -5128,25 +5128,22 @@ def scs_shapes():
           'its variable with the nearest class\'s defaults')
 
 
-scs_shapes()
-
-
-# ---- Pending: what AssetGen does not do yet
-
 def scs_no_scene_root():
     """An actor whose only own component is not a scene component still ends its construction with a root:
     ExecuteScriptOnActor makes one only when RootNodes is empty, so the SCS must list a scene root (the editor keeps its
     DefaultSceneRoot node in RootNodes until another scene component takes its place). A root node listed for this is a
     node like any other to keeps_invariants: in AllNodes too, with its own VariableGuid (what a subclass's override of
     it is keyed on); it needs no variable."""
-    b = pending_asset('ScsNoSceneRoot')
+    b = asset('ScsNoSceneRoot')
     root, attach, made, stored = construct(b)
     assert 'Spinner' in made and stored['Spinner'], (sorted(made), stored)
     assert root is not None, 'ScsNoSceneRoot_C ends its construction scripts without a RootComponent (it constructs only %s)' % sorted(made)
     keeps_invariants(b)
+    print('ok  ScsNoSceneRoot: an actor whose only component is not a scene component gets the default scene root')
 
 
-pending('ScsNoSceneRoot: an actor whose only component is not a scene component gets a root', scs_no_scene_root)
+scs_shapes()
+scs_no_scene_root()
 
 
 # ---- Refusals the compiler does not make yet: a CreationMethod of Instance on a template, or anything but Native on a

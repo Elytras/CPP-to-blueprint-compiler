@@ -408,6 +408,16 @@ void FBlueprintClass::Finish()
     const FIndex ScsNodeCdo = ClassDefaultObject("/Script/Engine", "SCS_Node");
     const FIndex ScsCdo = ClassDefaultObject("/Script/Engine", "SimpleConstructionScript");
 
+    /* Components, none of them a scene component: the DefaultSceneRoot node stays listed, first, as the editor keeps it
+       until a scene component can take its place. ExecuteScriptOnActor makes a root of its own only when RootNodes is
+       empty (SimpleConstructionScript.cpp 640-703), so an actor of movement components alone would otherwise end its
+       construction with no RootComponent; one that inherits a root skips this node (648). Listed, it is a node like any
+       other: its own VariableGuid is what a subclass's override of it is keyed on. */
+    const bool bKeepDefaultRoot = !Components.empty()
+                                  && std::none_of(Components.begin(), Components.end(), [](const FComponent& C) { return C.bIsScene; });
+    uint32 DefaultRootGuid[4];
+    ScsNodeGuid(ClassName, "DefaultSceneRoot", DefaultRootGuid);
+
     FExport RootTemplate;
     RootTemplate.ClassIndex = SceneCompClass;
     RootTemplate.TemplateIndex = SceneCompCdo;
@@ -433,6 +443,8 @@ void FBlueprintClass::Finish()
         Tag(Ar, "ComponentClass", "ObjectProperty", [=](FArc& V) { V.Idx(SceneCompClass); });
         Tag(Ar, "ComponentTemplate", "ObjectProperty",
             [=](FArc& V) { V.Idx(Exp(RowRootTemplate)); });
+        if (bKeepDefaultRoot)
+            Tag(Ar, "VariableGuid", "StructProperty", [=](FArc& V) { V.Raw(DefaultRootGuid, 16); }, "Guid");
         Tag(Ar, "InternalVariableName", "NameProperty",
             [](FArc& V) { V.Name("DefaultSceneRoot"); });
         TagEnd(Ar);
@@ -520,23 +532,26 @@ void FBlueprintClass::Finish()
         Scs.CreateBeforeSer.push_back(Exp(RowFirstComponent + 2 * int32(I) + 1).V);
     Scs.SerBeforeCreate = { ScsClass.V, ScsCdo.V };
     Scs.CreateBeforeCreate = { Exp(RowClass).V };
-    const int32 NumComponents = int32(Components.size());
-    std::vector<FIndex> Roots;                 // everything but the first scene component's children
+    std::vector<FIndex> Roots, All;            // Roots: everything but the first scene component's children
+    if (bKeepDefaultRoot) { Roots.push_back(Exp(RowScsNode)); All.push_back(Exp(RowScsNode)); }
     for (size_t I = 0; I < Components.size(); ++I)
+    {
         if (!Components[I].bIsScene || int32(I) == FirstScene) Roots.push_back(Exp(RowFirstComponent + 2 * int32(I) + 1));
+        All.push_back(Exp(RowFirstComponent + 2 * int32(I) + 1));
+    }
     Scs.Serialize = [=](FArc& Ar) {
         /* DefaultSceneRoot stays declared but drops out of both lists once a component can be the
-           root, exactly as Ene_Butterfly saves it; with no components at all the lists are absent
-           and ExecuteScriptOnActor makes its own root. */
-        if (NumComponents > 0)
+           root, exactly as Ene_Butterfly saves it (while none can, it is in both: bKeepDefaultRoot);
+           with no components at all the lists are absent and ExecuteScriptOnActor makes its own root. */
+        if (!All.empty())
         {
             Tag(Ar, "RootNodes", "ArrayProperty", [=](FArc& V) {
                 V.I32(int32(Roots.size()));
                 for (const FIndex& Root : Roots) V.Idx(Root);
             }, "ObjectProperty");
             Tag(Ar, "AllNodes", "ArrayProperty", [=](FArc& V) {
-                V.I32(NumComponents);
-                for (int32 I = 0; I < NumComponents; ++I) V.Idx(Exp(RowFirstComponent + 2 * I + 1));
+                V.I32(int32(All.size()));
+                for (const FIndex& Node : All) V.Idx(Node);
             }, "ObjectProperty");
         }
         Tag(Ar, "DefaultSceneRootNode", "ObjectProperty",
