@@ -149,12 +149,9 @@ KNOWN_RULES = {     # sweep rules the suite's own packages still break, each wit
     'class_tail_follows_parent': 'the class tail is hard-coded (ClassWithin Object, ClassConfigName Engine, ClassFlags '
                                  'guessed from ancestry) instead of taken from the parent',
     'edl_class_closure': "a BPGC's UberGraphFunction and InheritableComponentHandler are not serialized before the class",
-    'edl_create_prereqs': 'a native default-subobject override export has TemplateIndex 0',
     'edl_payload_created': 'objects named only in payloads are in no preload list, so they can resolve to null',
     'edl_property_types': 'UDS/UDE property types are never serialized before what they type',
     'edl_super_serialized': "an override's /Game parent function is created, never serialized, before the override",
-    'export_archetype': 'native default-subobject overrides have a null TemplateIndex',
-    'import_chains': 'packages import themselves (their own package, class and functions)',
     'native_out_arrays_emptied': "a native's out TArray is not emptied before the call, so Set_ToArray appends",
 }
 
@@ -3305,6 +3302,7 @@ def preload_dso():
     pkg, k = preload_dso_template('PreloadDsoBase', '/Script/Engine.Default__Character:CollisionCylinder')
     found = invariants.check(pkg, {'edl_create_prereqs'})
     assert not found, '; '.join('%s %s: %s' % f for f in found[:3])
+    print('ok  PreloadDso: a restated native subobject names Default__Character:CollisionCylinder as its TemplateIndex')
 
 
 def preload_dso_chain():
@@ -3334,7 +3332,7 @@ pending('PreloadUber: a function that enters the ubergraph has it created before
 pending('PreloadTypes: a user-defined struct or enum is serialized before the class, function or struct typed by it', preload_types)
 pending('PreloadRefs: every object a payload names is created before the payload is serialized', preload_refs)
 pending('PreloadIch: the class is serialized after its InheritableComponentHandler', preload_ich)
-pending('PreloadDso: a restated native subobject has its archetype as TemplateIndex', preload_dso)
+preload_dso()       # its mod stays in tests/pending for the two PreloadDso gaps below
 pending('PreloadDso: a child\'s subobject override is archetyped on the parent\'s, serialized before it and the child class',
         preload_dso_chain)
 pending('PreloadDso: a child class is serialized after every default subobject its Blueprint parent\'s CDO exports',
@@ -3405,28 +3403,36 @@ def subobject_template():
         assert imps['/Script/Engine.Default__Character:' + sub] == cls, imps
     assert imps['/Script/Engine.Default__Character'] == '/Script/Engine.Character', imps
     keeps_invariants(b)
+    print("ok  OverrideTest Walker: each default-subobject override names Default__Character's subobject as its archetype")
 
 
 def subobject_chain():
     """SubobjectChain: the base's override stands on Default__Character's CollisionCylinder, the kid's on the base's
-    own override - a /Game object, so the kid's export also waits for it to be serialized before it is created."""
-    kid, base = pending_asset('SubobjectChain'), pending_asset('SubobjectChain', 'SubobjectChainBase')
+    own override - a /Game object, so the kid's export also waits for it to be serialized before it is created. The
+    middle class restates nothing, yet exports the capsule the tip's override stands on."""
+    kid = asset('SubobjectChain')
+    base, mid, tip = (os.path.join(os.path.dirname(kid), 'SubobjectChain' + c) for c in ('Base', 'Mid', 'Tip'))
     for b, want in ((base, '/Script/Engine.Default__Character:CollisionCylinder'),
-                    (kid, '/Game/_ElytrasMods/SubobjectChain/SubobjectChainBase.Default__SubobjectChainBase_C:CollisionCylinder')):
+                    (kid, '/Game/_ElytrasMods/SubobjectChain/SubobjectChainBase.Default__SubobjectChainBase_C:CollisionCylinder'),
+                    (mid, '/Script/Engine.Default__Character:CollisionCylinder'),
+                    (tip, '/Game/_ElytrasMods/SubobjectChain/SubobjectChainMid.Default__SubobjectChainMid_C:CollisionCylinder')):
         e = dumpexp.load(b)[5][exports_of(b).index('CollisionCylinder')]
         got = ref(b, e['tmpl']) if e['tmpl'] else 'a null template'
         assert got == want, (os.path.basename(b), got)
         assert dict(import_paths(b, classes=True))[want] == '/Script/Engine.CapsuleComponent'
-    k = exports_of(kid).index('CollisionCylinder')
-    assert dumpexp.load(kid)[5][k]['tmpl'] in dumpexp.preload(kid)[k][2], 'the template is not serialized before create'
-    keeps_invariants(base)
-    keeps_invariants(kid)
+    for b in (kid, tip):
+        k = exports_of(b).index('CollisionCylinder')
+        assert dumpexp.load(b)[5][k]['tmpl'] in dumpexp.preload(b)[k][2], 'the template is not serialized before create'
+    for b in (base, kid, mid, tip):
+        keeps_invariants(b)
+    print("ok  SubobjectChain: an override's archetype is the parent CDO's subobject of its name, a /Game one serialized "
+          "before create; a parent that leaves it alone exports it for its subclass")
 
 
 def self_ref_import():
     """SelfRefImport: a member of the mod's own class and a call to its own function on another instance reference
     this package's exports, never an import of the package itself."""
-    b = pending_asset('SelfRefImport')
+    b = asset('SelfRefImport')
     own = '/game/_elytrasmods/selfrefimport/selfrefimport'
     selfs = [p for p in import_paths(b) if p.lower() == own or p.lower().startswith(own + '.')]
     assert not selfs, 'imports of itself: %s' % selfs
@@ -3434,6 +3440,7 @@ def self_ref_import():
     peer = next(p for p in pkg.struct(pkg.find('SelfRefImport_C')).props if p.name == 'Peer')
     assert peer.ref > 0 and pkg.exports[peer.ref - 1]['name'] == 'SelfRefImport_C', pkg.path(peer.ref)
     keeps_invariants(b)
+    print('ok  SelfRefImport: its own class and function are named as its exports, never through an import of itself')
 
 
 ABSTRACT_CLASS = 'class UPureDef : public UPrimaryDataAsset {\npublic:\n  virtual int32 Pure() = 0;\n};\n'
@@ -3610,10 +3617,9 @@ def tables_rules_fire():
 
 name_numbers()
 name_suffix()
-pending("OverrideTest Walker: a default-subobject override names its parent CDO's subobject as its archetype", subobject_template)
-pending("SubobjectChain: an override's archetype is the same-named subobject of the parent CDO, a /Game one serialized before create",
-        subobject_chain)
-pending('SelfRefImport: a package refers to its own objects as exports, never through an import of itself', self_ref_import)
+subobject_template()
+subobject_chain()
+self_ref_import()
 abstract_instances()
 refused('AbstractComp', '  UE_COMPONENT(UPureComp, Comp);\n', 'abstract', top=ABSTRACT_COMP)
 print('ok  AbstractComp: a component of an abstract mod class is refused, naming it abstract')

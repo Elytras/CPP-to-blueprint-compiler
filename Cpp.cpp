@@ -1143,6 +1143,9 @@ public:
 private:
     bool Collect(std::string* Err);
     bool Generate(const FRecord& R, const std::string& OutDir, std::string* Err);
+    /* The native default subobjects a class's UE_DEFAULTS restates: each component member -> the record declaring it. */
+    std::map<std::string, const FRecord*> RestatedSubobjects(const FRecord& R) const;
+    std::map<std::string, const FRecord*> SubobjectsRestatedBelow(const FRecord& R) const;
     /* S38: UE_ASSET_EDIT and UE_PATCH, the game's own packages with only the named tags changed. */
     bool GenerateEdit(const std::string& Key, const Json& Var, std::string* Err);
     bool GeneratePatch(const FRecord& R, std::string* Err);
@@ -11550,6 +11553,46 @@ bool FCompiler::GenerateNestedWrappers(const std::string& OutDir, std::string* E
     return true;
 }
 
+/* The members of R's UE_DEFAULTS statements `Comp->Field = value;` whose Comp a native class declares - a default
+   subobject, which Generate overrides by an export under the CDO - each with that class. Generate classifies every
+   statement and refuses the malformed ones; this only reads which subobjects a class restates, for its parents. */
+std::map<std::string, const FRecord*> FCompiler::RestatedSubobjects(const FRecord& R) const
+{
+    std::map<std::string, const FRecord*> Out;
+    if (!R.Defaults || R.bIsPatch) return Out;
+    const Json* Body = nullptr;
+    ForEach(*R.Defaults, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Body = &C; });
+    if (!Body) return Out;
+    ForEach(*Body, [&](const Json& S) {
+        const Json *Lhs = nullptr, *Rhs = nullptr, *Through = nullptr;
+        if (!DefaultAssignment(S, Lhs, Rhs, Through) || !Through) return;
+        const auto Owner = FieldOwner.find(Through->value("referencedMemberDecl", std::string()));
+        const FRecord* DR = Owner == FieldOwner.end() ? nullptr : Find(Owner->second);
+        const bool bBlueprint = DR && DR->UeName.size() > 2 && DR->UeName.compare(DR->UeName.size() - 2, 2, "_C") == 0;
+        if (DR && DR->IsNative() && !bBlueprint) Out.emplace(Name(*Through), DR);
+    });
+    return Out;
+}
+
+/* RestatedSubobjects of every class cooked here below R, its subclasses and theirs. R's CDO exports these too, so that
+   their overrides' archetype imports find an export: what R's package holds under its CDO is RestatedSubobjects(R) and
+   this. */
+std::map<std::string, const FRecord*> FCompiler::SubobjectsRestatedBelow(const FRecord& R) const
+{
+    std::map<std::string, const FRecord*> Out;
+    if (R.bIsPatch) return Out;
+    for (const auto& Entry : Records)
+    {
+        const FRecord& Below = Entry.second;
+        bool bBelow = false;
+        for (const FRecord* A = Below.IsNative() || Below.Base.empty() ? nullptr : Find(Below.Base); A && !bBelow;
+             A = A->Base.empty() ? nullptr : Find(A->Base))
+            bBelow = A == &R;
+        if (bBelow) Out.merge(RestatedSubobjects(Below));
+    }
+    return Out;
+}
+
 bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::string* Err)
 {
     const FRecord* B = Find(R.Base);
@@ -12037,6 +12080,12 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
        a subclass can swap the class (APlayerCharacter's CharMoveComp). The nearest engine class's CDO says which. */
     const FRecord* EngineParent = Find(R.Base);
     while (EngineParent && EngineParent->UePackage.compare(0, 8, "/Script/") != 0) EngineParent = Find(EngineParent->Base);
+    /* A subclass cooked here that restates a default subobject this class leaves alone has its override archetyped on
+       this CDO's subobject of that name (Blueprint.cpp), an import that only finds an export (AsyncLoading.cpp
+       2075-2129). So this class exports it too, with no tags - the cook exports every default subobject of a
+       Blueprint's CDO. */
+    for (const auto& [Member, Declarer] : SubobjectsRestatedBelow(R))
+        if (!SubobjectDefaults.count(Member)) SubobjectDefaults[Member].Owner = Declarer;
     for (const auto& Entry : SubobjectDefaults)
     {
         const std::string* Sub = nullptr;
@@ -12046,6 +12095,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         const size_t Dot = Sub ? Sub->rfind('.') : std::string::npos;
         if (Space == std::string::npos || Dot == std::string::npos || Dot < Space)
         {
+            if (Entry.second.Defaults.empty()) continue;         // only a subclass restates it: its own compile says so
             *Err = R.CppName + "::UE_DEFAULTS: UeApi does not say which default subobject " + Entry.first + " is on "
                    + (EngineParent ? EngineParent->UeName : R.Base) + " - regenerate it with genueapi, which reads that off the object dump";
             return false;
