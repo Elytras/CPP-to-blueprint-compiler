@@ -5425,10 +5425,12 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         break;
     }
     /* What the engine will not make, when the call names the class (`X::StaticClass()`, through an inline helper's
-       parameter too): SpawnActor of an abstract class returns None (LevelActor.cpp 338-342), and SpawnObject makes one
-       only in a Shipping game, asserting in a Development one (UObjectGlobals.cpp 2362; the editor's Construct Object
-       node refuses the class, K2Node_GenericCreateObject.cpp 13-64). SpawnObject with no Outer returns None
-       (GameplayStatics.cpp 606-627). Each is a warning at the function, as the value may be read nowhere. */
+       parameter too). SpawnActor of an abstract class returns None (LevelActor.cpp 338-342), and SpawnObject with no
+       Outer returns None (GameplayStatics.cpp 606-627): each a warning at the function, as the value may be read
+       nowhere. SpawnObject of an abstract class is refused: it ends in NewObject, whose allocation holds that "it is
+       illegal to create an abstract class" - asserting in a Development game, compiled out of a Shipping one, which
+       makes it (UObjectGlobals.cpp 2362) - and the editor's Construct Object node refuses the class
+       (K2Node_GenericCreateObject.cpp 13-64). */
     const bool bSpawns = MethodName == "BeginDeferredActorSpawnFromClass" || MethodName == "BeginSpawningActorFromClass";
     if ((bSpawns || MethodName == "SpawnObject") && Cur && Out.Args.size() == Parms.size())
         for (size_t I = 0; I < Parms.size(); ++I)
@@ -5437,10 +5439,15 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
             const std::string Where = Cur->CppName + "::" + CurFnName;
             const auto Held = A.K == FArgIR::Local ? LocalClass.find(A.S) : LocalClass.end();
             const FRecord* Named = A.K == FArgIR::ObjConst ? A.Class : Held != LocalClass.end() ? Held->second : nullptr;
+            if (Named && IsAbstract(*Named) && !bSpawns)
+            {
+                *Err = CurFnName + ": " + Named->CppName + " is an abstract class (a method of it is `= 0`), which the engine "
+                       "may not construct (a Development game asserts): construct a subclass";
+                return false;
+            }
             if (Named && IsAbstract(*Named) && WarnedMakes.insert(Where + " " + Named->CppName).second)
-                printf("  warning: %s: %s is an abstract class (a method of it is `= 0`), %s\n", Where.c_str(),
-                       Named->CppName.c_str(), bSpawns ? "and the engine spawns no actor of one: the spawn returns None"
-                       : "which SpawnObject makes only in a Shipping game (a Development one asserts): construct a subclass");
+                printf("  warning: %s: %s is an abstract class (a method of it is `= 0`), and the engine spawns no actor "
+                       "of one: the spawn returns None\n", Where.c_str(), Named->CppName.c_str());
             if (!bSpawns && Parms[I].compare(0, 5, "Outer") == 0 && A.K == FArgIR::NullObj && WarnedMakes.insert(Where + " Outer").second)
                 printf("  warning: %s: SpawnObject with no Outer (None) makes nothing and returns None: pass the object "
                        "that owns it, such as this\n", Where.c_str());

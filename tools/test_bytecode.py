@@ -6325,15 +6325,19 @@ def deferred_left():
 
 
 def spawn_abstract():
-    """SpawnActor of an abstract class returns None (LevelActor.cpp 333-347); SpawnObject of one makes it quietly in
-    Shipping and asserts in Development (UObjectGlobals.cpp 2362); SpawnObject with no Outer returns None
-    (GameplayStatics.cpp 606-627). Each call is warned about at the function that makes it; the abstract ones saying
-    so (the word, not the class name, which has it too)."""
+    """SpawnActor of an abstract class returns None (LevelActor.cpp 333-347); SpawnObject with no Outer returns None
+    (GameplayStatics.cpp 606-627). Each call is warned about at the function that makes it; the abstract one saying so
+    (the word, not the class name, which has it too). SpawnObject of an abstract class is refused: it makes one quietly
+    in Shipping and asserts in Development (UObjectGlobals.cpp 2362), which uber_spawn_class_operands holds every
+    package to, and the editor's Construct Object node refuses the class (K2Node_GenericCreateObject.cpp 13-64)."""
     log = LOGS['SpawnAbstract']
-    for fn, what in (('SpawnShape', r'\babstract\b'), ('MakeSpec', r'\babstract\b'), ('MakeOuterless', r'\bouter\b|\bNone\b')):
+    for fn, what in (('SpawnShape', r'\babstract\b'), ('MakeOuterless', r'\bouter\b|\bNone\b')):
         assert said(log, r'SpawnAbstract::%s\b' % fn, what), 'nothing said at %s: %s' % (fn, ' | '.join(log.strip().splitlines()))
-    print('ok  SpawnAbstract: spawning an abstract actor class, constructing an abstract object class and constructing '
-          'with no Outer each warn at the function')
+    refused('SpawnAbstractSpec', '  void MakeSpec() { NewObject<UAbstractSpec>(this); }\n',
+            'MakeSpec: UAbstractSpec is an abstract class',
+            OBJECTS + 'class UAbstractSpec : public UObject {\npublic:\n  virtual int32 N() = 0;\n};\n')
+    print('ok  SpawnAbstract: spawning an abstract actor class and constructing with no Outer each warn at the '
+          'function; constructing an abstract object class is refused')
 
 
 def wait_hold():
