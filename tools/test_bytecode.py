@@ -148,10 +148,6 @@ GAPS, FIXED, REFUSALS = [], [], {}
 KNOWN_RULES = {     # sweep rules the suite's own packages still break, each with the AssetGen defect (TODO.md, S33)
     'class_tail_follows_parent': 'the class tail is hard-coded (ClassWithin Object, ClassConfigName Engine, ClassFlags '
                                  'guessed from ancestry) instead of taken from the parent',
-    'edl_class_closure': "a BPGC's UberGraphFunction and InheritableComponentHandler are not serialized before the class",
-    'edl_payload_created': 'objects named only in payloads are in no preload list, so they can resolve to null',
-    'edl_property_types': 'UDS/UDE property types are never serialized before what they type',
-    'edl_super_serialized': "an override's /Game parent function is created, never serialized, before the override",
     'native_out_arrays_emptied': "a native's out TArray is not emptied before the call, so Set_ToArray appends",
 }
 
@@ -3169,8 +3165,8 @@ outer_runs()
 # A cooked package tells the event-driven loader, per export, what must be created or serialized before the export is
 # created or serialized (AsyncLoading.cpp 2447-2499). The edl_* rules read that graph and ask what the loader fetches
 # with bCheckSerialized, and what a payload names, is ordered before it: they hold on every package of the game's own
-# content. PreloadChain is what AssetGen orders today; each pending mod below carries a kind of dependency it does not
-# order yet, and its test asserts the order the engine needs.
+# content. Each mod below carries a kind of dependency, and its test asserts the order the engine needs; a pending one
+# is a kind AssetGen does not order yet.
 
 import invariants
 from invariant_rules import preload as EDL
@@ -3213,54 +3209,12 @@ def preload_chain():
 preload_chain()
 
 
-# ---- Pending: the preload dependencies AssetGen leaves out
-
-def preload_override():
-    """PreloadOverride's Step and Score override PreloadBase_C's: their SuperStruct is that function, and the loader
-    fetches it with bCheckSerialized while it serializes the override - a Fatal 'Missing Dependency' when the parent
-    package loads in the same batch and has not serialized it yet."""
-    base = pending_asset('PreloadOverride')
-    pkg = invariants.Package(base)
-    supers = {e['name']: pkg.path(e['super']) for k, e in enumerate(pkg.exports)
-              if pkg.class_of(k + 1) == 'Function' and e['super']}
-    assert supers == {'Step': '/Game/_ElytrasMods/PreloadOverride/PreloadBase.PreloadBase_C:Step',
-                      'Score': '/Game/_ElytrasMods/PreloadOverride/PreloadBase.PreloadBase_C:Score'}, supers
-    keeps_edl(base, ['edl_super_serialized'])
-
-
-def preload_uber_class():
-    """PreloadUber_C names ExecuteUbergraph_PreloadUber as its UberGraphFunction: Link preloads it, and the CDO's
-    persistent frame is only made from a loaded one, so it is serialized before the class."""
-    base = pending_asset('PreloadUber')
-    pkg = invariants.Package(base)
-    assert EDL.edl_obj_tag(pkg, pkg.find('PreloadUber_C'), 'UberGraphFunction') > 0
-    keeps_edl(base, ['edl_class_closure'])
-
-
-def preload_uber_calls():
-    """Wait, the stub the latent call leaves, calls ExecuteUbergraph_PreloadUber and writes its frame: resolved while
-    Wait is serialized, so the ubergraph is created before; otherwise the call target reads back null."""
-    base = pending_asset('PreloadUber')
-    pkg = invariants.Package(base)
-    wait = pkg.find('Wait')
-    assert any(op[0] == 'obj' and op[1] and pkg.path(op[1]).endswith(':ExecuteUbergraph_PreloadUber')
-               for t in pkg.script(wait) for n in t.walk() for op in n.ops), 'Wait does not call ExecuteUbergraph_PreloadUber'
-    keeps_edl(base, ['edl_payload_created'])
-
-
-def preload_types():
-    """PreloadTypes' structs and enum type a class variable, an array element, a parameter, a local and struct
-    members: each owner is serialized after the type it links against."""
-    base = pending_asset('PreloadTypes')
-    keeps_edl(base, ['edl_property_types'])
-
-
 def preload_refs():
     """PreloadRefs' payloads name UPreloadProbe_C as NewObject's class constant (Make) and as Probe's property class,
     OnPing's signature as Broadcast's target (Ping), and the engine cylinder as Mesh's template default. Each is created
-    before the export naming it is serialized, or it loads as null. The class orders Probe's class today; Make, Ping
-    and the template order nothing they name. First, that each payload does name what the source says it does."""
-    base = pending_asset('PreloadRefs')
+    before the export naming it is serialized, or it loads as null: the writer lists every object a payload names, as
+    the cook's DependsMap does. First, that each payload does name what the source says it does."""
+    base = asset('PreloadRefs')
     pkg = invariants.Package(base)
 
     def named(export):
@@ -3273,20 +3227,86 @@ def preload_refs():
     keeps_edl(base, ['edl_payload_created'])
 
 
+preload_refs()
+print("ok  PreloadRefs: a class constant, a property's class, a Broadcast target and a template default are created first")
+
+
+def preload_override():
+    """PreloadOverride's Step and Score override PreloadBase_C's: their SuperStruct is that function, and the loader
+    fetches it with bCheckSerialized while it serializes the override - a Fatal 'Missing Dependency' when the parent
+    package loads in the same batch and has not serialized it yet."""
+    base = asset('PreloadOverride')
+    pkg = invariants.Package(base)
+    supers = {e['name']: pkg.path(e['super']) for k, e in enumerate(pkg.exports)
+              if pkg.class_of(k + 1) == 'Function' and e['super']}
+    assert supers == {'Step': '/Game/_ElytrasMods/PreloadOverride/PreloadBase.PreloadBase_C:Step',
+                      'Score': '/Game/_ElytrasMods/PreloadOverride/PreloadBase.PreloadBase_C:Score'}, supers
+    keeps_edl(base, ['edl_super_serialized'])
+
+
+preload_override()
+print('ok  PreloadOverride: an override is serialized after its Blueprint parent function, its SuperStruct')
+
+
+def preload_types():
+    """PreloadTypes' structs and enum type a class variable, an array element, a parameter, a local and struct
+    members: each owner is serialized after the type it links against."""
+    base = asset('PreloadTypes')
+    keeps_edl(base, ['edl_property_types'])
+
+
+preload_types()
+print('ok  PreloadTypes: a user-defined struct or enum is serialized before the class, function or struct it types')
+
+
+def preload_uber_class():
+    """PreloadUber_C names ExecuteUbergraph_PreloadUber as its UberGraphFunction: Link preloads it, and the CDO's
+    persistent frame is only made from a loaded one, so it is serialized before the class."""
+    base = asset('PreloadUber')
+    pkg = invariants.Package(base)
+    assert EDL.edl_obj_tag(pkg, pkg.find('PreloadUber_C'), 'UberGraphFunction') > 0
+    keeps_edl(base, ['edl_class_closure'])
+
+
+preload_uber_class()
+print('ok  PreloadUber: the class is serialized after its ubergraph function')
+
+
+def preload_uber_calls():
+    """Wait, the stub the latent call leaves, calls ExecuteUbergraph_PreloadUber and writes its frame: resolved while
+    Wait is serialized, so the ubergraph is created before; otherwise the call target reads back null."""
+    base = asset('PreloadUber')
+    pkg = invariants.Package(base)
+    wait = pkg.find('Wait')
+    assert any(op[0] == 'obj' and op[1] and pkg.path(op[1]).endswith(':ExecuteUbergraph_PreloadUber')
+               for t in pkg.script(wait) for n in t.walk() for op in n.ops), 'Wait does not call ExecuteUbergraph_PreloadUber'
+    keeps_edl(base, ['edl_payload_created'])
+
+
+preload_uber_calls()
+print('ok  PreloadUber: a function that enters the ubergraph has it created before it is serialized')
+
+
 def preload_ich():
     """PreloadIch_C names its InheritableComponentHandler, through which the Lamp archetype is found: the handler is
     serialized (so created) before the class."""
-    base = pending_asset('PreloadIch')
+    base = asset('PreloadIch')
     pkg = invariants.Package(base)
     assert EDL.edl_obj_tag(pkg, pkg.find('PreloadIch_C'), 'InheritableComponentHandler') > 0
     keeps_edl(base, ['edl_class_closure', 'edl_payload_created'])
 
 
+preload_ich()
+print('ok  PreloadIch: the class is serialized after its InheritableComponentHandler')
+
+
+# PreloadDso: a native default subobject restated along a Blueprint chain, and a child that restates nothing.
+
 def preload_dso_template(name, want):
     """The export restating CollisionCylinder under Default__<name>_C, and the package: its TemplateIndex must be
     `want`, the subobject of that name under the parent CDO (GetArchetypeFromRequiredInfo, UObjectArchetype.cpp
     64-87)."""
-    pkg = invariants.Package(os.path.join(os.path.dirname(pending_asset('PreloadDso')), name))
+    pkg = invariants.Package(os.path.join(os.path.dirname(asset('PreloadDso')), name))
     k = next((k for k, e in enumerate(pkg.exports) if e['name'] == 'CollisionCylinder'
               and e['outer'] == pkg.find('Default__%s_C' % name) + 1), None)
     assert k is not None, '%s: no CollisionCylinder export under its CDO' % name
@@ -3311,14 +3331,14 @@ def preload_dso_chain():
     the class makes then builds its capsule from it, and a capsule copied from an unloaded archetype keeps
     ACharacter's half height instead of the parent's 120."""
     preload_dso_template('PreloadDso', '/Game/_ElytrasMods/PreloadDso/PreloadDsoBase.Default__PreloadDsoBase_C:CollisionCylinder')
-    keeps_edl(pending_asset('PreloadDso'), ['edl_create_prereqs', 'edl_class_closure', 'edl_parent_subobjects_serialized'])
+    keeps_edl(asset('PreloadDso'), ['edl_create_prereqs', 'edl_class_closure', 'edl_parent_subobjects_serialized'])
 
 
 def preload_dso_kid():
     """PreloadDsoKid restates nothing, so whether it exports a capsule of its own is the writer's choice; either way the
     CDO its class makes while it is serialized copies its capsule from PreloadDsoBase's CollisionCylinder export
     (UObjectGlobals.cpp 3844-3859). That export is in PreloadDsoKid's linker table and serialized before the class."""
-    kid = pending_asset('PreloadDso', 'PreloadDsoKid')
+    kid = os.path.join(os.path.dirname(asset('PreloadDso')), 'PreloadDsoKid')
     parent = invariants.Package(os.path.join(os.path.dirname(kid), 'PreloadDsoBase'))
     assert any(e['name'] == 'CollisionCylinder' and e['outer'] == parent.find('Default__PreloadDsoBase_C') + 1
                for e in parent.exports), 'PreloadDsoBase exports no CollisionCylinder under its CDO'
@@ -3326,17 +3346,11 @@ def preload_dso_kid():
     assert not found, '; '.join('%s %s: %s' % f for f in found[:3])
 
 
-pending('PreloadOverride: an override is serialized after its Blueprint parent function, its SuperStruct', preload_override)
-pending('PreloadUber: the class is serialized after its ubergraph function', preload_uber_class)
-pending('PreloadUber: a function that enters the ubergraph has it created before it is serialized', preload_uber_calls)
-pending('PreloadTypes: a user-defined struct or enum is serialized before the class, function or struct typed by it', preload_types)
-pending('PreloadRefs: every object a payload names is created before the payload is serialized', preload_refs)
-pending('PreloadIch: the class is serialized after its InheritableComponentHandler', preload_ich)
-preload_dso()       # its mod stays in tests/pending for the two PreloadDso gaps below
-pending('PreloadDso: a child\'s subobject override is archetyped on the parent\'s, serialized before it and the child class',
-        preload_dso_chain)
-pending('PreloadDso: a child class is serialized after every default subobject its Blueprint parent\'s CDO exports',
-        preload_dso_kid)
+preload_dso()
+preload_dso_chain()
+print('ok  PreloadDso: a child\'s subobject override is archetyped on the parent\'s, serialized before it and the child class')
+preload_dso_kid()
+print('ok  PreloadDso: a child class is serialized after every default subobject its Blueprint parent\'s CDO exports')
 
 
 # ---- TABLES: the package's own tables - names and their numbers, imports, exports, archetypes

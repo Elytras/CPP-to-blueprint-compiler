@@ -107,6 +107,9 @@ bool NativeUnwritten(const std::string& StructName);
 
 /* Every object D points at, for the owning export's create-before-serialize edges. */
 void DefaultRefs(const FDefaultValue& D, std::vector<int32>& Out);
+/* The structs and enums P is typed by, container elements included: what its owner links against, for the owner's
+   serialize-before-serialize edges. */
+void TypeRefs(const FPropertyDef& P, std::vector<int32>& Out);
 
 /*
 Kismet bytecode buffer. MemorySize and StorageSize differ by design: a property reference is

@@ -278,6 +278,19 @@ void FBlueprintClass::Finish()
     /* The CDO the class makes while it is serialized copies each default subobject from its archetype
        (UObjectGlobals.cpp 3822-3859), so a Blueprint parent's is loaded first, as Ene_Butterfly_C lists its parent's. */
     for (const FIndex A : SubobjectArchetypes) Class.SerBeforeSer.push_back(A.V);
+    /* UStruct::GetPreloadDependencies (Class.cpp 732-735): the structs and enums the class's variables are typed by,
+       which it links against while it is serialized. */
+    for (const FPropertyDef& V : Vars) TypeRefs(V, Class.SerBeforeSer);
+    /* The rest of UBlueprintGeneratedClass::GetPreloadDependencies (BlueprintGeneratedClass.cpp 1425-1459): Link preloads
+       the ubergraph and the CDO's persistent frame is made only from a loaded one (1636, 1358-1375), and a component
+       archetype lookup on the class meets RF_NeedLoad on an unloaded handler, a Fatal (858-866). */
+    if (UberGraphFunction.V != 0) Class.SerBeforeSer.push_back(UberGraphFunction.V);
+    if (!ComponentOverrides.empty()) Class.SerBeforeSer.push_back(Exp(RowIch).V);
+    /* Every default subobject a Blueprint parent's CDO exports, restated here or not: the CDO this class makes while it
+       is serialized copies each from that export as it stands (UObjectGlobals.cpp 3822-3859), so the cook maps it into
+       the linker table and orders it first (SavePackage.cpp 4013-4040). */
+    for (const FParentSubobject& S : ParentSubobjects)
+        Class.SerBeforeSer.push_back(Subobject(S.ClassPackage, S.ClassName, ParentCdo, S.Name).V);
     Class.SerBeforeCreate = { BpgcClass.V, BpgcCdo.V };
     Class.CreateBeforeCreate = { ParentIdx.V };
     for (int32 I = 0; I < NumFunctions; ++I)
@@ -715,6 +728,7 @@ void FBlueprintClass::FinishStruct(const uint32 (&Guid)[4])
     for (const FPropertyDef& V : Vars)
         if (V.Extra.V != 0)
             S.CreateBeforeSer.push_back(V.Extra.V);
+    for (const FPropertyDef& V : Vars) TypeRefs(V, S.SerBeforeSer);     // what its members link against (Class.cpp 732-735)
 
     uint32 G[4] = { Guid[0], Guid[1], Guid[2], Guid[3] };
     const std::vector<FPropertyDef> Members = Vars;

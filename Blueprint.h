@@ -110,6 +110,13 @@ public:
     void AddSubobjectOverride(const std::string& Name, const std::string& Property, FIndex ComponentClass,
                               const std::vector<FPropertyDef>& Defaults, const std::vector<uint8>& NativeTail = {});
 
+    /* A default subobject the Blueprint parent's CDO exports (its own AddSubobjectOverride): imported under the parent
+       CDO and serialized before this class, which builds its own CDO's copy from it. */
+    void AddParentSubobject(const std::string& Name, const std::string& ClassPackage, const std::string& ClassName_)
+    {
+        ParentSubobjects.push_back(FParentSubobject{ Name, ClassPackage, ClassName_ });
+    }
+
     /* A tag on this class's CDO for a property an ancestor declares, which a member initializer
        cannot express: declaring the name again would shadow it with a second property. */
     void AddCdoDefault(const FPropertyDef& Var) { CdoDefaults.push_back(Var); }
@@ -197,6 +204,12 @@ private:
         std::vector<uint8> NativeTail;
     };
     std::vector<FSubobjectOverride> SubobjectOverrides;
+
+    struct FParentSubobject
+    {
+        std::string Name, ClassPackage, ClassName;
+    };
+    std::vector<FParentSubobject> ParentSubobjects;
 
     int32 ClassRow = 0;
 };

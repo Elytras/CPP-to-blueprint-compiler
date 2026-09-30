@@ -12104,6 +12104,27 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                                 BP.EngineClass(Sub->substr(Space + 1, Dot - Space - 1), Sub->substr(Dot + 1)),
                                 Entry.second.Defaults, NativeTail(Find("U" + Sub->substr(Dot + 1))));
     }
+    /* A parent this compile cooks exports the native subobjects its own UE_DEFAULTS restate, and those a class below it
+       restates, as the loop above makes this class's; this class is serialized after each (AddParentSubobject), whether
+       it restates it or not. A game Blueprint parent's exports are not known here. */
+    if (B->IsGenerated() && !B->bIsInterface)
+    {
+        const FRecord* NativeParent = B;
+        while (NativeParent && NativeParent->UePackage.compare(0, 8, "/Script/") != 0) NativeParent = Find(NativeParent->Base);
+        std::map<std::string, const FRecord*> Exported = RestatedSubobjects(*B);
+        Exported.merge(SubobjectsRestatedBelow(*B));
+        for (const auto& Entry : Exported)
+        {
+            if (!NativeParent) break;
+            const std::string& Comp = Entry.first;
+            const auto It = NativeParent->Subobjects.find(Comp);
+            if (It == NativeParent->Subobjects.end()) continue;     // B's own compile refuses it
+            const std::string& Sub = It->second;
+            const size_t Space = Sub.find(' '), Dot = Sub.rfind('.');
+            if (Space == std::string::npos || Dot == std::string::npos || Dot < Space) continue;
+            BP.AddParentSubobject(Sub.substr(0, Space), Sub.substr(Space + 1, Dot - Space - 1), Sub.substr(Dot + 1));
+        }
+    }
     for (const auto& Entry : ComponentOverrides)
     {
         /* The parent's own archetype, imported as a subobject of its class, is the record's template:
