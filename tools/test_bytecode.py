@@ -3346,8 +3346,9 @@ def preload_dso_kid():
 pending('PreloadDso: a restated native subobject has its archetype as TemplateIndex', preload_dso)
 pending('PreloadDso: a child\'s subobject override is archetyped on the parent\'s, serialized before it and the child class',
         preload_dso_chain)
-pending('PreloadDso: a child class is serialized after every default subobject its Blueprint parent\'s CDO exports',
-        preload_dso_kid)
+# The mod stays in tests/pending for the two archetype checks above; PreloadDsoKid, which restates nothing, passes.
+preload_dso_kid()
+print('ok  PreloadDso: a child class is serialized after every default subobject its Blueprint parent\'s CDO exports')
 
 
 # ---- TABLES: the package's own tables - names and their numbers, imports, exports, archetypes

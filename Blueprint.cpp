@@ -270,6 +270,11 @@ void FBlueprintClass::Finish()
        archetype lookup on the class meets RF_NeedLoad on an unloaded handler, a Fatal (858-866). */
     if (UberGraphFunction.V != 0) Class.SerBeforeSer.push_back(UberGraphFunction.V);
     if (!ComponentOverrides.empty()) Class.SerBeforeSer.push_back(Exp(RowIch).V);
+    /* Every default subobject a Blueprint parent's CDO exports, restated here or not: the CDO this class makes while it
+       is serialized copies each from that export as it stands (UObjectGlobals.cpp 3822-3859), so the cook maps it into
+       the linker table and orders it first (SavePackage.cpp 4013-4040). */
+    for (const FParentSubobject& S : ParentSubobjects)
+        Class.SerBeforeSer.push_back(Subobject(S.ClassPackage, S.ClassName, ParentCdo, S.Name).V);
     Class.SerBeforeCreate = { BpgcClass.V, BpgcCdo.V };
     Class.CreateBeforeCreate = { ParentIdx.V };
     for (int32 I = 0; I < NumFunctions; ++I)

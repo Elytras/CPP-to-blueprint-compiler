@@ -10745,6 +10745,36 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                                 BP.EngineClass(Sub->substr(Space + 1, Dot - Space - 1), Sub->substr(Dot + 1)),
                                 Entry.second.Defaults, NativeTail(Find("U" + Sub->substr(Dot + 1))));
     }
+    /* A parent this compile cooks exports the native subobjects its own UE_DEFAULTS restate, as the loop above makes
+       this class's; this class is serialized after each (AddParentSubobject), whether it restates it or not. Only the
+       statements that land there are read: `Comp->Field` on a component a native, non-Blueprint class declares. A game
+       Blueprint parent's exports are not known here. */
+    if (B->IsGenerated() && !B->bIsInterface && B->Defaults)
+    {
+        const FRecord* NativeParent = B;
+        while (NativeParent && NativeParent->UePackage.compare(0, 8, "/Script/") != 0) NativeParent = Find(NativeParent->Base);
+        const Json* Body = nullptr;
+        ForEach(*B->Defaults, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Body = &C; });
+        std::set<std::string> Restated;
+        if (Body && NativeParent)
+            ForEach(*Body, [&](const Json& S) {
+                const Json *Lhs = nullptr, *Rhs = nullptr, *Through = nullptr;
+                if (!DefaultAssignment(S, Lhs, Rhs, Through) || !Through) return;
+                const auto Owner = FieldOwner.find(Through->value("referencedMemberDecl", std::string()));
+                const FRecord* DR = Owner == FieldOwner.end() ? nullptr : Find(Owner->second);
+                const bool bBlueprint = DR && DR->UeName.size() > 2 && DR->UeName.compare(DR->UeName.size() - 2, 2, "_C") == 0;
+                if (DR && DR->IsNative() && !bBlueprint) Restated.insert(Name(*Through));
+            });
+        for (const std::string& Comp : Restated)
+        {
+            const auto It = NativeParent->Subobjects.find(Comp);
+            if (It == NativeParent->Subobjects.end()) continue;     // B's own compile refuses it
+            const std::string& Sub = It->second;
+            const size_t Space = Sub.find(' '), Dot = Sub.rfind('.');
+            if (Space == std::string::npos || Dot == std::string::npos || Dot < Space) continue;
+            BP.AddParentSubobject(Sub.substr(0, Space), Sub.substr(Space + 1, Dot - Space - 1), Sub.substr(Dot + 1));
+        }
+    }
     for (const auto& Entry : ComponentOverrides)
     {
         /* The parent's own archetype, imported as a subobject of its class, is the record's template:
