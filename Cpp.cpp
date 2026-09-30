@@ -17,6 +17,10 @@
 #include <string>
 #include <vector>
 
+#ifndef _WIN32
+#include <unistd.h>     // getpid: the <initializer_list> shim's temp file
+#endif
+
 #include <nlohmann/json.hpp>
 
 #include "Blueprint.h"
@@ -13046,19 +13050,34 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
        so hand clang a stand-in (it checks only the two-pointer layout). */
     const std::filesystem::path ShimDir = std::filesystem::temp_directory_path(TmpEc) / "assetgen-include";
     std::filesystem::create_directories(ShimDir, TmpEc);
-    std::ofstream(ShimDir / "initializer_list", std::ios::binary | std::ios::trunc)
-        << "#pragma once\n"
-           "namespace std {\n"
-           "template <class E> class initializer_list {\n"
-           "    const E* First = nullptr;\n"
-           "    const E* Last = nullptr;\n"
-           "public:\n"
-           "    constexpr initializer_list() noexcept = default;\n"
-           "    constexpr const E* begin() const noexcept { return First; }\n"
-           "    constexpr const E* end() const noexcept { return Last; }\n"
-           "    constexpr decltype(sizeof 0) size() const noexcept { return Last - First; }\n"
-           "};\n"
-           "}\n";
+    const std::filesystem::path Shim = ShimDir / "initializer_list";
+    static const char ShimText[] =
+        "#pragma once\n"
+        "namespace std {\n"
+        "template <class E> class initializer_list {\n"
+        "    const E* First = nullptr;\n"
+        "    const E* Last = nullptr;\n"
+        "public:\n"
+        "    constexpr initializer_list() noexcept = default;\n"
+        "    constexpr const E* begin() const noexcept { return First; }\n"
+        "    constexpr const E* end() const noexcept { return Last; }\n"
+        "    constexpr decltype(sizeof 0) size() const noexcept { return Last - First; }\n"
+        "};\n"
+        "}\n";
+    /* Parallel compiles share this file, and one compile's clang may be reading it as the next compile starts. So
+       it is never truncated in place: it is rewritten only when it differs, whole, into a temp file named for this
+       process, which is then renamed over it (POSIX replaces the name atomically). A write or rename that fails
+       leaves no temp file and stays silent, as before; clang then reports the missing header. */
+    if (ReadText(Shim.string()) != ShimText)
+    {
+        const std::filesystem::path Tmp = ShimDir / ("initializer_list." + std::to_string(getpid()) + ".tmp");
+        std::ofstream Out(Tmp, std::ios::binary | std::ios::trunc);
+        Out << ShimText;
+        Out.close();
+        std::error_code ShimEc;
+        if (!Out.fail()) std::filesystem::rename(Tmp, Shim, ShimEc);
+        if (Out.fail() || ShimEc) std::filesystem::remove(Tmp, ShimEc);
+    }
     Cmd += " --target=x86_64-pc-windows-msvc -isystem \"" + ShimDir.string() + "\"";
 #endif
     Cmd += " \"" + SourcePath + "\" -I\"" + IncludeDir + "\" -I\"" + Parent + "\"";
