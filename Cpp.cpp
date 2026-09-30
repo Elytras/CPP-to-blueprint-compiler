@@ -10048,6 +10048,90 @@ bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object,
     return true;
 }
 
+/* Each FFieldPath operand of a cooked script, B[Begin, End) being its serialized bytes: Visit gets the offset of the
+   operand's owner, an FPackageIndex after its name segments. The grammar is the loader's (ScriptSerialization.h, UE
+   4.27), as tools/walkscript.py reads it. False when the bytes do not read as that grammar. */
+static bool ForEachFieldPath(const std::vector<uint8>& B, size_t Begin, size_t End, const std::function<void(size_t)>& Visit)
+{
+    size_t O = Begin;
+    bool bOk = true;
+    auto Skip = [&](size_t N) { if (O + N > End) bOk = false; O += N; };
+    auto Path = [&] {
+        int32 Segments = -1;
+        if (O + 4 <= End) std::memcpy(&Segments, &B[O], 4);
+        Skip(4);
+        if (Segments < 0) { bOk = false; return; }
+        Skip(size_t(Segments) * 8);
+        if (bOk && O + 4 <= End) Visit(O);
+        Skip(4);
+    };
+    std::function<uint8()> Expr;
+    auto Until = [&](uint8 Term) { while (bOk && Expr() != Term) {} };
+    Expr = [&]() -> uint8 {
+        if (!bOk || O >= End) { bOk = false; return 0xFF; }
+        const uint8 Op = B[O++];
+        switch (Op)
+        {
+        case 0x00: case 0x01: case 0x02: case 0x33: case 0x48: case 0x6C: Path(); break;      // variables, PropertyConst
+        case 0x04: case 0x4E: case 0x4F: case 0x51: case 0x67: case 0x6D: Expr(); break;
+        case 0x06: case 0x1D: case 0x1E: case 0x20: case 0x4C: case 0x5B: Skip(4); break;
+        case 0x07: case 0x18: Skip(4); Expr(); break;
+        case 0x09: Skip(3); Expr(); break;                                                      // EX_Assert
+        case 0x0B: case 0x15: case 0x16: case 0x17: case 0x25: case 0x26: case 0x27: case 0x28: case 0x2A: case 0x2D:
+        case 0x30: case 0x32: case 0x3A: case 0x3C: case 0x3E: case 0x40: case 0x4D: case 0x50: case 0x53: case 0x5A:
+        case 0x5E: case 0x66: case 0x6A: break;                     // no operand (EX_InstrumentationEvent's is not on disk)
+        case 0x0F: Path(); Expr(); Expr(); break;                                               // EX_Let
+        case 0x14: case 0x43: case 0x44: case 0x5C: case 0x5F: case 0x60: case 0x62: case 0x6B: Expr(); Expr(); break;
+        case 0x13: case 0x2E: case 0x52: case 0x54: case 0x55: Skip(4); Expr(); break;         // casts: a class, then the value
+        case 0x12: case 0x19: case 0x1A: Expr(); Skip(4); Path(); Expr(); break;               // contexts
+        case 0x1B: case 0x45: Skip(8); Until(0x16); break;                                      // calls by name
+        case 0x1C: case 0x46: case 0x68: Skip(4); Until(0x16); break;                           // calls by pointer
+        case 0x63: Skip(4); Expr(); Until(0x16); break;
+        case 0x1F: while (O < End && B[O]) ++O; Skip(1); break;
+        case 0x34: while (O + 1 < End && (B[O] || B[O + 1])) O += 2; Skip(2); break;
+        case 0x21: case 0x4B: Skip(8); break;
+        case 0x22: case 0x23: Skip(12); break;
+        case 0x2B: Skip(40); break;
+        case 0x24: case 0x2C: Skip(1); break;
+        case 0x29:                                                                              // EX_TextConst
+        {
+            const uint8 Type = O < End ? B[O] : 0xFF;
+            Skip(1);
+            if (Type == 1) { Expr(); Expr(); Expr(); }                                          // localized
+            else if (Type == 2 || Type == 3) Expr();                                            // invariant, literal
+            else if (Type == 4) { Skip(4); Expr(); Expr(); }                                    // string table
+            break;
+        }
+        case 0x2F: Skip(8); Until(0x30); break;
+        case 0x31: Expr(); Until(0x32); break;
+        case 0x35: case 0x36: Skip(8); break;
+        case 0x38: Skip(1); Expr(); break;
+        case 0x39: Expr(); Skip(4); Until(0x3A); break;
+        case 0x3B: Expr(); Skip(4); Until(0x3C); break;
+        case 0x3D: Path(); Skip(4); Until(0x3E); break;
+        case 0x3F: Path(); Path(); Skip(4); Until(0x40); break;
+        case 0x65: Path(); Skip(4); Until(0x66); break;
+        case 0x42: case 0x64: Path(); Expr(); break;
+        case 0x5D: Expr(); break;
+        case 0x61: Skip(8); Expr(); Expr(); break;
+        case 0x69:                                                                              // EX_SwitchValue
+        {
+            uint16 Cases = 0;
+            if (O + 2 <= End) std::memcpy(&Cases, &B[O], 2);
+            Skip(6);
+            Expr();
+            for (uint16 I = 0; I < Cases && bOk; ++I) { Expr(); Skip(4); Expr(); }
+            Expr();
+            break;
+        }
+        default: bOk = false;
+        }
+        return Op;
+    };
+    while (bOk && O < End) Expr();
+    return bOk && O == End;
+}
+
 /*
 S38 - a patch's methods, compiled by Generate as a scratch child class of the Blueprint B (each an override of B's
 function), written over B's own functions in B's package. The export row stays, so the class's function list, its
@@ -10175,6 +10259,18 @@ bool FCompiler::TransplantFunctions(const FRecord& R, const FRecord& B, const FP
         FCookedExport& C = P.Exports[size_t(Copy - 1)];
         std::memset(C.Payload.data() + L.Super, 0, 4);         // SuperStruct
         C.Super = 0;
+        /* The copy's script still names the game function's properties: each local and parameter operand is an
+           FFieldPath whose owner is the function it was cooked in, resolved as written (FieldPath.cpp:256-270). That
+           function now holds the method's locals, and the copy's frame lists each out parameter under the copy's own
+           property (ScriptCore.cpp:851-906), so execLocalOutVariable would walk off the list looking for the game
+           function's (2170-2185): the Parent:: call crashes. The copy holds the same properties, so each operand owned
+           by the game's function is owned by the copy. */
+        const bool bScriptReads = ForEachFieldPath(C.Payload, L.Script + 8, L.Tail, [&](size_t At) {
+            int32 Owner = 0;
+            std::memcpy(&Owner, C.Payload.data() + At, 4);
+            if (Owner == To) std::memcpy(C.Payload.data() + At, &Copy, 4);
+        });
+        if (!bScriptReads) { *Err = Where + "::" + Name + ": the game's script does not read as UE 4.27 bytecode"; return false; }
         /* Nothing overrides the copy, and Parent:: calls it by pointer, which the editor does only for a final function.
            An RPC's copy is a plain function. With FUNC_Net and no super it would be a net field of the class's own
            (Class.cpp:4189), shifting the RPC indices against the game's, and a call to it would be routed again

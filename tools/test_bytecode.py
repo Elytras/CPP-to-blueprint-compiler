@@ -6372,12 +6372,9 @@ COOKED_RULES = {'cooked_instancing_flags', 'cooked_instancing_scopes', 'cooked_t
 
 def pinned_elsewhere(f):
     """A finding a pending test below pins, which the behaviour checks leave to it:
-    - EditKeptLocals: a kept game body (<Fn>__Vanilla) whose local operands still name the replaced function's
-      properties (local_operands; and, once PRELOAD's rules are in, edl_payload_created on the same operand owner);
     - EditAddTick: a ReceiveTick a patch adds to a class that cannot tick (COMP's receive_tick_sets_can_ever_tick,
       once merged)."""
-    return f[0] in ('local_operands', 'edl_payload_created') and f[1].endswith('__Vanilla') \
-        or f[0] == 'receive_tick_sets_can_ever_tick'
+    return f[0] == 'receive_tick_sets_can_ever_tick'
 
 
 def compile_edit(tmp, mod, src, game):
@@ -6587,13 +6584,13 @@ def edit_invariants_game():
 
 def kept_body_locals():
     """A kept game body (<Fn>__Vanilla, a byte copy of the replaced function) reads its parameters through its own
-    properties. The copy keeps the original's bytecode, whose EX_LocalVariable / EX_LocalOutVariable operands name the
-    replaced function's properties (the operand's FFieldPath owner is resolved as written, FieldPath.cpp:256-270). An
-    out parameter is then never found: the copy's frame records each out parameter under the copy's own property
-    (ScriptCore.cpp:851-906, the list null-terminated), and execLocalOutVariable walks it for the replaced function's,
-    off its end (2170-2185, checkSlow only): the Parent:: call crashes the game. GruntKeep (GetEnemySpawnedCount(int&
-    SpawnCount), --game) and RpcKeep (ClientPing(int32 Seq)) keep bodies that read a parameter; local_operands must find
-    nothing on either."""
+    properties. The copy keeps the original's bytecode, whose EX_LocalVariable / EX_LocalOutVariable operands must be
+    re-owned: left naming the replaced function's properties (the operand's FFieldPath owner is resolved as written,
+    FieldPath.cpp:256-270), an out parameter is never found - the copy's frame records each out parameter under the
+    copy's own property (ScriptCore.cpp:851-906, the list null-terminated), and execLocalOutVariable walks it for the
+    replaced function's, off its end (2170-2185, checkSlow only): the Parent:: call crashes the game. GruntKeep
+    (GetEnemySpawnedCount(int& SpawnCount), --game) and RpcKeep (ClientPing(int32 Seq)) keep bodies that read a
+    parameter; local_operands must find nothing on either."""
     cases = [('RpcKeep', os.path.join(ROOT, 'ReplTest', 'FSD', 'Content'), '_ElytrasMods/ReplTest/ReplTest', RPC_KEEP)]
     if GAME and os.path.exists(os.path.join(UEAPI, 'Game', 'ENE_Spider_Grunt_Normal_C.h')):
         cases.insert(0, ('GruntKeep', GAME, GRUNT_PKGS[1], GRUNT + GRUNT_KEEP))
@@ -6754,8 +6751,9 @@ def edit_cooked_pending():
 if not globals().get('EDITS_EXPLORE'):     # set by the dev loop's exploration driver, which reuses the cases above
     edit_invariants_suite()
     edit_invariants_game()
-    pending('EditKeptLocals: a kept game body (<Fn>__Vanilla) reads its parameters through its own properties, not the '
-            'replaced function\'s (an out parameter\'s is never found: the Parent:: call crashes)', kept_body_locals)
+    kept_body_locals()
+    print('ok  S38: a kept game body (<Fn>__Vanilla) reads its parameters, an out parameter included, through its own '
+          'properties, not the replaced function\'s')
     pending('EditAddTick: a ReceiveTick a patch adds to a Blueprint that cannot tick sets PrimaryActorTick.bCanEverTick '
             'on its CDO, or is refused', added_tick_can_tick)
     edit_listed_component()
