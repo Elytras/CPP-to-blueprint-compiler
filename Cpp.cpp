@@ -4931,6 +4931,17 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         DeclId = Ref.value("id", std::string());
         MethodName = Name(Ref);
     }
+    /* SpawnActor returns None while a construction script runs (bIsRunningConstructionScript, LevelActor.cpp), and the
+       editor keeps spawning out of the construction script graph. */
+    if (CurFnName == "UserConstructionScript" && (MethodName == "BeginDeferredActorSpawnFromClass"
+        || MethodName == "BeginSpawningActorFromClass" || MethodName == "FinishSpawningActor"))
+    { *Err = "UserConstructionScript: " + MethodName + " spawns an actor, which the engine refuses while a construction "
+             "script runs (it returns None); spawn in ReceiveBeginPlay"; return false; }
+    /* AddComponent finds its template by name in the calling class's ComponentTemplates (ActorConstruction.cpp
+       1100-1125), and a mod class has none, so it would always return None. */
+    if (MethodName == "AddComponent" && K == "CXXMemberCallExpr")
+    { *Err = CurFnName + ": AddComponent looks up a component template by name, and a mod class has no component "
+             "templates, so it returns None; add one by class with AddComponentByClass"; return false; }
 
     /* __NAME__ free functions are compiler intrinsics; each resolves its imports here (Extra/Extra2). */
     const bool bIntrinsic = MethodName.size() >= 5

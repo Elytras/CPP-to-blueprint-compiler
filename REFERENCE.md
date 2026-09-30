@@ -5642,6 +5642,12 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
 
 ### Components, defaults, assets and other objects
 
+- `UserConstructionScript: <Function> spawns an actor, which the engine refuses while a construction script runs (it
+  returns None); spawn in ReceiveBeginPlay`: `SpawnActor<T>` or a deferred spawn written in UserConstructionScript.
+  Fix: spawn in ReceiveBeginPlay. A helper the construction script calls is not caught.
+- `<Function>: AddComponent looks up a component template by name, and a mod class has no component templates, so it
+  returns None; add one by class with AddComponentByClass`: `AddComponent(FName("X"), ...)`. Fix: use
+  `AddComponentByClass`, or `AddComponentByType<T>(Owner)`. See [Components](#components).
 - `<Class>::DefaultSceneRoot: DefaultSceneRoot is the root the construction script adds; rename the component`: the
   name is taken by the root the engine adds to a class with no scene component of its own. Fix: rename it.
 - `<Class>::<Component>: <Ancestor> already has a default subobject <Name> (its <Member>); rename the component`: a

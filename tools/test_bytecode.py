@@ -5453,8 +5453,7 @@ pending('CompOverrideChain: an override template is archetyped on the nearest an
 pending('CompAttachInherited: an own component attached to an inherited Blueprint or native component', comp_attach_inherited)
 
 
-# ---- Refusals: names a component cannot take, and what the compiler does not refuse yet (each builds a package the
-# engine mishandles)
+# ---- Refusals: each of these would build a package the engine mishandles
 
 CLASH_BASE = ('class ClashBase : public AActor {\npublic:\n  UE_COMPONENT(USceneComponent, Root);\n'
               '  UE_COMPONENT(UPointLightComponent, Lamp);\n};\n')
@@ -5488,12 +5487,10 @@ for mod, body, why, top in (
         # BPGC-32 / NODE-23: AddComponent finds a template by name in ComponentTemplates, which a mod class has none of.
         ('AddByName', '  void ReceiveBeginPlay() { AddComponent(FName("X"), false, FTransform(), nullptr, false); }\n',
          'component template', '')):
-    if mod.startswith('Clash'):
-        refused(mod, body, why, top)
-        continue
-    pending('%s: refused' % mod, lambda mod=mod, body=body, why=why, top=top: refused(mod, body, why, top))
-print('ok  component names already taken under the actor are refused: DefaultSceneRoot, a parent Blueprint\'s\n'
-      '    component, a native default subobject or member, a game Blueprint\'s SCS node')
+    refused(mod, body, why, top)
+print('ok  refused: component names already taken under the actor (DefaultSceneRoot, a parent Blueprint\'s component,\n'
+      '    a native default subobject or member, a game Blueprint\'s SCS node), a spawn in UserConstructionScript,\n'
+      '    AddComponent by template name')
 
 
 def refused_or_warned(mod, body, why, top=''):
