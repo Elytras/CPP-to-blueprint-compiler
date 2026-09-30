@@ -2165,7 +2165,8 @@ overload is the one with the most parameters.
 | `inline int32 Pick(int32 V)` beside `inline int32 Pick(bool B)` | Each call expands the overload C++ picked, and one overload may call another. None of them is a Blueprint function. | Yes |
 | `int32 Get(int32 A, int32 B)` beside `inline int32 Get(int32 A)` | The overload with the most parameters is the Blueprint function named `Get`; the inline ones beside it expand normally. | Yes |
 | `inline int32 Get(int32 A, int32 B)` beside a non-inline `int32 Get(int32 A)`, then `Get(V)` | Refused: `an overload set may not mix inline and non-inline functions`. Make the non-inline overload the one with the most parameters, or rename it. | Not yet |
-| `int32 Ov(int32 A)` beside `int32 Ov(int32 A, int32 B)`, neither inline | Not refused. Only the overload with the most parameters is cooked, and calls to the shorter one are miscompiled. Give them different names, or make the extra overloads `inline`. | Not yet |
+| `int32 Ov(int32 A)` beside `int32 Ov(int32 A, int32 B)`, neither inline | Refused: "a second function of that name". A Blueprint class has one function per name. Give them different names, or make the extra overloads `inline`. | Refused |
+| `int32 Get()` beside `int32 get()` | Refused: "differs from Get only in case". An FName ignores case, so both would be one function. The same holds for two variables, a variable and a function, and a name an ancestor already has: `int32 get()` in a class whose parent has `Get()` is refused, while `Get()` itself overrides it. | Refused |
 
 ```cpp
 inline int32 Pick(int32 V) { return V + 1; }
@@ -2731,8 +2732,8 @@ class Crate : public AActor {
 
 Notes:
 
-- Do not redeclare an inherited property to change its default. This compiles with no message, but it adds a second
-  variable of the same name that hides the parent's, and the engine never reads it:
+- Do not redeclare an inherited property to change its default. It is refused ("AActor already has a variable
+  InitialLifeSpan"): it would add a second variable of the same name that hides the parent's. Set it in UE_DEFAULTS:
 
   ```cpp
   class Shadowed : public AActor {
@@ -5541,6 +5542,14 @@ and where the feature is described. In each group, the messages you are most lik
 
 ### Functions and inline functions
 
+- `<Class>::<Name>: a second function of that name; a Blueprint class has one member per name, so rename one`: two
+  non-inline overloads, or two members of one name. Fix: rename one, or make the extra overloads `inline`. See
+  [Overloading](#overloading).
+- `<Class>::<Name>: differs from <Other> only in case, and an FName ignores case; rename one`: `Get` and `get` in one
+  class. Fix: rename one. See [Overloading](#overloading).
+- `<Class>::<Name>: <Ancestor> already has a variable <Name>, and an FName ignores case; rename it` (or `a function`):
+  a member reusing a name the parent chain has, in any case. Overriding a function under its exact name is fine. To
+  change an inherited variable's default, assign it in `UE_DEFAULTS`. See [Class defaults](#class-defaults).
 - `<Class>::<Function>: <N> parameters, the return value included; a function takes at most 255`: the engine counts a
   function's parameters in one byte. Fix: pass a struct instead of the long list.
 - `<Class>::<Function>: its parameters take <N> bytes; a function's parameter block holds at most 65535`: the engine
@@ -5633,6 +5642,12 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
 
 ### Components, defaults, assets and other objects
 
+- `<Class>::DefaultSceneRoot: DefaultSceneRoot is the root the construction script adds; rename the component`: the
+  name is taken by the root the engine adds to a class with no scene component of its own. Fix: rename it.
+- `<Class>::<Component>: <Ancestor> already has a default subobject <Name> (its <Member>); rename the component`: a
+  component named like a native parent's own component, such as `CharacterMesh0` or `CollisionCylinder` under an
+  ACharacter. The engine finds the objects under an actor by name. Fix: rename it; to change the native one, set
+  its properties in `UE_DEFAULTS`. See [Components](#components).
 - `the name '<start>...' is too long: <N> characters, where an FName holds at most 1023 (NAME_SIZE)`: a name in the
   package, usually an `FName("...")` literal, is 1024 characters or longer. The engine stops reading the package's
   names at such an entry and misreads every later one. Fix: shorten it; keep long text in an FString.

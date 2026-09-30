@@ -166,7 +166,6 @@ KNOWN_RULES = {     # sweep rules the suite's own packages still break, each wit
     'latent_proxy_frame_held': 'AsyncTest.Play keeps its montage callback proxy only in a local of a function that '
                                'does not wait',
     'locals_constructed_have_defaults': 'FUNC_HasDefaults is missing on functions with non-zero-constructible locals',
-    'member_names_distinct': "no member-name clash is refused: a member may shadow a super's property",
     'native_out_arrays_emptied': "a native's out TArray is not emptied before the call, so Set_ToArray appends",
     'prop_bool_native': 'Blueprint bools are cooked as 1-bit bitfields (NativeBool 0)',
     'typing_callmath_callee': 'container-library CustomThunks (Array_* / Set_* / Map_*) are emitted as EX_CallMath, '
@@ -2160,7 +2159,7 @@ def static_assets():
     assert objs('AssetUser', cdo['Picks'].hex()) == [
         '/Game/Enemies/Spider/Grunt/ED_Spider_Grunt.ED_Spider_Grunt', '/Game/Enemies/Spider/Exploder/ED_Spider_Exploder.ED_Spider_Exploder',
         '/Game/Art/Environments/Holiday_GreatEggHunt/SK_greatEggHunt_bunnyPlush.SK_GreatEggHunt_BunnyPlush'], cdo
-    tags = struct.unpack_from('<6i', cdo['Tags'])                                    # removed, count, (FName) x 2
+    tags = struct.unpack_from('<6i', cdo['Labels'])                              # removed, count, (FName) x 2
     assert tags[:2] == (0, 2) and [names[tags[2]], names[tags[4]]] == ['big', 'calm'], tags
     m = struct.unpack_from('<8i', cdo['ByName'])                                     # removed, count, (FName, object) x 2
     assert m[:2] == (0, 2) and [(names[m[2]], ref(user, m[4])), (names[m[5]], ref(user, m[7]))] == [('big', MOD + 'MD_Big.MD_Big'), ('calm', MOD + 'MD_Calm.MD_Calm')], m
@@ -3426,20 +3425,6 @@ def subobject_chain():
     keeps_invariants(kid)
 
 
-def root_twin():
-    """RootTwin: a component named DefaultSceneRoot. Refused naming the clash, or cooked with one export of each
-    (outer, name) - either keeps the loader's lookup by name unambiguous."""
-    try:
-        b = pending_asset('RootTwin')
-    except AssertionError as e:
-        assert 'DefaultSceneRoot' in str(e), e
-        return
-    rows = [(e['name'].lower(), e['outer']) for e in dumpexp.load(b)[5]]
-    twins = sorted({r[0] for r in rows if rows.count(r) > 1})
-    assert not twins, 'two exports under one outer: %s' % twins
-    keeps_invariants(b)
-
-
 def self_ref_import():
     """SelfRefImport: a member of the mod's own class and a call to its own function on another instance reference
     this package's exports, never an import of the package itself."""
@@ -3480,25 +3465,6 @@ def abstract_instances():
     refused_naming('AbstractAsset', '  UPureDef *Picked = &PureData;\n', abstract,
                    top=ABSTRACT_CLASS + 'UE_ASSET_AT(UPureDef, PureData, "/Game/_ElytrasMods/AbstractAsset/PureData");\n')
     print('ok  AbstractAsset: an asset of an abstract mod class, cooked here or named at a path, is refused as abstract')
-
-
-def name_case_twins():
-    """NameCaseTwins: Bump and bump are one FName. Refused, saying the names differ only in case; or cooked as
-    functions FName tells apart, each running its own body."""
-    try:
-        b = pending_asset('NameCaseTwins')
-    except AssertionError as e:
-        assert re.search(r'(?i)\bcase\b', str(e)), e
-        return
-    pkg = invariants.Package(b)
-    cls = pkg.find('NameCaseTwins_C')
-    fns = [(e['name'], k) for k, e in enumerate(pkg.exports)
-           if e['outer'] == cls + 1 and pkg.class_of(k + 1) in invariants.Package.FUNCTION_CLASSES]
-    folded = [n.lower() for n, _ in fns]
-    assert len(set(folded)) == len(folded), 'functions FName cannot tell apart: %s' % [n for n, _ in fns]
-    takes_v = [n for n, k in fns if any(p.name == 'V' for p in pkg.struct(k).props)]
-    assert sorted(run(b, n, V=1)[0] for n in takes_v) == [2, 3], takes_v
-    keeps_invariants(b)
 
 
 def name_too_long():
@@ -3649,13 +3615,10 @@ name_suffix()
 pending("OverrideTest Walker: a default-subobject override names its parent CDO's subobject as its archetype", subobject_template)
 pending("SubobjectChain: an override's archetype is the same-named subobject of the parent CDO, a /Game one serialized before create",
         subobject_chain)
-pending('RootTwin: a component named DefaultSceneRoot is refused, or cooked without a second DefaultSceneRoot_GEN_VARIABLE', root_twin)
 pending('SelfRefImport: a package refers to its own objects as exports, never through an import of itself', self_ref_import)
 abstract_instances()
 pending('AbstractComp: a component of an abstract mod class is refused, naming it abstract',
         lambda: refused('AbstractComp', '  UE_COMPONENT(UPureComp, Comp);\n', 'abstract', top=ABSTRACT_COMP))
-pending('NameCaseTwins: two methods whose names differ only in case are refused, or cooked under names FName tells apart',
-        name_case_twins)
 name_too_long()
 tables_rules_fire()
 
@@ -3888,8 +3851,9 @@ for _name, (_parent, _bits, _within, _config) in TAIL_META.items():
 pending('OverrideTest Walker: ClassConfigName Game, ACharacter\'s', walker_config)
 pending('InstancedRefs: component references flagged instanced, the class HasInstancedReference', instanced_refs)
 for _mod, (_src, _member, _oracle, _what) in SHADOWS.items():
-    pending('%s: %s refused, or kept apart' % (_mod, _what),
-            (lambda m, s, n, o: lambda: refused_or_distinct(m, s, n, o))(_mod, _src, _member, _oracle))
+    refused_or_distinct(_mod, _src, _member, _oracle)
+print('ok  member names: one per FName, overloads and case twins included, none reused from an ancestor (%d cases)'
+      % len(SHADOWS))
 
 
 # ---- FUNC: function flags, overrides and interface implementations, call kind vs callee (invariant_rules/functions.py)
@@ -5489,7 +5453,8 @@ pending('CompOverrideChain: an override template is archetyped on the nearest an
 pending('CompAttachInherited: an own component attached to an inherited Blueprint or native component', comp_attach_inherited)
 
 
-# ---- Refusals the compiler does not make yet: each builds a package the engine mishandles
+# ---- Refusals: names a component cannot take, and what the compiler does not refuse yet (each builds a package the
+# engine mishandles)
 
 CLASH_BASE = ('class ClashBase : public AActor {\npublic:\n  UE_COMPONENT(USceneComponent, Root);\n'
               '  UE_COMPONENT(UPointLightComponent, Lamp);\n};\n')
@@ -5523,7 +5488,12 @@ for mod, body, why, top in (
         # BPGC-32 / NODE-23: AddComponent finds a template by name in ComponentTemplates, which a mod class has none of.
         ('AddByName', '  void ReceiveBeginPlay() { AddComponent(FName("X"), false, FTransform(), nullptr, false); }\n',
          'component template', '')):
+    if mod.startswith('Clash'):
+        refused(mod, body, why, top)
+        continue
     pending('%s: refused' % mod, lambda mod=mod, body=body, why=why, top=top: refused(mod, body, why, top))
+print('ok  component names already taken under the actor are refused: DefaultSceneRoot, a parent Blueprint\'s\n'
+      '    component, a native default subobject or member, a game Blueprint\'s SCS node')
 
 
 def refused_or_warned(mod, body, why, top=''):

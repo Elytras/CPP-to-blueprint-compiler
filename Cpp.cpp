@@ -466,6 +466,7 @@ struct FRecord
     std::map<std::string, const Json*> MethodDefs;  // out-of-line definition (carries body/parms)
     std::map<std::string, const Json*> Inlines;     // decl id (in-class or out-of-line) -> an inline method's
                                                     // definition: by id, as Methods keeps one overload per name
+    std::vector<const Json*> AllMethods;            // every in-class method decl, overloads included, in order
     std::vector<const Json*> Fields;
     std::vector<const Json*> Ctors;                 // CXXConstructorDecls: their parameter names place a value's arguments
     std::vector<std::string> Interfaces;            // every base after the first
@@ -1140,6 +1141,7 @@ private:
     /* `inline` functions are the editor's macros: never a UFunction, their body is copied into each caller.
        `inline` may sit on the declaration or on an out-of-line definition. */
     bool IsInlineMethod(const FRecord& R, const std::string& Method) const;
+    bool CheckMemberNames(const FRecord& R, std::string* Err) const;
     bool ExpandInline(const Json& CallNode, const Json& Def, const std::string& Method, bool bMethod, FBlueprintClass& BP,
                       FCallIR& Out, std::string* Err, const Json* Receiver = nullptr, bool bStaticCall = false);
     /* `final`: the class holding the version of Method a call by name reaches on every object of class Of or below,
@@ -2105,6 +2107,7 @@ bool FCompiler::Collect(std::string* Err)
                 /* genueapi's overload without the world context shares the name; the longer one is the UFunction. */
                 const Json*& Slot = R.Methods[Name(C)];
                 if (!Slot || ParmNames(C).size() > ParmNames(*Slot).size()) Slot = &C;
+                R.AllMethods.push_back(&C);
                 MethodOwner[C.value("id", std::string())] = R.CppName;
                 R.MethodAccess[Name(C)] = Access;
                 if (C.value("inline", false)) R.Inlines[C.value("id", std::string())] = &C;
@@ -7109,6 +7112,56 @@ bool FCompiler::IsInlineMethod(const FRecord& R, const std::string& Method) cons
         || (Def != R.MethodDefs.end() && Def->second->value("inline", false));
 }
 
+/* A class's variables and functions share one FName namespace with its ancestors', and an FName ignores case. The
+   editor refuses a duplicate function and renames a clashing variable (KismetCompiler.cpp 570-616, 1737-1747); here
+   each is refused: two members of one name (overloads included, inline ones aside, which are no UFunction), two that
+   differ only in case, and a member reusing an inherited name - save a function overriding one of the same spelling. */
+bool FCompiler::CheckMemberNames(const FRecord& R, std::string* Err) const
+{
+    std::map<std::string, std::pair<std::string, bool>> Own;       // lower-case name -> (as written, is a function)
+    auto Claim = [&](const std::string& N, bool bFunction) {
+        auto [It, bNew] = Own.emplace(Lower(N), std::make_pair(N, bFunction));
+        if (bNew) return true;
+        *Err = R.CppName + "::" + N + (It->second.first == N
+            ? std::string(": a second ") + (bFunction ? "function" : "member") + " of that name; a Blueprint class has one "
+              "member per name, so rename one"
+            : ": differs from " + It->second.first + " only in case, and an FName ignores case; rename one");
+        return false;
+    };
+    for (const Json* F : R.Fields) if (!Claim(Name(*F), false)) return false;
+    for (const Json* M : R.AllMethods)
+        if (!M->value("inline", false) && !IsInlineMethod(R, Name(*M)) && !Claim(Name(*M), true)) return false;
+    if (R.bIsStruct) return true;
+    /* A component is an object named after its variable under the actor: DefaultSceneRoot is the node the SCS adds
+       when no component of its own is a scene root, and a native default subobject is created under its own name
+       before any SCS node, so a second object of that name is refused (the loader finds objects by outer and name). */
+    for (const std::string& C : R.Components)
+        if (Lower(C) == "defaultsceneroot")
+        { *Err = R.CppName + "::" + C + ": DefaultSceneRoot is the root the construction script adds; rename the component"; return false; }
+    for (const FRecord* A = R.Base.empty() ? nullptr : Find(R.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
+        for (const auto& [Member, Spec] : A->Subobjects)
+            for (const std::string& C : R.Components)
+                if (Lower(C) == Lower(Spec.substr(0, Spec.find(' '))))
+                { *Err = R.CppName + "::" + C + ": " + A->CppName + " already has a default subobject " + Spec.substr(0, Spec.find(' '))
+                         + " (its " + Member + "); rename the component"; return false; }
+    for (const FRecord* A = R.Base.empty() ? nullptr : Find(R.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
+    {
+        auto Inherited = [&](const std::string& CppN, bool bFunction) {
+            auto U = A->UeNames.find(CppN);
+            const std::string N = U == A->UeNames.end() ? CppN : U->second;
+            auto It = Own.find(Lower(N));
+            if (It == Own.end() || (bFunction && It->second.second && It->second.first == N)) return true;   // an override
+            *Err = R.CppName + "::" + It->second.first + ": " + A->CppName + " already has " + (bFunction ? "a function " : "a variable ")
+                 + N + ", and an FName ignores case; rename it";
+            return false;
+        };
+        for (const Json* F : A->Fields) if (!Inherited(Name(*F), false)) return false;
+        for (const auto& [N, D] : A->Methods)
+            if (!D->value("inline", false) && !IsInlineMethod(*A, N) && !Inherited(N, true)) return false;
+    }
+    return true;
+}
+
 /* Whether a body holds a `goto`, which can run a declaration again the way a loop does. */
 bool HasGoto(const Json& N)
 {
@@ -9983,6 +10036,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     /* Abstract: the nearest declaration of some method along the class chain is `= 0`. SpawnActor and CreateWidget
        refuse the class, as they do one the editor marks Generate Abstract Class. An interface's `= 0` does not count,
        since an implementer that leaves it out gets a stub, and clang's own isAbstract never reaches here (FAstSax). */
+    if (!CheckMemberNames(R, Err)) return false;
     bool bAbstract = false;
     std::set<std::string> Nearest;
     for (const FRecord* A = &R; A; A = A->Base.empty() ? nullptr : Find(A->Base))
