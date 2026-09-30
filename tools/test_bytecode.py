@@ -6213,35 +6213,47 @@ def await_fakes():
 def await_paths():
     """UE_AWAIT on an async action activates it once, after its dispatchers are bound, on whichever path runs
     (K2Node_BaseAsyncTask.cpp 410-467): the else branch's await as well as the then branch's, and an await inside a
-    loop on its first round only - a second Activate starts an action like AsyncLoadPrimaryAsset again."""
+    loop on its first round only - a second Activate starts an action like AsyncLoadPrimaryAsset again. An await some
+    paths reach with the action activated and some without is refused: keeping its Activate starts the action twice
+    on one path, dropping it never on the other."""
     def once(activated, task, disp, what):
         """The task was activated exactly once, with the dispatcher awaited already bound (others may be too)."""
         mine = [bound for t, bound in activated if t is task]
         assert len(mine) == 1 and disp in mine[0], '%s activates the task %d times, want once after %s is bound%s' % (
             what, len(mine), disp, '' if not mine else ' (bound: %s)' % mine)
 
-    def either():
-        made, activated, natives = await_fakes()
-        for ok, disp in ((True, 'OnSuccess'), (False, 'OnFail')):
-            vm = VM(pending_asset('AwaitPaths'), natives, Rounds=0)
-            vm.call('Either', 'u', ok)
-            task = made[-1]
-            once(activated, task, disp, 'Either(bOk=%s)' % ok)
-            vm.broadcast(task, disp, 'tex' if ok else None)
-            assert vm.self.vars == (dict(Rounds=0, Image='tex') if ok else dict(Rounds=-1)), vm.self.vars
+    made, activated, natives = await_fakes()
+    for ok, disp in ((True, 'OnSuccess'), (False, 'OnFail')):
+        vm = VM(asset('AwaitPaths'), natives, Rounds=0)
+        vm.call('Either', 'u', ok)
+        task = made[-1]
+        once(activated, task, disp, 'Either(bOk=%s)' % ok)
+        vm.broadcast(task, disp, 'tex' if ok else None)
+        assert vm.self.vars == (dict(Rounds=0, Image='tex') if ok else dict(Rounds=-1)), vm.self.vars
+    print("ok  AwaitPaths.Either: the else branch's UE_AWAIT activates the async action too")
 
-    def twice():
+    for fn in ('Twice', 'Until'):
         made, activated, natives = await_fakes()
-        vm = VM(pending_asset('AwaitPaths'), natives, Rounds=0)
-        vm.call('Twice', 'u')
+        vm = VM(asset('AwaitPaths'), natives, Rounds=0)
+        vm.call(fn, 'u')
         task = made[-1]
         vm.broadcast(task, 'OnSuccess', 't1')
         vm.broadcast(task, 'OnSuccess', 't2')
-        assert vm.self.vars == dict(Rounds=2, Image='t2'), vm.self.vars
+        assert vm.self.vars == dict(Rounds=2, Image='t2'), (fn, vm.self.vars)
         assert len(made) == 1, made
-        once(activated, task, 'OnSuccess', 'Twice')
-    pending("AwaitPaths.Either: the else branch's UE_AWAIT activates the async action too", either)
-    pending('AwaitPaths.Twice: a UE_AWAIT in a loop activates its async action once', twice)
+        once(activated, task, 'OnSuccess', fn)
+    made, activated, natives = await_fakes()
+    vm = VM(asset('AwaitPaths'), natives, Rounds=2)
+    vm.call('Until', 'u')                                   # the first round breaks: nothing bound, nothing activated
+    assert not activated and not vm.binds and vm.self.vars == dict(Rounds=2), (activated, vm.binds, vm.self.vars)
+    print('ok  AwaitPaths.Twice / Until: a UE_AWAIT in a loop activates its async action once, on the first round')
+
+    umg, task = '#include "UeApi/UMG.h"\n', '    UAsyncTaskDownloadImage* T = UAsyncTaskDownloadImage::DownloadImage(Url);\n'
+    for mod, body in (('AwaitSkips', '    for (int32 I = 0; I < 3; ++I) { if (Stop) continue; UE_AWAIT(T->OnSuccess); }\n'),
+                      ('AwaitMaybe', '    if (Stop) UE_AWAIT(T->OnSuccess);\n    UE_AWAIT(T->OnFail);\n')):
+        refused(mod, '  bool Stop;\n  void F(FString Url) {\n%s%s  }\n' % (task, body),
+                "some paths reach it with T's async action already activated and some without", top=umg)
+    print('ok  AwaitSkips / AwaitMaybe: an await reached with its action activated on some paths only is refused')
 
 
 def await_null_proxy():

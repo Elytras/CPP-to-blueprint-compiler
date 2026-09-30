@@ -4566,7 +4566,8 @@ the game's dispatchers and one of its own, and its comments show the async-actio
 | You write | What it does | Status |
 |---|---|---|
 | `FName Notify = UE_AWAIT(Proxy->OnCompleted);` | Binds a generated event to the dispatcher and returns to the caller. When the dispatcher fires, the event stores its one parameter, and the method resumes after the await with that value. | Yes |
-| `Image = UE_AWAIT(Task->OnSuccess);` on an async action | For a `UBlueprintAsyncActionBase`, such as `UAsyncTaskDownloadImage`, AssetGen calls `Activate()` right after binding the first awaited dispatcher of that variable, as the editor's async node does. A second await on the same variable does not activate it again. An object that is not an async action, such as the montage proxy, is never activated: its factory already started the work. | Yes |
+| `Image = UE_AWAIT(Task->OnSuccess);` on an async action | For a `UBlueprintAsyncActionBase`, such as `UAsyncTaskDownloadImage`, AssetGen calls `Activate()` right after the bind, as the editor's async node does, at the first await of that variable on each path the method runs: in whichever branch of an `if` runs, and in a loop on the first round only. A later await on the same variable does not activate it again, until the variable is assigned a new action. An object that is not an async action, such as the montage proxy, is never activated: its factory already started the work. | Yes |
+| `if (Stop) UE_AWAIT(T->OnSuccess);` then `UE_AWAIT(T->OnFail);` | Refused: `some paths reach it with T's async action already activated and some without`. Keeping the second await's `Activate()` would start the action twice on one path, dropping it would never start it on the other. The same for a loop that can skip its await, such as with `continue` before it. | Refused |
 | `UE_AWAIT(Target->OnDestroyed);` | As a statement: waits for the dispatcher and drops its value. | Yes |
 | `UE_AWAIT(Task->OnSuccess);` with `Task` None | The bind, and `Activate()` for an async action, run only when the object passes IsValid, as the editor's async node tests its proxy. A None or pending-kill object binds nothing and logs no "Accessed None"; the method stays parked at the await. | Yes |
 | `int32 Code = UE_AWAIT(OnReady);` | The object in front of the dispatcher may be self, a member or a local. | Yes |
@@ -5894,6 +5895,11 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   `UE_AWAIT(UAsyncTaskDownloadImage::DownloadImage(Url)->OnSuccess)`. The object is used by the bind and again to
   start the action. Fix: `UAsyncTaskDownloadImage *Task = UAsyncTaskDownloadImage::DownloadImage(Url);` and then
   `Image = UE_AWAIT(Task->OnSuccess);`. See [Waiting on events](#waiting-on-events).
+- `UE_AWAIT on <Var>: some paths reach it with <Var>'s async action already activated and some without, so it would
+  start twice or never`: an await on an async action that one path reaches after an earlier await on the same
+  variable and another path reaches without one, as in `if (Stop) UE_AWAIT(T->OnSuccess); UE_AWAIT(T->OnFail);`, or
+  in a loop that can skip its await (`continue` before it). Fix: await the variable on every path before this await
+  or on none, or assign it again on each path. See [Waiting on events](#waiting-on-events).
 - `<Class>::<Function>: static <Local> lives in the ubergraph's frame, which only a function that makes a latent call
   runs in; make <Local> a member`: a `static` local that the function changes, as in
   `static int32 Count = 0; ++Count;`, in a method that makes no latent call. Fix: make it a member of the class. A
