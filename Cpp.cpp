@@ -1267,6 +1267,8 @@ private:
     bool ConstToArg(const FConstVal& V, const std::string& Type, FArgIR& Out) const;
     std::map<std::string, const Json*> FreeInlines;                     // decl id -> an inline free function's definition
                                                                         // (a template's: each instantiation)
+    std::vector<const Json*> FreeInlineOrder;                           // the same definitions in document order: an id is
+                                                                        // an address in clang, so the map's order is not fixed
     std::map<std::string, const Json*> MemberTemplates;                 // decl id -> a member template's instantiation,
                                                                         // expanded inline like an inline method
     /* The class a field access `Obj->Field` / `Field` reads from: Obj's static type, or the class being generated. */
@@ -5405,11 +5407,12 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         {
             if (K == "CXXMemberCallExpr") Receiver = Strip(First(*Callee));
             if (!Receiver) { *Err = MethodName + "(): TODO: only a call on an object (`Obj->" + MethodName + "()`)"; return false; }
-            /* No `::`: a free inline function (UObject_GetOuter), expanded here with the object as its first argument. */
+            /* No `::`: a free inline function (UObject_GetOuter), expanded here with the object as its first argument.
+               Found by name, first in document order: walking FreeInlines would take whichever address sorts first. */
             if (Fw->second.find("::") == std::string::npos)
             {
                 const Json* Def = nullptr;
-                for (const auto& [Id, N] : FreeInlines) if (Name(*N) == Fw->second) { Def = N; break; }
+                for (const Json* N : FreeInlineOrder) if (Name(*N) == Fw->second) { Def = N; break; }
                 if (!Def) { *Err = MethodName + "() is " + Fw->second + ", which is not declared here: include its UeApi header"; return false; }
                 Out.bReceiverIsArg = true;
                 return ExpandInline(CallExprNode, *Def, Fw->second, false, BP, Out, Err, Receiver);
@@ -13094,6 +13097,7 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
             {
                 NormalizePointers(N);
                 FreeInlines[N.value("id", std::string())] = &N;
+                FreeInlineOrder.push_back(&N);
             }
             return;
         }
