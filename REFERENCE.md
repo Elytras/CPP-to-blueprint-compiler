@@ -3703,7 +3703,7 @@ Notes:
 | `{this, &Scorer::HandleTimer}` | Create Event wired into a delegate pin, written as the argument of a call that takes a TDelegate (timers, engine callbacks). The rules are those of a handler: `this` only, a non-inline method, and the signature of the `TDelegate<...>` in the header. | Yes |
 | `TDelegate<void()>(this, &Scorer::HandleTimer)` | The same value, spelled out. | Yes |
 | `K2_ClearTimerDelegate({})` | Refused: "a delegate value is {this, &Class::Function}". There is no empty or unbound delegate. | Refused |
-| `TDelegate<void()> Callback;` as a class variable or a function parameter | Refused today, with "unimplemented property" or "unimplemented parameter". A delegate can only be written directly as an argument. Keep what the call needs in variables and write `{this, &Class::Method}` at the call. | Not yet |
+| `TDelegate<void()> Callback;` as a class variable, a function parameter or a local | A delegate variable (DelegateProperty). `Callback = {this, &Class::Method};` stores a value, and `Callback` passes it on, to a timer or another function. Its signature function is one the class makes per delegate type, `<Variable>__DelegateSignature`, as the editor makes one per dispatcher. A struct or an interface makes none, so a delegate in one is refused. | Yes |
 
 The timers in [Timers and input](#timers-and-input) show delegate values in use.
 
@@ -5219,7 +5219,7 @@ listed here is refused with "unimplemented intrinsic".
 | `<Subsystem>::Get()` | A subsystem, as the editor's Get node gives it. `Get(Other)` asks Other's world. | [Working with other objects](#working-with-other-objects) |
 | `Super::Method()` | Not a name C++ knows. Write the parent class: `Base::Method()`. | [Overrides and parent calls](#overrides-and-parent-calls) |
 | `T &` parameter | A pass-by-reference pin: the callee's writes reach the caller. Bound to a map element or to `C ? X : Y`, it gets a copy stored back after the call, with a warning. | [Functions](#functions) |
-| `TDelegate<...>`, `{this, &C::F}` | A method of `this` passed as a delegate argument (Create Event), such as to a timer. | [Event dispatchers](#event-dispatchers), [Timers and input](#timers-and-input) |
+| `TDelegate<...>`, `{this, &C::F}` | A method of `this` passed as a delegate argument (Create Event), such as to a timer, or kept in a delegate variable. | [Event dispatchers](#event-dispatchers), [Timers and input](#timers-and-input) |
 | `TScriptInterface<I>` | An interface value. Assigning an object casts it, and `GetObject()` gives the object back. | [Interfaces](#interfaces) |
 | `(T *)Soft` | Resolve Soft Reference: the object or class, null unless it is loaded. | [Types](#types) |
 | `TSoftObjectPtr<T>`, `TSoftClassPtr<T>` | Soft Object and Soft Class References. A default is the asset's path. | [Types](#types) |

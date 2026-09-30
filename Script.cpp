@@ -151,6 +151,13 @@ FPropertyDef DispatcherParam(const std::string& Name, FIndex Signature, uint64 E
                          | CPF_BlueprintCallable | ExtraFlags, Signature };
 }
 
+/* FScriptDelegate: the bound object's FWeakObjectPtr and the function's FName, 16 bytes, the signature as the tail. */
+FPropertyDef DelegateParam(const std::string& Name, FIndex Signature, uint64 ExtraFlags)
+{
+    return FPropertyDef{ "DelegateProperty", Name, RF_Public, 1, 16,
+                         CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, Signature };
+}
+
 bool IsAscii(const std::string& Utf8)
 {
     return std::all_of(Utf8.begin(), Utf8.end(), [](char C) { return uint8(C) < 0x80; });
@@ -364,8 +371,8 @@ void WriteProperty(FArc& Ar, const FPropertyDef& P, bool bUncooked)
         Ar.Idx(P.Extra);                // PropertyClass
     else if (P.Type == "InterfaceProperty")
         Ar.Idx(P.Extra);                // InterfaceClass
-    else if (P.Type == "MulticastInlineDelegateProperty")
-        Ar.Idx(P.Extra);                // SignatureFunction
+    else if (P.Type == "MulticastInlineDelegateProperty" || P.Type == "DelegateProperty")
+        Ar.Idx(P.Extra);                // SignatureFunction (PropertyDelegate.cpp 161-175)
     else if (P.Type == "ClassProperty" || P.Type == "SoftClassProperty")
     {
         Ar.Idx(P.Extra);                // PropertyClass = UClass
@@ -399,7 +406,6 @@ void WriteProperty(FArc& Ar, const FPropertyDef& P, bool bUncooked)
         WriteProperty(Ar, *P.Inner, bUncooked);    // KeyProp
         WriteProperty(Ar, *P.Value, bUncooked);    // ValueProp
     }
-    // TODO: unimplemented tail - DelegateProperty (SignatureFunction).
 }
 
 /* ---- bytecode ---- */

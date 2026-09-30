@@ -1,6 +1,7 @@
 ﻿/* DelegateVar: a single-cast delegate kept in a variable - a class variable and a local - then handed to a timer.
-   Each is a DelegateProperty whose tail names its SignatureFunction (Script.cpp: "unimplemented tail -
-   DelegateProperty"), and what reaches K2_SetTimerDelegate is OnTimer bound on this object. */
+   Each is a DelegateProperty whose tail names its SignatureFunction, a *__DelegateSignature function of the class
+   with FUNC_Delegate (PropertyDelegate.cpp 161-175), and what reaches K2_SetTimerDelegate is OnTimer bound on this
+   object. */
 #include "UeApi/Types.h"
 #include "UeApi/FSD.h"
 

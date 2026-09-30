@@ -4933,7 +4933,7 @@ def delegate_var():
     """A TDelegate<void()> class variable is a DelegateProperty naming a delegate signature function (every
     DelegateProperty the package has does: keeps_invariants, delegate_property_signature), and what reaches
     K2_SetTimerDelegate from the variable and from a local is OnTimer bound on this object, which the variable holds."""
-    base = pending_asset('DelegateVar')
+    base = asset('DelegateVar')
     keeps_invariants(base)
     pkg = invariants.Package(base)
     ci = next(i for i, st in invariants.classes(pkg))
@@ -4967,8 +4967,8 @@ types_dispatcher()
 types_begin_play_dispatch()
 scoreboard_broadcast()
 timers_by_event_and_name()
-pending('DelegateVar: a TDelegate<void()> variable is a DelegateProperty naming its signature, holding OnTimer on this',
-        delegate_var)
+delegate_var()
+print('ok  DelegateVar: a TDelegate<void()> variable is a DelegateProperty naming its signature, holding OnTimer on this')
 inherited_fire()
 print('ok  DispatchInheritedFire: a child broadcasts its parent\'s dispatcher through the parent\'s signature')
 # A method of another class bound with `this`: EX_InstanceDelegate binds the name on this object, whose class has no

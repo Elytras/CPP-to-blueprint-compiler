@@ -84,6 +84,8 @@ FPropertyDef StructParam(const std::string& Name, FIndex Struct, const std::stri
 FPropertyDef InterfaceParam(const std::string& Name, FIndex InterfaceClass, uint64 ExtraFlags = 0);
 /* An event dispatcher. Extra = its <Name>__DelegateSignature function. */
 FPropertyDef DispatcherParam(const std::string& Name, FIndex Signature, uint64 ExtraFlags = 0);
+/* A single-cast delegate, TDelegate<...>. Extra = its signature function. */
+FPropertyDef DelegateParam(const std::string& Name, FIndex Signature, uint64 ExtraFlags = 0);
 
 /* bUncooked=true adds the editor-only per-field metadata flag (FField::Serialize writes it when not
    cooking); the cooked layout leaves it off. */

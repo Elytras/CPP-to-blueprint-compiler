@@ -1823,8 +1823,6 @@ each topic.
 - Broadcast on a dispatcher that the class did not declare with `UE_DISPATCHER`, such as `OnDestroyed` or a parent
   class's dispatcher. Add, Remove and Clear work on any dispatcher. Give the declaring class a method that broadcasts,
   and call it. See [Event dispatchers](REFERENCE.md#event-dispatchers).
-- A delegate held in a variable or a parameter, `TDelegate<void()> Callback;`. Pass `{ this, &AMine::Handle }` where
-  the delegate is needed. See [Event dispatchers](REFERENCE.md#event-dispatchers).
 - A class as a default: `TSubclassOf<AActor> Kind = AActor::StaticClass();`, or a class value in a data asset's
   braces. Set it in `ReceiveBeginPlay`, or use a `TSoftClassPtr` with a path. See
   [Classes and variables](REFERENCE.md#classes-and-variables).

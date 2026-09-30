@@ -1138,6 +1138,10 @@ private:
     bool GenerateAsset(const Json& Var, const std::string& OutDir, std::string* Err);
     bool TypeToProperty(const std::string& QualType, const std::string& PName, uint64 ExtraFlags,
                         const std::string& Where, FBlueprintClass& BP, FPropertyDef* Out, std::string* Err);
+    /* The signature function of `TDelegate<...>` Type in the class Generate is building, made the first time the type
+       is asked for, named after the variable Holder that asked. */
+    bool DelegateSignature(const std::string& Type, const std::string& Holder, FBlueprintClass& BP, FIndex* Sig,
+                           std::string* Err);
     bool LayoutOf(const std::string& QualType, int32* Size, int32* Align, std::string* Err);
     bool NeedsResultLocal(const std::string& Type, int32 Depth = 0);
     bool StructLayout(const FRecord& R, int32* Size, int32* Align, std::string* Err);
@@ -1460,6 +1464,9 @@ private:
     std::map<std::string, int32> EnumConstWidth;      // clang EnumConstantDecl id -> its enum's size, 1 / 4 / 8
     std::map<std::string, uint32> EventFlags;         // UeApi/Events.json: "Package.Class.Function" -> EFunctionFlags
     std::map<std::string, FIndex> CurSignatures;      // Generate: dispatcher name -> its signature function export
+    std::map<std::string, std::pair<std::string, FIndex>> DelegateSigs;    // Generate: a TDelegate type -> its signature
+                                                                            // function's name and export
+    const FBlueprintClass* DelegateSigsIn = nullptr;  // the class Generate is building, while it builds it
     const FConv* FindConv(const std::string& From, const std::string& To) const;
     const FOpInfo* FindOp(const std::string& Op, const std::string& Lhs, const std::string& Rhs) const;
     void ApplyConv(const FConv& C, FBlueprintClass& BP, FArgIR& Arg);
@@ -2483,6 +2490,9 @@ EExprToken LetOpFor(const std::string& QualType)
 {
     std::string Inner;
     if (QualType == "bool") return EX_LetBool;
+    /* A delegate is stored with EX_LetDelegate, as the editor stores one (EmitDestinationExpression,
+       KismetCompilerVMBackend.cpp 1431-1434). */
+    if (StripTypeKeywords(QualType).compare(0, 10, "TDelegate<") == 0) return EX_LetDelegate;
     if (TemplateArg(QualType, "TSubclassOf", &Inner)) return EX_LetObj;
     if (IsContainerType(QualType)) return EX_Let;
     if (!QualType.empty() && QualType.back() == '*') return EX_LetObj;
@@ -9239,6 +9249,15 @@ bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& P
         *Out = InterfaceParam(PName, ClassImportOf(*IR, BP), ExtraFlags);
         return true;
     }
+    /* A single-cast delegate, `TDelegate<void(int32)>`: a DelegateProperty, whose tail is its SignatureFunction
+       (FDelegateProperty::Serialize, PropertyDelegate.cpp 161-175). */
+    if (Type.compare(0, 10, "TDelegate<") == 0)
+    {
+        FIndex Sig;
+        if (!DelegateSignature(Type, PName, BP, &Sig, Err)) return false;
+        *Out = DelegateParam(PName, Sig, ExtraFlags);
+        return true;
+    }
     for (const char* Tpl : { "TSubclassOf", "TSoftObjectPtr", "TSoftClassPtr" })
     {
         if (!TemplateArg(Type, Tpl, &Inner)) continue;
@@ -9325,6 +9344,56 @@ bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& P
     return true;
 }
 
+/* UeApi spells every delegate `TDelegate<R(A...)>`, a native's delegate parameter too, so no native signature function
+   is known by name: the class makes one of its own per delegate type, as the editor makes one per dispatcher, and as UHT
+   makes one for DECLARE_DYNAMIC_DELEGATE: an empty function called *__DelegateSignature, FUNC_Public | FUNC_Delegate.
+   Only reflection reads it - SameType compares two delegate properties by it (PropertyDelegate.cpp 188-191), so one per
+   type keeps every variable of that type one type - while the VM copies an FScriptDelegate whole, whatever it names. */
+bool FCompiler::DelegateSignature(const std::string& Type, const std::string& Holder, FBlueprintClass& BP, FIndex* Sig,
+                                  std::string* Err)
+{
+    if (auto It = DelegateSigs.find(Type); It != DelegateSigs.end()) { *Sig = It->second.second; return true; }
+    if (DelegateSigsIn != &BP)
+    { *Err = Holder + ": " + Type + " needs a signature function, which only a class holds, not a struct or an interface"; return false; }
+    const size_t Open = Type.find('('), Close = Type.rfind(')');
+    if (Open == std::string::npos || Close == std::string::npos || Close < Open)
+    { *Err = "TODO: unimplemented delegate type " + Type + " of " + Holder; return false; }
+    std::string Ret = Type.substr(10, Open - 10);
+    while (!Ret.empty() && Ret.back() == ' ') Ret.pop_back();
+    std::vector<FPropertyDef> Params;
+    const std::string List = Type.substr(Open + 1, Close - Open - 1);
+    if (List.find_first_not_of(' ') != std::string::npos)
+        for (std::string A : SplitTemplateArgs(List))
+        {
+            bool bRef = false;
+            while (!A.empty() && (A.back() == '&' || A.back() == ' ')) { bRef = bRef || A.back() == '&'; A.pop_back(); }
+            FPropertyDef PD;
+            const std::string PName = "Param" + std::to_string(Params.size());
+            if (!TypeToProperty(A, PName, bRef ? uint64(CPF_OutParm | CPF_ReferenceParm) : 0, "parameter of " + Type, BP, &PD, Err))
+                return false;
+            Params.push_back(PD);
+        }
+    if (Ret != "void")
+    {
+        FPropertyDef PD;
+        if (!TypeToProperty(Ret, "ReturnValue", CPF_ReturnParm | CPF_OutParm, "return type of " + Type, BP, &PD, Err)) return false;
+        PD.PropertyFlags &= ~uint64(CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+        Params.push_back(PD);
+    }
+    /* Named after the variable asking, numbered past a dispatcher's signature or another type's of that name. */
+    auto Taken = [&](const std::string& N) {
+        return std::any_of(CurSignatures.begin(), CurSignatures.end(), [&](const auto& D) { return D.first + "__DelegateSignature" == N; })
+            || std::any_of(DelegateSigs.begin(), DelegateSigs.end(), [&](const auto& D) { return D.second.first == N; });
+    };
+    std::string Name = Holder + "__DelegateSignature";
+    for (int32 N = 2; Taken(Name); ++N) Name = Holder + "_" + std::to_string(N) + "__DelegateSignature";
+    const bool bOut = std::any_of(Params.begin(), Params.end(), [](const FPropertyDef& P) { return (P.PropertyFlags & CPF_OutParm) != 0; });
+    *Sig = BP.AddFunction(Name, Null(), Params, [](FScript& S, FIndex) { S.Return(); S.EndOfScript(); },
+                          FUNC_Public | FUNC_Delegate | (bOut ? uint32(FUNC_HasOutParms) : 0u));
+    DelegateSigs[Type] = { Name, *Sig };
+    return true;
+}
+
 bool FCompiler::LayoutOf(const std::string& QualType, int32* Size, int32* Align, std::string* Err)
 {
     const std::string T = StripTypeKeywords(QualType);
@@ -9346,6 +9415,7 @@ bool FCompiler::LayoutOf(const std::string& QualType, int32* Size, int32* Align,
     if (TemplateArg(T, "TArray", &Inner) || TemplateArg(T, "TScriptInterface", &Inner)) { *Size = 16; *Align = 8; return true; }
     if (TemplateArg(T, "TSet", &Inner) || TemplateArg(T, "TMap", &Inner)) { *Size = 80; *Align = 8; return true; }
     if (TemplateArg(T, "TSoftObjectPtr", &Inner) || TemplateArg(T, "TSoftClassPtr", &Inner)) { *Size = 40; *Align = 8; return true; }
+    if (T.compare(0, 10, "TDelegate<") == 0) { *Size = 16; *Align = 4; return true; }      // FScriptDelegate: FWeakObjectPtr, FName
     if (auto S = Structs.find(T); S != Structs.end()) { *Size = S->second.Size; *Align = S->second.Align; return true; }
     if (const FRecord* SR = Find(T); SR && SR->bIsStruct) return StructLayout(*SR, Size, Align, Err);
     *Err = "TODO: unimplemented struct member type: " + QualType;
@@ -10392,6 +10462,10 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
        BP_ThornsComponent). */
     const std::string ParentPkg = PackageOf(*B);
     FBlueprintClass BP(P, ClassOf(R), ParentPkg, ClassOf(*B), ParentPkg.compare(0, 6, "/Game/") == 0);
+    /* A TDelegate's signature function is made in this class while it is built (DelegateSignature), in no other. */
+    struct FSigScope { const FBlueprintClass*& In; ~FSigScope() { In = nullptr; } } SigScope{ DelegateSigsIn };
+    DelegateSigs.clear();
+    DelegateSigsIn = &BP;
 
     std::vector<std::string> Ancestry;
     for (const FRecord* A = &R; A; A = A->Base.empty() ? nullptr : Find(A->Base))
