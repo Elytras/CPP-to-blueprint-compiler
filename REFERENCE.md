@@ -5541,6 +5541,12 @@ and where the feature is described. In each group, the messages you are most lik
 
 ### Functions and inline functions
 
+- `<Class>::<Function>: <N> parameters, the return value included; a function takes at most 255`: the engine counts a
+  function's parameters in one byte. Fix: pass a struct instead of the long list.
+- `<Class>::<Function>: its parameters take <N> bytes; a function's parameter block holds at most 65535`: the engine
+  sizes a function's parameters in two bytes, and a `const&` parameter is a copy there too. Fix: keep the big struct
+  in a member variable and let the function read it there.
+
 - `call to an unknown function: <Name>`: a call to a function AssetGen has no body for. It compiles methods of classes
   and free functions marked `inline`, so the usual cause is a free function or function template without `inline`, a
   plain `constexpr` free function, or a standard library function such as `std::min`, `sqrtf` or `__builtin_sqrtf`.

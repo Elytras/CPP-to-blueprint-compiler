@@ -110,11 +110,13 @@ void SplitName(const std::string& S, std::string& OutBase, int32& OutNumber)
 
     const std::string Digits = S.substr(Underscore + 1);
     if (Digits.size() > 1 && Digits[0] == '0') return;       // leading zeros are part of the name
-    if (Digits.size() > 9) return;
+    if (Digits.size() > 10) return;                          // up to 10 digits, below MAX_int32 (UnrealNames.cpp 1938-1947)
     for (char C : Digits) if (C < '0' || C > '9') return;
+    const long long Value = std::stoll(Digits);
+    if (Value >= 2147483647) return;
 
     OutBase = S.substr(0, Underscore);
-    OutNumber = std::stoi(Digits) + 1;                       // stored number is one-based
+    OutNumber = int32(Value) + 1;                            // stored number is one-based
 }
 
 /* A non-ASCII string is stored (and so hashed) as WIDECHARs; the WIDECHAR Strihash takes both bytes of each. */

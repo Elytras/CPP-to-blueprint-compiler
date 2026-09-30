@@ -3384,13 +3384,14 @@ def name_numbers():
 
 def name_suffix():
     """The ten-digit case of the same rule: below MAX_int32, FName splits it too."""
-    base = pending_asset('NameSuffix')
+    base = asset('NameSuffix')
     refs, names = name_pairs(base)
     whole = [n for n in ('Tag_1234567890', 'Count_1234567890') if n in names]
     assert not whole, 'stored whole, Number 0: %s' % whole
     assert ('Count', 1234567891) in refs['NameSuffix_C', 'struct'] & refs['Default__NameSuffix_C', 'tags']
     assert ('Tag', 1234567891) in refs['Tag', 'script'] and ('Tag', 1234567891) in refs['Same', 'script']
     keeps_invariants(base)
+    print('ok  NameSuffix: a 10-digit _N suffix below MAX_int32 is stored split, as FName splits it')
 
 
 def subobject_template():
@@ -3644,7 +3645,7 @@ def tables_rules_fire():
 
 
 name_numbers()
-pending('NameSuffix: a 10-digit _N suffix below MAX_int32 is stored split, as FName splits it', name_suffix)
+name_suffix()
 pending("OverrideTest Walker: a default-subobject override names its parent CDO's subobject as its archetype", subobject_template)
 pending("SubobjectChain: an override's archetype is the same-named subobject of the parent CDO, a /Game one serialized before create",
         subobject_chain)
@@ -3739,14 +3740,17 @@ def parm_width():
 
 def parm_over():
     """255 arguments and a result would be 256 CPF_Parm properties: NumParms wraps to 0 (Class.cpp:5638-5651)."""
-    refused('ParmOver', '  int32 Sum(%s) { return A0; }\n' % ', '.join('int32 A%d' % k for k in range(255)), 'parameter')
+    refused('ParmOver', '  int32 Sum(%s) { return A0; }\n' % ', '.join('int32 A%d' % k for k in range(255)),
+            'ParmOver::Sum: 256 parameters, the return value included; a function takes at most 255')
+    print('ok  ParmWidth: 255 arguments and a result (256 parameters, NumParms a uint8) are refused')
 
 
 def parm_huge():
     """A 65600-byte struct argument: ParmsSize, a uint16, wraps and ProcessEvent copies the wrong range
     (ScriptCore.cpp:1952-1958)."""
-    refused('ParmHuge', '  int32 Take(FParmHuge B) { return 0; }\n', 'parameter',
+    refused('ParmHuge', '  int32 Take(FParmHuge B) { return 0; }\n', "a function's parameter block holds at most 65535",
             top='struct FParmHuge {\n  UE_STRUCT;\n%s};\n' % ''.join('  int32 M%d;\n' % k for k in range(16400)))
+    print('ok  ParmWidth: a 65600-byte parameter block (ParmsSize a uint16) is refused')
 
 
 # Children of native parents with a non-default tail (ClassTailMeta): parent, the ScriptInherit bits it passes on,
@@ -3876,8 +3880,8 @@ SHADOWS = {
 
 class_tail_keep()
 parm_width()
-pending('ParmWidth: 255 arguments and a result (256 parameters, NumParms a uint8) refused', parm_over)
-pending('ParmWidth: a 65600-byte parameter block (ParmsSize a uint16) refused', parm_huge)
+parm_over()
+parm_huge()
 for _name, (_parent, _bits, _within, _config) in TAIL_META.items():
     pending('ClassTailMeta %s: %s\'s tail (flags %#x, within %s, config %s)' % (_name, _parent.split('.')[-1], _bits,
                                                                                _within.split('.')[-1], _config), tail_meta(_name))

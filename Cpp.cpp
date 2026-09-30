@@ -10555,6 +10555,25 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             PD.PropertyFlags &= ~uint64(CPF_BlueprintVisible | CPF_BlueprintReadOnly);
             Params.push_back(PD);
         }
+        /* UFunction::NumParms is a uint8 and ParmsSize a uint16 (Class.h 1800-1805): past either, Link wraps them and
+           ProcessEvent copies the wrong range (Class.cpp 5638-5651, ScriptCore.cpp 1952-1958). */
+        if (Params.size() > 255)
+        { *Err = R.CppName + "::" + Fn.Name + ": " + std::to_string(Params.size()) + " parameters, the return value included; a function takes at most 255"; return false; }
+        {
+            int64 ParmsEnd = 0;
+            auto Add = [&](std::string T) {
+                T = StripTypeKeywords(T);
+                while (!T.empty() && (T.back() == '&' || T.back() == ' ')) T.pop_back();
+                int32 Size = 0, Align = 1;
+                std::string NoLayout;
+                if (T.empty() || T == "void" || !LayoutOf(StripTypeKeywords(T), &Size, &Align, &NoLayout)) return;
+                ParmsEnd = (ParmsEnd + Align - 1) / std::max(Align, 1) * std::max(Align, 1) + Size;
+            };
+            ForEach(M, [&](const Json& C) { if (Kind(C) == "ParmVarDecl") Add(TypeOf(C)); });
+            Add(RetType);
+            if (ParmsEnd > 65535)
+            { *Err = R.CppName + "::" + Fn.Name + ": its parameters take " + std::to_string(ParmsEnd) + " bytes; a function's parameter block holds at most 65535"; return false; }
+        }
 
         std::vector<FStmtIR> Stmts;
         std::vector<FPropertyDef> Locals;
