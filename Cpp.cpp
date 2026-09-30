@@ -10686,6 +10686,18 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             for (; C; C = C->Base.empty() ? nullptr : Find(C->Base)) if (C->UeName == "SceneComponent") return true;
             return false;
         };
+        /* No root of this class's in a subclass whose actor already has one when its SCS runs: a Blueprint parent's SCS
+           always leaves one (SimpleConstructionScript.cpp 690-702), and a native parent sets one in its constructor
+           (Character.cpp 59) or ExecuteConstruction takes its first unattached native scene component (ActorConstruction.cpp
+           736-746). The first own scene component then attaches under it (ExecuteScriptOnActor, 686) and keeps its
+           transform like the rest. */
+        bool bRootInherited = false;
+        for (const FRecord* A = R.Base.empty() ? nullptr : Find(R.Base); A && !bRootInherited; A = A->Base.empty() ? nullptr : Find(A->Base))
+        {
+            bRootInherited = !A->IsNative() || (A->UeName.size() > 2 && A->UeName.compare(A->UeName.size() - 2, 2, "_C") == 0);
+            for (const auto& [Member, Spec] : A->Subobjects)
+                bRootInherited = bRootInherited || (Spec.rfind('.') != std::string::npos && IsScene(Find("U" + Spec.substr(Spec.rfind('.') + 1))));
+        }
         std::vector<std::pair<std::string, const FRecord*>> Scene;     // this class's scene components, the root first
         for (const Json* F : R.Fields)
         {
@@ -10745,7 +10757,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             for (double& A : Out) A += 0.0;     // no -0 in the cooked float
             return Out;
         };
-        if (!Scene.empty())
+        if (!Scene.empty() && !bRootInherited)
         {
             std::vector<FPropertyDef>& RootDefs = ComponentDefaults[Scene[0].first];
             const FVec Lr = Read(RootDefs, "RelativeLocation", 0), Rr = Read(RootDefs, "RelativeRotation", 0),

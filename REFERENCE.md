@@ -2760,7 +2760,9 @@ Notes:
 ### The root's transform
 
 The engine puts an actor's root at the spawn transform and ignores the location, rotation and scale on the root's
-template.
+template. This is only about a class whose parent has no root: below a mod or game Blueprint parent, or a native one
+with a scene component such as `ACharacter`, the first scene component attaches under the inherited root and keeps
+its own location, rotation and scale like any other.
 
 | You write | What it does | Status |
 |---|---|---|

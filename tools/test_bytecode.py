@@ -5391,23 +5391,17 @@ def comp_override_chain():
     print('ok  CompOverrideChain: an override template is archetyped on the nearest ancestor\'s override, and loads its values')
 
 
-comp_tick()
-comp_tick_component()
-comp_tick_patch()
-comp_override_chain()
-
-
-# ---- Pending: what AssetGen does not do yet
-
-
 def world_location(p, ci, var):
     """Where component `var` of class ci ends up relative to the spawned actor, as the SCS builds it: its
     RelativeLocation plus its parent's, up the ChildNodes. A root node naming a parent hangs off that ancestor
     Blueprint's node, or off a native subobject (only the native root, at the actor's origin, is known here). A
     parentless root node hangs off the actor's root when the actor already has one - an ancestor Blueprint's SCS built
     one, or the native class has one (SimpleConstructionScript.cpp 643, 686) - and otherwise IS the actor's root, put at
-    the spawn transform whatever its template says (SCS_Node.cpp 122-135). Rotation and scale must be absent (identity),
-    so locations add."""
+    the spawn transform whatever its template says (SCS_Node.cpp 122-135). A native class has one when it has a scene
+    component default subobject: its constructor names the root (ACharacter's capsule, Character.cpp 59), or
+    ExecuteConstruction takes the first unattached native scene component (ActorConstruction.cpp 736-746) - so also
+    where UeApi leaves RootComponent unmarked because two subobjects fit it. Rotation and scale must be absent
+    (identity), so locations add."""
     si, nodes, roots, dsr = comp.scs(p, ci)
     parent_of = {c: k for k, n in nodes.items() for c in n.children}
     k = next(k for k, n in nodes.items() if n.name == var)
@@ -5431,7 +5425,9 @@ def world_location(p, ci, var):
                 return add(total, rel)
             q, qi = next((q, qi) for q, qi in links[1:] if q.exports[qi]['name'].lower() == n.owner.lower())
             return add(add(total, rel), world_location(q, qi, n.parent))
-        inherited = bool(native and comp.native_root(native)) or any(comp.executed(q, qi, False) for q, qi in links[1:])
+        native_root = native and (comp.native_root(native)
+                                  or any(comp.native_is_scene(c) for c in (comp.native_subobjects(native) or {}).values()))
+        inherited = bool(native_root) or any(comp.executed(q, qi, False) for q, qi in links[1:])
         return add(total, rel) if inherited else total
 
 
@@ -5440,17 +5436,28 @@ def comp_root_keep():
     so its first own scene component attaches to that root and keeps its offset: Pivot sits 100 above the actor's
     origin and Glow, attached to Pivot, 10 in front of it. RigSpot's Spot, a light, sits 50 up. None is warned about as
     the actor's root."""
-    folder = os.path.dirname(pending_asset('CompRootKeep'))
+    folder = os.path.dirname(asset('CompRootKeep'))
     for cls, want in (('CompRootKeep', {'Pivot': (0.0, 0.0, 100.0), 'Glow': (10.0, 0.0, 100.0)}),
                       ('RigChar', {'Pivot': (0.0, 0.0, 100.0), 'Glow': (10.0, 0.0, 100.0)}),
                       ('RigSpot', {'Spot': (0.0, 0.0, 50.0)})):
         p, ci = class_pkg(os.path.join(folder, cls))
         got = {var: world_location(p, ci, var) for var in want}
         assert got == want, '%s: components sit at %s from the actor, want %s' % (cls, got, want)
-    tmp, out, log = compile_to(open(os.path.join(PENDING, 'CompRootKeep.cpp'), encoding='utf-8-sig').read(), 'CompRootKeep')
+    tmp, out, log = compile_to(open(os.path.join(TESTS, 'CompRootKeep.cpp'), encoding='utf-8-sig').read(), 'CompRootKeep')
     shutil.rmtree(tmp, ignore_errors=True)
     assert "is the actor's root" not in log, log
     for cls in ('CompRootKeep', 'RigChar', 'RigSpot', 'RigBase'): keeps_invariants(os.path.join(folder, cls))
+    print('ok  CompRootKeep: a subclass\'s first scene component attaches to the inherited root and keeps its transform')
+
+
+comp_tick()
+comp_tick_component()
+comp_tick_patch()
+comp_override_chain()
+comp_root_keep()
+
+
+# ---- Pending: what AssetGen does not do yet
 
 
 def comp_attach_inherited():
@@ -5467,7 +5474,6 @@ def comp_attach_inherited():
         keeps_invariants(os.path.join(folder, cls))
 
 
-pending('CompRootKeep: a subclass\'s first scene component attaches to the inherited root and keeps its transform', comp_root_keep)
 pending('CompAttachInherited: an own component attached to an inherited Blueprint or native component', comp_attach_inherited)
 
 

@@ -487,7 +487,8 @@ public:
 Watch for:
 
 - The engine puts the root at the spawn transform and ignores the root's own location, rotation and scale. A plain
-  `USceneComponent` root hands them on to the components attached to it. A mesh or a light as the root keeps them,
+  `USceneComponent` root hands them on to the components attached to it. (A class whose parent already has a root,
+  such as a Blueprint parent or `ACharacter`, adds no root: its first scene component keeps its transform.) A mesh or a light as the root keeps them,
   and AssetGen warns that they are not applied. Declare a `USceneComponent` first.
 - `UE_DEFAULTS` is read when the mod is built and never runs. A call, an `if`, a `+=`, `nullptr`, or a member path
   such as `Lamp->RelativeLocation.Z = 50.0f;` is refused; the member path gets a misleading message about genueapi,
