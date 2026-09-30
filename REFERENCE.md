@@ -3607,6 +3607,11 @@ Notes:
 - Add never calls `Activate()`. For a UBlueprintAsyncActionBase such as UAsyncTaskDownloadImage, call `Activate()`
   yourself after binding, as the editor's node does. Once the binding method returns, nothing in your code refers to a
   proxy kept only in a local, so keep it in a member variable as above.
+- The montage proxy and the widget animation proxy (`CreateProxyObjectForPlayMontage`,
+  `CreatePlayAnimationProxyObject`, `CreatePlayAnimationTimeRangeProxyObject`) are kept alive by nothing but the
+  variable that holds them. Put in a local of a method that does not wait, the compiler also stores it into a hidden
+  transient member of the class, `<Method>_<Local>`, so it outlives the call as the editor's event graph keeps it;
+  a later call of the method replaces it there.
 - To continue a function when a dispatcher next fires, instead of binding a handler, use `UE_AWAIT`: see
   [Waiting on events](#waiting-on-events). [examples/AwaitEvents.cpp](examples/AwaitEvents.cpp) uses UE_AWAIT and
   contrasts it with the callback style in a comment.
@@ -4401,6 +4406,7 @@ Notes:
 | `Pause(2.0f);`, an inline helper that calls Delay | The helper is expanded into the caller, so the caller becomes the method that waits, and it resumes after the helper's Delay. Each expansion is a call site of its own. The caller has to follow the latent rules. A non-inline helper that waits returns to its caller at its first wait instead. | Yes |
 | `void ReceiveBeginPlay()` with a Delay inside | An override of an engine event can wait. The engine still calls it as that event. | Yes |
 | `Twice(1); Twice(2);` before `Twice` resumes | An object has one frame for a method that waits, not one per call. The second call starts at the top and overwrites the pending call's parameters and locals, and its Delay is ignored because one is already pending at that call site. The method resumes once, with the second call's values. An editor event graph behaves the same; a C++ coroutine would not. | Yes |
+| `UUserWidget *W = CreateWidget<UUserWidget>(P); UKismetSystemLibrary::Delay(1.0f); Kept = W;` | The frame holds an object local weakly: unless the object is flagged RF_StrongRefOnFrame, as SpawnObject's (`NewObject`) and the callback proxies' are, a garbage collection during the wait can take it, and the local then reads None. The editor's event graph is the same. The compiler warns where a local may hold an object the method made or loaded (not one read out of a property, nor an actor, component or async action) across a wait and reads it after: keep such an object in a member. | Warns |
 | `TArray<int32> Nums;` with no initializer | Empty on the object's first call. On a later call it holds whatever the previous call left in it, where C++ would give a new empty array. Initialize the local, or `Clear()` it at the top. Inside a loop it is reset every round, as usual. | Yes |
 
 ```cpp
@@ -4569,8 +4575,10 @@ the game's dispatchers and one of its own, and its comments show the async-actio
 | You write | What it does | Status |
 |---|---|---|
 | `FName Notify = UE_AWAIT(Proxy->OnCompleted);` | Binds a generated event to the dispatcher and returns to the caller. When the dispatcher fires, the event stores its one parameter, and the method resumes after the await with that value. | Yes |
-| `Image = UE_AWAIT(Task->OnSuccess);` on an async action | For a `UBlueprintAsyncActionBase`, such as `UAsyncTaskDownloadImage`, AssetGen calls `Activate()` right after binding the first awaited dispatcher of that variable, as the editor's async node does. A second await on the same variable does not activate it again. An object that is not an async action, such as the montage proxy, is never activated: its factory already started the work. | Yes |
+| `Image = UE_AWAIT(Task->OnSuccess);` on an async action | For a `UBlueprintAsyncActionBase`, such as `UAsyncTaskDownloadImage`, AssetGen calls `Activate()` right after the bind, as the editor's async node does, at the first await of that variable on each path the method runs: in whichever branch of an `if` runs, and in a loop on the first round only. A later await on the same variable does not activate it again, until the variable is assigned a new action. An object that is not an async action, such as the montage proxy, is never activated: its factory already started the work. | Yes |
+| `if (Stop) UE_AWAIT(T->OnSuccess);` then `UE_AWAIT(T->OnFail);` | Refused: `some paths reach it with T's async action already activated and some without`. Keeping the second await's `Activate()` would start the action twice on one path, dropping it would never start it on the other. The same for a loop that can skip its await, such as with `continue` before it. | Refused |
 | `UE_AWAIT(Target->OnDestroyed);` | As a statement: waits for the dispatcher and drops its value. | Yes |
+| `UE_AWAIT(Task->OnSuccess);` with `Task` None | The bind, and `Activate()` for an async action, run only when the object passes IsValid, as the editor's async node tests its proxy. A None or pending-kill object binds nothing and logs no "Accessed None"; the method stays parked at the await. | Yes |
 | `int32 Code = UE_AWAIT(OnReady);` | The object in front of the dispatcher may be self, a member or a local. | Yes |
 | the code after the await, on a later broadcast | The generated event stays bound, so each later broadcast runs the code after the await again: it acts as a handler, not a one-shot wait. The event has no name you can write, so only `Clear()` on the dispatcher stops it, and that drops every binding. | Yes |
 | `UE_AWAIT(OnScored);` on a dispatcher of two or more parameters | Compiles as a statement and resumes, but the values are dropped: `UE_AWAIT` has a value only for a dispatcher of exactly one parameter. Bind a handler to read them. | Not yet |
@@ -5899,10 +5907,20 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   UE_AWAIT in a class that is not an actor, component, widget, GameInstance or subsystem, such as a UObject child. The
   build goes on. Fix: create the object with an actor or component as its Outer, as `NewObject<T>(this)` does from an
   actor. See [Latent calls](#latent-calls).
+- `warning: <Class>::<Function> keeps <Local> (a <Type>) across a wait only in its ubergraph frame, which holds an object
+  weakly`: a method that waits (Delay, LoadAsset, UE_AWAIT) holds an object it made or loaded only in a local across a
+  wait and reads the local after it. The frame keeps an object only weakly, so a garbage collection during the wait
+  can take it and the local reads None. The build goes on. Fix: keep the object in a member variable. See
+  [When the code after a wait runs](#when-the-code-after-a-wait-runs).
 - `UE_AWAIT: keep the object in a variable, it is used twice`: the dispatcher's object is a call result, as in
   `UE_AWAIT(UAsyncTaskDownloadImage::DownloadImage(Url)->OnSuccess)`. The object is used by the bind and again to
   start the action. Fix: `UAsyncTaskDownloadImage *Task = UAsyncTaskDownloadImage::DownloadImage(Url);` and then
   `Image = UE_AWAIT(Task->OnSuccess);`. See [Waiting on events](#waiting-on-events).
+- `UE_AWAIT on <Var>: some paths reach it with <Var>'s async action already activated and some without, so it would
+  start twice or never`: an await on an async action that one path reaches after an earlier await on the same
+  variable and another path reaches without one, as in `if (Stop) UE_AWAIT(T->OnSuccess); UE_AWAIT(T->OnFail);`, or
+  in a loop that can skip its await (`continue` before it). Fix: await the variable on every path before this await
+  or on none, or assign it again on each path. See [Waiting on events](#waiting-on-events).
 - `<Class>::<Function>: static <Local> lives in the ubergraph's frame, which only a function that makes a latent call
   runs in; make <Local> a member`: a `static` local that the function changes, as in
   `static int32 Count = 0; ++Count;`, in a method that makes no latent call. Fix: make it a member of the class. A

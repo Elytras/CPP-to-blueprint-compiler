@@ -156,9 +156,6 @@ KNOWN_RULES = {     # sweep rules the suite's own packages still break, each wit
     'export_archetype': 'native default-subobject overrides have a null TemplateIndex',
     'import_chains': 'packages import themselves (their own package, class and functions)',
     'instanced_refs_flagged': 'no property ever gets CPF_InstancedReference / CPF_ContainsInstancedReference',
-    'latent_async_proxy_validated': 'the async proxy is bound and activated with no IsValid gate',
-    'latent_proxy_frame_held': 'AsyncTest.Play keeps its montage callback proxy only in a local of a function that '
-                               'does not wait',
     'native_out_arrays_emptied': "a native's out TArray is not emptied before the call, so Set_ToArray appends",
 }
 
@@ -6214,35 +6211,47 @@ def await_fakes():
 def await_paths():
     """UE_AWAIT on an async action activates it once, after its dispatchers are bound, on whichever path runs
     (K2Node_BaseAsyncTask.cpp 410-467): the else branch's await as well as the then branch's, and an await inside a
-    loop on its first round only - a second Activate starts an action like AsyncLoadPrimaryAsset again."""
+    loop on its first round only - a second Activate starts an action like AsyncLoadPrimaryAsset again. An await some
+    paths reach with the action activated and some without is refused: keeping its Activate starts the action twice
+    on one path, dropping it never on the other."""
     def once(activated, task, disp, what):
         """The task was activated exactly once, with the dispatcher awaited already bound (others may be too)."""
         mine = [bound for t, bound in activated if t is task]
         assert len(mine) == 1 and disp in mine[0], '%s activates the task %d times, want once after %s is bound%s' % (
             what, len(mine), disp, '' if not mine else ' (bound: %s)' % mine)
 
-    def either():
-        made, activated, natives = await_fakes()
-        for ok, disp in ((True, 'OnSuccess'), (False, 'OnFail')):
-            vm = VM(pending_asset('AwaitPaths'), natives, Rounds=0)
-            vm.call('Either', 'u', ok)
-            task = made[-1]
-            once(activated, task, disp, 'Either(bOk=%s)' % ok)
-            vm.broadcast(task, disp, 'tex' if ok else None)
-            assert vm.self.vars == (dict(Rounds=0, Image='tex') if ok else dict(Rounds=-1)), vm.self.vars
+    made, activated, natives = await_fakes()
+    for ok, disp in ((True, 'OnSuccess'), (False, 'OnFail')):
+        vm = VM(asset('AwaitPaths'), natives, Rounds=0)
+        vm.call('Either', 'u', ok)
+        task = made[-1]
+        once(activated, task, disp, 'Either(bOk=%s)' % ok)
+        vm.broadcast(task, disp, 'tex' if ok else None)
+        assert vm.self.vars == (dict(Rounds=0, Image='tex') if ok else dict(Rounds=-1)), vm.self.vars
+    print("ok  AwaitPaths.Either: the else branch's UE_AWAIT activates the async action too")
 
-    def twice():
+    for fn in ('Twice', 'Until'):
         made, activated, natives = await_fakes()
-        vm = VM(pending_asset('AwaitPaths'), natives, Rounds=0)
-        vm.call('Twice', 'u')
+        vm = VM(asset('AwaitPaths'), natives, Rounds=0)
+        vm.call(fn, 'u')
         task = made[-1]
         vm.broadcast(task, 'OnSuccess', 't1')
         vm.broadcast(task, 'OnSuccess', 't2')
-        assert vm.self.vars == dict(Rounds=2, Image='t2'), vm.self.vars
+        assert vm.self.vars == dict(Rounds=2, Image='t2'), (fn, vm.self.vars)
         assert len(made) == 1, made
-        once(activated, task, 'OnSuccess', 'Twice')
-    pending("AwaitPaths.Either: the else branch's UE_AWAIT activates the async action too", either)
-    pending('AwaitPaths.Twice: a UE_AWAIT in a loop activates its async action once', twice)
+        once(activated, task, 'OnSuccess', fn)
+    made, activated, natives = await_fakes()
+    vm = VM(asset('AwaitPaths'), natives, Rounds=2)
+    vm.call('Until', 'u')                                   # the first round breaks: nothing bound, nothing activated
+    assert not activated and not vm.binds and vm.self.vars == dict(Rounds=2), (activated, vm.binds, vm.self.vars)
+    print('ok  AwaitPaths.Twice / Until: a UE_AWAIT in a loop activates its async action once, on the first round')
+
+    umg, task = '#include "UeApi/UMG.h"\n', '    UAsyncTaskDownloadImage* T = UAsyncTaskDownloadImage::DownloadImage(Url);\n'
+    for mod, body in (('AwaitSkips', '    for (int32 I = 0; I < 3; ++I) { if (Stop) continue; UE_AWAIT(T->OnSuccess); }\n'),
+                      ('AwaitMaybe', '    if (Stop) UE_AWAIT(T->OnSuccess);\n    UE_AWAIT(T->OnFail);\n')):
+        refused(mod, '  bool Stop;\n  void F(FString Url) {\n%s%s  }\n' % (task, body),
+                "some paths reach it with T's async action already activated and some without", top=umg)
+    print('ok  AwaitSkips / AwaitMaybe: an await reached with its action activated on some paths only is refused')
 
 
 def await_null_proxy():
@@ -6250,22 +6259,21 @@ def await_null_proxy():
     and Activate (K2Node_BaseAsyncTask.cpp 393-408), where binding through a None context logs an Accessed None
     script warning per bind and per Activate (ScriptCore.cpp 2904-2937). Nothing after the await runs either way.
     (DownloadImage itself never returns None; a factory such as CreateMoveToProxyObject does, with no pawn.) The same
-    mod with a real task binds, activates and resumes, so the gap is the missing test and nothing else."""
-    def check():
-        made, activated, natives = await_fakes()
-        vm = VM(pending_asset('AwaitNullProxy'), natives)
-        vm.call('Download', 'u')
-        once_ok = len(activated) == 1 and activated[0][0] is made[-1] and 'OnSuccess' in activated[0][1]
-        vm.broadcast(made[-1], 'OnSuccess', 'tex')
-        assert once_ok and vm.self.vars == dict(Image='tex') and not vm.accessed_none, (activated, vm.self.vars)
-        made, activated, natives = await_fakes()
-        natives['DownloadImage'] = lambda vm, ctx, *a: None
-        vm = VM(pending_asset('AwaitNullProxy'), natives)
-        vm.call('Download', '')
-        assert not activated and 'Image' not in vm.self.vars and not vm.binds, (activated, vm.self.vars, vm.binds)
-        assert not vm.accessed_none, 'the None proxy is bound / activated through a warning context: Accessed None ' \
-                                     'at %s' % vm.accessed_none
-    pending('AwaitNullProxy.Download: a None async proxy skips its binds and Activate, as IsValid gates them', check)
+    mod with a real task binds, activates and resumes, so the None case is the IsValid test and nothing else."""
+    made, activated, natives = await_fakes()
+    vm = VM(asset('AwaitNullProxy'), natives)
+    vm.call('Download', 'u')
+    once_ok = len(activated) == 1 and activated[0][0] is made[-1] and 'OnSuccess' in activated[0][1]
+    vm.broadcast(made[-1], 'OnSuccess', 'tex')
+    assert once_ok and vm.self.vars == dict(Image='tex') and not vm.accessed_none, (activated, vm.self.vars)
+    made, activated, natives = await_fakes()
+    natives['DownloadImage'] = lambda vm, ctx, *a: None
+    vm = VM(asset('AwaitNullProxy'), natives)
+    vm.call('Download', '')
+    assert not activated and 'Image' not in vm.self.vars and not vm.binds, (activated, vm.self.vars, vm.binds)
+    assert not vm.accessed_none, 'the None proxy is bound / activated through a warning context: Accessed None ' \
+                                 'at %s' % vm.accessed_none
+    print('ok  AwaitNullProxy.Download: a None async proxy skips its binds and Activate, as IsValid gates them')
 
 
 def proxy_frame_held():
@@ -6273,41 +6281,45 @@ def proxy_frame_held():
     RF_StrongRefOnFrame and roots it nowhere else, PlayMontageCallbackProxy.cpp 15-23; the anim instance's delegates
     reach it weakly, 56-63) must be stored where the garbage collector sees it: a member, or a local of the ubergraph,
     whose frame the class reports (BlueprintGeneratedClass.cpp 1683-1713). ProxyLocalHeld.Play binds its proxy in a
-    plain function and keeps it in that function's local: after Play returns nothing references it, a GC collects it,
-    and Done never runs. A 'warning:' at ProxyLocalHeld::Play about its proxy is the other way to close this. (The
-    suite's AsyncTest.Play is the same case; latent_proxy_frame_held finds it there.)"""
+    plain function, whose local dies with the call: the compiler stores it into a transient member too, so after Play
+    returns the object still references it and a GC leaves it for Done. (The suite's AsyncTest.Play is the same case;
+    latent_proxy_frame_held checks it there.)"""
     import invariants
+    base = asset('ProxyLocalHeld')
+    pkg = invariants.Package(base)
+    local = lambda n: n.op == 0x00 and ('.'.join(n.ops[0][1]), n.ops[0][2])
 
-    def check():
-        base = pending_asset('ProxyLocalHeld')
-        if said(latent_compile_log(os.path.join(PENDING, 'ProxyLocalHeld.cpp'))[1], r'ProxyLocalHeld::Play\b', r'\bproxy\b'):
-            return
-        pkg = invariants.Package(base)
-        local = lambda n: n.op == 0x00 and ('.'.join(n.ops[0][1]), n.ops[0][2])
-
-        def holder(i, dest):
-            """Where a Let's destination keeps the proxy: a member, the ubergraph's frame, or a plain local - unless
-            that local is copied on into a member or the frame in the same function."""
-            if dest.op == 0x01: return 'a member'
-            if dest.op != 0x00: return 'op %02x' % dest.op
-            owner = dest.ops[0][2]
-            st = pkg.struct(owner - 1) if owner > 0 else None
-            if st and st.function_flags & 0x8000: return 'the frame'
-            for n in invariants.statements(pkg, i)[0]:
-                if (n.op in (0x0F, 0x5F) and n.kids[0].op == 0x01 and local(n.kids[1]) == local(dest)) or \
-                        (n.op == 0x64 and local(n.kids[0]) == local(dest)):
-                    return 'a member' if n.op != 0x64 else 'the frame'
-            return 'a local of ' + pkg.path(owner)
-        factory = lambda n: n.op in (0x1B, 0x1C, 0x45, 0x46, 0x68) and n.ops[0][0] == 'obj' \
-            and (pkg.path(n.ops[0][1]) or '').endswith(':CreateProxyObjectForPlayMontage')
-        held = []
-        for i, st in invariants.functions(pkg):
-            for n in invariants.statements(pkg, i)[0]:
-                if n.op in (0x0F, 0x5F) and factory(n.kids[1]): held.append(holder(i, n.kids[0]))
-                elif n.op == 0x64 and factory(n.kids[0]): held.append('the frame')
-        assert len(held) == 1, held
-        assert held[0] in ('a member', 'the frame'), 'the montage proxy is kept in %s' % held[0]
-    pending('ProxyLocalHeld.Play: a callback proxy bound in a plain function is kept where the GC sees it', check)
+    def holder(i, dest):
+        """Where a Let's destination keeps the proxy: a member, the ubergraph's frame, or a plain local - unless
+        that local is copied on into a member or the frame in the same function."""
+        if dest.op == 0x01: return 'a member'
+        if dest.op != 0x00: return 'op %02x' % dest.op
+        owner = dest.ops[0][2]
+        st = pkg.struct(owner - 1) if owner > 0 else None
+        if st and st.function_flags & 0x8000: return 'the frame'
+        for n in invariants.statements(pkg, i)[0]:
+            if (n.op in (0x0F, 0x5F) and n.kids[0].op == 0x01 and local(n.kids[1]) == local(dest)) or \
+                    (n.op == 0x64 and local(n.kids[0]) == local(dest)):
+                return 'a member' if n.op != 0x64 else 'the frame'
+        return 'a local of ' + pkg.path(owner)
+    factory = lambda n: n.op in (0x1B, 0x1C, 0x45, 0x46, 0x68) and n.ops[0][0] == 'obj' \
+        and (pkg.path(n.ops[0][1]) or '').endswith(':CreateProxyObjectForPlayMontage')
+    held = []
+    for i, st in invariants.functions(pkg):
+        for n in invariants.statements(pkg, i)[0]:
+            if n.op in (0x0F, 0x5F) and factory(n.kids[1]): held.append(holder(i, n.kids[0]))
+            elif n.op == 0x64 and factory(n.kids[0]): held.append('the frame')
+    assert len(held) == 1, held
+    assert held[0] in ('a member', 'the frame'), 'the montage proxy is kept in %s' % held[0]
+    made = []
+    vm = VM(base, {'CreateProxyObjectForPlayMontage': lambda vm, ctx, *a: made.append(Obj('PlayMontageCallbackProxy')) or made[-1]},
+            Mesh='mesh', Montage='montage', Last='None')
+    vm.call('Play')
+    assert any(v is made[-1] for v in vm.self.vars.values()), 'nothing of the object holds the proxy: %s' % vm.self.vars
+    vm.broadcast(made[-1], 'OnCompleted', 'End')
+    assert vm.self.vars['Last'] == 'End', vm.self.vars
+    keeps_invariants(base)
+    print('ok  ProxyLocalHeld.Play: a callback proxy bound in a plain function is kept in a member, where the GC sees it')
 
 
 def deferred_left():
@@ -6340,9 +6352,13 @@ def spawn_abstract():
 def wait_hold():
     """A local that holds an object across a wait is a weak reference in the persistent frame unless the object has
     RF_StrongRefOnFrame (UObjectGlobals.cpp 3460-3483): WaitHold.F's widget, made before the Delay and read after it,
-    can be collected in between. The compiler knows which locals outlive a wait, so it should say so."""
-    pending('WaitHold.F: an object local read after a wait warns that the frame does not keep it',
-            says('WaitHold', 'about W outliving the wait', r'WaitHold::F\b', r'\bW\b'))
+    can be collected in between. The compiler knows which locals outlive a wait, so it says so. Its controls are not
+    warned about: a widget read out of a member, one made after the wait, a SpawnObject result, an actor."""
+    log = LOGS['WaitHold']
+    assert said(log, r'WaitHold::F\b', r'\bW\b'), 'nothing said about W outliving the wait: ' + log
+    held = re.findall(r'warning: WaitHold::(\w+) keeps (\w+)', log)
+    assert held == [('F', 'W')], held
+    print('ok  WaitHold.F: an object local read after a wait warns that the frame does not keep it; its controls do not')
 
 
 latent_refusals()

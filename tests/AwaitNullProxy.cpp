@@ -5,7 +5,7 @@ The editor's async node calls the factory, tests the proxy with UKismetSystemLib
 dispatchers and calls Activate only when it is valid; the invalid branch goes straight on
 (K2Node_BaseAsyncTask.cpp 393-408, 440-448). Without that test a None proxy turns every bind and the Activate into an
 'Accessed None' script warning (ScriptCore.cpp 2904-2937; execAddMulticastDelegate binds nothing, 3085-3101). The
-method waits forever either way. Pending: UE_AWAIT lowers the binds and the Activate with no test.
+method waits forever either way. UE_AWAIT tests the object the same way before its bind and its Activate.
 */
 #include "UeApi/Types.h"
 

@@ -3,9 +3,10 @@ AwaitPaths.cpp - UE_AWAIT on an async action, on more than the straight path.
 
 K2Node_AsyncAction binds every dispatcher the node listens on and then calls Activate, once per action, on whichever
 path reaches the node (K2Node_BaseAsyncTask.cpp 410-467): Activate may broadcast at once, and an action whose
-Activate starts its work (AsyncActionLoadPrimaryAsset.cpp 6-35) runs it again on a second call. Pending: the compiler
-activates the first await of each variable in the order it lowers them, not the order they run, so the else branch's
-await never activates its task and an await inside a loop activates it on every round.
+Activate starts its work (AsyncActionLoadPrimaryAsset.cpp 6-35) runs it again on a second call. The compiler places
+each await's Activate by the order the awaits run, not the order it lowers them: the else branch's await activates its
+task as the then branch's does, and an await inside a loop activates it on the first round only (the loop's first
+round runs as a copy before it, whose await resumes in the loop).
 */
 #include "UeApi/Types.h"
 
@@ -34,6 +35,17 @@ public:
   void Twice(FString Url) {
     UAsyncTaskDownloadImage *T = UAsyncTaskDownloadImage::DownloadImage(Url);
     for (int32 I = 0; I < 2; ++I) {
+      Image = UE_AWAIT(T->OnSuccess);
+      ++Rounds;
+    }
+  }
+
+  /* The same with the loop's test a `break` before the await: the first round's break leaves without waiting. */
+  void Until(FString Url) {
+    UAsyncTaskDownloadImage *T = UAsyncTaskDownloadImage::DownloadImage(Url);
+    while (true) {
+      if (Rounds >= 2)
+        break;
       Image = UE_AWAIT(T->OnSuccess);
       ++Rounds;
     }

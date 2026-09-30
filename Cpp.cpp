@@ -638,6 +638,8 @@ struct FCallIR
     bool bLocal = false;                // EX_LocalVirtualFunction / EX_LocalFinalFunction: a script function that is no RPC
     std::string View;                   // __RefAtInline__: the TArray field of the view struct in Extra
     std::shared_ptr<int32> Resume;      // __AwaitPoint__: receives the ubergraph offset the awaited event re-enters at
+    bool bStrongOnFrame = false;        // its result is RF_StrongRefOnFrame, so a persistent frame holding it keeps it
+    bool bFrameHeld = false;            // ... and nothing else does: see HeldProxies
     std::shared_ptr<FArgIR> Target;     // the object an instance call runs against; null = self
     std::vector<FArgIR> Args;
 };
@@ -1588,9 +1590,12 @@ private:
     };
     std::string FreshEventName(const std::string& Stem);
     bool LowerAwait(const Json& CallNode, FBlueprintClass& BP, FCallIR& Out, std::string* Err);
+    bool PlaceActivations(std::vector<FStmtIR>& Stmts, std::string* Err);
+    bool PeelFirstRound(std::vector<FStmtIR>& Stmts, const int32* Await);
+    std::map<std::string, std::string> SourceLocals;  // LowerBody: the method's own declared locals, by name -> C++ type
+    void WarnFrameWeakLocals(const std::vector<FStmtIR>& Stmts, const std::string& Where);
     std::vector<FCompletion> Completions;             // the method being lowered's
     std::set<std::string> GeneratedEvents;            // the class's, so two never share a name
-    std::set<std::string> ActivatedActions;           // the method's variables an await already activated
     int32 SwitchDepth = 0;                            // LowerBody: the switches around it
     std::map<std::string, int32> GotoLabels;          // the body being lowered's: clang LabelDecl id -> FStmtIR::LabelId
     int32 NextGotoLabel = 0;                          // never reset: latent functions share one ubergraph script
@@ -5412,6 +5417,14 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         Out.Fn = BP.EngineFunction(CalleePackage, CalleeName, UeNameOf(Called, MethodName));
         Out.bScript = CalleePackage.compare(0, 6, "/Game/") == 0;
         Out.bInstance = !bStatic;
+        /* Each makes its proxy with NewObject, flags it RF_StrongRefOnFrame and roots it nowhere else
+           (PlayMontageCallbackProxy.cpp 15-23, the anim instance's delegates reaching it weakly, 56-63;
+           Animation/WidgetAnimationPlayCallbackProxy.cpp 10-24): only the frame that holds it keeps it alive.
+           SpawnObject flags what it makes too (GameplayStatics.cpp 606-627), whose Outer does not reference it. */
+        static const std::set<std::string> FrameHeld = {
+            "CreateProxyObjectForPlayMontage", "CreatePlayAnimationProxyObject", "CreatePlayAnimationTimeRangeProxyObject" };
+        Out.bFrameHeld = bStatic && Called->IsNative() && FrameHeld.count(MethodName) != 0;
+        Out.bStrongOnFrame = Out.bFrameHeld || (bStatic && Called->IsNative() && MethodName == "SpawnObject");
         /* A Blueprint static needs the CDO context; EX_CallMath finds it itself for a native, but never asks the
            callspace an authority-only or cosmetic one has (KismetCompilerVMBackend.cpp 1222-1231): that one is called
            through CallFunction on the CDO, as the editor calls it. */
@@ -6096,7 +6109,21 @@ bool FCompiler::LowerAwait(const Json& CallNode, FBlueprintClass& BP, FCallIR& O
     }
 
     auto Body = std::make_shared<std::vector<FStmtIR>>();
-    auto Add = [&](FCallIR Call) { Body->emplace_back(); Body->back().K = FStmtIR::StaticCall; Body->back().Call = std::move(Call); };
+    /* The editor's async node tests the proxy with IsValid and binds its dispatchers and calls Activate on the true
+       branch only (K2Node_BaseAsyncTask.cpp 393-408, 440-448): through a None object each would be an 'Accessed None'
+       script warning (ScriptCore.cpp 2904-2937) that binds nothing (3085-3101). The run ends at the await either way. */
+    auto Binds = Body;
+    if (Disp.Base && Disp.Base->K != FArgIR::Self)
+    {
+        FStmtIR Gate;
+        Gate.K = FStmtIR::If;
+        Gate.Cond = *Disp.Base;
+        WrapInCall(Gate.Cond, BP.EngineFunction("/Script/Engine", "KismetSystemLibrary", "IsValid"));
+        Gate.Cond.InnerType = "bool";
+        Gate.Then = Binds = std::make_shared<std::vector<FStmtIR>>();
+        Body->push_back(std::move(Gate));
+    }
+    auto Add = [&](FCallIR Call) { Binds->emplace_back(); Binds->back().K = FStmtIR::StaticCall; Binds->back().Call = std::move(Call); };
     FCallIR Bind;
     Bind.Intrinsic = "__AddDelegate__";
     Bind.Args.push_back(Disp);
@@ -6105,25 +6132,32 @@ bool FCompiler::LowerAwait(const Json& CallNode, FBlueprintClass& BP, FCallIR& O
     Bind.Args.back().S = C.Event;
     Add(Bind);
 
-    /* K2Node_AsyncAction activates a UBlueprintAsyncActionBase once its outputs are bound. Only the first await on a
-       variable does: a second one waits on the action already running. */
+    /* K2Node_AsyncAction activates a UBlueprintAsyncActionBase once its outputs are bound. Every await on an action
+       gets the call as an __Activate__ marker; PlaceActivations keeps it where the variable's action has not been
+       activated yet on any path that reaches the await, and drops it where it has, so a second await waits on the
+       action already running. */
     std::string ObjType = StripTypeKeywords(TypeOf(*Strip(First(*Arg))));
     while (!ObjType.empty() && (ObjType.back() == '*' || ObjType.back() == ' ')) ObjType.pop_back();
     bool bAction = false;
     for (const FRecord* A = Find(ObjType); A; A = A->Base.empty() ? nullptr : Find(A->Base))
         if (A->UeName == "BlueprintAsyncActionBase") bAction = true;
-    if (bAction && ActivatedActions.insert(Disp.Base ? Disp.Base->S : std::string("this")).second)
+    if (bAction)
     {
         FCallIR Activate;
+        Activate.Intrinsic = "__Activate__";
         Activate.Fn = BP.EngineFunction("/Script/Engine", "BlueprintAsyncActionBase", "Activate");
         Activate.bInstance = true;
         if (Disp.Base) Activate.Target = Disp.Base;
+        Activate.Resume = C.Resume;                     // the await it belongs to
         Add(Activate);
     }
     FCallIR Point;
     Point.Intrinsic = "__AwaitPoint__";
     Point.Resume = C.Resume;
-    Add(Point);
+    Point.Target = Disp.Base;                           // the object the resume finds its action active on
+    Body->emplace_back();
+    Body->back().K = FStmtIR::StaticCall;
+    Body->back().Call = std::move(Point);
 
     Completions.push_back(C);
     bMadeLatentCall = true;
@@ -6135,6 +6169,533 @@ bool FCompiler::LowerAwait(const Json& CallNode, FBlueprintClass& BP, FCallIR& O
     Out.InlineResult = C.Local;
     Out.InlineType = ResultType;
     return true;
+}
+
+namespace
+{
+/* Every statement of Stmts and of the lists nested in them, in the order FFlowWalk numbers them (each before its own
+   lists: Then, Else, Body, Inc, Trailer). Each list is copied before Fn sees it, so a change made through one place
+   never reaches another that shares the list. */
+void ForEachStmt(std::vector<FStmtIR>& Stmts, const std::function<void(std::vector<FStmtIR>&, size_t)>& Fn)
+{
+    for (size_t I = 0; I < Stmts.size(); ++I)
+    {
+        Fn(Stmts, I);
+        for (auto* L : { &Stmts[I].Then, &Stmts[I].Else, &Stmts[I].Body, &Stmts[I].Inc, &Stmts[I].Trailer })
+            if (*L)
+            {
+                *L = std::make_shared<std::vector<FStmtIR>>(**L);
+                ForEachStmt(**L, Fn);
+            }
+    }
+}
+
+/*
+A forward walk of one function's statements along every path its bytecode can take, as EmitStmts lays them out: both
+arms of an `if`, a loop's rounds and its exits, a switch's cases, break / continue / goto, an inline block's returns,
+a latent call and an await. It carries facts per variable, bit masks joined by OR where paths meet; Step applies one
+statement's own effect (its expressions and its store), in the order the VM runs them. A loop head, a goto label and an
+await's resume take their state from paths the walk reaches later, so Run walks again until none of them grows; a
+statement's number (Seq) is its place in that walk, the same each time.
+
+An await is where control leaves the function's shape: its run ends at the await's return, and the event it bound
+re-enters the ubergraph at the offset EmitStmts gave the LAST copy of that await in the function (PeelFirstRound
+copies a loop's first round, the await's completion shared). Nothing reaches the code after an earlier copy; the code
+after the last one is reached from every copy, with the state AfterAwait makes of each.
+*/
+struct FFlowWalk
+{
+    struct FState
+    {
+        bool bLive = false;                             // false: no path reaches here
+        std::map<std::string, uint8> Bits;
+    };
+    std::function<void(const FStmtIR&, int32, FState&)> Step;
+    std::function<void(const FCallIR&, FState&)> AfterAwait;
+
+    static bool Join(FState& Into, const FState& From)
+    {
+        if (!From.bLive) return false;
+        if (!Into.bLive) { Into = From; return true; }
+        bool bGrew = false;
+        for (const auto& [K, V] : From.Bits)
+        {
+            uint8& B = Into.Bits[K];
+            if ((B | V) != B) { B |= V; bGrew = true; }
+        }
+        return bGrew;
+    }
+
+    void Run(const std::vector<FStmtIR>& Stmts, const FState& Entry)
+    {
+        std::function<void(const std::vector<FStmtIR>&)> Last = [&](const std::vector<FStmtIR>& List) {
+            for (const FStmtIR& St : List)
+            {
+                if (St.K == FStmtIR::StaticCall && St.Call.Intrinsic == "__AwaitPoint__") LastCopy[St.Call.Resume.get()] = Seq;
+                ++Seq;
+                for (const auto* L : { &St.Then, &St.Else, &St.Body, &St.Inc, &St.Trailer }) if (*L) Last(**L);
+            }
+        };
+        Seq = 0;
+        Last(Stmts);
+        for (int32 Pass = 0; Pass < 64; ++Pass)
+        {
+            Seq = Loops = 0;
+            bGrew = false;
+            FState S = Entry;
+            List(Stmts, S);
+            if (!bGrew) return;
+        }
+    }
+
+private:
+    std::map<int32, FState> Heads, Labels;              // by loop number / LabelId: what paths walked later bring
+    std::map<const int32*, FState> Resumes;             // by an await's resume sink: the state its event re-enters with
+    std::map<const int32*, int32> LastCopy;
+    std::vector<FState*> Breaks, Continues, Returns;
+    int32 Seq = 0, Loops = 0;
+    bool bGrew = false;
+
+    void Grow(FState& Into, const FState& From) { bGrew = Join(Into, From) || bGrew; }
+    void List(const std::vector<FStmtIR>& Stmts, FState& S) { for (const FStmtIR& St : Stmts) One(St, S); }
+
+    void One(const FStmtIR& St, FState& S)
+    {
+        const int32 Me = Seq++;
+        const FState Dead;
+        switch (St.K)
+        {
+        case FStmtIR::If:
+        {
+            Step(St, Me, S);
+            FState Then = S, Else = S;
+            if (St.Then) List(*St.Then, Then);          // a jump-out `if`: Then is the break / continue itself
+            if (St.Else) List(*St.Else, Else);
+            if (!St.bJumpOut) { S = Then; Join(S, Else); }
+            break;
+        }
+        case FStmtIR::While:
+        {
+            const int32 Loop = Loops++;
+            FState Cur = S, Exit, Out, Round;
+            Join(Cur, Heads[Loop]);
+            if (!St.bPostTest && !St.bConstCond) { Step(St, Me, Cur); Join(Exit, Cur); }
+            Breaks.push_back(&Out);
+            Continues.push_back(&Round);
+            if (St.Body) List(*St.Body, Cur);
+            Breaks.pop_back();
+            Continues.pop_back();
+            Join(Cur, Round);
+            if (St.Inc) List(*St.Inc, Cur);
+            if (St.bPostTest && !St.bConstCond) { Step(St, Me, Cur); Join(Exit, Cur); }
+            if (!St.bConstCond || St.Cond.B) Grow(Heads[Loop], Cur);
+            else Join(Exit, Cur);                       // `do {} while (false)` runs once
+            if (St.Trailer) List(*St.Trailer, Out);     // runs on `break` only
+            Join(Exit, Out);
+            S = Exit;
+            break;
+        }
+        case FStmtIR::Switch:
+        {
+            Step(St, Me, S);
+            const FState Head = S;
+            FState Out;
+            Breaks.push_back(&Out);
+            S = Dead;
+            if (St.Body)
+                for (const FStmtIR& B : *St.Body)
+                {
+                    if (B.K == FStmtIR::Label && B.LabelId >= 0) Join(S, Head);
+                    One(B, S);
+                }
+            Breaks.pop_back();
+            Join(S, Out);
+            if (St.LabelId < 0) Join(S, Head);          // no default: a miss goes past the body
+            break;
+        }
+        case FStmtIR::Block:
+        {
+            /* An inline body's own break / continue belong to loops inside it. */
+            FState Ends;
+            std::vector<FState*> OuterBreaks, OuterContinues;
+            OuterBreaks.swap(Breaks);
+            OuterContinues.swap(Continues);
+            Returns.push_back(&Ends);
+            if (St.Body) List(*St.Body, S);
+            Returns.pop_back();
+            Breaks.swap(OuterBreaks);
+            Continues.swap(OuterContinues);
+            Join(S, Ends);
+            break;
+        }
+        case FStmtIR::Break:
+        case FStmtIR::Continue:
+        case FStmtIR::InlineReturn:
+        {
+            std::vector<FState*>& To = St.K == FStmtIR::Break ? Breaks : St.K == FStmtIR::Continue ? Continues : Returns;
+            if (!To.empty()) Join(*To.back(), S);
+            S = Dead;
+            break;
+        }
+        case FStmtIR::Return:
+            Step(St, Me, S);
+            S = Dead;
+            break;
+        case FStmtIR::Goto:
+            Grow(Labels[St.LabelId], S);
+            S = Dead;
+            break;
+        case FStmtIR::GotoLabel:
+            Join(S, Labels[St.LabelId]);
+            break;
+        case FStmtIR::Label:
+            break;
+        default:
+            if (St.K == FStmtIR::StaticCall && St.Call.Intrinsic == "__AwaitPoint__")
+            {
+                const int32* Key = St.Call.Resume.get();
+                if (S.bLive)
+                {
+                    FState Back = S;
+                    AfterAwait(St.Call, Back);
+                    Grow(Resumes[Key], Back);
+                }
+                S = LastCopy[Key] == Me ? Resumes[Key] : Dead;
+                break;
+            }
+            Step(St, Me, S);
+            break;
+        }
+    }
+};
+
+/* The variable an await or an __Activate__ marker is about: its Target's name, "this" for self. */
+std::string AwaitedOn(const FCallIR& C) { return C.Target ? C.Target->S : std::string("this"); }
+
+/* Whether a statement list holds the __Activate__ marker of the await whose resume sink is Await, at any depth. */
+bool HoldsActivate(const std::vector<FStmtIR>& Stmts, const int32* Await)
+{
+    for (const FStmtIR& St : Stmts)
+    {
+        if (St.K == FStmtIR::StaticCall && St.Call.Intrinsic == "__Activate__" && St.Call.Resume.get() == Await) return true;
+        for (const auto* L : { &St.Then, &St.Else, &St.Body, &St.Inc, &St.Trailer })
+            if (*L && HoldsActivate(**L, Await)) return true;
+    }
+    return false;
+}
+
+/* Whether Stmts, nested lists included, hold an await, or a goto label that a copy would define twice. */
+bool HoldsAwaitOrLabel(const std::vector<FStmtIR>& Stmts)
+{
+    for (const FStmtIR& St : Stmts)
+    {
+        if (St.K == FStmtIR::GotoLabel || (St.K == FStmtIR::StaticCall && St.Call.Intrinsic == "__AwaitPoint__")) return true;
+        for (const auto* L : { &St.Then, &St.Else, &St.Body, &St.Inc, &St.Trailer })
+            if (*L && HoldsAwaitOrLabel(**L)) return true;
+    }
+    return false;
+}
+
+/* A copy of a loop body's statements that runs outside the loop: its own `break` (the loop's Trailer, then a goto to
+   Exit) and `continue` (a goto to Next) become jumps; those of a loop inside it stay, as a switch's own break does. */
+std::vector<FStmtIR> Unlooped(const std::vector<FStmtIR>& Stmts, const std::shared_ptr<std::vector<FStmtIR>>& Trailer,
+                              int32 Exit, int32 Next, bool bInSwitch, bool* bNext)
+{
+    auto Jump = [](int32 Label) { FStmtIR G; G.K = FStmtIR::Goto; G.LabelId = Label; return G; };
+    auto Leave = [&](bool bBreak) {
+        std::vector<FStmtIR> Out;
+        if (bBreak && Trailer) Out = *Trailer;
+        if (!bBreak) *bNext = true;
+        Out.push_back(Jump(bBreak ? Exit : Next));
+        return Out;
+    };
+    std::vector<FStmtIR> Out;
+    for (FStmtIR St : Stmts)
+    {
+        const bool bLoopBreak = St.K == FStmtIR::Break && !bInSwitch;
+        if (bLoopBreak || St.K == FStmtIR::Continue)
+        {
+            for (FStmtIR& L : Leave(bLoopBreak)) Out.push_back(std::move(L));
+            continue;
+        }
+        if (St.K == FStmtIR::If && St.bJumpOut)
+        {
+            /* Then is the break / continue, taken when Cond is FALSE: now an else that jumps. */
+            const bool bBreak = (*St.Then)[0].K == FStmtIR::Break;
+            if (!bBreak || !bInSwitch)
+            {
+                St.bJumpOut = false;
+                St.Else = std::make_shared<std::vector<FStmtIR>>(Leave(bBreak));
+                St.Then = std::make_shared<std::vector<FStmtIR>>();
+            }
+        }
+        else if (St.K == FStmtIR::If)
+        {
+            if (St.Then) St.Then = std::make_shared<std::vector<FStmtIR>>(Unlooped(*St.Then, Trailer, Exit, Next, bInSwitch, bNext));
+            if (St.Else) St.Else = std::make_shared<std::vector<FStmtIR>>(Unlooped(*St.Else, Trailer, Exit, Next, bInSwitch, bNext));
+        }
+        else if (St.K == FStmtIR::Switch && St.Body)
+            St.Body = std::make_shared<std::vector<FStmtIR>>(Unlooped(*St.Body, Trailer, Exit, Next, true, bNext));
+        Out.push_back(std::move(St));
+    }
+    return Out;
+}
+}   // namespace
+
+/*
+A loop whose await finds its action fresh on the first round and active on the rest cannot keep or drop that await's
+Activate: it would start the action again each round, or never. So the first round, up to and including the await,
+runs as a copy before the loop: `if (Cond) { <round> } else goto Exit;` (no test for a loop that always runs once),
+the loop itself after it. The copy's await keeps its Activate and resumes in the loop's copy, which is the last one
+(FFlowWalk), so the loop's own await sees the action active on every path and drops it. Only an await at the top
+level of the body, with no other await or goto label before it, where a copy cannot tell which one resumes.
+*/
+bool FCompiler::PeelFirstRound(std::vector<FStmtIR>& Stmts, const int32* Await)
+{
+    for (size_t I = 0; I < Stmts.size(); ++I)
+    {
+        FStmtIR& St = Stmts[I];
+        if (St.K == FStmtIR::While && St.Body)
+        {
+            const std::vector<FStmtIR>& Body = *St.Body;
+            size_t At = 0;
+            while (At < Body.size() && !(Body[At].K == FStmtIR::Block && HoldsActivate({ Body[At] }, Await))) ++At;
+            if (At < Body.size())
+            {
+                const std::vector<FStmtIR> Before(Body.begin(), Body.begin() + At);
+                if (HoldsAwaitOrLabel(Before)) return false;
+                const int32 Exit = NextGotoLabel++, Next = NextGotoLabel++;
+                bool bNext = false;
+                std::vector<FStmtIR> Round = Unlooped(Before, St.Trailer, Exit, Next, false, &bNext);
+                Round.push_back(Body[At]);
+                FStmtIR Label;
+                Label.K = FStmtIR::GotoLabel;
+                Label.LabelId = Exit;
+                if (bNext)
+                {
+                    /* `continue` in the first round goes on at the loop's increment, where the loop's own lands. */
+                    FStmtIR Mark = Label;
+                    Mark.LabelId = Next;
+                    St.Inc = std::make_shared<std::vector<FStmtIR>>(St.Inc ? *St.Inc : std::vector<FStmtIR>());
+                    St.Inc->insert(St.Inc->begin(), Mark);
+                }
+                std::vector<FStmtIR> First;
+                if (!St.bPostTest && !St.bConstCond)
+                {
+                    First.emplace_back();
+                    First.back().K = FStmtIR::If;
+                    First.back().Cond = St.Cond;
+                    First.back().Then = std::make_shared<std::vector<FStmtIR>>(std::move(Round));
+                    First.back().Else = std::make_shared<std::vector<FStmtIR>>(1);
+                    (*First.back().Else)[0].K = FStmtIR::Goto;
+                    (*First.back().Else)[0].LabelId = Exit;
+                }
+                else First = std::move(Round);
+                Stmts.insert(Stmts.begin() + I + 1, Label);
+                Stmts.insert(Stmts.begin() + I, First.begin(), First.end());
+                return true;
+            }
+        }
+        for (auto* L : { &St.Then, &St.Else, &St.Body, &St.Inc, &St.Trailer })
+            if (*L && HoldsActivate(**L, Await))
+            {
+                *L = std::make_shared<std::vector<FStmtIR>>(**L);
+                return PeelFirstRound(**L, Await);
+            }
+    }
+    return false;
+}
+
+/*
+Decides each __Activate__ marker LowerAwait left (K2Node_BaseAsyncTask.cpp 410-467: an async node binds its outputs,
+then activates its proxy, once per run of the node): Activate may broadcast before it returns, and a second call
+starts an action such as AsyncLoadPrimaryAsset again (AsyncActionLoadPrimaryAsset.cpp 6-35). Walked in flow order,
+each action variable is fresh once assigned (or on entry) and active once an Activate ran or its await resumed; a
+marker every path reaches with the action fresh becomes the call, one every path reaches active goes. One reached
+both ways is a loop's first round against the rest, split by PeelFirstRound; anything else is refused, since either
+choice is wrong on some path.
+*/
+bool FCompiler::PlaceActivations(std::vector<FStmtIR>& Stmts, std::string* Err)
+{
+    enum : uint8 { Fresh = 1, Active = 2 };
+    std::set<std::string> Actions;
+    ForEachStmt(Stmts, [&](std::vector<FStmtIR>& L, size_t I) {
+        if (L[I].K == FStmtIR::StaticCall && L[I].Call.Intrinsic == "__Activate__") Actions.insert(AwaitedOn(L[I].Call));
+    });
+    if (Actions.empty()) return true;
+    FFlowWalk::FState Entry;
+    Entry.bLive = true;
+    for (const std::string& A : Actions) Entry.Bits[A] = Fresh;
+    std::set<const int32*> Peeled;
+    for (;;)
+    {
+        std::map<int32, uint8> Reached;                 // by the marker's Seq: how its action stands there
+        FFlowWalk Walk;
+        Walk.Step = [&](const FStmtIR& St, int32 Seq, FFlowWalk::FState& S) {
+            if ((St.K == FStmtIR::Assign || St.K == FStmtIR::Decl) && (St.Var.K == FArgIR::Local || St.Var.K == FArgIR::Field)
+                && Actions.count(St.Var.S))
+                S.Bits[St.Var.S] = Fresh;
+            if (St.K == FStmtIR::StaticCall && St.Call.Intrinsic == "__Activate__" && S.bLive)
+            {
+                Reached[Seq] |= S.Bits[AwaitedOn(St.Call)];
+                S.Bits[AwaitedOn(St.Call)] = Active;
+            }
+        };
+        Walk.AfterAwait = [&](const FCallIR& Point, FFlowWalk::FState& S) {
+            if (Actions.count(AwaitedOn(Point))) S.Bits[AwaitedOn(Point)] = Active;
+        };
+        Walk.Run(Stmts, Entry);
+
+        /* Numbered as the walk numbered them: a marker reached with the action fresh becomes the call (one no path
+           reaches too, as it costs nothing), one reached active goes. */
+        const int32* Both = nullptr;
+        std::string Var;
+        int32 Seq = 0;
+        ForEachStmt(Stmts, [&](std::vector<FStmtIR>& L, size_t I) {
+            const int32 Me = Seq++;
+            if (L[I].K == FStmtIR::StaticCall && L[I].Call.Intrinsic == "__Activate__" && Reached[Me] == (Fresh | Active) && !Both)
+            { Both = L[I].Call.Resume.get(); Var = AwaitedOn(L[I].Call); }
+        });
+        if (!Both)
+        {
+            Seq = 0;
+            std::function<void(std::vector<FStmtIR>&)> Decide = [&](std::vector<FStmtIR>& List) {
+                for (size_t I = 0; I < List.size(); ++I)
+                {
+                    const int32 Me = Seq++;
+                    for (auto* L : { &List[I].Then, &List[I].Else, &List[I].Body, &List[I].Inc, &List[I].Trailer })
+                        if (*L) { *L = std::make_shared<std::vector<FStmtIR>>(**L); Decide(**L); }
+                    if (List[I].K != FStmtIR::StaticCall || List[I].Call.Intrinsic != "__Activate__") continue;
+                    if (Reached[Me] == Active) List.erase(List.begin() + I--);
+                    else List[I].Call.Intrinsic.clear();
+                }
+            };
+            Decide(Stmts);
+            return true;
+        }
+        if (!Peeled.insert(Both).second || !PeelFirstRound(Stmts, Both))
+        {
+            *Err = "UE_AWAIT on " + Var + ": some paths reach it with " + Var + "'s async action already activated and "
+                   "some without, so it would start twice or never; await " + Var + " before the branch or loop, or "
+                   "assign " + Var + " again on each path";
+            return false;
+        }
+    }
+}
+
+namespace
+{
+/* The locals an expression reads, a call's object and arguments included. */
+void LocalsRead(const FCallIR& C, std::set<std::string>& Out);
+void LocalsRead(const FArgIR& A, std::set<std::string>& Out)
+{
+    if (A.K == FArgIR::Local || A.K == FArgIR::LocalOut) Out.insert(A.S);
+    if (A.Sub) LocalsRead(*A.Sub, Out);
+    if (A.Base) LocalsRead(*A.Base, Out);
+}
+void LocalsRead(const FCallIR& C, std::set<std::string>& Out)
+{
+    if (C.Intrinsic == "__AwaitPoint__") return;        // names the awaited object only to say what it waits on
+    if (C.Target) LocalsRead(*C.Target, Out);
+    for (const FArgIR& A : C.Args) LocalsRead(A, Out);
+}
+
+/* The latent calls an expression makes (a call given an FLatentActionInfo): each ends the run, which the latent
+   action resumes after the statement. */
+void LatentCalls(const FCallIR& C, std::vector<const FCallIR*>& Out);
+void LatentCalls(const FArgIR& A, std::vector<const FCallIR*>& Out)
+{
+    if (A.Sub) LatentCalls(*A.Sub, Out);
+    if (A.Base) LatentCalls(*A.Base, Out);
+}
+void LatentCalls(const FCallIR& C, std::vector<const FCallIR*>& Out)
+{
+    if (std::any_of(C.Args.begin(), C.Args.end(), [](const FArgIR& A) { return A.K == FArgIR::LatentInfo; })) Out.push_back(&C);
+    if (C.Target) LatentCalls(*C.Target, Out);
+    for (const FArgIR& A : C.Args) LatentCalls(A, Out);
+}
+}   // namespace
+
+/*
+The garbage collector reads the ubergraph's persistent frame, where a waiting method keeps its locals, and takes an
+object reference there as a weak one unless the object is RF_StrongRefOnFrame (UObjectGlobals.cpp 3460-3483), which
+only SpawnObject and the callback proxies set (bStrongOnFrame). So an object a waiting method made, or loaded, and
+holds only in a local across a wait can be collected before it resumes, and the local then reads None; the editor's
+event graph is the same, but the compiler sees which locals outlive a wait, so it says so. A local counts when it may
+hold the result of a call, directly or through a copy or cast (a value read out of a property is its owner's to keep),
+or of a latent load (LoadAsset, stored by the call's completion event), is of a UObject class that nothing else is
+known to keep - not an actor or a component, which the level or their owner holds, nor an async action - and is read
+after a wait that it may hold such a value across: Delay and its kind, or UE_AWAIT.
+*/
+void FCompiler::WarnFrameWeakLocals(const std::vector<FStmtIR>& Stmts, const std::string& Where)
+{
+    std::map<std::string, std::string> Classes;         // the candidates: local -> its class
+    for (const auto& [Local, Type] : SourceLocals)
+    {
+        std::string T = StripTypeKeywords(Type);
+        if (T.empty() || T.back() != '*') continue;
+        T.pop_back();
+        while (!T.empty() && T.back() == ' ') T.pop_back();
+        const FRecord* C = Find(T);
+        bool bObject = false, bKept = false;
+        for (const FRecord* A = C; A; A = A->Base.empty() ? nullptr : Find(A->Base))
+        {
+            bObject = bObject || A->UeName == "Object";
+            bKept = bKept || A->UeName == "Actor" || A->UeName == "ActorComponent" || A->UeName == "BlueprintAsyncActionBase"
+                 || A->UeName == "World" || A->UeName == "Level" || A->UeName == "GameInstance" || A->UeName == "LocalPlayer"
+                 || A->UeName == "Subsystem";
+        }
+        if (C && bObject && !bKept) Classes[Local] = C->CppName;
+    }
+    if (Classes.empty()) return;
+    std::map<std::string, std::string> LoadedInto;      // a latent load's completion event -> the local it stores into
+    for (const FCompletion& C : Completions)
+        if (!C.Resume && !C.Local.empty()) LoadedInto[C.Event] = C.Local;
+
+    enum : uint8 { Made = 1, Crossed = 2 };
+    std::set<std::string> Warned;
+    auto Cross = [](FFlowWalk::FState& S) { for (auto& [K, V] : S.Bits) if (V & Made) V |= Crossed; };
+    std::function<uint8(const FArgIR&, FFlowWalk::FState&)> MadeBy = [&](const FArgIR& V, FFlowWalk::FState& S) -> uint8 {
+        if (V.K == FArgIR::Call) return V.Sub && !V.Sub->bStrongOnFrame && V.Sub->Intrinsic.empty() ? Made : 0;
+        if (V.K == FArgIR::DynCast && V.Sub && !V.Sub->Args.empty()) return MadeBy(V.Sub->Args[0], S);
+        if (V.K == FArgIR::Local) return S.Bits.count(V.S) ? S.Bits[V.S] & Made : 0;
+        return 0;
+    };
+    FFlowWalk Walk;
+    Walk.Step = [&](const FStmtIR& St, int32, FFlowWalk::FState& S) {
+        if (!S.bLive) return;
+        const bool bStore = (St.K == FStmtIR::Assign || St.K == FStmtIR::Decl) && St.Var.K == FArgIR::Local && !St.Var.Base;
+        std::set<std::string> Reads;
+        LocalsRead(St.Call, Reads);
+        LocalsRead(St.Target, Reads);
+        for (const FArgIR* A : { &St.Value, &St.Cond, &St.SwitchValue }) LocalsRead(*A, Reads);
+        for (const FArgIR& A : St.CaseTests) LocalsRead(A, Reads);
+        if (!bStore) LocalsRead(St.Var, Reads);
+        for (const std::string& R : Reads)
+            if (Classes.count(R) && S.Bits.count(R) && (S.Bits[R] & Crossed)) Warned.insert(R);
+        std::vector<const FCallIR*> Waits;
+        LatentCalls(St.Call, Waits);
+        LatentCalls(St.Value, Waits);
+        if (!Waits.empty()) Cross(S);
+        for (const FCallIR* W : Waits)
+            for (const FArgIR& A : W->Args)
+                if (A.K == FArgIR::Delegate)
+                    if (auto L = LoadedInto.find(A.S); L != LoadedInto.end()) S.Bits[L->second] = Made;
+        if (bStore)
+        {
+            const uint8 By = St.K == FStmtIR::Decl && !St.bHasValue ? 0 : MadeBy(St.Value, S);
+            if (By) S.Bits[St.Var.S] = By;
+            else S.Bits.erase(St.Var.S);
+        }
+    };
+    Walk.AfterAwait = [&](const FCallIR&, FFlowWalk::FState& S) { Cross(S); };
+    FFlowWalk::FState Entry;
+    Entry.bLive = true;
+    Walk.Run(Stmts, Entry);
+    for (const std::string& L : Warned)
+        printf("  warning: %s keeps %s (a %s) across a wait only in its ubergraph frame, which holds an object weakly: a "
+               "garbage collection during the wait can take it, and %s then reads None; keep it in a member\n",
+               Where.c_str(), L.c_str(), Classes[L].c_str(), L.c_str());
 }
 
 bool OnlyRead(const Json& N, const std::string& Id);
@@ -6288,6 +6849,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                     Ds.Value.K = FArgIR::Local;
                     Ds.Value.S = Fresh;
                 }
+                if (InlineStack.empty()) SourceLocals[VarName] = VarType;
                 Locals.push_back(PD);
                 Out.push_back(Ds);
             });
@@ -11107,6 +11669,12 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     };
     std::vector<FSegment> Segments;
     GeneratedEvents.clear();
+    /* The transient members that keep a frame-held callback proxy alive past a function that does not wait (below),
+       named past the mod's own properties along the class chain. */
+    std::vector<FPropertyDef> HeldProxies;
+    std::set<std::string> TakenMembers;
+    for (const FRecord* A = &R; A; A = A->Base.empty() ? nullptr : Find(A->Base))
+        for (const Json* F : A->Fields) TakenMembers.insert(Name(*F));
 
     for (const FMethod& Fn : Methods)
     {
@@ -11191,7 +11759,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         StaticLocal.clear();
         LatentCount = 0;
         Completions.clear();
-        ActivatedActions.clear();
+        SourceLocals.clear();
         /* A const reference is only read, so the copy its stub makes into the ubergraph's frame is its value (the
            Segments stubs below); a write through any other would land in that copy once the caller has gone on. */
         bool bWritableRef = false;
@@ -11235,6 +11803,39 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             *Err = R.CppName + "::" + Fn.Name + ": " + *Err;
             return false;
         }
+        /* The editor places a frame-held proxy's node (bFrameHeld) in the event graph, whose persistent frame the GC
+           reads through the class (BlueprintGeneratedClass.cpp 1683-1713) and where a reference to an
+           RF_StrongRefOnFrame object is strong (UObjectGlobals.cpp 3460-3483). A local of a function that does not
+           wait dies with the call, after which a collection takes the proxy and its dispatchers never fire; so it is
+           stored into a transient member too, one per local, as the editor's frame keeps one per node. A waiting
+           function's locals are the frame's already. */
+        if (!bMadeLatentCall && !R.bIsPatch)
+            ForEachStmt(Stmts, [&](std::vector<FStmtIR>& List, size_t I) {
+                const FStmtIR& St = List[I];
+                if ((St.K != FStmtIR::Decl && St.K != FStmtIR::Assign) || St.Var.K != FArgIR::Local
+                    || St.Value.K != FArgIR::Call || !St.Value.Sub || !St.Value.Sub->bFrameHeld) return;
+                const auto Local = std::find_if(Locals.begin(), Locals.end(), [&](const FPropertyDef& L) { return L.Name == St.Var.S; });
+                if (Local == Locals.end()) return;
+                std::string To = Fn.Name + "_" + St.Var.S;
+                for (int32 N = 2; TakenMembers.count(To); ++N) To = Fn.Name + "_" + St.Var.S + "_" + std::to_string(N);
+                TakenMembers.insert(To);
+                FPropertyDef Held = *Local;
+                Held.Name = To;
+                Held.PropertyFlags = (Held.PropertyFlags & ~uint64(CPF_Parm | CPF_OutParm | CPF_BlueprintVisible | CPF_BlueprintReadOnly))
+                                   | CPF_Transient | CPF_DuplicateTransient;
+                Held.bApiHidden = true;
+                HeldProxies.push_back(Held);
+                FStmtIR Keep;
+                Keep.K = FStmtIR::Assign;
+                Keep.Var.K = FArgIR::Field;
+                Keep.Var.S = To;
+                Keep.Var.Owner = BP.ClassIndex();
+                Keep.Var.LetOp = St.Var.LetOp;
+                Keep.Value.K = FArgIR::Local;
+                Keep.Value.S = St.Var.S;
+                Keep.Value.LetOp = St.Var.LetOp;
+                List.insert(List.begin() + I + 1, std::move(Keep));
+            });
         if (!bCurNoOpt)
         {
             PruneConstBranches(Stmts);
@@ -11252,6 +11853,11 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 ThreadBranches(Stmts, Stmts, Locals);
                 CoalesceTemps(Stmts, Locals, BP);
             }
+        }
+        if (bMadeLatentCall && !PlaceActivations(Stmts, Err))
+        {
+            *Err = R.CppName + "::" + Fn.Name + ": " + *Err;
+            return false;
         }
         FWildcardContexts{ BP, P }.List(Stmts);
         for (const auto& [Struct, Keep] : KeepLoaded)
@@ -11360,6 +11966,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                        R.CppName.c_str(), Fn.Name.c_str());
             if (bScratchNeeded)
             { *Err = R.CppName + "::" + Fn.Name + ": TODO: a pointer read in a function that makes a latent call"; return false; }
+            WarnFrameWeakLocals(Stmts, R.CppName + "::" + Fn.Name);
             FSegment Seg{ Fn.Name, Super, {}, Locals, Stmts, Flags, {}, Completions };
             Seg.Parms.assign(Params.begin(), Params.end() - Locals.size());
             Segments.push_back(std::move(Seg));
@@ -11390,6 +11997,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         }, Flags);
     }
 
+    for (const FPropertyDef& Held : HeldProxies) BP.AddVariable(Held);
     if (!Segments.empty() && R.bIsPatch)
     {
         *Err = R.CppName + " (UE_PATCH)::" + Segments.front().Name + ": a patched function that waits (a latent call) needs "
