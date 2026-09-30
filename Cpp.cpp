@@ -4883,17 +4883,25 @@ std::vector<uint8> FCompiler::NativeTail(const FRecord* Component) const
     return Tail;
 }
 
-/* The mod directory's .h / .cpp sources, read on the first call. */
+/* The mod directory's .h / .cpp sources, read on the first call, in the order of their names' UTF-8 bytes.
+   NamedQualifier takes the first source that fits, so the order cannot be directory_iterator's: that is the
+   filesystem's, sorted on NTFS but hashed on ext4. */
 const std::vector<std::string>& FCompiler::ModSources() const
 {
     if (SourceTexts.empty())
     {
         std::error_code Ec;
+        std::vector<std::pair<std::string, std::filesystem::path>> Files;
         for (const auto& E : std::filesystem::directory_iterator(SourceDir, Ec))
         {
             const std::string Ext = E.path().extension().string();
             if (!E.is_regular_file() || (Ext != ".h" && Ext != ".hpp" && Ext != ".cpp")) continue;
-            std::ifstream F(E.path(), std::ios::binary);
+            Files.emplace_back(E.path().filename().u8string(), E.path());
+        }
+        std::sort(Files.begin(), Files.end());
+        for (const auto& File : Files)
+        {
+            std::ifstream F(File.second, std::ios::binary);
             SourceTexts.emplace_back(std::istreambuf_iterator<char>(F), std::istreambuf_iterator<char>());
         }
     }
