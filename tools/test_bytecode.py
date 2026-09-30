@@ -146,8 +146,6 @@ def refused(mod, body, why, top=''):
 PENDING = os.path.join(TESTS, 'pending')
 GAPS, FIXED, REFUSALS = [], [], {}
 KNOWN_RULES = {     # sweep rules the suite's own packages still break, each with the AssetGen defect (TODO.md, S33)
-    'class_tail_follows_parent': 'the class tail is hard-coded (ClassWithin Object, ClassConfigName Engine, ClassFlags '
-                                 'guessed from ancestry) instead of taken from the parent',
     'edl_class_closure': "a BPGC's UberGraphFunction and InheritableComponentHandler are not serialized before the class",
     'edl_create_prereqs': 'a native default-subobject override export has TemplateIndex 0',
     'edl_payload_created': 'objects named only in payloads are in no preload list, so they can resolve to null',
@@ -3727,7 +3725,7 @@ TAIL_META = {
 
 def tail_meta(name):
     def test():
-        base = pending_asset('ClassTailMeta', name)
+        base = os.path.join(os.path.dirname(asset('ClassTailMeta')), name)
         tail_facts(base, *TAIL_META[name])
         keeps_invariants(base)
         if name == 'ClassTailMeta':
@@ -3838,9 +3836,11 @@ parm_width()
 parm_over()
 parm_huge()
 for _name, (_parent, _bits, _within, _config) in TAIL_META.items():
-    pending('ClassTailMeta %s: %s\'s tail (flags %#x, within %s, config %s)' % (_name, _parent.split('.')[-1], _bits,
-                                                                               _within.split('.')[-1], _config), tail_meta(_name))
-pending('OverrideTest Walker: ClassConfigName Game, ACharacter\'s', walker_config)
+    tail_meta(_name)()
+    print('ok  ClassTailMeta %s: %s\'s tail (flags %#x, within %s, config %s)' % (_name, _parent.split('.')[-1], _bits,
+                                                                                 _within.split('.')[-1], _config))
+walker_config()
+print('ok  OverrideTest Walker: ClassConfigName Game, ACharacter\'s')
 pending('InstancedRefs: component references flagged instanced, the class HasInstancedReference', instanced_refs)
 for _mod, (_src, _member, _oracle, _what) in SHADOWS.items():
     refused_or_distinct(_mod, _src, _member, _oracle)

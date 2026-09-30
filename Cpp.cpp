@@ -470,6 +470,7 @@ struct FRecord
     std::vector<const Json*> Fields;
     std::vector<const Json*> Ctors;                 // CXXConstructorDecls: their parameter names place a value's arguments
     std::vector<std::string> Interfaces;            // every base after the first
+    std::string Tail;                               // genueapi's UeClassTail: "<ScriptInherit flags> <ClassWithin> <ConfigName>"
     std::map<std::string, std::string> Replicated;  // UE_REPLICATED*: variable -> "Notify:Condition"
     std::set<std::string> Components;               // UE_COMPONENT: variables that are also SCS nodes
     /* genueapi's `<X>__UeName`: the engine's name of a member or function Dumper-7 had to respell (`Name_0` is
@@ -2106,6 +2107,10 @@ bool FCompiler::Collect(std::string* Err)
             else if (Kind(C) == "VarDecl" && Name(C) == "UePatchMeta")
             {
                 R.bIsPatch = true;
+            }
+            else if (Kind(C) == "VarDecl" && Name(C) == "UeClassTail")
+            {
+                FindLiteral(C, R.Tail);
             }
             else if (Kind(C) == "VarDecl" && Name(C) == "UeStructMeta")
             {
@@ -10384,7 +10389,24 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     for (const FRecord* A = &R; A; A = A->Base.empty() ? nullptr : Find(A->Base))
         for (const auto& [Method, Decl] : A->Methods)
             if (Nearest.insert(Method).second && Decl->value("pure", false)) bAbstract = true;
-    BP.SetClassFlags(ClassFlagsFor(Ancestry) | (bAbstract ? uint32(CLASS_Abstract) : 0u));
+    /* The tail the editor copies from the parent - its ScriptInherit ClassFlags, ClassWithin and ClassConfigName
+       (KismetCompiler.cpp:320-321, 2450-2453) - and nothing at load re-derives: genueapi's UeClassTail of the nearest
+       class up the chain that has one. None (an old UeApi) leaves UObject's, within Object and config Engine. */
+    uint32 TailBits = 0;
+    for (const FRecord* A = B; A; A = A->Base.empty() ? nullptr : Find(A->Base))
+        if (!A->Tail.empty())
+        {
+            const std::string& T = A->Tail;
+            const size_t S1 = T.find(' '), S2 = T.find(' ', S1 + 1);
+            const std::string Within = T.substr(S1 + 1, S2 - S1 - 1);
+            const size_t Dot = Within.rfind('.');
+            if (S2 == std::string::npos || Dot == std::string::npos)
+            { *Err = A->CppName + ": UeClassTail \"" + T + "\" is not \"<flags> <within class path> <config name>\""; return false; }
+            TailBits = uint32(strtoul(T.c_str(), nullptr, 16));
+            BP.SetClassTail(Within.substr(0, Dot), Within.substr(Dot + 1), T.substr(S2 + 1));
+            break;
+        }
+    BP.SetClassFlags(ClassFlagsFor(Ancestry) | TailBits | (bAbstract ? uint32(CLASS_Abstract) : 0u));
 
     for (const std::string& I : R.Interfaces)
     {

@@ -1408,6 +1408,9 @@ and `Types.h` from the SDK repo, and optionally run `tools/genueassets.py`. What
   member the dumper renamed. Without it, genueapi stops with
   `no <path>: run genueapi on the SDK inside its Dumper-7 dump, not a copy of it`. The SDK folder and the object dump
   must come from the same dump.
+- **Give it the game's content with `--game <extracted Content dir>`.** The dump does not carry a class's flags,
+  ClassWithin and config name. genueapi reads each game Blueprint's off its cooked package (about 20 seconds). Without
+  it, a mod deriving from a game Blueprint gets its nearest native ancestor's.
 - **Your own mods are left out.** genueapi skips every class whose package a mod in the folder above `<UeApi dir>`
   cooks (any `.cpp` or `.h` directly in that folder with a `UE_MOD_PACKAGE`), and the shared nested-container structs.
   Keep `UeApi/` inside your mods folder, and a dump taken with your mods loaded does not declare them a second time.
@@ -1432,7 +1435,7 @@ genueapi prints one line per table it writes, then a summary of counts. These li
 genueapi stops with exit status 1 when the object dump is missing, and on
 `base-class cycle between packages: <package> -> <package> -> ...`, which a mod cannot fix: report it with the dump.
 Run with fewer than two arguments, it prints only the last sentence of its help text, not a usage line; the usage is
-`genueapi.py <SDK dir> <UeApi dir>`.
+`genueapi.py <SDK dir> <UeApi dir> [--game <Content dir>]`.
 
 ## Editor API stubs
 

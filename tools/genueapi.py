@@ -1,5 +1,9 @@
 ﻿#!/usr/bin/env python3
-"""usage: genueapi.py <SDK dir> <output dir>      e.g. C:/Dumper-7/<version>-FSD/SDK/SDK  BpMods/UeApi
+"""usage: genueapi.py <SDK dir> <output dir> [--game <Content dir>]
+       e.g. C:/Dumper-7/<version>-FSD/SDK/SDK  BpMods/UeApi  --game D:/DRGExtract/FSD-WindowsNoEditor/FSD/Content
+
+--game reads the game's cooked Blueprints for what the dump does not carry: each game Blueprint class's tail
+(UeClassTail).
 
 The SDK dir must sit in its Dumper-7 dump, two levels under GObjects-Dump-WithProperties.txt (see read_real_fields);
 a copy elsewhere (DrgMods/SDK/SDK) has no object dump beside it."""
@@ -958,6 +962,68 @@ def write_out_arrays(out_dir):
     print("  native out arrays: %d functions" % len(rows))
 
 
+SCRIPT_INHERIT = 0x4AA1364E         # CLASS_ScriptInherit, ObjectMacros.h:249-259
+OBJECT_PATH = "/Script/CoreUObject.Object"
+DEFAULT_TAIL = (0, OBJECT_PATH, "Engine")   # UObject's: Object.h:57-60
+
+
+def scan_game(content):
+    """What the game's cooked Blueprints show that the dump does not: {class path: (its ScriptInherit ClassFlags,
+    ClassWithin, ClassConfigName, super path)}."""
+    import invariants
+    classes = {}
+    for base in invariants.packages([content]):
+        p = invariants.Package(base)
+        for i, e in enumerate(p.exports):
+            kind = p.class_of(i + 1)
+            if kind.endswith("GeneratedClass"):
+                st = p.struct(i)
+                if st is not None and hasattr(st, "class_flags"):
+                    classes[p.path(i + 1)] = (st.class_flags & SCRIPT_INHERIT, p.path(st.within) if st.within else OBJECT_PATH,
+                                              st.config, p.path(e["super"]))
+    print("  game Blueprints scanned: %d classes" % len(classes))
+    return classes
+
+
+def class_tails(classes, by_name, game):
+    """{class: "<ScriptInherit ClassFlags> <ClassWithin> <ClassConfigName>"}, what a Blueprint child copies
+    (KismetCompiler.cpp:320-321, 2450-2453), for each class whose tail is not its parent's: AssetGen takes the nearest
+    one up the chain. A native class's comes from the class_tail invariant rule's tables - what every game Blueprint
+    child of the class carries, and the UCLASS specifiers of UE 4.27 - with UHT's inheritance (native_tail there): the
+    super's bits but the four a specifier clears, and the Within and config name of the nearest class that states
+    them. A game Blueprint's is read off its package (scan_game); one the game content lacks has its parent's."""
+    from invariant_rules.class_tail import NATIVE_TAILS, SOURCE_TAILS, UHT_CLEARABLE
+    memo = {}
+
+    def tail(k):
+        if k is None:
+            return DEFAULT_TAIL
+        if k.cpp not in memo:
+            path = k.path + "." + k.ue_name
+            if k.is_bp:
+                memo[k.cpp] = game[path][:3] if path in game else tail(by_name.get(k.base))
+            else:
+                bits, within, config, c = 0, None, None, k
+                while c is not None:
+                    p = c.path + "." + c.ue_name
+                    rows = [r for r in (NATIVE_TAILS.get(p), SOURCE_TAILS.get(p)) if r]
+                    for r in rows:
+                        bits |= r[0] if c is k else r[0] & ~UHT_CLEARABLE
+                    if rows and within is None:
+                        within, config = rows[0][1], rows[0][2]
+                    c = by_name.get(c.base) if c.base else None
+                memo[k.cpp] = (bits, within or OBJECT_PATH, config or "Engine")
+        return memo[k.cpp]
+
+    out = {}
+    for k in classes:
+        t = tail(k)
+        if t != tail(by_name.get(k.base) if k.base else None):
+            out[k.cpp] = "0x%08x %s %s" % t
+    print("  class tails: %d classes" % len(out))
+    return out
+
+
 def write_containers(classes, sdk_dir, out_dir):
     """Containers.h: one UE_CONTAINER_<Template> macro of method declarations per library.
     A method is const when its function is BlueprintPure."""
@@ -996,9 +1062,15 @@ def write_containers(classes, sdk_dir, out_dir):
 
 
 def main():
-    if len(sys.argv) < 3:
+    args = sys.argv[1:]
+    game_dir = None
+    if "--game" in args:
+        at = args.index("--game")
+        game_dir = args[at + 1] if at + 1 < len(args) else None
+        del args[at:at + 2]
+    if len(args) < 2 or ("--game" in sys.argv and not game_dir):
         sys.exit(__doc__.strip().splitlines()[-1])
-    sdk_dir, out_dir = sys.argv[1], sys.argv[2]
+    sdk_dir, out_dir = args[0], args[1]
 
     for name in sorted(f for f in os.listdir(sdk_dir) if f.endswith("_structs.hpp")):
         parse_structs(os.path.join(sdk_dir, name), name[: -len("_structs.hpp")])
@@ -1046,6 +1118,8 @@ def main():
 
     by_name = dict((k.cpp, k) for k in classes)
     map_subobjects(classes, by_name)
+    game = scan_game(game_dir) if game_dir else {}
+    tails = class_tails(classes, by_name, game)
     ordered, seen = [], set()
 
     def place(k):
@@ -1185,6 +1259,8 @@ def main():
                         % (k.ue_name if k.is_bp else k.cpp, inherits, k.path, k.ue_name))
             short = short_names(k)
             body += ["    using %s = %s;" % (leaf, short[leaf]) for leaf in sorted(short)]
+            if k.cpp in tails:
+                body.append('    static constexpr const char* UeClassTail = "%s";' % tails[k.cpp])
             names = set(f for _, _, f, _ in k.funcs)
             for ftype, fname in k.fields:
                 if fname in names:

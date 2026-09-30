@@ -337,9 +337,12 @@ Notes:
   `UeApi`. The compiler gives clang two include paths, the `UeApi` folder and the folder that holds it, so include
   `Objects.h` by its path from your source (the examples write `#include "../include/Objects.h"`) or from that folder,
   or copy it beside your source. A bare `#include "Objects.h"` finds it only there.
-- The class flags follow the kind of parent: an actor, an actor component, a function library, or anything else. The
-  compiler does not know flags that a native parent adds beyond these. A shipped status-effect Blueprint carries
-  `EditInlineNew`, and a mod `UStatusEffect` class is cooked without it. Whether that matters in game is untested.
+- The class takes its parent's class flags, ClassWithin and config name, as the editor copies them: an `AHUD` child
+  reads `Game.ini`, a `UCheatManager` child is within PlayerController, a `UStatusEffect` child is `EditInlineNew`.
+  UeApi states them per class (`UeClassTail`): a native class's from what the game's Blueprint children of it carry and
+  UE 4.27's UCLASS specifiers, a game Blueprint's read off its package. A native parent neither describes gets the
+  flags of the kind of parent (actor, actor component, function library, anything else), within Object, config
+  Engine; so does every parent with a UeApi generated before the markers existed.
 - A class that is not an actor has no construction script, so `UE_COMPONENT` in it is refused: "only an actor has a
   construction script". See [Components](#components).
 - A latent call such as `Delay` finds its world by itself in an actor, actor component, user widget, game instance or
