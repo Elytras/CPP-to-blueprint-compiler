@@ -651,6 +651,7 @@ struct FCallIR
     uint64 WrittenArgs = ~uint64(0);    // bit I: argument I must stay its own variable, which the callee may write: see ContainerWrites
     std::vector<std::string> RefParms;  // per argument, the type of the reference parameter it binds, else "": see HoistCallArgs
     bool bRefsTakeConst = false;        // a native's P_GET_PROPERTY_REF: a constant there goes through the thunk's own buffer
+    uint64 EmptiedArgs = 0;             // bit I: argument I is a native's out TArray, emptied just before the call: see HoistCallArgs
     std::string VirtualName;            // a generated class's own instance method: EX_VirtualFunction resolves it by name at run time
     bool bLocal = false;                // EX_LocalVirtualFunction / EX_LocalFinalFunction: a script function that is no RPC
     std::string View;                   // __RefAtInline__: the TArray field of the view struct in Extra
@@ -1475,6 +1476,14 @@ private:
     std::map<std::string, std::vector<std::pair<std::string, int64>>> EnumDecls;   // C++ name -> its enumerators, in order
     std::map<std::string, int32> EnumConstWidth;      // clang EnumConstantDecl id -> its enum's size, 1 / 4 / 8
     std::map<std::string, uint32> EventFlags;         // UeApi/Events.json: "Package.Class.Function" -> EFunctionFlags
+    /* UeApi/OutArrays.json: "Package.Class.Function" -> bit I for each parameter I of a native that is an out TArray,
+       emptied before the call (FCallIR::EmptiedArgs). A UeApi without the file empties nothing, as before. */
+    std::map<std::string, uint64> OutArrayArgs;
+    uint64 OutArraysOf(const std::string& Package, const std::string& Class, const std::string& Fn) const
+    {
+        auto It = OutArrayArgs.find(Package.substr(Package.rfind('/') + 1) + "." + Class + "." + Fn);
+        return It == OutArrayArgs.end() ? 0 : It->second;
+    }
     std::map<std::string, FIndex> CurSignatures;      // Generate: dispatcher name -> its signature function export
     const FConv* FindConv(const std::string& From, const std::string& To) const;
     const FOpInfo* FindOp(const std::string& Op, const std::string& Lhs, const std::string& Rhs) const;
@@ -3999,6 +4008,7 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             Out.Sub = std::make_shared<FCallIR>();
             Out.Sub->Fn = BP.EngineFunction("/Script/Engine", Lib, Prefix + Method);
             Out.Sub->WrittenArgs = ContainerWrites(Prefix + Method);
+            Out.Sub->EmptiedArgs = OutArraysOf("/Script/Engine", Lib, Prefix + Method);    // ToArray, Keys, Values
             Out.Sub->bOnArg0 = true;
             Out.Sub->Args.push_back(Target);
             Out.Sub->RefParms.emplace_back();
@@ -5089,6 +5099,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
     std::string DeclId, MethodName;
     const Json* FullDecl = nullptr;     // the UFunction's own signature, whichever overload was called
     const Json* Receiver = nullptr;     // a forwarded method's object, first among the arguments (UObject::GetOuter)
+    uint64 OutArrays = 0;               // a native callee's out TArray parameters (OutArrays.json)
     if (K == "CXXMemberCallExpr")
     {
         if (Kind(*Callee) != "MemberExpr") { *Err = "TODO: unimplemented callee " + Kind(*Callee); return false; }
@@ -5298,6 +5309,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         Out.Fn = BP.EngineFunction(CalleePackage, CalleeName, UeNameOf(Called, MethodName));
         Out.bScript = CalleePackage.compare(0, 6, "/Game/") == 0;
         Out.bInstance = !bStatic;
+        if (!Out.bScript) OutArrays = OutArraysOf(CalleePackage, CalleeName, UeNameOf(Called, MethodName));
         /* A Blueprint static needs the CDO context; EX_CallMath finds it itself for a native, but never asks the
            callspace an authority-only or cosmetic one has (KismetCompilerVMBackend.cpp 1222-1231): that one is called
            through CallFunction on the CDO, as the editor calls it. */
@@ -5405,6 +5417,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
        parameters `const T&` for this (Dumper-7's flags; its spelling alone cannot tell one from a by-value string). */
     auto FillRefParms = [&] {
         if (Out.Args.size() != Parms.size()) return;
+        Out.EmptiedArgs = OutArrays;        // the arguments stand where the UFunction's parameters do
         Out.RefParms.clear();
         Out.bRefsTakeConst = !Out.bScript;
         ForEach(*FullDecl, [&](const Json& C) {
@@ -7845,6 +7858,7 @@ bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vec
         St.K = FStmtIR::StaticCall;
         St.Call.Fn = BP.EngineFunction("/Script/Engine", Lib, Fn);
         St.Call.WrittenArgs = ContainerWrites(Fn);
+        St.Call.EmptiedArgs = OutArraysOf("/Script/Engine", Lib, Fn);     // the copy a TSet / TMap walk refills
         St.Call.Args = std::move(CallArgs);
         return St;
     };
@@ -8459,6 +8473,18 @@ bool FCompiler::HoistCallArgs(FCallIR& C, FBlueprintClass& BP, std::vector<FProp
             if (!HoistOperand(C.Args[I], BP, Locals, OutPre, Err)) return false;
         }
     }
+    /* A native's out TArray is emptied by a statement of its own, `EX_SetArray <arg> EX_EndArray`, after everything
+       else the call needs and so just before it, as the editor writes it "in case the native function doesn't clear
+       them before filling" (KismetCompilerVMBackend.cpp 1152-1174). One that appends, as GenericSet_ToArray does
+       (BlueprintSetLibrary.cpp 53-70), would otherwise add to what the variable already held. */
+    for (size_t I = 0; I < C.Args.size() && I < 64; ++I)
+        if (((C.EmptiedArgs >> I) & 1) && IsStored(C.Args[I]))
+        {
+            FStmtIR Empty;
+            Empty.Call.Intrinsic = "__SetArray__";
+            Empty.Call.Args = { C.Args[I] };
+            OutPre.push_back(std::move(Empty));
+        }
     return true;
 }
 
@@ -11430,6 +11456,11 @@ bool FCompiler::LoadTables(const std::string& IncludeDir, std::string* Err)
     if (!Load("Conv.json", &ConvDoc) || !Load("Ops.json", &OpsDoc) || !Load("Types.json", &TypesDoc)
         || !Load("Events.json", &EventsDoc)) return false;
     for (auto It = EventsDoc.begin(); It != EventsDoc.end(); ++It) EventFlags[It.key()] = It->get<uint32>();
+    const Json OutArraysDoc = Json::parse(ReadText(IncludeDir + "/OutArrays.json"), nullptr, false);
+    if (OutArraysDoc.is_object())
+        for (auto It = OutArraysDoc.begin(); It != OutArraysDoc.end(); ++It)
+            for (const Json& I : *It)
+                if (I.get<int32>() < 64) OutArrayArgs[It.key()] |= uint64(1) << I.get<int32>();
 
     for (const Json& Row : ConvDoc)
         Convs.push_back({ Row.value("from", std::string()), Row.value("to", std::string()),

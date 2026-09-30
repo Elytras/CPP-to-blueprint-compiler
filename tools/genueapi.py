@@ -547,21 +547,27 @@ def read_real_fields(sdk_dir):
 # ITS arguments read last (`Conv_TextToString(Conv_Int64ToText(Big))` read the int64 as an FText and crashed DRG). So
 # such a parameter stays `const T&` in the header, and AssetGen gives a computed argument a local of its own first.
 # Dumper-7 spells a by-value move type `const T&` too; only the flag comment in <Pkg>_parameters.hpp tells them apart.
-PARAM_FUNC = re.compile(r"^// Function \S+\.(\w+)\.(.+)$")
+PARAM_FUNC = re.compile(r"^// Function (\S+)\.(\w+)\.(.+)$")
 PARAM_LINE = re.compile(r"^\t(.+?)\s+(\w+)(?:\[\w+\])?;\s+// 0x\w+\(0x\w+\)\((.*)\)\s*$")
 REF_PARMS = {}       # (class, engine function name) -> {parameter spellings that are const references}
+# Before calling a native, the editor empties each TArray parameter that is CPF_OutParm and none of ReferenceParm /
+# ConstParm / ReturnParm, "in case the native function doesn't clear them before filling" (KismetCompilerVMBackend.cpp
+# 1152-1174), and a native such as GenericSet_ToArray relies on it, appending (BlueprintSetLibrary.cpp 53-70). UeApi
+# spells that array `T&`, as it does a UPARAM(ref) one the native reads (AssetRegistry's RunAssetsThroughFilter):
+# only the flags tell them apart, so OutArrays.json names them.
+OUT_ARRAYS = {}      # (package leaf, class, engine function name) -> [index among the parameters, return left out]
 
 
 def read_ref_parms(sdk_dir):
     for name in os.listdir(sdk_dir):
         if not name.endswith("_parameters.hpp"):
             continue
-        cur = None
+        cur, at = None, 0
         for line in io.open(os.path.join(sdk_dir, name), encoding="utf-8", errors="replace"):
             line = line.rstrip("\r\n")
             m = PARAM_FUNC.match(line)
             if m:
-                cur = (m.group(1), m.group(2).rstrip())
+                cur, at = (m.group(1).rsplit("/", 1)[-1], m.group(2), m.group(3).rstrip()), 0
                 continue
             if line.startswith("};"):
                 cur = None
@@ -570,7 +576,13 @@ def read_ref_parms(sdk_dir):
             if p:
                 flags = p.group(3).split(", ")
                 if "ReferenceParm" in flags and "ConstParm" in flags and "ReturnParm" not in flags:
-                    REF_PARMS.setdefault(cur, set()).add(p.group(2))
+                    REF_PARMS.setdefault(cur[1:], set()).add(p.group(2))
+                if "Parm" not in flags or "ReturnParm" in flags:
+                    continue                            # Dumper-7's padding, or the return value
+                if p.group(1).startswith("TArray<") and "OutParm" in flags \
+                        and not ("ReferenceParm" in flags or "ConstParm" in flags):
+                    OUT_ARRAYS.setdefault(cur, []).append(at)
+                at += 1
 
 
 def const_ref(t):
@@ -903,6 +915,7 @@ FUNC_BITS = {"Final": 0x1, "RequiredAPI": 0x2, "BlueprintAuthorityOnly": 0x4, "B
 # may still move a random stream or build an object.
 IMPURE_PURE = re.compile(r"Random|Now$|Today$|Create|Construct|Spawn|^New|^Make.*Object|Seed")
 PURE = set()     # (class, function) of every BlueprintPure function, filled by write_events
+NATIVE = set()   # (package leaf, class, function) of every FUNC_Native function, filled by write_events
 MARKS = {}       # (class, function) -> "UE_SERVER UE_RELIABLE " and the like, filled by write_events
 MARK_OF = (("NetServer", "UE_SERVER"), ("NetClient", "UE_CLIENT"), ("NetMulticast", "UE_MULTICAST"),
            ("NetReliable", "UE_RELIABLE"), ("BlueprintAuthorityOnly", "UE_AUTHORITY_ONLY"), ("BlueprintCosmetic", "UE_COSMETIC"))
@@ -922,6 +935,8 @@ def write_events(sdk_dir, out_dir):
                              r"[^\n(]*?((?:\w+::)*\w+)::(\w+)\(", text, re.M):
             pkg, cls, real, names = m.group(1), m.group(2), m.group(3).rstrip(), m.group(4).split(", ")
             REAL_FUNCS[(stem, m.group(5), m.group(6))] = real
+            if "Native" in names:
+                NATIVE.add((pkg, cls, real))
             if "BlueprintPure" in names:
                 PURE.add((cls, real))
             marks = "".join(mark + " " for flag, mark in MARK_OF if flag in names)
@@ -931,6 +946,16 @@ def write_events(sdk_dir, out_dir):
                 rows.append('  %s: %d' % (json.dumps("%s.%s.%s" % (pkg, cls, real)), sum(FUNC_BITS[n] for n in names)))
     io.open(os.path.join(out_dir, "Events.json"), "w", encoding="utf-8", newline="\n").write("{\n" + ",\n".join(rows) + "\n}\n")
     print("  events: %d" % len(rows))
+
+
+def write_out_arrays(out_dir):
+    """OutArrays.json: "Package.Class.Function" -> the parameter indices (the return value not counted) of each native
+    function's out arrays, which the compiler empties just before the call as the editor does (see OUT_ARRAYS). Only a
+    FUNC_Native function: the editor leaves a script callee's alone. Run after write_events, which collects NATIVE."""
+    keys = sorted(k for k in OUT_ARRAYS if k in NATIVE)
+    rows = ['  %s: %s' % (json.dumps("%s.%s.%s" % k), json.dumps(OUT_ARRAYS[k])) for k in keys]
+    io.open(os.path.join(out_dir, "OutArrays.json"), "w", encoding="utf-8", newline="\n").write("{\n" + ",\n".join(rows) + "\n}\n")
+    print("  native out arrays: %d functions" % len(rows))
 
 
 def write_containers(classes, sdk_dir, out_dir):
@@ -1083,6 +1108,7 @@ def main():
     conv_structs = write_conversions(ordered, out_dir)
     write_containers(ordered, sdk_dir, out_dir)
     write_events(sdk_dir, out_dir)
+    write_out_arrays(out_dir)
     ops_by_pkg = write_operators(ordered, out_dir)
     write_types(out_dir)
 

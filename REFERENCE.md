@@ -1202,6 +1202,7 @@ needs a container variable, not one a call returns.
 | `Scores.Add(7)` | A method is the Blueprint node, with the container as its target. The methods are listed under the table. `Add` returns the new index. | Yes |
 | `Scores.Num()` | The same as `Length()`. | Yes |
 | `Weights.Find("alpha", W)` | Results come back through reference parameters: `Find(Key, Out)` on a map, `Get(Index, Out)`, `Keys(OutArray)`, `Random(OutItem, OutIndex)`, `Seen.Union(Other, Result)`. | Yes |
+| `Seen.ToArray(List)`, `Weights.Keys(Names)`, `GetAllActorsOfClass(C, Found)` | An array an engine function only fills is emptied just before the call, as the editor does, so afterwards it holds exactly what the call put there: `ToArray` itself would add to what `List` held. An array the function also reads (`UPARAM(ref)`, such as RunAssetsThroughFilter's) is passed as it is. | Yes |
 | `Items.Remove(2)` | Removes the element at index 2 (the Remove Index node). UE C++'s `Remove(Item)` removes by value; this does not. | Yes |
 | `Items.RemoveItem(2)` | Removes the elements equal to 2 (the Remove node). | Yes |
 | `Items.Find(5)` | The index of 5, or -1. | Yes |

@@ -159,7 +159,6 @@ KNOWN_RULES = {     # sweep rules the suite's own packages still break, each wit
     'latent_async_proxy_validated': 'the async proxy is bound and activated with no IsValid gate',
     'latent_proxy_frame_held': 'AsyncTest.Play keeps its montage callback proxy only in a local of a function that '
                                'does not wait',
-    'native_out_arrays_emptied': "a native's out TArray is not emptied before the call, so Set_ToArray appends",
     'typing_callmath_callee': 'container-library CustomThunks (Array_* / Set_* / Map_*) are emitted as EX_CallMath, '
                               'not inside an EX_Context on the library default object',
 }
@@ -4399,7 +4398,7 @@ def drop_result():
 def out_array_reset():
     """A native's out TArray arrives empty (KismetCompilerVMBackend.cpp 1152-1174), so a native written against that
     contract - modelled here by one that only appends - leaves exactly what it found."""
-    base = pending_asset('OutArrayReset')
+    base = asset('OutArrayReset')
     found = Obj('Found_C')
 
     def appends(vm, ctx, wco, cls, out):         # a native written against the editor's contract: it only appends
@@ -4414,7 +4413,7 @@ def set_to_array_append():
     """The engine's own appending native: GenericSet_ToArray adds each element onto whatever Result holds
     (BlueprintSetLibrary.cpp 53-70), runscript's model below does the same for this test, and the editor empties Result
     first. So ToArray leaves exactly the set, and a range-for over a set in an outer loop sees it once per round."""
-    base = pending_asset('SetToArrayAppend')
+    base = asset('SetToArrayAppend')
     set_to_array_runs(base)
     vmsem_holds(base, 'native_out_arrays_emptied')
 
@@ -4490,8 +4489,11 @@ ctx_null_call()
 print('ok  CtxNullCall: a call through a None object zeroes its Let destination (the context names its r-value)')
 drop_result()
 print('ok  DropResult: a discarded FString / TArray result lands in a local, not the 64-byte statement buffer')
-pending('OutArrayReset: a native\'s out TArray is emptied before the call', out_array_reset)
-pending('SetToArrayAppend: ToArray / a set range-for empty the array Set_ToArray appends to', set_to_array_append)
+out_array_reset()
+print("ok  OutArrayReset: a native's out TArray is emptied just before the call (EX_SetArray), so it holds only what the "
+      "call found")
+set_to_array_append()
+print('ok  SetToArrayAppend: ToArray and a set range-for empty the array Set_ToArray appends to')
 no_world_warning()
 local_ctor_flags()
 print('ok  LocalCtorFlags: FUNC_HasDefaults on a function with an FHitResult / FTransform / FText / TMap local')
