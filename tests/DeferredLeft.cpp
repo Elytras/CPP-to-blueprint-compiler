@@ -6,10 +6,11 @@ An actor from BeginDeferredActorSpawnFromClass runs its construction script and 
 FinishAddComponent (ActorConstruction.cpp 1165-1212), and the bManualAttachment given to the add is then never read
 (1157-1160): the finish's own decides the attachment. The editor wires each pair itself (K2Node_SpawnActorFromClass.cpp
 412-435, K2Node_AddComponent.cpp 463-507); in C++ nothing ties them. (A finish at another transform than the spawn's
-is not here: FinishSpawning recomposes it on purpose, Actor.cpp 3212-3232, as if spawned there.) Pending: each
-function here compiles without a word; the compiler should warn at each.
+is not here: FinishSpawning recomposes it on purpose, Actor.cpp 3212-3232, as if spawned there.) The compiler warns
+at each function here. One that hands the object on - stores it in a member or out parameter, returns it, or passes
+it to a script function - is not warned about: UberDeferGuard finishes in Finish() what Begin() stored.
 */
-#include "../../include/Objects.h"
+#include "../include/Objects.h"
 
 #include "UeApi/FSD.h"
 

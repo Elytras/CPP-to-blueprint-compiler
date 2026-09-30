@@ -5533,6 +5533,106 @@ void NamesRead(const std::vector<FStmtIR>& Stmts, std::set<std::string>& Out, bo
     }
 }
 
+/* Every call a statement list makes, an inline body's and an argument's included, in no particular order. */
+void EachCall(const FArgIR& A, const std::function<void(const FCallIR&)>& Visit);
+void EachCall(const std::vector<FStmtIR>& Stmts, const std::function<void(const FCallIR&)>& Visit);
+void EachCall(const FCallIR& C, const std::function<void(const FCallIR&)>& Visit)
+{
+    Visit(C);
+    if (C.Inline) EachCall(*C.Inline, Visit);
+    if (C.Target) EachCall(*C.Target, Visit);
+    for (const FArgIR& A : C.Args) EachCall(A, Visit);
+}
+void EachCall(const FArgIR& A, const std::function<void(const FCallIR&)>& Visit)
+{
+    if (A.Sub) EachCall(*A.Sub, Visit);
+    if (A.Base) EachCall(*A.Base, Visit);
+}
+void EachCall(const std::vector<FStmtIR>& Stmts, const std::function<void(const FCallIR&)>& Visit)
+{
+    for (const FStmtIR& St : Stmts)
+    {
+        EachCall(St.Target, Visit);
+        EachCall(St.Call, Visit);
+        for (const FArgIR* A : { &St.Var, &St.Value, &St.Cond, &St.SwitchValue }) EachCall(*A, Visit);
+        for (const FArgIR& A : St.CaseTests) EachCall(A, Visit);
+        for (const auto* L : { &St.Then, &St.Else, &St.Body, &St.Inc, &St.Trailer }) if (*L) EachCall(**L, Visit);
+    }
+}
+
+/*
+A deferred spawn or component add is half of a pair C++ does not tie together: the editor's Spawn Actor and Add Component
+nodes always make the second call themselves (K2Node_SpawnActorFromClass.cpp 412-435, K2Node_AddComponent.cpp 463-507).
+An actor from BeginDeferredActorSpawnFromClass runs its construction script and BeginPlay only in FinishSpawningActor
+(Actor.cpp 3185-3251); a component added with bDeferredFinish is attached, registered and told it was created only in
+FinishAddComponent (ActorConstruction.cpp 1165-1212), whose own bManualAttachment decides the attachment - the add's is
+not read when deferred (1157-1160). So a function with more starts than finishes, or finishing with another
+bManualAttachment than it added with, is warned about, unless it hands the object on (below): the other half may be
+in another function. (A finish at another transform is not: FinishSpawning recomposes it on purpose, Actor.cpp
+3212-3232.) Fn names the function, Of maps a call's function to its name.
+*/
+void WarnDeferredLeft(const std::string& Fn, const std::vector<FStmtIR>& Stmts, const std::function<std::string(FIndex)>& Of)
+{
+    int32 Spawns = 0, SpawnsFinished = 0, Adds = 0, AddsFinished = 0;
+    std::set<int32> AddManual, FinishManual;        // each bManualAttachment given, 1 / 0, or -1 when not a constant
+    auto Manual = [](const FCallIR& C, size_t Arg) { return Arg < C.Args.size() && C.Args[Arg].K == FArgIR::Bool ? int32(C.Args[Arg].B) : -1; };
+    auto NameOf = [&](const FCallIR& C) { return C.Fn.V && C.Intrinsic.empty() ? Of(C.Fn) : std::string(); };
+    auto IsAdd = [&](const FCallIR& C) {
+        return NameOf(C) == "AddComponentByClass" && C.Args.size() == 4 && C.Args[3].K == FArgIR::Bool && C.Args[3].B;
+    };
+    EachCall(Stmts, [&](const FCallIR& C) {
+        const std::string Name = NameOf(C);
+        if (Name == "BeginDeferredActorSpawnFromClass") ++Spawns;
+        else if (Name == "FinishSpawningActor") ++SpawnsFinished;
+        else if (IsAdd(C)) { ++Adds; AddManual.insert(Manual(C, 1)); }
+        else if (Name == "FinishAddComponent") { ++AddsFinished; FinishManual.insert(Manual(C, 1)); }
+    });
+    /* A started object that leaves the function - stored in a member or out parameter, returned, or handed to a script
+       function - is finished elsewhere, as UberDeferGuard's Begin / Finish pair is: its kind is not counted as left. */
+    // ponytail: per kind, not per object; a function that both hands one off and drops another is not warned about.
+    std::set<std::string> SpawnHeld, AddHeld;       // locals given a started object, in statement order
+    bool bSpawnOut = false, bAddOut = false;
+    auto Carries = [&](const FArgIR& V, bool& bSpawn, bool& bAdd) {
+        EachCall(V, [&](const FCallIR& C) { bSpawn |= NameOf(C) == "BeginDeferredActorSpawnFromClass"; bAdd |= IsAdd(C); });
+        std::set<std::string> Read;
+        NamesRead(V, Read);
+        for (const std::string& N : Read) { bSpawn |= SpawnHeld.count(N) > 0; bAdd |= AddHeld.count(N) > 0; }
+    };
+    std::function<void(const std::vector<FStmtIR>&)> Walk = [&](const std::vector<FStmtIR>& List) {
+        for (const FStmtIR& St : List)
+        {
+            const bool bStore = St.K == FStmtIR::Assign || St.K == FStmtIR::Decl;
+            bool bSpawn = false, bAdd = false;
+            if (bStore || St.K == FStmtIR::Return) Carries(St.Value, bSpawn, bAdd);
+            if (bStore && St.Var.K == FArgIR::Local && !St.bAssignOutParm)
+            { if (bSpawn) SpawnHeld.insert(St.Var.S); if (bAdd) AddHeld.insert(St.Var.S); }
+            else { bSpawnOut |= bSpawn; bAddOut |= bAdd; }
+            const auto Visit = [&](const FCallIR& C) {
+                if (C.Inline) Walk(*C.Inline);
+                if (C.bScript) for (const FArgIR& A : C.Args) Carries(A, bSpawnOut, bAddOut);
+            };
+            EachCall(St.Target, Visit);
+            EachCall(St.Call, Visit);
+            for (const FArgIR* A : { &St.Var, &St.Value, &St.Cond }) EachCall(*A, Visit);
+            for (const auto* L : { &St.Then, &St.Else, &St.Body, &St.Inc, &St.Trailer }) if (*L) Walk(**L);
+        }
+    };
+    Walk(Stmts);
+    if (bSpawnOut) Spawns = 0;
+    if (bAddOut) Adds = AddsFinished;
+    if (Spawns > SpawnsFinished)
+        printf("  warning: %s: a deferred spawn (SpawnActorDeferred, BeginDeferredActorSpawnFromClass) is not finished in this "
+               "function: until FinishSpawning (FinishSpawningActor) runs on it, the actor runs no construction script and no "
+               "BeginPlay\n", Fn.c_str());
+    if (Adds > AddsFinished)
+        printf("  warning: %s: a deferred component add (AddComponentDeferred, AddComponentByClass with bDeferredFinish) is not "
+               "finished in this function: until FinishComponent (FinishAddComponent) runs on it, the component is neither "
+               "attached nor registered\n", Fn.c_str());
+    else if (Adds && !AddManual.count(-1) && !FinishManual.count(-1) && AddManual != FinishManual)
+        printf("  warning: %s: a deferred component add is given one bManualAttachment and finished with another: the "
+               "finish's decides whether it attaches to the root, the add's is not read; pass the same to both\n", Fn.c_str());
+}
+
 /* Removes the stores to a local in Unread; a value that calls something impure keeps its call as a statement,
    unless its result is one the VM cannot throw away (Constructed), in which case the whole store stays. */
 void DropStores(std::vector<FStmtIR>& Stmts, const std::set<std::string>& Unread, const std::set<std::string>& Constructed)
@@ -11118,6 +11218,10 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             *Err = R.CppName + "::" + Fn.Name + ": " + *Err;
             return false;
         }
+        WarnDeferredLeft(R.CppName + "::" + Fn.Name, Stmts, [&](FIndex I) {
+            const FImport* Im = P.ImportAt(I);
+            return Im ? Im->ObjectName : std::string();
+        });
         /* A stub returns the default. A script caller's destination is the return parameter itself (ScriptCore.cpp
            ProcessScriptFunction: RetVal->PropAddr = RESULT_PARAM), so Return Nothing would leave its old value there. A
            local is zeroed and constructed on every call, the value the editor's unlinked result pin gives. */

@@ -2687,7 +2687,10 @@ Notes:
 - `Objects.h` is in AssetGen's `include/` folder, not in `UeApi`. Include it by its path from your source,
   `#include "../include/Objects.h"` as the examples do, or copy it beside your source; a bare `#include "Objects.h"`
   finds it only there. [Creating objects](#creating-objects) has the rest of it.
-- Pass the same bManualAttachment to `AddComponentDeferred` and `FinishComponent`.
+- Pass the same bManualAttachment to `AddComponentDeferred` and `FinishComponent`: the finish's decides the
+  attachment. Two different constants get a warning, and so does a function that adds deferred and never calls
+  `FinishComponent`, unless it hands the component on (to a member, an out parameter, its return value or a script
+  function), where the finish may be.
 - The usage comment at the top of `Objects.h` writes `GetRootComponent()`, which the SDK does not declare. Write
   `K2_GetRootComponent()`.
 
@@ -2874,8 +2877,9 @@ Notes:
 
 - The world context is the caller: `this`, or a static function's own `WorldContextObject` parameter. See
   [Calling engine and game functions](#calling-engine-and-game-functions).
-- Until `FinishSpawning` runs, a deferred actor has not run its construction script or BeginPlay. Nothing makes you
-  call it.
+- Until `FinishSpawning` runs, a deferred actor has not run its construction script or BeginPlay. A function that
+  spawns deferred and never calls `FinishSpawning` gets a warning, unless it hands the actor on (to a member, an out
+  parameter, its return value or a script function), where the finish may be.
 - [examples/Beacon.cpp](examples/Beacon.cpp) spawns an actor of the mod near the player.
 
 ### Objects and widgets
@@ -5669,6 +5673,14 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   returns None); spawn in ReceiveBeginPlay`: `SpawnActor<T>` or a deferred spawn written in UserConstructionScript.
   Fix: spawn in ReceiveBeginPlay. A helper of the class the construction script calls warns instead: `warning:
   <Class>::<Helper> spawns an actor and UserConstructionScript calls it`, since it may run elsewhere too.
+- `warning: <Function>: a deferred spawn (SpawnActorDeferred, BeginDeferredActorSpawnFromClass) is not finished in
+  this function` and `warning: <Function>: a deferred component add (AddComponentDeferred, AddComponentByClass with
+  bDeferredFinish) is not finished in this function`: the function starts more than it finishes and keeps the object
+  to itself. Until the finish, the actor runs no construction script and no BeginPlay, and the component is neither
+  attached nor registered. Fix: call `FinishSpawning` / `FinishComponent` on it, or keep it in a member for the
+  function that does. See [Creating objects](#creating-objects).
+- `warning: <Function>: a deferred component add is given one bManualAttachment and finished with another`: the
+  finish's decides whether the component attaches to the root; the add's is not read. Fix: pass the same to both.
 - `<Function>: AddComponent looks up a component template by name, and a mod class has no component templates, so it
   returns None; add one by class with AddComponentByClass`: `AddComponent(FName("X"), ...)`. Fix: use
   `AddComponentByClass`, or `AddComponentByType<T>(Owner)`. See [Components](#components).

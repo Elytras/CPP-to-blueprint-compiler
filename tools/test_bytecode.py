@@ -6316,14 +6316,18 @@ def deferred_left():
     """A deferred spawn never finished (the actor never runs its construction script or BeginPlay, Actor.cpp
     3185-3251), and a deferred component add never finished (never attached or registered, ActorConstruction.cpp
     1165-1212) or begun with a bManualAttachment the finish then overrides (the add's is not read when deferred,
-    1157-1160): C++ compiles each, so the compiler should say so at the function. A finish at another transform is
-    not asked about: FinishSpawning recomposes it on purpose (Actor.cpp 3212-3232). The patterns start at a word, so
-    the function names NoFinish / CompNoFinish do not match them themselves."""
-    def warns(*cases):
-        return lambda: [says('DeferredLeft', 'at ' + fn, r'DeferredLeft::%s\b' % fn, what)() for fn, what in cases]
-    pending('DeferredLeft.NoFinish: a deferred spawn left unfinished warns', warns(('NoFinish', r'finish')))
-    pending('DeferredLeft: a deferred component add left unfinished, or finished with another attachment, warns',
-            warns(('CompNoFinish', r'finish'), ('CompManual', r'attach')))
+    1157-1160): C++ compiles each, so the compiler says so at the function. A finish at another transform is not
+    asked about: FinishSpawning recomposes it on purpose (Actor.cpp 3212-3232). The patterns start at a word, so the
+    function names NoFinish / CompNoFinish do not match them themselves. The control: UberDeferGuard's Begin stores
+    its deferred spawn in a member and Finish finishes it, which is not warned about."""
+    log = latent_compile_log(os.path.join(TESTS, 'DeferredLeft.cpp'))[1]
+    for fn, what in (('NoFinish', r'\bfinish'), ('CompNoFinish', r'\bfinish'), ('CompManual', r'\battach')):
+        assert said(log, r'DeferredLeft::%s\b' % fn, what), \
+            'nothing said at %s: %s' % (fn, ' | '.join(log.strip().splitlines()))
+    held = latent_compile_log(os.path.join(TESTS, 'UberDeferGuard.cpp'))[1]
+    assert not said(held, r'\bdeferred\b'), 'a deferred spawn kept in a member warned: ' + held
+    print('ok  DeferredLeft: an unfinished deferred spawn or component add, or a finish with another attachment, warns; '
+          'one kept in a member does not')
 
 
 def spawn_abstract():
