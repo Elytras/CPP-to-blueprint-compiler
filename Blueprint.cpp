@@ -265,6 +265,11 @@ void FBlueprintClass::Finish()
     /* UStruct::GetPreloadDependencies (Class.cpp 732-735): the structs and enums the class's variables are typed by,
        which it links against while it is serialized. */
     for (const FPropertyDef& V : Vars) TypeRefs(V, Class.SerBeforeSer);
+    /* The rest of UBlueprintGeneratedClass::GetPreloadDependencies (BlueprintGeneratedClass.cpp 1425-1459): Link preloads
+       the ubergraph and the CDO's persistent frame is made only from a loaded one (1636, 1358-1375), and a component
+       archetype lookup on the class meets RF_NeedLoad on an unloaded handler, a Fatal (858-866). */
+    if (UberGraphFunction.V != 0) Class.SerBeforeSer.push_back(UberGraphFunction.V);
+    if (!ComponentOverrides.empty()) Class.SerBeforeSer.push_back(Exp(RowIch).V);
     Class.SerBeforeCreate = { BpgcClass.V, BpgcCdo.V };
     Class.CreateBeforeCreate = { ParentIdx.V };
     for (int32 I = 0; I < NumFunctions; ++I)

@@ -148,7 +148,6 @@ GAPS, FIXED, REFUSALS = [], [], {}
 KNOWN_RULES = {     # sweep rules the suite's own packages still break, each with the AssetGen defect (TODO.md, S33)
     'class_tail_follows_parent': 'the class tail is hard-coded (ClassWithin Object, ClassConfigName Engine, ClassFlags '
                                  'guessed from ancestry) instead of taken from the parent',
-    'edl_class_closure': "a BPGC's UberGraphFunction and InheritableComponentHandler are not serialized before the class",
     'edl_create_prereqs': 'a native default-subobject override export has TemplateIndex 0',
     'export_archetype': 'native default-subobject overrides have a null TemplateIndex',
     'import_chains': 'packages import themselves (their own package, class and functions)',
@@ -3258,21 +3257,23 @@ preload_types()
 print('ok  PreloadTypes: a user-defined struct or enum is serialized before the class, function or struct it types')
 
 
-# ---- Pending: the preload dependencies AssetGen leaves out
-
 def preload_uber_class():
     """PreloadUber_C names ExecuteUbergraph_PreloadUber as its UberGraphFunction: Link preloads it, and the CDO's
     persistent frame is only made from a loaded one, so it is serialized before the class."""
-    base = pending_asset('PreloadUber')
+    base = asset('PreloadUber')
     pkg = invariants.Package(base)
     assert EDL.edl_obj_tag(pkg, pkg.find('PreloadUber_C'), 'UberGraphFunction') > 0
     keeps_edl(base, ['edl_class_closure'])
 
 
+preload_uber_class()
+print('ok  PreloadUber: the class is serialized after its ubergraph function')
+
+
 def preload_uber_calls():
     """Wait, the stub the latent call leaves, calls ExecuteUbergraph_PreloadUber and writes its frame: resolved while
     Wait is serialized, so the ubergraph is created before; otherwise the call target reads back null."""
-    base = pending_asset('PreloadUber')
+    base = asset('PreloadUber')
     pkg = invariants.Package(base)
     wait = pkg.find('Wait')
     assert any(op[0] == 'obj' and op[1] and pkg.path(op[1]).endswith(':ExecuteUbergraph_PreloadUber')
@@ -3280,14 +3281,24 @@ def preload_uber_calls():
     keeps_edl(base, ['edl_payload_created'])
 
 
+preload_uber_calls()
+print('ok  PreloadUber: a function that enters the ubergraph has it created before it is serialized')
+
+
 def preload_ich():
     """PreloadIch_C names its InheritableComponentHandler, through which the Lamp archetype is found: the handler is
     serialized (so created) before the class."""
-    base = pending_asset('PreloadIch')
+    base = asset('PreloadIch')
     pkg = invariants.Package(base)
     assert EDL.edl_obj_tag(pkg, pkg.find('PreloadIch_C'), 'InheritableComponentHandler') > 0
     keeps_edl(base, ['edl_class_closure', 'edl_payload_created'])
 
+
+preload_ich()
+print('ok  PreloadIch: the class is serialized after its InheritableComponentHandler')
+
+
+# ---- Pending: the preload dependencies AssetGen leaves out
 
 def preload_dso_template(name, want):
     """The export restating CollisionCylinder under Default__<name>_C, and the package: its TemplateIndex must be
@@ -3332,9 +3343,6 @@ def preload_dso_kid():
     assert not found, '; '.join('%s %s: %s' % f for f in found[:3])
 
 
-pending('PreloadUber: the class is serialized after its ubergraph function', preload_uber_class)
-pending('PreloadUber: a function that enters the ubergraph has it created before it is serialized', preload_uber_calls)
-pending('PreloadIch: the class is serialized after its InheritableComponentHandler', preload_ich)
 pending('PreloadDso: a restated native subobject has its archetype as TemplateIndex', preload_dso)
 pending('PreloadDso: a child\'s subobject override is archetyped on the parent\'s, serialized before it and the child class',
         preload_dso_chain)
