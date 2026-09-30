@@ -235,6 +235,45 @@ bool DefaultAssignment(const Json& S, const Json*& Lhs, const Json*& Rhs, const 
     return true;
 }
 
+/* An inherited set's or map's default P, made what the editor saves (PropertySet.cpp 359-429, PropertyMap.cpp
+   400-472) against Parent, the parent CDO's value it loads over: the parent's elements (a map's keys) P lacks as
+   removed, and of P's own only those the parent lacks (a map's pairs whose key it lacks or maps elsewhere). Elements
+   compare as the engine reads them, by their bytes: a name by its row in a scratch table, which a name spelled in
+   another case shares, as FName's comparison ignores case. */
+void DiffAgainstParent(FPropertyDef& P, const FDefaultValue& Parent)
+{
+    if (!P.Inner) return;
+    const bool bMap = P.Type == "MapProperty" && P.Value;
+    const size_t Step = bMap ? 2 : 1;
+    FPackage Scratch("/Scratch");
+    Scratch.SeedNames({});
+    auto Bytes = [&](const FPropertyDef& Of, const FDefaultValue& V) {
+        FPropertyDef E = Of;
+        E.Default = V;
+        FArc A(&Scratch);
+        WriteDefaultValue(A, E);
+        return A.B;
+    };
+    auto Find = [&](const std::vector<FDefaultValue>& In, const FDefaultValue& Key) -> const FDefaultValue* {
+        for (size_t I = 0; I + Step <= In.size(); I += Step)
+            if (Bytes(*P.Inner, In[I]) == Bytes(*P.Inner, Key)) return &In[I];
+        return nullptr;
+    };
+    FDefaultValue& Mine = P.Default;
+    Mine.Removed.clear();
+    for (size_t I = 0; I + Step <= Parent.Items.size(); I += Step)
+        if (!Find(Mine.Items, Parent.Items[I])) Mine.Removed.push_back(Parent.Items[I]);
+    std::vector<FDefaultValue> Differs;
+    for (size_t I = 0; I + Step <= Mine.Items.size(); I += Step)
+    {
+        const FDefaultValue* Had = Find(Parent.Items, Mine.Items[I]);
+        if (Had && (!bMap || Bytes(*P.Value, Had[1]) == Bytes(*P.Value, Mine.Items[I + 1]))) continue;
+        Differs.insert(Differs.end(), Mine.Items.begin() + std::ptrdiff_t(I), Mine.Items.begin() + std::ptrdiff_t(I + Step));
+    }
+    Mine.Items = std::move(Differs);
+    Mine.K = FDefaultValue::Array;
+}
+
 /* A patch's UE_DEFAULTS statement, which may also assign part of a member's value: DefaultAssignment's `Field` or
    `Component->Field`, then any `.Member` and `[i]` into it (`PrimaryActorTick.bCanEverTick = v`, `Spans[1].Max = v`).
    Root is the field's MemberExpr, Steps each `.Member`'s MemberExpr or `[i]`'s operator call, from the root out. */
@@ -10451,6 +10490,35 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 { *Err = Where + ": " + Name(*Lhs) + " needs a literal value"; bOk = false; return; }
                 if (bInterfaceVar) { InterfaceVarDefaults[Name(*Lhs)] = PD; return; }
 
+                /* An inherited set or map loads over the parent CDO's value (PropertySet.cpp 285-358, PropertyMap.cpp
+                   316-400: copied in, the listed removals taken out, the rest added), so written whole it would load as
+                   the union of both; DiffAgainstParent writes it as the editor does. The parent's value is the nearest
+                   UE_DEFAULTS up the chain that sets the member, else its initializer where it is declared. A native
+                   class on the way holds one no header says, and there it stays whole. */
+                if (!bThroughComponent && (PD.Type == "SetProperty" || PD.Type == "MapProperty"))
+                {
+                    const std::string Id = Lhs->value("referencedMemberDecl", std::string());
+                    FPropertyDef Parent = PD;
+                    Parent.Default = FDefaultValue();
+                    for (const FRecord* C = Find(R.Base); C && !C->IsNative(); C = C->Base.empty() ? nullptr : Find(C->Base))
+                    {
+                        const Json *Set = nullptr, *Value = nullptr, *Its = nullptr;
+                        if (C->Defaults) ForEach(*C->Defaults, [&](const Json& B) { if (Kind(B) == "CompoundStmt") Its = &B; });
+                        if (Its)
+                            ForEach(*Its, [&](const Json& S2) {
+                                const Json *L = nullptr, *V = nullptr, *Through = nullptr;
+                                if (DefaultAssignment(S2, L, V, Through) && !Through && L->value("referencedMemberDecl", std::string()) == Id)
+                                { Set = L; Value = V; }
+                            });
+                        const Json* Declared = nullptr;
+                        for (const Json* F : C->Fields) if (F->value("id", std::string()) == Id) Declared = F;
+                        if (!Set && !Declared) continue;
+                        if (!(Set ? LowerDefault(*Set, Parent, BP, Err, Value, /*bKeepZero=*/true) : LowerDefault(*Declared, Parent, BP, Err)))
+                        { bOk = false; return; }
+                        DiffAgainstParent(PD, Parent.Default);
+                        break;
+                    }
+                }
                 if (!bThroughComponent) { InheritedDefaults.push_back(PD); return; }
                 if (DR == &R) { ComponentDefaults[CompName].push_back(PD); return; }
                 /* A native parent's component is a default subobject, not an SCS node: it is

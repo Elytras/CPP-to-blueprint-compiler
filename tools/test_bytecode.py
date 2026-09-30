@@ -5637,24 +5637,6 @@ def prop_enum_casts():
     print('ok  an out-of-range enum default is refused: static_cast, C cast, constexpr, UE_DEFAULTS on a native member')
 
 
-prop_text_defaults()
-prop_flag_predicates()
-prop_hash_keys()
-prop_enum_casts()
-
-
-# -- pending
-
-for _mod, _body in (('PropSetBool', '  TSet<bool> Flags;\n'), ('PropMapBool', '  TMap<bool, int32> ByFlag;\n'),
-                    ('PropSetText', '  TSet<FText> Labels;\n'), ('PropMapText', '  TMap<FText, int32> ByLabel;\n'),
-                    ('PropSetHit', '  TSet<FHitResult> Hits;\n'), ('PropSetRotator', '  TSet<FRotator> Turns;\n'),
-                    ('PropSetBoolLocal', '  int32 F() { TSet<bool> S; S.Add(true); return S.Num(); }\n'),
-                    ('PropSetBoolParam', '  int32 F(TSet<bool> S) { return S.Num(); }\n')):
-    refused(_mod, _body, 'cannot hash, and the engine hashes each one')
-print('ok  a set element / map key that cannot hash is refused: bool, FText, a native struct without GetTypeHash; as '
-      'a variable, a local and a parameter')
-
-
 def fname_at(names, raw, o):
     import struct
     i, n = struct.unpack_from('<ii', raw, o)
@@ -5688,7 +5670,7 @@ def prop_set_delta():
     {a: 1, c: 3} become {2, 3} and {a: 5, b: 2}, read as the loader reads the child's tag on top of the parent CDO's
     loaded value (see loaded_container). Any encoding that loads that value passes."""
     import invariants
-    base = pending_asset('PropSetDelta')
+    base = asset('PropSetDelta')
     parent = invariants.Package(os.path.join(os.path.dirname(base), 'PropSetBase'))
     child = invariants.Package(base)
     pc, cc = parent.find('Default__PropSetBase_C'), child.find('Default__PropSetDelta_C')
@@ -5697,9 +5679,27 @@ def prop_set_delta():
     assert ids == {2, 3}, 'PropSetDelta loads Ids = %s, the source says {2, 3}' % sorted(ids)
     assert score == {'a': 5, 'b': 2}, 'PropSetDelta loads Score = %s, the source says {a: 5, b: 2}' % score
     keeps_invariants(base)
+    print('ok  PropSetDelta: an inherited TSet / TMap default lists the parent\'s elements it drops as removed, and loads '
+          'as its own value, not the union')
 
 
-pending('PropSetDelta: an inherited TSet / TMap default lists the parent\'s elements it drops as removed', prop_set_delta)
+prop_text_defaults()
+prop_flag_predicates()
+prop_hash_keys()
+prop_enum_casts()
+prop_set_delta()
+
+
+# -- pending
+
+for _mod, _body in (('PropSetBool', '  TSet<bool> Flags;\n'), ('PropMapBool', '  TMap<bool, int32> ByFlag;\n'),
+                    ('PropSetText', '  TSet<FText> Labels;\n'), ('PropMapText', '  TMap<FText, int32> ByLabel;\n'),
+                    ('PropSetHit', '  TSet<FHitResult> Hits;\n'), ('PropSetRotator', '  TSet<FRotator> Turns;\n'),
+                    ('PropSetBoolLocal', '  int32 F() { TSet<bool> S; S.Add(true); return S.Num(); }\n'),
+                    ('PropSetBoolParam', '  int32 F(TSet<bool> S) { return S.Num(); }\n')):
+    refused(_mod, _body, 'cannot hash, and the engine hashes each one')
+print('ok  a set element / map key that cannot hash is refused: bool, FText, a native struct without GetTypeHash; as '
+      'a variable, a local and a parameter')
 
 
 def prop_enum_class():

@@ -1041,7 +1041,13 @@ bool ReadValueOf(const FCookedPackage& P, FReader& R, FPropertyDef& T, FDefaultV
         const std::string What = bMap ? "map" : "set";
         FPropertyDef* Sides[2] = { T.Inner.get(), bMap ? T.Value.get() : nullptr };
         /* No tag names a set's or a map's struct: one is read as a tag list, which an unnamed struct is written as. */
-        if (R.I32() != 0) { Why = "a " + What + " with removed elements"; return false; }
+        /* An inherited one's removed elements (a map's keys) come first; bytes among them would leave the size test
+           below nothing to go by. */
+        const int32 Removed = R.I32();
+        if (Removed < 0 || R.bBad) { Why = "a " + What + " removal count past its value"; return false; }
+        if (Removed && Sides[0]->Type == "ByteProperty") { Why = "a " + What + " with removed bytes"; return false; }
+        for (int32 I = 0; I < Removed; ++I)
+            if (!ReadValueOf(P, R, *Sides[0], D.Removed.emplace_back(), Why)) return false;
         const int32 Count = R.I32();
         if (Count < 0 || R.bBad) { Why = "a " + What + " count past its value"; return false; }
         /* Nor whether a byte side is an enum's names (8 bytes each) or plain bytes: the bytes left say, when the other
