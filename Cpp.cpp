@@ -12122,10 +12122,11 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             }
             if (!bIsComponent) { *Err = R.CppName + "::" + FieldName + ": " + CR->CppName + " is not a UActorComponent"; return false; }
             /* The variable stays an ordinary ObjectProperty: ExecuteNodeOnActor finds it by name and
-               assigns the instance it built from the archetype. */
-            BP.AddComponent(FieldName, BP.EngineClass(CR->UePackage, CR->UeName),
-                            BP.ClassDefaultObject(CR->UePackage, CR->UeName), bIsScene,
-                            ComponentDefaults[FieldName], NativeTail(CR));
+               assigns the instance it built from the archetype. The class and its CDO are imported in two
+               statements: as two arguments of one call, the compiler picks which row is added first. */
+            const FIndex CompClass = BP.EngineClass(CR->UePackage, CR->UeName);
+            const FIndex CompCdo = BP.ClassDefaultObject(CR->UePackage, CR->UeName);
+            BP.AddComponent(FieldName, CompClass, CompCdo, bIsScene, ComponentDefaults[FieldName], NativeTail(CR));
             ComponentDefaults.erase(FieldName);
         }
         if (auto Rep = Decl.Replicated.find(FieldName); Rep != Decl.Replicated.end())
