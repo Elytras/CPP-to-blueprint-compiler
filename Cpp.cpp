@@ -10250,6 +10250,33 @@ bool FCompiler::TransplantFunctions(const FRecord& R, const FRecord& B, const FP
         P.Exports[size_t(Fn)].Payload = std::move(Out);
         Ed->Objects.push_back(Class + "::" + F.ObjectName + " (replaced)");
     }
+
+    /* A ReceiveTick the patch adds is an event the class did not have, and the editor's compiler sets the default
+       object's bCanEverTick for one (KismetCompiler.cpp:4738-4800, SetCanEverTick) as Generate does for a class of its
+       own: an actor's PrimaryActorTick, a component's PrimaryComponentTick. Without it the tick function never registers
+       (Actor.cpp:914-925, ActorComponent.cpp:1038-1046) and the added ReceiveTick never runs. */
+    if (Added.count("receivetick"))
+    {
+        bool bActor = false, bComponent = false;
+        for (const FRecord* A = &B; A; A = A->Base.empty() ? nullptr : Find(A->Base))
+        {
+            bActor = bActor || A->UeName == "Actor";
+            bComponent = bComponent || A->UeName == "ActorComponent";
+        }
+        if (bActor || bComponent)
+        {
+            FPropertyDef Can = BoolParam("bCanEverTick");
+            Can.Default.K = FDefaultValue::Bool;
+            Can.Default.I = 1;
+            FPropertyDef Tick;
+            Tick.Type = "StructProperty";
+            Tick.Name = bActor ? "PrimaryActorTick" : "PrimaryComponentTick";
+            Tick.StructName = bActor ? "ActorTickFunction" : "ActorComponentTickFunction";
+            FValueStep Step;
+            Step.Member = Can.Name;
+            if (!ApplyEdit(Package, "Default__" + Class, { FEditDef{ { Tick, Can }, { Step } } }, Scratch, Where, Err)) return false;
+        }
+    }
     return true;
 }
 

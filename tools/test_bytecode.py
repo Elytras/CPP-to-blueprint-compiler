@@ -5353,12 +5353,6 @@ def comp_tick_component():
     print('ok  CompTickComponent: a component Blueprint with its own ReceiveTick sets PrimaryComponentTick.bCanEverTick')
 
 
-comp_tick()
-comp_tick_component()
-
-
-# ---- Pending: what AssetGen does not do yet
-
 def comp_tick_patch():
     """A UE_PATCH that adds ReceiveTick to a Blueprint whose parent is AActor (CompTest, standing in for a game
     Blueprint) must set its CDO's PrimaryActorTick.bCanEverTick, or the added ReceiveTick never runs."""
@@ -5380,6 +5374,15 @@ def comp_tick_patch():
         keeps_invariants(b)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+    print('ok  CompTickPatch: a patch that adds ReceiveTick sets the CDO\'s PrimaryActorTick.bCanEverTick, and it runs')
+
+
+comp_tick()
+comp_tick_component()
+comp_tick_patch()
+
+
+# ---- Pending: what AssetGen does not do yet
 
 
 def world_location(p, ci, var):
@@ -5464,7 +5467,6 @@ def comp_attach_inherited():
         keeps_invariants(os.path.join(folder, cls))
 
 
-pending('CompTickPatch: a patch that adds ReceiveTick sets the CDO\'s PrimaryActorTick.bCanEverTick', comp_tick_patch)
 pending('CompRootKeep: a subclass\'s first scene component attaches to the inherited root and keeps its transform', comp_root_keep)
 pending('CompOverrideChain: an override template is archetyped on the nearest ancestor\'s override', comp_override_chain)
 pending('CompAttachInherited: an own component attached to an inherited Blueprint or native component', comp_attach_inherited)
@@ -6758,8 +6760,9 @@ if not globals().get('EDITS_EXPLORE'):     # set by the dev loop's exploration d
     edit_invariants_game()
     pending('EditKeptLocals: a kept game body (<Fn>__Vanilla) reads its parameters through its own properties, not the '
             'replaced function\'s (an out parameter\'s is never found: the Parent:: call crashes)', kept_body_locals)
-    pending('EditAddTick: a ReceiveTick a patch adds to a Blueprint that cannot tick sets PrimaryActorTick.bCanEverTick '
-            'on its CDO, or is refused', added_tick_can_tick)
+    added_tick_can_tick()
+    print('ok  EditAddTick: a ReceiveTick a patch adds to a Blueprint that cannot tick sets PrimaryActorTick.bCanEverTick '
+          'on its CDO')
     edit_listed_component()
     edit_bound_names()
     edit_cooked_pending()
