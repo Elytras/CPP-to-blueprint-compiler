@@ -57,6 +57,9 @@ class P(W):
             if op != 0x31: n.val = s.i32()
             s.args(k, op + 1)
         elif op == 0x67: k.append(s.node())                          # SoftObjectConst: its path string
+        elif op == 0x20:                                             # ObjectConst: the object by bare name
+            p = s.ptr().split(':', 1)[-1]
+            n.val = p.split("'")[1] if "'" in p else p
         elif op in (0x1C, 0x46, 0x68):
             p = s.ptr()                                              # exp[i]:Name, or imp[i]:Class'Name'
             n.own = p.startswith('exp[') or s.of_own_class(p)
@@ -487,6 +490,9 @@ def run(base, function, self_vars=None, **parms):
         if o == 0x29: return ev(n.kids[0]) if n.kids else ''
         if o == 0x17: return SELF
         if o in (0x2A, 0x2D): return None
+        # An object literal: here only a library's default object, the context a wildcard native (a container call)
+        # runs in (KismetCompilerVMBackend.cpp 1222-1231), which is never null.
+        if o == 0x20: return n.val
         if o in (0x19, 0x1A):                                        # a native call on another object; null skips it
             if n.kids[1].op != 0x1C: raise SystemExit('unsupported context expression op %02x' % n.kids[1].op)
             return ev(n.kids[1]) if ev(n.kids[0]) else 0

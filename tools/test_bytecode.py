@@ -160,8 +160,6 @@ KNOWN_RULES = {     # sweep rules the suite's own packages still break, each wit
     'latent_proxy_frame_held': 'AsyncTest.Play keeps its montage callback proxy only in a local of a function that '
                                'does not wait',
     'native_out_arrays_emptied': "a native's out TArray is not emptied before the call, so Set_ToArray appends",
-    'typing_callmath_callee': 'container-library CustomThunks (Array_* / Set_* / Map_*) are emitted as EX_CallMath, '
-                              'not inside an EX_Context on the library default object',
 }
 
 
@@ -4290,7 +4288,7 @@ def typing_refusals():
 
 
 def typing_arr_null():
-    base = pending_asset('TypingArrNull')
+    base = asset('TypingArrNull')
     vm = VM(base)
     vm.call('Poke')
     assert vm.self.vars.get('Done') == 1, vm.self.vars
@@ -4301,8 +4299,9 @@ typing_lits()
 typing_sets()
 typing_iface()
 typing_refusals()
-pending('TypingArrNull: Array_Add on a container of a null object is called inside EX_Context on the library '
-        'default object, so the failed thunk is skipped, not EX_CallMath', typing_arr_null)
+typing_arr_null()
+print('ok  TypingArrNull: Array_Add on a container of a null object is called inside EX_Context on the library '
+      'default object, so the failed thunk is skipped, not EX_CallMath')
 
 
 # ---- VMSEM: what the VM does at run time with a value the bytecode hands it - a None context's r-value, a statement's

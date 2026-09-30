@@ -645,7 +645,8 @@ struct FCallIR
 /* EX_CallMath calls UFunction::Func with the CALLER's frame, which is only correct for a native;
    a bytecode callee must go through EX_FinalFunction (UFunction::Invoke builds its own frame).
    EX_CallMath also runs on the function's outer-class CDO and ignores EX_Context, so it is only
-   right for a static: an instance native on it would run against e.g. Default__FSDGameState. */
+   right for a static: an instance native on it would run against e.g. Default__FSDGameState. A
+   wildcard static has a Context (FWildcardContexts), so it is EX_FinalFunction inside one. */
 void EmitCallOp(FScript& S, const FCallIR& Call)
 {
     if (!Call.VirtualName.empty() && Call.bLocal) S.LocalVirtualFunction(Call.VirtualName);
@@ -1895,6 +1896,81 @@ struct FLocalRenamer
         if (C.Target) Arg(*C.Target);
         if (C.Inline) List(*C.Inline);
         Name(C.InlineResult);
+    }
+    void List(std::vector<FStmtIR>& Stmts)
+    {
+        if (!Seen.insert(&Stmts).second) return;
+        for (FStmtIR& St : Stmts)
+        {
+            Call(St.Target);
+            Call(St.Call);
+            for (FArgIR* A : { &St.Var, &St.Value, &St.Cond, &St.SwitchValue }) Arg(*A);
+            for (FArgIR& A : St.CaseTests) Arg(A);
+            for (auto* L : { &St.Then, &St.Else, &St.Body, &St.Inc, &St.Trailer }) if (*L) List(**L);
+        }
+    }
+};
+
+/* The UFUNCTIONs with a wildcard parameter (ArrayParm / SetParam / MapParam / CustomStructureParam meta, read off UE
+   4.27's Runtime and Plugins headers, and FSD's own CustomThunks: invariant_rules/operand_types.py WILDCARD), which is
+   what UEdGraphSchema_K2::HasWildcardParams asks. Each is a CustomThunk that finds its container or struct through
+   Stack.MostRecentProperty. */
+bool HasWildcardParams(const std::string& Class, const std::string& Fn)
+{
+    static const std::map<std::string, std::set<std::string>> Wild = {
+        { "KismetArrayLibrary", { "Array_Add", "Array_AddUnique", "Array_Append", "Array_Clear", "Array_Contains",
+                                  "Array_Find", "Array_Get", "Array_Identical", "Array_Insert", "Array_IsValidIndex",
+                                  "Array_LastIndex", "Array_Length", "Array_Random", "Array_RandomFromStream", "Array_Remove",
+                                  "Array_RemoveItem", "Array_Resize", "Array_Reverse", "Array_Set", "Array_Shuffle",
+                                  "Array_Swap", "SetArrayPropertyByName" } },
+        { "BlueprintSetLibrary", { "Set_Add", "Set_AddItems", "Set_Clear", "Set_Contains", "Set_Difference",
+                                   "Set_Intersection", "Set_Length", "Set_Remove", "Set_RemoveItems", "Set_ToArray",
+                                   "Set_Union", "SetSetPropertyByName" } },
+        { "BlueprintMapLibrary", { "Map_Add", "Map_Clear", "Map_Contains", "Map_Find", "Map_Keys", "Map_Length",
+                                   "Map_Remove", "Map_Values", "SetMapPropertyByName" } },
+        { "DataTableFunctionLibrary", { "GetDataTableRowFromName" } },
+        { "KismetSystemLibrary", { "SetStructurePropertyByName", "GetEditorProperty", "SetEditorProperty" } },
+        { "DataRegistrySubsystem", { "FindCachedItemBP", "GetCachedItemBP", "GetCachedItemFromLookupBP" } },
+        { "FSDKismetArrayExtensionFunctions", { "Array_GetRandom" } },
+        { "FSDCheatManager", { "GetSavedCheatValue", "SetSavedCheatValue" } },
+    };
+    auto It = Wild.find(Class);
+    return It != Wild.end() && It->second.count(Fn) != 0;
+}
+
+/* Gives each static call of a wildcard native (HasWildcardParams) its class's default object as context, so EmitCall
+   writes EX_Context(Default__<Class>, EX_FinalFunction) where it would write EX_CallMath. When an argument names no
+   property - a container of a None object - the thunk sets bArrayContextFailed and returns with its other arguments
+   unread (KismetArrayLibrary.h 278-286); only ProcessContextOpcode rewinds and skips past them (ScriptCore.cpp
+   2896-2902). Outside a context the VM runs that argument list as statements, and EX_EndFunctionParms steps back onto
+   itself forever (2366-2370): the game hangs. So the editor never makes such a call a math call
+   (KismetCompilerVMBackend.cpp 1222-1231). Run over a function's statements once they are final, whichever lowering
+   made the call (a container method, a range-for's Array_Length, a pass's Map_Clear, a direct library call). */
+struct FWildcardContexts
+{
+    FBlueprintClass& BP;
+    const FPackage& P;
+    std::set<const void*> Seen;
+
+    void Arg(FArgIR& A)
+    {
+        if (!Seen.insert(&A).second) return;
+        if (A.Sub) Call(*A.Sub);
+        if (A.Base) Arg(*A.Base);
+    }
+    void Call(FCallIR& C)
+    {
+        if (!Seen.insert(&C).second) return;
+        for (FArgIR& A : C.Args) Arg(A);
+        if (C.Target) Arg(*C.Target);
+        if (C.Inline) List(*C.Inline);
+        if (!C.Intrinsic.empty() || C.bScript || C.bInstance || C.bReceiverIsArg || C.Target || C.Context.V
+            || !C.VirtualName.empty() || C.bLocal) return;
+        const FImport* Fn = P.ImportAt(C.Fn);
+        const FImport* Class = Fn ? P.ImportAt(Fn->Outer) : nullptr;
+        const FImport* Package = Class ? P.ImportAt(Class->Outer) : nullptr;
+        if (Package && HasWildcardParams(Class->ObjectName, Fn->ObjectName))
+            C.Context = BP.ClassDefaultObject(Package->ObjectName, Class->ObjectName);
     }
     void List(std::vector<FStmtIR>& Stmts)
     {
@@ -11040,6 +11116,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 CoalesceTemps(Stmts, Locals, BP);
             }
         }
+        FWildcardContexts{ BP, P }.List(Stmts);
         for (const auto& [Struct, Keep] : KeepLoaded)
         {
             auto Typed = [&](const FPropertyDef& P) { return P.Type == "StructProperty" && P.Extra.V == Struct; };
