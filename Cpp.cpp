@@ -5392,8 +5392,10 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
     {
         if (auto Free = FreeInlines.find(DeclId); Free != FreeInlines.end())
             return ExpandInline(CallExprNode, *Free->second, MethodName, false, BP, Out, Err);
+        /* Named without its id, which is an address in clang: the name only goes into messages, and those must not
+           change from run to run. The recursion check goes by the definition's node. */
         if (auto Tm = MemberTemplates.find(DeclId); Tm != MemberTemplates.end())
-            return ExpandInline(CallExprNode, *Tm->second, MethodName + "<" + DeclId + ">", true, BP, Out, Err);
+            return ExpandInline(CallExprNode, *Tm->second, MethodName, true, BP, Out, Err);
         auto Owner = MethodOwner.find(DeclId);
         if (Owner == MethodOwner.end()) { *Err = "call to an unknown function: " + MethodName; return false; }
         const FRecord* R = Find(Owner->second);
