@@ -10678,6 +10678,15 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             const size_t Star = TypeOf(*F).find('*');
             const FRecord* CR = Star == std::string::npos ? nullptr
                                                           : Find(StripTypeKeywords(TypeOf(*F).substr(0, Star)));
+            /* A template of an abstract class is never made: the loader constructs every export, and StaticAllocateObject
+               check()s !CLASS_Abstract (UObjectGlobals.cpp 2362). Abstract as Generate marks a class: the nearest
+               declaration of some method along its chain is `= 0`. */
+            std::set<std::string> NearestOfComp;
+            for (const FRecord* A = CR; A && !A->IsNative(); A = A->Base.empty() ? nullptr : Find(A->Base))
+                for (const auto& [Method, Decl] : A->Methods)
+                    if (NearestOfComp.insert(Method).second && Decl->value("pure", false))
+                    { *Err = R.CppName + "::" + FieldName + ": " + CR->CppName + " is abstract (" + A->CppName + "::" + Method
+                             + " is = 0), and an abstract class is never instanced, so it has no component template"; return false; }
             if (!CR || !CR->IsNative())
             { *Err = R.CppName + "::" + FieldName + ": a UE_COMPONENT names an engine component class"; return false; }
             bool bIsScene = false, bIsComponent = false;

@@ -2584,7 +2584,7 @@ component class, and the first scene component declared is the actor's root.
 | `UE_COMPONENT(UHealthComponent, Health);` | One of DRG's own component classes works like an engine one. | Yes |
 | `UE_COMPONENT(UInstancedStaticMeshComponent, Pile);` | Static mesh, instanced static mesh, hierarchical instanced static mesh, SkyAtmosphere and AtmosphericFog components write native data after their properties. AssetGen writes exactly the bytes a cooked template of that class carries, and a class derived from one of them gets the same bytes. Other component classes need nothing extra. | Yes |
 | `UE_COMPONENT(UModelComponent, Bsp);` | Refused: a model component "belongs to a level's BSP" and cannot be a template. | Refused |
-| `UE_COMPONENT(UCharges, Ammo);`, with a component class the mod declares | Refused: "a UE_COMPONENT names an engine component class". Add a component of your own class at run time with `AddComponentByType` or `AddComponentDeferred` (below). | Refused |
+| `UE_COMPONENT(UCharges, Ammo);`, with a component class the mod declares | Refused: "a UE_COMPONENT names an engine component class". Add a component of your own class at run time with `AddComponentByType` or `AddComponentDeferred` (below). An abstract one (a method `= 0`) is refused as "abstract": the engine never instances an abstract class. | Refused |
 | `UE_COMPONENT(UTexture2D, Icon);` | Refused: "is not a UActorComponent". | Refused |
 | `UE_COMPONENT` in a class that is not an actor | Refused: "only an actor has a construction script". | Refused |
 | `UE_COMPONENT` in a `UE_INTERFACE` | Refused: "an interface cannot declare a UE_COMPONENT". Declare the component on each class that implements the interface. | Refused |

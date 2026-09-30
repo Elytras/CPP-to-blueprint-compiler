@@ -3610,8 +3610,8 @@ pending("SubobjectChain: an override's archetype is the same-named subobject of 
         subobject_chain)
 pending('SelfRefImport: a package refers to its own objects as exports, never through an import of itself', self_ref_import)
 abstract_instances()
-pending('AbstractComp: a component of an abstract mod class is refused, naming it abstract',
-        lambda: refused('AbstractComp', '  UE_COMPONENT(UPureComp, Comp);\n', 'abstract', top=ABSTRACT_COMP))
+refused('AbstractComp', '  UE_COMPONENT(UPureComp, Comp);\n', 'abstract', top=ABSTRACT_COMP)
+print('ok  AbstractComp: a component of an abstract mod class is refused, naming it abstract')
 name_too_long()
 tables_rules_fire()
 
