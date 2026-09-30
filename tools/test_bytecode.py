@@ -2428,8 +2428,19 @@ def edits():
                 assert me == {'Ticks': 2}, me
                 tick = dump('dumpstruct.py', b, [e['name'] for e in lb[5]].index('ReceiveTick'))
                 assert re.search(r"^SuperStruct imp\[\d+\]:Function'ReceiveTick'$", tick, re.M), tick
+            import invariants
+            pa, pb = invariants.Package(a), invariants.Package(b)
+
+            def tick_only(i):
+                """An added ReceiveTick turns the default object's tick on (KismetCompiler.cpp 4738-4839, which
+                added_tick_can_tick checks): its tags are the game's plus PrimaryActorTick, and the rest is the game's."""
+                ta, tb = pa.tags(i), pb.tags(i)
+                key = lambda t: (t['name'], t['type'], t['index'], bytes(t['value']))
+                return (not pa.tag(i, 'PrimaryActorTick') and pa.blob(i)[ta.end:] == pb.blob(i)[tb.end:]
+                        and [key(t) for t in tb if t['name'] != 'PrimaryActorTick'] == [key(t) for t in ta])
             assert all(x['name'] == 'ReceiveBeginPlay' or new and x['name'] == 'CompTest_C' or blob(la, x) == blob(lb, y)
-                       for x, y in zip(la[5], lb[5])), 'another export changed'
+                       or 'ReceiveTick' in new and x['name'] == 'Default__CompTest_C' and tick_only(i)
+                       for i, (x, y) in enumerate(zip(la[5], lb[5]))), 'another export changed'
             proc = subprocess.run([ASSETGEN, 'roundtrip', tmp], capture_output=True, encoding='utf-8')
             assert proc.returncode == 0, proc.stdout
             n = 2 + len(new)
