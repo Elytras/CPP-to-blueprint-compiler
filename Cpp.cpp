@@ -12868,10 +12868,23 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     return true;
 }
 
+/* The keys FAstSax drops wherever they stand: source locations, mangled names, a record's definitionData, a type
+   alias's typeAliasDeclId. FAstSax::key asks this, and a filter that throws these members away before the parser
+   lexes them must ask this same function, so the two cannot disagree.
+   The contract: a key goes here only if FAstSax drops it in every context. A key it drops only in some (range, end,
+   isImplicit, isUsed, isReferenced) stays in key()'s own rules, which see the tree built so far; the filter passes
+   those through. A key that anything reads later is in neither. */
+bool DroppedAstKey(const std::string& K)
+{
+    return K == "loc" || K == "file" || K == "line" || K == "col" || K == "includedFrom" || K == "expansionLoc"
+        || K == "isMacroArgExpansion" || K == "mangledName" || K == "definitionData" || K == "typeAliasDeclId";
+}
+
 /* Builds the DOM of clang's AST dump as it streams in, without what nothing reads: source locations (all but a
    DeclRefExpr's or MemberExpr's range begin offset and token length, and its end's in a macro, see NamedQualifier and
    MemberQualifier), mangled names, a record's definitionData and
-   a few flags are most of the dump, and building them was most of a compile. A key read later must not be in key(). */
+   a few flags are most of the dump, and building them was most of a compile. A key read later must be in neither
+   DroppedAstKey nor key()'s own rules. */
 class FAstSax : public nlohmann::json_sax<Json>
 {
 public:
@@ -12900,11 +12913,10 @@ public:
                             && (*Stack.back())["begin"].contains("spellingLoc");
         /* A variable's use flags stay: Run refuses a used UE_ASSET_AT that cannot load. A method's isImplicit stays: the
            operator= clang declares up front in a class with a virtual is no Blueprint function. "kind" comes before them. */
-        bSkipNext = K == "loc" || (K == "end" && !bMacroEnd) || K == "file" || K == "line" || K == "col" || K == "includedFrom"
-                 || K == "expansionLoc" || K == "isMacroArgExpansion" || K == "mangledName" || K == "definitionData"
+        bSkipNext = DroppedAstKey(K) || (K == "end" && !bMacroEnd)
                  || (K == "isImplicit" && Stack.back()->value("kind", std::string()) != "CXXMethodDecl")
                  || ((K == "isUsed" || K == "isReferenced") && Stack.back()->value("kind", std::string()) != "VarDecl")
-                 || K == "typeAliasDeclId" || (K == "range" && !DeclRef.back());
+                 || (K == "range" && !DeclRef.back());
         bKindNext = K == "kind";
         if (!bSkipNext) Slot = &(*Stack.back())[std::move(K)];
         return true;
