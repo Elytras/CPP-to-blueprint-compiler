@@ -320,12 +320,12 @@ call, but it cannot be bound to a dispatcher, called on another object or called
 
 An event is a method named after an event the parent class exposes, such as `ReceiveBeginPlay`, `ReceiveTick` or
 `ReceiveActorBeginOverlap`. The engine calls it as it calls the event node you add in the editor, and overriding
-`ReceiveTick` also turns ticking on for the actor. Inside an override, `Base::Method()` runs the parent's version, the
-editor's Add call to parent function; C++ has no `Super`, so name the class you derive from. In a class that does
-not declare Method, `Base::Method()` copies Base's body in, or, where it cannot, goes by name with a warning. Every
-other call to a method goes by name, so the most derived override runs, also when the parent's own code makes the
-call. A `final` class or method has no override, so its calls go straight to the one function, and on `this` its body
-is copied in.
+`ReceiveTick` also turns ticking on for the actor or component. Inside an override, `Base::Method()` runs the parent's
+version, the editor's Add call to parent function; C++ has no `Super`, so name the class you derive from. In a class
+that does not declare Method, `Base::Method()` copies Base's body in, or, where it cannot, goes by name with a warning.
+Every other call to a method goes by name, so the most derived override runs, also when the parent's own code makes
+the call. A `final` class or method has no override, so its calls go straight to the one function, and on `this` its
+body is copied in.
 
 `UE_PURE` makes a pure function, drawn without exec pins. A `T&` parameter is an output, a pass-by-reference pin. A
 `static` method runs on the class default object (the instance that holds Class Defaults), which has no world, so give
@@ -489,7 +489,8 @@ public:
 Watch for:
 
 - The engine puts the root at the spawn transform and ignores the root's own location, rotation and scale. A plain
-  `USceneComponent` root hands them on to the components attached to it. A mesh or a light as the root keeps them,
+  `USceneComponent` root hands them on to the components attached to it. (A class whose parent already has a root,
+  such as a Blueprint parent or `ACharacter`, adds no root: its first scene component keeps its transform.) A mesh or a light as the root keeps them,
   and AssetGen warns that they are not applied. Declare a `USceneComponent` first.
 - `UE_DEFAULTS` is read when the mod is built and never runs. A call, an `if`, a `+=`, `nullptr`, or a member path
   such as `Lamp->RelativeLocation.Z = 50.0f;` is refused; the member path gets a misleading message about genueapi,
@@ -1868,8 +1869,6 @@ each topic.
 - `Weapons::Turret::StaticClass()` for a mod class in a namespace. It names the engine class that Turret inherits
   `StaticClass` from. Write `Turret::StaticClass()` inside the namespace, or let a `TSubclassOf<Weapons::Turret>`
   parameter, such as SpawnActor's, supply the class. See [Creating objects](REFERENCE.md#creating-objects).
-- `ReceiveTick` on a mod component class. It compiles and never ticks. Call a method of the component from its owner's
-  `ReceiveTick`. See [Classes and variables](REFERENCE.md#classes-and-variables).
 - A mod widget class. It has no designer layout, so it shows nothing of its own. For visible UI, create one of the
   game's widget Blueprints. See [Classes and variables](REFERENCE.md#classes-and-variables).
 - An RPC, authority-only or cosmetic marker on an `inline` method. The marker is ignored, and the call runs locally.

@@ -1184,6 +1184,7 @@ private:
        is asked for, named after the variable Holder that asked. */
     bool DelegateSignature(const std::string& Type, const std::string& Holder, FBlueprintClass& BP, FIndex* Sig,
                            std::string* Err);
+    void FlagInstancing(const std::string& QualType, FPropertyDef& PD) const;
     bool LayoutOf(const std::string& QualType, int32* Size, int32* Align, std::string* Err);
     bool NeedsResultLocal(const std::string& Type, int32 Depth = 0);
     bool StructLayout(const FRecord& R, int32* Size, int32* Align, std::string* Err);
@@ -5769,6 +5770,106 @@ void NamesRead(const std::vector<FStmtIR>& Stmts, std::set<std::string>& Out, bo
     }
 }
 
+/* Every call a statement list makes, an inline body's and an argument's included, in no particular order. */
+void EachCall(const FArgIR& A, const std::function<void(const FCallIR&)>& Visit);
+void EachCall(const std::vector<FStmtIR>& Stmts, const std::function<void(const FCallIR&)>& Visit);
+void EachCall(const FCallIR& C, const std::function<void(const FCallIR&)>& Visit)
+{
+    Visit(C);
+    if (C.Inline) EachCall(*C.Inline, Visit);
+    if (C.Target) EachCall(*C.Target, Visit);
+    for (const FArgIR& A : C.Args) EachCall(A, Visit);
+}
+void EachCall(const FArgIR& A, const std::function<void(const FCallIR&)>& Visit)
+{
+    if (A.Sub) EachCall(*A.Sub, Visit);
+    if (A.Base) EachCall(*A.Base, Visit);
+}
+void EachCall(const std::vector<FStmtIR>& Stmts, const std::function<void(const FCallIR&)>& Visit)
+{
+    for (const FStmtIR& St : Stmts)
+    {
+        EachCall(St.Target, Visit);
+        EachCall(St.Call, Visit);
+        for (const FArgIR* A : { &St.Var, &St.Value, &St.Cond, &St.SwitchValue }) EachCall(*A, Visit);
+        for (const FArgIR& A : St.CaseTests) EachCall(A, Visit);
+        for (const auto* L : { &St.Then, &St.Else, &St.Body, &St.Inc, &St.Trailer }) if (*L) EachCall(**L, Visit);
+    }
+}
+
+/*
+A deferred spawn or component add is half of a pair C++ does not tie together: the editor's Spawn Actor and Add Component
+nodes always make the second call themselves (K2Node_SpawnActorFromClass.cpp 412-435, K2Node_AddComponent.cpp 463-507).
+An actor from BeginDeferredActorSpawnFromClass runs its construction script and BeginPlay only in FinishSpawningActor
+(Actor.cpp 3185-3251); a component added with bDeferredFinish is attached, registered and told it was created only in
+FinishAddComponent (ActorConstruction.cpp 1165-1212), whose own bManualAttachment decides the attachment - the add's is
+not read when deferred (1157-1160). So a function with more starts than finishes, or finishing with another
+bManualAttachment than it added with, is warned about, unless it hands the object on (below): the other half may be
+in another function. (A finish at another transform is not: FinishSpawning recomposes it on purpose, Actor.cpp
+3212-3232.) Fn names the function, Of maps a call's function to its name.
+*/
+void WarnDeferredLeft(const std::string& Fn, const std::vector<FStmtIR>& Stmts, const std::function<std::string(FIndex)>& Of)
+{
+    int32 Spawns = 0, SpawnsFinished = 0, Adds = 0, AddsFinished = 0;
+    std::set<int32> AddManual, FinishManual;        // each bManualAttachment given, 1 / 0, or -1 when not a constant
+    auto Manual = [](const FCallIR& C, size_t Arg) { return Arg < C.Args.size() && C.Args[Arg].K == FArgIR::Bool ? int32(C.Args[Arg].B) : -1; };
+    auto NameOf = [&](const FCallIR& C) { return C.Fn.V && C.Intrinsic.empty() ? Of(C.Fn) : std::string(); };
+    auto IsAdd = [&](const FCallIR& C) {
+        return NameOf(C) == "AddComponentByClass" && C.Args.size() == 4 && C.Args[3].K == FArgIR::Bool && C.Args[3].B;
+    };
+    EachCall(Stmts, [&](const FCallIR& C) {
+        const std::string Name = NameOf(C);
+        if (Name == "BeginDeferredActorSpawnFromClass") ++Spawns;
+        else if (Name == "FinishSpawningActor") ++SpawnsFinished;
+        else if (IsAdd(C)) { ++Adds; AddManual.insert(Manual(C, 1)); }
+        else if (Name == "FinishAddComponent") { ++AddsFinished; FinishManual.insert(Manual(C, 1)); }
+    });
+    /* A started object that leaves the function - stored in a member or out parameter, returned, or handed to a script
+       function - is finished elsewhere, as UberDeferGuard's Begin / Finish pair is: its kind is not counted as left. */
+    // ponytail: per kind, not per object; a function that both hands one off and drops another is not warned about.
+    std::set<std::string> SpawnHeld, AddHeld;       // locals given a started object, in statement order
+    bool bSpawnOut = false, bAddOut = false;
+    auto Carries = [&](const FArgIR& V, bool& bSpawn, bool& bAdd) {
+        EachCall(V, [&](const FCallIR& C) { bSpawn |= NameOf(C) == "BeginDeferredActorSpawnFromClass"; bAdd |= IsAdd(C); });
+        std::set<std::string> Read;
+        NamesRead(V, Read);
+        for (const std::string& N : Read) { bSpawn |= SpawnHeld.count(N) > 0; bAdd |= AddHeld.count(N) > 0; }
+    };
+    std::function<void(const std::vector<FStmtIR>&)> Walk = [&](const std::vector<FStmtIR>& List) {
+        for (const FStmtIR& St : List)
+        {
+            const bool bStore = St.K == FStmtIR::Assign || St.K == FStmtIR::Decl;
+            bool bSpawn = false, bAdd = false;
+            if (bStore || St.K == FStmtIR::Return) Carries(St.Value, bSpawn, bAdd);
+            if (bStore && St.Var.K == FArgIR::Local && !St.bAssignOutParm)
+            { if (bSpawn) SpawnHeld.insert(St.Var.S); if (bAdd) AddHeld.insert(St.Var.S); }
+            else { bSpawnOut |= bSpawn; bAddOut |= bAdd; }
+            const auto Visit = [&](const FCallIR& C) {
+                if (C.Inline) Walk(*C.Inline);
+                if (C.bScript) for (const FArgIR& A : C.Args) Carries(A, bSpawnOut, bAddOut);
+            };
+            EachCall(St.Target, Visit);
+            EachCall(St.Call, Visit);
+            for (const FArgIR* A : { &St.Var, &St.Value, &St.Cond }) EachCall(*A, Visit);
+            for (const auto* L : { &St.Then, &St.Else, &St.Body, &St.Inc, &St.Trailer }) if (*L) Walk(**L);
+        }
+    };
+    Walk(Stmts);
+    if (bSpawnOut) Spawns = 0;
+    if (bAddOut) Adds = AddsFinished;
+    if (Spawns > SpawnsFinished)
+        printf("  warning: %s: a deferred spawn (SpawnActorDeferred, BeginDeferredActorSpawnFromClass) is not finished in this "
+               "function: until FinishSpawning (FinishSpawningActor) runs on it, the actor runs no construction script and no "
+               "BeginPlay\n", Fn.c_str());
+    if (Adds > AddsFinished)
+        printf("  warning: %s: a deferred component add (AddComponentDeferred, AddComponentByClass with bDeferredFinish) is not "
+               "finished in this function: until FinishComponent (FinishAddComponent) runs on it, the component is neither "
+               "attached nor registered\n", Fn.c_str());
+    else if (Adds && !AddManual.count(-1) && !FinishManual.count(-1) && AddManual != FinishManual)
+        printf("  warning: %s: a deferred component add is given one bManualAttachment and finished with another: the "
+               "finish's decides whether it attaches to the root, the add's is not read; pass the same to both\n", Fn.c_str());
+}
+
 /* Removes the stores to a local in Unread; a value that calls something impure keeps its call as a statement,
    unless its result is one the VM cannot throw away (Constructed), in which case the whole store stays. */
 void DropStores(std::vector<FStmtIR>& Stmts, const std::set<std::string>& Unread, const std::set<std::string>& Constructed)
@@ -10095,6 +10196,69 @@ bool FCompiler::DelegateSignature(const std::string& Type, const std::string& Ho
     return true;
 }
 
+/*
+The instancing flags the editor's compiler gives a property of this type (CreatePropertyOnScope, KismetCompilerMisc.cpp
+948-952, 974-977, 1215-1218, 1254-1257): an object or soft object reference to a DefaultToInstanced class - every
+component and widget, native or a mod's - is CPF_InstancedReference; a struct of a STRUCT_HasInstancedReference struct,
+and an array, set or map whose element, key or value carries either flag, CPF_ContainsInstancedReference. Instancing
+walks only flagged properties (UObjectGlobals.cpp 2874-2886 -> Class.cpp 2152-2163), so an unflagged member of a spawned
+actor or a duplicate keeps pointing at its archetype's component. PD is TypeToProperty's for QualType; its element and
+value become its own copies. A mod struct is not flagged: a UserDefinedStruct is cooked with StructFlags 0.
+*/
+void FCompiler::FlagInstancing(const std::string& QualType, FPropertyDef& PD) const
+{
+    /* Native classes declared DefaultToInstanced, which CLASS_Inherit passes to every subclass (UE 4.27's UCLASS
+       specifiers), and two FSD classes every game property of which is instanced: DTI_ROOTS in invariant_rules/class_tail.py. */
+    static const std::set<std::string> DefaultToInstanced = {
+        "/Script/Engine.ActorComponent", "/Script/UMG.Visual", "/Script/UMG.SlateAccessibleWidgetData",
+        "/Script/Engine.NavAreaBase", "/Script/NavigationSystem.NavArea", "/Script/Engine.Distribution",
+        "/Script/Engine.AssetUserData", "/Script/Engine.LevelActorContainer",
+        "/Script/LevelSequence.LevelSequenceBurnInInitSettings", "/Script/LevelSequence.LevelSequenceBurnInOptions",
+        "/Script/MovieScene.MovieScene", "/Script/MovieScene.MovieSceneBindingOverrides", "/Script/MovieScene.MovieSceneFolder",
+        "/Script/MovieScene.MovieSceneSection", "/Script/MovieScene.MovieSceneTrack",
+        "/Script/FSD.CarvedResourceCreator", "/Script/FSD.ProjectileAttack" };
+    /* Native structs with STRUCT_HasInstancedReference: every game property of these types carries
+       CPF_ContainsInstancedReference, and none of another native struct type does (INSTANCED_STRUCTS, measured). */
+    static const std::set<std::string> InstancedStructs = {
+        "/Script/Engine.HitResult", "/Script/AnimGraphRuntime.AnimNode_CopyPoseFromMesh", "/Script/FSD.BossFight",
+        "/Script/FSD.ClaimableRewardEntry", "/Script/FSD.ClaimableRewardView", "/Script/FSD.DamageData",
+        "/Script/FSD.EscortMuleExtractorSlot", "/Script/FSD.HolidayMeshItems", "/Script/FSD.MasteryItem",
+        "/Script/FSD.SeasonLevel", "/Script/FSD.TextCounterEntry", "/Script/FSD.VanityNode" };
+    const std::string Type = StripTypeKeywords(QualType);
+    std::string Inner;
+    for (const char* Tpl : { "TArray", "TSet", "TMap" })
+    {
+        if (!TemplateArg(Type, Tpl, &Inner)) continue;
+        const std::vector<std::string> Args = SplitTemplateArgs(Inner);
+        std::shared_ptr<FPropertyDef>* Parts[] = { &PD.Inner, &PD.Value };
+        for (size_t I = 0; I < Args.size() && I < 2; ++I)
+        {
+            if (!*Parts[I] || IsContainerType(Args[I])) continue;      // a nested container is a wrapper struct of the mod's
+            *Parts[I] = std::make_shared<FPropertyDef>(**Parts[I]);
+            FlagInstancing(Args[I], **Parts[I]);
+            if ((*Parts[I])->PropertyFlags & (CPF_InstancedReference | CPF_ContainsInstancedReference))
+                PD.PropertyFlags |= CPF_ContainsInstancedReference;
+        }
+        return;
+    }
+    if (PD.Type == "StructProperty")
+    {
+        if (auto S = Structs.find(Type); S != Structs.end() && InstancedStructs.count(S->second.Package + "." + S->second.UeName))
+            PD.PropertyFlags |= CPF_ContainsInstancedReference;
+        return;
+    }
+    if (PD.Type != "ObjectProperty" && PD.Type != "SoftObjectProperty") return;
+    const size_t Star = Type.find('*');
+    std::string ClassName = Star == std::string::npos ? std::string() : StripTypeKeywords(Type.substr(0, Star));
+    if (TemplateArg(Type, "TSoftObjectPtr", &Inner)) ClassName = Inner;
+    for (const FRecord* A = ClassName.empty() ? nullptr : Find(ClassName); A; A = A->Base.empty() ? nullptr : Find(A->Base))
+        if (A->IsNative() && DefaultToInstanced.count(A->UePackage + "." + A->UeName))
+        {
+            PD.PropertyFlags |= CPF_InstancedReference;
+            return;
+        }
+}
+
 bool FCompiler::LayoutOf(const std::string& QualType, int32* Size, int32* Align, std::string* Err)
 {
     const std::string T = StripTypeKeywords(QualType);
@@ -11309,6 +11473,33 @@ bool FCompiler::TransplantFunctions(const FRecord& R, const FRecord& B, const FP
         P.Exports[size_t(Fn)].Payload = std::move(Out);
         Ed->Objects.push_back(Class + "::" + F.ObjectName + " (replaced)");
     }
+
+    /* A ReceiveTick the patch adds is an event the class did not have, and the editor's compiler sets the default
+       object's bCanEverTick for one (KismetCompiler.cpp:4738-4800, SetCanEverTick) as Generate does for a class of its
+       own: an actor's PrimaryActorTick, a component's PrimaryComponentTick. Without it the tick function never registers
+       (Actor.cpp:914-925, ActorComponent.cpp:1038-1046) and the added ReceiveTick never runs. */
+    if (Added.count("receivetick"))
+    {
+        bool bActor = false, bComponent = false;
+        for (const FRecord* A = &B; A; A = A->Base.empty() ? nullptr : Find(A->Base))
+        {
+            bActor = bActor || A->UeName == "Actor";
+            bComponent = bComponent || A->UeName == "ActorComponent";
+        }
+        if (bActor || bComponent)
+        {
+            FPropertyDef Can = BoolParam("bCanEverTick");
+            Can.Default.K = FDefaultValue::Bool;
+            Can.Default.I = 1;
+            FPropertyDef Tick;
+            Tick.Type = "StructProperty";
+            Tick.Name = bActor ? "PrimaryActorTick" : "PrimaryComponentTick";
+            Tick.StructName = bActor ? "ActorTickFunction" : "ActorComponentTickFunction";
+            FValueStep Step;
+            Step.Member = Can.Name;
+            if (!ApplyEdit(Package, "Default__" + Class, { FEditDef{ { Tick, Can }, { Step } } }, Scratch, Where, Err)) return false;
+        }
+    }
     return true;
 }
 
@@ -11384,6 +11575,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
 
     const bool bIsActor = std::find(Ancestry.begin(), Ancestry.end(), "Actor") != Ancestry.end();
     BP.SetIsActor(bIsActor);
+    BP.SetIsComponent(std::find(Ancestry.begin(), Ancestry.end(), "ActorComponent") != Ancestry.end());
     /* Abstract: the nearest declaration of some method along the class chain is `= 0`. SpawnActor and CreateWidget
        refuse the class, as they do one the editor marks Generate Abstract Class. An interface's `= 0` does not count,
        since an implementer that leaves it out gets a stub, and clang's own isAbstract never reaches here (FAstSax). */
@@ -11586,6 +11778,18 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             for (; C; C = C->Base.empty() ? nullptr : Find(C->Base)) if (C->UeName == "SceneComponent") return true;
             return false;
         };
+        /* No root of this class's in a subclass whose actor already has one when its SCS runs: a Blueprint parent's SCS
+           always leaves one (SimpleConstructionScript.cpp 690-702), and a native parent sets one in its constructor
+           (Character.cpp 59) or ExecuteConstruction takes its first unattached native scene component (ActorConstruction.cpp
+           736-746). The first own scene component then attaches under it (ExecuteScriptOnActor, 686) and keeps its
+           transform like the rest. */
+        bool bRootInherited = false;
+        for (const FRecord* A = R.Base.empty() ? nullptr : Find(R.Base); A && !bRootInherited; A = A->Base.empty() ? nullptr : Find(A->Base))
+        {
+            bRootInherited = !A->IsNative() || (A->UeName.size() > 2 && A->UeName.compare(A->UeName.size() - 2, 2, "_C") == 0);
+            for (const auto& [Member, Spec] : A->Subobjects)
+                bRootInherited = bRootInherited || (Spec.rfind('.') != std::string::npos && IsScene(Find("U" + Spec.substr(Spec.rfind('.') + 1))));
+        }
         std::vector<std::pair<std::string, const FRecord*>> Scene;     // this class's scene components, the root first
         for (const Json* F : R.Fields)
         {
@@ -11645,7 +11849,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             for (double& A : Out) A += 0.0;     // no -0 in the cooked float
             return Out;
         };
-        if (!Scene.empty())
+        if (!Scene.empty() && !bRootInherited)
         {
             std::vector<FPropertyDef>& RootDefs = ComponentDefaults[Scene[0].first];
             const FVec Lr = Read(RootDefs, "RelativeLocation", 0), Rr = Read(RootDefs, "RelativeRotation", 0),
@@ -11734,6 +11938,10 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         PD.PropertyFlags = (PD.PropertyFlags & ~uint64(CPF_Parm | CPF_BlueprintReadOnly))
                          | CPF_Edit | CPF_BlueprintVisible | CPF_DisableEditOnInstance;
         if (TypeOf(*F).compare(0, 6, "const ") == 0) PD.PropertyFlags |= CPF_BlueprintReadOnly;
+        /* A member that refers to a component or holds one is instanced, and then so is the class, or instancing never
+           looks at it (KismetCompiler.cpp 2521-2529). */
+        FlagInstancing(TypeOf(*F), PD);
+        if (PD.PropertyFlags & (CPF_InstancedReference | CPF_ContainsInstancedReference)) BP.AddClassFlags(CLASS_HasInstancedReference);
         PD.bApiHidden = Decl.PrivateFields.count(Name(*F)) != 0;
         if (auto Cat = Decl.Categories.find(Name(*F)); Cat != Decl.Categories.end()) BP.ApiCategory[PD.Name] = Cat->second;
         if (&Decl == &R && R.Components.count(FieldName))
@@ -11742,6 +11950,15 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             const size_t Star = TypeOf(*F).find('*');
             const FRecord* CR = Star == std::string::npos ? nullptr
                                                           : Find(StripTypeKeywords(TypeOf(*F).substr(0, Star)));
+            /* A template of an abstract class is never made: the loader constructs every export, and StaticAllocateObject
+               check()s !CLASS_Abstract (UObjectGlobals.cpp 2362). Abstract as Generate marks a class: the nearest
+               declaration of some method along its chain is `= 0`. */
+            std::set<std::string> NearestOfComp;
+            for (const FRecord* A = CR; A && !A->IsNative(); A = A->Base.empty() ? nullptr : Find(A->Base))
+                for (const auto& [Method, Decl] : A->Methods)
+                    if (NearestOfComp.insert(Method).second && Decl->value("pure", false))
+                    { *Err = R.CppName + "::" + FieldName + ": " + CR->CppName + " is abstract (" + A->CppName + "::" + Method
+                             + " is = 0), and an abstract class is never instanced, so it has no component template"; return false; }
             if (!CR || !CR->IsNative())
             { *Err = R.CppName + "::" + FieldName + ": a UE_COMPONENT names an engine component class"; return false; }
             bool bIsScene = false, bIsComponent = false;
@@ -11860,8 +12077,26 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         else
             ScsNodeGuid(OwnerCls, Entry.first, NodeGuid);
         const FIndex OwnerClass = BP.EngineClass(OwnerPkg, OwnerCls);
+        /* The template's archetype is the NEAREST ancestor's template of its name: a mod class between this one and
+           Owner whose UE_DEFAULTS reach through the component has a record of its own, whose template GetArchetype
+           finds first (UObjectArchetype.cpp 83-108) and the loader builds this one from (AsyncLoading.cpp 2954-2964).
+           Archetyped on Owner's instead, a value only the class between sets would be lost here. */
+        auto Overrides = [&](const FRecord& A) {
+            const Json* Body = nullptr;
+            if (A.Defaults && !A.bIsPatch) ForEach(*A.Defaults, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Body = &C; });
+            bool bHit = false;
+            if (Body)
+                ForEach(*Body, [&](const Json& S) {
+                    const Json *Lhs = nullptr, *Rhs = nullptr, *Through = nullptr;
+                    bHit = bHit || (DefaultAssignment(S, Lhs, Rhs, Through) && Through && Name(*Through) == Entry.first);
+                });
+            return bHit;
+        };
+        FIndex ArchetypeClass = OwnerClass;
+        for (const FRecord* A = Find(R.Base); A && A != &Owner; A = A->Base.empty() ? nullptr : Find(A->Base))
+            if (Overrides(*A)) { ArchetypeClass = BP.EngineClass(PackageOf(*A), ClassOf(*A)); break; }
         BP.AddComponentOverride(VarName, BP.EngineClass(CR->UePackage, CR->UeName),
-                                BP.Subobject(CR->UePackage, CR->UeName, OwnerClass,
+                                BP.Subobject(CR->UePackage, CR->UeName, ArchetypeClass,
                                              VarName + "_GEN_VARIABLE"),
                                 OwnerClass, NodeGuid, Entry.second.Defaults, NativeTail(CR));
     }
@@ -12100,6 +12335,10 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             *Err = R.CppName + "::" + Fn.Name + ": " + *Err;
             return false;
         }
+        WarnDeferredLeft(R.CppName + "::" + Fn.Name, Stmts, [&](FIndex I) {
+            const FImport* Im = P.ImportAt(I);
+            return Im ? Im->ObjectName : std::string();
+        });
         /* A stub returns the default. A script caller's destination is the return parameter itself (ScriptCore.cpp
            ProcessScriptFunction: RetVal->PropAddr = RESULT_PARAM), so Return Nothing would leave its old value there. A
            local is zeroed and constructed on every call, the value the editor's unlinked result pin gives. */

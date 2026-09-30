@@ -155,7 +155,6 @@ KNOWN_RULES = {     # sweep rules the suite's own packages still break, each wit
     'edl_super_serialized': "an override's /Game parent function is created, never serialized, before the override",
     'export_archetype': 'native default-subobject overrides have a null TemplateIndex',
     'import_chains': 'packages import themselves (their own package, class and functions)',
-    'instanced_refs_flagged': 'no property ever gets CPF_InstancedReference / CPF_ContainsInstancedReference',
     'native_out_arrays_emptied': "a native's out TArray is not emptied before the call, so Set_ToArray appends",
 }
 
@@ -2424,8 +2423,19 @@ def edits():
                 assert me == {'Ticks': 2}, me
                 tick = dump('dumpstruct.py', b, [e['name'] for e in lb[5]].index('ReceiveTick'))
                 assert re.search(r"^SuperStruct imp\[\d+\]:Function'ReceiveTick'$", tick, re.M), tick
+            import invariants
+            pa, pb = invariants.Package(a), invariants.Package(b)
+
+            def tick_only(i):
+                """An added ReceiveTick turns the default object's tick on (KismetCompiler.cpp 4738-4839, which
+                added_tick_can_tick checks): its tags are the game's plus PrimaryActorTick, and the rest is the game's."""
+                ta, tb = pa.tags(i), pb.tags(i)
+                key = lambda t: (t['name'], t['type'], t['index'], bytes(t['value']))
+                return (not pa.tag(i, 'PrimaryActorTick') and pa.blob(i)[ta.end:] == pb.blob(i)[tb.end:]
+                        and [key(t) for t in tb if t['name'] != 'PrimaryActorTick'] == [key(t) for t in ta])
             assert all(x['name'] == 'ReceiveBeginPlay' or new and x['name'] == 'CompTest_C' or blob(la, x) == blob(lb, y)
-                       for x, y in zip(la[5], lb[5])), 'another export changed'
+                       or 'ReceiveTick' in new and x['name'] == 'Default__CompTest_C' and tick_only(i)
+                       for i, (x, y) in enumerate(zip(la[5], lb[5]))), 'another export changed'
             proc = subprocess.run([ASSETGEN, 'roundtrip', tmp], capture_output=True, encoding='utf-8')
             assert proc.returncode == 0, proc.stdout
             n = 2 + len(new)
@@ -3605,8 +3615,8 @@ pending("SubobjectChain: an override's archetype is the same-named subobject of 
         subobject_chain)
 pending('SelfRefImport: a package refers to its own objects as exports, never through an import of itself', self_ref_import)
 abstract_instances()
-pending('AbstractComp: a component of an abstract mod class is refused, naming it abstract',
-        lambda: refused('AbstractComp', '  UE_COMPONENT(UPureComp, Comp);\n', 'abstract', top=ABSTRACT_COMP))
+refused('AbstractComp', '  UE_COMPONENT(UPureComp, Comp);\n', 'abstract', top=ABSTRACT_COMP)
+print('ok  AbstractComp: a component of an abstract mod class is refused, naming it abstract')
 name_too_long()
 tables_rules_fire()
 
@@ -3746,9 +3756,9 @@ def instanced_refs():
     CPF_InstancedReference; an array, map or struct member holding one is CPF_ContainsInstancedReference; the class is
     CLASS_HasInstancedReference (KismetCompilerMisc.cpp:948-952, 974-977, 1215-1218, 1254-1257;
     KismetCompiler.cpp:2521-2529). Instancing walks only flagged members (Class.cpp:2152-2163)."""
-    base = pending_asset('InstancedRefs')
+    base = asset('InstancedRefs')
     pkg, i, st = class_tail(base)
-    part = class_tail(pending_asset('InstancedRefs', 'RefPart'))[2]
+    part = class_tail(os.path.join(os.path.dirname(base), 'RefPart'))[2]
     assert part.class_flags & 0x200000, 'RefPart ClassFlags %#x lack DefaultToInstanced' % part.class_flags
     props = {p.name: p for p in st.props}
     need = [('Root', props['Root'].flags, 0x80000), ('Spare', props['Spare'].flags, 0x80000),
@@ -3760,6 +3770,8 @@ def instanced_refs():
     assert st.class_flags & 0x800000, hex(st.class_flags)
     keeps_invariants(base)
     assert run(base, 'CountPieces', self_vars={'Pieces': ['a', 'b', 'c']})[0] == 3
+    print('ok  InstancedRefs: component references are flagged instanced, their containers and HitResult contain one, '
+          'the class HasInstancedReference')
 
 
 def run_fname(chain, fn, fields, **parms):
@@ -3837,7 +3849,7 @@ for _name, (_parent, _bits, _within, _config) in TAIL_META.items():
     pending('ClassTailMeta %s: %s\'s tail (flags %#x, within %s, config %s)' % (_name, _parent.split('.')[-1], _bits,
                                                                                _within.split('.')[-1], _config), tail_meta(_name))
 pending('OverrideTest Walker: ClassConfigName Game, ACharacter\'s', walker_config)
-pending('InstancedRefs: component references flagged instanced, the class HasInstancedReference', instanced_refs)
+instanced_refs()
 for _mod, (_src, _member, _oracle, _what) in SHADOWS.items():
     refused_or_distinct(_mod, _src, _member, _oracle)
 print('ok  member names: one per FName, overloads and case twins included, none reused from an ancestor (%d cases)'
@@ -5125,25 +5137,22 @@ def scs_shapes():
           'its variable with the nearest class\'s defaults')
 
 
-scs_shapes()
-
-
-# ---- Pending: what AssetGen does not do yet
-
 def scs_no_scene_root():
     """An actor whose only own component is not a scene component still ends its construction with a root:
     ExecuteScriptOnActor makes one only when RootNodes is empty, so the SCS must list a scene root (the editor keeps its
     DefaultSceneRoot node in RootNodes until another scene component takes its place). A root node listed for this is a
     node like any other to keeps_invariants: in AllNodes too, with its own VariableGuid (what a subclass's override of
     it is keyed on); it needs no variable."""
-    b = pending_asset('ScsNoSceneRoot')
+    b = asset('ScsNoSceneRoot')
     root, attach, made, stored = construct(b)
     assert 'Spinner' in made and stored['Spinner'], (sorted(made), stored)
     assert root is not None, 'ScsNoSceneRoot_C ends its construction scripts without a RootComponent (it constructs only %s)' % sorted(made)
     keeps_invariants(b)
+    print('ok  ScsNoSceneRoot: an actor whose only component is not a scene component gets the default scene root')
 
 
-pending('ScsNoSceneRoot: an actor whose only component is not a scene component gets a root', scs_no_scene_root)
+scs_shapes()
+scs_no_scene_root()
 
 
 # ---- Refusals the compiler does not make yet: a CreationMethod of Instance on a template, or anything but Native on a
@@ -5335,15 +5344,10 @@ def comp_tick():
     print('ok  CompTick: a class with its own ReceiveTick can ever tick, one without cannot (and the examples)')
 
 
-comp_tick()
-
-
-# ---- Pending: what AssetGen does not do yet
-
 def comp_tick_component():
     """A component Blueprint with its own ReceiveTick registers its tick: its CDO's PrimaryComponentTick.bCanEverTick
     is set (UActorComponent's is false), and the ReceiveTick it ships runs."""
-    b = pending_asset('CompTickComponent')
+    b = asset('CompTickComponent')
     p, ci = class_pkg(b)
     cdo = p.struct(ci).cdo - 1
     t = p.tag(cdo, 'PrimaryComponentTick')
@@ -5352,6 +5356,7 @@ def comp_tick_component():
     run(b, 'ReceiveTick', self_vars=fields, DeltaSeconds=0.25)
     assert fields == {'N': 3}, fields
     keeps_invariants(b)
+    print('ok  CompTickComponent: a component Blueprint with its own ReceiveTick sets PrimaryComponentTick.bCanEverTick')
 
 
 def comp_tick_patch():
@@ -5375,6 +5380,23 @@ def comp_tick_patch():
         keeps_invariants(b)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+    print('ok  CompTickPatch: a patch that adds ReceiveTick sets the CDO\'s PrimaryActorTick.bCanEverTick, and it runs')
+
+
+def comp_override_chain():
+    """Three levels of one component's defaults fold as C++ constructors do: the grandchild's Lamp has ChainMid's
+    Intensity 250 and its own bVisible false, its override template archetyped on ChainMid's (the nearest one, which
+    GetArchetype finds by name) and built after it."""
+    folder = os.path.dirname(asset('CompOverrideChain'))
+    p, ci = class_pkg(os.path.join(folder, 'CompOverrideChain'))
+    lamp = template(p, ci, 'Lamp')
+    got = effective(p, lamp, 'Intensity'), effective(p, lamp, 'bVisible')
+    assert got == (250.0, 0), 'CompOverrideChain\'s Lamp loads Intensity, bVisible %s, want (250.0, 0)' % (got,)
+    e = p.exports[lamp]
+    assert p.path(e['tmpl']) == '/Game/_ElytrasMods/CompOverrideChain/ChainMid.ChainMid_C:Lamp_GEN_VARIABLE', p.path(e['tmpl'])
+    assert e['tmpl'] in e['deps'][2], e['deps']
+    for cls in ('CompOverrideChain', 'ChainMid', 'ChainBase'): keeps_invariants(os.path.join(folder, cls))
+    print('ok  CompOverrideChain: an override template is archetyped on the nearest ancestor\'s override, and loads its values')
 
 
 def world_location(p, ci, var):
@@ -5383,8 +5405,11 @@ def world_location(p, ci, var):
     Blueprint's node, or off a native subobject (only the native root, at the actor's origin, is known here). A
     parentless root node hangs off the actor's root when the actor already has one - an ancestor Blueprint's SCS built
     one, or the native class has one (SimpleConstructionScript.cpp 643, 686) - and otherwise IS the actor's root, put at
-    the spawn transform whatever its template says (SCS_Node.cpp 122-135). Rotation and scale must be absent (identity),
-    so locations add."""
+    the spawn transform whatever its template says (SCS_Node.cpp 122-135). A native class has one when it has a scene
+    component default subobject: its constructor names the root (ACharacter's capsule, Character.cpp 59), or
+    ExecuteConstruction takes the first unattached native scene component (ActorConstruction.cpp 736-746) - so also
+    where UeApi leaves RootComponent unmarked because two subobjects fit it. Rotation and scale must be absent
+    (identity), so locations add."""
     si, nodes, roots, dsr = comp.scs(p, ci)
     parent_of = {c: k for k, n in nodes.items() for c in n.children}
     k = next(k for k, n in nodes.items() if n.name == var)
@@ -5408,7 +5433,9 @@ def world_location(p, ci, var):
                 return add(total, rel)
             q, qi = next((q, qi) for q, qi in links[1:] if q.exports[qi]['name'].lower() == n.owner.lower())
             return add(add(total, rel), world_location(q, qi, n.parent))
-        inherited = bool(native and comp.native_root(native)) or any(comp.executed(q, qi, False) for q, qi in links[1:])
+        native_root = native and (comp.native_root(native)
+                                  or any(comp.native_is_scene(c) for c in (comp.native_subobjects(native) or {}).values()))
+        inherited = bool(native_root) or any(comp.executed(q, qi, False) for q, qi in links[1:])
         return add(total, rel) if inherited else total
 
 
@@ -5417,32 +5444,28 @@ def comp_root_keep():
     so its first own scene component attaches to that root and keeps its offset: Pivot sits 100 above the actor's
     origin and Glow, attached to Pivot, 10 in front of it. RigSpot's Spot, a light, sits 50 up. None is warned about as
     the actor's root."""
-    folder = os.path.dirname(pending_asset('CompRootKeep'))
+    folder = os.path.dirname(asset('CompRootKeep'))
     for cls, want in (('CompRootKeep', {'Pivot': (0.0, 0.0, 100.0), 'Glow': (10.0, 0.0, 100.0)}),
                       ('RigChar', {'Pivot': (0.0, 0.0, 100.0), 'Glow': (10.0, 0.0, 100.0)}),
                       ('RigSpot', {'Spot': (0.0, 0.0, 50.0)})):
         p, ci = class_pkg(os.path.join(folder, cls))
         got = {var: world_location(p, ci, var) for var in want}
         assert got == want, '%s: components sit at %s from the actor, want %s' % (cls, got, want)
-    tmp, out, log = compile_to(open(os.path.join(PENDING, 'CompRootKeep.cpp'), encoding='utf-8-sig').read(), 'CompRootKeep')
+    tmp, out, log = compile_to(open(os.path.join(TESTS, 'CompRootKeep.cpp'), encoding='utf-8-sig').read(), 'CompRootKeep')
     shutil.rmtree(tmp, ignore_errors=True)
     assert "is the actor's root" not in log, log
     for cls in ('CompRootKeep', 'RigChar', 'RigSpot', 'RigBase'): keeps_invariants(os.path.join(folder, cls))
+    print('ok  CompRootKeep: a subclass\'s first scene component attaches to the inherited root and keeps its transform')
 
 
-def comp_override_chain():
-    """Three levels of one component's defaults fold as C++ constructors do: the grandchild's Lamp has ChainMid's
-    Intensity 250 and its own bVisible false, its override template archetyped on ChainMid's (the nearest one, which
-    GetArchetype finds by name) and built after it."""
-    folder = os.path.dirname(pending_asset('CompOverrideChain'))
-    p, ci = class_pkg(os.path.join(folder, 'CompOverrideChain'))
-    lamp = template(p, ci, 'Lamp')
-    got = effective(p, lamp, 'Intensity'), effective(p, lamp, 'bVisible')
-    assert got == (250.0, 0), 'CompOverrideChain\'s Lamp loads Intensity, bVisible %s, want (250.0, 0)' % (got,)
-    e = p.exports[lamp]
-    assert p.path(e['tmpl']) == '/Game/_ElytrasMods/CompOverrideChain/ChainMid.ChainMid_C:Lamp_GEN_VARIABLE', p.path(e['tmpl'])
-    assert e['tmpl'] in e['deps'][2], e['deps']
-    for cls in ('CompOverrideChain', 'ChainMid', 'ChainBase'): keeps_invariants(os.path.join(folder, cls))
+comp_tick()
+comp_tick_component()
+comp_tick_patch()
+comp_override_chain()
+comp_root_keep()
+
+
+# ---- Pending: what AssetGen does not do yet
 
 
 def comp_attach_inherited():
@@ -5459,10 +5482,6 @@ def comp_attach_inherited():
         keeps_invariants(os.path.join(folder, cls))
 
 
-pending('CompTickComponent: a component Blueprint with ReceiveTick sets PrimaryComponentTick.bCanEverTick', comp_tick_component)
-pending('CompTickPatch: a patch that adds ReceiveTick sets the CDO\'s PrimaryActorTick.bCanEverTick', comp_tick_patch)
-pending('CompRootKeep: a subclass\'s first scene component attaches to the inherited root and keeps its transform', comp_root_keep)
-pending('CompOverrideChain: an override template is archetyped on the nearest ancestor\'s override', comp_override_chain)
 pending('CompAttachInherited: an own component attached to an inherited Blueprint or native component', comp_attach_inherited)
 
 
@@ -6326,14 +6345,18 @@ def deferred_left():
     """A deferred spawn never finished (the actor never runs its construction script or BeginPlay, Actor.cpp
     3185-3251), and a deferred component add never finished (never attached or registered, ActorConstruction.cpp
     1165-1212) or begun with a bManualAttachment the finish then overrides (the add's is not read when deferred,
-    1157-1160): C++ compiles each, so the compiler should say so at the function. A finish at another transform is
-    not asked about: FinishSpawning recomposes it on purpose (Actor.cpp 3212-3232). The patterns start at a word, so
-    the function names NoFinish / CompNoFinish do not match them themselves."""
-    def warns(*cases):
-        return lambda: [says('DeferredLeft', 'at ' + fn, r'DeferredLeft::%s\b' % fn, what)() for fn, what in cases]
-    pending('DeferredLeft.NoFinish: a deferred spawn left unfinished warns', warns(('NoFinish', r'finish')))
-    pending('DeferredLeft: a deferred component add left unfinished, or finished with another attachment, warns',
-            warns(('CompNoFinish', r'finish'), ('CompManual', r'attach')))
+    1157-1160): C++ compiles each, so the compiler says so at the function. A finish at another transform is not
+    asked about: FinishSpawning recomposes it on purpose (Actor.cpp 3212-3232). The patterns start at a word, so the
+    function names NoFinish / CompNoFinish do not match them themselves. The control: UberDeferGuard's Begin stores
+    its deferred spawn in a member and Finish finishes it, which is not warned about."""
+    log = latent_compile_log(os.path.join(TESTS, 'DeferredLeft.cpp'))[1]
+    for fn, what in (('NoFinish', r'\bfinish'), ('CompNoFinish', r'\bfinish'), ('CompManual', r'\battach')):
+        assert said(log, r'DeferredLeft::%s\b' % fn, what), \
+            'nothing said at %s: %s' % (fn, ' | '.join(log.strip().splitlines()))
+    held = latent_compile_log(os.path.join(TESTS, 'UberDeferGuard.cpp'))[1]
+    assert not said(held, r'\bdeferred\b'), 'a deferred spawn kept in a member warned: ' + held
+    print('ok  DeferredLeft: an unfinished deferred spawn or component add, or a finish with another attachment, warns; '
+          'one kept in a member does not')
 
 
 def spawn_abstract():
@@ -6391,10 +6414,9 @@ COOKED_RULES = {'cooked_instancing_flags', 'cooked_instancing_scopes', 'cooked_t
 
 
 def pinned_elsewhere(f):
-    """A finding a pending test below pins, which the behaviour checks leave to it:
-    - EditAddTick: a ReceiveTick a patch adds to a class that cannot tick (COMP's receive_tick_sets_can_ever_tick,
-      once merged)."""
-    return f[0] == 'receive_tick_sets_can_ever_tick'
+    """A finding a pending test below pins, which the behaviour checks leave to it. None now: EditAddTick, which pinned
+    COMP's receive_tick_sets_can_ever_tick, passes (a ReceiveTick a patch adds turns the class's tick on)."""
+    return False
 
 
 def compile_edit(tmp, mod, src, game):
@@ -6774,8 +6796,9 @@ if not globals().get('EDITS_EXPLORE'):     # set by the dev loop's exploration d
     kept_body_locals()
     print('ok  S38: a kept game body (<Fn>__Vanilla) reads its parameters, an out parameter included, through its own '
           'properties, not the replaced function\'s')
-    pending('EditAddTick: a ReceiveTick a patch adds to a Blueprint that cannot tick sets PrimaryActorTick.bCanEverTick '
-            'on its CDO, or is refused', added_tick_can_tick)
+    added_tick_can_tick()
+    print('ok  EditAddTick: a ReceiveTick a patch adds to a Blueprint that cannot tick sets PrimaryActorTick.bCanEverTick '
+          'on its CDO')
     edit_listed_component()
     edit_bound_names()
     edit_cooked_unlisted_cases()

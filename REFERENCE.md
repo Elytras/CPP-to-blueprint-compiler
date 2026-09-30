@@ -276,8 +276,8 @@ Notes:
 | `: public UBlueprintFunctionLibrary` | A Blueprint Function Library, a class of static functions. See [Functions](#functions). | Yes |
 | `: public UPrimaryDataAsset`, `: public UDataAsset` | A data asset class. Its instances are braced variables at namespace scope; see [Data assets](#data-assets). | Yes |
 | `: public USaveGame`, `: public UFSDSaveGame` | A save game class. | Yes |
-| `: public UActorComponent`, `: public USceneComponent` | A component Blueprint, with the component class flags. Add one to an actor at run time with `AddComponentByType<T>(Owner)`, the editor's Add Component by Class node. Its own events to override are `ReceiveBeginPlay` and `ReceiveEndPlay`. It cannot be a `UE_COMPONENT` of a mod actor, which takes engine component classes only; see [Components](#components). | Yes |
-| `void ReceiveTick(float DeltaSeconds)` in a component class | Not yet: it compiles with no warning and never ticks. The compiler turns on an actor's tick flag, which a component does not have, and setting `PrimaryComponentTick` in `UE_DEFAULTS` is refused. Call a method of the component from its owner's `ReceiveTick` instead. | Not yet |
+| `: public UActorComponent`, `: public USceneComponent` | A component Blueprint, with the component class flags. Add one to an actor at run time with `AddComponentByType<T>(Owner)`, the editor's Add Component by Class node. Its own events to override are `ReceiveBeginPlay`, `ReceiveEndPlay` and `ReceiveTick`. It cannot be a `UE_COMPONENT` of a mod actor, which takes engine component classes only; see [Components](#components). | Yes |
+| `void ReceiveTick(float DeltaSeconds)` in a component class | Turns the component's ticking on: it sets `PrimaryComponentTick.bCanEverTick` on the class default object, as the editor's compiler does. UActorComponent leaves it off. | Yes |
 | `: public UUserWidget` | A widget with logic and no layout. `CreateWidget<T>` makes one. Its events, such as `Construct`, are overrides. `Tick` runs only if `bHasScriptImplementedTick` is set in `UE_DEFAULTS`, which the editor's widget compiler would do. | Yes |
 | a designer layout (a widget tree) for a mod widget | Not yet, and nothing warns. A mod widget has no widget tree, so it shows nothing of its own. For visible UI, create one of the game's widget Blueprints. | Not yet |
 
@@ -355,6 +355,7 @@ Notes:
 | `bool`, `uint8`, `int32`, `int64`, `float`, `FName`, `FString`, `FText` | Blueprint's Boolean, Byte, Integer, Integer64, Float, Name, String and Text variables. | Yes |
 | `EMood Mood;` | An enum variable. A `uint8` enum is cooked as a Byte of that enum, an `int32` or `int64` enum as an enum property over that integer. See [Enums](#enums). | Yes |
 | `AActor *Target;`, `UClass *Cls;`, `TSubclassOf<AActor> Kind;` | Object and class references. See [Types](#types). | Yes |
+| `USceneComponent *Spare;`, `TArray<UStaticMeshComponent *> Pieces;`, `FHitResult LastHit;` | A reference to a component or widget, or a container or struct that holds one, is flagged instanced, as the editor flags it, so an actor spawned from the class gets its own copy of what the class default points at, not the default's. | Yes |
 | `TSoftObjectPtr<T>`, `TSoftClassPtr<T>`, `TScriptInterface<I>` | Soft object and soft class references, and an interface reference. | Yes |
 | `FVector Home;`, `FAmmo Ammo;` | An engine or game struct, or a mod `UE_STRUCT`. See [Structs](#structs). | Yes |
 | `TArray<FVector>`, `TSet<int32>`, `TMap<FName, int32>` | Array, Set and Map variables. A container inside a container goes through a generated wrapper struct; see [Containers](#containers). | Yes |
@@ -2344,7 +2345,7 @@ the function it replaces is refused.
 | You write | What it does | Status |
 |---|---|---|
 | `void ReceiveBeginPlay() { ... }` | Overrides the parent's event, like adding the event node in the editor. The engine calls it. | Yes |
-| `void ReceiveTick(float DeltaSeconds)` | Also turns ticking on for the actor: it sets `PrimaryActorTick.bCanEverTick` on the class default object, as the editor's compiler does. AActor leaves ticking off by default. | Yes |
+| `void ReceiveTick(float DeltaSeconds)` | Also turns ticking on: it sets `PrimaryActorTick.bCanEverTick` on an actor's class default object, `PrimaryComponentTick.bCanEverTick` on a component's, as the editor's compiler does. AActor and UActorComponent leave ticking off by default. | Yes |
 | `void OnJumped() { ACharacter::OnJumped(); ... }` | Overrides a BlueprintNativeEvent (an event with a C++ default). The Blueprint version replaces the default, and the parent call runs it. | Yes |
 | `bool CanJumpInternal() const` | An override copies its parent's access, event, net, authority, cosmetic, const and pure flags, whatever section it is written in. It drops Native, because the Blueprint version is script. | Yes |
 | A class in `namespace Game::...` deriving a game Blueprint, redefining one of its functions | An override the game's code reaches by name, with the parent function's flags; see [examples/GameBlueprintChild.cpp](examples/GameBlueprintChild.cpp). | Yes |
@@ -2384,8 +2385,6 @@ Notes:
   native and no Blueprint event, so no function replaces it". C++ and calls bound to it keep running the engine's.
   An override of a function of another mod's class (from a `UE_CLASS` header) gets plain flags, not the parent's.
 - An event override is not BlueprintCallable, so the editor API stub leaves it out.
-- Only an actor's tick is switched on. A `UActorComponent` subclass that overrides ReceiveTick gets no component tick
-  setting, and whether it ticks is untested.
 
 ### Overriding your own parent's methods
 
@@ -2588,7 +2587,7 @@ component class, and the first scene component declared is the actor's root.
 | `UE_COMPONENT(UHealthComponent, Health);` | One of DRG's own component classes works like an engine one. | Yes |
 | `UE_COMPONENT(UInstancedStaticMeshComponent, Pile);` | Static mesh, instanced static mesh, hierarchical instanced static mesh, SkyAtmosphere and AtmosphericFog components write native data after their properties. AssetGen writes exactly the bytes a cooked template of that class carries, and a class derived from one of them gets the same bytes. Other component classes need nothing extra. | Yes |
 | `UE_COMPONENT(UModelComponent, Bsp);` | Refused: a model component "belongs to a level's BSP" and cannot be a template. | Refused |
-| `UE_COMPONENT(UCharges, Ammo);`, with a component class the mod declares | Refused: "a UE_COMPONENT names an engine component class". Add a component of your own class at run time with `AddComponentByType` or `AddComponentDeferred` (below). | Refused |
+| `UE_COMPONENT(UCharges, Ammo);`, with a component class the mod declares | Refused: "a UE_COMPONENT names an engine component class". Add a component of your own class at run time with `AddComponentByType` or `AddComponentDeferred` (below). An abstract one (a method `= 0`) is refused as "abstract": the engine never instances an abstract class. | Refused |
 | `UE_COMPONENT(UTexture2D, Icon);` | Refused: "is not a UActorComponent". | Refused |
 | `UE_COMPONENT` in a class that is not an actor | Refused: "only an actor has a construction script". | Refused |
 | `UE_COMPONENT` in a `UE_INTERFACE` | Refused: "an interface cannot declare a UE_COMPONENT". Declare the component on each class that implements the interface. | Refused |
@@ -2643,7 +2642,7 @@ Notes:
 | a later scene component | Attaches directly to the root. The tree is one level deep and uses no sockets. | Yes |
 | a component that is not a scene component, such as `UProjectileMovementComponent` | Is created with no attachment, wherever it is declared. | Yes |
 | no `UE_COMPONENT` at all | The actor gets the engine's default scene root. | Yes |
-| only components that are not scene components | The actor has no root component, so it has no location. Declare a `USceneComponent` first if it needs one. | Yes |
+| only components that are not scene components | The actor gets the engine's default scene root too, as in the editor, so a movement component has a root to move. | Yes |
 | a scene component nested under another, or at a socket | Not yet: there is no syntax for it. Attach it at run time with `AttachToComponent` (below). | Not yet |
 
 Notes:
@@ -2690,7 +2689,10 @@ Notes:
 - `Objects.h` is in AssetGen's `include/` folder, not in `UeApi`. Include it by its path from your source,
   `#include "../include/Objects.h"` as the examples do, or copy it beside your source; a bare `#include "Objects.h"`
   finds it only there. [Creating objects](#creating-objects) has the rest of it.
-- Pass the same bManualAttachment to `AddComponentDeferred` and `FinishComponent`.
+- Pass the same bManualAttachment to `AddComponentDeferred` and `FinishComponent`: the finish's decides the
+  attachment. Two different constants get a warning, and so does a function that adds deferred and never calls
+  `FinishComponent`, unless it hands the component on (to a member, an out parameter, its return value or a script
+  function), where the finish may be.
 - The usage comment at the top of `Objects.h` writes `GetRootComponent()`, which the SDK does not declare. Write
   `K2_GetRootComponent()`.
 
@@ -2761,7 +2763,9 @@ Notes:
 ### The root's transform
 
 The engine puts an actor's root at the spawn transform and ignores the location, rotation and scale on the root's
-template.
+template. This is only about a class whose parent has no root: below a mod or game Blueprint parent, or a native one
+with a scene component such as `ACharacter`, the first scene component attaches under the inherited root and keeps
+its own location, rotation and scale like any other.
 
 | You write | What it does | Status |
 |---|---|---|
@@ -2795,7 +2799,7 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `Lamp->Intensity = 250.0f;`, where a mod parent declares `Lamp` | Overrides that component's defaults for this class only, as the editor does for an inherited component. No `Super::` is needed: the compiler finds the class that declares the member. | Yes |
+| `Lamp->Intensity = 250.0f;`, where a mod parent declares `Lamp` | Overrides that component's defaults for this class only, as the editor does for an inherited component. No `Super::` is needed: the compiler finds the class that declares the member. A grandchild that sets `Lamp->bVisible = false;` keeps the 250 as well: defaults fold down the chain as C++ constructors do. | Yes |
 | `CapsuleComponent->CapsuleRadius = 55.0f;` in an `ACharacter` child | A C++ parent's component is a default subobject. AssetGen overrides it under the subobject's real name and class, which can differ from the member's: `ACharacter`'s `CapsuleComponent` is `CollisionCylinder`. The SDK records the name as `<Member>__UeSubobject`. | Yes |
 | `StaticMesh->RelativeScale3D = FVector(2.0f, 2.0f, 2.0f);` in a child of a game Blueprint | A game Blueprint's component is a construction-script node, as a mod parent's is. The override is keyed on that node's GUID, which the SDK records as `<Component>__UeScsNode`. The node's real name is used, even when it contains spaces. | Yes |
 | `Controller->bAttachToPawn = true;` in an `APawn` child | Refused: "UeApi does not say which default subobject Controller is". Either the member is not a default subobject, and you set the value at run time, or the SDK predates the markers, and you regenerate it with genueapi. | Refused |
@@ -2878,8 +2882,9 @@ Notes:
 
 - The world context is the caller: `this`, or a static function's own `WorldContextObject` parameter. See
   [Calling engine and game functions](#calling-engine-and-game-functions).
-- Until `FinishSpawning` runs, a deferred actor has not run its construction script or BeginPlay. Nothing makes you
-  call it.
+- Until `FinishSpawning` runs, a deferred actor has not run its construction script or BeginPlay. A function that
+  spawns deferred and never calls `FinishSpawning` gets a warning, unless it hands the actor on (to a member, an out
+  parameter, its return value or a script function), where the finish may be.
 - [examples/Beacon.cpp](examples/Beacon.cpp) spawns an actor of the mod near the player.
 
 ### Objects and widgets
@@ -5700,6 +5705,14 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   construct a subclass that defines every `= 0` method. See [Objects and widgets](#objects-and-widgets).
 - `warning: <Class>::<Function>: SpawnObject with no Outer (None) makes nothing and returns None`: `NewObject<T>(nullptr)`.
   The build goes on. Fix: pass the object that owns it, such as `this`. See [Objects and widgets](#objects-and-widgets).
+- `warning: <Function>: a deferred spawn (SpawnActorDeferred, BeginDeferredActorSpawnFromClass) is not finished in
+  this function` and `warning: <Function>: a deferred component add (AddComponentDeferred, AddComponentByClass with
+  bDeferredFinish) is not finished in this function`: the function starts more than it finishes and keeps the object
+  to itself. Until the finish, the actor runs no construction script and no BeginPlay, and the component is neither
+  attached nor registered. Fix: call `FinishSpawning` / `FinishComponent` on it, or keep it in a member for the
+  function that does. See [Creating objects](#creating-objects).
+- `warning: <Function>: a deferred component add is given one bManualAttachment and finished with another`: the
+  finish's decides whether the component attaches to the root; the add's is not read. Fix: pass the same to both.
 - `<Function>: AddComponent looks up a component template by name, and a mod class has no component templates, so it
   returns None; add one by class with AddComponentByClass`: `AddComponent(FName("X"), ...)`. Fix: use
   `AddComponentByClass`, or `AddComponentByType<T>(Owner)`. See [Components](#components).

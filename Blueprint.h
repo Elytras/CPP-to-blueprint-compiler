@@ -44,6 +44,10 @@ public:
 
     /* Only an actor may have the SCS trio: USimpleConstructionScript casts the owner CDO to AActor. */
     void SetIsActor(bool bValue) { bIsActor = bValue; }
+    /* An actor component: its tick function is PrimaryComponentTick, not an actor's PrimaryActorTick. */
+    void SetIsComponent(bool bValue) { bIsComponent = bValue; }
+    /* A flag the class's own members call for on top of what SetClassFlags gave (CLASS_HasInstancedReference). */
+    void AddClassFlags(uint32 Flags) { ClassFlags |= Flags; }
 
     /* A cooked class stores the FULL EClassFlags set, mostly inherited from the native parent. */
     void SetClassFlags(uint32 Flags) { ClassFlags = Flags; }
@@ -147,6 +151,7 @@ private:
     std::string ParentPackage, ParentClass;
     bool bParentIsBlueprint = false;
     bool bIsActor = true;
+    bool bIsComponent = false;
     bool bReplicates = false;
     FIndex UberGraphFunction;
     uint32 ClassFlags = 0x00840814;

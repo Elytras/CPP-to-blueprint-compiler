@@ -9,9 +9,8 @@ An actor whose only component is not a scene component still needs a root: the r
 component turns the actor's root (its UpdatedComponent), and an actor without one has no transform at
 all. USimpleConstructionScript::ExecuteScriptOnActor makes a SceneComponent root only when RootNodes is
 empty; with Spinner as the one root node it makes none, and no node of Spinner's makes one either. The
-editor keeps its DefaultSceneRoot node in RootNodes until another SCENE component can be the root.
-Pending: RootNodes is [Spinner] and the DefaultSceneRoot node is left out, so the actor ends its
-construction script without a RootComponent.
+editor keeps its DefaultSceneRoot node in RootNodes until another SCENE component can be the root, and so
+does AssetGen: RootNodes is [DefaultSceneRoot, Spinner].
 */
 class ScsNoSceneRoot : public AActor {
 public:
