@@ -508,7 +508,8 @@ struct FRecord
     std::vector<const Json*> AllMethods;            // every in-class method decl, overloads included, in order
     std::vector<const Json*> Fields;
     std::vector<const Json*> Ctors;                 // CXXConstructorDecls: their parameter names place a value's arguments
-    std::vector<std::string> Interfaces;            // every base after the first
+    std::vector<std::string> Interfaces;            // every base after the first; a native class's from UeNativeInterfaces
+    std::string Tail;                               // genueapi's UeClassTail: "<ScriptInherit flags> <ClassWithin> <ConfigName>"
     std::map<std::string, std::string> Replicated;  // UE_REPLICATED*: variable -> "Notify:Condition"
     std::set<std::string> Components;               // UE_COMPONENT: variables that are also SCS nodes
     /* genueapi's `<X>__UeName`: the engine's name of a member or function Dumper-7 had to respell (`Name_0` is
@@ -626,8 +627,25 @@ struct FStructInfo
     std::string Package, UeName;
     int32 Size = 0, Align = 1;
     bool bComplete = false;                                     // every reflected field is known, so a literal can be built
-    std::vector<std::pair<std::string, std::string>> Fields;    // (type, name) in property order
+    std::vector<std::pair<std::string, std::string>> Fields;    // (type, name) in C++ order, the super's members first
+    /* Types.json's "link", where it is not Fields: the members EX_StructConst writes, in PropertyLink order - the
+       struct's own, then its super's - and no Transient one (ScriptCore.cpp 3376-3405, Class.cpp 944-982). A UeApi
+       older than it has none, and a literal then takes Fields as they are. */
+    std::optional<std::vector<std::string>> Link;
 };
+
+bool IsVmConstant(const FArgIR& A);
+
+/* Each index into SI.Fields EX_StructConst writes, in the order it writes them. */
+std::vector<size_t> StructConstOrder(const FStructInfo& SI)
+{
+    std::vector<size_t> Out;
+    if (!SI.Link) { for (size_t I = 0; I < SI.Fields.size(); ++I) Out.push_back(I); return Out; }
+    for (const std::string& N : *SI.Link)
+        for (size_t I = 0; I < SI.Fields.size(); ++I)
+            if (SI.Fields[I].second == N) { Out.push_back(I); break; }
+    return Out;
+}
 
 std::vector<Json> ExtraArgs(const Json& Row)
 {
@@ -674,6 +692,7 @@ struct FCallIR
     uint64 WrittenArgs = ~uint64(0);    // bit I: argument I must stay its own variable, which the callee may write: see ContainerWrites
     std::vector<std::string> RefParms;  // per argument, the type of the reference parameter it binds, else "": see HoistCallArgs
     bool bRefsTakeConst = false;        // a native's P_GET_PROPERTY_REF: a constant there goes through the thunk's own buffer
+    uint64 EmptiedArgs = 0;             // bit I: argument I is a native's out TArray, emptied just before the call: see HoistCallArgs
     std::string VirtualName;            // a generated class's own instance method: EX_VirtualFunction resolves it by name at run time
     bool bLocal = false;                // EX_LocalVirtualFunction / EX_LocalFinalFunction: a script function that is no RPC
     std::string View;                   // __RefAtInline__: the TArray field of the view struct in Extra
@@ -1516,6 +1535,14 @@ private:
     std::map<std::string, std::vector<std::pair<std::string, int64>>> EnumDecls;   // C++ name -> its enumerators, in order
     std::map<std::string, int32> EnumConstWidth;      // clang EnumConstantDecl id -> its enum's size, 1 / 4 / 8
     std::map<std::string, uint32> EventFlags;         // UeApi/Events.json: "Package.Class.Function" -> EFunctionFlags
+    /* UeApi/OutArrays.json: "Package.Class.Function" -> bit I for each parameter I of a native that is an out TArray,
+       emptied before the call (FCallIR::EmptiedArgs). A UeApi without the file empties nothing, as before. */
+    std::map<std::string, uint64> OutArrayArgs;
+    uint64 OutArraysOf(const std::string& Package, const std::string& Class, const std::string& Fn) const
+    {
+        auto It = OutArrayArgs.find(Package.substr(Package.rfind('/') + 1) + "." + Class + "." + Fn);
+        return It == OutArrayArgs.end() ? 0 : It->second;
+    }
     std::map<std::string, FIndex> CurSignatures;      // Generate: dispatcher name -> its signature function export
     std::map<std::string, std::pair<std::string, FIndex>> DelegateSigs;    // Generate: a TDelegate type -> its signature
                                                                             // function's name and export
@@ -2222,6 +2249,22 @@ bool FCompiler::Collect(std::string* Err)
             {
                 R.bIsPatch = true;
             }
+            else if (Kind(C) == "VarDecl" && Name(C) == "UeClassTail")
+            {
+                FindLiteral(C, R.Tail);
+            }
+            else if (Kind(C) == "VarDecl" && Name(C) == "UeNativeInterfaces")
+            {
+                /* The native interfaces a native class implements, which the dump does not list: genueapi takes them
+                   from the game's Blueprints that override one's function. */
+                std::string List;
+                if (FindLiteral(C, List))
+                    for (size_t At = 0, End; At < List.size(); At = End + 1)
+                    {
+                        End = std::min(List.find(' ', At), List.size());
+                        if (End > At) R.Interfaces.push_back(List.substr(At, End - At));
+                    }
+            }
             else if (Kind(C) == "VarDecl" && Name(C) == "UeStructMeta")
             {
                 R.bIsStruct = true;
@@ -2898,17 +2941,19 @@ bool FCompiler::ZeroArg(const std::string& Type, FBlueprintClass& BP, FArgIR& Ou
     Out.I = SI->second.Size;
     Out.InnerType = T;
     Out.Sub = std::make_shared<FCallIR>();
-    for (const auto& F : SI->second.Fields)
+    for (size_t I : StructConstOrder(SI->second))
     {
         FArgIR M;
-        if (!ZeroArg(F.first, BP, M, Err)) return false;
+        if (!ZeroArg(SI->second.Fields[I].first, BP, M, Err)) return false;
         Out.Sub->Args.push_back(M);
     }
     return true;
 }
 
 /* `FVector(1, 2, 3)`: EX_StructConst wants one value per reflected field, in property order, so
-   only a struct whose every field is known can be written; argless means all zeros. */
+   only a struct whose every field is known can be written; argless means all zeros. The arguments come in C++'s order
+   (a super's members first) and go out in PropertyLink's (StructConstOrder); one for a Transient member has nowhere to
+   go, execStructConst skipping that member, so a constant there is dropped with a warning and anything else refused. */
 bool FCompiler::LowerStructLiteral(const Json& CtorNode, const FStructInfo& SI, FBlueprintClass& BP,
                                    FArgIR& Out, std::string* Err)
 {
@@ -2928,12 +2973,21 @@ bool FCompiler::LowerStructLiteral(const Json& CtorNode, const FStructInfo& SI, 
     Out.I = SI.Size;
     Out.InnerType = T;
     Out.Sub = std::make_shared<FCallIR>();
-    for (const Json* A : Args)
+    std::vector<FArgIR> Given(Args.size());
+    for (size_t I = 0; I < Args.size(); ++I)
+        if (!LowerArg(*Args[I], BP, Given[I], Err)) return false;
+    const std::vector<size_t> Order = StructConstOrder(SI);
+    for (size_t I = 0; I < Given.size(); ++I)
     {
-        FArgIR M;
-        if (!LowerArg(*A, BP, M, Err)) return false;
-        Out.Sub->Args.push_back(M);
+        if (std::find(Order.begin(), Order.end(), I) != Order.end()) continue;
+        const std::string& Member = SI.Fields[I].second;
+        if (!IsVmConstant(Given[I]))
+        { *Err = T + "::" + Member + " is Transient, which a struct literal cannot set: give it a constant, or set the member "
+                 "after"; return false; }
+        printf("  warning: %s::%s: %s::%s is Transient, which a struct literal does not set (execStructConst skips it): "
+               "the value given for it is dropped\n", Cur ? Cur->CppName.c_str() : "", CurFnName.c_str(), T.c_str(), Member.c_str());
     }
+    for (size_t I : Order) Out.Sub->Args.push_back(Given[I]);
     return true;
 }
 
@@ -4115,6 +4169,7 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             Out.Sub = std::make_shared<FCallIR>();
             Out.Sub->Fn = BP.EngineFunction("/Script/Engine", Lib, Prefix + Method);
             Out.Sub->WrittenArgs = ContainerWrites(Prefix + Method);
+            Out.Sub->EmptiedArgs = OutArraysOf("/Script/Engine", Lib, Prefix + Method);    // ToArray, Keys, Values
             Out.Sub->bOnArg0 = true;
             Out.Sub->Args.push_back(Target);
             Out.Sub->RefParms.emplace_back();
@@ -5248,6 +5303,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
     std::string DeclId, MethodName;
     const Json* FullDecl = nullptr;     // the UFunction's own signature, whichever overload was called
     const Json* Receiver = nullptr;     // a forwarded method's object, first among the arguments (UObject::GetOuter)
+    uint64 OutArrays = 0;               // a native callee's out TArray parameters (OutArrays.json)
     if (K == "CXXMemberCallExpr")
     {
         if (Kind(*Callee) != "MemberExpr") { *Err = "TODO: unimplemented callee " + Kind(*Callee); return false; }
@@ -5483,6 +5539,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
             "CreateProxyObjectForPlayMontage", "CreatePlayAnimationProxyObject", "CreatePlayAnimationTimeRangeProxyObject" };
         Out.bFrameHeld = bStatic && Called->IsNative() && FrameHeld.count(MethodName) != 0;
         Out.bStrongOnFrame = Out.bFrameHeld || (bStatic && Called->IsNative() && MethodName == "SpawnObject");
+        if (!Out.bScript) OutArrays = OutArraysOf(CalleePackage, CalleeName, UeNameOf(Called, MethodName));
         /* A Blueprint static needs the CDO context; EX_CallMath finds it itself for a native, but never asks the
            callspace an authority-only or cosmetic one has (KismetCompilerVMBackend.cpp 1222-1231): that one is called
            through CallFunction on the CDO, as the editor calls it. */
@@ -5618,6 +5675,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
        parameters `const T&` for this (Dumper-7's flags; its spelling alone cannot tell one from a by-value string). */
     auto FillRefParms = [&] {
         if (Out.Args.size() != Parms.size()) return;
+        Out.EmptiedArgs = OutArrays;        // the arguments stand where the UFunction's parameters do
         Out.RefParms.clear();
         Out.bRefsTakeConst = !Out.bScript;
         ForEach(*FullDecl, [&](const Json& C) {
@@ -8710,6 +8768,7 @@ bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vec
         St.K = FStmtIR::StaticCall;
         St.Call.Fn = BP.EngineFunction("/Script/Engine", Lib, Fn);
         St.Call.WrittenArgs = ContainerWrites(Fn);
+        St.Call.EmptiedArgs = OutArraysOf("/Script/Engine", Lib, Fn);     // the copy a TSet / TMap walk refills
         St.Call.Args = std::move(CallArgs);
         return St;
     };
@@ -9324,6 +9383,18 @@ bool FCompiler::HoistCallArgs(FCallIR& C, FBlueprintClass& BP, std::vector<FProp
             if (!HoistOperand(C.Args[I], BP, Locals, OutPre, Err)) return false;
         }
     }
+    /* A native's out TArray is emptied by a statement of its own, `EX_SetArray <arg> EX_EndArray`, after everything
+       else the call needs and so just before it, as the editor writes it "in case the native function doesn't clear
+       them before filling" (KismetCompilerVMBackend.cpp 1152-1174). One that appends, as GenericSet_ToArray does
+       (BlueprintSetLibrary.cpp 53-70), would otherwise add to what the variable already held. */
+    for (size_t I = 0; I < C.Args.size() && I < 64; ++I)
+        if (((C.EmptiedArgs >> I) & 1) && IsStored(C.Args[I]))
+        {
+            FStmtIR Empty;
+            Empty.Call.Intrinsic = "__SetArray__";
+            Empty.Call.Args = { C.Args[I] };
+            OutPre.push_back(std::move(Empty));
+        }
     return true;
 }
 
@@ -11628,7 +11699,24 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     for (const FRecord* A = &R; A; A = A->Base.empty() ? nullptr : Find(A->Base))
         for (const auto& [Method, Decl] : A->Methods)
             if (Nearest.insert(Method).second && Decl->value("pure", false)) bAbstract = true;
-    BP.SetClassFlags(ClassFlagsFor(Ancestry) | (bAbstract ? uint32(CLASS_Abstract) : 0u));
+    /* The tail the editor copies from the parent - its ScriptInherit ClassFlags, ClassWithin and ClassConfigName
+       (KismetCompiler.cpp:320-321, 2450-2453) - and nothing at load re-derives: genueapi's UeClassTail of the nearest
+       class up the chain that has one. None (an old UeApi) leaves UObject's, within Object and config Engine. */
+    uint32 TailBits = 0;
+    for (const FRecord* A = B; A; A = A->Base.empty() ? nullptr : Find(A->Base))
+        if (!A->Tail.empty())
+        {
+            const std::string& T = A->Tail;
+            const size_t S1 = T.find(' '), S2 = T.find(' ', S1 + 1);
+            const std::string Within = T.substr(S1 + 1, S2 - S1 - 1);
+            const size_t Dot = Within.rfind('.');
+            if (S2 == std::string::npos || Dot == std::string::npos)
+            { *Err = A->CppName + ": UeClassTail \"" + T + "\" is not \"<flags> <within class path> <config name>\""; return false; }
+            TailBits = uint32(strtoul(T.c_str(), nullptr, 16));
+            BP.SetClassTail(Within.substr(0, Dot), Within.substr(Dot + 1), T.substr(S2 + 1));
+            break;
+        }
+    BP.SetClassFlags(ClassFlagsFor(Ancestry) | TailBits | (bAbstract ? uint32(CLASS_Abstract) : 0u));
 
     for (const std::string& I : R.Interfaces)
     {
@@ -11637,7 +11725,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         if (!IR->IsNative() && !IR->bIsInterface)
         { *Err = R.CppName + " implements " + I + ", which is not an interface"; return false; }
         /* clang already rejects one listed twice; an ancestor's copy it only warns about. A native
-           ancestor's interfaces are not in the dump, so only the mod's classes are checked. */
+           ancestor's interfaces are not in the dump: only those UeNativeInterfaces names are checked. */
         /* Through an interface that extends it as well: this class's empty stubs would otherwise override the
            functions the ancestor implemented. */
         for (const FRecord* A = Find(R.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
@@ -12863,6 +12951,11 @@ bool FCompiler::LoadTables(const std::string& IncludeDir, std::string* Err)
     if (!Load("Conv.json", &ConvDoc) || !Load("Ops.json", &OpsDoc) || !Load("Types.json", &TypesDoc)
         || !Load("Events.json", &EventsDoc)) return false;
     for (auto It = EventsDoc.begin(); It != EventsDoc.end(); ++It) EventFlags[It.key()] = It->get<uint32>();
+    const Json OutArraysDoc = Json::parse(ReadText(IncludeDir + "/OutArrays.json"), nullptr, false);
+    if (OutArraysDoc.is_object())
+        for (auto It = OutArraysDoc.begin(); It != OutArraysDoc.end(); ++It)
+            for (const Json& I : *It)
+                if (I.get<int32>() < 64) OutArrayArgs[It.key()] |= uint64(1) << I.get<int32>();
 
     for (const Json& Row : ConvDoc)
         Convs.push_back({ Row.value("from", std::string()), Row.value("to", std::string()),
@@ -12884,6 +12977,7 @@ bool FCompiler::LoadTables(const std::string& IncludeDir, std::string* Err)
         S.Align = It->value("align", 1);
         S.bComplete = It->value("complete", false);
         for (const Json& F : (*It)["fields"]) S.Fields.emplace_back(F[0].get<std::string>(), F[1].get<std::string>());
+        if (It->contains("link")) S.Link = (*It)["link"].get<std::vector<std::string>>();
         Structs[It.key()] = S;
     }
     return true;

@@ -51,6 +51,9 @@ public:
 
     /* A cooked class stores the FULL EClassFlags set, mostly inherited from the native parent. */
     void SetClassFlags(uint32 Flags) { ClassFlags = Flags; }
+    /* ClassWithin and ClassConfigName, which the editor copies from the parent (KismetCompiler.cpp:320-321, 2453). */
+    void SetClassTail(std::string WithinPackage_, std::string WithinClass_, std::string ConfigName_)
+    { WithinPackage = std::move(WithinPackage_); WithinClass = std::move(WithinClass_); ConfigName = std::move(ConfigName_); }
 
     /* Replication: the CDO's bReplicates, set when the class replicates a variable or declares an RPC. The class's
        NumReplicatedProperties tag is counted from the CPF_Net variables. */
@@ -162,6 +165,7 @@ private:
     bool bReplicates = false;
     FIndex UberGraphFunction;
     uint32 ClassFlags = 0x00840814;
+    std::string WithinPackage = "/Script/CoreUObject", WithinClass = "Object", ConfigName = "Engine";
 
     std::unordered_map<std::string, int32> ImportCache;
 

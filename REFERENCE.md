@@ -337,9 +337,12 @@ Notes:
   `UeApi`. The compiler gives clang two include paths, the `UeApi` folder and the folder that holds it, so include
   `Objects.h` by its path from your source (the examples write `#include "../include/Objects.h"`) or from that folder,
   or copy it beside your source. A bare `#include "Objects.h"` finds it only there.
-- The class flags follow the kind of parent: an actor, an actor component, a function library, or anything else. The
-  compiler does not know flags that a native parent adds beyond these. A shipped status-effect Blueprint carries
-  `EditInlineNew`, and a mod `UStatusEffect` class is cooked without it. Whether that matters in game is untested.
+- The class takes its parent's class flags, ClassWithin and config name, as the editor copies them: an `AHUD` child
+  reads `Game.ini`, a `UCheatManager` child is within PlayerController, a `UStatusEffect` child is `EditInlineNew`.
+  UeApi states them per class (`UeClassTail`): a native class's from what the game's Blueprint children of it carry and
+  UE 4.27's UCLASS specifiers, a game Blueprint's read off its package. A native parent neither describes gets the
+  flags of the kind of parent (actor, actor component, function library, anything else), within Object, config
+  Engine; so does every parent with a UeApi generated before the markers existed.
 - A class that is not an actor has no construction script, so `UE_COMPONENT` in it is refused: "only an actor has a
   construction script". See [Components](#components).
 - A latent call such as `Delay` finds its world by itself in an actor, actor component, user widget, game instance or
@@ -1016,7 +1019,9 @@ copies it, as in C++.
 |---|---|---|
 | `FVector(1, 2, 3)`, `FLinearColor(1, 0.5f, 0, 1)` | A whole-struct constructor: one struct value (a Make node) built from the arguments, which can be any expressions. | Yes |
 | `FColor(255, 128, 0)` | R, G, B and A, with A 255 when left out, like the engine's constructor. Each argument lands on the member its parameter is named after, although FColor stores B, G, R, A. | Yes |
-| `FVector()`, `FQuat()`, `FTransform()` | All zeros, for a struct that has a whole-struct constructor. `FTransform()` is all zeros too, Scale3D included: it is not the identity. | Yes |
+| `FLightmassDirectionalLightSettings(1.5f, 2.5f, true, 4.5f)` | A struct with a parent struct: the arguments come in C++ order, the parent's members first, and each lands on its member (the engine lists the struct's own members first). | Yes |
+| `FMaterialAttributesInput(3, "In", "Ex", 9)` | A member the engine marks Transient (here PropertyConnectedBitmask) is not part of a struct literal, as in the engine: a constant given for it is dropped with a warning, anything else is refused. The member reads zero. | Warns |
+| `FVector()`, `FQuat()`, `FTransform()` | All zeros, for a struct that has a whole-struct constructor. `FTransform()` is all zeros too, Scale3D included: it is not the identity. `FTimerHandle()` writes no member at all: its one member is Transient. | Yes |
 | `FHitResult()`, `FStats{}` | Make Struct with nothing set, for a struct without a whole-struct constructor: the struct keeps its own defaults (`FHitResult::Time` is 1). | Yes |
 | `FStats S = {.Kills = K, .Alive = true};` | Make Struct: a fresh value, then one store for each member given. Members left out keep the struct's defaults. | Yes |
 | `KillsOf({.Kills = K})` | A braced value as an argument. | Yes |
@@ -1201,6 +1206,7 @@ needs a container variable, not one a call returns.
 | `Scores.Add(7)` | A method is the Blueprint node, with the container as its target. The methods are listed under the table. `Add` returns the new index. | Yes |
 | `Scores.Num()` | The same as `Length()`. | Yes |
 | `Weights.Find("alpha", W)` | Results come back through reference parameters: `Find(Key, Out)` on a map, `Get(Index, Out)`, `Keys(OutArray)`, `Random(OutItem, OutIndex)`, `Seen.Union(Other, Result)`. | Yes |
+| `Seen.ToArray(List)`, `Weights.Keys(Names)`, `GetAllActorsOfClass(C, Found)` | An array an engine function only fills is emptied just before the call, as the editor does, so afterwards it holds exactly what the call put there: `ToArray` itself would add to what `List` held. An array the function also reads (`UPARAM(ref)`, such as RunAssetsThroughFilter's) is passed as it is. | Yes |
 | `Items.Remove(2)` | Removes the element at index 2 (the Remove Index node). UE C++'s `Remove(Item)` removes by value; this does not. | Yes |
 | `Items.RemoveItem(2)` | Removes the elements equal to 2 (the Remove node). | Yes |
 | `Items.Find(5)` | The index of 5, or -1. | Yes |
@@ -4003,8 +4009,10 @@ Notes:
 - An empty stub stands in for every function left out, including those along the chain of an interface that extends
   another. Without it, a call through the interface would reach the interface's own function.
 - The native-only message names the first such function in alphabetical order.
-- The already-implemented check sees only mod ancestors. A native parent that already implements the interface is not
-  detected.
+- The already-implemented check sees mod ancestors, and native ones only for the interfaces UeApi lists on them
+  (`UeNativeInterfaces`): the dump lists no class's interfaces, so genueapi takes, with `--game`, those a game
+  Blueprint shows by overriding one's function. A method named like a function of such an interface is an override of
+  it, as `OnMessageAI` (ITriggerAI) is in an `AWoodLouse` child: its parameters must match.
 - For some of these base lists clang also prints a harmless warning, "direct base 'IAimable' is inaccessible due to
   ambiguity".
 
@@ -5485,6 +5493,10 @@ and where the feature is described. In each group, the messages you are most lik
   whole-struct literal cannot hold, such as weak pointers, delegates or bitfields. The SDK gives such structs no
   constructor that takes every member, so clang usually refuses the call first. Fix: designated braces, as the message
   shows, `FHitResult H = { .Time = 0.5f };`. Members you leave out keep the struct's defaults. See [Structs](#structs).
+- `<Struct>::<Member> is Transient, which a struct literal cannot set: give it a constant, or set the member after`: a
+  whole-struct constructor call computes the value of a member the engine never writes from a struct literal. Fix: pass
+  a constant there (it is dropped with a warning), and set the member with its own statement if it matters. See
+  [Structs](#structs).
 - `<Struct> literal must give every field (<N>)`, `<Struct> takes one value per member (<N>), in declaration order:
   <Member>` and `<Type> has no member for value <N>`: rare. A struct value is built with a constructor call or braces
   that give a different number of values than the struct has members. Fix: designated braces that name the members you
@@ -5879,7 +5891,8 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   `TScriptInterface<IMarkable>`. Fix: reach it on `this` in an implementing class, or through a pointer typed as that
   class, `Cast<Beacon>(Obj)->Marks`. See [Interfaces](#interfaces).
 - `<Class> implements <Interface>, which its parent <Ancestor> already implements (through <Other>)`: a class lists an
-  interface that a mod parent already implements, directly or through an interface that extends it. The
+  interface that a parent already implements (a mod one, or a native one UeApi lists it on), directly or through an
+  interface that extends it. The
   ` (through <Other>)` part appears only in the second case. Fix: drop the interface from the child and override its
   functions as ordinary methods. See [Interfaces](#interfaces).
 - `<Class> implements <Other> and <Interface>, which both extend <Common>`: two listed interfaces share a link in their

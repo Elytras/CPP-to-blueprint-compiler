@@ -146,9 +146,6 @@ def refused(mod, body, why, top=''):
 PENDING = os.path.join(TESTS, 'pending')
 GAPS, FIXED, REFUSALS = [], [], {}
 KNOWN_RULES = {     # sweep rules the suite's own packages still break, each with the AssetGen defect (TODO.md, S33)
-    'class_tail_follows_parent': 'the class tail is hard-coded (ClassWithin Object, ClassConfigName Engine, ClassFlags '
-                                 'guessed from ancestry) instead of taken from the parent',
-    'native_out_arrays_emptied': "a native's out TArray is not emptied before the call, so Set_ToArray appends",
 }
 
 
@@ -3753,7 +3750,7 @@ TAIL_META = {
 
 def tail_meta(name):
     def test():
-        base = pending_asset('ClassTailMeta', name)
+        base = os.path.join(os.path.dirname(asset('ClassTailMeta')), name)
         tail_facts(base, *TAIL_META[name])
         keeps_invariants(base)
         if name == 'ClassTailMeta':
@@ -3866,9 +3863,11 @@ parm_width()
 parm_over()
 parm_huge()
 for _name, (_parent, _bits, _within, _config) in TAIL_META.items():
-    pending('ClassTailMeta %s: %s\'s tail (flags %#x, within %s, config %s)' % (_name, _parent.split('.')[-1], _bits,
-                                                                               _within.split('.')[-1], _config), tail_meta(_name))
-pending('OverrideTest Walker: ClassConfigName Game, ACharacter\'s', walker_config)
+    tail_meta(_name)()
+    print('ok  ClassTailMeta %s: %s\'s tail (flags %#x, within %s, config %s)' % (_name, _parent.split('.')[-1], _bits,
+                                                                                 _within.split('.')[-1], _config))
+walker_config()
+print('ok  OverrideTest Walker: ClassConfigName Game, ACharacter\'s')
 instanced_refs()
 for _mod, (_src, _member, _oracle, _what) in SHADOWS.items():
     refused_or_distinct(_mod, _src, _member, _oracle)
@@ -3992,7 +3991,7 @@ def func_qualified_call():
 def func_ancestor_iface():
     """FuncAncestorIface: OnMessageAI on an AWoodLouse child replaces /Script/FSD.TriggerAI:OnMessageAI - linked as its
     super with the interface function's inherited flags and parameters - and runs as written."""
-    base = pending_asset('FuncAncestorIface')
+    base = asset('FuncAncestorIface')
     pkg = invariants.Package(base)
     fi = pkg.find('OnMessageAI')
     me = {}
@@ -4010,12 +4009,12 @@ print('ok  FuncLocalDefaults: FText / FTransform / FHitResult / defaulted-struct
 func_cosmetic_static()
 print('ok  FuncCosmeticStatic: ApplyDamage / PlaySound2D keep their callspace routing (not EX_CallMath)')
 pending('FuncQualifiedCall: Parent::Fn() is bound to the parent\'s function, not dispatched by name', func_qualified_call)
-pending('FuncAncestorIface: an override of a native ancestor\'s interface function links it as super (TriggerAI:OnMessageAI)',
-        func_ancestor_iface)
-pending('FuncAncestorParams: an override of a native ancestor\'s interface function with other parameters is refused',
-        lambda: refused('FuncAncestorParams', '', 'OnMessageAI',
-                        top='class AncestorLouse : public AWoodLouse {\npublic:\n  int32 Seen;\n'
-                            '  void OnMessageAI(int32 TriggerName) { Seen = TriggerName; }\n};\n'))
+func_ancestor_iface()
+print('ok  FuncAncestorIface: an override of a native ancestor\'s interface function links it as super (TriggerAI:OnMessageAI)')
+refused('FuncAncestorParams', '', 'OnMessageAI',
+        top='class AncestorLouse : public AWoodLouse {\npublic:\n  int32 Seen;\n'
+            '  void OnMessageAI(int32 TriggerName) { Seen = TriggerName; }\n};\n')
+print('ok  FuncAncestorParams: an override of a native ancestor\'s interface function with other parameters is refused')
 # An override or an interface implementation keeps the parameters of the function it replaces: a caller lays them out
 # for that one (ProcessEvent, an interface's Execute_, a received RPC) and ProcessEvent copies them into this one's
 # frame (ScriptCore.cpp:1958-2016). Only a Blueprint event is replaced at all: C++ and bound calls keep a native one.
@@ -4428,7 +4427,7 @@ def drop_result():
 def out_array_reset():
     """A native's out TArray arrives empty (KismetCompilerVMBackend.cpp 1152-1174), so a native written against that
     contract - modelled here by one that only appends - leaves exactly what it found."""
-    base = pending_asset('OutArrayReset')
+    base = asset('OutArrayReset')
     found = Obj('Found_C')
 
     def appends(vm, ctx, wco, cls, out):         # a native written against the editor's contract: it only appends
@@ -4443,7 +4442,7 @@ def set_to_array_append():
     """The engine's own appending native: GenericSet_ToArray adds each element onto whatever Result holds
     (BlueprintSetLibrary.cpp 53-70), runscript's model below does the same for this test, and the editor empties Result
     first. So ToArray leaves exactly the set, and a range-for over a set in an outer loop sees it once per round."""
-    base = pending_asset('SetToArrayAppend')
+    base = asset('SetToArrayAppend')
     set_to_array_runs(base)
     vmsem_holds(base, 'native_out_arrays_emptied')
 
@@ -4512,26 +4511,29 @@ def derived_literal(fn, struct):
     """A native struct literal's members follow PropertyLink - the struct's own first, then its super's - and leave out
     Transient ones (ScriptCore.cpp 3376-3405; Class.cpp 944-982)."""
     vmsem_dump_has(struct)
-    vmsem_holds(pending_asset('DerivedLiteral'), 'struct_const_members', fn=fn)
+    vmsem_holds(asset('DerivedLiteral'), 'struct_const_members', fn=fn)
 
 
 ctx_null_call()
 print('ok  CtxNullCall: a call through a None object zeroes its Let destination (the context names its r-value)')
 drop_result()
 print('ok  DropResult: a discarded FString / TArray result lands in a local, not the 64-byte statement buffer')
-pending('OutArrayReset: a native\'s out TArray is emptied before the call', out_array_reset)
-pending('SetToArrayAppend: ToArray / a set range-for empty the array Set_ToArray appends to', set_to_array_append)
+out_array_reset()
+print("ok  OutArrayReset: a native's out TArray is emptied just before the call (EX_SetArray), so it holds only what the "
+      "call found")
+set_to_array_append()
+print('ok  SetToArrayAppend: ToArray and a set range-for empty the array Set_ToArray appends to')
 no_world_warning()
 local_ctor_flags()
 print('ok  LocalCtorFlags: FUNC_HasDefaults on a function with an FHitResult / FTransform / FText / TMap local')
 iface_cast_slot()
 print('ok  IfaceCastSlot: Cast<IHealth> takes the object out of its 16-byte interface value')
-pending('DerivedLiteral: a derived struct literal lists its own members before its super\'s',
-        lambda: derived_literal('Angle', '/Script/Engine.LightmassDirectionalLightSettings'))
-pending('DerivedLiteral: a struct literal leaves out Transient members',
-        lambda: derived_literal('Output', '/Script/Engine.MaterialAttributesInput'))
-pending('DerivedLiteral: FTimerHandle() writes no member (Handle is Transient)',
-        lambda: derived_literal('ResetHandle', '/Script/Engine.TimerHandle'))
+derived_literal('Angle', '/Script/Engine.LightmassDirectionalLightSettings')
+derived_literal('Output', '/Script/Engine.MaterialAttributesInput')
+assert 'FMaterialAttributesInput::PropertyConnectedBitmask is Transient' in LOGS['DerivedLiteral'], LOGS['DerivedLiteral']
+derived_literal('ResetHandle', '/Script/Engine.TimerHandle')
+print("ok  DerivedLiteral: a derived struct literal lists its own members before its super's, and leaves out Transient "
+      "ones (a value given for one is warned about); FTimerHandle() writes no member")
 
 
 # ---- UBER: ubergraphs along a class chain, their frames and names, latent resumes, awaits in overrides

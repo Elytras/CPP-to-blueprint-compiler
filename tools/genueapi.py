@@ -1,5 +1,9 @@
 ﻿#!/usr/bin/env python3
-"""usage: genueapi.py <SDK dir> <output dir>      e.g. C:/Dumper-7/<version>-FSD/SDK/SDK  BpMods/UeApi
+"""usage: genueapi.py <SDK dir> <output dir> [--game <Content dir>]
+       e.g. C:/Dumper-7/<version>-FSD/SDK/SDK  BpMods/UeApi  --game D:/DRGExtract/FSD-WindowsNoEditor/FSD/Content
+
+--game reads the game's cooked Blueprints for what the dump does not carry: each game Blueprint class's tail
+(UeClassTail) and the native interfaces a native class implements (UeNativeInterfaces, see native_interfaces).
 
 The SDK dir must sit in its Dumper-7 dump, two levels under GObjects-Dump-WithProperties.txt (see read_real_fields);
 a copy elsewhere (DrgMods/SDK/SDK) has no object dump beside it."""
@@ -148,8 +152,9 @@ def map_type(raw):
 class Struct(object):
     def __init__(self, cpp, base, path, ue_name, size):
         self.cpp, self.base, self.path, self.ue_name, self.size = cpp, base, path, ue_name, size
-        self.raw_fields = []     # (raw type, name) in offset order, own fields only
+        self.raw_fields = []     # (raw type, name, CPF_Transient) in offset order, own fields only
         self.fields = []         # (mapped type, name), base first, filled by resolve_structs
+        self.link = []           # the names EX_StructConst writes, in PropertyLink order: see resolve_structs
         self.complete = False    # every reflected field is emitted, so a constructor over all of them exists
         self.pkg = path[len("/Script/"):]
 
@@ -167,6 +172,7 @@ STRUCT_COMMENT = re.compile(r"^// ScriptStruct (\S+)\.(\w+)\s*$")
 STRUCT_SIZE = re.compile(r"^// 0x([0-9A-Fa-f]+) \(0x([0-9A-Fa-f]+) - 0x([0-9A-Fa-f]+)\)")
 # Dumper-7 writes alignas(N) when the struct's MinAlignment is more than its members give (FQuat, FPlane).
 STRUCT_DECL = re.compile(r"^struct (?:alignas\((0x[0-9A-Fa-f]+)\)\s+)?(\w+)(?:\s+final)?(?:\s*:\s*public\s+(\w+))?\s*$")
+TRANSIENT = re.compile(r"[(,]\s*Transient\s*[,)]")     # CPF_Transient, not DuplicateTransient / TextExportTransient
 
 
 def parse_structs(path, pkg):
@@ -212,11 +218,16 @@ def parse_structs(path, pkg):
         elif cur_struct is not None and "//" in line:
             m = FIELD.match(line)
             if m and not m.group(2).startswith(("Pad_", "BitPad_")):
-                cur_struct.raw_fields.append(("bool" if m.group(3) else m.group(1), m.group(2)))
+                # The flag comment, `(Edit, Transient, ...)`, or a bitfield's `(BitIndex: .., PropSize: .. (flags))`.
+                transient = bool(TRANSIENT.search(line[line.index("//"):]))
+                cur_struct.raw_fields.append(("bool" if m.group(3) else m.group(1), m.group(2), transient))
 
 
 def resolve_structs():
-    """Second pass: map field types now that every struct and enum name is known."""
+    """Second pass: map field types now that every struct and enum name is known. `fields` are C++'s order, the super's
+    members first, which the stub's constructor takes; `link` is what EX_StructConst writes: UStruct::Link fills
+    PropertyLink from TFieldIterator(this), the struct's own properties and then each super's (Class.cpp 944-982), and
+    execStructConst skips a Transient one (ScriptCore.cpp 3376-3405)."""
     done = set()
 
     def resolve(st):
@@ -226,14 +237,17 @@ def resolve_structs():
         base = STRUCTS.get(st.base)
         if base:
             resolve(base)
-        own, complete = [], base.complete if base else True
-        for raw, name in st.raw_fields:
+        own, link, complete = [], [], base.complete if base else True
+        for raw, name, transient in st.raw_fields:
             mapped = map_type(raw)
             if mapped in KINDS or mapped == "void" or any(s in mapped for s in NO_STRUCT_LITERAL):
                 complete = False
                 continue
             own.append((mapped, name))
+            if not transient:
+                link.append(name)
         st.fields = (base.fields if base else []) + own
+        st.link = link + (base.link if base else [])
         st.complete = complete and bool(st.fields)
 
     for st in list(STRUCTS.values()):
@@ -257,7 +271,7 @@ def struct_align(st):
     align = getattr(st, "explicit_align", 1)
     if st.base in STRUCTS:
         align = max(align, struct_align(STRUCTS[st.base]))
-    for raw, _ in st.raw_fields:
+    for raw, _, _ in st.raw_fields:
         t = re.sub(r"^(const|struct|class|enum)\s+", "", raw.strip())
         if t.endswith("*") or t.endswith("&"):
             a = 8
@@ -383,9 +397,13 @@ def write_types(out_dir):
     sts = sorted(STRUCTS.values(), key=lambda t: t.cpp)
     for i, st in enumerate(sts):
         fields = ", ".join('["%s", "%s"]' % (t, n) for t, n in st.fields)
-        rows.append('    "%s": {"package": "%s", "name": "%s", "size": %d, "align": %d, "complete": %s, "fields": [%s]}%s'
+        # A literal's member order where it is not `fields`': a struct with a super and members of its own, or one with
+        # a Transient member. Only a complete struct takes a literal at all.
+        link = ', "link": [%s]' % ", ".join('"%s"' % n for n in st.link) \
+            if st.complete and st.link != [n for _, n in st.fields] else ""
+        rows.append('    "%s": {"package": "%s", "name": "%s", "size": %d, "align": %d, "complete": %s, "fields": [%s]%s}%s'
                     % (st.cpp, st.path, st.ue_name, st.size, struct_align(st), "true" if st.complete else "false",
-                       fields, "," if i + 1 < len(sts) else ""))
+                       fields, link, "," if i + 1 < len(sts) else ""))
     rows += ['  }', '}']
     io.open(os.path.join(out_dir, "Types.json"), "w", encoding="utf-8", newline="\n").write("\n".join(rows) + "\n")
     print("  types: %d enums, %d structs (%d complete)"
@@ -533,21 +551,27 @@ def read_real_fields(sdk_dir):
 # ITS arguments read last (`Conv_TextToString(Conv_Int64ToText(Big))` read the int64 as an FText and crashed DRG). So
 # such a parameter stays `const T&` in the header, and AssetGen gives a computed argument a local of its own first.
 # Dumper-7 spells a by-value move type `const T&` too; only the flag comment in <Pkg>_parameters.hpp tells them apart.
-PARAM_FUNC = re.compile(r"^// Function \S+\.(\w+)\.(.+)$")
+PARAM_FUNC = re.compile(r"^// Function (\S+)\.(\w+)\.(.+)$")
 PARAM_LINE = re.compile(r"^\t(.+?)\s+(\w+)(?:\[\w+\])?;\s+// 0x\w+\(0x\w+\)\((.*)\)\s*$")
 REF_PARMS = {}       # (class, engine function name) -> {parameter spellings that are const references}
+# Before calling a native, the editor empties each TArray parameter that is CPF_OutParm and none of ReferenceParm /
+# ConstParm / ReturnParm, "in case the native function doesn't clear them before filling" (KismetCompilerVMBackend.cpp
+# 1152-1174), and a native such as GenericSet_ToArray relies on it, appending (BlueprintSetLibrary.cpp 53-70). UeApi
+# spells that array `T&`, as it does a UPARAM(ref) one the native reads (AssetRegistry's RunAssetsThroughFilter):
+# only the flags tell them apart, so OutArrays.json names them.
+OUT_ARRAYS = {}      # (package leaf, class, engine function name) -> [index among the parameters, return left out]
 
 
 def read_ref_parms(sdk_dir):
     for name in os.listdir(sdk_dir):
         if not name.endswith("_parameters.hpp"):
             continue
-        cur = None
+        cur, at = None, 0
         for line in io.open(os.path.join(sdk_dir, name), encoding="utf-8", errors="replace"):
             line = line.rstrip("\r\n")
             m = PARAM_FUNC.match(line)
             if m:
-                cur = (m.group(1), m.group(2).rstrip())
+                cur, at = (m.group(1).rsplit("/", 1)[-1], m.group(2), m.group(3).rstrip()), 0
                 continue
             if line.startswith("};"):
                 cur = None
@@ -556,7 +580,13 @@ def read_ref_parms(sdk_dir):
             if p:
                 flags = p.group(3).split(", ")
                 if "ReferenceParm" in flags and "ConstParm" in flags and "ReturnParm" not in flags:
-                    REF_PARMS.setdefault(cur, set()).add(p.group(2))
+                    REF_PARMS.setdefault(cur[1:], set()).add(p.group(2))
+                if "Parm" not in flags or "ReturnParm" in flags:
+                    continue                            # Dumper-7's padding, or the return value
+                if p.group(1).startswith("TArray<") and "OutParm" in flags \
+                        and not ("ReferenceParm" in flags or "ConstParm" in flags):
+                    OUT_ARRAYS.setdefault(cur, []).append(at)
+                at += 1
 
 
 def const_ref(t):
@@ -889,6 +919,7 @@ FUNC_BITS = {"Final": 0x1, "RequiredAPI": 0x2, "BlueprintAuthorityOnly": 0x4, "B
 # may still move a random stream or build an object.
 IMPURE_PURE = re.compile(r"Random|Now$|Today$|Create|Construct|Spawn|^New|^Make.*Object|Seed")
 PURE = set()     # (class, function) of every BlueprintPure function, filled by write_events
+NATIVE = set()   # (package leaf, class, function) of every FUNC_Native function, filled by write_events
 MARKS = {}       # (class, function) -> "UE_SERVER UE_RELIABLE " and the like, filled by write_events
 MARK_OF = (("NetServer", "UE_SERVER"), ("NetClient", "UE_CLIENT"), ("NetMulticast", "UE_MULTICAST"),
            ("NetReliable", "UE_RELIABLE"), ("BlueprintAuthorityOnly", "UE_AUTHORITY_ONLY"), ("BlueprintCosmetic", "UE_COSMETIC"))
@@ -908,6 +939,8 @@ def write_events(sdk_dir, out_dir):
                              r"[^\n(]*?((?:\w+::)*\w+)::(\w+)\(", text, re.M):
             pkg, cls, real, names = m.group(1), m.group(2), m.group(3).rstrip(), m.group(4).split(", ")
             REAL_FUNCS[(stem, m.group(5), m.group(6))] = real
+            if "Native" in names:
+                NATIVE.add((pkg, cls, real))
             if "BlueprintPure" in names:
                 PURE.add((cls, real))
             marks = "".join(mark + " " for flag, mark in MARK_OF if flag in names)
@@ -917,6 +950,113 @@ def write_events(sdk_dir, out_dir):
                 rows.append('  %s: %d' % (json.dumps("%s.%s.%s" % (pkg, cls, real)), sum(FUNC_BITS[n] for n in names)))
     io.open(os.path.join(out_dir, "Events.json"), "w", encoding="utf-8", newline="\n").write("{\n" + ",\n".join(rows) + "\n}\n")
     print("  events: %d" % len(rows))
+
+
+def write_out_arrays(out_dir):
+    """OutArrays.json: "Package.Class.Function" -> the parameter indices (the return value not counted) of each native
+    function's out arrays, which the compiler empties just before the call as the editor does (see OUT_ARRAYS). Only a
+    FUNC_Native function: the editor leaves a script callee's alone. Run after write_events, which collects NATIVE."""
+    keys = sorted(k for k in OUT_ARRAYS if k in NATIVE)
+    rows = ['  %s: %s' % (json.dumps("%s.%s.%s" % k), json.dumps(OUT_ARRAYS[k])) for k in keys]
+    io.open(os.path.join(out_dir, "OutArrays.json"), "w", encoding="utf-8", newline="\n").write("{\n" + ",\n".join(rows) + "\n}\n")
+    print("  native out arrays: %d functions" % len(rows))
+
+
+SCRIPT_INHERIT = 0x4AA1364E         # CLASS_ScriptInherit, ObjectMacros.h:249-259
+OBJECT_PATH = "/Script/CoreUObject.Object"
+DEFAULT_TAIL = (0, OBJECT_PATH, "Engine")   # UObject's: Object.h:57-60
+
+
+def scan_game(content):
+    """What the game's cooked Blueprints show that the dump does not: {class path: (its ScriptInherit ClassFlags,
+    ClassWithin, ClassConfigName, super path)}, and each (class path, interface path) where a function of the class
+    has a native interface's function as its super. An implementation of an interface of the class's own list has no
+    super (measured on BP_SentryGun_MoveMarker), so such a pair is an interface a native ancestor implements."""
+    import invariants
+    classes, overrides = {}, set()
+    for base in invariants.packages([content]):
+        p = invariants.Package(base)
+        for i, e in enumerate(p.exports):
+            kind = p.class_of(i + 1)
+            if kind.endswith("GeneratedClass"):
+                st = p.struct(i)
+                if st is not None and hasattr(st, "class_flags"):
+                    classes[p.path(i + 1)] = (st.class_flags & SCRIPT_INHERIT, p.path(st.within) if st.within else OBJECT_PATH,
+                                              st.config, p.path(e["super"]))
+            elif kind == "Function" and e["super"] < 0:
+                sup = p.path(e["super"])
+                if sup.startswith("/Script/") and ":" in sup:
+                    overrides.add((p.path(e["outer"]), sup.split(":")[0]))
+    print("  game Blueprints scanned: %d classes, %d native-super functions" % (len(classes), len(overrides)))
+    return classes, overrides
+
+
+def class_tails(classes, by_name, game):
+    """{class: "<ScriptInherit ClassFlags> <ClassWithin> <ClassConfigName>"}, what a Blueprint child copies
+    (KismetCompiler.cpp:320-321, 2450-2453), for each class whose tail is not its parent's: AssetGen takes the nearest
+    one up the chain. A native class's comes from the class_tail invariant rule's tables - what every game Blueprint
+    child of the class carries, and the UCLASS specifiers of UE 4.27 - with UHT's inheritance (native_tail there): the
+    super's bits but the four a specifier clears, and the Within and config name of the nearest class that states
+    them. A game Blueprint's is read off its package (scan_game); one the game content lacks has its parent's."""
+    from invariant_rules.class_tail import NATIVE_TAILS, SOURCE_TAILS, UHT_CLEARABLE
+    memo = {}
+
+    def tail(k):
+        if k is None:
+            return DEFAULT_TAIL
+        if k.cpp not in memo:
+            path = k.path + "." + k.ue_name
+            if k.is_bp:
+                memo[k.cpp] = game[path][:3] if path in game else tail(by_name.get(k.base))
+            else:
+                bits, within, config, c = 0, None, None, k
+                while c is not None:
+                    p = c.path + "." + c.ue_name
+                    rows = [r for r in (NATIVE_TAILS.get(p), SOURCE_TAILS.get(p)) if r]
+                    for r in rows:
+                        bits |= r[0] if c is k else r[0] & ~UHT_CLEARABLE
+                    if rows and within is None:
+                        within, config = rows[0][1], rows[0][2]
+                    c = by_name.get(c.base) if c.base else None
+                memo[k.cpp] = (bits, within or OBJECT_PATH, config or "Engine")
+        return memo[k.cpp]
+
+    out = {}
+    for k in classes:
+        t = tail(k)
+        if t != tail(by_name.get(k.base) if k.base else None):
+            out[k.cpp] = "0x%08x %s %s" % t
+    print("  class tails: %d classes" % len(out))
+    return out
+
+
+def native_interfaces(classes, by_name, game, overrides):
+    """{native class: [interface C++ names]}: for each game Blueprint function whose super is a native interface's
+    function, the interface goes on the Blueprint's nearest native ancestor, unless one of its ancestors has it. The
+    dump lists no class's interfaces; the Kismet compiler finds such a super through the parent's Interfaces
+    (UClass::FindFunctionByName, Class.cpp:5281-5323)."""
+    by_path = dict((k.path + "." + k.ue_name, k) for k in classes)
+    found = {}
+    for cls, iface in overrides:
+        i = by_path.get(iface)
+        if not i or i.is_bp or i.base or not i.cpp.startswith("I"):
+            continue
+        for _ in range(64):
+            if cls is None or cls.startswith("/Script/"):
+                break
+            cls = game.get(cls, (0, 0, 0, None))[3]
+        if cls in by_path:
+            found.setdefault(by_path[cls].cpp, set()).add(i.cpp)
+    out = {}
+    for cpp, ifaces in found.items():
+        up, inherited = by_name[cpp].base, set()
+        while up:
+            inherited |= found.get(up, set())
+            up = by_name[up].base if up in by_name else None
+        if ifaces - inherited:
+            out[cpp] = sorted(ifaces - inherited)
+    print("  native interfaces: %d classes" % len(out))
+    return out
 
 
 def write_containers(classes, sdk_dir, out_dir):
@@ -957,9 +1097,15 @@ def write_containers(classes, sdk_dir, out_dir):
 
 
 def main():
-    if len(sys.argv) < 3:
+    args = sys.argv[1:]
+    game_dir = None
+    if "--game" in args:
+        at = args.index("--game")
+        game_dir = args[at + 1] if at + 1 < len(args) else None
+        del args[at:at + 2]
+    if len(args) < 2 or ("--game" in sys.argv and not game_dir):
         sys.exit(__doc__.strip().splitlines()[-1])
-    sdk_dir, out_dir = sys.argv[1], sys.argv[2]
+    sdk_dir, out_dir = args[0], args[1]
 
     for name in sorted(f for f in os.listdir(sdk_dir) if f.endswith("_structs.hpp")):
         parse_structs(os.path.join(sdk_dir, name), name[: -len("_structs.hpp")])
@@ -1007,6 +1153,9 @@ def main():
 
     by_name = dict((k.cpp, k) for k in classes)
     map_subobjects(classes, by_name)
+    game, overrides = scan_game(game_dir) if game_dir else ({}, set())
+    tails = class_tails(classes, by_name, game)
+    ifaces = native_interfaces(classes, by_name, game, overrides)
     ordered, seen = [], set()
 
     def place(k):
@@ -1069,6 +1218,7 @@ def main():
     conv_structs = write_conversions(ordered, out_dir)
     write_containers(ordered, sdk_dir, out_dir)
     write_events(sdk_dir, out_dir)
+    write_out_arrays(out_dir)
     ops_by_pkg = write_operators(ordered, out_dir)
     write_types(out_dir)
 
@@ -1145,6 +1295,10 @@ def main():
                         % (k.ue_name if k.is_bp else k.cpp, inherits, k.path, k.ue_name))
             short = short_names(k)
             body += ["    using %s = %s;" % (leaf, short[leaf]) for leaf in sorted(short)]
+            if k.cpp in tails:
+                body.append('    static constexpr const char* UeClassTail = "%s";' % tails[k.cpp])
+            if k.cpp in ifaces:
+                body.append('    static constexpr const char* UeNativeInterfaces = "%s";' % " ".join(ifaces[k.cpp]))
             names = set(f for _, _, f, _ in k.funcs)
             for ftype, fname in k.fields:
                 if fname in names:

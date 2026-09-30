@@ -214,7 +214,8 @@ void FBlueprintClass::Finish()
     const std::string CDOName = "Default__" + ClassName;
 
     const FIndex BpgcClass = EngineClass("/Script/Engine", "BlueprintGeneratedClass");
-    const FIndex ObjectClass = EngineClass("/Script/CoreUObject", "Object");
+    const bool bWithinObject = WithinPackage == "/Script/CoreUObject" && WithinClass == "Object";
+    const FIndex ObjectClass = bWithinObject ? EngineClass("/Script/CoreUObject", "Object") : Null();
     const FIndex FunctionClass = EngineClass("/Script/CoreUObject", "Function");
     const FIndex EnginePkg = PackageImport("/Script/Engine");
     const FIndex CorePkg = PackageImport("/Script/CoreUObject");
@@ -299,6 +300,10 @@ void FBlueprintClass::Finish()
         if (V.Extra.V != 0 && std::find(Class.CreateBeforeSer.begin(), Class.CreateBeforeSer.end(), V.Extra.V) == Class.CreateBeforeSer.end())
             Class.CreateBeforeSer.push_back(V.Extra.V);
     for (FIndex I : Interfaces) Class.CreateBeforeSer.push_back(I.V);  // as BP_SentryGun_MoveMarker lists Targetable
+    /* ABP_Amber_Depositbox lists its ClassWithin, SkeletalMeshComponent, there too; UObject is listed nowhere. */
+    const FIndex Within = bWithinObject ? ObjectClass : EngineClass(WithinPackage, WithinClass);
+    if (!bWithinObject) Class.CreateBeforeSer.push_back(Within.V);
+    const std::string Config = ConfigName;
     const std::vector<FIndex> ClassInterfaces = Interfaces;
     const std::vector<FPropertyDef> ClassVars = Vars;
     const bool bActor = bIsActor;
@@ -340,8 +345,8 @@ void FBlueprintClass::Finish()
         }
 
         Ar.U32(Flags);                              // ClassFlags
-        Ar.Idx(ObjectClass);                        // ClassWithin
-        Ar.Name("Engine");                          // ClassConfigName
+        Ar.Idx(Within);                             // ClassWithin
+        Ar.Name(Config);                            // ClassConfigName
         Ar.Idx(Null());                             // ClassGeneratedBy
         Ar.I32(int32(ClassInterfaces.size()));      // Interfaces: class, PointerOffset, bImplementedByK2
         for (FIndex I : ClassInterfaces) { Ar.Idx(I); Ar.I32(0); Ar.Bool(true); }
