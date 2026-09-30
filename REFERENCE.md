@@ -2040,7 +2040,7 @@ Notes:
 | `void Around(int32 A, int32 &Lo, int32 &Hi)` | A pass-by-reference pin: writes reach the caller's variable, member or array element. This is how a function returns several values. | Yes |
 | `int32 Plus1(const int32 &A)` | Passed by reference, with no copy. A literal or computed argument is first stored in a hidden local, as the editor's compiler does, because the VM needs an address. | Yes |
 | `int32 Times(int32 X, int32 By = 3)` | A call that leaves the argument out passes the default expression, evaluated at that call each time, as in C++. This holds for Blueprint functions and inline ones. | Yes |
-| A function that calls Delay or UE_AWAIT and returns a value or takes a `T&` | Refused: `a function that resumes later returns nothing and takes no reference parameters`. Store the result in a member; see [Latent calls](#latent-calls). | Refused |
+| A function that calls Delay or UE_AWAIT and returns a value or takes a non-const `T&` | Refused: `a function that resumes later returns nothing and takes no non-const reference parameters`. Store the result in a member; see [Latent calls](#latent-calls). | Refused |
 
 ```cpp
 int32 N;
@@ -4339,8 +4339,8 @@ Notes:
 A latent call finishes later: `Delay`, `RetriggerableDelay`, the async loads, and every engine or game function with
 an `FLatentActionInfo` parameter. A method that makes one moves into the class's event graph, the ubergraph named
 `ExecuteUbergraph_<Class>`, as an editor event with a Delay node does. Its locals and parameters live in that graph's
-frame, one per object. The rule to remember: a method that waits returns `void`, takes no reference parameters and is
-not `static`, and its caller carries on as soon as it reaches its first wait.
+frame, one per object. The rule to remember: a method that waits returns `void`, takes no non-const reference parameters
+and is not `static`, and its caller carries on as soon as it reaches its first wait.
 [examples/WaitForPlayer.cpp](examples/WaitForPlayer.cpp) waits in a loop until the player exists.
 
 ### Waiting with Delay
@@ -4458,8 +4458,9 @@ Notes:
 | You write | What it does | Status |
 |---|---|---|
 | `static void Later(UObject *WorldContextObject)` with a Delay inside | Refused: "a static function has no object whose ubergraph frame could keep its locals". | Refused |
-| `int32 CountLater()` with a Delay inside | Refused: "a function that resumes later returns nothing and takes no reference parameters". The caller gets control back at the first wait, before there is a value. Store the result in a member, or broadcast a dispatcher when done. | Refused |
-| `void SayLater(const FString &Msg)` with a Delay inside | Refused with the same message: the reference would point into a frame that is gone when the method resumes. Any `T &` parameter counts, `const` or not. Take it by value. | Refused |
+| `int32 CountLater()` with a Delay inside | Refused: "a function that resumes later returns nothing and takes no non-const reference parameters". The caller gets control back at the first wait, before there is a value. Store the result in a member, or broadcast a dispatcher when done. | Refused |
+| `void SayLater(const FString &Msg)` with a Delay inside | Msg is copied into the event graph's frame when the method is called, through EX_LocalOutVariable, as the editor's event stubs copy one (a ReceiveHit's `const FHitResult &Hit`); the code after the wait reads that copy. | Yes |
+| `void FillLater(int32 &Out)` with a Delay inside | Refused with the CountLater message: a write after the wait would land in the frame's copy, the caller having gone on. Store the result in a member. | Refused |
 | a Delay in a `UObject` child class | Warns: "finds its world only through its Outer". Actor, ActorComponent, UserWidget, GameInstance and Subsystem classes have a world of their own; any other object uses its Outer's. Make the object with an actor or component as its Outer, or the wait does nothing and the method never resumes. The editor offers Delay only where the class has a world. | Warns |
 | `V = __Read64__(Addr);` in a method that waits | Refused: "a pointer read in a function that makes a latent call". Move the read into a separate non-inline method that does not wait, and call that. See [Pointers and memory](#pointers-and-memory). `GetOuter()` and `GetTypedOuter` read memory too and are refused the same way (see [Working with other objects](#working-with-other-objects)). | Not yet |
 | `void ExecuteUbergraph_Door(int32 EntryPoint);` | Refused: "ExecuteUbergraph_<Class> is the name of a class's ubergraph". The engine resumes a class's latent calls through that function, found by name on the object, so a method of that name in the class or a subclass would catch them. | Refused |
@@ -4513,8 +4514,8 @@ void LoadNow() {
 
 Notes:
 
-- The method that loads follows every rule above: it returns `void`, takes no reference parameters and is not
-  `static`.
+- The method that loads follows every rule above: it returns `void`, takes no non-const reference parameters and
+  is not `static`.
 - UeApi's overload leaves out the completion delegate. AssetGen binds a generated event to it, named
   `<Method>_<DelegateParam>_<N>`, which stores the value before the method resumes. Here they are `LoadAll_OnLoaded_0`
   and `LoadAll_OnLoaded_1`, and they show in the class's function list. Any latent function with exactly one completion
@@ -4571,7 +4572,7 @@ the game's dispatchers and one of its own, and its comments show the async-actio
 | `int32 Code = UE_AWAIT(OnReady);` | The object in front of the dispatcher may be self, a member or a local. | Yes |
 | the code after the await, on a later broadcast | The generated event stays bound, so each later broadcast runs the code after the await again: it acts as a handler, not a one-shot wait. The event has no name you can write, so only `Clear()` on the dispatcher stops it, and that drops every binding. | Yes |
 | `UE_AWAIT(OnScored);` on a dispatcher of two or more parameters | Compiles as a statement and resumes, but the values are dropped: `UE_AWAIT` has a value only for a dispatcher of exactly one parameter. Bind a handler to read them. | Not yet |
-| `bool WaitDone() { UE_AWAIT(Proxy->OnCompleted); return true; }` | Refused with the latent messages ("a function that resumes later returns nothing and takes no reference parameters"; for a static method, "a static function has no object whose ubergraph frame could keep its locals"). A method that awaits returns `void`, takes no reference parameters and is not `static`. | Refused |
+| `bool WaitDone() { UE_AWAIT(Proxy->OnCompleted); return true; }` | Refused with the latent messages ("a function that resumes later returns nothing and takes no non-const reference parameters"; for a static method, "a static function has no object whose ubergraph frame could keep its locals"). A method that awaits returns `void`, takes no non-const reference parameters and is not `static`. | Refused |
 | `UE_AWAIT(UAsyncTaskDownloadImage::DownloadImage(Url)->OnSuccess);` | Refused: "keep the object in a variable, it is used twice", once for the bind and once for `Activate()`. | Refused |
 | `UE_AWAIT(Temp);` on a local delegate | Refused: `UE_AWAIT` takes a dispatcher property of an object. A multicast delegate as a local or a parameter is refused before `UE_AWAIT` sees it ("unimplemented local"). A single-cast `TDelegate` cannot be awaited at all. | Refused |
 | `Task->OnSuccess.Add(this, &Door::Done);` | Callback style: a handler per outcome, and the method does not wait. `Add` never calls `Activate()`, so call `Task->Activate()` yourself after binding. See [Event dispatchers](#event-dispatchers). | Yes |
@@ -5873,11 +5874,12 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
 
 ### Replication, RPCs and latent calls
 
-- `latent call <Callee>: a function that resumes later returns nothing and takes no reference parameters`: a latent
-  call such as `UKismetSystemLibrary::Delay` in a function that returns a value or takes a reference parameter,
-  `const&` included. The code after the wait resumes in the class's event graph, which has no return value or out
-  parameter. After UE_AWAIT the message starts `UE_AWAIT: ` instead of `latent call <Callee>: `. Fix: return void, take
-  parameters by value, and keep results in member variables. See [Latent calls](#latent-calls).
+- `latent call <Callee>: a function that resumes later returns nothing and takes no non-const reference parameters`: a
+  latent call such as `UKismetSystemLibrary::Delay` in a function that returns a value or takes a non-const
+  reference parameter. The code after the wait resumes in the class's event graph, which has no return value or
+  out parameter: a `const&` is copied into it, a write through any other would be lost. After UE_AWAIT the message
+  starts `UE_AWAIT: ` instead of `latent call <Callee>: `. Fix: return void, take parameters by value or `const&`,
+  and keep results in member variables. See [Latent calls](#latent-calls).
 - `latent call <Callee>: a static function has no object whose ubergraph frame could keep its locals`: a latent call,
   or UE_AWAIT (`UE_AWAIT: a static function ...`), in a static function. Fix: make it a non-static method. See
   [Latent calls](#latent-calls).

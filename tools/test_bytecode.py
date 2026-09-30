@@ -4162,7 +4162,7 @@ def opnd_callspace():
 def opnd_latent_hit():
     """OpndLatentHit: a latent call in an override of ReceiveHit, whose Hit is a const FHitResult&: the stub hands
     Hit to the ubergraph through EX_LocalOutVariable, and the body sees Hit's values before and after the Delay."""
-    base = pending_asset('OpndLatentHit')
+    base = asset('OpndLatentHit')
     keeps_invariants(base)
     vm = VM(base, {'Delay': latent_call})
     vm.call('ReceiveHit', None, None, None, False, None, None, None, {'Time': 0.25, 'Distance': 7.5})
@@ -4188,8 +4188,9 @@ opnd_dispatch_ref_refused()
 opnd_callspace()
 print('ok  OpndCallspace: an authority-only / cosmetic static is called through a context, so GetFunctionCallspace '
       'can absorb it')
-pending('OpndLatentHit: a latent call in an event override taking a const reference (ReceiveHit), the stub copying '
-        'it into the frame through EX_LocalOutVariable', opnd_latent_hit)
+opnd_latent_hit()
+print('ok  OpndLatentHit: a latent call in an event override taking a const reference (ReceiveHit), the stub copying '
+      'it into the frame through EX_LocalOutVariable')
 
 
 # ---- TYPING: literals, assignments, struct members, casts, returns, container literals, interface casts

@@ -553,9 +553,9 @@ public:
 
 Watch for:
 
-- A method that waits returns nothing, takes no reference parameters (`const&` included) and is not static. Anything
-  else is refused: a return value or a reference parameter with
-  `a function that resumes later returns nothing and takes no reference parameters`, a static method with
+- A method that waits returns nothing, takes no non-const reference parameters (a `const&` is copied when it is
+  called) and is not static. Anything else is refused: a return value or a `T&` parameter with
+  `a function that resumes later returns nothing and takes no non-const reference parameters`, a static method with
   `a static function has no object whose ubergraph frame could keep its locals`. Store a result in a member, or
   broadcast a dispatcher when the method is done.
 - Each object keeps one copy of a waiting method's locals, not one per call. Calling the method again before it
@@ -1764,7 +1764,7 @@ Each row gives the part of the message to look for, the reason, and what to writ
 | clang: `only virtual member functions can be marked 'override'` | The SDK declares engine functions non-virtual. The method's name alone makes the override. | `void ReceiveTick(float DeltaSeconds) { ... }` | [Overrides and parent calls](REFERENCE.md#overrides-and-parent-calls) |
 | `<Member>: a default is a value known when the mod is built - ...` | A member initializer is read when the mod is built and never runs, so it takes only a value known then. A class reference is not one yet. | Set it in `ReceiveBeginPlay`: `Kind = AActor::StaticClass();` | [Classes and variables](REFERENCE.md#classes-and-variables) |
 | `<Class>::UE_DEFAULTS: Charges is declared here - give it an initializer instead` | `UE_DEFAULTS` sets inherited variables and components, not the class's own. | `int32 Charges = 3;` | [Class defaults](REFERENCE.md#class-defaults) |
-| `latent call Delay: a function that resumes later returns nothing and takes no reference parameters` | The code after a wait resumes in the event graph, which has no return value and no out parameters. | Return `void`, take parameters by value and keep results in member variables | [Latent calls](REFERENCE.md#latent-calls) |
+| `latent call Delay: a function that resumes later returns nothing and takes no non-const reference parameters` | The code after a wait resumes in the event graph, which has no return value and no out parameters. | Return `void`, take parameters by value or `const&` and keep results in member variables | [Latent calls](REFERENCE.md#latent-calls) |
 | `static Calls lives in the ubergraph's frame, which only a function that makes a latent call runs in; make Calls a member` | A Blueprint function keeps nothing between calls (the ubergraph is the class's event graph). | A member variable | [Latent calls](REFERENCE.md#latent-calls) |
 | ``a delegate cannot bind Handle: an inline function is expanded where it is called, no UFunction (drop `inline`)`` | An inline method is pasted into its callers and is no function of the class. | Drop `inline` from the handler | [Event dispatchers](REFERENCE.md#event-dispatchers) |
 | ``TODO: a delegate can only bind a function of `this` `` | Not yet: the delegate binds the object whose code is running. | Bind a method of `this` that calls the other object: `void Forward(int32 P) { Other->Handle(P); }` | [Event dispatchers](REFERENCE.md#event-dispatchers) |

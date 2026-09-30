@@ -1874,7 +1874,8 @@ void EmitStmts(const std::vector<FStmtIR>& Stmts, FScript& S, FIndex SelfExp, FL
 }
 
 /* Renames the locals a list of statements names (a latent function's, moving into the ubergraph frame). Lowered
-   trees share nodes, so each one is renamed once. */
+   trees share nodes, so each one is renamed once. A const reference parameter's copy in the frame is a plain
+   variable there, no out parameter: its reads become EX_LocalVariable. */
 struct FLocalRenamer
 {
     const std::map<std::string, std::string>& To;
@@ -1884,6 +1885,7 @@ struct FLocalRenamer
     void Arg(FArgIR& A)
     {
         if (!Seen.insert(&A).second) return;
+        if (A.K == FArgIR::LocalOut && To.count(A.S)) A.K = FArgIR::Local;
         if (A.K == FArgIR::Local || A.K == FArgIR::LocalOut
             || (A.K == FArgIR::Call && A.Sub && A.Sub->Intrinsic == "__RefAtInline__")) Name(A.S);
         if (A.Sub) Call(*A.Sub);
@@ -11062,9 +11064,16 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         LatentCount = 0;
         Completions.clear();
         ActivatedActions.clear();
+        /* A const reference is only read, so the copy its stub makes into the ubergraph's frame is its value (the
+           Segments stubs below); a write through any other would land in that copy once the caller has gone on. */
+        bool bWritableRef = false;
+        ForEach(M, [&](const Json& C) {
+            const std::string T = TypeOf(C);
+            if (Kind(C) == "ParmVarDecl" && !T.empty() && T.back() == '&' && T.compare(0, 6, "const ") != 0) bWritableRef = true;
+        });
         LatentRefusal = IsStaticDecl(Decl) ? "a static function has no object whose ubergraph frame could keep its locals"
-                      : (!RetType.empty() && RetType != "void") || HasOutParm(Params)
-                          ? "a function that resumes later returns nothing and takes no reference parameters"
+                      : (!RetType.empty() && RetType != "void") || bWritableRef
+                          ? "a function that resumes later returns nothing and takes no non-const reference parameters"
                       : "";
         if (Fn.Body && !LowerBody(*Fn.Body, BP, Stmts, Locals, Err))
         {
@@ -11309,15 +11318,19 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         }, FUNC_UbergraphFunction | FUNC_HasDefaults | FUNC_Final);
 
         /* The stubs follow the ubergraph, so its body (and Entries) is written first. Measured on BP_LiftPod's
-           OnCompleted_*: each parm copied into the frame, then EX_LocalFinalFunction ExecuteUbergraph(offset). */
+           OnCompleted_*: each parm copied into the frame, then EX_LocalFinalFunction ExecuteUbergraph(offset). A const
+           reference is read through EX_LocalOutVariable, as BP_FireCracker's ReceiveHit stub reads Hit: a script caller
+           hands it only an out-parameter record, never a frame slot (ScriptCore.cpp 865-890). */
         for (size_t I = 0; I < Segments.size(); ++I)
         {
-            std::vector<std::pair<std::string, std::string>> Copies;
-            for (const FPropertyDef& P : Segments[I].Parms) Copies.emplace_back(P.Name, Segments[I].Rename.at(P.Name));
+            std::vector<std::tuple<std::string, std::string, bool>> Copies;
+            for (const FPropertyDef& P : Segments[I].Parms)
+                Copies.emplace_back(P.Name, Segments[I].Rename.at(P.Name), (P.PropertyFlags & CPF_OutParm) != 0);
             BP.AddFunction(UeNameOf(&R, Segments[I].Name), Segments[I].Super, Segments[I].Parms,
                            [Copies, Uber, Entries, I](FScript& S, FIndex SelfExp) {
-                for (const auto& [From, To] : Copies)
-                    S.LetValueOnPersistentFrame(To, Uber, [&, From](FScript& V) { V.LocalVariable(From, SelfExp); });
+                for (const auto& [From, To, bRef] : Copies)
+                    S.LetValueOnPersistentFrame(To, Uber, [&, From, bRef](FScript& V) {
+                        if (bRef) V.LocalOutVariable(From, SelfExp); else V.LocalVariable(From, SelfExp); });
                 S.LocalFinalFunction(Uber);
                 S.IntConst((*Entries)[I]);
                 S.EndFunctionParms();
