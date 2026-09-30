@@ -9928,6 +9928,112 @@ static int32 ImportInto(FCookedPackage& P, const std::string& Package, const FPa
 }
 
 /*
+An edit of export row Template, when it is a component template whose SCS node or override record carries valid cooked
+instancing data. A spawned actor builds such a component on the fast path: NewObject of the template's class, then only
+the properties the data's ChangedPropertyList names serialized over it from the template (SCS_Node.cpp:90-95,
+ActorConstruction.cpp:1013-1089, BlueprintGeneratedClass.cpp:1912-1953). The cooker scopes a root entry to the
+template's class, lists a struct member by member and an array element by element (BlueprintEditorUtils.cpp:9904-9988,
+10005). Edited is the tags the edit wrote, or null when it wrote part of one (a member, an element). The data stays
+valid when each is a whole property, not a struct or an array, that a root entry names at its array index; otherwise
+the edit would never reach a spawned component, so the data stops being valid (bHasValidCookedData false) and the node
+or record takes the slow path, which duplicates the whole template (SCS_Node.cpp:97-99). Each one dropped is named in
+Dropped. False, saying why, when the data does not read as tags.
+*/
+static bool DropStaleCookedData(FCookedPackage& P, int32 Template, const std::vector<FTag>* Edited,
+                                std::vector<std::string>& Dropped, std::string* Err)
+{
+    const int32 Class = P.Exports[size_t(Template)].Class;
+    auto Int = [](const FTag& T) { int32 V = 0; if (T.Value.size() >= 4) std::memcpy(&V, T.Value.data(), 4); return V; };
+    /* Data is one CookedComponentInstancingData's value, a tag list; bDropped when it was valid and is not now. */
+    auto Drop = [&](std::vector<uint8>& Data, bool& bDropped) {
+        std::vector<FTag> Tags;
+        size_t At = 0;
+        if (!ReadTags(P, Data, At, Tags)) return false;
+        FTag* Valid = nullptr;
+        const FTag* List = nullptr;
+        for (FTag& T : Tags)
+            if (P.Is(T.Name, "bHasValidCookedData")) Valid = &T;
+            else if (P.Is(T.Name, "ChangedPropertyList")) List = &T;
+        if (!Valid || !Valid->BoolVal) return true;
+        std::set<std::pair<std::string, int32>> Roots;
+        if (List && Int(*List) > 0)
+        {
+            size_t E = 4 + 49;          // the count, then an array of structs' inner tag
+            for (int32 I = 0; I < Int(*List); ++I)
+            {
+                std::vector<FTag> Entry;
+                if (!ReadTags(P, List->Value, E, Entry)) return false;
+                std::string Name;
+                int32 Index = 0, Scope = 0;     // a tag the struct's default (0, null) leaves out
+                for (const FTag& F : Entry)
+                    if (P.Is(F.Name, "PropertyName") && F.Value.size() >= 8)
+                    {
+                        FNameRef N;
+                        std::memcpy(&N.Index, F.Value.data(), 4);
+                        std::memcpy(&N.Number, F.Value.data() + 4, 4);
+                        Name = P.NameOf(N);
+                    }
+                    else if (P.Is(F.Name, "ArrayIndex")) Index = Int(F);
+                    else if (P.Is(F.Name, "PropertyScope")) Scope = Int(F);
+                if (Scope == Class) Roots.insert({ Lower(Name), Index });
+            }
+        }
+        if (Edited && std::all_of(Edited->begin(), Edited->end(), [&](const FTag& T) {
+                return !P.Is(T.Type, "StructProperty") && !P.Is(T.Type, "ArrayProperty")
+                    && Roots.count({ Lower(P.NameOf(T.Name)), T.ArrayIndex }) != 0; }))
+            return true;
+        Valid->BoolVal = 0;
+        Data.clear();
+        WriteTags(P, Tags, Data);
+        bDropped = true;
+        return true;
+    };
+    for (int32 K = 0; K < int32(P.Exports.size()); ++K)
+    {
+        const std::string Kind = P.ClassNameOf(P.Exports[size_t(K)].Class);
+        if (Kind != "SCS_Node" && Kind != "InheritableComponentHandler") continue;
+        std::vector<FTag> Tags;
+        size_t At = 0;
+        if (!ReadTags(P, P.Exports[size_t(K)].Payload, At, Tags)) continue;
+        const std::string Where = P.NameOf(P.Exports[size_t(K)].ObjectName);
+        for (FTag& T : Tags)
+        {
+            bool bDropped = false;
+            if (Kind == "SCS_Node" && P.Is(T.Name, "CookedComponentInstancingData"))
+            {
+                const auto Tmpl = std::find_if(Tags.begin(), Tags.end(), [&](const FTag& X) { return P.Is(X.Name, "ComponentTemplate"); });
+                if (Tmpl == Tags.end() || Int(*Tmpl) != Template + 1) continue;
+                if (!Drop(T.Value, bDropped)) { *Err = Where + "'s cooked instancing data does not read as tags"; return false; }
+            }
+            else if (Kind == "InheritableComponentHandler" && P.Is(T.Name, "Records") && Int(T) > 0)
+            {
+                /* An array of FComponentOverrideRecord: the count, the inner tag, each record's tag list. A bool's value
+                   is in its tag, so a record keeps its size and the inner tag its Size. */
+                std::vector<uint8> Out(T.Value.begin(), T.Value.begin() + std::min<size_t>(T.Value.size(), 4 + 49));
+                size_t E = 4 + 49;
+                for (int32 I = 0; I < Int(T); ++I)
+                {
+                    std::vector<FTag> Rec;
+                    if (!ReadTags(P, T.Value, E, Rec)) { *Err = Where + "'s Records do not read as tags"; return false; }
+                    const auto Tmpl = std::find_if(Rec.begin(), Rec.end(), [&](const FTag& X) { return P.Is(X.Name, "ComponentTemplate"); });
+                    for (FTag& R : Rec)
+                        if (Tmpl != Rec.end() && Int(*Tmpl) == Template + 1 && P.Is(R.Name, "CookedComponentInstancingData")
+                            && !Drop(R.Value, bDropped))
+                        { *Err = Where + "'s cooked instancing data does not read as tags"; return false; }
+                    WriteTags(P, Rec, Out);
+                }
+                if (Out.size() != T.Value.size()) { *Err = Where + ": internal: a record changed size"; return false; }
+                T.Value = std::move(Out);
+            }
+            if (!bDropped) continue;
+            if (!SetTags(P, K, { T }, Err)) return false;
+            Dropped.push_back(Where);
+        }
+    }
+    return true;
+}
+
+/*
 Edits, lowered against From (a scratch package, whose imports their objects are), into the tags of Object in the game's
 Package: read from GameDir the first time, saved by SaveEdits once every edit is in. A member's tag replaces the one of
 its name or is appended; an assignment to part of a member's value (a path) changes that part of the tag's value and
@@ -10030,6 +10136,8 @@ bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object,
     for (size_t I = P.Names.size(); I < Sink.NameTable().size(); ++I) P.Names.push_back({ Sink.NameTable()[I] });
 
     /* In statement order, so a later assignment lands on what an earlier one wrote. */
+    std::vector<FTag> Written;
+    bool bWhole = true;
     for (size_t I = 0; I < Edits.size(); ++I)
     {
         if (Edits[I].Path.empty())
@@ -10039,12 +10147,18 @@ bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object,
             if (!ReadTags(P, Fresh[I][0], End, Tags) || End != Fresh[I][0].size() || Tags.size() != 1)
             { *Err = Where + ": internal: the edit's tag does not read back"; return false; }
             if (!SetTags(P, Export, Tags, Err)) { *Err = Where + ": " + *Err; return false; }
+            Written.push_back(Tags[0]);
         }
         else if (!SetTagPath(P, Export, Edits[I].Chain[0].Name, Edits[I].Path, Fresh[I], Leaf[I], Err))
         { *Err = Where + ": " + *Err; return false; }
+        else bWhole = false;
     }
     for (int32 Dep : Deps) P.CreateBeforeSerialize(Export, Dep);
+    std::vector<std::string> Dropped;
+    if (!DropStaleCookedData(P, Export, bWhole ? &Written : nullptr, Dropped, Err)) { *Err = Where + ": " + *Err; return false; }
     Ed->Objects.push_back(Object + " (" + std::to_string(Edits.size()) + (Edits.size() == 1 ? " assignment)" : " assignments)"));
+    for (const std::string& D : Dropped)
+        Ed->Objects.push_back(D + " (its cooked instancing data for " + Object + " no longer valid: it did not list the edit)");
     return true;
 }
 

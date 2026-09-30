@@ -6730,22 +6730,22 @@ def edit_cooked_unlisted(mod, header, rel, member, template, body):
     return test
 
 
-def edit_cooked_pending():
+def edit_cooked_unlisted_cases():
     if not GAME or not os.path.exists(os.path.join(UEAPI, 'Game', 'PRJ_NormalBlasterShot_C.h')):
         print('--  S38 edits of components with cooked instancing data: skipped (needs --game and UeApi/Game)')
         return
-    pending('EditCookedScs: a patch of an SCS template property its valid cooked data does not list lists it, clears '
-            'bHasValidCookedData, or is refused',
-            edit_cooked_unlisted('EditCookedScs', 'PRJ_NormalBlasterShot_C.h', BLASTER, 'SourceRadius', 'PointLight_GEN_VARIABLE',
-                                 'class EditCookedScs : public PRJ_NormalBlasterShot_C {\n  UE_PATCH;\n'
-                                 '  UE_DEFAULTS { PointLight->SourceRadius = 12.0f; }\n};\n'))
-    pending('EditCookedIch: a patch of an override record\'s template property its valid cooked data does not list lists '
-            'it, clears bHasValidCookedData, or is refused',
-            edit_cooked_unlisted('EditCookedIch', 'PRJ_PatrolBotLaser_Flying_C.h',
-                                 'Enemies/RivalTech/PatrolBot/Projectiles/PRJ_PatrolBotLaser_Flying', 'bReceivesDecals',
-                                 'Body_GEN_VARIABLE',
-                                 'class EditCookedIch : public PRJ_PatrolBotLaser_Flying_C {\n  UE_PATCH;\n'
-                                 '  UE_DEFAULTS { Body->bReceivesDecals = false; }\n};\n'))
+    edit_cooked_unlisted('EditCookedScs', 'PRJ_NormalBlasterShot_C.h', BLASTER, 'SourceRadius', 'PointLight_GEN_VARIABLE',
+                         'class EditCookedScs : public PRJ_NormalBlasterShot_C {\n  UE_PATCH;\n'
+                         '  UE_DEFAULTS { PointLight->SourceRadius = 12.0f; }\n};\n')()
+    print('ok  EditCookedScs: a patch of an SCS template property its valid cooked data does not list leaves '
+          'no stale cooked data')
+    edit_cooked_unlisted('EditCookedIch', 'PRJ_PatrolBotLaser_Flying_C.h',
+                         'Enemies/RivalTech/PatrolBot/Projectiles/PRJ_PatrolBotLaser_Flying', 'bReceivesDecals',
+                         'Body_GEN_VARIABLE',
+                         'class EditCookedIch : public PRJ_PatrolBotLaser_Flying_C {\n  UE_PATCH;\n'
+                         '  UE_DEFAULTS { Body->bReceivesDecals = false; }\n};\n')()
+    print('ok  EditCookedIch: a patch of an override record\'s template property its valid cooked data does not list '
+          'leaves no stale cooked data')
 
 
 if not globals().get('EDITS_EXPLORE'):     # set by the dev loop's exploration driver, which reuses the cases above
@@ -6758,7 +6758,7 @@ if not globals().get('EDITS_EXPLORE'):     # set by the dev loop's exploration d
             'on its CDO, or is refused', added_tick_can_tick)
     edit_listed_component()
     edit_bound_names()
-    edit_cooked_pending()
+    edit_cooked_unlisted_cases()
 
 
 print('ok  %d known gaps, each a failing test of something AssetGen does not do yet' % len(GAPS))
