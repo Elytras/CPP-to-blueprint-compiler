@@ -4959,28 +4959,29 @@ pending('DelegateVar: a TDelegate<void()> variable is a DelegateProperty naming 
 pending('DispatchInheritedFire: a child broadcasts its parent\'s dispatcher through the parent\'s signature', inherited_fire)
 # A method of another class bound with `this`: EX_InstanceDelegate binds the name on this object, whose class has no
 # such function, so the broadcast or the timer silently skips it (ScriptDelegates.h 38-49, 479-502).
-pending('DelegateForeign: refused', lambda: refused(
-    'DelegateForeign', '  UE_DISPATCHER(OnHit, int32 Points);\n  void F() { OnHit.Add(this, &DelegateOther::ForeignHit); }\n',
-    'ForeignHit', top='class DelegateOther : public AActor {\npublic:\n  void ForeignHit(int32 Points) {}\n};\n'))
-pending('DelegateForeignTimer: refused', lambda: refused(
-    'DelegateForeignTimer', '  void F() { UKismetSystemLibrary::K2_SetTimerDelegate({this, &DelegateOther::ForeignTick}, '
-    '1.0f, false, 0.0f, 0.0f); }\n', 'ForeignTick', top='class DelegateOther : public AActor {\npublic:\n  void ForeignTick() {}\n};\n'))
+refused('DelegateForeign', '  UE_DISPATCHER(OnHit, int32 Points);\n  void F() { OnHit.Add(this, &DelegateOther::ForeignHit); }\n',
+        'cannot bind DelegateOther::ForeignHit',
+        top='class DelegateOther : public AActor {\npublic:\n  void ForeignHit(int32 Points) {}\n};\n')
+refused('DelegateForeignTimer', '  void F() { UKismetSystemLibrary::K2_SetTimerDelegate({this, &DelegateOther::ForeignTick}, '
+        '1.0f, false, 0.0f, 0.0f); }\n', 'cannot bind DelegateOther::ForeignTick',
+        top='class DelegateOther : public AActor {\npublic:\n  void ForeignTick() {}\n};\n')
 # UE_DISPATCHER's signature function is a real member: calling it runs its empty stub and broadcasts nothing, a call
 # the editor's backend never emits (KismetCompilerVMBackend.cpp 1248-1252).
-pending('DispatchSigCall: refused', lambda: refused(
-    'DispatchSigCall', '  UE_DISPATCHER(OnHit, int32 Points);\n  void F() { OnHit__DelegateSignature(1); }\n',
-    'OnHit__DelegateSignature'))
+refused('DispatchSigCall', '  UE_DISPATCHER(OnHit, int32 Points);\n  void F() { OnHit__DelegateSignature(1); }\n',
+        'OnHit__DelegateSignature is the dispatcher\'s signature')
 # K2_SetTimer by name: a method with parameters, an inline one, a misspelled one - the engine sets no timer
-# (KismetSystemLibrary.cpp 449-497). Refused, or at least a warning naming the method.
-pending('TimerByName: K2_SetTimer naming a method with parameters is refused or warned', lambda: compiled_with_flag(
-    'TimerByNameParms', '  int32 N;\n  void Poll(int32 X) { N = X; }\n'
-    '  void Start() { UKismetSystemLibrary::K2_SetTimer(this, "Poll", 1.0f, true, 0.0f, 0.0f); }\n', 'Poll'))
-pending('TimerByName: K2_SetTimer naming an inline method is refused or warned', lambda: compiled_with_flag(
-    'TimerByNameInline', '  int32 N;\n  inline void Blink() { N = 2; }\n'
-    '  void Start() { Blink(); UKismetSystemLibrary::K2_SetTimer(this, "Blink", 1.0f, true, 0.0f, 0.0f); }\n', 'Blink'))
-pending('TimerByName: K2_SetTimer naming no method of the class is refused or warned', lambda: compiled_with_flag(
-    'TimerByNameMissing', '  int32 N;\n  void Tock() { N = 3; }\n'
-    '  void Start() { UKismetSystemLibrary::K2_SetTimer(this, "Tik", 1.0f, true, 0.0f, 0.0f); }\n', 'Tik'))
+# (KismetSystemLibrary.cpp 449-497).
+refused('TimerByNameParms', '  int32 N;\n  void Poll(int32 X) { N = X; }\n'
+        '  void Start() { UKismetSystemLibrary::K2_SetTimer(this, "Poll", 1.0f, true, 0.0f, 0.0f); }\n',
+        'K2_SetTimer by name Poll names a function that takes parameters')
+refused('TimerByNameInline', '  int32 N;\n  inline void Blink() { N = 2; }\n'
+        '  void Start() { Blink(); UKismetSystemLibrary::K2_SetTimer(this, "Blink", 1.0f, true, 0.0f, 0.0f); }\n',
+        'K2_SetTimer by name Blink names an inline method')
+refused('TimerByNameMissing', '  int32 N;\n  void Tock() { N = 3; }\n'
+        '  void Start() { UKismetSystemLibrary::K2_SetTimer(this, "Tik", 1.0f, true, 0.0f, 0.0f); }\n',
+        'K2_SetTimer by name Tik names no function of the class')
+print('ok  delegate refusals: a bind of another class\'s method on this, a call to a dispatcher\'s signature, a timer by a '
+      'name with parameters, inline or missing')
 
 
 # ---- SCS: the SimpleConstructionScript, its nodes, the component templates and the inheritable component handler
@@ -6430,7 +6431,7 @@ def edit_findings(edited, game_root, only=None, pinned=lambda f: False):
     against it see it."""
     vanilla = os.path.join(game_root, *edited.replace(os.sep, '/').split('/FSD/Content/', 1)[1].split('/'))
     saved = list(invariants.GAME_CONTENT)
-    invariants.GAME_CONTENT[:] = [game_root] + [g for g in saved if g != game_root]
+    if saved: invariants.GAME_CONTENT[:] = [game_root] + [g for g in saved if g != game_root]   # no --game: /Game imports go unchecked
     try:
         new = set(invariants.check(invariants.Package(edited), only)) - set(invariants.check(invariants.Package(vanilla), only))
     finally:
@@ -6447,7 +6448,7 @@ def keeps_invariants_but(base, game_root, pinned=pinned_elsewhere):
     """keeps_invariants, a pending test's pinned findings left to it; game_root, the folder the edited packages came
     from, is searched first for /Game imports."""
     saved = list(invariants.GAME_CONTENT)
-    invariants.GAME_CONTENT[:] = [game_root] + [g for g in saved if g != game_root]
+    if saved: invariants.GAME_CONTENT[:] = [game_root] + [g for g in saved if g != game_root]   # no --game: /Game imports go unchecked
     try:
         found = [f for f in invariants.check(invariants.Package(base)) if f[0] not in KNOWN_RULES and not pinned(f)]
     finally:

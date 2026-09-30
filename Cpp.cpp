@@ -1539,7 +1539,7 @@ private:
     int32 ReadTmpCounter = 0;
     int32 LoopDepth = 0;                              // LowerBody: the loops around the statement being lowered
     std::string CurFnName;                            // Generate: the method being lowered
-    const Json* CurFnDef = nullptr;                   // ... its definition, which a call from it never expands
+    const Json* CurFnDef = nullptr;                  // ... its definition, which a call from it never expands
     std::string LatentRefusal;                        // why that method cannot make a latent call, or empty
     bool bMadeLatentCall = false;                     // LowerCall: it made one, so it moves into the ubergraph
     std::string StaticLocal;                          // LowerBody: a static it keeps in the ubergraph's frame, or empty
@@ -2885,6 +2885,16 @@ bool FCompiler::LowerDelegateValue(const Json& Obj, const Json& Fn, FArgIR& Out,
     auto Owner = MethodOwner.find(Ref.value("id", std::string()));
     if (const FRecord* R = Owner != MethodOwner.end() ? Find(Owner->second) : nullptr; R && IsInlineMethod(*R, Name(Ref)))
     { *Err = "a delegate cannot bind " + Name(Ref) + ": an inline function is expanded where it is called, no UFunction (drop `inline`)"; return false; }
+    /* EX_InstanceDelegate binds the name on this object, so a function of a class this one does not derive from is
+       never found there, and the broadcast or timer skips it (ScriptDelegates.h 38-49, 479-502). */
+    if (Owner != MethodOwner.end() && Cur)
+    {
+        bool bMine = false;
+        for (const FRecord* A = Cur; A && !bMine; A = A->Base.empty() ? nullptr : Find(A->Base)) bMine = A->CppName == Owner->second;
+        if (!bMine)
+        { *Err = "a delegate on `this` cannot bind " + Owner->second + "::" + Name(Ref) + ": the engine looks it up by name on this "
+                 "object, whose class has no such function"; return false; }
+    }
     Out.K = FArgIR::Delegate;
     Out.S = UeNameOf(Cur, (*F)["referencedDecl"].value("name", std::string()));     // found on self by name at run time
     return true;
@@ -4942,6 +4952,32 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
     if (MethodName == "AddComponent" && K == "CXXMemberCallExpr")
     { *Err = CurFnName + ": AddComponent looks up a component template by name, and a mod class has no component "
              "templates, so it returns None; add one by class with AddComponentByClass"; return false; }
+    /* A dispatcher's signature function is a stub the editor's backend never calls (KismetCompilerVMBackend.cpp
+       1248-1252): calling it runs nothing and broadcasts nothing. */
+    if (MethodName.size() > 19 && MethodName.compare(MethodName.size() - 19, 19, "__DelegateSignature") == 0)
+    { *Err = CurFnName + ": " + MethodName + " is the dispatcher's signature, which does nothing when called; call "
+             + MethodName.substr(0, MethodName.size() - 19) + ".Broadcast(...)"; return false; }
+    /* K2_SetTimer(this, "Name", ...) finds Name on the object at run time and sets no timer when it is missing or takes
+       parameters (KismetSystemLibrary.cpp 449-497); an inline method is no function of the class. */
+    if (MethodName == "K2_SetTimer" && Cur)
+    {
+        const Json* Obj = Strip(Nth(CallExprNode, 1));
+        const Json* FnArg = Nth(CallExprNode, 2);
+        std::string Target;
+        if (Obj && Kind(*Obj) == "CXXThisExpr" && FnArg && FindLiteral(*FnArg, Target))
+        {
+            const Json* Found = nullptr;
+            const FRecord* In = nullptr;
+            for (const FRecord* A = Cur; A && !Found; A = A->Base.empty() ? nullptr : Find(A->Base))
+                if (auto M = A->Methods.find(Target); M != A->Methods.end()) { Found = M->second; In = A; }
+            const char* Why = !Found ? "names no function of the class"
+                            : IsInlineMethod(*In, Target) ? "names an inline method, which is no function of the class"
+                            : !ParmNames(*Found).empty() ? "names a function that takes parameters" : nullptr;
+            if (Why)
+            { *Err = CurFnName + ": K2_SetTimer by name " + Target + " " + Why + ", so the engine sets no timer; "
+                     "name a method without parameters, or pass a delegate"; return false; }
+        }
+    }
 
     /* __NAME__ free functions are compiler intrinsics; each resolves its imports here (Extra/Extra2). */
     const bool bIntrinsic = MethodName.size() >= 5

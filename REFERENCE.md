@@ -5743,6 +5743,15 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
 
 ### Event dispatchers, timers and input
 
+- `a delegate on \`this\` cannot bind <Class>::<Function>: the engine looks it up by name on this object, whose class
+  has no such function`: `{this, &Other::F}` where this class is no `Other`. Fix: bind a method of this class, and
+  call the other object from it.
+- `<Function>: <Dispatcher>__DelegateSignature is the dispatcher's signature, which does nothing when called; call
+  <Dispatcher>.Broadcast(...)`. Fix: broadcast the dispatcher.
+- `<Function>: K2_SetTimer by name <Name> names no function of the class` (or `names an inline method`, or `names a
+  function that takes parameters`)`, so the engine sets no timer`: the engine finds the function by name when the
+  timer is set, and only calls one without parameters. Fix: name a method of the class that takes none, or pass a
+  delegate with `K2_SetTimerDelegate`.
 - `` a delegate cannot bind <Function>: an inline function is expanded where it is called, no UFunction (drop `inline`) ``:
   Add, Remove or a delegate value names an inline method. An inline method is copied into each caller and never
   becomes a function of the class. Fix: drop `inline` from the handler. See [Event dispatchers](#event-dispatchers).
