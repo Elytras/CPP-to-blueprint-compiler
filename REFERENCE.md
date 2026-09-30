@@ -4404,6 +4404,7 @@ Notes:
 | `Pause(2.0f);`, an inline helper that calls Delay | The helper is expanded into the caller, so the caller becomes the method that waits, and it resumes after the helper's Delay. Each expansion is a call site of its own. The caller has to follow the latent rules. A non-inline helper that waits returns to its caller at its first wait instead. | Yes |
 | `void ReceiveBeginPlay()` with a Delay inside | An override of an engine event can wait. The engine still calls it as that event. | Yes |
 | `Twice(1); Twice(2);` before `Twice` resumes | An object has one frame for a method that waits, not one per call. The second call starts at the top and overwrites the pending call's parameters and locals, and its Delay is ignored because one is already pending at that call site. The method resumes once, with the second call's values. An editor event graph behaves the same; a C++ coroutine would not. | Yes |
+| `UUserWidget *W = CreateWidget<UUserWidget>(P); UKismetSystemLibrary::Delay(1.0f); Kept = W;` | The frame holds an object local weakly: unless the object is flagged RF_StrongRefOnFrame, as SpawnObject's (`NewObject`) and the callback proxies' are, a garbage collection during the wait can take it, and the local then reads None. The editor's event graph is the same. The compiler warns where a local may hold an object the method made or loaded (not one read out of a property, nor an actor, component or async action) across a wait and reads it after: keep such an object in a member. | Warns |
 | `TArray<int32> Nums;` with no initializer | Empty on the object's first call. On a later call it holds whatever the previous call left in it, where C++ would give a new empty array. Initialize the local, or `Clear()` it at the top. Inside a loop it is reset every round, as usual. | Yes |
 
 ```cpp
@@ -5896,6 +5897,11 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   UE_AWAIT in a class that is not an actor, component, widget, GameInstance or subsystem, such as a UObject child. The
   build goes on. Fix: create the object with an actor or component as its Outer, as `NewObject<T>(this)` does from an
   actor. See [Latent calls](#latent-calls).
+- `warning: <Class>::<Function> keeps <Local> (a <Type>) across a wait only in its ubergraph frame, which holds an object
+  weakly`: a method that waits (Delay, LoadAsset, UE_AWAIT) holds an object it made or loaded only in a local across a
+  wait and reads the local after it. The frame keeps an object only weakly, so a garbage collection during the wait
+  can take it and the local reads None. The build goes on. Fix: keep the object in a member variable. See
+  [When the code after a wait runs](#when-the-code-after-a-wait-runs).
 - `UE_AWAIT: keep the object in a variable, it is used twice`: the dispatcher's object is a call result, as in
   `UE_AWAIT(UAsyncTaskDownloadImage::DownloadImage(Url)->OnSuccess)`. The object is used by the bind and again to
   start the action. Fix: `UAsyncTaskDownloadImage *Task = UAsyncTaskDownloadImage::DownloadImage(Url);` and then

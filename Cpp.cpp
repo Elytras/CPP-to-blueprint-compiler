@@ -638,7 +638,8 @@ struct FCallIR
     bool bLocal = false;                // EX_LocalVirtualFunction / EX_LocalFinalFunction: a script function that is no RPC
     std::string View;                   // __RefAtInline__: the TArray field of the view struct in Extra
     std::shared_ptr<int32> Resume;      // __AwaitPoint__: receives the ubergraph offset the awaited event re-enters at
-    bool bFrameHeld = false;            // a factory whose proxy only a persistent frame keeps alive: see HeldProxies
+    bool bStrongOnFrame = false;        // its result is RF_StrongRefOnFrame, so a persistent frame holding it keeps it
+    bool bFrameHeld = false;            // ... and nothing else does: see HeldProxies
     std::shared_ptr<FArgIR> Target;     // the object an instance call runs against; null = self
     std::vector<FArgIR> Args;
 };
@@ -1580,6 +1581,8 @@ private:
     bool LowerAwait(const Json& CallNode, FBlueprintClass& BP, FCallIR& Out, std::string* Err);
     bool PlaceActivations(std::vector<FStmtIR>& Stmts, std::string* Err);
     bool PeelFirstRound(std::vector<FStmtIR>& Stmts, const int32* Await);
+    std::map<std::string, std::string> SourceLocals;  // LowerBody: the method's own declared locals, by name -> C++ type
+    void WarnFrameWeakLocals(const std::vector<FStmtIR>& Stmts, const std::string& Where);
     std::vector<FCompletion> Completions;             // the method being lowered's
     std::set<std::string> GeneratedEvents;            // the class's, so two never share a name
     int32 SwitchDepth = 0;                            // LowerBody: the switches around it
@@ -5274,10 +5277,12 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         Out.bInstance = !bStatic;
         /* Each makes its proxy with NewObject, flags it RF_StrongRefOnFrame and roots it nowhere else
            (PlayMontageCallbackProxy.cpp 15-23, the anim instance's delegates reaching it weakly, 56-63;
-           Animation/WidgetAnimationPlayCallbackProxy.cpp 10-24): only the frame that holds it keeps it alive. */
+           Animation/WidgetAnimationPlayCallbackProxy.cpp 10-24): only the frame that holds it keeps it alive.
+           SpawnObject flags what it makes too (GameplayStatics.cpp 606-627), whose Outer does not reference it. */
         static const std::set<std::string> FrameHeld = {
             "CreateProxyObjectForPlayMontage", "CreatePlayAnimationProxyObject", "CreatePlayAnimationTimeRangeProxyObject" };
         Out.bFrameHeld = bStatic && Called->IsNative() && FrameHeld.count(MethodName) != 0;
+        Out.bStrongOnFrame = Out.bFrameHeld || (bStatic && Called->IsNative() && MethodName == "SpawnObject");
         /* A Blueprint static needs the CDO context; EX_CallMath finds it itself for a native, but never asks the
            callspace an authority-only or cosmetic one has (KismetCompilerVMBackend.cpp 1222-1231): that one is called
            through CallFunction on the CDO, as the editor calls it. */
@@ -6436,6 +6441,121 @@ bool FCompiler::PlaceActivations(std::vector<FStmtIR>& Stmts, std::string* Err)
     }
 }
 
+namespace
+{
+/* The locals an expression reads, a call's object and arguments included. */
+void LocalsRead(const FCallIR& C, std::set<std::string>& Out);
+void LocalsRead(const FArgIR& A, std::set<std::string>& Out)
+{
+    if (A.K == FArgIR::Local || A.K == FArgIR::LocalOut) Out.insert(A.S);
+    if (A.Sub) LocalsRead(*A.Sub, Out);
+    if (A.Base) LocalsRead(*A.Base, Out);
+}
+void LocalsRead(const FCallIR& C, std::set<std::string>& Out)
+{
+    if (C.Intrinsic == "__AwaitPoint__") return;        // names the awaited object only to say what it waits on
+    if (C.Target) LocalsRead(*C.Target, Out);
+    for (const FArgIR& A : C.Args) LocalsRead(A, Out);
+}
+
+/* The latent calls an expression makes (a call given an FLatentActionInfo): each ends the run, which the latent
+   action resumes after the statement. */
+void LatentCalls(const FCallIR& C, std::vector<const FCallIR*>& Out);
+void LatentCalls(const FArgIR& A, std::vector<const FCallIR*>& Out)
+{
+    if (A.Sub) LatentCalls(*A.Sub, Out);
+    if (A.Base) LatentCalls(*A.Base, Out);
+}
+void LatentCalls(const FCallIR& C, std::vector<const FCallIR*>& Out)
+{
+    if (std::any_of(C.Args.begin(), C.Args.end(), [](const FArgIR& A) { return A.K == FArgIR::LatentInfo; })) Out.push_back(&C);
+    if (C.Target) LatentCalls(*C.Target, Out);
+    for (const FArgIR& A : C.Args) LatentCalls(A, Out);
+}
+}   // namespace
+
+/*
+The garbage collector reads the ubergraph's persistent frame, where a waiting method keeps its locals, and takes an
+object reference there as a weak one unless the object is RF_StrongRefOnFrame (UObjectGlobals.cpp 3460-3483), which
+only SpawnObject and the callback proxies set (bStrongOnFrame). So an object a waiting method made, or loaded, and
+holds only in a local across a wait can be collected before it resumes, and the local then reads None; the editor's
+event graph is the same, but the compiler sees which locals outlive a wait, so it says so. A local counts when it may
+hold the result of a call, directly or through a copy or cast (a value read out of a property is its owner's to keep),
+or of a latent load (LoadAsset, stored by the call's completion event), is of a UObject class that nothing else is
+known to keep - not an actor or a component, which the level or their owner holds, nor an async action - and is read
+after a wait that it may hold such a value across: Delay and its kind, or UE_AWAIT.
+*/
+void FCompiler::WarnFrameWeakLocals(const std::vector<FStmtIR>& Stmts, const std::string& Where)
+{
+    std::map<std::string, std::string> Classes;         // the candidates: local -> its class
+    for (const auto& [Local, Type] : SourceLocals)
+    {
+        std::string T = StripTypeKeywords(Type);
+        if (T.empty() || T.back() != '*') continue;
+        T.pop_back();
+        while (!T.empty() && T.back() == ' ') T.pop_back();
+        const FRecord* C = Find(T);
+        bool bObject = false, bKept = false;
+        for (const FRecord* A = C; A; A = A->Base.empty() ? nullptr : Find(A->Base))
+        {
+            bObject = bObject || A->UeName == "Object";
+            bKept = bKept || A->UeName == "Actor" || A->UeName == "ActorComponent" || A->UeName == "BlueprintAsyncActionBase"
+                 || A->UeName == "World" || A->UeName == "Level" || A->UeName == "GameInstance" || A->UeName == "LocalPlayer"
+                 || A->UeName == "Subsystem";
+        }
+        if (C && bObject && !bKept) Classes[Local] = C->CppName;
+    }
+    if (Classes.empty()) return;
+    std::map<std::string, std::string> LoadedInto;      // a latent load's completion event -> the local it stores into
+    for (const FCompletion& C : Completions)
+        if (!C.Resume && !C.Local.empty()) LoadedInto[C.Event] = C.Local;
+
+    enum : uint8 { Made = 1, Crossed = 2 };
+    std::set<std::string> Warned;
+    auto Cross = [](FFlowWalk::FState& S) { for (auto& [K, V] : S.Bits) if (V & Made) V |= Crossed; };
+    std::function<uint8(const FArgIR&, FFlowWalk::FState&)> MadeBy = [&](const FArgIR& V, FFlowWalk::FState& S) -> uint8 {
+        if (V.K == FArgIR::Call) return V.Sub && !V.Sub->bStrongOnFrame && V.Sub->Intrinsic.empty() ? Made : 0;
+        if (V.K == FArgIR::DynCast && V.Sub && !V.Sub->Args.empty()) return MadeBy(V.Sub->Args[0], S);
+        if (V.K == FArgIR::Local) return S.Bits.count(V.S) ? S.Bits[V.S] & Made : 0;
+        return 0;
+    };
+    FFlowWalk Walk;
+    Walk.Step = [&](const FStmtIR& St, int32, FFlowWalk::FState& S) {
+        if (!S.bLive) return;
+        const bool bStore = (St.K == FStmtIR::Assign || St.K == FStmtIR::Decl) && St.Var.K == FArgIR::Local && !St.Var.Base;
+        std::set<std::string> Reads;
+        LocalsRead(St.Call, Reads);
+        LocalsRead(St.Target, Reads);
+        for (const FArgIR* A : { &St.Value, &St.Cond, &St.SwitchValue }) LocalsRead(*A, Reads);
+        for (const FArgIR& A : St.CaseTests) LocalsRead(A, Reads);
+        if (!bStore) LocalsRead(St.Var, Reads);
+        for (const std::string& R : Reads)
+            if (Classes.count(R) && S.Bits.count(R) && (S.Bits[R] & Crossed)) Warned.insert(R);
+        std::vector<const FCallIR*> Waits;
+        LatentCalls(St.Call, Waits);
+        LatentCalls(St.Value, Waits);
+        if (!Waits.empty()) Cross(S);
+        for (const FCallIR* W : Waits)
+            for (const FArgIR& A : W->Args)
+                if (A.K == FArgIR::Delegate)
+                    if (auto L = LoadedInto.find(A.S); L != LoadedInto.end()) S.Bits[L->second] = Made;
+        if (bStore)
+        {
+            const uint8 By = St.K == FStmtIR::Decl && !St.bHasValue ? 0 : MadeBy(St.Value, S);
+            if (By) S.Bits[St.Var.S] = By;
+            else S.Bits.erase(St.Var.S);
+        }
+    };
+    Walk.AfterAwait = [&](const FCallIR&, FFlowWalk::FState& S) { Cross(S); };
+    FFlowWalk::FState Entry;
+    Entry.bLive = true;
+    Walk.Run(Stmts, Entry);
+    for (const std::string& L : Warned)
+        printf("  warning: %s keeps %s (a %s) across a wait only in its ubergraph frame, which holds an object weakly: a "
+               "garbage collection during the wait can take it, and %s then reads None; keep it in a member\n",
+               Where.c_str(), L.c_str(), Classes[L].c_str(), L.c_str());
+}
+
 bool OnlyRead(const Json& N, const std::string& Id);
 int32 UsesOf(const Json& N, const std::string& Id);
 
@@ -6587,6 +6707,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                     Ds.Value.K = FArgIR::Local;
                     Ds.Value.S = Fresh;
                 }
+                if (InlineStack.empty()) SourceLocals[VarName] = VarType;
                 Locals.push_back(PD);
                 Out.push_back(Ds);
             });
@@ -11432,7 +11553,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         StaticLocal.clear();
         LatentCount = 0;
         Completions.clear();
-        LatentRefusal = IsStaticDecl(Decl) ? "a static function has no object whose ubergraph frame could keep its locals"
+        SourceLocals.clear();
+        LatentRefusal =IsStaticDecl(Decl) ? "a static function has no object whose ubergraph frame could keep its locals"
                       : (!RetType.empty() && RetType != "void") || HasOutParm(Params)
                           ? "a function that resumes later returns nothing and takes no reference parameters"
                       : "";
@@ -11630,6 +11752,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                        R.CppName.c_str(), Fn.Name.c_str());
             if (bScratchNeeded)
             { *Err = R.CppName + "::" + Fn.Name + ": TODO: a pointer read in a function that makes a latent call"; return false; }
+            WarnFrameWeakLocals(Stmts, R.CppName + "::" + Fn.Name);
             FSegment Seg{ Fn.Name, Super, {}, Locals, Stmts, Flags, {}, Completions };
             Seg.Parms.assign(Params.begin(), Params.end() - Locals.size());
             Segments.push_back(std::move(Seg));

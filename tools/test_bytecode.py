@@ -6352,9 +6352,13 @@ def spawn_abstract():
 def wait_hold():
     """A local that holds an object across a wait is a weak reference in the persistent frame unless the object has
     RF_StrongRefOnFrame (UObjectGlobals.cpp 3460-3483): WaitHold.F's widget, made before the Delay and read after it,
-    can be collected in between. The compiler knows which locals outlive a wait, so it should say so."""
-    pending('WaitHold.F: an object local read after a wait warns that the frame does not keep it',
-            says('WaitHold', 'about W outliving the wait', r'WaitHold::F\b', r'\bW\b'))
+    can be collected in between. The compiler knows which locals outlive a wait, so it says so. Its controls are not
+    warned about: a widget read out of a member, one made after the wait, a SpawnObject result, an actor."""
+    log = LOGS['WaitHold']
+    assert said(log, r'WaitHold::F\b', r'\bW\b'), 'nothing said about W outliving the wait: ' + log
+    held = re.findall(r'warning: WaitHold::(\w+) keeps (\w+)', log)
+    assert held == [('F', 'W')], held
+    print('ok  WaitHold.F: an object local read after a wait warns that the frame does not keep it; its controls do not')
 
 
 latent_refusals()

@@ -504,7 +504,9 @@ Full rules: [Components](REFERENCE.md#components), [Class defaults](REFERENCE.md
 
 `UKismetSystemLibrary::Delay(0.5f)` pauses the method it is in, as the Delay node does in an event graph. The method's
 locals and parameters keep their values, and the code after the call runs when the delay ends; in a loop, each round
-waits before the next one starts. The caller gets control back at the method's first wait. Leave out the world
+waits before the next one starts. An object in a local is kept only weakly across the wait, though: one the method
+made or loaded can be garbage-collected meanwhile and read None after it. The compiler warns where that can happen;
+keep such an object in a member. The caller gets control back at the method's first wait. Leave out the world
 context and the `FLatentActionInfo`: the compiler supplies both, and `RetriggerableDelay`, `MoveComponentTo` and the
 other latent functions are called the same way. Never pass the `FLatentActionInfo` yourself. With the world context
 the call is refused, and without it (`Delay(1.0f, Info)`) it is not caught yet and compiles to a broken call.
