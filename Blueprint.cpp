@@ -227,6 +227,19 @@ void FBlueprintClass::Finish()
     const FIndex ParentCdo = Imp(P.AddImport({ ParentPackage, ParentClass,
                                                PackageImport(ParentPackage),
                                                "Default__" + ParentClass }));
+    /* An overridden default subobject's archetype is the object of its name under its outer's archetype - the parent
+       CDO's subobject (GetArchetypeFromRequiredInfo rule 1, UObjectArchetype.cpp 64-83) - and the cook writes it as the
+       export's TemplateIndex: Ene_Butterfly's HealthComponent names
+       ENE_FlyingCritterBase.Default__ENE_FlyingCritterBase_C:HealthComponent. The loader check()s it is set and fetches
+       it serialized (AsyncLoading.cpp 2955, 3191-3193). A native parent's is found in memory; a Blueprint parent's is an
+       export of its package, where the cook exports every default subobject and this compiler every one the parent or a
+       subclass of it cooked here restates (Cpp.cpp, Generate). */
+    std::vector<FIndex> SubobjectArchetypes;
+    for (const FSubobjectOverride& O : SubobjectOverrides)
+    {
+        const FImport* SubClass = P.ImportAt(O.Class);
+        SubobjectArchetypes.push_back(Subobject(P.ImportAt(SubClass->Outer)->ObjectName, SubClass->ObjectName, ParentCdo, O.Name));
+    }
 
     const int32 RowClass = 0;
     const int32 RowCdo = 1;
@@ -262,6 +275,9 @@ void FBlueprintClass::Finish()
     // serialize-before-serialize edge aborts the async loading thread.
     Class.SerBeforeSer = { ParentIdx.V, ParentCdo.V };
     if (bIsActor) Class.SerBeforeSer.push_back(ScsIdx.V);
+    /* The CDO the class makes while it is serialized copies each default subobject from its archetype
+       (UObjectGlobals.cpp 3822-3859), so a Blueprint parent's is loaded first, as Ene_Butterfly_C lists its parent's. */
+    for (const FIndex A : SubobjectArchetypes) Class.SerBeforeSer.push_back(A.V);
     Class.SerBeforeCreate = { BpgcClass.V, BpgcCdo.V };
     Class.CreateBeforeCreate = { ParentIdx.V };
     for (int32 I = 0; I < NumFunctions; ++I)
@@ -378,15 +394,17 @@ void FBlueprintClass::Finish()
                           [Body, SelfExp](FScript& S) { Body(S, SelfExp); }, Refs);
     }
 
-    for (const FSubobjectOverride& O : SubobjectOverrides)
+    for (size_t I = 0; I < SubobjectOverrides.size(); ++I)
     {
+        const FSubobjectOverride& O = SubobjectOverrides[I];
         const std::vector<FPropertyDef> Defaults = O.Defaults;
         FExport Sub;
         Sub.ClassIndex = O.Class;
+        Sub.TemplateIndex = SubobjectArchetypes[I];
         Sub.OuterIndex = Exp(RowCdo);
         Sub.ObjectName = O.Name;
         Sub.ObjectFlags = RF_Public | RF_Transactional | RF_ArchetypeObject | RF_DefaultSubObject;
-        Sub.SerBeforeCreate = { O.Class.V };
+        Sub.SerBeforeCreate = { O.Class.V, Sub.TemplateIndex.V };      // as the cook lists class and template
         Sub.CreateBeforeCreate = { Exp(RowCdo).V };
         Sub.Serialize = [Defaults, Tail = O.NativeTail](FArc& Ar) {
             for (const FPropertyDef& V : Defaults) WriteDefaultTag(Ar, V);

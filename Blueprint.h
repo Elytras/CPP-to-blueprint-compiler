@@ -100,8 +100,8 @@ public:
     An override of a NATIVE parent's default subobject - its components, which are not SCS nodes and
     so have nothing to do with the handler above. Measured on Ene_Butterfly: one export named exactly
     as the subobject, outered to THIS class's CDO, flags Public|Transactional|ArchetypeObject|
-    DefaultSubObject and a null template (the engine resolves the archetype through the parent CDO's
-    subobject of the same name), plus an ObjectProperty tag of that name on the CDO.
+    DefaultSubObject, archetyped on the parent CDO's subobject of the same name (Finish imports it),
+    plus an ObjectProperty tag of that name on the CDO.
     */
     void AddSubobjectOverride(const std::string& Name, const std::string& Property, FIndex ComponentClass,
                               const std::vector<FPropertyDef>& Defaults, const std::vector<uint8>& NativeTail = {});
