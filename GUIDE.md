@@ -1059,7 +1059,7 @@ dumps as JSON. The include dir and its parent are both on the include path, so `
 `UeApi/`. A quoted include relative to the source's own folder works as in any clang build. On Linux, clang still parses
 for the game's Windows target; the [README](README.md) says what that means for includes. clang's own errors go to the
 console, and the compile then ends with `clang rejected <source> (diagnostics above)`. The syntax tree can run to
-hundreds of MB; it goes to the temp folder and is deleted when the compile ends, and several compiles can run at once.
+hundreds of MB; it streams from clang through a pipe and is never written to disk, and several compiles can run at once.
 
 **What it writes.** One cooked package, a `.uasset` and a `.uexp`, for each of these:
 
