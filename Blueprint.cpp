@@ -262,6 +262,9 @@ void FBlueprintClass::Finish()
     // serialize-before-serialize edge aborts the async loading thread.
     Class.SerBeforeSer = { ParentIdx.V, ParentCdo.V };
     if (bIsActor) Class.SerBeforeSer.push_back(ScsIdx.V);
+    /* UStruct::GetPreloadDependencies (Class.cpp 732-735): the structs and enums the class's variables are typed by,
+       which it links against while it is serialized. */
+    for (const FPropertyDef& V : Vars) TypeRefs(V, Class.SerBeforeSer);
     Class.SerBeforeCreate = { BpgcClass.V, BpgcCdo.V };
     Class.CreateBeforeCreate = { ParentIdx.V };
     for (int32 I = 0; I < NumFunctions; ++I)
@@ -678,6 +681,7 @@ void FBlueprintClass::FinishStruct(const uint32 (&Guid)[4])
     for (const FPropertyDef& V : Vars)
         if (V.Extra.V != 0)
             S.CreateBeforeSer.push_back(V.Extra.V);
+    for (const FPropertyDef& V : Vars) TypeRefs(V, S.SerBeforeSer);     // what its members link against (Class.cpp 732-735)
 
     uint32 G[4] = { Guid[0], Guid[1], Guid[2], Guid[3] };
     const std::vector<FPropertyDef> Members = Vars;

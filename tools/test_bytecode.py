@@ -150,8 +150,6 @@ KNOWN_RULES = {     # sweep rules the suite's own packages still break, each wit
                                  'guessed from ancestry) instead of taken from the parent',
     'edl_class_closure': "a BPGC's UberGraphFunction and InheritableComponentHandler are not serialized before the class",
     'edl_create_prereqs': 'a native default-subobject override export has TemplateIndex 0',
-    'edl_property_types': 'UDS/UDE property types are never serialized before what they type',
-    'edl_super_serialized': "an override's /Game parent function is created, never serialized, before the override",
     'export_archetype': 'native default-subobject overrides have a null TemplateIndex',
     'import_chains': 'packages import themselves (their own package, class and functions)',
     'instanced_refs_flagged': 'no property ever gets CPF_InstancedReference / CPF_ContainsInstancedReference',
@@ -3232,13 +3230,11 @@ preload_refs()
 print("ok  PreloadRefs: a class constant, a property's class, a Broadcast target and a template default are created first")
 
 
-# ---- Pending: the preload dependencies AssetGen leaves out
-
 def preload_override():
     """PreloadOverride's Step and Score override PreloadBase_C's: their SuperStruct is that function, and the loader
     fetches it with bCheckSerialized while it serializes the override - a Fatal 'Missing Dependency' when the parent
     package loads in the same batch and has not serialized it yet."""
-    base = pending_asset('PreloadOverride')
+    base = asset('PreloadOverride')
     pkg = invariants.Package(base)
     supers = {e['name']: pkg.path(e['super']) for k, e in enumerate(pkg.exports)
               if pkg.class_of(k + 1) == 'Function' and e['super']}
@@ -3246,6 +3242,23 @@ def preload_override():
                       'Score': '/Game/_ElytrasMods/PreloadOverride/PreloadBase.PreloadBase_C:Score'}, supers
     keeps_edl(base, ['edl_super_serialized'])
 
+
+preload_override()
+print('ok  PreloadOverride: an override is serialized after its Blueprint parent function, its SuperStruct')
+
+
+def preload_types():
+    """PreloadTypes' structs and enum type a class variable, an array element, a parameter, a local and struct
+    members: each owner is serialized after the type it links against."""
+    base = asset('PreloadTypes')
+    keeps_edl(base, ['edl_property_types'])
+
+
+preload_types()
+print('ok  PreloadTypes: a user-defined struct or enum is serialized before the class, function or struct it types')
+
+
+# ---- Pending: the preload dependencies AssetGen leaves out
 
 def preload_uber_class():
     """PreloadUber_C names ExecuteUbergraph_PreloadUber as its UberGraphFunction: Link preloads it, and the CDO's
@@ -3265,13 +3278,6 @@ def preload_uber_calls():
     assert any(op[0] == 'obj' and op[1] and pkg.path(op[1]).endswith(':ExecuteUbergraph_PreloadUber')
                for t in pkg.script(wait) for n in t.walk() for op in n.ops), 'Wait does not call ExecuteUbergraph_PreloadUber'
     keeps_edl(base, ['edl_payload_created'])
-
-
-def preload_types():
-    """PreloadTypes' structs and enum type a class variable, an array element, a parameter, a local and struct
-    members: each owner is serialized after the type it links against."""
-    base = pending_asset('PreloadTypes')
-    keeps_edl(base, ['edl_property_types'])
 
 
 def preload_ich():
@@ -3326,10 +3332,8 @@ def preload_dso_kid():
     assert not found, '; '.join('%s %s: %s' % f for f in found[:3])
 
 
-pending('PreloadOverride: an override is serialized after its Blueprint parent function, its SuperStruct', preload_override)
 pending('PreloadUber: the class is serialized after its ubergraph function', preload_uber_class)
 pending('PreloadUber: a function that enters the ubergraph has it created before it is serialized', preload_uber_calls)
-pending('PreloadTypes: a user-defined struct or enum is serialized before the class, function or struct typed by it', preload_types)
 pending('PreloadIch: the class is serialized after its InheritableComponentHandler', preload_ich)
 pending('PreloadDso: a restated native subobject has its archetype as TemplateIndex', preload_dso)
 pending('PreloadDso: a child\'s subobject override is archetyped on the parent\'s, serialized before it and the child class',

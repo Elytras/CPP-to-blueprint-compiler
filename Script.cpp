@@ -199,6 +199,21 @@ void DefaultRefs(const FDefaultValue& D, std::vector<int32>& Out)
     if (D.Members) for (const FPropertyDef& M : *D.Members) DefaultRefs(M.Default, Out);
 }
 
+/* UStruct::GetPreloadDependencies asks each property for these (Class.cpp 732-735): a struct property's struct, a byte
+   or enum property's enum, and through an array, set or map its element properties - not an enum property's
+   underlying one (PropertyStruct.cpp 183-187, PropertyByte.cpp 33-37, EnumProperty.cpp 366-371, PropertyArray.cpp
+   41-48, PropertySet.cpp 248-255, PropertyMap.cpp 289-300). The owner links them while it is serialized: a struct's
+   PropertiesSize becomes the property's ElementSize (PropertyStruct.cpp 91-103), an enum's names are read. */
+void TypeRefs(const FPropertyDef& P, std::vector<int32>& Out)
+{
+    if ((P.Type == "StructProperty" || P.Type == "ByteProperty" || P.Type == "EnumProperty") && P.Extra.V != 0
+        && std::find(Out.begin(), Out.end(), P.Extra.V) == Out.end())
+        Out.push_back(P.Extra.V);
+    if (P.Type == "ArrayProperty" || P.Type == "SetProperty" || P.Type == "MapProperty")
+        for (const std::shared_ptr<FPropertyDef>& Element : { P.Inner, P.Value })
+            if (Element) TypeRefs(*Element, Out);
+}
+
 namespace
 {
 /* D as P's value, without a tag: a tag's payload, or one array element. */
@@ -820,6 +835,11 @@ int32 AddFunctionExport(FPackage& P, const FFunctionDef& Def, FIndex OwnerClass,
     // and no SerBeforeCreate for class/template (unlike every other export).
     E.CreateBeforeSer = BytecodeRefs;
     E.CreateBeforeCreate = { OwnerClass.V };
+    /* UStruct::GetPreloadDependencies (Class.cpp 719-735), which the cook lists as serialize-before-serialize: the
+       function it overrides - fetched with bCheckSerialized while this one is serialized (AsyncLoading.cpp 3149-3162) -
+       and the structs and enums its parameters and locals are typed by. */
+    if (Def.Super.V != 0) E.SerBeforeSer.push_back(Def.Super.V);
+    for (const FPropertyDef& Prop : Def.Params) TypeRefs(Prop, E.SerBeforeSer);
 
     const FFunctionDef Captured = Def;
     E.Serialize = [Captured, Body](FArc& Ar) {
