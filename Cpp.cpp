@@ -651,11 +651,25 @@ void EmitCallOp(FScript& S, const FCallIR& Call)
     if (!Call.VirtualName.empty() && Call.bLocal) S.LocalVirtualFunction(Call.VirtualName);
     else if (!Call.VirtualName.empty()) S.VirtualFunction(Call.VirtualName);
     else if (Call.bLocal) S.LocalFinalFunction(Call.Fn);
-    else if (Call.bScript || Call.bInstance) S.FinalFunction(Call.Fn);
+    else if (Call.bScript || Call.bInstance || Call.Context.V) S.FinalFunction(Call.Fn);    // a native static on its CDO
     else S.CallMath(Call.Fn);
 }
 
-bool EmitCall(FScript& S, const FCallIR& Call, FIndex SelfExp, std::string* Err);
+/* RValue: the variable an assignment stores the call's value in, which a context call names so the VM clears it when
+   the object is None (ProcessContextOpcode, ScriptCore.cpp 2950-2953). */
+bool EmitCall(FScript& S, const FCallIR& Call, FIndex SelfExp, std::string* Err,
+              const std::optional<FFieldRef>& RValue = std::nullopt);
+bool EmitArg(FScript& S, const FArgIR& A, FIndex SelfExp, std::string* Err);
+
+/* A value stored into Dest: a call on another object names Dest as its context's r-value, as the editor's does
+   (KismetCompilerVMBackend.cpp 1241-1244), so a None object leaves Dest cleared, not holding its old value. */
+void EmitValueInto(FScript& S, const FArgIR& Value, FIndex SelfExp, const std::optional<FFieldRef>& Dest)
+{
+    if (Value.K == FArgIR::Call && Value.Sub && Value.Sub->Intrinsic.empty() && (Value.Sub->Target || Value.Sub->Context.V))
+        EmitCall(S, *Value.Sub, SelfExp, nullptr, Dest);
+    else
+        EmitArg(S, Value, SelfExp, nullptr);
+}
 
 struct FStmtIR
 {
@@ -914,7 +928,7 @@ bool EmitArgs(FScript& S, const std::vector<FArgIR>& Args, FIndex SelfExp, std::
     return true;
 }
 
-bool EmitCall(FScript& S, const FCallIR& Call, FIndex SelfExp, std::string* Err)
+bool EmitCall(FScript& S, const FCallIR& Call, FIndex SelfExp, std::string* Err, const std::optional<FFieldRef>& RValue)
 {
     if (Call.Intrinsic == "__AwaitPoint__") { S.ResumeSinks.push_back(Call.Resume); return true; }
     if (Call.Intrinsic == "__Asm__")
@@ -999,7 +1013,7 @@ bool EmitCall(FScript& S, const FCallIR& Call, FIndex SelfExp, std::string* Err)
                 EmitCallOp(C, Call);
                 bOk = EmitArgs(C, Call.Args, SelfExp, &SubErr);
                 C.EndFunctionParms();
-            });
+            }, RValue);
         if (!bOk && Err) *Err = SubErr;
         return bOk;
     }
@@ -1124,6 +1138,7 @@ private:
     bool TypeToProperty(const std::string& QualType, const std::string& PName, uint64 ExtraFlags,
                         const std::string& Where, FBlueprintClass& BP, FPropertyDef* Out, std::string* Err);
     bool LayoutOf(const std::string& QualType, int32* Size, int32* Align, std::string* Err);
+    bool NeedsResultLocal(const std::string& Type, int32 Depth = 0);
     bool StructLayout(const FRecord& R, int32* Size, int32* Align, std::string* Err);
     bool LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FStmtIR>& Out,
                    std::vector<FPropertyDef>& Locals, std::string* Err);
@@ -1338,6 +1353,9 @@ private:
     bool LowerCopyBack(const Json& Call, const std::vector<std::pair<const Json*, std::string>>& Refs,
                        const std::string& Method, FBlueprintClass& BP, FCallIR& Out, std::string* Err);
     std::set<std::string> WarnedCopies;
+    std::set<std::string> WarnedNoWorld;        // Class::Function that passed self as a world context without a world
+    std::set<std::string> UcsReached;           // the class's functions UserConstructionScript runs, itself included
+    std::set<std::string> WarnedUcsSpawn;
 
     /* `X::StaticClass()`: the record X names, read back from the mod's sources (clang's JSON keeps no qualifier). */
     const FRecord* NamedQualifier(const Json& Ref) const;
@@ -1351,6 +1369,10 @@ private:
     uint32 ModMethodFlags(const FRecord& Owner, const std::string& Method, FBlueprintClass& BP);
     FIndex FindEvent(FBlueprintClass& BP, const std::string& FromRecord, const std::string& Method,
                      uint32* InheritedFlags, bool bFlagsOnly = false);
+    /* The declaration of the function Method replaces, as ParentClass->FindFunctionByName finds it (each class's own
+       functions, then its interfaces, then its super; Self's own are no parent), and the record holding it. */
+    std::pair<const FRecord*, const Json*> ReplacedDecl(const FRecord& Self, const std::string& Method) const;
+    std::string Unreplicable(const Json& Typed, int32 Depth = 0) const;
 
     /* Records are keyed by qualified name; Bare holds only leaf names exactly one class claims,
        so an ambiguous bare name fails instead of picking the last class collected. */
@@ -1617,9 +1639,11 @@ void EmitStmts(const std::vector<FStmtIR>& Stmts, FScript& S, FIndex SelfExp, FL
                 ? std::vector<std::string>{ Top.S, Top.S } : std::vector<std::string>{ Top.S };
             const bool bLocalDest = Top.K == FArgIR::Local || Top.K == FArgIR::LocalOut;
             const FIndex VarOwner = bLocalDest ? SelfExp : Top.Owner;
+            const std::optional<FFieldRef> RValue = St.Var.K == FArgIR::Index ? std::nullopt
+                                                  : std::optional<FFieldRef>(FFieldRef{ Top.S, VarOwner });
             S.LetPath(St.Var.LetOp, Path, VarOwner,
                       [St, SelfExp](FScript& V) { EmitArg(V, St.Var, SelfExp, nullptr); },
-                      [St, SelfExp](FScript& V) { EmitArg(V, St.Value, SelfExp, nullptr); });
+                      [St, SelfExp, RValue](FScript& V) { EmitValueInto(V, St.Value, SelfExp, RValue); });
             break;
         }
 
@@ -1632,12 +1656,12 @@ void EmitStmts(const std::vector<FStmtIR>& Stmts, FScript& S, FIndex SelfExp, FL
             if (St.bHasValue)
                 S.Let(St.Var.LetOp, St.Var.S, SelfExp,
                       [St, SelfExp](FScript& V) { EmitArg(V, St.Var, SelfExp, nullptr); },
-                      [St, SelfExp](FScript& V) { EmitArg(V, St.Value, SelfExp, nullptr); });
+                      [St, SelfExp](FScript& V) { EmitValueInto(V, St.Value, SelfExp, FFieldRef{ St.Var.S, SelfExp }); });
             break;
 
         case FStmtIR::Return:
-            if (St.bHasValue)
-                S.Return([St, SelfExp](FScript& V) { EmitArg(V, St.Value, SelfExp, nullptr); });
+            if (St.bHasValue)       // the value goes to ReturnValue, the editor's Let destination for a return
+                S.Return([St, SelfExp](FScript& V) { EmitValueInto(V, St.Value, SelfExp, FFieldRef{ "ReturnValue", SelfExp }); });
             else
                 S.Return();
             break;
@@ -2189,6 +2213,12 @@ bool FCompiler::Collect(std::string* Err)
             if (En.second < Bottom || En.second > Top)
             { *Err = "UE_ENUM(" + Enum + "): " + En.first + " is out of range (the largest value is _MAX's)"; return false; }
         const std::string Leaf = LeafOf(Enum);
+        /* An enumerator's FName is <Enum>::<Name>, kept in one global map where the first enum loaded wins
+           (UEnum::AddNamesToMasterList, Enum.cpp 83-94): the game's enum of that name would answer every lookup. */
+        if (auto N = Enums.find(Leaf); (Owner.empty() || Owner == ModPackage) && N != Enums.end()
+            && N->second.Package.compare(0, ModPackage.size(), ModPackage) != 0)
+        { *Err = "UE_ENUM(" + Enum + "): " + N->second.Package + " already has an enum " + Leaf + ", whose enumerator names ("
+                 + Leaf + "::...) the engine keeps in one global table; rename it"; return false; }
         std::string First = D->second.front().first;
         for (const auto& En : D->second) if (En.second == 0) { First = En.first; break; }
         Enums[Enum] = { PathIn(Owner.empty() ? ModPackage : Owner, Enum), Leaf, U, First };
@@ -2248,15 +2278,82 @@ FIndex FCompiler::FindEvent(FBlueprintClass& BP, const std::string& FromRecord, 
             *InheritedFlags = FlagsOf(*R);
             return bFlagsOnly ? Null() : BP.EngineFunction(R->UePackage, R->UeName, UeMethod);
         }
-        /* Measured on BP_SentryGun_MoveMarker: an interface implementation has no Super. */
+        /* Measured on BP_SentryGun_MoveMarker: an implementation of an interface of the class's own list has no Super.
+           One an ancestor implements is found through it, as ParentClass->FindFunctionByName looks in each class's
+           interfaces before its super (Class.cpp:5281-5323): a mod ancestor's own stub (Generate compiles one for each
+           function it leaves out), a native one's interface function. */
         for (const std::string& I : R->Interfaces)
             if (const FRecord* IR = Find(I); IR && IR->IsNative() && IR->Methods.count(Method))
             {
                 *InheritedFlags = FlagsOf(*IR);
-                return Null();
+                if (R == Self || bFlagsOnly) return Null();
+                return R->IsNative() ? BP.EngineFunction(IR->UePackage, IR->UeName, UeMethod)
+                                     : BP.EngineFunction(PackageOf(*R), ClassOf(*R), UeMethod);
             }
     }
     return Null();      // not an override
+}
+
+/* A node's type with every typedef and alias resolved, as clang's canonical type spells it. */
+std::string DesugaredTypeOf(const Json& N)
+{
+    auto It = N.find("type");
+    return It == N.end() ? std::string() : It->value("desugaredQualType", It->value("qualType", std::string()));
+}
+
+std::pair<const FRecord*, const Json*> FCompiler::ReplacedDecl(const FRecord& Self, const std::string& Method) const
+{
+    for (const FRecord* R = &Self; R; R = R->Base.empty() ? nullptr : Find(R->Base))
+    {
+        if (R != &Self && !R->bIsInterface)
+            if (auto M = R->Methods.find(Method); M != R->Methods.end()
+                && (R->IsNative() ? !R->Forwards.count(Method) : !IsStaticDecl(*M->second) && !IsInlineMethod(*R, Method)))
+                return { R, M->second };
+        for (const std::string& I : R->Interfaces)
+            for (const FRecord* IR : InterfaceChain(Find(I)))
+                if (auto M = IR->Methods.find(Method); M != IR->Methods.end()) return { IR, M->second };
+    }
+    return {};
+}
+
+/* What of a C++ type never reaches the other machine, or empty: a TMap or TSet (their NetSerializeItem only logs) or an
+   interface (FInterfaceProperty's writes nothing), found through containers and a mod struct's members, as RepLayout
+   sends a struct member by member (InitFromProperty_r). A native struct may serialize itself, so it is not looked in. */
+std::string FCompiler::Unreplicable(const Json& Typed, int32 Depth) const
+{
+    const std::string Type = DesugaredTypeOf(Typed);
+    if (Type.find("TMap<") != std::string::npos || Type.find("TSet<") != std::string::npos) return "a TMap or TSet";
+    if (Type.find("TScriptInterface<") != std::string::npos) return "an interface";
+    if (Depth > 8) return {};
+    for (size_t At = 0; At < Type.size();)
+    {
+        const size_t End = std::find_if(Type.begin() + At, Type.end(), [](char C) { return !isalnum(uint8(C)) && C != '_' && C != ':'; }) - Type.begin();
+        if (End > At)
+            if (const FRecord* S = Find(Type.substr(At, End - At)); S && S->bIsStruct && !S->IsNative())
+                for (const Json* F : S->Fields)
+                    if (std::string Why = Unreplicable(*F, Depth + 1); !Why.empty()) return Why + " in " + S->CppName;
+        At = End + 1;
+    }
+    return {};
+}
+
+/* A function's signature as the engine tells two apart (IsSignatureCompatibleWith, Class.cpp:5882): the return type and
+   each parameter's, typedefs resolved, `const`, `class`, `struct` and `enum` dropped, and a const reference read as the
+   value it passes. Names do not count. */
+std::vector<std::string> SignatureOf(const Json& Fn)
+{
+    auto Norm = [](std::string T, bool bParm) {
+        const bool bConstRef = bParm && T.compare(0, 6, "const ") == 0 && !T.empty() && T.back() == '&';
+        for (const char* Kw : { "const ", "struct ", "class ", "enum " })
+            for (size_t At; (At = T.find(Kw)) != std::string::npos;) T.erase(At, strlen(Kw));
+        T.erase(std::remove(T.begin(), T.end(), ' '), T.end());
+        if (bConstRef) T.pop_back();
+        return T;
+    };
+    const std::string FnType = DesugaredTypeOf(Fn);
+    std::vector<std::string> Out{ Norm(FnType.substr(0, FnType.find('(')), false) };
+    ForEach(Fn, [&](const Json& C) { if (Kind(C) == "ParmVarDecl") Out.push_back(Norm(DesugaredTypeOf(C), true)); });
+    return Out;
 }
 
 /* The flags Generate gives a mod class's own method, less the ones that depend on its parameters: what an
@@ -2935,15 +3032,24 @@ bool FCompiler::LowerDispatcherCall(const Json& Call, const Json& Callee, const 
     if (Method == "Clear") { C.Intrinsic = "__ClearDelegate__"; return true; }
     if (Method != "Broadcast") { *Err = "TODO: unimplemented dispatcher method " + Method; return false; }
 
+    /* The signature function is the declaring class's: this one's own, or a Blueprint parent's, imported from its
+       package as the editor's broadcast node names it. */
+    const std::string SigName = Name(Obj) + "__DelegateSignature";
+    const FRecord* Declarer = nullptr;
+    for (const FRecord* A = Cur; A && !Declarer; A = A->Base.empty() ? nullptr : Find(A->Base))
+        if (A->Methods.count(SigName)) Declarer = A;
     auto Sig = CurSignatures.find(C.Args[0].S);
-    if (C.Args[0].Owner.V != BP.ClassIndex().V || Sig == CurSignatures.end())
+    if (Declarer && Declarer != Cur && (!Declarer->IsNative() || Declarer->UePackage.compare(0, 6, "/Game/") == 0))
+        C.Fn = BP.EngineFunction(PackageOf(*Declarer), ClassOf(*Declarer), C.Args[0].S + "__DelegateSignature");
+    else if (C.Args[0].Owner.V == BP.ClassIndex().V && Sig != CurSignatures.end())
+        C.Fn = Sig->second;
+    else
     {
-        *Err = "TODO: Broadcast needs the dispatcher's signature function, which only a UE_DISPATCHER of this class has: "
-             + C.Args[0].S;
+        *Err = "TODO: Broadcast needs the dispatcher's signature function, which only a UE_DISPATCHER of this class or a "
+               "Blueprint parent has: " + C.Args[0].S;
         return false;
     }
     C.Intrinsic = "__Broadcast__";
-    C.Fn = Sig->second;
     for (const Json* A : Args)
     {
         C.Args.emplace_back();
@@ -2951,17 +3057,24 @@ bool FCompiler::LowerDispatcherCall(const Json& Call, const Json& Callee, const 
     }
     /* A reference parameter of the signature is an out parm, which execCallMulticastDelegate steps with a null result
        pointer and copies from the address the argument left: HoistCallArgs gives anything but a variable a local. */
-    if (auto M = Cur->Methods.find(Name(Obj) + "__DelegateSignature"); M != Cur->Methods.end())
+    if (auto M = Declarer ? Declarer->Methods.find(SigName) : Cur->Methods.end(); Declarer && M != Declarer->Methods.end())
     {
         C.RefParms.emplace_back();
+        std::string WrittenRef;
         ForEach(*M->second, [&](const Json& P) {
             if (Kind(P) != "ParmVarDecl") return;
             std::string T = TypeOf(P);
             const bool bRef = !T.empty() && T.back() == '&';
+            if (bRef && T.compare(0, 6, "const ") != 0 && WrittenRef.empty()) WrittenRef = Name(P);
             while (!T.empty() && (T.back() == '&' || T.back() == ' ')) T.pop_back();
             C.RefParms.push_back(bRef ? StripTypeKeywords(T) : std::string());
         });
         if (C.RefParms.size() != C.Args.size()) C.RefParms.clear();
+        /* C++'s Broadcast copies a reference parameter back after the handlers ran; execCallMulticastDelegate copies the
+           argument into a parameter block of its own and never back (ScriptCore.cpp 3032-3075). */
+        if (!WrittenRef.empty())
+        { *Err = Name(Obj) + ".Broadcast: " + WrittenRef + " is a non-const reference, which a Broadcast never writes back "
+                 "to the caller; take it by value or by const reference"; return false; }
     }
     return true;
 }
@@ -4166,6 +4279,18 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             FArgIR A;
             if (!LowerArg(*Operand, BP, A, Err)) return false;
             Out.Sub->Args.push_back(A);
+            if (R->bIsInterface || (R->IsNative() && R->CppName[0] == 'I'))
+            {
+                /* A cast to an interface writes a 16-byte FScriptInterface (ScriptCore.cpp 3605-3645), and the `IFoo*` it
+                   gives is the object: EX_InterfaceToObjCast takes that out, where an 8-byte slot would take all 16. */
+                FArgIR Iface = std::move(Out);
+                Out = FArgIR();
+                Out.K = FArgIR::DynCast;
+                Out.CastOp = EX_InterfaceToObjCast;
+                Out.Owner = BP.EngineClass("/Script/CoreUObject", "Object");
+                Out.Sub = std::make_shared<FCallIR>();
+                Out.Sub->Args.push_back(std::move(Iface));
+            }
             return true;
         }
         if (CalleeName == "__ClassOf__")
@@ -4951,10 +5076,15 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
     }
     /* SpawnActor returns None while a construction script runs (bIsRunningConstructionScript, LevelActor.cpp), and the
        editor keeps spawning out of the construction script graph. */
-    if (CurFnName == "UserConstructionScript" && (MethodName == "BeginDeferredActorSpawnFromClass"
-        || MethodName == "BeginSpawningActorFromClass" || MethodName == "FinishSpawningActor"))
+    const bool bSpawn = MethodName == "BeginDeferredActorSpawnFromClass" || MethodName == "BeginSpawningActorFromClass"
+                     || MethodName == "FinishSpawningActor";
+    if (bSpawn && CurFnName == "UserConstructionScript")
     { *Err = "UserConstructionScript: " + MethodName + " spawns an actor, which the engine refuses while a construction "
              "script runs (it returns None); spawn in ReceiveBeginPlay"; return false; }
+    /* A helper may run elsewhere too, so it only warns. */
+    if (bSpawn && Cur && UcsReached.count(CurFnName) && WarnedUcsSpawn.insert(CurFnName).second)
+        printf("  warning: %s::%s spawns an actor and UserConstructionScript calls it: the engine refuses a spawn while a "
+               "construction script runs (it returns None)\n", Cur->CppName.c_str(), CurFnName.c_str());
     /* AddComponent finds its template by name in the calling class's ComponentTemplates (ActorConstruction.cpp
        1100-1125), and a mod class has none, so it would always return None. */
     if (MethodName == "AddComponent" && K == "CXXMemberCallExpr")
@@ -5140,8 +5270,10 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         Out.Fn = BP.EngineFunction(CalleePackage, CalleeName, UeNameOf(Called, MethodName));
         Out.bScript = CalleePackage.compare(0, 6, "/Game/") == 0;
         Out.bInstance = !bStatic;
-        /* A Blueprint static needs the CDO context; EX_CallMath finds it itself for a native. */
-        if (Out.bScript && bStatic)
+        /* A Blueprint static needs the CDO context; EX_CallMath finds it itself for a native, but never asks the
+           callspace an authority-only or cosmetic one has (KismetCompilerVMBackend.cpp 1222-1231): that one is called
+           through CallFunction on the CDO, as the editor calls it. */
+        if (bStatic && (Out.bScript || (FullDecl && AccessFlagsOf(*FullDecl))))
             Out.Context = BP.ClassDefaultObject(CalleePackage, CalleeName);
     }
 
@@ -5193,7 +5325,11 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         });
     }
     const size_t Hidden = LatentAt < Parms.size() ? 1 : 0;
-    if (Hidden && Out.Args.size() == Parms.size())
+    bool bGivesInfo = Hidden && Out.Args.size() == Parms.size();
+    if (Hidden && CallExprNode.contains("inner"))       // `Delay(1.0f, Info)`: one short, so the count alone misses it
+        for (size_t At = 1; At < CallExprNode["inner"].size(); ++At)
+            bGivesInfo = bGivesInfo || StripTypeKeywords(TypeOf(CallExprNode["inner"][At])) == "FLatentActionInfo";
+    if (bGivesInfo)
     { *Err = MethodName + ": leave the FLatentActionInfo argument out, the compiler supplies it"; return false; }
     /* `auto Cls = LoadAssetClass(Soft)`: genueapi's overload that leaves out a one-parameter completion delegate
        returns that parameter, where the UFunction returns nothing. clang's type drops the parameter's name. */
@@ -5218,8 +5354,20 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         if (!IsWcoName(Parms[I])) continue;
         FArgIR Wco;
         if (!CurrentWco.empty()) { Wco.K = FArgIR::Local; Wco.S = CurrentWco; }
+        const bool bSelf = CurrentWco.empty()
+                        && (Out.Args.size() + 1 + Omitted == Parms.size() || (I < Defaulted.size() && Defaulted[I]));
         if (Out.Args.size() + 1 + Omitted == Parms.size()) Out.Args.insert(Out.Args.begin() + I, Wco);
         else if (I < Defaulted.size() && Defaulted[I]) Out.Args[I] = Wco;
+        /* The editor wires self to the pin only in a class that implements GetWorld (CallFunctionHandler.cpp 547-598);
+           any other object finds a world only through its Outer (UObject::GetWorld). */
+        bool bOwnWorld = false;
+        for (const FRecord* A = Cur; A && !bOwnWorld; A = A->Base.empty() ? nullptr : Find(A->Base))
+            bOwnWorld = A->UeName == "Actor" || A->UeName == "ActorComponent" || A->UeName == "UserWidget"
+                     || A->UeName == "GameInstance" || A->UeName == "Subsystem";
+        if (bSelf && Cur && !bOwnWorld && WarnedNoWorld.insert(Cur->CppName + "::" + CurFnName).second)
+            printf("  warning: %s::%s passes self as %s's world context, and an object of this class finds its world only "
+                   "through its Outer: make it with an actor or component as Outer, or the call finds no world\n",
+                   Cur->CppName.c_str(), CurFnName.c_str(), MethodName.c_str());
         break;
     }
     /* A reference parameter, const or not, is CPF_OutParm. A script callee steps its argument with no result buffer to
@@ -5754,8 +5902,15 @@ std::string FCompiler::FreshEventName(const std::string& Stem)
             if (A->Methods.count(E)) return true;
         return false;
     };
+    /* The event is bound by name on self, found on the most derived class first: under a Blueprint parent, whose own
+       generated events this compile cannot see, the class's name keeps a child's apart from the parent's. */
+    bool bBlueprintParent = false;
+    for (const FRecord* A = Cur && !Cur->Base.empty() ? Find(Cur->Base) : nullptr; A && !bBlueprintParent;
+         A = A->Base.empty() ? nullptr : Find(A->Base))
+        bBlueprintParent = !A->IsNative() || A->UePackage.compare(0, 6, "/Game/") == 0;
+    const std::string Named = bBlueprintParent ? LeafOf(Cur->CppName) + "_" + Stem : Stem;
     std::string Event;
-    for (int32 N = 0; Taken(Event = Stem + "_" + std::to_string(N)); ++N) {}
+    for (int32 N = 0; Taken(Event = Named + "_" + std::to_string(N)); ++N) {}
     GeneratedEvents.insert(Event);
     return Event;
 }
@@ -5997,6 +6152,29 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             if (!bAny && bOk) { *Err = "a declaration statement declares nothing usable"; bOk = false; }
             return;
         }
+        /* A result the statement throws away is stepped into a 64-byte buffer nothing constructs or destroys
+           (ScriptCore.cpp 1058, 1120): one with a destructor, or a bigger one, lands in a local instead, as the editor
+           gives every return pin a term (KismetCompilerMisc.cpp 1841-1871). */
+        auto KeepResult = [&] {
+            if (St.K != FStmtIR::StaticCall || !CurLocals || (St.Call.Fn.V == 0 && St.Call.VirtualName.empty())
+                || !NeedsResultLocal(TypeOf(*S))) return true;
+            FPropertyDef PD;
+            const std::string Kept = "__Dropped" + std::to_string(ReadTmpCounter++) + "__";
+            if (!TypeToProperty(TypeOf(*S), Kept, 0, "a discarded result", BP, &PD, Err)) return false;
+            PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+            CurLocals->push_back(PD);
+            FArgIR Value;
+            Value.K = FArgIR::Call;
+            Value.Sub = std::make_shared<FCallIR>(std::move(St.Call));
+            St = FStmtIR();
+            St.K = FStmtIR::Assign;
+            St.Var.K = FArgIR::Local;
+            St.Var.S = Kept;
+            St.Var.LetOp = LetOpFor(TypeOf(*S));
+            St.bAssignLocal = true;
+            St.Value = std::move(Value);
+            return true;
+        };
         if (K == "CXXMemberCallExpr")
         {
             /* Same lowering as a call used for its value; the target rides in FCallIR::Target. */
@@ -6005,11 +6183,13 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             bOk = LowerArgRaw(*S, TypeOf(*S), BP, V, Err);
             if (bOk) St.Call = *V.Sub;
             if (bOk && St.Call.Inline) { for (FStmtIR& B : *St.Call.Inline) Out.push_back(std::move(B)); return; }
+            bOk = bOk && KeepResult();
         }
         else if (K == "CallExpr")
         {
             bOk = LowerCall(*S, BP, St.Call, Err);
             if (bOk && St.Call.Inline) { for (FStmtIR& B : *St.Call.Inline) Out.push_back(std::move(B)); return; }
+            bOk = bOk && KeepResult();
         }
         else if (K == "CompoundAssignOperator"
               || (K == "UnaryOperator" && (S->value("opcode", std::string()) == "++" || S->value("opcode", std::string()) == "--")))
@@ -7186,6 +7366,12 @@ bool FCompiler::CheckMemberNames(const FRecord& R, std::string* Err) const
     for (const Json* F : R.Fields) if (!Claim(Name(*F), false)) return false;
     for (const Json* M : R.AllMethods)
         if (!M->value("inline", false) && !IsInlineMethod(R, Name(*M)) && !Claim(Name(*M), true)) return false;
+    /* A class's latent calls resume through its ubergraph, found by name on the object (most derived first), so a
+       function of that name in this class or a subclass would catch its resumes. */
+    for (const Json* M : R.AllMethods)
+        if (Lower(Name(*M)).compare(0, 17, "executeubergraph_") == 0)
+        { *Err = R.CppName + "::" + Name(*M) + ": ExecuteUbergraph_<Class> is the name of a class's ubergraph, whose latent "
+                 "calls resume through it; rename it"; return false; }
     if (R.bIsStruct) return true;
     /* A component is an object named after its variable under the actor: DefaultSceneRoot is the node the SCS adds
        when no component of its own is a scene root, and a native default subobject is created under its own name
@@ -8894,6 +9080,24 @@ static std::string UnknownClass(const std::string& Where, const std::string& Qua
     return "TODO: unimplemented " + Where + ": " + QualType;
 }
 
+/* A call result the VM's 64-byte statement buffer cannot take: one with a destructor (a string, a container, a struct
+   holding one) or bigger than the buffer. */
+bool FCompiler::NeedsResultLocal(const std::string& Type, int32 Depth)
+{
+    const std::string T = StripTypeKeywords(Type);
+    if (T.empty() || T == "void" || Depth > 8) return false;
+    if (T == "FString" || T == "FText" || T.compare(0, 7, "TArray<") == 0 || T.compare(0, 5, "TMap<") == 0
+        || T.compare(0, 5, "TSet<") == 0) return true;
+    int32 Size = 0, Align = 1;
+    std::string NoLayout;
+    if (LayoutOf(T, &Size, &Align, &NoLayout) && Size > 64) return true;
+    if (auto St = Structs.find(T); St != Structs.end())
+        for (const auto& Field : St->second.Fields) if (NeedsResultLocal(Field.first, Depth + 1)) return true;
+    if (const FRecord* R = Find(T); R && R->bIsStruct)
+        for (const Json* F : R->Fields) if (NeedsResultLocal(TypeOf(*F), Depth + 1)) return true;
+    return false;
+}
+
 bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& PName, uint64 ExtraFlags,
                                const std::string& Where, FBlueprintClass& BP, FPropertyDef* Out, std::string* Err)
 {
@@ -8915,6 +9119,34 @@ bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& P
             }
             else if (!TypeToProperty(A, PName, 0, Where + " element", BP, &E, Err)) return false;
             Parts.push_back(E);
+        }
+        /* Every Add / Find and a loaded default hash the element or key through GetValueTypeHash, which check()s
+           CPF_HasGetValueTypeHash (Property.cpp 1517-1522): never on a bool, an FText or a delegate, and on a native
+           struct only when its CppStructOps has GetTypeHash. The list is HASHABLE_STRUCTS in invariant_rules/properties.py;
+           a UserDefinedStruct always hashes, and a struct of the game's own modules is not judged. */
+        if (Tpl[1] != 'A')
+        {
+            static const std::set<std::string> Hashable = {
+                "AdaptorTriangleID", "AssetData", "CachedRigElement", "Color", "CurveTableRowHandle", "DateTime",
+                "EdGraphPinReference", "EdgeID", "FontData", "FontOutlineSettings", "GameplayTag", "Guid", "HLODInstancingKey",
+                "InputChord", "IntPoint", "IntVector", "Key", "LinearColor", "MovieSceneEvaluationKey",
+                "MovieSceneEvaluationOperand", "MovieSceneObjectBindingID", "MovieSceneTrackInstanceInput",
+                "NavAgentProperties", "NiagaraAssetVersion", "NiagaraDataSetID", "NiagaraEmitterNameSettingsRef",
+                "NiagaraFunctionSignature", "NiagaraID", "NiagaraTypeDefinition", "NiagaraVMExecutableDataId",
+                "NiagaraVariableBase", "PolygonGroupID", "PolygonID", "PrimaryAssetId", "PrimaryAssetType", "RigElementKey",
+                "RigElementKeyCollection", "SlateFontInfo", "SolverTrailingData", "TimerHandle", "Timespan", "TriangleID",
+                "Vector", "Vector2D", "Vector4", "VertexID", "VertexInstanceID", "SoftObjectPath", "SoftClassPath",
+                "Vector_NetQuantize", "Vector_NetQuantize10", "Vector_NetQuantize100", "Vector_NetQuantizeNormal" };
+            const FPropertyDef& K = Parts[0];
+            const FRecord* S = K.Type == "StructProperty" ? Find(StripTypeKeywords(Args[0])) : nullptr;
+            static const std::set<std::string> GameModules = { "/Script/FSD", "/Script/FSDEngine", "/Script/FSDRawInput",
+                                                              "/Script/FSDAnsel", "/Script/DiscordSDK" };
+            const bool bNativeStruct = S && S->IsNative() && S->UePackage.compare(0, 8, "/Script/") == 0
+                                    && !GameModules.count(S->UePackage);
+            if (K.Type == "BoolProperty" || K.Type == "TextProperty" || K.Type.find("DelegateProperty") != std::string::npos
+                || (bNativeStruct && !Hashable.count(S->UeName)))
+            { *Err = Where + ": a " + (Tpl[1] == 'S' ? "TSet element" : "TMap key") + " of type " + StripTypeKeywords(Args[0])
+                     + " cannot hash, and the engine hashes each one; use a type that does, or a UE_STRUCT holding it"; return false; }
         }
         if (Tpl[1] == 'A')      *Out = ArrayParam(PName, Parts[0], ExtraFlags);
         else if (Tpl[1] == 'S') *Out = SetParam(PName, Parts[0], ExtraFlags);
@@ -9865,16 +10097,17 @@ bool FCompiler::TransplantFunctions(const FRecord& R, const FRecord& B, const FP
         FCookedExport& C = P.Exports[size_t(Copy - 1)];
         std::memset(C.Payload.data() + L.Super, 0, 4);         // SuperStruct
         C.Super = 0;
-        /* An RPC's copy is a plain function. With FUNC_Net and no super it would be a net field of the class's own
+        /* Nothing overrides the copy, and Parent:: calls it by pointer, which the editor does only for a final function.
+           An RPC's copy is a plain function. With FUNC_Net and no super it would be a net field of the class's own
            (Class.cpp:4189), shifting the RPC indices against the game's, and a call to it would be routed again
            (CallFunction's call space). Parent:: means the body, run where the RPC already arrived. */
+        uint32 CopyFlags = L.FunctionFlags | FUNC_Final;
         if (L.FunctionFlags & FUNC_Net)
         {
-            const uint32 Plain = L.FunctionFlags & ~uint32(FUNC_Net | FUNC_NetReliable | FUNC_NetServer | FUNC_NetClient
-                                                            | FUNC_NetMulticast | FUNC_NetValidate);
-            std::memcpy(C.Payload.data() + L.Flags, &Plain, 4);
+            CopyFlags &= ~uint32(FUNC_Net | FUNC_NetReliable | FUNC_NetServer | FUNC_NetClient | FUNC_NetMulticast | FUNC_NetValidate);
             C.Payload.erase(C.Payload.begin() + std::ptrdiff_t(L.Flags + 4), C.Payload.begin() + std::ptrdiff_t(L.Flags + 6));   // RepOffset
         }
+        std::memcpy(C.Payload.data() + L.Flags, &CopyFlags, 4);
         if (!AddClassFunction(P, ClassExport, Copy, CopyRef, &Bad)) { *Err = Where + ": " + Bad; return false; }
         Kept[To] = Copy;
         Ed->Objects.push_back(Class + "::" + CopyName + " (the game's " + Name + ", kept)");
@@ -10199,6 +10432,11 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 /* An interface's variable is this class's own property when this class is the one implementing
                    it; below a parent that does, it is one more inherited property. */
                 const bool bInterfaceVar = !bThroughComponent && DR->bIsInterface && InterfaceVarHolder(*DR, &R) == &R;
+                /* How the component was made decides how the actor keeps it: Instance or UserConstructionScript on a
+                   template skips AddOwnedComponent (ActorComponent.cpp 282-287) and the name lookups a native
+                   subobject answers (ActorComponent.cpp 1912; ActorConstruction.cpp 737). The engine sets it. */
+                if (bThroughComponent && Name(*Lhs) == "CreationMethod")
+                { *Err = Where + ": " + CompName + "->CreationMethod is set by the engine when it makes the component; drop it"; bOk = false; return; }
 
                 FPropertyDef PD;
                 /* The tag is read back by the engine's name of the member, which its declarer's header knows. */
@@ -10437,7 +10675,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                function's name when it has one. */
             const std::string Notify = Rep->second.substr(0, Rep->second.find(':'));
             const std::string Cond = Rep->second.substr(Rep->second.find(':') + 1);
-            if (HoldsMapOrSet(PD)) { *Err = R.CppName + "::" + FieldName + ": a TMap or TSet does not replicate"; return false; }
+            if (const std::string Why = HoldsMapOrSet(PD) ? "a TMap or TSet" : Unreplicable(*F); !Why.empty())
+            { *Err = R.CppName + "::" + FieldName + ": " + Why + " does not replicate"; return false; }
             PD.PropertyFlags |= CPF_Net;
             if (!Notify.empty())
             {
@@ -10607,6 +10846,24 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         }
     }
 
+    /* The functions UserConstructionScript reaches through calls to the class's own: a spawn in one returns None
+       there as in the script itself (LowerCall). */
+    UcsReached.clear();
+    WarnedUcsSpawn.clear();
+    for (std::vector<std::string> Todo = { "UserConstructionScript" }; !Todo.empty();)
+    {
+        const std::string Fn = Todo.back();
+        Todo.pop_back();
+        auto M = std::find_if(Methods.begin(), Methods.end(), [&](const FMethod& F) { return F.Name == Fn; });
+        if (M == Methods.end() || !M->Body || !UcsReached.insert(Fn).second) continue;
+        std::function<void(const Json&)> Scan = [&](const Json& N) {
+            if (Kind(N) == "MemberExpr") Todo.push_back(N.value("name", std::string()));
+            else if (Kind(N) == "DeclRefExpr" && N.contains("referencedDecl")) Todo.push_back(Name(N["referencedDecl"]));
+            ForEach(N, Scan);
+        };
+        Scan(*M->Body);
+    }
+
     /* A method that makes a latent call becomes a segment of ExecuteUbergraph_<Class> and keeps its name as a stub
        event that jumps in, as the editor compiles an event graph. Any class can: every BPGC object gets a persistent
        frame (FObjectInitializer::PostConstructInit), and UWorld::Tick resumes every object's actions
@@ -10626,6 +10883,12 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         if (!What.empty())
         { *Err = R.CppName + ": " + What + " does nothing, since only an actor or an actor component replicates"; return false; }
     }
+    /* The engine routes a call by the called UFunction's flags (CallFunction, GetFunctionCallspace); an inline method is
+       none, its body copied into each caller, so its marker would go nowhere. */
+    for (const Json* M : R.AllMethods)
+        if ((M->value("inline", false) || IsInlineMethod(R, Name(*M))) && (NetFlagsOf(*M) | AccessFlagsOf(*M)))
+        { *Err = R.CppName + "::" + Name(*M) + ": an RPC, authority-only or cosmetic marker on an inline method does nothing, "
+                 "since no call to it is routed; drop inline"; return false; }
     struct FSegment
     {
         std::string Name;
@@ -10783,6 +11046,19 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             if (std::none_of(Params.begin(), Params.end(), Typed) && std::none_of(Locals.begin(), Locals.end(), Typed))
                 Locals.push_back(Keep);
         }
+        /* The VM constructs a local only under FUNC_HasDefaults (UFunction::InitializeDerivedMembers sets
+           FirstPropertyToInit, Class.cpp 5653-5660; ScriptCore.cpp 909-916); without it the frame stays memzeroed, which
+           is no FText, FTransform, FHitResult, TMap or defaulted struct. The editor sets it for any local without
+           CPF_ZeroConstructor (KismetCompiler.cpp 2328-2335): the native structs below have it (Property.cpp 32-373,
+           ZERO_NATIVE_STRUCTS in invariant_rules/functions.py); a Blueprint struct is taken to need it, its defaults unread. */
+        static const std::set<std::string> ZeroStructs = {
+            "Vector", "IntPoint", "IntVector", "Vector2D", "Vector4", "Plane", "Rotator", "Box", "Box2D", "Matrix",
+            "BoxSphereBounds", "LinearColor", "Color", "TwoVectors", "Guid", "RandomStream", "DateTime", "Timespan",
+            "SoftObjectPath", "SoftClassPath", "PrimaryAssetType", "PrimaryAssetId", "Margin" };
+        const bool bLocalsNeedCtor = std::any_of(Locals.begin(), Locals.end(), [](const FPropertyDef& L) {
+            return L.Type == "TextProperty" || L.Type == "SetProperty" || L.Type == "MapProperty" || L.Type == "SoftObjectProperty"
+                || L.Type == "SoftClassProperty" || L.Type == "LazyObjectProperty" || L.Type == "FieldPathProperty"
+                || (L.Type == "StructProperty" && !ZeroStructs.count(L.StructName)); });
         /* Locals follow ReturnValue in ChildProperties; the engine tells them apart by CPF_Parm. */
         for (const FPropertyDef& L : Locals) Params.push_back(L);
 
@@ -10797,6 +11073,18 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
            FUNC_Event would be treated by the loader as an overridable entry point. */
         uint32 Inherited = 0;
         const FIndex Super = FindEvent(BP, R.CppName, Fn.Name, &Inherited);
+        const auto [Owner, Replaced] = ReplacedDecl(R, Fn.Name);
+        /* Only a Blueprint event is looked up by name; C++ and the calls bound to a native function (EX_FinalFunction)
+           keep running it, so a function of the same name replaces it for some callers only. Events.json lists every
+           event of the engine and the game; another mod's class, from its UE_CLASS header, is not in it. */
+        if (Super.V != 0 && !(Inherited & FUNC_BlueprintEvent) && Owner && Owner->UePackage.compare(0, 8, "/Script/") == 0)
+        { *Err = R.CppName + "::" + Fn.Name + ": " + Owner->CppName + "::" + Fn.Name + " is native and no Blueprint event, so "
+                 "no function replaces it: C++ and the calls bound to it still run it; rename " + Fn.Name; return false; }
+        /* A caller lays the parameters out for the function it names (ProcessEvent, an interface's Execute_, a received
+           RPC), and ProcessEvent copies them into this one's frame at this one's offsets (ScriptCore.cpp:1958-2016). */
+        if (Replaced && Replaced != &Decl && !R.bIsPatch && SignatureOf(*Replaced) != SignatureOf(Decl))     // a patch checks its own
+        { *Err = R.CppName + "::" + Fn.Name + " is " + TypeOf(Decl) + ", and the " + Owner->CppName + "::" + Fn.Name
+                 + " it replaces is " + TypeOf(*Replaced) + ": callers pass that one's parameters; declare the same"; return false; }
         uint32 Flags = Inherited ? Inherited & kOverrideInherits
                      : IsStaticDecl(Decl) ? uint32(FUNC_Static | FUNC_BlueprintCallable | FUNC_Public | FUNC_Final)
                      : kPlainMethodFlags;
@@ -10815,6 +11103,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         /* ProcessEvent only lists a script function's out-parms for EX_LocalOutVariable when this is set
            (ScriptCore.cpp), and native code, delegates and interfaces all call through ProcessEvent. */
         if (HasOutParm(Params)) Flags |= FUNC_HasOutParms;
+        if (bLocalsNeedCtor && !bMadeLatentCall) Flags |= FUNC_HasDefaults;     // a waiting one's locals are the ubergraph's
         if (const uint32 Net = NetFlagsOf(Decl) | NetFlagsOf(M))
         {
             /* Measured on BP_LiftPod: Server_ButtonPressedAnim is Net | NetServer, Multi_ButtonPressedAnim
@@ -10833,6 +11122,13 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             if (!RetType.empty() && RetType != "void") { *Err = R.CppName + "::" + Fn.Name + ": an RPC returns void"; return false; }
             if (std::any_of(Params.begin(), Params.end(), [](const FPropertyDef& P) { return HoldsMapOrSet(P); }))
             { *Err = R.CppName + "::" + Fn.Name + ": an RPC parameter cannot be a TMap or TSet, which do not replicate"; return false; }
+            std::string Unsent;
+            ForEach(Decl, [&](const Json& C) {
+                if (Kind(C) == "ParmVarDecl" && Unsent.empty())
+                    if (const std::string Why = Unreplicable(C); !Why.empty()) Unsent = Name(C) + " is or holds " + Why;
+            });
+            if (!Unsent.empty())
+            { *Err = R.CppName + "::" + Fn.Name + ": an RPC parameter cannot hold what does not replicate: " + Unsent; return false; }
             Flags |= Net;
             bReplicatesAnything = true;
         }
@@ -10888,9 +11184,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     }
     if (!Segments.empty())
     {
-        const std::string UberName = "ExecuteUbergraph_" + R.CppName;
-        for (const FRecord* A = &R; A; A = A->Base.empty() ? nullptr : Find(A->Base))
-            if (A->Methods.count(UberName)) { *Err = A->CppName + " declares " + UberName + ", the ubergraph's own name"; return false; }
+        const std::string UberName = "ExecuteUbergraph_" + R.CppName;    // CheckMemberNames refuses a member named so
 
         /* Every segment's parms and locals share the ubergraph frame: <Fn>_<Name>, numbered past a taken name. The
            mod's own properties along the class chain are taken too, so a frame local never reads like one. */

@@ -358,6 +358,7 @@ Notes:
 | `TSoftObjectPtr<T>`, `TSoftClassPtr<T>`, `TScriptInterface<I>` | Soft object and soft class references, and an interface reference. | Yes |
 | `FVector Home;`, `FAmmo Ammo;` | An engine or game struct, or a mod `UE_STRUCT`. See [Structs](#structs). | Yes |
 | `TArray<FVector>`, `TSet<int32>`, `TMap<FName, int32>` | Array, Set and Map variables. A container inside a container goes through a generated wrapper struct; see [Containers](#containers). | Yes |
+| `TSet<bool>`, `TMap<FText, int32>`, `TSet<FRotator>` | Refused: "cannot hash, and the engine hashes each one". A set element or map key must hash: not a bool, an FText or a delegate, and an engine struct only if it has a GetTypeHash (FVector, FGuid, FGameplayTag and others do; FRotator, FHitResult, FTransform do not). A `UE_STRUCT` always hashes. | Refused |
 | `UE_DISPATCHER(OnScored, int32 Score);` | An event dispatcher. See [Event dispatchers](#event-dispatchers). | Yes |
 | `int32 *Raw;` | A pointer to anything but a UObject is an address, held in an Integer64 variable. See [Pointers and memory](#pointers-and-memory). | Yes |
 | `uint16 W;`, `double D;` | Refused: "unimplemented property W: uint16". UE 4.27 Blueprint has no such type; see [Types](#types). | Refused |
@@ -928,6 +929,7 @@ number constants, not a Blueprint type.
 | `enum class EO : uint8 { A = 255 };` `UE_ENUM(EO);` | Refused (`A is out of range`): `_MAX` needs the next value, so a uint8 enum's largest value is 254. | Refused |
 | `enum class EGear : uint8 { Low, High, EGear_MAX };` | The UE C++ idiom: a declared `EGear_MAX` one past the largest value is the closing `_MAX` itself, not a second entry. Any other value for it is refused. | Yes |
 | `UE_ENUM(EMissing);` | Refused (`names no enum with enumerators`). | Refused |
+| `UE_ENUM(EDialogRestriction);` for a mod enum named like a game or engine enum, in any namespace | Refused (`/Script/FSD already has an enum EDialogRestriction`). The engine keeps every enumerator's name, `EDialogRestriction::None`, in one global table where the first enum loaded wins, so lookups by name would answer with the game's. Rename it. Two mods' enums of one name clash the same way, which the compiler cannot see; give each mod's enums names of their own. | Refused |
 | `UE_ENUM_IN(ESystems, "/Game/_MyMods/Shared");` | For an enum in a header several mods include. Only the source whose `UE_MOD_PACKAGE` is exactly that path cooks it; every other mod imports it from there. `UE_STRUCT_IN` does the same for structs: [Structs](#structs). | Yes |
 | `ELocal L;` with no `UE_ENUM` on `ELocal` | Refused (`unimplemented property L: ELocal`). The enum's constants still fold to numbers, `(int32)ELocal::B`, but it is not a Blueprint type. Add `UE_ENUM`. | Refused |
 | `enum { kCap = 1000, kFar = 5000000000 };` | Constants of an enum with no fixed type are int-sized, or int64 when a value needs it, as C++ makes them. They fold to their values. | Yes |
@@ -2198,6 +2200,8 @@ latent call's `FLatentActionInfo`, because the compiler fills them in.
 | `Char->Server_SetRunning(false);` | The same on another object. The engine applies its own authority, cosmetic and RPC routing to the call. | Yes |
 | `FHitResult Hit;` passed to a `T&` parameter | A `T&` parameter of an engine function is an output and needs a variable, as in C++. | Yes |
 | `UKismetMathLibrary::RandomInteger(10)` | A native static is a direct library call. | Yes |
+| `UGameplayStatics::ApplyDamage(...)`, `PlaySound2D(...)` | An authority-only or cosmetic static is called on the library's default object, so the engine checks where it may run, as for the editor's node. | Yes |
+| `UGameplayStatics::GetPlayerPawn(0)` in a class that is no actor, component, widget, GameInstance or subsystem | Warns: "passes self as GetPlayerPawn's world context, and an object of this class finds its world only through its Outer". The editor wires self to the pin only in a class with a world. Make the object with an actor or component as its Outer, or pass a world context. | Warns |
 | A static of a game Blueprint library, or of another mod's library | A final call on that class's default object. | Yes |
 | A call or an expression passed to an engine function's `const T&` parameter | Stored in a hidden local first, because the VM needs an address. | Yes |
 | `Target->K2_DestroyActor();` with `Target` null | The call is skipped (the engine logs "Accessed None"), and a returned value reads as zero. C++ would crash here; a Blueprint does not. The same holds for a mod function called on a null object. | Yes |
@@ -2332,8 +2336,8 @@ Notes:
 ## Overrides and parent calls
 
 A method with the name of an event or function that the parent class exposes overrides it. There is no macro, and
-C++'s `override` keyword is refused. The rule to remember: AssetGen does not check the parameter list, so copy the
-declaration from UeApi exactly, parameter names included.
+C++'s `override` keyword is refused. Copy the declaration from UeApi: an override with other parameter types than
+the function it replaces is refused.
 
 ### Overriding engine and game events
 
@@ -2370,13 +2374,15 @@ public:
 
 Notes:
 
-- The parameter list is not checked. `void ReceiveTick(int32 X)` still cooks as the ReceiveTick override, which the
-  engine calls with a float.
+- The parameter list must match. `void ReceiveTick(int32 X)` is refused: "FuncTickInt::ReceiveTick is void (int32),
+  and the AActor::ReceiveTick it replaces is void (float): callers pass that one's parameters; declare the same". The
+  same holds for an override of a mod parent's function, of an RPC, and for an interface function's implementation.
+  Names do not count, and a `const T&` parameter matches a `T` one.
 - An override keeps its parent's access: a ReceiveBeginPlay override is protected even when written under `public:`.
 - AssetGen reads a parent's flags from the SDK's `Events.json`, which lists engine and game classes. A mod method named
-  like an engine function that is not an event there (K2_DestroyActor, say) is cooked with plain flags, as an ordinary
-  mod function of that name. An override of a function of another mod's class (from a `UE_CLASS` header) gets plain
-  flags too, not the parent's.
+  like an engine function that is not an event there (K2_DestroyActor, say) is refused: "AActor::K2_DestroyActor is
+  native and no Blueprint event, so no function replaces it". C++ and calls bound to it keep running the engine's.
+  An override of a function of another mod's class (from a `UE_CLASS` header) gets plain flags, not the parent's.
 - An event override is not BlueprintCallable, so the editor API stub leaves it out.
 - Only an actor's tick is switched on. A `UActorComponent` subclass that overrides ReceiveTick gets no component tick
   setting, and whether it ticks is untested.
@@ -2603,7 +2609,7 @@ class Dummy : public AActor {
   UE_COMPONENT(USceneComponent, Root);
   UE_COMPONENT(UHealthComponent, Health);           // DRG's own component classes
   UE_COMPONENT(UOutlineComponent, Outline);
-  UE_DEFAULTS { Health->canTakeDamage = false; }
+  UE_DEFAULTS { Health->canTakeDamage = false; }   // not CreationMethod, which the engine sets and which is refused
 
 public:
   void ReceiveBeginPlay() { Health->SetHealthDirectly(50.0f); }
@@ -3661,9 +3667,9 @@ Notes:
 |---|---|---|
 | `OnScored.Broadcast(N, this);` | Call OnScored. Every bound handler runs right away, one after another, before Broadcast returns. | Yes |
 | `GetPeer()->OnPeerHit.Broadcast(X);` | Fires the dispatcher of another object of the same class. The object is evaluated before the arguments, so an argument that changes what GetPeer() returns does not redirect the broadcast. | Yes |
-| `UE_DISPATCHER(OnList, TArray<int32> &Items);` | A reference parameter. It compiles without a warning, but each handler works on a copy (see the notes). | Yes |
+| `UE_DISPATCHER(OnList, TArray<int32> &Items);` | A non-const reference parameter. The declaration compiles, but a Broadcast is refused: "Items is a non-const reference, which a Broadcast never writes back to the caller". The engine copies each argument into a parameter block of its own. Take it by value or by `const &`. | Refused |
 | `OnDestroyed.Broadcast(this);` | Refused today: "Broadcast needs the dispatcher's signature function". Only a UE_DISPATCHER of the class being compiled can be broadcast; the game's dispatchers cannot. | Not yet |
-| `OnHit.Broadcast(1);` on a dispatcher a mod parent declares | Refused today with the same message. Give the parent a method that broadcasts, and call it from the child. | Not yet |
+| `OnHit.Broadcast(1);` on a dispatcher a mod parent declares | Broadcasts through the parent's signature function, as the editor's node on a child does. | Yes |
 
 ```cpp
 class PBase : public AActor {
@@ -3916,9 +3922,9 @@ Notes:
   default a TScriptInterface class variable takes.
 - For a Blueprint interface (a name ending in `_C`) that a header only forward-declares, the variable is refused with
   the include to add: "is only forward-declared here - #include ...".
-- For a game interface, `Cast<IHealth>(Other)` compiles with no diagnostic, but the engine's cast produces a 16-byte
-  interface value where AssetGen reserves an 8-byte object pointer; whether it overruns has not been checked. Do not
-  use it; use `TScriptInterface<IHealth>`.
+- For a game interface, `Cast<IHealth>(Other)` is Other if it implements IHealth, else nullptr, as in C++. The
+  engine's cast makes a 16-byte interface value, and AssetGen takes the object out of it (EX_InterfaceToObjCast). To
+  call the interface's functions, hold it in `TScriptInterface<IHealth>`.
 
 ### Implementing an interface
 
@@ -4069,6 +4075,7 @@ together.
 | `UE_REPLICATED_USING_IF(TArray<int32>, Slots, OnRep_Slots, OwnerOnly);` | RepNotify and a condition on one variable. An array replicates, and its OnRep fires for the array as a whole. | Yes |
 | `UE_DEFAULTS { bReplicates = true; }` | A class that declares a replicated variable or an RPC of its own gets `bReplicates = true` in its Class Defaults, and a subclass inherits it. A class with neither keeps its parent's setting: set it by hand in `UE_DEFAULTS`. | Yes |
 | `UE_REPLICATED_IF(float, Aim, OwnerAndSimulated);` | Refused: "unknown replication condition". The name is case-sensitive, so `ownerOnly` is refused too. | Refused |
+| `UE_REPLICATED(TScriptInterface<IMark>, Target);`, or a replicated `UE_STRUCT` holding a TMap or an interface at any depth | Refused: "an interface does not replicate", "a TMap or TSet in FBag does not replicate". The engine sends a struct member by member, and sends nothing for a TMap, a TSet or an interface. | Refused |
 | `UE_REPLICATED(TSet<int32>, Ids);` | Refused: "a TMap or TSet does not replicate". The engine replicates neither, so the variable would never leave the server. A `TMap` or `TSet` inside a replicated array is refused too. Replicate two arrays, keys and values, and rebuild the map in the OnRep. | Refused |
 | `UE_REPLICATED(TMap<FName, int32>, Scores);` | Never reaches AssetGen. The comma in `TMap<FName, int32>` splits the macro argument, and clang stops with "too many arguments provided to function-like macro invocation". A type alias for the map is no way around it: through an alias declared in the class, the variable is refused as above ("a TMap or TSet does not replicate"), and an alias at namespace scope of a container or value type is refused as a variable's type ("unimplemented property"). | Refused |
 | `void OnRep_Ammo(int32 OldAmmo)` | Refused: the RepNotify "must be a method of the class taking no parameters". A Blueprint RepNotify takes none, so C++'s previous-value form has no equivalent. The same message appears when no method of that name exists. Keep the previous value in a member and compare it in the OnRep. | Refused |
@@ -4246,7 +4253,8 @@ put these markers only on an ordinary method with a body, neither `inline` nor `
 | `UE_SERVER int32 ServerScore() { return N; }` | Refused: "an RPC returns void". An RPC runs on another machine and cannot hand a value back. Answer with a Client RPC or a replicated variable. | Refused |
 | `UE_SERVER void ServerBump(int32 &Count) { Count += 1; }` | Warns once per parameter it writes: "reaches the caller only when the call runs locally". The receiving machine works on a copy, so the caller sees the write only when the call ran locally, as when the server calls its own Server RPC. Take the parameter by value or `const &`. | Warns |
 | `UE_SERVER void ServerSync(TMap<FName, int32> Scores) { Kept = Scores; }` | Refused: "an RPC parameter cannot be a TMap or TSet". The engine sends nothing for either, so the argument would arrive empty. Pass two arrays, keys and values. | Refused |
-| `UE_SERVER inline void ServerPing() { Pings += 1; }` | Not caught. An inline method is expanded at each call and is no Blueprint function, so the marker has no effect and the call runs locally as plain code. The same holds for `UE_AUTHORITY_ONLY` and `UE_COSMETIC`. Drop `inline`. The marker goes first: `inline UE_SERVER void` does not parse. | Not yet |
+| `UE_SERVER void Send(FBag Sack)`, where `FBag` holds a `TMap`; `UE_SERVER void S(TScriptInterface<IMark> T)` | Refused: "an RPC parameter cannot hold what does not replicate". A struct is sent member by member, and neither a TMap nor an interface sends anything. Pass the object as a `UObject*` or an actor pointer instead of an interface. | Refused |
+| `UE_SERVER inline void ServerPing() { Pings += 1; }` | Refused: "an RPC, authority-only or cosmetic marker on an inline method does nothing". An inline method is expanded at each call and is no Blueprint function, so no call to it is routed. The same holds for `UE_AUTHORITY_ONLY` and `UE_COSMETIC`. Drop `inline`. | Refused |
 | `UE_SERVER static void S(int32 X) { }` | Refused: "a static function cannot be an RPC". The engine routes a static function without looking at its net flags, so it would run locally and never be sent. Use a member function. | Refused |
 | `UE_MULTICAST UE_SERVER void Also() { }` | Refused: "an RPC goes one way". The sender picks one direction and the receiver checks its own, so a second marker would drop the call on one side. `UE_MULTICAST UE_CLIENT` is refused the same way. | Refused |
 
@@ -4344,7 +4352,7 @@ not `static`, and its caller carries on as soon as it reaches its first wait.
 | `UPendingLatentActionLibrary::WaitOneFrame();` | Any latent function, static or a method, has a UeApi overload without the `FLatentActionInfo` and without the world context, and that is the one you call. AssetGen fills in the resume point, an ID for this call site and self. | Yes |
 | `Mover->FindNearestPathfinderPoint_Async(Pos, 500.0f, Ok, At);` | A latent function that answers through reference parameters. `Ok` and `At` are locals in the frame, so the action can fill them in, and the code after the call reads them. This is how the editor wires a latent node's output pins. | Yes |
 | `UKismetSystemLibrary::Delay(this, 1.0f, FLatentActionInfo(0, 1, "ExecuteUbergraph_Door", this));` | Refused: "leave the FLatentActionInfo argument out". The resume point exists only once AssetGen has laid out the event graph. | Refused |
-| `UKismetSystemLibrary::Delay(1.0f, FLatentActionInfo(0, 1, "ExecuteUbergraph_Door", this));` | Not caught. Without the world context the call slips past the check and compiles into a broken call: `1.0` goes in as the world context and your struct as the duration. Leave the argument out. | Not yet |
+| `UKismetSystemLibrary::Delay(1.0f, FLatentActionInfo(0, 1, "ExecuteUbergraph_Door", this));` | Refused the same way, without the world context too. | Refused |
 
 ```cpp
 UDeepPathfinderMovement *Mover;
@@ -4454,7 +4462,7 @@ Notes:
 | `void SayLater(const FString &Msg)` with a Delay inside | Refused with the same message: the reference would point into a frame that is gone when the method resumes. Any `T &` parameter counts, `const` or not. Take it by value. | Refused |
 | a Delay in a `UObject` child class | Warns: "finds its world only through its Outer". Actor, ActorComponent, UserWidget, GameInstance and Subsystem classes have a world of their own; any other object uses its Outer's. Make the object with an actor or component as its Outer, or the wait does nothing and the method never resumes. The editor offers Delay only where the class has a world. | Warns |
 | `V = __Read64__(Addr);` in a method that waits | Refused: "a pointer read in a function that makes a latent call". Move the read into a separate non-inline method that does not wait, and call that. See [Pointers and memory](#pointers-and-memory). `GetOuter()` and `GetTypedOuter` read memory too and are refused the same way (see [Working with other objects](#working-with-other-objects)). | Not yet |
-| `void ExecuteUbergraph_Door(int32 EntryPoint);` | Refused when the class has anything that waits: `ExecuteUbergraph_<Class>` is the name of the generated event graph. | Refused |
+| `void ExecuteUbergraph_Door(int32 EntryPoint);` | Refused: "ExecuteUbergraph_<Class> is the name of a class's ubergraph". The engine resumes a class's latent calls through that function, found by name on the object, so a method of that name in the class or a subclass would catch them. | Refused |
 
 ```cpp
 #include "../include/Objects.h"   // AssetGen's include/ folder, by its path from your source
@@ -5144,7 +5152,7 @@ listed here is refused with "unimplemented intrinsic".
 | `__EmbedFile__("Path")` | A file's bytes, read at build time, as the default of a `TArray<uint8>` member. | [Classes and variables](#classes-and-variables) |
 | `__EnumMap__`, `__EnumMapInit__` | What UE_ENUM_MAP expands to. Write UE_ENUM_MAP. | [Enums](#enums) |
 | Event override, `void ReceiveBeginPlay()` | Overrides that event, as adding its node in the editor does. Copy the SDK's parameter list: nothing checks it. | [Overrides and parent calls](#overrides-and-parent-calls) |
-| `ExecuteUbergraph_<Class>` | The name of the event graph that holds the methods that wait. A method of that name is refused when the class has one. | [Latent calls](#latent-calls) |
+| `ExecuteUbergraph_<Class>` | The name of the event graph that holds the methods that wait. A method named so is refused. | [Latent calls](#latent-calls) |
 | `FDeref` | The scratch struct that every read and write through a pointer goes through. AssetGen creates it when the mod declares none. | [Pointers and memory](#pointers-and-memory) |
 | `FDerefTextView` | The struct that an FText read or write through a pointer imports, from a path the compiler fixes. A helper mod you supply cooks it. | [Pointers and memory](#pointers-and-memory) |
 | `final` | On a class or a virtual method: no subclass has a version of its own. The functions are cooked Final, and calls to them are direct and, on `this`, copied in. | [Calling your own functions](#calling-your-own-functions) |
@@ -5400,6 +5408,9 @@ and where the feature is described. In each group, the messages you are most lik
 
 ### Constants, enums, structs and containers
 
+- `<Where>: a TSet element of type <T> cannot hash, and the engine hashes each one` (or `a TMap key`): a bool, an
+  FText, a delegate, or an engine struct without GetTypeHash (FRotator, FHitResult, FTransform) as a set element or
+  map key. Fix: use a type that hashes, such as an int, an FName or FVector, or a `UE_STRUCT` holding the value.
 - `a container operation needs a variable, not a computed value: <Method>`,
   `` `[]` on a map needs a map variable, not a computed value `` and
   `indexing needs an array variable, not a computed value`: a container method, a map's `[]` or an array index on a
@@ -5430,6 +5441,8 @@ and where the feature is described. In each group, the messages you are most lik
 - `UE_ENUM(<Enum>): <Enumerator> is out of range (the largest value is _MAX's)`: the cooked enum adds `<Enum>_MAX`
   one past the largest value, and that would not fit, as with `A = 255` in a uint8 enum. Fix: keep every value at most
   254 in a uint8 enum, and one below the type's maximum in an int32 or int64 enum. See [Enums](#enums).
+- `UE_ENUM(<Enum>): <Package> already has an enum <Name>, whose enumerator names (<Name>::...) the engine keeps in one
+  global table; rename it`: a mod enum named like a game or engine enum. Fix: rename it. See [Enums](#enums).
 - `UE_ENUM(<Enum>): <Enum>_MAX is the sentinel the engine adds, one past the largest value; leave it out or give it
   that value`: the enum declares its own `_MAX` with another value, as in `{ A, B, EGear_MAX = 7 }`. Fix: drop the
   explicit value, or the enumerator. See [Enums](#enums).
@@ -5543,6 +5556,13 @@ and where the feature is described. In each group, the messages you are most lik
 
 ### Functions and inline functions
 
+- `<Class>::<Function> is <Type>, and the <Parent>::<Function> it replaces is <Type>: callers pass that one's
+  parameters; declare the same`: an override, or an interface function's implementation, with other parameter
+  types than the function it replaces. Names do not count, and `const T&` matches `T`. Fix: copy the declaration. See
+  [Overrides and parent calls](#overrides-and-parent-calls).
+- `<Class>::<Function>: <Parent>::<Function> is native and no Blueprint event, so no function replaces it`: a method
+  named like an engine function that is not an event, such as `K2_DestroyActor`. C++ and calls bound to it keep
+  running the engine's. Fix: rename the method.
 - `<Class>::<Name>: a second function of that name; a Blueprint class has one member per name, so rename one`: two
   non-inline overloads, or two members of one name. Fix: rename one, or make the extra overloads `inline`. See
   [Overloading](#overloading).
@@ -5643,9 +5663,13 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
 
 ### Components, defaults, assets and other objects
 
+- `<Class>::UE_DEFAULTS: <Component>->CreationMethod is set by the engine when it makes the component; drop it`:
+  how a component was made decides how its actor keeps it, and a template marked Instance or UserConstructionScript
+  is never registered with its actor. Fix: drop the line.
 - `UserConstructionScript: <Function> spawns an actor, which the engine refuses while a construction script runs (it
   returns None); spawn in ReceiveBeginPlay`: `SpawnActor<T>` or a deferred spawn written in UserConstructionScript.
-  Fix: spawn in ReceiveBeginPlay. A helper the construction script calls is not caught.
+  Fix: spawn in ReceiveBeginPlay. A helper of the class the construction script calls warns instead: `warning:
+  <Class>::<Helper> spawns an actor and UserConstructionScript calls it`, since it may run elsewhere too.
 - `<Function>: AddComponent looks up a component template by name, and a mod class has no component templates, so it
   returns None; add one by class with AddComponentByClass`: `AddComponent(FName("X"), ...)`. Fix: use
   `AddComponentByClass`, or `AddComponentByType<T>(Owner)`. See [Components](#components).
@@ -5744,6 +5768,9 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
 
 ### Event dispatchers, timers and input
 
+- `<Dispatcher>.Broadcast: <Parameter> is a non-const reference, which a Broadcast never writes back to the caller`:
+  the engine copies each argument into a parameter block of its own, so what the handlers write stays there. Fix:
+  take the parameter by value or by `const &`, and hand results back through a member variable.
 - `a delegate on \`this\` cannot bind <Class>::<Function>: the engine looks it up by name on this object, whose class
   has no such function`: `{this, &Other::F}` where this class is no `Other`. Fix: bind a method of this class, and
   call the other object from it.
@@ -5856,8 +5883,7 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   [Latent calls](#latent-calls).
 - `<Callee>: leave the FLatentActionInfo argument out, the compiler supplies it`: a latent call given its
   FLatentActionInfo, as in `UKismetSystemLibrary::Delay(this, 1.0f, Info);`. Fix: call the overload without it,
-  `UKismetSystemLibrary::Delay(1.0f);`. Only the form with the world context is caught: `Delay(1.0f, Info)` compiles
-  with no message into a broken call. See [Latent calls](#latent-calls).
+  `UKismetSystemLibrary::Delay(1.0f);`. See [Latent calls](#latent-calls).
 - `warning: <Class>::<Function> waits, and an object of this class finds its world only through its Outer: make it with
   an actor or component as Outer, or the call does nothing and the function never resumes`: a latent call or
   UE_AWAIT in a class that is not an actor, component, widget, GameInstance or subsystem, such as a UObject child. The
@@ -5903,6 +5929,14 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   splits the macro argument, and clang stops with `too many arguments provided to function-like macro invocation`.
   Fix: replicate TArrays, for example one of keys and one of values, and rebuild the map in the OnRep function. See
   [Replication](#replication).
+- `<Class>::<Member>: a TMap or TSet in <Struct> does not replicate`, `an interface does not replicate`: a replicated
+  variable that is or holds, at any depth of a `UE_STRUCT`, a TMap, a TSet or a `TScriptInterface`. The engine sends a
+  struct member by member and sends nothing for those. For an RPC: `an RPC parameter cannot hold what does not
+  replicate: <Parameter> is or holds ...`. Fix: send a `UObject*` or actor pointer instead of an interface, and
+  arrays instead of a map.
+- `<Class>::<Function>: an RPC, authority-only or cosmetic marker on an inline method does nothing, since no call to
+  it is routed; drop inline`: the engine routes a call by the called function's flags, and an inline method is no
+  function. Fix: drop `inline`.
 - `<Class>::<Function>: UE_RELIABLE needs UE_SERVER, UE_CLIENT or UE_MULTICAST`: `UE_RELIABLE void Ping() {}` with no
   RPC kind. Fix: add UE_SERVER, UE_CLIENT or UE_MULTICAST, or drop UE_RELIABLE. See [RPCs](#rpcs).
 - `<Class>::<Function>: an override takes its parent's replication; drop the RPC marker`: an RPC marker on a method
@@ -5919,9 +5953,10 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
 - `UE_AWAIT: cannot read the signature of <Type>`: the dispatcher's C++ type does not spell out
   `TMulticastInlineDelegate<void(...)>`, so AssetGen cannot read its parameters. Fix: declare the dispatcher with
   `UE_DISPATCHER(Name, Params...)`. See [Waiting on events](#waiting-on-events).
-- `<Class> declares ExecuteUbergraph_<Class>, the ubergraph's own name`: the class or one of its parents has a method
-  with that name, and the class makes a latent call, so the compiler needs the name for the event graph it generates.
-  Fix: rename the method. See [Latent calls](#latent-calls).
+- `<Class>::ExecuteUbergraph_<Name>: ExecuteUbergraph_<Class> is the name of a class's ubergraph, whose latent calls
+  resume through it; rename it`: the engine resumes a class's waits through that function, found by name on the
+  object, so a method of that name would catch them. `<Class> declares ExecuteUbergraph_<Class>, the ubergraph's own
+  name` is the same for a parent from another mod. Fix: rename the method. See [Latent calls](#latent-calls).
 
 ### Pointers, memory and intrinsics
 

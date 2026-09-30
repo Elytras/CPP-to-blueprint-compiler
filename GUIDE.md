@@ -359,12 +359,11 @@ public:
 Watch for:
 
 - Do not write `override`: clang refuses it with `only virtual member functions can be marked 'override'`. The name
-  alone makes the override, and AssetGen does not check the parameter list against the event's:
-  `void ReceiveTick(int32 X)` still cooks as the `ReceiveTick` override, and the engine calls it with a float. Copy
-  the declaration from UeApi exactly.
-- A Blueprint class has one function per name. Of two non-inline methods with the same name, only the one with the
-  most parameters is cooked, and calls to the other are miscompiled with no message; such overloads are not built yet.
-  Rename one, or make the extra overloads `inline`.
+  alone makes the override, and AssetGen refuses a parameter list other than the event's:
+  `void ReceiveTick(int32 X)` fails with "the AActor::ReceiveTick it replaces is void (float)". Copy the declaration
+  from UeApi.
+- A Blueprint class has one function per name. Two non-inline methods with the same name are refused ("a second
+  function of that name"). Rename one, or make the extra overloads `inline`.
 - A function outside a class must be `inline`. Without it the call is refused with
   `call to an unknown function: Helper`. Lambdas and function pointers are refused.
 
@@ -702,8 +701,7 @@ Watch for:
   no OnRep. Assign the whole value, or call the OnRep yourself.
 - The engine drops a Server RPC unless the client that calls it owns the actor.
 - Keep `inline` off every method that carries a marker, and off every OnRep. An inline method is no UFunction, so
-  `UE_SERVER inline void F()` runs locally as plain code, and an inline OnRep leaves every write calling a function the
-  class does not have. Neither is diagnosed.
+  both are refused.
 
 Full rules: [Replication](REFERENCE.md#replication), [RPCs](REFERENCE.md#rpcs). Example:
 [examples/NetworkedSwitch.cpp](examples/NetworkedSwitch.cpp).
@@ -1883,8 +1881,6 @@ each topic.
   [Latent calls](REFERENCE.md#latent-calls).
 - `UE_AWAIT` on a dispatcher with two or more parameters. The method resumes, but the values are not available. Bind
   a handler to read them. See [Waiting on events](REFERENCE.md#waiting-on-events).
-- `Cast<IHealth>(Other)` to a game interface. It compiles into a cast whose result may not fit the slot AssetGen gives
-  it; this was not checked. Use `TScriptInterface<IHealth>`. See [Interfaces](REFERENCE.md#interfaces).
 
 A few mistakes also compile without a message, because the construct itself works:
 

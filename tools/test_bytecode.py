@@ -146,28 +146,20 @@ def refused(mod, body, why, top=''):
 PENDING = os.path.join(TESTS, 'pending')
 GAPS, FIXED, REFUSALS = [], [], {}
 KNOWN_RULES = {     # sweep rules the suite's own packages still break, each with the AssetGen defect (TODO.md, S33)
-    'call_local_unrouted': 'an authority-only / cosmetic engine static is called through EX_CallMath (callspace skipped)',
-    'call_opcode_flags': 'EX_CallMath is emitted for BlueprintCosmetic and BlueprintAuthorityOnly static functions',
     'class_tail_follows_parent': 'the class tail is hard-coded (ClassWithin Object, ClassConfigName Engine, ClassFlags '
                                  'guessed from ancestry) instead of taken from the parent',
-    'context_rvalue': 'a call through an object used as a value names no context r-value, so on None its destination '
-                      'keeps its previous value',
     'edl_class_closure': "a BPGC's UberGraphFunction and InheritableComponentHandler are not serialized before the class",
     'edl_create_prereqs': 'a native default-subobject override export has TemplateIndex 0',
     'edl_payload_created': 'objects named only in payloads are in no preload list, so they can resolve to null',
     'edl_property_types': 'UDS/UDE property types are never serialized before what they type',
     'edl_super_serialized': "an override's /Game parent function is created, never serialized, before the override",
     'export_archetype': 'native default-subobject overrides have a null TemplateIndex',
-    'func_locals_constructed': 'FUNC_HasDefaults is never set: FText / FTransform / FHitResult / defaulted-UDS locals '
-                               'start zeroed',
     'import_chains': 'packages import themselves (their own package, class and functions)',
     'instanced_refs_flagged': 'no property ever gets CPF_InstancedReference / CPF_ContainsInstancedReference',
     'latent_async_proxy_validated': 'the async proxy is bound and activated with no IsValid gate',
     'latent_proxy_frame_held': 'AsyncTest.Play keeps its montage callback proxy only in a local of a function that '
                                'does not wait',
-    'locals_constructed_have_defaults': 'FUNC_HasDefaults is missing on functions with non-zero-constructible locals',
     'native_out_arrays_emptied': "a native's out TArray is not emptied before the call, so Set_ToArray appends",
-    'prop_bool_native': 'Blueprint bools are cooked as 1-bit bitfields (NativeBool 0)',
     'typing_callmath_callee': 'container-library CustomThunks (Array_* / Set_* / Map_*) are emitted as EX_CallMath, '
                               'not inside an EX_Context on the library default object',
 }
@@ -1636,7 +1628,7 @@ def types_defaults():
 def native_struct_values():
     """A struct the engine reads in its own binary form, which WriteValue does not write (it writes tags), gets no
     value: not as a default, and not as a UE_STRUCT member, whose default instance holds every member's."""
-    refused('NativeDefault', '  FGameplayTagContainer Tags = {};\n', 'GameplayTagContainer value in its own binary form')
+    refused('NativeDefault', '  FGameplayTagContainer Labels = {};\n', 'GameplayTagContainer value in its own binary form')
     refused('NativeMember', '  int32 X = 0;\n', "a UE_STRUCT's defaults hold every member's",
             top='struct FTagHolder {\n  UE_STRUCT;\n  FGameplayTagContainer Tags;\n};\n')
     print('ok  a GameplayTagContainer value is refused, as a default and as a UE_STRUCT member')
@@ -2129,7 +2121,7 @@ def static_assets():
         assert [x['name'] for x in e] == [a] and ref(base(a), e[0]['cls']) == cls and e[0]['flags'] & 0x3 == 0x3, (a, e)   # RF_Public | RF_Standalone
     # Only the named members are written, the rest stay the class defaults; an explicit zero is written.
     assert tags_of('MD_Plain') == {}, tags_of('MD_Plain')
-    assert tags_of('MD_Calm') == {'Count': 'IntProperty size=4: 0', 'Mood': 'ByteProperty size=8 enum=EMood: EMood::Calm'}, tags_of('MD_Calm')
+    assert tags_of('MD_Calm') == {'Count': 'IntProperty size=4: 0', 'Mood': 'ByteProperty size=8 enum=EDefMood: EDefMood::Calm'}, tags_of('MD_Calm')
     big = tags_of('MD_Big')
     assert set(big) == {'Health', 'Title', 'Tag', 'bBig', 'Next', 'Waves'}, big
     assert big['Health'].endswith(': -500.5') and big['Title'].endswith(": 'Big'") and big['Tag'].endswith(': big') and 'value=1' in big['bBig'], big
@@ -2137,7 +2129,7 @@ def static_assets():
     assert big['Waves'].endswith(struct.pack('<4i', 3, 3, 5, 8).hex()), big['Waves']
     cdo = dump('dumptags.py', base('UMoodDef'), exports_of(base('UMoodDef')).index('Default__UMoodDef_C'))
     for want in ("Title [0] StrProperty size=9: 'Base'", 'Health [0] FloatProperty size=4: 100.0', 'Count [0] IntProperty size=4: 3',
-                 'Mood [0] ByteProperty size=8 enum=EMood: EMood::Angry'):
+                 'Mood [0] ByteProperty size=8 enum=EDefMood: EDefMood::Angry'):
         assert want in cdo, (want, cdo)
     ed = tags_of('ED_AssetTest')
     assert objs('ED_AssetTest', ed['VeteranClasses'].split()[-1]) == ['/Game/Enemies/Spider/Grunt/ED_Spider_Grunt.ED_Spider_Grunt'], ed
@@ -2181,7 +2173,7 @@ def static_assets():
     ar = subprocess.run([sys.executable, os.path.join(HERE, 'dumpar.py'), registry_of('AssetTest')], capture_output=True, encoding='utf-8').stdout
     assert set(re.findall(r'^\s+(/Game/\S+)\s+(\S+)$', ar, re.M)) == {
         (MOD + 'AssetUser.AssetUser_C', 'BlueprintGeneratedClass'), (MOD + 'UMoodDef.UMoodDef_C', 'BlueprintGeneratedClass'),
-        (MOD + 'EMood.EMood', 'UserDefinedEnum'), (MOD + 'MD_Plain.MD_Plain', 'UMoodDef_C'), (MOD + 'MD_Calm.MD_Calm', 'UMoodDef_C'),
+        (MOD + 'EDefMood.EDefMood', 'UserDefinedEnum'), (MOD + 'MD_Plain.MD_Plain', 'UMoodDef_C'), (MOD + 'MD_Calm.MD_Calm', 'UMoodDef_C'),
         (MOD + 'MD_Big.MD_Big', 'UMoodDef_C'), (MOD + 'ED_AssetTest.ED_AssetTest', 'EnemyDescriptor')}, ar
     print('ok  AssetTest: the asset registry lists every asset with its class')
 
@@ -3081,7 +3073,8 @@ def spawn_runs():
         ('BeginDeferredActorSpawnFromClass', me, [me, 'SpawnTest_C', where, 0, None]),   # the mod class, deferred,
         ('set', twin, 'Tag'), ('FinishSpawningActor', me, [twin, where]),              # Tag set before it finishes
         ('SpawnObject', me, ['USpawnProbe_C', me]), ('set', me, 'Made'),
-        ('Create', me, [me, 'UserWidget', None]), ('set', me, 'Widget'),
+        ('Create', 'Default__WidgetBlueprintLibrary', [me, 'UserWidget', None]),       # cosmetic: on the library's CDO
+        ('set', me, 'Widget'),
         ('AddComponentByClass', me, ['SceneComponent', False, zero, False]), ('set', me, 'Part'),
         ('K2_AttachToComponent', vm.self.vars['Part'], ['root', 'None', 2, 2, 2, True]),  # SnapToTarget, weld
         ('AddComponentByClass', me, ['SceneComponent', False, zero, True]),               # held back ...
@@ -3943,30 +3936,17 @@ func_refusals()
 
 def func_local_defaults():
     """FuncLocalDefaults: locals whose zeroed memory is not their value start constructed, as C++ has them."""
-    base = pending_asset('FuncLocalDefaults')
+    base = asset('FuncLocalDefaults')
     assert run(base, 'EmptyText')[0] == ''
     assert run(base, 'IdentityScale')[0] == 2.0, run(base, 'IdentityScale')[0]
     assert run(base, 'HitTime')[0] == 1.0, run(base, 'HitTime')[0]
     assert run(base, 'StructDefault')[0] == 5, run(base, 'StructDefault')[0]
 
 
-def func_same_params(mod, name):
-    """The mod is refused, saying `name`; or it compiles and every override / implementation has the parameter block
-    of the function it replaces."""
-    def test():
-        try: base = pending_asset(mod)
-        except AssertionError as e:
-            assert name in str(e), e
-            return
-        found = func_findings(base, ['func_override_params'])
-        assert not found, found
-    return test
-
-
 def func_cosmetic_static():
     """FuncCosmeticStatic: ApplyDamage (BlueprintAuthorityOnly) and PlaySound2D (BlueprintCosmetic) are called
     through CallFunction's callspace check, as the editor calls them."""
-    base = pending_asset('FuncCosmeticStatic')
+    base = asset('FuncCosmeticStatic')
     calls = {(fn, where.rsplit(':', 1)[-1]): op for fn, op, where, flags in func_calls(base) if flags & ROUTED}
     assert set(calls) == {('Hit', 'ApplyDamage'), ('Beep', 'PlaySound2D')}, calls
     assert all(op in (0x1B, 0x1C) for op in calls.values()), 'called with %s' % {k: '%02x' % v for k, v in calls.items()}
@@ -3998,12 +3978,10 @@ def func_ancestor_iface():
     assert not found, found
 
 
-pending('FuncLocalDefaults: FText / FTransform / FHitResult / defaulted-struct locals start constructed (FUNC_HasDefaults)',
-        func_local_defaults)
-pending('FuncIfaceParams: an interface implementation has the interface function\'s parameters, or is refused',
-        func_same_params('FuncIfaceParams', 'Score'))
-pending('FuncRpcKidParams: an RPC override has its parent\'s parameters, or is refused', func_same_params('FuncRpcKidParams', 'ServerNudge'))
-pending('FuncCosmeticStatic: ApplyDamage / PlaySound2D keep their callspace routing (not EX_CallMath)', func_cosmetic_static)
+func_local_defaults()
+print('ok  FuncLocalDefaults: FText / FTransform / FHitResult / defaulted-struct locals start constructed (FUNC_HasDefaults)')
+func_cosmetic_static()
+print('ok  FuncCosmeticStatic: ApplyDamage / PlaySound2D keep their callspace routing (not EX_CallMath)')
 pending('FuncQualifiedCall: Parent::Fn() is bound to the parent\'s function, not dispatched by name', func_qualified_call)
 pending('FuncAncestorIface: an override of a native ancestor\'s interface function links it as super (TriggerAI:OnMessageAI)',
         func_ancestor_iface)
@@ -4011,14 +3989,28 @@ pending('FuncAncestorParams: an override of a native ancestor\'s interface funct
         lambda: refused('FuncAncestorParams', '', 'OnMessageAI',
                         top='class AncestorLouse : public AWoodLouse {\npublic:\n  int32 Seen;\n'
                             '  void OnMessageAI(int32 TriggerName) { Seen = TriggerName; }\n};\n'))
-pending('FuncHideNative: a method named like a native non-event (K2_DestroyActor) is refused',
-        lambda: refused('FuncHideNative', '  int32 Seen;\n  void K2_DestroyActor() { Seen = 1; }\n', 'K2_DestroyActor'))
-pending('FuncTickInt: an override of ReceiveTick(float) taking int32 is refused',
-        lambda: refused('FuncTickInt', '  int32 Seen;\n  void ReceiveTick(int32 Frames) { Seen = Frames; }\n', 'ReceiveTick'))
-pending('FuncSigShadow: a mod override with other parameters than its mod parent\'s is refused',
-        lambda: refused('FuncSigShadow', '', 'Scale',
-                        top='class SigBase : public AActor {\npublic:\n  int32 Scale(int32 X) { return X; }\n};\n'
-                            'class SigKid : public SigBase {\npublic:\n  int32 Scale(float X) { return 0; }\n};\n'))
+# An override or an interface implementation keeps the parameters of the function it replaces: a caller lays them out
+# for that one (ProcessEvent, an interface's Execute_, a received RPC) and ProcessEvent copies them into this one's
+# frame (ScriptCore.cpp:1958-2016). Only a Blueprint event is replaced at all: C++ and bound calls keep a native one.
+refused('FuncTickInt', '  int32 Seen;\n  void ReceiveTick(int32 Frames) { Seen = Frames; }\n',
+        'FuncTickInt::ReceiveTick is void (int32), and the AActor::ReceiveTick it replaces is void (float)')
+refused('FuncSigShadow', '', 'SigKid::Scale is int32 (float), and the SigBase::Scale it replaces is int32 (int32)',
+        top='class SigBase : public AActor {\npublic:\n  int32 Scale(int32 X) { return X; }\n};\n'
+            'class SigKid : public SigBase {\npublic:\n  int32 Scale(float X) { return 0; }\n};\n')
+refused('FuncRpcKidParams', '', 'RpcParamsKid::ServerNudge is void (float, int32), and the RpcKidParamsBase::ServerNudge '
+        'it replaces is void (int32)',
+        top='class RpcKidParamsBase : public AActor {\npublic:\n  UE_SERVER void ServerNudge(int32 V) {}\n};\n'
+            'class RpcParamsKid : public RpcKidParamsBase {\n  int32 Got = 0;\n\npublic:\n'
+            '  void ServerNudge(float V, int32 W) { Got = W; }\n};\n')
+refused('FuncIfaceParams', '', 'IfaceParamsKid::Score is int32 (float, int32), and the IScoredParams::Score it replaces '
+        'is int32 (int32)',
+        top='class IScoredParams {\npublic:\n  UE_INTERFACE;\n  int32 Score(int32 Times);\n};\n'
+            'class IfaceParamsKid : public AActor, public IScoredParams {\npublic:\n'
+            '  int32 Score(float Times, int32 Extra) { return Extra; }\n};\n')
+refused('FuncHideNative', '  int32 Seen;\n  void K2_DestroyActor() { Seen = 1; }\n',
+        'AActor::K2_DestroyActor is native and no Blueprint event')
+print('ok  override refusals: other parameters than a native event\'s, a mod parent\'s, an RPC\'s or an interface\'s; '
+      'a name of a native non-event')
 
 
 # ---- OPERANDS: operands the VM resolves against the object they run on - jumps, instance variables, calls by name,
@@ -4154,7 +4146,7 @@ opnd_latent_ref_refused()
 def opnd_callspace():
     """OpndCallspace: ApplyDamage (BlueprintAuthorityOnly) and PlaySound2D (BlueprintCosmetic) are called so the engine
     asks their callspace - through CallFunction on the library's CDO, never EX_CallMath - with the arguments given."""
-    base = pending_asset('OpndCallspace')
+    base = asset('OpndCallspace')
     paths = import_paths(base)
     for fn in ('ApplyDamage', 'PlaySound2D', 'Abs'):
         assert any(p.endswith(':' + fn) for p in paths), (fn, paths)
@@ -4189,13 +4181,15 @@ def opnd_dispatch_ref_refused():
     refused('OpndDispatchRef', '  UE_DISPATCHER(OnRef, int32 &Count, int32 Plain);\n'
             '  void  Add(int32 &Count, int32 Plain) { Count += Plain; }\n'
             '  int32 Fire(int32 V) {\n    OnRef.Add(this, &OpndDispatchRef::Add);\n    int32 C = V;\n'
-            '    OnRef.Broadcast(C, 5);\n    return C;\n  }\n', 'reference')
+            '    OnRef.Broadcast(C, 5);\n    return C;\n  }\n', 'OnRef.Broadcast: Count is a non-const reference, which a Broadcast '
+            'never writes back')
+    print('ok  OpndDispatchRef: a Broadcast with a non-const reference parameter is refused')
 
 
-pending('OpndDispatchRef: refused - a Broadcast never writes a non-const reference argument back',
-        lambda: opnd_dispatch_ref_refused())
-pending('OpndCallspace: an authority-only / cosmetic static is called through a context, so GetFunctionCallspace '
-        'can absorb it (EX_CallMath never asks)', opnd_callspace)
+opnd_dispatch_ref_refused()
+opnd_callspace()
+print('ok  OpndCallspace: an authority-only / cosmetic static is called through a context, so GetFunctionCallspace '
+      'can absorb it')
 pending('OpndLatentHit: a latent call in an event override taking a const reference (ReceiveHit), the stub copying '
         'it into the frame through EX_LocalOutVariable', opnd_latent_hit)
 
@@ -4378,7 +4372,7 @@ struct_link_order()
 def ctx_null_call():
     """A call through a None object, used as a value, zeroes its destination: the context names the Let's destination
     as its r-value (KismetCompilerVMBackend.cpp 1241-1244) and ProcessContextOpcode clears it (ScriptCore.cpp 2950-2953)."""
-    base = pending_asset('CtxNullCall')
+    base = asset('CtxNullCall')
     vm = VM(base, Peer=None, Got=7)
     vm.null_rvalues = True
     vm.call('Read')
@@ -4395,7 +4389,7 @@ def ctx_null_call():
 def drop_result():
     """A call whose FString / TArray result a statement throws away needs a local to land in: the statement buffer is
     64 raw bytes nothing constructs or destroys (ScriptCore.cpp 1058, 1120). The calls still run, each once."""
-    base = pending_asset('DropResult')
+    base = asset('DropResult')
     vmsem_holds(base, 'discarded_result_fits_scratch')
     vm = VM(base, Name='n', Items=[1], Calls=0)
     vm.call('Run')
@@ -4444,19 +4438,26 @@ def no_world_warning():
     refuses it ("Pin must have a connection", CallFunctionHandler.cpp 547-598). An actor stays silent."""
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
-        proc = subprocess.run([ASSETGEN, 'compile', os.path.join(PENDING, 'NoWorldCtx.cpp'), UEAPI, tmp],
-                              capture_output=True, encoding='utf-8')
+        src = os.path.join(tmp, 'NoWorldCtx.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/NoWorldCtx");\n'
+                    'class NoWorldCtx : public UObject {\npublic:\n  APawn *Pawn;\n'
+                    '  void Run() { Pawn = UGameplayStatics::GetPlayerPawn(0); }\n};\n'
+                    'class NoWorldCtxActor : public AActor {\npublic:\n  APawn *Pawn;\n'
+                    '  void Run() { Pawn = UGameplayStatics::GetPlayerPawn(0); }\n};\n')
+        proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, tmp], capture_output=True, encoding='utf-8')
     warns = [l.strip() for l in proc.stdout.splitlines() if l.strip().startswith('warning:')]
     assert any('NoWorldCtx::Run' in w and 'world' in w.lower() for w in warns), \
         'no warning that NoWorldCtx::Run hands GetPlayerPawn a world context with no world (exit %d): %s' % (proc.returncode, warns)
     assert not any('NoWorldCtxActor' in w for w in warns), warns
+    print('ok  NoWorldCtx: self passed as a world context from a class with no world is warned about; an actor is not')
 
 
 def local_ctor_flags():
     """A function with a local that is not zero-constructible is FUNC_HasDefaults (KismetCompiler.cpp 2328-2335), so
     the VM constructs that local (ScriptCore.cpp 909-916): FHitResult() has Time 1, FTransform the identity scale, an
     FText a TextData to read."""
-    base = pending_asset('LocalCtorFlags')
+    base = asset('LocalCtorFlags')
     fns = ('BlankTime', 'ScaleX', 'TextString', 'MapCount')
     flags = lambda fn: int(re.search(r'FunctionFlags (\S+)', dump('dumpstruct.py', base, export_index(base, fn))).group(1), 16)
     missing = [fn for fn in fns if not flags(fn) & 0x800000]
@@ -4468,9 +4469,14 @@ def local_ctor_flags():
 
 
 def iface_cast_slot():
-    """Cast<IHealth> writes a 16-byte FScriptInterface (ScriptCore.cpp 3634-3641): it must land in a 16-byte slot."""
+    """Cast<IHealth> writes a 16-byte FScriptInterface (ScriptCore.cpp 3634-3641): it must land in a 16-byte slot, and
+    the `IHealth*` it gives is the object, taken out of it. A None Other is no IHealth."""
     vmsem_dump_has('/Script/FSD.Health')
-    vmsem_holds(pending_asset('IfaceCastSlot'), 'interface_value_slot')
+    base = asset('IfaceCastSlot')
+    vmsem_holds(base, 'interface_value_slot')
+    for other, want in ((None, -7), (Obj('HealthThing'), 7)):   # every Obj here implements IHealth
+        got = VM(base, isa=lambda o, cls: isinstance(o, Obj), Other=other, Guard=7).call('Probe')
+        assert got == want, 'Probe() with Other %r = %r, not %r' % (other, got, want)
 
 
 def derived_literal(fn, struct):
@@ -4480,13 +4486,17 @@ def derived_literal(fn, struct):
     vmsem_holds(pending_asset('DerivedLiteral'), 'struct_const_members', fn=fn)
 
 
-pending('CtxNullCall: a call through a None object zeroes its Let destination (the context names its r-value)', ctx_null_call)
-pending('DropResult: a discarded FString / TArray result needs a local, not the 64-byte statement buffer', drop_result)
+ctx_null_call()
+print('ok  CtxNullCall: a call through a None object zeroes its Let destination (the context names its r-value)')
+drop_result()
+print('ok  DropResult: a discarded FString / TArray result lands in a local, not the 64-byte statement buffer')
 pending('OutArrayReset: a native\'s out TArray is emptied before the call', out_array_reset)
 pending('SetToArrayAppend: ToArray / a set range-for empty the array Set_ToArray appends to', set_to_array_append)
-pending('NoWorldCtx: a UObject handing self to a world-context call is warned about', no_world_warning)
-pending('LocalCtorFlags: FUNC_HasDefaults on a function with an FHitResult / FTransform / FText / TMap local', local_ctor_flags)
-pending('IfaceCastSlot: Cast<IHealth> lands its 16-byte interface value in a 16-byte slot', iface_cast_slot)
+no_world_warning()
+local_ctor_flags()
+print('ok  LocalCtorFlags: FUNC_HasDefaults on a function with an FHitResult / FTransform / FText / TMap local')
+iface_cast_slot()
+print('ok  IfaceCastSlot: Cast<IHealth> takes the object out of its 16-byte interface value')
 pending('DerivedLiteral: a derived struct literal lists its own members before its super\'s',
         lambda: derived_literal('Angle', '/Script/Engine.LightmassDirectionalLightSettings'))
 pending('DerivedLiteral: a struct literal leaves out Transient members',
@@ -4644,7 +4654,8 @@ def uber_await_kid():
     """UberAwaitKid: the parent's Fetch, run on an UberAwaitKid by the override's UberAwaitBase::Fetch, binds its
     task's OnSuccess by name on self. The name resolves on the child first, so it must be no function of the child:
     the parent's download completes into the parent (Image, then Base = 1), the child's into the child (Kid = 1)."""
-    kid, base = pending_asset('UberAwaitKid'), pending_asset('UberAwaitKid', 'UberAwaitBase')
+    kid = asset('UberAwaitKid')
+    base = os.path.join(os.path.dirname(kid), 'UberAwaitBase')
     pk, pb = invariants.Package(kid), invariants.Package(base)
     bound = {n.ops[0][1] for i, st in invariants.functions(pb) for n in invariants.statements(pb, i)[0] if n.op == 0x4B}
     mine = {n.lower() for n, v in pk.struct(class_export(pk)).func_map}
@@ -4712,11 +4723,13 @@ UBER_SHADOW_TOP = ('class UberShadowBase : public AActor {\npublic:\n  int32 N;\
 uber_chain_frames()
 uber_same_leaf()
 uber_defer_guard()
-pending('UberAwaitKid: a parent\'s await in an overridden method resumes in the parent on a child object - the '
-        'generated completion event it binds by name is no function of the child', uber_await_kid)
+uber_await_kid()
+print('ok  UberAwaitKid: a parent\'s await in an overridden method resumes in the parent on a child object')
 # A child method named like its parent's ubergraph would catch the parent's latent resumes (FindFunction, most
 # derived first): refused, like a method named like the class's own ubergraph.
-pending('UberShadow: refused', lambda: refused('UberShadow', '  int32 X;\n', 'ExecuteUbergraph_UberShadowBase', top=UBER_SHADOW_TOP))
+refused('UberShadow', '  int32 X;\n', 'UberShadowKid::ExecuteUbergraph_UberShadowBase: ExecuteUbergraph_<Class> is the name '
+        'of a class\'s ubergraph', top=UBER_SHADOW_TOP)
+print('ok  UberShadow: a method named like an ubergraph is refused')
 
 
 # ---- DELEG: delegates and event dispatchers - signatures, binds, broadcasts, timers by name (invariant_rules/delegates.py)
@@ -4938,7 +4951,7 @@ def delegate_var():
 def inherited_fire():
     """DispatchInheritedFire broadcasts its parent's OnHit, running the kid's bound handler with the argument; the
     broadcast names the parent's OnHit__DelegateSignature (keeps_invariants: broadcast_matches_signature)."""
-    base = pending_asset('DispatchInheritedFire')
+    base = asset('DispatchInheritedFire')
     keeps_invariants(base)
     vm = VM(base, {}, Got=0)
     vm.call('Hook')
@@ -4956,7 +4969,8 @@ scoreboard_broadcast()
 timers_by_event_and_name()
 pending('DelegateVar: a TDelegate<void()> variable is a DelegateProperty naming its signature, holding OnTimer on this',
         delegate_var)
-pending('DispatchInheritedFire: a child broadcasts its parent\'s dispatcher through the parent\'s signature', inherited_fire)
+inherited_fire()
+print('ok  DispatchInheritedFire: a child broadcasts its parent\'s dispatcher through the parent\'s signature')
 # A method of another class bound with `this`: EX_InstanceDelegate binds the name on this object, whose class has no
 # such function, so the broadcast or the timer silently skips it (ScriptDelegates.h 38-49, 479-502).
 refused('DelegateForeign', '  UE_DISPATCHER(OnHit, int32 Points);\n  void F() { OnHit.Add(this, &DelegateOther::ForeignHit); }\n',
@@ -5149,7 +5163,8 @@ for mod, body, top in (
                                        '  UE_DEFAULTS { Mesh->CreationMethod = EComponentCreationMethod::Instance; }\n};\n'),
         ('ScsCreationUcsDso', '', 'class ScsCreationUcsChar : public ACharacter {\n'
                                   '  UE_DEFAULTS { Mesh->CreationMethod = EComponentCreationMethod::UserConstructionScript; }\n};\n')):
-    pending('%s: refused' % mod, lambda mod=mod, body=body, top=top: refused(mod, body, 'CreationMethod', top))
+    refused(mod, body, '->CreationMethod is set by the engine when it makes the component', top)
+print('ok  CreationMethod set in UE_DEFAULTS is refused, on a UE_COMPONENT and on a native default subobject')
 
 
 # ---- COMP: component behaviour and refusals, the construction script, ticking (invariant_rules/components.py)
@@ -5508,10 +5523,12 @@ def refused_or_warned(mod, body, why, top=''):
 
 
 # NODE-19 through a helper only the construction script calls: the editor does not look into a helper, but on this
-# path its spawn returns None all the same, so the compiler refuses it or at least warns (NODE-G15 asks for either).
-pending('UcsSpawnHelper: refused or warned', lambda: refused_or_warned(
-    'UcsSpawnHelper', '  AActor* Made;\n  void Build() { Made = SpawnActorDeferred<AActor>(AActor::StaticClass(), FTransform()); }\n'
-                      '  void UserConstructionScript() { Build(); }\n', 'UserConstructionScript', OBJECTS))
+# path its spawn returns None all the same, so the compiler warns: the helper may run elsewhere too.
+refused_or_warned('UcsSpawnHelper', '  AActor* Made;\n'
+                  '  void Build() { Made = SpawnActorDeferred<AActor>(AActor::StaticClass(), FTransform()); }\n'
+                  '  void UserConstructionScript() { Build(); }\n', 'Build spawns an actor and UserConstructionScript calls it',
+                  OBJECTS)
+print('ok  UcsSpawnHelper: a helper UserConstructionScript calls that spawns is warned about')
 
 
 # ---- PROPS: property fields and tagged defaults - bool layout, field classes, flags, element sizes, containers
@@ -5628,26 +5645,14 @@ prop_enum_casts()
 
 # -- pending
 
-def unhashable_refused(mod, body):
-    """The editor refuses a set element or map key without CPF_HasGetValueTypeHash (KismetCompilerMisc.cpp 1224-1236,
-    1277-1294): a bool, an FText, a native struct with no GetTypeHash (FHitResult, FRotator: CppStructOps'
-    HasGetTypeHash, Class.h 1515-1518). As loaded they never get the flag: check() on load and on every Add / Find in a
-    check build (Property.cpp 1517-1522, PropertySet.cpp 348, 358), a hash of 0 for every element in Shipping."""
-    def test():
-        try: refused(mod, body, 'hash')
-        except AssertionError as e:
-            out = e.args[0][1] if e.args and isinstance(e.args[0], tuple) else str(e)
-            failed = re.findall(r'(?m)^\s*FAILED: (.*)$', out)
-            raise AssertionError('refused for another reason: ' + failed[0] if failed else 'compiles; not refused')
-    return test
-
-
 for _mod, _body in (('PropSetBool', '  TSet<bool> Flags;\n'), ('PropMapBool', '  TMap<bool, int32> ByFlag;\n'),
                     ('PropSetText', '  TSet<FText> Labels;\n'), ('PropMapText', '  TMap<FText, int32> ByLabel;\n'),
                     ('PropSetHit', '  TSet<FHitResult> Hits;\n'), ('PropSetRotator', '  TSet<FRotator> Turns;\n'),
                     ('PropSetBoolLocal', '  int32 F() { TSet<bool> S; S.Add(true); return S.Num(); }\n'),
                     ('PropSetBoolParam', '  int32 F(TSet<bool> S) { return S.Num(); }\n')):
-    pending('%s: a set element / map key that cannot hash is refused' % _mod, unhashable_refused(_mod, _body))
+    refused(_mod, _body, 'cannot hash, and the engine hashes each one')
+print('ok  a set element / map key that cannot hash is refused: bool, FText, a native struct without GetTypeHash; as '
+      'a variable, a local and a parameter')
 
 
 def fname_at(names, raw, o):
@@ -5840,7 +5845,7 @@ def enum_entries(base):
 
 
 def uds_local_init():
-    base = pending_asset('UdsLocalInit')
+    base = asset('UdsLocalInit')
     for fn, parms, want in (('LocalHp', {}, 1109), ('BracedHp', {}, 120.0), ('LoopHp', {'N': 3}, 300), ('LoopHp', {'N': 0}, 0),
                             ('GaugeKills', {}, 9), ('TagAndSeq', {}, 12)):
         got = run(base, fn, **parms)[0]
@@ -5865,20 +5870,6 @@ def enum_max_dup():
     print('ok  EnumMaxDup: a declared <Enum>_MAX is the sentinel, one entry of its name; another value for it is refused')
 
 
-def enum_game_name_clash():
-    try:
-        pending_asset('EnumNativeClash')
-    except AssertionError as e:                     # a refusal naming the game's enum
-        assert 'EDialogRestriction' in str(e), e
-        return
-    import tempfile
-    with tempfile.TemporaryDirectory() as tmp:
-        proc = subprocess.run([ASSETGEN, 'compile', os.path.join(PENDING, 'EnumNativeClash.cpp'), UEAPI, tmp],
-                              capture_output=True, encoding='utf-8')
-    said = [l for l in proc.stdout.splitlines() if 'EDialogRestriction' in l and 'warning' in l.lower()]
-    assert said, "EDialogRestriction::None and ::SinglePlayerOnly are the game enum's names too, and the compile says nothing"
-
-
 def enum_names_across_mods():
     """No enumerator FName is cooked by two packages of the mods built here: UEnum::AddNamesToMasterList keeps the first
     of two in its one global map (Enum.cpp 83-94), so with both mods loaded, LookupEnumName answers for one of them."""
@@ -5896,11 +5887,17 @@ def enum_names_across_mods():
 uds_init_defaults()
 enum_net_store()
 enum_refusals()
-pending('UdsLocalInit: a function with a UE_STRUCT local whose defaults are not zero is FUNC_HasDefaults, so the frame '
-        'starts the local at the struct defaults', uds_local_init)
+uds_local_init()
+print('ok  UdsLocalInit: a function with a UE_STRUCT local whose defaults are not zero is FUNC_HasDefaults, so the frame '
+      'starts the local at the struct defaults')
 enum_max_dup()
-pending('EnumNativeClash: a UE_ENUM sharing a game enum\'s enumerator names is refused or warned about', enum_game_name_clash)
-pending('EnumNamesAcrossMods: no enumerator name is cooked by two of the mods (EMood)', enum_names_across_mods)
+# An enumerator's FName is <Enum>::<Name>, kept in one global table where the first enum loaded wins
+# (UEnum::AddNamesToMasterList): a mod enum named like the game's is refused, and no two test mods share one.
+refused('EnumNativeClash', '  ClashNs::EDialogRestriction Mode = ClashNs::EDialogRestriction::SinglePlayerOnly;\n',
+        'UE_ENUM(ClashNs::EDialogRestriction): /Script/FSD already has an enum EDialogRestriction',
+        top='namespace ClashNs {\nenum class EDialogRestriction : uint8 { None, SinglePlayerOnly };\nUE_ENUM(EDialogRestriction);\n}\n')
+enum_names_across_mods()
+print('ok  enumerator names: a UE_ENUM named like a game enum is refused; no two test mods cook one name')
 
 
 # ---- REPL: replication and RPCs (invariant_rules/replication.py)
@@ -6027,23 +6024,6 @@ def repl_notify_refusals():
     print('ok  RepNotify refusals: one that returns a value, an inline one')
 
 
-def repl_unreplicable(mod, member):
-    """mod's `member` (a replicated variable, or an RPC whose parameter it is) holds a TMap or an interface, which
-    never reaches the other machine: refused naming it - worded as the TMap refusals are, 'does not replicate' or 'an
-    RPC parameter cannot be' - or compiled with a warning naming it and without the replication (no finding of
-    repl_types_replicable)."""
-    def test():
-        try:
-            base = pending_asset(mod)
-        except AssertionError as e:
-            assert '%s::%s' % (mod, member) in str(e) and re.search(r'replicat|RPC parameter', str(e)), str(e)
-            return
-        keeps_invariants(base)
-        assert re.search(r'warning: .*%s::%s\b' % (mod, member), compile_log(mod)), \
-            '%s::%s compiles with no word that it does not replicate' % (mod, member)
-    return test
-
-
 def rpc_one_way():
     """An RPC goes one way: the sender routes by one direction (AActor::GetFunctionCallspace), the receiver accepts by
     its own flags, so Multicast with Server or Client is refused (Server with Client never parses: clang refuses
@@ -6055,37 +6035,29 @@ def rpc_one_way():
     print('ok  RPC refusals: Multicast with Server or Client, and an RPC marker on a static method')
 
 
-def rpc_inline():
-    """Refused naming one of them; or a warning names each of ServerPing, Auth and Cos; or each is cooked as a function
-    with its marker's flag (FUNC_Net | NetServer, BlueprintAuthorityOnly 0x4, BlueprintCosmetic 0x8) that Go reaches
-    only through CallFunction's routing (EX_VirtualFunction / EX_FinalFunction, rpc_routing's rule)."""
-    marked = {'ServerPing': 0x200040, 'Auth': 0x4, 'Cos': 0x8}
-    base = refused_naming('RpcInline', *marked)
-    if base is None: return
-    warned = [l for l in compile_log('RpcInline').splitlines() if 'warning:' in l]
-    if all(any(re.search(r'\b%s\b' % f, l) for l in warned) for f in marked): return
-    pkg = invariants.Package(base)
-    calls = called(pkg, pkg.find('Go'))
-    routed = {name for op, name in calls if op in (0x1B, 0x1C)}
-    assert set(marked) <= routed and not {name for op, name in calls if op not in (0x1B, 0x1C)} & set(marked), \
-        'Go runs ServerPing, Auth and Cos in place, no call for the engine to route (calls %s), and no warning' % calls
-    for fn, flag in marked.items():
-        f = pkg.struct(pkg.find(fn)).function_flags
-        assert f & flag == flag, '%s cooks FunctionFlags %#x, without its marker %#x' % (fn, f, flag)
-    keeps_invariants(base)
-
-
 repl_conditions()
 repl_refusals()
 repl_notify_refusals()
 repl_never()
 rpc_one_way()
-pending('ReplHiddenMap: a replicated struct holding a TMap is refused like a TMap variable', repl_unreplicable('ReplHiddenMap', 'Bag'))
-pending('ReplHiddenIface: a replicated TScriptInterface is refused (FInterfaceProperty sends nothing)', repl_unreplicable('ReplHiddenIface', 'Target'))
-pending('ReplHiddenRpc: an RPC parameter struct holding a TMap is refused like a TMap parameter', repl_unreplicable('ReplHiddenRpc', 'Send'))
-pending('ReplIfaceRpc: an RPC TScriptInterface parameter is refused (FInterfaceProperty sends nothing)', repl_unreplicable('ReplIfaceRpc', 'S'))
-pending('ReplIfaceNest: a replicated struct holding an array of TScriptInterface is refused (sent member by member, the interfaces as nothing)',
-        repl_unreplicable('ReplIfaceNest', 'Nest'))
+# RepLayout sends a struct member by member and an array element by element (InitFromProperty_r, InitFromFunction):
+# a TMap member sends nothing (FMapProperty::NetSerializeItem only logs), nor does an interface
+# (FInterfaceProperty::NetSerializeItem writes nothing), at any depth.
+REPL_BAG = 'struct FReplBag {\n  UE_STRUCT;\n  int32 Total;\n  TMap<int32, int32> Counts;\n};\n'
+REPL_MARK = 'class IReplMarker {\npublic:\n  UE_INTERFACE;\n  void Mark();\n};\n'
+refused('ReplHiddenMap', '  UE_REPLICATED(FReplBag, Bag);\n', 'ReplHiddenMap::Bag: a TMap or TSet in FReplBag does not replicate',
+        top=REPL_BAG)
+refused('ReplHiddenIface', '  UE_REPLICATED(TScriptInterface<IReplMarker>, Target);\n',
+        'ReplHiddenIface::Target: an interface does not replicate', top=REPL_MARK)
+refused('ReplHiddenRpc', '  int32 Got;\n  UE_SERVER void Send(FReplBag Sack) { Got = Sack.Total; }\n',
+        'ReplHiddenRpc::Send: an RPC parameter cannot hold what does not replicate: Sack is or holds a TMap or TSet in FReplBag',
+        top=REPL_BAG)
+refused('ReplIfaceRpc', '  int32 N;\n  UE_SERVER void S(TScriptInterface<IReplMarker> Target) { N = 1; }\n',
+        'ReplIfaceRpc::S: an RPC parameter cannot hold what does not replicate: Target is or holds an interface', top=REPL_MARK)
+refused('ReplIfaceNest', '  UE_REPLICATED(FReplNest, Nest);\n', 'ReplIfaceNest::Nest: an interface in FReplNest does not replicate',
+        top=REPL_MARK + 'struct FReplNest {\n  UE_STRUCT;\n  int32 N;\n  TArray<TScriptInterface<IReplMarker>> Marks;\n};\n')
+print('ok  replication refusals: a TMap or an interface inside a replicated struct, as a replicated variable or an RPC '
+      'parameter')
 # A struct is sent whole, through the class variable holding it; a UObject lists no replicated variables and runs
 # every RPC locally. A component replicates, so ReplComponentCtl compiles.
 refused('StructRepl', '  UE_REPLICATED(FReplHp, Hp);\n', 'FReplHp::A: UE_REPLICATED on a struct member has no effect',
@@ -6103,7 +6075,11 @@ with tempfile.TemporaryDirectory() as _tmp:
     _proc = subprocess.run([ASSETGEN, 'compile', _src, UEAPI, _tmp], capture_output=True, encoding='utf-8')
     assert _proc.returncode == 0, _proc.stdout + _proc.stderr
 print('ok  replication refusals: UE_REPLICATED on a struct member, replication on a UObject (a component compiles)')
-pending('RpcInline: a net / authority-only / cosmetic marker on an inline method is refused, warned, or cooks a routed call', rpc_inline)
+# The engine routes a call by the called UFunction's flags; an inline method is none, so its marker goes nowhere.
+for _mod, _mark in (('RpcInline', 'UE_SERVER'), ('AuthInline', 'UE_AUTHORITY_ONLY'), ('CosInline', 'UE_COSMETIC')):
+    refused(_mod, '  int32 Pings;\n  %s inline void Ping() { Pings += 1; }\n  void Go() { Ping(); }\n' % _mark,
+            '%s::Ping: an RPC, authority-only or cosmetic marker on an inline method does nothing' % _mod)
+print('ok  a net, authority-only or cosmetic marker on an inline method is refused')
 
 
 # ---- LATENT: latent calls, async actions, deferred spawn / construct warnings (invariant_rules/latent.py)
@@ -6151,7 +6127,7 @@ def latent_refusals():
     refused('WaitInfo', '  void F() { FLatentActionInfo I; UKismetSystemLibrary::Delay(this, 1.0f, I); }\n',
             'leave the FLatentActionInfo argument out')
     refused('WaitUberName', '  void ExecuteUbergraph_WaitUberName(int32 EntryPoint) {}\n'
-            '  void F() { UKismetSystemLibrary::Delay(1.0f); }\n', "the ubergraph's own name")
+            '  void F() { UKismetSystemLibrary::Delay(1.0f); }\n', "is the name of a class's ubergraph")
     # A UE_PATCH of AssetTest's AssetUser, AssetTest's output standing in for the game as EditTest has it.
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
@@ -6170,12 +6146,11 @@ def latent_refusals():
 
 def latent_info_written():
     """Delay(Duration, Info) is the world-context-less overload with the latent info written out: the compiler supplies
-    the info, so it must refuse this as it refuses Delay(this, Duration, Info). Today the argument count hides it from
-    that refusal and the call is lowered as Delay(WorldContextObject = Duration, Duration = Info, LatentInfo = its
-    own): a float read as an object, and a 32-byte struct copied into a float's slot."""
-    pending('WaitInfoNoWco: Delay(Duration, Info) refused, the compiler supplies the FLatentActionInfo',
-            lambda: refused('WaitInfoNoWco', '  void F() { FLatentActionInfo I; UKismetSystemLibrary::Delay(0.5f, I); }\n',
-                            'leave the FLatentActionInfo argument out'))
+    the info, so it refuses this as it refuses Delay(this, Duration, Info), though the argument count alone would not
+    tell: lowered, it would be Delay(WorldContextObject = Duration, Duration = Info, LatentInfo = its own)."""
+    refused('WaitInfoNoWco', '  void F() { FLatentActionInfo I; UKismetSystemLibrary::Delay(0.5f, I); }\n',
+            'Delay: leave the FLatentActionInfo argument out')
+    print('ok  WaitInfoNoWco: Delay(Duration, Info) is refused, the compiler supplies the FLatentActionInfo')
 
 
 def latent_worlds():

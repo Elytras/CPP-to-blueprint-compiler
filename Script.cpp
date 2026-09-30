@@ -375,13 +375,15 @@ void WriteProperty(FArc& Ar, const FPropertyDef& P, bool bUncooked)
         Ar.Idx(P.Extra);                // Struct
     else if (P.Type == "BoolProperty")
     {
-        // Whole-byte bool, not a bitfield.
+        /* A native C++ bool, as the editor makes every Blueprint bool (SetBoolSize(sizeof(bool), true),
+           KismetCompilerMisc.cpp 1056-1061): the loader rebuilds it from BoolSize and NativeBool alone, and NativeBool 0
+           would load a one-bit bitfield (PropertyBool.cpp 61-91), neither POD nor zero-constructed. */
         Ar.U8(1);                       // FieldSize
         Ar.U8(0);                       // ByteOffset
         Ar.U8(1);                       // ByteMask
         Ar.U8(0xFF);                    // FieldMask
         Ar.U8(1);                       // BoolSize
-        Ar.U8(0);                       // NativeBool
+        Ar.U8(1);                       // NativeBool
     }
     else if (P.Type == "ByteProperty")
         Ar.Idx(P.Extra);                // Enum

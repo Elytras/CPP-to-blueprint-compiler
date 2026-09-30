@@ -17,8 +17,8 @@ member, or an expression in a function body.
 
 UE_MOD_PACKAGE("/Game/_ElytrasMods/AssetTest");
 
-enum class EMood : uint8 { Calm, Angry };
-UE_ENUM(EMood);
+enum class EDefMood : uint8 { Calm, Angry };
+UE_ENUM(EDefMood);
 
 class UMoodDef : public UPrimaryDataAsset {
 public:
@@ -26,14 +26,14 @@ public:
   int32          Count  = 3;
   FString        Title  = "Base";
   FName          Tag;
-  EMood          Mood = EMood::Angry;
+  EDefMood          Mood = EDefMood::Angry;
   bool           bBig = false;
   UMoodDef      *Next = nullptr;
   TArray<int32>  Waves;
 };
 
 UMoodDef MD_Plain = {};
-UMoodDef MD_Calm  = {.Count = 0, .Mood = EMood::Calm}; // an explicit zero is written, not dropped
+UMoodDef MD_Calm  = {.Count = 0, .Mood = EDefMood::Calm}; // an explicit zero is written, not dropped
 UMoodDef MD_Big   = {.Health = -500.5f, .Title = "Big", .Tag = "big", .bBig = true, .Next = &MD_Calm, .Waves = {3, 5, 8}};
 
 /* A native class works the same way, and so does pointing at the game's own assets. EnemyClass is a TSoftClassPtr,
