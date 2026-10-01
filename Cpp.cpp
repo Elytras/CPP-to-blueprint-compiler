@@ -8861,7 +8861,8 @@ bool FCompiler::IsFinalFunction(const FRecord& A, const std::string& Method) con
 {
     const auto M = A.Methods.find(Method);
     if (A.UePackage.compare(0, 8, "/Script/") == 0 || M == A.Methods.end() || IsStaticDecl(*M->second)
-        || IsInlineMethod(A, Method) || !(A.bFinal || !A.FinalAs.empty() || A.FinalMethods.count(Method)))
+        || IsInlineMethod(A, Method) || !(A.bFinal || !A.FinalAs.empty() || A.FinalMethods.count(Method))
+        || ModInterfaceWith(A, Method))        // it implements a mod interface A lists: not Final (Generate)
         return false;
     for (const FRecord* R = &A; R; R = R->Base.empty() ? nullptr : Find(R->Base))
     {
@@ -13968,8 +13969,12 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                      : IsStaticDecl(Decl) ? uint32(FUNC_Static | FUNC_BlueprintCallable | FUNC_Public | FUNC_Final)
                      : kPlainMethodFlags;
         /* `final`, the class or the method: no subclass has a version of its own, and calls are bound to this one
-           (LowerCall). Without BlueprintEvent the editor offers no override either (CanKismetOverrideFunction). */
-        if (!Inherited && !IsStaticDecl(Decl) && (R.bFinal || !R.FinalAs.empty() || R.FinalMethods.count(Fn.Name)))
+           (LowerCall). Without BlueprintEvent the editor offers no override either (CanKismetOverrideFunction). An
+           implementation of a mod interface the class lists itself has no inherited flags (FindEvent: no super) and is
+           no new function: it keeps the contract of the interface's, BlueprintEvent and not Final (func_override_flags),
+           as in any class, and calls to it go by name (IsFinalFunction). */
+        if (!Inherited && !IsStaticDecl(Decl) && (R.bFinal || !R.FinalAs.empty() || R.FinalMethods.count(Fn.Name))
+            && !ModInterfaceWith(R, Fn.Name))
             Flags = (Flags & ~uint32(FUNC_BlueprintEvent)) | FUNC_Final;
         /* All 7229 BlueprintPure functions in the DRG dump are BlueprintCallable too. */
         /* Its own access specifier, where no parent decides. The editor refuses a call node it forbids; the VM checks

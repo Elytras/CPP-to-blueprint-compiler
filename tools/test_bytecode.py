@@ -5156,7 +5156,7 @@ def func_own_iface_final():
     """FuncOwnIfaceFinal: Tell and the stub Left implement IFoiTell, which the class itself lists, keeping the interface
     function's contract (func_override_flags) - BlueprintEvent, not Final - in a final class and in a UE_FINAL_AS base,
     and Ask's call to Tell reaches each class's own."""
-    leaf = pending_asset('FuncOwnIfaceFinal')
+    leaf = asset('FuncOwnIfaceFinal')
     p = lambda c: os.path.join(os.path.dirname(leaf), c)
     final, base = p('FoiFinal'), p('FoiBase')
     for b in (final, base, leaf): keeps_invariants(b)
@@ -5169,8 +5169,9 @@ def func_own_iface_final():
     assert run_as([leaf, base], 'Ask', {}, V=2) == 40
 
 
-pending('FuncOwnIfaceFinal: an implementation of an interface a final class lists has the interface function\'s flags',
-        func_own_iface_final)
+func_own_iface_final()
+print('ok  FuncOwnIfaceFinal: an implementation of an interface a final class lists keeps the interface function\'s '
+      'contract, not Final')
 
 
 def func_template_call():
