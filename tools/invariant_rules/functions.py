@@ -160,9 +160,12 @@ def class_functions(pkg):
 def replaced(pkg, ci, fi, st):
     """(the function F replaces, how): its SuperStruct's function ('super'), or when it has none the interface function
     of a class it lists that it implements ('interface'). (None, None) for a new function; (None, 'unknown') when the
-    super cannot be read."""
+    super cannot be read. A static whose super is a static replaces nothing: it only hides that one, as C++ does, and
+    every call to either is bound to the one it names (EX_CallMath / EX_FinalFunction), so neither its flags nor its
+    parameters reach a caller of the other. Its super is still what FindFunctionByName finds (func_super_link)."""
     if st.super:
         f = fn_at(pkg, st.super)
+        if f and f.flags & FUNC_Static and st.function_flags & FUNC_Static: return None, None
         return (f, 'super') if f else (None, 'unknown')
     f = own_interface_function(pkg, ci, pkg.exports[fi]['name'])
     if f == 'unknown': return None, 'unknown'

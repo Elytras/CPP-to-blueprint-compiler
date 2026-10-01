@@ -2160,6 +2160,8 @@ Notes:
 | `static APawn *FirstPawn(UObject *WorldContextObject = nullptr)` | The first parameter whose name starts with `WorldContext` is what every engine call inside the static receives as its world context, as the editor wires the hidden pin. A caller that leaves it out passes its own `this`, or its own world context when the caller is itself such a static. | Yes |
 | `class MyLib : public UBlueprintFunctionLibrary` holding statics | The editor's Blueprint Function Library. Another mod that includes its header calls the statics like an engine library's: a final call on the library's default object, with a world context left out filled with the caller's `this`. | Yes |
 | A static that calls Delay or UE_AWAIT | Refused: `a static function has no object whose ubergraph frame could keep its locals`; see [Latent calls](#latent-calls). | Refused |
+| `static int32 Tell(int32 V)` in a class whose mod parent has a static `Tell` too | Hides the parent's, as in C++. Every call to a static is bound to the one it names, so `Tell(V)` runs this one and `Parent::Tell(V)` the parent's. It is cooked with the parent's static as its super, as the editor links any function named like a parent's; the editor itself would refuse the name. | Yes |
+| A method that is not static named like a mod parent's static, or a static named like a parent's method | Refused: "... is static, and the editor takes a function of that name in a subclass for an override of it ..." or "... is static, and the Parent::Tell it hides is not ...". The editor makes a function named like a parent's an override of it, and an override must agree with it on Static. Rename one of them. | Refused |
 
 ```cpp
 static int32 Twice(int32 V) { return V * 2; }
@@ -4024,7 +4026,7 @@ Notes:
 | A function left out | Gets an empty stub, as the editor compiles one. The stub returns the zero value (0, false, None, null) and leaves out-parameters unchanged. | Yes |
 | A function left out that a parent this source cooks already has, without listing the interface | The parent's function implements it, as in C++: AssetGen adds an override of it that only calls the parent's (or expands it, if inline), the editor's override with a parent call, so calls through the interface and by name run the parent's body. An empty stub would replace it for every caller, and with no function at all a call would find the interface's own empty one first. | Yes |
 | The same, where the parent's function is a multicast, or has a parameter with no name | Refused: "... no override can call it for ITrigger, and an empty one would replace it; declare Pistol::Pull". An override would send a multicast twice on a server, and cannot pass on an unnamed parameter. | Refused |
-| The same, where the parent's function is static | Refused: "... is static: the editor takes such a function for an override of the static and refuses it ...; rename Rifle::Pull". A static implements no interface function, but the editor makes any function of its name in a subclass an override of it, and an override of a static must be static. | Refused |
+| The same, where the parent's function is static, or the class declares its own `Pull` beside the parent's static | Refused: "... is static: the editor takes such a function for an override of the static and refuses it ...; rename Rifle::Pull". A static implements no interface function, but the editor makes any function of its name in a subclass an override of it, and an override of a static must be static. | Refused |
 | An implementation that returns a value, is `const`, or has out-parameters | Compiled as a function, where the editor would make a function graph rather than an event. It takes the interface function's flags, so callers through the interface find it. A void event such as ShowDamageEffects is compiled as a function too. | Yes |
 | `class Pistol : public Weapons::Rifle` | A subclass implements the interface through its parent without listing it. Redefining an interface function is an ordinary override, and `Weapons::Rifle::Pull(Times)` calls the parent's. | Yes |
 | `class NativeOnly : public AActor, public IHealth` | Refused: "IHealth::GetHealth is native only ..., so a Blueprint cannot implement IHealth". The editor refuses the same. Calling IHealth through `TScriptInterface<IHealth>` on the game's objects still works. | Refused |
@@ -5734,6 +5736,13 @@ and where the feature is described. In each group, the messages you are most lik
   under `virtual int32 Step() final`. C++ lets it hide the parent's, but a Blueprint finds functions by name, and the
   same parameters are already refused by clang. Fix: rename the subclass's method, or drop `final`. See
   [Functions](#functions).
+- `<Class>::<Method>: <Base>::<Method> is static, and the editor takes a function of that name in a subclass for an
+  override of it, which only a static can be ("Check flags: Exec, Final, Static"); rename this one`: a method that is
+  not static has the name of an ancestor's static. C++ lets it hide the static, but the editor links a function named
+  like a parent's as an override of it and refuses one that does not agree on Static. Fix: rename one of them, or make
+  this one static too. See [Static functions and function libraries](#static-functions-and-function-libraries).
+- `<Class>::<Method> is static, and the <Base>::<Method> it hides is not: ...; rename this one`: the same the other way
+  round, a static named like an ancestor's method. Fix: rename one of them.
 - `inline function <Class>::<Method> calls itself`: recursion through inline functions, direct or through another
   inline function. Each call copies the body in, so the copying never ends. One overload calling another is fine. Fix:
   drop `inline`, because a Blueprint function can call itself, or write a loop. See

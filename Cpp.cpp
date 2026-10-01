@@ -1334,6 +1334,9 @@ private:
     const FRecord* InheritedImplementation(const FRecord& R, const std::string& Method) const;
     /* Why no forwarder can call A's Method (static, a multicast, an unnamed parameter), or empty. */
     std::string WhyNotForwarded(const FRecord& A, const std::string& Method) const;
+    /* What ParentClass->FindFunctionByName finds of Method above R, walked as FindEvent walks for a super: the class
+       holding it and whether it is a static; {nullptr, false} for nothing. */
+    std::pair<const FRecord*, bool> FoundAbove(const FRecord& R, const std::string& Method) const;
     bool IsMulticast(const FRecord& R, const std::string& Method) const;
     /* A constant outside any function body, `constexpr int32 kMax = 40;` at namespace scope or static in a class, and an
        inline class variable, `static inline const TArray<FName> Tags = {...};`: decl id -> its VarDecl. It has no
@@ -2644,8 +2647,11 @@ FIndex FCompiler::FindEvent(FBlueprintClass& BP, const std::string& FromRecord, 
            ParentClass->FindFunctionByName. What matters most is its net flags: an override of an RPC is that RPC, and
            a mismatch "will trigger an assert in Link()" (KismetCompiler.cpp:2019). An inline method is no UFunction. */
         if (R != Self && !R->IsNative() && !R->bIsInterface)
-            if (auto M = R->Methods.find(Method); M != R->Methods.end() && !IsStaticDecl(*M->second) && !IsInlineMethod(*R, Method))
+            if (auto M = R->Methods.find(Method); M != R->Methods.end() && !IsInlineMethod(*R, Method))
             {
+                /* A static is found the same. Only a static of Self's own gets here over one (Generate refuses the rest),
+                   and it inherits nothing: no caller is split, every call to either being bound, so its flags are its own. */
+                if (IsStaticDecl(*M->second)) return bFlagsOnly ? Null() : BP.EngineFunction(PackageOf(*R), ClassOf(*R), UeMethod);
                 *InheritedFlags = ModMethodFlags(*R, Method, BP);
                 return bFlagsOnly ? Null() : BP.EngineFunction(PackageOf(*R), ClassOf(*R), UeMethod);
             }
@@ -9118,6 +9124,24 @@ void FCompiler::SynthesizeForwarders()
     }
 }
 
+std::pair<const FRecord*, bool> FCompiler::FoundAbove(const FRecord& R, const std::string& Method) const
+{
+    for (const FRecord* A = R.Base.empty() ? nullptr : Find(R.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
+    {
+        if (!A->IsNative() && !A->bIsInterface)
+        {
+            if (auto M = A->Methods.find(Method); M != A->Methods.end() && !IsInlineMethod(*A, Method))
+                return { A, IsStaticDecl(*M->second) };
+            if (!A->Methods.count(Method) && ModInterfaceWith(*A, Method)) return { A, false };     // its stub
+        }
+        if (A->IsNative() && A->Methods.count(Method) && !A->Forwards.count(Method))
+            return { A, IsStaticDecl(*A->Methods.at(Method)) };
+        for (const std::string& I : A->Interfaces)
+            if (const FRecord* IR = Find(I); IR && IR->IsNative() && IR->Methods.count(Method)) return { A, false };
+    }
+    return { nullptr, false };
+}
+
 const FRecord* FCompiler::InheritedImplementation(const FRecord& R, const std::string& Method) const
 {
     for (const FRecord* A = R.Base.empty() ? nullptr : Find(R.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
@@ -13521,6 +13545,32 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                        "function of that name; rename this one";
                 return false;
             }
+        /* A function of a mod ancestor's name is an override of it to the editor, a static too: its super is
+           ParentClass->FindFunctionByName (KismetCompiler.cpp 1733-1774), and an override must agree with it on Static
+           ("Check flags: Exec, Final, Static", 1855-1868). C++ only hides the one above, so one that does not agree is
+           refused. A static over a static splits no caller - every call to either is bound - and keeps it as its super
+           (FindEvent). A native ancestor's is Generate's below: no function replaces one that is no Blueprint event. */
+        if (const auto [A, bAboveStatic] = FoundAbove(R, Fn.Name); A && !A->IsNative() && bAboveStatic != IsStaticDecl(*Fn.Decl))
+        {
+            const FRecord* Listed = nullptr;
+            for (const std::string& I : R.Interfaces)
+                for (const FRecord* IR : InterfaceChain(Find(I)))
+                    if (!Listed && IR && IR->Methods.count(Fn.Name)) Listed = IR;
+            if (!bAboveStatic)
+                *Err = R.CppName + "::" + Fn.Name + " is static, and the " + A->CppName + "::" + Fn.Name + " it hides is not: "
+                       "the editor takes it for an override of that one, which a static cannot be (\"Check flags: Exec, "
+                       "Final, Static\"); rename this one";
+            else if (Listed)
+                *Err = R.CppName + " implements " + Listed->CppName + ", whose " + Fn.Name + " " + R.CppName + "::" + Fn.Name
+                     + " implements, and the " + A->CppName + "::" + Fn.Name + " it inherits is static: the editor takes "
+                       "such a function for an override of the static and refuses it (\"Check flags: Exec, Final, "
+                       "Static\"); rename " + A->CppName + "::" + Fn.Name;
+            else
+                *Err = R.CppName + "::" + Fn.Name + ": " + A->CppName + "::" + Fn.Name + " is static, and the editor takes "
+                       "a function of that name in a subclass for an override of it, which only a static can be (\"Check "
+                       "flags: Exec, Final, Static\"); rename this one";
+            return false;
+        }
         /* `= 0` with no body anywhere is an empty function, like an interface's stub below: a subclass's version needs
            it as its super, and a call by name on an object without one would not find a function (a Fatal). */
         if ((Fn.Body = BodyOf(R, Fn.Name, Fn.Def)) || Fn.Decl->value("pure", false)) Methods.push_back(Fn);

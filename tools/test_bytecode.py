@@ -5103,7 +5103,7 @@ def func_static_above():
     refused('StaticOverMethod', '', 'SomKid::Tell is static, and the SomRoot::Tell it hides is not',
             top='class SomRoot : public AActor {\npublic:\n  int32 Tell(int32 V) { return V + 1; }\n};\n'
                 'class SomKid : public SomRoot {\npublic:\n  static int32 Tell(int32 V) { return V * 3; }\n};\n')
-    kid = pending_asset('FuncStaticHide')
+    kid = asset('FuncStaticHide')
     root = os.path.join(os.path.dirname(kid), 'FshRoot')
     for b in (kid, root): keeps_invariants(b)
     pkg = invariants.Package(kid)
@@ -5113,8 +5113,9 @@ def func_static_above():
     assert run_as([kid, root], 'Use', {}, V=2) == 603
 
 
-pending('FuncStaticHide: a function named like a mod ancestor\'s static is refused unless it is a static, whose super '
-        'is that one', func_static_above)
+func_static_above()
+print('ok  FuncStaticHide: a function named like a mod ancestor\'s static is refused unless it is a static, whose super '
+      'is that one')
 
 
 def func_iface_unnamed():
