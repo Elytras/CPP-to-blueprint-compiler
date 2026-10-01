@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """usage: bpbuild.py <mods dir (holds mods.yaml) or a parent with BpMods/> <UeApi dir> <assetgen executable> [--force] [--no-pak]"""
+import glob
 import io
 import os
 import re
@@ -29,12 +30,41 @@ def oldest(paths):
     return min(times) if times else 0
 
 
-def mod_package(source):
-    text = io.open(source, encoding="utf-8-sig", errors="replace").read()
-    m = MOD_PACKAGE.search(text)
-    if not m:
-        sys.exit("%s declares no UE_MOD_PACKAGE" % source)
-    return m.group(1)
+def mod_package(sources):
+    """The first UE_MOD_PACKAGE among a mod's sources - any one .cpp of a multi-file mod may carry it."""
+    for source in sources:
+        if source.endswith(".cpp"):
+            m = MOD_PACKAGE.search(io.open(source, encoding="utf-8-sig", errors="replace").read())
+            if m:
+                return m.group(1)
+    sys.exit("%s declares no UE_MOD_PACKAGE" % ", ".join(s for s in sources if s.endswith(".cpp")))
+
+
+INCLUDE = re.compile(r'^\s*#\s*include\s*"([^"]+)"', re.M)
+GENERATED = ("UeApi", "UeAssets")  # dumped headers: thousands of files, covered by toolchain_time instead
+
+
+def mod_sources(mod, bp):
+    """A mod's `sources`, globs expanded (`Foo/*.cpp`), plus every local header they #include, transitively,
+    so a mod lists its .cpp files only. An entry naming nothing comes back as-is, for the caller's missing check."""
+    out = []
+    for entry in mod.get("sources") or []:
+        path = os.path.join(bp, entry)
+        out += sorted(glob.glob(path)) if glob.has_magic(entry) else [path]
+    seen = set(os.path.normcase(os.path.abspath(p)) for p in out)
+    todo = [p for p in out if os.path.exists(p)]
+    while todo:
+        src = todo.pop()
+        for inc in INCLUDE.findall(io.open(src, encoding="utf-8-sig", errors="replace").read()):
+            if inc.replace("\\", "/").split("/")[0] in GENERATED:
+                continue
+            path = os.path.abspath(os.path.join(os.path.dirname(src), inc))
+            key = os.path.normcase(path)
+            if key not in seen and os.path.exists(path):
+                seen.add(key)
+                out.append(path)
+                todo.append(path)
+    return out
 
 
 def order(mods):
@@ -129,7 +159,7 @@ def content_dir(stage_fsd, package):
 def dep_stage(dep, by_name, bp):
     """Where dep's cooked assets sit - the import path (its UE_MOD_PACKAGE) plus its build dir,
     both known from the manifest, so nothing needs threading through the build loop."""
-    package = mod_package(os.path.join(bp, by_name[dep]["sources"][0]))
+    package = mod_package(mod_sources(by_name[dep], bp))
     fsd = os.path.join(bp, "build", dep, "FSD")
     return content_dir(fsd, package), package, fsd
 
@@ -323,14 +353,14 @@ def main():
     # so compiling is a pass of its own, separate from packing (phase 2).
     for mod in order(mods):
         name = mod["name"]
-        sources = [os.path.join(bp, s) for s in (mod.get("sources") or [])]
+        sources = mod_sources(mod, bp)
         missing = [s for s in sources if not os.path.exists(s)]
-        if not sources or missing:
-            print("%-16s SKIP - no such source: %s" % (name, ", ".join(missing) or "(none listed)"))
+        if not any(s.endswith(".cpp") for s in sources) or missing:
+            print("%-16s SKIP - no such source: %s" % (name, ", ".join(missing) or "(no .cpp listed)"))
             failed.append(name)
             continue
 
-        package = mod_package(sources[0])
+        package = mod_package(sources)
         stage_fsd = os.path.join(bp, "build", name, "FSD")
         stage_content = os.path.join(stage_fsd, "Content", *package.replace("/Game/", "").split("/"))
         assets = cooked_assets(stage_content)
