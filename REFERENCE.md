@@ -6127,7 +6127,7 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
 - `missing or invalid <IncludeDir>/<File> (run genueapi.py)`: the include-dir argument is not a generated UeApi
   folder: `Conv.json`, `Ops.json`, `Types.json` or `Events.json` is missing or unreadable. Fix: pass the UeApi folder
   that genueapi wrote, or regenerate it. See [The SDK](GUIDE.md#the-sdk).
-- `usage: assetgen verify <out-dir> <reference-dir>` (and the two lines after it): an unknown subcommand or too few
+- `usage: assetgen verify <out-dir> <reference-dir>` (and the lines after it): an unknown subcommand or too few
   arguments, with exit code 2. Fix: `assetgen compile <source.cpp> <UeApi dir> <out dir> [--api <api dir>]`. The
   `--api` folder is where the editor stubs go, not the UeApi folder. See [Building mods](GUIDE.md#building-mods).
 - `<Class> -> no API asset: <Reason>`: printed with `--api` (`generate_api` in `mods.yaml`); the build goes on. The
@@ -6158,9 +6158,14 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   writing (a missing folder or a read-only file), or the disk filled while it was written. compile writes it to
   `<root>/AssetRegistry.bin` when the out dir is `<root>/Content/<package path>`, and into the out dir otherwise.
   Fix: create the folder, make the file writable, or free space. See [Building mods](GUIDE.md#building-mods).
-- `clang produced no AST at <Path>` and `could not parse clang's AST dump`: the JSON syntax tree clang writes to the
-  temp folder is missing, empty or cut short. It can run to hundreds of MB. Fix: make sure the temp folder is
-  writable and has room, and compile again. Report it if it repeats.
+- `clang produced no AST for <Source>` and `could not parse clang's AST dump`: clang exited without an error but wrote
+  no syntax tree, or one that is cut short or is not JSON. The tree streams from clang through a pipe and is never
+  written to disk. Fix: check that the `clang++` on `PATH` runs, and compile again. Report it if it repeats.
+- `assetgen: the filtered AST dump did not parse; reading it again unfiltered (clang runs again, so its warnings above
+  print again)`, on stderr: before parsing clang's syntax tree, AssetGen drops the parts it never reads, and the
+  parser refused what that step left. The compile runs clang again and reads the whole tree, so it takes longer and
+  clang's warnings print twice; what it writes is the same. Fix: nothing in the mod. It is a bug in AssetGen: report
+  it with the source.
 - `<Path>: cannot read`: `assetgen registry` was given an input that does not exist or cannot be opened. Fix: pass a
   registry that assetgen wrote, such as a mod's `build/<mod>/FSD/AssetRegistry.bin`.
 - `<Path>: not an AssetRegistry.bin`, `<Path>: not a UE 4.27 AssetRegistry.bin`, `<Path>: a malformed tag store`,
