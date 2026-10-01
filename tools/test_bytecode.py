@@ -5119,6 +5119,26 @@ print('ok  FuncStaticHide: a function named like a mod ancestor\'s static is ref
       'is that one')
 
 
+def static_above_foreign():
+    """The same rule over another mod's class, pinned by UE_CLASS to its owner: its functions come from the header it
+    shares, so whether one is static is known, and the editor takes a function of its name below for an override of it
+    all the same (its super is ParentClass->FindFunctionByName). A method over its static, and a static over its method,
+    are refused."""
+    refused('StaticAboveForeign', '', 'XafBase::Tell is static, and the editor takes a function of that name in a '
+            'subclass for an override of it',
+            top='class XafBase : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/XafOwner/XafBase", "XafBase_C");\n'
+                '  static int32 Tell(int32 V);\n};\n'
+                'class XafKid : public XafBase {\npublic:\n  int32 Tell(int32 V) { return V * 2; }\n};\n')
+    refused('StaticOverForeign', '', 'XofKid::Tell is static, and the XofBase::Tell it hides is not',
+            top='class XofBase : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/XofOwner/XofBase", "XofBase_C");\n'
+                '  int32 Tell(int32 V);\n};\n'
+                'class XofKid : public XofBase {\npublic:\n  static int32 Tell(int32 V) { return V * 2; }\n};\n')
+
+
+pending('FuncStaticHide: a function named like the static of another mod\'s class, or a static named like its method, '
+        'is refused', static_above_foreign)
+
+
 def func_iface_unnamed():
     """FuncIfaceUnnamed gets an override of FiuRoot's Tell (for IFiuTell) and of Kept (for its `FiuRoot::Kept` call),
     each calling FiuRoot's though a parameter of it has no name: the override names it, as an editor override does.
