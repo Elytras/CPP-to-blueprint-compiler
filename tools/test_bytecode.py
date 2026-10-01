@@ -4749,7 +4749,7 @@ def func_template_call():
     `AuthOnly()` in Helper is a call by name from FtKid's Use, so on an FtKid it runs FtMid's override (7), as C++ does,
     and FtKid, which declares no AuthOnly, gets no function of that name; `FuncTemplateCall::AuthOnly()` in HelperQ runs
     FuncTemplateCall's (3) on an FtQKid. The inline Plain is the same call, read the same way."""
-    top = pending_asset('FuncTemplateCall')
+    top = asset('FuncTemplateCall')
     p = lambda *cs: [os.path.join(os.path.dirname(top), c) for c in cs]
     mid = p('FtMid', 'FuncTemplateCall')
     kid, qkid = p('FtKid') + mid, p('FtQKid') + mid
@@ -4761,8 +4761,8 @@ def func_template_call():
         assert fields['Seen'] == want, (os.path.basename(chain[0]), fn, fields)
 
 
-pending('FuncTemplateCall: an unqualified call in a member template goes by name from each class it is copied into',
-        func_template_call)
+func_template_call()
+print('ok  FuncTemplateCall: an unqualified call in a member template goes by name from each class it is copied into')
 
 
 def func_iface_static():

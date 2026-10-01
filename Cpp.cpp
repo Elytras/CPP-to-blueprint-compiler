@@ -1295,6 +1295,9 @@ private:
     const Json* CopyableDef(const FRecord& In, const std::string& Method) const;
     /* The body a call on `this` always expands in place, an inline method's or a member template's, or null. */
     const Json* InlineOnThis(const Json& Call) const;
+    /* The class such a body is declared in, an inline method's or a member template's, or null: it is that class's
+       code wherever it is copied, so what it names is read there (NamesQualified). */
+    const FRecord* DeclaredIn(const Json& Inline) const;
     bool ResumesLater(const Json& N, std::set<const Json*>& Seen) const;
     /* `Base::Fn()` from a class without an Fn of its own, to an Fn that is not copied in: an override of Fn declared in
        that class, forwarding to the parent's, so that the call can be bound to Base's. Run once, before any Generate. */
@@ -1679,6 +1682,7 @@ private:
     mutable bool    bSynthDeref = false;
     std::map<std::string, FRecord> Records;
     std::map<std::string, std::string> MethodOwner;   // clang decl id -> owning record
+    std::map<std::string, std::string> TemplateOwner; // a member template's instantiation's decl id -> its record
     std::map<std::string, std::string> FieldOwner;    // clang decl id -> declaring record
     std::map<std::string, std::string> Bare;          // unambiguous leaf name -> qualified name
     std::map<std::string, std::string> Aliases;       // a namespace-scope `using A = B;` / typedef: A -> B
@@ -2421,6 +2425,10 @@ bool FCompiler::Collect(std::string* Err)
                 R.TypeAliases[Name(C)] = StripTypeKeywords(TypeOf(C));
             else if (Kind(C) == "FinalAttr")
                 R.bFinal = true;
+            else if (Kind(C) == "FunctionTemplateDecl")
+                ForEach(C, [&](const Json& M) {
+                    if (Kind(M) == "CXXMethodDecl") TemplateOwner[M.value("id", std::string())] = R.CppName;
+                });
         });
         /* A set is looked up in Replicated by the name it is cooked under, so the marker's C++ key follows. */
         for (const auto& N2 : R.UeNames)
@@ -5586,11 +5594,11 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
            the inherited one). A call written unqualified is never one: PBase::Twice's `Speak()`, an inline body, stays
            a call by name in a Kid that declares Speak. The rest of the qualified calls, to the class's own Method
            (`Cur::Method()`) or with no Method in Cur, are bQualified, handled below. Whether it is written qualified
-           is read from the class it is written in (NamesQualified): an inline body's own, or the copied function's. */
+           is read from the class it is written in (NamesQualified): an inline body's own, a member template's included
+           (DeclaredIn), or the copied function's. */
         const FRecord* Written = Cur;
         if (!InlineStack.empty())
-            if (auto O = MethodOwner.find(InlineStack.back()->value("id", std::string())); O != MethodOwner.end())
-                Written = Find(O->second);
+            if (const FRecord* In = DeclaredIn(*InlineStack.back())) Written = In;
         bool bParentCall = false, bQualified = false;
         if (Kind(CallExprNode) == "CXXMemberCallExpr")
         {
@@ -8599,8 +8607,7 @@ const Json* FCompiler::CopyableDef(const FRecord& In, const std::string& Method)
                     bBindsParent = true;
         if (const Json* Inl = InlineOnThis(N); Inl && Expanded.insert(Inl).second)
         {
-            const auto O = MethodOwner.find(Inl->value("id", std::string()));
-            const FRecord* Owner = O != MethodOwner.end() ? Find(O->second) : nullptr;
+            const FRecord* Owner = DeclaredIn(*Inl);
             ForEach(*Inl, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Walk(C, Owner ? Owner : &In); });
         }
         ForEach(N, [&](const Json& C) { Walk(C, Written); });
@@ -8619,6 +8626,14 @@ const Json* FCompiler::InlineOnThis(const Json& Call) const
     if (auto O = MethodOwner.find(Id); O != MethodOwner.end())
         if (const FRecord* R = Find(O->second))
             if (auto I = R->Inlines.find(Id); I != R->Inlines.end()) return I->second;
+    return nullptr;
+}
+
+const FRecord* FCompiler::DeclaredIn(const Json& Inline) const
+{
+    const std::string Id = Inline.value("id", std::string());
+    if (auto O = MethodOwner.find(Id); O != MethodOwner.end()) return Find(O->second);
+    if (auto T = TemplateOwner.find(Id); T != TemplateOwner.end()) return Find(T->second);
     return nullptr;
 }
 
@@ -8695,8 +8710,7 @@ void FCompiler::SynthesizeForwarders()
                     Consider(N, bNoOpt, Written);
                     if (const Json* Inl = InlineOnThis(N); Inl && Expanded.insert(Inl).second)
                     {
-                        const auto O = MethodOwner.find(Inl->value("id", std::string()));
-                        const FRecord* Owner = O != MethodOwner.end() ? Find(O->second) : nullptr;
+                        const FRecord* Owner = DeclaredIn(*Inl);
                         ForEach(*Inl, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Walk(C, Owner ? Owner : &W); });
                     }
                 }

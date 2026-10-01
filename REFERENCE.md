@@ -2446,8 +2446,9 @@ public:
 
 Notes:
 
-- An inline body is copied into each class that calls it, and `Base::Method()` in it is judged from that class, as if
-  written there: a class with its own Method makes the parent call, and one without gets the added override.
+- An inline body, a member template's too, is copied into each class that calls it, and `Base::Method()` in it is
+  judged from that class, as if written there: a class with its own Method makes the parent call, and one without gets
+  the added override. A plain `Method()` in it stays a call by name from every such class.
 - No override is added where the nearest parent's declaration of the method has a parameter with no name, or is
   inline, static or pure virtual: such a call whose body cannot be copied in goes by name, with the warning.
 - A parent this source cooks has its body copied in, as a `final` method's is (see
@@ -2470,7 +2471,7 @@ object, write a free inline function.
 | `inline bool AttachTo(USceneComponent *Child, USceneComponent *Parent)` at namespace scope | A free inline function, expanded at every call. A free function can act on any object; an inline method expands only on `this`. | Yes |
 | `int32 Helper(int32 X) { ... }` at namespace scope, without `inline` | Refused at the call: `call to an unknown function: Helper`. A Blueprint has no free functions. Add `inline`, or make it a static of a function library class. | Refused |
 | `static inline int32 AddOne(int32 V)` in a library class | Expanded at the call, from its own class or from any class that includes the header, in any mod. The library does not export it. | Yes |
-| `Bump(By)` inside an inline body that a subclass expands | A call on `this` goes by name, so the object's most derived method runs, including an override compiled later. | Yes |
+| `Bump(By)` inside an inline body or a member template that a subclass expands | A call on `this` goes by name, so the object's most derived method runs, including an override compiled later or one in a class between. | Yes |
 | `Other->Twice(3)` where `Twice` is an inline method | Refused: `called on another object (only this)`, because `this` in the body stays the caller's self. Make the method non-inline, or write a free inline function that takes the object. | Not yet |
 | An inline function that calls itself, directly or through another inline | Refused (`calls itself`): the expansion would never end. Make it non-inline; a Blueprint function may recurse. One overload calling another is fine. | Refused |
 | `inline int32 Nope(int32 X);` with no body | Refused at the call (`has no body`). clang also warns with `-Wundefined-inline`. | Refused |
@@ -2538,7 +2539,7 @@ Notes:
 | `SpawnActor<AActor>(AActor::StaticClass(), Where)` from `Objects.h` | Each instantiation clang makes is expanded at its call like any inline function. No function exists per instantiation; see [Creating objects](#creating-objects). | Yes |
 | `template <class T> inline T Max2(T A, T B)` | A free function template needs `inline`. | Yes |
 | `template <class T> T Max2(T A, T B)` without `inline` | Refused at the call: `call to an unknown function: Max2`. Add `inline`. | Refused |
-| `template <class T> int32 WidthOf()` in a class | A member template is expanded at its call, with or without `inline`. No Blueprint function is made, and only calls on `this` expand. | Yes |
+| `template <class T> int32 WidthOf()` in a class | A member template is expanded at its call, with or without `inline`. No Blueprint function is made, and only calls on `this` expand. Its body is its own class's code, as an inline method's is: a call in it is read there, wherever it is copied. | Yes |
 | `inline auto TwiceN(Number auto V)`, or `int32 AutoP(auto V)` in a class | An `auto` parameter makes the function a template, expanded at each call. A free one needs `inline`. | Yes |
 | `template <class T> concept Number = requires(T A) { A + A; };` | Concepts and requires-clauses are checked by clang and cost nothing at run time. A wrong type is a "constraints not satisfied" error on the calling line. | Yes |
 | `template <class... T> inline int32 Fwd(T... V) { return Sum2(V...); }` | Pack expansion into a call works. | Yes |
