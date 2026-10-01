@@ -2446,7 +2446,8 @@ Notes:
 
 - Inside an inline body, `Base::Method()` is judged from the class the body is written in. No override is added for
   a call there, since the body is copied into subclasses too: one whose body cannot be copied in goes by name, with
-  the warning.
+  the warning. So does such a call where the nearest parent's declaration of the method has a parameter with no
+  name, or is inline, static or pure virtual.
 - A parent this source cooks has its body copied in, as a `final` method's is (see
   [Calling your own functions](#calling-your-own-functions)). An override of an engine event, such as
   ReceiveBeginPlay above, stays a call.
@@ -5642,9 +5643,11 @@ and where the feature is described. In each group, the messages you are most lik
   off. The name alone makes the override. See [Overrides and parent calls](#overrides-and-parent-calls).
 - `warning: <Class>::<Function>: <Base>::<Method>() is a call by name, which on an object of a subclass that
   overrides <Method> runs that override; to run <Base>'s alone, call it from an override of <Method> in <Class>`:
-  a qualified call, in an inline method, to a method its class does not declare and whose body cannot be copied in
-  (authority-only, cosmetic, an RPC, `noinline`, one that waits). Outside an inline method AssetGen adds the override
-  itself. Fix: move the call into a method that is not inline, or declare the method in the class, calling
+  a qualified call to a method its class does not declare and whose body cannot be copied in (authority-only,
+  cosmetic, an RPC, `noinline`, one that waits), where AssetGen cannot add the override itself: the call is in an
+  inline method, or the nearest parent's declaration of the method has a parameter with no name, or is inline,
+  static or pure virtual. Elsewhere AssetGen adds the override and prints nothing. Fix: move the call into a method
+  that is not inline, name the parameter, or declare the method in the class, calling
   `<Base>::<Method>()`; the qualified call then runs Base's function alone. See
   [Calling the parent](#calling-the-parent).
 - `warning: <Class>::<Function>: <Base>::<Method>() is a call by name, which on an object of a subclass that
