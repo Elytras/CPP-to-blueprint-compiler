@@ -971,6 +971,17 @@ def switch_in_loop(Count):
     return s
 
 
+check('FlowTest', 'CommaStmt', lambda N: wrap((N + 200) * 100 + 10 - N), [dict(N=n) for n in (-5, 0, 7, 2**30)])
+check('FlowTest', 'CommaIf', lambda N: N + 1 if N + 1 <= 2 else -1 if N + 11 == 13 else (N + 11) * 10,
+      [dict(N=n) for n in (-3, 0, 1, 2, 3, 50)])
+for n in (-3, 0, 4):
+    me = {'Total': 1}
+    run(asset('FlowTest'), 'ForwardVoid', self_vars=me, N=n)
+    assert me['Total'] == 1 + (-n * 100 if n < 0 else n), (n, me)
+print('ok  FlowTest.ForwardVoid: `return F();` of a void F calls it, then returns')
+refused('CommaExpr', '  int32 F(int32 N) { return (N += 1, N * 2); }\n', 'the comma operator inside an expression')
+refused('CommaWhile', '  int32 F(int32 N) { while (N += 1, N < 9) {} return N; }\n', 'the comma operator inside an expression')
+print('ok  the comma operator inside an expression or a loop condition is refused by name')
 check('FlowTest', 'Classify', classify, [dict(Code=c) for c in range(-2, 8)])
 check('FlowTest', 'NoDefault', no_default, [dict(Code=c) for c in (-1, 0, 1, 9, 10)])
 check('FlowTest', 'NameSet', lambda N: 2 if N.lower() == 'none' else 1, [dict(N=n) for n in ('None', 'none', 'IntProperty', 'x', 'None_1')])
@@ -4963,11 +4974,23 @@ def typing_iface():
 
 
 def typing_refusals():
-    """`return (void)<value>;` has no Blueprint form: the value would be stepped into the null result a function
-    with no return value has (ScriptCore.cpp 1123-1133)."""
-    refused('TypingVoidCast', '  int32 N;\n  void Cast5() { return (void)5; }\n', 'no Kismet conversion from int to void')
-    refused('TypingVoidCast', '  int32 N;\n  void CastVar() { return (void)N; }\n', 'no Kismet conversion from int to void')
-    print('ok  `return (void)5;` / `return (void)N;` in a void function are refused')
+    """`return (void)<value>;` in a void function evaluates the value and returns, as C++ does. A value that can do
+    nothing is dropped, so none is ever stepped into the null result a function with no return value has
+    (ScriptCore.cpp 1123-1133); the plain return still leaves the function there."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, 'TypingVoidCast.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/TypingVoidCast");\n'
+                    'class TypingVoidCast : public AActor {\npublic:\n  int32 N;\n'
+                    '  void Cast5() { N = 1; return (void)5; N = 2; }\n'
+                    '  void CastVar() { N = 7; return (void)N; N = 8; }\n};\n')
+        proc = assetgen_compile([src, UEAPI, tmp])
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        for fn, want in (('Cast5', 1), ('CastVar', 7)):
+            me = {'N': 0}
+            run(os.path.join(tmp, 'TypingVoidCast'), fn, self_vars=me)
+            assert me['N'] == want, (fn, me)
+    print('ok  `return (void)5;` / `return (void)N;` in a void function return there, no value stepped')
 
 
 def typing_arr_null():

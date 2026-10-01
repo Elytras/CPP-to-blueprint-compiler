@@ -488,7 +488,7 @@ Notes:
 | `Index_0 = 7;`, for a member the SDK spells `Index_0` | Write the SDK's spelling. Dumper-7 respells names that C++ cannot use: a clash gets a suffix (`Name` becomes `Name_0`), an illegal character becomes `_` (`Audio Flying` becomes `Audio_Flying`), and a leading digit becomes a word (`3P` becomes `ThreeP`). The SDK keeps the real name beside the member, and everything the compiler cooks uses the real name. | Yes |
 | `class Größe : public AActor { FName Umlaut = "Größe"; };` | Non-ASCII class, member and asset names, and non-ASCII name and string defaults, are cooked and registered correctly. | Yes |
 | `using FTarget = AActor;`, then `FTarget *Aimed;` | An alias of a UObject class is still an object reference, not an address. It works at namespace scope and at class scope. | Yes |
-| `using FMoods = TArray<EMood>;`, `using Factory = TScriptInterface<IFoo>;` | A global alias of a template type is that type wherever it is used, in out-of-line method definitions too. | Yes |
+| `using FMoods = TArray<EMood>;`, `using Factory = TScriptInterface<IFoo>;` | A global alias of a template type is that type wherever it is used, in out-of-line method definitions too. A global alias of a class is that class the same way, so an override may spell a parameter through it. | Yes |
 | `using Grapple = Game::WeaponsNTools::GrapplingGun::WPN_GrapplingGun_C;` | An alias to a game class's full `Game::` path. The SDK gives a game class a short name at global scope only when no other game package has a class of that name. For one that does, write such an alias. | Yes |
 
 ```cpp
@@ -1441,7 +1441,9 @@ Notes:
 | `X > 0 ? X * 2 : X < -5 ? -1 : 7` | Only the chosen arm runs. The operator compiles to an if/else that stores into a temp, or straight into the variable being assigned, and `return C ? A : B;` becomes two returns. Nested ternaries work. | Yes |
 | `(C ? Left : Right) = 5` | Refused ("assignment to ConditionalOperator"): Blueprint has no reference to whichever variable the condition picks. Write `if (C) Left = 5; else Right = 5;`. | Refused |
 | `Add5(C ? A : B)` into a `T&` parameter | The callee gets a copy, stored back into the picked variable after the call, with a warning. See [Functions](#functions). | Warns |
-| `A = 1, B = 2`, `++I, --J` | The comma operator is refused, both as a statement ("unimplemented statement BinaryOperator") and as a value ("unimplemented binary operator , on IntInt"). Write two statements. A declaration of several variables, `int32 I = 0, J = N;`, is not the comma operator and works. | Refused |
+| `A = 1, B = 2;`, `++I, --J` | The comma operator as a statement: each side runs in turn, as two statements. A side that does nothing (`I, J++`) is dropped. A declaration of several variables, `int32 I = 0, J = N;`, is not the comma operator and works too. | Yes |
+| `if (bool bOk; Get(Out, bOk), !bOk)`, `switch (N += 10, N)` | An if or switch condition with a comma: the left side runs once, before the test, as an init-statement does, and the right side is the condition. This is how an out-parameter call is tested in one line. | Yes |
+| `return (N += 1, N * 2);`, `while (Next(X), X > 0)` | Not yet: a comma inside any other expression, or in a loop condition (which would rerun its left side on every trip), is refused naming the comma operator. Write the left side as a statement of its own, before the loop and at the end of its body for a loop. | Not yet |
 
 Notes:
 
@@ -1587,6 +1589,7 @@ Notes:
 | `break;`, `continue;` | Plain jumps. `break` leaves the innermost loop or switch. `continue` goes to a for loop's increment, a do-while's test, or the loop around a switch. Inside an inline function's body they belong to that body's own loops. | Yes |
 | `goto done;` | A jump, backward or forward, which can leave any number of loops at once. The editor's nearest equivalent is a wire looping back. Each expansion of an inline function gets its own labels. A declaration that a goto reaches again is made again, as one in a loop is. | Yes |
 | `return Found;`, `return;` | The Return Node. `return C ? A : B;` becomes two returns. In an inline function, return jumps to the end of the expanded body. Inside a TMap loop that writes values back, the values are stored first. | Yes |
+| `return Log(Errors, "bad");` in a void function | A void call, then a plain return, as C++ runs it. `return (void)X;` with an X that does nothing is a plain return. | Yes |
 | `goto` inside a TMap loop that writes values back | Refused; see [Loops](#loops). | Refused |
 
 ```cpp
@@ -1652,7 +1655,7 @@ a build a loop that never ends hangs the game instead of being stopped.
 | `for (int32 I = 0; I < Count; ++I)` | `Init; while (Cond) { Body; Inc; }`: the editor's ForLoop, with any condition and increment. `continue` reaches the increment. Loops nest freely. | Yes |
 | `for (;;)`, `for (; I < N; I++)` | A missing condition is `true`, and a missing init or increment is left out. | Yes |
 | `for (int32 I = 0; int32 L = N - I; ++I)` | A declaring condition: L is made again and tested on every trip, and `continue` still reaches the increment. | Yes |
-| `for (int32 I = 0, J = N; I < J; ++I, --J)` | The comma in the increment is refused (see [Operators](#operators)); the two-variable init is fine. Move `--J` into the body. | Refused |
+| `for (int32 I = 0, J = N; I < J; ++I, --J)` | Two variables, both updated in the increment. See [Operators](#operators) for the comma. | Yes |
 
 ### Range-for over a TArray
 
@@ -5575,7 +5578,6 @@ and where the feature is described. In each group, the messages you are most lik
   - `< on ObjectObject` (or `>`, `<=`, `>=`): ordering object pointers. Blueprint has only `==` and `!=` on objects.
   - `= on IntInt` (or another flavour): `=` used as a value, as in `A = B = 0;` or `if ((X = Next()) > 3)`. Put each
     assignment in its own statement, or use `if (int32 X = Next(); X > 3)`. `+=`, `++` and `--` work as values.
-  - `, on IntInt`: the comma operator used as a value, `return (N += 1, N * 2);`. Split it into statements.
 
   See [Operators](#operators).
 - `TODO: unimplemented operator overload <Operator> yielding <Type>`, and `TODO: unimplemented operator overload
@@ -5586,8 +5588,7 @@ and where the feature is described. In each group, the messages you are most lik
 - `TODO: unimplemented statement <Kind>`: a statement with no Blueprint form. `<Kind>` is clang's name for it:
   - `CXXTryStmt`: try and catch. Blueprint has no exceptions.
   - `ConditionalOperator`: `C ? Open() : Close();`. Write the if/else out.
-  - `BinaryOperator`: `bReady && Launch();`, an unused expression, or a comma, such as the for increment
-    `++I, --J`. Write the if out, and move the second update into the loop body.
+  - `BinaryOperator`: `bReady && Launch();` or another unused expression. Write the if out.
   - `DeclRefExpr`: `(void)Unused;`. Leave an unused parameter unnamed instead. `(void)SomeCall();` compiles as the call.
   - `IntegerLiteral`: a GNU case range, `case 1 ... 3:`. Write one `case` per value; labels in a row share a body.
   - `CaseStmt`: a case label inside a nested block of the switch. Put every label directly in the switch body.
@@ -5721,8 +5722,9 @@ and where the feature is described. In each group, the messages you are most lik
   `static int32 Count = 0;`. The message follows the prefix `<Class>::<Function>: inline <Function>: `
   (`inline <Class>::<Method>: ` for a method). A `static constexpr` constant works here. Fix: make it a member of the
   class. See [Latent calls](#latent-calls).
-- `a void inline function used as a value`: `return Bump();` where `Bump` is an inline function that returns void.
-  Fix: `Bump(); return;`. See [Inline functions and templates](#inline-functions-and-templates).
+- `TODO: the comma operator inside an expression or a loop condition; ...`: a comma as a value, `return (N += 1,
+  N * 2);` or an argument, or in a `while` / `for` / `do` condition. Fix: put the left side in a statement of its own
+  (for a loop, before it and at the end of its body). See [Operators](#operators).
 - `inline call to <Class>::<Method> with <N> arguments`: a C-style variadic inline function,
   `inline int32 First(int32 N, ...)`, called with extra arguments. Fix: give it a fixed parameter list, or overloads.
   See [Inline functions and templates](#inline-functions-and-templates).

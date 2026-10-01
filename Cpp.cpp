@@ -2163,7 +2163,7 @@ bool FCompiler::Collect(std::string* Err)
     std::set<std::string> Ambiguous;
     std::map<std::string, std::string> EnumUnderlying;
     std::vector<std::pair<std::string, std::string>> EnumMarks;      // enum, owning mod ("" for this one)
-    std::map<std::string, std::string> TemplateAliases;              // a global `using A = T<...>;`: A -> T<...>
+    std::map<std::string, std::string> GlobalAliases;                // a global `using A = B;` / typedef: A -> B
 
     /* UeApi headers put Blueprint classes in namespaces mirroring their /Game path. */
     std::function<void(const Json&, const std::string&)> Walk =
@@ -2178,7 +2178,7 @@ bool FCompiler::Collect(std::string* Err)
         if ((Kind(N) == "TypeAliasDecl" || Kind(N) == "TypedefDecl") && N.contains("name"))
         {
             Aliases[Ns + Name(N)] = Aliases[Name(N)] = StripTypeKeywords(TypeOf(N));
-            if (Ns.empty() && TypeOf(N).find('<') != std::string::npos) TemplateAliases[Name(N)] = TypeOf(N);
+            if (Ns.empty()) GlobalAliases[Name(N)] = TypeOf(N);
         }
         if (Kind(N) == "VarDecl" && Name(N) == "UeModPackage") FindLiteral(N, ModPackage);
         /* UE_ASSET_EDIT: a pointer naming the target, then the braced variable holding the edit, one number between them. */
@@ -2438,9 +2438,15 @@ bool FCompiler::Collect(std::string* Err)
     };
     Walk(Doc, std::string());
     if (!bMetaOk) return false;
-    /* `using ValueFactory = TScriptInterface<...>;`: Find resolves an alias of a class, nothing resolves one of a
-       template, so its uses - out-of-line method bodies included - are written out once here. */
-    if (!TemplateAliases.empty()) ExpandAliases(const_cast<Json&>(Doc), TemplateAliases);
+    /* A global alias of a template or a class (`using ValueFactory = TScriptInterface<...>;`, `using JSON =
+       Game::...::JSONValue_C;`) is written out in every use, out-of-line method bodies included. Find resolved one of
+       a class but nothing one of a template, and clang desugars only a type's outer layer, so `JSON *` kept its alias
+       where an override's signature is compared with its parent's. A scalar alias (`using int32 = int;`) stays: the
+       lowering reads those spellings. */
+    std::map<std::string, std::string> Expand;
+    for (const auto& [A, T] : GlobalAliases)
+        if (T.find('<') != std::string::npos || Records.count(StripTypeKeywords(T))) Expand[A] = T;
+    if (!Expand.empty()) ExpandAliases(const_cast<Json&>(Doc), Expand);
 
     if (ModPackage.empty())
     {
@@ -4726,6 +4732,14 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         const Json* LhsRaw = Nth(*N, 0);
         const Json* RhsRaw = Nth(*N, 1);
         if (!LhsRaw || !RhsRaw) { *Err = "binary operator with a missing side"; return false; }
+        /* LowerBody takes a comma apart where its left side can run as a statement of its own; here it would have
+           to be hoisted out of an expression, which nothing does yet. */
+        if (Op == ",")
+        {
+            *Err = "TODO: the comma operator inside an expression or a loop condition; it works as a statement "
+                   "(`A, B;`, a for increment) and as an if / switch condition (`if (A, B)`)";
+            return false;
+        }
         /* `"Kills: " + N`: C++ reads an address N characters into the literal (clang warns, -Wstring-plus-int, and
            compiles it), which nothing in a Blueprint could mean. It is the concat the author wrote. A float or an
            object on the other side never gets here - clang refuses those, so they stay `FString("lit") + X`. */
@@ -7111,6 +7125,53 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             if (!bCondOk) bOk = false;
             return bCondOk;
         };
+        /* The comma operator. `A, B;` is two statements (a for increment `++I, --J` too, lowered here). An if /
+           switch condition runs once, so `if (A, B)` is A, then `if (B)`, as an init-statement is lowered - which
+           is how `if (bool bOk; Get(Out, bOk), !bOk)` tests an out-param. The casts and parens around the comma
+           stay on B. A loop condition reruns its left side every trip, and a comma inside any other expression
+           would need hoisting: both reach LowerArg, which refuses them. */
+        auto IsComma = [](const Json& E) { return Kind(E) == "BinaryOperator" && E.value("opcode", std::string()) == ","; };
+        /* A discarded side that can do nothing (`I, J++`) is no statement at all. */
+        auto Discarded = [&](std::initializer_list<const Json*> Sides) {
+            Json A = Json::array();
+            for (const Json* E : Sides) if (!IsEagerSafe(*Strip(E))) A.push_back(*E);
+            return A;
+        };
+        if (IsComma(*S))
+        {
+            Json Wrap = { {"kind", "CompoundStmt"}, {"inner", Discarded({ Nth(*S, 0), Nth(*S, 1) })} };
+            if (!LowerBody(Wrap, BP, Out, Locals, Err)) bOk = false;
+            return;
+        }
+        /* `return F();` with a void F, as a void function forwards to another: the call, then a plain return. A void
+           value that can do nothing (`return (void)5;`) is dropped: no value is ever stepped into a void result. */
+        if (K == "ReturnStmt" && First(*S) && StripTypeKeywords(TypeOf(*First(*S))) == "void")
+        {
+            Json Bare = *S;
+            Bare.erase("inner");
+            Json Wrap = { {"kind", "CompoundStmt"}, {"inner", IsEagerSafe(*Strip(First(*S))) ? Json::array({ Bare })
+                                                                                       : Json::array({ *First(*S), Bare })} };
+            if (!LowerBody(Wrap, BP, Out, Locals, Err)) bOk = false;
+            return;
+        }
+        if ((K == "IfStmt" || K == "SwitchStmt") && !S->value("hasInit", false) && !S->value("hasVar", false) && Nth(*S, 0))
+        {
+            Json Plain = *S;
+            Json* At = &Plain["inner"][0];
+            for (std::string AK = Kind(*At); (AK == "ImplicitCastExpr" || AK == "ParenExpr" || AK == "ExprWithCleanups"
+                 || AK == "ConstantExpr") && At->contains("inner") && !(*At)["inner"].empty(); AK = Kind(*At))
+                At = &(*At)["inner"][0];
+            if (IsComma(*At))
+            {
+                Json Left = (*At)["inner"][0];
+                *At = Json((*At)["inner"][1]);
+                Json Seq = Discarded({ &Left });
+                Seq.push_back(Plain);
+                Json Wrap = { {"kind", "CompoundStmt"}, {"inner", Seq} };
+                if (!LowerBody(Wrap, BP, Out, Locals, Err)) bOk = false;
+                return;
+            }
+        }
         if (K == "DeclStmt")
         {
             /* clang groups comma-declared vars under one DeclStmt. */
