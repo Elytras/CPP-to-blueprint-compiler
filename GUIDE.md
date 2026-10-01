@@ -443,7 +443,9 @@ write `Tip->SetupAttachment(Glow);` in `UE_DEFAULTS`, as a C++ constructor does:
 components, at a socket with `SetupAttachment(Glow, FName("Muzzle"))`, or under a component the class inherits, from
 a mod or game Blueprint parent or a native one (`SetupAttachment(Mesh)` in an `ACharacter` or `APlayerCharacter`
 child), or under the actor's root, whichever that is (`SetupAttachment(RootComponent)`). A component that is not a
-scene component, such as a movement component, attaches to nothing.
+scene component, such as a movement component, attaches to nothing. `SetupAttachment` in a function attaches at once,
+keeping the relative transform, with a warning: the engine's own does nothing once the actor is constructed, so write
+`AttachToComponent` there.
 
 Set a component's defaults in `UE_DEFAULTS`, one `Comp->Field = value;` each, as you would in its Details panel.
 Assign a struct whole (`FVector(...)`, `FColor(R, G, B)`), and an asset with `&Asset`

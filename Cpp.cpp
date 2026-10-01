@@ -5494,6 +5494,16 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         {
             if (K == "CXXMemberCallExpr") Receiver = Strip(First(*Callee));
             if (!Receiver) { *Err = MethodName + "(): TODO: only a call on an object (`Obj->" + MethodName + "()`)"; return false; }
+            /* A constructor's SetupAttachment, called in a function: it attaches at once, as OnRegister does after a
+               constructor's call (SceneComponent.cpp 667-683). The engine's own does nothing on a component already
+               registered (an ensure, 1750), as an actor's are once it is constructed, so the sugar differs from what C++
+               would do there: said, not refused, since attaching is what the call asks for. */
+            if (MethodName == "SetupAttachment" && R->UeName == "SceneComponent")
+                printf("  warning: %s::%s: SetupAttachment attaches at once here, as AttachToComponent with KeepRelative "
+                       "location, rotation and scale and no welding, which is where the engine's own call leads when the "
+                       "component registers; on a component already registered, as an actor's are once it is constructed, "
+                       "the engine's own does nothing. Call AttachToComponent to pick the rules, or SetupAttachment in "
+                       "UE_DEFAULTS to place a component of the class's own\n", Cur->CppName.c_str(), CurFnName.c_str());
             /* No `::`: a free inline function (UObject_GetOuter), expanded here with the object as its first argument.
                Found by name, first in document order: walking FreeInlines would take whichever address sorts first. */
             if (Fw->second.find("::") == std::string::npos)

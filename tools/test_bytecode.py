@@ -6251,17 +6251,18 @@ def comp_attach_body():
     the component registers (SceneComponent.cpp 667-683). On a component already registered, as an actor's are once it
     is constructed, the engine's own call does nothing but fail an ensure (1750), so the compiler says, naming the
     function, that it attached anyway."""
-    base = pending_asset('CompAttachBody')
-    tmp, out, log = compile_to(open(os.path.join(PENDING, 'CompAttachBody.cpp'), encoding='utf-8-sig').read(), 'CompAttachBody')
-    shutil.rmtree(tmp, ignore_errors=True)
+    base = asset('CompAttachBody')
+    log = LOGS['CompAttachBody']
     warned = [l for l in log.splitlines() if 'warning:' in l and 'SetupAttachment' in l]
     assert warned and all('CompAttachBody::ReceiveBeginPlay' in l for l in warned), log
     vm = VM(base, {}, Pivot=Obj('SceneComponent'), Lamp=Obj('PointLightComponent'))
     vm.call('ReceiveBeginPlay')
     assert vm.log == [('K2_AttachToComponent', vm.self.vars['Pivot'], [vm.self.vars['Lamp'], 'None', 0, 0, 0, False])], vm.log
+    print('ok  CompAttachBody: SetupAttachment in a function attaches at once, keeping the relative transform, and warns '
+          'that the engine\'s own would not')
 
 
-pending('CompAttachBody: SetupAttachment in a function warns that it attaches where the engine\'s would not', comp_attach_body)
+comp_attach_body()
 
 
 # ---- Refusals: each of these would build a package the engine mishandles

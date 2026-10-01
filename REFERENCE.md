@@ -2665,7 +2665,7 @@ Notes:
 | `Glow->SetupAttachment(Mesh);` in an `ACharacter` child | Glow attaches to a native default subobject. The node names the subobject by its object name, `CharacterMesh0` for `Mesh` (bIsParentComponentNative), which UeApi records. It stays `CharacterMesh0` further down, in an `APlayerCharacter` child, though `FPMesh` is a skeletal mesh too: a subclass cannot rename a subobject its parent makes. A native member that is no default subobject is refused: attach to it at run time. | Yes |
 | `Glow->SetupAttachment(RootComponent);` | Glow attaches to the actor's root, whichever component that is, as a constructor's call does. Below a parent that gives the actor a root, such as `ACharacter`'s capsule or a Blueprint parent's root, its node is a root node naming no parent, which the construction script attaches to that root. With no root to inherit, Glow is never the root itself: it hangs from the first scene component `SetupAttachment` leaves alone, or, with none, from the default scene root, which stays, as the editor keeps a component added under it. It keeps its own location, rotation and scale, relative to the root. | Yes |
 | `Lamp->SetupAttachment(Own);` for an inherited Lamp, `A->SetupAttachment(B); B->SetupAttachment(A);`, or one component attached twice | Refused. An inherited component stays where its own class puts it. A cycle has no node the construction script starts from, so none of its components would be made. | Refused |
-| `Pivot->SetupAttachment(Lamp);` in a function | Attaches at once, keeping the relative transform: `K2_AttachToComponent` with KeepRelative for location, rotation and scale, and no welding. That is what the engine's own `SetupAttachment` leads to when the component registers; called on a component already registered, as any in a function is, the engine's own does nothing. | Yes |
+| `Pivot->SetupAttachment(Lamp);` in a function | Attaches at once, keeping the relative transform: `K2_AttachToComponent` with KeepRelative for location, rotation and scale, and no welding. That is what the engine's own `SetupAttachment` leads to when the component registers; called on a component already registered, as any of a constructed actor is, the engine's own does nothing, so the compiler warns, naming the function. Call `AttachToComponent` to pick the rules yourself. | Warns |
 
 Notes:
 
@@ -5833,6 +5833,12 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   member (`Lamp`, `Mesh`); attach to anything else at run time. See [The root and attachment](#the-root-and-attachment).
 - `<Class>::UE_DEFAULTS: <Component>->SetupAttachment's socket is a literal name (FName("hand_r")) or none`: the
   socket is a variable or a call, which a node cannot hold. Fix: write the name, or attach at run time. See
+  [The root and attachment](#the-root-and-attachment).
+- `warning: <Class>::<Function>: SetupAttachment attaches at once here, as AttachToComponent with KeepRelative
+  location, rotation and scale and no welding, ...`: `SetupAttachment` in a function. It attaches as the engine's own
+  call would once the component registers, but on a component already registered, as an actor's are once it is
+  constructed, the engine's own does nothing. The build goes on. Fix: call `AttachToComponent` with the rules you
+  want, or place a component of the class's own with `SetupAttachment` in UE_DEFAULTS. See
   [The root and attachment](#the-root-and-attachment).
 - `<Class>::<Member>: only an actor has a construction script`: UE_COMPONENT in a class that does not derive from
   AActor. Fix: declare components only on an actor class. See [Components](#components).
