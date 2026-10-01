@@ -1308,16 +1308,29 @@ private:
        the nearest declaration from Of up that is a Blueprint function, when no subclass can bring its own: Of is
        final, or that declaration is. Null when one could. */
     const FRecord* FinalOwner(const FRecord* Of, const std::string& Method) const;
+    /* Whether Generate cooks A's Method FUNC_Final: A or the method is `final`, and it replaces no function (FindEvent),
+       whose flags it would take instead. */
+    bool IsFinalFunction(const FRecord& A, const std::string& Method) const;
     /* The definition a call (Call, to the declaration clang picked, Picked) to In's Method may be expanded from in
        place of the call, or null. See LowerCall. */
     const Json* Expandable(const FRecord& In, const std::string& Method, const Json& Call, const Json* Picked) const;
     /* The part of Expandable that holds for every call: In's definition of Method, or null when no call may copy it. */
     const Json* CopyableDef(const FRecord& In, const std::string& Method) const;
+    /* The body a call on `this` always expands in place, an inline method's or a member template's, or null. */
+    const Json* InlineOnThis(const Json& Call) const;
+    /* The class such a body is declared in, an inline method's or a member template's, or null: it is that class's
+       code wherever it is copied, so what it names is read there (NamesQualified). */
+    const FRecord* DeclaredIn(const Json& Inline) const;
     bool ResumesLater(const Json& N, std::set<const Json*>& Seen) const;
     /* `Base::Fn()` from a class without an Fn of its own, to an Fn that is not copied in: an override of Fn declared in
        that class, forwarding to the parent's, so that the call can be bound to Base's. Run once, before any Generate. */
     void SynthesizeForwarders();
     std::deque<Json> ForwarderDecls;            // their declarations, which the records point into
+    /* The class above R, cooked by this source, whose Method implements R's interface function of that name in C++:
+       the nearest declaration from R's parent up, unless it is a native class's or `= 0`. Null when none. */
+    const FRecord* InheritedImplementation(const FRecord& R, const std::string& Method) const;
+    /* Why no forwarder can call A's Method (static, a multicast, an unnamed parameter), or empty. */
+    std::string WhyNotForwarded(const FRecord& A, const std::string& Method) const;
     bool IsMulticast(const FRecord& R, const std::string& Method) const;
     /* A constant outside any function body, `constexpr int32 kMax = 40;` at namespace scope or static in a class, and an
        inline class variable, `static inline const TArray<FName> Tags = {...};`: decl id -> its VarDecl. It has no
@@ -1520,6 +1533,11 @@ private:
     const FRecord* NamedQualifier(const Json& Ref) const;
     /* `Base::Method()` on this: the record the qualifier names, read back the same way, else null. */
     const FRecord* MemberQualifier(const Json& Member) const;
+    /* Whether a call on `this` to R's Method, written in class Written, names R's own: the forwarder's call, one
+       written `R::Method()` (MemberQualifier), or one past a declaration of Method from Written up to R, which in C++
+       hides R's from an unqualified call - so it got there through a qualifier, however spelled (`this->R::Method()`).
+       A forwarder is no declaration of the source's, so this answers the same before and after SynthesizeForwarders. */
+    bool NamesQualified(const Json& Callee, const FRecord* Written, const FRecord& R, const std::string& Method) const;
     const std::vector<std::string>& ModSources() const;
     bool IsSubclassOf(const FRecord& Child, const FRecord& Parent) const;
     /* The nearest declaration of some method along R's chain is `= 0`: the class Generate cooks CLASS_Abstract. */
@@ -1690,6 +1708,7 @@ private:
     mutable bool    bSynthDeref = false;
     std::map<std::string, FRecord> Records;
     std::map<std::string, std::string> MethodOwner;   // clang decl id -> owning record
+    std::map<std::string, std::string> TemplateOwner; // a member template's instantiation's decl id -> its record
     std::map<std::string, std::string> FieldOwner;    // clang decl id -> declaring record
     std::map<std::string, std::string> Bare;          // unambiguous leaf name -> qualified name
     std::map<std::string, std::string> Aliases;       // a namespace-scope `using A = B;` / typedef: A -> B
@@ -2436,6 +2455,10 @@ bool FCompiler::Collect(std::string* Err)
                 R.TypeAliases[Name(C)] = StripTypeKeywords(TypeOf(C));
             else if (Kind(C) == "FinalAttr")
                 R.bFinal = true;
+            else if (Kind(C) == "FunctionTemplateDecl")
+                ForEach(C, [&](const Json& M) {
+                    if (Kind(M) == "CXXMethodDecl") TemplateOwner[M.value("id", std::string())] = R.CppName;
+                });
         });
         /* A set is looked up in Replicated by the name it is cooked under, so the marker's C++ key follows. */
         for (const auto& N2 : R.UeNames)
@@ -5196,27 +5219,49 @@ const FRecord* FCompiler::NamedQualifier(const Json& Ref) const
 /* A MemberExpr on an implicit this begins at its qualifier when it has one and at the member's own name when not
    (clang's MemberExpr::getBeginLoc), so `QcParent::Plain()` is told from `Plain()` by what is written where its range
    begins: `<Record>::<member>`, tried in each of the mod's sources as NamedQualifier does.
+   The record's name may come in parts, `Weapons::Rifle::Pull`.
    ponytail: `this->QcParent::Plain()` begins at `this` and a qualifier written in a macro has spelling locations; both
-   read as unqualified, a call by name. */
+   read as unqualified here, a call by name, unless a class on the way declares Plain (NamesQualified). */
 const FRecord* FCompiler::MemberQualifier(const Json& Member) const
 {
     const Json Begin = Member.value("range", Json::object()).value("begin", Json::object());
     if (!Begin.contains("offset") || !Begin.contains("tokLen")) return nullptr;
     const size_t Off = Begin["offset"].get<size_t>(), Len = Begin["tokLen"].get<size_t>();
     const std::string Method = Member.value("name", std::string());
+    auto Ident = [](char C) { return std::isalnum(uint8(C)) || C == '_'; };
     for (const std::string& T : ModSources())
     {
         if (Off + Len > T.size()) continue;
-        size_t P = Off + Len;
-        while (P < T.size() && (T[P] == ' ' || T[P] == '\t')) ++P;
-        if (T.compare(P, 2, "::") != 0) continue;
-        P += 2;
-        while (P < T.size() && (T[P] == ' ' || T[P] == '\t')) ++P;
-        if (T.compare(P, Method.size(), Method) != 0) continue;
-        if (P + Method.size() < T.size() && (std::isalnum(uint8(T[P + Method.size()])) || T[P + Method.size()] == '_')) continue;
-        if (const FRecord* R = Find(T.substr(Off, Len))) return R;
+        /* `<Record>::<member>`, the record's name in as many parts as it is written with: `Weapons::Rifle::Pull`. */
+        std::string Qualifier = T.substr(Off, Len);
+        for (size_t P = Off + Len;;)
+        {
+            while (P < T.size() && (T[P] == ' ' || T[P] == '\t')) ++P;
+            if (T.compare(P, 2, "::") != 0) break;
+            P += 2;
+            while (P < T.size() && (T[P] == ' ' || T[P] == '\t')) ++P;
+            size_t End = P;
+            while (End < T.size() && Ident(T[End])) ++End;
+            if (End == P) break;
+            if (T.compare(P, End - P, Method) == 0 && End - P == Method.size())
+            {
+                if (const FRecord* R = Find(Qualifier)) return R;
+                break;
+            }
+            Qualifier += "::" + T.substr(P, End - P);
+            P = End;
+        }
     }
     return nullptr;
+}
+
+bool FCompiler::NamesQualified(const Json& Callee, const FRecord* Written, const FRecord& R, const std::string& Method) const
+{
+    if (Callee.value("forwards", false)) return true;
+    if (Written && IsSubclassOf(*Written, R))
+        for (const FRecord* A = Written; A && A != &R; A = A->Base.empty() ? nullptr : Find(A->Base))
+            if (A->Methods.count(Method) && !A->Forwarders.count(Method)) return true;
+    return MemberQualifier(Callee) != nullptr;
 }
 
 /* True when evaluating N twice is the same as once: names, literals, member reads and arithmetic, no call or store. */
@@ -5710,31 +5755,28 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
            it means THAT implementation: the editor's "call to parent function", EX_FinalFunction on the parent's own
            UFunction (K2Node_CallParentFunction) - which Out.Fn below already is. By name the call would come straight
            back to the override making it, forever: a shipping build has no script recursion guard. A native ancestor's
-           takes the final form anyway. */
-        /* The class the call is written in: an inline method expanded into a subclass keeps its own class's view, so
-           PBase::Twice's `Speak()` stays a call by name in Kid, not Kid's call to its parent's Speak. */
+           takes the final form anyway.
+           The call is the compiled class's, Cur's, wherever it is written: an inline body copied into a subclass makes
+           it from that subclass, so it is a parent call only where Cur has its own Method - one of the source's, or the
+           forwarder SynthesizeForwarders gave it, which no call by name names (`AuthOnly()` in its class still names
+           the inherited one). A call written unqualified is never one: PBase::Twice's `Speak()`, an inline body, stays
+           a call by name in a Kid that declares Speak. The rest of the qualified calls, to the class's own Method
+           (`Cur::Method()`) or with no Method in Cur, are bQualified, handled below. Whether it is written qualified
+           is read from the class it is written in (NamesQualified): an inline body's own, a member template's included
+           (DeclaredIn), or the copied function's. */
         const FRecord* Written = Cur;
         if (!InlineStack.empty())
-            if (auto O = MethodOwner.find(InlineStack.back()->value("id", std::string())); O != MethodOwner.end())
-                Written = Find(O->second);
+            if (const FRecord* In = DeclaredIn(*InlineStack.back())) Written = In;
         bool bParentCall = false, bQualified = false;
-        if (Written && R != Written && Kind(CallExprNode) == "CXXMemberCallExpr")
+        if (Kind(CallExprNode) == "CXXMemberCallExpr")
         {
             const Json* Callee = Strip(First(CallExprNode));
             const Json* Obj = Callee ? Strip(First(*Callee)) : nullptr;
-            if (Obj && Kind(*Obj) == "CXXThisExpr")
+            if (Obj && Kind(*Obj) == "CXXThisExpr" && NamesQualified(*Callee, Written, *R, MethodName))
             {
-                /* A forwarder is no declaration of the source's: `AuthOnly()` in its class still names the inherited
-                   one, a call by name. Only a call written qualified, or the forwarder's own, binds through it, and only
-                   in its own class's code: an inline body copied into a subclass is that subclass's. */
-                std::optional<bool> bWrittenQualified;
-                auto Qualified = [&] {
-                    if (!bWrittenQualified) bWrittenQualified = Callee->value("forwards", false) || MemberQualifier(*Callee);
-                    return *bWrittenQualified;
-                };
-                for (const FRecord* A = Written; A && A != R && !bParentCall; A = A->Base.empty() ? nullptr : Find(A->Base))
-                    bParentCall = A->Methods.count(MethodName) != 0 && (!A->Forwarders.count(MethodName) || (A == Cur && Qualified()));
-                bQualified = !bParentCall && !R->IsNative() && Qualified();
+                const auto Own = Cur->Methods.find(MethodName);
+                bParentCall = R != Cur && Own != Cur->Methods.end() && !IsStaticDecl(*Own->second) && !IsInlineMethod(*Cur, MethodName);
+                bQualified = !bParentCall && !R->IsNative();
             }
         }
         /* `final` (FinalOwner): the one version of the method every object the call can run on reaches, called as
@@ -5745,14 +5787,19 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
            one it names. */
         const Json* On = K == "CXXMemberCallExpr" ? Strip(First(*Callee)) : nullptr;
         const bool bOnThis = !On || Kind(*On) == "CXXThisExpr";
-        const FRecord* Bound = nullptr;
+        const FRecord* Only = nullptr;
         if (!R->IsNative() && !bStatic && !bParentCall && !Out.bReceiverIsArg)
         {
             std::string Of = bOnThis ? std::string() : StripTypeKeywords(TypeOf(*On));
             while (!Of.empty() && (Of.back() == '*' || Of.back() == ' ')) Of.pop_back();
-            if ((Bound = FinalOwner(bOnThis ? Cur : Find(Of), MethodName)) && (Bound->IsNative() || (bQualified && Bound != R)))
-                Bound = nullptr;
+            if ((Only = FinalOwner(bOnThis ? Cur : Find(Of), MethodName)) && (Only->IsNative() || (bQualified && Only != R)))
+                Only = nullptr;
         }
+        /* Its body is copied in where it can be (below); the call is bound to it only when it is FUNC_Final. The editor
+           binds a call to a function without that flag only as a parent call (the call_opcode_flags rule), and a `final`
+           class's inherited function has none, nor has an override, which takes its parent's flags. By name the call
+           reaches that same function, as no subclass brings its own. */
+        const FRecord* Bound = Only && IsFinalFunction(*Only, MethodName) ? Only : nullptr;
         const FRecord* Called = Bound ? Bound : R;
         /* KismetCompilerVMBackend.cpp picks the local form unless the callee is native, a net function, authority
            only or cosmetic. A method declared only by mod classes, without an RPC marker, is none of those; an
@@ -5771,7 +5818,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         Out.bLocal = (!Out.VirtualName.empty() || Bound) && bLocal;
         /* A call whose one body is known here - bound on `this`, a parent's, or a static of this mod - is that body,
            expanded in place. The function stays, for delegates, timers, other mods and the editor. */
-        if (const FRecord* In = bStatic || bParentCall ? R : Bound; In && bOnThis && !Out.bReceiverIsArg && CurLocals)
+        if (const FRecord* In = bStatic || bParentCall ? R : Only; In && bOnThis && !Out.bReceiverIsArg && CurLocals)
             if (const Json* Def = Expandable(*In, MethodName, CallExprNode, FullDecl))
                 return ExpandInline(CallExprNode, *Def, In->CppName + "::" + MethodName, true, BP, Out, Err, nullptr, bStatic);
         /* `QcParent::Plain()` from a class that does not declare Plain: C++ runs QcParent's without dispatch, where by
@@ -5779,12 +5826,18 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
            bound to it is not a Blueprint's: the editor calls a parent's function without dispatch only from an override
            of it (K2Node_CallParentFunction), and binds no other call to a function a subclass can override (the
            call_opcode_flags rule); so one that cannot be copied in is a parent call above, from the override
-           SynthesizeForwarders declared, and one that has none stays a call by name, with a warning. */
-        if (bQualified && Bound != R)
+           SynthesizeForwarders declared, and one that has none stays a call by name, with a warning.
+           `SqA::H()` in SqA's own code, its own H, is the same: C++ runs SqA's H on an SqKid that overrides H too, and no
+           Blueprint calls its own class's function without dispatch unless that function is final (bound above). */
+        if (bQualified && Only != R)
         {
             if (const Json* Def = bOnThis && !Out.bReceiverIsArg && CurLocals ? Expandable(*R, MethodName, CallExprNode, FullDecl) : nullptr)
                 return ExpandInline(CallExprNode, *Def, R->CppName + "::" + MethodName, true, BP, Out, Err);
-            if (IsMulticast(*R, MethodName))
+            if (R == Cur)
+                printf("  warning: %s::%s: %s::%s() is a call by name, which on an object of a subclass that overrides %s runs "
+                       "that override: a Blueprint calls its own class's function without dispatch only when it is final\n",
+                       Cur->CppName.c_str(), CurFnName.c_str(), R->CppName.c_str(), MethodName.c_str(), MethodName.c_str());
+            else if (IsMulticast(*R, MethodName))
                 printf("  warning: %s::%s: %s::%s() is a call by name, which on an object of a subclass that overrides %s runs "
                        "that override: a multicast is called without dispatch only from an override of it, which on a "
                        "server sends it a second time\n", Cur->CppName.c_str(), CurFnName.c_str(), R->CppName.c_str(),
@@ -5793,7 +5846,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
                 printf("  warning: %s::%s: %s::%s() is a call by name, which on an object of a subclass that overrides %s runs "
                        "that override; to run %s's alone, call it from an override of %s in %s\n", Cur->CppName.c_str(),
                        CurFnName.c_str(), R->CppName.c_str(), MethodName.c_str(), MethodName.c_str(), R->CppName.c_str(),
-                       MethodName.c_str(), Written->CppName.c_str());
+                       MethodName.c_str(), Cur->CppName.c_str());
         }
 
         const std::string CalleePackage = PackageOf(*Called), CalleeName = ClassOf(*Called);
@@ -8694,6 +8747,26 @@ const FRecord* FCompiler::FinalOwner(const FRecord* Of, const std::string& Metho
     return nullptr;
 }
 
+/* The same walk FindEvent makes for a super, without importing it: a mod ancestor's function, a native one's, or a
+   native interface's of any class on the way. */
+bool FCompiler::IsFinalFunction(const FRecord& A, const std::string& Method) const
+{
+    const auto M = A.Methods.find(Method);
+    if (A.IsNative() || M == A.Methods.end() || IsStaticDecl(*M->second) || IsInlineMethod(A, Method)
+        || !(A.bFinal || A.FinalMethods.count(Method)))
+        return false;
+    for (const FRecord* R = &A; R; R = R->Base.empty() ? nullptr : Find(R->Base))
+    {
+        if (R != &A && !R->IsNative() && !R->bIsInterface)
+            if (auto P = R->Methods.find(Method); P != R->Methods.end() && !IsStaticDecl(*P->second) && !IsInlineMethod(*R, Method))
+                return false;
+        if (R->IsNative() && R->Methods.count(Method) && !R->Forwards.count(Method)) return false;
+        for (const std::string& I : R->Interfaces)
+            if (const FRecord* IR = Find(I); IR && IR->IsNative() && IR->Methods.count(Method)) return false;
+    }
+    return true;
+}
+
 /* Every call whose body is known here expands, unless: the function is not a Blueprint function of this mod with a
    body; it or an ancestor's version is an RPC, authority only or cosmetic, or overrides an engine function (the
    engine's routing must see the call); it is noinline or UE_NO_OPTIMIZE, or the caller is UE_NO_OPTIMIZE; it is
@@ -8743,21 +8816,49 @@ const Json* FCompiler::CopyableDef(const FRecord& In, const std::string& Method)
        Fn, its own or the one SynthesizeForwarders gives it, and with neither goes by name, with a warning. Copied
        into a subclass's function the call would be that subclass's, which has no such Fn: by name, a subclass's
        override would run, or bound from a class without the function. So that body stays In's function, called;
-       a caller written `In::Method()` gets a forwarder of its own for it. Each step goes to a strict ancestor. */
+       a caller written `In::Method()` gets a forwarder of its own for it. Each step goes to a strict ancestor. An
+       inline body the function expands counts as its own: SynthesizeForwarders gave In the forwarder for it. */
     bool bBindsParent = false;
-    std::function<void(const Json&)> Walk = [&](const Json& N) {
+    std::set<const Json*> Expanded;
+    std::function<void(const Json&, const FRecord*)> Walk = [&](const Json& N, const FRecord* Written) {
         if (bBindsParent) return;
         const Json* Callee = Kind(N) == "CXXMemberCallExpr" ? Strip(First(N)) : nullptr;
         const Json* Obj = Callee && Kind(*Callee) == "MemberExpr" ? Strip(First(*Callee)) : nullptr;
         if (Obj && Kind(*Obj) == "CXXThisExpr")
             if (const auto O = MethodOwner.find(Callee->value("referencedMemberDecl", std::string())); O != MethodOwner.end())
                 if (const FRecord* R = Find(O->second); R && R != &In && !R->IsNative() && IsSubclassOf(In, *R)
-                    && MemberQualifier(*Callee) && !CopyableDef(*R, Name(*Callee)))
+                    && NamesQualified(*Callee, Written, *R, Name(*Callee)) && !CopyableDef(*R, Name(*Callee)))
                     bBindsParent = true;
-        ForEach(N, Walk);
+        if (const Json* Inl = InlineOnThis(N); Inl && Expanded.insert(Inl).second)
+        {
+            const FRecord* Owner = DeclaredIn(*Inl);
+            ForEach(*Inl, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Walk(C, Owner ? Owner : &In); });
+        }
+        ForEach(N, [&](const Json& C) { Walk(C, Written); });
     };
-    Walk(*Body);
+    Walk(*Body, &In);
     return bBindsParent ? nullptr : Def;
+}
+
+const Json* FCompiler::InlineOnThis(const Json& Call) const
+{
+    const Json* Callee = Kind(Call) == "CXXMemberCallExpr" ? Strip(First(Call)) : nullptr;
+    const Json* Obj = Callee && Kind(*Callee) == "MemberExpr" ? Strip(First(*Callee)) : nullptr;
+    if (!Obj || Kind(*Obj) != "CXXThisExpr") return nullptr;
+    const std::string Id = Callee->value("referencedMemberDecl", std::string());
+    if (auto T = MemberTemplates.find(Id); T != MemberTemplates.end()) return T->second;
+    if (auto O = MethodOwner.find(Id); O != MethodOwner.end())
+        if (const FRecord* R = Find(O->second))
+            if (auto I = R->Inlines.find(Id); I != R->Inlines.end()) return I->second;
+    return nullptr;
+}
+
+const FRecord* FCompiler::DeclaredIn(const Json& Inline) const
+{
+    const std::string Id = Inline.value("id", std::string());
+    if (auto O = MethodOwner.find(Id); O != MethodOwner.end()) return Find(O->second);
+    if (auto T = TemplateOwner.find(Id); T != TemplateOwner.end()) return Find(T->second);
+    return nullptr;
 }
 
 /* `QcParent::AuthOnly()` in a class W that has no AuthOnly of its own means QcParent's AuthOnly, whatever the object.
@@ -8772,16 +8873,29 @@ const Json* FCompiler::CopyableDef(const FRecord& In, const std::string& Method)
    inherits - and a script function asks it as it starts (ProcessInternal, ScriptCore.cpp 1172-1182), so the second
    ask changes nothing: Local runs both, Remote sends the forwarder, which the receiver runs. Except Local | Remote, a
    multicast on a server (Actor.cpp 4270-4278): the forwarder would send it, and then the call in it again, so a
-   multicast keeps the call by name and its warning. So does a qualified call in an inline method, which is copied
-   into other classes too, one to a pure function, or past an inline or static one of that name; a `final` method has
-   no override, and a call to it is bound already (FinalOwner). */
+   multicast keeps the call by name and its warning. So does one to a pure function, or past an inline or static one
+   of that name; a `final` method has no override, and a call to it is bound already (FinalOwner).
+   An inline method's body (or a member template's) is copied into each caller, so its qualified call is made from
+   each class that calls it, through inline calls too: the walk follows them, and each such class gets the forwarder
+   its copy needs. A body CopyableDef copies into a subclass's function never holds such a call.
+   The classes go base-first, a class's name order within a depth: a forwarder calls the nearest Fn above its class,
+   which may be one declared here for a class above, and must be whatever the class is named. */
 void FCompiler::SynthesizeForwarders()
 {
+    std::vector<std::pair<int, FRecord*>> Order;
     for (auto& [Key, W] : Records)
     {
         if (!W.IsGenerated() || W.bIsStruct || W.bIsInterface || W.bIsPatch || W.Base.empty()) continue;
+        int Depth = 0;
+        for (const FRecord* A = Find(W.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base)) ++Depth;
+        Order.emplace_back(Depth, &W);
+    }
+    std::stable_sort(Order.begin(), Order.end(), [](const auto& A, const auto& B) { return A.first < B.first; });
+    for (const auto& Ordered : Order)
+    {
+        FRecord& W = *Ordered.second;
         std::map<std::string, const FRecord*> Wanted;      // method -> the nearest ancestor declaring it
-        auto Consider = [&](const Json& Call, bool bNoOpt) {
+        auto Consider = [&](const Json& Call, bool bNoOpt, const FRecord* Written) {
             const Json* Callee = Strip(First(Call));
             const Json* Obj = Callee && Kind(*Callee) == "MemberExpr" ? Strip(First(*Callee)) : nullptr;
             if (!Obj || Kind(*Obj) != "CXXThisExpr") return;
@@ -8805,7 +8919,7 @@ void FCompiler::SynthesizeForwarders()
             bool bNamed = true;
             ForEach(NearDef != Nearest->MethodDefs.end() ? *NearDef->second : NearDecl,
                     [&](const Json& P) { bNamed = bNamed && (Kind(P) != "ParmVarDecl" || !Name(P).empty()); });
-            if (bNamed && MemberQualifier(*Callee)) Wanted[Method] = Nearest;
+            if (bNamed && NamesQualified(*Callee, Written, *R, Method)) Wanted[Method] = Nearest;
         };
         for (const auto& [Method, Decl] : W.Methods)
         {
@@ -8813,12 +8927,36 @@ void FCompiler::SynthesizeForwarders()
             const auto DefIt = W.MethodDefs.find(Method);
             const Json& Def = DefIt != W.MethodDefs.end() ? *DefIt->second : *Decl;
             const bool bNoOpt = IsNoOptDecl(*Decl) || IsNoOptDecl(Def);
-            std::function<void(const Json&)> Walk = [&](const Json& N) {
-                if (Kind(N) == "CXXMemberCallExpr") Consider(N, bNoOpt);
-                ForEach(N, Walk);
+            std::set<const Json*> Expanded;      // the inline bodies this method copies in, each walked once
+            std::function<void(const Json&, const FRecord*)> Walk = [&](const Json& N, const FRecord* Written) {
+                if (Kind(N) == "CXXMemberCallExpr")
+                {
+                    Consider(N, bNoOpt, Written);
+                    if (const Json* Inl = InlineOnThis(N); Inl && Expanded.insert(Inl).second)
+                    {
+                        const FRecord* Owner = DeclaredIn(*Inl);
+                        ForEach(*Inl, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Walk(C, Owner ? Owner : &W); });
+                    }
+                }
+                ForEach(N, [&](const Json& C) { Walk(C, Written); });
             };
-            ForEach(Def, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Walk(C); });
+            ForEach(Def, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Walk(C, &W); });
         }
+        /* An interface W lists whose function W inherits from a class above that this source cooks, which does not list
+           it: in C++ that class's function implements it. Generate's empty stub would replace it for every caller, and
+           no function at all is no better: a call by name, an interface call too, finds the interface's own empty one
+           first (UClass::FindFunctionByName looks in a class's interfaces before its super, Class.cpp 5281-5323). So W
+           gets a forwarder to it, the editor's override calling its parent; to an inline one, which it expands. Where
+           none can call it (WhyNotForwarded), Generate refuses the class. */
+        for (const std::string& Listed : W.Interfaces)
+            for (const FRecord* IR : InterfaceChain(Find(Listed)))
+                for (const auto& Entry : IR->Methods)
+                {
+                    const std::string& Method = Entry.first;
+                    if (Method == "StaticClass" || W.Methods.count(Method) || Wanted.count(Method)) continue;
+                    if (const FRecord* A = InheritedImplementation(W, Method); A && WhyNotForwarded(*A, Method).empty())
+                        Wanted[Method] = A;
+                }
 
         /* The forwarder as clang would write it: the nearest declaration's type and parameters (its definition's names),
            and a body of one call on this, each parameter passed as itself (a reference one as the place it names). The
@@ -8875,6 +9013,26 @@ void FCompiler::SynthesizeForwarders()
             MethodOwner[Id] = W.CppName;
         }
     }
+}
+
+const FRecord* FCompiler::InheritedImplementation(const FRecord& R, const std::string& Method) const
+{
+    for (const FRecord* A = R.Base.empty() ? nullptr : Find(R.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
+        if (auto M = A->Methods.find(Method); M != A->Methods.end())
+            return A->IsGenerated() && !A->bIsInterface && !A->bIsStruct && !M->second->value("pure", false) ? A : nullptr;
+    return nullptr;
+}
+
+std::string FCompiler::WhyNotForwarded(const FRecord& A, const std::string& Method) const
+{
+    const Json& Decl = *A.Methods.at(Method);
+    if (IsStaticDecl(Decl)) return "static";
+    if (IsMulticast(A, Method)) return "a multicast, which an override calling it would send twice on a server";
+    const auto Def = A.MethodDefs.find(Method);
+    bool bNamed = true;
+    ForEach(Def != A.MethodDefs.end() ? *Def->second : Decl,
+            [&](const Json& P) { bNamed = bNamed && (Kind(P) != "ParmVarDecl" || !Name(P).empty()); });
+    return bNamed ? std::string() : "declared with a parameter that has no name, which an override cannot pass on";
 }
 
 /* A multicast wherever Method is declared from R up: a mod's marker, or a native or interface function's flags. */
@@ -13243,7 +13401,29 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
        so its stubs are empty. BlueprintEvent is the flag, not the editor's event node: a function that
        returns a value has it too (Targetable::GetIsTargetable) and the editor implements it as a function
        graph. Only a native-only function lacks it, which UHT allows just under
-       CannotImplementInterfaceInBlueprint (HeaderParser.cpp:7538). */
+       CannotImplementInterfaceInBlueprint (HeaderParser.cpp:7538).
+       A function the class inherits from a class above this source cooks implements it in C++, and a stub would
+       replace that body for every caller: SynthesizeForwarders declared an override calling it in its place wherever
+       one can, and the class is refused where none can.
+       A static is refused for another reason. It implements no interface function and its callers are bound to it, so
+       a stub would take over none of them; but the editor makes any function of its name in a subclass, the stub or
+       one the source declares, an override of it (its super is ParentClass->FindFunctionByName, KismetCompiler.cpp
+       1733-1774) and refuses one that is not static: "Check flags: Exec, Final, Static" (1855-1868). */
+    auto ReplacesInherited = [&](const std::string& I, const std::string& Fn) {
+        const FRecord* A = InheritedImplementation(R, Fn);
+        const std::string Why = A ? WhyNotForwarded(*A, Fn) : std::string();
+        if (Why.empty()) return false;
+        if (IsStaticDecl(*A->Methods.at(Fn)))
+            *Err = R.CppName + " implements " + I + ", whose " + Fn + " needs a function of that name in " + R.CppName
+                 + ", and the " + A->CppName + "::" + Fn + " it inherits is static: the editor takes such a function for "
+                   "an override of the static and refuses it (\"Check flags: Exec, Final, Static\"); rename "
+                 + A->CppName + "::" + Fn;
+        else
+            *Err = R.CppName + " implements " + I + ", and the " + A->CppName + "::" + Fn + " it inherits is " + Why
+                 + ": no override can call it for " + I + ", and an empty one would replace it; declare " + R.CppName
+                 + "::" + Fn;
+        return true;
+    };
     for (const std::string& Listed : R.Interfaces)
     for (const FRecord* Link : InterfaceChain(Find(Listed)))        // the interfaces it extends are implemented too
     {
@@ -13258,6 +13438,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             {
                 if (std::any_of(Methods.begin(), Methods.end(),
                                 [&](const FMethod& F) { return F.Name == M.first; })) continue;
+                if (ReplacesInherited(I, M.first)) return false;
                 FMethod Fn{ M.first, M.second, M.second, nullptr };
                 Fn.Body = BodyOf(IR, M.first, Fn.Def);
                 Methods.push_back(Fn);
@@ -13276,6 +13457,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             auto Decl = IR.Methods.find(Name_);
             if (Decl == IR.Methods.end())
             { *Err = I + "::" + Name_ + " takes a type AssetGen cannot write yet, so " + R.CppName + " cannot implement " + I; return false; }
+            if (ReplacesInherited(I, Name_)) return false;
             FMethod Fn{ Name_, Decl->second, Decl->second, nullptr };
             Fn.Body = BodyOf(IR, Name_, Fn.Def);
             Methods.push_back(Fn);

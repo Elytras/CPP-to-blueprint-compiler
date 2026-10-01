@@ -326,7 +326,7 @@ that does not declare Method, `Base::Method()` copies Base's body in, or, where 
 an override of Method that AssetGen adds to your class, which only calls the parent's; a multicast goes by name with a
 warning.
 Every other call to a method goes by name, so the most derived override runs, also when the parent's own code makes
-the call. A `final` class or method has no override, so its calls go straight to the one function, and on `this` its
+the call. A `final` class or method has no override, so its calls reach the one function, and on `this` its
 body is copied in.
 
 `UE_PURE` makes a pure function, drawn without exec pins. A `T&` parameter is an output, a pass-by-reference pin. A

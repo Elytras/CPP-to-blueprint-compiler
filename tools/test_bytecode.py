@@ -710,6 +710,7 @@ def pending_asset(mod, cls=None):
     if mod not in REFUSALS:
         os.makedirs(out, exist_ok=True)
         proc = assetgen_compile([src, UEAPI, out])
+        LOGS[mod] = proc.stdout
         failed = re.findall(r'(?m)^\s*FAILED: (.*)$', proc.stdout)
         REFUSALS[mod] = (failed or [proc.stdout.strip() or 'exit %d' % proc.returncode])[0] if proc.returncode else None
     if REFUSALS[mod]: raise AssertionError('refused: ' + REFUSALS[mod])
@@ -2493,10 +2494,13 @@ def inherited_defaults():
 def run_as(chain, fn, fields, **parms):
     """Runs fn on an object of class chain[0] whose mod ancestors are chain[1:] (package bases) as the VM
     dispatches: a call by name runs the most derived definition, EX_FinalFunction exactly the function its import
-    names. (runscript alone looks both up in the calling package.)"""
+    names. (runscript alone looks both up in the calling package.) A final call goes by its import, (package, index):
+    one package can call two classes' functions of one name, a forwarding override its parent's and a qualified call
+    an ancestor's."""
     import runscript
     names = {b: exports_of(b) for b in chain}
     owner = lambda f: next(b for b in chain if f in names[b])
+    same = lambda a, b: os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
     finals = {}
     for b in chain:
         paths = import_paths(b)
@@ -2504,12 +2508,13 @@ def run_as(chain, fn, fields, **parms):
             for imp in re.findall(r'FinalFunction\s+imp\[(\d+)\]', dump('walkscript.py', b, i)):
                 pkg, _, fname = paths[int(imp)].rpartition(':')
                 if pkg.startswith('/Game/'):                        # a mod function, in a package beside this one
-                    finals[fname] = os.path.join(os.path.dirname(chain[0]), pkg.split('.')[0].rsplit('/', 1)[1])
+                    t = os.path.join(os.path.dirname(chain[0]), pkg.split('.')[0].rsplit('/', 1)[1])
+                    finals[fname] = finals[b, int(imp)] = (next((c for c in chain if same(c, t)), t), fname)
     saved = runscript.run, runscript.params_of, dict(runscript.MATH)
     runscript.run = lambda base, f, self_vars=None, **p: saved[0](owner(f), f, self_vars, **p)
     runscript.params_of = lambda base, f, *flag: saved[1](owner(f), f, *flag)
-    for f, target in finals.items():
-        runscript.MATH[f] = (lambda t, f: lambda *a: saved[0](t, f, fields, **dict(zip(saved[1](t, f), a)))[0])(target, f)
+    for k, (target, f) in finals.items():
+        runscript.MATH[k] = (lambda t, f: lambda *a: saved[0](t, f, fields, **dict(zip(saved[1](t, f), a)))[0])(target, f)
     try:
         return saved[0](owner(fn), fn, fields, **parms)[0]
     finally:
@@ -4698,6 +4703,168 @@ refused('FuncHideNative', '  int32 Seen;\n  void K2_DestroyActor() { Seen = 1; }
         'AActor::K2_DestroyActor is native and no Blueprint event')
 print('ok  override refusals: other parameters than a native event\'s, a mod parent\'s, an RPC\'s or an interface\'s; '
       'a name of a native non-event')
+
+
+def func_final_inherited():
+    """FuncFinalInherited (`final`) calls FfBase's AuthOnly, ServerBump and Kept unqualified, FfOwn (`final`) its own
+    AuthOnly, an override, and FfOther AuthOnly through a FuncFinalInherited pointer. None of them is FUNC_Final, so
+    each is a call by name, which finds that same function, no class deriving from a final one (call_opcode_flags:
+    the editor binds a call to a function without FUNC_Final only as a parent call); each runs that function."""
+    kid = asset('FuncFinalInherited')
+    folder = os.path.dirname(kid)
+    base, own, other = (os.path.join(folder, c) for c in ('FfBase', 'FfOwn', 'FfOther'))
+    for b in (kid, own, other): keeps_invariants(b)
+    for chain, fn, want in (([kid, base], 'CallAuth', 3), ([kid, base], 'CallServer', 2), ([own, base], 'CallAuth', 30)):
+        fields = {'Seen': 0}
+        run_as(chain, fn, fields)
+        assert fields['Seen'] == want, (os.path.basename(chain[0]), fn, fields)
+    assert run_as([kid, base], 'CallKept', {}) == 2
+
+
+func_final_inherited()
+print('ok  FuncFinalInherited: a final class calls an inherited or overriding function that is not FUNC_Final by name')
+
+
+def func_inline_parent():
+    """FuncInlineParent: `IpBase::AuthOnly()` in an inline method runs IpBase's AuthOnly in each class its body is
+    copied into - FuncInlineParent and IpKid, below IpMid's AuthOnly; IpDirect, with none between, also on an
+    IpDirectKid, which overrides AuthOnly - bound from that class's own AuthOnly, an override forwarding to its
+    parent's (call_opcode_flags), with no warning. A call by name to AuthOnly still runs the object's own."""
+    top = asset('FuncInlineParent')
+    p = lambda *cs: [os.path.join(os.path.dirname(top), c) for c in cs]
+    mid = p('FuncInlineParent', 'IpMid', 'IpBase')
+    kid, direct = p('IpKid') + mid, p('IpDirect', 'IpBase')
+    dkid = p('IpDirectKid') + direct
+    for b in mid[:2] + kid[:1] + direct[:1] + dkid[:1]: keeps_invariants(b)
+    for chain, fn, want in ((mid, 'Use', 3), (kid, 'Use', 3), (kid, 'UseKid', 3), (direct, 'Use2', 3), (dkid, 'Use2', 3),
+                            (dkid, 'UseKid2', 3), (kid, 'AuthOnly', 7), (dkid, 'AuthOnly', 70)):
+        fields = {'Seen': 0}
+        run_as(chain, fn, fields)
+        assert fields['Seen'] == want, (os.path.basename(chain[0]), fn, fields)
+    assert 'is a call by name' not in LOGS['FuncInlineParent'], LOGS['FuncInlineParent']
+
+
+func_inline_parent()
+print('ok  FuncInlineParent: Base::Fn() in an inline method binds Base\'s from each class the body is copied into')
+
+
+def func_qualified_self():
+    """FuncQualifiedSelf: `FuncQualifiedSelf::H()` in the class's own code runs its own H on an SqKid too, which
+    overrides H: H's body is copied in. Auth's cannot be (authority-only), and a call bound to a function a subclass
+    can override is no Blueprint's, so that one stays a call by name, with a warning."""
+    kid = os.path.join(os.path.dirname(asset('FuncQualifiedSelf')), 'SqKid')
+    chain = [kid, os.path.join(os.path.dirname(kid), 'FuncQualifiedSelf')]
+    for b in chain: keeps_invariants(b)
+    got = run_as(chain, 'CallH', {})
+    assert got == 5, 'FuncQualifiedSelf::H() on an SqKid returned %r' % got
+    log = LOGS['FuncQualifiedSelf']
+    assert 'FuncQualifiedSelf::Auth() is a call by name' in log and 'FuncQualifiedSelf::H()' not in log, log
+
+
+func_qualified_self()
+print('ok  FuncQualifiedSelf: Self::Fn() in its own class runs its own Fn, copied in, or warns')
+
+
+def func_forwarder_order():
+    """FuncForwarderOrder: AaFoKid and ZzFoKid each get an override of Auth forwarding to FoMid's, itself one
+    forwarding to FoRoot's. Each kid's calls the function it overrides, its super, as the editor's call to a parent
+    function does, whichever side of FoMid the kid's name sorts on."""
+    mid = os.path.join(os.path.dirname(asset('FuncForwarderOrder')), 'FoMid')
+    folder = os.path.dirname(mid)
+    for kid in ('AaFoKid', 'ZzFoKid'):
+        base = os.path.join(folder, kid)
+        pkg = invariants.Package(base)
+        sup = pkg.path(pkg.struct(pkg.find('Auth')).super)
+        calls = [where for fn, op, where, flags in func_calls(base) if fn == 'Auth']
+        assert sup.endswith('/FoMid.FoMid_C:Auth') and calls == [sup], (kid, sup, calls)
+        fields = {'Seen': 0}
+        run_as([base, mid, os.path.join(folder, 'FoRoot')], 'KidCall', fields)
+        assert fields['Seen'] == 3, (kid, fields)
+
+
+func_forwarder_order()
+print('ok  FuncForwarderOrder: a forwarding override calls its own super, whatever its class\'s name')
+
+
+def func_iface_inherited():
+    """FuncIfaceInherited implements IFiTell, whose Tell, Kept, Ping, Twice and Auth it inherits from FiRoot. Each of
+    its own calls FiRoot's - Twice, inline, expanded in it; Auth, authority-only, bound and authority-only itself, as an
+    override takes its parent's flags - so a call by name or through the interface runs FiRoot's: either finds the
+    class's own function first (UClass::FindFunctionByName, Class.cpp 5281-5323), and with none would find the
+    interface's empty one before the super's. FiKid's Tell and Auth override those two, and their `FiRoot::` calls run
+    FiRoot's."""
+    kid = asset('FuncIfaceInherited')
+    folder = os.path.dirname(kid)
+    chain = [kid, os.path.join(folder, 'FiRoot')]
+    fikid = [os.path.join(folder, 'FiKid')] + chain
+    for b in (kid, fikid[0]): keeps_invariants(b)
+    assert {'Tell', 'Kept', 'Ping', 'Twice', 'Auth'} <= set(exports_of(kid)), exports_of(kid)
+    got = run_as(chain, 'Tell', {}, V=2), run_as(chain, 'Kept', {}, V=2), run_as(chain, 'Twice', {}, V=2)
+    assert got == (3, 20, 4), 'Tell(2), Kept(2), Twice(2) on a FuncIfaceInherited returned %r, %r, %r' % got
+    for c, fn, parms, want, seen in ((chain, 'Ping', {}, None, 9), (chain, 'Auth', {'V': 2}, 6, 2), (fikid, 'Auth', {'V': 2}, 106, 2)):
+        fields = {'Seen': 0}
+        got = run_as(c, fn, fields, **parms)
+        assert (want is None or got == want) and fields['Seen'] == seen, (os.path.basename(c[0]), fn, got, fields)
+    assert run_as(fikid, 'Tell', {}, V=2) == 103
+    pkg = invariants.Package(kid)
+    assert pkg.struct(pkg.find('Auth')).function_flags & 0x4, 'FuncIfaceInherited::Auth is not BlueprintAuthorityOnly'
+    pkg = invariants.Package(fikid[0])
+    for fn in ('Tell', 'Auth'):
+        sup = pkg.path(pkg.struct(pkg.find(fn)).super)
+        assert sup.endswith('/FuncIfaceInherited.FuncIfaceInherited_C:' + fn), (fn, sup)
+
+
+func_iface_inherited()
+print('ok  FuncIfaceInherited: an interface function an ancestor has runs the ancestor\'s, not an empty stub')
+# A multicast no forwarder can call (it would be sent twice on a server), so the stub would replace it: refused.
+refused('FuncIfaceMulticast', '', 'the IfmRoot::Ping it inherits is a multicast',
+        top='class IIfmPing {\npublic:\n  UE_INTERFACE;\n  void Ping();\n};\n'
+            'class IfmRoot : public AActor {\npublic:\n  int32 Seen = 0;\n  UE_MULTICAST void Ping() { Seen = 1; }\n};\n'
+            'class IfmKid : public IfmRoot, public IIfmPing {\npublic:\n};\n')
+print('ok  FuncIfaceMulticast: an interface function inherited as a multicast, which no override can call, is refused')
+# A static of that name: the class's function of that name, the stub too, is an override of the static to the editor
+# (its super is ParentClass->FindFunctionByName), which refuses a non-static one ("Check flags: Exec, Final, Static").
+refused('FuncIfaceStatic', '', 'the FsRoot::Tell it inherits is static: the editor takes such a function for an override '
+        'of the static and refuses it',
+        top='class IFsTell {\npublic:\n  UE_INTERFACE;\n  int32 Tell(int32 V);\n};\n'
+            'class FsRoot : public AActor {\npublic:\n  static int32 Tell(int32 V) { return V + 1; }\n};\n'
+            'class FsKid : public FsRoot, public IFsTell {\npublic:\n  int32 Ask() { return FsRoot::Tell(4); }\n};\n')
+print('ok  FuncIfaceStatic: an interface function inherited as a static is refused, as the editor refuses its override')
+
+
+def func_template_call():
+    """FuncTemplateCall: a member template's body is copied into each caller and read in the class it is written in.
+    `AuthOnly()` in Helper is a call by name from FtKid's Use, so on an FtKid it runs FtMid's override (7), as C++ does,
+    and FtKid, which declares no AuthOnly, gets no function of that name; `FuncTemplateCall::AuthOnly()` in HelperQ runs
+    FuncTemplateCall's (3) on an FtQKid. The inline Plain is the same call, read the same way."""
+    top = asset('FuncTemplateCall')
+    p = lambda *cs: [os.path.join(os.path.dirname(top), c) for c in cs]
+    mid = p('FtMid', 'FuncTemplateCall')
+    kid, qkid = p('FtKid') + mid, p('FtQKid') + mid
+    for b in kid[:1] + qkid[:1] + mid[:1]: keeps_invariants(b)
+    assert 'AuthOnly' not in exports_of(kid[0]), exports_of(kid[0])
+    for chain, fn, want in ((kid, 'Use', 7), (kid, 'UsePlain', 7), (qkid, 'UseQ', 3), (qkid, 'AuthOnly', 7)):
+        fields = {'Seen': 0}
+        run_as(chain, fn, fields)
+        assert fields['Seen'] == want, (os.path.basename(chain[0]), fn, fields)
+
+
+func_template_call()
+print('ok  FuncTemplateCall: an unqualified call in a member template goes by name from each class it is copied into')
+
+
+def ns_parent_call():
+    """NsTest's Pistol: `Weapons::Rifle::Pull(Times)` in its own Pull runs Rifle's, however many parts the qualifier
+    has (5 + 3, then + 100). By name it would be Pistol's own Pull, calling itself forever."""
+    content = os.path.join(ROOT, 'NsTest', 'FSD', 'Content')
+    chain = [os.path.join(content, 'NsTestAbs', 'Pistol'), os.path.join(content, '_ElytrasMods', 'NsTest', 'Weapons', 'Rifle')]
+    fields = dict(Shots=5)
+    got = run_as(chain, 'Pull', fields, Times=3)
+    assert got == 108 and fields == dict(Shots=8), (got, fields)
+
+
+ns_parent_call()
+print('ok  NsTest: Weapons::Rifle::Pull() in Pistol\'s own Pull is the parent\'s, its qualifier in parts')
 
 
 # ---- OPERANDS: operands the VM resolves against the object they run on - jumps, instance variables, calls by name,

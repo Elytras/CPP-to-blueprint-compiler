@@ -251,7 +251,7 @@ starts private.
 | `class Helper { ... };` | A class with no base is plain C++. Nothing is cooked for it. | Yes |
 | `class X : public ANotIncluded {};` | Refused by clang, "expected class name", when no included header declares the base. Include the SDK header that declares it. | Refused |
 | `class InitCave : public Hello {};` | A child of another class of the mod. A parent in the same source is used from there. A parent pinned with `UE_CLASS` to another mod is imported from that mod. | Yes |
-| `class Turret final : public AActor { ... };` | A class with no subclass. Its functions are cooked Final, which the editor does not let a Blueprint override, and a call to one of them reaches that function directly instead of by name; on `this` the body is usually copied in. See [Calling your own functions](#calling-your-own-functions). | Yes |
+| `class Turret final : public AActor { ... };` | A class with no subclass. Its functions, overrides aside, are cooked Final, which the editor does not let a Blueprint override, and a call to one of them reaches that function directly instead of by name; on `this` the body is usually copied in. See [Calling your own functions](#calling-your-own-functions). | Yes |
 | `class WPN_GrapplingGun_Long : public WPN_GrapplingGun_C` | A child of one of the game's Blueprint classes. Include the parent's `UeApi/Game/` header and derive from it; the parent is imported from the game. Put the child in the parent's `Game::` namespace to cook it beside the parent (see [Mod sources and packages](#mod-sources-and-packages)). | Yes |
 
 Notes:
@@ -2021,7 +2021,7 @@ Notes:
 | `Peer->Bump(1)` | Runs on that object and reaches the most derived version for its class. | Yes |
 | `Fact(V - 1)` inside `Fact` | Recursion. Each call gets its own frame, as a recursive Blueprint function does. Mutual recursion works the same way. | Yes |
 | `Other->Twice(3)` where `Twice` is inline | Refused; see the inline table below. | Not yet |
-| `Bump(By)` in a `final` class, or to a `final` method | Reaches that one function directly, the editor's call to a function no Blueprint can override, instead of by name. The body is copied into the caller, as an inline function's is, and the function is still cooked for every other caller: the editor, delegates, timers, other mods. | Yes |
+| `Bump(By)` in a `final` class, or to a `final` method | Reaches that one function directly, the editor's call to a function no Blueprint can override, instead of by name. The body is copied into the caller, as an inline function's is, and the function is still cooked for every other caller: the editor, delegates, timers, other mods. A function the final class inherits, or overrides, is not cooked Final (an override takes its parent's flags), so a call to one whose body is not copied in (authority-only, an RPC, `noinline`) stays a call by name, as the editor's is; with no subclass, the name finds that one function. | Yes |
 | `Twice(V)`, a static of a class this source cooks | Its body is copied in the same way. | Yes |
 | `Peer->Bump(1)` in a `final` class | Direct, but not copied in: the body would need Peer as its `this`. | Yes |
 | `[[gnu::noinline]] int32 Kept(int32 V)` | Calls to Kept stay calls, wherever they could be copied in. | Yes |
@@ -2067,8 +2067,8 @@ Notes:
 - These are never copied in: a function that waits (Delay, UE_AWAIT) or contains a goto; an RPC, an authority-only or
   cosmetic function; an override of an engine function; UE_NO_OPTIMIZE on the function or on the caller; a class
   another mod cooks (UE_CLASS); a function whose body calls a parent's function that is not copied in, such as
-  `Base::AuthOnly()` (see [Calling the parent](#calling-the-parent)): that call is bound from the function's own
-  class, and in a subclass's copy it would be the subclass's.
+  `Base::AuthOnly()`, itself or in an inline body it expands (see [Calling the parent](#calling-the-parent)): that
+  call is bound from the function's own class, and in a subclass's copy it would be the subclass's.
 - Copying makes the caller bigger. A large function called in many places may be worth `[[gnu::noinline]]`.
 - A function that native code intercepts by name, such as an empty one a DLL or script mod hooks to read its
   arguments, must be `[[gnu::noinline]]`: a copied call runs the body in place and never reaches the hook.
@@ -2454,6 +2454,8 @@ Notes:
 | `SuperBase::Twice(1)` in a class that does not declare Twice | SuperBase's Twice, its body copied in: C++ runs that function without dispatch, so an object of a subclass that overrides Twice does not reach its own. | Yes |
 | The same call to a function whose body cannot be copied in: authority-only, cosmetic, a server or client RPC, `noinline`, one that waits, one whose body makes such a call itself, or any from a `UE_NO_OPTIMIZE` caller | SuperBase's function, without dispatch. Blueprint calls a parent's function that way only from a class that has its own function of that name, so AssetGen adds one to your class: an override of the method that only calls the nearest parent's version with the same arguments, compiled like one you write, with an override's flags and super. The call is then bound to SuperBase's function, and a subclass's override of the method overrides the added one. A call by name runs what it ran before: the added override passes it on, and the engine routes both calls the same way. | Yes |
 | The same call to a multicast RPC | A call by name, with a warning: an object of a subclass that overrides the function runs its override. On a server a multicast runs locally and is also sent, so an added override would send it once, then again when it calls the parent's. An override you declare yourself does that too, as an editor override that calls its parent does. | Warns |
+| `SuperTest::Thrice(1)` in SuperTest's own code | SuperTest's own Thrice, its body copied in: C++ runs that one without dispatch, also on an object of a subclass that overrides Thrice. | Yes |
+| The same call to one of the class's own functions whose body cannot be copied in | A call by name, with a warning: on an object of a subclass that overrides the function, the override runs. A Blueprint calls its own class's function without dispatch only when that function is `final`, and then the call is bound to it. | Warns |
 | `Other->SuperBase::Bump(1)` | Not what C++ does. The qualifier is recognised only on `this`, so this is a call by name that reaches Other's most derived Bump. | Not yet |
 
 ```cpp
@@ -2480,10 +2482,11 @@ public:
 
 Notes:
 
-- Inside an inline body, `Base::Method()` is judged from the class the body is written in. No override is added for
-  a call there, since the body is copied into subclasses too: one whose body cannot be copied in goes by name, with
-  the warning. So does such a call where the nearest parent's declaration of the method has a parameter with no
-  name, or is inline, static or pure virtual.
+- An inline body, a member template's too, is copied into each class that calls it, and `Base::Method()` in it is
+  judged from that class, as if written there: a class with its own Method makes the parent call, and one without gets
+  the added override. A plain `Method()` in it stays a call by name from every such class.
+- No override is added where the nearest parent's declaration of the method has a parameter with no name, or is
+  inline, static or pure virtual: such a call whose body cannot be copied in goes by name, with the warning.
 - A parent this source cooks has its body copied in, as a `final` method's is (see
   [Calling your own functions](#calling-your-own-functions)). An override of an engine event, such as
   ReceiveBeginPlay above, stays a call.
@@ -2504,7 +2507,7 @@ object, write a free inline function.
 | `inline bool AttachTo(USceneComponent *Child, USceneComponent *Parent)` at namespace scope | A free inline function, expanded at every call. A free function can act on any object; an inline method expands only on `this`. | Yes |
 | `int32 Helper(int32 X) { ... }` at namespace scope, without `inline` | Refused at the call: `call to an unknown function: Helper`. A Blueprint has no free functions. Add `inline`, or make it a static of a function library class. | Refused |
 | `static inline int32 AddOne(int32 V)` in a library class | Expanded at the call, from its own class or from any class that includes the header, in any mod. The library does not export it. | Yes |
-| `Bump(By)` inside an inline body that a subclass expands | A call on `this` goes by name, so the object's most derived method runs, including an override compiled later. | Yes |
+| `Bump(By)` inside an inline body or a member template that a subclass expands | A call on `this` goes by name, so the object's most derived method runs, including an override compiled later or one in a class between. | Yes |
 | `Other->Twice(3)` where `Twice` is an inline method | Refused: `called on another object (only this)`, because `this` in the body stays the caller's self. Make the method non-inline, or write a free inline function that takes the object. | Not yet |
 | An inline function that calls itself, directly or through another inline | Refused (`calls itself`): the expansion would never end. Make it non-inline; a Blueprint function may recurse. One overload calling another is fine. | Refused |
 | `inline int32 Nope(int32 X);` with no body | Refused at the call (`has no body`). clang also warns with `-Wundefined-inline`. | Refused |
@@ -2572,7 +2575,7 @@ Notes:
 | `SpawnActor<AActor>(AActor::StaticClass(), Where)` from `Objects.h` | Each instantiation clang makes is expanded at its call like any inline function. No function exists per instantiation; see [Creating objects](#creating-objects). | Yes |
 | `template <class T> inline T Max2(T A, T B)` | A free function template needs `inline`. | Yes |
 | `template <class T> T Max2(T A, T B)` without `inline` | Refused at the call: `call to an unknown function: Max2`. Add `inline`. | Refused |
-| `template <class T> int32 WidthOf()` in a class | A member template is expanded at its call, with or without `inline`. No Blueprint function is made, and only calls on `this` expand. | Yes |
+| `template <class T> int32 WidthOf()` in a class | A member template is expanded at its call, with or without `inline`. No Blueprint function is made, and only calls on `this` expand. Its body is its own class's code, as an inline method's is: a call in it is read there, wherever it is copied. | Yes |
 | `inline auto TwiceN(Number auto V)`, or `int32 AutoP(auto V)` in a class | An `auto` parameter makes the function a template, expanded at each call. A free one needs `inline`. | Yes |
 | `template <class T> concept Number = requires(T A) { A + A; };` | Concepts and requires-clauses are checked by clang and cost nothing at run time. A wrong type is a "constraints not satisfied" error on the calling line. | Yes |
 | `template <class... T> inline int32 Fwd(T... V) { return Sum2(V...); }` | Pack expansion into a call works. | Yes |
@@ -4012,6 +4015,9 @@ Notes:
 | `class Singer : public AActor, public ICurveSourceInterface` | Class Settings > Implemented Interfaces. The first base is the UE parent, and every base after it is an implemented interface. A class can implement several, game and mod interfaces alike. | Yes |
 | `float GetCurveValue(FName CurveName) const { return 0.5f; }` | An implementation is an ordinary method, matched to the interface function by name. Only functions the interface marks BlueprintNativeEvent or BlueprintImplementableEvent can be implemented; AssetGen checks this against the SDK's Events.json. | Yes |
 | A function left out | Gets an empty stub, as the editor compiles one. The stub returns the zero value (0, false, None, null) and leaves out-parameters unchanged. | Yes |
+| A function left out that a parent this source cooks already has, without listing the interface | The parent's function implements it, as in C++: AssetGen adds an override of it that only calls the parent's (or expands it, if inline), the editor's override with a parent call, so calls through the interface and by name run the parent's body. An empty stub would replace it for every caller, and with no function at all a call would find the interface's own empty one first. | Yes |
+| The same, where the parent's function is a multicast, or has a parameter with no name | Refused: "... no override can call it for ITrigger, and an empty one would replace it; declare Pistol::Pull". An override would send a multicast twice on a server, and cannot pass on an unnamed parameter. | Refused |
+| The same, where the parent's function is static | Refused: "... is static: the editor takes such a function for an override of the static and refuses it ...; rename Rifle::Pull". A static implements no interface function, but the editor makes any function of its name in a subclass an override of it, and an override of a static must be static. | Refused |
 | An implementation that returns a value, is `const`, or has out-parameters | Compiled as a function, where the editor would make a function graph rather than an event. It takes the interface function's flags, so callers through the interface find it. A void event such as ShowDamageEffects is compiled as a function too. | Yes |
 | `class Pistol : public Weapons::Rifle` | A subclass implements the interface through its parent without listing it. Redefining an interface function is an ordinary override, and `Weapons::Rifle::Pull(Times)` calls the parent's. | Yes |
 | `class NativeOnly : public AActor, public IHealth` | Refused: "IHealth::GetHealth is native only ..., so a Blueprint cannot implement IHealth". The editor refuses the same. Calling IHealth through `TScriptInterface<IHealth>` on the game's objects still works. | Refused |
@@ -4062,8 +4068,8 @@ Notes:
 - Do not mark an implementation `inline`. It compiles with no diagnostic, but an inline method is not a function of the
   class, so the class gets the empty stub under that name, and a call through the interface returns 0.
 - List the UE class first. If an interface comes first, it is taken as the parent.
-- An empty stub stands in for every function left out, including those along the chain of an interface that extends
-  another. Without it, a call through the interface would reach the interface's own function.
+- An empty stub stands in for every function left out that no parent has, including those along the chain of an
+  interface that extends another. Without it, a call through the interface would reach the interface's own function.
 - The native-only message names the first such function in alphabetical order.
 - The already-implemented check sees mod ancestors, and native ones only for the interfaces UeApi lists on them
   (`UeNativeInterfaces`): the dump lists no class's interfaces, so genueapi takes, with `--game`, those a game
