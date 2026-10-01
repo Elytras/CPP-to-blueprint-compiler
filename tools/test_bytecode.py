@@ -4663,7 +4663,7 @@ def func_inline_parent():
     copied into - FuncInlineParent and IpKid, below IpMid's AuthOnly; IpDirect, with none between, also on an
     IpDirectKid, which overrides AuthOnly - bound from that class's own AuthOnly, an override forwarding to its
     parent's (call_opcode_flags), with no warning. A call by name to AuthOnly still runs the object's own."""
-    top = pending_asset('FuncInlineParent')
+    top = asset('FuncInlineParent')
     p = lambda *cs: [os.path.join(os.path.dirname(top), c) for c in cs]
     mid = p('FuncInlineParent', 'IpMid', 'IpBase')
     kid, direct = p('IpKid') + mid, p('IpDirect', 'IpBase')
@@ -4677,8 +4677,8 @@ def func_inline_parent():
     assert 'is a call by name' not in LOGS['FuncInlineParent'], LOGS['FuncInlineParent']
 
 
-pending('FuncInlineParent: Base::Fn() in an inline method binds Base\'s from each class the body is copied into',
-        func_inline_parent)
+func_inline_parent()
+print('ok  FuncInlineParent: Base::Fn() in an inline method binds Base\'s from each class the body is copied into')
 
 
 def func_qualified_self():

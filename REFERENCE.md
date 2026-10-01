@@ -2031,8 +2031,8 @@ Notes:
 - These are never copied in: a function that waits (Delay, UE_AWAIT) or contains a goto; an RPC, an authority-only or
   cosmetic function; an override of an engine function; UE_NO_OPTIMIZE on the function or on the caller; a class
   another mod cooks (UE_CLASS); a function whose body calls a parent's function that is not copied in, such as
-  `Base::AuthOnly()` (see [Calling the parent](#calling-the-parent)): that call is bound from the function's own
-  class, and in a subclass's copy it would be the subclass's.
+  `Base::AuthOnly()`, itself or in an inline body it expands (see [Calling the parent](#calling-the-parent)): that
+  call is bound from the function's own class, and in a subclass's copy it would be the subclass's.
 - Copying makes the caller bigger. A large function called in many places may be worth `[[gnu::noinline]]`.
 - A function that native code intercepts by name, such as an empty one a DLL or script mod hooks to read its
   arguments, must be `[[gnu::noinline]]`: a copied call runs the body in place and never reaches the hook.
@@ -2446,10 +2446,10 @@ public:
 
 Notes:
 
-- Inside an inline body, `Base::Method()` is judged from the class the body is written in. No override is added for
-  a call there, since the body is copied into subclasses too: one whose body cannot be copied in goes by name, with
-  the warning. So does such a call where the nearest parent's declaration of the method has a parameter with no
-  name, or is inline, static or pure virtual.
+- An inline body is copied into each class that calls it, and `Base::Method()` in it is judged from that class, as if
+  written there: a class with its own Method makes the parent call, and one without gets the added override.
+- No override is added where the nearest parent's declaration of the method has a parameter with no name, or is
+  inline, static or pure virtual: such a call whose body cannot be copied in goes by name, with the warning.
 - A parent this source cooks has its body copied in, as a `final` method's is (see
   [Calling your own functions](#calling-your-own-functions)). An override of an engine event, such as
   ReceiveBeginPlay above, stays a call.

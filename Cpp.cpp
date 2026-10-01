@@ -1293,6 +1293,8 @@ private:
     const Json* Expandable(const FRecord& In, const std::string& Method, const Json& Call, const Json* Picked) const;
     /* The part of Expandable that holds for every call: In's definition of Method, or null when no call may copy it. */
     const Json* CopyableDef(const FRecord& In, const std::string& Method) const;
+    /* The body a call on `this` always expands in place, an inline method's or a member template's, or null. */
+    const Json* InlineOnThis(const Json& Call) const;
     bool ResumesLater(const Json& N, std::set<const Json*>& Seen) const;
     /* `Base::Fn()` from a class without an Fn of its own, to an Fn that is not copied in: an override of Fn declared in
        that class, forwarding to the parent's, so that the call can be bound to Base's. Run once, before any Generate. */
@@ -8545,8 +8547,10 @@ const Json* FCompiler::CopyableDef(const FRecord& In, const std::string& Method)
        Fn, its own or the one SynthesizeForwarders gives it, and with neither goes by name, with a warning. Copied
        into a subclass's function the call would be that subclass's, which has no such Fn: by name, a subclass's
        override would run, or bound from a class without the function. So that body stays In's function, called;
-       a caller written `In::Method()` gets a forwarder of its own for it. Each step goes to a strict ancestor. */
+       a caller written `In::Method()` gets a forwarder of its own for it. Each step goes to a strict ancestor. An
+       inline body the function expands counts as its own: SynthesizeForwarders gave In the forwarder for it. */
     bool bBindsParent = false;
+    std::set<const Json*> Expanded;
     std::function<void(const Json&)> Walk = [&](const Json& N) {
         if (bBindsParent) return;
         const Json* Callee = Kind(N) == "CXXMemberCallExpr" ? Strip(First(N)) : nullptr;
@@ -8556,10 +8560,25 @@ const Json* FCompiler::CopyableDef(const FRecord& In, const std::string& Method)
                 if (const FRecord* R = Find(O->second); R && R != &In && !R->IsNative() && IsSubclassOf(In, *R)
                     && MemberQualifier(*Callee) && !CopyableDef(*R, Name(*Callee)))
                     bBindsParent = true;
+        if (const Json* Inl = InlineOnThis(N); Inl && Expanded.insert(Inl).second)
+            ForEach(*Inl, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Walk(C); });
         ForEach(N, Walk);
     };
     Walk(*Body);
     return bBindsParent ? nullptr : Def;
+}
+
+const Json* FCompiler::InlineOnThis(const Json& Call) const
+{
+    const Json* Callee = Kind(Call) == "CXXMemberCallExpr" ? Strip(First(Call)) : nullptr;
+    const Json* Obj = Callee && Kind(*Callee) == "MemberExpr" ? Strip(First(*Callee)) : nullptr;
+    if (!Obj || Kind(*Obj) != "CXXThisExpr") return nullptr;
+    const std::string Id = Callee->value("referencedMemberDecl", std::string());
+    if (auto T = MemberTemplates.find(Id); T != MemberTemplates.end()) return T->second;
+    if (auto O = MethodOwner.find(Id); O != MethodOwner.end())
+        if (const FRecord* R = Find(O->second))
+            if (auto I = R->Inlines.find(Id); I != R->Inlines.end()) return I->second;
+    return nullptr;
 }
 
 /* `QcParent::AuthOnly()` in a class W that has no AuthOnly of its own means QcParent's AuthOnly, whatever the object.
@@ -8574,9 +8593,11 @@ const Json* FCompiler::CopyableDef(const FRecord& In, const std::string& Method)
    inherits - and a script function asks it as it starts (ProcessInternal, ScriptCore.cpp 1172-1182), so the second
    ask changes nothing: Local runs both, Remote sends the forwarder, which the receiver runs. Except Local | Remote, a
    multicast on a server (Actor.cpp 4270-4278): the forwarder would send it, and then the call in it again, so a
-   multicast keeps the call by name and its warning. So does a qualified call in an inline method, which is copied
-   into other classes too, one to a pure function, or past an inline or static one of that name; a `final` method has
-   no override, and a call to it is bound already (FinalOwner).
+   multicast keeps the call by name and its warning. So does one to a pure function, or past an inline or static one
+   of that name; a `final` method has no override, and a call to it is bound already (FinalOwner).
+   An inline method's body (or a member template's) is copied into each caller, so its qualified call is made from
+   each class that calls it, through inline calls too: the walk follows them, and each such class gets the forwarder
+   its copy needs. A body CopyableDef copies into a subclass's function never holds such a call.
    The classes go base-first, a class's name order within a depth: a forwarder calls the nearest Fn above its class,
    which may be one declared here for a class above, and must be whatever the class is named. */
 void FCompiler::SynthesizeForwarders()
@@ -8626,8 +8647,14 @@ void FCompiler::SynthesizeForwarders()
             const auto DefIt = W.MethodDefs.find(Method);
             const Json& Def = DefIt != W.MethodDefs.end() ? *DefIt->second : *Decl;
             const bool bNoOpt = IsNoOptDecl(*Decl) || IsNoOptDecl(Def);
+            std::set<const Json*> Expanded;      // the inline bodies this method copies in, each walked once
             std::function<void(const Json&)> Walk = [&](const Json& N) {
-                if (Kind(N) == "CXXMemberCallExpr") Consider(N, bNoOpt);
+                if (Kind(N) == "CXXMemberCallExpr")
+                {
+                    Consider(N, bNoOpt);
+                    if (const Json* Inl = InlineOnThis(N); Inl && Expanded.insert(Inl).second)
+                        ForEach(*Inl, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Walk(C); });
+                }
                 ForEach(N, Walk);
             };
             ForEach(Def, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Walk(C); });
