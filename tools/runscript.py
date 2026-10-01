@@ -468,6 +468,12 @@ def _has(c, v):
     return low(v) in map(low, c)
 
 
+def _find(c, v):
+    """Find: the first index whose element equals v, as _has compares, else INDEX_NONE (TArray::Find)."""
+    low = lambda x: x.lower() if isinstance(x, str) else x
+    return next((i for i, x in enumerate(c) if low(x) == low(v)), -1)
+
+
 class Slot:
     """A TMap element in the compiler's __Slots__ view of the map's storage: its Key, and its Value, which is the map's
     own, so a store through it changes the map."""
@@ -517,6 +523,7 @@ CONTAINERS = {
     'Set_Clear': lambda ev, store, a: store(a[0], []),
     'Map_Clear': lambda ev, store, a: store(a[0], {}),
     'Array_Contains': lambda ev, store, a: _has(_made(ev, store, a[0], []), ev(a[1])),
+    'Array_Find': lambda ev, store, a: _find(_made(ev, store, a[0], []), ev(a[1])),
     'Set_Contains': lambda ev, store, a: _has(_made(ev, store, a[0], []), ev(a[1])),
     'Map_Contains': lambda ev, store, a: _has(_made(ev, store, a[0], {}), ev(a[1])),
 }

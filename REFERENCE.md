@@ -1254,6 +1254,7 @@ needs a container variable, not one a call returns.
 | `Items.Empty()`, `Items.Sort()`, `Items.Pop()` | Refused by clang. `Empty`, `Emplace`, `FindOrAdd`, `IsEmpty`, `Last`, `Pop`, `Sort` and the like are UE C++, not Blueprint nodes, and the SDK does not declare them. | Refused |
 | `Seen[0]` on a TSet | Refused by clang: a set has no `[]`. | Refused |
 | `GetItems().Num()` | Refused (`a container operation needs a variable, not a computed value`). Store the result in a local first. | Refused |
+| `TArray<int32> R = GetItems(); return R.Num();` | The local stays a variable, read once or not: a container function reads its container where it lies, so the call is never folded into its place. The same for a parameter of an `inline` function. | Yes |
 
 ```cpp
 TArray<int32> Scores;

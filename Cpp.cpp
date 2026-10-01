@@ -8350,17 +8350,27 @@ bool MayWriteArg(const FCallIR& C, size_t I, const FArgIR* Value = nullptr)
     return !C.bPure && !IsBranch(C.Intrinsic) && (I >= 64 || (C.WrittenArgs >> I & 1));
 }
 
+/* Whether argument I of C must stay the variable it names, Value being what would go there instead: one C may write
+   or reads where it lies (MayWriteArg), and the container or dispatcher C works on (bOnArg0), which the Kismet
+   container thunks step with no result buffer and read at MostRecentPropertyAddress (execArray_Length and the rest).
+   Another variable may go there, as may a block's result local (IsContainerVariable); a call would leave them the
+   address of what its callee read, not a value. */
+bool StaysVariable(const FCallIR& C, size_t I, const FArgIR* Value)
+{
+    return (I == 0 && C.bOnArg0 && !(Value && IsContainerVariable(*Value))) || MayWriteArg(C, I, Value);
+}
+
 /* The read of local Name that runs exactly once whenever A does: not under a branch's later operands, an inline
-   body, an object or struct base (which may need a variable), or a call's target. Nor an argument bRefSlot says may
-   be written: the variable is the argument there, and another in its place would take the write. Value: what is to
-   replace the read. */
+   body, an object or struct base (which may need a variable), or a call's target. Nor an argument bRefSlot says must
+   stay a variable (StaysVariable): another in its place would take the write, or be read where it lies. Value: what is
+   to replace the read. */
 FArgIR* FindPlainRead(FArgIR& A, const std::string& Name, const FArgIR* Value, bool bRefSlot = false)
 {
     if (A.K == FArgIR::Local && A.S == Name && !A.Base) return bRefSlot ? nullptr : &A;
     if (A.K != FArgIR::Call || !A.Sub || A.Sub->Inline) return nullptr;
     const size_t Count = IsBranch(A.Sub->Intrinsic) ? std::min<size_t>(1, A.Sub->Args.size()) : A.Sub->Args.size();
     for (size_t I = 0; I < Count; ++I)
-        if (FArgIR* F = FindPlainRead(A.Sub->Args[I], Name, Value, MayWriteArg(*A.Sub, I, Value))) return F;
+        if (FArgIR* F = FindPlainRead(A.Sub->Args[I], Name, Value, StaysVariable(*A.Sub, I, Value))) return F;
     return nullptr;
 }
 
@@ -8498,7 +8508,7 @@ void FCompiler::ArgumentsInPlace(std::vector<FStmtIR>& Body, const std::vector<s
         if (First.K == FStmtIR::StaticCall && !First.Target.Target && First.Target.Args.empty())
         {
             for (size_t I = 0; I < First.Call.Args.size() && !Read; ++I)
-                if ((Read = FindPlainRead(First.Call.Args[I], Name, &Arg, MayWriteArg(First.Call, I, &Arg))))
+                if ((Read = FindPlainRead(First.Call.Args[I], Name, &Arg, StaysVariable(First.Call, I, &Arg))))
                     Scope = &First.Call.Args[I];
         }
         else if ((First.K == FStmtIR::Assign || First.K == FStmtIR::Decl || First.K == FStmtIR::Return) && !First.Var.Base)
@@ -8561,7 +8571,7 @@ void FCompiler::ForwardSingleUse(std::vector<FStmtIR>& Stmts, const std::vector<
         if (Next.K == FStmtIR::StaticCall && !Next.Target.Target && Next.Target.Args.empty())
         {
             for (size_t I = 0; I < Next.Call.Args.size() && !Read; ++I)
-                if ((Read = FindPlainRead(Next.Call.Args[I], Name, &E, MayWriteArg(Next.Call, I, &E))))
+                if ((Read = FindPlainRead(Next.Call.Args[I], Name, &E, StaysVariable(Next.Call, I, &E))))
                     Scope = &Next.Call.Args[I];
         }
         else if ((Next.K == FStmtIR::Assign || Next.K == FStmtIR::Decl || Next.K == FStmtIR::Return)

@@ -5671,7 +5671,7 @@ def local_by_address():
     read the container where it lies (Stack.MostRecentPropertyAddress after StepCompiledIn, execArray_Length and the
     rest), and a call in its place leaves the address of what the callee's frame read, not a value. An array, a set and
     a map, by Num, Find and Contains, and an inline function's parameter read so."""
-    base = pending_asset('LocalByAddress')
+    base = asset('LocalByAddress')
     keeps_invariants(base)
     cases = {'ArrayNum': lambda M: 2 + M, 'ArrayFind': lambda M: 1 + M, 'ArrayContains': lambda M: 10 + M,
              'SetNum': lambda M: 2 + M, 'MapNum': lambda M: 2 + M, 'MapFind': lambda M: 4 + M,
@@ -5682,7 +5682,9 @@ def local_by_address():
             assert got == want(m), 'LocalByAddress.%s(%d) = %r, want %r' % (fn, m, got, want(m))
 
 
-pending('LocalByAddress: a local a container function reads by address is kept', local_by_address)
+local_by_address()
+print('ok  LocalByAddress: a local a container function reads where it lies stays a variable, an inline function\'s '
+      'parameter too')
 
 
 # ---- UBER: ubergraphs along a class chain, their frames and names, latent resumes, awaits in overrides
