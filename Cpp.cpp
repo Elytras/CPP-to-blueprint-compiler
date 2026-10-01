@@ -5831,7 +5831,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         const FRecord* Written = Cur;
         if (!InlineStack.empty())
             if (const FRecord* In = DeclaredIn(*InlineStack.back())) Written = In;
-        bool bParentCall = false, bQualified = false;
+        bool bParentCall = false, bQualified = false, bNamesQualified = false;
         if (Kind(CallExprNode) == "CXXMemberCallExpr")
         {
             const Json* Callee = Strip(First(CallExprNode));
@@ -5841,6 +5841,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
                 const auto Own = Cur->Methods.find(MethodName);
                 bParentCall = R != Cur && Own != Cur->Methods.end() && !IsStaticDecl(*Own->second) && !IsInlineMethod(*Cur, MethodName);
                 bQualified = !bParentCall && !R->IsNative();
+                bNamesQualified = true;
             }
         }
         /* `final` (FinalOwner): the one version of the method every object the call can run on reaches, called as
@@ -5877,7 +5878,16 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
             if (auto D = A->MethodDefs.find(MethodName); D != A->MethodDefs.end() && (NetFlagsOf(*D->second) || AccessFlagsOf(*D->second)))
                 bLocal = false;
         }
-        if (!R->IsNative() && !bStatic && !bParentCall && !Bound)
+        /* A Blueprint class this source imports - another mod's, through UE_CLASS, or a game Blueprint, through UeApi's
+           Game headers - is native to the compiler, but its functions are script: EX_FinalFunction runs exactly the
+           UFunction it names (execFinalFunction, ScriptCore.cpp 3005-3009), where a native's C++ thunk dispatches, so
+           bound it would skip a subclass's override. Such a call goes by name, as the editor calls a function without
+           FUNC_Final, unless the header makes it final (IsFinalFunction), it is static, or it is a parent call or another
+           qualified one. It stays the non-local form (bLocal above): the header does not say which are RPCs, and that
+           form routes them too. */
+        const bool bImportedScript = R->IsNative() && R->UePackage.compare(0, 6, "/Game/") == 0 && !Out.bReceiverIsArg
+                                  && !bNamesQualified && !IsFinalFunction(*R, MethodName);
+        if ((!R->IsNative() || bImportedScript) && !bStatic && !bParentCall && !Bound)
             Out.VirtualName = UeNameOf(R, MethodName);      // an override of `Set is Extruded` is found by that name
         Out.bLocal = (!Out.VirtualName.empty() || Bound) && bLocal;
         /* A call whose one body is known here - bound on `this`, a parent's, or a static of this mod - is that body,
@@ -8819,19 +8829,20 @@ const FRecord* FCompiler::FinalOwner(const FRecord* Of, const std::string& Metho
 }
 
 /* The same walk FindEvent makes for a super, without importing it: a mod ancestor's function, a native one's, or a
-   native interface's of any class on the way. */
+   native interface's of any class on the way. A is a class of this source, or one it imports from another mod, whose
+   header says the same as the source that cooks it; never a /Script class. */
 bool FCompiler::IsFinalFunction(const FRecord& A, const std::string& Method) const
 {
     const auto M = A.Methods.find(Method);
-    if (A.IsNative() || M == A.Methods.end() || IsStaticDecl(*M->second) || IsInlineMethod(A, Method)
-        || !(A.bFinal || !A.FinalAs.empty() || A.FinalMethods.count(Method)))
+    if (A.UePackage.compare(0, 8, "/Script/") == 0 || M == A.Methods.end() || IsStaticDecl(*M->second)
+        || IsInlineMethod(A, Method) || !(A.bFinal || !A.FinalAs.empty() || A.FinalMethods.count(Method)))
         return false;
     for (const FRecord* R = &A; R; R = R->Base.empty() ? nullptr : Find(R->Base))
     {
         if (R != &A && !R->IsNative() && !R->bIsInterface)
             if (auto P = R->Methods.find(Method); P != R->Methods.end() && !IsStaticDecl(*P->second) && !IsInlineMethod(*R, Method))
                 return false;
-        if (R->IsNative() && R->Methods.count(Method) && !R->Forwards.count(Method)) return false;
+        if (R != &A && R->IsNative() && R->Methods.count(Method) && !R->Forwards.count(Method)) return false;
         for (const std::string& I : R->Interfaces)
             if (const FRecord* IR = Find(I); IR && IR->IsNative() && IR->Methods.count(Method)) return false;
     }

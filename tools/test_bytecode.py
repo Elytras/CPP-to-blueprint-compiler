@@ -1922,8 +1922,8 @@ def func_import_call():
     call to Bump, which FicKid overrides, goes by name, as the editor calls a function without FUNC_Final, and reaches
     FicKid's on a FicKid; the final Fixed and the static Twice are bound to FicBase's, and FicUserKid's parent call is
     FicBase's own."""
-    pending_asset('FuncImportOwner', 'FicKid')
-    user = pending_asset('FuncImportUser')
+    asset('FuncImportOwner')
+    user = asset('FuncImportUser')
     kid = os.path.join(os.path.dirname(user), 'FicUserKid')
     for b in (user, kid): keeps_invariants(b)
     assert calls_in(user, 'Via') == [('Bump', 0x1B)], calls_in(user, 'Via')
@@ -1932,8 +1932,9 @@ def func_import_call():
         assert '/Game/_ElytrasMods/FuncImportOwner/FicBase.FicBase_C:' + callee in import_paths(b), (fn, import_paths(b))
 
 
-pending('FuncImportCall: a call to another mod\'s Blueprint function goes by name unless it is final, static or a '
-        'parent call', func_import_call)
+func_import_call()
+print('ok  FuncImportCall: a call to another mod\'s Blueprint function goes by name unless it is final, static or a '
+      'parent call')
 
 
 def final_as_shared():
