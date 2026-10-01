@@ -1559,6 +1559,8 @@ private:
     /* The declaration of the function Method replaces, as ParentClass->FindFunctionByName finds it (each class's own
        functions, then its interfaces, then its super; Self's own are no parent), and the record holding it. */
     std::pair<const FRecord*, const Json*> ReplacedDecl(const FRecord& Self, const std::string& Method) const;
+    /* The mod interface R lists (or one it extends) that declares Method, or null: R's stub of Method is Generate's. */
+    const FRecord* ModInterfaceWith(const FRecord& R, const std::string& Method) const;
     std::string Unreplicable(const Json& Typed, int32 Depth = 0) const;
 
     /* Records are keyed by qualified name; Bare holds only leaf names exactly one class claims,
@@ -2647,6 +2649,15 @@ FIndex FCompiler::FindEvent(FBlueprintClass& BP, const std::string& FromRecord, 
                 *InheritedFlags = ModMethodFlags(*R, Method, BP);
                 return bFlagsOnly ? Null() : BP.EngineFunction(PackageOf(*R), ClassOf(*R), UeMethod);
             }
+        /* A mod ancestor that lists a mod interface and leaves Method out has the empty stub Generate compiles for it,
+           its own function, so that stub is the super ParentClass->FindFunctionByName finds; its flags are a function's
+           declared as the interface declares it. */
+        if (R != Self && !R->IsNative() && !R->bIsInterface && !R->Methods.count(Method))
+            if (const FRecord* IR = ModInterfaceWith(*R, Method))
+            {
+                *InheritedFlags = ModMethodFlags(*IR, Method, BP);
+                return bFlagsOnly ? Null() : BP.EngineFunction(PackageOf(*R), ClassOf(*R), UeMethod);
+            }
         if (R->IsNative() && R->Methods.count(Method) && !R->Forwards.count(Method))   // a forwarder is no UFunction to override
         {
             *InheritedFlags = FlagsOf(*R);
@@ -2673,6 +2684,14 @@ std::string DesugaredTypeOf(const Json& N)
 {
     auto It = N.find("type");
     return It == N.end() ? std::string() : It->value("desugaredQualType", It->value("qualType", std::string()));
+}
+
+const FRecord* FCompiler::ModInterfaceWith(const FRecord& R, const std::string& Method) const
+{
+    for (const std::string& I : R.Interfaces)
+        for (const FRecord* IR : InterfaceChain(Find(I)))
+            if (IR && IR->bIsInterface && !IR->IsNative() && IR->Methods.count(Method)) return IR;
+    return nullptr;
 }
 
 std::pair<const FRecord*, const Json*> FCompiler::ReplacedDecl(const FRecord& Self, const std::string& Method) const
@@ -8842,6 +8861,8 @@ bool FCompiler::IsFinalFunction(const FRecord& A, const std::string& Method) con
         if (R != &A && !R->IsNative() && !R->bIsInterface)
             if (auto P = R->Methods.find(Method); P != R->Methods.end() && !IsStaticDecl(*P->second) && !IsInlineMethod(*R, Method))
                 return false;
+        if (R != &A && !R->IsNative() && !R->bIsInterface && !R->Methods.count(Method) && ModInterfaceWith(*R, Method))
+            return false;
         if (R != &A && R->IsNative() && R->Methods.count(Method) && !R->Forwards.count(Method)) return false;
         for (const std::string& I : R->Interfaces)
             if (const FRecord* IR = Find(I); IR && IR->IsNative() && IR->Methods.count(Method)) return false;

@@ -1902,7 +1902,7 @@ def func_stub_super():
     """FuncStubSuper: FssRoot leaves IFssTell's Tell out and gets its empty stub. FssKid's Tell and the UE_FINAL_AS
     base FssBase's override that stub: each has it as its super (func_super_link) and its flags, so FssBase's is not
     Final; and a call by name from FssRoot's code reaches each class's own."""
-    leaf = pending_asset('FuncStubSuper')
+    leaf = asset('FuncStubSuper')
     p = lambda c: os.path.join(os.path.dirname(leaf), c)
     root, kid, base = p('FssRoot'), p('FssKid'), p('FssBase')
     for b in (root, kid, base, leaf): keeps_invariants(b)
@@ -1913,7 +1913,8 @@ def func_stub_super():
         assert got == want, (fn, got, want)
 
 
-pending('FuncStubSuper: an override of an interface stub a mod ancestor got has that stub as its super', func_stub_super)
+func_stub_super()
+print('ok  FuncStubSuper: an override of an interface stub a mod ancestor got has that stub as its super')
 
 
 def func_import_call():
