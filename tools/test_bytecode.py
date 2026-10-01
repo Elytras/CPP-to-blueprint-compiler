@@ -657,7 +657,6 @@ def refused(mod, body, why, top=''):
 PENDING = os.path.join(TESTS, 'pending')
 GAPS, FIXED, REFUSALS = [], [], {}
 KNOWN_RULES = {     # sweep rules the suite's own packages still break, each with the AssetGen defect (TODO.md, S33)
-    'enum_tag_encoding': 'TODO.md S33, Enums: an empty array / set / map tag of enums reads as undecodable',
 }
 
 
