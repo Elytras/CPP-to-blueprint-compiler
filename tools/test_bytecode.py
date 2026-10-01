@@ -4908,14 +4908,16 @@ def typing_lits():
     vm = VM(base)
     vm.call('Hide')
     assert vm.self.vars == {'bHidden': True, 'bCanBeDamaged': False}, vm.self.vars
-    kinds = typing_resolved(base, 'Hide', 'Hide')
-    assert [t.bitfield for op, t in kinds] == [True, True], kinds
+    if SDK:     # the typing of a native member: only the dump describes AActor's and FHitResult's bitfields
+        kinds = typing_resolved(base, 'Hide', 'Hide')
+        assert [t.bitfield for op, t in kinds] == [True, True], kinds
     print('ok  TypingLits.Hide: AActor\'s bitfield bools bHidden / bCanBeDamaged, written without clobbering their byte')
     vm = VM(base)
     vm.call('Flags')
     assert vm.self.vars == {'Hit': {'bStartPenetrating': True, 'bBlockingHit': False, 'Time': 0.5}}, vm.self.vars
-    kinds = typing_resolved(base, 'Flags', 'Flags')
-    assert [(t.cls, t.bitfield) for op, t in kinds] == [('BoolProperty', True), ('BoolProperty', True), ('FloatProperty', False)], kinds
+    if SDK:
+        kinds = typing_resolved(base, 'Flags', 'Flags')
+        assert [(t.cls, t.bitfield) for op, t in kinds] == [('BoolProperty', True), ('BoolProperty', True), ('FloatProperty', False)], kinds
     print('ok  TypingLits.Flags: FHitResult\'s bitfield bools bStartPenetrating / bBlockingHit, members of a member, '
           'written without clobbering their byte')
     for n in (0, 4):
@@ -5000,10 +5002,15 @@ def vmsem_holds(base, *names, fn=None):
 
 
 def vmsem_dump_has(*paths):
-    """The Dumper-7 dump (sdkinfo.py) knows these /Script structs and interfaces. Without it the rules skip native
-    operands, and a pending check that only runs a rule would pass for want of anything to check."""
+    """Whether the Dumper-7 dump (sdkinfo.py) knows these /Script structs and interfaces. Without it the rules skip
+    native operands, and a check that only runs a rule would pass for want of anything to check: with --sdk a missing
+    one fails, without it the caller skips the rule and this says so."""
     missing = [p for p in paths if vmsem_rules.struct_members(None, p) is None and not vmsem_rules.sdkinfo.is_interface(p)]
+    if missing and not SDK:
+        print('--  the rule on %s: skipped (needs --sdk: what the engine links there is read off the dump)' % ', '.join(missing))
+        return False
     assert not missing, 'no Dumper-7 dump of %s (sdkinfo.py): the rule cannot see what the engine links there' % missing
+    return True
 
 
 def ctx_null_reads():
@@ -5151,9 +5158,9 @@ def local_ctor_flags():
 def iface_cast_slot():
     """Cast<IHealth> writes a 16-byte FScriptInterface (ScriptCore.cpp 3634-3641): it must land in a 16-byte slot, and
     the `IHealth*` it gives is the object, taken out of it. A None Other is no IHealth."""
-    vmsem_dump_has('/Script/FSD.Health')
     base = asset('IfaceCastSlot')
-    vmsem_holds(base, 'interface_value_slot')
+    if vmsem_dump_has('/Script/FSD.Health'):
+        vmsem_holds(base, 'interface_value_slot')
     for other, want in ((None, -7), (Obj('HealthThing'), 7)):   # every Obj here implements IHealth
         got = VM(base, isa=lambda o, cls: isinstance(o, Obj), Other=other, Guard=7).call('Probe')
         assert got == want, 'Probe() with Other %r = %r, not %r' % (other, got, want)
@@ -5162,8 +5169,8 @@ def iface_cast_slot():
 def derived_literal(fn, struct):
     """A native struct literal's members follow PropertyLink - the struct's own first, then its super's - and leave out
     Transient ones (ScriptCore.cpp 3376-3405; Class.cpp 944-982)."""
-    vmsem_dump_has(struct)
-    vmsem_holds(asset('DerivedLiteral'), 'struct_const_members', fn=fn)
+    if vmsem_dump_has(struct):
+        vmsem_holds(asset('DerivedLiteral'), 'struct_const_members', fn=fn)
 
 
 ctx_null_call()
