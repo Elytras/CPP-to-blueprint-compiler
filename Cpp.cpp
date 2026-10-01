@@ -13174,7 +13174,9 @@ private:
 };
 
 /* What the parser reads: the dump's chunks in order, each through FDumpFilter first unless bFilter is off (the
-   fallback's way). Cur holds the current chunk's bytes as filtered, and Pos the parser's place in them. */
+   fallback's way). Cur holds the current chunk's bytes as filtered, and Pos the parser's place in them. The filter
+   runs here, on the parser's thread, not on the reader's: there it held up clang's 1 KB pipe, and the design's pipe
+   bench took 2.110 s against 1.646 s (DESIGN.md, M2). */
 class FAstSource
 {
 public:
