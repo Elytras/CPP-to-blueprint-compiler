@@ -7155,6 +7155,22 @@ pending('TEnumHolders: a TArray of TEnum<E> and a dispatcher with a TEnum<E> par
         tenum_holders)
 
 
+def tenum_map_key():
+    """TEnumMapKey: a TMap keyed by a TEnum<E> whose value is a template too (TSubclassOf, TEnum, TArray, TSoftObjectPtr)
+    is a map of the enum to that value, as a variable, a local and a parameter."""
+    import invariants
+    base = pending_asset('TEnumMapKey')
+    keeps_invariants(base)
+    pkg = invariants.Package(base)
+    props = {p.name: [s.type for s in p.subs] for p in pkg.struct(pkg.find('TEnumMapKey_C')).props}
+    assert props['Classes'] == ['ByteProperty', 'ClassProperty'], props
+    assert props['Rules'] == ['ByteProperty', 'EnumProperty'] and props['Lists'] == ['ByteProperty', 'ArrayProperty'], props
+    for fn, vars_, parms, want in (('Rule', {'Rules': {1: 1}}, {}, 1), ('Local', {}, {}, 20), ('Pass', {}, {'R': {2: 2}}, 2)):
+        got = run(base, fn, vars_, M=3, **parms)[0]
+        assert got == want + 3, (fn, got, want + 3)
+
+
+pending('TEnumMapKey: a TMap keyed by a TEnum<E> takes a templated value type', tenum_map_key)
 
 
 # -- pending
