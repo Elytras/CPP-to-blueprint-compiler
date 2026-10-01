@@ -679,14 +679,15 @@ def asset(mod):
     return os.path.join(ROOT, mod, 'FSD', 'Content', '_ElytrasMods', mod, mod)
 
 
-def refused(mod, body, why, top=''):
-    """A mod (the class body given, `top` before the class) the compiler must refuse, saying why."""
+def refused(mod, body, why, top='', base='AActor'):
+    """A mod (the class body given, `top` before the class, which derives from `base`) the compiler must refuse, saying
+    why."""
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
         src = os.path.join(tmp, mod + '.cpp')
         with open(src, 'w', encoding='utf-8') as f:
             f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\n%s'
-                    'class %s : public AActor {\npublic:\n%s};\n' % (mod, top, mod, body))
+                    'class %s : public %s {\npublic:\n%s};\n' % (mod, top, mod, base, body))
         proc = assetgen_compile([src, UEAPI, tmp])
         assert proc.returncode != 0 and why in proc.stdout, (mod, proc.stdout)
 
@@ -5921,15 +5922,19 @@ def none_names():
     1326-1329): a UE_STRUCT member named None ends a class default's value of the struct, its later members unread, and
     a class's own member would end its default object's list. The editor refuses the name for a variable or a function
     ("Name cannot be empty.", FKismetNameValidator::IsValid, Kismet2NameValidators.cpp 135-142), and so is it here: a
-    member, a UE_STRUCT member and a function, in any case."""
+    member, a UE_STRUCT member, a function, a component and an interface's member, in any case."""
     refused('NoneMember', '  int32 None;\n', 'NoneMember::None: None is UE\'s empty name')
     refused('NoneStructMember', '  FNoneSlot S;\n', 'FNoneSlot::none: None is UE\'s empty name',
             'struct FNoneSlot {\n  UE_STRUCT;\n  int32 A = 1;\n  int32 none{};\n  int32 B = 3;\n};\n')
     refused('NoneFunction', '  int32 NONE() { return 1; }\n', 'NoneFunction::NONE: None is UE\'s empty name')
+    refused('NoneComponent', '  UE_COMPONENT(USceneComponent, None);\n', 'NoneComponent::None: None is UE\'s empty name')
+    refused('NoneIfaceMember', '  int32 Count = 1;\n', 'INoneHeld::none: None is UE\'s empty name',
+            'class INoneHeld {\npublic:\n  UE_INTERFACE;\n  int32 none = 2;\n  void Touch();\n};\n', 'AActor, public INoneHeld')
 
 
 none_names()
-print('ok  Names: a member, a UE_STRUCT member or a function named None, in any case, is refused')
+print('ok  Names: a member, a UE_STRUCT member, a function, a component or an interface member named None, in any '
+      'case, is refused')
 
 
 # ---- DELEG: delegates and event dispatchers - signatures, binds, broadcasts, timers by name (invariant_rules/delegates.py)
