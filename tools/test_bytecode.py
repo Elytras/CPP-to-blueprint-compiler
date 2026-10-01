@@ -1970,6 +1970,38 @@ print('ok  FinalAsTest: UE_FINAL_AS over a base this mod does not cook is refuse
       'owner shares')
 
 
+def final_as_private_header():
+    """UE_FINAL_AS over another mod's base counts only in the header its owner's own source includes, so that the owner
+    cooks the leaf. A header of this mod's own that re-declares the base with its UE_CLASS is the same text, but the
+    owner never sees it: refused. An owner of several sources, whose UE_MOD_PACKAGE is in one and whose header another
+    includes, is the owner all the same: another mod including that header compiles."""
+    head = '﻿#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\n'
+    base = lambda b, owner: ('class %s : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/%s/%s", "%s_C");\n'
+                             '  int32 Bump(int32 V);\n};\nUE_FINAL_AS(%s, %sLeaf);\n' % (b, owner, b, b, b, b))
+    user = lambda mod, inc, b: (head + '#include "%s"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\nclass %s : public AActor '
+                                '{\npublic:\n  int32 Use(%sLeaf* L) { return L->Bump(1); }\n};\n' % (inc, mod, mod, b))
+    files = {'PvHdr/PvPriv.h': '﻿#pragma once\n' + head[1:] + base('PvBase', 'PvOwner'),
+             'PvHdr/PvHdr.cpp': user('PvHdr', 'PvPriv.h', 'PvBase'),
+             'FapOwner/Shared.h': '﻿#pragma once\n' + head[1:] + base('FapBase', 'FapOwner'),
+             'FapOwner/FapOwner.cpp': head + 'UE_MOD_PACKAGE("/Game/_ElytrasMods/FapOwner");\n',
+             'FapOwner/Part.cpp': head + '#include "Shared.h"\nint32 FapBase::Bump(int32 V) { return V + 1; }\n',
+             'FapUser/FapUser.cpp': user('FapUser', '../FapOwner/Shared.h', 'FapBase')}
+    with tempfile.TemporaryDirectory() as tmp:
+        for rel, text in files.items():
+            os.makedirs(os.path.dirname(os.path.join(tmp, rel)), exist_ok=True)
+            with open(os.path.join(tmp, rel), 'w', encoding='utf-8', newline='\n') as f: f.write(text)
+        out = os.path.join(tmp, 'out')
+        os.makedirs(out)
+        proc = assetgen_compile([os.path.join(tmp, 'FapUser', 'FapUser.cpp'), UEAPI, out])
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        proc = assetgen_compile([os.path.join(tmp, 'PvHdr', 'PvHdr.cpp'), UEAPI, out])
+        assert proc.returncode != 0 and 'only the UE_FINAL_AS in the header that declares it' in proc.stdout, proc.stdout
+
+
+pending('FinalAsTest: UE_FINAL_AS over another mod\'s base in a header of this mod\'s own is refused; in the header its '
+        'owner\'s sources include it is not', final_as_private_header)
+
+
 # ---- NestedTest
 
 def nested_containers():
