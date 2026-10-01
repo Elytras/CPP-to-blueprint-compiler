@@ -12410,6 +12410,14 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             const FRecord* DR = Find(OwnerOf(*Parent));
             const bool bBlueprint = DR && (!DR->IsNative() || (DR->UeName.size() > 2 && DR->UeName.compare(DR->UeName.size() - 2, 2, "_C") == 0));
             if (!DR) { *Err = Where + ": cannot tell which class declares " + Of; return false; }
+            /* AActor's RootComponent: the actor's root, whichever component that is - the one a constructor's call finds
+               there. It is no default subobject a node could name; a node naming no parent goes under it (bRoot). */
+            if (DR->IsNative() && DR->UeName == "Actor" && UeNameOf(DR, Of) == "RootComponent")
+            {
+                A.bRoot = true;
+                Attachments[Comp] = A;
+                return true;
+            }
             if (DR == &R || bBlueprint)
             {
                 /* This class's: one of its own node's ChildNodes. An ancestor Blueprint's: a root node naming that node's
@@ -12608,12 +12616,14 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             if (R.Components.count(Name(*F)) && IsScene(CR)) Scene.emplace_back(Name(*F), CR);
         }
         /* SetupAttachment takes a component off the root: under another of this class's, which passes the root's
-           transform on to it, or under an inherited one. The root is the first scene component it leaves alone. */
+           transform on to it, or under an inherited one. The root is the first scene component it leaves alone; one
+           attached to RootComponent is never it, and hangs from it directly. With none left, the root is the
+           DefaultSceneRoot node's, which has no transform to pass on (RootName empty). */
         const auto RootAt = std::find_if(Scene.begin(), Scene.end(), [&](const auto& S) { return !Attachments.count(S.first); });
         const std::string RootName = RootAt == Scene.end() ? std::string() : RootAt->first;
         Scene.erase(std::remove_if(Scene.begin(), Scene.end(), [&](const auto& S) {
             const auto At = Attachments.find(S.first);
-            return At != Attachments.end() && !(At->second.bOwn && At->second.Parent == RootName);
+            return At != Attachments.end() && !At->second.bRoot && !(At->second.bOwn && At->second.Parent == RootName);
         }), Scene.end());
         std::stable_partition(Scene.begin(), Scene.end(), [&](const auto& S) { return S.first == RootName; });
         /* A component's vector default: X, Y, Z (Or each, when it has none), and the def to write another like it. */
@@ -12668,7 +12678,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             for (double& A : Out) A += 0.0;     // no -0 in the cooked float
             return Out;
         };
-        if (!Scene.empty() && !bRootInherited)
+        if (!RootName.empty() && !bRootInherited)
         {
             std::vector<FPropertyDef>& RootDefs = ComponentDefaults[Scene[0].first];
             const FVec Lr = Read(RootDefs, "RelativeLocation", 0), Rr = Read(RootDefs, "RelativeRotation", 0),

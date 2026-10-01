@@ -2661,7 +2661,8 @@ Notes:
 | `UE_DEFAULTS { Tip->SetupAttachment(Glow); }`, Glow another `UE_COMPONENT` of the class | Tip attaches to Glow, as in a C++ constructor: in the construction script it is one of Glow's child nodes. It keeps its own location, rotation and scale, relative to Glow. | Yes |
 | `Tip->SetupAttachment(Glow, FName("Muzzle"));` | The same at a socket or bone of Glow (the node's AttachToName). The socket is a literal name or none; a variable or a call there is refused, since it would be dropped. | Yes |
 | `Glow->SetupAttachment(Lamp);`, Lamp a component of a mod or game Blueprint parent | Glow attaches to the inherited Lamp. Its node names Lamp and the parent class whose construction script makes it (ParentComponentOrVariableName, ParentComponentOwnerClassName), as the editor saves a component dropped on an inherited one. A game Blueprint's component needs the UeApi header to mark it as a construction-script node (`Scene__UeScsNode`); one without it is refused with what to regenerate. | Yes |
-| `Glow->SetupAttachment(Mesh);` in an `ACharacter` child | Glow attaches to a native default subobject. The node names the subobject by its object name, `CharacterMesh0` for `Mesh` (bIsParentComponentNative), which UeApi records. It stays `CharacterMesh0` further down, in an `APlayerCharacter` child, though `FPMesh` is a skeletal mesh too: a subclass cannot rename a subobject its parent makes. A native member that is no default subobject, such as `AActor`'s `RootComponent`, is refused: attach to it at run time. | Yes |
+| `Glow->SetupAttachment(Mesh);` in an `ACharacter` child | Glow attaches to a native default subobject. The node names the subobject by its object name, `CharacterMesh0` for `Mesh` (bIsParentComponentNative), which UeApi records. It stays `CharacterMesh0` further down, in an `APlayerCharacter` child, though `FPMesh` is a skeletal mesh too: a subclass cannot rename a subobject its parent makes. A native member that is no default subobject is refused: attach to it at run time. | Yes |
+| `Glow->SetupAttachment(RootComponent);` | Glow attaches to the actor's root, whichever component that is, as a constructor's call does. Below a parent that gives the actor a root, such as `ACharacter`'s capsule or a Blueprint parent's root, its node is a root node naming no parent, which the construction script attaches to that root. With no root to inherit, Glow is never the root itself: it hangs from the first scene component `SetupAttachment` leaves alone, or, with none, from the default scene root, which stays, as the editor keeps a component added under it. It keeps its own location, rotation and scale, relative to the root. | Yes |
 | `Lamp->SetupAttachment(Own);` for an inherited Lamp, `A->SetupAttachment(B); B->SetupAttachment(A);`, or one component attached twice | Refused. An inherited component stays where its own class puts it. A cycle has no node the construction script starts from, so none of its components would be made. | Refused |
 | `Pivot->SetupAttachment(Lamp);` in a function | Attaches at once, keeping the relative transform: `K2_AttachToComponent` with KeepRelative for location, rotation and scale, and no welding. That is what the engine's own `SetupAttachment` leads to when the component registers; called on a component already registered, as any in a function is, the engine's own does nothing. | Yes |
 
@@ -2670,7 +2671,7 @@ Notes:
 - If the parent class already has a root, such as `ACharacter`'s capsule or a mod parent's first scene component, this
   class's first scene component attaches under that root instead of replacing it.
 - With no root to inherit, the root is the first scene component that `SetupAttachment` leaves alone, even if a
-  component declared before it is attached elsewhere.
+  component declared before it is attached elsewhere, to `RootComponent` too.
 - The root's own location, rotation and scale are a special case: see [Class defaults](#class-defaults).
 
 ### Adding components at run time
@@ -5797,8 +5798,8 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   that has `GObjects-Dump-WithProperties.txt`; assign whole values,
   `Lamp->RelativeLocation = FVector(0.0f, 0.0f, 50.0f);`; set a member that is not a default subobject at run time.
   See [Class defaults](#class-defaults). The same message, ending "a member that is no default subobject is attached
-  to at run time, with AttachToComponent", is `SetupAttachment` onto such a member, such as `AActor`'s
-  `RootComponent`, which no subobject of that name backs.
+  to at run time, with AttachToComponent", is `SetupAttachment` onto such a member, which no subobject of that name
+  backs. `AActor`'s `RootComponent` is not one: `SetupAttachment(RootComponent)` attaches to the actor's root.
 - `<Class>::UE_DEFAULTS: <Component> is a component of the Blueprint <BlueprintClass>, and its header does not say
   which SCS node it is - re-dump the game with the Dumper-7 fork (ScsNode=) and regenerate UeApi`: a default on a
   component of a game Blueprint parent whose header has no `<Component>__UeScsNode` marker. The same message appears

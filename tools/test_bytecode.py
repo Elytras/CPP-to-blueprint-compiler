@@ -6224,7 +6224,7 @@ def comp_attach_root():
     scene components left alone, Base though Glow is declared first (RootOwn), and with none of those the
     DefaultSceneRoot node, which keeps Glow as its child, as the editor saves a component added under it
     (CompAttachRoot). Glow sits 30 above the root, and RootOwn's Base hands its own 50 on to it."""
-    base = pending_asset('CompAttachRoot')
+    base = asset('CompAttachRoot')
     folder = os.path.dirname(base)
     for cls, root in (('RootKid', 'Root'), ('RootOwn', 'Base'), ('CompAttachRoot', 'DefaultSceneRoot')):
         got, attach, made, stored = construct(os.path.join(folder, cls))
@@ -6237,9 +6237,11 @@ def comp_attach_root():
         p, ci = class_pkg(os.path.join(folder, cls))
         assert world_location(p, ci, 'Glow') == (0.0, 0.0, want), (cls, world_location(p, ci, 'Glow'))
         keeps_invariants(os.path.join(folder, cls))
+    print('ok  CompAttachRoot: SetupAttachment(RootComponent) puts a component under the actor\'s root, inherited, own or '
+          'the default one')
 
 
-pending('CompAttachRoot: SetupAttachment(RootComponent) puts a component under the actor\'s root', comp_attach_root)
+comp_attach_root()
 
 
 def comp_attach_body():

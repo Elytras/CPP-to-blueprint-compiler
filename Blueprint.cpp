@@ -194,6 +194,13 @@ void FBlueprintClass::AttachComponent(const std::string& Name, const FAttachment
         if (C.Name == Name) C.Attachment = Attachment;
 }
 
+bool FBlueprintClass::ListsDefaultRoot() const
+{
+    return bIsActor && !bRootInherited && std::none_of(Components.begin(), Components.end(), [](const FComponent& C) {
+        return C.bIsScene && C.Attachment.Parent.empty() && !C.Attachment.bRoot;
+    });
+}
+
 void FBlueprintClass::AddSubobjectOverride(const std::string& Name, const std::string& Property, FIndex ComponentClass,
                                            const std::vector<FPropertyDef>& Defaults, const std::vector<uint8>& NativeTail)
 {
@@ -459,11 +466,50 @@ void FBlueprintClass::Finish()
        would skip the node (648), and the editor drops it from both lists then (ValidateSceneRootNodes, 1132-1150: a
        native root or scene component, or a scene root node of a parent Blueprint's, GetSceneRootComponentTemplate
        1029-1108), as all 1,885 of the game's SCS classes have it. Listed, it is a node like any other: its own
-       VariableGuid is what a subclass's override of it is keyed on. */
-    const bool bKeepDefaultRoot = !bRootInherited
-                                  && std::none_of(Components.begin(), Components.end(), [](const FComponent& C) { return C.bIsScene; });
+       VariableGuid is what a subclass's override of it is keyed on, and the components SetupAttachment(RootComponent)
+       puts under it, with none of the class's own left to be the root, are its ChildNodes, as the editor keeps a
+       component added under it. */
+    const bool bKeepDefaultRoot = ListsDefaultRoot();
     uint32 DefaultRootGuid[4];
     ScsNodeGuid(ClassName, "DefaultSceneRoot", DefaultRootGuid);
+
+    /*
+    One archetype + one node per UE_COMPONENT, in declaration order. Measured on DRG's Ene_Butterfly:
+    the node carries ComponentClass / ComponentTemplate / VariableGuid / InternalVariableName.
+    USimpleConstructionScript::ExecuteScriptOnActor walks RootNodes in order, passing a null parent
+    for the first scene component, which makes it the actor's root, and USCS_Node::ExecuteNodeOnActor
+    attaches each of a node's ChildNodes to it. So every later scene component is a child of the first.
+    Not a root node naming it in ParentComponentOrVariableName: the SCS's PostLoad
+    (FixupRootNodeParentReferences, cooked builds too) looks such a name up only among native components
+    and ancestor Blueprints' nodes, and clears it when the parent is a node of this same SCS.
+    SetupAttachment (AttachComponent) moves a component off that root: under another of this class's, as one
+    of its ChildNodes, or under an inherited one, as a root node that names it - which is how the game's own
+    Blueprints save both (BP_PlayerCharacter's FilmFaceLight on CharacterMesh0, BP_PumpkinFace_Item's
+    PointLight on BP_Pumpkin_Item_C's DefaultSceneRoot). The root is then the first scene component left alone.
+    One attached to the actor's root (bRoot) goes where a component left alone goes, without being the root itself:
+    a root node of no parent under an inherited root, else a child of this class's root, or of the DefaultSceneRoot
+    node when none of the class's own is left to be it.
+    */
+    auto IndexOf = [&](const std::string& Name) {
+        return int32(std::find_if(Components.begin(), Components.end(), [&](const FComponent& C) { return C.Name == Name; })
+                     - Components.begin());
+    };
+    const int32 FirstScene = int32(std::find_if(Components.begin(), Components.end(), [](const FComponent& C) {
+        return C.bIsScene && C.Attachment.Parent.empty() && !C.Attachment.bRoot;
+    }) - Components.begin());
+    const int32 UnderDefaultRoot = -2;
+    std::vector<int32> ParentOf(Components.size(), -1);        // the node whose ChildNodes list it, -1 for a root node
+    for (size_t I = 0; I < Components.size(); ++I)
+    {
+        const FComponent& C = Components[I];
+        if (C.Attachment.bOwn) ParentOf[I] = IndexOf(C.Attachment.Parent);
+        else if (C.Attachment.bRoot && !bRootInherited)
+            ParentOf[I] = FirstScene < int32(Components.size()) ? FirstScene : UnderDefaultRoot;
+        else if (C.bIsScene && C.Attachment.Parent.empty() && !C.Attachment.bRoot && int32(I) != FirstScene) ParentOf[I] = FirstScene;
+    }
+    std::vector<FIndex> DefaultRootChildren;
+    for (size_t I = 0; I < Components.size(); ++I)
+        if (ParentOf[I] == UnderDefaultRoot) DefaultRootChildren.push_back(Exp(RowFirstComponent + 2 * int32(I) + 1));
 
     FExport RootTemplate;
     RootTemplate.ClassIndex = SceneCompClass;
@@ -484,12 +530,18 @@ void FBlueprintClass::Finish()
     ScsNode.ObjectName = "SCS_Node_0";
     ScsNode.ObjectFlags = RF_Transactional;
     ScsNode.CreateBeforeSer = { Exp(RowRootTemplate).V, SceneCompClass.V };
+    for (const FIndex& Child : DefaultRootChildren) ScsNode.CreateBeforeSer.push_back(Child.V);
     ScsNode.SerBeforeCreate = { ScsNodeClass.V, ScsNodeCdo.V };
     ScsNode.CreateBeforeCreate = { Exp(RowScs).V };
     ScsNode.Serialize = [=](FArc& Ar) {
         Tag(Ar, "ComponentClass", "ObjectProperty", [=](FArc& V) { V.Idx(SceneCompClass); });
         Tag(Ar, "ComponentTemplate", "ObjectProperty",
             [=](FArc& V) { V.Idx(Exp(RowRootTemplate)); });
+        if (!DefaultRootChildren.empty())
+            Tag(Ar, "ChildNodes", "ArrayProperty", [=](FArc& V) {
+                V.I32(int32(DefaultRootChildren.size()));
+                for (const FIndex& Child : DefaultRootChildren) V.Idx(Child);
+            }, "ObjectProperty");
         if (bKeepDefaultRoot)
             Tag(Ar, "VariableGuid", "StructProperty", [=](FArc& V) { V.Raw(DefaultRootGuid, 16); }, "Guid");
         Tag(Ar, "InternalVariableName", "NameProperty",
@@ -499,34 +551,6 @@ void FBlueprintClass::Finish()
     };
     P.AddExport(std::move(ScsNode));
 
-    /*
-    One archetype + one node per UE_COMPONENT, in declaration order. Measured on DRG's Ene_Butterfly:
-    the node carries ComponentClass / ComponentTemplate / VariableGuid / InternalVariableName.
-    USimpleConstructionScript::ExecuteScriptOnActor walks RootNodes in order, passing a null parent
-    for the first scene component, which makes it the actor's root, and USCS_Node::ExecuteNodeOnActor
-    attaches each of a node's ChildNodes to it. So every later scene component is a child of the first.
-    Not a root node naming it in ParentComponentOrVariableName: the SCS's PostLoad
-    (FixupRootNodeParentReferences, cooked builds too) looks such a name up only among native components
-    and ancestor Blueprints' nodes, and clears it when the parent is a node of this same SCS.
-    SetupAttachment (AttachComponent) moves a component off that root: under another of this class's, as one
-    of its ChildNodes, or under an inherited one, as a root node that names it - which is how the game's own
-    Blueprints save both (BP_PlayerCharacter's FilmFaceLight on CharacterMesh0, BP_PumpkinFace_Item's
-    PointLight on BP_Pumpkin_Item_C's DefaultSceneRoot). The root is then the first scene component left alone.
-    */
-    auto IndexOf = [&](const std::string& Name) {
-        return int32(std::find_if(Components.begin(), Components.end(), [&](const FComponent& C) { return C.Name == Name; })
-                     - Components.begin());
-    };
-    const int32 FirstScene = int32(std::find_if(Components.begin(), Components.end(),
-                                                [](const FComponent& C) { return C.bIsScene && C.Attachment.Parent.empty(); })
-                                   - Components.begin());
-    std::vector<int32> ParentOf(Components.size(), -1);        // the node whose ChildNodes list it, -1 for a root node
-    for (size_t I = 0; I < Components.size(); ++I)
-    {
-        const FComponent& C = Components[I];
-        if (C.Attachment.bOwn) ParentOf[I] = IndexOf(C.Attachment.Parent);
-        else if (C.bIsScene && C.Attachment.Parent.empty() && int32(I) != FirstScene) ParentOf[I] = FirstScene;
-    }
     for (size_t I = 0; I < Components.size(); ++I)
     {
         const FComponent& C = Components[I];
@@ -606,7 +630,7 @@ void FBlueprintClass::Finish()
     if (bKeepDefaultRoot) { Roots.push_back(Exp(RowScsNode)); All.push_back(Exp(RowScsNode)); }
     for (size_t I = 0; I < Components.size(); ++I)
     {
-        if (ParentOf[I] < 0) Roots.push_back(Exp(RowFirstComponent + 2 * int32(I) + 1));
+        if (ParentOf[I] == -1) Roots.push_back(Exp(RowFirstComponent + 2 * int32(I) + 1));
         All.push_back(Exp(RowFirstComponent + 2 * int32(I) + 1));
     }
     Scs.Serialize = [=](FArc& Ar) {
