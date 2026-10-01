@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import uuid
 
 import yaml
 
@@ -284,14 +285,18 @@ def write_vs_filters(bp):
             rows.append(("ClCompile", f, "Tests" if f.endswith("Test.cpp") else "Mods"))
         elif f.endswith(".h"):
             rows.append(("ClInclude", f, "Helpers"))
-    # A mod in its own folder (`ECD2A/`): its headers and .cpp files all go under Mods.
+    # A mod in its own folder (`ECD2A/`) gets a filter of its own under Mods (`Mods\ECD2A`), nested as the folders
+    # are. Its GUID is derived from the name, so a rewrite does not churn it.
+    filters = list(VS_FILTERS)
     for root, dirs, files in os.walk(bp):
         dirs[:] = sorted((d for d in dirs if root != bp or d not in ("build", "out") + GENERATED), key=str.lower)
         if root != bp:
+            folder = "Mods\\" + os.path.relpath(root, bp)
+            filters.append((folder, str(uuid.uuid5(uuid.NAMESPACE_URL, "bpmods:" + folder.lower()))))
             for f in sorted(files, key=str.lower):
                 if f.endswith((".cpp", ".h")):
                     rows.append(("ClCompile" if f.endswith(".cpp") else "ClInclude",
-                                 os.path.relpath(os.path.join(root, f), bp), "Mods"))
+                                 os.path.relpath(os.path.join(root, f), bp), folder))
     # The compiler's own test mods and the headers any mod may include live beside it, in AssetGen.
     for sub, kind, ext, folder in (("tests", "ClCompile", ".cpp", "Tests"), ("include", "ClInclude", ".h", "Helpers")):
         d = os.path.join(bp, "..", "AssetGen", sub)
@@ -305,7 +310,7 @@ def write_vs_filters(bp):
     text = ('<?xml version="1.0" encoding="utf-8"?>\n'
             '<!-- Written by AssetGen/tools/bpbuild.py on every build. Do not edit. -->\n'
             '<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">\n  <ItemGroup>\n'
-            + "".join('    <Filter Include="%s"><UniqueIdentifier>{%s}</UniqueIdentifier></Filter>\n' % f for f in VS_FILTERS)
+            + "".join('    <Filter Include="%s"><UniqueIdentifier>{%s}</UniqueIdentifier></Filter>\n' % f for f in filters)
             + '  </ItemGroup>\n  <ItemGroup>\n'
             + "".join('    <%s Include="%s"><Filter>%s</Filter></%s>\n' % (kind, name, folder, kind) for kind, name, folder in rows)
             + '    <None Include="mods.yaml" />\n  </ItemGroup>\n</Project>\n')
