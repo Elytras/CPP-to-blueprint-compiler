@@ -2328,7 +2328,8 @@ bool FCompiler::Collect(std::string* Err)
             }
             else if (Kind(C) == "VarDecl" && Name(C) == "UeDefaultSubobjects")
             {
-                /* Every default subobject a game Blueprint's CDO exports, "<class path> <name>" joined by ';'. */
+                /* Every default subobject and archetype a game Blueprint's CDO exports, at any depth, "<class path>
+                   <name>" joined by ';', a nested one's name its path under the CDO (Damage:BreakIceBonus_0). */
                 std::string List;
                 if (FindLiteral(C, List))
                     for (size_t At = 0, End; At < List.size(); At = End + 1)

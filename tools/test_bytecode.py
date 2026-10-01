@@ -3923,7 +3923,7 @@ def preload_nested_kid():
     subobjects (Damage:BreakIceBonus_0): the class is serialized after those too, as after every default subobject,
     since the CDO it makes then copies each from them (edl_parent_subobjects_serialized walks every depth)."""
     assert GAME, 'needs --game: the parent CDO\'s subobjects are read off the game\'s package'
-    base = pending_asset('PreloadNestedKid')
+    base = asset('PreloadNestedKid')
     saved = list(invariants.GAME_CONTENT)
     invariants.GAME_CONTENT[:] = [GAME]
     try:
@@ -3934,8 +3934,8 @@ def preload_nested_kid():
     keeps_invariants(base)
 
 
-pending('PreloadNestedKid: a child of a game Blueprint is serialized after its parent CDO\'s nested subobjects',
-        preload_nested_kid)
+preload_nested_kid()
+print('ok  PreloadNestedKid: a child of a game Blueprint is serialized after its parent CDO\'s nested subobjects too')
 
 
 def ueapi_too_old():

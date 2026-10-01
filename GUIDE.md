@@ -1381,7 +1381,7 @@ markers of this kind, all written by the generator and read by the compiler. You
 | `<Member>__UeName` | The engine's name for a member or function the dumper respelled. |
 | `<Member>__UeScsNode` | The construction-script node of a component that a game Blueprint adds, through which a child class overrides the component's defaults. |
 | `<Member>__UeSubobject` | The default subobject that a native component member points at, which a mod class overrides by that name. |
-| `UeDefaultSubobjects` | Every default subobject a game Blueprint's default object exports, which a child class is loaded after. |
+| `UeDefaultSubobjects` | Every default subobject a game Blueprint's default object exports, and every object nested in one (`Damage:BreakIceBonus_0`), which a child class is loaded after. |
 | `<Member>__Replicated` | That a property replicates, and its RepNotify function. |
 | `<Function>__UeForward` | What `GetOuter`, `GetClass` and `GetName` really call. |
 

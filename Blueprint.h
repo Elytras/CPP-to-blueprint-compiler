@@ -129,7 +129,8 @@ public:
                               const std::vector<FPropertyDef>& Defaults, const std::vector<uint8>& NativeTail = {});
 
     /* A default subobject the Blueprint parent's CDO exports (its own AddSubobjectOverride): imported under the parent
-       CDO and serialized before this class, which builds its own CDO's copy from it. */
+       CDO and serialized before this class, which builds its own CDO's copy from it. A nested one is named by its path
+       under the CDO, `Damage:BreakIceBonus_0`, and imported under its outer's import, which must be added too. */
     void AddParentSubobject(const std::string& Name, const std::string& ClassPackage, const std::string& ClassName_)
     {
         ParentSubobjects.push_back(FParentSubobject{ Name, ClassPackage, ClassName_ });

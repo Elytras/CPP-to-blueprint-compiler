@@ -3,7 +3,7 @@
        e.g. C:/Dumper-7/<version>-FSD/SDK/SDK  BpMods/UeApi  --game D:/DRGExtract/FSD-WindowsNoEditor/FSD/Content
 
 --game reads the game's cooked Blueprints for what the dump does not carry: each game Blueprint class's tail
-(UeClassTail) and its CDO's default subobjects (UeDefaultSubobjects), and the native interfaces a native class
+(UeClassTail) and the subobjects under its CDO (UeDefaultSubobjects), and the native interfaces a native class
 implements (UeNativeInterfaces, see native_interfaces).
 
 The SDK dir must sit in its Dumper-7 dump, two levels under GObjects-Dump-WithProperties.txt (see read_real_fields);
@@ -1069,8 +1069,8 @@ def write_out_arrays(out_dir):
 
 
 SCRIPT_INHERIT = 0x4AA1364E         # CLASS_ScriptInherit, ObjectMacros.h:249-259
-RF_DEFAULT_SUBOBJECT = 0x40000
-GAME_SUBOBJECTS = {}                # game Blueprint class path -> ["<class path> <name>"] its CDO exports as default subobjects
+RF_ARCHETYPE_OBJECT, RF_DEFAULT_SUBOBJECT = 0x20, 0x40000
+GAME_SUBOBJECTS = {}                # game Blueprint class path -> ["<class path> <name>"] under its CDO (scan_game)
 OBJECT_PATH = "/Script/CoreUObject.Object"
 DEFAULT_TAIL = (0, OBJECT_PATH, "Engine")   # UObject's: Object.h:57-60
 
@@ -1093,6 +1093,16 @@ def scan_game(content):
         for s in prop.subs:
             enum_kinds(p, s)
 
+    def under(p, x, cdo):
+        up = x["outer"]
+        while 0 < up <= len(p.exports) and up != cdo:
+            up = p.exports[up - 1]["outer"]
+        return up == cdo
+
+    def name_path(p, k, cdo):
+        x = p.exports[k - 1]
+        return x["name"] if x["outer"] == cdo else name_path(p, x["outer"], cdo) + ":" + x["name"]
+
     for base in invariants.packages([content]):
         p = invariants.Package(base)
         for i, e in enumerate(p.exports):
@@ -1103,9 +1113,13 @@ def scan_game(content):
                     classes[p.path(i + 1)] = (st.class_flags & SCRIPT_INHERIT, p.path(st.within) if st.within else OBJECT_PATH,
                                               st.config, p.path(e["super"]))
                     # Not the native class's list from the dump: the cook leaves some out (an AI controller's
-                    # PathFollowingComponent), and an import of one it left out would not resolve.
-                    GAME_SUBOBJECTS[p.path(i + 1)] = ["%s %s" % (p.path(x["cls"]), x["name"]) for x in p.exports
-                                                      if x["outer"] == st.cdo and x["flags"] & RF_DEFAULT_SUBOBJECT]
+                    # PathFollowingComponent), and an import of one it left out would not resolve. Every object under
+                    # the CDO that is a default subobject or an archetype, at any depth, as the cook orders them
+                    # before a child class (SavePackage.cpp 4013-4040): Damage:BreakIceBonus_0, an object instanced in
+                    # WPN_Pickaxe's Damage, is copied into a child's Damage too.
+                    GAME_SUBOBJECTS[p.path(i + 1)] = [
+                        "%s %s" % (p.path(x["cls"]), name_path(p, k + 1, st.cdo)) for k, x in enumerate(p.exports)
+                        if x["flags"] & (RF_DEFAULT_SUBOBJECT | RF_ARCHETYPE_OBJECT) and under(p, x, st.cdo)]
                     for prop in st.props:
                         enum_kinds(p, prop)
             elif kind == "Function" and e["super"] < 0:
