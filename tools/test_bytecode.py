@@ -7443,8 +7443,9 @@ if not globals().get('EDITS_EXPLORE'):     # set by the dev loop's exploration d
     edit_listed_component()
     edit_bound_names()
     edit_cooked_unlisted_cases()
-    pending('EditDeps: a patch\'s added override and replaced function get the preload dependencies the cook completes',
-            edit_deps_completed)
+    edit_deps_completed()
+    print('ok  EditDeps: a patch\'s added override and replaced function get the preload dependencies the cook '
+          'completes: the super serialized first, a new local\'s type serialized and created first')
     pending('MapPatch: a patch\'s whole TSet / TMap lists the archetype\'s elements it drops as removed', edit_whole_containers)
 
 

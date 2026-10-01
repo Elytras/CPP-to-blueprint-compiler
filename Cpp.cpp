@@ -11484,6 +11484,12 @@ bool FCompiler::TransplantFunctions(const FRecord& R, const FRecord& B, const FP
         return FIndex{ E + 1 };
     };
 
+    /* An import under /Script/CoreUObject: compiled in and never waited on, so the cook lists it nowhere (SavePackage.cpp
+       3899, 3947). */
+    auto InCoreUObject = [&](int32 V) {
+        while (V < 0 && P.Imports[size_t(-V - 1)].Outer != 0) V = P.Imports[size_t(-V - 1)].Outer;
+        return V < 0 && P.SameName(P.Imports[size_t(-V - 1)].ObjectName, "/Script/CoreUObject");
+    };
     for (const FExport& F : Rows)
     {
         if (!IsFunction(F)) continue;
@@ -11495,20 +11501,42 @@ bool FCompiler::TransplantFunctions(const FRecord& R, const FRecord& B, const FP
 
         Replacing = Fn + 1;
         FArc Ar(&Sink);
+        std::vector<int32> Named;           // every object the payload names, as FPackage::Save records it
+        Sink.Recording = &Named;
         F.Serialize(Ar);
-        if (bAdded)                         // its own run, at the end: the four phases in order
+        Sink.Recording = nullptr;
+        /* The dependencies FPackage::Save completes for a function of AssetGen's own package, in this package's terms
+           (Package.cpp, after SavePackage.cpp 3962-4140): the four lists the scratch export declares; its class and
+           template serialized before it is created, its outer and super created before; every object its payload names
+           created before it is serialized; and its super serialized before it is, which UStruct::GetPreloadDependencies
+           adds and the scratch could not, Generate having written no super into it. The loader fetches that super with
+           bCheckSerialized while it serializes the function (AsyncLoading.cpp 3149-3162), and the types its properties
+           name are linked against then (Class.cpp 732-735). An added function gets a run of its own; a replaced one
+           keeps the game's and gains what its new body needs. An entry another list already orders is left out, as
+           Save leaves it. */
         {
-            FCookedExport& E = P.Exports[size_t(Fn)];
-            E.FirstExportDependency = int32(P.PreloadDependencies.size());
-            int32* const Counts[] = { &E.SerBeforeSer, &E.CreateBeforeSer, &E.SerBeforeCreate, &E.CreateBeforeCreate };
+            const FCookedExport& E = P.Exports[size_t(Fn)];
+            std::array<std::vector<int32>, 4> Deps = bAdded ? std::array<std::vector<int32>, 4>{} : P.Dependencies(Fn);
+            auto Has = [](const std::vector<int32>& List, int32 V) { return std::find(List.begin(), List.end(), V) != List.end(); };
+            auto Put = [&](size_t Phase, int32 V) {
+                if (V != 0 && V != Replacing && !InCoreUObject(V) && !Has(Deps[Phase], V)) Deps[Phase].push_back(V);
+            };
             const std::vector<int32>* const Lists[] = { &F.SerBeforeSer, &F.CreateBeforeSer, &F.SerBeforeCreate, &F.CreateBeforeCreate };
             for (size_t K = 0; K < 4; ++K)
-                for (int32 Dep : *Lists[K])
-                    if (const FIndex To = Sink.RemapIndex(FIndex{ Dep }); To.V != 0) { P.PreloadDependencies.push_back(To.V); ++*Counts[K]; }
+                for (int32 Dep : *Lists[K]) Put(K, Sink.RemapIndex(FIndex{ Dep }).V);
+            Put(0, E.Super);
+            Put(2, E.Class);
+            Put(2, E.Template);
+            Put(3, E.Outer);
+            Put(3, E.Super);
+            for (int32 V : Named) Put(1, V);
+            auto Drop = [&](std::vector<int32>& List, auto Redundant) {
+                List.erase(std::remove_if(List.begin(), List.end(), Redundant), List.end());
+            };
+            Drop(Deps[0], [&](int32 V) { return Has(Deps[2], V); });
+            Drop(Deps[1], [&](int32 V) { return Has(Deps[2], V) || Has(Deps[0], V) || Has(Deps[3], V); });
+            P.SetDependencies(Fn, Deps);
         }
-        else
-            for (int32 Dep : F.CreateBeforeSer)
-                if (const FIndex To = Sink.RemapIndex(FIndex{ Dep }); To.V != 0 && To.V != Replacing) P.CreateBeforeSerialize(Fn, To.V);
         if (!Bad.empty()) { *Err = Where + "::" + F.ObjectName + ": " + Bad; return false; }
         for (size_t I = P.Names.size(); I < Sink.NameTable().size(); ++I) P.Names.push_back({ Sink.NameTable()[I] });
         if (!ReadFunctionLayout(P, Ar.B, New))

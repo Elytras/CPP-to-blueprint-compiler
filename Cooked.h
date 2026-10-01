@@ -8,6 +8,7 @@ PKG_FilterEditorOnly, one generation, no engine version, and the name map, impor
 and preload dependencies back to back after the summary, with the payloads in export order in the .uexp. Anything
 else is refused with its reason rather than read loosely.
 */
+#include <array>
 #include <string>
 #include <vector>
 
@@ -80,6 +81,12 @@ public:
     /* Dep (an FPackageIndex) created before export row Export is serialized - the edge the cook gives an object that
        export's tags reference. Nothing when Dep is already one of its dependencies. */
     void CreateBeforeSerialize(int32 Export, int32 Dep);
+    /* Export row Export's dependency run as its four lists, in the order the run keeps them: serialize-before-serialize,
+       create-before-serialize, serialize-before-create, create-before-create. */
+    std::array<std::vector<int32>, 4> Dependencies(int32 Export) const;
+    /* Export row Export's run replaced by Lists, where it stands (the runs after it move with it), or appended for an
+       export that had none. */
+    void SetDependencies(int32 Export, const std::array<std::vector<int32>, 4>& Lists);
     /* A copy of export row From named Name, appended with its payload and its dependency run (one on From itself
        becomes one on the copy). The copy's FPackageIndex. */
     int32 CopyExport(int32 From, FNameRef Name);

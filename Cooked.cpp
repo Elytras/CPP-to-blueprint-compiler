@@ -226,6 +226,40 @@ void FCookedPackage::CreateBeforeSerialize(int32 Export, int32 Dep)
         if (&O != &E && O.FirstExportDependency >= At) ++O.FirstExportDependency;
 }
 
+std::array<std::vector<int32>, 4> FCookedPackage::Dependencies(int32 Export) const
+{
+    const FCookedExport& E = Exports[size_t(Export)];
+    std::array<std::vector<int32>, 4> Out;
+    if (E.FirstExportDependency < 0) return Out;
+    const int32 Counts[4] = { E.SerBeforeSer, E.CreateBeforeSer, E.SerBeforeCreate, E.CreateBeforeCreate };
+    auto At = PreloadDependencies.begin() + E.FirstExportDependency;
+    for (size_t K = 0; K < 4; ++K)
+    {
+        Out[K].assign(At, At + Counts[K]);
+        At += Counts[K];
+    }
+    return Out;
+}
+
+void FCookedPackage::SetDependencies(int32 Export, const std::array<std::vector<int32>, 4>& Lists)
+{
+    FCookedExport& E = Exports[size_t(Export)];
+    const int32 Old = E.FirstExportDependency < 0 ? 0 : E.SerBeforeSer + E.CreateBeforeSer + E.SerBeforeCreate + E.CreateBeforeCreate;
+    const int32 At = E.FirstExportDependency < 0 ? int32(PreloadDependencies.size()) : E.FirstExportDependency;
+    std::vector<int32> Run;
+    for (const std::vector<int32>& L : Lists) Run.insert(Run.end(), L.begin(), L.end());
+    PreloadDependencies.erase(PreloadDependencies.begin() + At, PreloadDependencies.begin() + At + Old);
+    PreloadDependencies.insert(PreloadDependencies.begin() + At, Run.begin(), Run.end());
+    /* The engine reads each run from its own offset, so a run after this one only moves; one that had none keeps -1. */
+    for (FCookedExport& O : Exports)
+        if (&O != &E && O.FirstExportDependency >= At + Old) O.FirstExportDependency += int32(Run.size()) - Old;
+    E.FirstExportDependency = Run.empty() ? -1 : At;
+    E.SerBeforeSer = int32(Lists[0].size());
+    E.CreateBeforeSer = int32(Lists[1].size());
+    E.SerBeforeCreate = int32(Lists[2].size());
+    E.CreateBeforeCreate = int32(Lists[3].size());
+}
+
 namespace
 {
 /* E's payload with its tag list, which ended at At, replaced by List. */
