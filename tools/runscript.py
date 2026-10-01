@@ -190,8 +190,8 @@ class Unconstructed:
 def frame_defaults(base, function, _cache={}):
     """name -> value of the locals a frame of `function` starts with that are not zero: each UserDefinedStruct local
     whose default instance is not, when the function is FUNC_HasDefaults (not the ubergraph: its persistent frame is
-    runvm's). Zero members are left out, as a missing one reads zero; an enum member is not decoded, nor an engine
-    struct's but an IMMUTABLE one."""
+    runvm's). Zero members are left out, as a missing one reads zero; an enum member reads its enumerator's value
+    (_enumerator); an engine struct's member is not decoded but an IMMUTABLE one's."""
     if (base, function) not in _cache:
         import invariants
         pkg = invariants.load(base)
@@ -238,7 +238,7 @@ def _load_tags(pkg, i, tags, sp, st, v, depth):
 
 
 def _tag_value(pkg, i, t, sp, q, before, depth):
-    """(decoded, value) of one tagged value of property q: ints, floats, bools, names, strings, an IMMUTABLE engine
+    """(decoded, value) of one tagged value of property q: ints, floats, bools, enums, names, strings, an IMMUTABLE engine
     struct (its non-zero members), a UserDefinedStruct (loaded over what the member held), an array of those."""
     ty, b = t['type'], bytes(t['value'])
     if ty == 'StructProperty' and q.type == 'StructProperty' and t.get('struct') in IMMUTABLE:
@@ -248,6 +248,7 @@ def _tag_value(pkg, i, t, sp, q, before, depth):
     if ty in ('IntProperty', 'Int64Property', 'Int16Property', 'Int8Property'): return True, int.from_bytes(b, 'little', signed=True)
     if ty in ('UInt16Property', 'UInt32Property', 'UInt64Property'): return True, int.from_bytes(b, 'little')
     if ty == 'ByteProperty' and t['enum'] == 'None': return True, b[0]
+    if ty in ('ByteProperty', 'EnumProperty') and len(b) == 8: return _enumerator(pkg, t['enum'], sp, q, _name(pkg, b, 0))
     if ty in ('FloatProperty', 'DoubleProperty'): return True, struct.unpack('<f' if len(b) == 4 else '<d', b)[0]
     if ty == 'BoolProperty': return True, bool(t['bool'])
     if ty == 'NameProperty': return True, _name(pkg, b, 0)
@@ -270,6 +271,41 @@ def _tag_value(pkg, i, t, sp, q, before, depth):
             for _ in range(n): s, o = _fstring(b, o); out.append(s)
             return True, out
     return False, None
+
+
+def _enumerator(pkg, enum, sp, q, name):
+    """(decoded, value) of an enum tag's value, an FName '<Enum>::<Short>', as the loader looks it up in the enum's
+    names (UEnum::GetValueByName): a UserDefinedEnum's entries off its package, a native enum's values as the UeApi
+    header declares them. Not decoded when neither the enum nor the name is found."""
+    from invariant_rules import user_types
+    short = name.split('::')[-1]
+    found = user_types.enum_of(pkg, enum, sp, q)
+    if found and found[0] == 'ude':
+        return next(((True, v) for n, v in found[1] if n == name or n.split('::')[-1] == short), (False, None))
+    values = native_enum_values().get(enum, {})
+    return (True, values[short]) if short in values else (False, None)
+
+
+_NATIVE_ENUM_VALUES = {}
+
+
+def native_enum_values():
+    """name -> {short enumerator name: value} of every native enum Types.json lists, off the header of its module
+    (/Script/Engine's in Engine.h), where genueapi writes each value. {} without a UeApi (INVARIANTS_UEAPI)."""
+    import json, re
+    d = os.environ.get('INVARIANTS_UEAPI')
+    if not _NATIVE_ENUM_VALUES and d and os.path.exists(os.path.join(d, 'Types.json')):
+        enums = json.load(open(os.path.join(d, 'Types.json'), encoding='utf-8'))['enums']
+        for module in sorted({e['package'].rsplit('/', 1)[-1] for e in enums.values()}):
+            h = os.path.join(d, module + '.h')
+            if not os.path.exists(h): continue
+            text = open(h, encoding='utf-8', errors='replace').read()
+            for m in re.finditer(r'^enum\s+(?:class\s+)?(\w+)\s*(?::\s*\w+)?\s*\{([^}]*)\}', text, re.M):
+                if m.group(1) in enums:
+                    _NATIVE_ENUM_VALUES.setdefault(m.group(1), {n: int(v, 0) for n, v in
+                                                   re.findall(r'^\s*(\w+)\s*=\s*(-?(?:0x[0-9a-fA-F]+|\d+))', m.group(2), re.M)})
+        _NATIVE_ENUM_VALUES.setdefault('', {})
+    return _NATIVE_ENUM_VALUES
 
 
 def _name(pkg, b, o):

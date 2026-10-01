@@ -80,6 +80,8 @@ public:
   int32 ObjAssign(int32 M) { Seen = this; Seen = {}; return Seen == nullptr ? 1 : 0; }
   int32 Elements(int32 M) { TArray<EAttachmentRule> A = {EAttachmentRule{}, EAttachmentRule::KeepWorld}; return (int32)A[0] + (int32)A[1] * 10 + M; }
   int32 SlotBraces(int32 M) { FValueSlot S = {{}, {}, {}, {}}; return (int32)S.Kept * 10 + S.Five + M; }
+  /* The members the literal leaves out keep their defaults: Kept is KeepWorld, Five 5. */
+  int32 SlotOmit(int32 M) { FValueSlot S = {EAttachmentRule::SnapToTarget}; return (int32)S.Zeroed * 100 + (int32)S.Kept * 10 + S.Five + M; }
 
   int32 NativeBraces(int32 M) { FValueNative S = {M, {}}; return S.A * 10 + (int32)S.V.Y; }
   int32 NativeDesig(int32 M) { FValueNative S = {.A = M, .V = {}}; return S.A * 10 + (int32)S.V.Y; }

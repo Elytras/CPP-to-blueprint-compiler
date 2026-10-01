@@ -7041,7 +7041,8 @@ def value_init_scalar():
     """Braces or `T()` around something that is not a struct are C++'s: `E R{}`, `T()` and `{}` the type's zero
     (value-initialisation), `{V}` the value V - an enum, an own UE_ENUM, an int, an int64, a byte, a float, a bool and an
     object pointer, in a local, an assignment, an argument, a return value, an array element and a member of a braced
-    UE_STRUCT (`{}` there is the member's zero, not its default), and as the default of a member and of a UE_STRUCT
+    UE_STRUCT (`{}` there is the member's zero, not its default, and a member the braces leave out keeps its default,
+    an enum's included: runscript reads a UserDefinedStruct's enum defaults), and as the default of a member and of a UE_STRUCT
     member (a zero one writes no tag on the class default object; a UserDefinedStruct's default instance tags every
     member: with no defaults to diff against, Class.cpp 1547 writes each), and as a braced asset's value, where `{}` is
     written as the zero it is. A UE_STRUCT's `T()` default is its defaults.
@@ -7054,7 +7055,7 @@ def value_init_scalar():
     keeps_invariants(base)
     for fn, want in (('EnumBraces', 0), ('EnumEqBraces', 0), ('EnumParens', 0), ('EnumValue', 1), ('EnumArg', 20),
                      ('EnumAssign', 0), ('EnumReturn', 10), ('OwnEnum', 20), ('IntBraces', 7), ('IntParens', 0),
-                     ('WideBraces', 0), ('Elements', 10), ('SlotBraces', 0)):
+                     ('WideBraces', 0), ('Elements', 10), ('SlotBraces', 0), ('SlotOmit', 215)):
         for m in (0, 3):
             got = run(base, fn, {'Held': 1}, M=m)[0]
             assert got == want + m, 'ValueInitScalar.%s(%d) = %r, want %r' % (fn, m, got, want + m)
