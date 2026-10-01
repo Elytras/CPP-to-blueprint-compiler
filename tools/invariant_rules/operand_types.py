@@ -95,7 +95,9 @@ def same(a, b):
     if ka == 'struct':
         if not a.sub or not b.sub or a.sub.startswith('?') or b.sub.startswith('?'): return None
         if a.sub == b.sub: return True
-        if a.sub.startswith('/script/') and sdk():
+        if a.sub.startswith('/script/') and not sdk():  # no SDK, so its supers are unknown: only another size says no
+            return False if a.size and b.size and a.size != b.size else None
+        if a.sub.startswith('/script/'):
             if a.sub not in sdk().objs or b.sub not in sdk().objs: return None
             c, seen = a.sub, 0
             while c and seen < 32:
@@ -888,8 +890,11 @@ def typing_let_destination(pkg):
 
 
 def struct_chain_paths(pkg, path):
+    """The struct's path and its supers', or None for a native struct the SDK does not describe (none was given): its
+    supers are unknown."""
     sc = scope_by_path(pkg, path)
-    return [c.path() for c in sc.chain()] if sc else [path]
+    if sc: return [c.path() for c in sc.chain()]
+    return None if path.startswith('/script/') else [path]
 
 
 @rule
@@ -914,8 +919,8 @@ def typing_struct_member_owner(pkg):
             if bt is None or not owner: continue
             if judged(me, bt.cls == 'StructProperty' or member_pun(pkg, T, n)) is False:
                 yield i, 'StructMemberContext at mem %d offsets into a %r' % (n.mem, bt); continue
-            if bt.cls == 'StructProperty' and bt.sub and not bt.sub.startswith('?') and judged(
-                    me, owner in struct_chain_paths(pkg, bt.sub) or member_pun(pkg, T, n)) is False:
+            chain = struct_chain_paths(pkg, bt.sub) if bt.cls == 'StructProperty' and bt.sub and not bt.sub.startswith('?') else None
+            if chain is not None and judged(me, owner in chain or member_pun(pkg, T, n)) is False:
                 yield i, 'StructMemberContext at mem %d names %s of %s in a %s' % (n.mem, '.'.join(n.ops[0][1]), owner, bt.sub)
 
 
