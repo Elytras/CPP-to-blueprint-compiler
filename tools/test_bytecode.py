@@ -7252,7 +7252,7 @@ def defaults_zero():
     subclass's default object deltas against its parent's, so each zero is a tag the loader reads over the parent's
     value, as `Count = 0;` writes one. A UE_STRUCT's `{}` or `T()` is its own defaults, an engine struct's its zeros."""
     import struct
-    base = pending_asset('DefaultsZero')
+    base = asset('DefaultsZero')
     keeps_invariants(base)
     pkg = invariants.Package(base)
     cdo = pkg.find('Default__DefaultsZero_C')
@@ -7274,7 +7274,9 @@ def defaults_zero():
         assert [struct.unpack('<i', inner[n]['value'])[0] for n in ('P', 'Q')] == [1, 2], (name, inner)
 
 
-pending('DefaultsZero: UE_DEFAULTS\' {} / T() / nullptr over a parent\'s default is the type\'s zero', defaults_zero)
+defaults_zero()
+print('ok  DefaultsZero: UE_DEFAULTS\' {} / T() / nullptr over a parent\'s default writes the type\'s zero, a '
+      'UE_STRUCT\'s its defaults')
 
 
 def tenum_value_init():

@@ -501,9 +501,10 @@ Watch for:
   `USceneComponent` root hands them on to the components attached to it. (A class whose parent already has a root,
   such as a Blueprint parent or `ACharacter`, adds no root: its first scene component keeps its transform.) A mesh or a light as the root keeps them,
   and AssetGen warns that they are not applied. Declare a `USceneComponent` first.
-- `UE_DEFAULTS` is read when the mod is built and never runs. A call, an `if`, a `+=`, `nullptr`, or a member path
+- `UE_DEFAULTS` is read when the mod is built and never runs. A call, an `if`, a `+=`, or a member path
   such as `Lamp->RelativeLocation.Z = 50.0f;` is refused; the member path gets a misleading message about genueapi,
   the SDK generator ([The SDK](#the-sdk)). A variable the class declares itself takes an initializer instead.
+  `Target = nullptr;`, `Count = {};` and `Offset = FVector();` write the type's zero over the parent's value.
 - `Weapons::Turret::StaticClass()`, for a mod class in a namespace, names the engine class that `Turret` inherits
   `StaticClass` from, with no message: the qualified form is not built yet. Inside the namespace, write
   `Turret::StaticClass()`. Where the value goes straight into a `TSubclassOf<Weapons::Turret>`, such as the class

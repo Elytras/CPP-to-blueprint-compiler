@@ -684,7 +684,7 @@ float value needs its `f`. `X * 0.5` is a double operation in C++, and Blueprint
 | `'A'`, `('a' - 'A')` | The int constant of its code unit. A plain `char` is signed, so `'\xff'` is -1. | Yes |
 | `nullptr` | None for an object or class. For a `TScriptInterface` it is the null interface. Where an int64 address is wanted it is 0. | Yes |
 | `int32 N{7};`, `EMood M{EMood::Angry};` | Braces around one value of a type that is not a struct are that value. | Yes |
-| `EMood M{};`, `int32 N = int32();`, `AActor* A{};`, `Mood = {};`, `return {};` | C++'s value-initialisation: the type's zero, the zero enumerator or None. In a function and as a default, where a zero writes nothing. | Yes |
+| `EMood M{};`, `int32 N = int32();`, `AActor* A{};`, `Mood = {};`, `return {};` | C++'s value-initialisation: the type's zero, the zero enumerator or None. In a function and as a default, where a zero writes nothing. In `UE_DEFAULTS` the zero is written, as `= 0` is (see [Class defaults](#class-defaults)). | Yes |
 | `"text"`, `L"wide"` | A String, Name or Text constant: [Strings and text](#strings-and-text). | Yes |
 
 ```cpp
@@ -2791,7 +2791,7 @@ component: see [The root and attachment](#the-root-and-attachment).
 | `Extra->bVisible = false;`, where `Extra` is a plain pointer member | Refused: "is not a UE_COMPONENT". Only a `UE_COMPONENT`, this class's or a parent's, has a template to hold defaults. | Refused |
 | `Lamp->Intensity += 100.0f;`, an `if`, a call such as `K2_DestroyActor();` | Refused: "every statement is `Field = value;`, `Component->Field = value;` or `Component->SetupAttachment(Parent);`". The block never runs, so logic in it could do nothing. | Refused |
 | `Lamp->Intensity = UKismetMathLibrary::RandomFloat();`, `InitialLifeSpan = sizeof(FVector);` | Refused: "a default is a value known when the mod is built". A value here follows the rules for a member's initializer: see [Classes and variables](#classes-and-variables). Compute anything else in `ReceiveBeginPlay` or `UserConstructionScript`. | Refused |
-| `Instigator = nullptr;`, `Mesh->StaticMesh = nullptr;` | Refused: "needs a literal value". `nullptr` writes nothing, so `UE_DEFAULTS` cannot clear an inherited object reference. Leave the statement out to keep the parent's value. | Refused |
+| `Instigator = nullptr;`, `Mesh->StaticMesh = nullptr;`, `Count = {};`, `Rule = EAttachmentRule();`, `Offset = FVector();` | The type's zero, written over the parent's value: null, 0, `false`, the zero enumerator, None, an empty string or container, an engine struct's zeros. A `UE_STRUCT`'s `{}` or `T()` is its own defaults. The same as `Count = 0;`. | Yes |
 | `Lantern() { InitialLifeSpan = 5.0f; }` | Not yet: a constructor is dropped with no message. It makes no function and writes no default. Use initializers and `UE_DEFAULTS`, and do run-time setup in `ReceiveBeginPlay`. | Not yet |
 
 ```cpp
@@ -5837,9 +5837,10 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   member-default message that starts `<Member>: a default is a value known when the mod is built`. Fix: keep only
   assignments of build-time values in UE_DEFAULTS, and move the rest to ReceiveBeginPlay or UserConstructionScript.
   See [Class defaults](#class-defaults).
-- `<Class>::UE_DEFAULTS: <Member> needs a literal value`: the value writes nothing, as in `Instigator = nullptr;`.
-  UE_DEFAULTS cannot set an inherited object reference back to null. Fix: write an explicit value, or leave the
-  statement out to keep the parent's default. See [Class defaults](#class-defaults).
+- `<Class>::UE_DEFAULTS: <Member> needs a literal value`: the value writes nothing: `{}` or `T()` of a type AssetGen
+  writes no zero for. `nullptr`, `{}` and `T()` of a number, an enum, a name, a string, an object, a container or a
+  struct are written as that type's zero. Fix: write an explicit value, or leave the statement out to
+  keep the parent's default. See [Class defaults](#class-defaults).
 - `warning: <Class>::UE_DEFAULTS: <Root> is the actor's root, which the engine puts at the spawn transform, so its
   <Properties> is not applied. A USceneComponent root passes its transform on to the components attached to it.`:
   UE_DEFAULTS sets RelativeLocation, RelativeRotation or RelativeScale3D on the actor's root, and the root is not a

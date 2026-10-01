@@ -10688,11 +10688,46 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
     }
     /* A member `{ .Q = 9 }` leaves unwritten (with no default of its own) is ImplicitValueInitExpr: zero. So are `T()`
        and `{}` around a value that is not a struct, C++'s value-initialisation; a struct's `T()` keeps its defaults, as
-       no value does. Braces around one value are that value. */
+       no value does. Braces around one value are that value. Where a zero is a value of its own (bKeepZero: a
+       UE_DEFAULTS statement deltas against the parent's default, a struct value or an asset names every member it
+       holds), it is written as one: the type's zero, an empty container, and a struct's default instance, each member
+       its own initializer, else its zero. */
     const bool bBraced = !bNeg && K == "InitListExpr" && PD.Type != "StructProperty";
     if (!bNeg && (K == "CXXNullPtrLiteralExpr" || K == "ImplicitValueInitExpr" || K == "CXXScalarValueInitExpr"
                   || ((K == "CXXConstructExpr" || K == "CXXTemporaryObjectExpr") && !First(*Init)) || (bBraced && !First(*Init))))
+    {
+        if (!bKeepZero) return true;
+        FDefaultValue& D = PD.Default;
+        const std::string& T = PD.Type;
+        if (T == "IntProperty" || T == "Int64Property" || (T == "ByteProperty" && PD.StructName.empty())) { D.K = FDefaultValue::Int; D.I = 0; }
+        else if (T == "FloatProperty") { D.K = FDefaultValue::Float; D.F = 0.0; }
+        else if (T == "BoolProperty") { D.K = FDefaultValue::Bool; D.I = 0; }
+        else if (T == "ByteProperty" || T == "EnumProperty") { D.K = FDefaultValue::Str; D.S = PD.EnumZero; }
+        else if (T == "NameProperty") { D.K = FDefaultValue::Str; D.S = "None"; }
+        else if (T == "StrProperty" || T == "TextProperty" || T == "SoftObjectProperty" || T == "SoftClassProperty")
+        { D.K = FDefaultValue::Str; D.S.clear(); }
+        else if (T == "ObjectProperty" || T == "ClassProperty" || T == "InterfaceProperty") { D.K = FDefaultValue::Obj; D.Object = Null(); }
+        else if (T == "ArrayProperty" || T == "SetProperty" || T == "MapProperty") { D.K = FDefaultValue::Array; D.Items.clear(); }
+        else if (T == "StructProperty")
+        {
+            const FRecord* SR = Find(StripTypeKeywords(TypeOf(*Init)));
+            if (!SR || !SR->bIsStruct) SR = Find(StripTypeKeywords(TypeOf(F)));
+            if (!SR) { *Err = "unknown struct type in an initializer: " + TypeOf(*Init); return false; }
+            auto Members = std::make_shared<std::vector<FPropertyDef>>();
+            for (const Json* SF : SR->Fields)
+            {
+                FPropertyDef MD;
+                const std::string MName = UeNameOf(SR, Name(*SF));
+                if (!TypeToProperty(TypeOf(*SF), MName, 0, "member " + MName + " of " + SR->CppName, BP, &MD, Err)
+                    || !LowerDefault(*SF, MD, BP, Err, nullptr, /*bKeepZero=*/true))
+                    return false;
+                Members->push_back(MD);
+            }
+            PD.Members = Members;
+            D.K = FDefaultValue::Struct;
+        }
         return true;
+    }
     if (bBraced) return LowerDefault(F, PD, BP, Err, First(*Init), bKeepZero);
 
     /* A struct value: `FFloatInterval(1, 5)` or `{1, 5}`, one argument per member in declaration
