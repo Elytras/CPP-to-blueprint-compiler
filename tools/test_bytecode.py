@@ -3966,6 +3966,41 @@ ueapi_too_old()
 print('ok  a UeApi older than the compiler, or with no Version.json, is refused, saying to regenerate it')
 
 
+def ueapi_without_game():
+    """genueapi without --game writes no game Blueprint's UeDefaultSubobjects or UeClassTail, which reads as a Blueprint
+    with none: a class deriving from one would compile without a word and load before its parent's subobjects. Its
+    Version.json says "game": false, and such a class is refused, saying to regenerate with --game; one with a native
+    parent still compiles. Here this UeApi's own headers, included by their full path, under tables whose Version.json
+    says false."""
+    import json, shutil, tempfile
+    real = os.path.abspath(UEAPI).replace('\\', '/')
+    with tempfile.TemporaryDirectory() as tmp:
+        api = os.path.join(tmp, 'UeApi')
+        os.makedirs(api)
+        for f in glob.glob(os.path.join(UEAPI, '*.json')):
+            shutil.copy(f, api)
+        stamp = json.load(open(os.path.join(UEAPI, 'Version.json'), encoding='utf-8'))
+        stamp['game'] = False
+        json.dump(stamp, open(os.path.join(api, 'Version.json'), 'w', encoding='utf-8'))
+        for mod, header, parent, ok in (('NoGameKid', 'Game/ENE_Spider_Grunt_Normal_C.h', 'ENE_Spider_Grunt_Normal_C', False),
+                                        ('NoGameActor', 'Engine.h', 'AActor', True)):
+            src = os.path.join(tmp, mod + '.cpp')
+            with open(src, 'w', encoding='utf-8') as f:
+                f.write('#include "%s/UeMeta.h"\n#include "%s/%s"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\n'
+                        'class %s : public %s {\npublic:\n    int32 Count;\n};\n' % (real, real, header, mod, mod, parent))
+            proc = assetgen_compile([src, api, os.path.join(tmp, 'out', mod)])
+            if ok:
+                assert proc.returncode == 0, (mod, proc.stdout[-500:])
+            else:
+                assert proc.returncode != 0 and 'without --game' in proc.stdout and 'regenerate' in proc.stdout, \
+                    (mod, proc.stdout[-500:])
+
+
+ueapi_without_game()
+print('ok  a UeApi made without --game refuses a class deriving from a game Blueprint, saying to regenerate it with '
+      '--game; a native parent still compiles')
+
+
 def subobject_bomber():
     """SubobjectBomber restates two of ABomber's own members that two default subobjects each fit, neither named for
     the member: GooSoundComponent is GooAudioComponent, AcidEmitterLeft is GooEmitterLeft, as the game's ENE_Bomber_C

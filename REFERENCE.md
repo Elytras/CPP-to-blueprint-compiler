@@ -252,7 +252,7 @@ starts private.
 | `class X : public ANotIncluded {};` | Refused by clang, "expected class name", when no included header declares the base. Include the SDK header that declares it. | Refused |
 | `class InitCave : public Hello {};` | A child of another class of the mod. A parent in the same source is used from there. A parent pinned with `UE_CLASS` to another mod is imported from that mod. | Yes |
 | `class Turret final : public AActor { ... };` | A class with no subclass. Its functions are cooked Final, which the editor does not let a Blueprint override, and a call to one of them reaches that function directly instead of by name; on `this` the body is usually copied in. See [Calling your own functions](#calling-your-own-functions). | Yes |
-| `class WPN_GrapplingGun_Long : public WPN_GrapplingGun_C` | A child of one of the game's Blueprint classes. Include the parent's `UeApi/Game/` header and derive from it; the parent is imported from the game. Put the child in the parent's `Game::` namespace to cook it beside the parent (see [Mod sources and packages](#mod-sources-and-packages)). | Yes |
+| `class WPN_GrapplingGun_Long : public WPN_GrapplingGun_C` | A child of one of the game's Blueprint classes. Include the parent's `UeApi/Game/` header and derive from it; the parent is imported from the game. Put the child in the parent's `Game::` namespace to cook it beside the parent (see [Mod sources and packages](#mod-sources-and-packages)). The child loads after every default subobject the parent's default object exports, which UeApi lists only when genueapi had `--game`: against a UeApi made without it, the class is refused, saying to regenerate with `--game`. | Yes |
 
 Notes:
 
@@ -6188,6 +6188,13 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   write (a game Blueprint's child would load before its parent's subobjects). genueapi writes `Version.json` last, so
   a run that stopped halfway leaves none either. Fix: regenerate UeApi with the genueapi of this AssetGen, or use the
   SDK release made for it. See [The SDK](GUIDE.md#the-sdk).
+- `<Class> derives from the game Blueprint <Parent>, but <IncludeDir> was generated without --game, so it does not list
+  the default subobjects that Blueprint's default object exports, which this class must load after - regenerate it
+  with AssetGen/tools/genueapi.py <SDK dir> <UeApi dir> --game <extracted Content dir>`: the UeApi's `Version.json`
+  says genueapi ran without `--game`, so no game Blueprint header lists its default subobjects or its tail, which
+  reads the same as a Blueprint that has none. The class would compile and then load before its parent's subobjects.
+  A class with a native parent still compiles against such a UeApi. Fix: regenerate UeApi with `--game` and the
+  game's extracted `Content` folder, or use the SDK release. See [The SDK](GUIDE.md#generating-your-own).
 - `usage: assetgen verify <out-dir> <reference-dir>` (and the lines after it): an unknown subcommand or too few
   arguments, with exit code 2. Fix: `assetgen compile <source.cpp> <UeApi dir> <out dir> [--api <api dir>]`. The
   `--api` folder is where the editor stubs go, not the UeApi folder. See [Building mods](GUIDE.md#building-mods).

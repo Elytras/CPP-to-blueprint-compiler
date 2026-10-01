@@ -1335,7 +1335,7 @@ use a newer SDK or regenerate your own.
 | `Containers.h` | The Kismet `Array_*`, `Set_*` and `Map_*` functions, as methods of `TArray`, `TSet` and `TMap`. |
 | `Types.json` | Every enum and struct: package, engine name, size, alignment and fields, and whether an enum is an `enum class` (`form`), read off how the dump's properties of it are reflected. |
 | `Events.json` | The function flags of every `BlueprintEvent`, which an override inherits. |
-| `Version.json` | Which genueapi wrote the folder, written last. A compiler that needs a later one refuses the folder, saying to regenerate it, rather than compile against what the older one did not write. |
+| `Version.json` | Which genueapi wrote the folder, and whether it had `--game`, written last. A compiler that needs a later one refuses the folder, saying to regenerate it, rather than compile against what the older one did not write. Without `--game` it refuses a class deriving from a game Blueprint, whose default subobjects the folder then does not list. |
 | `UeMeta.h` | The `UE_*` macros. Written by hand. |
 | `Types.h` | The integer spellings, `FString`, `FName`, `FText` and the container templates. Written by hand. |
 
@@ -1420,10 +1420,12 @@ and `Types.h` from the SDK repo, and optionally run `tools/genueassets.py`. What
   `no <path>: run genueapi on the SDK inside its Dumper-7 dump, not a copy of it`. The SDK folder and the object dump
   must come from the same dump.
 - **Give it the game's content with `--game <extracted Content dir>`.** The dump carries neither a class's flags,
-  ClassWithin and config name nor a native class's interfaces. genueapi reads the game's cooked Blueprints for them
-  (about 20 seconds): each game Blueprint's own tail, and the native interfaces a native class implements, as the
-  Blueprints that override one's function show. Without it, a mod deriving from a game Blueprint gets its nearest
-  native ancestor's tail, and an override of a native ancestor's interface function is taken for a new function.
+  ClassWithin and config name, nor the default subobjects a Blueprint's default object exports, nor a native class's
+  interfaces. genueapi reads the game's cooked Blueprints for them (about 20 seconds): each game Blueprint's own tail
+  and default subobjects, and the native interfaces a native class implements, as the Blueprints that override one's
+  function show. Without it, `Version.json` says so and the compiler refuses a class deriving from a game Blueprint,
+  which would otherwise load before its parent's subobjects; an override of a native ancestor's interface function is
+  taken for a new function.
 - **Your own mods are left out.** genueapi skips every class whose package a mod in the folder above `<UeApi dir>`
   cooks (any `.cpp` or `.h` directly in that folder with a `UE_MOD_PACKAGE`), and the shared nested-container structs.
   Keep `UeApi/` inside your mods folder, and a dump taken with your mods loaded does not declare them a second time.
@@ -1443,6 +1445,7 @@ genueapi prints one line per table it writes, then a summary of counts. These li
 | `NOT named back, ...: <n>, e.g. ...` | For these members, the object dump's name at the member's offset is not one that the dumper's renaming rules explain. genueapi writes no `__UeName` rather than a wrong one, and the member keeps the SDK's spelling; if the engine's name really differs, reads, writes and defaults of it miss in game without an error. | This almost always means the SDK folder and the object dump come from different dumps. Dump once and run genueapi on that dump. |
 | `SDK helpers left out, no UFunction behind them: <n> (...)` | Functions in the dump's headers that are the dumper's own C++ helpers, not engine functions. No Blueprint can call them. | Nothing. |
 | `out of reach: <kind> <n>, ...` | Class functions and properties held back because one of their types has no mapping yet, by kind: `enum`, `struct`, `container` or `other`. `UeApi.h` records the same numbers. | Nothing a mod can do. |
+| `no --game: no game Blueprint's default subobjects or tail, so the compiler refuses a class deriving from one` | genueapi ran without `--game`, and its `Version.json` says so. A mod with a native parent compiles against the folder; one deriving from a game Blueprint is refused. | Rerun with `--game <extracted Content dir>`. |
 | `blueprint classes dropped for want of a /Game path: <n> (...)` | The dump was taken without `FullAssetPaths=1`, so these Blueprint classes have no path to import them by. | Set `FullAssetPaths=1` in `Dumper-7.ini`, dump again with the fork, and rerun genueapi. |
 
 genueapi stops with exit status 1 when the object dump is missing, and on
