@@ -11,7 +11,7 @@ defaults, references, which function a call reaches). Never the bytecode's shape
 --ueapi to ue-mods' BpMods/UeApi. Outside ue-mods, pass the UeApi of https://github.com/Elytras/DRG-Blueprint-Cpp-SDK.
 --cases also writes each offline run as a JSON case, which ue-mods' `bpcheck` command replays in the running game.
 --game (the extracted game pak's FSD/Content) adds the S38 edits of the game's own packages; without it they are skipped."""
-import copy, glob, itertools, os, re, shutil, subprocess, sys
+import atexit, copy, glob, hashlib, itertools, json, os, posixpath, re, shutil, subprocess, sys, tempfile, threading
 os.environ['PYTHONIOENCODING'] = 'utf-8'   # the dump tools print non-ASCII names; read back as UTF-8, not the code page
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import runscript
@@ -53,11 +53,377 @@ def parallel(fn, items):
         return list(pool.map(fn, items))
 
 
+# ---- Compiles. Every `assetgen compile` a test makes goes through assetgen_compile(). The ~200 the tests make one at a
+# time after build() are prefetched: each run records them in a manifest, and the next starts them all right after
+# build(), WORKERS at once, each in a staging folder of its own, in the order the tests last made them. A test whose
+# compile is one of them takes that result, moved into place, instead of compiling. The manifest only says what to
+# compile: every result is this run's assetgen on the files the test itself wrote, used only when it is the same
+# compile in everything a compile reads (_compile_entry). --no-prefetch compiles each one when the test asks, as before,
+# and still records the manifest; --check-prefetch also compiles every prefetched one in its real place, and stops the
+# run on any difference.
+
+PREFETCH_MANIFEST = os.path.join(tempfile.gettempdir(), 'assetgen-suite-prefetch.json')   # one per machine: any checkout's last run
+PREFETCH_OFF, PREFETCH_CHECK = '--no-prefetch' in sys.argv, '--check-prefetch' in sys.argv
+PREFETCH_VERSION = 1            # of the manifest's layout; a manifest of another reads as none
+PREFETCH_MAX = 1000             # manifest entries kept; a run records about 200
+TREE_MAX_FILES, TREE_MAX_BYTES = 64, 1 << 20            # a test's source folder past either compiles directly, unrecorded
+TREE_EXTS = ('.cpp', '.h', '.hpp', '.inl', '.inc')      # any other file in a test's source folder: not a fresh out
+STABLE_DIRS = {os.path.normcase(os.path.join(AG, *d)) for d in (('tests',), ('tests', 'pending'), ('tests', 'ast'), ('examples',))}
+
+
+def _stamp(path):
+    """path, its size and its modification time: what tells two builds of a file apart without reading it."""
+    try:
+        st = os.stat(path)
+        return [path, st.st_size, st.st_mtime_ns]
+    except (OSError, TypeError):
+        return [path]
+
+
+# What every compile reads besides the files its entry names, in every key. The prefetch runs this run's assetgen and
+# clang on this run's UeApi, so within a run these never tell two compiles apart; they keep the key whole.
+TOOLCHAIN = [_stamp(ASSETGEN), _stamp(shutil.which('clang++')), os.path.normcase(UEAPI)]
+
+
+def _no_content_dir(path):
+    """No folder on path is named Content. A compile writes its registry, and a package outside the mod's own path, into
+    the Content folder its out ends in, or above (FCompiler::Run, ContentDir in Cpp.cpp): with no Content folder in the
+    part a staging folder replaces, the staged compile writes each at the same place relative to the part it keeps."""
+    return 'content' not in [c.lower() for c in re.split(r'[\\/]', path)]
+
+
+def _place(path):
+    """path as the manifest keeps it: inside AssetGen as <AG> and the rest, separators as written, so that a manifest
+    one checkout wrote maps onto another's; anything else as it is."""
+    return '<AG>' + path[len(AG):] if path == AG or path.startswith(AG + os.sep) else path
+
+
+def _unplace(place):
+    return AG + place[4:] if place.startswith('<AG>') else place
+
+
+def _plain_rel(rel):
+    """rel, a path the manifest puts below a staging folder, stays below it."""
+    return ':' not in rel and not any(p in ('.', '..') for p in re.split(r'[\\/]', rel))
+
+
+def _tree(top):
+    """The folders (relative, '/'-separated) and files (relative name -> text) under top; None when a file there is no
+    source - a compile's output, so top is no fresh out - or when there is more than a manifest should carry."""
+    dirs, files, size = [], {}, 0
+    for root, subdirs, names in os.walk(top):
+        subdirs.sort()
+        rel = os.path.relpath(root, top).replace(os.sep, '/')
+        if rel != '.': dirs.append(rel)
+        for name in sorted(names):
+            if not name.lower().endswith(TREE_EXTS) or len(files) == TREE_MAX_FILES: return None
+            with open(os.path.join(root, name), 'rb') as f: data = f.read()
+            size += len(data)
+            if size > TREE_MAX_BYTES: return None
+            try: files[name if rel == '.' else rel + '/' + name] = data.decode('utf-8')
+            except UnicodeDecodeError: return None
+    return dirs, files
+
+
+def _walk(top):
+    """The folders and files under top, relative and '/'-separated, the files with their bytes."""
+    dirs, files = set(), {}
+    for root, _, names in os.walk(top):
+        rel = os.path.relpath(root, top).replace(os.sep, '/')
+        if rel != '.': dirs.add(rel)
+        for name in names:
+            with open(os.path.join(root, name), 'rb') as f: files[name if rel == '.' else rel + '/' + name] = f.read()
+    return dirs, files
+
+
+def _compile_entry(args, cwd):
+    """The manifest entry of `assetgen compile <args>`: what to compile and, with _compile_key, everything it reads that
+    two compiles in one run can differ in. None when a staged compile cannot stand in for it: only `<src> <UEAPI> <out>`
+    qualifies, absolute, no flag (--game reads the game's packages, --api writes elsewhere), no cwd, in one of two shapes.
+    tree    A source in a folder the test made, out that folder or one inside it. The entry holds the whole folder: the
+            mod's own .h/.cpp, which ModSources (Cpp.cpp) reads beside the source, what clang includes or __EmbedFile__
+            reads from there, and the folders out is in. Nothing else, so out is fresh: the one thing a compile reads
+            back from where it writes, an AssetRegistry.bin to merge into (MergeAssetRegistry), is not there. The staged
+            copy is made beside the real folder, so `../x.h` and absolute includes reach the same files.
+    stable  A source in tests/, tests/pending/, tests/ast/ or examples/, compiled where it is into an empty out: one in
+            AssetGen (tests/build/_pending/...), mirrored below the staging folder so that the registry lands at the
+            same place relative to it, or one outside (a temp folder), staged beside it. The key adds the bytes of every
+            file directly in the source's folder."""
+    if cwd is not None or len(args) != 3 or args[1] != UEAPI: return None
+    src, out = args[0], args[2]
+    if not (os.path.isabs(src) and os.path.isabs(out)): return None
+    srcdir = os.path.dirname(src)
+    if os.path.normcase(srcdir) in STABLE_DIRS:
+        if not src.startswith(AG + os.sep) or not os.path.isdir(out) or os.listdir(out): return None
+        if out.startswith(AG + os.sep) and _no_content_dir(AG) and _no_content_dir(tempfile.gettempdir()):
+            return {'kind': 'stable', 'src': src[len(AG):], 'out': ['ag', out[len(AG):]]}
+        if _no_content_dir(out):
+            return {'kind': 'stable', 'src': src[len(AG):], 'out': ['beside', _place(os.path.dirname(out))]}
+        return None
+    inside = out == srcdir or out.startswith(srcdir) and out[len(srcdir)] in (os.sep, os.altsep)
+    tree = _tree(srcdir) if inside and _no_content_dir(srcdir) else None
+    if tree is None: return None
+    return {'kind': 'tree', 'dir': _place(os.path.dirname(srcdir)), 'src': src[len(srcdir):], 'out': out[len(srcdir):],
+            'dirs': tree[0], 'files': tree[1]}
+
+
+def _stageable(entry):
+    """A manifest entry this checkout can stage: a shape it knows, its folders here, and no path that leaves them."""
+    try:
+        if entry['kind'] == 'tree':
+            names = [entry['src'], entry['out']] + list(entry['dirs']) + list(entry['files'])
+            ok = os.path.isdir(_unplace(entry['dir'])) and all(isinstance(t, str) for t in entry['files'].values())
+        elif entry['kind'] == 'stable':
+            names = [entry['src']] + ([entry['out'][1]] if entry['out'][0] == 'ag' else [])
+            ok = (os.path.isfile(AG + entry['src']) and os.path.normcase(os.path.dirname(AG + entry['src'])) in STABLE_DIRS
+                  and (entry['out'][0] == 'ag' or entry['out'][0] == 'beside' and os.path.isdir(_unplace(entry['out'][1]))))
+        else:
+            return False
+        return ok and all(isinstance(n, str) and _plain_rel(n) for n in names)
+    except (KeyError, TypeError, IndexError, AttributeError):
+        return False
+
+
+def _dir_digest(folder):
+    """The names and bytes of the files directly in folder: what ModSources reads beside a stable source, and more."""
+    h = hashlib.sha256()
+    for name in sorted(os.listdir(folder)):
+        path = os.path.join(folder, name)
+        if os.path.isfile(path):
+            with open(path, 'rb') as f: data = f.read()
+            h.update(json.dumps([name, len(data)]).encode('utf-8') + data)
+    return h.hexdigest()
+
+
+def _compile_key(entry, digests=None):
+    """What a staged compile and a test's must share for one to stand in for the other: the entry, the files beside a
+    stable source (digests caches them for start(), which keys every entry at once) and the toolchain."""
+    beside = None
+    if entry['kind'] == 'stable':
+        folder = os.path.dirname(AG + entry['src'])
+        beside = (digests or {}).get(folder) or _dir_digest(folder)
+        if digests is not None: digests[folder] = beside
+    return hashlib.sha256(json.dumps([entry, beside, TOOLCHAIN], sort_keys=True).encode('utf-8')).hexdigest()
+
+
+def _swap(text, stage, real):
+    """A staged compile's stdout or stderr as the compile in real prints it: clang names the source by the path it was
+    given, the compiler its source and its out and registry folders, the registry's with forward slashes."""
+    text = text.replace(stage, real)
+    return text.replace(stage.replace('\\', '/'), real.replace('\\', '/')) if os.sep == '\\' else text
+
+
+def _wrote_outside(stdout, stage, outputs):
+    """A staged compile wrote what its staging folder does not hold, so its result cannot be moved into place: a package
+    outside the mod's own path (printed by its /Game path) that ContentDir put above the folder, or the registry."""
+    lower = [o.lower() for o in outputs]
+    if any(not any(o.endswith('/' + p.lower()) for o in lower) for p in re.findall(r'-> /Game/(\S+)', stdout)): return True
+    return any(d != '.' and not d.startswith(stage.replace('\\', '/'))
+               for d in re.findall(r'(?m)^\s*registry\s+-> (.+)/AssetRegistry\.bin', stdout))
+
+
+def _read_manifest():
+    """The last run's entries, in the order it made their compiles; none when there is no manifest of this layout."""
+    try:
+        with open(PREFETCH_MANIFEST, encoding='utf-8') as f:
+            data = json.load(f)
+        if data.get('version') == PREFETCH_VERSION and isinstance(data.get('entries'), list):
+            return [e for e in data['entries'] if isinstance(e, dict)]
+    except (OSError, ValueError, AttributeError):
+        pass
+    return []
+
+
+def _write_manifest(entries):
+    """Into a temp file beside the manifest, then renamed over it, so a run never reads half of one. The last run to
+    finish wins; a stale entry only costs a compile nobody takes. One that cannot be written keeps the old one."""
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(prefix='assetgen-suite-prefetch.', suffix='.tmp', dir=os.path.dirname(PREFETCH_MANIFEST))
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump({'version': PREFETCH_VERSION, 'entries': entries[:PREFETCH_MAX]}, f)
+        os.replace(tmp, PREFETCH_MANIFEST)
+    except OSError:
+        if tmp and os.path.exists(tmp): os.remove(tmp)
+
+
+def _call_site():
+    """The suite's own frames that led to a compile, innermost first (any frames, for a driver that runs the helpers on
+    their own): where a --check-prefetch difference came from."""
+    import traceback
+    inner = ('compile', '_prefetched', '_checked', '_call_site', 'assetgen_compile')
+    stack = [f for f in traceback.extract_stack() if f.name not in inner]
+    frames = [f for f in stack if f.filename == CompilePrefetch.compile.__code__.co_filename] or stack
+    return ' <- '.join('%s (%s:%d)' % (f.name, os.path.basename(f.filename), f.lineno) for f in reversed(frames[-4:]))
+
+
+class PrefetchMismatch(BaseException):
+    """A prefetched compile that is not what the direct one gives (--check-prefetch). Not an Exception: pending() reads
+    those as known gaps, and this must stop the run."""
+
+
+class CompilePrefetch:
+    """The prefetch: what this run records for the next, the staged compiles running or queued (by key, in the
+    manifest's order), and the counts the summary line prints."""
+
+    def __init__(self):
+        self.started = self.finished = False
+        self.lock = threading.Lock()                    # guards stages, which the prefetch threads add to
+        self.pool, self.waiting, self.stages = None, {}, set()
+        self.record, self.previous = [], []
+        self.calls = self.hits = self.unused = 0
+
+    def start(self):
+        """Right after build(), not before: build() wipes tests/build and keeps WORKERS busy, and its compiles, made all
+        at once already, are not recorded. Queues every compile the manifest lists, in its order."""
+        self.started, self.previous = True, _read_manifest()
+        atexit.register(self.finish, complete=False)
+        if PREFETCH_OFF or not self.previous: return
+        from concurrent.futures import ThreadPoolExecutor
+        self.pool = ThreadPoolExecutor(WORKERS)
+        # Before the interpreter joins the pool's threads at exit, which drains the queue first: a run a failure stops
+        # waits only for the compiles already running. (atexit runs after that join.)
+        stop = getattr(threading, '_register_atexit', None)
+        if stop: stop(lambda: self.pool.shutdown(wait=False, cancel_futures=True))
+        digests = {}
+        for entry in self.previous:
+            if _stageable(entry):
+                self.waiting.setdefault(_compile_key(entry, digests), []).append(self.pool.submit(self._staged, entry))
+
+    def compile(self, args, cwd=None):
+        cmd = [ASSETGEN, 'compile'] + list(args)
+        if self.started and not self.finished:
+            self.calls += 1
+            entry = _compile_entry(args, cwd)
+            if entry is not None:
+                self.record.append(entry)
+                proc = self._prefetched(cmd, entry, args)
+                if proc is not None: return proc
+        return subprocess.run(cmd, capture_output=True, encoding='utf-8', cwd=cwd)
+
+    def _staged(self, entry):
+        """entry's compile in a staging folder of its own, on a prefetch thread: what it printed and returned, and what
+        it wrote, relative to the staging folder, which stands for the real one."""
+        res = {'stage': None, 'usable': False}
+        try:
+            parent = (_unplace(entry['dir']) if entry['kind'] == 'tree' else
+                      None if entry['out'][0] == 'ag' else _unplace(entry['out'][1]))
+            stage = res['stage'] = tempfile.mkdtemp(dir=parent)
+            with self.lock: self.stages.add(stage)
+            if entry['kind'] == 'tree':
+                for d in entry['dirs']: os.makedirs(os.path.join(stage, *d.split('/')), exist_ok=True)
+                for rel, text in entry['files'].items():
+                    with open(os.path.join(stage, *rel.split('/')), 'wb') as f: f.write(text.encode('utf-8'))
+                src, out = stage + entry['src'], stage + entry['out']
+            else:
+                src, out = AG + entry['src'], stage + entry['out'][1] if entry['out'][0] == 'ag' else stage
+                os.makedirs(out, exist_ok=True)
+            dirs, files = _walk(stage)
+            proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, out], capture_output=True, encoding='utf-8')
+            dirs_after, files_after = _walk(stage)
+            outputs = sorted(r for r, data in files_after.items() if files.get(r) != data)
+            res.update(rc=proc.returncode, stdout=proc.stdout, stderr=proc.stderr, outputs=outputs,
+                       dirs=sorted(dirs_after - dirs), usable=files.keys() <= files_after.keys()
+                       and not any(r in files for r in outputs) and not _wrote_outside(proc.stdout, stage, outputs))
+        except Exception:       # an OSError mostly: a compile that could not be staged is one the test makes itself
+            res['usable'] = False
+        return res
+
+    def _prefetched(self, cmd, entry, args):
+        """The prefetched result of entry's compile, moved into place; None when there is none to take: never queued,
+        still queued (cancelled: compiling here costs the same, and is the real thing), or its outputs' places taken."""
+        futures = self.waiting.get(_compile_key(entry)) if self.pool else None
+        if not futures: return None
+        future = futures.pop(0)
+        if future.cancel(): return None
+        res = future.result()
+        real = os.path.dirname(args[0]) if entry['kind'] == 'tree' else AG if entry['out'][0] == 'ag' else args[2]
+        try:
+            if not res['usable'] or any(os.path.lexists(os.path.join(real, *o.split('/'))) for o in res['outputs']):
+                self.unused += 1
+                return None
+            self.hits += 1
+            if PREFETCH_CHECK: return self._checked(cmd, entry, real, res)
+            for d in res['dirs']: os.makedirs(os.path.join(real, *d.split('/')), exist_ok=True)
+            for o in res['outputs']:
+                dst = os.path.join(real, *o.split('/'))
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copyfile(os.path.join(res['stage'], *o.split('/')), dst)
+            return subprocess.CompletedProcess(cmd, res['rc'], _swap(res['stdout'], res['stage'], real),
+                                               _swap(res['stderr'], res['stage'], real))
+        finally:
+            self._drop(res)
+
+    def _checked(self, cmd, entry, real, res):
+        """--check-prefetch: the compile made directly in its real place, which must give what the staged one gave: exit
+        code, stdout and stderr (staging folder swapped for the real one), and every folder and file it wrote, byte for
+        byte. In AssetGen only the folder holding all it wrote is compared, not the whole tree."""
+        top = ''
+        if entry['kind'] == 'stable' and entry['out'][0] == 'ag':
+            top = posixpath.commonpath([posixpath.dirname(o) for o in res['outputs']]
+                                       + [entry['out'][1].replace('\\', '/').strip('/')])
+        root = os.path.join(real, *top.split('/')) if top else real
+        under = lambda rels: {r[len(top) + 1:] if top else r for r in rels}
+        dirs, files = _walk(root)
+        proc = subprocess.run(cmd, capture_output=True, encoding='utf-8')
+        dirs_after, files_after = _walk(root)
+        made = {r: data for r, data in files_after.items() if files.get(r) != data}
+        want = {}
+        for o in res['outputs']:
+            with open(os.path.join(res['stage'], *o.split('/')), 'rb') as f: want[next(iter(under([o])))] = f.read()
+        problems = [] if proc.returncode == res['rc'] else ['exit %d, prefetched %d' % (proc.returncode, res['rc'])]
+        for name in ('stdout', 'stderr'):
+            got, staged = getattr(proc, name).splitlines(), _swap(res[name], res['stage'], real).splitlines()
+            if got != staged:
+                at = next((i for i, (a, b) in enumerate(zip(got, staged)) if a != b), min(len(got), len(staged)))
+                problems.append('%s line %d: %r, prefetched %r' % (name, at + 1, (got + [None])[at], (staged + [None])[at]))
+        if made.keys() != want.keys() or dirs_after - dirs != under(res['dirs']):
+            problems.append('wrote %s, prefetched %s' % (sorted(made) + sorted(dirs_after - dirs), sorted(want) + sorted(under(res['dirs']))))
+        problems += ['%s differs' % r for r in sorted(made.keys() & want.keys()) if made[r] != want[r]]
+        if problems: raise PrefetchMismatch('--check-prefetch, at %s: %s' % (_call_site(), '; '.join(problems)))
+        return proc
+
+    def _drop(self, res):
+        if res.get('stage'):
+            shutil.rmtree(res['stage'], ignore_errors=True)
+            with self.lock: self.stages.discard(res['stage'])
+
+    def finish(self, complete=True):
+        """Stops the prefetch, removes its staging folders and writes the manifest; at the end of a run (complete),
+        prints the summary line. A run cut short (atexit) keeps the last manifest's other entries after its own: its
+        tests never got to theirs."""
+        if not self.started or self.finished: return
+        self.finished = True
+        if self.pool:
+            self.pool.shutdown(wait=True, cancel_futures=True)
+            for future in itertools.chain.from_iterable(self.waiting.values()):
+                if not future.cancelled():
+                    self.unused += 1
+                    self._drop(future.result())
+        with self.lock: stages = list(self.stages)
+        for stage in stages: shutil.rmtree(stage, ignore_errors=True)
+        entries = self.record
+        if not complete:
+            mine = {json.dumps(e, sort_keys=True) for e in entries}
+            entries = entries + [e for e in self.previous if json.dumps(e, sort_keys=True) not in mine]
+        _write_manifest(entries)
+        if not complete: return
+        if PREFETCH_OFF:
+            print('ok  prefetch: off, all %d compiles made directly (%d recorded for the next run)' % (self.calls, len(self.record)))
+        else:
+            print('ok  prefetch: %d of %d compiles were ready (%d compiled directly, %d prefetched and unused)%s' % (
+                self.hits, self.calls, self.calls - self.hits, self.unused,
+                '; each checked against a direct compile' if PREFETCH_CHECK else ''))
+
+
+PREFETCH = CompilePrefetch()
+
+
 def assetgen_compile(args, cwd=None):
-    """`assetgen compile <args>`, run in cwd, its stdout and stderr captured as UTF-8 text: every compile the suite
-    makes goes through here, so what is done around a compile is done in one place. The other verbs (roundtrip,
-    registry, astcheck) run as they are."""
-    return subprocess.run([ASSETGEN, 'compile'] + list(args), capture_output=True, encoding='utf-8', cwd=cwd)
+    """`assetgen compile <args>`, run in cwd, its stdout and stderr captured as UTF-8 text, as subprocess.run returns
+    it: every compile the suite makes goes through here. Before PREFETCH.start() it just compiles; after, a compile
+    the prefetch made already is taken from it. The other verbs (roundtrip, registry, astcheck) run as they are."""
+    return PREFETCH.compile(args, cwd)
 
 
 def build():
@@ -102,6 +468,7 @@ def astcheck():
 
 
 build()
+PREFETCH.start()
 astcheck()
 
 
@@ -6875,5 +7242,6 @@ if not globals().get('EDITS_EXPLORE'):     # set by the dev loop's exploration d
     edit_cooked_unlisted_cases()
 
 
+PREFETCH.finish()
 print('ok  %d known gaps, each a failing test of something AssetGen does not do yet' % len(GAPS))
 assert not FIXED, 'these pass now, move them in with the others: ' + ', '.join(FIXED)
