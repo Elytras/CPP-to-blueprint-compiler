@@ -27,6 +27,6 @@ endif()
 find_package(Threads REQUIRED)
 
 add_executable(assetgen
-  Blueprint.cpp Cpp.cpp Main.cpp Package.cpp Registry.cpp Script.cpp Uncooked.cpp Verify.cpp)
+  Blueprint.cpp Command.cpp Cooked.cpp Cpp.cpp Main.cpp Package.cpp Registry.cpp Script.cpp Uncooked.cpp Verify.cpp)
 target_include_directories(assetgen PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(assetgen PRIVATE nlohmann_json::nlohmann_json Threads::Threads)
