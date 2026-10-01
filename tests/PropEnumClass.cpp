@@ -7,7 +7,9 @@ The editor makes such a pin an EnumProperty over a ByteProperty named Underlying
 ByteProperty with its Enum (Editor/KismetCompiler/Private/KismetCompilerMisc.cpp 1071-1094); the game's cooks carry an
 EnumProperty for every enum class. Tags follow the property: an EnumProperty tag naming the enum. EAttachmentRule and
 EActorUpdateOverlapsMethod are both `enum class : uint8` in UE 4.27 (EngineTypes.h 57, Actor.h 38); EAttachLocation is
-a namespaced enum, which stays a ByteProperty.
+a namespaced enum, which stays a ByteProperty. EAbilityIndex's one property in the game is ABosco's
+UsePlayerActivatedAbillity parameter `Index`, an EnumProperty that the SDK spells `Index_0`: its form is read through
+that respelling.
 */
 #include "UeApi/Types.h"
 
@@ -25,6 +27,7 @@ class PropEnumClass : public AActor {
 public:
   EAttachmentRule Rule = EAttachmentRule::KeepWorld;
   EAttachLocation Where = EAttachLocation::SnapToTarget;
+  EAbilityIndex Ability = EAbilityIndex::ESecondary;
   TArray<EAttachmentRule> Order = {EAttachmentRule::SnapToTarget, EAttachmentRule::KeepRelative};
   TSet<EAttachmentRule> Seen;
   TMap<EAttachmentRule, int32> Cost = {{EAttachmentRule::KeepWorld, 3}};

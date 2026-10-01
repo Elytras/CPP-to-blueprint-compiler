@@ -6273,6 +6273,8 @@ def prop_enum_class():
         'Rule is a %s over %s, not an EnumProperty over a ByteProperty' % (props['Rule'].type, [s.type for s in props['Rule'].subs])
     assert (props['Where'].type, pkg.path(props['Where'].ref)) == ('ByteProperty', '/Script/Engine.EAttachLocation'), \
         'Where, of a namespaced enum, is a %s' % props['Where'].type
+    # EAbilityIndex's form comes off one parameter the SDK respells (Index -> Index_0); a ByteProperty means it was lost
+    assert is_enum_class(props['Ability'], '/Script/FSD.EAbilityIndex'), 'Ability is a %s' % props['Ability'].type
     for name, sub in (('Order', 0), ('Seen', 0), ('Cost', 0)):
         assert is_enum_class(props[name].subs[sub], rule_enum), '%s holds %s' % (name, props[name].subs[sub].type)
     fn_props = lambda owner, fn: {p.name: p for p in owner.struct(owner.find(fn)).props}
@@ -6291,7 +6293,7 @@ def prop_enum_class():
     assert (t['type'], t['enum'], fname_at(slot.names, t['value'], 0)) == ('EnumProperty', 'EAttachmentRule', 'eattachmentrule::snaptotarget'), t
 
     cdo = pkg.find('Default__PropEnumClass_C')
-    for name, enum, value in (('Rule', 'EAttachmentRule', 'keepworld'),
+    for name, enum, value in (('Rule', 'EAttachmentRule', 'keepworld'), ('Ability', 'EAbilityIndex', 'esecondary'),
                               ('UpdateOverlapsMethodDuringLevelStreaming', 'EActorUpdateOverlapsMethod', 'alwaysupdate'),
                               ('Where', 'EAttachLocation', 'snaptotarget')):
         t = pkg.tag(cdo, name)

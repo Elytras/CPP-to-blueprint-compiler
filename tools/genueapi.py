@@ -542,7 +542,7 @@ def read_real_fields(sdk_dir):
             if cur is not None:
                 cur.setdefault(int(m.group(1), 16), []).append(m.group(3).rstrip("\r\n"))
             if owner and m.group(2) in ("EnumProperty", "ByteProperty"):
-                ENUM_PROPS[(owner, m.group(3).rstrip("\r\n"))] = m.group(2)
+                ENUM_PROPS.setdefault((owner, int(m.group(1), 16)), []).append((m.group(3).rstrip("\r\n"), m.group(2)))
             continue
         m = DUMP_OBJECT.match(line)
         owner = m.group(2).rstrip("\r\n") if m else None
@@ -556,14 +556,19 @@ def read_real_fields(sdk_dir):
 # The editor makes a pin of an enum an EnumProperty over a ByteProperty when the UEnum's CppForm is EnumClass, and a
 # ByteProperty naming the enum otherwise (KismetCompilerMisc.cpp 1071-1094). The dump does not write CppForm, but UHT
 # reflects a member or parameter of an `enum class` type as an FEnumProperty and a TEnumAsByte<> one as an FByteProperty,
-# and the object dump names each property's field class while the SDK headers name its enum. Joined on (owner, member
-# name), every enum's properties come out one kind: on the FSD 4.27 dump 841 enum classes and 354 TEnumAsByte enums, none
-# both, and the 198 native enums any property of the game's own cooked Blueprints is of (variables, parameters, locals)
-# are the kind the dump says, bar one the dump has no property of (2026-10-01; scan_game reads only the variables). An
-# enum no property uses (250 of 1445) has no form, and AssetGen keeps such an enum a ByteProperty.
-ENUM_PROPS = {}      # (owner path, property name) -> "EnumProperty" / "ByteProperty", off the object dump
+# and the object dump names each property's field class while the SDK headers name its enum. The join is on (owner,
+# offset), as REAL_FIELDS' is, with the name its control: Dumper-7 respells a member (Bosco.UsePlayerActivatedAbillity's
+# parameter `Index` is the header's `Index_0`, and so are 185 members of a native enum on the FSD dump), and a join on
+# the name lost those, and with them EAbilityIndex's only property. So joined, every enum's properties come out one
+# kind: on the FSD 4.27 dump 842 enum classes and 354 TEnumAsByte enums, none both, and the 198 native enums any
+# property of the game's own cooked Blueprints is of (variables, parameters, locals) are the kind the dump says, bar
+# one the dump has no property of (2026-10-01; scan_game reads only the variables). An enum no member or parameter in
+# the headers is of has no form (249 of 1445), and AssetGen keeps such an enum a ByteProperty. 10 of those are a native
+# delegate's parameter (the dump has its signature, the headers no parameter struct to join it to) or a container's
+# element (the dump names no inner's field class).
+ENUM_PROPS = {}      # (owner path, offset) -> [(property name, "EnumProperty" / "ByteProperty")], off the object dump
 ENUM_OWNER = re.compile(r"^// \w+ (/.*?)\s*$")     # "// Class /Script/Engine.Actor", "// Function /Game/A.B_C.Do It"
-ENUM_MEMBER = re.compile(r"^\t(?:const\s+)?(E\w+)\s*&?\s+(\w+)(?:\[\w+\])?;\s+//")
+ENUM_MEMBER = re.compile(r"^\t(?:const\s+)?(E\w+)\s*&?\s+(\w+)(?:\[\w+\])?;\s+// 0x([0-9A-Fa-f]+)\(")
 
 
 def read_enum_forms(sdk_dir, game_forms):
@@ -583,7 +588,11 @@ def read_enum_forms(sdk_dir, game_forms):
                 owner = None
                 continue
             m = ENUM_MEMBER.match(line) if owner and not owner.startswith("/Game/_ElytrasMods/") else None
-            kind = ENUM_PROPS.get((owner, m.group(2))) if m and m.group(1) in ENUMS else None
+            if not m or m.group(1) not in ENUMS:
+                continue
+            # Dumper-7's own UObject members (Object.Flags) are no property, and have none at their offset.
+            props = ENUM_PROPS.get((owner, int(m.group(3), 16)), ())
+            kind = next((k for real, k in props if is_spelling_of(m.group(2), real)), None)
             if kind:
                 seen.setdefault(m.group(1), set()).add(kind)
     by_path = dict(("/Script/%s.%s" % (e.pkg, e.ue_name), e) for e in ENUMS.values())
@@ -666,6 +675,13 @@ def dumper_spelling(real):
     return re.sub(r"_\d+_[0-9A-Fa-f]{32}$", "", {"bool": "Bool", "NULL": "NULLL"}.get(valid, valid))
 
 
+def is_spelling_of(fname, real):
+    """Whether fname is how Dumper-7 spells the engine's member name real: dumper_spelling's, or that with the `_<n>`
+    it adds to a name that clashes (`Index` -> `Index_0`). The control of every join on an offset."""
+    stem = dumper_spelling(real)
+    return fname == stem or fname.startswith(stem + "_")
+
+
 def real_field(k, fname):
     """The engine's name of member `fname` of k, or None where it is the C++ spelling (or cannot be told)."""
     at = k.offsets.get(fname)
@@ -675,8 +691,7 @@ def real_field(k, fname):
         return None
     # The offset is the join; this is its control. A name the respelling rules do not explain means the SDK and the
     # object dump are not of one run, and then no name is better than a wrong one.
-    stem = dumper_spelling(real)
-    if fname != stem and not fname.startswith(stem + "_"):
+    if not is_spelling_of(fname, real):
         UNEXPLAINED.append("%s.%s <- %s" % (k.ue_name, fname, real))
         return None
     return real
