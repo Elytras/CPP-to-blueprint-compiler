@@ -6522,6 +6522,42 @@ prop_set_delta()
 prop_enum_class()
 
 
+def value_init_scalar():
+    """Braces or `T()` around something that is not a struct are C++'s: `E R{}`, `T()` and `{}` the type's zero
+    (value-initialisation), `{V}` the value V - an enum, an own UE_ENUM, an int, an int64, a byte, a float, a bool and an
+    object pointer, in a local, an assignment, an argument, a return value and an array element, and as the default of a
+    member and of a UE_STRUCT member (a zero one writes no tag on the class default object; a UserDefinedStruct's default
+    instance tags every member: with no defaults to diff against, Class.cpp 1547 writes each)."""
+    import struct
+    base = pending_asset('ValueInitScalar')
+    keeps_invariants(base)
+    for fn, want in (('EnumBraces', 0), ('EnumEqBraces', 0), ('EnumParens', 0), ('EnumValue', 1), ('EnumArg', 20),
+                     ('EnumAssign', 0), ('EnumReturn', 10), ('OwnEnum', 20), ('IntBraces', 7), ('IntParens', 0),
+                     ('WideBraces', 0), ('Elements', 10)):
+        for m in (0, 3):
+            got = run(base, fn, {'Held': 1}, M=m)[0]
+            assert got == want + m, 'ValueInitScalar.%s(%d) = %r, want %r' % (fn, m, got, want + m)
+    assert run(base, 'FloatBraces', F=2.0)[0] == 3.5 and run(base, 'BoolBraces', M=1)[0] is False
+    assert run(base, 'ObjBraces', M=0)[0] == 1 and run(base, 'ObjAssign', {'Seen': None}, M=0)[0] == 1
+    pkg = invariants.Package(base)
+    cdo = pkg.find('Default__ValueInitScalar_C')
+    for name in ('Rule', 'Count', 'Who'):
+        assert not pkg.tag(cdo, name), 'the zero default of %s writes a tag: %r' % (name, pkg.tag(cdo, name))
+    kept, seven, half = pkg.tag(cdo, 'Kept'), pkg.tag(cdo, 'Seven'), pkg.tag(cdo, 'Half')
+    assert kept and fname_at(pkg.names, kept['value'], 0) == 'eattachmentrule::keepworld', kept
+    assert seven and struct.unpack('<i', seven['value'])[0] == 7, seven
+    assert half and struct.unpack('<f', half['value'])[0] == 0.5, half
+    slot = invariants.Package(os.path.join(os.path.dirname(base), 'FValueSlot'))
+    tags = {t['name'].split('_')[0]: t for t in slot.struct(0).defaults}
+    assert fname_at(slot.names, tags['Zeroed']['value'], 0) == 'eattachmentrule::keeprelative', tags['Zeroed']
+    assert fname_at(slot.names, tags['Kept']['value'], 0) == 'eattachmentrule::keepworld', tags['Kept']
+    assert [struct.unpack('<i', tags[n]['value'])[0] for n in ('None', 'Five')] == [0, 5], (tags['None'], tags['Five'])
+
+
+pending('ValueInitScalar: braces or T() around an enum, a number or a pointer are its zero, or the value braced',
+        value_init_scalar)
+
+
 # -- pending
 
 for _mod, _body in (('PropSetBool', '  TSet<bool> Flags;\n'), ('PropMapBool', '  TMap<bool, int32> ByFlag;\n'),
