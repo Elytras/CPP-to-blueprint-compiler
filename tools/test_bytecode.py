@@ -3918,6 +3918,26 @@ preload_case_kid()
 print('ok  PreloadCaseKid: a restated subobject spelled in another case than the parent\'s export is one import')
 
 
+def preload_nested_kid():
+    """PreloadNestedKid's parent, the game's WPN_Pickaxe_C, exports an instanced bonus under each of two default
+    subobjects (Damage:BreakIceBonus_0): the class is serialized after those too, as after every default subobject,
+    since the CDO it makes then copies each from them (edl_parent_subobjects_serialized walks every depth)."""
+    assert GAME, 'needs --game: the parent CDO\'s subobjects are read off the game\'s package'
+    base = pending_asset('PreloadNestedKid')
+    saved = list(invariants.GAME_CONTENT)
+    invariants.GAME_CONTENT[:] = [GAME]
+    try:
+        found = invariants.check(invariants.Package(base), {'edl_parent_subobjects_serialized', 'import_unique'})
+    finally:
+        invariants.GAME_CONTENT[:] = saved
+    assert not found, '%d findings, e.g. %s' % (len(found), '; '.join('%s %s: %s' % f for f in found[:2]))
+    keeps_invariants(base)
+
+
+pending('PreloadNestedKid: a child of a game Blueprint is serialized after its parent CDO\'s nested subobjects',
+        preload_nested_kid)
+
+
 # ---- TABLES: the package's own tables - names and their numbers, imports, exports, archetypes
 # (invariant_rules/tables.py)
 
