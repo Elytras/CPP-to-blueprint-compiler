@@ -4360,9 +4360,10 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         }
         const Json* Obj = Callee ? Strip(First(*Callee)) : nullptr;
         if (!Obj) { *Err = "member call with no object"; return false; }
-        if (std::string Raw = TypeOf(*First(*Callee)); Raw.find("TEnum<") != std::string::npos)
+        if (std::string Raw = TypeOf(*First(*Callee)); IsTEnumType(Raw))
         {
-            /* TEnum<E>::Name() / String(): the engine's own enumerator lookups on E's UEnum, an ObjectConst. */
+            /* TEnum<E>::Name() / String(): the engine's own enumerator lookups on E's UEnum, an ObjectConst. Only on a
+               TEnum<E> itself: a TArray of them or a dispatcher with one as a parameter has methods of its own. */
             const std::string Method = Name(*Callee);
             auto E = Enums.find(StripTypeKeywords(Raw));
             if (E == Enums.end()) { *Err = "TEnum over an unknown enum: " + Raw; return false; }

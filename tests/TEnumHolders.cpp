@@ -30,7 +30,7 @@ public:
   int32 Size(const TArray<TEnum<EThPick>>& A) { return A.Num(); }
   int32 Local(int32 M) {
     TArray<TEnum<EThPick>> A = {EThPick::One, EThPick::Two};
-    return A.Num() + Size(A) * 10 + A.Find(EThPick::Two) * 100 + M;
+    return A.Num() + Size(A) * 10 + (A.Contains(EThPick::Two) ? 100 : 0) + M;
   }
   FName NameOf() { return Items[1].Name(); }
 };
