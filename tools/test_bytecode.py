@@ -7133,8 +7133,43 @@ def edit_invariants_suite():
           'overriding nothing or the native event they name; each edited CDO ends at its SerialSize')
 
 
+SUPER_DECL = ('class SuperBase : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/SuperTest/SuperBase", "SuperBase_C");\n'
+              '  int32 Count;\n  int32 Bump(int32 By);\n  int32 Twice(int32 By);\n};\n'
+              'class SuperTest : public SuperBase {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/SuperTest/SuperTest", "SuperTest_C");\n'
+              '  int32 Bump(int32 By);\n  int32 Thrice(int32 By);\n};\n')
+TYPES_DECL = ('enum class EPreloadTier : uint8 { Low, High };\nUE_ENUM_IN(EPreloadTier, "/Game/_ElytrasMods/PreloadTypes");\n'
+              'struct FPreloadInner {\n  UE_STRUCT_IN("/Game/_ElytrasMods/PreloadTypes");\n  int32 A;\n};\n'
+              'struct FPreloadOuter {\n  UE_STRUCT_IN("/Game/_ElytrasMods/PreloadTypes");\n  FPreloadInner Inner;\n  EPreloadTier Tier;\n};\n'
+              'class PreloadTypes : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/PreloadTypes/PreloadTypes", "PreloadTypes_C");\n'
+              '  int32 Sum(FPreloadOuter O);\n};\n')
+
+
+def edit_deps_completed():
+    """S38: a function a patch writes into a game package has the preload dependencies FPackage::Save completes for a
+    function of AssetGen's own package (SavePackage.cpp 3962-4140): no edl_* finding the vanilla package lacks.
+    FnOverrideBp adds to SuperTest_C an override of SuperBase_C's Twice, which SuperTest_C did not override: the loader
+    fetches its SuperStruct, a function in the parent Blueprint's package, with bCheckSerialized while it serializes the
+    override (edl_super_serialized). FnTypeLocal replaces PreloadTypes_C's Sum with a body holding a TArray<EPreloadTier>
+    local, a type the game's Sum never named: the function links against the enum while it is serialized, so the enum
+    is serialized first (edl_property_types) and created before the payload naming it is read (edl_payload_created)."""
+    cases = (('FnOverrideBp', 'SuperTest', 'SuperTest/SuperTest', SUPER_DECL + 'class Tweaks : public SuperTest {\n  UE_PATCH;\n'
+              'public:\n  int32 Twice(int32 By) { return By * 3; }\n};\n'),
+             ('FnTypeLocal', 'PreloadTypes', 'PreloadTypes/PreloadTypes', TYPES_DECL + 'class Tweaks : public PreloadTypes {\n'
+              '  UE_PATCH;\npublic:\n  int32 Sum(FPreloadOuter O) {\n    TArray<EPreloadTier> Tiers;\n'
+              '    Tiers.Add(EPreloadTier::High);\n    return Tiers.Num();\n  }\n};\n'))
+    found = []
+    for mod, stand_in, path, body in cases:
+        game = os.path.join(ROOT, stand_in, 'FSD', 'Content')
+        with tempfile.TemporaryDirectory() as tmp:
+            proc, content = compile_edit(tmp, mod, EDIT_HEAD + 'UE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\n%s' % (mod, body), game)
+            assert proc.returncode == 0, mod + ':\n' + proc.stdout + proc.stderr
+            b = os.path.join(content, '_ElytrasMods', *path.split('/'))
+            found += ['%s %s %s: %s' % ((mod,) + f) for f in edit_findings(b, game, set(EDL_RULES))]
+    assert not found, '%d findings, e.g. %s' % (len(found), '; '.join(found[:2]))
+
+
 GRUNT = '#include "UeApi/Game/ENE_Spider_Grunt_Normal_C.h"\n'
-GRUNT_PKGS = ['Enemies/Spider/Grunt/ED_Spider_Grunt', 'Enemies/Spider/Grunt/ENE_Spider_Grunt_Normal']
+GRUNT_PKGS =['Enemies/Spider/Grunt/ED_Spider_Grunt', 'Enemies/Spider/Grunt/ENE_Spider_Grunt_Normal']
 GRUNT_KEEP = ('class GruntCount : public ENE_Spider_Grunt_Normal_C {\n  UE_PATCH;\n'
               '  void GetEnemySpawnedCount(int& SpawnCount) {\n'
               '    ENE_Spider_Grunt_Normal_C::GetEnemySpawnedCount(SpawnCount);\n    SpawnCount = SpawnCount + 41;\n  }\n};\n')
@@ -7368,6 +7403,8 @@ if not globals().get('EDITS_EXPLORE'):     # set by the dev loop's exploration d
     edit_listed_component()
     edit_bound_names()
     edit_cooked_unlisted_cases()
+    pending('EditDeps: a patch\'s added override and replaced function get the preload dependencies the cook completes',
+            edit_deps_completed)
 
 
 PREFETCH.finish()
