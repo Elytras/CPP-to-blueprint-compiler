@@ -56,10 +56,10 @@ def mod_sources(mod, bp):
     while todo:
         src = todo.pop()
         for inc in INCLUDE.findall(io.open(src, encoding="utf-8-sig", errors="replace").read()):
-            if inc.replace("\\", "/").split("/")[0] in GENERATED:
-                continue
             path = os.path.abspath(os.path.join(os.path.dirname(src), inc))
             key = os.path.normcase(path)
+            if any(g.lower() in key.split(os.sep) for g in GENERATED):
+                continue
             if key not in seen and os.path.exists(path):
                 seen.add(key)
                 out.append(path)
@@ -284,6 +284,14 @@ def write_vs_filters(bp):
             rows.append(("ClCompile", f, "Tests" if f.endswith("Test.cpp") else "Mods"))
         elif f.endswith(".h"):
             rows.append(("ClInclude", f, "Helpers"))
+    # A mod in its own folder (`ECD2A/`): its headers and .cpp files all go under Mods.
+    for root, dirs, files in os.walk(bp):
+        dirs[:] = sorted((d for d in dirs if root != bp or d not in ("build", "out") + GENERATED), key=str.lower)
+        if root != bp:
+            for f in sorted(files, key=str.lower):
+                if f.endswith((".cpp", ".h")):
+                    rows.append(("ClCompile" if f.endswith(".cpp") else "ClInclude",
+                                 os.path.relpath(os.path.join(root, f), bp), "Mods"))
     # The compiler's own test mods and the headers any mod may include live beside it, in AssetGen.
     for sub, kind, ext, folder in (("tests", "ClCompile", ".cpp", "Tests"), ("include", "ClInclude", ".h", "Helpers")):
         d = os.path.join(bp, "..", "AssetGen", sub)
