@@ -4720,18 +4720,31 @@ print('ok  FuncForwarderOrder: a forwarding override calls its own super, whatev
 
 
 def func_iface_inherited():
-    """FuncIfaceInherited implements IFiTell, whose Tell, Kept and Ping it inherits from FiRoot. Each of its own
-    calls FiRoot's, so a call by name or through the interface runs FiRoot's (with no function of its own the interface's
-    empty one would be found first, UClass::FindFunctionByName, Class.cpp 5281-5323)."""
+    """FuncIfaceInherited implements IFiTell, whose Tell, Kept, Ping, Twice and Auth it inherits from FiRoot. Each of
+    its own calls FiRoot's - Twice, inline, expanded in it; Auth, authority-only, bound and authority-only itself, as an
+    override takes its parent's flags - so a call by name or through the interface runs FiRoot's: either finds the
+    class's own function first (UClass::FindFunctionByName, Class.cpp 5281-5323), and with none would find the
+    interface's empty one before the super's. FiKid's Tell and Auth override those two, and their `FiRoot::` calls run
+    FiRoot's."""
     kid = asset('FuncIfaceInherited')
-    chain = [kid, os.path.join(os.path.dirname(kid), 'FiRoot')]
-    keeps_invariants(kid)
-    assert {'Tell', 'Kept', 'Ping'} <= set(exports_of(kid)), exports_of(kid)
-    got = run_as(chain, 'Tell', {}, V=2), run_as(chain, 'Kept', {}, V=2)
-    assert got == (3, 20), 'Tell(2), Kept(2) on a FuncIfaceInherited returned %r, %r' % got
-    fields = {'Seen': 0}
-    run_as(chain, 'Ping', fields)
-    assert fields['Seen'] == 9, fields
+    folder = os.path.dirname(kid)
+    chain = [kid, os.path.join(folder, 'FiRoot')]
+    fikid = [os.path.join(folder, 'FiKid')] + chain
+    for b in (kid, fikid[0]): keeps_invariants(b)
+    assert {'Tell', 'Kept', 'Ping', 'Twice', 'Auth'} <= set(exports_of(kid)), exports_of(kid)
+    got = run_as(chain, 'Tell', {}, V=2), run_as(chain, 'Kept', {}, V=2), run_as(chain, 'Twice', {}, V=2)
+    assert got == (3, 20, 4), 'Tell(2), Kept(2), Twice(2) on a FuncIfaceInherited returned %r, %r, %r' % got
+    for c, fn, parms, want, seen in ((chain, 'Ping', {}, None, 9), (chain, 'Auth', {'V': 2}, 6, 2), (fikid, 'Auth', {'V': 2}, 106, 2)):
+        fields = {'Seen': 0}
+        got = run_as(c, fn, fields, **parms)
+        assert (want is None or got == want) and fields['Seen'] == seen, (os.path.basename(c[0]), fn, got, fields)
+    assert run_as(fikid, 'Tell', {}, V=2) == 103
+    pkg = invariants.Package(kid)
+    assert pkg.struct(pkg.find('Auth')).function_flags & 0x4, 'FuncIfaceInherited::Auth is not BlueprintAuthorityOnly'
+    pkg = invariants.Package(fikid[0])
+    for fn in ('Tell', 'Auth'):
+        sup = pkg.path(pkg.struct(pkg.find(fn)).super)
+        assert sup.endswith('/FuncIfaceInherited.FuncIfaceInherited_C:' + fn), (fn, sup)
 
 
 func_iface_inherited()
