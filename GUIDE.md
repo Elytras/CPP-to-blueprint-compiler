@@ -327,7 +327,9 @@ an override of Method that AssetGen adds to your class, which only calls the par
 warning.
 Every other call to a method goes by name, so the most derived override runs, also when the parent's own code makes
 the call. A `final` class or method has no override, so its calls reach the one function, and on `this` its
-body is copied in.
+body is copied in. A call that stays a call is bound only to a function the final class declares new; one it
+overrides or inherits is called by name, as the editor calls a function that is not Final, which with no subclass
+reaches the same body.
 
 `UE_PURE` makes a pure function, drawn without exec pins. A `T&` parameter is an output, a pass-by-reference pin. A
 `static` method runs on the class default object (the instance that holds Class Defaults), which has no world, so give
