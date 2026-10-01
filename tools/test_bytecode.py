@@ -669,6 +669,7 @@ def pending_asset(mod, cls=None):
     if mod not in REFUSALS:
         os.makedirs(out, exist_ok=True)
         proc = assetgen_compile([src, UEAPI, out])
+        LOGS[mod] = proc.stdout
         failed = re.findall(r'(?m)^\s*FAILED: (.*)$', proc.stdout)
         REFUSALS[mod] = (failed or [proc.stdout.strip() or 'exit %d' % proc.returncode])[0] if proc.returncode else None
     if REFUSALS[mod]: raise AssertionError('refused: ' + REFUSALS[mod])
@@ -2433,10 +2434,13 @@ def inherited_defaults():
 def run_as(chain, fn, fields, **parms):
     """Runs fn on an object of class chain[0] whose mod ancestors are chain[1:] (package bases) as the VM
     dispatches: a call by name runs the most derived definition, EX_FinalFunction exactly the function its import
-    names. (runscript alone looks both up in the calling package.)"""
+    names. (runscript alone looks both up in the calling package.) A final call goes by its import, (package, index):
+    one package can call two classes' functions of one name, a forwarding override its parent's and a qualified call
+    an ancestor's."""
     import runscript
     names = {b: exports_of(b) for b in chain}
     owner = lambda f: next(b for b in chain if f in names[b])
+    same = lambda a, b: os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
     finals = {}
     for b in chain:
         paths = import_paths(b)
@@ -2444,12 +2448,13 @@ def run_as(chain, fn, fields, **parms):
             for imp in re.findall(r'FinalFunction\s+imp\[(\d+)\]', dump('walkscript.py', b, i)):
                 pkg, _, fname = paths[int(imp)].rpartition(':')
                 if pkg.startswith('/Game/'):                        # a mod function, in a package beside this one
-                    finals[fname] = os.path.join(os.path.dirname(chain[0]), pkg.split('.')[0].rsplit('/', 1)[1])
+                    t = os.path.join(os.path.dirname(chain[0]), pkg.split('.')[0].rsplit('/', 1)[1])
+                    finals[fname] = finals[b, int(imp)] = (next((c for c in chain if same(c, t)), t), fname)
     saved = runscript.run, runscript.params_of, dict(runscript.MATH)
     runscript.run = lambda base, f, self_vars=None, **p: saved[0](owner(f), f, self_vars, **p)
     runscript.params_of = lambda base, f, *flag: saved[1](owner(f), f, *flag)
-    for f, target in finals.items():
-        runscript.MATH[f] = (lambda t, f: lambda *a: saved[0](t, f, fields, **dict(zip(saved[1](t, f), a)))[0])(target, f)
+    for k, (target, f) in finals.items():
+        runscript.MATH[k] = (lambda t, f: lambda *a: saved[0](t, f, fields, **dict(zip(saved[1](t, f), a)))[0])(target, f)
     try:
         return saved[0](owner(fn), fn, fields, **parms)[0]
     finally:

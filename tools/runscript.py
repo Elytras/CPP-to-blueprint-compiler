@@ -64,6 +64,7 @@ class P(W):
             p = s.ptr()                                              # exp[i]:Name, or imp[i]:Class'Name'
             n.own = p.startswith('exp[') or s.of_own_class(p)
             n.val = p.split(':', 1)[1] if p.startswith('exp[') else p.split("'")[-2]
+            n.imp = int(p[4:p.index(']')]) if p.startswith('imp[') else None   # MATH may name one import: (base, index)
             s.args(k)
         elif op == 0x1D: n.val = s.i32()
         elif op == 0x1E: n.val = struct.unpack_from('<f', s.b, s.o)[0]; s.raw(4)
@@ -525,12 +526,13 @@ def run(base, function, self_vars=None, **parms):
             return CONTAINERS[n.val](ev, lambda d, v: d is n.kids[2] or store(d, v), n.kids)
         if o in (0x1C, 0x46, 0x68) and n.val in CONTAINERS: return CONTAINERS[n.val](ev, store, n.kids)
         if o in (0x1C, 0x46, 0x68):
-            if n.val not in MATH: raise SystemExit('unsupported call %s (in %s of %s)' % (n.val, function, base))
+            fn = MATH.get((base, getattr(n, 'imp', None))) or MATH.get(n.val)    # one package can import two classes' Fn
+            if fn is None: raise SystemExit('unsupported call %s (in %s of %s)' % (n.val, function, base))
             args = [ev(a) for a in n.kids]
             if n.val.endswith('_Int64Int64'):
                 args = [v & 0xFFFFFFFF if is32(a) else v for a, v in zip(n.kids, args)]
             CALLS.append((n.val, tuple(args)))
-            return MATH[n.val](*args)
+            return fn(*args)
         if o == 0x69:
             # execSwitchValue compares the cases with the index where it lies, so the index is a variable; and no case
             # matching throws a script exception (a logged warning) before the default runs.
