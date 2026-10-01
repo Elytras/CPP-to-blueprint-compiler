@@ -6598,7 +6598,7 @@ def prop_enum_forms():
     `enum class`, a ByteProperty naming the enum for a TEnumAsByte one. The forms are the object dump's delegate
     signatures' and the game's own packages' (PropEnumForms.cpp says where each comes from)."""
     import invariants
-    base = pending_asset('PropEnumForms')
+    base = asset('PropEnumForms')
     pkg = invariants.Package(base)
     props = {p.name: p for p in pkg.struct(pkg.find('PropEnumForms_C')).props}
     want = {'Severity': 'EnumProperty', 'QuartzEvent': 'EnumProperty', 'PurchaseStatus': 'EnumProperty',
@@ -6609,8 +6609,9 @@ def prop_enum_forms():
     keeps_invariants(base)
 
 
-pending('PropEnumForms: an enum only a delegate\'s parameter or a container\'s element shows the form of keeps it',
-        prop_enum_forms)
+prop_enum_forms()
+print('ok  PropEnumForms: an enum only a native delegate\'s parameter or a container\'s element shows the form of is '
+      'the property the editor makes')
 
 
 # ---- TYPES: UE_STRUCT default instances, UE_ENUM payloads and names (invariant_rules/user_types.py)

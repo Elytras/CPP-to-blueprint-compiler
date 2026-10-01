@@ -1931,9 +1931,9 @@ A few mistakes also compile without a message, because the construct itself work
   pointer in the game, or subclass the Blueprint and set its defaults in `UE_DEFAULTS`. See
   [Game assets](REFERENCE.md#game-assets).
 - The form of a game enum that no property uses. genueapi learns whether a game enum is an `enum class` from how the
-  dump's properties of it are reflected, and 249 of the SDK's 1445 enums have none; a variable of one is a Byte, which
-  differs from the editor's Enum variable only in type, and only if the enum is an `enum class`. See
-  [Enums](REFERENCE.md#enums).
+  dump's properties of it and the game's Blueprints are reflected, and 240 of the SDK's 1445 enums have none; a
+  variable of one is a Byte, which differs from the editor's Enum variable only in type, and only if the enum is an
+  `enum class`. See [Enums](REFERENCE.md#enums).
 - Walking a `TSet` in place. A range-for over a `TSet` walks a copy, while a `TMap` walks its own slots. Only the cost
   differs. See [Loops](REFERENCE.md#loops).
 - Reusing a repeated pure call. It is evaluated each time it appears. To compute it once, keep the result in a local.
