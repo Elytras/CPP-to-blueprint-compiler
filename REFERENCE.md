@@ -1033,7 +1033,7 @@ copies it, as in C++.
 | `FStats S = {.Kills = K, .Alive = true};` | Make Struct: a fresh value, then one store for each member given. Members left out keep the struct's defaults. | Yes |
 | `KillsOf({.Kills = K})` | A braced value as an argument. | Yes |
 | `FStats S = {K, 2.0f};` | Positional braces go by member declaration order. | Yes |
-| `FStats S = {{}, 2.0f};` | A `{}` for a member that is not a struct is its zero, as in C++, not the member's default. | Yes |
+| `FStats S = {{}, 2.0f};` | A `{}` for a member is a fresh value of its type, as in C++, not the member's default: zero, an empty container, None, an engine struct's zeros, or a `UE_STRUCT`'s own defaults. | Yes |
 
 ```cpp
 FVector Home;
@@ -1127,7 +1127,7 @@ void ZeroAll() {
 | `FVector Offset = {0, 0, 50};` | Positional braces as a default. | Yes |
 | `FNested Deep = {.Inner = {.Time = 1.5f}, .Stamp = 7};` | Designated braces, nested. Members left out are zero, or take their own default initializer. | Yes |
 | `FColor Lamp = FColor(255, 128, 0);` | FColor's argument order holds in defaults too. | Yes |
-| `FStats Fresh = FStats();`, `FStats Cleared = {{}, {}};` | A `UE_STRUCT`'s `T()` is its defaults, and writes nothing. A `{}` for a member is that member's zero, written even where its default is not zero. | Yes |
+| `FStats Fresh = FStats();`, `FStats Cleared = {{}, {}};` | A `UE_STRUCT`'s `T()` is its defaults, and writes nothing. A `{}` for a member is a fresh value of its type (zero, empty, None, a `UE_STRUCT`'s own defaults), written even where the member's default differs. | Yes |
 
 Notes:
 - Every value in a default must be known when the mod is built: [Classes and variables](#classes-and-variables).
@@ -1297,6 +1297,7 @@ Notes:
 | `TArray<int32> Rolls = {UKismetMathLibrary::RandomInteger(3)};` | Refused: every element of a default must be known when the mod is built. See [Classes and variables](#classes-and-variables). | Refused |
 | `TArray<int32> L = {4, 5, 6};` in a function | The Make Array node: a temporary filled at once, made afresh each time the code runs. | Yes |
 | `TSet<int32> S = {1, 2};`, `TMap<int32, float> M = {{1, 0.5f}};` in a function | Make Set and Make Map. | Yes |
+| `Items = {};`, `Count({})`, `TArray<int32>()`, `return {};` in a function | An empty container: a Make Array (Set, Map) with no element. | Yes |
 
 ```cpp
 TArray<int32> Primes = {2, 3, 5};
@@ -3333,7 +3334,7 @@ not a C++ value, so point at it with `&`.
 |---|---|---|
 | `UMoodDef MD_Big = {.Health = -500.5f, .Title = "Big"};` | An asset of the class, cooked as `<mod package>/MD_Big`. Only the members the braces name are written, and the rest keep the class defaults. A member named with a zero value is still written. | Yes |
 | `UMoodDef MD_Plain = {};` | An asset with the class defaults only. | Yes |
-| `UMoodDef MD_Zero = {.Health = {}};` | `{}` for a member is its zero, written as `.Health = 0` is. | Yes |
+| `UMoodDef MD_Zero = {.Health = {}};` | `{}` for a member is its zero, written as `.Health = 0` is. A struct, container or name member's `{}` is written too: zeros, an empty container, None, or a `UE_STRUCT`'s own defaults, not the class default. | Yes |
 | `UEnemyDescriptor ED_Mine = {.SpawnSpread = 250.0f, .IdealSpawnSize = 4};` | An asset of a game or engine class. | Yes |
 | `namespace Moods { UMoodDef Angry = {.Health = 50}; }` | A namespace is a folder: the asset is cooked at `<mod package>/Moods/Angry`. See [Mod sources and packages](#mod-sources-and-packages). | Yes |
 | `.Delay = FFloatInterval(1.0f, 5.0f)`, `.Delay = {2.0f, 6.0f}` | A struct member, by constructor or by braces, one value per member, as in any default. | Yes |

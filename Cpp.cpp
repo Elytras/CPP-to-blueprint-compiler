@@ -144,14 +144,34 @@ void ForEach(const Json& N, const F& Fn)
     for (const Json& C : *It) Fn(C);
 }
 
-/* What clang writes for a member the braces leave out; an aggregate member (a struct, a TArray) is a list of those. An
-   empty list is a `{}` written for a value that is not a struct: its zero, not the member's default. */
+/* Whether the source spells braced value E: its range runs from its `{` to its `}`. What clang makes up for a member
+   the braces leave out - a CXXConstructExpr with no argument for a class (FVector2D, a TArray), a list of its members'
+   values for an aggregate - lies on one point, the closing brace of the list it fills, begin and end alike, or has no
+   range at all (`[V]` on probes, positional and designated; the JSON says nothing else apart: both are `"list": true,
+   "zeroing": true`). A location in a macro is its spelling's, so `{}` written through a macro is spelled too. */
+bool IsSpelledBraces(const Json& E)
+{
+    const auto R = E.find("range");
+    if (R == E.end()) return false;
+    auto Offset = [&](const char* Side) {
+        const auto L = R->find(Side);
+        if (L == R->end()) return int64(-1);
+        const auto S = L->find("spellingLoc");
+        return (S == L->end() ? *L : *S).value("offset", int64(-1));
+    };
+    return Offset("begin") != Offset("end");
+}
+
+/* Whether E is what clang writes for a member the braces leave out: ImplicitValueInitExpr, CXXDefaultInitExpr, a
+   CXXConstructExpr with no argument for a class, or for an aggregate (a UE_STRUCT) a list of those. A `{}` written for
+   a member is a value - a fresh one of its type: zero, empty, None, a UE_STRUCT's own defaults - not the member's
+   default, though clang writes the same node for it, only at the braces (IsSpelledBraces). */
 bool IsUnsetInit(const Json& E)
 {
     const std::string K = Kind(E);
     if (K == "ImplicitValueInitExpr" || K == "CXXDefaultInitExpr") return true;
+    if ((K != "CXXConstructExpr" && K != "InitListExpr") || IsSpelledBraces(E)) return false;
     if (K == "CXXConstructExpr") return !First(E);
-    if (K != "InitListExpr" || !First(E)) return false;
     bool bAll = true;
     ForEach(E, [&](const Json& C) { bAll = bAll && IsUnsetInit(C); });
     return bAll;
@@ -4220,6 +4240,8 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
     {
         auto SI = Structs.find(StripTypeKeywords(TypeOf(*N)));
         if (SI != Structs.end()) return LowerStructLiteral(*N, SI->second, BP, Out, Err);
+        /* `{}` or `TArray<int32>()` as a value: an empty container, a Make Array (Set, Map) with no element. */
+        if (!First(*N) && IsContainerType(TypeOf(*N))) return LowerContainerLiteral(*N, TypeOf(*N), BP, Out, Err);
     }
     /* `T()` of an aggregate - a struct with no constructor declared, which is what lets it take `{ .A = 1 }`. */
     if (const FRecord* R = K == "CXXScalarValueInitExpr" ? Find(StripTypeKeywords(TypeOf(*N))) : nullptr; R && R->bIsStruct)
@@ -13778,7 +13800,7 @@ private:
 
 /* Builds the DOM of clang's AST dump as it streams in, without what nothing reads: source locations (all but a
    DeclRefExpr's or MemberExpr's range begin offset and token length, and its end's in a macro, see NamedQualifier and
-   MemberQualifier), mangled names, a record's definitionData and
+   MemberQualifier, and a braced value's whole range, see IsUnsetInit), mangled names, a record's definitionData and
    a few flags are most of the dump, and building them was most of a compile. A key read later must be in neither
    DroppedAstKey nor key()'s own rules. */
 class FAstSax : public nlohmann::json_sax<Json>
@@ -13793,7 +13815,9 @@ public:
     bool number_float(number_float_t V, const string_t&) override { return Value(V); }
     bool string(string_t& V) override
     {
-        if (bKindNext && !Skipped) DeclRef.back() = V == "DeclRefExpr" || V == "MemberExpr";   // "kind" comes before "range"
+        if (bKindNext && !Skipped)          // "kind" comes before "range"
+            Ranged.back() = V == "DeclRefExpr" || V == "MemberExpr" ? ERange::Begin
+                          : V == "InitListExpr" || V == "CXXConstructExpr" ? ERange::Whole : ERange::None;
         return Value(std::move(V));
     }
     bool binary(binary_t& V) override { return Value(std::move(V)); }
@@ -13804,16 +13828,18 @@ public:
     bool key(string_t& K) override
     {
         if (Skipped) return true;
-        /* A spellingLoc only gets here inside a DeclRefExpr's or MemberExpr's range (every other loc and range is skipped whole); the
-           range's end is kept only then, for a qualifier written in a macro (NamedQualifier). */
+        /* A spellingLoc only gets here inside a range kept (every other loc and range is skipped whole). A DeclRefExpr's
+           or MemberExpr's end is kept only for a qualifier written in a macro (NamedQualifier); a braced value's, always:
+           IsUnsetInit tells a `{}` written from a member the braces leave out by it. */
         const bool bMacroEnd = K == "end" && Stack.back()->is_object() && Stack.back()->contains("begin")
                             && (*Stack.back())["begin"].contains("spellingLoc");
+        const bool bWholeEnd = K == "end" && Ranged.size() >= 2 && Ranged[Ranged.size() - 2] == ERange::Whole;
         /* A variable's use flags stay: Run refuses a used UE_ASSET_AT that cannot load. A method's isImplicit stays: the
            operator= clang declares up front in a class with a virtual is no Blueprint function. "kind" comes before them. */
-        bSkipNext = (bFrozenKeys ? FrozenDroppedAstKey(K) : DroppedAstKey(K)) || (K == "end" && !bMacroEnd)
+        bSkipNext = (bFrozenKeys ? FrozenDroppedAstKey(K) : DroppedAstKey(K)) || (K == "end" && !bMacroEnd && !bWholeEnd)
                  || (K == "isImplicit" && Stack.back()->value("kind", std::string()) != "CXXMethodDecl")
                  || ((K == "isUsed" || K == "isReferenced") && Stack.back()->value("kind", std::string()) != "VarDecl")
-                 || (K == "range" && !DeclRef.back());
+                 || (K == "range" && Ranged.back() == ERange::None);
         bKindNext = K == "kind";
         if (!bSkipNext) Slot = &(*Stack.back())[std::move(K)];
         return true;
@@ -13821,10 +13847,13 @@ public:
     bool parse_error(size_t, const std::string&, const nlohmann::detail::exception&) override { return false; }
 
 private:
+    /* What of an open node's range is kept: none, its begin (a DeclRefExpr or MemberExpr), or the whole range (a braced
+       value: an InitListExpr or CXXConstructExpr). */
+    enum class ERange : uint8 { None, Begin, Whole };
     Json& Root;
     const bool bFrozenKeys;         // astcheck's reference parse
     std::vector<Json*> Stack;       // the open objects and arrays being filled
-    std::vector<bool> DeclRef;      // per open object or array: a DeclRefExpr, whose range is kept
+    std::vector<ERange> Ranged;     // per open object or array: what of its range is kept
     Json* Slot = nullptr;           // the object member the last key named
     int32 Skipped = 0;              // depth inside a dropped object or array
     bool bSkipNext = false;         // the next value is a dropped key's
@@ -13845,14 +13874,14 @@ private:
     bool Open(Json::value_t T)
     {
         if (Skipped || bSkipNext) ++Skipped;
-        else { Stack.push_back(Place(Json(T))); DeclRef.push_back(false); }
+        else { Stack.push_back(Place(Json(T))); Ranged.push_back(ERange::None); }
         bSkipNext = bKindNext = false;
         return true;
     }
     bool Close()
     {
         if (Skipped) --Skipped;
-        else { Stack.pop_back(); DeclRef.pop_back(); }
+        else { Stack.pop_back(); Ranged.pop_back(); }
         return true;
     }
 };

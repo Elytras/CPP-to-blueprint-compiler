@@ -720,9 +720,10 @@ Full rules: [Replication](REFERENCE.md#replication), [RPCs](REFERENCE.md#rpcs). 
 The game's structs are ordinary types. `FVector(1, 2, 3)` makes one value, a literal when its members are constants or
 variables, and the editor's Make Struct when one computes something (`FVector2D(X, M ? 1.0f : 2.0f)`), each member then
 its own statement, left to right. Braces, positional or with designated members, are the editor's Make Struct:
-`FHitResult Hit = { .Time = 0.5f };`. Members the braces leave out keep their defaults. Member reads and writes, nested
-to any depth, act on the struct in place. A struct of your own carries `UE_STRUCT;` in its body. It is cooked as a
-Structure asset in the mod package, and its members' initializers are its default values.
+`FHitResult Hit = { .Time = 0.5f };`. Members the braces leave out keep their defaults; a member given `{}` is a fresh
+value of its type, as in C++: zero, empty, None. Member reads and writes, nested to any depth, act on the struct in
+place. A struct of your own carries `UE_STRUCT;` in its body. It is cooked as a Structure asset in the mod package, and
+its members' initializers are its default values.
 
 An enum of your own is an `enum class` with a `uint8`, `int32` or `int64` underlying type, followed by `UE_ENUM(Name);`.
 It is cooked as an Enumeration asset and then works like any Blueprint enum: variables, parameters, constants and

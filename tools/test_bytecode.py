@@ -6535,7 +6535,11 @@ def value_init_scalar():
     UE_STRUCT (`{}` there is the member's zero, not its default), and as the default of a member and of a UE_STRUCT
     member (a zero one writes no tag on the class default object; a UserDefinedStruct's default instance tags every
     member: with no defaults to diff against, Class.cpp 1547 writes each), and as a braced asset's value, where `{}` is
-    written as the zero it is. A UE_STRUCT's `T()` default is its defaults."""
+    written as the zero it is. A UE_STRUCT's `T()` default is its defaults.
+    A `{}` for a member of a class type - an engine struct, a TArray, an FName, a UE_STRUCT - is that type's fresh value
+    too, not the member's default: in a function body (where the UE_STRUCT's frame local starts as its default instance,
+    UUserDefinedStruct::InitializeStruct, so a member left unstored would read its default), in a class default and in
+    a braced asset. An empty container is a value: assigned, passed, constructed and returned."""
     import struct
     base = asset('ValueInitScalar')
     keeps_invariants(base)
@@ -6545,6 +6549,13 @@ def value_init_scalar():
         for m in (0, 3):
             got = run(base, fn, {'Held': 1}, M=m)[0]
             assert got == want + m, 'ValueInitScalar.%s(%d) = %r, want %r' % (fn, m, got, want + m)
+    for fn, want in (('NativeBraces', lambda m: 10 * m), ('NativeDesig', lambda m: 10 * m),
+                     ('NativeOmit', lambda m: 10 * m + 2), ('NativeMacro', lambda m: 10 * m), ('NativeArray', lambda m: m),
+                     ('NativeNested', lambda m: 12 + m),
+                     ('NativeName', lambda m: True), ('EmptyAssign', lambda m: m), ('EmptyArg', lambda m: m)):
+        for m in (0, 3):
+            got = run(base, fn, {'Items': [1, 2]}, M=m)[0]
+            assert got == want(m), 'ValueInitScalar.%s(%d) = %r, want %r' % (fn, m, got, want(m))
     assert run(base, 'FloatBraces', F=2.0)[0] == 3.5 and run(base, 'BoolBraces', M=1)[0] is False
     assert run(base, 'ObjBraces', M=0)[0] == 1 and run(base, 'ObjAssign', {'Seen': None}, M=0)[0] == 1
     pkg = invariants.Package(base)
@@ -6568,9 +6579,27 @@ def value_init_scalar():
     assert set(named) == {'Count', 'Rule'} and struct.unpack('<i', named['Count']['value'])[0] == 0, named
     assert fname_at(asset_pkg.names, named['Rule']['value'], 0) == 'eattachmentrule::keeprelative', named['Rule']
 
+    def fresh(pkg, i, tags, where):
+        """V zero, L empty, In FValueIn's own defaults (1, 2), N None: each `{}` of the value tagged in tags."""
+        inner = {u['name'].split('_')[0]: u for u in pkg.tags(i, tags['In']['at'])}
+        assert struct.unpack('<ff', tags['V']['value']) == (0.0, 0.0), (where, tags['V'])
+        assert struct.unpack('<i', tags['L']['value'][:4])[0] == 0, (where, tags['L'])
+        assert [struct.unpack('<i', inner[n]['value'])[0] for n in ('P', 'Q')] == [1, 2], (where, inner)
+        assert fname_at(pkg.names, tags['N']['value'], 0) == 'none', (where, tags['N'])
+    held = {u['name'].split('_')[0]: u for u in pkg.tags(cdo, pkg.tag(cdo, 'NativeHeld')['at'])}
+    assert struct.unpack('<i', held['A']['value'])[0] == 7, held['A']
+    fresh(pkg, cdo, held, 'NativeHeld')
+    native = invariants.Package(os.path.join(os.path.dirname(base), 'VN_Braces'))
+    named = {t['name']: t for t in native.tags(native.find('VN_Braces'))}
+    assert set(named) == {'Count', 'V', 'L', 'In', 'N'}, named
+    fresh(native, native.find('VN_Braces'), named, 'VN_Braces')
+    omit = invariants.Package(os.path.join(os.path.dirname(base), 'VN_Omit'))
+    assert [t['name'] for t in omit.tags(omit.find('VN_Omit'))] == ['Count'], 'a member VN_Omit leaves out is written'
+
 
 value_init_scalar()
-print('ok  ValueInitScalar: braces or T() around an enum, a number or a pointer are its zero, or the value braced')
+print('ok  ValueInitScalar: braces or T() around an enum, a number or a pointer are its zero, or the value braced; '
+      '{} for a struct, container or name member is its fresh value, not the default; an empty container is a value')
 
 
 # -- pending
