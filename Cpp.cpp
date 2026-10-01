@@ -13149,13 +13149,24 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
        CannotImplementInterfaceInBlueprint (HeaderParser.cpp:7538).
        A function the class inherits from a class above this source cooks implements it in C++, and a stub would
        replace that body for every caller: SynthesizeForwarders declared an override calling it in its place wherever
-       one can, and the class is refused where none can. */
+       one can, and the class is refused where none can.
+       A static is refused for another reason. It implements no interface function and its callers are bound to it, so
+       a stub would take over none of them; but the editor makes any function of its name in a subclass, the stub or
+       one the source declares, an override of it (its super is ParentClass->FindFunctionByName, KismetCompiler.cpp
+       1733-1774) and refuses one that is not static: "Check flags: Exec, Final, Static" (1855-1868). */
     auto ReplacesInherited = [&](const std::string& I, const std::string& Fn) {
         const FRecord* A = InheritedImplementation(R, Fn);
         const std::string Why = A ? WhyNotForwarded(*A, Fn) : std::string();
         if (Why.empty()) return false;
-        *Err = R.CppName + " implements " + I + ", and the " + A->CppName + "::" + Fn + " it inherits is " + Why
-             + ": no override can call it for " + I + ", and an empty one would replace it; declare " + R.CppName + "::" + Fn;
+        if (IsStaticDecl(*A->Methods.at(Fn)))
+            *Err = R.CppName + " implements " + I + ", whose " + Fn + " needs a function of that name in " + R.CppName
+                 + ", and the " + A->CppName + "::" + Fn + " it inherits is static: the editor takes such a function for "
+                   "an override of the static and refuses it (\"Check flags: Exec, Final, Static\"); rename "
+                 + A->CppName + "::" + Fn;
+        else
+            *Err = R.CppName + " implements " + I + ", and the " + A->CppName + "::" + Fn + " it inherits is " + Why
+                 + ": no override can call it for " + I + ", and an empty one would replace it; declare " + R.CppName
+                 + "::" + Fn;
         return true;
     };
     for (const std::string& Listed : R.Interfaces)

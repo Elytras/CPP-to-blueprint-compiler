@@ -4742,6 +4742,14 @@ refused('FuncIfaceMulticast', '', 'the IfmRoot::Ping it inherits is a multicast'
             'class IfmRoot : public AActor {\npublic:\n  int32 Seen = 0;\n  UE_MULTICAST void Ping() { Seen = 1; }\n};\n'
             'class IfmKid : public IfmRoot, public IIfmPing {\npublic:\n};\n')
 print('ok  FuncIfaceMulticast: an interface function inherited as a multicast, which no override can call, is refused')
+# A static of that name: the class's function of that name, the stub too, is an override of the static to the editor
+# (its super is ParentClass->FindFunctionByName), which refuses a non-static one ("Check flags: Exec, Final, Static").
+refused('FuncIfaceStatic', '', 'the FsRoot::Tell it inherits is static: the editor takes such a function for an override '
+        'of the static and refuses it',
+        top='class IFsTell {\npublic:\n  UE_INTERFACE;\n  int32 Tell(int32 V);\n};\n'
+            'class FsRoot : public AActor {\npublic:\n  static int32 Tell(int32 V) { return V + 1; }\n};\n'
+            'class FsKid : public FsRoot, public IFsTell {\npublic:\n  int32 Ask() { return FsRoot::Tell(4); }\n};\n')
+print('ok  FuncIfaceStatic: an interface function inherited as a static is refused, as the editor refuses its override')
 
 
 def func_template_call():
@@ -4763,21 +4771,6 @@ def func_template_call():
 
 func_template_call()
 print('ok  FuncTemplateCall: an unqualified call in a member template goes by name from each class it is copied into')
-
-
-def func_iface_static():
-    """FuncIfaceStatic implements IFsTell and inherits a static Tell from FsRoot, which implements no interface function
-    and which a call reaches only bound (FUNC_Static | FUNC_Final): the class gets the empty stub every function left
-    out gets (Tell returns 0), and FsRoot::Tell(4) is still FsRoot's (5)."""
-    kid = pending_asset('FuncIfaceStatic')
-    chain = [kid, os.path.join(os.path.dirname(kid), 'FsRoot')]
-    keeps_invariants(kid)
-    assert 'Tell' in exports_of(kid), exports_of(kid)
-    got = run_as(chain, 'Tell', {}, V=2), run_as(chain, 'Ask', {})
-    assert got == (0, 5), 'Tell(2), Ask() on a FuncIfaceStatic returned %r, %r' % got
-
-
-pending('FuncIfaceStatic: an interface function an ancestor has only as a static gets the empty stub', func_iface_static)
 
 
 def ns_parent_call():
