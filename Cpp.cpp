@@ -712,6 +712,7 @@ struct FStructInfo
 };
 
 bool IsVmConstant(const FArgIR& A);
+bool IsZeroConstant(const FArgIR& A);
 bool SteppedInPlace(const FArgIR& A);
 
 /* Each index into SI.Fields EX_StructConst writes, in the order it writes them. */
@@ -3165,8 +3166,8 @@ bool FCompiler::ZeroArg(const std::string& Type, FBlueprintClass& BP, FArgIR& Ou
 /* `FVector(1, 2, 3)`: EX_StructConst wants one value per reflected field, in property order, so
    only a struct whose every field is known can be written; argless means all zeros. The arguments come in C++'s order
    (a super's members first) and go out in PropertyLink's (StructConstOrder); one for a Transient member has nowhere to
-   go, execStructConst skipping that member, so a constant there is dropped with a warning. A literal with any other
-   member, or a computed value for a Transient one, is the editor's Make Struct instead (LowerStructByMembers). */
+   go, execStructConst skipping that member, so only a zero can stay there. A literal with any other member, or any
+   other value for a Transient one, is the editor's Make Struct instead (LowerStructByMembers). */
 bool FCompiler::LowerStructLiteral(const Json& CtorNode, const FStructInfo& SI, FBlueprintClass& BP,
                                    FArgIR& Out, std::string* Err)
 {
@@ -3195,19 +3196,14 @@ bool FCompiler::LowerStructLiteral(const Json& CtorNode, const FStructInfo& SI, 
        read what it has just written, a call there may read the destination too, and a `?:` or an inline call needs
        statements of its own, which nothing would hoist out of the literal. The editor writes a literal for constants
        only, and a Make Struct for the rest: through a temp, one statement per member, left to right as C++ runs a braced
-       list. A Transient member's computed value can be set there too. */
+       list. A Transient member's value, computed or a constant other than its zero, is set there too: the literal
+       would drop it (execStructConst skips the member), so whether it counted would hang on another member. A zero
+       stays in a literal, which leaves the member as the destination holds it. */
     bool bInPlace = true;
     for (size_t I = 0; I < Given.size(); ++I)
         bInPlace = bInPlace && (std::find(Order.begin(), Order.end(), I) != Order.end() ? SteppedInPlace(Given[I])
-                                                                                        : IsVmConstant(Given[I]));
+                                                                                        : IsZeroConstant(Given[I]));
     if (!bInPlace) return LowerStructByMembers(T, SI, Given, BP, Out, Err);
-    for (size_t I = 0; I < Given.size(); ++I)
-    {
-        if (std::find(Order.begin(), Order.end(), I) != Order.end()) continue;
-        const std::string& Member = SI.Fields[I].second;
-        printf("  warning: %s::%s: %s::%s is Transient, which a struct literal does not set (execStructConst skips it): "
-               "the value given for it is dropped\n", Cur ? Cur->CppName.c_str() : "", CurFnName.c_str(), T.c_str(), Member.c_str());
-    }
     for (size_t I : Order) Out.Sub->Args.push_back(Given[I]);
     return true;
 }
@@ -3722,6 +3718,24 @@ bool IsVmConstant(const FArgIR& A)
         return A.Sub && std::all_of(A.Sub->Args.begin(), A.Sub->Args.end(), [](const FArgIR& M) { return IsVmConstant(M); });
     default:
         return false;
+    }
+}
+
+/* Whether A is a constant of its type's zero: 0, false, an empty string or text, None, a null object, or a literal of
+   such. */
+bool IsZeroConstant(const FArgIR& A)
+{
+    switch (A.K)
+    {
+    case FArgIR::Int: case FArgIR::Byte: return A.I == 0;
+    case FArgIR::Int64: return A.I64 == 0;
+    case FArgIR::Float: return A.F == 0.0f;
+    case FArgIR::Bool: return !A.B;
+    case FArgIR::Str: case FArgIR::Text: return A.S.empty();
+    case FArgIR::Name: return A.S.empty() || Lower(A.S) == "none";
+    case FArgIR::NullObj: return true;
+    case FArgIR::StructLit: return A.Sub && std::all_of(A.Sub->Args.begin(), A.Sub->Args.end(), IsZeroConstant);
+    default: return false;
     }
 }
 

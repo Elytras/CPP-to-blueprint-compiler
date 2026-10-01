@@ -5616,10 +5616,10 @@ iface_cast_slot()
 print('ok  IfaceCastSlot: Cast<IHealth> takes the object out of its 16-byte interface value')
 derived_literal('Angle', '/Script/Engine.LightmassDirectionalLightSettings')
 derived_literal('Output', '/Script/Engine.MaterialAttributesInput')
-assert 'FMaterialAttributesInput::PropertyConnectedBitmask is Transient' in LOGS['DerivedLiteral'], LOGS['DerivedLiteral']
+assert 'is Transient' not in LOGS['DerivedLiteral'], LOGS['DerivedLiteral']
 derived_literal('ResetHandle', '/Script/Engine.TimerHandle')
 print("ok  DerivedLiteral: a derived struct literal lists its own members before its super's, and leaves out Transient "
-      "ones (a value given for one is warned about); FTimerHandle() writes no member")
+      "ones (a zero given for one keeps the literal); FTimerHandle() writes no member")
 
 
 def struct_lit_expr():
@@ -5655,7 +5655,7 @@ def transient_const():
     """A non-zero constant for a native struct literal's Transient member makes the Make Struct a computed one does,
     which sets it: execStructConst skips the member (ScriptCore.cpp 3376-3405), so a literal of constants would drop the
     value, and whether it counted would hang on another member. A zero there stays a literal, with no warning."""
-    base = pending_asset('TransientConst')
+    base = asset('TransientConst')
     keeps_invariants(base)
     for m in (0, 1):
         got = VM(base).call('AllConst', M=m)
@@ -5663,7 +5663,9 @@ def transient_const():
     assert 'is Transient' not in LOGS['TransientConst'], LOGS['TransientConst']
 
 
-pending('TransientConst: a non-zero constant for a Transient member of a struct literal is set', transient_const)
+transient_const()
+print('ok  TransientConst: a non-zero constant for a Transient member makes the Make Struct, which sets it; a zero keeps '
+      'the literal')
 
 
 def local_by_address():
