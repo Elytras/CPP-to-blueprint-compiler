@@ -310,17 +310,26 @@ class CompilePrefetch:
         if stop: stop(lambda: self.pool.shutdown(wait=False, cancel_futures=True))
         digests = {}
         for entry in self.previous:
-            if _stageable(entry):
-                self.waiting.setdefault(_compile_key(entry, digests), []).append(self.pool.submit(self._staged, entry))
+            try:
+                key = _compile_key(entry, digests) if _stageable(entry) else None
+            except Exception:       # a file beside its source held open by an editor or a scanner: not staged
+                key = None
+            if key: self.waiting.setdefault(key, []).append(self.pool.submit(self._staged, entry))
 
     def compile(self, args, cwd=None):
         cmd = [ASSETGEN, 'compile'] + list(args)
         if self.started and not self.finished:
             self.calls += 1
-            entry = _compile_entry(args, cwd)
+            # The entry and key read every file beside the source. One held open by an editor or a scanner makes this
+            # compile what it was before the prefetch: made directly, and not recorded.
+            try:
+                entry = _compile_entry(args, cwd)
+                key = _compile_key(entry) if entry is not None and self.pool else None
+            except OSError:
+                entry = key = None
             if entry is not None:
                 self.record.append(entry)
-                proc = self._prefetched(cmd, entry, args)
+                proc = self._prefetched(cmd, entry, key, args) if key else None
                 if proc is not None: return proc
         return subprocess.run(cmd, capture_output=True, encoding='utf-8', cwd=cwd)
 
@@ -352,10 +361,11 @@ class CompilePrefetch:
             res['usable'] = False
         return res
 
-    def _prefetched(self, cmd, entry, args):
-        """The prefetched result of entry's compile, moved into place; None when there is none to take: never queued,
-        still queued (cancelled: compiling here costs the same, and is the real thing), or its outputs' places taken."""
-        futures = self.waiting.get(_compile_key(entry)) if self.pool else None
+    def _prefetched(self, cmd, entry, key, args):
+        """The prefetched result of entry's compile (key: _compile_key's), moved into place; None when there is none to
+        take: never queued, still queued (cancelled: compiling here costs the same, and is the real thing), or its
+        outputs' places taken."""
+        futures = self.waiting.get(key)
         if not futures: return None
         future = futures.pop(0)
         if future.cancel(): return None
