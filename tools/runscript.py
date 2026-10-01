@@ -137,8 +137,9 @@ def script_of(base, function):
 
 def params_of(base, function, flag=0x80):
     """The function's parameters in order, the return value left out, read off dumpstruct.py's property lines.
-    flag=0x100 (CPF_OutParm): only its reference parameters. A parameter the source left unnamed is cooked with an
-    empty name and listed as '': the VM fills a callee's parameters by their order, so it keeps its place."""
+    flag=0x100 (CPF_OutParm): only its reference parameters. A parameter with an empty name (an unnamed one, as
+    AssetGen cooked it before it named such a parameter P<index>) is listed as '': the VM fills a callee's parameters
+    by their order, so it keeps its place."""
     import re
     exports = dumpexp.load(base)[5]
     idx = next(i for i, e in enumerate(exports) if e['name'] == function)

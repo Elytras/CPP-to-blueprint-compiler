@@ -1978,6 +1978,7 @@ written inside the class does not make a method inline. Only the `inline` keywor
 |---|---|---|
 | `int32 AddCharges(int32 By) { ... }` | A Blueprint function, Public and BlueprintCallable. An editor Blueprint can call it, and an editor subclass can override it. | Yes |
 | `void Refill(int32 Amount);` and `void AMyActor::Refill(...) { ... }` | The same function, defined outside the class or in a `.cpp` beside the header. The definition gives the body and parameters; the declaration gives `static` and the access. | Yes |
+| `int32 Pick(int32, int32 B)` | A parameter left unnamed is cooked as `P<its index>` (`P0` here; `_` is added while another parameter has that name), as the editor names every pin. Callers pass it in its place. | Yes |
 | `int32 GetCharges() const` | A const Blueprint function, as a UFUNCTION declared const would be. | Yes |
 | `UE_PURE int32 Doubled() const` | A pure function: the editor draws it as a node without exec pins. Each C++ call runs once, where it is written. An editor pure node, by contrast, runs again for each use. | Yes |
 | `UE_PURE static int32 Clamp01(int32 V)` | A pure static function. | Yes |

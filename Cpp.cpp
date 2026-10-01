@@ -11339,10 +11339,18 @@ bool FCompiler::LowerParams(const Json& M, const std::string& Fn, FBlueprintClas
 {
     CurrentOutParms.clear();
     bool bOk = true;
+    /* A parameter the source leaves unnamed is named P<its index>, `_` added while another has that name, as the
+       editor names every pin and SynthesizeForwarders names the override's: an empty name is None once loaded, and
+       two such parameters would share it. No body reads it, and callers fill parameters by order. */
+    const std::vector<std::string> Given = ParmNames(M);
+    size_t Index = 0;
     ForEach(M, [&](const Json& C) {
         if (Kind(C) != "ParmVarDecl" || !bOk) return;
         std::string Type = TypeOf(C);
-        const std::string PName = Name(C);
+        std::string PName = Name(C);
+        if (PName.empty())
+            for (PName = "P" + std::to_string(Index); std::count(Given.begin(), Given.end(), PName);) PName += "_";
+        ++Index;
         bool bOutParm = false;
         while (!Type.empty() && (Type.back() == '&' || Type.back() == ' ' || Type.back() == '\t'))
         {

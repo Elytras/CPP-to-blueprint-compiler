@@ -5251,14 +5251,17 @@ def parm_unnamed():
     """ParmUnnamed: a parameter the source leaves unnamed is cooked under the name the editor's pin and AssetGen's
     override give it, P<index> (`_` added while another parameter has that name), not as an empty name, None once
     loaded, which two of them in one function would share. The calls still pass each argument in its place."""
-    base = pending_asset('ParmUnnamed')
+    base = asset('ParmUnnamed')
     keeps_invariants(base)
     assert runscript.params_of(base, 'Pick') == ['P0', 'B'], runscript.params_of(base, 'Pick')
     assert runscript.params_of(base, 'Both') == ['P0', 'P1'], runscript.params_of(base, 'Both')
     assert run_as([base], 'Use', {}) == 64
+    root = os.path.join(os.path.dirname(asset('FuncIfaceUnnamed')), 'FiuRoot')
+    assert runscript.params_of(root, 'Tell') == ['P0_', 'P0'], runscript.params_of(root, 'Tell')
 
 
-pending('ParmUnnamed: an unnamed parameter is cooked as P<index>', parm_unnamed)
+parm_unnamed()
+print('ok  ParmUnnamed: an unnamed parameter is cooked as P<index>, as the editor names the pin')
 
 
 def func_own_iface_final():
