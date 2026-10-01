@@ -9536,13 +9536,14 @@ its left, a call's object before its arguments, a braced list's members in order
 would run after the one and before the other, and the comma stays where it is (LowerArg refuses it). Beside it, as
 another argument of the same call or the other operand of an arithmetic operator, C++ fixes no order: the whole
 operand holding the comma may run first, so where a sibling is not a fixed value that operand moves to a temporary
-first (`F(G(), (Bump(), M))` is `T = (Bump(), M); F(G(), T)`), unless the operand is the comma itself and both its
-right side and the siblings only read (IsEagerSafe), where reading the right side after the siblings changes nothing.
-A comma whose value is written or bound to a non-const reference cannot move to a temporary; its right side then has
-to be a variable, which names the same place wherever it is read. A loop's condition reruns it every trip and is not
-looked at here. A plain assignment used as a value, `A = B = E` or `F(B = 1)`, is the comma `(B = E, B)`: the
-assignment runs as a statement, then its left side is read again, which must be a plain variable to give the same place. Returns 1 with Seq set, 0 for a statement with no such comma, -1 with Err set for one that cannot
-move.
+first (`F(G(), (Bump(), M))` is `T = (Bump(), M); F(G(), T)`), unless the operand is the comma itself and both its right side and the siblings only read (IsEagerSafe), where reading
+the right side after the siblings changes nothing. A comma whose value is written or bound to a reference, `const T&`
+included, cannot move to a temporary: the callee reads the place when it runs, after every argument, and a temporary
+would hold what it held before them. Its right side then has to be a variable, which names the same place wherever it
+is read, and only the left side moves. A loop's condition reruns it every trip and is not looked at here. A plain
+assignment used as a value, `A = B = E` or `F(B = 1)`, is the comma `(B = E, B)`: the assignment runs as a statement,
+then its left side is read again, which must be a plain variable to give the same place. Returns 1 with Seq set, 0
+for a statement with no such comma, -1 with Err set for one that cannot move.
 */
 int32 FCompiler::HoistComma(const Json& Stmt, Json* Seq, std::string* Err)
 {
@@ -9668,14 +9669,11 @@ int32 FCompiler::HoistComma(const Json& Stmt, Json* Seq, std::string* Err)
     else if (K.size() > 4 && K.compare(K.size() - 4, 4, "Stmt") == 0) return 0;
     else if (K.find("Decl") != std::string::npos || !Seek(Plain, true)) return 0;
 
-    /* What a node's place makes of it: its value read (a copy, a const view, an operator's operand), or the place itself,
-       written or bound to a reference - which a temporary would not be. */
-    auto ValueUse = [&](const Json& N, const Json* Parent) {
-        const std::string Cat = N.value("valueCategory", std::string());
-        if (Cat != "lvalue" || Kind(N) == "MaterializeTemporaryExpr" || TypeOf(N).compare(0, 6, "const ") == 0) return true;
-        if (!Parent) return false;
-        const std::string PK = Kind(*Parent), Cast = Parent->value("castKind", std::string());
-        return (PK == "ImplicitCastExpr" && (Cast == "LValueToRValue" || Cast == "NoOp")) || PK == "CXXConstructExpr";
+    /* What an operand's place makes of it: its value read (a copy, an operator's operand, a temporary bound to a
+       `const T&`), or the place itself, written or bound to a reference - a `const T&` too, which the callee reads
+       when it runs, after every argument, where a temporary would hold what the place held before them. */
+    auto ValueUse = [&](const Json& N) {
+        return N.value("valueCategory", std::string()) != "lvalue" || Kind(N) == "MaterializeTemporaryExpr";
     };
     /* Down through wrappers only, from an operand to the comma. */
     auto JustTarget = [&](Json* N) {
@@ -9695,7 +9693,6 @@ int32 FCompiler::HoistComma(const Json& Stmt, Json* Seq, std::string* Err)
              "it: assign in a statement of its own, then use what it assigned"; return -1; }
     const std::string What = bAssign ? "an assignment used as a value" : "the comma operator";
     const Json* Moved = nullptr;
-    const Json* MovedParent = nullptr;
     for (auto L = Levels.rbegin(); L != Levels.rend() && !Moved; ++L)    // outermost first
         if (!L->bFixed)
         {
@@ -9703,13 +9700,14 @@ int32 FCompiler::HoistComma(const Json& Stmt, Json* Seq, std::string* Err)
             const Json& In = (*L->Parent)["inner"];
             for (size_t I = L->From; I < In.size(); ++I)
                 if (&In[I] != L->Child && !IsFixedOperand(In[I])) bSiblingsRead = bSiblingsRead && IsEagerSafe(In[I]);
-            if (!(JustTarget(L->Child) && IsEagerSafe(Right) && bSiblingsRead)) { Moved = L->Child; MovedParent = L->Parent; }
+            if (!(JustTarget(L->Child) && IsEagerSafe(Right) && bSiblingsRead)) Moved = L->Child;
         }
-    if (Moved && !ValueUse(*Moved, MovedParent))
+    if (Moved && !ValueUse(*Moved))
     {
         if (!(JustTarget(const_cast<Json*>(Moved)) && IsEagerSafe(Right)))
-        { *Err = What + " here is written to or bound to a reference, beside something that may run before it, and its "
-                 "right side is no variable: write its left side as a statement before this one"; return -1; }
+        { *Err = What + " here is written to or bound to a reference (a `T&` or `const T&` parameter), beside something "
+                 "that may run before it, and its right side is no variable: write its left side as a statement before "
+                 "this one"; return -1; }
         Moved = nullptr;
     }
     *Seq = Pre;

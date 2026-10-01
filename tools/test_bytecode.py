@@ -1032,7 +1032,7 @@ def comma_const_ref():
     """CommaConstRef: a comma or an assignment used as a value, bound to a `const T&` beside an argument that writes
     what it names, is that variable, which the callee reads after every argument: it sees the write (50) whichever
     order C++ picks. Assign's pairs: `B = M` before SetB (1050, B 50) or after it (1000 + M, B M)."""
-    base = pending_asset('CommaConstRef')
+    base = asset('CommaConstRef')
     keeps_invariants(base)
     for m in (0, 7, -3):
         for fn, legal in (('Struct', {(1050, 1)}), ('Int', {(1050, 1)}), ('Ahead', {(1050, 1)})):
@@ -1044,8 +1044,9 @@ def comma_const_ref():
         assert (got, me.get('B')) in {(1050, 50), (1000 + m, m)}, 'CommaConstRef.Assign(%d) = %r, B %r' % (m, got, me.get('B'))
 
 
-pending('CommaConstRef: a comma or an assignment bound to a const T& beside a writing argument is read as a copy made '
-        'before it', comma_const_ref)
+comma_const_ref()
+print('ok  CommaConstRef: a comma or an assignment bound to a const T& beside a writing argument is the variable, read '
+      'when the callee runs')
 
 
 def comma_ctor_default():
@@ -1064,6 +1065,13 @@ def comma_ctor_default():
 
 pending('CommaCtorDefault: a comma in a parenthesised constructor call is refused as a braced list\'s, and one beside '
         'a constant default argument is refused as beside an argument that may run first', comma_ctor_default)
+# Bound to a reference, `const T&` included, a comma whose right side is no variable cannot move into a temporary.
+refused('CommaConstSlot', '  int32 Count;\n  TArray<int32> L;\n  int32 Idx() { Count += 1; return 0; }\n'
+        '  int32 SetL() { L[0] = 50; return 1; }\n  int32 Peek(int32 X, const int32& V) { return X * 1000 + V; }\n'
+        '  int32 F(int32 M) { L = {M}; return Peek(SetL(), (Count += 1, L[Idx()])); }\n',
+        'the comma operator here is written to or bound to a reference (a `T&` or `const T&` parameter)')
+print('ok  CommaConstSlot: a comma bound to a const T& beside an argument that may run first, its right side no '
+      'variable, is refused by name')
 
 
 def expr_temps():
