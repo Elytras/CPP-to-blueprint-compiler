@@ -12873,8 +12873,20 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
    this same function, so the two cannot disagree.
    The contract: a key goes here only if FAstSax drops it in every context. A key it drops only in some (range, end,
    isImplicit, isUsed, isReferenced) stays in key()'s own rules, which see the tree built so far; the filter passes
-   those through. A key that anything reads later is in neither. */
+   those through. A key that anything reads later is in neither.
+   astcheck checks an edit here: its reference tree drops FrozenDroppedAstKey's keys instead. */
 bool DroppedAstKey(const std::string& K)
+{
+    return K == "loc" || K == "file" || K == "line" || K == "col" || K == "includedFrom" || K == "expansionLoc"
+        || K == "isMacroArgExpansion" || K == "mangledName" || K == "definitionData" || K == "typeAliasDeclId";
+}
+
+/* astcheck's frozen copy of DroppedAstKey, which its reference parse of the unfiltered dump drops in DroppedAstKey's
+   place. Were the reference to ask DroppedAstKey too, a key added there would vanish from both trees and astcheck would
+   print `same`, though the compile's tree had lost it: `range`, say, whose offsets NamedQualifier reads. So an edit to
+   DroppedAstKey shows up as a tree difference at that key until this copy gets the same edit, made on purpose once
+   the edit is known to be right (for a key added: nothing reads it, in any context). */
+bool FrozenDroppedAstKey(const std::string& K)
 {
     return K == "loc" || K == "file" || K == "line" || K == "col" || K == "includedFrom" || K == "expansionLoc"
         || K == "isMacroArgExpansion" || K == "mangledName" || K == "definitionData" || K == "typeAliasDeclId";
@@ -13000,7 +13012,8 @@ private:
 class FAstSax : public nlohmann::json_sax<Json>
 {
 public:
-    explicit FAstSax(Json& InRoot) : Root(InRoot) {}
+    /* bInFrozenKeys: drop FrozenDroppedAstKey's keys in DroppedAstKey's place, for astcheck's reference tree. */
+    FAstSax(Json& InRoot, bool bInFrozenKeys) : Root(InRoot), bFrozenKeys(bInFrozenKeys) {}
     bool null() override { return Value(nullptr); }
     bool boolean(bool V) override { return Value(V); }
     bool number_integer(number_integer_t V) override { return Value(V); }
@@ -13025,7 +13038,7 @@ public:
                             && (*Stack.back())["begin"].contains("spellingLoc");
         /* A variable's use flags stay: Run refuses a used UE_ASSET_AT that cannot load. A method's isImplicit stays: the
            operator= clang declares up front in a class with a virtual is no Blueprint function. "kind" comes before them. */
-        bSkipNext = DroppedAstKey(K) || (K == "end" && !bMacroEnd)
+        bSkipNext = (bFrozenKeys ? FrozenDroppedAstKey(K) : DroppedAstKey(K)) || (K == "end" && !bMacroEnd)
                  || (K == "isImplicit" && Stack.back()->value("kind", std::string()) != "CXXMethodDecl")
                  || ((K == "isUsed" || K == "isReferenced") && Stack.back()->value("kind", std::string()) != "VarDecl")
                  || (K == "range" && !DeclRef.back());
@@ -13037,6 +13050,7 @@ public:
 
 private:
     Json& Root;
+    const bool bFrozenKeys;         // astcheck's reference parse
     std::vector<Json*> Stack;       // the open objects and arrays being filled
     std::vector<bool> DeclRef;      // per open object or array: a DeclRefExpr, whose range is kept
     Json* Slot = nullptr;           // the object member the last key named
@@ -13226,10 +13240,11 @@ struct FAstSourceIt
     bool operator!=(const FAstSourceIt& O) const { return S != O.S; }
 };
 
-/* Builds the DOM of the dump Src reads into Out (FAstSax); false if the dump is not JSON. */
-bool ParseAst(FAstSource& Src, Json* Out)
+/* Builds the DOM of the dump Src reads into Out (FAstSax); false if the dump is not JSON. bFrozenKeys: astcheck's
+   reference tree, which drops FrozenDroppedAstKey's keys in DroppedAstKey's place. */
+bool ParseAst(FAstSource& Src, Json* Out, bool bFrozenKeys)
 {
-    FAstSax Sax(*Out);
+    FAstSax Sax(*Out, bFrozenKeys);
     return Src.Next() && Json::sax_parse(FAstSourceIt{ &Src }, FAstSourceIt{}, &Sax);
 }
 
@@ -13284,7 +13299,7 @@ bool ParseClangAst(const std::string& Cmd, const std::string& SourcePath, Json* 
     bool bParsed = false;
     const auto Parse = [&](IDumpChunks& Chunks) {
         FAstSource Src(Chunks, bFilter);
-        bParsed = ParseAst(Src, Out);
+        bParsed = ParseAst(Src, Out, false);
     };
     if (!RunClang(Cmd, SourcePath, Parse, Err)) return false;
     if (bParsed) return true;
@@ -13383,12 +13398,13 @@ std::string FilteredDump(const std::vector<std::string>& Dump, std::function<siz
     return Out;
 }
 
-/* FAstSax's tree of Dump, read in the pipe's 256 KB chunks; through the filter or, the fallback's way, not. */
-bool ParseInMemory(const std::vector<std::string>& Dump, bool bFilter, Json* Out)
+/* FAstSax's tree of Dump, read unfiltered (the fallback's way) in the pipe's 256 KB chunks. bFrozenKeys: the reference
+   tree, which drops FrozenDroppedAstKey's keys in DroppedAstKey's place. */
+bool ParseInMemory(const std::vector<std::string>& Dump, bool bFrozenKeys, Json* Out)
 {
     FMemChunks Chunks(Dump, [] { return size_t(256) << 10; });
-    FAstSource Src(Chunks, bFilter);
-    return ParseAst(Src, Out);
+    FAstSource Src(Chunks, false);
+    return ParseAst(Src, Out, bFrozenKeys);
 }
 
 /* The first place where trees A and B differ, as a JSON pointer and both sides, or nothing if they are the same.
@@ -13468,10 +13484,11 @@ std::optional<std::string> TreeDifference(const Json& A, const Json& B, uint64* 
 
 /* astcheck: proves on one dump that FDumpFilter changes nothing (DESIGN.md, "Compile time: the UeApi header cost").
    First, the filter's output must not depend on where the dump is cut: the pipe's 256 KB chunks, 7-byte chunks and
-   1 to 4096 bytes from a fixed-seed LCG must give the same bytes. Then FAstSax must build the same tree from the dump
-   and from the filter's output (TreeDifference). Prints `same` and the sizes, or the first difference; returns the
-   exit code. The dump, its filtered copy and a tree, then both trees, are in memory at once: about 1 GB for an FSD.h
-   mod, so run one at a time. */
+   1 to 4096 bytes from a fixed-seed LCG must give the same bytes. Then the tree a compile builds from the filter's
+   output must be the reference tree (TreeDifference): FAstSax's from the dump itself, but dropping FrozenDroppedAstKey's
+   keys, so that an edit to DroppedAstKey, which the filter and FAstSax both follow, shows up too. Prints `same` and the
+   sizes, or the first difference; returns the exit code. The dump, its filtered copy and a tree, then both trees, are
+   in memory at once: about 1 GB for an FSD.h mod, so run one at a time. */
 int CheckDumpFilter(std::vector<std::string> Dump)
 {
     uint64 RawBytes = 0;
@@ -13500,7 +13517,7 @@ int CheckDumpFilter(std::vector<std::string> Dump)
     /* Never freed, as in CompileToAssets: the process ends right after, and tearing a tree down takes longer. */
     Json& Unfiltered = *new Json;
     Json& FromFiltered = *new Json;
-    const bool bUnfiltered = ParseInMemory(Dump, false, &Unfiltered);
+    const bool bUnfiltered = ParseInMemory(Dump, true, &Unfiltered);
     std::vector<std::string>().swap(Dump);
     const uint64 FilteredBytes = Filtered.size();
     std::vector<std::string> FilteredPieces;
@@ -13518,6 +13535,12 @@ int CheckDumpFilter(std::vector<std::string> Dump)
     if (const std::optional<std::string> Where = TreeDifference(Unfiltered, FromFiltered, &Values))
     {
         printf("the trees differ at %s\n", Where->c_str());
+        /* A member only one tree has, whose key the two lists disagree on: DroppedAstKey was edited. */
+        const std::string Path = Where->substr(0, Where->find(" ("));
+        const std::string Key = Path.substr(Path.rfind('/') + 1);
+        if (DroppedAstKey(Key) != FrozenDroppedAstKey(Key))
+            printf("DroppedAstKey %s \"%s\" and astcheck's frozen copy does not: once that is known to be right, make "
+                   "the same edit to FrozenDroppedAstKey\n", DroppedAstKey(Key) ? "drops" : "keeps", Key.c_str());
         return 1;
     }
     printf("same (%llu values, %llu -> %llu bytes)\n", (unsigned long long)Values, (unsigned long long)RawBytes,

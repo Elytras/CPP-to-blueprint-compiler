@@ -84,8 +84,10 @@ def astcheck():
     """A compile throws away what its AST parser never reads before nlohmann lexes it (FDumpFilter, DESIGN.md "Compile
     time: the UeApi header cost"). `assetgen astcheck` proves that changes nothing on three dumps: an FSD.h mod's, a mod
     with a Game/ header and a GetSubsystem<T> instance, and tests/ast/Edge.cpp, the shapes a filter could get wrong. The
-    filter's output must be the same however the dump is cut, and parse to the same tree as the dump itself, which also
-    runs the unfiltered fallback's path. One at a time: each holds about 1 GB."""
+    filter's output must be the same however the dump is cut, and parse to the same tree as the dump itself, read the
+    unfiltered fallback's way. That reference read drops a frozen copy of DroppedAstKey's keys, not the list the filter
+    and the compile's parser share, so an edit to that list fails here too until the copy gets the same edit on purpose.
+    One at a time: each holds about 1 GB."""
     for src in ('FlowTest.cpp', 'SubsystemTest.cpp', os.path.join('ast', 'Edge.cpp')):
         proc = subprocess.run([ASSETGEN, 'astcheck', os.path.join(TESTS, src), UEAPI], capture_output=True, encoding='utf-8')
         assert proc.returncode == 0 and proc.stdout.startswith('same ('), '%s:\n%s%s' % (src, proc.stdout, proc.stderr)
