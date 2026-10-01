@@ -1021,6 +1021,7 @@ stays `E`, because an `E` variable cannot bind to a `TEnum<E>&`.
 | `Mood.Name()` | The enumerator's name as an FName, from `KismetNodeHelperLibrary::GetEnumeratorName` on EMood's UEnum. | Yes |
 | `Mood.String()` | Its display name as an FString, from `GetEnumeratorUserFriendlyName`: the label typed in the editor for a Blueprint enum. | Yes |
 | `.Name()` / `.String()` on an `int32` or `int64` enum | Refused ("a uint8 enum only"): the engine's two lookups take a uint8. | Refused |
+| `TMap<TEnum<EMood>, TSubclassOf<AActor>> Spawns;` | A map keyed by EMood, its value any type a map takes, a template too. | Yes |
 
 ```cpp
 TEnum<EMood> Mood = EMood::Angry;

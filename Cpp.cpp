@@ -82,6 +82,7 @@ const Json* Nth(const Json& N, size_t I)
 }
 
 std::string StripTypeKeywords(std::string T);
+bool IsTEnumType(std::string T);
 const Json* PeelLvalue(const Json* N);
 Json RefToLocal(const std::string& Name, const std::string& Type);
 
@@ -10174,8 +10175,24 @@ std::string StripTypeKeywords(std::string T)
         if (T.compare(0, strlen(Prefix), Prefix) == 0) T = T.substr(strlen(Prefix));
     while (!T.empty() && (T.back() == ' ' || T.back() == '\t')) T.pop_back();
     /* TEnum<E> (UeMeta.h) is E to everything but its two methods, which LowerArg reads off the unstripped type. */
-    if (T.size() > 7 && T.compare(0, 6, "TEnum<") == 0 && T.back() == '>') return StripTypeKeywords(T.substr(6, T.size() - 7));
+    if (IsTEnumType(T) && T.back() == '>') return StripTypeKeywords(T.substr(6, T.size() - 7));
     return T;
+}
+
+/* T is TEnum<E> itself, `const` and a reference aside: not a type that holds one (`TArray<TEnum<E>>`), nor a list of
+   template arguments that starts with one (`TEnum<A>, TSubclassOf<B>`, a TMap's as TemplateArg hands it on), whose
+   `>` closing the `TEnum<` is not the last. */
+bool IsTEnumType(std::string T)
+{
+    for (const char* Prefix : { "const ", "struct ", "class " })
+        if (T.compare(0, strlen(Prefix), Prefix) == 0) T = T.substr(strlen(Prefix));
+    while (!T.empty() && (T.back() == ' ' || T.back() == '\t' || T.back() == '&')) T.pop_back();
+    if (T.compare(0, 6, "TEnum<") != 0) return false;
+    int32 Depth = 0;
+    for (size_t I = 5; I < T.size(); ++I)
+        if (T[I] == '<') ++Depth;
+        else if (T[I] == '>' && --Depth == 0) return I + 1 == T.size();
+    return false;
 }
 
 /* The number a constant expression comes to: literals, enum constants, ConstVars, the constants inlined parameters
