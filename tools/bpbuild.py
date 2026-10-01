@@ -285,7 +285,7 @@ def write_vs_filters(bp):
             rows.append(("ClCompile", f, "Tests" if f.endswith("Test.cpp") else "Mods"))
         elif f.endswith(".h"):
             rows.append(("ClInclude", f, "Helpers"))
-    # A mod in its own folder (`ECD2A/`) gets a filter of its own under Mods (`Mods\ECD2A`), nested as the folders
+    # A mod in its own folder (`MyMod/`) gets a filter of its own under Mods (`Mods\MyMod`), nested as the folders
     # are. Its GUID is derived from the name, so a rewrite does not churn it.
     filters = list(VS_FILTERS)
     for root, dirs, files in os.walk(bp):
