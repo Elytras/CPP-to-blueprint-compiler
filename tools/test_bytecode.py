@@ -6026,11 +6026,28 @@ def comp_root_keep():
     print('ok  CompRootKeep: a subclass\'s first scene component attaches to the inherited root and keeps its transform')
 
 
+def comp_char_root():
+    """components.py's hierarchy(), the construction scs_names_distinct checks names against, is the one the engine
+    runs. CompCharRoot's SCS lists its DefaultSceneRoot node in RootNodes, and ExecuteScriptOnActor skips that node
+    when the actor has a root already (SimpleConstructionScript.cpp 648), as an ACharacter always does: its capsule
+    (Character.cpp 59), and failing that the first unattached native scene component (ActorConstruction.cpp 736-746).
+    UeApi marks no RootComponent subobject for ACharacter, since two of its subobjects fit the member."""
+    base = asset('CompCharRoot')
+    p, ci = class_pkg(base)
+    si, nodes, roots, dsr = comp.scs(p, ci)
+    assert dsr is not None and dsr in roots, 'CompCharRoot\'s SCS does not list DefaultSceneRoot in RootNodes'
+    built = [n.name for _, _, ns, _ in comp.hierarchy(p, ci)[0] for n in ns]
+    assert 'DefaultSceneRoot' not in built, 'hierarchy() builds %s on a character, whose capsule is its root' % built
+    keeps_invariants(base)
+    print('ok  CompCharRoot: the rules\' construction of a character skips its DefaultSceneRoot node, as the engine does')
+
+
 comp_tick()
 comp_tick_component()
 comp_tick_patch()
 comp_override_chain()
 comp_root_keep()
+comp_char_root()
 
 
 # ---- Pending: what AssetGen does not do yet
@@ -6051,24 +6068,6 @@ def comp_attach_inherited():
 
 
 pending('CompAttachInherited: an own component attached to an inherited Blueprint or native component', comp_attach_inherited)
-
-
-def comp_char_root():
-    """components.py's hierarchy(), the construction scs_names_distinct checks names against, is the one the engine
-    runs. CompCharRoot's SCS lists its DefaultSceneRoot node in RootNodes, and ExecuteScriptOnActor skips that node
-    when the actor has a root already (SimpleConstructionScript.cpp 648), as an ACharacter always does: its capsule
-    (Character.cpp 59), and failing that the first unattached native scene component (ActorConstruction.cpp 736-746).
-    UeApi marks no RootComponent subobject for ACharacter, since two of its subobjects fit the member."""
-    base = pending_asset('CompCharRoot')
-    p, ci = class_pkg(base)
-    si, nodes, roots, dsr = comp.scs(p, ci)
-    assert dsr is not None and dsr in roots, 'CompCharRoot\'s SCS does not list DefaultSceneRoot in RootNodes'
-    built = [n.name for _, _, ns, _ in comp.hierarchy(p, ci)[0] for n in ns]
-    assert 'DefaultSceneRoot' not in built, 'hierarchy() builds %s on a character, whose capsule is its root' % built
-    keeps_invariants(base)
-
-
-pending('CompCharRoot: the rules\' construction of a character skips its DefaultSceneRoot node', comp_char_root)
 
 
 # ---- Refusals: each of these would build a package the engine mishandles

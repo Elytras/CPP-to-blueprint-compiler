@@ -143,6 +143,15 @@ def native_root(path):
     return None
 
 
+def native_has_root(path):
+    """Whether an actor of native class `path` has a root component before any SCS runs: its constructor names one
+    (UeApi's RootComponent__UeSubobject), or it has a native scene component, the first unattached one of which
+    ExecuteConstruction makes the root (ActorConstruction.cpp 736-746). The second covers what the marker misses: UeApi
+    writes none where two subobjects fit the member, as for ACharacter, whose constructor roots the capsule (Character.cpp
+    59)."""
+    return bool(native_root(path) or any(native_is_scene(c) for c in (native_subobjects(path) or {}).values()))
+
+
 # ---- a Blueprint class, its parents and its SCS
 
 def bp_class(pkg):
@@ -251,7 +260,7 @@ def hierarchy(pkg, ci):
     ScsNode], [timeline names])], the native end's path and its default subobject names (None if unknown)."""
     links, native = chain(pkg, ci)
     subs = native_subobjects(native) if native else None
-    root = bool(native and native_root(native))
+    root = bool(native and native_has_root(native))
     out = []
     for p, i in reversed(links):
         nodes = executed(p, i, root)
