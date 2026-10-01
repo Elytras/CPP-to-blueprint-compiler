@@ -410,19 +410,22 @@ def main():
                     for old in api_manifest(api_dir):
                         if os.path.exists(old):
                             os.remove(old)
-            ok = True
-            for source in sources:
-                if not source.endswith(".cpp"):
-                    continue
-                cmd = [assetgen, "compile", source, ue_api, stage_content]
-                if api_content:
-                    cmd += ["--api", api_content]
-                if game_dir:
-                    cmd += ["--game", game_dir]
-                proc = subprocess.run(cmd)
-                if proc.returncode != 0:
-                    ok = False
-                    break
+            # One translation unit per mod: compiled apart, every .cpp would re-cook each class of the headers
+            # they share, the last one's copy winning with only its own bodies. So several .cpp files compile as
+            # a generated file that #includes them all - each still resolves its quoted includes from its own folder.
+            # ponytail: a unity build, so file-local names (static, anonymous namespaces) must not clash across files.
+            cpps = [s for s in sources if s.endswith(".cpp")]
+            unit = cpps[0]
+            if len(cpps) > 1:
+                unit = os.path.join(bp, "build", name, name + ".unity.cpp")
+                io.open(unit, "w", encoding="utf-8", newline="\n").write(
+                    "".join('#include "%s"\n' % os.path.abspath(s).replace("\\", "/") for s in cpps))
+            cmd = [assetgen, "compile", unit, ue_api, stage_content]
+            if api_content:
+                cmd += ["--api", api_content]
+            if game_dir:
+                cmd += ["--game", game_dir]
+            ok = subprocess.run(cmd).returncode == 0
             if not ok:
                 print("%-16s FAILED" % name)
                 failed.append(name)
