@@ -5180,6 +5180,9 @@ def static_over_static():
     one it hides, as FindFunctionByName gives it; of another, that super would carry other parameters, and it is
     refused."""
     assert re.search(r'warning: .*FuncStaticHide::Tell hides FshRoot::Tell', LOGS['FuncStaticHide']), LOGS['FuncStaticHide']
+    # UE_CLASS's StaticClass is declared in every class and compiled in none: no function hides another.
+    hid = [m for m, log in LOGS.items() if 'StaticClass hides' in log]
+    assert not hid, hid
     refused('StaticOverStaticSig', '', 'SssKid::Tell is static and hides SssRoot::Tell, a static of another signature',
             top='class SssRoot : public AActor {\npublic:\n  static int32 Tell(int32 V) { return V + 1; }\n};\n'
                 'class SssKid : public SssRoot {\npublic:\n  static float Tell(float V) { return V * 3; }\n'

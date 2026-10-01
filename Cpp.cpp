@@ -13727,9 +13727,13 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
            function, no BlueprintEvent, "cannot be overridden" (KismetCompiler.cpp 3312-3316). It splits no caller, so
            it compiles with a warning, its super the one it hides as FindFunctionByName gives it; but a super of other
            parameters is a link no editor makes (IsSignatureCompatibleWith, 1993-2011), so one of another signature is
-           refused. */
-        if (const auto [A, bAboveStatic] = FoundAbove(R, Fn.Name);
-            A && A->UePackage.compare(0, 8, "/Script/") != 0 && bAboveStatic && IsStaticDecl(*Fn.Decl))
+           refused. Only a function this class compiles counts: UE_CLASS's StaticClass is in every class, and no
+           UFunction.
+           `= 0` with no body anywhere is an empty function, like an interface's stub below: a subclass's version needs
+           it as its super, and a call by name on an object without one would not find a function (a Fatal). */
+        const bool bCompiled = (Fn.Body = BodyOf(R, Fn.Name, Fn.Def)) || Fn.Decl->value("pure", false);
+        if (const auto [A, bAboveStatic] = FoundAbove(R, Fn.Name); bCompiled && Fn.Name != "StaticClass"
+            && A && A->UePackage.compare(0, 8, "/Script/") != 0 && bAboveStatic && IsStaticDecl(*Fn.Decl))
         {
             const Json& Above = *A->Methods.at(Fn.Name);
             if (SignatureOf(Above) != SignatureOf(*Fn.Decl))
@@ -13744,9 +13748,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                    "names; the editor refuses a function named like its parent's (\"cannot be overridden\")\n",
                    R.CppName.c_str(), Fn.Name.c_str(), A->CppName.c_str(), Fn.Name.c_str());
         }
-        /* `= 0` with no body anywhere is an empty function, like an interface's stub below: a subclass's version needs
-           it as its super, and a call by name on an object without one would not find a function (a Fatal). */
-        if ((Fn.Body = BodyOf(R, Fn.Name, Fn.Def)) || Fn.Decl->value("pure", false)) Methods.push_back(Fn);
+        if (bCompiled) Methods.push_back(Fn);
     }
     /* The editor compiles every Blueprint-implementable function of an implemented interface, a stub
        where the Blueprint has none (KismetCompiler.cpp MergeUbergraphPagesIn, ConformImplementedInterfaces);
