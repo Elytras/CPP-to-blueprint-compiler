@@ -1331,7 +1331,7 @@ use a newer SDK or regenerate your own.
 | `Conv.h`, `Conv.json` | Every Kismet `Conv_XToY` the compiler can use as an implicit conversion or an explicit cast. |
 | `Ops.json` | The Kismet functions behind operators on structs and soft pointers (`==`, `+`, ...). |
 | `Containers.h` | The Kismet `Array_*`, `Set_*` and `Map_*` functions, as methods of `TArray`, `TSet` and `TMap`. |
-| `Types.json` | Every enum and struct: package, engine name, size, alignment and fields. |
+| `Types.json` | Every enum and struct: package, engine name, size, alignment and fields, and whether an enum is an `enum class` (`form`), read off how the dump's properties of it are reflected. |
 | `Events.json` | The function flags of every `BlueprintEvent`, which an override inherits. |
 | `UeMeta.h` | The `UE_*` macros. Written by hand. |
 | `Types.h` | The integer spellings, `FString`, `FName`, `FText` and the container templates. Written by hand. |
@@ -1928,9 +1928,10 @@ A few mistakes also compile without a message, because the construct itself work
 - Changing a game data asset, or a game Blueprint's defaults, in place in the pak. Change the loaded asset through its
   pointer in the game, or subclass the Blueprint and set its defaults in `UE_DEFAULTS`. See
   [Game assets](REFERENCE.md#game-assets).
-- A `uint8` `enum class` variable as the editor writes it, an Enum variable (EnumProperty). AssetGen writes a Byte
-  variable bound to the enum. Both are the same byte in the game; only tools that read the property type see a
-  difference. See [Enums](REFERENCE.md#enums).
+- The form of a game enum that no property uses. genueapi learns whether a game enum is an `enum class` from how the
+  dump's properties of it are reflected, and 249 of the SDK's 1445 enums have none; a variable of one is a Byte, which
+  differs from the editor's Enum variable only in type, and only if the enum is an `enum class`. See
+  [Enums](REFERENCE.md#enums).
 - Walking a `TSet` in place. A range-for over a `TSet` walks a copy, while a `TMap` walks its own slots. Only the cost
   differs. See [Loops](REFERENCE.md#loops).
 - Reusing a repeated pure call. It is evaluated each time it appears. To compute it once, keep the result in a local.
