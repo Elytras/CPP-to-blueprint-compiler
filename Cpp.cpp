@@ -8780,7 +8780,7 @@ bool FCompiler::IsFinalFunction(const FRecord& A, const std::string& Method) con
 {
     const auto M = A.Methods.find(Method);
     if (A.IsNative() || M == A.Methods.end() || IsStaticDecl(*M->second) || IsInlineMethod(A, Method)
-        || !(A.bFinal || A.FinalMethods.count(Method)))
+        || !(A.bFinal || !A.FinalAs.empty() || A.FinalMethods.count(Method)))
         return false;
     for (const FRecord* R = &A; R; R = R->Base.empty() ? nullptr : Find(R->Base))
     {
