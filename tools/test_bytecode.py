@@ -7400,7 +7400,7 @@ def edit_whole_containers():
 
 
 GRUNT = '#include "UeApi/Game/ENE_Spider_Grunt_Normal_C.h"\n'
-GRUNT_PKGS =['Enemies/Spider/Grunt/ED_Spider_Grunt', 'Enemies/Spider/Grunt/ENE_Spider_Grunt_Normal']
+GRUNT_PKGS = ['Enemies/Spider/Grunt/ED_Spider_Grunt', 'Enemies/Spider/Grunt/ENE_Spider_Grunt_Normal']
 GRUNT_KEEP = ('class GruntCount : public ENE_Spider_Grunt_Normal_C {\n  UE_PATCH;\n'
               '  void GetEnemySpawnedCount(int& SpawnCount) {\n'
               '    ENE_Spider_Grunt_Normal_C::GetEnemySpawnedCount(SpawnCount);\n    SpawnCount = SpawnCount + 41;\n  }\n};\n')
