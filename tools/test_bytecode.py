@@ -5171,6 +5171,22 @@ pending('FuncStaticHide: a function named like the static of another mod\'s clas
         'is refused', static_above_foreign)
 
 
+def static_over_static():
+    """A static over a mod ancestor's static is C++ name hiding, which no Blueprint can write: the editor refuses a
+    function named like its parent's, as an override of a function that is no BlueprintEvent ("cannot be overridden",
+    KismetCompiler.cpp 3312-3316). Of the same signature it compiles with a `warning:` (FuncStaticHide), its super the
+    one it hides, as FindFunctionByName gives it; of another, that super would carry other parameters, and it is
+    refused."""
+    assert re.search(r'warning: .*FuncStaticHide::Tell hides FshRoot::Tell', LOGS['FuncStaticHide']), LOGS['FuncStaticHide']
+    refused('StaticOverStaticSig', '', 'SssKid::Tell is static and hides SssRoot::Tell, a static of another signature',
+            top='class SssRoot : public AActor {\npublic:\n  static int32 Tell(int32 V) { return V + 1; }\n};\n'
+                'class SssKid : public SssRoot {\npublic:\n  static float Tell(float V) { return V * 3; }\n'
+                '  float Use(float V) { return Tell(V) + SssRoot::Tell(2); }\n};\n')
+
+
+pending('FuncStaticHide: a static over a static warns, and is refused when its signature differs', static_over_static)
+
+
 def func_iface_unnamed():
     """FuncIfaceUnnamed gets an override of FiuRoot's Tell (for IFiuTell) and of Kept (for its `FiuRoot::Kept` call),
     each calling FiuRoot's though a parameter of it has no name: the override names it, as an editor override does.
