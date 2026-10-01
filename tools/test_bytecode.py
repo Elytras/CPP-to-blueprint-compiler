@@ -58,6 +58,47 @@ def parallel(fn, items):
         return list(pool.map(fn, items))
 
 
+COMPILE_MB, RESERVE_MB = 1024, 2048     # an FSD.h mod's clang and DOM peak near 1 GB; what is left to the machine
+_START_LOCK, _STARTS = threading.Lock(), []
+
+
+def free_mb():
+    """Physical memory free for a new process, in MB, or None where it cannot be read."""
+    if os.name == 'nt':
+        import ctypes
+
+        class Status(ctypes.Structure):
+            _fields_ = [('dwLength', ctypes.c_ulong), ('dwMemoryLoad', ctypes.c_ulong)] + \
+                       [(n, ctypes.c_ulonglong) for n in ('total', 'avail', 'pagefile', 'pagefile_avail', 'virtual',
+                                                          'virtual_avail', 'extended')]
+        s = Status(dwLength=ctypes.sizeof(Status))
+        return s.avail >> 20 if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(s)) else None
+    try:
+        with open('/proc/meminfo') as f:
+            return next(int(l.split()[1]) >> 10 for l in f if l.startswith('MemAvailable:'))
+    except (OSError, StopIteration):
+        return None
+
+
+def run_compile(cmd, cwd=None):
+    """subprocess.run of one assetgen compile, started only when the machine has memory for it. Several suites on one
+    machine, each with WORKERS compiles at once, ran it out of memory. A compile claims its memory over its first
+    second or two, so the ones started in the last 2 s count as not claimed yet: one more starts while free memory
+    covers RESERVE_MB plus COMPILE_MB for each of them and for itself."""
+    with _START_LOCK:
+        while True:
+            now = time.monotonic()
+            _STARTS[:] = [t for t in _STARTS if now - t < 2]
+            free = free_mb()
+            if free is None or free >= RESERVE_MB + COMPILE_MB * (len(_STARTS) + 1):
+                break
+            time.sleep(0.25)
+        _STARTS.append(now)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf-8', cwd=cwd)
+    out, err = proc.communicate()
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
+
 # ---- Compiles. Every `assetgen compile` a test makes goes through assetgen_compile(). The ~200 the tests make one at a
 # time after build() are prefetched: each run records them in a manifest, and the next starts them all right after
 # build(), WORKERS at once, each in a staging folder of its own, in the order the tests last made them. A test whose
@@ -389,7 +430,7 @@ class CompilePrefetch:
                 self.record.append(entry)
                 proc = self._prefetched(cmd, entry, key, args) if key else None
                 if proc is not None: return proc
-        return subprocess.run(cmd, capture_output=True, encoding='utf-8', cwd=cwd)
+        return run_compile(cmd, cwd)
 
     def _staged(self, entry):
         """entry's compile in a staging folder of its own, on a prefetch thread: what it printed and returned, and what
@@ -409,7 +450,7 @@ class CompilePrefetch:
                 src, out = AG + entry['src'], stage + entry['out'][1] if entry['out'][0] == 'ag' else stage
                 os.makedirs(out, exist_ok=True)
             dirs, files = _walk(stage)
-            proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, out], capture_output=True, encoding='utf-8')
+            proc = run_compile([ASSETGEN, 'compile', src, UEAPI, out])
             dirs_after, files_after = _walk(stage)
             outputs = sorted(r for r, data in files_after.items() if files.get(r) != data)
             res.update(rc=proc.returncode, stdout=proc.stdout, stderr=proc.stderr, outputs=outputs,
@@ -472,7 +513,7 @@ class CompilePrefetch:
             for r in files_moved.keys() - files.keys(): os.remove(os.path.join(root, *r.split('/')))
             for d in sorted(dirs_moved - dirs, reverse=True): os.rmdir(os.path.join(root, *d.split('/')))
             if _walk(root) != (dirs, files): raise fail(['taking the moved result out did not leave the folder as it was'])
-            proc = subprocess.run(cmd, capture_output=True, encoding='utf-8')
+            proc = run_compile(cmd)
             dirs_after, files_after = _walk(root)
         except OSError as e:
             raise fail(['%s: %s' % (type(e).__name__, e)])
