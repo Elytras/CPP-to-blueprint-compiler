@@ -1504,6 +1504,11 @@ private:
     const FRecord* NamedQualifier(const Json& Ref) const;
     /* `Base::Method()` on this: the record the qualifier names, read back the same way, else null. */
     const FRecord* MemberQualifier(const Json& Member) const;
+    /* Whether a call on `this` to R's Method, written in class Written, names R's own: the forwarder's call, one
+       written `R::Method()` (MemberQualifier), or one past a declaration of Method from Written up to R, which in C++
+       hides R's from an unqualified call - so it got there through a qualifier, however spelled (`this->R::Method()`).
+       A forwarder is no declaration of the source's, so this answers the same before and after SynthesizeForwarders. */
+    bool NamesQualified(const Json& Callee, const FRecord* Written, const FRecord& R, const std::string& Method) const;
     const std::vector<std::string>& ModSources() const;
     bool IsSubclassOf(const FRecord& Child, const FRecord& Parent) const;
     /* The nearest declaration of some method along R's chain is `= 0`: the class Generate cooks CLASS_Abstract. */
@@ -5048,27 +5053,49 @@ const FRecord* FCompiler::NamedQualifier(const Json& Ref) const
 /* A MemberExpr on an implicit this begins at its qualifier when it has one and at the member's own name when not
    (clang's MemberExpr::getBeginLoc), so `QcParent::Plain()` is told from `Plain()` by what is written where its range
    begins: `<Record>::<member>`, tried in each of the mod's sources as NamedQualifier does.
+   The record's name may come in parts, `Weapons::Rifle::Pull`.
    ponytail: `this->QcParent::Plain()` begins at `this` and a qualifier written in a macro has spelling locations; both
-   read as unqualified, a call by name. */
+   read as unqualified here, a call by name, unless a class on the way declares Plain (NamesQualified). */
 const FRecord* FCompiler::MemberQualifier(const Json& Member) const
 {
     const Json Begin = Member.value("range", Json::object()).value("begin", Json::object());
     if (!Begin.contains("offset") || !Begin.contains("tokLen")) return nullptr;
     const size_t Off = Begin["offset"].get<size_t>(), Len = Begin["tokLen"].get<size_t>();
     const std::string Method = Member.value("name", std::string());
+    auto Ident = [](char C) { return std::isalnum(uint8(C)) || C == '_'; };
     for (const std::string& T : ModSources())
     {
         if (Off + Len > T.size()) continue;
-        size_t P = Off + Len;
-        while (P < T.size() && (T[P] == ' ' || T[P] == '\t')) ++P;
-        if (T.compare(P, 2, "::") != 0) continue;
-        P += 2;
-        while (P < T.size() && (T[P] == ' ' || T[P] == '\t')) ++P;
-        if (T.compare(P, Method.size(), Method) != 0) continue;
-        if (P + Method.size() < T.size() && (std::isalnum(uint8(T[P + Method.size()])) || T[P + Method.size()] == '_')) continue;
-        if (const FRecord* R = Find(T.substr(Off, Len))) return R;
+        /* `<Record>::<member>`, the record's name in as many parts as it is written with: `Weapons::Rifle::Pull`. */
+        std::string Qualifier = T.substr(Off, Len);
+        for (size_t P = Off + Len;;)
+        {
+            while (P < T.size() && (T[P] == ' ' || T[P] == '\t')) ++P;
+            if (T.compare(P, 2, "::") != 0) break;
+            P += 2;
+            while (P < T.size() && (T[P] == ' ' || T[P] == '\t')) ++P;
+            size_t End = P;
+            while (End < T.size() && Ident(T[End])) ++End;
+            if (End == P) break;
+            if (T.compare(P, End - P, Method) == 0 && End - P == Method.size())
+            {
+                if (const FRecord* R = Find(Qualifier)) return R;
+                break;
+            }
+            Qualifier += "::" + T.substr(P, End - P);
+            P = End;
+        }
     }
     return nullptr;
+}
+
+bool FCompiler::NamesQualified(const Json& Callee, const FRecord* Written, const FRecord& R, const std::string& Method) const
+{
+    if (Callee.value("forwards", false)) return true;
+    if (Written && IsSubclassOf(*Written, R))
+        for (const FRecord* A = Written; A && A != &R; A = A->Base.empty() ? nullptr : Find(A->Base))
+            if (A->Methods.count(Method) && !A->Forwarders.count(Method)) return true;
+    return MemberQualifier(Callee) != nullptr;
 }
 
 /* True when evaluating N twice is the same as once: names, literals, member reads and arithmetic, no call or store. */
@@ -5558,13 +5585,18 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
            forwarder SynthesizeForwarders gave it, which no call by name names (`AuthOnly()` in its class still names
            the inherited one). A call written unqualified is never one: PBase::Twice's `Speak()`, an inline body, stays
            a call by name in a Kid that declares Speak. The rest of the qualified calls, to the class's own Method
-           (`Cur::Method()`) or with no Method in Cur, are bQualified, handled below. */
+           (`Cur::Method()`) or with no Method in Cur, are bQualified, handled below. Whether it is written qualified
+           is read from the class it is written in (NamesQualified): an inline body's own, or the copied function's. */
+        const FRecord* Written = Cur;
+        if (!InlineStack.empty())
+            if (auto O = MethodOwner.find(InlineStack.back()->value("id", std::string())); O != MethodOwner.end())
+                Written = Find(O->second);
         bool bParentCall = false, bQualified = false;
         if (Kind(CallExprNode) == "CXXMemberCallExpr")
         {
             const Json* Callee = Strip(First(CallExprNode));
             const Json* Obj = Callee ? Strip(First(*Callee)) : nullptr;
-            if (Obj && Kind(*Obj) == "CXXThisExpr" && (Callee->value("forwards", false) || MemberQualifier(*Callee)))
+            if (Obj && Kind(*Obj) == "CXXThisExpr" && NamesQualified(*Callee, Written, *R, MethodName))
             {
                 const auto Own = Cur->Methods.find(MethodName);
                 bParentCall = R != Cur && Own != Cur->Methods.end() && !IsStaticDecl(*Own->second) && !IsInlineMethod(*Cur, MethodName);
@@ -8556,20 +8588,24 @@ const Json* FCompiler::CopyableDef(const FRecord& In, const std::string& Method)
        inline body the function expands counts as its own: SynthesizeForwarders gave In the forwarder for it. */
     bool bBindsParent = false;
     std::set<const Json*> Expanded;
-    std::function<void(const Json&)> Walk = [&](const Json& N) {
+    std::function<void(const Json&, const FRecord*)> Walk = [&](const Json& N, const FRecord* Written) {
         if (bBindsParent) return;
         const Json* Callee = Kind(N) == "CXXMemberCallExpr" ? Strip(First(N)) : nullptr;
         const Json* Obj = Callee && Kind(*Callee) == "MemberExpr" ? Strip(First(*Callee)) : nullptr;
         if (Obj && Kind(*Obj) == "CXXThisExpr")
             if (const auto O = MethodOwner.find(Callee->value("referencedMemberDecl", std::string())); O != MethodOwner.end())
                 if (const FRecord* R = Find(O->second); R && R != &In && !R->IsNative() && IsSubclassOf(In, *R)
-                    && MemberQualifier(*Callee) && !CopyableDef(*R, Name(*Callee)))
+                    && NamesQualified(*Callee, Written, *R, Name(*Callee)) && !CopyableDef(*R, Name(*Callee)))
                     bBindsParent = true;
         if (const Json* Inl = InlineOnThis(N); Inl && Expanded.insert(Inl).second)
-            ForEach(*Inl, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Walk(C); });
-        ForEach(N, Walk);
+        {
+            const auto O = MethodOwner.find(Inl->value("id", std::string()));
+            const FRecord* Owner = O != MethodOwner.end() ? Find(O->second) : nullptr;
+            ForEach(*Inl, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Walk(C, Owner ? Owner : &In); });
+        }
+        ForEach(N, [&](const Json& C) { Walk(C, Written); });
     };
-    Walk(*Body);
+    Walk(*Body, &In);
     return bBindsParent ? nullptr : Def;
 }
 
@@ -8616,11 +8652,11 @@ void FCompiler::SynthesizeForwarders()
         Order.emplace_back(Depth, &W);
     }
     std::stable_sort(Order.begin(), Order.end(), [](const auto& A, const auto& B) { return A.first < B.first; });
-    for (const auto& Entry : Order)
+    for (const auto& Ordered : Order)
     {
-        FRecord& W = *Entry.second;
+        FRecord& W = *Ordered.second;
         std::map<std::string, const FRecord*> Wanted;      // method -> the nearest ancestor declaring it
-        auto Consider = [&](const Json& Call, bool bNoOpt) {
+        auto Consider = [&](const Json& Call, bool bNoOpt, const FRecord* Written) {
             const Json* Callee = Strip(First(Call));
             const Json* Obj = Callee && Kind(*Callee) == "MemberExpr" ? Strip(First(*Callee)) : nullptr;
             if (!Obj || Kind(*Obj) != "CXXThisExpr") return;
@@ -8644,7 +8680,7 @@ void FCompiler::SynthesizeForwarders()
             bool bNamed = true;
             ForEach(NearDef != Nearest->MethodDefs.end() ? *NearDef->second : NearDecl,
                     [&](const Json& P) { bNamed = bNamed && (Kind(P) != "ParmVarDecl" || !Name(P).empty()); });
-            if (bNamed && MemberQualifier(*Callee)) Wanted[Method] = Nearest;
+            if (bNamed && NamesQualified(*Callee, Written, *R, Method)) Wanted[Method] = Nearest;
         };
         for (const auto& [Method, Decl] : W.Methods)
         {
@@ -8653,16 +8689,20 @@ void FCompiler::SynthesizeForwarders()
             const Json& Def = DefIt != W.MethodDefs.end() ? *DefIt->second : *Decl;
             const bool bNoOpt = IsNoOptDecl(*Decl) || IsNoOptDecl(Def);
             std::set<const Json*> Expanded;      // the inline bodies this method copies in, each walked once
-            std::function<void(const Json&)> Walk = [&](const Json& N) {
+            std::function<void(const Json&, const FRecord*)> Walk = [&](const Json& N, const FRecord* Written) {
                 if (Kind(N) == "CXXMemberCallExpr")
                 {
-                    Consider(N, bNoOpt);
+                    Consider(N, bNoOpt, Written);
                     if (const Json* Inl = InlineOnThis(N); Inl && Expanded.insert(Inl).second)
-                        ForEach(*Inl, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Walk(C); });
+                    {
+                        const auto O = MethodOwner.find(Inl->value("id", std::string()));
+                        const FRecord* Owner = O != MethodOwner.end() ? Find(O->second) : nullptr;
+                        ForEach(*Inl, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Walk(C, Owner ? Owner : &W); });
+                    }
                 }
-                ForEach(N, Walk);
+                ForEach(N, [&](const Json& C) { Walk(C, Written); });
             };
-            ForEach(Def, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Walk(C); });
+            ForEach(Def, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Walk(C, &W); });
         }
         /* An interface W lists whose function W inherits from a class above that this source cooks, which does not list
            it: in C++ that class's function implements it. Generate's empty stub would replace it for every caller, and

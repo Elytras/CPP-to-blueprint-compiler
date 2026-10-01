@@ -1599,6 +1599,10 @@ def namespaces():
     for want in (mine + '/Weapons/Rifle.Rifle_C:Load', '/Game/NsTestAbs/Pistol.Pistol_C:Pull', mine + '/Weapons/FAmmo.FAmmo'):
         assert want in ns, (want, ns)
     assert run(base(mine + '/Weapons/Rifle'), 'Pull', self_vars=dict(Shots=5), Times=3)[0] == 8
+    # `Weapons::Rifle::Pull(Times)` in Pistol's Pull is the parent's, however many parts the qualifier has: 5 + 3 + 100.
+    fields = dict(Shots=5)
+    got = run_as([base('/Game/NsTestAbs/Pistol'), base(mine + '/Weapons/Rifle')], 'Pull', fields, Times=3)
+    assert got == 108 and fields == dict(Shots=8), (got, fields)
     # `Game::<the mod's own path>::X` and a plain X are one package.
     refused('NsTwice', '  int32 F() { return 1; }\n', 'would both be cooked as /Game/_ElytrasMods/NsTwice/NsTwice',
             top='namespace Game::_ElytrasMods::NsTwice { class NsTwice : public AActor { public: int32 X; }; }\n')
