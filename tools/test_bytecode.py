@@ -53,6 +53,13 @@ def parallel(fn, items):
         return list(pool.map(fn, items))
 
 
+def assetgen_compile(args, cwd=None):
+    """`assetgen compile <args>`, run in cwd, its stdout and stderr captured as UTF-8 text: every compile the suite
+    makes goes through here, so what is done around a compile is done in one place. The other verbs (roundtrip,
+    registry, astcheck) run as they are."""
+    return subprocess.run([ASSETGEN, 'compile'] + list(args), capture_output=True, encoding='utf-8', cwd=cwd)
+
+
 def build():
     """Each test compiles into build/<Test>/FSD/Content/<its package>, the layout bpbuild stages a mod in. The examples
     the docs point at compile the same way, so one the compiler stops accepting fails here rather than for a reader."""
@@ -64,7 +71,7 @@ def build():
         out = os.path.join(ROOT, mod, 'FSD', 'Content', *package.split('/'))
         os.makedirs(out)
         game = ['--game', os.path.join(ROOT, 'AssetTest', 'FSD', 'Content')] if mod == 'EditTest' else []
-        return mod, subprocess.run([ASSETGEN, 'compile', src, UEAPI, out] + game, capture_output=True, encoding='utf-8')
+        return mod, assetgen_compile([src, UEAPI, out] + game)
     srcs = sorted(glob.glob(os.path.join(TESTS, '*.cpp'))) + sorted(glob.glob(os.path.join(AG, 'examples', '*.cpp')))
     # EditTest edits AssetTest's cooked assets as if they were the game's, so it compiles once AssetTest has.
     edits = [s for s in srcs if os.path.basename(s) == 'EditTest.cpp']
@@ -162,7 +169,7 @@ def refused(mod, body, why, top=''):
         with open(src, 'w', encoding='utf-8') as f:
             f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\n%s'
                     'class %s : public AActor {\npublic:\n%s};\n' % (mod, top, mod, body))
-        proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, tmp], capture_output=True, encoding='utf-8')
+        proc = assetgen_compile([src, UEAPI, tmp])
         assert proc.returncode != 0 and why in proc.stdout, (mod, proc.stdout)
 
 
@@ -184,7 +191,7 @@ def pending_asset(mod, cls=None):
     out = os.path.join(ROOT, '_pending', mod, 'FSD', 'Content', *package.split('/'))
     if mod not in REFUSALS:
         os.makedirs(out, exist_ok=True)
-        proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, out], capture_output=True, encoding='utf-8')
+        proc = assetgen_compile([src, UEAPI, out])
         failed = re.findall(r'(?m)^\s*FAILED: (.*)$', proc.stdout)
         REFUSALS[mod] = (failed or [proc.stdout.strip() or 'exit %d' % proc.returncode])[0] if proc.returncode else None
     if REFUSALS[mod]: raise AssertionError('refused: ' + REFUSALS[mod])
@@ -299,7 +306,7 @@ def registry_non_ascii():
         rows = lambda path: [(r['object_path'], r['package_path'], r['asset_class'], r['package_name'], r['asset_name'])
                              for r in dumpar.read(path)[2]]
         for twice in range(2):
-            proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, tmp], capture_output=True, encoding='utf-8')
+            proc = assetgen_compile([src, UEAPI, tmp])
             assert proc.returncode == 0, proc.stdout + proc.stderr
             assert rows(os.path.join(tmp, 'AssetRegistry.bin')) == want, rows(os.path.join(tmp, 'AssetRegistry.bin'))
         merged = os.path.join(tmp, 'Merged.bin')
@@ -1037,7 +1044,7 @@ def inline_mixed_overloads():
         for mod, body in mods.items():
             with open(os.path.join(tmp, mod + '.cpp'), 'w') as f:
                 f.write(head % (mod, mod) + body)
-            proc = subprocess.run([ASSETGEN, 'compile', os.path.join(tmp, mod + '.cpp'), UEAPI, tmp], capture_output=True, encoding='utf-8')
+            proc = assetgen_compile([os.path.join(tmp, mod + '.cpp'), UEAPI, tmp])
             if mod == 'MixOk':
                 assert proc.returncode == 0, proc.stdout + proc.stderr
                 for v in (-3, 0, 5):
@@ -1302,7 +1309,7 @@ def final_calls():
             f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/FinalHide");\n'
                     'class FinalHideBase : public AActor {\npublic:\n  virtual int32 F() final { return 1; }\n};\n'
                     'class FinalHide : public FinalHideBase {\npublic:\n  int32 F(int32 X) { return X; }\n};\n')
-        proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, tmp], capture_output=True, encoding='utf-8')
+        proc = assetgen_compile([src, UEAPI, tmp])
         assert proc.returncode != 0 and 'FinalHideBase::F is final' in proc.stdout, proc.stdout
     print("ok  FinalTest: a subclass function of a final method's name is refused")
 
@@ -1780,7 +1787,7 @@ def pointer_behaviour():
         with open(os.path.join(tmp, 'ReadU32.cpp'), 'w') as f:
             f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/ReadU32");\n'
                     'class ReadU32 : public AActor {\npublic:\n  int64 Get(uint32 *P) { return *P; }\n};\n')
-        proc = subprocess.run([ASSETGEN, 'compile', os.path.join(tmp, 'ReadU32.cpp'), UEAPI, tmp], capture_output=True, encoding='utf-8')
+        proc = assetgen_compile([os.path.join(tmp, 'ReadU32.cpp'), UEAPI, tmp])
         assert proc.returncode != 0 and 'reading a uint32 through a pointer' in proc.stdout, proc.stdout
     # The synthesized read scratch is cooked beside the class, and the class imports it.
     d = dumpexp.load(os.path.join(os.path.dirname(asset('PointerTest')), 'FDeref'))
@@ -2096,8 +2103,8 @@ def api_stub():
     with tempfile.TemporaryDirectory() as tmp:
         os.makedirs(os.path.join(tmp, 'cooked'))
         os.makedirs(os.path.join(tmp, 'api'))
-        proc = subprocess.run([ASSETGEN, 'compile', os.path.join(TESTS, 'NameTest.cpp'), UEAPI,
-                               os.path.join(tmp, 'cooked'), '--api', os.path.join(tmp, 'api')], capture_output=True, encoding='utf-8')
+        proc = assetgen_compile([os.path.join(TESTS, 'NameTest.cpp'), UEAPI,
+                                 os.path.join(tmp, 'cooked'), '--api', os.path.join(tmp, 'api')])
         assert proc.returncode == 0, proc.stdout + proc.stderr
         base = os.path.join(tmp, 'api', 'NameTest')
         ua, ue, total, names, imports, exports = dumpexp.load(base)
@@ -2227,7 +2234,7 @@ def ue_assets():
                     'class UeAssetsUser : public AActor {\npublic:\n'
                     '  UEnemyDescriptor *Ed = &UeAssets::UEnemyDescriptor::Game::_ElytrasMods::AssetTest::ED_AssetTest;\n'
                     '  int32 Count() { return UeAssets::UEnemyDescriptor::All.Num(); }\n};\n')
-        proc = subprocess.run([ASSETGEN, 'compile', os.path.join(tmp, 'UeAssetsUser.cpp'), UEAPI, tmp], capture_output=True, encoding='utf-8')
+        proc = assetgen_compile([os.path.join(tmp, 'UeAssetsUser.cpp'), UEAPI, tmp])
         assert proc.returncode == 0, proc.stdout + proc.stderr
         user = os.path.join(tmp, 'UeAssetsUser')
         cdo = dump('dumptags.py', user, exports_of(user).index('Default__UeAssetsUser_C'))
@@ -2266,7 +2273,7 @@ def asset_elsewhere():
             f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/AssetPinned");\n'
                     + top % '  UE_CLASS("/Game/_ElytrasMods/Other/UOtherDef", "UOtherDef_C");\n'
                     + 'class AssetPinned : public AActor {\npublic:\n  UOtherDef *Picked = &OtherData;\n};\n')
-        proc = subprocess.run([ASSETGEN, 'compile', os.path.join(tmp, 'AssetPinned.cpp'), UEAPI, tmp], capture_output=True, encoding='utf-8')
+        proc = assetgen_compile([os.path.join(tmp, 'AssetPinned.cpp'), UEAPI, tmp])
         assert proc.returncode == 0, proc.stdout + proc.stderr
         assert not os.path.exists(os.path.join(tmp, 'UOtherDef.uasset')), os.listdir(tmp)
         imports = dict(import_paths(os.path.join(tmp, 'AssetPinned'), classes=True))
@@ -2374,7 +2381,7 @@ def edits():
                         'UE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\n'
                         'class UMoodDef : public UPrimaryDataAsset {\npublic:\n'
                         '  UE_CLASS("/Game/_ElytrasMods/AssetTest/UMoodDef", "UMoodDef_C");\n  int32 Count;\n};\n%s' % (name, src))
-            proc = subprocess.run([ASSETGEN, 'compile', path, UEAPI, tmp] + flags, capture_output=True, encoding='utf-8')
+            proc = assetgen_compile([path, UEAPI, tmp] + flags)
             assert proc.returncode != 0 and why in proc.stdout, (name, proc.stdout)
     print('ok  EditTest: an edit of a mod\'s own asset, a patch of a native class, a patch with a member of its own, and '
           'no --game are refused')
@@ -2400,7 +2407,7 @@ def edits():
                 f.write(decl % body)
             out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'LampEdit')
             os.makedirs(out)
-            proc = subprocess.run([ASSETGEN, 'compile', path, UEAPI, out, '--game', comp_game], capture_output=True, encoding='utf-8')
+            proc = assetgen_compile([path, UEAPI, out, '--game', comp_game])
             if why:
                 assert proc.returncode != 0 and why in proc.stdout, (body, proc.stdout)
                 continue
@@ -2437,7 +2444,7 @@ def edits():
                 f.write(decl % body)
             out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'FnEdit')
             os.makedirs(out)
-            proc = subprocess.run([ASSETGEN, 'compile', path, UEAPI, out, '--game', comp_game], capture_output=True, encoding='utf-8')
+            proc = assetgen_compile([path, UEAPI, out, '--game', comp_game])
             if why:
                 assert proc.returncode != 0 and why in proc.stdout, (body, proc.stdout)
                 continue
@@ -2490,8 +2497,7 @@ def edits():
                     '  void ClientPing(int32 Seq) { ReplTest::ClientPing(Seq); Local = Local + 1; }\n};\n')
         out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'RpcEdit')
         os.makedirs(out)
-        proc = subprocess.run([ASSETGEN, 'compile', path, UEAPI, out, '--game', os.path.join(ROOT, 'ReplTest', 'FSD', 'Content')],
-                              capture_output=True, encoding='utf-8')
+        proc = assetgen_compile([path, UEAPI, out, '--game', os.path.join(ROOT, 'ReplTest', 'FSD', 'Content')])
         assert proc.returncode == 0, proc.stdout + proc.stderr
         b = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'ReplTest', 'ReplTest')
         me = {}
@@ -2520,7 +2526,7 @@ def edits():
                     '  void ReceiveBeginPlay() { Ticks = Ticks + Step; Step = Step + 1; }\n};\n')
         out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'GlobalEdit')
         os.makedirs(out)
-        proc = subprocess.run([ASSETGEN, 'compile', path, UEAPI, out, '--game', comp_game], capture_output=True, encoding='utf-8')
+        proc = assetgen_compile([path, UEAPI, out, '--game', comp_game])
         assert proc.returncode == 0, proc.stdout + proc.stderr
         assert os.path.exists(os.path.join(out, 'Step.uasset')), 'the global\'s class was not cooked: %s' % os.listdir(out)
         assert global_default(out, 'Step', 'Step') == '5'
@@ -2576,8 +2582,7 @@ def path_edits():
                 f.write(decl % body)
             out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'PathEdit')
             os.makedirs(out)
-            proc = subprocess.run([ASSETGEN, 'compile', path, UEAPI, out, '--game', os.path.join(ROOT, 'TypesTest', 'FSD', 'Content')],
-                                  capture_output=True, encoding='utf-8')
+            proc = assetgen_compile([path, UEAPI, out, '--game', os.path.join(ROOT, 'TypesTest', 'FSD', 'Content')])
             if why:
                 assert proc.returncode != 0 and why in proc.stdout, (body, proc.stdout)
                 continue
@@ -2606,8 +2611,7 @@ def path_edits():
                     'UE_ASSET_EDITS {\n  ED_AssetTest.VeteranClasses[0] = &ED_Spider_Exploder;\n  ED_AssetTest.IdealSpawnSize = 9;\n}\n')
         out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'AssetEdits')
         os.makedirs(out)
-        proc = subprocess.run([ASSETGEN, 'compile', path, UEAPI, out, '--game', os.path.join(ROOT, 'AssetTest', 'FSD', 'Content')],
-                              capture_output=True, encoding='utf-8')
+        proc = assetgen_compile([path, UEAPI, out, '--game', os.path.join(ROOT, 'AssetTest', 'FSD', 'Content')])
         assert proc.returncode == 0, proc.stdout + proc.stderr
         b = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'AssetTest', 'ED_AssetTest')
         la, lb = dumpexp.load(a), dumpexp.load(b)
@@ -2651,7 +2655,7 @@ def game_edits():
                     '    SpawnCount = SpawnCount + 41;\n  }\n};\n')
         out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'GameEdit')
         os.makedirs(out)
-        proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, out, '--game', GAME], capture_output=True, encoding='utf-8')
+        proc = assetgen_compile([src, UEAPI, out, '--game', GAME])
         assert proc.returncode == 0, proc.stdout + proc.stderr
         proc = subprocess.run([ASSETGEN, 'roundtrip', tmp], capture_output=True, encoding='utf-8')
         assert proc.returncode == 0, proc.stdout
@@ -2689,7 +2693,7 @@ def game_edits():
                     '#include "UeApi/Game/ENE_Spider_Grunt_Normal_C.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/GameEdit");\n'
                     'class GruntTweaks : public ENE_Spider_Grunt_Normal_C {\n  UE_PATCH;\n'
                     '  UE_DEFAULTS { Sphere->SphereRadius = 10.0f; }\n};\n')
-        proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, out, '--game', GAME], capture_output=True, encoding='utf-8')
+        proc = assetgen_compile([src, UEAPI, out, '--game', GAME])
         assert proc.returncode != 0 and 'does not override that inherited component' in proc.stdout, proc.stdout
 
     # Paths into the grunt's values: PrimaryActorTick, which its default object has no value of, becomes a tag holding
@@ -2711,7 +2715,7 @@ def game_edits():
                     'UE_ASSET_EDITS { ED_Spider_Grunt.SpawnRarityModifiers[1].Rarity = 2.0f; }\n')
         out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'GamePaths')
         os.makedirs(out)
-        proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, out, '--game', GAME], capture_output=True, encoding='utf-8')
+        proc = assetgen_compile([src, UEAPI, out, '--game', GAME])
         assert proc.returncode == 0, proc.stdout + proc.stderr
         a, b = game('Enemies/Spider/Grunt/ENE_Spider_Grunt_Normal'), os.path.join(tmp, 'FSD', 'Content', 'Enemies', 'Spider', 'Grunt', 'ENE_Spider_Grunt_Normal')
         la, lb = dumpexp.load(a), dumpexp.load(b)
@@ -3139,7 +3143,7 @@ def spawn_relative():
     (the qualifier is read back from the mod's sources, which a bare path's empty parent once hid)."""
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
-        proc = subprocess.run([ASSETGEN, 'compile', 'SpawnTest.cpp', UEAPI, tmp], capture_output=True, encoding='utf-8', cwd=TESTS)
+        proc = assetgen_compile(['SpawnTest.cpp', UEAPI, tmp], cwd=TESTS)
         assert proc.returncode == 0, proc.stdout + proc.stderr
         assert VM(os.path.join(tmp, 'SpawnTest'), {}).call('OwnClass') == 'SpawnTest_C'
     print('ok  SpawnTest: a bare relative source path finds X::StaticClass() qualifiers')
@@ -3513,7 +3517,7 @@ def refused_naming(mod, body, pattern, top=''):
         with open(src, 'w', encoding='utf-8') as f:
             f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\n%s'
                     'class %s : public AActor {\npublic:\n%s};\n' % (mod, top, mod, body))
-        proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, tmp], capture_output=True, encoding='utf-8')
+        proc = assetgen_compile([src, UEAPI, tmp])
         assert proc.returncode != 0 and re.search(pattern, proc.stdout + proc.stderr), (mod, proc.stdout, proc.stderr)
 
 
@@ -3541,7 +3545,7 @@ def name_too_long():
         with open(src, 'w', encoding='utf-8') as f:
             f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/NameAtLimit");\n'
                     'class NameAtLimit : public AActor {\npublic:\n%s};\n' % (body % ('x' * 1023)))
-        proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, tmp], capture_output=True, encoding='utf-8')
+        proc = assetgen_compile([src, UEAPI, tmp])
         assert proc.returncode == 0, proc.stdout + proc.stderr
     print('ok  NameTooLong: an FName over 1023 characters is refused as too long; one of 1023 cooks')
 
@@ -3868,7 +3872,7 @@ def refused_or_distinct(mod, classes_src, member, oracle=None):
             f.write('#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\n%s' % (mod, classes_src))
         out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', mod)
         os.makedirs(out)
-        proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, out], capture_output=True, encoding='utf-8')
+        proc = assetgen_compile([src, UEAPI, out])
         if proc.returncode:
             assert member in proc.stdout, (mod, proc.stdout[-400:])
             return
@@ -4520,7 +4524,7 @@ def no_world_warning():
                     '  void Run() { Pawn = UGameplayStatics::GetPlayerPawn(0); }\n};\n'
                     'class NoWorldCtxActor : public AActor {\npublic:\n  APawn *Pawn;\n'
                     '  void Run() { Pawn = UGameplayStatics::GetPlayerPawn(0); }\n};\n')
-        proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, tmp], capture_output=True, encoding='utf-8')
+        proc = assetgen_compile([src, UEAPI, tmp])
     warns = [l.strip() for l in proc.stdout.splitlines() if l.strip().startswith('warning:')]
     assert any('NoWorldCtx::Run' in w and 'world' in w.lower() for w in warns), \
         'no warning that NoWorldCtx::Run hands GetPlayerPawn a world context with no world (exit %d): %s' % (proc.returncode, warns)
@@ -5001,7 +5005,7 @@ def compiled_with_flag(mod, body, name):
         with open(src, 'w', encoding='utf-8') as f:
             f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\n'
                     'class %s : public AActor {\npublic:\n%s};\n' % (mod, mod, body))
-        proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, tmp], capture_output=True, encoding='utf-8')
+        proc = assetgen_compile([src, UEAPI, tmp])
         warned = [l for l in proc.stdout.splitlines() if 'warning' in l.lower() and name in l]
         assert (proc.returncode != 0 and name in proc.stdout) or warned, \
             '%s compiles (exit %d) with no refusal or warning naming %s' % (mod, proc.returncode, name)
@@ -5288,7 +5292,7 @@ def compile_to(src_text, mod, extra=()):
     with open(src, 'w', encoding='utf-8') as f: f.write(src_text)
     out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', mod)
     os.makedirs(out)
-    proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, out] + list(extra), capture_output=True, encoding='utf-8')
+    proc = assetgen_compile([src, UEAPI, out] + list(extra))
     assert proc.returncode == 0, proc.stdout + proc.stderr
     return tmp, out, proc.stdout
 
@@ -5602,7 +5606,7 @@ def refused_or_warned(mod, body, why, top=''):
         with open(src, 'w', encoding='utf-8') as f:
             f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\n%s'
                     'class %s : public AActor {\npublic:\n%s};\n' % (mod, top, mod, body))
-        proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, tmp], capture_output=True, encoding='utf-8')
+        proc = assetgen_compile([src, UEAPI, tmp])
         warned = [l for l in proc.stdout.splitlines() if 'warning:' in l and why in l]
         assert (proc.returncode != 0 and why in proc.stdout) or (proc.returncode == 0 and warned), (mod, proc.stdout)
 
@@ -6007,8 +6011,7 @@ def compile_log(mod):
     """What the compiler printed for tests/pending/<mod>.cpp: pending_asset keeps only a refusal's reason, and a
     warning is what some of these gaps are closed by."""
     with tempfile.TemporaryDirectory() as tmp:
-        return subprocess.run([ASSETGEN, 'compile', os.path.join(PENDING, mod + '.cpp'), UEAPI, tmp],
-                              capture_output=True, encoding='utf-8').stdout
+        return assetgen_compile([os.path.join(PENDING, mod + '.cpp'), UEAPI, tmp]).stdout
 
 
 def refused_naming(mod, *names):
@@ -6157,7 +6160,7 @@ with tempfile.TemporaryDirectory() as _tmp:
     with open(_src, 'w', encoding='utf-8') as _f:
         _f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/ReplComponentCtl");\n'
                  'class ReplComponentCtl : public UActorComponent {\n' + REPL_OBJ)
-    _proc = subprocess.run([ASSETGEN, 'compile', _src, UEAPI, _tmp], capture_output=True, encoding='utf-8')
+    _proc = assetgen_compile([_src, UEAPI, _tmp])
     assert _proc.returncode == 0, _proc.stdout + _proc.stderr
 print('ok  replication refusals: UE_REPLICATED on a struct member, replication on a UObject (a component compiles)')
 # The engine routes a call by the called UFunction's flags; an inline method is none, so its marker goes nowhere.
@@ -6173,8 +6176,7 @@ def latent_compile_log(src, game=None):
     """(exit code, what the compiler printed) for one source, compiled into a scratch folder: warnings are read off it."""
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
-        proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, tmp] + (['--game', game] if game else []),
-                              capture_output=True, encoding='utf-8')
+        proc = assetgen_compile([src, UEAPI, tmp] + (['--game', game] if game else []))
     return proc.returncode, proc.stdout
 
 
@@ -6496,7 +6498,7 @@ def compile_edit(tmp, mod, src, game):
         f.write(src)
     out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', mod)
     os.makedirs(out)
-    proc = subprocess.run([ASSETGEN, 'compile', path, UEAPI, out, '--game', game], capture_output=True, encoding='utf-8')
+    proc = assetgen_compile([path, UEAPI, out, '--game', game])
     return proc, os.path.join(tmp, 'FSD', 'Content')
 
 
