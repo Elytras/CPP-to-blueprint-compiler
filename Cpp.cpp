@@ -13443,16 +13443,18 @@ std::optional<std::string> TreeDifference(const Json& A, const Json& B, uint64* 
             if (!Levels.empty()) { ++Levels.back().ItA; ++Levels.back().ItB; }
             continue;
         }
-        const std::string Up = PathTo(Levels.size() - 1);
-        const std::string Here = Up == "/" ? std::string() : Up;
-        if (L.A->is_array() && (bEndA || bEndB))
-            return Differ(Here + "/" + std::to_string(L.A->size() < L.B->size() ? L.A->size() : L.B->size()),
-                          bEndA ? nullptr : &*L.ItA, bEndB ? nullptr : &*L.ItB);
-        /* Both objects are sorted by key: at the first keys that differ, the smaller one is missing on the other side. */
-        if (L.A->is_object() && (bEndA || bEndB || L.ItA.key() != L.ItB.key()))
+        const bool bArray = L.A->is_array();
+        if (bEndA || bEndB || (!bArray && L.ItA.key() != L.ItB.key()))
         {
+            /* A member or element one side lacks. Both objects are sorted by key, so at the first keys that differ the
+               smaller one is missing on the other side. */
+            std::string Path = PathTo(Levels.size() - 1);
+            if (Path == "/") Path.clear();
+            if (bArray)
+                return Differ(Path + "/" + std::to_string(std::min(L.A->size(), L.B->size())),
+                              bEndA ? nullptr : &*L.ItA, bEndB ? nullptr : &*L.ItB);
             const bool bOnlyA = bEndB || (!bEndA && L.ItA.key() < L.ItB.key());
-            return Differ(Here + "/" + (bOnlyA ? L.ItA.key() : L.ItB.key()), bOnlyA ? &*L.ItA : nullptr,
+            return Differ(Path + "/" + (bOnlyA ? L.ItA.key() : L.ItB.key()), bOnlyA ? &*L.ItA : nullptr,
                           bOnlyA ? nullptr : &*L.ItB);
         }
         const size_t Depth = Levels.size();
