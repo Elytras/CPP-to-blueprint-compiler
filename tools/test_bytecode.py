@@ -239,6 +239,34 @@ def _retried(fn):
             time.sleep(MANIFEST_RETRY_S)
 
 
+def _materialize(cmd, res, real):
+    """A staged compile's result (res, from _staged) as the compile in real gives it: its new folders made in real and
+    its outputs copied there, stdout and stderr with the staging folder swapped for real. None when that fails part
+    way, on an OSError (a file an indexer or a scanner holds, a full disk): what it put in real is removed again, so
+    real is as fresh as it was and the test compiles there directly."""
+    made, copied = [], []
+    try:
+        for d in sorted(res['dirs']):       # a folder sorts before those inside it; the rest of the path is in real
+            path = os.path.join(real, *d.split('/'))
+            if not os.path.isdir(path):
+                os.mkdir(path)
+                made.append(path)
+        for o in res['outputs']:
+            dst = os.path.join(real, *o.split('/'))
+            copied.append(dst)
+            shutil.copyfile(os.path.join(res['stage'], *o.split('/')), dst)
+    except OSError:
+        for path in copied:
+            try: os.remove(path)
+            except OSError: pass
+        for path in reversed(made):
+            try: os.rmdir(path)
+            except OSError: pass
+        return None
+    return subprocess.CompletedProcess(cmd, res['rc'], _swap(res['stdout'], res['stage'], real),
+                                       _swap(res['stderr'], res['stage'], real))
+
+
 def _read_manifest():
     """The last run's entries, in the order it made their compiles; none when there is no manifest of this layout.
     Any failure to read one means no prefetch, never a failed run: json.load raises RecursionError on deep nesting."""
@@ -363,8 +391,8 @@ class CompilePrefetch:
 
     def _prefetched(self, cmd, entry, key, args):
         """The prefetched result of entry's compile (key: _compile_key's), moved into place; None when there is none to
-        take: never queued, still queued (cancelled: compiling here costs the same, and is the real thing), or its
-        outputs' places taken."""
+        take: never queued, still queued (cancelled: compiling here costs the same, and is the real thing), its
+        outputs' places taken, or moving them there failed (_materialize)."""
         futures = self.waiting.get(key)
         if not futures: return None
         future = futures.pop(0)
@@ -375,15 +403,13 @@ class CompilePrefetch:
             if not res['usable'] or any(os.path.lexists(os.path.join(real, *o.split('/'))) for o in res['outputs']):
                 self.unused += 1
                 return None
-            self.hits += 1
-            if PREFETCH_CHECK: return self._checked(cmd, entry, real, res)
-            for d in res['dirs']: os.makedirs(os.path.join(real, *d.split('/')), exist_ok=True)
-            for o in res['outputs']:
-                dst = os.path.join(real, *o.split('/'))
-                os.makedirs(os.path.dirname(dst), exist_ok=True)
-                shutil.copyfile(os.path.join(res['stage'], *o.split('/')), dst)
-            return subprocess.CompletedProcess(cmd, res['rc'], _swap(res['stdout'], res['stage'], real),
-                                               _swap(res['stderr'], res['stage'], real))
+            if PREFETCH_CHECK:
+                self.hits += 1
+                return self._checked(cmd, entry, real, res)
+            proc = _materialize(cmd, res, real)
+            if proc is None: self.unused += 1
+            else: self.hits += 1
+            return proc
         finally:
             self._drop(res)
 
