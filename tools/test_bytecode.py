@@ -413,8 +413,9 @@ class CompilePrefetch:
 
     def finish(self, complete=True):
         """Stops the prefetch, removes its staging folders and writes the manifest; at the end of a run (complete),
-        prints the summary line. A run cut short (atexit) keeps the last manifest's other entries after its own: its
-        tests never got to theirs."""
+        prints the summary line. A run cut short (atexit) keeps, after its own, the last manifest's entries past as
+        many as it recorded: its tests never got to those. Not every entry it lacks: an edited test's old compile,
+        made before the run stopped, would then come back after every run cut short, and be prefetched each time."""
         if not self.started or self.finished: return
         self.finished = True
         if self.pool:
@@ -428,7 +429,7 @@ class CompilePrefetch:
         entries = self.record
         if not complete:
             mine = {json.dumps(e, sort_keys=True) for e in entries}
-            entries = entries + [e for e in self.previous if json.dumps(e, sort_keys=True) not in mine]
+            entries = entries + [e for e in self.previous[len(entries):] if json.dumps(e, sort_keys=True) not in mine]
         _write_manifest(entries)
         if not complete: return
         if PREFETCH_OFF:
