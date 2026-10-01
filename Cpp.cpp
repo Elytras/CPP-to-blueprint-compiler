@@ -2523,6 +2523,17 @@ bool FCompiler::Collect(std::string* Err)
                    "so " + Leaf.CppName + ", the one class made, would be abstract; give " + Method + " a body";
             return false;
         }
+        /* A base UE_CLASS pins to its owner's path (a header mods share) is cooked by that owner alone, and so is its
+           leaf, beside it: unpinned, every mod that includes the header would cook a leaf of its own, which no leaf
+           object is, so its casts to the leaf would fail. The owner is the base's path less the folders its C++ name
+           gives it; a base pinned elsewhere, as a game Blueprint is, leaves the leaf where it was. */
+        const std::string Natural = PathIn("", Base->CppName);
+        if (Leaf.UePackage.empty() && Base->UePackage.size() > Natural.size()
+            && Base->UePackage.compare(Base->UePackage.size() - Natural.size(), Natural.size(), Natural) == 0)
+        {
+            Leaf.UePackage = PathIn(Base->UePackage.substr(0, Base->UePackage.size() - Natural.size()), Leaf.CppName);
+            Leaf.UeName = LeafOf(Leaf.CppName) + "_C";
+        }
         /* A second macro on the base would read below as a stray subclass of the first leaf: say what it is. */
         if (!Base->FinalAs.empty() && Base->FinalAs != Leaf.CppName)
         {

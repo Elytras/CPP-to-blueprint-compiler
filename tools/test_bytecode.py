@@ -1940,8 +1940,8 @@ def final_as_shared():
     """FinalAsShared.h declares a UE_CLASS base and its UE_FINAL_AS beside it. FinalAsOwner, whose path the base's is,
     cooks both; FinalAsUser includes the header and cooks neither: its cast to the leaf and its call through one name
     the owner's FaShLeaf, the class every leaf object is, as a cast to the base names the owner's FaShBase."""
-    leaf = pending_asset('FinalAsOwner', 'FaShLeaf')
-    user = pending_asset('FinalAsUser')
+    leaf = os.path.join(os.path.dirname(asset('FinalAsOwner')), 'FaShLeaf')
+    user = asset('FinalAsUser')
     assert os.path.exists(leaf + '.uasset') and os.path.exists(os.path.join(os.path.dirname(leaf), 'FaShBase.uasset'))
     made = sorted(f for f in os.listdir(os.path.dirname(user)) if f.endswith('.uasset'))
     assert made == ['FinalAsUser.uasset'], made
@@ -1950,8 +1950,8 @@ def final_as_shared():
     keeps_invariants(user)
 
 
-pending('FinalAsTest: a UE_FINAL_AS in a shared header makes the base owner\'s leaf, imported by every other mod',
-        final_as_shared)
+final_as_shared()
+print('ok  FinalAsTest: a UE_FINAL_AS in a shared header makes the base owner\'s leaf, imported by every other mod')
 
 
 # ---- NestedTest
