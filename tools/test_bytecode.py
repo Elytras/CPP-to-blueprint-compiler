@@ -3883,7 +3883,7 @@ def preload_game_parent():
     subobject of its CDO: the class is serialized after each of them, as after a parent cooked in the same compile
     (preload_dso_kid). edl_parent_subobjects_serialized reads them off the game's package, so this needs --game."""
     assert GAME, 'needs --game: the parent CDO\'s subobjects are read off the game\'s package'
-    base = pending_asset('PreloadGameParent')
+    base = asset('PreloadGameParent')
     saved = list(invariants.GAME_CONTENT)
     invariants.GAME_CONTENT[:] = [GAME]
     try:
@@ -3893,7 +3893,9 @@ def preload_game_parent():
     assert not found, '%d findings, e.g. %s' % (len(found), '; '.join('%s %s: %s' % f for f in found[:2]))
 
 
-pending('PreloadGameParent: a child of a game Blueprint is serialized after its parent CDO\'s default subobjects', preload_game_parent)
+preload_game_parent()
+print('ok  PreloadGameParent: a child of a game Blueprint is serialized after every default subobject its parent\'s CDO '
+      'exports')
 
 
 # ---- TABLES: the package's own tables - names and their numbers, imports, exports, archetypes

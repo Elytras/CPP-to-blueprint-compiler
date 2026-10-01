@@ -527,6 +527,7 @@ struct FRecord
     std::set<std::string> PrivateFields;
     std::map<std::string, std::string> ScsNodes;    // `<X>__UeScsNode`: a game Blueprint's component -> its node's guid, 32 hex
     std::map<std::string, std::string> Subobjects;  // `<X>__UeSubobject`: a native component -> "<name> <class path>" on this CDO
+    std::vector<std::pair<std::string, std::string>> DefaultSubobjects;    // UeDefaultSubobjects: (name, class path), a game Blueprint CDO's
     std::map<std::string, std::string> TypeAliases; // `using Leaf = Game::...::Leaf;` in the class body
     std::set<std::string> FinalMethods;             // `virtual T F() final`: no subclass has an F of its own
     const Json* Defaults = nullptr;                 // UE_DEFAULTS: the static-init block, never lowered
@@ -2268,6 +2269,18 @@ bool FCompiler::Collect(std::string* Err)
                     {
                         End = std::min(List.find(' ', At), List.size());
                         if (End > At) R.Interfaces.push_back(List.substr(At, End - At));
+                    }
+            }
+            else if (Kind(C) == "VarDecl" && Name(C) == "UeDefaultSubobjects")
+            {
+                /* Every default subobject a game Blueprint's CDO exports, "<class path> <name>" joined by ';'. */
+                std::string List;
+                if (FindLiteral(C, List))
+                    for (size_t At = 0, End; At < List.size(); At = End + 1)
+                    {
+                        End = std::min(List.find(';', At), List.size());
+                        const size_t Space = List.find(' ', At);
+                        if (Space < End) R.DefaultSubobjects.emplace_back(List.substr(Space + 1, End - Space - 1), List.substr(At, Space - At));
                     }
             }
             else if (Kind(C) == "VarDecl" && Name(C) == "UeStructMeta")
@@ -12466,8 +12479,13 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     }
     /* A parent this compile cooks exports the native subobjects its own UE_DEFAULTS restate, and those a class below it
        restates, as the loop above makes this class's; this class is serialized after each (AddParentSubobject), whether
-       it restates it or not. A game Blueprint parent's exports are not known here. */
-    if (B->IsGenerated() && !B->bIsInterface)
+       it restates it or not. A game Blueprint parent's are the ones its package exports, which UeApi lists. */
+    if (B->IsNative() && !B->bIsInterface)
+    {
+        for (const auto& [Sub, Path] : B->DefaultSubobjects)
+            BP.AddParentSubobject(Sub, Path.substr(0, Path.rfind('.')), Path.substr(Path.rfind('.') + 1));
+    }
+    else if (B->IsGenerated() && !B->bIsInterface)
     {
         const FRecord* NativeParent = B;
         while (NativeParent && NativeParent->UePackage.compare(0, 8, "/Script/") != 0) NativeParent = Find(NativeParent->Base);
