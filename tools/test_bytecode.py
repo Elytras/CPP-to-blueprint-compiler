@@ -5651,6 +5651,21 @@ struct_lit_expr()
 print('ok  StructLitExpr: a struct literal with a member that is not a constant is a Make Struct, and runs as C++ runs it')
 
 
+def transient_const():
+    """A non-zero constant for a native struct literal's Transient member makes the Make Struct a computed one does,
+    which sets it: execStructConst skips the member (ScriptCore.cpp 3376-3405), so a literal of constants would drop the
+    value, and whether it counted would hang on another member. A zero there stays a literal, with no warning."""
+    base = pending_asset('TransientConst')
+    keeps_invariants(base)
+    for m in (0, 1):
+        got = VM(base).call('AllConst', M=m)
+        assert got == 43 + m, 'TransientConst.AllConst(%d) = %r, want %r' % (m, got, 43 + m)
+    assert 'is Transient' not in LOGS['TransientConst'], LOGS['TransientConst']
+
+
+pending('TransientConst: a non-zero constant for a Transient member of a struct literal is set', transient_const)
+
+
 def local_by_address():
     """A local holding a call's result, read once by a container function, stays a local: the Kismet container thunks
     read the container where it lies (Stack.MostRecentPropertyAddress after StepCompiledIn, execArray_Length and the
