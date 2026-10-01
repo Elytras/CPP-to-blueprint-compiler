@@ -6015,24 +6015,43 @@ comp_override_chain()
 comp_root_keep()
 
 
-# ---- Pending: what AssetGen does not do yet
-
-
 def comp_attach_inherited():
-    """SetupAttachment in UE_DEFAULTS attaches an own component to an inherited one: the root node names the parent
-    Blueprint's node and its class, or the native default subobject (CharacterMesh0 for ACharacter's Mesh)."""
-    folder = os.path.dirname(pending_asset('CompAttachInherited'))
+    """SetupAttachment in UE_DEFAULTS places a component as a constructor does. Attached to an inherited one, it is a
+    root node naming that parent: an ancestor Blueprint's node by its variable and class (Glow on AttachBase_C's Lamp),
+    or a native default subobject by its object name (AttachChar's Glow on CharacterMesh0, ACharacter's Mesh). Attached
+    to one of the class's own, it is one of that node's ChildNodes, at its socket (Tip on Glow, at Bulb). Each keeps its
+    offset under its parent; with no inherited root, the root is the first scene component left alone (AttachOwn's
+    Root, not Bulb), and its offset passes to what hangs below it. In a function, SetupAttachment attaches at once and
+    keeps the relative transform: AttachToComponent with KeepRelative (0), no welding."""
+    folder = os.path.dirname(asset('CompAttachInherited'))
     for cls, parent, owner, native in (('CompAttachInherited', 'Lamp', 'AttachBase_C', False),
-                                       ('AttachChar', 'CharacterMesh0', None, True)):
+                                       ('AttachChar', 'CharacterMesh0', 'None', True)):
         p, ci = class_pkg(os.path.join(folder, cls))
         si, nodes, roots, dsr = comp.scs(p, ci)
         glow = next(n for n in nodes.values() if n.name == 'Glow')
-        assert glow.index in roots and glow.parent == parent and glow.native == native, (cls, glow.parent, glow.native)
-        assert owner is None or glow.owner == owner, (cls, glow.owner)
-        keeps_invariants(os.path.join(folder, cls))
+        assert glow.index in roots and (glow.parent, glow.owner, glow.native) == (parent, owner, native), (
+            cls, glow.parent, glow.owner, glow.native)
+    p, ci = class_pkg(os.path.join(folder, 'CompAttachInherited'))
+    glow, tip = node_named(p, ci, 'Glow'), node_named(p, ci, 'Tip')
+    assert glow.children == [tip.index] and comp.tag_name(p, comp.tags_at(p, tip.index)['AttachToName']) == 'Bulb'
+    want = {'Glow': (10.0, 0.0, 100.0), 'Tip': (10.0, 5.0, 100.0), 'Pivot': (0.0, 0.0, 20.0)}
+    got = {var: world_location(p, ci, var) for var in want}
+    assert got == want, 'components sit at %s from the actor, want %s' % (got, want)
+    p, ci = class_pkg(os.path.join(folder, 'AttachOwn'))
+    si, nodes, roots, dsr = comp.scs(p, ci)
+    assert [nodes[r].name for r in roots] == ['Root'], [nodes[r].name for r in roots]
+    want = {'Arm': (100.0, 0.0, 50.0), 'Bulb': (100.0, 0.0, 60.0)}
+    got = {var: world_location(p, ci, var) for var in want}
+    assert got == want, 'components sit at %s from the actor, want %s' % (got, want)
+    vm = VM(asset('CompAttachInherited'), {}, Pivot=Obj('SceneComponent'), Lamp=Obj('PointLightComponent'))
+    vm.call('ReceiveBeginPlay')
+    assert vm.log == [('K2_AttachToComponent', vm.self.vars['Pivot'], [vm.self.vars['Lamp'], 'None', 0, 0, 0, False])], vm.log
+    for cls in ('CompAttachInherited', 'AttachBase', 'AttachChar', 'AttachOwn'): keeps_invariants(os.path.join(folder, cls))
+    print('ok  CompAttachInherited: SetupAttachment attaches a component to an inherited Blueprint or native one, or at a\n'
+          '    socket of one of its own class\'s, each keeping its offset; in a function it attaches at once')
 
 
-pending('CompAttachInherited: an own component attached to an inherited Blueprint or native component', comp_attach_inherited)
+comp_attach_inherited()
 
 
 # ---- Refusals: each of these would build a package the engine mishandles
@@ -6068,11 +6087,20 @@ for mod, body, why, top in (
                             '        ESpawnActorCollisionHandlingMethod::Undefined, nullptr);\n  }\n', 'UserConstructionScript', OBJECTS),
         # BPGC-32 / NODE-23: AddComponent finds a template by name in ComponentTemplates, which a mod class has none of.
         ('AddByName', '  void ReceiveBeginPlay() { AddComponent(FName("X"), false, FTransform(), nullptr, false); }\n',
-         'component template', '')):
+         'component template', ''),
+        # SetupAttachment: nodes in a cycle are reached from no root node, so none is made; an inherited component's
+        # node is its own class's to place; a socket that is no literal name would be dropped.
+        ('AttachCycle', '  UE_COMPONENT(USceneComponent, A);\n  UE_COMPONENT(USceneComponent, B);\n'
+                        '  UE_DEFAULTS { A->SetupAttachment(B); B->SetupAttachment(A); }\n', 'a cycle', ''),
+        ('AttachInherited', '', 'an inherited one', CLASH_BASE + 'class AttachKid : public ClashBase {\npublic:\n'
+                                                    '  UE_COMPONENT(USceneComponent, Own);\n'
+                                                    '  UE_DEFAULTS { Lamp->SetupAttachment(Own); }\n};\n'),
+        ('AttachSocket', '  UE_COMPONENT(USceneComponent, A);\n  UE_COMPONENT(USceneComponent, B);\n  FName Where;\n'
+                         '  UE_DEFAULTS { B->SetupAttachment(A, Where); }\n', 'literal name', '')):
     refused(mod, body, why, top)
 print('ok  refused: component names already taken under the actor (DefaultSceneRoot, a parent Blueprint\'s component,\n'
       '    a native default subobject or member, a game Blueprint\'s SCS node), a spawn in UserConstructionScript,\n'
-      '    AddComponent by template name')
+      '    AddComponent by template name, SetupAttachment in a cycle, of an inherited component or at a computed socket')
 
 
 def refused_or_warned(mod, body, why, top=''):

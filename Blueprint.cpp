@@ -185,7 +185,13 @@ void FBlueprintClass::AddComponent(const std::string& Name, FIndex ComponentClas
                                    bool bIsSceneComponent, const std::vector<FPropertyDef>& Defaults,
                                    const std::vector<uint8>& NativeTail)
 {
-    Components.push_back(FComponent{ Name, ComponentClass, ComponentCdo, bIsSceneComponent, Defaults, NativeTail });
+    Components.push_back(FComponent{ Name, ComponentClass, ComponentCdo, bIsSceneComponent, Defaults, NativeTail, {} });
+}
+
+void FBlueprintClass::AttachComponent(const std::string& Name, const FAttachment& Attachment)
+{
+    for (FComponent& C : Components)
+        if (C.Name == Name) C.Attachment = Attachment;
 }
 
 void FBlueprintClass::AddSubobjectOverride(const std::string& Name, const std::string& Property, FIndex ComponentClass,
@@ -497,10 +503,25 @@ void FBlueprintClass::Finish()
     Not a root node naming it in ParentComponentOrVariableName: the SCS's PostLoad
     (FixupRootNodeParentReferences, cooked builds too) looks such a name up only among native components
     and ancestor Blueprints' nodes, and clears it when the parent is a node of this same SCS.
+    SetupAttachment (AttachComponent) moves a component off that root: under another of this class's, as one
+    of its ChildNodes, or under an inherited one, as a root node that names it - which is how the game's own
+    Blueprints save both (BP_PlayerCharacter's FilmFaceLight on CharacterMesh0, BP_PumpkinFace_Item's
+    PointLight on BP_Pumpkin_Item_C's DefaultSceneRoot). The root is then the first scene component left alone.
     */
+    auto IndexOf = [&](const std::string& Name) {
+        return int32(std::find_if(Components.begin(), Components.end(), [&](const FComponent& C) { return C.Name == Name; })
+                     - Components.begin());
+    };
     const int32 FirstScene = int32(std::find_if(Components.begin(), Components.end(),
-                                                [](const FComponent& C) { return C.bIsScene; })
+                                                [](const FComponent& C) { return C.bIsScene && C.Attachment.Parent.empty(); })
                                    - Components.begin());
+    std::vector<int32> ParentOf(Components.size(), -1);        // the node whose ChildNodes list it, -1 for a root node
+    for (size_t I = 0; I < Components.size(); ++I)
+    {
+        const FComponent& C = Components[I];
+        if (C.Attachment.bOwn) ParentOf[I] = IndexOf(C.Attachment.Parent);
+        else if (C.bIsScene && C.Attachment.Parent.empty() && int32(I) != FirstScene) ParentOf[I] = FirstScene;
+    }
     for (size_t I = 0; I < Components.size(); ++I)
     {
         const FComponent& C = Components[I];
@@ -524,12 +545,12 @@ void FBlueprintClass::Finish()
 
         uint32 NodeGuid[4];
         ScsNodeGuid(ClassName, C.Name, NodeGuid);
-        const bool bParent = int32(I) == FirstScene;
         std::vector<FIndex> Children;
-        for (size_t J = 0; bParent && J < Components.size(); ++J)
-            if (Components[J].bIsScene && J != I) Children.push_back(Exp(RowFirstComponent + 2 * int32(J) + 1));
+        for (size_t J = 0; J < Components.size(); ++J)
+            if (ParentOf[J] == int32(I)) Children.push_back(Exp(RowFirstComponent + 2 * int32(J) + 1));
         const FIndex CompClass = C.Class;
         const std::string VarName = C.Name;
+        const FAttachment At = C.Attachment;
 
         FExport Node;
         Node.ClassIndex = ScsNodeClass;
@@ -544,6 +565,14 @@ void FBlueprintClass::Finish()
         Node.Serialize = [=](FArc& Ar) {
             Tag(Ar, "ComponentClass", "ObjectProperty", [=](FArc& V) { V.Idx(CompClass); });
             Tag(Ar, "ComponentTemplate", "ObjectProperty", [=](FArc& V) { V.Idx(Exp(RowTemplate)); });
+            /* USCS_Node's own order (SCS_Node.h 43-61), as the game's nodes keep it. */
+            if (!At.Socket.empty()) Tag(Ar, "AttachToName", "NameProperty", [=](FArc& V) { V.Name(At.Socket); });
+            if (!At.bOwn && !At.Parent.empty())
+            {
+                Tag(Ar, "ParentComponentOrVariableName", "NameProperty", [=](FArc& V) { V.Name(At.Parent); });
+                if (At.bNative) TagBool(Ar, "bIsParentComponentNative", true);
+                else Tag(Ar, "ParentComponentOwnerClassName", "NameProperty", [=](FArc& V) { V.Name(At.OwnerClass); });
+            }
             if (!Children.empty())
                 Tag(Ar, "ChildNodes", "ArrayProperty", [=](FArc& V) {
                     V.I32(int32(Children.size()));
@@ -568,11 +597,11 @@ void FBlueprintClass::Finish()
         Scs.CreateBeforeSer.push_back(Exp(RowFirstComponent + 2 * int32(I) + 1).V);
     Scs.SerBeforeCreate = { ScsClass.V, ScsCdo.V };
     Scs.CreateBeforeCreate = { Exp(RowClass).V };
-    std::vector<FIndex> Roots, All;            // Roots: everything but the first scene component's children
+    std::vector<FIndex> Roots, All;            // Roots: every node no other node lists as a child
     if (bKeepDefaultRoot) { Roots.push_back(Exp(RowScsNode)); All.push_back(Exp(RowScsNode)); }
     for (size_t I = 0; I < Components.size(); ++I)
     {
-        if (!Components[I].bIsScene || int32(I) == FirstScene) Roots.push_back(Exp(RowFirstComponent + 2 * int32(I) + 1));
+        if (ParentOf[I] < 0) Roots.push_back(Exp(RowFirstComponent + 2 * int32(I) + 1));
         All.push_back(Exp(RowFirstComponent + 2 * int32(I) + 1));
     }
     Scs.Serialize = [=](FArc& Ar) {

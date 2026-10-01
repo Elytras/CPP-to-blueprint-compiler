@@ -238,6 +238,19 @@ bool DefaultAssignment(const Json& S, const Json*& Lhs, const Json*& Rhs, const 
     return true;
 }
 
+/* A UE_DEFAULTS statement `Comp->SetupAttachment(Parent, Socket)`: the call's MemberExpr, the object it is called on,
+   and its two arguments as written (Socket a CXXDefaultArgExpr when left out). False for any other statement. */
+bool AttachmentCall(const Json& S, const Json*& Callee, const Json*& Child, const Json*& Parent, const Json*& Socket)
+{
+    const Json* Call = Strip(&S);
+    Callee = Call && Kind(*Call) == "CXXMemberCallExpr" ? Strip(First(*Call)) : nullptr;
+    if (!Callee || Kind(*Callee) != "MemberExpr" || Name(*Callee) != "SetupAttachment") return false;
+    Child = Strip(First(*Callee));
+    Parent = Strip(Nth(*Call, 1));
+    Socket = Nth(*Call, 2);
+    return Child != nullptr;
+}
+
 /* An inherited set's or map's default P, made what the editor saves (PropertySet.cpp 359-429, PropertyMap.cpp
    400-472) against Parent, the parent CDO's value it loads over: the parent's elements (a map's keys) P lacks as
    removed, and of P's own only those the parent lacks (a map's pairs whose key it lacks or maps elsewhere). Elements
@@ -11804,6 +11817,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     std::map<std::string, FOverride> SubobjectDefaults;
     std::vector<FPropertyDef> InheritedDefaults;
     std::map<std::string, FPropertyDef> InterfaceVarDefaults;     // a default for a variable an implemented interface declares
+    std::map<std::string, FBlueprintClass::FAttachment> Attachments;    // a UE_COMPONENT -> where SetupAttachment puts it
     if (R.Defaults && !R.bIsPatch)      // a patch's defaults are tags of the game's own package (GeneratePatch)
     {
         const std::string Where = R.CppName + "::UE_DEFAULTS";
@@ -11811,15 +11825,89 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             auto It = FieldOwner.find(M.value("referencedMemberDecl", std::string()));
             return It == FieldOwner.end() ? std::string() : It->second;
         };
+        /* `Comp->SetupAttachment(Parent, Socket)`, a constructor's way to place a component, read and never called:
+           Comp is one of this class's UE_COMPONENTs, Parent another of them, or a component the class inherits - a
+           Blueprint ancestor's, which is a node of its SCS, or a native default subobject. Which, the class that
+           declares Parent says. The socket is a literal name or none: any other would be dropped. */
+        auto Attach = [&](const Json& Child, const Json* Parent, const Json* Socket) {
+            const std::string Comp = Name(Child);
+            if (Kind(Child) != "MemberExpr" || OwnerOf(Child) != R.CppName || !R.Components.count(Comp))
+            { *Err = Where + ": SetupAttachment places a component this class declares with UE_COMPONENT; an inherited one "
+                     "stays where its class put it"; return false; }
+            if (Attachments.count(Comp)) { *Err = Where + ": " + Comp + " is attached twice"; return false; }
+            const Json* Self = Parent && Kind(*Parent) == "MemberExpr" ? Strip(First(*Parent)) : nullptr;
+            if (!Self || Kind(*Self) != "CXXThisExpr")
+            { *Err = Where + ": " + Comp + "->SetupAttachment takes a component of this class or of a class above it, by its "
+                     "member name"; return false; }
+            FBlueprintClass::FAttachment A;
+            bool bComputed = false;         // anything but a literal: a variable, a call, an operator
+            std::function<void(const Json&)> Scan = [&](const Json& N) {
+                const std::string K = Kind(N);
+                bComputed = bComputed || K == "DeclRefExpr" || K == "MemberExpr" || K == "CallExpr" || K == "CXXMemberCallExpr"
+                            || K == "ConditionalOperator" || K == "BinaryOperator";
+                ForEach(N, Scan);
+            };
+            if (Socket && Kind(*Socket) != "CXXDefaultArgExpr") { Scan(*Socket); FindLiteral(*Socket, A.Socket); }
+            if (bComputed)
+            { *Err = Where + ": " + Comp + "->SetupAttachment's socket is a literal name (FName(\"hand_r\")) or none"; return false; }
+
+            const std::string Of = Name(*Parent);
+            const FRecord* DR = Find(OwnerOf(*Parent));
+            const bool bBlueprint = DR && (!DR->IsNative() || (DR->UeName.size() > 2 && DR->UeName.compare(DR->UeName.size() - 2, 2, "_C") == 0));
+            if (!DR) { *Err = Where + ": cannot tell which class declares " + Of; return false; }
+            if (DR == &R || bBlueprint)
+            {
+                /* This class's: one of its own node's ChildNodes. An ancestor Blueprint's: a root node naming that node's
+                   variable and the class whose SCS has it, the only one FixupRootNodeParentReferences searches. */
+                if (!DR->Components.count(Of) && !DR->ScsNodes.count(Of))
+                { *Err = Where + ": " + Of + (DR->IsNative() ? " is a variable of the Blueprint " + DR->UeName + ", and its header "
+                         "does not say it is a node of its construction script - re-dump the game with the Dumper-7 fork "
+                         "(ScsNode=) and regenerate UeApi" : " is not a UE_COMPONENT"); return false; }
+                if (Of == Comp) { *Err = Where + ": " + Comp + " is attached to itself"; return false; }
+                A.bOwn = DR == &R;
+                A.Parent = A.bOwn ? Of : UeNameOf(DR, Of);
+                if (!A.bOwn) A.OwnerClass = ClassOf(*DR);
+            }
+            else
+            {
+                /* A native default subobject, which the node names by its object name (CharacterMesh0 for ACharacter's
+                   Mesh): the nearest engine class's CDO has it under that name, which UeApi carries. */
+                const FRecord* Engine = Find(R.Base);
+                while (Engine && Engine->UePackage.compare(0, 8, "/Script/") != 0) Engine = Find(Engine->Base);
+                const std::string* Sub = nullptr;
+                if (Engine)
+                    if (auto It = Engine->Subobjects.find(Of); It != Engine->Subobjects.end()) Sub = &It->second;
+                if (!Sub || Sub->find(' ') == std::string::npos)
+                { *Err = Where + ": UeApi does not say which default subobject " + Of + " is on " + (Engine ? Engine->UeName : R.Base)
+                         + " - regenerate it with genueapi, which reads that off the object dump; a member that is no "
+                         "default subobject is attached to at run time, with AttachToComponent"; return false; }
+                A.Parent = Sub->substr(0, Sub->find(' '));
+                A.bNative = true;
+            }
+            Attachments[Comp] = A;
+            return true;
+        };
         const Json* Body = nullptr;
         ForEach(*R.Defaults, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Body = &C; });
         bool bOk = true;
         if (Body)
             ForEach(*Body, [&](const Json& S) {
                 if (!bOk) return;
+                const Json *Callee = nullptr, *Child = nullptr, *Parent = nullptr, *Socket = nullptr;
+                if (AttachmentCall(S, Callee, Child, Parent, Socket))
+                {
+                    const auto On = MethodOwner.find(Callee->value("referencedMemberDecl", std::string()));
+                    const FRecord* OnR = On == MethodOwner.end() ? nullptr : Find(On->second);
+                    if (OnR && OnR->IsNative() && OnR->Forwards.count("SetupAttachment"))
+                    {
+                        bOk = Attach(*Child, Parent, Socket);
+                        return;
+                    }
+                }
                 const Json *Lhs = nullptr, *Rhs = nullptr, *Owner = nullptr;
                 if (!DefaultAssignment(S, Lhs, Rhs, Owner))
-                { *Err = Where + ": every statement is `Field = value;` or `Component->Field = value;`"; bOk = false; return; }
+                { *Err = Where + ": every statement is `Field = value;`, `Component->Field = value;` or "
+                         "`Component->SetupAttachment(Parent);`"; bOk = false; return; }
 
                 /* `Comp->Field` reaches through a component; a bare `Field` targets this class's
                    own CDO. Which of the three destinations a statement means is decided by who
@@ -11913,6 +12001,21 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 O.Defaults.push_back(PD);
             });
         if (!bOk) return false;
+        /* Attached to one another, this class's components must still form a tree: a node in a cycle is no root node
+           and no child of one, so ExecuteScriptOnActor never reaches it and the component is never made. */
+        for (const auto& Entry : Attachments)
+        {
+            std::string At = Entry.first, Path = Entry.first;
+            for (size_t Step = 0; Step <= Attachments.size(); ++Step)
+            {
+                const auto It = Attachments.find(At);
+                if (It == Attachments.end() || !It->second.bOwn) break;
+                At = It->second.Parent;
+                Path += " -> " + At;
+                if (At == Entry.first || Step == Attachments.size())
+                { *Err = Where + ": SetupAttachment attaches " + Path + ", a cycle no component of which is ever made"; return false; }
+            }
+        }
     }
 
     /* The first scene component is the actor's root, and the engine puts it at the spawn transform: it never reads the
@@ -11940,13 +12043,22 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             for (const auto& [Member, Spec] : A->Subobjects)
                 bRootInherited = bRootInherited || (Spec.rfind('.') != std::string::npos && IsScene(Find("U" + Spec.substr(Spec.rfind('.') + 1))));
         }
-        std::vector<std::pair<std::string, const FRecord*>> Scene;     // this class's scene components, the root first
+        std::vector<std::pair<std::string, const FRecord*>> Scene;     // the root, then the components attached to it
         for (const Json* F : R.Fields)
         {
             const size_t Star = TypeOf(*F).find('*');
             const FRecord* CR = Star == std::string::npos ? nullptr : Find(StripTypeKeywords(TypeOf(*F).substr(0, Star)));
             if (R.Components.count(Name(*F)) && IsScene(CR)) Scene.emplace_back(Name(*F), CR);
         }
+        /* SetupAttachment takes a component off the root: under another of this class's, which passes the root's
+           transform on to it, or under an inherited one. The root is the first scene component it leaves alone. */
+        const auto RootAt = std::find_if(Scene.begin(), Scene.end(), [&](const auto& S) { return !Attachments.count(S.first); });
+        const std::string RootName = RootAt == Scene.end() ? std::string() : RootAt->first;
+        Scene.erase(std::remove_if(Scene.begin(), Scene.end(), [&](const auto& S) {
+            const auto At = Attachments.find(S.first);
+            return At != Attachments.end() && !(At->second.bOwn && At->second.Parent == RootName);
+        }), Scene.end());
+        std::stable_partition(Scene.begin(), Scene.end(), [&](const auto& S) { return S.first == RootName; });
         /* A component's vector default: X, Y, Z (Or each, when it has none), and the def to write another like it. */
         struct FVec { std::array<double, 3> V; std::optional<FPropertyDef> Def; };
         auto Read = [](const std::vector<FPropertyDef>& Defs, const char* Prop, double Or) {
@@ -12127,6 +12239,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             const FIndex CompClass = BP.EngineClass(CR->UePackage, CR->UeName);
             const FIndex CompCdo = BP.ClassDefaultObject(CR->UePackage, CR->UeName);
             BP.AddComponent(FieldName, CompClass, CompCdo, bIsScene, ComponentDefaults[FieldName], NativeTail(CR));
+            if (auto At = Attachments.find(FieldName); At != Attachments.end()) BP.AttachComponent(FieldName, At->second);
             ComponentDefaults.erase(FieldName);
         }
         if (auto Rep = Decl.Replicated.find(FieldName); Rep != Decl.Replicated.end())
