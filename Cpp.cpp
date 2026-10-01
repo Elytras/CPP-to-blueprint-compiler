@@ -13484,11 +13484,12 @@ std::optional<std::string> TreeDifference(const Json& A, const Json& B, uint64* 
 
 /* astcheck: proves on one dump that FDumpFilter changes nothing (DESIGN.md, "Compile time: the UeApi header cost").
    First, the filter's output must not depend on where the dump is cut: the pipe's 256 KB chunks, 7-byte chunks and
-   1 to 4096 bytes from a fixed-seed LCG must give the same bytes. Then the tree a compile builds from the filter's
-   output must be the reference tree (TreeDifference): FAstSax's from the dump itself, but dropping FrozenDroppedAstKey's
-   keys, so that an edit to DroppedAstKey, which the filter and FAstSax both follow, shows up too. Prints `same` and the
-   sizes, or the first difference; returns the exit code. The dump, its filtered copy and a tree, then both trees, are
-   in memory at once: about 1 GB for an FSD.h mod, so run one at a time. */
+   1 to 4096 bytes from a fixed-seed LCG must give the same bytes. So must 1-byte chunks, which cut at every byte but
+   cost a Feed per byte: only for a dump of 4 MB or less, such as Edge.cpp's. Then the tree a compile builds from the
+   filter's output must be the reference tree (TreeDifference): FAstSax's from the dump itself, but dropping
+   FrozenDroppedAstKey's keys, so that an edit to DroppedAstKey, which the filter and FAstSax both follow, shows up too.
+   Prints `same` and the sizes, or the first difference; returns the exit code. The dump, its filtered copy and a tree,
+   then both trees, are in memory at once: about 1 GB for an FSD.h mod, so run one at a time. */
 int CheckDumpFilter(std::vector<std::string> Dump)
 {
     uint64 RawBytes = 0;
@@ -13500,9 +13501,11 @@ int CheckDumpFilter(std::vector<std::string> Dump)
             Seed = Seed * 1664525u + 1013904223u;       // the Numerical Recipes LCG: the same cuts on every run
             return size_t(Seed >> 20) + 1;
         } },
+        { "1-byte chunks", [] { return size_t(1); } },
     };
+    const size_t Count = RawBytes <= (4 << 20) ? std::size(Chunkings) : std::size(Chunkings) - 1;
     std::string Filtered = FilteredDump(Dump, Chunkings[0].second);
-    for (size_t I = 1; I < std::size(Chunkings); ++I)
+    for (size_t I = 1; I < Count; ++I)
     {
         const std::string Other = FilteredDump(Dump, Chunkings[I].second);
         if (Other == Filtered) continue;
