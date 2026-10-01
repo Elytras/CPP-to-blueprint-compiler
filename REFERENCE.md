@@ -2724,6 +2724,7 @@ Notes:
 |---|---|---|
 | `AddComponentByType<USceneComponent>(this)` | The Add Component by Class node (`AActor::AddComponentByClass`), returning the component as a `T*`. It is created at the owner's origin, and a scene component attaches to the owner's root. | Yes |
 | `AddComponentByType<UCharges>(this, ChargesClass, true)` | The class can be picked at run time as a `TSubclassOf<T>`; it is `T` by default. The third argument is bManualAttachment: with `true`, a scene component is not attached. A component class the mod declares itself works here. | Yes |
+| `AddComponentByType<UAbstractComp>(this)`, where the class has a `= 0` method left or is a UE_FINAL_AS base | Refused: "is an abstract class ... which the engine may not construct". AddComponentByClass constructs it with NewObject, which asserts on an abstract class in a Development game. Add a subclass that defines every `= 0` method, or the UE_FINAL_AS leaf, which the message names. Only a class the call names is checked. | Refused |
 | `AddComponentDeferred<UCharges>(this)`, then `FinishComponent(this, C)` | The Add Component node with exposed pins. Registration, and with it the component's BeginPlay, waits for `FinishComponent` (`AActor::FinishAddComponent`), so the values you set in between are the first ones it sees. | Yes |
 | `AttachToComponent(Muzzle, Barrel)` | `K2_AttachToComponent` with one attachment rule for location, rotation and scale (SnapToTarget unless you pass another) and welding on. Returns whether it attached. | Yes |
 | `AttachToComponent(Gun, Hand, FName("hand_r"), EAttachmentRule::KeepRelative, false)` | The same at a socket, with another rule and without welding. For a different rule per channel, call `Gun->K2_AttachToComponent(...)` yourself. | Yes |
@@ -2965,8 +2966,8 @@ Notes:
 | `NewObject<UObject>(this, Kind)` | The class picked at run time, as a `TSubclassOf<T>`. | Yes |
 | `CreateWidget<UUserWidget>(PlayerController, HudClass)` | The Create Widget node (`UWidgetBlueprintLibrary::Create`), with the calling object as world context. The owning player may be null. | Yes |
 | `NewObject<AActor>(this)`, `SpawnActor<UObject>(UObject::StaticClass(), Where)` | Refused by clang on the calling line: "no matching function", then a note naming the constraint `T` fails. `SpawnActor` and `SpawnActorDeferred` take an actor class, `AddComponentByType` and `AddComponentDeferred` a component class, `CreateWidget` a widget class, and `NewObject` any other class. | Refused |
-| `SpawnActor<AShape>(AShape::StaticClass(), Where)`, where the class has a `= 0` method left | Warns: "is an abstract class". SpawnActor makes no actor of an abstract class and returns None. Only a class the call names is checked (`X::StaticClass()`); one picked at run time is not. | Warns |
-| `NewObject<USpec>(this)`, where the class has a `= 0` method left | Refused: "is an abstract class ... which the engine may not construct". SpawnObject makes one in a Shipping game and asserts in a Development one; the editor's Construct Object node refuses the class too. Construct a subclass that defines every `= 0` method. Only a class the call names is checked (`X::StaticClass()`, or `NewObject`'s default). | Refused |
+| `SpawnActor<AShape>(AShape::StaticClass(), Where)`, where the class has a `= 0` method left or is a UE_FINAL_AS base | Warns: "is an abstract class" (for a UE_FINAL_AS base, naming the leaf to spawn). SpawnActor makes no actor of an abstract class and returns None. Only a class the call names is checked (`X::StaticClass()`); one picked at run time is not. | Warns |
+| `NewObject<USpec>(this)`, where the class has a `= 0` method left or is a UE_FINAL_AS base | Refused: "is an abstract class ... which the engine may not construct". SpawnObject makes one in a Shipping game and asserts in a Development one; the editor's Construct Object node refuses the class too. Construct a subclass that defines every `= 0` method, or the UE_FINAL_AS leaf the message names. Only a class the call names is checked (`X::StaticClass()`, or `NewObject`'s default). | Refused |
 | `NewObject<UProbe>(nullptr)` | Warns: "SpawnObject with no Outer (None) makes nothing and returns None". Pass the object that owns it, such as `this`. | Warns |
 
 ```cpp
@@ -5786,11 +5787,14 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   <Class>::<Helper> spawns an actor and UserConstructionScript calls it`, since it may run elsewhere too.
 - `warning: <Class>::<Function>: <Target> is an abstract class (a method of it is `= 0`), and the engine spawns no
   actor of one`: `SpawnActor<T>` or `SpawnActorDeferred<T>` of a class with a pure virtual left, named by the call
-  (`X::StaticClass()`). SpawnActor makes no actor of it and returns None. The build goes on. Fix: spawn a subclass
-  that defines every `= 0` method. See [Objects and widgets](#objects-and-widgets).
+  (`X::StaticClass()`), or of a UE_FINAL_AS base (`(UE_FINAL_AS <Leaf>'s base)`, then `spawn <Leaf>`). SpawnActor
+  makes no actor of it and returns None. The build goes on. Fix: spawn a subclass that defines every `= 0` method, or
+  the leaf. See [Objects and widgets](#objects-and-widgets).
 - `<Function>: <Target> is an abstract class (a method of it is `= 0`), which the engine may not construct`:
-  `NewObject<T>` of such a class. SpawnObject makes one in a Shipping game and asserts in a Development one. Fix:
-  construct a subclass that defines every `= 0` method. See [Objects and widgets](#objects-and-widgets).
+  `NewObject<T>` or `AddComponentByType<T>` of such a class, or of a UE_FINAL_AS base (`(UE_FINAL_AS <Leaf>'s base)
+  ... construct <Leaf>`). SpawnObject and AddComponentByClass make one with NewObject, in a Shipping game, and assert
+  in a Development one. Fix: construct a subclass that defines every `= 0` method, or the leaf. See
+  [Objects and widgets](#objects-and-widgets).
 - `warning: <Class>::<Function>: SpawnObject with no Outer (None) makes nothing and returns None`: `NewObject<T>(nullptr)`.
   The build goes on. Fix: pass the object that owns it, such as `this`. See [Objects and widgets](#objects-and-widgets).
 - `warning: <Function>: a deferred spawn (SpawnActorDeferred, BeginDeferredActorSpawnFromClass) is not finished in

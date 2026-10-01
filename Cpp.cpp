@@ -6000,25 +6000,32 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
        nowhere. SpawnObject of an abstract class is refused: it ends in NewObject, whose allocation holds that "it is
        illegal to create an abstract class" - asserting in a Development game, compiled out of a Shipping one, which
        makes it (UObjectGlobals.cpp 2362) - and the editor's Construct Object node refuses the class
-       (K2Node_GenericCreateObject.cpp 13-64). */
+       (K2Node_GenericCreateObject.cpp 13-64). AddComponentByClass (AddComponentByType) ends in the same NewObject
+       (ActorConstruction.cpp 1140-1163), so it is refused alike. A UE_FINAL_AS base is cooked Abstract too: the
+       message names its leaf, the class to make. */
     const bool bSpawns = MethodName == "BeginDeferredActorSpawnFromClass" || MethodName == "BeginSpawningActorFromClass";
-    if ((bSpawns || MethodName == "SpawnObject") && Cur && Out.Args.size() == Parms.size())
+    const bool bMakes = MethodName == "SpawnObject" || MethodName == "AddComponentByClass";
+    if ((bSpawns || bMakes) && Cur && Out.Args.size() == Parms.size())
         for (size_t I = 0; I < Parms.size(); ++I)
         {
             const FArgIR& A = Out.Args[I];
             const std::string Where = Cur->CppName + "::" + CurFnName;
             const auto Held = A.K == FArgIR::Local ? LocalClass.find(A.S) : LocalClass.end();
             const FRecord* Named = A.K == FArgIR::ObjConst ? A.Class : Held != LocalClass.end() ? Held->second : nullptr;
-            if (Named && IsAbstract(*Named) && !bSpawns)
+            const std::string Why = !Named ? std::string() : Named->FinalAs.empty() ? "a method of it is `= 0`"
+                                  : "UE_FINAL_AS " + Named->FinalAs + "'s base";
+            if (Named && IsAbstract(*Named) && bMakes)
             {
-                *Err = CurFnName + ": " + Named->CppName + " is an abstract class (a method of it is `= 0`), which the engine "
-                       "may not construct (a Development game asserts): construct a subclass";
+                *Err = CurFnName + ": " + Named->CppName + " is an abstract class (" + Why + "), which the engine may not "
+                       "construct (a Development game asserts): construct "
+                     + (Named->FinalAs.empty() ? std::string("a subclass") : Named->FinalAs);
                 return false;
             }
             if (Named && IsAbstract(*Named) && WarnedMakes.insert(Where + " " + Named->CppName).second)
-                printf("  warning: %s: %s is an abstract class (a method of it is `= 0`), and the engine spawns no actor "
-                       "of one: the spawn returns None\n", Where.c_str(), Named->CppName.c_str());
-            if (!bSpawns && Parms[I].compare(0, 5, "Outer") == 0 && A.K == FArgIR::NullObj && WarnedMakes.insert(Where + " Outer").second)
+                printf("  warning: %s: %s is an abstract class (%s), and the engine spawns no actor of one: the spawn "
+                       "returns None%s\n", Where.c_str(), Named->CppName.c_str(), Why.c_str(),
+                       Named->FinalAs.empty() ? "" : ("; spawn " + Named->FinalAs).c_str());
+            if (MethodName == "SpawnObject" && Parms[I].compare(0, 5, "Outer") == 0 && A.K == FArgIR::NullObj && WarnedMakes.insert(Where + " Outer").second)
                 printf("  warning: %s: SpawnObject with no Outer (None) makes nothing and returns None: pass the object "
                        "that owns it, such as this\n", Where.c_str());
         }

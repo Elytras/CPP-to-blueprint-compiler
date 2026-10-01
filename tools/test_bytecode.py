@@ -7925,7 +7925,8 @@ def spawn_abstract_component():
                       'UE_FINAL_AS(UFaCompBase, UFaComp);\n')
 
 
-pending('SpawnAbstract: AddComponentByType of an abstract component class is refused', spawn_abstract_component)
+spawn_abstract_component()
+print('ok  SpawnAbstract: AddComponentByType of an abstract component class is refused, a UE_FINAL_AS base\'s naming the leaf')
 
 
 def wait_hold():
