@@ -8429,6 +8429,15 @@ bool FCompiler::CheckMemberNames(const FRecord& R, std::string* Err) const
     for (const std::string& C : R.Components)
         if (Lower(C) == "defaultsceneroot")
         { *Err = R.CppName + "::" + C + ": DefaultSceneRoot is the root the construction script adds; rename the component"; return false; }
+    /* ...and the class's variable that holds it, where the SCS lists it (Generate): an actor's member of that name would
+       be a second variable of one name, or, in a subclass, the one FindFProperty finds first, which ExecuteNodeOnActor
+       then stores the root in (SCS_Node.cpp 159-170). */
+    bool bActor = false;
+    for (const FRecord* A = &R; A && !bActor; A = A->Base.empty() ? nullptr : Find(A->Base)) bActor = A->UeName == "Actor";
+    for (const Json* F : R.Fields)
+        if (bActor && Lower(Name(*F)) == "defaultsceneroot")
+        { *Err = R.CppName + "::" + Name(*F) + ": DefaultSceneRoot is the variable of the root an actor's construction script "
+                 "adds; rename it"; return false; }
     for (const FRecord* A = R.Base.empty() ? nullptr : Find(R.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
         for (const auto& [Member, Spec] : A->Subobjects)
             for (const std::string& C : R.Components)
@@ -12847,6 +12856,19 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             bReplicatesAnything = true;
         }
         AddVariable(TypeOf(*F), PD);
+    }
+    /* Where the SCS lists its DefaultSceneRoot node, the class has a variable of that name, as the editor gives every node
+       it lists one (KismetCompiler.cpp 884-898; ENE_EnemySpawner's DefaultSceneRoot, BlueprintVisible | NonTransactional
+       | InstancedReference): ExecuteNodeOnActor stores the component there, and with none logs on every spawn that it
+       found no such property (SCS_Node.cpp 159-178). First, where the editor's sits among the class's variables. */
+    if (BP.ListsDefaultRoot())
+    {
+        FPropertyDef PD;
+        if (!TypeToProperty("USceneComponent *", "DefaultSceneRoot", 0, "the DefaultSceneRoot variable", BP, &PD, Err)) return false;
+        PD.PropertyFlags = (PD.PropertyFlags & ~uint64(CPF_Parm | CPF_BlueprintReadOnly)) | CPF_BlueprintVisible | CPF_NonTransactional;
+        FlagInstancing("USceneComponent *", PD);
+        if (PD.PropertyFlags & CPF_InstancedReference) BP.AddClassFlags(CLASS_HasInstancedReference);
+        ClassVars.insert(ClassVars.begin(), { 8, PD });
     }
     std::stable_sort(ClassVars.begin(), ClassVars.end(), [](const auto& A, const auto& B) { return A.first > B.first; });
     for (const auto& V : ClassVars) BP.AddVariable(V.second);

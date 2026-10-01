@@ -2656,7 +2656,8 @@ Notes:
 | `UE_COMPONENT(USceneComponent, Root);` as the first scene component | Becomes the actor's root. | Yes |
 | a later scene component | Attaches directly to the root, unless `SetupAttachment` places it. | Yes |
 | a component that is not a scene component, such as `UProjectileMovementComponent` | Is created with no attachment, wherever it is declared. | Yes |
-| no `UE_COMPONENT` at all | The actor gets the default scene root, as in the editor: a `USceneComponent` named DefaultSceneRoot, made by the class's construction script, which a reference can name across the network. Below a parent that gives the actor a root already, it gets none. | Yes |
+| no `UE_COMPONENT` at all | The actor gets the default scene root, as in the editor: a `USceneComponent` named DefaultSceneRoot, made by the class's construction script, which a reference can name across the network, and held in the class's variable `DefaultSceneRoot`. Below a parent that gives the actor a root already, it gets none. | Yes |
+| a member named `DefaultSceneRoot` in an actor class | Refused: the construction script stores the default scene root in the variable of that name, a second one or the one a subclass declares. | Refused |
 | only components that are not scene components | The actor gets the engine's default scene root too, as in the editor, so a movement component has a root to move. Below a parent that gives the actor a root already, a Blueprint parent or a native one such as ACharacter (its capsule), it gets none, as in the editor. | Yes |
 | `UE_DEFAULTS { Tip->SetupAttachment(Glow); }`, Glow another `UE_COMPONENT` of the class | Tip attaches to Glow, as in a C++ constructor: in the construction script it is one of Glow's child nodes. It keeps its own location, rotation and scale, relative to Glow. | Yes |
 | `Tip->SetupAttachment(Glow, FName("Muzzle"));` | The same at a socket or bone of Glow (the node's AttachToName). The socket is a literal name or none; a variable or a call there is refused, since it would be dropped. | Yes |
@@ -5758,6 +5759,9 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   `AddComponentByClass`, or `AddComponentByType<T>(Owner)`. See [Components](#components).
 - `<Class>::DefaultSceneRoot: DefaultSceneRoot is the root the construction script adds; rename the component`: the
   name is taken by the root the engine adds to a class with no scene component of its own. Fix: rename it.
+- `<Class>::DefaultSceneRoot: DefaultSceneRoot is the variable of the root an actor's construction script adds; rename
+  it`: a member of that name in an actor class. The construction script stores the default scene root in the variable
+  named DefaultSceneRoot that it finds first, which would be this one. Fix: rename it.
 - `<Class>::<Component>: <Ancestor> already has a default subobject <Name> (its <Member>); rename the component`: a
   component named like a native parent's own component, such as `CharacterMesh0` or `CollisionCylinder` under an
   ACharacter. The engine finds the objects under an actor by name. Fix: rename it; to change the native one, set

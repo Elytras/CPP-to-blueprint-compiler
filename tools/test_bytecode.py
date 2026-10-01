@@ -5758,7 +5758,7 @@ def scs_no_scene_root():
     ExecuteScriptOnActor makes one only when RootNodes is empty, so the SCS must list a scene root (the editor keeps its
     DefaultSceneRoot node in RootNodes until another scene component takes its place). A root node listed for this is a
     node like any other to keeps_invariants: in AllNodes too, with its own VariableGuid (what a subclass's override of
-    it is keyed on); it needs no variable."""
+    it is keyed on), and its variable (CompRootVariable)."""
     b = asset('ScsNoSceneRoot')
     root, attach, made, stored = construct(b)
     assert 'Spinner' in made and stored['Spinner'], (sorted(made), stored)
@@ -6152,16 +6152,17 @@ def comp_root_variable():
     (ENE_EnemySpawner): ExecuteNodeOnActor stores the component there, where with none it logs on every spawn that the
     class has no such property (SCS_Node.cpp 159-178). CompRootVariable has no component, RootVarMover a movement
     component alone, and RootVarKid finds its parent's (FindFProperty walks the supers)."""
-    base = pending_asset('CompRootVariable')
+    base = asset('CompRootVariable')
     for cls in ('CompRootVariable', 'RootVarMover', 'RootVarKid'):
         b = os.path.join(os.path.dirname(base), cls)
         root, attach, made, stored = construct(b)
         assert root == 'DefaultSceneRoot' and stored.get('DefaultSceneRoot'), \
             '%s: no variable holds its root, the DefaultSceneRoot node\'s component (%s)' % (cls, stored)
         keeps_invariants(b)
+    print('ok  CompRootVariable: a listed DefaultSceneRoot node has its variable on the class, which holds the root')
 
 
-pending('CompRootVariable: a listed DefaultSceneRoot node has its variable on the class', comp_root_variable)
+comp_root_variable()
 
 
 def comp_attach_inherited():
@@ -6272,6 +6273,8 @@ for mod, body, why, top in (
         # BPGC-18: the class's own DefaultSceneRoot node and template already have that name.
         ('ClashDefaultRoot', '  UE_COMPONENT(USceneComponent, DefaultSceneRoot);\n  UE_COMPONENT(UStaticMeshComponent, Body);\n',
          'DefaultSceneRoot', ''),
+        # ...and its variable, which ExecuteNodeOnActor stores the root in: a second one, or a subclass's found first.
+        ('ClashRootVariable', '  USceneComponent* DefaultSceneRoot;\n', 'the variable of the root', ''),
         # A parent Blueprint's component: two nodes, one name, and the second rebuilds the first in place.
         ('ClashInherited', '', 'Lamp', CLASH_BASE + 'class ClashKid : public ClashBase {\npublic:\n'
                                                     '  UE_COMPONENT(UPointLightComponent, Lamp);\n};\n'),
@@ -6307,9 +6310,10 @@ for mod, body, why, top in (
         ('AttachSocket', '  UE_COMPONENT(USceneComponent, A);\n  UE_COMPONENT(USceneComponent, B);\n  FName Where;\n'
                          '  UE_DEFAULTS { B->SetupAttachment(A, Where); }\n', 'literal name', '')):
     refused(mod, body, why, top)
-print('ok  refused: component names already taken under the actor (DefaultSceneRoot, a parent Blueprint\'s component,\n'
-      '    a native default subobject or member, a game Blueprint\'s SCS node), a spawn in UserConstructionScript,\n'
-      '    AddComponent by template name, SetupAttachment in a cycle, of an inherited component or at a computed socket')
+print('ok  refused: component names already taken under the actor (DefaultSceneRoot and its variable, a parent\n'
+      '    Blueprint\'s component, a native default subobject or member, a game Blueprint\'s SCS node), a spawn in\n'
+      '    UserConstructionScript, AddComponent by template name, SetupAttachment in a cycle, of an inherited component\n'
+      '    or at a computed socket')
 
 
 def refused_or_warned(mod, body, why, top=''):
