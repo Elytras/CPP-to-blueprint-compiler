@@ -8550,12 +8550,23 @@ const Json* FCompiler::CopyableDef(const FRecord& In, const std::string& Method)
    multicast on a server (Actor.cpp 4270-4278): the forwarder would send it, and then the call in it again, so a
    multicast keeps the call by name and its warning. So does a qualified call in an inline method, which is copied
    into other classes too, one to a pure function, or past an inline or static one of that name; a `final` method has
-   no override, and a call to it is bound already (FinalOwner). */
+   no override, and a call to it is bound already (FinalOwner).
+   The classes go base-first, a class's name order within a depth: a forwarder calls the nearest Fn above its class,
+   which may be one declared here for a class above, and must be whatever the class is named. */
 void FCompiler::SynthesizeForwarders()
 {
+    std::vector<std::pair<int, FRecord*>> Order;
     for (auto& [Key, W] : Records)
     {
         if (!W.IsGenerated() || W.bIsStruct || W.bIsInterface || W.bIsPatch || W.Base.empty()) continue;
+        int Depth = 0;
+        for (const FRecord* A = Find(W.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base)) ++Depth;
+        Order.emplace_back(Depth, &W);
+    }
+    std::stable_sort(Order.begin(), Order.end(), [](const auto& A, const auto& B) { return A.first < B.first; });
+    for (const auto& Entry : Order)
+    {
+        FRecord& W = *Entry.second;
         std::map<std::string, const FRecord*> Wanted;      // method -> the nearest ancestor declaring it
         auto Consider = [&](const Json& Call, bool bNoOpt) {
             const Json* Callee = Strip(First(Call));

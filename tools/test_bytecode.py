@@ -4701,7 +4701,7 @@ def func_forwarder_order():
     """FuncForwarderOrder: AaFoKid and ZzFoKid each get an override of Auth forwarding to FoMid's, itself one
     forwarding to FoRoot's. Each kid's calls the function it overrides, its super, as the editor's call to a parent
     function does, whichever side of FoMid the kid's name sorts on."""
-    mid = pending_asset('FuncForwarderOrder', 'FoMid')
+    mid = os.path.join(os.path.dirname(asset('FuncForwarderOrder')), 'FoMid')
     folder = os.path.dirname(mid)
     for kid in ('AaFoKid', 'ZzFoKid'):
         base = os.path.join(folder, kid)
@@ -4714,7 +4714,8 @@ def func_forwarder_order():
         assert fields['Seen'] == 3, (kid, fields)
 
 
-pending('FuncForwarderOrder: a forwarding override calls its own super, whatever its class\'s name', func_forwarder_order)
+func_forwarder_order()
+print('ok  FuncForwarderOrder: a forwarding override calls its own super, whatever its class\'s name')
 
 
 def func_iface_inherited():
