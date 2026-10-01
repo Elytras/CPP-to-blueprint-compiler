@@ -3965,7 +3965,7 @@ def subobject_bomber():
     default object says. Each override is an export of the subobject's name under the class's CDO, archetyped on
     Default__Bomber's subobject, and the CDO's tag of the member names it."""
     import struct
-    base = pending_asset('SubobjectBomber')
+    base = asset('SubobjectBomber')
     pkg = invariants.Package(base)
     cdo = pkg.find('Default__SubobjectBomber_C')
     for member, sub, value in (('GooSoundComponent', 'GooAudioComponent', ('VolumeMultiplier', 0.5)),
@@ -3980,8 +3980,9 @@ def subobject_bomber():
     keeps_invariants(base)
 
 
-pending('SubobjectBomber: a member two subobjects fit, neither named for it, overrides the one the game\'s Blueprint '
-        'says', subobject_bomber)
+subobject_bomber()
+print('ok  SubobjectBomber: a member two subobjects fit, neither named for it, overrides the one the game\'s Blueprint '
+      'names')
 
 
 # ---- TABLES: the package's own tables - names and their numbers, imports, exports, archetypes

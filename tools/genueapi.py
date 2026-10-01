@@ -3,8 +3,9 @@
        e.g. C:/Dumper-7/<version>-FSD/SDK/SDK  BpMods/UeApi  --game D:/DRGExtract/FSD-WindowsNoEditor/FSD/Content
 
 --game reads the game's cooked Blueprints for what the dump does not carry: each game Blueprint class's tail
-(UeClassTail) and the subobjects under its CDO (UeDefaultSubobjects), and the native interfaces a native class
-implements (UeNativeInterfaces, see native_interfaces).
+(UeClassTail) and the subobjects under its CDO (UeDefaultSubobjects), the native interfaces a native class
+implements (UeNativeInterfaces, see native_interfaces), and which subobject a component member points at where the
+types cannot tell (map_subobjects).
 
 The SDK dir must sit in its Dumper-7 dump, two levels under GObjects-Dump-WithProperties.txt (see read_real_fields);
 a copy elsewhere (DrgMods/SDK/SDK) has no object dump beside it."""
@@ -729,11 +730,14 @@ def map_subobjects(classes, by_name):
     Default__Character.CollisionCylinder, and APlayerCharacter's CharMoveComp is a PlayerMovementComponent. The dump
     has no values, so a member is joined to the one subobject whose class is a kind of its type; one that two fit
     (AActor's RootComponent) is left out unless one of them has its name, or is the one the class declaring the member
-    joins it to on its own CDO. A subclass cannot rename a default subobject its parent's constructor made, only swap
-    its class or drop it (FObjectInitializer::SetDefaultSubobjectClass / DoNotCreateDefaultSubobject, by that name),
-    so APlayerCharacter's Mesh, which its FPMesh fits too, is still ACharacter's CharacterMesh0, as the game's own
-    BP_PlayerCharacter nodes attached to it say. That would only mislead for a member a subclass points elsewhere,
-    which ACharacter's, private, cannot be."""
+    joins it to on its own CDO, or is the one the game's Blueprints whose parent is k name on their default objects
+    (GAME_MEMBER_SUBOBJECTS, scan_game): ABomber's GooSoundComponent, which WingSound fits too, is GooAudioComponent,
+    as ENE_Bomber_C's tag of it says. Over every such Blueprint those tags agree with each join made the other ways
+    (1,204 on the FSD 4.27 dump, 2026-10-01). A subclass cannot rename a default subobject its parent's constructor
+    made, only swap its class or drop it (FObjectInitializer::SetDefaultSubobjectClass / DoNotCreateDefaultSubobject, by
+    that name), so APlayerCharacter's Mesh, which its FPMesh fits too, is still ACharacter's CharacterMesh0, as the
+    game's own BP_PlayerCharacter nodes attached to it say. That would only mislead for a member a subclass points
+    elsewhere, which ACharacter's, private, cannot be."""
     native = dict((k.ue_name, k) for k in classes if not k.is_bp)
 
     def isa(k, cpp):
@@ -759,9 +763,12 @@ def map_subobjects(classes, by_name):
                     continue
                 fits = [(n, c) for n, c in subs if isa(c, t.group(1))]
                 if len(fits) > 1:
-                    named = [(n, c) for n, c in fits if n == (real_field(o, fname) or fname)]
+                    real = real_field(o, fname) or fname
+                    named = [(n, c) for n, c in fits if n == real]
                     held = getattr(o, "subobjects", {}).get(fname) if o is not k else None
-                    fits = named or [(n, c) for n, c in fits if held and n == held.split(" ")[0]]
+                    shown = set(s.lower() for s in GAME_MEMBER_SUBOBJECTS.get((k.path + "." + k.ue_name, real.lower()), ()))
+                    fits = named or [(n, c) for n, c in fits if held and n == held.split(" ")[0]] \
+                        or [(n, c) for n, c in fits if n.lower() in shown]
                 if len(fits) == 1:
                     k.subobjects[fname] = "%s %s.%s" % (fits[0][0], fits[0][1].path, fits[0][1].ue_name)
             o = by_name.get(o.base)
@@ -1071,6 +1078,7 @@ def write_out_arrays(out_dir):
 SCRIPT_INHERIT = 0x4AA1364E         # CLASS_ScriptInherit, ObjectMacros.h:249-259
 RF_ARCHETYPE_OBJECT, RF_DEFAULT_SUBOBJECT = 0x20, 0x40000
 GAME_SUBOBJECTS = {}                # game Blueprint class path -> ["<class path> <name>"] under its CDO (scan_game)
+GAME_MEMBER_SUBOBJECTS = {}         # (native class path, member's engine name lowered) -> {subobject names} (scan_game)
 OBJECT_PATH = "/Script/CoreUObject.Object"
 DEFAULT_TAIL = (0, OBJECT_PATH, "Engine")   # UObject's: Object.h:57-60
 
@@ -1081,8 +1089,9 @@ def scan_game(content):
     has a native interface's function as its super. An implementation of an interface of the class's own list has no
     super (measured on BP_SentryGun_MoveMarker), so such a pair is an interface a native ancestor implements. Also
     {native enum path: {"EnumProperty" / "ByteProperty"}}, how the classes' variables of each enum are reflected: the
-    editor's own choice of the two (read_enum_forms)."""
+    editor's own choice of the two (read_enum_forms). Fills GAME_SUBOBJECTS and GAME_MEMBER_SUBOBJECTS."""
     import invariants
+    import struct
     classes, overrides, enums = {}, set(), {}
 
     def enum_kinds(p, prop):
@@ -1122,12 +1131,22 @@ def scan_game(content):
                         if x["flags"] & (RF_DEFAULT_SUBOBJECT | RF_ARCHETYPE_OBJECT) and under(p, x, st.cdo)]
                     for prop in st.props:
                         enum_kinds(p, prop)
+                    # A Blueprint's default object holds a tag for each component member, naming the default subobject
+                    # it points at: the join map_subobjects cannot make by type where two subobjects fit.
+                    sup = p.path(e["super"]) if e["super"] < 0 else ""
+                    if sup.startswith("/Script/") and 0 < st.cdo <= len(p.exports):
+                        for t in p.tags(st.cdo - 1):
+                            v = struct.unpack_from("<i", t["value"])[0] if t["type"] == "ObjectProperty" and t["size"] == 4 else 0
+                            o = p.obj(v)
+                            if v > 0 and o["outer"] == st.cdo and o["flags"] & RF_DEFAULT_SUBOBJECT \
+                                    or v < 0 and o["outer"] < 0 and p.obj(o["outer"])["name"].startswith("Default__"):
+                                GAME_MEMBER_SUBOBJECTS.setdefault((sup, t["name"].lower()), set()).add(o["name"])
             elif kind == "Function" and e["super"] < 0:
                 sup = p.path(e["super"])
                 if sup.startswith("/Script/") and ":" in sup:
                     overrides.add((p.path(e["outer"]), sup.split(":")[0]))
-    print("  game Blueprints scanned: %d classes, %d native-super functions, %d native enums held"
-          % (len(classes), len(overrides), len(enums)))
+    print("  game Blueprints scanned: %d classes, %d native-super functions, %d native enums held, %d component members "
+          "named" % (len(classes), len(overrides), len(enums), len(GAME_MEMBER_SUBOBJECTS)))
     return classes, overrides, enums
 
 
@@ -1292,8 +1311,8 @@ def main():
     unique = set(n for n, c in name_count.items() if c == 1)
 
     by_name = dict((k.cpp, k) for k in classes)
-    map_subobjects(classes, by_name)
     game, overrides, game_enums = scan_game(game_dir) if game_dir else ({}, set(), {})
+    map_subobjects(classes, by_name)
     read_enum_forms(sdk_dir, game_enums)
     for k in classes:
         k.default_subobjects = GAME_SUBOBJECTS.get(k.path + "." + k.ue_name, []) if k.is_bp else []
