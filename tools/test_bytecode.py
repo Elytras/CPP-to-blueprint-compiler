@@ -983,6 +983,33 @@ print('ok  FlowTest.ForwardVoid: `return F();` of a void F calls it, then return
 refused('CommaExpr', '  int32 F(int32 N) { return (N += 1, N * 2); }\n', 'the comma operator inside an expression')
 refused('CommaWhile', '  int32 F(int32 N) { while (N += 1, N < 9) {} return N; }\n', 'the comma operator inside an expression')
 print('ok  the comma operator inside an expression or a loop condition is refused by name')
+
+
+def comma_hoist():
+    """CommaHoist: a comma inside an expression runs its left side first, as a statement, wherever nothing in the
+    statement runs before it, and is worth its right side, read where C++ reads it: Count is what Bump left. An
+    initialiser (a TEnum<E>'s too), an argument beside a constant or beside a call, a struct literal's first member, a
+    return value, an assignment's right side, a switch over a TEnum<E>, a reference argument, a comma in a comma. The
+    class default `(1, 4)` is 4."""
+    base = pending_asset('CommaHoist')
+    keeps_invariants(base)
+    for fn, want, bumps in (('Brace', lambda m, c: m + c * 100, 1), ('Enum', lambda m, c: m + c * 100, 1),
+                            ('Arg', lambda m, c: 2 * (m + c), 1), ('Beside', lambda m, c: 70 + m + c, 1),
+                            ('BesideCall', lambda m, c: 20 * m + c, 1), ('Literal', lambda m, c: 10 * m + c, 1),
+                            ('Ret', lambda m, c: m + c, 1), ('Assign', lambda m, c: m + c * 100, 1),
+                            ('Pick', lambda m, c: (1000 if m == 1 else 0) + c, 1), ('Ref', lambda m, c: (m + 5) * 100 + c, 1),
+                            ('Nested', lambda m, c: 2 * (10 + m), 2)):
+        for m, c in ((0, 0), (1, 5), (3, -2)):
+            me = {'Count': c}
+            got = run(base, fn, me, M=m)[0]
+            assert got == want(m, c + bumps) and me['Count'] == c + bumps, \
+                'CommaHoist.%s(%d) with Count %d = %r, Count %r; want %r, Count %d' % (fn, m, c, got, me['Count'], want(m, c + bumps), c + bumps)
+    cdo = dump('dumptags.py', base, str(exports_of(base).index('Default__CommaHoist_C')))
+    assert 'D [0] IntProperty size=4: 4' in cdo, cdo
+
+
+pending('Comma: a comma inside an expression runs its left side first, as a statement, where nothing runs before it',
+        comma_hoist)
 check('FlowTest', 'Classify', classify, [dict(Code=c) for c in range(-2, 8)])
 check('FlowTest', 'NoDefault', no_default, [dict(Code=c) for c in (-1, 0, 1, 9, 10)])
 check('FlowTest', 'NameSet', lambda N: 2 if N.lower() == 'none' else 1, [dict(N=n) for n in ('None', 'none', 'IntProperty', 'x', 'None_1')])
