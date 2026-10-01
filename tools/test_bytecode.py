@@ -4697,6 +4697,26 @@ def func_qualified_self():
 pending('FuncQualifiedSelf: Self::Fn() in its own class runs its own Fn, copied in, or warns', func_qualified_self)
 
 
+def func_forwarder_order():
+    """FuncForwarderOrder: AaFoKid and ZzFoKid each get an override of Auth forwarding to FoMid's, itself one
+    forwarding to FoRoot's. Each kid's calls the function it overrides, its super, as the editor's call to a parent
+    function does, whichever side of FoMid the kid's name sorts on."""
+    mid = pending_asset('FuncForwarderOrder', 'FoMid')
+    folder = os.path.dirname(mid)
+    for kid in ('AaFoKid', 'ZzFoKid'):
+        base = os.path.join(folder, kid)
+        pkg = invariants.Package(base)
+        sup = pkg.path(pkg.struct(pkg.find('Auth')).super)
+        calls = [where for fn, op, where, flags in func_calls(base) if fn == 'Auth']
+        assert sup.endswith('/FoMid.FoMid_C:Auth') and calls == [sup], (kid, sup, calls)
+        fields = {'Seen': 0}
+        run_as([base, mid, os.path.join(folder, 'FoRoot')], 'KidCall', fields)
+        assert fields['Seen'] == 3, (kid, fields)
+
+
+pending('FuncForwarderOrder: a forwarding override calls its own super, whatever its class\'s name', func_forwarder_order)
+
+
 # ---- OPERANDS: operands the VM resolves against the object they run on - jumps, instance variables, calls by name,
 # field paths, object operands, arity, out and reference arguments (invariant_rules/operands.py)
 
