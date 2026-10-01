@@ -3,6 +3,8 @@ usage: assetgen verify <out-dir> <reference-dir>     rebuilds Autosprint/InitCav
        assetgen compile <source.cpp> <include-dir> <out-dir> [--api <api-dir>] [--game <folder /Game is in>]
        assetgen registry <out AssetRegistry.bin> <AssetRegistry.bin>...   merges registries assetgen wrote into one
        assetgen roundtrip <dir>      reads every cooked package under dir and writes it back in memory: the S38 gate
+       assetgen astcheck <source.cpp> <include-dir>   checks that the AST dump filter changes nothing on source's dump
+       assetgen astcheck --dump <file.json>            ... on a saved dump
 */
 #include <cstdio>
 #include <string>
@@ -53,9 +55,18 @@ int main(int argc, char** argv)
     if (argc >= 3 && std::string(argv[1]) == "roundtrip")
         return RoundTrip(argv[2]);
 
+    if (argc >= 4 && std::string(argv[1]) == "astcheck")
+    {
+        try { return std::string(argv[2]) == "--dump" ? AstCheckDump(argv[3]) : AstCheck(argv[2], argv[3]); }
+        catch (const std::exception& E) { printf("  FAILED: internal error: %s\n", E.what()); }
+        return 1;
+    }
+
     printf("usage: assetgen verify <out-dir> <reference-dir>\n"
            "       assetgen compile <source.cpp> <include-dir> <out-dir> [--api <api-dir>] [--game <folder /Game is in>]\n"
            "       assetgen registry <out AssetRegistry.bin> <AssetRegistry.bin>...\n"
-           "       assetgen roundtrip <dir>\n");
+           "       assetgen roundtrip <dir>\n"
+           "       assetgen astcheck <source.cpp> <include-dir>\n"
+           "       assetgen astcheck --dump <file.json>\n");
     return 2;
 }

@@ -13292,6 +13292,235 @@ bool ParseClangAst(const std::string& Cmd, const std::string& SourcePath, Json* 
     return ParseClangAst(Cmd, SourcePath, Out, Err, false);
 }
 
+/* The clang command whose stdout is the AST dump of SourcePath, with the UeApi headers in IncludeDir: a compile's,
+   and astcheck's, so the check reads the dump a compile reads. */
+std::string ClangCommand(const std::string& SourcePath, const std::string& IncludeDir)
+{
+    std::error_code TmpEc;
+    /* Both the UeApi dir and its parent are include paths, so "FSD.h" and "UeApi/FSD.h" both resolve. Absolute
+       first: a relative "UeApi" has an empty parent, and -I"" swallows the next argument. */
+    const std::string Parent = std::filesystem::absolute(IncludeDir, TmpEc).parent_path().string();
+    /* -Wno-string-plus-int: `"lit" + N` is a Concat_StrStr here, not pointer arithmetic. */
+    std::string Cmd = "clang++ -std=c++20 -Wno-string-plus-int -fsyntax-only -Xclang -ast-dump=json";
+#ifndef _WIN32
+    /* Parse with the game's ABI, not the host's: on x86-64 Linux size_t is `unsigned long`, so sizeof has no
+       Kismet conversion. The msvc target finds no C++ headers here and the SDK needs only <initializer_list>,
+       so hand clang a stand-in (it checks only the two-pointer layout). */
+    const std::filesystem::path ShimDir = std::filesystem::temp_directory_path(TmpEc) / "assetgen-include";
+    std::filesystem::create_directories(ShimDir, TmpEc);
+    const std::filesystem::path Shim = ShimDir / "initializer_list";
+    static const char ShimText[] =
+        "#pragma once\n"
+        "namespace std {\n"
+        "template <class E> class initializer_list {\n"
+        "    const E* First = nullptr;\n"
+        "    const E* Last = nullptr;\n"
+        "public:\n"
+        "    constexpr initializer_list() noexcept = default;\n"
+        "    constexpr const E* begin() const noexcept { return First; }\n"
+        "    constexpr const E* end() const noexcept { return Last; }\n"
+        "    constexpr decltype(sizeof 0) size() const noexcept { return Last - First; }\n"
+        "};\n"
+        "}\n";
+    /* Parallel compiles share this file, and one compile's clang may be reading it as the next compile starts. So
+       it is never truncated in place: it is rewritten only when it differs, whole, into a temp file named for this
+       process, which is then renamed over it (POSIX replaces the name atomically). A write or rename that fails
+       leaves no temp file and stays silent, as before; clang then reports the missing header. */
+    if (ReadText(Shim.string()) != ShimText)
+    {
+        const std::filesystem::path Tmp = ShimDir / ("initializer_list." + std::to_string(getpid()) + ".tmp");
+        std::ofstream Out(Tmp, std::ios::binary | std::ios::trunc);
+        Out << ShimText;
+        Out.close();
+        std::error_code ShimEc;
+        if (!Out.fail()) std::filesystem::rename(Tmp, Shim, ShimEc);
+        if (Out.fail() || ShimEc) std::filesystem::remove(Tmp, ShimEc);
+    }
+    Cmd += " --target=x86_64-pc-windows-msvc -isystem \"" + ShimDir.string() + "\"";
+#endif
+    Cmd += " \"" + SourcePath + "\" -I\"" + IncludeDir + "\" -I\"" + Parent + "\"";
+    return Cmd;
+}
+
+/* astcheck's copy of a dump in memory, kept in the pieces it was read in, handed out again in chunks of the sizes
+   ChunkSize picks (at least 1 byte each), cut anywhere. */
+class FMemChunks : public IDumpChunks
+{
+public:
+    FMemChunks(const std::vector<std::string>& InPieces, std::function<size_t()> InChunkSize)
+        : Pieces(InPieces), ChunkSize(std::move(InChunkSize)) {}
+
+    bool Next(std::string& Chunk) override
+    {
+        Chunk.clear();
+        for (size_t Want = ChunkSize(); Want != 0 && Piece < Pieces.size();)
+        {
+            const size_t N = std::min(Want, Pieces[Piece].size() - Offset);
+            Chunk.append(Pieces[Piece], Offset, N);
+            Want -= N;
+            if ((Offset += N) == Pieces[Piece].size()) { ++Piece; Offset = 0; }
+        }
+        return !Chunk.empty();
+    }
+
+private:
+    const std::vector<std::string>& Pieces;
+    std::function<size_t()> ChunkSize;
+    size_t Piece = 0;           // where the next chunk starts
+    size_t Offset = 0;
+};
+
+/* The filter's output over Dump cut into chunks of ChunkSize's sizes, read through FAstSource as the parser reads it:
+   its buffer sizing (MaxOut) included. */
+std::string FilteredDump(const std::vector<std::string>& Dump, std::function<size_t()> ChunkSize)
+{
+    FMemChunks Chunks(Dump, std::move(ChunkSize));
+    FAstSource Src(Chunks, true);
+    std::string Out;
+    while (Src.Next()) Out += Src.Cur;
+    return Out;
+}
+
+/* FAstSax's tree of Dump, read in the pipe's 256 KB chunks; through the filter or, the fallback's way, not. */
+bool ParseInMemory(const std::vector<std::string>& Dump, bool bFilter, Json* Out)
+{
+    FMemChunks Chunks(Dump, [] { return size_t(256) << 10; });
+    FAstSource Src(Chunks, bFilter);
+    return ParseAst(Src, Out);
+}
+
+/* The first place where trees A and B differ, as a JSON pointer and both sides, or nothing if they are the same.
+   Stricter than nlohmann's ==, which takes 1u for 1 and 1.0 for 1: each value's type (value_t) must match too, and a
+   float's bits. Values counts the values in A. A loop over a stack of levels, not a recursion: a dump nests as deep
+   as the source's expressions. */
+std::optional<std::string> TreeDifference(const Json& A, const Json& B, uint64* Values)
+{
+    struct FLevel { const Json* A; const Json* B; Json::const_iterator ItA, ItB; };    // an object or array being walked
+    std::vector<FLevel> Levels;
+    const auto Shown = [](const Json* V) {
+        if (!V) return std::string("absent");
+        if (V->is_structured()) return std::string(V->type_name()) + " of " + std::to_string(V->size());
+        std::string S = std::string(V->type_name()) + " " + V->dump(-1, ' ', false, Json::error_handler_t::replace);
+        return S.size() > 100 ? S.substr(0, 97) + "..." : S;
+    };
+    /* The pointer to the member or element each of the first Count levels is at. */
+    const auto PathTo = [&](size_t Count) {
+        std::string Path;
+        for (size_t I = 0; I < Count; ++I)
+        {
+            Path += '/';
+            if (Levels[I].A->is_array()) { Path += std::to_string(Levels[I].ItA - Levels[I].A->cbegin()); continue; }
+            for (const char C : Levels[I].ItA.key()) Path += C == '~' ? "~0" : C == '/' ? "~1" : std::string(1, C);
+        }
+        return Path.empty() ? std::string("/") : Path;
+    };
+    const auto Differ = [&](const std::string& Path, const Json* X, const Json* Y) {
+        return Path + " (unfiltered: " + Shown(X) + "; filtered: " + Shown(Y) + ")";
+    };
+    /* Compares X and Y themselves, and starts a level to walk their members or elements. */
+    const auto Visit = [&](const Json& X, const Json& Y) {
+        ++*Values;
+        if (X.type() != Y.type()) return false;
+        if (X.is_structured()) Levels.push_back({ &X, &Y, X.cbegin(), Y.cbegin() });
+        else if (X.is_number_float())
+        {
+            const double FX = X.get<double>(), FY = Y.get<double>();
+            return std::memcmp(&FX, &FY, sizeof FX) == 0;
+        }
+        else return X == Y;
+        return true;
+    };
+
+    *Values = 0;
+    if (!Visit(A, B)) return Differ("/", &A, &B);
+    while (!Levels.empty())
+    {
+        FLevel& L = Levels.back();
+        const bool bEndA = L.ItA == L.A->cend(), bEndB = L.ItB == L.B->cend();
+        if (bEndA && bEndB)
+        {
+            Levels.pop_back();
+            if (!Levels.empty()) { ++Levels.back().ItA; ++Levels.back().ItB; }
+            continue;
+        }
+        const std::string Up = PathTo(Levels.size() - 1);
+        const std::string Here = Up == "/" ? std::string() : Up;
+        if (L.A->is_array() && (bEndA || bEndB))
+            return Differ(Here + "/" + std::to_string(L.A->size() < L.B->size() ? L.A->size() : L.B->size()),
+                          bEndA ? nullptr : &*L.ItA, bEndB ? nullptr : &*L.ItB);
+        /* Both objects are sorted by key: at the first keys that differ, the smaller one is missing on the other side. */
+        if (L.A->is_object() && (bEndA || bEndB || L.ItA.key() != L.ItB.key()))
+        {
+            const bool bOnlyA = bEndB || (!bEndA && L.ItA.key() < L.ItB.key());
+            return Differ(Here + "/" + (bOnlyA ? L.ItA.key() : L.ItB.key()), bOnlyA ? &*L.ItA : nullptr,
+                          bOnlyA ? nullptr : &*L.ItB);
+        }
+        const size_t Depth = Levels.size();
+        if (!Visit(*L.ItA, *L.ItB)) return Differ(PathTo(Depth), &*Levels[Depth - 1].ItA, &*Levels[Depth - 1].ItB);
+        if (Levels.size() == Depth) { ++Levels.back().ItA; ++Levels.back().ItB; }
+    }
+    return std::nullopt;
+}
+
+/* astcheck: proves on one dump that FDumpFilter changes nothing (DESIGN.md, "Compile time: the UeApi header cost").
+   First, the filter's output must not depend on where the dump is cut: the pipe's 256 KB chunks, 7-byte chunks and
+   1 to 4096 bytes from a fixed-seed LCG must give the same bytes. Then FAstSax must build the same tree from the dump
+   and from the filter's output (TreeDifference). Prints `same` and the sizes, or the first difference; returns the
+   exit code. The dump, its filtered copy and a tree, then both trees, are in memory at once: about 1 GB for an FSD.h
+   mod, so run one at a time. */
+int CheckDumpFilter(std::vector<std::string> Dump)
+{
+    uint64 RawBytes = 0;
+    for (const std::string& Piece : Dump) RawBytes += Piece.size();
+    const std::pair<const char*, std::function<size_t()>> Chunkings[] = {
+        { "256 KB chunks", [] { return size_t(256) << 10; } },
+        { "7-byte chunks", [] { return size_t(7); } },
+        { "chunks of 1-4096 bytes", [Seed = uint32(1)]() mutable {
+            Seed = Seed * 1664525u + 1013904223u;       // the Numerical Recipes LCG: the same cuts on every run
+            return size_t(Seed >> 20) + 1;
+        } },
+    };
+    std::string Filtered = FilteredDump(Dump, Chunkings[0].second);
+    for (size_t I = 1; I < std::size(Chunkings); ++I)
+    {
+        const std::string Other = FilteredDump(Dump, Chunkings[I].second);
+        if (Other == Filtered) continue;
+        const size_t At = size_t(std::mismatch(Filtered.begin(), Filtered.end(), Other.begin(), Other.end()).first
+                                 - Filtered.begin());
+        printf("the filtered bytes differ at offset %llu: %s give %llu bytes, %s %llu\n", (unsigned long long)At,
+               Chunkings[0].first, (unsigned long long)Filtered.size(), Chunkings[I].first,
+               (unsigned long long)Other.size());
+        return 1;
+    }
+
+    /* Never freed, as in CompileToAssets: the process ends right after, and tearing a tree down takes longer. */
+    Json& Unfiltered = *new Json;
+    Json& FromFiltered = *new Json;
+    const bool bUnfiltered = ParseInMemory(Dump, false, &Unfiltered);
+    std::vector<std::string>().swap(Dump);
+    const uint64 FilteredBytes = Filtered.size();
+    std::vector<std::string> FilteredPieces;
+    FilteredPieces.push_back(std::move(Filtered));
+    const bool bFiltered = ParseInMemory(FilteredPieces, false, &FromFiltered);
+    std::vector<std::string>().swap(FilteredPieces);
+    if (!bUnfiltered || !bFiltered)
+    {
+        printf("%s\n", !bUnfiltered && !bFiltered ? "neither the dump nor the filter's output parses"
+                     : !bUnfiltered ? "the filter's output parses, but the dump does not"
+                                    : "the dump parses, but the filter's output does not");
+        return 1;
+    }
+    uint64 Values = 0;
+    if (const std::optional<std::string> Where = TreeDifference(Unfiltered, FromFiltered, &Values))
+    {
+        printf("the trees differ at %s\n", Where->c_str());
+        return 1;
+    }
+    printf("same (%llu values, %llu -> %llu bytes)\n", (unsigned long long)Values, (unsigned long long)RawBytes,
+           (unsigned long long)FilteredBytes);
+    return 0;
+}
+
 bool FCompiler::LoadTables(const std::string& IncludeDir, std::string* Err)
 {
     auto Load = [&](const char* File, Json* Out) {
@@ -13342,49 +13571,7 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     std::error_code TmpEc;
     /* Absolute: a bare "Mod.cpp" has an empty parent, and NamedQualifier cannot list "". */
     SourceDir = std::filesystem::absolute(SourcePath, TmpEc).parent_path().string();
-    /* Both the UeApi dir and its parent are include paths, so "FSD.h" and "UeApi/FSD.h" both resolve. Absolute
-       first: a relative "UeApi" has an empty parent, and -I"" swallows the next argument. */
-    const std::string Parent = std::filesystem::absolute(IncludeDir, TmpEc).parent_path().string();
-    /* -Wno-string-plus-int: `"lit" + N` is a Concat_StrStr here, not pointer arithmetic. */
-    std::string Cmd = "clang++ -std=c++20 -Wno-string-plus-int -fsyntax-only -Xclang -ast-dump=json";
-#ifndef _WIN32
-    /* Parse with the game's ABI, not the host's: on x86-64 Linux size_t is `unsigned long`, so sizeof has no
-       Kismet conversion. The msvc target finds no C++ headers here and the SDK needs only <initializer_list>,
-       so hand clang a stand-in (it checks only the two-pointer layout). */
-    const std::filesystem::path ShimDir = std::filesystem::temp_directory_path(TmpEc) / "assetgen-include";
-    std::filesystem::create_directories(ShimDir, TmpEc);
-    const std::filesystem::path Shim = ShimDir / "initializer_list";
-    static const char ShimText[] =
-        "#pragma once\n"
-        "namespace std {\n"
-        "template <class E> class initializer_list {\n"
-        "    const E* First = nullptr;\n"
-        "    const E* Last = nullptr;\n"
-        "public:\n"
-        "    constexpr initializer_list() noexcept = default;\n"
-        "    constexpr const E* begin() const noexcept { return First; }\n"
-        "    constexpr const E* end() const noexcept { return Last; }\n"
-        "    constexpr decltype(sizeof 0) size() const noexcept { return Last - First; }\n"
-        "};\n"
-        "}\n";
-    /* Parallel compiles share this file, and one compile's clang may be reading it as the next compile starts. So
-       it is never truncated in place: it is rewritten only when it differs, whole, into a temp file named for this
-       process, which is then renamed over it (POSIX replaces the name atomically). A write or rename that fails
-       leaves no temp file and stays silent, as before; clang then reports the missing header. */
-    if (ReadText(Shim.string()) != ShimText)
-    {
-        const std::filesystem::path Tmp = ShimDir / ("initializer_list." + std::to_string(getpid()) + ".tmp");
-        std::ofstream Out(Tmp, std::ios::binary | std::ios::trunc);
-        Out << ShimText;
-        Out.close();
-        std::error_code ShimEc;
-        if (!Out.fail()) std::filesystem::rename(Tmp, Shim, ShimEc);
-        if (Out.fail() || ShimEc) std::filesystem::remove(Tmp, ShimEc);
-    }
-    Cmd += " --target=x86_64-pc-windows-msvc -isystem \"" + ShimDir.string() + "\"";
-#endif
-    Cmd += " \"" + SourcePath + "\" -I\"" + IncludeDir + "\" -I\"" + Parent + "\"";
-    if (!ParseClangAst(Cmd, SourcePath, &Doc, Err)) return false;
+    if (!ParseClangAst(ClangCommand(SourcePath, IncludeDir), SourcePath, &Doc, Err)) return false;
 
     if (!LoadTables(IncludeDir, Err)) return false;
     if (!Collect(Err)) return false;
@@ -13567,6 +13754,36 @@ bool CompileToAssets(const std::string& SourcePath, const std::string& IncludeDi
     FCompiler* C = new FCompiler;
     C->GameDir = GameDir;
     return C->Run(SourcePath, IncludeDir, OutDir, ApiDir, Err);
+}
+
+int AstCheck(const std::string& SourcePath, const std::string& IncludeDir)
+{
+    std::vector<std::string> Dump;
+    const auto Read = [&](IDumpChunks& Chunks) {
+        for (std::string Chunk; Chunks.Next(Chunk);) Dump.push_back(std::move(Chunk));
+    };
+    std::string Err;
+    if (!RunClang(ClangCommand(SourcePath, IncludeDir), SourcePath, Read, &Err))
+    {
+        printf("  FAILED: %s\n", Err.c_str());
+        return 1;
+    }
+    return CheckDumpFilter(std::move(Dump));
+}
+
+int AstCheckDump(const std::string& DumpPath)
+{
+    FILE* F = fopen(DumpPath.c_str(), "rb");
+    if (!F)
+    {
+        printf("  FAILED: cannot read %s\n", DumpPath.c_str());
+        return 1;
+    }
+    std::vector<std::string> Dump;
+    std::vector<char> Buf(256 << 10);
+    for (size_t N; (N = fread(Buf.data(), 1, Buf.size(), F)) != 0;) Dump.emplace_back(Buf.data(), N);
+    fclose(F);
+    return CheckDumpFilter(std::move(Dump));
 }
 
 }   // namespace Uasset
