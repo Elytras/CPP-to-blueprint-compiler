@@ -1658,6 +1658,9 @@ private:
     std::string ModPackage;
     std::optional<std::string> ApiDir;      // `--api`: where the uncooked editor-side stubs go
     std::string SourceDir;      // the compiled .cpp's folder: what __EmbedFile__ resolves a relative path against
+    /* The UeApi folder when genueapi wrote it without --game (Version.json "game": false), else empty: it then lists
+       no game Blueprint's default subobjects or tail, so Generate refuses a class deriving from one. */
+    std::string UeApiWithoutGame;
     /* A container inside a container: UE has no such property, so the inner one is the single member (Value) of a
        wrapper struct, <wrapper name> -> the container type. The wrapper has the container's layout. */
     std::map<std::string, std::string> NestedWrappers;
@@ -2377,7 +2380,8 @@ bool FCompiler::Collect(std::string* Err)
             }
             else if (Kind(C) == "VarDecl" && Name(C) == "UeDefaultSubobjects")
             {
-                /* Every default subobject a game Blueprint's CDO exports, "<class path> <name>" joined by ';'. */
+                /* Every default subobject and archetype a game Blueprint's CDO exports, at any depth, "<class path>
+                   <name>" joined by ';', a nested one's name its path under the CDO (Damage:BreakIceBonus_0). */
                 std::string List;
                 if (FindLiteral(C, List))
                     for (size_t At = 0, End; At < List.size(); At = End + 1)
@@ -12644,6 +12648,17 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
 {
     const FRecord* B = Find(R.Base);
     if (!B) { *Err = R.CppName + " derives from an undeclared class: " + R.Base; return false; }
+    /* A game Blueprint parent's default subobjects, which this class is serialized after, and its tail are what
+       genueapi --game reads off the game's packages. A UeApi made without it has neither, and this class would compile
+       without a word and load before its parent's subobjects. */
+    if (!UeApiWithoutGame.empty() && B->IsNative() && PackageOf(*B).compare(0, 6, "/Game/") == 0)
+    {
+        *Err = R.CppName + " derives from the game Blueprint " + ClassOf(*B) + ", but " + UeApiWithoutGame
+               + " was generated without --game, so it does not list the default subobjects that Blueprint's default "
+                 "object exports, which this class must load after - regenerate it with AssetGen/tools/genueapi.py "
+                 "<SDK dir> <UeApi dir> --game <extracted Content dir>";
+        return false;
+    }
     Cur = &R;
 
     const std::string PackageName = PackageOf(R);
@@ -14718,6 +14733,25 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     std::error_code TmpEc;
     /* Absolute: a bare "Mod.cpp" has an empty parent, and NamedQualifier cannot list "". */
     SourceDir = std::filesystem::absolute(SourcePath, TmpEc).parent_path().string();
+    /* First we check what wrote the UeApi: one older than this compiler compiles without a word wrong (one made before
+       UeDefaultSubobjects orders a game Blueprint's child after none of its parent's subobjects), and the merge of a
+       genueapi change carries the tracked Types.json but not the ignored headers. genueapi writes Version.json last, so
+       a run that stopped halfway has none either. Bump with genueapi.py's GENUEAPI_VERSION (2: "game"). */
+    constexpr int32 UeApiVersion = 2;
+    const Json Stamp = Json::parse(ReadText(IncludeDir + "/Version.json"), nullptr, false);
+    const int32 Stamped = Stamp.is_object() && Stamp.contains("genueapi") && Stamp["genueapi"].is_number_integer()
+                              ? Stamp["genueapi"].get<int32>() : 0;
+    if (Stamped < UeApiVersion)
+    {
+        *Err = IncludeDir + " was written by an older genueapi (" + (Stamped ? "version " + std::to_string(Stamped)
+               : std::string("no Version.json")) + ", this assetgen needs version " + std::to_string(UeApiVersion)
+               + ") - regenerate it with AssetGen/tools/genueapi.py";
+        return false;
+    }
+    /* Then whether genueapi read the game's packages (--game): without them a game Blueprint's header has no
+       UeDefaultSubobjects and no UeClassTail, which reads the same as a Blueprint with none of either. */
+    UeApiWithoutGame = Stamp.contains("game") && Stamp["game"].is_boolean() && Stamp["game"].get<bool>() ? std::string()
+                                                                                                          : IncludeDir;
     if (!ParseClangAst(ClangCommand(SourcePath, IncludeDir), SourcePath, &Doc, Err)) return false;
 
     if (!LoadTables(IncludeDir, Err)) return false;

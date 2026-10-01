@@ -1065,7 +1065,7 @@ building a mod.
 | Argument | Meaning |
 | --- | --- |
 | `<source.cpp>` | One translation unit. It must contain `UE_MOD_PACKAGE("/Game/...")`, which names the mod's own package folder. |
-| `<include-dir>` | The SDK's `UeApi` folder. It must hold `Conv.json`, `Ops.json`, `Types.json` and `Events.json`; otherwise the compile stops with `missing or invalid <dir>/<file> (run genueapi.py)`. |
+| `<include-dir>` | The SDK's `UeApi` folder. It must hold `Conv.json`, `Ops.json`, `Types.json` and `Events.json`; otherwise the compile stops with `missing or invalid <dir>/<file> (run genueapi.py)`. Its `Version.json` must name a genueapi this compiler can use; a folder an older one wrote, or one without the file, stops the compile before clang runs, with `<dir> was written by an older genueapi (...) - regenerate it with AssetGen/tools/genueapi.py`. |
 | `<out-dir>` | Where the mod's own packages go. The compiler creates it, and the folder of every package it writes, when missing. |
 | `--api <api-dir>` | Optional, after the out dir. Also writes an editor stub for each class, struct and enum into this folder (see [Editor API stubs](#editor-api-stubs)). It is an output folder for the editor, not the SDK folder. It must already exist: without it a class gets no stub and prints `<Class> -> no API asset: cannot write .uasset`, and a struct or enum fails the compile. |
 
@@ -1342,6 +1342,7 @@ use a newer SDK or regenerate your own.
 | `Containers.h` | The Kismet `Array_*`, `Set_*` and `Map_*` functions, as methods of `TArray`, `TSet` and `TMap`. |
 | `Types.json` | Every enum and struct: package, engine name, size, alignment and fields, and whether an enum is an `enum class` (`form`), read off how the dump's properties of it are reflected. |
 | `Events.json` | The function flags of every `BlueprintEvent`, which an override inherits. |
+| `Version.json` | Which genueapi wrote the folder, and whether it had `--game`, written last. A compiler that needs a later one refuses the folder, saying to regenerate it, rather than compile against what the older one did not write. Without `--game` it refuses a class deriving from a game Blueprint, whose default subobjects the folder then does not list. |
 | `UeMeta.h` | The `UE_*` macros. Written by hand. |
 | `Types.h` | The integer spellings, `FString`, `FName`, `FText` and the container templates. Written by hand. |
 
@@ -1387,8 +1388,8 @@ markers of this kind, all written by the generator and read by the compiler. You
 | --- | --- |
 | `<Member>__UeName` | The engine's name for a member or function the dumper respelled. |
 | `<Member>__UeScsNode` | The construction-script node of a component that a game Blueprint adds, through which a child class overrides the component's defaults. |
-| `<Member>__UeSubobject` | The default subobject that a native component member points at, which a mod class overrides by that name. |
-| `UeDefaultSubobjects` | Every default subobject a game Blueprint's default object exports, which a child class is loaded after. |
+| `<Member>__UeSubobject` | The default subobject that a native component member points at, which a mod class overrides by that name. Where two of the class's subobjects fit the member's type and neither has its name, the one the game's Blueprints name on their default objects. |
+| `UeDefaultSubobjects` | Every default subobject a game Blueprint's default object exports, and every object nested in one (`Damage:BreakIceBonus_0`), which a child class is loaded after. |
 | `<Member>__Replicated` | That a property replicates, and its RepNotify function. |
 | `<Function>__UeForward` | What `GetOuter`, `GetClass` and `GetName` really call. |
 
@@ -1426,10 +1427,12 @@ and `Types.h` from the SDK repo, and optionally run `tools/genueassets.py`. What
   `no <path>: run genueapi on the SDK inside its Dumper-7 dump, not a copy of it`. The SDK folder and the object dump
   must come from the same dump.
 - **Give it the game's content with `--game <extracted Content dir>`.** The dump carries neither a class's flags,
-  ClassWithin and config name nor a native class's interfaces. genueapi reads the game's cooked Blueprints for them
-  (about 20 seconds): each game Blueprint's own tail, and the native interfaces a native class implements, as the
-  Blueprints that override one's function show. Without it, a mod deriving from a game Blueprint gets its nearest
-  native ancestor's tail, and an override of a native ancestor's interface function is taken for a new function.
+  ClassWithin and config name, nor the default subobjects a Blueprint's default object exports, nor a native class's
+  interfaces. genueapi reads the game's cooked Blueprints for them (about 20 seconds): each game Blueprint's own tail
+  and default subobjects, and the native interfaces a native class implements, as the Blueprints that override one's
+  function show. Without it, `Version.json` says so and the compiler refuses a class deriving from a game Blueprint,
+  which would otherwise load before its parent's subobjects; an override of a native ancestor's interface function is
+  taken for a new function.
 - **Your own mods are left out.** genueapi skips every class whose package a mod in the folder above `<UeApi dir>`
   cooks (any `.cpp` or `.h` directly in that folder with a `UE_MOD_PACKAGE`), and the shared nested-container structs.
   Keep `UeApi/` inside your mods folder, and a dump taken with your mods loaded does not declare them a second time.
@@ -1449,6 +1452,7 @@ genueapi prints one line per table it writes, then a summary of counts. These li
 | `NOT named back, ...: <n>, e.g. ...` | For these members, the object dump's name at the member's offset is not one that the dumper's renaming rules explain. genueapi writes no `__UeName` rather than a wrong one, and the member keeps the SDK's spelling; if the engine's name really differs, reads, writes and defaults of it miss in game without an error. | This almost always means the SDK folder and the object dump come from different dumps. Dump once and run genueapi on that dump. |
 | `SDK helpers left out, no UFunction behind them: <n> (...)` | Functions in the dump's headers that are the dumper's own C++ helpers, not engine functions. No Blueprint can call them. | Nothing. |
 | `out of reach: <kind> <n>, ...` | Class functions and properties held back because one of their types has no mapping yet, by kind: `enum`, `struct`, `container` or `other`. `UeApi.h` records the same numbers. | Nothing a mod can do. |
+| `no --game: no game Blueprint's default subobjects or tail, so the compiler refuses a class deriving from one` | genueapi ran without `--game`, and its `Version.json` says so. A mod with a native parent compiles against the folder; one deriving from a game Blueprint is refused. | Rerun with `--game <extracted Content dir>`. |
 | `blueprint classes dropped for want of a /Game path: <n> (...)` | The dump was taken without `FullAssetPaths=1`, so these Blueprint classes have no path to import them by. | Set `FullAssetPaths=1` in `Dumper-7.ini`, dump again with the fork, and rerun genueapi. |
 
 genueapi stops with exit status 1 when the object dump is missing, and on
@@ -1938,9 +1942,9 @@ A few mistakes also compile without a message, because the construct itself work
   pointer in the game, or subclass the Blueprint and set its defaults in `UE_DEFAULTS`. See
   [Game assets](REFERENCE.md#game-assets).
 - The form of a game enum that no property uses. genueapi learns whether a game enum is an `enum class` from how the
-  dump's properties of it are reflected, and 249 of the SDK's 1445 enums have none; a variable of one is a Byte, which
-  differs from the editor's Enum variable only in type, and only if the enum is an `enum class`. See
-  [Enums](REFERENCE.md#enums).
+  dump's properties of it and the game's Blueprints are reflected, and 240 of the SDK's 1445 enums have none; a
+  variable of one is a Byte, which differs from the editor's Enum variable only in type, and only if the enum is an
+  `enum class`. See [Enums](REFERENCE.md#enums).
 - Walking a `TSet` in place. A range-for over a `TSet` walks a copy, while a `TMap` walks its own slots. Only the cost
   differs. See [Loops](REFERENCE.md#loops).
 - Reusing a repeated pure call. It is evaluated each time it appears. To compute it once, keep the result in a local.

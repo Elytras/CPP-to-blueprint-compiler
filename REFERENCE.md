@@ -252,7 +252,7 @@ starts private.
 | `class X : public ANotIncluded {};` | Refused by clang, "expected class name", when no included header declares the base. Include the SDK header that declares it. | Refused |
 | `class InitCave : public Hello {};` | A child of another class of the mod. A parent in the same source is used from there. A parent pinned with `UE_CLASS` to another mod is imported from that mod. | Yes |
 | `class Turret final : public AActor { ... };` | A class with no subclass. Its functions, overrides aside, are cooked Final, which the editor does not let a Blueprint override, and a call to one of them reaches that function directly instead of by name; on `this` the body is usually copied in. See [Calling your own functions](#calling-your-own-functions). | Yes |
-| `class WPN_GrapplingGun_Long : public WPN_GrapplingGun_C` | A child of one of the game's Blueprint classes. Include the parent's `UeApi/Game/` header and derive from it; the parent is imported from the game. Put the child in the parent's `Game::` namespace to cook it beside the parent (see [Mod sources and packages](#mod-sources-and-packages)). | Yes |
+| `class WPN_GrapplingGun_Long : public WPN_GrapplingGun_C` | A child of one of the game's Blueprint classes. Include the parent's `UeApi/Game/` header and derive from it; the parent is imported from the game. Put the child in the parent's `Game::` namespace to cook it beside the parent (see [Mod sources and packages](#mod-sources-and-packages)). The child loads after every default subobject the parent's default object exports, which UeApi lists only when genueapi had `--game`: against a UeApi made without it, the class is refused, saying to regenerate with `--game`. | Yes |
 
 Notes:
 
@@ -924,7 +924,7 @@ constants, not a Blueprint type.
 |---|---|---|
 | `EEndPlayReason LastReason;` | A variable of the game's enum: a Byte bound to its UEnum, as the editor makes a variable of an enum that is no `enum class` (here a namespaced one, which the game's C++ holds as `TEnumAsByte`). Its enumerators are byte constants. | Yes |
 | `EAttachmentRule Rule = EAttachmentRule::KeepWorld;` | A variable of a game `enum class`: an EnumProperty over a ByteProperty named UnderlyingType, as the editor makes it and as the game's own members and parameters of it are. The same goes for a parameter, a return value, a local, a container's element or key, a UE_STRUCT member, a delegate's parameter and a `UE_DEFAULTS` tag on a native member: an override or a delegate of a native signature then has the native's types. The value is the same byte, its enumerators byte constants, and a default is written as the enumerator's name in an EnumProperty tag. | Yes |
-| A game enum that no property uses | UeApi's `Types.json` gives each enum's form, which genueapi reads off how the Dumper-7 dump's properties of the enum, and the game's Blueprints' variables, are reflected (`form`: `EnumClass` or `TEnumAsByte`). 249 of the SDK's 1445 enums have no property to read it from, and a variable of one is a Byte bound to the enum. 10 of them the game uses only as a native delegate's parameter or a container's element, which genueapi does not read the form from. | Yes |
+| A game enum that no property uses | UeApi's `Types.json` gives each enum's form, which genueapi reads off how the Dumper-7 dump's properties of the enum (a native delegate's parameters among them), and the game's Blueprints' variables, locals and containers' elements, are reflected (`form`: `EnumClass` or `TEnumAsByte`). 240 of the SDK's 1445 enums have nothing to read it from, and a variable of one is a Byte bound to the enum. One the game uses, ESteamVRInputStringBits, is only the element of a native function's `TArray` parameter, whose inner property neither the dump nor Dumper-7's usmap tells apart and no game package holds. | Yes |
 | `LastReason == EEndPlayReason::Quit`, `<` | Comparisons work. | Yes |
 | `switch (Reason)` | A switch works on any enum. | Yes |
 | `EEndPlayReason Last = EEndPlayReason::Quit;` as a default | The default is written as the enumerator's name. | Yes |
@@ -2864,8 +2864,9 @@ Notes:
 | You write | What it does | Status |
 |---|---|---|
 | `Lamp->Intensity = 250.0f;`, where a mod parent declares `Lamp` | Overrides that component's defaults for this class only, as the editor does for an inherited component. No `Super::` is needed: the compiler finds the class that declares the member. A grandchild that sets `Lamp->bVisible = false;` keeps the 250 as well: defaults fold down the chain as C++ constructors do. | Yes |
-| `CapsuleComponent->CapsuleRadius = 55.0f;` in an `ACharacter` child | A C++ parent's component is a default subobject. AssetGen overrides it under the subobject's real name and class, which can differ from the member's: `ACharacter`'s `CapsuleComponent` is `CollisionCylinder`. The SDK records the name as `<Member>__UeSubobject`, for a subclass too: `Mesh` in an `APlayerCharacter` child is still `CharacterMesh0`. | Yes |
+| `CapsuleComponent->CapsuleRadius = 55.0f;` in an `ACharacter` child | A C++ parent's component is a default subobject. AssetGen overrides it under the subobject's real name and class, which can differ from the member's: `ACharacter`'s `CapsuleComponent` is `CollisionCylinder`. The SDK records the name as `<Member>__UeSubobject`, for a subclass too: `Mesh` in an `APlayerCharacter` child is still `CharacterMesh0`. Where two of the class's subobjects fit the member and neither has its name, it records the one the game's Blueprints of the class name on their default objects: `ABomber`'s `GooSoundComponent` is `GooAudioComponent`, not `WingSound`. | Yes |
 | `CapsuleComponent->CapsuleRadius = 70.0f;` in a child of a mod class that sets the capsule too | Builds on the parent's override: the child keeps what the parent set, such as its half height, and changes only the radius. The parent is loaded first. A mod parent that leaves the capsule alone still carries one for its child to build on. | Yes |
+| `temperature->TemperatureChangeScale = 2.0f;` in a child of a game Blueprint (`ENE_Spider_Grunt_Normal_C`) | The C++ ancestor's component is a default subobject of the game Blueprint's default object, which its package exports: the override is built on that export, and the class loads after every default subobject the parent exports, restated or not, and every object nested in one, such as the bonus instanced in `WPN_Pickaxe_C`'s `Damage` (the SDK lists them as `UeDefaultSubobjects`). The SDK spells a name as the game's object dump does, which can differ in case from the parent's package (`temperature`, `Temperature`); names compare without case, so both are one object. | Yes |
 | `StaticMesh->RelativeScale3D = FVector(2.0f, 2.0f, 2.0f);` in a child of a game Blueprint | A game Blueprint's component is a construction-script node, as a mod parent's is. The override is keyed on that node's GUID, which the SDK records as `<Component>__UeScsNode`. The node's real name is used, even when it contains spaces. | Yes |
 | `Controller->bAttachToPawn = true;` in an `APawn` child | Refused: "UeApi does not say which default subobject Controller is". Either the member is not a default subobject, and you set the value at run time, or the SDK predates the markers, and you regenerate it with genueapi. | Refused |
 | a component of a game Blueprint whose header has no `__UeScsNode` marker | Refused: "its header does not say which SCS node it is". Regenerate the SDK from a dump made with the Dumper-7 fork, which writes the markers. | Refused |
@@ -5832,7 +5833,8 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   with genueapi, which reads that off the object dump`: a default set through a native parent's component, such as
   `CapsuleComponent->CapsuleRadius = 55.0f;` on an ACharacter child, when the UeApi headers record no default subobject
   of that name. The headers come from an older genueapi, or the member is a plain pointer and not a default subobject,
-  or two of the class's subobjects fit it and neither its name nor the class that declares it tells which.
+  or two of the class's subobjects fit it and neither its name, nor the class that declares it, nor a game Blueprint
+  deriving from the class (which genueapi reads with `--game`) tells which.
   The same message appears for a path one level too deep, `Lamp->RelativeLocation.Z = 50.0f;`, which it misreads as a
   component called RelativeLocation; regenerating does not help there. Fix: regenerate UeApi with genueapi from a dump
   that has `GObjects-Dump-WithProperties.txt`; assign whole values,
@@ -6227,6 +6229,19 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
 - `missing or invalid <IncludeDir>/<File> (run genueapi.py)`: the include-dir argument is not a generated UeApi
   folder: `Conv.json`, `Ops.json`, `Types.json` or `Events.json` is missing or unreadable. Fix: pass the UeApi folder
   that genueapi wrote, or regenerate it. See [The SDK](GUIDE.md#the-sdk).
+- `<IncludeDir> was written by an older genueapi (no Version.json, this assetgen needs version <N>) - regenerate it
+  with AssetGen/tools/genueapi.py` (or `version <M>` for an older stamp): the UeApi folder comes from a genueapi older
+  than this compiler, which would compile against it without a word wrong where it relies on what that one did not
+  write (a game Blueprint's child would load before its parent's subobjects). genueapi writes `Version.json` last, so
+  a run that stopped halfway leaves none either. Fix: regenerate UeApi with the genueapi of this AssetGen, or use the
+  SDK release made for it. See [The SDK](GUIDE.md#the-sdk).
+- `<Class> derives from the game Blueprint <Parent>, but <IncludeDir> was generated without --game, so it does not list
+  the default subobjects that Blueprint's default object exports, which this class must load after - regenerate it
+  with AssetGen/tools/genueapi.py <SDK dir> <UeApi dir> --game <extracted Content dir>`: the UeApi's `Version.json`
+  says genueapi ran without `--game`, so no game Blueprint header lists its default subobjects or its tail, which
+  reads the same as a Blueprint that has none. The class would compile and then load before its parent's subobjects.
+  A class with a native parent still compiles against such a UeApi. Fix: regenerate UeApi with `--game` and the
+  game's extracted `Content` folder, or use the SDK release. See [The SDK](GUIDE.md#generating-your-own).
 - `usage: assetgen verify <out-dir> <reference-dir>` (and the lines after it): an unknown subcommand or too few
   arguments, with exit code 2. Fix: `assetgen compile <source.cpp> <UeApi dir> <out dir> [--api <api dir>]`. The
   `--api` folder is where the editor stubs go, not the UeApi folder. See [Building mods](GUIDE.md#building-mods).

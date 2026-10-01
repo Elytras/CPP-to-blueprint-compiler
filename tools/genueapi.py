@@ -3,8 +3,13 @@
        e.g. C:/Dumper-7/<version>-FSD/SDK/SDK  BpMods/UeApi  --game D:/DRGExtract/FSD-WindowsNoEditor/FSD/Content
 
 --game reads the game's cooked Blueprints for what the dump does not carry: each game Blueprint class's tail
-(UeClassTail) and its CDO's default subobjects (UeDefaultSubobjects), and the native interfaces a native class
-implements (UeNativeInterfaces, see native_interfaces).
+(UeClassTail) and the subobjects under its CDO (UeDefaultSubobjects), the native interfaces a native class
+implements (UeNativeInterfaces, see native_interfaces), which subobject a component member points at where the types
+cannot tell (map_subobjects), and the form of an enum only a local or a container element shows (scan_game).
+
+The output's Version.json, written last, says which genueapi wrote it (GENUEAPI_VERSION) and whether it had --game;
+the compiler refuses a UeApi older than it needs, and a class deriving from a game Blueprint against one without
+--game.
 
 The SDK dir must sit in its Dumper-7 dump, two levels under GObjects-Dump-WithProperties.txt (see read_real_fields);
 a copy elsewhere (DrgMods/SDK/SDK) has no object dump beside it."""
@@ -31,6 +36,16 @@ DELEGATE = re.compile(r'^(?:const\s+)?(TDelegate|TMulticastInlineDelegate|TMulti
 
 CLASS_WORD = re.compile(r"class\s+((?:\w+::)?\w+)")
 CONTAINER = re.compile(r"^(?:const\s+)?(TArray|TSet|TMap)<(.*)>\s*&?$")
+
+# Version.json, written last: {"genueapi": GENUEAPI_VERSION, "game": whether --game was given}. The compiler refuses a
+# UeApi stamped lower than the version it needs (UeApiVersion in Cpp.cpp), or not at all: a UeApi older than what the
+# compiler reads compiles without a word wrong (one made before UeDefaultSubobjects orders a game Blueprint's child
+# after none of its parent's subobjects). Bump both together whenever the compiler starts relying on something new
+# genueapi writes. "game": false (no --game) is a UeApi with no game Blueprint's UeDefaultSubobjects or tail, which
+# would be the same silent case: the compiler refuses a class deriving from a game Blueprint against it.
+# 1: UeDefaultSubobjects with the nested ones, __UeSubobject markers joined through the game's Blueprints.
+# 2: "game".
+GENUEAPI_VERSION = 2
 
 
 def class_refs(t):
@@ -545,6 +560,7 @@ FIELD_OFFSET = re.compile(r"^\s*0x([0-9A-Fa-f]+)\(0x[0-9A-Fa-f]+\)\(")
 REAL_FIELDS = {}     # "<class path>.<class name>" -> {offset: [property names, in the dump's order]}
 REAL_FUNCS = {}      # (SDK file stem, Dumper-7's class spelling, its function spelling) -> the engine's function name
 SUBOBJECTS = {}      # "<class path>.<class name>" -> [(subobject name, its class's name)] on that class's CDO
+SIGNATURES = {}      # a delegate signature function's path -> [(field class, name)] of its parameters, in the dump's order
 DUMP_SUBOBJECT = re.compile(r"^(/Script/[^.]+)\.Default__([^.:]+)\.([^.:]+)$")
 NUMBER_WORDS = ("Zero", "One", "Two", "Three", "Four", "Five", "Six", "Seven", "Eight", "Nine")
 
@@ -555,7 +571,7 @@ def read_real_fields(sdk_dir):
         # Without it every respelled member (UFSDSaveGame's Index_0) cooks by its C++ name, which the engine does not
         # know: its default and its reads are lost in game, silently. So no UeApi rather than that one.
         sys.exit("no %s: run genueapi on the SDK inside its Dumper-7 dump, not a copy of it" % os.path.normpath(path))
-    cur, owner = None, None
+    cur, owner, sig = None, None, None
     for line in io.open(path, encoding="utf-8", errors="replace"):
         if not line.startswith("["):
             continue
@@ -565,10 +581,13 @@ def read_real_fields(sdk_dir):
                 cur.setdefault(int(m.group(1), 16), []).append(m.group(3).rstrip("\r\n"))
             if owner and m.group(2) in ("EnumProperty", "ByteProperty"):
                 ENUM_PROPS.setdefault((owner, int(m.group(1), 16)), []).append((m.group(3).rstrip("\r\n"), m.group(2)))
+            if sig is not None:
+                sig.append((m.group(2), m.group(3).rstrip("\r\n")))
             continue
         m = DUMP_OBJECT.match(line)
         owner = m.group(2).rstrip("\r\n") if m else None
         cur = REAL_FIELDS.setdefault(owner, {}) if m and m.group(1).endswith("Class") else None
+        sig = SIGNATURES.setdefault(owner, []) if m and m.group(1) in ("DelegateFunction", "SparseDelegateFunction") else None
         sub = DUMP_SUBOBJECT.match(m.group(2).rstrip("\r\n")) if m else None
         if sub:
             SUBOBJECTS.setdefault(sub.group(1) + "." + sub.group(2), []).append((sub.group(3), m.group(1)))
@@ -584,21 +603,76 @@ def read_real_fields(sdk_dir):
 # the name lost those, and with them EAbilityIndex's only property. So joined, every enum's properties come out one
 # kind: on the FSD 4.27 dump 842 enum classes and 354 TEnumAsByte enums, none both, and the 198 native enums any
 # property of the game's own cooked Blueprints is of (variables, parameters, locals) are the kind the dump says, bar
-# one the dump has no property of (2026-10-01; scan_game reads only the variables). An enum no member or parameter in
-# the headers is of has no form (249 of 1445), and AssetGen keeps such an enum a ByteProperty. 10 of those are a native
-# delegate's parameter (the dump has its signature, the headers no parameter struct to join it to) or a container's
-# element (the dump names no inner's field class).
+# one the dump has no property of (2026-10-01). An enum no member or parameter in the headers is of has no form there
+# (249 of 1445). 7 of those are a native delegate's parameter, which the dump lists under the delegate's signature
+# function and no header names (delegate_enum_kinds), and 3 a container's element, whose field class the dump does not
+# give: scan_game reads two off the game (a Blueprint local, a data asset's tags); ESteamVRInputStringBits stays
+# without. AssetGen keeps an enum with no form a ByteProperty.
 ENUM_PROPS = {}      # (owner path, offset) -> [(property name, "EnumProperty" / "ByteProperty")], off the object dump
 ENUM_OWNER = re.compile(r"^// \w+ (/.*?)\s*$")     # "// Class /Script/Engine.Actor", "// Function /Game/A.B_C.Do It"
 ENUM_MEMBER = re.compile(r"^\t(?:const\s+)?(E\w+)\s*&?\s+(\w+)(?:\[\w+\])?;\s+// 0x([0-9A-Fa-f]+)\(")
+DELEGATE_PARAMS = re.compile(r"(?:TDelegate|TMulticastInlineDelegate|TMulticastSparseDelegate)<[^()<>]*\(([^()]*)\)")
+# The field class each spelling of a delegate's parameter can be, where one alone fits: the control on the join below.
+FIELD_OF_PREFIX = (("TArray<", "ArrayProperty"), ("TSet<", "SetProperty"), ("TMap<", "MapProperty"),
+                   ("struct ", "StructProperty"), ("TSubclassOf<", "ClassProperty"), ("TSoftObjectPtr<", "SoftObjectProperty"),
+                   ("TSoftClassPtr<", "SoftClassProperty"), ("TWeakObjectPtr<", "WeakObjectProperty"),
+                   ("TScriptInterface<", "InterfaceProperty"), ("TDelegate<", "DelegateProperty"))
+FIELD_OF_TYPE = {"bool": "BoolProperty", "float": "FloatProperty", "double": "DoubleProperty", "int8": "Int8Property",
+                 "int16": "Int16Property", "int32": "IntProperty", "int64": "Int64Property", "uint8": "ByteProperty",
+                 "uint16": "UInt16Property", "uint32": "UInt32Property", "uint64": "UInt64Property",
+                 "class FString": "StrProperty", "class FName": "NameProperty", "class FText": "TextProperty"}
+
+
+def field_fits(ctype, field):
+    """Whether a parameter the SDK spells ctype can be a property of the dump's field class `field`."""
+    m = ENUM_REF.match(ctype.strip())
+    if m and m.group(1) in ENUMS:
+        return field in ("EnumProperty", "ByteProperty")
+    t = re.sub(r"\s*&$", "", re.sub(r"^const\s+", "", ctype.strip()))
+    for prefix, want in FIELD_OF_PREFIX:
+        if t.startswith(prefix):
+            return field == want
+    if t in FIELD_OF_TYPE:
+        return field == FIELD_OF_TYPE[t]
+    return field in ("ObjectProperty", "ClassProperty") if t.endswith("*") else True
+
+
+def delegate_enum_kinds(signatures):
+    """{enum: {"EnumProperty" / "ByteProperty"}} off the native delegates' parameters, from {(owner path, ((type, name),
+    ...))}: each delegate the headers spell, as its signature (`TMulticastInlineDelegate<void(ETemperatureSeverityType
+    Severity)>`), and the class, struct or function that spells it. No header names the signature function, so the join
+    to the dump's (SIGNATURES) is on the parameters themselves: a signature whose parameters are those names in that
+    order, each of a field class its spelling can be - the InAppPurchase proxies' OnSuccess take (PurchaseStatus,
+    InAppPurchaseReceipts) in two signatures, one with a struct and a ByteProperty, the other with an array and an
+    EnumProperty, and the types tell them apart. Looked for first under the owner (a class's own delegate types), then in
+    its package, then anywhere (UQuartzClockHandle's take Engine's OnQuartzCommandEvent). Where those found disagree on a
+    parameter's field class, the join cannot tell which is meant, and that parameter shows nothing."""
+    kinds = {}
+    params_of = dict((path, [x for x in sig if x[1] != "ReturnValue"]) for path, sig in SIGNATURES.items())
+    for owner, params in signatures:
+        scope = owner.rsplit(".", 1)[0] if owner.count(".") > 1 else owner      # a function's class
+        found = []
+        for near in (lambda p: p.startswith(owner + ".") or p.startswith(scope + "."),
+                     lambda p: p.startswith(owner.split(".")[0] + "."), lambda p: True):
+            found = [sig for path, sig in params_of.items() if near(path) and len(sig) == len(params) and
+                     all(is_spelling_of(n, real) and field_fits(t, field) for (t, n), (field, real) in zip(params, sig))]
+            if found:
+                break
+        for at, (t, _) in enumerate(params):
+            m = ENUM_REF.match(t.strip())
+            seen = set(sig[at][0] for sig in found)
+            if m and m.group(1) in ENUMS and len(seen) == 1:
+                kinds.setdefault(m.group(1), set()).update(seen)
+    return kinds
 
 
 def read_enum_forms(sdk_dir, game_forms):
     """Sets each Enum's form from its properties: the object dump's (ENUM_PROPS, joined to the member the SDK headers
-    declare), then game_forms ({enum path: {"EnumProperty" / "ByteProperty"}}, what the game's cooked Blueprints hold,
-    scan_game), the editor's own choice and so the one kept where the two disagree. Properties our own mods have in a dump
-    taken with them loaded are AssetGen's, and do not count."""
-    seen = {}
+    declare), then for an enum no member shows, the native delegates' parameters (delegate_enum_kinds), then game_forms
+    ({enum path: {"EnumProperty" / "ByteProperty"}}, what the game's cooked packages hold, scan_game), the editor's own
+    choice and so the one kept where they disagree. Properties our own mods have in a dump taken with them loaded are
+    AssetGen's, and do not count."""
+    seen, signatures = {}, set()
     for name in sorted(f for f in os.listdir(sdk_dir) if f.endswith(("_classes.hpp", "_structs.hpp", "_parameters.hpp"))):
         owner = None
         for line in io.open(os.path.join(sdk_dir, name), encoding="utf-8", errors="replace"):
@@ -609,7 +683,14 @@ def read_enum_forms(sdk_dir, game_forms):
             if line.startswith("};"):
                 owner = None
                 continue
-            m = ENUM_MEMBER.match(line) if owner and not owner.startswith("/Game/_ElytrasMods/") else None
+            if owner and owner.startswith("/Game/_ElytrasMods/"):
+                continue
+            for d in DELEGATE_PARAMS.finditer(line):
+                params = tuple((p.group(1).strip(), p.group(2)) for p in
+                               (re.match(r"^(.*?)\s*\b([A-Za-z_]\w*)$", a) for a in split_args(d.group(1))) if p)
+                if any(ENUM_REF.match(t) and ENUM_REF.match(t).group(1) in ENUMS for t, _ in params):
+                    signatures.add((owner or "", params))
+            m = ENUM_MEMBER.match(line) if owner else None
             if not m or m.group(1) not in ENUMS:
                 continue
             # Dumper-7's own UObject members (Object.Flags) are no property, and have none at their offset.
@@ -617,6 +698,16 @@ def read_enum_forms(sdk_dir, game_forms):
             kind = next((k for real, k in props if is_spelling_of(m.group(2), real)), None)
             if kind:
                 seen.setdefault(m.group(1), set()).add(kind)
+    added, agree, differ = 0, 0, []
+    for cpp, kinds in sorted(delegate_enum_kinds(signatures).items()):
+        if kinds and cpp not in seen:
+            seen[cpp], added = set(kinds), added + 1
+        elif kinds and seen[cpp] != kinds:
+            differ.append(cpp)
+        elif kinds:
+            agree += 1
+    print("  enum forms off native delegates' parameters: %d new, %d as their members'%s" % (
+        added, agree, "; NOT the members' kind, check the join: " + ", ".join(differ) if differ else ""))
     by_path = dict(("/Script/%s.%s" % (e.pkg, e.ue_name), e) for e in ENUMS.values())
     for path, kinds in game_forms.items():
         e = by_path.get(path)
@@ -729,11 +820,14 @@ def map_subobjects(classes, by_name):
     Default__Character.CollisionCylinder, and APlayerCharacter's CharMoveComp is a PlayerMovementComponent. The dump
     has no values, so a member is joined to the one subobject whose class is a kind of its type; one that two fit
     (AActor's RootComponent) is left out unless one of them has its name, or is the one the class declaring the member
-    joins it to on its own CDO. A subclass cannot rename a default subobject its parent's constructor made, only swap
-    its class or drop it (FObjectInitializer::SetDefaultSubobjectClass / DoNotCreateDefaultSubobject, by that name),
-    so APlayerCharacter's Mesh, which its FPMesh fits too, is still ACharacter's CharacterMesh0, as the game's own
-    BP_PlayerCharacter nodes attached to it say. That would only mislead for a member a subclass points elsewhere,
-    which ACharacter's, private, cannot be."""
+    joins it to on its own CDO, or is the one the game's Blueprints whose parent is k name on their default objects
+    (GAME_MEMBER_SUBOBJECTS, scan_game): ABomber's GooSoundComponent, which WingSound fits too, is GooAudioComponent,
+    as ENE_Bomber_C's tag of it says. Over every such Blueprint those tags agree with each join made the other ways
+    (1,204 on the FSD 4.27 dump, 2026-10-01). A subclass cannot rename a default subobject its parent's constructor
+    made, only swap its class or drop it (FObjectInitializer::SetDefaultSubobjectClass / DoNotCreateDefaultSubobject, by
+    that name), so APlayerCharacter's Mesh, which its FPMesh fits too, is still ACharacter's CharacterMesh0, as the
+    game's own BP_PlayerCharacter nodes attached to it say. That would only mislead for a member a subclass points
+    elsewhere, which ACharacter's, private, cannot be."""
     native = dict((k.ue_name, k) for k in classes if not k.is_bp)
 
     def isa(k, cpp):
@@ -759,9 +853,12 @@ def map_subobjects(classes, by_name):
                     continue
                 fits = [(n, c) for n, c in subs if isa(c, t.group(1))]
                 if len(fits) > 1:
-                    named = [(n, c) for n, c in fits if n == (real_field(o, fname) or fname)]
+                    real = real_field(o, fname) or fname
+                    named = [(n, c) for n, c in fits if n == real]
                     held = getattr(o, "subobjects", {}).get(fname) if o is not k else None
-                    fits = named or [(n, c) for n, c in fits if held and n == held.split(" ")[0]]
+                    shown = set(s.lower() for s in GAME_MEMBER_SUBOBJECTS.get((k.path + "." + k.ue_name, real.lower()), ()))
+                    fits = named or [(n, c) for n, c in fits if held and n == held.split(" ")[0]] \
+                        or [(n, c) for n, c in fits if n.lower() in shown]
                 if len(fits) == 1:
                     k.subobjects[fname] = "%s %s.%s" % (fits[0][0], fits[0][1].path, fits[0][1].ue_name)
             o = by_name.get(o.base)
@@ -1069,21 +1166,25 @@ def write_out_arrays(out_dir):
 
 
 SCRIPT_INHERIT = 0x4AA1364E         # CLASS_ScriptInherit, ObjectMacros.h:249-259
-RF_DEFAULT_SUBOBJECT = 0x40000
-GAME_SUBOBJECTS = {}                # game Blueprint class path -> ["<class path> <name>"] its CDO exports as default subobjects
+RF_ARCHETYPE_OBJECT, RF_DEFAULT_SUBOBJECT = 0x20, 0x40000
+GAME_SUBOBJECTS = {}                # game Blueprint class path -> ["<class path> <name>"] under its CDO (scan_game)
+GAME_MEMBER_SUBOBJECTS = {}         # (native class path, member's engine name lowered) -> {subobject names} (scan_game)
 OBJECT_PATH = "/Script/CoreUObject.Object"
 DEFAULT_TAIL = (0, OBJECT_PATH, "Engine")   # UObject's: Object.h:57-60
 
 
-def scan_game(content):
+def scan_game(content, container_members):
     """What the game's cooked Blueprints show that the dump does not: {class path: (its ScriptInherit ClassFlags,
     ClassWithin, ClassConfigName, super path)}, and each (class path, interface path) where a function of the class
     has a native interface's function as its super. An implementation of an interface of the class's own list has no
     super (measured on BP_SentryGun_MoveMarker), so such a pair is an interface a native ancestor implements. Also
-    {native enum path: {"EnumProperty" / "ByteProperty"}}, how the classes' variables of each enum are reflected: the
-    editor's own choice of the two (read_enum_forms)."""
+    {native enum path: {"EnumProperty" / "ByteProperty"}}, how the Blueprints' properties of each enum are reflected -
+    variables, parameters and locals, the editor's own choice of the two (read_enum_forms) - and how the native
+    objects' tags of the container members container_members names hold their elements (container_enum_members).
+    Fills GAME_SUBOBJECTS and GAME_MEMBER_SUBOBJECTS."""
     import invariants
-    classes, overrides, enums = {}, set(), {}
+    import struct
+    classes, overrides, enums, unread = {}, set(), {}, []
 
     def enum_kinds(p, prop):
         idx = prop.enum if prop.type == "EnumProperty" else prop.ref if prop.type == "ByteProperty" else 0
@@ -1092,6 +1193,16 @@ def scan_game(content):
             enums.setdefault(path, set()).add(prop.type)
         for s in prop.subs:
             enum_kinds(p, s)
+
+    def under(p, x, cdo):
+        up = x["outer"]
+        while 0 < up <= len(p.exports) and up != cdo:
+            up = p.exports[up - 1]["outer"]
+        return up == cdo
+
+    def name_path(p, k, cdo):
+        x = p.exports[k - 1]
+        return x["name"] if x["outer"] == cdo else name_path(p, x["outer"], cdo) + ":" + x["name"]
 
     for base in invariants.packages([content]):
         p = invariants.Package(base)
@@ -1103,18 +1214,83 @@ def scan_game(content):
                     classes[p.path(i + 1)] = (st.class_flags & SCRIPT_INHERIT, p.path(st.within) if st.within else OBJECT_PATH,
                                               st.config, p.path(e["super"]))
                     # Not the native class's list from the dump: the cook leaves some out (an AI controller's
-                    # PathFollowingComponent), and an import of one it left out would not resolve.
-                    GAME_SUBOBJECTS[p.path(i + 1)] = ["%s %s" % (p.path(x["cls"]), x["name"]) for x in p.exports
-                                                      if x["outer"] == st.cdo and x["flags"] & RF_DEFAULT_SUBOBJECT]
+                    # PathFollowingComponent), and an import of one it left out would not resolve. Every object under
+                    # the CDO that is a default subobject or an archetype, at any depth, as the cook orders them
+                    # before a child class (SavePackage.cpp 4013-4040): Damage:BreakIceBonus_0, an object instanced in
+                    # WPN_Pickaxe's Damage, is copied into a child's Damage too.
+                    GAME_SUBOBJECTS[p.path(i + 1)] = [
+                        "%s %s" % (p.path(x["cls"]), name_path(p, k + 1, st.cdo)) for k, x in enumerate(p.exports)
+                        if x["flags"] & (RF_DEFAULT_SUBOBJECT | RF_ARCHETYPE_OBJECT) and under(p, x, st.cdo)]
                     for prop in st.props:
                         enum_kinds(p, prop)
-            elif kind == "Function" and e["super"] < 0:
-                sup = p.path(e["super"])
-                if sup.startswith("/Script/") and ":" in sup:
-                    overrides.add((p.path(e["outer"]), sup.split(":")[0]))
-    print("  game Blueprints scanned: %d classes, %d native-super functions, %d native enums held"
-          % (len(classes), len(overrides), len(enums)))
+                    # A Blueprint's default object holds a tag for each component member, naming the default subobject
+                    # it points at: the join map_subobjects cannot make by type where two subobjects fit.
+                    sup = p.path(e["super"]) if e["super"] < 0 else ""
+                    if sup.startswith("/Script/") and 0 < st.cdo <= len(p.exports):
+                        for t in p.tags(st.cdo - 1):
+                            v = struct.unpack_from("<i", t["value"])[0] if t["type"] == "ObjectProperty" and t["size"] == 4 else 0
+                            o = p.obj(v)
+                            if v > 0 and o["outer"] == st.cdo and o["flags"] & RF_DEFAULT_SUBOBJECT \
+                                    or v < 0 and o["outer"] < 0 and p.obj(o["outer"])["name"].startswith("Default__"):
+                                GAME_MEMBER_SUBOBJECTS.setdefault((sup, t["name"].lower()), set()).add(o["name"])
+            elif kind in invariants.Package.FUNCTION_CLASSES:
+                if kind == "Function" and e["super"] < 0:
+                    sup = p.path(e["super"])
+                    if sup.startswith("/Script/") and ":" in sup:
+                        overrides.add((p.path(e["outer"]), sup.split(":")[0]))
+                try:
+                    st = p.struct(i)
+                except Exception:
+                    unread.append(p.path(i + 1))
+                    continue
+                for prop in st.props if st is not None else ():
+                    enum_kinds(p, prop)
+            elif e["cls"] < 0 and p.path(e["cls"]) in container_members:
+                # A native object's tag of a TArray / TSet / TMap member names its element's field class, which the
+                # dump does not: GD_TreasureSettings' CrateTreasureTypes holds EnumProperty elements.
+                members = container_members[p.path(e["cls"])]
+                try:
+                    tags = p.tags(i)
+                except Exception:
+                    unread.append(p.path(i + 1))
+                    continue
+                for t in tags:
+                    for enum, slot in members.get(t["name"], ()):
+                        if t.get(slot) in ("EnumProperty", "ByteProperty"):
+                            enums.setdefault(enum, set()).add(t[slot])
+    print("  game Blueprints scanned: %d classes, %d native-super functions, %d native enums held, %d component members "
+          "named" % (len(classes), len(overrides), len(enums), len(GAME_MEMBER_SUBOBJECTS)))
+    if unread:
+        print("  game objects whose properties could not be read, left out: %d, e.g. %s" % (len(unread), "; ".join(unread[:3])))
     return classes, overrides, enums
+
+
+def container_enum_members(classes, by_name):
+    """{native class path: {member's engine name: [(enum path, tag slot)]}}: each TArray / TSet / TMap member of an enum,
+    the class's own or inherited, and which of its tag's type names is the enum's field class there ("inner": an
+    array's or set's element, a map's key; "value_type": a map's value; Package.tags). Neither the object dump nor the
+    usmap says whether such an element is an EnumProperty or a TEnumAsByte ByteProperty (Dumper-7's MappingGenerator.cpp
+    writes the latter as an EnumProperty over a byte); a cooked tag does (scan_game)."""
+    out = {}
+    for k in classes:
+        if k.is_bp:
+            continue
+        members, o = {}, k
+        while o is not None:
+            for ftype, fname in o.fields:
+                t = ftype.replace(" ", "")
+                m = re.match(r"^(?:TArray|TSet)<(\w+)>$", t)
+                slots = [(m.group(1), "inner")] if m else []
+                m = re.match(r"^TMap<(\w+),(\w+)>$", t)
+                slots += [(m.group(1), "inner"), (m.group(2), "value_type")] if m else []
+                for e, slot in slots:
+                    if e in ENUMS:
+                        members.setdefault(real_field(o, fname) or fname, []).append(
+                            ("/Script/%s.%s" % (ENUMS[e].pkg, ENUMS[e].ue_name), slot))
+            o = by_name.get(o.base) if o.base else None
+        if members:
+            out[k.path + "." + k.ue_name] = members
+    return out
 
 
 def class_tails(classes, by_name, game):
@@ -1278,8 +1454,9 @@ def main():
     unique = set(n for n, c in name_count.items() if c == 1)
 
     by_name = dict((k.cpp, k) for k in classes)
+    game, overrides, game_enums = scan_game(game_dir, container_enum_members(classes, by_name)) if game_dir \
+        else ({}, set(), {})
     map_subobjects(classes, by_name)
-    game, overrides, game_enums = scan_game(game_dir) if game_dir else ({}, set(), {})
     read_enum_forms(sdk_dir, game_enums)
     for k in classes:
         k.default_subobjects = GAME_SUBOBJECTS.get(k.path + "." + k.ue_name, []) if k.is_bp else []
@@ -1343,6 +1520,9 @@ def main():
 
     if not os.path.isdir(out_dir):
         os.makedirs(out_dir)
+    # The stamp goes last: a run that stops halfway leaves none, and the compiler refuses the half-written UeApi.
+    if os.path.exists(os.path.join(out_dir, "Version.json")):
+        os.remove(os.path.join(out_dir, "Version.json"))
 
     conv_structs = write_conversions(ordered, out_dir)
     write_containers(ordered, sdk_dir, out_dir)
@@ -1591,6 +1771,11 @@ def main():
                 "*/"]
     umbrella += ["#include \"%s.h\"" % pkg for pkg in sorted(by_pkg) if not pkg.startswith("Game/")]
     io.open(os.path.join(out_dir, "UeApi.h"), "w", encoding="utf-8-sig", newline="\n").write("\n".join(umbrella) + "\n")
+    io.open(os.path.join(out_dir, "Version.json"), "w", encoding="utf-8", newline="\n").write(
+        '{"genueapi": %d, "game": %s}\n' % (GENUEAPI_VERSION, "true" if game_dir else "false"))
+    if not game_dir:
+        print("  no --game: no game Blueprint's default subobjects or tail, so the compiler refuses a class deriving "
+              "from one")
 
     bp = [k for k in ordered if k.is_bp]
     print("UeApi: %d classes, %d functions, %d properties, %d headers"

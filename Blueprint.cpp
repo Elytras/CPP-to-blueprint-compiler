@@ -26,7 +26,10 @@ void ScsNodeGuid(const std::string& ClassName, const std::string& ComponentName,
 FIndex FBlueprintClass::Subobject(const std::string& ClassPackage, const std::string& ClassName_,
                                   FIndex Outer, const std::string& ObjectName)
 {
-    const std::string Key = "sub:" + std::to_string(Outer.V) + ":" + ObjectName;
+    /* An FName compares without case, so `temperature` (UeApi's member, off the object dump) and the grunt's package's
+       `Temperature` are one object, which the cook imports once (SavePackage.cpp 3288-3339): the first spelling asked
+       for is the row's. */
+    const std::string Key = "sub:" + std::to_string(Outer.V) + ":" + Lower(ObjectName);
     auto It = ImportCache.find(Key);
     if (It != ImportCache.end()) return Imp(It->second);
 
@@ -302,9 +305,20 @@ void FBlueprintClass::Finish()
     if (!ComponentOverrides.empty()) Class.SerBeforeSer.push_back(Exp(RowIch).V);
     /* Every default subobject a Blueprint parent's CDO exports, restated here or not: the CDO this class makes while it
        is serialized copies each from that export as it stands (UObjectGlobals.cpp 3822-3859), so the cook maps it into
-       the linker table and orders it first (SavePackage.cpp 4013-4040). */
+       the linker table and orders it first (SavePackage.cpp 4013-4040). Nested ones as well, named by their path under
+       the CDO (Damage:BreakIceBonus_0, an object instanced in WPN_Pickaxe's Damage, which this class's Damage gets a
+       copy of): the cook's walk takes every default subobject and archetype under the CDO, at any depth. Each is
+       imported under its outer's import. */
+    std::function<FIndex(const std::string&)> ParentSubobjectAt = [&](const std::string& Path) -> FIndex {
+        const auto It = std::find_if(ParentSubobjects.begin(), ParentSubobjects.end(),
+                                     [&](const FParentSubobject& S) { return Lower(S.Name) == Lower(Path); });
+        const size_t Colon = Path.rfind(':');
+        const FIndex Outer = Colon == std::string::npos ? ParentCdo : ParentSubobjectAt(Path.substr(0, Colon));
+        if (It == ParentSubobjects.end() || Outer.V == 0) return Null();
+        return Subobject(It->ClassPackage, It->ClassName, Outer, Path.substr(Colon + 1));
+    };
     for (const FParentSubobject& S : ParentSubobjects)
-        Class.SerBeforeSer.push_back(Subobject(S.ClassPackage, S.ClassName, ParentCdo, S.Name).V);
+        if (const FIndex Sub = ParentSubobjectAt(S.Name); Sub.V != 0) Class.SerBeforeSer.push_back(Sub.V);
     Class.SerBeforeCreate = { BpgcClass.V, BpgcCdo.V };
     Class.CreateBeforeCreate = { ParentIdx.V };
     for (int32 I = 0; I < NumFunctions; ++I)

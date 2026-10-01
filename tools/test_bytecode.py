@@ -3967,6 +3967,134 @@ if preload_game_parent():
           'CDO exports')
 
 
+def preload_case_kid():
+    """PreloadCaseKid restates the grunt's Temperature by the name UeApi gives it, temperature (the object dump's
+    spelling). FName compares without case, so that is one object: one import row, which is both the override's
+    archetype and a parent subobject the class is serialized after (import_unique, edl_parent_subobjects_serialized)."""
+    if not GAME:
+        print('--  PreloadCaseKid: skipped (needs --game: the parent CDO\'s subobjects are read off the game\'s package)')
+        return False
+    base = asset('PreloadCaseKid')
+    saved = list(invariants.GAME_CONTENT)
+    invariants.GAME_CONTENT[:] = [GAME]
+    try:
+        found = invariants.check(invariants.Package(base), {'import_unique', 'edl_parent_subobjects_serialized'})
+    finally:
+        invariants.GAME_CONTENT[:] = saved
+    assert not found, '; '.join('%s %s: %s' % f for f in found[:3])
+    return True
+
+
+if preload_case_kid():
+    print('ok  PreloadCaseKid: a restated subobject spelled in another case than the parent\'s export is one import')
+
+
+def preload_nested_kid():
+    """PreloadNestedKid's parent, the game's WPN_Pickaxe_C, exports an instanced bonus under each of two default
+    subobjects (Damage:BreakIceBonus_0): the class is serialized after those too, as after every default subobject,
+    since the CDO it makes then copies each from them (edl_parent_subobjects_serialized walks every depth)."""
+    if not GAME:
+        print('--  PreloadNestedKid: skipped (needs --game: the parent CDO\'s subobjects are read off the game\'s package)')
+        return False
+    base = asset('PreloadNestedKid')
+    saved = list(invariants.GAME_CONTENT)
+    invariants.GAME_CONTENT[:] = [GAME]
+    try:
+        found = invariants.check(invariants.Package(base), {'edl_parent_subobjects_serialized', 'import_unique'})
+    finally:
+        invariants.GAME_CONTENT[:] = saved
+    assert not found, '%d findings, e.g. %s' % (len(found), '; '.join('%s %s: %s' % f for f in found[:2]))
+    keeps_invariants(base)
+    return True
+
+
+if preload_nested_kid():
+    print('ok  PreloadNestedKid: a child of a game Blueprint is serialized after its parent CDO\'s nested subobjects too')
+
+
+def ueapi_too_old():
+    """A UeApi that a genueapi older than the compiler wrote is refused, saying to regenerate it, before the compile
+    reads any of it: one made before UeDefaultSubobjects compiles a game Blueprint's child with none of the ordering
+    edges above, and says nothing. Here a UeApi with no Version.json (any made before genueapi stamped one) and one
+    stamped 0."""
+    import tempfile
+    src = os.path.join(TESTS, 'PreloadCaseKid.cpp')
+    for stamp in (None, '{"genueapi": 0}\n'):
+        with tempfile.TemporaryDirectory() as tmp:
+            stale = os.path.join(tmp, 'UeApi')
+            os.makedirs(stale)
+            if stamp:
+                with open(os.path.join(stale, 'Version.json'), 'w', encoding='utf-8') as f: f.write(stamp)
+            proc = assetgen_compile([src, stale, os.path.join(tmp, 'out')])
+            assert proc.returncode != 0 and 'older genueapi' in proc.stdout and 'regenerate' in proc.stdout, \
+                (stamp, proc.stdout[-500:])
+
+
+ueapi_too_old()
+print('ok  a UeApi older than the compiler, or with no Version.json, is refused, saying to regenerate it')
+
+
+def ueapi_without_game():
+    """genueapi without --game writes no game Blueprint's UeDefaultSubobjects or UeClassTail, which reads as a Blueprint
+    with none: a class deriving from one would compile without a word and load before its parent's subobjects. Its
+    Version.json says "game": false, and such a class is refused, saying to regenerate with --game; one with a native
+    parent still compiles. Here this UeApi's own headers, included by their full path, under tables whose Version.json
+    says false."""
+    import json, shutil, tempfile
+    real = os.path.abspath(UEAPI).replace('\\', '/')
+    with tempfile.TemporaryDirectory() as tmp:
+        api = os.path.join(tmp, 'UeApi')
+        os.makedirs(api)
+        for f in glob.glob(os.path.join(UEAPI, '*.json')):
+            shutil.copy(f, api)
+        stamp = json.load(open(os.path.join(UEAPI, 'Version.json'), encoding='utf-8'))
+        stamp['game'] = False
+        json.dump(stamp, open(os.path.join(api, 'Version.json'), 'w', encoding='utf-8'))
+        for mod, header, parent, ok in (('NoGameKid', 'Game/ENE_Spider_Grunt_Normal_C.h', 'ENE_Spider_Grunt_Normal_C', False),
+                                        ('NoGameActor', 'Engine.h', 'AActor', True)):
+            src = os.path.join(tmp, mod + '.cpp')
+            with open(src, 'w', encoding='utf-8') as f:
+                f.write('#include "%s/UeMeta.h"\n#include "%s/%s"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\n'
+                        'class %s : public %s {\npublic:\n    int32 Count;\n};\n' % (real, real, header, mod, mod, parent))
+            proc = assetgen_compile([src, api, os.path.join(tmp, 'out', mod)])
+            if ok:
+                assert proc.returncode == 0, (mod, proc.stdout[-500:])
+            else:
+                assert proc.returncode != 0 and 'without --game' in proc.stdout and 'regenerate' in proc.stdout, \
+                    (mod, proc.stdout[-500:])
+
+
+ueapi_without_game()
+print('ok  a UeApi made without --game refuses a class deriving from a game Blueprint, saying to regenerate it with '
+      '--game; a native parent still compiles')
+
+
+def subobject_bomber():
+    """SubobjectBomber restates two of ABomber's own members that two default subobjects each fit, neither named for
+    the member: GooSoundComponent is GooAudioComponent, AcidEmitterLeft is GooEmitterLeft, as the game's ENE_Bomber_C
+    default object says. Each override is an export of the subobject's name under the class's CDO, archetyped on
+    Default__Bomber's subobject, and the CDO's tag of the member names it."""
+    import struct
+    base = asset('SubobjectBomber')
+    pkg = invariants.Package(base)
+    cdo = pkg.find('Default__SubobjectBomber_C')
+    for member, sub, value in (('GooSoundComponent', 'GooAudioComponent', ('VolumeMultiplier', 0.5)),
+                               ('AcidEmitterLeft', 'GooEmitterLeft', ('SecondsBeforeInactive', 2.0))):
+        k = next((k for k, e in enumerate(pkg.exports) if e['name'] == sub and e['outer'] == cdo + 1), None)
+        assert k is not None, 'no %s export under the CDO for %s' % (sub, member)
+        assert pkg.path(pkg.exports[k]['tmpl']) == '/Script/FSD.Default__Bomber:' + sub, pkg.path(pkg.exports[k]['tmpl'])
+        t = pkg.tag(cdo, member)
+        assert t and struct.unpack_from('<i', t['value'])[0] == k + 1, (member, t)
+        t = pkg.tag(k, value[0])
+        assert t and struct.unpack_from('<f', t['value'])[0] == value[1], (sub, value[0], t)
+    keeps_invariants(base)
+
+
+subobject_bomber()
+print('ok  SubobjectBomber: a member two subobjects fit, neither named for it, overrides the one the game\'s Blueprint '
+      'names')
+
+
 # ---- TABLES: the package's own tables - names and their numbers, imports, exports, archetypes
 # (invariant_rules/tables.py)
 
@@ -6967,6 +7095,28 @@ for _mod, _body in (('PropSetBool', '  TSet<bool> Flags;\n'), ('PropMapBool', ' 
     refused(_mod, _body, 'cannot hash, and the engine hashes each one')
 print('ok  a set element / map key that cannot hash is refused: bool, FText, a native struct without GetTypeHash; as '
       'a variable, a local and a parameter')
+
+
+def prop_enum_forms():
+    """A variable of a native enum whose form only a native delegate's parameter or a container's element shows is
+    the property the editor makes of it (KismetCompilerMisc.cpp 1071-1094): an EnumProperty over a ByteProperty for an
+    `enum class`, a ByteProperty naming the enum for a TEnumAsByte one. The forms are the object dump's delegate
+    signatures' and the game's own packages' (PropEnumForms.cpp says where each comes from)."""
+    import invariants
+    base = asset('PropEnumForms')
+    pkg = invariants.Package(base)
+    props = {p.name: p for p in pkg.struct(pkg.find('PropEnumForms_C')).props}
+    want = {'Severity': 'EnumProperty', 'QuartzEvent': 'EnumProperty', 'PurchaseStatus': 'EnumProperty',
+            'Treasure': 'EnumProperty', 'AppState': 'ByteProperty', 'PathEvent': 'ByteProperty',
+            'QueryStatus': 'ByteProperty', 'PurchaseState': 'ByteProperty', 'Cleaned': 'ByteProperty'}
+    got = {n: (props[n].type, [s.type for s in props[n].subs]) for n in want}
+    assert got == {n: (t, ['ByteProperty'] if t == 'EnumProperty' else []) for n, t in want.items()}, got
+    keeps_invariants(base)
+
+
+prop_enum_forms()
+print('ok  PropEnumForms: an enum only a native delegate\'s parameter or a container\'s element shows the form of is '
+      'the property the editor makes')
 
 
 # ---- TYPES: UE_STRUCT default instances, UE_ENUM payloads and names (invariant_rules/user_types.py)
