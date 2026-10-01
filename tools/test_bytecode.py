@@ -7189,23 +7189,26 @@ def edit_whole_containers():
     """S38: a patch's whole TSet / TMap is what the edited default object loads. Its tag is a delta against the
     archetype, the parent Blueprint's CDO: the loader copies that value in, takes out the elements the tag lists as
     removed, then adds the rest (PropertySet.cpp 285-358, PropertyMap.cpp 316-400), as for a mod class's own
-    (prop_set_delta). MapPatch sets PropSetDelta_C's Ids = {7} and Score = {a: 9} over PropSetBase_C's {1, 2} and
-    {a: 1, c: 3}: written as additions only, the CDO would load the union."""
+    (prop_set_delta). MapPatch sets PropSetDelta_C's Ids and Score over PropSetBase_C's {1, 2} and {a: 1, c: 3}: to
+    {7} and {a: 9} (every element dropped or changed), then to {1, 7} and {a: 1, b: 2} (some kept as they were).
+    Written as additions only, the CDO would load the union."""
     game = os.path.join(ROOT, 'PropSetDelta', 'FSD', 'Content')
     decl = ('class PropSetBase : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/PropSetDelta/PropSetBase", "PropSetBase_C");\n'
             '  TSet<int32> Ids;\n  TMap<FName, int32> Score;\n};\n'
             'class PropSetDelta : public PropSetBase {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/PropSetDelta/PropSetDelta", "PropSetDelta_C");\n};\n')
-    with tempfile.TemporaryDirectory() as tmp:
-        proc, content = compile_edit(tmp, 'MapPatch', EDIT_HEAD + 'UE_MOD_PACKAGE("/Game/_ElytrasMods/MapPatch");\n' + decl
-                                     + 'class Tweaks : public PropSetDelta {\n  UE_PATCH;\n'
-                                     '  UE_DEFAULTS {\n    Ids = {7};\n    Score = {{"a", 9}};\n  }\n};\n', game)
-        assert proc.returncode == 0, proc.stdout + proc.stderr
-        parent = invariants.Package(os.path.join(game, '_ElytrasMods', 'PropSetDelta', 'PropSetBase'))
-        child = invariants.Package(os.path.join(content, '_ElytrasMods', 'PropSetDelta', 'PropSetDelta'))
-        pc, cc = parent.find('Default__PropSetBase_C'), child.find('Default__PropSetDelta_C')
-        ids = loaded_container(child, cc, 'Ids', 'set', loaded_container(parent, pc, 'Ids', 'set', set()))
-        score = loaded_container(child, cc, 'Score', 'map', loaded_container(parent, pc, 'Score', 'map', {}))
-    assert (ids, score) == ({7}, {'a': 9}), 'the patched CDO loads Ids = %s, Score = %s; the patch says {7}, {a: 9}' % (sorted(ids), score)
+    for body, want in (('Ids = {7};\n    Score = {{"a", 9}};', ({7}, {'a': 9})),
+                       ('Ids = {1, 7};\n    Score = {{"a", 1}, {"b", 2}};', ({1, 7}, {'a': 1, 'b': 2}))):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc, content = compile_edit(tmp, 'MapPatch', EDIT_HEAD + 'UE_MOD_PACKAGE("/Game/_ElytrasMods/MapPatch");\n' + decl
+                                         + 'class Tweaks : public PropSetDelta {\n  UE_PATCH;\n'
+                                         '  UE_DEFAULTS {\n    ' + body + '\n  }\n};\n', game)
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+            parent = invariants.Package(os.path.join(game, '_ElytrasMods', 'PropSetDelta', 'PropSetBase'))
+            child = invariants.Package(os.path.join(content, '_ElytrasMods', 'PropSetDelta', 'PropSetDelta'))
+            pc, cc = parent.find('Default__PropSetBase_C'), child.find('Default__PropSetDelta_C')
+            ids = loaded_container(child, cc, 'Ids', 'set', loaded_container(parent, pc, 'Ids', 'set', set()))
+            score = loaded_container(child, cc, 'Score', 'map', loaded_container(parent, pc, 'Score', 'map', {}))
+        assert (ids, score) == want, 'the patched CDO loads Ids = %s, Score = %s; the patch says %s' % (sorted(ids), score, body)
 
 
 GRUNT = '#include "UeApi/Game/ENE_Spider_Grunt_Normal_C.h"\n'
@@ -7446,7 +7449,9 @@ if not globals().get('EDITS_EXPLORE'):     # set by the dev loop's exploration d
     edit_deps_completed()
     print('ok  EditDeps: a patch\'s added override and replaced function get the preload dependencies the cook '
           'completes: the super serialized first, a new local\'s type serialized and created first')
-    pending('MapPatch: a patch\'s whole TSet / TMap lists the archetype\'s elements it drops as removed', edit_whole_containers)
+    edit_whole_containers()
+    print('ok  MapPatch: a patch\'s whole TSet / TMap loads as written: the archetype\'s elements it drops are listed as '
+          'removed')
 
 
 PREFETCH.finish()

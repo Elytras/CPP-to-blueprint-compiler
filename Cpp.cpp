@@ -10955,6 +10955,166 @@ static int32 ImportInto(FCookedPackage& P, const std::string& Package, const FPa
     return Moved[Index] = Out;
 }
 
+/* Q's FPackageIndex V, Q being the cooked package named QName, as an FPackageIndex of P (named PName): P's own export
+   when the object is one of P's, else an import of P, found or appended after its outers. 0, with Err set, for an
+   object of P that P does not hold. */
+static int32 ImportCooked(FCookedPackage& P, const std::string& PName, const FCookedPackage& Q, const std::string& QName,
+                          int32 V, std::string* Err)
+{
+    if (V == 0 || &P == &Q) return V;
+    struct FLink { std::string ClassPackage, ClassName, Name; };
+    auto ClassOf = [&](int32 C) -> std::pair<std::string, std::string> {
+        if (C == 0) return { "/Script/CoreUObject", "Class" };
+        if (C > 0) return { QName, Q.NameOf(Q.Exports[size_t(C - 1)].ObjectName) };
+        int32 Top = C;
+        while (Q.Imports[size_t(-Top - 1)].Outer < 0) Top = Q.Imports[size_t(-Top - 1)].Outer;
+        return { Q.NameOf(Q.Imports[size_t(-Top - 1)].ObjectName), Q.NameOf(Q.Imports[size_t(-C - 1)].ObjectName) };
+    };
+    std::vector<FLink> Chain;                       // the object first, its package last
+    for (int32 I = V; I != 0;)
+        if (I < 0)
+        {
+            const FCookedImport& Im = Q.Imports[size_t(-I - 1)];
+            Chain.push_back({ Q.NameOf(Im.ClassPackage), Q.NameOf(Im.ClassName), Q.NameOf(Im.ObjectName) });
+            I = Im.Outer;
+        }
+        else
+        {
+            const FCookedExport& E = Q.Exports[size_t(I - 1)];
+            const auto Class = ClassOf(E.Class);
+            Chain.push_back({ Class.first, Class.second, Q.NameOf(E.ObjectName) });
+            I = E.Outer;
+            if (I == 0) Chain.push_back({ "/Script/CoreUObject", "Package", QName });
+        }
+    int32 Out = 0;
+    if (Lower(Chain.back().Name) == Lower(PName))
+    {
+        for (size_t K = Chain.size() - 1; K-- > 0;)
+        {
+            const int32 E = P.FindExport(Chain[K].Name, Out);
+            if (E < 0) { *Err = PName + " holds no " + Chain[K].Name; return 0; }
+            Out = E + 1;
+        }
+        return Out;
+    }
+    for (size_t K = Chain.size(); K-- > 0;) Out = P.Import(Chain[K].ClassPackage, Chain[K].ClassName, Out, Chain[K].Name);
+    return Out;
+}
+
+/* V, read off Q, with every object it names made P's (ImportCooked). False, with Err set, as ImportCooked fails. */
+static bool ImportCookedValue(FCookedPackage& P, const std::string& PName, const FCookedPackage& Q, const std::string& QName,
+                              FDefaultValue& V, std::string* Err)
+{
+    if (V.K == FDefaultValue::Obj && V.Object.V != 0 && !(V.Object.V = ImportCooked(P, PName, Q, QName, V.Object.V, Err))) return false;
+    for (std::vector<FDefaultValue>* List : { &V.Items, &V.Removed })
+        for (FDefaultValue& Item : *List)
+            if (!ImportCookedValue(P, PName, Q, QName, Item, Err)) return false;
+    if (V.Members)
+    {
+        V.Members = std::make_shared<std::vector<FPropertyDef>>(*V.Members);
+        for (FPropertyDef& M : *V.Members)
+            if (!ImportCookedValue(P, PName, Q, QName, M.Default, Err)) return false;
+    }
+    return true;
+}
+
+/* An element of a TSet or TMap as a package loads it: its key (a set's element) and a map's value, each a def whose
+   Default is the value, with the bytes it compares by, written to a scratch package as DiffAgainstParent compares. */
+struct FLoadedElement
+{
+    FPropertyDef Key, Value;
+    std::vector<uint8> KeyBytes, ValueBytes;
+};
+
+/* Reads a /Game package by name: one the compile edits as it stands, else the game's own. Null, with Err set, when
+   there is none. */
+using FCookedLoader = std::function<const FCookedPackage*(const std::string& Package, std::string* Err)>;
+
+/*
+S38: the TSet or TMap property Name of export row X of Q (the cooked package QName) as the loader leaves it: what X's
+archetype holds (its TemplateIndex, followed through the packages Load reads), less the elements X's own tag lists as
+removed, then the rest added or, in a map, their values replaced (PropertySet.cpp 285-358, PropertyMap.cpp 316-400).
+bOwn false stops at the archetype's. Every object an element names becomes P's (an import appended), so nothing is
+written yet; Cmp is the scratch the bytes are compared in. A native archetype holds its C++ default, which no package
+has: it is taken as empty, and bNativeDefault is set when the property is the native class's (X's class is native, or
+a Blueprint class that does not declare it); a Blueprint class's own property starts empty under a native parent
+(UnrealType.h 439-446). False, saying why, when a package or a tag does not read.
+*/
+static bool LoadedElements(FCookedPackage& P, const std::string& PName, const FCookedPackage& Q, const std::string& QName,
+                           int32 X, const std::string& Name, bool bOwn, const FCookedLoader& Load, FPackage& Cmp,
+                           std::vector<FLoadedElement>& Out, bool& bNativeDefault, int32 Depth, std::string* Err)
+{
+    if (Depth > 64) { *Err = "the archetype chain does not end"; return false; }
+    const FCookedExport& Self = Q.Exports[size_t(X)];
+    if (Self.Template > 0 && !LoadedElements(P, PName, Q, QName, Self.Template - 1, Name, true, Load, Cmp, Out, bNativeDefault, Depth + 1, Err))
+        return false;
+    if (Self.Template < 0)
+    {
+        std::vector<std::string> Path;              // the archetype first, its package last
+        for (int32 I = Self.Template; I < 0; I = Q.Imports[size_t(-I - 1)].Outer) Path.push_back(Q.NameOf(Q.Imports[size_t(-I - 1)].ObjectName));
+        if (Path.back().compare(0, 8, "/Script/") == 0)
+        {
+            bool bDeclared = false;
+            FClassLayout L;
+            if (Self.Class > 0 && ReadClassLayout(Q, Q.Exports[size_t(Self.Class - 1)].Payload, L))
+                for (const FClassLayout::FField& F : L.Fields) bDeclared = bDeclared || Lower(Q.NameOf(F.Name)) == Lower(Name);
+            bNativeDefault = bNativeDefault || !bDeclared;
+        }
+        else
+        {
+            const FCookedPackage* Arch = Load(Path.back(), Err);
+            if (!Arch) return false;
+            int32 Row = -1;
+            for (size_t K = Path.size() - 1; K-- > 0 && (Row = Arch->FindExport(Path[K], Row + 1)) >= 0;) {}
+            if (Row < 0) { *Err = Path.back() + " holds no " + Path.front(); return false; }
+            if (!LoadedElements(P, PName, *Arch, Path.back(), Row, Name, true, Load, Cmp, Out, bNativeDefault, Depth + 1, Err)) return false;
+        }
+    }
+    if (!bOwn) return true;
+
+    std::vector<FTag> Tags;
+    size_t At = 0;
+    if (!ReadTags(Q, Self.Payload, At, Tags)) { *Err = QName + ": " + Q.NameOf(Self.ObjectName) + "'s tags do not read"; return false; }
+    const auto Tag = std::find_if(Tags.begin(), Tags.end(), [&](const FTag& T) { return T.ArrayIndex == 0 && Q.SameName(T.Name, Name); });
+    if (Tag == Tags.end()) return true;
+    FPropertyDef Def;
+    std::string Why;
+    if (!ReadTagValue(Q, *Tag, Def, &Why) || !Def.Inner)
+    { *Err = QName + ": " + Q.NameOf(Self.ObjectName) + "'s " + Name + " does not read" + (Why.empty() ? "" : " (" + Why + ")"); return false; }
+    if (!ImportCookedValue(P, PName, Q, QName, Def.Default, Err)) return false;
+    const bool bMap = Def.Type == "MapProperty" && Def.Value;
+    auto Bytes = [&](const FPropertyDef& Of, const FDefaultValue& V) {
+        FPropertyDef E = Of;
+        E.Default = V;
+        FArc A(&Cmp);
+        WriteDefaultValue(A, E);
+        return A.B;
+    };
+    for (const FDefaultValue& Gone : Def.Default.Removed)
+    {
+        const std::vector<uint8> Key = Bytes(*Def.Inner, Gone);
+        Out.erase(std::remove_if(Out.begin(), Out.end(), [&](const FLoadedElement& E) { return E.KeyBytes == Key; }), Out.end());
+    }
+    const std::vector<FDefaultValue>& Items = Def.Default.Items;
+    for (size_t I = 0; I + (bMap ? 2 : 1) <= Items.size(); I += bMap ? 2 : 1)
+    {
+        FLoadedElement E;
+        E.Key = *Def.Inner;
+        E.Key.Default = Items[I];
+        E.KeyBytes = Bytes(E.Key, Items[I]);
+        if (bMap)
+        {
+            E.Value = *Def.Value;
+            E.Value.Default = Items[I + 1];
+            E.ValueBytes = Bytes(E.Value, Items[I + 1]);
+        }
+        const auto Had = std::find_if(Out.begin(), Out.end(), [&](const FLoadedElement& O) { return O.KeyBytes == E.KeyBytes; });
+        if (Had == Out.end()) Out.push_back(std::move(E));
+        else if (bMap) *Had = std::move(E);
+    }
+    return true;
+}
+
 /*
 An edit of export row Template, when it is a component template whose SCS node or override record carries valid cooked
 instancing data. A spawned actor builds such a component on the fast path: NewObject of the template's class, then only
@@ -11127,6 +11287,70 @@ bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object,
                 Deps.push_back(Move(D.Extra.V));
         }
     if (!MoveErr.empty()) { *Err = Where + ": " + MoveErr; return false; }
+
+    /* A whole TSet or TMap is written as the cook writes one: a delta the loader reads over the archetype's value
+       (PropertySet.cpp 285-358, PropertyMap.cpp 316-400). The archetype's elements (a map's keys) the assignment drops
+       are listed as removed and only the elements it adds or changes are written; written whole, the object would load
+       the union. Before the names are seeded below: a removed element can name an object P has no import of yet. */
+    std::map<std::string, FCookedPackage> Read;
+    const FCookedLoader Load = [&](const std::string& Name, std::string* LoadErr) -> const FCookedPackage* {
+        if (auto Slot = Edited.find(Lower(Name)); Slot != Edited.end()) return &Slot->second.P;
+        if (auto Slot = Read.find(Lower(Name)); Slot != Read.end()) return &Slot->second;
+        if (Name.compare(0, 6, "/Game/") != 0) { *LoadErr = Name + " is not a /Game package"; return nullptr; }
+        const std::string Base = (std::filesystem::u8path(GameDir) / std::filesystem::u8path(Name.substr(6))).u8string();
+        FCookedPackage Q;
+        for (const char* Ext : { ".uasset", ".umap" })
+            if (std::filesystem::exists(std::filesystem::u8path(Base + Ext)))
+                return Q.Load(Base + Ext, LoadErr) ? &(Read[Lower(Name)] = std::move(Q)) : nullptr;
+        *LoadErr = Name + " is not in " + GameDir;
+        return nullptr;
+    };
+    for (FEditDef& E : Edits)
+    {
+        FPropertyDef& D = E.Chain[0];
+        if (!E.Path.empty() || !D.Inner || (D.Type != "SetProperty" && D.Type != "MapProperty")) continue;
+        FPackage Cmp("/Scratch");
+        Cmp.SeedNames({});
+        std::vector<FLoadedElement> Had;
+        bool bNativeDefault = false;
+        std::string Why;
+        if (!LoadedElements(P, Package, P, Package, Export, D.Name, false, Load, Cmp, Had, bNativeDefault, 0, &Why))
+        {
+            printf("  warning: %s: %s: the archetype's value does not read (%s), so none of its elements is removed: the "
+                   "object loads them as well\n", Where.c_str(), D.Name.c_str(), Why.c_str());
+            continue;
+        }
+        if (bNativeDefault)
+            printf("  warning: %s: %s: the archetype's value is the native class's C++ default, which no package holds, so "
+                   "none of its elements is removed: the object loads any it has as well\n", Where.c_str(), D.Name.c_str());
+        const bool bMap = D.Type == "MapProperty" && D.Value;
+        auto Bytes = [&](const FPropertyDef& Of, const FDefaultValue& V) {
+            FPropertyDef Element = Of;
+            Element.Default = V;
+            FArc A(&Cmp);
+            WriteDefaultValue(A, Element);
+            return A.B;
+        };
+        FDefaultValue Delta = D.Default;
+        Delta.Items.clear();
+        Delta.Removed.clear();
+        std::vector<std::vector<uint8>> Keys;
+        for (size_t I = 0; I + (bMap ? 2 : 1) <= D.Default.Items.size(); I += bMap ? 2 : 1)
+        {
+            Keys.push_back(Bytes(*D.Inner, D.Default.Items[I]));
+            const auto Same = std::find_if(Had.begin(), Had.end(), [&](const FLoadedElement& H) { return H.KeyBytes == Keys.back(); });
+            if (Same != Had.end() && (!bMap || Same->ValueBytes == Bytes(*D.Value, D.Default.Items[I + 1]))) continue;
+            Delta.Items.push_back(D.Default.Items[I]);
+            if (bMap) Delta.Items.push_back(D.Default.Items[I + 1]);
+        }
+        for (const FLoadedElement& H : Had)
+            if (std::find(Keys.begin(), Keys.end(), H.KeyBytes) == Keys.end())
+            {
+                Delta.Removed.push_back(H.Key.Default);
+                DefaultRefs(H.Key.Default, Deps);
+            }
+        D.Default = std::move(Delta);
+    }
 
     /* Each assignment's bytes, written against P's names (a name P lacks is appended), then read back as P's own.
        Fresh[K] is the tag holding only the path below step K, for each K it can be one (every step on is a member of a
