@@ -1339,9 +1339,10 @@ private:
        holding it and whether it is a static; {nullptr, false} for nothing. */
     std::pair<const FRecord*, bool> FoundAbove(const FRecord& R, const std::string& Method) const;
     /* Each file of the mod's own holding `UE_FINAL_AS(Base, Leaf)` (last name segments compared), as whether it is a
-       header that names Package, its base's UE_CLASS path: the compiled source and what it includes by a quoted path
-       beside it, transitively, UeApi headers left out. Empty when the macro is written nowhere these reach. */
-    std::vector<bool> FinalAsSites(const std::string& Base, const std::string& Leaf, const std::string& Package) const;
+       header a source of Owner's (the mod package that cooks the base) includes: the compiled source and what it
+       includes by a quoted path beside it, transitively, UeApi headers left out. Empty when the macro is written
+       nowhere these reach. */
+    std::vector<bool> FinalAsSites(const std::string& Base, const std::string& Leaf, const std::string& Owner) const;
     bool IsMulticast(const FRecord& R, const std::string& Method) const;
     /* A constant outside any function body, `constexpr int32 kMax = 40;` at namespace scope or static in a class, and an
        inline class variable, `static inline const TArray<FName> Tags = {...};`: decl id -> its VarDecl. It has no
@@ -2548,13 +2549,15 @@ bool FCompiler::Collect(std::string* Err)
             return false;
         }
         if (!bCookedHere)
-            if (const std::vector<bool> Sites = FinalAsSites(LeafOf(Base->CppName), LeafOf(Leaf.CppName), Base->UePackage);
+            if (const std::vector<bool> Sites = FinalAsSites(LeafOf(Base->CppName), LeafOf(Leaf.CppName),
+                                                             Base->UePackage.substr(0, Base->UePackage.size() - Natural.size()));
                 !Sites.empty() && std::none_of(Sites.begin(), Sites.end(), [](bool bShared) { return bShared; }))
             {
                 *Err = "UE_FINAL_AS(" + Leaf.Base + ", " + Leaf.CppName + "): " + LeafOf(Base->CppName) + " is another "
                        "mod's class (UE_CLASS \"" + Base->UePackage + "\"), and only the UE_FINAL_AS in the header that "
-                       "declares it, which that mod includes too, makes the leaf that mod cooks; move it there, beside "
-                     + LeafOf(Base->CppName) + ", or derive " + LeafOf(Leaf.CppName) + " from it as a plain class";
+                       "declares it, which a source of that mod beside it includes too, makes the leaf that mod cooks; a "
+                       "header of this mod's own is not it; move it there, beside " + LeafOf(Base->CppName) + ", or derive "
+                     + LeafOf(Leaf.CppName) + " from it as a plain class";
                 return false;
             }
         /* The leaf brings no method of its own, so a `= 0` one left above it makes the one class made abstract too
@@ -5294,8 +5297,13 @@ const std::vector<std::string>& FCompiler::ModSources() const
    the text says where the macro was written: the compiled source and the files it includes by a quoted path that
    resolves beside the including one (bpbuild's unity file includes each .cpp of a mod by its absolute path), read as
    text. A UeApi header is generated and no mod's, so a path through a UeApi folder is not followed. A macro written
-   through another macro is not found; the caller then takes the compiler's old answer. */
-std::vector<bool> FCompiler::FinalAsSites(const std::string& Base, const std::string& Leaf, const std::string& Package) const
+   through another macro is not found; the caller then takes the compiler's old answer.
+   A site is the shared one when the owner sees it too: a header that a source of the owner's, beside it and outside
+   this compile, includes. A source is the owner's when its UE_MOD_PACKAGE is Owner, or when it has none and every
+   UE_MOD_PACKAGE written in its folder's sources is Owner (a mod of several sources, its package in one of them). A
+   header of this mod's own that re-declares the base, the same text, is no such header: the owner never cooks the
+   leaf that one declares. */
+std::vector<bool> FCompiler::FinalAsSites(const std::string& Base, const std::string& Leaf, const std::string& Owner) const
 {
     namespace fs = std::filesystem;
     auto IsIdent = [](char C) { return isalnum(uint8(C)) || C == '_'; };
@@ -5306,23 +5314,63 @@ std::vector<bool> FCompiler::FinalAsSites(const std::string& Base, const std::st
         while (Begin > 0 && IsIdent(S[Begin - 1])) --Begin;
         return S.substr(Begin, End - Begin);
     };
-    std::vector<bool> Sites;
-    std::set<std::string> Seen;
-    for (std::vector<fs::path> Todo{ fs::path(SourceFile) }; !Todo.empty();)
-    {
-        const fs::path File = Todo.back();
-        Todo.pop_back();
-        std::error_code Ec;
-        if (!fs::is_regular_file(File, Ec) || !Seen.insert(fs::weakly_canonical(File, Ec).string()).second) continue;
-        if (std::any_of(File.begin(), File.end(), [](const fs::path& Part) { return Part == "UeApi"; })) continue;
-        const std::string Text = ReadText(File.string());
-        for (size_t At = 0; (At = Text.find("#include", At)) != std::string::npos; At += 8)
+    auto Canonical = [](const fs::path& P) { std::error_code Ec; return fs::weakly_canonical(P, Ec).string(); };
+    /* The files Root reaches by quoted includes, Root among them, by canonical path. */
+    auto Reach = [&](const fs::path& Root) {
+        std::map<std::string, std::pair<fs::path, std::string>> Reached;
+        for (std::vector<fs::path> Todo{ Root }; !Todo.empty();)
         {
-            const size_t Open = Text.find_first_of("\"<\n", At + 8);
-            if (Open == std::string::npos || Text[Open] != '"') continue;
-            const size_t Close = Text.find('"', Open + 1);
-            if (Close != std::string::npos) Todo.push_back(File.parent_path() / fs::path(Text.substr(Open + 1, Close - Open - 1)));
+            const fs::path File = Todo.back();
+            Todo.pop_back();
+            std::error_code Ec;
+            if (!fs::is_regular_file(File, Ec) || Reached.count(Canonical(File))) continue;
+            if (std::any_of(File.begin(), File.end(), [](const fs::path& Part) { return Part == "UeApi"; })) continue;
+            const std::string Text = ReadText(File.string());
+            for (size_t At = 0; (At = Text.find("#include", At)) != std::string::npos; At += 8)
+            {
+                const size_t Open = Text.find_first_of("\"<\n", At + 8);
+                if (Open == std::string::npos || Text[Open] != '"') continue;
+                const size_t Close = Text.find('"', Open + 1);
+                if (Close != std::string::npos) Todo.push_back(File.parent_path() / fs::path(Text.substr(Open + 1, Close - Open - 1)));
+            }
+            Reached[Canonical(File)] = { File, Text };
         }
+        return Reached;
+    };
+    /* The path a source's UE_MOD_PACKAGE names, or empty. */
+    auto PackageIn = [&](const std::string& Text) {
+        for (size_t At = 0; (At = Text.find("UE_MOD_PACKAGE", At)) != std::string::npos; At += 14)
+        {
+            if ((At > 0 && IsIdent(Text[At - 1])) || (At + 14 < Text.size() && IsIdent(Text[At + 14]))) continue;
+            const size_t Open = Text.find_first_not_of(" \t", At + 14);
+            if (Open == std::string::npos || Text[Open] != '(') continue;
+            const size_t Quote = Text.find_first_not_of(" \t", Open + 1);
+            const size_t End = Quote == std::string::npos || Text[Quote] != '"' ? std::string::npos : Text.find('"', Quote + 1);
+            if (End != std::string::npos) return Text.substr(Quote + 1, End - Quote - 1);
+        }
+        return std::string();
+    };
+    const auto Unit = Reach(fs::path(SourceFile));
+    auto SharedByOwner = [&](const fs::path& Header) {
+        std::error_code Ec;
+        std::vector<std::pair<fs::path, std::string>> Sources;      // the .cpp files beside it, outside this compile
+        std::set<std::string> Packages;
+        for (const auto& E : fs::directory_iterator(Header.parent_path(), Ec))
+            if (E.is_regular_file(Ec) && E.path().extension() == ".cpp" && !Unit.count(Canonical(E.path())))
+            {
+                Sources.emplace_back(E.path(), PackageIn(ReadText(E.path().string())));
+                if (!Sources.back().second.empty()) Packages.insert(Sources.back().second);
+            }
+        const bool bOwnersFolder = Packages.size() == 1 && *Packages.begin() == Owner;
+        const std::string Want = Canonical(Header);
+        return std::any_of(Sources.begin(), Sources.end(), [&](const auto& S) {
+            return (S.second == Owner || (S.second.empty() && bOwnersFolder)) && Reach(S.first).count(Want);
+        });
+    };
+    std::vector<bool> Sites;
+    for (const auto& [Key, Entry] : Unit)
+    {
+        const auto& [File, Text] = Entry;
         bool bHere = false;
         for (size_t At = 0; !bHere && (At = Text.find("UE_FINAL_AS", At)) != std::string::npos; At += 11)
         {
@@ -5335,8 +5383,7 @@ std::vector<bool> FCompiler::FinalAsSites(const std::string& Base, const std::st
         }
         if (!bHere) continue;
         const std::string Ext = File.extension().string();
-        Sites.push_back((Ext == ".h" || Ext == ".hpp" || Ext == ".hh" || Ext == ".inl")
-                        && Text.find("\"" + Package + "\"") != std::string::npos);
+        Sites.push_back((Ext == ".h" || Ext == ".hpp" || Ext == ".hh" || Ext == ".inl") && SharedByOwner(File));
     }
     return Sites;
 }

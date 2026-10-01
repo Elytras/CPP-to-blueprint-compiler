@@ -1998,8 +1998,9 @@ def final_as_private_header():
         assert proc.returncode != 0 and 'only the UE_FINAL_AS in the header that declares it' in proc.stdout, proc.stdout
 
 
-pending('FinalAsTest: UE_FINAL_AS over another mod\'s base in a header of this mod\'s own is refused; in the header its '
-        'owner\'s sources include it is not', final_as_private_header)
+final_as_private_header()
+print('ok  FinalAsTest: UE_FINAL_AS over another mod\'s base in a header of this mod\'s own is refused; in the header its '
+      'owner\'s sources include it is not')
 
 
 # ---- NestedTest
