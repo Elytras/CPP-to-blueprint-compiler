@@ -322,7 +322,9 @@ An event is a method named after an event the parent class exposes, such as `Rec
 `ReceiveActorBeginOverlap`. The engine calls it as it calls the event node you add in the editor, and overriding
 `ReceiveTick` also turns ticking on for the actor or component. Inside an override, `Base::Method()` runs the parent's
 version, the editor's Add call to parent function; C++ has no `Super`, so name the class you derive from. In a class
-that does not declare Method, `Base::Method()` copies Base's body in, or, where it cannot, goes by name with a warning.
+that does not declare Method, `Base::Method()` copies Base's body in, or, where it cannot, runs Base's function through
+an override of Method that AssetGen adds to your class, which only calls the parent's; a multicast goes by name with a
+warning.
 Every other call to a method goes by name, so the most derived override runs, also when the parent's own code makes
 the call. A `final` class or method has no override, so its calls go straight to the one function, and on `this` its
 body is copied in.
