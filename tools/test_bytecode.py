@@ -1876,7 +1876,10 @@ def final_as():
     refused('FinalAsHdr', '', 'derives from FaHdr, which is UE_FINAL_AS FaHdrLeaf',
             top='class FaHdr : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/FinalAsHdr/FaHdr", "FaHdr_C");\n};\n'
                 'UE_FINAL_AS(FaHdr, FaHdrLeaf);\nclass FaHdrOther : public FaHdr {};\n')
-    print('ok  FinalAsTest: UE_FINAL_AS compiles the base as final, cooks it Abstract, and refuses a second subclass')
+    refused('FinalAsTwice', '', 'FaTwo has two UE_FINAL_AS leaves, FaTwoA and FaTwoB',
+            top='class FaTwo : public AActor {\npublic:\n  int32 X;\n};\nUE_FINAL_AS(FaTwo, FaTwoB);\nUE_FINAL_AS(FaTwo, FaTwoA);\n')
+    print('ok  FinalAsTest: UE_FINAL_AS compiles the base as final, cooks it Abstract, and refuses a second subclass '
+          'or a second leaf')
 
 
 final_as()

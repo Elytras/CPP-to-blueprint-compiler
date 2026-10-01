@@ -2523,6 +2523,13 @@ bool FCompiler::Collect(std::string* Err)
                    "so " + Leaf.CppName + ", the one class made, would be abstract; give " + Method + " a body";
             return false;
         }
+        /* A second macro on the base would read below as a stray subclass of the first leaf: say what it is. */
+        if (!Base->FinalAs.empty() && Base->FinalAs != Leaf.CppName)
+        {
+            *Err = Leaf.Base + " has two UE_FINAL_AS leaves, " + std::min(Base->FinalAs, Leaf.CppName) + " and "
+                 + std::max(Base->FinalAs, Leaf.CppName) + ": a base has one, the one class made";
+            return false;
+        }
         Records[Base->CppName].FinalAs = Leaf.CppName;
     }
     for (const auto& [Key, W] : Records)
