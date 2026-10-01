@@ -2653,16 +2653,23 @@ Notes:
 | You write | What it does | Status |
 |---|---|---|
 | `UE_COMPONENT(USceneComponent, Root);` as the first scene component | Becomes the actor's root. | Yes |
-| a later scene component | Attaches directly to the root. The tree is one level deep and uses no sockets. | Yes |
+| a later scene component | Attaches directly to the root, unless `SetupAttachment` places it. | Yes |
 | a component that is not a scene component, such as `UProjectileMovementComponent` | Is created with no attachment, wherever it is declared. | Yes |
 | no `UE_COMPONENT` at all | The actor gets the engine's default scene root. | Yes |
 | only components that are not scene components | The actor gets the engine's default scene root too, as in the editor, so a movement component has a root to move. Below a parent that gives the actor a root already, a Blueprint parent or a native one such as ACharacter (its capsule), it gets none, as in the editor. | Yes |
-| a scene component nested under another, or at a socket | Not yet: there is no syntax for it. Attach it at run time with `AttachToComponent` (below). | Not yet |
+| `UE_DEFAULTS { Tip->SetupAttachment(Glow); }`, Glow another `UE_COMPONENT` of the class | Tip attaches to Glow, as in a C++ constructor: in the construction script it is one of Glow's child nodes. It keeps its own location, rotation and scale, relative to Glow. | Yes |
+| `Tip->SetupAttachment(Glow, FName("Muzzle"));` | The same at a socket or bone of Glow (the node's AttachToName). The socket is a literal name or none; a variable or a call there is refused, since it would be dropped. | Yes |
+| `Glow->SetupAttachment(Lamp);`, Lamp a component of a mod or game Blueprint parent | Glow attaches to the inherited Lamp. Its node names Lamp and the parent class whose construction script makes it (ParentComponentOrVariableName, ParentComponentOwnerClassName), as the editor saves a component dropped on an inherited one. A game Blueprint's component needs the UeApi header to mark it as a construction-script node (`Scene__UeScsNode`); one without it is refused with what to regenerate. | Yes |
+| `Glow->SetupAttachment(Mesh);` in an `ACharacter` child | Glow attaches to a native default subobject. The node names the subobject by its object name, `CharacterMesh0` for `Mesh` (bIsParentComponentNative), which UeApi records. It stays `CharacterMesh0` further down, in an `APlayerCharacter` child, though `FPMesh` is a skeletal mesh too: a subclass cannot rename a subobject its parent makes. A native member that is no default subobject, such as `AActor`'s `RootComponent`, is refused: attach to it at run time. | Yes |
+| `Lamp->SetupAttachment(Own);` for an inherited Lamp, `A->SetupAttachment(B); B->SetupAttachment(A);`, or one component attached twice | Refused. An inherited component stays where its own class puts it. A cycle has no node the construction script starts from, so none of its components would be made. | Refused |
+| `Pivot->SetupAttachment(Lamp);` in a function | Attaches at once, keeping the relative transform: `K2_AttachToComponent` with KeepRelative for location, rotation and scale, and no welding. That is what the engine's own `SetupAttachment` leads to when the component registers; called on a component already registered, as any in a function is, the engine's own does nothing. | Yes |
 
 Notes:
 
 - If the parent class already has a root, such as `ACharacter`'s capsule or a mod parent's first scene component, this
   class's first scene component attaches under that root instead of replacing it.
+- With no root to inherit, the root is the first scene component that `SetupAttachment` leaves alone, even if a
+  component declared before it is attached elsewhere.
 - The root's own location, rotation and scale are a special case: see [Class defaults](#class-defaults).
 
 ### Adding components at run time
@@ -2716,7 +2723,8 @@ Notes:
 properties a parent class declares. It is what editing a component or Class Defaults in the details panel writes. The
 block is data: AssetGen reads its assignments when it compiles, and nothing in it ever runs. The rule to remember:
 every statement is `Field = value;` or `Component->Field = value;`, and a variable the class declares takes its default
-from its own initializer instead.
+from its own initializer instead. The one call it takes is `Component->SetupAttachment(Parent);`, which places a
+component: see [The root and attachment](#the-root-and-attachment).
 
 ### UE_DEFAULTS
 
@@ -2731,7 +2739,7 @@ from its own initializer instead.
 | `Lamp->RelativeLocation.Z = 50.0f;` | Refused. Assign the whole struct: `Lamp->RelativeLocation = FVector(0.0f, 0.0f, 50.0f);`. The message is misleading: it says UeApi "does not say which default subobject RelativeLocation is", and regenerating the SDK does not help. | Refused |
 | `int32 Charges;` with `UE_DEFAULTS { Charges = 3; }` | Refused: "is declared here - give it an initializer instead". Write `int32 Charges = 3;`. | Refused |
 | `Extra->bVisible = false;`, where `Extra` is a plain pointer member | Refused: "is not a UE_COMPONENT". Only a `UE_COMPONENT`, this class's or a parent's, has a template to hold defaults. | Refused |
-| `Lamp->Intensity += 100.0f;`, an `if`, a call such as `K2_DestroyActor();` | Refused: "every statement is `Field = value;` or `Component->Field = value;`". The block never runs, so logic in it could do nothing. | Refused |
+| `Lamp->Intensity += 100.0f;`, an `if`, a call such as `K2_DestroyActor();` | Refused: "every statement is `Field = value;`, `Component->Field = value;` or `Component->SetupAttachment(Parent);`". The block never runs, so logic in it could do nothing. | Refused |
 | `Lamp->Intensity = UKismetMathLibrary::RandomFloat();`, `InitialLifeSpan = sizeof(FVector);` | Refused: "a default is a value known when the mod is built". A value here follows the rules for a member's initializer: see [Classes and variables](#classes-and-variables). Compute anything else in `ReceiveBeginPlay` or `UserConstructionScript`. | Refused |
 | `Instigator = nullptr;`, `Mesh->StaticMesh = nullptr;` | Refused: "needs a literal value". `nullptr` writes nothing, so `UE_DEFAULTS` cannot clear an inherited object reference. Leave the statement out to keep the parent's value. | Refused |
 | `Lantern() { InitialLifeSpan = 5.0f; }` | Not yet: a constructor is dropped with no message. It makes no function and writes no default. Use initializers and `UE_DEFAULTS`, and do run-time setup in `ReceiveBeginPlay`. | Not yet |
@@ -2814,7 +2822,7 @@ Notes:
 | You write | What it does | Status |
 |---|---|---|
 | `Lamp->Intensity = 250.0f;`, where a mod parent declares `Lamp` | Overrides that component's defaults for this class only, as the editor does for an inherited component. No `Super::` is needed: the compiler finds the class that declares the member. A grandchild that sets `Lamp->bVisible = false;` keeps the 250 as well: defaults fold down the chain as C++ constructors do. | Yes |
-| `CapsuleComponent->CapsuleRadius = 55.0f;` in an `ACharacter` child | A C++ parent's component is a default subobject. AssetGen overrides it under the subobject's real name and class, which can differ from the member's: `ACharacter`'s `CapsuleComponent` is `CollisionCylinder`. The SDK records the name as `<Member>__UeSubobject`. | Yes |
+| `CapsuleComponent->CapsuleRadius = 55.0f;` in an `ACharacter` child | A C++ parent's component is a default subobject. AssetGen overrides it under the subobject's real name and class, which can differ from the member's: `ACharacter`'s `CapsuleComponent` is `CollisionCylinder`. The SDK records the name as `<Member>__UeSubobject`, for a subclass too: `Mesh` in an `APlayerCharacter` child is still `CharacterMesh0`. | Yes |
 | `CapsuleComponent->CapsuleRadius = 70.0f;` in a child of a mod class that sets the capsule too | Builds on the parent's override: the child keeps what the parent set, such as its half height, and changes only the radius. The parent is loaded first. A mod parent that leaves the capsule alone still carries one for its child to build on. | Yes |
 | `StaticMesh->RelativeScale3D = FVector(2.0f, 2.0f, 2.0f);` in a child of a game Blueprint | A game Blueprint's component is a construction-script node, as a mod parent's is. The override is keyed on that node's GUID, which the SDK records as `<Component>__UeScsNode`. The node's real name is used, even when it contains spaces. | Yes |
 | `Controller->bAttachToPawn = true;` in an `APawn` child | Refused: "UeApi does not say which default subobject Controller is". Either the member is not a default subobject, and you set the value at run time, or the SDK predates the markers, and you regenerate it with genueapi. | Refused |
@@ -5243,6 +5251,7 @@ listed here is refused with "unimplemented intrinsic".
 | `__ReadText__(Addr)` | Copies the FText at an address or pointer. Needs the FDerefTextView helper struct. | [Intrinsics](#intrinsics) |
 | `__RefAt__(Addr)` | Passes the memory at Addr by reference, for an engine function's wildcard parameter. | [Intrinsics](#intrinsics) |
 | Respelled SDK member, `Name_0`, `Index_0` | Write the SDK spelling. Everything AssetGen cooks uses the real name. | [Classes and variables](#classes-and-variables) |
+| `Comp->SetupAttachment(Parent)` | In UE_DEFAULTS, places a component under another, its own class's or an inherited one, as a constructor does. In a function, attaches at once, keeping the relative transform. | [Components](#components) |
 | `sizeof`, `alignof` | The game's layout, not clang's view of the SDK's stand-in types. | [Pointers and memory](#pointers-and-memory) |
 | `SpawnActor<T>(Class, Transform)` | Spawn Actor from Class. The new actor's construction script and BeginPlay run inside the call. | [Creating objects](#creating-objects) |
 | `SpawnActorDeferred<T>(Class, Transform)` | Spawn Actor with Expose on Spawn pins: set its variables, then call FinishSpawning. | [Creating objects](#creating-objects) |
@@ -5756,9 +5765,10 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   that the same class declares, as in `int32 Health; UE_DEFAULTS { Health = 100; }`. Fix: give the variable its value
   where it is declared, `int32 Health = 100;`. UE_DEFAULTS is for inherited variables and for components. See
   [Class defaults](#class-defaults).
-- `` <Class>::UE_DEFAULTS: every statement is `Field = value;` or `Component->Field = value;` ``: a statement in
-  UE_DEFAULTS is not a plain `=` onto a member: a call such as `K2_DestroyActor();`, `Health += 5;`, a local or an
-  `if`. The block never runs; AssetGen only reads its assignments. A value computed at run time is refused with the
+- `` <Class>::UE_DEFAULTS: every statement is `Field = value;`, `Component->Field = value;` or `Component->SetupAttachment(Parent);` ``:
+  a statement in UE_DEFAULTS is not a plain `=` onto a member, nor a SetupAttachment: a call such as
+  `K2_DestroyActor();`, `Health += 5;`, a local or an `if`. The block never runs; AssetGen only reads its assignments
+  and attachments. A value computed at run time is refused with the
   member-default message that starts `<Member>: a default is a value known when the mod is built`. Fix: keep only
   assignments of build-time values in UE_DEFAULTS, and move the rest to ReceiveBeginPlay or UserConstructionScript.
   See [Class defaults](#class-defaults).
@@ -5777,12 +5787,15 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
 - `<Class>::UE_DEFAULTS: UeApi does not say which default subobject <Component> is on <EngineClass> - regenerate it
   with genueapi, which reads that off the object dump`: a default set through a native parent's component, such as
   `CapsuleComponent->CapsuleRadius = 55.0f;` on an ACharacter child, when the UeApi headers record no default subobject
-  of that name. The headers come from an older genueapi, or the member is a plain pointer and not a default subobject.
+  of that name. The headers come from an older genueapi, or the member is a plain pointer and not a default subobject,
+  or two of the class's subobjects fit it and neither its name nor the class that declares it tells which.
   The same message appears for a path one level too deep, `Lamp->RelativeLocation.Z = 50.0f;`, which it misreads as a
   component called RelativeLocation; regenerating does not help there. Fix: regenerate UeApi with genueapi from a dump
   that has `GObjects-Dump-WithProperties.txt`; assign whole values,
   `Lamp->RelativeLocation = FVector(0.0f, 0.0f, 50.0f);`; set a member that is not a default subobject at run time.
-  See [Class defaults](#class-defaults).
+  See [Class defaults](#class-defaults). The same message, ending "a member that is no default subobject is attached
+  to at run time, with AttachToComponent", is `SetupAttachment` onto such a member, such as `AActor`'s
+  `RootComponent`, which no subobject of that name backs.
 - `<Class>::UE_DEFAULTS: <Component> is a component of the Blueprint <BlueprintClass>, and its header does not say
   which SCS node it is - re-dump the game with the Dumper-7 fork (ScsNode=) and regenerate UeApi`: a default on a
   component of a game Blueprint parent whose header has no `<Component>__UeScsNode` marker. The same message appears
@@ -5790,6 +5803,29 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   not apply there. Fix: for a game Blueprint, regenerate UeApi from a dump made with the Dumper-7 fork; for another
   mod's class, set the component's value at run time, for example in ReceiveBeginPlay. See
   [Class defaults](#class-defaults).
+- `<Class>::UE_DEFAULTS: <Parent> is a variable of the Blueprint <BlueprintClass>, and its header does not say it is a
+  node of its construction script - re-dump the game with the Dumper-7 fork (ScsNode=) and regenerate UeApi`:
+  `SetupAttachment(Parent)` onto a game Blueprint parent's member whose header has no `<Parent>__UeScsNode` marker,
+  so nothing says the member is a component that Blueprint's construction script makes. Fix: as for the message above;
+  or attach at run time, by calling `SetupAttachment` or `AttachToComponent` in ReceiveBeginPlay. The same message
+  without the Blueprint, `<Parent> is not a UE_COMPONENT`, is a mod class's plain pointer member. See
+  [The root and attachment](#the-root-and-attachment).
+- `<Class>::UE_DEFAULTS: SetupAttachment places a component this class declares with UE_COMPONENT; an inherited one
+  stays where its class put it`: `Lamp->SetupAttachment(...)` where Lamp is a parent's component. The node that makes
+  Lamp is the parent's, which a subclass does not move, in the editor either. Fix: attach it at run time, or move the
+  `SetupAttachment` into the parent's UE_DEFAULTS. See [The root and attachment](#the-root-and-attachment).
+- `<Class>::UE_DEFAULTS: SetupAttachment attaches <A> -> <B> -> <A>, a cycle no component of which is ever made`, and
+  `<Component> is attached to itself`: the construction script starts from the components attached to nothing of the
+  class's own, and none in a cycle is. Fix: break the cycle. See [The root and attachment](#the-root-and-attachment).
+- `<Class>::UE_DEFAULTS: <Component> is attached twice`: two `SetupAttachment` calls for one component. A node has one
+  parent. Fix: keep one. See [The root and attachment](#the-root-and-attachment).
+- `<Class>::UE_DEFAULTS: <Component>->SetupAttachment takes a component of this class or of a class above it, by its
+  member name`: the parent is written as something other than a member, such as `GetRootComponent()`, a local or
+  `nullptr`. The node names its parent, so only a component the class has can be one. Fix: name the component's
+  member (`Lamp`, `Mesh`); attach to anything else at run time. See [The root and attachment](#the-root-and-attachment).
+- `<Class>::UE_DEFAULTS: <Component>->SetupAttachment's socket is a literal name (FName("hand_r")) or none`: the
+  socket is a variable or a call, which a node cannot hold. Fix: write the name, or attach at run time. See
+  [The root and attachment](#the-root-and-attachment).
 - `<Class>::<Member>: only an actor has a construction script`: UE_COMPONENT in a class that does not derive from
   AActor. Fix: declare components only on an actor class. See [Components](#components).
 - `<Class>::<Member>: a UE_COMPONENT names an engine component class`: UE_COMPONENT of a component class the mod

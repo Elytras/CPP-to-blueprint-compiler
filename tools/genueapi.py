@@ -458,6 +458,27 @@ UOBJECT_FORWARDS = (
     ("FString", "GetName", "UKismetSystemLibrary::GetObjectName"),
 )
 
+# A component's place under another, which a constructor gives it with USceneComponent::SetupAttachment: no UFunction
+# either. In UE_DEFAULTS AssetGen reads it and calls nothing, the attachment being the SCS node's parent there. Anywhere
+# else the call forwards to the inline below, which attaches at once as USceneComponent::OnRegister would have
+# (SceneComponent.cpp 667-683: AttachToComponent with KeepRelativeTransform, which does not weld): a component a
+# function reaches is registered, and the engine's own call then does nothing (it ensures !bRegistered, 1748-1765).
+# class -> [(return, method, its parameters, the free inline function it forwards to)], each inline defined after the
+# package's classes.
+CLASS_FORWARDS = {
+    "USceneComponent": [("void", "SetupAttachment", "class USceneComponent* InParent, FName InSocketName = FName()",
+                         "USceneComponent_SetupAttachment")],
+}
+FORWARD_DEFS = {
+    "USceneComponent_SetupAttachment": [
+        "inline void USceneComponent_SetupAttachment(class USceneComponent* Child, class USceneComponent* InParent,",
+        "                                            FName InSocketName = FName())",
+        "{",
+        "    Child->K2_AttachToComponent(InParent, InSocketName, EAttachmentRule::KeepRelative, EAttachmentRule::KeepRelative,",
+        "                                EAttachmentRule::KeepRelative, false);",
+        "}"],
+}
+
 
 # ---- subsystem getters ---------------------------------------------------------------------------------------
 # The editor's Get <X> node (K2Node_GetSubsystem, K2Node_GetEngineSubsystem ...) is a call to the
@@ -707,7 +728,12 @@ def map_subobjects(classes, by_name):
     name and class (FLinkerLoad::CreateExport), which the member names neither of: ACharacter's CapsuleComponent is
     Default__Character.CollisionCylinder, and APlayerCharacter's CharMoveComp is a PlayerMovementComponent. The dump
     has no values, so a member is joined to the one subobject whose class is a kind of its type; one that two fit
-    (AActor's RootComponent) is left out unless one of them has its name."""
+    (AActor's RootComponent) is left out unless one of them has its name, or is the one the class declaring the member
+    joins it to on its own CDO. A subclass cannot rename a default subobject its parent's constructor made, only swap
+    its class or drop it (FObjectInitializer::SetDefaultSubobjectClass / DoNotCreateDefaultSubobject, by that name),
+    so APlayerCharacter's Mesh, which its FPMesh fits too, is still ACharacter's CharacterMesh0, as the game's own
+    BP_PlayerCharacter nodes attached to it say. That would only mislead for a member a subclass points elsewhere,
+    which ACharacter's, private, cannot be."""
     native = dict((k.ue_name, k) for k in classes if not k.is_bp)
 
     def isa(k, cpp):
@@ -715,7 +741,14 @@ def map_subobjects(classes, by_name):
             k = by_name.get(k.base)
         return k is not None
 
-    for k in classes:
+    def depth(k):
+        n = 0
+        while k is not None:
+            k, n = by_name.get(k.base), n + 1
+        return n
+
+    # Parents first, so the class that declares a member has its own mapping when a subclass needs it.
+    for k in sorted(classes, key=depth):
         k.subobjects = {}
         subs = [] if k.is_bp else [(n, native[c]) for n, c in SUBOBJECTS.get(k.path + "." + k.ue_name, ()) if c in native]
         o = k
@@ -726,7 +759,9 @@ def map_subobjects(classes, by_name):
                     continue
                 fits = [(n, c) for n, c in subs if isa(c, t.group(1))]
                 if len(fits) > 1:
-                    fits = [(n, c) for n, c in fits if n == (real_field(o, fname) or fname)]
+                    named = [(n, c) for n, c in fits if n == (real_field(o, fname) or fname)]
+                    held = getattr(o, "subobjects", {}).get(fname) if o is not k else None
+                    fits = named or [(n, c) for n, c in fits if held and n == held.split(" ")[0]]
                 if len(fits) == 1:
                     k.subobjects[fname] = "%s %s.%s" % (fits[0][0], fits[0][1].path, fits[0][1].ue_name)
             o = by_name.get(o.base)
@@ -1349,7 +1384,7 @@ def main():
     funcs, fields, aliased, renamed, not_ufunctions, const_refs, getters = 0, 0, 0, 0, [], 0, 0
     kinds = subsystem_kinds(by_name)
     for pkg, members in sorted(by_pkg.items()):
-        body, referenced, get_defs = [], set(), []
+        body, referenced, get_defs, forward_defs = [], set(), [], []
         defined = set(k.cpp for k in members)
         ns_open = None
         for en in sorted((e for e in ENUMS.values() if e.pkg == pkg), key=lambda e: e.cpp):
@@ -1472,6 +1507,10 @@ def main():
                 for ret, name, target in UOBJECT_FORWARDS:
                     body.append("    %s %s();" % (ret, name))
                     body.append('    static constexpr const char* %s__UeForward = "%s";' % (name, target))
+            for ret, name, params, target in CLASS_FORWARDS.get(k.cpp, ()):
+                body.append("    %s %s(%s);" % (ret, name, params))
+                body.append('    static constexpr const char* %s__UeForward = "%s";' % (name, target))
+                forward_defs += FORWARD_DEFS[target]
             decls, defs = subsystem_get(k, by_name, kinds, rewrite)
             body += decls
             get_defs += defs
@@ -1482,6 +1521,8 @@ def main():
         if get_defs:
             body += ["/* Each subsystem's Get: the USubsystemBlueprintLibrary getter for its kind, as the editor's Get node. */"]
             body += get_defs + [""]
+        if forward_defs:
+            body += ["/* What a method above forwards to (its __UeForward), the object first. */"] + forward_defs + [""]
 
         body += ops_by_pkg.get(pkg, [])
 

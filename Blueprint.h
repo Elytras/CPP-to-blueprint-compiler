@@ -93,6 +93,21 @@ public:
                       const std::vector<uint8>& NativeTail = {});
 
     /*
+    Where UE_DEFAULTS' SetupAttachment puts a component added above, by the fields of its SCS node: under another of
+    this class's components, as one of that node's ChildNodes (bOwn); or, as a root node, under an inherited one the
+    node names - an ancestor Blueprint's node by its variable and OwnerClass, that Blueprint's class, which
+    FixupRootNodeParentReferences looks it up in, or a native default subobject by its object name (bNative), which
+    ExecuteScriptOnActor matches among the actor's native scene components. Socket is AttachToName. A component given
+    none is placed as before: the first such scene component is the root and the others attach to it.
+    */
+    struct FAttachment
+    {
+        std::string Parent, OwnerClass, Socket;
+        bool bOwn = false, bNative = false;
+    };
+    void AttachComponent(const std::string& Name, const FAttachment& Attachment);
+
+    /*
     An inherited component's defaults: one UInheritableComponentHandler record, which is how the
     editor stores a child class's override of a parent's SCS component. The template is a fresh
     component export archetyped on the parent's, so `Defaults` are its deltas.
@@ -191,6 +206,7 @@ private:
         bool bIsScene = false;
         std::vector<FPropertyDef> Defaults;
         std::vector<uint8> NativeTail;
+        FAttachment Attachment;
     };
     std::vector<FComponent> Components;
 
