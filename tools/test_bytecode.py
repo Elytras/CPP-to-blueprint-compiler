@@ -1952,7 +1952,6 @@ def final_as_shared():
 final_as_shared()
 print('ok  FinalAsTest: a UE_FINAL_AS in a shared header makes the base owner\'s leaf, imported by every other mod')
 
-
 # ---- NestedTest
 
 def nested_containers():
@@ -5067,6 +5066,58 @@ refused('FuncIfaceStatic', '', 'the FsRoot::Tell it inherits is static: the edit
             'class FsRoot : public AActor {\npublic:\n  static int32 Tell(int32 V) { return V + 1; }\n};\n'
             'class FsKid : public FsRoot, public IFsTell {\npublic:\n  int32 Ask() { return FsRoot::Tell(4); }\n};\n')
 print('ok  FuncIfaceStatic: an interface function inherited as a static is refused, as the editor refuses its override')
+
+
+def func_static_above():
+    """A function named like a mod ancestor's static is an override of it to the editor (its super is
+    ParentClass->FindFunctionByName, KismetCompiler.cpp 1733-1774), which refuses one that is not static, or a static
+    over one that is not ("Check flags: Exec, Final, Static", 1855-1868): a method of the class's own, an interface
+    implementation it declares, a static over a method. A static over a static splits no caller - each call to either is
+    bound - so FuncStaticHide compiles, its Tell linked to FshRoot's as its super, and each call runs the one it names."""
+    refused('StaticAboveOwn', '', 'SaRoot::Tell is static, and the editor takes a function of that name in a subclass '
+            'for an override of it',
+            top='class SaRoot : public AActor {\npublic:\n  static int32 Tell(int32 V) { return V + 1; }\n};\n'
+                'class SaKid : public SaRoot {\npublic:\n  int32 Tell(int32 V) { return V * 2; }\n};\n')
+    refused('StaticAboveIface', '', 'the SaiRoot::Tell it inherits is static: the editor takes such a function for an '
+            'override of the static and refuses it',
+            top='class ISaiTell {\npublic:\n  UE_INTERFACE;\n  int32 Tell(int32 V);\n};\n'
+                'class SaiRoot : public AActor {\npublic:\n  static int32 Tell(int32 V) { return V + 1; }\n};\n'
+                'class SaiKid : public SaiRoot, public ISaiTell {\npublic:\n  int32 Tell(int32 V) { return V * 4; }\n};\n')
+    refused('StaticOverMethod', '', 'SomKid::Tell is static, and the SomRoot::Tell it hides is not',
+            top='class SomRoot : public AActor {\npublic:\n  int32 Tell(int32 V) { return V + 1; }\n};\n'
+                'class SomKid : public SomRoot {\npublic:\n  static int32 Tell(int32 V) { return V * 3; }\n};\n')
+    kid = pending_asset('FuncStaticHide')
+    root = os.path.join(os.path.dirname(kid), 'FshRoot')
+    for b in (kid, root): keeps_invariants(b)
+    pkg = invariants.Package(kid)
+    st = pkg.struct(pkg.find('Tell'))
+    assert st.super and pkg.path(st.super).endswith('/FshRoot.FshRoot_C:Tell'), 'FuncStaticHide::Tell has no super'
+    assert st.function_flags & 0x2000, 'FuncStaticHide::Tell FunctionFlags %#x is not static' % st.function_flags
+    assert run_as([kid, root], 'Use', {}, V=2) == 603
+
+
+pending('FuncStaticHide: a function named like a mod ancestor\'s static is refused unless it is a static, whose super '
+        'is that one', func_static_above)
+
+def func_own_iface_final():
+    """FuncOwnIfaceFinal: Tell and the stub Left implement IFoiTell, which the class itself lists, keeping the interface
+    function's contract (func_override_flags) - BlueprintEvent, not Final - in a final class and in a UE_FINAL_AS base,
+    and Ask's call to Tell reaches each class's own."""
+    leaf = pending_asset('FuncOwnIfaceFinal')
+    p = lambda c: os.path.join(os.path.dirname(leaf), c)
+    final, base = p('FoiFinal'), p('FoiBase')
+    for b in (final, base, leaf): keeps_invariants(b)
+    for b in (final, base):
+        pkg = invariants.Package(b)
+        for fn in ('Tell', 'Left'):
+            got = pkg.struct(pkg.find(fn)).function_flags
+            assert got & 0x08000000 and not got & 0x1, '%s::%s FunctionFlags %#x' % (os.path.basename(b), fn, got)
+    assert run_as([final], 'Ask', {}, V=2) == 30
+    assert run_as([leaf, base], 'Ask', {}, V=2) == 40
+
+
+pending('FuncOwnIfaceFinal: an implementation of an interface a final class lists has the interface function\'s flags',
+        func_own_iface_final)
 
 
 def func_template_call():
