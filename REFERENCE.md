@@ -1454,7 +1454,9 @@ Notes:
 | `Add5(C ? A : B)` into a `T&` parameter | The callee gets a copy, stored back into the picked variable after the call, with a warning. See [Functions](#functions). | Warns |
 | `A = 1, B = 2;`, `++I, --J` | The comma operator as a statement: each side runs in turn, as two statements. A side that does nothing (`I, J++`) is dropped. A declaration of several variables, `int32 I = 0, J = N;`, is not the comma operator and works too. | Yes |
 | `if (bool bOk; Get(Out, bOk), !bOk)`, `switch (N += 10, N)` | An if or switch condition with a comma: the left side runs once, before the test, as an init-statement does, and the right side is the condition. This is how an out-parameter call is tested in one line. | Yes |
-| `return (N += 1, N * 2);`, `while (Next(X), X > 0)` | Not yet: a comma inside any other expression, or in a loop condition (which would rerun its left side on every trip), is refused naming the comma operator. Write the left side as a statement of its own, before the loop and at the end of its body for a loop. | Not yet |
+| `int32 N{(Bump(), M)};`, `F((Bump(), M))`, `return (N += 1, N * 2);`, `switch (Bump(), T)` over a `TEnum<E>`, `S = {(Bump(), M), 2}` | A comma inside a statement's expression: the left side runs first, as a statement of its own, and the comma is worth its right side, read where C++ reads it. This holds wherever nothing in the statement runs before the comma: an initialiser, a return value, an assignment's right side, an argument, a braced list's first member. Beside another argument that is no constant (C++ leaves their order open) the whole argument holding the comma runs first, into a temporary. | Yes |
+| `while (Next(X), X > 0)`, `A && (Bump(), B)`, `Obj->F((Bump(), M))`, `{G(), (Bump(), M)}` | Refused naming the comma operator: a loop condition would rerun its left side on every trip, and behind something the statement runs first (the right side of `&&` / `\|\|` / `?:`, the arguments of a call on another object, a later member of a braced list) the left side would run too early. Write the left side as a statement of its own, before the loop and at the end of its body for a loop. A comma bound to a reference parameter beside an argument that may run first must end in a variable. | Refused |
+| `int32 D = (1, 4);` as a class default | The right side, when the left side does nothing. A left side that does something would run when the game builds the object, which a default cannot: refused as any computed default. | Yes |
 
 Notes:
 
@@ -5745,9 +5747,15 @@ and where the feature is described. In each group, the messages you are most lik
   `static int32 Count = 0;`. The message follows the prefix `<Class>::<Function>: inline <Function>: `
   (`inline <Class>::<Method>: ` for a method). A `static constexpr` constant works here. Fix: make it a member of the
   class. See [Latent calls](#latent-calls).
-- `TODO: the comma operator inside an expression or a loop condition; ...`: a comma as a value, `return (N += 1,
-  N * 2);` or an argument, or in a `while` / `for` / `do` condition. Fix: put the left side in a statement of its own
+- `the comma operator in a loop condition, or after something its statement runs first (...): write its left side as a
+  statement of its own. ...`: a comma in a `while` / `for` / `do` condition, which would rerun its left side on every
+  trip, or behind something the statement runs first: the right side of `&&` / `||` / `?:`, an argument of a call on
+  another object (`Obj->F((A, B))`), a later member of a braced list. Fix: put the left side in a statement of its own
   (for a loop, before it and at the end of its body). See [Operators](#operators).
+- `the comma operator here is written to or bound to a reference, beside something that may run before it, and its
+  right side is no variable: ...`: `F(G(), (A, L[0]))` where F takes a non-const reference: the argument cannot run
+  first into a temporary, which F would then write. Fix: put the left side in a statement of its own. See
+  [Operators](#operators).
 - `inline call to <Class>::<Method> with <N> arguments`: a C-style variadic inline function,
   `inline int32 First(int32 N, ...)`, called with extra arguments. Fix: give it a fixed parameter list, or overloads.
   See [Inline functions and templates](#inline-functions-and-templates).

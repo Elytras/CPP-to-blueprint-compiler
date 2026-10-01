@@ -980,9 +980,14 @@ for n in (-3, 0, 4):
     run(asset('FlowTest'), 'ForwardVoid', self_vars=me, N=n)
     assert me['Total'] == 1 + (-n * 100 if n < 0 else n), (n, me)
 print('ok  FlowTest.ForwardVoid: `return F();` of a void F calls it, then returns')
-refused('CommaExpr', '  int32 F(int32 N) { return (N += 1, N * 2); }\n', 'the comma operator inside an expression')
-refused('CommaWhile', '  int32 F(int32 N) { while (N += 1, N < 9) {} return N; }\n', 'the comma operator inside an expression')
-print('ok  the comma operator inside an expression or a loop condition is refused by name')
+refused('CommaWhile', '  int32 F(int32 N) { while (N += 1, N < 9) {} return N; }\n', 'the comma operator in a loop condition')
+refused('CommaAnd', '  int32 Count;\n  bool F(int32 M) { return M > 0 && (Count += 1, M > 2); }\n',
+        'the comma operator in a loop condition, or after something its statement runs first')
+refused('CommaRef', '  void Add(int32 X, int32& Y) { Y += X; }\n  int32 Twice(int32 X) { return X * 2; }\n'
+        '  int32 F(int32 M) { TArray<int32> L = {1}; Add(Twice(M), (M += 1, L[0])); return L[0]; }\n',
+        'the comma operator here is written to or bound to a reference')
+print('ok  the comma operator in a loop condition, behind something its statement runs first, or bound to a reference '
+      'beside an argument that may run first is refused by name')
 
 
 def comma_hoist():
@@ -991,7 +996,7 @@ def comma_hoist():
     initialiser (a TEnum<E>'s too), an argument beside a constant or beside a call, a struct literal's first member, a
     return value, an assignment's right side, a switch over a TEnum<E>, a reference argument, a comma in a comma. The
     class default `(1, 4)` is 4."""
-    base = pending_asset('CommaHoist')
+    base = asset('CommaHoist')
     keeps_invariants(base)
     for fn, want, bumps in (('Brace', lambda m, c: m + c * 100, 1), ('Enum', lambda m, c: m + c * 100, 1),
                             ('Arg', lambda m, c: 2 * (m + c), 1), ('Beside', lambda m, c: 70 + m + c, 1),
@@ -1008,8 +1013,8 @@ def comma_hoist():
     assert 'D [0] IntProperty size=4: 4' in cdo, cdo
 
 
-pending('Comma: a comma inside an expression runs its left side first, as a statement, where nothing runs before it',
-        comma_hoist)
+comma_hoist()
+print('ok  CommaHoist: a comma inside an expression runs its left side first, as a statement, where nothing runs before it')
 
 
 def expr_temps():
