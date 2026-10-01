@@ -7843,6 +7843,23 @@ def spawn_abstract():
           'function; constructing an abstract object class is refused')
 
 
+def spawn_abstract_component():
+    """AddComponentByType of an abstract component class ends in NewObject too (AActor::AddComponentByClass,
+    ActorConstruction.cpp 1140-1163), whose allocation asserts in a Development game (UObjectGlobals.cpp 2362), so it is
+    refused as SpawnObject's is: a class with a `= 0` method, and a UE_FINAL_AS base, cooked Abstract, whose message
+    names the leaf to make instead."""
+    refused('SpawnAbstractComp', '  void MakeComp() { AddComponentByType<UAbstractComp>(this); }\n',
+            'MakeComp: UAbstractComp is an abstract class',
+            OBJECTS + 'class UAbstractComp : public UActorComponent {\npublic:\n  virtual int32 N() = 0;\n};\n')
+    refused('SpawnAbstractLeaf', '  void MakeBase() { AddComponentByType<UFaCompBase>(this); }\n',
+            'MakeBase: UFaCompBase is an abstract class (UE_FINAL_AS UFaComp\'s base)',
+            OBJECTS + 'class UFaCompBase : public UActorComponent {\npublic:\n  int32 Seen;\n};\n'
+                      'UE_FINAL_AS(UFaCompBase, UFaComp);\n')
+
+
+pending('SpawnAbstract: AddComponentByType of an abstract component class is refused', spawn_abstract_component)
+
+
 def wait_hold():
     """A local that holds an object across a wait is a weak reference in the persistent frame unless the object has
     RF_StrongRefOnFrame (UObjectGlobals.cpp 3460-3483): WaitHold.F's widget, made before the Delay and read after it,
