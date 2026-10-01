@@ -1010,6 +1010,29 @@ def comma_hoist():
 
 pending('Comma: a comma inside an expression runs its left side first, as a statement, where nothing runs before it',
         comma_hoist)
+
+
+def expr_temps():
+    """ExprTemps: `TArray<int32>{1, 2, M}` as an argument is that array; a UE_STRUCT's `FEtSlot()` has its members'
+    defaults (A 1, B 2), passed or stored; `A = B = E` sets both, for a number, a string and a struct; `B = A += E`
+    adds first, B getting A's new value."""
+    base = pending_asset('ExprTemps')
+    keeps_invariants(base)
+    for m in (-4, 0, 9):
+        assert run(base, 'ListArg', M=m)[0] == 300 + m, ('ListArg', m)
+        assert run(base, 'StructLocal', M=m)[0] == (1 + m) * 10 + 2, ('StructLocal', m)
+        me = {'A': 0, 'B': 0}
+        assert run(base, 'ChainInt', me, E=m)[0] == m * 11 and me == {'A': m, 'B': m}, ('ChainInt', m, me)
+        me = {'A': 0, 'B': 0}
+        assert run(base, 'ChainCompound', me, E=m)[0] == (5 + m) * 101 and me == {'A': 5 + m, 'B': 5 + m}, ('ChainCompound', m, me)
+        assert run(base, 'ChainStruct', {}, M=m)[0] == (m * 10 + m + 1) * 101, ('ChainStruct', m)
+    assert run(base, 'StructArg')[0] == 12
+    for e in ('', 'ab'):
+        me = {'SA': 'x', 'SB': 'y'}
+        assert run(base, 'ChainString', me, E=e)[0] == e + e and me == {'SA': e, 'SB': e}, ('ChainString', e, me)
+
+
+pending('Expressions: TArray<T>{...} and a UE_STRUCT\'s T() as values, and a chained assignment', expr_temps)
 check('FlowTest', 'Classify', classify, [dict(Code=c) for c in range(-2, 8)])
 check('FlowTest', 'NoDefault', no_default, [dict(Code=c) for c in (-1, 0, 1, 9, 10)])
 check('FlowTest', 'NameSet', lambda N: 2 if N.lower() == 'none' else 1, [dict(N=n) for n in ('None', 'none', 'IntProperty', 'x', 'None_1')])
