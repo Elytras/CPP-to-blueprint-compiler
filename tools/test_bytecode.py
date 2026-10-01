@@ -6591,6 +6591,27 @@ print('ok  a set element / map key that cannot hash is refused: bool, FText, a n
       'a variable, a local and a parameter')
 
 
+def prop_enum_forms():
+    """A variable of a native enum whose form only a native delegate's parameter or a container's element shows is
+    the property the editor makes of it (KismetCompilerMisc.cpp 1071-1094): an EnumProperty over a ByteProperty for an
+    `enum class`, a ByteProperty naming the enum for a TEnumAsByte one. The forms are the object dump's delegate
+    signatures' and the game's own packages' (PropEnumForms.cpp says where each comes from)."""
+    import invariants
+    base = pending_asset('PropEnumForms')
+    pkg = invariants.Package(base)
+    props = {p.name: p for p in pkg.struct(pkg.find('PropEnumForms_C')).props}
+    want = {'Severity': 'EnumProperty', 'QuartzEvent': 'EnumProperty', 'PurchaseStatus': 'EnumProperty',
+            'Treasure': 'EnumProperty', 'AppState': 'ByteProperty', 'PathEvent': 'ByteProperty',
+            'QueryStatus': 'ByteProperty', 'PurchaseState': 'ByteProperty', 'Cleaned': 'ByteProperty'}
+    got = {n: (props[n].type, [s.type for s in props[n].subs]) for n in want}
+    assert got == {n: (t, ['ByteProperty'] if t == 'EnumProperty' else []) for n, t in want.items()}, got
+    keeps_invariants(base)
+
+
+pending('PropEnumForms: an enum only a delegate\'s parameter or a container\'s element shows the form of keeps it',
+        prop_enum_forms)
+
+
 # ---- TYPES: UE_STRUCT default instances, UE_ENUM payloads and names (invariant_rules/user_types.py)
 
 import struct
