@@ -1080,6 +1080,12 @@ def main():
             return "class %s" % target.emit if target else m.group(0)
         return CLASS_WORD.sub(one, ctype)
 
+    def named(ctype):
+        """An enum field, return value or by-value parameter as TEnum<E> (Types.h): still E to AssetGen, plus
+        .Name() / .String(), and an E argument converts. An E& out-parm stays E: an E variable cannot bind to a
+        TEnum<E>& (the conversion makes a temporary)."""
+        return "TEnum<%s>" % ctype if ctype in ENUMS else ctype
+
     def short_names(k):
         """A Blueprint class is named by its whole /Game path, which makes a signature unreadable. A class opens
         with `using Leaf = Game::...::Leaf;` for each one its members name, where the leaf is free: one target
@@ -1149,7 +1155,7 @@ def main():
             for ftype, fname in k.fields:
                 if fname in names:
                     continue
-                body.append("    %s %s;" % (rewrite(ftype, short, k), fname))
+                body.append("    %s %s;" % (rewrite(named(ftype), short, k), fname))
                 real = real_field(k, fname)
                 if real:
                     body.append('    static constexpr const char* %s__UeName = "%s";' % (fname, c_literal(real)))
@@ -1202,10 +1208,10 @@ def main():
                 variants = [(r, [(const_ref(t) if n in refs else t, n) for t, n in v]) for r, v in variants]
                 const_refs += sum(1 for t, n in params if n in refs and const_ref(t) != t)
                 for vret, plist in variants:
-                    args = ", ".join("%s %s" % (rewrite(t, short, k), n) for t, n in plist)
+                    args = ", ".join("%s %s" % (rewrite(named(t), short, k), n) for t, n in plist)
                     body.append("    %s%s%s%s %s(%s)%s;" % (MARKS.get((k.ue_name, real_fn), ""),
                                                              "UE_PURE " if pure else "", "static " if is_static else "",
-                                                           rewrite(vret, short, k), fname, args,
+                                                           rewrite(named(vret), short, k), fname, args,
                                                            " const" if fname in k.const_funcs else ""))
                 if real_fn != fname:
                     body.append('    static constexpr const char* %s__UeName = "%s";' % (fname, c_literal(real_fn)))

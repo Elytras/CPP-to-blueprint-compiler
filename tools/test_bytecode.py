@@ -1500,6 +1500,17 @@ def types_behaviour():
             got = run(asset('TypesTest'), 'SpanScore', self_vars={'Span': span}, S=s)[0]
             assert got == {-3: 1, 70000: 2, 70001: 3, 70002: 4}.get(s, 10 if s == span else 0), ('SpanScore', span, s, got)
     print('ok  TypesTest.MoodScore / SpanScore: the switch, then the member compare')
+    # TEnum<EMood> is an EMood; Name() / String() hand the engine EMood's UEnum and the value.
+    calls, names = [], {0: 'Calm', 5: 'Angry', 6: 'Sleepy'}
+    vm = VM(asset('TypesTest'), {'GetEnumeratorName': lambda vm, ctx, e, v: calls.append(('Name', e, v)) or names[v],
+                                 'GetEnumeratorUserFriendlyName': lambda vm, ctx, e, v: calls.append(('String', e, v)) or names[v] + '!'},
+            Mood=5, Tagged=6)
+    assert (vm.call('TaggedName', 5), vm.call('TaggedString', 0), vm.call('MemberString')) == ('Angry', 'Calm!', 'Sleepy!')
+    assert calls == [('Name', 'EMood', 5), ('String', 'EMood', 0), ('String', 'EMood', 6)], calls
+    assert [vm.call('TaggedScore', m) for m in (0, 5, 6, 7)] == [0, 10, 3, 0] and vm.self.vars['Tagged'] == 7, vm.self.vars
+    print('ok  TypesTest: TEnum<E> switches, compares and assigns as E; Name() / String() are the engine\'s lookups on E')
+    assert [vm.call('SleepyCount', l) for l in ([], [6], [0, 6, 5, 6])] == [0, 1, 2]
+    print('ok  TypesTest: a global `using` of a template type is that type')
     check('TypesTest', 'GetIsTargetable', lambda: True, [dict()])
     for r in (0, 4):
         f = {}

@@ -1907,6 +1907,7 @@ bool FCompiler::Collect(std::string* Err)
     std::set<std::string> Ambiguous;
     std::map<std::string, std::string> EnumUnderlying;
     std::vector<std::pair<std::string, std::string>> EnumMarks;      // enum, owning mod ("" for this one)
+    std::map<std::string, std::string> TemplateAliases;              // a global `using A = T<...>;`: A -> T<...>
 
     /* UeApi headers put Blueprint classes in namespaces mirroring their /Game path. */
     std::function<void(const Json&, const std::string&)> Walk =
@@ -1919,7 +1920,10 @@ bool FCompiler::Collect(std::string* Err)
             return;
         }
         if ((Kind(N) == "TypeAliasDecl" || Kind(N) == "TypedefDecl") && N.contains("name"))
+        {
             Aliases[Ns + Name(N)] = Aliases[Name(N)] = StripTypeKeywords(TypeOf(N));
+            if (Ns.empty() && TypeOf(N).find('<') != std::string::npos) TemplateAliases[Name(N)] = TypeOf(N);
+        }
         if (Kind(N) == "VarDecl" && Name(N) == "UeModPackage") FindLiteral(N, ModPackage);
         /* UE_ASSET_EDIT: a pointer naming the target, then the braced variable holding the edit, one number between them. */
         if (Kind(N) == "VarDecl" && Name(N).compare(0, 10, "UeEditOf__") == 0)
@@ -2149,6 +2153,9 @@ bool FCompiler::Collect(std::string* Err)
     };
     Walk(Doc, std::string());
     if (!bMetaOk) return false;
+    /* `using ValueFactory = TScriptInterface<...>;`: Find resolves an alias of a class, nothing resolves one of a
+       template, so its uses - out-of-line method bodies included - are written out once here. */
+    if (!TemplateAliases.empty()) ExpandAliases(const_cast<Json&>(Doc), TemplateAliases);
 
     if (ModPackage.empty())
     {
@@ -3775,6 +3782,28 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         }
         const Json* Obj = Callee ? Strip(First(*Callee)) : nullptr;
         if (!Obj) { *Err = "member call with no object"; return false; }
+        if (std::string Raw = TypeOf(*First(*Callee)); Raw.find("TEnum<") != std::string::npos)
+        {
+            /* TEnum<E>::Name() / String(): the engine's own enumerator lookups on E's UEnum, an ObjectConst. */
+            const std::string Method = Name(*Callee);
+            auto E = Enums.find(StripTypeKeywords(Raw));
+            if (E == Enums.end()) { *Err = "TEnum over an unknown enum: " + Raw; return false; }
+            if (E->second.Underlying != "uint8") { *Err = "TEnum::" + Method + ": a uint8 enum only, " + E->first + " is " + E->second.Underlying; return false; }
+            if (Method != "Name" && Method != "String") { *Err = "TEnum has no method " + Method; return false; }
+            FArgIR EnumObj, Value;
+            EnumObj.K = FArgIR::ObjConst;
+            EnumObj.Owner = BP.Enum(E->second.Package, E->second.UeName);
+            EnumObj.InnerType = "UEnum *";
+            if (!LowerArg(*Obj, BP, Value, Err)) return false;
+            Out.K = FArgIR::Call;
+            Out.InnerType = Method == "Name" ? "FName" : "FString";
+            Out.Sub = std::make_shared<FCallIR>();
+            Out.Sub->Fn = BP.EngineFunction("/Script/Engine", "KismetNodeHelperLibrary",
+                                            Method == "Name" ? "GetEnumeratorName" : "GetEnumeratorUserFriendlyName");
+            Out.Sub->bPure = true;
+            Out.Sub->Args = { EnumObj, Value };
+            return true;
+        }
         const std::string ObjType = StripTypeKeywords(TypeOf(*Obj));
         if (ObjType.compare(0, 10, "TMulticast") == 0) return LowerDispatcherCall(*N, *Callee, *Obj, BP, Out, Err);
         std::string Iface;
@@ -8222,6 +8251,8 @@ std::string StripTypeKeywords(std::string T)
     for (const char* Prefix : { "const ", "struct ", "class " })
         if (T.compare(0, strlen(Prefix), Prefix) == 0) T = T.substr(strlen(Prefix));
     while (!T.empty() && (T.back() == ' ' || T.back() == '\t')) T.pop_back();
+    /* TEnum<E> (UeMeta.h) is E to everything but its two methods, which LowerArg reads off the unstripped type. */
+    if (T.size() > 7 && T.compare(0, 6, "TEnum<") == 0 && T.back() == '>') return StripTypeKeywords(T.substr(6, T.size() - 7));
     return T;
 }
 

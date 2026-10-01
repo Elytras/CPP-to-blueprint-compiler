@@ -356,6 +356,7 @@ Notes:
 | `EMood Mood;` | An enum variable. A `uint8` enum is cooked as a Byte of that enum, an `int32` or `int64` enum as an enum property over that integer. See [Enums](#enums). | Yes |
 | `AActor *Target;`, `UClass *Cls;`, `TSubclassOf<AActor> Kind;` | Object and class references. See [Types](#types). | Yes |
 | `TSoftObjectPtr<T>`, `TSoftClassPtr<T>`, `TScriptInterface<I>` | Soft object and soft class references, and an interface reference. | Yes |
+| `TEnum<EMood>` | The enum itself, plus `.Name()` and `.String()`. See [TEnum](#tenum). | Yes |
 | `FVector Home;`, `FAmmo Ammo;` | An engine or game struct, or a mod `UE_STRUCT`. See [Structs](#structs). | Yes |
 | `TArray<FVector>`, `TSet<int32>`, `TMap<FName, int32>` | Array, Set and Map variables. A container inside a container goes through a generated wrapper struct; see [Containers](#containers). | Yes |
 | `UE_DISPATCHER(OnScored, int32 Score);` | An event dispatcher. See [Event dispatchers](#event-dispatchers). | Yes |
@@ -482,6 +483,7 @@ Notes:
 | `Index_0 = 7;`, for a member the SDK spells `Index_0` | Write the SDK's spelling. Dumper-7 respells names that C++ cannot use: a clash gets a suffix (`Name` becomes `Name_0`), an illegal character becomes `_` (`Audio Flying` becomes `Audio_Flying`), and a leading digit becomes a word (`3P` becomes `ThreeP`). The SDK keeps the real name beside the member, and everything the compiler cooks uses the real name. | Yes |
 | `class Größe : public AActor { FName Umlaut = "Größe"; };` | Non-ASCII class, member and asset names, and non-ASCII name and string defaults, are cooked and registered correctly. | Yes |
 | `using FTarget = AActor;`, then `FTarget *Aimed;` | An alias of a UObject class is still an object reference, not an address. It works at namespace scope and at class scope. | Yes |
+| `using FMoods = TArray<EMood>;`, `using Factory = TScriptInterface<IFoo>;` | A global alias of a template type is that type wherever it is used, in out-of-line method definitions too. | Yes |
 | `using Grapple = Game::WeaponsNTools::GrapplingGun::WPN_GrapplingGun_C;` | An alias to a game class's full `Game::` path. The SDK gives a game class a short name at global scope only when no other game package has a class of that name. For one that does, write such an alias. | Yes |
 
 ```cpp
@@ -988,6 +990,29 @@ TMap<FString, EMood> MoodsByName = UE_ENUM_MAP(EMood);
 
 FName NameOf(EMood M) { return MoodNames[M]; }
 EMood Parse(FString Text) { return MoodsByName[Text]; }  // Calm for an unknown name
+```
+
+For enum to name, `TEnum` below needs no table.
+
+### TEnum
+
+`TEnum<E>` (UeApi `Types.h`) is `E` to the compiler: the same property and the same bytes. It converts to and from `E`,
+and adds the two lookups the editor's Enum to Name and Enum to String nodes make. UeApi spells every game enum field,
+return value and by-value parameter as `TEnum<E>`, so `Actor->Mode.String()` works on game data. An `E&` out-parameter
+stays `E`, because an `E` variable cannot bind to a `TEnum<E>&`.
+
+| You write | What it does | Status |
+|---|---|---|
+| `TEnum<EMood> Mood = EMood::Calm;` | An EMood variable, member, parameter or local. It switches, compares and assigns like a plain EMood. | Yes |
+| `Mood.Name()` | The enumerator's name as an FName, from `KismetNodeHelperLibrary::GetEnumeratorName` on EMood's UEnum. | Yes |
+| `Mood.String()` | Its display name as an FString, from `GetEnumeratorUserFriendlyName`: the label typed in the editor for a Blueprint enum. | Yes |
+| `.Name()` / `.String()` on an `int32` or `int64` enum | Refused ("a uint8 enum only"): the engine's two lookups take a uint8. | Refused |
+
+```cpp
+TEnum<EMood> Mood = EMood::Angry;
+
+FString Describe() { return "Mood: " + Mood.String(); }   // "Mood: Angry"
+FName MoodName(TEnum<EMood> M) { return M.Name(); }        // an EMood argument converts
 ```
 
 ## Structs
@@ -5243,6 +5268,7 @@ listed here is refused with "unimplemented intrinsic".
 | `UE_STRUCT_IN(Package)` | UE_STRUCT for a struct in a shared header: only the source whose UE_MOD_PACKAGE is exactly Package cooks it. | [Structs](#structs) |
 | `UeAssets::<Class>::All` | Every game asset of that class, as soft pointers. | [Game assets](#game-assets) |
 | `UeAssets::<Class>::Game::...::<Name>` | A game asset by its content path, for `&` to point at. | [Game assets](#game-assets) |
+| `TEnum<E>` | An enum that is E to the compiler, with `.Name()` and `.String()`. | [TEnum](#tenum) |
 | `using FTarget = AActor;` | An alias of a class. A variable of it is still an object reference. | [Classes and variables](#classes-and-variables) |
 | `virtual` | Accepted and ignored: every mod method is called by name, so the most derived one runs. With `final`, see `final`; with `= 0`, see pure virtual. | [Functions](#functions) |
 | `WorldContextObject` argument left out | Filled with self, as the editor's hidden pin is; in a static function, with its own world context parameter. An inline helper's own WorldContext parameter left at its default gets the same. | [Calling engine and game functions](#calling-engine-and-game-functions) |
