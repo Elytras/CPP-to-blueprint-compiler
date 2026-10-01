@@ -5875,7 +5875,7 @@ def scs_no_scene_root():
     ExecuteScriptOnActor makes one only when RootNodes is empty, so the SCS must list a scene root (the editor keeps its
     DefaultSceneRoot node in RootNodes until another scene component takes its place). A root node listed for this is a
     node like any other to keeps_invariants: in AllNodes too, with its own VariableGuid (what a subclass's override of
-    it is keyed on); it needs no variable."""
+    it is keyed on), and its variable (CompRootVariable)."""
     b = asset('ScsNoSceneRoot')
     root, attach, made, stored = construct(b)
     assert 'Spinner' in made and stored['Spinner'], (sorted(made), stored)
@@ -6240,6 +6240,48 @@ comp_char_root()
 comp_default_root_inherited()
 
 
+def comp_no_components():
+    """An actor class that declares no UE_COMPONENT and inherits no root ends its construction with the DefaultSceneRoot
+    node's component as its root, as the editor builds it: the editor keeps that node in RootNodes and AllNodes while no
+    scene component takes its place, as 40 of the game's classes save it (ENE_EnemySpawner). That component is named
+    DefaultSceneRoot and net addressable (SCS_Node.cpp 99, 107). With neither list ExecuteScriptOnActor makes a plain
+    SceneComponent instead (SimpleConstructionScript.cpp 690-702), which nothing marks net addressable, so no reference
+    to it crosses the network (ActorComponent.cpp 1901-1913). NoCompKid's Lamp attaches to that root, 40 above it."""
+    base = asset('CompNoComponents')
+    for cls, attached in (('CompNoComponents', {}), ('NoCompKid', {'Lamp': 'DefaultSceneRoot'})):
+        b = os.path.join(os.path.dirname(base), cls)
+        root, attach, made, stored = construct(b)
+        assert root == 'DefaultSceneRoot', 'an actor of %s ends its construction with %s as its root' % (cls, root)
+        assert attach == dict(attached, DefaultSceneRoot=None), (cls, attach)
+        keeps_invariants(b)
+    p, ci = class_pkg(os.path.join(os.path.dirname(base), 'NoCompKid'))
+    assert world_location(p, ci, 'Lamp') == (0.0, 0.0, 40.0), world_location(p, ci, 'Lamp')
+    print('ok  CompNoComponents: an actor with no components gets the DefaultSceneRoot node as its root, as in the '
+          'editor')
+
+
+comp_no_components()
+
+
+def comp_root_variable():
+    """Where an SCS lists its DefaultSceneRoot node, the class has a variable of that name holding the component, as the
+    editor gives each node it lists one (KismetCompiler.cpp 884-898) and 40 of the game's classes have it
+    (ENE_EnemySpawner): ExecuteNodeOnActor stores the component there, where with none it logs on every spawn that the
+    class has no such property (SCS_Node.cpp 159-178). CompRootVariable has no component, RootVarMover a movement
+    component alone, and RootVarKid finds its parent's (FindFProperty walks the supers)."""
+    base = asset('CompRootVariable')
+    for cls in ('CompRootVariable', 'RootVarMover', 'RootVarKid'):
+        b = os.path.join(os.path.dirname(base), cls)
+        root, attach, made, stored = construct(b)
+        assert root == 'DefaultSceneRoot' and stored.get('DefaultSceneRoot'), \
+            '%s: no variable holds its root, the DefaultSceneRoot node\'s component (%s)' % (cls, stored)
+        keeps_invariants(b)
+    print('ok  CompRootVariable: a listed DefaultSceneRoot node has its variable on the class, which holds the root')
+
+
+comp_root_variable()
+
+
 def comp_attach_inherited():
     """SetupAttachment in UE_DEFAULTS places a component as a constructor does. Attached to an inherited one, it is a
     root node naming that parent: an ancestor Blueprint's node by its variable and class (Glow on AttachBase_C's Lamp),
@@ -6292,6 +6334,61 @@ def comp_attach_inherited():
 comp_attach_inherited()
 
 
+def comp_attach_root():
+    """`Glow->SetupAttachment(RootComponent)` in UE_DEFAULTS puts Glow under the actor's root, whichever component that
+    is, as a constructor's call does. Below a parent that gives the actor a root, ACharacter's capsule (RootChar) or a
+    Blueprint parent's root (RootKid), Glow's node is a root node naming no parent, which ExecuteScriptOnActor attaches
+    to that root (SimpleConstructionScript.cpp 686). With none to inherit, the root is the first of the class's own
+    scene components left alone, Base though Glow is declared first (RootOwn), and with none of those the
+    DefaultSceneRoot node, which keeps Glow as its child, as the editor saves a component added under it
+    (CompAttachRoot). Glow sits 30 above the root, and RootOwn's Base hands its own 50 on to it. At a socket
+    (RootSock), the node keeps it as AttachToName, which ExecuteNodeOnActor passes to SetupAttachment (SCS_Node.cpp
+    152)."""
+    base = asset('CompAttachRoot')
+    folder = os.path.dirname(base)
+    for cls, root in (('RootKid', 'Root'), ('RootOwn', 'Base'), ('CompAttachRoot', 'DefaultSceneRoot')):
+        got, attach, made, stored = construct(os.path.join(folder, cls))
+        assert (got, attach.get('Glow')) == (root, root), '%s: the root is %s and Glow attaches to %s' % (cls, got, attach.get('Glow'))
+    for cls, socket in (('RootChar', None), ('RootSock', 'Sock')):
+        p, ci = class_pkg(os.path.join(folder, cls))
+        si, nodes, roots, dsr = comp.scs(p, ci)
+        glow = node_named(p, ci, 'Glow')
+        assert glow.index in roots and glow.parent == 'None', (cls, glow.parent, [nodes[r].name for r in roots])
+        at = comp.tags_at(p, glow.index).get('AttachToName')
+        assert (at and comp.tag_name(p, at)) == socket, '%s: Glow attaches at socket %r, want %r' % (
+            cls, at and comp.tag_name(p, at), socket)
+    keeps_invariants(os.path.join(folder, 'RootSock'))
+    for cls, want in (('RootChar', 30.0), ('RootKid', 30.0), ('RootOwn', 80.0), ('CompAttachRoot', 30.0)):
+        p, ci = class_pkg(os.path.join(folder, cls))
+        assert world_location(p, ci, 'Glow') == (0.0, 0.0, want), (cls, world_location(p, ci, 'Glow'))
+        keeps_invariants(os.path.join(folder, cls))
+    print('ok  CompAttachRoot: SetupAttachment(RootComponent) puts a component under the actor\'s root, inherited, own or '
+          'the default one, at a socket of it')
+
+
+comp_attach_root()
+
+
+def comp_attach_body():
+    """SetupAttachment in a function attaches at once and keeps the relative transform: K2_AttachToComponent with
+    KeepRelative (0) for location, rotation and scale and no welding, which is what the engine's own call leads to when
+    the component registers (SceneComponent.cpp 667-683). On a component already registered, as an actor's are once it
+    is constructed, the engine's own call does nothing but fail an ensure (1750), so the compiler says, naming the
+    function, that it attached anyway."""
+    base = asset('CompAttachBody')
+    log = LOGS['CompAttachBody']
+    warned = [l for l in log.splitlines() if 'warning:' in l and 'SetupAttachment' in l]
+    assert warned and all('CompAttachBody::ReceiveBeginPlay' in l for l in warned), log
+    vm = VM(base, {}, Pivot=Obj('SceneComponent'), Lamp=Obj('PointLightComponent'))
+    vm.call('ReceiveBeginPlay')
+    assert vm.log == [('K2_AttachToComponent', vm.self.vars['Pivot'], [vm.self.vars['Lamp'], 'None', 0, 0, 0, False])], vm.log
+    print('ok  CompAttachBody: SetupAttachment in a function attaches at once, keeping the relative transform, and warns '
+          'that the engine\'s own would not')
+
+
+comp_attach_body()
+
+
 # ---- Refusals: each of these would build a package the engine mishandles
 
 CLASH_BASE = ('class ClashBase : public AActor {\npublic:\n  UE_COMPONENT(USceneComponent, Root);\n'
@@ -6301,6 +6398,8 @@ for mod, body, why, top in (
         # BPGC-18: the class's own DefaultSceneRoot node and template already have that name.
         ('ClashDefaultRoot', '  UE_COMPONENT(USceneComponent, DefaultSceneRoot);\n  UE_COMPONENT(UStaticMeshComponent, Body);\n',
          'DefaultSceneRoot', ''),
+        # ...and its variable, which ExecuteNodeOnActor stores the root in: a second one, or a subclass's found first.
+        ('ClashRootVariable', '  USceneComponent* DefaultSceneRoot;\n', 'the variable of the root', ''),
         # A parent Blueprint's component: two nodes, one name, and the second rebuilds the first in place.
         ('ClashInherited', '', 'Lamp', CLASH_BASE + 'class ClashKid : public ClashBase {\npublic:\n'
                                                     '  UE_COMPONENT(UPointLightComponent, Lamp);\n};\n'),
@@ -6336,9 +6435,10 @@ for mod, body, why, top in (
         ('AttachSocket', '  UE_COMPONENT(USceneComponent, A);\n  UE_COMPONENT(USceneComponent, B);\n  FName Where;\n'
                          '  UE_DEFAULTS { B->SetupAttachment(A, Where); }\n', 'literal name', '')):
     refused(mod, body, why, top)
-print('ok  refused: component names already taken under the actor (DefaultSceneRoot, a parent Blueprint\'s component,\n'
-      '    a native default subobject or member, a game Blueprint\'s SCS node), a spawn in UserConstructionScript,\n'
-      '    AddComponent by template name, SetupAttachment in a cycle, of an inherited component or at a computed socket')
+print('ok  refused: component names already taken under the actor (DefaultSceneRoot and its variable, a parent\n'
+      '    Blueprint\'s component, a native default subobject or member, a game Blueprint\'s SCS node), a spawn in\n'
+      '    UserConstructionScript, AddComponent by template name, SetupAttachment in a cycle, of an inherited component\n'
+      '    or at a computed socket')
 
 
 def refused_or_warned(mod, body, why, top=''):
@@ -6975,7 +7075,7 @@ def repl_refusals():
 def repl_never():
     base = asset('ReplNever')
     pkg = invariants.Package(base)
-    got = {p.name: (p.cond, p.flags & 0x20) for p in pkg.struct(pkg.find('ReplNever_C')).props}
+    got = {p.name: (p.cond, p.flags & 0x20) for p in pkg.struct(pkg.find('ReplNever_C')).props if p.flags & 0x20}
     assert got == {'Hidden': (15, 0x20), 'NoReplay': (13, 0x20), 'Shown': (0, 0x20)}, \
         'Hidden cooks condition %d, want COND_Never 15: %s' % (got.get('Hidden', (None,))[0], got)
     keeps_invariants(base)

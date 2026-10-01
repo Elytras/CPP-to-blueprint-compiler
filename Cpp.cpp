@@ -5652,6 +5652,16 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         {
             if (K == "CXXMemberCallExpr") Receiver = Strip(First(*Callee));
             if (!Receiver) { *Err = MethodName + "(): TODO: only a call on an object (`Obj->" + MethodName + "()`)"; return false; }
+            /* A constructor's SetupAttachment, called in a function: it attaches at once, as OnRegister does after a
+               constructor's call (SceneComponent.cpp 667-683). The engine's own does nothing on a component already
+               registered (an ensure, 1750), as an actor's are once it is constructed, so the sugar differs from what C++
+               would do there: said, not refused, since attaching is what the call asks for. */
+            if (MethodName == "SetupAttachment" && R->UeName == "SceneComponent")
+                printf("  warning: %s::%s: SetupAttachment attaches at once here, as AttachToComponent with KeepRelative "
+                       "location, rotation and scale and no welding, which is where the engine's own call leads when the "
+                       "component registers; on a component already registered, as an actor's are once it is constructed, "
+                       "the engine's own does nothing. Call AttachToComponent to pick the rules, or SetupAttachment in "
+                       "UE_DEFAULTS to place a component of the class's own\n", Cur->CppName.c_str(), CurFnName.c_str());
             /* No `::`: a free inline function (UObject_GetOuter), expanded here with the object as its first argument.
                Found by name, first in document order: walking FreeInlines would take whichever address sorts first. */
             if (Fw->second.find("::") == std::string::npos)
@@ -8634,6 +8644,15 @@ bool FCompiler::CheckMemberNames(const FRecord& R, std::string* Err) const
     for (const std::string& C : R.Components)
         if (Lower(C) == "defaultsceneroot")
         { *Err = R.CppName + "::" + C + ": DefaultSceneRoot is the root the construction script adds; rename the component"; return false; }
+    /* ...and the class's variable that holds it, where the SCS lists it (Generate): an actor's member of that name would
+       be a second variable of one name, or, in a subclass, the one FindFProperty finds first, which ExecuteNodeOnActor
+       then stores the root in (SCS_Node.cpp 159-170). */
+    bool bActor = false;
+    for (const FRecord* A = &R; A && !bActor; A = A->Base.empty() ? nullptr : Find(A->Base)) bActor = A->UeName == "Actor";
+    for (const Json* F : R.Fields)
+        if (bActor && Lower(Name(*F)) == "defaultsceneroot")
+        { *Err = R.CppName + "::" + Name(*F) + ": DefaultSceneRoot is the variable of the root an actor's construction script "
+                 "adds; rename it"; return false; }
     for (const FRecord* A = R.Base.empty() ? nullptr : Find(R.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
         for (const auto& [Member, Spec] : A->Subobjects)
             for (const std::string& C : R.Components)
@@ -12622,6 +12641,14 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             const FRecord* DR = Find(OwnerOf(*Parent));
             const bool bBlueprint = DR && (!DR->IsNative() || (DR->UeName.size() > 2 && DR->UeName.compare(DR->UeName.size() - 2, 2, "_C") == 0));
             if (!DR) { *Err = Where + ": cannot tell which class declares " + Of; return false; }
+            /* AActor's RootComponent: the actor's root, whichever component that is - the one a constructor's call finds
+               there. It is no default subobject a node could name; a node naming no parent goes under it (bRoot). */
+            if (DR->IsNative() && DR->UeName == "Actor" && UeNameOf(DR, Of) == "RootComponent")
+            {
+                A.bRoot = true;
+                Attachments[Comp] = A;
+                return true;
+            }
             if (DR == &R || bBlueprint)
             {
                 /* This class's: one of its own node's ChildNodes. An ancestor Blueprint's: a root node naming that node's
@@ -12820,12 +12847,14 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             if (R.Components.count(Name(*F)) && IsScene(CR)) Scene.emplace_back(Name(*F), CR);
         }
         /* SetupAttachment takes a component off the root: under another of this class's, which passes the root's
-           transform on to it, or under an inherited one. The root is the first scene component it leaves alone. */
+           transform on to it, or under an inherited one. The root is the first scene component it leaves alone; one
+           attached to RootComponent is never it, and hangs from it directly. With none left, the root is the
+           DefaultSceneRoot node's, which has no transform to pass on (RootName empty). */
         const auto RootAt = std::find_if(Scene.begin(), Scene.end(), [&](const auto& S) { return !Attachments.count(S.first); });
         const std::string RootName = RootAt == Scene.end() ? std::string() : RootAt->first;
         Scene.erase(std::remove_if(Scene.begin(), Scene.end(), [&](const auto& S) {
             const auto At = Attachments.find(S.first);
-            return At != Attachments.end() && !(At->second.bOwn && At->second.Parent == RootName);
+            return At != Attachments.end() && !At->second.bRoot && !(At->second.bOwn && At->second.Parent == RootName);
         }), Scene.end());
         std::stable_partition(Scene.begin(), Scene.end(), [&](const auto& S) { return S.first == RootName; });
         /* A component's vector default: X, Y, Z (Or each, when it has none), and the def to write another like it. */
@@ -12880,7 +12909,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             for (double& A : Out) A += 0.0;     // no -0 in the cooked float
             return Out;
         };
-        if (!Scene.empty() && !bRootInherited)
+        if (!RootName.empty() && !bRootInherited)
         {
             std::vector<FPropertyDef>& RootDefs = ComponentDefaults[Scene[0].first];
             const FVec Lr = Read(RootDefs, "RelativeLocation", 0), Rr = Read(RootDefs, "RelativeRotation", 0),
@@ -13049,6 +13078,20 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             bReplicatesAnything = true;
         }
         AddVariable(TypeOf(*F), PD);
+    }
+    /* Where the SCS lists its DefaultSceneRoot node, the class has a variable of that name, as the editor gives every node
+       it lists one (KismetCompiler.cpp 884-898; ENE_EnemySpawner's DefaultSceneRoot, BlueprintVisible | NonTransactional
+       | InstancedReference): ExecuteNodeOnActor stores the component there, and with none logs on every spawn that it
+       found no such property (SCS_Node.cpp 159-178). First, where the editor's sits among the class's variables. */
+    if (BP.ListsDefaultRoot())
+    {
+        FPropertyDef PD;
+        if (!TypeToProperty("USceneComponent *", "DefaultSceneRoot", 0, "the DefaultSceneRoot variable", BP, &PD, Err)) return false;
+        PD.PropertyFlags = (PD.PropertyFlags & ~uint64(CPF_Parm | CPF_BlueprintReadOnly)) | CPF_BlueprintVisible | CPF_NonTransactional;
+        FlagInstancing("USceneComponent *", PD);
+        if (PD.PropertyFlags & CPF_InstancedReference) BP.AddClassFlags(CLASS_HasInstancedReference);
+        PD.bApiHidden = true;       // the editor stub's PostLoad makes the node, and the editor's compile its variable
+        ClassVars.insert(ClassVars.begin(), { 8, PD });
     }
     std::stable_sort(ClassVars.begin(), ClassVars.end(), [](const auto& A, const auto& B) { return A.first > B.first; });
     for (const auto& V : ClassVars) BP.AddVariable(V.second);

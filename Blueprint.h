@@ -97,15 +97,24 @@ public:
     this class's components, as one of that node's ChildNodes (bOwn); or, as a root node, under an inherited one the
     node names - an ancestor Blueprint's node by its variable and OwnerClass, that Blueprint's class, which
     FixupRootNodeParentReferences looks it up in, or a native default subobject by its object name (bNative), which
-    ExecuteScriptOnActor matches among the actor's native scene components. Socket is AttachToName. A component given
-    none is placed as before: the first such scene component is the root and the others attach to it.
+    ExecuteScriptOnActor matches among the actor's native scene components. Or under the actor's root, whichever
+    component that is (bRoot, `SetupAttachment(RootComponent)`): an inherited root takes a root node naming no parent
+    (SimpleConstructionScript.cpp 686); without one, the component is a child of the class's own root, or of the
+    DefaultSceneRoot node when no component of its own is left to be the root. Socket is AttachToName. A component
+    given none is placed as before: the first such scene component is the root and the others attach to it.
     */
     struct FAttachment
     {
         std::string Parent, OwnerClass, Socket;
-        bool bOwn = false, bNative = false;
+        bool bOwn = false, bNative = false, bRoot = false;
     };
     void AttachComponent(const std::string& Name, const FAttachment& Attachment);
+
+    /* Whether the SCS lists its DefaultSceneRoot node, in RootNodes and AllNodes: the actor has no root before it runs
+       and no scene component of the class's own is left to be the root - none, or each attached somewhere. The editor
+       keeps the node there exactly then (ValidateSceneRootNodes, SimpleConstructionScript.cpp 1132-1150), and gives the
+       class a variable of its name, which Generate adds. Known once every component is added and attached. */
+    bool ListsDefaultRoot() const;
 
     /*
     An inherited component's defaults: one UInheritableComponentHandler record, which is how the
