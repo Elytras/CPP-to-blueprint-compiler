@@ -4658,6 +4658,29 @@ pending('FuncFinalInherited: a final class calls an inherited or overriding func
         func_final_inherited)
 
 
+def func_inline_parent():
+    """FuncInlineParent: `IpBase::AuthOnly()` in an inline method runs IpBase's AuthOnly in each class its body is
+    copied into - FuncInlineParent and IpKid, below IpMid's AuthOnly; IpDirect, with none between, also on an
+    IpDirectKid, which overrides AuthOnly - bound from that class's own AuthOnly, an override forwarding to its
+    parent's (call_opcode_flags), with no warning. A call by name to AuthOnly still runs the object's own."""
+    top = pending_asset('FuncInlineParent')
+    p = lambda *cs: [os.path.join(os.path.dirname(top), c) for c in cs]
+    mid = p('FuncInlineParent', 'IpMid', 'IpBase')
+    kid, direct = p('IpKid') + mid, p('IpDirect', 'IpBase')
+    dkid = p('IpDirectKid') + direct
+    for b in mid[:2] + kid[:1] + direct[:1] + dkid[:1]: keeps_invariants(b)
+    for chain, fn, want in ((mid, 'Use', 3), (kid, 'Use', 3), (kid, 'UseKid', 3), (direct, 'Use2', 3), (dkid, 'Use2', 3),
+                            (dkid, 'UseKid2', 3), (kid, 'AuthOnly', 7), (dkid, 'AuthOnly', 70)):
+        fields = {'Seen': 0}
+        run_as(chain, fn, fields)
+        assert fields['Seen'] == want, (os.path.basename(chain[0]), fn, fields)
+    assert 'is a call by name' not in LOGS['FuncInlineParent'], LOGS['FuncInlineParent']
+
+
+pending('FuncInlineParent: Base::Fn() in an inline method binds Base\'s from each class the body is copied into',
+        func_inline_parent)
+
+
 # ---- OPERANDS: operands the VM resolves against the object they run on - jumps, instance variables, calls by name,
 # field paths, object operands, arity, out and reference arguments (invariant_rules/operands.py)
 
