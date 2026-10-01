@@ -252,7 +252,17 @@ class VM:
         pc = 0
         for _ in range(100000):
             n = stmts[pc]; o = n.op; pc += 1
-            if o in (0xF, 0x14, 0x5F):
+            named = o == 0xF and n.kids[1].op == 0x2F and s.struct_const \
+                and s.struct_const(n.kids[1].val, list(range(len(n.kids[1].kids))))
+            if isinstance(named, Written):
+                # execLet hands EX_StructConst the variable's own address (ScriptCore.cpp 2647-2686), and it steps each
+                # member straight into it (3376-3405): a member that reads the variable sees the ones written before it.
+                put, dest = locate(n.kids[0]), ev(n.kids[0])
+                if not isinstance(dest, dict):
+                    dest = Written()
+                    put(dest)
+                for member, k in zip(named, n.kids[1].kids): dest[member] = ev(k)
+            elif o in (0xF, 0x14, 0x5F):
                 # EX_Let steps the value into the destination itself, so a None context's STALE keeps it; EX_LetBool /
                 # EX_LetObj step it into a local that starts false / NULL, then store that (ScriptCore.cpp 2688-2800).
                 put, v = locate(n.kids[0]), ev(n.kids[1], keep=o == 0xF)

@@ -5130,6 +5130,34 @@ print("ok  DerivedLiteral: a derived struct literal lists its own members before
       "ones (a value given for one is warned about); FTimerHandle() writes no member")
 
 
+def struct_lit_expr():
+    """A whole-struct literal whose members are not all constants - a `?:`, a `&&`, a call, a member of the variable it
+    is assigned to, a value for a Transient member - is what C++ makes of it, in a local, a member variable, an argument,
+    a return value, a nested struct, a TArray's elements and a UE_STRUCT's braces: the members run left to right, each
+    once, and one that reads the destination reads it as it was. execStructConst steps each member straight into the
+    destination the Let names (ScriptCore.cpp 2647-2686, 3376-3405), which runvm models once struct_const names the
+    members."""
+    import runvm
+    base = pending_asset('StructLitExpr')
+    keeps_invariants(base)
+    members = {'Vector2D': ['X', 'Y'], 'IntPoint': ['X', 'Y'], 'Box2D': ['Min', 'Max', 'bIsValid']}
+    cases = {'Local': lambda M: 12.0 + M, 'Paren': lambda M: 21.0 + 10 * M, 'Member': lambda M: 46.0 + 10 * M,
+             'Arg': lambda M: 17.0 + M, 'ArgBraced': lambda M: 71.0 + 10 * M, 'Ret': lambda M: 13.0 + 10 * M,
+             'Nested': lambda M: 42.0 + M, 'Array': lambda M: 42.0 + M, 'Both': lambda M: 10 * M + (0 < M < 5),
+             'Call': lambda M: 20 * M + 1, 'Order': lambda M: 110 if M == 0 else 100, 'Swap': lambda M: 21.0,
+             'SwapMember': lambda M: 21.0, 'ReadBack': lambda M: 31.0, 'Mod': lambda M: 12 + M, 'ModSwap': lambda M: 21,
+             'Transient': lambda M: 43 + 10 * M}
+    for fn, want in cases.items():
+        for m in (0, 1, 7) if fn == 'Both' else (0, 1):
+            vm = VM(base, Count=0)
+            vm.struct_const = lambda name, vals: runvm.Written(zip(members[name], vals))
+            got = vm.call(fn, M=m)
+            assert got == want(m), 'StructLitExpr.%s(%d) = %r, want %r' % (fn, m, got, want(m))
+
+
+pending('StructLitExpr: a struct literal with a member that is not a constant runs as C++ runs it', struct_lit_expr)
+
+
 # ---- UBER: ubergraphs along a class chain, their frames and names, latent resumes, awaits in overrides
 # (invariant_rules/ubergraph.py)
 
