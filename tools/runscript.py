@@ -37,7 +37,15 @@ class P(W):
         elif op in (4, 0x4E, 0x4F): k.append(s.node())
         elif op == 6: n.val = s.i32()
         elif op == 7: n.val = s.i32(); k.append(s.node())
-        elif op in (0xB, 0x16, 0x17, 0x25, 0x26, 0x27, 0x28, 0x2A, 0x2D, 0x32, 0x3A, 0x3C, 0x4D, 0x53): pass
+        elif op in (0xB, 0x16, 0x17, 0x25, 0x26, 0x27, 0x28, 0x2A, 0x2D, 0x30, 0x32, 0x3A, 0x3C, 0x4D, 0x53): pass
+        elif op == 0x2F:                                             # StructConst: the struct by bare name, its size,
+            p = s.ptr().split(':', 1)[-1]                            # then its members up to EX_EndStructConst
+            n.val = p.split("'")[1] if "'" in p else p
+            s.i32()
+            while True:
+                m = s.node()
+                if m.op == 0x30: break
+                k.append(m)
         elif op == 0x1F: n.val = s.cstr()
         elif op == 0x34:                                             # UnicodeStringConst: UTF-16 up to a 0 unit
             st = s.o
@@ -144,6 +152,14 @@ FUNC_HasDefaults, FUNC_UbergraphFunction = 0x800000, 0x8000
 # (EngineTypes.h:2074). A member left out reads zero.
 NATIVE_CTORS = {'Transform': {'Rotation': {'W': 1.0}, 'Scale3D': {'X': 1.0, 'Y': 1.0, 'Z': 1.0}},
                 'Quat': {'W': 1.0}, 'HitResult': {'Time': 1.0}}
+# The engine structs NoExportTypes.h declares USTRUCT(immutable): a tag holds one as its members' bytes
+# (UScriptStruct::UseBinarySerialization, Class.cpp 2706-2711), in PropertyLink order, which is their declaration order
+# (none has a super). Each is its unpack format and its members; EX_StructConst steps them in that order too
+# (ScriptCore.cpp 3376-3405).
+IMMUTABLE = {'Vector': ('<fff', 'X Y Z'), 'Vector2D': ('<ff', 'X Y'), 'Vector4': ('<ffff', 'X Y Z W'),
+             'Rotator': ('<fff', 'Pitch Yaw Roll'), 'Quat': ('<ffff', 'X Y Z W'), 'IntPoint': ('<ii', 'X Y'),
+             'IntVector': ('<iii', 'X Y Z'), 'Color': ('<BBBB', 'B G R A'), 'LinearColor': ('<ffff', 'R G B A'),
+             'Guid': ('<iiii', 'A B C D')}
 
 
 class Unconstructed:
@@ -157,7 +173,8 @@ class Unconstructed:
 def frame_defaults(base, function, _cache={}):
     """name -> value of the locals a frame of `function` starts with that are not zero: each UserDefinedStruct local
     whose default instance is not, when the function is FUNC_HasDefaults (not the ubergraph: its persistent frame is
-    runvm's). Zero members are left out, as a missing one reads zero; an enum or engine-struct member is not decoded."""
+    runvm's). Zero members are left out, as a missing one reads zero; an enum member is not decoded, nor an engine
+    struct's but an IMMUTABLE one."""
     if (base, function) not in _cache:
         import invariants
         pkg = invariants.load(base)
@@ -204,9 +221,13 @@ def _load_tags(pkg, i, tags, sp, st, v, depth):
 
 
 def _tag_value(pkg, i, t, sp, q, before, depth):
-    """(decoded, value) of one tagged value of property q: ints, floats, bools, names, strings, a UserDefinedStruct
-    (loaded over what the member held), an array of those."""
+    """(decoded, value) of one tagged value of property q: ints, floats, bools, names, strings, an IMMUTABLE engine
+    struct (its non-zero members), a UserDefinedStruct (loaded over what the member held), an array of those."""
     ty, b = t['type'], bytes(t['value'])
+    if ty == 'StructProperty' and q.type == 'StructProperty' and t.get('struct') in IMMUTABLE:
+        fmt, members = IMMUTABLE[t['struct']]
+        if len(b) != struct.calcsize(fmt): return False, None
+        return True, {m: x for m, x in zip(members.split(), struct.unpack(fmt, b)) if x}
     if ty in ('IntProperty', 'Int64Property', 'Int16Property', 'Int8Property'): return True, int.from_bytes(b, 'little', signed=True)
     if ty in ('UInt16Property', 'UInt32Property', 'UInt64Property'): return True, int.from_bytes(b, 'little')
     if ty == 'ByteProperty' and t['enum'] == 'None': return True, b[0]
@@ -488,6 +509,9 @@ def run(base, function, self_vars=None, **parms):
             if n.val == '__Slots__': return slots_of(s)
             return s.get(n.val, 0) if isinstance(s, dict) else 0     # a struct is a dict; an unset member reads 0
         if o in (0x1F, 0x34): return n.val
+        if o == 0x2F:                                                # an IMMUTABLE engine struct's literal: a dict
+            if n.val not in IMMUTABLE: raise SystemExit('unsupported struct literal %s at mem %d' % (n.val, n.mem))
+            return dict(zip(IMMUTABLE[n.val][1].split(), [ev(k) for k in n.kids]))
         if o == 0x67: return ev(n.kids[0])
         if o == 0x29: return ev(n.kids[0]) if n.kids else ''
         if o == 0x17: return SELF
