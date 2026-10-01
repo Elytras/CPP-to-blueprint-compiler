@@ -3878,6 +3878,24 @@ preload_dso_kid()
 print('ok  PreloadDso: a child class is serialized after every default subobject its Blueprint parent\'s CDO exports')
 
 
+def preload_game_parent():
+    """PreloadGameParent's parent is the game's ENE_Spider_Grunt_Normal_C, whose package exports every default
+    subobject of its CDO: the class is serialized after each of them, as after a parent cooked in the same compile
+    (preload_dso_kid). edl_parent_subobjects_serialized reads them off the game's package, so this needs --game."""
+    assert GAME, 'needs --game: the parent CDO\'s subobjects are read off the game\'s package'
+    base = pending_asset('PreloadGameParent')
+    saved = list(invariants.GAME_CONTENT)
+    invariants.GAME_CONTENT[:] = [GAME]
+    try:
+        found = invariants.check(invariants.Package(base), {'edl_parent_subobjects_serialized'})
+    finally:
+        invariants.GAME_CONTENT[:] = saved
+    assert not found, '%d findings, e.g. %s' % (len(found), '; '.join('%s %s: %s' % f for f in found[:2]))
+
+
+pending('PreloadGameParent: a child of a game Blueprint is serialized after its parent CDO\'s default subobjects', preload_game_parent)
+
+
 # ---- TABLES: the package's own tables - names and their numbers, imports, exports, archetypes
 # (invariant_rules/tables.py)
 
