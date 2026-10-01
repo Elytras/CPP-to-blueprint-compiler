@@ -739,8 +739,7 @@ def pending(name, test):
     FIXED.append(name)
     print('FIXED %s: it passes now; move it out of tests/pending' % name)
 
-def dump(t, base, i):
-    return subprocess.run([sys.executable, os.path.join(HERE, t), base, str(i)], capture_output=True, encoding='utf-8').stdout
+dump = runscript.tool_output   # what `python <tool> <args>` prints, without the process
 
 
 def exports_of(base):
@@ -785,8 +784,7 @@ def registry_of(mod):
 
 
 def registry_rows(path):
-    return set(re.findall(r'^\s+(/Game/\S+)\s+(\S+)$', subprocess.run(
-        [sys.executable, os.path.join(HERE, 'dumpar.py'), path], capture_output=True, encoding='utf-8').stdout, re.M))
+    return set(re.findall(r'^\s+(/Game/\S+)\s+(\S+)$', dump('dumpar.py', path), re.M))
 
 
 def registry_layout():
@@ -1982,9 +1980,9 @@ def mod_enum():
     pairs = [(names[struct.unpack_from('<i', raw, 16 + i * 16)[0]], struct.unpack_from('<q', raw, 24 + i * 16)[0]) for i in range(count)]
     assert pairs == [('EMood::Calm', 0), ('EMood::Angry', 5), ('EMood::Sleepy', 6), ('EMood::EMood_MAX', 7)], pairs
     exports = [e['name'] for e in dumpexp.load(base)[5]]
-    cls = subprocess.run([sys.executable, os.path.join(here, 'dumpstruct.py'), base, '0'], capture_output=True, encoding='utf-8').stdout
+    cls = dump('dumpstruct.py', base, '0')
     assert re.search(r'ByteProperty Mood .*EMood', cls), cls
-    cdo = subprocess.run([sys.executable, os.path.join(here, 'dumptags.py'), base, str(exports.index('Default__TypesTest_C'))], capture_output=True, encoding='utf-8').stdout
+    cdo = dump('dumptags.py', base, str(exports.index('Default__TypesTest_C')))
     assert 'EMood::Angry' in cdo, cdo
     print('ok  TypesTest: UE_ENUM cooks EMood with its C++ names and values; the default is its enumerator')
     for enum, pairs_want in (('ESpan', [('ESpan::Tiny', -3), ('ESpan::Wide', 70000), ('ESpan::Huge', 70001), ('ESpan::Vast', 70002), ('ESpan::ESpan_MAX', 70003)]),
@@ -2011,7 +2009,7 @@ def constants():
     here = os.path.dirname(os.path.abspath(__file__))
     base = asset('TypesTest')
     exports = [e['name'] for e in dumpexp.load(base)[5]]
-    cdo = subprocess.run([sys.executable, os.path.join(here, 'dumptags.py'), base, str(exports.index('Default__TypesTest_C'))], capture_output=True, encoding='utf-8').stdout
+    cdo = dump('dumptags.py', base, str(exports.index('Default__TypesTest_C')))
     for want in ('Seed [0] IntProperty size=4: %d' % fnv('types'), 'Budget [0] IntProperty size=4: 25', 'Reach [0] FloatProperty size=4: 125.0', 'Bits [0] IntProperty size=4: 236',
                  'Halfway [0] BoolProperty size=0 value=1'):
         assert want in cdo, (want, cdo)
@@ -2032,7 +2030,7 @@ def constants():
     print('ok  TypesTest: UE_ENUM_MAP fills a map from the enum, either way round')
     base = asset('TypesTest')
     exports = [e['name'] for e in dumpexp.load(base)[5]]
-    tool = lambda t, i: subprocess.run([sys.executable, os.path.join(here, t), base, str(i)], capture_output=True, encoding='utf-8').stdout
+    tool = lambda t, i: dump(t, base, str(i))
     assert re.search(r"ObjectProperty Aimed .*Class'Actor'", tool('dumpstruct.py', 0)), 'a `using` alias of a class is still an object reference'
     assert re.search(r"ObjectProperty Spotted .*Class'Pawn'", tool('dumpstruct.py', 0)), 'and so is a class-scope one'
     forget = ' '.join(tool('walkscript.py', exports.index('Forget')).split())
@@ -2147,7 +2145,7 @@ def types_behaviour():
     # so a call through the interface finds the Blueprint function rather than the interface's native one. It returns
     # a value of its own: runscript's None is `Return Nothing`, which leaves a script caller's destination as it was.
     here = os.path.dirname(os.path.abspath(__file__))
-    cls = subprocess.run([sys.executable, os.path.join(here, 'dumpstruct.py'), asset('TypesTest'), '0'], capture_output=True, encoding='utf-8').stdout
+    cls = dump('dumpstruct.py', asset('TypesTest'), '0')
     assert re.search(r"""Interfaces \[\("imp\[\d+\]:Class'Targetable'", 0, 1\)\]""", cls), cls
     for fn, zero in (('GetTargetCenterMass', 0), ('GetTargetHealthComponent', 0), ('ShowDamageEffects', None)):
         assert run(asset('TypesTest'), fn)[0] == zero, fn
@@ -2160,8 +2158,7 @@ def types_defaults():
     from dumptags import tags
     here, base = os.path.dirname(os.path.abspath(__file__)), asset('TypesTest')
     names, exports = dumpexp.load(base)[3], [e['name'] for e in dumpexp.load(base)[5]]
-    cdo = subprocess.run([sys.executable, os.path.join(here, 'dumptags.py'), base, str(exports.index('Default__TypesTest_C'))],
-                         capture_output=True, encoding='utf-8').stdout
+    cdo = dump('dumptags.py', base, str(exports.index('Default__TypesTest_C')))
     raw = bytes.fromhex(re.search(r'Spans \[0\] ArrayProperty size=\d+ inner=StructProperty: (\w+)', cdo).group(1))
     o, spans = 4 + 49, []                                  # count, then the inner tag (name, type, size, index, struct, guid)
     for _ in range(struct.unpack_from('<i', raw, 0)[0]):
@@ -2726,7 +2723,7 @@ def static_assets():
                  r'InstanceVariable\s+Count@'):
         assert re.search(want, w), (want, w)
     print('ok  AssetTest: a function body reaches an asset by reference')
-    ar = subprocess.run([sys.executable, os.path.join(HERE, 'dumpar.py'), registry_of('AssetTest')], capture_output=True, encoding='utf-8').stdout
+    ar = dump('dumpar.py', registry_of('AssetTest'))
     assert set(re.findall(r'^\s+(/Game/\S+)\s+(\S+)$', ar, re.M)) == {
         (MOD + 'AssetUser.AssetUser_C', 'BlueprintGeneratedClass'), (MOD + 'UMoodDef.UMoodDef_C', 'BlueprintGeneratedClass'),
         (MOD + 'EDefMood.EDefMood', 'UserDefinedEnum'), (MOD + 'MD_Plain.MD_Plain', 'UMoodDef_C'), (MOD + 'MD_Calm.MD_Calm', 'UMoodDef_C'),
@@ -3392,7 +3389,7 @@ def replication():
     import re, subprocess
     here, base = os.path.dirname(os.path.abspath(__file__)), asset('ReplTest')
     exports = [e['name'] for e in dumpexp.load(base)[5]]
-    tool = lambda t, i: subprocess.run([sys.executable, os.path.join(here, t), base, str(i)], capture_output=True, encoding='utf-8').stdout
+    tool = lambda t, i: dump(t, base, str(i))
     cls = tool('dumpstruct.py', 0)
     assert 'NumReplicatedProperties [0] IntProperty size=4: 4' in cls, cls
     for prop, flags, notify, cond in (('Score', '0x10025', 'None', 0), ('bOpen', '0x100010025', 'OnRep_Open', 0),
@@ -3409,7 +3406,7 @@ def replication():
     imports, kid_exports = dumpexp.load(kid)[4], dumpexp.load(kid)[5]
     for fn, flags in (('ServerOpen', 0xc2208c0), ('MultiBoom', 0xc024840), ('OnRep_Open', 0xc020800)):
         e = next(x for x in kid_exports if x['name'] == fn)
-        out = subprocess.run([sys.executable, os.path.join(here, 'dumpstruct.py'), kid, str(kid_exports.index(e))], capture_output=True, encoding='utf-8').stdout
+        out = dump('dumpstruct.py', kid, str(kid_exports.index(e)))
         assert 'FunctionFlags %#x' % flags in out, (fn, out)
         assert e['super'] < 0 and imports[-e['super'] - 1] == "Function'%s'" % fn, (fn, e['super'])
     print("ok  ReplTest: an override of a mod parent's RPC keeps its net flags and names it as super")
@@ -3924,7 +3921,9 @@ def preload_game_parent():
     """PreloadGameParent's parent is the game's ENE_Spider_Grunt_Normal_C, whose package exports every default
     subobject of its CDO: the class is serialized after each of them, as after a parent cooked in the same compile
     (preload_dso_kid). edl_parent_subobjects_serialized reads them off the game's package, so this needs --game."""
-    assert GAME, 'needs --game: the parent CDO\'s subobjects are read off the game\'s package'
+    if not GAME:
+        print('--  PreloadGameParent: skipped (needs --game: the parent CDO\'s subobjects are read off the game\'s package)')
+        return False
     base = asset('PreloadGameParent')
     saved = list(invariants.GAME_CONTENT)
     invariants.GAME_CONTENT[:] = [GAME]
@@ -3933,11 +3932,12 @@ def preload_game_parent():
     finally:
         invariants.GAME_CONTENT[:] = saved
     assert not found, '%d findings, e.g. %s' % (len(found), '; '.join('%s %s: %s' % f for f in found[:2]))
+    return True
 
 
-preload_game_parent()
-print('ok  PreloadGameParent: a child of a game Blueprint is serialized after every default subobject its parent\'s CDO '
-      'exports')
+if preload_game_parent():
+    print('ok  PreloadGameParent: a child of a game Blueprint is serialized after every default subobject its parent\'s '
+          'CDO exports')
 
 
 # ---- TABLES: the package's own tables - names and their numbers, imports, exports, archetypes
@@ -4562,10 +4562,14 @@ def func_local_defaults():
 def func_cosmetic_static():
     """FuncCosmeticStatic: ApplyDamage (BlueprintAuthorityOnly) and PlaySound2D (BlueprintCosmetic) are called
     through CallFunction's callspace check, as the editor calls them."""
+    if not SDK:
+        print('--  FuncCosmeticStatic: skipped (needs --sdk: the native callees\' flags are read off the dump)')
+        return False
     base = asset('FuncCosmeticStatic')
     calls = {(fn, where.rsplit(':', 1)[-1]): op for fn, op, where, flags in func_calls(base) if flags & ROUTED}
     assert set(calls) == {('Hit', 'ApplyDamage'), ('Beep', 'PlaySound2D')}, calls
     assert all(op in (0x1B, 0x1C) for op in calls.values()), 'called with %s' % {k: '%02x' % v for k, v in calls.items()}
+    return True
 
 
 def func_qualified_call():
@@ -4638,8 +4642,8 @@ def func_ancestor_iface():
 
 func_local_defaults()
 print('ok  FuncLocalDefaults: FText / FTransform / FHitResult / defaulted-struct locals start constructed (FUNC_HasDefaults)')
-func_cosmetic_static()
-print('ok  FuncCosmeticStatic: ApplyDamage / PlaySound2D keep their callspace routing (not EX_CallMath)')
+if func_cosmetic_static():
+    print('ok  FuncCosmeticStatic: ApplyDamage / PlaySound2D keep their callspace routing (not EX_CallMath)')
 func_qualified_call()
 print('ok  FuncQualifiedCall: Parent::Fn() runs the parent\'s function, copied in or bound from a forwarding override')
 func_qualified_multicast()
@@ -4765,8 +4769,10 @@ def opnd_rules_hold():
         assert not found, '%s: %s' % (os.path.basename(b), found[:3])
     stats = {r: operand_rules.OPERAND_STATS.get(r, {}) for r in ('instance_var_owner', 'out_args_addressable', 'call_names_resolve',
                                                          'interface_context_placement')}
-    assert all(s and not any('unknown' in k for k in s) for s in stats.values()), stats   # every operand was resolved
-    print('ok  OpndRefArgs: %d packages keep the %d operand rules, every context and callee resolved' % (len(bases), len(OPERAND_RULES)))
+    if SDK:     # every operand was resolved; a native callee only resolves off the dump
+        assert all(s and not any('unknown' in k for k in s) for s in stats.values()), stats
+    print('ok  OpndRefArgs: %d packages keep the %d operand rules%s' % (len(bases), len(OPERAND_RULES),
+                                                                          ', every context and callee resolved' if SDK else ''))
 
 
 def opnd_latent_ref_refused():

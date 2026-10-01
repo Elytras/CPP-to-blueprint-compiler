@@ -15,6 +15,24 @@ from walkscript import W
 FLOW_OPS = {6, 7, 0x4C, 0x4D, 0x4E, 0x4F}
 
 
+def tool_output(tool, *args):
+    """What `python <tool> <args>` prints, run in this process instead: a process per call was most of the processes a
+    test run started, and on some Windows machines every exited process stays in the kernel until a reboot. sys.argv
+    and sys.stdout are the process's, so one thread at a time. A tool that fails gives what it printed before, as the
+    process's stdout did; what it writes to stderr is dropped, as it was."""
+    import contextlib, importlib, io
+    out, argv = io.StringIO(), sys.argv
+    sys.argv = [tool] + [str(a) for a in args]
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            importlib.import_module(tool[:-3]).main()
+    except (SystemExit, Exception):
+        pass
+    finally:
+        sys.argv = argv
+    return out.getvalue()
+
+
 class Node:
     def __init__(s, op, mem):
         s.op, s.mem, s.kids, s.val, s.own = op, mem, [], None, False
@@ -111,11 +129,10 @@ def script_of(base, function):
 def params_of(base, function, flag=0x80):
     """The function's parameters in order, the return value left out, read off dumpstruct.py's property lines.
     flag=0x100 (CPF_OutParm): only its reference parameters."""
-    import os, re, subprocess
+    import re
     exports = dumpexp.load(base)[5]
     idx = next(i for i, e in enumerate(exports) if e['name'] == function)
-    out = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dumpstruct.py'), base, str(idx)],
-                         capture_output=True, encoding='utf-8').stdout
+    out = tool_output('dumpstruct.py', base, idx)
     found = re.findall(r'^\s+\w+Property (\w+) .*? flags=(0x[0-9a-fA-F]+)', out, re.M)
     return [name for name, flags in found if int(flags, 16) & flag and not int(flags, 16) & 0x400]
 
@@ -123,12 +140,11 @@ def params_of(base, function, flag=0x80):
 def props_of(base, function, _cache={}):
     """The function's own properties (parms and locals), name -> FProperty class, off dumpstruct.py's top-level lines.
     An EnumProperty over a byte (an enum class) reads as the ByteProperty it is to the VM."""
-    import os, re, subprocess
+    import re
     if (base, function) not in _cache:
         exports = dumpexp.load(base)[5]
         idx = next(i for i, e in enumerate(exports) if e['name'] == function)
-        out = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dumpstruct.py'), base, str(idx)],
-                             capture_output=True, encoding='utf-8').stdout
+        out = tool_output('dumpstruct.py', base, idx)
         _cache[base, function] = dict((n, 'ByteProperty' if (t, size) == ('EnumProperty', '1') else t)
                                       for t, n, size in re.findall(r'^  (\w+Property) (\w+) \S+ \S+ size=(\d+)', out, re.M))
     return _cache[base, function]
