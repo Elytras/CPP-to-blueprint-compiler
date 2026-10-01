@@ -4717,6 +4717,25 @@ def func_forwarder_order():
 pending('FuncForwarderOrder: a forwarding override calls its own super, whatever its class\'s name', func_forwarder_order)
 
 
+def func_iface_inherited():
+    """FuncIfaceInherited implements IFiTell, whose Tell, Kept and Ping it inherits from FiRoot. Each of its own
+    calls FiRoot's, so a call by name or through the interface runs FiRoot's (with no function of its own the interface's
+    empty one would be found first, UClass::FindFunctionByName, Class.cpp 5281-5323)."""
+    kid = pending_asset('FuncIfaceInherited')
+    chain = [kid, os.path.join(os.path.dirname(kid), 'FiRoot')]
+    keeps_invariants(kid)
+    assert {'Tell', 'Kept', 'Ping'} <= set(exports_of(kid)), exports_of(kid)
+    got = run_as(chain, 'Tell', {}, V=2), run_as(chain, 'Kept', {}, V=2)
+    assert got == (3, 20), 'Tell(2), Kept(2) on a FuncIfaceInherited returned %r, %r' % got
+    fields = {'Seen': 0}
+    run_as(chain, 'Ping', fields)
+    assert fields['Seen'] == 9, fields
+
+
+pending('FuncIfaceInherited: an interface function an ancestor has runs the ancestor\'s, not an empty stub',
+        func_iface_inherited)
+
+
 # ---- OPERANDS: operands the VM resolves against the object they run on - jumps, instance variables, calls by name,
 # field paths, object operands, arity, out and reference arguments (invariant_rules/operands.py)
 
