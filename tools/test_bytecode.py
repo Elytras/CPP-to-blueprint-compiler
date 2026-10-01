@@ -5656,17 +5656,52 @@ def transient_const():
     """A non-zero constant for a native struct literal's Transient member makes the Make Struct a computed one does,
     which sets it: execStructConst skips the member (ScriptCore.cpp 3376-3405), so a literal of constants would drop the
     value, and whether it counted would hang on another member. A zero there stays a literal, with no warning."""
+    import runvm
     base = asset('TransientConst')
     keeps_invariants(base)
-    for m in (0, 1):
-        got = VM(base).call('AllConst', M=m)
-        assert got == 43 + m, 'TransientConst.AllConst(%d) = %r, want %r' % (m, got, 43 + m)
+    for fn, want in (('AllConst', lambda m: 43 + m), ('ZeroConst', lambda m: 3 + m)):
+        for m in (0, 1):
+            vm = VM(base)
+            vm.struct_const = lambda name, vals: runvm.Written(zip(TRANSIENT_LINK[name], vals))
+            got = vm.call(fn, M=m)
+            assert got == want(m), 'TransientConst.%s(%d) = %r, want %r' % (fn, m, got, want(m))
     assert 'is Transient' not in LOGS['TransientConst'], LOGS['TransientConst']
 
 
+# What EX_StructConst writes of each struct the Transient tests build, in PropertyLink order: never the Transient member.
+TRANSIENT_LINK = {'MaterialAttributesInput': ['OutputIndex', 'InputName', 'ExpressionName'], 'TimerHandle': []}
 transient_const()
 print('ok  TransientConst: a non-zero constant for a Transient member makes the Make Struct, which sets it; a zero keeps '
       'the literal')
+
+
+def transient_zero():
+    """A zero for a Transient member, or `T()` / `{}` of a struct whose one member is Transient, sets the member to zero
+    as C++ does, over a member variable that held 4 (or a timer handle 5) and over a loop's local, which a Blueprint
+    does not make afresh each time round: execStructConst skips the member (ScriptCore.cpp 3376-3405) and steps the rest
+    into the destination, which runvm models once struct_const names what a literal writes."""
+    import runvm
+    base = pending_asset('TransientZero')
+    keeps_invariants(base)
+
+    def vm():
+        v = VM(base, Kept=runvm.Written(), Handle=runvm.Written(Handle=5))
+        v.struct_const = lambda name, vals: runvm.Written(zip(TRANSIENT_LINK[name], vals))
+        return v
+    v = vm()
+    got = (v.call('SetFour'), v.call('SetZero'))
+    assert got == (4, 0), 'TransientZero.SetFour, SetZero = %r, want (4, 0)' % (got,)
+    for m in (0, 1):
+        got = vm().call('Loop', M=m)
+        assert got == m, 'TransientZero.Loop(%d) = %r, want %d' % (m, got, m)
+    for fn in ('ResetHandle', 'ClearHandle'):
+        v = vm()
+        v.call(fn)
+        assert v.self.vars['Handle'].get('Handle') == 0, 'TransientZero.%s leaves Handle %r, want 0' % (fn, v.self.vars['Handle'])
+
+
+pending('TransientZero: a zero for a Transient member, or T() of a struct whose member is Transient, sets it',
+        transient_zero)
 
 
 def local_by_address():
@@ -7284,6 +7319,46 @@ def defaults_zero():
 defaults_zero()
 print('ok  DefaultsZero: UE_DEFAULTS\' {} / T() / nullptr over a parent\'s default writes the type\'s zero, a '
       'UE_STRUCT\'s its defaults')
+
+
+def defaults_value_init():
+    """`{}` and `T()` of an engine struct whose header declares no constructor hold what the engine's constructor sets,
+    which no header says: FHitResult's sets Time to 1 (FHitResult::Init, EngineTypes.h), as a function body's
+    FHitResult() keeps. A class's own default starts as that fresh value, so it is kept by tagging none of the struct's
+    members; over a parent's value it cannot be written, and is refused, the struct's own or a UE_STRUCT's member. An
+    engine struct with a constructor is its zeros, as FFindFloorResult() is in a function, its FHitResult's Time too."""
+    import struct
+    top = ('struct FHeldHit {\n  UE_STRUCT;\n  FHitResult Hit;\n  int32 N = 0;\n};\n'
+           'class ValueInitParent : public AActor {\npublic:\n  FHitResult Hit;\n  FHeldHit H;\n};\n')
+    for mod, assign, path in (('ValueInitCtor', 'Hit = FHitResult();', 'Hit'), ('ValueInitBraces', 'Hit = {};', 'Hit'),
+                              ('ValueInitHeld', 'H = {};', 'H.Hit')):
+        refused(mod, '  UE_DEFAULTS {\n    %s\n  }\n' % assign,
+                "%s: `FHitResult()` or `{}` holds what the engine's FHitResult constructor sets" % path, top, 'ValueInitParent')
+    base = pending_asset('DefaultsValueInit')
+    keeps_invariants(base)
+    pkg = invariants.Package(base)
+    cdo = pkg.find('Default__DefaultsValueInit_C')
+
+    def members(at=None):
+        return {t['name'].split('_')[0]: t for t in (pkg.tags(cdo, at) if at is not None else pkg.tags(cdo))}
+
+    def time_of(hit):
+        """Time as the loader leaves it in a fresh FHitResult that this tag (or none) is read over."""
+        inner = members(hit['at']) if hit else {}
+        return struct.unpack('<f', inner['Time']['value'])[0] if 'Time' in inner else 1.0
+    tags = members()
+    for name in ('Own', 'Own2'):
+        held = members(tags[name]['at'])
+        assert struct.unpack('<i', held['N']['value'])[0] == 5, (name, held)
+        assert time_of(held.get('Hit')) == 1.0, '%s.Hit.Time is written %r, where C++ gives 1' % (name, time_of(held.get('Hit')))
+    assert time_of(tags.get('Mine')) == 1.0, 'Mine.Time is written %r, where C++ gives 1' % time_of(tags.get('Mine'))
+    floor = members(tags['Floor']['at'])
+    assert struct.unpack('<f', floor['FloorDist']['value'])[0] == 0.0 and floor['bBlockingHit']['bool'] == 0, floor
+    assert 'HitResult' in floor and time_of(floor['HitResult']) == 0.0, 'Floor.HitResult.Time is not written 0: %r' % floor
+
+
+pending('DefaultsValueInit: {} / T() of an engine struct without a constructor keeps the engine\'s values in a fresh '
+        'default and is refused over a parent\'s', defaults_value_init)
 
 
 def tenum_value_init():
