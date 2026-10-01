@@ -14856,6 +14856,14 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     const Json Stamp = Json::parse(ReadText(IncludeDir + "/Version.json"), nullptr, false);
     const int32 Stamped = Stamp.is_object() && Stamp.contains("genueapi") && Stamp["genueapi"].is_number_integer()
                               ? Stamp["genueapi"].get<int32>() : 0;
+    /* A folder with no stamp and none of genueapi's tables either is no UeApi at all (a mod folder, a path that does not
+       exist): said as LoadTables says it, not as one an older genueapi wrote. */
+    if (Stamp.is_discarded() && !std::filesystem::exists(IncludeDir + "/Types.json", TmpEc)
+        && !std::filesystem::exists(IncludeDir + "/Conv.json", TmpEc))
+    {
+        *Err = "missing or invalid " + IncludeDir + "/Conv.json (run genueapi.py)";
+        return false;
+    }
     if (Stamped < UeApiVersion)
     {
         *Err = IncludeDir + " was written by an older genueapi (" + (Stamped ? "version " + std::to_string(Stamped)

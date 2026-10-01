@@ -4174,14 +4174,15 @@ if preload_nested_kid():
 def ueapi_too_old():
     """A UeApi that a genueapi older than the compiler wrote is refused, saying to regenerate it, before the compile
     reads any of it: one made before UeDefaultSubobjects compiles a game Blueprint's child with none of the ordering
-    edges above, and says nothing. Here a UeApi with no Version.json (any made before genueapi stamped one) and one
-    stamped 0."""
+    edges above, and says nothing. Here a UeApi with no Version.json (any made before genueapi stamped one, which has
+    its tables) and one stamped 0."""
     import tempfile
     src = os.path.join(TESTS, 'PreloadCaseKid.cpp')
     for stamp in (None, '{"genueapi": 0}\n'):
         with tempfile.TemporaryDirectory() as tmp:
             stale = os.path.join(tmp, 'UeApi')
             os.makedirs(stale)
+            with open(os.path.join(stale, 'Conv.json'), 'w', encoding='utf-8') as f: f.write('[]\n')
             if stamp:
                 with open(os.path.join(stale, 'Version.json'), 'w', encoding='utf-8') as f: f.write(stamp)
             proc = assetgen_compile([src, stale, os.path.join(tmp, 'out')])
@@ -4206,7 +4207,8 @@ def ueapi_not_one():
                 and 'older genueapi' not in proc.stdout, (api, proc.stdout[-500:])
 
 
-pending('UeApi: a folder that is no UeApi is reported as none, not as an older one', ueapi_not_one)
+ueapi_not_one()
+print('ok  UeApi: a folder that is no UeApi is reported as none, not as an older one')
 
 
 def ueapi_without_game():

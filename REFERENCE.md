@@ -6242,13 +6242,16 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   fix what clang reports, and check that `clang++` is on `PATH`. See
   [Mod sources and packages](#mod-sources-and-packages).
 - `missing or invalid <IncludeDir>/<File> (run genueapi.py)`: the include-dir argument is not a generated UeApi
-  folder: `Conv.json`, `Ops.json`, `Types.json` or `Events.json` is missing or unreadable. Fix: pass the UeApi folder
-  that genueapi wrote, or regenerate it. See [The SDK](GUIDE.md#the-sdk).
+  folder: `Conv.json`, `Ops.json`, `Types.json` or `Events.json` is missing or unreadable. A folder with no
+  `Version.json` and neither `Types.json` nor `Conv.json` (a mod folder, a path that does not exist) is reported so,
+  naming `Conv.json`, before clang runs. Fix: pass the UeApi folder that genueapi wrote, or regenerate it. See
+  [The SDK](GUIDE.md#the-sdk).
 - `<IncludeDir> was written by an older genueapi (no Version.json, this assetgen needs version <N>) - regenerate it
   with AssetGen/tools/genueapi.py` (or `version <M>` for an older stamp): the UeApi folder comes from a genueapi older
   than this compiler, which would compile against it without a word wrong where it relies on what that one did not
   write (a game Blueprint's child would load before its parent's subobjects). genueapi writes `Version.json` last, so
-  a run that stopped halfway leaves none either. Fix: regenerate UeApi with the genueapi of this AssetGen, or use the
+  a run that stopped halfway leaves none either (a folder with no `Types.json` or `Conv.json` either is no UeApi, the
+  message above). Fix: regenerate UeApi with the genueapi of this AssetGen, or use the
   SDK release made for it. See [The SDK](GUIDE.md#the-sdk).
 - `<Class> derives from the game Blueprint <Parent>, but <IncludeDir> was generated without --game, so it does not list
   the default subobjects that Blueprint's default object exports, which this class must load after - regenerate it
