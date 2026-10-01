@@ -4638,6 +4638,26 @@ print('ok  override refusals: other parameters than a native event\'s, a mod par
       'a name of a native non-event')
 
 
+def func_final_inherited():
+    """FuncFinalInherited (`final`) calls FfBase's AuthOnly, ServerBump and Kept unqualified, FfOwn (`final`) its own
+    AuthOnly, an override, and FfOther AuthOnly through a FuncFinalInherited pointer. None of them is FUNC_Final, so
+    each is a call by name, which finds that same function, no class deriving from a final one (call_opcode_flags:
+    the editor binds a call to a function without FUNC_Final only as a parent call); each runs that function."""
+    kid = pending_asset('FuncFinalInherited')
+    folder = os.path.dirname(kid)
+    base, own, other = (os.path.join(folder, c) for c in ('FfBase', 'FfOwn', 'FfOther'))
+    for b in (kid, own, other): keeps_invariants(b)
+    for chain, fn, want in (([kid, base], 'CallAuth', 3), ([kid, base], 'CallServer', 2), ([own, base], 'CallAuth', 30)):
+        fields = {'Seen': 0}
+        run_as(chain, fn, fields)
+        assert fields['Seen'] == want, (os.path.basename(chain[0]), fn, fields)
+    assert run_as([kid, base], 'CallKept', {}) == 2
+
+
+pending('FuncFinalInherited: a final class calls an inherited or overriding function that is not FUNC_Final by name',
+        func_final_inherited)
+
+
 # ---- OPERANDS: operands the VM resolves against the object they run on - jumps, instance variables, calls by name,
 # field paths, object operands, arity, out and reference arguments (invariant_rules/operands.py)
 
