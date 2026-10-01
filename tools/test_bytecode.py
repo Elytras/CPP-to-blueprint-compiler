@@ -994,8 +994,9 @@ def comma_hoist():
     """CommaHoist: a comma inside an expression runs its left side first, as a statement, wherever nothing in the
     statement runs before it, and is worth its right side, read where C++ reads it: Count is what Bump left. An
     initialiser (a TEnum<E>'s too), an argument beside a constant or beside a call, a struct literal's first member, a
-    return value, an assignment's right side, a switch over a TEnum<E>, a reference argument, a comma in a comma. The
-    class default `(1, 4)` is 4."""
+    return value, an assignment's right side, a switch over a TEnum<E>, a reference argument, a comma in a comma. Beside
+    a call that sets what it reads, by value or by reference, it runs whole before the call or after it. The class
+    default `(1, 4)` is 4."""
     base = asset('CommaHoist')
     keeps_invariants(base)
     for fn, want, bumps in (('Brace', lambda m, c: m + c * 100, 1), ('Enum', lambda m, c: m + c * 100, 1),
@@ -1009,6 +1010,16 @@ def comma_hoist():
             got = run(base, fn, me, M=m)[0]
             assert got == want(m, c + bumps) and me['Count'] == c + bumps, \
                 'CommaHoist.%s(%d) with Count %d = %r, Count %r; want %r, Count %d' % (fn, m, c, got, me['Count'], want(m, c + bumps), c + bumps)
+    # Beside a call that sets Count, the comma runs whole before it or after it: the (value, Count) pairs C++ allows.
+    # Its left side alone first and its right side read after the call (Interleave 10 * m + 100) is no C++ order, nor
+    # is a reference bound to a copy (RefBeside c + 1 + m, Count 100).
+    for m, c in ((0, 0), (7, 5), (3, -2)):
+        for fn, legal in (('Interleave', {(10 * m + c + 1, 100), (10 * m + 101, 101)}),
+                          ('RefBeside', {(100 + m, 100 + m), (101 + m, 101 + m)})):
+            me = {'Count': c}
+            got = run(base, fn, me, M=m)[0]
+            assert (got, me['Count']) in legal, 'CommaHoist.%s(%d) with Count %d = %r, Count %r; want one of %r' % (
+                fn, m, c, got, me['Count'], sorted(legal))
     cdo = dump('dumptags.py', base, str(exports_of(base).index('Default__CommaHoist_C')))
     assert 'D [0] IntProperty size=4: 4' in cdo, cdo
 
