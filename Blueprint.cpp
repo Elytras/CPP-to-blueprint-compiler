@@ -26,7 +26,10 @@ void ScsNodeGuid(const std::string& ClassName, const std::string& ComponentName,
 FIndex FBlueprintClass::Subobject(const std::string& ClassPackage, const std::string& ClassName_,
                                   FIndex Outer, const std::string& ObjectName)
 {
-    const std::string Key = "sub:" + std::to_string(Outer.V) + ":" + ObjectName;
+    /* An FName compares without case, so `temperature` (UeApi's member, off the object dump) and the grunt's package's
+       `Temperature` are one object, which the cook imports once (SavePackage.cpp 3288-3339): the first spelling asked
+       for is the row's. */
+    const std::string Key = "sub:" + std::to_string(Outer.V) + ":" + Lower(ObjectName);
     auto It = ImportCache.find(Key);
     if (It != ImportCache.end()) return Imp(It->second);
 

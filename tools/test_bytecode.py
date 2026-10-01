@@ -3904,7 +3904,7 @@ def preload_case_kid():
     spelling). FName compares without case, so that is one object: one import row, which is both the override's
     archetype and a parent subobject the class is serialized after (import_unique, edl_parent_subobjects_serialized)."""
     assert GAME, 'needs --game: the parent CDO\'s subobjects are read off the game\'s package'
-    base = pending_asset('PreloadCaseKid')
+    base = asset('PreloadCaseKid')
     saved = list(invariants.GAME_CONTENT)
     invariants.GAME_CONTENT[:] = [GAME]
     try:
@@ -3914,8 +3914,8 @@ def preload_case_kid():
     assert not found, '; '.join('%s %s: %s' % f for f in found[:3])
 
 
-pending('PreloadCaseKid: a restated subobject spelled in another case than the parent\'s export is one import',
-        preload_case_kid)
+preload_case_kid()
+print('ok  PreloadCaseKid: a restated subobject spelled in another case than the parent\'s export is one import')
 
 
 # ---- TABLES: the package's own tables - names and their numbers, imports, exports, archetypes
