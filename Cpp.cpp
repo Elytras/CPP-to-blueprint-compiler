@@ -687,6 +687,7 @@ struct FStructInfo
 };
 
 bool IsVmConstant(const FArgIR& A);
+bool SteppedInPlace(const FArgIR& A);
 
 /* Each index into SI.Fields EX_StructConst writes, in the order it writes them. */
 std::vector<size_t> StructConstOrder(const FStructInfo& SI)
@@ -1379,6 +1380,9 @@ private:
     bool ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgIR& Arg, std::string* Err);
     bool LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     bool LowerMakeStruct(const std::string& Type, const Json* List, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
+    bool MakeTemp(const std::string& Type, FBlueprintClass& BP, std::string* Tmp, std::string* Err);
+    bool LowerStructByMembers(const std::string& Type, const FStructInfo& SI, std::vector<FArgIR>& Values,
+                              FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     bool LowerDispatcherCall(const Json& Call, const Json& Callee, const Json& Obj, FBlueprintClass& BP,
                              FArgIR& Out, std::string* Err);
     bool LowerDelegateValue(const Json& Obj, const Json& Fn, FArgIR& Out, std::string* Err);
@@ -3026,7 +3030,8 @@ bool FCompiler::ZeroArg(const std::string& Type, FBlueprintClass& BP, FArgIR& Ou
 /* `FVector(1, 2, 3)`: EX_StructConst wants one value per reflected field, in property order, so
    only a struct whose every field is known can be written; argless means all zeros. The arguments come in C++'s order
    (a super's members first) and go out in PropertyLink's (StructConstOrder); one for a Transient member has nowhere to
-   go, execStructConst skipping that member, so a constant there is dropped with a warning and anything else refused. */
+   go, execStructConst skipping that member, so a constant there is dropped with a warning. A literal with any other
+   member, or a computed value for a Transient one, is the editor's Make Struct instead (LowerStructByMembers). */
 bool FCompiler::LowerStructLiteral(const Json& CtorNode, const FStructInfo& SI, FBlueprintClass& BP,
                                    FArgIR& Out, std::string* Err)
 {
@@ -3050,17 +3055,83 @@ bool FCompiler::LowerStructLiteral(const Json& CtorNode, const FStructInfo& SI, 
     for (size_t I = 0; I < Args.size(); ++I)
         if (!LowerArg(*Args[I], BP, Given[I], Err)) return false;
     const std::vector<size_t> Order = StructConstOrder(SI);
+    /* First we see whether EX_StructConst can take the members as they are. execLet hands it the destination's own
+       address and it steps each member straight in (ScriptCore.cpp 2647-2686, 3376-3405), so `V = {V.Y, V.X}` would
+       read what it has just written, a call there may read the destination too, and a `?:` or an inline call needs
+       statements of its own, which nothing would hoist out of the literal. The editor writes a literal for constants
+       only, and a Make Struct for the rest: through a temp, one statement per member, left to right as C++ runs a braced
+       list. A Transient member's computed value can be set there too. */
+    bool bInPlace = true;
+    for (size_t I = 0; I < Given.size(); ++I)
+        bInPlace = bInPlace && (std::find(Order.begin(), Order.end(), I) != Order.end() ? SteppedInPlace(Given[I])
+                                                                                        : IsVmConstant(Given[I]));
+    if (!bInPlace) return LowerStructByMembers(T, SI, Given, BP, Out, Err);
     for (size_t I = 0; I < Given.size(); ++I)
     {
         if (std::find(Order.begin(), Order.end(), I) != Order.end()) continue;
         const std::string& Member = SI.Fields[I].second;
-        if (!IsVmConstant(Given[I]))
-        { *Err = T + "::" + Member + " is Transient, which a struct literal cannot set: give it a constant, or set the member "
-                 "after"; return false; }
         printf("  warning: %s::%s: %s::%s is Transient, which a struct literal does not set (execStructConst skips it): "
                "the value given for it is dropped\n", Cur ? Cur->CppName.c_str() : "", CurFnName.c_str(), T.c_str(), Member.c_str());
     }
     for (size_t I : Order) Out.Sub->Args.push_back(Given[I]);
+    return true;
+}
+
+/* A native struct literal with computed members, as the editor's Make Struct (LowerMakeStruct): a temp, then one store
+   per member in C++'s order, Values holding one per SI.Fields entry. A member a super declares is that struct's
+   property, so its store names it there, as LowerField does for `S.Member`. */
+bool FCompiler::LowerStructByMembers(const std::string& Type, const FStructInfo& SI, std::vector<FArgIR>& Values,
+                                     FBlueprintClass& BP, FArgIR& Out, std::string* Err)
+{
+    std::string Tmp;
+    if (!MakeTemp(Type, BP, &Tmp, Err)) return false;
+    auto Body = std::make_shared<std::vector<FStmtIR>>();
+    for (size_t I = 0; I < Values.size() && I < SI.Fields.size(); ++I)
+    {
+        /* The struct that declares member I: the topmost super whose own fields reach it (a super's come first). */
+        const FRecord* DeclRec = Find(Type);
+        const FStructInfo* Decl = &SI;
+        for (const FRecord* R = DeclRec; R && !R->Base.empty(); R = Find(R->Base))
+        {
+            const auto Up = Structs.find(R->Base);
+            if (Up == Structs.end() || Up->second.Fields.size() <= I) break;
+            Decl = &Up->second;
+            DeclRec = Find(R->Base);
+        }
+        FStmtIR& Set = Body->emplace_back();
+        Set.K = FStmtIR::Assign;
+        Set.Var.K = FArgIR::Member;
+        Set.Var.S = DeclRec ? UeNameOf(DeclRec, SI.Fields[I].second) : SI.Fields[I].second;
+        Set.Var.Owner = BP.ScriptStruct(Decl->Package, Decl->UeName);
+        Set.Var.LetOp = LetOpFor(SI.Fields[I].first);
+        Set.Var.Base = std::make_shared<FArgIR>();
+        Set.Var.Base->K = FArgIR::Local;
+        Set.Var.Base->S = Tmp;
+        Set.Value = std::move(Values[I]);
+    }
+    auto Block = std::make_shared<std::vector<FStmtIR>>(1);
+    (*Block)[0].K = FStmtIR::Block;
+    (*Block)[0].Body = Body;
+    Out = FArgIR();
+    Out.K = FArgIR::Call;
+    Out.InnerType = Type;
+    Out.Sub = std::make_shared<FCallIR>();
+    Out.Sub->Intrinsic = "__Inline__";
+    Out.Sub->Inline = Block;
+    Out.Sub->InlineResult = Tmp;
+    Out.Sub->InlineType = Type;
+    return true;
+}
+
+/* The temp a Make Struct fills: a local of Type the frame default-constructs, named into Tmp. */
+bool FCompiler::MakeTemp(const std::string& Type, FBlueprintClass& BP, std::string* Tmp, std::string* Err)
+{
+    if (!CurLocals) { *Err = "internal: a struct value outside a function body"; return false; }
+    *Tmp = "__Make" + std::to_string(ReadTmpCounter++) + "__";
+    FPropertyDef PD;
+    if (!TypeToProperty(Type, *Tmp, 0, "a " + Type + " value", BP, &PD, Err)) return false;
+    PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+    CurLocals->push_back(PD);
     return true;
 }
 
@@ -3073,13 +3144,8 @@ bool FCompiler::LowerMakeStruct(const std::string& Type, const Json* List, FBlue
 {
     const FRecord* R = Find(Type);
     if (!R || !R->bIsStruct) { *Err = "a braced value needs a struct type, not " + Type; return false; }
-    if (!CurLocals) { *Err = "internal: a struct value outside a function body"; return false; }
-
-    const std::string Tmp = "__Make" + std::to_string(ReadTmpCounter++) + "__";
-    FPropertyDef PD;
-    if (!TypeToProperty(Type, Tmp, 0, "a " + Type + " value", BP, &PD, Err)) return false;
-    PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
-    CurLocals->push_back(PD);
+    std::string Tmp;
+    if (!MakeTemp(Type, BP, &Tmp, Err)) return false;
 
     const bool bPlainName = R->IsNative() || IsInternalViewStruct(R->CppName);
     const FIndex Struct = BP.ScriptStruct(PackageOf(*R), ClassOf(*R));
@@ -3522,6 +3588,15 @@ bool IsVmConstant(const FArgIR& A)
     default:
         return false;
     }
+}
+
+/* A struct literal's member EX_StructConst may step straight into the destination: a constant, a local of this frame,
+   one of this object's variables, or a literal of those. Nothing else in the literal can change one, and none can be
+   the destination or a part of it, a struct never holding its own type. A reference parameter could alias either. */
+bool SteppedInPlace(const FArgIR& A)
+{
+    if (A.K == FArgIR::StructLit) return A.Sub && std::all_of(A.Sub->Args.begin(), A.Sub->Args.end(), SteppedInPlace);
+    return IsVmConstant(A) || A.K == FArgIR::Local || (A.K == FArgIR::Field && !A.Base);
 }
 
 const Json* FCompiler::InlineListOf(const Json* E) const

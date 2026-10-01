@@ -5138,7 +5138,7 @@ def struct_lit_expr():
     destination the Let names (ScriptCore.cpp 2647-2686, 3376-3405), which runvm models once struct_const names the
     members."""
     import runvm
-    base = pending_asset('StructLitExpr')
+    base = asset('StructLitExpr')
     keeps_invariants(base)
     members = {'Vector2D': ['X', 'Y'], 'IntPoint': ['X', 'Y'], 'Box2D': ['Min', 'Max', 'bIsValid']}
     cases = {'Local': lambda M: 12.0 + M, 'Paren': lambda M: 21.0 + 10 * M, 'Member': lambda M: 46.0 + 10 * M,
@@ -5155,7 +5155,8 @@ def struct_lit_expr():
             assert got == want(m), 'StructLitExpr.%s(%d) = %r, want %r' % (fn, m, got, want(m))
 
 
-pending('StructLitExpr: a struct literal with a member that is not a constant runs as C++ runs it', struct_lit_expr)
+struct_lit_expr()
+print('ok  StructLitExpr: a struct literal with a member that is not a constant is a Make Struct, and runs as C++ runs it')
 
 
 # ---- UBER: ubergraphs along a class chain, their frames and names, latent resumes, awaits in overrides

@@ -1020,10 +1020,11 @@ copies it, as in C++.
 
 | You write | What it does | Status |
 |---|---|---|
-| `FVector(1, 2, 3)`, `FLinearColor(1, 0.5f, 0, 1)` | A whole-struct constructor: one struct value (a Make node) built from the arguments, which can be any expressions. | Yes |
+| `FVector(1, 2, 3)`, `FLinearColor(1, 0.5f, 0, 1)` | A whole-struct constructor: one struct value built from the arguments. Constants, locals and the object's own variables make one literal value, as the editor's literal pin does. | Yes |
+| `FVector2D(1.0f, M == 0 ? 2.0f : 3.0f)`, `{Twice(M), 1}`, `V = {V.Y, V.X}` | A member that computes anything else (a call, `?:`, `&&`, a member of a struct) makes the editor's Make Struct instead: a fresh value, then one store per member, left to right as C++ runs a braced list. The variable assigned is written after all of them, so `V = {V.Y, V.X}` swaps. | Yes |
 | `FColor(255, 128, 0)` | R, G, B and A, with A 255 when left out, like the engine's constructor. Each argument lands on the member its parameter is named after, although FColor stores B, G, R, A. | Yes |
 | `FLightmassDirectionalLightSettings(1.5f, 2.5f, true, 4.5f)` | A struct with a parent struct: the arguments come in C++ order, the parent's members first, and each lands on its member (the engine lists the struct's own members first). | Yes |
-| `FMaterialAttributesInput(3, "In", "Ex", 9)` | A member the engine marks Transient (here PropertyConnectedBitmask) is not part of a struct literal, as in the engine: a constant given for it is dropped with a warning, anything else is refused. The member reads zero. | Warns |
+| `FMaterialAttributesInput(3, "In", "Ex", 9)` | A member the engine marks Transient (here PropertyConnectedBitmask) is not part of a struct literal, as in the engine: with every member a constant, the one given for it is dropped with a warning and the member reads zero. A computed value for it, or any computed member, makes the Make Struct above, which sets it. | Warns |
 | `FVector()`, `FQuat()`, `FTransform()` | All zeros, for a struct that has a whole-struct constructor. `FTransform()` is all zeros too, Scale3D included: it is not the identity. `FTimerHandle()` writes no member at all: its one member is Transient. | Yes |
 | `FHitResult()`, `FStats{}` | Make Struct with nothing set, for a struct without a whole-struct constructor: the struct keeps its own defaults (`FHitResult::Time` is 1). | Yes |
 | `FStats S = {.Kills = K, .Alive = true};` | Make Struct: a fresh value, then one store for each member given. Members left out keep the struct's defaults. | Yes |
@@ -1447,6 +1448,7 @@ Notes:
 | `Slots[Cursor] = NextSlot();` | The right side of `=` or `op=` runs first, then the destination (object, array, index, map key) is located, as C++17 requires. This stores at the new Cursor. | Yes |
 | `GetPeer()->SetCursor(SwapPeerInline());` | The object a call runs on is evaluated before its arguments. When an argument needs statements of its own that could change the object, the object is saved into a local first. The same holds for `E1[E2]`, a container method's container and a dispatcher's Broadcast. | Yes |
 | `Bump() * 100 + BumpInline()`, `Pair(Bump(), BumpInline())` | An operand or argument that needs statements (an inline call, `&&`, `\|\|`, `?:`, a `++` or `op=` value, a pointer read) runs before the whole expression or call. C++ leaves this order unspecified. | Yes |
+| `FIntPoint P = {Bump(), M ? N : 0};` | A struct literal's members run left to right, each once, as C++ requires of braces: each computed member is its own statement. | Yes |
 
 ```cpp
 TArray<int32> Slots;
@@ -5511,10 +5513,6 @@ and where the feature is described. In each group, the messages you are most lik
   whole-struct literal cannot hold, such as weak pointers, delegates or bitfields. The SDK gives such structs no
   constructor that takes every member, so clang usually refuses the call first. Fix: designated braces, as the message
   shows, `FHitResult H = { .Time = 0.5f };`. Members you leave out keep the struct's defaults. See [Structs](#structs).
-- `<Struct>::<Member> is Transient, which a struct literal cannot set: give it a constant, or set the member after`: a
-  whole-struct constructor call computes the value of a member the engine never writes from a struct literal. Fix: pass
-  a constant there (it is dropped with a warning), and set the member with its own statement if it matters. See
-  [Structs](#structs).
 - `<Struct> literal must give every field (<N>)`, `<Struct> takes one value per member (<N>), in declaration order:
   <Member>` and `<Type> has no member for value <N>`: rare. A struct value is built with a constructor call or braces
   that give a different number of values than the struct has members. Fix: designated braces that name the members you
