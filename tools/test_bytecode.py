@@ -4744,6 +4744,27 @@ refused('FuncIfaceMulticast', '', 'the IfmRoot::Ping it inherits is a multicast'
 print('ok  FuncIfaceMulticast: an interface function inherited as a multicast, which no override can call, is refused')
 
 
+def func_template_call():
+    """FuncTemplateCall: a member template's body is copied into each caller and read in the class it is written in.
+    `AuthOnly()` in Helper is a call by name from FtKid's Use, so on an FtKid it runs FtMid's override (7), as C++ does,
+    and FtKid, which declares no AuthOnly, gets no function of that name; `FuncTemplateCall::AuthOnly()` in HelperQ runs
+    FuncTemplateCall's (3) on an FtQKid. The inline Plain is the same call, read the same way."""
+    top = pending_asset('FuncTemplateCall')
+    p = lambda *cs: [os.path.join(os.path.dirname(top), c) for c in cs]
+    mid = p('FtMid', 'FuncTemplateCall')
+    kid, qkid = p('FtKid') + mid, p('FtQKid') + mid
+    for b in kid[:1] + qkid[:1] + mid[:1]: keeps_invariants(b)
+    assert 'AuthOnly' not in exports_of(kid[0]), exports_of(kid[0])
+    for chain, fn, want in ((kid, 'Use', 7), (kid, 'UsePlain', 7), (qkid, 'UseQ', 3), (qkid, 'AuthOnly', 7)):
+        fields = {'Seen': 0}
+        run_as(chain, fn, fields)
+        assert fields['Seen'] == want, (os.path.basename(chain[0]), fn, fields)
+
+
+pending('FuncTemplateCall: an unqualified call in a member template goes by name from each class it is copied into',
+        func_template_call)
+
+
 def ns_parent_call():
     """NsTest's Pistol: `Weapons::Rifle::Pull(Times)` in its own Pull runs Rifle's, however many parts the qualifier
     has (5 + 3, then + 100). By name it would be Pistol's own Pull, calling itself forever."""
