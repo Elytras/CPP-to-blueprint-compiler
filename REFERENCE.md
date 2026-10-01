@@ -2411,7 +2411,8 @@ Notes:
 | `SuperBase::ReceiveBeginPlay();` inside an override | Runs the parent's own implementation once and comes back: the editor's "Add call to parent function". Write the class you derive from; C++ has no `Super`. | Yes |
 | `AActor::ReceiveBeginPlay();` | Calls the engine's function. For a BlueprintImplementableEvent it does nothing, because there is no parent body. For a BlueprintNativeEvent it runs the C++ default. | Yes |
 | `SuperBase::Twice(1)` in a class that does not declare Twice | SuperBase's Twice, its body copied in: C++ runs that function without dispatch, so an object of a subclass that overrides Twice does not reach its own. | Yes |
-| The same call to a function whose body cannot be copied in: authority-only, cosmetic, an RPC, `noinline`, or one that waits | A call by name, with a warning: an object of a subclass that overrides the function runs its override. Blueprint calls a parent's function without dispatch only from a class that overrides it. Declare the method in your class too; then `Base::Method()` anywhere in the class runs Base's alone. | Warns |
+| The same call to a function whose body cannot be copied in: authority-only, cosmetic, a server or client RPC, `noinline`, one that waits, or any from a `UE_NO_OPTIMIZE` caller | SuperBase's function, without dispatch. Blueprint calls a parent's function that way only from a class that has its own function of that name, so AssetGen adds one to your class: an override of the method that only calls the nearest parent's version with the same arguments, compiled like one you write, with an override's flags and super. The call is then bound to SuperBase's function, and a subclass's override of the method overrides the added one. A call by name runs what it ran before: the added override passes it on, and the engine routes both calls the same way. | Yes |
+| The same call to a multicast RPC | A call by name, with a warning: an object of a subclass that overrides the function runs its override. On a server a multicast runs locally and is also sent, so an added override would send it once, then again when it calls the parent's. An override you declare yourself does that too, as an editor override that calls its parent does. | Warns |
 | `Other->SuperBase::Bump(1)` | Not what C++ does. The qualifier is recognised only on `this`, so this is a call by name that reaches Other's most derived Bump. | Not yet |
 
 ```cpp
@@ -2438,7 +2439,9 @@ public:
 
 Notes:
 
-- Inside an inline body, `Base::Method()` is judged from the class the body is written in.
+- Inside an inline body, `Base::Method()` is judged from the class the body is written in. No override is added for
+  a call there, since the body is copied into subclasses too: one whose body cannot be copied in goes by name, with
+  the warning.
 - A parent this source cooks has its body copied in, as a `final` method's is (see
   [Calling your own functions](#calling-your-own-functions)). An override of an engine event, such as
   ReceiveBeginPlay above, stays a call.
@@ -5625,10 +5628,16 @@ and where the feature is described. In each group, the messages you are most lik
   off. The name alone makes the override. See [Overrides and parent calls](#overrides-and-parent-calls).
 - `warning: <Class>::<Function>: <Base>::<Method>() is a call by name, which on an object of a subclass that
   overrides <Method> runs that override; to run <Base>'s alone, call it from an override of <Method> in <Class>`:
-  a qualified call from a class that does not declare the method, to one whose body cannot be copied in
-  (authority-only, cosmetic, an RPC, `noinline`, one that waits). Fix: declare the method in the class, calling
+  a qualified call, in an inline method, to a method its class does not declare and whose body cannot be copied in
+  (authority-only, cosmetic, an RPC, `noinline`, one that waits). Outside an inline method AssetGen adds the override
+  itself. Fix: move the call into a method that is not inline, or declare the method in the class, calling
   `<Base>::<Method>()`; the qualified call then runs Base's function alone. See
   [Calling the parent](#calling-the-parent).
+- `warning: <Class>::<Function>: <Base>::<Method>() is a call by name, which on an object of a subclass that
+  overrides <Method> runs that override: a multicast is called without dispatch only from an override of it, which on
+  a server sends it a second time`: the same qualified call, to a multicast RPC. An override that forwards would send
+  the multicast twice on a server, so none is added. Fix: none that keeps one send; call it by name, or move what
+  must run alone into a function that is not an RPC. See [Calling the parent](#calling-the-parent).
 - `warning: <Class>::<Function>: <Callee>'s reference parameter <Parm> is bound to <What>: Blueprint has no reference
   to it, so <Parm> gets a copy, stored back after the call`: a `T&` parameter is bound to a place Blueprint cannot pass
   by reference. `<What>` is `a map element` (`Add5(M[K])`), `a map element's member`, `` `C ? X : Y` `` or

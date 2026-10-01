@@ -4507,13 +4507,44 @@ def func_cosmetic_static():
 
 
 def func_qualified_call():
-    """FuncQualifiedCall: `QcParent::Plain()` and `QcParent::AuthOnly()` on a QcKid run QcParent's functions."""
-    chain = [pending_asset('FuncQualifiedCall', c) for c in ('QcKid', 'FuncQualifiedCall', 'QcParent')]
-    got = run_as(chain, 'CallParentPlain', {})
-    assert got == 5, 'QcParent::Plain() on a QcKid returned %r, QcKid\'s' % got
-    fields = {}
-    run_as(chain, 'CallParentAuth', fields)
-    assert fields.get('Seen') == 3, fields
+    """FuncQualifiedCall: `QcParent::Fn()` on a QcKid runs QcParent's Fn - copied in, or, for an authority-only, RPC or
+    noinline Fn or a UE_NO_OPTIMIZE caller, bound from the override of Fn the calling class gets, which forwards to
+    QcParent's. That override has QcParent's flags and is QcKid's super; a call by name runs what it ran before it."""
+    folder = os.path.dirname(asset('FuncQualifiedCall'))
+    chain = [os.path.join(folder, c) for c in ('QcKid', 'FuncQualifiedCall', 'QcParent')]
+    for b in chain: keeps_invariants(b)
+    for fn in ('CallParentPlain', 'CallParentPlainSlow'):
+        got = run_as(chain, fn, {})
+        assert got == 5, '%s: QcParent::Plain() on a QcKid returned %r' % (fn, got)
+    assert run_as(chain, 'CallParentKept', {}) == 2
+    for fn, fields, want in (('CallParentAuth', {}, 3), ('CallParentServer', {'Seen': 1}, 5)):
+        run_as(chain, fn, fields)
+        assert fields.get('Seen') == want, (fn, fields)
+    kid, mine, parent = (invariants.Package(b) for b in chain)
+    for fn in ('AuthOnly', 'ServerBump', 'Kept', 'Plain'):
+        sup = kid.struct(kid.find(fn)).super
+        assert kid.path(sup).endswith('FuncQualifiedCall.FuncQualifiedCall_C:' + fn), (fn, kid.path(sup))
+        got, want = mine.struct(mine.find(fn)).function_flags, parent.struct(parent.find(fn)).function_flags
+        assert got == want, 'FuncQualifiedCall::%s FunctionFlags %#x, QcParent\'s %#x' % (fn, got, want)
+    for objects, want in ((chain, 30), (chain[1:], 3)):     # `AuthOnly()`: the object's own, the forwarder's QcParent's
+        fields = {}
+        run_as(objects, 'CallAuth', fields)
+        assert fields.get('Seen') == want, (os.path.basename(objects[0]), fields)
+    assert run_as(chain[1:], 'Kept', {}, V=1) == 2
+
+
+def func_qualified_multicast():
+    """The same call to a multicast stays a call by name, with a warning: on a server a multicast runs here and is sent
+    (Local | Remote, Actor.cpp 4270-4278), so a forwarding override would send it, and its call to the parent's again."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, 'QcMulti.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/QcMulti");\n'
+                    'class QcMultiBase : public AActor {\npublic:\n  int32 Seen = 0;\n  UE_MULTICAST void Ping() { Seen = 1; }\n};\n'
+                    'class QcMulti : public QcMultiBase {\npublic:\n  void Use() { QcMultiBase::Ping(); }\n};\n')
+        proc = assetgen_compile([src, UEAPI, tmp])
+        assert proc.returncode == 0 and 'QcMultiBase::Ping() is a call by name' in proc.stdout and 'multicast' in proc.stdout, proc.stdout
+        assert 'Ping' not in exports_of(os.path.join(tmp, 'QcMulti')), exports_of(os.path.join(tmp, 'QcMulti'))
 
 
 def func_ancestor_iface():
@@ -4536,7 +4567,10 @@ func_local_defaults()
 print('ok  FuncLocalDefaults: FText / FTransform / FHitResult / defaulted-struct locals start constructed (FUNC_HasDefaults)')
 func_cosmetic_static()
 print('ok  FuncCosmeticStatic: ApplyDamage / PlaySound2D keep their callspace routing (not EX_CallMath)')
-pending('FuncQualifiedCall: Parent::Fn() is bound to the parent\'s function, not dispatched by name', func_qualified_call)
+func_qualified_call()
+print('ok  FuncQualifiedCall: Parent::Fn() runs the parent\'s function, copied in or bound from a forwarding override')
+func_qualified_multicast()
+print('ok  a qualified call to a multicast from a class without one warns and gets no forwarding override')
 func_ancestor_iface()
 print('ok  FuncAncestorIface: an override of a native ancestor\'s interface function links it as super (TriggerAI:OnMessageAI)')
 refused('FuncAncestorParams', '', 'OnMessageAI',

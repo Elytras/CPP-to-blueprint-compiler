@@ -529,6 +529,7 @@ struct FRecord
     std::map<std::string, std::string> Subobjects;  // `<X>__UeSubobject`: a native component -> "<name> <class path>" on this CDO
     std::map<std::string, std::string> TypeAliases; // `using Leaf = Game::...::Leaf;` in the class body
     std::set<std::string> FinalMethods;             // `virtual T F() final`: no subclass has an F of its own
+    std::set<std::string> Forwarders;               // Methods AssetGen declared, not the source: see SynthesizeForwarders
     const Json* Defaults = nullptr;                 // UE_DEFAULTS: the static-init block, never lowered
     bool bFinal = false;        // `class X final`: X has no subclass
     bool bIsLocal = false;      // UePackage == ModPackage/CppName: cooked here, published at its /Game path
@@ -1239,7 +1240,14 @@ private:
     /* The definition a call (Call, to the declaration clang picked, Picked) to In's Method may be expanded from in
        place of the call, or null. See LowerCall. */
     const Json* Expandable(const FRecord& In, const std::string& Method, const Json& Call, const Json* Picked) const;
+    /* The part of Expandable that holds for every call: In's definition of Method, or null when no call may copy it. */
+    const Json* CopyableDef(const FRecord& In, const std::string& Method) const;
     bool ResumesLater(const Json& N, std::set<const Json*>& Seen) const;
+    /* `Base::Fn()` from a class without an Fn of its own, to an Fn that is not copied in: an override of Fn declared in
+       that class, forwarding to the parent's, so that the call can be bound to Base's. Run once, before any Generate. */
+    void SynthesizeForwarders();
+    std::deque<Json> ForwarderDecls;            // their declarations, which the records point into
+    bool IsMulticast(const FRecord& R, const std::string& Method) const;
     /* A constant outside any function body, `constexpr int32 kMax = 40;` at namespace scope or static in a class, and an
        inline class variable, `static inline const TArray<FName> Tags = {...};`: decl id -> its VarDecl. It has no
        storage in a Blueprint, so nothing is cooked for it and a use is its value (LowerInlineVar). */
@@ -5488,9 +5496,17 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
             const Json* Obj = Callee ? Strip(First(*Callee)) : nullptr;
             if (Obj && Kind(*Obj) == "CXXThisExpr")
             {
+                /* A forwarder is no declaration of the source's: `AuthOnly()` in its class still names the inherited
+                   one, a call by name. Only a call written qualified, or the forwarder's own, binds through it, and only
+                   in its own class's code: an inline body copied into a subclass is that subclass's. */
+                std::optional<bool> bWrittenQualified;
+                auto Qualified = [&] {
+                    if (!bWrittenQualified) bWrittenQualified = Callee->value("forwards", false) || MemberQualifier(*Callee);
+                    return *bWrittenQualified;
+                };
                 for (const FRecord* A = Written; A && A != R && !bParentCall; A = A->Base.empty() ? nullptr : Find(A->Base))
-                    bParentCall = A->Methods.count(MethodName) != 0;
-                bQualified = !bParentCall && !R->IsNative() && MemberQualifier(*Callee);
+                    bParentCall = A->Methods.count(MethodName) != 0 && (!A->Forwarders.count(MethodName) || (A == Cur && Qualified()));
+                bQualified = !bParentCall && !R->IsNative() && Qualified();
             }
         }
         /* `final` (FinalOwner): the one version of the method every object the call can run on reaches, called as
@@ -5531,16 +5547,22 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
            name an object of a subclass that overrides Plain runs its own. Its body copied in is exactly that. A call
            bound to it is not a Blueprint's: the editor calls a parent's function without dispatch only from an override
            of it (K2Node_CallParentFunction), and binds no other call to a function a subclass can override (the
-           call_opcode_flags rule); so one that cannot be copied in (authority-only, an RPC, noinline) stays a call by
-           name, with a warning. */
+           call_opcode_flags rule); so one that cannot be copied in is a parent call above, from the override
+           SynthesizeForwarders declared, and one that has none stays a call by name, with a warning. */
         if (bQualified && Bound != R)
         {
             if (const Json* Def = bOnThis && !Out.bReceiverIsArg && CurLocals ? Expandable(*R, MethodName, CallExprNode, FullDecl) : nullptr)
                 return ExpandInline(CallExprNode, *Def, R->CppName + "::" + MethodName, true, BP, Out, Err);
-            printf("  warning: %s::%s: %s::%s() is a call by name, which on an object of a subclass that overrides %s runs "
-                   "that override; to run %s's alone, call it from an override of %s in %s\n", Cur->CppName.c_str(),
-                   CurFnName.c_str(), R->CppName.c_str(), MethodName.c_str(), MethodName.c_str(), R->CppName.c_str(),
-                   MethodName.c_str(), Written->CppName.c_str());
+            if (IsMulticast(*R, MethodName))
+                printf("  warning: %s::%s: %s::%s() is a call by name, which on an object of a subclass that overrides %s runs "
+                       "that override: a multicast is called without dispatch only from an override of it, which on a "
+                       "server sends it a second time\n", Cur->CppName.c_str(), CurFnName.c_str(), R->CppName.c_str(),
+                       MethodName.c_str(), MethodName.c_str());
+            else
+                printf("  warning: %s::%s: %s::%s() is a call by name, which on an object of a subclass that overrides %s runs "
+                       "that override; to run %s's alone, call it from an override of %s in %s\n", Cur->CppName.c_str(),
+                       CurFnName.c_str(), R->CppName.c_str(), MethodName.c_str(), MethodName.c_str(), R->CppName.c_str(),
+                       MethodName.c_str(), Written->CppName.c_str());
         }
 
         const std::string CalleePackage = PackageOf(*Called), CalleeName = ClassOf(*Called);
@@ -8392,14 +8414,30 @@ const FRecord* FCompiler::FinalOwner(const FRecord* Of, const std::string& Metho
    call does not match it, an overload's or another class's version with other parameters. */
 const Json* FCompiler::Expandable(const FRecord& In, const std::string& Method, const Json& Call, const Json* Picked) const
 {
+    const Json* Def = bCurNoOpt ? nullptr : CopyableDef(In, Method);
+    if (!Def || Def == CurFnDef || std::find(InlineStack.begin(), InlineStack.end(), Def) != InlineStack.end()) return nullptr;
+    auto Types = [](const Json& D) {
+        std::vector<std::string> T;
+        ForEach(D, [&](const Json& C) { if (Kind(C) == "ParmVarDecl") T.push_back(TypeOf(C)); });
+        return T;
+    };
+    if (Types(*Def).size() + 1 != (Call.contains("inner") ? Call["inner"].size() : 0)) return nullptr;
+    const Json* Decl = In.Methods.at(Method);
+    return Picked && Picked != Decl && Types(*Picked) != Types(*Decl) ? nullptr : Def;
+}
+
+/* A forwarder (SynthesizeForwarders) is one call to a function that could not be copied in, so it is not either. */
+const Json* FCompiler::CopyableDef(const FRecord& In, const std::string& Method) const
+{
     auto Decl = In.Methods.find(Method);
-    if (bCurNoOpt || !In.IsGenerated() || In.bIsStruct || In.bIsInterface || Decl == In.Methods.end() || IsInlineMethod(In, Method))
+    if (!In.IsGenerated() || In.bIsStruct || In.bIsInterface || Decl == In.Methods.end() || IsInlineMethod(In, Method)
+        || In.Forwarders.count(Method))
         return nullptr;
     auto DefIt = In.MethodDefs.find(Method);
     const Json* Def = DefIt != In.MethodDefs.end() ? DefIt->second : Decl->second;
     const Json* Body = nullptr;
     ForEach(*Def, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Body = &C; });
-    if (!Body || Def == CurFnDef || std::find(InlineStack.begin(), InlineStack.end(), Def) != InlineStack.end()) return nullptr;
+    if (!Body) return nullptr;
     for (const Json* D : { Decl->second, Def })
         if (HasAttr(*D, "NoInlineAttr") || IsNoOptDecl(*D)) return nullptr;
     for (const FRecord* A = &In; A; A = A->Base.empty() ? nullptr : Find(A->Base))
@@ -8410,15 +8448,148 @@ const Json* FCompiler::Expandable(const FRecord& In, const std::string& Method, 
         if (auto D = A->MethodDefs.find(Method); D != A->MethodDefs.end() && (NetFlagsOf(*D->second) || AccessFlagsOf(*D->second)))
             return nullptr;
     }
-    auto Types = [](const Json& D) {
-        std::vector<std::string> T;
-        ForEach(D, [&](const Json& C) { if (Kind(C) == "ParmVarDecl") T.push_back(TypeOf(C)); });
-        return T;
-    };
-    if (Types(*Def).size() + 1 != (Call.contains("inner") ? Call["inner"].size() : 0)) return nullptr;
-    if (Picked && Picked != Decl->second && Types(*Picked) != Types(*Decl->second)) return nullptr;
     std::set<const Json*> Seen;
     return HasGoto(*Body) || ResumesLater(*Body, Seen) ? nullptr : Def;
+}
+
+/* `QcParent::AuthOnly()` in a class W that has no AuthOnly of its own means QcParent's AuthOnly, whatever the object.
+   Its body copied in is that (LowerCall); one that is not (authority-only, an RPC, noinline, one that waits, or a
+   UE_NO_OPTIMIZE caller) must be a call bound to QcParent's function, and the editor binds a parent's function only
+   from a class that has its own function of that name, its override (K2Node_CallParentFunction; the call_opcode_flags
+   rule). So W gets one: `AuthOnly() { return <nearest>::AuthOnly(...); }`, the parameters passed on as they came, and
+   the qualified call then binds QcParent's. Generate compiles it like any override, so its flags and super are those an
+   editor override has, and a subclass's AuthOnly takes it as its super (FindEvent reads these records).
+   A call by name on a W object now runs the forwarder and, through it, what it ran before. GetFunctionCallspace answers
+   the same for both - a net function is asked by its root (Actor.cpp 4264-4268), the rest by flags the override
+   inherits - and a script function asks it as it starts (ProcessInternal, ScriptCore.cpp 1172-1182), so the second
+   ask changes nothing: Local runs both, Remote sends the forwarder, which the receiver runs. Except Local | Remote, a
+   multicast on a server (Actor.cpp 4270-4278): the forwarder would send it, and then the call in it again, so a
+   multicast keeps the call by name and its warning. So does a qualified call in an inline method, which is copied
+   into other classes too, one to a pure function, or past an inline or static one of that name; a `final` method has
+   no override, and a call to it is bound already (FinalOwner). */
+void FCompiler::SynthesizeForwarders()
+{
+    for (auto& [Key, W] : Records)
+    {
+        if (!W.IsGenerated() || W.bIsStruct || W.bIsInterface || W.bIsPatch || W.Base.empty()) continue;
+        std::map<std::string, const FRecord*> Wanted;      // method -> the nearest ancestor declaring it
+        auto Consider = [&](const Json& Call, bool bNoOpt) {
+            const Json* Callee = Strip(First(Call));
+            const Json* Obj = Callee && Kind(*Callee) == "MemberExpr" ? Strip(First(*Callee)) : nullptr;
+            if (!Obj || Kind(*Obj) != "CXXThisExpr") return;
+            const std::string Method = Name(*Callee);
+            const auto O = MethodOwner.find(Callee->value("referencedMemberDecl", std::string()));
+            const FRecord* R = O == MethodOwner.end() ? nullptr : Find(O->second);
+            if (!R || R == &W || R->IsNative() || W.Methods.count(Method) || Wanted.count(Method) || !IsSubclassOf(W, *R)) return;
+            const FRecord* Nearest = nullptr;
+            for (const FRecord* A = Find(W.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
+            {
+                if (A->FinalMethods.count(Method)) return;      // no subclass may have one (Generate)
+                if (auto M = A->Methods.find(Method); M != A->Methods.end() && !Nearest && IsSubclassOf(*A, *R))
+                {
+                    if (IsStaticDecl(*M->second) || IsInlineMethod(*A, Method) || M->second->value("pure", false)) return;
+                    Nearest = A;
+                }
+            }
+            if (!Nearest || (!bNoOpt && CopyableDef(*R, Method)) || IsMulticast(*R, Method)) return;
+            const Json& NearDecl = *Nearest->Methods.at(Method);
+            const auto NearDef = Nearest->MethodDefs.find(Method);
+            bool bNamed = true;
+            ForEach(NearDef != Nearest->MethodDefs.end() ? *NearDef->second : NearDecl,
+                    [&](const Json& P) { bNamed = bNamed && (Kind(P) != "ParmVarDecl" || !Name(P).empty()); });
+            if (bNamed && MemberQualifier(*Callee)) Wanted[Method] = Nearest;
+        };
+        for (const auto& [Method, Decl] : W.Methods)
+        {
+            if (IsStaticDecl(*Decl) || IsInlineMethod(W, Method)) continue;
+            const auto DefIt = W.MethodDefs.find(Method);
+            const Json& Def = DefIt != W.MethodDefs.end() ? *DefIt->second : *Decl;
+            const bool bNoOpt = IsNoOptDecl(*Decl) || IsNoOptDecl(Def);
+            std::function<void(const Json&)> Walk = [&](const Json& N) {
+                if (Kind(N) == "CXXMemberCallExpr") Consider(N, bNoOpt);
+                ForEach(N, Walk);
+            };
+            ForEach(Def, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Walk(C); });
+        }
+
+        /* The forwarder as clang would write it: the nearest declaration's type and parameters (its definition's names),
+           and a body of one call on this, each parameter passed as itself (a reference one as the place it names). The
+           call is marked `forwards`, which LowerCall reads as a qualified call (it has no source range to read). */
+        for (const auto& [Method, Nearest] : Wanted)
+        {
+            const Json& NearDecl = *Nearest->Methods.at(Method);
+            const auto NearDef = Nearest->MethodDefs.find(Method);
+            const std::string Id = "forwarder:" + W.CppName + "::" + Method;
+            auto Referent = [](Json Type) {
+                for (const char* Field : { "qualType", "desugaredQualType" })
+                    if (Type.contains(Field))
+                    {
+                        std::string T = Type[Field].get<std::string>();
+                        while (!T.empty() && (T.back() == '&' || T.back() == ' ')) T.pop_back();
+                        Type[Field] = T;
+                    }
+                return Type;
+            };
+            Json Parms = Json::array(), Args = Json::array();
+            Args.push_back({ { "kind", "MemberExpr" }, { "name", Method }, { "isArrow", true }, { "forwards", true },
+                             { "referencedMemberDecl", NearDecl.value("id", std::string()) },
+                             { "inner", Json::array({ { { "kind", "CXXThisExpr" }, { "implicit", true },
+                                                        { "type", { { "qualType", W.CppName + " *" } } } } }) } });
+            ForEach(NearDef != Nearest->MethodDefs.end() ? *NearDef->second : NearDecl, [&](const Json& P) {
+                if (Kind(P) != "ParmVarDecl") return;
+                Json Parm = P;
+                Parm["id"] = Id + "/" + Name(P);
+                Args.push_back({ { "kind", "DeclRefExpr" }, { "valueCategory", "lvalue" }, { "type", Referent(P["type"]) },
+                                 { "referencedDecl", { { "id", Parm["id"] }, { "kind", "ParmVarDecl" }, { "name", Name(P) },
+                                                       { "type", P["type"] } } } });
+                Parms.push_back(std::move(Parm));
+            });
+            /* The call's type is the function type's return part, `int32` of `int32 (int32) const`. */
+            Json RetType = Json::object();
+            for (const char* Field : { "qualType", "desugaredQualType" })
+                if (const Json T = NearDecl.value("type", Json::object()); T.contains(Field))
+                {
+                    std::string S = T[Field].get<std::string>();
+                    S = S.substr(0, S.find('('));
+                    while (!S.empty() && S.back() == ' ') S.pop_back();
+                    RetType[Field] = S;
+                }
+            Json Call = { { "kind", "CXXMemberCallExpr" }, { "valueCategory", "prvalue" }, { "type", RetType },
+                          { "inner", std::move(Args) } };
+            const bool bVoid = RetType.value("qualType", std::string()) == "void";
+            Json Stmt = bVoid ? std::move(Call) : Json{ { "kind", "ReturnStmt" }, { "inner", Json::array({ std::move(Call) }) } };
+            Parms.push_back({ { "kind", "CompoundStmt" }, { "inner", Json::array({ std::move(Stmt) }) } });
+            Json& F = ForwarderDecls.emplace_back(Json{ { "kind", "CXXMethodDecl" }, { "id", Id }, { "name", Method },
+                                                        { "type", NearDecl.value("type", Json::object()) },
+                                                        { "inner", std::move(Parms) } });
+            W.Methods[Method] = &F;
+            W.Forwarders.insert(Method);
+            MethodOwner[Id] = W.CppName;
+        }
+    }
+}
+
+/* A multicast wherever Method is declared from R up: a mod's marker, or a native or interface function's flags. */
+bool FCompiler::IsMulticast(const FRecord& R, const std::string& Method) const
+{
+    for (const FRecord* A = &R; A; A = A->Base.empty() ? nullptr : Find(A->Base))
+    {
+        std::vector<const FRecord*> Owners{ A };
+        for (const std::string& I : A->Interfaces)
+            for (const FRecord* IR : InterfaceChain(Find(I))) Owners.push_back(IR);
+        for (const FRecord* D : Owners)
+        {
+            auto M = D->Methods.find(Method);
+            if (M == D->Methods.end()) continue;
+            uint32 Flags = NetFlagsOf(*M->second);
+            if (auto Def = D->MethodDefs.find(Method); Def != D->MethodDefs.end()) Flags |= NetFlagsOf(*Def->second);
+            if (auto E = EventFlags.find(D->UePackage.substr(D->UePackage.rfind('/') + 1) + "." + D->UeName + "."
+                                         + UeNameOf(D, Method)); D->IsNative() && E != EventFlags.end())
+                Flags |= E->second;
+            if (Flags & FUNC_NetMulticast) return true;
+        }
+    }
+    return false;
 }
 
 /* Whether running N makes a latent call or an await of its own, itself or in an inline body it always expands: a call
@@ -13671,6 +13842,8 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         for (const auto& M : Entry.second.MethodDefs) NormalizePointers(const_cast<Json&>(*M.second));
         for (const auto& M : Entry.second.Inlines) NormalizePointers(const_cast<Json&>(*M.second));
     }
+    /* After that, as they copy the types it settled; before any Generate, as a subclass's super may be one. */
+    SynthesizeForwarders();
 
     /* A namespace is a folder (PathIn), so `Game::<the mod's own path>::X` is X's package, and a package name is
        case-blind. */
