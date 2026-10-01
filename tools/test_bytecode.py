@@ -4681,6 +4681,22 @@ pending('FuncInlineParent: Base::Fn() in an inline method binds Base\'s from eac
         func_inline_parent)
 
 
+def func_qualified_self():
+    """FuncQualifiedSelf: `FuncQualifiedSelf::H()` in the class's own code runs its own H on an SqKid too, which
+    overrides H: H's body is copied in. Auth's cannot be (authority-only), and a call bound to a function a subclass
+    can override is no Blueprint's, so that one stays a call by name, with a warning."""
+    kid = pending_asset('FuncQualifiedSelf', 'SqKid')
+    chain = [kid, os.path.join(os.path.dirname(kid), 'FuncQualifiedSelf')]
+    for b in chain: keeps_invariants(b)
+    got = run_as(chain, 'CallH', {})
+    assert got == 5, 'FuncQualifiedSelf::H() on an SqKid returned %r' % got
+    log = LOGS['FuncQualifiedSelf']
+    assert 'FuncQualifiedSelf::Auth() is a call by name' in log and 'FuncQualifiedSelf::H()' not in log, log
+
+
+pending('FuncQualifiedSelf: Self::Fn() in its own class runs its own Fn, copied in, or warns', func_qualified_self)
+
+
 # ---- OPERANDS: operands the VM resolves against the object they run on - jumps, instance variables, calls by name,
 # field paths, object operands, arity, out and reference arguments (invariant_rules/operands.py)
 
