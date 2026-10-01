@@ -1305,6 +1305,9 @@ private:
        `inline` may sit on the declaration or on an out-of-line definition. */
     bool IsInlineMethod(const FRecord& R, const std::string& Method) const;
     bool CheckMemberNames(const FRecord& R, std::string* Err) const;
+    bool IsSceneRecord(const FRecord* C) const;
+    bool RootInheritedBy(const FRecord& R) const;
+    bool ListsDefaultRootOf(const FRecord& R) const;
     bool ExpandInline(const Json& CallNode, const Json& Def, const std::string& Method, bool bMethod, FBlueprintClass& BP,
                       FCallIR& Out, std::string* Err, const Json* Receiver = nullptr, bool bStaticCall = false);
     /* `final`: the class holding the version of Method a call by name reaches on every object of class Of or below,
@@ -8769,6 +8772,56 @@ bool FCompiler::IsInlineMethod(const FRecord& R, const std::string& Method) cons
    editor refuses a duplicate function and renames a clashing variable (KismetCompiler.cpp 570-616, 1737-1747); here
    each is refused: two members of one name (overloads included, inline ones aside, which are no UFunction), two that
    differ only in case, and a member reusing an inherited name - save a function overriding one of the same spelling. */
+/* Whether C is a scene component class: it or a class above it is USceneComponent. */
+bool FCompiler::IsSceneRecord(const FRecord* C) const
+{
+    for (; C; C = C->Base.empty() ? nullptr : Find(C->Base)) if (C->UeName == "SceneComponent") return true;
+    return false;
+}
+
+/* Whether R's actor already has a root when R's SCS runs, so that no component of R's is the root and R's SCS lists no
+   DefaultSceneRoot node: a Blueprint parent's SCS always leaves one (SimpleConstructionScript.cpp 690-702), and a native
+   parent sets one in its constructor (Character.cpp 59) or ExecuteConstruction takes its first unattached native scene
+   component (ActorConstruction.cpp 736-746). The first own scene component then attaches under it (ExecuteScriptOnActor,
+   686) and keeps its transform like the rest. Generate reads it for the class it builds. */
+bool FCompiler::RootInheritedBy(const FRecord& R) const
+{
+    for (const FRecord* A = R.Base.empty() ? nullptr : Find(R.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
+    {
+        if (!A->IsNative() || (A->UeName.size() > 2 && A->UeName.compare(A->UeName.size() - 2, 2, "_C") == 0)) return true;
+        for (const auto& [Member, Spec] : A->Subobjects)
+            if (Spec.rfind('.') != std::string::npos && IsSceneRecord(Find("U" + Spec.substr(Spec.rfind('.') + 1)))) return true;
+    }
+    return false;
+}
+
+/* Whether mod class R's SCS lists the DefaultSceneRoot node, as FBlueprintClass::ListsDefaultRoot decides it when R is
+   generated: an actor whose root no ancestor provides, each of whose own scene components UE_DEFAULTS' SetupAttachment
+   places (under another, or under RootComponent), so none is left to be the root. Generate asks it of a subclass's mod
+   ancestors, whose own generation it does not see. */
+bool FCompiler::ListsDefaultRootOf(const FRecord& R) const
+{
+    bool bActor = false;
+    for (const FRecord* A = &R; A && !bActor; A = A->Base.empty() ? nullptr : Find(A->Base)) bActor = A->UeName == "Actor";
+    if (!bActor || R.IsNative() || RootInheritedBy(R)) return false;
+    std::set<std::string> Placed;
+    if (R.Defaults)
+        ForEach(*R.Defaults, [&](const Json& Body) {
+            if (Kind(Body) != "CompoundStmt") return;
+            ForEach(Body, [&](const Json& S) {
+                const Json *Callee = nullptr, *Child = nullptr, *Parent = nullptr, *Socket = nullptr;
+                if (AttachmentCall(S, Callee, Child, Parent, Socket) && Kind(*Child) == "MemberExpr") Placed.insert(Name(*Child));
+            });
+        });
+    for (const Json* F : R.Fields)
+    {
+        if (!R.Components.count(Name(*F)) || Placed.count(Name(*F))) continue;
+        const size_t Star = TypeOf(*F).find('*');
+        if (Star != std::string::npos && IsSceneRecord(Find(StripTypeKeywords(TypeOf(*F).substr(0, Star))))) return false;
+    }
+    return true;
+}
+
 bool FCompiler::CheckMemberNames(const FRecord& R, std::string* Err) const
 {
     std::map<std::string, std::pair<std::string, bool>> Own;       // lower-case name -> (as written, is a function)
@@ -8797,15 +8850,8 @@ bool FCompiler::CheckMemberNames(const FRecord& R, std::string* Err) const
     for (const std::string& C : R.Components)
         if (Lower(C) == "defaultsceneroot")
         { *Err = R.CppName + "::" + C + ": DefaultSceneRoot is the root the construction script adds; rename the component"; return false; }
-    /* ...and the class's variable that holds it, where the SCS lists it (Generate): an actor's member of that name would
-       be a second variable of one name, or, in a subclass, the one FindFProperty finds first, which ExecuteNodeOnActor
-       then stores the root in (SCS_Node.cpp 159-170). */
-    bool bActor = false;
-    for (const FRecord* A = &R; A && !bActor; A = A->Base.empty() ? nullptr : Find(A->Base)) bActor = A->UeName == "Actor";
-    for (const Json* F : R.Fields)
-        if (bActor && Lower(Name(*F)) == "defaultsceneroot")
-        { *Err = R.CppName + "::" + Name(*F) + ": DefaultSceneRoot is the variable of the root an actor's construction script "
-                 "adds; rename it"; return false; }
+    /* (A member named like the variable that holds that root is Generate's to refuse, which knows whether the SCS lists
+       the node.) */
     for (const FRecord* A = R.Base.empty() ? nullptr : Find(R.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
         for (const auto& [Member, Spec] : A->Subobjects)
             for (const std::string& C : R.Components)
@@ -13110,22 +13156,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
        would need its own, so that is only warned about. ponytail: a negative scale takes FTransform's matrix path
        and an absolute child ignores its parent; neither is special-cased here. */
     {
-        auto IsScene = [&](const FRecord* C) {
-            for (; C; C = C->Base.empty() ? nullptr : Find(C->Base)) if (C->UeName == "SceneComponent") return true;
-            return false;
-        };
-        /* No root of this class's in a subclass whose actor already has one when its SCS runs: a Blueprint parent's SCS
-           always leaves one (SimpleConstructionScript.cpp 690-702), and a native parent sets one in its constructor
-           (Character.cpp 59) or ExecuteConstruction takes its first unattached native scene component (ActorConstruction.cpp
-           736-746). The first own scene component then attaches under it (ExecuteScriptOnActor, 686) and keeps its
-           transform like the rest. */
-        bool bRootInherited = false;
-        for (const FRecord* A = R.Base.empty() ? nullptr : Find(R.Base); A && !bRootInherited; A = A->Base.empty() ? nullptr : Find(A->Base))
-        {
-            bRootInherited = !A->IsNative() || (A->UeName.size() > 2 && A->UeName.compare(A->UeName.size() - 2, 2, "_C") == 0);
-            for (const auto& [Member, Spec] : A->Subobjects)
-                bRootInherited = bRootInherited || (Spec.rfind('.') != std::string::npos && IsScene(Find("U" + Spec.substr(Spec.rfind('.') + 1))));
-        }
+        auto IsScene = [&](const FRecord* C) { return IsSceneRecord(C); };
+        const bool bRootInherited = RootInheritedBy(R);
         BP.SetRootInherited(bRootInherited);      // and its DefaultSceneRoot node is listed nowhere
         std::vector<std::pair<std::string, const FRecord*>> Scene;     // the root, then the components attached to it
         for (const Json* F : R.Fields)
@@ -13370,7 +13402,24 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     /* Where the SCS lists its DefaultSceneRoot node, the class has a variable of that name, as the editor gives every node
        it lists one (KismetCompiler.cpp 884-898; ENE_EnemySpawner's DefaultSceneRoot, BlueprintVisible | NonTransactional
        | InstancedReference): ExecuteNodeOnActor stores the component there, and with none logs on every spawn that it
-       found no such property (SCS_Node.cpp 159-178). First, where the editor's sits among the class's variables. */
+       found no such property (SCS_Node.cpp 159-178). First, where the editor's sits among the class's variables.
+       A member of that name here would be a second variable of one name, and one below a mod class that lists the node
+       would hide that class's (an object property is the one ExecuteNodeOnActor finds first and stores the root in,
+       SCS_Node.cpp 164; any other is a variable named like a super's, which the editor renames, member_names_distinct).
+       Where neither lists it, a member of that name is a member like any other: no variable of the engine's has it. */
+    const FRecord* RootLister = nullptr;
+    for (const FRecord* A = R.Base.empty() ? nullptr : Find(R.Base); A && !RootLister; A = A->Base.empty() ? nullptr : Find(A->Base))
+        if (!A->IsNative() && ListsDefaultRootOf(*A)) RootLister = A;
+    for (const auto& V : ClassVars)
+    {
+        if (Lower(V.second.Name) != "defaultsceneroot") continue;
+        if (BP.ListsDefaultRoot())
+        { *Err = R.CppName + "::" + V.second.Name + ": DefaultSceneRoot is the variable of the root an actor's construction "
+                 "script adds, and this class has no scene component of its own left to be that root; rename it"; return false; }
+        if (RootLister)
+        { *Err = R.CppName + "::" + V.second.Name + ": DefaultSceneRoot is the variable of the root " + RootLister->CppName
+                 + "'s construction script adds, which a variable of that name here would hide; rename it"; return false; }
+    }
     if (BP.ListsDefaultRoot())
     {
         FPropertyDef PD;

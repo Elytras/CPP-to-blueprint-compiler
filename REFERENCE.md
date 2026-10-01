@@ -5811,9 +5811,15 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   `AddComponentByClass`, or `AddComponentByType<T>(Owner)`. See [Components](#components).
 - `<Class>::DefaultSceneRoot: DefaultSceneRoot is the root the construction script adds; rename the component`: the
   name is taken by the root the engine adds to a class with no scene component of its own. Fix: rename it.
-- `<Class>::DefaultSceneRoot: DefaultSceneRoot is the variable of the root an actor's construction script adds; rename
-  it`: a member of that name in an actor class. The construction script stores the default scene root in the variable
-  named DefaultSceneRoot that it finds first, which would be this one. Fix: rename it.
+- `<Class>::DefaultSceneRoot: DefaultSceneRoot is the variable of the root an actor's construction script adds, and
+  this class has no scene component of its own left to be that root; rename it`: a member of that name in an actor
+  class that gets the DefaultSceneRoot node (no scene component of its own takes the root, none inherited): the class
+  already has a variable of that name, which the construction script stores the root in. Fix: rename it. Where a scene
+  component of the class's own is the root, no such variable exists and the member is a member like any other.
+- `<Class>::DefaultSceneRoot: DefaultSceneRoot is the variable of the root <Ancestor>'s construction script adds, which
+  a variable of that name here would hide; rename it`: a member of that name below a mod class that gets the
+  DefaultSceneRoot node. An object variable here would be the one the root is stored in, the ancestor's left empty;
+  any other would be a variable named like its parent's, which the editor never builds. Fix: rename it.
 - `<Class>::<Component>: <Ancestor> already has a default subobject <Name> (its <Member>); rename the component`: a
   component named like a native parent's own component, such as `CharacterMesh0` or `CollisionCylinder` under an
   ACharacter. The engine finds the objects under an actor by name. Fix: rename it; to change the native one, set

@@ -6755,27 +6755,28 @@ comp_root_variable()
 
 
 def comp_root_member():
-    """A member named DefaultSceneRoot is refused only where the root's variable would be misread: on a class whose SCS
-    lists the DefaultSceneRoot node (a second variable of one name, whatever its type), or as an object property below a
-    mod class that lists it, which FindFProperty<FObjectPropertyBase> finds before the parent's (SCS_Node.cpp 164).
-    CompRootMember's Body takes the root, so it lists no node and keeps its int32; RootMemberKid's int32 is no object
-    property, and RootMemberBase's variable still holds the root."""
-    base = pending_asset('CompRootMember')
-    for cls, root, value in (('CompRootMember', 'Body', 5), ('RootMemberKid', 'DefaultSceneRoot', 7)):
+    """A member named DefaultSceneRoot is refused only where it meets the root's variable: on a class whose SCS lists
+    the DefaultSceneRoot node (a second variable of one name, whatever its type), and below a mod class that lists it,
+    where an object property is the one ExecuteNodeOnActor finds first and stores the root in (SCS_Node.cpp 164) and
+    any other a variable named like a super's (member_names_distinct). CompRootMember's Body takes the root, so it lists
+    no node and keeps its int32, and so does RootMemberKid, below it."""
+    base = asset('CompRootMember')
+    for cls in ('CompRootMember', 'RootMemberKid'):
         b = os.path.join(os.path.dirname(base), cls)
-        got, attach, made, stored = construct(b)
-        assert got == root and stored.get(root), '%s: root %s, stored %s' % (cls, got, stored)
-        cdo = dump('dumptags.py', b, str(exports_of(b).index('Default__%s_C' % cls)))
-        assert 'DefaultSceneRoot [0] IntProperty size=4: %d' % value in cdo, (cls, cdo)
+        root, attach, made, stored = construct(b)
+        assert root == 'Body' and all(stored.values()) and 'DefaultSceneRoot' not in made, (cls, root, made, stored)
         keeps_invariants(b)
+    cdo = dump('dumptags.py', base, str(exports_of(base).index('Default__CompRootMember_C')))
+    assert 'DefaultSceneRoot [0] IntProperty size=4: 5' in cdo, cdo
     refused('RootMemberLists', '  int32 DefaultSceneRoot;\n', 'the variable of the root')
-    refused('RootMemberObject', '', 'the variable of the root',
-            'class RootObjBase : public AActor {\npublic:\n  int32 Count;\n};\n'
-            'class RootObjKid : public RootObjBase {\npublic:\n  USceneComponent* DefaultSceneRoot;\n};\n')
+    for member in ('USceneComponent* DefaultSceneRoot;', 'int32 DefaultSceneRoot;'):
+        refused('RootMemberBelow', '', 'the variable of the root RootBelowBase\'s construction script adds',
+                'class RootBelowBase : public AActor {\npublic:\n  int32 Count;\n};\n'
+                'class RootBelowKid : public RootBelowBase {\npublic:\n  %s\n};\n' % member)
 
 
-pending('CompRootMember: a member named DefaultSceneRoot is refused only where the root\'s variable would be misread',
-        comp_root_member)
+comp_root_member()
+print('ok  CompRootMember: a member named DefaultSceneRoot is refused only where it meets the root\'s variable')
 
 
 def comp_attach_inherited():
