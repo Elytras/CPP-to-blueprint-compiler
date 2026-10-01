@@ -2656,7 +2656,7 @@ Notes:
 | `UE_COMPONENT(USceneComponent, Root);` as the first scene component | Becomes the actor's root. | Yes |
 | a later scene component | Attaches directly to the root, unless `SetupAttachment` places it. | Yes |
 | a component that is not a scene component, such as `UProjectileMovementComponent` | Is created with no attachment, wherever it is declared. | Yes |
-| no `UE_COMPONENT` at all | The actor gets the engine's default scene root. | Yes |
+| no `UE_COMPONENT` at all | The actor gets the default scene root, as in the editor: a `USceneComponent` named DefaultSceneRoot, made by the class's construction script, which a reference can name across the network. Below a parent that gives the actor a root already, it gets none. | Yes |
 | only components that are not scene components | The actor gets the engine's default scene root too, as in the editor, so a movement component has a root to move. Below a parent that gives the actor a root already, a Blueprint parent or a native one such as ACharacter (its capsule), it gets none, as in the editor. | Yes |
 | `UE_DEFAULTS { Tip->SetupAttachment(Glow); }`, Glow another `UE_COMPONENT` of the class | Tip attaches to Glow, as in a C++ constructor: in the construction script it is one of Glow's child nodes. It keeps its own location, rotation and scale, relative to Glow. | Yes |
 | `Tip->SetupAttachment(Glow, FName("Muzzle"));` | The same at a socket or bone of Glow (the node's AttachToName). The socket is a literal name or none; a variable or a call there is refused, since it would be dropped. | Yes |

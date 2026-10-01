@@ -6130,7 +6130,7 @@ def comp_no_components():
     DefaultSceneRoot and net addressable (SCS_Node.cpp 99, 107). With neither list ExecuteScriptOnActor makes a plain
     SceneComponent instead (SimpleConstructionScript.cpp 690-702), which nothing marks net addressable, so no reference
     to it crosses the network (ActorComponent.cpp 1901-1913). NoCompKid's Lamp attaches to that root, 40 above it."""
-    base = pending_asset('CompNoComponents')
+    base = asset('CompNoComponents')
     for cls, attached in (('CompNoComponents', {}), ('NoCompKid', {'Lamp': 'DefaultSceneRoot'})):
         b = os.path.join(os.path.dirname(base), cls)
         root, attach, made, stored = construct(b)
@@ -6139,9 +6139,11 @@ def comp_no_components():
         keeps_invariants(b)
     p, ci = class_pkg(os.path.join(os.path.dirname(base), 'NoCompKid'))
     assert world_location(p, ci, 'Lamp') == (0.0, 0.0, 40.0), world_location(p, ci, 'Lamp')
+    print('ok  CompNoComponents: an actor with no components gets the DefaultSceneRoot node as its root, as in the '
+          'editor')
 
 
-pending('CompNoComponents: an actor with no components gets the DefaultSceneRoot node as its root', comp_no_components)
+comp_no_components()
 
 
 def comp_attach_inherited():

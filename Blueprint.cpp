@@ -450,15 +450,17 @@ void FBlueprintClass::Finish()
     const FIndex ScsNodeCdo = ClassDefaultObject("/Script/Engine", "SCS_Node");
     const FIndex ScsCdo = ClassDefaultObject("/Script/Engine", "SimpleConstructionScript");
 
-    /* Components, none of them a scene component, and no root inherited: the DefaultSceneRoot node stays listed, first,
-       as the editor keeps it until a scene component can take its place. ExecuteScriptOnActor makes a root of its own
-       only when RootNodes is empty (SimpleConstructionScript.cpp 640-703), so an actor of movement components alone would
-       otherwise end its construction with no RootComponent. An actor that has a root before this SCS runs would skip the
-       node (648), and the editor drops it from both lists then (ValidateSceneRootNodes, 1132-1150: a native root or
-       scene component, or a scene root node of a parent Blueprint's, GetSceneRootComponentTemplate 1029-1108), as all
-       1,885 of the game's SCS classes have it. Listed, it is a node like any other: its own VariableGuid is what a
-       subclass's override of it is keyed on. */
-    const bool bKeepDefaultRoot = !bRootInherited && !Components.empty()
+    /* No scene component of the class's own and no root inherited: the DefaultSceneRoot node stays listed, first, as the
+       editor keeps it until a scene component can take its place, with no component at all too (40 of the game's
+       classes, ENE_EnemySpawner). ExecuteScriptOnActor makes a root of its own only when RootNodes is empty
+       (SimpleConstructionScript.cpp 640-703): an actor of movement components alone would end its construction with no
+       RootComponent, and one of no components would get a plain SceneComponent, not net addressable as a node's
+       component is (SCS_Node.cpp 107, ActorComponent.cpp 1901-1913). An actor that has a root before this SCS runs
+       would skip the node (648), and the editor drops it from both lists then (ValidateSceneRootNodes, 1132-1150: a
+       native root or scene component, or a scene root node of a parent Blueprint's, GetSceneRootComponentTemplate
+       1029-1108), as all 1,885 of the game's SCS classes have it. Listed, it is a node like any other: its own
+       VariableGuid is what a subclass's override of it is keyed on. */
+    const bool bKeepDefaultRoot = !bRootInherited
                                   && std::none_of(Components.begin(), Components.end(), [](const FComponent& C) { return C.bIsScene; });
     uint32 DefaultRootGuid[4];
     ScsNodeGuid(ClassName, "DefaultSceneRoot", DefaultRootGuid);
@@ -610,8 +612,8 @@ void FBlueprintClass::Finish()
     Scs.Serialize = [=](FArc& Ar) {
         /* DefaultSceneRoot stays declared but drops out of both lists once a component can be the
            root, or the actor has one already, exactly as Ene_Butterfly saves it (while neither, it is in
-           both: bKeepDefaultRoot); with no components at all the lists are absent and
-           ExecuteScriptOnActor makes its own root. */
+           both: bKeepDefaultRoot). The lists are absent only when both are empty: a subclass's SCS
+           with no component, below an inherited root. */
         if (!All.empty())
         {
             Tag(Ar, "RootNodes", "ArrayProperty", [=](FArc& V) {
