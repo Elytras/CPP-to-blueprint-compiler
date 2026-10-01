@@ -3959,6 +3959,31 @@ def ueapi_too_old():
 pending('UeApi stamp: a UeApi older than the compiler is refused, not compiled against', ueapi_too_old)
 
 
+def subobject_bomber():
+    """SubobjectBomber restates two of ABomber's own members that two default subobjects each fit, neither named for
+    the member: GooSoundComponent is GooAudioComponent, AcidEmitterLeft is GooEmitterLeft, as the game's ENE_Bomber_C
+    default object says. Each override is an export of the subobject's name under the class's CDO, archetyped on
+    Default__Bomber's subobject, and the CDO's tag of the member names it."""
+    import struct
+    base = pending_asset('SubobjectBomber')
+    pkg = invariants.Package(base)
+    cdo = pkg.find('Default__SubobjectBomber_C')
+    for member, sub, value in (('GooSoundComponent', 'GooAudioComponent', ('VolumeMultiplier', 0.5)),
+                               ('AcidEmitterLeft', 'GooEmitterLeft', ('SecondsBeforeInactive', 2.0))):
+        k = next((k for k, e in enumerate(pkg.exports) if e['name'] == sub and e['outer'] == cdo + 1), None)
+        assert k is not None, 'no %s export under the CDO for %s' % (sub, member)
+        assert pkg.path(pkg.exports[k]['tmpl']) == '/Script/FSD.Default__Bomber:' + sub, pkg.path(pkg.exports[k]['tmpl'])
+        t = pkg.tag(cdo, member)
+        assert t and struct.unpack_from('<i', t['value'])[0] == k + 1, (member, t)
+        t = pkg.tag(k, value[0])
+        assert t and struct.unpack_from('<f', t['value'])[0] == value[1], (sub, value[0], t)
+    keeps_invariants(base)
+
+
+pending('SubobjectBomber: a member two subobjects fit, neither named for it, overrides the one the game\'s Blueprint '
+        'says', subobject_bomber)
+
+
 # ---- TABLES: the package's own tables - names and their numbers, imports, exports, archetypes
 # (invariant_rules/tables.py)
 
