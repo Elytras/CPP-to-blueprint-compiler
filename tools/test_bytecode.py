@@ -3938,6 +3938,27 @@ pending('PreloadNestedKid: a child of a game Blueprint is serialized after its p
         preload_nested_kid)
 
 
+def ueapi_too_old():
+    """A UeApi that a genueapi older than the compiler wrote is refused, saying to regenerate it, before the compile
+    reads any of it: one made before UeDefaultSubobjects compiles a game Blueprint's child with none of the ordering
+    edges above, and says nothing. Here a UeApi with no Version.json (any made before genueapi stamped one) and one
+    stamped 0."""
+    import tempfile
+    src = os.path.join(TESTS, 'PreloadCaseKid.cpp')
+    for stamp in (None, '{"genueapi": 0}\n'):
+        with tempfile.TemporaryDirectory() as tmp:
+            stale = os.path.join(tmp, 'UeApi')
+            os.makedirs(stale)
+            if stamp:
+                with open(os.path.join(stale, 'Version.json'), 'w', encoding='utf-8') as f: f.write(stamp)
+            proc = assetgen_compile([src, stale, os.path.join(tmp, 'out')])
+            assert proc.returncode != 0 and 'older genueapi' in proc.stdout and 'regenerate' in proc.stdout, \
+                (stamp, proc.stdout[-500:])
+
+
+pending('UeApi stamp: a UeApi older than the compiler is refused, not compiled against', ueapi_too_old)
+
+
 # ---- TABLES: the package's own tables - names and their numbers, imports, exports, archetypes
 # (invariant_rules/tables.py)
 
