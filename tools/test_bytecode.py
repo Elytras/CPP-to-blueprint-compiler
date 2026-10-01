@@ -657,6 +657,7 @@ def refused(mod, body, why, top=''):
 PENDING = os.path.join(TESTS, 'pending')
 GAPS, FIXED, REFUSALS = [], [], {}
 KNOWN_RULES = {     # sweep rules the suite's own packages still break, each with the AssetGen defect (TODO.md, S33)
+    'enum_tag_encoding': 'TODO.md S33, Enums: an empty array / set / map tag of enums reads as undecodable',
 }
 
 
@@ -6444,8 +6445,9 @@ def prop_enum_class():
     override's parameter, which then has its native parent's type (FEnumProperty::SameType, EnumProperty.cpp 395-398). A
     namespaced enum (EAttachLocation) stays a ByteProperty. Its tags - the CDO's, a UE_DEFAULTS one on a native
     EnumProperty member, an array's and a map's, a UserDefinedStruct's default and a native struct's member - are
-    EnumProperty tags (the GetID(), PropertyTag.cpp 17, 30-36) naming the enum and holding the enumerator's FName. Its
-    values run as bytes: a switch, a compare, a cast, a map lookup and a native struct literal."""
+    EnumProperty tags (the GetID(), PropertyTag.cpp 17, 30-36) naming the enum and holding the enumerator's FName; an
+    empty array, set or map of it, its counts alone. Its values run as bytes: a switch, a compare, a cast, a map lookup
+    and a native struct literal."""
     import invariants, runvm
     base = asset('PropEnumClass')
     folder = os.path.dirname(base)
@@ -6478,6 +6480,10 @@ def prop_enum_class():
     assert is_enum_class(member, rule_enum, slot), 'the UE_STRUCT member is a %s' % member.type
     t = next(t for t in slot.struct(0).defaults if t['name'].startswith('Rule_'))
     assert (t['type'], t['enum'], fname_at(slot.names, t['value'], 0)) == ('EnumProperty', 'EAttachmentRule', 'eattachmentrule::snaptotarget'), t
+    # Its empty array, set and map of the enum: the default instance tags each with its counts alone.
+    empty = {t['name'].split('_')[0]: t['value'] for t in slot.struct(0).defaults
+             if t['name'].split('_')[0] in ('Vis', 'Met', 'Toll')}
+    assert empty == {'Vis': bytes(4), 'Met': bytes(8), 'Toll': bytes(8)}, empty
 
     cdo = pkg.find('Default__PropEnumClass_C')
     for name, enum, value in (('Rule', 'EAttachmentRule', 'keepworld'), ('Ability', 'EAbilityIndex', 'esecondary'),
