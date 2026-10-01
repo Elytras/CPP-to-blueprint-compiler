@@ -5124,7 +5124,7 @@ def func_iface_unnamed():
     An inherited function of another signature, or a final one, cannot implement an interface function of its name,
     and the refusal says so in the interface's terms; so does one of the class's own that the inherited one's
     signature would make its super's."""
-    kid = pending_asset('FuncIfaceUnnamed')
+    kid = asset('FuncIfaceUnnamed')
     root = os.path.join(os.path.dirname(kid), 'FiuRoot')
     assert 'call by name' not in LOGS['FuncIfaceUnnamed'], LOGS['FuncIfaceUnnamed']
     keeps_invariants(kid)
@@ -5147,8 +5147,9 @@ def func_iface_unnamed():
                 'class IsoKid : public IsoRoot, public IIsoTell {\npublic:\n  int32 Tell(int32 V) { return V; }\n};\n')
 
 
-pending('FuncIfaceUnnamed: an inherited function with an unnamed parameter is forwarded; one of another signature, '
-        'or final, is refused in the interface\'s terms', func_iface_unnamed)
+func_iface_unnamed()
+print('ok  FuncIfaceUnnamed: an inherited function with an unnamed parameter is forwarded; one of another signature, '
+      'or final, is refused in the interface\'s terms')
 
 
 def func_own_iface_final():

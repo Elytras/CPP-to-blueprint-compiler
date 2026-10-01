@@ -1332,8 +1332,9 @@ private:
     /* The class above R, cooked by this source, whose Method implements R's interface function of that name in C++:
        the nearest declaration from R's parent up, unless it is a native class's or `= 0`. Null when none. */
     const FRecord* InheritedImplementation(const FRecord& R, const std::string& Method) const;
-    /* Why no forwarder can call A's Method (static, a multicast, an unnamed parameter), or empty. */
-    std::string WhyNotForwarded(const FRecord& A, const std::string& Method) const;
+    /* Why no forwarder can call A's Method for the interface function IfaceDecl declares (static, a multicast, final,
+       of another signature), or empty. */
+    std::string WhyNotForwarded(const FRecord& A, const std::string& Method, const Json& IfaceDecl) const;
     /* What ParentClass->FindFunctionByName finds of Method above R, walked as FindEvent walks for a super: the class
        holding it and whether it is a static; {nullptr, false} for nothing. */
     std::pair<const FRecord*, bool> FoundAbove(const FRecord& R, const std::string& Method) const;
@@ -9023,12 +9024,7 @@ void FCompiler::SynthesizeForwarders()
                 }
             }
             if (!Nearest || (!bNoOpt && CopyableDef(*R, Method)) || IsMulticast(*R, Method)) return;
-            const Json& NearDecl = *Nearest->Methods.at(Method);
-            const auto NearDef = Nearest->MethodDefs.find(Method);
-            bool bNamed = true;
-            ForEach(NearDef != Nearest->MethodDefs.end() ? *NearDef->second : NearDecl,
-                    [&](const Json& P) { bNamed = bNamed && (Kind(P) != "ParmVarDecl" || !Name(P).empty()); });
-            if (bNamed && NamesQualified(*Callee, Written, *R, Method)) Wanted[Method] = Nearest;
+            if (NamesQualified(*Callee, Written, *R, Method)) Wanted[Method] = Nearest;
         };
         for (const auto& [Method, Decl] : W.Methods)
         {
@@ -9063,13 +9059,15 @@ void FCompiler::SynthesizeForwarders()
                 {
                     const std::string& Method = Entry.first;
                     if (Method == "StaticClass" || W.Methods.count(Method) || Wanted.count(Method)) continue;
-                    if (const FRecord* A = InheritedImplementation(W, Method); A && WhyNotForwarded(*A, Method).empty())
+                    if (const FRecord* A = InheritedImplementation(W, Method); A && WhyNotForwarded(*A, Method, *Entry.second).empty())
                         Wanted[Method] = A;
                 }
 
         /* The forwarder as clang would write it: the nearest declaration's type and parameters (its definition's names),
            and a body of one call on this, each parameter passed as itself (a reference one as the place it names). The
-           call is marked `forwards`, which LowerCall reads as a qualified call (it has no source range to read). */
+           call is marked `forwards`, which LowerCall reads as a qualified call (it has no source range to read). A
+           parameter the definition leaves unnamed is named P<its index>, `_` added while another parameter has that
+           name, as the editor's override names every pin; the parent's own function keeps its unnamed one. */
         for (const auto& [Method, Nearest] : Wanted)
         {
             const Json& NearDecl = *Nearest->Methods.at(Method);
@@ -9090,12 +9088,20 @@ void FCompiler::SynthesizeForwarders()
                              { "referencedMemberDecl", NearDecl.value("id", std::string()) },
                              { "inner", Json::array({ { { "kind", "CXXThisExpr" }, { "implicit", true },
                                                         { "type", { { "qualType", W.CppName + " *" } } } } }) } });
-            ForEach(NearDef != Nearest->MethodDefs.end() ? *NearDef->second : NearDecl, [&](const Json& P) {
+            const Json& Source = NearDef != Nearest->MethodDefs.end() ? *NearDef->second : NearDecl;
+            const std::vector<std::string> Given = ParmNames(Source);
+            size_t Index = 0;
+            ForEach(Source, [&](const Json& P) {
                 if (Kind(P) != "ParmVarDecl") return;
+                std::string PName = Name(P);
+                if (PName.empty())
+                    for (PName = "P" + std::to_string(Index); std::count(Given.begin(), Given.end(), PName);) PName += "_";
+                ++Index;
                 Json Parm = P;
-                Parm["id"] = Id + "/" + Name(P);
+                Parm["id"] = Id + "/" + PName;
+                Parm["name"] = PName;
                 Args.push_back({ { "kind", "DeclRefExpr" }, { "valueCategory", "lvalue" }, { "type", Referent(P["type"]) },
-                                 { "referencedDecl", { { "id", Parm["id"] }, { "kind", "ParmVarDecl" }, { "name", Name(P) },
+                                 { "referencedDecl", { { "id", Parm["id"] }, { "kind", "ParmVarDecl" }, { "name", PName },
                                                        { "type", P["type"] } } } });
                 Parms.push_back(std::move(Parm));
             });
@@ -9150,16 +9156,18 @@ const FRecord* FCompiler::InheritedImplementation(const FRecord& R, const std::s
     return nullptr;
 }
 
-std::string FCompiler::WhyNotForwarded(const FRecord& A, const std::string& Method) const
+/* A parameter with no name is passed on all the same: the forwarder names it (SynthesizeForwarders). A final function
+   or one of another signature is no function an override of the interface's can be: Generate refuses any function of
+   a final one's name below it, and callers through the interface pass the interface function's parameters. */
+std::string FCompiler::WhyNotForwarded(const FRecord& A, const std::string& Method, const Json& IfaceDecl) const
 {
     const Json& Decl = *A.Methods.at(Method);
     if (IsStaticDecl(Decl)) return "static";
     if (IsMulticast(A, Method)) return "a multicast, which an override calling it would send twice on a server";
-    const auto Def = A.MethodDefs.find(Method);
-    bool bNamed = true;
-    ForEach(Def != A.MethodDefs.end() ? *Def->second : Decl,
-            [&](const Json& P) { bNamed = bNamed && (Kind(P) != "ParmVarDecl" || !Name(P).empty()); });
-    return bNamed ? std::string() : "declared with a parameter that has no name, which an override cannot pass on";
+    for (const FRecord* X = &A; X; X = X->Base.empty() ? nullptr : Find(X->Base))
+        if (X->FinalMethods.count(Method)) return "final";
+    if (SignatureOf(Decl) != SignatureOf(IfaceDecl)) return TypeOf(Decl);
+    return {};
 }
 
 /* A multicast wherever Method is declared from R up: a mod's marker, or a native or interface function's flags. */
@@ -13589,15 +13597,23 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
        a stub would take over none of them; but the editor makes any function of its name in a subclass, the stub or
        one the source declares, an override of it (its super is ParentClass->FindFunctionByName, KismetCompiler.cpp
        1733-1774) and refuses one that is not static: "Check flags: Exec, Final, Static" (1855-1868). */
-    auto ReplacesInherited = [&](const std::string& I, const std::string& Fn) {
+    auto ReplacesInherited = [&](const std::string& I, const std::string& Fn, const Json& IfaceDecl) {
         const FRecord* A = InheritedImplementation(R, Fn);
-        const std::string Why = A ? WhyNotForwarded(*A, Fn) : std::string();
+        const std::string Why = A ? WhyNotForwarded(*A, Fn, IfaceDecl) : std::string();
         if (Why.empty()) return false;
         if (IsStaticDecl(*A->Methods.at(Fn)))
             *Err = R.CppName + " implements " + I + ", whose " + Fn + " needs a function of that name in " + R.CppName
                  + ", and the " + A->CppName + "::" + Fn + " it inherits is static: the editor takes such a function for "
                    "an override of the static and refuses it (\"Check flags: Exec, Final, Static\"); rename "
                  + A->CppName + "::" + Fn;
+        else if (Why == "final")
+            *Err = R.CppName + " implements " + I + ", whose " + Fn + " needs a function of that name in " + R.CppName
+                 + ", and the " + A->CppName + "::" + Fn + " it inherits is final, so no subclass may have one; rename "
+                 + A->CppName + "::" + Fn + ", or drop `final`";
+        else if (Why == TypeOf(*A->Methods.at(Fn)))
+            *Err = R.CppName + " implements " + I + ", whose " + Fn + " is " + TypeOf(IfaceDecl) + ", and the " + A->CppName
+                 + "::" + Fn + " it inherits is " + Why + ": a Blueprint class has one function of a name, and callers "
+                   "through " + I + " pass that one's parameters; rename " + A->CppName + "::" + Fn;
         else
             *Err = R.CppName + " implements " + I + ", and the " + A->CppName + "::" + Fn + " it inherits is " + Why
                  + ": no override can call it for " + I + ", and an empty one would replace it; declare " + R.CppName
@@ -13618,7 +13634,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             {
                 if (std::any_of(Methods.begin(), Methods.end(),
                                 [&](const FMethod& F) { return F.Name == M.first; })) continue;
-                if (ReplacesInherited(I, M.first)) return false;
+                if (ReplacesInherited(I, M.first, *M.second)) return false;
                 FMethod Fn{ M.first, M.second, M.second, nullptr };
                 Fn.Body = BodyOf(IR, M.first, Fn.Def);
                 Methods.push_back(Fn);
@@ -13637,7 +13653,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             auto Decl = IR.Methods.find(Name_);
             if (Decl == IR.Methods.end())
             { *Err = I + "::" + Name_ + " takes a type AssetGen cannot write yet, so " + R.CppName + " cannot implement " + I; return false; }
-            if (ReplacesInherited(I, Name_)) return false;
+            if (ReplacesInherited(I, Name_, *Decl->second)) return false;
             FMethod Fn{ Name_, Decl->second, Decl->second, nullptr };
             Fn.Body = BodyOf(IR, Name_, Fn.Def);
             Methods.push_back(Fn);
@@ -13939,6 +13955,15 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         if (Replaced && Replaced != &Decl && !R.bIsPatch && SignatureOf(*Replaced) != SignatureOf(Decl))     // a patch checks its own
         { *Err = R.CppName + "::" + Fn.Name + " is " + TypeOf(Decl) + ", and the " + Owner->CppName + "::" + Fn.Name
                  + " it replaces is " + TypeOf(*Replaced) + ": callers pass that one's parameters; declare the same"; return false; }
+        /* An implementation of an interface of the class's own list, whose name a mod ancestor's function has too: that
+           one is its super (FindEvent), so it replaces both, and a caller of either lays out that one's parameters. */
+        if (Replaced && Replaced != &Decl && !R.bIsPatch)
+            if (const auto [A, bStatic] = FoundAbove(R, Fn.Name); A && A != Owner && !A->IsNative() && !bStatic
+                && A->Methods.count(Fn.Name) && SignatureOf(*A->Methods.at(Fn.Name)) != SignatureOf(Decl))
+            { *Err = R.CppName + "::" + Fn.Name + " implements " + Owner->CppName + "::" + Fn.Name + ", " + TypeOf(*Replaced)
+                     + ", and replaces the " + A->CppName + "::" + Fn.Name + " it inherits, " + TypeOf(*A->Methods.at(Fn.Name))
+                     + ": a Blueprint function has one signature, and callers of each pass that one's parameters; rename "
+                       "one of them"; return false; }
         uint32 Flags = Inherited ? Inherited & kOverrideInherits
                      : IsStaticDecl(Decl) ? uint32(FUNC_Static | FUNC_BlueprintCallable | FUNC_Public | FUNC_Final)
                      : kPlainMethodFlags;

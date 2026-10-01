@@ -2492,8 +2492,9 @@ Notes:
 - An inline body, a member template's too, is copied into each class that calls it, and `Base::Method()` in it is
   judged from that class, as if written there: a class with its own Method makes the parent call, and one without gets
   the added override. A plain `Method()` in it stays a call by name from every such class.
-- No override is added where the nearest parent's declaration of the method has a parameter with no name, or is
-  inline, static or pure virtual: such a call whose body cannot be copied in goes by name, with the warning.
+- No override is added where the nearest parent's declaration of the method is inline, static or pure virtual: such a
+  call whose body cannot be copied in goes by name, with the warning. A parameter the parent leaves unnamed is named
+  in the added override (`P0`, `P1`, ... by position) and passed on.
 - A parent this source cooks has its body copied in, as a `final` method's is (see
   [Calling your own functions](#calling-your-own-functions)). An override of an engine event, such as
   ReceiveBeginPlay above, stays a call.
@@ -4025,7 +4026,10 @@ Notes:
 | `float GetCurveValue(FName CurveName) const { return 0.5f; }` | An implementation is an ordinary method, matched to the interface function by name. Only functions the interface marks BlueprintNativeEvent or BlueprintImplementableEvent can be implemented; AssetGen checks this against the SDK's Events.json. | Yes |
 | A function left out | Gets an empty stub, as the editor compiles one. The stub returns the zero value (0, false, None, null) and leaves out-parameters unchanged. | Yes |
 | A function left out that a parent this source cooks already has, without listing the interface | The parent's function implements it, as in C++: AssetGen adds an override of it that only calls the parent's (or expands it, if inline), the editor's override with a parent call, so calls through the interface and by name run the parent's body. An empty stub would replace it for every caller, and with no function at all a call would find the interface's own empty one first. | Yes |
-| The same, where the parent's function is a multicast, or has a parameter with no name | Refused: "... no override can call it for ITrigger, and an empty one would replace it; declare Pistol::Pull". An override would send a multicast twice on a server, and cannot pass on an unnamed parameter. | Refused |
+| The same, where the parent's function has a parameter with no name | The added override names it (`P0`, `P1`, ... by position) and passes it on, as the editor's override names every pin. | Yes |
+| The same, where the parent's function is a multicast | Refused: "... no override can call it for ITrigger, and an empty one would replace it; declare Pistol::Pull". An override would send a multicast twice on a server. | Refused |
+| The same, where the parent's function is `final`, or has another signature than the interface's | Refused: "Pistol implements ITrigger, whose Pull needs a function of that name in Pistol, and the Rifle::Pull it inherits is final ..." or "... whose Pull is int32 (int32), and the Rifle::Pull it inherits is float (float): a Blueprint class has one function of a name ...". No function of a final one's name may follow it, and callers through the interface pass the interface's parameters. Rename one of them. | Refused |
+| `int32 Pull(int32 N)` implementing ITrigger, where a parent has `float Pull(float)` | Refused: "Pistol::Pull implements ITrigger::Pull, int32 (int32), and replaces the Rifle::Pull it inherits, float (float) ...". A Blueprint function overrides the parent's of its name too, so it would have two signatures. Rename one of them. | Refused |
 | The same, where the parent's function is static, or the class declares its own `Pull` beside the parent's static | Refused: "... is static: the editor takes such a function for an override of the static and refuses it ...; rename Rifle::Pull". A static implements no interface function, but the editor makes any function of its name in a subclass an override of it, and an override of a static must be static. | Refused |
 | An implementation that returns a value, is `const`, or has out-parameters | Compiled as a function, where the editor would make a function graph rather than an event. It takes the interface function's flags, so callers through the interface find it. A void event such as ShowDamageEffects is compiled as a function too. | Yes |
 | `class Pistol : public Weapons::Rifle` | A subclass implements the interface through its parent without listing it. Redefining an interface function is an ordinary override, and `Weapons::Rifle::Pull(Times)` calls the parent's. | Yes |
@@ -5692,9 +5696,9 @@ and where the feature is described. In each group, the messages you are most lik
   overrides <Method> runs that override; to run <Base>'s alone, call it from an override of <Method> in <Class>`:
   a qualified call to a method its class does not declare and whose body cannot be copied in (authority-only,
   cosmetic, an RPC, `noinline`, one that waits), where AssetGen cannot add the override itself: the call is in an
-  inline method, or the nearest parent's declaration of the method has a parameter with no name, or is inline,
-  static or pure virtual. Elsewhere AssetGen adds the override and prints nothing. Fix: move the call into a method
-  that is not inline, name the parameter, or declare the method in the class, calling
+  inline method, or the nearest parent's declaration of the method is inline, static or pure virtual. Elsewhere
+  AssetGen adds the override and prints nothing. Fix: move the call into a method that is not inline, or declare the
+  method in the class, calling
   `<Base>::<Method>()`; the qualified call then runs Base's function alone. See
   [Calling the parent](#calling-the-parent).
 - `warning: <Class>::<Function>: <Base>::<Method>() is a call by name, which on an object of a subclass that
