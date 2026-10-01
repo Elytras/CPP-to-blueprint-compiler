@@ -13293,9 +13293,10 @@ bool RunClang(const std::string& Cmd, const std::string& SourcePath, const std::
 }
 
 /* Parses the AST dump clang's command Cmd writes, filtered by FDumpFilter unless bFilter is off. A filtered dump that
-   does not parse is read again unfiltered, which costs one more clang run: a filter bug then costs time, not the
-   compile. Only a failure the parse notices gets that far, never clang's own (RunClang reports those first), and a
-   filter bug that still parsed would build a different tree: catching that is astcheck's job. */
+   does not parse is read again unfiltered, which costs one more clang run, whose warnings print a second time: a filter
+   bug then costs time, not the compile. Only a failure the parse notices gets that far, never clang's own (RunClang
+   reports those first), and a filter bug that still parsed would build a different tree: catching that is astcheck's
+   job. */
 bool ParseClangAst(const std::string& Cmd, const std::string& SourcePath, Json* Out, std::string* Err,
                    bool bFilter = true)
 {
@@ -13307,7 +13308,8 @@ bool ParseClangAst(const std::string& Cmd, const std::string& SourcePath, Json* 
     if (!RunClang(Cmd, SourcePath, Parse, Err)) return false;
     if (bParsed) return true;
     if (!bFilter) { *Err = "could not parse clang's AST dump"; return false; }
-    fprintf(stderr, "assetgen: the filtered AST dump did not parse; reading it again unfiltered\n");
+    fprintf(stderr, "assetgen: the filtered AST dump did not parse; reading it again unfiltered (clang runs again, so "
+                    "its warnings above print again)\n");
     *Out = Json();
     return ParseClangAst(Cmd, SourcePath, Out, Err, false);
 }
