@@ -1028,6 +1028,44 @@ comma_hoist()
 print('ok  CommaHoist: a comma inside an expression runs its left side first, as a statement, where nothing runs before it')
 
 
+def comma_const_ref():
+    """CommaConstRef: a comma or an assignment used as a value, bound to a `const T&` beside an argument that writes
+    what it names, is that variable, which the callee reads after every argument: it sees the write (50) whichever
+    order C++ picks. Assign's pairs: `B = M` before SetB (1050, B 50) or after it (1000 + M, B M)."""
+    base = pending_asset('CommaConstRef')
+    keeps_invariants(base)
+    for m in (0, 7, -3):
+        for fn, legal in (('Struct', {(1050, 1)}), ('Int', {(1050, 1)}), ('Ahead', {(1050, 1)})):
+            me = {'Count': 0}
+            got = run(base, fn, me, M=m)[0]
+            assert (got, me['Count']) in legal, 'CommaConstRef.%s(%d) = %r, Count %r; want %r' % (fn, m, got, me['Count'], legal)
+        me = {}
+        got = run(base, 'Assign', me, M=m)[0]
+        assert (got, me.get('B')) in {(1050, 50), (1000 + m, m)}, 'CommaConstRef.Assign(%d) = %r, B %r' % (m, got, me.get('B'))
+
+
+pending('CommaConstRef: a comma or an assignment bound to a const T& beside a writing argument is read as a copy made '
+        'before it', comma_const_ref)
+
+
+def comma_ctor_default():
+    """CommaCtorDefault: a comma among a parenthesised constructor's arguments runs as among a call's (Get before it or
+    after it, Y is M); a comma beside nothing but a constant default argument needs no temporary, and its element
+    reaches Inc's reference (M + 5)."""
+    base = pending_asset('CommaCtorDefault')
+    keeps_invariants(base)
+    for m, c in ((2, 0), (-1, 4)):
+        me = {'Count': float(c)}
+        got = run(base, 'Ctor', me, M=float(m))[0]
+        assert me['Count'] == c + 1 and got in {(c + 3) * 100 + m, (c + 4) * 100 + m}, ('Ctor', m, c, got, me)
+        me = {'Bumps': c}
+        assert run(base, 'DefaultRef', me, M=m)[0] == m + 5 and me['Bumps'] == c + 1, ('DefaultRef', m, c, me)
+
+
+pending('CommaCtorDefault: a comma in a parenthesised constructor call is refused as a braced list\'s, and one beside '
+        'a constant default argument is refused as beside an argument that may run first', comma_ctor_default)
+
+
 def expr_temps():
     """ExprTemps: `TArray<int32>{1, 2, M}` as an argument is that array; a UE_STRUCT's `FEtSlot()` has its members'
     defaults (A 1, B 2), passed or stored; `A = B = E` sets both, for a number, a string and a struct; `B = A += E`
