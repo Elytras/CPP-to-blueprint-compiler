@@ -1952,6 +1952,23 @@ def final_as_shared():
 final_as_shared()
 print('ok  FinalAsTest: a UE_FINAL_AS in a shared header makes the base owner\'s leaf, imported by every other mod')
 
+
+def final_as_foreign():
+    """UE_FINAL_AS over a base this source does not cook. A game Blueprint stays as the game has it - not final, its own
+    subclasses kept - so it is refused. Another mod's UE_CLASS base is final only where its owner says so, in the header
+    it shares (FinalAsShared): written in a mod's own source, the leaf would be pinned beside the owner's base, imported,
+    and never cooked by the owner, so it is refused there."""
+    refused('FinalAsGame', '', 'BP_TutorialComponent_C is the game\'s Blueprint',
+            top='#include "UeApi/Game/BP_TutorialComponent_C.h"\nUE_FINAL_AS(BP_TutorialComponent_C, FagLeaf);\n')
+    refused('FinalAsForeign', '', 'only the UE_FINAL_AS in the header that declares it',
+            top='class FafBase : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/FafOwner/FafBase", "FafBase_C");\n'
+                '  int32 Bump(int32 V);\n};\nUE_FINAL_AS(FafBase, FafLeaf);\n')
+
+
+pending('FinalAsTest: UE_FINAL_AS over a base this mod does not cook is refused, unless written in the header its '
+        'owner shares', final_as_foreign)
+
+
 # ---- NestedTest
 
 def nested_containers():
