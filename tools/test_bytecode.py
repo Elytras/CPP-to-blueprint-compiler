@@ -1965,8 +1965,9 @@ def final_as_foreign():
                 '  int32 Bump(int32 V);\n};\nUE_FINAL_AS(FafBase, FafLeaf);\n')
 
 
-pending('FinalAsTest: UE_FINAL_AS over a base this mod does not cook is refused, unless written in the header its '
-        'owner shares', final_as_foreign)
+final_as_foreign()
+print('ok  FinalAsTest: UE_FINAL_AS over a base this mod does not cook is refused, unless written in the header its '
+      'owner shares')
 
 
 # ---- NestedTest

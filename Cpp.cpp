@@ -1338,6 +1338,10 @@ private:
     /* What ParentClass->FindFunctionByName finds of Method above R, walked as FindEvent walks for a super: the class
        holding it and whether it is a static; {nullptr, false} for nothing. */
     std::pair<const FRecord*, bool> FoundAbove(const FRecord& R, const std::string& Method) const;
+    /* Each file of the mod's own holding `UE_FINAL_AS(Base, Leaf)` (last name segments compared), as whether it is a
+       header that names Package, its base's UE_CLASS path: the compiled source and what it includes by a quoted path
+       beside it, transitively, UeApi headers left out. Empty when the macro is written nowhere these reach. */
+    std::vector<bool> FinalAsSites(const std::string& Base, const std::string& Leaf, const std::string& Package) const;
     bool IsMulticast(const FRecord& R, const std::string& Method) const;
     /* A constant outside any function body, `constexpr int32 kMax = 40;` at namespace scope or static in a class, and an
        inline class variable, `static inline const TArray<FName> Tags = {...};`: decl id -> its VarDecl. It has no
@@ -1669,6 +1673,7 @@ private:
     std::string ModPackage;
     std::optional<std::string> ApiDir;      // `--api`: where the uncooked editor-side stubs go
     std::string SourceDir;      // the compiled .cpp's folder: what __EmbedFile__ resolves a relative path against
+    std::string SourceFile;     // the compiled .cpp itself, absolute: FinalAsSites follows its includes
     /* The UeApi folder when genueapi wrote it without --game (Version.json "game": false), else empty: it then lists
        no game Blueprint's default subobjects or tail, so Generate refuses a class deriving from one. */
     std::string UeApiWithoutGame;
@@ -2521,6 +2526,37 @@ bool FCompiler::Collect(std::string* Err)
         const FRecord* Base = Leaf.Base.empty() ? nullptr : Find(Leaf.Base);
         if (!Base || Base->UePackage.compare(0, 8, "/Script/") == 0 || !Leaf.bFinal)
         { *Err = "UE_FINAL_AS(" + Leaf.Base + ", " + Leaf.CppName + "): the base must be a Blueprint class, a mod's"; return false; }
+        /* A base this source does not cook stays as its owner cooks it: its functions not Final, its other subclasses
+           kept, while the calls this mod makes to them would be bound as final, skipping their overrides. A game
+           Blueprint, or a class pinned to a path its name does not give, has no mod to say otherwise: refused. Another
+           mod's class pinned to its owner (a header mods share) is final only where that owner sees the macro too, in
+           the header declaring it; written anywhere else, the leaf pinned beside the base below is one its owner never
+           cooks. */
+        const std::string Natural = PathIn("", Base->CppName);
+        const bool bCookedHere = Base->UePackage.empty() || Base->UePackage == PathIn(ModPackage, Base->CppName);
+        const bool bOwnerPinned = Base->UePackage.size() > Natural.size()
+                                  && Base->UePackage.compare(Base->UePackage.size() - Natural.size(), Natural.size(), Natural) == 0;
+        if (!bCookedHere && !bOwnerPinned)
+        {
+            const std::string B = LeafOf(Base->CppName);
+            *Err = "UE_FINAL_AS(" + Leaf.Base + ", " + Leaf.CppName + "): " + B
+                 + (Base->UeName == B ? " is the game's Blueprint (" + Base->UePackage + "), which no mod cooks"
+                                      : " is cooked at " + Base->UePackage + ", not by this mod")
+                 + ": it stays as it is cooked there, its functions not final and its other subclasses kept, so calls "
+                   "bound to them as final would skip their overrides; derive " + LeafOf(Leaf.CppName) + " from it as a "
+                   "plain class";
+            return false;
+        }
+        if (!bCookedHere)
+            if (const std::vector<bool> Sites = FinalAsSites(LeafOf(Base->CppName), LeafOf(Leaf.CppName), Base->UePackage);
+                !Sites.empty() && std::none_of(Sites.begin(), Sites.end(), [](bool bShared) { return bShared; }))
+            {
+                *Err = "UE_FINAL_AS(" + Leaf.Base + ", " + Leaf.CppName + "): " + LeafOf(Base->CppName) + " is another "
+                       "mod's class (UE_CLASS \"" + Base->UePackage + "\"), and only the UE_FINAL_AS in the header that "
+                       "declares it, which that mod includes too, makes the leaf that mod cooks; move it there, beside "
+                     + LeafOf(Base->CppName) + ", or derive " + LeafOf(Leaf.CppName) + " from it as a plain class";
+                return false;
+            }
         /* The leaf brings no method of its own, so a `= 0` one left above it makes the one class made abstract too
            (IsAbstract): nothing could be spawned, and the base's calls would be bound to the method's empty stub. */
         if (const auto [Owner, Method] = PureMethod(Leaf); Owner)
@@ -2533,9 +2569,7 @@ bool FCompiler::Collect(std::string* Err)
            leaf, beside it: unpinned, every mod that includes the header would cook a leaf of its own, which no leaf
            object is, so its casts to the leaf would fail. The owner is the base's path less the folders its C++ name
            gives it; a base pinned elsewhere, as a game Blueprint is, leaves the leaf where it was. */
-        const std::string Natural = PathIn("", Base->CppName);
-        if (Leaf.UePackage.empty() && Base->UePackage.size() > Natural.size()
-            && Base->UePackage.compare(Base->UePackage.size() - Natural.size(), Natural.size(), Natural) == 0)
+        if (Leaf.UePackage.empty() && bOwnerPinned)
         {
             Leaf.UePackage = PathIn(Base->UePackage.substr(0, Base->UePackage.size() - Natural.size()), Leaf.CppName);
             Leaf.UeName = LeafOf(Leaf.CppName) + "_C";
@@ -5254,6 +5288,57 @@ const std::vector<std::string>& FCompiler::ModSources() const
         }
     }
     return SourceTexts;
+}
+
+/* The AST keeps no file of a declaration (DroppedAstKey), and the leaf UE_FINAL_AS declares is spelled in UeMeta.h, so
+   the text says where the macro was written: the compiled source and the files it includes by a quoted path that
+   resolves beside the including one (bpbuild's unity file includes each .cpp of a mod by its absolute path), read as
+   text. A UeApi header is generated and no mod's, so a path through a UeApi folder is not followed. A macro written
+   through another macro is not found; the caller then takes the compiler's old answer. */
+std::vector<bool> FCompiler::FinalAsSites(const std::string& Base, const std::string& Leaf, const std::string& Package) const
+{
+    namespace fs = std::filesystem;
+    auto IsIdent = [](char C) { return isalnum(uint8(C)) || C == '_'; };
+    auto LastOf = [&](const std::string& S) {
+        size_t End = S.size();
+        while (End > 0 && !IsIdent(S[End - 1])) --End;
+        size_t Begin = End;
+        while (Begin > 0 && IsIdent(S[Begin - 1])) --Begin;
+        return S.substr(Begin, End - Begin);
+    };
+    std::vector<bool> Sites;
+    std::set<std::string> Seen;
+    for (std::vector<fs::path> Todo{ fs::path(SourceFile) }; !Todo.empty();)
+    {
+        const fs::path File = Todo.back();
+        Todo.pop_back();
+        std::error_code Ec;
+        if (!fs::is_regular_file(File, Ec) || !Seen.insert(fs::weakly_canonical(File, Ec).string()).second) continue;
+        if (std::any_of(File.begin(), File.end(), [](const fs::path& Part) { return Part == "UeApi"; })) continue;
+        const std::string Text = ReadText(File.string());
+        for (size_t At = 0; (At = Text.find("#include", At)) != std::string::npos; At += 8)
+        {
+            const size_t Open = Text.find_first_of("\"<\n", At + 8);
+            if (Open == std::string::npos || Text[Open] != '"') continue;
+            const size_t Close = Text.find('"', Open + 1);
+            if (Close != std::string::npos) Todo.push_back(File.parent_path() / fs::path(Text.substr(Open + 1, Close - Open - 1)));
+        }
+        bool bHere = false;
+        for (size_t At = 0; !bHere && (At = Text.find("UE_FINAL_AS", At)) != std::string::npos; At += 11)
+        {
+            if ((At > 0 && IsIdent(Text[At - 1])) || (At + 11 < Text.size() && IsIdent(Text[At + 11]))) continue;
+            const size_t Open = Text.find_first_not_of(" \t", At + 11);
+            if (Open == std::string::npos || Text[Open] != '(') continue;
+            const size_t Comma = Text.find(',', Open), Close = Text.find(')', Open);
+            if (Comma < Close && Close != std::string::npos)
+                bHere = LastOf(Text.substr(Open + 1, Comma - Open - 1)) == Base && LastOf(Text.substr(Comma + 1, Close - Comma - 1)) == Leaf;
+        }
+        if (!bHere) continue;
+        const std::string Ext = File.extension().string();
+        Sites.push_back((Ext == ".h" || Ext == ".hpp" || Ext == ".hh" || Ext == ".inl")
+                        && Text.find("\"" + Package + "\"") != std::string::npos);
+    }
+    return Sites;
 }
 
 /* The qualifier token is where a qualified DeclRefExpr's range begins; the JSON gives its byte offset and length but
@@ -14927,7 +15012,8 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     ApiDir = InApiDir;
     std::error_code TmpEc;
     /* Absolute: a bare "Mod.cpp" has an empty parent, and NamedQualifier cannot list "". */
-    SourceDir = std::filesystem::absolute(SourcePath, TmpEc).parent_path().string();
+    SourceFile = std::filesystem::absolute(SourcePath, TmpEc).string();
+    SourceDir = std::filesystem::path(SourceFile).parent_path().string();
     /* First we check what wrote the UeApi: one older than this compiler compiles without a word wrong (one made before
        UeDefaultSubobjects orders a game Blueprint's child after none of its parent's subobjects), and the merge of a
        genueapi change carries the tracked Types.json but not the ignored headers. genueapi writes Version.json last, so
