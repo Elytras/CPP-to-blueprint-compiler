@@ -1844,6 +1844,32 @@ def final_calls():
 final_calls()
 
 
+def final_as():
+    """UE_FINAL_AS: the base's calls on `this` expand as a final class's do; the base is cooked Abstract and the leaf,
+    the one class made, is not; any other subclass of the base is refused."""
+    folder = os.path.dirname(asset('FinalAsTest'))
+    base, leaf = os.path.join(folder, 'UFinalAsBase'), asset('FinalAsTest')
+    for c in (0, 5):
+        for v in (-3, 7):
+            f = dict(Counter=c)
+            got = run(base, 'UseBump', self_vars=f, V=v)[0]
+            assert got == (c + v) * 100 + c + 2 * v and f == dict(Counter=c + 2 * v), ('UseBump', c, v, got, f)
+    assert not [n for n, op in calls_in(base, 'UseBump') if n in exports_of(base)], calls_in(base, 'UseBump')
+    abstract = lambda b: int(re.search(r'ClassFlags (\S+)', dump('dumpstruct.py', b, 0)).group(1), 16) & 0x1
+    assert abstract(base) and not abstract(leaf)
+    refused('FinalAsTwo', '', 'derives from FaBase, which is UE_FINAL_AS FaLeaf',
+            top='class FaBase : public AActor {\npublic:\n  int32 X;\n};\nUE_FINAL_AS(FaBase, FaLeaf);\n'
+                'class FaOther : public FaBase {};\n')
+    # A base with UE_CLASS, as a header shared by mods declares it, is a mod class like any other.
+    refused('FinalAsHdr', '', 'derives from FaHdr, which is UE_FINAL_AS FaHdrLeaf',
+            top='class FaHdr : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/FinalAsHdr/FaHdr", "FaHdr_C");\n};\n'
+                'UE_FINAL_AS(FaHdr, FaHdrLeaf);\nclass FaHdrOther : public FaHdr {};\n')
+    print('ok  FinalAsTest: UE_FINAL_AS compiles the base as final, cooks it Abstract, and refuses a second subclass')
+
+
+final_as()
+
+
 # ---- NestedTest
 
 def nested_containers():

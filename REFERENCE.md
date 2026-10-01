@@ -252,6 +252,7 @@ starts private.
 | `class X : public ANotIncluded {};` | Refused by clang, "expected class name", when no included header declares the base. Include the SDK header that declares it. | Refused |
 | `class InitCave : public Hello {};` | A child of another class of the mod. A parent in the same source is used from there. A parent pinned with `UE_CLASS` to another mod is imported from that mod. | Yes |
 | `class Turret final : public AActor { ... };` | A class with no subclass. Its functions are cooked Final, which the editor does not let a Blueprint override, and a call to one of them reaches that function directly instead of by name; on `this` the body is usually copied in. See [Calling your own functions](#calling-your-own-functions). | Yes |
+| `UE_FINAL_AS(UTurretBase, Turret);` at namespace scope, after UTurretBase | Final through one leaf: declares `class Turret final : public UTurretBase {}`, the class that is made, in the namespace it is written in (its package path, as for any class). UTurretBase's own code is then compiled as if it were final: its functions are cooked Final, and its calls on `this` are direct and usually copied in. UTurretBase is cooked Abstract, and any other class deriving from it is refused, so put the macro in the header beside UTurretBase: a mod that includes the header is refused a subclass too. | Yes |
 | `class WPN_GrapplingGun_Long : public WPN_GrapplingGun_C` | A child of one of the game's Blueprint classes. Include the parent's `UeApi/Game/` header and derive from it; the parent is imported from the game. Put the child in the parent's `Game::` namespace to cook it beside the parent (see [Mod sources and packages](#mod-sources-and-packages)). | Yes |
 
 Notes:
@@ -5314,6 +5315,7 @@ listed here is refused with "unimplemented intrinsic".
 | `UE_ENUM(Enum)` | Cooks an `enum class` based on `uint8`, `int32` or `int64` as a UserDefinedEnum (an Enumeration asset). | [Enums](#enums) |
 | `UE_ENUM_IN(Enum, Package)` | UE_ENUM for an enum in a shared header: only the source whose UE_MOD_PACKAGE is exactly Package cooks it. | [Enums](#enums) |
 | `UE_ENUM_MAP(Enum)` | A TMap member default from each enumerator to its name, or back, filled in at build time. | [Enums](#enums) |
+| `UE_FINAL_AS(Base, Leaf)` | Declares `class Leaf final : public Base {}`, Base's one subclass: Base is compiled as final and cooked Abstract. | [Classes and variables](#classes-and-variables) |
 | `UE_INTERFACE` | Declares a mod interface, cooked as a Blueprint Interface asset. Its variables go to the classes that implement it. | [Interfaces](#interfaces) |
 | `UE_MOD_PACKAGE(Path)` | The /Game folder that a source's classes, structs, enums, interfaces and assets are cooked into. A namespace is a subfolder. | [Mod sources and packages](#mod-sources-and-packages) |
 | `UE_MULTICAST` | Multicast RPC: called on the server, it runs on the server and on every client. | [RPCs](#rpcs) |
@@ -5706,6 +5708,11 @@ and where the feature is described. In each group, the messages you are most lik
   so the call finds no function. Calling an inline overload beside a non-inline one with more parameters works. Fix:
   give the inline and non-inline functions different names, or make every overload of the name inline. See
   [Functions](#functions).
+- `<Class> derives from <Base>, which is UE_FINAL_AS <Leaf>: that is its one subclass`: a second class derives from
+  a UE_FINAL_AS base, here or in another mod that includes its header. Fix: derive from the leaf's base's own parent,
+  or drop UE_FINAL_AS and declare the base's subclasses yourself.
+- `UE_FINAL_AS(<Base>, <Leaf>): the base must be a Blueprint class, a mod's`: the base is an engine (`/Script/`)
+  class, whose code is not compiled here. Fix: derive the leaf from it with plain `class Leaf final : public Base`.
 - `<Class>::<Method>: <Base>::<Method> is final, so no subclass may have a function of that name; rename this one`: a
   subclass declares a method with the name of an ancestor's `final` one and other parameters, `int32 Step(int32 By)`
   under `virtual int32 Step() final`. C++ lets it hide the parent's, but a Blueprint finds functions by name, and the

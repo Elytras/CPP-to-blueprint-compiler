@@ -580,6 +580,8 @@ struct FRecord
     std::set<std::string> Forwarders;               // Methods AssetGen declared, not the source: see SynthesizeForwarders
     const Json* Defaults = nullptr;                 // UE_DEFAULTS: the static-init block, never lowered
     bool bFinal = false;        // `class X final`: X has no subclass
+    bool bFinalAsLeaf = false;  // UE_FINAL_AS's leaf: its base's one subclass
+    std::string FinalAs;        // UE_FINAL_AS(this, Leaf): Leaf's CppName - compiled as final, cooked Abstract
     bool bIsLocal = false;      // UePackage == ModPackage/CppName: cooked here, published at its /Game path
     bool bIsStruct = false;     // UE_STRUCT: cooked as a UserDefinedStruct asset
     bool bIsInterface = false;  // UE_INTERFACE: cooked as a BPGC whose super is UInterface
@@ -2353,6 +2355,8 @@ bool FCompiler::Collect(std::string* Err)
                     R.UeName = LeafOf(R.CppName);
                 }
             }
+            else if (Kind(C) == "VarDecl" && Name(C) == "UeFinalAsLeaf")
+                R.bFinalAsLeaf = true;
             else if (Kind(C) == "VarDecl" && Name(C).size() > 11 && Name(C).compare(Name(C).size() - 11, 11, "__UeForward") == 0)
             {
                 std::string Target;
@@ -2447,6 +2451,24 @@ bool FCompiler::Collect(std::string* Err)
     for (const auto& [A, T] : GlobalAliases)
         if (T.find('<') != std::string::npos || Records.count(StripTypeKeywords(T))) Expand[A] = T;
     if (!Expand.empty()) ExpandAliases(const_cast<Json&>(Doc), Expand);
+    /* UE_FINAL_AS: the leaf's base is final in all but name. Its own code runs only on the leaf, which brings nothing
+       of its own, so the base is compiled as `final` (FinalOwner, FUNC_Final) and cooked Abstract; a second subclass,
+       here or in a mod that includes the header, would break that, so it is refused. */
+    for (auto& [Key, Leaf] : Records)
+    {
+        if (!Leaf.bFinalAsLeaf) continue;
+        const FRecord* Base = Leaf.Base.empty() ? nullptr : Find(Leaf.Base);
+        if (!Base || Base->UePackage.compare(0, 8, "/Script/") == 0 || !Leaf.bFinal)
+        { *Err = "UE_FINAL_AS(" + Leaf.Base + ", " + Leaf.CppName + "): the base must be a Blueprint class, a mod's"; return false; }
+        Records[Base->CppName].FinalAs = Leaf.CppName;
+    }
+    for (const auto& [Key, W] : Records)
+        if (const FRecord* Base = W.Base.empty() ? nullptr : Find(W.Base); Base && !Base->FinalAs.empty() && Base->FinalAs != W.CppName)
+        {
+            *Err = W.CppName + " derives from " + Base->CppName + ", which is UE_FINAL_AS " + Base->FinalAs
+                 + ": that is its one subclass";
+            return false;
+        }
 
     if (ModPackage.empty())
     {
@@ -4969,6 +4991,7 @@ bool FCompiler::IsSubclassOf(const FRecord& Child, const FRecord& Parent) const
 
 bool FCompiler::IsAbstract(const FRecord& R) const
 {
+    if (!R.FinalAs.empty()) return true;
     std::set<std::string> Nearest;
     for (const FRecord* A = &R; A; A = A->Base.empty() ? nullptr : Find(A->Base))
         for (const auto& [Method, Decl] : A->Methods)
@@ -8560,7 +8583,7 @@ const FRecord* FCompiler::FinalOwner(const FRecord* Of, const std::string& Metho
 {
     for (const FRecord* A = Of; A; A = A->Base.empty() ? nullptr : Find(A->Base))
         if (auto M = A->Methods.find(Method); M != A->Methods.end() && !IsInlineMethod(*A, Method))
-            return (Of->bFinal || A->FinalMethods.count(Method)) && !IsStaticDecl(*M->second) ? A : nullptr;
+            return (Of->bFinal || !Of->FinalAs.empty() || A->FinalMethods.count(Method)) && !IsStaticDecl(*M->second) ? A : nullptr;
     return nullptr;
 }
 
@@ -12377,7 +12400,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
        refuse the class, as they do one the editor marks Generate Abstract Class. An interface's `= 0` does not count,
        since an implementer that leaves it out gets a stub, and clang's own isAbstract never reaches here (FAstSax). */
     if (!CheckMemberNames(R, Err)) return false;
-    bool bAbstract = false;
+    bool bAbstract = !R.FinalAs.empty();        // UE_FINAL_AS: only the leaf is ever made
     std::set<std::string> Nearest;
     for (const FRecord* A = &R; A; A = A->Base.empty() ? nullptr : Find(A->Base))
         for (const auto& [Method, Decl] : A->Methods)
@@ -13423,7 +13446,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                      : kPlainMethodFlags;
         /* `final`, the class or the method: no subclass has a version of its own, and calls are bound to this one
            (LowerCall). Without BlueprintEvent the editor offers no override either (CanKismetOverrideFunction). */
-        if (!Inherited && !IsStaticDecl(Decl) && (R.bFinal || R.FinalMethods.count(Fn.Name)))
+        if (!Inherited && !IsStaticDecl(Decl) && (R.bFinal || !R.FinalAs.empty() || R.FinalMethods.count(Fn.Name)))
             Flags = (Flags & ~uint32(FUNC_BlueprintEvent)) | FUNC_Final;
         /* All 7229 BlueprintPure functions in the DRG dump are BlueprintCallable too. */
         /* Its own access specifier, where no parent decides. The editor refuses a call node it forbids; the VM checks
