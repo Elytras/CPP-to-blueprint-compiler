@@ -7,6 +7,9 @@
 implements (UeNativeInterfaces, see native_interfaces), which subobject a component member points at where the types
 cannot tell (map_subobjects), and the form of an enum only a local or a container element shows (scan_game).
 
+The output's Version.json, written last, says which genueapi wrote it (GENUEAPI_VERSION); the compiler refuses a UeApi
+older than it needs.
+
 The SDK dir must sit in its Dumper-7 dump, two levels under GObjects-Dump-WithProperties.txt (see read_real_fields);
 a copy elsewhere (DrgMods/SDK/SDK) has no object dump beside it."""
 import collections
@@ -32,6 +35,13 @@ DELEGATE = re.compile(r'^(?:const\s+)?(TDelegate|TMulticastInlineDelegate|TMulti
 
 CLASS_WORD = re.compile(r"class\s+((?:\w+::)?\w+)")
 CONTAINER = re.compile(r"^(?:const\s+)?(TArray|TSet|TMap)<(.*)>\s*&?$")
+
+# Version.json, written last: {"genueapi": GENUEAPI_VERSION}. The compiler refuses a UeApi stamped lower than the
+# version it needs (UeApiVersion in Cpp.cpp), or not at all: a UeApi older than what the compiler reads compiles
+# without a word wrong (one made before UeDefaultSubobjects orders a game Blueprint's child after none of its parent's
+# subobjects). Bump both together whenever the compiler starts relying on something new genueapi writes.
+# 1: UeDefaultSubobjects with the nested ones, __UeSubobject markers joined through the game's Blueprints.
+GENUEAPI_VERSION = 1
 
 
 def class_refs(t):
@@ -1506,6 +1516,9 @@ def main():
 
     if not os.path.isdir(out_dir):
         os.makedirs(out_dir)
+    # The stamp goes last: a run that stops halfway leaves none, and the compiler refuses the half-written UeApi.
+    if os.path.exists(os.path.join(out_dir, "Version.json")):
+        os.remove(os.path.join(out_dir, "Version.json"))
 
     conv_structs = write_conversions(ordered, out_dir)
     write_containers(ordered, sdk_dir, out_dir)
@@ -1748,6 +1761,8 @@ def main():
                 "*/"]
     umbrella += ["#include \"%s.h\"" % pkg for pkg in sorted(by_pkg) if not pkg.startswith("Game/")]
     io.open(os.path.join(out_dir, "UeApi.h"), "w", encoding="utf-8-sig", newline="\n").write("\n".join(umbrella) + "\n")
+    io.open(os.path.join(out_dir, "Version.json"), "w", encoding="utf-8", newline="\n").write(
+        '{"genueapi": %d}\n' % GENUEAPI_VERSION)
 
     bp = [k for k in ordered if k.is_bp]
     print("UeApi: %d classes, %d functions, %d properties, %d headers"

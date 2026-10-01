@@ -3956,7 +3956,8 @@ def ueapi_too_old():
                 (stamp, proc.stdout[-500:])
 
 
-pending('UeApi stamp: a UeApi older than the compiler is refused, not compiled against', ueapi_too_old)
+ueapi_too_old()
+print('ok  a UeApi older than the compiler, or with no Version.json, is refused, saying to regenerate it')
 
 
 def subobject_bomber():

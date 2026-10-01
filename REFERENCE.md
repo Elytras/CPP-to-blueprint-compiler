@@ -6182,6 +6182,12 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
 - `missing or invalid <IncludeDir>/<File> (run genueapi.py)`: the include-dir argument is not a generated UeApi
   folder: `Conv.json`, `Ops.json`, `Types.json` or `Events.json` is missing or unreadable. Fix: pass the UeApi folder
   that genueapi wrote, or regenerate it. See [The SDK](GUIDE.md#the-sdk).
+- `<IncludeDir> was written by an older genueapi (no Version.json, this assetgen needs version <N>) - regenerate it
+  with AssetGen/tools/genueapi.py` (or `version <M>` for an older stamp): the UeApi folder comes from a genueapi older
+  than this compiler, which would compile against it without a word wrong where it relies on what that one did not
+  write (a game Blueprint's child would load before its parent's subobjects). genueapi writes `Version.json` last, so
+  a run that stopped halfway leaves none either. Fix: regenerate UeApi with the genueapi of this AssetGen, or use the
+  SDK release made for it. See [The SDK](GUIDE.md#the-sdk).
 - `usage: assetgen verify <out-dir> <reference-dir>` (and the lines after it): an unknown subcommand or too few
   arguments, with exit code 2. Fix: `assetgen compile <source.cpp> <UeApi dir> <out dir> [--api <api dir>]`. The
   `--api` folder is where the editor stubs go, not the UeApi folder. See [Building mods](GUIDE.md#building-mods).
