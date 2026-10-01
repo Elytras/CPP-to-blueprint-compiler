@@ -2603,8 +2603,9 @@ std::string FCompiler::Unreplicable(const Json& Typed, int32 Depth) const
 }
 
 /* A function's signature as the engine tells two apart (IsSignatureCompatibleWith, Class.cpp:5882): the return type and
-   each parameter's, typedefs resolved, `const`, `class`, `struct` and `enum` dropped, and a const reference read as the
-   value it passes. Names do not count. */
+   each parameter's, typedefs resolved, `const`, `class`, `struct` and `enum` dropped, a const reference read as the
+   value it passes, and TEnum<E> read as the E it is to the compiler (StripTypeKeywords), so an override may spell either.
+   Names do not count. */
 std::vector<std::string> SignatureOf(const Json& Fn)
 {
     auto Norm = [](std::string T, bool bParm) {
@@ -2612,6 +2613,8 @@ std::vector<std::string> SignatureOf(const Json& Fn)
         for (const char* Kw : { "const ", "struct ", "class ", "enum " })
             for (size_t At; (At = T.find(Kw)) != std::string::npos;) T.erase(At, strlen(Kw));
         T.erase(std::remove(T.begin(), T.end(), ' '), T.end());
+        for (size_t At, Close; (At = T.find("TEnum<")) != std::string::npos && (Close = T.find('>', At)) != std::string::npos;)
+            T.erase(Close, 1).erase(At, 6);
         if (bConstRef) T.pop_back();
         return T;
     };

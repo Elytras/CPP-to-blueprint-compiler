@@ -2414,7 +2414,7 @@ Notes:
 - The parameter list must match. `void ReceiveTick(int32 X)` is refused: "FuncTickInt::ReceiveTick is void (int32),
   and the AActor::ReceiveTick it replaces is void (float): callers pass that one's parameters; declare the same". The
   same holds for an override of a mod parent's function, of an RPC, and for an interface function's implementation.
-  Names do not count, and a `const T&` parameter matches a `T` one.
+  Names do not count, a `const T&` parameter matches a `T` one, and an enum `E` matches the `TEnum<E>` UeApi declares.
 - An override keeps its parent's access: a ReceiveBeginPlay override is protected even when written under `public:`.
 - AssetGen reads a parent's flags from the SDK's `Events.json`, which lists engine and game classes. A mod method named
   like an engine function that is not an event there (K2_DestroyActor, say) is refused: "AActor::K2_DestroyActor is
