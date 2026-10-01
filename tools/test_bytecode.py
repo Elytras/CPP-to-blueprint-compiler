@@ -6146,6 +6146,24 @@ def comp_no_components():
 comp_no_components()
 
 
+def comp_root_variable():
+    """Where an SCS lists its DefaultSceneRoot node, the class has a variable of that name holding the component, as the
+    editor gives each node it lists one (KismetCompiler.cpp 884-898) and 40 of the game's classes have it
+    (ENE_EnemySpawner): ExecuteNodeOnActor stores the component there, where with none it logs on every spawn that the
+    class has no such property (SCS_Node.cpp 159-178). CompRootVariable has no component, RootVarMover a movement
+    component alone, and RootVarKid finds its parent's (FindFProperty walks the supers)."""
+    base = pending_asset('CompRootVariable')
+    for cls in ('CompRootVariable', 'RootVarMover', 'RootVarKid'):
+        b = os.path.join(os.path.dirname(base), cls)
+        root, attach, made, stored = construct(b)
+        assert root == 'DefaultSceneRoot' and stored.get('DefaultSceneRoot'), \
+            '%s: no variable holds its root, the DefaultSceneRoot node\'s component (%s)' % (cls, stored)
+        keeps_invariants(b)
+
+
+pending('CompRootVariable: a listed DefaultSceneRoot node has its variable on the class', comp_root_variable)
+
+
 def comp_attach_inherited():
     """SetupAttachment in UE_DEFAULTS places a component as a constructor does. Attached to an inherited one, it is a
     root node naming that parent: an ancestor Blueprint's node by its variable and class (Glow on AttachBase_C's Lamp),
