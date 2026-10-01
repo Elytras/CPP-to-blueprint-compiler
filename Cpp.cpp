@@ -1285,6 +1285,9 @@ private:
        the nearest declaration from Of up that is a Blueprint function, when no subclass can bring its own: Of is
        final, or that declaration is. Null when one could. */
     const FRecord* FinalOwner(const FRecord* Of, const std::string& Method) const;
+    /* Whether Generate cooks A's Method FUNC_Final: A or the method is `final`, and it replaces no function (FindEvent),
+       whose flags it would take instead. */
+    bool IsFinalFunction(const FRecord& A, const std::string& Method) const;
     /* The definition a call (Call, to the declaration clang picked, Picked) to In's Method may be expanded from in
        place of the call, or null. See LowerCall. */
     const Json* Expandable(const FRecord& In, const std::string& Method, const Json& Call, const Json* Picked) const;
@@ -5577,14 +5580,19 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
            one it names. */
         const Json* On = K == "CXXMemberCallExpr" ? Strip(First(*Callee)) : nullptr;
         const bool bOnThis = !On || Kind(*On) == "CXXThisExpr";
-        const FRecord* Bound = nullptr;
+        const FRecord* Only = nullptr;
         if (!R->IsNative() && !bStatic && !bParentCall && !Out.bReceiverIsArg)
         {
             std::string Of = bOnThis ? std::string() : StripTypeKeywords(TypeOf(*On));
             while (!Of.empty() && (Of.back() == '*' || Of.back() == ' ')) Of.pop_back();
-            if ((Bound = FinalOwner(bOnThis ? Cur : Find(Of), MethodName)) && (Bound->IsNative() || (bQualified && Bound != R)))
-                Bound = nullptr;
+            if ((Only = FinalOwner(bOnThis ? Cur : Find(Of), MethodName)) && (Only->IsNative() || (bQualified && Only != R)))
+                Only = nullptr;
         }
+        /* Its body is copied in where it can be (below); the call is bound to it only when it is FUNC_Final. The editor
+           binds a call to a function without that flag only as a parent call (the call_opcode_flags rule), and a `final`
+           class's inherited function has none, nor has an override, which takes its parent's flags. By name the call
+           reaches that same function, as no subclass brings its own. */
+        const FRecord* Bound = Only && IsFinalFunction(*Only, MethodName) ? Only : nullptr;
         const FRecord* Called = Bound ? Bound : R;
         /* KismetCompilerVMBackend.cpp picks the local form unless the callee is native, a net function, authority
            only or cosmetic. A method declared only by mod classes, without an RPC marker, is none of those; an
@@ -5603,7 +5611,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         Out.bLocal = (!Out.VirtualName.empty() || Bound) && bLocal;
         /* A call whose one body is known here - bound on `this`, a parent's, or a static of this mod - is that body,
            expanded in place. The function stays, for delegates, timers, other mods and the editor. */
-        if (const FRecord* In = bStatic || bParentCall ? R : Bound; In && bOnThis && !Out.bReceiverIsArg && CurLocals)
+        if (const FRecord* In = bStatic || bParentCall ? R : Only; In && bOnThis && !Out.bReceiverIsArg && CurLocals)
             if (const Json* Def = Expandable(*In, MethodName, CallExprNode, FullDecl))
                 return ExpandInline(CallExprNode, *Def, In->CppName + "::" + MethodName, true, BP, Out, Err, nullptr, bStatic);
         /* `QcParent::Plain()` from a class that does not declare Plain: C++ runs QcParent's without dispatch, where by
@@ -5612,7 +5620,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
            of it (K2Node_CallParentFunction), and binds no other call to a function a subclass can override (the
            call_opcode_flags rule); so one that cannot be copied in is a parent call above, from the override
            SynthesizeForwarders declared, and one that has none stays a call by name, with a warning. */
-        if (bQualified && Bound != R)
+        if (bQualified && Only != R)
         {
             if (const Json* Def = bOnThis && !Out.bReceiverIsArg && CurLocals ? Expandable(*R, MethodName, CallExprNode, FullDecl) : nullptr)
                 return ExpandInline(CallExprNode, *Def, R->CppName + "::" + MethodName, true, BP, Out, Err);
@@ -8468,6 +8476,26 @@ const FRecord* FCompiler::FinalOwner(const FRecord* Of, const std::string& Metho
         if (auto M = A->Methods.find(Method); M != A->Methods.end() && !IsInlineMethod(*A, Method))
             return (Of->bFinal || A->FinalMethods.count(Method)) && !IsStaticDecl(*M->second) ? A : nullptr;
     return nullptr;
+}
+
+/* The same walk FindEvent makes for a super, without importing it: a mod ancestor's function, a native one's, or a
+   native interface's of any class on the way. */
+bool FCompiler::IsFinalFunction(const FRecord& A, const std::string& Method) const
+{
+    const auto M = A.Methods.find(Method);
+    if (A.IsNative() || M == A.Methods.end() || IsStaticDecl(*M->second) || IsInlineMethod(A, Method)
+        || !(A.bFinal || A.FinalMethods.count(Method)))
+        return false;
+    for (const FRecord* R = &A; R; R = R->Base.empty() ? nullptr : Find(R->Base))
+    {
+        if (R != &A && !R->IsNative() && !R->bIsInterface)
+            if (auto P = R->Methods.find(Method); P != R->Methods.end() && !IsStaticDecl(*P->second) && !IsInlineMethod(*R, Method))
+                return false;
+        if (R->IsNative() && R->Methods.count(Method) && !R->Forwards.count(Method)) return false;
+        for (const std::string& I : R->Interfaces)
+            if (const FRecord* IR = Find(I); IR && IR->IsNative() && IR->Methods.count(Method)) return false;
+    }
+    return true;
 }
 
 /* Every call whose body is known here expands, unless: the function is not a Blueprint function of this mod with a

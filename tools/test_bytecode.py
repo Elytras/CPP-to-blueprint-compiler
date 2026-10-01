@@ -4643,7 +4643,7 @@ def func_final_inherited():
     AuthOnly, an override, and FfOther AuthOnly through a FuncFinalInherited pointer. None of them is FUNC_Final, so
     each is a call by name, which finds that same function, no class deriving from a final one (call_opcode_flags:
     the editor binds a call to a function without FUNC_Final only as a parent call); each runs that function."""
-    kid = pending_asset('FuncFinalInherited')
+    kid = asset('FuncFinalInherited')
     folder = os.path.dirname(kid)
     base, own, other = (os.path.join(folder, c) for c in ('FfBase', 'FfOwn', 'FfOther'))
     for b in (kid, own, other): keeps_invariants(b)
@@ -4654,8 +4654,8 @@ def func_final_inherited():
     assert run_as([kid, base], 'CallKept', {}) == 2
 
 
-pending('FuncFinalInherited: a final class calls an inherited or overriding function that is not FUNC_Final by name',
-        func_final_inherited)
+func_final_inherited()
+print('ok  FuncFinalInherited: a final class calls an inherited or overriding function that is not FUNC_Final by name')
 
 
 def func_inline_parent():

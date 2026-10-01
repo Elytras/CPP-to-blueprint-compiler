@@ -251,7 +251,7 @@ starts private.
 | `class Helper { ... };` | A class with no base is plain C++. Nothing is cooked for it. | Yes |
 | `class X : public ANotIncluded {};` | Refused by clang, "expected class name", when no included header declares the base. Include the SDK header that declares it. | Refused |
 | `class InitCave : public Hello {};` | A child of another class of the mod. A parent in the same source is used from there. A parent pinned with `UE_CLASS` to another mod is imported from that mod. | Yes |
-| `class Turret final : public AActor { ... };` | A class with no subclass. Its functions are cooked Final, which the editor does not let a Blueprint override, and a call to one of them reaches that function directly instead of by name; on `this` the body is usually copied in. See [Calling your own functions](#calling-your-own-functions). | Yes |
+| `class Turret final : public AActor { ... };` | A class with no subclass. Its functions, overrides aside, are cooked Final, which the editor does not let a Blueprint override, and a call to one of them reaches that function directly instead of by name; on `this` the body is usually copied in. See [Calling your own functions](#calling-your-own-functions). | Yes |
 | `class WPN_GrapplingGun_Long : public WPN_GrapplingGun_C` | A child of one of the game's Blueprint classes. Include the parent's `UeApi/Game/` header and derive from it; the parent is imported from the game. Put the child in the parent's `Game::` namespace to cook it beside the parent (see [Mod sources and packages](#mod-sources-and-packages)). | Yes |
 
 Notes:
@@ -1985,7 +1985,7 @@ Notes:
 | `Peer->Bump(1)` | Runs on that object and reaches the most derived version for its class. | Yes |
 | `Fact(V - 1)` inside `Fact` | Recursion. Each call gets its own frame, as a recursive Blueprint function does. Mutual recursion works the same way. | Yes |
 | `Other->Twice(3)` where `Twice` is inline | Refused; see the inline table below. | Not yet |
-| `Bump(By)` in a `final` class, or to a `final` method | Reaches that one function directly, the editor's call to a function no Blueprint can override, instead of by name. The body is copied into the caller, as an inline function's is, and the function is still cooked for every other caller: the editor, delegates, timers, other mods. | Yes |
+| `Bump(By)` in a `final` class, or to a `final` method | Reaches that one function directly, the editor's call to a function no Blueprint can override, instead of by name. The body is copied into the caller, as an inline function's is, and the function is still cooked for every other caller: the editor, delegates, timers, other mods. A function the final class inherits, or overrides, is not cooked Final (an override takes its parent's flags), so a call to one whose body is not copied in (authority-only, an RPC, `noinline`) stays a call by name, as the editor's is; with no subclass, the name finds that one function. | Yes |
 | `Twice(V)`, a static of a class this source cooks | Its body is copied in the same way. | Yes |
 | `Peer->Bump(1)` in a `final` class | Direct, but not copied in: the body would need Peer as its `this`. | Yes |
 | `[[gnu::noinline]] int32 Kept(int32 V)` | Calls to Kept stay calls, wherever they could be copied in. | Yes |
