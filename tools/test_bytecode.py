@@ -1882,6 +1882,18 @@ def final_as():
 final_as()
 
 
+def final_as_pure():
+    """UE_FINAL_AS on a base with a `= 0` method is refused: the leaf, the one class made, would be abstract too
+    (IsAbstract walks its chain to the method), so nothing could be spawned, and the base's calls to the method are
+    bound to its empty stub."""
+    refused('FinalAsPure', '', 'UE_FINAL_AS(FaPureBase, FaPureLeaf): FaPureBase::Need is `= 0`',
+            top='class FaPureBase : public AActor {\npublic:\n  virtual int32 Need(int32 V) = 0;\n'
+                '  int32 Use(int32 V) { return Need(V) + 1; }\n};\nUE_FINAL_AS(FaPureBase, FaPureLeaf);\n')
+
+
+pending('FinalAsTest: UE_FINAL_AS on a base with a `= 0` method is refused', final_as_pure)
+
+
 # ---- NestedTest
 
 def nested_containers():
