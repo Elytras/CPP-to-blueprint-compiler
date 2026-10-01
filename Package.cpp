@@ -3,6 +3,7 @@
 #include "Script.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstring>
 
@@ -110,11 +111,13 @@ void SplitName(const std::string& S, std::string& OutBase, int32& OutNumber)
 
     const std::string Digits = S.substr(Underscore + 1);
     if (Digits.size() > 1 && Digits[0] == '0') return;       // leading zeros are part of the name
-    if (Digits.size() > 9) return;
+    if (Digits.size() > 10) return;                          // up to 10 digits, below MAX_int32 (UnrealNames.cpp 1938-1947)
     for (char C : Digits) if (C < '0' || C > '9') return;
+    const long long Value = std::stoll(Digits);
+    if (Value >= 2147483647) return;
 
     OutBase = S.substr(0, Underscore);
-    OutNumber = std::stoi(Digits) + 1;                       // stored number is one-based
+    OutNumber = int32(Value) + 1;                            // stored number is one-based
 }
 
 /* A non-ASCII string is stored (and so hashed) as WIDECHARs; the WIDECHAR Strihash takes both bytes of each. */
@@ -152,7 +155,12 @@ void FArc::Raw(const void* P, size_t N)
     B.insert(B.end(), Bytes, Bytes + N);
 }
 
-void FArc::Idx(FIndex V) { I32(Pkg && Pkg->RemapIndex ? Pkg->RemapIndex(V).V : V.V); }
+void FArc::Idx(FIndex V)
+{
+    const int32 Out = Pkg ? Pkg->Written(V).V : V.V;
+    if (Pkg && Pkg->Recording && Out != 0) Pkg->Recording->push_back(Out);
+    I32(Out);
+}
 
 void FArc::Str(const std::string& S) { WriteFString(B, S); }
 
@@ -245,6 +253,52 @@ int32 FPackage::AddExport(FExport&& In)
     return int32(Exports.size()) - 1;
 }
 
+/*
+A package's own objects are exports, never imports of itself: the event-driven loader check()s that an import's package
+is not the one being loaded (AsyncLoading.cpp 1988, 2077), and Shipping, which compiles that out, resolves such an
+import back onto the export with arcs between the two. The compiler names its own class and functions the way it names
+any other package's, through imports, so Save writes each import of an object this package exports as that export,
+drops the import of the package itself they hang off, and closes up the rows it keeps. An import no export answers is
+kept, outers and all. The rows in memory keep their numbering (WriteApi reads them after Save).
+*/
+void FPackage::FoldOwnImports() const
+{
+    constexpr int32 Kept = -1;
+    std::vector<int32> Target(Imports.size(), Kept);
+    std::vector<bool> Done(Imports.size(), false);
+    const std::string Own = Lower(PackageName);
+    /* What import I is written as: 0 for this package, an export's FPackageIndex, or Kept. Outers come first. */
+    std::function<int32(size_t)> Resolve = [&](size_t I) {
+        if (Done[I]) return Target[I];
+        Done[I] = true;
+        const FImport& Im = Imports[I];
+        if (Im.Outer.V == 0) return Target[I] = Lower(Im.ObjectName) == Own ? 0 : Kept;
+        if (Im.Outer.V > 0 || size_t(-Im.Outer.V - 1) >= Imports.size()) return Target[I] = Kept;
+        const int32 Outer = Resolve(size_t(-Im.Outer.V - 1));
+        if (Outer == Kept) return Target[I] = Kept;
+        for (size_t E = 0; E < Exports.size(); ++E)
+            if (Exports[E].OuterIndex.V == Outer && Lower(Exports[E].ObjectName) == Lower(Im.ObjectName))
+                return Target[I] = int32(E) + 1;
+        return Target[I] = Kept;
+    };
+    for (size_t I = 0; I < Imports.size(); ++I) Resolve(I);
+    /* A kept import keeps its outers too, so its chain still ends at a package. */
+    for (size_t I = 0; I < Imports.size(); ++I)
+        if (Target[I] == Kept)
+            for (int32 O = Imports[I].Outer.V; O < 0 && size_t(-O - 1) < Imports.size(); O = Imports[size_t(-O - 1)].Outer.V)
+                Target[size_t(-O - 1)] = Kept;
+    ImportFold.assign(Imports.size(), 0);
+    int32 Row = 0;
+    for (size_t I = 0; I < Imports.size(); ++I) ImportFold[I] = Target[I] == Kept ? Imp(Row++).V : Target[I];
+}
+
+FIndex FPackage::Written(FIndex V) const
+{
+    if (RemapIndex) V = RemapIndex(V);
+    if (V.V < 0 && size_t(-V.V - 1) < ImportFold.size()) V.V = ImportFold[size_t(-V.V - 1)];
+    return V;
+}
+
 int32 FPackage::NameIndex(const std::string& S)
 {
     // Only the base of a numbered name reaches the table.
@@ -292,11 +346,28 @@ bool FPackage::Save(const std::string& OutBaseNoExt, std::string* Err) const
     FPackage* Self = const_cast<FPackage*>(this);
     Self->NameIndex(PackageName);
 
+    FoldOwnImports();
+    struct FUnfold { std::vector<int32>& Fold; ~FUnfold() { Fold.clear(); } } Unfold{ ImportFold };
+    const int32 NumImports = int32(std::count_if(ImportFold.begin(), ImportFold.end(), [](int32 V) { return V < 0; }));
+
     // Pass one: run every payload only to collect FNames.
     for (const FExport& E : Exports)
     {
         FArc Discard(Self);
         E.Serialize(Discard);
+    }
+
+    /* The loader reads each name-map entry into a NAME_SIZE buffer, the NUL included (NameTypes.h 36), and stops at a
+       longer one with "String is too long", misreading every later name (UnrealNames.cpp 2657-2672). */
+    for (const std::string& N : Names)
+    {
+        const size_t Chars = std::count_if(N.begin(), N.end(), [](char C) { return (uint8(C) & 0xC0) != 0x80; });
+        if (Chars >= 1024)
+        {
+            if (Err) *Err = "the name '" + N.substr(0, 32) + "...' is too long: " + std::to_string(Chars)
+                          + " characters, where an FName holds at most 1023 (NAME_SIZE)";
+            return false;
+        }
     }
 
     // The name table is stored sorted case-insensitively; indices follow that order.
@@ -306,13 +377,16 @@ bool FPackage::Save(const std::string& OutBaseNoExt, std::string* Err) const
     for (int32 I = 0; I < int32(Names.size()); ++I) Self->NameLookup[Lower(Names[size_t(I)])] = I;
     Self->bNamesFinal = true;
 
-    // Pass two: real bytes.
+    // Pass two: real bytes, and every object each payload names (Recording), for its preload dependencies below.
     std::vector<std::vector<uint8>> Payloads;
+    std::vector<std::vector<int32>> Named(Exports.size());
     Payloads.reserve(Exports.size());
-    for (const FExport& E : Exports)
+    for (size_t I = 0; I < Exports.size(); ++I)
     {
         FArc Ar(Self);
-        E.Serialize(Ar);
+        Self->Recording = &Named[I];
+        Exports[I].Serialize(Ar);
+        Self->Recording = nullptr;
         Payloads.push_back(std::move(Ar.B));
     }
 
@@ -329,8 +403,10 @@ bool FPackage::Save(const std::string& OutBaseNoExt, std::string* Err) const
     }
 
     FArc ImportTable(Self);
-    for (const FImport& I : Imports)
+    for (size_t Row = 0; Row < Imports.size(); ++Row)
     {
+        if (ImportFold[Row] >= 0) continue;         // written as this package's own export (FoldOwnImports)
+        const FImport& I = Imports[Row];
         ImportTable.Name(I.ClassPackage);
         ImportTable.Name(I.ClassName);
         ImportTable.Idx(I.Outer);
@@ -338,17 +414,52 @@ bool FPackage::Save(const std::string& OutBaseNoExt, std::string* Err) const
         if (bUncooked) ImportTable.Name("None");    // PackageName: only set for a package override
     }
     const int32 ImportEntrySize = bUncooked ? kUncookedImportEntrySize : kImportEntrySize;
-    if (ImportTable.B.size() != size_t(ImportEntrySize) * Imports.size())
+    if (ImportTable.B.size() != size_t(ImportEntrySize) * size_t(NumImports))
         return Fail("import entry size drifted");
 
-    // EDL table: one flat run of FPackageIndex; each export row gives its first index plus four per-phase counts.
-    FArc PreloadDeps(Self);
-    std::vector<int32> FirstDep(Exports.size(), -1);
-    std::vector<std::vector<int32>> CreateBeforeCreate(Exports.size());
+    /*
+    EDL table: one flat run of FPackageIndex; each export row gives its first index plus four per-phase counts. What
+    an export declares is completed here the way the cook completes it (SavePackage.cpp 3962-4140), so every export
+    gets what the loader needs of it whichever writer built it:
+    - serialize-before-create: its class and its archetype (3969-3972). The create step fetches both with
+      bCheckSerialized, the archetype at serialize time for an export found in memory (AsyncLoading.cpp 2867, 3191).
+    - create-before-create: its outer and its super (4070-4073), as BP_LiftPod's overrides list their native event.
+    - serialize-before-serialize, on a class: the class and archetype of each default subobject of its CDO
+      (UBlueprintGeneratedClass::GetPreloadDependencies, BlueprintGeneratedClass.cpp 1437-1446). The CDO the class makes
+      while it is serialized (Class.cpp 4632-4634) builds each from that archetype as it stands.
+    - create-before-serialize: every object its payload names, the DependsMap (4043-4068), bar a class's own CDO, which
+      the class makes itself. The linker resolves each index as whatever is created by then, with no load and no check
+      (AsyncLoading.cpp 3188; LinkerLoad.cpp 5397-5421): one not created yet reads back null.
+    An entry another list already orders is left out (4104-4117), and so is anything in /Script/CoreUObject, which is
+    compiled in and never waited on (3899, 3947). Every entry is the index as Idx writes it (Written), so an import
+    folded onto an export is that export; the folded package itself is no dependency (check(!Dep.IsNull()),
+    AsyncLoading.cpp 2459-2499), and an entry a list already has is dropped.
+    */
+    std::vector<bool> CoreImport(size_t(NumImports), false);   // by written import row: under /Script/CoreUObject
+    for (size_t Row = 0; Row < Imports.size(); ++Row)
+    {
+        if (ImportFold[Row] >= 0) continue;
+        const FImport* I = &Imports[Row];
+        while (I && I->Outer.V < 0) I = ImportAt(I->Outer);
+        if (I && I->Outer.V == 0 && I->ObjectName == "/Script/CoreUObject") CoreImport[size_t(-ImportFold[Row] - 1)] = true;
+    }
+    auto InCoreUObject = [&](int32 V) { return V < 0 && size_t(-V - 1) < CoreImport.size() && CoreImport[size_t(-V - 1)]; };
+    auto Listed = [](const std::vector<int32>& List, int32 V) { return std::find(List.begin(), List.end(), V) != List.end(); };
+    auto Put = [&](std::vector<int32>& Into, int32 V) {         // V as written
+        if (V != 0 && !InCoreUObject(V) && !Listed(Into, V)) Into.push_back(V);
+    };
+    auto Add = [&](std::vector<int32>& Into, FIndex Ref) { Put(Into, Written(Ref).V); };
+    std::vector<std::array<std::vector<int32>, 4>> Deps(Exports.size());   // serBeforeSer, createBeforeSer, serBeforeCreate, createBeforeCreate
     for (size_t I = 0; I < Exports.size(); ++I)
     {
         const FExport& E = Exports[I];
-        CreateBeforeCreate[I] = E.CreateBeforeCreate;
+        const std::vector<int32>* const Declared[4] = { &E.SerBeforeSer, &E.CreateBeforeSer, &E.SerBeforeCreate, &E.CreateBeforeCreate };
+        for (size_t Phase = 0; Phase < 4; ++Phase)
+            for (int32 V : *Declared[Phase])
+            {
+                const int32 To = Written(FIndex{ V }).V;
+                if (To != 0 && !Listed(Deps[I][Phase], To)) Deps[I][Phase].push_back(To);
+            }
 
         // An export that declares nothing gets CreateBeforeCreate on the objects its own row references.
         if (E.SerBeforeSer.empty() && E.CreateBeforeSer.empty()
@@ -356,26 +467,60 @@ bool FPackage::Save(const std::string& OutBaseNoExt, std::string* Err) const
         {
             for (FIndex Ref : { E.ClassIndex, E.SuperIndex, E.TemplateIndex, E.OuterIndex })
             {
-                if (Ref.V == 0) continue;
-                std::vector<int32>& Into = CreateBeforeCreate[I];
-                if (std::find(Into.begin(), Into.end(), Ref.V) == Into.end()) Into.push_back(Ref.V);
+                const int32 To = Written(Ref).V;
+                if (To != 0 && !Listed(Deps[I][3], To)) Deps[I][3].push_back(To);
             }
         }
-
-        const size_t Count = E.SerBeforeSer.size() + E.CreateBeforeSer.size()
-                           + E.SerBeforeCreate.size() + CreateBeforeCreate[I].size();
-        FirstDep[I] = Count ? int32(PreloadDeps.B.size() / 4) : -1;
-        const std::vector<int32>* const Phases[4] = {
-            &E.SerBeforeSer, &E.CreateBeforeSer, &E.SerBeforeCreate, &CreateBeforeCreate[I]
+        else
+        {
+            for (FIndex Ref : { E.ClassIndex, E.TemplateIndex }) Add(Deps[I][2], Ref);
+            for (FIndex Ref : { E.OuterIndex, E.SuperIndex }) Add(Deps[I][3], Ref);
+        }
+    }
+    for (size_t I = 0; I < Exports.size(); ++I)
+    {
+        const FExport& E = Exports[I];
+        const int32 Cdo = Written(E.OuterIndex).V;
+        if (!(E.ObjectFlags & RF_DefaultSubObject) || Cdo <= 0 || !(Exports[size_t(Cdo - 1)].ObjectFlags & RF_ClassDefaultObject)) continue;
+        const int32 Class = Written(Exports[size_t(Cdo - 1)].ClassIndex).V;
+        if (Class > 0) for (FIndex Ref : { E.ClassIndex, E.TemplateIndex }) Add(Deps[size_t(Class - 1)][0], Ref);
+    }
+    for (size_t I = 0; I < Exports.size(); ++I)
+    {
+        std::vector<int32>& SerBeforeSer = Deps[I][0];
+        std::vector<int32>& CreateBeforeSer = Deps[I][1];
+        std::vector<int32>& SerBeforeCreate = Deps[I][2];
+        std::vector<int32>& CreateBeforeCreate = Deps[I][3];
+        for (int32 V : Named[I])
+        {
+            const bool bOwnCdo = V > 0 && (Exports[size_t(V - 1)].ObjectFlags & RF_ClassDefaultObject)
+                                 && Written(Exports[size_t(V - 1)].ClassIndex).V == int32(I) + 1;
+            if (V != int32(I) + 1 && !bOwnCdo) Put(CreateBeforeSer, V);
+        }
+        auto Drop = [&](std::vector<int32>& List, auto Redundant) {
+            List.erase(std::remove_if(List.begin(), List.end(), [&](int32 V) { return InCoreUObject(V) || Redundant(V); }), List.end());
         };
-        for (const std::vector<int32>* List : Phases)
-            for (int32 V : *List) PreloadDeps.I32(V);
+        Drop(SerBeforeSer, [&](int32 V) { return Listed(SerBeforeCreate, V); });
+        Drop(CreateBeforeSer, [&](int32 V) { return Listed(SerBeforeCreate, V) || Listed(SerBeforeSer, V) || Listed(CreateBeforeCreate, V); });
+        Drop(SerBeforeCreate, [](int32) { return false; });
+        Drop(CreateBeforeCreate, [](int32) { return false; });
+    }
+
+    FArc PreloadDeps(Self);
+    std::vector<int32> FirstDep(Exports.size(), -1);
+    for (size_t I = 0; I < Exports.size(); ++I)
+    {
+        size_t Count = 0;
+        for (const std::vector<int32>& List : Deps[I]) Count += List.size();
+        FirstDep[I] = Count ? int32(PreloadDeps.B.size() / 4) : -1;
+        for (const std::vector<int32>& List : Deps[I])
+            for (int32 V : List) PreloadDeps.I32(V);
     }
     if (bUncooked)
     {
         // The editor writes no EDL table; the count is -1, not 0, and every export row says -1 too.
         PreloadDeps.B.clear();
-        for (size_t I = 0; I < Exports.size(); ++I) { FirstDep[I] = -1; CreateBeforeCreate[I].clear(); }
+        for (size_t I = 0; I < Exports.size(); ++I) { FirstDep[I] = -1; for (std::vector<int32>& List : Deps[I]) List.clear(); }
     }
     const int32 PreloadCount = bUncooked ? -1 : int32(PreloadDeps.B.size() / 4);
 
@@ -410,7 +555,7 @@ bool FPackage::Save(const std::string& OutBaseNoExt, std::string* Err) const
         S.I32(0); S.I32(0);                         // GatherableTextData count/offset
         S.I32(int32(Exports.size()));
         S.I32(O.ExportOff);
-        S.I32(int32(Imports.size()));
+        S.I32(NumImports);
         S.I32(O.ImportOff);
         S.I32(O.DependsOff);
         S.I32(0); S.I32(0);                         // SoftPackageReferences count/offset
@@ -472,10 +617,10 @@ bool FPackage::Save(const std::string& OutBaseNoExt, std::string* Err) const
             }
         }
         // TBitArray: bit count, then one uint32 per 32 bits. Every import counts as used in game.
-        I32Into(DepBlock, int32(Imports.size()));
-        for (size_t Word = 0; Word * 32 < Imports.size(); ++Word)
+        I32Into(DepBlock, NumImports);
+        for (size_t Word = 0; Word * 32 < size_t(NumImports); ++Word)
         {
-            const size_t Bits = Imports.size() - Word * 32;
+            const size_t Bits = size_t(NumImports) - Word * 32;
             I32Into(DepBlock, Bits >= 32 ? int32(0xFFFFFFFF) : int32((1u << Bits) - 1));
         }
         I32Into(DepBlock, 0);                       // SoftPackageUsedInGame: no soft references
@@ -518,10 +663,7 @@ bool FPackage::Save(const std::string& OutBaseNoExt, std::string* Err) const
         ExportTable.Bool(false);                    // bNotAlwaysLoadedForEditorGame
         ExportTable.Bool(E.bIsAsset);
         ExportTable.I32(FirstDep[I]);
-        ExportTable.I32(bUncooked ? 0 : int32(E.SerBeforeSer.size()));
-        ExportTable.I32(bUncooked ? 0 : int32(E.CreateBeforeSer.size()));
-        ExportTable.I32(bUncooked ? 0 : int32(E.SerBeforeCreate.size()));
-        ExportTable.I32(bUncooked ? 0 : int32(CreateBeforeCreate[I].size()));
+        for (const std::vector<int32>& List : Deps[I]) ExportTable.I32(int32(List.size()));
     }
     if (ExportTable.B.size() != size_t(kExportEntrySize) * Exports.size())
         return Fail("export entry size drifted from 104 bytes");

@@ -19,17 +19,20 @@ def _ref(s):
 def _node(s):
     """runscript's parser plus what latent / async / spawn bodies use. Nodes runscript already read keep its val."""
     op, mem = s.b[s.o], s.mem
-    if op not in (0, 0x48, 0x19, 0x20, 0x2E, 0x2F, 0x30, 0x4B, 0x5B, 0x5C, 0x63, 0x64):
+    if op not in (0, 0x48, 0x19, 0x20, 0x2E, 0x2F, 0x30, 0x4B, 0x5B, 0x5C, 0x63, 0x64, 0x44, 0x5D, 0x61, 0x62):
         return _parse(s)                                                     # final calls too: runscript marks an export callee own
     s.u8()
     n = Node(op, mem)
     if op in (0, 0x48, 0x64): n.val, n.owner = s.fieldpath().split('@')
-    if op == 0x19: n.kids.append(s.node()); s.i32(); s.fieldpath(); n.kids.append(s.node())
+    if op == 0x19: n.kids.append(s.node()); s.i32(); n.rvalue, n.rvalue_owner = s.fieldpath().split('@'); n.kids.append(s.node())
     elif op in (0x20, 0x2E, 0x2F): n.val = _ref(s)
     elif op == 0x63: n.val = _ref(s); s.args(n.kids)                        # the signature, the dispatcher, its args
     elif op == 0x4B: n.val = s.name()
     elif op == 0x5B: n.val = s.i32()
     elif op == 0x5C: n.kids += [s.node(), s.node()]
+    elif op in (0x62, 0x44): n.kids += [s.node(), s.node()]                  # RemoveMulticastDelegate; LetDelegate
+    elif op == 0x5D: n.kids.append(s.node())                                 # ClearMulticastDelegate
+    elif op == 0x61: n.val = s.name(); n.kids += [s.node(), s.node()]        # BindDelegate: name, variable, object
     if op in (0x2E, 0x64): n.kids.append(s.node())
     if op == 0x2F:
         s.i32()
@@ -41,10 +44,33 @@ def _node(s):
 
 
 P.node = _node
+_parse_casts = P.node
+
+
+def _node_casts(s):
+    """The casts runscript's parser leaves out: EX_PrimitiveCast (its cast byte), EX_InterfaceContext, and the
+    interface casts EX_ObjToInterfaceCast / EX_CrossInterfaceCast / EX_InterfaceToObjCast (their class by bare name)."""
+    op, mem = s.b[s.o], s.mem
+    if op not in (0x38, 0x51, 0x52, 0x54, 0x55): return _parse_casts(s)
+    s.u8()
+    n = Node(op, mem)
+    if op == 0x38: n.val = s.u8()
+    elif op != 0x51: n.val = _ref(s)
+    n.kids.append(s.node())
+    return n
+
+
+P.node = _node_casts
 
 
 class Struct(list):
     def __init__(s, name, vals): super().__init__(vals); s.name = name
+
+
+class Written(dict):
+    """What an EX_StructConst writes, member name -> value, when VM.struct_const names its members. execStructConst
+    steps each literal into its member of the destination itself (ScriptCore.cpp 3376-3405), so an EX_Let of one
+    leaves a member it does not write (a Transient one) as the destination had it."""
 
 
 class Obj:
@@ -59,6 +85,22 @@ class Obj:
     def __repr__(s): return '<%s>' % s.cls
 
 
+class _Stale:
+    def __repr__(s): return '<stale: the destination keeps its previous value>'
+
+
+STALE = _Stale()     # what a None context with no r-value writes: nothing (VM.null_rvalues)
+_CLEARED = {'IntProperty': 0, 'Int64Property': 0, 'ByteProperty': 0, 'EnumProperty': 0, 'FloatProperty': 0.0,
+            'DoubleProperty': 0.0, 'BoolProperty': False, 'StrProperty': '', 'NameProperty': 'None', 'TextProperty': ''}
+
+
+def cleared(ftype):
+    """FProperty::ClearValue of a property class, as this VM holds values: zero, empty, or None for an object."""
+    if ftype in ('ArrayProperty', 'SetProperty'): return []
+    if ftype in ('MapProperty', 'StructProperty'): return {}
+    return _CLEARED.get(ftype)
+
+
 class VM:
     """One cooked class run the way the VM would, for what runscript cannot: latent calls, the ubergraph's persistent
     frame, delegate binds, calls and sets on other objects. Engine calls are logged as (name, context, args) and
@@ -70,8 +112,36 @@ class VM:
         s.self = Obj(os.path.basename(base) + '_C', **self_vars)
         s.frames, s.latent, s.binds, s.log, s.scripts, s.mem = {}, [], [], [], {}, {}
         s.isa = isa or (lambda o, cls: isinstance(o, Obj) and o.cls == cls)
+        s.null_rvalues = False      # True: an EX_Context on None does what ProcessContextOpcode does (none_context)
+        s.struct_const = None       # set: (struct name, literal values) -> Written, the members an EX_StructConst writes
+        s.accessed_none = []        # (function, mem) of each EX_Context run on None: an 'Accessed None' script warning
+        s.ref_params = False        # True: a script callee's reference parameters write back into their arguments (ref_writeback)
+        s.env_log = []              # with ref_params, each call's frame as it starts, so ref_writeback finds the callee's
 
     def new(s, **vars): return Obj(s.self.cls, **vars)
+
+    def ref_writeback(s, fn, args, env, store):
+        """A script callee's reference parameter is its argument's own variable: ProcessScriptFunction hands the callee an
+        FOutParmRec at the address the argument left (ScriptCore.cpp 865-890). What the callee left in each is stored
+        back through its argument, which runs on the caller's frame object like every argument (868)."""
+        outs = runscript.params_of(s.base, fn, 0x100)
+        for parm, a in zip(s.script(fn)[2], args):
+            if parm in outs and parm in env: store(a, env[parm])
+
+    def frame(s, me, uber):
+        """The persistent frame of ubergraph `uber` on object me: one per object here; a subclass running a class chain
+        keys it by the ubergraph too, as GetPersistentUberGraphFrame keeps one per class (BlueprintGeneratedClass.cpp)."""
+        return s.frames.setdefault(id(me), {})
+
+    def none_context(s, n, keep):
+        """EX_Context on a None object with null_rvalues on, as ProcessContextOpcode runs it (ScriptCore.cpp 2940-2953):
+        the r-value property is cleared in the result slot, so the destination reads zero; with no r-value nothing is
+        written - STALE, which a Let or EX_Return (keep) passes on, so their destination keeps its previous value.
+        Anywhere else STALE reads as None, the zeroed slot a parameter or a context object starts as."""
+        if not n.rvalue: return STALE if keep else None
+        owner = n.rvalue_owner.split(':', 1)[-1] if n.rvalue_owner.startswith('exp[') else None
+        types = runscript.props_of(s.base, owner) if owner in s.exports else {}
+        return cleared(types.get(n.rvalue.split('.')[-1]))
 
     def script(s, fn):
         if fn not in s.scripts:
@@ -82,14 +152,15 @@ class VM:
     def call(s, fn, *args, on=None, **parms):
         me = on or s.self
         stmts, at, names = s.script(fn)
-        env = s.frames.setdefault(id(me), {}) if fn.startswith('ExecuteUbergraph_') else {}   # the persistent frame
+        env = s.frame(me, fn) if fn.startswith('ExecuteUbergraph_') else {}   # the persistent frame
         env.update(zip(names, args)); env.update(parms)
+        if s.ref_params: s.env_log.append(env)
 
         def local(n):
             assert n.owner.endswith(':' + fn), '%s uses %s of %s, a property of another function' % (fn, n.val, n.owner)
             return n.val
 
-        def ev(n, ctx=me):
+        def ev(n, ctx=me, keep=False):
             o = n.op
             if o in (0, 0x48): return env.get(local(n), 0)
             if o == 1: return ctx.vars.get(n.val, 0)
@@ -101,12 +172,20 @@ class VM:
             if o == 0x4B: return ('delegate', n.val, me)                   # EX_InstanceDelegate binds Stack.Object
             if o in (0x25, 0x26): return o - 0x25
             if o in (0x27, 0x28): return o == 0x27
-            if o == 0x2F: return Struct(n.val, [ev(k) for k in n.kids])
+            if o == 0x2F: return (s.struct_const or Struct)(n.val, [ev(k) for k in n.kids])
             if o == 0x2E:
                 v = ev(n.kids[0]); return v if s.isa(v, n.val) else None
+            if o in (0x52, 0x54, 0x55):                     # an interface cast: the object behind it, if it is of the class
+                v = ev(n.kids[0]); return v if v not in (None, 0) and s.isa(v, n.val) else None
+            if o == 0x51: return ev(n.kids[0])              # EX_InterfaceContext: the object behind the interface
+            if o == 0x38:                                   # CST_ObjectToBool / CST_InterfaceToBool: GetObject() != null
+                if n.val not in (0x47, 0x49): raise SystemExit('vm: PrimitiveCast %#x' % n.val)
+                return ev(n.kids[0]) not in (None, 0)
             if o == 0x19:
                 obj = ev(n.kids[0])
-                return None if obj is None else ev(n.kids[1], obj)
+                if obj is None: s.accessed_none.append((fn, n.mem))  # ProcessContextOpcode, ScriptCore.cpp 2904-2937
+                if obj is None and s.null_rvalues: return s.none_context(n, keep)
+                return None if obj is None else ev(n.kids[1], obj, keep)
             if o == 0x42:                                   # a struct member; raw-pointer reads land here too
                 base = ev(n.kids[0])
                 if isinstance(base, (runscript.Slot, runscript.Free)): return base[n.val]
@@ -123,9 +202,21 @@ class VM:
                     if parm in runscript.params_of(s.base, name, 0x100) and a.op not in runscript.ADDRESSABLE \
                             and not (a.op in (0x19, 0x1A) and a.kids[1].op in runscript.ADDRESSABLE):
                         raise SystemExit('vm: %s: reference parameter %s gets a non-variable (op %02x), which crashes the VM' % (name, parm, a.op))
-                return s.call(name, *[ev(a) for a in n.kids], on=ctx)
+                vals, first = [ev(a) for a in n.kids], len(s.env_log)
+                r = s.call(name, *vals, on=ctx)
+                if s.ref_params: s.ref_writeback(name, n.kids, s.env_log[first], store)
+                return None if r is STALE and not keep else r
             if o in (0x1B, 0x45, 0x1C, 0x46, 0x68):
                 runscript.native_refs(n)
+                if name.startswith(('Array_', 'Set_', 'Map_')) and n.kids and n.kids[0].op in (0x19, 0x1A) \
+                        and ev(n.kids[0].kids[0]) in (None, 0):
+                    # The container is a member of a null object, so the thunk finds no container property: it sets
+                    # bArrayContextFailed and returns, the rest of its arguments unread (KismetArrayLibrary.h 278-286).
+                    # Only an EX_Context rewinds and skips past them (ScriptCore.cpp 2896-2902).
+                    if ctx is me: raise SystemExit('vm: %s on a null container outside a context: the VM runs its '
+                                                   'arguments as statements, and EX_EndFunctionParms steps back onto '
+                                                   'itself forever (ScriptCore.cpp 2366-2370)' % name)
+                    return None
                 if name in runscript.CONTAINERS: return runscript.CONTAINERS[name](ev, store, n.kids)
                 if name in runscript.MATH: return runscript.MATH[name](*[ev(a) for a in n.kids])
                 vals = [ev(a) for a in n.kids]
@@ -161,16 +252,35 @@ class VM:
         pc = 0
         for _ in range(100000):
             n = stmts[pc]; o = n.op; pc += 1
-            if o in (0xF, 0x14, 0x5F): locate(n.kids[0])(ev(n.kids[1]))
+            if o in (0xF, 0x14, 0x5F):
+                # EX_Let steps the value into the destination itself, so a None context's STALE keeps it; EX_LetBool /
+                # EX_LetObj step it into a local that starts false / NULL, then store that (ScriptCore.cpp 2688-2800).
+                put, v = locate(n.kids[0]), ev(n.kids[1], keep=o == 0xF)
+                if isinstance(v, Written) and isinstance(ev(n.kids[0]), dict): v = Written({**ev(n.kids[0]), **v})
+                if v is not STALE: put(False if v is None and o == 0x14 and s.null_rvalues else v)
             elif o == 0x64:                                 # LetValueOnPersistentFrame: into the ubergraph's frame
-                assert n.owner.split(':')[-1].startswith('ExecuteUbergraph_'), n.owner
-                s.frames.setdefault(id(me), {})[n.val] = ev(n.kids[0])
+                uber = n.owner.split(':', 1)[-1]           # exp[2]:ExecuteUbergraph_A::Gun: a namespaced class's '::'
+                uber = uber.split("'")[1] if "'" in uber else uber
+                assert uber.startswith('ExecuteUbergraph_'), n.owner
+                s.frame(me, uber)[n.val] = ev(n.kids[0])
             elif o == 0x5C:                                 # AddMulticastDelegate(Obj.Prop, delegate)
                 t = n.kids[0]
                 obj, prop = (ev(t.kids[0]), t.kids[1].val) if t.op == 0x19 else (me, t.val)
+                if obj is None:                             # Accessed None, and no address: nothing added (ScriptCore.cpp 3098)
+                    s.accessed_none.append((fn, t.mem)); continue
                 _, dfn, dobj = ev(n.kids[1])
-                s.binds.append((obj, prop, dfn, dobj))
-            elif o == 0x63:                                 # CallMulticastDelegate: the dispatcher, then its arguments
+                if (obj, prop, dfn, dobj) not in s.binds: s.binds.append((obj, prop, dfn, dobj))   # AddUnique
+            elif o in (0x62, 0x5D):                         # Remove(Obj.Prop, delegate): one match; Clear(Obj.Prop): all
+                t = n.kids[0]
+                obj, prop = (ev(t.kids[0]), t.kids[1].val) if t.op == 0x19 else (me, t.val)
+                drop = [b for b in s.binds if b[0] is obj and b[1] == prop]
+                if o == 0x62:
+                    _, dfn, dobj = ev(n.kids[1])
+                    drop = [b for b in drop if b[2:] == (dfn, dobj)][:1]
+                for b in drop: s.binds.remove(b)
+            elif o == 0x44: locate(n.kids[0])(ev(n.kids[1]))                    # LetDelegate
+            elif o == 0x61: locate(n.kids[0])(('delegate', n.val, ev(n.kids[1])))   # BindDelegate(name, var, obj)
+            elif o == 0x63:                                # CallMulticastDelegate: the dispatcher, then its arguments
                 t = n.kids[0]
                 obj, prop = (ev(t.kids[0]), t.kids[1].val) if t.op == 0x19 else (me, t.val)
                 vals = [ev(a) for a in n.kids[1:]]
@@ -180,7 +290,8 @@ class VM:
             elif o == 7:
                 if not ev(n.kids[0]): pc = at[n.val]
             elif o == 0x4E: pc = at[ev(n.kids[0])]
-            elif o == 4: return None if n.kids[0].op == 0xB else ev(n.kids[0])
+            elif o == 4: return None if n.kids[0].op == 0xB else ev(n.kids[0], keep=True)
+            elif o == 0x31: store(n.kids[0], [ev(k) for k in n.kids[1:]])   # SetArray: the variable, emptied, then each element
             elif o != 0xB: ev(n)
         raise SystemExit('vm: runaway loop in ' + fn)
 
@@ -197,10 +308,14 @@ class VM:
             if o is obj and p == prop: s.call(fn, *args, on=bound)
 
 
+ALWAYS_NEW = {'LoadAsset', 'LoadAssetClass'}    # "We always spawn a new load" (KismetSystemLibrary.cpp 2662, 2691)
+
+
 def latent_call(vm, ctx, *args):
     """A latent library call (Delay, LoadAsset, ...) as a native: recorded with its FLatentActionInfo and completion
-    delegate; like FindExistingAction, a second action with the same CallbackTarget and UUID is dropped."""
+    delegate; like FindExistingAction, a second action with the same CallbackTarget and UUID is dropped (Delay ignores
+    it, RetriggerableDelay only resets the one it has: either way one action resumes), except the ALWAYS_NEW calls."""
     info = next(a for a in args if isinstance(a, Struct) and a.name == 'LatentActionInfo')
     delegate = next((a for a in args if isinstance(a, tuple) and a[0] == 'delegate'), None)
-    if not any(p[2][1] == info[1] and p[2][3] is info[3] for p in vm.latent):
+    if vm.log[-1][0] in ALWAYS_NEW or not any(p[2][1] == info[1] and p[2][3] is info[3] for p in vm.latent):
         vm.latent.append((vm.log[-1][0], args[0], info, delegate))

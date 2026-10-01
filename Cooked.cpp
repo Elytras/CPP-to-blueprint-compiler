@@ -226,6 +226,40 @@ void FCookedPackage::CreateBeforeSerialize(int32 Export, int32 Dep)
         if (&O != &E && O.FirstExportDependency >= At) ++O.FirstExportDependency;
 }
 
+std::array<std::vector<int32>, 4> FCookedPackage::Dependencies(int32 Export) const
+{
+    const FCookedExport& E = Exports[size_t(Export)];
+    std::array<std::vector<int32>, 4> Out;
+    if (E.FirstExportDependency < 0) return Out;
+    const int32 Counts[4] = { E.SerBeforeSer, E.CreateBeforeSer, E.SerBeforeCreate, E.CreateBeforeCreate };
+    auto At = PreloadDependencies.begin() + E.FirstExportDependency;
+    for (size_t K = 0; K < 4; ++K)
+    {
+        Out[K].assign(At, At + Counts[K]);
+        At += Counts[K];
+    }
+    return Out;
+}
+
+void FCookedPackage::SetDependencies(int32 Export, const std::array<std::vector<int32>, 4>& Lists)
+{
+    FCookedExport& E = Exports[size_t(Export)];
+    const int32 Old = E.FirstExportDependency < 0 ? 0 : E.SerBeforeSer + E.CreateBeforeSer + E.SerBeforeCreate + E.CreateBeforeCreate;
+    const int32 At = E.FirstExportDependency < 0 ? int32(PreloadDependencies.size()) : E.FirstExportDependency;
+    std::vector<int32> Run;
+    for (const std::vector<int32>& L : Lists) Run.insert(Run.end(), L.begin(), L.end());
+    PreloadDependencies.erase(PreloadDependencies.begin() + At, PreloadDependencies.begin() + At + Old);
+    PreloadDependencies.insert(PreloadDependencies.begin() + At, Run.begin(), Run.end());
+    /* The engine reads each run from its own offset, so a run after this one only moves; one that had none keeps -1. */
+    for (FCookedExport& O : Exports)
+        if (&O != &E && O.FirstExportDependency >= At + Old) O.FirstExportDependency += int32(Run.size()) - Old;
+    E.FirstExportDependency = Run.empty() ? -1 : At;
+    E.SerBeforeSer = int32(Lists[0].size());
+    E.CreateBeforeSer = int32(Lists[1].size());
+    E.SerBeforeCreate = int32(Lists[2].size());
+    E.CreateBeforeCreate = int32(Lists[3].size());
+}
+
 namespace
 {
 /* E's payload with its tag list, which ended at At, replaced by List. */
@@ -1041,7 +1075,13 @@ bool ReadValueOf(const FCookedPackage& P, FReader& R, FPropertyDef& T, FDefaultV
         const std::string What = bMap ? "map" : "set";
         FPropertyDef* Sides[2] = { T.Inner.get(), bMap ? T.Value.get() : nullptr };
         /* No tag names a set's or a map's struct: one is read as a tag list, which an unnamed struct is written as. */
-        if (R.I32() != 0) { Why = "a " + What + " with removed elements"; return false; }
+        /* An inherited one's removed elements (a map's keys) come first; bytes among them would leave the size test
+           below nothing to go by. */
+        const int32 Removed = R.I32();
+        if (Removed < 0 || R.bBad) { Why = "a " + What + " removal count past its value"; return false; }
+        if (Removed && Sides[0]->Type == "ByteProperty") { Why = "a " + What + " with removed bytes"; return false; }
+        for (int32 I = 0; I < Removed; ++I)
+            if (!ReadValueOf(P, R, *Sides[0], D.Removed.emplace_back(), Why)) return false;
         const int32 Count = R.I32();
         if (Count < 0 || R.bBad) { Why = "a " + What + " count past its value"; return false; }
         /* Nor whether a byte side is an enum's names (8 bytes each) or plain bytes: the bytes left say, when the other

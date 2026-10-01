@@ -320,10 +320,14 @@ call, but it cannot be bound to a dispatcher, called on another object or called
 
 An event is a method named after an event the parent class exposes, such as `ReceiveBeginPlay`, `ReceiveTick` or
 `ReceiveActorBeginOverlap`. The engine calls it as it calls the event node you add in the editor, and overriding
-`ReceiveTick` also turns ticking on for the actor. Inside an override, `Base::Method()` runs the parent's version, the
-editor's Add call to parent function; C++ has no `Super`, so name the class you derive from. Every other call to a
-method goes by name, so the most derived override runs, also when the parent's own code makes the call. A `final`
-class or method has no override, so its calls go straight to the one function, and on `this` its body is copied in.
+`ReceiveTick` also turns ticking on for the actor or component. Inside an override, `Base::Method()` runs the parent's
+version, the editor's Add call to parent function; C++ has no `Super`, so name the class you derive from. In a class
+that does not declare Method, `Base::Method()` copies Base's body in, or, where it cannot, runs Base's function through
+an override of Method that AssetGen adds to your class, which only calls the parent's; a multicast goes by name with a
+warning.
+Every other call to a method goes by name, so the most derived override runs, also when the parent's own code makes
+the call. A `final` class or method has no override, so its calls go straight to the one function, and on `this` its
+body is copied in.
 
 `UE_PURE` makes a pure function, drawn without exec pins. A `T&` parameter is an output, a pass-by-reference pin. A
 `static` method runs on the class default object (the instance that holds Class Defaults), which has no world, so give
@@ -359,12 +363,11 @@ public:
 Watch for:
 
 - Do not write `override`: clang refuses it with `only virtual member functions can be marked 'override'`. The name
-  alone makes the override, and AssetGen does not check the parameter list against the event's:
-  `void ReceiveTick(int32 X)` still cooks as the `ReceiveTick` override, and the engine calls it with a float. Copy
-  the declaration from UeApi exactly.
-- A Blueprint class has one function per name. Of two non-inline methods with the same name, only the one with the
-  most parameters is cooked, and calls to the other are miscompiled with no message; such overloads are not built yet.
-  Rename one, or make the extra overloads `inline`.
+  alone makes the override, and AssetGen refuses a parameter list other than the event's:
+  `void ReceiveTick(int32 X)` fails with "the AActor::ReceiveTick it replaces is void (float)". Copy the declaration
+  from UeApi.
+- A Blueprint class has one function per name. Two non-inline methods with the same name are refused ("a second
+  function of that name"). Rename one, or make the extra overloads `inline`.
 - A function outside a class must be `inline`. Without it the call is refused with
   `call to an unknown function: Helper`. Lambdas and function pointers are refused.
 
@@ -435,9 +438,11 @@ Full rules: [Calling engine and game functions](REFERENCE.md#calling-engine-and-
 
 `UE_COMPONENT(Type, Name)` adds a component, as Add Component in the Components panel does. `Name` is an object
 variable, and each spawned actor gets its own instance, in place by the time its construction script and BeginPlay
-run. The first scene component is the root, and every later scene component attaches to it. The hierarchy is one
-level deep, with no sockets; nest components at run time with `AttachToComponent`. A component that is not a scene
-component, such as a movement component, attaches to nothing.
+run. The first scene component is the root, and every later scene component attaches to it. To place one elsewhere,
+write `Tip->SetupAttachment(Glow);` in `UE_DEFAULTS`, as a C++ constructor does: under another of the class's
+components, at a socket with `SetupAttachment(Glow, FName("Muzzle"))`, or under a component the class inherits, from
+a mod or game Blueprint parent or a native one (`SetupAttachment(Mesh)` in an `ACharacter` or `APlayerCharacter`
+child). A component that is not a scene component, such as a movement component, attaches to nothing.
 
 Set a component's defaults in `UE_DEFAULTS`, one `Comp->Field = value;` each, as you would in its Details panel.
 Assign a struct whole (`FVector(...)`, `FColor(R, G, B)`), and an asset with `&Asset`
@@ -488,7 +493,8 @@ public:
 Watch for:
 
 - The engine puts the root at the spawn transform and ignores the root's own location, rotation and scale. A plain
-  `USceneComponent` root hands them on to the components attached to it. A mesh or a light as the root keeps them,
+  `USceneComponent` root hands them on to the components attached to it. (A class whose parent already has a root,
+  such as a Blueprint parent or `ACharacter`, adds no root: its first scene component keeps its transform.) A mesh or a light as the root keeps them,
   and AssetGen warns that they are not applied. Declare a `USceneComponent` first.
 - `UE_DEFAULTS` is read when the mod is built and never runs. A call, an `if`, a `+=`, `nullptr`, or a member path
   such as `Lamp->RelativeLocation.Z = 50.0f;` is refused; the member path gets a misleading message about genueapi,
@@ -505,7 +511,9 @@ Full rules: [Components](REFERENCE.md#components), [Class defaults](REFERENCE.md
 
 `UKismetSystemLibrary::Delay(0.5f)` pauses the method it is in, as the Delay node does in an event graph. The method's
 locals and parameters keep their values, and the code after the call runs when the delay ends; in a loop, each round
-waits before the next one starts. The caller gets control back at the method's first wait. Leave out the world
+waits before the next one starts. An object in a local is kept only weakly across the wait, though: one the method
+made or loaded can be garbage-collected meanwhile and read None after it. The compiler warns where that can happen;
+keep such an object in a member. The caller gets control back at the method's first wait. Leave out the world
 context and the `FLatentActionInfo`: the compiler supplies both, and `RetriggerableDelay`, `MoveComponentTo` and the
 other latent functions are called the same way. Never pass the `FLatentActionInfo` yourself. With the world context
 the call is refused, and without it (`Delay(1.0f, Info)`) it is not caught yet and compiles to a broken call.
@@ -554,9 +562,9 @@ public:
 
 Watch for:
 
-- A method that waits returns nothing, takes no reference parameters (`const&` included) and is not static. Anything
-  else is refused: a return value or a reference parameter with
-  `a function that resumes later returns nothing and takes no reference parameters`, a static method with
+- A method that waits returns nothing, takes no non-const reference parameters (a `const&` is copied when it is
+  called) and is not static. Anything else is refused: a return value or a `T&` parameter with
+  `a function that resumes later returns nothing and takes no non-const reference parameters`, a static method with
   `a static function has no object whose ubergraph frame could keep its locals`. Store a result in a member, or
   broadcast a dispatcher when the method is done.
 - Each object keeps one copy of a waiting method's locals, not one per call. Calling the method again before it
@@ -702,8 +710,7 @@ Watch for:
   no OnRep. Assign the whole value, or call the OnRep yourself.
 - The engine drops a Server RPC unless the client that calls it owns the actor.
 - Keep `inline` off every method that carries a marker, and off every OnRep. An inline method is no UFunction, so
-  `UE_SERVER inline void F()` runs locally as plain code, and an inline OnRep leaves every write calling a function the
-  class does not have. Neither is diagnosed.
+  both are refused.
 
 Full rules: [Replication](REFERENCE.md#replication), [RPCs](REFERENCE.md#rpcs). Example:
 [examples/NetworkedSwitch.cpp](examples/NetworkedSwitch.cpp).
@@ -1063,7 +1070,7 @@ dumps as JSON. The include dir and its parent are both on the include path, so `
 `UeApi/`. A quoted include relative to the source's own folder works as in any clang build. On Linux, clang still parses
 for the game's Windows target; the [README](README.md) says what that means for includes. clang's own errors go to the
 console, and the compile then ends with `clang rejected <source> (diagnostics above)`. The syntax tree can run to
-hundreds of MB; it goes to the temp folder and is deleted when the compile ends, and several compiles can run at once.
+hundreds of MB; it streams from clang through a pipe and is never written to disk, and several compiles can run at once.
 
 **What it writes.** One cooked package, a `.uasset` and a `.uexp`, for each of these:
 
@@ -1328,7 +1335,7 @@ use a newer SDK or regenerate your own.
 | `Conv.h`, `Conv.json` | Every Kismet `Conv_XToY` the compiler can use as an implicit conversion or an explicit cast. |
 | `Ops.json` | The Kismet functions behind operators on structs and soft pointers (`==`, `+`, ...). |
 | `Containers.h` | The Kismet `Array_*`, `Set_*` and `Map_*` functions, as methods of `TArray`, `TSet` and `TMap`. |
-| `Types.json` | Every enum and struct: package, engine name, size, alignment and fields. |
+| `Types.json` | Every enum and struct: package, engine name, size, alignment and fields, and whether an enum is an `enum class` (`form`), read off how the dump's properties of it are reflected. |
 | `Events.json` | The function flags of every `BlueprintEvent`, which an override inherits. |
 | `UeMeta.h` | The `UE_*` macros. Written by hand. |
 | `Types.h` | The integer spellings, `FString`, `FName`, `FText` and the container templates. Written by hand. |
@@ -1376,6 +1383,7 @@ markers of this kind, all written by the generator and read by the compiler. You
 | `<Member>__UeName` | The engine's name for a member or function the dumper respelled. |
 | `<Member>__UeScsNode` | The construction-script node of a component that a game Blueprint adds, through which a child class overrides the component's defaults. |
 | `<Member>__UeSubobject` | The default subobject that a native component member points at, which a mod class overrides by that name. |
+| `UeDefaultSubobjects` | Every default subobject a game Blueprint's default object exports, which a child class is loaded after. |
 | `<Member>__Replicated` | That a property replicates, and its RepNotify function. |
 | `<Function>__UeForward` | What `GetOuter`, `GetClass` and `GetName` really call. |
 
@@ -1412,6 +1420,11 @@ and `Types.h` from the SDK repo, and optionally run `tools/genueassets.py`. What
   member the dumper renamed. Without it, genueapi stops with
   `no <path>: run genueapi on the SDK inside its Dumper-7 dump, not a copy of it`. The SDK folder and the object dump
   must come from the same dump.
+- **Give it the game's content with `--game <extracted Content dir>`.** The dump carries neither a class's flags,
+  ClassWithin and config name nor a native class's interfaces. genueapi reads the game's cooked Blueprints for them
+  (about 20 seconds): each game Blueprint's own tail, and the native interfaces a native class implements, as the
+  Blueprints that override one's function show. Without it, a mod deriving from a game Blueprint gets its nearest
+  native ancestor's tail, and an override of a native ancestor's interface function is taken for a new function.
 - **Your own mods are left out.** genueapi skips every class whose package a mod in the folder above `<UeApi dir>`
   cooks (any `.cpp` or `.h` directly in that folder with a `UE_MOD_PACKAGE`), and the shared nested-container structs.
   Keep `UeApi/` inside your mods folder, and a dump taken with your mods loaded does not declare them a second time.
@@ -1436,7 +1449,7 @@ genueapi prints one line per table it writes, then a summary of counts. These li
 genueapi stops with exit status 1 when the object dump is missing, and on
 `base-class cycle between packages: <package> -> <package> -> ...`, which a mod cannot fix: report it with the dump.
 Run with fewer than two arguments, it prints only the last sentence of its help text, not a usage line; the usage is
-`genueapi.py <SDK dir> <UeApi dir>`.
+`genueapi.py <SDK dir> <UeApi dir> [--game <Content dir>]`.
 
 ## Editor API stubs
 
@@ -1527,7 +1540,7 @@ package. Those below need only Python 3's standard library.
 ### The test suite
 
 ```
-python tools/test_bytecode.py [--assetgen <assetgen>] [--ueapi <UeApi dir>] [--cases <file>]
+python tools/test_bytecode.py [--assetgen <assetgen>] [--ueapi <UeApi dir>] [--cases <file>] [--no-prefetch | --check-prefetch]
 ```
 
 It compiles every `tests/*.cpp` and every `examples/*.cpp`, runs the compiled functions offline against expected
@@ -1535,6 +1548,14 @@ results, and checks what the engine reads off the cooked files. It deletes `test
 checkout break each other. Pass `--ueapi` with the SDK's `UeApi`. `--cases <file>` also writes every offline run as
 JSON (arguments, members before and after, return value), for replaying the calls in game with a harness of your own.
 CI runs it on Linux and Windows.
+
+After those first compiles, the tests compile about 200 small mods one at a time. The suite makes them ahead: each run
+lists them in `assetgen-suite-prefetch.json` in the temp folder (one file for every checkout on the machine), and the
+next run starts them all at once in staging folders, so a test usually finds its compile done. A result is used only
+when the compile is the same in everything it reads, and its output is moved into place as if the test had compiled
+there; the line before the last says how many were ready. `--no-prefetch` compiles each one when the test asks;
+`--check-prefetch` also compiles each prefetched one directly and stops the run if anything differs. Deleting the
+JSON file only costs the next run its head start.
 
 ### Running a function offline
 
@@ -1768,7 +1789,7 @@ Each row gives the part of the message to look for, the reason, and what to writ
 | clang: `only virtual member functions can be marked 'override'` | The SDK declares engine functions non-virtual. The method's name alone makes the override. | `void ReceiveTick(float DeltaSeconds) { ... }` | [Overrides and parent calls](REFERENCE.md#overrides-and-parent-calls) |
 | `<Member>: a default is a value known when the mod is built - ...` | A member initializer is read when the mod is built and never runs, so it takes only a value known then. A class reference is not one yet. | Set it in `ReceiveBeginPlay`: `Kind = AActor::StaticClass();` | [Classes and variables](REFERENCE.md#classes-and-variables) |
 | `<Class>::UE_DEFAULTS: Charges is declared here - give it an initializer instead` | `UE_DEFAULTS` sets inherited variables and components, not the class's own. | `int32 Charges = 3;` | [Class defaults](REFERENCE.md#class-defaults) |
-| `latent call Delay: a function that resumes later returns nothing and takes no reference parameters` | The code after a wait resumes in the event graph, which has no return value and no out parameters. | Return `void`, take parameters by value and keep results in member variables | [Latent calls](REFERENCE.md#latent-calls) |
+| `latent call Delay: a function that resumes later returns nothing and takes no non-const reference parameters` | The code after a wait resumes in the event graph, which has no return value and no out parameters. | Return `void`, take parameters by value or `const&` and keep results in member variables | [Latent calls](REFERENCE.md#latent-calls) |
 | `static Calls lives in the ubergraph's frame, which only a function that makes a latent call runs in; make Calls a member` | A Blueprint function keeps nothing between calls (the ubergraph is the class's event graph). | A member variable | [Latent calls](REFERENCE.md#latent-calls) |
 | ``a delegate cannot bind Handle: an inline function is expanded where it is called, no UFunction (drop `inline`)`` | An inline method is pasted into its callers and is no function of the class. | Drop `inline` from the handler | [Event dispatchers](REFERENCE.md#event-dispatchers) |
 | ``TODO: a delegate can only bind a function of `this` `` | Not yet: the delegate binds the object whose code is running. | Bind a method of `this` that calls the other object: `void Forward(int32 P) { Other->Handle(P); }` | [Event dispatchers](REFERENCE.md#event-dispatchers) |
@@ -1827,8 +1848,6 @@ each topic.
 - Broadcast on a dispatcher that the class did not declare with `UE_DISPATCHER`, such as `OnDestroyed` or a parent
   class's dispatcher. Add, Remove and Clear work on any dispatcher. Give the declaring class a method that broadcasts,
   and call it. See [Event dispatchers](REFERENCE.md#event-dispatchers).
-- A delegate held in a variable or a parameter, `TDelegate<void()> Callback;`. Pass `{ this, &AMine::Handle }` where
-  the delegate is needed. See [Event dispatchers](REFERENCE.md#event-dispatchers).
 - A class as a default: `TSubclassOf<AActor> Kind = AActor::StaticClass();`, or a class value in a data asset's
   braces. Set it in `ReceiveBeginPlay`, or use a `TSoftClassPtr` with a path. See
   [Classes and variables](REFERENCE.md#classes-and-variables).
@@ -1870,18 +1889,10 @@ each topic.
 - `Weapons::Turret::StaticClass()` for a mod class in a namespace. It names the engine class that Turret inherits
   `StaticClass` from. Write `Turret::StaticClass()` inside the namespace, or let a `TSubclassOf<Weapons::Turret>`
   parameter, such as SpawnActor's, supply the class. See [Creating objects](REFERENCE.md#creating-objects).
-- `ReceiveTick` on a mod component class. It compiles and never ticks. Call a method of the component from its owner's
-  `ReceiveTick`. See [Classes and variables](REFERENCE.md#classes-and-variables).
 - A mod widget class. It has no designer layout, so it shows nothing of its own. For visible UI, create one of the
   game's widget Blueprints. See [Classes and variables](REFERENCE.md#classes-and-variables).
-- An `inline` OnRep function. The variable names a RepNotify the class does not have, and each assignment calls it by
-  name, which the engine treats as a fatal error: the first assignment would crash the game. Declare the OnRep without
-  `inline`. See [Replication](REFERENCE.md#replication).
-- `UE_REPLICATED` on a member of a `UE_STRUCT`. The marker is ignored. Replicate the class variable that holds the
-  struct. See [Replication](REFERENCE.md#replication).
 - An RPC, authority-only or cosmetic marker on an `inline` method. The marker is ignored, and the call runs locally.
   See [RPCs](REFERENCE.md#rpcs).
-- An RPC marker on a static method. Expect it to run locally, never over the network. See [RPCs](REFERENCE.md#rpcs).
 - An engine or game static marked authority-only or cosmetic, such as `UGameplayStatics::ApplyDamage` or
   `UGameplayStatics::PlaySound2D`. The editor's node skips an authority-only function on a client and a cosmetic one
   on a dedicated server; AssetGen's call runs both on every machine. Guard such a call with `HasAuthority()` or
@@ -1891,8 +1902,6 @@ each topic.
   [Latent calls](REFERENCE.md#latent-calls).
 - `UE_AWAIT` on a dispatcher with two or more parameters. The method resumes, but the values are not available. Bind
   a handler to read them. See [Waiting on events](REFERENCE.md#waiting-on-events).
-- `Cast<IHealth>(Other)` to a game interface. It compiles into a cast whose result may not fit the slot AssetGen gives
-  it; this was not checked. Use `TScriptInterface<IHealth>`. See [Interfaces](REFERENCE.md#interfaces).
 
 A few mistakes also compile without a message, because the construct itself works:
 
@@ -1923,9 +1932,10 @@ A few mistakes also compile without a message, because the construct itself work
 - Changing a game data asset, or a game Blueprint's defaults, in place in the pak. Change the loaded asset through its
   pointer in the game, or subclass the Blueprint and set its defaults in `UE_DEFAULTS`. See
   [Game assets](REFERENCE.md#game-assets).
-- A `uint8` `enum class` variable as the editor writes it, an Enum variable (EnumProperty). AssetGen writes a Byte
-  variable bound to the enum. Both are the same byte in the game; only tools that read the property type see a
-  difference. See [Enums](REFERENCE.md#enums).
+- The form of a game enum that no property uses. genueapi learns whether a game enum is an `enum class` from how the
+  dump's properties of it are reflected, and 249 of the SDK's 1445 enums have none; a variable of one is a Byte, which
+  differs from the editor's Enum variable only in type, and only if the enum is an `enum class`. See
+  [Enums](REFERENCE.md#enums).
 - Walking a `TSet` in place. A range-for over a `TSet` walks a copy, while a `TMap` walks its own slots. Only the cost
   differs. See [Loops](REFERENCE.md#loops).
 - Reusing a repeated pure call. It is evaluated each time it appears. To compute it once, keep the result in a local.

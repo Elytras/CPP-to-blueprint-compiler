@@ -112,6 +112,9 @@ public:
     /* S38: each FPackageIndex an FArc over this package writes goes through RemapIndex when it is set, so an export
        built in one package (a function a patch compiles) can be written in another's terms. */
     std::function<FIndex(FIndex)> RemapIndex;
+    /* When set, each FPackageIndex an FArc over this package writes (as written - Written - null left out) is appended here:
+       what a payload names, the cook's DependsMap. Save sets it around each payload; a patch sets it the same way. */
+    std::vector<int32>* Recording = nullptr;
     const std::vector<FExport>& ExportRows() const { return Exports; }
 
     void SetGuid(uint32 A, uint32 B, uint32 C, uint32 D) { PkgGuid[0] = A; PkgGuid[1] = B; PkgGuid[2] = C; PkgGuid[3] = D; }
@@ -149,6 +152,12 @@ private:
     uint32 PackageSource = 0;
     bool bUncooked = false;
     std::vector<FRegistryObject> RegistryObjects;
+
+    /* While Save runs: each import row's FPackageIndex as written (FoldOwnImports). Empty otherwise. */
+    mutable std::vector<int32> ImportFold;
+    void FoldOwnImports() const;
+    /* The FPackageIndex V is written as: through RemapIndex, then onto the import rows Save keeps. */
+    FIndex Written(FIndex V) const;
 };
 
 /* ASCII lowercase: FName and package-name comparisons are case-insensitive. */

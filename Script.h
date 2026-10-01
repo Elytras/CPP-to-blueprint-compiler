@@ -36,6 +36,7 @@ struct FDefaultValue
     FIndex Object;                      // Obj: the asset an ObjectProperty points at
     std::vector<FDefaultValue> Items;   // Array (also a set / map): one value per element, typed by the property's Inner; a map alternates key, value
     std::shared_ptr<std::vector<struct FPropertyDef>> Members;  // Struct, as a container's element: its own members (a lone struct's are FPropertyDef::Members)
+    std::vector<FDefaultValue> Removed; // a set / map read over the parent's value: its elements (a map's keys) taken out first
 };
 
 /* One ChildProperties entry. ElementSize must equal the type's runtime size; the engine lays the struct out from it. */
@@ -84,6 +85,8 @@ FPropertyDef StructParam(const std::string& Name, FIndex Struct, const std::stri
 FPropertyDef InterfaceParam(const std::string& Name, FIndex InterfaceClass, uint64 ExtraFlags = 0);
 /* An event dispatcher. Extra = its <Name>__DelegateSignature function. */
 FPropertyDef DispatcherParam(const std::string& Name, FIndex Signature, uint64 ExtraFlags = 0);
+/* A single-cast delegate, TDelegate<...>. Extra = its signature function. */
+FPropertyDef DelegateParam(const std::string& Name, FIndex Signature, uint64 ExtraFlags = 0);
 
 /* bUncooked=true adds the editor-only per-field metadata flag (FField::Serialize writes it when not
    cooking); the cooked layout leaves it off. */
@@ -104,6 +107,9 @@ bool NativeUnwritten(const std::string& StructName);
 
 /* Every object D points at, for the owning export's create-before-serialize edges. */
 void DefaultRefs(const FDefaultValue& D, std::vector<int32>& Out);
+/* The structs and enums P is typed by, container elements included: what its owner links against, for the owner's
+   serialize-before-serialize edges. */
+void TypeRefs(const FPropertyDef& P, std::vector<int32>& Out);
 
 /*
 Kismet bytecode buffer. MemorySize and StorageSize differ by design: a property reference is

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """usage: test_bytecode.py [--assetgen <exe>] [--ueapi <UeApi dir>] [--cases <file>] [--game <folder /Game is in>]
+                        [--sdk <Dumper-7 dump of the game>] [--no-prefetch | --check-prefetch]
 
 Compiles every test mod in AssetGen/tests and every example mod in AssetGen/examples, then checks what a mod can
 observe: its functions run offline (runscript.py, runvm.py for latent / delegate / cross-object code) against Python
@@ -9,8 +10,13 @@ defaults, references, which function a call reaches). Never the bytecode's shape
 --assetgen defaults to the first build found (ue-mods x64/Release, this repo's x64/Release, a CMake build/);
 --ueapi to ue-mods' BpMods/UeApi. Outside ue-mods, pass the UeApi of https://github.com/Elytras/DRG-Blueprint-Cpp-SDK.
 --cases also writes each offline run as a JSON case, which ue-mods' `bpcheck` command replays in the running game.
---game (the extracted game pak's FSD/Content) adds the S38 edits of the game's own packages; without it they are skipped."""
-import copy, glob, itertools, os, re, shutil, subprocess, sys
+--game (the extracted game pak's FSD/Content) adds the S38 edits of the game's own packages; without it they are skipped.
+The compiles the tests make one at a time after build() are prefetched: the last run's list of them, in
+assetgen-suite-prefetch.json in the temp folder (one for every checkout on the machine), runs on as many threads as
+build() uses, each in a staging folder, and a test whose compile is ready takes the result (see assetgen_compile).
+The line before the last says how many were. --no-prefetch compiles each one when the test asks, and still writes the
+list; --check-prefetch also compiles every prefetched one in place and stops the run on any difference."""
+import atexit, copy, glob, hashlib, itertools, json, os, posixpath, re, shutil, subprocess, sys, tempfile, threading, time
 os.environ['PYTHONIOENCODING'] = 'utf-8'   # the dump tools print non-ASCII names; read back as UTF-8, not the code page
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import runscript
@@ -34,25 +40,559 @@ ASSETGEN = option('--assetgen', [os.path.join(AG, '..', 'x64', 'Release', 'asset
                                  os.path.join(AG, 'x64', 'Release', 'assetgen.exe'), os.path.join(AG, 'build', 'assetgen')])
 UEAPI = option('--ueapi', [os.path.join(AG, '..', 'BpMods', 'UeApi')])
 GAME = option('--game', [])
+SDK = option('--sdk', [])       # invariants.py's rules read the engine's own classes off it; without, they skip them
+os.environ['INVARIANTS_UEAPI'] = UEAPI or ''
+if SDK: os.environ['INVARIANTS_SDK'] = SDK
 if not ASSETGEN or not UEAPI:
     sys.exit(__doc__)
 
 
 LOGS = {}      # what each test's compile printed
+WORKERS = max(1, (os.cpu_count() or 2) // 2)    # a compile or a rule run is one busy core; leave the rest to the machine
+
+
+def parallel(fn, items):
+    """fn over items on WORKERS threads, results in items' order. Each fn runs a subprocess, which frees the GIL."""
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(WORKERS) as pool:
+        return list(pool.map(fn, items))
+
+
+COMPILE_MB, RESERVE_MB = 1024, 2048     # an FSD.h mod's clang and DOM peak near 1 GB; what is left to the machine
+_START_LOCK, _STARTS = threading.Lock(), []
+
+
+def free_mb():
+    """Physical memory free for a new process, in MB, or None where it cannot be read."""
+    if os.name == 'nt':
+        import ctypes
+
+        class Status(ctypes.Structure):
+            _fields_ = [('dwLength', ctypes.c_ulong), ('dwMemoryLoad', ctypes.c_ulong)] + \
+                       [(n, ctypes.c_ulonglong) for n in ('total', 'avail', 'pagefile', 'pagefile_avail', 'virtual',
+                                                          'virtual_avail', 'extended')]
+        s = Status(dwLength=ctypes.sizeof(Status))
+        return s.avail >> 20 if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(s)) else None
+    try:
+        with open('/proc/meminfo') as f:
+            return next(int(l.split()[1]) >> 10 for l in f if l.startswith('MemAvailable:'))
+    except (OSError, StopIteration):
+        return None
+
+
+def run_compile(cmd, cwd=None):
+    """subprocess.run of one assetgen compile, started only when the machine has memory for it. Several suites on one
+    machine, each with WORKERS compiles at once, ran it out of memory. A compile claims its memory over its first
+    second or two, so the ones started in the last 2 s count as not claimed yet: one more starts while free memory
+    covers RESERVE_MB plus COMPILE_MB for each of them and for itself."""
+    with _START_LOCK:
+        while True:
+            now = time.monotonic()
+            _STARTS[:] = [t for t in _STARTS if now - t < 2]
+            free = free_mb()
+            if free is None or free >= RESERVE_MB + COMPILE_MB * (len(_STARTS) + 1):
+                break
+            time.sleep(0.25)
+        _STARTS.append(now)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, encoding='utf-8', cwd=cwd)
+    out, err = proc.communicate()
+    return subprocess.CompletedProcess(cmd, proc.returncode, out, err)
+
+
+# ---- Compiles. Every `assetgen compile` a test makes goes through assetgen_compile(). The ~200 the tests make one at a
+# time after build() are prefetched: each run records them in a manifest, and the next starts them all right after
+# build(), WORKERS at once, each in a staging folder of its own, in the order the tests last made them. A test whose
+# compile is one of them takes that result, moved into place, instead of compiling. The manifest only says what to
+# compile: every result is this run's assetgen on the files the test itself wrote, used only when it is the same
+# compile in everything a compile reads (_compile_entry). --no-prefetch compiles each one when the test asks, as before,
+# and still records the manifest; --check-prefetch also compiles every prefetched one in its real place, once the moved
+# result is taken out again, and stops the run on any difference.
+
+PREFETCH_MANIFEST = os.path.join(tempfile.gettempdir(), 'assetgen-suite-prefetch.json')   # one per machine: any checkout's last run
+PREFETCH_OFF, PREFETCH_CHECK = '--no-prefetch' in sys.argv, '--check-prefetch' in sys.argv
+PREFETCH_VERSION = 1            # of the manifest's layout; a manifest of another reads as none
+PREFETCH_MAX = 1000             # manifest entries kept; a run records about 200
+MANIFEST_TRIES, MANIFEST_RETRY_S = 10, 0.05     # another run reading or replacing the manifest holds it this long at most
+TREE_MAX_FILES, TREE_MAX_BYTES = 64, 1 << 20            # a test's source folder past either compiles directly, unrecorded
+TREE_EXTS = ('.cpp', '.h', '.hpp', '.inl', '.inc')      # any other file in a test's source folder: not a fresh out
+STABLE_DIRS = {os.path.normcase(os.path.join(AG, *d)) for d in (('tests',), ('tests', 'pending'), ('tests', 'ast'), ('examples',))}
+
+
+def _stamp(path):
+    """path, its size and its modification time: what tells two builds of a file apart without reading it."""
+    try:
+        st = os.stat(path)
+        return [path, st.st_size, st.st_mtime_ns]
+    except (OSError, TypeError):
+        return [path]
+
+
+# What every compile reads besides the files its entry names, in every key. The prefetch runs this run's assetgen and
+# clang on this run's UeApi, so within a run these never tell two compiles apart; they keep the key whole. That they do
+# not change during the run is _inputs_stamp's to check.
+CLANG = shutil.which('clang++')
+TOOLCHAIN = [_stamp(ASSETGEN), _stamp(CLANG), os.path.normcase(UEAPI)]
+HEADER_EXTS = ('.h', '.hpp', '.inl', '.inc', '.json')   # what an include or LoadTables can name below UeApi's parent
+
+
+def _inputs_stamp():
+    """The size and time of every file a compile can read outside the folders its key holds, and of the files directly
+    in the stable source folders, whose bytes the key holds: assetgen and clang++; every header and table below UeApi's
+    parent (ClangCommand in Cpp.cpp passes -I<UeApi> and -I<its parent>, which holds UeAssets/ too; LoadTables reads
+    UeApi/*.json); and AssetGen/include (tests/ include ../include/Objects.h). A write changes a file's time, so the same
+    stamp at a call as at start() means nothing a staged compile could have read changed in between, a change and its
+    undo included. os.scandir reads sizes and times off the folder on Windows: about 10 ms for UeApi's 7,300 headers."""
+    stamp = {path: tuple(_stamp(path)[1:]) for path in (ASSETGEN, CLANG)}
+    folders = [(os.path.dirname(UEAPI), HEADER_EXTS), (os.path.join(AG, 'include'), HEADER_EXTS)]
+    folders += [(d, None) for d in sorted(STABLE_DIRS)]
+    while folders:
+        folder, exts = folders.pop()
+        try:
+            with os.scandir(folder) as it:
+                for e in it:
+                    if e.is_dir():
+                        if exts: folders.append((e.path, exts))     # the stable folders' own files only
+                    elif exts is None or e.name.lower().endswith(exts):
+                        st = e.stat()
+                        stamp[e.path] = (st.st_size, st.st_mtime_ns)
+        except OSError:
+            stamp[folder] = None
+    return stamp
+
+
+def _no_content_dir(path):
+    """No folder on path is named Content. A compile writes its registry, and a package outside the mod's own path, into
+    the Content folder its out ends in, or above (FCompiler::Run, ContentDir in Cpp.cpp): with no Content folder in the
+    part a staging folder replaces, the staged compile writes each at the same place relative to the part it keeps."""
+    return 'content' not in [c.lower() for c in re.split(r'[\\/]', path)]
+
+
+def _place(path):
+    """path as the manifest keeps it: inside AssetGen as <AG> and the rest, separators as written, so that a manifest
+    one checkout wrote maps onto another's; anything else as it is."""
+    return '<AG>' + path[len(AG):] if path == AG or path.startswith(AG + os.sep) else path
+
+
+def _unplace(place):
+    return AG + place[4:] if place.startswith('<AG>') else place
+
+
+def _plain_rel(rel):
+    """rel, a path the manifest puts below a staging folder, stays below it."""
+    return ':' not in rel and not any(p in ('.', '..') for p in re.split(r'[\\/]', rel))
+
+
+def _tree(top):
+    """The folders (relative, '/'-separated) and files (relative name -> text) under top; None when a file there is no
+    source - a compile's output, so top is no fresh out - or when there is more than a manifest should carry."""
+    dirs, files, size = [], {}, 0
+    for root, subdirs, names in os.walk(top):
+        subdirs.sort()
+        rel = os.path.relpath(root, top).replace(os.sep, '/')
+        if rel != '.': dirs.append(rel)
+        for name in sorted(names):
+            if not name.lower().endswith(TREE_EXTS) or len(files) == TREE_MAX_FILES: return None
+            with open(os.path.join(root, name), 'rb') as f: data = f.read()
+            size += len(data)
+            if size > TREE_MAX_BYTES: return None
+            try: files[name if rel == '.' else rel + '/' + name] = data.decode('utf-8')
+            except UnicodeDecodeError: return None
+    return dirs, files
+
+
+def _walk(top):
+    """The folders and files under top, relative and '/'-separated, the files with their bytes."""
+    dirs, files = set(), {}
+    for root, _, names in os.walk(top):
+        rel = os.path.relpath(root, top).replace(os.sep, '/')
+        if rel != '.': dirs.add(rel)
+        for name in names:
+            with open(os.path.join(root, name), 'rb') as f: files[name if rel == '.' else rel + '/' + name] = f.read()
+    return dirs, files
+
+
+def _compile_entry(args, cwd):
+    """The manifest entry of `assetgen compile <args>`: what to compile and, with _compile_key, everything it reads that
+    two compiles in one run can differ in. None when a staged compile cannot stand in for it: only `<src> <UEAPI> <out>`
+    qualifies, absolute, no flag (--game reads the game's packages, --api writes elsewhere), no cwd, in one of two shapes.
+    tree    A source in a folder the test made, out that folder or one inside it. The entry holds the whole folder: the
+            mod's own .h/.cpp, which ModSources (Cpp.cpp) reads beside the source, what clang includes or __EmbedFile__
+            reads from there, and the folders out is in. Nothing else, so out is fresh: the one thing a compile reads
+            back from where it writes, an AssetRegistry.bin to merge into (MergeAssetRegistry), is not there. The staged
+            copy is made beside the real folder, so `../x.h` and absolute includes reach the same files.
+    stable  A source in tests/, tests/pending/, tests/ast/ or examples/, compiled where it is into an empty out: one in
+            AssetGen (tests/build/_pending/...), mirrored below the staging folder so that the registry lands at the
+            same place relative to it, or one outside (a temp folder), staged beside it. The key adds the bytes of every
+            file directly in the source's folder."""
+    if cwd is not None or len(args) != 3 or args[1] != UEAPI: return None
+    src, out = args[0], args[2]
+    if not (os.path.isabs(src) and os.path.isabs(out)): return None
+    srcdir = os.path.dirname(src)
+    if os.path.normcase(srcdir) in STABLE_DIRS:
+        if not src.startswith(AG + os.sep) or not os.path.isdir(out) or os.listdir(out): return None
+        if out.startswith(AG + os.sep) and _no_content_dir(AG) and _no_content_dir(tempfile.gettempdir()):
+            return {'kind': 'stable', 'src': src[len(AG):], 'out': ['ag', out[len(AG):]]}
+        if _no_content_dir(out):
+            return {'kind': 'stable', 'src': src[len(AG):], 'out': ['beside', _place(os.path.dirname(out))]}
+        return None
+    inside = out == srcdir or out.startswith(srcdir) and out[len(srcdir)] in (os.sep, os.altsep)
+    tree = _tree(srcdir) if inside and _no_content_dir(srcdir) else None
+    if tree is None: return None
+    return {'kind': 'tree', 'dir': _place(os.path.dirname(srcdir)), 'src': src[len(srcdir):], 'out': out[len(srcdir):],
+            'dirs': tree[0], 'files': tree[1]}
+
+
+def _stageable(entry):
+    """A manifest entry this checkout can stage: a shape it knows, its folders here, and no path that leaves them."""
+    try:
+        if entry['kind'] == 'tree':
+            names = [entry['src'], entry['out']] + list(entry['dirs']) + list(entry['files'])
+            ok = os.path.isdir(_unplace(entry['dir'])) and all(isinstance(t, str) for t in entry['files'].values())
+        elif entry['kind'] == 'stable':
+            names = [entry['src']] + ([entry['out'][1]] if entry['out'][0] == 'ag' else [])
+            ok = (os.path.isfile(AG + entry['src']) and os.path.normcase(os.path.dirname(AG + entry['src'])) in STABLE_DIRS
+                  and (entry['out'][0] == 'ag' or entry['out'][0] == 'beside' and os.path.isdir(_unplace(entry['out'][1]))))
+        else:
+            return False
+        return ok and all(isinstance(n, str) and _plain_rel(n) for n in names)
+    except (KeyError, TypeError, IndexError, AttributeError):
+        return False
+
+
+def _dir_digest(folder):
+    """The names and bytes of the files directly in folder: what ModSources reads beside a stable source, and more."""
+    h = hashlib.sha256()
+    for name in sorted(os.listdir(folder)):
+        path = os.path.join(folder, name)
+        if os.path.isfile(path):
+            with open(path, 'rb') as f: data = f.read()
+            h.update(json.dumps([name, len(data)]).encode('utf-8') + data)
+    return h.hexdigest()
+
+
+def _compile_key(entry, digests=None):
+    """What a staged compile and a test's must share for one to stand in for the other: the entry, the files beside a
+    stable source (digests caches them for start(), which keys every entry at once) and the toolchain."""
+    beside = None
+    if entry['kind'] == 'stable':
+        folder = os.path.dirname(AG + entry['src'])
+        beside = (digests or {}).get(folder) or _dir_digest(folder)
+        if digests is not None: digests[folder] = beside
+    return hashlib.sha256(json.dumps([entry, beside, TOOLCHAIN], sort_keys=True).encode('utf-8')).hexdigest()
+
+
+def _swap(text, stage, real):
+    """A staged compile's stdout or stderr as the compile in real prints it: clang names the source by the path it was
+    given, the compiler its source and its out and registry folders, the registry's with forward slashes."""
+    text = text.replace(stage, real)
+    return text.replace(stage.replace('\\', '/'), real.replace('\\', '/')) if os.sep == '\\' else text
+
+
+def _wrote_outside(stdout, stage, outputs):
+    """A staged compile wrote what its staging folder does not hold, so its result cannot be moved into place: a package
+    outside the mod's own path (printed by its /Game path) that ContentDir put above the folder, or the registry."""
+    lower = [o.lower() for o in outputs]
+    if any(not any(o.endswith('/' + p.lower()) for o in lower) for p in re.findall(r'-> /Game/(\S+)', stdout)): return True
+    return any(d != '.' and not d.startswith(stage.replace('\\', '/'))
+               for d in re.findall(r'(?m)^\s*registry\s+-> (.+)/AssetRegistry\.bin', stdout))
+
+
+def _retried(fn):
+    """fn(), tried again for a while on PermissionError. Windows renames over no file another process has open, and
+    opens no file while it is being renamed over: two checkouts' runs share the manifest, so one may hold it briefly."""
+    for attempt in range(MANIFEST_TRIES):
+        try:
+            return fn()
+        except PermissionError:
+            if attempt == MANIFEST_TRIES - 1: raise
+            time.sleep(MANIFEST_RETRY_S)
+
+
+def _materialize(cmd, res, real):
+    """A staged compile's result (res, from _staged) as the compile in real gives it: its new folders made in real and
+    its outputs copied there, stdout and stderr with the staging folder swapped for real. None when that fails part
+    way, on an OSError (a file an indexer or a scanner holds, a full disk): what it put in real is removed again, so
+    real is as fresh as it was and the test compiles there directly."""
+    made, copied = [], []
+    try:
+        for d in sorted(res['dirs']):       # a folder sorts before those inside it; the rest of the path is in real
+            path = os.path.join(real, *d.split('/'))
+            if not os.path.isdir(path):
+                os.mkdir(path)
+                made.append(path)
+        for o in res['outputs']:
+            dst = os.path.join(real, *o.split('/'))
+            copied.append(dst)
+            shutil.copyfile(os.path.join(res['stage'], *o.split('/')), dst)
+    except OSError:
+        for path in copied:
+            try: os.remove(path)
+            except OSError: pass
+        for path in reversed(made):
+            try: os.rmdir(path)
+            except OSError: pass
+        return None
+    return subprocess.CompletedProcess(cmd, res['rc'], _swap(res['stdout'], res['stage'], real),
+                                       _swap(res['stderr'], res['stage'], real))
+
+
+def _read_manifest():
+    """The last run's entries, in the order it made their compiles; none when there is no manifest of this layout.
+    Any failure to read one means no prefetch, never a failed run: json.load raises RecursionError on deep nesting."""
+    def load():
+        with open(PREFETCH_MANIFEST, encoding='utf-8') as f:
+            return json.load(f)
+    try:
+        data = _retried(load)
+        if data.get('version') == PREFETCH_VERSION and isinstance(data.get('entries'), list):
+            return [e for e in data['entries'] if isinstance(e, dict)]
+    except Exception:
+        pass
+    return []
+
+
+def _write_manifest(entries):
+    """Into a temp file beside the manifest, then renamed over it, so a run never reads half of one. The last run to
+    finish wins; a stale entry only costs a compile nobody takes. One that cannot be written keeps the old one."""
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(prefix='assetgen-suite-prefetch.', suffix='.tmp', dir=os.path.dirname(PREFETCH_MANIFEST))
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump({'version': PREFETCH_VERSION, 'entries': entries[:PREFETCH_MAX]}, f)
+        _retried(lambda: os.replace(tmp, PREFETCH_MANIFEST))
+    except OSError:
+        try:
+            if tmp: os.remove(tmp)
+        except OSError:
+            pass
+
+
+def _call_site():
+    """The suite's own frames that led to a compile, innermost first (any frames, for a driver that runs the helpers on
+    their own): where a --check-prefetch difference came from."""
+    import traceback
+    inner = ('compile', '_prefetched', '_checked', '_call_site', 'assetgen_compile')
+    stack = [f for f in traceback.extract_stack() if f.name not in inner]
+    frames = [f for f in stack if f.filename == CompilePrefetch.compile.__code__.co_filename] or stack
+    return ' <- '.join('%s (%s:%d)' % (f.name, os.path.basename(f.filename), f.lineno) for f in reversed(frames[-4:]))
+
+
+class PrefetchMismatch(BaseException):
+    """A prefetched compile that is not what the direct one gives (--check-prefetch). Not an Exception: pending() reads
+    those as known gaps, and this must stop the run."""
+
+
+class CompilePrefetch:
+    """The prefetch: what this run records for the next, the staged compiles running or queued (by key, in the
+    manifest's order), and the counts the summary line prints."""
+
+    def __init__(self):
+        self.started = self.finished = False
+        self.lock = threading.Lock()                    # guards stages, which the prefetch threads add to
+        self.pool, self.waiting, self.stages = None, {}, set()
+        self.record, self.previous = [], []
+        self.calls = self.hits = self.unused = 0
+        self.inputs, self.changed_at = None, 0          # _inputs_stamp() at start(); the call that found it changed
+
+    def start(self):
+        """Right after build(), not before: build() wipes tests/build and keeps WORKERS busy, and its compiles, made all
+        at once already, are not recorded. Queues every compile the manifest lists, in its order."""
+        self.started, self.previous = True, _read_manifest()
+        atexit.register(self.finish, complete=False)
+        if PREFETCH_OFF or not self.previous: return
+        from concurrent.futures import ThreadPoolExecutor
+        self.pool = ThreadPoolExecutor(WORKERS)
+        # Before the interpreter joins the pool's threads at exit, which drains the queue first: a run a failure stops
+        # waits only for the compiles already running. (atexit runs after that join.)
+        stop = getattr(threading, '_register_atexit', None)
+        if stop: stop(lambda: self.pool.shutdown(wait=False, cancel_futures=True))
+        self.inputs = _inputs_stamp()       # before the keys read the stable folders, and before any staged compile
+        digests = {}
+        for entry in self.previous:
+            try:
+                key = _compile_key(entry, digests) if _stageable(entry) else None
+            except Exception:       # a file beside its source held open by an editor or a scanner: not staged
+                key = None
+            if key: self.waiting.setdefault(key, []).append(self.pool.submit(self._staged, entry))
+
+    def compile(self, args, cwd=None):
+        cmd = [ASSETGEN, 'compile'] + list(args)
+        if self.started and not self.finished:
+            self.calls += 1
+            # The entry and key read every file beside the source. One held open by an editor or a scanner makes this
+            # compile what it was before the prefetch: made directly, and not recorded.
+            try:
+                entry = _compile_entry(args, cwd)
+                key = _compile_key(entry) if entry is not None and self.pool else None
+            except OSError:
+                entry = key = None
+            if entry is not None:
+                self.record.append(entry)
+                proc = self._prefetched(cmd, entry, key, args) if key else None
+                if proc is not None: return proc
+        return run_compile(cmd, cwd)
+
+    def _staged(self, entry):
+        """entry's compile in a staging folder of its own, on a prefetch thread: what it printed and returned, and what
+        it wrote, relative to the staging folder, which stands for the real one."""
+        res = {'stage': None, 'usable': False}
+        try:
+            parent = (_unplace(entry['dir']) if entry['kind'] == 'tree' else
+                      None if entry['out'][0] == 'ag' else _unplace(entry['out'][1]))
+            stage = res['stage'] = tempfile.mkdtemp(dir=parent)
+            with self.lock: self.stages.add(stage)
+            if entry['kind'] == 'tree':
+                for d in entry['dirs']: os.makedirs(os.path.join(stage, *d.split('/')), exist_ok=True)
+                for rel, text in entry['files'].items():
+                    with open(os.path.join(stage, *rel.split('/')), 'wb') as f: f.write(text.encode('utf-8'))
+                src, out = stage + entry['src'], stage + entry['out']
+            else:
+                src, out = AG + entry['src'], stage + entry['out'][1] if entry['out'][0] == 'ag' else stage
+                os.makedirs(out, exist_ok=True)
+            dirs, files = _walk(stage)
+            proc = run_compile([ASSETGEN, 'compile', src, UEAPI, out])
+            dirs_after, files_after = _walk(stage)
+            outputs = sorted(r for r, data in files_after.items() if files.get(r) != data)
+            res.update(rc=proc.returncode, stdout=proc.stdout, stderr=proc.stderr, outputs=outputs,
+                       dirs=sorted(dirs_after - dirs), usable=files.keys() <= files_after.keys()
+                       and not any(r in files for r in outputs) and not _wrote_outside(proc.stdout, stage, outputs))
+        except Exception:       # an OSError mostly: a compile that could not be staged is one the test makes itself
+            res['usable'] = False
+        return res
+
+    def _prefetched(self, cmd, entry, key, args):
+        """The prefetched result of entry's compile (key: _compile_key's), moved into place; None when there is none to
+        take: never queued, still queued (cancelled: compiling here costs the same, and is the real thing), staged
+        before a file it may have read changed (_inputs_changed), its outputs' places taken, or moving them there
+        failed (_materialize)."""
+        futures = self.waiting.get(key)
+        if not futures: return None
+        future = futures.pop(0)
+        if future.cancel(): return None
+        res = future.result()
+        real = os.path.dirname(args[0]) if entry['kind'] == 'tree' else AG if entry['out'][0] == 'ag' else args[2]
+        try:
+            if (not res['usable'] or self._inputs_changed()
+                    or any(os.path.lexists(os.path.join(real, *o.split('/'))) for o in res['outputs'])):
+                self.unused += 1
+                return None
+            proc = self._checked(cmd, entry, real, res) if PREFETCH_CHECK else _materialize(cmd, res, real)
+            if proc is None: self.unused += 1
+            else: self.hits += 1
+            return proc
+        finally:
+            self._drop(res)
+
+    def _inputs_changed(self):
+        """Whether a file a compile can read outside its key changed since start() (_inputs_stamp), checked once the
+        staged compile is done, so its reads fall in between. Once one has, no prefetched result is taken any more and
+        the queued ones are cancelled: each was or would be staged on the old files, or on some of each."""
+        if not self.changed_at and _inputs_stamp() != self.inputs:
+            self.changed_at = self.calls
+            for future in itertools.chain.from_iterable(self.waiting.values()): future.cancel()
+        return bool(self.changed_at)
+
+    def _checked(self, cmd, entry, real, res):
+        """--check-prefetch: the result moved into place as a plain run moves it (_materialize), what that put there
+        taken out again, then the compile made directly in the same place, which must give the same: exit code, stdout
+        and stderr, and every folder and file written, byte for byte. So the check covers the move a plain run relies
+        on, not only the staged compile. In AssetGen only the folder holding all it wrote is compared, not the whole
+        tree. None, as in a plain run, when the move fails; an error taking it out or walking the folder stops the run."""
+        top = ''
+        if entry['kind'] == 'stable' and entry['out'][0] == 'ag':
+            top = posixpath.commonpath([posixpath.dirname(o) for o in res['outputs']] + list(res['dirs'])
+                                       + [entry['out'][1].replace('\\', '/').strip('/')])
+        root = os.path.join(real, *top.split('/')) if top else real
+        site = _call_site()
+        fail = lambda problems: PrefetchMismatch('--check-prefetch, at %s: %s' % (site, '; '.join(problems)))
+        try:
+            dirs, files = _walk(root)
+            moved = _materialize(cmd, res, real)
+            if moved is None: return None
+            dirs_moved, files_moved = _walk(root)
+            for r in files_moved.keys() - files.keys(): os.remove(os.path.join(root, *r.split('/')))
+            for d in sorted(dirs_moved - dirs, reverse=True): os.rmdir(os.path.join(root, *d.split('/')))
+            if _walk(root) != (dirs, files): raise fail(['taking the moved result out did not leave the folder as it was'])
+            proc = run_compile(cmd)
+            dirs_after, files_after = _walk(root)
+        except OSError as e:
+            raise fail(['%s: %s' % (type(e).__name__, e)])
+        problems = [] if proc.returncode == moved.returncode else ['exit %d, prefetched %d' % (proc.returncode, moved.returncode)]
+        for name in ('stdout', 'stderr'):
+            got, staged = getattr(proc, name).splitlines(), getattr(moved, name).splitlines()
+            if got != staged:
+                at = next((i for i, (a, b) in enumerate(zip(got, staged)) if a != b), min(len(got), len(staged)))
+                problems.append('%s line %d: %r, prefetched %r' % (name, at + 1, (got + [None])[at], (staged + [None])[at]))
+        made = {r: data for r, data in files_after.items() if files.get(r) != data}
+        want = {r: data for r, data in files_moved.items() if files.get(r) != data}
+        if made.keys() != want.keys() or dirs_after - dirs != dirs_moved - dirs:
+            problems.append('wrote %s, moved in %s' % (sorted(made) + sorted(dirs_after - dirs), sorted(want) + sorted(dirs_moved - dirs)))
+        problems += ['%s differs' % r for r in sorted(made.keys() & want.keys()) if made[r] != want[r]]
+        if problems: raise fail(problems)
+        return proc
+
+    def _drop(self, res):
+        if res.get('stage'):
+            shutil.rmtree(res['stage'], ignore_errors=True)
+            with self.lock: self.stages.discard(res['stage'])
+
+    def finish(self, complete=True):
+        """Stops the prefetch, removes its staging folders and writes the manifest; at the end of a run (complete),
+        prints the summary line. A run cut short (atexit) keeps, after its own, the last manifest's entries past as
+        many as it recorded: its tests never got to those. Not every entry it lacks: an edited test's old compile,
+        made before the run stopped, would then come back after every run cut short, and be prefetched each time."""
+        if not self.started or self.finished: return
+        self.finished = True
+        if self.pool:
+            self.pool.shutdown(wait=True, cancel_futures=True)
+            for future in itertools.chain.from_iterable(self.waiting.values()):
+                if not future.cancelled():
+                    self.unused += 1
+                    self._drop(future.result())
+        with self.lock: stages = list(self.stages)
+        for stage in stages: shutil.rmtree(stage, ignore_errors=True)
+        entries = self.record
+        if not complete:
+            mine = {json.dumps(e, sort_keys=True) for e in entries}
+            entries = entries + [e for e in self.previous[len(entries):] if json.dumps(e, sort_keys=True) not in mine]
+        _write_manifest(entries)
+        if not complete: return
+        if PREFETCH_OFF:
+            print('ok  prefetch: off, all %d compiles made directly (%d recorded for the next run)' % (self.calls, len(self.record)))
+        else:
+            print('ok  prefetch: %d of %d compiles were ready (%d compiled directly, %d prefetched and unused)%s%s' % (
+                self.hits, self.calls, self.calls - self.hits, self.unused,
+                '; each checked against a direct compile' if PREFETCH_CHECK else '',
+                '; a header, table, source or the exe changed by compile %d, none taken after' % self.changed_at
+                if self.changed_at else ''))
+
+
+PREFETCH = CompilePrefetch()
+
+
+def assetgen_compile(args, cwd=None):
+    """`assetgen compile <args>`, run in cwd, its stdout and stderr captured as UTF-8 text, as subprocess.run returns
+    it: every compile the suite makes goes through here. Before PREFETCH.start() it just compiles; after, a compile
+    the prefetch made already is taken from it. The other verbs (roundtrip, registry, astcheck) run as they are."""
+    return PREFETCH.compile(args, cwd)
 
 
 def build():
     """Each test compiles into build/<Test>/FSD/Content/<its package>, the layout bpbuild stages a mod in. The examples
     the docs point at compile the same way, so one the compiler stops accepting fails here rather than for a reader."""
     shutil.rmtree(ROOT, ignore_errors=True)
-    for src in sorted(glob.glob(os.path.join(TESTS, '*.cpp'))) + sorted(glob.glob(os.path.join(AG, 'examples', '*.cpp'))):
+
+    def compile_mod(src):
         mod = os.path.splitext(os.path.basename(src))[0]
         package = re.search(r'UE_MOD_PACKAGE\s*\(\s*"/Game/([^"]+)"', open(src, encoding='utf-8-sig').read()).group(1)
         out = os.path.join(ROOT, mod, 'FSD', 'Content', *package.split('/'))
         os.makedirs(out)
-        # EditTest edits AssetTest's cooked assets as if they were the game's (sorted, AssetTest compiles first).
         game = ['--game', os.path.join(ROOT, 'AssetTest', 'FSD', 'Content')] if mod == 'EditTest' else []
-        proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, out] + game, capture_output=True, encoding='utf-8')
+        return mod, assetgen_compile([src, UEAPI, out] + game)
+    srcs = sorted(glob.glob(os.path.join(TESTS, '*.cpp'))) + sorted(glob.glob(os.path.join(AG, 'examples', '*.cpp')))
+    # EditTest edits AssetTest's cooked assets as if they were the game's, so it compiles once AssetTest has.
+    edits = [s for s in srcs if os.path.basename(s) == 'EditTest.cpp']
+    for mod, proc in parallel(compile_mod, [s for s in srcs if s not in edits]) + [compile_mod(s) for s in edits]:
         assert proc.returncode == 0, '%s:\n%s%s' % (mod, proc.stdout, proc.stderr)
         LOGS[mod] = proc.stdout
     print('ok  every test and example compiles')
@@ -64,7 +604,23 @@ def build():
     print('ok  every package reads back and writes out byte for byte, and every tag value re-encodes (assetgen roundtrip)')
 
 
+def astcheck():
+    """A compile throws away what its AST parser never reads before nlohmann lexes it (FDumpFilter, DESIGN.md "Compile
+    time: the UeApi header cost"). `assetgen astcheck` proves that changes nothing on three dumps: an FSD.h mod's, a mod
+    with a Game/ header and a GetSubsystem<T> instance, and tests/ast/Edge.cpp, the shapes a filter could get wrong. The
+    filter's output must be the same however the dump is cut, and parse to the same tree as the dump itself, read the
+    unfiltered fallback's way. That reference read drops a frozen copy of DroppedAstKey's keys, not the list the filter
+    and the compile's parser share, so an edit to that list fails here too until the copy gets the same edit on purpose.
+    One at a time: each holds about 1 GB."""
+    for src in ('FlowTest.cpp', 'SubsystemTest.cpp', os.path.join('ast', 'Edge.cpp')):
+        proc = subprocess.run([ASSETGEN, 'astcheck', os.path.join(TESTS, src), UEAPI], capture_output=True, encoding='utf-8')
+        assert proc.returncode == 0 and proc.stdout.startswith('same ('), '%s:\n%s%s' % (src, proc.stdout, proc.stderr)
+    print('ok  the AST dump filter changes nothing: same bytes however the dump is cut, and the same tree (assetgen astcheck)')
+
+
 build()
+PREFETCH.start()
+astcheck()
 
 
 # --cases <file>: also write every run() below as a case for BpMods' `bpcheck` command, which replays it in the game
@@ -131,12 +687,59 @@ def refused(mod, body, why, top=''):
         with open(src, 'w', encoding='utf-8') as f:
             f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\n%s'
                     'class %s : public AActor {\npublic:\n%s};\n' % (mod, top, mod, body))
-        proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, tmp], capture_output=True, encoding='utf-8')
+        proc = assetgen_compile([src, UEAPI, tmp])
         assert proc.returncode != 0 and why in proc.stdout, (mod, proc.stdout)
 
 
-def dump(t, base, i):
-    return subprocess.run([sys.executable, os.path.join(HERE, t), base, str(i)], capture_output=True, encoding='utf-8').stdout
+# ---- Known gaps: what AssetGen does not do yet, as tests that fail today. A pending test has its mod in tests/pending;
+# a rule of invariants.py the suite's own packages still break is listed in KNOWN_RULES with where it is tracked. Each
+# prints as `gap` while it fails, and the run fails the day one passes, until it moves in with the others.
+
+PENDING = os.path.join(TESTS, 'pending')
+GAPS, FIXED, REFUSALS = [], [], {}
+KNOWN_RULES = {     # sweep rules the suite's own packages still break, each with the AssetGen defect (TODO.md, S33)
+}
+
+
+def pending_asset(mod, cls=None):
+    """tests/pending/<mod>.cpp compiled into build/_pending/<mod>, and the base path of its class `cls` (default: the
+    mod's own). A refusal raises, carrying the compiler's reason, so the gap reads as what the compiler said."""
+    src = os.path.join(PENDING, mod + '.cpp')
+    package = re.search(r'UE_MOD_PACKAGE\s*\(\s*"/Game/([^"]+)"', open(src, encoding='utf-8-sig').read()).group(1)
+    out = os.path.join(ROOT, '_pending', mod, 'FSD', 'Content', *package.split('/'))
+    if mod not in REFUSALS:
+        os.makedirs(out, exist_ok=True)
+        proc = assetgen_compile([src, UEAPI, out])
+        failed = re.findall(r'(?m)^\s*FAILED: (.*)$', proc.stdout)
+        REFUSALS[mod] = (failed or [proc.stdout.strip() or 'exit %d' % proc.returncode])[0] if proc.returncode else None
+    if REFUSALS[mod]: raise AssertionError('refused: ' + REFUSALS[mod])
+    return os.path.join(out, cls or mod)
+
+
+def keeps_invariants(base):
+    """The package at base breaks none of invariants.py's rules but the known ones; a pending mod that compiles is checked
+    by them too."""
+    import invariants
+    found = [f for f in invariants.check(invariants.Package(base)) if f[0] not in KNOWN_RULES]
+    assert not found, '%s breaks %s' % (os.path.basename(base), '; '.join('%s %s: %s' % f for f in found[:3]))
+
+
+def pending(name, test):
+    """A test of something AssetGen does not do yet. It fails today - refused, or compiled but not behaving as the
+    engine needs - and prints as a known gap. The day it passes, the feature has landed and the run fails until the
+    test moves in with the others (its mod to tests/, its check above): a gap never closes unnoticed, and none is
+    reported open that is closed."""
+    try:
+        test()
+    except (Exception, SystemExit) as e:        # runscript stops on an op it cannot run with SystemExit
+        GAPS.append(name)
+        why = str(e).strip().splitlines()[0] if str(e).strip() else type(e).__name__
+        print('gap %s: %s' % (name, why[:200]))
+        return
+    FIXED.append(name)
+    print('FIXED %s: it passes now; move it out of tests/pending' % name)
+
+dump = runscript.tool_output   # what `python <tool> <args>` prints, without the process
 
 
 def exports_of(base):
@@ -181,8 +784,7 @@ def registry_of(mod):
 
 
 def registry_rows(path):
-    return set(re.findall(r'^\s+(/Game/\S+)\s+(\S+)$', subprocess.run(
-        [sys.executable, os.path.join(HERE, 'dumpar.py'), path], capture_output=True, encoding='utf-8').stdout, re.M))
+    return set(re.findall(r'^\s+(/Game/\S+)\s+(\S+)$', dump('dumpar.py', path), re.M))
 
 
 def registry_layout():
@@ -220,7 +822,7 @@ def registry_non_ascii():
         rows = lambda path: [(r['object_path'], r['package_path'], r['asset_class'], r['package_name'], r['asset_name'])
                              for r in dumpar.read(path)[2]]
         for twice in range(2):
-            proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, tmp], capture_output=True, encoding='utf-8')
+            proc = assetgen_compile([src, UEAPI, tmp])
             assert proc.returncode == 0, proc.stdout + proc.stderr
             assert rows(os.path.join(tmp, 'AssetRegistry.bin')) == want, rows(os.path.join(tmp, 'AssetRegistry.bin'))
         merged = os.path.join(tmp, 'Merged.bin')
@@ -234,23 +836,50 @@ def export_index(base, name):
     return exports_of(base).index(name)
 
 
+def game_findings(bases):
+    """invariants.check over the game's packages, in WORKERS shards run by invariants.py --json (a process each: the
+    rules are pure Python, one core per process). Sorted, so the first ones reported do not depend on the shards."""
+    import json, tempfile
+
+    def shard(part):
+        with tempfile.NamedTemporaryFile('w', suffix='.txt', delete=False, encoding='utf-8') as f:
+            f.write('\n'.join(part))
+        try:
+            proc = subprocess.run([sys.executable, os.path.join(HERE, 'invariants.py'), '--json', '--from', f.name,
+                                   '--game', GAME], capture_output=True, encoding='utf-8')
+        finally:
+            os.remove(f.name)
+        lines = proc.stdout.splitlines()
+        # every package of the shard read, or the shard's silence would pass for a clean one
+        assert lines[-1:] == ['done %d' % len(part)], 'invariants.py stopped on a game shard:\n' + proc.stdout[-2000:] + proc.stderr[-3000:]
+        return [tuple(json.loads(l)) for l in lines[:-1]]
+    return sorted(f for part in parallel(shard, [bases[i::WORKERS] for i in range(WORKERS)]) for f in part)
+
+
 def sweep():
-    """Every function of every built mod decodes to exactly its header's storage and memory sizes."""
-    import glob, re, subprocess
-    here = os.path.dirname(os.path.abspath(__file__))
-    n = 0
-    for ua in glob.glob(os.path.join(ROOT, '*', 'FSD', 'Content', '**', '*.uasset'), recursive=True):
-        base = ua[:-len('.uasset')]
-        exports = dumpexp.load(base)[5]
-        for i in range(len(exports)):
-            out = subprocess.run([sys.executable, os.path.join(here, 'walkscript.py'), base, str(i)],
-                                 capture_output=True, encoding='utf-8').stdout
-            m = re.search(r'walked: disk (\d+) \(header (\d+)\)  mem (\d+) \(header (\d+)\)', out)
-            if not m: continue
-            assert m.group(1) == m.group(2) and m.group(3) == m.group(4), '%s export %d: %s' % (base, i, m.group(0))
-            assert 'loader would STOP' not in out, '%s export %d stops early' % (base, i)
-            n += 1
-    print('ok  %d functions decode to their header sizes' % n)
+    """Every package built above keeps each engine invariant of invariants.py, whose rules cite the engine source that
+    makes them one: every function decodes to exactly its header's sizes, every jump lands on a statement, ... With
+    --game, the same rules first run on every 9th package of the game's own content: a rule Epic's cooked Blueprints
+    break is a wrong rule, not a finding."""
+    import invariants
+    invariants.GAME_CONTENT[:] = [GAME] if GAME else []
+    if GAME:
+        found = game_findings(invariants.packages([GAME], 9))
+        assert not found, 'a rule the game breaks:\n' + '\n'.join('%s  %s %s: %s' % f for f in found[:30])
+        print('ok  the %d rules of invariants.py hold on the game\'s own packages' % len(invariants.RULES))
+    bases = invariants.packages([ROOT])
+    found = [(os.path.relpath(b, ROOT), *f) for b in bases for f in invariants.check(invariants.Package(b))]
+    for rule, why in KNOWN_RULES.items():
+        mine = [f for f in found if f[1] == rule]
+        if mine:
+            GAPS.append('sweep ' + rule)
+            print('gap sweep %s: %d findings (%s), e.g. %s' % (rule, len(mine), why, '%s  %s %s: %s' % mine[0]))
+        else:
+            FIXED.append('sweep ' + rule)
+            print('FIXED sweep %s: no package breaks it now; take it out of KNOWN_RULES' % rule)
+    found = [f for f in found if f[1] not in KNOWN_RULES]
+    assert not found, '\n'.join('%s  %s %s: %s' % f for f in found[:30])
+    print('ok  %d packages keep the %d engine invariants of invariants.py' % (len(bases), len(invariants.RULES) - len(KNOWN_RULES)))
 
 
 def check(mod, fn, oracle, cases):
@@ -931,7 +1560,7 @@ def inline_mixed_overloads():
         for mod, body in mods.items():
             with open(os.path.join(tmp, mod + '.cpp'), 'w') as f:
                 f.write(head % (mod, mod) + body)
-            proc = subprocess.run([ASSETGEN, 'compile', os.path.join(tmp, mod + '.cpp'), UEAPI, tmp], capture_output=True, encoding='utf-8')
+            proc = assetgen_compile([os.path.join(tmp, mod + '.cpp'), UEAPI, tmp])
             if mod == 'MixOk':
                 assert proc.returncode == 0, proc.stdout + proc.stderr
                 for v in (-3, 0, 5):
@@ -1196,7 +1825,7 @@ def final_calls():
             f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/FinalHide");\n'
                     'class FinalHideBase : public AActor {\npublic:\n  virtual int32 F() final { return 1; }\n};\n'
                     'class FinalHide : public FinalHideBase {\npublic:\n  int32 F(int32 X) { return X; }\n};\n')
-        proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, tmp], capture_output=True, encoding='utf-8')
+        proc = assetgen_compile([src, UEAPI, tmp])
         assert proc.returncode != 0 and 'FinalHideBase::F is final' in proc.stdout, proc.stdout
     print("ok  FinalTest: a subclass function of a final method's name is refused")
 
@@ -1351,9 +1980,9 @@ def mod_enum():
     pairs = [(names[struct.unpack_from('<i', raw, 16 + i * 16)[0]], struct.unpack_from('<q', raw, 24 + i * 16)[0]) for i in range(count)]
     assert pairs == [('EMood::Calm', 0), ('EMood::Angry', 5), ('EMood::Sleepy', 6), ('EMood::EMood_MAX', 7)], pairs
     exports = [e['name'] for e in dumpexp.load(base)[5]]
-    cls = subprocess.run([sys.executable, os.path.join(here, 'dumpstruct.py'), base, '0'], capture_output=True, encoding='utf-8').stdout
+    cls = dump('dumpstruct.py', base, '0')
     assert re.search(r'ByteProperty Mood .*EMood', cls), cls
-    cdo = subprocess.run([sys.executable, os.path.join(here, 'dumptags.py'), base, str(exports.index('Default__TypesTest_C'))], capture_output=True, encoding='utf-8').stdout
+    cdo = dump('dumptags.py', base, str(exports.index('Default__TypesTest_C')))
     assert 'EMood::Angry' in cdo, cdo
     print('ok  TypesTest: UE_ENUM cooks EMood with its C++ names and values; the default is its enumerator')
     for enum, pairs_want in (('ESpan', [('ESpan::Tiny', -3), ('ESpan::Wide', 70000), ('ESpan::Huge', 70001), ('ESpan::Vast', 70002), ('ESpan::ESpan_MAX', 70003)]),
@@ -1380,7 +2009,7 @@ def constants():
     here = os.path.dirname(os.path.abspath(__file__))
     base = asset('TypesTest')
     exports = [e['name'] for e in dumpexp.load(base)[5]]
-    cdo = subprocess.run([sys.executable, os.path.join(here, 'dumptags.py'), base, str(exports.index('Default__TypesTest_C'))], capture_output=True, encoding='utf-8').stdout
+    cdo = dump('dumptags.py', base, str(exports.index('Default__TypesTest_C')))
     for want in ('Seed [0] IntProperty size=4: %d' % fnv('types'), 'Budget [0] IntProperty size=4: 25', 'Reach [0] FloatProperty size=4: 125.0', 'Bits [0] IntProperty size=4: 236',
                  'Halfway [0] BoolProperty size=0 value=1'):
         assert want in cdo, (want, cdo)
@@ -1401,7 +2030,7 @@ def constants():
     print('ok  TypesTest: UE_ENUM_MAP fills a map from the enum, either way round')
     base = asset('TypesTest')
     exports = [e['name'] for e in dumpexp.load(base)[5]]
-    tool = lambda t, i: subprocess.run([sys.executable, os.path.join(here, t), base, str(i)], capture_output=True, encoding='utf-8').stdout
+    tool = lambda t, i: dump(t, base, str(i))
     assert re.search(r"ObjectProperty Aimed .*Class'Actor'", tool('dumpstruct.py', 0)), 'a `using` alias of a class is still an object reference'
     assert re.search(r"ObjectProperty Spotted .*Class'Pawn'", tool('dumpstruct.py', 0)), 'and so is a class-scope one'
     forget = ' '.join(tool('walkscript.py', exports.index('Forget')).split())
@@ -1527,7 +2156,7 @@ def types_behaviour():
     # so a call through the interface finds the Blueprint function rather than the interface's native one. It returns
     # a value of its own: runscript's None is `Return Nothing`, which leaves a script caller's destination as it was.
     here = os.path.dirname(os.path.abspath(__file__))
-    cls = subprocess.run([sys.executable, os.path.join(here, 'dumpstruct.py'), asset('TypesTest'), '0'], capture_output=True, encoding='utf-8').stdout
+    cls = dump('dumpstruct.py', asset('TypesTest'), '0')
     assert re.search(r"""Interfaces \[\("imp\[\d+\]:Class'Targetable'", 0, 1\)\]""", cls), cls
     for fn, zero in (('GetTargetCenterMass', 0), ('GetTargetHealthComponent', 0), ('ShowDamageEffects', None)):
         assert run(asset('TypesTest'), fn)[0] == zero, fn
@@ -1540,8 +2169,7 @@ def types_defaults():
     from dumptags import tags
     here, base = os.path.dirname(os.path.abspath(__file__)), asset('TypesTest')
     names, exports = dumpexp.load(base)[3], [e['name'] for e in dumpexp.load(base)[5]]
-    cdo = subprocess.run([sys.executable, os.path.join(here, 'dumptags.py'), base, str(exports.index('Default__TypesTest_C'))],
-                         capture_output=True, encoding='utf-8').stdout
+    cdo = dump('dumptags.py', base, str(exports.index('Default__TypesTest_C')))
     raw = bytes.fromhex(re.search(r'Spans \[0\] ArrayProperty size=\d+ inner=StructProperty: (\w+)', cdo).group(1))
     o, spans = 4 + 49, []                                  # count, then the inner tag (name, type, size, index, struct, guid)
     for _ in range(struct.unpack_from('<i', raw, 0)[0]):
@@ -1564,7 +2192,7 @@ def types_defaults():
 def native_struct_values():
     """A struct the engine reads in its own binary form, which WriteValue does not write (it writes tags), gets no
     value: not as a default, and not as a UE_STRUCT member, whose default instance holds every member's."""
-    refused('NativeDefault', '  FGameplayTagContainer Tags = {};\n', 'GameplayTagContainer value in its own binary form')
+    refused('NativeDefault', '  FGameplayTagContainer Labels = {};\n', 'GameplayTagContainer value in its own binary form')
     refused('NativeMember', '  int32 X = 0;\n', "a UE_STRUCT's defaults hold every member's",
             top='struct FTagHolder {\n  UE_STRUCT;\n  FGameplayTagContainer Tags;\n};\n')
     print('ok  a GameplayTagContainer value is refused, as a default and as a UE_STRUCT member')
@@ -1685,7 +2313,7 @@ def pointer_behaviour():
         with open(os.path.join(tmp, 'ReadU32.cpp'), 'w') as f:
             f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/ReadU32");\n'
                     'class ReadU32 : public AActor {\npublic:\n  int64 Get(uint32 *P) { return *P; }\n};\n')
-        proc = subprocess.run([ASSETGEN, 'compile', os.path.join(tmp, 'ReadU32.cpp'), UEAPI, tmp], capture_output=True, encoding='utf-8')
+        proc = assetgen_compile([os.path.join(tmp, 'ReadU32.cpp'), UEAPI, tmp])
         assert proc.returncode != 0 and 'reading a uint32 through a pointer' in proc.stdout, proc.stdout
     # The synthesized read scratch is cooked beside the class, and the class imports it.
     d = dumpexp.load(os.path.join(os.path.dirname(asset('PointerTest')), 'FDeref'))
@@ -2001,8 +2629,8 @@ def api_stub():
     with tempfile.TemporaryDirectory() as tmp:
         os.makedirs(os.path.join(tmp, 'cooked'))
         os.makedirs(os.path.join(tmp, 'api'))
-        proc = subprocess.run([ASSETGEN, 'compile', os.path.join(TESTS, 'NameTest.cpp'), UEAPI,
-                               os.path.join(tmp, 'cooked'), '--api', os.path.join(tmp, 'api')], capture_output=True, encoding='utf-8')
+        proc = assetgen_compile([os.path.join(TESTS, 'NameTest.cpp'), UEAPI,
+                                 os.path.join(tmp, 'cooked'), '--api', os.path.join(tmp, 'api')])
         assert proc.returncode == 0, proc.stdout + proc.stderr
         base = os.path.join(tmp, 'api', 'NameTest')
         ua, ue, total, names, imports, exports = dumpexp.load(base)
@@ -2057,7 +2685,7 @@ def static_assets():
         assert [x['name'] for x in e] == [a] and ref(base(a), e[0]['cls']) == cls and e[0]['flags'] & 0x3 == 0x3, (a, e)   # RF_Public | RF_Standalone
     # Only the named members are written, the rest stay the class defaults; an explicit zero is written.
     assert tags_of('MD_Plain') == {}, tags_of('MD_Plain')
-    assert tags_of('MD_Calm') == {'Count': 'IntProperty size=4: 0', 'Mood': 'ByteProperty size=8 enum=EMood: EMood::Calm'}, tags_of('MD_Calm')
+    assert tags_of('MD_Calm') == {'Count': 'IntProperty size=4: 0', 'Mood': 'ByteProperty size=8 enum=EDefMood: EDefMood::Calm'}, tags_of('MD_Calm')
     big = tags_of('MD_Big')
     assert set(big) == {'Health', 'Title', 'Tag', 'bBig', 'Next', 'Waves'}, big
     assert big['Health'].endswith(': -500.5') and big['Title'].endswith(": 'Big'") and big['Tag'].endswith(': big') and 'value=1' in big['bBig'], big
@@ -2065,7 +2693,7 @@ def static_assets():
     assert big['Waves'].endswith(struct.pack('<4i', 3, 3, 5, 8).hex()), big['Waves']
     cdo = dump('dumptags.py', base('UMoodDef'), exports_of(base('UMoodDef')).index('Default__UMoodDef_C'))
     for want in ("Title [0] StrProperty size=9: 'Base'", 'Health [0] FloatProperty size=4: 100.0', 'Count [0] IntProperty size=4: 3',
-                 'Mood [0] ByteProperty size=8 enum=EMood: EMood::Angry'):
+                 'Mood [0] ByteProperty size=8 enum=EDefMood: EDefMood::Angry'):
         assert want in cdo, (want, cdo)
     ed = tags_of('ED_AssetTest')
     assert objs('ED_AssetTest', ed['VeteranClasses'].split()[-1]) == ['/Game/Enemies/Spider/Grunt/ED_Spider_Grunt.ED_Spider_Grunt'], ed
@@ -2087,7 +2715,7 @@ def static_assets():
     assert objs('AssetUser', cdo['Picks'].hex()) == [
         '/Game/Enemies/Spider/Grunt/ED_Spider_Grunt.ED_Spider_Grunt', '/Game/Enemies/Spider/Exploder/ED_Spider_Exploder.ED_Spider_Exploder',
         '/Game/Art/Environments/Holiday_GreatEggHunt/SK_greatEggHunt_bunnyPlush.SK_GreatEggHunt_BunnyPlush'], cdo
-    tags = struct.unpack_from('<6i', cdo['Tags'])                                    # removed, count, (FName) x 2
+    tags = struct.unpack_from('<6i', cdo['Labels'])                              # removed, count, (FName) x 2
     assert tags[:2] == (0, 2) and [names[tags[2]], names[tags[4]]] == ['big', 'calm'], tags
     m = struct.unpack_from('<8i', cdo['ByName'])                                     # removed, count, (FName, object) x 2
     assert m[:2] == (0, 2) and [(names[m[2]], ref(user, m[4])), (names[m[5]], ref(user, m[7]))] == [('big', MOD + 'MD_Big.MD_Big'), ('calm', MOD + 'MD_Calm.MD_Calm')], m
@@ -2106,10 +2734,10 @@ def static_assets():
                  r'InstanceVariable\s+Count@'):
         assert re.search(want, w), (want, w)
     print('ok  AssetTest: a function body reaches an asset by reference')
-    ar = subprocess.run([sys.executable, os.path.join(HERE, 'dumpar.py'), registry_of('AssetTest')], capture_output=True, encoding='utf-8').stdout
+    ar = dump('dumpar.py', registry_of('AssetTest'))
     assert set(re.findall(r'^\s+(/Game/\S+)\s+(\S+)$', ar, re.M)) == {
         (MOD + 'AssetUser.AssetUser_C', 'BlueprintGeneratedClass'), (MOD + 'UMoodDef.UMoodDef_C', 'BlueprintGeneratedClass'),
-        (MOD + 'EMood.EMood', 'UserDefinedEnum'), (MOD + 'MD_Plain.MD_Plain', 'UMoodDef_C'), (MOD + 'MD_Calm.MD_Calm', 'UMoodDef_C'),
+        (MOD + 'EDefMood.EDefMood', 'UserDefinedEnum'), (MOD + 'MD_Plain.MD_Plain', 'UMoodDef_C'), (MOD + 'MD_Calm.MD_Calm', 'UMoodDef_C'),
         (MOD + 'MD_Big.MD_Big', 'UMoodDef_C'), (MOD + 'ED_AssetTest.ED_AssetTest', 'EnemyDescriptor')}, ar
     print('ok  AssetTest: the asset registry lists every asset with its class')
 
@@ -2132,7 +2760,7 @@ def ue_assets():
                     'class UeAssetsUser : public AActor {\npublic:\n'
                     '  UEnemyDescriptor *Ed = &UeAssets::UEnemyDescriptor::Game::_ElytrasMods::AssetTest::ED_AssetTest;\n'
                     '  int32 Count() { return UeAssets::UEnemyDescriptor::All.Num(); }\n};\n')
-        proc = subprocess.run([ASSETGEN, 'compile', os.path.join(tmp, 'UeAssetsUser.cpp'), UEAPI, tmp], capture_output=True, encoding='utf-8')
+        proc = assetgen_compile([os.path.join(tmp, 'UeAssetsUser.cpp'), UEAPI, tmp])
         assert proc.returncode == 0, proc.stdout + proc.stderr
         user = os.path.join(tmp, 'UeAssetsUser')
         cdo = dump('dumptags.py', user, exports_of(user).index('Default__UeAssetsUser_C'))
@@ -2171,7 +2799,7 @@ def asset_elsewhere():
             f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/AssetPinned");\n'
                     + top % '  UE_CLASS("/Game/_ElytrasMods/Other/UOtherDef", "UOtherDef_C");\n'
                     + 'class AssetPinned : public AActor {\npublic:\n  UOtherDef *Picked = &OtherData;\n};\n')
-        proc = subprocess.run([ASSETGEN, 'compile', os.path.join(tmp, 'AssetPinned.cpp'), UEAPI, tmp], capture_output=True, encoding='utf-8')
+        proc = assetgen_compile([os.path.join(tmp, 'AssetPinned.cpp'), UEAPI, tmp])
         assert proc.returncode == 0, proc.stdout + proc.stderr
         assert not os.path.exists(os.path.join(tmp, 'UOtherDef.uasset')), os.listdir(tmp)
         imports = dict(import_paths(os.path.join(tmp, 'AssetPinned'), classes=True))
@@ -2234,7 +2862,8 @@ def edits():
     before, after = tags(a, 0), tags(b, 0)
     assert list(after) == list(before) + ['EnemySignificance'], (list(before), list(after))     # replaced in place, one appended
     assert after['SpawnSpread'].endswith(': 800.0') and 'value=0' in after['CanBeUsedForConstantPressure'], after
-    assert after['EnemySignificance'] == 'ByteProperty size=8 enum=EEnemySignificance: EEnemySignificance::Critical', after
+    # EEnemySignificance is an enum class: UEnemyDescriptor's member is an EnumProperty, and so is the tag (PropEnumClass)
+    assert after['EnemySignificance'] == 'EnumProperty size=8 enum=EEnemySignificance: EEnemySignificance::Critical', after
     for same in ('EnemyClass', 'IdealSpawnSize'):
         assert after[same] == before[same], (same, before[same], after[same])
     la, lb = dumpexp.load(a), dumpexp.load(b)
@@ -2279,7 +2908,7 @@ def edits():
                         'UE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\n'
                         'class UMoodDef : public UPrimaryDataAsset {\npublic:\n'
                         '  UE_CLASS("/Game/_ElytrasMods/AssetTest/UMoodDef", "UMoodDef_C");\n  int32 Count;\n};\n%s' % (name, src))
-            proc = subprocess.run([ASSETGEN, 'compile', path, UEAPI, tmp] + flags, capture_output=True, encoding='utf-8')
+            proc = assetgen_compile([path, UEAPI, tmp] + flags)
             assert proc.returncode != 0 and why in proc.stdout, (name, proc.stdout)
     print('ok  EditTest: an edit of a mod\'s own asset, a patch of a native class, a patch with a member of its own, and '
           'no --game are refused')
@@ -2305,7 +2934,7 @@ def edits():
                 f.write(decl % body)
             out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'LampEdit')
             os.makedirs(out)
-            proc = subprocess.run([ASSETGEN, 'compile', path, UEAPI, out, '--game', comp_game], capture_output=True, encoding='utf-8')
+            proc = assetgen_compile([path, UEAPI, out, '--game', comp_game])
             if why:
                 assert proc.returncode != 0 and why in proc.stdout, (body, proc.stdout)
                 continue
@@ -2342,7 +2971,7 @@ def edits():
                 f.write(decl % body)
             out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'FnEdit')
             os.makedirs(out)
-            proc = subprocess.run([ASSETGEN, 'compile', path, UEAPI, out, '--game', comp_game], capture_output=True, encoding='utf-8')
+            proc = assetgen_compile([path, UEAPI, out, '--game', comp_game])
             if why:
                 assert proc.returncode != 0 and why in proc.stdout, (body, proc.stdout)
                 continue
@@ -2365,8 +2994,19 @@ def edits():
                 assert me == {'Ticks': 2}, me
                 tick = dump('dumpstruct.py', b, [e['name'] for e in lb[5]].index('ReceiveTick'))
                 assert re.search(r"^SuperStruct imp\[\d+\]:Function'ReceiveTick'$", tick, re.M), tick
+            import invariants
+            pa, pb = invariants.Package(a), invariants.Package(b)
+
+            def tick_only(i):
+                """An added ReceiveTick turns the default object's tick on (KismetCompiler.cpp 4738-4839, which
+                added_tick_can_tick checks): its tags are the game's plus PrimaryActorTick, and the rest is the game's."""
+                ta, tb = pa.tags(i), pb.tags(i)
+                key = lambda t: (t['name'], t['type'], t['index'], bytes(t['value']))
+                return (not pa.tag(i, 'PrimaryActorTick') and pa.blob(i)[ta.end:] == pb.blob(i)[tb.end:]
+                        and [key(t) for t in tb if t['name'] != 'PrimaryActorTick'] == [key(t) for t in ta])
             assert all(x['name'] == 'ReceiveBeginPlay' or new and x['name'] == 'CompTest_C' or blob(la, x) == blob(lb, y)
-                       for x, y in zip(la[5], lb[5])), 'another export changed'
+                       or 'ReceiveTick' in new and x['name'] == 'Default__CompTest_C' and tick_only(i)
+                       for i, (x, y) in enumerate(zip(la[5], lb[5]))), 'another export changed'
             proc = subprocess.run([ASSETGEN, 'roundtrip', tmp], capture_output=True, encoding='utf-8')
             assert proc.returncode == 0, proc.stdout
             n = 2 + len(new)
@@ -2384,8 +3024,7 @@ def edits():
                     '  void ClientPing(int32 Seq) { ReplTest::ClientPing(Seq); Local = Local + 1; }\n};\n')
         out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'RpcEdit')
         os.makedirs(out)
-        proc = subprocess.run([ASSETGEN, 'compile', path, UEAPI, out, '--game', os.path.join(ROOT, 'ReplTest', 'FSD', 'Content')],
-                              capture_output=True, encoding='utf-8')
+        proc = assetgen_compile([path, UEAPI, out, '--game', os.path.join(ROOT, 'ReplTest', 'FSD', 'Content')])
         assert proc.returncode == 0, proc.stdout + proc.stderr
         b = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'ReplTest', 'ReplTest')
         me = {}
@@ -2414,7 +3053,7 @@ def edits():
                     '  void ReceiveBeginPlay() { Ticks = Ticks + Step; Step = Step + 1; }\n};\n')
         out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'GlobalEdit')
         os.makedirs(out)
-        proc = subprocess.run([ASSETGEN, 'compile', path, UEAPI, out, '--game', comp_game], capture_output=True, encoding='utf-8')
+        proc = assetgen_compile([path, UEAPI, out, '--game', comp_game])
         assert proc.returncode == 0, proc.stdout + proc.stderr
         assert os.path.exists(os.path.join(out, 'Step.uasset')), 'the global\'s class was not cooked: %s' % os.listdir(out)
         assert global_default(out, 'Step', 'Step') == '5'
@@ -2470,8 +3109,7 @@ def path_edits():
                 f.write(decl % body)
             out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'PathEdit')
             os.makedirs(out)
-            proc = subprocess.run([ASSETGEN, 'compile', path, UEAPI, out, '--game', os.path.join(ROOT, 'TypesTest', 'FSD', 'Content')],
-                                  capture_output=True, encoding='utf-8')
+            proc = assetgen_compile([path, UEAPI, out, '--game', os.path.join(ROOT, 'TypesTest', 'FSD', 'Content')])
             if why:
                 assert proc.returncode != 0 and why in proc.stdout, (body, proc.stdout)
                 continue
@@ -2500,8 +3138,7 @@ def path_edits():
                     'UE_ASSET_EDITS {\n  ED_AssetTest.VeteranClasses[0] = &ED_Spider_Exploder;\n  ED_AssetTest.IdealSpawnSize = 9;\n}\n')
         out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'AssetEdits')
         os.makedirs(out)
-        proc = subprocess.run([ASSETGEN, 'compile', path, UEAPI, out, '--game', os.path.join(ROOT, 'AssetTest', 'FSD', 'Content')],
-                              capture_output=True, encoding='utf-8')
+        proc = assetgen_compile([path, UEAPI, out, '--game', os.path.join(ROOT, 'AssetTest', 'FSD', 'Content')])
         assert proc.returncode == 0, proc.stdout + proc.stderr
         b = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'AssetTest', 'ED_AssetTest')
         la, lb = dumpexp.load(a), dumpexp.load(b)
@@ -2545,7 +3182,7 @@ def game_edits():
                     '    SpawnCount = SpawnCount + 41;\n  }\n};\n')
         out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'GameEdit')
         os.makedirs(out)
-        proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, out, '--game', GAME], capture_output=True, encoding='utf-8')
+        proc = assetgen_compile([src, UEAPI, out, '--game', GAME])
         assert proc.returncode == 0, proc.stdout + proc.stderr
         proc = subprocess.run([ASSETGEN, 'roundtrip', tmp], capture_output=True, encoding='utf-8')
         assert proc.returncode == 0, proc.stdout
@@ -2583,7 +3220,7 @@ def game_edits():
                     '#include "UeApi/Game/ENE_Spider_Grunt_Normal_C.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/GameEdit");\n'
                     'class GruntTweaks : public ENE_Spider_Grunt_Normal_C {\n  UE_PATCH;\n'
                     '  UE_DEFAULTS { Sphere->SphereRadius = 10.0f; }\n};\n')
-        proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, out, '--game', GAME], capture_output=True, encoding='utf-8')
+        proc = assetgen_compile([src, UEAPI, out, '--game', GAME])
         assert proc.returncode != 0 and 'does not override that inherited component' in proc.stdout, proc.stdout
 
     # Paths into the grunt's values: PrimaryActorTick, which its default object has no value of, becomes a tag holding
@@ -2605,7 +3242,7 @@ def game_edits():
                     'UE_ASSET_EDITS { ED_Spider_Grunt.SpawnRarityModifiers[1].Rarity = 2.0f; }\n')
         out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'GamePaths')
         os.makedirs(out)
-        proc = subprocess.run([ASSETGEN, 'compile', src, UEAPI, out, '--game', GAME], capture_output=True, encoding='utf-8')
+        proc = assetgen_compile([src, UEAPI, out, '--game', GAME])
         assert proc.returncode == 0, proc.stdout + proc.stderr
         a, b = game('Enemies/Spider/Grunt/ENE_Spider_Grunt_Normal'), os.path.join(tmp, 'FSD', 'Content', 'Enemies', 'Spider', 'Grunt', 'ENE_Spider_Grunt_Normal')
         la, lb = dumpexp.load(a), dumpexp.load(b)
@@ -2763,7 +3400,7 @@ def replication():
     import re, subprocess
     here, base = os.path.dirname(os.path.abspath(__file__)), asset('ReplTest')
     exports = [e['name'] for e in dumpexp.load(base)[5]]
-    tool = lambda t, i: subprocess.run([sys.executable, os.path.join(here, t), base, str(i)], capture_output=True, encoding='utf-8').stdout
+    tool = lambda t, i: dump(t, base, str(i))
     cls = tool('dumpstruct.py', 0)
     assert 'NumReplicatedProperties [0] IntProperty size=4: 4' in cls, cls
     for prop, flags, notify, cond in (('Score', '0x10025', 'None', 0), ('bOpen', '0x100010025', 'OnRep_Open', 0),
@@ -2780,7 +3417,7 @@ def replication():
     imports, kid_exports = dumpexp.load(kid)[4], dumpexp.load(kid)[5]
     for fn, flags in (('ServerOpen', 0xc2208c0), ('MultiBoom', 0xc024840), ('OnRep_Open', 0xc020800)):
         e = next(x for x in kid_exports if x['name'] == fn)
-        out = subprocess.run([sys.executable, os.path.join(here, 'dumpstruct.py'), kid, str(kid_exports.index(e))], capture_output=True, encoding='utf-8').stdout
+        out = dump('dumpstruct.py', kid, str(kid_exports.index(e)))
         assert 'FunctionFlags %#x' % flags in out, (fn, out)
         assert e['super'] < 0 and imports[-e['super'] - 1] == "Function'%s'" % fn, (fn, e['super'])
     print("ok  ReplTest: an override of a mod parent's RPC keeps its net flags and names it as super")
@@ -3009,7 +3646,8 @@ def spawn_runs():
         ('BeginDeferredActorSpawnFromClass', me, [me, 'SpawnTest_C', where, 0, None]),   # the mod class, deferred,
         ('set', twin, 'Tag'), ('FinishSpawningActor', me, [twin, where]),              # Tag set before it finishes
         ('SpawnObject', me, ['USpawnProbe_C', me]), ('set', me, 'Made'),
-        ('Create', me, [me, 'UserWidget', None]), ('set', me, 'Widget'),
+        ('Create', 'Default__WidgetBlueprintLibrary', [me, 'UserWidget', None]),       # cosmetic: on the library's CDO
+        ('set', me, 'Widget'),
         ('AddComponentByClass', me, ['SceneComponent', False, zero, False]), ('set', me, 'Part'),
         ('K2_AttachToComponent', vm.self.vars['Part'], ['root', 'None', 2, 2, 2, True]),  # SnapToTarget, weld
         ('AddComponentByClass', me, ['SceneComponent', False, zero, True]),               # held back ...
@@ -3032,7 +3670,7 @@ def spawn_relative():
     (the qualifier is read back from the mod's sources, which a bare path's empty parent once hid)."""
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
-        proc = subprocess.run([ASSETGEN, 'compile', 'SpawnTest.cpp', UEAPI, tmp], capture_output=True, encoding='utf-8', cwd=TESTS)
+        proc = assetgen_compile(['SpawnTest.cpp', UEAPI, tmp], cwd=TESTS)
         assert proc.returncode == 0, proc.stdout + proc.stderr
         assert VM(os.path.join(tmp, 'SpawnTest'), {}).call('OwnClass') == 'SpawnTest_C'
     print('ok  SpawnTest: a bare relative source path finds X::StaticClass() qualifiers')
@@ -3095,3 +3733,3973 @@ delegate_targets()
 spawn_runs()
 spawn_relative()
 outer_runs()
+
+
+# ---- PRELOAD: the event-driven loader's preload dependencies (invariant_rules/preload.py)
+#
+# A cooked package tells the event-driven loader, per export, what must be created or serialized before the export is
+# created or serialized (AsyncLoading.cpp 2447-2499). The edl_* rules read that graph and ask what the loader fetches
+# with bCheckSerialized, and what a payload names, is ordered before it: they hold on every package of the game's own
+# content. Each mod below carries a kind of dependency, and its test asserts the order the engine needs; a pending one
+# is a kind AssetGen does not order yet.
+
+import invariants
+from invariant_rules import preload as EDL
+
+EDL_RULES = ('edl_preload_arcs', 'edl_create_prereqs', 'edl_super_serialized', 'edl_class_cdo', 'edl_class_closure',
+             'edl_parent_subobjects_serialized', 'edl_property_types', 'edl_payload_created', 'edl_cdo_components')
+
+
+def mod_packages(base):
+    """Every package a mod's compile wrote: the Content folder its class sits under, walked."""
+    return invariants.packages([base.replace(os.sep, '/').split('/Content/')[0] + '/Content'])
+
+
+def keeps_edl(base, names=EDL_RULES):
+    """Every package of base's mod keeps the named edl_* rules."""
+    found = [(os.path.basename(b),) + f for b in mod_packages(base) for f in invariants.check(invariants.Package(b), set(names))]
+    assert not found, '; '.join('%s %s %s: %s' % f for f in found[:3])
+
+
+def preload_chain():
+    """PreloadChain_C <- PreloadMid_C <- PreloadRoot_C <- AActor, one package each. Each class has exactly one CDO,
+    whose template is its parent's CDO; the parent class and the parent CDO are serialized before the class, and the
+    class before its CDO is created; every export's class, template and outer are ready before it is created; the
+    graph has no cycle. And the CDO holds the class's own defaults, on top of what it inherits."""
+    keeps_edl(asset('PreloadChain'))
+    folder = os.path.dirname(asset('PreloadChain'))
+    for name, parent in (('PreloadChain', '/Game/_ElytrasMods/PreloadChain/PreloadMid.Default__PreloadMid_C'),
+                         ('PreloadMid', '/Game/_ElytrasMods/PreloadChain/PreloadRoot.Default__PreloadRoot_C'),
+                         ('PreloadRoot', '/Script/Engine.Default__Actor')):
+        pkg = invariants.Package(os.path.join(folder, name))
+        st = pkg.struct(pkg.find(name + '_C'))
+        cdo = pkg.exports[st.cdo - 1]
+        assert pkg.path(cdo['tmpl']) == parent, (name, pkg.path(cdo['tmpl']))
+    cdo = dump('dumptags.py', asset('PreloadChain'), exports_of(asset('PreloadChain')).index('Default__PreloadChain_C'))
+    assert 'Level [0] IntProperty size=4: 3' in cdo and 'Weight [0] FloatProperty size=4: 4.0' in cdo, cdo
+    print('ok  PreloadChain: one CDO per class, templated on the parent CDO; parent class and CDO serialized before '
+          'the class, the class before its CDO is created; no cycle')
+
+
+preload_chain()
+
+
+def preload_refs():
+    """PreloadRefs' payloads name UPreloadProbe_C as NewObject's class constant (Make) and as Probe's property class,
+    OnPing's signature as Broadcast's target (Ping), and the engine cylinder as Mesh's template default. Each is created
+    before the export naming it is serialized, or it loads as null: the writer lists every object a payload names, as
+    the cook's DependsMap does. First, that each payload does name what the source says it does."""
+    base = asset('PreloadRefs')
+    pkg = invariants.Package(base)
+
+    def named(export):
+        return {pkg.path(r) for _, r in EDL.edl_payload_refs(pkg, pkg.find(export)) if EDL.edl_in_range(pkg, r)}
+    probe = '/Game/_ElytrasMods/PreloadRefs/UPreloadProbe.UPreloadProbe_C'
+    for export, want in (('Make', probe), ('PreloadRefs_C', probe),
+                         ('Ping', '/Game/_ElytrasMods/PreloadRefs/PreloadRefs.PreloadRefs_C:OnPing__DelegateSignature'),
+                         ('Mesh_GEN_VARIABLE', '/Engine/BasicShapes/Cylinder.Cylinder')):
+        assert want in named(export), '%s does not name %s: %s' % (export, want, sorted(named(export)))
+    keeps_edl(base, ['edl_payload_created'])
+
+
+preload_refs()
+print("ok  PreloadRefs: a class constant, a property's class, a Broadcast target and a template default are created first")
+
+
+def preload_override():
+    """PreloadOverride's Step and Score override PreloadBase_C's: their SuperStruct is that function, and the loader
+    fetches it with bCheckSerialized while it serializes the override - a Fatal 'Missing Dependency' when the parent
+    package loads in the same batch and has not serialized it yet."""
+    base = asset('PreloadOverride')
+    pkg = invariants.Package(base)
+    supers = {e['name']: pkg.path(e['super']) for k, e in enumerate(pkg.exports)
+              if pkg.class_of(k + 1) == 'Function' and e['super']}
+    assert supers == {'Step': '/Game/_ElytrasMods/PreloadOverride/PreloadBase.PreloadBase_C:Step',
+                      'Score': '/Game/_ElytrasMods/PreloadOverride/PreloadBase.PreloadBase_C:Score'}, supers
+    keeps_edl(base, ['edl_super_serialized'])
+
+
+preload_override()
+print('ok  PreloadOverride: an override is serialized after its Blueprint parent function, its SuperStruct')
+
+
+def preload_types():
+    """PreloadTypes' structs and enum type a class variable, an array element, a parameter, a local and struct
+    members: each owner is serialized after the type it links against."""
+    base = asset('PreloadTypes')
+    keeps_edl(base, ['edl_property_types'])
+
+
+preload_types()
+print('ok  PreloadTypes: a user-defined struct or enum is serialized before the class, function or struct it types')
+
+
+def preload_uber_class():
+    """PreloadUber_C names ExecuteUbergraph_PreloadUber as its UberGraphFunction: Link preloads it, and the CDO's
+    persistent frame is only made from a loaded one, so it is serialized before the class."""
+    base = asset('PreloadUber')
+    pkg = invariants.Package(base)
+    assert EDL.edl_obj_tag(pkg, pkg.find('PreloadUber_C'), 'UberGraphFunction') > 0
+    keeps_edl(base, ['edl_class_closure'])
+
+
+preload_uber_class()
+print('ok  PreloadUber: the class is serialized after its ubergraph function')
+
+
+def preload_uber_calls():
+    """Wait, the stub the latent call leaves, calls ExecuteUbergraph_PreloadUber and writes its frame: resolved while
+    Wait is serialized, so the ubergraph is created before; otherwise the call target reads back null."""
+    base = asset('PreloadUber')
+    pkg = invariants.Package(base)
+    wait = pkg.find('Wait')
+    assert any(op[0] == 'obj' and op[1] and pkg.path(op[1]).endswith(':ExecuteUbergraph_PreloadUber')
+               for t in pkg.script(wait) for n in t.walk() for op in n.ops), 'Wait does not call ExecuteUbergraph_PreloadUber'
+    keeps_edl(base, ['edl_payload_created'])
+
+
+preload_uber_calls()
+print('ok  PreloadUber: a function that enters the ubergraph has it created before it is serialized')
+
+
+def preload_ich():
+    """PreloadIch_C names its InheritableComponentHandler, through which the Lamp archetype is found: the handler is
+    serialized (so created) before the class."""
+    base = asset('PreloadIch')
+    pkg = invariants.Package(base)
+    assert EDL.edl_obj_tag(pkg, pkg.find('PreloadIch_C'), 'InheritableComponentHandler') > 0
+    keeps_edl(base, ['edl_class_closure', 'edl_payload_created'])
+
+
+preload_ich()
+print('ok  PreloadIch: the class is serialized after its InheritableComponentHandler')
+
+
+# PreloadDso: a native default subobject restated along a Blueprint chain, and a child that restates nothing.
+
+def preload_dso_template(name, want):
+    """The export restating CollisionCylinder under Default__<name>_C, and the package: its TemplateIndex must be
+    `want`, the subobject of that name under the parent CDO (GetArchetypeFromRequiredInfo, UObjectArchetype.cpp
+    64-87)."""
+    pkg = invariants.Package(os.path.join(os.path.dirname(asset('PreloadDso')), name))
+    k = next((k for k, e in enumerate(pkg.exports) if e['name'] == 'CollisionCylinder'
+              and e['outer'] == pkg.find('Default__%s_C' % name) + 1), None)
+    assert k is not None, '%s: no CollisionCylinder export under its CDO' % name
+    tmpl = pkg.exports[k]['tmpl']
+    assert tmpl and pkg.path(tmpl) == want, '%s: TemplateIndex %s, not %s' % (name, tmpl and pkg.path(tmpl), want)
+    return pkg, k
+
+
+def preload_dso():
+    """PreloadDsoBase restates CollisionCylinder, a default subobject ACharacter's constructor makes: the export's
+    TemplateIndex is its archetype, Default__Character's subobject of that name; the loader checks it is set and
+    fetches it with bCheckSerialized."""
+    pkg, k = preload_dso_template('PreloadDsoBase', '/Script/Engine.Default__Character:CollisionCylinder')
+    found = invariants.check(pkg, {'edl_create_prereqs'})
+    assert not found, '; '.join('%s %s: %s' % f for f in found[:3])
+    print('ok  PreloadDso: a restated native subobject names Default__Character:CollisionCylinder as its TemplateIndex')
+
+
+def preload_dso_chain():
+    """PreloadDso restates it again: its override's archetype is PreloadDsoBase's, an import from the parent's
+    package. That export is serialized before the override is created, and before PreloadDso_C is serialized: the CDO
+    the class makes then builds its capsule from it, and a capsule copied from an unloaded archetype keeps
+    ACharacter's half height instead of the parent's 120."""
+    preload_dso_template('PreloadDso', '/Game/_ElytrasMods/PreloadDso/PreloadDsoBase.Default__PreloadDsoBase_C:CollisionCylinder')
+    keeps_edl(asset('PreloadDso'), ['edl_create_prereqs', 'edl_class_closure', 'edl_parent_subobjects_serialized'])
+
+
+def preload_dso_kid():
+    """PreloadDsoKid restates nothing, so whether it exports a capsule of its own is the writer's choice; either way the
+    CDO its class makes while it is serialized copies its capsule from PreloadDsoBase's CollisionCylinder export
+    (UObjectGlobals.cpp 3844-3859). That export is in PreloadDsoKid's linker table and serialized before the class."""
+    kid = os.path.join(os.path.dirname(asset('PreloadDso')), 'PreloadDsoKid')
+    parent = invariants.Package(os.path.join(os.path.dirname(kid), 'PreloadDsoBase'))
+    assert any(e['name'] == 'CollisionCylinder' and e['outer'] == parent.find('Default__PreloadDsoBase_C') + 1
+               for e in parent.exports), 'PreloadDsoBase exports no CollisionCylinder under its CDO'
+    found = invariants.check(invariants.Package(kid), {'edl_parent_subobjects_serialized'})
+    assert not found, '; '.join('%s %s: %s' % f for f in found[:3])
+
+
+preload_dso()
+preload_dso_chain()
+print('ok  PreloadDso: a child\'s subobject override is archetyped on the parent\'s, serialized before it and the child class')
+preload_dso_kid()
+print('ok  PreloadDso: a child class is serialized after every default subobject its Blueprint parent\'s CDO exports')
+
+
+def preload_game_parent():
+    """PreloadGameParent's parent is the game's ENE_Spider_Grunt_Normal_C, whose package exports every default
+    subobject of its CDO: the class is serialized after each of them, as after a parent cooked in the same compile
+    (preload_dso_kid). edl_parent_subobjects_serialized reads them off the game's package, so this needs --game."""
+    if not GAME:
+        print('--  PreloadGameParent: skipped (needs --game: the parent CDO\'s subobjects are read off the game\'s package)')
+        return False
+    base = asset('PreloadGameParent')
+    saved = list(invariants.GAME_CONTENT)
+    invariants.GAME_CONTENT[:] = [GAME]
+    try:
+        found = invariants.check(invariants.Package(base), {'edl_parent_subobjects_serialized'})
+    finally:
+        invariants.GAME_CONTENT[:] = saved
+    assert not found, '%d findings, e.g. %s' % (len(found), '; '.join('%s %s: %s' % f for f in found[:2]))
+    return True
+
+
+if preload_game_parent():
+    print('ok  PreloadGameParent: a child of a game Blueprint is serialized after every default subobject its parent\'s '
+          'CDO exports')
+
+
+# ---- TABLES: the package's own tables - names and their numbers, imports, exports, archetypes
+# (invariant_rules/tables.py)
+
+import struct, tempfile, glob as _glob
+import invariants
+from invariant_rules import tables          # raw_tables, name_refs, parse_tables
+
+
+def name_pairs(base):
+    """{(export name or None, where): {(name-map entry, Number)}} of every FName reference in the package at base, as
+    the loader resolves them (tables.name_refs): 'struct' is a struct body, 'tags' an export's tags, 'script' bytecode."""
+    pkg = invariants.Package(base)
+    names, out = tables.raw_tables(pkg).names, {}
+    for k, where, i, n in tables.name_refs(pkg):
+        out.setdefault((pkg.exports[k]['name'] if k is not None else None, where), set()).add((names[i], n))
+    return out, names
+
+
+def name_numbers():
+    """NameNumberTest: a name ending in _digits is stored as FName makes it - the entry without the suffix, the number
+    one above it - wherever ParseNumber splits it (a lone zero, nine digits), and whole where it does not (a leading
+    zero, MAX_int32): members, their CDO tags, the body that reads them, and FName literals alike."""
+    base = asset('NameNumberTest')
+    refs, names = name_pairs(base)
+    members = {('Count', 8), ('Level', 1), ('Rocket_04', 0), ('Width', 123456790)}
+    for where in (('NameNumberTest_C', 'struct'), ('Default__NameNumberTest_C', 'tags'), ('Sum', 'script')):
+        assert members <= refs[where], (where, sorted(refs[where]))
+    for fn, want in (('Tag', ('Tag', 8)), ('Socket', ('Socket_01', 0)), ('Nine', ('Nine', 123456790)),
+                     ('Cap', ('Cap_2147483647', 0))):
+        assert want in refs[fn, 'script'], (fn, sorted(refs[fn, 'script']))
+    whole = [n for n in ('Count_7', 'Level_0', 'Width_123456789', 'Tag_7', 'Nine_123456789') if n in names]
+    assert not whole, 'stored whole: %s' % whole
+    fields = {'Count_7': 1, 'Level_0': 2, 'Rocket_04': 3, 'Width_123456789': 4}
+    assert run(base, 'Sum', self_vars=fields)[0] == 10
+    keeps_invariants(base)
+    print('ok  NameNumberTest: a _N suffix is stored as FName splits it (entry, N+1), and whole where FName keeps it whole')
+
+
+def name_suffix():
+    """The ten-digit case of the same rule: below MAX_int32, FName splits it too."""
+    base = asset('NameSuffix')
+    refs, names = name_pairs(base)
+    whole = [n for n in ('Tag_1234567890', 'Count_1234567890') if n in names]
+    assert not whole, 'stored whole, Number 0: %s' % whole
+    assert ('Count', 1234567891) in refs['NameSuffix_C', 'struct'] & refs['Default__NameSuffix_C', 'tags']
+    assert ('Tag', 1234567891) in refs['Tag', 'script'] and ('Tag', 1234567891) in refs['Same', 'script']
+    keeps_invariants(base)
+    print('ok  NameSuffix: a 10-digit _N suffix below MAX_int32 is stored split, as FName splits it')
+
+
+def subobject_template():
+    """OverrideTest's Walker overrides ACharacter's default subobjects: each override's archetype is the parent CDO's
+    subobject of that name (GetArchetypeFromRequiredInfo rule 1), which the loader constructs it on."""
+    b = os.path.join(os.path.dirname(asset('OverrideTest')), 'Walker')
+    ex, names = dumpexp.load(b)[5], exports_of(b)
+    imps = dict(import_paths(b, classes=True))
+    for sub, cls in (('CollisionCylinder', '/Script/Engine.CapsuleComponent'),
+                     ('CharacterMesh0', '/Script/Engine.SkeletalMeshComponent')):
+        e = ex[names.index(sub)]
+        got = ref(b, e['tmpl']) if e['tmpl'] else 'a null template'
+        assert got == '/Script/Engine.Default__Character:' + sub, (sub, got)
+        assert imps['/Script/Engine.Default__Character:' + sub] == cls, imps
+    assert imps['/Script/Engine.Default__Character'] == '/Script/Engine.Character', imps
+    keeps_invariants(b)
+    print("ok  OverrideTest Walker: each default-subobject override names Default__Character's subobject as its archetype")
+
+
+def subobject_chain():
+    """SubobjectChain: the base's override stands on Default__Character's CollisionCylinder, the kid's on the base's
+    own override - a /Game object, so the kid's export also waits for it to be serialized before it is created. The
+    middle class restates nothing, yet exports the capsule the tip's override stands on."""
+    kid = asset('SubobjectChain')
+    base, mid, tip = (os.path.join(os.path.dirname(kid), 'SubobjectChain' + c) for c in ('Base', 'Mid', 'Tip'))
+    for b, want in ((base, '/Script/Engine.Default__Character:CollisionCylinder'),
+                    (kid, '/Game/_ElytrasMods/SubobjectChain/SubobjectChainBase.Default__SubobjectChainBase_C:CollisionCylinder'),
+                    (mid, '/Script/Engine.Default__Character:CollisionCylinder'),
+                    (tip, '/Game/_ElytrasMods/SubobjectChain/SubobjectChainMid.Default__SubobjectChainMid_C:CollisionCylinder')):
+        e = dumpexp.load(b)[5][exports_of(b).index('CollisionCylinder')]
+        got = ref(b, e['tmpl']) if e['tmpl'] else 'a null template'
+        assert got == want, (os.path.basename(b), got)
+        assert dict(import_paths(b, classes=True))[want] == '/Script/Engine.CapsuleComponent'
+    for b in (kid, tip):
+        k = exports_of(b).index('CollisionCylinder')
+        assert dumpexp.load(b)[5][k]['tmpl'] in dumpexp.preload(b)[k][2], 'the template is not serialized before create'
+    for b in (base, kid, mid, tip):
+        keeps_invariants(b)
+    print("ok  SubobjectChain: an override's archetype is the parent CDO's subobject of its name, a /Game one serialized "
+          "before create; a parent that leaves it alone exports it for its subclass")
+
+
+def self_ref_import():
+    """SelfRefImport: a member of the mod's own class and a call to its own function on another instance reference
+    this package's exports, never an import of the package itself."""
+    b = asset('SelfRefImport')
+    own = '/game/_elytrasmods/selfrefimport/selfrefimport'
+    selfs = [p for p in import_paths(b) if p.lower() == own or p.lower().startswith(own + '.')]
+    assert not selfs, 'imports of itself: %s' % selfs
+    pkg = invariants.Package(b)
+    peer = next(p for p in pkg.struct(pkg.find('SelfRefImport_C')).props if p.name == 'Peer')
+    assert peer.ref > 0 and pkg.exports[peer.ref - 1]['name'] == 'SelfRefImport_C', pkg.path(peer.ref)
+    keeps_invariants(b)
+    print('ok  SelfRefImport: its own class and function are named as its exports, never through an import of itself')
+
+
+ABSTRACT_CLASS = 'class UPureDef : public UPrimaryDataAsset {\npublic:\n  virtual int32 Pure() = 0;\n};\n'
+ABSTRACT_COMP = 'class UPureComp : public UActorComponent {\npublic:\n  virtual int32 Pure() = 0;\n};\n'
+
+
+def refused_naming(mod, body, pattern, top=''):
+    """refused(), where the reason may come from clang (its diagnostics go to stderr, the compiler's FAILED line to
+    stdout) or from the compiler itself: the compile fails and stdout or stderr matches the regex `pattern`."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, mod + '.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\n%s'
+                    'class %s : public AActor {\npublic:\n%s};\n' % (mod, top, mod, body))
+        proc = assetgen_compile([src, UEAPI, tmp])
+        assert proc.returncode != 0 and re.search(pattern, proc.stdout + proc.stderr), (mod, proc.stdout, proc.stderr)
+
+
+def abstract_instances():
+    """A class left abstract is never instanced: the loader constructs every non-CDO export, and StaticAllocateObject
+    check()s !CLASS_Abstract (UObjectGlobals.cpp 2362). An asset of an abstract mod class - one this mod would cook,
+    or one it names at a path - is refused, naming the class abstract (today clang does: a variable of an abstract
+    type)."""
+    abstract = r"'UPureDef' is an abstract class|UPureDef\W.*\babstract\b"
+    refused_naming('AbstractAsset', '  UPureDef *Picked = &PureData;\n', abstract,
+                   top=ABSTRACT_CLASS + 'UPureDef PureData = {};\n')
+    refused_naming('AbstractAsset', '  UPureDef *Picked = &PureData;\n', abstract,
+                   top=ABSTRACT_CLASS + 'UE_ASSET_AT(UPureDef, PureData, "/Game/_ElytrasMods/AbstractAsset/PureData");\n')
+    print('ok  AbstractAsset: an asset of an abstract mod class, cooked here or named at a path, is refused as abstract')
+
+
+def name_too_long():
+    """An FName literal of 1100 characters has no cooked form: the loader reads a name-map entry into a NAME_SIZE
+    buffer, NUL included (NameTypes.h 36), and a longer one misreads every later name (UnrealNames.cpp 2657-2672). It
+    is refused, saying it is too long; 1023 characters, the most an FName holds, still cooks."""
+    body = '  bool F() { return FName("%s") == FName("A"); }\n'
+    refused('NameTooLong', body % ('x' * 1100), 'is too long: 1100 characters')
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, 'NameAtLimit.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/NameAtLimit");\n'
+                    'class NameAtLimit : public AActor {\npublic:\n%s};\n' % (body % ('x' * 1023)))
+        proc = assetgen_compile([src, UEAPI, tmp])
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+    print('ok  NameTooLong: an FName over 1023 characters is refused as too long; one of 1023 cooks')
+
+
+def mutated(tmp, base, patch):
+    """A copy of base's package folder in a fresh Content tree under tmp, with base's own files patched in memory:
+    patch(ua, ue, t, pkg) edits the bytearrays of its .uasset / .uexp (t its raw tables, pkg the Package). The copy keeps
+    its path below FSD/Content, so its package name and its /Game imports of the folder's other packages still hold."""
+    tmp = tempfile.mkdtemp(dir=tmp)
+    rel = base.replace(os.sep, '/').split('/FSD/Content/')[-1]
+    out = os.path.join(tmp, 'Mut', 'FSD', 'Content', *rel.split('/'))
+    os.makedirs(os.path.dirname(out))
+    for f in _glob.glob(os.path.join(os.path.dirname(base), '*.u*')):
+        with open(f, 'rb') as src, open(os.path.join(os.path.dirname(out), os.path.basename(f)), 'wb') as dst:
+            dst.write(src.read())
+    ua, ue = bytearray(open(base + '.uasset', 'rb').read()), bytearray(open(base + '.uexp', 'rb').read())
+    pkg = invariants.Package(base)
+    patch(ua, ue, tables.raw_tables(pkg), pkg)
+    open(out + '.uasset', 'wb').write(ua)
+    open(out + '.uexp', 'wb').write(ue)
+    return out
+
+
+def tables_rules_fire():
+    """Each TABLES rule sees the thing it checks: one package, clean as built, patched to break exactly that invariant,
+    and the rule reports it."""
+    nn = asset('NameNumberTest')
+    dp = os.path.join(os.path.dirname(asset('OverrideTest')), 'DimProp')
+    mood = os.path.join(os.path.dirname(asset('AssetTest')), 'UMoodDef')       # MD_Big beside it is an instance of it
+    ct = asset('CompTest')                                                      # its Rocks / Grass are (H)ISMC templates
+    exp_at = lambda t, k, field: t.export_offset + 104 * k + {'cls': 0, 'super': 4, 'tmpl': 8, 'outer': 12, 'name': 16,
+                                                              'flags': 24, 'size': 28, 'forced': 44}[field]
+    imp_at = lambda t, j, field: t.import_offset + 28 * j + {'cn': 8, 'outer': 16, 'obj': 20, 'num': 24}[field]
+    put = lambda buf, at, v: struct.pack_into('<i', buf, at, v)
+    get = lambda buf, at: struct.unpack_from('<i', buf, at)[0]
+    idx = lambda pkg, name: pkg.find(name)
+
+    def rename(t, old, new):
+        """Rewrites name entry `old` in place as `new`, of the same length."""
+        j = t.names.index(old)
+        return lambda ua: ua.__setitem__(slice(t.names_at[j] + 4, t.names_at[j] + 4 + len(new)), new.encode())
+
+    def super_payload(ua, ue, t, pkg, k, v):
+        """Sets struct export k's serialized SuperStruct (after its tags and lazy-object GUID bool) to v."""
+        at = pkg.tags(k).end
+        at += 4 + (16 if get(pkg.blob(k), at) else 0)
+        put(ue, pkg.exports[k]['off'] - pkg.total + at, v)
+
+    def first_nonroot(t):
+        return next(j for j, m in enumerate(t.imports) if m['outer'])
+
+    def import_of(t, name):
+        return next(j for j, m in enumerate(t.imports) if t.name(m['obj']) == name)
+
+    def within_of_itself(ua, ue, t, p):
+        """Sets class UMoodDef_C's ClassWithin (in its tail: ClassWithin, config name, ClassGeneratedBy, interfaces,
+        bDeprecatedForceScriptOrder, the dummy name, bCooked, the CDO) to the class itself."""
+        k = idx(p, 'UMoodDef_C')
+        st = p.struct(k)
+        put(ue, p.exports[k]['off'] - p.total + st.end - 40 - 12 * len(st.interfaces), k + 1)
+
+    def archetype_twin(ua, ue, t, p):
+        """Makes the CDO the archetype of the class, and puts a DefaultSceneRoot_GEN_VARIABLE of the same class under
+        the CDO (the Tag function, renamed and reclassed): rule 1 now finds that one for the class's own
+        DefaultSceneRoot_GEN_VARIABLE, whose template is still the SceneComponent CDO."""
+        dsr, tag = idx(p, 'DefaultSceneRoot_GEN_VARIABLE'), idx(p, 'Tag')
+        put(ua, exp_at(t, 0, 'tmpl'), 2)
+        put(ua, exp_at(t, tag, 'outer'), 2)
+        put(ua, exp_at(t, tag, 'cls'), t.exports[dsr]['cls'])
+        struct.pack_into('<ii', ua, exp_at(t, tag, 'name'), *t.exports[dsr]['obj'])
+
+    cases = [
+        ('table_bounds', nn, lambda ua, ue, t, p: put(ua, exp_at(t, 2, 'outer'), 999), 'outer 999 is outside'),
+        ('table_bounds', nn, lambda ua, ue, t, p: ua.__setitem__(t.names_at[t.names.index('Rocket_04')] + 4 + len('Rocket_04'), ord('!')),
+         'does not end in its only NUL'),
+        ('table_bounds', nn, lambda ua, ue, t, p: put(ue, p.exports[1]['off'] - p.total, 99999), 'FName (99999,'),
+        ('names_split', nn, lambda ua, ue, t, p: rename(t, 'Rocket_04', 'Rocket_40')(ua), "'Rocket_40' #0"),
+        ('import_chains', nn, lambda ua, ue, t, p: put(ua, imp_at(t, first_nonroot(t), 'outer'), 1), 'reaches export 0'),
+        ('imports_resolve', dp, lambda ua, ue, t, p: put(ua, imp_at(t, import_of(t, 'BaseProp_C'), 'num'), 5),
+         'has no export BaseProp_C_4'),
+        ('imports_resolve', dp, lambda ua, ue, t, p: put(ua, imp_at(t, import_of(t, 'BaseProp_C'), 'cn'),
+                                                        t.names.index('Package')), 'is a /Script/Engine.Package'),
+        ('imports_resolve', dp, lambda ua, ue, t, p: rename(t, '/Game/_ElytrasMods/OverrideTest/BaseProp',
+                                                           '/Game/_ElytrasMods/OverrideTest/BaseProq')(ua), 'no such package'),
+        ('export_rows', nn, lambda ua, ue, t, p: put(ua, exp_at(t, 2, 'forced'), 1), 'bForcedExport'),
+        ('export_rows', nn, lambda ua, ue, t, p: put(ua, exp_at(t, 2, 'flags'), p.exports[2]['flags'] | 0x10),
+         'RF_ClassDefaultObject set'),
+        ('export_name_unique', nn, lambda ua, ue, t, p: struct.pack_into('<ii', ua, exp_at(t, 3, 'name'), *t.exports[2]['obj']),
+         'repeats export 2'),
+        ('payload_exact', nn, lambda ua, ue, t, p: put(ua, exp_at(t, idx(p, 'SCS_Node_0'), 'size'), p.exports[idx(p, 'SCS_Node_0')]['size'] + 4),
+         'reads to'),
+        ('cdo_body_exact', nn, lambda ua, ue, t, p: put(ua, exp_at(t, 1, 'size'), p.exports[1]['size'] + 4), 'CDO tags end at'),
+        ('super_index_matches_payload', nn, lambda ua, ue, t, p: put(ua, exp_at(t, 0, 'super'), 0), 'SuperIndex None'),
+        ('struct_super_kinds', nn, lambda ua, ue, t, p: (put(ua, exp_at(t, 0, 'super'), 0), super_payload(ua, ue, t, p, 0, 0)),
+         'a class without a super'),
+        ('function_placement', nn, lambda ua, ue, t, p: put(ua, exp_at(t, idx(p, 'Tag'), 'outer'), 0), 'a function inside the package'),
+        ('public_exports', nn, lambda ua, ue, t, p: put(ua, exp_at(t, idx(p, 'Tag'), 'flags'), p.exports[idx(p, 'Tag')]['flags'] & ~1),
+         'function Tag is not RF_Public'),
+        ('export_archetype', nn, lambda ua, ue, t, p: put(ua, exp_at(t, 1, 'tmpl'), 0), 'null TemplateIndex'),
+        ('export_archetype', nn, archetype_twin, 'which rule 1 finds first'),
+        ('export_outer_within', mood, within_of_itself, 'directly in the package, but its class', 'MD_Big'),
+        ('payload_exact', ct, lambda ua, ue, t, p: put(ua, exp_at(t, idx(p, 'Rocks_GEN_VARIABLE'), 'size'),
+                                                      p.exports[idx(p, 'Rocks_GEN_VARIABLE')]['size'] + 8),
+         'a InstancedStaticMeshComponent (native InstancedStaticMeshComponent) reads to'),
+        ('payload_exact', ct, lambda ua, ue, t, p: put(ua, exp_at(t, idx(p, 'Grass_GEN_VARIABLE'), 'size'),
+                                                      p.exports[idx(p, 'Grass_GEN_VARIABLE')]['size'] - 8),
+         'a HierarchicalInstancedStaticMeshComponent (native HierarchicalInstancedStaticMeshComponent) reads to'),
+        ('payload_exact', os.path.join(os.path.dirname(mood), 'MD_Big'),
+         lambda ua, ue, t, p: put(ua, exp_at(t, idx(p, 'MD_Big'), 'size'), p.exports[idx(p, 'MD_Big')]['size'] + 4),
+         '(native PrimaryDataAsset) reads to'),
+        ('package_flags', nn, lambda ua, ue, t, p: struct.pack_into('<I', ua, t.flags_at, t.flags | 0x2000),
+         'PackageFlags 0x80002000'),
+    ]
+    for base in (nn, dp, ct):
+        found = invariants.check(invariants.Package(base), set(tables.TABLES_RULES))
+        assert not found, (os.path.basename(base), found)
+    game = list(invariants.GAME_CONTENT)
+    with tempfile.TemporaryDirectory() as tmp:
+        invariants.GAME_CONTENT[:] = [tmp]          # a game folder is set, so a /Game package found nowhere is missing
+        try:
+            for rule, base, patch, want, *other in cases:
+                at = lambda b: os.path.join(os.path.dirname(b), other[0]) if other else b   # the package the rule reads
+                found = invariants.check(invariants.Package(at(base)), {rule})
+                assert not found, ('clean as built', rule, os.path.basename(at(base)), found)
+                found = [m for r, _, m in invariants.check(invariants.Package(at(mutated(tmp, base, patch))), {rule})]
+                assert any(want in m for m in found), (rule, want, found)
+        finally:
+            invariants.GAME_CONTENT[:] = game
+    print('ok  every TABLES rule reports its invariant broken in a patched package  (%d cases)' % len(cases))
+
+
+name_numbers()
+name_suffix()
+subobject_template()
+subobject_chain()
+self_ref_import()
+abstract_instances()
+refused('AbstractComp', '  UE_COMPONENT(UPureComp, Comp);\n', 'abstract', top=ABSTRACT_COMP)
+print('ok  AbstractComp: a component of an abstract mod class is refused, naming it abstract')
+name_too_long()
+tables_rules_fire()
+
+
+# ---- CLASS: the class tail, what a class inherits from its parent (ScriptInherit flags, ClassWithin, ClassConfigName),
+# instanced references, member names and the parameter block's width (invariant_rules/class_tail.py)
+
+import struct, tempfile
+import invariants
+
+OBJ = '/Script/CoreUObject.Object'
+PLAYER_CONTROLLER = '/Script/Engine.PlayerController'
+
+
+def class_tail(base, name=None):
+    """(Package, export index, Struct) of the class `name`_C (default: the package's namesake) at base."""
+    pkg = invariants.Package(base)
+    want = (name or os.path.basename(base)) + '_C'
+    i = next(i for i, st in invariants.classes(pkg) if pkg.exports[i]['name'] == want)
+    return pkg, i, pkg.struct(i)
+
+
+def tail_facts(base, parent, bits, within, config):
+    """The class at base names `parent` as its super and carries what the parent passes on: its ScriptInherit `bits`,
+    its ClassWithin and its ClassConfigName (KismetCompiler.cpp:320-321, 2450-2453)."""
+    pkg, i, st = class_tail(base)
+    name = os.path.basename(base)
+    assert pkg.path(st.super) == parent, (name, pkg.path(st.super))
+    assert st.class_flags & bits == bits, '%s ClassFlags %#x lack %#x of %s' % (name, st.class_flags, bits & ~st.class_flags, parent)
+    assert pkg.path(st.within) == within, '%s ClassWithin %s, %s is within %s' % (name, pkg.path(st.within), parent, within)
+    assert st.config == config, '%s ClassConfigName %s, %s has %s' % (name, st.config, parent, config)
+    return pkg, i, st
+
+
+def class_tail_keep():
+    """ClassTailKeep: children of the native parents AssetGen already follows carry each parent's flags, Within and
+    ConfigName (UCLASS specifiers, and what every game Blueprint child of the parent carries), a mod child copies its
+    mod parent's exactly, and every tail is a cooked Blueprint's: Parsed|CompiledFromBlueprint, bCooked, no
+    ClassGeneratedBy."""
+    folder = os.path.dirname(asset('ClassTailKeep'))
+    for name, parent, bits, config in (('ClassTailKeep', '/Script/Engine.Actor', 0x800004, 'Engine'),        # Actor.h:131
+                                       ('TailPart', '/Script/Engine.ActorComponent', 0xa00004, 'Engine'),    # ActorComponent.h:115
+                                       ('TailScene', '/Script/Engine.SceneComponent', 0xa00004, 'Engine'),
+                                       ('TailObject', OBJ, 0, 'Engine'),                                     # Object.h:57-60
+                                       ('TailLib', '/Script/Engine.BlueprintFunctionLibrary', 0, 'Engine')):
+        pkg, i, st = tail_facts(os.path.join(folder, name), parent, bits, OBJ, config)
+        assert st.class_flags & 0x40010 == 0x40010 and st.cooked == 1 and st.generated_by == 0, (name, hex(st.class_flags), st.cooked)
+        keeps_invariants(os.path.join(folder, name))
+    _, _, mine = class_tail(os.path.join(folder, 'ClassTailKeep'))
+    kid = tail_facts(os.path.join(folder, 'TailKid'), '/Game/_ElytrasMods/ClassTailKeep/ClassTailKeep.ClassTailKeep_C',
+                     mine.class_flags & 0x4AA1364E, OBJ, mine.config)
+    keeps_invariants(os.path.join(folder, 'TailKid'))
+    print('ok  ClassTailKeep: each class carries its parent\'s ScriptInherit flags, ClassWithin and ClassConfigName')
+    # NumReplicatedProperties covers the replicated member: GetLifetimeBlueprintReplicationList registers that many
+    # CPF_Net properties and stops (BlueprintGeneratedClass.cpp:1786-1799).
+    pkg, i, st = class_tail(asset('ClassTailKeep'))
+    tag = pkg.tag(i, 'NumReplicatedProperties')
+    count = struct.unpack_from('<i', tag['value'])[0] if tag else 0
+    assert count >= sum(1 for p in st.props if p.flags & 0x20) == 1, (count, [(p.name, hex(p.flags)) for p in st.props])
+    fields = {'Count': 5}
+    assert run(asset('ClassTailKeep'), 'Next', self_vars=fields)[0] == 6 and fields['Count'] == 6, fields
+    fields = {'Count': 2, 'Extra': 10}
+    assert run_as([os.path.join(folder, 'TailKid'), asset('ClassTailKeep')], 'Both', fields) == 13 and fields['Count'] == 3, fields
+    assert run(os.path.join(folder, 'TailLib'), 'Twice', V=21)[0] == 42
+    print('ok  ClassTailKeep: NumReplicatedProperties covers Shared; Next, TailKid.Both and TailLib.Twice run as in C++')
+
+
+def parm_width():
+    """ParmWidth: 254 arguments and a return value - 255 CPF_Parm properties, the most UFunction::NumParms (a uint8,
+    Class.h:1800-1805) counts - cook, keep every invariant (function_parms_fit among them), and run."""
+    base = asset('ParmWidth')
+    pkg = invariants.Package(base)
+    edge = next(pkg.struct(i) for i, e in enumerate(pkg.exports) if e['name'] == 'Edge')
+    parms = [p for p in edge.props if p.flags & 0x80]
+    assert len(parms) == 255 and sum(1 for p in parms if p.flags & 0x400) == 1, len(parms)
+    keeps_invariants(base)
+    for scale in (1, -7):
+        args = {'A%d' % k: (k * 31 - 1000) * scale for k in range(254)}
+        assert run(base, 'Edge', **args)[0] == args['A0'] - args['A126'] + args['A253']
+    print('ok  ParmWidth: 254 arguments and a result cook as 255 parameters and run')
+
+
+def parm_over():
+    """255 arguments and a result would be 256 CPF_Parm properties: NumParms wraps to 0 (Class.cpp:5638-5651)."""
+    refused('ParmOver', '  int32 Sum(%s) { return A0; }\n' % ', '.join('int32 A%d' % k for k in range(255)),
+            'ParmOver::Sum: 256 parameters, the return value included; a function takes at most 255')
+    print('ok  ParmWidth: 255 arguments and a result (256 parameters, NumParms a uint8) are refused')
+
+
+def parm_huge():
+    """A 65600-byte struct argument: ParmsSize, a uint16, wraps and ProcessEvent copies the wrong range
+    (ScriptCore.cpp:1952-1958)."""
+    refused('ParmHuge', '  int32 Take(FParmHuge B) { return 0; }\n', "a function's parameter block holds at most 65535",
+            top='struct FParmHuge {\n  UE_STRUCT;\n%s};\n' % ''.join('  int32 M%d;\n' % k for k in range(16400)))
+    print('ok  ParmWidth: a 65600-byte parameter block (ParmsSize a uint16) is refused')
+
+
+# Children of native parents with a non-default tail (ClassTailMeta): parent, the ScriptInherit bits it passes on,
+# its ClassWithin and ClassConfigName, from UE 4.27's UCLASS specifiers and the game's own Blueprint children.
+TAIL_META = {
+    'ClassTailMeta': ('/Script/FSD.StatusEffect', 0x801000, OBJ, 'Engine'),                 # all 242 game STE_ BPs: 0x801000
+    'MetaHud': ('/Script/Engine.HUD', 0x80020c, OBJ, 'Game'),                               # HUD.h:35
+    'MetaController': ('/Script/Engine.PlayerController', 0x800204, OBJ, 'Game'),           # PlayerController.h:222, Controller.h:39
+    'MetaMode': ('/Script/Engine.GameModeBase', 0x80020c, OBJ, 'Game'),                     # GameModeBase.h:45
+    'MetaCheats': ('/Script/Engine.CheatManager', 0, PLAYER_CONTROLLER, 'Engine'),          # CheatManager.h:87
+    'MetaSettings': ('/Script/Engine.GameUserSettings', 0x40000004, OBJ, 'GameUserSettings'),  # GameUserSettings.h:37
+    'MetaWalker': ('/Script/Engine.Character', 0x800004, OBJ, 'Game'),                      # Character.h:213
+    'MetaTask': ('/Script/AIModule.BTTask_BlueprintBase', 0, OBJ, 'Game'),                  # BTNode.h:36
+    'MetaDamage': ('/Script/Engine.DamageType', 0x10000, OBJ, 'Engine'),                     # DamageType.h:19
+    'MetaAnim': ('/Script/Engine.AnimInstance', 0x800008, '/Script/Engine.SkeletalMeshComponent', 'Engine'),  # AnimInstance.h:361
+    'MetaInput': ('/Script/Engine.PlayerInput', 0xc, PLAYER_CONTROLLER, 'Input'),           # PlayerInput.h:333
+}
+
+
+def tail_meta(name):
+    def test():
+        base = os.path.join(os.path.dirname(asset('ClassTailMeta')), name)
+        tail_facts(base, *TAIL_META[name])
+        keeps_invariants(base)
+        if name == 'ClassTailMeta':
+            assert run(base, 'More', self_vars={'Stacks': 4})[0] == 5
+        if name == 'MetaCheats':
+            fields = {'N': 2}
+            run(base, 'Bump', self_vars=fields)
+            assert fields['N'] == 3, fields
+    return test
+
+
+def walker_config():
+    """OverrideTest's Walker derives from ACharacter, config=Game (Character.h:213): its config members read Game.ini."""
+    pkg, i, st = class_tail(os.path.join(os.path.dirname(asset('OverrideTest')), 'Walker'))
+    assert st.config == 'Game', 'Walker_C ClassConfigName %s, ACharacter has Game' % st.config
+
+
+def instanced_refs():
+    """InstancedRefs: a member typed by a component class - native, or the mod's own RefPart - is
+    CPF_InstancedReference; an array, map or struct member holding one is CPF_ContainsInstancedReference; the class is
+    CLASS_HasInstancedReference (KismetCompilerMisc.cpp:948-952, 974-977, 1215-1218, 1254-1257;
+    KismetCompiler.cpp:2521-2529). Instancing walks only flagged members (Class.cpp:2152-2163)."""
+    base = asset('InstancedRefs')
+    pkg, i, st = class_tail(base)
+    part = class_tail(os.path.join(os.path.dirname(base), 'RefPart'))[2]
+    assert part.class_flags & 0x200000, 'RefPart ClassFlags %#x lack DefaultToInstanced' % part.class_flags
+    props = {p.name: p for p in st.props}
+    need = [('Root', props['Root'].flags, 0x80000), ('Spare', props['Spare'].flags, 0x80000),
+            ('Pieces', props['Pieces'].flags, 0x8000000000), ('Pieces inner', props['Pieces'].subs[0].flags, 0x80000),
+            ('ByIndex', props['ByIndex'].flags, 0x8000000000), ('ByIndex value', props['ByIndex'].subs[1].flags, 0x80000),
+            ('LastHit', props['LastHit'].flags, 0x8000000000), ('Mine', props['Mine'].flags, 0x80000)]
+    missing = ['%s %#x lacks %#x' % (n, f, bit) for n, f, bit in need if not f & bit]
+    assert not missing, '; '.join(missing)
+    assert st.class_flags & 0x800000, hex(st.class_flags)
+    keeps_invariants(base)
+    assert run(base, 'CountPieces', self_vars={'Pieces': ['a', 'b', 'c']})[0] == 3
+    print('ok  InstancedRefs: component references are flagged instanced, their containers and HitResult contain one, '
+          'the class HasInstancedReference')
+
+
+def run_fname(chain, fn, fields, **parms):
+    """run_as without its exact-case name match: fn is run on an object of class chain[0] (mod ancestors chain[1:]),
+    and every call by name - the first included - finds the most derived function of that FName, case-insensitively,
+    as the VM does (EX_VirtualFunction / ProcessEvent: FindFunctionChecked through FuncMap)."""
+    import runscript
+    names = {b: exports_of(b) for b in chain}
+
+    def owner(f):
+        return next((b, n) for b in chain for n in names[b] if n.lower() == f.lower())
+    saved = runscript.run, runscript.params_of
+    runscript.run = lambda base, f, self_vars=None, **p: saved[0](*owner(f), self_vars, **p)
+    runscript.params_of = lambda base, f, *flag: saved[1](*owner(f), *flag)
+    try:
+        return saved[0](*owner(fn), fields, **parms)[0]
+    finally:
+        runscript.run, runscript.params_of = saved
+
+
+def refused_or_distinct(mod, classes_src, member, oracle=None):
+    """A mod whose members are one FName (FNames compare case-insensitively), or a C++ overload set a Blueprint class
+    cannot hold: the compiler must refuse it, naming `member`, or cook every class with its members apart
+    (member_names_distinct) and, given `oracle` = (function, value[, class chain]), the function returning what C++
+    returns - run on the mod's class, or dispatched by FName on an object of the chain's first class.
+    The editor refuses a duplicate function and renames a clashing variable (KismetCompiler.cpp:570-616, 1737-1747)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, mod + '.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\n%s' % (mod, classes_src))
+        out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', mod)
+        os.makedirs(out)
+        proc = assetgen_compile([src, UEAPI, out])
+        if proc.returncode:
+            assert member in proc.stdout, (mod, proc.stdout[-400:])
+            return
+        found = [f for b in invariants.packages([out]) for f in invariants.check(invariants.Package(b), {'member_names_distinct'})]
+        assert not found, '%s cooks %s: %s' % (mod, found[0][1], found[0][2])
+        if oracle:
+            chain = oracle[2] if len(oracle) > 2 else [mod]
+            got = run_fname([os.path.join(out, c) for c in chain], oracle[0], {})
+            assert got == oracle[1], '%s: %s() on a %s returns %r, C++ returns %r' % (mod, oracle[0], chain[0], got, oracle[1])
+
+
+SHADOW_BASE = 'class ShadowBase : public AActor {\npublic:\n  int32 Score;\n};\n'
+# name: (source, the member the refusal names, oracle or None, what the gap is)
+SHADOWS = {
+    'ShadowVarProp': (SHADOW_BASE + 'class ShadowVarProp : public ShadowBase {\npublic:\n  int32 Score;\n};\n', 'Score', None,
+                      "a variable named like its Blueprint parent's (Score)"),
+    'ShadowNative': ('class ShadowNative : public AActor {\npublic:\n  bool bHidden = true;\n};\n', 'bHidden', None,
+                     "a variable named like AActor's bHidden"),
+    'ShadowCase': ('class ShadowCase : public AActor {\npublic:\n  int32 Score;\n  int32 score;\n};\n', 'score', None,
+                   'two variables of one FName (Score, score)'),
+    'ShadowFnCase': ('class ShadowFnCase : public AActor {\npublic:\n  int32 Get() { return 1; }\n  int32 get() { return 2; }\n'
+                     '  int32 Use() { return Get() * 10 + get(); }\n};\n', 'get', ('Use', 12),
+                     'two functions of one FName (Get, get), Use() = 12'),
+    'ShadowSuperCase': ('class ShadowSuperBase : public AActor {\npublic:\n  virtual int32 Get() { return 1; }\n};\n'
+                        'class ShadowSuperCase : public ShadowSuperBase {\npublic:\n  int32 get() { return 2; }\n};\n', 'get',
+                        ('Get', 1, ['ShadowSuperCase', 'ShadowSuperBase']),
+                        "a new function get() beside the parent's virtual Get(), one FName; Get() on the child = 1"),
+    'ShadowOverload': ('class ShadowOverload : public AActor {\npublic:\n  int32 Ov(int32 A) { return A * 100; }\n'
+                       '  int32 Ov(int32 A, int32 B) { return A + B; }\n  int32 Use() { return Ov(1) + Ov(1, 2); }\n};\n',
+                       'Ov', ('Use', 103), 'two non-inline overloads Ov(A), Ov(A, B), Use() = 103'),
+    'ShadowOverloadType': ('class ShadowOverloadType : public AActor {\npublic:\n  int32 Ov(int32 A) { return A; }\n'
+                           '  int32 Ov(float A) { return 2; }\n  int32 Use() { return Ov(1) * 10 + Ov(1.0f); }\n};\n',
+                           'Ov', ('Use', 12), 'two non-inline overloads Ov(int32), Ov(float), Use() = 12'),
+}
+
+
+class_tail_keep()
+parm_width()
+parm_over()
+parm_huge()
+for _name, (_parent, _bits, _within, _config) in TAIL_META.items():
+    tail_meta(_name)()
+    print('ok  ClassTailMeta %s: %s\'s tail (flags %#x, within %s, config %s)' % (_name, _parent.split('.')[-1], _bits,
+                                                                                 _within.split('.')[-1], _config))
+walker_config()
+print('ok  OverrideTest Walker: ClassConfigName Game, ACharacter\'s')
+instanced_refs()
+for _mod, (_src, _member, _oracle, _what) in SHADOWS.items():
+    refused_or_distinct(_mod, _src, _member, _oracle)
+print('ok  member names: one per FName, overloads and case twins included, none reused from an ancestor (%d cases)'
+      % len(SHADOWS))
+
+
+# ---- FUNC: function flags, overrides and interface implementations, call kind vs callee (invariant_rules/functions.py)
+
+import sys
+import invariants
+from invariant_rules import functions as func_rules
+
+
+def func_findings(base, names):
+    """What the named invariants.py rules find on the package at base, as '<rule> <export>: <message>' lines."""
+    return ['%s %s: %s' % f for f in invariants.check(invariants.Package(base), set(names))]
+
+
+def func_calls(base):
+    """(function, opcode, callee path, callee FunctionFlags) of every call in the package whose callee the rules can
+    resolve: its own class chain for a call by name on self, the import or export for a call by object."""
+    pkg, out = invariants.Package(base), []
+    for i, st in invariants.functions(pkg):
+        for n, mine in (x for t in pkg.script(i) for x in t.on_self()):
+            if n.op in (0x1B, 0x1C, 0x45, 0x46, 0x68):
+                f = func_rules.call_target(pkg, i, n, mine)
+                if f is not None: out.append((pkg.exports[i]['name'], n.op, f.where, f.flags))
+    return out
+
+
+ROUTED = 0x40 | 0x4 | 0x8 | 0x100 | 0x1000 | 0x80 | 0x200000 | 0x1000000 | 0x4000
+
+
+def func_rpc_routing():
+    """FuncRpcRouting: every call to an RPC, authority-only, cosmetic or multicast function - inherited, overridden,
+    or the parent's through `RpcRouteBase::ServerOpen` - goes through the engine's callspace routing (EX_VirtualFunction
+    / EX_FinalFunction), and on the authority each runs the body C++ says: the parent's for the qualified call."""
+    kid = asset('FuncRpcRouting')
+    base = os.path.join(os.path.dirname(kid), 'RpcRouteBase')
+    calls = [c for c in func_calls(kid) if c[3] & ROUTED]
+    got = sorted((fn, where.rsplit('/', 1)[-1]) for fn, op, where, flags in calls)
+    assert got == [('Inherited', 'RpcRouteBase.RpcRouteBase_C:AuthOnly'), ('Inherited', 'RpcRouteBase.RpcRouteBase_C:MultiPing'),
+                   ('Inherited', 'RpcRouteBase.RpcRouteBase_C:Pretty'), ('OpenViaParent', 'RpcRouteBase.RpcRouteBase_C:ServerOpen'),
+                   ('OwnRpc', 'FuncRpcRouting.FuncRpcRouting_C:ServerOpen')], got
+    assert all(op in (0x1B, 0x1C) for _, op, _, _ in calls), calls
+    for b in (kid, base):
+        found = func_findings(b, ['call_local_unrouted', 'func_override_flags', 'func_override_params', 'func_super_link'])
+        assert not found, found
+    for fn, want in (('OpenViaParent', 1), ('Inherited', 114), ('OwnRpc', 7)):
+        fields = {'Opened': 0}
+        run_as([kid, base], fn, fields)
+        assert fields['Opened'] == want, (fn, fields)
+    print('ok  FuncRpcRouting: inherited, overridden and parent-qualified RPC / authority / cosmetic calls keep their routing')
+
+
+def func_stub_iface():
+    """FuncStubIface: an interface's own functions are stubs with no effect - whatever they return or take by
+    reference - and the implementer's function and its stubs for the rest do what C++ says."""
+    folder = os.path.dirname(asset('FuncStubIface'))
+    iface, impl = os.path.join(folder, 'IStubbed'), asset('FuncStubIface')
+    for b in (iface, impl):
+        found = func_findings(b, ['interface_class_stubs', 'func_override_flags', 'func_override_params', 'func_super_link',
+                                  'func_has_out_parms', 'func_parm_flags'])
+        assert not found, found
+    for fn, parms in (('Count', dict(By=3)), ('Touch', dict(By='x')), ('Pair', dict(A=1, Out=9))):
+        me = {'Seen': 4}
+        ret, env = run(iface, fn, self_vars=me, **parms)
+        assert ret in (0, None) and me == {'Seen': 4} and env.get('Out', 9) == 9, (fn, ret, me, env)
+    me = {'Seen': 2}
+    assert run(impl, 'Count', self_vars=me, By=3)[0] == 5 and me == {'Seen': 5}, me
+    ret, env = run(impl, 'Pair', self_vars=me, A=1, Out=9)
+    assert ret == 0 and env['Out'] == 9 and me == {'Seen': 5}, (ret, env, me)
+    assert run(impl, 'Touch', self_vars=me, By='x')[0] is None and me == {'Seen': 5}, me
+    print('ok  FuncStubIface: interface stubs change nothing; the implementation and its own stubs run as written')
+
+
+def func_refusals():
+    """Implementing a native interface one of whose functions is native only (no BlueprintNativeEvent /
+    BlueprintImplementableEvent): no Blueprint override of it is ever reached, so the class is refused."""
+    refused('FuncNativeOnly', '', 'is native only',
+            top='class NativeOnlyImpl : public AActor, public IGameplayTagAssetInterface {\npublic:\n};\n')
+    print('ok  a class implementing a native interface with a native-only function is refused')
+
+
+func_rpc_routing()
+func_stub_iface()
+func_refusals()
+
+
+# ---- FUNC pending
+
+def func_local_defaults():
+    """FuncLocalDefaults: locals whose zeroed memory is not their value start constructed, as C++ has them."""
+    base = asset('FuncLocalDefaults')
+    assert run(base, 'EmptyText')[0] == ''
+    assert run(base, 'IdentityScale')[0] == 2.0, run(base, 'IdentityScale')[0]
+    assert run(base, 'HitTime')[0] == 1.0, run(base, 'HitTime')[0]
+    assert run(base, 'StructDefault')[0] == 5, run(base, 'StructDefault')[0]
+
+
+def func_cosmetic_static():
+    """FuncCosmeticStatic: ApplyDamage (BlueprintAuthorityOnly) and PlaySound2D (BlueprintCosmetic) are called
+    through CallFunction's callspace check, as the editor calls them."""
+    if not SDK:
+        print('--  FuncCosmeticStatic: skipped (needs --sdk: the native callees\' flags are read off the dump)')
+        return False
+    base = asset('FuncCosmeticStatic')
+    calls = {(fn, where.rsplit(':', 1)[-1]): op for fn, op, where, flags in func_calls(base) if flags & ROUTED}
+    assert set(calls) == {('Hit', 'ApplyDamage'), ('Beep', 'PlaySound2D')}, calls
+    assert all(op in (0x1B, 0x1C) for op in calls.values()), 'called with %s' % {k: '%02x' % v for k, v in calls.items()}
+    return True
+
+
+def func_qualified_call():
+    """FuncQualifiedCall: `QcParent::Fn()` on a QcKid runs QcParent's Fn - copied in, or, for an authority-only, RPC or
+    noinline Fn or a UE_NO_OPTIMIZE caller, bound from the override of Fn the calling class gets, which forwards to
+    QcParent's. That override has QcParent's flags and is QcKid's super; a call by name runs what it ran before it.
+    A body making such a call is not copied into a subclass's function, where the call would be the subclass's: a
+    QcRelayKid, which overrides AuthOnly, still runs QcParent's through FuncQualifiedCall::CallParentAuth, and its call
+    to QcRelay::RelayServer leaves RelayServer's parent call bound from QcRelay, which has a ServerBump. Copied into
+    QcFinalPlain, CallParentPlain's `QcParent::Plain()` is still QcParent's, not QcFinalPlain's final Plain."""
+    folder = os.path.dirname(asset('FuncQualifiedCall'))
+    chain = [os.path.join(folder, c) for c in ('QcKid', 'FuncQualifiedCall', 'QcParent')]
+    relay = [os.path.join(folder, c) for c in ('QcRelayKid', 'QcRelay')] + chain[1:]
+    final = [os.path.join(folder, 'QcFinalPlain')] + chain[1:]
+    for b in chain + relay[:2] + final[:1]: keeps_invariants(b)
+    for fn, fields, want in (('CallRelayAuth', {}, 3), ('CallRelayServer', {'Seen': 1}, 3)):
+        run_as(relay, fn, fields)
+        assert fields.get('Seen') == want, (fn, fields)
+    got = run_as(final, 'CallRelayPlain', {})
+    assert got == 5, 'QcParent::Plain() copied into QcFinalPlain returned %r' % got
+    for fn in ('CallParentPlain', 'CallParentPlainSlow'):
+        got = run_as(chain, fn, {})
+        assert got == 5, '%s: QcParent::Plain() on a QcKid returned %r' % (fn, got)
+    assert run_as(chain, 'CallParentKept', {}) == 2
+    for fn, fields, want in (('CallParentAuth', {}, 3), ('CallParentServer', {'Seen': 1}, 5)):
+        run_as(chain, fn, fields)
+        assert fields.get('Seen') == want, (fn, fields)
+    kid, mine, parent = (invariants.Package(b) for b in chain)
+    for fn in ('AuthOnly', 'ServerBump', 'Kept', 'Plain'):
+        sup = kid.struct(kid.find(fn)).super
+        assert kid.path(sup).endswith('FuncQualifiedCall.FuncQualifiedCall_C:' + fn), (fn, kid.path(sup))
+        got, want = mine.struct(mine.find(fn)).function_flags, parent.struct(parent.find(fn)).function_flags
+        assert got == want, 'FuncQualifiedCall::%s FunctionFlags %#x, QcParent\'s %#x' % (fn, got, want)
+    for objects, want in ((chain, 30), (chain[1:], 3)):     # `AuthOnly()`: the object's own, the forwarder's QcParent's
+        fields = {}
+        run_as(objects, 'CallAuth', fields)
+        assert fields.get('Seen') == want, (os.path.basename(objects[0]), fields)
+    assert run_as(chain[1:], 'Kept', {}, V=1) == 2
+
+
+def func_qualified_multicast():
+    """The same call to a multicast stays a call by name, with a warning: on a server a multicast runs here and is sent
+    (Local | Remote, Actor.cpp 4270-4278), so a forwarding override would send it, and its call to the parent's again."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, 'QcMulti.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/QcMulti");\n'
+                    'class QcMultiBase : public AActor {\npublic:\n  int32 Seen = 0;\n  UE_MULTICAST void Ping() { Seen = 1; }\n};\n'
+                    'class QcMulti : public QcMultiBase {\npublic:\n  void Use() { QcMultiBase::Ping(); }\n};\n')
+        proc = assetgen_compile([src, UEAPI, tmp])
+        assert proc.returncode == 0 and 'QcMultiBase::Ping() is a call by name' in proc.stdout and 'multicast' in proc.stdout, proc.stdout
+        assert 'Ping' not in exports_of(os.path.join(tmp, 'QcMulti')), exports_of(os.path.join(tmp, 'QcMulti'))
+
+
+def func_ancestor_iface():
+    """FuncAncestorIface: OnMessageAI on an AWoodLouse child replaces /Script/FSD.TriggerAI:OnMessageAI - linked as its
+    super with the interface function's inherited flags and parameters - and runs as written."""
+    base = asset('FuncAncestorIface')
+    pkg = invariants.Package(base)
+    fi = pkg.find('OnMessageAI')
+    me = {}
+    run(base, 'OnMessageAI', self_vars=me, TriggerName='Boom')
+    assert me.get('Heard') == 'Boom', me
+    st = pkg.struct(fi)
+    got = pkg.path(st.super) if st.super else None
+    assert got == '/Script/FSD.TriggerAI:OnMessageAI', 'OnMessageAI super %s, FunctionFlags %#x' % (got, st.function_flags)
+    found = func_findings(base, ['func_override_flags', 'func_override_params', 'func_super_link'])
+    assert not found, found
+
+
+func_local_defaults()
+print('ok  FuncLocalDefaults: FText / FTransform / FHitResult / defaulted-struct locals start constructed (FUNC_HasDefaults)')
+if func_cosmetic_static():
+    print('ok  FuncCosmeticStatic: ApplyDamage / PlaySound2D keep their callspace routing (not EX_CallMath)')
+func_qualified_call()
+print('ok  FuncQualifiedCall: Parent::Fn() runs the parent\'s function, copied in or bound from a forwarding override')
+func_qualified_multicast()
+print('ok  a qualified call to a multicast from a class without one warns and gets no forwarding override')
+func_ancestor_iface()
+print('ok  FuncAncestorIface: an override of a native ancestor\'s interface function links it as super (TriggerAI:OnMessageAI)')
+refused('FuncAncestorParams', '', 'OnMessageAI',
+        top='class AncestorLouse : public AWoodLouse {\npublic:\n  int32 Seen;\n'
+            '  void OnMessageAI(int32 TriggerName) { Seen = TriggerName; }\n};\n')
+print('ok  FuncAncestorParams: an override of a native ancestor\'s interface function with other parameters is refused')
+# An override or an interface implementation keeps the parameters of the function it replaces: a caller lays them out
+# for that one (ProcessEvent, an interface's Execute_, a received RPC) and ProcessEvent copies them into this one's
+# frame (ScriptCore.cpp:1958-2016). Only a Blueprint event is replaced at all: C++ and bound calls keep a native one.
+refused('FuncTickInt', '  int32 Seen;\n  void ReceiveTick(int32 Frames) { Seen = Frames; }\n',
+        'FuncTickInt::ReceiveTick is void (int32), and the AActor::ReceiveTick it replaces is void (float)')
+refused('FuncSigShadow', '', 'SigKid::Scale is int32 (float), and the SigBase::Scale it replaces is int32 (int32)',
+        top='class SigBase : public AActor {\npublic:\n  int32 Scale(int32 X) { return X; }\n};\n'
+            'class SigKid : public SigBase {\npublic:\n  int32 Scale(float X) { return 0; }\n};\n')
+refused('FuncRpcKidParams', '', 'RpcParamsKid::ServerNudge is void (float, int32), and the RpcKidParamsBase::ServerNudge '
+        'it replaces is void (int32)',
+        top='class RpcKidParamsBase : public AActor {\npublic:\n  UE_SERVER void ServerNudge(int32 V) {}\n};\n'
+            'class RpcParamsKid : public RpcKidParamsBase {\n  int32 Got = 0;\n\npublic:\n'
+            '  void ServerNudge(float V, int32 W) { Got = W; }\n};\n')
+refused('FuncIfaceParams', '', 'IfaceParamsKid::Score is int32 (float, int32), and the IScoredParams::Score it replaces '
+        'is int32 (int32)',
+        top='class IScoredParams {\npublic:\n  UE_INTERFACE;\n  int32 Score(int32 Times);\n};\n'
+            'class IfaceParamsKid : public AActor, public IScoredParams {\npublic:\n'
+            '  int32 Score(float Times, int32 Extra) { return Extra; }\n};\n')
+refused('FuncHideNative', '  int32 Seen;\n  void K2_DestroyActor() { Seen = 1; }\n',
+        'AActor::K2_DestroyActor is native and no Blueprint event')
+print('ok  override refusals: other parameters than a native event\'s, a mod parent\'s, an RPC\'s or an interface\'s; '
+      'a name of a native non-event')
+
+
+# ---- OPERANDS: operands the VM resolves against the object they run on - jumps, instance variables, calls by name,
+# field paths, object operands, arity, out and reference arguments (invariant_rules/operands.py)
+
+from invariant_rules import operands as operand_rules
+import invariants
+
+OPERAND_RULES = ('jump_targets_executable', 'return_only_top_level', 'ubergraph_entry_offsets', 'latent_linkage_offsets',
+                 'out_param_access', 'object_operand_kinds', 'field_paths_resolve', 'instance_var_owner',
+                 'call_target_owner', 'call_opcode_flags', 'call_names_resolve', 'interface_context_placement',
+                 'call_args_fit_callee', 'out_args_addressable')
+
+
+def operand_findings(base, only=None):
+    """What invariants.py's rules, the operand rules among them, find on the package at base."""
+    return invariants.check(invariants.Package(base), set(only) if only else None)
+
+
+def opnd_ref_args():
+    """OpndRefArgs: every lvalue form a C++ reference argument takes reaches the script callee as that variable - its
+    writes land in the local, the member, the native struct's member, the array element - and an rvalue bound to a
+    const reference is read as its value."""
+    base = asset('OpndRefArgs')
+
+    def fields(**kw):
+        return dict(Member=kw.get('Member', 0), Spot=dict(kw.get('Spot', {'X': 0, 'Y': 0})), Slots=list(kw.get('Slots', [0, 0, 0])))
+
+    def forms(f, V):                                     # OpndRefArgs.cpp's Forms, as Python
+        f['Member'], f['Spot']['Y'], f['Slots'][1] = wrap(V + 1), wrap(V + 2), wrap(V + 3)
+        return wrap(wrap(V + (5 + 1)) + wrap(wrap(V * 2) + 1))
+
+    def swapped(f, A, B):
+        f['Spot']['X'], f['Slots'][0] = f['Slots'][0], f['Spot']['X']
+        return wrap(B * 1000 + A)
+
+    n = 0
+    for fn, model, cases in (('Forms', forms, [dict(V=v) for v in EDGE]),
+                             ('Swapped', swapped, [dict(A=a, B=b) for a, b in ((1, 2), (-7, 40), (0, 2**31 - 1))])):
+        for parms in cases:
+            for start in (dict(Member=9, Spot={'X': 4, 'Y': 5}, Slots=[6, 7, 8]), dict()):
+                mine, theirs = fields(**start), fields(**start)
+                got, want = run(base, fn, self_vars=mine, **parms)[0], model(theirs, **parms)
+                assert (got, mine) == (want, theirs), (fn, parms, start, got, want, mine, theirs)
+                n += 1
+    print('ok  OpndRefArgs: reference arguments reach the callee as the local, member, struct member, array element  (%d cases)' % n)
+    # On another object: Virt is found on Other's class by name and runs there, Other->Member is Other's, and the
+    # argument Member + X is read on this object (the arguments of a call under EX_Context run on the caller).
+    for mine, theirs, x in ((3, 40, 5), (0, -2, 7)):
+        vm = VM(base, {}, Member=mine)
+        vm.self.vars['Other'] = vm.new(Member=theirs)
+        assert vm.call('OnOther', x) == wrap((mine + x + 100) * 1000 + theirs), (mine, theirs, vm.log)
+    vm = VM(base, {}, Member=1)
+    vm.self.vars['Other'] = None
+    assert vm.call('OnOther', 5) == -1
+    print('ok  OpndRefArgs: a call by name and a member read on another object, its argument read on this one')
+    # Reference arguments on another object (FillOther): each write lands in Other's member, in Other's struct's
+    # member, in Other's array element - never in this object's, never in a copy. ref_params writes what the callee
+    # left in a reference parameter back through its argument, as the FOutParmRec at the argument's address does.
+    for v in (7, -2**31):
+        vm = VM(base, {}, Member=1, Spot={'X': 2, 'Y': 3}, Slots=[4, 5])
+        vm.ref_params = True
+        other = vm.new(Member=10, Spot={'X': 20, 'Y': 30}, Slots=[40, 50])
+        vm.self.vars['Other'] = other
+        vm.call('FillOther', v)
+        assert other.vars == dict(Member=v, Spot={'X': wrap(v + 1), 'Y': 30}, Slots=[wrap(v + 2), 50]), (v, other.vars)
+        assert vm.self.vars == dict(Member=1, Spot={'X': 2, 'Y': 3}, Slots=[4, 5], Other=other), (v, vm.self.vars)
+    vm = VM(base, {}, Member=1)
+    vm.ref_params, vm.self.vars['Other'] = True, None
+    vm.call('FillOther', 7)
+    assert vm.self.vars == dict(Member=1, Other=None) and not vm.accessed_none, (vm.self.vars, vm.accessed_none)
+    # An interface value a call returns, as a call's object: Ping runs on the object behind it, with this one's X.
+    pal = Obj('OpndPinger_C', Mult=3)
+    vm = VM(base, {'Ping': lambda vm, ctx, x: ctx.vars['Mult'] * x}, Pal=pal)
+    assert vm.call('PingPal', 7) == 21 and vm.log == [('Ping', pal, [7])], vm.log
+    vm.self.vars['Pal'] = None
+    assert vm.call('PingPal', 7) == -1 and not vm.log[1:], vm.log
+    print('ok  OpndRefArgs: reference arguments on another object write its member, struct member, array element; '
+          'a call through a returned interface runs on its object')
+
+
+def opnd_rules_hold():
+    """OpndRefArgs' classes - reference arguments on this object and on another, a call and a member read under
+    EX_Context, an interface value a call returns as a context - keep every operand rule: each operand resolves to what
+    the VM needs of it on the object it runs on."""
+    folder = os.path.dirname(asset('OpndRefArgs'))
+    bases = invariants.packages([folder])
+    operand_rules.OPERAND_STATS.clear()
+    for b in bases:
+        found = operand_findings(b, OPERAND_RULES)            # the other rules: sweep() runs them on every package
+        assert not found, '%s: %s' % (os.path.basename(b), found[:3])
+    stats = {r: operand_rules.OPERAND_STATS.get(r, {}) for r in ('instance_var_owner', 'out_args_addressable', 'call_names_resolve',
+                                                         'interface_context_placement')}
+    if SDK:     # every operand was resolved; a native callee only resolves off the dump
+        assert all(s and not any('unknown' in k for k in s) for s in stats.values()), stats
+    print('ok  OpndRefArgs: %d packages keep the %d operand rules%s' % (len(bases), len(OPERAND_RULES),
+                                                                          ', every context and callee resolved' if SDK else ''))
+
+
+def opnd_latent_ref_refused():
+    """A function that resumes later cannot write through a reference parameter: the caller has returned by then, and
+    the ubergraph's frame holds a copy, not the caller's variable (a write would be lost silently)."""
+    refused('OpndLatentRef', '  int32 Member;\n  void WaitRef(int32 &X) {\n    UKismetSystemLibrary::Delay(1.0f);\n'
+            '    X = Member;\n  }\n', 'reference parameters')
+    print('ok  OpndLatentRef: a latent function taking a reference parameter is refused')
+
+
+def opnd_event_ref():
+    """OpndEventRef: an override of ReceiveHit, whose Hit is a const FHitResult&, with no latent call. Called as the
+    engine calls it (the parameters in its frame) and from script (Poke passes a local), it reads the caller's Hit;
+    the engine facts it needs: Hit an out parameter, the function FUNC_HasOutParms, and every read of Hit through
+    EX_LocalOutVariable (out_param_access, with the other operand rules)."""
+    base = asset('OpndEventRef')
+    pkg = invariants.Package(base)
+    st = pkg.struct(pkg.find('ReceiveHit'))
+    hit = next(p for p in st.props if p.name == 'Hit')
+    assert hit.flags & 0x180 == 0x180 and st.function_flags & 0x400000, (hex(hit.flags), hex(st.function_flags))
+    found = operand_findings(base, OPERAND_RULES)
+    assert not found, found[:3]
+    vm = VM(base, {})
+    vm.call('ReceiveHit', None, None, None, False, None, None, None, {'Time': 0.25, 'Distance': 7.5})
+    assert (vm.self.vars.get('HitTime'), vm.self.vars.get('HitDistance')) == (0.25, 7.5), vm.self.vars
+    for t in (0.25, 1.5, -3.0):
+        vm = VM(base, {})
+        assert vm.call('Poke', t) == t * 3 and vm.self.vars.get('Seen') == t * 3, (t, vm.self.vars)
+    print('ok  OpndEventRef: an event override reads its const-reference parameter as the engine and a script caller pass it')
+
+
+opnd_ref_args()
+opnd_rules_hold()
+opnd_event_ref()
+opnd_latent_ref_refused()
+
+
+def opnd_callspace():
+    """OpndCallspace: ApplyDamage (BlueprintAuthorityOnly) and PlaySound2D (BlueprintCosmetic) are called so the engine
+    asks their callspace - through CallFunction on the library's CDO, never EX_CallMath - with the arguments given."""
+    base = asset('OpndCallspace')
+    paths = import_paths(base)
+    for fn in ('ApplyDamage', 'PlaySound2D', 'Abs'):
+        assert any(p.endswith(':' + fn) for p in paths), (fn, paths)
+    vm = VM(base, {})
+    target = vm.new()
+    vm.call('Damage', target)
+    vm.call('Sound')
+    # PlaySound2D's world context, which the C++ leaves out, is this object.
+    assert [(n, list(a)) for n, _, a in vm.log] == [('ApplyDamage', [target, 2.0, None, vm.self, None]),
+                                                     ('PlaySound2D', [vm.self, None, 0.5, 1.0, 0.0, None, None, False])], vm.log
+    found = operand_findings(base, ['call_opcode_flags'])
+    assert not found, found[0][2]
+
+
+def opnd_latent_hit():
+    """OpndLatentHit: a latent call in an override of ReceiveHit, whose Hit is a const FHitResult&: the stub hands
+    Hit to the ubergraph through EX_LocalOutVariable, and the body sees Hit's values before and after the Delay."""
+    base = asset('OpndLatentHit')
+    keeps_invariants(base)
+    vm = VM(base, {'Delay': latent_call})
+    vm.call('ReceiveHit', None, None, None, False, None, None, None, {'Time': 0.25, 'Distance': 7.5})
+    assert vm.self.vars.get('HitTime') == 0.25 and 'HitDistance' not in vm.self.vars, vm.self.vars
+    vm.fire(0)
+    assert vm.self.vars.get('HitDistance') == 7.5, vm.self.vars
+
+
+def opnd_dispatch_ref_refused():
+    """A dispatcher whose signature takes a non-const reference: C++'s Broadcast copies each reference parameter back
+    after the handlers ran (UHT's delegate wrapper), but execCallMulticastDelegate copies the argument into its own
+    parameter block and never back (ScriptCore.cpp 3032-3075), so the caller would silently keep its old value -
+    Fire(10) returns 10 cooked, 15 in C++. Nothing in the VM can write it back: the compiler must refuse it."""
+    refused('OpndDispatchRef', '  UE_DISPATCHER(OnRef, int32 &Count, int32 Plain);\n'
+            '  void  Add(int32 &Count, int32 Plain) { Count += Plain; }\n'
+            '  int32 Fire(int32 V) {\n    OnRef.Add(this, &OpndDispatchRef::Add);\n    int32 C = V;\n'
+            '    OnRef.Broadcast(C, 5);\n    return C;\n  }\n', 'OnRef.Broadcast: Count is a non-const reference, which a Broadcast '
+            'never writes back')
+    print('ok  OpndDispatchRef: a Broadcast with a non-const reference parameter is refused')
+
+
+opnd_dispatch_ref_refused()
+opnd_callspace()
+print('ok  OpndCallspace: an authority-only / cosmetic static is called through a context, so GetFunctionCallspace '
+      'can absorb it')
+opnd_latent_hit()
+print('ok  OpndLatentHit: a latent call in an event override taking a const reference (ReceiveHit), the stub copying '
+      'it into the frame through EX_LocalOutVariable')
+
+
+# ---- TYPING: literals, assignments, struct members, casts, returns, container literals, interface casts
+# (invariant_rules/operand_types.py)
+
+import invariants
+from invariant_rules import operand_types as typing_rules
+
+
+def typing_resolved(base, fn, what):
+    """(op, destination Ty) of each assignment in fn, as the typing rules resolve it: a rule that cannot type a
+    position does not check it, so a test that relies on a rule first makes sure the position was typed."""
+    pkg = invariants.Package(base)
+    i = pkg.find(fn)
+    T, nodes = typing_rules.nodes_of(pkg, i)
+    out = [(n.op, T.of(n.kids[0])) for n, ctx in nodes if n.op in typing_rules.LETS]
+    assert out and all(t is not None for op, t in out), (what, out)
+    return out
+
+
+def typing_lits():
+    """TypingLits: each literal writes its receiver's type - members, script and native parameters, a return - and
+    the two native bitfield bools are written with the op that masks (the typing_* rules, over the whole package)."""
+    base = asset('TypingLits')
+    keeps_invariants(base)
+    f = {}
+    run(base, 'Fill', self_vars=f)
+    assert f == dict(B=200, P=2, F=True, W=5000000000, R=2.5, N='tag', S='s', T='t', I=7), f
+    vm = VM(base)
+    vm.call('FillVector')
+    assert list(vm.self.vars['V']) == [1.0, 2.0, 3.0], vm.self.vars
+    print('ok  TypingLits.Fill / FillVector: a byte, an enum, a bool, an int64, a float, a name, a string, a text, a vector')
+    check('TypingLits', 'Calls', lambda: 44 - 2 + 1 + 10 + 3 + 2, [dict()])
+    check('TypingLits', 'Natives', lambda X: 250 + X, [dict(X=x) for x in (0, 5, 255)])
+    vm = VM(base)
+    vm.call('Hide')
+    assert vm.self.vars == {'bHidden': True, 'bCanBeDamaged': False}, vm.self.vars
+    kinds = typing_resolved(base, 'Hide', 'Hide')
+    assert [t.bitfield for op, t in kinds] == [True, True], kinds
+    print('ok  TypingLits.Hide: AActor\'s bitfield bools bHidden / bCanBeDamaged, written without clobbering their byte')
+    vm = VM(base)
+    vm.call('Flags')
+    assert vm.self.vars == {'Hit': {'bStartPenetrating': True, 'bBlockingHit': False, 'Time': 0.5}}, vm.self.vars
+    kinds = typing_resolved(base, 'Flags', 'Flags')
+    assert [(t.cls, t.bitfield) for op, t in kinds] == [('BoolProperty', True), ('BoolProperty', True), ('FloatProperty', False)], kinds
+    print('ok  TypingLits.Flags: FHitResult\'s bitfield bools bStartPenetrating / bBlockingHit, members of a member, '
+          'written without clobbering their byte')
+    for n in (0, 4):
+        f = {'Touched': n}
+        assert run(base, 'Relay', self_vars=f)[0] is None and f == {'Touched': n + 1}, f
+    print('ok  TypingLits.Relay: `return Touch();` in a void function runs the call and returns nothing')
+
+
+def typing_sets():
+    """TypingSets: container literals fill their variables with elements of the inner / key / value type."""
+    base = asset('TypingSets')
+    keeps_invariants(base)
+    f = {}
+    run(base, 'Fill', self_vars=f)
+    assert f == {'Seen': [1, 2, 3], 'Rates': {1: 0.5, 2: 1.5}, 'Bytes': [7, 250]}, f
+    vm = VM(base)
+    vm.call('FillPoints')
+    assert [list(p) for p in vm.self.vars['Points']] == [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], vm.self.vars
+    assert run(base, 'Second', self_vars={'Bytes': [7, 250]})[0] == 250
+    print('ok  TypingSets: a set, a map, a byte array and a vector array from literals; an element read in place')
+
+
+def typing_iface():
+    """TypingIface: object <-> interface casts on objects that implement both interfaces, one, or neither."""
+    base = asset('TypingIface')
+    keeps_invariants(base)
+    implements = {'TypingIface_C': {'ITypingMark_C', 'ITypingMore_C', 'Actor', 'Object'},
+                  'Half_C': {'ITypingMark_C', 'Actor', 'Object'}, 'Plain_C': {'Actor', 'Object'}}
+    isa = lambda o, cls: isinstance(o, Obj) and cls in implements.get(o.cls, ())
+    vm = VM(base, natives={'Mark': lambda vm, ctx: 5}, isa=isa)
+    n = 0
+    for a in (vm.new(), Obj('Half_C'), Obj('Plain_C'), None):
+        impl = implements.get(a.cls, set()) if a is not None else set()
+        mark = 'ITypingMark_C' in impl
+        assert vm.call('Has', a) == mark, ('Has', a)
+        assert vm.call('Back', a) is (a if mark else None), ('Back', a)
+        assert vm.call('Cross', a) == ('ITypingMore_C' in impl), ('Cross', a)
+        vm.call('Keep', a)
+        assert vm.self.vars['Held'] is (a if mark else None), ('Keep', a, vm.self.vars)
+        assert vm.call('MarkOf', a) == {'TypingIface_C': 3, 'Half_C': 5}.get(a.cls if mark else None, -1), ('MarkOf', a)
+        n += 5
+    print('ok  TypingIface: object -> interface, interface -> interface, interface -> object, (bool) of one  (%d cases)' % n)
+
+
+def typing_refusals():
+    """`return (void)<value>;` has no Blueprint form: the value would be stepped into the null result a function
+    with no return value has (ScriptCore.cpp 1123-1133)."""
+    refused('TypingVoidCast', '  int32 N;\n  void Cast5() { return (void)5; }\n', 'no Kismet conversion from int to void')
+    refused('TypingVoidCast', '  int32 N;\n  void CastVar() { return (void)N; }\n', 'no Kismet conversion from int to void')
+    print('ok  `return (void)5;` / `return (void)N;` in a void function are refused')
+
+
+def typing_arr_null():
+    base = asset('TypingArrNull')
+    vm = VM(base)
+    vm.call('Poke')
+    assert vm.self.vars.get('Done') == 1, vm.self.vars
+    keeps_invariants(base)
+
+
+typing_lits()
+typing_sets()
+typing_iface()
+typing_refusals()
+typing_arr_null()
+print('ok  TypingArrNull: Array_Add on a container of a null object is called inside EX_Context on the library '
+      'default object, so the failed thunk is skipped, not EX_CallMath')
+
+
+# ---- VMSEM: what the VM does at run time with a value the bytecode hands it - a None context's r-value, a statement's
+# discarded result, a native's out array, a struct constant's members, a function's constructed locals, an interface
+# cast's slot (invariant_rules/vm_semantics.py)
+
+import invariants
+from invariant_rules import vm_semantics as vmsem_rules
+
+
+def vmsem_holds(base, *names, fn=None):
+    """The package at base keeps invariants rules `names` - in function `fn` only, when given."""
+    found = [f for f in invariants.check(invariants.Package(base), only=set(names)) if fn is None or f[1] == fn]
+    assert not found, '; '.join('%s %s: %s' % f for f in found[:3])
+
+
+def vmsem_dump_has(*paths):
+    """The Dumper-7 dump (sdkinfo.py) knows these /Script structs and interfaces. Without it the rules skip native
+    operands, and a pending check that only runs a rule would pass for want of anything to check."""
+    missing = [p for p in paths if vmsem_rules.struct_members(None, p) is None and not vmsem_rules.sdkinfo.is_interface(p)]
+    assert not missing, 'no Dumper-7 dump of %s (sdkinfo.py): the rule cannot see what the engine links there' % missing
+
+
+def ctx_null_reads():
+    """A member read through a None object reads zero: the context's r-value names the member, and ProcessContextOpcode
+    clears it in the destination (ScriptCore.cpp 2940-2953) - a Let's variable, a return value, either link of a chain.
+    A discarded int result is a harmless statement."""
+    base = asset('CtxNullRead')
+    vm = VM(base, Score=5, Calls=0, Seen=3, Peer=None)
+    vm.null_rvalues = True
+    far = vm.new(Score=9, Peer=None)
+    near = vm.new(Score=4, Peer=far)
+    for p, want in ((None, 0), (near, 4), (far, 9)):
+        got = vm.call('FieldOf', p)
+        assert got == want, ('FieldOf', p, got, want)
+    for p, want in ((None, 0), (far, 0), (near, 9)):
+        got = vm.call('ChainOf', p)
+        assert got == want, ('ChainOf', p, got, want)
+    vm.call('Remember')
+    assert vm.self.vars['Seen'] == 0, vm.self.vars
+    vm.self.vars['Peer'] = near
+    vm.call('Remember')
+    assert vm.self.vars['Seen'] == 4, vm.self.vars
+    vm.call('Touch')
+    assert vm.self.vars['Calls'] == 2, vm.self.vars
+    vmsem_holds(base, *(set(vmsem_rules.VMSEM_RULES) - set(KNOWN_RULES)))
+    print('ok  CtxNullRead: a member read through None reads zero, in a Let, a return and a chain; a discarded int result runs')
+
+
+def struct_link_order():
+    """A struct literal with no super, and one whose members all come from its super, list their members in
+    PropertyLink order, which is the order C++ declares them: what the VM reads back is what the constructor was given."""
+    base = asset('StructLinkOrder')
+    vm = VM(base)
+    vm.call('Fill')
+    assert vm.self.vars['Aim'] == [1.0, 2.0, 3.0] and vm.self.vars['Tint'] == [0.25, 0.5, 0.75, 1.0], vm.self.vars
+    vm.call('Clear')
+    assert vm.self.vars['Aim'] == [0.0] * 3 and vm.self.vars['Tint'] == [0.0] * 4, vm.self.vars
+    vmsem_holds(base, 'struct_const_members')
+    print('ok  StructLinkOrder: FVector_NetQuantize and FLinearColor literals follow PropertyLink (super-only, no super)')
+
+
+ctx_null_reads()
+struct_link_order()
+
+
+def ctx_null_call():
+    """A call through a None object, used as a value, zeroes its destination: the context names the Let's destination
+    as its r-value (KismetCompilerVMBackend.cpp 1241-1244) and ProcessContextOpcode clears it (ScriptCore.cpp 2950-2953)."""
+    base = asset('CtxNullCall')
+    vm = VM(base, Peer=None, Got=7)
+    vm.null_rvalues = True
+    vm.call('Read')
+    assert vm.self.vars['Got'] == 0, 'Read on a None Peer leaves Got = %r, not 0' % (vm.self.vars['Got'],)
+    got = vm.call('ReadLocal', None)
+    assert got == 0, 'ReadLocal(None) = %r, not 0' % (got,)
+    peer = vm.new(Peer=None, Got=0)
+    vm.self.vars['Peer'] = peer
+    vm.call('Read')
+    assert vm.self.vars['Got'] == 5 and vm.call('ReadLocal', peer) == 5, vm.self.vars
+    vmsem_holds(base, 'context_rvalue')
+
+
+def drop_result():
+    """A call whose FString / TArray result a statement throws away needs a local to land in: the statement buffer is
+    64 raw bytes nothing constructs or destroys (ScriptCore.cpp 1058, 1120). The calls still run, each once."""
+    base = asset('DropResult')
+    vmsem_holds(base, 'discarded_result_fits_scratch')
+    vm = VM(base, Name='n', Items=[1], Calls=0)
+    vm.call('Run')
+    assert vm.self.vars['Calls'] == 111, vm.self.vars
+
+
+def out_array_reset():
+    """A native's out TArray arrives empty (KismetCompilerVMBackend.cpp 1152-1174), so a native written against that
+    contract - modelled here by one that only appends - leaves exactly what it found."""
+    base = asset('OutArrayReset')
+    found = Obj('Found_C')
+
+    def appends(vm, ctx, wco, cls, out):         # a native written against the editor's contract: it only appends
+        out.append(found)
+    vm = VM(base, {'GetAllActorsOfClass': appends}, Found=[])
+    vm.call('Run')
+    assert vm.self.vars['Found'] == [found], 'Found = %r, not [what the call found]' % (vm.self.vars['Found'],)
+    vmsem_holds(base, 'native_out_arrays_emptied')
+
+
+def set_to_array_append():
+    """The engine's own appending native: GenericSet_ToArray adds each element onto whatever Result holds
+    (BlueprintSetLibrary.cpp 53-70), runscript's model below does the same for this test, and the editor empties Result
+    first. So ToArray leaves exactly the set, and a range-for over a set in an outer loop sees it once per round."""
+    base = asset('SetToArrayAppend')
+    set_to_array_runs(base)
+    vmsem_holds(base, 'native_out_arrays_emptied')
+
+
+def set_to_array_runs(base):
+    real = runscript.CONTAINERS['Set_ToArray']
+    runscript.CONTAINERS['Set_ToArray'] = lambda ev, store, a: runscript._made(ev, store, a[1], []).extend(
+        copy.deepcopy(list(runscript._made(ev, store, a[0], []))))
+    try:
+        mine = dict(Picks=[1, 2], Listed=[9])
+        run(base, 'List', self_vars=mine)
+        assert mine['Listed'] == [1, 2], 'ToArray leaves Listed = %r, not the set [1, 2]' % (mine['Listed'],)
+        got = run(base, 'SumTwice', self_vars=dict(Picks=[1, 2]))[0]
+        assert got == 6, 'SumTwice over {1, 2} = %r, not 6: the second round walks the first round\'s copy too' % (got,)
+    finally:
+        runscript.CONTAINERS['Set_ToArray'] = real
+
+
+def no_world_warning():
+    """self handed to a world-context parameter from a class with no world of its own is warned about; the editor
+    refuses it ("Pin must have a connection", CallFunctionHandler.cpp 547-598). An actor stays silent."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, 'NoWorldCtx.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/NoWorldCtx");\n'
+                    'class NoWorldCtx : public UObject {\npublic:\n  APawn *Pawn;\n'
+                    '  void Run() { Pawn = UGameplayStatics::GetPlayerPawn(0); }\n};\n'
+                    'class NoWorldCtxActor : public AActor {\npublic:\n  APawn *Pawn;\n'
+                    '  void Run() { Pawn = UGameplayStatics::GetPlayerPawn(0); }\n};\n')
+        proc = assetgen_compile([src, UEAPI, tmp])
+    warns = [l.strip() for l in proc.stdout.splitlines() if l.strip().startswith('warning:')]
+    assert any('NoWorldCtx::Run' in w and 'world' in w.lower() for w in warns), \
+        'no warning that NoWorldCtx::Run hands GetPlayerPawn a world context with no world (exit %d): %s' % (proc.returncode, warns)
+    assert not any('NoWorldCtxActor' in w for w in warns), warns
+    print('ok  NoWorldCtx: self passed as a world context from a class with no world is warned about; an actor is not')
+
+
+def local_ctor_flags():
+    """A function with a local that is not zero-constructible is FUNC_HasDefaults (KismetCompiler.cpp 2328-2335), so
+    the VM constructs that local (ScriptCore.cpp 909-916): FHitResult() has Time 1, FTransform the identity scale, an
+    FText a TextData to read."""
+    base = asset('LocalCtorFlags')
+    fns = ('BlankTime', 'ScaleX', 'TextString', 'MapCount')
+    flags = lambda fn: int(re.search(r'FunctionFlags (\S+)', dump('dumpstruct.py', base, export_index(base, fn))).group(1), 16)
+    missing = [fn for fn in fns if not flags(fn) & 0x800000]
+    assert not missing, 'no FUNC_HasDefaults on %s, whose locals the VM must construct' % missing
+    vmsem_holds(base, 'locals_constructed_have_defaults')
+    for fn, want in (('BlankTime', 1.0), ('ScaleX', 1.0), ('TextString', ''), ('MapCount', 1)):
+        got = run(base, fn)[0]
+        assert got == want, '%s() = %r, want %r' % (fn, got, want)
+
+
+def iface_cast_slot():
+    """Cast<IHealth> writes a 16-byte FScriptInterface (ScriptCore.cpp 3634-3641): it must land in a 16-byte slot, and
+    the `IHealth*` it gives is the object, taken out of it. A None Other is no IHealth."""
+    vmsem_dump_has('/Script/FSD.Health')
+    base = asset('IfaceCastSlot')
+    vmsem_holds(base, 'interface_value_slot')
+    for other, want in ((None, -7), (Obj('HealthThing'), 7)):   # every Obj here implements IHealth
+        got = VM(base, isa=lambda o, cls: isinstance(o, Obj), Other=other, Guard=7).call('Probe')
+        assert got == want, 'Probe() with Other %r = %r, not %r' % (other, got, want)
+
+
+def derived_literal(fn, struct):
+    """A native struct literal's members follow PropertyLink - the struct's own first, then its super's - and leave out
+    Transient ones (ScriptCore.cpp 3376-3405; Class.cpp 944-982)."""
+    vmsem_dump_has(struct)
+    vmsem_holds(asset('DerivedLiteral'), 'struct_const_members', fn=fn)
+
+
+ctx_null_call()
+print('ok  CtxNullCall: a call through a None object zeroes its Let destination (the context names its r-value)')
+drop_result()
+print('ok  DropResult: a discarded FString / TArray result lands in a local, not the 64-byte statement buffer')
+out_array_reset()
+print("ok  OutArrayReset: a native's out TArray is emptied just before the call (EX_SetArray), so it holds only what the "
+      "call found")
+set_to_array_append()
+print('ok  SetToArrayAppend: ToArray and a set range-for empty the array Set_ToArray appends to')
+no_world_warning()
+local_ctor_flags()
+print('ok  LocalCtorFlags: FUNC_HasDefaults on a function with an FHitResult / FTransform / FText / TMap local')
+iface_cast_slot()
+print('ok  IfaceCastSlot: Cast<IHealth> takes the object out of its 16-byte interface value')
+derived_literal('Angle', '/Script/Engine.LightmassDirectionalLightSettings')
+derived_literal('Output', '/Script/Engine.MaterialAttributesInput')
+assert 'FMaterialAttributesInput::PropertyConnectedBitmask is Transient' in LOGS['DerivedLiteral'], LOGS['DerivedLiteral']
+derived_literal('ResetHandle', '/Script/Engine.TimerHandle')
+print("ok  DerivedLiteral: a derived struct literal lists its own members before its super's, and leaves out Transient "
+      "ones (a value given for one is warned about); FTimerHandle() writes no member")
+
+
+# ---- UBER: ubergraphs along a class chain, their frames and names, latent resumes, awaits in overrides
+# (invariant_rules/ubergraph.py)
+
+import invariants
+from invariant_rules import ubergraph as uber_rules
+
+_PARAMS_OF = runscript.params_of
+
+
+class ChainVM(VM):
+    """runvm's VM over a class chain - package bases, most derived first - dispatching as the engine does: a call by
+    name, a delegate and a latent resume find the most derived function (UObject::FindFunction, the object's own
+    FuncMap first), EX_FinalFunction runs exactly the parent's function its import names, and each class's ubergraph
+    has a persistent frame of its own on the object (GetPersistentUberGraphFrame keeps one per class)."""
+    def __init__(s, chain, natives=None, **self_vars):
+        VM.__init__(s, chain[0], natives, **self_vars)
+        s.chain = [os.path.abspath(b) for b in chain]
+        s.names = {b: {e['name'] for e in dumpexp.load(b)[5]} for b in s.chain}
+        s.exports = set().union(*s.names.values())
+        s.cache, s.ran, s.finals, s.pin = {}, [], {}, None
+        key = lambda b: os.path.normcase(os.path.abspath(b))
+        for b in s.chain:                                  # a final call on a function of a class up the chain
+            pkg = invariants.Package(b)
+            for k, imp in enumerate(pkg.imports):
+                r = pkg.resolve(-k - 1) if imp['class_name'] == 'Function' else None
+                if r and key(r[0].base) in map(key, s.chain):
+                    s.finals[b, imp['name']] = [key(c) for c in s.chain].index(key(r[0].base))
+
+    def where(s, fn):
+        """(base, name) of the function a call of fn reaches: fn@k is the chain's k-th class's; a bare name the most
+        derived one declaring it."""
+        if '@' in fn:
+            name, k = fn.rsplit('@', 1)
+            return s.chain[int(k)], name
+        return next(b for b in s.chain if fn in s.names[b]), fn
+
+    def script(s, fn):
+        if s.pin and s.pin[1] == fn: (b, name), s.pin = s.pin, None     # the call below runs a pinned final one
+        else: b, name = s.where(fn)
+        if (b, name) not in s.cache:
+            stmts = runscript.script_of(b, name)
+            stack = list(stmts)
+            while stack:                                   # EX_FinalFunction on a parent's import: exactly that one
+                n = stack.pop()
+                stack += n.kids
+                if n.op in (0x1C, 0x46) and not n.own and (b, n.val) in s.finals:
+                    n.val = '%s@%d' % (n.val, s.finals[b, n.val]); s.exports.add(n.val)
+            s.cache[b, name] = (stmts, {n.mem: i for i, n in enumerate(stmts)}, _PARAMS_OF(b, name))
+        return s.cache[b, name]
+
+    def frame(s, me, uber):
+        return s.frames.setdefault((id(me), s.where(uber)[0], uber), {})
+
+    def call(s, fn, *args, on=None, **parms):
+        b, name = s.where(fn)
+        s.ran.append((b, name))
+        s.pin = (b, name) if '@' in fn else None
+        before = runscript.params_of                        # VM.call reads a callee's reference parameters by name
+        runscript.params_of = lambda base, f, *flag: _PARAMS_OF(*s.where(f), *flag)
+        try:
+            return VM.call(s, name, *args, on=on, **parms)
+        finally:
+            runscript.params_of = before
+
+
+def class_export(pkg):
+    return next(ci for ci, st in invariants.classes(pkg))
+
+
+def uber_name(pkg):
+    """The name of the function the class's UberGraphFunction tag names."""
+    ci = class_export(pkg)
+    t = pkg.tag(ci, 'UberGraphFunction')
+    return pkg.exports[int.from_bytes(t['value'], 'little', signed=True) - 1]['name']
+
+
+def latent_uuids(pkg):
+    """The UUID of every LatentActionInfo literal in the package's functions."""
+    out = []
+    for i, st in invariants.functions(pkg):
+        for n in invariants.statements(pkg, i)[0]:
+            if n.op == 0x2F and pkg.path(n.ops[0][1]) == '/Script/Engine.LatentActionInfo':
+                out.append(n.kids[1].ops[0][1])
+    return out
+
+
+def uber_chain_frames():
+    """UberChain: on one UberChainKid, WaitA (the child's, which runs the parent's first) and WaitB leave three
+    actions pending: the parent's Delay, the child's WaitA Delay, WaitB's. Each resumes - by name, found on the object
+    as FindFunction finds it - in the ubergraph of the class that made the call, and reads back the local it computed
+    before the wait from its own class's frame, whichever fires first: the two WaitA segments' L share a name but not
+    a frame. Each class keeps its own ubergraph and UberGraphFrame (the uber_* rules), and the calls' UUIDs differ,
+    so no action drops another."""
+    folder = os.path.dirname(asset('UberChain'))
+    base, kid = asset('UberChain'), os.path.join(folder, 'UberChainKid')
+    for b in (base, kid): keeps_invariants(b)
+    assert uber_name(invariants.Package(base)).lower() != uber_name(invariants.Package(kid)).lower()
+    seconds = {11: 0.1, 13: 0.3, 12: 0.2}                 # the value each action logs, by its Delay
+    for order in ((0, 0, 0), (2, 1, 0), (1, 1, 0)):   # indices into the shrinking pending list
+        vm = ChainVM([kid, base], {'Delay': latent_call}, Stage=10, Log=[])
+        vm.call('WaitA')
+        vm.call('WaitB')
+        waits = [round(l[2][1], 4) for l in vm.log if l[0] == 'Delay']
+        assert waits == [0.1, 0.3, 0.2] and len(vm.latent) == 3, (vm.latent, vm.log)
+        resumes = [vm.where(info[2])[0] for _, _, info, _ in vm.latent]   # FindFunction(ExecutionFunction) on the kid
+        assert resumes == [vm.chain[1], vm.chain[0], vm.chain[0]] and all(info[3] is vm.self for _, _, info, _ in vm.latent), vm.latent
+        vm.self.vars['Stage'] = 50                        # a local recomputed after the wait would show
+        fired = []
+        for i in order:
+            fired.append(waits.pop(i))
+            vm.fire(i)
+        assert vm.self.vars['Log'] == [next(v for v, s in seconds.items() if s == f) for f in fired] and not vm.latent, \
+            (order, fired, vm.self.vars)
+    vm = ChainVM([base], {'Delay': latent_call}, Stage=1, Log=[])          # and on a plain UberChain
+    vm.call('WaitA')
+    vm.fire()
+    assert vm.self.vars['Log'] == [2], vm.self.vars
+    print('ok  UberChain: a parent\'s and a child\'s waits on one object each resume in their own class\'s ubergraph and frame')
+
+
+def uber_same_leaf():
+    """UberChain's UberA::Gun and UberB::Gun: one leaf name, two folders, the second the first's child. Their
+    ubergraphs are two names (FName-compared, as FindFunction does), neither a function of the other class, their
+    latent UUIDs are disjoint, and on one UberB::Gun both waits resume, each in its own class's ubergraph with the
+    parameter it copied into its own frame."""
+    folder = os.path.dirname(asset('UberChain'))
+    a, b = os.path.join(folder, 'UberA', 'Gun'), os.path.join(folder, 'UberB', 'Gun')
+    pa, pb = invariants.Package(a), invariants.Package(b)
+    for p in (pa, pb): keeps_invariants(p.base)
+    assert pb.path(pb.struct(class_export(pb)).super) == '/Game/_ElytrasMods/UberChain/UberA/Gun.Gun_C'
+    ua, ub = uber_name(pa), uber_name(pb)
+    fa = {n.lower() for n, v in pa.struct(class_export(pa)).func_map}
+    fb = {n.lower() for n, v in pb.struct(class_export(pb)).func_map}
+    assert ua.lower() != ub.lower() and ub.lower() not in fa and ua.lower() not in fb, (ua, ub, fa, fb)
+    assert latent_uuids(pa) and latent_uuids(pb) and not set(latent_uuids(pa)) & set(latent_uuids(pb))
+    for order in ((0, 0), (1, 0)):
+        vm = ChainVM([b, a], {'Delay': latent_call}, Hits=0, Kicks=0)
+        vm.call('Fire', 2)
+        vm.call('Kick', 3)
+        assert len(vm.latent) == 2 and [vm.where(info[2])[0] for _, _, info, _ in vm.latent] == [vm.chain[1], vm.chain[0]], vm.latent
+        for i in order: vm.fire(i)
+        assert (vm.self.vars['Hits'], vm.self.vars['Kicks']) == (2, 3) and not vm.latent, (order, vm.self.vars)
+    print('ok  UberChain: UberA::Gun / UberB::Gun keep two ubergraphs and UUID sets; each wait resumes in its own')
+
+
+def uber_await_kid():
+    """UberAwaitKid: the parent's Fetch, run on an UberAwaitKid by the override's UberAwaitBase::Fetch, binds its
+    task's OnSuccess by name on self. The name resolves on the child first, so it must be no function of the child:
+    the parent's download completes into the parent (Image, then Base = 1), the child's into the child (Kid = 1)."""
+    kid = asset('UberAwaitKid')
+    base = os.path.join(os.path.dirname(kid), 'UberAwaitBase')
+    pk, pb = invariants.Package(kid), invariants.Package(base)
+    bound = {n.ops[0][1] for i, st in invariants.functions(pb) for n in invariants.statements(pb, i)[0] if n.op == 0x4B}
+    mine = {n.lower() for n, v in pk.struct(class_export(pk)).func_map}
+    assert bound and not {b.lower() for b in bound} & mine, \
+        'UberAwaitKid declares %s, which UberAwaitBase binds by name' % sorted(b for b in bound if b.lower() in mine)
+    made = []
+    natives = {'DownloadImage': lambda vm, ctx, *a: made.append(Obj('AsyncTaskDownloadImage', args=a)) or made[-1]}
+    vm = ChainVM([kid, base], natives)
+    vm.call('Fetch', 'http://x')
+    assert len(made) == 2 and made[0].vars['args'] == ('http://x',), made
+    vm.broadcast(made[0], 'OnSuccess', 'tex')
+    assert (vm.self.vars.get('Image'), vm.self.vars.get('Base'), vm.self.vars.get('Kid')) == ('tex', 1, None), vm.self.vars
+    vm.broadcast(made[1], 'OnSuccess', 'tex2')
+    assert vm.self.vars.get('Kid') == 1 and vm.self.vars.get('Image') == 'tex', vm.self.vars
+
+
+def uber_defer_guard():
+    """UberDeferGuard with the engine faked: each deferred actor or component is finished once, the spawn's own
+    result, and only when there is one - behind a null test, from another event, at another transform - and the
+    package keeps every rule: correct code the editor's nodes never write is what shows a finish rule is no stricter
+    than the engine (at most one finish, Actor.cpp 3206)."""
+    base = asset('UberDeferGuard')
+    keeps_invariants(base)
+    where, there, zero = ('xf', 1), ('xf', 2), ('xf', (0.0, 0.0, 0.0))
+
+    def run(fn, *args, gives=True):
+        made = []
+        natives = {'Conv_VectorToTransform': lambda vm, ctx, v: ('xf', tuple(v)),
+                   'BeginDeferredActorSpawnFromClass': lambda vm, ctx, *a: (made.append(Obj(a[1], args=a)) or made[-1]) if gives else None,
+                   'AddComponentByClass': lambda vm, ctx, *a: (made.append(Obj(a[0], args=a)) or made[-1]) if gives else None,
+                   'FinishSpawningActor': lambda vm, ctx, a, xf: a}
+        vm = VM(base, natives)
+        vm.call(fn, *args)
+        return vm, vm.self, made, [l for l in vm.log if l[0] not in ('Conv_VectorToTransform', 'IsValid')]
+
+    for fn, tag in (('GuardIf', 1), ('GuardReturn', 2)):
+        vm, me, made, calls = run(fn, where)
+        begin = ('BeginDeferredActorSpawnFromClass', me, [me, 'UberDeferGuard_C', where, 0, None])
+        assert calls == [begin, ('set', made[0], 'Tag'), ('FinishSpawningActor', me, [made[0], where])], (fn, calls)
+        assert made[0].vars['Tag'] == tag
+        vm, me, made, calls = run(fn, where, gives=False)                 # no actor: nothing set, nothing finished
+        assert calls == [('BeginDeferredActorSpawnFromClass', me, [me, 'UberDeferGuard_C', where, 0, None])], (fn, calls)
+    vm, me, made, calls = run('Moved', where, there)                    # begun at one transform, finished at another
+    assert calls == [('BeginDeferredActorSpawnFromClass', me, [me, 'UberDeferGuard_C', where, 0, None]),
+                     ('set', made[0], 'Tag'), ('FinishSpawningActor', me, [made[0], there])], calls
+    vm, me, made, calls = run('Begin', where)                           # begun by one event, finished by another
+    vm.call('Finish', there)
+    assert vm.self.vars['Pending'] is made[0] and [l for l in vm.log if l[0] == 'FinishSpawningActor'] == [
+        ('FinishSpawningActor', me, [made[0], there])], vm.log
+    vm, me, made, calls = run('CompGuard')
+    assert calls == [('AddComponentByClass', me, ['SceneComponent', False, zero, True]), ('set', made[0], 'bHiddenInGame'),
+                     ('FinishAddComponent', me, [made[0], False, zero]), ('set', me, 'Part')], calls
+    vm, me, made, calls = run('CompGuard', gives=False)
+    assert calls == [('AddComponentByClass', me, ['SceneComponent', False, zero, True]), ('set', me, 'Part')], calls
+    assert vm.self.vars['Part'] is None
+    print('ok  UberDeferGuard: deferred spawns and adds finished once - guarded, from another event, elsewhere - keep the rules')
+
+
+UBER_SHADOW_TOP = ('class UberShadowBase : public AActor {\npublic:\n  int32 N;\n'
+                   '  void Wait() { UKismetSystemLibrary::Delay(0.1f); N = 1; }\n};\n'
+                   'class UberShadowKid : public UberShadowBase {\npublic:\n  int32 M;\n'
+                   '  void ExecuteUbergraph_UberShadowBase(int32 EntryPoint) { M = EntryPoint; }\n};\n')
+
+
+uber_chain_frames()
+uber_same_leaf()
+uber_defer_guard()
+uber_await_kid()
+print('ok  UberAwaitKid: a parent\'s await in an overridden method resumes in the parent on a child object')
+# A child method named like its parent's ubergraph would catch the parent's latent resumes (FindFunction, most
+# derived first): refused, like a method named like the class's own ubergraph.
+refused('UberShadow', '  int32 X;\n', 'UberShadowKid::ExecuteUbergraph_UberShadowBase: ExecuteUbergraph_<Class> is the name '
+        'of a class\'s ubergraph', top=UBER_SHADOW_TOP)
+print('ok  UberShadow: a method named like an ubergraph is refused')
+
+
+# ---- DELEG: delegates and event dispatchers - signatures, binds, broadcasts, timers by name (invariant_rules/delegates.py)
+
+import invariants
+from invariant_rules import delegates as deleg_rules
+
+DELEG_RULES = {'dispatcher_signature_export', 'delegate_property_signature', 'delegate_signature_not_called',
+               'multicast_operand_is_dispatcher', 'broadcast_matches_signature', 'delegate_bind_matches_signature',
+               'timer_by_name_resolves'}
+
+
+def deleg_rules_hold():
+    """Every package built here keeps the DELEG rules: each dispatcher names its own FUNC_Delegate signature, no call
+    reaches a signature, every multicast opcode works on a dispatcher variable, every broadcast passes its signature's
+    parameters, and every function bound by name is found on the bound object's class with the signature's parameter
+    chain. (test_bytecode.py's sweep() runs them over every suite package once they are in invariants.py.)"""
+    bases = invariants.packages([ROOT])
+    found = [(os.path.relpath(b, ROOT), *f) for b in bases for f in invariants.check(invariants.Package(b), only=DELEG_RULES)]
+    assert not found, '\n'.join('%s  %s %s: %s' % f for f in found[:20])
+    print('ok  %d packages keep the %d DELEG rules' % (len(bases), len(DELEG_RULES)))
+
+
+def dispatch_facts():
+    """What a Blueprint binding to DispatchRuns sees: each UE_DISPATCHER is a MulticastInlineDelegateProperty whose
+    SignatureFunction is the class's own <Name>__DelegateSignature, FUNC_Delegate, with the declared parameters - a
+    by-value struct as CPF_Parm, a const reference as CPF_Parm | CPF_OutParm | CPF_ReferenceParm - and every handler
+    takes exactly that chain."""
+    pkg = invariants.Package(asset('DispatchRuns'))
+    ci = next(i for i, st in invariants.classes(pkg))
+    disp = {p.name: p for p in pkg.struct(ci).props if p.type.endswith('DelegateProperty')}
+    assert sorted(disp) == ['OnNote', 'OnPing', 'OnScore'], disp
+    sigs = {}
+    for name, p in disp.items():
+        e = pkg.exports[p.ref - 1] if p.ref > 0 else None
+        assert p.type == 'MulticastInlineDelegateProperty' and e and e['name'] == name + '__DelegateSignature' \
+            and e['outer'] == ci + 1 and pkg.struct(p.ref - 1).function_flags & 0x00100000, (name, p.type, e)
+        sigs[name] = [(q.type, q.name, q.flags & 0x8000180, pkg.path(q.ref) if q.ref else None)
+                      for q in deleg_rules.parm_list(pkg, p.ref - 1)]
+    note = '/Game/_ElytrasMods/DispatchRuns/FDispatchNote.FDispatchNote'
+    assert sigs == {'OnScore': [('IntProperty', 'Points', 0x80, None), ('ObjectProperty', 'By', 0x80, '/Script/Engine.Actor')],
+                    'OnNote': [('StructProperty', 'Note', 0x80, note), ('StructProperty', 'Seen', 0x8000180, note)],
+                    'OnPing': []}, sigs
+    for handler, name in (('HandleScore', 'OnScore'), ('HandleDouble', 'OnScore'), ('HandleNote', 'OnNote'),
+                          ('HandlePing', 'OnPing')):
+        why = deleg_rules.mismatch((pkg, pkg.find(handler)), ('disk', pkg, disp[name].ref - 1))
+        assert why is None, (handler, why)
+    # As the editor makes a dispatcher's signature (all 166 in every third game package): BlueprintEvent |
+    # BlueprintCallable | Delegate | Public, no super function, and a body that does nothing when run.
+    vm = VM(asset('DispatchRuns'), {}, Total=0, Pings=0)
+    for name, p in disp.items():
+        sig = pkg.struct(p.ref - 1)
+        assert sig.function_flags & 0x0C120000 == 0x0C120000 and sig.super == 0, (name, hex(sig.function_flags), sig.super)
+        args = [(1, vm.self), ({'Points': 1, 'Tag': 'x'},) * 2, ()][['OnScore', 'OnNote', 'OnPing'].index(name)]
+        assert vm.call(name + '__DelegateSignature', *args) is None
+    assert vm.self.vars == dict(Total=0, Pings=0) and not vm.log and not vm.binds, (vm.self.vars, vm.log, vm.binds)
+    print('ok  DispatchRuns: each dispatcher names its own FUNC_Delegate signature with the declared parameters, '
+          'which every handler shares; the signature is a callable, public, parentless stub')
+
+
+def dispatch_runs():
+    """DispatchRuns as the VM runs it. Add binds (object, name) once - AddUnique - Remove drops that binding, Clear
+    drops all, Broadcast runs each bound handler on its object with the arguments (a struct by value and by const
+    reference among them); with nothing bound it does nothing. A binding on another object's dispatcher runs when
+    that object broadcasts, on the object that bound it."""
+    base = asset('DispatchRuns')
+
+    def fresh():
+        return VM(base, {}, Total=0, Pings=0)
+    for setup, fire, total in ((['AddBoth'], 5, 15), (['AddTwice'], 3, 3), (['AddBoth', 'RemoveScore'], 4, 8),
+                               (['AddBoth', 'ClearScore'], 4, 0), (['AddTwice', 'RemoveScore'], 4, 0), ([], 4, 0)):
+        vm = fresh()
+        for fn in setup: vm.call(fn)
+        vm.call('Fire', fire)
+        assert vm.self.vars['Total'] == total and vm.self.vars.get('LastBy', vm.self) is vm.self, (setup, vm.self.vars)
+    vm = fresh()
+    vm.call('FireNote', 7)
+    assert vm.self.vars['Total'] == 707 and vm.self.vars['LastTag'] == 'hit', vm.self.vars
+    vm = fresh()
+    vm.call('PingTwice')
+    assert vm.self.vars['Pings'] == 2, vm.self.vars
+    vm = fresh()
+    vm.call('FireEmpty')
+    assert vm.self.vars == dict(Total=0, Pings=0), vm.self.vars
+    vm = fresh()
+    other = vm.self.vars['Other'] = vm.new(Total=0, Pings=0)
+    vm.call('HookOther')                                  # self's HandleScore on the other object's OnScore
+    assert vm.binds == [(other, 'OnScore', 'HandleScore', vm.self)], vm.binds
+    vm.call('Fire', 2)                                    # self's own OnScore has nothing bound
+    assert vm.self.vars['Total'] == 0 and other.vars['Total'] == 0
+    vm.call('FireOther', 6)
+    assert vm.self.vars['Total'] == 6 and vm.self.vars['LastBy'] is vm.self and other.vars['Total'] == 0, vm.self.vars
+    print('ok  DispatchRuns: Add (once per handler), Remove, Clear and Broadcast run as the engine\'s invocation list does')
+
+
+def dispatch_kid():
+    """DispatchKid binds its parent's handler and its own to the dispatchers it inherits: the bindings name the
+    handlers on the kid itself (FindFunction walks up to the parent), and broadcasting OnPing runs KidPing."""
+    kid = os.path.join(os.path.dirname(asset('DispatchRuns')), 'DispatchKid')
+    vm = VM(kid, {}, Pings=0)
+    vm.call('Hook')
+    assert vm.binds == [(vm.self, 'OnScore', 'HandleDouble', vm.self), (vm.self, 'OnPing', 'KidPing', vm.self)], vm.binds
+    vm.broadcast(vm.self, 'OnPing')
+    assert vm.self.vars['Pings'] == 10, vm.self.vars
+    pkg = invariants.Package(kid)
+    ci = next(i for i, st in invariants.classes(pkg))
+    for name in ('HandleDouble', 'KidPing'):
+        found = deleg_rules.find_function(pkg, ci, name)
+        assert found and found[0] == 'disk' and found[1].exports[found[2]]['name'] == name, (name, found)
+    print('ok  DispatchKid: its parent\'s dispatchers take its own and its parent\'s handlers, found up the class chain')
+
+
+def types_dispatcher():
+    """TypesTest.HandleTimer broadcasts OnScored(1, self): with nothing bound it changes nothing; with HandleScored
+    bound, as ReceiveBeginPlay's Add binds it, the handler runs once with the arguments (Scores gets the 1)."""
+    vm = VM(asset('TypesTest'), {}, Scores=[])
+    vm.call('HandleTimer')
+    assert vm.self.vars == dict(Scores=[]), vm.self.vars
+    vm.binds.append((vm.self, 'OnScored', 'HandleScored', vm.self))
+    vm.call('HandleTimer')
+    assert vm.self.vars == dict(Scores=[1]), vm.self.vars
+    print('ok  TypesTest.HandleTimer: its broadcast reaches what is bound to OnScored, and nothing when nothing is')
+
+
+def types_begin_play_dispatch():
+    """TypesTest.ReceiveBeginPlay as the VM runs it, through TypesTest.cpp 211-217: OnScored.Add binds HandleScored,
+    the Broadcast runs it once with First (1, what the container calls before it leave) and the actor, Remove and Clear
+    leave nothing on OnScored, OnDestroyed keeps HandleDestroyed on this actor, and the timer gets HandleTimer bound on
+    this object. When the actor is a Pawn, the Pawn's OnDestroyed.Add is the same binding on the same object, which
+    AddUnique keeps once. Set_Add and Conv_VectorToString are the engine calls faked."""
+    def set_add(vm, ctx, s, x):
+        if x not in s: s.append(x)
+    for pawn in (False, True):
+        vm = VM(asset('TypesTest'), {'Set_Add': set_add, 'Conv_VectorToString': lambda vm, ctx, v: str(v)},
+                isa=(lambda o, cls: cls in ('Pawn', 'TypesTest_C')) if pawn else None,
+                Scores=[], Points=[], Weights={}, Seen=[])
+        heard, real = [], vm.call
+
+        def call(fn, *a, on=None, **k):
+            if fn == 'HandleScored': heard.append((a, on))
+            return real(fn, *a, on=on, **k)
+        vm.call = call
+        vm.call('ReceiveBeginPlay')
+        me = vm.self
+        timers = [a for n, c, a in vm.log if n == 'K2_SetTimerDelegate']
+        assert heard == [((1, me), me)], (pawn, heard)
+        assert vm.binds == [(me, 'OnDestroyed', 'HandleDestroyed', me)], (pawn, vm.binds)
+        assert timers == [[('delegate', 'HandleTimer', me), 1.0, False, 0.0, 0.0]], (pawn, timers)
+    print('ok  TypesTest.ReceiveBeginPlay: OnScored\'s Broadcast reaches HandleScored once, Remove / Clear empty it, '
+          'OnDestroyed and the timer hold this actor\'s handlers')
+
+
+def scoreboard_broadcast():
+    """examples/Scoreboard: Score broadcasts OnScored with the FScoreChange it built - feat, name and running total -
+    by value, and the board itself."""
+    base = os.path.join(ROOT, 'Scoreboard', 'FSD', 'Content', '_AssetGenExamples', 'Scoreboard', 'Scoreboard')
+    vm = VM(base, {}, Scores={})
+    got, real = [], vm.call
+
+    def call(fn, *a, on=None, **k):                       # a listener standing in for Announce
+        if fn == 'Heard': got.append((base_names(dict(a[0])), a[1], on))
+        else: return real(fn, *a, on=on, **k)
+    vm.call = call
+    vm.binds.append((vm.self, 'OnScored', 'Heard', vm.self))
+    for feat in (1, 1, 3): vm.call('Score', feat)
+    me = vm.self
+    assert got == [(dict(Feat=1, Name='Salutes', Total=1), me, me), (dict(Feat=1, Name='Salutes', Total=2), me, me),
+                   (dict(Feat=3, Name='Flares', Total=1), me, me)], got
+    print('ok  Scoreboard.Score: OnScored carries the FScoreChange and the board to what is bound')
+
+
+def timers_by_event_and_name():
+    """A timer by event hands K2_SetTimerDelegate Tock bound on this object; one by name hands K2_SetTimer this object
+    and the name "Tock", a zero-parameter function of the class, with no warning."""
+    vm = VM(asset('DispatchRuns'), {})
+    vm.call('ArmByEvent')
+    vm.call('ArmByName')
+    calls = [(n, a) for n, c, a in vm.log if n.startswith('K2_SetTimer')]
+    assert calls == [('K2_SetTimerDelegate', [('delegate', 'Tock', vm.self), 0.5, True, 0.0, 0.0]),
+                     ('K2_SetTimer', [vm.self, 'Tock', 1.0, False, 0.0, 0.0])], calls
+    warned = [l for l in LOGS['DispatchRuns'].splitlines() if 'warning' in l.lower() and 'Tock' in l]
+    assert not warned, warned
+    print('ok  DispatchRuns: timers by event and by name name Tock on this object')
+
+
+def compiled_with_flag(mod, body, name):
+    """The compiler refuses the mod (the class body given) naming `name`, or compiles it with a warning naming it."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, mod + '.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\n'
+                    'class %s : public AActor {\npublic:\n%s};\n' % (mod, mod, body))
+        proc = assetgen_compile([src, UEAPI, tmp])
+        warned = [l for l in proc.stdout.splitlines() if 'warning' in l.lower() and name in l]
+        assert (proc.returncode != 0 and name in proc.stdout) or warned, \
+            '%s compiles (exit %d) with no refusal or warning naming %s' % (mod, proc.returncode, name)
+
+
+def delegate_var():
+    """A TDelegate<void()> class variable is a DelegateProperty naming a delegate signature function (every
+    DelegateProperty the package has does: keeps_invariants, delegate_property_signature), and what reaches
+    K2_SetTimerDelegate from the variable and from a local is OnTimer bound on this object, which the variable holds."""
+    base = asset('DelegateVar')
+    keeps_invariants(base)
+    pkg = invariants.Package(base)
+    ci = next(i for i, st in invariants.classes(pkg))
+    stored = next(p for p in pkg.struct(ci).props if p.name == 'Stored')
+    assert stored.type == 'DelegateProperty' and pkg.obj(stored.ref)['name'].endswith('__DelegateSignature'), stored
+    vm = VM(base, {}, Fired=0)
+    vm.call('Arm')
+    vm.call('ArmLocal')
+    bound = ('delegate', 'OnTimer', vm.self)
+    calls = [(n, a) for n, c, a in vm.log if n == 'K2_SetTimerDelegate']
+    assert calls == [('K2_SetTimerDelegate', [bound, 0.5, False, 0.0, 0.0]),
+                     ('K2_SetTimerDelegate', [bound, 2.0, True, 0.0, 0.0])] and vm.self.vars['Stored'] == bound, (calls, vm.self.vars)
+
+
+def inherited_fire():
+    """DispatchInheritedFire broadcasts its parent's OnHit, running the kid's bound handler with the argument; the
+    broadcast names the parent's OnHit__DelegateSignature (keeps_invariants: broadcast_matches_signature)."""
+    base = asset('DispatchInheritedFire')
+    keeps_invariants(base)
+    vm = VM(base, {}, Got=0)
+    vm.call('Hook')
+    vm.call('Fire', 4)
+    assert vm.self.vars['Got'] == 40, vm.self.vars
+
+
+deleg_rules_hold()
+dispatch_facts()
+dispatch_runs()
+dispatch_kid()
+types_dispatcher()
+types_begin_play_dispatch()
+scoreboard_broadcast()
+timers_by_event_and_name()
+delegate_var()
+print('ok  DelegateVar: a TDelegate<void()> variable is a DelegateProperty naming its signature, holding OnTimer on this')
+inherited_fire()
+print('ok  DispatchInheritedFire: a child broadcasts its parent\'s dispatcher through the parent\'s signature')
+# A method of another class bound with `this`: EX_InstanceDelegate binds the name on this object, whose class has no
+# such function, so the broadcast or the timer silently skips it (ScriptDelegates.h 38-49, 479-502).
+refused('DelegateForeign', '  UE_DISPATCHER(OnHit, int32 Points);\n  void F() { OnHit.Add(this, &DelegateOther::ForeignHit); }\n',
+        'cannot bind DelegateOther::ForeignHit',
+        top='class DelegateOther : public AActor {\npublic:\n  void ForeignHit(int32 Points) {}\n};\n')
+refused('DelegateForeignTimer', '  void F() { UKismetSystemLibrary::K2_SetTimerDelegate({this, &DelegateOther::ForeignTick}, '
+        '1.0f, false, 0.0f, 0.0f); }\n', 'cannot bind DelegateOther::ForeignTick',
+        top='class DelegateOther : public AActor {\npublic:\n  void ForeignTick() {}\n};\n')
+# UE_DISPATCHER's signature function is a real member: calling it runs its empty stub and broadcasts nothing, a call
+# the editor's backend never emits (KismetCompilerVMBackend.cpp 1248-1252).
+refused('DispatchSigCall', '  UE_DISPATCHER(OnHit, int32 Points);\n  void F() { OnHit__DelegateSignature(1); }\n',
+        'OnHit__DelegateSignature is the dispatcher\'s signature')
+# K2_SetTimer by name: a method with parameters, an inline one, a misspelled one - the engine sets no timer
+# (KismetSystemLibrary.cpp 449-497).
+refused('TimerByNameParms', '  int32 N;\n  void Poll(int32 X) { N = X; }\n'
+        '  void Start() { UKismetSystemLibrary::K2_SetTimer(this, "Poll", 1.0f, true, 0.0f, 0.0f); }\n',
+        'K2_SetTimer by name Poll names a function that takes parameters')
+refused('TimerByNameInline', '  int32 N;\n  inline void Blink() { N = 2; }\n'
+        '  void Start() { Blink(); UKismetSystemLibrary::K2_SetTimer(this, "Blink", 1.0f, true, 0.0f, 0.0f); }\n',
+        'K2_SetTimer by name Blink names an inline method')
+refused('TimerByNameMissing', '  int32 N;\n  void Tock() { N = 3; }\n'
+        '  void Start() { UKismetSystemLibrary::K2_SetTimer(this, "Tik", 1.0f, true, 0.0f, 0.0f); }\n',
+        'K2_SetTimer by name Tik names no function of the class')
+print('ok  delegate refusals: a bind of another class\'s method on this, a call to a dispatcher\'s signature, a timer by a '
+      'name with parameters, inline or missing')
+
+
+# ---- SCS: the SimpleConstructionScript, its nodes, the component templates and the inheritable component handler
+# (invariant_rules/scs.py)
+
+import struct
+import invariants
+
+from invariant_rules import scs
+assert {'scs_ownership', 'scs_forest', 'scs_ich_records'} <= set(invariants.RULES), sorted(invariants.RULES)
+
+
+# ---- an offline model of what spawning an actor builds through its construction scripts
+
+def bp_class(base):
+    """(Package, the class export's FPackageIndex) of the package at base."""
+    p = invariants.Package(base)
+    return p, next(i for i, st in invariants.classes(p)) + 1
+
+
+def actual_template(chain, owner, node):
+    """USCS_Node::GetActualComponentTemplate (SCS_Node.cpp 27-52): from the actor's own class down to, not including,
+    the class that owns the node, the first InheritableComponentHandler record keyed on it - FComponentKey::Match
+    compares OwnerClass and AssociatedGuid (InheritableComponentHandler.cpp 557-560) - whose template is not null; else
+    the node's own ComponentTemplate. As (package, export index), or None when nothing is constructed."""
+    op, ok = owner
+    for p, k in chain:
+        if (p, k) == owner: break
+        for cls, h, recs in scs.handlers(p):
+            if cls != k: continue
+            r = next((r for r in recs if r.owner and p.path(r.owner).lower() == op.path(ok).lower() and r.guid == node.guid), None)
+            if r and r.template > 0: return p, r.template - 1
+    return (op, node.template - 1) if node.template > 0 else None
+
+
+def construct(base):
+    """What AActor::ExecuteConstruction builds for an actor of the class at base whose native parent has no scene
+    subobject (AActor's case): each Blueprint class's SCS runs, oldest first (ActorConstruction.cpp 754-766).
+    ExecuteScriptOnActor takes the actor's root once and hands it to every root node, skipping the DefaultSceneRootNode
+    when there is one (SimpleConstructionScript.cpp 640-688); with no root nodes and no root it makes a plain
+    SceneComponent (690-702). ExecuteNodeOnActor builds the node's actual template; a scene component with no parent
+    becomes the actor's root, else it attaches to the parent; its children get it as their parent, a non-scene
+    component's children its own parent (SCS_Node.cpp 97-199). The component is stored in the actor's object property of
+    the node's variable name when the class has one it IsA (159-175).
+    Returns (root name or None, {component: attach parent or None}, {component: (package, template export)},
+    {component: whether a variable holds it})."""
+    p, cls = bp_class(base)
+    chain = [(q, k + 1) for q, k, path in scs.class_chain(p, cls) if q is not None]
+    assert scs.class_chain(p, cls)[-1][2] is not None, 'the class chain of %s is not all found' % base
+    state = dict(root=None)
+    attach, made, stored = {}, {}, {}
+
+    def execute(s, x, parent):
+        n = s.node(x)
+        assert n is not None, 'node %d of %s is no SCS_Node' % (x, s.class_name())
+        assert not n.parent_name, 'this model does not follow ParentComponentOrVariableName (%s)' % n.var
+        t = actual_template(chain, (s.pkg, s.cls), n)
+        if t is None: return
+        tp, ti = t
+        made[n.var] = t
+        scene = scs.derives(tp, tp.exports[ti]['cls'], scs.SCENE)
+        assert scene is not None, 'cannot tell whether %s is a scene component' % n.var
+        if scene:
+            if parent is None: state['root'] = n.var
+            attach[n.var] = parent
+        q, prop = scs.find_object_property(p, cls, n.var)
+        stored[n.var] = q is not None and q.path(prop.ref).lower() in [c[2].lower() for c in scs.class_chain(tp, tp.exports[ti]['cls']) if c[2]]
+        for c in n.children: execute(s, c, n.var if scene else parent)
+
+    for q, k in reversed(chain):
+        s = scs.own_scs(q, k - 1)
+        if s is None: continue
+        if s.roots:
+            captured = state['root']
+            for x in s.roots:
+                if x and (x != s.dsr or captured is None): execute(s, x, captured)
+        elif state['root'] is None:
+            state['root'] = '(a new SceneComponent)'
+    return state['root'], attach, made, stored
+
+
+def effective(p, i, prop):
+    """What an object loaded from export i holds for a tagged property: its own tag, else the value of the object it
+    was constructed from, up the TemplateIndex chain (the event-driven loader constructs an export from its
+    TemplateIndex object, AsyncLoading.cpp 2954-2971, then serializes its tags on top). A /Script CDO ends the chain:
+    None, the class's native default."""
+    while True:
+        t = p.tag(i, prop)
+        if t is not None:
+            if t['type'] == 'BoolProperty': return t['bool']
+            if t['type'] == 'FloatProperty': return struct.unpack('<f', t['value'])[0]
+            return t['value']
+        r = p.resolve(p.exports[i]['tmpl'])
+        if not r: return None
+        p, i = r
+
+
+# ---- ScsShapes: the shapes AssetGen's construction scripts take, three classes deep
+
+def scs_shapes():
+    """ScsShapes declares a movement component before its first scene component: the actor's root is that first
+    SCENE component (Pivot), the later scene components attach to it, the movement components attach to nothing and
+    none has children. ScsShapesKid's own scene component attaches to the root its parent's construction script made.
+    Every component lands in its variable, and the defaults each class sets reach the component the actor gets: an
+    inherited component's through the nearest class's override record (ScsShapesGrandkid's Glow is ScsShapesKid's)."""
+    folder = os.path.dirname(asset('ScsShapes'))
+    own = {'Mover', 'Pivot', 'Arm', 'Glow', 'Spinner'}
+    for cls, extra in (('ScsShapes', set()), ('ScsShapesKid', {'Hum'}), ('ScsShapesGrandkid', {'Hum'})):
+        root, attach, made, stored = construct(os.path.join(folder, cls))
+        want = {'Pivot': None, 'Arm': 'Pivot', 'Glow': 'Pivot'}
+        want.update({h: 'Pivot' for h in extra})
+        assert root == 'Pivot' and attach == want, (cls, root, attach)
+        assert set(made) == own | extra and all(stored.values()), (cls, sorted(made), stored)
+    speed = lambda cls, var: (lambda t: effective(t[0], t[1], var[1]))(construct(os.path.join(folder, cls))[2][var[0]])
+    for cls, var, want in (('ScsShapes', ('Mover', 'InitialSpeed'), 1200.0), ('ScsShapes', ('Glow', 'Intensity'), 1000.0),
+                           ('ScsShapesKid', ('Glow', 'Intensity'), 250.0), ('ScsShapesKid', ('Hum', 'VolumeMultiplier'), 0.75),
+                           ('ScsShapesKid', ('Mover', 'InitialSpeed'), 1200.0),
+                           ('ScsShapesGrandkid', ('Glow', 'Intensity'), 250.0), ('ScsShapesGrandkid', ('Arm', 'bVisible'), 0),
+                           ('ScsShapesGrandkid', ('Hum', 'VolumeMultiplier'), 0.75), ('ScsShapesGrandkid', ('Hum', 'PitchMultiplier'), 2.0)):
+        got = speed(cls, var)
+        assert got == want, '%s: %s.%s loads %r, want %r' % (cls, var[0], var[1], got, want)
+    # An override record's template is an importable archetype that GetArchetype resolves through the supers: RF_Public |
+    # RF_ArchetypeObject | RF_InheritableComponentTemplate (UObjectArchetype.cpp 88-108).
+    for cls in ('ScsShapesKid', 'ScsShapesGrandkid'):
+        p, ci = bp_class(os.path.join(folder, cls))
+        recs = [r for c, h, rs in scs.handlers(p) for r in rs]
+        assert recs and all(p.exports[r.template - 1]['flags'] & 0x400021 == 0x400021 for r in recs), (cls, [hex(p.exports[r.template - 1]['flags']) for r in recs])
+    for cls in ('ScsShapes', 'ScsShapesKid', 'ScsShapesGrandkid'): keeps_invariants(os.path.join(folder, cls))
+    print('ok  ScsShapes: the first scene component is the root, a subclass\'s attaches to it, every component lands in '
+          'its variable with the nearest class\'s defaults')
+
+
+def scs_no_scene_root():
+    """An actor whose only own component is not a scene component still ends its construction with a root:
+    ExecuteScriptOnActor makes one only when RootNodes is empty, so the SCS must list a scene root (the editor keeps its
+    DefaultSceneRoot node in RootNodes until another scene component takes its place). A root node listed for this is a
+    node like any other to keeps_invariants: in AllNodes too, with its own VariableGuid (what a subclass's override of
+    it is keyed on); it needs no variable."""
+    b = asset('ScsNoSceneRoot')
+    root, attach, made, stored = construct(b)
+    assert 'Spinner' in made and stored['Spinner'], (sorted(made), stored)
+    assert root is not None, 'ScsNoSceneRoot_C ends its construction scripts without a RootComponent (it constructs only %s)' % sorted(made)
+    keeps_invariants(b)
+    print('ok  ScsNoSceneRoot: an actor whose only component is not a scene component gets the default scene root')
+
+
+scs_shapes()
+scs_no_scene_root()
+
+
+# ---- Refusals the compiler does not make yet: a CreationMethod of Instance on a template, or anything but Native on a
+# CDO's component subobject (BPGC-30). A component built on it as its archetype - an actor's native subobject off a CDO
+# subobject, a subclass override's instance off an SCS template - skips AddOwnedComponent in
+# UActorComponent::PostInitProperties (ActorComponent.cpp 282-287), so the actor never lists, registers or attaches to
+# it; a native subobject marked UserConstructionScript is no longer addressable by name over the network
+# (ActorComponent.cpp 1912) nor a native parent SCS nodes can attach to (ActorConstruction.cpp 737).
+
+for mod, body, top in (
+        ('ScsCreationInstance', '  UE_COMPONENT(UStaticMeshComponent, Body);\n'
+                                '  UE_DEFAULTS { Body->CreationMethod = EComponentCreationMethod::Instance; }\n', ''),
+        ('ScsCreationInstanceDso', '', 'class ScsCreationChar : public ACharacter {\n'
+                                       '  UE_DEFAULTS { Mesh->CreationMethod = EComponentCreationMethod::Instance; }\n};\n'),
+        ('ScsCreationUcsDso', '', 'class ScsCreationUcsChar : public ACharacter {\n'
+                                  '  UE_DEFAULTS { Mesh->CreationMethod = EComponentCreationMethod::UserConstructionScript; }\n};\n')):
+    refused(mod, body, '->CreationMethod is set by the engine when it makes the component', top)
+print('ok  CreationMethod set in UE_DEFAULTS is refused, on a UE_COMPONENT and on a native default subobject')
+
+
+# ---- COMP: component behaviour and refusals, the construction script, ticking (invariant_rules/components.py)
+
+import struct, sys, tempfile
+import invariants
+from invariant_rules import components as comp
+
+
+# ---- helpers: a cooked class read through invariants.Package
+
+def class_pkg(base):
+    """(Package, the class export's index) of the package at base."""
+    p = invariants.Package(base)
+    return p, comp.bp_class(p)
+
+
+def template(p, ci, var):
+    """The export index of the class's own <var>_GEN_VARIABLE (an SCS template or an override template)."""
+    hits = [i for i, e in enumerate(p.exports) if e['name'] == var + '_GEN_VARIABLE' and e['outer'] == ci + 1]
+    assert len(hits) == 1, '%s: %d exports named %s_GEN_VARIABLE under the class' % (p.base, len(hits), var)
+    return hits[0]
+
+
+def effective(p, i, prop):
+    """What an object built from export i reads for a tagged property: its own tag, else its archetype's, up the
+    TemplateIndex chain through the /Game packages (a /Script CDO ends it: None, the class's native default)."""
+    while True:
+        t = p.tag(i, prop)
+        if t is not None:
+            return t['bool'] if t['type'] == 'BoolProperty' else struct.unpack('<f', t['value'])[0] if t['type'] == 'FloatProperty' else t['value']
+        r = comp.resolve(p, p.exports[i]['tmpl'])
+        if not r: return None
+        p, i = r
+
+
+def node_named(p, ci, var):
+    s = comp.scs(p, ci)
+    return next((n for n in s[1].values() if n.name == var), None) if s else None
+
+
+def compile_to(src_text, mod, extra=()):
+    """Compiles a source text as tests/<mod>.cpp would be, into a fresh temp dir: (dir, the package folder, stdout)."""
+    tmp = tempfile.mkdtemp()
+    src = os.path.join(tmp, mod + '.cpp')
+    with open(src, 'w', encoding='utf-8') as f: f.write(src_text)
+    out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', mod)
+    os.makedirs(out)
+    proc = assetgen_compile([src, UEAPI, out] + list(extra))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    return tmp, out, proc.stdout
+
+
+# ---- CompTwoSet: two defaults on one inherited component, and a parent's rebuild
+
+def comp_two_set():
+    """Two UE_DEFAULTS statements on one inherited component are one override: one handler record, keyed on the
+    parent's node (FComponentKey: OwnerClass + AssociatedGuid), and one template holding both values."""
+    folder = os.path.dirname(asset('CompTwoSet'))
+    kid, ci = class_pkg(os.path.join(folder, 'CompTwoSet'))
+    base, bi = class_pkg(os.path.join(folder, 'TwoSetBase'))
+    hi, records = comp.ich_records(kid, ci)
+    assert len(records) == 1, [sorted(el) for _, el, _ in records]
+    _, el, key = records[0]
+    assert kid.path(struct.unpack('<i', key['OwnerClass']['value'])[0]) == '/Game/_ElytrasMods/CompTwoSet/TwoSetBase.TwoSetBase_C', key
+    assert comp.tag_name(kid, key['SCSVariableName']) == 'Lamp' and key['AssociatedGuid']['value'] == node_named(base, bi, 'Lamp').guid, key
+    lamp = template(kid, ci, 'Lamp')
+    assert struct.unpack('<i', el['ComponentTemplate']['value'])[0] == lamp + 1, el['ComponentTemplate']
+    assert effective(kid, lamp, 'Intensity') == 300.0 and effective(kid, lamp, 'bVisible') == 0, \
+        (effective(kid, lamp, 'Intensity'), effective(kid, lamp, 'bVisible'))
+    for c in ('CompTwoSet', 'TwoSetBase'): keeps_invariants(os.path.join(folder, c))
+    print('ok  CompTwoSet: two defaults on one inherited component make one record and one template holding both')
+
+
+def comp_guid_stable():
+    """A parent Blueprint shipped again with a component added before Lamp and a method more keeps Lamp's node guid,
+    so the record a child already ships with still matches it (FComponentKey::Match compares the guid, and a changed
+    one orphans the child's override silently)."""
+    folder = os.path.dirname(asset('CompTwoSet'))
+    src = open(os.path.join(TESTS, 'CompTwoSet.cpp'), encoding='utf-8-sig').read()
+    lamp_decl = '  UE_COMPONENT(UPointLightComponent, Lamp);\n'
+    probe = '  int32 Probe() { return 1; }\n'
+    assert src.count(lamp_decl) == 1 and src.count(probe) == 1, 'CompTwoSet.cpp changed shape'
+    variant = src.replace(lamp_decl, '  UE_COMPONENT(UStaticMeshComponent, Extra);\n' + lamp_decl) \
+                 .replace(probe, probe + '  int32 Probe2() { return 2; }\n')
+    tmp, out, _ = compile_to(variant, 'CompTwoSet')
+    try:
+        old_base, obi = class_pkg(os.path.join(folder, 'TwoSetBase'))
+        new_base, nbi = class_pkg(os.path.join(out, 'TwoSetBase'))
+        old, new, extra = node_named(old_base, obi, 'Lamp'), node_named(new_base, nbi, 'Lamp'), node_named(new_base, nbi, 'Extra')
+        assert extra is not None and old.guid == new.guid != bytes(16), (old.guid.hex(), new.guid.hex())
+        assert extra.guid not in (new.guid, bytes(16)), extra.guid.hex()
+        for kid_base in (os.path.join(folder, 'CompTwoSet'), os.path.join(out, 'CompTwoSet')):
+            kid, ci = class_pkg(kid_base)
+            (_, _, key), = comp.ich_records(kid, ci)[1]
+            assert key['AssociatedGuid']['value'] == old.guid, (kid_base, key['AssociatedGuid']['value'].hex())
+        keeps_invariants(os.path.join(out, 'TwoSetBase'))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print('ok  CompTwoSet: a parent rebuilt with a component before Lamp and a method more keeps Lamp\'s node guid')
+
+
+comp_two_set()
+comp_guid_stable()
+
+
+# ---- CompUcs: the construction script
+
+def comp_ucs():
+    """UserConstructionScript is an override of AActor's event, reached by name - in FuncMap, no parameters (the event
+    thunk passes none), not native (a native one is bound to no script) - and only the most derived one runs: a
+    parent's body runs in a child through the explicit parent call alone, once."""
+    folder = os.path.dirname(asset('CompUcs'))
+    base = os.path.join(folder, 'UcsBase')
+    for cls, parent_ucs in (('UcsBase', '/Script/Engine.Actor:UserConstructionScript'),
+                            ('CompUcs', '/Game/_ElytrasMods/CompUcs/UcsBase.UcsBase_C:UserConstructionScript'),
+                            ('UcsSolo', '/Game/_ElytrasMods/CompUcs/UcsBase.UcsBase_C:UserConstructionScript'),
+                            ('UcsAdder', '/Script/Engine.Actor:UserConstructionScript')):
+        p, ci = class_pkg(os.path.join(folder, cls))
+        u = comp.ucs_function(p, ci)
+        assert u is not None and ('UserConstructionScript', u + 1) in p.struct(ci).func_map, (cls, p.struct(ci).func_map)
+        st = p.struct(u)
+        assert not [x.name for x in st.props if x.flags & invariants.CPF_Parm], (cls, st.props)
+        assert not st.function_flags & comp.FUNC_Native, (cls, hex(st.function_flags))
+        # The super is editor convention, not dispatch (a call by name resolves through FuncMap): Actor's event or a
+        # Blueprint parent's override of it.
+        assert p.path(st.super).endswith(':UserConstructionScript') and p.path(st.super) in (
+            '/Script/Engine.Actor:UserConstructionScript', parent_ucs), (cls, p.path(st.super))
+        keeps_invariants(os.path.join(folder, cls))
+    n = 0
+    for chain, want in (([base], 1), ([os.path.join(folder, 'CompUcs'), base], 11), ([os.path.join(folder, 'UcsSolo'), base], 100)):
+        for start in (0, 5):
+            fields = {'Hits': start}
+            run_as(chain, 'UserConstructionScript', fields)
+            assert fields['Hits'] == start + want, (os.path.basename(chain[0]), start, fields)
+            n += 1
+    # Adding a component is what the construction script is for: UcsAdder's reaches AddComponentByClass.
+    p, ci = class_pkg(os.path.join(folder, 'UcsAdder'))
+    assert '/Script/Engine.Actor:AddComponentByClass' in {t for _, t in comp.calls(p, comp.ucs_function(p, ci))}
+    print('ok  CompUcs: UserConstructionScript overrides by name with no parameters; the parent\'s runs only through '
+          'the explicit parent call  (%d cases)' % n)
+
+
+comp_ucs()
+
+
+# ---- CompTick: ReceiveTick makes the class tick
+
+def comp_tick():
+    """An actor with its own ReceiveTick has PrimaryActorTick.bCanEverTick set on its CDO - AActor's is false, and
+    the tick function registers only when it is set - and one without does not tick (no tick function spent on it).
+    Also for the examples the docs point at: WaitForPlayer and NetworkedSwitch's SwitchRemote tick, HelloWorld does
+    not."""
+    folder = os.path.dirname(asset('CompTick'))
+    cases = [(os.path.join(folder, 'CompTick'), True), (os.path.join(folder, 'TickLess'), False)]
+    for example, cls, ticks in (('WaitForPlayer', 'WaitForPlayer', True), ('NetworkedSwitch', 'SwitchRemote', True),
+                                ('HelloWorld', 'HelloWorld', False)):
+        b = os.path.join(ROOT, example, 'FSD', 'Content', '_AssetGenExamples', example, cls)
+        if os.path.exists(b + '.uasset'): cases.append((b, ticks))
+    assert len(cases) == 5, 'the examples are not built under ' + ROOT
+    for b, ticks in cases:
+        p, ci = class_pkg(b)
+        cdo = p.struct(ci).cdo - 1
+        t = p.tag(cdo, 'PrimaryActorTick')
+        can = comp.bool_in(p, cdo, t, 'bCanEverTick') if t else None
+        assert (can == 1) if ticks else not can, (os.path.basename(b), can)
+        keeps_invariants(b)
+    fields = {'Frames': 3}
+    run(os.path.join(folder, 'CompTick'), 'ReceiveTick', self_vars=fields, DeltaSeconds=0.25)
+    assert fields == {'Frames': 4}, fields
+    print('ok  CompTick: a class with its own ReceiveTick can ever tick, one without cannot (and the examples)')
+
+
+def comp_tick_component():
+    """A component Blueprint with its own ReceiveTick registers its tick: its CDO's PrimaryComponentTick.bCanEverTick
+    is set (UActorComponent's is false), and the ReceiveTick it ships runs."""
+    b = asset('CompTickComponent')
+    p, ci = class_pkg(b)
+    cdo = p.struct(ci).cdo - 1
+    t = p.tag(cdo, 'PrimaryComponentTick')
+    assert t and comp.bool_in(p, cdo, t, 'bCanEverTick') == 1, 'Default__CompTickComponent_C has no PrimaryComponentTick.bCanEverTick'
+    fields = {'N': 2}
+    run(b, 'ReceiveTick', self_vars=fields, DeltaSeconds=0.25)
+    assert fields == {'N': 3}, fields
+    keeps_invariants(b)
+    print('ok  CompTickComponent: a component Blueprint with its own ReceiveTick sets PrimaryComponentTick.bCanEverTick')
+
+
+def comp_tick_patch():
+    """A UE_PATCH that adds ReceiveTick to a Blueprint whose parent is AActor (CompTest, standing in for a game
+    Blueprint) must set its CDO's PrimaryActorTick.bCanEverTick, or the added ReceiveTick never runs."""
+    comp_game = os.path.join(ROOT, 'CompTest', 'FSD', 'Content')
+    src = ('#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/CompTickPatch");\n'
+           'class CompTest : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/CompTest/CompTest", "CompTest_C");\n'
+           '  int32 Ticks;\n};\n'
+           'class Tweaks : public CompTest {\n  UE_PATCH;\n  void ReceiveTick(float DeltaSeconds) { Ticks = Ticks + 1; }\n};\n')
+    tmp, out, _ = compile_to(src, 'CompTickPatch', ['--game', comp_game])
+    try:
+        b = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'CompTest', 'CompTest')
+        fields = {'Ticks': 1}
+        run(b, 'ReceiveTick', self_vars=fields, DeltaSeconds=0.5)
+        assert fields == {'Ticks': 2}, fields
+        p, ci = class_pkg(b)
+        cdo = p.struct(ci).cdo - 1
+        t = p.tag(cdo, 'PrimaryActorTick')
+        assert t and comp.bool_in(p, cdo, t, 'bCanEverTick') == 1, 'the patched Default__CompTest_C has no PrimaryActorTick.bCanEverTick'
+        keeps_invariants(b)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print('ok  CompTickPatch: a patch that adds ReceiveTick sets the CDO\'s PrimaryActorTick.bCanEverTick, and it runs')
+
+
+def comp_override_chain():
+    """Three levels of one component's defaults fold as C++ constructors do: the grandchild's Lamp has ChainMid's
+    Intensity 250 and its own bVisible false, its override template archetyped on ChainMid's (the nearest one, which
+    GetArchetype finds by name) and built after it."""
+    folder = os.path.dirname(asset('CompOverrideChain'))
+    p, ci = class_pkg(os.path.join(folder, 'CompOverrideChain'))
+    lamp = template(p, ci, 'Lamp')
+    got = effective(p, lamp, 'Intensity'), effective(p, lamp, 'bVisible')
+    assert got == (250.0, 0), 'CompOverrideChain\'s Lamp loads Intensity, bVisible %s, want (250.0, 0)' % (got,)
+    e = p.exports[lamp]
+    assert p.path(e['tmpl']) == '/Game/_ElytrasMods/CompOverrideChain/ChainMid.ChainMid_C:Lamp_GEN_VARIABLE', p.path(e['tmpl'])
+    assert e['tmpl'] in e['deps'][2], e['deps']
+    for cls in ('CompOverrideChain', 'ChainMid', 'ChainBase'): keeps_invariants(os.path.join(folder, cls))
+    print('ok  CompOverrideChain: an override template is archetyped on the nearest ancestor\'s override, and loads its values')
+
+
+def world_location(p, ci, var):
+    """Where component `var` of class ci ends up relative to the spawned actor, as the SCS builds it: its
+    RelativeLocation plus its parent's, up the ChildNodes. A root node naming a parent hangs off that ancestor
+    Blueprint's node, or off a native subobject (only the native root, at the actor's origin, is known here). A
+    parentless root node hangs off the actor's root when the actor already has one - an ancestor Blueprint's SCS built
+    one, or the native class has one (SimpleConstructionScript.cpp 643, 686) - and otherwise IS the actor's root, put at
+    the spawn transform whatever its template says (SCS_Node.cpp 122-135). A native class has one when it has a scene
+    component default subobject: its constructor names the root (ACharacter's capsule, Character.cpp 59), or
+    ExecuteConstruction takes the first unattached native scene component (ActorConstruction.cpp 736-746) - so also
+    where UeApi leaves RootComponent unmarked because two subobjects fit it. Rotation and scale must be absent
+    (identity), so locations add."""
+    si, nodes, roots, dsr = comp.scs(p, ci)
+    parent_of = {c: k for k, n in nodes.items() for c in n.children}
+    k = next(k for k, n in nodes.items() if n.name == var)
+    total = (0.0, 0.0, 0.0)
+    add = lambda a, b: tuple(round(x + y, 4) for x, y in zip(a, b))
+    while True:
+        n = nodes[k]
+        assert n.template > 0, '%s: node %s has no template' % (p.exports[ci]['name'], n.name)
+        for prop, one in (('RelativeRotation', (0.0, 0.0, 0.0)), ('RelativeScale3D', (1.0, 1.0, 1.0))):
+            v = effective(p, n.template - 1, prop)
+            assert v is None or struct.unpack('<3f', v) == one, '%s: %s has %s %s' % (p.exports[ci]['name'], n.name, prop, struct.unpack('<3f', v))
+        v = effective(p, n.template - 1, 'RelativeLocation')
+        rel = struct.unpack('<3f', v) if v is not None else (0.0, 0.0, 0.0)
+        if k in parent_of:
+            total, k = add(total, rel), parent_of[k]
+            continue
+        links, native = comp.chain(p, ci)
+        if n.parent != 'None':
+            if n.native:
+                assert native and n.parent.lower() == (comp.native_root(native) or '').lower(), (n.name, n.parent)
+                return add(total, rel)
+            q, qi = next((q, qi) for q, qi in links[1:] if q.exports[qi]['name'].lower() == n.owner.lower())
+            return add(add(total, rel), world_location(q, qi, n.parent))
+        native_root = native and (comp.native_root(native)
+                                  or any(comp.native_is_scene(c) for c in (comp.native_subobjects(native) or {}).values()))
+        inherited = bool(native_root) or any(comp.executed(q, qi, False) for q, qi in links[1:])
+        return add(total, rel) if inherited else total
+
+
+def comp_root_keep():
+    """In a subclass the actor already has a root when the class's SCS runs (a mod parent's, or ACharacter's capsule),
+    so its first own scene component attaches to that root and keeps its offset: Pivot sits 100 above the actor's
+    origin and Glow, attached to Pivot, 10 in front of it. RigSpot's Spot, a light, sits 50 up. None is warned about as
+    the actor's root."""
+    folder = os.path.dirname(asset('CompRootKeep'))
+    for cls, want in (('CompRootKeep', {'Pivot': (0.0, 0.0, 100.0), 'Glow': (10.0, 0.0, 100.0)}),
+                      ('RigChar', {'Pivot': (0.0, 0.0, 100.0), 'Glow': (10.0, 0.0, 100.0)}),
+                      ('RigSpot', {'Spot': (0.0, 0.0, 50.0)})):
+        p, ci = class_pkg(os.path.join(folder, cls))
+        got = {var: world_location(p, ci, var) for var in want}
+        assert got == want, '%s: components sit at %s from the actor, want %s' % (cls, got, want)
+    tmp, out, log = compile_to(open(os.path.join(TESTS, 'CompRootKeep.cpp'), encoding='utf-8-sig').read(), 'CompRootKeep')
+    shutil.rmtree(tmp, ignore_errors=True)
+    assert "is the actor's root" not in log, log
+    for cls in ('CompRootKeep', 'RigChar', 'RigSpot', 'RigBase'): keeps_invariants(os.path.join(folder, cls))
+    print('ok  CompRootKeep: a subclass\'s first scene component attaches to the inherited root and keeps its transform')
+
+
+def comp_char_root():
+    """components.py's hierarchy(), the construction scs_names_distinct checks names against, is the one the engine
+    runs: it builds no DefaultSceneRoot node for CompCharRoot, a character, or NoiseKid, below a Blueprint parent with a
+    root, whether or not their SCS lists one. ExecuteScriptOnActor skips that node when the actor has a root already
+    (SimpleConstructionScript.cpp 648), as an ACharacter always does: its capsule (Character.cpp 59), and failing that
+    the first unattached native scene component (ActorConstruction.cpp 736-746). UeApi marks no RootComponent subobject
+    for ACharacter, since two of its subobjects fit the member."""
+    folder = os.path.dirname(asset('CompCharRoot'))
+    for cls in ('CompCharRoot', 'NoiseKid'):
+        p, ci = class_pkg(os.path.join(folder, cls))
+        built = [n.name for _, _, ns, _ in comp.hierarchy(p, ci)[0] for n in ns]
+        assert 'DefaultSceneRoot' not in built, 'hierarchy() builds %s on %s, whose actor has a root already' % (built, cls)
+        keeps_invariants(os.path.join(folder, cls))
+    print('ok  CompCharRoot: the rules\' construction of an actor with a root already skips a DefaultSceneRoot node, as '
+          'the engine does')
+
+
+def comp_default_root_inherited():
+    """The DefaultSceneRoot node is in an SCS's RootNodes and AllNodes exactly when no root is there before the SCS
+    runs and none of the class's own components is a scene component: the editor drops it once
+    GetSceneRootComponentTemplate finds a root - the native CDO's root or a scene subobject, or a scene root node of a
+    parent Blueprint's (ValidateSceneRootNodes, SimpleConstructionScript.cpp 1006-1150), and every one of the game's
+    1,885 SCS classes is saved that way. CompCharRoot, a character, and NoiseKid, below NoiseBase's root, list none;
+    ScsNoSceneRoot, an AActor of a movement component alone, lists it. The two below AActor end their construction
+    with a root (construct(); the character's is its capsule)."""
+    folder = os.path.dirname(asset('CompCharRoot'))
+    for base, listed in ((os.path.join(folder, 'CompCharRoot'), False), (os.path.join(folder, 'NoiseKid'), False),
+                         (asset('ScsNoSceneRoot'), True)):
+        p, ci = class_pkg(base)
+        si, nodes, roots, dsr = comp.scs(p, ci)
+        every = [x - 1 for x in comp.tag_objects(comp.tags_at(p, si).get('AllNodes')) if x > 0]
+        where = [name for name, of in (('RootNodes', roots), ('AllNodes', every)) if dsr is not None and dsr in of]
+        assert where == (['RootNodes', 'AllNodes'] if listed else []), \
+            '%s lists its DefaultSceneRoot node in %s' % (os.path.basename(base), where or 'neither RootNodes nor AllNodes')
+        if not base.endswith('CompCharRoot'):
+            assert construct(base)[0] is not None, '%s ends its construction with no root' % os.path.basename(base)
+    print('ok  CompDefaultRoot: the DefaultSceneRoot node is listed only where the actor has no root before the SCS and '
+          'no own scene component, as the editor saves it')
+
+
+comp_tick()
+comp_tick_component()
+comp_tick_patch()
+comp_override_chain()
+comp_root_keep()
+comp_char_root()
+comp_default_root_inherited()
+
+
+def comp_attach_inherited():
+    """SetupAttachment in UE_DEFAULTS places a component as a constructor does. Attached to an inherited one, it is a
+    root node naming that parent: an ancestor Blueprint's node by its variable and class (Glow on AttachBase_C's Lamp),
+    or a native default subobject by its object name (AttachChar's Glow on CharacterMesh0, ACharacter's Mesh). Below
+    ACharacter, Mesh is still CharacterMesh0 though APlayerCharacter's FPMesh is a skeletal mesh too (AttachPlayer, at
+    its socket), and a default set through it overrides that subobject. Attached
+    to one of the class's own, it is one of that node's ChildNodes, at its socket (Tip on Glow, at Bulb). Each keeps its
+    offset under its parent; with no inherited root, the root is the first scene component left alone (AttachOwn's
+    Root, not Bulb), and its offset passes to what hangs below it. In a function, SetupAttachment attaches at once and
+    keeps the relative transform: AttachToComponent with KeepRelative (0), no welding."""
+    folder = os.path.dirname(asset('CompAttachInherited'))
+    for cls, parent, owner, native, socket in (('CompAttachInherited', 'Lamp', 'AttachBase_C', False, None),
+                                               ('AttachChar', 'CharacterMesh0', 'None', True, None),
+                                               ('AttachPlayer', 'CharacterMesh0', 'None', True, 'S_Lamp')):
+        p, ci = class_pkg(os.path.join(folder, cls))
+        si, nodes, roots, dsr = comp.scs(p, ci)
+        glow = next(n for n in nodes.values() if n.name == 'Glow')
+        assert glow.index in roots and (glow.parent, glow.owner, glow.native) == (parent, owner, native), (
+            cls, glow.parent, glow.owner, glow.native)
+        at = comp.tags_at(p, glow.index).get('AttachToName')
+        assert (at and comp.tag_name(p, at)) == (socket or None), (cls, at and comp.tag_name(p, at))
+    b = os.path.join(folder, 'AttachPlayer')
+    ex = dumpexp.load(b)[5]
+    k = next(i for i, e in enumerate(ex) if e['name'] == 'CharacterMesh0')
+    got = tuple(ref(b, ex[k][f]) for f in ('cls', 'tmpl', 'outer'))
+    assert got == ('/Script/Engine.SkeletalMeshComponent', '/Script/FSD.Default__PlayerCharacter:CharacterMesh0',
+                   'Default__AttachPlayer_C'), got
+    assert 'bVisible [0] BoolProperty size=0 value=0' in dump('dumptags.py', b, k), dump('dumptags.py', b, k)
+    p, ci = class_pkg(os.path.join(folder, 'CompAttachInherited'))
+    glow, tip = node_named(p, ci, 'Glow'), node_named(p, ci, 'Tip')
+    assert glow.children == [tip.index] and comp.tag_name(p, comp.tags_at(p, tip.index)['AttachToName']) == 'Bulb'
+    want = {'Glow': (10.0, 0.0, 100.0), 'Tip': (10.0, 5.0, 100.0), 'Pivot': (0.0, 0.0, 20.0)}
+    got = {var: world_location(p, ci, var) for var in want}
+    assert got == want, 'components sit at %s from the actor, want %s' % (got, want)
+    p, ci = class_pkg(os.path.join(folder, 'AttachOwn'))
+    si, nodes, roots, dsr = comp.scs(p, ci)
+    assert [nodes[r].name for r in roots] == ['Root'], [nodes[r].name for r in roots]
+    want = {'Arm': (100.0, 0.0, 50.0), 'Bulb': (100.0, 0.0, 60.0)}
+    got = {var: world_location(p, ci, var) for var in want}
+    assert got == want, 'components sit at %s from the actor, want %s' % (got, want)
+    vm = VM(asset('CompAttachInherited'), {}, Pivot=Obj('SceneComponent'), Lamp=Obj('PointLightComponent'))
+    vm.call('ReceiveBeginPlay')
+    assert vm.log == [('K2_AttachToComponent', vm.self.vars['Pivot'], [vm.self.vars['Lamp'], 'None', 0, 0, 0, False])], vm.log
+    for cls in ('CompAttachInherited', 'AttachBase', 'AttachChar', 'AttachPlayer', 'AttachOwn'):
+        keeps_invariants(os.path.join(folder, cls))
+    print('ok  CompAttachInherited: SetupAttachment attaches a component to an inherited Blueprint or native one, or at a\n'
+          '    socket of one of its own class\'s, each keeping its offset; in a function it attaches at once')
+
+
+comp_attach_inherited()
+
+
+# ---- Refusals: each of these would build a package the engine mishandles
+
+CLASH_BASE = ('class ClashBase : public AActor {\npublic:\n  UE_COMPONENT(USceneComponent, Root);\n'
+              '  UE_COMPONENT(UPointLightComponent, Lamp);\n};\n')
+OBJECTS = '#include "%s"\n' % os.path.join(AG, 'include', 'Objects.h').replace(os.sep, '/')
+for mod, body, why, top in (
+        # BPGC-18: the class's own DefaultSceneRoot node and template already have that name.
+        ('ClashDefaultRoot', '  UE_COMPONENT(USceneComponent, DefaultSceneRoot);\n  UE_COMPONENT(UStaticMeshComponent, Body);\n',
+         'DefaultSceneRoot', ''),
+        # A parent Blueprint's component: two nodes, one name, and the second rebuilds the first in place.
+        ('ClashInherited', '', 'Lamp', CLASH_BASE + 'class ClashKid : public ClashBase {\npublic:\n'
+                                                    '  UE_COMPONENT(UPointLightComponent, Lamp);\n};\n'),
+        # ACharacter's default subobjects (CollisionCylinder, CharacterMesh0): another class under that name is a Fatal.
+        ('ClashCharMesh', '', 'CharacterMesh0', 'class ClashChar : public ACharacter {\npublic:\n'
+                                                '  UE_COMPONENT(UStaticMeshComponent, CharacterMesh0);\n};\n'),
+        ('ClashCapsule', '', 'CollisionCylinder', 'class ClashChar : public ACharacter {\npublic:\n'
+                                                  '  UE_COMPONENT(USceneComponent, CollisionCylinder);\n};\n'),
+        # ACharacter's member Mesh: a second property of that name on the class, which the editor never allows.
+        ('ClashCharMember', '', 'Mesh', 'class ClashChar : public ACharacter {\npublic:\n'
+                                        '  UE_COMPONENT(UStaticMeshComponent, Mesh);\n};\n'),
+        # A game Blueprint's SCS node (BP_LightPost01's Scene).
+        ('ClashGameScs', '', 'Scene', '#include "UeApi/Game/BP_LightPost01_C.h"\n'
+                                      'class ClashPost : public Game::Art::Environments::SpaceRig::BP_LightPost01_C {\npublic:\n'
+                                      '  UE_COMPONENT(USceneComponent, Scene);\n};\n'),
+        # BPGC-43 / NODE-19: the construction script runs with bIsRunningConstructionScript set, and SpawnActor returns
+        # None. The editor keeps a spawn out of the construction script graph itself, so a spawn written there is refused.
+        ('UcsSpawn', '  AActor* Made;\n  void UserConstructionScript() { Made = SpawnActor<AActor>(AActor::StaticClass(), FTransform()); }\n',
+         'UserConstructionScript', OBJECTS),
+        ('UcsSpawnStatics', '  AActor* Made;\n  void UserConstructionScript() {\n'
+                            '    Made = UGameplayStatics::BeginDeferredActorSpawnFromClass(this, AActor::StaticClass(), FTransform(),\n'
+                            '        ESpawnActorCollisionHandlingMethod::Undefined, nullptr);\n  }\n', 'UserConstructionScript', OBJECTS),
+        # BPGC-32 / NODE-23: AddComponent finds a template by name in ComponentTemplates, which a mod class has none of.
+        ('AddByName', '  void ReceiveBeginPlay() { AddComponent(FName("X"), false, FTransform(), nullptr, false); }\n',
+         'component template', ''),
+        # SetupAttachment: nodes in a cycle are reached from no root node, so none is made; an inherited component's
+        # node is its own class's to place; a socket that is no literal name would be dropped.
+        ('AttachCycle', '  UE_COMPONENT(USceneComponent, A);\n  UE_COMPONENT(USceneComponent, B);\n'
+                        '  UE_DEFAULTS { A->SetupAttachment(B); B->SetupAttachment(A); }\n', 'a cycle', ''),
+        ('AttachInherited', '', 'an inherited one', CLASH_BASE + 'class AttachKid : public ClashBase {\npublic:\n'
+                                                    '  UE_COMPONENT(USceneComponent, Own);\n'
+                                                    '  UE_DEFAULTS { Lamp->SetupAttachment(Own); }\n};\n'),
+        ('AttachSocket', '  UE_COMPONENT(USceneComponent, A);\n  UE_COMPONENT(USceneComponent, B);\n  FName Where;\n'
+                         '  UE_DEFAULTS { B->SetupAttachment(A, Where); }\n', 'literal name', '')):
+    refused(mod, body, why, top)
+print('ok  refused: component names already taken under the actor (DefaultSceneRoot, a parent Blueprint\'s component,\n'
+      '    a native default subobject or member, a game Blueprint\'s SCS node), a spawn in UserConstructionScript,\n'
+      '    AddComponent by template name, SetupAttachment in a cycle, of an inherited component or at a computed socket')
+
+
+def refused_or_warned(mod, body, why, top=''):
+    """A mod the compiler must refuse, or build with a `warning:` line, either naming `why` (refused()'s source)."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, mod + '.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\n%s'
+                    'class %s : public AActor {\npublic:\n%s};\n' % (mod, top, mod, body))
+        proc = assetgen_compile([src, UEAPI, tmp])
+        warned = [l for l in proc.stdout.splitlines() if 'warning:' in l and why in l]
+        assert (proc.returncode != 0 and why in proc.stdout) or (proc.returncode == 0 and warned), (mod, proc.stdout)
+
+
+# NODE-19 through a helper only the construction script calls: the editor does not look into a helper, but on this
+# path its spawn returns None all the same, so the compiler warns: the helper may run elsewhere too.
+refused_or_warned('UcsSpawnHelper', '  AActor* Made;\n'
+                  '  void Build() { Made = SpawnActorDeferred<AActor>(AActor::StaticClass(), FTransform()); }\n'
+                  '  void UserConstructionScript() { Build(); }\n', 'Build spawns an actor and UserConstructionScript calls it',
+                  OBJECTS)
+print('ok  UcsSpawnHelper: a helper UserConstructionScript calls that spawns is warned about')
+
+
+# ---- PROPS: property fields and tagged defaults - bool layout, field classes, flags, element sizes, containers
+# (invariant_rules/properties.py)
+
+def fstring_at(raw, o):
+    """An FString at o as the engine reads it: int32 length, then that many ANSI bytes (each widened to a TCHAR, so
+    Latin-1) or, for a negative length, UTF-16 code units; the terminator dropped. (text, end)."""
+    import struct
+    n = struct.unpack_from('<i', raw, o)[0]; o += 4
+    if n == 0: return '', o
+    if n < 0: return raw[o:o - 2 * n - 2].decode('utf-16-le'), o - 2 * n
+    return raw[o:o + n - 1].decode('latin-1'), o + n
+
+
+def text_at(raw, o):
+    """An FText at o as FText::SerializeText reads it (Core/Private/Internationalization/Text.cpp 882-995): int32 Flags,
+    int8 HistoryType, then the history. Base (0) is Namespace, Key, SourceString; any type outside 0..12 - None is -1 -
+    is bool32 bHasCultureInvariantString and the string when set. (display string, end); another history raises."""
+    import struct
+    kind = struct.unpack_from('<b', raw, o + 4)[0]; o += 5
+    if kind == 0:
+        _, o = fstring_at(raw, o); _, o = fstring_at(raw, o)
+        return fstring_at(raw, o)
+    assert not 0 < kind <= 12, 'FText history %d: not a literal' % kind
+    has = struct.unpack_from('<i', raw, o)[0]; o += 4
+    return fstring_at(raw, o) if has else ('', o)
+
+
+def prop_text_defaults():
+    """An FText default reads back as the text the source gives it: a literal, ASCII or not, is the text; an empty or
+    unset one is empty (no tag at all, the class default, is empty too). Read as the engine reads a TextProperty tag
+    (TextProperty.cpp 103-107), so any history that carries the same string passes. A text map value too."""
+    import invariants, struct
+    pkg = invariants.Package(asset('PropDefaults'))
+    cdo = pkg.find('Default__PropDefaults_C')
+    got = {}
+    for name in ('Label', 'Wide', 'Empty', 'Blank'):
+        t = pkg.tag(cdo, name)
+        if t is None: got[name] = ''; continue
+        assert t['type'] == 'TextProperty', t
+        got[name], end = text_at(t['value'], 0)
+        assert end == t['size'], (name, t['value'].hex())
+    assert got == {'Label': 'Ready', 'Wide': 'Größe', 'Empty': '', 'Blank': ''}, got
+    t = pkg.tag(cdo, 'Labels')
+    raw = t['value']
+    removed, n = struct.unpack_from('<ii', raw, 0)
+    key = struct.unpack_from('<i', raw, 8)[0]
+    text, end = text_at(raw, 12)
+    assert (removed, n, key, text, end) == (0, 1, 1, 'one', len(raw)), raw.hex()
+    print('ok  PropDefaults: FText defaults read back as their literal (ASCII and UTF-16), empty ones empty, a map\'s too')
+
+
+def reset_predicates(flags):
+    """What AActor::ResetPropertiesForConstruction asks of a variable before it resets it to its default
+    (Engine/Private/ActorConstruction.cpp 111-112): (bCanEditInstanceValue, bCanBeSetInBlueprints)."""
+    return (not flags & 0x10000 and bool(flags & 0x1)), (bool(flags & 0x4) and not flags & 0x10)
+
+
+def prop_flag_predicates():
+    """Plain, const and component variables carry the descriptive flags the engine reads at run time as the editor's
+    do - not the raw bits, the two predicates built from them: a plain variable (editor 0x10005) and a component's
+    (editor 0x400080004) are settable from a Blueprint and not instance-editable, a const one (BlueprintReadOnly,
+    0x10015) neither."""
+    import invariants
+    want = {'Plain': (False, True), 'Limit': (False, False), 'Root': (False, True), 'Mesh': (False, True),
+            'Ticks': (False, True), 'Lamp': (False, True), 'Rocks': (False, True), 'Grass': (False, True)}
+    seen = {}
+    for mod in ('PropDefaults', 'CompTest'):
+        pkg = invariants.Package(asset(mod))
+        st = pkg.struct(pkg.find(mod + '_C'))
+        for p in st.props:
+            if p.name in want: seen[p.name] = reset_predicates(p.flags)
+    assert seen == want, seen
+    print('ok  PropDefaults / CompTest: plain, const and component variables reset at construction as the editor\'s do')
+
+
+def prop_hash_keys():
+    """Set elements and map keys a mod declares are of hashable types (the engine check()s CPF_HasGetValueTypeHash on
+    every Add / Find and on loading a default: Property.cpp 1517-1522): a name, an int, FVector (which has
+    GetTypeHash), and a nested array - wrapped in a UserDefinedStruct, which always hashes."""
+    import invariants
+    pkg = invariants.Package(asset('PropDefaults'))
+    props = {p.name: p for p in pkg.struct(pkg.find('PropDefaults_C')).props}
+    keys = {n: (props[n].subs[0].type, pkg.class_of(props[n].subs[0].ref) if props[n].subs[0].ref else None,
+                pkg.obj(props[n].subs[0].ref)['name'] if props[n].subs[0].ref else None)
+            for n in ('Names', 'Labels', 'Spots', 'Lists')}
+    assert keys['Names'][0] == 'NameProperty' and keys['Labels'][0] == 'IntProperty', keys
+    assert keys['Spots'] == ('StructProperty', 'ScriptStruct', 'Vector') and keys['Lists'][:2] == ('StructProperty', 'UserDefinedStruct'), keys
+    print('ok  PropDefaults: set elements and map keys of hashable types, a nested array as a struct')
+
+
+EKIND = 'enum class EKind : uint8 { A, B };\nUE_ENUM(EKind);\n'
+
+
+def prop_enum_casts():
+    """An enum default must be one of its enumerators: the loader maps any other name to _MAX (EnumProperty.cpp
+    129-170), and a value past the enum has no name to write. A cast of an out-of-range integer is refused, naming the
+    member, whether it reaches the default directly, through a constexpr or as a UE_DEFAULTS on a native member.
+    Today the compiler refuses every enum cast in a default (even static_cast<EKind>(1)) as not a value known at build
+    time; the day it accepts casts, these must still be refused (or, per sugar-with-a-warning, change this test)."""
+    refused('PropEnumCast', '  EKind K = static_cast<EKind>(9);\n', 'K: ', top=EKIND)
+    refused('PropEnumCastC', '  EKind K = (EKind)9;\n', 'K: ', top=EKIND)
+    refused('PropEnumCastK', '  static constexpr EKind kBad = static_cast<EKind>(9);\n  EKind K = kBad;\n', 'K: ', top=EKIND)
+    refused('PropEnumCastNative', '  UE_DEFAULTS { AutoReceiveInput = (EAutoReceiveInput)9; }\n', 'AutoReceiveInput: ')
+    print('ok  an out-of-range enum default is refused: static_cast, C cast, constexpr, UE_DEFAULTS on a native member')
+
+
+def fname_at(names, raw, o):
+    import struct
+    i, n = struct.unpack_from('<ii', raw, o)
+    return (names[i] + ('_%d' % (n - 1) if n else '')).lower()
+
+
+def loaded_container(pkg, cdo, name, kind, start):
+    """The value the loader leaves for tag `name` of CDO export cdo, from `start` - the parent CDO's loaded value for an
+    inherited property, empty for the class's own (UnrealType.h 439-446: a defaults pointer only inside the parent's
+    layout): the listed removals taken out, then each element added (a set, PropertySet.cpp 285-358) or each pair set
+    (a map, PropertyMap.cpp 316-400). `name` may be a tuple, a property and then members of structs written as tags: a
+    struct loads each member over the parent's struct's (Class.cpp 2775), so the same reading holds there. No tag (or
+    no member's tag): start unchanged. TSet<int32> and TMap<FName, int32> only."""
+    import struct
+    path = (name,) if isinstance(name, str) else name
+    t = pkg.tag(cdo, path[0])
+    for member in path[1:]:
+        if t is None: break
+        t = next((x for x in pkg.tags(cdo, t['at']) if x['name'] == member), None)
+    if t is None: return start
+    raw, o = t['value'], 0
+    out = set(start) if kind == 'set' else dict(start)
+    removed = struct.unpack_from('<i', raw, o)[0]; o += 4
+    for _ in range(removed):
+        if kind == 'set': out.discard(struct.unpack_from('<i', raw, o)[0]); o += 4
+        else: out.pop(fname_at(pkg.names, raw, o), None); o += 8
+    n = struct.unpack_from('<i', raw, o)[0]; o += 4
+    for _ in range(n):
+        if kind == 'set': out.add(struct.unpack_from('<i', raw, o)[0]); o += 4
+        else: out[fname_at(pkg.names, raw, o)] = struct.unpack_from('<i', raw, o + 8)[0]; o += 12
+    assert o == len(raw), (name, raw.hex())
+    return out
+
+
+def prop_set_delta():
+    """A child Blueprint's own default for an inherited TSet / TMap is what its CDO loads: the parent's {1, 2} and
+    {a: 1, c: 3} become {2, 3} and {a: 5, b: 2}, read as the loader reads the child's tag on top of the parent CDO's
+    loaded value (see loaded_container). So does one inside an inherited struct the child assigns whole (Held), whose
+    members load over the parent's struct's; Deep, which it leaves alone, keeps the parent's. Any encoding that loads
+    that value passes."""
+    import invariants
+    base = asset('PropSetDelta')
+    parent = invariants.Package(os.path.join(os.path.dirname(base), 'PropSetBase'))
+    child = invariants.Package(base)
+    pc, cc = parent.find('Default__PropSetBase_C'), child.find('Default__PropSetDelta_C')
+    for where, ids_want, score_want in (((), {2, 3}, {'a': 5, 'b': 2}), (('Held',), {2, 3}, {'a': 5, 'b': 2}),
+                                        (('Deep', 'In'), {1, 2}, {'a': 1, 'c': 3})):
+        ids = loaded_container(child, cc, where + ('Ids',), 'set', loaded_container(parent, pc, where + ('Ids',), 'set', set()))
+        score = loaded_container(child, cc, where + ('Score',), 'map', loaded_container(parent, pc, where + ('Score',), 'map', {}))
+        label = '.'.join(where + ('',))
+        assert ids == ids_want, 'PropSetDelta loads %sIds = %s, the source says %s' % (label, sorted(ids), sorted(ids_want))
+        assert score == score_want, 'PropSetDelta loads %sScore = %s, the source says %s' % (label, score, score_want)
+    keeps_invariants(base)
+    print('ok  PropSetDelta: an inherited TSet / TMap default, a property or one in a struct assigned whole, lists the '
+          'parent\'s elements it drops as removed, and loads as its own value, not the union')
+
+
+def prop_enum_class():
+    """A property of a native `enum class : uint8` is an EnumProperty over a ByteProperty, as the editor makes it
+    (KismetCompilerMisc.cpp 1071-1094; every EnumProperty of the game's Blueprints is over a ByteProperty): a variable, a
+    parameter, a return value, a local, a container's element and key, a UE_STRUCT member, a delegate's parameter and an
+    override's parameter, which then has its native parent's type (FEnumProperty::SameType, EnumProperty.cpp 395-398). A
+    namespaced enum (EAttachLocation) stays a ByteProperty. Its tags - the CDO's, a UE_DEFAULTS one on a native
+    EnumProperty member, an array's and a map's, a UserDefinedStruct's default and a native struct's member - are
+    EnumProperty tags (the GetID(), PropertyTag.cpp 17, 30-36) naming the enum and holding the enumerator's FName. Its
+    values run as bytes: a switch, a compare, a cast, a map lookup and a native struct literal."""
+    import invariants, runvm
+    base = asset('PropEnumClass')
+    folder = os.path.dirname(base)
+    pkg = invariants.Package(base)
+    rule_enum = '/Script/Engine.EAttachmentRule'
+
+    def is_enum_class(p, enum, owner=pkg):
+        return (p.type, [s.type for s in p.subs], owner.path(p.enum) if p.enum else owner.path(p.ref)) == \
+            ('EnumProperty', ['ByteProperty'], enum)
+    props = {p.name: p for p in pkg.struct(pkg.find('PropEnumClass_C')).props}
+    assert is_enum_class(props['Rule'], rule_enum), \
+        'Rule is a %s over %s, not an EnumProperty over a ByteProperty' % (props['Rule'].type, [s.type for s in props['Rule'].subs])
+    assert (props['Where'].type, pkg.path(props['Where'].ref)) == ('ByteProperty', '/Script/Engine.EAttachLocation'), \
+        'Where, of a namespaced enum, is a %s' % props['Where'].type
+    # EAbilityIndex's form comes off one parameter the SDK respells (Index -> Index_0); a ByteProperty means it was lost
+    assert is_enum_class(props['Ability'], '/Script/FSD.EAbilityIndex'), 'Ability is a %s' % props['Ability'].type
+    for name, sub in (('Order', 0), ('Seen', 0), ('Cost', 0)):
+        assert is_enum_class(props[name].subs[sub], rule_enum), '%s holds %s' % (name, props[name].subs[sub].type)
+    fn_props = lambda owner, fn: {p.name: p for p in owner.struct(owner.find(fn)).props}
+    for fn, names in (('Pick', ('In', 'ReturnValue')), ('Score', ('In', 'Local')), ('Weight', ('K',)),
+                      ('OnRule__DelegateSignature', ('Param0',))):
+        for name in names:
+            assert is_enum_class(fn_props(pkg, fn)[name], rule_enum), '%s.%s is a %s' % (fn, name, fn_props(pkg, fn)[name].type)
+    assert is_enum_class(fn_props(pkg, 'Weight')['W'].subs[0], rule_enum), 'a local map\'s key'
+    crystal = invariants.Package(os.path.join(folder, 'PropEnumCrystal'))
+    assert is_enum_class(fn_props(crystal, 'Receive_EnteredState')['State'], '/Script/FSD.ECoreCorruptionCrystalState', crystal), \
+        'the override\'s parameter is not its native parent\'s EnumProperty'
+    slot = invariants.Package(os.path.join(folder, 'FRuleSlot'))
+    member = next(p for p in slot.struct(0).props if p.name.startswith('Rule_'))
+    assert is_enum_class(member, rule_enum, slot), 'the UE_STRUCT member is a %s' % member.type
+    t = next(t for t in slot.struct(0).defaults if t['name'].startswith('Rule_'))
+    assert (t['type'], t['enum'], fname_at(slot.names, t['value'], 0)) == ('EnumProperty', 'EAttachmentRule', 'eattachmentrule::snaptotarget'), t
+
+    cdo = pkg.find('Default__PropEnumClass_C')
+    for name, enum, value in (('Rule', 'EAttachmentRule', 'keepworld'), ('Ability', 'EAbilityIndex', 'esecondary'),
+                              ('UpdateOverlapsMethodDuringLevelStreaming', 'EActorUpdateOverlapsMethod', 'alwaysupdate'),
+                              ('Where', 'EAttachLocation', 'snaptotarget')):
+        t = pkg.tag(cdo, name)
+        want = 'ByteProperty' if name == 'Where' else 'EnumProperty'
+        assert t and t['type'] == want and t['enum'] == enum, (name, t)
+        assert fname_at(pkg.names, t['value'], 0).split('::')[-1] == value, (name, fname_at(pkg.names, t['value'], 0))
+    order, cost = pkg.tag(cdo, 'Order'), pkg.tag(cdo, 'Cost')
+    assert order['inner'] == 'EnumProperty' and [fname_at(pkg.names, order['value'], 4 + 8 * k) for k in range(2)] == \
+        ['eattachmentrule::snaptotarget', 'eattachmentrule::keeprelative'], order
+    assert (cost['inner'], cost['value_type']) == ('EnumProperty', 'IntProperty') and \
+        fname_at(pkg.names, cost['value'], 8) == 'eattachmentrule::keepworld', cost
+    shake = {u['name']: u for u in pkg.tags(cdo, pkg.tag(cdo, 'Shake')['at'])}
+    assert (shake['Type']['type'], shake['Type']['enum'], fname_at(pkg.names, shake['Type']['value'], 0)) == \
+        ('EnumProperty', 'ECameraShakeDurationType', 'ecamerashakedurationtype::custom'), shake['Type']
+    for b in (base, crystal.base, slot.base):
+        keeps_invariants(b)
+
+    for rule in (1, 2):
+        for In in (0, 1, 2):
+            for M in (0, 1):
+                local = In if M == 0 else 2
+                want = 12 if local == 0 else 21 if local == 1 else 100 if local == rule else local
+                got = run(base, 'Score', {'Rule': rule}, In=In, M=M)[0]
+                assert got == want, 'Score(%d, %d) with Rule %d = %r, want %r' % (In, M, rule, got, want)
+    assert [run(base, 'Weight', K=k)[0] for k in (0, 1, 2)] == [-1, 3, 5]
+    vm = runvm.VM(base)
+    vm.struct_const = lambda name, vals: runvm.Written(zip(['Duration', 'Type'], vals)) if name == 'CameraShakeDuration' \
+        else runvm.Struct(name, vals)
+    assert [vm.call('ShakeType', M=m) for m in (0, 1)] == [0, 1]
+    print('ok  PropEnumClass: a native enum class is an EnumProperty over a ByteProperty wherever it lands, tagged '
+          'EnumProperty, and runs as a byte')
+
+
+prop_text_defaults()
+prop_flag_predicates()
+prop_hash_keys()
+prop_enum_casts()
+prop_set_delta()
+prop_enum_class()
+
+
+# -- pending
+
+for _mod, _body in (('PropSetBool', '  TSet<bool> Flags;\n'), ('PropMapBool', '  TMap<bool, int32> ByFlag;\n'),
+                    ('PropSetText', '  TSet<FText> Labels;\n'), ('PropMapText', '  TMap<FText, int32> ByLabel;\n'),
+                    ('PropSetHit', '  TSet<FHitResult> Hits;\n'), ('PropSetRotator', '  TSet<FRotator> Turns;\n'),
+                    ('PropSetBoolLocal', '  int32 F() { TSet<bool> S; S.Add(true); return S.Num(); }\n'),
+                    ('PropSetBoolParam', '  int32 F(TSet<bool> S) { return S.Num(); }\n')):
+    refused(_mod, _body, 'cannot hash, and the engine hashes each one')
+print('ok  a set element / map key that cannot hash is refused: bool, FText, a native struct without GetTypeHash; as '
+      'a variable, a local and a parameter')
+
+
+# ---- TYPES: UE_STRUCT default instances, UE_ENUM payloads and names (invariant_rules/user_types.py)
+
+import struct
+import invariants
+from invariant_rules import user_types as types_rules
+
+
+def tag_values(pkg, i, tags):
+    """A tag list as {name without the member suffix: value}, the way the engine reads it back: ints, floats, bools,
+    names, strings, an enum value as its name, an engine vector as a tuple, an int array as a list, and a struct value
+    as a dict of its own tags. An enum value is its short name, which it loads by as well as by the full one."""
+    out = {}
+    for t in tags:
+        ty, v = t['type'], bytes(t['value'])
+        if ty == 'IntProperty': x = struct.unpack('<i', v)[0]
+        elif ty == 'FloatProperty': x = struct.unpack('<f', v)[0]
+        elif ty == 'BoolProperty': x = bool(t['bool'])
+        elif ty == 'NameProperty' or ty in ('ByteProperty', 'EnumProperty') and t['size'] == 8:
+            n, num = struct.unpack('<ii', v); x = pkg.names[n] + ('_%d' % (num - 1) if num else '')
+            if ty != 'NameProperty': x = x.split('::')[-1]   # an enum value loads by either name (UEnum::GetIndexByName)
+        elif ty == 'StrProperty': x = v[4:-1].decode('latin-1')
+        elif ty == 'StructProperty' and t['struct'] == 'Vector': x = struct.unpack('<3f', v)
+        elif ty == 'StructProperty': x = tag_values(pkg, i, pkg.tags(i, t['at']))
+        elif ty == 'ArrayProperty' and t['inner'] == 'IntProperty': x = list(struct.unpack_from('<%di' % struct.unpack_from('<i', v)[0], v, 4))
+        else: x = ('?', ty)
+        out[re.sub(r'_\d+_[0-9A-F]{32}$', '', t['name'])] = x
+    return out
+
+
+def uds_defaults(base):
+    """The default instance a UserDefinedStruct package's Data stream holds, as tag_values reads it."""
+    pkg = invariants.Package(base)
+    st = pkg.struct(0)
+    assert st.kind == 'UserDefinedStruct' and hasattr(st, 'defaults'), (base, st.kind)
+    return tag_values(pkg, 0, st.defaults)
+
+
+def uds_init_defaults():
+    """Every member initializer of a UE_STRUCT is in its default instance, the Data stream the engine copies into each
+    new value of the struct (UUserDefinedStruct::InitializeStruct). A member at its type's default may be left out, and
+    a struct member may be left out or written without the members at its own struct's defaults: the load starts
+    each member at its own default, a struct member at its struct's default instance."""
+    here = os.path.dirname(asset('UdsInitTest'))
+    gauge = uds_defaults(os.path.join(here, 'FUdsGauge'))
+    assert gauge.get('Kills') == 9 and gauge.get('Time', 0.0) == 0.0 and set(gauge) <= {'Kills', 'Time'}, gauge
+    tuned = uds_defaults(os.path.join(here, 'FUdsTuned'))
+    want = {'Hp': 100, 'Rate': 0.25, 'bOn': True, 'Tag': 'Hot', 'Label': 'x', 'Pos': (1.0, 2.0, 3.0), 'Seq': [4, 5]}
+    assert {k: tuned.get(k) for k in want} == want, tuned
+    assert tuned['Dial'] == 'Low' and tuned.get('Zero', 0) == 0, tuned
+    loaded = lambda v: {'Kills': v.get('Kills', 9), 'Time': v.get('Time', 0.0)}      # over FUdsGauge's own defaults
+    assert loaded(tuned['Inner']) == {'Kills': 9, 'Time': 2.5} and loaded(tuned.get('Plain', {})) == {'Kills': 9, 'Time': 0.0}, tuned
+    print('ok  UdsInitTest: every UE_STRUCT member initializer is in the struct\'s default instance, a struct member\'s too')
+    # The class's members: a plain one takes the struct's defaults from InitializeValue, so its CDO tag may be left
+    # out; a designated default changes the members it names, nested ones included, and leaves the rest at theirs.
+    base = asset('UdsInitTest')
+    pkg = invariants.Package(base)
+    cdo = tag_values(pkg, pkg.find('Default__UdsInitTest_C'), pkg.tags(pkg.find('Default__UdsInitTest_C')))
+    over = lambda d, v: {k: (over(d[k], v[k]) if isinstance(d.get(k), dict) and isinstance(v.get(k), dict) else v.get(k, d[k])) for k in d}
+    full = over(dict(tuned, Zero=0, Inner=loaded(tuned['Inner']), Plain=loaded(tuned.get('Plain', {}))), {})
+    assert over(full, cdo.get('Tuned', {})) == full, cdo.get('Tuned')
+    braced = over(full, cdo['Braced'])
+    assert braced == dict(full, Hp=7, Plain={'Kills': 9, 'Time': 0.5}), braced
+    print('ok  UdsInitTest: a designated default of a UE_STRUCT member names what it changes; the rest keep the initializers')
+    for name in ('UdsInitTest', 'FUdsTuned', 'FUdsGauge', 'EUdsDial'):
+        keeps_invariants(os.path.join(here, name))
+    print('ok  UdsInitTest: its struct, enum and class packages keep every invariants.py rule')
+
+
+def enum_net_store():
+    """A replicated UE_ENUM variable and a server RPC's UE_ENUM parameter, run as the server: the store wakes the object
+    and holds the enumerator's value; the RPC called on the authority runs its body with the value passed. Every
+    constant that reaches them is within the enum (enum_net_values: NetSerializeItem sends only the bits the enum's
+    largest value needs)."""
+    base = asset('EnumNetStore')
+    vm = VM(base)
+    vm.call('Shift')
+    assert vm.self.vars.get('Gear') == 2, vm.self.vars
+    assert [l[0] for l in vm.log if l[1] is vm.self][:2] == ['FlushNetDormancy', 'set'], vm.log
+    vm = VM(base)
+    vm.call('Ask')
+    assert vm.self.vars.get('Gear') == 1 and vm.self.vars.get('Asked') == 1, vm.self.vars
+    pkg = invariants.Package(base)
+    stores = [n for i, st in invariants.functions(pkg) for n in invariants.statements(pkg, i)[0]
+              if n.op == 0x0F and types_rules.const_value(pkg, i, n.kids[1]) is not None
+              and (types_rules.field_prop(pkg, n.ops[0][2], n.ops[0][1][-1]) or (0, None))[1] is not None
+              and types_rules.field_prop(pkg, n.ops[0][2], n.ops[0][1][-1])[1].flags & types_rules.CPF_Net]
+    assert stores, 'no constant store into the replicated Gear for enum_net_values to judge'
+    keeps_invariants(base)
+    keeps_invariants(os.path.join(os.path.dirname(base), 'ENetGear'))
+    print('ok  EnumNetStore: a replicated UE_ENUM variable and a server RPC\'s UE_ENUM parameter take the enumerators stored and passed')
+
+
+def enum_refusals():
+    """A UE_ENUM's closing _MAX takes the next value, so a uint8 enum's largest is 254 and an int32 / int64 enum's is
+    one below the type's top; and a Blueprint enum is a uint8 (a byte variable), or an int32 / int64 one."""
+    refused('EnumTop', '  int32 X;\n', 'is out of range', top='enum class EBig : uint8 { A, B = 255 };\nUE_ENUM(EBig);\n')
+    refused('EnumTop', '  int32 X;\n', 'is out of range', top='enum class EWide : int32 { A = 2147483647 };\nUE_ENUM(EWide);\n')
+    refused('EnumTop', '  int32 X;\n', 'is out of range', top='enum class EHuge : int64 { A = 9223372036854775807 };\nUE_ENUM(EHuge);\n')
+    refused('EnumType', '  int32 X;\n', 'declare it', top='enum class EShort : int16 { A };\nUE_ENUM(EShort);\n')
+    print('ok  a UE_ENUM with no room for its _MAX, or of another underlying type than uint8 / int32 / int64, is refused')
+
+
+def enum_entries(base):
+    """(entries [(FName, value)], CppForm) of the enum package at base, as UEnum::Serialize reads it."""
+    pkg = invariants.Package(base)
+    entries, form, end = types_rules.enum_body(pkg, 0)
+    assert end == pkg.exports[0]['size'], (base, end, pkg.exports[0]['size'])
+    return entries, form
+
+
+def uds_local_init():
+    base = asset('UdsLocalInit')
+    for fn, parms, want in (('LocalHp', {}, 1109), ('BracedHp', {}, 120.0), ('LoopHp', {'N': 3}, 300), ('LoopHp', {'N': 0}, 0),
+                            ('GaugeKills', {}, 9), ('TagAndSeq', {}, 12)):
+        got = run(base, fn, **parms)[0]
+        assert got == want, '%s(%s) = %r, want %r: a UE_STRUCT local starts at zero, not its defaults' % (fn, parms, got, want)
+    keeps_invariants(base)
+
+
+def enum_max_dup():
+    """A declared <Enum>_MAX, the UE C++ idiom, is the sentinel itself: one entry of that name, the largest; any other
+    value for it is refused."""
+    base = asset('EnumMaxDup')
+    entries, form = enum_entries(os.path.join(os.path.dirname(base), 'EMaxDupGear'))
+    names = [n.lower() for n, _ in entries]
+    assert len(set(names)) == len(names), 'an entry named twice: %s' % entries
+    top = [(n, v) for n, v in entries if n.endswith('_MAX')]
+    assert len(top) == 1 and all(v < top[0][1] for n, v in entries if n != top[0][0]), entries
+    assert entries[:2] == [('EMaxDupGear::Low', 0), ('EMaxDupGear::High', 1)], entries
+    keeps_invariants(os.path.join(os.path.dirname(base), 'EMaxDupGear'))
+    keeps_invariants(base)
+    refused('EnumMaxOff', '  int32 N = 0;\n', 'EMaxOff_MAX is the sentinel the engine adds',
+            top='enum class EMaxOff : uint8 { A, B, EMaxOff_MAX = 7 };\nUE_ENUM(EMaxOff);\n')
+    print('ok  EnumMaxDup: a declared <Enum>_MAX is the sentinel, one entry of its name; another value for it is refused')
+
+
+def enum_names_across_mods():
+    """No enumerator FName is cooked by two packages of the mods built here: UEnum::AddNamesToMasterList keeps the first
+    of two in its one global map (Enum.cpp 83-94), so with both mods loaded, LookupEnumName answers for one of them."""
+    owner = {}
+    for b in invariants.packages([ROOT]):
+        if os.sep + '_pending' + os.sep in os.path.normpath(b): continue
+        pkg = invariants.Package(b)
+        for i, e in enumerate(pkg.exports):
+            if pkg.class_of(i + 1) == 'UserDefinedEnum':
+                for n, _ in types_rules.enum_body(pkg, i)[0]: owner.setdefault(n, set()).add(pkg.package_name())
+    both = {n: sorted(p) for n, p in owner.items() if len(p) > 1}
+    assert not both, 'cooked by two packages: %s' % sorted(both.items())[:2]
+
+
+uds_init_defaults()
+enum_net_store()
+enum_refusals()
+uds_local_init()
+print('ok  UdsLocalInit: a function with a UE_STRUCT local whose defaults are not zero is FUNC_HasDefaults, so the frame '
+      'starts the local at the struct defaults')
+enum_max_dup()
+# An enumerator's FName is <Enum>::<Name>, kept in one global table where the first enum loaded wins
+# (UEnum::AddNamesToMasterList): a mod enum named like the game's is refused, and no two test mods share one.
+refused('EnumNativeClash', '  ClashNs::EDialogRestriction Mode = ClashNs::EDialogRestriction::SinglePlayerOnly;\n',
+        'UE_ENUM(ClashNs::EDialogRestriction): /Script/FSD already has an enum EDialogRestriction',
+        top='namespace ClashNs {\nenum class EDialogRestriction : uint8 { None, SinglePlayerOnly };\nUE_ENUM(EDialogRestriction);\n}\n')
+enum_names_across_mods()
+print('ok  enumerator names: a UE_ENUM named like a game enum is refused; no two test mods cook one name')
+
+
+# ---- REPL: replication and RPCs (invariant_rules/replication.py)
+
+import struct, tempfile
+import invariants
+
+NET_DIRECTIONS = 0x200000 | 0x1000000 | 0x4000        # FUNC_NetServer | FUNC_NetClient | FUNC_NetMulticast
+
+
+def called(pkg, i):
+    """(opcode, callee name) of every call in export i's script, nested ones included."""
+    out = []
+    for n in invariants.statements(pkg, i)[0]:
+        if n.op not in (0x1B, 0x1C, 0x45, 0x46, 0x68): continue
+        kind, v = n.ops[0][:2]
+        out.append((n.op, v if kind == 'name' else pkg.obj(v)['name'] if v else None))
+    return out
+
+
+def compile_log(mod):
+    """What the compiler printed for tests/pending/<mod>.cpp: pending_asset keeps only a refusal's reason, and a
+    warning is what some of these gaps are closed by."""
+    with tempfile.TemporaryDirectory() as tmp:
+        return assetgen_compile([os.path.join(PENDING, mod + '.cpp'), UEAPI, tmp]).stdout
+
+
+def refused_naming(mod, *names):
+    """pending_asset(mod), or None when the compiler refused it naming one of `names`: for these gaps a refusal is
+    one right answer. A refusal for anything else still fails the test."""
+    try:
+        return pending_asset(mod)
+    except AssertionError as e:
+        if str(e).startswith('refused: ') and any(re.search(r'\b%s\b' % re.escape(n), str(e)) for n in names): return None
+        raise
+
+
+def repl_conditions():
+    """What the engine reads off ReplConditions: every ELifetimeCondition a replicated variable names cooks as its UE
+    4.27 value (CoreNetTypes.h 12-25; COND_-prefixed the same), on a CPF_Net property; a RepNotify struct variable is
+    CPF_Net | CPF_RepNotify naming its OnRep; NumReplicatedProperties counts the class's 16 CPF_Net properties; the
+    RPCs carry one direction each and take their parameters as plain CPF_Parm, no return value. Run as the server
+    runs it, SendPair writes the struct, runs OnRep_Pair right after, and appends to the replicated array."""
+    base = asset('ReplConditions')
+    pkg = invariants.Package(base)
+    ci = pkg.find('ReplConditions_C')
+    props = {p.name: p for p in pkg.struct(ci).props}
+    got = [(props['C%d' % n].cond, props['C%d' % n].flags & 0x100000020, props['C%d' % n].notify) for n in range(14)]
+    assert got == [(n, 0x20, 'None') for n in range(14)], got
+    pair, pairs = props['Pair'], props['Pairs']
+    assert (pair.flags & 0x100000020, pair.notify, pair.cond) == (0x100000020, 'OnRep_Pair', 0), (hex(pair.flags), pair.notify)
+    assert pkg.path(pair.ref).endswith('/ReplConditions/FReplPair.FReplPair'), pkg.path(pair.ref)
+    assert pairs.flags & 0x20 and pairs.subs[0].type == 'StructProperty' and pairs.subs[0].ref == pair.ref, pairs.subs
+    assert not (props['Plain'].flags | props['Notified'].flags) & 0x20
+    count = struct.unpack('<i', pkg.tag(ci, 'NumReplicatedProperties')['value'])[0]
+    assert count == 16, count
+    for fn, net, parms in (('SendPair', 0x2000C0, [('P', 'StructProperty')]), ('Tell', 0x1000040, [('N', 'IntProperty'), ('Why', 'StrProperty')]),
+                           ('OnRep_Pair', 0, [])):
+        st = pkg.struct(pkg.find(fn))
+        assert st.function_flags & (0xC0 | NET_DIRECTIONS) == net, (fn, hex(st.function_flags))
+        assert [(p.name, p.type) for p in st.props if p.flags & 0x80] == parms, (fn, st.props)
+        assert not any(p.flags & 0x400 for p in st.props), fn
+    keeps_invariants(base)
+    names = dumpexp.load(os.path.join(os.path.dirname(base), 'FReplPair'))[3]
+    a, b = (next(n for n in names if n.startswith(m + '_')) for m in ('A', 'B'))
+    for A in (7, -3, 0):
+        vm = VM(base, Notified=2, Pairs=[])
+        P = {a: A, b: 1.5}
+        vm.call('SendPair', P=P)
+        assert (vm.self.vars['Pair'], vm.self.vars['Pairs'], vm.self.vars['Notified']) == (P, [P], 2 + A), vm.self.vars
+        sets = [l[2] for l in vm.log if l[0] == 'set' and l[1] is vm.self]
+        assert sets.index('Pair') < sets.index('Notified'), sets                 # the OnRep after the write
+    vm = VM(base)
+    vm.call('Tell', N=5, Why='x')
+    assert vm.self.vars == dict(Plain=5), vm.self.vars
+    print('ok  ReplConditions: each ELifetimeCondition by its UE 4.27 value, a RepNotify struct and its array, '
+          'NumReplicatedProperties 16, one-way RPCs; SendPair writes, notifies, appends')
+
+
+def repl_refusals():
+    """What UE replicates wrongly or not at all, refused with the reason: a TMap / TSet variable (a nested one too) or
+    RPC parameter sends nothing (PropertyMap.cpp 505-509, PropertySet.cpp 451-455); a RepNotify must be a
+    no-parameter method of the class, the only kind the Kismet compiler keeps (KismetCompiler.cpp 2531-2545); a
+    condition must be an ELifetimeCondition; an RPC needs a direction, returns nothing (RepLayout.cpp 6119 never
+    sends a return value) and an override keeps its parent's net flags (Class.cpp 4189-4190). UE_SERVER with
+    UE_CLIENT never compiles (clang: 'cold' and 'hot' attributes are not compatible); UE_MULTICAST with either is
+    refused by rpc_one_way."""
+    refused('ReplSetVar', '  UE_REPLICATED(TSet<int32>, Seen);\n', 'ReplSetVar::Seen: a TMap or TSet does not replicate')
+    refused('ReplNestedSet', '  UE_REPLICATED(TArray<TSet<int32>>, Seen);\n', 'ReplNestedSet::Seen: a TMap or TSet does not replicate')
+    refused('ReplMapVar', '  using FIntMap = TMap<int32, int32>;\n  UE_REPLICATED(FIntMap, M);\n', 'ReplMapVar::M: a TMap or TSet does not replicate')
+    refused('RpcMapParm', '  UE_SERVER void S(TMap<int32, int32> M) {}\n', 'RpcMapParm::S: an RPC parameter cannot be a TMap or TSet')
+    refused('RpcSetParm', '  UE_MULTICAST void S(TSet<FName> M) {}\n', 'RpcSetParm::S: an RPC parameter cannot be a TMap or TSet')
+    refused('RepNotifyArg', '  UE_REPLICATED_USING(int32, N, OnRep_N);\n  void OnRep_N(int32 Old) {}\n',
+            'its RepNotify OnRep_N must be a method of the class taking no parameters')
+    refused('RepNotifyMissing', '  UE_REPLICATED_USING(int32, N, OnRep_Nope);\n', 'its RepNotify OnRep_Nope must be a method of the class')
+    refused('ReplCondBad', '  UE_REPLICATED_IF(int32, A, Sometimes);\n', 'unknown replication condition Sometimes')
+    refused('RpcReliableAlone', '  UE_RELIABLE void R() {}\n', 'UE_RELIABLE needs UE_SERVER, UE_CLIENT or UE_MULTICAST')
+    refused('RpcReturns', '  UE_SERVER int32 S() { return 1; }\n', 'RpcReturns::S: an RPC returns void')
+    refused('RpcOverride', '', "RpcKid::S: an override takes its parent's replication; drop the RPC marker",
+            top='class RpcBase : public AActor { public: UE_SERVER void S() {} };\n'
+                'class RpcKid : public RpcBase { public: UE_SERVER void S() {} };\n')
+    refused('RpcServerClient', '  int32 N;\n  UE_SERVER UE_CLIENT void Both() { N = 1; }\n', 'FAILED: ')
+    print('ok  replication refusals: TMap / TSet variables and RPC parameters, RepNotify with parameters or missing, '
+          'unknown condition, RPC without direction / with a return / re-marked override, Server + Client')
+
+
+def repl_never():
+    base = asset('ReplNever')
+    pkg = invariants.Package(base)
+    got = {p.name: (p.cond, p.flags & 0x20) for p in pkg.struct(pkg.find('ReplNever_C')).props}
+    assert got == {'Hidden': (15, 0x20), 'NoReplay': (13, 0x20), 'Shown': (0, 0x20)}, \
+        'Hidden cooks condition %d, want COND_Never 15: %s' % (got.get('Hidden', (None,))[0], got)
+    keeps_invariants(base)
+    print('ok  ReplNever: UE_REPLICATED_IF(..., Never) is COND_Never 15 (CoreNetTypes.h 26), not the undefined 14')
+
+
+def repl_notify_refusals():
+    """A RepNotify returns void (RepLayout calls it with no room for a result), and is a function of the class: an
+    inline method is none, so a client's RepLayout would never find it."""
+    refused('RepNotifyRet', '  UE_REPLICATED_USING(int32, N, OnRep_N);\n  int32 OnRep_N() { return N; }\n', 'OnRep_N must return void')
+    refused('ReplInlineNotify', '  UE_REPLICATED_USING(int32, Ammo, OnRep_Ammo);\n  int32 Seen;\n'
+            '  inline void OnRep_Ammo() { Seen += 1; }\n  void Fire() { Ammo = 3; }\n', 'OnRep_Ammo is inline')
+    print('ok  RepNotify refusals: one that returns a value, an inline one')
+
+
+def rpc_one_way():
+    """An RPC goes one way: the sender routes by one direction (AActor::GetFunctionCallspace), the receiver accepts by
+    its own flags, so Multicast with Server or Client is refused (Server with Client never parses: clang refuses
+    [[gnu::hot]] with [[gnu::cold]]). A static function's callspace comes from GetGlobalFunctionCallspace, which never
+    answers Remote, so a static RPC is refused too."""
+    refused('RpcTwoWays', '  int32 N;\n  UE_MULTICAST UE_SERVER void Also() { N = 2; }\n', 'RpcTwoWays::Also: an RPC goes one way')
+    refused('RpcTwoWaysClient', '  int32 N;\n  UE_MULTICAST UE_CLIENT void Wide() { N = 3; }\n', 'RpcTwoWaysClient::Wide: an RPC goes one way')
+    refused('RpcStatic', '  UE_SERVER static void S(int32 X) {}\n  void Call() { S(3); }\n', 'RpcStatic::S: a static function cannot be an RPC')
+    print('ok  RPC refusals: Multicast with Server or Client, and an RPC marker on a static method')
+
+
+repl_conditions()
+repl_refusals()
+repl_notify_refusals()
+repl_never()
+rpc_one_way()
+# RepLayout sends a struct member by member and an array element by element (InitFromProperty_r, InitFromFunction):
+# a TMap member sends nothing (FMapProperty::NetSerializeItem only logs), nor does an interface
+# (FInterfaceProperty::NetSerializeItem writes nothing), at any depth.
+REPL_BAG = 'struct FReplBag {\n  UE_STRUCT;\n  int32 Total;\n  TMap<int32, int32> Counts;\n};\n'
+REPL_MARK = 'class IReplMarker {\npublic:\n  UE_INTERFACE;\n  void Mark();\n};\n'
+refused('ReplHiddenMap', '  UE_REPLICATED(FReplBag, Bag);\n', 'ReplHiddenMap::Bag: a TMap or TSet in FReplBag does not replicate',
+        top=REPL_BAG)
+refused('ReplHiddenIface', '  UE_REPLICATED(TScriptInterface<IReplMarker>, Target);\n',
+        'ReplHiddenIface::Target: an interface does not replicate', top=REPL_MARK)
+refused('ReplHiddenRpc', '  int32 Got;\n  UE_SERVER void Send(FReplBag Sack) { Got = Sack.Total; }\n',
+        'ReplHiddenRpc::Send: an RPC parameter cannot hold what does not replicate: Sack is or holds a TMap or TSet in FReplBag',
+        top=REPL_BAG)
+refused('ReplIfaceRpc', '  int32 N;\n  UE_SERVER void S(TScriptInterface<IReplMarker> Target) { N = 1; }\n',
+        'ReplIfaceRpc::S: an RPC parameter cannot hold what does not replicate: Target is or holds an interface', top=REPL_MARK)
+refused('ReplIfaceNest', '  UE_REPLICATED(FReplNest, Nest);\n', 'ReplIfaceNest::Nest: an interface in FReplNest does not replicate',
+        top=REPL_MARK + 'struct FReplNest {\n  UE_STRUCT;\n  int32 N;\n  TArray<TScriptInterface<IReplMarker>> Marks;\n};\n')
+print('ok  replication refusals: a TMap or an interface inside a replicated struct, as a replicated variable or an RPC '
+      'parameter')
+# A struct is sent whole, through the class variable holding it; a UObject lists no replicated variables and runs
+# every RPC locally. A component replicates, so ReplComponentCtl compiles.
+refused('StructRepl', '  UE_REPLICATED(FReplHp, Hp);\n', 'FReplHp::A: UE_REPLICATED on a struct member has no effect',
+        top='struct FReplHp {\n  UE_STRUCT;\n  UE_REPLICATED(int32, A);\n  int32 B;\n};\n')
+REPL_OBJ = '  UE_REPLICATED(int32, A);\n\npublic:\n  UE_SERVER void S() { A = 1; }\n};\n'
+refused('ReplObjectHost', '', 'ReplObject: the replicated variable A does nothing',
+        top='class ReplObject : public UObject {\n' + REPL_OBJ)
+refused('ReplObjectRpc', '', 'ReplRpcObject: the RPC S does nothing',
+        top='class ReplRpcObject : public UObject {\npublic:\n  UE_SERVER void S() {}\n};\n')
+with tempfile.TemporaryDirectory() as _tmp:
+    _src = os.path.join(_tmp, 'ReplComponentCtl.cpp')
+    with open(_src, 'w', encoding='utf-8') as _f:
+        _f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/ReplComponentCtl");\n'
+                 'class ReplComponentCtl : public UActorComponent {\n' + REPL_OBJ)
+    _proc = assetgen_compile([_src, UEAPI, _tmp])
+    assert _proc.returncode == 0, _proc.stdout + _proc.stderr
+print('ok  replication refusals: UE_REPLICATED on a struct member, replication on a UObject (a component compiles)')
+# The engine routes a call by the called UFunction's flags; an inline method is none, so its marker goes nowhere.
+for _mod, _mark in (('RpcInline', 'UE_SERVER'), ('AuthInline', 'UE_AUTHORITY_ONLY'), ('CosInline', 'UE_COSMETIC')):
+    refused(_mod, '  int32 Pings;\n  %s inline void Ping() { Pings += 1; }\n  void Go() { Ping(); }\n' % _mark,
+            '%s::Ping: an RPC, authority-only or cosmetic marker on an inline method does nothing' % _mod)
+print('ok  a net, authority-only or cosmetic marker on an inline method is refused')
+
+
+# ---- LATENT: latent calls, async actions, deferred spawn / construct warnings (invariant_rules/latent.py)
+
+def latent_compile_log(src, game=None):
+    """(exit code, what the compiler printed) for one source, compiled into a scratch folder: warnings are read off it."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        proc = assetgen_compile([src, UEAPI, tmp] + (['--game', game] if game else []))
+    return proc.returncode, proc.stdout
+
+
+def said(log, *patterns):
+    """A 'warning:' or a refusal ('FAILED:') line of a compile log that matches every regex given, ignoring case."""
+    lines = [l for l in log.splitlines() if re.search(r'\b(warning|FAILED):', l)]
+    return any(all(re.search(p, l, re.I) for p in patterns) for l in lines)
+
+
+def says(mod, what, *patterns):
+    """A pending check: compiling tests/pending/<mod>.cpp warns (or refuses) on a line matching every pattern."""
+    def check():
+        out = latent_compile_log(os.path.join(PENDING, mod + '.cpp'))[1]
+        assert said(out, *patterns), 'nothing said %s: %s' % (what, ' | '.join(out.strip().splitlines()))
+    return check
+
+
+def latent_refusals():
+    """What a function that waits cannot be, each refused with its reason: a static (no object, so no frame to keep its
+    locals in), one that returns a value or takes a non-const reference (its caller is gone when it resumes), one that
+    passes its own FLatentActionInfo (the compiler writes the one the latent action manager resumes through), a class that
+    declares its ubergraph's name (FindFunction would find that one, LatentActionManager.cpp 214-221), and a patched
+    game class (whose ubergraph is the game's)."""
+    umg = '#include "UeApi/UMG.h"\n'
+    download = '  UAsyncTaskDownloadImage* T = UAsyncTaskDownloadImage::DownloadImage("u");'
+    refused('WaitStatic', '  static void F() { UKismetSystemLibrary::Delay(1.0f); }\n', 'no object whose ubergraph frame')
+    refused('WaitStaticAwait', '  static void F() {%s UE_AWAIT(T->OnSuccess); }\n' % download,
+            'no object whose ubergraph frame', top=umg)
+    refused('WaitValue', '  int32 F() { UKismetSystemLibrary::Delay(1.0f); return 1; }\n',
+            'returns nothing and takes no non-const reference')
+    refused('WaitRef', '  void F(int32& Out) { UKismetSystemLibrary::Delay(1.0f); Out = 1; }\n',
+            'returns nothing and takes no non-const reference')
+    refused('WaitAwaitValue', '  int32 F() {%s UE_AWAIT(T->OnSuccess); return 1; }\n' % download,
+            'returns nothing and takes no non-const reference', top=umg)
+    refused('WaitInfo', '  void F() { FLatentActionInfo I; UKismetSystemLibrary::Delay(this, 1.0f, I); }\n',
+            'leave the FLatentActionInfo argument out')
+    refused('WaitUberName', '  void ExecuteUbergraph_WaitUberName(int32 EntryPoint) {}\n'
+            '  void F() { UKismetSystemLibrary::Delay(1.0f); }\n', "is the name of a class's ubergraph")
+    # A UE_PATCH of AssetTest's AssetUser, AssetTest's output standing in for the game as EditTest has it.
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, 'WaitPatch.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/WaitPatch");\n'
+                    'class AssetUser : public AActor {\npublic:\n'
+                    '  UE_CLASS("/Game/_ElytrasMods/AssetTest/AssetUser", "AssetUser_C");\n};\n'
+                    'class UserWaits : public AssetUser {\n  UE_PATCH;\npublic:\n'
+                    '  void ReceiveBeginPlay() { UKismetSystemLibrary::Delay(1.0f); }\n};\n')
+        code, log = latent_compile_log(src, os.path.join(ROOT, 'AssetTest', 'FSD', 'Content'))
+        assert code and 'a patched function that waits' in log, log
+    print('ok  a function that waits: refused when static, returning, by reference, passing its own FLatentActionInfo, '
+          'shadowing the ubergraph, or patched into a game class')
+
+
+def latent_info_written():
+    """Delay(Duration, Info) is the world-context-less overload with the latent info written out: the compiler supplies
+    the info, so it refuses this as it refuses Delay(this, Duration, Info), though the argument count alone would not
+    tell: lowered, it would be Delay(WorldContextObject = Duration, Duration = Info, LatentInfo = its own)."""
+    refused('WaitInfoNoWco', '  void F() { FLatentActionInfo I; UKismetSystemLibrary::Delay(0.5f, I); }\n',
+            'Delay: leave the FLatentActionInfo argument out')
+    print('ok  WaitInfoNoWco: Delay(Duration, Info) is refused, the compiler supplies the FLatentActionInfo')
+
+
+def latent_worlds():
+    """A class that waits and has no world of its own (not an actor, component, widget, game instance or subsystem:
+    Delay finds its world through GetWorld, which a plain UObject answers only through its Outer, Obj.cpp 846) is
+    warned about, by method; one that has a world is not. The warning is advice: all three still wait and resume."""
+    warned = lambda mod: sorted(re.findall(r'warning: (\S+) waits, and an object of this class finds its world only '
+                                           r'through its Outer', LOGS[mod]))
+    assert warned('LatentTest') == ['LatentJob::Run'], LOGS['LatentTest']
+    assert warned('LatentWorlds') == ['ULatentWorldJob::Run'], LOGS['LatentWorlds']
+    assert warned('AsyncTest') == [] and 'finds its world' not in LOGS['AsyncTest'], LOGS['AsyncTest']
+    folder = os.path.dirname(asset('LatentWorlds'))
+    for cls, done in (('ULatentWorldPart', 1), ('ULatentWorldJob', 2), ('LatentWorlds', 3)):
+        vm = VM(os.path.join(folder, cls), {'Delay': latent_call})
+        vm.call('Run', 0.5)
+        [(fn, ctx, info, _)] = vm.latent
+        assert ctx is vm.self and info[3] is vm.self and vm.log[-1][2][1] == 0.5 and 'Done' not in vm.self.vars, cls
+        vm.fire()
+        assert vm.self.vars['Done'] == done, (cls, vm.self.vars)
+        keeps_invariants(os.path.join(folder, cls))
+    print('ok  LatentWorlds: a waiting UObject is warned it finds its world only through its Outer; a component or '
+          'an actor is not; all three resume')
+
+
+def latent_repeats():
+    """A waiting method called again before its action is done, as the latent action manager answers it: a Delay at
+    the same (object, UUID) is ignored while one is pending (KismetSystemLibrary.cpp 2164-2174), so one resume, which
+    reads the frame as the second call left it; a LoadAsset / LoadAssetClass always adds an action (2662, 2691), so
+    each call resumes on its own. A compiler that gave each run of a call site its own UUID would resume twice."""
+    lat = {n: latent_call for n in ('Delay', 'LoadAsset', 'LoadAssetClass')}
+    vm = VM(asset('LatentTest'), lat, Stage=4, Log=[])
+    vm.call('Wait', 1.0, 100)
+    vm.call('Wait', 2.0, 200)                             # same call site, first Delay still pending
+    assert vm.self.vars['Log'] == [100, 200] and len(vm.latent) == 1, (vm.self.vars, vm.latent)
+    assert vm.log[-1][0] == 'Delay' and vm.log[-1][2][1] == 2.0, vm.log[-1]
+    vm.fire(0)
+    assert vm.self.vars['Log'] == [100, 200, 201] and not vm.latent, (vm.self.vars, vm.latent)   # the second call's Tag
+    vm = VM(asset('LatentTest'), lat, Stage=9, Wanted='soft:Cls', Icon='soft:Icon')
+    vm.call('Load')
+    vm.call('Load')
+    assert [a[0] for a in vm.latent] == ['LoadAssetClass'] * 2 and vm.latent[0][2][1] == vm.latent[1][2][1], vm.latent
+    vm.fire(0, result='A')
+    vm.fire(0, result='B')
+    assert vm.self.vars['Got'] == 'B' and [a[0] for a in vm.latent] == ['LoadAsset'] * 2, (vm.self.vars, vm.latent)
+    vm.fire(0, result=Obj('Texture2D'))
+    assert vm.self.vars['Stage'] == 1, vm.self.vars
+    vm.fire(0, result=None)
+    assert vm.self.vars['Stage'] == 0 and not vm.latent, (vm.self.vars, vm.latent)
+    assert sum(1 for l in vm.log if l[0] == 'LoadAsset') == 2, vm.log
+    print('ok  LatentTest: a Delay called again while pending resumes once, with the latest frame; each LoadAsset resumes')
+
+
+def await_fakes():
+    """AsyncTest's download factory and Activate, recorded: (made tasks, [(task, dispatchers bound on it)])."""
+    made, activated = [], []
+    natives = {'DownloadImage': lambda vm, ctx, *a: made.append(Obj('AsyncTaskDownloadImage', args=a)) or made[-1],
+               'Activate': lambda vm, ctx: activated.append((ctx, sorted(p for o, p, f, _ in vm.binds if o is ctx)))}
+    return made, activated, natives
+
+
+def await_paths():
+    """UE_AWAIT on an async action activates it once, after its dispatchers are bound, on whichever path runs
+    (K2Node_BaseAsyncTask.cpp 410-467): the else branch's await as well as the then branch's, and an await inside a
+    loop on its first round only - a second Activate starts an action like AsyncLoadPrimaryAsset again. An await some
+    paths reach with the action activated and some without is refused: keeping its Activate starts the action twice
+    on one path, dropping it never on the other."""
+    def once(activated, task, disp, what):
+        """The task was activated exactly once, with the dispatcher awaited already bound (others may be too)."""
+        mine = [bound for t, bound in activated if t is task]
+        assert len(mine) == 1 and disp in mine[0], '%s activates the task %d times, want once after %s is bound%s' % (
+            what, len(mine), disp, '' if not mine else ' (bound: %s)' % mine)
+
+    made, activated, natives = await_fakes()
+    for ok, disp in ((True, 'OnSuccess'), (False, 'OnFail')):
+        vm = VM(asset('AwaitPaths'), natives, Rounds=0)
+        vm.call('Either', 'u', ok)
+        task = made[-1]
+        once(activated, task, disp, 'Either(bOk=%s)' % ok)
+        vm.broadcast(task, disp, 'tex' if ok else None)
+        assert vm.self.vars == (dict(Rounds=0, Image='tex') if ok else dict(Rounds=-1)), vm.self.vars
+    print("ok  AwaitPaths.Either: the else branch's UE_AWAIT activates the async action too")
+
+    for fn in ('Twice', 'Until'):
+        made, activated, natives = await_fakes()
+        vm = VM(asset('AwaitPaths'), natives, Rounds=0)
+        vm.call(fn, 'u')
+        task = made[-1]
+        vm.broadcast(task, 'OnSuccess', 't1')
+        vm.broadcast(task, 'OnSuccess', 't2')
+        assert vm.self.vars == dict(Rounds=2, Image='t2'), (fn, vm.self.vars)
+        assert len(made) == 1, made
+        once(activated, task, 'OnSuccess', fn)
+    made, activated, natives = await_fakes()
+    vm = VM(asset('AwaitPaths'), natives, Rounds=2)
+    vm.call('Until', 'u')                                   # the first round breaks: nothing bound, nothing activated
+    assert not activated and not vm.binds and vm.self.vars == dict(Rounds=2), (activated, vm.binds, vm.self.vars)
+    print('ok  AwaitPaths.Twice / Until: a UE_AWAIT in a loop activates its async action once, on the first round')
+
+    umg, task = '#include "UeApi/UMG.h"\n', '    UAsyncTaskDownloadImage* T = UAsyncTaskDownloadImage::DownloadImage(Url);\n'
+    for mod, body in (('AwaitSkips', '    for (int32 I = 0; I < 3; ++I) { if (Stop) continue; UE_AWAIT(T->OnSuccess); }\n'),
+                      ('AwaitMaybe', '    if (Stop) UE_AWAIT(T->OnSuccess);\n    UE_AWAIT(T->OnFail);\n')):
+        refused(mod, '  bool Stop;\n  void F(FString Url) {\n%s%s  }\n' % (task, body),
+                "some paths reach it with T's async action already activated and some without", top=umg)
+    print('ok  AwaitSkips / AwaitMaybe: an await reached with its action activated on some paths only is refused')
+
+
+def await_null_proxy():
+    """An async factory that returns None: the editor's expansion tests the proxy with IsValid and skips the binds
+    and Activate (K2Node_BaseAsyncTask.cpp 393-408), where binding through a None context logs an Accessed None
+    script warning per bind and per Activate (ScriptCore.cpp 2904-2937). Nothing after the await runs either way.
+    (DownloadImage itself never returns None; a factory such as CreateMoveToProxyObject does, with no pawn.) The same
+    mod with a real task binds, activates and resumes, so the None case is the IsValid test and nothing else."""
+    made, activated, natives = await_fakes()
+    vm = VM(asset('AwaitNullProxy'), natives)
+    vm.call('Download', 'u')
+    once_ok = len(activated) == 1 and activated[0][0] is made[-1] and 'OnSuccess' in activated[0][1]
+    vm.broadcast(made[-1], 'OnSuccess', 'tex')
+    assert once_ok and vm.self.vars == dict(Image='tex') and not vm.accessed_none, (activated, vm.self.vars)
+    made, activated, natives = await_fakes()
+    natives['DownloadImage'] = lambda vm, ctx, *a: None
+    vm = VM(asset('AwaitNullProxy'), natives)
+    vm.call('Download', '')
+    assert not activated and 'Image' not in vm.self.vars and not vm.binds, (activated, vm.self.vars, vm.binds)
+    assert not vm.accessed_none, 'the None proxy is bound / activated through a warning context: Accessed None ' \
+                                 'at %s' % vm.accessed_none
+    print('ok  AwaitNullProxy.Download: a None async proxy skips its binds and Activate, as IsValid gates them')
+
+
+def proxy_frame_held():
+    """A callback proxy whose factory leaves it to the persistent frame to keep (CreateProxyObjectForPlayMontage sets
+    RF_StrongRefOnFrame and roots it nowhere else, PlayMontageCallbackProxy.cpp 15-23; the anim instance's delegates
+    reach it weakly, 56-63) must be stored where the garbage collector sees it: a member, or a local of the ubergraph,
+    whose frame the class reports (BlueprintGeneratedClass.cpp 1683-1713). ProxyLocalHeld.Play binds its proxy in a
+    plain function, whose local dies with the call: the compiler stores it into a transient member too, so after Play
+    returns the object still references it and a GC leaves it for Done. (The suite's AsyncTest.Play is the same case;
+    latent_proxy_frame_held checks it there.)"""
+    import invariants
+    base = asset('ProxyLocalHeld')
+    pkg = invariants.Package(base)
+    local = lambda n: n.op == 0x00 and ('.'.join(n.ops[0][1]), n.ops[0][2])
+
+    def holder(i, dest):
+        """Where a Let's destination keeps the proxy: a member, the ubergraph's frame, or a plain local - unless
+        that local is copied on into a member or the frame in the same function."""
+        if dest.op == 0x01: return 'a member'
+        if dest.op != 0x00: return 'op %02x' % dest.op
+        owner = dest.ops[0][2]
+        st = pkg.struct(owner - 1) if owner > 0 else None
+        if st and st.function_flags & 0x8000: return 'the frame'
+        for n in invariants.statements(pkg, i)[0]:
+            if (n.op in (0x0F, 0x5F) and n.kids[0].op == 0x01 and local(n.kids[1]) == local(dest)) or \
+                    (n.op == 0x64 and local(n.kids[0]) == local(dest)):
+                return 'a member' if n.op != 0x64 else 'the frame'
+        return 'a local of ' + pkg.path(owner)
+    factory = lambda n: n.op in (0x1B, 0x1C, 0x45, 0x46, 0x68) and n.ops[0][0] == 'obj' \
+        and (pkg.path(n.ops[0][1]) or '').endswith(':CreateProxyObjectForPlayMontage')
+    held = []
+    for i, st in invariants.functions(pkg):
+        for n in invariants.statements(pkg, i)[0]:
+            if n.op in (0x0F, 0x5F) and factory(n.kids[1]): held.append(holder(i, n.kids[0]))
+            elif n.op == 0x64 and factory(n.kids[0]): held.append('the frame')
+    assert len(held) == 1, held
+    assert held[0] in ('a member', 'the frame'), 'the montage proxy is kept in %s' % held[0]
+    made = []
+    vm = VM(base, {'CreateProxyObjectForPlayMontage': lambda vm, ctx, *a: made.append(Obj('PlayMontageCallbackProxy')) or made[-1]},
+            Mesh='mesh', Montage='montage', Last='None')
+    vm.call('Play')
+    assert any(v is made[-1] for v in vm.self.vars.values()), 'nothing of the object holds the proxy: %s' % vm.self.vars
+    vm.broadcast(made[-1], 'OnCompleted', 'End')
+    assert vm.self.vars['Last'] == 'End', vm.self.vars
+    keeps_invariants(base)
+    print('ok  ProxyLocalHeld.Play: a callback proxy bound in a plain function is kept in a member, where the GC sees it')
+
+
+def deferred_left():
+    """A deferred spawn never finished (the actor never runs its construction script or BeginPlay, Actor.cpp
+    3185-3251), and a deferred component add never finished (never attached or registered, ActorConstruction.cpp
+    1165-1212) or begun with a bManualAttachment the finish then overrides (the add's is not read when deferred,
+    1157-1160): C++ compiles each, so the compiler says so at the function. A finish at another transform is not
+    asked about: FinishSpawning recomposes it on purpose (Actor.cpp 3212-3232). The patterns start at a word, so the
+    function names NoFinish / CompNoFinish do not match them themselves. The control: UberDeferGuard's Begin stores
+    its deferred spawn in a member and Finish finishes it, which is not warned about."""
+    log = latent_compile_log(os.path.join(TESTS, 'DeferredLeft.cpp'))[1]
+    for fn, what in (('NoFinish', r'\bfinish'), ('CompNoFinish', r'\bfinish'), ('CompManual', r'\battach')):
+        assert said(log, r'DeferredLeft::%s\b' % fn, what), \
+            'nothing said at %s: %s' % (fn, ' | '.join(log.strip().splitlines()))
+    held = latent_compile_log(os.path.join(TESTS, 'UberDeferGuard.cpp'))[1]
+    assert not said(held, r'\bdeferred\b'), 'a deferred spawn kept in a member warned: ' + held
+    print('ok  DeferredLeft: an unfinished deferred spawn or component add, or a finish with another attachment, warns; '
+          'one kept in a member does not')
+
+
+def spawn_abstract():
+    """SpawnActor of an abstract class returns None (LevelActor.cpp 333-347); SpawnObject with no Outer returns None
+    (GameplayStatics.cpp 606-627). Each call is warned about at the function that makes it; the abstract one saying so
+    (the word, not the class name, which has it too). SpawnObject of an abstract class is refused: it makes one quietly
+    in Shipping and asserts in Development (UObjectGlobals.cpp 2362), which uber_spawn_class_operands holds every
+    package to, and the editor's Construct Object node refuses the class (K2Node_GenericCreateObject.cpp 13-64)."""
+    log = LOGS['SpawnAbstract']
+    for fn, what in (('SpawnShape', r'\babstract\b'), ('MakeOuterless', r'\bouter\b|\bNone\b')):
+        assert said(log, r'SpawnAbstract::%s\b' % fn, what), 'nothing said at %s: %s' % (fn, ' | '.join(log.strip().splitlines()))
+    refused('SpawnAbstractSpec', '  void MakeSpec() { NewObject<UAbstractSpec>(this); }\n',
+            'MakeSpec: UAbstractSpec is an abstract class',
+            OBJECTS + 'class UAbstractSpec : public UObject {\npublic:\n  virtual int32 N() = 0;\n};\n')
+    print('ok  SpawnAbstract: spawning an abstract actor class and constructing with no Outer each warn at the '
+          'function; constructing an abstract object class is refused')
+
+
+def wait_hold():
+    """A local that holds an object across a wait is a weak reference in the persistent frame unless the object has
+    RF_StrongRefOnFrame (UObjectGlobals.cpp 3460-3483): WaitHold.F's widget, made before the Delay and read after it,
+    can be collected in between. The compiler knows which locals outlive a wait, so it says so. Its controls are not
+    warned about: a widget read out of a member, one made after the wait, a SpawnObject result, an actor."""
+    log = LOGS['WaitHold']
+    assert said(log, r'WaitHold::F\b', r'\bW\b'), 'nothing said about W outliving the wait: ' + log
+    held = re.findall(r'warning: WaitHold::(\w+) keeps (\w+)', log)
+    assert held == [('F', 'W')], held
+    print('ok  WaitHold.F: an object local read after a wait warns that the frame does not keep it; its controls do not')
+
+
+latent_refusals()
+latent_info_written()
+latent_worlds()
+latent_repeats()
+await_paths()
+await_null_proxy()
+proxy_frame_held()
+deferred_left()
+spawn_abstract()
+wait_hold()
+
+
+# ---- EDITS: invariants on the packages UE_PATCH / UE_ASSET_EDITS produce from the game (invariant_rules/edits.py)
+# sweep() never reaches those, so each check here runs invariants.py's rules on them itself. A game package's own findings
+# are not the edit's: for those only what the edit adds counts. The mods are inline, as edits()'s are: an S38 mod
+# compiles only with --game, which build() gives EditTest alone, so it cannot sit in tests/ or tests/pending.
+
+import tempfile
+import invariants
+from invariant_rules import edits as edits_rules
+
+
+EDIT_HEAD = '#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\n#include "UeApi/FSD.h"\n'
+COOKED_RULES = {'cooked_instancing_flags', 'cooked_instancing_scopes', 'cooked_template_tags_listed', 'edited_template_changes_listed'}
+
+
+def pinned_elsewhere(f):
+    """A finding a pending test below pins, which the behaviour checks leave to it. None now: EditAddTick, which pinned
+    COMP's receive_tick_sets_can_ever_tick, passes (a ReceiveTick a patch adds turns the class's tick on)."""
+    return False
+
+
+def compile_edit(tmp, mod, src, game):
+    """Compiles an S38 mod (its whole source) against `game`, the folder /Game is in, into tmp; returns the process and
+    the Content folder the edited packages are written to, each at its own /Game path."""
+    path = os.path.join(tmp, mod + '.cpp')
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(src)
+    out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', mod)
+    os.makedirs(out)
+    proc = assetgen_compile([path, UEAPI, out, '--game', game])
+    return proc, os.path.join(tmp, 'FSD', 'Content')
+
+
+def edit_findings(edited, game_root, only=None, pinned=lambda f: False):
+    """invariants.py's findings on an edited package that its vanilla copy (the same path under game_root) does not
+    have, the known ones and the pinned ones left out. The vanilla copy is in GAME_CONTENT meanwhile, so rules comparing
+    against it see it."""
+    vanilla = os.path.join(game_root, *edited.replace(os.sep, '/').split('/FSD/Content/', 1)[1].split('/'))
+    saved = list(invariants.GAME_CONTENT)
+    if saved: invariants.GAME_CONTENT[:] = [game_root] + [g for g in saved if g != game_root]   # no --game: /Game imports go unchecked
+    try:
+        new = set(invariants.check(invariants.Package(edited), only)) - set(invariants.check(invariants.Package(vanilla), only))
+    finally:
+        invariants.GAME_CONTENT[:] = saved
+    return sorted(f for f in new if f[0] not in KNOWN_RULES and not pinned(f))
+
+
+def keeps_edit_invariants(edited, game_root, pinned=pinned_elsewhere):
+    found = edit_findings(edited, game_root, pinned=pinned)
+    assert not found, '%s: the edit breaks %s' % (os.path.basename(edited), '; '.join('%s %s: %s' % f for f in found[:3]))
+
+
+def keeps_invariants_but(base, game_root, pinned=pinned_elsewhere):
+    """keeps_invariants, a pending test's pinned findings left to it; game_root, the folder the edited packages came
+    from, is searched first for /Game imports."""
+    saved = list(invariants.GAME_CONTENT)
+    if saved: invariants.GAME_CONTENT[:] = [game_root] + [g for g in saved if g != game_root]   # no --game: /Game imports go unchecked
+    try:
+        found = [f for f in invariants.check(invariants.Package(base)) if f[0] not in KNOWN_RULES and not pinned(f)]
+    finally:
+        invariants.GAME_CONTENT[:] = saved
+    assert not found, '%s breaks %s' % (os.path.basename(base), '; '.join('%s %s: %s' % f for f in found[:3]))
+
+
+def function_facts(base, name):
+    """What the engine reads off a class's function `name`: whether the class lists it in Children and in FuncMap
+    under its own name, its SuperStruct as the export header and the payload give it, its flags."""
+    pkg = invariants.Package(base)
+    c = next(i for i, st in invariants.classes(pkg))
+    cls = pkg.struct(c)
+    f = next(i for i, e in enumerate(pkg.exports) if e['name'] == name and e['outer'] == c + 1)
+    st = pkg.struct(f)
+    return dict(child=f + 1 in cls.children, funcmap=dict(cls.func_map).get(name) == f + 1,
+                header_super=pkg.path(pkg.exports[f]['super']), super=pkg.path(st.super), flags=st.function_flags)
+
+
+def cdo_ends_at_serial_size(base):
+    """The class default object's tags end at its SerialSize: SerializeDefaultObject writes the tags and nothing after
+    them for a class without sparse data (Class.cpp:4674-4697)."""
+    pkg = invariants.Package(base)
+    c = next(i for i, st in invariants.classes(pkg))
+    cdo = pkg.struct(c).cdo - 1
+    return pkg.tags(cdo).end == len(pkg.blob(cdo))
+
+
+FUNC_NETFUNCFLAGS = 0x012040C0      # Net | NetReliable | NetServer | NetClient | NetMulticast (Script.h:157)
+
+COMP_DECL = ('class CompTest : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/CompTest/CompTest", "CompTest_C");\n'
+             '  int32 Ticks;\n  class UPointLightComponent* Lamp;\n'
+             '  static constexpr const char* Lamp__UeScsNode = "00000000000000000000000000000000";\n'
+             '  void ReceiveBeginPlay();\n};\n')
+RPC_KEEP = ('class ReplTest : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/ReplTest/ReplTest", "ReplTest_C");\n'
+            '  int32 Local;\n  UE_CLIENT void ClientPing(int32 Seq);\n};\n'
+            'class Tweaks : public ReplTest {\n  UE_PATCH;\n  void ClientPing(int32 Seq) { ReplTest::ClientPing(Seq); Local = Local + 1; }\n};\n')
+
+
+def suite_edit_cases():
+    """The edits edits() and path_edits() make of the suite's own stand-ins for game packages, as (mod, the folder /Game
+    is in, the edited package's path under _ElytrasMods, source after the includes)."""
+    comp, repl, types, assets = (os.path.join(ROOT, m, 'FSD', 'Content') for m in ('CompTest', 'ReplTest', 'TypesTest', 'AssetTest'))
+    return (
+        ('FnLocal', comp, 'CompTest/CompTest', COMP_DECL + 'class Tweaks : public CompTest {\n  UE_PATCH;\n'
+         '  void ReceiveBeginPlay() { int32 Step = 5; Ticks = Ticks + Step; }\n};\n'),
+        ('FnKeep', comp, 'CompTest/CompTest', COMP_DECL + 'class Tweaks : public CompTest {\n  UE_PATCH;\n'
+         '  void ReceiveBeginPlay() { CompTest::ReceiveBeginPlay(); Ticks = Ticks + 5; }\n};\n'),
+        ('FnAdd', comp, 'CompTest/CompTest', COMP_DECL + 'class Tweaks : public CompTest {\n  UE_PATCH;\n'
+         '  void ReceiveBeginPlay() { Ticks = Twice(Ticks) + 5; }\n  int32 Twice(int32 X) { return X * 2; }\n'
+         '  void ReceiveTick(float DeltaSeconds) { Ticks = Ticks + 1; }\n};\n'),
+        ('LampDefaults', comp, 'CompTest/CompTest', COMP_DECL + 'class Tweaks : public CompTest {\n  UE_PATCH;\n'
+         '  UE_DEFAULTS { Lamp->Intensity = 5000.0f; Lamp->AttenuationRadius = 900.0f; Ticks = 3; }\n};\n'),
+        ('GlobalFn', comp, 'CompTest/CompTest', COMP_DECL + 'int32 Step = 5;\nclass Tweaks : public CompTest {\n  UE_PATCH;\n'
+         '  void ReceiveBeginPlay() { Ticks = Ticks + Step; Step = Step + 1; }\n};\n'),
+        ('RpcKeep', repl, 'ReplTest/ReplTest', RPC_KEEP),
+        ('TypesPaths', types, 'TypesTest/TypesTest',
+         'class TypesTest : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/TypesTest/TypesTest", "TypesTest_C");\n'
+         '  TArray<FVector> Points;\n  TArray<FFloatInterval> Spans;\n};\n'
+         'class Tweaks : public TypesTest {\n  UE_PATCH;\n'
+         '  UE_DEFAULTS { Points[1].Y = 50.0f; Spans[0].Max = 9.0f; Spans[1] = FFloatInterval{3.0f, 4.0f}; }\n};\n'),
+        ('MoodPatch', assets, 'AssetTest/UMoodDef',
+         'UE_ASSET_AT(UEnemyDescriptor, ED_Spider_Exploder, "/Game/Enemies/Spider/Exploder/ED_Spider_Exploder");\n'
+         'UE_ASSET_AT(UEnemyDescriptor, ED_AssetTest, "/Game/_ElytrasMods/AssetTest/ED_AssetTest");\n'
+         'UE_ASSET_EDITS {\n  ED_AssetTest.VeteranClasses[0] = &ED_Spider_Exploder;\n  ED_AssetTest.IdealSpawnSize = 9;\n}\n'
+         'class UMoodDef : public UPrimaryDataAsset {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/AssetTest/UMoodDef", "UMoodDef_C");\n'
+         '  float Health;\n  int32 Count;\n  FName Tag;\n};\n'
+         'class MoodTweaks : public UMoodDef {\n  UE_PATCH;\n  UE_DEFAULTS { Health = 42.0f; Count = 0; Tag = "tweaked"; }\n};\n'))
+
+
+def edit_invariants_suite():
+    """CLS-G11 on the suite's own stand-ins for game packages: every edit edits() and path_edits() make - defaults, a
+    component's template, a function replaced (with a local of its own, and around its game body, kept), added (a
+    helper and an override of a native event), an RPC's body kept, a global, paths into values, a data asset - keeps
+    invariants.py's rules (a pending test's pinned findings left to it), and
+    what it adds to a class is listed as the engine looks functions up: in Children and FuncMap under its own name, the
+    kept body overriding nothing and routed nowhere, the override naming the native function it overrides."""
+    for mod, game, path, body in suite_edit_cases():
+        with tempfile.TemporaryDirectory() as tmp:
+            proc, content = compile_edit(tmp, mod, EDIT_HEAD + 'UE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\n%s' % (mod, body), game)
+            assert proc.returncode == 0, mod + ':\n' + proc.stdout + proc.stderr
+            own = os.path.join(content, '_ElytrasMods', mod)
+            written = [os.path.join(dp, f[:-len('.uasset')]) for dp, _, fs in os.walk(content) for f in fs if f.endswith('.uasset')]
+            edited = [w for w in written if not w.startswith(own + os.sep)]
+            assert os.path.join(content, '_ElytrasMods', *path.split('/')) in edited, (mod, edited)
+            for b in written:
+                keeps_invariants_but(b, game)           # the rules that hold on every package: the edited ones, a global's class
+            for b in edited:
+                keeps_edit_invariants(b, game)          # and nothing new against the package it edits
+                if any(True for _ in invariants.classes(invariants.Package(b))):
+                    assert cdo_ends_at_serial_size(b), (mod, b, 'the edited CDO does not end at its SerialSize')
+            b = os.path.join(content, '_ElytrasMods', *path.split('/'))
+            if mod == 'FnKeep':
+                kept = function_facts(b, 'ReceiveBeginPlay__Vanilla')
+                assert kept['child'] and kept['funcmap'] and kept['header_super'] is None and kept['super'] is None \
+                    and not kept['flags'] & FUNC_NETFUNCFLAGS, kept
+                was = function_facts(os.path.join(game, '_ElytrasMods', 'CompTest', 'CompTest'), 'ReceiveBeginPlay')
+                now = function_facts(b, 'ReceiveBeginPlay')
+                assert now == was, (was, now)           # the replaced function: same listing, super and flags
+            if mod == 'FnAdd':
+                tick, twice = function_facts(b, 'ReceiveTick'), function_facts(b, 'Twice')
+                assert tick['child'] and tick['funcmap'] and tick['header_super'] == tick['super'] == '/Script/Engine.Actor:ReceiveTick', tick
+                assert twice['child'] and twice['funcmap'] and twice['header_super'] is twice['super'] is None, twice
+            if mod == 'RpcKeep':
+                kept, rpc = function_facts(b, 'ClientPing__Vanilla'), function_facts(b, 'ClientPing')
+                assert kept['child'] and kept['funcmap'] and kept['super'] is None and not kept['flags'] & (FUNC_NETFUNCFLAGS | 0x80000000), kept
+                assert rpc['flags'] & FUNC_NETFUNCFLAGS == 0x01000040 and rpc['child'] and rpc['funcmap'], rpc
+    print('ok  EditTest: every UE_PATCH / UE_ASSET_EDITS edit of the suite\'s packages keeps invariants.py\'s rules; a kept game '
+          'body (a plain function, an RPC\'s without its net flags) and an added function are in Children and FuncMap, '
+          'overriding nothing or the native event they name; each edited CDO ends at its SerialSize')
+
+
+SUPER_DECL = ('class SuperBase : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/SuperTest/SuperBase", "SuperBase_C");\n'
+              '  int32 Count;\n  int32 Bump(int32 By);\n  int32 Twice(int32 By);\n};\n'
+              'class SuperTest : public SuperBase {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/SuperTest/SuperTest", "SuperTest_C");\n'
+              '  int32 Bump(int32 By);\n  int32 Thrice(int32 By);\n};\n')
+TYPES_DECL = ('enum class EPreloadTier : uint8 { Low, High };\nUE_ENUM_IN(EPreloadTier, "/Game/_ElytrasMods/PreloadTypes");\n'
+              'struct FPreloadInner {\n  UE_STRUCT_IN("/Game/_ElytrasMods/PreloadTypes");\n  int32 A;\n};\n'
+              'struct FPreloadOuter {\n  UE_STRUCT_IN("/Game/_ElytrasMods/PreloadTypes");\n  FPreloadInner Inner;\n  EPreloadTier Tier;\n};\n'
+              'class PreloadTypes : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/PreloadTypes/PreloadTypes", "PreloadTypes_C");\n'
+              '  int32 Sum(FPreloadOuter O);\n};\n')
+
+
+def edit_deps_completed():
+    """S38: a function a patch writes into a game package has the preload dependencies FPackage::Save completes for a
+    function of AssetGen's own package (SavePackage.cpp 3962-4140): no edl_* finding the vanilla package lacks.
+    FnOverrideBp adds to SuperTest_C an override of SuperBase_C's Twice, which SuperTest_C did not override: the loader
+    fetches its SuperStruct, a function in the parent Blueprint's package, with bCheckSerialized while it serializes the
+    override (edl_super_serialized). FnTypeLocal replaces PreloadTypes_C's Sum with a body holding a TArray<EPreloadTier>
+    local, a type the game's Sum never named: the function links against the enum while it is serialized, so the enum
+    is serialized first (edl_property_types) and created before the payload naming it is read (edl_payload_created)."""
+    cases = (('FnOverrideBp', 'SuperTest', 'SuperTest/SuperTest', SUPER_DECL + 'class Tweaks : public SuperTest {\n  UE_PATCH;\n'
+              'public:\n  int32 Twice(int32 By) { return By * 3; }\n};\n'),
+             ('FnTypeLocal', 'PreloadTypes', 'PreloadTypes/PreloadTypes', TYPES_DECL + 'class Tweaks : public PreloadTypes {\n'
+              '  UE_PATCH;\npublic:\n  int32 Sum(FPreloadOuter O) {\n    TArray<EPreloadTier> Tiers;\n'
+              '    Tiers.Add(EPreloadTier::High);\n    return Tiers.Num();\n  }\n};\n'))
+    found = []
+    for mod, stand_in, path, body in cases:
+        game = os.path.join(ROOT, stand_in, 'FSD', 'Content')
+        with tempfile.TemporaryDirectory() as tmp:
+            proc, content = compile_edit(tmp, mod, EDIT_HEAD + 'UE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\n%s' % (mod, body), game)
+            assert proc.returncode == 0, mod + ':\n' + proc.stdout + proc.stderr
+            b = os.path.join(content, '_ElytrasMods', *path.split('/'))
+            found += ['%s %s %s: %s' % ((mod,) + f) for f in edit_findings(b, game, set(EDL_RULES))]
+    assert not found, '%d findings, e.g. %s' % (len(found), '; '.join(found[:2]))
+
+
+def edit_whole_containers():
+    """S38: a patch's whole TSet / TMap is what the edited default object loads. Its tag is a delta against the
+    archetype, the parent Blueprint's CDO: the loader copies that value in, takes out the elements the tag lists as
+    removed, then adds the rest (PropertySet.cpp 285-358, PropertyMap.cpp 316-400), as for a mod class's own
+    (prop_set_delta). MapPatch sets PropSetDelta_C's Ids and Score over PropSetBase_C's {1, 2} and {a: 1, c: 3}: to
+    {7} and {a: 9} (every element dropped or changed), then to {1, 7} and {a: 1, b: 2} (some kept as they were). A set
+    or map inside a struct written as tags loads the same way, each member over the archetype's struct's (Class.cpp
+    2775): by a member path (Held.Ids, and Deep.In.Score, where the CDO has no Deep tag of its own) and inside a whole
+    struct (Held, Deep). Written as additions only, the CDO would load the union. What a case does not assign keeps
+    what the unpatched CDO loads."""
+    game = os.path.join(ROOT, 'PropSetDelta', 'FSD', 'Content')
+    decl = ('struct FPropSetHeld {\n  UE_STRUCT_IN("/Game/_ElytrasMods/PropSetDelta");\n  TSet<int32> Ids;\n'
+            '  TMap<FName, int32> Score;\n  int32 N;\n};\n'
+            'struct FPropSetDeep {\n  UE_STRUCT_IN("/Game/_ElytrasMods/PropSetDelta");\n  FPropSetHeld In;\n  int32 M;\n};\n'
+            'class PropSetBase : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/PropSetDelta/PropSetBase", "PropSetBase_C");\n'
+            '  TSet<int32> Ids;\n  TMap<FName, int32> Score;\n  FPropSetHeld Held;\n  FPropSetDeep Deep;\n};\n'
+            'class PropSetDelta : public PropSetBase {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/PropSetDelta/PropSetDelta", "PropSetDelta_C");\n};\n')
+    paths = (('Ids',), ('Score',), ('Held', 'Ids'), ('Held', 'Score'), ('Deep', 'In', 'Ids'), ('Deep', 'In', 'Score'))
+    parent = invariants.Package(os.path.join(game, '_ElytrasMods', 'PropSetDelta', 'PropSetBase'))
+    pc = parent.find('Default__PropSetBase_C')
+
+    def loads(child):
+        cc = child.find('Default__PropSetDelta_C')
+        kinds = {p: 'set' if p[-1] == 'Ids' else 'map' for p in paths}
+        return {p: loaded_container(child, cc, p, kinds[p], loaded_container(parent, pc, p, kinds[p], set() if kinds[p] == 'set' else {}))
+                for p in paths}
+    vanilla = loads(invariants.Package(os.path.join(game, '_ElytrasMods', 'PropSetDelta', 'PropSetDelta')))
+    for body, assigned in (('Ids = {7};\n    Score = {{"a", 9}};', {('Ids',): {7}, ('Score',): {'a': 9}}),
+                           ('Ids = {1, 7};\n    Score = {{"a", 1}, {"b", 2}};', {('Ids',): {1, 7}, ('Score',): {'a': 1, 'b': 2}}),
+                           ('Held.Ids = {7};\n    Deep.In.Score = {{"a", 9}};', {('Held', 'Ids'): {7}, ('Deep', 'In', 'Score'): {'a': 9}}),
+                           ('Held = {{1, 7}, {{"a", 1}, {"b", 2}}, 3};\n    Deep = {{{7}, {{"c", 3}}, 3}, 4};',
+                            {('Held', 'Ids'): {1, 7}, ('Held', 'Score'): {'a': 1, 'b': 2}, ('Deep', 'In', 'Ids'): {7},
+                             ('Deep', 'In', 'Score'): {'c': 3}})):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc, content = compile_edit(tmp, 'MapPatch', EDIT_HEAD + 'UE_MOD_PACKAGE("/Game/_ElytrasMods/MapPatch");\n' + decl
+                                         + 'class Tweaks : public PropSetDelta {\n  UE_PATCH;\n'
+                                         '  UE_DEFAULTS {\n    ' + body + '\n  }\n};\n', game)
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+            got = loads(invariants.Package(os.path.join(content, '_ElytrasMods', 'PropSetDelta', 'PropSetDelta')))
+        want = {**vanilla, **assigned}
+        assert got == want, 'the patched CDO loads %s; the patch says %s, so it should load %s' % (got, body, want)
+
+
+GRUNT = '#include "UeApi/Game/ENE_Spider_Grunt_Normal_C.h"\n'
+GRUNT_PKGS = ['Enemies/Spider/Grunt/ED_Spider_Grunt', 'Enemies/Spider/Grunt/ENE_Spider_Grunt_Normal']
+GRUNT_KEEP = ('class GruntCount : public ENE_Spider_Grunt_Normal_C {\n  UE_PATCH;\n'
+              '  void GetEnemySpawnedCount(int& SpawnCount) {\n'
+              '    ENE_Spider_Grunt_Normal_C::GetEnemySpawnedCount(SpawnCount);\n    SpawnCount = SpawnCount + 41;\n  }\n};\n')
+
+
+def game_edit_cases():
+    """game_edits()'s edits of the game's own packages, split by kind, as (mod, the UeApi include, the edited packages'
+    paths under /Game, source after the includes)."""
+    return (
+        ('GruntDefaults', GRUNT, GRUNT_PKGS,
+         'UE_ASSET_AT(UEnemyDescriptor, ED_Spider_Grunt, "/Game/Enemies/Spider/Grunt/ED_Spider_Grunt");\n'
+         'UE_ASSET_EDIT(ED_Spider_Grunt) {.SpawnSpread = 800.0f, .IdealSpawnSize = 12};\n'
+         'class GruntTweaks : public ENE_Spider_Grunt_Normal_C {\n  UE_PATCH;\n'
+         '  UE_DEFAULTS {\n    CustomTimeDilation = 0.5f;\n    HealthComponent->MaxHealth = 180.0f;\n'
+         '    MeleeAttack->CenterOnTarget = true;\n    enemy->mixerName = "Grunty";\n  }\n};\n'),
+        ('GruntPathsInv', GRUNT, GRUNT_PKGS,
+         'UE_ASSET_AT(UAnimMontage, ANIM_Spider_Grunt_Attack_I, "/Game/Enemies/Spider/Animation/ANIM_Spider_Grunt_Attack_I");\n'
+         'UE_ASSET_AT(UParticleSystem, P_SpiderGrunt_Armor_Debris, "/Game/Enemies/Spider/Particles/P_SpiderGrunt_Armor_Debris");\n'
+         'class GruntPaths : public ENE_Spider_Grunt_Normal_C {\n  UE_PATCH;\n  UE_DEFAULTS {\n'
+         '    PrimaryActorTick.bCanEverTick = true;\n    MeleeAttack->Montages[0] = &ANIM_Spider_Grunt_Attack_I;\n'
+         '    SimpleArmorDamage->ArmorBreakEffects.DissolveParticles[0] = &P_SpiderGrunt_Armor_Debris;\n  }\n};\n'
+         'UE_ASSET_AT(UEnemyDescriptor, ED_Spider_Grunt, "/Game/Enemies/Spider/Grunt/ED_Spider_Grunt");\n'
+         'UE_ASSET_EDITS { ED_Spider_Grunt.SpawnRarityModifiers[1].Rarity = 2.0f; }\n'),
+        ('GruntReplace', GRUNT, GRUNT_PKGS[1:],
+         'class GruntCount : public ENE_Spider_Grunt_Normal_C {\n  UE_PATCH;\n'
+         '  void GetEnemySpawnedCount(int& SpawnCount) { SpawnCount = 42; }\n};\n'),
+        ('GruntKeep', GRUNT, GRUNT_PKGS[1:], GRUNT_KEEP))
+
+
+def edit_invariants_game():
+    """CLS-G11 on the game (--game): the edits game_edits() makes to ED_Spider_Grunt and the grunt Blueprint - its CDO,
+    a native subobject, its own and an inherited component's templates, a function replaced with and without its game
+    body kept, paths into four values - add no finding of invariants.py's to what the game's own packages have; the
+    kept body is listed in Children and FuncMap, overriding nothing; each edited CDO ends at its SerialSize."""
+    if not GAME or not os.path.exists(os.path.join(UEAPI, 'Game', 'ENE_Spider_Grunt_Normal_C.h')):
+        print('--  S38 edits keep the invariants on the game\'s packages: skipped (needs --game and UeApi/Game)')
+        return
+    for mod, header, rels, body in game_edit_cases():
+        with tempfile.TemporaryDirectory() as tmp:
+            proc, content = compile_edit(tmp, mod, EDIT_HEAD + header + 'UE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\n%s' % (mod, body), GAME)
+            assert proc.returncode == 0, mod + ':\n' + proc.stdout + proc.stderr
+            for rel in rels:
+                keeps_edit_invariants(os.path.join(content, *rel.split('/')), GAME)
+            b = os.path.join(content, 'Enemies', 'Spider', 'Grunt', 'ENE_Spider_Grunt_Normal')
+            assert cdo_ends_at_serial_size(b), (mod, 'the edited CDO does not end at its SerialSize')
+            if mod == 'GruntKeep':
+                kept = function_facts(b, 'GetEnemySpawnedCount__Vanilla')
+                assert kept['child'] and kept['funcmap'] and kept['super'] is None and kept['header_super'] is None, kept
+                was = function_facts(os.path.join(GAME, *GRUNT_PKGS[1].split('/')), 'GetEnemySpawnedCount')
+                assert function_facts(b, 'GetEnemySpawnedCount') == was
+    print('ok  S38 on the game: the grunt\'s default, component, path and asset edits and a function replaced with and '
+          'without its game body add no invariants.py finding to the game\'s packages; the kept body is listed, '
+          'overriding nothing; each edited CDO ends at its SerialSize')
+
+
+def kept_body_locals():
+    """A kept game body (<Fn>__Vanilla, a byte copy of the replaced function) reads its parameters through its own
+    properties. The copy keeps the original's bytecode, whose EX_LocalVariable / EX_LocalOutVariable operands must be
+    re-owned: left naming the replaced function's properties (the operand's FFieldPath owner is resolved as written,
+    FieldPath.cpp:256-270), an out parameter is never found - the copy's frame records each out parameter under the
+    copy's own property (ScriptCore.cpp:851-906, the list null-terminated), and execLocalOutVariable walks it for the
+    replaced function's, off its end (2170-2185, checkSlow only): the Parent:: call crashes the game. GruntKeep
+    (GetEnemySpawnedCount(int& SpawnCount), --game) and RpcKeep (ClientPing(int32 Seq)) keep bodies that read a
+    parameter; local_operands must find nothing on either."""
+    cases = [('RpcKeep', os.path.join(ROOT, 'ReplTest', 'FSD', 'Content'), '_ElytrasMods/ReplTest/ReplTest', RPC_KEEP)]
+    if GAME and os.path.exists(os.path.join(UEAPI, 'Game', 'ENE_Spider_Grunt_Normal_C.h')):
+        cases.insert(0, ('GruntKeep', GAME, GRUNT_PKGS[1], GRUNT + GRUNT_KEEP))
+    found = []
+    for mod, game, rel, body in cases:
+        with tempfile.TemporaryDirectory() as tmp:
+            proc, content = compile_edit(tmp, mod, EDIT_HEAD + 'UE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\n%s' % (mod, body), game)
+            assert proc.returncode == 0, mod + ':\n' + proc.stdout + proc.stderr
+            b = os.path.join(content, *rel.split('/'))
+            assert any(e['name'].endswith('__Vanilla') for e in invariants.Package(b).exports), (mod, 'no kept body')
+            found += ['%s %s: %s' % (mod, f[1], f[2]) for f in edit_findings(b, game, {'local_operands'})]
+    assert not found, '; '.join(found)
+
+
+def added_tick_can_tick():
+    """A ReceiveTick a patch adds to a Blueprint that cannot tick turns ticking on, as the editor's compiler does for a
+    ReceiveTick event (KismetCompiler.cpp:4738-4800: the CDO's PrimaryActorTick.bCanEverTick) and as AssetGen does for
+    a class of its own (Blueprint.cpp:336-352). The runtime registers an actor's tick only when bCanEverTick is set
+    (Actor.cpp:914-925), and AActor leaves it off (Actor.cpp:99): CompTest, a direct AActor child whose default object
+    sets no PrimaryActorTick, would never run the added ReceiveTick. Passes when the edited CDO sets
+    PrimaryActorTick.bCanEverTick, or the patch is refused naming ReceiveTick."""
+    from dumptags import tags as read_tags
+    game = os.path.join(ROOT, 'CompTest', 'FSD', 'Content')
+    with tempfile.TemporaryDirectory() as tmp:
+        proc, content = compile_edit(tmp, 'EditAddTick', EDIT_HEAD + 'UE_MOD_PACKAGE("/Game/_ElytrasMods/EditAddTick");\n' + COMP_DECL
+                                     + 'class Tweaks : public CompTest {\n  UE_PATCH;\n'
+                                     '  void ReceiveTick(float DeltaSeconds) { Ticks = Ticks + 1; }\n};\n', game)
+        if proc.returncode:
+            assert 'ReceiveTick' in proc.stdout, 'refused, but not for ReceiveTick: ' + proc.stdout
+            return
+        b = os.path.join(content, '_ElytrasMods', 'CompTest', 'CompTest')
+        pkg = invariants.Package(b)
+        c = next(i for i, st in invariants.classes(pkg))
+        assert pkg.path(pkg.struct(c).super) == '/Script/Engine.Actor' and function_facts(b, 'ReceiveTick')['funcmap']
+        cdo = pkg.struct(c).cdo - 1
+        before = invariants.Package(os.path.join(game, '_ElytrasMods', 'CompTest', 'CompTest'))
+        cb = next(i for i, st in invariants.classes(before))
+        assert not before.tag(before.struct(cb).cdo - 1, 'PrimaryActorTick'), 'the stand-in could tick before the patch'
+        t = pkg.tag(cdo, 'PrimaryActorTick')
+        lines = []
+        if t: read_tags(t['value'], 0, len(t['value']), pkg.names, 0, lines)
+        assert any(l.startswith('bCanEverTick [0] BoolProperty') and 'value=1' in l for l in lines), \
+            'the patch adds ReceiveTick, and the CDO sets no PrimaryActorTick.bCanEverTick: %s' % (lines or 'no PrimaryActorTick tag')
+
+
+GLOW = '#include "UeApi/Game/PRJ_NormalBlasterShot_C.h"\n'
+BLASTER = 'WeaponsNTools/ChargeBlaster/PRJ_NormalBlasterShot'
+
+
+def component_record(base, template):
+    """(kind, bHasValidCookedData, the ChangedPropertyList's root names) of the SCS node or override record whose template
+    is the export `template`, and that template's tags as {name: value bytes}."""
+    pkg = invariants.Package(base)
+    data = edits_rules.component_data
+    for kind, i, c, tmpl, key, valid, lst in data(pkg):
+        if tmpl > 0 and pkg.exports[tmpl - 1]['name'] == template:
+            cls = pkg.exports[tmpl - 1]['cls']
+            return kind, valid, {n for n, _, s in lst if s == cls}, {t['name']: t['value'] for t in pkg.tags(tmpl - 1)}
+    return None
+
+
+def edit_listed_component():
+    """BPGC-G25, the half that works: an edit of a property a component's cooked instancing data already lists reaches
+    spawned components, since the fast path copies every listed property from the template. PRJ_NormalBlasterShot's
+    PointLight node has valid cooked data listing Intensity; the patch rewrites the template's Intensity tag, keeps the
+    data valid and listing it, and the cooked-data rules find nothing new against the game's package."""
+    if not GAME or not os.path.exists(os.path.join(UEAPI, 'Game', 'PRJ_NormalBlasterShot_C.h')):
+        print('--  S38 edit of a listed component property: skipped (needs --game and UeApi/Game)')
+        return
+    import struct
+    with tempfile.TemporaryDirectory() as tmp:
+        proc, content = compile_edit(tmp, 'BlasterGlow', EDIT_HEAD + GLOW + 'UE_MOD_PACKAGE("/Game/_ElytrasMods/BlasterGlow");\n'
+                                     'class BlasterGlow : public PRJ_NormalBlasterShot_C {\n  UE_PATCH;\n'
+                                     '  UE_DEFAULTS { PointLight->Intensity = 5000.0f; }\n};\n', GAME)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        b = os.path.join(content, *BLASTER.split('/'))
+        kind, valid, listed, tags = component_record(b, 'PointLight_GEN_VARIABLE')
+        assert kind == 'scs' and valid and 'Intensity' in listed and struct.unpack('<f', tags['Intensity'])[0] == 5000.0, (kind, valid, listed)
+        assert component_record(os.path.join(GAME, *BLASTER.split('/')), 'PointLight_GEN_VARIABLE')[:3] == (kind, valid, listed)
+        keeps_edit_invariants(b, GAME)
+    print('ok  S38: a patch of a component property its cooked instancing data lists keeps the data valid and listing it')
+
+
+PUMPKIN = 'Art/Environments/Holiday_Halloween/BP_PumpkinFace_Item'
+
+
+def edit_bound_names():
+    """BPGC-G28: a patch replacing functions a timeline calls by name keeps every name the timeline and the class's
+    component bindings bind resolving, to the same export. BP_PumpkinFace_Item's Timeline_0 binds Timeline_0__UpdateFunc
+    and Timeline_0__FinishedFunc, its ComponentDelegateBinding two BndEvt__ events. The patch replaces both timeline
+    functions (the update one around its game body, kept as __Vanilla): timeline_names_resolve and
+    dynamic_binding_names_resolve still pass, every FuncMap entry the game had names the export it named, and the bound
+    functions still take no parameter."""
+    if not GAME or not os.path.exists(os.path.join(UEAPI, 'Game', 'BP_PumpkinFace_Item_C.h')):
+        print('--  S38 patch of timeline functions: skipped (needs --game and UeApi/Game)')
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        proc, content = compile_edit(tmp, 'PumpkinTimeline', EDIT_HEAD + '#include "UeApi/Game/BP_PumpkinFace_Item_C.h"\n'
+                                     'UE_MOD_PACKAGE("/Game/_ElytrasMods/PumpkinTimeline");\n'
+                                     'class PumpkinTimeline : public BP_PumpkinFace_Item_C {\n  UE_PATCH;\n'
+                                     '  void Timeline_0__UpdateFunc() { BP_PumpkinFace_Item_C::Timeline_0__UpdateFunc(); }\n'
+                                     '  void Timeline_0__FinishedFunc() { }\n};\n', GAME)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        b, a = os.path.join(content, *PUMPKIN.split('/')), os.path.join(GAME, *PUMPKIN.split('/'))
+        names = {'timeline_names_resolve', 'dynamic_binding_names_resolve'}
+        assert not invariants.check(invariants.Package(a), names), 'the game\'s own package breaks them'
+        assert not invariants.check(invariants.Package(b), names), invariants.check(invariants.Package(b), names)
+        keeps_edit_invariants(b, GAME)
+        for fn in ('Timeline_0__UpdateFunc', 'Timeline_0__FinishedFunc'):
+            assert function_facts(b, fn) == function_facts(a, fn), fn
+        assert function_facts(b, 'Timeline_0__UpdateFunc__Vanilla')['funcmap']
+        pa, pb = invariants.Package(a), invariants.Package(b)
+        fm = lambda p: dict(p.struct(next(i for i, st in invariants.classes(p))).func_map)
+        assert {k: v for k, v in fm(pb).items() if k in fm(pa)} == fm(pa), 'a name the game bound moved'
+        assert not [p for p in pb.struct(fm(pb)['Timeline_0__UpdateFunc'] - 1).props if p.flags & 0x80], 'the update function takes parameters'
+    print('ok  S38: a patch of the functions a timeline binds by name keeps each bound name resolving to its export, parameterless')
+
+
+def edit_cooked_unlisted(mod, header, rel, member, template, body):
+    """BPGC-G25: a patch of a component property that the component's valid cooked instancing data does not list. A
+    spawned actor builds that component on the fast path (NewObject of its class, then only the listed properties
+    copied from the template), so the edit must list the property, clear bHasValidCookedData, or be refused - never
+    ship a template edit the fast path drops. Passes when the edit is refused naming the member, or is written (the
+    tag holds the new value) with no finding of the cooked-data rules against the game's package."""
+    def test():
+        with tempfile.TemporaryDirectory() as tmp:
+            proc, content = compile_edit(tmp, mod, EDIT_HEAD + '#include "UeApi/Game/%s"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\n%s'
+                                         % (header, mod, body), GAME)
+            if proc.returncode:
+                assert member in proc.stdout, 'refused, but not for the member: ' + proc.stdout
+                return
+            b = os.path.join(content, *rel.split('/'))
+            got = component_record(b, template)
+            assert got and member in got[3], (got, 'the edit is not in the template')
+            found = edit_findings(b, GAME, COOKED_RULES)
+            assert not found, '%s: %s' % found[0][::2]
+    return test
+
+
+def edit_cooked_unlisted_cases():
+    if not GAME or not os.path.exists(os.path.join(UEAPI, 'Game', 'PRJ_NormalBlasterShot_C.h')):
+        print('--  S38 edits of components with cooked instancing data: skipped (needs --game and UeApi/Game)')
+        return
+    edit_cooked_unlisted('EditCookedScs', 'PRJ_NormalBlasterShot_C.h', BLASTER, 'SourceRadius', 'PointLight_GEN_VARIABLE',
+                         'class EditCookedScs : public PRJ_NormalBlasterShot_C {\n  UE_PATCH;\n'
+                         '  UE_DEFAULTS { PointLight->SourceRadius = 12.0f; }\n};\n')()
+    print('ok  EditCookedScs: a patch of an SCS template property its valid cooked data does not list leaves '
+          'no stale cooked data')
+    edit_cooked_unlisted('EditCookedIch', 'PRJ_PatrolBotLaser_Flying_C.h',
+                         'Enemies/RivalTech/PatrolBot/Projectiles/PRJ_PatrolBotLaser_Flying', 'bReceivesDecals',
+                         'Body_GEN_VARIABLE',
+                         'class EditCookedIch : public PRJ_PatrolBotLaser_Flying_C {\n  UE_PATCH;\n'
+                         '  UE_DEFAULTS { Body->bReceivesDecals = false; }\n};\n')()
+    print('ok  EditCookedIch: a patch of an override record\'s template property its valid cooked data does not list '
+          'leaves no stale cooked data')
+
+
+if not globals().get('EDITS_EXPLORE'):     # set by the dev loop's exploration driver, which reuses the cases above
+    edit_invariants_suite()
+    edit_invariants_game()
+    kept_body_locals()
+    print('ok  S38: a kept game body (<Fn>__Vanilla) reads its parameters, an out parameter included, through its own '
+          'properties, not the replaced function\'s')
+    added_tick_can_tick()
+    print('ok  EditAddTick: a ReceiveTick a patch adds to a Blueprint that cannot tick sets PrimaryActorTick.bCanEverTick '
+          'on its CDO')
+    edit_listed_component()
+    edit_bound_names()
+    edit_cooked_unlisted_cases()
+    edit_deps_completed()
+    print('ok  EditDeps: a patch\'s added override and replaced function get the preload dependencies the cook '
+          'completes: the super serialized first, a new local\'s type serialized and created first')
+    edit_whole_containers()
+    print('ok  MapPatch: a patch\'s whole TSet / TMap loads as written, a property or one inside a struct (by a member '
+          'path or in a whole struct): the archetype\'s elements it drops are listed as removed')
+
+
+PREFETCH.finish()
+print('ok  %d known gaps, each a failing test of something AssetGen does not do yet' % len(GAPS))
+assert not FIXED, 'these pass now, move them in with the others: ' + ', '.join(FIXED)

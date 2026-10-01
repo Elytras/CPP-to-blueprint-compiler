@@ -151,6 +151,13 @@ FPropertyDef DispatcherParam(const std::string& Name, FIndex Signature, uint64 E
                          | CPF_BlueprintCallable | ExtraFlags, Signature };
 }
 
+/* FScriptDelegate: the bound object's FWeakObjectPtr and the function's FName, 16 bytes, the signature as the tail. */
+FPropertyDef DelegateParam(const std::string& Name, FIndex Signature, uint64 ExtraFlags)
+{
+    return FPropertyDef{ "DelegateProperty", Name, RF_Public, 1, 16,
+                         CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, Signature };
+}
+
 bool IsAscii(const std::string& Utf8)
 {
     return std::all_of(Utf8.begin(), Utf8.end(), [](char C) { return uint8(C) < 0x80; });
@@ -199,6 +206,21 @@ void DefaultRefs(const FDefaultValue& D, std::vector<int32>& Out)
     if (D.Members) for (const FPropertyDef& M : *D.Members) DefaultRefs(M.Default, Out);
 }
 
+/* UStruct::GetPreloadDependencies asks each property for these (Class.cpp 732-735): a struct property's struct, a byte
+   or enum property's enum, and through an array, set or map its element properties - not an enum property's
+   underlying one (PropertyStruct.cpp 183-187, PropertyByte.cpp 33-37, EnumProperty.cpp 366-371, PropertyArray.cpp
+   41-48, PropertySet.cpp 248-255, PropertyMap.cpp 289-300). The owner links them while it is serialized: a struct's
+   PropertiesSize becomes the property's ElementSize (PropertyStruct.cpp 91-103), an enum's names are read. */
+void TypeRefs(const FPropertyDef& P, std::vector<int32>& Out)
+{
+    if ((P.Type == "StructProperty" || P.Type == "ByteProperty" || P.Type == "EnumProperty") && P.Extra.V != 0
+        && std::find(Out.begin(), Out.end(), P.Extra.V) == Out.end())
+        Out.push_back(P.Extra.V);
+    if (P.Type == "ArrayProperty" || P.Type == "SetProperty" || P.Type == "MapProperty")
+        for (const std::shared_ptr<FPropertyDef>& Element : { P.Inner, P.Value })
+            if (Element) TypeRefs(*Element, Out);
+}
+
 namespace
 {
 /* D as P's value, without a tag: a tag's payload, or one array element. */
@@ -233,9 +255,12 @@ void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
         { V.Name(D.K == FDefaultValue::Str && !D.S.empty() ? D.S : std::string("None")); V.I32(0); }
         else if (P.Type == "SetProperty" || P.Type == "MapProperty")
         {
-            /* Removed count, count, then the elements; a map's Items alternate key, value. */
+            /* The removed elements (a map's keys), then the count and the elements; a map's Items alternate key, value.
+               Only an inherited one has any to remove: the loader reads it over the parent's value (PropertySet.cpp
+               285-358, PropertyMap.cpp 316-400), a class's own over an empty one. */
             const bool bMap = P.Type == "MapProperty" && P.Value;
-            V.I32(0);
+            V.I32(int32(D.Removed.size()));
+            if (P.Inner) for (const FDefaultValue& Gone : D.Removed) WriteValue(V, *P.Inner, Gone);
             V.I32(int32(D.Items.size() / (bMap ? 2 : 1)));
             if (P.Inner)
                 for (size_t I = 0; I < D.Items.size(); ++I)
@@ -364,8 +389,8 @@ void WriteProperty(FArc& Ar, const FPropertyDef& P, bool bUncooked)
         Ar.Idx(P.Extra);                // PropertyClass
     else if (P.Type == "InterfaceProperty")
         Ar.Idx(P.Extra);                // InterfaceClass
-    else if (P.Type == "MulticastInlineDelegateProperty")
-        Ar.Idx(P.Extra);                // SignatureFunction
+    else if (P.Type == "MulticastInlineDelegateProperty" || P.Type == "DelegateProperty")
+        Ar.Idx(P.Extra);                // SignatureFunction (PropertyDelegate.cpp 161-175)
     else if (P.Type == "ClassProperty" || P.Type == "SoftClassProperty")
     {
         Ar.Idx(P.Extra);                // PropertyClass = UClass
@@ -375,13 +400,15 @@ void WriteProperty(FArc& Ar, const FPropertyDef& P, bool bUncooked)
         Ar.Idx(P.Extra);                // Struct
     else if (P.Type == "BoolProperty")
     {
-        // Whole-byte bool, not a bitfield.
+        /* A native C++ bool, as the editor makes every Blueprint bool (SetBoolSize(sizeof(bool), true),
+           KismetCompilerMisc.cpp 1056-1061): the loader rebuilds it from BoolSize and NativeBool alone, and NativeBool 0
+           would load a one-bit bitfield (PropertyBool.cpp 61-91), neither POD nor zero-constructed. */
         Ar.U8(1);                       // FieldSize
         Ar.U8(0);                       // ByteOffset
         Ar.U8(1);                       // ByteMask
         Ar.U8(0xFF);                    // FieldMask
         Ar.U8(1);                       // BoolSize
-        Ar.U8(0);                       // NativeBool
+        Ar.U8(1);                       // NativeBool
     }
     else if (P.Type == "ByteProperty")
         Ar.Idx(P.Extra);                // Enum
@@ -397,7 +424,6 @@ void WriteProperty(FArc& Ar, const FPropertyDef& P, bool bUncooked)
         WriteProperty(Ar, *P.Inner, bUncooked);    // KeyProp
         WriteProperty(Ar, *P.Value, bUncooked);    // ValueProp
     }
-    // TODO: unimplemented tail - DelegateProperty (SignatureFunction).
 }
 
 /* ---- bytecode ---- */
@@ -818,6 +844,11 @@ int32 AddFunctionExport(FPackage& P, const FFunctionDef& Def, FIndex OwnerClass,
     // and no SerBeforeCreate for class/template (unlike every other export).
     E.CreateBeforeSer = BytecodeRefs;
     E.CreateBeforeCreate = { OwnerClass.V };
+    /* UStruct::GetPreloadDependencies (Class.cpp 719-735), which the cook lists as serialize-before-serialize: the
+       function it overrides - fetched with bCheckSerialized while this one is serialized (AsyncLoading.cpp 3149-3162) -
+       and the structs and enums its parameters and locals are typed by. */
+    if (Def.Super.V != 0) E.SerBeforeSer.push_back(Def.Super.V);
+    for (const FPropertyDef& Prop : Def.Params) TypeRefs(Prop, E.SerBeforeSer);
 
     const FFunctionDef Captured = Def;
     E.Serialize = [Captured, Body](FArc& Ar) {
