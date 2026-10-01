@@ -7229,6 +7229,36 @@ print('ok  ValueInitScalar: braces or T() around an enum, a number or a pointer 
       '{} for a struct, container or name member is its fresh value, not the default; an empty container is a value')
 
 
+def defaults_zero():
+    """UE_DEFAULTS over a parent's non-zero defaults, each member set to its type's zero by `{}`, `T()` or `nullptr`: a
+    subclass's default object deltas against its parent's, so each zero is a tag the loader reads over the parent's
+    value, as `Count = 0;` writes one. A UE_STRUCT's `{}` or `T()` is its own defaults, an engine struct's its zeros."""
+    import struct
+    base = pending_asset('DefaultsZero')
+    keeps_invariants(base)
+    pkg = invariants.Package(base)
+    cdo = pkg.find('Default__DefaultsZero_C')
+    tags = {t['name']: t for t in pkg.tags(cdo)}
+    assert set(tags) == {'Count', 'Rate', 'bOn', 'Rule', 'Who', 'Tag', 'Text', 'Ids', 'V', 'In', 'More', 'W', 'Kept'}, sorted(tags)
+    assert struct.unpack('<i', tags['Count']['value'])[0] == 0, tags['Count']
+    assert struct.unpack('<f', tags['Rate']['value'])[0] == 0.0, tags['Rate']
+    assert tags['bOn']['bool'] == 0, tags['bOn']
+    assert fname_at(pkg.names, tags['Rule']['value'], 0) == 'eattachmentrule::keeprelative', tags['Rule']
+    assert struct.unpack('<i', tags['Who']['value'])[0] == 0, tags['Who']
+    assert fname_at(pkg.names, tags['Tag']['value'], 0) == 'none', tags['Tag']
+    assert struct.unpack('<i', tags['Text']['value'][:4])[0] == 0, tags['Text']
+    for name in ('Ids', 'More'):
+        assert struct.unpack('<i', tags[name]['value'][:4])[0] == 0, tags[name]
+    for name in ('V', 'W'):
+        assert struct.unpack('<ff', tags[name]['value']) == (0.0, 0.0), tags[name]
+    for name in ('In', 'Kept'):
+        inner = {u['name'].split('_')[0]: u for u in pkg.tags(cdo, tags[name]['at'])}
+        assert [struct.unpack('<i', inner[n]['value'])[0] for n in ('P', 'Q')] == [1, 2], (name, inner)
+
+
+pending('DefaultsZero: UE_DEFAULTS\' {} / T() / nullptr over a parent\'s default is the type\'s zero', defaults_zero)
+
+
 def tenum_value_init():
     """TEnumValueInit: `{}` and `TEnum<E>()` are a TEnum<E>'s zero enumerator, as they are an E's: assigned (Held's
     default is Two, Rule's KeepWorld), passed, returned, as a struct literal's member over a non-zero default (P One,
