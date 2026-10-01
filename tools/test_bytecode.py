@@ -5227,6 +5227,12 @@ def opnd_ref_args():
                 assert (got, mine) == (want, theirs), (fn, parms, start, got, want, mine, theirs)
                 n += 1
     print('ok  OpndRefArgs: reference arguments reach the callee as the local, member, struct member, array element  (%d cases)' % n)
+    # ReadLate: PeekAfter(Member, SetMember(V + 5)) - the const reference is Member itself, read when PeekAfter runs.
+    for v in (0, 7, -40):
+        mine = fields(Member=3)
+        got = run(base, 'ReadLate', self_vars=mine, V=v)[0]
+        assert (got, mine['Member']) == (wrap((v + 5) * 10 + 1), v + 5), ('ReadLate', v, got, mine)
+    print('ok  OpndRefArgs.ReadLate: a const reference argument is read when the callee runs, after the arguments after it')
     # On another object: Virt is found on Other's class by name and runs there, Other->Member is Other's, and the
     # argument Member + X is read on this object (the arguments of a call under EX_Context run on the caller).
     for mine, theirs, x in ((3, 40, 5), (0, -2, 7)):
