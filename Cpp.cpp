@@ -12899,7 +12899,10 @@ bool FrozenDroppedAstKey(const std::string& K)
    it as before, and the keys FAstSax keeps or drops by context (range, end, isImplicit, isUsed, isReferenced) pass
    through for it to decide.
    Feed takes the dump in pieces cut anywhere, inside a token too: the state carries over to the next call. The values
-   it skips are not checked, which is safe only because clang's JSON writer never writes a malformed one. */
+   it skips are not checked, and neither is the JSON around what it keeps: it drops whitespace between any two tokens,
+   so `[1 2]` would come out as `[12]`, and holds an object's commas back for the next kept key, so `{"a":1,}` would
+   come out valid. All of that is safe only because clang's JSON writer never writes a malformed dump; astcheck reports
+   one as `the filter's output parses, but the dump does not`. */
 class FDumpFilter
 {
 public:
