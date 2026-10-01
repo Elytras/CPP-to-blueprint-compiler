@@ -7112,6 +7112,32 @@ print('ok  ValueInitScalar: braces or T() around an enum, a number or a pointer 
       '{} for a struct, container or name member is its fresh value, not the default; an empty container is a value')
 
 
+def tenum_value_init():
+    """TEnumValueInit: `{}` and `TEnum<E>()` are a TEnum<E>'s zero enumerator, as they are an E's: assigned (Held's
+    default is Two, Rule's KeepWorld), passed, returned, as a struct literal's member over a non-zero default (P One,
+    R KeepWorld; a member left out keeps its default), as an array's element, as a conditional's arm, and as a game
+    function's TEnum<E> arguments."""
+    base = pending_asset('TEnumValueInit')
+    keeps_invariants(base)
+    for fn, want in (('Assign', lambda m: m), ('AssignParens', lambda m: m), ('Arg', lambda m: 300 + m),
+                     ('Return', lambda m: m), ('Literal', lambda m: (m + 1) * 10), ('Designated', lambda m: 350 + m),
+                     ('Kept', lambda m: 351 + m), ('Elements', lambda m: 20 + m), ('Choose', lambda m: 0 if m == 0 else 2)):
+        for m in (0, 3):
+            got = run(base, fn, {'Held': 2, 'Rule': 1}, M=m)[0]
+            assert got == want(m), 'TEnumValueInit.%s(%d) = %r, want %r' % (fn, m, got, want(m))
+    runscript.MATH['K2_DetachFromActor'] = lambda *a: None
+    try:
+        del runscript.CALLS[:]
+        run(base, 'Detach')
+        assert runscript.CALLS == [('K2_DetachFromActor', (0, 0, 0))], runscript.CALLS
+    finally:
+        del runscript.MATH['K2_DetachFromActor']
+
+
+pending('TEnumValueInit: {} and TEnum<E>() are the zero enumerator wherever a TEnum<E> is assigned, passed or returned',
+        tenum_value_init)
+
+
 # -- pending
 
 for _mod, _body in (('PropSetBool', '  TSet<bool> Flags;\n'), ('PropMapBool', '  TMap<bool, int32> ByFlag;\n'),
