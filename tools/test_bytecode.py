@@ -6224,22 +6224,29 @@ def comp_attach_root():
     to that root (SimpleConstructionScript.cpp 686). With none to inherit, the root is the first of the class's own
     scene components left alone, Base though Glow is declared first (RootOwn), and with none of those the
     DefaultSceneRoot node, which keeps Glow as its child, as the editor saves a component added under it
-    (CompAttachRoot). Glow sits 30 above the root, and RootOwn's Base hands its own 50 on to it."""
+    (CompAttachRoot). Glow sits 30 above the root, and RootOwn's Base hands its own 50 on to it. At a socket
+    (RootSock), the node keeps it as AttachToName, which ExecuteNodeOnActor passes to SetupAttachment (SCS_Node.cpp
+    152)."""
     base = asset('CompAttachRoot')
     folder = os.path.dirname(base)
     for cls, root in (('RootKid', 'Root'), ('RootOwn', 'Base'), ('CompAttachRoot', 'DefaultSceneRoot')):
         got, attach, made, stored = construct(os.path.join(folder, cls))
         assert (got, attach.get('Glow')) == (root, root), '%s: the root is %s and Glow attaches to %s' % (cls, got, attach.get('Glow'))
-    p, ci = class_pkg(os.path.join(folder, 'RootChar'))
-    si, nodes, roots, dsr = comp.scs(p, ci)
-    glow = node_named(p, ci, 'Glow')
-    assert glow.index in roots and glow.parent == 'None', (glow.parent, [nodes[r].name for r in roots])
+    for cls, socket in (('RootChar', None), ('RootSock', 'Sock')):
+        p, ci = class_pkg(os.path.join(folder, cls))
+        si, nodes, roots, dsr = comp.scs(p, ci)
+        glow = node_named(p, ci, 'Glow')
+        assert glow.index in roots and glow.parent == 'None', (cls, glow.parent, [nodes[r].name for r in roots])
+        at = comp.tags_at(p, glow.index).get('AttachToName')
+        assert (at and comp.tag_name(p, at)) == socket, '%s: Glow attaches at socket %r, want %r' % (
+            cls, at and comp.tag_name(p, at), socket)
+    keeps_invariants(os.path.join(folder, 'RootSock'))
     for cls, want in (('RootChar', 30.0), ('RootKid', 30.0), ('RootOwn', 80.0), ('CompAttachRoot', 30.0)):
         p, ci = class_pkg(os.path.join(folder, cls))
         assert world_location(p, ci, 'Glow') == (0.0, 0.0, want), (cls, world_location(p, ci, 'Glow'))
         keeps_invariants(os.path.join(folder, cls))
     print('ok  CompAttachRoot: SetupAttachment(RootComponent) puts a component under the actor\'s root, inherited, own or '
-          'the default one')
+          'the default one, at a socket of it')
 
 
 comp_attach_root()

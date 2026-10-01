@@ -11,7 +11,8 @@ call does. Below a parent that gives the actor a root, ACharacter's capsule or a
 root node naming no parent, which ExecuteScriptOnActor attaches to that root (SimpleConstructionScript.cpp 686). With
 none to inherit, the root is the first of the class's own scene components left alone, Base though Glow is declared
 first; with none of those, the DefaultSceneRoot node, which keeps Glow as its child, as the editor saves a component
-added under it. Glow sits 30 above the root in each, and RootOwn's Base hands its own 50 on to it.
+added under it. Glow sits 30 above the root in each, and RootOwn's Base hands its own 50 on to it. RootSock attaches
+Glow at a socket of the root, which its node keeps as AttachToName.
 */
 class RootChar : public ACharacter {
 public:
@@ -21,6 +22,13 @@ public:
     Glow->SetupAttachment(RootComponent);
     Glow->RelativeLocation = FVector(0.0f, 0.0f, 30.0f);
   }
+};
+
+class RootSock : public ACharacter {
+public:
+  UE_COMPONENT(UPointLightComponent, Glow);
+
+  UE_DEFAULTS { Glow->SetupAttachment(RootComponent, FName("Sock")); }
 };
 
 class RootBase : public AActor {
