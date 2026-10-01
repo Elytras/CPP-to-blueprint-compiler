@@ -5153,6 +5153,27 @@ print('ok  FuncIfaceUnnamed: an inherited function with an unnamed parameter is 
       'or final, is refused in the interface\'s terms')
 
 
+def iface_over_stub_sig():
+    """A mod ancestor that lists a mod interface and leaves its function out has the stub of it, and that stub is the
+    parent function of any function of its name below (ParentClass->FindFunctionByName, KismetCompiler.cpp 1733-1734).
+    The editor refuses an override whose parent has another signature ("Cannot override ... declared in a parent with a
+    different signature", 1993-2011): an implementation of another interface's function of that name, the class's own
+    or the stub of one it leaves out, is refused in the interfaces' terms."""
+    two = ('class ISsA {\npublic:\n  UE_INTERFACE;\n  float Tell(float V);\n};\n'
+           'class ISsB {\npublic:\n  UE_INTERFACE;\n  int32 Tell(int32 V);\n};\n'
+           'class SsRoot : public AActor, public ISsA {\npublic:\n  int32 Other() { return 0; }\n};\n')
+    refused('IfaceStubSigOwn', '', 'SsKid::Tell implements ISsB::Tell, int32 (int32), and replaces the Tell of ISsA, '
+            'float (float), that SsRoot implements',
+            top=two + 'class SsKid : public SsRoot, public ISsB {\npublic:\n  int32 Tell(int32 V) { return V * 2; }\n};\n')
+    refused('IfaceStubSigStub', '', 'SsKid implements ISsB, whose Tell is int32 (int32), and replaces the Tell of ISsA, '
+            'float (float), that SsRoot implements',
+            top=two + 'class SsKid : public SsRoot, public ISsB {\npublic:\n  int32 Other2() { return 1; }\n};\n')
+
+
+pending('FuncIfaceUnnamed: an implementation over an ancestor\'s interface stub of another signature is refused in the '
+        'interfaces\' terms', iface_over_stub_sig)
+
+
 def func_own_iface_final():
     """FuncOwnIfaceFinal: Tell and the stub Left implement IFoiTell, which the class itself lists, keeping the interface
     function's contract (func_override_flags) - BlueprintEvent, not Final - in a final class and in a UE_FINAL_AS base,
