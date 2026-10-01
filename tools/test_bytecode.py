@@ -7138,6 +7138,25 @@ pending('TEnumValueInit: {} and TEnum<E>() are the zero enumerator wherever a TE
         tenum_value_init)
 
 
+def tenum_holders():
+    """TEnumHolders: a TArray<TEnum<E>> has an array's methods (Add, Num, Contains, Find, on a variable, a local and a
+    parameter), and a dispatcher with a TEnum<E> parameter binds and broadcasts; Name() on an element is still E's."""
+    base = pending_asset('TEnumHolders')
+    keeps_invariants(base)
+    names = []
+    vm = VM(base, {'GetEnumeratorName': lambda vm, ctx, e, v: names.append((e, v)) or 'Three'}, Items=[1, 3], Seen=0)
+    assert vm.call('Fire', 4) == 24 and vm.self.vars['Seen'] == 24, vm.self.vars
+    assert vm.call('Count', 5) == 36 and vm.self.vars['Items'] == [1, 3, 2], vm.self.vars
+    assert vm.call('Local', 5) == 127, vm.call('Local', 5)
+    assert vm.call('NameOf') == 'Three' and names == [('EThPick', 2)], names
+
+
+pending('TEnumHolders: a TArray of TEnum<E> and a dispatcher with a TEnum<E> parameter keep their own methods',
+        tenum_holders)
+
+
+
+
 # -- pending
 
 for _mod, _body in (('PropSetBool', '  TSet<bool> Flags;\n'), ('PropMapBool', '  TMap<bool, int32> ByFlag;\n'),
