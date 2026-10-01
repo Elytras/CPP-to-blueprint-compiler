@@ -1911,10 +1911,7 @@ def func_stub_super():
     for chain, fn, want in (([kid, root], 'RootCall', 41), ([base, root], 'UseTell', 82), ([leaf, base, root], 'RootCall', 81)):
         got = run_as(chain, fn, {}, V=4)
         assert got == want, (fn, got, want)
-
-
-func_stub_super()
-print('ok  FuncStubSuper: an override of an interface stub a mod ancestor got has that stub as its super')
+    print('ok  FuncStubSuper: an override of an interface stub a mod ancestor got has that stub as its super')
 
 
 def func_import_call():
@@ -3446,6 +3443,7 @@ interface_calls()
 inherited_defaults()
 parent_call()
 pure_virtual()
+func_stub_super()
 engine_names()
 object_forwards()
 api_stub()
