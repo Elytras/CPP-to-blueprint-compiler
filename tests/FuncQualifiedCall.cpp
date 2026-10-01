@@ -15,6 +15,8 @@ FuncQualifiedCall gets an override of each that forwards to QcParent's, and QcKi
 A body that makes such a call is not copied into a subclass's function either, where the call would be the subclass's:
 QcRelay gets an override of CallParentAuth, so on a QcRelayKid, which overrides AuthOnly, QcParent's still runs; and
 QcRelayKid one of RelayServer, whose parent call is bound from QcRelay's own ServerBump, which QcRelayKid has not.
+CallParentPlain's body is copied into QcFinalPlain's CallRelayPlain, and its call is still QcParent's Plain, not
+QcFinalPlain's final one.
 */
 class QcParent : public AActor {
 public:
@@ -54,4 +56,10 @@ class QcRelayKid : public QcRelay {
 public:
   void AuthOnly() { Seen = 30; }
   void CallRelayServer() { QcRelay::RelayServer(); }
+};
+
+class QcFinalPlain : public FuncQualifiedCall {
+public:
+  virtual int32 Plain() final { return 50; }
+  int32 CallRelayPlain() { return FuncQualifiedCall::CallParentPlain(); }
 };

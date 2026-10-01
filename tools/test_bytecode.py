@@ -4512,14 +4512,18 @@ def func_qualified_call():
     QcParent's. That override has QcParent's flags and is QcKid's super; a call by name runs what it ran before it.
     A body making such a call is not copied into a subclass's function, where the call would be the subclass's: a
     QcRelayKid, which overrides AuthOnly, still runs QcParent's through FuncQualifiedCall::CallParentAuth, and its call
-    to QcRelay::RelayServer leaves RelayServer's parent call bound from QcRelay, which has a ServerBump."""
+    to QcRelay::RelayServer leaves RelayServer's parent call bound from QcRelay, which has a ServerBump. Copied into
+    QcFinalPlain, CallParentPlain's `QcParent::Plain()` is still QcParent's, not QcFinalPlain's final Plain."""
     folder = os.path.dirname(asset('FuncQualifiedCall'))
     chain = [os.path.join(folder, c) for c in ('QcKid', 'FuncQualifiedCall', 'QcParent')]
     relay = [os.path.join(folder, c) for c in ('QcRelayKid', 'QcRelay')] + chain[1:]
-    for b in chain + relay[:2]: keeps_invariants(b)
+    final = [os.path.join(folder, 'QcFinalPlain')] + chain[1:]
+    for b in chain + relay[:2] + final[:1]: keeps_invariants(b)
     for fn, fields, want in (('CallRelayAuth', {}, 3), ('CallRelayServer', {'Seen': 1}, 3)):
         run_as(relay, fn, fields)
         assert fields.get('Seen') == want, (fn, fields)
+    got = run_as(final, 'CallRelayPlain', {})
+    assert got == 5, 'QcParent::Plain() copied into QcFinalPlain returned %r' % got
     for fn in ('CallParentPlain', 'CallParentPlainSlow'):
         got = run_as(chain, fn, {})
         assert got == 5, '%s: QcParent::Plain() on a QcKid returned %r' % (fn, got)

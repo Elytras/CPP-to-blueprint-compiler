@@ -5512,7 +5512,9 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         /* `final` (FinalOwner): the one version of the method every object the call can run on reaches, called as
            that function instead of by name. On `this` the class asked is the one being compiled, not the one the call
            is written in, since a call by name from an inherited body reaches the object's version; on another object,
-           the object's type. */
+           the object's type. A qualified call is R's function, which only R's own `final` binds: in a body copied
+           down from a class above, a final version between the class compiled and R (its own `G() final`) is not the
+           one it names. */
         const Json* On = K == "CXXMemberCallExpr" ? Strip(First(*Callee)) : nullptr;
         const bool bOnThis = !On || Kind(*On) == "CXXThisExpr";
         const FRecord* Bound = nullptr;
@@ -5520,7 +5522,8 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         {
             std::string Of = bOnThis ? std::string() : StripTypeKeywords(TypeOf(*On));
             while (!Of.empty() && (Of.back() == '*' || Of.back() == ' ')) Of.pop_back();
-            if ((Bound = FinalOwner(bOnThis ? Cur : Find(Of), MethodName)) && Bound->IsNative()) Bound = nullptr;
+            if ((Bound = FinalOwner(bOnThis ? Cur : Find(Of), MethodName)) && (Bound->IsNative() || (bQualified && Bound != R)))
+                Bound = nullptr;
         }
         const FRecord* Called = Bound ? Bound : R;
         /* KismetCompilerVMBackend.cpp picks the local form unless the callee is native, a net function, authority
