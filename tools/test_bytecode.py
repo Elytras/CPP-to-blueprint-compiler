@@ -5243,6 +5243,20 @@ pending('FuncIfaceUnnamed: an implementation over an ancestor\'s interface stub 
         'interfaces\' terms', iface_over_stub_sig)
 
 
+def parm_unnamed():
+    """ParmUnnamed: a parameter the source leaves unnamed is cooked under the name the editor's pin and AssetGen's
+    override give it, P<index> (`_` added while another parameter has that name), not as an empty name, None once
+    loaded, which two of them in one function would share. The calls still pass each argument in its place."""
+    base = pending_asset('ParmUnnamed')
+    keeps_invariants(base)
+    assert runscript.params_of(base, 'Pick') == ['P0', 'B'], runscript.params_of(base, 'Pick')
+    assert runscript.params_of(base, 'Both') == ['P0', 'P1'], runscript.params_of(base, 'Both')
+    assert run_as([base], 'Use', {}) == 64
+
+
+pending('ParmUnnamed: an unnamed parameter is cooked as P<index>', parm_unnamed)
+
+
 def func_own_iface_final():
     """FuncOwnIfaceFinal: Tell and the stub Left implement IFoiTell, which the class itself lists, keeping the interface
     function's contract (func_override_flags) - BlueprintEvent, not Final - in a final class and in a UE_FINAL_AS base,
