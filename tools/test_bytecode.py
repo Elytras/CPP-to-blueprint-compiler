@@ -1894,6 +1894,24 @@ def final_as_pure():
 pending('FinalAsTest: UE_FINAL_AS on a base with a `= 0` method is refused', final_as_pure)
 
 
+def func_stub_super():
+    """FuncStubSuper: FssRoot leaves IFssTell's Tell out and gets its empty stub. FssKid's Tell and the UE_FINAL_AS
+    base FssBase's override that stub: each has it as its super (func_super_link) and its flags, so FssBase's is not
+    Final; and a call by name from FssRoot's code reaches each class's own."""
+    leaf = pending_asset('FuncStubSuper')
+    p = lambda c: os.path.join(os.path.dirname(leaf), c)
+    root, kid, base = p('FssRoot'), p('FssKid'), p('FssBase')
+    for b in (root, kid, base, leaf): keeps_invariants(b)
+    flags = lambda b: int(re.search(r'FunctionFlags (\S+)', dump('dumpstruct.py', b, export_index(b, 'Tell'))).group(1), 16)
+    assert flags(kid) == flags(base) == flags(root) and not flags(base) & 0x1, (hex(flags(root)), hex(flags(kid)), hex(flags(base)))
+    for chain, fn, want in (([kid, root], 'RootCall', 41), ([base, root], 'UseTell', 82), ([leaf, base, root], 'RootCall', 81)):
+        got = run_as(chain, fn, {}, V=4)
+        assert got == want, (fn, got, want)
+
+
+pending('FuncStubSuper: an override of an interface stub a mod ancestor got has that stub as its super', func_stub_super)
+
+
 def func_import_call():
     """FuncImportUser calls into FuncImportOwner's classes through a shared header. A Blueprint function is no
     native whose thunk dispatches: EX_FinalFunction runs exactly the one it names (ScriptCore.cpp 3005-3009). So Via's
