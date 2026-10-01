@@ -5167,8 +5167,9 @@ def static_above_foreign():
                 'class XofKid : public XofBase {\npublic:\n  static int32 Tell(int32 V) { return V * 2; }\n};\n')
 
 
-pending('FuncStaticHide: a function named like the static of another mod\'s class, or a static named like its method, '
-        'is refused', static_above_foreign)
+static_above_foreign()
+print('ok  FuncStaticHide: a function named like the static of another mod\'s class, or a static named like its method, '
+      'is refused')
 
 
 def static_over_static():

@@ -13643,8 +13643,11 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
            ParentClass->FindFunctionByName (KismetCompiler.cpp 1733-1774), and an override must agree with it on Static
            ("Check flags: Exec, Final, Static", 1855-1868). C++ only hides the one above, so one that does not agree is
            refused. A static over a static splits no caller - every call to either is bound - and keeps it as its super
-           (FindEvent). A native ancestor's is Generate's below: no function replaces one that is no Blueprint event. */
-        if (const auto [A, bAboveStatic] = FoundAbove(R, Fn.Name); A && !A->IsNative() && bAboveStatic != IsStaticDecl(*Fn.Decl))
+           (FindEvent). Another mod's class, from the header it shares, is a mod ancestor too: its declarations say
+           which of its functions are static. A native ancestor's is Generate's below: no function replaces one that is
+           no Blueprint event. */
+        if (const auto [A, bAboveStatic] = FoundAbove(R, Fn.Name);
+            A && A->UePackage.compare(0, 8, "/Script/") != 0 && bAboveStatic != IsStaticDecl(*Fn.Decl))
         {
             const FRecord* Listed = nullptr;
             for (const std::string& I : R.Interfaces)
