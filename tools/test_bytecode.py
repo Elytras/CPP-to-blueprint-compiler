@@ -5132,6 +5132,28 @@ def func_iface_unnamed():
 pending('FuncIfaceUnnamed: an inherited function with an unnamed parameter is forwarded; one of another signature, '
         'or final, is refused in the interface\'s terms', func_iface_unnamed)
 
+
+def func_own_iface_final():
+    """FuncOwnIfaceFinal: Tell and the stub Left implement IFoiTell, which the class itself lists, keeping the interface
+    function's contract (func_override_flags) - BlueprintEvent, not Final - in a final class and in a UE_FINAL_AS base,
+    and Ask's call to Tell reaches each class's own."""
+    leaf = pending_asset('FuncOwnIfaceFinal')
+    p = lambda c: os.path.join(os.path.dirname(leaf), c)
+    final, base = p('FoiFinal'), p('FoiBase')
+    for b in (final, base, leaf): keeps_invariants(b)
+    for b in (final, base):
+        pkg = invariants.Package(b)
+        for fn in ('Tell', 'Left'):
+            got = pkg.struct(pkg.find(fn)).function_flags
+            assert got & 0x08000000 and not got & 0x1, '%s::%s FunctionFlags %#x' % (os.path.basename(b), fn, got)
+    assert run_as([final], 'Ask', {}, V=2) == 30
+    assert run_as([leaf, base], 'Ask', {}, V=2) == 40
+
+
+pending('FuncOwnIfaceFinal: an implementation of an interface a final class lists has the interface function\'s flags',
+        func_own_iface_final)
+
+
 def func_template_call():
     """FuncTemplateCall: a member template's body is copied into each caller and read in the class it is written in.
     `AuthOnly()` in Helper is a call by name from FtKid's Use, so on an FtKid it runs FtMid's override (7), as C++ does,
