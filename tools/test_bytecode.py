@@ -5099,26 +5099,38 @@ def func_static_above():
 pending('FuncStaticHide: a function named like a mod ancestor\'s static is refused unless it is a static, whose super '
         'is that one', func_static_above)
 
-def func_own_iface_final():
-    """FuncOwnIfaceFinal: Tell and the stub Left implement IFoiTell, which the class itself lists, keeping the interface
-    function's contract (func_override_flags) - BlueprintEvent, not Final - in a final class and in a UE_FINAL_AS base,
-    and Ask's call to Tell reaches each class's own."""
-    leaf = pending_asset('FuncOwnIfaceFinal')
-    p = lambda c: os.path.join(os.path.dirname(leaf), c)
-    final, base = p('FoiFinal'), p('FoiBase')
-    for b in (final, base, leaf): keeps_invariants(b)
-    for b in (final, base):
-        pkg = invariants.Package(b)
-        for fn in ('Tell', 'Left'):
-            got = pkg.struct(pkg.find(fn)).function_flags
-            assert got & 0x08000000 and not got & 0x1, '%s::%s FunctionFlags %#x' % (os.path.basename(b), fn, got)
-    assert run_as([final], 'Ask', {}, V=2) == 30
-    assert run_as([leaf, base], 'Ask', {}, V=2) == 40
+
+def func_iface_unnamed():
+    """FuncIfaceUnnamed gets an override of FiuRoot's Tell (for IFiuTell) and of Kept (for its `FiuRoot::Kept` call),
+    each calling FiuRoot's though a parameter of it has no name: the override names it, as an editor override does.
+    An inherited function of another signature, or a final one, cannot implement an interface function of its name,
+    and the refusal says so in the interface's terms; so does one of the class's own that the inherited one's
+    signature would make its super's."""
+    kid = pending_asset('FuncIfaceUnnamed')
+    root = os.path.join(os.path.dirname(kid), 'FiuRoot')
+    assert 'call by name' not in LOGS['FuncIfaceUnnamed'], LOGS['FuncIfaceUnnamed']
+    keeps_invariants(kid)
+    assert {'Tell', 'Kept'} <= set(exports_of(kid)), exports_of(kid)
+    assert run_as([kid, root], 'Tell', {}, V=2) == 5
+    fields = {'Seen': 0}
+    assert run_as([kid, root], 'Use', fields) == 14 and fields['Seen'] == 2, fields
+    refused('IfaceSigInherited', '', 'IsiKid implements IIsiTell, whose Tell is int32 (int32), and the IsiRoot::Tell it '
+            'inherits is float (float)',
+            top='class IIsiTell {\npublic:\n  UE_INTERFACE;\n  int32 Tell(int32 V);\n};\n'
+                'class IsiRoot : public AActor {\npublic:\n  float Tell(float V) { return V; }\n};\n'
+                'class IsiKid : public IsiRoot, public IIsiTell {\npublic:\n  int32 Other() { return 0; }\n};\n')
+    refused('IfaceFinalInherited', '', 'the IfiRoot::Tell it inherits is final',
+            top='class IIfiTell {\npublic:\n  UE_INTERFACE;\n  int32 Tell(int32 V);\n};\n'
+                'class IfiRoot : public AActor {\npublic:\n  virtual int32 Tell(int32 V) final { return V; }\n};\n'
+                'class IfiKid : public IfiRoot, public IIfiTell {\npublic:\n  int32 Other() { return 0; }\n};\n')
+    refused('IfaceSigOwn', '', 'and replaces the IsoRoot::Tell it inherits, float (float)',
+            top='class IIsoTell {\npublic:\n  UE_INTERFACE;\n  int32 Tell(int32 V);\n};\n'
+                'class IsoRoot : public AActor {\npublic:\n  float Tell(float V) { return V; }\n};\n'
+                'class IsoKid : public IsoRoot, public IIsoTell {\npublic:\n  int32 Tell(int32 V) { return V; }\n};\n')
 
 
-pending('FuncOwnIfaceFinal: an implementation of an interface a final class lists has the interface function\'s flags',
-        func_own_iface_final)
-
+pending('FuncIfaceUnnamed: an inherited function with an unnamed parameter is forwarded; one of another signature, '
+        'or final, is refused in the interface\'s terms', func_iface_unnamed)
 
 def func_template_call():
     """FuncTemplateCall: a member template's body is copied into each caller and read in the class it is written in.
