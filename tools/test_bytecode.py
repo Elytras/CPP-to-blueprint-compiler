@@ -5651,6 +5651,25 @@ struct_lit_expr()
 print('ok  StructLitExpr: a struct literal with a member that is not a constant is a Make Struct, and runs as C++ runs it')
 
 
+def local_by_address():
+    """A local holding a call's result, read once by a container function, stays a local: the Kismet container thunks
+    read the container where it lies (Stack.MostRecentPropertyAddress after StepCompiledIn, execArray_Length and the
+    rest), and a call in its place leaves the address of what the callee's frame read, not a value. An array, a set and
+    a map, by Num, Find and Contains, and an inline function's parameter read so."""
+    base = pending_asset('LocalByAddress')
+    keeps_invariants(base)
+    cases = {'ArrayNum': lambda M: 2 + M, 'ArrayFind': lambda M: 1 + M, 'ArrayContains': lambda M: 10 + M,
+             'SetNum': lambda M: 2 + M, 'MapNum': lambda M: 2 + M, 'MapFind': lambda M: 4 + M,
+             'InlineParm': lambda M: 2 + M}
+    for fn, want in cases.items():
+        for m in (0, 3):
+            got = run(base, fn, M=m)[0]
+            assert got == want(m), 'LocalByAddress.%s(%d) = %r, want %r' % (fn, m, got, want(m))
+
+
+pending('LocalByAddress: a local a container function reads by address is kept', local_by_address)
+
+
 # ---- UBER: ubergraphs along a class chain, their frames and names, latent resumes, awaits in overrides
 # (invariant_rules/ubergraph.py)
 
