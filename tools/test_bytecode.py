@@ -6277,19 +6277,24 @@ def loaded_container(pkg, cdo, name, kind, start):
 def prop_set_delta():
     """A child Blueprint's own default for an inherited TSet / TMap is what its CDO loads: the parent's {1, 2} and
     {a: 1, c: 3} become {2, 3} and {a: 5, b: 2}, read as the loader reads the child's tag on top of the parent CDO's
-    loaded value (see loaded_container). Any encoding that loads that value passes."""
+    loaded value (see loaded_container). So does one inside an inherited struct the child assigns whole (Held), whose
+    members load over the parent's struct's; Deep, which it leaves alone, keeps the parent's. Any encoding that loads
+    that value passes."""
     import invariants
     base = asset('PropSetDelta')
     parent = invariants.Package(os.path.join(os.path.dirname(base), 'PropSetBase'))
     child = invariants.Package(base)
     pc, cc = parent.find('Default__PropSetBase_C'), child.find('Default__PropSetDelta_C')
-    ids = loaded_container(child, cc, 'Ids', 'set', loaded_container(parent, pc, 'Ids', 'set', set()))
-    score = loaded_container(child, cc, 'Score', 'map', loaded_container(parent, pc, 'Score', 'map', {}))
-    assert ids == {2, 3}, 'PropSetDelta loads Ids = %s, the source says {2, 3}' % sorted(ids)
-    assert score == {'a': 5, 'b': 2}, 'PropSetDelta loads Score = %s, the source says {a: 5, b: 2}' % score
+    for where, ids_want, score_want in (((), {2, 3}, {'a': 5, 'b': 2}), (('Held',), {2, 3}, {'a': 5, 'b': 2}),
+                                        (('Deep', 'In'), {1, 2}, {'a': 1, 'c': 3})):
+        ids = loaded_container(child, cc, where + ('Ids',), 'set', loaded_container(parent, pc, where + ('Ids',), 'set', set()))
+        score = loaded_container(child, cc, where + ('Score',), 'map', loaded_container(parent, pc, where + ('Score',), 'map', {}))
+        label = '.'.join(where + ('',))
+        assert ids == ids_want, 'PropSetDelta loads %sIds = %s, the source says %s' % (label, sorted(ids), sorted(ids_want))
+        assert score == score_want, 'PropSetDelta loads %sScore = %s, the source says %s' % (label, score, score_want)
     keeps_invariants(base)
-    print('ok  PropSetDelta: an inherited TSet / TMap default lists the parent\'s elements it drops as removed, and loads '
-          'as its own value, not the union')
+    print('ok  PropSetDelta: an inherited TSet / TMap default, a property or one in a struct assigned whole, lists the '
+          'parent\'s elements it drops as removed, and loads as its own value, not the union')
 
 
 prop_text_defaults()

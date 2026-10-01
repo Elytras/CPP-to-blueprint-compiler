@@ -41,5 +41,6 @@ public:
   UE_DEFAULTS {
     Ids = {2, 3};
     Score = {{"a", 5}, {"b", 2}};
+    Held = {{2, 3}, {{"a", 5}, {"b", 2}}, 3};
   }
 };

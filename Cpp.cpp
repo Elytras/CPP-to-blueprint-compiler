@@ -277,6 +277,39 @@ void DiffAgainstParent(FPropertyDef& P, const FDefaultValue& Parent)
     Mine.K = FDefaultValue::Array;
 }
 
+/* Whether P's value holds a TSet or TMap: P itself, or a member of structs written as tags down from it. */
+bool HoldsTaggedSetOrMap(const FPropertyDef& P)
+{
+    if (P.Inner && (P.Type == "SetProperty" || P.Type == "MapProperty")) return true;
+    if (P.Type != "StructProperty" || NativeStructSize(P.StructName)) return false;
+    const auto& Members = P.Default.Members ? P.Default.Members : P.Members;      // as WriteValue picks them
+    return Members && std::any_of(Members->begin(), Members->end(), [](const FPropertyDef& M) { return HoldsTaggedSetOrMap(M); });
+}
+
+/* DiffAgainstParent for each set or map in P's value, down through the members of structs written as tags: a struct
+   loads each member over the parent's struct's (FStructProperty::SerializeItem passes its defaults on, PropertyStruct.cpp
+   148-153; UScriptStruct::SerializeItem to SerializeTaggedProperties, Class.cpp 2775, 1473), so a set in one is a delta
+   just as an inherited set is. Parent is the parent CDO's value of the same type; a member it gives no value is
+   empty there. The members are copied before they change: a type's other properties may share them. */
+void DiffTaggedAgainstParent(FPropertyDef& P, const FPropertyDef& Parent)
+{
+    if (P.Inner && (P.Type == "SetProperty" || P.Type == "MapProperty")) { DiffAgainstParent(P, Parent.Default); return; }
+    if (P.Type != "StructProperty" || P.Default.K != FDefaultValue::Struct || NativeStructSize(P.StructName)) return;
+    std::shared_ptr<std::vector<FPropertyDef>>& Mine = P.Default.Members ? P.Default.Members : P.Members;
+    if (!Mine) return;
+    Mine = std::make_shared<std::vector<FPropertyDef>>(*Mine);
+    const auto& Theirs = Parent.Default.Members ? Parent.Default.Members : Parent.Members;
+    for (FPropertyDef& M : *Mine)
+    {
+        const FPropertyDef* Was = nullptr;
+        if (Parent.Default.K == FDefaultValue::Struct && Theirs)
+            for (const FPropertyDef& T : *Theirs) if (T.Name == M.Name) Was = &T;
+        FPropertyDef Empty = M;
+        Empty.Default = FDefaultValue();
+        DiffTaggedAgainstParent(M, Was ? *Was : Empty);
+    }
+}
+
 /* A patch's UE_DEFAULTS statement, which may also assign part of a member's value: DefaultAssignment's `Field` or
    `Component->Field`, then any `.Member` and `[i]` into it (`PrimaryActorTick.bCanEverTick = v`, `Spans[1].Max = v`).
    Root is the field's MemberExpr, Steps each `.Member`'s MemberExpr or `[i]`'s operator call, from the root out. */
@@ -12174,10 +12207,11 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
 
                 /* An inherited set or map loads over the parent CDO's value (PropertySet.cpp 285-358, PropertyMap.cpp
                    316-400: copied in, the listed removals taken out, the rest added), so written whole it would load as
-                   the union of both; DiffAgainstParent writes it as the editor does. The parent's value is the nearest
-                   UE_DEFAULTS up the chain that sets the member, else its initializer where it is declared. A native
-                   class on the way holds one no header says, and there it stays whole. */
-                if (!bThroughComponent && (PD.Type == "SetProperty" || PD.Type == "MapProperty"))
+                   the union of both; DiffAgainstParent writes it as the editor does. So does one inside an inherited
+                   struct written as tags (DiffTaggedAgainstParent). The parent's value is the nearest UE_DEFAULTS up the
+                   chain that sets the member, else its initializer where it is declared. A native class on the way
+                   holds one no header says, and there it stays whole. */
+                if (!bThroughComponent && HoldsTaggedSetOrMap(PD))
                 {
                     const std::string Id = Lhs->value("referencedMemberDecl", std::string());
                     FPropertyDef Parent = PD;
@@ -12197,7 +12231,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                         if (!Set && !Declared) continue;
                         if (!(Set ? LowerDefault(*Set, Parent, BP, Err, Value, /*bKeepZero=*/true) : LowerDefault(*Declared, Parent, BP, Err)))
                         { bOk = false; return; }
-                        DiffAgainstParent(PD, Parent.Default);
+                        DiffTaggedAgainstParent(PD, Parent);
                         break;
                     }
                 }
