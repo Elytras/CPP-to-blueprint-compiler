@@ -4723,7 +4723,7 @@ def func_iface_inherited():
     """FuncIfaceInherited implements IFiTell, whose Tell, Kept and Ping it inherits from FiRoot. Each of its own
     calls FiRoot's, so a call by name or through the interface runs FiRoot's (with no function of its own the interface's
     empty one would be found first, UClass::FindFunctionByName, Class.cpp 5281-5323)."""
-    kid = pending_asset('FuncIfaceInherited')
+    kid = asset('FuncIfaceInherited')
     chain = [kid, os.path.join(os.path.dirname(kid), 'FiRoot')]
     keeps_invariants(kid)
     assert {'Tell', 'Kept', 'Ping'} <= set(exports_of(kid)), exports_of(kid)
@@ -4734,8 +4734,14 @@ def func_iface_inherited():
     assert fields['Seen'] == 9, fields
 
 
-pending('FuncIfaceInherited: an interface function an ancestor has runs the ancestor\'s, not an empty stub',
-        func_iface_inherited)
+func_iface_inherited()
+print('ok  FuncIfaceInherited: an interface function an ancestor has runs the ancestor\'s, not an empty stub')
+# A multicast no forwarder can call (it would be sent twice on a server), so the stub would replace it: refused.
+refused('FuncIfaceMulticast', '', 'the IfmRoot::Ping it inherits is a multicast',
+        top='class IIfmPing {\npublic:\n  UE_INTERFACE;\n  void Ping();\n};\n'
+            'class IfmRoot : public AActor {\npublic:\n  int32 Seen = 0;\n  UE_MULTICAST void Ping() { Seen = 1; }\n};\n'
+            'class IfmKid : public IfmRoot, public IIfmPing {\npublic:\n};\n')
+print('ok  FuncIfaceMulticast: an interface function inherited as a multicast, which no override can call, is refused')
 
 
 # ---- OPERANDS: operands the VM resolves against the object they run on - jumps, instance variables, calls by name,

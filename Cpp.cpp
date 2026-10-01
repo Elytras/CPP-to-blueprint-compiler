@@ -1300,6 +1300,11 @@ private:
        that class, forwarding to the parent's, so that the call can be bound to Base's. Run once, before any Generate. */
     void SynthesizeForwarders();
     std::deque<Json> ForwarderDecls;            // their declarations, which the records point into
+    /* The class above R, cooked by this source, whose Method implements R's interface function of that name in C++:
+       the nearest declaration from R's parent up, unless it is a native class's or `= 0`. Null when none. */
+    const FRecord* InheritedImplementation(const FRecord& R, const std::string& Method) const;
+    /* Why no forwarder can call A's Method (static, a multicast, an unnamed parameter), or empty. */
+    std::string WhyNotForwarded(const FRecord& A, const std::string& Method) const;
     bool IsMulticast(const FRecord& R, const std::string& Method) const;
     /* A constant outside any function body, `constexpr int32 kMax = 40;` at namespace scope or static in a class, and an
        inline class variable, `static inline const TArray<FName> Tags = {...};`: decl id -> its VarDecl. It has no
@@ -8659,6 +8664,21 @@ void FCompiler::SynthesizeForwarders()
             };
             ForEach(Def, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Walk(C); });
         }
+        /* An interface W lists whose function W inherits from a class above that this source cooks, which does not list
+           it: in C++ that class's function implements it. Generate's empty stub would replace it for every caller, and
+           no function at all is no better: a call by name, an interface call too, finds the interface's own empty one
+           first (UClass::FindFunctionByName looks in a class's interfaces before its super, Class.cpp 5281-5323). So W
+           gets a forwarder to it, the editor's override calling its parent; to an inline one, which it expands. Where
+           none can call it (WhyNotForwarded), Generate refuses the class. */
+        for (const std::string& Listed : W.Interfaces)
+            for (const FRecord* IR : InterfaceChain(Find(Listed)))
+                for (const auto& Entry : IR->Methods)
+                {
+                    const std::string& Method = Entry.first;
+                    if (Method == "StaticClass" || W.Methods.count(Method) || Wanted.count(Method)) continue;
+                    if (const FRecord* A = InheritedImplementation(W, Method); A && WhyNotForwarded(*A, Method).empty())
+                        Wanted[Method] = A;
+                }
 
         /* The forwarder as clang would write it: the nearest declaration's type and parameters (its definition's names),
            and a body of one call on this, each parameter passed as itself (a reference one as the place it names). The
@@ -8715,6 +8735,26 @@ void FCompiler::SynthesizeForwarders()
             MethodOwner[Id] = W.CppName;
         }
     }
+}
+
+const FRecord* FCompiler::InheritedImplementation(const FRecord& R, const std::string& Method) const
+{
+    for (const FRecord* A = R.Base.empty() ? nullptr : Find(R.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
+        if (auto M = A->Methods.find(Method); M != A->Methods.end())
+            return A->IsGenerated() && !A->bIsInterface && !A->bIsStruct && !M->second->value("pure", false) ? A : nullptr;
+    return nullptr;
+}
+
+std::string FCompiler::WhyNotForwarded(const FRecord& A, const std::string& Method) const
+{
+    const Json& Decl = *A.Methods.at(Method);
+    if (IsStaticDecl(Decl)) return "static";
+    if (IsMulticast(A, Method)) return "a multicast, which an override calling it would send twice on a server";
+    const auto Def = A.MethodDefs.find(Method);
+    bool bNamed = true;
+    ForEach(Def != A.MethodDefs.end() ? *Def->second : Decl,
+            [&](const Json& P) { bNamed = bNamed && (Kind(P) != "ParmVarDecl" || !Name(P).empty()); });
+    return bNamed ? std::string() : "declared with a parameter that has no name, which an override cannot pass on";
 }
 
 /* A multicast wherever Method is declared from R up: a mod's marker, or a native or interface function's flags. */
@@ -13052,7 +13092,18 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
        so its stubs are empty. BlueprintEvent is the flag, not the editor's event node: a function that
        returns a value has it too (Targetable::GetIsTargetable) and the editor implements it as a function
        graph. Only a native-only function lacks it, which UHT allows just under
-       CannotImplementInterfaceInBlueprint (HeaderParser.cpp:7538). */
+       CannotImplementInterfaceInBlueprint (HeaderParser.cpp:7538).
+       A function the class inherits from a class above this source cooks implements it in C++, and a stub would
+       replace that body for every caller: SynthesizeForwarders declared an override calling it in its place wherever
+       one can, and the class is refused where none can. */
+    auto ReplacesInherited = [&](const std::string& I, const std::string& Fn) {
+        const FRecord* A = InheritedImplementation(R, Fn);
+        const std::string Why = A ? WhyNotForwarded(*A, Fn) : std::string();
+        if (Why.empty()) return false;
+        *Err = R.CppName + " implements " + I + ", and the " + A->CppName + "::" + Fn + " it inherits is " + Why
+             + ": no override can call it for " + I + ", and an empty one would replace it; declare " + R.CppName + "::" + Fn;
+        return true;
+    };
     for (const std::string& Listed : R.Interfaces)
     for (const FRecord* Link : InterfaceChain(Find(Listed)))        // the interfaces it extends are implemented too
     {
@@ -13067,6 +13118,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             {
                 if (std::any_of(Methods.begin(), Methods.end(),
                                 [&](const FMethod& F) { return F.Name == M.first; })) continue;
+                if (ReplacesInherited(I, M.first)) return false;
                 FMethod Fn{ M.first, M.second, M.second, nullptr };
                 Fn.Body = BodyOf(IR, M.first, Fn.Def);
                 Methods.push_back(Fn);
@@ -13085,6 +13137,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             auto Decl = IR.Methods.find(Name_);
             if (Decl == IR.Methods.end())
             { *Err = I + "::" + Name_ + " takes a type AssetGen cannot write yet, so " + R.CppName + " cannot implement " + I; return false; }
+            if (ReplacesInherited(I, Name_)) return false;
             FMethod Fn{ Name_, Decl->second, Decl->second, nullptr };
             Fn.Body = BodyOf(IR, Name_, Fn.Def);
             Methods.push_back(Fn);

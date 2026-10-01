@@ -3975,6 +3975,8 @@ Notes:
 | `class Singer : public AActor, public ICurveSourceInterface` | Class Settings > Implemented Interfaces. The first base is the UE parent, and every base after it is an implemented interface. A class can implement several, game and mod interfaces alike. | Yes |
 | `float GetCurveValue(FName CurveName) const { return 0.5f; }` | An implementation is an ordinary method, matched to the interface function by name. Only functions the interface marks BlueprintNativeEvent or BlueprintImplementableEvent can be implemented; AssetGen checks this against the SDK's Events.json. | Yes |
 | A function left out | Gets an empty stub, as the editor compiles one. The stub returns the zero value (0, false, None, null) and leaves out-parameters unchanged. | Yes |
+| A function left out that a parent this source cooks already has, without listing the interface | The parent's function implements it, as in C++: AssetGen adds an override of it that only calls the parent's (or expands it, if inline), the editor's override with a parent call, so calls through the interface and by name run the parent's body. An empty stub would replace it for every caller, and with no function at all a call would find the interface's own empty one first. | Yes |
+| The same, where the parent's function is static, a multicast, or has a parameter with no name | Refused: "... no override can call it for ITrigger, and an empty one would replace it; declare Pistol::Pull". An override would send a multicast twice on a server, and cannot pass on an unnamed parameter. | Refused |
 | An implementation that returns a value, is `const`, or has out-parameters | Compiled as a function, where the editor would make a function graph rather than an event. It takes the interface function's flags, so callers through the interface find it. A void event such as ShowDamageEffects is compiled as a function too. | Yes |
 | `class Pistol : public Weapons::Rifle` | A subclass implements the interface through its parent without listing it. Redefining an interface function is an ordinary override, and `Weapons::Rifle::Pull(Times)` calls the parent's. | Yes |
 | `class NativeOnly : public AActor, public IHealth` | Refused: "IHealth::GetHealth is native only ..., so a Blueprint cannot implement IHealth". The editor refuses the same. Calling IHealth through `TScriptInterface<IHealth>` on the game's objects still works. | Refused |
@@ -4025,8 +4027,8 @@ Notes:
 - Do not mark an implementation `inline`. It compiles with no diagnostic, but an inline method is not a function of the
   class, so the class gets the empty stub under that name, and a call through the interface returns 0.
 - List the UE class first. If an interface comes first, it is taken as the parent.
-- An empty stub stands in for every function left out, including those along the chain of an interface that extends
-  another. Without it, a call through the interface would reach the interface's own function.
+- An empty stub stands in for every function left out that no parent has, including those along the chain of an
+  interface that extends another. Without it, a call through the interface would reach the interface's own function.
 - The native-only message names the first such function in alphabetical order.
 - The already-implemented check sees mod ancestors, and native ones only for the interfaces UeApi lists on them
   (`UeNativeInterfaces`): the dump lists no class's interfaces, so genueapi takes, with `--game`, those a game
