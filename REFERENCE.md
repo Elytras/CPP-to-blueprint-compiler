@@ -1156,7 +1156,7 @@ void ZeroAll() {
 | `FVector Offset = {0, 0, 50};` | Positional braces as a default. | Yes |
 | `FNested Deep = {.Inner = {.Time = 1.5f}, .Stamp = 7};` | Designated braces, nested. Members left out are zero, or take their own default initializer. | Yes |
 | `FColor Lamp = FColor(255, 128, 0);` | FColor's argument order holds in defaults too. | Yes |
-| `FStats Fresh = FStats();`, `FStats Cleared = {{}, {}};` | A `UE_STRUCT`'s `T()` is its defaults, and writes nothing. A `{}` for a member is a fresh value of its type (zero, empty, None, a `UE_STRUCT`'s own defaults), written even where the member's default differs. | Yes |
+| `FStats Fresh = FStats();`, `FStats Cleared = {{}, {}};` | A `UE_STRUCT`'s `T()` is its defaults, and writes nothing. A `{}` for a member is a fresh value of its type (zero, empty, None, a `UE_STRUCT`'s own defaults), written even where the member's default differs. In a function, `Code(FStats())` and `FStats S = FStats();` are the Make Struct of its defaults, as `FStats S{}` is. | Yes |
 
 Notes:
 - Every value in a default must be known when the mod is built: [Classes and variables](#classes-and-variables).
@@ -1327,6 +1327,7 @@ Notes:
 | `TArray<int32> L = {4, 5, 6};` in a function | The Make Array node: a temporary filled at once, made afresh each time the code runs. | Yes |
 | `TSet<int32> S = {1, 2};`, `TMap<int32, float> M = {{1, 0.5f}};` in a function | Make Set and Make Map. | Yes |
 | `Items = {};`, `Count({})`, `TArray<int32>()`, `return {};` in a function | An empty container: a Make Array (Set, Map) with no element. | Yes |
+| `Size(TArray<int32>{1, 2, M})`, `TSet<int32>{1, M}`, `TArray<int32>({1, 2})` in a function | The typed list, braced or in parentheses: the same Make Array (Set, Map) as the untyped braces. | Yes |
 
 ```cpp
 TArray<int32> Primes = {2, 3, 5};
@@ -1478,7 +1479,7 @@ Notes:
 | `Acc += I;`, and `-=` `*=` `/=` `%=` `&=` `\|=` `^=` `<<=` `>>=` | `X = X op Y`: a math node and a Set. X is located once, so `Slots[NextSlot()] += By` calls NextSlot a single time, and Y is evaluated first. It works on everything plain `=` works on, map values and their members included. `<<=`, `>>=` and int64 `%=` follow the rules of the plain operators. | Yes |
 | `int32 Z = (Y += X) * 10;` | A compound assignment used as a value is X after the store. | Yes |
 | `X++`, `++X`, `X--`, `--X` | The Increment Int and Decrement Int macros, with X located once. Postfix gives the value before the store, prefix the value after. Works on int32, int64, float and uint8 (a uint8 wraps at 255). On a raw pointer it steps by the element size; see [Pointers and memory](#pointers-and-memory). | Yes |
-| `A = B = 0;`, `if ((X = Next()) > 3)` | Refused ("unimplemented binary operator = on IntInt", the flavour following the operand type): plain `=` works only as a statement. Use an init-statement, `if (int32 Twice = V * 2; Twice > 10)`, or a declaring condition, `while (int32 Left = Start - Steps)`. | Refused |
+| `A = B = 0;`, `S1 = S2 = Name;`, `if ((X = Next()) > 3)`, `return A = N;` | A plain `=` used as a value: the assignment runs first, as a statement, and the value is the variable it wrote, read after it. Numbers, strings and structs alike. Where nothing in the statement runs before it, as for the comma operator: in a loop condition, on the right of `&&` / `\|\|` / `?:` or in an argument of a call on another object it is refused ("an assignment used as a value in a loop condition, ..."); use a declaring condition there, `while (int32 Left = Start - Steps)`. The left side must be a plain variable (`A = L[0] = 1` is refused): it is read again. | Yes |
 
 ### Evaluation order
 
@@ -5596,8 +5597,6 @@ and where the feature is described. In each group, the messages you are most lik
   `<Flavour>` names them: IntInt, Int64Int64, FloatFloat, ByteByte, BoolBool or ObjectObject. The usual cases:
   - `% on Int64Int64`: `%` or `%=` on int64, which UE 4.27 lacks. Write `A - A / B * B`.
   - `< on ObjectObject` (or `>`, `<=`, `>=`): ordering object pointers. Blueprint has only `==` and `!=` on objects.
-  - `= on IntInt` (or another flavour): `=` used as a value, as in `A = B = 0;` or `if ((X = Next()) > 3)`. Put each
-    assignment in its own statement, or use `if (int32 X = Next(); X > 3)`. `+=`, `++` and `--` work as values.
 
   See [Operators](#operators).
 - `TODO: unimplemented operator overload <Operator> yielding <Type>`, and `TODO: unimplemented operator overload
@@ -5756,6 +5755,12 @@ and where the feature is described. In each group, the messages you are most lik
   right side is no variable: ...`: `F(G(), (A, L[0]))` where F takes a non-const reference: the argument cannot run
   first into a temporary, which F would then write. Fix: put the left side in a statement of its own. See
   [Operators](#operators).
+- `an assignment used as a value in a loop condition, or after something its statement runs first (...): assign in a
+  statement of its own, then use what it assigned`: a plain `=` used as a value where the comma operator is refused
+  too, `while ((A = Next()) > 0)` or `B && (A = N) > 2`. Fix: as the message says; for a loop, a declaring condition,
+  `while (int32 Left = Next())`. See [Operators](#operators).
+- `an assignment used as a value, whose left side is no plain variable, which would be evaluated again to read it:
+  ...`: `A = L[0] = N`. Fix: assign in a statement of its own, then use what it assigned. See [Operators](#operators).
 - `inline call to <Class>::<Method> with <N> arguments`: a C-style variadic inline function,
   `inline int32 First(int32 N, ...)`, called with extra arguments. Fix: give it a fixed parameter list, or overloads.
   See [Inline functions and templates](#inline-functions-and-templates).

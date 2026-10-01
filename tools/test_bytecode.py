@@ -1021,7 +1021,7 @@ def expr_temps():
     """ExprTemps: `TArray<int32>{1, 2, M}` as an argument is that array; a UE_STRUCT's `FEtSlot()` has its members'
     defaults (A 1, B 2), passed or stored; `A = B = E` sets both, for a number, a string and a struct; `B = A += E`
     adds first, B getting A's new value."""
-    base = pending_asset('ExprTemps')
+    base = asset('ExprTemps')
     keeps_invariants(base)
     for m in (-4, 0, 9):
         assert run(base, 'ListArg', M=m)[0] == 300 + m, ('ListArg', m)
@@ -1035,9 +1035,15 @@ def expr_temps():
     for e in ('', 'ab'):
         me = {'SA': 'x', 'SB': 'y'}
         assert run(base, 'ChainString', me, E=e)[0] == e + e and me == {'SA': e, 'SB': e}, ('ChainString', e, me)
+    # Read again after the store, the left side must be a plain variable; and where a comma could not move, neither can it.
+    refused('AssignElement', '  int32 A;\n  int32 F(int32 M) { TArray<int32> L = {1}; A = L[0] = M; return A; }\n',
+            'an assignment used as a value, whose left side is no plain variable')
+    refused('AssignWhile', '  int32 A;\n  int32 F(int32 M) { while ((A = M) < 3) M += 1; return A; }\n',
+            'an assignment used as a value in a loop condition')
 
 
-pending('Expressions: TArray<T>{...} and a UE_STRUCT\'s T() as values, and a chained assignment', expr_temps)
+expr_temps()
+print('ok  ExprTemps: TArray<T>{...} and a UE_STRUCT\'s T() are values, and a chained assignment sets both sides')
 check('FlowTest', 'Classify', classify, [dict(Code=c) for c in range(-2, 8)])
 check('FlowTest', 'NoDefault', no_default, [dict(Code=c) for c in (-1, 0, 1, 9, 10)])
 check('FlowTest', 'NameSet', lambda N: 2 if N.lower() == 'none' else 1, [dict(N=n) for n in ('None', 'none', 'IntProperty', 'x', 'None_1')])

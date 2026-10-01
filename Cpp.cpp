@@ -4363,6 +4363,16 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         /* `{}` or `TEnum<E>()`: TEnum<E> declares a constructor, so its value-initialisation is an argless construct
            where an E's is a CXXScalarValueInitExpr below. The same zero enumerator. */
         if (!First(*N) && IsTEnumType(TypeOf(*N))) return ZeroArg(StripTypeKeywords(TypeOf(*N)), BP, Out, Err);
+        /* `TArray<int32>{1, 2, M}`: the typed spelling is a CXXTemporaryObjectExpr around the initializer_list, which
+           Strip does not look through as it does `TArray<int32>({1, 2})`'s one-argument construct. The same list. */
+        if (const Json* List = First(*N); List && !Nth(*N, 1) && Kind(*List) == "CXXStdInitializerListExpr"
+            && IsContainerType(TypeOf(*N)))
+            return LowerContainerLiteral(*List, TypeOf(*N), BP, Out, Err);
+        /* `FSlot()` of a UE_STRUCT whose members have defaults: clang calls its implicit constructor, where an aggregate
+           with none gets a CXXScalarValueInitExpr below. Either way the struct with its members' defaults, as
+           `FSlot S{}` has them. */
+        if (const FRecord* R = First(*N) ? nullptr : Find(StripTypeKeywords(TypeOf(*N))); R && R->bIsStruct)
+            return LowerMakeStruct(R->CppName, nullptr, BP, Out, Err);
     }
     /* `T()` of an aggregate - a struct with no constructor declared, which is what lets it take `{ .A = 1 }`. */
     if (const FRecord* R = K == "CXXScalarValueInitExpr" ? Find(StripTypeKeywords(TypeOf(*N))) : nullptr; R && R->bIsStruct)
@@ -4684,6 +4694,10 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
                 return true;
             }
         }
+        if (OpName == "operator=")
+        { *Err = "an assignment used as a value in a loop condition, or after something its statement runs first (the "
+                 "right side of && / || / ?:, an argument of a call on another object, a later member of a braced list): "
+                 "assign in a statement of its own, then use what it assigned"; return false; }
         if (OpName != "operator+" || !Lhs || !Rhs || StrKindOf(TypeOf(*N)) != SK_Str)
         { *Err = "TODO: unimplemented operator overload " + OpName + " yielding " + TypeOf(*N); return false; }
 
@@ -4946,6 +4960,14 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
                    "of && / || / ?:, an argument of a call on another object, a later member of a braced list): write its "
                    "left side as a statement of its own. It works as a statement (`A, B;`, a for increment) and anywhere "
                    "else in a statement (`int32 N = (A, B);`, `F((A, B))`, `if (A, B)`)";
+            return false;
+        }
+        /* An assignment used as a value LowerBody's HoistComma did not take apart, as it does `A = B = E`. */
+        if (Op == "=")
+        {
+            *Err = "an assignment used as a value in a loop condition, or after something its statement runs first (the "
+                   "right side of && / || / ?:, an argument of a call on another object, a later member of a braced "
+                   "list): assign in a statement of its own, then use what it assigned";
             return false;
         }
         /* `"Kills: " + N`: C++ reads an address N characters into the literal (clang warns, -Wstring-plus-int, and
@@ -9518,7 +9540,8 @@ first (`F(G(), (Bump(), M))` is `T = (Bump(), M); F(G(), T)`), unless the operan
 right side and the siblings only read (IsEagerSafe), where reading the right side after the siblings changes nothing.
 A comma whose value is written or bound to a non-const reference cannot move to a temporary; its right side then has
 to be a variable, which names the same place wherever it is read. A loop's condition reruns it every trip and is not
-looked at here. Returns 1 with Seq set, 0 for a statement with no such comma, -1 with Err set for one that cannot
+looked at here. A plain assignment used as a value, `A = B = E` or `F(B = 1)`, is the comma `(B = E, B)`: the
+assignment runs as a statement, then its left side is read again, which must be a plain variable to give the same place. Returns 1 with Seq set, 0 for a statement with no such comma, -1 with Err set for one that cannot
 move.
 */
 int32 FCompiler::HoistComma(const Json& Stmt, Json* Seq, std::string* Err)
@@ -9528,10 +9551,24 @@ int32 FCompiler::HoistComma(const Json& Stmt, Json* Seq, std::string* Err)
     std::vector<FLevel> Levels;                                                 // its parent's From-th; innermost first
     Json* Target = nullptr;
     auto IsComma = [](const Json& E) { return Kind(E) == "BinaryOperator" && E.value("opcode", std::string()) == ","; };
+    static const std::set<std::string> Assigns = { "=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=" };
+    auto OperatorOf = [](const Json& E) {      // a CXXOperatorCallExpr's operator: "=" for operator=
+        const Json* Callee = Strip(First(E));
+        const std::string Name = Callee && Callee->contains("referencedDecl") ? (*Callee)["referencedDecl"].value("name", std::string())
+                                                                             : std::string();
+        return Name.compare(0, 8, "operator") == 0 ? Name.substr(8) : std::string();
+    };
+    /* A plain assignment used as a value, `A = (B = E)`: the assignment, then its left side, as `(B = E, B)` would be.
+       A compound one is a value of LowerArg's already, its place located once (`Slots[Next()] += 1`). */
+    auto IsAssign = [&](const Json& E) {
+        const std::string K = Kind(E);
+        return (K == "BinaryOperator" && E.value("opcode", std::string()) == "=")
+            || (K == "CXXOperatorCallExpr" && OperatorOf(E) == "=" && Nth(E, 2));
+    };
     std::function<Json*(Json&, bool)> Seek = [&](Json& E, bool bRoot) -> Json* {
         if (!E.is_object()) return nullptr;
         const std::string K = Kind(E);
-        if (!bRoot && IsComma(E)) { Target = &E; return &E; }
+        if (!bRoot && (IsComma(E) || IsAssign(E))) { Target = &E; return &E; }
         if (!E.contains("inner") || !E["inner"].is_array() || E["inner"].empty()) return nullptr;
         Json& In = E["inner"];
         auto Ordered = [&](std::initializer_list<size_t> Order) -> Json* {
@@ -9584,10 +9621,7 @@ int32 FCompiler::HoistComma(const Json& Stmt, Json* Seq, std::string* Err)
         }
         if (K == "CXXOperatorCallExpr")
         {
-            const std::string Name = Strip(&In[0]) && Strip(&In[0])->contains("referencedDecl")
-                                   ? (*Strip(&In[0]))["referencedDecl"].value("name", std::string()) : std::string();
-            const std::string Sym = Name.compare(0, 8, "operator") == 0 ? Name.substr(8) : std::string();
-            static const std::set<std::string> Assigns = { "=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=" };
+            const std::string Sym = OperatorOf(E);
             static const std::set<std::string> Unsequenced = { "+", "-", "*", "/", "%", "==", "!=", "<", ">", "<=", ">=",
                                                                "&", "|", "^" };
             if (Assigns.count(Sym)) return Ordered({ 2, 1 });       // C++17: the right side first
@@ -9651,7 +9685,15 @@ int32 FCompiler::HoistComma(const Json& Stmt, Json* Seq, std::string* Err)
             N = &(*N)["inner"][0];
         return N == Target;
     };
-    Json Left = (*Target)["inner"][0], Right = (*Target)["inner"][1];
+    /* A comma's sides; an assignment is its own left side, and the variable it wrote its right, read again after it. A
+       left side that is no plain variable would run a second time. */
+    const bool bAssign = !IsComma(*Target);
+    const Json Left = bAssign ? *Target : (*Target)["inner"][0];
+    const Json Right = !bAssign ? (*Target)["inner"][1] : (*Target)["inner"][Kind(*Target) == "CXXOperatorCallExpr" ? 1 : 0];
+    if (bAssign && !IsEagerSafe(*Strip(&Right)))
+    { *Err = "an assignment used as a value, whose left side is no plain variable, which would be evaluated again to read "
+             "it: assign in a statement of its own, then use what it assigned"; return -1; }
+    const std::string What = bAssign ? "an assignment used as a value" : "the comma operator";
     const Json* Moved = nullptr;
     const Json* MovedParent = nullptr;
     for (auto L = Levels.rbegin(); L != Levels.rend() && !Moved; ++L)    // outermost first
@@ -9666,8 +9708,8 @@ int32 FCompiler::HoistComma(const Json& Stmt, Json* Seq, std::string* Err)
     if (Moved && !ValueUse(*Moved, MovedParent))
     {
         if (!(JustTarget(const_cast<Json*>(Moved)) && IsEagerSafe(Right)))
-        { *Err = "the comma operator here is written to or bound to a reference, beside something that may run before it, "
-                 "and its right side is no variable: write its left side as a statement before this one"; return -1; }
+        { *Err = What + " here is written to or bound to a reference, beside something that may run before it, and its "
+                 "right side is no variable: write its left side as a statement before this one"; return -1; }
         Moved = nullptr;
     }
     *Seq = Pre;
