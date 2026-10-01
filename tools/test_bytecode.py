@@ -16,7 +16,7 @@ assetgen-suite-prefetch.json in the temp folder (one for every checkout on the m
 build() uses, each in a staging folder, and a test whose compile is ready takes the result (see assetgen_compile).
 The line before the last says how many were. --no-prefetch compiles each one when the test asks, and still writes the
 list; --check-prefetch also compiles every prefetched one in place and stops the run on any difference."""
-import atexit, copy, glob, hashlib, itertools, json, os, posixpath, re, shutil, subprocess, sys, tempfile, threading
+import atexit, copy, glob, hashlib, itertools, json, os, posixpath, re, shutil, subprocess, sys, tempfile, threading, time
 os.environ['PYTHONIOENCODING'] = 'utf-8'   # the dump tools print non-ASCII names; read back as UTF-8, not the code page
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import runscript
@@ -71,6 +71,7 @@ PREFETCH_MANIFEST = os.path.join(tempfile.gettempdir(), 'assetgen-suite-prefetch
 PREFETCH_OFF, PREFETCH_CHECK = '--no-prefetch' in sys.argv, '--check-prefetch' in sys.argv
 PREFETCH_VERSION = 1            # of the manifest's layout; a manifest of another reads as none
 PREFETCH_MAX = 1000             # manifest entries kept; a run records about 200
+MANIFEST_TRIES, MANIFEST_RETRY_S = 10, 0.05     # another run reading or replacing the manifest holds it this long at most
 TREE_MAX_FILES, TREE_MAX_BYTES = 64, 1 << 20            # a test's source folder past either compiles directly, unrecorded
 TREE_EXTS = ('.cpp', '.h', '.hpp', '.inl', '.inc')      # any other file in a test's source folder: not a fresh out
 STABLE_DIRS = {os.path.normcase(os.path.join(AG, *d)) for d in (('tests',), ('tests', 'pending'), ('tests', 'ast'), ('examples',))}
@@ -227,12 +228,25 @@ def _wrote_outside(stdout, stage, outputs):
                for d in re.findall(r'(?m)^\s*registry\s+-> (.+)/AssetRegistry\.bin', stdout))
 
 
+def _retried(fn):
+    """fn(), tried again for a while on PermissionError. Windows renames over no file another process has open, and
+    opens no file while it is being renamed over: two checkouts' runs share the manifest, so one may hold it briefly."""
+    for attempt in range(MANIFEST_TRIES):
+        try:
+            return fn()
+        except PermissionError:
+            if attempt == MANIFEST_TRIES - 1: raise
+            time.sleep(MANIFEST_RETRY_S)
+
+
 def _read_manifest():
     """The last run's entries, in the order it made their compiles; none when there is no manifest of this layout.
     Any failure to read one means no prefetch, never a failed run: json.load raises RecursionError on deep nesting."""
-    try:
+    def load():
         with open(PREFETCH_MANIFEST, encoding='utf-8') as f:
-            data = json.load(f)
+            return json.load(f)
+    try:
+        data = _retried(load)
         if data.get('version') == PREFETCH_VERSION and isinstance(data.get('entries'), list):
             return [e for e in data['entries'] if isinstance(e, dict)]
     except Exception:
@@ -248,9 +262,12 @@ def _write_manifest(entries):
         fd, tmp = tempfile.mkstemp(prefix='assetgen-suite-prefetch.', suffix='.tmp', dir=os.path.dirname(PREFETCH_MANIFEST))
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             json.dump({'version': PREFETCH_VERSION, 'entries': entries[:PREFETCH_MAX]}, f)
-        os.replace(tmp, PREFETCH_MANIFEST)
+        _retried(lambda: os.replace(tmp, PREFETCH_MANIFEST))
     except OSError:
-        if tmp and os.path.exists(tmp): os.remove(tmp)
+        try:
+            if tmp: os.remove(tmp)
+        except OSError:
+            pass
 
 
 def _call_site():
