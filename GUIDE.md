@@ -968,15 +968,15 @@ public:
 ```
 
 In `mods.yaml`, `needs` builds the owner first, and `embed` packs the owner's assets and registry rows into the user's
-pak, so that one pak works alone. Without `embed`, ship both paks. List the header in `sources`, so that an edit to it
-rebuilds every mod that uses it.
+pak, so that one pak works alone. Without `embed`, ship both paks. An edit to the shared header rebuilds every mod that
+includes it; bpbuild finds the includes itself.
 
 ```yaml
 mods:
   - name: Core
-    sources: [Core.cpp, Shared.h]    # the first source holds the UE_MOD_PACKAGE line
+    sources: [Core.cpp]
   - name: Arena
-    sources: [Arena.cpp, Shared.h]
+    sources: [Arena.cpp]
     needs: [Core]                    # build Core first
     embed: true                      # and pack Core's assets into Arena_P.pak too
 ```
@@ -1159,11 +1159,11 @@ With fewer than three arguments, bpbuild prints its usage line and stops.
 ```yaml
 mods:
   - name: MathLib                  # -> out/MathLib_P.pak
-    sources: [MathLib.cpp, MathLib.h]
+    sources: [MathLib.cpp]
     generate_api: true             # also write editor stubs
 
   - name: LibraryUser              # -> out/LibraryUser_P.pak
-    sources: [LibraryUser.cpp, MathLib.h]
+    sources: [LibraryUser.cpp]
     needs: [MathLib]               # build MathLib first
     embed: true                    # and pack MathLib's assets into LibraryUser_P.pak too
 ```
@@ -1180,7 +1180,7 @@ Keys of a mod:
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `name` | required | Names the build folder `build/<name>/` and the pak `out/<name>_P.pak`. Other mods refer to the mod by this name in `needs`. |
-| `sources` | required | Files relative to the mods dir. Each `.cpp` is compiled, in order, into the mod's package folder. Any other file only counts for staleness, so list the headers the `.cpp` files include. The **first** entry must hold the mod's `UE_MOD_PACKAGE` line: bpbuild finds it with a text search and stops the whole build with `<file> declares no UE_MOD_PACKAGE` otherwise, so list the `.cpp` first. With `embed`, the same check runs on the first source of each dependency. A mod with no sources, or with a source that does not exist, prints `SKIP - no such source` and counts as failed. |
+| `sources` | required | The mod's `.cpp` files, relative to the mods dir; globs work (`MyMod/*.cpp`, expanded in name order). The `.cpp` files compile into the mod's package folder as **one** translation unit: with more than one, bpbuild writes `build/<name>/<name>.unity.cpp`, which `#include`s each in order, and compiles that. So a mod can keep a header and a `.cpp` per class (`sources: [MyMod/*.cpp]`), `UE_MOD_PACKAGE` is written once in any one of them, and file-local names (`static` functions, anonymous namespaces) must not clash across the files. The headers they `#include "..."`, transitively, count for staleness on their own, except `UeApi/` and `UeAssets/` (the UeApi dir counts as a whole); a header listed here also only counts for staleness. One of the `.cpp` files must hold the mod's `UE_MOD_PACKAGE` line: bpbuild finds the first with a text search and stops the whole build with `<files> declares no UE_MOD_PACKAGE` otherwise. With `embed`, the same check runs on each dependency. A mod with no `.cpp`, or with a listed source that does not exist, prints `SKIP - no such source` and counts as failed. |
 | `needs` | none | Mods to build before this one. An unknown name stops the build with ``mods.yaml: `needs` names an unknown mod: <name>``. A cycle is not an error: bpbuild breaks it, and since every mod compiles before any mod packs, both sides still see each other's assets. |
 | `embed` | `false` | Also packs every mod reachable through `needs`, directly or not, into this mod's pak, and merges their registries into its registry. The pak then works on its own. |
 | `generate_api` | `false` | Also writes the editor stubs for this mod's classes, structs and enums (see [Editor API stubs](#editor-api-stubs)). |
@@ -1237,7 +1237,7 @@ The last line counts the mods built, packed, up to date and failed. The exit sta
 
 | bpbuild... | when |
 | --- | --- |
-| recompiles the mod | `--force` is given; the mod's package folder holds no staged asset yet; `generate_api` is set and a stub folder holds no `.uasset`/`.uexp`; or one of the `sources`, the files directly in the UeApi dir, or the `assetgen` binary is newer than the **oldest** staged asset. |
+| recompiles the mod | `--force` is given; the mod's package folder holds no staged asset yet; `generate_api` is set and a stub folder holds no `.uasset`/`.uexp`; or one of the `sources` or the local headers they include, the files directly in the UeApi dir, or the `assetgen` binary is newer than the **oldest** staged asset. |
 | repacks without recompiling | the newest staged asset of the mod, or of a dependency it embeds, is newer than the mod's pak (not with `--no-pak`). This picks up a dependency that changed, or a pak that an earlier `--no-pak` run skipped. |
 | prints `up to date` | neither applies. |
 
@@ -1469,7 +1469,7 @@ editor can then call your mod's functions from their own Blueprints. At run time
 ```yaml
 mods:
   - name: MathLib
-    sources: [MathLib.cpp, MathLib.h]
+    sources: [MathLib.cpp]
     generate_api: true
     api_dir: D:/UeProjects/MyProject/Content    # optional; the default is out/api/Content in the mods dir
 ```

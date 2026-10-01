@@ -6314,12 +6314,12 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
 - `<Mod> FAILED`: `assetgen compile` failed on one of the mod's sources; its `FAILED: <message>` line is printed
   directly above. The mod's remaining sources are not compiled, the other mods still build, and the exit code is 1.
   Fix: fix what assetgen's message names. See [Building mods](GUIDE.md#building-mods).
-- `<Source> declares no UE_MOD_PACKAGE`: the first file in the mod's `sources` has no `UE_MOD_PACKAGE("...")` line.
-  bpbuild reads the package from that file with a text search, so it does not see the macro when a header is listed
-  first or when another macro produces it. The same check runs on the first source of each `needs` dependency when
-  the mod sets `embed: true`. It stops the whole build. Fix: list the `.cpp` that holds the `UE_MOD_PACKAGE` line
-  first. See [Building mods](GUIDE.md#building-mods).
-- `<Mod> SKIP - no such source: <Paths>`: a listed source does not exist, or the mod lists none (`(none listed)`).
+- `<Sources> declares no UE_MOD_PACKAGE`: no `.cpp` in the mod's `sources` has a `UE_MOD_PACKAGE("...")` line.
+  bpbuild reads the package with a text search, so it does not see the macro when a header holds it or another macro
+  produces it. The same check runs on each `needs` dependency when the mod sets `embed: true`. It stops the whole
+  build. Fix: write the `UE_MOD_PACKAGE` line in one of the mod's `.cpp` files. See
+  [Building mods](GUIDE.md#building-mods).
+- `<Mod> SKIP - no such source: <Paths>`: a listed source does not exist, or the mod lists no `.cpp` (`(no .cpp listed)`).
   Paths are relative to the folder that holds `mods.yaml`. The mod counts as failed; the others still build. Fix: fix
   the `sources` paths. See [Building mods](GUIDE.md#building-mods).
 - ``mods.yaml: `needs` names an unknown mod: <Name>``: a `needs` entry names no mod in `mods.yaml`. It stops the
