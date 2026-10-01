@@ -6216,6 +6216,32 @@ def comp_attach_inherited():
 comp_attach_inherited()
 
 
+def comp_attach_root():
+    """`Glow->SetupAttachment(RootComponent)` in UE_DEFAULTS puts Glow under the actor's root, whichever component that
+    is, as a constructor's call does. Below a parent that gives the actor a root, ACharacter's capsule (RootChar) or a
+    Blueprint parent's root (RootKid), Glow's node is a root node naming no parent, which ExecuteScriptOnActor attaches
+    to that root (SimpleConstructionScript.cpp 686). With none to inherit, the root is the first of the class's own
+    scene components left alone, Base though Glow is declared first (RootOwn), and with none of those the
+    DefaultSceneRoot node, which keeps Glow as its child, as the editor saves a component added under it
+    (CompAttachRoot). Glow sits 30 above the root, and RootOwn's Base hands its own 50 on to it."""
+    base = pending_asset('CompAttachRoot')
+    folder = os.path.dirname(base)
+    for cls, root in (('RootKid', 'Root'), ('RootOwn', 'Base'), ('CompAttachRoot', 'DefaultSceneRoot')):
+        got, attach, made, stored = construct(os.path.join(folder, cls))
+        assert (got, attach.get('Glow')) == (root, root), '%s: the root is %s and Glow attaches to %s' % (cls, got, attach.get('Glow'))
+    p, ci = class_pkg(os.path.join(folder, 'RootChar'))
+    si, nodes, roots, dsr = comp.scs(p, ci)
+    glow = node_named(p, ci, 'Glow')
+    assert glow.index in roots and glow.parent == 'None', (glow.parent, [nodes[r].name for r in roots])
+    for cls, want in (('RootChar', 30.0), ('RootKid', 30.0), ('RootOwn', 80.0), ('CompAttachRoot', 30.0)):
+        p, ci = class_pkg(os.path.join(folder, cls))
+        assert world_location(p, ci, 'Glow') == (0.0, 0.0, want), (cls, world_location(p, ci, 'Glow'))
+        keeps_invariants(os.path.join(folder, cls))
+
+
+pending('CompAttachRoot: SetupAttachment(RootComponent) puts a component under the actor\'s root', comp_attach_root)
+
+
 # ---- Refusals: each of these would build a package the engine mishandles
 
 CLASH_BASE = ('class ClashBase : public AActor {\npublic:\n  UE_COMPONENT(USceneComponent, Root);\n'
