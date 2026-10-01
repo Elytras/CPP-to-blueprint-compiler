@@ -4193,6 +4193,22 @@ ueapi_too_old()
 print('ok  a UeApi older than the compiler, or with no Version.json, is refused, saying to regenerate it')
 
 
+def ueapi_not_one():
+    """A folder that is no UeApi at all - a mod folder, which has no Version.json, Types.json or Conv.json, or a path
+    that does not exist - is reported as such, `missing or invalid <dir>/<File> (run genueapi.py)`, and not as one an
+    older genueapi wrote."""
+    import tempfile
+    src = os.path.join(TESTS, 'PreloadCaseKid.cpp')
+    with tempfile.TemporaryDirectory() as tmp:
+        for api in (os.path.join(AG, 'tests'), os.path.join(tmp, 'NoSuchFolder')):
+            proc = assetgen_compile([src, api, os.path.join(tmp, 'out')])
+            assert proc.returncode != 0 and 'missing or invalid' in proc.stdout and 'run genueapi.py' in proc.stdout \
+                and 'older genueapi' not in proc.stdout, (api, proc.stdout[-500:])
+
+
+pending('UeApi: a folder that is no UeApi is reported as none, not as an older one', ueapi_not_one)
+
+
 def ueapi_without_game():
     """genueapi without --game writes no game Blueprint's UeDefaultSubobjects or UeClassTail, which reads as a Blueprint
     with none: a class deriving from one would compile without a word and load before its parent's subobjects. Its
