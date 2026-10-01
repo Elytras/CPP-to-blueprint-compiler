@@ -5878,6 +5878,21 @@ refused('UberShadow', '  int32 X;\n', 'UberShadowKid::ExecuteUbergraph_UberShado
 print('ok  UberShadow: a method named like an ubergraph is refused')
 
 
+def none_names():
+    """FName("None") is NAME_None, whatever its case, and a tag of that name ends the tag list a value is read as (Class.cpp
+    1326-1329): a UE_STRUCT member named None ends a class default's value of the struct, its later members unread, and
+    a class's own member would end its default object's list. The editor refuses the name for a variable or a function
+    ("Name cannot be empty.", FKismetNameValidator::IsValid, Kismet2NameValidators.cpp 135-142), and so is it here: a
+    member, a UE_STRUCT member and a function, in any case."""
+    refused('NoneMember', '  int32 None;\n', 'NoneMember::None: None is UE\'s empty name')
+    refused('NoneStructMember', '  FNoneSlot S;\n', 'FNoneSlot::none: None is UE\'s empty name',
+            'struct FNoneSlot {\n  UE_STRUCT;\n  int32 A = 1;\n  int32 none{};\n  int32 B = 3;\n};\n')
+    refused('NoneFunction', '  int32 NONE() { return 1; }\n', 'NoneFunction::NONE: None is UE\'s empty name')
+
+
+pending('Names: a member, UE_STRUCT member or function named None is refused', none_names)
+
+
 # ---- DELEG: delegates and event dispatchers - signatures, binds, broadcasts, timers by name (invariant_rules/delegates.py)
 
 import invariants
