@@ -13715,6 +13715,27 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                        "flags: Exec, Final, Static\"); rename this one";
             return false;
         }
+        /* A static over a static is C++ name hiding, which no Blueprint writes: the editor's entry naming the parent's
+           function, no BlueprintEvent, "cannot be overridden" (KismetCompiler.cpp 3312-3316). It splits no caller, so
+           it compiles with a warning, its super the one it hides as FindFunctionByName gives it; but a super of other
+           parameters is a link no editor makes (IsSignatureCompatibleWith, 1993-2011), so one of another signature is
+           refused. */
+        if (const auto [A, bAboveStatic] = FoundAbove(R, Fn.Name);
+            A && A->UePackage.compare(0, 8, "/Script/") != 0 && bAboveStatic && IsStaticDecl(*Fn.Decl))
+        {
+            const Json& Above = *A->Methods.at(Fn.Name);
+            if (SignatureOf(Above) != SignatureOf(*Fn.Decl))
+            {
+                *Err = R.CppName + "::" + Fn.Name + " is static and hides " + A->CppName + "::" + Fn.Name + ", a static of "
+                       "another signature, " + TypeOf(Above) + " against " + TypeOf(*Fn.Decl) + ": a Blueprint class has "
+                       "one function of a name, and the editor makes the parent's its super, which takes the same "
+                       "parameters; rename this one";
+                return false;
+            }
+            printf("  warning: %s::%s hides %s::%s, a static: compiled as C++ name hiding, each call running the one it "
+                   "names; the editor refuses a function named like its parent's (\"cannot be overridden\")\n",
+                   R.CppName.c_str(), Fn.Name.c_str(), A->CppName.c_str(), Fn.Name.c_str());
+        }
         /* `= 0` with no body anywhere is an empty function, like an interface's stub below: a subclass's version needs
            it as its super, and a call by name on an object without one would not find a function (a Fatal). */
         if ((Fn.Body = BodyOf(R, Fn.Name, Fn.Def)) || Fn.Decl->value("pure", false)) Methods.push_back(Fn);

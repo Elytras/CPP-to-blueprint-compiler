@@ -5186,7 +5186,8 @@ def static_over_static():
                 '  float Use(float V) { return Tell(V) + SssRoot::Tell(2); }\n};\n')
 
 
-pending('FuncStaticHide: a static over a static warns, and is refused when its signature differs', static_over_static)
+static_over_static()
+print('ok  FuncStaticHide: a static over a static warns, and is refused when its signature differs')
 
 
 def func_iface_unnamed():

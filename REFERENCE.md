@@ -2160,7 +2160,8 @@ Notes:
 | `static APawn *FirstPawn(UObject *WorldContextObject = nullptr)` | The first parameter whose name starts with `WorldContext` is what every engine call inside the static receives as its world context, as the editor wires the hidden pin. A caller that leaves it out passes its own `this`, or its own world context when the caller is itself such a static. | Yes |
 | `class MyLib : public UBlueprintFunctionLibrary` holding statics | The editor's Blueprint Function Library. Another mod that includes its header calls the statics like an engine library's: a final call on the library's default object, with a world context left out filled with the caller's `this`. | Yes |
 | A static that calls Delay or UE_AWAIT | Refused: `a static function has no object whose ubergraph frame could keep its locals`; see [Latent calls](#latent-calls). | Refused |
-| `static int32 Tell(int32 V)` in a class whose mod parent has a static `Tell` too | Hides the parent's, as in C++. Every call to a static is bound to the one it names, so `Tell(V)` runs this one and `Parent::Tell(V)` the parent's. It is cooked with the parent's static as its super, as the editor links any function named like a parent's; the editor itself would refuse the name. | Yes |
+| `static int32 Tell(int32 V)` in a class whose mod parent has a static `Tell` too | Hides the parent's, as in C++, with a warning: "... hides Parent::Tell, a static: compiled as C++ name hiding ...". Every call to a static is bound to the one it names, so `Tell(V)` runs this one and `Parent::Tell(V)` the parent's. It is cooked with the parent's static as its super, as the editor links any function named like a parent's; the editor itself would refuse the name ("cannot be overridden"). | Warns |
+| `static float Tell(float V)` over a mod parent's `static int32 Tell(int32)` | Refused: "... is static and hides Parent::Tell, a static of another signature, ...". Its super would be the parent's static, a function of other parameters, which no editor links. Rename this one. | Refused |
 | A method that is not static named like a mod parent's static, or a static named like a parent's method | Refused: "... is static, and the editor takes a function of that name in a subclass for an override of it ..." or "... is static, and the Parent::Tell it hides is not ...". The editor makes a function named like a parent's an override of it, and an override must agree with it on Static. The parent may be another mod's class, from the header it shares. Rename one of them. | Refused |
 
 ```cpp
@@ -5759,6 +5760,13 @@ and where the feature is described. In each group, the messages you are most lik
   this one static too. See [Static functions and function libraries](#static-functions-and-function-libraries).
 - `<Class>::<Method> is static, and the <Base>::<Method> it hides is not: ...; rename this one`: the same the other way
   round, a static named like an ancestor's method. Fix: rename one of them.
+- `<Class>::<Method> is static and hides <Base>::<Method>, a static of another signature, ...; rename this one`: a
+  static named like an ancestor's static that takes other parameters. Its super would be that static, a function of
+  other parameters, which the editor never links. Fix: rename one of them, or give both the same signature (that
+  compiles, with a warning).
+- `warning: <Class>::<Method> hides <Base>::<Method>, a static: compiled as C++ name hiding, ...`: a static named like
+  an ancestor's static of the same signature. Each call runs the one it names, as in C++; the editor would refuse the
+  name. Fix: rename one of them to make no Blueprint the editor could not.
 - `inline function <Class>::<Method> calls itself`: recursion through inline functions, direct or through another
   inline function. Each call copies the body in, so the copying never ends. One overload calling another is fine. Fix:
   drop `inline`, because a Blueprint function can call itself, or write a loop. See

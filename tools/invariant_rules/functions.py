@@ -159,13 +159,15 @@ def class_functions(pkg):
 
 def replaced(pkg, ci, fi, st):
     """(the function F replaces, how): its SuperStruct's function ('super'), or when it has none the interface function
-    of a class it lists that it implements ('interface'). (None, None) for a new function; (None, 'unknown') when the
-    super cannot be read. A static whose super is a static replaces nothing: it only hides that one, as C++ does, and
-    every call to either is bound to the one it names (EX_CallMath / EX_FinalFunction), so neither its flags nor its
-    parameters reach a caller of the other. Its super is still what FindFunctionByName finds (func_super_link)."""
+    of a class it lists that it implements ('interface'); a static whose super is a static ('hides'). (None, None) for a
+    new function; (None, 'unknown') when the super cannot be read. A static over a static replaces nothing: it only
+    hides that one, as C++ does, and every call to either is bound to the one it names (EX_CallMath /
+    EX_FinalFunction), so its flags reach no caller of the other (func_override_flags skips it). Its super is still
+    what FindFunctionByName finds (func_super_link), and a super of other parameters is a link the editor never makes
+    (IsSignatureCompatibleWith, KismetCompiler.cpp:1993-2011), so func_override_params still holds it to that one's."""
     if st.super:
         f = fn_at(pkg, st.super)
-        if f and f.flags & FUNC_Static and st.function_flags & FUNC_Static: return None, None
+        if f and f.flags & FUNC_Static and st.function_flags & FUNC_Static: return f, 'hides'
         return (f, 'super') if f else (None, 'unknown')
     f = own_interface_function(pkg, ci, pkg.exports[fi]['name'])
     if f == 'unknown': return None, 'unknown'
@@ -467,7 +469,7 @@ def func_override_flags(pkg):
     non-event - splits the behaviour: those callers keep the parent's, by-name callers get this one."""
     for ci, fi, st in class_functions(pkg):
         p, how = replaced(pkg, ci, fi, st)
-        if p is None: continue
+        if p is None or how == 'hides': continue
         f, q = st.function_flags, p.flags
         inherit = q & (FUNC_FuncInherit | FUNC_AccessSpecifiers | FUNC_BlueprintPure)
         if inherit & ~f: yield fi, 'FunctionFlags %#x lack %#x of %s (%#x)' % (f, inherit & ~f, p.where, q)
@@ -492,7 +494,7 @@ def func_override_params(pkg):
         p, how = replaced(pkg, ci, fi, st)
         if p is None: continue
         why = sig_mismatch(Fn(pkg, fi), p)
-        if why: yield fi, '%s of %s: %s' % ('overriding' if how == 'super' else 'implementing', p.where, why)
+        if why: yield fi, '%s of %s: %s' % ({'super': 'overriding', 'hides': 'hiding'}.get(how, 'implementing'), p.where, why)
 
 
 INTERFACE_STUB = FUNC_BlueprintEvent | FUNC_BlueprintCallable | FUNC_Public
