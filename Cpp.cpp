@@ -29,6 +29,7 @@
 #include <nlohmann/json.hpp>
 
 #include "Blueprint.h"
+#include "Command.h"
 #include "Cooked.h"
 #include "Package.h"
 #include "Registry.h"
@@ -13774,7 +13775,7 @@ public:
 };
 
 /* Reads clang's pipe on a thread of its own and hands the dump to the parser in chunks, in order. On one thread clang
-   and FAstSax took turns: _popen's pipe holds 1 KB and fread keeps reading until it has filled the whole request, so
+   and FAstSax took turns: the pipe holds a few KB and fread keeps reading until it has filled the whole request, so
    clang sat on a full pipe while FAstSax parsed a MB, and FAstSax sat idle while clang wrote the next one. The queue is
    capped: a parser slower than clang would otherwise hold most of the dump, and the suite runs 8 compiles at once. */
 class FDumpStream : public IDumpChunks
@@ -13799,7 +13800,7 @@ public:
     }
 
     /* Drops what is queued and waits for the reader, which reads the rest of the pipe without keeping it: after a parse
-       that stopped early clang still has output to write, and pclose waits for clang to exit. */
+       that stopped early clang still has output to write, and CloseCommand waits for clang to exit. */
     void Stop() noexcept
     {
         {
@@ -13934,15 +13935,11 @@ bool ParseAst(FAstSource& Src, Json* Out, bool bFrozenKeys)
 bool RunClang(const std::string& Cmd, const std::string& SourcePath, const std::function<void(IDumpChunks&)>& Read,
               std::string* Err)
 {
-#ifdef _WIN32
-    /* cmd /c strips the first and last quote of a line that starts with one, so wrap it in a spare pair. */
-    FILE* Pipe = _popen(("\"" + Cmd + "\"").c_str(), "rb");
-#else
-    FILE* Pipe = popen(Cmd.c_str(), "r");
-#endif
-    if (!Pipe) { *Err = "could not run clang"; return false; }
+    FCommandPipe Clang;
+    if (!OpenCommand(Cmd, Clang)) { *Err = "could not run clang++ (is it on PATH?)"; return false; }
+    FILE* const Pipe = Clang.Out;
     uint64 Total = 0;
-    /* Any exception, the reader's or Read's, waits until the pipe is closed: thrown past pclose, it would leave clang
+    /* Any exception, the reader's or Read's, waits until the pipe is closed: thrown past CloseCommand, it would leave clang
        behind. */
     std::exception_ptr Error;
     try
@@ -13954,13 +13951,9 @@ bool RunClang(const std::string& Cmd, const std::string& SourcePath, const std::
         Total = Stream.Total();
     }
     catch (...) { Error = std::current_exception(); }
-    /* Already at its end, unless the reader thread never started: clang would wait on a full pipe, and pclose on clang. */
+    /* Already at its end, unless the reader thread never started: clang would wait on a full pipe, and CloseCommand on clang. */
     for (char Rest[4096]; fread(Rest, 1, sizeof Rest, Pipe) != 0;) {}
-#ifdef _WIN32
-    const int Status = _pclose(Pipe);
-#else
-    const int Status = pclose(Pipe);
-#endif
+    const int Status = CloseCommand(Clang);
     if (Error) std::rethrow_exception(Error);
     if (Status != 0) { *Err = "clang rejected " + SourcePath + " (diagnostics above)"; return false; }
     if (Total == 0) { *Err = "clang produced no AST for " + SourcePath; return false; }
