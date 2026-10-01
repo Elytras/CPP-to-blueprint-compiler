@@ -64,8 +64,8 @@ def parallel(fn, items):
 # compile is one of them takes that result, moved into place, instead of compiling. The manifest only says what to
 # compile: every result is this run's assetgen on the files the test itself wrote, used only when it is the same
 # compile in everything a compile reads (_compile_entry). --no-prefetch compiles each one when the test asks, as before,
-# and still records the manifest; --check-prefetch also compiles every prefetched one in its real place, and stops the
-# run on any difference.
+# and still records the manifest; --check-prefetch also compiles every prefetched one in its real place, once the moved
+# result is taken out again, and stops the run on any difference.
 
 PREFETCH_MANIFEST = os.path.join(tempfile.gettempdir(), 'assetgen-suite-prefetch.json')   # one per machine: any checkout's last run
 PREFETCH_OFF, PREFETCH_CHECK = '--no-prefetch' in sys.argv, '--check-prefetch' in sys.argv
@@ -403,10 +403,7 @@ class CompilePrefetch:
             if not res['usable'] or any(os.path.lexists(os.path.join(real, *o.split('/'))) for o in res['outputs']):
                 self.unused += 1
                 return None
-            if PREFETCH_CHECK:
-                self.hits += 1
-                return self._checked(cmd, entry, real, res)
-            proc = _materialize(cmd, res, real)
+            proc = self._checked(cmd, entry, real, res) if PREFETCH_CHECK else _materialize(cmd, res, real)
             if proc is None: self.unused += 1
             else: self.hits += 1
             return proc
@@ -414,32 +411,42 @@ class CompilePrefetch:
             self._drop(res)
 
     def _checked(self, cmd, entry, real, res):
-        """--check-prefetch: the compile made directly in its real place, which must give what the staged one gave: exit
-        code, stdout and stderr (staging folder swapped for the real one), and every folder and file it wrote, byte for
-        byte. In AssetGen only the folder holding all it wrote is compared, not the whole tree."""
+        """--check-prefetch: the result moved into place as a plain run moves it (_materialize), what that put there
+        taken out again, then the compile made directly in the same place, which must give the same: exit code, stdout
+        and stderr, and every folder and file written, byte for byte. So the check covers the move a plain run relies
+        on, not only the staged compile. In AssetGen only the folder holding all it wrote is compared, not the whole
+        tree. None, as in a plain run, when the move fails; an error taking it out or walking the folder stops the run."""
         top = ''
         if entry['kind'] == 'stable' and entry['out'][0] == 'ag':
-            top = posixpath.commonpath([posixpath.dirname(o) for o in res['outputs']]
+            top = posixpath.commonpath([posixpath.dirname(o) for o in res['outputs']] + list(res['dirs'])
                                        + [entry['out'][1].replace('\\', '/').strip('/')])
         root = os.path.join(real, *top.split('/')) if top else real
-        under = lambda rels: {r[len(top) + 1:] if top else r for r in rels}
-        dirs, files = _walk(root)
-        proc = subprocess.run(cmd, capture_output=True, encoding='utf-8')
-        dirs_after, files_after = _walk(root)
-        made = {r: data for r, data in files_after.items() if files.get(r) != data}
-        want = {}
-        for o in res['outputs']:
-            with open(os.path.join(res['stage'], *o.split('/')), 'rb') as f: want[next(iter(under([o])))] = f.read()
-        problems = [] if proc.returncode == res['rc'] else ['exit %d, prefetched %d' % (proc.returncode, res['rc'])]
+        site = _call_site()
+        fail = lambda problems: PrefetchMismatch('--check-prefetch, at %s: %s' % (site, '; '.join(problems)))
+        try:
+            dirs, files = _walk(root)
+            moved = _materialize(cmd, res, real)
+            if moved is None: return None
+            dirs_moved, files_moved = _walk(root)
+            for r in files_moved.keys() - files.keys(): os.remove(os.path.join(root, *r.split('/')))
+            for d in sorted(dirs_moved - dirs, reverse=True): os.rmdir(os.path.join(root, *d.split('/')))
+            if _walk(root) != (dirs, files): raise fail(['taking the moved result out did not leave the folder as it was'])
+            proc = subprocess.run(cmd, capture_output=True, encoding='utf-8')
+            dirs_after, files_after = _walk(root)
+        except OSError as e:
+            raise fail(['%s: %s' % (type(e).__name__, e)])
+        problems = [] if proc.returncode == moved.returncode else ['exit %d, prefetched %d' % (proc.returncode, moved.returncode)]
         for name in ('stdout', 'stderr'):
-            got, staged = getattr(proc, name).splitlines(), _swap(res[name], res['stage'], real).splitlines()
+            got, staged = getattr(proc, name).splitlines(), getattr(moved, name).splitlines()
             if got != staged:
                 at = next((i for i, (a, b) in enumerate(zip(got, staged)) if a != b), min(len(got), len(staged)))
                 problems.append('%s line %d: %r, prefetched %r' % (name, at + 1, (got + [None])[at], (staged + [None])[at]))
-        if made.keys() != want.keys() or dirs_after - dirs != under(res['dirs']):
-            problems.append('wrote %s, prefetched %s' % (sorted(made) + sorted(dirs_after - dirs), sorted(want) + sorted(under(res['dirs']))))
+        made = {r: data for r, data in files_after.items() if files.get(r) != data}
+        want = {r: data for r, data in files_moved.items() if files.get(r) != data}
+        if made.keys() != want.keys() or dirs_after - dirs != dirs_moved - dirs:
+            problems.append('wrote %s, moved in %s' % (sorted(made) + sorted(dirs_after - dirs), sorted(want) + sorted(dirs_moved - dirs)))
         problems += ['%s differs' % r for r in sorted(made.keys() & want.keys()) if made[r] != want[r]]
-        if problems: raise PrefetchMismatch('--check-prefetch, at %s: %s' % (_call_site(), '; '.join(problems)))
+        if problems: raise fail(problems)
         return proc
 
     def _drop(self, res):
