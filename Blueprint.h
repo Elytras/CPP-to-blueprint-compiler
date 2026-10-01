@@ -124,6 +124,11 @@ public:
        cannot express: declaring the name again would shadow it with a second property. */
     void AddCdoDefault(const FPropertyDef& Var) { CdoDefaults.push_back(Var); }
 
+    /* The actor has a root before this class's SCS runs: a Blueprint parent's SCS leaves one, and a native parent's
+       constructor sets one or ExecuteConstruction takes its first native scene component. Then the DefaultSceneRoot
+       node is in neither RootNodes nor AllNodes, as the editor saves it (ValidateSceneRootNodes). */
+    void SetRootInherited(bool bInherited) { bRootInherited = bInherited; }
+
     void Finish();
 
     /* The editor-side stub of this class: <OutDir>/<asset>.uasset, signatures only (Uncooked.h).
@@ -160,6 +165,7 @@ private:
     std::string ClassName;
     std::string ParentPackage, ParentClass;
     bool bParentIsBlueprint = false;
+    bool bRootInherited = false;
     bool bIsActor = true;
     bool bIsComponent = false;
     bool bReplicates = false;

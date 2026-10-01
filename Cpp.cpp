@@ -12290,6 +12290,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             for (const auto& [Member, Spec] : A->Subobjects)
                 bRootInherited = bRootInherited || (Spec.rfind('.') != std::string::npos && IsScene(Find("U" + Spec.substr(Spec.rfind('.') + 1))));
         }
+        BP.SetRootInherited(bRootInherited);      // and its DefaultSceneRoot node is listed nowhere
         std::vector<std::pair<std::string, const FRecord*>> Scene;     // this class's scene components, the root first
         for (const Json* F : R.Fields)
         {

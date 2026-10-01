@@ -6030,18 +6030,42 @@ def comp_root_keep():
 
 def comp_char_root():
     """components.py's hierarchy(), the construction scs_names_distinct checks names against, is the one the engine
-    runs. CompCharRoot's SCS lists its DefaultSceneRoot node in RootNodes, and ExecuteScriptOnActor skips that node
-    when the actor has a root already (SimpleConstructionScript.cpp 648), as an ACharacter always does: its capsule
-    (Character.cpp 59), and failing that the first unattached native scene component (ActorConstruction.cpp 736-746).
-    UeApi marks no RootComponent subobject for ACharacter, since two of its subobjects fit the member."""
-    base = asset('CompCharRoot')
-    p, ci = class_pkg(base)
-    si, nodes, roots, dsr = comp.scs(p, ci)
-    assert dsr is not None and dsr in roots, 'CompCharRoot\'s SCS does not list DefaultSceneRoot in RootNodes'
-    built = [n.name for _, _, ns, _ in comp.hierarchy(p, ci)[0] for n in ns]
-    assert 'DefaultSceneRoot' not in built, 'hierarchy() builds %s on a character, whose capsule is its root' % built
-    keeps_invariants(base)
-    print('ok  CompCharRoot: the rules\' construction of a character skips its DefaultSceneRoot node, as the engine does')
+    runs: it builds no DefaultSceneRoot node for CompCharRoot, a character, or NoiseKid, below a Blueprint parent with a
+    root, whether or not their SCS lists one. ExecuteScriptOnActor skips that node when the actor has a root already
+    (SimpleConstructionScript.cpp 648), as an ACharacter always does: its capsule (Character.cpp 59), and failing that
+    the first unattached native scene component (ActorConstruction.cpp 736-746). UeApi marks no RootComponent subobject
+    for ACharacter, since two of its subobjects fit the member."""
+    folder = os.path.dirname(asset('CompCharRoot'))
+    for cls in ('CompCharRoot', 'NoiseKid'):
+        p, ci = class_pkg(os.path.join(folder, cls))
+        built = [n.name for _, _, ns, _ in comp.hierarchy(p, ci)[0] for n in ns]
+        assert 'DefaultSceneRoot' not in built, 'hierarchy() builds %s on %s, whose actor has a root already' % (built, cls)
+        keeps_invariants(os.path.join(folder, cls))
+    print('ok  CompCharRoot: the rules\' construction of an actor with a root already skips a DefaultSceneRoot node, as '
+          'the engine does')
+
+
+def comp_default_root_inherited():
+    """The DefaultSceneRoot node is in an SCS's RootNodes and AllNodes exactly when no root is there before the SCS
+    runs and none of the class's own components is a scene component: the editor drops it once
+    GetSceneRootComponentTemplate finds a root - the native CDO's root or a scene subobject, or a scene root node of a
+    parent Blueprint's (ValidateSceneRootNodes, SimpleConstructionScript.cpp 1006-1150), and every one of the game's
+    1,885 SCS classes is saved that way. CompCharRoot, a character, and NoiseKid, below NoiseBase's root, list none;
+    ScsNoSceneRoot, an AActor of a movement component alone, lists it. The two below AActor end their construction
+    with a root (construct(); the character's is its capsule)."""
+    folder = os.path.dirname(asset('CompCharRoot'))
+    for base, listed in ((os.path.join(folder, 'CompCharRoot'), False), (os.path.join(folder, 'NoiseKid'), False),
+                         (asset('ScsNoSceneRoot'), True)):
+        p, ci = class_pkg(base)
+        si, nodes, roots, dsr = comp.scs(p, ci)
+        every = [x - 1 for x in comp.tag_objects(comp.tags_at(p, si).get('AllNodes')) if x > 0]
+        where = [name for name, of in (('RootNodes', roots), ('AllNodes', every)) if dsr is not None and dsr in of]
+        assert where == (['RootNodes', 'AllNodes'] if listed else []), \
+            '%s lists its DefaultSceneRoot node in %s' % (os.path.basename(base), where or 'neither RootNodes nor AllNodes')
+        if not base.endswith('CompCharRoot'):
+            assert construct(base)[0] is not None, '%s ends its construction with no root' % os.path.basename(base)
+    print('ok  CompDefaultRoot: the DefaultSceneRoot node is listed only where the actor has no root before the SCS and '
+          'no own scene component, as the editor saves it')
 
 
 comp_tick()
@@ -6050,6 +6074,7 @@ comp_tick_patch()
 comp_override_chain()
 comp_root_keep()
 comp_char_root()
+comp_default_root_inherited()
 
 
 # ---- Pending: what AssetGen does not do yet

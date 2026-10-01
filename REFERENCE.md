@@ -2648,7 +2648,7 @@ Notes:
 | a later scene component | Attaches directly to the root. The tree is one level deep and uses no sockets. | Yes |
 | a component that is not a scene component, such as `UProjectileMovementComponent` | Is created with no attachment, wherever it is declared. | Yes |
 | no `UE_COMPONENT` at all | The actor gets the engine's default scene root. | Yes |
-| only components that are not scene components | The actor gets the engine's default scene root too, as in the editor, so a movement component has a root to move. | Yes |
+| only components that are not scene components | The actor gets the engine's default scene root too, as in the editor, so a movement component has a root to move. Below a parent that gives the actor a root already, a Blueprint parent or a native one such as ACharacter (its capsule), it gets none, as in the editor. | Yes |
 | a scene component nested under another, or at a socket | Not yet: there is no syntax for it. Attach it at run time with `AttachToComponent` (below). | Not yet |
 
 Notes:
