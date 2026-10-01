@@ -7117,7 +7117,7 @@ def tenum_value_init():
     default is Two, Rule's KeepWorld), passed, returned, as a struct literal's member over a non-zero default (P One,
     R KeepWorld; a member left out keeps its default), as an array's element, as a conditional's arm, and as a game
     function's TEnum<E> arguments."""
-    base = pending_asset('TEnumValueInit')
+    base = asset('TEnumValueInit')
     keeps_invariants(base)
     for fn, want in (('Assign', lambda m: m), ('AssignParens', lambda m: m), ('Arg', lambda m: 300 + m),
                      ('Return', lambda m: m), ('Literal', lambda m: (m + 1) * 10), ('Designated', lambda m: 350 + m),
@@ -7134,8 +7134,8 @@ def tenum_value_init():
         del runscript.MATH['K2_DetachFromActor']
 
 
-pending('TEnumValueInit: {} and TEnum<E>() are the zero enumerator wherever a TEnum<E> is assigned, passed or returned',
-        tenum_value_init)
+tenum_value_init()
+print('ok  TEnumValueInit: {} and TEnum<E>() are the zero enumerator wherever a TEnum<E> is assigned, passed or returned')
 
 
 def tenum_holders():

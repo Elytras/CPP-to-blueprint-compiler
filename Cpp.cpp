@@ -4309,6 +4309,9 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         if (SI != Structs.end()) return LowerStructLiteral(*N, SI->second, BP, Out, Err);
         /* `{}` or `TArray<int32>()` as a value: an empty container, a Make Array (Set, Map) with no element. */
         if (!First(*N) && IsContainerType(TypeOf(*N))) return LowerContainerLiteral(*N, TypeOf(*N), BP, Out, Err);
+        /* `{}` or `TEnum<E>()`: TEnum<E> declares a constructor, so its value-initialisation is an argless construct
+           where an E's is a CXXScalarValueInitExpr below. The same zero enumerator. */
+        if (!First(*N) && IsTEnumType(TypeOf(*N))) return ZeroArg(StripTypeKeywords(TypeOf(*N)), BP, Out, Err);
     }
     /* `T()` of an aggregate - a struct with no constructor declared, which is what lets it take `{ .A = 1 }`. */
     if (const FRecord* R = K == "CXXScalarValueInitExpr" ? Find(StripTypeKeywords(TypeOf(*N))) : nullptr; R && R->bIsStruct)

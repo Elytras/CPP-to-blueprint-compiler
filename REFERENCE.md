@@ -1018,6 +1018,7 @@ stays `E`, because an `E` variable cannot bind to a `TEnum<E>&`.
 | You write | What it does | Status |
 |---|---|---|
 | `TEnum<EMood> Mood = EMood::Calm;` | An EMood variable, member, parameter or local. It switches, compares and assigns like a plain EMood. | Yes |
+| `Mood = {};`, `TEnum<EMood>()`, `K2_DetachFromActor({}, {}, {})` | The zero enumerator, as for a plain EMood: assigned, passed (to a game function too), returned, as a struct literal's member or an array element. | Yes |
 | `Mood.Name()` | The enumerator's name as an FName, from `KismetNodeHelperLibrary::GetEnumeratorName` on EMood's UEnum. | Yes |
 | `Mood.String()` | Its display name as an FString, from `GetEnumeratorUserFriendlyName`: the label typed in the editor for a Blueprint enum. | Yes |
 | `.Name()` / `.String()` on an `int32` or `int64` enum | Refused ("a uint8 enum only"): the engine's two lookups take a uint8. | Refused |
