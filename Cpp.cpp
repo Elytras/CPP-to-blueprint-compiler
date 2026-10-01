@@ -12878,6 +12878,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         PD.PropertyFlags = (PD.PropertyFlags & ~uint64(CPF_Parm | CPF_BlueprintReadOnly)) | CPF_BlueprintVisible | CPF_NonTransactional;
         FlagInstancing("USceneComponent *", PD);
         if (PD.PropertyFlags & CPF_InstancedReference) BP.AddClassFlags(CLASS_HasInstancedReference);
+        PD.bApiHidden = true;       // the editor stub's PostLoad makes the node, and the editor's compile its variable
         ClassVars.insert(ClassVars.begin(), { 8, PD });
     }
     std::stable_sort(ClassVars.begin(), ClassVars.end(), [](const auto& A, const auto& B) { return A.first > B.first; });
