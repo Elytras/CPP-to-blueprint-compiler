@@ -5218,6 +5218,35 @@ print("ok  DerivedLiteral: a derived struct literal lists its own members before
       "ones (a value given for one is warned about); FTimerHandle() writes no member")
 
 
+def struct_lit_expr():
+    """A whole-struct literal whose members are not all constants - a `?:`, a `&&`, a call, a member of the variable it
+    is assigned to, a value for a Transient member - is what C++ makes of it, in a local, a member variable, an argument,
+    a return value, a nested struct, a TArray's elements and a UE_STRUCT's braces: the members run left to right, each
+    once, and one that reads the destination reads it as it was. execStructConst steps each member straight into the
+    destination the Let names (ScriptCore.cpp 2647-2686, 3376-3405), which runvm models once struct_const names the
+    members."""
+    import runvm
+    base = asset('StructLitExpr')
+    keeps_invariants(base)
+    members = {'Vector2D': ['X', 'Y'], 'IntPoint': ['X', 'Y'], 'Box2D': ['Min', 'Max', 'bIsValid']}
+    cases = {'Local': lambda M: 12.0 + M, 'Paren': lambda M: 21.0 + 10 * M, 'Member': lambda M: 46.0 + 10 * M,
+             'Arg': lambda M: 17.0 + M, 'ArgBraced': lambda M: 71.0 + 10 * M, 'Ret': lambda M: 13.0 + 10 * M,
+             'Nested': lambda M: 42.0 + M, 'Array': lambda M: 42.0 + M, 'Both': lambda M: 10 * M + (0 < M < 5),
+             'Call': lambda M: 20 * M + 1, 'Order': lambda M: 110 if M == 0 else 100, 'Swap': lambda M: 21.0,
+             'SwapMember': lambda M: 21.0, 'ReadBack': lambda M: 31.0, 'Mod': lambda M: 12 + M, 'ModSwap': lambda M: 21,
+             'Transient': lambda M: 43 + 10 * M}
+    for fn, want in cases.items():
+        for m in (0, 1, 7) if fn == 'Both' else (0, 1):
+            vm = VM(base, Count=0)
+            vm.struct_const = lambda name, vals: runvm.Written(zip(members[name], vals))
+            got = vm.call(fn, M=m)
+            assert got == want(m), 'StructLitExpr.%s(%d) = %r, want %r' % (fn, m, got, want(m))
+
+
+struct_lit_expr()
+print('ok  StructLitExpr: a struct literal with a member that is not a constant is a Make Struct, and runs as C++ runs it')
+
+
 # ---- UBER: ubergraphs along a class chain, their frames and names, latent resumes, awaits in overrides
 # (invariant_rules/ubergraph.py)
 
@@ -6504,8 +6533,9 @@ def prop_enum_class():
     override's parameter, which then has its native parent's type (FEnumProperty::SameType, EnumProperty.cpp 395-398). A
     namespaced enum (EAttachLocation) stays a ByteProperty. Its tags - the CDO's, a UE_DEFAULTS one on a native
     EnumProperty member, an array's and a map's, a UserDefinedStruct's default and a native struct's member - are
-    EnumProperty tags (the GetID(), PropertyTag.cpp 17, 30-36) naming the enum and holding the enumerator's FName. Its
-    values run as bytes: a switch, a compare, a cast, a map lookup and a native struct literal."""
+    EnumProperty tags (the GetID(), PropertyTag.cpp 17, 30-36) naming the enum and holding the enumerator's FName; an
+    empty array, set or map of it, its counts alone. Its values run as bytes: a switch, a compare, a cast, a map lookup
+    and a native struct literal."""
     import invariants, runvm
     base = asset('PropEnumClass')
     folder = os.path.dirname(base)
@@ -6538,6 +6568,10 @@ def prop_enum_class():
     assert is_enum_class(member, rule_enum, slot), 'the UE_STRUCT member is a %s' % member.type
     t = next(t for t in slot.struct(0).defaults if t['name'].startswith('Rule_'))
     assert (t['type'], t['enum'], fname_at(slot.names, t['value'], 0)) == ('EnumProperty', 'EAttachmentRule', 'eattachmentrule::snaptotarget'), t
+    # Its empty array, set and map of the enum: the default instance tags each with its counts alone.
+    empty = {t['name'].split('_')[0]: t['value'] for t in slot.struct(0).defaults
+             if t['name'].split('_')[0] in ('Vis', 'Met', 'Toll')}
+    assert empty == {'Vis': bytes(4), 'Met': bytes(8), 'Toll': bytes(8)}, empty
 
     cdo = pkg.find('Default__PropEnumClass_C')
     for name, enum, value in (('Rule', 'EAttachmentRule', 'keepworld'), ('Ability', 'EAbilityIndex', 'esecondary'),
@@ -6580,6 +6614,80 @@ prop_hash_keys()
 prop_enum_casts()
 prop_set_delta()
 prop_enum_class()
+
+
+def value_init_scalar():
+    """Braces or `T()` around something that is not a struct are C++'s: `E R{}`, `T()` and `{}` the type's zero
+    (value-initialisation), `{V}` the value V - an enum, an own UE_ENUM, an int, an int64, a byte, a float, a bool and an
+    object pointer, in a local, an assignment, an argument, a return value, an array element and a member of a braced
+    UE_STRUCT (`{}` there is the member's zero, not its default), and as the default of a member and of a UE_STRUCT
+    member (a zero one writes no tag on the class default object; a UserDefinedStruct's default instance tags every
+    member: with no defaults to diff against, Class.cpp 1547 writes each), and as a braced asset's value, where `{}` is
+    written as the zero it is. A UE_STRUCT's `T()` default is its defaults.
+    A `{}` for a member of a class type - an engine struct, a TArray, an FName, a UE_STRUCT - is that type's fresh value
+    too, not the member's default: in a function body (where the UE_STRUCT's frame local starts as its default instance,
+    UUserDefinedStruct::InitializeStruct, so a member left unstored would read its default), in a class default and in
+    a braced asset. An empty container is a value: assigned, passed, constructed and returned."""
+    import struct
+    base = asset('ValueInitScalar')
+    keeps_invariants(base)
+    for fn, want in (('EnumBraces', 0), ('EnumEqBraces', 0), ('EnumParens', 0), ('EnumValue', 1), ('EnumArg', 20),
+                     ('EnumAssign', 0), ('EnumReturn', 10), ('OwnEnum', 20), ('IntBraces', 7), ('IntParens', 0),
+                     ('WideBraces', 0), ('Elements', 10), ('SlotBraces', 0)):
+        for m in (0, 3):
+            got = run(base, fn, {'Held': 1}, M=m)[0]
+            assert got == want + m, 'ValueInitScalar.%s(%d) = %r, want %r' % (fn, m, got, want + m)
+    for fn, want in (('NativeBraces', lambda m: 10 * m), ('NativeDesig', lambda m: 10 * m),
+                     ('NativeOmit', lambda m: 10 * m + 2), ('NativeMacro', lambda m: 10 * m), ('NativeArray', lambda m: m),
+                     ('NativeNested', lambda m: 12 + m),
+                     ('NativeName', lambda m: True), ('EmptyAssign', lambda m: m), ('EmptyArg', lambda m: m)):
+        for m in (0, 3):
+            got = run(base, fn, {'Items': [1, 2]}, M=m)[0]
+            assert got == want(m), 'ValueInitScalar.%s(%d) = %r, want %r' % (fn, m, got, want(m))
+    assert run(base, 'FloatBraces', F=2.0)[0] == 3.5 and run(base, 'BoolBraces', M=1)[0] is False
+    assert run(base, 'ObjBraces', M=0)[0] == 1 and run(base, 'ObjAssign', {'Seen': None}, M=0)[0] == 1
+    pkg = invariants.Package(base)
+    cdo = pkg.find('Default__ValueInitScalar_C')
+    for name in ('Rule', 'Count', 'Who', 'Parens', 'RuleParens', 'Fresh'):
+        assert not pkg.tag(cdo, name), 'the zero default of %s writes a tag: %r' % (name, pkg.tag(cdo, name))
+    cleared = {u['name'].split('_')[0]: u for u in pkg.tags(cdo, pkg.tag(cdo, 'Cleared')['at'])}
+    assert fname_at(pkg.names, cleared['Kept']['value'], 0) == 'eattachmentrule::keeprelative', cleared['Kept']
+    assert struct.unpack('<i', cleared['Five']['value'])[0] == 0, cleared['Five']
+    kept, seven, half = pkg.tag(cdo, 'Kept'), pkg.tag(cdo, 'Seven'), pkg.tag(cdo, 'Half')
+    assert kept and fname_at(pkg.names, kept['value'], 0) == 'eattachmentrule::keepworld', kept
+    assert seven and struct.unpack('<i', seven['value'])[0] == 7, seven
+    assert half and struct.unpack('<f', half['value'])[0] == 0.5, half
+    slot = invariants.Package(os.path.join(os.path.dirname(base), 'FValueSlot'))
+    tags = {t['name'].split('_')[0]: t for t in slot.struct(0).defaults}
+    assert fname_at(slot.names, tags['Zeroed']['value'], 0) == 'eattachmentrule::keeprelative', tags['Zeroed']
+    assert fname_at(slot.names, tags['Kept']['value'], 0) == 'eattachmentrule::keepworld', tags['Kept']
+    assert [struct.unpack('<i', tags[n]['value'])[0] for n in ('Nil', 'Five')] == [0, 5], (tags['Nil'], tags['Five'])
+    asset_pkg = invariants.Package(os.path.join(os.path.dirname(base), 'VD_Braces'))
+    named = {t['name']: t for t in asset_pkg.tags(asset_pkg.find('VD_Braces'))}
+    assert set(named) == {'Count', 'Rule'} and struct.unpack('<i', named['Count']['value'])[0] == 0, named
+    assert fname_at(asset_pkg.names, named['Rule']['value'], 0) == 'eattachmentrule::keeprelative', named['Rule']
+
+    def fresh(pkg, i, tags, where):
+        """V zero, L empty, In FValueIn's own defaults (1, 2), N None: each `{}` of the value tagged in tags."""
+        inner = {u['name'].split('_')[0]: u for u in pkg.tags(i, tags['In']['at'])}
+        assert struct.unpack('<ff', tags['V']['value']) == (0.0, 0.0), (where, tags['V'])
+        assert struct.unpack('<i', tags['L']['value'][:4])[0] == 0, (where, tags['L'])
+        assert [struct.unpack('<i', inner[n]['value'])[0] for n in ('P', 'Q')] == [1, 2], (where, inner)
+        assert fname_at(pkg.names, tags['N']['value'], 0) == 'none', (where, tags['N'])
+    held = {u['name'].split('_')[0]: u for u in pkg.tags(cdo, pkg.tag(cdo, 'NativeHeld')['at'])}
+    assert struct.unpack('<i', held['A']['value'])[0] == 7, held['A']
+    fresh(pkg, cdo, held, 'NativeHeld')
+    native = invariants.Package(os.path.join(os.path.dirname(base), 'VN_Braces'))
+    named = {t['name']: t for t in native.tags(native.find('VN_Braces'))}
+    assert set(named) == {'Count', 'V', 'L', 'In', 'N'}, named
+    fresh(native, native.find('VN_Braces'), named, 'VN_Braces')
+    omit = invariants.Package(os.path.join(os.path.dirname(base), 'VN_Omit'))
+    assert [t['name'] for t in omit.tags(omit.find('VN_Omit'))] == ['Count'], 'a member VN_Omit leaves out is written'
+
+
+value_init_scalar()
+print('ok  ValueInitScalar: braces or T() around an enum, a number or a pointer are its zero, or the value braced; '
+      '{} for a struct, container or name member is its fresh value, not the default; an empty container is a value')
 
 
 # -- pending

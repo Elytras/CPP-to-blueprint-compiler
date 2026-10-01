@@ -145,13 +145,34 @@ void ForEach(const Json& N, const F& Fn)
     for (const Json& C : *It) Fn(C);
 }
 
-/* What clang writes for a member the braces leave out; an aggregate member (a struct, a TArray) is a list of those. */
+/* Whether the source spells braced value E: its range runs from its `{` to its `}`. What clang makes up for a member
+   the braces leave out - a CXXConstructExpr with no argument for a class (FVector2D, a TArray), a list of its members'
+   values for an aggregate - lies on one point, the closing brace of the list it fills, begin and end alike, or has no
+   range at all (`[V]` on probes, positional and designated; the JSON says nothing else apart: both are `"list": true,
+   "zeroing": true`). A location in a macro is its spelling's, so `{}` written through a macro is spelled too. */
+bool IsSpelledBraces(const Json& E)
+{
+    const auto R = E.find("range");
+    if (R == E.end()) return false;
+    auto Offset = [&](const char* Side) {
+        const auto L = R->find(Side);
+        if (L == R->end()) return int64(-1);
+        const auto S = L->find("spellingLoc");
+        return (S == L->end() ? *L : *S).value("offset", int64(-1));
+    };
+    return Offset("begin") != Offset("end");
+}
+
+/* Whether E is what clang writes for a member the braces leave out: ImplicitValueInitExpr, CXXDefaultInitExpr, a
+   CXXConstructExpr with no argument for a class, or for an aggregate (a UE_STRUCT) a list of those. A `{}` written for
+   a member is a value - a fresh one of its type: zero, empty, None, a UE_STRUCT's own defaults - not the member's
+   default, though clang writes the same node for it, only at the braces (IsSpelledBraces). */
 bool IsUnsetInit(const Json& E)
 {
     const std::string K = Kind(E);
     if (K == "ImplicitValueInitExpr" || K == "CXXDefaultInitExpr") return true;
+    if ((K != "CXXConstructExpr" && K != "InitListExpr") || IsSpelledBraces(E)) return false;
     if (K == "CXXConstructExpr") return !First(E);
-    if (K != "InitListExpr") return false;
     bool bAll = true;
     ForEach(E, [&](const Json& C) { bAll = bAll && IsUnsetInit(C); });
     return bAll;
@@ -688,6 +709,7 @@ struct FStructInfo
 };
 
 bool IsVmConstant(const FArgIR& A);
+bool SteppedInPlace(const FArgIR& A);
 
 /* Each index into SI.Fields EX_StructConst writes, in the order it writes them. */
 std::vector<size_t> StructConstOrder(const FStructInfo& SI)
@@ -1380,6 +1402,9 @@ private:
     bool ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgIR& Arg, std::string* Err);
     bool LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     bool LowerMakeStruct(const std::string& Type, const Json* List, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
+    bool MakeTemp(const std::string& Type, FBlueprintClass& BP, std::string* Tmp, std::string* Err);
+    bool LowerStructByMembers(const std::string& Type, const FStructInfo& SI, std::vector<FArgIR>& Values,
+                              FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     bool LowerDispatcherCall(const Json& Call, const Json& Callee, const Json& Obj, FBlueprintClass& BP,
                              FArgIR& Out, std::string* Err);
     bool LowerDelegateValue(const Json& Obj, const Json& Fn, FArgIR& Out, std::string* Err);
@@ -3043,7 +3068,8 @@ bool FCompiler::ZeroArg(const std::string& Type, FBlueprintClass& BP, FArgIR& Ou
 /* `FVector(1, 2, 3)`: EX_StructConst wants one value per reflected field, in property order, so
    only a struct whose every field is known can be written; argless means all zeros. The arguments come in C++'s order
    (a super's members first) and go out in PropertyLink's (StructConstOrder); one for a Transient member has nowhere to
-   go, execStructConst skipping that member, so a constant there is dropped with a warning and anything else refused. */
+   go, execStructConst skipping that member, so a constant there is dropped with a warning. A literal with any other
+   member, or a computed value for a Transient one, is the editor's Make Struct instead (LowerStructByMembers). */
 bool FCompiler::LowerStructLiteral(const Json& CtorNode, const FStructInfo& SI, FBlueprintClass& BP,
                                    FArgIR& Out, std::string* Err)
 {
@@ -3067,17 +3093,83 @@ bool FCompiler::LowerStructLiteral(const Json& CtorNode, const FStructInfo& SI, 
     for (size_t I = 0; I < Args.size(); ++I)
         if (!LowerArg(*Args[I], BP, Given[I], Err)) return false;
     const std::vector<size_t> Order = StructConstOrder(SI);
+    /* First we see whether EX_StructConst can take the members as they are. execLet hands it the destination's own
+       address and it steps each member straight in (ScriptCore.cpp 2647-2686, 3376-3405), so `V = {V.Y, V.X}` would
+       read what it has just written, a call there may read the destination too, and a `?:` or an inline call needs
+       statements of its own, which nothing would hoist out of the literal. The editor writes a literal for constants
+       only, and a Make Struct for the rest: through a temp, one statement per member, left to right as C++ runs a braced
+       list. A Transient member's computed value can be set there too. */
+    bool bInPlace = true;
+    for (size_t I = 0; I < Given.size(); ++I)
+        bInPlace = bInPlace && (std::find(Order.begin(), Order.end(), I) != Order.end() ? SteppedInPlace(Given[I])
+                                                                                        : IsVmConstant(Given[I]));
+    if (!bInPlace) return LowerStructByMembers(T, SI, Given, BP, Out, Err);
     for (size_t I = 0; I < Given.size(); ++I)
     {
         if (std::find(Order.begin(), Order.end(), I) != Order.end()) continue;
         const std::string& Member = SI.Fields[I].second;
-        if (!IsVmConstant(Given[I]))
-        { *Err = T + "::" + Member + " is Transient, which a struct literal cannot set: give it a constant, or set the member "
-                 "after"; return false; }
         printf("  warning: %s::%s: %s::%s is Transient, which a struct literal does not set (execStructConst skips it): "
                "the value given for it is dropped\n", Cur ? Cur->CppName.c_str() : "", CurFnName.c_str(), T.c_str(), Member.c_str());
     }
     for (size_t I : Order) Out.Sub->Args.push_back(Given[I]);
+    return true;
+}
+
+/* A native struct literal with computed members, as the editor's Make Struct (LowerMakeStruct): a temp, then one store
+   per member in C++'s order, Values holding one per SI.Fields entry. A member a super declares is that struct's
+   property, so its store names it there, as LowerField does for `S.Member`. */
+bool FCompiler::LowerStructByMembers(const std::string& Type, const FStructInfo& SI, std::vector<FArgIR>& Values,
+                                     FBlueprintClass& BP, FArgIR& Out, std::string* Err)
+{
+    std::string Tmp;
+    if (!MakeTemp(Type, BP, &Tmp, Err)) return false;
+    auto Body = std::make_shared<std::vector<FStmtIR>>();
+    for (size_t I = 0; I < Values.size() && I < SI.Fields.size(); ++I)
+    {
+        /* The struct that declares member I: the topmost super whose own fields reach it (a super's come first). */
+        const FRecord* DeclRec = Find(Type);
+        const FStructInfo* Decl = &SI;
+        for (const FRecord* R = DeclRec; R && !R->Base.empty(); R = Find(R->Base))
+        {
+            const auto Up = Structs.find(R->Base);
+            if (Up == Structs.end() || Up->second.Fields.size() <= I) break;
+            Decl = &Up->second;
+            DeclRec = Find(R->Base);
+        }
+        FStmtIR& Set = Body->emplace_back();
+        Set.K = FStmtIR::Assign;
+        Set.Var.K = FArgIR::Member;
+        Set.Var.S = DeclRec ? UeNameOf(DeclRec, SI.Fields[I].second) : SI.Fields[I].second;
+        Set.Var.Owner = BP.ScriptStruct(Decl->Package, Decl->UeName);
+        Set.Var.LetOp = LetOpFor(SI.Fields[I].first);
+        Set.Var.Base = std::make_shared<FArgIR>();
+        Set.Var.Base->K = FArgIR::Local;
+        Set.Var.Base->S = Tmp;
+        Set.Value = std::move(Values[I]);
+    }
+    auto Block = std::make_shared<std::vector<FStmtIR>>(1);
+    (*Block)[0].K = FStmtIR::Block;
+    (*Block)[0].Body = Body;
+    Out = FArgIR();
+    Out.K = FArgIR::Call;
+    Out.InnerType = Type;
+    Out.Sub = std::make_shared<FCallIR>();
+    Out.Sub->Intrinsic = "__Inline__";
+    Out.Sub->Inline = Block;
+    Out.Sub->InlineResult = Tmp;
+    Out.Sub->InlineType = Type;
+    return true;
+}
+
+/* The temp a Make Struct fills: a local of Type the frame default-constructs, named into Tmp. */
+bool FCompiler::MakeTemp(const std::string& Type, FBlueprintClass& BP, std::string* Tmp, std::string* Err)
+{
+    if (!CurLocals) { *Err = "internal: a struct value outside a function body"; return false; }
+    *Tmp = "__Make" + std::to_string(ReadTmpCounter++) + "__";
+    FPropertyDef PD;
+    if (!TypeToProperty(Type, *Tmp, 0, "a " + Type + " value", BP, &PD, Err)) return false;
+    PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+    CurLocals->push_back(PD);
     return true;
 }
 
@@ -3090,13 +3182,8 @@ bool FCompiler::LowerMakeStruct(const std::string& Type, const Json* List, FBlue
 {
     const FRecord* R = Find(Type);
     if (!R || !R->bIsStruct) { *Err = "a braced value needs a struct type, not " + Type; return false; }
-    if (!CurLocals) { *Err = "internal: a struct value outside a function body"; return false; }
-
-    const std::string Tmp = "__Make" + std::to_string(ReadTmpCounter++) + "__";
-    FPropertyDef PD;
-    if (!TypeToProperty(Type, Tmp, 0, "a " + Type + " value", BP, &PD, Err)) return false;
-    PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
-    CurLocals->push_back(PD);
+    std::string Tmp;
+    if (!MakeTemp(Type, BP, &Tmp, Err)) return false;
 
     const bool bPlainName = R->IsNative() || IsInternalViewStruct(R->CppName);
     const FIndex Struct = BP.ScriptStruct(PackageOf(*R), ClassOf(*R));
@@ -3539,6 +3626,15 @@ bool IsVmConstant(const FArgIR& A)
     default:
         return false;
     }
+}
+
+/* A struct literal's member EX_StructConst may step straight into the destination: a constant, a local of this frame,
+   one of this object's variables, or a literal of those. Nothing else in the literal can change one, and none can be
+   the destination or a part of it, a struct never holding its own type. A reference parameter could alias either. */
+bool SteppedInPlace(const FArgIR& A)
+{
+    if (A.K == FArgIR::StructLit) return A.Sub && std::all_of(A.Sub->Args.begin(), A.Sub->Args.end(), SteppedInPlace);
+    return IsVmConstant(A) || A.K == FArgIR::Local || (A.K == FArgIR::Field && !A.Base);
 }
 
 const Json* FCompiler::InlineListOf(const Json* E) const
@@ -4161,10 +4257,14 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
     {
         auto SI = Structs.find(StripTypeKeywords(TypeOf(*N)));
         if (SI != Structs.end()) return LowerStructLiteral(*N, SI->second, BP, Out, Err);
+        /* `{}` or `TArray<int32>()` as a value: an empty container, a Make Array (Set, Map) with no element. */
+        if (!First(*N) && IsContainerType(TypeOf(*N))) return LowerContainerLiteral(*N, TypeOf(*N), BP, Out, Err);
     }
     /* `T()` of an aggregate - a struct with no constructor declared, which is what lets it take `{ .A = 1 }`. */
     if (const FRecord* R = K == "CXXScalarValueInitExpr" ? Find(StripTypeKeywords(TypeOf(*N))) : nullptr; R && R->bIsStruct)
         return LowerMakeStruct(R->CppName, nullptr, BP, Out, Err);
+    /* `int32()`, `EAttachmentRule()`: value-initialisation, the type's zero. */
+    if (K == "CXXScalarValueInitExpr") return ZeroArg(StripTypeKeywords(TypeOf(*N)), BP, Out, Err);
     if ((K == "CXXConstructExpr" || K == "CXXTemporaryObjectExpr")
         && (Slot == SK_Name || Slot == SK_Text || Slot == SK_Str))
     {
@@ -4951,7 +5051,18 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         return true;
     }
 
-    if (K == "InitListExpr") return LowerMakeStruct(StripTypeKeywords(TypeOf(*N)), N, BP, Out, Err);
+    if (K == "InitListExpr")
+    {
+        /* Braces around a type that is not a struct - `E R{};`, `int32 N{7};`, `AActor* A{};`, `return {};` - are C++'s
+           value-initialisation, the type's zero, or the one value braced. */
+        const std::string T = StripTypeKeywords(TypeOf(*N));
+        if (const FRecord* R = Find(T); !R || !R->bIsStruct)
+        {
+            const Json* One = First(*N);
+            return One && !IsUnsetInit(*One) ? LowerArg(*One, BP, Out, Err) : ZeroArg(T, BP, Out, Err);
+        }
+        return LowerMakeStruct(T, N, BP, Out, Err);
+    }
     /* A container's braced list: Strip took the constructor it is the one argument of, whose type is the slot's. */
     if (K == "CXXStdInitializerListExpr") return LowerContainerLiteral(*N, OuterType, BP, Out, Err);
     if (K == "CompoundAssignOperator") return LowerUpdateValue(*N, BP, Out, Err);
@@ -10249,9 +10360,14 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
         Init = Strip(First(*Init));
         K = Init ? Kind(*Init) : std::string();
     }
-    /* A member `{ .Q = 9 }` leaves unwritten (with no default of its own) is ImplicitValueInitExpr: zero. */
-    if (!bNeg && (K == "CXXNullPtrLiteralExpr" || K == "ImplicitValueInitExpr" || (K == "CXXConstructExpr" && !First(*Init))))
+    /* A member `{ .Q = 9 }` leaves unwritten (with no default of its own) is ImplicitValueInitExpr: zero. So are `T()`
+       and `{}` around a value that is not a struct, C++'s value-initialisation; a struct's `T()` keeps its defaults, as
+       no value does. Braces around one value are that value. */
+    const bool bBraced = !bNeg && K == "InitListExpr" && PD.Type != "StructProperty";
+    if (!bNeg && (K == "CXXNullPtrLiteralExpr" || K == "ImplicitValueInitExpr" || K == "CXXScalarValueInitExpr"
+                  || ((K == "CXXConstructExpr" || K == "CXXTemporaryObjectExpr") && !First(*Init)) || (bBraced && !First(*Init))))
         return true;
+    if (bBraced) return LowerDefault(F, PD, BP, Err, First(*Init), bKeepZero);
 
     /* A struct value: `FFloatInterval(1, 5)` or `{1, 5}`, one argument per member in declaration
        order. The members go on the property, each with its own default, and the writer turns them
@@ -13780,7 +13896,7 @@ private:
 
 /* Builds the DOM of clang's AST dump as it streams in, without what nothing reads: source locations (all but a
    DeclRefExpr's or MemberExpr's range begin offset and token length, and its end's in a macro, see NamedQualifier and
-   MemberQualifier), mangled names, a record's definitionData and
+   MemberQualifier, and a braced value's whole range, see IsUnsetInit), mangled names, a record's definitionData and
    a few flags are most of the dump, and building them was most of a compile. A key read later must be in neither
    DroppedAstKey nor key()'s own rules. */
 class FAstSax : public nlohmann::json_sax<Json>
@@ -13795,7 +13911,9 @@ public:
     bool number_float(number_float_t V, const string_t&) override { return Value(V); }
     bool string(string_t& V) override
     {
-        if (bKindNext && !Skipped) DeclRef.back() = V == "DeclRefExpr" || V == "MemberExpr";   // "kind" comes before "range"
+        if (bKindNext && !Skipped)          // "kind" comes before "range"
+            Ranged.back() = V == "DeclRefExpr" || V == "MemberExpr" ? ERange::Begin
+                          : V == "InitListExpr" || V == "CXXConstructExpr" ? ERange::Whole : ERange::None;
         return Value(std::move(V));
     }
     bool binary(binary_t& V) override { return Value(std::move(V)); }
@@ -13806,16 +13924,18 @@ public:
     bool key(string_t& K) override
     {
         if (Skipped) return true;
-        /* A spellingLoc only gets here inside a DeclRefExpr's or MemberExpr's range (every other loc and range is skipped whole); the
-           range's end is kept only then, for a qualifier written in a macro (NamedQualifier). */
+        /* A spellingLoc only gets here inside a range kept (every other loc and range is skipped whole). A DeclRefExpr's
+           or MemberExpr's end is kept only for a qualifier written in a macro (NamedQualifier); a braced value's, always:
+           IsUnsetInit tells a `{}` written from a member the braces leave out by it. */
         const bool bMacroEnd = K == "end" && Stack.back()->is_object() && Stack.back()->contains("begin")
                             && (*Stack.back())["begin"].contains("spellingLoc");
+        const bool bWholeEnd = K == "end" && Ranged.size() >= 2 && Ranged[Ranged.size() - 2] == ERange::Whole;
         /* A variable's use flags stay: Run refuses a used UE_ASSET_AT that cannot load. A method's isImplicit stays: the
            operator= clang declares up front in a class with a virtual is no Blueprint function. "kind" comes before them. */
-        bSkipNext = (bFrozenKeys ? FrozenDroppedAstKey(K) : DroppedAstKey(K)) || (K == "end" && !bMacroEnd)
+        bSkipNext = (bFrozenKeys ? FrozenDroppedAstKey(K) : DroppedAstKey(K)) || (K == "end" && !bMacroEnd && !bWholeEnd)
                  || (K == "isImplicit" && Stack.back()->value("kind", std::string()) != "CXXMethodDecl")
                  || ((K == "isUsed" || K == "isReferenced") && Stack.back()->value("kind", std::string()) != "VarDecl")
-                 || (K == "range" && !DeclRef.back());
+                 || (K == "range" && Ranged.back() == ERange::None);
         bKindNext = K == "kind";
         if (!bSkipNext) Slot = &(*Stack.back())[std::move(K)];
         return true;
@@ -13823,10 +13943,13 @@ public:
     bool parse_error(size_t, const std::string&, const nlohmann::detail::exception&) override { return false; }
 
 private:
+    /* What of an open node's range is kept: none, its begin (a DeclRefExpr or MemberExpr), or the whole range (a braced
+       value: an InitListExpr or CXXConstructExpr). */
+    enum class ERange : uint8 { None, Begin, Whole };
     Json& Root;
     const bool bFrozenKeys;         // astcheck's reference parse
     std::vector<Json*> Stack;       // the open objects and arrays being filled
-    std::vector<bool> DeclRef;      // per open object or array: a DeclRefExpr, whose range is kept
+    std::vector<ERange> Ranged;     // per open object or array: what of its range is kept
     Json* Slot = nullptr;           // the object member the last key named
     int32 Skipped = 0;              // depth inside a dropped object or array
     bool bSkipNext = false;         // the next value is a dropped key's
@@ -13847,14 +13970,14 @@ private:
     bool Open(Json::value_t T)
     {
         if (Skipped || bSkipNext) ++Skipped;
-        else { Stack.push_back(Place(Json(T))); DeclRef.push_back(false); }
+        else { Stack.push_back(Place(Json(T))); Ranged.push_back(ERange::None); }
         bSkipNext = bKindNext = false;
         return true;
     }
     bool Close()
     {
         if (Skipped) --Skipped;
-        else { Stack.pop_back(); DeclRef.pop_back(); }
+        else { Stack.pop_back(); Ranged.pop_back(); }
         return true;
     }
 };
