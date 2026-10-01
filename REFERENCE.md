@@ -356,7 +356,7 @@ Notes:
 |---|---|---|
 | `int32 Health = 100;` | A Blueprint variable of the class. Blueprints get and set it, and it is editable in Class Defaults but not on a placed instance. | Yes |
 | `bool`, `uint8`, `int32`, `int64`, `float`, `FName`, `FString`, `FText` | Blueprint's Boolean, Byte, Integer, Integer64, Float, Name, String and Text variables. | Yes |
-| `EMood Mood;` | An enum variable. A `uint8` enum is cooked as a Byte of that enum, an `int32` or `int64` enum as an enum property over that integer. See [Enums](#enums). | Yes |
+| `EMood Mood;` | An enum variable. A `uint8` enum is cooked as a Byte of that enum, except a game `enum class`, which is an enum property over a byte as in the editor; an `int32` or `int64` enum is an enum property over that integer. See [Enums](#enums). | Yes |
 | `AActor *Target;`, `UClass *Cls;`, `TSubclassOf<AActor> Kind;` | Object and class references. See [Types](#types). | Yes |
 | `USceneComponent *Spare;`, `TArray<UStaticMeshComponent *> Pieces;`, `FHitResult LastHit;` | A reference to a component or widget, or a container or struct that holds one, is flagged instanced, as the editor flags it, so an actor spawned from the class gets its own copy of what the class default points at, not the default's. | Yes |
 | `TSoftObjectPtr<T>`, `TSoftClassPtr<T>`, `TScriptInterface<I>` | Soft object and soft class references, and an interface reference. | Yes |
@@ -908,15 +908,18 @@ Notes:
 
 ## Enums
 
-A game enum is a Byte variable bound to its enum, as in the editor. A mod's own enum needs `UE_ENUM`, which cooks it as
-a UserDefinedEnum asset in the mod's package. The rule to remember: a mod enum without `UE_ENUM` is only a set of
-number constants, not a Blueprint type.
+A variable of a game enum is what the editor makes of it: an Enum variable (an enum property over a byte) for an
+`enum class`, a Byte bound to the enum for any other. A mod's own enum needs `UE_ENUM`, which cooks it as a
+UserDefinedEnum asset in the mod's package. The rule to remember: a mod enum without `UE_ENUM` is only a set of number
+constants, not a Blueprint type.
 
 ### Game enums
 
 | You write | What it does | Status |
 |---|---|---|
-| `EEndPlayReason LastReason;` | A variable of the game's enum: a Byte bound to its UEnum. Its enumerators are byte constants. | Yes |
+| `EEndPlayReason LastReason;` | A variable of the game's enum: a Byte bound to its UEnum, as the editor makes a variable of an enum that is no `enum class` (here a namespaced one, which the game's C++ holds as `TEnumAsByte`). Its enumerators are byte constants. | Yes |
+| `EAttachmentRule Rule = EAttachmentRule::KeepWorld;` | A variable of a game `enum class`: an EnumProperty over a ByteProperty named UnderlyingType, as the editor makes it and as the game's own members and parameters of it are. The same goes for a parameter, a return value, a local, a container's element or key, a UE_STRUCT member, a delegate's parameter and a `UE_DEFAULTS` tag on a native member: an override or a delegate of a native signature then has the native's types. The value is the same byte, its enumerators byte constants, and a default is written as the enumerator's name in an EnumProperty tag. | Yes |
+| A game enum that no property uses | UeApi's `Types.json` gives each enum's form, which genueapi reads off how the Dumper-7 dump's properties of the enum, and the game's Blueprints' variables, are reflected (`form`: `EnumClass` or `TEnumAsByte`). 250 of the SDK's 1445 enums have no property to read it from, and a variable of one is a Byte bound to the enum. | Yes |
 | `LastReason == EEndPlayReason::Quit`, `<` | Comparisons work. | Yes |
 | `switch (Reason)` | A switch works on any enum. | Yes |
 | `EEndPlayReason Last = EEndPlayReason::Quit;` as a default | The default is written as the enumerator's name. | Yes |
@@ -937,7 +940,7 @@ number constants, not a Blueprint type.
 | `UE_ENUM_IN(ESystems, "/Game/_MyMods/Shared");` | For an enum in a header several mods include. Only the source whose `UE_MOD_PACKAGE` is exactly that path cooks it; every other mod imports it from there. `UE_STRUCT_IN` does the same for structs: [Structs](#structs). | Yes |
 | `ELocal L;` with no `UE_ENUM` on `ELocal` | Refused (`unimplemented property L: ELocal`). The enum's constants still fold to numbers, `(int32)ELocal::B`, but it is not a Blueprint type. Add `UE_ENUM`. | Refused |
 | `enum { kCap = 1000, kFar = 5000000000 };` | Constants of an enum with no fixed type are int-sized, or int64 when a value needs it, as C++ makes them. They fold to their values. | Yes |
-| `EMood Mood;` as the editor writes it | Not yet: the editor makes a variable of an `enum class` an Enum variable (EnumProperty). AssetGen writes a Byte variable bound to the enum for every uint8 enum. At run time both are the same byte; only tools that read the property type see a difference. | Not yet |
+| `EMood Mood;` of a `uint8` UE_ENUM | A Byte bound to the enum, which is what the editor makes of a UserDefinedEnum: its form is namespaced, never `enum class`, whatever the C++ says. | Yes |
 
 ```cpp
 enum class EMood : uint8 { Calm, Angry = 5, Sleepy };

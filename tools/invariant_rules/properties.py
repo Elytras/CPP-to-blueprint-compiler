@@ -68,6 +68,8 @@ class _Api:
         s.enum_by_name = {}
         for cpp, v in types['enums'].items():
             if cpp in s.enum_cpp: s.enum_by_name.setdefault(v['name'].lower(), []).append(v['package'] + '.' + v['name'])
+        # enum path -> "EnumClass" / "TEnumAsByte", where genueapi.py could tell (read_enum_forms); a UeApi from before it, none
+        s.enum_forms = {v['package'] + '.' + v['name']: v['form'] for v in types['enums'].values() if v.get('form')}
         # UObject's reflection classes UeApi leaves out: a class object's own chain.
         for path, parent in (('/Script/CoreUObject.Object', None), ('/Script/CoreUObject.Field', '/Script/CoreUObject.Object'),
                              ('/Script/CoreUObject.Struct', '/Script/CoreUObject.Field'),
@@ -276,6 +278,29 @@ def prop_field_classes(pkg):
             yield i, '%s: %s has sub-fields %s' % (where, p.type, [s.type for s in p.subs])
         if p.type == 'EnumProperty' and p.subs and p.subs[0].type not in INTEGRAL:
             yield i, '%s: enum over %s, not an integer property' % (where, p.subs[0].type)
+
+
+@rule
+def prop_enum_form(pkg):
+    """A property of a native enum, sub-fields included, is the field class the editor makes for the enum's CppForm: an
+    EnumProperty for an `enum class` (over a ByteProperty: a Blueprint takes only uint8 ones), a ByteProperty naming the
+    enum for any other (Editor/KismetCompiler/Private/KismetCompilerMisc.cpp 1071-1094), which is also what UHT makes of
+    the engine's own members of it. Two properties of one enum are the same type only as the same field class
+    (FEnumProperty::SameType, EnumProperty.cpp 395-398), which an override's and a delegate's parameters are held to
+    against their native signature. Types.json's "form" says which an enum is (genueapi.py read_enum_forms); one with
+    none is not judged."""
+    forms = api().enum_forms
+    for i, where, p in props(pkg):
+        idx = p.enum if p.type == 'EnumProperty' else p.ref if p.type == 'ByteProperty' else 0
+        path = pkg.path(idx) if idx else None
+        if not path or not path.startswith('/Script/'): continue
+        form = forms.get(path)
+        if form is None: _skip('prop_enum_form', 'enum form unknown'); continue
+        _judged('prop_enum_form')
+        if form == 'EnumClass' and p.type != 'EnumProperty':
+            yield i, '%s: a %s of enum class %s, not an EnumProperty' % (where, p.type, path)
+        elif form == 'TEnumAsByte' and p.type != 'ByteProperty':
+            yield i, '%s: an %s of %s, which is no enum class: a ByteProperty' % (where, p.type, path)
 
 
 CPF_ComputedFlags, CPF_EditorOnly, CPF_SkipSerialization = 0x0008001040000200, 0x800000000, 0x0080000000000000

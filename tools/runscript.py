@@ -121,14 +121,16 @@ def params_of(base, function, flag=0x80):
 
 
 def props_of(base, function, _cache={}):
-    """The function's own properties (parms and locals), name -> FProperty class, off dumpstruct.py's top-level lines."""
+    """The function's own properties (parms and locals), name -> FProperty class, off dumpstruct.py's top-level lines.
+    An EnumProperty over a byte (an enum class) reads as the ByteProperty it is to the VM."""
     import os, re, subprocess
     if (base, function) not in _cache:
         exports = dumpexp.load(base)[5]
         idx = next(i for i, e in enumerate(exports) if e['name'] == function)
         out = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'dumpstruct.py'), base, str(idx)],
                              capture_output=True, encoding='utf-8').stdout
-        _cache[base, function] = dict((n, t) for t, n in re.findall(r'^  (\w+Property) (\w+) ', out, re.M))
+        _cache[base, function] = dict((n, 'ByteProperty' if (t, size) == ('EnumProperty', '1') else t)
+                                      for t, n, size in re.findall(r'^  (\w+Property) (\w+) \S+ \S+ size=(\d+)', out, re.M))
     return _cache[base, function]
 
 

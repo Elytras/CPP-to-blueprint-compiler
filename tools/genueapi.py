@@ -163,6 +163,7 @@ class Enum(object):
     def __init__(self, cpp, pkg, underlying):
         self.cpp, self.pkg, self.underlying = cpp, pkg, underlying
         self.values = []
+        self.form = None         # "EnumClass" / "TEnumAsByte" off its properties (read_enum_forms), None if none says
 
 
 ENUM_COMMENT = re.compile(r"^// Enum (\S+)\.(\w+)\s*$")
@@ -390,8 +391,9 @@ def write_operators(classes, out_dir):
 def write_types(out_dir):
     rows = ['{', '  "enums": {']
     ens = sorted(ENUMS.values(), key=lambda e: e.cpp)
-    rows += ['    "%s": {"package": "/Script/%s", "name": "%s", "underlying": "%s", "first": "%s"}%s'
-             % (e.cpp, e.pkg, e.ue_name, e.underlying, e.values[0][0] if e.values else "", "," if i + 1 < len(ens) else "")
+    rows += ['    "%s": {"package": "/Script/%s", "name": "%s", "underlying": "%s", "first": "%s"%s}%s'
+             % (e.cpp, e.pkg, e.ue_name, e.underlying, e.values[0][0] if e.values else "",
+                ', "form": "%s"' % e.form if e.form else "", "," if i + 1 < len(ens) else "")
              for i, e in enumerate(ens)]
     rows += ['  },', '  "structs": {']
     sts = sorted(STRUCTS.values(), key=lambda t: t.cpp)
@@ -406,8 +408,9 @@ def write_types(out_dir):
                        fields, link, "," if i + 1 < len(sts) else ""))
     rows += ['  }', '}']
     io.open(os.path.join(out_dir, "Types.json"), "w", encoding="utf-8", newline="\n").write("\n".join(rows) + "\n")
-    print("  types: %d enums, %d structs (%d complete)"
-          % (len(ENUMS), len(STRUCTS), sum(1 for t in STRUCTS.values() if t.complete)))
+    print("  types: %d enums (%d enum class, %d TEnumAsByte), %d structs (%d complete)"
+          % (len(ENUMS), sum(1 for e in ENUMS.values() if e.form == "EnumClass"),
+             sum(1 for e in ENUMS.values() if e.form == "TEnumAsByte"), len(STRUCTS), sum(1 for t in STRUCTS.values() if t.complete)))
 
 
 def split_params(text):
@@ -530,7 +533,7 @@ def read_real_fields(sdk_dir):
         # Without it every respelled member (UFSDSaveGame's Index_0) cooks by its C++ name, which the engine does not
         # know: its default and its reads are lost in game, silently. So no UeApi rather than that one.
         sys.exit("no %s: run genueapi on the SDK inside its Dumper-7 dump, not a copy of it" % os.path.normpath(path))
-    cur = None
+    cur, owner = None, None
     for line in io.open(path, encoding="utf-8", errors="replace"):
         if not line.startswith("["):
             continue
@@ -538,12 +541,64 @@ def read_real_fields(sdk_dir):
         if m:
             if cur is not None:
                 cur.setdefault(int(m.group(1), 16), []).append(m.group(3).rstrip("\r\n"))
+            if owner and m.group(2) in ("EnumProperty", "ByteProperty"):
+                ENUM_PROPS[(owner, m.group(3).rstrip("\r\n"))] = m.group(2)
             continue
         m = DUMP_OBJECT.match(line)
-        cur = REAL_FIELDS.setdefault(m.group(2).rstrip("\r\n"), {}) if m and m.group(1).endswith("Class") else None
+        owner = m.group(2).rstrip("\r\n") if m else None
+        cur = REAL_FIELDS.setdefault(owner, {}) if m and m.group(1).endswith("Class") else None
         sub = DUMP_SUBOBJECT.match(m.group(2).rstrip("\r\n")) if m else None
         if sub:
             SUBOBJECTS.setdefault(sub.group(1) + "." + sub.group(2), []).append((sub.group(3), m.group(1)))
+
+
+# ---- enum forms
+# The editor makes a pin of an enum an EnumProperty over a ByteProperty when the UEnum's CppForm is EnumClass, and a
+# ByteProperty naming the enum otherwise (KismetCompilerMisc.cpp 1071-1094). The dump does not write CppForm, but UHT
+# reflects a member or parameter of an `enum class` type as an FEnumProperty and a TEnumAsByte<> one as an FByteProperty,
+# and the object dump names each property's field class while the SDK headers name its enum. Joined on (owner, member
+# name), every enum's properties come out one kind: on the FSD 4.27 dump 841 enum classes and 354 TEnumAsByte enums, none
+# both, and the 198 native enums any property of the game's own cooked Blueprints is of (variables, parameters, locals)
+# are the kind the dump says, bar one the dump has no property of (2026-10-01; scan_game reads only the variables). An
+# enum no property uses (250 of 1445) has no form, and AssetGen keeps such an enum a ByteProperty.
+ENUM_PROPS = {}      # (owner path, property name) -> "EnumProperty" / "ByteProperty", off the object dump
+ENUM_OWNER = re.compile(r"^// \w+ (/.*?)\s*$")     # "// Class /Script/Engine.Actor", "// Function /Game/A.B_C.Do It"
+ENUM_MEMBER = re.compile(r"^\t(?:const\s+)?(E\w+)\s*&?\s+(\w+)(?:\[\w+\])?;\s+//")
+
+
+def read_enum_forms(sdk_dir, game_forms):
+    """Sets each Enum's form from its properties: the object dump's (ENUM_PROPS, joined to the member the SDK headers
+    declare), then game_forms ({enum path: {"EnumProperty" / "ByteProperty"}}, what the game's cooked Blueprints hold,
+    scan_game), the editor's own choice and so the one kept where the two disagree. Properties our own mods have in a dump
+    taken with them loaded are AssetGen's, and do not count."""
+    seen = {}
+    for name in sorted(f for f in os.listdir(sdk_dir) if f.endswith(("_classes.hpp", "_structs.hpp", "_parameters.hpp"))):
+        owner = None
+        for line in io.open(os.path.join(sdk_dir, name), encoding="utf-8", errors="replace"):
+            if line.startswith("// "):
+                m = ENUM_OWNER.match(line)
+                owner = m.group(1) if m else owner
+                continue
+            if line.startswith("};"):
+                owner = None
+                continue
+            m = ENUM_MEMBER.match(line) if owner and not owner.startswith("/Game/_ElytrasMods/") else None
+            kind = ENUM_PROPS.get((owner, m.group(2))) if m and m.group(1) in ENUMS else None
+            if kind:
+                seen.setdefault(m.group(1), set()).add(kind)
+    by_path = dict(("/Script/%s.%s" % (e.pkg, e.ue_name), e) for e in ENUMS.values())
+    for path, kinds in game_forms.items():
+        e = by_path.get(path)
+        if e is not None and seen.get(e.cpp, kinds) != kinds:
+            print("  enum %s: the dump's properties are %s, the game's Blueprints' %s; kept the game's"
+                  % (e.cpp, "/".join(sorted(seen[e.cpp])), "/".join(sorted(kinds))))
+        if e is not None:
+            seen[e.cpp] = set(kinds)
+    for cpp, kinds in seen.items():
+        if len(kinds) == 1:
+            ENUMS[cpp].form = "EnumClass" if kinds == {"EnumProperty"} else "TEnumAsByte"
+        else:
+            print("  enum %s: both EnumProperty and ByteProperty properties, its form left unknown" % cpp)
 
 
 # A native reads a const reference parameter (ConstParm + ReferenceParm) by address: P_GET_PROPERTY_REF takes
@@ -971,9 +1026,20 @@ def scan_game(content):
     """What the game's cooked Blueprints show that the dump does not: {class path: (its ScriptInherit ClassFlags,
     ClassWithin, ClassConfigName, super path)}, and each (class path, interface path) where a function of the class
     has a native interface's function as its super. An implementation of an interface of the class's own list has no
-    super (measured on BP_SentryGun_MoveMarker), so such a pair is an interface a native ancestor implements."""
+    super (measured on BP_SentryGun_MoveMarker), so such a pair is an interface a native ancestor implements. Also
+    {native enum path: {"EnumProperty" / "ByteProperty"}}, how the classes' variables of each enum are reflected: the
+    editor's own choice of the two (read_enum_forms)."""
     import invariants
-    classes, overrides = {}, set()
+    classes, overrides, enums = {}, set(), {}
+
+    def enum_kinds(p, prop):
+        idx = prop.enum if prop.type == "EnumProperty" else prop.ref if prop.type == "ByteProperty" else 0
+        path = p.path(idx) if idx else None
+        if path and path.startswith("/Script/"):
+            enums.setdefault(path, set()).add(prop.type)
+        for s in prop.subs:
+            enum_kinds(p, s)
+
     for base in invariants.packages([content]):
         p = invariants.Package(base)
         for i, e in enumerate(p.exports):
@@ -983,12 +1049,15 @@ def scan_game(content):
                 if st is not None and hasattr(st, "class_flags"):
                     classes[p.path(i + 1)] = (st.class_flags & SCRIPT_INHERIT, p.path(st.within) if st.within else OBJECT_PATH,
                                               st.config, p.path(e["super"]))
+                    for prop in st.props:
+                        enum_kinds(p, prop)
             elif kind == "Function" and e["super"] < 0:
                 sup = p.path(e["super"])
                 if sup.startswith("/Script/") and ":" in sup:
                     overrides.add((p.path(e["outer"]), sup.split(":")[0]))
-    print("  game Blueprints scanned: %d classes, %d native-super functions" % (len(classes), len(overrides)))
-    return classes, overrides
+    print("  game Blueprints scanned: %d classes, %d native-super functions, %d native enums held"
+          % (len(classes), len(overrides), len(enums)))
+    return classes, overrides, enums
 
 
 def class_tails(classes, by_name, game):
@@ -1153,7 +1222,8 @@ def main():
 
     by_name = dict((k.cpp, k) for k in classes)
     map_subobjects(classes, by_name)
-    game, overrides = scan_game(game_dir) if game_dir else ({}, set())
+    game, overrides, game_enums = scan_game(game_dir) if game_dir else ({}, set(), {})
+    read_enum_forms(sdk_dir, game_enums)
     tails = class_tails(classes, by_name, game)
     ifaces = native_interfaces(classes, by_name, game, overrides)
     ordered, seen = [], set()

@@ -600,6 +600,7 @@ struct FOpInfo
 struct FEnumInfo
 {
     std::string Package, UeName, Underlying, First;     // First: the enumerator a zero is written as
+    bool bEnumClass = false;    // a native `enum class` (Types.json "form"), whose properties are EnumProperties
 };
 
 bool IsContainerType(const std::string& T)
@@ -6055,6 +6056,7 @@ static bool ZeroOf(const FPropertyDef& P, FArgIR& Out)
     else if (P.Type == "FloatProperty") Out.K = FArgIR::Float;
     else if (P.Type == "BoolProperty") Out.K = FArgIR::Bool;
     else if (P.Type == "ByteProperty") Out.K = FArgIR::Byte;
+    else if (P.Type == "EnumProperty" && P.Inner && P.Inner->Type == "ByteProperty") Out.K = FArgIR::Byte;  // EX_ByteConst
     else if (P.Type == "NameProperty") { Out.K = FArgIR::Name; Out.S = "None"; }
     else if (P.Type == "StrProperty") Out.K = FArgIR::Str;
     else if (P.Type == "ObjectProperty" || P.Type == "ClassProperty") Out.K = FArgIR::NullObj;
@@ -10202,6 +10204,16 @@ bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& P
         Out->Extra = BP.Enum(E->second.Package, E->second.UeName);
         Out->StructName = E->second.UeName;
         Out->EnumZero = E->second.UeName + "::" + E->second.First;
+        /* The editor makes a pin of an ECppForm::EnumClass enum an EnumProperty over a ByteProperty named UnderlyingType,
+           and of any other enum a ByteProperty naming it (KismetCompilerMisc.cpp 1071-1094), as UHT does a native
+           member: so an override or a delegate of a native signature has its parent's property types (SameType). A
+           UE_ENUM is a UserDefinedEnum, ECppForm::Namespaced (EnumEditorUtils.cpp 46-51): a ByteProperty. */
+        if (E->second.bEnumClass)
+        {
+            Out->Type = "EnumProperty";
+            Out->Inner = std::make_shared<FPropertyDef>(ByteParam("UnderlyingType"));
+            Out->Inner->PropertyFlags = 0;
+        }
         return true;
     }
     if (auto S = Structs.find(Type); S != Structs.end())
@@ -13583,7 +13595,8 @@ bool FCompiler::LoadTables(const std::string& IncludeDir, std::string* Err)
                         Row.value("class", std::string()), Row.value("fn", std::string()), ExtraArgs(Row), RefArgs(Row) });
     for (auto It = TypesDoc["enums"].begin(); It != TypesDoc["enums"].end(); ++It)
         Enums[It.key()] = { It->value("package", std::string()), It->value("name", std::string()),
-                            It->value("underlying", std::string()), It->value("first", std::string()) };
+                            It->value("underlying", std::string()), It->value("first", std::string()),
+                            It->value("form", std::string()) == "EnumClass" };
     for (auto It = TypesDoc["structs"].begin(); It != TypesDoc["structs"].end(); ++It)
     {
         FStructInfo S;

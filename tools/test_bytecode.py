@@ -2813,7 +2813,8 @@ def edits():
     before, after = tags(a, 0), tags(b, 0)
     assert list(after) == list(before) + ['EnemySignificance'], (list(before), list(after))     # replaced in place, one appended
     assert after['SpawnSpread'].endswith(': 800.0') and 'value=0' in after['CanBeUsedForConstantPressure'], after
-    assert after['EnemySignificance'] == 'ByteProperty size=8 enum=EEnemySignificance: EEnemySignificance::Critical', after
+    # EEnemySignificance is an enum class: UEnemyDescriptor's member is an EnumProperty, and so is the tag (PropEnumClass)
+    assert after['EnemySignificance'] == 'EnumProperty size=8 enum=EEnemySignificance: EEnemySignificance::Critical', after
     for same in ('EnemyClass', 'IdealSpawnSize'):
         assert after[same] == before[same], (same, before[same], after[same])
     la, lb = dumpexp.load(a), dumpexp.load(b)
@@ -6249,11 +6250,87 @@ def prop_set_delta():
           'as its own value, not the union')
 
 
+def prop_enum_class():
+    """A property of a native `enum class : uint8` is an EnumProperty over a ByteProperty, as the editor makes it
+    (KismetCompilerMisc.cpp 1071-1094; every EnumProperty of the game's Blueprints is over a ByteProperty): a variable, a
+    parameter, a return value, a local, a container's element and key, a UE_STRUCT member, a delegate's parameter and an
+    override's parameter, which then has its native parent's type (FEnumProperty::SameType, EnumProperty.cpp 395-398). A
+    namespaced enum (EAttachLocation) stays a ByteProperty. Its tags - the CDO's, a UE_DEFAULTS one on a native
+    EnumProperty member, an array's and a map's, a UserDefinedStruct's default and a native struct's member - are
+    EnumProperty tags (the GetID(), PropertyTag.cpp 17, 30-36) naming the enum and holding the enumerator's FName. Its
+    values run as bytes: a switch, a compare, a cast, a map lookup and a native struct literal."""
+    import invariants, runvm
+    base = asset('PropEnumClass')
+    folder = os.path.dirname(base)
+    pkg = invariants.Package(base)
+    rule_enum = '/Script/Engine.EAttachmentRule'
+
+    def is_enum_class(p, enum, owner=pkg):
+        return (p.type, [s.type for s in p.subs], owner.path(p.enum) if p.enum else owner.path(p.ref)) == \
+            ('EnumProperty', ['ByteProperty'], enum)
+    props = {p.name: p for p in pkg.struct(pkg.find('PropEnumClass_C')).props}
+    assert is_enum_class(props['Rule'], rule_enum), \
+        'Rule is a %s over %s, not an EnumProperty over a ByteProperty' % (props['Rule'].type, [s.type for s in props['Rule'].subs])
+    assert (props['Where'].type, pkg.path(props['Where'].ref)) == ('ByteProperty', '/Script/Engine.EAttachLocation'), \
+        'Where, of a namespaced enum, is a %s' % props['Where'].type
+    for name, sub in (('Order', 0), ('Seen', 0), ('Cost', 0)):
+        assert is_enum_class(props[name].subs[sub], rule_enum), '%s holds %s' % (name, props[name].subs[sub].type)
+    fn_props = lambda owner, fn: {p.name: p for p in owner.struct(owner.find(fn)).props}
+    for fn, names in (('Pick', ('In', 'ReturnValue')), ('Score', ('In', 'Local')), ('Weight', ('K',)),
+                      ('OnRule__DelegateSignature', ('Param0',))):
+        for name in names:
+            assert is_enum_class(fn_props(pkg, fn)[name], rule_enum), '%s.%s is a %s' % (fn, name, fn_props(pkg, fn)[name].type)
+    assert is_enum_class(fn_props(pkg, 'Weight')['W'].subs[0], rule_enum), 'a local map\'s key'
+    crystal = invariants.Package(os.path.join(folder, 'PropEnumCrystal'))
+    assert is_enum_class(fn_props(crystal, 'Receive_EnteredState')['State'], '/Script/FSD.ECoreCorruptionCrystalState', crystal), \
+        'the override\'s parameter is not its native parent\'s EnumProperty'
+    slot = invariants.Package(os.path.join(folder, 'FRuleSlot'))
+    member = next(p for p in slot.struct(0).props if p.name.startswith('Rule_'))
+    assert is_enum_class(member, rule_enum, slot), 'the UE_STRUCT member is a %s' % member.type
+    t = next(t for t in slot.struct(0).defaults if t['name'].startswith('Rule_'))
+    assert (t['type'], t['enum'], fname_at(slot.names, t['value'], 0)) == ('EnumProperty', 'EAttachmentRule', 'eattachmentrule::snaptotarget'), t
+
+    cdo = pkg.find('Default__PropEnumClass_C')
+    for name, enum, value in (('Rule', 'EAttachmentRule', 'keepworld'),
+                              ('UpdateOverlapsMethodDuringLevelStreaming', 'EActorUpdateOverlapsMethod', 'alwaysupdate'),
+                              ('Where', 'EAttachLocation', 'snaptotarget')):
+        t = pkg.tag(cdo, name)
+        want = 'ByteProperty' if name == 'Where' else 'EnumProperty'
+        assert t and t['type'] == want and t['enum'] == enum, (name, t)
+        assert fname_at(pkg.names, t['value'], 0).split('::')[-1] == value, (name, fname_at(pkg.names, t['value'], 0))
+    order, cost = pkg.tag(cdo, 'Order'), pkg.tag(cdo, 'Cost')
+    assert order['inner'] == 'EnumProperty' and [fname_at(pkg.names, order['value'], 4 + 8 * k) for k in range(2)] == \
+        ['eattachmentrule::snaptotarget', 'eattachmentrule::keeprelative'], order
+    assert (cost['inner'], cost['value_type']) == ('EnumProperty', 'IntProperty') and \
+        fname_at(pkg.names, cost['value'], 8) == 'eattachmentrule::keepworld', cost
+    shake = {u['name']: u for u in pkg.tags(cdo, pkg.tag(cdo, 'Shake')['at'])}
+    assert (shake['Type']['type'], shake['Type']['enum'], fname_at(pkg.names, shake['Type']['value'], 0)) == \
+        ('EnumProperty', 'ECameraShakeDurationType', 'ecamerashakedurationtype::custom'), shake['Type']
+    for b in (base, crystal.base, slot.base):
+        keeps_invariants(b)
+
+    for rule in (1, 2):
+        for In in (0, 1, 2):
+            for M in (0, 1):
+                local = In if M == 0 else 2
+                want = 12 if local == 0 else 21 if local == 1 else 100 if local == rule else local
+                got = run(base, 'Score', {'Rule': rule}, In=In, M=M)[0]
+                assert got == want, 'Score(%d, %d) with Rule %d = %r, want %r' % (In, M, rule, got, want)
+    assert [run(base, 'Weight', K=k)[0] for k in (0, 1, 2)] == [-1, 3, 5]
+    vm = runvm.VM(base)
+    vm.struct_const = lambda name, vals: runvm.Written(zip(['Duration', 'Type'], vals)) if name == 'CameraShakeDuration' \
+        else runvm.Struct(name, vals)
+    assert [vm.call('ShakeType', M=m) for m in (0, 1)] == [0, 1]
+    print('ok  PropEnumClass: a native enum class is an EnumProperty over a ByteProperty wherever it lands, tagged '
+          'EnumProperty, and runs as a byte')
+
+
 prop_text_defaults()
 prop_flag_predicates()
 prop_hash_keys()
 prop_enum_casts()
 prop_set_delta()
+prop_enum_class()
 
 
 # -- pending
@@ -6266,38 +6343,6 @@ for _mod, _body in (('PropSetBool', '  TSet<bool> Flags;\n'), ('PropMapBool', ' 
     refused(_mod, _body, 'cannot hash, and the engine hashes each one')
 print('ok  a set element / map key that cannot hash is refused: bool, FText, a native struct without GetTypeHash; as '
       'a variable, a local and a parameter')
-
-
-def prop_enum_class():
-    """A native `enum class : uint8` variable, parameter and return value is an EnumProperty over a ByteProperty, as the
-    editor makes it (KismetCompilerMisc.cpp 1071-1094; every one of the game's 1340 sampled EnumProperties is over a
-    ByteProperty), so an override of a native signature matches its parent's property types (ScriptCore.cpp 1958-1996).
-    Its CDO tag, and a UE_DEFAULTS tag on a native EnumProperty member, is an EnumProperty tag (the GetID(), PropertyTag.cpp
-    17, 30-36) naming the enum and holding the enumerator's FName."""
-    import invariants
-    base = pending_asset('PropEnumClass')
-    pkg = invariants.Package(base)
-
-    def is_enum_class(p, enum):
-        return (p.type, [s.type for s in p.subs], pkg.path(p.enum) if p.enum else pkg.path(p.ref)) == \
-            ('EnumProperty', ['ByteProperty'], enum)
-    rule = {p.name: p for p in pkg.struct(pkg.find('PropEnumClass_C')).props}['Rule']
-    assert is_enum_class(rule, '/Script/Engine.EAttachmentRule'), \
-        'Rule is a %s over %s, not an EnumProperty over a ByteProperty' % (rule.type, [s.type for s in rule.subs])
-    parms = [p for p in pkg.struct(pkg.find('Pick')).props if p.flags & 0x80]          # CPF_Parm: In, ReturnValue
-    assert sorted(p.name for p in parms) == ['In', 'ReturnValue'], [p.name for p in parms]
-    for p in parms:
-        assert is_enum_class(p, '/Script/Engine.EAttachmentRule'), 'Pick.%s is a %s' % (p.name, p.type)
-    cdo = pkg.find('Default__PropEnumClass_C')
-    for name, enum, value in (('Rule', 'EAttachmentRule', 'keepworld'),
-                              ('UpdateOverlapsMethodDuringLevelStreaming', 'EActorUpdateOverlapsMethod', 'alwaysupdate')):
-        t = pkg.tag(cdo, name)
-        assert t and t['type'] == 'EnumProperty' and t['enum'] == enum, (name, t)
-        assert fname_at(pkg.names, t['value'], 0).split('::')[-1] == value, (name, fname_at(pkg.names, t['value'], 0))
-    keeps_invariants(base)
-
-
-pending('PropEnumClass: a native enum class is an EnumProperty over a ByteProperty, tagged EnumProperty', prop_enum_class)
 
 
 # ---- TYPES: UE_STRUCT default instances, UE_ENUM payloads and names (invariant_rules/user_types.py)
