@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """usage: test_bytecode.py [--assetgen <exe>] [--ueapi <UeApi dir>] [--cases <file>] [--game <folder /Game is in>]
-                        [--sdk <Dumper-7 dump of the game>]
+                        [--sdk <Dumper-7 dump of the game>] [--no-prefetch | --check-prefetch]
 
 Compiles every test mod in AssetGen/tests and every example mod in AssetGen/examples, then checks what a mod can
 observe: its functions run offline (runscript.py, runvm.py for latent / delegate / cross-object code) against Python
@@ -10,7 +10,12 @@ defaults, references, which function a call reaches). Never the bytecode's shape
 --assetgen defaults to the first build found (ue-mods x64/Release, this repo's x64/Release, a CMake build/);
 --ueapi to ue-mods' BpMods/UeApi. Outside ue-mods, pass the UeApi of https://github.com/Elytras/DRG-Blueprint-Cpp-SDK.
 --cases also writes each offline run as a JSON case, which ue-mods' `bpcheck` command replays in the running game.
---game (the extracted game pak's FSD/Content) adds the S38 edits of the game's own packages; without it they are skipped."""
+--game (the extracted game pak's FSD/Content) adds the S38 edits of the game's own packages; without it they are skipped.
+The compiles the tests make one at a time after build() are prefetched: the last run's list of them, in
+assetgen-suite-prefetch.json in the temp folder (one for every checkout on the machine), runs on as many threads as
+build() uses, each in a staging folder, and a test whose compile is ready takes the result (see assetgen_compile).
+The line before the last says how many were. --no-prefetch compiles each one when the test asks, and still writes the
+list; --check-prefetch also compiles every prefetched one in place and stops the run on any difference."""
 import atexit, copy, glob, hashlib, itertools, json, os, posixpath, re, shutil, subprocess, sys, tempfile, threading
 os.environ['PYTHONIOENCODING'] = 'utf-8'   # the dump tools print non-ASCII names; read back as UTF-8, not the code page
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))

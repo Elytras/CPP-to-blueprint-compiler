@@ -1533,7 +1533,7 @@ package. Those below need only Python 3's standard library.
 ### The test suite
 
 ```
-python tools/test_bytecode.py [--assetgen <assetgen>] [--ueapi <UeApi dir>] [--cases <file>]
+python tools/test_bytecode.py [--assetgen <assetgen>] [--ueapi <UeApi dir>] [--cases <file>] [--no-prefetch | --check-prefetch]
 ```
 
 It compiles every `tests/*.cpp` and every `examples/*.cpp`, runs the compiled functions offline against expected
@@ -1541,6 +1541,14 @@ results, and checks what the engine reads off the cooked files. It deletes `test
 checkout break each other. Pass `--ueapi` with the SDK's `UeApi`. `--cases <file>` also writes every offline run as
 JSON (arguments, members before and after, return value), for replaying the calls in game with a harness of your own.
 CI runs it on Linux and Windows.
+
+After those first compiles, the tests compile about 200 small mods one at a time. The suite makes them ahead: each run
+lists them in `assetgen-suite-prefetch.json` in the temp folder (one file for every checkout on the machine), and the
+next run starts them all at once in staging folders, so a test usually finds its compile done. A result is used only
+when the compile is the same in everything it reads, and its output is moved into place as if the test had compiled
+there; the line before the last says how many were ready. `--no-prefetch` compiles each one when the test asks;
+`--check-prefetch` also compiles each prefetched one directly and stops the run if anything differs. Deleting the
+JSON file only costs the next run its head start.
 
 ### Running a function offline
 
