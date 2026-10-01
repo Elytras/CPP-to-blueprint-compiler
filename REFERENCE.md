@@ -2221,6 +2221,7 @@ overload is the one with the most parameters.
 | `inline int32 Get(int32 A, int32 B)` beside a non-inline `int32 Get(int32 A)`, then `Get(V)` | Refused: `an overload set may not mix inline and non-inline functions`. Make the non-inline overload the one with the most parameters, or rename it. | Not yet |
 | `int32 Ov(int32 A)` beside `int32 Ov(int32 A, int32 B)`, neither inline | Refused: "a second function of that name". A Blueprint class has one function per name. Give them different names, or make the extra overloads `inline`. | Refused |
 | `int32 Get()` beside `int32 get()` | Refused: "differs from Get only in case". An FName ignores case, so both would be one function. The same holds for two variables, a variable and a function, and a name an ancestor already has: `int32 get()` in a class whose parent has `Get()` is refused, while `Get()` itself overrides it. | Refused |
+| `int32 None;`, `int32 none();`, a `UE_STRUCT` member `int32 NONE;` | Refused: "None is UE's empty name". The name None is UE's empty name in any case, which the Blueprint editor refuses for a variable or a function. A saved value's members end at one of that name, so a `UE_STRUCT` member called None would cut the struct's value short in a class default. The same for a component and an interface's member. | Refused |
 
 ```cpp
 inline int32 Pick(int32 V) { return V + 1; }
@@ -5664,6 +5665,9 @@ and where the feature is described. In each group, the messages you are most lik
   [Overloading](#overloading).
 - `<Class>::<Name>: differs from <Other> only in case, and an FName ignores case; rename one`: `Get` and `get` in one
   class. Fix: rename one. See [Overloading](#overloading).
+- `<Class>::<Name>: None is UE's empty name, in any case: the Blueprint editor refuses it, and the members of a saved
+  value end at one of that name; rename it`: a variable, function, component or `UE_STRUCT` member named None, none or
+  NONE. Fix: rename it. See [Overloading](#overloading).
 - `<Class>::<Name>: <Ancestor> already has a variable <Name>, and an FName ignores case; rename it` (or `a function`):
   a member reusing a name the parent chain has, in any case. Overriding a function under its exact name is fine. To
   change an inherited variable's default, assign it in `UE_DEFAULTS`. See [Class defaults](#class-defaults).

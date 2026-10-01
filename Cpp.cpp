@@ -8765,12 +8765,32 @@ bool FCompiler::IsInlineMethod(const FRecord& R, const std::string& Method) cons
         || (Def != R.MethodDefs.end() && Def->second->value("inline", false));
 }
 
+/* FName("None") is NAME_None, whatever its case. The editor refuses it as a variable's or a function's name ("Name
+   cannot be empty.", FKismetNameValidator::IsValid, Kismet2NameValidators.cpp 135-142), and a tag of that name ends the
+   tag list a value is read as (Class.cpp 1326-1329): a UE_STRUCT member's tag in a class default carries its bare
+   name, so one named None would end the struct's value there, its later members unread, and a class's own member would
+   end its default object's list. A class's, a UE_STRUCT's or an interface's members, functions and components. */
+static bool RefuseNoneNames(const FRecord& R, std::string* Err)
+{
+    auto Refuse = [&](const std::string& N) {
+        if (Lower(N) != "none") return true;
+        *Err = R.CppName + "::" + N + ": None is UE's empty name, in any case: the Blueprint editor refuses it, and the "
+               "members of a saved value end at one of that name; rename it";
+        return false;
+    };
+    for (const Json* F : R.Fields) if (!Refuse(Name(*F))) return false;
+    for (const Json* M : R.AllMethods) if (!Refuse(Name(*M))) return false;
+    for (const std::string& C : R.Components) if (!Refuse(C)) return false;
+    return true;
+}
+
 /* A class's variables and functions share one FName namespace with its ancestors', and an FName ignores case. The
    editor refuses a duplicate function and renames a clashing variable (KismetCompiler.cpp 570-616, 1737-1747); here
    each is refused: two members of one name (overloads included, inline ones aside, which are no UFunction), two that
    differ only in case, and a member reusing an inherited name - save a function overriding one of the same spelling. */
 bool FCompiler::CheckMemberNames(const FRecord& R, std::string* Err) const
 {
+    if (!RefuseNoneNames(R, Err)) return false;
     std::map<std::string, std::pair<std::string, bool>> Own;       // lower-case name -> (as written, is a function)
     auto Claim = [&](const std::string& N, bool bFunction) {
         auto [It, bNew] = Own.emplace(Lower(N), std::make_pair(N, bFunction));
@@ -11225,6 +11245,7 @@ bool FCompiler::GenerateInterface(const FRecord& R, const std::string& OutDir, s
     /* A variable on an interface is this compiler's own idea, not the engine's: it becomes a property of every
        class that implements the interface (Generate), so none is written here. What cannot move that way is
        refused. */
+    if (!RefuseNoneNames(R, Err)) return false;
     for (const Json* F : R.Fields)
     {
         if (R.Components.count(Name(*F)))
@@ -11281,6 +11302,7 @@ bool FCompiler::GenerateStruct(const FRecord& R, const std::string& OutDir, std:
     FPackage P(PackageName);
     StampIdentity(P, PackageName);
     FBlueprintClass BP(P, ClassOf(R), "", "", false);
+    if (!RefuseNoneNames(R, Err)) return false;
 
     for (const Json* F : R.Fields)
     {

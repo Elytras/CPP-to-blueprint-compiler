@@ -5924,7 +5924,8 @@ def none_names():
     refused('NoneFunction', '  int32 NONE() { return 1; }\n', 'NoneFunction::NONE: None is UE\'s empty name')
 
 
-pending('Names: a member, UE_STRUCT member or function named None is refused', none_names)
+none_names()
+print('ok  Names: a member, a UE_STRUCT member or a function named None, in any case, is refused')
 
 
 # ---- DELEG: delegates and event dispatchers - signatures, binds, broadcasts, timers by name (invariant_rules/delegates.py)
