@@ -405,6 +405,7 @@ public:
 |---|---|---|
 | `int32 Budget = kSlots * 2 + 1;` | The compiler works the initializer out when the mod is built and writes it into the class default object: the variable's default value in Class Defaults. Nothing runs in game to set it. | Yes |
 | `int32 Hits = 0;`, `int32 Hits;` | A zero default writes nothing, as the engine cooks it, and the variable starts at zero. The same holds for the zero enumerator, `nullptr` and an empty string. | Yes |
+| `int32 Hits{};`, `EMood Mood = EMood();`, `int32 Budget{25};` | `{}` and `T()` are the zero, and write nothing; braces around one value are that value. | Yes |
 | `int32 X = UKismetMathLibrary::RandomInteger(5);` | Refused: "a default is a value known when the mod is built". Set such a value in `ReceiveBeginPlay` or `UserConstructionScript`. | Refused |
 | `static constexpr int32 kSeed = Fnv("types");` then `int32 Seed = kSeed;` | A call counts as a default only through a `consteval` function, which clang runs itself. A call to a plain `constexpr` function is refused like any call. See [Constants](#constants). | Yes |
 | `TSubclassOf<AActor> Kind = AActor::StaticClass();` | Not yet. A class reference has no build-time value, so a `TSubclassOf` or `UClass*` member always starts null, and this initializer is refused with the build-time message. `= nullptr` compiles. Set the class in `ReceiveBeginPlay`, or use a `TSoftClassPtr` member, which takes a path. | Not yet |
@@ -679,6 +680,8 @@ float value needs its `f`. `X * 0.5` is a double operation in C++, and Blueprint
 | `float Y = 0.5;`, `return 0.25;`, `FVector(1.0, 2.0, X)` | A double literal on its own converts to float where a float is wanted. So does a default, `float Delay = 0.75;`. | Yes |
 | `'A'`, `('a' - 'A')` | The int constant of its code unit. A plain `char` is signed, so `'\xff'` is -1. | Yes |
 | `nullptr` | None for an object or class. For a `TScriptInterface` it is the null interface. Where an int64 address is wanted it is 0. | Yes |
+| `int32 N{7};`, `EMood M{EMood::Angry};` | Braces around one value of a type that is not a struct are that value. | Yes |
+| `EMood M{};`, `int32 N = int32();`, `AActor* A{};`, `Mood = {};`, `return {};` | C++'s value-initialisation: the type's zero, the zero enumerator or None. In a function and as a default, where a zero writes nothing. | Yes |
 | `"text"`, `L"wide"` | A String, Name or Text constant: [Strings and text](#strings-and-text). | Yes |
 
 ```cpp
@@ -1030,6 +1033,7 @@ copies it, as in C++.
 | `FStats S = {.Kills = K, .Alive = true};` | Make Struct: a fresh value, then one store for each member given. Members left out keep the struct's defaults. | Yes |
 | `KillsOf({.Kills = K})` | A braced value as an argument. | Yes |
 | `FStats S = {K, 2.0f};` | Positional braces go by member declaration order. | Yes |
+| `FStats S = {{}, 2.0f};` | A `{}` for a member that is not a struct is its zero, as in C++, not the member's default. | Yes |
 
 ```cpp
 FVector Home;
@@ -1123,6 +1127,7 @@ void ZeroAll() {
 | `FVector Offset = {0, 0, 50};` | Positional braces as a default. | Yes |
 | `FNested Deep = {.Inner = {.Time = 1.5f}, .Stamp = 7};` | Designated braces, nested. Members left out are zero, or take their own default initializer. | Yes |
 | `FColor Lamp = FColor(255, 128, 0);` | FColor's argument order holds in defaults too. | Yes |
+| `FStats Fresh = FStats();`, `FStats Cleared = {{}, {}};` | A `UE_STRUCT`'s `T()` is its defaults, and writes nothing. A `{}` for a member is that member's zero, written even where its default is not zero. | Yes |
 
 Notes:
 - Every value in a default must be known when the mod is built: [Classes and variables](#classes-and-variables).
@@ -3328,6 +3333,7 @@ not a C++ value, so point at it with `&`.
 |---|---|---|
 | `UMoodDef MD_Big = {.Health = -500.5f, .Title = "Big"};` | An asset of the class, cooked as `<mod package>/MD_Big`. Only the members the braces name are written, and the rest keep the class defaults. A member named with a zero value is still written. | Yes |
 | `UMoodDef MD_Plain = {};` | An asset with the class defaults only. | Yes |
+| `UMoodDef MD_Zero = {.Health = {}};` | `{}` for a member is its zero, written as `.Health = 0` is. | Yes |
 | `UEnemyDescriptor ED_Mine = {.SpawnSpread = 250.0f, .IdealSpawnSize = 4};` | An asset of a game or engine class. | Yes |
 | `namespace Moods { UMoodDef Angry = {.Health = 50}; }` | A namespace is a folder: the asset is cooked at `<mod package>/Moods/Angry`. See [Mod sources and packages](#mod-sources-and-packages). | Yes |
 | `.Delay = FFloatInterval(1.0f, 5.0f)`, `.Delay = {2.0f, 6.0f}` | A struct member, by constructor or by braces, one value per member, as in any default. | Yes |
@@ -5441,9 +5447,6 @@ and where the feature is described. In each group, the messages you are most lik
   int32's range wraps`: an int64 converted to float, `(float)X`. UE 4.27 Blueprint has no such conversion, so the value
   goes through int32 and only its low 32 bits survive: 2^32 + 5 becomes 5.0, where C++ would round the whole value.
   Fix: nothing, when the value fits in an int32. Otherwise bring it into that range before converting. See
-  [Literals and conversions](#literals-and-conversions).
-- `a braced value needs a struct type, not <Type>`: braces around a single value of a type that is not a struct,
-  `int32 N{ 5 };`. Fix: `int32 N = 5;`. Braces are for structs and containers. See
   [Literals and conversions](#literals-and-conversions).
 - `no template named 'TWeakObjectPtr'; did you mean 'TSoftObjectPtr'?`: clang's message. The SDK declares no weak or
   lazy object pointer. Fix: use an object pointer, tested with `if (Obj)`, or a soft reference. See [Types](#types).

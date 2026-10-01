@@ -7,7 +7,9 @@ UE_MOD_PACKAGE("/Game/_ElytrasMods/ValueInitScalar");
 /*
 Braces and `T()` around a value that is not a struct: `E R{};`, `int32 N = int32();` and `AActor* A{};` are the type's
 zero (value-initialisation), `E R{E::B};` and `int32 N{7}` the value in the braces. In a function body - a local, an
-assignment, an argument, a return value, an array's element - and as a member's or a UE_STRUCT member's default.
+assignment, an argument, a return value, an array's element, a member of a braced UE_STRUCT, where `{}` is that
+member's zero and not its default - and as a member's or a UE_STRUCT member's default, and a braced asset's value. A
+UE_STRUCT's own `T()` as a default is its defaults.
 */
 enum class EValuePick : uint8 { Zero, One, Two };
 UE_ENUM(EValuePick);
@@ -16,7 +18,7 @@ struct FValueSlot {
   UE_STRUCT;
   EAttachmentRule Zeroed{};
   EAttachmentRule Kept{EAttachmentRule::KeepWorld};
-  int32 None{};
+  int32 Nil{};
   int32 Five{5};
 };
 
@@ -29,6 +31,10 @@ public:
   float Half{0.5f};
   AActor* Who{};
   FValueSlot Slot;
+  FValueSlot Cleared = {{}, {}, {}, {}};
+  FValueSlot Fresh = FValueSlot();
+  int32 Parens = int32();
+  EAttachmentRule RuleParens = EAttachmentRule();
   EAttachmentRule Held = EAttachmentRule::KeepWorld;
   AActor* Seen;
 
@@ -52,4 +58,14 @@ public:
   int32 ObjBraces(int32 M) { AActor* A{}; return A == nullptr ? 1 : 0; }
   int32 ObjAssign(int32 M) { Seen = this; Seen = {}; return Seen == nullptr ? 1 : 0; }
   int32 Elements(int32 M) { TArray<EAttachmentRule> A = {EAttachmentRule{}, EAttachmentRule::KeepWorld}; return (int32)A[0] + (int32)A[1] * 10 + M; }
+  int32 SlotBraces(int32 M) { FValueSlot S = {{}, {}, {}, {}}; return (int32)S.Kept * 10 + S.Five + M; }
 };
+
+class UValueDef : public UPrimaryDataAsset {
+public:
+  int32 Count = 5;
+  EAttachmentRule Rule = EAttachmentRule::KeepWorld;
+};
+
+/* `{}` for a member an asset names is its zero, written, as `.Count = 0` is: not the class default. */
+UValueDef VD_Braces = {.Count = {}, .Rule = {}};

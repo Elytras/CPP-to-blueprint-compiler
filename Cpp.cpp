@@ -144,13 +144,14 @@ void ForEach(const Json& N, const F& Fn)
     for (const Json& C : *It) Fn(C);
 }
 
-/* What clang writes for a member the braces leave out; an aggregate member (a struct, a TArray) is a list of those. */
+/* What clang writes for a member the braces leave out; an aggregate member (a struct, a TArray) is a list of those. An
+   empty list is a `{}` written for a value that is not a struct: its zero, not the member's default. */
 bool IsUnsetInit(const Json& E)
 {
     const std::string K = Kind(E);
     if (K == "ImplicitValueInitExpr" || K == "CXXDefaultInitExpr") return true;
     if (K == "CXXConstructExpr") return !First(E);
-    if (K != "InitListExpr") return false;
+    if (K != "InitListExpr" || !First(E)) return false;
     bool bAll = true;
     ForEach(E, [&](const Json& C) { bAll = bAll && IsUnsetInit(C); });
     return bAll;
@@ -4223,6 +4224,8 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
     /* `T()` of an aggregate - a struct with no constructor declared, which is what lets it take `{ .A = 1 }`. */
     if (const FRecord* R = K == "CXXScalarValueInitExpr" ? Find(StripTypeKeywords(TypeOf(*N))) : nullptr; R && R->bIsStruct)
         return LowerMakeStruct(R->CppName, nullptr, BP, Out, Err);
+    /* `int32()`, `EAttachmentRule()`: value-initialisation, the type's zero. */
+    if (K == "CXXScalarValueInitExpr") return ZeroArg(StripTypeKeywords(TypeOf(*N)), BP, Out, Err);
     if ((K == "CXXConstructExpr" || K == "CXXTemporaryObjectExpr")
         && (Slot == SK_Name || Slot == SK_Text || Slot == SK_Str))
     {
@@ -4979,7 +4982,18 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         return true;
     }
 
-    if (K == "InitListExpr") return LowerMakeStruct(StripTypeKeywords(TypeOf(*N)), N, BP, Out, Err);
+    if (K == "InitListExpr")
+    {
+        /* Braces around a type that is not a struct - `E R{};`, `int32 N{7};`, `AActor* A{};`, `return {};` - are C++'s
+           value-initialisation, the type's zero, or the one value braced. */
+        const std::string T = StripTypeKeywords(TypeOf(*N));
+        if (const FRecord* R = Find(T); !R || !R->bIsStruct)
+        {
+            const Json* One = First(*N);
+            return One && !IsUnsetInit(*One) ? LowerArg(*One, BP, Out, Err) : ZeroArg(T, BP, Out, Err);
+        }
+        return LowerMakeStruct(T, N, BP, Out, Err);
+    }
     /* A container's braced list: Strip took the constructor it is the one argument of, whose type is the slot's. */
     if (K == "CXXStdInitializerListExpr") return LowerContainerLiteral(*N, OuterType, BP, Out, Err);
     if (K == "CompoundAssignOperator") return LowerUpdateValue(*N, BP, Out, Err);
@@ -10228,9 +10242,14 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
         Init = Strip(First(*Init));
         K = Init ? Kind(*Init) : std::string();
     }
-    /* A member `{ .Q = 9 }` leaves unwritten (with no default of its own) is ImplicitValueInitExpr: zero. */
-    if (!bNeg && (K == "CXXNullPtrLiteralExpr" || K == "ImplicitValueInitExpr" || (K == "CXXConstructExpr" && !First(*Init))))
+    /* A member `{ .Q = 9 }` leaves unwritten (with no default of its own) is ImplicitValueInitExpr: zero. So are `T()`
+       and `{}` around a value that is not a struct, C++'s value-initialisation; a struct's `T()` keeps its defaults, as
+       no value does. Braces around one value are that value. */
+    const bool bBraced = !bNeg && K == "InitListExpr" && PD.Type != "StructProperty";
+    if (!bNeg && (K == "CXXNullPtrLiteralExpr" || K == "ImplicitValueInitExpr" || K == "CXXScalarValueInitExpr"
+                  || ((K == "CXXConstructExpr" || K == "CXXTemporaryObjectExpr") && !First(*Init)) || (bBraced && !First(*Init))))
         return true;
+    if (bBraced) return LowerDefault(F, PD, BP, Err, First(*Init), bKeepZero);
 
     /* A struct value: `FFloatInterval(1, 5)` or `{1, 5}`, one argument per member in declaration
        order. The members go on the property, each with its own default, and the writer turns them

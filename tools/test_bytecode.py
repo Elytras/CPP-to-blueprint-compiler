@@ -6531,15 +6531,17 @@ prop_enum_class()
 def value_init_scalar():
     """Braces or `T()` around something that is not a struct are C++'s: `E R{}`, `T()` and `{}` the type's zero
     (value-initialisation), `{V}` the value V - an enum, an own UE_ENUM, an int, an int64, a byte, a float, a bool and an
-    object pointer, in a local, an assignment, an argument, a return value and an array element, and as the default of a
-    member and of a UE_STRUCT member (a zero one writes no tag on the class default object; a UserDefinedStruct's default
-    instance tags every member: with no defaults to diff against, Class.cpp 1547 writes each)."""
+    object pointer, in a local, an assignment, an argument, a return value, an array element and a member of a braced
+    UE_STRUCT (`{}` there is the member's zero, not its default), and as the default of a member and of a UE_STRUCT
+    member (a zero one writes no tag on the class default object; a UserDefinedStruct's default instance tags every
+    member: with no defaults to diff against, Class.cpp 1547 writes each), and as a braced asset's value, where `{}` is
+    written as the zero it is. A UE_STRUCT's `T()` default is its defaults."""
     import struct
-    base = pending_asset('ValueInitScalar')
+    base = asset('ValueInitScalar')
     keeps_invariants(base)
     for fn, want in (('EnumBraces', 0), ('EnumEqBraces', 0), ('EnumParens', 0), ('EnumValue', 1), ('EnumArg', 20),
                      ('EnumAssign', 0), ('EnumReturn', 10), ('OwnEnum', 20), ('IntBraces', 7), ('IntParens', 0),
-                     ('WideBraces', 0), ('Elements', 10)):
+                     ('WideBraces', 0), ('Elements', 10), ('SlotBraces', 0)):
         for m in (0, 3):
             got = run(base, fn, {'Held': 1}, M=m)[0]
             assert got == want + m, 'ValueInitScalar.%s(%d) = %r, want %r' % (fn, m, got, want + m)
@@ -6547,8 +6549,11 @@ def value_init_scalar():
     assert run(base, 'ObjBraces', M=0)[0] == 1 and run(base, 'ObjAssign', {'Seen': None}, M=0)[0] == 1
     pkg = invariants.Package(base)
     cdo = pkg.find('Default__ValueInitScalar_C')
-    for name in ('Rule', 'Count', 'Who'):
+    for name in ('Rule', 'Count', 'Who', 'Parens', 'RuleParens', 'Fresh'):
         assert not pkg.tag(cdo, name), 'the zero default of %s writes a tag: %r' % (name, pkg.tag(cdo, name))
+    cleared = {u['name'].split('_')[0]: u for u in pkg.tags(cdo, pkg.tag(cdo, 'Cleared')['at'])}
+    assert fname_at(pkg.names, cleared['Kept']['value'], 0) == 'eattachmentrule::keeprelative', cleared['Kept']
+    assert struct.unpack('<i', cleared['Five']['value'])[0] == 0, cleared['Five']
     kept, seven, half = pkg.tag(cdo, 'Kept'), pkg.tag(cdo, 'Seven'), pkg.tag(cdo, 'Half')
     assert kept and fname_at(pkg.names, kept['value'], 0) == 'eattachmentrule::keepworld', kept
     assert seven and struct.unpack('<i', seven['value'])[0] == 7, seven
@@ -6557,11 +6562,15 @@ def value_init_scalar():
     tags = {t['name'].split('_')[0]: t for t in slot.struct(0).defaults}
     assert fname_at(slot.names, tags['Zeroed']['value'], 0) == 'eattachmentrule::keeprelative', tags['Zeroed']
     assert fname_at(slot.names, tags['Kept']['value'], 0) == 'eattachmentrule::keepworld', tags['Kept']
-    assert [struct.unpack('<i', tags[n]['value'])[0] for n in ('None', 'Five')] == [0, 5], (tags['None'], tags['Five'])
+    assert [struct.unpack('<i', tags[n]['value'])[0] for n in ('Nil', 'Five')] == [0, 5], (tags['Nil'], tags['Five'])
+    asset_pkg = invariants.Package(os.path.join(os.path.dirname(base), 'VD_Braces'))
+    named = {t['name']: t for t in asset_pkg.tags(asset_pkg.find('VD_Braces'))}
+    assert set(named) == {'Count', 'Rule'} and struct.unpack('<i', named['Count']['value'])[0] == 0, named
+    assert fname_at(asset_pkg.names, named['Rule']['value'], 0) == 'eattachmentrule::keeprelative', named['Rule']
 
 
-pending('ValueInitScalar: braces or T() around an enum, a number or a pointer are its zero, or the value braced',
-        value_init_scalar)
+value_init_scalar()
+print('ok  ValueInitScalar: braces or T() around an enum, a number or a pointer are its zero, or the value braced')
 
 
 # -- pending
