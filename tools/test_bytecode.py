@@ -5198,7 +5198,8 @@ def func_iface_unnamed():
     assert 'call by name' not in LOGS['FuncIfaceUnnamed'], LOGS['FuncIfaceUnnamed']
     keeps_invariants(kid)
     assert {'Tell', 'Kept'} <= set(exports_of(kid)), exports_of(kid)
-    assert run_as([kid, root], 'Tell', {}, V=2) == 5
+    assert runscript.params_of(kid, 'Tell') == ['P0_', 'P0'], runscript.params_of(kid, 'Tell')
+    assert run_as([kid, root], 'Tell', {}, P0_=1, P0=2) == 20
     fields = {'Seen': 0}
     assert run_as([kid, root], 'Use', fields) == 14 and fields['Seen'] == 2, fields
     refused('IfaceSigInherited', '', 'IsiKid implements IIsiTell, whose Tell is int32 (int32), and the IsiRoot::Tell it '
