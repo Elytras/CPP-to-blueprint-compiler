@@ -87,8 +87,36 @@ def _stamp(path):
 
 
 # What every compile reads besides the files its entry names, in every key. The prefetch runs this run's assetgen and
-# clang on this run's UeApi, so within a run these never tell two compiles apart; they keep the key whole.
-TOOLCHAIN = [_stamp(ASSETGEN), _stamp(shutil.which('clang++')), os.path.normcase(UEAPI)]
+# clang on this run's UeApi, so within a run these never tell two compiles apart; they keep the key whole. That they do
+# not change during the run is _inputs_stamp's to check.
+CLANG = shutil.which('clang++')
+TOOLCHAIN = [_stamp(ASSETGEN), _stamp(CLANG), os.path.normcase(UEAPI)]
+HEADER_EXTS = ('.h', '.hpp', '.inl', '.inc', '.json')   # what an include or LoadTables can name below UeApi's parent
+
+
+def _inputs_stamp():
+    """The size and time of every file a compile can read outside the folders its key holds, and of the files directly
+    in the stable source folders, whose bytes the key holds: assetgen and clang++; every header and table below UeApi's
+    parent (ClangCommand in Cpp.cpp passes -I<UeApi> and -I<its parent>, which holds UeAssets/ too; LoadTables reads
+    UeApi/*.json); and AssetGen/include (tests/ include ../include/Objects.h). A write changes a file's time, so the same
+    stamp at a call as at start() means nothing a staged compile could have read changed in between, a change and its
+    undo included. os.scandir reads sizes and times off the folder on Windows: about 10 ms for UeApi's 7,300 headers."""
+    stamp = {path: tuple(_stamp(path)[1:]) for path in (ASSETGEN, CLANG)}
+    folders = [(os.path.dirname(UEAPI), HEADER_EXTS), (os.path.join(AG, 'include'), HEADER_EXTS)]
+    folders += [(d, None) for d in sorted(STABLE_DIRS)]
+    while folders:
+        folder, exts = folders.pop()
+        try:
+            with os.scandir(folder) as it:
+                for e in it:
+                    if e.is_dir():
+                        if exts: folders.append((e.path, exts))     # the stable folders' own files only
+                    elif exts is None or e.name.lower().endswith(exts):
+                        st = e.stat()
+                        stamp[e.path] = (st.st_size, st.st_mtime_ns)
+        except OSError:
+            stamp[folder] = None
+    return stamp
 
 
 def _no_content_dir(path):
@@ -323,6 +351,7 @@ class CompilePrefetch:
         self.pool, self.waiting, self.stages = None, {}, set()
         self.record, self.previous = [], []
         self.calls = self.hits = self.unused = 0
+        self.inputs, self.changed_at = None, 0          # _inputs_stamp() at start(); the call that found it changed
 
     def start(self):
         """Right after build(), not before: build() wipes tests/build and keeps WORKERS busy, and its compiles, made all
@@ -336,6 +365,7 @@ class CompilePrefetch:
         # waits only for the compiles already running. (atexit runs after that join.)
         stop = getattr(threading, '_register_atexit', None)
         if stop: stop(lambda: self.pool.shutdown(wait=False, cancel_futures=True))
+        self.inputs = _inputs_stamp()       # before the keys read the stable folders, and before any staged compile
         digests = {}
         for entry in self.previous:
             try:
@@ -391,8 +421,9 @@ class CompilePrefetch:
 
     def _prefetched(self, cmd, entry, key, args):
         """The prefetched result of entry's compile (key: _compile_key's), moved into place; None when there is none to
-        take: never queued, still queued (cancelled: compiling here costs the same, and is the real thing), its
-        outputs' places taken, or moving them there failed (_materialize)."""
+        take: never queued, still queued (cancelled: compiling here costs the same, and is the real thing), staged
+        before a file it may have read changed (_inputs_changed), its outputs' places taken, or moving them there
+        failed (_materialize)."""
         futures = self.waiting.get(key)
         if not futures: return None
         future = futures.pop(0)
@@ -400,7 +431,8 @@ class CompilePrefetch:
         res = future.result()
         real = os.path.dirname(args[0]) if entry['kind'] == 'tree' else AG if entry['out'][0] == 'ag' else args[2]
         try:
-            if not res['usable'] or any(os.path.lexists(os.path.join(real, *o.split('/'))) for o in res['outputs']):
+            if (not res['usable'] or self._inputs_changed()
+                    or any(os.path.lexists(os.path.join(real, *o.split('/'))) for o in res['outputs'])):
                 self.unused += 1
                 return None
             proc = self._checked(cmd, entry, real, res) if PREFETCH_CHECK else _materialize(cmd, res, real)
@@ -409,6 +441,15 @@ class CompilePrefetch:
             return proc
         finally:
             self._drop(res)
+
+    def _inputs_changed(self):
+        """Whether a file a compile can read outside its key changed since start() (_inputs_stamp), checked once the
+        staged compile is done, so its reads fall in between. Once one has, no prefetched result is taken any more and
+        the queued ones are cancelled: each was or would be staged on the old files, or on some of each."""
+        if not self.changed_at and _inputs_stamp() != self.inputs:
+            self.changed_at = self.calls
+            for future in itertools.chain.from_iterable(self.waiting.values()): future.cancel()
+        return bool(self.changed_at)
 
     def _checked(self, cmd, entry, real, res):
         """--check-prefetch: the result moved into place as a plain run moves it (_materialize), what that put there
@@ -478,9 +519,11 @@ class CompilePrefetch:
         if PREFETCH_OFF:
             print('ok  prefetch: off, all %d compiles made directly (%d recorded for the next run)' % (self.calls, len(self.record)))
         else:
-            print('ok  prefetch: %d of %d compiles were ready (%d compiled directly, %d prefetched and unused)%s' % (
+            print('ok  prefetch: %d of %d compiles were ready (%d compiled directly, %d prefetched and unused)%s%s' % (
                 self.hits, self.calls, self.calls - self.hits, self.unused,
-                '; each checked against a direct compile' if PREFETCH_CHECK else ''))
+                '; each checked against a direct compile' if PREFETCH_CHECK else '',
+                '; a header, table, source or the exe changed by compile %d, none taken after' % self.changed_at
+                if self.changed_at else ''))
 
 
 PREFETCH = CompilePrefetch()
