@@ -6736,6 +6736,30 @@ def comp_root_variable():
 comp_root_variable()
 
 
+def comp_root_member():
+    """A member named DefaultSceneRoot is refused only where the root's variable would be misread: on a class whose SCS
+    lists the DefaultSceneRoot node (a second variable of one name, whatever its type), or as an object property below a
+    mod class that lists it, which FindFProperty<FObjectPropertyBase> finds before the parent's (SCS_Node.cpp 164).
+    CompRootMember's Body takes the root, so it lists no node and keeps its int32; RootMemberKid's int32 is no object
+    property, and RootMemberBase's variable still holds the root."""
+    base = pending_asset('CompRootMember')
+    for cls, root, value in (('CompRootMember', 'Body', 5), ('RootMemberKid', 'DefaultSceneRoot', 7)):
+        b = os.path.join(os.path.dirname(base), cls)
+        got, attach, made, stored = construct(b)
+        assert got == root and stored.get(root), '%s: root %s, stored %s' % (cls, got, stored)
+        cdo = dump('dumptags.py', b, str(exports_of(b).index('Default__%s_C' % cls)))
+        assert 'DefaultSceneRoot [0] IntProperty size=4: %d' % value in cdo, (cls, cdo)
+        keeps_invariants(b)
+    refused('RootMemberLists', '  int32 DefaultSceneRoot;\n', 'the variable of the root')
+    refused('RootMemberObject', '', 'the variable of the root',
+            'class RootObjBase : public AActor {\npublic:\n  int32 Count;\n};\n'
+            'class RootObjKid : public RootObjBase {\npublic:\n  USceneComponent* DefaultSceneRoot;\n};\n')
+
+
+pending('CompRootMember: a member named DefaultSceneRoot is refused only where the root\'s variable would be misread',
+        comp_root_member)
+
+
 def comp_attach_inherited():
     """SetupAttachment in UE_DEFAULTS places a component as a constructor does. Attached to an inherited one, it is a
     root node naming that parent: an ancestor Blueprint's node by its variable and class (Glow on AttachBase_C's Lamp),
