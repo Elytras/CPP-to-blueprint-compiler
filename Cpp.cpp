@@ -5545,31 +5545,23 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
            it means THAT implementation: the editor's "call to parent function", EX_FinalFunction on the parent's own
            UFunction (K2Node_CallParentFunction) - which Out.Fn below already is. By name the call would come straight
            back to the override making it, forever: a shipping build has no script recursion guard. A native ancestor's
-           takes the final form anyway. */
-        /* The class the call is written in: an inline method expanded into a subclass keeps its own class's view, so
-           PBase::Twice's `Speak()` stays a call by name in Kid, not Kid's call to its parent's Speak. */
-        const FRecord* Written = Cur;
-        if (!InlineStack.empty())
-            if (auto O = MethodOwner.find(InlineStack.back()->value("id", std::string())); O != MethodOwner.end())
-                Written = Find(O->second);
+           takes the final form anyway.
+           The call is the compiled class's, Cur's, wherever it is written: an inline body copied into a subclass makes
+           it from that subclass, so it is a parent call only where Cur has its own Method - one of the source's, or the
+           forwarder SynthesizeForwarders gave it, which no call by name names (`AuthOnly()` in its class still names
+           the inherited one). A call written unqualified is never one: PBase::Twice's `Speak()`, an inline body, stays
+           a call by name in a Kid that declares Speak. The rest of the qualified calls, to the class's own Method
+           (`Cur::Method()`) or with no Method in Cur, are bQualified, handled below. */
         bool bParentCall = false, bQualified = false;
-        if (Written && R != Written && Kind(CallExprNode) == "CXXMemberCallExpr")
+        if (Kind(CallExprNode) == "CXXMemberCallExpr")
         {
             const Json* Callee = Strip(First(CallExprNode));
             const Json* Obj = Callee ? Strip(First(*Callee)) : nullptr;
-            if (Obj && Kind(*Obj) == "CXXThisExpr")
+            if (Obj && Kind(*Obj) == "CXXThisExpr" && (Callee->value("forwards", false) || MemberQualifier(*Callee)))
             {
-                /* A forwarder is no declaration of the source's: `AuthOnly()` in its class still names the inherited
-                   one, a call by name. Only a call written qualified, or the forwarder's own, binds through it, and only
-                   in its own class's code: an inline body copied into a subclass is that subclass's. */
-                std::optional<bool> bWrittenQualified;
-                auto Qualified = [&] {
-                    if (!bWrittenQualified) bWrittenQualified = Callee->value("forwards", false) || MemberQualifier(*Callee);
-                    return *bWrittenQualified;
-                };
-                for (const FRecord* A = Written; A && A != R && !bParentCall; A = A->Base.empty() ? nullptr : Find(A->Base))
-                    bParentCall = A->Methods.count(MethodName) != 0 && (!A->Forwarders.count(MethodName) || (A == Cur && Qualified()));
-                bQualified = !bParentCall && !R->IsNative() && Qualified();
+                const auto Own = Cur->Methods.find(MethodName);
+                bParentCall = R != Cur && Own != Cur->Methods.end() && !IsStaticDecl(*Own->second) && !IsInlineMethod(*Cur, MethodName);
+                bQualified = !bParentCall && !R->IsNative();
             }
         }
         /* `final` (FinalOwner): the one version of the method every object the call can run on reaches, called as
@@ -5619,12 +5611,18 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
            bound to it is not a Blueprint's: the editor calls a parent's function without dispatch only from an override
            of it (K2Node_CallParentFunction), and binds no other call to a function a subclass can override (the
            call_opcode_flags rule); so one that cannot be copied in is a parent call above, from the override
-           SynthesizeForwarders declared, and one that has none stays a call by name, with a warning. */
+           SynthesizeForwarders declared, and one that has none stays a call by name, with a warning.
+           `SqA::H()` in SqA's own code, its own H, is the same: C++ runs SqA's H on an SqKid that overrides H too, and no
+           Blueprint calls its own class's function without dispatch unless that function is final (bound above). */
         if (bQualified && Only != R)
         {
             if (const Json* Def = bOnThis && !Out.bReceiverIsArg && CurLocals ? Expandable(*R, MethodName, CallExprNode, FullDecl) : nullptr)
                 return ExpandInline(CallExprNode, *Def, R->CppName + "::" + MethodName, true, BP, Out, Err);
-            if (IsMulticast(*R, MethodName))
+            if (R == Cur)
+                printf("  warning: %s::%s: %s::%s() is a call by name, which on an object of a subclass that overrides %s runs "
+                       "that override: a Blueprint calls its own class's function without dispatch only when it is final\n",
+                       Cur->CppName.c_str(), CurFnName.c_str(), R->CppName.c_str(), MethodName.c_str(), MethodName.c_str());
+            else if (IsMulticast(*R, MethodName))
                 printf("  warning: %s::%s: %s::%s() is a call by name, which on an object of a subclass that overrides %s runs "
                        "that override: a multicast is called without dispatch only from an override of it, which on a "
                        "server sends it a second time\n", Cur->CppName.c_str(), CurFnName.c_str(), R->CppName.c_str(),
@@ -5633,7 +5631,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
                 printf("  warning: %s::%s: %s::%s() is a call by name, which on an object of a subclass that overrides %s runs "
                        "that override; to run %s's alone, call it from an override of %s in %s\n", Cur->CppName.c_str(),
                        CurFnName.c_str(), R->CppName.c_str(), MethodName.c_str(), MethodName.c_str(), R->CppName.c_str(),
-                       MethodName.c_str(), Written->CppName.c_str());
+                       MethodName.c_str(), Cur->CppName.c_str());
         }
 
         const std::string CalleePackage = PackageOf(*Called), CalleeName = ClassOf(*Called);
