@@ -228,13 +228,14 @@ def _wrote_outside(stdout, stage, outputs):
 
 
 def _read_manifest():
-    """The last run's entries, in the order it made their compiles; none when there is no manifest of this layout."""
+    """The last run's entries, in the order it made their compiles; none when there is no manifest of this layout.
+    Any failure to read one means no prefetch, never a failed run: json.load raises RecursionError on deep nesting."""
     try:
         with open(PREFETCH_MANIFEST, encoding='utf-8') as f:
             data = json.load(f)
         if data.get('version') == PREFETCH_VERSION and isinstance(data.get('entries'), list):
             return [e for e in data['entries'] if isinstance(e, dict)]
-    except (OSError, ValueError, AttributeError):
+    except Exception:
         pass
     return []
 
