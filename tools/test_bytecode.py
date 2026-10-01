@@ -6123,6 +6123,27 @@ comp_char_root()
 comp_default_root_inherited()
 
 
+def comp_no_components():
+    """An actor class that declares no UE_COMPONENT and inherits no root ends its construction with the DefaultSceneRoot
+    node's component as its root, as the editor builds it: the editor keeps that node in RootNodes and AllNodes while no
+    scene component takes its place, as 40 of the game's classes save it (ENE_EnemySpawner). That component is named
+    DefaultSceneRoot and net addressable (SCS_Node.cpp 99, 107). With neither list ExecuteScriptOnActor makes a plain
+    SceneComponent instead (SimpleConstructionScript.cpp 690-702), which nothing marks net addressable, so no reference
+    to it crosses the network (ActorComponent.cpp 1901-1913). NoCompKid's Lamp attaches to that root, 40 above it."""
+    base = pending_asset('CompNoComponents')
+    for cls, attached in (('CompNoComponents', {}), ('NoCompKid', {'Lamp': 'DefaultSceneRoot'})):
+        b = os.path.join(os.path.dirname(base), cls)
+        root, attach, made, stored = construct(b)
+        assert root == 'DefaultSceneRoot', 'an actor of %s ends its construction with %s as its root' % (cls, root)
+        assert attach == dict(attached, DefaultSceneRoot=None), (cls, attach)
+        keeps_invariants(b)
+    p, ci = class_pkg(os.path.join(os.path.dirname(base), 'NoCompKid'))
+    assert world_location(p, ci, 'Lamp') == (0.0, 0.0, 40.0), world_location(p, ci, 'Lamp')
+
+
+pending('CompNoComponents: an actor with no components gets the DefaultSceneRoot node as its root', comp_no_components)
+
+
 def comp_attach_inherited():
     """SetupAttachment in UE_DEFAULTS places a component as a constructor does. Attached to an inherited one, it is a
     root node naming that parent: an ancestor Blueprint's node by its variable and class (Glow on AttachBase_C's Lamp),
