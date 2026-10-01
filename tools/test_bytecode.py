@@ -6250,9 +6250,15 @@ def loaded_container(pkg, cdo, name, kind, start):
     """The value the loader leaves for tag `name` of CDO export cdo, from `start` - the parent CDO's loaded value for an
     inherited property, empty for the class's own (UnrealType.h 439-446: a defaults pointer only inside the parent's
     layout): the listed removals taken out, then each element added (a set, PropertySet.cpp 285-358) or each pair set
-    (a map, PropertyMap.cpp 316-400). No tag: start unchanged. TSet<int32> and TMap<FName, int32> only."""
+    (a map, PropertyMap.cpp 316-400). `name` may be a tuple, a property and then members of structs written as tags: a
+    struct loads each member over the parent's struct's (Class.cpp 2775), so the same reading holds there. No tag (or
+    no member's tag): start unchanged. TSet<int32> and TMap<FName, int32> only."""
     import struct
-    t = pkg.tag(cdo, name)
+    path = (name,) if isinstance(name, str) else name
+    t = pkg.tag(cdo, path[0])
+    for member in path[1:]:
+        if t is None: break
+        t = next((x for x in pkg.tags(cdo, t['at']) if x['name'] == member), None)
     if t is None: return start
     raw, o = t['value'], 0
     out = set(start) if kind == 'set' else dict(start)
@@ -7192,25 +7198,42 @@ def edit_whole_containers():
     archetype, the parent Blueprint's CDO: the loader copies that value in, takes out the elements the tag lists as
     removed, then adds the rest (PropertySet.cpp 285-358, PropertyMap.cpp 316-400), as for a mod class's own
     (prop_set_delta). MapPatch sets PropSetDelta_C's Ids and Score over PropSetBase_C's {1, 2} and {a: 1, c: 3}: to
-    {7} and {a: 9} (every element dropped or changed), then to {1, 7} and {a: 1, b: 2} (some kept as they were).
-    Written as additions only, the CDO would load the union."""
+    {7} and {a: 9} (every element dropped or changed), then to {1, 7} and {a: 1, b: 2} (some kept as they were). A set
+    or map inside a struct written as tags loads the same way, each member over the archetype's struct's (Class.cpp
+    2775): by a member path (Held.Ids, and Deep.In.Score, where the CDO has no Deep tag of its own) and inside a whole
+    struct (Held, Deep). Written as additions only, the CDO would load the union. What a case does not assign keeps
+    what the unpatched CDO loads."""
     game = os.path.join(ROOT, 'PropSetDelta', 'FSD', 'Content')
-    decl = ('class PropSetBase : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/PropSetDelta/PropSetBase", "PropSetBase_C");\n'
-            '  TSet<int32> Ids;\n  TMap<FName, int32> Score;\n};\n'
+    decl = ('struct FPropSetHeld {\n  UE_STRUCT_IN("/Game/_ElytrasMods/PropSetDelta");\n  TSet<int32> Ids;\n'
+            '  TMap<FName, int32> Score;\n  int32 N;\n};\n'
+            'struct FPropSetDeep {\n  UE_STRUCT_IN("/Game/_ElytrasMods/PropSetDelta");\n  FPropSetHeld In;\n  int32 M;\n};\n'
+            'class PropSetBase : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/PropSetDelta/PropSetBase", "PropSetBase_C");\n'
+            '  TSet<int32> Ids;\n  TMap<FName, int32> Score;\n  FPropSetHeld Held;\n  FPropSetDeep Deep;\n};\n'
             'class PropSetDelta : public PropSetBase {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/PropSetDelta/PropSetDelta", "PropSetDelta_C");\n};\n')
-    for body, want in (('Ids = {7};\n    Score = {{"a", 9}};', ({7}, {'a': 9})),
-                       ('Ids = {1, 7};\n    Score = {{"a", 1}, {"b", 2}};', ({1, 7}, {'a': 1, 'b': 2}))):
+    paths = (('Ids',), ('Score',), ('Held', 'Ids'), ('Held', 'Score'), ('Deep', 'In', 'Ids'), ('Deep', 'In', 'Score'))
+    parent = invariants.Package(os.path.join(game, '_ElytrasMods', 'PropSetDelta', 'PropSetBase'))
+    pc = parent.find('Default__PropSetBase_C')
+
+    def loads(child):
+        cc = child.find('Default__PropSetDelta_C')
+        kinds = {p: 'set' if p[-1] == 'Ids' else 'map' for p in paths}
+        return {p: loaded_container(child, cc, p, kinds[p], loaded_container(parent, pc, p, kinds[p], set() if kinds[p] == 'set' else {}))
+                for p in paths}
+    vanilla = loads(invariants.Package(os.path.join(game, '_ElytrasMods', 'PropSetDelta', 'PropSetDelta')))
+    for body, assigned in (('Ids = {7};\n    Score = {{"a", 9}};', {('Ids',): {7}, ('Score',): {'a': 9}}),
+                           ('Ids = {1, 7};\n    Score = {{"a", 1}, {"b", 2}};', {('Ids',): {1, 7}, ('Score',): {'a': 1, 'b': 2}}),
+                           ('Held.Ids = {7};\n    Deep.In.Score = {{"a", 9}};', {('Held', 'Ids'): {7}, ('Deep', 'In', 'Score'): {'a': 9}}),
+                           ('Held = {{1, 7}, {{"a", 1}, {"b", 2}}, 3};\n    Deep = {{{7}, {{"c", 3}}, 3}, 4};',
+                            {('Held', 'Ids'): {1, 7}, ('Held', 'Score'): {'a': 1, 'b': 2}, ('Deep', 'In', 'Ids'): {7},
+                             ('Deep', 'In', 'Score'): {'c': 3}})):
         with tempfile.TemporaryDirectory() as tmp:
             proc, content = compile_edit(tmp, 'MapPatch', EDIT_HEAD + 'UE_MOD_PACKAGE("/Game/_ElytrasMods/MapPatch");\n' + decl
                                          + 'class Tweaks : public PropSetDelta {\n  UE_PATCH;\n'
                                          '  UE_DEFAULTS {\n    ' + body + '\n  }\n};\n', game)
             assert proc.returncode == 0, proc.stdout + proc.stderr
-            parent = invariants.Package(os.path.join(game, '_ElytrasMods', 'PropSetDelta', 'PropSetBase'))
-            child = invariants.Package(os.path.join(content, '_ElytrasMods', 'PropSetDelta', 'PropSetDelta'))
-            pc, cc = parent.find('Default__PropSetBase_C'), child.find('Default__PropSetDelta_C')
-            ids = loaded_container(child, cc, 'Ids', 'set', loaded_container(parent, pc, 'Ids', 'set', set()))
-            score = loaded_container(child, cc, 'Score', 'map', loaded_container(parent, pc, 'Score', 'map', {}))
-        assert (ids, score) == want, 'the patched CDO loads Ids = %s, Score = %s; the patch says %s' % (sorted(ids), score, body)
+            got = loads(invariants.Package(os.path.join(content, '_ElytrasMods', 'PropSetDelta', 'PropSetDelta')))
+        want = {**vanilla, **assigned}
+        assert got == want, 'the patched CDO loads %s; the patch says %s, so it should load %s' % (got, body, want)
 
 
 GRUNT = '#include "UeApi/Game/ENE_Spider_Grunt_Normal_C.h"\n'
@@ -7452,8 +7475,8 @@ if not globals().get('EDITS_EXPLORE'):     # set by the dev loop's exploration d
     print('ok  EditDeps: a patch\'s added override and replaced function get the preload dependencies the cook '
           'completes: the super serialized first, a new local\'s type serialized and created first')
     edit_whole_containers()
-    print('ok  MapPatch: a patch\'s whole TSet / TMap loads as written: the archetype\'s elements it drops are listed as '
-          'removed')
+    print('ok  MapPatch: a patch\'s whole TSet / TMap loads as written, a property or one inside a struct (by a member '
+          'path or in a whole struct): the archetype\'s elements it drops are listed as removed')
 
 
 PREFETCH.finish()

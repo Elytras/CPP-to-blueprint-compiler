@@ -11044,28 +11044,34 @@ struct FLoadedElement
 using FCookedLoader = std::function<const FCookedPackage*(const std::string& Package, std::string* Err)>;
 
 /*
-S38: the TSet or TMap property Name of export row X of Q (the cooked package QName) as the loader leaves it: what X's
-archetype holds (its TemplateIndex, followed through the packages Load reads), less the elements X's own tag lists as
-removed, then the rest added or, in a map, their values replaced (PropertySet.cpp 285-358, PropertyMap.cpp 316-400).
-bOwn false stops at the archetype's. Every object an element names becomes P's (an import appended), so nothing is
-written yet; Cmp is the scratch the bytes are compared in. A native archetype holds its C++ default, which no package
-has: it is taken as empty, and bNativeDefault is set when the property is the native class's (X's class is native, or
-a Blueprint class that does not declare it); a Blueprint class's own property starts empty under a native parent
-(UnrealType.h 439-446). False, saying why, when a package or a tag does not read.
+S38: the TSet or TMap at Path of export row X of Q (the cooked package QName) as the loader leaves it. Path is a
+property, then the members of tagged structs down to the set or map: a struct written as tags loads each member over
+the archetype's struct, so a set inside one is a delta just as a property is (FStructProperty::SerializeItem passes
+its defaults on, UScriptStruct::SerializeItem to SerializeTaggedProperties: PropertyStruct.cpp 148-153, Class.cpp
+2775, 1473). The value is what X's archetype holds (its TemplateIndex, followed through the packages Load reads), less
+the elements X's own tag lists as removed, then the rest added or, in a map, their values replaced (PropertySet.cpp
+285-358, PropertyMap.cpp 316-400). A tag, or a member's tag, that X leaves out is the archetype's: X was constructed
+from it. bOwn false stops at the archetype's. Every object an element names becomes P's (an import appended), so
+nothing is written yet; Cmp is the scratch the bytes are compared in. A native archetype holds its C++ default, which no
+package has: it is taken as empty, and bNativeDefault is set when the property is the native class's (X's class is
+native, or a Blueprint class that does not declare it); a Blueprint class's own property starts empty under a native
+parent (UnrealType.h 439-446), a struct's members with it (Class.cpp 1548: a struct without defaults writes every
+member). False, saying why, when a package or a tag does not read.
 */
 static bool LoadedElements(FCookedPackage& P, const std::string& PName, const FCookedPackage& Q, const std::string& QName,
-                           int32 X, const std::string& Name, bool bOwn, const FCookedLoader& Load, FPackage& Cmp,
+                           int32 X, const std::vector<std::string>& Path, bool bOwn, const FCookedLoader& Load, FPackage& Cmp,
                            std::vector<FLoadedElement>& Out, bool& bNativeDefault, int32 Depth, std::string* Err)
 {
     if (Depth > 64) { *Err = "the archetype chain does not end"; return false; }
     const FCookedExport& Self = Q.Exports[size_t(X)];
-    if (Self.Template > 0 && !LoadedElements(P, PName, Q, QName, Self.Template - 1, Name, true, Load, Cmp, Out, bNativeDefault, Depth + 1, Err))
+    const std::string& Name = Path.front();
+    if (Self.Template > 0 && !LoadedElements(P, PName, Q, QName, Self.Template - 1, Path, true, Load, Cmp, Out, bNativeDefault, Depth + 1, Err))
         return false;
     if (Self.Template < 0)
     {
-        std::vector<std::string> Path;              // the archetype first, its package last
-        for (int32 I = Self.Template; I < 0; I = Q.Imports[size_t(-I - 1)].Outer) Path.push_back(Q.NameOf(Q.Imports[size_t(-I - 1)].ObjectName));
-        if (Path.back().compare(0, 8, "/Script/") == 0)
+        std::vector<std::string> Chain;             // the archetype first, its package last
+        for (int32 I = Self.Template; I < 0; I = Q.Imports[size_t(-I - 1)].Outer) Chain.push_back(Q.NameOf(Q.Imports[size_t(-I - 1)].ObjectName));
+        if (Chain.back().compare(0, 8, "/Script/") == 0)
         {
             bool bDeclared = false;
             FClassLayout L;
@@ -11075,25 +11081,41 @@ static bool LoadedElements(FCookedPackage& P, const std::string& PName, const FC
         }
         else
         {
-            const FCookedPackage* Arch = Load(Path.back(), Err);
+            const FCookedPackage* Arch = Load(Chain.back(), Err);
             if (!Arch) return false;
             int32 Row = -1;
-            for (size_t K = Path.size() - 1; K-- > 0 && (Row = Arch->FindExport(Path[K], Row + 1)) >= 0;) {}
-            if (Row < 0) { *Err = Path.back() + " holds no " + Path.front(); return false; }
-            if (!LoadedElements(P, PName, *Arch, Path.back(), Row, Name, true, Load, Cmp, Out, bNativeDefault, Depth + 1, Err)) return false;
+            for (size_t K = Chain.size() - 1; K-- > 0 && (Row = Arch->FindExport(Chain[K], Row + 1)) >= 0;) {}
+            if (Row < 0) { *Err = Chain.back() + " holds no " + Chain.front(); return false; }
+            if (!LoadedElements(P, PName, *Arch, Chain.back(), Row, Path, true, Load, Cmp, Out, bNativeDefault, Depth + 1, Err)) return false;
         }
     }
     if (!bOwn) return true;
 
+    /* The property's tag, then each member's inside the struct before it. */
+    std::string Here = Name;
     std::vector<FTag> Tags;
     size_t At = 0;
     if (!ReadTags(Q, Self.Payload, At, Tags)) { *Err = QName + ": " + Q.NameOf(Self.ObjectName) + "'s tags do not read"; return false; }
-    const auto Tag = std::find_if(Tags.begin(), Tags.end(), [&](const FTag& T) { return T.ArrayIndex == 0 && Q.SameName(T.Name, Name); });
-    if (Tag == Tags.end()) return true;
+    FTag Tag;
+    for (size_t K = 0; K < Path.size(); ++K)
+    {
+        if (K > 0)
+        {
+            Here += "." + Path[K];
+            const std::vector<uint8> Struct = std::move(Tag.Value);
+            Tags.clear();
+            At = 0;
+            if (!Q.Is(Tag.Type, "StructProperty") || !ReadTags(Q, Struct, At, Tags) || At != Struct.size())
+            { *Err = QName + ": " + Q.NameOf(Self.ObjectName) + "'s " + Here + " is not in a struct written as tags"; return false; }
+        }
+        const auto Found = std::find_if(Tags.begin(), Tags.end(), [&](const FTag& T) { return T.ArrayIndex == 0 && Q.SameName(T.Name, Path[K]); });
+        if (Found == Tags.end()) return true;
+        Tag = *Found;
+    }
     FPropertyDef Def;
     std::string Why;
-    if (!ReadTagValue(Q, *Tag, Def, &Why) || !Def.Inner)
-    { *Err = QName + ": " + Q.NameOf(Self.ObjectName) + "'s " + Name + " does not read" + (Why.empty() ? "" : " (" + Why + ")"); return false; }
+    if (!ReadTagValue(Q, Tag, Def, &Why) || !Def.Inner)
+    { *Err = QName + ": " + Q.NameOf(Self.ObjectName) + "'s " + Here + " does not read" + (Why.empty() ? "" : " (" + Why + ")"); return false; }
     if (!ImportCookedValue(P, PName, Q, QName, Def.Default, Err)) return false;
     const bool bMap = Def.Type == "MapProperty" && Def.Value;
     auto Bytes = [&](const FPropertyDef& Of, const FDefaultValue& V) {
@@ -11304,7 +11326,11 @@ bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object,
     /* A whole TSet or TMap is written as the cook writes one: a delta the loader reads over the archetype's value
        (PropertySet.cpp 285-358, PropertyMap.cpp 316-400). The archetype's elements (a map's keys) the assignment drops
        are listed as removed and only the elements it adds or changes are written; written whole, the object would load
-       the union. Before the names are seeded below: a removed element can name an object P has no import of yet. */
+       the union. So is one a struct holds, reached through members of structs written as tags alone - assigned by a
+       path (`H.Ids = {7}`) or inside a whole struct (`H = {{7}, 3}`): each member loads over the archetype's struct's
+       (LoadedElements). An element of an array or a map loads over nothing (PropertyArray.cpp 166, PropertyMap.cpp
+       397), so a set inside one is written whole, as it is. Before the names are seeded below: a removed element can
+       name an object P has no import of yet. */
     std::map<std::string, FCookedPackage> Read;
     const FCookedLoader Load = [&](const std::string& Name, std::string* LoadErr) -> const FCookedPackage* {
         if (auto Slot = Edited.find(Lower(Name)); Slot != Edited.end()) return &Slot->second.P;
@@ -11318,24 +11344,24 @@ bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object,
         *LoadErr = Name + " is not in " + GameDir;
         return nullptr;
     };
-    for (FEditDef& E : Edits)
-    {
-        FPropertyDef& D = E.Chain[0];
-        if (!E.Path.empty() || !D.Inner || (D.Type != "SetProperty" && D.Type != "MapProperty")) continue;
+    /* D, the set or map at Path, made the delta against what the archetype holds there. */
+    auto DiffAgainstArchetype = [&](FPropertyDef& D, const std::vector<std::string>& Path) {
+        std::string Named = Path[0];
+        for (size_t K = 1; K < Path.size(); ++K) Named += "." + Path[K];
         FPackage Cmp("/Scratch");
         Cmp.SeedNames({});
         std::vector<FLoadedElement> Had;
         bool bNativeDefault = false;
         std::string Why;
-        if (!LoadedElements(P, Package, P, Package, Export, D.Name, false, Load, Cmp, Had, bNativeDefault, 0, &Why))
+        if (!LoadedElements(P, Package, P, Package, Export, Path, false, Load, Cmp, Had, bNativeDefault, 0, &Why))
         {
             printf("  warning: %s: %s: the archetype's value does not read (%s), so none of its elements is removed: the "
-                   "object loads them as well\n", Where.c_str(), D.Name.c_str(), Why.c_str());
-            continue;
+                   "object loads them as well\n", Where.c_str(), Named.c_str(), Why.c_str());
+            return;
         }
         if (bNativeDefault)
             printf("  warning: %s: %s: the archetype's value is the native class's C++ default, which no package holds, so "
-                   "none of its elements is removed: the object loads any it has as well\n", Where.c_str(), D.Name.c_str());
+                   "none of its elements is removed: the object loads any it has as well\n", Where.c_str(), Named.c_str());
         const bool bMap = D.Type == "MapProperty" && D.Value;
         auto Bytes = [&](const FPropertyDef& Of, const FDefaultValue& V) {
             FPropertyDef Element = Of;
@@ -11363,6 +11389,31 @@ bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object,
                 DefaultRefs(H.Key.Default, Deps);
             }
         D.Default = std::move(Delta);
+    };
+    /* Every set or map in D's value at Path, down through the members of structs written as tags. MoveDef made the
+       members this edit's own, so they change here alone. */
+    std::function<void(FPropertyDef&, std::vector<std::string>&)> Visit = [&](FPropertyDef& D, std::vector<std::string>& Path) {
+        if (D.Inner && (D.Type == "SetProperty" || D.Type == "MapProperty")) { DiffAgainstArchetype(D, Path); return; }
+        if (D.Type != "StructProperty" || D.Default.K != FDefaultValue::Struct || NativeStructSize(D.StructName)) return;
+        const auto& Members = D.Default.Members ? D.Default.Members : D.Members;    // as WriteValue picks them
+        if (!Members) return;
+        for (FPropertyDef& M : *Members)
+        {
+            Path.push_back(M.Name);
+            Visit(M, Path);
+            Path.pop_back();
+        }
+    };
+    for (FEditDef& E : Edits)
+    {
+        std::vector<std::string> Path{ E.Chain[0].Name };
+        bool bTagged = true;
+        for (const FValueStep& S : E.Path)
+        {
+            bTagged = bTagged && S.IsTaggedMember();
+            Path.push_back(S.Member);
+        }
+        if (bTagged) Visit(E.Chain[E.Path.size()], Path);
     }
 
     /* Each assignment's bytes, written against P's names (a name P lacks is appended), then read back as P's own.
