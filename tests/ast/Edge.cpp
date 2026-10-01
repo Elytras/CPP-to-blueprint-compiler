@@ -5,6 +5,8 @@ folder of its own, outside the test mods the suite cooks; astcheck parses it wit
 
 - escapes and non-ASCII text: in string and character literals, in a name, and in a doc comment that holds a raw
   U+0001 and U+007F (the dump writes the first as \u0001 and the second as it is)
+- a string that ends in a backslash, so its closing quote comes right after an escaped one (\\"): kept (a deprecation
+  message) and dropped (a #line file name, inside the locations after it)
 - DeclRefExprs and a MemberExpr written through macros: their range's end has a spellingLoc, which FAstSax keeps
 - the largest u64, the smallest i64, negative enumerators and '\xff'
 - friend templates, and operator= declared defaulted, user-defined, and implicit (in a class with a virtual)
@@ -39,6 +41,7 @@ Extremes<-9223372036854775807ll - 1, 18446744073709551615ull> Ex;
 constexpr long long Lowest = Extremes<-9223372036854775807ll - 1, 18446744073709551615ull>::Low;
 using Int32 = int;
 Int32 Aliased = -3;
+[[deprecated("ends in a backslash\\")]] int Deprecated = 0;
 
 struct S
 {
@@ -101,6 +104,9 @@ int h()
 const char Long[] = S256K S16K;
 
 #else
+/* The locations after a #line carry its file name as a string inside the dropped loc. */
 /// From an included file.
 inline int FromInclude(int X) { return X + 1; }
+#line 1 "dir\\"
+inline int FromDir(int X) { return X - 1; }
 #endif
