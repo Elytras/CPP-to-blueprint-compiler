@@ -3903,7 +3903,9 @@ def preload_case_kid():
     """PreloadCaseKid restates the grunt's Temperature by the name UeApi gives it, temperature (the object dump's
     spelling). FName compares without case, so that is one object: one import row, which is both the override's
     archetype and a parent subobject the class is serialized after (import_unique, edl_parent_subobjects_serialized)."""
-    assert GAME, 'needs --game: the parent CDO\'s subobjects are read off the game\'s package'
+    if not GAME:
+        print('--  PreloadCaseKid: skipped (needs --game: the parent CDO\'s subobjects are read off the game\'s package)')
+        return False
     base = asset('PreloadCaseKid')
     saved = list(invariants.GAME_CONTENT)
     invariants.GAME_CONTENT[:] = [GAME]
@@ -3912,17 +3914,20 @@ def preload_case_kid():
     finally:
         invariants.GAME_CONTENT[:] = saved
     assert not found, '; '.join('%s %s: %s' % f for f in found[:3])
+    return True
 
 
-preload_case_kid()
-print('ok  PreloadCaseKid: a restated subobject spelled in another case than the parent\'s export is one import')
+if preload_case_kid():
+    print('ok  PreloadCaseKid: a restated subobject spelled in another case than the parent\'s export is one import')
 
 
 def preload_nested_kid():
     """PreloadNestedKid's parent, the game's WPN_Pickaxe_C, exports an instanced bonus under each of two default
     subobjects (Damage:BreakIceBonus_0): the class is serialized after those too, as after every default subobject,
     since the CDO it makes then copies each from them (edl_parent_subobjects_serialized walks every depth)."""
-    assert GAME, 'needs --game: the parent CDO\'s subobjects are read off the game\'s package'
+    if not GAME:
+        print('--  PreloadNestedKid: skipped (needs --game: the parent CDO\'s subobjects are read off the game\'s package)')
+        return False
     base = asset('PreloadNestedKid')
     saved = list(invariants.GAME_CONTENT)
     invariants.GAME_CONTENT[:] = [GAME]
@@ -3932,10 +3937,11 @@ def preload_nested_kid():
         invariants.GAME_CONTENT[:] = saved
     assert not found, '%d findings, e.g. %s' % (len(found), '; '.join('%s %s: %s' % f for f in found[:2]))
     keeps_invariants(base)
+    return True
 
 
-preload_nested_kid()
-print('ok  PreloadNestedKid: a child of a game Blueprint is serialized after its parent CDO\'s nested subobjects too')
+if preload_nested_kid():
+    print('ok  PreloadNestedKid: a child of a game Blueprint is serialized after its parent CDO\'s nested subobjects too')
 
 
 def ueapi_too_old():
