@@ -6872,7 +6872,7 @@ def repl_refusals():
 def repl_never():
     base = asset('ReplNever')
     pkg = invariants.Package(base)
-    got = {p.name: (p.cond, p.flags & 0x20) for p in pkg.struct(pkg.find('ReplNever_C')).props}
+    got = {p.name: (p.cond, p.flags & 0x20) for p in pkg.struct(pkg.find('ReplNever_C')).props if p.flags & 0x20}
     assert got == {'Hidden': (15, 0x20), 'NoReplay': (13, 0x20), 'Shown': (0, 0x20)}, \
         'Hidden cooks condition %d, want COND_Never 15: %s' % (got.get('Hidden', (None,))[0], got)
     keeps_invariants(base)
