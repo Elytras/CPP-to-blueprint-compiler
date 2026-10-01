@@ -5239,8 +5239,9 @@ def iface_over_stub_sig():
             top=two + 'class SsKid : public SsRoot, public ISsB {\npublic:\n  int32 Other2() { return 1; }\n};\n')
 
 
-pending('FuncIfaceUnnamed: an implementation over an ancestor\'s interface stub of another signature is refused in the '
-        'interfaces\' terms', iface_over_stub_sig)
+iface_over_stub_sig()
+print('ok  FuncIfaceUnnamed: an implementation over an ancestor\'s interface stub of another signature is refused in '
+      'the interfaces\' terms')
 
 
 def parm_unnamed():

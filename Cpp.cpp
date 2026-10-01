@@ -14041,15 +14041,33 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         if (Replaced && Replaced != &Decl && !R.bIsPatch && SignatureOf(*Replaced) != SignatureOf(Decl))     // a patch checks its own
         { *Err = R.CppName + "::" + Fn.Name + " is " + TypeOf(Decl) + ", and the " + Owner->CppName + "::" + Fn.Name
                  + " it replaces is " + TypeOf(*Replaced) + ": callers pass that one's parameters; declare the same"; return false; }
-        /* An implementation of an interface of the class's own list, whose name a mod ancestor's function has too: that
-           one is its super (FindEvent), so it replaces both, and a caller of either lays out that one's parameters. */
-        if (Replaced && Replaced != &Decl && !R.bIsPatch)
-            if (const auto [A, bStatic] = FoundAbove(R, Fn.Name); A && A != Owner && !A->IsNative() && !bStatic
-                && A->Methods.count(Fn.Name) && SignatureOf(*A->Methods.at(Fn.Name)) != SignatureOf(Decl))
-            { *Err = R.CppName + "::" + Fn.Name + " implements " + Owner->CppName + "::" + Fn.Name + ", " + TypeOf(*Replaced)
-                     + ", and replaces the " + A->CppName + "::" + Fn.Name + " it inherits, " + TypeOf(*A->Methods.at(Fn.Name))
-                     + ": a Blueprint function has one signature, and callers of each pass that one's parameters; rename "
-                       "one of them"; return false; }
+        /* An implementation of an interface of the class's own list, its own function or the stub of one it leaves out,
+           whose name a mod ancestor's function has too, that one's own or the stub of another interface's it leaves
+           out: that one is its super (FindEvent), so it replaces both, and a caller of either lays out that one's
+           parameters. The editor refuses it: "Cannot override ... declared in a parent with a different signature"
+           (KismetCompiler.cpp 1993-2011). */
+        if (Replaced && Owner && Owner->bIsInterface && !R.bIsPatch)
+            if (const auto [A, bStatic] = FoundAbove(R, Fn.Name); A && A != Owner && !A->IsNative() && !bStatic)
+            {
+                const FRecord* AboveIface = A->Methods.count(Fn.Name) ? nullptr : ModInterfaceWith(*A, Fn.Name);
+                const Json* AboveDecl = AboveIface ? AboveIface->Methods.at(Fn.Name)
+                                      : A->Methods.count(Fn.Name) ? A->Methods.at(Fn.Name) : nullptr;     // else a native interface's
+                const Json& Above = AboveDecl ? *AboveDecl : Decl;
+                if (SignatureOf(Above) != SignatureOf(Decl))
+                {
+                    *Err = (Replaced == &Decl ? R.CppName + " implements " + Owner->CppName + ", whose " + Fn.Name + " is "
+                                                + TypeOf(Decl)
+                                              : R.CppName + "::" + Fn.Name + " implements " + Owner->CppName + "::" + Fn.Name
+                                                + ", " + TypeOf(*Replaced))
+                         + ", and replaces "
+                         + (AboveIface ? "the " + Fn.Name + " of " + AboveIface->CppName + ", " + TypeOf(Above) + ", that "
+                                         + A->CppName + " implements"
+                                       : "the " + A->CppName + "::" + Fn.Name + " it inherits, " + TypeOf(Above))
+                         + ": a Blueprint function has one signature, and callers of each pass that one's parameters; "
+                           "rename one of them";
+                    return false;
+                }
+            }
         uint32 Flags = Inherited ? Inherited & kOverrideInherits
                      : IsStaticDecl(Decl) ? uint32(FUNC_Static | FUNC_BlueprintCallable | FUNC_Public | FUNC_Final)
                      : kPlainMethodFlags;
