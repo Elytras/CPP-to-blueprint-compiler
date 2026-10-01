@@ -11,6 +11,8 @@ folder of its own, outside the test mods the suite cooks; astcheck parses it wit
 - the largest u64, the smallest i64, negative enumerators and '\xff'
 - friend templates, and operator= declared defaulted, user-defined, and implicit (in a class with a virtual)
 - a type alias (typeAliasDeclId) and a declaration from an included file (includedFrom): this file, included again
+- unbalanced brackets inside a string in a dropped location (a #line file name): a skip that counted them would run
+  past the end of the location
 - a string literal longer than the reader's 256 KB chunk, built from adjacent literals in macros so the file stays small
 */
 #ifndef EDGE_SECOND_PASS
@@ -105,6 +107,7 @@ const char Long[] = S256K S16K;
 
 #else
 /* The locations after a #line carry its file name as a string inside the dropped loc. */
+#line 1 "Edge{[.h"
 /// From an included file.
 inline int FromInclude(int X) { return X + 1; }
 #line 1 "dir\\"
