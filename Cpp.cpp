@@ -8410,7 +8410,8 @@ const FRecord* FCompiler::FinalOwner(const FRecord* Of, const std::string& Metho
    body; it or an ancestor's version is an RPC, authority only or cosmetic, or overrides an engine function (the
    engine's routing must see the call); it is noinline or UE_NO_OPTIMIZE, or the caller is UE_NO_OPTIMIZE; it is
    the function being compiled or expanded already (recursion stays a call); it makes a latent call or an await,
-   which would move the caller into the ubergraph, or holds a goto, which turns the caller's optimizer off; or the
+   which would move the caller into the ubergraph, or holds a goto, which turns the caller's optimizer off; it makes
+   a qualified call to a parent's function that is not copied in, bound from its own class (CopyableDef); or the
    call does not match it, an overload's or another class's version with other parameters. */
 const Json* FCompiler::Expandable(const FRecord& In, const std::string& Method, const Json& Call, const Json* Picked) const
 {
@@ -8449,7 +8450,26 @@ const Json* FCompiler::CopyableDef(const FRecord& In, const std::string& Method)
             return nullptr;
     }
     std::set<const Json*> Seen;
-    return HasGoto(*Body) || ResumesLater(*Body, Seen) ? nullptr : Def;
+    if (HasGoto(*Body) || ResumesLater(*Body, Seen)) return nullptr;
+    /* `Base::Fn()` on this, to an ancestor's Fn that is not copied in either, is bound in In's own code through In's
+       Fn, its own or the one SynthesizeForwarders gives it, and with neither goes by name, with a warning. Copied
+       into a subclass's function the call would be that subclass's, which has no such Fn: by name, a subclass's
+       override would run, or bound from a class without the function. So that body stays In's function, called;
+       a caller written `In::Method()` gets a forwarder of its own for it. Each step goes to a strict ancestor. */
+    bool bBindsParent = false;
+    std::function<void(const Json&)> Walk = [&](const Json& N) {
+        if (bBindsParent) return;
+        const Json* Callee = Kind(N) == "CXXMemberCallExpr" ? Strip(First(N)) : nullptr;
+        const Json* Obj = Callee && Kind(*Callee) == "MemberExpr" ? Strip(First(*Callee)) : nullptr;
+        if (Obj && Kind(*Obj) == "CXXThisExpr")
+            if (const auto O = MethodOwner.find(Callee->value("referencedMemberDecl", std::string())); O != MethodOwner.end())
+                if (const FRecord* R = Find(O->second); R && R != &In && !R->IsNative() && IsSubclassOf(In, *R)
+                    && MemberQualifier(*Callee) && !CopyableDef(*R, Name(*Callee)))
+                    bBindsParent = true;
+        ForEach(N, Walk);
+    };
+    Walk(*Body);
+    return bBindsParent ? nullptr : Def;
 }
 
 /* `QcParent::AuthOnly()` in a class W that has no AuthOnly of its own means QcParent's AuthOnly, whatever the object.

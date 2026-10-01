@@ -2027,7 +2027,9 @@ Notes:
   its call back stays a call.
 - These are never copied in: a function that waits (Delay, UE_AWAIT) or contains a goto; an RPC, an authority-only or
   cosmetic function; an override of an engine function; UE_NO_OPTIMIZE on the function or on the caller; a class
-  another mod cooks (UE_CLASS).
+  another mod cooks (UE_CLASS); a function whose body calls a parent's function that is not copied in, such as
+  `Base::AuthOnly()` (see [Calling the parent](#calling-the-parent)): that call is bound from the function's own
+  class, and in a subclass's copy it would be the subclass's.
 - Copying makes the caller bigger. A large function called in many places may be worth `[[gnu::noinline]]`.
 - A function that native code intercepts by name, such as an empty one a DLL or script mod hooks to read its
   arguments, must be `[[gnu::noinline]]`: a copied call runs the body in place and never reaches the hook.
@@ -2411,7 +2413,7 @@ Notes:
 | `SuperBase::ReceiveBeginPlay();` inside an override | Runs the parent's own implementation once and comes back: the editor's "Add call to parent function". Write the class you derive from; C++ has no `Super`. | Yes |
 | `AActor::ReceiveBeginPlay();` | Calls the engine's function. For a BlueprintImplementableEvent it does nothing, because there is no parent body. For a BlueprintNativeEvent it runs the C++ default. | Yes |
 | `SuperBase::Twice(1)` in a class that does not declare Twice | SuperBase's Twice, its body copied in: C++ runs that function without dispatch, so an object of a subclass that overrides Twice does not reach its own. | Yes |
-| The same call to a function whose body cannot be copied in: authority-only, cosmetic, a server or client RPC, `noinline`, one that waits, or any from a `UE_NO_OPTIMIZE` caller | SuperBase's function, without dispatch. Blueprint calls a parent's function that way only from a class that has its own function of that name, so AssetGen adds one to your class: an override of the method that only calls the nearest parent's version with the same arguments, compiled like one you write, with an override's flags and super. The call is then bound to SuperBase's function, and a subclass's override of the method overrides the added one. A call by name runs what it ran before: the added override passes it on, and the engine routes both calls the same way. | Yes |
+| The same call to a function whose body cannot be copied in: authority-only, cosmetic, a server or client RPC, `noinline`, one that waits, one whose body makes such a call itself, or any from a `UE_NO_OPTIMIZE` caller | SuperBase's function, without dispatch. Blueprint calls a parent's function that way only from a class that has its own function of that name, so AssetGen adds one to your class: an override of the method that only calls the nearest parent's version with the same arguments, compiled like one you write, with an override's flags and super. The call is then bound to SuperBase's function, and a subclass's override of the method overrides the added one. A call by name runs what it ran before: the added override passes it on, and the engine routes both calls the same way. | Yes |
 | The same call to a multicast RPC | A call by name, with a warning: an object of a subclass that overrides the function runs its override. On a server a multicast runs locally and is also sent, so an added override would send it once, then again when it calls the parent's. An override you declare yourself does that too, as an editor override that calls its parent does. | Warns |
 | `Other->SuperBase::Bump(1)` | Not what C++ does. The qualifier is recognised only on `this`, so this is a call by name that reaches Other's most derived Bump. | Not yet |
 

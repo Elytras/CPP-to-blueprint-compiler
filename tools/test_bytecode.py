@@ -4509,10 +4509,17 @@ def func_cosmetic_static():
 def func_qualified_call():
     """FuncQualifiedCall: `QcParent::Fn()` on a QcKid runs QcParent's Fn - copied in, or, for an authority-only, RPC or
     noinline Fn or a UE_NO_OPTIMIZE caller, bound from the override of Fn the calling class gets, which forwards to
-    QcParent's. That override has QcParent's flags and is QcKid's super; a call by name runs what it ran before it."""
+    QcParent's. That override has QcParent's flags and is QcKid's super; a call by name runs what it ran before it.
+    A body making such a call is not copied into a subclass's function, where the call would be the subclass's: a
+    QcRelayKid, which overrides AuthOnly, still runs QcParent's through FuncQualifiedCall::CallParentAuth, and its call
+    to QcRelay::RelayServer leaves RelayServer's parent call bound from QcRelay, which has a ServerBump."""
     folder = os.path.dirname(asset('FuncQualifiedCall'))
     chain = [os.path.join(folder, c) for c in ('QcKid', 'FuncQualifiedCall', 'QcParent')]
-    for b in chain: keeps_invariants(b)
+    relay = [os.path.join(folder, c) for c in ('QcRelayKid', 'QcRelay')] + chain[1:]
+    for b in chain + relay[:2]: keeps_invariants(b)
+    for fn, fields, want in (('CallRelayAuth', {}, 3), ('CallRelayServer', {'Seen': 1}, 3)):
+        run_as(relay, fn, fields)
+        assert fields.get('Seen') == want, (fn, fields)
     for fn in ('CallParentPlain', 'CallParentPlainSlow'):
         got = run_as(chain, fn, {})
         assert got == 5, '%s: QcParent::Plain() on a QcKid returned %r' % (fn, got)

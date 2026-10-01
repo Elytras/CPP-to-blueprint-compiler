@@ -12,6 +12,9 @@ so the call must be bound to QcParent's function. AuthOnly is the same with a ro
 Plain's body is copied in. AuthOnly's, ServerBump's and Kept's are not (authority-only, an RPC, noinline), nor Plain's
 into a UE_NO_OPTIMIZE caller: the editor binds a parent's function only from a class that has one of that name, so
 FuncQualifiedCall gets an override of each that forwards to QcParent's, and QcKid's versions override those.
+A body that makes such a call is not copied into a subclass's function either, where the call would be the subclass's:
+QcRelay gets an override of CallParentAuth, so on a QcRelayKid, which overrides AuthOnly, QcParent's still runs; and
+QcRelayKid one of RelayServer, whose parent call is bound from QcRelay's own ServerBump, which QcRelayKid has not.
 */
 class QcParent : public AActor {
 public:
@@ -38,4 +41,17 @@ public:
   void  ServerBump(int32 By) { Seen = By * 100; }
   int32 Kept(int32 V) { return V + 1000; }
   int32 Plain() { return 50; }
+};
+
+class QcRelay : public FuncQualifiedCall {
+public:
+  void ServerBump(int32 By) { Seen = By * 10; }
+  void RelayServer() { QcParent::ServerBump(2); }                 // a parent call: QcRelay has a ServerBump
+  void CallRelayAuth() { FuncQualifiedCall::CallParentAuth(); }   // through FuncQualifiedCall's forwarder
+};
+
+class QcRelayKid : public QcRelay {
+public:
+  void AuthOnly() { Seen = 30; }
+  void CallRelayServer() { QcRelay::RelayServer(); }
 };
