@@ -1894,6 +1894,26 @@ def final_as_pure():
 pending('FinalAsTest: UE_FINAL_AS on a base with a `= 0` method is refused', final_as_pure)
 
 
+def func_import_call():
+    """FuncImportUser calls into FuncImportOwner's classes through a shared header. A Blueprint function is no
+    native whose thunk dispatches: EX_FinalFunction runs exactly the one it names (ScriptCore.cpp 3005-3009). So Via's
+    call to Bump, which FicKid overrides, goes by name, as the editor calls a function without FUNC_Final, and reaches
+    FicKid's on a FicKid; the final Fixed and the static Twice are bound to FicBase's, and FicUserKid's parent call is
+    FicBase's own."""
+    pending_asset('FuncImportOwner', 'FicKid')
+    user = pending_asset('FuncImportUser')
+    kid = os.path.join(os.path.dirname(user), 'FicUserKid')
+    for b in (user, kid): keeps_invariants(b)
+    assert calls_in(user, 'Via') == [('Bump', 0x1B)], calls_in(user, 'Via')
+    for b, fn, callee in ((user, 'ViaFixed', 'Fixed'), (user, 'ViaStatic', 'Twice'), (kid, 'Bump', 'Bump')):
+        assert calls_in(b, fn) == [(callee, 0x1C)], (fn, calls_in(b, fn))
+        assert '/Game/_ElytrasMods/FuncImportOwner/FicBase.FicBase_C:' + callee in import_paths(b), (fn, import_paths(b))
+
+
+pending('FuncImportCall: a call to another mod\'s Blueprint function goes by name unless it is final, static or a '
+        'parent call', func_import_call)
+
+
 def final_as_shared():
     """FinalAsShared.h declares a UE_CLASS base and its UE_FINAL_AS beside it. FinalAsOwner, whose path the base's is,
     cooks both; FinalAsUser includes the header and cooks neither: its cast to the leaf and its call through one name
