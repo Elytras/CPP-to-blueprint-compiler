@@ -1,6 +1,7 @@
 ﻿#include "UeApi/Types.h"
 
 #include "UeApi/Engine.h"
+#include "UeApi/FSD.h"
 
 UE_MOD_PACKAGE("/Game/_ElytrasMods/CompAttachInherited");
 
@@ -44,6 +45,19 @@ public:
   UE_COMPONENT(UPointLightComponent, Glow);
 
   UE_DEFAULTS { Glow->SetupAttachment(Mesh); }
+};
+
+/* Further down, Mesh is still ACharacter's CharacterMesh0: APlayerCharacter's FPMesh is a skeletal mesh as well, but a
+   subclass cannot rename a subobject its parent made. The game's BP_PlayerCharacter hangs FilmFaceLight there, at
+   S_Lamp. The same holds for a default set through Mesh: it overrides CharacterMesh0. */
+class AttachPlayer : public APlayerCharacter {
+public:
+  UE_COMPONENT(UPointLightComponent, Glow);
+
+  UE_DEFAULTS {
+    Glow->SetupAttachment(Mesh, FName("S_Lamp"));
+    Mesh->bVisible = false;
+  }
 };
 
 /* With no inherited root, the root is the first scene component SetupAttachment leaves alone, Root, though Bulb is

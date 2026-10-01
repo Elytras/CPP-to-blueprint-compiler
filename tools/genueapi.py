@@ -657,7 +657,12 @@ def map_subobjects(classes, by_name):
     name and class (FLinkerLoad::CreateExport), which the member names neither of: ACharacter's CapsuleComponent is
     Default__Character.CollisionCylinder, and APlayerCharacter's CharMoveComp is a PlayerMovementComponent. The dump
     has no values, so a member is joined to the one subobject whose class is a kind of its type; one that two fit
-    (AActor's RootComponent) is left out unless one of them has its name."""
+    (AActor's RootComponent) is left out unless one of them has its name, or is the one the class declaring the member
+    joins it to on its own CDO. A subclass cannot rename a default subobject its parent's constructor made, only swap
+    its class or drop it (FObjectInitializer::SetDefaultSubobjectClass / DoNotCreateDefaultSubobject, by that name),
+    so APlayerCharacter's Mesh, which its FPMesh fits too, is still ACharacter's CharacterMesh0, as the game's own
+    BP_PlayerCharacter nodes attached to it say. That would only mislead for a member a subclass points elsewhere,
+    which ACharacter's, private, cannot be."""
     native = dict((k.ue_name, k) for k in classes if not k.is_bp)
 
     def isa(k, cpp):
@@ -665,7 +670,14 @@ def map_subobjects(classes, by_name):
             k = by_name.get(k.base)
         return k is not None
 
-    for k in classes:
+    def depth(k):
+        n = 0
+        while k is not None:
+            k, n = by_name.get(k.base), n + 1
+        return n
+
+    # Parents first, so the class that declares a member has its own mapping when a subclass needs it.
+    for k in sorted(classes, key=depth):
         k.subobjects = {}
         subs = [] if k.is_bp else [(n, native[c]) for n, c in SUBOBJECTS.get(k.path + "." + k.ue_name, ()) if c in native]
         o = k
@@ -676,7 +688,9 @@ def map_subobjects(classes, by_name):
                     continue
                 fits = [(n, c) for n, c in subs if isa(c, t.group(1))]
                 if len(fits) > 1:
-                    fits = [(n, c) for n, c in fits if n == (real_field(o, fname) or fname)]
+                    named = [(n, c) for n, c in fits if n == (real_field(o, fname) or fname)]
+                    held = getattr(o, "subobjects", {}).get(fname) if o is not k else None
+                    fits = named or [(n, c) for n, c in fits if held and n == held.split(" ")[0]]
                 if len(fits) == 1:
                     k.subobjects[fname] = "%s %s.%s" % (fits[0][0], fits[0][1].path, fits[0][1].ue_name)
             o = by_name.get(o.base)

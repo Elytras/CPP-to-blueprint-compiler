@@ -6018,19 +6018,31 @@ comp_root_keep()
 def comp_attach_inherited():
     """SetupAttachment in UE_DEFAULTS places a component as a constructor does. Attached to an inherited one, it is a
     root node naming that parent: an ancestor Blueprint's node by its variable and class (Glow on AttachBase_C's Lamp),
-    or a native default subobject by its object name (AttachChar's Glow on CharacterMesh0, ACharacter's Mesh). Attached
+    or a native default subobject by its object name (AttachChar's Glow on CharacterMesh0, ACharacter's Mesh). Below
+    ACharacter, Mesh is still CharacterMesh0 though APlayerCharacter's FPMesh is a skeletal mesh too (AttachPlayer, at
+    its socket), and a default set through it overrides that subobject. Attached
     to one of the class's own, it is one of that node's ChildNodes, at its socket (Tip on Glow, at Bulb). Each keeps its
     offset under its parent; with no inherited root, the root is the first scene component left alone (AttachOwn's
     Root, not Bulb), and its offset passes to what hangs below it. In a function, SetupAttachment attaches at once and
     keeps the relative transform: AttachToComponent with KeepRelative (0), no welding."""
     folder = os.path.dirname(asset('CompAttachInherited'))
-    for cls, parent, owner, native in (('CompAttachInherited', 'Lamp', 'AttachBase_C', False),
-                                       ('AttachChar', 'CharacterMesh0', 'None', True)):
+    for cls, parent, owner, native, socket in (('CompAttachInherited', 'Lamp', 'AttachBase_C', False, None),
+                                               ('AttachChar', 'CharacterMesh0', 'None', True, None),
+                                               ('AttachPlayer', 'CharacterMesh0', 'None', True, 'S_Lamp')):
         p, ci = class_pkg(os.path.join(folder, cls))
         si, nodes, roots, dsr = comp.scs(p, ci)
         glow = next(n for n in nodes.values() if n.name == 'Glow')
         assert glow.index in roots and (glow.parent, glow.owner, glow.native) == (parent, owner, native), (
             cls, glow.parent, glow.owner, glow.native)
+        at = comp.tags_at(p, glow.index).get('AttachToName')
+        assert (at and comp.tag_name(p, at)) == (socket or None), (cls, at and comp.tag_name(p, at))
+    b = os.path.join(folder, 'AttachPlayer')
+    ex = dumpexp.load(b)[5]
+    k = next(i for i, e in enumerate(ex) if e['name'] == 'CharacterMesh0')
+    got = tuple(ref(b, ex[k][f]) for f in ('cls', 'tmpl', 'outer'))
+    assert got == ('/Script/Engine.SkeletalMeshComponent', '/Script/FSD.Default__PlayerCharacter:CharacterMesh0',
+                   'Default__AttachPlayer_C'), got
+    assert 'bVisible [0] BoolProperty size=0 value=0' in dump('dumptags.py', b, k), dump('dumptags.py', b, k)
     p, ci = class_pkg(os.path.join(folder, 'CompAttachInherited'))
     glow, tip = node_named(p, ci, 'Glow'), node_named(p, ci, 'Tip')
     assert glow.children == [tip.index] and comp.tag_name(p, comp.tags_at(p, tip.index)['AttachToName']) == 'Bulb'
@@ -6046,7 +6058,8 @@ def comp_attach_inherited():
     vm = VM(asset('CompAttachInherited'), {}, Pivot=Obj('SceneComponent'), Lamp=Obj('PointLightComponent'))
     vm.call('ReceiveBeginPlay')
     assert vm.log == [('K2_AttachToComponent', vm.self.vars['Pivot'], [vm.self.vars['Lamp'], 'None', 0, 0, 0, False])], vm.log
-    for cls in ('CompAttachInherited', 'AttachBase', 'AttachChar', 'AttachOwn'): keeps_invariants(os.path.join(folder, cls))
+    for cls in ('CompAttachInherited', 'AttachBase', 'AttachChar', 'AttachPlayer', 'AttachOwn'):
+        keeps_invariants(os.path.join(folder, cls))
     print('ok  CompAttachInherited: SetupAttachment attaches a component to an inherited Blueprint or native one, or at a\n'
           '    socket of one of its own class\'s, each keeping its offset; in a function it attaches at once')
 
