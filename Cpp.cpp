@@ -1301,6 +1301,7 @@ private:
     bool LowerWithoutPrefix(const Json& Stmt, FBlueprintClass& BP, std::vector<FStmtIR>& Out,
                             std::vector<FPropertyDef>& Locals, std::string* Err);
     int32 HoistComma(const Json& Stmt, Json* Seq, std::string* Err);
+    const Json* CalledDecl(const Json& Call) const;
 
     /* `inline` functions are the editor's macros: never a UFunction, their body is copied into each caller.
        `inline` may sit on the declaration or on an out-of-line definition. */
@@ -9522,6 +9523,22 @@ bool IsFixedOperand(const Json& N)
     return false;
 }
 
+/* The declaration a call names, for its parameters' defaults: an inline free function, or a method of the class being
+   compiled or of an ancestor (its in-class declaration, which holds them). Null for anything else. */
+const Json* FCompiler::CalledDecl(const Json& Call) const
+{
+    const Json* Callee = First(Call) ? Strip(First(Call)) : nullptr;
+    if (!Callee) return nullptr;
+    const std::string Id = Kind(*Callee) == "MemberExpr" ? Callee->value("referencedMemberDecl", std::string())
+                         : Kind(*Callee) == "DeclRefExpr" && Callee->contains("referencedDecl")
+                         ? (*Callee)["referencedDecl"].value("id", std::string()) : std::string();
+    if (Id.empty()) return nullptr;
+    if (const auto F = FreeInlines.find(Id); F != FreeInlines.end()) return F->second;
+    for (const FRecord* R = Cur; R; R = R->Base.empty() ? nullptr : Find(R->Base))
+        for (const Json* M : R->AllMethods) if (M->value("id", std::string()) == Id) return M;
+    return nullptr;
+}
+
 /*
 The comma operator inside a statement's expression: `int32 N = (Bump(), M);`, `F((Bump(), M))`, `return (A, B);`,
 `switch (Bump(), T)`. C++ runs the comma's left side, then its right side, whose value the comma is; the editor has no
@@ -9531,12 +9548,13 @@ C++ evaluates, whose place allows that, and rewrites the statement into the stat
 at a time: LowerBody lowers them, and a comma left in them is taken apart the same way.
 
 Where the comma sits decides it. Before it, in an operand C++ evaluates first (an assignment's right side runs before
-its left, a call's object before its arguments, a braced list's members in order), there may be only a fixed value
+its left, a call's object before its arguments, braces' members in order), there may be only a fixed value
 (IsFixedOperand): else something the comma's left side could change, or that could change what its right side reads,
 would run after the one and before the other, and the comma stays where it is (LowerArg refuses it). Beside it, as
-another argument of the same call or the other operand of an arithmetic operator, C++ fixes no order: the whole
-operand holding the comma may run first, so where a sibling is not a fixed value that operand moves to a temporary
-first (`F(G(), (Bump(), M))` is `T = (Bump(), M); F(G(), T)`), unless the operand is the comma itself and both its right side and the siblings only read (IsEagerSafe), where reading
+another argument of the same call or constructor or the other operand of an arithmetic operator, C++ fixes no
+order: the whole operand holding the comma may run first, so where a sibling is not a fixed value (a left-out argument
+counts as its default) that operand moves to a temporary first (`F(G(), (Bump(), M))` is `T = (Bump(), M); F(G(), T)`),
+unless the operand is the comma itself and both its right side and the siblings only read (IsEagerSafe), where reading
 the right side after the siblings changes nothing. A comma whose value is written or bound to a reference, `const T&`
 included, cannot move to a temporary: the callee reads the place when it runs, after every argument, and a temporary
 would hold what it held before them. Its right side then has to be a variable, which names the same place wherever it
@@ -9566,6 +9584,19 @@ int32 FCompiler::HoistComma(const Json& Stmt, Json* Seq, std::string* Err)
         return (K == "BinaryOperator" && E.value("opcode", std::string()) == "=")
             || (K == "CXXOperatorCallExpr" && OperatorOf(E) == "=" && Nth(E, 2));
     };
+    /* A left-out argument stands for its parameter's default, which C++ evaluates at the call like any other argument:
+       a fixed value there (`int32 By = 5`) is no sibling that could run before the comma. */
+    std::set<const Json*> FixedDefaults;
+    auto NoteDefaults = [&](const Json& Call) {
+        std::vector<const Json*> Parms;
+        if (const Json* D = CalledDecl(Call)) ForEach(*D, [&](const Json& C) { if (Kind(C) == "ParmVarDecl") Parms.push_back(&C); });
+        const Json& In = Call["inner"];
+        for (size_t J = 1; J < In.size(); ++J)
+            if (Kind(In[J]) == "CXXDefaultArgExpr")
+                if (const Json* V = DefaultedArg(In[J], J - 1 < Parms.size() ? Parms[J - 1] : nullptr); V != &In[J] && IsFixedOperand(*V))
+                    FixedDefaults.insert(&In[J]);
+    };
+    auto IsFixedSibling = [&](const Json& E) { return IsFixedOperand(E) || FixedDefaults.count(&E) != 0; };
     std::function<Json*(Json&, bool)> Seek = [&](Json& E, bool bRoot) -> Json* {
         if (!E.is_object()) return nullptr;
         const std::string K = Kind(E);
@@ -9594,7 +9625,7 @@ int32 FCompiler::HoistComma(const Json& Stmt, Json* Seq, std::string* Err)
                 if (Json* F = Seek(In[I], false))
                 {
                     bool bFixed = true;
-                    for (size_t J = From; J < In.size(); ++J) if (J != I) bFixed = bFixed && IsFixedOperand(In[J]);
+                    for (size_t J = From; J < In.size(); ++J) if (J != I) bFixed = bFixed && IsFixedSibling(In[J]);
                     Levels.push_back({ &In[I], &E, From, bFixed });
                     return F;
                 }
@@ -9606,17 +9637,24 @@ int32 FCompiler::HoistComma(const Json& Stmt, Json* Seq, std::string* Err)
             || K == "CStyleCastExpr" || K == "CXXStaticCastExpr" || K == "CXXConstCastExpr" || K == "CXXStdInitializerListExpr"
             || K == "UnaryOperator" || K == "MemberExpr")
             return Seek(In[0], false);
-        if (K == "CXXConstructExpr" || K == "CXXTemporaryObjectExpr" || K == "InitListExpr" || K == "ArraySubscriptExpr")
+        /* Braces fix their members' order; a parenthesised constructor's arguments are a call's, in no fixed order. */
+        if (K == "InitListExpr" || K == "ArraySubscriptExpr"
+            || ((K == "CXXConstructExpr" || K == "CXXTemporaryObjectExpr") && E.value("list", false)))
             return InOrder(0);
+        if (K == "CXXConstructExpr" || K == "CXXTemporaryObjectExpr") return Unordered(0);
         if (K == "CallExpr")
-            return In.size() > 1 && IsFixedOperand(In[0]) ? Unordered(1) : nullptr;
+        {
+            if (In.size() < 2 || !IsFixedOperand(In[0])) return nullptr;
+            NoteDefaults(E);
+            return Unordered(1);
+        }
         if (K == "CXXMemberCallExpr")
         {
             /* The object runs before the arguments: they come into it only when it is this. */
             Json& Callee = In[0];
             if (Kind(Callee) != "MemberExpr" || !Callee.contains("inner") || Callee["inner"].empty()) return nullptr;
             const Json* Obj = Strip(&Callee["inner"][0]);
-            if (Obj && Kind(*Obj) == "CXXThisExpr") return Unordered(1);
+            if (Obj && Kind(*Obj) == "CXXThisExpr") { NoteDefaults(E); return Unordered(1); }
             if (Json* F = Seek(Callee["inner"][0], false)) return F;
             return nullptr;
         }
@@ -9699,7 +9737,7 @@ int32 FCompiler::HoistComma(const Json& Stmt, Json* Seq, std::string* Err)
             bool bSiblingsRead = true;
             const Json& In = (*L->Parent)["inner"];
             for (size_t I = L->From; I < In.size(); ++I)
-                if (&In[I] != L->Child && !IsFixedOperand(In[I])) bSiblingsRead = bSiblingsRead && IsEagerSafe(In[I]);
+                if (&In[I] != L->Child && !IsFixedSibling(In[I])) bSiblingsRead = bSiblingsRead && IsEagerSafe(In[I]);
             if (!(JustTarget(L->Child) && IsEagerSafe(Right) && bSiblingsRead)) Moved = L->Child;
         }
     if (Moved && !ValueUse(*Moved))

@@ -1053,7 +1053,7 @@ def comma_ctor_default():
     """CommaCtorDefault: a comma among a parenthesised constructor's arguments runs as among a call's (Get before it or
     after it, Y is M); a comma beside nothing but a constant default argument needs no temporary, and its element
     reaches Inc's reference (M + 5)."""
-    base = pending_asset('CommaCtorDefault')
+    base = asset('CommaCtorDefault')
     keeps_invariants(base)
     for m, c in ((2, 0), (-1, 4)):
         me = {'Count': float(c)}
@@ -1063,8 +1063,9 @@ def comma_ctor_default():
         assert run(base, 'DefaultRef', me, M=m)[0] == m + 5 and me['Bumps'] == c + 1, ('DefaultRef', m, c, me)
 
 
-pending('CommaCtorDefault: a comma in a parenthesised constructor call is refused as a braced list\'s, and one beside '
-        'a constant default argument is refused as beside an argument that may run first', comma_ctor_default)
+comma_ctor_default()
+print('ok  CommaCtorDefault: a comma among a parenthesised constructor\'s arguments is a call\'s, and a constant default '
+      'argument beside one runs nothing')
 # Bound to a reference, `const T&` included, a comma whose right side is no variable cannot move into a temporary.
 refused('CommaConstSlot', '  int32 Count;\n  TArray<int32> L;\n  int32 Idx() { Count += 1; return 0; }\n'
         '  int32 SetL() { L[0] = 50; return 1; }\n  int32 Peek(int32 X, const int32& V) { return X * 1000 + V; }\n'
