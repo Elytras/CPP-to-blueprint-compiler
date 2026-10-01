@@ -1545,6 +1545,8 @@ private:
     bool IsSubclassOf(const FRecord& Child, const FRecord& Parent) const;
     /* The nearest declaration of some method along R's chain is `= 0`: the class Generate cooks CLASS_Abstract. */
     bool IsAbstract(const FRecord& R) const;
+    /* The nearest `= 0` method R is left with, up its chain, and the class declaring it; {nullptr, ""} when none. */
+    std::pair<const FRecord*, std::string> PureMethod(const FRecord& R) const;
     std::vector<uint8> NativeTail(const FRecord* Component) const;
     std::vector<const Json*> StructArgs(const Json& Value, const FRecord* R, const std::vector<std::string>& Fields) const;
     mutable std::vector<std::string> SourceTexts;                       // the mod directory's .h/.cpp, read on demand
@@ -2513,6 +2515,14 @@ bool FCompiler::Collect(std::string* Err)
         const FRecord* Base = Leaf.Base.empty() ? nullptr : Find(Leaf.Base);
         if (!Base || Base->UePackage.compare(0, 8, "/Script/") == 0 || !Leaf.bFinal)
         { *Err = "UE_FINAL_AS(" + Leaf.Base + ", " + Leaf.CppName + "): the base must be a Blueprint class, a mod's"; return false; }
+        /* The leaf brings no method of its own, so a `= 0` one left above it makes the one class made abstract too
+           (IsAbstract): nothing could be spawned, and the base's calls would be bound to the method's empty stub. */
+        if (const auto [Owner, Method] = PureMethod(Leaf); Owner)
+        {
+            *Err = "UE_FINAL_AS(" + Leaf.Base + ", " + Leaf.CppName + "): " + Owner->CppName + "::" + Method + " is `= 0`, "
+                   "so " + Leaf.CppName + ", the one class made, would be abstract; give " + Method + " a body";
+            return false;
+        }
         Records[Base->CppName].FinalAs = Leaf.CppName;
     }
     for (const auto& [Key, W] : Records)
@@ -5134,12 +5144,16 @@ bool FCompiler::IsSubclassOf(const FRecord& Child, const FRecord& Parent) const
 
 bool FCompiler::IsAbstract(const FRecord& R) const
 {
-    if (!R.FinalAs.empty()) return true;
+    return !R.FinalAs.empty() || PureMethod(R).first;
+}
+
+std::pair<const FRecord*, std::string> FCompiler::PureMethod(const FRecord& R) const
+{
     std::set<std::string> Nearest;
     for (const FRecord* A = &R; A; A = A->Base.empty() ? nullptr : Find(A->Base))
         for (const auto& [Method, Decl] : A->Methods)
-            if (Nearest.insert(Method).second && Decl->value("pure", false)) return true;
-    return false;
+            if (Nearest.insert(Method).second && Decl->value("pure", false)) return { A, Method };
+    return { nullptr, std::string() };
 }
 
 /* What a component class's native Serialize reads after UObject's part, for an archetype with no instance data: each

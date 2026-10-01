@@ -1891,7 +1891,8 @@ def final_as_pure():
                 '  int32 Use(int32 V) { return Need(V) + 1; }\n};\nUE_FINAL_AS(FaPureBase, FaPureLeaf);\n')
 
 
-pending('FinalAsTest: UE_FINAL_AS on a base with a `= 0` method is refused', final_as_pure)
+final_as_pure()
+print('ok  FinalAsTest: UE_FINAL_AS on a base with a `= 0` method is refused')
 
 
 def func_stub_super():
