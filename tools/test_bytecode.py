@@ -1846,8 +1846,9 @@ final_calls()
 
 
 def final_as():
-    """UE_FINAL_AS: the base's calls on `this` expand as a final class's do; the base is cooked Abstract and the leaf,
-    the one class made, is not; any other subclass of the base is refused."""
+    """UE_FINAL_AS: the base's calls on `this` expand as a final class's do, and one that stays a call is bound to the
+    base's function, Final as a final class's; the base is cooked Abstract and the leaf, the one class made, is not; any
+    other subclass of the base is refused."""
     folder = os.path.dirname(asset('FinalAsTest'))
     base, leaf = os.path.join(folder, 'UFinalAsBase'), asset('FinalAsTest')
     for c in (0, 5):
@@ -1856,6 +1857,16 @@ def final_as():
             got = run(base, 'UseBump', self_vars=f, V=v)[0]
             assert got == (c + v) * 100 + c + 2 * v and f == dict(Counter=c + 2 * v), ('UseBump', c, v, got, f)
     assert not [n for n, op in calls_in(base, 'UseBump') if n in exports_of(base)], calls_in(base, 'UseBump')
+    # A call that stays a call - noinline, recursion - is bound to the base's own function (EX_LocalFinalFunction), as
+    # a final class's is, and those functions are Final and not BlueprintEvent.
+    fact = lambda v: 1 if v <= 1 else v * fact(v - 1)
+    for v in (-2, 0, 5):
+        assert run(base, 'UseKept', V=v)[0] == (v + 1) * 10 + v and run(base, 'Fact', V=v)[0] == fact(v), v
+    reached = lambda fn: {name for name, op in calls_in(base, fn) if name in exports_of(base) and op == 0x46}
+    assert reached('UseKept') == {'Kept'} and reached('Fact') == {'Fact'}, (calls_in(base, 'UseKept'), calls_in(base, 'Fact'))
+    flags = lambda fn: int(re.search(r'FunctionFlags (\S+)', dump('dumpstruct.py', base, export_index(base, fn))).group(1), 16)
+    for fn in ('Bump', 'Kept', 'Fact'):
+        assert flags(fn) & 0x1 and not flags(fn) & 0x8000000, (fn, hex(flags(fn)))
     abstract = lambda b: int(re.search(r'ClassFlags (\S+)', dump('dumpstruct.py', b, 0)).group(1), 16) & 0x1
     assert abstract(base) and not abstract(leaf)
     refused('FinalAsTwo', '', 'derives from FaBase, which is UE_FINAL_AS FaLeaf',
