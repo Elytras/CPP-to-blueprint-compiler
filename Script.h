@@ -36,6 +36,7 @@ struct FDefaultValue
     FIndex Object;                      // Obj: the asset an ObjectProperty points at
     std::vector<FDefaultValue> Items;   // Array (also a set / map): one value per element, typed by the property's Inner; a map alternates key, value
     std::shared_ptr<std::vector<struct FPropertyDef>> Members;  // Struct, as a container's element: its own members (a lone struct's are FPropertyDef::Members)
+    std::vector<FDefaultValue> Removed; // a set / map read over the parent's value: its elements (a map's keys) taken out first
 };
 
 /* One ChildProperties entry. ElementSize must equal the type's runtime size; the engine lays the struct out from it. */
@@ -84,6 +85,8 @@ FPropertyDef StructParam(const std::string& Name, FIndex Struct, const std::stri
 FPropertyDef InterfaceParam(const std::string& Name, FIndex InterfaceClass, uint64 ExtraFlags = 0);
 /* An event dispatcher. Extra = its <Name>__DelegateSignature function. */
 FPropertyDef DispatcherParam(const std::string& Name, FIndex Signature, uint64 ExtraFlags = 0);
+/* A single-cast delegate, TDelegate<...>. Extra = its signature function. */
+FPropertyDef DelegateParam(const std::string& Name, FIndex Signature, uint64 ExtraFlags = 0);
 
 /* bUncooked=true adds the editor-only per-field metadata flag (FField::Serialize writes it when not
    cooking); the cooked layout leaves it off. */
@@ -91,9 +94,22 @@ void WriteProperty(FArc& Ar, const FPropertyDef& P, bool bUncooked = false);
 
 /* The property as a tagged-property entry holding P.Default (its zero value when unset). */
 void WriteDefaultTag(FArc& Ar, const FPropertyDef& P);
+/* P.Default alone, as a tag's value or a container element holds it: no tag around it. */
+void WriteDefaultValue(FArc& Ar, const FPropertyDef& P);
+/* The bytes a struct the engine serializes natively takes (FVector's three floats: 12), or 0 for one written as tags. */
+int32 NativeStructSize(const std::string& StructName);
+/* The bytes WriteDefaultValue writes for P whatever the value, or 0 when that depends on the value (a string, a text, a
+   soft path, a struct written as tags, a container). */
+int32 FixedValueSize(const FPropertyDef& P);
+/* Whether the engine serializes StructName natively in a form WriteValue does not write (it writes tags for it): each
+   one the S38 value gate met in the pak's values. The engine misreads any value of one AssetGen writes. */
+bool NativeUnwritten(const std::string& StructName);
 
 /* Every object D points at, for the owning export's create-before-serialize edges. */
 void DefaultRefs(const FDefaultValue& D, std::vector<int32>& Out);
+/* The structs and enums P is typed by, container elements included: what its owner links against, for the owner's
+   serialize-before-serialize edges. */
+void TypeRefs(const FPropertyDef& P, std::vector<int32>& Out);
 
 /*
 Kismet bytecode buffer. MemorySize and StorageSize differ by design: a property reference is

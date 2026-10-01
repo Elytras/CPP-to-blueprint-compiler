@@ -44,9 +44,16 @@ public:
 
     /* Only an actor may have the SCS trio: USimpleConstructionScript casts the owner CDO to AActor. */
     void SetIsActor(bool bValue) { bIsActor = bValue; }
+    /* An actor component: its tick function is PrimaryComponentTick, not an actor's PrimaryActorTick. */
+    void SetIsComponent(bool bValue) { bIsComponent = bValue; }
+    /* A flag the class's own members call for on top of what SetClassFlags gave (CLASS_HasInstancedReference). */
+    void AddClassFlags(uint32 Flags) { ClassFlags |= Flags; }
 
     /* A cooked class stores the FULL EClassFlags set, mostly inherited from the native parent. */
     void SetClassFlags(uint32 Flags) { ClassFlags = Flags; }
+    /* ClassWithin and ClassConfigName, which the editor copies from the parent (KismetCompiler.cpp:320-321, 2453). */
+    void SetClassTail(std::string WithinPackage_, std::string WithinClass_, std::string ConfigName_)
+    { WithinPackage = std::move(WithinPackage_); WithinClass = std::move(WithinClass_); ConfigName = std::move(ConfigName_); }
 
     /* Replication: the CDO's bReplicates, set when the class replicates a variable or declares an RPC. The class's
        NumReplicatedProperties tag is counted from the CPF_Net variables. */
@@ -86,6 +93,21 @@ public:
                       const std::vector<uint8>& NativeTail = {});
 
     /*
+    Where UE_DEFAULTS' SetupAttachment puts a component added above, by the fields of its SCS node: under another of
+    this class's components, as one of that node's ChildNodes (bOwn); or, as a root node, under an inherited one the
+    node names - an ancestor Blueprint's node by its variable and OwnerClass, that Blueprint's class, which
+    FixupRootNodeParentReferences looks it up in, or a native default subobject by its object name (bNative), which
+    ExecuteScriptOnActor matches among the actor's native scene components. Socket is AttachToName. A component given
+    none is placed as before: the first such scene component is the root and the others attach to it.
+    */
+    struct FAttachment
+    {
+        std::string Parent, OwnerClass, Socket;
+        bool bOwn = false, bNative = false;
+    };
+    void AttachComponent(const std::string& Name, const FAttachment& Attachment);
+
+    /*
     An inherited component's defaults: one UInheritableComponentHandler record, which is how the
     editor stores a child class's override of a parent's SCS component. The template is a fresh
     component export archetyped on the parent's, so `Defaults` are its deltas.
@@ -100,15 +122,27 @@ public:
     An override of a NATIVE parent's default subobject - its components, which are not SCS nodes and
     so have nothing to do with the handler above. Measured on Ene_Butterfly: one export named exactly
     as the subobject, outered to THIS class's CDO, flags Public|Transactional|ArchetypeObject|
-    DefaultSubObject and a null template (the engine resolves the archetype through the parent CDO's
-    subobject of the same name), plus an ObjectProperty tag of that name on the CDO.
+    DefaultSubObject, archetyped on the parent CDO's subobject of the same name (Finish imports it),
+    plus an ObjectProperty tag of that name on the CDO.
     */
     void AddSubobjectOverride(const std::string& Name, const std::string& Property, FIndex ComponentClass,
                               const std::vector<FPropertyDef>& Defaults, const std::vector<uint8>& NativeTail = {});
 
+    /* A default subobject the Blueprint parent's CDO exports (its own AddSubobjectOverride): imported under the parent
+       CDO and serialized before this class, which builds its own CDO's copy from it. */
+    void AddParentSubobject(const std::string& Name, const std::string& ClassPackage, const std::string& ClassName_)
+    {
+        ParentSubobjects.push_back(FParentSubobject{ Name, ClassPackage, ClassName_ });
+    }
+
     /* A tag on this class's CDO for a property an ancestor declares, which a member initializer
        cannot express: declaring the name again would shadow it with a second property. */
     void AddCdoDefault(const FPropertyDef& Var) { CdoDefaults.push_back(Var); }
+
+    /* The actor has a root before this class's SCS runs: a Blueprint parent's SCS leaves one, and a native parent's
+       constructor sets one or ExecuteConstruction takes its first native scene component. Then the DefaultSceneRoot
+       node is in neither RootNodes nor AllNodes, as the editor saves it (ValidateSceneRootNodes). */
+    void SetRootInherited(bool bInherited) { bRootInherited = bInherited; }
 
     void Finish();
 
@@ -146,10 +180,13 @@ private:
     std::string ClassName;
     std::string ParentPackage, ParentClass;
     bool bParentIsBlueprint = false;
+    bool bRootInherited = false;
     bool bIsActor = true;
+    bool bIsComponent = false;
     bool bReplicates = false;
     FIndex UberGraphFunction;
     uint32 ClassFlags = 0x00840814;
+    std::string WithinPackage = "/Script/CoreUObject", WithinClass = "Object", ConfigName = "Engine";
 
     std::unordered_map<std::string, int32> ImportCache;
 
@@ -169,6 +206,7 @@ private:
         bool bIsScene = false;
         std::vector<FPropertyDef> Defaults;
         std::vector<uint8> NativeTail;
+        FAttachment Attachment;
     };
     std::vector<FComponent> Components;
 
@@ -192,6 +230,12 @@ private:
         std::vector<uint8> NativeTail;
     };
     std::vector<FSubobjectOverride> SubobjectOverrides;
+
+    struct FParentSubobject
+    {
+        std::string Name, ClassPackage, ClassName;
+    };
+    std::vector<FParentSubobject> ParentSubobjects;
 
     int32 ClassRow = 0;
 };

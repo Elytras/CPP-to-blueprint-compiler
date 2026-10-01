@@ -36,6 +36,8 @@ inline auto Twice(Number auto V) { return V + V; }
 /* A mod's own name for a class: how one that two packages both have (so the headers give it no short name) is
    spelled. It must stay the object reference it is, not pass for a raw pointer. */
 using FTarget = AActor;
+/* And one for a template, a parameter's type here: written out where it is used. */
+using FMoods = TArray<EMood>;
 
 class TypesTest : public AActor, public ITargetable {
   FTarget *Aimed;
@@ -75,6 +77,7 @@ class TypesTest : public AActor, public ITargetable {
   TMap<EMood, FName> MoodNames = UE_ENUM_MAP(EMood);         // one pair per enumerator, filled at build time,
   TMap<FString, EMood> MoodsByName = UE_ENUM_MAP(EMood);      // so the table follows the enum
   EMood Mood = EMood::Angry;
+  TEnum<EMood> Tagged = EMood::Sleepy;                        // a plain EMood property, with its names on call
   ESpan Span = ESpan::Wide;
   EAge Age = EAge::Eon;
 
@@ -149,6 +152,19 @@ public:
     case EMood::Sleepy: return 3;
     }
     return M == Mood ? 10 : 0;
+  }
+
+  /* TEnum<E> is E: it switches, compares and assigns as one; Name() / String() ask the engine for E's names. */
+  FName TaggedName(TEnum<EMood> M) { return M.Name(); }
+  FString TaggedString(EMood M) { TEnum<EMood> T = M; return T.String(); }
+  FString MemberString() { return Tagged.String(); }
+  int32 SleepyCount(FMoods Moods) { int32 N = 0; for (EMood M : Moods) N += M == EMood::Sleepy; return N; }
+  int32 TaggedScore(EMood M) {
+    Tagged = M;
+    switch (Tagged) {
+    case EMood::Sleepy: return 3;
+    default: return Tagged == Mood ? 10 : 0;
+    }
   }
 
   int32 SpanScore(ESpan S) {

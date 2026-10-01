@@ -33,3 +33,32 @@ public:
   int32 Thrice(int32 By) { return Twice(By) + Bump(By); }
   int32 ViaInline(int32 By) { return TwiceInline(By); }
 };
+
+/* `= 0` is an empty function that returns the default: the super of a subclass's version, and what a call by name
+   finds on an object without one. A class that declares one, or inherits one with no version of its own, is
+   cooked Abstract, as clang calls it abstract. */
+class PureBase : public AActor {
+public:
+  virtual int32 Pure(int32 V) = 0;
+  virtual void  Touch() = 0;
+  int32         UsePure(int32 V) { return Pure(V) * 10; }
+};
+
+class PureMid : public PureBase {
+public:
+  void Touch() override {}
+};
+
+class PureKid : public PureMid {
+public:
+  int32 Pure(int32 V) override { return V + 3; }
+};
+
+/* An interface's `= 0` leaves no class Abstract: one that leaves it out gets the interface stub. */
+class IPokable {
+public:
+  UE_INTERFACE;
+  virtual int32 Poke() = 0;
+};
+
+class PokeLess : public AActor, public IPokable {};

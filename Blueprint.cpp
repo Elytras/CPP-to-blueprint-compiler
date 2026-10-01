@@ -185,7 +185,13 @@ void FBlueprintClass::AddComponent(const std::string& Name, FIndex ComponentClas
                                    bool bIsSceneComponent, const std::vector<FPropertyDef>& Defaults,
                                    const std::vector<uint8>& NativeTail)
 {
-    Components.push_back(FComponent{ Name, ComponentClass, ComponentCdo, bIsSceneComponent, Defaults, NativeTail });
+    Components.push_back(FComponent{ Name, ComponentClass, ComponentCdo, bIsSceneComponent, Defaults, NativeTail, {} });
+}
+
+void FBlueprintClass::AttachComponent(const std::string& Name, const FAttachment& Attachment)
+{
+    for (FComponent& C : Components)
+        if (C.Name == Name) C.Attachment = Attachment;
 }
 
 void FBlueprintClass::AddSubobjectOverride(const std::string& Name, const std::string& Property, FIndex ComponentClass,
@@ -214,7 +220,8 @@ void FBlueprintClass::Finish()
     const std::string CDOName = "Default__" + ClassName;
 
     const FIndex BpgcClass = EngineClass("/Script/Engine", "BlueprintGeneratedClass");
-    const FIndex ObjectClass = EngineClass("/Script/CoreUObject", "Object");
+    const bool bWithinObject = WithinPackage == "/Script/CoreUObject" && WithinClass == "Object";
+    const FIndex ObjectClass = bWithinObject ? EngineClass("/Script/CoreUObject", "Object") : Null();
     const FIndex FunctionClass = EngineClass("/Script/CoreUObject", "Function");
     const FIndex EnginePkg = PackageImport("/Script/Engine");
     const FIndex CorePkg = PackageImport("/Script/CoreUObject");
@@ -227,6 +234,19 @@ void FBlueprintClass::Finish()
     const FIndex ParentCdo = Imp(P.AddImport({ ParentPackage, ParentClass,
                                                PackageImport(ParentPackage),
                                                "Default__" + ParentClass }));
+    /* An overridden default subobject's archetype is the object of its name under its outer's archetype - the parent
+       CDO's subobject (GetArchetypeFromRequiredInfo rule 1, UObjectArchetype.cpp 64-83) - and the cook writes it as the
+       export's TemplateIndex: Ene_Butterfly's HealthComponent names
+       ENE_FlyingCritterBase.Default__ENE_FlyingCritterBase_C:HealthComponent. The loader check()s it is set and fetches
+       it serialized (AsyncLoading.cpp 2955, 3191-3193). A native parent's is found in memory; a Blueprint parent's is an
+       export of its package, where the cook exports every default subobject and this compiler every one the parent or a
+       subclass of it cooked here restates (Cpp.cpp, Generate). */
+    std::vector<FIndex> SubobjectArchetypes;
+    for (const FSubobjectOverride& O : SubobjectOverrides)
+    {
+        const FImport* SubClass = P.ImportAt(O.Class);
+        SubobjectArchetypes.push_back(Subobject(P.ImportAt(SubClass->Outer)->ObjectName, SubClass->ObjectName, ParentCdo, O.Name));
+    }
 
     const int32 RowClass = 0;
     const int32 RowCdo = 1;
@@ -262,6 +282,22 @@ void FBlueprintClass::Finish()
     // serialize-before-serialize edge aborts the async loading thread.
     Class.SerBeforeSer = { ParentIdx.V, ParentCdo.V };
     if (bIsActor) Class.SerBeforeSer.push_back(ScsIdx.V);
+    /* The CDO the class makes while it is serialized copies each default subobject from its archetype
+       (UObjectGlobals.cpp 3822-3859), so a Blueprint parent's is loaded first, as Ene_Butterfly_C lists its parent's. */
+    for (const FIndex A : SubobjectArchetypes) Class.SerBeforeSer.push_back(A.V);
+    /* UStruct::GetPreloadDependencies (Class.cpp 732-735): the structs and enums the class's variables are typed by,
+       which it links against while it is serialized. */
+    for (const FPropertyDef& V : Vars) TypeRefs(V, Class.SerBeforeSer);
+    /* The rest of UBlueprintGeneratedClass::GetPreloadDependencies (BlueprintGeneratedClass.cpp 1425-1459): Link preloads
+       the ubergraph and the CDO's persistent frame is made only from a loaded one (1636, 1358-1375), and a component
+       archetype lookup on the class meets RF_NeedLoad on an unloaded handler, a Fatal (858-866). */
+    if (UberGraphFunction.V != 0) Class.SerBeforeSer.push_back(UberGraphFunction.V);
+    if (!ComponentOverrides.empty()) Class.SerBeforeSer.push_back(Exp(RowIch).V);
+    /* Every default subobject a Blueprint parent's CDO exports, restated here or not: the CDO this class makes while it
+       is serialized copies each from that export as it stands (UObjectGlobals.cpp 3822-3859), so the cook maps it into
+       the linker table and orders it first (SavePackage.cpp 4013-4040). */
+    for (const FParentSubobject& S : ParentSubobjects)
+        Class.SerBeforeSer.push_back(Subobject(S.ClassPackage, S.ClassName, ParentCdo, S.Name).V);
     Class.SerBeforeCreate = { BpgcClass.V, BpgcCdo.V };
     Class.CreateBeforeCreate = { ParentIdx.V };
     for (int32 I = 0; I < NumFunctions; ++I)
@@ -270,6 +306,10 @@ void FBlueprintClass::Finish()
         if (V.Extra.V != 0 && std::find(Class.CreateBeforeSer.begin(), Class.CreateBeforeSer.end(), V.Extra.V) == Class.CreateBeforeSer.end())
             Class.CreateBeforeSer.push_back(V.Extra.V);
     for (FIndex I : Interfaces) Class.CreateBeforeSer.push_back(I.V);  // as BP_SentryGun_MoveMarker lists Targetable
+    /* ABP_Amber_Depositbox lists its ClassWithin, SkeletalMeshComponent, there too; UObject is listed nowhere. */
+    const FIndex Within = bWithinObject ? ObjectClass : EngineClass(WithinPackage, WithinClass);
+    if (!bWithinObject) Class.CreateBeforeSer.push_back(Within.V);
+    const std::string Config = ConfigName;
     const std::vector<FIndex> ClassInterfaces = Interfaces;
     const std::vector<FPropertyDef> ClassVars = Vars;
     const bool bActor = bIsActor;
@@ -311,8 +351,8 @@ void FBlueprintClass::Finish()
         }
 
         Ar.U32(Flags);                              // ClassFlags
-        Ar.Idx(ObjectClass);                        // ClassWithin
-        Ar.Name("Engine");                          // ClassConfigName
+        Ar.Idx(Within);                             // ClassWithin
+        Ar.Name(Config);                            // ClassConfigName
         Ar.Idx(Null());                             // ClassGeneratedBy
         Ar.I32(int32(ClassInterfaces.size()));      // Interfaces: class, PointerOffset, bImplementedByK2
         for (FIndex I : ClassInterfaces) { Ar.Idx(I); Ar.I32(0); Ar.Bool(true); }
@@ -333,10 +373,14 @@ void FBlueprintClass::Finish()
     if (bParentIsBlueprint)
         Cdo.CreateBeforeSer = { ParentIdx.V };
     for (const FPropertyDef& V : Vars) DefaultRefs(V.Default, Cdo.CreateBeforeSer);     // as ED_Spider_Grunt lists its EnemyID
-    // AActor defaults bCanEverTick to false; the BP compiler sets it on the CDO when ReceiveTick
-    // is overridden (KismetCompiler.cpp, SetCanEverTick), else the actor loads and never ticks.
-    const bool bOverridesTick = std::any_of(Functions.begin(), Functions.end(),
+    // AActor and UActorComponent default bCanEverTick to false; the BP compiler sets it on the CDO's
+    // tick function - an actor's PrimaryActorTick, a component's PrimaryComponentTick - when ReceiveTick
+    // is overridden (KismetCompiler.cpp:4738-4800, SetCanEverTick), else the object loads and never
+    // ticks (Actor.cpp:914-925, ActorComponent.cpp:1038-1046). Any other class has no tick function.
+    const bool bOverridesTick = (bIsActor || bIsComponent) && std::any_of(Functions.begin(), Functions.end(),
         [](const FPending& F) { return F.Def.Name == "ReceiveTick"; });
+    const char* const TickProperty = bIsActor ? "PrimaryActorTick" : "PrimaryComponentTick";
+    const char* const TickStruct = bIsActor ? "ActorTickFunction" : "ActorComponentTickFunction";
 
     const bool bCdoReplicates = bReplicates;
     const std::vector<FPropertyDef> Inherited = CdoDefaults;
@@ -346,10 +390,10 @@ void FBlueprintClass::Finish()
     Cdo.Serialize = [=](FArc& Ar) {
         if (bCdoReplicates) TagBool(Ar, "bReplicates", true);
         if (bOverridesTick)
-            Tag(Ar, "PrimaryActorTick", "StructProperty", [](FArc& V) {
+            Tag(Ar, TickProperty, "StructProperty", [](FArc& V) {
                 TagBool(V, "bCanEverTick", true);
                 TagEnd(V);
-            }, "ActorTickFunction");
+            }, TickStruct);
         /* Only initialised members: an absent tag keeps the parent CDO's (zero) value. */
         for (const FPropertyDef& V : ClassVars)
             if (V.Default.K != FDefaultValue::None) WriteDefaultTag(Ar, V);
@@ -378,15 +422,17 @@ void FBlueprintClass::Finish()
                           [Body, SelfExp](FScript& S) { Body(S, SelfExp); }, Refs);
     }
 
-    for (const FSubobjectOverride& O : SubobjectOverrides)
+    for (size_t I = 0; I < SubobjectOverrides.size(); ++I)
     {
+        const FSubobjectOverride& O = SubobjectOverrides[I];
         const std::vector<FPropertyDef> Defaults = O.Defaults;
         FExport Sub;
         Sub.ClassIndex = O.Class;
+        Sub.TemplateIndex = SubobjectArchetypes[I];
         Sub.OuterIndex = Exp(RowCdo);
         Sub.ObjectName = O.Name;
         Sub.ObjectFlags = RF_Public | RF_Transactional | RF_ArchetypeObject | RF_DefaultSubObject;
-        Sub.SerBeforeCreate = { O.Class.V };
+        Sub.SerBeforeCreate = { O.Class.V, Sub.TemplateIndex.V };      // as the cook lists class and template
         Sub.CreateBeforeCreate = { Exp(RowCdo).V };
         Sub.Serialize = [Defaults, Tail = O.NativeTail](FArc& Ar) {
             for (const FPropertyDef& V : Defaults) WriteDefaultTag(Ar, V);
@@ -403,6 +449,19 @@ void FBlueprintClass::Finish()
     const FIndex SceneCompCdo = ClassDefaultObject("/Script/Engine", "SceneComponent");
     const FIndex ScsNodeCdo = ClassDefaultObject("/Script/Engine", "SCS_Node");
     const FIndex ScsCdo = ClassDefaultObject("/Script/Engine", "SimpleConstructionScript");
+
+    /* Components, none of them a scene component, and no root inherited: the DefaultSceneRoot node stays listed, first,
+       as the editor keeps it until a scene component can take its place. ExecuteScriptOnActor makes a root of its own
+       only when RootNodes is empty (SimpleConstructionScript.cpp 640-703), so an actor of movement components alone would
+       otherwise end its construction with no RootComponent. An actor that has a root before this SCS runs would skip the
+       node (648), and the editor drops it from both lists then (ValidateSceneRootNodes, 1132-1150: a native root or
+       scene component, or a scene root node of a parent Blueprint's, GetSceneRootComponentTemplate 1029-1108), as all
+       1,885 of the game's SCS classes have it. Listed, it is a node like any other: its own VariableGuid is what a
+       subclass's override of it is keyed on. */
+    const bool bKeepDefaultRoot = !bRootInherited && !Components.empty()
+                                  && std::none_of(Components.begin(), Components.end(), [](const FComponent& C) { return C.bIsScene; });
+    uint32 DefaultRootGuid[4];
+    ScsNodeGuid(ClassName, "DefaultSceneRoot", DefaultRootGuid);
 
     FExport RootTemplate;
     RootTemplate.ClassIndex = SceneCompClass;
@@ -429,6 +488,8 @@ void FBlueprintClass::Finish()
         Tag(Ar, "ComponentClass", "ObjectProperty", [=](FArc& V) { V.Idx(SceneCompClass); });
         Tag(Ar, "ComponentTemplate", "ObjectProperty",
             [=](FArc& V) { V.Idx(Exp(RowRootTemplate)); });
+        if (bKeepDefaultRoot)
+            Tag(Ar, "VariableGuid", "StructProperty", [=](FArc& V) { V.Raw(DefaultRootGuid, 16); }, "Guid");
         Tag(Ar, "InternalVariableName", "NameProperty",
             [](FArc& V) { V.Name("DefaultSceneRoot"); });
         TagEnd(Ar);
@@ -445,10 +506,25 @@ void FBlueprintClass::Finish()
     Not a root node naming it in ParentComponentOrVariableName: the SCS's PostLoad
     (FixupRootNodeParentReferences, cooked builds too) looks such a name up only among native components
     and ancestor Blueprints' nodes, and clears it when the parent is a node of this same SCS.
+    SetupAttachment (AttachComponent) moves a component off that root: under another of this class's, as one
+    of its ChildNodes, or under an inherited one, as a root node that names it - which is how the game's own
+    Blueprints save both (BP_PlayerCharacter's FilmFaceLight on CharacterMesh0, BP_PumpkinFace_Item's
+    PointLight on BP_Pumpkin_Item_C's DefaultSceneRoot). The root is then the first scene component left alone.
     */
+    auto IndexOf = [&](const std::string& Name) {
+        return int32(std::find_if(Components.begin(), Components.end(), [&](const FComponent& C) { return C.Name == Name; })
+                     - Components.begin());
+    };
     const int32 FirstScene = int32(std::find_if(Components.begin(), Components.end(),
-                                                [](const FComponent& C) { return C.bIsScene; })
+                                                [](const FComponent& C) { return C.bIsScene && C.Attachment.Parent.empty(); })
                                    - Components.begin());
+    std::vector<int32> ParentOf(Components.size(), -1);        // the node whose ChildNodes list it, -1 for a root node
+    for (size_t I = 0; I < Components.size(); ++I)
+    {
+        const FComponent& C = Components[I];
+        if (C.Attachment.bOwn) ParentOf[I] = IndexOf(C.Attachment.Parent);
+        else if (C.bIsScene && C.Attachment.Parent.empty() && int32(I) != FirstScene) ParentOf[I] = FirstScene;
+    }
     for (size_t I = 0; I < Components.size(); ++I)
     {
         const FComponent& C = Components[I];
@@ -472,12 +548,12 @@ void FBlueprintClass::Finish()
 
         uint32 NodeGuid[4];
         ScsNodeGuid(ClassName, C.Name, NodeGuid);
-        const bool bParent = int32(I) == FirstScene;
         std::vector<FIndex> Children;
-        for (size_t J = 0; bParent && J < Components.size(); ++J)
-            if (Components[J].bIsScene && J != I) Children.push_back(Exp(RowFirstComponent + 2 * int32(J) + 1));
+        for (size_t J = 0; J < Components.size(); ++J)
+            if (ParentOf[J] == int32(I)) Children.push_back(Exp(RowFirstComponent + 2 * int32(J) + 1));
         const FIndex CompClass = C.Class;
         const std::string VarName = C.Name;
+        const FAttachment At = C.Attachment;
 
         FExport Node;
         Node.ClassIndex = ScsNodeClass;
@@ -492,6 +568,14 @@ void FBlueprintClass::Finish()
         Node.Serialize = [=](FArc& Ar) {
             Tag(Ar, "ComponentClass", "ObjectProperty", [=](FArc& V) { V.Idx(CompClass); });
             Tag(Ar, "ComponentTemplate", "ObjectProperty", [=](FArc& V) { V.Idx(Exp(RowTemplate)); });
+            /* USCS_Node's own order (SCS_Node.h 43-61), as the game's nodes keep it. */
+            if (!At.Socket.empty()) Tag(Ar, "AttachToName", "NameProperty", [=](FArc& V) { V.Name(At.Socket); });
+            if (!At.bOwn && !At.Parent.empty())
+            {
+                Tag(Ar, "ParentComponentOrVariableName", "NameProperty", [=](FArc& V) { V.Name(At.Parent); });
+                if (At.bNative) TagBool(Ar, "bIsParentComponentNative", true);
+                else Tag(Ar, "ParentComponentOwnerClassName", "NameProperty", [=](FArc& V) { V.Name(At.OwnerClass); });
+            }
             if (!Children.empty())
                 Tag(Ar, "ChildNodes", "ArrayProperty", [=](FArc& V) {
                     V.I32(int32(Children.size()));
@@ -516,23 +600,27 @@ void FBlueprintClass::Finish()
         Scs.CreateBeforeSer.push_back(Exp(RowFirstComponent + 2 * int32(I) + 1).V);
     Scs.SerBeforeCreate = { ScsClass.V, ScsCdo.V };
     Scs.CreateBeforeCreate = { Exp(RowClass).V };
-    const int32 NumComponents = int32(Components.size());
-    std::vector<FIndex> Roots;                 // everything but the first scene component's children
+    std::vector<FIndex> Roots, All;            // Roots: every node no other node lists as a child
+    if (bKeepDefaultRoot) { Roots.push_back(Exp(RowScsNode)); All.push_back(Exp(RowScsNode)); }
     for (size_t I = 0; I < Components.size(); ++I)
-        if (!Components[I].bIsScene || int32(I) == FirstScene) Roots.push_back(Exp(RowFirstComponent + 2 * int32(I) + 1));
+    {
+        if (ParentOf[I] < 0) Roots.push_back(Exp(RowFirstComponent + 2 * int32(I) + 1));
+        All.push_back(Exp(RowFirstComponent + 2 * int32(I) + 1));
+    }
     Scs.Serialize = [=](FArc& Ar) {
         /* DefaultSceneRoot stays declared but drops out of both lists once a component can be the
-           root, exactly as Ene_Butterfly saves it; with no components at all the lists are absent
-           and ExecuteScriptOnActor makes its own root. */
-        if (NumComponents > 0)
+           root, or the actor has one already, exactly as Ene_Butterfly saves it (while neither, it is in
+           both: bKeepDefaultRoot); with no components at all the lists are absent and
+           ExecuteScriptOnActor makes its own root. */
+        if (!All.empty())
         {
             Tag(Ar, "RootNodes", "ArrayProperty", [=](FArc& V) {
                 V.I32(int32(Roots.size()));
                 for (const FIndex& Root : Roots) V.Idx(Root);
             }, "ObjectProperty");
             Tag(Ar, "AllNodes", "ArrayProperty", [=](FArc& V) {
-                V.I32(NumComponents);
-                for (int32 I = 0; I < NumComponents; ++I) V.Idx(Exp(RowFirstComponent + 2 * I + 1));
+                V.I32(int32(All.size()));
+                for (const FIndex& Node : All) V.Idx(Node);
             }, "ObjectProperty");
         }
         Tag(Ar, "DefaultSceneRootNode", "ObjectProperty",
@@ -678,6 +766,7 @@ void FBlueprintClass::FinishStruct(const uint32 (&Guid)[4])
     for (const FPropertyDef& V : Vars)
         if (V.Extra.V != 0)
             S.CreateBeforeSer.push_back(V.Extra.V);
+    for (const FPropertyDef& V : Vars) TypeRefs(V, S.SerBeforeSer);     // what its members link against (Class.cpp 732-735)
 
     uint32 G[4] = { Guid[0], Guid[1], Guid[2], Guid[3] };
     const std::vector<FPropertyDef> Members = Vars;

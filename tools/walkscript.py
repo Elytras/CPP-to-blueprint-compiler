@@ -5,7 +5,7 @@ import struct, sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import dumpexp
 
-NAMES = {0:'LocalVariable',1:'InstanceVariable',2:'DefaultVariable',4:'Return',6:'Jump',7:'JumpIfNot',8:'Assert',
+NAMES = {0:'LocalVariable',1:'InstanceVariable',2:'DefaultVariable',4:'Return',6:'Jump',7:'JumpIfNot',9:'Assert',
  0xB:'Nothing',0xF:'Let',0x12:'ClassContext',0x13:'MetaCast',0x14:'LetBool',0x15:'EndParmValue',0x16:'EndFunctionParms',
  0x17:'Self',0x18:'Skip',0x19:'Context',0x1A:'Context_FailSilent',0x1B:'VirtualFunction',0x1C:'FinalFunction',0x1D:'IntConst',
  0x1E:'FloatConst',0x1F:'StringConst',0x20:'ObjectConst',0x21:'NameConst',0x22:'RotationConst',0x23:'VectorConst',0x24:'ByteConst',
@@ -40,7 +40,7 @@ class W:
         cnt = struct.unpack_from('<i', s.b, s.o)[0]; s.o += 4
         segs = []
         for _ in range(cnt):
-            i = struct.unpack_from('<i', s.b, s.o)[0]; segs.append(s.names[i]); s.o += 8
+            i, n = struct.unpack_from('<ii', s.b, s.o); segs.append(s.names[i] + (('_%d' % (n - 1)) if n else '')); s.o += 8
         owner = struct.unpack_from('<i', s.b, s.o)[0]; s.o += 4
         s.mem += 8
         return '.'.join(segs) + '@' + dumpexp.pidx(owner, s.imports, s.exports)
@@ -63,7 +63,7 @@ class W:
         elif op in (4, 0x51, 0x4E, 0x4F, 0x67, 0x6D): s.expr()
         elif op == 6: info = 'to %d' % s.i32()
         elif op == 7: info = 'to %d' % s.i32(); s.expr()
-        elif op == 8: s.u16(); s.u8(); s.expr()
+        elif op == 9: s.u16(); s.u8(); s.expr()   # EX_Assert; 0x08 is unassigned in 4.27 (Script.h)
         elif op in (0xB, 0x15, 0x16, 0x17, 0x25, 0x26, 0x27, 0x28, 0x2A, 0x2D, 0x30, 0x32, 0x3A, 0x3C, 0x3E, 0x40, 0x4D, 0x50, 0x53, 0x5A, 0x5E, 0x66): pass
         elif op == 0xF: info = s.fieldpath(); s.expr(); s.expr()
         elif op in (0x14, 0x43, 0x44, 0x5F, 0x60): s.expr(); s.expr()
@@ -108,11 +108,10 @@ class W:
             n = s.u16(); s.i32(); s.expr()   # count, end skip, index (ScriptSerialization.h)
             for _ in range(n): s.expr(); s.i32(); s.expr()
             s.expr()
-        elif op == 0x6A:
-            t = s.u8()
-            if t == 0x0A: s.name()   # InlineEvent
+        elif op == 0x6A:   # the loader transfers no operand byte, only moves its memory index (ScriptSerialization.h 275-281)
+            s.mem += 1
         elif op == 0x6B: s.expr(); s.expr()
-        else: raise SystemExit('unknown op %02x at %d' % (op, start_o))
+        else: raise ValueError('unknown op %02x at %d' % (op, start_o))   # an Exception: a sweep reports it and goes on
         # the run-until-terminator forms
         if op in (0x2F, 0x31, 0x39, 0x3B, 0x3D, 0x3F, 0x65):
             term = {0x2F:0x30, 0x31:0x32, 0x39:0x3A, 0x3B:0x3C, 0x3D:0x3E, 0x3F:0x40, 0x65:0x66}[op]

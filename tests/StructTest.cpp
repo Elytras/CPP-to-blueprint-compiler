@@ -18,12 +18,12 @@ struct FNested {
   int64 Stamp;
 };
 
-enum class EMood : uint8 { Happy, Sad, Angry };
-UE_ENUM(EMood);
+enum class EStructMood : uint8 { Happy, Sad, Angry };
+UE_ENUM(EStructMood);
 
 struct FMoody {
   UE_STRUCT;
-  EMood Mood;
+  EStructMood Mood;
   int32 Level;
 };
 
@@ -113,7 +113,7 @@ public:
     Stats = Local;
     Nested.Inner = Stats;
     Nested.Inner.Kills = Nested.Inner.Kills + Local.Kills;
-    Moody.Mood = EMood::Happy;
+    Moody.Mood = EStructMood::Happy;
     Moody.Level = 2;
     if (Stats.Alive)
       UGameFunctionLibrary::GetFSDGameState(this)->PostGameMessage("StructTest: struct members round-trip");

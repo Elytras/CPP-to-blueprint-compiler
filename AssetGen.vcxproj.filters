@@ -14,10 +14,16 @@
     <ClInclude Include="Blueprint.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="Cooked.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="Cpp.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="Package.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Command.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="Registry.h">
@@ -40,6 +46,9 @@
     <ClCompile Include="Blueprint.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="Cooked.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="Cpp.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -47,6 +56,9 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="Package.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Command.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="Registry.cpp">

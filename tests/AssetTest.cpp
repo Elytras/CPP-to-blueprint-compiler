@@ -17,8 +17,8 @@ member, or an expression in a function body.
 
 UE_MOD_PACKAGE("/Game/_ElytrasMods/AssetTest");
 
-enum class EMood : uint8 { Calm, Angry };
-UE_ENUM(EMood);
+enum class EDefMood : uint8 { Calm, Angry };
+UE_ENUM(EDefMood);
 
 class UMoodDef : public UPrimaryDataAsset {
 public:
@@ -26,14 +26,14 @@ public:
   int32          Count  = 3;
   FString        Title  = "Base";
   FName          Tag;
-  EMood          Mood = EMood::Angry;
+  EDefMood          Mood = EDefMood::Angry;
   bool           bBig = false;
   UMoodDef      *Next = nullptr;
   TArray<int32>  Waves;
 };
 
 UMoodDef MD_Plain = {};
-UMoodDef MD_Calm  = {.Count = 0, .Mood = EMood::Calm}; // an explicit zero is written, not dropped
+UMoodDef MD_Calm  = {.Count = 0, .Mood = EDefMood::Calm}; // an explicit zero is written, not dropped
 UMoodDef MD_Big   = {.Health = -500.5f, .Title = "Big", .Tag = "big", .bBig = true, .Next = &MD_Calm, .Waves = {3, 5, 8}};
 
 /* A native class works the same way, and so does pointing at the game's own assets. EnemyClass is a TSoftClassPtr,
@@ -59,7 +59,7 @@ public:
   TArray<UEnemyDescriptor *>  Enemies = {&ED_Spider_Grunt, &ED_AssetTest};
   TArray<UObject *>           Picks = {&UeAssets::UEnemyDescriptor::Game::Enemies::Spider::Grunt::Spider,
                                        &UeAssets::UEnemyDescriptor::Game::Enemies::Spider::Exploder::Spider, &BunnyPlush};
-  TSet<FName>                 Tags = {"big", "calm"};
+  TSet<FName>                 Labels = {"big", "calm"};    // not Tags: AActor has a Tags of its own
   TMap<FName, UMoodDef *>     ByName = {{"big", &MD_Big}, {"calm", &MD_Calm}};
   TMap<int32, float>          Scale = {{1, 0.5f}, {2, -2.0f}};
 
