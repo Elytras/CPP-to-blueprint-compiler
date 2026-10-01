@@ -1599,10 +1599,6 @@ def namespaces():
     for want in (mine + '/Weapons/Rifle.Rifle_C:Load', '/Game/NsTestAbs/Pistol.Pistol_C:Pull', mine + '/Weapons/FAmmo.FAmmo'):
         assert want in ns, (want, ns)
     assert run(base(mine + '/Weapons/Rifle'), 'Pull', self_vars=dict(Shots=5), Times=3)[0] == 8
-    # `Weapons::Rifle::Pull(Times)` in Pistol's Pull is the parent's, however many parts the qualifier has: 5 + 3 + 100.
-    fields = dict(Shots=5)
-    got = run_as([base('/Game/NsTestAbs/Pistol'), base(mine + '/Weapons/Rifle')], 'Pull', fields, Times=3)
-    assert got == 108 and fields == dict(Shots=8), (got, fields)
     # `Game::<the mod's own path>::X` and a plain X are one package.
     refused('NsTwice', '  int32 F() { return 1; }\n', 'would both be cooked as /Game/_ElytrasMods/NsTwice/NsTwice',
             top='namespace Game::_ElytrasMods::NsTwice { class NsTwice : public AActor { public: int32 X; }; }\n')
@@ -4746,6 +4742,20 @@ refused('FuncIfaceMulticast', '', 'the IfmRoot::Ping it inherits is a multicast'
             'class IfmRoot : public AActor {\npublic:\n  int32 Seen = 0;\n  UE_MULTICAST void Ping() { Seen = 1; }\n};\n'
             'class IfmKid : public IfmRoot, public IIfmPing {\npublic:\n};\n')
 print('ok  FuncIfaceMulticast: an interface function inherited as a multicast, which no override can call, is refused')
+
+
+def ns_parent_call():
+    """NsTest's Pistol: `Weapons::Rifle::Pull(Times)` in its own Pull runs Rifle's, however many parts the qualifier
+    has (5 + 3, then + 100). By name it would be Pistol's own Pull, calling itself forever."""
+    content = os.path.join(ROOT, 'NsTest', 'FSD', 'Content')
+    chain = [os.path.join(content, 'NsTestAbs', 'Pistol'), os.path.join(content, '_ElytrasMods', 'NsTest', 'Weapons', 'Rifle')]
+    fields = dict(Shots=5)
+    got = run_as(chain, 'Pull', fields, Times=3)
+    assert got == 108 and fields == dict(Shots=8), (got, fields)
+
+
+ns_parent_call()
+print('ok  NsTest: Weapons::Rifle::Pull() in Pistol\'s own Pull is the parent\'s, its qualifier in parts')
 
 
 # ---- OPERANDS: operands the VM resolves against the object they run on - jumps, instance variables, calls by name,
