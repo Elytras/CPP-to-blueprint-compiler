@@ -8423,10 +8423,11 @@ def defaults_other_nest():
     initializer of its own (Time 0.5): the braces are a new FHitResult, whose Time is what the engine's constructor sets,
     not the 0.5 the struct's default holds, so leaving it untagged would load 0.5. Refused by name, as for a UE_STRUCT
     (LocalNest). Compiled on fa30eccf with Time untagged: another mod's struct counted as an engine struct, whose
-    fresh value is the engine's."""
+    fresh value is the engine's. The refusal names Time, the member the initializer gives; FaceIndex, which both
+    braces leave out, holds the engine's value either way (DefaultsOwnNest; fix/r5-leftovers named FaceIndex)."""
     for mod, kind in (('OtherNest', 'UE_STRUCT_IN("/Game/_ElytrasMods/DboOtherMod")'), ('LocalNest', 'UE_STRUCT')):
         refused(mod, '  F%sHeld H = {.Hit = {.Distance = 5.0f}};\n' % mod,
-                "H.Hit.FaceIndex, left out of the braces, holds what the engine's FHitResult constructor sets",
+                "H.Hit.Time, left out of the braces, holds what the engine's FHitResult constructor sets",
                 'struct F%sHeld {\n  %s;\n  FHitResult Hit = {.Time = 0.5f};\n  int32 N = 0;\n};\n' % (mod, kind))
 
 
@@ -8638,7 +8639,7 @@ def defaults_own_nest():
     rest the engine's ([dcl.init.aggr]/5, the editor's Make Struct), which the start value's Hit holds too, so only
     Time and Distance may be written; N is its initializer 0. Where the new braces leave Time out it would load the
     initializer's 0.5: refused, naming Time. Refused on fa30eccf + the r5 fixes at Hit.FaceIndex, which needs no tag."""
-    here = os.path.dirname(pending_asset('DefaultsOwnNest'))
+    here = os.path.dirname(asset('DefaultsOwnNest'))
     base = os.path.join(here, 'DefaultsOwnNest')
     keeps_invariants(base)
     pkg = invariants.Package(base)
@@ -8659,8 +8660,9 @@ def defaults_own_nest():
             hit_half + 'struct FDonOut {\n  UE_STRUCT;\n  FDonHeld In = {.Hit = {.Distance = 5.0f}};\n};\n')
 
 
-pending('DefaultsOwnNest: braces in a value that starts as a struct\'s default instance leave out what its initializer '
-        'leaves out', defaults_own_nest)
+defaults_own_nest()
+print('ok  DefaultsOwnNest: braces in a value that starts as a struct\'s default instance leave out what its initializer '
+      'leaves out, and are refused at what it gives')
 
 
 def uds_init_defaults():

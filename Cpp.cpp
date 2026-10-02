@@ -1801,7 +1801,7 @@ private:
        leave them out. Null: as each member's own declaration makes it. */
     const Json* ParentInit = nullptr;
     const FRecord* ParentInitOf = nullptr;
-    bool ParentValueFresh(const FRecord& R, const Json& Lhs) const;
+    bool ParentValueFresh(const FRecord& R, const Json& Lhs, const Json*& Braces, const FRecord*& BracesOf) const;
     std::map<std::string, std::vector<std::pair<std::string, int64>>> ModEnums;  // UE_ENUM cooked here: enumerators
 
     /* Per-function state reset in Generate: whether this function needs the FDeref scratch
@@ -11675,7 +11675,9 @@ bool FCompiler::ValueInitStruct(const FRecord& SR, bool bZeros, const std::strin
 
 /* Whether R's parent holds the member Lhs names (a UE_DEFAULTS statement's left side) as a fresh value, what the engine
    makes of its type: it is declared in a class cooked here with no initializer, `{}` or `T()`, and no UE_DEFAULTS
-   between sets it. A native class on the way, another mod's too, holds a value no header says. */
+   between sets it. Braces that give a struct some members (`= {.N = 2}`) leave it fresh as they leave it: Braces
+   and BracesOf say which, for LowerDefault's ParentInit. A native class on the way, another mod's too, holds a value
+   no header says. */
 /* Whether a member's initializer I (stripped; null for none) leaves it as the engine makes its type: none, `{}`, `T()`. */
 static bool StartsFresh(const Json* I)
 {
@@ -11688,8 +11690,10 @@ static bool StartsFresh(const Json* I)
     return bAll;
 }
 
-bool FCompiler::ParentValueFresh(const FRecord& R, const Json& Lhs) const
+bool FCompiler::ParentValueFresh(const FRecord& R, const Json& Lhs, const Json*& Braces, const FRecord*& BracesOf) const
 {
+    Braces = nullptr;
+    BracesOf = nullptr;
     const std::string Id = Lhs.value("referencedMemberDecl", std::string());
     for (const FRecord* C = R.Base.empty() ? nullptr : Find(R.Base); C && !Id.empty(); C = C->Base.empty() ? nullptr : Find(C->Base))
     {
@@ -11706,7 +11710,18 @@ bool FCompiler::ParentValueFresh(const FRecord& R, const Json& Lhs) const
             });
         if (bSet) return false;
         for (const Json* F : C->Fields)
-            if (F->value("id", std::string()) == Id) return StartsFresh(Strip(First(*F)));
+            if (F->value("id", std::string()) == Id)
+            {
+                const Json* const I = Strip(First(*F));
+                if (StartsFresh(I)) return true;
+                /* Braces for a struct (`FHeld H = {.N = 2}`) make it fresh as they leave it: the default instance under
+                   them, as LowerDefault lowers a value that starts fresh. */
+                const FRecord* const SR = Kind(*I) == "InitListExpr" ? Find(StripTypeKeywords(TypeOf(*F))) : nullptr;
+                if (!SR || !SR->bIsStruct) return false;
+                Braces = I;
+                BracesOf = SR;
+                return true;
+            }
     }
     return false;
 }
@@ -11888,10 +11903,14 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
                               ~FRestoreInit() { Init = WasInit; Of = WasOf; } }
             RestoreInit{ ParentInit, ParentInitOf, WasParentInit, WasParentInitOf };
         /* The parent's value of this struct is fresh as the braces it was made with leave it (ParentInit, a member's
-           initializer further up), else as each member's declaration makes it; braces for another struct say nothing. */
-        const std::vector<const Json*> ParentArgs = bWasParentFresh && WasParentInit && WasParentInitOf == SR
+           initializer further up), else as each member's declaration makes it; braces for another struct say nothing.
+           A value that starts fresh (a class's own default, a struct's default instance, a container's element) starts
+           as the struct's default instance, each member as its declaration makes it (UUserDefinedStruct::InitializeStruct
+           copies the default instance in, UserDefinedStruct.cpp 254), so its braces lie over that the way a UE_DEFAULTS
+           statement's lie over a fresh parent. */
+        const std::vector<const Json*> ParentArgs = bKeepZero && bWasParentFresh && WasParentInit && WasParentInitOf == SR
                                                   ? StructArgs(*WasParentInit, SR, Names) : std::vector<const Json*>();
-        const bool bParentHere = bWasParentFresh && (!WasParentInit || ParentArgs.size() == Names.size());
+        const bool bParentHere = !bKeepZero || (bWasParentFresh && (!WasParentInit || ParentArgs.size() == Names.size()));
         /* Braces that give some members and leave the rest out (`{.Distance = 5.0f}`; `{}` gives none). */
         const bool bSomeGiven = std::any_of(Args.begin(), Args.end(), [](const Json* A) { return !IsUnsetInit(*A); });
         auto Members = std::make_shared<std::vector<FPropertyDef>>();
@@ -14298,8 +14317,10 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 /* Zero is a real value here: an archetype deltas against the component CDO (where
                    bVisible is already true) and an inherited property against the parent's CDO,
                    not against the type's zero the way a fresh class variable does. */
-                bParentFresh = !bThroughComponent && ParentValueFresh(R, *Lhs);
-                struct FUnset { bool& Flag; ~FUnset() { Flag = false; } } UnsetParentFresh{ bParentFresh };
+                bParentFresh = !bThroughComponent && ParentValueFresh(R, *Lhs, ParentInit, ParentInitOf);
+                struct FUnset { bool& Flag; const Json*& Init; const FRecord*& Of;
+                                ~FUnset() { Flag = false; Init = nullptr; Of = nullptr; } }
+                    UnsetParentFresh{ bParentFresh, ParentInit, ParentInitOf };
                 if (!LowerDefault(*Lhs, PD, BP, Err, Rhs, /*bKeepZero=*/true)) { bOk = false; return; }
                 if (PD.Default.K == FDefaultValue::None)
                 { *Err = Where + ": " + Name(*Lhs) + " needs a literal value"; bOk = false; return; }
