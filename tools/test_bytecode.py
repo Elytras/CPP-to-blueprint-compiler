@@ -6937,6 +6937,108 @@ delegate_var()
 print('ok  DelegateVar: a TDelegate<void()> variable is a DelegateProperty naming its signature, holding OnTimer on this')
 inherited_fire()
 print('ok  DispatchInheritedFire: a child broadcasts its parent\'s dispatcher through the parent\'s signature')
+
+
+def dispatch_other_fire():
+    """DispatchOtherFire broadcasts dispatchers other classes declare, through pointers: its sibling DispatchOtherTarget's
+    OnHit and a game Blueprint's, BP_BurrowComponent_C's OnBurrowComplete. Each broadcast names the declaring class's own
+    <Name>__DelegateSignature, imported, as the editor's Call node does (keeps_invariants: broadcast_matches_signature),
+    and runs what is bound to that object's dispatcher with the arguments; what is bound to another object's dispatcher
+    of the same name does not run."""
+    base = pending_asset('DispatchOtherFire')
+    keeps_invariants(base)
+    sigs = sorted(p for p in import_paths(base) if p.endswith('__DelegateSignature'))
+    assert sigs == ['/Game/Enemies/Spider/BP_BurrowComponent.BP_BurrowComponent_C:OnBurrowComplete__DelegateSignature',
+                    '/Game/_ElytrasMods/DispatchOtherFire/DispatchOtherTarget.DispatchOtherTarget_C:OnHit__DelegateSignature'], sigs
+    vm = VM(base, {}, Got=0, Emerged=False)
+    t, burrow, other = Obj('DispatchOtherTarget_C', Got=0), Obj('BP_BurrowComponent_C'), Obj('DispatchOtherTarget_C', Got=0)
+    vm.self.vars.update(T=t, Burrow=burrow)
+    vm.call('Hook')
+    assert vm.binds == [(t, 'OnHit', 'Mine', vm.self), (burrow, 'OnBurrowComplete', 'Dug', vm.self)], vm.binds
+    vm.binds.append((other, 'OnHit', 'Mine', vm.self))
+    vm.call('Fire', 4)
+    assert vm.self.vars['Got'] == 40 and vm.self.vars['LastTag'] == 'far', vm.self.vars
+    vm.call('FireBurrow')
+    assert vm.self.vars['Emerged'] is True, vm.self.vars
+
+
+def delegate_other_bind():
+    """DelegateOtherBind binds functions of objects other than this one: Add and Remove on its own dispatcher with another
+    class's object (DelegateOtherTarget::Take) and with another instance of its own class (Peer, Mine), Add on Peer's
+    dispatcher with Peer's Peer, and a TDelegate value naming Peer's Ping handed to a timer. The broadcast runs each
+    handler on the object bound, found by name on that object's class (runvm's peer: DelegateOtherTarget's own
+    package), and never on this one; Remove takes the (object, name) binding off; the timer gets Ping bound on Peer.
+    keeps_invariants: delegate_bind_matches_signature checks each bound name against the dispatcher's signature on the
+    class the object's variable declares."""
+    base = pending_asset('DelegateOtherBind')
+    keeps_invariants(base)
+    vm = VM(base, {}, Got=0)
+    vm.classes['DelegateOtherTarget_C'] = os.path.join(os.path.dirname(base), 'DelegateOtherTarget')
+    t, peer, far = Obj('DelegateOtherTarget_C', Got=0), vm.new(Got=0), vm.new(Got=0)
+    vm.self.vars.update(T=t, Peer=peer)
+    peer.vars['Peer'] = far
+    vm.call('BindPeer')
+    assert vm.binds == [(vm.self, 'OnScore', 'Mine', peer)], vm.binds
+    vm.call('Fire', 3)
+    assert (vm.self.vars['Got'], peer.vars['Got']) == (0, 30), (vm.self.vars, peer.vars)
+    vm.call('UnbindPeer')
+    assert vm.binds == [], vm.binds
+    vm.call('BindTarget')
+    vm.call('Fire', 5)
+    assert (vm.self.vars['Got'], peer.vars['Got'], t.vars['Got']) == (0, 30, 5), (vm.self.vars, peer.vars, t.vars)
+    vm.binds.clear()
+    vm.call('BindPeersPeer')
+    assert vm.binds == [(peer, 'OnScore', 'Mine', far)], vm.binds
+    vm.broadcast(peer, 'OnScore', 2)
+    assert (peer.vars['Got'], far.vars['Got']) == (30, 20), (peer.vars, far.vars)
+    vm.call('ArmPeer')
+    timers = [a for n, c, a in vm.log if n == 'K2_SetTimerDelegate']
+    assert timers == [[('delegate', 'Ping', peer), 1.0, False, 0.0, 0.0]], timers
+
+
+def dispatch_native_callable():
+    """A native dispatcher the engine marks BlueprintCallable (AFSDGameState::OnTerrainGenerated, one of FSD's 41) is
+    one the editor's Call node takes. UeApi does not say which signature function it names (the dump does not link a
+    delegate property to its signature), so the broadcast names one of the class's own with the same parameters - the
+    layout execCallMulticastDelegate builds and the handlers read (ScriptCore.cpp 3032-3063) - and the compiler warns
+    that it does. The bound handler runs. Needs a UeApi that marks callable dispatchers (genueapi's __UeDispatcher)."""
+    base = pending_asset('DispatchNativeCallable')
+    keeps_invariants(base)
+    assert any('warning' in l and 'OnTerrainGenerated' in l for l in LOGS['DispatchNativeCallable'].splitlines()), \
+        LOGS['DispatchNativeCallable']
+    vm = VM(base, {}, Heard=0)
+    state = Obj('FSDGameState')
+    vm.self.vars['State'] = state
+    vm.call('Hook')
+    vm.call('Fire')
+    vm.call('Fire')
+    assert vm.self.vars['Heard'] == 2 and vm.binds == [(state, 'OnTerrainGenerated', 'Generated', vm.self)], \
+        (vm.self.vars, vm.binds)
+
+
+pending('DispatchOtherFire: Broadcast on a sibling mod class\'s and a game Blueprint\'s dispatcher through a pointer',
+        dispatch_other_fire)
+pending('DelegateOtherBind: a delegate binds a function of an object other than this', delegate_other_bind)
+pending('DispatchNativeCallable: Broadcast on a BlueprintCallable native dispatcher', dispatch_native_callable)
+# A bound name the object's class does not have: the broadcast or the timer skips it (ScriptDelegates.h 38-49,
+# 479-502). The editor binds only a BlueprintCallable function, never a pure or latent one (K2Node_CreateDelegate.cpp
+# 156-164 -> EdGraphSchema_K2.cpp 929-985): AActor::ReceiveTick is a BlueprintEvent only.
+pending('DelegateOtherForeign: binding on another object a method its class does not have is refused',
+        lambda: refused('DelegateOtherForeign', '  UE_DISPATCHER(OnHit, int32 Points);\n  DelegateOtherHolder *H = nullptr;\n'
+                        '  void Own(int32 Points) {}\n  void F() { OnHit.Add(H, &DelegateOtherForeign::Own); }\n',
+                        'cannot bind DelegateOtherForeign::Own',
+                        top='class DelegateOtherHolder : public AActor {\npublic:\n  int32 N = 0;\n};\n'))
+pending('DelegateOtherEvent: binding on another object a function the editor cannot bind is refused',
+        lambda: refused('DelegateOtherEvent', '  UE_DISPATCHER(OnTick, float Delta);\n  AActor *A = nullptr;\n'
+                        '  void F() { OnTick.Add(A, &AActor::ReceiveTick); }\n', 'cannot bind AActor::ReceiveTick'))
+# A native dispatcher the editor's Call node refuses ("Event Dispatcher is not 'BlueprintCallable'", K2Node_MCDelegate.cpp
+# 453-462): none of Engine's is; and an Add on one its Bind node refuses (not 'BlueprintAssignable', 36-46).
+pending('DispatchNativeFire: Broadcast on a native dispatcher that is not BlueprintCallable is refused in the editor\'s terms',
+        lambda: refused('DispatchNativeFire', '  void F() { OnDestroyed.Broadcast(this); }\n', 'OnDestroyed is a native dispatcher'))
+pending('DispatchNotAssignable: Add on a native dispatcher that is not BlueprintAssignable is refused',
+        lambda: refused('DispatchNotAssignable', '  AGameEvent *E = nullptr;\n  void Ping() {}\n'
+                        '  void F() { E->EventTriggeredDelegate.Add(this, &DispatchNotAssignable::Ping); }\n',
+                        'EventTriggeredDelegate is a native dispatcher that is not BlueprintAssignable'))
 # A method of another class bound with `this`: EX_InstanceDelegate binds the name on this object, whose class has no
 # such function, so the broadcast or the timer silently skips it (ScriptDelegates.h 38-49, 479-502).
 refused('DelegateForeign', '  UE_DISPATCHER(OnHit, int32 Points);\n  void F() { OnHit.Add(this, &DelegateOther::ForeignHit); }\n',

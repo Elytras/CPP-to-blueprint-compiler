@@ -127,8 +127,21 @@ class VM:
         s.accessed_none = []        # (function, mem) of each EX_Context run on None: an 'Accessed None' script warning
         s.ref_params = False        # True: a script callee's reference parameters write back into their arguments (ref_writeback)
         s.env_log = []              # with ref_params, each call's frame as it starts, so ref_writeback finds the callee's
+        s.classes = {}              # another class's name -> the base of its package: what runs on an object of it (peer)
+        s._peers = {}
 
     def new(s, **vars): return Obj(s.self.cls, **vars)
+
+    def peer(s, cls):
+        """The VM of the package of class `cls` (one of `classes`), sharing this one's objects, bindings, latent actions,
+        log and Accessed None list: a call on an object of that class runs that class's function, as a broadcast or a
+        timer finds a bound name on the bound object's own class (FindFunction, ScriptDelegates.h 38-49, 479-502)."""
+        v = s._peers.get(cls)
+        if v is None:
+            v = s._peers[cls] = VM(s.classes[cls], s.natives, s.isa, s.objects)
+            v.binds, v.latent, v.log, v.accessed_none = s.binds, s.latent, s.log, s.accessed_none
+            v.classes, v._peers, v.null_rvalues, v.struct_const = s.classes, s._peers, s.null_rvalues, s.struct_const
+        return v
 
     def ref_writeback(s, fn, args, env, store):
         """A script callee's reference parameter is its argument's own variable: ProcessScriptFunction hands the callee an
@@ -161,6 +174,8 @@ class VM:
 
     def call(s, fn, *args, on=None, **parms):
         me = on or s.self
+        if isinstance(me, Obj) and me.cls != s.self.cls and me.cls in s.classes:
+            return s.peer(me.cls).call(fn, *args, on=me, **parms)
         stmts, at, names = s.script(fn)
         env = s.frame(me, fn) if fn.startswith('ExecuteUbergraph_') else {}   # the persistent frame
         if not fn.startswith('ExecuteUbergraph_'):
