@@ -3832,7 +3832,7 @@ Notes:
 | `{Peer, &Scorer::HandleTimer}` | The same with the Object pin wired: HandleTimer bound on Peer, which the timer then calls. The rules are those of a handler on another object. | Yes |
 | `TDelegate<void()>(this, &Scorer::HandleTimer)` | The same value, spelled out. | Yes |
 | `K2_ClearTimerDelegate({})` | Refused: "a delegate value is {this, &Class::Function}". There is no empty or unbound delegate. | Refused |
-| `TDelegate<void()> Callback;` as a class variable, a function parameter or a local | A delegate variable (DelegateProperty). `Callback = {this, &Class::Method};` stores a value, and `Callback` passes it on, to a timer or another function. Its signature function is one the class makes per delegate type, `<Variable>__DelegateSignature`, as the editor makes one per dispatcher, numbered past a name the class or one of its parents already uses. A struct or an interface makes none, so a delegate in one is refused. | Yes |
+| `TDelegate<void()> Callback;` as a class variable, a function parameter or a local | A delegate variable (DelegateProperty). `Callback = {this, &Class::Method};` stores a value, and `Callback` passes it on, to a timer or another function. Its signature function is one the class makes per delegate type, `<Variable>__DelegateSignature`, as the editor makes one per dispatcher, numbered past a name the class, a mod or game Blueprint parent, or a mod child compiled with it already uses (not past a native parent's own delegate signatures, such as UWidget's `GetText__DelegateSignature`, which UeApi does not list). A struct or an interface makes none, so a delegate in one is refused. | Yes |
 
 The timers in [Timers and input](#timers-and-input) show delegate values in use.
 
