@@ -1157,6 +1157,7 @@ void ZeroAll() {
 | `FNested Deep = {.Inner = {.Time = 1.5f}, .Stamp = 7};` | Designated braces, nested. Members left out are zero, or take their own default initializer. | Yes |
 | `FColor Lamp = FColor(255, 128, 0);` | FColor's argument order holds in defaults too. | Yes |
 | `FStats Fresh = FStats();`, `FStats Cleared = {{}, {}};` | A `UE_STRUCT`'s `T()` is its defaults, and writes nothing. A `{}` for a member is a fresh value of its type (zero, empty, None, a `UE_STRUCT`'s own defaults), written even where the member's default differs. | Yes |
+| `FHitResult Hit = {};`, `FHeld H = {FHitResult(), 5};` | An engine struct whose header declares no constructor, by `{}` or `T()`: none of its members is written, so it holds what the engine's constructor sets (`FHitResult::Time` is 1), as `FHitResult()` does in a function. One whose header declares a constructor (`FFindFloorResult()`) is all zeros, as in a function. In `UE_DEFAULTS` see [Class defaults](#class-defaults). | Yes |
 
 Notes:
 - Every value in a default must be known when the mod is built: [Classes and variables](#classes-and-variables).
@@ -2791,7 +2792,8 @@ component: see [The root and attachment](#the-root-and-attachment).
 | `Extra->bVisible = false;`, where `Extra` is a plain pointer member | Refused: "is not a UE_COMPONENT". Only a `UE_COMPONENT`, this class's or a parent's, has a template to hold defaults. | Refused |
 | `Lamp->Intensity += 100.0f;`, an `if`, a call such as `K2_DestroyActor();` | Refused: "every statement is `Field = value;`, `Component->Field = value;` or `Component->SetupAttachment(Parent);`". The block never runs, so logic in it could do nothing. | Refused |
 | `Lamp->Intensity = UKismetMathLibrary::RandomFloat();`, `InitialLifeSpan = sizeof(FVector);` | Refused: "a default is a value known when the mod is built". A value here follows the rules for a member's initializer: see [Classes and variables](#classes-and-variables). Compute anything else in `ReceiveBeginPlay` or `UserConstructionScript`. | Refused |
-| `Instigator = nullptr;`, `Mesh->StaticMesh = nullptr;`, `Count = {};`, `Rule = EAttachmentRule();`, `Offset = FVector();` | The type's zero, written over the parent's value: null, 0, `false`, the zero enumerator, None, an empty string or container, an engine struct's zeros. A `UE_STRUCT`'s `{}` or `T()` is its own defaults. The same as `Count = 0;`. | Yes |
+| `Instigator = nullptr;`, `Mesh->StaticMesh = nullptr;`, `Count = {};`, `Rule = EAttachmentRule();`, `Offset = FVector();` | The type's zero, written over the parent's value: null, 0, `false`, the zero enumerator, None, an empty string or container, and the zeros of an engine struct whose header declares a constructor, as `FVector()` is in a function. A `UE_STRUCT`'s `{}` or `T()` is its own defaults. The same as `Count = 0;`. | Yes |
+| `Hit = FHitResult();`, `Hit = {};`, a `UE_STRUCT`'s `{}` that holds an FHitResult | Refused: "holds what the engine's FHitResult constructor sets". An engine struct whose header declares no constructor holds what the engine's constructor sets (`FHitResult::Time` is 1), which no header says, so it cannot be written over the parent's value. Leave the statement out, or give the members in braces: `Hit = {.Time = 1.0f};`. | Refused |
 | `Lantern() { InitialLifeSpan = 5.0f; }` | Not yet: a constructor is dropped with no message. It makes no function and writes no default. Use initializers and `UE_DEFAULTS`, and do run-time setup in `ReceiveBeginPlay`. | Not yet |
 
 ```cpp
@@ -5841,6 +5843,12 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   writes no zero for. `nullptr`, `{}` and `T()` of a number, an enum, a name, a string, an object, a container or a
   struct are written as that type's zero. Fix: write an explicit value, or leave the statement out to
   keep the parent's default. See [Class defaults](#class-defaults).
+- `` <Member>: `<Struct>()` or `{}` holds what the engine's <Struct> constructor sets, which its header does not
+  say, so AssetGen cannot write it over the value already there ``: `Hit = FHitResult();` or `Hit = {};` in
+  UE_DEFAULTS or an asset edit, or a `UE_STRUCT`'s `{}` with such a member (`H.Hit: ...`), for an engine struct
+  whose header declares no constructor. Its values are what the engine's constructor sets (`FHitResult::Time` is
+  1). Fix: leave the statement out to keep the parent's value, or give the members in braces,
+  `Hit = {.Time = 1.0f};`. See [Class defaults](#class-defaults).
 - `warning: <Class>::UE_DEFAULTS: <Root> is the actor's root, which the engine puts at the spawn transform, so its
   <Properties> is not applied. A USceneComponent root passes its transform on to the components attached to it.`:
   UE_DEFAULTS sets RelativeLocation, RelativeRotation or RelativeScale3D on the actor's root, and the root is not a

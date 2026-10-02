@@ -7347,7 +7347,7 @@ def defaults_value_init():
                               ('ValueInitHeld', 'H = {};', 'H.Hit')):
         refused(mod, '  UE_DEFAULTS {\n    %s\n  }\n' % assign,
                 "%s: `FHitResult()` or `{}` holds what the engine's FHitResult constructor sets" % path, top, 'ValueInitParent')
-    base = pending_asset('DefaultsValueInit')
+    base = asset('DefaultsValueInit')
     keeps_invariants(base)
     pkg = invariants.Package(base)
     cdo = pkg.find('Default__DefaultsValueInit_C')
@@ -7370,8 +7370,9 @@ def defaults_value_init():
     assert 'HitResult' in floor and time_of(floor['HitResult']) == 0.0, 'Floor.HitResult.Time is not written 0: %r' % floor
 
 
-pending('DefaultsValueInit: {} / T() of an engine struct without a constructor keeps the engine\'s values in a fresh '
-        'default and is refused over a parent\'s', defaults_value_init)
+defaults_value_init()
+print('ok  DefaultsValueInit: {} / T() of an engine struct without a constructor keeps the engine\'s values in a fresh '
+      'default and is refused over a parent\'s; one with a constructor is its zeros')
 
 
 def tenum_value_init():

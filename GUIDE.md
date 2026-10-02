@@ -505,6 +505,8 @@ Watch for:
   such as `Lamp->RelativeLocation.Z = 50.0f;` is refused; the member path gets a misleading message about genueapi,
   the SDK generator ([The SDK](#the-sdk)). A variable the class declares itself takes an initializer instead.
   `Target = nullptr;`, `Count = {};` and `Offset = FVector();` write the type's zero over the parent's value.
+  `Hit = FHitResult();` is refused: an FHitResult's values come from the engine's constructor (Time is 1), which
+  no header shows; give the members instead, `Hit = {.Time = 1.0f};`.
 - `Weapons::Turret::StaticClass()`, for a mod class in a namespace, names the engine class that `Turret` inherits
   `StaticClass` from, with no message: the qualified form is not built yet. Inside the namespace, write
   `Turret::StaticClass()`. Where the value goes straight into a `TSubclassOf<Weapons::Turret>`, such as the class
