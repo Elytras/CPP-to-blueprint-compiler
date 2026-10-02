@@ -1108,7 +1108,9 @@ def update_loop():
     another object is the variable too. The C++ results: a loop condition is a full-expression evaluated before each
     trip ([stmt.while]), so each trip runs `B += 1`, then IncRef's `V += 3` on B itself, and tests the B it returns;
     && evaluates its right side only when the left is true ([expr.log.and]); the call's object is sequenced before its
-    arguments ([expr.call] 8, C++17), and P is this. A copy passed instead leaves B 3 short per call (1617, not 420)."""
+    arguments ([expr.call] 8, C++17): P is this, and OtherObj's GetP() makes B ten times M before `B += 1` reads it (an
+    update run ahead of the object gives 10M + 13, not 10M + 4). A copy passed instead leaves B 3 short per call (1617,
+    not 420)."""
     base = asset('UpdateLoop')
     keeps_invariants(base)
 
@@ -1126,9 +1128,10 @@ def update_loop():
     for m in (0, 7, -3):
         cases = (('Loop', loop(m)), ('LoopPre', loop(m)), ('LoopInline', loop(m)), ('LoopLocal', loop(m)),
                  ('DoLoop', do_loop(m)), ('Arms', (m + 4) * 101 if m > 0 else (1000 + m + 4) * 100 + m + 4),
-                 ('AndRight', (1000 if m > 1 else 0) + m + 4 if m > 0 else m), ('Other', (1000 + m + 4) * 100 + m + 4))
+                 ('AndRight', (1000 if m > 1 else 0) + m + 4 if m > 0 else m), ('Other', (1000 + m + 4) * 100 + m + 4),
+                 ('OtherObj', (1000 + 10 * m + 4) * 1000 + 10 * m + 4))
         for fn, want in cases:
-            if fn != 'Other':                       # runscript runs no call on another object
+            if not fn.startswith('Other'):          # runscript runs no call on another object
                 got = run(base, fn, {'B': 0}, M=m)[0]
                 assert got == want, 'UpdateLoop.%s(%d) = %r; C++ %r' % (fn, m, got, want)
             vm = VM(base, B=0)
@@ -1152,7 +1155,8 @@ def comma_places():
     an arm of ?:, and in an argument of a call on another object. The C++ results: the comma runs its left side, then
     its right, whose value it is ([expr.comma]); a loop condition is evaluated before each trip ([stmt.while]); && / ||
     and ?: evaluate only what the left side / condition picks ([expr.log.and], [expr.cond]); a call's object is
-    sequenced before its arguments ([expr.call] 8), and P is this. Bound to IncRef's `int32&`, `(Bump(), N)` is N
+    sequenced before its arguments ([expr.call] 8): P is this, and in OtherObj / OtherObjRef GetP()'s `Count *= 10`
+    runs before the comma's Bump (Bump first gives Count 10, not 1). Bound to IncRef's `int32&`, `(Bump(), N)` is N
     itself, which IncRef's `V += 3` moves."""
     base = asset('CommaPlaces')
     keeps_invariants(base)
@@ -1182,6 +1186,8 @@ def comma_places():
                  ('Or', 1000 if m > 0 else (1000 if m < -1 else 0) + 2),
                  ('Cond', (m + 1) * 100 + 1 if m > 0 else (m - 2) * 100 + 2),
                  ('Other', (2 * m + 2) * 100 + 1), ('OtherRef', (1000 + m + 3) * 100 + (m + 3) * 10 + 1),
+                 ('OtherObj', (20 * m + 2) * 1000 + 10 * m + 1),
+                 ('OtherObjRef', (1003 + m) * 10000 + (m + 3) * 100 + 1),
                  ('WhileRef', while_ref(m)), ('WhileAssign', while_assign(m)))
         for fn, want in cases:
             if not fn.startswith('Other'):          # runscript runs no call on another object
