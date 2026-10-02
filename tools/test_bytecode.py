@@ -7723,18 +7723,28 @@ print('ok  DefaultsZero: UE_DEFAULTS\' {} / T() / nullptr over a parent\'s defau
 
 
 def defaults_value_init():
-    """`{}` and `T()` of an engine struct whose header declares no constructor hold what the engine's constructor sets,
-    which no header says: FHitResult's sets Time to 1 (FHitResult::Init, EngineTypes.h), as a function body's
-    FHitResult() keeps. A class's own default starts as that fresh value, so it is kept by tagging none of the struct's
-    members; over a parent's value it cannot be written, and is refused, the struct's own or a UE_STRUCT's member. An
-    engine struct with a constructor is its zeros, as FFindFloorResult() is in a function, its FHitResult's Time too."""
+    """`{}` and `T()` of an engine struct hold what the engine's constructor sets, which no header says: FHitResult's
+    sets Time to 1 (FHitResult::Init, EngineTypes.h), FFindFloorResult's HitResult(1.f) does the same to its member,
+    FTransform's is the identity (TransformVectorized.h 108), FVector4's W is 1 (Vector4.h 59), and the UeApi's
+    `T() = default;` says none of it. A class's own default starts as that fresh value, so it is kept by tagging none of
+    the struct's members, however deep; over a parent's value, or over a UE_STRUCT member's own initializer, it cannot
+    be written, and is refused. An engine struct whose constructor sets nothing is its zeros (DefaultsZero's FVector2D)."""
     import struct
     top = ('struct FHeldHit {\n  UE_STRUCT;\n  FHitResult Hit;\n  int32 N = 0;\n};\n'
-           'class ValueInitParent : public AActor {\npublic:\n  FHitResult Hit;\n  FHeldHit H;\n};\n')
-    for mod, assign, path in (('ValueInitCtor', 'Hit = FHitResult();', 'Hit'), ('ValueInitBraces', 'Hit = {};', 'Hit'),
-                              ('ValueInitHeld', 'H = {};', 'H.Hit')):
+           'class ValueInitParent : public AActor {\npublic:\n  FHitResult Hit;\n  FHeldHit H;\n'
+           '  FFindFloorResult Floor = {true, true, true, 2.0f, 3.0f, {}};\n  FTransform Xf;\n  FVector4 V4;\n};\n')
+    for mod, assign, path, what in (('ValueInitCtor', 'Hit = FHitResult();', 'Hit', 'FHitResult'),
+                                    ('ValueInitBraces', 'Hit = {};', 'Hit', 'FHitResult'),
+                                    ('ValueInitHeld', 'H = {};', 'H.Hit', 'FHitResult'),
+                                    ('ValueInitFloor', 'Floor = FFindFloorResult();', 'Floor', 'FFindFloorResult'),
+                                    ('ValueInitFloorBraces', 'Floor = {};', 'Floor', 'FFindFloorResult'),
+                                    ('ValueInitXform', 'Xf = FTransform();', 'Xf', 'FTransform'),
+                                    ('ValueInitV4', 'V4 = FVector4();', 'V4', 'FVector4')):
         refused(mod, '  UE_DEFAULTS {\n    %s\n  }\n' % assign,
-                "%s: `FHitResult()` or `{}` holds what the engine's FHitResult constructor sets" % path, top, 'ValueInitParent')
+                "%s: `%s()` or `{}` holds what the engine's %s constructor sets" % (path, what, what), top, 'ValueInitParent')
+    refused('ValueInitOverInit', '  FHasInit Y = {FHitResult(), 5};\n',
+            "Y.Hit: `FHitResult()` or `{}` holds what the engine's FHitResult constructor sets",
+            'struct FHasInit {\n  UE_STRUCT;\n  FHitResult Hit = {.Time = 0.5f};\n  int32 N = 0;\n};\n')
     base = asset('DefaultsValueInit')
     keeps_invariants(base)
     pkg = invariants.Package(base)
@@ -7753,14 +7763,22 @@ def defaults_value_init():
         assert struct.unpack('<i', held['N']['value'])[0] == 5, (name, held)
         assert time_of(held.get('Hit')) == 1.0, '%s.Hit.Time is written %r, where C++ gives 1' % (name, time_of(held.get('Hit')))
     assert time_of(tags.get('Mine')) == 1.0, 'Mine.Time is written %r, where C++ gives 1' % time_of(tags.get('Mine'))
-    floor = members(tags['Floor']['at'])
-    assert struct.unpack('<f', floor['FloorDist']['value'])[0] == 0.0 and floor['bBlockingHit']['bool'] == 0, floor
-    assert 'HitResult' in floor and time_of(floor['HitResult']) == 0.0, 'Floor.HitResult.Time is not written 0: %r' % floor
+    for name, n in (('Floor', 5), ('Floor2', 6)):
+        held = members(tags[name]['at'])
+        assert struct.unpack('<i', held['N']['value'])[0] == n, (name, held)
+        floor = members(held['F']['at']) if 'F' in held else {}
+        got = time_of(floor.get('HitResult')) if 'F' in held else 1.0
+        assert got == 1.0, '%s.F.HitResult.Time is written %r, where C++ gives 1' % (name, got)
+    bare = members(tags['Bare']['at']) if 'Bare' in tags else {}
+    assert ('HitResult' not in bare if 'Bare' in tags else True) or time_of(bare['HitResult']) == 1.0, bare
+    xf = members(tags['Xf']['at']) if 'Xf' in tags else {}
+    scale = struct.unpack('<3f', xf['Scale3D']['value'][:12]) if 'Scale3D' in xf else (1.0, 1.0, 1.0)
+    assert scale == (1.0, 1.0, 1.0), 'Xf.Scale3D is written %r, where FTransform() is the identity' % (scale,)
 
 
 defaults_value_init()
-print('ok  DefaultsValueInit: {} / T() of an engine struct without a constructor keeps the engine\'s values in a fresh '
-      'default and is refused over a parent\'s; one with a constructor is its zeros')
+print('ok  DefaultsValueInit: {} / T() of an engine struct keeps the engine\'s values in a fresh default, however deep, '
+      'and is refused over a value already there, unless its constructor sets nothing')
 
 
 def tenum_value_init():

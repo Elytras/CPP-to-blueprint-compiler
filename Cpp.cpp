@@ -11109,17 +11109,27 @@ static void ZeroDefault(FPropertyDef& PD)
     else if (T == "ArrayProperty" || T == "SetProperty" || T == "MapProperty") { D.K = FDefaultValue::Array; D.Items.clear(); }
 }
 
+/* Engine structs whose default constructor sets nothing (`FVector() {}`, Vector.h 1243; Vector2D.h 47, Rotator.h 63,
+   Color.h 45 and 430), so the zero a fresh property's memory holds is their value-initialisation. Every other engine
+   constructor may set members (FTransform's is the identity, TransformVectorized.h 108; FVector4's W is 1, Vector4.h
+   59; FFindFloorResult's HitResult has Time 1), and the UeApi header's `T() = default;` says nothing of it: genueapi
+   writes one beside every member-wise constructor. */
+static bool ConstructsNothing(const FRecord& R)
+{
+    static const char* const Names[] = {"FVector", "FVector2D", "FRotator", "FLinearColor", "FColor"};
+    return std::any_of(std::begin(Names), std::end(Names), [&](const char* N) { return R.CppName == N; });
+}
+
 /* C++'s value-initialisation of a struct SR, `T()` or `{}`, as a default written as a value (LowerDefault's bKeepZero),
    into PD; Path names it for a message. A UE_STRUCT's members are each its initializer, else their own
-   value-initialisation. An engine struct whose header declares a constructor is all zeros, members of members too, as a
-   function body's `T()` writes it (ZeroArg); bZeros says we are inside one. An engine struct whose header declares
-   none holds what the engine's constructor sets (FHitResult's Time is 1, FHitResult::Init), which no header says and a
-   function body's `T()` keeps (LowerMakeStruct): in a value that starts fresh (bFreshValue) no tag keeps it, and over a
-   value already there it cannot be written, so it is refused. */
+   value-initialisation. An engine struct whose constructor sets nothing (ConstructsNothing) is its zeros; bZeros says
+   we are inside one. Any other holds what the engine's constructor sets (FHitResult's Time is 1, FHitResult::Init),
+   which no header says and a function body's Make Struct keeps: in a value that starts as the engine's
+   (bFreshValue) no tag keeps it, and over a value already there it cannot be written, so it is refused. */
 bool FCompiler::ValueInitStruct(const FRecord& SR, bool bZeros, const std::string& Path, FPropertyDef& PD,
                                 FBlueprintClass& BP, std::string* Err)
 {
-    if (!bZeros && SR.IsNative() && !DeclaresCtor(SR))
+    if (!bZeros && SR.IsNative() && !ConstructsNothing(SR))
     {
         if (bFreshValue) return true;
         *Err = Path + ": `" + SR.CppName + "()` or `{}` holds what the engine's " + SR.CppName + " constructor sets, which "
@@ -11328,6 +11338,9 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
             /* Every member is written, so a zero is a value here and not "leave it out". One the braces leave out
                but that has a default of its own (CXXDefaultInitExpr) takes that default, as in C++. */
             const Json* A = Kind(*Args[I]) == "CXXDefaultInitExpr" ? nullptr : Args[I];
+            /* A UE_STRUCT's member with an initializer of its own starts as that, not as the engine's value, so a value
+               given for it is written over one already there. */
+            bFreshValue = (bWasFresh || !bKeepZero) && !(A && !SR->IsNative() && First(*SR->Fields[I]));
             if (!LowerDefault(*SR->Fields[I], MD, BP, Err, A, /*bKeepZero=*/true))
             {
                 /* A message about the member says whose: `H.Hit: ...`. */
