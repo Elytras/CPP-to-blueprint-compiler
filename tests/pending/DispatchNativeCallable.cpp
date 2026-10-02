@@ -1,8 +1,9 @@
 ﻿/* DispatchNativeCallable: Broadcast on a native dispatcher the engine marks BlueprintCallable, AFSDGameState's
    OnTerrainGenerated (UPROPERTY(BlueprintAssignable, BlueprintCallable)): the editor's Call node takes it, and its
-   EX_CallMulticastDelegate needs a signature function with the dispatcher's parameters. AssetGen refuses it today
-   ("Broadcast needs the dispatcher's signature function, which only a UE_DISPATCHER of this class or a Blueprint parent
-   has"). */
+   EX_CallMulticastDelegate needs a signature function with the dispatcher's parameters. It lives in tests/pending
+   because only a UeApi that marks callable dispatchers (genueapi's <D>__UeDispatcher) lets it compile: against an older
+   one AssetGen cannot tell OnTerrainGenerated from OnDestroyed and refuses both (test_bytecode.py runs it or reports a
+   gap accordingly). */
 #include "UeApi/Types.h"
 #include "UeApi/FSD.h"
 

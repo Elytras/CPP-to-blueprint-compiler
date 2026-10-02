@@ -1,9 +1,7 @@
 ﻿/* DispatchOtherFire: Broadcast on a dispatcher another class declares, reached through a pointer: a sibling mod
    class's UE_DISPATCHER and a game Blueprint's (BP_BurrowComponent_C::OnBurrowComplete). The editor's Call node has a
    Target pin and takes any Blueprint dispatcher, every one being BlueprintCallable: its EX_CallMulticastDelegate names
-   the declaring class's own <Name>__DelegateSignature, imported, over the other object's variable. AssetGen refuses it
-   today ("Broadcast needs the dispatcher's signature function, which only a UE_DISPATCHER of this class or a Blueprint
-   parent has"). */
+   the declaring class's own <Name>__DelegateSignature, imported, over the other object's variable. */
 #include "UeApi/Types.h"
 #include "UeApi/FSD.h"
 #include "UeApi/Game/BP_BurrowComponent_C.h"

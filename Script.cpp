@@ -457,6 +457,16 @@ void FScript::InstanceDelegate(const std::string& FunctionName)
     Memory += kFNameSize;
 }
 
+void FScript::BindDelegate(const std::string& FunctionName, const std::function<void(FScript&)>& Delegate,
+                           const std::function<void(FScript&)>& Object)
+{
+    Op(EX_BindDelegate);
+    Ar.Name(FunctionName);
+    Memory += kFNameSize;
+    Delegate(*this);
+    Object(*this);
+}
+
 void FScript::AddMulticastDelegate(const std::function<void(FScript&)>& Dispatcher,
                                    const std::function<void(FScript&)>& Delegate)
 {

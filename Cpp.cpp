@@ -600,6 +600,7 @@ struct FRecord
     std::set<std::string> PrivateFields;
     std::map<std::string, std::string> ScsNodes;    // `<X>__UeScsNode`: a game Blueprint's component -> its node's guid, 32 hex
     std::map<std::string, std::string> Subobjects;  // `<X>__UeSubobject`: a native component -> "<name> <class path>" on this CDO
+    std::map<std::string, std::string> Dispatchers; // `<X>__UeDispatcher`: a native dispatcher -> "Assignable Callable", what of them it is
     std::vector<std::pair<std::string, std::string>> DefaultSubobjects;    // UeDefaultSubobjects: (name, class path), a game Blueprint CDO's
     std::map<std::string, std::string> TypeAliases; // `using Leaf = Game::...::Leaf;` in the class body
     std::set<std::string> FinalMethods;             // `virtual T F() final`: no subclass has an F of its own
@@ -1103,6 +1104,18 @@ bool EmitCall(FScript& S, const FCallIR& Call, FIndex SelfExp, std::string* Err,
         S.Raw(Bytes.data(), Bytes.size(), MemBytes);
         return true;
     }
+    /* Create Event with its Object pin wired (KCST_BindDelegate, LowerDelegateValue): Args[0] the delegate local, Args[1]
+       the object, Args[2] the function's name (KismetCompilerVMBackend.cpp 1609-1625). */
+    if (Call.Intrinsic == "__BindDelegate__")
+    {
+        bool bOk = true;
+        std::string SubErr;
+        S.BindDelegate(Call.Args[2].S,
+                       [&](FScript& C) { bOk = bOk && EmitArg(C, Call.Args[0], SelfExp, &SubErr); },
+                       [&](FScript& C) { bOk = bOk && EmitArg(C, Call.Args[1], SelfExp, &SubErr); });
+        if (!bOk && Err) *Err = SubErr;
+        return bOk;
+    }
     /* A dispatcher operation: Args[0] is the dispatcher, then the delegate or the broadcast's arguments. */
     const bool bAdd = Call.Intrinsic == "__AddDelegate__", bRemove = Call.Intrinsic == "__RemoveDelegate__";
     if (bAdd || bRemove || Call.Intrinsic == "__ClearDelegate__" || Call.Intrinsic == "__Broadcast__")
@@ -1449,7 +1462,9 @@ private:
                               FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     bool LowerDispatcherCall(const Json& Call, const Json& Callee, const Json& Obj, FBlueprintClass& BP,
                              FArgIR& Out, std::string* Err);
-    bool LowerDelegateValue(const Json& Obj, const Json& Fn, FArgIR& Out, std::string* Err);
+    bool LowerDelegateValue(const Json& Obj, const Json& Fn, const std::string& DelegateType, FIndex Sig, const std::string& Holder,
+                            FBlueprintClass& BP, FArgIR& Out, std::string* Err);
+    const FRecord* DispatcherOwner(const Json& Dispatcher);
 
     /* Raw pointers: a pointer to anything but a UObject (void*, int32*, FName*, UObject**) is an address,
        an int64 at run time. NormalizePointers respells them int64 in a declaration's subtree before
@@ -2470,6 +2485,12 @@ bool FCompiler::Collect(std::string* Err)
             {
                 std::string Sub;
                 if (FindLiteral(C, Sub)) R.Subobjects[Name(C).substr(0, Name(C).size() - 13)] = Sub;
+            }
+            else if (Kind(C) == "VarDecl" && Name(C).size() > 14 && Name(C).compare(Name(C).size() - 14, 14, "__UeDispatcher") == 0)
+            {
+                std::string Kinds;
+                FindLiteral(C, Kinds);
+                R.Dispatchers[Name(C).substr(0, Name(C).size() - 14)] = Kinds;
             }
             else if (Kind(C) == "VarDecl" && Name(C).size() > 11 && Name(C).compare(Name(C).size() - 11, 11, "__UeScsNode") == 0)
             {
@@ -3588,35 +3609,136 @@ bool FCompiler::LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& 
     return LowerArg(*ObjRaw, BP, *Out.Base, Err);
 }
 
-/* `this, &Foo::Handler`: EX_InstanceDelegate binds the frame's object, so only self can be bound. */
-bool FCompiler::LowerDelegateValue(const Json& Obj, const Json& Fn, FArgIR& Out, std::string* Err)
+/* A delegate value, `{Obj, &Foo::Handler}`: Handler bound by name on Obj, which the engine looks up on Obj's class when the
+   broadcast or the timer runs. On `this` it is EX_InstanceDelegate, which binds the frame's object. On another object it
+   is the editor's Create Event node with its Object pin wired (KCST_BindDelegate): EX_BindDelegate binds the name on the
+   object into a delegate local, and the local is the value (KismetCompilerVMBackend.cpp 1609-1625, execBindDelegate
+   ScriptCore.cpp 3302-3321). DelegateType is the TDelegate<...> the value is: the local's type, whose signature is Sig
+   when the caller knows the one it goes to (a dispatcher of this class), else one of the class's own named after Holder. */
+bool FCompiler::LowerDelegateValue(const Json& Obj, const Json& Fn, const std::string& DelegateType, FIndex Sig,
+                                   const std::string& Holder, FBlueprintClass& BP, FArgIR& Out, std::string* Err)
 {
     const Json* O = Strip(&Obj);
     const Json* F = Strip(&Fn);
-    if (!O || Kind(*O) != "CXXThisExpr") { *Err = "TODO: a delegate can only bind a function of `this`"; return false; }
     if (F && Kind(*F) == "UnaryOperator" && F->value("opcode", std::string()) == "&") F = Strip(First(*F));
     if (!F || Kind(*F) != "DeclRefExpr") { *Err = "a delegate binds `&Class::Function`"; return false; }
     const Json& Ref = (*F)["referencedDecl"];
+    const std::string FnName = Name(Ref);
     auto Owner = MethodOwner.find(Ref.value("id", std::string()));
-    if (const FRecord* R = Owner != MethodOwner.end() ? Find(Owner->second) : nullptr; R && IsInlineMethod(*R, Name(Ref)))
-    { *Err = "a delegate cannot bind " + Name(Ref) + ": an inline function is expanded where it is called, no UFunction (drop `inline`)"; return false; }
-    /* EX_InstanceDelegate binds the name on this object, so a function of a class this one does not derive from is
-       never found there, and the broadcast or timer skips it (ScriptDelegates.h 38-49, 479-502). */
-    if (Owner != MethodOwner.end() && Cur)
+    const FRecord* R = Owner != MethodOwner.end() ? Find(Owner->second) : nullptr;
+    if (R && IsInlineMethod(*R, FnName))
+    { *Err = "a delegate cannot bind " + FnName + ": an inline function is expanded where it is called, no UFunction (drop `inline`)"; return false; }
+    const bool bSelf = O && Kind(*O) == "CXXThisExpr";
+
+    /* The class the engine looks the name up on: this one's, or the one the object's type names. A function of a class
+       that one does not derive from is never found there, and the broadcast or timer skips it (ScriptDelegates.h 38-49,
+       479-502); the editor's Create Event node lists the functions of its Object pin's class (K2Node_CreateDelegate.cpp
+       126-146). */
+    const FRecord* On = Cur;
+    std::string OnType;
+    if (!bSelf)
+    {
+        if (!O) { *Err = "a delegate binds a function of an object: {Object, &Class::Function}"; return false; }
+        OnType = StripTypeKeywords(TypeOf(*O));
+        while (!OnType.empty() && (OnType.back() == '*' || OnType.back() == ' ')) OnType.pop_back();
+        On = Find(OnType);
+        if (!On || On->bIsStruct || On->bIsInterface)
+        { *Err = "a delegate binds " + FnName + " on an object, through a pointer to its class, not " + StripTypeKeywords(TypeOf(*O)); return false; }
+    }
+    if (Owner != MethodOwner.end() && On)
     {
         bool bMine = false;
-        for (const FRecord* A = Cur; A && !bMine; A = A->Base.empty() ? nullptr : Find(A->Base)) bMine = A->CppName == Owner->second;
-        if (!bMine)
-        { *Err = "a delegate on `this` cannot bind " + Owner->second + "::" + Name(Ref) + ": the engine looks it up by name on this "
+        for (const FRecord* A = On; A && !bMine; A = A->Base.empty() ? nullptr : Find(A->Base)) bMine = A->CppName == Owner->second;
+        if (!bMine && bSelf)
+        { *Err = "a delegate on `this` cannot bind " + Owner->second + "::" + FnName + ": the engine looks it up by name on this "
                  "object, whose class has no such function"; return false; }
+        if (!bMine)
+        { *Err = "a delegate on a " + OnType + " cannot bind " + Owner->second + "::" + FnName + ": the engine looks it up by name on "
+                 "that object, whose class has no such function"; return false; }
     }
-    Out.K = FArgIR::Delegate;
-    Out.S = UeNameOf(Cur, (*F)["referencedDecl"].value("name", std::string()));     // found on self by name at run time
+    if (bSelf)
+    {
+        Out.K = FArgIR::Delegate;
+        Out.S = UeNameOf(Cur, FnName);     // found on self by name at run time
+        return true;
+    }
+
+    /* What the editor binds (K2Node_CreateDelegate.cpp 156-164, FunctionCanBeUsedInDelegate EdGraphSchema_K2.cpp 974-985):
+       a BlueprintCallable function, not pure, not latent. A mod's method is what Generate makes it - BlueprintCallable,
+       unless it overrides an event that is not - and one only declared is no function at all. A native or game
+       Blueprint's event says so in Events.json; any other function UeApi lists is a BlueprintCallable UFunction. */
+    if (R)
+    {
+        std::string Why;
+        uint32 Flags = 0;
+        if (!R->IsNative())
+        {
+            if (!CompilesMethod(*R, FnName))
+            { *Err = "a delegate cannot bind " + R->CppName + "::" + FnName + ", which " + R->CppName + " declares and never defines"; return false; }
+            Flags = ModMethodFlags(*R, FnName, BP);
+        }
+        else if (auto E = EventFlags.find(R->UePackage.substr(R->UePackage.rfind('/') + 1) + "." + R->UeName + "." + UeNameOf(R, FnName));
+                 E != EventFlags.end())
+            Flags = E->second;
+        else
+            Flags = FUNC_BlueprintCallable;
+        if (const auto M = R->Methods.find(FnName); M != R->Methods.end() && IsPureDecl(*M->second)) Flags |= FUNC_BlueprintPure;
+        if (!(Flags & FUNC_BlueprintCallable)) Why = FnName + " is not BlueprintCallable";
+        else if (Flags & FUNC_BlueprintPure) Why = FnName + " is pure";
+        else if (DesugaredTypeOf(Ref).find("FLatentActionInfo") != std::string::npos) Why = FnName + " is latent";
+        if (!Why.empty())
+        { *Err = "a delegate cannot bind " + R->CppName + "::" + FnName + " on another object: the editor binds a BlueprintCallable "
+                 "function that is not pure or latent, and " + Why; return false; }
+    }
+
+    if (!CurLocals) { *Err = "internal: a delegate value outside a function body"; return false; }
+    if (!Sig.V && !DelegateSignature(DelegateType, Holder, BP, &Sig, Err)) return false;
+    const std::string Tmp = "__Make" + std::to_string(ReadTmpCounter++) + "__";
+    FPropertyDef PD = DelegateParam(Tmp, Sig);
+    PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+    CurLocals->push_back(PD);
+
+    FCallIR Bind;
+    Bind.Intrinsic = "__BindDelegate__";
+    Bind.Args.resize(3);
+    Bind.Args[0].K = FArgIR::Local;
+    Bind.Args[0].S = Tmp;
+    Bind.Args[0].LetOp = LetOpFor(DelegateType);
+    Bind.Args[0].InnerType = DelegateType;
+    if (!LowerArg(Obj, BP, Bind.Args[1], Err)) return false;
+    Bind.Args[2].K = FArgIR::Name;
+    Bind.Args[2].S = UeNameOf(R ? R : On, FnName);
+    auto Body = std::make_shared<std::vector<FStmtIR>>(1);
+    (*Body)[0].K = FStmtIR::StaticCall;
+    (*Body)[0].Call = std::move(Bind);
+    auto Block = std::make_shared<std::vector<FStmtIR>>(1);
+    (*Block)[0].K = FStmtIR::Block;
+    (*Block)[0].Body = Body;
+    Out = FArgIR();
+    Out.K = FArgIR::Call;
+    Out.InnerType = DelegateType;
+    Out.Sub = std::make_shared<FCallIR>();
+    Out.Sub->Intrinsic = "__Inline__";
+    Out.Sub->Inline = Block;
+    Out.Sub->InlineResult = Tmp;
+    Out.Sub->InlineType = DelegateType;
     return true;
 }
 
-/* Add / Remove / Clear on any dispatcher; Broadcast needs the signature function, known only for a
-   UE_DISPATCHER of the class being generated. */
+/* The class that declares the dispatcher a member expression names, or null. */
+const FRecord* FCompiler::DispatcherOwner(const Json& Dispatcher)
+{
+    const Json* M = Strip(&Dispatcher);
+    if (!M || Kind(*M) != "MemberExpr") return nullptr;
+    auto It = FieldOwner.find(M->value("referencedMemberDecl", std::string()));
+    return It == FieldOwner.end() ? nullptr : Find(It->second);
+}
+
+/* `D.Add(Obj, &F)`, `D.Remove(Obj, &F)`, `D.Clear()` and `D.Broadcast(...)` on a dispatcher D of this class or of another
+   object, as the editor's Bind / Add / Remove / Clear and Call nodes (K2Node_MCDelegate.cpp). A Blueprint's dispatcher -
+   this class's, a mod's, a game Blueprint's - takes them all; a native one takes the first four only when the engine
+   marks it BlueprintAssignable, and Call only when BlueprintCallable (36-46, 453-462), which UeApi's <D>__UeDispatcher
+   says. */
 bool FCompiler::LowerDispatcherCall(const Json& Call, const Json& Callee, const Json& Obj, FBlueprintClass& BP,
                                     FArgIR& Out, std::string* Err)
 {
@@ -3633,32 +3755,64 @@ bool FCompiler::LowerDispatcherCall(const Json& Call, const Json& Callee, const 
     if (!LowerArg(Obj, BP, C.Args[0], Err)) return false;
     if (C.Args[0].K != FArgIR::Field) { *Err = "a dispatcher must be a property: " + Method; return false; }
 
-    if (Method == "Add" || Method == "Remove")
+    /* Whose dispatcher it is, and what the editor's nodes allow on it. A Blueprint's every dispatcher is both (the game's
+       1404 all are); a native one says through UeApi, and a UeApi from before genueapi wrote that says nothing. */
+    const std::string Disp = Name(Obj);
+    const FRecord* Owner = DispatcherOwner(Obj);
+    const bool bNative = Owner && Owner->IsNative() && Owner->UePackage.compare(0, 6, "/Game/") != 0;
+    const auto Marked = bNative ? Owner->Dispatchers.find(Disp) : std::map<std::string, std::string>::const_iterator();
+    const bool bMarked = bNative && Marked != Owner->Dispatchers.end();
+    auto Has = [&](const char* What) { return bMarked && (" " + Marked->second + " ").find(std::string(" ") + What + " ") != std::string::npos; };
+    const std::string Where = bNative ? Owner->CppName + "::" + Disp : Disp;
+
+    /* The delegate type a value bound to it is, and the signature such a value names: this class's dispatcher's own. */
+    std::string Type = TypeOf(Obj);
+    const size_t Lt = Type.find('<');
+    const std::string DelegateType = Lt == std::string::npos ? std::string() : "TDelegate" + StripTypeKeywords(Type.substr(Lt));
+    auto Own = CurSignatures.find(C.Args[0].S);
+    const bool bOwn = Owner == Cur && Cur && !Cur->IsNative() && Own != CurSignatures.end();
+
+    if (Method == "Add" || Method == "Remove" || Method == "Clear")
     {
+        if (bMarked && !Has("Assignable"))
+        { *Err = Disp + "." + Method + ": " + Disp + " is a native dispatcher that is not BlueprintAssignable (" + Where + "), and "
+                 "the editor's dispatcher nodes refuse one (\"Event Dispatcher is not 'BlueprintAssignable'\"): only the "
+                 "engine's own code binds it"; return false; }
+        if (Method == "Clear") { C.Intrinsic = "__ClearDelegate__"; return true; }
         C.Intrinsic = Method == "Add" ? "__AddDelegate__" : "__RemoveDelegate__";
         C.Args.emplace_back();
-        return LowerDelegateValue(*Args[0], *Args[1], C.Args[1], Err);   // clang checked the arity
+        return LowerDelegateValue(*Args[0], *Args[1], DelegateType, bOwn ? Own->second : Null(), Disp, BP, C.Args[1], Err);
     }
-    if (Method == "Clear") { C.Intrinsic = "__ClearDelegate__"; return true; }
     if (Method != "Broadcast") { *Err = "TODO: unimplemented dispatcher method " + Method; return false; }
 
-    /* The signature function is the declaring class's: this one's own, or a Blueprint parent's, imported from its
-       package as the editor's broadcast node names it. */
-    const std::string SigName = Name(Obj) + "__DelegateSignature";
-    const FRecord* Declarer = nullptr;
-    for (const FRecord* A = Cur; A && !Declarer; A = A->Base.empty() ? nullptr : Find(A->Base))
-        if (A->Methods.count(SigName)) Declarer = A;
-    auto Sig = CurSignatures.find(C.Args[0].S);
-    if (Declarer && Declarer != Cur && (!Declarer->IsNative() || Declarer->UePackage.compare(0, 6, "/Game/") == 0))
-        C.Fn = BP.EngineFunction(PackageOf(*Declarer), ClassOf(*Declarer), C.Args[0].S + "__DelegateSignature");
-    else if (C.Args[0].Owner.V == BP.ClassIndex().V && Sig != CurSignatures.end())
-        C.Fn = Sig->second;
-    else
+    /* The signature function the Call node names is the dispatcher's own, <D>__DelegateSignature of the class that declares
+       it (FKCHandler_CallDelegate): this class's export, or a mod's or a game Blueprint's imported from its package. A
+       native's UeApi does not name - the dump links no delegate property to its signature - so a callable native one
+       gets a function of this class with its parameters: execCallMulticastDelegate builds the parameter block by the
+       operand's chain and the handlers read it as theirs (ScriptCore.cpp 3032-3063), so they get the same arguments. */
+    if (bOwn)
+        C.Fn = Own->second;
+    else if (Owner && !bNative)
+        C.Fn = BP.EngineFunction(PackageOf(*Owner), ClassOf(*Owner), C.Args[0].S + "__DelegateSignature");
+    else if (bNative && Has("Callable"))
     {
-        *Err = "TODO: Broadcast needs the dispatcher's signature function, which only a UE_DISPATCHER of this class or a "
-               "Blueprint parent has: " + C.Args[0].S;
+        if (DelegateType.empty() || !DelegateSignature(DelegateType, Disp, BP, &C.Fn, Err)) return false;
+        printf("  warning: %s::%s: %s.Broadcast names a signature function of this class with %s's parameters, as UeApi does not "
+               "name the engine's; the handlers get the same arguments\n", Cur ? Cur->CppName.c_str() : "", CurFnName.c_str(),
+               Disp.c_str(), Where.c_str());
+    }
+    else if (bNative)
+    {
+        *Err = Disp + ".Broadcast: " + Disp + " is a native dispatcher (" + Where + ") " + (bMarked
+                   ? std::string("that is not BlueprintCallable, and the editor's Call node refuses one (\"Event Dispatcher is "
+                                 "not 'BlueprintCallable'\"): only the engine's own code broadcasts it")
+                   : std::string("and the editor's Call node takes one only when it is BlueprintCallable, which this UeApi does "
+                                 "not say (regenerate it with genueapi)"));
         return false;
     }
+    else
+    { *Err = "internal: Broadcast on " + Disp + ", whose declaring class is not known"; return false; }
+
     C.Intrinsic = "__Broadcast__";
     for (const Json* A : Args)
     {
@@ -3666,26 +3820,32 @@ bool FCompiler::LowerDispatcherCall(const Json& Call, const Json& Callee, const 
         if (!LowerArg(*A, BP, C.Args.back(), Err)) return false;
     }
     /* A reference parameter of the signature is an out parm, which execCallMulticastDelegate steps with a null result
-       pointer and copies from the address the argument left: HoistCallArgs gives anything but a variable a local. */
-    if (auto M = Declarer ? Declarer->Methods.find(SigName) : Cur->Methods.end(); Declarer && M != Declarer->Methods.end())
+       pointer and copies from the address the argument left: HoistCallArgs gives anything but a variable a local. The
+       parameters are a UE_DISPATCHER's signature declaration's, named, or else the dispatcher's type's. */
+    std::vector<std::pair<std::string, std::string>> Parms;     // (name, type as written)
+    const auto M = Owner && !Owner->IsNative() ? Owner->Methods.find(Disp + "__DelegateSignature") : std::map<std::string, const Json*>::const_iterator();
+    if (Owner && !Owner->IsNative() && M != Owner->Methods.end())
+        ForEach(*M->second, [&](const Json& P) { if (Kind(P) == "ParmVarDecl") Parms.emplace_back(Name(P), TypeOf(P)); });
+    else if (const size_t Open = Type.find('('), Close = Type.rfind(')'); Open != std::string::npos && Close != std::string::npos && Close > Open
+             && Type.substr(Open + 1, Close - Open - 1).find_first_not_of(' ') != std::string::npos)
+        for (const std::string& T : SplitTemplateArgs(Type.substr(Open + 1, Close - Open - 1)))
+            Parms.emplace_back("parameter " + std::to_string(Parms.size() + 1) + " (" + T + ")", T);
+    C.RefParms.emplace_back();
+    std::string WrittenRef;
+    for (auto [PName, T] : Parms)
     {
-        C.RefParms.emplace_back();
-        std::string WrittenRef;
-        ForEach(*M->second, [&](const Json& P) {
-            if (Kind(P) != "ParmVarDecl") return;
-            std::string T = TypeOf(P);
-            const bool bRef = !T.empty() && T.back() == '&';
-            if (bRef && T.compare(0, 6, "const ") != 0 && WrittenRef.empty()) WrittenRef = Name(P);
-            while (!T.empty() && (T.back() == '&' || T.back() == ' ')) T.pop_back();
-            C.RefParms.push_back(bRef ? StripTypeKeywords(T) : std::string());
-        });
-        if (C.RefParms.size() != C.Args.size()) C.RefParms.clear();
-        /* C++'s Broadcast copies a reference parameter back after the handlers ran; execCallMulticastDelegate copies the
-           argument into a parameter block of its own and never back (ScriptCore.cpp 3032-3075). */
-        if (!WrittenRef.empty())
-        { *Err = Name(Obj) + ".Broadcast: " + WrittenRef + " is a non-const reference, which a Broadcast never writes back "
-                 "to the caller; take it by value or by const reference"; return false; }
+        while (!T.empty() && T.back() == ' ') T.pop_back();
+        const bool bRef = !T.empty() && T.back() == '&';
+        if (bRef && T.compare(0, 6, "const ") != 0 && WrittenRef.empty()) WrittenRef = PName;
+        while (!T.empty() && (T.back() == '&' || T.back() == ' ')) T.pop_back();
+        C.RefParms.push_back(bRef ? StripTypeKeywords(T) : std::string());
     }
+    if (C.RefParms.size() != C.Args.size()) C.RefParms.clear();
+    /* C++'s Broadcast copies a reference parameter back after the handlers ran; execCallMulticastDelegate copies the
+       argument into a parameter block of its own and never back (ScriptCore.cpp 3032-3075). */
+    if (!WrittenRef.empty())
+    { *Err = Disp + ".Broadcast: " + WrittenRef + " is a non-const reference, which a Broadcast never writes back "
+             "to the caller; take it by value or by const reference"; return false; }
     return true;
 }
 
@@ -4493,7 +4653,11 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         const Json* Obj = Nth(*N, 0);
         const Json* Fn = Nth(*N, 1);
         if (!Obj || !Fn) { *Err = "a delegate value is {this, &Class::Function}"; return false; }
-        return LowerDelegateValue(*Obj, *Fn, Out, Err);
+        const Json* FnRef = Strip(Fn);
+        if (FnRef && Kind(*FnRef) == "UnaryOperator") FnRef = Strip(First(*FnRef));
+        return LowerDelegateValue(*Obj, *Fn, StripTypeKeywords(TypeOf(*N)), Null(),
+                                  FnRef && FnRef->contains("referencedDecl") ? Name((*FnRef)["referencedDecl"]) : std::string("Bound"),
+                                  BP, Out, Err);
     }
     if (K == "CXXConstructExpr" || K == "CXXTemporaryObjectExpr")
     {
