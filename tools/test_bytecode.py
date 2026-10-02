@@ -2073,6 +2073,56 @@ final_as_shared()
 print('ok  FinalAsTest: a UE_FINAL_AS in a shared header makes the base owner\'s leaf, imported by every other mod')
 
 
+def final_as_foreign():
+    """UE_FINAL_AS over a base this source does not cook. A game Blueprint stays as the game has it - not final, its own
+    subclasses kept - so it is refused. Another mod's UE_CLASS base is final only where its owner says so, in the header
+    it shares (FinalAsShared): written in a mod's own source, the leaf would be pinned beside the owner's base, imported,
+    and never cooked by the owner, so it is refused there."""
+    refused('FinalAsGame', '', 'BP_TutorialComponent_C is the game\'s Blueprint',
+            top='#include "UeApi/Game/BP_TutorialComponent_C.h"\nUE_FINAL_AS(BP_TutorialComponent_C, FagLeaf);\n')
+    refused('FinalAsForeign', '', 'only the UE_FINAL_AS in the header that declares it',
+            top='class FafBase : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/FafOwner/FafBase", "FafBase_C");\n'
+                '  int32 Bump(int32 V);\n};\nUE_FINAL_AS(FafBase, FafLeaf);\n')
+
+
+final_as_foreign()
+print('ok  FinalAsTest: UE_FINAL_AS over a base this mod does not cook is refused, unless written in the header its '
+      'owner shares')
+
+
+def final_as_private_header():
+    """UE_FINAL_AS over another mod's base counts only in the header its owner's own source includes, so that the owner
+    cooks the leaf. A header of this mod's own that re-declares the base with its UE_CLASS is the same text, but the
+    owner never sees it: refused. An owner of several sources, whose UE_MOD_PACKAGE is in one and whose header another
+    includes, is the owner all the same: another mod including that header compiles."""
+    head = '﻿#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\n'
+    base = lambda b, owner: ('class %s : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/%s/%s", "%s_C");\n'
+                             '  int32 Bump(int32 V);\n};\nUE_FINAL_AS(%s, %sLeaf);\n' % (b, owner, b, b, b, b))
+    user = lambda mod, inc, b: (head + '#include "%s"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\nclass %s : public AActor '
+                                '{\npublic:\n  int32 Use(%sLeaf* L) { return L->Bump(1); }\n};\n' % (inc, mod, mod, b))
+    files = {'PvHdr/PvPriv.h': '﻿#pragma once\n' + head[1:] + base('PvBase', 'PvOwner'),
+             'PvHdr/PvHdr.cpp': user('PvHdr', 'PvPriv.h', 'PvBase'),
+             'FapOwner/Shared.h': '﻿#pragma once\n' + head[1:] + base('FapBase', 'FapOwner'),
+             'FapOwner/FapOwner.cpp': head + 'UE_MOD_PACKAGE("/Game/_ElytrasMods/FapOwner");\n',
+             'FapOwner/Part.cpp': head + '#include "Shared.h"\nint32 FapBase::Bump(int32 V) { return V + 1; }\n',
+             'FapUser/FapUser.cpp': user('FapUser', '../FapOwner/Shared.h', 'FapBase')}
+    with tempfile.TemporaryDirectory() as tmp:
+        for rel, text in files.items():
+            os.makedirs(os.path.dirname(os.path.join(tmp, rel)), exist_ok=True)
+            with open(os.path.join(tmp, rel), 'w', encoding='utf-8', newline='\n') as f: f.write(text)
+        out = os.path.join(tmp, 'out')
+        os.makedirs(out)
+        proc = assetgen_compile([os.path.join(tmp, 'FapUser', 'FapUser.cpp'), UEAPI, out])
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        proc = assetgen_compile([os.path.join(tmp, 'PvHdr', 'PvHdr.cpp'), UEAPI, out])
+        assert proc.returncode != 0 and 'only the UE_FINAL_AS in the header that declares it' in proc.stdout, proc.stdout
+
+
+final_as_private_header()
+print('ok  FinalAsTest: UE_FINAL_AS over another mod\'s base in a header of this mod\'s own is refused; in the header its '
+      'owner\'s sources include it is not')
+
+
 # ---- NestedTest
 
 def nested_containers():
@@ -5205,6 +5255,176 @@ refused('FuncIfaceStatic', '', 'the FsRoot::Tell it inherits is static: the edit
             'class FsRoot : public AActor {\npublic:\n  static int32 Tell(int32 V) { return V + 1; }\n};\n'
             'class FsKid : public FsRoot, public IFsTell {\npublic:\n  int32 Ask() { return FsRoot::Tell(4); }\n};\n')
 print('ok  FuncIfaceStatic: an interface function inherited as a static is refused, as the editor refuses its override')
+
+
+def func_static_above():
+    """A function named like a mod ancestor's static is an override of it to the editor (its super is
+    ParentClass->FindFunctionByName, KismetCompiler.cpp 1733-1774), which refuses one that is not static, or a static
+    over one that is not ("Check flags: Exec, Final, Static", 1855-1868): a method of the class's own, an interface
+    implementation it declares, a static over a method. A static over a static splits no caller - each call to either is
+    bound - so FuncStaticHide compiles, its Tell linked to FshRoot's as its super, and each call runs the one it names."""
+    refused('StaticAboveOwn', '', 'SaRoot::Tell is static, and the editor takes a function of that name in a subclass '
+            'for an override of it',
+            top='class SaRoot : public AActor {\npublic:\n  static int32 Tell(int32 V) { return V + 1; }\n};\n'
+                'class SaKid : public SaRoot {\npublic:\n  int32 Tell(int32 V) { return V * 2; }\n};\n')
+    refused('StaticAboveIface', '', 'the SaiRoot::Tell it inherits is static: the editor takes such a function for an '
+            'override of the static and refuses it',
+            top='class ISaiTell {\npublic:\n  UE_INTERFACE;\n  int32 Tell(int32 V);\n};\n'
+                'class SaiRoot : public AActor {\npublic:\n  static int32 Tell(int32 V) { return V + 1; }\n};\n'
+                'class SaiKid : public SaiRoot, public ISaiTell {\npublic:\n  int32 Tell(int32 V) { return V * 4; }\n};\n')
+    refused('StaticOverMethod', '', 'SomKid::Tell is static, and the SomRoot::Tell it hides is not',
+            top='class SomRoot : public AActor {\npublic:\n  int32 Tell(int32 V) { return V + 1; }\n};\n'
+                'class SomKid : public SomRoot {\npublic:\n  static int32 Tell(int32 V) { return V * 3; }\n};\n')
+    kid = asset('FuncStaticHide')
+    root = os.path.join(os.path.dirname(kid), 'FshRoot')
+    for b in (kid, root): keeps_invariants(b)
+    pkg = invariants.Package(kid)
+    st = pkg.struct(pkg.find('Tell'))
+    assert st.super and pkg.path(st.super).endswith('/FshRoot.FshRoot_C:Tell'), 'FuncStaticHide::Tell has no super'
+    assert st.function_flags & 0x2000, 'FuncStaticHide::Tell FunctionFlags %#x is not static' % st.function_flags
+    assert run_as([kid, root], 'Use', {}, V=2) == 603
+
+
+func_static_above()
+print('ok  FuncStaticHide: a function named like a mod ancestor\'s static is refused unless it is a static, whose super '
+      'is that one')
+
+
+def static_above_foreign():
+    """The same rule over another mod's class, pinned by UE_CLASS to its owner: its functions come from the header it
+    shares, so whether one is static is known, and the editor takes a function of its name below for an override of it
+    all the same (its super is ParentClass->FindFunctionByName). A method over its static, and a static over its method,
+    are refused."""
+    refused('StaticAboveForeign', '', 'XafBase::Tell is static, and the editor takes a function of that name in a '
+            'subclass for an override of it',
+            top='class XafBase : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/XafOwner/XafBase", "XafBase_C");\n'
+                '  static int32 Tell(int32 V);\n};\n'
+                'class XafKid : public XafBase {\npublic:\n  int32 Tell(int32 V) { return V * 2; }\n};\n')
+    refused('StaticOverForeign', '', 'XofKid::Tell is static, and the XofBase::Tell it hides is not',
+            top='class XofBase : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/XofOwner/XofBase", "XofBase_C");\n'
+                '  int32 Tell(int32 V);\n};\n'
+                'class XofKid : public XofBase {\npublic:\n  static int32 Tell(int32 V) { return V * 2; }\n};\n')
+
+
+static_above_foreign()
+print('ok  FuncStaticHide: a function named like the static of another mod\'s class, or a static named like its method, '
+      'is refused')
+
+
+def static_over_static():
+    """A static over a mod ancestor's static is C++ name hiding, which no Blueprint can write: the editor refuses a
+    function named like its parent's, as an override of a function that is no BlueprintEvent ("cannot be overridden",
+    KismetCompiler.cpp 3312-3316). Of the same signature it compiles with a `warning:` (FuncStaticHide), its super the
+    one it hides, as FindFunctionByName gives it; of another, that super would carry other parameters, and it is
+    refused."""
+    assert re.search(r'warning: .*FuncStaticHide::Tell hides FshRoot::Tell', LOGS['FuncStaticHide']), LOGS['FuncStaticHide']
+    # UE_CLASS's StaticClass is declared in every class and compiled in none: no function hides another.
+    hid = [m for m, log in LOGS.items() if 'StaticClass hides' in log]
+    assert not hid, hid
+    refused('StaticOverStaticSig', '', 'SssKid::Tell is static and hides SssRoot::Tell, a static of another signature',
+            top='class SssRoot : public AActor {\npublic:\n  static int32 Tell(int32 V) { return V + 1; }\n};\n'
+                'class SssKid : public SssRoot {\npublic:\n  static float Tell(float V) { return V * 3; }\n'
+                '  float Use(float V) { return Tell(V) + SssRoot::Tell(2); }\n};\n')
+
+
+static_over_static()
+print('ok  FuncStaticHide: a static over a static warns, and is refused when its signature differs')
+
+
+def func_iface_unnamed():
+    """FuncIfaceUnnamed gets an override of FiuRoot's Tell (for IFiuTell) and of Kept (for its `FiuRoot::Kept` call),
+    each calling FiuRoot's though a parameter of it has no name: the override names it, as an editor override does.
+    An inherited function of another signature, or a final one, cannot implement an interface function of its name,
+    and the refusal says so in the interface's terms; so does one of the class's own that the inherited one's
+    signature would make its super's."""
+    kid = asset('FuncIfaceUnnamed')
+    root = os.path.join(os.path.dirname(kid), 'FiuRoot')
+    assert 'call by name' not in LOGS['FuncIfaceUnnamed'], LOGS['FuncIfaceUnnamed']
+    keeps_invariants(kid)
+    assert {'Tell', 'Kept'} <= set(exports_of(kid)), exports_of(kid)
+    assert runscript.params_of(kid, 'Tell') == ['P0_', 'P0'], runscript.params_of(kid, 'Tell')
+    assert run_as([kid, root], 'Tell', {}, P0_=1, P0=2) == 20
+    fields = {'Seen': 0}
+    assert run_as([kid, root], 'Use', fields) == 14 and fields['Seen'] == 2, fields
+    refused('IfaceSigInherited', '', 'IsiKid implements IIsiTell, whose Tell is int32 (int32), and the IsiRoot::Tell it '
+            'inherits is float (float)',
+            top='class IIsiTell {\npublic:\n  UE_INTERFACE;\n  int32 Tell(int32 V);\n};\n'
+                'class IsiRoot : public AActor {\npublic:\n  float Tell(float V) { return V; }\n};\n'
+                'class IsiKid : public IsiRoot, public IIsiTell {\npublic:\n  int32 Other() { return 0; }\n};\n')
+    refused('IfaceFinalInherited', '', 'the IfiRoot::Tell it inherits is final',
+            top='class IIfiTell {\npublic:\n  UE_INTERFACE;\n  int32 Tell(int32 V);\n};\n'
+                'class IfiRoot : public AActor {\npublic:\n  virtual int32 Tell(int32 V) final { return V; }\n};\n'
+                'class IfiKid : public IfiRoot, public IIfiTell {\npublic:\n  int32 Other() { return 0; }\n};\n')
+    refused('IfaceSigOwn', '', 'and replaces the IsoRoot::Tell it inherits, float (float)',
+            top='class IIsoTell {\npublic:\n  UE_INTERFACE;\n  int32 Tell(int32 V);\n};\n'
+                'class IsoRoot : public AActor {\npublic:\n  float Tell(float V) { return V; }\n};\n'
+                'class IsoKid : public IsoRoot, public IIsoTell {\npublic:\n  int32 Tell(int32 V) { return V; }\n};\n')
+
+
+func_iface_unnamed()
+print('ok  FuncIfaceUnnamed: an inherited function with an unnamed parameter is forwarded; one of another signature, '
+      'or final, is refused in the interface\'s terms')
+
+
+def iface_over_stub_sig():
+    """A mod ancestor that lists a mod interface and leaves its function out has the stub of it, and that stub is the
+    parent function of any function of its name below (ParentClass->FindFunctionByName, KismetCompiler.cpp 1733-1734).
+    The editor refuses an override whose parent has another signature ("Cannot override ... declared in a parent with a
+    different signature", 1993-2011): an implementation of another interface's function of that name, the class's own
+    or the stub of one it leaves out, is refused in the interfaces' terms."""
+    two = ('class ISsA {\npublic:\n  UE_INTERFACE;\n  float Tell(float V);\n};\n'
+           'class ISsB {\npublic:\n  UE_INTERFACE;\n  int32 Tell(int32 V);\n};\n'
+           'class SsRoot : public AActor, public ISsA {\npublic:\n  int32 Other() { return 0; }\n};\n')
+    refused('IfaceStubSigOwn', '', 'SsKid::Tell implements ISsB::Tell, int32 (int32), and replaces the Tell of ISsA, '
+            'float (float), that SsRoot implements',
+            top=two + 'class SsKid : public SsRoot, public ISsB {\npublic:\n  int32 Tell(int32 V) { return V * 2; }\n};\n')
+    refused('IfaceStubSigStub', '', 'SsKid implements ISsB, whose Tell is int32 (int32), and replaces the Tell of ISsA, '
+            'float (float), that SsRoot implements',
+            top=two + 'class SsKid : public SsRoot, public ISsB {\npublic:\n  int32 Other2() { return 1; }\n};\n')
+
+
+iface_over_stub_sig()
+print('ok  FuncIfaceUnnamed: an implementation over an ancestor\'s interface stub of another signature is refused in '
+      'the interfaces\' terms')
+
+
+def parm_unnamed():
+    """ParmUnnamed: a parameter the source leaves unnamed is cooked under the name the editor's pin and AssetGen's
+    override give it, P<index> (`_` added while another parameter has that name), not as an empty name, None once
+    loaded, which two of them in one function would share. The calls still pass each argument in its place."""
+    base = asset('ParmUnnamed')
+    keeps_invariants(base)
+    assert runscript.params_of(base, 'Pick') == ['P0', 'B'], runscript.params_of(base, 'Pick')
+    assert runscript.params_of(base, 'Both') == ['P0', 'P1'], runscript.params_of(base, 'Both')
+    assert run_as([base], 'Use', {}) == 64
+    root = os.path.join(os.path.dirname(asset('FuncIfaceUnnamed')), 'FiuRoot')
+    assert runscript.params_of(root, 'Tell') == ['P0_', 'P0'], runscript.params_of(root, 'Tell')
+
+
+parm_unnamed()
+print('ok  ParmUnnamed: an unnamed parameter is cooked as P<index>, as the editor names the pin')
+
+
+def func_own_iface_final():
+    """FuncOwnIfaceFinal: Tell and the stub Left implement IFoiTell, which the class itself lists, keeping the interface
+    function's contract (func_override_flags) - BlueprintEvent, not Final - in a final class and in a UE_FINAL_AS base,
+    and Ask's call to Tell reaches each class's own."""
+    leaf = asset('FuncOwnIfaceFinal')
+    p = lambda c: os.path.join(os.path.dirname(leaf), c)
+    final, base = p('FoiFinal'), p('FoiBase')
+    for b in (final, base, leaf): keeps_invariants(b)
+    for b in (final, base):
+        pkg = invariants.Package(b)
+        for fn in ('Tell', 'Left'):
+            got = pkg.struct(pkg.find(fn)).function_flags
+            assert got & 0x08000000 and not got & 0x1, '%s::%s FunctionFlags %#x' % (os.path.basename(b), fn, got)
+    assert run_as([final], 'Ask', {}, V=2) == 30
+    assert run_as([leaf, base], 'Ask', {}, V=2) == 40
+
+
+func_own_iface_final()
+print('ok  FuncOwnIfaceFinal: an implementation of an interface a final class lists keeps the interface function\'s '
+      'contract, not Final')
 
 
 def func_template_call():

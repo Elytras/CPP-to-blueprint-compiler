@@ -1337,8 +1337,17 @@ private:
     /* The class above R, cooked by this source, whose Method implements R's interface function of that name in C++:
        the nearest declaration from R's parent up, unless it is a native class's or `= 0`. Null when none. */
     const FRecord* InheritedImplementation(const FRecord& R, const std::string& Method) const;
-    /* Why no forwarder can call A's Method (static, a multicast, an unnamed parameter), or empty. */
-    std::string WhyNotForwarded(const FRecord& A, const std::string& Method) const;
+    /* Why no forwarder can call A's Method for the interface function IfaceDecl declares (static, a multicast, final,
+       of another signature), or empty. */
+    std::string WhyNotForwarded(const FRecord& A, const std::string& Method, const Json& IfaceDecl) const;
+    /* What ParentClass->FindFunctionByName finds of Method above R, walked as FindEvent walks for a super: the class
+       holding it and whether it is a static; {nullptr, false} for nothing. */
+    std::pair<const FRecord*, bool> FoundAbove(const FRecord& R, const std::string& Method) const;
+    /* Each file of the mod's own holding `UE_FINAL_AS(Base, Leaf)` (last name segments compared), as whether it is a
+       header a source of Owner's (the mod package that cooks the base) includes: the compiled source and what it
+       includes by a quoted path beside it, transitively, UeApi headers left out. Empty when the macro is written
+       nowhere these reach. */
+    std::vector<bool> FinalAsSites(const std::string& Base, const std::string& Leaf, const std::string& Owner) const;
     bool IsMulticast(const FRecord& R, const std::string& Method) const;
     /* A constant outside any function body, `constexpr int32 kMax = 40;` at namespace scope or static in a class, and an
        inline class variable, `static inline const TArray<FName> Tags = {...};`: decl id -> its VarDecl. It has no
@@ -1670,6 +1679,7 @@ private:
     std::string ModPackage;
     std::optional<std::string> ApiDir;      // `--api`: where the uncooked editor-side stubs go
     std::string SourceDir;      // the compiled .cpp's folder: what __EmbedFile__ resolves a relative path against
+    std::string SourceFile;     // the compiled .cpp itself, absolute: FinalAsSites follows its includes
     /* The UeApi folder when genueapi wrote it without --game (Version.json "game": false), else empty: it then lists
        no game Blueprint's default subobjects or tail, so Generate refuses a class deriving from one. */
     std::string UeApiWithoutGame;
@@ -2529,6 +2539,39 @@ bool FCompiler::Collect(std::string* Err)
         const FRecord* Base = Leaf.Base.empty() ? nullptr : Find(Leaf.Base);
         if (!Base || Base->UePackage.compare(0, 8, "/Script/") == 0 || !Leaf.bFinal)
         { *Err = "UE_FINAL_AS(" + Leaf.Base + ", " + Leaf.CppName + "): the base must be a Blueprint class, a mod's"; return false; }
+        /* A base this source does not cook stays as its owner cooks it: its functions not Final, its other subclasses
+           kept, while the calls this mod makes to them would be bound as final, skipping their overrides. A game
+           Blueprint, or a class pinned to a path its name does not give, has no mod to say otherwise: refused. Another
+           mod's class pinned to its owner (a header mods share) is final only where that owner sees the macro too, in
+           the header declaring it; written anywhere else, the leaf pinned beside the base below is one its owner never
+           cooks. */
+        const std::string Natural = PathIn("", Base->CppName);
+        const bool bCookedHere = Base->UePackage.empty() || Base->UePackage == PathIn(ModPackage, Base->CppName);
+        const bool bOwnerPinned = Base->UePackage.size() > Natural.size()
+                                  && Base->UePackage.compare(Base->UePackage.size() - Natural.size(), Natural.size(), Natural) == 0;
+        if (!bCookedHere && !bOwnerPinned)
+        {
+            const std::string B = LeafOf(Base->CppName);
+            *Err = "UE_FINAL_AS(" + Leaf.Base + ", " + Leaf.CppName + "): " + B
+                 + (Base->UeName == B ? " is the game's Blueprint (" + Base->UePackage + "), which no mod cooks"
+                                      : " is cooked at " + Base->UePackage + ", not by this mod")
+                 + ": it stays as it is cooked there, its functions not final and its other subclasses kept, so calls "
+                   "bound to them as final would skip their overrides; derive " + LeafOf(Leaf.CppName) + " from it as a "
+                   "plain class";
+            return false;
+        }
+        if (!bCookedHere)
+            if (const std::vector<bool> Sites = FinalAsSites(LeafOf(Base->CppName), LeafOf(Leaf.CppName),
+                                                             Base->UePackage.substr(0, Base->UePackage.size() - Natural.size()));
+                !Sites.empty() && std::none_of(Sites.begin(), Sites.end(), [](bool bShared) { return bShared; }))
+            {
+                *Err = "UE_FINAL_AS(" + Leaf.Base + ", " + Leaf.CppName + "): " + LeafOf(Base->CppName) + " is another "
+                       "mod's class (UE_CLASS \"" + Base->UePackage + "\"), and only the UE_FINAL_AS in the header that "
+                       "declares it, which a source of that mod beside it includes too, makes the leaf that mod cooks; a "
+                       "header of this mod's own is not it; move it there, beside " + LeafOf(Base->CppName) + ", or derive "
+                     + LeafOf(Leaf.CppName) + " from it as a plain class";
+                return false;
+            }
         /* The leaf brings no method of its own, so a `= 0` one left above it makes the one class made abstract too
            (IsAbstract): nothing could be spawned, and the base's calls would be bound to the method's empty stub. */
         if (const auto [Owner, Method] = PureMethod(Leaf); Owner)
@@ -2541,9 +2584,7 @@ bool FCompiler::Collect(std::string* Err)
            leaf, beside it: unpinned, every mod that includes the header would cook a leaf of its own, which no leaf
            object is, so its casts to the leaf would fail. The owner is the base's path less the folders its C++ name
            gives it; a base pinned elsewhere, as a game Blueprint is, leaves the leaf where it was. */
-        const std::string Natural = PathIn("", Base->CppName);
-        if (Leaf.UePackage.empty() && Base->UePackage.size() > Natural.size()
-            && Base->UePackage.compare(Base->UePackage.size() - Natural.size(), Natural.size(), Natural) == 0)
+        if (Leaf.UePackage.empty() && bOwnerPinned)
         {
             Leaf.UePackage = PathIn(Base->UePackage.substr(0, Base->UePackage.size() - Natural.size()), Leaf.CppName);
             Leaf.UeName = LeafOf(Leaf.CppName) + "_C";
@@ -2656,8 +2697,11 @@ FIndex FCompiler::FindEvent(FBlueprintClass& BP, const std::string& FromRecord, 
            ParentClass->FindFunctionByName. What matters most is its net flags: an override of an RPC is that RPC, and
            a mismatch "will trigger an assert in Link()" (KismetCompiler.cpp:2019). An inline method is no UFunction. */
         if (R != Self && !R->IsNative() && !R->bIsInterface)
-            if (auto M = R->Methods.find(Method); M != R->Methods.end() && !IsStaticDecl(*M->second) && !IsInlineMethod(*R, Method))
+            if (auto M = R->Methods.find(Method); M != R->Methods.end() && !IsInlineMethod(*R, Method))
             {
+                /* A static is found the same. Only a static of Self's own gets here over one (Generate refuses the rest),
+                   and it inherits nothing: no caller is split, every call to either being bound, so its flags are its own. */
+                if (IsStaticDecl(*M->second)) return bFlagsOnly ? Null() : BP.EngineFunction(PackageOf(*R), ClassOf(*R), UeMethod);
                 *InheritedFlags = ModMethodFlags(*R, Method, BP);
                 return bFlagsOnly ? Null() : BP.EngineFunction(PackageOf(*R), ClassOf(*R), UeMethod);
             }
@@ -5288,6 +5332,101 @@ const std::vector<std::string>& FCompiler::ModSources() const
         }
     }
     return SourceTexts;
+}
+
+/* The AST keeps no file of a declaration (DroppedAstKey), and the leaf UE_FINAL_AS declares is spelled in UeMeta.h, so
+   the text says where the macro was written: the compiled source and the files it includes by a quoted path that
+   resolves beside the including one (bpbuild's unity file includes each .cpp of a mod by its absolute path), read as
+   text. A UeApi header is generated and no mod's, so a path through a UeApi folder is not followed. A macro written
+   through another macro is not found; the caller then takes the compiler's old answer.
+   A site is the shared one when the owner sees it too: a header that a source of the owner's, beside it and outside
+   this compile, includes. A source is the owner's when its UE_MOD_PACKAGE is Owner, or when it has none and every
+   UE_MOD_PACKAGE written in its folder's sources is Owner (a mod of several sources, its package in one of them). A
+   header of this mod's own that re-declares the base, the same text, is no such header: the owner never cooks the
+   leaf that one declares. */
+std::vector<bool> FCompiler::FinalAsSites(const std::string& Base, const std::string& Leaf, const std::string& Owner) const
+{
+    namespace fs = std::filesystem;
+    auto IsIdent = [](char C) { return isalnum(uint8(C)) || C == '_'; };
+    auto LastOf = [&](const std::string& S) {
+        size_t End = S.size();
+        while (End > 0 && !IsIdent(S[End - 1])) --End;
+        size_t Begin = End;
+        while (Begin > 0 && IsIdent(S[Begin - 1])) --Begin;
+        return S.substr(Begin, End - Begin);
+    };
+    auto Canonical = [](const fs::path& P) { std::error_code Ec; return fs::weakly_canonical(P, Ec).string(); };
+    /* The files Root reaches by quoted includes, Root among them, by canonical path. */
+    auto Reach = [&](const fs::path& Root) {
+        std::map<std::string, std::pair<fs::path, std::string>> Reached;
+        for (std::vector<fs::path> Todo{ Root }; !Todo.empty();)
+        {
+            const fs::path File = Todo.back();
+            Todo.pop_back();
+            std::error_code Ec;
+            if (!fs::is_regular_file(File, Ec) || Reached.count(Canonical(File))) continue;
+            if (std::any_of(File.begin(), File.end(), [](const fs::path& Part) { return Part == "UeApi"; })) continue;
+            const std::string Text = ReadText(File.string());
+            for (size_t At = 0; (At = Text.find("#include", At)) != std::string::npos; At += 8)
+            {
+                const size_t Open = Text.find_first_of("\"<\n", At + 8);
+                if (Open == std::string::npos || Text[Open] != '"') continue;
+                const size_t Close = Text.find('"', Open + 1);
+                if (Close != std::string::npos) Todo.push_back(File.parent_path() / fs::path(Text.substr(Open + 1, Close - Open - 1)));
+            }
+            Reached[Canonical(File)] = { File, Text };
+        }
+        return Reached;
+    };
+    /* The path a source's UE_MOD_PACKAGE names, or empty. */
+    auto PackageIn = [&](const std::string& Text) {
+        for (size_t At = 0; (At = Text.find("UE_MOD_PACKAGE", At)) != std::string::npos; At += 14)
+        {
+            if ((At > 0 && IsIdent(Text[At - 1])) || (At + 14 < Text.size() && IsIdent(Text[At + 14]))) continue;
+            const size_t Open = Text.find_first_not_of(" \t", At + 14);
+            if (Open == std::string::npos || Text[Open] != '(') continue;
+            const size_t Quote = Text.find_first_not_of(" \t", Open + 1);
+            const size_t End = Quote == std::string::npos || Text[Quote] != '"' ? std::string::npos : Text.find('"', Quote + 1);
+            if (End != std::string::npos) return Text.substr(Quote + 1, End - Quote - 1);
+        }
+        return std::string();
+    };
+    const auto Unit = Reach(fs::path(SourceFile));
+    auto SharedByOwner = [&](const fs::path& Header) {
+        std::error_code Ec;
+        std::vector<std::pair<fs::path, std::string>> Sources;      // the .cpp files beside it, outside this compile
+        std::set<std::string> Packages;
+        for (const auto& E : fs::directory_iterator(Header.parent_path(), Ec))
+            if (E.is_regular_file(Ec) && E.path().extension() == ".cpp" && !Unit.count(Canonical(E.path())))
+            {
+                Sources.emplace_back(E.path(), PackageIn(ReadText(E.path().string())));
+                if (!Sources.back().second.empty()) Packages.insert(Sources.back().second);
+            }
+        const bool bOwnersFolder = Packages.size() == 1 && *Packages.begin() == Owner;
+        const std::string Want = Canonical(Header);
+        return std::any_of(Sources.begin(), Sources.end(), [&](const auto& S) {
+            return (S.second == Owner || (S.second.empty() && bOwnersFolder)) && Reach(S.first).count(Want);
+        });
+    };
+    std::vector<bool> Sites;
+    for (const auto& [Key, Entry] : Unit)
+    {
+        const auto& [File, Text] = Entry;
+        bool bHere = false;
+        for (size_t At = 0; !bHere && (At = Text.find("UE_FINAL_AS", At)) != std::string::npos; At += 11)
+        {
+            if ((At > 0 && IsIdent(Text[At - 1])) || (At + 11 < Text.size() && IsIdent(Text[At + 11]))) continue;
+            const size_t Open = Text.find_first_not_of(" \t", At + 11);
+            if (Open == std::string::npos || Text[Open] != '(') continue;
+            const size_t Comma = Text.find(',', Open), Close = Text.find(')', Open);
+            if (Comma < Close && Close != std::string::npos)
+                bHere = LastOf(Text.substr(Open + 1, Comma - Open - 1)) == Base && LastOf(Text.substr(Comma + 1, Close - Comma - 1)) == Leaf;
+        }
+        if (!bHere) continue;
+        const std::string Ext = File.extension().string();
+        Sites.push_back((Ext == ".h" || Ext == ".hpp" || Ext == ".hh" || Ext == ".inl") && SharedByOwner(File));
+    }
+    return Sites;
 }
 
 /* The qualifier token is where a qualified DeclRefExpr's range begins; the JSON gives its byte offset and length but
@@ -8956,7 +9095,8 @@ bool FCompiler::IsFinalFunction(const FRecord& A, const std::string& Method) con
 {
     const auto M = A.Methods.find(Method);
     if (A.UePackage.compare(0, 8, "/Script/") == 0 || M == A.Methods.end() || IsStaticDecl(*M->second)
-        || IsInlineMethod(A, Method) || !(A.bFinal || !A.FinalAs.empty() || A.FinalMethods.count(Method)))
+        || IsInlineMethod(A, Method) || !(A.bFinal || !A.FinalAs.empty() || A.FinalMethods.count(Method))
+        || ModInterfaceWith(A, Method))        // it implements a mod interface A lists: not Final (Generate)
         return false;
     for (const FRecord* R = &A; R; R = R->Base.empty() ? nullptr : Find(R->Base))
     {
@@ -9119,12 +9259,7 @@ void FCompiler::SynthesizeForwarders()
                 }
             }
             if (!Nearest || (!bNoOpt && CopyableDef(*R, Method)) || IsMulticast(*R, Method)) return;
-            const Json& NearDecl = *Nearest->Methods.at(Method);
-            const auto NearDef = Nearest->MethodDefs.find(Method);
-            bool bNamed = true;
-            ForEach(NearDef != Nearest->MethodDefs.end() ? *NearDef->second : NearDecl,
-                    [&](const Json& P) { bNamed = bNamed && (Kind(P) != "ParmVarDecl" || !Name(P).empty()); });
-            if (bNamed && NamesQualified(*Callee, Written, *R, Method)) Wanted[Method] = Nearest;
+            if (NamesQualified(*Callee, Written, *R, Method)) Wanted[Method] = Nearest;
         };
         for (const auto& [Method, Decl] : W.Methods)
         {
@@ -9159,13 +9294,15 @@ void FCompiler::SynthesizeForwarders()
                 {
                     const std::string& Method = Entry.first;
                     if (Method == "StaticClass" || W.Methods.count(Method) || Wanted.count(Method)) continue;
-                    if (const FRecord* A = InheritedImplementation(W, Method); A && WhyNotForwarded(*A, Method).empty())
+                    if (const FRecord* A = InheritedImplementation(W, Method); A && WhyNotForwarded(*A, Method, *Entry.second).empty())
                         Wanted[Method] = A;
                 }
 
         /* The forwarder as clang would write it: the nearest declaration's type and parameters (its definition's names),
            and a body of one call on this, each parameter passed as itself (a reference one as the place it names). The
-           call is marked `forwards`, which LowerCall reads as a qualified call (it has no source range to read). */
+           call is marked `forwards`, which LowerCall reads as a qualified call (it has no source range to read). A
+           parameter the definition leaves unnamed is named P<its index>, `_` added while another parameter has that
+           name, as the editor's override names every pin; the parent's own function keeps its unnamed one. */
         for (const auto& [Method, Nearest] : Wanted)
         {
             const Json& NearDecl = *Nearest->Methods.at(Method);
@@ -9186,12 +9323,20 @@ void FCompiler::SynthesizeForwarders()
                              { "referencedMemberDecl", NearDecl.value("id", std::string()) },
                              { "inner", Json::array({ { { "kind", "CXXThisExpr" }, { "implicit", true },
                                                         { "type", { { "qualType", W.CppName + " *" } } } } }) } });
-            ForEach(NearDef != Nearest->MethodDefs.end() ? *NearDef->second : NearDecl, [&](const Json& P) {
+            const Json& Source = NearDef != Nearest->MethodDefs.end() ? *NearDef->second : NearDecl;
+            const std::vector<std::string> Given = ParmNames(Source);
+            size_t Index = 0;
+            ForEach(Source, [&](const Json& P) {
                 if (Kind(P) != "ParmVarDecl") return;
+                std::string PName = Name(P);
+                if (PName.empty())
+                    for (PName = "P" + std::to_string(Index); std::count(Given.begin(), Given.end(), PName);) PName += "_";
+                ++Index;
                 Json Parm = P;
-                Parm["id"] = Id + "/" + Name(P);
+                Parm["id"] = Id + "/" + PName;
+                Parm["name"] = PName;
                 Args.push_back({ { "kind", "DeclRefExpr" }, { "valueCategory", "lvalue" }, { "type", Referent(P["type"]) },
-                                 { "referencedDecl", { { "id", Parm["id"] }, { "kind", "ParmVarDecl" }, { "name", Name(P) },
+                                 { "referencedDecl", { { "id", Parm["id"] }, { "kind", "ParmVarDecl" }, { "name", PName },
                                                        { "type", P["type"] } } } });
                 Parms.push_back(std::move(Parm));
             });
@@ -9220,6 +9365,24 @@ void FCompiler::SynthesizeForwarders()
     }
 }
 
+std::pair<const FRecord*, bool> FCompiler::FoundAbove(const FRecord& R, const std::string& Method) const
+{
+    for (const FRecord* A = R.Base.empty() ? nullptr : Find(R.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
+    {
+        if (!A->IsNative() && !A->bIsInterface)
+        {
+            if (auto M = A->Methods.find(Method); M != A->Methods.end() && !IsInlineMethod(*A, Method))
+                return { A, IsStaticDecl(*M->second) };
+            if (!A->Methods.count(Method) && ModInterfaceWith(*A, Method)) return { A, false };     // its stub
+        }
+        if (A->IsNative() && A->Methods.count(Method) && !A->Forwards.count(Method))
+            return { A, IsStaticDecl(*A->Methods.at(Method)) };
+        for (const std::string& I : A->Interfaces)
+            if (const FRecord* IR = Find(I); IR && IR->IsNative() && IR->Methods.count(Method)) return { A, false };
+    }
+    return { nullptr, false };
+}
+
 const FRecord* FCompiler::InheritedImplementation(const FRecord& R, const std::string& Method) const
 {
     for (const FRecord* A = R.Base.empty() ? nullptr : Find(R.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
@@ -9228,16 +9391,18 @@ const FRecord* FCompiler::InheritedImplementation(const FRecord& R, const std::s
     return nullptr;
 }
 
-std::string FCompiler::WhyNotForwarded(const FRecord& A, const std::string& Method) const
+/* A parameter with no name is passed on all the same: the forwarder names it (SynthesizeForwarders). A final function
+   or one of another signature is no function an override of the interface's can be: Generate refuses any function of
+   a final one's name below it, and callers through the interface pass the interface function's parameters. */
+std::string FCompiler::WhyNotForwarded(const FRecord& A, const std::string& Method, const Json& IfaceDecl) const
 {
     const Json& Decl = *A.Methods.at(Method);
     if (IsStaticDecl(Decl)) return "static";
     if (IsMulticast(A, Method)) return "a multicast, which an override calling it would send twice on a server";
-    const auto Def = A.MethodDefs.find(Method);
-    bool bNamed = true;
-    ForEach(Def != A.MethodDefs.end() ? *Def->second : Decl,
-            [&](const Json& P) { bNamed = bNamed && (Kind(P) != "ParmVarDecl" || !Name(P).empty()); });
-    return bNamed ? std::string() : "declared with a parameter that has no name, which an override cannot pass on";
+    for (const FRecord* X = &A; X; X = X->Base.empty() ? nullptr : Find(X->Base))
+        if (X->FinalMethods.count(Method)) return "final";
+    if (SignatureOf(Decl) != SignatureOf(IfaceDecl)) return TypeOf(Decl);
+    return {};
 }
 
 /* A multicast wherever Method is declared from R up: a mod's marker, or a native or interface function's flags. */
@@ -11651,10 +11816,18 @@ bool FCompiler::LowerParams(const Json& M, const std::string& Fn, FBlueprintClas
 {
     CurrentOutParms.clear();
     bool bOk = true;
+    /* A parameter the source leaves unnamed is named P<its index>, `_` added while another has that name, as the
+       editor names every pin and SynthesizeForwarders names the override's: an empty name is None once loaded, and
+       two such parameters would share it. No body reads it, and callers fill parameters by order. */
+    const std::vector<std::string> Given = ParmNames(M);
+    size_t Index = 0;
     ForEach(M, [&](const Json& C) {
         if (Kind(C) != "ParmVarDecl" || !bOk) return;
         std::string Type = TypeOf(C);
-        const std::string PName = Name(C);
+        std::string PName = Name(C);
+        if (PName.empty())
+            for (PName = "P" + std::to_string(Index); std::count(Given.begin(), Given.end(), PName);) PName += "_";
+        ++Index;
         bool bOutParm = false;
         while (!Type.empty() && (Type.back() == '&' || Type.back() == ' ' || Type.back() == '\t'))
         {
@@ -14003,9 +14176,61 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                        "function of that name; rename this one";
                 return false;
             }
-        /* `= 0` with no body anywhere is an empty function, like an interface's stub below: a subclass's version needs
+        /* A function of a mod ancestor's name is an override of it to the editor, a static too: its super is
+           ParentClass->FindFunctionByName (KismetCompiler.cpp 1733-1774), and an override must agree with it on Static
+           ("Check flags: Exec, Final, Static", 1855-1868). C++ only hides the one above, so one that does not agree is
+           refused. A static over a static splits no caller - every call to either is bound - and keeps it as its super
+           (FindEvent). Another mod's class, from the header it shares, is a mod ancestor too: its declarations say
+           which of its functions are static. A native ancestor's is Generate's below: no function replaces one that is
+           no Blueprint event. */
+        if (const auto [A, bAboveStatic] = FoundAbove(R, Fn.Name);
+            A && A->UePackage.compare(0, 8, "/Script/") != 0 && bAboveStatic != IsStaticDecl(*Fn.Decl))
+        {
+            const FRecord* Listed = nullptr;
+            for (const std::string& I : R.Interfaces)
+                for (const FRecord* IR : InterfaceChain(Find(I)))
+                    if (!Listed && IR && IR->Methods.count(Fn.Name)) Listed = IR;
+            if (!bAboveStatic)
+                *Err = R.CppName + "::" + Fn.Name + " is static, and the " + A->CppName + "::" + Fn.Name + " it hides is not: "
+                       "the editor takes it for an override of that one, which a static cannot be (\"Check flags: Exec, "
+                       "Final, Static\"); rename this one";
+            else if (Listed)
+                *Err = R.CppName + " implements " + Listed->CppName + ", whose " + Fn.Name + " " + R.CppName + "::" + Fn.Name
+                     + " implements, and the " + A->CppName + "::" + Fn.Name + " it inherits is static: the editor takes "
+                       "such a function for an override of the static and refuses it (\"Check flags: Exec, Final, "
+                       "Static\"); rename " + A->CppName + "::" + Fn.Name;
+            else
+                *Err = R.CppName + "::" + Fn.Name + ": " + A->CppName + "::" + Fn.Name + " is static, and the editor takes "
+                       "a function of that name in a subclass for an override of it, which only a static can be (\"Check "
+                       "flags: Exec, Final, Static\"); rename this one";
+            return false;
+        }
+        /* A static over a static is C++ name hiding, which no Blueprint writes: the editor's entry naming the parent's
+           function, no BlueprintEvent, "cannot be overridden" (KismetCompiler.cpp 3312-3316). It splits no caller, so
+           it compiles with a warning, its super the one it hides as FindFunctionByName gives it; but a super of other
+           parameters is a link no editor makes (IsSignatureCompatibleWith, 1993-2011), so one of another signature is
+           refused. Only a function this class compiles counts: UE_CLASS's StaticClass is in every class, and no
+           UFunction.
+           `= 0` with no body anywhere is an empty function, like an interface's stub below: a subclass's version needs
            it as its super, and a call by name on an object without one would not find a function (a Fatal). */
-        if ((Fn.Body = BodyOf(R, Fn.Name, Fn.Def)) || Fn.Decl->value("pure", false)) Methods.push_back(Fn);
+        const bool bCompiled = (Fn.Body = BodyOf(R, Fn.Name, Fn.Def)) || Fn.Decl->value("pure", false);
+        if (const auto [A, bAboveStatic] = FoundAbove(R, Fn.Name); bCompiled && Fn.Name != "StaticClass"
+            && A && A->UePackage.compare(0, 8, "/Script/") != 0 && bAboveStatic && IsStaticDecl(*Fn.Decl))
+        {
+            const Json& Above = *A->Methods.at(Fn.Name);
+            if (SignatureOf(Above) != SignatureOf(*Fn.Decl))
+            {
+                *Err = R.CppName + "::" + Fn.Name + " is static and hides " + A->CppName + "::" + Fn.Name + ", a static of "
+                       "another signature, " + TypeOf(Above) + " against " + TypeOf(*Fn.Decl) + ": a Blueprint class has "
+                       "one function of a name, and the editor makes the parent's its super, which takes the same "
+                       "parameters; rename this one";
+                return false;
+            }
+            printf("  warning: %s::%s hides %s::%s, a static: compiled as C++ name hiding, each call running the one it "
+                   "names; the editor refuses a function named like its parent's (\"cannot be overridden\")\n",
+                   R.CppName.c_str(), Fn.Name.c_str(), A->CppName.c_str(), Fn.Name.c_str());
+        }
+        if (bCompiled) Methods.push_back(Fn);
     }
     /* The editor compiles every Blueprint-implementable function of an implemented interface, a stub
        where the Blueprint has none (KismetCompiler.cpp MergeUbergraphPagesIn, ConformImplementedInterfaces);
@@ -14021,15 +14246,23 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
        a stub would take over none of them; but the editor makes any function of its name in a subclass, the stub or
        one the source declares, an override of it (its super is ParentClass->FindFunctionByName, KismetCompiler.cpp
        1733-1774) and refuses one that is not static: "Check flags: Exec, Final, Static" (1855-1868). */
-    auto ReplacesInherited = [&](const std::string& I, const std::string& Fn) {
+    auto ReplacesInherited = [&](const std::string& I, const std::string& Fn, const Json& IfaceDecl) {
         const FRecord* A = InheritedImplementation(R, Fn);
-        const std::string Why = A ? WhyNotForwarded(*A, Fn) : std::string();
+        const std::string Why = A ? WhyNotForwarded(*A, Fn, IfaceDecl) : std::string();
         if (Why.empty()) return false;
         if (IsStaticDecl(*A->Methods.at(Fn)))
             *Err = R.CppName + " implements " + I + ", whose " + Fn + " needs a function of that name in " + R.CppName
                  + ", and the " + A->CppName + "::" + Fn + " it inherits is static: the editor takes such a function for "
                    "an override of the static and refuses it (\"Check flags: Exec, Final, Static\"); rename "
                  + A->CppName + "::" + Fn;
+        else if (Why == "final")
+            *Err = R.CppName + " implements " + I + ", whose " + Fn + " needs a function of that name in " + R.CppName
+                 + ", and the " + A->CppName + "::" + Fn + " it inherits is final, so no subclass may have one; rename "
+                 + A->CppName + "::" + Fn + ", or drop `final`";
+        else if (Why == TypeOf(*A->Methods.at(Fn)))
+            *Err = R.CppName + " implements " + I + ", whose " + Fn + " is " + TypeOf(IfaceDecl) + ", and the " + A->CppName
+                 + "::" + Fn + " it inherits is " + Why + ": a Blueprint class has one function of a name, and callers "
+                   "through " + I + " pass that one's parameters; rename " + A->CppName + "::" + Fn;
         else
             *Err = R.CppName + " implements " + I + ", and the " + A->CppName + "::" + Fn + " it inherits is " + Why
                  + ": no override can call it for " + I + ", and an empty one would replace it; declare " + R.CppName
@@ -14050,7 +14283,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             {
                 if (std::any_of(Methods.begin(), Methods.end(),
                                 [&](const FMethod& F) { return F.Name == M.first; })) continue;
-                if (ReplacesInherited(I, M.first)) return false;
+                if (ReplacesInherited(I, M.first, *M.second)) return false;
                 FMethod Fn{ M.first, M.second, M.second, nullptr };
                 Fn.Body = BodyOf(IR, M.first, Fn.Def);
                 Methods.push_back(Fn);
@@ -14069,7 +14302,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             auto Decl = IR.Methods.find(Name_);
             if (Decl == IR.Methods.end())
             { *Err = I + "::" + Name_ + " takes a type AssetGen cannot write yet, so " + R.CppName + " cannot implement " + I; return false; }
-            if (ReplacesInherited(I, Name_)) return false;
+            if (ReplacesInherited(I, Name_, *Decl->second)) return false;
             FMethod Fn{ Name_, Decl->second, Decl->second, nullptr };
             Fn.Body = BodyOf(IR, Name_, Fn.Def);
             Methods.push_back(Fn);
@@ -14371,12 +14604,43 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         if (Replaced && Replaced != &Decl && !R.bIsPatch && SignatureOf(*Replaced) != SignatureOf(Decl))     // a patch checks its own
         { *Err = R.CppName + "::" + Fn.Name + " is " + TypeOf(Decl) + ", and the " + Owner->CppName + "::" + Fn.Name
                  + " it replaces is " + TypeOf(*Replaced) + ": callers pass that one's parameters; declare the same"; return false; }
+        /* An implementation of an interface of the class's own list, its own function or the stub of one it leaves out,
+           whose name a mod ancestor's function has too, that one's own or the stub of another interface's it leaves
+           out: that one is its super (FindEvent), so it replaces both, and a caller of either lays out that one's
+           parameters. The editor refuses it: "Cannot override ... declared in a parent with a different signature"
+           (KismetCompiler.cpp 1993-2011). */
+        if (Replaced && Owner && Owner->bIsInterface && !R.bIsPatch)
+            if (const auto [A, bStatic] = FoundAbove(R, Fn.Name); A && A != Owner && !A->IsNative() && !bStatic)
+            {
+                const FRecord* AboveIface = A->Methods.count(Fn.Name) ? nullptr : ModInterfaceWith(*A, Fn.Name);
+                const Json* AboveDecl = AboveIface ? AboveIface->Methods.at(Fn.Name)
+                                      : A->Methods.count(Fn.Name) ? A->Methods.at(Fn.Name) : nullptr;     // else a native interface's
+                const Json& Above = AboveDecl ? *AboveDecl : Decl;
+                if (SignatureOf(Above) != SignatureOf(Decl))
+                {
+                    *Err = (Replaced == &Decl ? R.CppName + " implements " + Owner->CppName + ", whose " + Fn.Name + " is "
+                                                + TypeOf(Decl)
+                                              : R.CppName + "::" + Fn.Name + " implements " + Owner->CppName + "::" + Fn.Name
+                                                + ", " + TypeOf(*Replaced))
+                         + ", and replaces "
+                         + (AboveIface ? "the " + Fn.Name + " of " + AboveIface->CppName + ", " + TypeOf(Above) + ", that "
+                                         + A->CppName + " implements"
+                                       : "the " + A->CppName + "::" + Fn.Name + " it inherits, " + TypeOf(Above))
+                         + ": a Blueprint function has one signature, and callers of each pass that one's parameters; "
+                           "rename one of them";
+                    return false;
+                }
+            }
         uint32 Flags = Inherited ? Inherited & kOverrideInherits
                      : IsStaticDecl(Decl) ? uint32(FUNC_Static | FUNC_BlueprintCallable | FUNC_Public | FUNC_Final)
                      : kPlainMethodFlags;
         /* `final`, the class or the method: no subclass has a version of its own, and calls are bound to this one
-           (LowerCall). Without BlueprintEvent the editor offers no override either (CanKismetOverrideFunction). */
-        if (!Inherited && !IsStaticDecl(Decl) && (R.bFinal || !R.FinalAs.empty() || R.FinalMethods.count(Fn.Name)))
+           (LowerCall). Without BlueprintEvent the editor offers no override either (CanKismetOverrideFunction). An
+           implementation of a mod interface the class lists itself has no inherited flags (FindEvent: no super) and is
+           no new function: it keeps the contract of the interface's, BlueprintEvent and not Final (func_override_flags),
+           as in any class, and calls to it go by name (IsFinalFunction). */
+        if (!Inherited && !IsStaticDecl(Decl) && (R.bFinal || !R.FinalAs.empty() || R.FinalMethods.count(Fn.Name))
+            && !ModInterfaceWith(R, Fn.Name))
             Flags = (Flags & ~uint32(FUNC_BlueprintEvent)) | FUNC_Final;
         /* All 7229 BlueprintPure functions in the DRG dump are BlueprintCallable too. */
         /* Its own access specifier, where no parent decides. The editor refuses a call node it forbids; the VM checks
@@ -15332,7 +15596,8 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     ApiDir = InApiDir;
     std::error_code TmpEc;
     /* Absolute: a bare "Mod.cpp" has an empty parent, and NamedQualifier cannot list "". */
-    SourceDir = std::filesystem::absolute(SourcePath, TmpEc).parent_path().string();
+    SourceFile = std::filesystem::absolute(SourcePath, TmpEc).string();
+    SourceDir = std::filesystem::path(SourceFile).parent_path().string();
     /* First we check what wrote the UeApi: one older than this compiler compiles without a word wrong (one made before
        UeDefaultSubobjects orders a game Blueprint's child after none of its parent's subobjects), and the merge of a
        genueapi change carries the tracked Types.json but not the ignored headers. genueapi writes Version.json last, so

@@ -251,8 +251,8 @@ starts private.
 | `class Helper { ... };` | A class with no base is plain C++. Nothing is cooked for it. | Yes |
 | `class X : public ANotIncluded {};` | Refused by clang, "expected class name", when no included header declares the base. Include the SDK header that declares it. | Refused |
 | `class InitCave : public Hello {};` | A child of another class of the mod. A parent in the same source is used from there. A parent pinned with `UE_CLASS` to another mod is imported from that mod. | Yes |
-| `class Turret final : public AActor { ... };` | A class with no subclass. Its functions, overrides aside, are cooked Final, which the editor does not let a Blueprint override, and a call to one of them reaches that function directly instead of by name; on `this` the body is usually copied in. See [Calling your own functions](#calling-your-own-functions). | Yes |
-| `UE_FINAL_AS(UTurretBase, Turret);` at namespace scope, after UTurretBase | Final through one leaf: declares `class Turret final : public UTurretBase {}`, the class that is made, in the namespace it is written in (its package path, as for any class). UTurretBase's own code is then compiled as if it were final: its own functions, overrides aside, are cooked Final, and its calls on `this` to them are direct and usually copied in. A call to one of its overrides, or to a function it inherits, goes by name, as the editor calls a function that is not Final; with Turret the only class made, it reaches the same function. UTurretBase is cooked Abstract, and any other class deriving from it is refused, so put the macro in the header beside UTurretBase: a mod that includes the header is refused a subclass too. When UTurretBase has a `UE_CLASS` (a header mods share), Turret is pinned beside it, so only the mod that owns UTurretBase cooks Turret and every other mod imports it, and a second UE_FINAL_AS on the same base is refused ("has two UE_FINAL_AS leaves"). A base left with a `= 0` method is refused ("would be abstract"): Turret brings no method of its own, so it would be abstract too and nothing could be made. | Yes |
+| `class Turret final : public AActor { ... };` | A class with no subclass. Its functions, overrides and interface implementations aside, are cooked Final, which the editor does not let a Blueprint override, and a call to one of them reaches that function directly instead of by name; on `this` the body is usually copied in. See [Calling your own functions](#calling-your-own-functions). | Yes |
+| `UE_FINAL_AS(UTurretBase, Turret);` at namespace scope, after UTurretBase | Final through one leaf: declares `class Turret final : public UTurretBase {}`, the class that is made, in the namespace it is written in (its package path, as for any class). UTurretBase's own code is then compiled as if it were final: its own functions, overrides and interface implementations aside, are cooked Final, and its calls on `this` to them are direct and usually copied in. A call to one of its overrides, or to a function it inherits, goes by name, as the editor calls a function that is not Final; with Turret the only class made, it reaches the same function. UTurretBase is cooked Abstract, and any other class deriving from it is refused, so put the macro in the header beside UTurretBase: a mod that includes the header is refused a subclass too. When UTurretBase has a `UE_CLASS` (a header mods share), Turret is pinned beside it, so only the mod that owns UTurretBase cooks Turret and every other mod imports it, and a second UE_FINAL_AS on the same base is refused ("has two UE_FINAL_AS leaves"). Such a base is final only through the UE_FINAL_AS in the header that declares it, which its owner sees too: one written in another mod's own source, its `.cpp` or a header of its own that re-declares the base, is refused ("only the UE_FINAL_AS in the header that declares it ..."), since its owner would never cook that leaf. The header counts as the owner's when a source beside it includes it whose `UE_MOD_PACKAGE` is the owner's, or that has none in a folder whose only `UE_MOD_PACKAGE` is the owner's (a mod of several sources). A game Blueprint base is refused ("is the game's Blueprint ..."): no mod cooks it, so it stays as the game has it. A base left with a `= 0` method is refused ("would be abstract"): Turret brings no method of its own, so it would be abstract too and nothing could be made. | Yes |
 | `class WPN_GrapplingGun_Long : public WPN_GrapplingGun_C` | A child of one of the game's Blueprint classes. Include the parent's `UeApi/Game/` header and derive from it; the parent is imported from the game. Put the child in the parent's `Game::` namespace to cook it beside the parent (see [Mod sources and packages](#mod-sources-and-packages)). The child loads after every default subobject the parent's default object exports, which UeApi lists only when genueapi had `--game`: against a UeApi made without it, the class is refused, saying to regenerate with `--game`. | Yes |
 
 Notes:
@@ -1984,6 +1984,7 @@ written inside the class does not make a method inline. Only the `inline` keywor
 |---|---|---|
 | `int32 AddCharges(int32 By) { ... }` | A Blueprint function, Public and BlueprintCallable. An editor Blueprint can call it, and an editor subclass can override it. | Yes |
 | `void Refill(int32 Amount);` and `void AMyActor::Refill(...) { ... }` | The same function, defined outside the class or in a `.cpp` beside the header. The definition gives the body and parameters; the declaration gives `static` and the access. | Yes |
+| `int32 Pick(int32, int32 B)` | A parameter left unnamed is cooked as `P<its index>` (`P0` here; `_` is added while another parameter has that name), as the editor names every pin. Callers pass it in its place. | Yes |
 | `int32 GetCharges() const` | A const Blueprint function, as a UFUNCTION declared const would be. | Yes |
 | `UE_PURE int32 Doubled() const` | A pure function: the editor draws it as a node without exec pins. Each C++ call runs once, where it is written. An editor pure node, by contrast, runs again for each use. | Yes |
 | `UE_PURE static int32 Clamp01(int32 V)` | A pure static function. | Yes |
@@ -2031,7 +2032,7 @@ Notes:
 | `Peer->Bump(1)` | Runs on that object and reaches the most derived version for its class. | Yes |
 | `Fact(V - 1)` inside `Fact` | Recursion. Each call gets its own frame, as a recursive Blueprint function does. Mutual recursion works the same way. | Yes |
 | `Other->Twice(3)` where `Twice` is inline | Refused; see the inline table below. | Not yet |
-| `Bump(By)` in a `final` class, or to a `final` method | Reaches that one function directly, the editor's call to a function no Blueprint can override, instead of by name. The body is copied into the caller, as an inline function's is, and the function is still cooked for every other caller: the editor, delegates, timers, other mods. A function the final class inherits, or overrides, is not cooked Final (an override takes its parent's flags), so a call to one whose body is not copied in (authority-only, an RPC, `noinline`) stays a call by name, as the editor's is; with no subclass, the name finds that one function. | Yes |
+| `Bump(By)` in a `final` class, or to a `final` method | Reaches that one function directly, the editor's call to a function no Blueprint can override, instead of by name. The body is copied into the caller, as an inline function's is, and the function is still cooked for every other caller: the editor, delegates, timers, other mods. A function the final class inherits, overrides, or implements for an interface it lists is not cooked Final (an override takes its parent's flags, an implementation keeps the interface function's BlueprintEvent), so a call to one whose body is not copied in (authority-only, an RPC, `noinline`) stays a call by name, as the editor's is; with no subclass, the name finds that one function. | Yes |
 | `Twice(V)`, a static of a class this source cooks | Its body is copied in the same way. | Yes |
 | `Peer->Bump(1)` in a `final` class | Direct, but not copied in: the body would need Peer as its `this`. | Yes |
 | `[[gnu::noinline]] int32 Kept(int32 V)` | Calls to Kept stay calls, wherever they could be copied in. | Yes |
@@ -2166,6 +2167,9 @@ Notes:
 | `static APawn *FirstPawn(UObject *WorldContextObject = nullptr)` | The first parameter whose name starts with `WorldContext` is what every engine call inside the static receives as its world context, as the editor wires the hidden pin. A caller that leaves it out passes its own `this`, or its own world context when the caller is itself such a static. | Yes |
 | `class MyLib : public UBlueprintFunctionLibrary` holding statics | The editor's Blueprint Function Library. Another mod that includes its header calls the statics like an engine library's: a final call on the library's default object, with a world context left out filled with the caller's `this`. | Yes |
 | A static that calls Delay or UE_AWAIT | Refused: `a static function has no object whose ubergraph frame could keep its locals`; see [Latent calls](#latent-calls). | Refused |
+| `static int32 Tell(int32 V)` in a class whose mod parent has a static `Tell` too | Hides the parent's, as in C++, with a warning: "... hides Parent::Tell, a static: compiled as C++ name hiding ...". Every call to a static is bound to the one it names, so `Tell(V)` runs this one and `Parent::Tell(V)` the parent's. It is cooked with the parent's static as its super, as the editor links any function named like a parent's; the editor itself would refuse the name ("cannot be overridden"). | Warns |
+| `static float Tell(float V)` over a mod parent's `static int32 Tell(int32)` | Refused: "... is static and hides Parent::Tell, a static of another signature, ...". Its super would be the parent's static, a function of other parameters, which no editor links. Rename this one. | Refused |
+| A method that is not static named like a mod parent's static, or a static named like a parent's method | Refused: "... is static, and the editor takes a function of that name in a subclass for an override of it ..." or "... is static, and the Parent::Tell it hides is not ...". The editor makes a function named like a parent's an override of it, and an override must agree with it on Static. The parent may be another mod's class, from the header it shares. Rename one of them. | Refused |
 
 ```cpp
 static int32 Twice(int32 V) { return V * 2; }
@@ -2497,8 +2501,9 @@ Notes:
 - An inline body, a member template's too, is copied into each class that calls it, and `Base::Method()` in it is
   judged from that class, as if written there: a class with its own Method makes the parent call, and one without gets
   the added override. A plain `Method()` in it stays a call by name from every such class.
-- No override is added where the nearest parent's declaration of the method has a parameter with no name, or is
-  inline, static or pure virtual: such a call whose body cannot be copied in goes by name, with the warning.
+- No override is added where the nearest parent's declaration of the method is inline, static or pure virtual: such a
+  call whose body cannot be copied in goes by name, with the warning. A parameter the parent leaves unnamed is named
+  in the added override (`P0`, `P1`, ... by position) and passed on.
 - A parent this source cooks has its body copied in, as a `final` method's is (see
   [Calling your own functions](#calling-your-own-functions)). An override of an engine event, such as
   ReceiveBeginPlay above, stays a call.
@@ -4031,8 +4036,12 @@ Notes:
 | `float GetCurveValue(FName CurveName) const { return 0.5f; }` | An implementation is an ordinary method, matched to the interface function by name. Only functions the interface marks BlueprintNativeEvent or BlueprintImplementableEvent can be implemented; AssetGen checks this against the SDK's Events.json. | Yes |
 | A function left out | Gets an empty stub, as the editor compiles one. The stub returns the zero value (0, false, None, null) and leaves out-parameters unchanged. | Yes |
 | A function left out that a parent this source cooks already has, without listing the interface | The parent's function implements it, as in C++: AssetGen adds an override of it that only calls the parent's (or expands it, if inline), the editor's override with a parent call, so calls through the interface and by name run the parent's body. An empty stub would replace it for every caller, and with no function at all a call would find the interface's own empty one first. | Yes |
-| The same, where the parent's function is a multicast, or has a parameter with no name | Refused: "... no override can call it for ITrigger, and an empty one would replace it; declare Pistol::Pull". An override would send a multicast twice on a server, and cannot pass on an unnamed parameter. | Refused |
-| The same, where the parent's function is static | Refused: "... is static: the editor takes such a function for an override of the static and refuses it ...; rename Rifle::Pull". A static implements no interface function, but the editor makes any function of its name in a subclass an override of it, and an override of a static must be static. | Refused |
+| The same, where the parent's function has a parameter with no name | The added override names it (`P0`, `P1`, ... by position) and passes it on, as the editor's override names every pin. | Yes |
+| The same, where the parent's function is a multicast | Refused: "... no override can call it for ITrigger, and an empty one would replace it; declare Pistol::Pull". An override would send a multicast twice on a server. | Refused |
+| The same, where the parent's function is `final`, or has another signature than the interface's | Refused: "Pistol implements ITrigger, whose Pull needs a function of that name in Pistol, and the Rifle::Pull it inherits is final ..." or "... whose Pull is int32 (int32), and the Rifle::Pull it inherits is float (float): a Blueprint class has one function of a name ...". No function of a final one's name may follow it, and callers through the interface pass the interface's parameters. Rename one of them. | Refused |
+| `int32 Pull(int32 N)` implementing ITrigger, where a parent has `float Pull(float)` | Refused: "Pistol::Pull implements ITrigger::Pull, int32 (int32), and replaces the Rifle::Pull it inherits, float (float) ...". A Blueprint function overrides the parent's of its name too, so it would have two signatures. Rename one of them. | Refused |
+| The same, where the parent has no `Pull` but implements another interface, IAim, whose `Pull` is `float Pull(float)`, and leaves it out; or the class leaves ITrigger's `Pull` out too | Refused: "Pistol::Pull implements ITrigger::Pull, int32 (int32), and replaces the Pull of IAim, float (float), that Rifle implements ..." or "Pistol implements ITrigger, whose Pull is int32 (int32), and replaces the Pull of IAim ...". The parent's stub for IAim is a function of that name, and the editor refuses an override of another signature ("Cannot override ... declared in a parent with a different signature"). Rename one of the interface functions. | Refused |
+| The same, where the parent's function is static, or the class declares its own `Pull` beside the parent's static | Refused: "... is static: the editor takes such a function for an override of the static and refuses it ...; rename Rifle::Pull". A static implements no interface function, but the editor makes any function of its name in a subclass an override of it, and an override of a static must be static. | Refused |
 | An implementation that returns a value, is `const`, or has out-parameters | Compiled as a function, where the editor would make a function graph rather than an event. It takes the interface function's flags, so callers through the interface find it. A void event such as ShowDamageEffects is compiled as a function too. | Yes |
 | `class Pistol : public Weapons::Rifle` | A subclass implements the interface through its parent without listing it. Redefining an interface function is an ordinary override, and `Weapons::Rifle::Pull(Times)` calls the parent's. | Yes |
 | `class NativeOnly : public AActor, public IHealth` | Refused: "IHealth::GetHealth is native only ..., so a Blueprint cannot implement IHealth". The editor refuses the same. Calling IHealth through `TScriptInterface<IHealth>` on the game's objects still works. | Refused |
@@ -5699,9 +5708,9 @@ and where the feature is described. In each group, the messages you are most lik
   overrides <Method> runs that override; to run <Base>'s alone, call it from an override of <Method> in <Class>`:
   a qualified call to a method its class does not declare and whose body cannot be copied in (authority-only,
   cosmetic, an RPC, `noinline`, one that waits), where AssetGen cannot add the override itself: the call is in an
-  inline method, or the nearest parent's declaration of the method has a parameter with no name, or is inline,
-  static or pure virtual. Elsewhere AssetGen adds the override and prints nothing. Fix: move the call into a method
-  that is not inline, name the parameter, or declare the method in the class, calling
+  inline method, or the nearest parent's declaration of the method is inline, static or pure virtual. Elsewhere
+  AssetGen adds the override and prints nothing. Fix: move the call into a method that is not inline, or declare the
+  method in the class, calling
   `<Base>::<Method>()`; the qualified call then runs Base's function alone. See
   [Calling the parent](#calling-the-parent).
 - `warning: <Class>::<Function>: <Base>::<Method>() is a call by name, which on an object of a subclass that
@@ -5738,11 +5747,36 @@ and where the feature is described. In each group, the messages you are most lik
   or drop UE_FINAL_AS and declare the base's subclasses yourself.
 - `UE_FINAL_AS(<Base>, <Leaf>): the base must be a Blueprint class, a mod's`: the base is an engine (`/Script/`)
   class, whose code is not compiled here. Fix: derive the leaf from it with plain `class Leaf final : public Base`.
+- `UE_FINAL_AS(<Base>, <Leaf>): <Base> is the game's Blueprint (<path>), which no mod cooks: it stays as it is cooked
+  there, ...; derive <Leaf> from it as a plain class`: the base is a game Blueprint (or a class pinned to a path its
+  name does not give, "is cooked at <path>, not by this mod"). Its functions stay non-final and its other subclasses
+  stay, so this mod's calls bound to them as final would skip their overrides. Fix: `class Leaf : public Base`.
+- `UE_FINAL_AS(<Base>, <Leaf>): <Base> is another mod's class (UE_CLASS "<path>"), and only the UE_FINAL_AS in the
+  header that declares it, which a source of that mod beside it includes too, makes the leaf that mod cooks; ...`:
+  the macro is written in this mod's own source, its `.cpp` or a header of its own that re-declares the base, not in
+  the shared header beside the base, the one a source of the owner's (its `UE_MOD_PACKAGE`, or the only one in its
+  folder) includes. The leaf is pinned beside the base and imported, and its owner, which never sees this macro, never
+  cooks it. Fix: move the macro into that header, or derive the leaf plainly. AssetGen finds where the macro is written by reading the source and the files it includes by a quoted
+  path; a macro written through another macro is not found and is accepted as before.
 - `<Class>::<Method>: <Base>::<Method> is final, so no subclass may have a function of that name; rename this one`: a
   subclass declares a method with the name of an ancestor's `final` one and other parameters, `int32 Step(int32 By)`
   under `virtual int32 Step() final`. C++ lets it hide the parent's, but a Blueprint finds functions by name, and the
   same parameters are already refused by clang. Fix: rename the subclass's method, or drop `final`. See
   [Functions](#functions).
+- `<Class>::<Method>: <Base>::<Method> is static, and the editor takes a function of that name in a subclass for an
+  override of it, which only a static can be ("Check flags: Exec, Final, Static"); rename this one`: a method that is
+  not static has the name of an ancestor's static. C++ lets it hide the static, but the editor links a function named
+  like a parent's as an override of it and refuses one that does not agree on Static. Fix: rename one of them, or make
+  this one static too. See [Static functions and function libraries](#static-functions-and-function-libraries).
+- `<Class>::<Method> is static, and the <Base>::<Method> it hides is not: ...; rename this one`: the same the other way
+  round, a static named like an ancestor's method. Fix: rename one of them.
+- `<Class>::<Method> is static and hides <Base>::<Method>, a static of another signature, ...; rename this one`: a
+  static named like an ancestor's static that takes other parameters. Its super would be that static, a function of
+  other parameters, which the editor never links. Fix: rename one of them, or give both the same signature (that
+  compiles, with a warning).
+- `warning: <Class>::<Method> hides <Base>::<Method>, a static: compiled as C++ name hiding, ...`: a static named like
+  an ancestor's static of the same signature. Each call runs the one it names, as in C++; the editor would refuse the
+  name. Fix: rename one of them to make no Blueprint the editor could not.
 - `inline function <Class>::<Method> calls itself`: recursion through inline functions, direct or through another
   inline function. Each call copies the body in, so the copying never ends. One overload calling another is fine. Fix:
   drop `inline`, because a Blueprint function can call itself, or write a loop. See
