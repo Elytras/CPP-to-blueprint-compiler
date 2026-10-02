@@ -4949,6 +4949,48 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             Out.Base = std::make_shared<FArgIR>();
             return LowerArg(*Lhs, BP, *Out.Base, Err);
         }
+        std::string SetElem;
+        if ((OpName == "operator+" || OpName == "operator-" || OpName == "operator&") && Lhs && Rhs
+            && TemplateArg(StripTypeKeywords(TypeOf(*Lhs)), "TSet", &SetElem))
+        {
+            /* `A + B`, `A - B`, `A & B` on sets: Set_Union / Set_Difference / Set_Intersection into a temp, which is the
+               value. Each empties Result first (BlueprintSetLibrary.cpp 162-186), so a temp reused round a loop
+               starts clean. */
+            const char* Fn = OpName == "operator+" ? "Set_Union" : OpName == "operator-" ? "Set_Difference"
+                                                                                         : "Set_Intersection";
+            std::string Type = TypeOf(*N);
+            while (!Type.empty() && (Type.back() == '&' || Type.back() == ' ')) Type.pop_back();
+            Type = StripTypeKeywords(Type);
+            FArgIR A, B;
+            if (!LowerArg(*Lhs, BP, A, Err) || !LowerArg(*Rhs, BP, B, Err)) return false;
+            if (!IsContainerVariable(A) || !IsContainerVariable(B))
+            { *Err = std::string("set `") + OpName.substr(8) + "` needs set variables, not computed values"; return false; }
+            const std::string Tmp = "__SetOp" + std::to_string(ReadTmpCounter++) + "__";
+            FPropertyDef PD;
+            if (!TypeToProperty(Type, Tmp, 0, "a set operation's result", BP, &PD, Err)) return false;
+            PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+            CurLocals->push_back(PD);
+            FArgIR Into;
+            Into.K = FArgIR::Local;
+            Into.S = Tmp;
+            auto Body = std::make_shared<std::vector<FStmtIR>>(1);
+            (*Body)[0].K = FStmtIR::StaticCall;
+            (*Body)[0].Call.Fn = BP.EngineFunction("/Script/Engine", "BlueprintSetLibrary", Fn);
+            (*Body)[0].Call.WrittenArgs = ContainerWrites(Fn);
+            (*Body)[0].Call.bOnArg0 = true;
+            (*Body)[0].Call.Args = { A, B, Into };
+            auto Block = std::make_shared<std::vector<FStmtIR>>(1);
+            (*Block)[0].K = FStmtIR::Block;
+            (*Block)[0].Body = Body;
+            Out.K = FArgIR::Call;
+            Out.InnerType = Type;
+            Out.Sub = std::make_shared<FCallIR>();
+            Out.Sub->Intrinsic = "__Inline__";
+            Out.Sub->Inline = Block;
+            Out.Sub->InlineResult = Tmp;
+            Out.Sub->InlineType = Type;
+            return true;
+        }
         if (IsTMapElement(*N) && Rhs)
         {
             /* `Map[Key]` read: Map_Find into a temp, which it resets to the value type's default for a missing key

@@ -6390,6 +6390,20 @@ def out_array_reset():
     vmsem_holds(base, 'native_out_arrays_emptied')
 
 
+def set_operators():
+    """`A + B`, `A - B`, `A & B` on sets: Set_Union / Set_Difference / Set_Intersection into a temp. A temp reused
+    round a loop holds only this round's result, and one operator's temp feeds the next."""
+    base = asset('SetOperators')
+    sets = lambda: dict(A=[1, 2, 3], B=[2, 3, 4], C=[1, 4], Out=[9])
+    for fn, want in (('Union', [1, 2, 3, 4]), ('Inter', [2, 3]), ('Chain', [2, 3])):
+        mine = sets()
+        run(base, fn, self_vars=mine)
+        assert sorted(mine['Out']) == want, '%s leaves Out = %r, not %r' % (fn, mine['Out'], want)
+    mine = sets()
+    got = run(base, 'Diff', self_vars=mine)[0]
+    assert got == 2 and mine['Out'] == [1], 'Diff = %r with Out %r, not 2 with [1]' % (got, mine['Out'])
+
+
 def set_to_array_append():
     """The engine's own appending native: GenericSet_ToArray adds each element onto whatever Result holds
     (BlueprintSetLibrary.cpp 53-70), runscript's model below does the same for this test, and the editor empties Result
@@ -6475,6 +6489,8 @@ print("ok  OutArrayReset: a native's out TArray is emptied just before the call 
       "call found")
 set_to_array_append()
 print('ok  SetToArrayAppend: ToArray and a set range-for empty the array Set_ToArray appends to')
+set_operators()
+print('ok  SetOperators: set + - & are Set_Union / Set_Difference / Set_Intersection, chained and in a loop')
 no_world_warning()
 local_ctor_flags()
 print('ok  LocalCtorFlags: FUNC_HasDefaults on a function with an FHitResult / FTransform / FText / TMap local')
