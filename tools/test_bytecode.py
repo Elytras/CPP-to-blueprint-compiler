@@ -1303,6 +1303,29 @@ print('ok  CommaTargets: a comma or a = assigned to or updated in a loop conditi
       'right runs its left side, then the update of the variable it names')
 
 
+def comma_slot_right():
+    """CommaSlotRight: a struct's or FString's `=` onto a comma whose right side is an element, `(Bump(), T) = L[Count]`.
+    C++17 sequences the right operand before the left ([expr.ass]/1; an overloaded operator's operands in that order,
+    [over.match.oper]/2), so L[Count] is located with Count before Bump; operator= reads it through its reference
+    after both, so a place the comma's left side changes reads changed (PlaceAfter). A loop condition is evaluated
+    before each trip ([stmt.while]); && evaluates its right side only when the left is true ([expr.log.and]).
+    Compiled on 075e7b28 with L[Count] located after Bump (2001 for SlotStmt)."""
+    base = pending_asset('CommaSlotRight')
+    keeps_invariants(base)
+    for m in (0, 3):
+        cases = (('SlotStmt', 1001), ('StrSlotStmt', 101), ('SlotLoop', 2002), ('StrSlotLoop', 202),
+                 ('SlotAnd', 1001 if m > 0 else 100), ('PlaceAfter', m + 1))
+        for fn, want in cases:
+            got = run(base, fn, {'Count': 0}, M=m)[0]
+            assert got == want, 'CommaSlotRight.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+            got = VM(base, Count=0).call(fn, M=m)
+            assert got == want, 'runvm: CommaSlotRight.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+
+
+pending('CommaSlotRight: an element on the right of a struct\'s = onto a comma is located before the comma runs',
+        comma_slot_right)
+
+
 def comma_ctor_default():
     """CommaCtorDefault: a comma among a parenthesised constructor's arguments runs as among a call's (Get before it or
     after it, Y is M); a comma beside nothing but a constant default argument needs no temporary, and its element
@@ -5614,6 +5637,25 @@ def func_declared_sig():
 
 func_declared_sig()
 print('ok  FuncDeclaredSig: a method of another signature over a declared-only one is its own')
+
+
+def func_declared_called():
+    """A call to a mod class's method that is declared and never defined names a function the class never compiles, and
+    C++ would not link it. By name it lands in a subclass's function of that name, whatever its signature (FdcRoot's
+    int32 laid into FuncDeclaredCalled's float Scale), and on an FdcRoot object FindFunctionChecked finds nothing
+    (execLocalVirtualFunction, ScriptCore.cpp 3012-3016). Refused naming the method, from the class's own code, from
+    another class through a pointer, and whatever the subclass's signature."""
+    root = ('class FdcRoot : public AActor {\npublic:\n  int32 Scale(int32 V);\n'
+            '  int32 Call(int32 V) { return Scale(V) + 1; }\n};\n')
+    why = 'FdcRoot::Scale, which FdcRoot declares and never defines'
+    refused('FuncDeclaredCalled', '  float Scale(float V) { return V * 3.0f; }\n', why, root, 'FdcRoot')
+    refused('FuncDeclaredCalledSame', '  int32 Scale(int32 V) { return V * 3; }\n', why, root, 'FdcRoot')
+    refused('FuncDeclaredCalledOther', '  FdcRoot* P;\n  int32 Call(int32 V) { return P->Scale(V) + 1; }\n', why,
+            'class FdcRoot : public AActor {\npublic:\n  int32 Scale(int32 V);\n};\n'
+            'class FdcKid : public FdcRoot {\npublic:\n  float Scale(float V) { return V * 3.0f; }\n};\n')
+
+
+pending('FuncDeclaredCalled: a call to a declared-only method is refused', func_declared_called)
 
 
 def func_iface_unnamed():
