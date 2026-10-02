@@ -3,7 +3,8 @@
    EX_CallMulticastDelegate needs a signature function with the dispatcher's parameters. It lives in tests/pending
    because only a UeApi that marks callable dispatchers (genueapi's <D>__UeDispatcher) lets it compile: against an older
    one AssetGen cannot tell OnTerrainGenerated from OnDestroyed and refuses both (test_bytecode.py runs it or reports a
-   gap accordingly). */
+   gap accordingly). DispatchNativeKid broadcasts it too: its own signature function must not take the name of
+   its parent's, which FindFunctionByName would find in place of the parent's (invariants.py func_super_link). */
 #include "UeApi/Types.h"
 #include "UeApi/FSD.h"
 
@@ -17,4 +18,9 @@ public:
   void Generated() { Heard += 1; }
   void Hook() { State->OnTerrainGenerated.Add(this, &DispatchNativeCallable::Generated); }
   void Fire() { State->OnTerrainGenerated.Broadcast(); }
+};
+
+class DispatchNativeKid : public DispatchNativeCallable {
+public:
+  void FireKid() { State->OnTerrainGenerated.Broadcast(); }
 };

@@ -660,7 +660,8 @@ Watch for:
 - A handler is a method that is not `inline`, of the object you bind it on. An inline one is refused with
   ``a delegate cannot bind Handle: an inline function is expanded where it is called, no UFunction (drop `inline`)``.
   On another object it must be a function of that object's class that Blueprint code can call: a mod method, a game
-  Blueprint's function or a native BlueprintCallable one, not an event the engine calls such as `ReceiveTick`.
+  Blueprint's function or a native BlueprintCallable one. An event the engine calls such as `ReceiveTick`, an RPC
+  such as `Server_StartUsing` and a RepNotify such as `OnRep_Instigator` are refused, on `this` too.
 - `Broadcast` on an engine dispatcher such as `OnDestroyed` is refused, as the editor refuses it: the engine marks
   none of its dispatchers BlueprintCallable. On one of the game's 41 that are, it compiles with a warning, through a
   signature function of your class with the same parameters. `Clear()` on a game dispatcher also removes the game's
@@ -1353,6 +1354,7 @@ use a newer SDK or regenerate your own.
 | `Containers.h` | The Kismet `Array_*`, `Set_*` and `Map_*` functions, as methods of `TArray`, `TSet` and `TMap`. |
 | `Types.json` | Every enum and struct: package, engine name, size, alignment and fields, and whether an enum is an `enum class` (`form`), read off how the dump's properties of it are reflected. |
 | `Events.json` | The function flags of every `BlueprintEvent`, which an override inherits. |
+| `NotCallable.json` | Every other function the engine does not mark BlueprintCallable (RPCs, RepNotifies, `ExecuteUbergraph_*`), which a delegate cannot bind. Without it only an RPC is told apart. |
 | `Version.json` | Which genueapi wrote the folder, and whether it had `--game`, written last. A compiler that needs a later one refuses the folder, saying to regenerate it, rather than compile against what the older one did not write. Without `--game` it refuses a class deriving from a game Blueprint, whose default subobjects the folder then does not list. |
 | `UeMeta.h` | The `UE_*` macros. Written by hand. |
 | `Types.h` | The integer spellings, `FString`, `FName`, `FText` and the container templates. Written by hand. |
@@ -1813,6 +1815,7 @@ Each row gives the part of the message to look for, the reason, and what to writ
 | `static Calls lives in the ubergraph's frame, which only a function that makes a latent call runs in; make Calls a member` | A Blueprint function keeps nothing between calls (the ubergraph is the class's event graph). | A member variable | [Latent calls](REFERENCE.md#latent-calls) |
 | ``a delegate cannot bind Handle: an inline function is expanded where it is called, no UFunction (drop `inline`)`` | An inline method is pasted into its callers and is no function of the class. | Drop `inline` from the handler | [Event dispatchers](REFERENCE.md#event-dispatchers) |
 | `a delegate on a Helper cannot bind Other::Handle: the engine looks it up by name on that object, whose class has no such function` | A binding is an object and a function name, and the object's class has no function of that name, so the broadcast would skip it. | Bind a function of the object's own class: `OnHit.Add(H, &Helper::Handle)` | [Event dispatchers](REFERENCE.md#event-dispatchers) |
+| `a delegate cannot bind AItem::Server_StartUsing on another object: the editor binds a BlueprintCallable function that is not pure or latent, and Server_StartUsing is not BlueprintCallable` | The editor's Create Event takes only a function Blueprint code can call; an event the engine calls, an RPC or a RepNotify is none. | Bind a method of your own class that calls it | [Event dispatchers](REFERENCE.md#event-dispatchers) |
 | `OnDestroyed.Broadcast: OnDestroyed is a native dispatcher (AActor::OnDestroyed) that is not BlueprintCallable, ...` | The editor's Call node refuses a native dispatcher the engine does not mark BlueprintCallable; only the engine broadcasts it. | Call what makes the event happen, such as `K2_DestroyActor()` | [Event dispatchers](REFERENCE.md#event-dispatchers) |
 | `a container operation needs a variable, not a computed value: Length` | A container node works on a variable, not on the result of a call. | `TArray<int32> L = GetItems(); return L.Num();` | [Containers](REFERENCE.md#containers) |
 | `TODO: unimplemented local Inc: (lambda at ...)` | Lambdas are not compiled, in any form. | An `inline` method or a free `inline` function | [Functions](REFERENCE.md#functions) |

@@ -1688,6 +1688,10 @@ private:
     std::map<std::string, std::vector<std::pair<std::string, int64>>> EnumDecls;   // C++ name -> its enumerators, in order
     std::map<std::string, int32> EnumConstWidth;      // clang EnumConstantDecl id -> its enum's size, 1 / 4 / 8
     std::map<std::string, uint32> EventFlags;         // UeApi/Events.json: "Package.Class.Function" -> EFunctionFlags
+    /* UeApi/NotCallable.json: "Package.Class.Function" of each function the engine does not mark BlueprintCallable and
+       that is no BlueprintEvent (Events.json has those); a UeApi without it does not say (bHaveNotCallable false). */
+    std::set<std::string> NotCallable;
+    bool bHaveNotCallable = false;
     /* UeApi/OutArrays.json: "Package.Class.Function" -> bit I for each parameter I of a native that is an out TArray,
        emptied before the call (FCallIR::EmptiedArgs). A UeApi without the file empties nothing, as before. */
     std::map<std::string, uint64> OutArrayArgs;
@@ -1700,6 +1704,9 @@ private:
     std::map<std::string, std::pair<std::string, FIndex>> DelegateSigs;    // Generate: a TDelegate type -> its signature
                                                                             // function's name and export
     const FBlueprintClass* DelegateSigsIn = nullptr;  // the class Generate is building, while it builds it
+    /* A class -> the signature functions DelegateSignature made in it: a parent or child generated after it names its
+       own around them (DelegateSignature's Taken). */
+    std::map<std::string, std::set<std::string>> MadeSignatures;
     const FConv* FindConv(const std::string& From, const std::string& To) const;
     const FOpInfo* FindOp(const std::string& Op, const std::string& Lhs, const std::string& Rhs) const;
     void ApplyConv(const FConv& C, FBlueprintClass& BP, FArgIR& Arg);
@@ -3656,39 +3663,44 @@ bool FCompiler::LowerDelegateValue(const Json& Obj, const Json& Fn, const std::s
         { *Err = "a delegate on a " + OnType + " cannot bind " + Owner->second + "::" + FnName + ": the engine looks it up by name on "
                  "that object, whose class has no such function"; return false; }
     }
-    if (bSelf)
-    {
-        Out.K = FArgIR::Delegate;
-        Out.S = UeNameOf(Cur, FnName);     // found on self by name at run time
-        return true;
-    }
-
-    /* What the editor binds (K2Node_CreateDelegate.cpp 156-164, FunctionCanBeUsedInDelegate EdGraphSchema_K2.cpp 974-985):
-       a BlueprintCallable function, not pure, not latent. A mod's method is what Generate makes it - BlueprintCallable,
-       unless it overrides an event that is not - and one only declared is no function at all. A native or game
-       Blueprint's event says so in Events.json; any other function UeApi lists is a BlueprintCallable UFunction. */
+    /* What the editor binds, on this object or another (K2Node_CreateDelegate.cpp 156-164, FunctionCanBeUsedInDelegate
+       EdGraphSchema_K2.cpp 929-933, 974-985): a BlueprintCallable function, not pure, not latent. A mod's method is what
+       Generate makes it - BlueprintCallable, unless it overrides an event that is not - and one only declared is no
+       function at all. A native or game Blueprint's event says so in Events.json; any other function UeApi lists is
+       BlueprintCallable unless NotCallable.json names it (OnRep_*, RPCs, ExecuteUbergraph_*). A UeApi from before
+       genueapi wrote that table says it only of an RPC, through UE_SERVER / UE_CLIENT / UE_MULTICAST. */
     if (R)
     {
         std::string Why;
         uint32 Flags = 0;
+        const auto M = R->Methods.find(FnName);
+        const std::string Key = R->UePackage.substr(R->UePackage.rfind('/') + 1) + "." + R->UeName + "." + UeNameOf(R, FnName);
         if (!R->IsNative())
         {
             if (!CompilesMethod(*R, FnName))
             { *Err = "a delegate cannot bind " + R->CppName + "::" + FnName + ", which " + R->CppName + " declares and never defines"; return false; }
             Flags = ModMethodFlags(*R, FnName, BP);
         }
-        else if (auto E = EventFlags.find(R->UePackage.substr(R->UePackage.rfind('/') + 1) + "." + R->UeName + "." + UeNameOf(R, FnName));
-                 E != EventFlags.end())
+        else if (auto E = EventFlags.find(Key); E != EventFlags.end())
             Flags = E->second;
+        else if (bHaveNotCallable)
+            Flags = NotCallable.count(Key) ? 0u : uint32(FUNC_BlueprintCallable);
         else
-            Flags = FUNC_BlueprintCallable;
-        if (const auto M = R->Methods.find(FnName); M != R->Methods.end() && IsPureDecl(*M->second)) Flags |= FUNC_BlueprintPure;
+            Flags = M != R->Methods.end() && (NetFlagsOf(*M->second) & (FUNC_NetServer | FUNC_NetClient | FUNC_NetMulticast))
+                  ? 0u : uint32(FUNC_BlueprintCallable);
+        if (M != R->Methods.end() && IsPureDecl(*M->second)) Flags |= FUNC_BlueprintPure;
         if (!(Flags & FUNC_BlueprintCallable)) Why = FnName + " is not BlueprintCallable";
         else if (Flags & FUNC_BlueprintPure) Why = FnName + " is pure";
         else if (DesugaredTypeOf(Ref).find("FLatentActionInfo") != std::string::npos) Why = FnName + " is latent";
         if (!Why.empty())
-        { *Err = "a delegate cannot bind " + R->CppName + "::" + FnName + " on another object: the editor binds a BlueprintCallable "
-                 "function that is not pure or latent, and " + Why; return false; }
+        { *Err = "a delegate cannot bind " + R->CppName + "::" + FnName + (bSelf ? " on this object" : " on another object")
+                 + ": the editor binds a BlueprintCallable function that is not pure or latent, and " + Why; return false; }
+    }
+    if (bSelf)
+    {
+        Out.K = FArgIR::Delegate;
+        Out.S = UeNameOf(Cur, FnName);     // found on self by name at run time
+        return true;
     }
 
     if (!CurLocals) { *Err = "internal: a delegate value outside a function body"; return false; }
@@ -3781,7 +3793,15 @@ bool FCompiler::LowerDispatcherCall(const Json& Call, const Json& Callee, const 
         if (Method == "Clear") { C.Intrinsic = "__ClearDelegate__"; return true; }
         C.Intrinsic = Method == "Add" ? "__AddDelegate__" : "__RemoveDelegate__";
         C.Args.emplace_back();
-        return LowerDelegateValue(*Args[0], *Args[1], DelegateType, bOwn ? Own->second : Null(), Disp, BP, C.Args[1], Err);
+        /* A function of another object goes through a delegate local, which the editor's Create Event types with the
+           dispatcher's own signature: this class's export, or the declaring Blueprint's - a mod parent's or sibling's,
+           a game Blueprint's - imported from its package, as Broadcast names it below. A function of its own of that
+           name would hide the parent's. Bound on `this` there is no local, so nothing to import. */
+        FIndex Sig = bOwn ? Own->second : Null();
+        const Json* On = Strip(Args[0]);
+        if (!bOwn && Owner && Owner != Cur && !bNative && !(On && Kind(*On) == "CXXThisExpr"))
+            Sig = BP.EngineFunction(PackageOf(*Owner), ClassOf(*Owner), C.Args[0].S + "__DelegateSignature");
+        return LowerDelegateValue(*Args[0], *Args[1], DelegateType, Sig, Disp, BP, C.Args[1], Err);
     }
     if (Method != "Broadcast") { *Err = "TODO: unimplemented dispatcher method " + Method; return false; }
 
@@ -12398,17 +12418,41 @@ bool FCompiler::DelegateSignature(const std::string& Type, const std::string& Ho
         PD.PropertyFlags &= ~uint64(CPF_BlueprintVisible | CPF_BlueprintReadOnly);
         Params.push_back(PD);
     }
-    /* Named after the variable asking, numbered past a dispatcher's signature or another type's of that name. */
-    auto Taken = [&](const std::string& N) {
-        return std::any_of(CurSignatures.begin(), CurSignatures.end(), [&](const auto& D) { return D.first + "__DelegateSignature" == N; })
-            || std::any_of(DelegateSigs.begin(), DelegateSigs.end(), [&](const auto& D) { return D.second.first == N; });
+    /* Named after the variable asking, numbered past a dispatcher's signature or another type's of that name - this
+       class's, or any class's up or down the chain: one of a child's that a parent has too is no override of it (no
+       super link), and FindFunctionByName on the child finds the child's (invariants.py func_super_link). A class's
+       names are its functions and UE_DISPATCHER signatures (Methods), a game Blueprint's dispatchers' (its
+       TMulticastInlineDelegate fields), and those this made in a mod class generated before it (MadeSignatures):
+       Compile goes by name, so of a parent and a child the first keeps the plain name and the other numbers past it. */
+    auto Has = [&](const FRecord& A, const std::string& N) {
+        if (A.Methods.count(N)) return true;
+        if (const auto M = MadeSignatures.find(A.CppName); M != MadeSignatures.end() && M->second.count(N)) return true;
+        return std::any_of(A.Fields.begin(), A.Fields.end(), [&](const Json* F) {
+            return Name(*F) + "__DelegateSignature" == N
+                && StripTypeKeywords(TypeOf(*F)).compare(0, 25, "TMulticastInlineDelegate<") == 0; });
     };
-    std::string Name = Holder + "__DelegateSignature";
-    for (int32 N = 2; Taken(Name); ++N) Name = Holder + "_" + std::to_string(N) + "__DelegateSignature";
+    auto Taken = [&](const std::string& N) {
+        if (std::any_of(CurSignatures.begin(), CurSignatures.end(), [&](const auto& D) { return D.first + "__DelegateSignature" == N; })
+            || std::any_of(DelegateSigs.begin(), DelegateSigs.end(), [&](const auto& D) { return D.second.first == N; }))
+            return true;
+        if (!Cur) return false;
+        for (const FRecord* A = Cur->Base.empty() ? nullptr : Find(Cur->Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
+            if (Has(*A, N)) return true;
+        for (const auto& [CppName, D] : Records)
+        {
+            if (&D == Cur || !D.IsGenerated() || D.bIsStruct || D.bIsInterface) continue;
+            for (const FRecord* A = D.Base.empty() ? nullptr : Find(D.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
+                if (A == Cur) { if (Has(D, N)) return true; break; }
+        }
+        return false;
+    };
+    std::string Made = Holder + "__DelegateSignature";
+    for (int32 N = 2; Taken(Made); ++N) Made = Holder + "_" + std::to_string(N) + "__DelegateSignature";
     const bool bOut = std::any_of(Params.begin(), Params.end(), [](const FPropertyDef& P) { return (P.PropertyFlags & CPF_OutParm) != 0; });
-    *Sig = BP.AddFunction(Name, Null(), Params, [](FScript& S, FIndex) { S.Return(); S.EndOfScript(); },
+    *Sig = BP.AddFunction(Made, Null(), Params, [](FScript& S, FIndex) { S.Return(); S.EndOfScript(); },
                           FUNC_Public | FUNC_Delegate | (bOut ? uint32(FUNC_HasOutParms) : 0u));
-    DelegateSigs[Type] = { Name, *Sig };
+    DelegateSigs[Type] = { Made, *Sig };
+    if (Cur) MadeSignatures[Cur->CppName].insert(Made);
     return true;
 }
 
@@ -16286,6 +16330,12 @@ bool FCompiler::LoadTables(const std::string& IncludeDir, std::string* Err)
     if (!Load("Conv.json", &ConvDoc) || !Load("Ops.json", &OpsDoc) || !Load("Types.json", &TypesDoc)
         || !Load("Events.json", &EventsDoc)) return false;
     for (auto It = EventsDoc.begin(); It != EventsDoc.end(); ++It) EventFlags[It.key()] = It->get<uint32>();
+    const Json NotCallableDoc = Json::parse(ReadText(IncludeDir + "/NotCallable.json"), nullptr, false);
+    if (NotCallableDoc.is_array())
+    {
+        bHaveNotCallable = true;
+        for (const Json& Key : NotCallableDoc) NotCallable.insert(Key.get<std::string>());
+    }
     const Json OutArraysDoc = Json::parse(ReadText(IncludeDir + "/OutArrays.json"), nullptr, false);
     if (OutArraysDoc.is_object())
         for (auto It = OutArraysDoc.begin(); It != OutArraysDoc.end(); ++It)
