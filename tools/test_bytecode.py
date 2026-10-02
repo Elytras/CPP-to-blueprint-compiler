@@ -1410,7 +1410,7 @@ def updated_update():
     CompoundAssignOperator" (Loop, Step, Assigned) and "an assignment used as a value after something its statement
     runs first" (StructLoop). An update of an update to an element, `(IL[Idx()] += M) += 1;`, would locate the element
     twice: refused, saying so (it said "passed to a reference parameter")."""
-    base = pending_asset('UpdatedUpdate')
+    base = asset('UpdatedUpdate')
     keeps_invariants(base)
 
     def loop(m):                                    # `while (((N += G2()) += 1) < 20) K += 1;`
@@ -1444,8 +1444,9 @@ def updated_update():
             'an update (`+=`, `++`, ...) assigned to or updated, whose left side is no plain variable')
 
 
-pending('UpdatedUpdate: an update or a struct\'s operator= updated or assigned writes the variable it names',
-        updated_update)
+updated_update()
+print('ok  UpdatedUpdate: an update or a struct\'s operator= updated or assigned writes the variable it names; one onto '
+      'an element is refused, saying so')
 
 
 def comma_slot_right():

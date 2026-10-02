@@ -88,6 +88,8 @@ bool IsFixedOperand(const Json& N);
 /* `(L[Idx()] = 3) += 1`: AssignedPlace writes an assignment's left side only when it is a plain variable. */
 const char* const kAssignedAssignNoVar = "an assignment assigned to or updated, whose left side is no plain variable, "
     "which would be evaluated again to write it: assign in a statement of its own, then update what it assigned";
+/* kAssignedAssignNoVar, or its words for an update assigned to or updated; empty for anything else. */
+std::string AssignedNoVar(const Json& Target);
 Json RefToLocal(const std::string& Name, const std::string& Type);
 
 std::string TypeOf(const Json& N)
@@ -5756,8 +5758,8 @@ bool FCompiler::DesugarUpdate(const Json& S, Json& Wrap, std::string* Result, st
         Wrap = { {"kind", "CompoundStmt"}, {"inner", std::move(Pre)} };
         return true;
     }
-    if (const Json* Bare = PlaceRoot(Orig); Bare && Kind(*Bare) == "BinaryOperator" && Bare->value("opcode", std::string()) == "=")
-    { *Err = kAssignedAssignNoVar; return false; }
+    if (const Json* Bare = PlaceRoot(Orig); Bare && !AssignedNoVar(*Bare).empty())
+    { *Err = AssignedNoVar(*Bare); return false; }
 
     /* X is located once. C++17 sequences Y before X in `X op= Y`, so a Y that must not move past what locates X
        (its side effects, or an index Y changes) goes first. */
@@ -8089,10 +8091,11 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 St.bAssignOutParm = St.Var.Base->K == FArgIR::LocalOut;
                 bOk = LowerArg(*Rhs, BP, St.Value, Err);
             }
-            else if (LK == "BinaryOperator" && Lhs->value("opcode", std::string()) == "=")
+            else if (!AssignedNoVar(*Lhs).empty())
             {
-                /* `(L[Idx()] = 3) = 4`: AssignedPlace takes only a plain variable, which names the same place again. */
-                *Err = kAssignedAssignNoVar;
+                /* `(L[Idx()] = 3) = 4`, `(L[Idx()] += 3) = 4`: AssignedPlace takes only a plain variable, which names the
+                   same place again. */
+                *Err = AssignedNoVar(*Lhs);
                 bOk = false;
                 return;
             }
@@ -10157,8 +10160,8 @@ int32 FCompiler::HoistComma(const Json& Stmt, FBlueprintClass& BP, Json* Seq, st
     {
         /* One that is itself assigned to or updated, `(L[Idx()] = M) += 1`, says so, as it does where no statement
            before can hold it (DesugarUpdate). */
-        if (!bUpdate && std::any_of(Written.begin(), Written.end(), [&](const Json* N) { return PlaceRoot(N) == Target; }))
-        { *Err = kAssignedAssignNoVar; return -1; }
+        if (std::any_of(Written.begin(), Written.end(), [&](const Json* N) { return PlaceRoot(N) == Target; }))
+        { *Err = AssignedNoVar(*Target); return -1; }
         *Err = std::string(bUpdate ? "an update (`+=`, `++`, ...) passed to a reference parameter" : "an assignment used as a value")
              + ", whose left side is no plain variable, which would be evaluated again to read it: assign in a statement "
                "of its own, then use what it assigned";
@@ -10459,15 +10462,23 @@ bool FCompiler::AssignedPlace(const Json& Place, Json& Pre, Json& Out) const
         Out["inner"][Of - 1] = std::move(Base);
         return true;
     }
-    const std::string Op = Bare && Kind(*Bare) == "BinaryOperator" ? Bare->value("opcode", std::string()) : std::string();
-    const Json* Left = Bare ? Nth(*Bare, 0) : nullptr;
-    const Json* Right = Bare ? Nth(*Bare, 1) : nullptr;
+    /* An update as a place, `(N += G()) += 1` or `++N`, is its left operand after it, as an assignment's is
+       ([expr.ass], [expr.pre.incr]); so is a struct's or an FString's operator= or update, `(T = S).A`, whose result is
+       the object it was called on. A postfix `N++` is a value, not a place. */
+    const std::string BareKind = Bare ? Kind(*Bare) : std::string();
+    const std::string Op = !Bare ? std::string() : BareKind == "BinaryOperator" ? Bare->value("opcode", std::string())
+                         : PlaceOp(*Bare) == "update" && Bare->value("valueCategory", std::string()) == "lvalue" ? "update"
+                         : BareKind == "CXXOperatorCallExpr" && PlaceOp(*Bare) == "=" ? "=" : std::string();
+    const bool bOperator = BareKind == "CXXOperatorCallExpr";
+    const Json* Left = Bare ? Nth(*Bare, bOperator ? 1 : 0) : nullptr;
+    const Json* Right = Bare && BareKind != "UnaryOperator" ? Nth(*Bare, bOperator ? 2 : 1) : Left;
     /* An assignment's left side, read again after it, must name the same place: a plain variable, or a comma or another
        assignment that names one, which the assignment's own lowering takes apart. */
     Json Named, Unused = Json::array();
-    if (Op == "=" && Left) AssignedPlace(*Left, Unused, Named);
-    if (!Left || !Right || (Op != "," && !(Op == "=" && Strip(&Named) && IsEagerSafe(*Strip(&Named))))) { Out = Place; return false; }
-    if (Op == "=")
+    const bool bWrites = Op == "=" || Op == "update";
+    if (bWrites && Left) AssignedPlace(*Left, Unused, Named);
+    if (!Left || !Right || (Op != "," && !(bWrites && Strip(&Named) && IsEagerSafe(*Strip(&Named))))) { Out = Place; return false; }
+    if (bWrites)
     {
         Pre.push_back(*Bare);
         Out = std::move(Named);
@@ -10476,6 +10487,18 @@ bool FCompiler::AssignedPlace(const Json& Place, Json& Pre, Json& Out) const
     if (const Json* L = Strip(Left); L && !IsEagerSafe(*L)) Pre.push_back(*Left);
     AssignedPlace(*Right, Pre, Out);
     return true;
+}
+
+/* The refusal for an assignment or an update (Target's PlaceOp, "=" or "update") that is itself assigned to or
+   updated, whose left side is no plain variable: `(L[Idx()] = 3) += 1`, `(L[Idx()] += M) += 1`. Empty where Target is
+   neither. */
+std::string AssignedNoVar(const Json& Target)
+{
+    const std::string Op = PlaceOp(Target);
+    if (Op == "=") return kAssignedAssignNoVar;
+    if (Op != "update") return std::string();
+    return "an update (`+=`, `++`, ...) assigned to or updated, whose left side is no plain variable, which would be "
+           "evaluated again to write it: update in a statement of its own, then write what it updated";
 }
 
 /* `for (Elem : Range)` over a TArray / TSet / TMap. CXXForRangeStmt inner is
