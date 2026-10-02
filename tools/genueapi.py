@@ -1137,8 +1137,10 @@ MARK_OF = (("NetServer", "UE_SERVER"), ("NetClient", "UE_CLIENT"), ("NetMulticas
 def write_events(sdk_dir, out_dir):
     """Events.json: "Package.Class.Function" -> EFunctionFlags of every BlueprintEvent, the functions a Blueprint
     overrides or implements. The compiler copies part of these onto the override (KismetCompiler.cpp).
-    Also collects PURE."""
-    rows = []
+    Also collects PURE, and writes NotCallable.json: "Package.Class.Function" of every function that is neither
+    BlueprintCallable nor a BlueprintEvent (OnRep_*, RPCs, Exec commands, ExecuteUbergraph_*), which the editor's
+    Create Event node does not bind (EdGraphSchema_K2.cpp 929-933, 974-985) and no other flag in UeApi tells apart."""
+    rows, not_callable = [], []
     for name in sorted(f for f in os.listdir(sdk_dir) if f.endswith("_functions.cpp")):
         text = io.open(os.path.join(sdk_dir, name), encoding="utf-8", errors="replace").read()
         stem = name[: -len("_functions.cpp")]
@@ -1157,8 +1159,12 @@ def write_events(sdk_dir, out_dir):
                 MARKS[(cls, real)] = marks
             if "BlueprintEvent" in names:
                 rows.append('  %s: %d' % (json.dumps("%s.%s.%s" % (pkg, cls, real)), sum(FUNC_BITS[n] for n in names)))
+            elif "BlueprintCallable" not in names:
+                not_callable.append("%s.%s.%s" % (pkg, cls, real))
     io.open(os.path.join(out_dir, "Events.json"), "w", encoding="utf-8", newline="\n").write("{\n" + ",\n".join(rows) + "\n}\n")
-    print("  events: %d" % len(rows))
+    io.open(os.path.join(out_dir, "NotCallable.json"), "w", encoding="utf-8", newline="\n").write(
+        "[\n" + ",\n".join("  " + json.dumps(k) for k in sorted(set(not_callable))) + "\n]\n")
+    print("  events: %d, not callable: %d" % (len(rows), len(not_callable)))
 
 
 def write_out_arrays(out_dir):
