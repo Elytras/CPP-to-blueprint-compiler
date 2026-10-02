@@ -23,6 +23,30 @@ public:
     return Sum;
   }
 
+  /* The comma operator: a statement, a for increment, and an if / switch condition whose left side runs first
+     (the out-param it sets is what the test reads). */
+  void Bump(int32 &N, bool &bBig) { N += 1; bBig = N > 2; }
+  int32 CommaStmt(int32 N) {
+    int32 A = 0, B = 10;
+    A += N, B -= N;
+    A, B += 0;
+    for (int32 I = 0, J = 3; I < J; ++I, --J) A += 100;
+    return A * 100 + B;
+  }
+  /* `return F();` of a void F: the call runs, then the function returns. */
+  void BumpTotal(int32 N) { Total += N; }
+  void ForwardVoid(int32 N) {
+    if (N < 0) return BumpTotal(-N * 100);
+    BumpTotal(N);
+  }
+  int32 CommaIf(int32 N) {
+    if (bool bBig = false; Bump(N, bBig), !bBig) return N;
+    switch (N += 10, N) {
+    case 13: return -1;
+    default: return N * 10;
+    }
+  }
+
   int32 FirstOver(int32 Limit) {
     int32 N = 0;
     while (true) {

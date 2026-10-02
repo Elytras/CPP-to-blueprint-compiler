@@ -251,8 +251,9 @@ starts private.
 | `class Helper { ... };` | A class with no base is plain C++. Nothing is cooked for it. | Yes |
 | `class X : public ANotIncluded {};` | Refused by clang, "expected class name", when no included header declares the base. Include the SDK header that declares it. | Refused |
 | `class InitCave : public Hello {};` | A child of another class of the mod. A parent in the same source is used from there. A parent pinned with `UE_CLASS` to another mod is imported from that mod. | Yes |
-| `class Turret final : public AActor { ... };` | A class with no subclass. Its functions are cooked Final, which the editor does not let a Blueprint override, and a call to one of them reaches that function directly instead of by name; on `this` the body is usually copied in. See [Calling your own functions](#calling-your-own-functions). | Yes |
-| `class WPN_GrapplingGun_Long : public WPN_GrapplingGun_C` | A child of one of the game's Blueprint classes. Include the parent's `UeApi/Game/` header and derive from it; the parent is imported from the game. Put the child in the parent's `Game::` namespace to cook it beside the parent (see [Mod sources and packages](#mod-sources-and-packages)). | Yes |
+| `class Turret final : public AActor { ... };` | A class with no subclass. Its functions, overrides and interface implementations aside, are cooked Final, which the editor does not let a Blueprint override, and a call to one of them reaches that function directly instead of by name; on `this` the body is usually copied in. See [Calling your own functions](#calling-your-own-functions). | Yes |
+| `UE_FINAL_AS(UTurretBase, Turret);` at namespace scope, after UTurretBase | Final through one leaf: declares `class Turret final : public UTurretBase {}`, the class that is made, in the namespace it is written in (its package path, as for any class). UTurretBase's own code is then compiled as if it were final: its own functions, overrides and interface implementations aside, are cooked Final, and its calls on `this` to them are direct and usually copied in. A call to one of its overrides, or to a function it inherits, goes by name, as the editor calls a function that is not Final; with Turret the only class made, it reaches the same function. UTurretBase is cooked Abstract, and any other class deriving from it is refused, so put the macro in the header beside UTurretBase: a mod that includes the header is refused a subclass too. When UTurretBase has a `UE_CLASS` (a header mods share), Turret is pinned beside it, so only the mod that owns UTurretBase cooks Turret and every other mod imports it, and a second UE_FINAL_AS on the same base is refused ("has two UE_FINAL_AS leaves"). Such a base is final only through the UE_FINAL_AS in the header that declares it, which its owner sees too: one written in another mod's own source, its `.cpp` or a header of its own that re-declares the base, is refused ("only the UE_FINAL_AS in the header that declares it ..."), since its owner would never cook that leaf. The header counts as the owner's when a source beside it includes it whose `UE_MOD_PACKAGE` is the owner's, or that has none in a folder whose only `UE_MOD_PACKAGE` is the owner's (a mod of several sources). A game Blueprint base is refused ("is the game's Blueprint ..."): no mod cooks it, so it stays as the game has it. A base left with a `= 0` method is refused ("would be abstract"): Turret brings no method of its own, so it would be abstract too and nothing could be made. | Yes |
+| `class WPN_GrapplingGun_Long : public WPN_GrapplingGun_C` | A child of one of the game's Blueprint classes. Include the parent's `UeApi/Game/` header and derive from it; the parent is imported from the game. Put the child in the parent's `Game::` namespace to cook it beside the parent (see [Mod sources and packages](#mod-sources-and-packages)). The child loads after every default subobject the parent's default object exports, which UeApi lists only when genueapi had `--game`: against a UeApi made without it, the class is refused, saying to regenerate with `--game`. | Yes |
 
 Notes:
 
@@ -406,6 +407,7 @@ public:
 |---|---|---|
 | `int32 Budget = kSlots * 2 + 1;` | The compiler works the initializer out when the mod is built and writes it into the class default object: the variable's default value in Class Defaults. Nothing runs in game to set it. | Yes |
 | `int32 Hits = 0;`, `int32 Hits;` | A zero default writes nothing, as the engine cooks it, and the variable starts at zero. The same holds for the zero enumerator, `nullptr` and an empty string. | Yes |
+| `int32 Hits{};`, `EMood Mood = EMood();`, `int32 Budget{25};` | `{}` and `T()` are the zero, and write nothing; braces around one value are that value. | Yes |
 | `int32 X = UKismetMathLibrary::RandomInteger(5);` | Refused: "a default is a value known when the mod is built". Set such a value in `ReceiveBeginPlay` or `UserConstructionScript`. | Refused |
 | `static constexpr int32 kSeed = Fnv("types");` then `int32 Seed = kSeed;` | A call counts as a default only through a `consteval` function, which clang runs itself. A call to a plain `constexpr` function is refused like any call. See [Constants](#constants). | Yes |
 | `TSubclassOf<AActor> Kind = AActor::StaticClass();` | Not yet. A class reference has no build-time value, so a `TSubclassOf` or `UClass*` member always starts null, and this initializer is refused with the build-time message. `= nullptr` compiles. Set the class in `ReceiveBeginPlay`, or use a `TSoftClassPtr` member, which takes a path. | Not yet |
@@ -451,6 +453,7 @@ Notes:
 | `public:`, `protected:`, `private:` before a function | The function is cooked as public, protected or private, and the editor allows or refuses a call node to it the same way. An override keeps its parent's access. Nothing is checked at run time. | Yes |
 | `private:` before a variable | The variable is still cooked on the class, but the editor API stub leaves it out. A Blueprint variable has no other access: a protected one and a public one look the same. | Yes |
 | `const int32 Limit = 3;` | A read-only variable (BlueprintReadOnly): the editor offers a Get node and no Set node. The initializer is the default. clang refuses a write in C++, and the Blueprint VM does not check it. | Yes |
+| `UE_READONLY int32 Cap = 5;` | Read-only the same way (BlueprintReadOnly), but it can still be written: a subclass's `UE_DEFAULTS` may give it a default, and a write from code compiles with `warning: <Class>::<Function>: Cap is BlueprintReadOnly; the editor would not set it`, because the VM allows the write (for example, setting a deferred spawn's members before FinishSpawning). UeApi declares the engine's and game's BlueprintReadOnly properties this way. | Yes |
 | `UE_CATEGORY("Teleporter\|Setup");` | Gives the functions and variables declared after it that category. `\|` starts a subcategory, and `UE_CATEGORY("")` ends the category. It is positional, like an access specifier. | Yes |
 | a keyword or a tooltip for a function | Not yet: there is no macro for it. | Not yet |
 
@@ -488,7 +491,7 @@ Notes:
 | `Index_0 = 7;`, for a member the SDK spells `Index_0` | Write the SDK's spelling. Dumper-7 respells names that C++ cannot use: a clash gets a suffix (`Name` becomes `Name_0`), an illegal character becomes `_` (`Audio Flying` becomes `Audio_Flying`), and a leading digit becomes a word (`3P` becomes `ThreeP`). The SDK keeps the real name beside the member, and everything the compiler cooks uses the real name. | Yes |
 | `class Größe : public AActor { FName Umlaut = "Größe"; };` | Non-ASCII class, member and asset names, and non-ASCII name and string defaults, are cooked and registered correctly. | Yes |
 | `using FTarget = AActor;`, then `FTarget *Aimed;` | An alias of a UObject class is still an object reference, not an address. It works at namespace scope and at class scope. | Yes |
-| `using FMoods = TArray<EMood>;`, `using Factory = TScriptInterface<IFoo>;` | A global alias of a template type is that type wherever it is used, in out-of-line method definitions too. | Yes |
+| `using FMoods = TArray<EMood>;`, `using Factory = TScriptInterface<IFoo>;` | A global alias of a template type is that type wherever it is used, in out-of-line method definitions too. A global alias of a class is that class the same way, so an override may spell a parameter through it. | Yes |
 | `using Grapple = Game::WeaponsNTools::GrapplingGun::WPN_GrapplingGun_C;` | An alias to a game class's full `Game::` path. The SDK gives a game class a short name at global scope only when no other game package has a class of that name. For one that does, write such an alias. | Yes |
 
 ```cpp
@@ -681,6 +684,8 @@ float value needs its `f`. `X * 0.5` is a double operation in C++, and Blueprint
 | `float Y = 0.5;`, `return 0.25;`, `FVector(1.0, 2.0, X)` | A double literal on its own converts to float where a float is wanted. So does a default, `float Delay = 0.75;`. | Yes |
 | `'A'`, `('a' - 'A')` | The int constant of its code unit. A plain `char` is signed, so `'\xff'` is -1. | Yes |
 | `nullptr` | None for an object or class. For a `TScriptInterface` it is the null interface. Where an int64 address is wanted it is 0. | Yes |
+| `int32 N{7};`, `EMood M{EMood::Angry};` | Braces around one value of a type that is not a struct are that value. | Yes |
+| `EMood M{};`, `int32 N = int32();`, `AActor* A{};`, `Mood = {};`, `return {};` | C++'s value-initialisation: the type's zero, the zero enumerator or None. In a function and as a default, where a zero writes nothing. In `UE_DEFAULTS` the zero is written, as `= 0` is (see [Class defaults](#class-defaults)). | Yes |
 | `"text"`, `L"wide"` | A String, Name or Text constant: [Strings and text](#strings-and-text). | Yes |
 
 ```cpp
@@ -921,7 +926,7 @@ constants, not a Blueprint type.
 |---|---|---|
 | `EEndPlayReason LastReason;` | A variable of the game's enum: a Byte bound to its UEnum, as the editor makes a variable of an enum that is no `enum class` (here a namespaced one, which the game's C++ holds as `TEnumAsByte`). Its enumerators are byte constants. | Yes |
 | `EAttachmentRule Rule = EAttachmentRule::KeepWorld;` | A variable of a game `enum class`: an EnumProperty over a ByteProperty named UnderlyingType, as the editor makes it and as the game's own members and parameters of it are. The same goes for a parameter, a return value, a local, a container's element or key, a UE_STRUCT member, a delegate's parameter and a `UE_DEFAULTS` tag on a native member: an override or a delegate of a native signature then has the native's types. The value is the same byte, its enumerators byte constants, and a default is written as the enumerator's name in an EnumProperty tag. | Yes |
-| A game enum that no property uses | UeApi's `Types.json` gives each enum's form, which genueapi reads off how the Dumper-7 dump's properties of the enum, and the game's Blueprints' variables, are reflected (`form`: `EnumClass` or `TEnumAsByte`). 249 of the SDK's 1445 enums have no property to read it from, and a variable of one is a Byte bound to the enum. 10 of them the game uses only as a native delegate's parameter or a container's element, which genueapi does not read the form from. | Yes |
+| A game enum that no property uses | UeApi's `Types.json` gives each enum's form, which genueapi reads off how the Dumper-7 dump's properties of the enum (a native delegate's parameters among them), and the game's Blueprints' variables, locals and containers' elements, are reflected (`form`: `EnumClass` or `TEnumAsByte`). 240 of the SDK's 1445 enums have no such property, and a variable of one is a Byte bound to the enum. One the game uses, ESteamVRInputStringBits, is only the element of a native function's `TArray` parameter, whose inner property neither the dump nor Dumper-7's usmap tells apart and no game package holds. Their form is not read yet rather than unknown: the editor takes it from the enum itself (`UEnum::GetCppForm`), which the dump does not carry yet. | Yes |
 | `LastReason == EEndPlayReason::Quit`, `<` | Comparisons work. | Yes |
 | `switch (Reason)` | A switch works on any enum. | Yes |
 | `EEndPlayReason Last = EEndPlayReason::Quit;` as a default | The default is written as the enumerator's name. | Yes |
@@ -1014,9 +1019,12 @@ stays `E`, because an `E` variable cannot bind to a `TEnum<E>&`.
 | You write | What it does | Status |
 |---|---|---|
 | `TEnum<EMood> Mood = EMood::Calm;` | An EMood variable, member, parameter or local. It switches, compares and assigns like a plain EMood. | Yes |
+| `Mood = {};`, `TEnum<EMood>()`, `K2_DetachFromActor({}, {}, {})` | The zero enumerator, as for a plain EMood: assigned, passed (to a game function too), returned, as a struct literal's member or an array element. | Yes |
 | `Mood.Name()` | The enumerator's name as an FName, from `KismetNodeHelperLibrary::GetEnumeratorName` on EMood's UEnum. | Yes |
 | `Mood.String()` | Its display name as an FString, from `GetEnumeratorUserFriendlyName`: the label typed in the editor for a Blueprint enum. | Yes |
 | `.Name()` / `.String()` on an `int32` or `int64` enum | Refused ("a uint8 enum only"): the engine's two lookups take a uint8. | Refused |
+| `TMap<TEnum<EMood>, TSubclassOf<AActor>> Spawns;` | A map keyed by EMood, its value any type a map takes, a template too. | Yes |
+| `Moods.Num()` on a `TArray<TEnum<EMood>>`; `UE_DISPATCHER(OnMood, TEnum<EMood> M)` | A container of EMood with a container's methods, and a dispatcher whose Add and Broadcast are a dispatcher's. Only `TEnum<E>` itself has `.Name()` / `.String()`. | Yes |
 
 ```cpp
 TEnum<EMood> Mood = EMood::Angry;
@@ -1045,15 +1053,17 @@ copies it, as in C++.
 
 | You write | What it does | Status |
 |---|---|---|
-| `FVector(1, 2, 3)`, `FLinearColor(1, 0.5f, 0, 1)` | A whole-struct constructor: one struct value (a Make node) built from the arguments, which can be any expressions. | Yes |
+| `FVector(1, 2, 3)`, `FLinearColor(1, 0.5f, 0, 1)` | A whole-struct constructor: one struct value built from the arguments. Constants, locals and the object's own variables make one literal value, as the editor's literal pin does. | Yes |
+| `FVector2D(1.0f, M == 0 ? 2.0f : 3.0f)`, `{Twice(M), 1}`, `V = {V.Y, V.X}` | A member that computes anything else (a call, `?:`, `&&`, a member of a struct) makes the editor's Make Struct instead: a fresh value, then one store per member, left to right as C++ runs a braced list. The variable assigned is written after all of them, so `V = {V.Y, V.X}` swaps. | Yes |
 | `FColor(255, 128, 0)` | R, G, B and A, with A 255 when left out, like the engine's constructor. Each argument lands on the member its parameter is named after, although FColor stores B, G, R, A. | Yes |
 | `FLightmassDirectionalLightSettings(1.5f, 2.5f, true, 4.5f)` | A struct with a parent struct: the arguments come in C++ order, the parent's members first, and each lands on its member (the engine lists the struct's own members first). | Yes |
-| `FMaterialAttributesInput(3, "In", "Ex", 9)` | A member the engine marks Transient (here PropertyConnectedBitmask) is not part of a struct literal, as in the engine: a constant given for it is dropped with a warning, anything else is refused. The member reads zero. | Warns |
-| `FVector()`, `FQuat()`, `FTransform()` | All zeros, for a struct that has a whole-struct constructor. `FTransform()` is all zeros too, Scale3D included: it is not the identity. `FTimerHandle()` writes no member at all: its one member is Transient. | Yes |
+| `FMaterialAttributesInput(3, "In", "Ex", 0)`, `Handle = FTimerHandle();` | A struct with a member the engine marks Transient (PropertyConnectedBitmask here, FTimerHandle's one member Handle) is the Make Struct above, never a literal: the engine's literal skips that member and leaves it as the variable assigned held it, which a variable assigned again, or a local in a loop, still holds. The Make Struct sets it, to the value given or zero, so `Handle = FTimerHandle();` resets a live handle, as in C++. | Yes |
+| `FVector()`, `FVector4()`, `FTransform()`, `FTransform T{};` | What the engine's constructor makes. `FVector`, `FVector2D`, `FRotator`, `FLinearColor`, `FColor` and the `FVector_NetQuantize` types, whose constructor sets nothing, are their zeros, a literal. `FVector4()` is the literal (0, 0, 0, 1), its constructor's W; so is an FVector4 declared with no initializer, each time a loop comes round, since the engine makes a fresh FVector4 variable as zeros. Any other engine struct, `FTransform()` (the identity) or `FQuat()` among them, is the editor's Make Struct with nothing set: a temporary the function's frame constructs as the engine does. So `SpawnActor<T>(Class, FTransform())` spawns at the origin at scale 1. | Yes |
 | `FHitResult()`, `FStats{}` | Make Struct with nothing set, for a struct without a whole-struct constructor: the struct keeps its own defaults (`FHitResult::Time` is 1). | Yes |
 | `FStats S = {.Kills = K, .Alive = true};` | Make Struct: a fresh value, then one store for each member given. Members left out keep the struct's defaults. | Yes |
 | `KillsOf({.Kills = K})` | A braced value as an argument. | Yes |
 | `FStats S = {K, 2.0f};` | Positional braces go by member declaration order. | Yes |
+| `FStats S = {{}, 2.0f};` | A `{}` for a member is a fresh value of its type, as in C++, not the member's default: zero, an empty container, None, an engine struct's zeros, or a `UE_STRUCT`'s own defaults. | Yes |
 
 ```cpp
 FVector Home;
@@ -1146,7 +1156,11 @@ void ZeroAll() {
 | `FFloatInterval Delay = FFloatInterval(1, 5);` | A constructor call as a member default. It is written into Class Defaults. | Yes |
 | `FVector Offset = {0, 0, 50};` | Positional braces as a default. | Yes |
 | `FNested Deep = {.Inner = {.Time = 1.5f}, .Stamp = 7};` | Designated braces, nested. Members left out are zero, or take their own default initializer. | Yes |
+| `FHitResult Mine = {.Distance = 5.0f};` | Designated (or positional) braces of an engine struct whose header has no constructor: the members given are written, the ones left out are not, so they hold what the engine's constructor sets (`FHitResult::Time` is 1), as the editor's Make Struct leaves them. | Yes |
+| `FHeld H = {.Hit = {.Distance = 5.0f, .Time = 1.0f}};` where FHeld declares `FHitResult Hit = {.Time = 0.5f};` | New braces for a struct member with an initializer of its own. The value starts as the struct's default instance, which holds that initializer, so a member both braces leave out (FaceIndex) is the engine's in either and stays unwritten. A member the initializer gives and the new braces leave out would load the initializer's value instead of the engine's: `H = {.Hit = {.Distance = 5.0f}}` is refused, naming `H.Hit.Time`. The same holds for a `UE_STRUCT` or another mod's `UE_STRUCT_IN` struct, in a struct's member initializer and in a container's element. | Yes |
 | `FColor Lamp = FColor(255, 128, 0);` | FColor's argument order holds in defaults too. | Yes |
+| `FStats Fresh = FStats();`, `FStats Cleared = {{}, {}};` | A `UE_STRUCT`'s `T()` is its defaults, and writes nothing. A `{}` for a member is a fresh value of its type (zero, empty, None, a `UE_STRUCT`'s own defaults), written even where the member's default differs. In a function, `Code(FStats())` and `FStats S = FStats();` are the Make Struct of its defaults, as `FStats S{}` is. | Yes |
+| `FHitResult Hit = {};`, `FHeld H = {FHitResult(), 5};`, `FTransform T = FTransform();` | An engine struct by `{}` or `T()`: none of its members is written, so it holds what the engine's constructor sets (`FHitResult::Time` is 1, `FTransform()` is the identity, `FFindFloorResult()`'s HitResult has Time 1), however deep it sits in a struct value. The UeApi header's `T() = default;` says nothing of those values. Only `FVector`, `FVector2D`, `FRotator`, `FLinearColor`, `FColor` and the `FVector_NetQuantize` types, whose constructor sets nothing, are written as zeros. `FVector4` is written as (0, 0, 0, 1), its constructor's W, by `{}`, `T()` or no initializer at all, a `UE_STRUCT`'s member too: the engine makes a fresh one as zeros. A `UE_STRUCT` member with an initializer of its own, given `T()` in braces (`{FHitResult(), 5}` where the member is `FHitResult Hit = {.Time = 0.5f};`), is refused as in `UE_DEFAULTS`: see [Class defaults](#class-defaults). | Yes |
 
 Notes:
 - Every value in a default must be known when the mod is built: [Classes and variables](#classes-and-variables).
@@ -1244,6 +1258,7 @@ needs a container variable, not one a call returns.
 | `Items.Empty()`, `Items.Sort()`, `Items.Pop()` | Refused by clang. `Empty`, `Emplace`, `FindOrAdd`, `IsEmpty`, `Last`, `Pop`, `Sort` and the like are UE C++, not Blueprint nodes, and the SDK does not declare them. | Refused |
 | `Seen[0]` on a TSet | Refused by clang: a set has no `[]`. | Refused |
 | `GetItems().Num()` | Refused (`a container operation needs a variable, not a computed value`). Store the result in a local first. | Refused |
+| `TArray<int32> R = GetItems(); return R.Num();` | The local stays a variable, read once or not: a container function reads its container where it lies, so the call is never folded into its place. The same for a parameter of an `inline` function. | Yes |
 
 ```cpp
 TArray<int32> Scores;
@@ -1316,6 +1331,8 @@ Notes:
 | `TArray<int32> Rolls = {UKismetMathLibrary::RandomInteger(3)};` | Refused: every element of a default must be known when the mod is built. See [Classes and variables](#classes-and-variables). | Refused |
 | `TArray<int32> L = {4, 5, 6};` in a function | The Make Array node: a temporary filled at once, made afresh each time the code runs. | Yes |
 | `TSet<int32> S = {1, 2};`, `TMap<int32, float> M = {{1, 0.5f}};` in a function | Make Set and Make Map. | Yes |
+| `Items = {};`, `Count({})`, `TArray<int32>()`, `return {};` in a function | An empty container: a Make Array (Set, Map) with no element. | Yes |
+| `Size(TArray<int32>{1, 2, M})`, `TSet<int32>{1, M}`, `TArray<int32>({1, 2})` in a function | The typed list, braced or in parentheses: the same Make Array (Set, Map) as the untyped braces. | Yes |
 
 ```cpp
 TArray<int32> Primes = {2, 3, 5};
@@ -1441,7 +1458,15 @@ Notes:
 | `X > 0 ? X * 2 : X < -5 ? -1 : 7` | Only the chosen arm runs. The operator compiles to an if/else that stores into a temp, or straight into the variable being assigned, and `return C ? A : B;` becomes two returns. Nested ternaries work. | Yes |
 | `(C ? Left : Right) = 5` | Refused ("assignment to ConditionalOperator"): Blueprint has no reference to whichever variable the condition picks. Write `if (C) Left = 5; else Right = 5;`. | Refused |
 | `Add5(C ? A : B)` into a `T&` parameter | The callee gets a copy, stored back into the picked variable after the call, with a warning. See [Functions](#functions). | Warns |
-| `A = 1, B = 2`, `++I, --J` | The comma operator is refused, both as a statement ("unimplemented statement BinaryOperator") and as a value ("unimplemented binary operator , on IntInt"). Write two statements. A declaration of several variables, `int32 I = 0, J = N;`, is not the comma operator and works. | Refused |
+| `A = 1, B = 2;`, `++I, --J` | The comma operator as a statement: each side runs in turn, as two statements. A side that does nothing (`I, J++`) is dropped. A declaration of several variables, `int32 I = 0, J = N;`, is not the comma operator and works too. | Yes |
+| `if (bool bOk; Get(Out, bOk), !bOk)`, `switch (N += 10, N)` | An if or switch condition with a comma: the left side runs once, before the test, as an init-statement does, and the right side is the condition. This is how an out-parameter call is tested in one line. | Yes |
+| `int32 N{(Bump(), M)};`, `F((Bump(), M))`, `return (N += 1, N * 2);`, `switch (Bump(), T)` over a `TEnum<E>`, `S = {(Bump(), M), 2}` | A comma inside a statement's expression: the left side runs first, as a statement of its own, and the comma is worth its right side, read where C++ reads it. This holds wherever nothing in the statement runs before the comma: an initialiser, a return value, an assignment's right side, an argument, a braced list's first member. Beside another argument that is no constant (C++ leaves their order open, a parenthesised constructor's `FVector(Get(), (Bump(), M), 0.f)` included; braces fix theirs) the whole argument holding the comma runs first, into a temporary. A left-out argument whose default is a constant counts as that constant. Passed to a reference parameter, `const T&` included, the comma is its right side's variable itself, which the callee reads when it runs, after every argument: only the left side runs first, and the right side must be a variable (see the refusal below). | Yes |
+| `while (Next(X), X > 0)`, `while ((Bump(), N) < 5)`, `A && (Bump(), B)`, `C ? (Bump(), X) : Y`, `Obj->F((Bump(), M))` | Where no statement before the one holding the comma fits, the comma runs in place: its left side, then a copy of its right side, read right after it. That is a loop condition, which runs it again on every trip; the right side of `&&` / `\|\|` and an arm of `?:`, which run it only when C++ does; and an argument of a call on another object, whose object C++ evaluates first. Passed to a reference parameter there, `while (IncRef(0, (Bump(), N)) < 20)`, it is the right side's variable itself, which must then be a plain variable. | Yes |
+| `{G(), (Bump(), M)}`, `L[(Bump(), I)] = G()` | Refused ("the comma operator after something its statement runs first ..."). C++ runs G first: braces evaluate their members in order, and an assignment's right side runs before its left. The comma's left side would run before G. Write the left side as a statement of its own. | Refused |
+| `while ((Bump(), S).X < 3)` | Refused ("the comma operator used as a place, not a value ..."): a member taken of the comma, or the comma bound to an operator's or a constructor's reference, needs the place itself, and a loop condition has no statement before it to hold the left side. Write the left side as a statement of its own. A comma assigned to or updated there works, and so does a member or an element of one, `while (((Bump(), S).X += 1) < 3)`: see [Assignment and updates](#assignment-and-updates). | Refused |
+| `F(G(), (Bump(), L[I]))` where F takes `int32&` or `const int32&`, `Get() + (Bump(), L[0])` over FString | Refused: a comma bound to a reference beside an argument that may run first must end in a variable. That covers a call's reference parameter and an operator's reference operand (FString's `+` takes `const FString&`; the message names the operator). A temporary would not be the place the callee writes or reads, and `L[I]` located again after G would not be the one C++ binds. In a loop condition, the right of `&&` / `\|\|` / `?:` or a call on another object, a comma passed to a reference parameter must end in a variable even alone. | Refused |
+| `(Bump(), M) * (G() + 0.5)` | Refused for the double math (`no Kismet conversion from float to double`), as `M * (G() + 0.5)` is. The comma runs first into a temporary, and the conversion to double stays outside it. A comma whose own value is a type no Blueprint variable holds is refused naming that type. | Refused |
+| `int32 D = (1, 4);` as a class default | The right side, when the left side does nothing. A left side that does something would run when the game builds the object, which a default cannot: refused as any computed default. | Yes |
 
 Notes:
 
@@ -1462,8 +1487,10 @@ Notes:
 | `Spots[Name].X = 1;` | A store into a map value's member is copied out, changed and stored back, as `T E = Map[K]; E.X = 1; Map[K] = E;`, with the key evaluated once. | Yes |
 | `Acc += I;`, and `-=` `*=` `/=` `%=` `&=` `\|=` `^=` `<<=` `>>=` | `X = X op Y`: a math node and a Set. X is located once, so `Slots[NextSlot()] += By` calls NextSlot a single time, and Y is evaluated first. It works on everything plain `=` works on, map values and their members included. `<<=`, `>>=` and int64 `%=` follow the rules of the plain operators. | Yes |
 | `int32 Z = (Y += X) * 10;` | A compound assignment used as a value is X after the store. | Yes |
+| `IncRef(1, B += 1)`, `Peek(SetB(), ++B)`, where the parameter is `int32&` or `const int32&` | Passed to a reference parameter, a compound assignment or a prefix `++` / `--` is the variable itself, as a plain `=` is: the update runs first, as a statement, and the callee reads, and for `T&` writes, B after every argument. Its left side must be a plain variable (`IncRef(1, L[Idx()] += 1)` is refused). The same holds in a loop condition (`while (IncRef(0, B += 1) < 20)`), on the right of `&&` / `\|\|` or in `?:`, and in a call on another object (`P->IncRef(1, B += 1)`). There the call runs as one block each time C++ runs it: the object first, then the update, then the call on B. Behind something its statement runs first, `{G(), IncRef(0, B += 1)}`, it is refused, since the update would run before G. | Yes |
 | `X++`, `++X`, `X--`, `--X` | The Increment Int and Decrement Int macros, with X located once. Postfix gives the value before the store, prefix the value after. Works on int32, int64, float and uint8 (a uint8 wraps at 255). On a raw pointer it steps by the element size; see [Pointers and memory](#pointers-and-memory). | Yes |
-| `A = B = 0;`, `if ((X = Next()) > 3)` | Refused ("unimplemented binary operator = on IntInt", the flavour following the operand type): plain `=` works only as a statement. Use an init-statement, `if (int32 Twice = V * 2; Twice > 10)`, or a declaring condition, `while (int32 Left = Start - Steps)`. | Refused |
+| `A = B = 0;`, `S1 = S2 = Name;`, `if ((X = Next()) > 3)`, `return A = N;` | A plain `=` used as a value: the assignment runs first, as a statement, and the value is the variable it wrote, read after it. Numbers, strings and structs alike. It works wherever the comma operator does, and like it, passed to a reference parameter (`const T&` included) it is that variable itself, with no copy. In a loop condition (`while ((V = Next()) > 0)`, `while (UsePair(T = S) < 100)` with a struct passed by value), on the right of `&&` / `\|\|` / `?:` or in an argument of a call on another object it runs in place, as the comma does there; a member taken of it in those places, `while ((T = S).X < 9)`, is refused ("an assignment used as a place, not a value ..."). Behind something its statement runs first, `{G(), (A = M)}`, it is refused ("an assignment used as a value after something its statement runs first ..."). The left side must be a plain variable (`A = L[0] = 1` is refused): it is read again. A comma there names one, so `int32 X = ((Bump(), N) = G());` is `(Bump(), N) = G();` then `X = N`, and `((Bump(), T).A = G())` reads T.A. | Yes |
+| `(Bump(), N) += 1`, `while (++(Bump(), N) < 5)`, `(Bump(), N) = G();`, `(N = Next()) += G()` | A comma or a plain `=` assigned to or updated writes the variable it names: the comma's right side, or the `=`'s left side after the assignment. The outer assignment's right side runs first, as C++17 orders it, then the comma's left side (or the inner assignment), then the store: `(Bump(), N) = G()` gives N what G returned before Bump ran; a struct's or FString's `=` reads an element on its right through its reference, so `(Bump(), T) = L[Count]` locates L[Count] before Bump and reads it after. In a loop condition, on the right of `&&` / `\|\|` and as a statement alike. A member or an element of one is the same member or element of the variable, its index run after the comma: `while (((Bump(), T).A += 1) < 5)`, `((Bump(), L)[0] += 1)`, `(Bump(), L)[Idx()] = G();` (G, then Bump, then Idx). The inner `=`'s left side must be a plain variable, or a comma that names one (`((Bump(), N) = G()) += 1`); `(L[Idx()] = M) += 1` is refused: it is named twice. An update or a struct's `=` there is the same: `while (((N += G()) += 1) < 20)` is `N += G(); N += 1` on every trip, `++(N += 1)` steps N twice, `(N += G()) = N + 5;` reads N + 5 first, and `while (((T = S).A += 1) < 5)` copies S, then updates T.A. `(L[Idx()] += M) += 1` is refused the same way. | Yes |
 
 ### Evaluation order
 
@@ -1472,6 +1499,7 @@ Notes:
 | `Slots[Cursor] = NextSlot();` | The right side of `=` or `op=` runs first, then the destination (object, array, index, map key) is located, as C++17 requires. This stores at the new Cursor. | Yes |
 | `GetPeer()->SetCursor(SwapPeerInline());` | The object a call runs on is evaluated before its arguments. When an argument needs statements of its own that could change the object, the object is saved into a local first. The same holds for `E1[E2]`, a container method's container and a dispatcher's Broadcast. | Yes |
 | `Bump() * 100 + BumpInline()`, `Pair(Bump(), BumpInline())` | An operand or argument that needs statements (an inline call, `&&`, `\|\|`, `?:`, a `++` or `op=` value, a pointer read) runs before the whole expression or call. C++ leaves this order unspecified. | Yes |
+| `FIntPoint P = {Bump(), M ? N : 0};` | A struct literal's members run left to right, each once, as C++ requires of braces: each computed member is its own statement. | Yes |
 
 ```cpp
 TArray<int32> Slots;
@@ -1587,6 +1615,7 @@ Notes:
 | `break;`, `continue;` | Plain jumps. `break` leaves the innermost loop or switch. `continue` goes to a for loop's increment, a do-while's test, or the loop around a switch. Inside an inline function's body they belong to that body's own loops. | Yes |
 | `goto done;` | A jump, backward or forward, which can leave any number of loops at once. The editor's nearest equivalent is a wire looping back. Each expansion of an inline function gets its own labels. A declaration that a goto reaches again is made again, as one in a loop is. | Yes |
 | `return Found;`, `return;` | The Return Node. `return C ? A : B;` becomes two returns. In an inline function, return jumps to the end of the expanded body. Inside a TMap loop that writes values back, the values are stored first. | Yes |
+| `return Log(Errors, "bad");` in a void function | A void call, then a plain return, as C++ runs it. `return (void)X;` with an X that does nothing is a plain return. | Yes |
 | `goto` inside a TMap loop that writes values back | Refused; see [Loops](#loops). | Refused |
 
 ```cpp
@@ -1652,7 +1681,7 @@ a build a loop that never ends hangs the game instead of being stopped.
 | `for (int32 I = 0; I < Count; ++I)` | `Init; while (Cond) { Body; Inc; }`: the editor's ForLoop, with any condition and increment. `continue` reaches the increment. Loops nest freely. | Yes |
 | `for (;;)`, `for (; I < N; I++)` | A missing condition is `true`, and a missing init or increment is left out. | Yes |
 | `for (int32 I = 0; int32 L = N - I; ++I)` | A declaring condition: L is made again and tested on every trip, and `continue` still reaches the increment. | Yes |
-| `for (int32 I = 0, J = N; I < J; ++I, --J)` | The comma in the increment is refused (see [Operators](#operators)); the two-variable init is fine. Move `--J` into the body. | Refused |
+| `for (int32 I = 0, J = N; I < J; ++I, --J)` | Two variables, both updated in the increment. See [Operators](#operators) for the comma. | Yes |
 
 ### Range-for over a TArray
 
@@ -1963,6 +1992,7 @@ written inside the class does not make a method inline. Only the `inline` keywor
 |---|---|---|
 | `int32 AddCharges(int32 By) { ... }` | A Blueprint function, Public and BlueprintCallable. An editor Blueprint can call it, and an editor subclass can override it. | Yes |
 | `void Refill(int32 Amount);` and `void AMyActor::Refill(...) { ... }` | The same function, defined outside the class or in a `.cpp` beside the header. The definition gives the body and parameters; the declaration gives `static` and the access. | Yes |
+| `int32 Pick(int32, int32 B)` | A parameter left unnamed is cooked as `P<its index>` (`P0` here; `_` is added while another parameter or a local of the body has that name, so `void Fill(int32&, int32 B) { int32 P0 = B * 2; ... }` names it `P0_`), as the editor names every pin. Callers pass it in its place. | Yes |
 | `int32 GetCharges() const` | A const Blueprint function, as a UFUNCTION declared const would be. | Yes |
 | `UE_PURE int32 Doubled() const` | A pure function: the editor draws it as a node without exec pins. Each C++ call runs once, where it is written. An editor pure node, by contrast, runs again for each use. | Yes |
 | `UE_PURE static int32 Clamp01(int32 V)` | A pure static function. | Yes |
@@ -1973,7 +2003,7 @@ written inside the class does not make a method inline. Only the `inline` keywor
 | `UE_CATEGORY("Teleporter\|Setup");` | The category of the members that follow, written into the editor API stub; see [Classes and variables](#classes-and-variables). | Yes |
 | `UE_AUTHORITY_ONLY` / `UE_COSMETIC` | The editor's Authority Only and Cosmetic function flags; see [RPCs](#rpcs). | Yes |
 | `generate_api: true` in `mods.yaml` | Writes an editor stub of the class, so a Blueprint made in the editor can place call nodes for its functions; see [Editor API stubs](GUIDE.md#editor-api-stubs). | Yes |
-| `int32 Undef(int32 X);` with no body anywhere | Not refused. No function is cooked, but a call to it still compiles to a call by name of a function the class does not have. Give every method a body, or make it `virtual ... = 0` for an empty one. | Not yet |
+| `int32 Undef(int32 X);` with no body anywhere | No function is cooked, and a call to it is refused ("... declares and never defines"), as C++ would not link it. Give every method a body, or make it `virtual ... = 0` for an empty one. | Refused |
 | `AMyActor() { Charges = 5; }` | A constructor body is silently ignored: it makes no function and no default. Use a member initializer or UE_DEFAULTS, and do runtime setup in ReceiveBeginPlay; see [Class defaults](#class-defaults). | Not yet |
 | `int32 Sum() const { ... }` inside a UE_STRUCT | A struct holds no functions. A non-inline struct method is not refused and compiles to a call that cannot work; an inline one is refused (`called on another object`). Write a free inline function that takes the struct: `inline int32 SumOf(const FPair &P)`. | Not yet |
 
@@ -2010,7 +2040,7 @@ Notes:
 | `Peer->Bump(1)` | Runs on that object and reaches the most derived version for its class. | Yes |
 | `Fact(V - 1)` inside `Fact` | Recursion. Each call gets its own frame, as a recursive Blueprint function does. Mutual recursion works the same way. | Yes |
 | `Other->Twice(3)` where `Twice` is inline | Refused; see the inline table below. | Not yet |
-| `Bump(By)` in a `final` class, or to a `final` method | Reaches that one function directly, the editor's call to a function no Blueprint can override, instead of by name. The body is copied into the caller, as an inline function's is, and the function is still cooked for every other caller: the editor, delegates, timers, other mods. | Yes |
+| `Bump(By)` in a `final` class, or to a `final` method | Reaches that one function directly, the editor's call to a function no Blueprint can override, instead of by name. The body is copied into the caller, as an inline function's is, and the function is still cooked for every other caller: the editor, delegates, timers, other mods. A function the final class inherits, overrides, or implements for an interface it lists is not cooked Final (an override takes its parent's flags, an implementation keeps the interface function's BlueprintEvent), so a call to one whose body is not copied in (authority-only, an RPC, `noinline`) stays a call by name, as the editor's is; with no subclass, the name finds that one function. | Yes |
 | `Twice(V)`, a static of a class this source cooks | Its body is copied in the same way. | Yes |
 | `Peer->Bump(1)` in a `final` class | Direct, but not copied in: the body would need Peer as its `this`. | Yes |
 | `[[gnu::noinline]] int32 Kept(int32 V)` | Calls to Kept stay calls, wherever they could be copied in. | Yes |
@@ -2056,8 +2086,8 @@ Notes:
 - These are never copied in: a function that waits (Delay, UE_AWAIT) or contains a goto; an RPC, an authority-only or
   cosmetic function; an override of an engine function; UE_NO_OPTIMIZE on the function or on the caller; a class
   another mod cooks (UE_CLASS); a function whose body calls a parent's function that is not copied in, such as
-  `Base::AuthOnly()` (see [Calling the parent](#calling-the-parent)): that call is bound from the function's own
-  class, and in a subclass's copy it would be the subclass's.
+  `Base::AuthOnly()`, itself or in an inline body it expands (see [Calling the parent](#calling-the-parent)): that
+  call is bound from the function's own class, and in a subclass's copy it would be the subclass's.
 - Copying makes the caller bigger. A large function called in many places may be worth `[[gnu::noinline]]`.
 - A function that native code intercepts by name, such as an empty one a DLL or script mod hooks to read its
   arguments, must be `[[gnu::noinline]]`: a copied call runs the body in place and never reaches the hook.
@@ -2145,6 +2175,10 @@ Notes:
 | `static APawn *FirstPawn(UObject *WorldContextObject = nullptr)` | The first parameter whose name starts with `WorldContext` is what every engine call inside the static receives as its world context, as the editor wires the hidden pin. A caller that leaves it out passes its own `this`, or its own world context when the caller is itself such a static. | Yes |
 | `class MyLib : public UBlueprintFunctionLibrary` holding statics | The editor's Blueprint Function Library. Another mod that includes its header calls the statics like an engine library's: a final call on the library's default object, with a world context left out filled with the caller's `this`. | Yes |
 | A static that calls Delay or UE_AWAIT | Refused: `a static function has no object whose ubergraph frame could keep its locals`; see [Latent calls](#latent-calls). | Refused |
+| `static int32 Tell(int32 V)` in a class whose mod parent has a static `Tell` too | Hides the parent's, as in C++, with a warning: "... hides Parent::Tell, a static: compiled as C++ name hiding ...". Every call to a static is bound to the one it names, so `Tell(V)` runs this one and `Parent::Tell(V)` the parent's. It is cooked with the parent's static as its super, as the editor links any function named like a parent's; the editor itself would refuse the name ("cannot be overridden"). | Warns |
+| `static float Tell(float V)` over a mod parent's `static int32 Tell(int32)` | Refused: "... is static and hides Parent::Tell, a static of another signature, ...". Its super would be the parent's static, a function of other parameters, which no editor links. Rename this one. | Refused |
+| A method that is not static named like a mod parent's static, or a static named like a parent's method | Refused: "... is static, and the editor takes a function of that name in a subclass for an override of it ..." or "... is static, and the Parent::Tell it hides is not ...". The editor makes a function named like a parent's an override of it, and an override must agree with it on Static. The parent may be another mod's class, from the header it shares. Rename one of them. | Refused |
+| A static or a method named like one a mod parent of this source declares and never defines (no body, not `= 0`) | The parent compiles no function of that name, so this one hides nothing a Blueprint has: no warning, no refusal, no super, and its parameters may differ from the declaration's (`float Scale(float)` over a declared-only `int32 Scale(int32)`): a call to the declared-only one is refused, as C++ would not link it, so none lays out the parent's parameters. A function above the parent of that name, a native one too, is found as if the parent did not declare it. | Yes |
 
 ```cpp
 static int32 Twice(int32 V) { return V * 2; }
@@ -2206,6 +2240,7 @@ overload is the one with the most parameters.
 | `inline int32 Get(int32 A, int32 B)` beside a non-inline `int32 Get(int32 A)`, then `Get(V)` | Refused: `an overload set may not mix inline and non-inline functions`. Make the non-inline overload the one with the most parameters, or rename it. | Not yet |
 | `int32 Ov(int32 A)` beside `int32 Ov(int32 A, int32 B)`, neither inline | Refused: "a second function of that name". A Blueprint class has one function per name. Give them different names, or make the extra overloads `inline`. | Refused |
 | `int32 Get()` beside `int32 get()` | Refused: "differs from Get only in case". An FName ignores case, so both would be one function. The same holds for two variables, a variable and a function, and a name an ancestor already has: `int32 get()` in a class whose parent has `Get()` is refused, while `Get()` itself overrides it. | Refused |
+| `int32 None;`, `int32 none();`, a `UE_STRUCT` member `int32 NONE;` | Refused: "None is UE's empty name". The name None is UE's empty name in any case, which the Blueprint editor refuses for a variable or a function. A saved value's members end at one of that name, so a `UE_STRUCT` member called None would cut the struct's value short in a class default. The same for a component and an interface's member. | Refused |
 
 ```cpp
 inline int32 Pick(int32 V) { return V + 1; }
@@ -2240,6 +2275,7 @@ latent call's `FLatentActionInfo`, because the compiler fills them in.
 | `UGameplayStatics::ApplyDamage(...)`, `PlaySound2D(...)` | An authority-only or cosmetic static is called on the library's default object, so the engine checks where it may run, as for the editor's node. | Yes |
 | `UGameplayStatics::GetPlayerPawn(0)` in a class that is no actor, component, widget, GameInstance or subsystem | Warns: "passes self as GetPlayerPawn's world context, and an object of this class finds its world only through its Outer". The editor wires self to the pin only in a class with a world. Make the object with an actor or component as its Outer, or pass a world context. | Warns |
 | A static of a game Blueprint library, or of another mod's library | A final call on that class's default object. | Yes |
+| `Json->GetPath(...)` on a game Blueprint, `T->Fire(2)` on another mod's class | A call by name, as the editor calls a Blueprint function that is not final: on an object of a subclass that overrides it, the override runs. A function the header marks `final`, a static, and a parent call (`Turret::Fire(N)` in an override) are bound to that class's function. | Yes |
 | A call or an expression passed to an engine function's `const T&` parameter | Stored in a hidden local first, because the VM needs an address. | Yes |
 | `Target->K2_DestroyActor();` with `Target` null | The call is skipped (the engine logs "Accessed None"), and a returned value reads as zero. C++ would crash here; a Blueprint does not. The same holds for a mod function called on a null object. | Yes |
 | `Seen->GetPriority()` on a `TScriptInterface<ITagged>` | A call by name to the object behind the interface; see [Interfaces](#interfaces). | Yes |
@@ -2443,6 +2479,8 @@ Notes:
 | `SuperBase::Twice(1)` in a class that does not declare Twice | SuperBase's Twice, its body copied in: C++ runs that function without dispatch, so an object of a subclass that overrides Twice does not reach its own. | Yes |
 | The same call to a function whose body cannot be copied in: authority-only, cosmetic, a server or client RPC, `noinline`, one that waits, one whose body makes such a call itself, or any from a `UE_NO_OPTIMIZE` caller | SuperBase's function, without dispatch. Blueprint calls a parent's function that way only from a class that has its own function of that name, so AssetGen adds one to your class: an override of the method that only calls the nearest parent's version with the same arguments, compiled like one you write, with an override's flags and super. The call is then bound to SuperBase's function, and a subclass's override of the method overrides the added one. A call by name runs what it ran before: the added override passes it on, and the engine routes both calls the same way. | Yes |
 | The same call to a multicast RPC | A call by name, with a warning: an object of a subclass that overrides the function runs its override. On a server a multicast runs locally and is also sent, so an added override would send it once, then again when it calls the parent's. An override you declare yourself does that too, as an editor override that calls its parent does. | Warns |
+| `SuperTest::Thrice(1)` in SuperTest's own code | SuperTest's own Thrice, its body copied in: C++ runs that one without dispatch, also on an object of a subclass that overrides Thrice. | Yes |
+| The same call to one of the class's own functions whose body cannot be copied in | A call by name, with a warning: on an object of a subclass that overrides the function, the override runs. A Blueprint calls its own class's function without dispatch only when that function is `final`, and then the call is bound to it. | Warns |
 | `Other->SuperBase::Bump(1)` | Not what C++ does. The qualifier is recognised only on `this`, so this is a call by name that reaches Other's most derived Bump. | Not yet |
 
 ```cpp
@@ -2469,10 +2507,12 @@ public:
 
 Notes:
 
-- Inside an inline body, `Base::Method()` is judged from the class the body is written in. No override is added for
-  a call there, since the body is copied into subclasses too: one whose body cannot be copied in goes by name, with
-  the warning. So does such a call where the nearest parent's declaration of the method has a parameter with no
-  name, or is inline, static or pure virtual.
+- An inline body, a member template's too, is copied into each class that calls it, and `Base::Method()` in it is
+  judged from that class, as if written there: a class with its own Method makes the parent call, and one without gets
+  the added override. A plain `Method()` in it stays a call by name from every such class.
+- No override is added where the nearest parent's declaration of the method is inline, static or pure virtual: such a
+  call whose body cannot be copied in goes by name, with the warning. A parameter the parent leaves unnamed is named
+  in the added override (`P0`, `P1`, ... by position) and passed on.
 - A parent this source cooks has its body copied in, as a `final` method's is (see
   [Calling your own functions](#calling-your-own-functions)). An override of an engine event, such as
   ReceiveBeginPlay above, stays a call.
@@ -2493,7 +2533,7 @@ object, write a free inline function.
 | `inline bool AttachTo(USceneComponent *Child, USceneComponent *Parent)` at namespace scope | A free inline function, expanded at every call. A free function can act on any object; an inline method expands only on `this`. | Yes |
 | `int32 Helper(int32 X) { ... }` at namespace scope, without `inline` | Refused at the call: `call to an unknown function: Helper`. A Blueprint has no free functions. Add `inline`, or make it a static of a function library class. | Refused |
 | `static inline int32 AddOne(int32 V)` in a library class | Expanded at the call, from its own class or from any class that includes the header, in any mod. The library does not export it. | Yes |
-| `Bump(By)` inside an inline body that a subclass expands | A call on `this` goes by name, so the object's most derived method runs, including an override compiled later. | Yes |
+| `Bump(By)` inside an inline body or a member template that a subclass expands | A call on `this` goes by name, so the object's most derived method runs, including an override compiled later or one in a class between. | Yes |
 | `Other->Twice(3)` where `Twice` is an inline method | Refused: `called on another object (only this)`, because `this` in the body stays the caller's self. Make the method non-inline, or write a free inline function that takes the object. | Not yet |
 | An inline function that calls itself, directly or through another inline | Refused (`calls itself`): the expansion would never end. Make it non-inline; a Blueprint function may recurse. One overload calling another is fine. | Refused |
 | `inline int32 Nope(int32 X);` with no body | Refused at the call (`has no body`). clang also warns with `-Wundefined-inline`. | Refused |
@@ -2561,7 +2601,7 @@ Notes:
 | `SpawnActor<AActor>(AActor::StaticClass(), Where)` from `Objects.h` | Each instantiation clang makes is expanded at its call like any inline function. No function exists per instantiation; see [Creating objects](#creating-objects). | Yes |
 | `template <class T> inline T Max2(T A, T B)` | A free function template needs `inline`. | Yes |
 | `template <class T> T Max2(T A, T B)` without `inline` | Refused at the call: `call to an unknown function: Max2`. Add `inline`. | Refused |
-| `template <class T> int32 WidthOf()` in a class | A member template is expanded at its call, with or without `inline`. No Blueprint function is made, and only calls on `this` expand. | Yes |
+| `template <class T> int32 WidthOf()` in a class | A member template is expanded at its call, with or without `inline`. No Blueprint function is made, and only calls on `this` expand. Its body is its own class's code, as an inline method's is: a call in it is read there, wherever it is copied. | Yes |
 | `inline auto TwiceN(Number auto V)`, or `int32 AutoP(auto V)` in a class | An `auto` parameter makes the function a template, expanded at each call. A free one needs `inline`. | Yes |
 | `template <class T> concept Number = requires(T A) { A + A; };` | Concepts and requires-clauses are checked by clang and cost nothing at run time. A wrong type is a "constraints not satisfied" error on the calling line. | Yes |
 | `template <class... T> inline int32 Fwd(T... V) { return Sum2(V...); }` | Pack expansion into a call works. | Yes |
@@ -2681,21 +2721,23 @@ Notes:
 | `UE_COMPONENT(USceneComponent, Root);` as the first scene component | Becomes the actor's root. | Yes |
 | a later scene component | Attaches directly to the root, unless `SetupAttachment` places it. | Yes |
 | a component that is not a scene component, such as `UProjectileMovementComponent` | Is created with no attachment, wherever it is declared. | Yes |
-| no `UE_COMPONENT` at all | The actor gets the engine's default scene root. | Yes |
+| no `UE_COMPONENT` at all | The actor gets the default scene root, as in the editor: a `USceneComponent` named DefaultSceneRoot, made by the class's construction script, which a reference can name across the network, and held in the class's variable `DefaultSceneRoot`. Below a parent that gives the actor a root already, it gets none. | Yes |
+| a member named `DefaultSceneRoot` in an actor class | Refused: the construction script stores the default scene root in the variable of that name, a second one or the one a subclass declares. | Refused |
 | only components that are not scene components | The actor gets the engine's default scene root too, as in the editor, so a movement component has a root to move. Below a parent that gives the actor a root already, a Blueprint parent or a native one such as ACharacter (its capsule), it gets none, as in the editor. | Yes |
 | `UE_DEFAULTS { Tip->SetupAttachment(Glow); }`, Glow another `UE_COMPONENT` of the class | Tip attaches to Glow, as in a C++ constructor: in the construction script it is one of Glow's child nodes. It keeps its own location, rotation and scale, relative to Glow. | Yes |
 | `Tip->SetupAttachment(Glow, FName("Muzzle"));` | The same at a socket or bone of Glow (the node's AttachToName). The socket is a literal name or none; a variable or a call there is refused, since it would be dropped. | Yes |
 | `Glow->SetupAttachment(Lamp);`, Lamp a component of a mod or game Blueprint parent | Glow attaches to the inherited Lamp. Its node names Lamp and the parent class whose construction script makes it (ParentComponentOrVariableName, ParentComponentOwnerClassName), as the editor saves a component dropped on an inherited one. A game Blueprint's component needs the UeApi header to mark it as a construction-script node (`Scene__UeScsNode`); one without it is refused with what to regenerate. | Yes |
-| `Glow->SetupAttachment(Mesh);` in an `ACharacter` child | Glow attaches to a native default subobject. The node names the subobject by its object name, `CharacterMesh0` for `Mesh` (bIsParentComponentNative), which UeApi records. It stays `CharacterMesh0` further down, in an `APlayerCharacter` child, though `FPMesh` is a skeletal mesh too: a subclass cannot rename a subobject its parent makes. A native member that is no default subobject, such as `AActor`'s `RootComponent`, is refused: attach to it at run time. | Yes |
+| `Glow->SetupAttachment(Mesh);` in an `ACharacter` child | Glow attaches to a native default subobject. The node names the subobject by its object name, `CharacterMesh0` for `Mesh` (bIsParentComponentNative), which UeApi records. It stays `CharacterMesh0` further down, in an `APlayerCharacter` child, though `FPMesh` is a skeletal mesh too: a subclass cannot rename a subobject its parent makes. A native member that is no default subobject is refused: attach to it at run time. | Yes |
+| `Glow->SetupAttachment(RootComponent);` | Glow attaches to the actor's root, whichever component that is, as a constructor's call does. Below a parent that gives the actor a root, such as `ACharacter`'s capsule or a Blueprint parent's root, its node is a root node naming no parent, which the construction script attaches to that root. With no root to inherit, Glow is never the root itself: it hangs from the first scene component `SetupAttachment` leaves alone, or, with none, from the default scene root, which stays, as the editor keeps a component added under it. It keeps its own location, rotation and scale, relative to the root. `SetupAttachment(RootComponent, FName("Sock"))` attaches at that socket of the root, the node's AttachToName. | Yes |
 | `Lamp->SetupAttachment(Own);` for an inherited Lamp, `A->SetupAttachment(B); B->SetupAttachment(A);`, or one component attached twice | Refused. An inherited component stays where its own class puts it. A cycle has no node the construction script starts from, so none of its components would be made. | Refused |
-| `Pivot->SetupAttachment(Lamp);` in a function | Attaches at once, keeping the relative transform: `K2_AttachToComponent` with KeepRelative for location, rotation and scale, and no welding. That is what the engine's own `SetupAttachment` leads to when the component registers; called on a component already registered, as any in a function is, the engine's own does nothing. | Yes |
+| `Pivot->SetupAttachment(Lamp);` in a function | Attaches at once, keeping the relative transform: `K2_AttachToComponent` with KeepRelative for location, rotation and scale, and no welding. That is what the engine's own `SetupAttachment` leads to when the component registers; called on a component already registered, as any of a constructed actor is, the engine's own does nothing, so the compiler warns, naming the function. Call `AttachToComponent` to pick the rules yourself. | Warns |
 
 Notes:
 
 - If the parent class already has a root, such as `ACharacter`'s capsule or a mod parent's first scene component, this
   class's first scene component attaches under that root instead of replacing it.
 - With no root to inherit, the root is the first scene component that `SetupAttachment` leaves alone, even if a
-  component declared before it is attached elsewhere.
+  component declared before it is attached elsewhere, to `RootComponent` too.
 - The root's own location, rotation and scale are a special case: see [Class defaults](#class-defaults).
 
 ### Adding components at run time
@@ -2704,6 +2746,7 @@ Notes:
 |---|---|---|
 | `AddComponentByType<USceneComponent>(this)` | The Add Component by Class node (`AActor::AddComponentByClass`), returning the component as a `T*`. It is created at the owner's origin, and a scene component attaches to the owner's root. | Yes |
 | `AddComponentByType<UCharges>(this, ChargesClass, true)` | The class can be picked at run time as a `TSubclassOf<T>`; it is `T` by default. The third argument is bManualAttachment: with `true`, a scene component is not attached. A component class the mod declares itself works here. | Yes |
+| `AddComponentByType<UAbstractComp>(this)`, where the class has a `= 0` method left or is a UE_FINAL_AS base | Refused: "is an abstract class ... which the engine may not construct". AddComponentByClass constructs it with NewObject, which asserts on an abstract class in a Development game. Add a subclass that defines every `= 0` method, or the UE_FINAL_AS leaf, which the message names. Only a class the call names is checked. | Refused |
 | `AddComponentDeferred<UCharges>(this)`, then `FinishComponent(this, C)` | The Add Component node with exposed pins. Registration, and with it the component's BeginPlay, waits for `FinishComponent` (`AActor::FinishAddComponent`), so the values you set in between are the first ones it sees. | Yes |
 | `AttachToComponent(Muzzle, Barrel)` | `K2_AttachToComponent` with one attachment rule for location, rotation and scale (SnapToTarget unless you pass another) and welding on. Returns whether it attached. | Yes |
 | `AttachToComponent(Gun, Hand, FName("hand_r"), EAttachmentRule::KeepRelative, false)` | The same at a socket, with another rule and without welding. For a different rule per channel, call `Gun->K2_AttachToComponent(...)` yourself. | Yes |
@@ -2767,7 +2810,11 @@ component: see [The root and attachment](#the-root-and-attachment).
 | `Extra->bVisible = false;`, where `Extra` is a plain pointer member | Refused: "is not a UE_COMPONENT". Only a `UE_COMPONENT`, this class's or a parent's, has a template to hold defaults. | Refused |
 | `Lamp->Intensity += 100.0f;`, an `if`, a call such as `K2_DestroyActor();` | Refused: "every statement is `Field = value;`, `Component->Field = value;` or `Component->SetupAttachment(Parent);`". The block never runs, so logic in it could do nothing. | Refused |
 | `Lamp->Intensity = UKismetMathLibrary::RandomFloat();`, `InitialLifeSpan = sizeof(FVector);` | Refused: "a default is a value known when the mod is built". A value here follows the rules for a member's initializer: see [Classes and variables](#classes-and-variables). Compute anything else in `ReceiveBeginPlay` or `UserConstructionScript`. | Refused |
-| `Instigator = nullptr;`, `Mesh->StaticMesh = nullptr;` | Refused: "needs a literal value". `nullptr` writes nothing, so `UE_DEFAULTS` cannot clear an inherited object reference. Leave the statement out to keep the parent's value. | Refused |
+| `Instigator = nullptr;`, `Mesh->StaticMesh = nullptr;`, `Count = {};`, `Rule = EAttachmentRule();`, `Offset = FVector();` | The type's zero, written over the parent's value: null, 0, `false`, the zero enumerator, None, an empty string or container, and the zeros of `FVector`, `FVector2D`, `FRotator`, `FLinearColor`, `FColor` and the `FVector_NetQuantize` types, whose engine constructor sets nothing. A `UE_STRUCT`'s `{}` or `T()` is its own defaults, and so is another mod's (`UE_STRUCT_IN`): its header says each member's initializer, written. The same as `Count = 0;`. | Yes |
+| `Hit = FHitResult();`, `Hit = {};`, `Floor = FFindFloorResult();`, `Xf = FTransform();`, a `UE_STRUCT`'s `{}` that holds an FHitResult | Refused: "holds what the engine's FHitResult constructor sets". Any other engine struct than those above holds what the engine's constructor sets (`FHitResult::Time` is 1, `FTransform()` is the identity), which no header says, so it cannot be written over the parent's value. Leave the statement out, or give the members in braces: `Hit = {.Time = 1.0f};`. `V4 = FVector4();` is written, (0, 0, 0, 1). | Refused |
+| `Hit = {.Distance = 6.0f};` | The members given are written. One the braces leave out holds what the engine's constructor sets, which no header says: it is left unwritten where the parent's value is a fresh one (declared in a mod parent with no initializer, `{}` or `T()`, or with braces that leave it out, followed down, and set by no `UE_DEFAULTS` on the way), and refused over any other value: "Hit.FaceIndex, left out of the braces, holds what the engine's FHitResult constructor sets". Give every member, or leave the statement out. A `UE_STRUCT` value's braces, `H = {.N = 5};`, refuse a member of such a struct they leave out the same way. Braces nested for a `UE_STRUCT`'s member, `H = {.Hit = {.Distance = 5.0f}};`, are over a fresh value where that member has no initializer of its own, or one whose braces, followed down, leave it out: with `FInner In = {.K = 4};`, `O = {.In = {.Hit = {.Distance = 3.0f}}};` leaves the rest of Hit unwritten, and where the initializer gives Hit `{.Time = 0.5f}`, the Time the new braces leave out is refused. Another mod's struct (`UE_STRUCT_IN`) is no engine struct: a member its braces leave out takes the initializer its header gives it, written. | Yes |
+| `Hit = {.Time = 3.0f};` then `Hit = {.Distance = 6.0f};` | The last statement on a member is its value, as the last assignment is in C++: the earlier one writes nothing, so `Hit` is Distance 6 with Time the engine's 1, not 3. | Yes |
+| `Handle = FTimerHandle();` | Writes nothing, with a warning: FTimerHandle's one member is Transient, which the engine never loads from a default, so the value stays the parent's. | Warns |
 | `Lantern() { InitialLifeSpan = 5.0f; }` | Not yet: a constructor is dropped with no message. It makes no function and writes no default. Use initializers and `UE_DEFAULTS`, and do run-time setup in `ReceiveBeginPlay`. | Not yet |
 
 ```cpp
@@ -2848,8 +2895,9 @@ Notes:
 | You write | What it does | Status |
 |---|---|---|
 | `Lamp->Intensity = 250.0f;`, where a mod parent declares `Lamp` | Overrides that component's defaults for this class only, as the editor does for an inherited component. No `Super::` is needed: the compiler finds the class that declares the member. A grandchild that sets `Lamp->bVisible = false;` keeps the 250 as well: defaults fold down the chain as C++ constructors do. | Yes |
-| `CapsuleComponent->CapsuleRadius = 55.0f;` in an `ACharacter` child | A C++ parent's component is a default subobject. AssetGen overrides it under the subobject's real name and class, which can differ from the member's: `ACharacter`'s `CapsuleComponent` is `CollisionCylinder`. The SDK records the name as `<Member>__UeSubobject`, for a subclass too: `Mesh` in an `APlayerCharacter` child is still `CharacterMesh0`. | Yes |
+| `CapsuleComponent->CapsuleRadius = 55.0f;` in an `ACharacter` child | A C++ parent's component is a default subobject. AssetGen overrides it under the subobject's real name and class, which can differ from the member's: `ACharacter`'s `CapsuleComponent` is `CollisionCylinder`. The SDK records the name as `<Member>__UeSubobject`, for a subclass too: `Mesh` in an `APlayerCharacter` child is still `CharacterMesh0`. Where two of the class's subobjects fit the member and neither has its name, it records the one the game's Blueprints of the class name on their default objects: `ABomber`'s `GooSoundComponent` is `GooAudioComponent`, not `WingSound`. | Yes |
 | `CapsuleComponent->CapsuleRadius = 70.0f;` in a child of a mod class that sets the capsule too | Builds on the parent's override: the child keeps what the parent set, such as its half height, and changes only the radius. The parent is loaded first. A mod parent that leaves the capsule alone still carries one for its child to build on. | Yes |
+| `temperature->TemperatureChangeScale = 2.0f;` in a child of a game Blueprint (`ENE_Spider_Grunt_Normal_C`) | The C++ ancestor's component is a default subobject of the game Blueprint's default object, which its package exports: the override is built on that export, and the class loads after every default subobject the parent exports, restated or not, and every object nested in one, such as the bonus instanced in `WPN_Pickaxe_C`'s `Damage` (the SDK lists them as `UeDefaultSubobjects`). The SDK spells a name as the game's object dump does, which can differ in case from the parent's package (`temperature`, `Temperature`); names compare without case, so both are one object. | Yes |
 | `StaticMesh->RelativeScale3D = FVector(2.0f, 2.0f, 2.0f);` in a child of a game Blueprint | A game Blueprint's component is a construction-script node, as a mod parent's is. The override is keyed on that node's GUID, which the SDK records as `<Component>__UeScsNode`. The node's real name is used, even when it contains spaces. | Yes |
 | `Controller->bAttachToPawn = true;` in an `APawn` child | Refused: "UeApi does not say which default subobject Controller is". Either the member is not a default subobject, and you set the value at run time, or the SDK predates the markers, and you regenerate it with genueapi. | Refused |
 | a component of a game Blueprint whose header has no `__UeScsNode` marker | Refused: "its header does not say which SCS node it is". Regenerate the SDK from a dump made with the Dumper-7 fork, which writes the markers. | Refused |
@@ -2944,8 +2992,8 @@ Notes:
 | `NewObject<UObject>(this, Kind)` | The class picked at run time, as a `TSubclassOf<T>`. | Yes |
 | `CreateWidget<UUserWidget>(PlayerController, HudClass)` | The Create Widget node (`UWidgetBlueprintLibrary::Create`), with the calling object as world context. The owning player may be null. | Yes |
 | `NewObject<AActor>(this)`, `SpawnActor<UObject>(UObject::StaticClass(), Where)` | Refused by clang on the calling line: "no matching function", then a note naming the constraint `T` fails. `SpawnActor` and `SpawnActorDeferred` take an actor class, `AddComponentByType` and `AddComponentDeferred` a component class, `CreateWidget` a widget class, and `NewObject` any other class. | Refused |
-| `SpawnActor<AShape>(AShape::StaticClass(), Where)`, where the class has a `= 0` method left | Warns: "is an abstract class". SpawnActor makes no actor of an abstract class and returns None. Only a class the call names is checked (`X::StaticClass()`); one picked at run time is not. | Warns |
-| `NewObject<USpec>(this)`, where the class has a `= 0` method left | Refused: "is an abstract class ... which the engine may not construct". SpawnObject makes one in a Shipping game and asserts in a Development one; the editor's Construct Object node refuses the class too. Construct a subclass that defines every `= 0` method. Only a class the call names is checked (`X::StaticClass()`, or `NewObject`'s default). | Refused |
+| `SpawnActor<AShape>(AShape::StaticClass(), Where)`, where the class has a `= 0` method left or is a UE_FINAL_AS base | Warns: "is an abstract class" (for a UE_FINAL_AS base, naming the leaf to spawn). SpawnActor makes no actor of an abstract class and returns None. Only a class the call names is checked (`X::StaticClass()`); one picked at run time is not. | Warns |
+| `NewObject<USpec>(this)`, where the class has a `= 0` method left or is a UE_FINAL_AS base | Refused: "is an abstract class ... which the engine may not construct". SpawnObject makes one in a Shipping game and asserts in a Development one; the editor's Construct Object node refuses the class too. Construct a subclass that defines every `= 0` method, or the UE_FINAL_AS leaf the message names. Only a class the call names is checked (`X::StaticClass()`, or `NewObject`'s default). | Refused |
 | `NewObject<UProbe>(nullptr)` | Warns: "SpawnObject with no Outer (None) makes nothing and returns None". Pass the object that owns it, such as `this`. | Warns |
 
 ```cpp
@@ -3065,7 +3113,7 @@ remember: unlike C++, a read through a null object does not crash; it gives zero
 | `Char->InventoryComponent->MiningItem` | The Get node with a Target pin: the property is read from that object, and a chain reads each object in turn. Properties of game classes, of the mod's other classes and of data assets read the same way. A read through a null object gives zero or empty, and the game logs "Accessed None". | Yes |
 | `Other->Hits += 1;`, `Other->Cursor = Next();` | The Set node with a Target pin. As in C++17, the right side is evaluated before the object is located, so if the right side changes what the pointer names, the write goes to the new object. | Yes |
 | `GetPeer()->Slots.Add(5);`, `GetPeer()->SlotMap[FName("a")] = 7;` | A container on another object is changed where it lives, as the editor's container nodes do with a Target. The object is located before the arguments are evaluated, which is C++ order. | Yes |
-| `GetPeer()->OnPeerHit.Broadcast(3);` | Fires the dispatcher of another object of the same class. Only a dispatcher the class being compiled declares can be broadcast; see [Event dispatchers](#event-dispatchers). | Yes |
+| `GetPeer()->OnPeerHit.Broadcast(3);` | Fires the dispatcher of another object of the same class. Another mod class's, a game Blueprint's and a BlueprintCallable native dispatcher can be broadcast too; see [Event dispatchers](#event-dispatchers). | Yes |
 
 ```cpp
 class Peer : public AActor {
@@ -3140,7 +3188,9 @@ Notes:
 | `GetTypedOuter<AActor>(Obj)` | From `Objects.h`: the nearest outer of `Obj` that is a `T`, or null. `Obj` itself is never a candidate, and a null `Obj` gives null. Each step is one outer read and one Cast. | Yes |
 | `GetOutermostTypedOuter<ULevel>(Obj)` | From `Objects.h`: the same walk, keeping the farthest outer that is a `T`. | Yes |
 | `GetOuter()` or `GetTypedOuter<T>()` in a function that waits (`Delay`, `UE_AWAIT`) | Not yet: refused with "a pointer read in a function that makes a latent call". Do the walk in a separate function that does not wait, or loop over `UKismetSystemLibrary::GetOuterObject`, which is an engine call. | Not yet |
-| `Obj->Class`, `Obj->IsA(AActor::StaticClass())` | Refused by clang: "no member named 'Class' in 'UObject'". The SDK declares none of UObject's raw fields (`Class`, `Outer`, `Name`) and no `IsA`. Use the helpers above, and `Cast<T>` to test a class. | Refused |
+| `Obj->IsA(AActor::StaticClass())` | Get Class, then Class Is Child Of: `UKismetMathLibrary::ClassIsChildOf(UGameplayStatics::GetObjectClass(Obj), Class)`. False on a null object. Needs `UeApi/Engine.h`. | Yes |
+| `Class->IsChildOf(AActor::StaticClass())` | Class Is Child Of (`UKismetMathLibrary::ClassIsChildOf`). False on a null class. | Yes |
+| `Obj->Class` | Refused by clang: "no member named 'Class' in 'UObject'". The SDK declares none of UObject's raw fields (`Class`, `Outer`, `Name`). Use the helpers above. | Refused |
 
 ```cpp
 #include "../include/Objects.h"
@@ -3162,6 +3212,33 @@ Notes:
   itself, or that the outer walk is a `GetOuterObject` call, is out of date.
 - The forwarders need the header that declares their target. Without it the compiler says "which is not declared
   here: include its UeApi header"; `UGameplayStatics` and `UKismetSystemLibrary` are in `UeApi/Engine.h`.
+
+### Methods on structs, text and soft pointers
+
+The editor drags a struct pin out to every library function that takes the struct first. UeApi declares each of those
+as a method of the struct, so calls chain the way the nodes do. FString, FName, FText, `TSoftObjectPtr<T>` and
+`TSoftClassPtr<T>` get them too.
+
+| You write | What it does | Status |
+|---|---|---|
+| `AssetData.GetExportTextName()` | `UAssetRegistryHelpers::GetExportTextName(AssetData)`: the value goes first, the arguments after it. | Yes |
+| `Path.ToSoftClassPtr()`, `V.ToString()` | A one-argument `Conv_XToY` is `To<Y>()`: `Conv_SoftClassPathToSoftClassRef`, `Conv_VectorToString`. | Yes |
+| `Soft.LoadClassAsset_Blocking()` | The same on a soft pointer, `UKismetSystemLibrary::LoadClassAsset_Blocking(Soft)`. | Yes |
+| A library function taking a world context, or a latent one, as a method | Not declared: call the static. | Not yet |
+
+```cpp
+UClass *ClassOf(const FAssetData &AssetData)
+{
+  return AssetData.GetExportTextName().MakeSoftClassPath().ToSoftClassPtr().LoadClassAsset_Blocking();
+}
+```
+
+Notes:
+
+- Hover a method in the editor: the comment above it names the library function and the UeApi header it is in. The
+  call needs that header included; without it the compiler says "which is not declared here: include its UeApi header".
+- One function per name. Where two libraries have one, `/Script/Engine`'s wins; call the other as a static.
+- A function whose first parameter is a non-const reference (it changes the value) is not a method.
 
 ### The player and the game
 
@@ -3351,6 +3428,8 @@ not a C++ value, so point at it with `&`.
 |---|---|---|
 | `UMoodDef MD_Big = {.Health = -500.5f, .Title = "Big"};` | An asset of the class, cooked as `<mod package>/MD_Big`. Only the members the braces name are written, and the rest keep the class defaults. A member named with a zero value is still written. | Yes |
 | `UMoodDef MD_Plain = {};` | An asset with the class defaults only. | Yes |
+| `UMoodDef MD_Zero = {.Health = {}};` | `{}` for a member is its zero, written as `.Health = 0` is. A struct, container or name member's `{}` is written too: zeros, an empty container, None, or a `UE_STRUCT`'s own defaults, not the class default. | Yes |
+| `UHitDef HD_Near = {.H = {.Hit = {.Distance = 5.0f}}};` | An asset starts as its class's default object, so braces for a struct member are written over the default object's value, as a `UE_DEFAULTS` statement's are over a parent's. A member they leave out that the engine's constructor sets (`FHitResult`'s FaceIndex) stays unwritten where the default object's value of it is the engine's too. Where the class's own braces or a `UE_DEFAULTS` gave it another value (`H = {.Hit = {.FaceIndex = 3}}`), or the class is a game or engine class, whose value no header says, it is refused, naming the member. | Yes |
 | `UEnemyDescriptor ED_Mine = {.SpawnSpread = 250.0f, .IdealSpawnSize = 4};` | An asset of a game or engine class. | Yes |
 | `namespace Moods { UMoodDef Angry = {.Health = 50}; }` | A namespace is a folder: the asset is cooked at `<mod package>/Moods/Angry`. See [Mod sources and packages](#mod-sources-and-packages). | Yes |
 | `.Delay = FFloatInterval(1.0f, 5.0f)`, `.Delay = {2.0f, 6.0f}` | A struct member, by constructor or by braces, one value per member, as in any default. | Yes |
@@ -3558,8 +3637,8 @@ Notes:
 
 An event dispatcher is a list of bindings that its owner calls all at once. This section covers declaring one on a
 mod class, binding handlers to it and to the game's own dispatchers, broadcasting it, and passing a method as a single
-delegate value. The rule to remember: a binding is an object and a function name, so a handler is always a non-inline
-method of `this` whose parameters match the dispatcher's exactly. [examples/Scoreboard.cpp](examples/Scoreboard.cpp)
+delegate value. The rule to remember: a binding is an object and a function name, so a handler is a non-inline method
+of the object you bind (`this` or another) whose parameters match the dispatcher's exactly. [examples/Scoreboard.cpp](examples/Scoreboard.cpp)
 declares, binds and broadcasts one.
 
 ### Declaring a dispatcher
@@ -3596,10 +3675,12 @@ Notes:
 | `OnDestroyed.Add(this, &Scorer::HandleDestroyed);` | Binds to a game or engine dispatcher of this object or of its component, inline or sparse: OnDestroyed, `Box->OnComponentBeginOverlap`. The handler runs whenever the game broadcasts it. | Yes |
 | `C->OnFirePressed.Add(this, &Scorer::OnFire);` | Bind Event with another object as Target, also through a component: `C->InventoryComponent->OnItemEquipped`. The bound function is still this object's own. | Yes |
 | `OnHit.Add(this, &PBase::BaseHandle);` | In a child of a mod class: Add, Remove and Clear work on a dispatcher the mod parent declares, and a handler the parent defines can be bound. | Yes |
+| `OnHit.Add(H, &Helper::Take);` on a dispatcher a mod or game Blueprint parent declares | Binds Take on H, as on a dispatcher of this class. The delegate is typed with the parent's own `OnHit__DelegateSignature`, imported from its package, as the editor's Create Event does on an inherited dispatcher. The class makes no function of that name, which would hide the parent's. | Yes |
 | The same `Add` twice | The handler is bound once. The engine skips a second binding with the same object and function. | Yes |
 | `OnScored.Remove(this, &Scorer::HandleScored);` | Unbind Event from OnScored. Removes the binding that has this object and this function name. It works on every dispatcher Add works on. | Yes |
 | `OnScored.Clear();` | Unbind all Events from OnScored. Empties the whole list. | Yes |
 | `Proxy->OnCompleted.Add(this, &Scorer::Done);` | An async node with its output pins wired to custom events. Each Add binds one outcome, and one method can serve several. | Yes |
+| `E->EventTriggeredDelegate.Add(this, &Scorer::Ping);` on a native dispatcher that is not BlueprintAssignable | Refused: "EventTriggeredDelegate is a native dispatcher that is not BlueprintAssignable (AGameEvent::EventTriggeredDelegate)". The editor's Bind, Unbind and Unbind All nodes refuse one ("Event Dispatcher is not 'BlueprintAssignable'"); only the engine's own code binds it. 17 of the game's are; Remove and Clear are refused the same. A UeApi from before genueapi marked them says nothing, and then Add is taken. | Refused |
 | `OnHit.IsBound()`, `OnHit.AddUnique(...)`, `OnHit.Contains(...)` | Refused by clang: "no member named 'IsBound'". A dispatcher has Add, Remove, Clear and Broadcast, and nothing else. Add already skips a duplicate. To know whether your own dispatcher has listeners, count them where you call Add and Remove. | Refused |
 
 ```cpp
@@ -3678,10 +3759,15 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `void HandleScored(int32 Points, AActor *By)` | A handler is a non-inline member function of the class or of a mod ancestor. It returns void and takes exactly the dispatcher's parameter types. clang checks this at the Add call. | Yes |
+| `void HandleScored(int32 Points, AActor *By)` | A handler bound on `this` is a non-inline member function of the class or of a mod ancestor. It returns void and takes exactly the dispatcher's parameter types. clang checks this at the Add call. An inherited native or game Blueprint function bound on `this` follows the rules of one bound on another object below. | Yes |
 | A `const` handler, or `const FHitResult &Hit` where the header says `FHitResult Hit` | clang error: "no matching member function for call to 'Add'". Copy the parameter list as the header spells it. | Refused |
 | `inline void Handle(int32 Points)` as a handler | Refused: "a delegate cannot bind Handle: an inline function is expanded where it is called". An inline method never becomes a function of the class. Drop `inline`. | Refused |
-| `OnHit.Add(H, &Helper::HandleHit);` | Refused today: "a delegate can only bind a function of `this`". Bind a method of `this` that calls H. | Not yet |
+| `OnHit.Add(H, &Helper::HandleHit);` | Binds HandleHit on the object H points to: the editor's Create Event with its Object pin wired. The binding is made where the Add runs, with H as it is then. HandleHit must be a function of H's class or of an ancestor of it: a mod class's method, a game Blueprint's function, or a native BlueprintCallable one (`OnRate.Add(Pawn, &AActor::SetActorTickInterval)`). Remove takes the same pair off. | Yes |
+| `OnHit.Add(H, &Other::HandleHit);` where H's class has no HandleHit | Refused: "a delegate on a Helper cannot bind Other::HandleHit: the engine looks it up by name on that object, whose class has no such function". The broadcast would skip it. | Refused |
+| `OnTick.Add(A, &AActor::ReceiveTick);` | Refused: "a delegate cannot bind AActor::ReceiveTick on another object: the editor binds a BlueprintCallable function that is not pure or latent, and ReceiveTick is not BlueprintCallable". An event the engine calls is not one Blueprint code can bind, on another object or on `this` ("on this object"), nor a pure or latent function. A mod method that overrides such an event is refused the same. | Refused |
+| `OnUse.Add(Item, &AItem::Server_StartUsing);`, `OnPing.Add(this, &AActor::OnRep_Instigator);` | Refused the same way: "... and Server_StartUsing is not BlueprintCallable". A native function the engine does not mark BlueprintCallable, such as an RPC or a RepNotify, is not one the editor binds. UeApi's `NotCallable.json` names them. | Refused |
+| `OnPing.Add(PC, &APlayerController::ClientClearCameraLensEffects);` | Binds it: an RPC the engine marks BlueprintCallable (49 are, `Server_ResetHUD` among them) is one the editor binds, on another object or on `this`. Being an RPC says nothing either way. | Yes |
+| `OnHit.Add(H, &Helper::Half);` where Helper declares Half and never defines it | Refused: "a delegate cannot bind Helper::Half, which Helper declares and never defines". No function of that name exists. | Refused |
 
 ```cpp
 class Pad : public AActor {
@@ -3697,7 +3783,7 @@ public:
 };
 ```
 
-To have another object handle a broadcast, bind a method of `this` that forwards the call:
+Another object can handle a broadcast itself: bind its method on it.
 
 ```cpp
 class Helper : public AActor {
@@ -3709,22 +3795,27 @@ class Relay : public AActor {
 public:
   UE_DISPATCHER(OnHit, int32 Points);
   Helper *H;
-  void ForwardHit(int32 Points) {
-    if (H != nullptr) H->HandleHit(Points);
+  void ReceiveBeginPlay() {
+    if (H != nullptr) OnHit.Add(H, &Helper::HandleHit);   // each OnHit.Broadcast runs H->HandleHit
   }
-  void ReceiveBeginPlay() { OnHit.Add(this, &Relay::ForwardHit); }
 };
 ```
+
+[tests/DelegateOtherBind.cpp](tests/DelegateOtherBind.cpp) binds a sibling class's, a peer's, a native and a game
+Blueprint's function this way.
 
 Notes:
 
 - A binding stores the object, held weakly, and the function's name. When the dispatcher fires, the engine looks the
   function up by name on that object, so if a subclass overrides the handler, the override runs. A binding whose
   object is gone is skipped and dropped from the list.
-- This is Blueprint dispatch, not a C++ member pointer. A function the object does not have is a fatal error at
-  broadcast time, which is why AssetGen refuses an inline handler.
-- Both refusals are raised in the function that binds, so they print with its `<Class>::<Function>: ` prefix.
-- The same rules hold for a delegate value, `{this, &Class::Method}` (see Delegate values below).
+- This is Blueprint dispatch, not a C++ member pointer. A broadcast silently skips a binding whose object has no
+  function of that name, which is why AssetGen refuses an inline handler and one the object's class lacks.
+- The refusals are raised in the function that binds, so they print with its `<Class>::<Function>: ` prefix.
+- On another object the binding is the editor's: a delegate local the object's function is bound into
+  (EX_BindDelegate), then added. If the object is null when the Add runs, the binding holds no object and the broadcast
+  skips it.
+- The same rules hold for a delegate value, `{this, &Class::Method}` or `{H, &Helper::Method}` (see Delegate values below).
 
 ### Broadcast
 
@@ -3733,8 +3824,10 @@ Notes:
 | `OnScored.Broadcast(N, this);` | Call OnScored. Every bound handler runs right away, one after another, before Broadcast returns. | Yes |
 | `GetPeer()->OnPeerHit.Broadcast(X);` | Fires the dispatcher of another object of the same class. The object is evaluated before the arguments, so an argument that changes what GetPeer() returns does not redirect the broadcast. | Yes |
 | `UE_DISPATCHER(OnList, TArray<int32> &Items);` | A non-const reference parameter. The declaration compiles, but a Broadcast is refused: "Items is a non-const reference, which a Broadcast never writes back to the caller". The engine copies each argument into a parameter block of its own. Take it by value or by `const &`. | Refused |
-| `OnDestroyed.Broadcast(this);` | Refused today: "Broadcast needs the dispatcher's signature function". Only a UE_DISPATCHER of the class being compiled can be broadcast; the game's dispatchers cannot. | Not yet |
 | `OnHit.Broadcast(1);` on a dispatcher a mod parent declares | Broadcasts through the parent's signature function, as the editor's node on a child does. | Yes |
+| `T->OnHit.Broadcast(P);`, `Burrow->OnBurrowComplete.Broadcast(true);` | The Call node with another object as Target: a dispatcher another mod class declares, or a game Blueprint's (every Blueprint dispatcher is BlueprintCallable). It broadcasts through that class's signature function, imported from its package. | Yes |
+| `State->OnTerrainGenerated.Broadcast();` | A native dispatcher the engine marks BlueprintCallable (41 of the game's). UeApi does not say which signature function the engine gives it, so the broadcast names one of the class's own with the same parameters and warns that it does; the handlers get the same arguments. | Warns |
+| `OnDestroyed.Broadcast(this);` | Refused: "OnDestroyed is a native dispatcher (AActor::OnDestroyed) that is not BlueprintCallable". The editor's Call node refuses a native dispatcher without BlueprintCallable ("Event Dispatcher is not 'BlueprintCallable'"), and none of the engine's has it; only the engine's own code broadcasts it. With a UeApi from before genueapi marked them, every native dispatcher is refused this way, the message saying the UeApi does not tell. | Refused |
 
 ```cpp
 class PBase : public AActor {
@@ -3748,7 +3841,7 @@ public:
   void Handle(int32 Points) { Mine = Points; }
   void ReceiveBeginPlay() {
     OnHit.Add(this, &Child::Handle);   // Add, Remove and Clear work on the parent's dispatcher
-    Fire(3);                           // OnHit.Broadcast(3) here would be refused
+    OnHit.Broadcast(3);                // through PBase's OnHit__DelegateSignature, as Fire(3) does
   }
 };
 ```
@@ -3765,10 +3858,11 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `{this, &Scorer::HandleTimer}` | Create Event wired into a delegate pin, written as the argument of a call that takes a TDelegate (timers, engine callbacks). The rules are those of a handler: `this` only, a non-inline method, and the signature of the `TDelegate<...>` in the header. | Yes |
+| `{this, &Scorer::HandleTimer}` | Create Event wired into a delegate pin, written as the argument of a call that takes a TDelegate (timers, engine callbacks). The rules are those of a handler: a non-inline method, and the signature of the `TDelegate<...>` in the header. | Yes |
+| `{Peer, &Scorer::HandleTimer}` | The same with the Object pin wired: HandleTimer bound on Peer, which the timer then calls. The rules are those of a handler on another object. | Yes |
 | `TDelegate<void()>(this, &Scorer::HandleTimer)` | The same value, spelled out. | Yes |
 | `K2_ClearTimerDelegate({})` | Refused: "a delegate value is {this, &Class::Function}". There is no empty or unbound delegate. | Refused |
-| `TDelegate<void()> Callback;` as a class variable, a function parameter or a local | A delegate variable (DelegateProperty). `Callback = {this, &Class::Method};` stores a value, and `Callback` passes it on, to a timer or another function. Its signature function is one the class makes per delegate type, `<Variable>__DelegateSignature`, as the editor makes one per dispatcher. A struct or an interface makes none, so a delegate in one is refused. | Yes |
+| `TDelegate<void()> Callback;` as a class variable, a function parameter or a local | A delegate variable (DelegateProperty). `Callback = {this, &Class::Method};` stores a value, and `Callback` passes it on, to a timer or another function. Its signature function is one the class makes per delegate type, `<Variable>__DelegateSignature`, as the editor makes one per dispatcher, numbered past a name the class, a mod or game Blueprint parent, or a mod child compiled with it already uses (not past a native parent's own delegate signatures, such as UWidget's `GetText__DelegateSignature`, which UeApi does not list). A struct or an interface makes none, so a delegate in one is refused. | Yes |
 
 The timers in [Timers and input](#timers-and-input) show delegate values in use.
 
@@ -3998,6 +4092,13 @@ Notes:
 | `class Singer : public AActor, public ICurveSourceInterface` | Class Settings > Implemented Interfaces. The first base is the UE parent, and every base after it is an implemented interface. A class can implement several, game and mod interfaces alike. | Yes |
 | `float GetCurveValue(FName CurveName) const { return 0.5f; }` | An implementation is an ordinary method, matched to the interface function by name. Only functions the interface marks BlueprintNativeEvent or BlueprintImplementableEvent can be implemented; AssetGen checks this against the SDK's Events.json. | Yes |
 | A function left out | Gets an empty stub, as the editor compiles one. The stub returns the zero value (0, false, None, null) and leaves out-parameters unchanged. | Yes |
+| A function left out that a parent this source cooks already has, without listing the interface | The parent's function implements it, as in C++: AssetGen adds an override of it that only calls the parent's (or expands it, if inline), the editor's override with a parent call, so calls through the interface and by name run the parent's body. An empty stub would replace it for every caller, and with no function at all a call would find the interface's own empty one first. | Yes |
+| The same, where the parent's function has a parameter with no name | The added override names it (`P0`, `P1`, ... by position) and passes it on, as the editor's override names every pin. | Yes |
+| The same, where the parent's function is a multicast | Refused: "... no override can call it for ITrigger, and an empty one would replace it; declare Pistol::Pull". An override would send a multicast twice on a server. | Refused |
+| The same, where the parent's function is `final`, or has another signature than the interface's | Refused: "Pistol implements ITrigger, whose Pull needs a function of that name in Pistol, and the Rifle::Pull it inherits is final ..." or "... whose Pull is int32 (int32), and the Rifle::Pull it inherits is float (float): a Blueprint class has one function of a name ...". No function of a final one's name may follow it, and callers through the interface pass the interface's parameters. Rename one of them. | Refused |
+| `int32 Pull(int32 N)` implementing ITrigger, where a parent has `float Pull(float)` | Refused: "Pistol::Pull implements ITrigger::Pull, int32 (int32), and replaces the Rifle::Pull it inherits, float (float) ...". A Blueprint function overrides the parent's of its name too, so it would have two signatures. The parent may be another mod's class, from the header it shares; the same goes for ITrigger's stub when the class leaves `Pull` out. Rename one of them. | Refused |
+| The same, where the parent has no `Pull` but implements another interface, IAim, whose `Pull` is `float Pull(float)`, and leaves it out; or the class leaves ITrigger's `Pull` out too | Refused: "Pistol::Pull implements ITrigger::Pull, int32 (int32), and replaces the Pull of IAim, float (float), that Rifle implements ..." or "Pistol implements ITrigger, whose Pull is int32 (int32), and replaces the Pull of IAim ...". The parent's stub for IAim is a function of that name, and the editor refuses an override of another signature ("Cannot override ... declared in a parent with a different signature"). Rename one of the interface functions. | Refused |
+| The same, where the parent's function is static, or the class declares its own `Pull` beside the parent's static | Refused: "... is static: the editor takes such a function for an override of the static and refuses it ...; rename Rifle::Pull". A static implements no interface function, but the editor makes any function of its name in a subclass an override of it, and an override of a static must be static. | Refused |
 | An implementation that returns a value, is `const`, or has out-parameters | Compiled as a function, where the editor would make a function graph rather than an event. It takes the interface function's flags, so callers through the interface find it. A void event such as ShowDamageEffects is compiled as a function too. | Yes |
 | `class Pistol : public Weapons::Rifle` | A subclass implements the interface through its parent without listing it. Redefining an interface function is an ordinary override, and `Weapons::Rifle::Pull(Times)` calls the parent's. | Yes |
 | `class NativeOnly : public AActor, public IHealth` | Refused: "IHealth::GetHealth is native only ..., so a Blueprint cannot implement IHealth". The editor refuses the same. Calling IHealth through `TScriptInterface<IHealth>` on the game's objects still works. | Refused |
@@ -4048,8 +4149,8 @@ Notes:
 - Do not mark an implementation `inline`. It compiles with no diagnostic, but an inline method is not a function of the
   class, so the class gets the empty stub under that name, and a call through the interface returns 0.
 - List the UE class first. If an interface comes first, it is taken as the parent.
-- An empty stub stands in for every function left out, including those along the chain of an interface that extends
-  another. Without it, a call through the interface would reach the interface's own function.
+- An empty stub stands in for every function left out that no parent has, including those along the chain of an
+  interface that extends another. Without it, a call through the interface would reach the interface's own function.
 - The native-only message names the first such function in alphabetical order.
 - The already-implemented check sees mod ancestors, and native ones only for the interfaces UeApi lists on them
   (`UeNativeInterfaces`): the dump lists no class's interfaces, so genueapi takes, with `--game`, those a game
@@ -4356,8 +4457,7 @@ Notes:
 - In a class that is neither an actor nor an actor component, an RPC always runs locally.
 - A class with an RPC of its own gets `bReplicates` (see [Replication](#replication)).
 - Give every RPC a body. A method that is declared but never defined is not compiled, so no marker check runs on it,
-  and a call to it becomes a call by name to a function the class does not have, which is a fatal error in the engine.
-  See [Functions](#functions).
+  and a call to it is refused, as C++ would not link it. See [Functions](#functions).
 
 ### Authority-only and cosmetic functions
 
@@ -5209,6 +5309,7 @@ listed here is refused with "unimplemented intrinsic".
 | `Cast<T>(Obj)` | Cast To: the object if it is a T, otherwise null. To reach an interface, use TScriptInterface. | [Types](#types), [Interfaces](#interfaces) |
 | `__ClassOf__(X)` | The property class name of a parameter or local, such as IntProperty, found at run time by the class's GetParmClassName. | [Intrinsics](#intrinsics) |
 | `const` member, `const int32 Limit = 3;` | A read-only variable (BlueprintReadOnly): a Get node and no Set. Its initializer is the default. | [Classes and variables](#classes-and-variables) |
+| `UE_READONLY int32 Cap = 5;` | BlueprintReadOnly like `const`, but a subclass's `UE_DEFAULTS` may set it, and a write from code compiles with a warning. | [Access, read-only and categories](#access-read-only-and-categories) |
 | `const` method, `int32 Get() const` | A const Blueprint function. | [Functions](#functions) |
 | `consteval` function | Runs while the mod compiles, and only the result is cooked. Its arguments must be constants. | [Constants](#constants) |
 | `constexpr` and `const` variables at namespace scope | Constants: no storage, each use is the value, worked out at build time. | [Constants](#constants) |
@@ -5311,6 +5412,7 @@ listed here is refused with "unimplemented intrinsic".
 | `UE_ENUM(Enum)` | Cooks an `enum class` based on `uint8`, `int32` or `int64` as a UserDefinedEnum (an Enumeration asset). | [Enums](#enums) |
 | `UE_ENUM_IN(Enum, Package)` | UE_ENUM for an enum in a shared header: only the source whose UE_MOD_PACKAGE is exactly Package cooks it. | [Enums](#enums) |
 | `UE_ENUM_MAP(Enum)` | A TMap member default from each enumerator to its name, or back, filled in at build time. | [Enums](#enums) |
+| `UE_FINAL_AS(Base, Leaf)` | Declares `class Leaf final : public Base {}`, Base's one subclass: Base is compiled as final and cooked Abstract. | [Classes and variables](#classes-and-variables) |
 | `UE_INTERFACE` | Declares a mod interface, cooked as a Blueprint Interface asset. Its variables go to the classes that implement it. | [Interfaces](#interfaces) |
 | `UE_MOD_PACKAGE(Path)` | The /Game folder that a source's classes, structs, enums, interfaces and assets are cooked into. A namespace is a subfolder. | [Mod sources and packages](#mod-sources-and-packages) |
 | `UE_MULTICAST` | Multicast RPC: called on the server, it runs on the server and on every client. | [RPCs](#rpcs) |
@@ -5466,9 +5568,6 @@ and where the feature is described. In each group, the messages you are most lik
   goes through int32 and only its low 32 bits survive: 2^32 + 5 becomes 5.0, where C++ would round the whole value.
   Fix: nothing, when the value fits in an int32. Otherwise bring it into that range before converting. See
   [Literals and conversions](#literals-and-conversions).
-- `a braced value needs a struct type, not <Type>`: braces around a single value of a type that is not a struct,
-  `int32 N{ 5 };`. Fix: `int32 N = 5;`. Braces are for structs and containers. See
-  [Literals and conversions](#literals-and-conversions).
 - `no template named 'TWeakObjectPtr'; did you mean 'TSoftObjectPtr'?`: clang's message. The SDK declares no weak or
   lazy object pointer. Fix: use an object pointer, tested with `if (Obj)`, or a soft reference. See [Types](#types).
 - `no conversion from <From> to <To>`: a conversion to `TScriptInterface<I>` where AssetGen has no declaration of `I`,
@@ -5537,10 +5636,6 @@ and where the feature is described. In each group, the messages you are most lik
   whole-struct literal cannot hold, such as weak pointers, delegates or bitfields. The SDK gives such structs no
   constructor that takes every member, so clang usually refuses the call first. Fix: designated braces, as the message
   shows, `FHitResult H = { .Time = 0.5f };`. Members you leave out keep the struct's defaults. See [Structs](#structs).
-- `<Struct>::<Member> is Transient, which a struct literal cannot set: give it a constant, or set the member after`: a
-  whole-struct constructor call computes the value of a member the engine never writes from a struct literal. Fix: pass
-  a constant there (it is dropped with a warning), and set the member with its own statement if it matters. See
-  [Structs](#structs).
 - `<Struct> literal must give every field (<N>)`, `<Struct> takes one value per member (<N>), in declaration order:
   <Member>` and `<Type> has no member for value <N>`: rare. A struct value is built with a constructor call or braces
   that give a different number of values than the struct has members. Fix: designated braces that name the members you
@@ -5573,9 +5668,6 @@ and where the feature is described. In each group, the messages you are most lik
   `<Flavour>` names them: IntInt, Int64Int64, FloatFloat, ByteByte, BoolBool or ObjectObject. The usual cases:
   - `% on Int64Int64`: `%` or `%=` on int64, which UE 4.27 lacks. Write `A - A / B * B`.
   - `< on ObjectObject` (or `>`, `<=`, `>=`): ordering object pointers. Blueprint has only `==` and `!=` on objects.
-  - `= on IntInt` (or another flavour): `=` used as a value, as in `A = B = 0;` or `if ((X = Next()) > 3)`. Put each
-    assignment in its own statement, or use `if (int32 X = Next(); X > 3)`. `+=`, `++` and `--` work as values.
-  - `, on IntInt`: the comma operator used as a value, `return (N += 1, N * 2);`. Split it into statements.
 
   See [Operators](#operators).
 - `TODO: unimplemented operator overload <Operator> yielding <Type>`, and `TODO: unimplemented operator overload
@@ -5586,8 +5678,7 @@ and where the feature is described. In each group, the messages you are most lik
 - `TODO: unimplemented statement <Kind>`: a statement with no Blueprint form. `<Kind>` is clang's name for it:
   - `CXXTryStmt`: try and catch. Blueprint has no exceptions.
   - `ConditionalOperator`: `C ? Open() : Close();`. Write the if/else out.
-  - `BinaryOperator`: `bReady && Launch();`, an unused expression, or a comma, such as the for increment
-    `++I, --J`. Write the if out, and move the second update into the loop body.
+  - `BinaryOperator`: `bReady && Launch();` or another unused expression. Write the if out.
   - `DeclRefExpr`: `(void)Unused;`. Leave an unused parameter unnamed instead. `(void)SomeCall();` compiles as the call.
   - `IntegerLiteral`: a GNU case range, `case 1 ... 3:`. Write one `case` per value; labels in a row share a body.
   - `CaseStmt`: a case label inside a nested block of the switch. Put every label directly in the switch body.
@@ -5637,6 +5728,10 @@ and where the feature is described. In each group, the messages you are most lik
   parameters; declare the same`: an override, or an interface function's implementation, with other parameter
   types than the function it replaces. Names do not count, and `const T&` matches `T`. Fix: copy the declaration. See
   [Overrides and parent calls](#overrides-and-parent-calls).
+- `<Owner>::<Method>, which <Owner> declares and never defines, is no function of the class, and C++ would not link a
+  call to it`: a call to a method of a class this source cooks that has no body and is not `= 0`. By name the call
+  would run a subclass's function of that name, whatever its parameters, and on an object of the class find none,
+  which is fatal. Fix: give the method a body, or `= 0` for an empty one subclasses override.
 - `<Class>::<Function>: <Parent>::<Function> is native and no Blueprint event, so no function replaces it`: a method
   named like an engine function that is not an event, such as `K2_DestroyActor`. C++ and calls bound to it keep
   running the engine's. Fix: rename the method.
@@ -5645,6 +5740,9 @@ and where the feature is described. In each group, the messages you are most lik
   [Overloading](#overloading).
 - `<Class>::<Name>: differs from <Other> only in case, and an FName ignores case; rename one`: `Get` and `get` in one
   class. Fix: rename one. See [Overloading](#overloading).
+- `<Class>::<Name>: None is UE's empty name, in any case: the Blueprint editor refuses it, and the members of a saved
+  value end at one of that name; rename it`: a variable, function, component or `UE_STRUCT` member named None, none or
+  NONE. Fix: rename it. See [Overloading](#overloading).
 - `<Class>::<Name>: <Ancestor> already has a variable <Name>, and an FName ignores case; rename it` (or `a function`):
   a member reusing a name the parent chain has, in any case. Overriding a function under its exact name is fine. To
   change an inherited variable's default, assign it in `UE_DEFAULTS`. See [Class defaults](#class-defaults).
@@ -5671,9 +5769,9 @@ and where the feature is described. In each group, the messages you are most lik
   overrides <Method> runs that override; to run <Base>'s alone, call it from an override of <Method> in <Class>`:
   a qualified call to a method its class does not declare and whose body cannot be copied in (authority-only,
   cosmetic, an RPC, `noinline`, one that waits), where AssetGen cannot add the override itself: the call is in an
-  inline method, or the nearest parent's declaration of the method has a parameter with no name, or is inline,
-  static or pure virtual. Elsewhere AssetGen adds the override and prints nothing. Fix: move the call into a method
-  that is not inline, name the parameter, or declare the method in the class, calling
+  inline method, or the nearest parent's declaration of the method is inline, static or pure virtual. Elsewhere
+  AssetGen adds the override and prints nothing. Fix: move the call into a method that is not inline, or declare the
+  method in the class, calling
   `<Base>::<Method>()`; the qualified call then runs Base's function alone. See
   [Calling the parent](#calling-the-parent).
 - `warning: <Class>::<Function>: <Base>::<Method>() is a call by name, which on an object of a subclass that
@@ -5705,11 +5803,41 @@ and where the feature is described. In each group, the messages you are most lik
   so the call finds no function. Calling an inline overload beside a non-inline one with more parameters works. Fix:
   give the inline and non-inline functions different names, or make every overload of the name inline. See
   [Functions](#functions).
+- `<Class> derives from <Base>, which is UE_FINAL_AS <Leaf>: that is its one subclass`: a second class derives from
+  a UE_FINAL_AS base, here or in another mod that includes its header. Fix: derive from the leaf's base's own parent,
+  or drop UE_FINAL_AS and declare the base's subclasses yourself.
+- `UE_FINAL_AS(<Base>, <Leaf>): the base must be a Blueprint class, a mod's`: the base is an engine (`/Script/`)
+  class, whose code is not compiled here. Fix: derive the leaf from it with plain `class Leaf final : public Base`.
+- `UE_FINAL_AS(<Base>, <Leaf>): <Base> is the game's Blueprint (<path>), which no mod cooks: it stays as it is cooked
+  there, ...; derive <Leaf> from it as a plain class`: the base is a game Blueprint (or a class pinned to a path its
+  name does not give, "is cooked at <path>, not by this mod"). Its functions stay non-final and its other subclasses
+  stay, so this mod's calls bound to them as final would skip their overrides. Fix: `class Leaf : public Base`.
+- `UE_FINAL_AS(<Base>, <Leaf>): <Base> is another mod's class (UE_CLASS "<path>"), and only the UE_FINAL_AS in the
+  header that declares it, which a source of that mod beside it includes too, makes the leaf that mod cooks; ...`:
+  the macro is written in this mod's own source, its `.cpp` or a header of its own that re-declares the base, not in
+  the shared header beside the base, the one a source of the owner's (its `UE_MOD_PACKAGE`, or the only one in its
+  folder) includes. The leaf is pinned beside the base and imported, and its owner, which never sees this macro, never
+  cooks it. Fix: move the macro into that header, or derive the leaf plainly. AssetGen finds where the macro is written by reading the source and the files it includes by a quoted
+  path; a macro written through another macro is not found and is accepted as before.
 - `<Class>::<Method>: <Base>::<Method> is final, so no subclass may have a function of that name; rename this one`: a
   subclass declares a method with the name of an ancestor's `final` one and other parameters, `int32 Step(int32 By)`
   under `virtual int32 Step() final`. C++ lets it hide the parent's, but a Blueprint finds functions by name, and the
   same parameters are already refused by clang. Fix: rename the subclass's method, or drop `final`. See
   [Functions](#functions).
+- `<Class>::<Method>: <Base>::<Method> is static, and the editor takes a function of that name in a subclass for an
+  override of it, which only a static can be ("Check flags: Exec, Final, Static"); rename this one`: a method that is
+  not static has the name of an ancestor's static. C++ lets it hide the static, but the editor links a function named
+  like a parent's as an override of it and refuses one that does not agree on Static. Fix: rename one of them, or make
+  this one static too. See [Static functions and function libraries](#static-functions-and-function-libraries).
+- `<Class>::<Method> is static, and the <Base>::<Method> it hides is not: ...; rename this one`: the same the other way
+  round, a static named like an ancestor's method. Fix: rename one of them.
+- `<Class>::<Method> is static and hides <Base>::<Method>, a static of another signature, ...; rename this one`: a
+  static named like an ancestor's static that takes other parameters. Its super would be that static, a function of
+  other parameters, which the editor never links. Fix: rename one of them, or give both the same signature (that
+  compiles, with a warning).
+- `warning: <Class>::<Method> hides <Base>::<Method>, a static: compiled as C++ name hiding, ...`: a static named like
+  an ancestor's static of the same signature. Each call runs the one it names, as in C++; the editor would refuse the
+  name. Fix: rename one of them to make no Blueprint the editor could not.
 - `inline function <Class>::<Method> calls itself`: recursion through inline functions, direct or through another
   inline function. Each call copies the body in, so the copying never ends. One overload calling another is fine. Fix:
   drop `inline`, because a Blueprint function can call itself, or write a loop. See
@@ -5721,8 +5849,51 @@ and where the feature is described. In each group, the messages you are most lik
   `static int32 Count = 0;`. The message follows the prefix `<Class>::<Function>: inline <Function>: `
   (`inline <Class>::<Method>: ` for a method). A `static constexpr` constant works here. Fix: make it a member of the
   class. See [Latent calls](#latent-calls).
-- `a void inline function used as a value`: `return Bump();` where `Bump` is an inline function that returns void.
-  Fix: `Bump(); return;`. See [Inline functions and templates](#inline-functions-and-templates).
+- `the comma operator after something its statement runs first (...), which its left side would run before: write its
+  left side as a statement of its own`: a comma behind an operand C++ evaluates before it, `{G(), (A, B)}` (braces
+  run their members in order) or `L[(A, I)] = G()` (an assignment's right side runs first). Fix: as the message says.
+  See [Operators](#operators).
+- `the comma operator used as a place, not a value (...), where no statement before this one can hold its left side
+  (...)`: `while ((A, S).X < 3)`, a member taken of a comma or a comma bound to an operator's or a constructor's
+  reference, in a loop condition, on the right of `&&` / `||` / `?:` or in a call on another object. `an assignment
+  used as a place, not a value (...)` is the same for a `=`, `while ((T = S).X < 9)`. Fix: put the left side, or the
+  assignment, in a statement of its own. See [Operators](#operators).
+- `an assignment assigned to or updated, whose left side is no plain variable, which would be evaluated again to write
+  it: ...`: `(L[Idx()] = M) += 1`, as a statement or in a loop condition. Fix: assign in a statement of its own, then
+  update what it assigned. See [Assignment and updates](#assignment-and-updates).
+- ``an update (`+=`, `++`, ...) assigned to or updated, whose left side is no plain variable, which would be evaluated
+  again to write it: ...``: the same for an update, `(L[Idx()] += M) += 1`. Fix: update in a statement of its own,
+  then write what it updated.
+- `the comma operator's value here is a <Type>, which no Blueprint variable can hold: ...`: a comma that runs in place
+  (a loop condition, ...) worth a double or another type no Blueprint variable has, `while ((A, 0.5) < X)`. Fix: put
+  the left side in a statement of its own, and use a float. See [Types](#types).
+- `the comma operator here would run first, whole, into a temporary, and its value is a <Type>, which no Blueprint
+  variable can hold: ...`: the same for a comma that moves into a temporary beside an argument that may run first.
+  Fix: as above.
+- ``the comma operator here is written to or bound to a reference (a `T&` or `const T&` parameter), beside something
+  that may run before it, and its right side is no variable: ...``: `F(G(), (A, L[0]))` where F takes `int32&` or
+  `const int32&`: the argument cannot run first into a temporary, which F would then write, or read with what
+  `L[0]` held before G ran. An operator's reference operand gets the same message naming the operator instead:
+  ``... bound to a reference, operator `+`'s `const FString &` operand, ...`` for `Get() + (A, L[0])` over FString.
+  Fix: put the left side in a statement of its own. See [Operators](#operators).
+- `<what> passed to a reference parameter, whose right side is no plain variable, where no statement before this one
+  can hold it (...)` (`left side` for an update or an assignment): `while (IncRef(0, (A, L[0])) < 20)` or
+  `while (IncRef(0, L[0] += 1) < 20)`, in a loop condition, on the right of `&&` / `||` / `?:` or in a call on
+  another object. The parameter must be a variable, and nothing before the statement can hold the rest. Fix: as the
+  message says. See [Operators](#operators).
+- `<what> passed to a reference parameter after something its statement runs first (...), which it would run before:
+  ...`: `{G(), IncRef(0, B += 1)}`, the update would run before G. Fix: as the message says.
+- `an assignment used as a value after something its statement runs first (...), which its left side would run
+  before: assign in a statement of its own, then use what it assigned`: a plain `=` used as a value where the comma
+  operator is refused for that reason too, `{G(), (A = N)}`. Fix: as the message says. See [Operators](#operators).
+- `an assignment used as a value, whose left side is no plain variable, which would be evaluated again to read it:
+  ...`: `A = L[0] = N`. A left side that is a comma, or a member of one, names its variable and works:
+  `int32 X = ((Bump(), N) = G());`, `((Bump(), T).A = G())`. An element of one, `int32 X = ((Bump(), L)[1] = G());`
+  or `while (((Bump(), L)[I] = M) < 0)`, is refused like `A = L[0] = N`: the element would be located again to read
+  it. Fix: assign in a statement of its own, then use what it assigned. See [Operators](#operators).
+- `an update (`+=`, `++`, ...) passed to a reference parameter, whose left side is no plain variable, ...`:
+  `IncRef(1, L[Idx()] += 1)` where IncRef takes `int32&` or `const int32&`. Fix: update in a statement of its own,
+  then pass the element. See [Operators](#operators).
 - `inline call to <Class>::<Method> with <N> arguments`: a C-style variadic inline function,
   `inline int32 First(int32 N, ...)`, called with extra arguments. Fix: give it a fixed parameter list, or overloads.
   See [Inline functions and templates](#inline-functions-and-templates).
@@ -5746,9 +5917,8 @@ and where the feature is described. In each group, the messages you are most lik
   the call. UE_NO_OPTIMIZE on the calling function keeps it. See
   [Calling engine and game functions](#calling-engine-and-game-functions).
 
-These compile with no message and do not work as C++ would: the body of a C++ constructor, which is dropped; a call to
-a method declared and never defined; the shorter of two non-inline methods with one name; a non-inline method of a
-UE_STRUCT; and `S.Len()`, the one FString method the SDK declares. `UKismetSystemLibrary::PrintString` compiles too, but UE 4.27 keeps
+These compile with no message and do not work as C++ would: the body of a C++ constructor, which is dropped; the
+shorter of two non-inline methods with one name; a non-inline method of a UE_STRUCT; and `S.Len()`, the one FString method the SDK declares. `UKismetSystemLibrary::PrintString` compiles too, but UE 4.27 keeps
 its body only outside shipping builds, so the retail game prints nothing. See [Functions](#functions),
 [Strings and text](#strings-and-text) and [Calling engine and game functions](#calling-engine-and-game-functions).
 
@@ -5763,11 +5933,14 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   <Class>::<Helper> spawns an actor and UserConstructionScript calls it`, since it may run elsewhere too.
 - `warning: <Class>::<Function>: <Target> is an abstract class (a method of it is `= 0`), and the engine spawns no
   actor of one`: `SpawnActor<T>` or `SpawnActorDeferred<T>` of a class with a pure virtual left, named by the call
-  (`X::StaticClass()`). SpawnActor makes no actor of it and returns None. The build goes on. Fix: spawn a subclass
-  that defines every `= 0` method. See [Objects and widgets](#objects-and-widgets).
+  (`X::StaticClass()`), or of a UE_FINAL_AS base (`(UE_FINAL_AS <Leaf>'s base)`, then `spawn <Leaf>`). SpawnActor
+  makes no actor of it and returns None. The build goes on. Fix: spawn a subclass that defines every `= 0` method, or
+  the leaf. See [Objects and widgets](#objects-and-widgets).
 - `<Function>: <Target> is an abstract class (a method of it is `= 0`), which the engine may not construct`:
-  `NewObject<T>` of such a class. SpawnObject makes one in a Shipping game and asserts in a Development one. Fix:
-  construct a subclass that defines every `= 0` method. See [Objects and widgets](#objects-and-widgets).
+  `NewObject<T>` or `AddComponentByType<T>` of such a class, or of a UE_FINAL_AS base (`(UE_FINAL_AS <Leaf>'s base)
+  ... construct <Leaf>`). SpawnObject and AddComponentByClass make one with NewObject, in a Shipping game, and assert
+  in a Development one. Fix: construct a subclass that defines every `= 0` method, or the leaf. See
+  [Objects and widgets](#objects-and-widgets).
 - `warning: <Class>::<Function>: SpawnObject with no Outer (None) makes nothing and returns None`: `NewObject<T>(nullptr)`.
   The build goes on. Fix: pass the object that owns it, such as `this`. See [Objects and widgets](#objects-and-widgets).
 - `warning: <Function>: a deferred spawn (SpawnActorDeferred, BeginDeferredActorSpawnFromClass) is not finished in
@@ -5783,6 +5956,15 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   `AddComponentByClass`, or `AddComponentByType<T>(Owner)`. See [Components](#components).
 - `<Class>::DefaultSceneRoot: DefaultSceneRoot is the root the construction script adds; rename the component`: the
   name is taken by the root the engine adds to a class with no scene component of its own. Fix: rename it.
+- `<Class>::DefaultSceneRoot: DefaultSceneRoot is the variable of the root an actor's construction script adds, and
+  this class has no scene component of its own left to be that root; rename it`: a member of that name in an actor
+  class that gets the DefaultSceneRoot node (no scene component of its own takes the root, none inherited): the class
+  already has a variable of that name, which the construction script stores the root in. Fix: rename it. Where a scene
+  component of the class's own is the root, no such variable exists and the member is a member like any other.
+- `<Class>::DefaultSceneRoot: DefaultSceneRoot is the variable of the root <Ancestor>'s construction script adds, which
+  a variable of that name here would hide; rename it`: a member of that name below a mod class that gets the
+  DefaultSceneRoot node. An object variable here would be the one the root is stored in, the ancestor's left empty;
+  any other would be a variable named like its parent's, which the editor never builds. Fix: rename it.
 - `<Class>::<Component>: <Ancestor> already has a default subobject <Name> (its <Member>); rename the component`: a
   component named like a native parent's own component, such as `CharacterMesh0` or `CollisionCylinder` under an
   ACharacter. The engine finds the objects under an actor by name. Fix: rename it; to change the native one, set
@@ -5801,9 +5983,39 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   member-default message that starts `<Member>: a default is a value known when the mod is built`. Fix: keep only
   assignments of build-time values in UE_DEFAULTS, and move the rest to ReceiveBeginPlay or UserConstructionScript.
   See [Class defaults](#class-defaults).
-- `<Class>::UE_DEFAULTS: <Member> needs a literal value`: the value writes nothing, as in `Instigator = nullptr;`.
-  UE_DEFAULTS cannot set an inherited object reference back to null. Fix: write an explicit value, or leave the
-  statement out to keep the parent's default. See [Class defaults](#class-defaults).
+- `<Class>::UE_DEFAULTS: <Member> needs a literal value`: the value writes nothing: `{}` or `T()` of a type AssetGen
+  writes no zero for. `nullptr`, `{}` and `T()` of a number, an enum, a name, a string, an object, a container or a
+  struct are written as that type's zero. Fix: write an explicit value, or leave the statement out to
+  keep the parent's default. See [Class defaults](#class-defaults).
+- `` <Member>: `<Struct>()` or `{}` holds what the engine's <Struct> constructor sets, which its header does not
+  say, so AssetGen cannot write it over the value already there ``: `Hit = FHitResult();` or `Hit = {};` in
+  UE_DEFAULTS or an asset edit, or a `UE_STRUCT`'s `{}` with such a member (`H.Hit: ...`), or `T()` in braces for a
+  `UE_STRUCT` member with an initializer of its own, for any engine struct but `FVector`, `FVector2D`, `FRotator`,
+  `FLinearColor`, `FColor` and the `FVector_NetQuantize` types (another mod's `UE_STRUCT_IN` struct is no engine
+  struct: its `T()` is its members' initializers). Its values are what the engine's constructor sets
+  (`FHitResult::Time` is 1, `FTransform()` is the identity). Fix: leave the statement out to keep the parent's value,
+  or give the members in braces,
+  `Hit = {.Time = 1.0f};`. See [Class defaults](#class-defaults).
+- `` <Member>.<Left>, left out of the braces, holds what the engine's <Struct> constructor sets, which its header does
+  not say, so AssetGen cannot write it over the value already there ``: braces in UE_DEFAULTS give some members and
+  leave `<Left>` out, over a parent's value that is not a fresh one: a member of an engine struct whose header has no
+  constructor (`Hit2 = {.Distance = 5.0f};` leaves `Hit2.FaceIndex` out over a native parent's value, and
+  `Hit2.Time` out over a mod parent's `FHitResult Hit2 = {.Time = 0.5f};`, whose other members are the engine's
+  and stay unwritten), or a `UE_STRUCT` value's member of such a
+  struct, with no initializer or `{}` (`H = {.N = 5};` leaves `H.Hit` out), or braces nested for a `UE_STRUCT`
+  member with an initializer of its own (`H = {.Hit = {.Distance = 5.0f}};` where the member is `FHitResult Hit =
+  {.Time = 0.5f};` leaves `H.Hit.Time` out: the parent's `H.Hit` holds that initializer's Time; FaceIndex, which the
+  initializer leaves out too, is still fresh and stays unwritten). A class's own default, a struct's member
+  initializer and a container's element say the same where new braces leave out a member that such an initializer
+  gives, of a `UE_STRUCT` or another mod's struct (`UE_STRUCT_IN`): `H = {.Hit = {.Distance = 5.0f}}` names
+  `H.Hit.Time`. A mod's own asset's braces say it over the class's default object, which the asset starts as:
+  `{.H = {.Hit = {.Distance = 5.0f}}}` where the class's `H = {.Hit = {.FaceIndex = 3}}` names `H.Hit.FaceIndex`.
+  Fix: give that member in the braces, or leave the statement out to keep the parent's value. See
+  [Class defaults](#class-defaults) and [Data assets](#data-assets).
+- `warning: <Member>: every member of <Struct> is Transient, which the engine never loads from a default: nothing is
+  written, and it keeps the parent's value`: `Handle = FTimerHandle();` in UE_DEFAULTS. No tag can set a Transient
+  member (the loader skips it), so the default holds the parent's handle. Fix: none needed; drop the statement to
+  silence it.
 - `warning: <Class>::UE_DEFAULTS: <Root> is the actor's root, which the engine puts at the spawn transform, so its
   <Properties> is not applied. A USceneComponent root passes its transform on to the components attached to it.`:
   UE_DEFAULTS sets RelativeLocation, RelativeRotation or RelativeScale3D on the actor's root, and the root is not a
@@ -5817,14 +6029,15 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   with genueapi, which reads that off the object dump`: a default set through a native parent's component, such as
   `CapsuleComponent->CapsuleRadius = 55.0f;` on an ACharacter child, when the UeApi headers record no default subobject
   of that name. The headers come from an older genueapi, or the member is a plain pointer and not a default subobject,
-  or two of the class's subobjects fit it and neither its name nor the class that declares it tells which.
+  or two of the class's subobjects fit it and neither its name, nor the class that declares it, nor a game Blueprint
+  deriving from the class (which genueapi reads with `--game`) tells which.
   The same message appears for a path one level too deep, `Lamp->RelativeLocation.Z = 50.0f;`, which it misreads as a
   component called RelativeLocation; regenerating does not help there. Fix: regenerate UeApi with genueapi from a dump
   that has `GObjects-Dump-WithProperties.txt`; assign whole values,
   `Lamp->RelativeLocation = FVector(0.0f, 0.0f, 50.0f);`; set a member that is not a default subobject at run time.
   See [Class defaults](#class-defaults). The same message, ending "a member that is no default subobject is attached
-  to at run time, with AttachToComponent", is `SetupAttachment` onto such a member, such as `AActor`'s
-  `RootComponent`, which no subobject of that name backs.
+  to at run time, with AttachToComponent", is `SetupAttachment` onto such a member, which no subobject of that name
+  backs. `AActor`'s `RootComponent` is not one: `SetupAttachment(RootComponent)` attaches to the actor's root.
 - `<Class>::UE_DEFAULTS: <Component> is a component of the Blueprint <BlueprintClass>, and its header does not say
   which SCS node it is - re-dump the game with the Dumper-7 fork (ScsNode=) and regenerate UeApi`: a default on a
   component of a game Blueprint parent whose header has no `<Component>__UeScsNode` marker. The same message appears
@@ -5855,6 +6068,12 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
 - `<Class>::UE_DEFAULTS: <Component>->SetupAttachment's socket is a literal name (FName("hand_r")) or none`: the
   socket is a variable or a call, which a node cannot hold. Fix: write the name, or attach at run time. See
   [The root and attachment](#the-root-and-attachment).
+- `warning: <Class>::<Function>: SetupAttachment attaches at once here, as AttachToComponent with KeepRelative
+  location, rotation and scale and no welding, ...`: `SetupAttachment` in a function. It attaches as the engine's own
+  call would once the component registers, but on a component already registered, as an actor's are once it is
+  constructed, the engine's own does nothing. The build goes on. Fix: call `AttachToComponent` with the rules you
+  want, or place a component of the class's own with `SetupAttachment` in UE_DEFAULTS. See
+  [The root and attachment](#the-root-and-attachment).
 - `<Class>::<Member>: only an actor has a construction script`: UE_COMPONENT in a class that does not derive from
   AActor. Fix: declare components only on an actor class. See [Components](#components).
 - `<Class>::<Member>: a UE_COMPONENT names an engine component class`: UE_COMPONENT of a component class the mod
@@ -5875,8 +6094,9 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   for. `Cast<IFoo>(Obj)` to a mod interface reports the type as `int64`. Fix: include the header that defines T, and
   cast only to classes. For an interface, write `TScriptInterface<IFoo> I = Obj;`. See [Types](#types) and
   [Interfaces](#interfaces).
-- `<Method>() is <Target>, which is not declared here: include its UeApi header`: `Obj->GetOuter()`, `GetClass()` or
-  `GetName()` in a source that does not include the header declaring the function the SDK forwards the call to.
+- `<Method>() is <Target>, which is not declared here: include its UeApi header`: `Obj->GetOuter()`, `GetClass()`,
+  `GetName()`, `IsA()`, or a struct, text or soft pointer method (`AssetData.GetExportTextName()`), in a source that
+  does not include the header declaring the function the SDK forwards the call to.
   Fix: include the header that declares `<Target>`; UGameplayStatics and UKismetSystemLibrary are in `UeApi/Engine.h`.
   See [Working with other objects](#working-with-other-objects).
 - `access to an unknown property: <Member>`: a data member of a type AssetGen keeps no record of. It records named
@@ -5907,8 +6127,22 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   the engine copies each argument into a parameter block of its own, so what the handlers write stays there. Fix:
   take the parameter by value or by `const &`, and hand results back through a member variable.
 - `a delegate on \`this\` cannot bind <Class>::<Function>: the engine looks it up by name on this object, whose class
-  has no such function`: `{this, &Other::F}` where this class is no `Other`. Fix: bind a method of this class, and
-  call the other object from it.
+  has no such function`: `{this, &Other::F}` where this class is no `Other`. Fix: bind it on an `Other` object,
+  `{O, &Other::F}`, or bind a method of this class.
+- `a delegate on a <Type> cannot bind <Class>::<Function>: the engine looks it up by name on that object, whose class
+  has no such function`: `OnHit.Add(H, &Other::F)` where H's type is no `Other`; the broadcast would skip it. Fix:
+  bind a function of H's class, or pass an object that has F. See [Event dispatchers](#event-dispatchers).
+- `a delegate cannot bind <Class>::<Function> on another object: the editor binds a BlueprintCallable function that is
+  not pure or latent, and <Function> is not BlueprintCallable` (or `is pure`, `is latent`; `on this object` for a
+  binding on `this`): the editor's Create Event node lists only such functions of its Object pin's class. An event the
+  engine calls (`AActor::ReceiveTick`) or a mod method that overrides one is none, and neither is a native function
+  the engine does not mark BlueprintCallable: an RPC (`AItem::Server_StartUsing`), a RepNotify
+  (`AActor::OnRep_Instigator`). Fix: bind a method of your own class that calls it. See
+  [Event dispatchers](#event-dispatchers).
+- `a delegate cannot bind <Class>::<Function>, which <Class> declares and never defines`: a binding on another object
+  names a mod method with no body, so no function of that name exists. Fix: define it.
+- `a delegate binds <Function> on an object, through a pointer to its class, not <Type>`: the object half of a binding
+  is no class pointer (an interface, a struct). Fix: pass the object, `I.GetObject()` cast to its class.
 - `<Function>: <Dispatcher>__DelegateSignature is the dispatcher's signature, which does nothing when called; call
   <Dispatcher>.Broadcast(...)`. Fix: broadcast the dispatcher.
 - `<Function>: K2_SetTimer by name <Name> names no function of the class` (or `names an inline method`, or `names a
@@ -5918,15 +6152,18 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
 - `` a delegate cannot bind <Function>: an inline function is expanded where it is called, no UFunction (drop `inline`) ``:
   Add, Remove or a delegate value names an inline method. An inline method is copied into each caller and never
   becomes a function of the class. Fix: drop `inline` from the handler. See [Event dispatchers](#event-dispatchers).
-- `` TODO: a delegate can only bind a function of `this` ``: Not yet. Binding a method of another object,
-  `OnHit.Add(Other, &AOther::Handle);` or `{ Other, &AOther::Handle }`, is refused, because the Blueprint delegate
-  binds the object whose code is running. Fix: bind a method of this class that calls the other object. See
-  [Event dispatchers](#event-dispatchers).
-- `TODO: Broadcast needs the dispatcher's signature function, which only a UE_DISPATCHER of this class has:
-  <Dispatcher>`: Not yet. Broadcast on a dispatcher that the class being compiled did not declare is refused: an
-  engine dispatcher such as `OnDestroyed.Broadcast(this)`, or one a parent mod class declares. Add, Remove and Clear
-  work on any dispatcher. Fix: to fire a parent's dispatcher, give the parent a method that broadcasts it,
-  `void Fire(int32 P) { OnHit.Broadcast(P); }`, and call that. See [Event dispatchers](#event-dispatchers).
+- `<Dispatcher>.Broadcast: <Dispatcher> is a native dispatcher (<Class>::<Dispatcher>) that is not BlueprintCallable,
+  and the editor's Call node refuses one ("Event Dispatcher is not 'BlueprintCallable'"): only the engine's own code
+  broadcasts it`: `OnDestroyed.Broadcast(this)` and the like; none of the engine's dispatchers is BlueprintCallable, 41
+  of the game's are. Fix: none; call what the engine calls to make the event happen (`K2_DestroyActor()`).
+- `<Dispatcher>.Broadcast: <Dispatcher> is a native dispatcher (<Class>::<Dispatcher>) and the editor's Call node takes
+  one only when it is BlueprintCallable, which this UeApi does not say (regenerate it with genueapi)`: the UeApi
+  headers have no `<Dispatcher>__UeDispatcher` mark for it, which genueapi writes for every native dispatcher (since
+  UeApi version 3; an older folder is refused before this), so the header was edited by hand. Fix: regenerate them.
+- `<Dispatcher>.<Add|Remove|Clear>: <Dispatcher> is a native dispatcher that is not BlueprintAssignable
+  (<Class>::<Dispatcher>), and the editor's dispatcher nodes refuse one ("Event Dispatcher is not 'BlueprintAssignable'"):
+  only the engine's own code binds it`: 17 of the game's dispatchers are not BlueprintAssignable. Fix: none from
+  Blueprint code.
 - `a delegate value is {this, &Class::Function}`: a delegate argument built any other way, such as an empty `{}`
   passed to `UKismetSystemLibrary::K2_ClearTimerDelegate`. There is no empty delegate value. Fix: pass
   `{ this, &AMine::Handle }` or `TDelegate<void()>(this, &AMine::Handle)`. See
@@ -6204,8 +6441,24 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   fix what clang reports, and check that `clang++` is on `PATH`. See
   [Mod sources and packages](#mod-sources-and-packages).
 - `missing or invalid <IncludeDir>/<File> (run genueapi.py)`: the include-dir argument is not a generated UeApi
-  folder: `Conv.json`, `Ops.json`, `Types.json` or `Events.json` is missing or unreadable. Fix: pass the UeApi folder
-  that genueapi wrote, or regenerate it. See [The SDK](GUIDE.md#the-sdk).
+  folder: `Conv.json`, `Ops.json`, `Types.json` or `Events.json` is missing or unreadable. A folder with no
+  `Version.json` and neither `Types.json` nor `Conv.json` (a mod folder, a path that does not exist) is reported so,
+  naming `Conv.json`, before clang runs. Fix: pass the UeApi folder that genueapi wrote, or regenerate it. See
+  [The SDK](GUIDE.md#the-sdk).
+- `<IncludeDir> was written by an older genueapi (no Version.json, this assetgen needs version <N>) - regenerate it
+  with AssetGen/tools/genueapi.py` (or `version <M>` for an older stamp): the UeApi folder comes from a genueapi older
+  than this compiler, which would compile against it without a word wrong where it relies on what that one did not
+  write (a game Blueprint's child would load before its parent's subobjects). genueapi writes `Version.json` last, so
+  a run that stopped halfway leaves none either (a folder with no `Types.json` or `Conv.json` either is no UeApi, the
+  message above). Fix: regenerate UeApi with the genueapi of this AssetGen, or use the
+  SDK release made for it. See [The SDK](GUIDE.md#the-sdk).
+- `<Class> derives from the game Blueprint <Parent>, but <IncludeDir> was generated without --game, so it does not list
+  the default subobjects that Blueprint's default object exports, which this class must load after - regenerate it
+  with AssetGen/tools/genueapi.py <SDK dir> <UeApi dir> --game <extracted Content dir>`: the UeApi's `Version.json`
+  says genueapi ran without `--game`, so no game Blueprint header lists its default subobjects or its tail, which
+  reads the same as a Blueprint that has none. The class would compile and then load before its parent's subobjects.
+  A class with a native parent still compiles against such a UeApi. Fix: regenerate UeApi with `--game` and the
+  game's extracted `Content` folder, or use the SDK release. See [The SDK](GUIDE.md#generating-your-own).
 - `usage: assetgen verify <out-dir> <reference-dir>` (and the lines after it): an unknown subcommand or too few
   arguments, with exit code 2. Fix: `assetgen compile <source.cpp> <UeApi dir> <out dir> [--api <api dir>]`. The
   `--api` folder is where the editor stubs go, not the UeApi folder. See [Building mods](GUIDE.md#building-mods).
@@ -6271,12 +6524,12 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
 - `<Mod> FAILED`: `assetgen compile` failed on one of the mod's sources; its `FAILED: <message>` line is printed
   directly above. The mod's remaining sources are not compiled, the other mods still build, and the exit code is 1.
   Fix: fix what assetgen's message names. See [Building mods](GUIDE.md#building-mods).
-- `<Source> declares no UE_MOD_PACKAGE`: the first file in the mod's `sources` has no `UE_MOD_PACKAGE("...")` line.
-  bpbuild reads the package from that file with a text search, so it does not see the macro when a header is listed
-  first or when another macro produces it. The same check runs on the first source of each `needs` dependency when
-  the mod sets `embed: true`. It stops the whole build. Fix: list the `.cpp` that holds the `UE_MOD_PACKAGE` line
-  first. See [Building mods](GUIDE.md#building-mods).
-- `<Mod> SKIP - no such source: <Paths>`: a listed source does not exist, or the mod lists none (`(none listed)`).
+- `<Sources> declares no UE_MOD_PACKAGE`: no `.cpp` in the mod's `sources` has a `UE_MOD_PACKAGE("...")` line.
+  bpbuild reads the package with a text search, so it does not see the macro when a header holds it or another macro
+  produces it. The same check runs on each `needs` dependency when the mod sets `embed: true`. It stops the whole
+  build. Fix: write the `UE_MOD_PACKAGE` line in one of the mod's `.cpp` files. See
+  [Building mods](GUIDE.md#building-mods).
+- `<Mod> SKIP - no such source: <Paths>`: a listed source does not exist, or the mod lists no `.cpp` (`(no .cpp listed)`).
   Paths are relative to the folder that holds `mods.yaml`. The mod counts as failed; the others still build. Fix: fix
   the `sources` paths. See [Building mods](GUIDE.md#building-mods).
 - ``mods.yaml: `needs` names an unknown mod: <Name>``: a `needs` entry names no mod in `mods.yaml`. It stops the

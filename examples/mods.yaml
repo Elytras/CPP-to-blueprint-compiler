@@ -6,23 +6,23 @@ mods:
   - name: WaitForPlayer
     sources: [WaitForPlayer.cpp]
   - name: Beacon
-    sources: [Beacon.cpp, ../include/Objects.h]
+    sources: [Beacon.cpp]
   - name: Scoreboard
     sources: [Scoreboard.cpp]
   - name: NetworkedSwitch
-    sources: [NetworkedSwitch.cpp, ../include/Objects.h]
+    sources: [NetworkedSwitch.cpp]
   - name: EnemyInfo
     sources: [EnemyInfo.cpp]
   - name: GameBlueprintChild
-    sources: [GameBlueprintChild.cpp, ../include/Objects.h]
+    sources: [GameBlueprintChild.cpp]
   - name: AwaitEvents
     sources: [AwaitEvents.cpp]
   - name: MemoryRead
-    sources: [MemoryRead.cpp, ../include/Intrin.h]
+    sources: [MemoryRead.cpp]
   - name: MathLib
-    sources: [MathLib.cpp, MathLib.h]
+    sources: [MathLib.cpp]
     generate_api: true
   - name: LibraryUser
-    sources: [LibraryUser.cpp, MathLib.h]
+    sources: [LibraryUser.cpp]
     needs: [MathLib]
     embed: true

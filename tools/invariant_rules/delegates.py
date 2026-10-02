@@ -62,7 +62,9 @@ def api():
                 if not u: continue
                 c = dict(cpp=cpp, super=sup, members={}, methods={})
                 for line in body.split('\n'):
-                    line = line.strip()
+                    # A function's attribute marks (UE_PURE, UE_SERVER UE_RELIABLE, UE_AUTHORITY_ONLY, ...) come first;
+                    # the function is a UFunction FindFunction finds all the same.
+                    line = re.sub(r'^(?:UE_[A-Z_]+\s+)+', '', line.strip())
                     if not line.endswith(';') or line.startswith(('UE_', '//', '/*', 'public', 'private', 'protected')): continue
                     depth, k = 0, None
                     for j, ch in enumerate(line):

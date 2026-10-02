@@ -873,7 +873,9 @@ def enum_tag_encoding(pkg):
     (PropertyTag.cpp 37-43, PropertyByte.cpp 39-98, 205-232). An EnumProperty's tag names its enum (PropertyTag.cpp 30-36).
     An enum-typed byte tagged 'None' is read as one byte of an FName and the stream desynchronises in Shipping, where
     check(Tag.Size == Loaded) is off (Class.cpp 1491-1499). An array of enums holds 8-byte FNames (EnumProperty.cpp
-    114-170)."""
+    114-170); an empty one is its counts alone, as SerializeItem reads an element only Num times (PropertyArray.cpp
+    113-215, PropertySet.cpp 285-358, PropertyMap.cpp 328-400), which the game's own UserDefinedStruct defaults carry
+    (Struct_Wardrobe_Entry's empty NewNotificationObjects, 4 bytes)."""
     for i, tl, sc in tagged(pkg):
         if sc is None: continue
         own = sc[0]
@@ -889,7 +891,7 @@ def enum_tag_encoding(pkg):
                 if t['enum'] != want: yield i, 'tag %s: EnumName %s, the property\'s enum %s' % (t['name'], t['enum'], want)
             elif p.type in ('ArrayProperty', 'SetProperty', 'MapProperty') and t['type'] == p.type:
                 if any(s.type == 'EnumProperty' or (s.type == 'ByteProperty' and s.ref) for s in p.subs) and decodable(p) \
-                        and not values(t, p):
+                        and not frames(t, p):
                     yield i, 'tag %s: %s of enums does not decode as 8-byte names' % (t['name'], p.type)
 
 

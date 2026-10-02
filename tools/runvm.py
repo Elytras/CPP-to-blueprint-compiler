@@ -2,6 +2,7 @@
 """A class run the way the Blueprint VM runs it, for what runscript.py alone cannot: latent calls and the ubergraph's
 persistent frame, delegate binds and broadcasts, calls and sets on other objects. Engine calls are logged and answered
 by a test's fakes. Importing this extends runscript's parser with the opcodes those bodies use."""
+import copy
 import os
 import dumpexp
 import runscript
@@ -73,6 +74,15 @@ class Written(dict):
     leaves a member it does not write (a Transient one) as the destination had it."""
 
 
+def by_value(v):
+    """v as a variable takes it: FProperty::CopyCompleteValue copies a struct or container (execLet,
+    ScriptCore.cpp 2647-2686), so its dicts and lists are new, the objects they hold the same."""
+    if not isinstance(v, (dict, list)): return v
+    c = copy.copy(v)
+    for k in (list(c) if isinstance(c, dict) else range(len(c))): c[k] = by_value(c[k])
+    return c
+
+
 class Obj:
     """An object the VM hands around: class name, variables, outer (OuterPrivate) and a fake address."""
     _next = 0x10000
@@ -117,8 +127,21 @@ class VM:
         s.accessed_none = []        # (function, mem) of each EX_Context run on None: an 'Accessed None' script warning
         s.ref_params = False        # True: a script callee's reference parameters write back into their arguments (ref_writeback)
         s.env_log = []              # with ref_params, each call's frame as it starts, so ref_writeback finds the callee's
+        s.classes = {}              # another class's name -> the base of its package: what runs on an object of it (peer)
+        s._peers = {}
 
     def new(s, **vars): return Obj(s.self.cls, **vars)
+
+    def peer(s, cls):
+        """The VM of the package of class `cls` (one of `classes`), sharing this one's objects, bindings, latent actions,
+        log and Accessed None list: a call on an object of that class runs that class's function, as a broadcast or a
+        timer finds a bound name on the bound object's own class (FindFunction, ScriptDelegates.h 38-49, 479-502)."""
+        v = s._peers.get(cls)
+        if v is None:
+            v = s._peers[cls] = VM(s.classes[cls], s.natives, s.isa, s.objects)
+            v.binds, v.latent, v.log, v.accessed_none = s.binds, s.latent, s.log, s.accessed_none
+            v.classes, v._peers, v.null_rvalues, v.struct_const = s.classes, s._peers, s.null_rvalues, s.struct_const
+        return v
 
     def ref_writeback(s, fn, args, env, store):
         """A script callee's reference parameter is its argument's own variable: ProcessScriptFunction hands the callee an
@@ -151,8 +174,21 @@ class VM:
 
     def call(s, fn, *args, on=None, **parms):
         me = on or s.self
+        if isinstance(me, Obj) and me.cls != s.self.cls and me.cls in s.classes:
+            return s.peer(me.cls).call(fn, *args, on=me, **parms)
         stmts, at, names = s.script(fn)
         env = s.frame(me, fn) if fn.startswith('ExecuteUbergraph_') else {}   # the persistent frame
+        if not fn.startswith('ExecuteUbergraph_'):
+            # A frame starts zeroed, its locals constructed under FUNC_HasDefaults (ScriptCore.cpp 909-916): a struct
+            # local is a struct of zeros, or what InitializeValue leaves in it (runscript.frame_defaults: FTransform's
+            # identity, FHitResult's Time 1, a UserDefinedStruct's defaults), which a Make Struct's temp holds. A
+            # function base has no export of (a class chain's parent's) is left as it was.
+            try:
+                env.update((p, {}) for p, t in runscript.props_of(s.base, fn).items()
+                           if t == 'StructProperty' and p not in names)
+                env.update((p, v) for p, v in runscript.frame_defaults(s.base, fn).items()
+                           if not isinstance(v, runscript.Unconstructed))
+            except StopIteration: pass
         env.update(zip(names, args)); env.update(parms)
         if s.ref_params: s.env_log.append(env)
 
@@ -202,7 +238,14 @@ class VM:
                     if parm in runscript.params_of(s.base, name, 0x100) and a.op not in runscript.ADDRESSABLE \
                             and not (a.op in (0x19, 0x1A) and a.kids[1].op in runscript.ADDRESSABLE):
                         raise SystemExit('vm: %s: reference parameter %s gets a non-variable (op %02x), which crashes the VM' % (name, parm, a.op))
-                vals, first = [ev(a) for a in n.kids], len(s.env_log)
+                # A reference argument the callee reads through its address is read once every argument has run, as
+                # runscript reads it (read_late): a sibling may write it first.
+                outs = runscript.params_of(s.base, name, 0x100)
+                bound = [i < len(s.script(name)[2]) and s.script(name)[2][i] in outs and runscript.read_late(a)
+                         for i, a in enumerate(n.kids)]
+                vals = [None if b else ev(a) for b, a in zip(bound, n.kids)]
+                vals = [ev(a) if b else v for b, a, v in zip(bound, n.kids, vals)]
+                first = len(s.env_log)
                 r = s.call(name, *vals, on=ctx)
                 if s.ref_params: s.ref_writeback(name, n.kids, s.env_log[first], store)
                 return None if r is STALE and not keep else r
@@ -252,24 +295,36 @@ class VM:
         pc = 0
         for _ in range(100000):
             n = stmts[pc]; o = n.op; pc += 1
-            if o in (0xF, 0x14, 0x5F):
+            named = o == 0xF and n.kids[1].op == 0x2F and s.struct_const \
+                and s.struct_const(n.kids[1].val, list(range(len(n.kids[1].kids))))
+            if isinstance(named, Written):
+                # execLet hands EX_StructConst the variable's own address (ScriptCore.cpp 2647-2686), and it steps each
+                # member straight into it (3376-3405): a member that reads the variable sees the ones written before it.
+                put, dest = locate(n.kids[0]), ev(n.kids[0])
+                if not isinstance(dest, dict):
+                    dest = Written()
+                    put(dest)
+                for member, k in zip(named, n.kids[1].kids): dest[member] = by_value(ev(k))
+            elif o in (0xF, 0x14, 0x5F):
                 # EX_Let steps the value into the destination itself, so a None context's STALE keeps it; EX_LetBool /
                 # EX_LetObj step it into a local that starts false / NULL, then store that (ScriptCore.cpp 2688-2800).
                 put, v = locate(n.kids[0]), ev(n.kids[1], keep=o == 0xF)
                 if isinstance(v, Written) and isinstance(ev(n.kids[0]), dict): v = Written({**ev(n.kids[0]), **v})
-                if v is not STALE: put(False if v is None and o == 0x14 and s.null_rvalues else v)
+                if v is not STALE: put(False if v is None and o == 0x14 and s.null_rvalues else by_value(v))
             elif o == 0x64:                                 # LetValueOnPersistentFrame: into the ubergraph's frame
                 uber = n.owner.split(':', 1)[-1]           # exp[2]:ExecuteUbergraph_A::Gun: a namespaced class's '::'
                 uber = uber.split("'")[1] if "'" in uber else uber
                 assert uber.startswith('ExecuteUbergraph_'), n.owner
-                s.frame(me, uber)[n.val] = ev(n.kids[0])
+                s.frame(me, uber)[n.val] = by_value(ev(n.kids[0]))
             elif o == 0x5C:                                 # AddMulticastDelegate(Obj.Prop, delegate)
                 t = n.kids[0]
                 obj, prop = (ev(t.kids[0]), t.kids[1].val) if t.op == 0x19 else (me, t.val)
                 if obj is None:                             # Accessed None, and no address: nothing added (ScriptCore.cpp 3098)
                     s.accessed_none.append((fn, t.mem)); continue
                 _, dfn, dobj = ev(n.kids[1])
-                if (obj, prop, dfn, dobj) not in s.binds: s.binds.append((obj, prop, dfn, dobj))   # AddUnique
+                # AddUnique, then CompactInvocationList: a delegate bound to no object is compactable, so it is taken
+                # straight off again (ScriptDelegates.h 336-343, IsCompactable 100-103).
+                if dobj is not None and (obj, prop, dfn, dobj) not in s.binds: s.binds.append((obj, prop, dfn, dobj))
             elif o in (0x62, 0x5D):                         # Remove(Obj.Prop, delegate): one match; Clear(Obj.Prop): all
                 t = n.kids[0]
                 obj, prop = (ev(t.kids[0]), t.kids[1].val) if t.op == 0x19 else (me, t.val)
@@ -284,8 +339,8 @@ class VM:
                 t = n.kids[0]
                 obj, prop = (ev(t.kids[0]), t.kids[1].val) if t.op == 0x19 else (me, t.val)
                 vals = [ev(a) for a in n.kids[1:]]
-                for bobj, bprop, dfn, dobj in list(s.binds):
-                    if bobj is obj and bprop == prop: s.call(dfn, *vals, on=dobj)
+                for bobj, bprop, dfn, dobj in list(s.binds):     # each IsBound one (ScriptDelegates.h 479-502)
+                    if bobj is obj and bprop == prop and dobj is not None: s.call(dfn, *vals, on=dobj)
             elif o == 6: pc = at[n.val]
             elif o == 7:
                 if not ev(n.kids[0]): pc = at[n.val]
@@ -300,12 +355,12 @@ class VM:
         one) gets `result`, then CallbackTarget->ProcessEvent(FindFunction(ExecutionFunction), &Linkage)."""
         fn, ctx, (link, uuid, execfn, target), delegate = s.latent.pop(i)
         assert execfn in s.exports, execfn
-        if delegate: s.call(delegate[1], result, on=delegate[2])
+        if delegate and delegate[2] is not None: s.call(delegate[1], result, on=delegate[2])   # ExecuteIfBound
         s.call(execfn, on=target, EntryPoint=link)
 
     def broadcast(s, obj, prop, *args):
         for o, p, fn, bound in list(s.binds):
-            if o is obj and p == prop: s.call(fn, *args, on=bound)
+            if o is obj and p == prop and bound is not None: s.call(fn, *args, on=bound)
 
 
 ALWAYS_NEW = {'LoadAsset', 'LoadAssetClass'}    # "We always spawn a new load" (KismetSystemLibrary.cpp 2662, 2691)

@@ -82,7 +82,14 @@ const Json* Nth(const Json& N, size_t I)
 }
 
 std::string StripTypeKeywords(std::string T);
+bool IsTEnumType(std::string T);
 const Json* PeelLvalue(const Json* N);
+bool IsFixedOperand(const Json& N);
+/* `(L[Idx()] = 3) += 1`: AssignedPlace writes an assignment's left side only when it is a plain variable. */
+const char* const kAssignedAssignNoVar = "an assignment assigned to or updated, whose left side is no plain variable, "
+    "which would be evaluated again to write it: assign in a statement of its own, then update what it assigned";
+/* kAssignedAssignNoVar, or its words for an update assigned to or updated; empty for anything else. */
+std::string AssignedNoVar(const Json& Target);
 Json RefToLocal(const std::string& Name, const std::string& Type);
 
 std::string TypeOf(const Json& N)
@@ -145,13 +152,34 @@ void ForEach(const Json& N, const F& Fn)
     for (const Json& C : *It) Fn(C);
 }
 
-/* What clang writes for a member the braces leave out; an aggregate member (a struct, a TArray) is a list of those. */
+/* Whether the source spells braced value E: its range runs from its `{` to its `}`. What clang makes up for a member
+   the braces leave out - a CXXConstructExpr with no argument for a class (FVector2D, a TArray), a list of its members'
+   values for an aggregate - lies on one point, the closing brace of the list it fills, begin and end alike, or has no
+   range at all (`[V]` on probes, positional and designated; the JSON says nothing else apart: both are `"list": true,
+   "zeroing": true`). A location in a macro is its spelling's, so `{}` written through a macro is spelled too. */
+bool IsSpelledBraces(const Json& E)
+{
+    const auto R = E.find("range");
+    if (R == E.end()) return false;
+    auto Offset = [&](const char* Side) {
+        const auto L = R->find(Side);
+        if (L == R->end()) return int64(-1);
+        const auto S = L->find("spellingLoc");
+        return (S == L->end() ? *L : *S).value("offset", int64(-1));
+    };
+    return Offset("begin") != Offset("end");
+}
+
+/* Whether E is what clang writes for a member the braces leave out: ImplicitValueInitExpr, CXXDefaultInitExpr, a
+   CXXConstructExpr with no argument for a class, or for an aggregate (a UE_STRUCT) a list of those. A `{}` written for
+   a member is a value - a fresh one of its type: zero, empty, None, a UE_STRUCT's own defaults - not the member's
+   default, though clang writes the same node for it, only at the braces (IsSpelledBraces). */
 bool IsUnsetInit(const Json& E)
 {
     const std::string K = Kind(E);
     if (K == "ImplicitValueInitExpr" || K == "CXXDefaultInitExpr") return true;
+    if ((K != "CXXConstructExpr" && K != "InitListExpr") || IsSpelledBraces(E)) return false;
     if (K == "CXXConstructExpr") return !First(E);
-    if (K != "InitListExpr") return false;
     bool bAll = true;
     ForEach(E, [&](const Json& C) { bAll = bAll && IsUnsetInit(C); });
     return bAll;
@@ -574,12 +602,15 @@ struct FRecord
     std::set<std::string> PrivateFields;
     std::map<std::string, std::string> ScsNodes;    // `<X>__UeScsNode`: a game Blueprint's component -> its node's guid, 32 hex
     std::map<std::string, std::string> Subobjects;  // `<X>__UeSubobject`: a native component -> "<name> <class path>" on this CDO
+    std::map<std::string, std::string> Dispatchers; // `<X>__UeDispatcher`: a native dispatcher -> "Assignable Callable", what of them it is
     std::vector<std::pair<std::string, std::string>> DefaultSubobjects;    // UeDefaultSubobjects: (name, class path), a game Blueprint CDO's
     std::map<std::string, std::string> TypeAliases; // `using Leaf = Game::...::Leaf;` in the class body
     std::set<std::string> FinalMethods;             // `virtual T F() final`: no subclass has an F of its own
     std::set<std::string> Forwarders;               // Methods AssetGen declared, not the source: see SynthesizeForwarders
     const Json* Defaults = nullptr;                 // UE_DEFAULTS: the static-init block, never lowered
     bool bFinal = false;        // `class X final`: X has no subclass
+    bool bFinalAsLeaf = false;  // UE_FINAL_AS's leaf: its base's one subclass
+    std::string FinalAs;        // UE_FINAL_AS(this, Leaf): Leaf's CppName - compiled as final, cooked Abstract
     bool bIsLocal = false;      // UePackage == ModPackage/CppName: cooked here, published at its /Game path
     bool bIsStruct = false;     // UE_STRUCT: cooked as a UserDefinedStruct asset
     bool bIsInterface = false;  // UE_INTERFACE: cooked as a BPGC whose super is UInterface
@@ -688,6 +719,7 @@ struct FStructInfo
 };
 
 bool IsVmConstant(const FArgIR& A);
+bool SteppedInPlace(const FArgIR& A);
 
 /* Each index into SI.Fields EX_StructConst writes, in the order it writes them. */
 std::vector<size_t> StructConstOrder(const FStructInfo& SI)
@@ -1074,6 +1106,18 @@ bool EmitCall(FScript& S, const FCallIR& Call, FIndex SelfExp, std::string* Err,
         S.Raw(Bytes.data(), Bytes.size(), MemBytes);
         return true;
     }
+    /* Create Event with its Object pin wired (KCST_BindDelegate, LowerDelegateValue): Args[0] the delegate local, Args[1]
+       the object, Args[2] the function's name (KismetCompilerVMBackend.cpp 1609-1625). */
+    if (Call.Intrinsic == "__BindDelegate__")
+    {
+        bool bOk = true;
+        std::string SubErr;
+        S.BindDelegate(Call.Args[2].S,
+                       [&](FScript& C) { bOk = bOk && EmitArg(C, Call.Args[0], SelfExp, &SubErr); },
+                       [&](FScript& C) { bOk = bOk && EmitArg(C, Call.Args[1], SelfExp, &SubErr); });
+        if (!bOk && Err) *Err = SubErr;
+        return bOk;
+    }
     /* A dispatcher operation: Args[0] is the dispatcher, then the delegate or the broadcast's arguments. */
     const bool bAdd = Call.Intrinsic == "__AddDelegate__", bRemove = Call.Intrinsic == "__RemoveDelegate__";
     if (bAdd || bRemove || Call.Intrinsic == "__ClearDelegate__" || Call.Intrinsic == "__Broadcast__")
@@ -1236,7 +1280,7 @@ private:
                    const FPackage& From, const std::string& Where, std::string* Err);
     bool SaveEdits(const std::string& OutDir, std::string* Err);
     bool BracedMembers(const Json& List, const FRecord& Rec, const std::string& Where, FBlueprintClass& BP, bool bKeepZero,
-                       std::vector<FPropertyDef>& Out, std::string* Err);
+                       std::vector<FPropertyDef>& Out, std::string* Err, const FRecord* Archetype = nullptr);
     struct FEdited { std::string Package, Ext; FCookedPackage P; std::vector<std::string> Objects; };
     std::map<std::string, FEdited> Edited;                  // lowercased package name -> the game's package, edited
     FEdited* LoadEdited(const std::string& Package, const std::string& Where, std::string* Err);
@@ -1275,27 +1319,62 @@ private:
     bool ChangesMapCount(const Json& Body, const std::string& MapType) const;
     bool LowerWithoutPrefix(const Json& Stmt, FBlueprintClass& BP, std::vector<FStmtIR>& Out,
                             std::vector<FPropertyDef>& Locals, std::string* Err);
+    int32 HoistComma(const Json& Stmt, FBlueprintClass& BP, Json* Seq, std::string* Err);
+    /* The commas, assignments and updates of the statement being lowered that sit behind an operand C++ evaluates
+       before them (NoteBehind), where an inline body would run ahead of that operand. */
+    std::set<const Json*> Behind;
+    void NoteBehind(const Json& Root, std::vector<const Json*>& Added);
+    int32 LowerBoundArgs(const Json& Call, FBlueprintClass& BP, FCallIR& Out, std::string* Err);
+    bool LowerCommaValue(const Json& N, bool bRead, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
+    bool AssignedPlace(const Json& Place, Json& Pre, Json& Out) const;
+    const Json* ReadComma = nullptr;    // LowerArg: the comma or `=` under the LValueToRValue it is lowering, read there
+    const Json* CalledDecl(const Json& Call) const;
 
     /* `inline` functions are the editor's macros: never a UFunction, their body is copied into each caller.
        `inline` may sit on the declaration or on an out-of-line definition. */
     bool IsInlineMethod(const FRecord& R, const std::string& Method) const;
     bool CheckMemberNames(const FRecord& R, std::string* Err) const;
+    bool IsSceneRecord(const FRecord* C) const;
+    bool RootInheritedBy(const FRecord& R) const;
+    bool ListsDefaultRootOf(const FRecord& R) const;
     bool ExpandInline(const Json& CallNode, const Json& Def, const std::string& Method, bool bMethod, FBlueprintClass& BP,
                       FCallIR& Out, std::string* Err, const Json* Receiver = nullptr, bool bStaticCall = false);
     /* `final`: the class holding the version of Method a call by name reaches on every object of class Of or below,
        the nearest declaration from Of up that is a Blueprint function, when no subclass can bring its own: Of is
        final, or that declaration is. Null when one could. */
     const FRecord* FinalOwner(const FRecord* Of, const std::string& Method) const;
+    /* Whether Generate cooks A's Method FUNC_Final: A or the method is `final`, and it replaces no function (FindEvent),
+       whose flags it would take instead. */
+    bool IsFinalFunction(const FRecord& A, const std::string& Method) const;
     /* The definition a call (Call, to the declaration clang picked, Picked) to In's Method may be expanded from in
        place of the call, or null. See LowerCall. */
     const Json* Expandable(const FRecord& In, const std::string& Method, const Json& Call, const Json* Picked) const;
     /* The part of Expandable that holds for every call: In's definition of Method, or null when no call may copy it. */
     const Json* CopyableDef(const FRecord& In, const std::string& Method) const;
+    /* The body a call on `this` always expands in place, an inline method's or a member template's, or null. */
+    const Json* InlineOnThis(const Json& Call) const;
+    /* The class such a body is declared in, an inline method's or a member template's, or null: it is that class's
+       code wherever it is copied, so what it names is read there (NamesQualified). */
+    const FRecord* DeclaredIn(const Json& Inline) const;
     bool ResumesLater(const Json& N, std::set<const Json*>& Seen) const;
     /* `Base::Fn()` from a class without an Fn of its own, to an Fn that is not copied in: an override of Fn declared in
        that class, forwarding to the parent's, so that the call can be bound to Base's. Run once, before any Generate. */
     void SynthesizeForwarders();
     std::deque<Json> ForwarderDecls;            // their declarations, which the records point into
+    /* The class above R, cooked by this source, whose Method implements R's interface function of that name in C++:
+       the nearest declaration from R's parent up, unless it is a native class's or `= 0`. Null when none. */
+    const FRecord* InheritedImplementation(const FRecord& R, const std::string& Method) const;
+    /* Why no forwarder can call A's Method for the interface function IfaceDecl declares (static, a multicast, final,
+       of another signature), or empty. */
+    std::string WhyNotForwarded(const FRecord& A, const std::string& Method, const Json& IfaceDecl) const;
+    /* What ParentClass->FindFunctionByName finds of Method above R, walked as FindEvent walks for a super: the class
+       holding it and whether it is a static; {nullptr, false} for nothing. */
+    std::pair<const FRecord*, bool> FoundAbove(const FRecord& R, const std::string& Method) const;
+    /* Each file of the mod's own holding `UE_FINAL_AS(Base, Leaf)` (last name segments compared), as whether it is a
+       header a source of Owner's (the mod package that cooks the base) includes: the compiled source and what it
+       includes by a quoted path beside it, transitively, UeApi headers left out. Empty when the macro is written
+       nowhere these reach. */
+    std::vector<bool> FinalAsSites(const std::string& Base, const std::string& Leaf, const std::string& Owner) const;
     bool IsMulticast(const FRecord& R, const std::string& Method) const;
     /* A constant outside any function body, `constexpr int32 kMax = 40;` at namespace scope or static in a class, and an
        inline class variable, `static inline const TArray<FName> Tags = {...};`: decl id -> its VarDecl. It has no
@@ -1380,9 +1459,14 @@ private:
     bool ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgIR& Arg, std::string* Err);
     bool LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     bool LowerMakeStruct(const std::string& Type, const Json* List, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
+    bool MakeTemp(const std::string& Type, FBlueprintClass& BP, std::string* Tmp, std::string* Err);
+    bool LowerStructByMembers(const std::string& Type, const FStructInfo& SI, std::vector<FArgIR>& Values,
+                              FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     bool LowerDispatcherCall(const Json& Call, const Json& Callee, const Json& Obj, FBlueprintClass& BP,
                              FArgIR& Out, std::string* Err);
-    bool LowerDelegateValue(const Json& Obj, const Json& Fn, FArgIR& Out, std::string* Err);
+    bool LowerDelegateValue(const Json& Obj, const Json& Fn, const std::string& DelegateType, FIndex Sig, const std::string& Holder,
+                            FBlueprintClass& BP, FArgIR& Out, std::string* Err);
+    const FRecord* DispatcherOwner(const Json& Dispatcher);
 
     /* Raw pointers: a pointer to anything but a UObject (void*, int32*, FName*, UObject**) is an address,
        an int64 at run time. NormalizePointers respells them int64 in a declaration's subtree before
@@ -1495,10 +1579,17 @@ private:
     const FRecord* NamedQualifier(const Json& Ref) const;
     /* `Base::Method()` on this: the record the qualifier names, read back the same way, else null. */
     const FRecord* MemberQualifier(const Json& Member) const;
+    /* Whether a call on `this` to R's Method, written in class Written, names R's own: the forwarder's call, one
+       written `R::Method()` (MemberQualifier), or one past a declaration of Method from Written up to R, which in C++
+       hides R's from an unqualified call - so it got there through a qualifier, however spelled (`this->R::Method()`).
+       A forwarder is no declaration of the source's, so this answers the same before and after SynthesizeForwarders. */
+    bool NamesQualified(const Json& Callee, const FRecord* Written, const FRecord& R, const std::string& Method) const;
     const std::vector<std::string>& ModSources() const;
     bool IsSubclassOf(const FRecord& Child, const FRecord& Parent) const;
     /* The nearest declaration of some method along R's chain is `= 0`: the class Generate cooks CLASS_Abstract. */
     bool IsAbstract(const FRecord& R) const;
+    /* The nearest `= 0` method R is left with, up its chain, and the class declaring it; {nullptr, ""} when none. */
+    std::pair<const FRecord*, std::string> PureMethod(const FRecord& R) const;
     std::vector<uint8> NativeTail(const FRecord* Component) const;
     std::vector<const Json*> StructArgs(const Json& Value, const FRecord* R, const std::vector<std::string>& Fields) const;
     mutable std::vector<std::string> SourceTexts;                       // the mod directory's .h/.cpp, read on demand
@@ -1511,6 +1602,8 @@ private:
     /* The declaration of the function Method replaces, as ParentClass->FindFunctionByName finds it (each class's own
        functions, then its interfaces, then its super; Self's own are no parent), and the record holding it. */
     std::pair<const FRecord*, const Json*> ReplacedDecl(const FRecord& Self, const std::string& Method) const;
+    /* The mod interface R lists (or one it extends) that declares Method, or null: R's stub of Method is Generate's. */
+    const FRecord* ModInterfaceWith(const FRecord& R, const std::string& Method) const;
     std::string Unreplicable(const Json& Typed, int32 Depth = 0) const;
 
     /* Records are keyed by qualified name; Bare holds only leaf names exactly one class claims,
@@ -1597,6 +1690,9 @@ private:
     std::map<std::string, std::vector<std::pair<std::string, int64>>> EnumDecls;   // C++ name -> its enumerators, in order
     std::map<std::string, int32> EnumConstWidth;      // clang EnumConstantDecl id -> its enum's size, 1 / 4 / 8
     std::map<std::string, uint32> EventFlags;         // UeApi/Events.json: "Package.Class.Function" -> EFunctionFlags
+    /* UeApi/NotCallable.json: "Package.Class.Function" of each function the engine does not mark BlueprintCallable and
+       that is no BlueprintEvent (Events.json has those). Every UeApi this compiler takes has it (UeApiVersion 3). */
+    std::set<std::string> NotCallable;
     /* UeApi/OutArrays.json: "Package.Class.Function" -> bit I for each parameter I of a native that is an out TArray,
        emptied before the call (FCallIR::EmptiedArgs). A UeApi without the file empties nothing, as before. */
     std::map<std::string, uint64> OutArrayArgs;
@@ -1609,12 +1705,19 @@ private:
     std::map<std::string, std::pair<std::string, FIndex>> DelegateSigs;    // Generate: a TDelegate type -> its signature
                                                                             // function's name and export
     const FBlueprintClass* DelegateSigsIn = nullptr;  // the class Generate is building, while it builds it
+    /* A class -> the signature functions DelegateSignature made in it: a parent or child generated after it names its
+       own around them (DelegateSignature's Taken). */
+    std::map<std::string, std::set<std::string>> MadeSignatures;
     const FConv* FindConv(const std::string& From, const std::string& To) const;
     const FOpInfo* FindOp(const std::string& Op, const std::string& Lhs, const std::string& Rhs) const;
     void ApplyConv(const FConv& C, FBlueprintClass& BP, FArgIR& Arg);
     std::string ModPackage;
     std::optional<std::string> ApiDir;      // `--api`: where the uncooked editor-side stubs go
     std::string SourceDir;      // the compiled .cpp's folder: what __EmbedFile__ resolves a relative path against
+    std::string SourceFile;     // the compiled .cpp itself, absolute: FinalAsSites follows its includes
+    /* The UeApi folder when genueapi wrote it without --game (Version.json "game": false), else empty: it then lists
+       no game Blueprint's default subobjects or tail, so Generate refuses a class deriving from one. */
+    std::string UeApiWithoutGame;
     /* A container inside a container: UE has no such property, so the inner one is the single member (Value) of a
        wrapper struct, <wrapper name> -> the container type. The wrapper has the container's layout. */
     std::map<std::string, std::string> NestedWrappers;
@@ -1665,7 +1768,9 @@ private:
     mutable bool    bSynthDeref = false;
     std::map<std::string, FRecord> Records;
     std::map<std::string, std::string> MethodOwner;   // clang decl id -> owning record
+    std::map<std::string, std::string> TemplateOwner; // a member template's instantiation's decl id -> its record
     std::map<std::string, std::string> FieldOwner;    // clang decl id -> declaring record
+    std::set<std::string> ReadOnlyFields;             // decl ids of the UE_READONLY (`mutable`) fields, any record's
     std::map<std::string, std::string> Bare;          // unambiguous leaf name -> qualified name
     std::map<std::string, std::string> Aliases;       // a namespace-scope `using A = B;` / typedef: A -> B
     const FRecord* Cur = nullptr;                     // record Generate is working on
@@ -1685,6 +1790,17 @@ private:
         printf("  warning: %s::%s: modifying reference parameter %s of an RPC reaches the caller only when the call runs "
                "locally; take it by value or const&\n", Cur ? Cur->CppName.c_str() : "", CurFnName.c_str(), Root->S.c_str());
     }
+    std::set<std::string> WarnedReadOnly;             // function + field of the read-only writes already warned about
+
+    /* A write to a UE_READONLY member: the editor offers no Set node for it, but the VM checks no flag, so the write is
+       kept - a deferred spawn's defaults before FinishSpawning is the case for it. Warned once per function and field. */
+    void WarnReadOnlyWrite(const Json& Member)
+    {
+        const std::string Id = Member.value("referencedMemberDecl", std::string());
+        if (!ReadOnlyFields.count(Id) || !WarnedReadOnly.insert(CurFnName + "|" + Id).second) return;
+        printf("  warning: %s::%s: %s is BlueprintReadOnly; the editor would not set it\n",
+               Cur ? Cur->CppName.c_str() : "", CurFnName.c_str(), Name(Member).c_str());
+    }
     std::string CurrentWco;                           // its WorldContext* parm when it is a static, else empty
     std::vector<FRegistryAsset> RegistryRows;
     std::vector<const Json*> AssetDecls;        // namespace-scope variables brace-initialized, see GenerateAsset
@@ -1703,6 +1819,25 @@ private:
        list of those for a TArray / TSet, of { key, value } pairs for a TMap. Init overrides F's own initializer. */
     bool LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& BP, std::string* Err, const Json* Init = nullptr,
                       bool bKeepZero = false);
+    /* C++'s value-initialisation of a struct LowerDefault writes as a value; see its definition. */
+    bool ValueInitStruct(const FRecord& SR, bool bZeros, const std::string& Path, FPropertyDef& PD, FBlueprintClass& BP,
+                         std::string* Err);
+    /* Set while LowerDefault lowers the members of a value that starts fresh - a class's own default, a struct's
+       default instance, a container's element - rather than one read over a value already there (UE_DEFAULTS over the
+       parent's, an asset edit over the game's). */
+    bool bFreshValue = false;
+    /* Set while LowerDefault lowers a member that braces giving others leave out, for ValueInitStruct's message. */
+    bool bLeftOutMember = false;
+    /* Set while a UE_DEFAULTS statement is lowered whose member the parent holds as a fresh value (ParentValueFresh):
+       a member its braces leave out keeps that value, as C++ would make it. */
+    bool bParentFresh = false;
+    /* With bParentFresh, the braces the parent's value of the struct being lowered was made with, as a member's
+       initializer gave them (`FRvInner In = {.K = 4}`), and that struct's record: its members are fresh where these
+       leave them out. Null: as each member's own declaration makes it. */
+    const Json* ParentInit = nullptr;
+    const FRecord* ParentInitOf = nullptr;
+    bool ParentValueFresh(const FRecord& R, const Json& Lhs, const Json*& Braces, const FRecord*& BracesOf) const;
+    bool ValueFreshFrom(const FRecord* From, const std::string& Id, const Json*& Braces, const FRecord*& BracesOf) const;
     std::map<std::string, std::vector<std::pair<std::string, int64>>> ModEnums;  // UE_ENUM cooked here: enumerators
 
     /* Per-function state reset in Generate: whether this function needs the FDeref scratch
@@ -2163,7 +2298,7 @@ bool FCompiler::Collect(std::string* Err)
     std::set<std::string> Ambiguous;
     std::map<std::string, std::string> EnumUnderlying;
     std::vector<std::pair<std::string, std::string>> EnumMarks;      // enum, owning mod ("" for this one)
-    std::map<std::string, std::string> TemplateAliases;              // a global `using A = T<...>;`: A -> T<...>
+    std::map<std::string, std::string> GlobalAliases;                // a global `using A = B;` / typedef: A -> B
 
     /* UeApi headers put Blueprint classes in namespaces mirroring their /Game path. */
     std::function<void(const Json&, const std::string&)> Walk =
@@ -2178,7 +2313,7 @@ bool FCompiler::Collect(std::string* Err)
         if ((Kind(N) == "TypeAliasDecl" || Kind(N) == "TypedefDecl") && N.contains("name"))
         {
             Aliases[Ns + Name(N)] = Aliases[Name(N)] = StripTypeKeywords(TypeOf(N));
-            if (Ns.empty() && TypeOf(N).find('<') != std::string::npos) TemplateAliases[Name(N)] = TypeOf(N);
+            if (Ns.empty()) GlobalAliases[Name(N)] = TypeOf(N);
         }
         if (Kind(N) == "VarDecl" && Name(N) == "UeModPackage") FindLiteral(N, ModPackage);
         /* UE_ASSET_EDIT: a pointer naming the target, then the braced variable holding the edit, one number between them. */
@@ -2258,7 +2393,22 @@ bool FCompiler::Collect(std::string* Err)
             if (N.value("inline", false) || Inlines.count(PrevId)) Inlines[PrevId] = Inlines[N.value("id", std::string())] = &N;
             return;
         }
-        if (Kind(N) != "CXXRecordDecl" || !N.contains("name") || !N.contains("inner")) return;
+        /* A soft pointer's methods (genueapi's Methods_<T>.inc): a call names its instantiation's, so each
+           instantiation is a record of the template's name, and they all say the same. */
+        if (Kind(N) == "ClassTemplateDecl" && (Name(N) == "TSoftObjectPtr" || Name(N) == "TSoftClassPtr"))
+        {
+            Walk(N, Ns);
+            return;
+        }
+        if ((Kind(N) != "CXXRecordDecl" && (Kind(N) != "ClassTemplateSpecializationDecl" || !Scope.contains("kind")
+                                           || Kind(Scope) != "ClassTemplateDecl"))
+            || !N.contains("name") || !N.contains("inner")) return;
+        /* A forward declaration is no record, though it may carry an attribute: `&AActor::F` gives every declaration of
+           AActor an implicit MSInheritanceAttr, the `class AActor;` a header has after the definition too, which would
+           replace the class with an empty one. */
+        bool bOnlyAttrs = true;
+        ForEach(N, [&](const Json& C) { const std::string K = Kind(C); bOnlyAttrs = bOnlyAttrs && K.size() > 4 && K.compare(K.size() - 4, 4, "Attr") == 0; });
+        if (bOnlyAttrs) return;
 
         FRecord R;
         R.CppName = Ns + Name(N);
@@ -2280,7 +2430,14 @@ bool FCompiler::Collect(std::string* Err)
 
         uint32 Access = N.value("tagUsed", std::string()) == "struct" ? FUNC_Public : FUNC_Private;
         std::string Category;       // UE_CATEGORY is positional, like an access specifier
-        ForEach(N, [&](const Json& C) {
+        std::function<void(const Json&)> Member = [&](const Json& C) {
+            /* genueapi puts a class's markers in a private `struct UeMarkers` at its bottom, out of IntelliSense's
+               member list: they are the class's own. */
+            if (Kind(C) == "CXXRecordDecl" && C.value("name", std::string()) == "UeMarkers" && !C.value("isImplicit", false))
+            {
+                ForEach(C, Member);
+                return;
+            }
             if (Kind(C) == "VarDecl" && Name(C).compare(0, 12, "UeCategory__") == 0)
             {
                 Category.clear();
@@ -2333,7 +2490,8 @@ bool FCompiler::Collect(std::string* Err)
             }
             else if (Kind(C) == "VarDecl" && Name(C) == "UeDefaultSubobjects")
             {
-                /* Every default subobject a game Blueprint's CDO exports, "<class path> <name>" joined by ';'. */
+                /* Every default subobject and archetype a game Blueprint's CDO exports, at any depth, "<class path>
+                   <name>" joined by ';', a nested one's name its path under the CDO (Damage:BreakIceBonus_0). */
                 std::string List;
                 if (FindLiteral(C, List))
                     for (size_t At = 0, End; At < List.size(); At = End + 1)
@@ -2353,6 +2511,8 @@ bool FCompiler::Collect(std::string* Err)
                     R.UeName = LeafOf(R.CppName);
                 }
             }
+            else if (Kind(C) == "VarDecl" && Name(C) == "UeFinalAsLeaf")
+                R.bFinalAsLeaf = true;
             else if (Kind(C) == "VarDecl" && Name(C).size() > 11 && Name(C).compare(Name(C).size() - 11, 11, "__UeForward") == 0)
             {
                 std::string Target;
@@ -2367,6 +2527,12 @@ bool FCompiler::Collect(std::string* Err)
             {
                 std::string Sub;
                 if (FindLiteral(C, Sub)) R.Subobjects[Name(C).substr(0, Name(C).size() - 13)] = Sub;
+            }
+            else if (Kind(C) == "VarDecl" && Name(C).size() > 14 && Name(C).compare(Name(C).size() - 14, 14, "__UeDispatcher") == 0)
+            {
+                std::string Kinds;
+                FindLiteral(C, Kinds);
+                R.Dispatchers[Name(C).substr(0, Name(C).size() - 14)] = Kinds;
             }
             else if (Kind(C) == "VarDecl" && Name(C).size() > 11 && Name(C).compare(Name(C).size() - 11, 11, "__UeScsNode") == 0)
             {
@@ -2405,13 +2571,19 @@ bool FCompiler::Collect(std::string* Err)
             {
                 R.Fields.push_back(&C);
                 FieldOwner[C.value("id", std::string())] = R.CppName;
+                if (C.value("mutable", false)) ReadOnlyFields.insert(C.value("id", std::string()));
                 if (Access == FUNC_Private) R.PrivateFields.insert(Name(C));
             }
             else if ((Kind(C) == "TypeAliasDecl" || Kind(C) == "TypedefDecl") && C.contains("name"))
                 R.TypeAliases[Name(C)] = StripTypeKeywords(TypeOf(C));
             else if (Kind(C) == "FinalAttr")
                 R.bFinal = true;
-        });
+            else if (Kind(C) == "FunctionTemplateDecl")
+                ForEach(C, [&](const Json& M) {
+                    if (Kind(M) == "CXXMethodDecl") TemplateOwner[M.value("id", std::string())] = R.CppName;
+                });
+        };
+        ForEach(N, Member);
         /* A set is looked up in Replicated by the name it is cooked under, so the marker's C++ key follows. */
         for (const auto& N2 : R.UeNames)
             if (auto Rep = R.Replicated.find(N2.first); Rep != R.Replicated.end())
@@ -2438,9 +2610,90 @@ bool FCompiler::Collect(std::string* Err)
     };
     Walk(Doc, std::string());
     if (!bMetaOk) return false;
-    /* `using ValueFactory = TScriptInterface<...>;`: Find resolves an alias of a class, nothing resolves one of a
-       template, so its uses - out-of-line method bodies included - are written out once here. */
-    if (!TemplateAliases.empty()) ExpandAliases(const_cast<Json&>(Doc), TemplateAliases);
+    /* A global alias of a template or a class (`using ValueFactory = TScriptInterface<...>;`, `using JSON =
+       Game::...::JSONValue_C;`) is written out in every use, out-of-line method bodies included. Find resolved one of
+       a class but nothing one of a template, and clang desugars only a type's outer layer, so `JSON *` kept its alias
+       where an override's signature is compared with its parent's. A scalar alias (`using int32 = int;`) stays: the
+       lowering reads those spellings. */
+    std::map<std::string, std::string> Expand;
+    for (const auto& [A, T] : GlobalAliases)
+        if (T.find('<') != std::string::npos || Records.count(StripTypeKeywords(T))) Expand[A] = T;
+    if (!Expand.empty()) ExpandAliases(const_cast<Json&>(Doc), Expand);
+    /* UE_FINAL_AS: the leaf's base is final in all but name. Its own code runs only on the leaf, which brings nothing
+       of its own, so the base is compiled as `final` (FinalOwner, FUNC_Final) and cooked Abstract; a second subclass,
+       here or in a mod that includes the header, would break that, so it is refused. */
+    for (auto& [Key, Leaf] : Records)
+    {
+        if (!Leaf.bFinalAsLeaf) continue;
+        const FRecord* Base = Leaf.Base.empty() ? nullptr : Find(Leaf.Base);
+        if (!Base || Base->UePackage.compare(0, 8, "/Script/") == 0 || !Leaf.bFinal)
+        { *Err = "UE_FINAL_AS(" + Leaf.Base + ", " + Leaf.CppName + "): the base must be a Blueprint class, a mod's"; return false; }
+        /* A base this source does not cook stays as its owner cooks it: its functions not Final, its other subclasses
+           kept, while the calls this mod makes to them would be bound as final, skipping their overrides. A game
+           Blueprint, or a class pinned to a path its name does not give, has no mod to say otherwise: refused. Another
+           mod's class pinned to its owner (a header mods share) is final only where that owner sees the macro too, in
+           the header declaring it; written anywhere else, the leaf pinned beside the base below is one its owner never
+           cooks. */
+        const std::string Natural = PathIn("", Base->CppName);
+        const bool bCookedHere = Base->UePackage.empty() || Base->UePackage == PathIn(ModPackage, Base->CppName);
+        const bool bOwnerPinned = Base->UePackage.size() > Natural.size()
+                                  && Base->UePackage.compare(Base->UePackage.size() - Natural.size(), Natural.size(), Natural) == 0;
+        if (!bCookedHere && !bOwnerPinned)
+        {
+            const std::string B = LeafOf(Base->CppName);
+            *Err = "UE_FINAL_AS(" + Leaf.Base + ", " + Leaf.CppName + "): " + B
+                 + (Base->UeName == B ? " is the game's Blueprint (" + Base->UePackage + "), which no mod cooks"
+                                      : " is cooked at " + Base->UePackage + ", not by this mod")
+                 + ": it stays as it is cooked there, its functions not final and its other subclasses kept, so calls "
+                   "bound to them as final would skip their overrides; derive " + LeafOf(Leaf.CppName) + " from it as a "
+                   "plain class";
+            return false;
+        }
+        if (!bCookedHere)
+            if (const std::vector<bool> Sites = FinalAsSites(LeafOf(Base->CppName), LeafOf(Leaf.CppName),
+                                                             Base->UePackage.substr(0, Base->UePackage.size() - Natural.size()));
+                !Sites.empty() && std::none_of(Sites.begin(), Sites.end(), [](bool bShared) { return bShared; }))
+            {
+                *Err = "UE_FINAL_AS(" + Leaf.Base + ", " + Leaf.CppName + "): " + LeafOf(Base->CppName) + " is another "
+                       "mod's class (UE_CLASS \"" + Base->UePackage + "\"), and only the UE_FINAL_AS in the header that "
+                       "declares it, which a source of that mod beside it includes too, makes the leaf that mod cooks; a "
+                       "header of this mod's own is not it; move it there, beside " + LeafOf(Base->CppName) + ", or derive "
+                     + LeafOf(Leaf.CppName) + " from it as a plain class";
+                return false;
+            }
+        /* The leaf brings no method of its own, so a `= 0` one left above it makes the one class made abstract too
+           (IsAbstract): nothing could be spawned, and the base's calls would be bound to the method's empty stub. */
+        if (const auto [Owner, Method] = PureMethod(Leaf); Owner)
+        {
+            *Err = "UE_FINAL_AS(" + Leaf.Base + ", " + Leaf.CppName + "): " + Owner->CppName + "::" + Method + " is `= 0`, "
+                   "so " + Leaf.CppName + ", the one class made, would be abstract; give " + Method + " a body";
+            return false;
+        }
+        /* A base UE_CLASS pins to its owner's path (a header mods share) is cooked by that owner alone, and so is its
+           leaf, beside it: unpinned, every mod that includes the header would cook a leaf of its own, which no leaf
+           object is, so its casts to the leaf would fail. The owner is the base's path less the folders its C++ name
+           gives it; a base pinned elsewhere, as a game Blueprint is, leaves the leaf where it was. */
+        if (Leaf.UePackage.empty() && bOwnerPinned)
+        {
+            Leaf.UePackage = PathIn(Base->UePackage.substr(0, Base->UePackage.size() - Natural.size()), Leaf.CppName);
+            Leaf.UeName = LeafOf(Leaf.CppName) + "_C";
+        }
+        /* A second macro on the base would read below as a stray subclass of the first leaf: say what it is. */
+        if (!Base->FinalAs.empty() && Base->FinalAs != Leaf.CppName)
+        {
+            *Err = Leaf.Base + " has two UE_FINAL_AS leaves, " + std::min(Base->FinalAs, Leaf.CppName) + " and "
+                 + std::max(Base->FinalAs, Leaf.CppName) + ": a base has one, the one class made";
+            return false;
+        }
+        Records[Base->CppName].FinalAs = Leaf.CppName;
+    }
+    for (const auto& [Key, W] : Records)
+        if (const FRecord* Base = W.Base.empty() ? nullptr : Find(W.Base); Base && !Base->FinalAs.empty() && Base->FinalAs != W.CppName)
+        {
+            *Err = W.CppName + " derives from " + Base->CppName + ", which is UE_FINAL_AS " + Base->FinalAs
+                 + ": that is its one subclass";
+            return false;
+        }
 
     if (ModPackage.empty())
     {
@@ -2515,6 +2768,20 @@ bool FCompiler::Collect(std::string* Err)
     return true;
 }
 
+/* Whether a class cooked here compiles a function for Method, as Generate decides: one with a body, in the class or out
+   of line, or `= 0` (an empty function). A declaration with neither is no function of the class's, so a subclass's of
+   its name has nothing of the class's above it. */
+static bool CompilesMethod(const FRecord& R, const std::string& Method)
+{
+    const auto M = R.Methods.find(Method);
+    if (M == R.Methods.end()) return false;
+    if (M->second->value("pure", false)) return true;
+    const auto D = R.MethodDefs.find(Method);
+    bool bBody = false;
+    ForEach(D != R.MethodDefs.end() ? *D->second : *M->second, [&](const Json& C) { bBody = bBody || Kind(C) == "CompoundStmt"; });
+    return bBody;
+}
+
 FIndex FCompiler::FindEvent(FBlueprintClass& BP, const std::string& FromRecord, const std::string& Method,
                             uint32* InheritedFlags, bool bFlagsOnly)
 {
@@ -2531,11 +2798,25 @@ FIndex FCompiler::FindEvent(FBlueprintClass& BP, const std::string& FromRecord, 
     {
         /* A mod ancestor's function is a super like a native one, and the nearest wins, as the Kismet compiler takes
            ParentClass->FindFunctionByName. What matters most is its net flags: an override of an RPC is that RPC, and
-           a mismatch "will trigger an assert in Link()" (KismetCompiler.cpp:2019). An inline method is no UFunction. */
+           a mismatch "will trigger an assert in Link()" (KismetCompiler.cpp:2019). An inline method is no UFunction, and
+           neither is one declared and never defined (CompilesMethod). */
         if (R != Self && !R->IsNative() && !R->bIsInterface)
-            if (auto M = R->Methods.find(Method); M != R->Methods.end() && !IsStaticDecl(*M->second) && !IsInlineMethod(*R, Method))
+            if (auto M = R->Methods.find(Method); M != R->Methods.end() && !IsInlineMethod(*R, Method) && CompilesMethod(*R, Method))
             {
+                /* A static is found the same. Only a static of Self's own gets here over one (Generate refuses the rest),
+                   and it inherits nothing: no caller is split, every call to either being bound, so its flags are its own. */
+                if (IsStaticDecl(*M->second)) return bFlagsOnly ? Null() : BP.EngineFunction(PackageOf(*R), ClassOf(*R), UeMethod);
                 *InheritedFlags = ModMethodFlags(*R, Method, BP);
+                return bFlagsOnly ? Null() : BP.EngineFunction(PackageOf(*R), ClassOf(*R), UeMethod);
+            }
+        /* A mod ancestor that lists a mod interface and leaves Method out (or only declares it) has the empty stub
+           Generate compiles for it, its own function, so that stub is the super ParentClass->FindFunctionByName finds;
+           its flags are a function's declared as the interface declares it. */
+        if (R != Self && !R->IsNative() && !R->bIsInterface
+            && (!R->Methods.count(Method) || (!IsInlineMethod(*R, Method) && !CompilesMethod(*R, Method))))
+            if (const FRecord* IR = ModInterfaceWith(*R, Method))
+            {
+                *InheritedFlags = ModMethodFlags(*IR, Method, BP);
                 return bFlagsOnly ? Null() : BP.EngineFunction(PackageOf(*R), ClassOf(*R), UeMethod);
             }
         if (R->IsNative() && R->Methods.count(Method) && !R->Forwards.count(Method))   // a forwarder is no UFunction to override
@@ -2566,13 +2847,24 @@ std::string DesugaredTypeOf(const Json& N)
     return It == N.end() ? std::string() : It->value("desugaredQualType", It->value("qualType", std::string()));
 }
 
+const FRecord* FCompiler::ModInterfaceWith(const FRecord& R, const std::string& Method) const
+{
+    for (const std::string& I : R.Interfaces)
+        for (const FRecord* IR : InterfaceChain(Find(I)))
+            if (IR && IR->bIsInterface && !IR->IsNative() && IR->Methods.count(Method)) return IR;
+    return nullptr;
+}
+
 std::pair<const FRecord*, const Json*> FCompiler::ReplacedDecl(const FRecord& Self, const std::string& Method) const
 {
     for (const FRecord* R = &Self; R; R = R->Base.empty() ? nullptr : Find(R->Base))
     {
+        /* A mod ancestor's function only declared is none of its (CompilesMethod), and a call to it is refused (LowerCall,
+           as C++ would not link it): no caller lays out its parameters. The stub of a mod interface it lists is, below. */
         if (R != &Self && !R->bIsInterface)
             if (auto M = R->Methods.find(Method); M != R->Methods.end()
-                && (R->IsNative() ? !R->Forwards.count(Method) : !IsStaticDecl(*M->second) && !IsInlineMethod(*R, Method)))
+                && (R->IsNative() ? !R->Forwards.count(Method)
+                                  : !IsStaticDecl(*M->second) && !IsInlineMethod(*R, Method) && CompilesMethod(*R, Method)))
                 return { R, M->second };
         for (const std::string& I : R->Interfaces)
             for (const FRecord* IR : InterfaceChain(Find(I)))
@@ -3002,6 +3294,36 @@ bool FCompiler::ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgI
     return false;
 }
 
+/* Engine structs whose default constructor sets nothing (`FVector() {}`, Vector.h 1243; Vector2D.h 47, Rotator.h 63,
+   Color.h 45 and 430; the FVector_NetQuantize family over FVector, NetSerialization.h 1983-2120), so the zero a fresh
+   property's memory holds is their value-initialisation. Every other engine
+   constructor may set members (FTransform's is the identity, TransformVectorized.h 108; FVector4's W is 1, Vector4.h
+   59; FFindFloorResult's HitResult has Time 1), and the UeApi header's `T() = default;` says nothing of it: genueapi
+   writes one beside every member-wise constructor. */
+static bool ConstructsNothing(const FRecord& R)
+{
+    static const char* const Names[] = {"FVector", "FVector2D", "FRotator", "FLinearColor", "FColor", "FVector_NetQuantize",
+                                        "FVector_NetQuantize10", "FVector_NetQuantize100", "FVector_NetQuantizeNormal"};
+    return std::any_of(std::begin(Names), std::end(Names), [&](const char* N) { return R.CppName == N; });
+}
+
+/* An engine struct the engine makes as zeros though its C++ constructor sets a member: STRUCT_ZeroConstructor
+   (WithZeroConstructor, Property.cpp 32-373) memzeroes a fresh property and a frame's local (InitializeValue,
+   ScriptCore.cpp 909-916), where FVector4() has W 1 (Vector4.h 59). The rest of those structs construct nothing, or
+   zeros (FRandomStream, FGuid, FTwoVectors). So a value of one is written, member and value said here, and never left
+   to a fresh property or local. */
+struct FCtorOverZeros { const char* Struct; const char* Member; float Value; };
+static const FCtorOverZeros* CtorOverZeros(const std::string& CppName)
+{
+    static const FCtorOverZeros Table[] = { { "FVector4", "W", 1.0f } };
+    for (const FCtorOverZeros& E : Table) if (CppName == E.Struct) return &E;
+    return nullptr;
+}
+
+/* The value-initialisation of Type, `T()` / `{}` in a function: the type's zero; an engine struct's is what its
+   constructor makes. One whose constructor sets nothing is its zeros, a literal; FVector4 the literal its constructor
+   gives (CtorOverZeros); any other the editor's Make Struct with nothing set, a temp the frame constructs as the engine
+   does (InitializeValue: the native constructor, FTransform's identity, FHitResult's Time 1). */
 bool FCompiler::ZeroArg(const std::string& Type, FBlueprintClass& BP, FArgIR& Out, std::string* Err)
 {
     const std::string T = Canon(Type);
@@ -3018,26 +3340,43 @@ bool FCompiler::ZeroArg(const std::string& Type, FBlueprintClass& BP, FArgIR& Ou
     case SK_Object: Out.K = FArgIR::NullObj; return true;
     default: break;
     }
+    const FRecord* R = Find(T);
+    const FCtorOverZeros* Ctor = R ? CtorOverZeros(R->CppName) : nullptr;
+    if (R && R->bIsStruct && R->IsNative() && !ConstructsNothing(*R) && !Ctor)
+        return LowerMakeStruct(R->CppName, nullptr, BP, Out, Err);
     auto SI = Structs.find(T);
     if (SI == Structs.end() || !SI->second.bComplete) { *Err = "no zero literal for " + Type; return false; }
+    /* A Transient member, here or in a member struct, is one EX_StructConst skips (ScriptCore.cpp 3376-3405), leaving it
+       as the destination holds it: `Handle = FTimerHandle()` would keep a live handle. In a function the zero is then the
+       editor's Make Struct, which stores every member. */
+    const std::vector<size_t> Order = StructConstOrder(SI->second);
+    std::vector<FArgIR> Zeros(SI->second.Fields.size());
+    bool bByMembers = CurLocals && Order.size() < Zeros.size();
+    /* The struct, then the literal's members in its order: the imports come in the order a literal always made them. */
+    const FIndex Owner = BP.ScriptStruct(SI->second.Package, SI->second.UeName);
+    std::vector<size_t> Each = Order;
+    for (size_t I = 0; I < Zeros.size(); ++I) if (std::find(Order.begin(), Order.end(), I) == Order.end()) Each.push_back(I);
+    for (size_t I : Each)
+    {
+        if (!ZeroArg(SI->second.Fields[I].first, BP, Zeros[I], Err)) return false;
+        if (Ctor && SI->second.Fields[I].second == Ctor->Member) Zeros[I].F = Ctor->Value;
+        bByMembers = bByMembers || Zeros[I].K == FArgIR::Call;
+    }
+    if (bByMembers) return LowerStructByMembers(T, SI->second, Zeros, BP, Out, Err);
     Out.K = FArgIR::StructLit;
-    Out.Owner = BP.ScriptStruct(SI->second.Package, SI->second.UeName);
+    Out.Owner = Owner;
     Out.I = SI->second.Size;
     Out.InnerType = T;
     Out.Sub = std::make_shared<FCallIR>();
-    for (size_t I : StructConstOrder(SI->second))
-    {
-        FArgIR M;
-        if (!ZeroArg(SI->second.Fields[I].first, BP, M, Err)) return false;
-        Out.Sub->Args.push_back(M);
-    }
+    for (size_t I : Order) Out.Sub->Args.push_back(Zeros[I]);
     return true;
 }
 
 /* `FVector(1, 2, 3)`: EX_StructConst wants one value per reflected field, in property order, so
    only a struct whose every field is known can be written; argless means all zeros. The arguments come in C++'s order
    (a super's members first) and go out in PropertyLink's (StructConstOrder); one for a Transient member has nowhere to
-   go, execStructConst skipping that member, so a constant there is dropped with a warning and anything else refused. */
+   go, execStructConst skipping that member. A literal with any other member, or of a struct with a Transient one, is
+   the editor's Make Struct instead (LowerStructByMembers). */
 bool FCompiler::LowerStructLiteral(const Json& CtorNode, const FStructInfo& SI, FBlueprintClass& BP,
                                    FArgIR& Out, std::string* Err)
 {
@@ -3061,17 +3400,76 @@ bool FCompiler::LowerStructLiteral(const Json& CtorNode, const FStructInfo& SI, 
     for (size_t I = 0; I < Args.size(); ++I)
         if (!LowerArg(*Args[I], BP, Given[I], Err)) return false;
     const std::vector<size_t> Order = StructConstOrder(SI);
-    for (size_t I = 0; I < Given.size(); ++I)
-    {
-        if (std::find(Order.begin(), Order.end(), I) != Order.end()) continue;
-        const std::string& Member = SI.Fields[I].second;
-        if (!IsVmConstant(Given[I]))
-        { *Err = T + "::" + Member + " is Transient, which a struct literal cannot set: give it a constant, or set the member "
-                 "after"; return false; }
-        printf("  warning: %s::%s: %s::%s is Transient, which a struct literal does not set (execStructConst skips it): "
-               "the value given for it is dropped\n", Cur ? Cur->CppName.c_str() : "", CurFnName.c_str(), T.c_str(), Member.c_str());
-    }
+    /* First we see whether EX_StructConst can take the members as they are. execLet hands it the destination's own
+       address and it steps each member straight in (ScriptCore.cpp 2647-2686, 3376-3405), so `V = {V.Y, V.X}` would
+       read what it has just written, a call there may read the destination too, and a `?:` or an inline call needs
+       statements of its own, which nothing would hoist out of the literal. The editor writes a literal for constants
+       only, and a Make Struct for the rest: through a temp, one statement per member, left to right as C++ runs a braced
+       list. A Transient member's value, whatever it is, is set there too: execStructConst skips the member and steps
+       the rest straight into the destination, so a literal would leave it as the destination held it, which is no
+       fresh value when that is a variable assigned again or a local of a loop body. */
+    bool bInPlace = Order.size() == Given.size();
+    for (size_t I : Order) bInPlace = bInPlace && SteppedInPlace(Given[I]);
+    if (!bInPlace) return LowerStructByMembers(T, SI, Given, BP, Out, Err);
     for (size_t I : Order) Out.Sub->Args.push_back(Given[I]);
+    return true;
+}
+
+/* A native struct literal with computed members, as the editor's Make Struct (LowerMakeStruct): a temp, then one store
+   per member in C++'s order, Values holding one per SI.Fields entry. A member a super declares is that struct's
+   property, so its store names it there, as LowerField does for `S.Member`. */
+bool FCompiler::LowerStructByMembers(const std::string& Type, const FStructInfo& SI, std::vector<FArgIR>& Values,
+                                     FBlueprintClass& BP, FArgIR& Out, std::string* Err)
+{
+    std::string Tmp;
+    if (!MakeTemp(Type, BP, &Tmp, Err)) return false;
+    auto Body = std::make_shared<std::vector<FStmtIR>>();
+    for (size_t I = 0; I < Values.size() && I < SI.Fields.size(); ++I)
+    {
+        /* The struct that declares member I: the topmost super whose own fields reach it (a super's come first). */
+        const FRecord* DeclRec = Find(Type);
+        const FStructInfo* Decl = &SI;
+        for (const FRecord* R = DeclRec; R && !R->Base.empty(); R = Find(R->Base))
+        {
+            const auto Up = Structs.find(R->Base);
+            if (Up == Structs.end() || Up->second.Fields.size() <= I) break;
+            Decl = &Up->second;
+            DeclRec = Find(R->Base);
+        }
+        FStmtIR& Set = Body->emplace_back();
+        Set.K = FStmtIR::Assign;
+        Set.Var.K = FArgIR::Member;
+        Set.Var.S = DeclRec ? UeNameOf(DeclRec, SI.Fields[I].second) : SI.Fields[I].second;
+        Set.Var.Owner = BP.ScriptStruct(Decl->Package, Decl->UeName);
+        Set.Var.LetOp = LetOpFor(SI.Fields[I].first);
+        Set.Var.Base = std::make_shared<FArgIR>();
+        Set.Var.Base->K = FArgIR::Local;
+        Set.Var.Base->S = Tmp;
+        Set.Value = std::move(Values[I]);
+    }
+    auto Block = std::make_shared<std::vector<FStmtIR>>(1);
+    (*Block)[0].K = FStmtIR::Block;
+    (*Block)[0].Body = Body;
+    Out = FArgIR();
+    Out.K = FArgIR::Call;
+    Out.InnerType = Type;
+    Out.Sub = std::make_shared<FCallIR>();
+    Out.Sub->Intrinsic = "__Inline__";
+    Out.Sub->Inline = Block;
+    Out.Sub->InlineResult = Tmp;
+    Out.Sub->InlineType = Type;
+    return true;
+}
+
+/* The temp a Make Struct fills: a local of Type the frame default-constructs, named into Tmp. */
+bool FCompiler::MakeTemp(const std::string& Type, FBlueprintClass& BP, std::string* Tmp, std::string* Err)
+{
+    if (!CurLocals) { *Err = "internal: a struct value outside a function body"; return false; }
+    *Tmp = "__Make" + std::to_string(ReadTmpCounter++) + "__";
+    FPropertyDef PD;
+    if (!TypeToProperty(Type, *Tmp, 0, "a " + Type + " value", BP, &PD, Err)) return false;
+    PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+    CurLocals->push_back(PD);
     return true;
 }
 
@@ -3084,13 +3482,8 @@ bool FCompiler::LowerMakeStruct(const std::string& Type, const Json* List, FBlue
 {
     const FRecord* R = Find(Type);
     if (!R || !R->bIsStruct) { *Err = "a braced value needs a struct type, not " + Type; return false; }
-    if (!CurLocals) { *Err = "internal: a struct value outside a function body"; return false; }
-
-    const std::string Tmp = "__Make" + std::to_string(ReadTmpCounter++) + "__";
-    FPropertyDef PD;
-    if (!TypeToProperty(Type, Tmp, 0, "a " + Type + " value", BP, &PD, Err)) return false;
-    PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
-    CurLocals->push_back(PD);
+    std::string Tmp;
+    if (!MakeTemp(Type, BP, &Tmp, Err)) return false;
 
     const bool bPlainName = R->IsNative() || IsInternalViewStruct(R->CppName);
     const FIndex Struct = BP.ScriptStruct(PackageOf(*R), ClassOf(*R));
@@ -3260,35 +3653,138 @@ bool FCompiler::LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& 
     return LowerArg(*ObjRaw, BP, *Out.Base, Err);
 }
 
-/* `this, &Foo::Handler`: EX_InstanceDelegate binds the frame's object, so only self can be bound. */
-bool FCompiler::LowerDelegateValue(const Json& Obj, const Json& Fn, FArgIR& Out, std::string* Err)
+/* A delegate value, `{Obj, &Foo::Handler}`: Handler bound by name on Obj, which the engine looks up on Obj's class when the
+   broadcast or the timer runs. On `this` it is EX_InstanceDelegate, which binds the frame's object. On another object it
+   is the editor's Create Event node with its Object pin wired (KCST_BindDelegate): EX_BindDelegate binds the name on the
+   object into a delegate local, and the local is the value (KismetCompilerVMBackend.cpp 1609-1625, execBindDelegate
+   ScriptCore.cpp 3302-3321). DelegateType is the TDelegate<...> the value is: the local's type, whose signature is Sig
+   when the caller knows the one it goes to (a dispatcher of this class), else one of the class's own named after Holder. */
+bool FCompiler::LowerDelegateValue(const Json& Obj, const Json& Fn, const std::string& DelegateType, FIndex Sig,
+                                   const std::string& Holder, FBlueprintClass& BP, FArgIR& Out, std::string* Err)
 {
     const Json* O = Strip(&Obj);
     const Json* F = Strip(&Fn);
-    if (!O || Kind(*O) != "CXXThisExpr") { *Err = "TODO: a delegate can only bind a function of `this`"; return false; }
     if (F && Kind(*F) == "UnaryOperator" && F->value("opcode", std::string()) == "&") F = Strip(First(*F));
     if (!F || Kind(*F) != "DeclRefExpr") { *Err = "a delegate binds `&Class::Function`"; return false; }
     const Json& Ref = (*F)["referencedDecl"];
+    const std::string FnName = Name(Ref);
     auto Owner = MethodOwner.find(Ref.value("id", std::string()));
-    if (const FRecord* R = Owner != MethodOwner.end() ? Find(Owner->second) : nullptr; R && IsInlineMethod(*R, Name(Ref)))
-    { *Err = "a delegate cannot bind " + Name(Ref) + ": an inline function is expanded where it is called, no UFunction (drop `inline`)"; return false; }
-    /* EX_InstanceDelegate binds the name on this object, so a function of a class this one does not derive from is
-       never found there, and the broadcast or timer skips it (ScriptDelegates.h 38-49, 479-502). */
-    if (Owner != MethodOwner.end() && Cur)
+    const FRecord* R = Owner != MethodOwner.end() ? Find(Owner->second) : nullptr;
+    if (R && IsInlineMethod(*R, FnName))
+    { *Err = "a delegate cannot bind " + FnName + ": an inline function is expanded where it is called, no UFunction (drop `inline`)"; return false; }
+    const bool bSelf = O && Kind(*O) == "CXXThisExpr";
+
+    /* The class the engine looks the name up on: this one's, or the one the object's type names. A function of a class
+       that one does not derive from is never found there, and the broadcast or timer skips it (ScriptDelegates.h 38-49,
+       479-502); the editor's Create Event node lists the functions of its Object pin's class (K2Node_CreateDelegate.cpp
+       126-146). */
+    const FRecord* On = Cur;
+    std::string OnType;
+    if (!bSelf)
+    {
+        if (!O) { *Err = "a delegate binds a function of an object: {Object, &Class::Function}"; return false; }
+        OnType = StripTypeKeywords(TypeOf(*O));
+        while (!OnType.empty() && (OnType.back() == '*' || OnType.back() == ' ')) OnType.pop_back();
+        On = Find(OnType);
+        if (!On || On->bIsStruct || On->bIsInterface)
+        { *Err = "a delegate binds " + FnName + " on an object, through a pointer to its class, not " + StripTypeKeywords(TypeOf(*O)); return false; }
+    }
+    if (Owner != MethodOwner.end() && On)
     {
         bool bMine = false;
-        for (const FRecord* A = Cur; A && !bMine; A = A->Base.empty() ? nullptr : Find(A->Base)) bMine = A->CppName == Owner->second;
-        if (!bMine)
-        { *Err = "a delegate on `this` cannot bind " + Owner->second + "::" + Name(Ref) + ": the engine looks it up by name on this "
+        for (const FRecord* A = On; A && !bMine; A = A->Base.empty() ? nullptr : Find(A->Base)) bMine = A->CppName == Owner->second;
+        if (!bMine && bSelf)
+        { *Err = "a delegate on `this` cannot bind " + Owner->second + "::" + FnName + ": the engine looks it up by name on this "
                  "object, whose class has no such function"; return false; }
+        if (!bMine)
+        { *Err = "a delegate on a " + OnType + " cannot bind " + Owner->second + "::" + FnName + ": the engine looks it up by name on "
+                 "that object, whose class has no such function"; return false; }
     }
-    Out.K = FArgIR::Delegate;
-    Out.S = UeNameOf(Cur, (*F)["referencedDecl"].value("name", std::string()));     // found on self by name at run time
+    /* What the editor binds, on this object or another (K2Node_CreateDelegate.cpp 156-164, FunctionCanBeUsedInDelegate
+       EdGraphSchema_K2.cpp 929-933, 974-985): a BlueprintCallable function, not pure, not latent. A mod's method is what
+       Generate makes it - BlueprintCallable, unless it overrides an event that is not - and one only declared is no
+       function at all. A native or game Blueprint's event says so in Events.json; any other function UeApi lists is
+       BlueprintCallable unless NotCallable.json names it (OnRep_*, most RPCs, ExecuteUbergraph_*). The net flags say
+       nothing here: 49 RPCs are BlueprintCallable (ClientClearCameraLensEffects), and the editor binds them. */
+    if (R)
+    {
+        std::string Why;
+        uint32 Flags = 0;
+        const auto M = R->Methods.find(FnName);
+        const std::string Key = R->UePackage.substr(R->UePackage.rfind('/') + 1) + "." + R->UeName + "." + UeNameOf(R, FnName);
+        if (!R->IsNative())
+        {
+            if (!CompilesMethod(*R, FnName))
+            { *Err = "a delegate cannot bind " + R->CppName + "::" + FnName + ", which " + R->CppName + " declares and never defines"; return false; }
+            Flags = ModMethodFlags(*R, FnName, BP);
+        }
+        else if (auto E = EventFlags.find(Key); E != EventFlags.end())
+            Flags = E->second;
+        else
+            Flags = NotCallable.count(Key) ? 0u : uint32(FUNC_BlueprintCallable);
+        if (M != R->Methods.end() && IsPureDecl(*M->second)) Flags |= FUNC_BlueprintPure;
+        if (!(Flags & FUNC_BlueprintCallable)) Why = FnName + " is not BlueprintCallable";
+        else if (Flags & FUNC_BlueprintPure) Why = FnName + " is pure";
+        else if (DesugaredTypeOf(Ref).find("FLatentActionInfo") != std::string::npos) Why = FnName + " is latent";
+        if (!Why.empty())
+        { *Err = "a delegate cannot bind " + R->CppName + "::" + FnName + (bSelf ? " on this object" : " on another object")
+                 + ": the editor binds a BlueprintCallable function that is not pure or latent, and " + Why; return false; }
+    }
+    if (bSelf)
+    {
+        Out.K = FArgIR::Delegate;
+        Out.S = UeNameOf(Cur, FnName);     // found on self by name at run time
+        return true;
+    }
+
+    if (!CurLocals) { *Err = "internal: a delegate value outside a function body"; return false; }
+    if (!Sig.V && !DelegateSignature(DelegateType, Holder, BP, &Sig, Err)) return false;
+    const std::string Tmp = "__Make" + std::to_string(ReadTmpCounter++) + "__";
+    FPropertyDef PD = DelegateParam(Tmp, Sig);
+    PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+    CurLocals->push_back(PD);
+
+    FCallIR Bind;
+    Bind.Intrinsic = "__BindDelegate__";
+    Bind.Args.resize(3);
+    Bind.Args[0].K = FArgIR::Local;
+    Bind.Args[0].S = Tmp;
+    Bind.Args[0].LetOp = LetOpFor(DelegateType);
+    Bind.Args[0].InnerType = DelegateType;
+    if (!LowerArg(Obj, BP, Bind.Args[1], Err)) return false;
+    Bind.Args[2].K = FArgIR::Name;
+    Bind.Args[2].S = UeNameOf(R ? R : On, FnName);
+    auto Body = std::make_shared<std::vector<FStmtIR>>(1);
+    (*Body)[0].K = FStmtIR::StaticCall;
+    (*Body)[0].Call = std::move(Bind);
+    auto Block = std::make_shared<std::vector<FStmtIR>>(1);
+    (*Block)[0].K = FStmtIR::Block;
+    (*Block)[0].Body = Body;
+    Out = FArgIR();
+    Out.K = FArgIR::Call;
+    Out.InnerType = DelegateType;
+    Out.Sub = std::make_shared<FCallIR>();
+    Out.Sub->Intrinsic = "__Inline__";
+    Out.Sub->Inline = Block;
+    Out.Sub->InlineResult = Tmp;
+    Out.Sub->InlineType = DelegateType;
     return true;
 }
 
-/* Add / Remove / Clear on any dispatcher; Broadcast needs the signature function, known only for a
-   UE_DISPATCHER of the class being generated. */
+/* The class that declares the dispatcher a member expression names, or null. */
+const FRecord* FCompiler::DispatcherOwner(const Json& Dispatcher)
+{
+    const Json* M = Strip(&Dispatcher);
+    if (!M || Kind(*M) != "MemberExpr") return nullptr;
+    auto It = FieldOwner.find(M->value("referencedMemberDecl", std::string()));
+    return It == FieldOwner.end() ? nullptr : Find(It->second);
+}
+
+/* `D.Add(Obj, &F)`, `D.Remove(Obj, &F)`, `D.Clear()` and `D.Broadcast(...)` on a dispatcher D of this class or of another
+   object, as the editor's Bind / Add / Remove / Clear and Call nodes (K2Node_MCDelegate.cpp). A Blueprint's dispatcher -
+   this class's, a mod's, a game Blueprint's - takes them all; a native one takes the first four only when the engine
+   marks it BlueprintAssignable, and Call only when BlueprintCallable (36-46, 453-462), which UeApi's <D>__UeDispatcher
+   says. */
 bool FCompiler::LowerDispatcherCall(const Json& Call, const Json& Callee, const Json& Obj, FBlueprintClass& BP,
                                     FArgIR& Out, std::string* Err)
 {
@@ -3305,32 +3801,73 @@ bool FCompiler::LowerDispatcherCall(const Json& Call, const Json& Callee, const 
     if (!LowerArg(Obj, BP, C.Args[0], Err)) return false;
     if (C.Args[0].K != FArgIR::Field) { *Err = "a dispatcher must be a property: " + Method; return false; }
 
-    if (Method == "Add" || Method == "Remove")
+    /* Whose dispatcher it is, and what the editor's nodes allow on it. A Blueprint's every dispatcher is both (the game's
+       1404 all are); a native one says through UeApi's <D>__UeDispatcher, which every UeApi this compiler takes writes
+       (UeApiVersion 3). */
+    const std::string Disp = Name(Obj);
+    const FRecord* Owner = DispatcherOwner(Obj);
+    const bool bNative = Owner && Owner->IsNative() && Owner->UePackage.compare(0, 6, "/Game/") != 0;
+    const auto Marked = bNative ? Owner->Dispatchers.find(Disp) : std::map<std::string, std::string>::const_iterator();
+    const bool bMarked = bNative && Marked != Owner->Dispatchers.end();
+    auto Has = [&](const char* What) { return bMarked && (" " + Marked->second + " ").find(std::string(" ") + What + " ") != std::string::npos; };
+    const std::string Where = bNative ? Owner->CppName + "::" + Disp : Disp;
+
+    /* The delegate type a value bound to it is, and the signature such a value names: this class's dispatcher's own. */
+    std::string Type = TypeOf(Obj);
+    const size_t Lt = Type.find('<');
+    const std::string DelegateType = Lt == std::string::npos ? std::string() : "TDelegate" + StripTypeKeywords(Type.substr(Lt));
+    auto Own = CurSignatures.find(C.Args[0].S);
+    const bool bOwn = Owner == Cur && Cur && !Cur->IsNative() && Own != CurSignatures.end();
+
+    if (Method == "Add" || Method == "Remove" || Method == "Clear")
     {
+        if (bMarked && !Has("Assignable"))
+        { *Err = Disp + "." + Method + ": " + Disp + " is a native dispatcher that is not BlueprintAssignable (" + Where + "), and "
+                 "the editor's dispatcher nodes refuse one (\"Event Dispatcher is not 'BlueprintAssignable'\"): only the "
+                 "engine's own code binds it"; return false; }
+        if (Method == "Clear") { C.Intrinsic = "__ClearDelegate__"; return true; }
         C.Intrinsic = Method == "Add" ? "__AddDelegate__" : "__RemoveDelegate__";
         C.Args.emplace_back();
-        return LowerDelegateValue(*Args[0], *Args[1], C.Args[1], Err);   // clang checked the arity
+        /* A function of another object goes through a delegate local, which the editor's Create Event types with the
+           dispatcher's own signature: this class's export, or the declaring Blueprint's - a mod parent's or sibling's,
+           a game Blueprint's - imported from its package, as Broadcast names it below. A function of its own of that
+           name would hide the parent's. Bound on `this` there is no local, so nothing to import. */
+        FIndex Sig = bOwn ? Own->second : Null();
+        const Json* On = Strip(Args[0]);
+        if (!bOwn && Owner && Owner != Cur && !bNative && !(On && Kind(*On) == "CXXThisExpr"))
+            Sig = BP.EngineFunction(PackageOf(*Owner), ClassOf(*Owner), C.Args[0].S + "__DelegateSignature");
+        return LowerDelegateValue(*Args[0], *Args[1], DelegateType, Sig, Disp, BP, C.Args[1], Err);
     }
-    if (Method == "Clear") { C.Intrinsic = "__ClearDelegate__"; return true; }
     if (Method != "Broadcast") { *Err = "TODO: unimplemented dispatcher method " + Method; return false; }
 
-    /* The signature function is the declaring class's: this one's own, or a Blueprint parent's, imported from its
-       package as the editor's broadcast node names it. */
-    const std::string SigName = Name(Obj) + "__DelegateSignature";
-    const FRecord* Declarer = nullptr;
-    for (const FRecord* A = Cur; A && !Declarer; A = A->Base.empty() ? nullptr : Find(A->Base))
-        if (A->Methods.count(SigName)) Declarer = A;
-    auto Sig = CurSignatures.find(C.Args[0].S);
-    if (Declarer && Declarer != Cur && (!Declarer->IsNative() || Declarer->UePackage.compare(0, 6, "/Game/") == 0))
-        C.Fn = BP.EngineFunction(PackageOf(*Declarer), ClassOf(*Declarer), C.Args[0].S + "__DelegateSignature");
-    else if (C.Args[0].Owner.V == BP.ClassIndex().V && Sig != CurSignatures.end())
-        C.Fn = Sig->second;
-    else
+    /* The signature function the Call node names is the dispatcher's own, <D>__DelegateSignature of the class that declares
+       it (FKCHandler_CallDelegate): this class's export, or a mod's or a game Blueprint's imported from its package. A
+       native's UeApi does not name - the dump links no delegate property to its signature - so a callable native one
+       gets a function of this class with its parameters: execCallMulticastDelegate builds the parameter block by the
+       operand's chain and the handlers read it as theirs (ScriptCore.cpp 3032-3063), so they get the same arguments. */
+    if (bOwn)
+        C.Fn = Own->second;
+    else if (Owner && !bNative)
+        C.Fn = BP.EngineFunction(PackageOf(*Owner), ClassOf(*Owner), C.Args[0].S + "__DelegateSignature");
+    else if (bNative && Has("Callable"))
     {
-        *Err = "TODO: Broadcast needs the dispatcher's signature function, which only a UE_DISPATCHER of this class or a "
-               "Blueprint parent has: " + C.Args[0].S;
+        if (DelegateType.empty() || !DelegateSignature(DelegateType, Disp, BP, &C.Fn, Err)) return false;
+        printf("  warning: %s::%s: %s.Broadcast names a signature function of this class with %s's parameters, as UeApi does not "
+               "name the engine's; the handlers get the same arguments\n", Cur ? Cur->CppName.c_str() : "", CurFnName.c_str(),
+               Disp.c_str(), Where.c_str());
+    }
+    else if (bNative)
+    {
+        *Err = Disp + ".Broadcast: " + Disp + " is a native dispatcher (" + Where + ") " + (bMarked
+                   ? std::string("that is not BlueprintCallable, and the editor's Call node refuses one (\"Event Dispatcher is "
+                                 "not 'BlueprintCallable'\"): only the engine's own code broadcasts it")
+                   : std::string("and the editor's Call node takes one only when it is BlueprintCallable, which this UeApi does "
+                                 "not say (regenerate it with genueapi)"));
         return false;
     }
+    else
+    { *Err = "internal: Broadcast on " + Disp + ", whose declaring class is not known"; return false; }
+
     C.Intrinsic = "__Broadcast__";
     for (const Json* A : Args)
     {
@@ -3338,26 +3875,32 @@ bool FCompiler::LowerDispatcherCall(const Json& Call, const Json& Callee, const 
         if (!LowerArg(*A, BP, C.Args.back(), Err)) return false;
     }
     /* A reference parameter of the signature is an out parm, which execCallMulticastDelegate steps with a null result
-       pointer and copies from the address the argument left: HoistCallArgs gives anything but a variable a local. */
-    if (auto M = Declarer ? Declarer->Methods.find(SigName) : Cur->Methods.end(); Declarer && M != Declarer->Methods.end())
+       pointer and copies from the address the argument left: HoistCallArgs gives anything but a variable a local. The
+       parameters are a UE_DISPATCHER's signature declaration's, named, or else the dispatcher's type's. */
+    std::vector<std::pair<std::string, std::string>> Parms;     // (name, type as written)
+    const auto M = Owner && !Owner->IsNative() ? Owner->Methods.find(Disp + "__DelegateSignature") : std::map<std::string, const Json*>::const_iterator();
+    if (Owner && !Owner->IsNative() && M != Owner->Methods.end())
+        ForEach(*M->second, [&](const Json& P) { if (Kind(P) == "ParmVarDecl") Parms.emplace_back(Name(P), TypeOf(P)); });
+    else if (const size_t Open = Type.find('('), Close = Type.rfind(')'); Open != std::string::npos && Close != std::string::npos && Close > Open
+             && Type.substr(Open + 1, Close - Open - 1).find_first_not_of(' ') != std::string::npos)
+        for (const std::string& T : SplitTemplateArgs(Type.substr(Open + 1, Close - Open - 1)))
+            Parms.emplace_back("parameter " + std::to_string(Parms.size() + 1) + " (" + T + ")", T);
+    C.RefParms.emplace_back();
+    std::string WrittenRef;
+    for (auto [PName, T] : Parms)
     {
-        C.RefParms.emplace_back();
-        std::string WrittenRef;
-        ForEach(*M->second, [&](const Json& P) {
-            if (Kind(P) != "ParmVarDecl") return;
-            std::string T = TypeOf(P);
-            const bool bRef = !T.empty() && T.back() == '&';
-            if (bRef && T.compare(0, 6, "const ") != 0 && WrittenRef.empty()) WrittenRef = Name(P);
-            while (!T.empty() && (T.back() == '&' || T.back() == ' ')) T.pop_back();
-            C.RefParms.push_back(bRef ? StripTypeKeywords(T) : std::string());
-        });
-        if (C.RefParms.size() != C.Args.size()) C.RefParms.clear();
-        /* C++'s Broadcast copies a reference parameter back after the handlers ran; execCallMulticastDelegate copies the
-           argument into a parameter block of its own and never back (ScriptCore.cpp 3032-3075). */
-        if (!WrittenRef.empty())
-        { *Err = Name(Obj) + ".Broadcast: " + WrittenRef + " is a non-const reference, which a Broadcast never writes back "
-                 "to the caller; take it by value or by const reference"; return false; }
+        while (!T.empty() && T.back() == ' ') T.pop_back();
+        const bool bRef = !T.empty() && T.back() == '&';
+        if (bRef && T.compare(0, 6, "const ") != 0 && WrittenRef.empty()) WrittenRef = PName;
+        while (!T.empty() && (T.back() == '&' || T.back() == ' ')) T.pop_back();
+        C.RefParms.push_back(bRef ? StripTypeKeywords(T) : std::string());
     }
+    if (C.RefParms.size() != C.Args.size()) C.RefParms.clear();
+    /* C++'s Broadcast copies a reference parameter back after the handlers ran; execCallMulticastDelegate copies the
+       argument into a parameter block of its own and never back (ScriptCore.cpp 3032-3075). */
+    if (!WrittenRef.empty())
+    { *Err = Disp + ".Broadcast: " + WrittenRef + " is a non-const reference, which a Broadcast never writes back "
+             "to the caller; take it by value or by const reference"; return false; }
     return true;
 }
 
@@ -3378,6 +3921,22 @@ const Json* PeelLvalue(const Json* N)
     while (N && First(*N) && (Kind(*N) == "ParenExpr" || Kind(*N) == "ExprWithCleanups"
                               || (Kind(*N) == "ImplicitCastExpr" && N->value("castKind", std::string()) == "NoOp")))
         N = First(*N);
+    return N;
+}
+
+bool IsTArrayElement(const Json& N);
+bool IsTMapElement(const Json& N);
+
+/* What a place stands on, past its wrappers, the members taken of it and the elements indexed in it: `T` for `T.A`,
+   `(L = M)` for `(L = M)[0].B`. A pointer's member (`P->A`) stands on the pointer's value, which is no place: it ends there. */
+const Json* PlaceRoot(const Json* N)
+{
+    for (N = PeelLvalue(N); N; N = PeelLvalue(N))
+    {
+        if (Kind(*N) == "MemberExpr" && !N->value("isArrow", false) && First(*N)) N = First(*N);
+        else if ((IsTArrayElement(*N) || IsTMapElement(*N)) && (*N)["inner"].size() == 3) N = &(*N)["inner"][1];
+        else return N;
+    }
     return N;
 }
 
@@ -3533,6 +4092,15 @@ bool IsVmConstant(const FArgIR& A)
     default:
         return false;
     }
+}
+
+/* A struct literal's member EX_StructConst may step straight into the destination: a constant, a local of this frame,
+   one of this object's variables, or a literal of those. Nothing else in the literal can change one, and none can be
+   the destination or a part of it, a struct never holding its own type. A reference parameter could alias either. */
+bool SteppedInPlace(const FArgIR& A)
+{
+    if (A.K == FArgIR::StructLit) return A.Sub && std::all_of(A.Sub->Args.begin(), A.Sub->Args.end(), SteppedInPlace);
+    return IsVmConstant(A) || A.K == FArgIR::Local || (A.K == FArgIR::Field && !A.Base);
 }
 
 const Json* FCompiler::InlineListOf(const Json* E) const
@@ -4086,6 +4654,13 @@ bool FCompiler::LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, 
     }
     const Json* N = Strip(&ArgNode);
     if (!N) { *Err = "empty argument expression"; return false; }
+    /* A comma or a `=` under an LValueToRValue or a copy is read where it stands (LowerCommaValue); without one, its
+       place is what is used. */
+    struct FReadRestore { const Json** Slot; const Json* Old; ~FReadRestore() { *Slot = Old; } } ReadRestore{ &ReadComma, ReadComma };
+    ReadComma = nullptr;
+    for (const Json* W = &ArgNode; W && W != N; W = First(*W))
+        if ((Kind(*W) == "ImplicitCastExpr" && W->value("castKind", std::string()) == "LValueToRValue") || Kind(*W) == "CXXConstructExpr")
+            ReadComma = N;
     /* Arithmetic, a comparison or logic over constants is the constant it comes to: no Kismet call left to run. */
     if (const std::string K = Kind(*N); !bCurNoOpt && (K == "BinaryOperator" || K == "ConditionalOperator"
         || (K == "UnaryOperator" && N->value("opcode", std::string()).find_first_of("&*+") == std::string::npos)))
@@ -4149,16 +4724,37 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         const Json* Obj = Nth(*N, 0);
         const Json* Fn = Nth(*N, 1);
         if (!Obj || !Fn) { *Err = "a delegate value is {this, &Class::Function}"; return false; }
-        return LowerDelegateValue(*Obj, *Fn, Out, Err);
+        const Json* FnRef = Strip(Fn);
+        if (FnRef && Kind(*FnRef) == "UnaryOperator") FnRef = Strip(First(*FnRef));
+        return LowerDelegateValue(*Obj, *Fn, StripTypeKeywords(TypeOf(*N)), Null(),
+                                  FnRef && FnRef->contains("referencedDecl") ? Name((*FnRef)["referencedDecl"]) : std::string("Bound"),
+                                  BP, Out, Err);
     }
     if (K == "CXXConstructExpr" || K == "CXXTemporaryObjectExpr")
     {
         auto SI = Structs.find(StripTypeKeywords(TypeOf(*N)));
         if (SI != Structs.end()) return LowerStructLiteral(*N, SI->second, BP, Out, Err);
+        /* `{}` or `TArray<int32>()` as a value: an empty container, a Make Array (Set, Map) with no element. */
+        if (!First(*N) && IsContainerType(TypeOf(*N))) return LowerContainerLiteral(*N, TypeOf(*N), BP, Out, Err);
+        /* `{}` or `TEnum<E>()`: TEnum<E> declares a constructor, so its value-initialisation is an argless construct
+           where an E's is a CXXScalarValueInitExpr below. The same zero enumerator. */
+        if (!First(*N) && IsTEnumType(TypeOf(*N))) return ZeroArg(StripTypeKeywords(TypeOf(*N)), BP, Out, Err);
+        /* `TArray<int32>{1, 2, M}`: the typed spelling is a CXXTemporaryObjectExpr around the initializer_list, which
+           Strip does not look through as it does `TArray<int32>({1, 2})`'s one-argument construct. The same list. */
+        if (const Json* List = First(*N); List && !Nth(*N, 1) && Kind(*List) == "CXXStdInitializerListExpr"
+            && IsContainerType(TypeOf(*N)))
+            return LowerContainerLiteral(*List, TypeOf(*N), BP, Out, Err);
+        /* `FSlot()` of a UE_STRUCT whose members have defaults: clang calls its implicit constructor, where an aggregate
+           with none gets a CXXScalarValueInitExpr below. Either way the struct with its members' defaults, as
+           `FSlot S{}` has them. */
+        if (const FRecord* R = First(*N) ? nullptr : Find(StripTypeKeywords(TypeOf(*N))); R && R->bIsStruct)
+            return LowerMakeStruct(R->CppName, nullptr, BP, Out, Err);
     }
     /* `T()` of an aggregate - a struct with no constructor declared, which is what lets it take `{ .A = 1 }`. */
     if (const FRecord* R = K == "CXXScalarValueInitExpr" ? Find(StripTypeKeywords(TypeOf(*N))) : nullptr; R && R->bIsStruct)
         return LowerMakeStruct(R->CppName, nullptr, BP, Out, Err);
+    /* `int32()`, `EAttachmentRule()`: value-initialisation, the type's zero. */
+    if (K == "CXXScalarValueInitExpr") return ZeroArg(StripTypeKeywords(TypeOf(*N)), BP, Out, Err);
     if ((K == "CXXConstructExpr" || K == "CXXTemporaryObjectExpr")
         && (Slot == SK_Name || Slot == SK_Text || Slot == SK_Str))
     {
@@ -4204,9 +4800,10 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         }
         const Json* Obj = Callee ? Strip(First(*Callee)) : nullptr;
         if (!Obj) { *Err = "member call with no object"; return false; }
-        if (std::string Raw = TypeOf(*First(*Callee)); Raw.find("TEnum<") != std::string::npos)
+        if (std::string Raw = TypeOf(*First(*Callee)); IsTEnumType(Raw))
         {
-            /* TEnum<E>::Name() / String(): the engine's own enumerator lookups on E's UEnum, an ObjectConst. */
+            /* TEnum<E>::Name() / String(): the engine's own enumerator lookups on E's UEnum, an ObjectConst. Only on a
+               TEnum<E> itself: a TArray of them or a dispatcher with one as a parameter has methods of its own. */
             const std::string Method = Name(*Callee);
             auto E = Enums.find(StripTypeKeywords(Raw));
             if (E == Enums.end()) { *Err = "TEnum over an unknown enum: " + Raw; return false; }
@@ -4473,6 +5070,9 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
                 return true;
             }
         }
+        /* A struct's or an FString's `=` used as a value where HoistComma left it, as a number's (BinaryOperator below). */
+        if (OpName == "operator=" && Lhs && Rhs)
+            return LowerCommaValue(*N, ReadComma == N || N->value("valueCategory", std::string()) != "lvalue", BP, Out, Err);
         if (OpName != "operator+" || !Lhs || !Rhs || StrKindOf(TypeOf(*N)) != SK_Str)
         { *Err = "TODO: unimplemented operator overload " + OpName + " yielding " + TypeOf(*N); return false; }
 
@@ -4726,6 +5326,11 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         const Json* LhsRaw = Nth(*N, 0);
         const Json* RhsRaw = Nth(*N, 1);
         if (!LhsRaw || !RhsRaw) { *Err = "binary operator with a missing side"; return false; }
+        /* LowerBody takes a comma, or an assignment used as a value, apart where its left side can run as a statement of
+           its own (HoistComma); one that reaches here is in a loop condition, which reruns it every trip, on the right
+           of && / || or in ?:, or in a call on another object: an inline body there. */
+        if (Op == "," || Op == "=")
+            return LowerCommaValue(*N, ReadComma == N || N->value("valueCategory", std::string()) != "lvalue", BP, Out, Err);
         /* `"Kills: " + N`: C++ reads an address N characters into the literal (clang warns, -Wstring-plus-int, and
            compiles it), which nothing in a Blueprint could mean. It is the concat the author wrote. A float or an
            object on the other side never gets here - clang refuses those, so they stay `FString("lit") + X`. */
@@ -4937,7 +5542,18 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         return true;
     }
 
-    if (K == "InitListExpr") return LowerMakeStruct(StripTypeKeywords(TypeOf(*N)), N, BP, Out, Err);
+    if (K == "InitListExpr")
+    {
+        /* Braces around a type that is not a struct - `E R{};`, `int32 N{7};`, `AActor* A{};`, `return {};` - are C++'s
+           value-initialisation, the type's zero, or the one value braced. */
+        const std::string T = StripTypeKeywords(TypeOf(*N));
+        if (const FRecord* R = Find(T); !R || !R->bIsStruct)
+        {
+            const Json* One = First(*N);
+            return One && !IsUnsetInit(*One) ? LowerArg(*One, BP, Out, Err) : ZeroArg(T, BP, Out, Err);
+        }
+        return LowerMakeStruct(T, N, BP, Out, Err);
+    }
     /* A container's braced list: Strip took the constructor it is the one argument of, whose type is the slot's. */
     if (K == "CXXStdInitializerListExpr") return LowerContainerLiteral(*N, OuterType, BP, Out, Err);
     if (K == "CompoundAssignOperator") return LowerUpdateValue(*N, BP, Out, Err);
@@ -4955,11 +5571,16 @@ bool FCompiler::IsSubclassOf(const FRecord& Child, const FRecord& Parent) const
 
 bool FCompiler::IsAbstract(const FRecord& R) const
 {
+    return !R.FinalAs.empty() || PureMethod(R).first;
+}
+
+std::pair<const FRecord*, std::string> FCompiler::PureMethod(const FRecord& R) const
+{
     std::set<std::string> Nearest;
     for (const FRecord* A = &R; A; A = A->Base.empty() ? nullptr : Find(A->Base))
         for (const auto& [Method, Decl] : A->Methods)
-            if (Nearest.insert(Method).second && Decl->value("pure", false)) return true;
-    return false;
+            if (Nearest.insert(Method).second && Decl->value("pure", false)) return { A, Method };
+    return { nullptr, std::string() };
 }
 
 /* What a component class's native Serialize reads after UObject's part, for an archetype with no instance data: each
@@ -5018,6 +5639,101 @@ const std::vector<std::string>& FCompiler::ModSources() const
     return SourceTexts;
 }
 
+/* The AST keeps no file of a declaration (DroppedAstKey), and the leaf UE_FINAL_AS declares is spelled in UeMeta.h, so
+   the text says where the macro was written: the compiled source and the files it includes by a quoted path that
+   resolves beside the including one (bpbuild's unity file includes each .cpp of a mod by its absolute path), read as
+   text. A UeApi header is generated and no mod's, so a path through a UeApi folder is not followed. A macro written
+   through another macro is not found; the caller then takes the compiler's old answer.
+   A site is the shared one when the owner sees it too: a header that a source of the owner's, beside it and outside
+   this compile, includes. A source is the owner's when its UE_MOD_PACKAGE is Owner, or when it has none and every
+   UE_MOD_PACKAGE written in its folder's sources is Owner (a mod of several sources, its package in one of them). A
+   header of this mod's own that re-declares the base, the same text, is no such header: the owner never cooks the
+   leaf that one declares. */
+std::vector<bool> FCompiler::FinalAsSites(const std::string& Base, const std::string& Leaf, const std::string& Owner) const
+{
+    namespace fs = std::filesystem;
+    auto IsIdent = [](char C) { return isalnum(uint8(C)) || C == '_'; };
+    auto LastOf = [&](const std::string& S) {
+        size_t End = S.size();
+        while (End > 0 && !IsIdent(S[End - 1])) --End;
+        size_t Begin = End;
+        while (Begin > 0 && IsIdent(S[Begin - 1])) --Begin;
+        return S.substr(Begin, End - Begin);
+    };
+    auto Canonical = [](const fs::path& P) { std::error_code Ec; return fs::weakly_canonical(P, Ec).string(); };
+    /* The files Root reaches by quoted includes, Root among them, by canonical path. */
+    auto Reach = [&](const fs::path& Root) {
+        std::map<std::string, std::pair<fs::path, std::string>> Reached;
+        for (std::vector<fs::path> Todo{ Root }; !Todo.empty();)
+        {
+            const fs::path File = Todo.back();
+            Todo.pop_back();
+            std::error_code Ec;
+            if (!fs::is_regular_file(File, Ec) || Reached.count(Canonical(File))) continue;
+            if (std::any_of(File.begin(), File.end(), [](const fs::path& Part) { return Part == "UeApi"; })) continue;
+            const std::string Text = ReadText(File.string());
+            for (size_t At = 0; (At = Text.find("#include", At)) != std::string::npos; At += 8)
+            {
+                const size_t Open = Text.find_first_of("\"<\n", At + 8);
+                if (Open == std::string::npos || Text[Open] != '"') continue;
+                const size_t Close = Text.find('"', Open + 1);
+                if (Close != std::string::npos) Todo.push_back(File.parent_path() / fs::path(Text.substr(Open + 1, Close - Open - 1)));
+            }
+            Reached[Canonical(File)] = { File, Text };
+        }
+        return Reached;
+    };
+    /* The path a source's UE_MOD_PACKAGE names, or empty. */
+    auto PackageIn = [&](const std::string& Text) {
+        for (size_t At = 0; (At = Text.find("UE_MOD_PACKAGE", At)) != std::string::npos; At += 14)
+        {
+            if ((At > 0 && IsIdent(Text[At - 1])) || (At + 14 < Text.size() && IsIdent(Text[At + 14]))) continue;
+            const size_t Open = Text.find_first_not_of(" \t", At + 14);
+            if (Open == std::string::npos || Text[Open] != '(') continue;
+            const size_t Quote = Text.find_first_not_of(" \t", Open + 1);
+            const size_t End = Quote == std::string::npos || Text[Quote] != '"' ? std::string::npos : Text.find('"', Quote + 1);
+            if (End != std::string::npos) return Text.substr(Quote + 1, End - Quote - 1);
+        }
+        return std::string();
+    };
+    const auto Unit = Reach(fs::path(SourceFile));
+    auto SharedByOwner = [&](const fs::path& Header) {
+        std::error_code Ec;
+        std::vector<std::pair<fs::path, std::string>> Sources;      // the .cpp files beside it, outside this compile
+        std::set<std::string> Packages;
+        for (const auto& E : fs::directory_iterator(Header.parent_path(), Ec))
+            if (E.is_regular_file(Ec) && E.path().extension() == ".cpp" && !Unit.count(Canonical(E.path())))
+            {
+                Sources.emplace_back(E.path(), PackageIn(ReadText(E.path().string())));
+                if (!Sources.back().second.empty()) Packages.insert(Sources.back().second);
+            }
+        const bool bOwnersFolder = Packages.size() == 1 && *Packages.begin() == Owner;
+        const std::string Want = Canonical(Header);
+        return std::any_of(Sources.begin(), Sources.end(), [&](const auto& S) {
+            return (S.second == Owner || (S.second.empty() && bOwnersFolder)) && Reach(S.first).count(Want);
+        });
+    };
+    std::vector<bool> Sites;
+    for (const auto& [Key, Entry] : Unit)
+    {
+        const auto& [File, Text] = Entry;
+        bool bHere = false;
+        for (size_t At = 0; !bHere && (At = Text.find("UE_FINAL_AS", At)) != std::string::npos; At += 11)
+        {
+            if ((At > 0 && IsIdent(Text[At - 1])) || (At + 11 < Text.size() && IsIdent(Text[At + 11]))) continue;
+            const size_t Open = Text.find_first_not_of(" \t", At + 11);
+            if (Open == std::string::npos || Text[Open] != '(') continue;
+            const size_t Comma = Text.find(',', Open), Close = Text.find(')', Open);
+            if (Comma < Close && Close != std::string::npos)
+                bHere = LastOf(Text.substr(Open + 1, Comma - Open - 1)) == Base && LastOf(Text.substr(Comma + 1, Close - Comma - 1)) == Leaf;
+        }
+        if (!bHere) continue;
+        const std::string Ext = File.extension().string();
+        Sites.push_back((Ext == ".h" || Ext == ".hpp" || Ext == ".hh" || Ext == ".inl") && SharedByOwner(File));
+    }
+    return Sites;
+}
+
 /* The qualifier token is where a qualified DeclRefExpr's range begins; the JSON gives its byte offset and length but
    not its file (that is only written when it changes, and Json's sorted keys lose the order). So each of the mod's own
    sources is tried at that offset, and a hit counts only when `<Record>::StaticClass` is what is written there.
@@ -5071,27 +5787,49 @@ const FRecord* FCompiler::NamedQualifier(const Json& Ref) const
 /* A MemberExpr on an implicit this begins at its qualifier when it has one and at the member's own name when not
    (clang's MemberExpr::getBeginLoc), so `QcParent::Plain()` is told from `Plain()` by what is written where its range
    begins: `<Record>::<member>`, tried in each of the mod's sources as NamedQualifier does.
+   The record's name may come in parts, `Weapons::Rifle::Pull`.
    ponytail: `this->QcParent::Plain()` begins at `this` and a qualifier written in a macro has spelling locations; both
-   read as unqualified, a call by name. */
+   read as unqualified here, a call by name, unless a class on the way declares Plain (NamesQualified). */
 const FRecord* FCompiler::MemberQualifier(const Json& Member) const
 {
     const Json Begin = Member.value("range", Json::object()).value("begin", Json::object());
     if (!Begin.contains("offset") || !Begin.contains("tokLen")) return nullptr;
     const size_t Off = Begin["offset"].get<size_t>(), Len = Begin["tokLen"].get<size_t>();
     const std::string Method = Member.value("name", std::string());
+    auto Ident = [](char C) { return std::isalnum(uint8(C)) || C == '_'; };
     for (const std::string& T : ModSources())
     {
         if (Off + Len > T.size()) continue;
-        size_t P = Off + Len;
-        while (P < T.size() && (T[P] == ' ' || T[P] == '\t')) ++P;
-        if (T.compare(P, 2, "::") != 0) continue;
-        P += 2;
-        while (P < T.size() && (T[P] == ' ' || T[P] == '\t')) ++P;
-        if (T.compare(P, Method.size(), Method) != 0) continue;
-        if (P + Method.size() < T.size() && (std::isalnum(uint8(T[P + Method.size()])) || T[P + Method.size()] == '_')) continue;
-        if (const FRecord* R = Find(T.substr(Off, Len))) return R;
+        /* `<Record>::<member>`, the record's name in as many parts as it is written with: `Weapons::Rifle::Pull`. */
+        std::string Qualifier = T.substr(Off, Len);
+        for (size_t P = Off + Len;;)
+        {
+            while (P < T.size() && (T[P] == ' ' || T[P] == '\t')) ++P;
+            if (T.compare(P, 2, "::") != 0) break;
+            P += 2;
+            while (P < T.size() && (T[P] == ' ' || T[P] == '\t')) ++P;
+            size_t End = P;
+            while (End < T.size() && Ident(T[End])) ++End;
+            if (End == P) break;
+            if (T.compare(P, End - P, Method) == 0 && End - P == Method.size())
+            {
+                if (const FRecord* R = Find(Qualifier)) return R;
+                break;
+            }
+            Qualifier += "::" + T.substr(P, End - P);
+            P = End;
+        }
     }
     return nullptr;
+}
+
+bool FCompiler::NamesQualified(const Json& Callee, const FRecord* Written, const FRecord& R, const std::string& Method) const
+{
+    if (Callee.value("forwards", false)) return true;
+    if (Written && IsSubclassOf(*Written, R))
+        for (const FRecord* A = Written; A && A != &R; A = A->Base.empty() ? nullptr : Find(A->Base))
+            if (A->Methods.count(Method) && !A->Forwarders.count(Method)) return true;
+    return MemberQualifier(Callee) != nullptr;
 }
 
 /* True when evaluating N twice is the same as once: names, literals, member reads and arithmetic, no call or store. */
@@ -5222,6 +5960,24 @@ bool FCompiler::DesugarUpdate(const Json& S, Json& Wrap, std::string* Result, st
     const bool bStep = K == "UnaryOperator";
     const Json* Orig = Nth(S, 0);
     if (!Orig || (!bStep && !Nth(S, 1))) { *Err = "`" + Op + "` with no destination"; return false; }
+
+    /* `(Bump(), N) += Y`, `++(Bump(), N)`, `(N = M) += Y`: the update writes N (AssignedPlace). Y first, as C++17
+       sequences it before the left side ([expr.ass]/1), then the comma's left side or the assignment, then the update of
+       N. HoistComma takes apart one whose left side can run as a statement before the one holding it; this is the
+       rest, a loop condition's or one behind Y. */
+    if (Json Lefts = Json::array(), Place; AssignedPlace(*Orig, Lefts, Place))
+    {
+        Json Pre = Json::array(), Again = S, Rest;
+        if (!bStep && !IsFixedOperand(*Nth(S, 1))) Again["inner"][1] = HoistExpr(*Nth(S, 1), Pre, true);
+        for (Json& L : Lefts) Pre.push_back(std::move(L));
+        Again["inner"][0] = Place;
+        if (!DesugarUpdate(Again, Rest, Result, Err)) return false;
+        for (Json& St : Rest["inner"]) Pre.push_back(std::move(St));
+        Wrap = { {"kind", "CompoundStmt"}, {"inner", std::move(Pre)} };
+        return true;
+    }
+    if (const Json* Bare = PlaceRoot(Orig); Bare && !AssignedNoVar(*Bare).empty())
+    { *Err = AssignedNoVar(*Bare); return false; }
 
     /* X is located once. C++17 sequences Y before X in `X op= Y`, so a Y that must not move past what locates X
        (its side effects, or an index Y changes) goes first. */
@@ -5478,6 +6234,8 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
     const bool bIntrinsic = MethodName.size() >= 5
         && MethodName.compare(0, 2, "__") == 0
         && MethodName.compare(MethodName.size() - 2, 2, "__") == 0;
+    /* `IncRef(0, B += 1)` in a loop condition, or on another object: the reference is B itself, not LowerArg's copy. */
+    if (const int32 Bound = bIntrinsic ? 0 : LowerBoundArgs(CallExprNode, BP, Out, Err)) return Bound > 0;
     if (bIntrinsic)
     {
         Out.Intrinsic = MethodName;
@@ -5527,6 +6285,16 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         {
             if (K == "CXXMemberCallExpr") Receiver = Strip(First(*Callee));
             if (!Receiver) { *Err = MethodName + "(): TODO: only a call on an object (`Obj->" + MethodName + "()`)"; return false; }
+            /* A constructor's SetupAttachment, called in a function: it attaches at once, as OnRegister does after a
+               constructor's call (SceneComponent.cpp 667-683). The engine's own does nothing on a component already
+               registered (an ensure, 1750), as an actor's are once it is constructed, so the sugar differs from what C++
+               would do there: said, not refused, since attaching is what the call asks for. */
+            if (MethodName == "SetupAttachment" && R->UeName == "SceneComponent")
+                printf("  warning: %s::%s: SetupAttachment attaches at once here, as AttachToComponent with KeepRelative "
+                       "location, rotation and scale and no welding, which is where the engine's own call leads when the "
+                       "component registers; on a component already registered, as an actor's are once it is constructed, "
+                       "the engine's own does nothing. Call AttachToComponent to pick the rules, or SetupAttachment in "
+                       "UE_DEFAULTS to place a component of the class's own\n", Cur->CppName.c_str(), CurFnName.c_str());
             /* No `::`: a free inline function (UObject_GetOuter), expanded here with the object as its first argument.
                Found by name, first in document order: walking FreeInlines would take whichever address sorts first. */
             if (Fw->second.find("::") == std::string::npos)
@@ -5569,37 +6337,48 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
             *Err = R->CppName + "::" + MethodName + ": TODO: an overload set may not mix inline and non-inline functions";
             return false;
         }
+        /* A method of a class cooked here that is declared and never defined is no function of the class's
+           (CompilesMethod), and C++ would not link a call to it. By name the call would land in a subclass's function of
+           that name, whatever its parameters (ReplacedDecl lets that one's signature be its own), and on an object of
+           the class find none (execLocalVirtualFunction's FindFunctionChecked, ScriptCore.cpp 3012-3016); from another
+           class it imports a function the class never exports. The stub of a mod interface the class lists is one. */
+        if (Decl != R->Methods.end() && !R->IsNative() && !R->bIsInterface && !R->bIsPatch && MethodName != "StaticClass"
+            && !CompilesMethod(*R, MethodName) && !ModInterfaceWith(*R, MethodName))
+        {
+            *Err = R->CppName + "::" + MethodName + ", which " + R->CppName + " declares and never defines, "
+                   "is no function of the class, and C++ would not link a call to it: give it a body, or `= 0` for an "
+                   "empty one";
+            return false;
+        }
 
         /* `Base::Method()` on this, from a class that declares Method itself. C++ name hiding leaves only the qualified
            spelling to reach the ancestor's (clang's JSON drops the qualifier, the referenced decl's owner keeps it), and
            it means THAT implementation: the editor's "call to parent function", EX_FinalFunction on the parent's own
            UFunction (K2Node_CallParentFunction) - which Out.Fn below already is. By name the call would come straight
            back to the override making it, forever: a shipping build has no script recursion guard. A native ancestor's
-           takes the final form anyway. */
-        /* The class the call is written in: an inline method expanded into a subclass keeps its own class's view, so
-           PBase::Twice's `Speak()` stays a call by name in Kid, not Kid's call to its parent's Speak. */
+           takes the final form anyway.
+           The call is the compiled class's, Cur's, wherever it is written: an inline body copied into a subclass makes
+           it from that subclass, so it is a parent call only where Cur has its own Method - one of the source's, or the
+           forwarder SynthesizeForwarders gave it, which no call by name names (`AuthOnly()` in its class still names
+           the inherited one). A call written unqualified is never one: PBase::Twice's `Speak()`, an inline body, stays
+           a call by name in a Kid that declares Speak. The rest of the qualified calls, to the class's own Method
+           (`Cur::Method()`) or with no Method in Cur, are bQualified, handled below. Whether it is written qualified
+           is read from the class it is written in (NamesQualified): an inline body's own, a member template's included
+           (DeclaredIn), or the copied function's. */
         const FRecord* Written = Cur;
         if (!InlineStack.empty())
-            if (auto O = MethodOwner.find(InlineStack.back()->value("id", std::string())); O != MethodOwner.end())
-                Written = Find(O->second);
-        bool bParentCall = false, bQualified = false;
-        if (Written && R != Written && Kind(CallExprNode) == "CXXMemberCallExpr")
+            if (const FRecord* In = DeclaredIn(*InlineStack.back())) Written = In;
+        bool bParentCall = false, bQualified = false, bNamesQualified = false;
+        if (Kind(CallExprNode) == "CXXMemberCallExpr")
         {
             const Json* Callee = Strip(First(CallExprNode));
             const Json* Obj = Callee ? Strip(First(*Callee)) : nullptr;
-            if (Obj && Kind(*Obj) == "CXXThisExpr")
+            if (Obj && Kind(*Obj) == "CXXThisExpr" && NamesQualified(*Callee, Written, *R, MethodName))
             {
-                /* A forwarder is no declaration of the source's: `AuthOnly()` in its class still names the inherited
-                   one, a call by name. Only a call written qualified, or the forwarder's own, binds through it, and only
-                   in its own class's code: an inline body copied into a subclass is that subclass's. */
-                std::optional<bool> bWrittenQualified;
-                auto Qualified = [&] {
-                    if (!bWrittenQualified) bWrittenQualified = Callee->value("forwards", false) || MemberQualifier(*Callee);
-                    return *bWrittenQualified;
-                };
-                for (const FRecord* A = Written; A && A != R && !bParentCall; A = A->Base.empty() ? nullptr : Find(A->Base))
-                    bParentCall = A->Methods.count(MethodName) != 0 && (!A->Forwarders.count(MethodName) || (A == Cur && Qualified()));
-                bQualified = !bParentCall && !R->IsNative() && Qualified();
+                const auto Own = Cur->Methods.find(MethodName);
+                bParentCall = R != Cur && Own != Cur->Methods.end() && !IsStaticDecl(*Own->second) && !IsInlineMethod(*Cur, MethodName);
+                bQualified = !bParentCall && !R->IsNative();
+                bNamesQualified = true;
             }
         }
         /* `final` (FinalOwner): the one version of the method every object the call can run on reaches, called as
@@ -5610,14 +6389,19 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
            one it names. */
         const Json* On = K == "CXXMemberCallExpr" ? Strip(First(*Callee)) : nullptr;
         const bool bOnThis = !On || Kind(*On) == "CXXThisExpr";
-        const FRecord* Bound = nullptr;
+        const FRecord* Only = nullptr;
         if (!R->IsNative() && !bStatic && !bParentCall && !Out.bReceiverIsArg)
         {
             std::string Of = bOnThis ? std::string() : StripTypeKeywords(TypeOf(*On));
             while (!Of.empty() && (Of.back() == '*' || Of.back() == ' ')) Of.pop_back();
-            if ((Bound = FinalOwner(bOnThis ? Cur : Find(Of), MethodName)) && (Bound->IsNative() || (bQualified && Bound != R)))
-                Bound = nullptr;
+            if ((Only = FinalOwner(bOnThis ? Cur : Find(Of), MethodName)) && (Only->IsNative() || (bQualified && Only != R)))
+                Only = nullptr;
         }
+        /* Its body is copied in where it can be (below); the call is bound to it only when it is FUNC_Final. The editor
+           binds a call to a function without that flag only as a parent call (the call_opcode_flags rule), and a `final`
+           class's inherited function has none, nor has an override, which takes its parent's flags. By name the call
+           reaches that same function, as no subclass brings its own. */
+        const FRecord* Bound = Only && IsFinalFunction(*Only, MethodName) ? Only : nullptr;
         const FRecord* Called = Bound ? Bound : R;
         /* KismetCompilerVMBackend.cpp picks the local form unless the callee is native, a net function, authority
            only or cosmetic. A method declared only by mod classes, without an RPC marker, is none of those; an
@@ -5631,12 +6415,21 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
             if (auto D = A->MethodDefs.find(MethodName); D != A->MethodDefs.end() && (NetFlagsOf(*D->second) || AccessFlagsOf(*D->second)))
                 bLocal = false;
         }
-        if (!R->IsNative() && !bStatic && !bParentCall && !Bound)
+        /* A Blueprint class this source imports - another mod's, through UE_CLASS, or a game Blueprint, through UeApi's
+           Game headers - is native to the compiler, but its functions are script: EX_FinalFunction runs exactly the
+           UFunction it names (execFinalFunction, ScriptCore.cpp 3005-3009), where a native's C++ thunk dispatches, so
+           bound it would skip a subclass's override. Such a call goes by name, as the editor calls a function without
+           FUNC_Final, unless the header makes it final (IsFinalFunction), it is static, or it is a parent call or another
+           qualified one. It stays the non-local form (bLocal above): the header does not say which are RPCs, and that
+           form routes them too. */
+        const bool bImportedScript = R->IsNative() && R->UePackage.compare(0, 6, "/Game/") == 0 && !Out.bReceiverIsArg
+                                  && !bNamesQualified && !IsFinalFunction(*R, MethodName);
+        if ((!R->IsNative() || bImportedScript) && !bStatic && !bParentCall && !Bound)
             Out.VirtualName = UeNameOf(R, MethodName);      // an override of `Set is Extruded` is found by that name
         Out.bLocal = (!Out.VirtualName.empty() || Bound) && bLocal;
         /* A call whose one body is known here - bound on `this`, a parent's, or a static of this mod - is that body,
            expanded in place. The function stays, for delegates, timers, other mods and the editor. */
-        if (const FRecord* In = bStatic || bParentCall ? R : Bound; In && bOnThis && !Out.bReceiverIsArg && CurLocals)
+        if (const FRecord* In = bStatic || bParentCall ? R : Only; In && bOnThis && !Out.bReceiverIsArg && CurLocals)
             if (const Json* Def = Expandable(*In, MethodName, CallExprNode, FullDecl))
                 return ExpandInline(CallExprNode, *Def, In->CppName + "::" + MethodName, true, BP, Out, Err, nullptr, bStatic);
         /* `QcParent::Plain()` from a class that does not declare Plain: C++ runs QcParent's without dispatch, where by
@@ -5644,12 +6437,18 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
            bound to it is not a Blueprint's: the editor calls a parent's function without dispatch only from an override
            of it (K2Node_CallParentFunction), and binds no other call to a function a subclass can override (the
            call_opcode_flags rule); so one that cannot be copied in is a parent call above, from the override
-           SynthesizeForwarders declared, and one that has none stays a call by name, with a warning. */
-        if (bQualified && Bound != R)
+           SynthesizeForwarders declared, and one that has none stays a call by name, with a warning.
+           `SqA::H()` in SqA's own code, its own H, is the same: C++ runs SqA's H on an SqKid that overrides H too, and no
+           Blueprint calls its own class's function without dispatch unless that function is final (bound above). */
+        if (bQualified && Only != R)
         {
             if (const Json* Def = bOnThis && !Out.bReceiverIsArg && CurLocals ? Expandable(*R, MethodName, CallExprNode, FullDecl) : nullptr)
                 return ExpandInline(CallExprNode, *Def, R->CppName + "::" + MethodName, true, BP, Out, Err);
-            if (IsMulticast(*R, MethodName))
+            if (R == Cur)
+                printf("  warning: %s::%s: %s::%s() is a call by name, which on an object of a subclass that overrides %s runs "
+                       "that override: a Blueprint calls its own class's function without dispatch only when it is final\n",
+                       Cur->CppName.c_str(), CurFnName.c_str(), R->CppName.c_str(), MethodName.c_str(), MethodName.c_str());
+            else if (IsMulticast(*R, MethodName))
                 printf("  warning: %s::%s: %s::%s() is a call by name, which on an object of a subclass that overrides %s runs "
                        "that override: a multicast is called without dispatch only from an override of it, which on a "
                        "server sends it a second time\n", Cur->CppName.c_str(), CurFnName.c_str(), R->CppName.c_str(),
@@ -5658,7 +6457,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
                 printf("  warning: %s::%s: %s::%s() is a call by name, which on an object of a subclass that overrides %s runs "
                        "that override; to run %s's alone, call it from an override of %s in %s\n", Cur->CppName.c_str(),
                        CurFnName.c_str(), R->CppName.c_str(), MethodName.c_str(), MethodName.c_str(), R->CppName.c_str(),
-                       MethodName.c_str(), Written->CppName.c_str());
+                       MethodName.c_str(), Cur->CppName.c_str());
         }
 
         const std::string CalleePackage = PackageOf(*Called), CalleeName = ClassOf(*Called);
@@ -5780,25 +6579,32 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
        nowhere. SpawnObject of an abstract class is refused: it ends in NewObject, whose allocation holds that "it is
        illegal to create an abstract class" - asserting in a Development game, compiled out of a Shipping one, which
        makes it (UObjectGlobals.cpp 2362) - and the editor's Construct Object node refuses the class
-       (K2Node_GenericCreateObject.cpp 13-64). */
+       (K2Node_GenericCreateObject.cpp 13-64). AddComponentByClass (AddComponentByType) ends in the same NewObject
+       (ActorConstruction.cpp 1140-1163), so it is refused alike. A UE_FINAL_AS base is cooked Abstract too: the
+       message names its leaf, the class to make. */
     const bool bSpawns = MethodName == "BeginDeferredActorSpawnFromClass" || MethodName == "BeginSpawningActorFromClass";
-    if ((bSpawns || MethodName == "SpawnObject") && Cur && Out.Args.size() == Parms.size())
+    const bool bMakes = MethodName == "SpawnObject" || MethodName == "AddComponentByClass";
+    if ((bSpawns || bMakes) && Cur && Out.Args.size() == Parms.size())
         for (size_t I = 0; I < Parms.size(); ++I)
         {
             const FArgIR& A = Out.Args[I];
             const std::string Where = Cur->CppName + "::" + CurFnName;
             const auto Held = A.K == FArgIR::Local ? LocalClass.find(A.S) : LocalClass.end();
             const FRecord* Named = A.K == FArgIR::ObjConst ? A.Class : Held != LocalClass.end() ? Held->second : nullptr;
-            if (Named && IsAbstract(*Named) && !bSpawns)
+            const std::string Why = !Named ? std::string() : Named->FinalAs.empty() ? "a method of it is `= 0`"
+                                  : "UE_FINAL_AS " + Named->FinalAs + "'s base";
+            if (Named && IsAbstract(*Named) && bMakes)
             {
-                *Err = CurFnName + ": " + Named->CppName + " is an abstract class (a method of it is `= 0`), which the engine "
-                       "may not construct (a Development game asserts): construct a subclass";
+                *Err = CurFnName + ": " + Named->CppName + " is an abstract class (" + Why + "), which the engine may not "
+                       "construct (a Development game asserts): construct "
+                     + (Named->FinalAs.empty() ? std::string("a subclass") : Named->FinalAs);
                 return false;
             }
             if (Named && IsAbstract(*Named) && WarnedMakes.insert(Where + " " + Named->CppName).second)
-                printf("  warning: %s: %s is an abstract class (a method of it is `= 0`), and the engine spawns no actor "
-                       "of one: the spawn returns None\n", Where.c_str(), Named->CppName.c_str());
-            if (!bSpawns && Parms[I].compare(0, 5, "Outer") == 0 && A.K == FArgIR::NullObj && WarnedMakes.insert(Where + " Outer").second)
+                printf("  warning: %s: %s is an abstract class (%s), and the engine spawns no actor of one: the spawn "
+                       "returns None%s\n", Where.c_str(), Named->CppName.c_str(), Why.c_str(),
+                       Named->FinalAs.empty() ? "" : ("; spawn " + Named->FinalAs).c_str());
+            if (MethodName == "SpawnObject" && Parms[I].compare(0, 5, "Outer") == 0 && A.K == FArgIR::NullObj && WarnedMakes.insert(Where + " Outer").second)
                 printf("  warning: %s: SpawnObject with no Outer (None) makes nothing and returns None: pass the object "
                        "that owns it, such as this\n", Where.c_str());
         }
@@ -7111,6 +7917,46 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             if (!bCondOk) bOk = false;
             return bCondOk;
         };
+        /* The comma operator. `A, B;` is two statements (a for increment `++I, --J` too, lowered here). Inside the
+           statement's expression HoistComma takes it apart: an if / switch condition runs once, so `if (A, B)` is A,
+           then `if (B)`, as an init-statement is lowered - which is how `if (bool bOk; Get(Out, bOk), !bOk)` tests an
+           out-param - and so is an initialiser, an argument, a return value, where nothing runs before the comma. A
+           loop condition reruns its left side every trip: it reaches LowerArg, which runs it as an inline body there
+           (LowerCommaValue), unless it sits behind something the statement runs first (NoteBehind). */
+        std::vector<const Json*> Noted;
+        NoteBehind(*S, Noted);
+        struct FUnnote { std::set<const Json*>& Set; const std::vector<const Json*>& Of; ~FUnnote() { for (const Json* P : Of) Set.erase(P); } }
+            Unnote{ Behind, Noted };
+        auto IsComma = [](const Json& E) { return Kind(E) == "BinaryOperator" && E.value("opcode", std::string()) == ","; };
+        /* A discarded side that can do nothing (`I, J++`) is no statement at all. */
+        auto Discarded = [&](std::initializer_list<const Json*> Sides) {
+            Json A = Json::array();
+            for (const Json* E : Sides) if (!IsEagerSafe(*Strip(E))) A.push_back(*E);
+            return A;
+        };
+        if (IsComma(*S))
+        {
+            Json Wrap = { {"kind", "CompoundStmt"}, {"inner", Discarded({ Nth(*S, 0), Nth(*S, 1) })} };
+            if (!LowerBody(Wrap, BP, Out, Locals, Err)) bOk = false;
+            return;
+        }
+        /* `return F();` with a void F, as a void function forwards to another: the call, then a plain return. A void
+           value that can do nothing (`return (void)5;`) is dropped: no value is ever stepped into a void result. */
+        if (K == "ReturnStmt" && First(*S) && StripTypeKeywords(TypeOf(*First(*S))) == "void")
+        {
+            Json Bare = *S;
+            Bare.erase("inner");
+            Json Wrap = { {"kind", "CompoundStmt"}, {"inner", IsEagerSafe(*Strip(First(*S))) ? Json::array({ Bare })
+                                                                                       : Json::array({ *First(*S), Bare })} };
+            if (!LowerBody(Wrap, BP, Out, Locals, Err)) bOk = false;
+            return;
+        }
+        if (Json Seq; const int32 Hoisted = HoistComma(*S, BP, &Seq, Err))
+        {
+            Json Wrap = { {"kind", "CompoundStmt"}, {"inner", Seq} };
+            if (Hoisted < 0 || !LowerBody(Wrap, BP, Out, Locals, Err)) bOk = false;
+            return;
+        }
         if (K == "DeclStmt")
         {
             /* clang groups comma-declared vars under one DeclStmt. */
@@ -7155,6 +8001,13 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 const Json* Init = Ds.bHasValue ? nullptr : Strip(First(D));
                 /* `FStats S;` carries an implicit argless CXXConstructExpr: no initialiser. */
                 if (Init && Kind(*Init) == "CXXConstructExpr" && !First(*Init)) Init = nullptr;
+                /* So does `FVector4 V;` or `V{}`, whose constructor gives W 1 where the frame makes the local as zeros
+                   (CtorOverZeros): it is given that value, each time a loop comes round too. */
+                if (const FRecord* SR = !Init && !Ds.bHasValue ? Find(VarType) : nullptr; SR && SR->bIsStruct && CtorOverZeros(SR->CppName))
+                {
+                    Ds.bHasValue = true;
+                    if (!ZeroArg(VarType, BP, Ds.Value, Err)) { bOk = false; return; }
+                }
                 const std::string DeclId = D.value("id", std::string());
                 if (Init)
                 {
@@ -7307,6 +8160,31 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             }
             if (!Lhs || !Rhs) { *Err = "assignment with a missing side"; bOk = false; return; }
 
+            /* `(Bump(), N) = G();`, `(N = M) = G();`: the store goes to N (AssignedPlace). G() first, as C++17
+               sequences an assignment's right side before its left ([expr.ass]/1), then the comma's left side or the
+               inner assignment, then the store. A class's operator= reads an lvalue right side through its reference
+               when it runs, after both, so only its place is fixed first: `(Bump(), T) = L[Count]` locates L[Count]
+               before Bump ([over.match.oper]/2 orders the operands as the built-in's), and `(BumpS(), T) = S` reads S
+               after it. HoistComma takes apart one whose left side can run as a statement first; this is one behind its
+               right side, or the assignment a loop condition's `=` runs (LowerCommaValue). */
+            const size_t At = K == "BinaryOperator" ? 0 : 1;
+            if (Json Lefts = Json::array(), Place; AssignedPlace((*S)["inner"][At], Lefts, Place))
+            {
+                Json Pre = Json::array(), Again = *S;
+                Json& Value = Again["inner"][At + 1];
+                if (IsFixedOperand(Value)) {}
+                else if (K == "BinaryOperator" || Value.value("valueCategory", std::string()) != "lvalue")
+                    Value = HoistExpr(Value, Pre, true);
+                else
+                    Value = StabilizeLvalue(Value, Pre, true);
+                for (Json& L : Lefts) Pre.push_back(std::move(L));
+                Again["inner"][At] = Place;
+                Pre.push_back(std::move(Again));
+                const Json Wrap = { { "kind", "CompoundStmt" }, { "inner", std::move(Pre) } };
+                bOk = LowerBody(Wrap, BP, Out, Locals, Err);
+                return;
+            }
+
             /* A reference local is the variable it names, or the memory at the address it keeps. */
             while (Kind(*Lhs) == "DeclRefExpr")
             {
@@ -7366,7 +8244,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             {
                 St.K = FStmtIR::Assign;
                 bOk = LowerField(*Lhs, BP, St.Var, Err) && LowerArg(*Rhs, BP, St.Value, Err);
-                if (bOk) { SetOn = RecordOfFieldAccess(*Lhs); SetField = St.Var.S; SetObject = St.Var.Base; }
+                if (bOk) { SetOn = RecordOfFieldAccess(*Lhs); SetField = St.Var.S; SetObject = St.Var.Base; WarnReadOnlyWrite(*Lhs); }
             }
             else if (LK == "DeclRefExpr" && NsVars.count((*Lhs)["referencedDecl"].value("id", std::string())))
             {
@@ -7413,7 +8291,8 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 { *Err = "`[]` on a map needs a map variable, not a computed value"; bOk = false; }
                 if (bOk) WarnRpcRefWrite(St.Call.Args[0]);
                 if (bOk && St.Call.Args[0].K == FArgIR::Field && Strip(Nth(*Lhs, 1)) && Kind(*Strip(Nth(*Lhs, 1))) == "MemberExpr")
-                { SetOn = RecordOfFieldAccess(*Strip(Nth(*Lhs, 1))); SetField = St.Call.Args[0].S; SetObject = St.Call.Args[0].Base; }
+                { SetOn = RecordOfFieldAccess(*Strip(Nth(*Lhs, 1))); SetField = St.Call.Args[0].S; SetObject = St.Call.Args[0].Base;
+                  WarnReadOnlyWrite(*Strip(Nth(*Lhs, 1))); }
             }
             else if (LK == "CXXOperatorCallExpr")
             {
@@ -7426,10 +8305,19 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 if (St.Var.K != FArgIR::Index)
                 { *Err = "TODO: assignment to an operator call that is not an array element"; bOk = false; return; }
                 if (St.Var.Base->K == FArgIR::Field && Strip(Nth(*Lhs, 1)) && Kind(*Strip(Nth(*Lhs, 1))) == "MemberExpr")
-                { SetOn = RecordOfFieldAccess(*Strip(Nth(*Lhs, 1))); SetField = St.Var.Base->S; SetObject = St.Var.Base->Base; }
+                { SetOn = RecordOfFieldAccess(*Strip(Nth(*Lhs, 1))); SetField = St.Var.Base->S; SetObject = St.Var.Base->Base;
+                  WarnReadOnlyWrite(*Strip(Nth(*Lhs, 1))); }
                 St.bAssignLocal = St.Var.Base->K == FArgIR::Local;
                 St.bAssignOutParm = St.Var.Base->K == FArgIR::LocalOut;
                 bOk = LowerArg(*Rhs, BP, St.Value, Err);
+            }
+            else if (!AssignedNoVar(*Lhs).empty())
+            {
+                /* `(L[Idx()] = 3) = 4`, `(L[Idx()] += 3) = 4`: AssignedPlace takes only a plain variable, which names the
+                   same place again. */
+                *Err = AssignedNoVar(*Lhs);
+                bOk = false;
+                return;
             }
             else
             {
@@ -8015,17 +8903,27 @@ bool MayWriteArg(const FCallIR& C, size_t I, const FArgIR* Value = nullptr)
     return !C.bPure && !IsBranch(C.Intrinsic) && (I >= 64 || (C.WrittenArgs >> I & 1));
 }
 
+/* Whether argument I of C must stay the variable it names, Value being what would go there instead: one C may write
+   or reads where it lies (MayWriteArg), and the container or dispatcher C works on (bOnArg0), which the Kismet
+   container thunks step with no result buffer and read at MostRecentPropertyAddress (execArray_Length and the rest).
+   Another variable may go there, as may a block's result local (IsContainerVariable); a call would leave them the
+   address of what its callee read, not a value. */
+bool StaysVariable(const FCallIR& C, size_t I, const FArgIR* Value)
+{
+    return (I == 0 && C.bOnArg0 && !(Value && IsContainerVariable(*Value))) || MayWriteArg(C, I, Value);
+}
+
 /* The read of local Name that runs exactly once whenever A does: not under a branch's later operands, an inline
-   body, an object or struct base (which may need a variable), or a call's target. Nor an argument bRefSlot says may
-   be written: the variable is the argument there, and another in its place would take the write. Value: what is to
-   replace the read. */
+   body, an object or struct base (which may need a variable), or a call's target. Nor an argument bRefSlot says must
+   stay a variable (StaysVariable): another in its place would take the write, or be read where it lies. Value: what is
+   to replace the read. */
 FArgIR* FindPlainRead(FArgIR& A, const std::string& Name, const FArgIR* Value, bool bRefSlot = false)
 {
     if (A.K == FArgIR::Local && A.S == Name && !A.Base) return bRefSlot ? nullptr : &A;
     if (A.K != FArgIR::Call || !A.Sub || A.Sub->Inline) return nullptr;
     const size_t Count = IsBranch(A.Sub->Intrinsic) ? std::min<size_t>(1, A.Sub->Args.size()) : A.Sub->Args.size();
     for (size_t I = 0; I < Count; ++I)
-        if (FArgIR* F = FindPlainRead(A.Sub->Args[I], Name, Value, MayWriteArg(*A.Sub, I, Value))) return F;
+        if (FArgIR* F = FindPlainRead(A.Sub->Args[I], Name, Value, StaysVariable(*A.Sub, I, Value))) return F;
     return nullptr;
 }
 
@@ -8163,7 +9061,7 @@ void FCompiler::ArgumentsInPlace(std::vector<FStmtIR>& Body, const std::vector<s
         if (First.K == FStmtIR::StaticCall && !First.Target.Target && First.Target.Args.empty())
         {
             for (size_t I = 0; I < First.Call.Args.size() && !Read; ++I)
-                if ((Read = FindPlainRead(First.Call.Args[I], Name, &Arg, MayWriteArg(First.Call, I, &Arg))))
+                if ((Read = FindPlainRead(First.Call.Args[I], Name, &Arg, StaysVariable(First.Call, I, &Arg))))
                     Scope = &First.Call.Args[I];
         }
         else if ((First.K == FStmtIR::Assign || First.K == FStmtIR::Decl || First.K == FStmtIR::Return) && !First.Var.Base)
@@ -8226,7 +9124,7 @@ void FCompiler::ForwardSingleUse(std::vector<FStmtIR>& Stmts, const std::vector<
         if (Next.K == FStmtIR::StaticCall && !Next.Target.Target && Next.Target.Args.empty())
         {
             for (size_t I = 0; I < Next.Call.Args.size() && !Read; ++I)
-                if ((Read = FindPlainRead(Next.Call.Args[I], Name, &E, MayWriteArg(Next.Call, I, &E))))
+                if ((Read = FindPlainRead(Next.Call.Args[I], Name, &E, StaysVariable(Next.Call, I, &E))))
                     Scope = &Next.Call.Args[I];
         }
         else if ((Next.K == FStmtIR::Assign || Next.K == FStmtIR::Decl || Next.K == FStmtIR::Return)
@@ -8430,12 +9328,82 @@ bool FCompiler::IsInlineMethod(const FRecord& R, const std::string& Method) cons
         || (Def != R.MethodDefs.end() && Def->second->value("inline", false));
 }
 
+/* FName("None") is NAME_None, whatever its case. The editor refuses it as a variable's or a function's name ("Name
+   cannot be empty.", FKismetNameValidator::IsValid, Kismet2NameValidators.cpp 135-142), and a tag of that name ends the
+   tag list a value is read as (Class.cpp 1326-1329): a UE_STRUCT member's tag in a class default carries its bare
+   name, so one named None would end the struct's value there, its later members unread, and a class's own member would
+   end its default object's list. A class's, a UE_STRUCT's or an interface's members, functions and components. */
+static bool RefuseNoneNames(const FRecord& R, std::string* Err)
+{
+    auto Refuse = [&](const std::string& N) {
+        if (Lower(N) != "none") return true;
+        *Err = R.CppName + "::" + N + ": None is UE's empty name, in any case: the Blueprint editor refuses it, and the "
+               "members of a saved value end at one of that name; rename it";
+        return false;
+    };
+    for (const Json* F : R.Fields) if (!Refuse(Name(*F))) return false;
+    for (const Json* M : R.AllMethods) if (!Refuse(Name(*M))) return false;
+    for (const std::string& C : R.Components) if (!Refuse(C)) return false;
+    return true;
+}
+
 /* A class's variables and functions share one FName namespace with its ancestors', and an FName ignores case. The
    editor refuses a duplicate function and renames a clashing variable (KismetCompiler.cpp 570-616, 1737-1747); here
    each is refused: two members of one name (overloads included, inline ones aside, which are no UFunction), two that
    differ only in case, and a member reusing an inherited name - save a function overriding one of the same spelling. */
+/* Whether C is a scene component class: it or a class above it is USceneComponent. */
+bool FCompiler::IsSceneRecord(const FRecord* C) const
+{
+    for (; C; C = C->Base.empty() ? nullptr : Find(C->Base)) if (C->UeName == "SceneComponent") return true;
+    return false;
+}
+
+/* Whether R's actor already has a root when R's SCS runs, so that no component of R's is the root and R's SCS lists no
+   DefaultSceneRoot node: a Blueprint parent's SCS always leaves one (SimpleConstructionScript.cpp 690-702), and a native
+   parent sets one in its constructor (Character.cpp 59) or ExecuteConstruction takes its first unattached native scene
+   component (ActorConstruction.cpp 736-746). The first own scene component then attaches under it (ExecuteScriptOnActor,
+   686) and keeps its transform like the rest. Generate reads it for the class it builds. */
+bool FCompiler::RootInheritedBy(const FRecord& R) const
+{
+    for (const FRecord* A = R.Base.empty() ? nullptr : Find(R.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
+    {
+        if (!A->IsNative() || (A->UeName.size() > 2 && A->UeName.compare(A->UeName.size() - 2, 2, "_C") == 0)) return true;
+        for (const auto& [Member, Spec] : A->Subobjects)
+            if (Spec.rfind('.') != std::string::npos && IsSceneRecord(Find("U" + Spec.substr(Spec.rfind('.') + 1)))) return true;
+    }
+    return false;
+}
+
+/* Whether mod class R's SCS lists the DefaultSceneRoot node, as FBlueprintClass::ListsDefaultRoot decides it when R is
+   generated: an actor whose root no ancestor provides, each of whose own scene components UE_DEFAULTS' SetupAttachment
+   places (under another, or under RootComponent), so none is left to be the root. Generate asks it of a subclass's mod
+   ancestors, whose own generation it does not see. */
+bool FCompiler::ListsDefaultRootOf(const FRecord& R) const
+{
+    bool bActor = false;
+    for (const FRecord* A = &R; A && !bActor; A = A->Base.empty() ? nullptr : Find(A->Base)) bActor = A->UeName == "Actor";
+    if (!bActor || R.IsNative() || RootInheritedBy(R)) return false;
+    std::set<std::string> Placed;
+    if (R.Defaults)
+        ForEach(*R.Defaults, [&](const Json& Body) {
+            if (Kind(Body) != "CompoundStmt") return;
+            ForEach(Body, [&](const Json& S) {
+                const Json *Callee = nullptr, *Child = nullptr, *Parent = nullptr, *Socket = nullptr;
+                if (AttachmentCall(S, Callee, Child, Parent, Socket) && Kind(*Child) == "MemberExpr") Placed.insert(Name(*Child));
+            });
+        });
+    for (const Json* F : R.Fields)
+    {
+        if (!R.Components.count(Name(*F)) || Placed.count(Name(*F))) continue;
+        const size_t Star = TypeOf(*F).find('*');
+        if (Star != std::string::npos && IsSceneRecord(Find(StripTypeKeywords(TypeOf(*F).substr(0, Star))))) return false;
+    }
+    return true;
+}
+
 bool FCompiler::CheckMemberNames(const FRecord& R, std::string* Err) const
 {
+    if (!RefuseNoneNames(R, Err)) return false;
     std::map<std::string, std::pair<std::string, bool>> Own;       // lower-case name -> (as written, is a function)
     auto Claim = [&](const std::string& N, bool bFunction) {
         auto [It, bNew] = Own.emplace(Lower(N), std::make_pair(N, bFunction));
@@ -8462,6 +9430,8 @@ bool FCompiler::CheckMemberNames(const FRecord& R, std::string* Err) const
     for (const std::string& C : R.Components)
         if (Lower(C) == "defaultsceneroot")
         { *Err = R.CppName + "::" + C + ": DefaultSceneRoot is the root the construction script adds; rename the component"; return false; }
+    /* (A member named like the variable that holds that root is Generate's to refuse, which knows whether the SCS lists
+       the node.) */
     for (const FRecord* A = R.Base.empty() ? nullptr : Find(R.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
         for (const auto& [Member, Spec] : A->Subobjects)
             for (const std::string& C : R.Components)
@@ -8499,8 +9469,32 @@ const FRecord* FCompiler::FinalOwner(const FRecord* Of, const std::string& Metho
 {
     for (const FRecord* A = Of; A; A = A->Base.empty() ? nullptr : Find(A->Base))
         if (auto M = A->Methods.find(Method); M != A->Methods.end() && !IsInlineMethod(*A, Method))
-            return (Of->bFinal || A->FinalMethods.count(Method)) && !IsStaticDecl(*M->second) ? A : nullptr;
+            return (Of->bFinal || !Of->FinalAs.empty() || A->FinalMethods.count(Method)) && !IsStaticDecl(*M->second) ? A : nullptr;
     return nullptr;
+}
+
+/* The same walk FindEvent makes for a super, without importing it: a mod ancestor's function, a native one's, or a
+   native interface's of any class on the way. A is a class of this source, or one it imports from another mod, whose
+   header says the same as the source that cooks it; never a /Script class. */
+bool FCompiler::IsFinalFunction(const FRecord& A, const std::string& Method) const
+{
+    const auto M = A.Methods.find(Method);
+    if (A.UePackage.compare(0, 8, "/Script/") == 0 || M == A.Methods.end() || IsStaticDecl(*M->second)
+        || IsInlineMethod(A, Method) || !(A.bFinal || !A.FinalAs.empty() || A.FinalMethods.count(Method))
+        || ModInterfaceWith(A, Method))        // it implements a mod interface A lists: not Final (Generate)
+        return false;
+    for (const FRecord* R = &A; R; R = R->Base.empty() ? nullptr : Find(R->Base))
+    {
+        if (R != &A && !R->IsNative() && !R->bIsInterface)
+            if (auto P = R->Methods.find(Method); P != R->Methods.end() && !IsStaticDecl(*P->second) && !IsInlineMethod(*R, Method))
+                return false;
+        if (R != &A && !R->IsNative() && !R->bIsInterface && !R->Methods.count(Method) && ModInterfaceWith(*R, Method))
+            return false;
+        if (R != &A && R->IsNative() && R->Methods.count(Method) && !R->Forwards.count(Method)) return false;
+        for (const std::string& I : R->Interfaces)
+            if (const FRecord* IR = Find(I); IR && IR->IsNative() && IR->Methods.count(Method)) return false;
+    }
+    return true;
 }
 
 /* Every call whose body is known here expands, unless: the function is not a Blueprint function of this mod with a
@@ -8552,21 +9546,49 @@ const Json* FCompiler::CopyableDef(const FRecord& In, const std::string& Method)
        Fn, its own or the one SynthesizeForwarders gives it, and with neither goes by name, with a warning. Copied
        into a subclass's function the call would be that subclass's, which has no such Fn: by name, a subclass's
        override would run, or bound from a class without the function. So that body stays In's function, called;
-       a caller written `In::Method()` gets a forwarder of its own for it. Each step goes to a strict ancestor. */
+       a caller written `In::Method()` gets a forwarder of its own for it. Each step goes to a strict ancestor. An
+       inline body the function expands counts as its own: SynthesizeForwarders gave In the forwarder for it. */
     bool bBindsParent = false;
-    std::function<void(const Json&)> Walk = [&](const Json& N) {
+    std::set<const Json*> Expanded;
+    std::function<void(const Json&, const FRecord*)> Walk = [&](const Json& N, const FRecord* Written) {
         if (bBindsParent) return;
         const Json* Callee = Kind(N) == "CXXMemberCallExpr" ? Strip(First(N)) : nullptr;
         const Json* Obj = Callee && Kind(*Callee) == "MemberExpr" ? Strip(First(*Callee)) : nullptr;
         if (Obj && Kind(*Obj) == "CXXThisExpr")
             if (const auto O = MethodOwner.find(Callee->value("referencedMemberDecl", std::string())); O != MethodOwner.end())
                 if (const FRecord* R = Find(O->second); R && R != &In && !R->IsNative() && IsSubclassOf(In, *R)
-                    && MemberQualifier(*Callee) && !CopyableDef(*R, Name(*Callee)))
+                    && NamesQualified(*Callee, Written, *R, Name(*Callee)) && !CopyableDef(*R, Name(*Callee)))
                     bBindsParent = true;
-        ForEach(N, Walk);
+        if (const Json* Inl = InlineOnThis(N); Inl && Expanded.insert(Inl).second)
+        {
+            const FRecord* Owner = DeclaredIn(*Inl);
+            ForEach(*Inl, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Walk(C, Owner ? Owner : &In); });
+        }
+        ForEach(N, [&](const Json& C) { Walk(C, Written); });
     };
-    Walk(*Body);
+    Walk(*Body, &In);
     return bBindsParent ? nullptr : Def;
+}
+
+const Json* FCompiler::InlineOnThis(const Json& Call) const
+{
+    const Json* Callee = Kind(Call) == "CXXMemberCallExpr" ? Strip(First(Call)) : nullptr;
+    const Json* Obj = Callee && Kind(*Callee) == "MemberExpr" ? Strip(First(*Callee)) : nullptr;
+    if (!Obj || Kind(*Obj) != "CXXThisExpr") return nullptr;
+    const std::string Id = Callee->value("referencedMemberDecl", std::string());
+    if (auto T = MemberTemplates.find(Id); T != MemberTemplates.end()) return T->second;
+    if (auto O = MethodOwner.find(Id); O != MethodOwner.end())
+        if (const FRecord* R = Find(O->second))
+            if (auto I = R->Inlines.find(Id); I != R->Inlines.end()) return I->second;
+    return nullptr;
+}
+
+const FRecord* FCompiler::DeclaredIn(const Json& Inline) const
+{
+    const std::string Id = Inline.value("id", std::string());
+    if (auto O = MethodOwner.find(Id); O != MethodOwner.end()) return Find(O->second);
+    if (auto T = TemplateOwner.find(Id); T != TemplateOwner.end()) return Find(T->second);
+    return nullptr;
 }
 
 /* `QcParent::AuthOnly()` in a class W that has no AuthOnly of its own means QcParent's AuthOnly, whatever the object.
@@ -8581,16 +9603,29 @@ const Json* FCompiler::CopyableDef(const FRecord& In, const std::string& Method)
    inherits - and a script function asks it as it starts (ProcessInternal, ScriptCore.cpp 1172-1182), so the second
    ask changes nothing: Local runs both, Remote sends the forwarder, which the receiver runs. Except Local | Remote, a
    multicast on a server (Actor.cpp 4270-4278): the forwarder would send it, and then the call in it again, so a
-   multicast keeps the call by name and its warning. So does a qualified call in an inline method, which is copied
-   into other classes too, one to a pure function, or past an inline or static one of that name; a `final` method has
-   no override, and a call to it is bound already (FinalOwner). */
+   multicast keeps the call by name and its warning. So does one to a pure function, or past an inline or static one
+   of that name; a `final` method has no override, and a call to it is bound already (FinalOwner).
+   An inline method's body (or a member template's) is copied into each caller, so its qualified call is made from
+   each class that calls it, through inline calls too: the walk follows them, and each such class gets the forwarder
+   its copy needs. A body CopyableDef copies into a subclass's function never holds such a call.
+   The classes go base-first, a class's name order within a depth: a forwarder calls the nearest Fn above its class,
+   which may be one declared here for a class above, and must be whatever the class is named. */
 void FCompiler::SynthesizeForwarders()
 {
+    std::vector<std::pair<int, FRecord*>> Order;
     for (auto& [Key, W] : Records)
     {
         if (!W.IsGenerated() || W.bIsStruct || W.bIsInterface || W.bIsPatch || W.Base.empty()) continue;
+        int Depth = 0;
+        for (const FRecord* A = Find(W.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base)) ++Depth;
+        Order.emplace_back(Depth, &W);
+    }
+    std::stable_sort(Order.begin(), Order.end(), [](const auto& A, const auto& B) { return A.first < B.first; });
+    for (const auto& Ordered : Order)
+    {
+        FRecord& W = *Ordered.second;
         std::map<std::string, const FRecord*> Wanted;      // method -> the nearest ancestor declaring it
-        auto Consider = [&](const Json& Call, bool bNoOpt) {
+        auto Consider = [&](const Json& Call, bool bNoOpt, const FRecord* Written) {
             const Json* Callee = Strip(First(Call));
             const Json* Obj = Callee && Kind(*Callee) == "MemberExpr" ? Strip(First(*Callee)) : nullptr;
             if (!Obj || Kind(*Obj) != "CXXThisExpr") return;
@@ -8609,12 +9644,7 @@ void FCompiler::SynthesizeForwarders()
                 }
             }
             if (!Nearest || (!bNoOpt && CopyableDef(*R, Method)) || IsMulticast(*R, Method)) return;
-            const Json& NearDecl = *Nearest->Methods.at(Method);
-            const auto NearDef = Nearest->MethodDefs.find(Method);
-            bool bNamed = true;
-            ForEach(NearDef != Nearest->MethodDefs.end() ? *NearDef->second : NearDecl,
-                    [&](const Json& P) { bNamed = bNamed && (Kind(P) != "ParmVarDecl" || !Name(P).empty()); });
-            if (bNamed && MemberQualifier(*Callee)) Wanted[Method] = Nearest;
+            if (NamesQualified(*Callee, Written, *R, Method)) Wanted[Method] = Nearest;
         };
         for (const auto& [Method, Decl] : W.Methods)
         {
@@ -8622,16 +9652,42 @@ void FCompiler::SynthesizeForwarders()
             const auto DefIt = W.MethodDefs.find(Method);
             const Json& Def = DefIt != W.MethodDefs.end() ? *DefIt->second : *Decl;
             const bool bNoOpt = IsNoOptDecl(*Decl) || IsNoOptDecl(Def);
-            std::function<void(const Json&)> Walk = [&](const Json& N) {
-                if (Kind(N) == "CXXMemberCallExpr") Consider(N, bNoOpt);
-                ForEach(N, Walk);
+            std::set<const Json*> Expanded;      // the inline bodies this method copies in, each walked once
+            std::function<void(const Json&, const FRecord*)> Walk = [&](const Json& N, const FRecord* Written) {
+                if (Kind(N) == "CXXMemberCallExpr")
+                {
+                    Consider(N, bNoOpt, Written);
+                    if (const Json* Inl = InlineOnThis(N); Inl && Expanded.insert(Inl).second)
+                    {
+                        const FRecord* Owner = DeclaredIn(*Inl);
+                        ForEach(*Inl, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Walk(C, Owner ? Owner : &W); });
+                    }
+                }
+                ForEach(N, [&](const Json& C) { Walk(C, Written); });
             };
-            ForEach(Def, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Walk(C); });
+            ForEach(Def, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Walk(C, &W); });
         }
+        /* An interface W lists whose function W inherits from a class above that this source cooks, which does not list
+           it: in C++ that class's function implements it. Generate's empty stub would replace it for every caller, and
+           no function at all is no better: a call by name, an interface call too, finds the interface's own empty one
+           first (UClass::FindFunctionByName looks in a class's interfaces before its super, Class.cpp 5281-5323). So W
+           gets a forwarder to it, the editor's override calling its parent; to an inline one, which it expands. Where
+           none can call it (WhyNotForwarded), Generate refuses the class. */
+        for (const std::string& Listed : W.Interfaces)
+            for (const FRecord* IR : InterfaceChain(Find(Listed)))
+                for (const auto& Entry : IR->Methods)
+                {
+                    const std::string& Method = Entry.first;
+                    if (Method == "StaticClass" || W.Methods.count(Method) || Wanted.count(Method)) continue;
+                    if (const FRecord* A = InheritedImplementation(W, Method); A && WhyNotForwarded(*A, Method, *Entry.second).empty())
+                        Wanted[Method] = A;
+                }
 
         /* The forwarder as clang would write it: the nearest declaration's type and parameters (its definition's names),
            and a body of one call on this, each parameter passed as itself (a reference one as the place it names). The
-           call is marked `forwards`, which LowerCall reads as a qualified call (it has no source range to read). */
+           call is marked `forwards`, which LowerCall reads as a qualified call (it has no source range to read). A
+           parameter the definition leaves unnamed is named P<its index>, `_` added while another parameter has that
+           name, as the editor's override names every pin; the parent's own function keeps its unnamed one. */
         for (const auto& [Method, Nearest] : Wanted)
         {
             const Json& NearDecl = *Nearest->Methods.at(Method);
@@ -8652,12 +9708,20 @@ void FCompiler::SynthesizeForwarders()
                              { "referencedMemberDecl", NearDecl.value("id", std::string()) },
                              { "inner", Json::array({ { { "kind", "CXXThisExpr" }, { "implicit", true },
                                                         { "type", { { "qualType", W.CppName + " *" } } } } }) } });
-            ForEach(NearDef != Nearest->MethodDefs.end() ? *NearDef->second : NearDecl, [&](const Json& P) {
+            const Json& Source = NearDef != Nearest->MethodDefs.end() ? *NearDef->second : NearDecl;
+            const std::vector<std::string> Given = ParmNames(Source);
+            size_t Index = 0;
+            ForEach(Source, [&](const Json& P) {
                 if (Kind(P) != "ParmVarDecl") return;
+                std::string PName = Name(P);
+                if (PName.empty())
+                    for (PName = "P" + std::to_string(Index); std::count(Given.begin(), Given.end(), PName);) PName += "_";
+                ++Index;
                 Json Parm = P;
-                Parm["id"] = Id + "/" + Name(P);
+                Parm["id"] = Id + "/" + PName;
+                Parm["name"] = PName;
                 Args.push_back({ { "kind", "DeclRefExpr" }, { "valueCategory", "lvalue" }, { "type", Referent(P["type"]) },
-                                 { "referencedDecl", { { "id", Parm["id"] }, { "kind", "ParmVarDecl" }, { "name", Name(P) },
+                                 { "referencedDecl", { { "id", Parm["id"] }, { "kind", "ParmVarDecl" }, { "name", PName },
                                                        { "type", P["type"] } } } });
                 Parms.push_back(std::move(Parm));
             });
@@ -8684,6 +9748,48 @@ void FCompiler::SynthesizeForwarders()
             MethodOwner[Id] = W.CppName;
         }
     }
+}
+
+std::pair<const FRecord*, bool> FCompiler::FoundAbove(const FRecord& R, const std::string& Method) const
+{
+    for (const FRecord* A = R.Base.empty() ? nullptr : Find(R.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
+    {
+        if (!A->IsNative() && !A->bIsInterface)
+        {
+            /* A function the class compiles: not an inline one, nor one declared and never defined. */
+            if (auto M = A->Methods.find(Method); M != A->Methods.end() && !IsInlineMethod(*A, Method) && CompilesMethod(*A, Method))
+                return { A, IsStaticDecl(*M->second) };
+            if ((!A->Methods.count(Method) || (!IsInlineMethod(*A, Method) && !CompilesMethod(*A, Method)))
+                && ModInterfaceWith(*A, Method)) return { A, false };     // its stub
+        }
+        if (A->IsNative() && A->Methods.count(Method) && !A->Forwards.count(Method))
+            return { A, IsStaticDecl(*A->Methods.at(Method)) };
+        for (const std::string& I : A->Interfaces)
+            if (const FRecord* IR = Find(I); IR && IR->IsNative() && IR->Methods.count(Method)) return { A, false };
+    }
+    return { nullptr, false };
+}
+
+const FRecord* FCompiler::InheritedImplementation(const FRecord& R, const std::string& Method) const
+{
+    for (const FRecord* A = R.Base.empty() ? nullptr : Find(R.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
+        if (auto M = A->Methods.find(Method); M != A->Methods.end())
+            return A->IsGenerated() && !A->bIsInterface && !A->bIsStruct && !M->second->value("pure", false) ? A : nullptr;
+    return nullptr;
+}
+
+/* A parameter with no name is passed on all the same: the forwarder names it (SynthesizeForwarders). A final function
+   or one of another signature is no function an override of the interface's can be: Generate refuses any function of
+   a final one's name below it, and callers through the interface pass the interface function's parameters. */
+std::string FCompiler::WhyNotForwarded(const FRecord& A, const std::string& Method, const Json& IfaceDecl) const
+{
+    const Json& Decl = *A.Methods.at(Method);
+    if (IsStaticDecl(Decl)) return "static";
+    if (IsMulticast(A, Method)) return "a multicast, which an override calling it would send twice on a server";
+    for (const FRecord* X = &A; X; X = X->Base.empty() ? nullptr : Find(X->Base))
+        if (X->FinalMethods.count(Method)) return "final";
+    if (SignatureOf(Decl) != SignatureOf(IfaceDecl)) return TypeOf(Decl);
+    return {};
 }
 
 /* A multicast wherever Method is declared from R up: a mod's marker, or a native or interface function's flags. */
@@ -8989,6 +10095,630 @@ bool FCompiler::LowerWithoutPrefix(const Json& Stmt, FBlueprintClass& BP, std::v
     Seq.push_back(Plain);
     Json Wrap = { {"kind", "CompoundStmt"}, {"inner", Seq} };
     return LowerBody(Wrap, BP, Out, Locals, Err);
+}
+
+/* Whether evaluating N can neither do anything nor read anything that something else could change: a literal, an
+   enum constant, `this`, a function's name. Whatever runs before or after it, its value is the same. */
+bool IsFixedOperand(const Json& N)
+{
+    const std::string K = Kind(N);
+    if (K == "IntegerLiteral" || K == "FloatingLiteral" || K == "CXXBoolLiteralExpr" || K == "CharacterLiteral"
+        || K == "StringLiteral" || K == "CXXNullPtrLiteralExpr" || K == "CXXThisExpr") return true;
+    if (K == "ConstantExpr" && N.contains("value")) return true;
+    if (K == "DeclRefExpr")
+    {
+        const std::string DK = N.contains("referencedDecl") ? N["referencedDecl"].value("kind", std::string()) : std::string();
+        return DK == "EnumConstantDecl" || DK == "FunctionDecl" || DK == "CXXMethodDecl";
+    }
+    if (K == "ImplicitCastExpr" || K == "ParenExpr" || K == "ConstantExpr" || K == "CStyleCastExpr"
+        || (K == "UnaryOperator" && (N.value("opcode", std::string()) == "-" || N.value("opcode", std::string()) == "+")))
+        return First(N) && IsFixedOperand(*First(N));
+    return false;
+}
+
+/* The declaration a call names, for its parameters' defaults: an inline free function, or a method of the class being
+   compiled or of an ancestor (its in-class declaration, which holds them). Null for anything else. */
+const Json* FCompiler::CalledDecl(const Json& Call) const
+{
+    const Json* Callee = First(Call) ? Strip(First(Call)) : nullptr;
+    if (!Callee) return nullptr;
+    const std::string Id = Kind(*Callee) == "MemberExpr" ? Callee->value("referencedMemberDecl", std::string())
+                         : Kind(*Callee) == "DeclRefExpr" && Callee->contains("referencedDecl")
+                         ? (*Callee)["referencedDecl"].value("id", std::string()) : std::string();
+    if (Id.empty()) return nullptr;
+    if (const auto F = FreeInlines.find(Id); F != FreeInlines.end()) return F->second;
+    for (const FRecord* R = Cur; R; R = R->Base.empty() ? nullptr : Find(R->Base))
+        for (const Json* M : R->AllMethods) if (M->value("id", std::string()) == Id) return M;
+    return nullptr;
+}
+
+namespace
+{
+/* A CXXOperatorCallExpr's operator, "=" for operator=; empty for anything else. */
+std::string OperatorSymbol(const Json& E)
+{
+    if (Kind(E) != "CXXOperatorCallExpr") return std::string();
+    const Json* Callee = Strip(First(E));
+    const std::string Name = Callee && Callee->contains("referencedDecl") ? (*Callee)["referencedDecl"].value("name", std::string())
+                                                                         : std::string();
+    return Name.compare(0, 8, "operator") == 0 ? Name.substr(8) : std::string();
+}
+
+/* What E is among the expressions that act and are worth a place: "," the comma operator, "=" a plain assignment,
+   "update" a compound assignment or a `++` / `--` (a place only when prefix: its valueCategory says), "" anything else. */
+std::string PlaceOp(const Json& E)
+{
+    const std::string K = Kind(E), Op = E.value("opcode", std::string());
+    if (K == "BinaryOperator" && (Op == "," || Op == "=")) return Op;
+    if (K == "CompoundAssignOperator" || (K == "UnaryOperator" && (Op == "++" || Op == "--"))) return "update";
+    static const std::set<std::string> Compound = { "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=" };
+    const std::string Sym = OperatorSymbol(E);
+    if (Sym == "=" && Nth(E, 2)) return "=";
+    if ((Compound.count(Sym) && Nth(E, 2)) || Sym == "++" || Sym == "--") return "update";
+    return std::string();
+}
+}
+
+/*
+The comma operator inside a statement's expression: `int32 N = (Bump(), M);`, `F((Bump(), M))`, `return (A, B);`,
+`switch (Bump(), T)`. C++ runs the comma's left side, then its right side, whose value the comma is; the editor has no
+such node, so the left side becomes a statement of its own before the statement, the comma its right side - which is
+only C++'s order where nothing in the statement runs before the comma. HoistComma finds the first comma, in the order
+C++ evaluates, whose place allows that, and rewrites the statement into the statements that replace it (Seq), one step
+at a time: LowerBody lowers them, and a comma left in them is taken apart the same way.
+
+Where the comma sits decides it. Before it, in an operand C++ evaluates first (an assignment's right side runs before
+its left, a call's object before its arguments, braces' members in order), there may be only a fixed value
+(IsFixedOperand): else something the comma's left side could change, or that could change what its right side reads,
+would run after the one and before the other, and the comma stays where it is (LowerArg refuses it). Beside it, as
+another argument of the same call or constructor or the other operand of an arithmetic operator, C++ fixes no
+order: the whole operand holding the comma may run first, so where a sibling is not a fixed value (a left-out argument
+counts as its default) that operand moves to a temporary first (`F(G(), (Bump(), M))` is `T = (Bump(), M); F(G(), T)`),
+unless the operand is the comma itself and both its right side and the siblings only read (IsEagerSafe), where reading
+the right side after the siblings changes nothing. A comma whose value is written or bound to a reference, `const T&`
+included, cannot move to a temporary: the callee reads the place when it runs, after every argument, and a temporary
+would hold what it held before them. Its right side then has to be a variable, which names the same place wherever it
+is read, and only the left side moves. A loop's condition reruns it every trip and is not looked at here. A plain
+assignment used as a value, `A = B = E` or `F(B = 1)`, is the comma `(B = E, B)`: the assignment runs as a statement,
+then its left side is read again, which must be a plain variable to give the same place. Returns 1 with Seq set, 0
+for a statement with no such comma, -1 with Err set for one that cannot move.
+*/
+int32 FCompiler::HoistComma(const Json& Stmt, FBlueprintClass& BP, Json* Seq, std::string* Err)
+{
+    Json Plain = Stmt;
+    struct FLevel { Json* Child; Json* Parent; size_t From; bool bFixed; };     // an unordered operand on the way, from
+    std::vector<FLevel> Levels;                                                 // its parent's From-th; innermost first
+    Json* Target = nullptr;
+    auto IsComma = [](const Json& E) { return Kind(E) == "BinaryOperator" && E.value("opcode", std::string()) == ","; };
+    static const std::set<std::string> Assigns = { "=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=" };
+    auto OperatorOf = [](const Json& E) {      // a CXXOperatorCallExpr's operator: "=" for operator=
+        const Json* Callee = Strip(First(E));
+        const std::string Name = Callee && Callee->contains("referencedDecl") ? (*Callee)["referencedDecl"].value("name", std::string())
+                                                                             : std::string();
+        return Name.compare(0, 8, "operator") == 0 ? Name.substr(8) : std::string();
+    };
+    /* A plain assignment used as a value, `A = (B = E)`: the assignment, then its left side, as `(B = E, B)` would be.
+       A compound one is a value of LowerArg's already, its place located once (`Slots[Next()] += 1`). */
+    auto IsAssign = [&](const Json& E) {
+        const std::string K = Kind(E);
+        return (K == "BinaryOperator" && E.value("opcode", std::string()) == "=")
+            || (K == "CXXOperatorCallExpr" && OperatorOf(E) == "=" && Nth(E, 2));
+    };
+    /* A compound assignment or a prefix ++ / -- whose place is not read but bound, to a `T&` or `const T&` parameter
+       (`IncRef(1, B += 1)`): the callee reads and writes the place itself, after every argument, so it is the
+       assignment's `(B += 1, B)` too. LowerArg's value of one (LowerUpdateValue) is a copy, right where it is read. */
+    auto IsUpdate = [&](const Json& E) {
+        const std::string K = Kind(E), Op = E.value("opcode", std::string());
+        if (K == "CompoundAssignOperator") return true;
+        if (K == "UnaryOperator") return (Op == "++" || Op == "--") && !E.value("isPostfix", false);
+        if (K != "CXXOperatorCallExpr") return false;
+        const std::string Sym = OperatorOf(E);
+        return (Assigns.count(Sym) && Sym != "=" && Nth(E, 2)) || ((Sym == "++" || Sym == "--") && !Nth(E, 2));
+    };
+    std::set<const Json*> ReadUpdates;     // updates whose value is read where they stand: LowerArg's
+    auto NoteRead = [&](Json& Operand) {
+        Json* N = &Operand;
+        while (Kind(*N) == "ParenExpr" && N->contains("inner") && !(*N)["inner"].empty()) N = &(*N)["inner"][0];
+        if (IsUpdate(*N)) ReadUpdates.insert(N);
+    };
+    /* A left-out argument stands for its parameter's default, which C++ evaluates at the call like any other argument:
+       a fixed value there (`int32 By = 5`) is no sibling that could run before the comma. */
+    std::set<const Json*> FixedDefaults;
+    auto NoteDefaults = [&](const Json& Call) {
+        std::vector<const Json*> Parms;
+        if (const Json* D = CalledDecl(Call)) ForEach(*D, [&](const Json& C) { if (Kind(C) == "ParmVarDecl") Parms.push_back(&C); });
+        const Json& In = Call["inner"];
+        for (size_t J = 1; J < In.size(); ++J)
+            if (Kind(In[J]) == "CXXDefaultArgExpr")
+                if (const Json* V = DefaultedArg(In[J], J - 1 < Parms.size() ? Parms[J - 1] : nullptr); V != &In[J] && IsFixedOperand(*V))
+                    FixedDefaults.insert(&In[J]);
+    };
+    auto IsFixedSibling = [&](const Json& E) { return IsFixedOperand(E) || FixedDefaults.count(&E) != 0; };
+    std::vector<const Json*> Written;      // the operands assignments and updates write, on the way to the target
+    std::function<Json*(Json&, bool)> Seek = [&](Json& E, bool bRoot) -> Json* {
+        if (!E.is_object()) return nullptr;
+        const std::string K = Kind(E);
+        if (!bRoot && (IsComma(E) || IsAssign(E) || (IsUpdate(E) && !ReadUpdates.count(&E)))) { Target = &E; return &E; }
+        if (!E.contains("inner") || !E["inner"].is_array() || E["inner"].empty()) return nullptr;
+        Json& In = E["inner"];
+        if ((K == "ImplicitCastExpr" && E.value("castKind", std::string()) == "LValueToRValue") || K == "CXXConstructExpr")
+            for (Json& C : In) NoteRead(C);
+        auto Ordered = [&](std::initializer_list<size_t> Order) -> Json* {
+            for (size_t I : Order)
+            {
+                if (I >= In.size()) return nullptr;
+                if (Json* F = Seek(In[I], false)) return F;
+                if (!IsFixedOperand(In[I])) return nullptr;      // it runs first, and could see or change what the comma does
+            }
+            return nullptr;
+        };
+        auto InOrder = [&](size_t From) -> Json* {
+            for (size_t I = From; I < In.size(); ++I)
+            {
+                if (Json* F = Seek(In[I], false)) return F;
+                if (!IsFixedOperand(In[I])) return nullptr;
+            }
+            return nullptr;
+        };
+        auto Unordered = [&](size_t From) -> Json* {
+            for (size_t I = From; I < In.size(); ++I)
+                if (Json* F = Seek(In[I], false))
+                {
+                    bool bFixed = true;
+                    for (size_t J = From; J < In.size(); ++J) if (J != I) bFixed = bFixed && IsFixedSibling(In[J]);
+                    Levels.push_back({ &In[I], &E, From, bFixed });
+                    return F;
+                }
+            return nullptr;
+        };
+        const std::string Op = E.value("opcode", std::string());
+        if ((K == "UnaryOperator" && (Op == "++" || Op == "--")) || K == "CompoundAssignOperator"
+            || (K == "BinaryOperator" && Op == "="))
+            Written.push_back(&In[0]);
+        else if (K == "CXXOperatorCallExpr" && In.size() > 1 && (Assigns.count(OperatorOf(E)) || OperatorOf(E) == "++"
+                                                                 || OperatorOf(E) == "--"))
+            Written.push_back(&In[1]);
+        if (K == "ImplicitCastExpr" || K == "ParenExpr" || K == "ConstantExpr" || K == "ExprWithCleanups"
+            || K == "MaterializeTemporaryExpr" || K == "CXXBindTemporaryExpr" || K == "CXXFunctionalCastExpr"
+            || K == "CStyleCastExpr" || K == "CXXStaticCastExpr" || K == "CXXConstCastExpr" || K == "CXXStdInitializerListExpr"
+            || K == "UnaryOperator" || K == "MemberExpr")
+            return Seek(In[0], false);
+        /* Braces fix their members' order; a parenthesised constructor's arguments are a call's, in no fixed order. */
+        if (K == "InitListExpr" || K == "ArraySubscriptExpr"
+            || ((K == "CXXConstructExpr" || K == "CXXTemporaryObjectExpr") && E.value("list", false)))
+            return InOrder(0);
+        if (K == "CXXConstructExpr" || K == "CXXTemporaryObjectExpr") return Unordered(0);
+        if (K == "CallExpr")
+        {
+            if (In.size() < 2 || !IsFixedOperand(In[0])) return nullptr;
+            NoteDefaults(E);
+            return Unordered(1);
+        }
+        if (K == "CXXMemberCallExpr")
+        {
+            /* The object runs before the arguments: they come into it only when it is this. */
+            Json& Callee = In[0];
+            if (Kind(Callee) != "MemberExpr" || !Callee.contains("inner") || Callee["inner"].empty()) return nullptr;
+            const Json* Obj = Strip(&Callee["inner"][0]);
+            if (Obj && Kind(*Obj) == "CXXThisExpr") { NoteDefaults(E); return Unordered(1); }
+            if (Json* F = Seek(Callee["inner"][0], false)) return F;
+            return nullptr;
+        }
+        if (K == "CXXOperatorCallExpr")
+        {
+            const std::string Sym = OperatorOf(E);
+            static const std::set<std::string> Unsequenced = { "+", "-", "*", "/", "%", "==", "!=", "<", ">", "<=", ">=",
+                                                               "&", "|", "^" };
+            if (Assigns.count(Sym)) return Ordered({ 2, 1 });       // C++17: the right side first
+            if (Sym == "&&" || Sym == "||") return Ordered({ 1 });
+            if (Unsequenced.count(Sym)) return Unordered(1);
+            return InOrder(1);
+        }
+        if (K == "BinaryOperator" || K == "CompoundAssignOperator")
+        {
+            if (K == "CompoundAssignOperator" || Op == "=") return Ordered({ 1, 0 });
+            if (Op == "&&" || Op == "||") return Ordered({ 0 });
+            if (Op == "<<" || Op == ">>") return Ordered({ 0, 1 });
+            return Unordered(0);
+        }
+        if (K == "ConditionalOperator" || K == "BinaryConditionalOperator") return Ordered({ 0 });
+        return nullptr;
+    };
+
+    /* Which expression of the statement: an expression statement's own (whose top is no comma: LowerBody makes that
+       two statements), a return value, an if / switch condition (a loop's reruns), a declaration's initialiser. */
+    const std::string K = Kind(Plain);
+    Json Pre = Json::array();          // declarations of the same statement before the one that holds the comma
+    if (K == "ReturnStmt" || ((K == "IfStmt" || K == "SwitchStmt") && !Plain.value("hasInit", false) && !Plain.value("hasVar", false)))
+    {
+        if (!Plain.contains("inner") || Plain["inner"].empty() || !Seek(Plain["inner"][0], false)) return 0;
+    }
+    else if (K == "DeclStmt")
+    {
+        if (!Plain.contains("inner")) return 0;
+        Json& Decls = Plain["inner"];
+        size_t At = 0;
+        for (; At < Decls.size() && !Target; ++At)
+            if (Kind(Decls[At]) == "VarDecl" && Decls[At].contains("inner") && !Decls[At]["inner"].empty())
+                Seek(Decls[At]["inner"][0], false);
+        if (!Target) return 0;
+        /* The declarations before it run first, as the statement of their own they are: a DeclStmt of several is
+           several, in order. Pointers into Decls stay valid while only the front is cut off by copying. */
+        if (At > 1)
+        {
+            for (size_t I = 0; I + 1 < At; ++I) Pre.push_back(Decls[I]);
+            Pre = Json::array({ Json{ {"kind", "DeclStmt"}, {"inner", Pre} } });
+        }
+    }
+    else if (K.size() > 4 && K.compare(K.size() - 4, 4, "Stmt") == 0) return 0;
+    else if (K.find("Decl") != std::string::npos || !Seek(Plain, true)) return 0;
+
+    /* What an operand's place makes of it: its value read (a copy, an operator's operand, a temporary bound to a
+       `const T&`), or the place itself, written or bound to a reference - a `const T&` too, which the callee reads
+       when it runs, after every argument, where a temporary would hold what the place held before them. */
+    auto ValueUse = [&](const Json& N) {
+        return N.value("valueCategory", std::string()) != "lvalue" || Kind(N) == "MaterializeTemporaryExpr";
+    };
+    /* Down through wrappers only, from an operand to the comma. */
+    auto JustTarget = [&](Json* N) {
+        while (N && N != Target && (Kind(*N) == "ImplicitCastExpr" || Kind(*N) == "ParenExpr" || Kind(*N) == "MaterializeTemporaryExpr"
+                                    || Kind(*N) == "CXXBindTemporaryExpr" || Kind(*N) == "ConstantExpr")
+               && N->contains("inner") && !(*N)["inner"].empty())
+            N = &(*N)["inner"][0];
+        return N == Target;
+    };
+    /* A comma's sides; an assignment is its own left side, and the variable it wrote its right, read again after it. A
+       left side that is no plain variable would run a second time. */
+    const bool bAssign = !IsComma(*Target);
+    const Json Left = bAssign ? *Target : (*Target)["inner"][0];
+    /* What an assignment wrote, read again after it: its left side, or the variable a comma or another assignment there
+       names (AssignedPlace: `((Bump(), N) = G())` is N), which its own statement takes apart. */
+    Json Right = !bAssign ? (*Target)["inner"][1] : (*Target)["inner"][Kind(*Target) == "CXXOperatorCallExpr" ? 1 : 0];
+    if (bAssign) { Json Unused = Json::array(), Named; AssignedPlace(Right, Unused, Named); Right = std::move(Named); }
+    const bool bUpdate = bAssign && IsUpdate(*Target);
+    if (bAssign && !IsEagerSafe(*Strip(&Right)))
+    {
+        /* One that is itself assigned to or updated, `(L[Idx()] = M) += 1`, says so, as it does where no statement
+           before can hold it (DesugarUpdate). */
+        if (std::any_of(Written.begin(), Written.end(), [&](const Json* N) { return PlaceRoot(N) == Target; }))
+        { *Err = AssignedNoVar(*Target); return -1; }
+        *Err = std::string(bUpdate ? "an update (`+=`, `++`, ...) passed to a reference parameter" : "an assignment used as a value")
+             + ", whose left side is no plain variable, which would be evaluated again to read it: assign in a statement "
+               "of its own, then use what it assigned";
+        return -1;
+    }
+    const std::string What = !bAssign ? "the comma operator"
+                           : bUpdate ? "an update (`+=`, `++`, ...)" : "an assignment used as a value";
+    const Json* Moved = nullptr;
+    for (auto L = Levels.rbegin(); L != Levels.rend() && !Moved; ++L)    // outermost first
+        if (!L->bFixed)
+        {
+            bool bSiblingsRead = true;
+            const Json& In = (*L->Parent)["inner"];
+            for (size_t I = L->From; I < In.size(); ++I)
+                if (&In[I] != L->Child && !IsFixedSibling(In[I])) bSiblingsRead = bSiblingsRead && IsEagerSafe(In[I]);
+            if (!(JustTarget(L->Child) && IsEagerSafe(Right) && bSiblingsRead)) Moved = L->Child;
+        }
+    if (Moved && !ValueUse(*Moved))
+    {
+        /* An overloaded operator's operand is bound to its parameter as a call's argument is (`Get() + (Bump(), L[0])`
+           over FString's `const FString&`): the message names the operator, which the user wrote, not a parameter. */
+        std::string Bound = "written to or bound to a reference (a `T&` or `const T&` parameter)";
+        for (const FLevel& L : Levels)
+            if (L.Child == Moved && Kind(*L.Parent) == "CXXOperatorCallExpr")
+            {
+                const std::string Sym = OperatorSymbol(*L.Parent);
+                if (!Sym.empty()) Bound = "bound to a reference, operator `" + Sym + "`'s `" + TypeOf(*Moved) + " &` operand";
+            }
+        if (!(JustTarget(const_cast<Json*>(Moved)) && IsEagerSafe(Right)))
+        { *Err = What + " here is " + Bound + ", beside something that may run before it, and its right side is no "
+                 "variable: write its left side as a statement before this one"; return -1; }
+        Moved = nullptr;
+    }
+    *Seq = Pre;
+    if (Moved)
+    {
+        /* An operand that ends in an implicit conversion to a type no Blueprint variable holds (`(Bump(), M) * (G() +
+           0.5)`, float M made double) moves without it: the conversion stays over the temporary, where the statement
+           meets it as it would without the comma, and whatever it says of it (here that 4.27 has no double math) is
+           about what the user wrote. A type that still cannot be a local is refused as such. */
+        FPropertyDef Probe;
+        std::string NoLocal;
+        /* Only a built-in arithmetic type is asked: a struct's or an object's property would import its type here, ahead
+           of the temporary's own. */
+        static const std::set<std::string> Builtins = { "double", "long double", "float", "short", "unsigned short", "int",
+            "unsigned int", "long", "unsigned long", "long long", "unsigned long long", "char", "signed char",
+            "unsigned char", "wchar_t", "char16_t", "char32_t", "bool", "int8", "uint8", "int16", "uint16", "int32",
+            "uint32", "int64", "uint64" };
+        auto Holdable = [&](const Json& E) {
+            const std::string T = StripTypeKeywords(TypeOf(E));
+            return !Builtins.count(T) || TypeToProperty(T, "__Comma__", 0, What, BP, &Probe, &NoLocal);
+        };
+        while (!Holdable(*Moved) && Kind(*Moved) == "ImplicitCastExpr" && First(*Moved)
+               && Moved->value("castKind", std::string()) != "LValueToRValue" && Moved->value("castKind", std::string()) != "NoOp")
+            Moved = First(*Moved);
+        if (!Holdable(*Moved))
+        { *Err = What + " here would run first, whole, into a temporary, and its value is a " + StripTypeKeywords(TypeOf(*Moved))
+                 + ", which no Blueprint variable can hold: write its left side as a statement before this one"; return -1; }
+        /* The operand runs first, whole, into a temporary the statement then reads. */
+        const std::string Type = StripTypeKeywords(TypeOf(*Moved));
+        const std::string Tmp = "__Comma" + std::to_string(ReadTmpCounter++) + "__";
+        Json Var = { {"kind", "VarDecl"}, {"id", "synthetic:" + Tmp}, {"name", Tmp}, {"type", {{"qualType", Type}}},
+                     {"init", "c"}, {"inner", Json::array({ *Moved })} };
+        Seq->push_back(Json{ {"kind", "DeclStmt"}, {"inner", Json::array({ Var })} });
+        Json Ref = RefToLocal(Tmp, Type);
+        Ref["valueCategory"] = "lvalue";
+        *const_cast<Json*>(Moved) = Ref;
+    }
+    else
+    {
+        /* A left side that can do nothing (`(I, J)`) is no statement at all. */
+        if (const Json* L = Strip(&Left); L && !IsEagerSafe(*L)) Seq->push_back(Left);
+        *Target = Right;
+    }
+    if (K == "DeclStmt" && !Pre.empty())
+    {
+        Json Rest = Json::array();
+        const Json& Decls = Plain["inner"];
+        for (size_t I = Pre[0]["inner"].size(); I < Decls.size(); ++I) Rest.push_back(Decls[I]);
+        Plain["inner"] = Rest;
+    }
+    Seq->push_back(Plain);
+    return 1;
+}
+
+/*
+Which commas, assignments and updates of a statement's expression sit behind an operand C++ evaluates before them that
+is no fixed value (IsFixedOperand): a later member of braces, an assignment's left side (its right side runs first), the
+right side of `<<` / `>>`, a later operand of an overloaded operator that is no arithmetic or comparison. What HoistComma
+leaves in place becomes an inline body (LowerCommaValue, LowerBoundArgs), and an inline body runs before everything
+its statement evaluates: behind such an operand it would run ahead of it, so those are refused. A call's object and an
+index's array are pinned first when an argument hoists (PinObject, PinHolder), and the right side of && / || and the
+arms of ?: hoist into their own branch, so none of those puts what follows behind. A nested statement is left to its
+own lowering. Added gets what this call marked, which the caller unmarks when the statement is lowered: the nodes are
+the statement's, and a later one may reuse their memory.
+*/
+void FCompiler::NoteBehind(const Json& Root, std::vector<const Json*>& Added)
+{
+    static const std::set<std::string> Assigns = { "=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=" };
+    static const std::set<std::string> Unsequenced = { "+", "-", "*", "/", "%", "==", "!=", "<", ">", "<=", ">=",
+                                                       "&", "|", "^", "[]" };
+    std::function<void(const Json&, bool, bool)> Walk = [&](const Json& E, bool bBehind, bool bRoot) {
+        if (!E.is_object()) return;
+        const std::string K = Kind(E);
+        if (!bRoot && K.size() > 4 && K.compare(K.size() - 4, 4, "Stmt") == 0) return;
+        if (bBehind && !PlaceOp(E).empty() && Behind.insert(&E).second) Added.push_back(&E);
+        const auto It = E.find("inner");
+        if (It == E.end() || !It->is_array()) return;
+        const Json& In = *It;
+        /* The operands in the order C++ evaluates them: each one after an earlier that is no fixed value is behind. */
+        auto Order = [&](const std::vector<size_t>& Seq) {
+            std::vector<bool> Seen(In.size());
+            bool bAfter = bBehind;
+            for (size_t I : Seq)
+                if (I < In.size())
+                {
+                    Walk(In[I], bAfter, false);
+                    Seen[I] = true;
+                    bAfter = bAfter || !IsFixedOperand(In[I]);
+                }
+            for (size_t I = 0; I < In.size(); ++I) if (!Seen[I]) Walk(In[I], bBehind, false);
+        };
+        auto From = [&](size_t Start) {
+            std::vector<size_t> Seq;
+            for (size_t I = Start; I < In.size(); ++I) Seq.push_back(I);
+            Order(Seq);
+        };
+        const std::string Op = E.value("opcode", std::string()), Sym = OperatorSymbol(E);
+        if (K == "InitListExpr" || ((K == "CXXConstructExpr" || K == "CXXTemporaryObjectExpr") && E.value("list", false))) From(0);
+        else if ((K == "BinaryOperator" && Op == "=") || K == "CompoundAssignOperator") Order({ 1, 0 });
+        else if (K == "BinaryOperator" && (Op == "<<" || Op == ">>")) Order({ 0, 1 });
+        else if (K == "CXXOperatorCallExpr" && Assigns.count(Sym)) Order({ 2, 1 });
+        else if (K == "CXXOperatorCallExpr" && !Unsequenced.count(Sym)) From(1);
+        else for (const Json& C : In) Walk(C, bBehind, false);
+    };
+    Walk(Root, false, true);
+}
+
+/*
+An argument bound to a reference parameter that is a comma, a plain `=` or an update (`IncRef(0, B += 1)`,
+`IncRef(0, (Bump(), N))`) which HoistComma did not take apart: in a loop condition, on the right of && / || or in an
+arm of ?:, in a call on another object. The parameter is then the comma's right side, or what the assignment wrote,
+itself, which the callee reads and writes after every argument; LowerArg's value of one would be a copy, and the
+callee's write would be lost. So the call becomes an inline body that runs where the call does (every trip of a loop,
+in the branch that runs it): the object pinned first when it is not this, as C++ evaluates it before the arguments;
+then each such argument's left side, or the assignment, as a statement; then the call, with the variable in the
+argument's place. C++ leaves the arguments' order among themselves open, and this runs each such argument whole before
+the rest, one order it allows. The variable must name the same place wherever it is read (IsEagerSafe), as HoistComma
+asks; behind something the statement runs first (Behind) the body would run before that, and both are refused.
+Returns 0 for a call with no such argument, 1 with Out set, -1 with Err set.
+*/
+int32 FCompiler::LowerBoundArgs(const Json& Call, FBlueprintClass& BP, FCallIR& Out, std::string* Err)
+{
+    const std::string K = Kind(Call);
+    if ((K != "CallExpr" && K != "CXXMemberCallExpr") || !Call.contains("inner")) return 0;
+    const Json& In = Call["inner"];
+    std::vector<size_t> Bound;
+    for (size_t I = 1; I < In.size(); ++I)
+        if (const Json* Bare = PeelLvalue(&In[I]); Bare && Bare->value("valueCategory", std::string()) == "lvalue" && !PlaceOp(*Bare).empty())
+            Bound.push_back(I);
+    if (Bound.empty()) return 0;
+    if (!CurLocals) { *Err = "internal: a call outside a function body"; return -1; }
+
+    Json Pre = Json::array(), Again = Call;
+    /* The object first, as C++ evaluates it: a pointer's value into a local, a struct's place fixed. */
+    if (K == "CXXMemberCallExpr" && Kind(In[0]) == "MemberExpr" && First(In[0]))
+        if (const Json* Obj = First(In[0]); Kind(*Strip(Obj)) != "CXXThisExpr")
+            Again["inner"][0]["inner"][0] = In[0].value("isArrow", false) ? HoistExpr(*Obj, Pre, true) : StabilizeLvalue(*Obj, Pre, true);
+    for (size_t I : Bound)
+    {
+        const Json* Bare = PeelLvalue(&In[I]);
+        const std::string Op = PlaceOp(*Bare);
+        const std::string What = Op == "," ? "the comma operator" : Op == "=" ? "an assignment used as a value"
+                               : "an update (`+=`, `++`, ...)";
+        if (Behind.count(Bare))
+        { *Err = What + " passed to a reference parameter after something its statement runs first (a later member of a "
+                 "braced list, an assignment's left side, the right side of `<<` / `>>`), which it would run before: "
+                 "write it as a statement of its own, then pass the variable"; return -1; }
+        const Json* Place = Op == "," ? Nth(*Bare, 1) : Kind(*Bare) == "CXXOperatorCallExpr" ? Nth(*Bare, 1) : Nth(*Bare, 0);
+        if (!Place || !IsEagerSafe(*Strip(Place)))
+        { *Err = What + " passed to a reference parameter, whose " + (Op == "," ? "right" : "left") + " side is no plain "
+                 "variable, where no statement before this one can hold it (a loop condition, the right side of && / || "
+                 "/ ?:, a call on another object): write it as a statement of its own, then pass the variable"; return -1; }
+        if (const Json* Side = Op == "," ? Nth(*Bare, 0) : Bare; Side && !IsEagerSafe(*Strip(Side))) Pre.push_back(*Side);
+        /* The variable stands where the comma or the update stood, under the same casts. */
+        const Json* From = &In[I];
+        Json* To = &Again["inner"][I];
+        while (From != Bare) { From = First(*From); To = &(*To)["inner"][0]; }
+        *To = *Place;
+    }
+    const std::string Type = StripTypeKeywords(TypeOf(Call));
+    std::string Result;
+    if (Type.empty() || Type == "void") Pre.push_back(Again);
+    else Result = SynthLocal(Type, Again, Pre)["inner"][0]["referencedDecl"].value("name", std::string());
+    const Json Wrap = { {"kind", "CompoundStmt"}, {"inner", std::move(Pre)} };
+    auto Body = std::make_shared<std::vector<FStmtIR>>();
+    if (!LowerBody(Wrap, BP, *Body, *CurLocals, Err)) return -1;
+    Out = FCallIR();
+    Out.Intrinsic = "__Inline__";
+    Out.Inline = std::make_shared<std::vector<FStmtIR>>(1);
+    (*Out.Inline)[0].K = FStmtIR::Block;
+    (*Out.Inline)[0].Body = Body;
+    Out.InlineResult = Result;
+    if (!Result.empty()) Out.InlineType = Type;
+    return 1;
+}
+
+/*
+A comma, or a `=` used as a value (the comma `(A = E, A)`; a number's, or a struct's or an FString's operator=), that
+HoistComma left where it stands: in a loop condition, on the right of && / || or in an arm of ?:, in an argument of
+a call on another object. An inline body runs where its value is needed - every trip of a loop, in the branch that
+needs it, after a call's object is pinned - so the comma is one: its left side as a statement, then a copy of its right
+side, read right after it, as C++ reads it (bRead: an LValueToRValue or a copy over it, or a prvalue comma). Refused
+where that is not C++'s order or not its value: behind an operand its statement evaluates first (Behind), where the
+body would run ahead of that operand; and where its place is used rather than its value (bound to an operator's or a
+constructor's reference, a member taken of it), which a copy is not. A call's reference parameter takes the place
+through LowerBoundArgs; one assigned to or updated is AssignedPlace's.
+*/
+bool FCompiler::LowerCommaValue(const Json& N, bool bRead, FBlueprintClass& BP, FArgIR& Out, std::string* Err)
+{
+    const bool bOperator = Kind(N) == "CXXOperatorCallExpr";      // a struct's or an FString's operator=
+    const bool bAssign = bOperator || N.value("opcode", std::string()) == "=";
+    const std::string What = bAssign ? "an assignment used as a value" : "the comma operator";
+    const std::string Fix = bAssign ? "assign in a statement of its own, then use what it assigned"
+                                    : "write its left side as a statement of its own";
+    if (Behind.count(&N))
+    { *Err = What + " after something its statement runs first (a later member of a braced list, an assignment's left "
+             "side, the right side of `<<` / `>>`), which its left side would run before: " + Fix; return false; }
+    if (!bRead)
+    { *Err = std::string(bAssign ? "an assignment" : "the comma operator") + " used as a place, not a value (bound to an operator's or a constructor's reference, a member taken "
+             "of it), where no statement before this one can hold its left side (a loop condition, the "
+             "right side of && / || / ?:, a call on another object): " + Fix; return false; }
+    if (!CurLocals) { *Err = "internal: " + What + " outside a function body"; return false; }
+    const Json* Left = Nth(N, bOperator ? 1 : 0);
+    const Json* Right = Nth(N, bOperator ? 2 : 1);
+    if (!Left || !Right) { *Err = What + " with a missing side"; return false; }
+    Json Pre = Json::array();
+    const Json* Value = Right;
+    Json Place;
+    if (bAssign)
+    {
+        /* What is read back is the variable assigned: a comma's right side for `(Bump(), N) = E`, whose left side the
+           assignment's own statement runs (LowerBody's assignment). */
+        Json Unused = Json::array();
+        AssignedPlace(*Left, Unused, Place);
+        if (!IsEagerSafe(*Strip(&Place)))
+        { *Err = "an assignment used as a value, whose left side is no plain variable, which would be evaluated again to "
+                 "read it: assign in a statement of its own, then use what it assigned"; return false; }
+        Pre.push_back(N);
+        Value = &Place;
+    }
+    else if (!IsEagerSafe(*Strip(Left))) Pre.push_back(*Left);
+    const std::string Type = StripTypeKeywords(TypeOf(*Value));
+    FPropertyDef Probe;
+    std::string NoLocal;
+    if (!TypeToProperty(Type, "__Comma__", 0, What, BP, &Probe, &NoLocal))
+    { *Err = What + "'s value here is a " + Type + ", which no Blueprint variable can hold: " + Fix; return false; }
+    const Json Init = Value->value("valueCategory", std::string()) == "lvalue" ? ReadOf(*Value) : *Value;
+    const std::string Result = SynthLocal(Type, Init, Pre)["inner"][0]["referencedDecl"].value("name", std::string());
+    const Json Wrap = { {"kind", "CompoundStmt"}, {"inner", std::move(Pre)} };
+    auto Body = std::make_shared<std::vector<FStmtIR>>();
+    if (!LowerBody(Wrap, BP, *Body, *CurLocals, Err)) return false;
+    Out.K = FArgIR::Call;
+    Out.InnerType = Type;
+    Out.Sub = std::make_shared<FCallIR>();
+    Out.Sub->Intrinsic = "__Inline__";
+    Out.Sub->Inline = std::make_shared<std::vector<FStmtIR>>(1);
+    (*Out.Sub->Inline)[0].K = FStmtIR::Block;
+    (*Out.Sub->Inline)[0].Body = Body;
+    Out.Sub->InlineResult = Result;
+    Out.Sub->InlineType = Type;
+    return true;
+}
+
+/*
+The place an assignment or an update writes when its left side is a comma or a plain `=`: `(Bump(), N) += 1` writes
+the comma's right side, an lvalue ([expr.comma]); `(N = M) += 1` writes N after the assignment ([expr.ass]: its value is
+its left operand, an lvalue). Out gets that variable, through commas in commas, and Pre what runs first, in order: each
+comma's left side that can do something, or the assignment itself, whose left side must then be a plain variable
+(IsEagerSafe), named twice. The caller puts ahead of them what C++ evaluates before the left side of an assignment, its
+right side ([expr.ass]/1, C++17). A member or an element of one, `(Bump(), T).A` or `(Bump(), L)[I]`, is the same member
+or element of the variable ([expr.ref]; an overloaded `[]`'s operands are sequenced as the built-in's, [over.match.oper]/2,
+[expr.sub]: the array first), its index left where it is, to run after. False, with Out the place as it is, for anything
+else: the caller's own lowering refuses what it cannot write to. DesugarUpdate, LowerBody's assignment, LowerCommaValue
+and HoistComma use it.
+*/
+bool FCompiler::AssignedPlace(const Json& Place, Json& Pre, Json& Out) const
+{
+    const Json* Bare = PeelLvalue(&Place);
+    /* The object a member or an element is taken of: a place too, its own path walked the same way. */
+    const size_t Of = !Bare ? 0 : Kind(*Bare) == "MemberExpr" && !Bare->value("isArrow", false) && First(*Bare) ? 1
+                    : (IsTArrayElement(*Bare) || IsTMapElement(*Bare)) && (*Bare)["inner"].size() == 3 ? 2 : 0;
+    if (Of)
+    {
+        Json Base;
+        if (!AssignedPlace((*Bare)["inner"][Of - 1], Pre, Base)) { Out = Place; return false; }
+        Out = *Bare;
+        Out["inner"][Of - 1] = std::move(Base);
+        return true;
+    }
+    /* An update as a place, `(N += G()) += 1` or `++N`, is its left operand after it, as an assignment's is
+       ([expr.ass], [expr.pre.incr]); so is a struct's or an FString's operator= or update, `(T = S).A`, whose result is
+       the object it was called on. A postfix `N++` is a value, not a place. */
+    const std::string BareKind = Bare ? Kind(*Bare) : std::string();
+    const std::string Op = !Bare ? std::string() : BareKind == "BinaryOperator" ? Bare->value("opcode", std::string())
+                         : PlaceOp(*Bare) == "update" && Bare->value("valueCategory", std::string()) == "lvalue" ? "update"
+                         : BareKind == "CXXOperatorCallExpr" && PlaceOp(*Bare) == "=" ? "=" : std::string();
+    const bool bOperator = BareKind == "CXXOperatorCallExpr";
+    const Json* Left = Bare ? Nth(*Bare, bOperator ? 1 : 0) : nullptr;
+    const Json* Right = Bare && BareKind != "UnaryOperator" ? Nth(*Bare, bOperator ? 2 : 1) : Left;
+    /* An assignment's left side, read again after it, must name the same place: a plain variable, or a comma or another
+       assignment that names one, which the assignment's own lowering takes apart. */
+    Json Named, Unused = Json::array();
+    const bool bWrites = Op == "=" || Op == "update";
+    if (bWrites && Left) AssignedPlace(*Left, Unused, Named);
+    if (!Left || !Right || (Op != "," && !(bWrites && Strip(&Named) && IsEagerSafe(*Strip(&Named))))) { Out = Place; return false; }
+    if (bWrites)
+    {
+        Pre.push_back(*Bare);
+        Out = std::move(Named);
+        return true;
+    }
+    if (const Json* L = Strip(Left); L && !IsEagerSafe(*L)) Pre.push_back(*Left);
+    AssignedPlace(*Right, Pre, Out);
+    return true;
+}
+
+/* The refusal for an assignment or an update (Target's PlaceOp, "=" or "update") that is itself assigned to or
+   updated, whose left side is no plain variable: `(L[Idx()] = 3) += 1`, `(L[Idx()] += M) += 1`. Empty where Target is
+   neither. */
+std::string AssignedNoVar(const Json& Target)
+{
+    const std::string Op = PlaceOp(Target);
+    if (Op == "=") return kAssignedAssignNoVar;
+    if (Op != "update") return std::string();
+    return "an update (`+=`, `++`, ...) assigned to or updated, whose left side is no plain variable, which would be "
+           "evaluated again to write it: update in a statement of its own, then write what it updated";
 }
 
 /* `for (Elem : Range)` over a TArray / TSet / TMap. CXXForRangeStmt inner is
@@ -9798,8 +11528,24 @@ std::string StripTypeKeywords(std::string T)
         if (T.compare(0, strlen(Prefix), Prefix) == 0) T = T.substr(strlen(Prefix));
     while (!T.empty() && (T.back() == ' ' || T.back() == '\t')) T.pop_back();
     /* TEnum<E> (UeMeta.h) is E to everything but its two methods, which LowerArg reads off the unstripped type. */
-    if (T.size() > 7 && T.compare(0, 6, "TEnum<") == 0 && T.back() == '>') return StripTypeKeywords(T.substr(6, T.size() - 7));
+    if (IsTEnumType(T) && T.back() == '>') return StripTypeKeywords(T.substr(6, T.size() - 7));
     return T;
+}
+
+/* T is TEnum<E> itself, `const` and a reference aside: not a type that holds one (`TArray<TEnum<E>>`), nor a list of
+   template arguments that starts with one (`TEnum<A>, TSubclassOf<B>`, a TMap's as TemplateArg hands it on), whose
+   `>` closing the `TEnum<` is not the last. */
+bool IsTEnumType(std::string T)
+{
+    for (const char* Prefix : { "const ", "struct ", "class " })
+        if (T.compare(0, strlen(Prefix), Prefix) == 0) T = T.substr(strlen(Prefix));
+    while (!T.empty() && (T.back() == ' ' || T.back() == '\t' || T.back() == '&')) T.pop_back();
+    if (T.compare(0, 6, "TEnum<") != 0) return false;
+    int32 Depth = 0;
+    for (size_t I = 5; I < T.size(); ++I)
+        if (T[I] == '<') ++Depth;
+        else if (T[I] == '>' && --Depth == 0) return I + 1 == T.size();
+    return false;
 }
 
 /* The number a constant expression comes to: literals, enum constants, ConstVars, the constants inlined parameters
@@ -10076,13 +11822,178 @@ bool FCompiler::AssetRef(const Json& N, FBlueprintClass& BP, FIndex* Out)
     return true;
 }
 
+/* Whether R's header declares a constructor, defaulted ones included: clang adds an implicit one to a struct that is
+   only value-initialised. */
+static bool DeclaresCtor(const FRecord& R)
+{
+    return std::any_of(R.Ctors.begin(), R.Ctors.end(), [](const Json* C) { return !C->value("isImplicit", false); });
+}
+
+/* The zero of a default that is not a struct, written as a value: 0, false, the zero enumerator, None, an empty string,
+   text or soft path, a null object, an empty container. */
+static void ZeroDefault(FPropertyDef& PD)
+{
+    FDefaultValue& D = PD.Default;
+    const std::string& T = PD.Type;
+    if (T == "IntProperty" || T == "Int64Property" || (T == "ByteProperty" && PD.StructName.empty())) { D.K = FDefaultValue::Int; D.I = 0; }
+    else if (T == "FloatProperty") { D.K = FDefaultValue::Float; D.F = 0.0; }
+    else if (T == "BoolProperty") { D.K = FDefaultValue::Bool; D.I = 0; }
+    else if (T == "ByteProperty" || T == "EnumProperty") { D.K = FDefaultValue::Str; D.S = PD.EnumZero; }
+    else if (T == "NameProperty") { D.K = FDefaultValue::Str; D.S = "None"; }
+    else if (T == "StrProperty" || T == "TextProperty" || T == "SoftObjectProperty" || T == "SoftClassProperty")
+    { D.K = FDefaultValue::Str; D.S.clear(); }
+    else if (T == "ObjectProperty" || T == "ClassProperty" || T == "InterfaceProperty") { D.K = FDefaultValue::Obj; D.Object = Null(); }
+    else if (T == "ArrayProperty" || T == "SetProperty" || T == "MapProperty") { D.K = FDefaultValue::Array; D.Items.clear(); }
+}
+
+/* C++'s value-initialisation of a struct SR, `T()` or `{}`, as a default written as a value (LowerDefault's bKeepZero),
+   into PD; Path names it for a message. A UE_STRUCT's members are each its initializer, else their own
+   value-initialisation. An engine struct whose constructor sets nothing (ConstructsNothing) is its zeros; bZeros says
+   we are inside one. FVector4 is its zeros but the member its constructor sets (CtorOverZeros), always written, as the
+   engine makes a fresh one as zeros. Any other holds what the engine's constructor sets (FHitResult's Time is 1,
+   FHitResult::Init), which no header says and a function body's Make Struct keeps: in a value that starts as the
+   engine's (bFreshValue) no tag keeps it, and over a value already there it cannot be written, so it is refused; a
+   member the braces of a UE_DEFAULTS statement leave out says so (bLeftOutMember). One whose every member is Transient
+   is written as no member at all, with a warning. Another mod's struct (UE_STRUCT_IN) is no engine struct: its header
+   says each member's value, as a UE_STRUCT's does. */
+bool FCompiler::ValueInitStruct(const FRecord& SR, bool bZeros, const std::string& Path, FPropertyDef& PD,
+                                FBlueprintClass& BP, std::string* Err)
+{
+    const bool bEngine = SR.IsNative() && !SR.IsModStruct();
+    if (!bZeros && bEngine && !ConstructsNothing(SR) && !CtorOverZeros(SR.CppName))
+    {
+        if (bFreshValue) return true;
+        /* A struct whose every member is Transient (FTimerHandle's Handle) has nothing a default can say: the loader
+           skips a Transient member's tag (Class.cpp 1452). The struct's tag holds no member, and the value stays the
+           parent's. */
+        if (const auto SI = Structs.find(SR.CppName); SI != Structs.end() && !SI->second.Fields.empty()
+            && StructConstOrder(SI->second).empty())
+        {
+            printf("  warning: %s: every member of %s is Transient, which the engine never loads from a default: nothing "
+                   "is written, and it keeps the parent's value\n", Path.c_str(), SR.CppName.c_str());
+            PD.Members = std::make_shared<std::vector<FPropertyDef>>();
+            PD.Default.K = FDefaultValue::Struct;
+            return true;
+        }
+        *Err = bLeftOutMember
+             ? Path + ", left out of the braces, holds what the engine's " + SR.CppName + " constructor sets, which its "
+               "header does not say, so AssetGen cannot write it over the value already there; give it in the braces, or "
+               "leave the statement out to keep that value"
+             : Path + ": `" + SR.CppName + "()` or `{}` holds what the engine's " + SR.CppName + " constructor sets, which "
+               "its header does not say, so AssetGen cannot write it over the value already there; leave the statement "
+               "out to keep that value, or give the members in braces, `{.Member = value}`";
+        return false;
+    }
+    bZeros = bZeros || bEngine;
+    /* The struct and its supers, topmost first: a super's members are the struct's too. */
+    std::vector<const FRecord*> Chain;
+    for (const FRecord* R = &SR; R; R = R->Base.empty() ? nullptr : Find(R->Base)) Chain.insert(Chain.begin(), R);
+    auto Members = std::make_shared<std::vector<FPropertyDef>>();
+    for (const FRecord* R : Chain)
+        for (const Json* SF : R->Fields)
+        {
+            FPropertyDef MD;
+            const std::string MName = UeNameOf(R, Name(*SF));
+            if (!TypeToProperty(TypeOf(*SF), MName, 0, "member " + MName + " of " + R->CppName, BP, &MD, Err)) return false;
+            if (!bZeros && First(*SF))
+            {
+                if (!LowerDefault(*SF, MD, BP, Err, nullptr, /*bKeepZero=*/true)) return false;
+            }
+            else if (MD.Type != "StructProperty")
+            {
+                ZeroDefault(MD);
+                if (const FCtorOverZeros* C = CtorOverZeros(R->CppName); C && Name(*SF) == C->Member) MD.Default.F = C->Value;
+            }
+            else if (const FRecord* Sub = Find(StripTypeKeywords(TypeOf(*SF))))
+            {
+                if (!ValueInitStruct(*Sub, bZeros, Path + "." + Name(*SF), MD, BP, Err)) return false;
+            }
+            else { *Err = Path + "." + Name(*SF) + ": unknown struct type " + TypeOf(*SF); return false; }
+            Members->push_back(MD);
+        }
+    PD.Members = Members;
+    PD.Default.K = FDefaultValue::Struct;
+    return true;
+}
+
+/* Whether R's parent holds the member Lhs names (a UE_DEFAULTS statement's left side) as a fresh value, what the engine
+   makes of its type: it is declared in a class cooked here with no initializer, `{}` or `T()`, and no UE_DEFAULTS
+   between sets it. Braces that give a struct some members (`= {.N = 2}`) leave it fresh as they leave it: Braces
+   and BracesOf say which, for LowerDefault's ParentInit. A native class on the way, another mod's too, holds a value
+   no header says. */
+/* Whether a member's initializer I (stripped; null for none) leaves it as the engine makes its type: none, `{}`, `T()`. */
+static bool StartsFresh(const Json* I)
+{
+    if (!I) return true;
+    const std::string K = Kind(*I);
+    if (K == "ImplicitValueInitExpr" || K == "CXXScalarValueInitExpr") return true;
+    if (K == "CXXConstructExpr" || K == "CXXTemporaryObjectExpr") return !First(*I);
+    bool bAll = K == "InitListExpr";
+    if (bAll) ForEach(*I, [&](const Json& C) { bAll = bAll && IsUnsetInit(C); });
+    return bAll;
+}
+
+bool FCompiler::ParentValueFresh(const FRecord& R, const Json& Lhs, const Json*& Braces, const FRecord*& BracesOf) const
+{
+    return ValueFreshFrom(R.Base.empty() ? nullptr : Find(R.Base), Lhs.value("referencedMemberDecl", std::string()), Braces,
+                          BracesOf);
+}
+
+/* ParentValueFresh's walk, from the class From up: whether From's default object holds the member whose declaration is
+   Id as a fresh value. An asset starts as its class's default object, so its braces lie over From = its class. */
+bool FCompiler::ValueFreshFrom(const FRecord* From, const std::string& Id, const Json*& Braces, const FRecord*& BracesOf) const
+{
+    Braces = nullptr;
+    BracesOf = nullptr;
+    for (const FRecord* C = From; C && !Id.empty(); C = C->Base.empty() ? nullptr : Find(C->Base))
+    {
+        if (C->IsNative()) return false;
+        bool bSet = false;
+        if (C->Defaults)
+            ForEach(*C->Defaults, [&](const Json& B) {
+                if (Kind(B) == "CompoundStmt")
+                    ForEach(B, [&](const Json& S) {
+                        const Json *L = nullptr, *V = nullptr, *Through = nullptr;
+                        bSet = bSet || (DefaultAssignment(S, L, V, Through) && !Through
+                                        && L->value("referencedMemberDecl", std::string()) == Id);
+                    });
+            });
+        if (bSet) return false;
+        for (const Json* F : C->Fields)
+            if (F->value("id", std::string()) == Id)
+            {
+                const Json* const I = Strip(First(*F));
+                if (StartsFresh(I)) return true;
+                /* Braces for a struct (`FHeld H = {.N = 2}`) make it fresh as they leave it: the default instance under
+                   them, as LowerDefault lowers a value that starts fresh. */
+                const FRecord* const SR = Kind(*I) == "InitListExpr" ? Find(StripTypeKeywords(TypeOf(*F))) : nullptr;
+                if (!SR || !SR->bIsStruct) return false;
+                Braces = I;
+                BracesOf = SR;
+                return true;
+            }
+    }
+    return false;
+}
+
 bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& BP, std::string* Err, const Json* Init,
                              bool bKeepZero)
 {
     const Json* const Whole = Init ? Init : First(F);
     Init = Strip(Whole);
-    if (!Init) return true;
+    /* No initializer: the property starts as the engine makes it, which is the C++ constructor's value but for a struct
+       the engine makes as zeros though its constructor sets a member (CtorOverZeros): that value is written. */
+    if (!Init)
+    {
+        const FRecord* SR = PD.Type == "StructProperty" ? Find(StripTypeKeywords(TypeOf(F))) : nullptr;
+        return !SR || !CtorOverZeros(SR->CppName) || ValueInitStruct(*SR, /*bZeros=*/false, Name(F), PD, BP, Err);
+    }
     std::string K = Kind(*Init);
+    /* `(A, B)` whose left side does nothing (`(1, 4)`) is its right side; one that does something would run when the
+       game does, and is refused below. */
+    if (K == "BinaryOperator" && Init->value("opcode", std::string()) == "," && Nth(*Init, 1) && Nth(*Init, 0)
+        && IsEagerSafe(*Strip(Nth(*Init, 0))))
+        return LowerDefault(F, PD, BP, Err, Nth(*Init, 1), bKeepZero);
     if (PD.Type == "StructProperty" && NativeUnwritten(PD.StructName))
     {
         *Err = Name(F) + ": the engine reads a " + PD.StructName + " value in its own binary form, which AssetGen does not "
@@ -10188,9 +12099,25 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
         Init = Strip(First(*Init));
         K = Init ? Kind(*Init) : std::string();
     }
-    /* A member `{ .Q = 9 }` leaves unwritten (with no default of its own) is ImplicitValueInitExpr: zero. */
-    if (!bNeg && (K == "CXXNullPtrLiteralExpr" || K == "ImplicitValueInitExpr" || (K == "CXXConstructExpr" && !First(*Init))))
-        return true;
+    /* A member `{ .Q = 9 }` leaves unwritten (with no default of its own) is ImplicitValueInitExpr: zero. So are `T()`
+       and `{}` around a value that is not a struct, C++'s value-initialisation; a struct's `T()` keeps its defaults, as
+       no value does. Braces around one value are that value. Where a zero is a value of its own (bKeepZero: a
+       UE_DEFAULTS statement deltas against the parent's default, a struct value or an asset names every member it
+       holds), it is written as one: the type's zero, an empty container, or a struct's value-initialisation
+       (ValueInitStruct). */
+    const bool bBraced = !bNeg && K == "InitListExpr" && PD.Type != "StructProperty";
+    if (!bNeg && (K == "CXXNullPtrLiteralExpr" || K == "ImplicitValueInitExpr" || K == "CXXScalarValueInitExpr"
+                  || ((K == "CXXConstructExpr" || K == "CXXTemporaryObjectExpr") && !First(*Init)) || (bBraced && !First(*Init))))
+    {
+        const FRecord* SR = PD.Type == "StructProperty" ? Find(StripTypeKeywords(TypeOf(*Init))) : nullptr;
+        if (PD.Type == "StructProperty" && (!SR || !SR->bIsStruct)) SR = Find(StripTypeKeywords(TypeOf(F)));
+        /* A fresh FVector4 is zeros, its constructor's W 1 (CtorOverZeros): written even where a zero is not. */
+        if (!bKeepZero && !(SR && CtorOverZeros(SR->CppName))) return true;
+        if (PD.Type != "StructProperty") { ZeroDefault(PD); return true; }
+        if (!SR) { *Err = "unknown struct type in an initializer: " + TypeOf(*Init); return false; }
+        return ValueInitStruct(*SR, /*bZeros=*/false, Name(F), PD, BP, Err);
+    }
+    if (bBraced) return LowerDefault(F, PD, BP, Err, First(*Init), bKeepZero);
 
     /* A struct value: `FFloatInterval(1, 5)` or `{1, 5}`, one argument per member in declaration
        order. The members go on the property, each with its own default, and the writer turns them
@@ -10203,12 +12130,39 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
         std::vector<std::string> Names;
         for (const Json* SF : SR->Fields) Names.push_back(Name(*SF));
         const std::vector<const Json*> Args = StructArgs(*Init, SR, Names);
+        /* `{}` of an engine struct whose header declares no constructor is its value-initialisation too, which the
+           braces spell member by member: `FHitResult Hit = {};` holds Time 1, as FHitResult() does. */
+        if (K == "InitListExpr" && SR->IsNative() && !DeclaresCtor(*SR)
+            && std::all_of(Args.begin(), Args.end(), [](const Json* A) { return IsUnsetInit(*A); }))
+            return !bKeepZero || ValueInitStruct(*SR, /*bZeros=*/false, Name(F), PD, BP, Err);
         if (Args.size() != SR->Fields.size())
         {
             *Err = SR->CppName + " takes one value per member (" + std::to_string(SR->Fields.size())
                  + "), in declaration order: " + Name(F);
             return false;
         }
+        /* Without bKeepZero this is a value that starts fresh, and so are its members, however deep. */
+        const bool bWasFresh = bFreshValue, bWasLeftOut = bLeftOutMember, bWasParentFresh = bParentFresh;
+        bFreshValue = bFreshValue || !bKeepZero;
+        struct FRestore { bool& Flag; bool Was; ~FRestore() { Flag = Was; } } Restore{ bFreshValue, bWasFresh },
+                                                                          RestoreLeftOut{ bLeftOutMember, bWasLeftOut },
+                                                                          RestoreParentFresh{ bParentFresh, bWasParentFresh };
+        const Json* const WasParentInit = ParentInit;
+        const FRecord* const WasParentInitOf = ParentInitOf;
+        struct FRestoreInit { const Json*& Init; const FRecord*& Of; const Json* WasInit; const FRecord* WasOf;
+                              ~FRestoreInit() { Init = WasInit; Of = WasOf; } }
+            RestoreInit{ ParentInit, ParentInitOf, WasParentInit, WasParentInitOf };
+        /* The parent's value of this struct is fresh as the braces it was made with leave it (ParentInit, a member's
+           initializer further up), else as each member's declaration makes it; braces for another struct say nothing.
+           A value that starts fresh (a class's own default, a struct's default instance, a container's element) starts
+           as the struct's default instance, each member as its declaration makes it (UUserDefinedStruct::InitializeStruct
+           copies the default instance in, UserDefinedStruct.cpp 254), so its braces lie over that the way a UE_DEFAULTS
+           statement's lie over a fresh parent. */
+        const std::vector<const Json*> ParentArgs = bKeepZero && bWasParentFresh && WasParentInit && WasParentInitOf == SR
+                                                  ? StructArgs(*WasParentInit, SR, Names) : std::vector<const Json*>();
+        const bool bParentHere = !bKeepZero || (bWasParentFresh && (!WasParentInit || ParentArgs.size() == Names.size()));
+        /* Braces that give some members and leave the rest out (`{.Distance = 5.0f}`; `{}` gives none). */
+        const bool bSomeGiven = std::any_of(Args.begin(), Args.end(), [](const Json* A) { return !IsUnsetInit(*A); });
         auto Members = std::make_shared<std::vector<FPropertyDef>>();
         for (size_t I = 0; I < Args.size(); ++I)
         {
@@ -10220,7 +12174,54 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
             /* Every member is written, so a zero is a value here and not "leave it out". One the braces leave out
                but that has a default of its own (CXXDefaultInitExpr) takes that default, as in C++. */
             const Json* A = Kind(*Args[I]) == "CXXDefaultInitExpr" ? nullptr : Args[I];
-            if (!LowerDefault(*SR->Fields[I], MD, BP, Err, A, /*bKeepZero=*/true)) return false;
+            bLeftOutMember = bSomeGiven && IsUnsetInit(*Args[I]);
+            /* The parent's value of a member given here is fresh where the parent's struct is and the member starts as
+               the engine makes it: a UE_STRUCT's member with an initializer of its own (`Hit = {.Time = 0.5f}`) holds
+               that in the parent, and braces given for it are a new value over it. The parent's member was made by
+               the braces the parent's struct was (ParentArgs) where they give it, else by its declaration; braces
+               there (`In = {.K = 4}`) are followed down, so what they leave out is still fresh under it (In.Hit). */
+            const Json* const Given = I < ParentArgs.size() && ParentArgs[I] && !IsUnsetInit(*ParentArgs[I])
+                                    ? Strip(ParentArgs[I]) : nullptr;
+            const Json* const Made = Given ? Given : Strip(First(*SR->Fields[I]));
+            const FRecord* const MemberStruct = Made && Kind(*Made) == "InitListExpr" && !StartsFresh(Made)
+                                              ? Find(StripTypeKeywords(TypeOf(*SR->Fields[I]))) : nullptr;
+            const bool bFollow = MemberStruct && MemberStruct->bIsStruct;
+            bParentFresh = bParentHere && ((!A || IsUnsetInit(*A)) ? !Given : (StartsFresh(Made) || bFollow));
+            ParentInit = bParentFresh && bFollow ? Made : nullptr;
+            ParentInitOf = ParentInit ? MemberStruct : nullptr;
+            /* A UE_STRUCT's member with an initializer of its own starts as that, not as the engine's value, so a value
+               given for it is written over one already there; so does one of another mod's struct (UE_STRUCT_IN). One
+               the braces of a UE_DEFAULTS statement leave out is over the parent's value, which may be the fresh one
+               (bParentFresh). */
+            bFreshValue = (bWasFresh || !bKeepZero || (bLeftOutMember && bParentFresh))
+                       && !(A && (!SR->IsNative() || SR->IsModStruct()) && First(*SR->Fields[I]));
+            /* Braces of an engine struct whose header declares no constructor are the editor's Make Struct: a member
+               they leave out keeps what the engine's constructor sets, which no header says (FHitResult's Time 1). A
+               fresh value holds it with no tag; over another it cannot be written. A struct written as raw bytes
+               (NativeStructSize: FBox, FPlane, whose constructors set nothing) has every member, its zero. Another
+               mod's struct (UE_STRUCT_IN) is no engine struct: its header says each member's value, and one with an
+               initializer (CXXDefaultInitExpr, A null) takes it. */
+            if (bLeftOutMember && A && !SR->IsModStruct() && SR->IsNative() && !DeclaresCtor(*SR)
+                && !NativeStructSize(PD.StructName))
+            {
+                if (!bFreshValue)
+                {
+                    *Err = Name(F) + "." + Name(*SR->Fields[I]) + ", left out of the braces, holds what the engine's "
+                         + SR->CppName + " constructor sets, which its header does not say, so AssetGen cannot write it "
+                           "over the value already there; give it in the braces, or leave the statement out to keep that value";
+                    return false;
+                }
+                continue;
+            }
+            if (!LowerDefault(*SR->Fields[I], MD, BP, Err, A, /*bKeepZero=*/true))
+            {
+                /* A message about the member says whose: `H.Hit: ...`, `H.Hit, left out ...`. */
+                const std::string Member = Name(*SR->Fields[I]);
+                if (Err->compare(0, Member.size() + 1, Member + ":") == 0 || Err->compare(0, Member.size() + 1, Member + ".") == 0
+                    || Err->compare(0, Member.size() + 1, Member + ",") == 0)
+                    *Err = Name(F) + "." + *Err;
+                return false;
+            }
             Members->push_back(MD);
         }
         PD.Members = Members;
@@ -10575,17 +12576,41 @@ bool FCompiler::DelegateSignature(const std::string& Type, const std::string& Ho
         PD.PropertyFlags &= ~uint64(CPF_BlueprintVisible | CPF_BlueprintReadOnly);
         Params.push_back(PD);
     }
-    /* Named after the variable asking, numbered past a dispatcher's signature or another type's of that name. */
-    auto Taken = [&](const std::string& N) {
-        return std::any_of(CurSignatures.begin(), CurSignatures.end(), [&](const auto& D) { return D.first + "__DelegateSignature" == N; })
-            || std::any_of(DelegateSigs.begin(), DelegateSigs.end(), [&](const auto& D) { return D.second.first == N; });
+    /* Named after the variable asking, numbered past a dispatcher's signature or another type's of that name - this
+       class's, or any class's up or down the chain: one of a child's that a parent has too is no override of it (no
+       super link), and FindFunctionByName on the child finds the child's (invariants.py func_super_link). A class's
+       names are its functions and UE_DISPATCHER signatures (Methods), a game Blueprint's dispatchers' (its
+       TMulticastInlineDelegate fields), and those this made in a mod class generated before it (MadeSignatures):
+       Compile goes by name, so of a parent and a child the first keeps the plain name and the other numbers past it. */
+    auto Has = [&](const FRecord& A, const std::string& N) {
+        if (A.Methods.count(N)) return true;
+        if (const auto M = MadeSignatures.find(A.CppName); M != MadeSignatures.end() && M->second.count(N)) return true;
+        return std::any_of(A.Fields.begin(), A.Fields.end(), [&](const Json* F) {
+            return Name(*F) + "__DelegateSignature" == N
+                && StripTypeKeywords(TypeOf(*F)).compare(0, 25, "TMulticastInlineDelegate<") == 0; });
     };
-    std::string Name = Holder + "__DelegateSignature";
-    for (int32 N = 2; Taken(Name); ++N) Name = Holder + "_" + std::to_string(N) + "__DelegateSignature";
+    auto Taken = [&](const std::string& N) {
+        if (std::any_of(CurSignatures.begin(), CurSignatures.end(), [&](const auto& D) { return D.first + "__DelegateSignature" == N; })
+            || std::any_of(DelegateSigs.begin(), DelegateSigs.end(), [&](const auto& D) { return D.second.first == N; }))
+            return true;
+        if (!Cur) return false;
+        for (const FRecord* A = Cur->Base.empty() ? nullptr : Find(Cur->Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
+            if (Has(*A, N)) return true;
+        for (const auto& [CppName, D] : Records)
+        {
+            if (&D == Cur || !D.IsGenerated() || D.bIsStruct || D.bIsInterface) continue;
+            for (const FRecord* A = D.Base.empty() ? nullptr : Find(D.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
+                if (A == Cur) { if (Has(D, N)) return true; break; }
+        }
+        return false;
+    };
+    std::string Made = Holder + "__DelegateSignature";
+    for (int32 N = 2; Taken(Made); ++N) Made = Holder + "_" + std::to_string(N) + "__DelegateSignature";
     const bool bOut = std::any_of(Params.begin(), Params.end(), [](const FPropertyDef& P) { return (P.PropertyFlags & CPF_OutParm) != 0; });
-    *Sig = BP.AddFunction(Name, Null(), Params, [](FScript& S, FIndex) { S.Return(); S.EndOfScript(); },
+    *Sig = BP.AddFunction(Made, Null(), Params, [](FScript& S, FIndex) { S.Return(); S.EndOfScript(); },
                           FUNC_Public | FUNC_Delegate | (bOut ? uint32(FUNC_HasOutParms) : 0u));
-    DelegateSigs[Type] = { Name, *Sig };
+    DelegateSigs[Type] = { Made, *Sig };
+    if (Cur) MadeSignatures[Cur->CppName].insert(Made);
     return true;
 }
 
@@ -10701,10 +12726,26 @@ bool FCompiler::LowerParams(const Json& M, const std::string& Fn, FBlueprintClas
 {
     CurrentOutParms.clear();
     bool bOk = true;
+    /* A parameter the source leaves unnamed is named P<its index>, `_` added while another has that name, as the
+       editor names every pin and SynthesizeForwarders names the override's: an empty name is None once loaded, and
+       two such parameters would share it. No body reads it, and callers fill parameters by order. A local of the body
+       may be named P0 too, which C++ allows beside an unnamed parameter; the frame holds both by name, and the engine
+       finds a property by its name, first match (FFieldPath::TryToResolvePath), so the local's name is taken as well. */
+    std::vector<std::string> Given = ParmNames(M);
+    Given.push_back("ReturnValue");
+    std::function<void(const Json&)> Locals = [&](const Json& N) {
+        if (Kind(N) == "VarDecl") Given.push_back(Name(N));
+        ForEach(N, Locals);
+    };
+    Locals(M);
+    size_t Index = 0;
     ForEach(M, [&](const Json& C) {
         if (Kind(C) != "ParmVarDecl" || !bOk) return;
         std::string Type = TypeOf(C);
-        const std::string PName = Name(C);
+        std::string PName = Name(C);
+        if (PName.empty())
+            for (PName = "P" + std::to_string(Index); std::count(Given.begin(), Given.end(), PName);) PName += "_";
+        ++Index;
         bool bOutParm = false;
         while (!Type.empty() && (Type.back() == '&' || Type.back() == ' ' || Type.back() == '\t'))
         {
@@ -10752,6 +12793,7 @@ bool FCompiler::GenerateInterface(const FRecord& R, const std::string& OutDir, s
     /* A variable on an interface is this compiler's own idea, not the engine's: it becomes a property of every
        class that implements the interface (Generate), so none is written here. What cannot move that way is
        refused. */
+    if (!RefuseNoneNames(R, Err)) return false;
     for (const Json* F : R.Fields)
     {
         if (R.Components.count(Name(*F)))
@@ -10808,6 +12850,7 @@ bool FCompiler::GenerateStruct(const FRecord& R, const std::string& OutDir, std:
     FPackage P(PackageName);
     StampIdentity(P, PackageName);
     FBlueprintClass BP(P, ClassOf(R), "", "", false);
+    if (!RefuseNoneNames(R, Err)) return false;
 
     for (const Json* F : R.Fields)
     {
@@ -10859,16 +12902,19 @@ bool FCompiler::GenerateEnum(const std::string& Enum, const std::string& OutDir,
 
 /* The members a braced initializer of a Rec names, typed and lowered, in order. Measured on ED_Spider_Grunt: the
    semantic form lists the bases first, then every field in order, so a designator is found by position. A member
-   the braces leave out is skipped. */
+   the braces leave out is skipped. With Archetype, each value is written over that class's default object's, as a
+   UE_DEFAULTS statement's over its parent's: a zero is a value, and a struct member the braces leave out is fresh only
+   where the default object's value of it is (ValueFreshFrom). */
 bool FCompiler::BracedMembers(const Json& List, const FRecord& Rec, const std::string& Where, FBlueprintClass& BP,
-                              bool bKeepZero, std::vector<FPropertyDef>& Out, std::string* Err)
+                              bool bKeepZero, std::vector<FPropertyDef>& Out, std::string* Err, const FRecord* Archetype)
 {
     size_t I = 0;
     if (!Rec.Base.empty())
     {
         const FRecord* B = Find(Rec.Base);
         const Json* Sub = Nth(List, I++);
-        if (B && Sub && Kind(*Sub) == "InitListExpr" && !BracedMembers(*Sub, *B, Where, BP, bKeepZero, Out, Err)) return false;
+        if (B && Sub && Kind(*Sub) == "InitListExpr" && !BracedMembers(*Sub, *B, Where, BP, bKeepZero, Out, Err, Archetype))
+            return false;
     }
     I += Rec.Interfaces.size();
     for (const Json* F : Rec.Fields)
@@ -10877,13 +12923,20 @@ bool FCompiler::BracedMembers(const Json& List, const FRecord& Rec, const std::s
         if (!Init || IsUnsetInit(*Init)) continue;
         FPropertyDef PD;
         if (!TypeToProperty(TypeOf(*F), UeNameOf(&Rec, Name(*F)), 0, Where + "." + Name(*F), BP, &PD, Err)) return false;
-        if (!LowerDefault(*F, PD, BP, Err, Init, bKeepZero)) return false;
+        struct FRestore { bool& Flag; const Json*& Init; const FRecord*& Of; bool WasFlag; const Json* WasInit; const FRecord* WasOf;
+                          ~FRestore() { Flag = WasFlag; Init = WasInit; Of = WasOf; } }
+            Restore{ bParentFresh, ParentInit, ParentInitOf, bParentFresh, ParentInit, ParentInitOf };
+        if (Archetype)
+            bParentFresh = ValueFreshFrom(Archetype, F->value("id", std::string()), ParentInit, ParentInitOf);
+        if (!LowerDefault(*F, PD, BP, Err, Init, bKeepZero || Archetype)) return false;
         Out.push_back(PD);
     }
     return true;
 }
 
-/* Only a field the braces name is written: the rest stay the CDO's. */
+/* Only a field the braces name is written: the rest stay the CDO's. The export is made with the CDO as its archetype
+   (FObjectInitializer::InitProperties copies it in, UObjectGlobals.cpp 2999), so every value is written over the CDO's,
+   as a UE_DEFAULTS statement's is over its parent's (BracedMembers' Archetype). */
 bool FCompiler::GenerateAsset(const Json& Var, const std::string& OutDir, std::string* Err)
 {
     const FRecord* R = Find(StripTypeKeywords(TypeOf(Var)));
@@ -10898,7 +12951,7 @@ bool FCompiler::GenerateAsset(const Json& Var, const std::string& OutDir, std::s
     FBlueprintClass BP(P, AssetName, "", "", false);
 
     std::vector<FPropertyDef> Set;
-    if (!BracedMembers(*BracedInit(Var), *R, AssetName, BP, false, Set, Err)) return false;
+    if (!BracedMembers(*BracedInit(Var), *R, AssetName, BP, false, Set, Err, R)) return false;
     for (const FPropertyDef& PD : Set) BP.AddVariable(PD);
 
     const std::string ClassPkg = PackageOf(*R), ClassName = ClassOf(*R);
@@ -12290,6 +14343,17 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
 {
     const FRecord* B = Find(R.Base);
     if (!B) { *Err = R.CppName + " derives from an undeclared class: " + R.Base; return false; }
+    /* A game Blueprint parent's default subobjects, which this class is serialized after, and its tail are what
+       genueapi --game reads off the game's packages. A UeApi made without it has neither, and this class would compile
+       without a word and load before its parent's subobjects. */
+    if (!UeApiWithoutGame.empty() && B->IsNative() && PackageOf(*B).compare(0, 6, "/Game/") == 0)
+    {
+        *Err = R.CppName + " derives from the game Blueprint " + ClassOf(*B) + ", but " + UeApiWithoutGame
+               + " was generated without --game, so it does not list the default subobjects that Blueprint's default "
+                 "object exports, which this class must load after - regenerate it with AssetGen/tools/genueapi.py "
+                 "<SDK dir> <UeApi dir> --game <extracted Content dir>";
+        return false;
+    }
     Cur = &R;
 
     const std::string PackageName = PackageOf(R);
@@ -12316,7 +14380,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
        refuse the class, as they do one the editor marks Generate Abstract Class. An interface's `= 0` does not count,
        since an implementer that leaves it out gets a stub, and clang's own isAbstract never reaches here (FAstSax). */
     if (!CheckMemberNames(R, Err)) return false;
-    bool bAbstract = false;
+    bool bAbstract = !R.FinalAs.empty();        // UE_FINAL_AS: only the leaf is ever made
     std::set<std::string> Nearest;
     for (const FRecord* A = &R; A; A = A->Base.empty() ? nullptr : Find(A->Base))
         for (const auto& [Method, Decl] : A->Methods)
@@ -12445,6 +14509,14 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             const FRecord* DR = Find(OwnerOf(*Parent));
             const bool bBlueprint = DR && (!DR->IsNative() || (DR->UeName.size() > 2 && DR->UeName.compare(DR->UeName.size() - 2, 2, "_C") == 0));
             if (!DR) { *Err = Where + ": cannot tell which class declares " + Of; return false; }
+            /* AActor's RootComponent: the actor's root, whichever component that is - the one a constructor's call finds
+               there. It is no default subobject a node could name; a node naming no parent goes under it (bRoot). */
+            if (DR->IsNative() && DR->UeName == "Actor" && UeNameOf(DR, Of) == "RootComponent")
+            {
+                A.bRoot = true;
+                Attachments[Comp] = A;
+                return true;
+            }
             if (DR == &R || bBlueprint)
             {
                 /* This class's: one of its own node's ChildNodes. An ancestor Blueprint's: a root node naming that node's
@@ -12529,6 +14601,10 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 /* Zero is a real value here: an archetype deltas against the component CDO (where
                    bVisible is already true) and an inherited property against the parent's CDO,
                    not against the type's zero the way a fresh class variable does. */
+                bParentFresh = !bThroughComponent && ParentValueFresh(R, *Lhs, ParentInit, ParentInitOf);
+                struct FUnset { bool& Flag; const Json*& Init; const FRecord*& Of;
+                                ~FUnset() { Flag = false; Init = nullptr; Of = nullptr; } }
+                    UnsetParentFresh{ bParentFresh, ParentInit, ParentInitOf };
                 if (!LowerDefault(*Lhs, PD, BP, Err, Rhs, /*bKeepZero=*/true)) { bOk = false; return; }
                 if (PD.Default.K == FDefaultValue::None)
                 { *Err = Where + ": " + Name(*Lhs) + " needs a literal value"; bOk = false; return; }
@@ -12564,7 +14640,16 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                         break;
                     }
                 }
-                if (!bThroughComponent) { InheritedDefaults.push_back(PD); return; }
+                /* A statement is the member's whole new value, as an assignment is in C++: one before it on the same
+                   member is gone, not a tag under this one's (whose left-out members would load its values). */
+                if (!bThroughComponent)
+                {
+                    InheritedDefaults.erase(std::remove_if(InheritedDefaults.begin(), InheritedDefaults.end(),
+                                                           [&](const FPropertyDef& P) { return P.Name == PD.Name; }),
+                                            InheritedDefaults.end());
+                    InheritedDefaults.push_back(PD);
+                    return;
+                }
                 if (DR == &R) { ComponentDefaults[CompName].push_back(PD); return; }
                 /* A native parent's component is a default subobject, not an SCS node: it is
                    overridden by an export under this class's CDO, with no handler involved. */
@@ -12618,22 +14703,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
        would need its own, so that is only warned about. ponytail: a negative scale takes FTransform's matrix path
        and an absolute child ignores its parent; neither is special-cased here. */
     {
-        auto IsScene = [&](const FRecord* C) {
-            for (; C; C = C->Base.empty() ? nullptr : Find(C->Base)) if (C->UeName == "SceneComponent") return true;
-            return false;
-        };
-        /* No root of this class's in a subclass whose actor already has one when its SCS runs: a Blueprint parent's SCS
-           always leaves one (SimpleConstructionScript.cpp 690-702), and a native parent sets one in its constructor
-           (Character.cpp 59) or ExecuteConstruction takes its first unattached native scene component (ActorConstruction.cpp
-           736-746). The first own scene component then attaches under it (ExecuteScriptOnActor, 686) and keeps its
-           transform like the rest. */
-        bool bRootInherited = false;
-        for (const FRecord* A = R.Base.empty() ? nullptr : Find(R.Base); A && !bRootInherited; A = A->Base.empty() ? nullptr : Find(A->Base))
-        {
-            bRootInherited = !A->IsNative() || (A->UeName.size() > 2 && A->UeName.compare(A->UeName.size() - 2, 2, "_C") == 0);
-            for (const auto& [Member, Spec] : A->Subobjects)
-                bRootInherited = bRootInherited || (Spec.rfind('.') != std::string::npos && IsScene(Find("U" + Spec.substr(Spec.rfind('.') + 1))));
-        }
+        auto IsScene = [&](const FRecord* C) { return IsSceneRecord(C); };
+        const bool bRootInherited = RootInheritedBy(R);
         BP.SetRootInherited(bRootInherited);      // and its DefaultSceneRoot node is listed nowhere
         std::vector<std::pair<std::string, const FRecord*>> Scene;     // the root, then the components attached to it
         for (const Json* F : R.Fields)
@@ -12643,12 +14714,14 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             if (R.Components.count(Name(*F)) && IsScene(CR)) Scene.emplace_back(Name(*F), CR);
         }
         /* SetupAttachment takes a component off the root: under another of this class's, which passes the root's
-           transform on to it, or under an inherited one. The root is the first scene component it leaves alone. */
+           transform on to it, or under an inherited one. The root is the first scene component it leaves alone; one
+           attached to RootComponent is never it, and hangs from it directly. With none left, the root is the
+           DefaultSceneRoot node's, which has no transform to pass on (RootName empty). */
         const auto RootAt = std::find_if(Scene.begin(), Scene.end(), [&](const auto& S) { return !Attachments.count(S.first); });
         const std::string RootName = RootAt == Scene.end() ? std::string() : RootAt->first;
         Scene.erase(std::remove_if(Scene.begin(), Scene.end(), [&](const auto& S) {
             const auto At = Attachments.find(S.first);
-            return At != Attachments.end() && !(At->second.bOwn && At->second.Parent == RootName);
+            return At != Attachments.end() && !At->second.bRoot && !(At->second.bOwn && At->second.Parent == RootName);
         }), Scene.end());
         std::stable_partition(Scene.begin(), Scene.end(), [&](const auto& S) { return S.first == RootName; });
         /* A component's vector default: X, Y, Z (Or each, when it has none), and the def to write another like it. */
@@ -12703,7 +14776,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             for (double& A : Out) A += 0.0;     // no -0 in the cooked float
             return Out;
         };
-        if (!Scene.empty() && !bRootInherited)
+        if (!RootName.empty() && !bRootInherited)
         {
             std::vector<FPropertyDef>& RootDefs = ComponentDefaults[Scene[0].first];
             const FVec Lr = Read(RootDefs, "RelativeLocation", 0), Rr = Read(RootDefs, "RelativeRotation", 0),
@@ -12788,10 +14861,11 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         }
 
         /* CPF_Parm would make it part of the call frame; CPF_BlueprintReadOnly would forbid assignment -
-           except on a `const` field, where the source forbids it anyway, so the flag is the truth. */
+           except on a `const` field, where the source forbids it anyway, and a UE_READONLY (`mutable`) one, whose
+           writes are warned about. */
         PD.PropertyFlags = (PD.PropertyFlags & ~uint64(CPF_Parm | CPF_BlueprintReadOnly))
                          | CPF_Edit | CPF_BlueprintVisible | CPF_DisableEditOnInstance;
-        if (TypeOf(*F).compare(0, 6, "const ") == 0) PD.PropertyFlags |= CPF_BlueprintReadOnly;
+        if (TypeOf(*F).compare(0, 6, "const ") == 0 || F->value("mutable", false)) PD.PropertyFlags |= CPF_BlueprintReadOnly;
         /* A member that refers to a component or holds one is instanced, and then so is the class, or instancing never
            looks at it (KismetCompiler.cpp 2521-2529). */
         FlagInstancing(TypeOf(*F), PD);
@@ -12872,6 +14946,37 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             bReplicatesAnything = true;
         }
         AddVariable(TypeOf(*F), PD);
+    }
+    /* Where the SCS lists its DefaultSceneRoot node, the class has a variable of that name, as the editor gives every node
+       it lists one (KismetCompiler.cpp 884-898; ENE_EnemySpawner's DefaultSceneRoot, BlueprintVisible | NonTransactional
+       | InstancedReference): ExecuteNodeOnActor stores the component there, and with none logs on every spawn that it
+       found no such property (SCS_Node.cpp 159-178). First, where the editor's sits among the class's variables.
+       A member of that name here would be a second variable of one name, and one below a mod class that lists the node
+       would hide that class's (an object property is the one ExecuteNodeOnActor finds first and stores the root in,
+       SCS_Node.cpp 164; any other is a variable named like a super's, which the editor renames, member_names_distinct).
+       Where neither lists it, a member of that name is a member like any other: no variable of the engine's has it. */
+    const FRecord* RootLister = nullptr;
+    for (const FRecord* A = R.Base.empty() ? nullptr : Find(R.Base); A && !RootLister; A = A->Base.empty() ? nullptr : Find(A->Base))
+        if (!A->IsNative() && ListsDefaultRootOf(*A)) RootLister = A;
+    for (const auto& V : ClassVars)
+    {
+        if (Lower(V.second.Name) != "defaultsceneroot") continue;
+        if (BP.ListsDefaultRoot())
+        { *Err = R.CppName + "::" + V.second.Name + ": DefaultSceneRoot is the variable of the root an actor's construction "
+                 "script adds, and this class has no scene component of its own left to be that root; rename it"; return false; }
+        if (RootLister)
+        { *Err = R.CppName + "::" + V.second.Name + ": DefaultSceneRoot is the variable of the root " + RootLister->CppName
+                 + "'s construction script adds, which a variable of that name here would hide; rename it"; return false; }
+    }
+    if (BP.ListsDefaultRoot())
+    {
+        FPropertyDef PD;
+        if (!TypeToProperty("USceneComponent *", "DefaultSceneRoot", 0, "the DefaultSceneRoot variable", BP, &PD, Err)) return false;
+        PD.PropertyFlags = (PD.PropertyFlags & ~uint64(CPF_Parm | CPF_BlueprintReadOnly)) | CPF_BlueprintVisible | CPF_NonTransactional;
+        FlagInstancing("USceneComponent *", PD);
+        if (PD.PropertyFlags & CPF_InstancedReference) BP.AddClassFlags(CLASS_HasInstancedReference);
+        PD.bApiHidden = true;       // the editor stub's PostLoad makes the node, and the editor's compile its variable
+        ClassVars.insert(ClassVars.begin(), { 8, PD });
     }
     std::stable_sort(ClassVars.begin(), ClassVars.end(), [](const auto& A, const auto& B) { return A.first > B.first; });
     for (const auto& V : ClassVars) BP.AddVariable(V.second);
@@ -13013,9 +15118,61 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                        "function of that name; rename this one";
                 return false;
             }
-        /* `= 0` with no body anywhere is an empty function, like an interface's stub below: a subclass's version needs
+        /* A function of a mod ancestor's name is an override of it to the editor, a static too: its super is
+           ParentClass->FindFunctionByName (KismetCompiler.cpp 1733-1774), and an override must agree with it on Static
+           ("Check flags: Exec, Final, Static", 1855-1868). C++ only hides the one above, so one that does not agree is
+           refused. A static over a static splits no caller - every call to either is bound - and keeps it as its super
+           (FindEvent). Another mod's class, from the header it shares, is a mod ancestor too: its declarations say
+           which of its functions are static. A native ancestor's is Generate's below: no function replaces one that is
+           no Blueprint event. */
+        if (const auto [A, bAboveStatic] = FoundAbove(R, Fn.Name);
+            A && A->UePackage.compare(0, 8, "/Script/") != 0 && bAboveStatic != IsStaticDecl(*Fn.Decl))
+        {
+            const FRecord* Listed = nullptr;
+            for (const std::string& I : R.Interfaces)
+                for (const FRecord* IR : InterfaceChain(Find(I)))
+                    if (!Listed && IR && IR->Methods.count(Fn.Name)) Listed = IR;
+            if (!bAboveStatic)
+                *Err = R.CppName + "::" + Fn.Name + " is static, and the " + A->CppName + "::" + Fn.Name + " it hides is not: "
+                       "the editor takes it for an override of that one, which a static cannot be (\"Check flags: Exec, "
+                       "Final, Static\"); rename this one";
+            else if (Listed)
+                *Err = R.CppName + " implements " + Listed->CppName + ", whose " + Fn.Name + " " + R.CppName + "::" + Fn.Name
+                     + " implements, and the " + A->CppName + "::" + Fn.Name + " it inherits is static: the editor takes "
+                       "such a function for an override of the static and refuses it (\"Check flags: Exec, Final, "
+                       "Static\"); rename " + A->CppName + "::" + Fn.Name;
+            else
+                *Err = R.CppName + "::" + Fn.Name + ": " + A->CppName + "::" + Fn.Name + " is static, and the editor takes "
+                       "a function of that name in a subclass for an override of it, which only a static can be (\"Check "
+                       "flags: Exec, Final, Static\"); rename this one";
+            return false;
+        }
+        /* A static over a static is C++ name hiding, which no Blueprint writes: the editor's entry naming the parent's
+           function, no BlueprintEvent, "cannot be overridden" (KismetCompiler.cpp 3312-3316). It splits no caller, so
+           it compiles with a warning, its super the one it hides as FindFunctionByName gives it; but a super of other
+           parameters is a link no editor makes (IsSignatureCompatibleWith, 1993-2011), so one of another signature is
+           refused. Only a function this class compiles counts: UE_CLASS's StaticClass is in every class, and no
+           UFunction.
+           `= 0` with no body anywhere is an empty function, like an interface's stub below: a subclass's version needs
            it as its super, and a call by name on an object without one would not find a function (a Fatal). */
-        if ((Fn.Body = BodyOf(R, Fn.Name, Fn.Def)) || Fn.Decl->value("pure", false)) Methods.push_back(Fn);
+        const bool bCompiled = (Fn.Body = BodyOf(R, Fn.Name, Fn.Def)) || Fn.Decl->value("pure", false);
+        if (const auto [A, bAboveStatic] = FoundAbove(R, Fn.Name); bCompiled && Fn.Name != "StaticClass"
+            && A && A->UePackage.compare(0, 8, "/Script/") != 0 && bAboveStatic && IsStaticDecl(*Fn.Decl))
+        {
+            const Json& Above = *A->Methods.at(Fn.Name);
+            if (SignatureOf(Above) != SignatureOf(*Fn.Decl))
+            {
+                *Err = R.CppName + "::" + Fn.Name + " is static and hides " + A->CppName + "::" + Fn.Name + ", a static of "
+                       "another signature, " + TypeOf(Above) + " against " + TypeOf(*Fn.Decl) + ": a Blueprint class has "
+                       "one function of a name, and the editor makes the parent's its super, which takes the same "
+                       "parameters; rename this one";
+                return false;
+            }
+            printf("  warning: %s::%s hides %s::%s, a static: compiled as C++ name hiding, each call running the one it "
+                   "names; the editor refuses a function named like its parent's (\"cannot be overridden\")\n",
+                   R.CppName.c_str(), Fn.Name.c_str(), A->CppName.c_str(), Fn.Name.c_str());
+        }
+        if (bCompiled) Methods.push_back(Fn);
     }
     /* The editor compiles every Blueprint-implementable function of an implemented interface, a stub
        where the Blueprint has none (KismetCompiler.cpp MergeUbergraphPagesIn, ConformImplementedInterfaces);
@@ -13023,7 +15180,37 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
        so its stubs are empty. BlueprintEvent is the flag, not the editor's event node: a function that
        returns a value has it too (Targetable::GetIsTargetable) and the editor implements it as a function
        graph. Only a native-only function lacks it, which UHT allows just under
-       CannotImplementInterfaceInBlueprint (HeaderParser.cpp:7538). */
+       CannotImplementInterfaceInBlueprint (HeaderParser.cpp:7538).
+       A function the class inherits from a class above this source cooks implements it in C++, and a stub would
+       replace that body for every caller: SynthesizeForwarders declared an override calling it in its place wherever
+       one can, and the class is refused where none can.
+       A static is refused for another reason. It implements no interface function and its callers are bound to it, so
+       a stub would take over none of them; but the editor makes any function of its name in a subclass, the stub or
+       one the source declares, an override of it (its super is ParentClass->FindFunctionByName, KismetCompiler.cpp
+       1733-1774) and refuses one that is not static: "Check flags: Exec, Final, Static" (1855-1868). */
+    auto ReplacesInherited = [&](const std::string& I, const std::string& Fn, const Json& IfaceDecl) {
+        const FRecord* A = InheritedImplementation(R, Fn);
+        const std::string Why = A ? WhyNotForwarded(*A, Fn, IfaceDecl) : std::string();
+        if (Why.empty()) return false;
+        if (IsStaticDecl(*A->Methods.at(Fn)))
+            *Err = R.CppName + " implements " + I + ", whose " + Fn + " needs a function of that name in " + R.CppName
+                 + ", and the " + A->CppName + "::" + Fn + " it inherits is static: the editor takes such a function for "
+                   "an override of the static and refuses it (\"Check flags: Exec, Final, Static\"); rename "
+                 + A->CppName + "::" + Fn;
+        else if (Why == "final")
+            *Err = R.CppName + " implements " + I + ", whose " + Fn + " needs a function of that name in " + R.CppName
+                 + ", and the " + A->CppName + "::" + Fn + " it inherits is final, so no subclass may have one; rename "
+                 + A->CppName + "::" + Fn + ", or drop `final`";
+        else if (Why == TypeOf(*A->Methods.at(Fn)))
+            *Err = R.CppName + " implements " + I + ", whose " + Fn + " is " + TypeOf(IfaceDecl) + ", and the " + A->CppName
+                 + "::" + Fn + " it inherits is " + Why + ": a Blueprint class has one function of a name, and callers "
+                   "through " + I + " pass that one's parameters; rename " + A->CppName + "::" + Fn;
+        else
+            *Err = R.CppName + " implements " + I + ", and the " + A->CppName + "::" + Fn + " it inherits is " + Why
+                 + ": no override can call it for " + I + ", and an empty one would replace it; declare " + R.CppName
+                 + "::" + Fn;
+        return true;
+    };
     for (const std::string& Listed : R.Interfaces)
     for (const FRecord* Link : InterfaceChain(Find(Listed)))        // the interfaces it extends are implemented too
     {
@@ -13038,6 +15225,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             {
                 if (std::any_of(Methods.begin(), Methods.end(),
                                 [&](const FMethod& F) { return F.Name == M.first; })) continue;
+                if (ReplacesInherited(I, M.first, *M.second)) return false;
                 FMethod Fn{ M.first, M.second, M.second, nullptr };
                 Fn.Body = BodyOf(IR, M.first, Fn.Def);
                 Methods.push_back(Fn);
@@ -13056,6 +15244,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             auto Decl = IR.Methods.find(Name_);
             if (Decl == IR.Methods.end())
             { *Err = I + "::" + Name_ + " takes a type AssetGen cannot write yet, so " + R.CppName + " cannot implement " + I; return false; }
+            if (ReplacesInherited(I, Name_, *Decl->second)) return false;
             FMethod Fn{ Name_, Decl->second, Decl->second, nullptr };
             Fn.Body = BodyOf(IR, Name_, Fn.Def);
             Methods.push_back(Fn);
@@ -13357,12 +15546,45 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         if (Replaced && Replaced != &Decl && !R.bIsPatch && SignatureOf(*Replaced) != SignatureOf(Decl))     // a patch checks its own
         { *Err = R.CppName + "::" + Fn.Name + " is " + TypeOf(Decl) + ", and the " + Owner->CppName + "::" + Fn.Name
                  + " it replaces is " + TypeOf(*Replaced) + ": callers pass that one's parameters; declare the same"; return false; }
+        /* An implementation of an interface of the class's own list, its own function or the stub of one it leaves out,
+           whose name a mod ancestor's function has too, that one's own or the stub of another interface's it leaves
+           out: that one is its super (FindEvent), so it replaces both, and a caller of either lays out that one's
+           parameters. The editor refuses it: "Cannot override ... declared in a parent with a different signature"
+           (KismetCompiler.cpp 1993-2011). Another mod's class, from the header it shares, is such an ancestor too: its
+           declarations give the signature, as for the static rule above. */
+        if (Replaced && Owner && Owner->bIsInterface && !R.bIsPatch)
+            if (const auto [A, bStatic] = FoundAbove(R, Fn.Name);
+                A && A != Owner && A->UePackage.compare(0, 8, "/Script/") != 0 && !bStatic)
+            {
+                const FRecord* AboveIface = A->Methods.count(Fn.Name) ? nullptr : ModInterfaceWith(*A, Fn.Name);
+                const Json* AboveDecl = AboveIface ? AboveIface->Methods.at(Fn.Name)
+                                      : A->Methods.count(Fn.Name) ? A->Methods.at(Fn.Name) : nullptr;     // else a native interface's
+                const Json& Above = AboveDecl ? *AboveDecl : Decl;
+                if (SignatureOf(Above) != SignatureOf(Decl))
+                {
+                    *Err = (Replaced == &Decl ? R.CppName + " implements " + Owner->CppName + ", whose " + Fn.Name + " is "
+                                                + TypeOf(Decl)
+                                              : R.CppName + "::" + Fn.Name + " implements " + Owner->CppName + "::" + Fn.Name
+                                                + ", " + TypeOf(*Replaced))
+                         + ", and replaces "
+                         + (AboveIface ? "the " + Fn.Name + " of " + AboveIface->CppName + ", " + TypeOf(Above) + ", that "
+                                         + A->CppName + " implements"
+                                       : "the " + A->CppName + "::" + Fn.Name + " it inherits, " + TypeOf(Above))
+                         + ": a Blueprint function has one signature, and callers of each pass that one's parameters; "
+                           "rename one of them";
+                    return false;
+                }
+            }
         uint32 Flags = Inherited ? Inherited & kOverrideInherits
                      : IsStaticDecl(Decl) ? uint32(FUNC_Static | FUNC_BlueprintCallable | FUNC_Public | FUNC_Final)
                      : kPlainMethodFlags;
         /* `final`, the class or the method: no subclass has a version of its own, and calls are bound to this one
-           (LowerCall). Without BlueprintEvent the editor offers no override either (CanKismetOverrideFunction). */
-        if (!Inherited && !IsStaticDecl(Decl) && (R.bFinal || R.FinalMethods.count(Fn.Name)))
+           (LowerCall). Without BlueprintEvent the editor offers no override either (CanKismetOverrideFunction). An
+           implementation of a mod interface the class lists itself has no inherited flags (FindEvent: no super) and is
+           no new function: it keeps the contract of the interface's, BlueprintEvent and not Final (func_override_flags),
+           as in any class, and calls to it go by name (IsFinalFunction). */
+        if (!Inherited && !IsStaticDecl(Decl) && (R.bFinal || !R.FinalAs.empty() || R.FinalMethods.count(Fn.Name))
+            && !ModInterfaceWith(R, Fn.Name))
             Flags = (Flags & ~uint32(FUNC_BlueprintEvent)) | FUNC_Final;
         /* All 7229 BlueprintPure functions in the DRG dump are BlueprintCallable too. */
         /* Its own access specifier, where no parent decides. The editor refuses a call node it forbids; the VM checks
@@ -13719,7 +15941,7 @@ private:
 
 /* Builds the DOM of clang's AST dump as it streams in, without what nothing reads: source locations (all but a
    DeclRefExpr's or MemberExpr's range begin offset and token length, and its end's in a macro, see NamedQualifier and
-   MemberQualifier), mangled names, a record's definitionData and
+   MemberQualifier, and a braced value's whole range, see IsUnsetInit), mangled names, a record's definitionData and
    a few flags are most of the dump, and building them was most of a compile. A key read later must be in neither
    DroppedAstKey nor key()'s own rules. */
 class FAstSax : public nlohmann::json_sax<Json>
@@ -13734,7 +15956,9 @@ public:
     bool number_float(number_float_t V, const string_t&) override { return Value(V); }
     bool string(string_t& V) override
     {
-        if (bKindNext && !Skipped) DeclRef.back() = V == "DeclRefExpr" || V == "MemberExpr";   // "kind" comes before "range"
+        if (bKindNext && !Skipped)          // "kind" comes before "range"
+            Ranged.back() = V == "DeclRefExpr" || V == "MemberExpr" ? ERange::Begin
+                          : V == "InitListExpr" || V == "CXXConstructExpr" ? ERange::Whole : ERange::None;
         return Value(std::move(V));
     }
     bool binary(binary_t& V) override { return Value(std::move(V)); }
@@ -13745,16 +15969,21 @@ public:
     bool key(string_t& K) override
     {
         if (Skipped) return true;
-        /* A spellingLoc only gets here inside a DeclRefExpr's or MemberExpr's range (every other loc and range is skipped whole); the
-           range's end is kept only then, for a qualifier written in a macro (NamedQualifier). */
+        /* A spellingLoc only gets here inside a range kept (every other loc and range is skipped whole). A DeclRefExpr's
+           or MemberExpr's end is kept only for a qualifier written in a macro (NamedQualifier); a braced value's, always:
+           IsUnsetInit tells a `{}` written from a member the braces leave out by it. */
         const bool bMacroEnd = K == "end" && Stack.back()->is_object() && Stack.back()->contains("begin")
                             && (*Stack.back())["begin"].contains("spellingLoc");
+        const bool bWholeEnd = K == "end" && Ranged.size() >= 2 && Ranged[Ranged.size() - 2] == ERange::Whole;
         /* A variable's use flags stay: Run refuses a used UE_ASSET_AT that cannot load. A method's isImplicit stays: the
-           operator= clang declares up front in a class with a virtual is no Blueprint function. "kind" comes before them. */
-        bSkipNext = (bFrozenKeys ? FrozenDroppedAstKey(K) : DroppedAstKey(K)) || (K == "end" && !bMacroEnd)
-                 || (K == "isImplicit" && Stack.back()->value("kind", std::string()) != "CXXMethodDecl")
+           operator= clang declares up front in a class with a virtual is no Blueprint function. So does a constructor's:
+           clang adds one to a struct only value-initialised, whose header declares none (DeclaresCtor). "kind" comes
+           before them. */
+        bSkipNext = (bFrozenKeys ? FrozenDroppedAstKey(K) : DroppedAstKey(K)) || (K == "end" && !bMacroEnd && !bWholeEnd)
+                 || (K == "isImplicit" && Stack.back()->value("kind", std::string()) != "CXXMethodDecl"
+                     && Stack.back()->value("kind", std::string()) != "CXXConstructorDecl")
                  || ((K == "isUsed" || K == "isReferenced") && Stack.back()->value("kind", std::string()) != "VarDecl")
-                 || (K == "range" && !DeclRef.back());
+                 || (K == "range" && Ranged.back() == ERange::None);
         bKindNext = K == "kind";
         if (!bSkipNext) Slot = &(*Stack.back())[std::move(K)];
         return true;
@@ -13762,10 +15991,13 @@ public:
     bool parse_error(size_t, const std::string&, const nlohmann::detail::exception&) override { return false; }
 
 private:
+    /* What of an open node's range is kept: none, its begin (a DeclRefExpr or MemberExpr), or the whole range (a braced
+       value: an InitListExpr or CXXConstructExpr). */
+    enum class ERange : uint8 { None, Begin, Whole };
     Json& Root;
     const bool bFrozenKeys;         // astcheck's reference parse
     std::vector<Json*> Stack;       // the open objects and arrays being filled
-    std::vector<bool> DeclRef;      // per open object or array: a DeclRefExpr, whose range is kept
+    std::vector<ERange> Ranged;     // per open object or array: what of its range is kept
     Json* Slot = nullptr;           // the object member the last key named
     int32 Skipped = 0;              // depth inside a dropped object or array
     bool bSkipNext = false;         // the next value is a dropped key's
@@ -13786,14 +16018,14 @@ private:
     bool Open(Json::value_t T)
     {
         if (Skipped || bSkipNext) ++Skipped;
-        else { Stack.push_back(Place(Json(T))); DeclRef.push_back(false); }
+        else { Stack.push_back(Place(Json(T))); Ranged.push_back(ERange::None); }
         bSkipNext = bKindNext = false;
         return true;
     }
     bool Close()
     {
         if (Skipped) --Skipped;
-        else { Stack.pop_back(); DeclRef.pop_back(); }
+        else { Stack.pop_back(); Ranged.pop_back(); }
         return true;
     }
 };
@@ -14265,10 +16497,11 @@ bool FCompiler::LoadTables(const std::string& IncludeDir, std::string* Err)
         if (Out->is_discarded()) { *Err = std::string("missing or invalid ") + IncludeDir + "/" + File + " (run genueapi.py)"; return false; }
         return true;
     };
-    Json ConvDoc, OpsDoc, TypesDoc, EventsDoc;
+    Json ConvDoc, OpsDoc, TypesDoc, EventsDoc, NotCallableDoc;
     if (!Load("Conv.json", &ConvDoc) || !Load("Ops.json", &OpsDoc) || !Load("Types.json", &TypesDoc)
-        || !Load("Events.json", &EventsDoc)) return false;
+        || !Load("Events.json", &EventsDoc) || !Load("NotCallable.json", &NotCallableDoc)) return false;
     for (auto It = EventsDoc.begin(); It != EventsDoc.end(); ++It) EventFlags[It.key()] = It->get<uint32>();
+    for (const Json& Key : NotCallableDoc) NotCallable.insert(Key.get<std::string>());
     const Json OutArraysDoc = Json::parse(ReadText(IncludeDir + "/OutArrays.json"), nullptr, false);
     if (OutArraysDoc.is_object())
         for (auto It = OutArraysDoc.begin(); It != OutArraysDoc.end(); ++It)
@@ -14308,7 +16541,36 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     ApiDir = InApiDir;
     std::error_code TmpEc;
     /* Absolute: a bare "Mod.cpp" has an empty parent, and NamedQualifier cannot list "". */
-    SourceDir = std::filesystem::absolute(SourcePath, TmpEc).parent_path().string();
+    SourceFile = std::filesystem::absolute(SourcePath, TmpEc).string();
+    SourceDir = std::filesystem::path(SourceFile).parent_path().string();
+    /* First we check what wrote the UeApi: one older than this compiler compiles without a word wrong (one made before
+       UeDefaultSubobjects orders a game Blueprint's child after none of its parent's subobjects), and the merge of a
+       genueapi change carries the tracked Types.json but not the ignored headers. genueapi writes Version.json last, so
+       a run that stopped halfway has none either. Bump with genueapi.py's GENUEAPI_VERSION (2: "game"; 3: the native
+       dispatchers' marks, NotCallable.json, TEnum spellings). */
+    constexpr int32 UeApiVersion = 3;
+    const Json Stamp = Json::parse(ReadText(IncludeDir + "/Version.json"), nullptr, false);
+    const int32 Stamped = Stamp.is_object() && Stamp.contains("genueapi") && Stamp["genueapi"].is_number_integer()
+                              ? Stamp["genueapi"].get<int32>() : 0;
+    /* A folder with no stamp and none of genueapi's tables either is no UeApi at all (a mod folder, a path that does not
+       exist): said as LoadTables says it, not as one an older genueapi wrote. */
+    if (Stamp.is_discarded() && !std::filesystem::exists(IncludeDir + "/Types.json", TmpEc)
+        && !std::filesystem::exists(IncludeDir + "/Conv.json", TmpEc))
+    {
+        *Err = "missing or invalid " + IncludeDir + "/Conv.json (run genueapi.py)";
+        return false;
+    }
+    if (Stamped < UeApiVersion)
+    {
+        *Err = IncludeDir + " was written by an older genueapi (" + (Stamped ? "version " + std::to_string(Stamped)
+               : std::string("no Version.json")) + ", this assetgen needs version " + std::to_string(UeApiVersion)
+               + ") - regenerate it with AssetGen/tools/genueapi.py";
+        return false;
+    }
+    /* Then whether genueapi read the game's packages (--game): without them a game Blueprint's header has no
+       UeDefaultSubobjects and no UeClassTail, which reads the same as a Blueprint with none of either. */
+    UeApiWithoutGame = Stamp.contains("game") && Stamp["game"].is_boolean() && Stamp["game"].get<bool>() ? std::string()
+                                                                                                          : IncludeDir;
     if (!ParseClangAst(ClangCommand(SourcePath, IncludeDir), SourcePath, &Doc, Err)) return false;
 
     if (!LoadTables(IncludeDir, Err)) return false;

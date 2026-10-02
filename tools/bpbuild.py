@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """usage: bpbuild.py <mods dir (holds mods.yaml) or a parent with BpMods/> <UeApi dir> <assetgen executable> [--force] [--no-pak]"""
+import glob
 import io
 import os
 import re
 import shutil
 import subprocess
 import sys
+import uuid
 
 import yaml
 
@@ -29,12 +31,41 @@ def oldest(paths):
     return min(times) if times else 0
 
 
-def mod_package(source):
-    text = io.open(source, encoding="utf-8-sig", errors="replace").read()
-    m = MOD_PACKAGE.search(text)
-    if not m:
-        sys.exit("%s declares no UE_MOD_PACKAGE" % source)
-    return m.group(1)
+def mod_package(sources):
+    """The first UE_MOD_PACKAGE among a mod's sources - any one .cpp of a multi-file mod may carry it."""
+    for source in sources:
+        if source.endswith(".cpp"):
+            m = MOD_PACKAGE.search(io.open(source, encoding="utf-8-sig", errors="replace").read())
+            if m:
+                return m.group(1)
+    sys.exit("%s declares no UE_MOD_PACKAGE" % ", ".join(s for s in sources if s.endswith(".cpp")))
+
+
+INCLUDE = re.compile(r'^\s*#\s*include\s*"([^"]+)"', re.M)
+GENERATED = ("UeApi", "UeAssets")  # dumped headers: thousands of files, covered by toolchain_time instead
+
+
+def mod_sources(mod, bp):
+    """A mod's `sources`, globs expanded (`Foo/*.cpp`), plus every local header they #include, transitively,
+    so a mod lists its .cpp files only. An entry naming nothing comes back as-is, for the caller's missing check."""
+    out = []
+    for entry in mod.get("sources") or []:
+        path = os.path.join(bp, entry)
+        out += sorted(glob.glob(path)) if glob.has_magic(entry) else [path]
+    seen = set(os.path.normcase(os.path.abspath(p)) for p in out)
+    todo = [p for p in out if os.path.exists(p)]
+    while todo:
+        src = todo.pop()
+        for inc in INCLUDE.findall(io.open(src, encoding="utf-8-sig", errors="replace").read()):
+            path = os.path.abspath(os.path.join(os.path.dirname(src), inc))
+            key = os.path.normcase(path)
+            if any(g.lower() in key.split(os.sep) for g in GENERATED):
+                continue
+            if key not in seen and os.path.exists(path):
+                seen.add(key)
+                out.append(path)
+                todo.append(path)
+    return out
 
 
 def order(mods):
@@ -129,7 +160,7 @@ def content_dir(stage_fsd, package):
 def dep_stage(dep, by_name, bp):
     """Where dep's cooked assets sit - the import path (its UE_MOD_PACKAGE) plus its build dir,
     both known from the manifest, so nothing needs threading through the build loop."""
-    package = mod_package(os.path.join(bp, by_name[dep]["sources"][0]))
+    package = mod_package(mod_sources(by_name[dep], bp))
     fsd = os.path.join(bp, "build", dep, "FSD")
     return content_dir(fsd, package), package, fsd
 
@@ -254,6 +285,18 @@ def write_vs_filters(bp):
             rows.append(("ClCompile", f, "Tests" if f.endswith("Test.cpp") else "Mods"))
         elif f.endswith(".h"):
             rows.append(("ClInclude", f, "Helpers"))
+    # A mod in its own folder (`MyMod/`) gets a filter of its own under Mods (`Mods\MyMod`), nested as the folders
+    # are. Its GUID is derived from the name, so a rewrite does not churn it.
+    filters = list(VS_FILTERS)
+    for root, dirs, files in os.walk(bp):
+        dirs[:] = sorted((d for d in dirs if root != bp or d not in ("build", "out") + GENERATED), key=str.lower)
+        if root != bp:
+            folder = "Mods\\" + os.path.relpath(root, bp)
+            filters.append((folder, str(uuid.uuid5(uuid.NAMESPACE_URL, "bpmods:" + folder.lower()))))
+            for f in sorted(files, key=str.lower):
+                if f.endswith((".cpp", ".h")):
+                    rows.append(("ClCompile" if f.endswith(".cpp") else "ClInclude",
+                                 os.path.relpath(os.path.join(root, f), bp), folder))
     # The compiler's own test mods and the headers any mod may include live beside it, in AssetGen.
     for sub, kind, ext, folder in (("tests", "ClCompile", ".cpp", "Tests"), ("include", "ClInclude", ".h", "Helpers")):
         d = os.path.join(bp, "..", "AssetGen", sub)
@@ -267,7 +310,7 @@ def write_vs_filters(bp):
     text = ('<?xml version="1.0" encoding="utf-8"?>\n'
             '<!-- Written by AssetGen/tools/bpbuild.py on every build. Do not edit. -->\n'
             '<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">\n  <ItemGroup>\n'
-            + "".join('    <Filter Include="%s"><UniqueIdentifier>{%s}</UniqueIdentifier></Filter>\n' % f for f in VS_FILTERS)
+            + "".join('    <Filter Include="%s"><UniqueIdentifier>{%s}</UniqueIdentifier></Filter>\n' % f for f in filters)
             + '  </ItemGroup>\n  <ItemGroup>\n'
             + "".join('    <%s Include="%s"><Filter>%s</Filter></%s>\n' % (kind, name, folder, kind) for kind, name, folder in rows)
             + '    <None Include="mods.yaml" />\n  </ItemGroup>\n</Project>\n')
@@ -323,14 +366,14 @@ def main():
     # so compiling is a pass of its own, separate from packing (phase 2).
     for mod in order(mods):
         name = mod["name"]
-        sources = [os.path.join(bp, s) for s in (mod.get("sources") or [])]
+        sources = mod_sources(mod, bp)
         missing = [s for s in sources if not os.path.exists(s)]
-        if not sources or missing:
-            print("%-16s SKIP - no such source: %s" % (name, ", ".join(missing) or "(none listed)"))
+        if not any(s.endswith(".cpp") for s in sources) or missing:
+            print("%-16s SKIP - no such source: %s" % (name, ", ".join(missing) or "(no .cpp listed)"))
             failed.append(name)
             continue
 
-        package = mod_package(sources[0])
+        package = mod_package(sources)
         stage_fsd = os.path.join(bp, "build", name, "FSD")
         stage_content = os.path.join(stage_fsd, "Content", *package.replace("/Game/", "").split("/"))
         assets = cooked_assets(stage_content)
@@ -372,19 +415,22 @@ def main():
                     for old in api_manifest(api_dir):
                         if os.path.exists(old):
                             os.remove(old)
-            ok = True
-            for source in sources:
-                if not source.endswith(".cpp"):
-                    continue
-                cmd = [assetgen, "compile", source, ue_api, stage_content]
-                if api_content:
-                    cmd += ["--api", api_content]
-                if game_dir:
-                    cmd += ["--game", game_dir]
-                proc = subprocess.run(cmd)
-                if proc.returncode != 0:
-                    ok = False
-                    break
+            # One translation unit per mod: compiled apart, every .cpp would re-cook each class of the headers
+            # they share, the last one's copy winning with only its own bodies. So several .cpp files compile as
+            # a generated file that #includes them all - each still resolves its quoted includes from its own folder.
+            # ponytail: a unity build, so file-local names (static, anonymous namespaces) must not clash across files.
+            cpps = [s for s in sources if s.endswith(".cpp")]
+            unit = cpps[0]
+            if len(cpps) > 1:
+                unit = os.path.join(bp, "build", name, name + ".unity.cpp")
+                io.open(unit, "w", encoding="utf-8", newline="\n").write(
+                    "".join('#include "%s"\n' % os.path.abspath(s).replace("\\", "/") for s in cpps))
+            cmd = [assetgen, "compile", unit, ue_api, stage_content]
+            if api_content:
+                cmd += ["--api", api_content]
+            if game_dir:
+                cmd += ["--game", game_dir]
+            ok = subprocess.run(cmd).returncode == 0
             if not ok:
                 print("%-16s FAILED" % name)
                 failed.append(name)

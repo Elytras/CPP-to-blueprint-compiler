@@ -55,7 +55,15 @@ class P(W):
         elif op in (4, 0x4E, 0x4F): k.append(s.node())
         elif op == 6: n.val = s.i32()
         elif op == 7: n.val = s.i32(); k.append(s.node())
-        elif op in (0xB, 0x16, 0x17, 0x25, 0x26, 0x27, 0x28, 0x2A, 0x2D, 0x32, 0x3A, 0x3C, 0x4D, 0x53): pass
+        elif op in (0xB, 0x16, 0x17, 0x25, 0x26, 0x27, 0x28, 0x2A, 0x2D, 0x30, 0x32, 0x3A, 0x3C, 0x4D, 0x53): pass
+        elif op == 0x2F:                                             # StructConst: the struct by bare name, its size,
+            p = s.ptr().split(':', 1)[-1]                            # then its members up to EX_EndStructConst
+            n.val = p.split("'")[1] if "'" in p else p
+            s.i32()
+            while True:
+                m = s.node()
+                if m.op == 0x30: break
+                k.append(m)
         elif op == 0x1F: n.val = s.cstr()
         elif op == 0x34:                                             # UnicodeStringConst: UTF-16 up to a 0 unit
             st = s.o
@@ -82,6 +90,7 @@ class P(W):
             p = s.ptr()                                              # exp[i]:Name, or imp[i]:Class'Name'
             n.own = p.startswith('exp[') or s.of_own_class(p)
             n.val = p.split(':', 1)[1] if p.startswith('exp[') else p.split("'")[-2]
+            n.imp = int(p[4:p.index(']')]) if p.startswith('imp[') else None   # MATH may name one import: (base, index)
             s.args(k)
         elif op == 0x1D: n.val = s.i32()
         elif op == 0x1E: n.val = struct.unpack_from('<f', s.b, s.o)[0]; s.raw(4)
@@ -128,12 +137,14 @@ def script_of(base, function):
 
 def params_of(base, function, flag=0x80):
     """The function's parameters in order, the return value left out, read off dumpstruct.py's property lines.
-    flag=0x100 (CPF_OutParm): only its reference parameters."""
+    flag=0x100 (CPF_OutParm): only its reference parameters. A parameter with an empty name (an unnamed one, as
+    AssetGen cooked it before it named such a parameter P<index>) is listed as '': the VM fills a callee's parameters
+    by their order, so it keeps its place."""
     import re
     exports = dumpexp.load(base)[5]
     idx = next(i for i, e in enumerate(exports) if e['name'] == function)
     out = tool_output('dumpstruct.py', base, idx)
-    found = re.findall(r'^\s+\w+Property (\w+) .*? flags=(0x[0-9a-fA-F]+)', out, re.M)
+    found = re.findall(r'^\s+\w+Property (\w*) .*? flags=(0x[0-9a-fA-F]+)', out, re.M)
     return [name for name, flags in found if int(flags, 16) & flag and not int(flags, 16) & 0x400]
 
 
@@ -160,6 +171,14 @@ FUNC_HasDefaults, FUNC_UbergraphFunction = 0x800000, 0x8000
 # (EngineTypes.h:2074). A member left out reads zero.
 NATIVE_CTORS = {'Transform': {'Rotation': {'W': 1.0}, 'Scale3D': {'X': 1.0, 'Y': 1.0, 'Z': 1.0}},
                 'Quat': {'W': 1.0}, 'HitResult': {'Time': 1.0}}
+# The engine structs NoExportTypes.h declares USTRUCT(immutable): a tag holds one as its members' bytes
+# (UScriptStruct::UseBinarySerialization, Class.cpp 2706-2711), in PropertyLink order, which is their declaration order
+# (none has a super). Each is its unpack format and its members; EX_StructConst steps them in that order too
+# (ScriptCore.cpp 3376-3405).
+IMMUTABLE = {'Vector': ('<fff', 'X Y Z'), 'Vector2D': ('<ff', 'X Y'), 'Vector4': ('<ffff', 'X Y Z W'),
+             'Rotator': ('<fff', 'Pitch Yaw Roll'), 'Quat': ('<ffff', 'X Y Z W'), 'IntPoint': ('<ii', 'X Y'),
+             'IntVector': ('<iii', 'X Y Z'), 'Color': ('<BBBB', 'B G R A'), 'LinearColor': ('<ffff', 'R G B A'),
+             'Guid': ('<iiii', 'A B C D')}
 
 
 class Unconstructed:
@@ -173,7 +192,8 @@ class Unconstructed:
 def frame_defaults(base, function, _cache={}):
     """name -> value of the locals a frame of `function` starts with that are not zero: each UserDefinedStruct local
     whose default instance is not, when the function is FUNC_HasDefaults (not the ubergraph: its persistent frame is
-    runvm's). Zero members are left out, as a missing one reads zero; an enum or engine-struct member is not decoded."""
+    runvm's). Zero members are left out, as a missing one reads zero; an enum member reads its enumerator's value
+    (_enumerator); an engine struct's member is not decoded but an IMMUTABLE one's."""
     if (base, function) not in _cache:
         import invariants
         pkg = invariants.load(base)
@@ -220,12 +240,17 @@ def _load_tags(pkg, i, tags, sp, st, v, depth):
 
 
 def _tag_value(pkg, i, t, sp, q, before, depth):
-    """(decoded, value) of one tagged value of property q: ints, floats, bools, names, strings, a UserDefinedStruct
-    (loaded over what the member held), an array of those."""
+    """(decoded, value) of one tagged value of property q: ints, floats, bools, enums, names, strings, an IMMUTABLE engine
+    struct (its non-zero members), a UserDefinedStruct (loaded over what the member held), an array of those."""
     ty, b = t['type'], bytes(t['value'])
+    if ty == 'StructProperty' and q.type == 'StructProperty' and t.get('struct') in IMMUTABLE:
+        fmt, members = IMMUTABLE[t['struct']]
+        if len(b) != struct.calcsize(fmt): return False, None
+        return True, {m: x for m, x in zip(members.split(), struct.unpack(fmt, b)) if x}
     if ty in ('IntProperty', 'Int64Property', 'Int16Property', 'Int8Property'): return True, int.from_bytes(b, 'little', signed=True)
     if ty in ('UInt16Property', 'UInt32Property', 'UInt64Property'): return True, int.from_bytes(b, 'little')
     if ty == 'ByteProperty' and t['enum'] == 'None': return True, b[0]
+    if ty in ('ByteProperty', 'EnumProperty') and len(b) == 8: return _enumerator(pkg, t['enum'], sp, q, _name(pkg, b, 0))
     if ty in ('FloatProperty', 'DoubleProperty'): return True, struct.unpack('<f' if len(b) == 4 else '<d', b)[0]
     if ty == 'BoolProperty': return True, bool(t['bool'])
     if ty == 'NameProperty': return True, _name(pkg, b, 0)
@@ -250,6 +275,41 @@ def _tag_value(pkg, i, t, sp, q, before, depth):
     return False, None
 
 
+def _enumerator(pkg, enum, sp, q, name):
+    """(decoded, value) of an enum tag's value, an FName '<Enum>::<Short>', as the loader looks it up in the enum's
+    names (UEnum::GetValueByName): a UserDefinedEnum's entries off its package, a native enum's values as the UeApi
+    header declares them. Not decoded when neither the enum nor the name is found."""
+    from invariant_rules import user_types
+    short = name.split('::')[-1]
+    found = user_types.enum_of(pkg, enum, sp, q)
+    if found and found[0] == 'ude':
+        return next(((True, v) for n, v in found[1] if n == name or n.split('::')[-1] == short), (False, None))
+    values = native_enum_values().get(enum, {})
+    return (True, values[short]) if short in values else (False, None)
+
+
+_NATIVE_ENUM_VALUES = {}
+
+
+def native_enum_values():
+    """name -> {short enumerator name: value} of every native enum Types.json lists, off the header of its module
+    (/Script/Engine's in Engine.h), where genueapi writes each value. {} without a UeApi (INVARIANTS_UEAPI)."""
+    import json, re
+    d = os.environ.get('INVARIANTS_UEAPI')
+    if not _NATIVE_ENUM_VALUES and d and os.path.exists(os.path.join(d, 'Types.json')):
+        enums = json.load(open(os.path.join(d, 'Types.json'), encoding='utf-8'))['enums']
+        for module in sorted({e['package'].rsplit('/', 1)[-1] for e in enums.values()}):
+            h = os.path.join(d, module + '.h')
+            if not os.path.exists(h): continue
+            text = open(h, encoding='utf-8', errors='replace').read()
+            for m in re.finditer(r'^enum\s+(?:class\s+)?(\w+)\s*(?::\s*\w+)?\s*\{([^}]*)\}', text, re.M):
+                if m.group(1) in enums:
+                    _NATIVE_ENUM_VALUES.setdefault(m.group(1), {n: int(v, 0) for n, v in
+                                                   re.findall(r'^\s*(\w+)\s*=\s*(-?(?:0x[0-9a-fA-F]+|\d+))', m.group(2), re.M)})
+        _NATIVE_ENUM_VALUES.setdefault('', {})
+    return _NATIVE_ENUM_VALUES
+
+
 def _name(pkg, b, o):
     i, num = struct.unpack_from('<ii', b, o)
     return pkg.names[i] + ('_%d' % (num - 1) if num else '')
@@ -270,6 +330,15 @@ INT64_RESULT = {'Conv_IntToInt64', 'FTrunc64', 'Not_Int64'} | {op + '_Int64Int64
 # The operands that leave Stack.MostRecentPropertyAddress, which StructMemberContext and ArrayGetByRef offset into:
 # a call evaluated into nothing leaves none (and a native writes its result through a null RESULT_PARAM).
 ADDRESSABLE = {0, 1, 0x48, 0x42, 0x6B}
+
+
+def read_late(a):
+    """A reference argument whose place is found without running anything: a variable, or a member of one, however
+    deep (execStructMemberContext leaves MostRecentPropertyAddress at the member inside the real struct, ScriptCore.cpp
+    2957). The callee reads such a place through its address after every argument has run (ProcessScriptFunction's
+    out-parm list, EX_LocalOutVariable), so an oracle reads it then too. An element is read in place: its index may
+    run code."""
+    return a.op in (0, 1, 0x48) or (a.op == 0x42 and read_late(a.kids[0]))
 # The arguments a native reads by address: a const reference parameter (P_GET_PROPERTY_REF takes the address the
 # argument left) and a container library's containers (stepped into no buffer, then read where they lie). A call or a
 # cast there leaves the address of whatever ITS operands read last, and the native reads that - an int64 as an FText
@@ -410,6 +479,12 @@ def _has(c, v):
     return low(v) in map(low, c)
 
 
+def _find(c, v):
+    """Find: the first index whose element equals v, as _has compares, else INDEX_NONE (TArray::Find)."""
+    low = lambda x: x.lower() if isinstance(x, str) else x
+    return next((i for i, x in enumerate(c) if low(x) == low(v)), -1)
+
+
 class Slot:
     """A TMap element in the compiler's __Slots__ view of the map's storage: its Key, and its Value, which is the map's
     own, so a store through it changes the map."""
@@ -459,6 +534,7 @@ CONTAINERS = {
     'Set_Clear': lambda ev, store, a: store(a[0], []),
     'Map_Clear': lambda ev, store, a: store(a[0], {}),
     'Array_Contains': lambda ev, store, a: _has(_made(ev, store, a[0], []), ev(a[1])),
+    'Array_Find': lambda ev, store, a: _find(_made(ev, store, a[0], []), ev(a[1])),
     'Set_Contains': lambda ev, store, a: _has(_made(ev, store, a[0], []), ev(a[1])),
     'Map_Contains': lambda ev, store, a: _has(_made(ev, store, a[0], {}), ev(a[1])),
 }
@@ -504,6 +580,9 @@ def run(base, function, self_vars=None, **parms):
             if n.val == '__Slots__': return slots_of(s)
             return s.get(n.val, 0) if isinstance(s, dict) else 0     # a struct is a dict; an unset member reads 0
         if o in (0x1F, 0x34): return n.val
+        if o == 0x2F:                                                # an IMMUTABLE engine struct's literal: a dict
+            if n.val not in IMMUTABLE: raise SystemExit('unsupported struct literal %s at mem %d' % (n.val, n.mem))
+            return dict(zip(IMMUTABLE[n.val][1].split(), [ev(k) for k in n.kids]))
         if o == 0x67: return ev(n.kids[0])
         if o == 0x29: return ev(n.kids[0]) if n.kids else ''
         if o == 0x17: return SELF
@@ -530,7 +609,12 @@ def run(base, function, self_vars=None, **parms):
             for name, a in zip(names, n.kids):
                 if name in outs and a.op not in ADDRESSABLE and not (a.op in (0x19, 0x1A) and a.kids[1].op in ADDRESSABLE):
                     raise SystemExit('%s: reference parameter %s gets a non-variable (op %02x), which crashes the VM' % (n.val, name, a.op))
-            r, callee = run(base, n.val, self_vars, **dict(zip(names, [copy.deepcopy(ev(a)) for a in n.kids])))
+            # A reference parameter is the caller's variable, which the callee reads through its address (EX_LocalOutVariable,
+            # ProcessScriptFunction's out-parm list): what it holds once every argument has run, not when its argument came.
+            bound = [i < len(names) and names[i] in outs and read_late(a) for i, a in enumerate(n.kids)]
+            vals = [None if b else copy.deepcopy(ev(a)) for b, a in zip(bound, n.kids)]
+            vals = [copy.deepcopy(ev(a)) if b else v for b, a, v in zip(bound, n.kids, vals)]
+            r, callee = run(base, n.val, self_vars, **dict(zip(names, vals)))
             for name, a in zip(names, n.kids):                       # a reference parameter is its argument's variable
                 if name in outs and a.op in ADDRESSABLE: store(a, callee.get(name, 0))
             return r
@@ -541,12 +625,13 @@ def run(base, function, self_vars=None, **parms):
             return CONTAINERS[n.val](ev, lambda d, v: d is n.kids[2] or store(d, v), n.kids)
         if o in (0x1C, 0x46, 0x68) and n.val in CONTAINERS: return CONTAINERS[n.val](ev, store, n.kids)
         if o in (0x1C, 0x46, 0x68):
-            if n.val not in MATH: raise SystemExit('unsupported call %s (in %s of %s)' % (n.val, function, base))
+            fn = MATH.get((base, getattr(n, 'imp', None))) or MATH.get(n.val)    # one package can import two classes' Fn
+            if fn is None: raise SystemExit('unsupported call %s (in %s of %s)' % (n.val, function, base))
             args = [ev(a) for a in n.kids]
             if n.val.endswith('_Int64Int64'):
                 args = [v & 0xFFFFFFFF if is32(a) else v for a, v in zip(n.kids, args)]
             CALLS.append((n.val, tuple(args)))
-            return MATH[n.val](*args)
+            return fn(*args)
         if o == 0x69:
             # execSwitchValue compares the cases with the index where it lies, so the index is a variable; and no case
             # matching throws a script exception (a logged warning) before the default runs.

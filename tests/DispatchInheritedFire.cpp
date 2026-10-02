@@ -1,7 +1,6 @@
 ﻿/* DispatchInheritedFire: a child class broadcasts the dispatcher its mod parent declares. The engine needs an
    EX_CallMulticastDelegate naming the parent's OnHit__DelegateSignature (an import) over the inherited variable, as
-   an editor child Blueprint's Call node does; AssetGen refuses it today ("Broadcast needs the dispatcher's signature
-   function, which only a UE_DISPATCHER of this class has"). */
+   an editor child Blueprint's Call node does. */
 #include "UeApi/Types.h"
 #include "UeApi/FSD.h"
 

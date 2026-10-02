@@ -1,7 +1,8 @@
 ﻿/*
 PropEnumClass.cpp - a native `enum class : uint8` (UENUM, ECppForm::EnumClass) wherever a type lands: a variable, a
-parameter, a return value, a local, a container's element and key, a UE_STRUCT member, a delegate's parameter, an
-override of a native event, a native struct's member, and an inherited default.
+parameter, a return value, a local, a container's element and key, a UE_STRUCT member (and a UE_STRUCT's empty array,
+set and map of it, whose tags hold counts only), a delegate's parameter, an override of a native event, a native
+struct's member, and an inherited default.
 
 The editor makes such a pin an EnumProperty over a ByteProperty named UnderlyingType, and a plain or namespaced enum a
 ByteProperty with its Enum (Editor/KismetCompiler/Private/KismetCompilerMisc.cpp 1071-1094); the game's cooks carry an
@@ -21,6 +22,9 @@ struct FRuleSlot {
   UE_STRUCT;
   EAttachmentRule Rule = EAttachmentRule::SnapToTarget;
   int32 Weight = 2;
+  TArray<EAttachmentRule> Vis;      // empty: the default instance still tags each one
+  TSet<EAttachmentRule> Met;
+  TMap<EAttachmentRule, int32> Toll;
 };
 
 class PropEnumClass : public AActor {

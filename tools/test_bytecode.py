@@ -679,14 +679,15 @@ def asset(mod):
     return os.path.join(ROOT, mod, 'FSD', 'Content', '_ElytrasMods', mod, mod)
 
 
-def refused(mod, body, why, top=''):
-    """A mod (the class body given, `top` before the class) the compiler must refuse, saying why."""
+def refused(mod, body, why, top='', base='AActor', after=''):
+    """A mod (the class body given, `top` before the class, which derives from `base`, `after` after it) the compiler
+    must refuse, saying why."""
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
         src = os.path.join(tmp, mod + '.cpp')
         with open(src, 'w', encoding='utf-8') as f:
             f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\n%s'
-                    'class %s : public AActor {\npublic:\n%s};\n' % (mod, top, mod, body))
+                    'class %s : public %s {\npublic:\n%s};\n%s' % (mod, top, mod, base, body, after))
         proc = assetgen_compile([src, UEAPI, tmp])
         assert proc.returncode != 0 and why in proc.stdout, (mod, proc.stdout)
 
@@ -710,6 +711,7 @@ def pending_asset(mod, cls=None):
     if mod not in REFUSALS:
         os.makedirs(out, exist_ok=True)
         proc = assetgen_compile([src, UEAPI, out])
+        LOGS[mod] = proc.stdout
         failed = re.findall(r'(?m)^\s*FAILED: (.*)$', proc.stdout)
         REFUSALS[mod] = (failed or [proc.stdout.strip() or 'exit %d' % proc.returncode])[0] if proc.returncode else None
     if REFUSALS[mod]: raise AssertionError('refused: ' + REFUSALS[mod])
@@ -971,6 +973,560 @@ def switch_in_loop(Count):
     return s
 
 
+check('FlowTest', 'CommaStmt', lambda N: wrap((N + 200) * 100 + 10 - N), [dict(N=n) for n in (-5, 0, 7, 2**30)])
+check('FlowTest', 'CommaIf', lambda N: N + 1 if N + 1 <= 2 else -1 if N + 11 == 13 else (N + 11) * 10,
+      [dict(N=n) for n in (-3, 0, 1, 2, 3, 50)])
+for n in (-3, 0, 4):
+    me = {'Total': 1}
+    run(asset('FlowTest'), 'ForwardVoid', self_vars=me, N=n)
+    assert me['Total'] == 1 + (-n * 100 if n < 0 else n), (n, me)
+print('ok  FlowTest.ForwardVoid: `return F();` of a void F calls it, then returns')
+# Behind an operand C++ evaluates first (a later braced member, an assignment's left side), the comma's left side would
+# run ahead of it; where its place is used, not its value, and no statement before fits, a copy is not that place.
+COMMA_TOP = 'struct FCbPair {\n  UE_STRUCT;\n  int32 A = 1;\n  int32 B = 2;\n};\n'
+refused('CommaBrace', '  int32 Count;\n  [[gnu::noinline]] int32 G() { return Count; }\n'
+        '  int32 F(int32 M) { FCbPair T = {G(), (Count += 1, M)}; return T.B; }\n',
+        'the comma operator after something its statement runs first', COMMA_TOP)
+refused('CommaAssignLeft', '  int32 Count;\n  TArray<int32> L;\n  [[gnu::noinline]] int32 G() { return Count; }\n'
+        '  int32 F(int32 M) { L = {0}; L[(Count += 1, 0)] = G(); return L[0]; }\n',
+        'the comma operator after something its statement runs first')
+refused('CommaLoopPlace', '  int32 Count;\n  FCbPair S;\n'
+        '  int32 F(int32 M) { int32 N = 0; while ((Count += 1, S).A < M) { S.A += 1; N += 1; } return N; }\n',
+        'the comma operator used as a place, not a value', COMMA_TOP)
+refused('CommaRef', '  void Add(int32 X, int32& Y) { Y += X; }\n  int32 Twice(int32 X) { return X * 2; }\n'
+        '  int32 F(int32 M) { TArray<int32> L = {1}; Add(Twice(M), (M += 1, L[0])); return L[0]; }\n',
+        'the comma operator here is written to or bound to a reference')
+refused('CommaLoopSlot', '  TArray<int32> L;\n  int32 Count;\n  [[gnu::noinline]] int32 IncRef(int32 X, int32& V) { V += 3; return V; }\n'
+        '  int32 F(int32 M) { L = {M}; int32 N = 0; while (IncRef(0, (Count += 1, L[0])) < 20) N += 1; return N; }\n',
+        'the comma operator passed to a reference parameter, whose right side is no plain variable')
+print('ok  the comma operator behind something its statement runs first, used as a place where no statement fits, or '
+      'bound to a reference beside an argument that may run first, its right side no variable, is refused by name')
+
+
+def comma_hoist():
+    """CommaHoist: a comma inside an expression runs its left side first, as a statement, wherever nothing in the
+    statement runs before it, and is worth its right side, read where C++ reads it: Count is what Bump left. An
+    initialiser (a TEnum<E>'s too), an argument beside a constant or beside a call, a struct literal's first member, a
+    return value, an assignment's right side, a switch over a TEnum<E>, a reference argument, a comma in a comma. Beside
+    a call that sets what it reads, by value or by reference, it runs whole before the call or after it. The class
+    default `(1, 4)` is 4."""
+    base = asset('CommaHoist')
+    keeps_invariants(base)
+    for fn, want, bumps in (('Brace', lambda m, c: m + c * 100, 1), ('Enum', lambda m, c: m + c * 100, 1),
+                            ('Arg', lambda m, c: 2 * (m + c), 1), ('Beside', lambda m, c: 70 + m + c, 1),
+                            ('BesideCall', lambda m, c: 20 * m + c, 1), ('Literal', lambda m, c: 10 * m + c, 1),
+                            ('Ret', lambda m, c: m + c, 1), ('Assign', lambda m, c: m + c * 100, 1),
+                            ('Pick', lambda m, c: (1000 if m == 1 else 0) + c, 1), ('Ref', lambda m, c: (m + 5) * 100 + c, 1),
+                            ('Nested', lambda m, c: 2 * (10 + m), 2)):
+        for m, c in ((0, 0), (1, 5), (3, -2)):
+            me = {'Count': c}
+            got = run(base, fn, me, M=m)[0]
+            assert got == want(m, c + bumps) and me['Count'] == c + bumps, \
+                'CommaHoist.%s(%d) with Count %d = %r, Count %r; want %r, Count %d' % (fn, m, c, got, me['Count'], want(m, c + bumps), c + bumps)
+    # Beside a call that sets Count, the comma runs whole before it or after it: the (value, Count) pairs C++ allows.
+    # Its left side alone first and its right side read after the call (Interleave 10 * m + 100) is no C++ order, nor
+    # is a reference bound to a copy (RefBeside c + 1 + m, Count 100).
+    for m, c in ((0, 0), (7, 5), (3, -2)):
+        for fn, legal in (('Interleave', {(10 * m + c + 1, 100), (10 * m + 101, 101)}),
+                          ('RefBeside', {(100 + m, 100 + m), (101 + m, 101 + m)})):
+            me = {'Count': c}
+            got = run(base, fn, me, M=m)[0]
+            assert (got, me['Count']) in legal, 'CommaHoist.%s(%d) with Count %d = %r, Count %r; want one of %r' % (
+                fn, m, c, got, me['Count'], sorted(legal))
+    cdo = dump('dumptags.py', base, str(exports_of(base).index('Default__CommaHoist_C')))
+    assert 'D [0] IntProperty size=4: 4' in cdo, cdo
+
+
+comma_hoist()
+print('ok  CommaHoist: a comma inside an expression runs its left side first, as a statement, where nothing runs before it')
+
+
+def comma_const_ref():
+    """CommaConstRef: a comma or an assignment used as a value, bound to a `const T&` beside an argument that writes
+    what it names, is that variable, which the callee reads after every argument: it sees the write (50) whichever
+    order C++ picks. Assign's pairs: `B = M` before SetB (1050, B 50) or after it (1000 + M, B M)."""
+    base = asset('CommaConstRef')
+    keeps_invariants(base)
+    for m in (0, 7, -3):
+        for fn, legal in (('Struct', {(1050, 1)}), ('Int', {(1050, 1)}), ('Ahead', {(1050, 1)})):
+            me = {'Count': 0}
+            got = run(base, fn, me, M=m)[0]
+            assert (got, me['Count']) in legal, 'CommaConstRef.%s(%d) = %r, Count %r; want %r' % (fn, m, got, me['Count'], legal)
+        me = {}
+        got = run(base, 'Assign', me, M=m)[0]
+        assert (got, me.get('B')) in {(1050, 50), (1000 + m, m)}, 'CommaConstRef.Assign(%d) = %r, B %r' % (m, got, me.get('B'))
+
+
+comma_const_ref()
+print('ok  CommaConstRef: a comma or an assignment bound to a const T& beside a writing argument is the variable, read '
+      'when the callee runs')
+
+
+def update_ref():
+    """UpdateRef: a compound assignment or a prefix ++ passed to a reference parameter is the variable itself: the
+    callee's write to an `int32&` lands in B (M + 4 after `IncRef(1, B += 1)`), and beside SetB, which writes B too,
+    the callee reads B after both arguments, in either order C++ may pick. A struct member bound to a `const T&` is
+    read when the callee runs too (Member: 1050, S.A 50). Read's `(B += 1) * 2` is a value, read where it stands. Each
+    case runs under runscript and under runvm with ref_params, the two oracles reading a reference argument alike."""
+    base = asset('UpdateRef')
+    keeps_invariants(base)
+    for m in (0, 7, -3):
+        cases = (('Alone', {(1004 + m, m + 4)}), ('PreAlone', {(1004 + m, m + 4)}),
+                 ('ConstBeside', {(1050, 50), (1051, 51)}), ('PreBeside', {(1050, 50), (1051, 51)}),
+                 ('RefBeside', {(1053, 53), (1054, 54)}), ('Read', {((m + 1) * 200 + m + 1, m + 1)}))
+        for fn, legal in cases:
+            me = {'B': 0, 'S': {}}
+            got = run(base, fn, me, M=m)[0]
+            assert (got, me['B']) in legal, 'UpdateRef.%s(%d) = %r, B %r; C++ allows %r' % (fn, m, got, me['B'], legal)
+            vm = VM(base, B=0, S={})
+            vm.ref_params = True
+            got = vm.call(fn, M=m)
+            assert (got, vm.self.vars['B']) in legal, 'runvm: UpdateRef.%s(%d) = %r, B %r; C++ allows %r' % (
+                fn, m, got, vm.self.vars['B'], legal)
+        a_of = lambda st: next(v for k, v in st.items() if k.split('_')[0] == 'A')    # a UDS member's GUID-suffixed name
+        me = {'B': 0, 'S': {}}
+        got = run(base, 'Member', me, M=m)[0]
+        assert (got, a_of(me['S'])) == (1050, 50), 'UpdateRef.Member(%d) = %r, S %r' % (m, got, me['S'])
+        vm = VM(base, B=0, S={})
+        vm.ref_params = True
+        got = vm.call('Member', M=m)
+        assert (got, a_of(vm.self.vars['S'])) == (1050, 50), 'runvm: UpdateRef.Member(%d) = %r, S %r' % (m, got, vm.self.vars['S'])
+    # Its place found by a call, the update cannot be read again as the variable it wrote.
+    refused('UpdateRefSlot', '  TArray<int32> L;\n  int32 Idx() { return 0; }\n'
+            '  int32 IncRef(int32 X, int32& V) { V += 3; return X * 1000 + V; }\n'
+            '  int32 Slot(int32 M) { L = {M}; return IncRef(1, L[Idx()] += 1); }\n',
+            'an update (`+=`, `++`, ...) passed to a reference parameter, whose left side is no plain variable')
+
+
+update_ref()
+print('ok  UpdateRef: a compound assignment or a prefix ++ passed to a reference parameter is the variable, read and '
+      'written by the callee after every argument')
+
+
+def update_loop():
+    """UpdateLoop: an update passed to a reference parameter in a loop condition, on the right of &&, or in a call on
+    another object is the variable too. The C++ results: a loop condition is a full-expression evaluated before each
+    trip ([stmt.while]), so each trip runs `B += 1`, then IncRef's `V += 3` on B itself, and tests the B it returns;
+    && evaluates its right side only when the left is true ([expr.log.and]); the call's object is sequenced before its
+    arguments ([expr.call] 8, C++17): P is this, and OtherObj's GetP() makes B ten times M before `B += 1` reads it (an
+    update run ahead of the object gives 10M + 13, not 10M + 4). A copy passed instead leaves B 3 short per call (1617,
+    not 420)."""
+    base = asset('UpdateLoop')
+    keeps_invariants(base)
+
+    def loop(m):                                    # `while (IncRef(0, B += 1) < 20) N += 1;`, B starting at m
+        b, n = m, 0
+        while True:
+            b += 1; b += 3
+            if not b < 20: return n * 100 + b
+            n += 1
+    def do_loop(m):                                 # `do { N += 1; } while (IncRef(0, ++B) < 20);`: the test after the body
+        b, n = m, 0
+        while True:
+            n += 1; b += 4
+            if not b < 20: return n * 100 + b
+    for m in (0, 7, -3):
+        cases = (('Loop', loop(m)), ('LoopPre', loop(m)), ('LoopInline', loop(m)), ('LoopLocal', loop(m)),
+                 ('DoLoop', do_loop(m)), ('Arms', (m + 4) * 101 if m > 0 else (1000 + m + 4) * 100 + m + 4),
+                 ('AndRight', (1000 if m > 1 else 0) + m + 4 if m > 0 else m), ('Other', (1000 + m + 4) * 100 + m + 4),
+                 ('OtherObj', (1000 + 10 * m + 4) * 1000 + 10 * m + 4))
+        for fn, want in cases:
+            if not fn.startswith('Other'):          # runscript runs no call on another object
+                got = run(base, fn, {'B': 0}, M=m)[0]
+                assert got == want, 'UpdateLoop.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+            vm = VM(base, B=0)
+            vm.ref_params = True
+            got = vm.call(fn, M=m)
+            assert got == want, 'runvm: UpdateLoop.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+
+
+update_loop()
+print('ok  UpdateLoop: an update bound to a reference in a loop condition, right of &&, or in a call on another object '
+      'is the variable, which the callee writes')
+# Behind a braced member C++ evaluates first, the update would run ahead of it.
+refused('UpdateBrace', '  int32 B;\n  [[gnu::noinline]] int32 G() { return B; }\n'
+        '  [[gnu::noinline]] int32 IncRef(int32 X, int32& V) { V += 3; return V; }\n'
+        '  int32 F(int32 M) { FCbPair T = {G(), IncRef(0, B += 1)}; return T.B; }\n',
+        'an update (`+=`, `++`, ...) passed to a reference parameter after something its statement runs first', COMMA_TOP)
+
+
+def comma_places():
+    """CommaPlaces: the comma operator, and an assignment used as a value, in a loop condition, right of && / ||, in
+    an arm of ?:, and in an argument of a call on another object. The C++ results: the comma runs its left side, then
+    its right, whose value it is ([expr.comma]); a loop condition is evaluated before each trip ([stmt.while]); && / ||
+    and ?: evaluate only what the left side / condition picks ([expr.log.and], [expr.cond]); a call's object is
+    sequenced before its arguments ([expr.call] 8): P is this, and in OtherObj / OtherObjRef GetP()'s `Count *= 10`
+    runs before the comma's Bump (Bump first gives Count 10, not 1). Bound to IncRef's `int32&`, `(Bump(), N)` is N
+    itself, which IncRef's `V += 3` moves."""
+    base = asset('CommaPlaces')
+    keeps_invariants(base)
+
+    def loop_count(m):                              # `while ((Bump(), N) < 5) N += 1;`: N, and how often Bump ran
+        n, c = m, 0
+        while True:
+            c += 1
+            if not n < 5: return n * 100 + c
+            n += 1
+
+    def while_ref(m):                               # `while (IncRef(0, (Bump(), N)) < 20) T += 1;`
+        n, t = m, 0
+        while True:
+            n += 3
+            if not n < 20: return t * 100 + n
+            t += 1
+
+    def while_assign(m):                            # `while ((V = I * 2) < M) I += 1;`
+        i = 0
+        while i * 2 < m: i += 1
+        return i * 100 + i * 2
+    for m in (0, 3, 7, -2):
+        cases = (('While', loop_count(m)), ('For', loop_count(m)),
+                 ('Do', max(m + 1, 5) * 100 + max(m + 1, 5) - m),      # the test runs once per body run
+                 ('And', (1000 if m > 2 else 0) + (1 if m > 0 else 0)),
+                 ('Or', 1000 if m > 0 else (1000 if m < -1 else 0) + 2),
+                 ('Cond', (m + 1) * 100 + 1 if m > 0 else (m - 2) * 100 + 2),
+                 ('Other', (2 * m + 2) * 100 + 1), ('OtherRef', (1000 + m + 3) * 100 + (m + 3) * 10 + 1),
+                 ('OtherObj', (20 * m + 2) * 1000 + 10 * m + 1),
+                 ('OtherObjRef', (1003 + m) * 10000 + (m + 3) * 100 + 1),
+                 ('WhileRef', while_ref(m)), ('WhileAssign', while_assign(m)))
+        for fn, want in cases:
+            if not fn.startswith('Other'):          # runscript runs no call on another object
+                got = run(base, fn, {'Count': 0, 'N': 0}, M=m)[0]
+                assert got == want, 'CommaPlaces.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+            vm = VM(base, Count=0, N=0)
+            vm.ref_params = True
+            got = vm.call(fn, M=m)
+            assert got == want, 'runvm: CommaPlaces.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+
+
+comma_places()
+print('ok  CommaPlaces: a comma or an assignment used as a value in a loop condition, right of && / ||, in ?:, or in a '
+      'call on another object runs as C++ runs it')
+# A comma bound to an operator's `const T&` operand names the operator; a comma moved to a temporary of a type no
+# Blueprint variable holds is refused for what the user wrote, here the double arithmetic, not the temporary's name.
+refused('CommaOperand', '  int32 Count;\n  TArray<FString> L;\n  void Bump() { Count += 1; }\n'
+        '  [[gnu::noinline]] FString Get() { return FString("x"); }\n'
+        '  FString F() { L = {FString("a")}; return Get() + (Bump(), L[0]); }\n',
+        "the comma operator here is bound to a reference, operator `+`'s `const FString &` operand")
+refused('CommaDouble', '  int32 Count;\n  float M;\n  void Bump() { Count += 1; }\n'
+        '  [[gnu::noinline]] float G() { return 1.0f; }\n  float F() { return (Bump(), M) * (G() + 0.5); }\n',
+        'no Kismet conversion from float to double')
+print('ok  CommaOperand, CommaDouble: a comma refused in an operator\'s reference operand names the operator, and one '
+      'whose temporary no variable could hold is refused for what the user wrote')
+
+
+def assign_value():
+    """AssignValue: a struct's or an FString's `=` (operator=) read by value in a loop condition, right of &&, in an
+    arm of ?:, or in an argument of a call on another object. The C++ results: the assignment's value is T itself
+    ([expr.ass]), copied into the by-value parameter right after it; a loop condition is evaluated before each trip
+    ([stmt.while]); && and ?: evaluate only what the left side / condition picks ([expr.log.and], [expr.cond]); a
+    call's object is sequenced before its arguments ([expr.call] 8), and P is this. Refused on 9ac803ad, with a message
+    REFERENCE no longer listed."""
+    base = asset('AssignValue')
+    keeps_invariants(base)
+
+    def loop(m):                                    # `while (UsePairV(T = S) < 100) { S.A += 3; K += 1; }`
+        sa, k = m, 0
+        while True:
+            if not sa * 10 + 2 < 100: return k * 1000 + sa
+            sa += 3; k += 1
+    for m in (0, 1, 7):
+        cases = (('While', loop(m)), ('And', ((1000 if m * 10 + 2 > 50 else 0) + m) if m > 0 else 0),
+                 ('Cond', (m * 10 + 2) * 100 + m if m > 0 else 500), ('Other', (m * 10 + 2) * 100 + m),
+                 ('StrWhile', (4 if m > 2 else 0) * 10 + 1), ('StrAnd', 11 if m > 0 else 0))
+        for fn, want in cases:
+            if fn != 'Other':                       # runscript runs no call on another object
+                got = run(base, fn, {'S': {}, 'T': {}, 'Str': ''}, M=m)[0]
+                assert got == want, 'AssignValue.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+            vm = VM(base, S={}, T={}, Str='')
+            vm.ref_params = True
+            got = vm.call(fn, M=m)
+            assert got == want, 'runvm: AssignValue.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+
+
+assign_value()
+print('ok  AssignValue: a struct\'s or an FString\'s = read by value in a loop condition, right of &&, in ?: or in a '
+      'call on another object is a copy of what it assigned')
+# A member taken of a struct `=` in a loop condition uses its place, which no statement before the loop can hold; an
+# assignment updated whose left side is no plain variable would locate it twice.
+refused('AssignMemberPlace', '  FCbPair S;\n  FCbPair T;\n'
+        '  int32 F(int32 M) { S.A = M; int32 K = 0; while ((T = S).A < 9) { S.A += 3; K += 1; } return K; }\n',
+        'an assignment used as a place, not a value', COMMA_TOP)
+refused('AssignSlotUpdate', '  TArray<int32> L;\n  int32 Idx() { return 0; }\n'
+        '  int32 F(int32 M) { L = {M}; int32 K = 0; while (((L[Idx()] = M) += 1) < 5) { M += 1; K += 1; } return K; }\n',
+        'an assignment assigned to or updated, whose left side is no plain variable')
+print('ok  AssignMemberPlace, AssignSlotUpdate: a member of a struct = in a loop condition, and an update of an '
+      'assignment to no plain variable, are refused by name')
+
+
+def comma_targets():
+    """CommaTargets: the comma operator assigned to or updated, in a loop condition, right of &&, and as a statement
+    whose right side is a call. The C++ results: the comma is its right side, the lvalue N ([expr.comma]), so each
+    trip runs Bump, then the update on N; a loop condition is evaluated before each trip ([stmt.while]); && evaluates
+    its right side only when the left is true ([expr.log.and]); an assignment's right side is sequenced before its
+    left ([expr.ass]/1, C++17), so G() reads Count before Bump moves it. A plain `=` assigned to or updated is its
+    left side after it ([expr.ass]): G() runs before Next(), and OnAssignEq's `N + 1` reads N before `N = M`. Refused
+    on 9ac803ad as "TODO: assignment to BinaryOperator"."""
+    base = asset('CommaTargets')
+    keeps_invariants(base)
+
+    def loop(m, post=False, by_g=False, limit=5):   # Count bumps once per trip; N moves by 1 (or by G(), Count before it)
+        c, n = 0, m
+        while True:
+            g = c; c += 1
+            v = n
+            n += g if by_g else 1
+            if not (v if post else n) < limit: return n * 100 + c
+    def on_assign_call(m):                          # `while (((N = Next()) += G()) < 20) K += 1;`, Count from m
+        c, k = m, 0
+        while True:
+            g = c; c += 1; n = c + g
+            if not n < 20: return k * 100 + n
+            k += 1
+    for m in (0, 3, 7, 12):
+        cases = (('Compound', loop(m)), ('Pre', loop(m)), ('Post', loop(m, post=True)), ('Assign', loop(m)),
+                 ('CompoundCall', loop(m, by_g=True, limit=9)),
+                 ('AndRight', ((1000 if m + 1 > 2 else 0) + (m + 1) * 10 + 1) if m > 0 else m * 10),
+                 ('StmtAssign', m * 100 + m + 1), ('StmtCompound', (1 + m) * 100 + m + 1),
+                 ('OnAssign', max(0, 4 - m) * 100 + max(m + 1, 5)), ('OnAssignEq', 405),
+                 ('OnAssignCall', on_assign_call(m)), ('OnAssignStmt', (2 * m + 1) * 100 + m + 1))
+        for fn, want in cases:
+            got = run(base, fn, {'Count': 0, 'N': 0}, M=m)[0]
+            assert got == want, 'CommaTargets.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+            vm = VM(base, Count=0, N=0)
+            got = vm.call(fn, M=m)
+            assert got == want, 'runvm: CommaTargets.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+
+
+comma_targets()
+print('ok  CommaTargets: a comma or a = assigned to or updated in a loop condition, right of &&, or before a call on its '
+      'right runs its left side, then the update of the variable it names')
+
+
+def assigned_comma_stmt():
+    """AssignedCommaStmt: an assignment onto a comma used as a value in a statement, `int32 X = ((Bump(), N) = G());`.
+    The C++ results: the assignment's value is its left operand ([expr.ass]), the comma's right side, the lvalue N
+    ([expr.comma]), or T.A of it ([expr.ref]); C++17 sequences G() before the comma ([expr.ass]/1), so it reads Count
+    before Bump moves it; `(... = G()) += 1` updates N after the assignment, as a statement and in a loop condition
+    (Loop: 1 first, then G, Bump and the store, then the update, [expr.ass]/1); `(Bump(), IL)[Idx()] = G()` runs G,
+    then Bump, then Idx ([expr.sub]: the array before the index, C++17), so Idx sees Count M + 2. Refused on fa30eccf
+    as "an assignment used as a value, whose left side is no plain variable", where the loop form compiles. An update of
+    an assignment to an element (`(IL[Idx()] = M) += 1;`) would locate the element twice: refused, as in a loop
+    condition, by the same message (fa30eccf said "an assignment used as a value")."""
+    base = asset('AssignedCommaStmt')
+    keeps_invariants(base)
+
+    def loop(m):                                    # `while ((((Bump(), N) = G()) += 1) < 50) K += 1;`
+        c, k = m, 0
+        while True:
+            g = c * 10; c += 1; n = g + 1
+            if not n < 50: return k * 1000 + n
+            k += 1
+
+    def slot(m):                                    # `(Bump(), IL)[Idx()] = G();` over IL = {0, 0}
+        il, g = [0, 0], m * 10
+        il[(m + 2) % 2] = g
+        return il[0] * 10000 + il[1] * 100 + m + 2
+    for m in (0, 3, 4):
+        for fn, want in (('Value', 10 * m * 100 + m + 1), ('Member', 10 * m * 100 + m + 1),
+                         ('Update', (10 * m + 1) * 100 + m + 1), ('Loop', loop(m)), ('Slot', slot(m))):
+            got = run(base, fn, {'Count': 0, 'N': 0, 'T': {}, 'IL': []}, M=m)[0]
+            assert got == want, 'AssignedCommaStmt.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+            got = VM(base, Count=0, N=0, T={}, IL=[]).call(fn, M=m)
+            assert got == want, 'runvm: AssignedCommaStmt.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+    refused('SlotUpdStmt', '  int32 Count;\n  TArray<int32> IL;\n  [[gnu::noinline]] int32 Idx() { Count += 1; return 0; }\n'
+            '  int32 F(int32 M) { IL = {0}; (IL[Idx()] = M) += 1; return IL[0]; }\n',
+            'an assignment assigned to or updated, whose left side is no plain variable')
+
+
+assigned_comma_stmt()
+print('ok  AssignedCommaStmt: an assignment onto a comma, or a member or element of one, used as a value in a statement '
+      'writes the variable it names; one onto an element, updated, is refused as in a loop condition')
+
+
+def member_of_comma():
+    """MemberOfComma: a member or an element of a comma updated or assigned in a loop condition. The C++ results: the
+    comma is its right side, the lvalue T or IL ([expr.comma]), T.A a member of it ([expr.ref]), IL[0] its element
+    after the comma ran (an overloaded operator's operands sequenced as the built-in's, [over.match.oper]/2, [expr.sub]);
+    a loop condition is evaluated before each trip ([stmt.while]); `(Bump(), T).A = T.A + Count` reads its right side
+    first ([expr.ass]/1, C++17), Count before Bump. Refused on fa30eccf as "the comma operator after something its
+    statement runs first" (Element) or "an assignment used as a value, whose left side is no plain variable"
+    (Assign), neither of which the user wrote."""
+    base = asset('MemberOfComma')
+    keeps_invariants(base)
+
+    def loop(m, by_count=False, limit=5):           # Count bumps once per trip; A moves by 1 (or by Count before it)
+        c, a = 0, m
+        while True:
+            g = c; c += 1
+            a += g if by_count else 1
+            if not a < limit: return a * 100 + c
+    for m in (0, 3, 7):
+        for fn, want in (('Member', loop(m)), ('Element', loop(m)), ('Step', loop(m)),
+                         ('Assign', loop(m, by_count=True, limit=9))):
+            got = run(base, fn, {'Count': 0, 'T': {}, 'IL': []}, M=m)[0]
+            assert got == want, 'MemberOfComma.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+            got = VM(base, Count=0, T={}, IL=[]).call(fn, M=m)
+            assert got == want, 'runvm: MemberOfComma.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+
+
+member_of_comma()
+print('ok  MemberOfComma: a member or an element of a comma updated or assigned in a loop condition writes it, the '
+      'comma\'s left side run first on every trip')
+
+
+def member_of_comma_stmt():
+    """MemberOfComma's statement forms: a member or an element of a comma updated or assigned as a statement, in an if
+    condition, as an initializer and as a reference argument. The C++ results: the right side runs before the left
+    ([expr.ass]/1, C++17), so G() reads Count before Bump moves it, and `(Bump(), T).A = T.A + Count` reads Count
+    before Bump; the update's value is T.A itself ([expr.ass]), so IncRef's `int32&` adds 3 to T.A. Each was refused on
+    fa30eccf as "the comma operator after something its statement runs first"; nothing covered them before."""
+    base = asset('MemberOfComma')
+    vm = lambda: VM(base, Count=0, T={}, IL=[], N=0)
+    for m in (0, 3, 7):
+        compound = (1 + 10 * m) * 100 + m + 1
+        for fn, want in (('CompoundStmt', compound), ('AssignStmt', 10 * m * 100 + m + 1), ('ElementStmt', compound),
+                         ('RightReadStmt', (1 + m) * 100 + m + 1), ('StepStmt', 2 * 100 + m + 1),
+                         ('IfCond', 5 * 10000 + compound), ('Value', compound), ('RefArg', (m + 4) * 100 + m + 1)):
+            got = run(base, fn, {'Count': 0, 'T': {}, 'IL': [], 'N': 0}, M=m)[0]
+            assert got == want, 'MemberOfComma.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+            v = vm()
+            v.ref_params = True
+            got = v.call(fn, M=m)
+            assert got == want, 'runvm: MemberOfComma.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+
+
+member_of_comma_stmt()
+print('ok  MemberOfComma: the same as statements, an if condition, an initializer and a reference argument, the right '
+      'side run before the comma')
+
+
+def updated_update():
+    """UpdatedUpdate: an update, or a struct's operator=, itself updated or assigned. The C++ results: a compound
+    assignment's or a prefix `++`'s value is its left operand, an lvalue ([expr.ass], [expr.pre.incr]), and the implicit
+    operator= returns the object assigned, so `(N += G2()) += 1` is `N += G2(); N += 1`, every trip of a loop condition
+    ([stmt.while]); the right side runs first ([expr.ass]/1, C++17), so `(N += G2()) = N + 5` reads N before G2 moves
+    it; `((T = S).A += 1)` copies S, then updates T.A. Refused on fa30eccf + the r5 fixes as "TODO: assignment to
+    CompoundAssignOperator" (Loop, Step, Assigned) and "an assignment used as a value after something its statement
+    runs first" (StructLoop). An update of an update to an element, `(IL[Idx()] += M) += 1;`, would locate the element
+    twice: refused, saying so (it said "passed to a reference parameter")."""
+    base = asset('UpdatedUpdate')
+    keeps_invariants(base)
+
+    def loop(m):                                    # `while (((N += G2()) += 1) < 20) K += 1;`
+        c, n, k = 0, m, 0
+        while True:
+            c += 1; n += c; n += 1
+            if not n < 20: return k * 10000 + n * 100 + c
+            k += 1
+
+    def step(m):                                    # `while (++(N += 1) < 10) K += 1;`
+        n, k = m, 0
+        while True:
+            n += 2
+            if not n < 10: return k * 100 + n
+            k += 1
+
+    def struct_loop(m):                             # `while (((T = S).A += 1) < 5) { S.A += 1; K += 1; }`
+        s, k = m, 0
+        while True:
+            t = s + 1
+            if not t < 5: return k * 10000 + t * 100 + s
+            s += 1; k += 1
+    for m in (0, 3, 7):
+        for fn, want in (('Loop', loop(m)), ('Step', step(m)), ('Assigned', (m + 5) * 100 + 1), ('StructLoop', struct_loop(m))):
+            got = run(base, fn, {'Count': 0, 'N': 0, 'T': {}, 'S': {}}, M=m)[0]
+            assert got == want, 'UpdatedUpdate.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+            got = VM(base, Count=0, N=0, T={}, S={}).call(fn, M=m)
+            assert got == want, 'runvm: UpdatedUpdate.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+    refused('UpdUpdSlot', '  int32 Count;\n  TArray<int32> IL;\n  [[gnu::noinline]] int32 Idx() { Count += 1; return 0; }\n'
+            '  int32 F(int32 M) { IL = {0}; (IL[Idx()] += M) += 1; return IL[0]; }\n',
+            'an update (`+=`, `++`, ...) assigned to or updated, whose left side is no plain variable')
+
+
+updated_update()
+print('ok  UpdatedUpdate: an update or a struct\'s operator= updated or assigned writes the variable it names; one onto '
+      'an element is refused, saying so')
+
+
+def comma_slot_right():
+    """CommaSlotRight: a struct's or FString's `=` onto a comma whose right side is an element, `(Bump(), T) = L[Count]`.
+    C++17 sequences the right operand before the left ([expr.ass]/1; an overloaded operator's operands in that order,
+    [over.match.oper]/2), so L[Count] is located with Count before Bump; operator= reads it through its reference
+    after both, so a place the comma's left side changes reads changed (PlaceAfter). A loop condition is evaluated
+    before each trip ([stmt.while]); && evaluates its right side only when the left is true ([expr.log.and]).
+    Compiled on 075e7b28 with L[Count] located after Bump (2001 for SlotStmt)."""
+    base = asset('CommaSlotRight')
+    keeps_invariants(base)
+    for m in (0, 3):
+        cases = (('SlotStmt', 1001), ('StrSlotStmt', 101), ('SlotLoop', 2002), ('StrSlotLoop', 202),
+                 ('SlotAnd', 1001 if m > 0 else 100), ('PlaceAfter', m + 1))
+        for fn, want in cases:
+            got = run(base, fn, {'Count': 0}, M=m)[0]
+            assert got == want, 'CommaSlotRight.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+            got = VM(base, Count=0).call(fn, M=m)
+            assert got == want, 'runvm: CommaSlotRight.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+
+
+comma_slot_right()
+print('ok  CommaSlotRight: an element on the right of a struct\'s or FString\'s = onto a comma is located before the '
+      'comma runs, and read after it')
+
+
+def comma_ctor_default():
+    """CommaCtorDefault: a comma among a parenthesised constructor's arguments runs as among a call's (Get before it or
+    after it, Y is M); a comma beside nothing but a constant default argument needs no temporary, and its element
+    reaches Inc's reference (M + 5)."""
+    base = asset('CommaCtorDefault')
+    keeps_invariants(base)
+    for m, c in ((2, 0), (-1, 4)):
+        me = {'Count': float(c)}
+        got = run(base, 'Ctor', me, M=float(m))[0]
+        assert me['Count'] == c + 1 and got in {(c + 3) * 100 + m, (c + 4) * 100 + m}, ('Ctor', m, c, got, me)
+        me = {'Bumps': c}
+        assert run(base, 'DefaultRef', me, M=m)[0] == m + 5 and me['Bumps'] == c + 1, ('DefaultRef', m, c, me)
+
+
+comma_ctor_default()
+print('ok  CommaCtorDefault: a comma among a parenthesised constructor\'s arguments is a call\'s, and a constant default '
+      'argument beside one runs nothing')
+# Bound to a reference, `const T&` included, a comma whose right side is no variable cannot move into a temporary.
+refused('CommaConstSlot', '  int32 Count;\n  TArray<int32> L;\n  int32 Idx() { Count += 1; return 0; }\n'
+        '  int32 SetL() { L[0] = 50; return 1; }\n  int32 Peek(int32 X, const int32& V) { return X * 1000 + V; }\n'
+        '  int32 F(int32 M) { L = {M}; return Peek(SetL(), (Count += 1, L[Idx()])); }\n',
+        'the comma operator here is written to or bound to a reference (a `T&` or `const T&` parameter)')
+print('ok  CommaConstSlot: a comma bound to a const T& beside an argument that may run first, its right side no '
+      'variable, is refused by name')
+
+
+def expr_temps():
+    """ExprTemps: `TArray<int32>{1, 2, M}` as an argument is that array; a UE_STRUCT's `FEtSlot()` has its members'
+    defaults (A 1, B 2), passed or stored; `A = B = E` sets both, for a number, a string and a struct; `B = A += E`
+    adds first, B getting A's new value."""
+    base = asset('ExprTemps')
+    keeps_invariants(base)
+    for m in (-4, 0, 9):
+        assert run(base, 'ListArg', M=m)[0] == 300 + m, ('ListArg', m)
+        assert run(base, 'StructLocal', M=m)[0] == (1 + m) * 10 + 2, ('StructLocal', m)
+        me = {'A': 0, 'B': 0}
+        assert run(base, 'ChainInt', me, E=m)[0] == m * 11 and me == {'A': m, 'B': m}, ('ChainInt', m, me)
+        me = {'A': 0, 'B': 0}
+        assert run(base, 'ChainCompound', me, E=m)[0] == (5 + m) * 101 and me == {'A': 5 + m, 'B': 5 + m}, ('ChainCompound', m, me)
+        assert run(base, 'ChainStruct', {}, M=m)[0] == (m * 10 + m + 1) * 101, ('ChainStruct', m)
+    assert run(base, 'StructArg')[0] == 12
+    for e in ('', 'ab'):
+        me = {'SA': 'x', 'SB': 'y'}
+        assert run(base, 'ChainString', me, E=e)[0] == e + e and me == {'SA': e, 'SB': e}, ('ChainString', e, me)
+    # Read again after the store, the left side must be a plain variable; and where a comma could not move, neither can it.
+    refused('AssignElement', '  int32 A;\n  int32 F(int32 M) { TArray<int32> L = {1}; A = L[0] = M; return A; }\n',
+            'an assignment used as a value, whose left side is no plain variable')
+    refused('AssignBrace', '  int32 A;\n  [[gnu::noinline]] int32 G() { return A; }\n'
+            '  int32 F(int32 M) { FCbPair T = {G(), (A = M)}; return T.B; }\n',
+            'an assignment used as a value after something its statement runs first', COMMA_TOP)
+
+
+expr_temps()
+print('ok  ExprTemps: TArray<T>{...} and a UE_STRUCT\'s T() are values, and a chained assignment sets both sides')
 check('FlowTest', 'Classify', classify, [dict(Code=c) for c in range(-2, 8)])
 check('FlowTest', 'NoDefault', no_default, [dict(Code=c) for c in (-1, 0, 1, 9, 10)])
 check('FlowTest', 'NameSet', lambda N: 2 if N.lower() == 'none' else 1, [dict(N=n) for n in ('None', 'none', 'IntProperty', 'x', 'None_1')])
@@ -1833,6 +2389,164 @@ def final_calls():
 final_calls()
 
 
+def final_as():
+    """UE_FINAL_AS: the base's calls on `this` expand as a final class's do, and one that stays a call is bound to the
+    base's function, Final as a final class's; the base is cooked Abstract and the leaf, the one class made, is not; any
+    other subclass of the base is refused."""
+    folder = os.path.dirname(asset('FinalAsTest'))
+    base, leaf = os.path.join(folder, 'UFinalAsBase'), asset('FinalAsTest')
+    for c in (0, 5):
+        for v in (-3, 7):
+            f = dict(Counter=c)
+            got = run(base, 'UseBump', self_vars=f, V=v)[0]
+            assert got == (c + v) * 100 + c + 2 * v and f == dict(Counter=c + 2 * v), ('UseBump', c, v, got, f)
+    assert not [n for n, op in calls_in(base, 'UseBump') if n in exports_of(base)], calls_in(base, 'UseBump')
+    # A call that stays a call - noinline, recursion - is bound to the base's own function (EX_LocalFinalFunction), as
+    # a final class's is, and those functions are Final and not BlueprintEvent.
+    fact = lambda v: 1 if v <= 1 else v * fact(v - 1)
+    for v in (-2, 0, 5):
+        assert run(base, 'UseKept', V=v)[0] == (v + 1) * 10 + v and run(base, 'Fact', V=v)[0] == fact(v), v
+    reached = lambda fn: {name for name, op in calls_in(base, fn) if name in exports_of(base) and op == 0x46}
+    assert reached('UseKept') == {'Kept'} and reached('Fact') == {'Fact'}, (calls_in(base, 'UseKept'), calls_in(base, 'Fact'))
+    flags = lambda fn: int(re.search(r'FunctionFlags (\S+)', dump('dumpstruct.py', base, export_index(base, fn))).group(1), 16)
+    for fn in ('Bump', 'Kept', 'Fact'):
+        assert flags(fn) & 0x1 and not flags(fn) & 0x8000000, (fn, hex(flags(fn)))
+    abstract = lambda b: int(re.search(r'ClassFlags (\S+)', dump('dumpstruct.py', b, 0)).group(1), 16) & 0x1
+    assert abstract(base) and not abstract(leaf)
+    refused('FinalAsTwo', '', 'derives from FaBase, which is UE_FINAL_AS FaLeaf',
+            top='class FaBase : public AActor {\npublic:\n  int32 X;\n};\nUE_FINAL_AS(FaBase, FaLeaf);\n'
+                'class FaOther : public FaBase {};\n')
+    # A base with UE_CLASS, as a header shared by mods declares it, is a mod class like any other.
+    refused('FinalAsHdr', '', 'derives from FaHdr, which is UE_FINAL_AS FaHdrLeaf',
+            top='class FaHdr : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/FinalAsHdr/FaHdr", "FaHdr_C");\n};\n'
+                'UE_FINAL_AS(FaHdr, FaHdrLeaf);\nclass FaHdrOther : public FaHdr {};\n')
+    refused('FinalAsTwice', '', 'FaTwo has two UE_FINAL_AS leaves, FaTwoA and FaTwoB',
+            top='class FaTwo : public AActor {\npublic:\n  int32 X;\n};\nUE_FINAL_AS(FaTwo, FaTwoB);\nUE_FINAL_AS(FaTwo, FaTwoA);\n')
+    print('ok  FinalAsTest: UE_FINAL_AS compiles the base as final, cooks it Abstract, and refuses a second subclass '
+          'or a second leaf')
+
+
+final_as()
+
+
+def final_as_pure():
+    """UE_FINAL_AS on a base with a `= 0` method is refused: the leaf, the one class made, would be abstract too
+    (IsAbstract walks its chain to the method), so nothing could be spawned, and the base's calls to the method are
+    bound to its empty stub."""
+    refused('FinalAsPure', '', 'UE_FINAL_AS(FaPureBase, FaPureLeaf): FaPureBase::Need is `= 0`',
+            top='class FaPureBase : public AActor {\npublic:\n  virtual int32 Need(int32 V) = 0;\n'
+                '  int32 Use(int32 V) { return Need(V) + 1; }\n};\nUE_FINAL_AS(FaPureBase, FaPureLeaf);\n')
+
+
+final_as_pure()
+print('ok  FinalAsTest: UE_FINAL_AS on a base with a `= 0` method is refused')
+
+
+def func_stub_super():
+    """FuncStubSuper: FssRoot leaves IFssTell's Tell out and gets its empty stub. FssKid's Tell and the UE_FINAL_AS
+    base FssBase's override that stub: each has it as its super (func_super_link) and its flags, so FssBase's is not
+    Final; and a call by name from FssRoot's code reaches each class's own."""
+    leaf = asset('FuncStubSuper')
+    p = lambda c: os.path.join(os.path.dirname(leaf), c)
+    root, kid, base = p('FssRoot'), p('FssKid'), p('FssBase')
+    for b in (root, kid, base, leaf): keeps_invariants(b)
+    flags = lambda b: int(re.search(r'FunctionFlags (\S+)', dump('dumpstruct.py', b, export_index(b, 'Tell'))).group(1), 16)
+    assert flags(kid) == flags(base) == flags(root) and not flags(base) & 0x1, (hex(flags(root)), hex(flags(kid)), hex(flags(base)))
+    for chain, fn, want in (([kid, root], 'RootCall', 41), ([base, root], 'UseTell', 82), ([leaf, base, root], 'RootCall', 81)):
+        got = run_as(chain, fn, {}, V=4)
+        assert got == want, (fn, got, want)
+    print('ok  FuncStubSuper: an override of an interface stub a mod ancestor got has that stub as its super')
+
+
+def func_import_call():
+    """FuncImportUser calls into FuncImportOwner's classes through a shared header. A Blueprint function is no
+    native whose thunk dispatches: EX_FinalFunction runs exactly the one it names (ScriptCore.cpp 3005-3009). So Via's
+    call to Bump, which FicKid overrides, goes by name, as the editor calls a function without FUNC_Final, and reaches
+    FicKid's on a FicKid; the final Fixed and the static Twice are bound to FicBase's, and FicUserKid's parent call is
+    FicBase's own."""
+    asset('FuncImportOwner')
+    user = asset('FuncImportUser')
+    kid = os.path.join(os.path.dirname(user), 'FicUserKid')
+    for b in (user, kid): keeps_invariants(b)
+    assert calls_in(user, 'Via') == [('Bump', 0x1B)], calls_in(user, 'Via')
+    for b, fn, callee in ((user, 'ViaFixed', 'Fixed'), (user, 'ViaStatic', 'Twice'), (kid, 'Bump', 'Bump')):
+        assert calls_in(b, fn) == [(callee, 0x1C)], (fn, calls_in(b, fn))
+        assert '/Game/_ElytrasMods/FuncImportOwner/FicBase.FicBase_C:' + callee in import_paths(b), (fn, import_paths(b))
+
+
+func_import_call()
+print('ok  FuncImportCall: a call to another mod\'s Blueprint function goes by name unless it is final, static or a '
+      'parent call')
+
+
+def final_as_shared():
+    """FinalAsShared.h declares a UE_CLASS base and its UE_FINAL_AS beside it. FinalAsOwner, whose path the base's is,
+    cooks both; FinalAsUser includes the header and cooks neither: its cast to the leaf and its call through one name
+    the owner's FaShLeaf, the class every leaf object is, as a cast to the base names the owner's FaShBase."""
+    leaf = os.path.join(os.path.dirname(asset('FinalAsOwner')), 'FaShLeaf')
+    user = asset('FinalAsUser')
+    assert os.path.exists(leaf + '.uasset') and os.path.exists(os.path.join(os.path.dirname(leaf), 'FaShBase.uasset'))
+    made = sorted(f for f in os.listdir(os.path.dirname(user)) if f.endswith('.uasset'))
+    assert made == ['FinalAsUser.uasset'], made
+    paths = import_paths(user)
+    assert '/Game/_ElytrasMods/FinalAsOwner/FaShLeaf.FaShLeaf_C' in paths, paths
+    keeps_invariants(user)
+
+
+final_as_shared()
+print('ok  FinalAsTest: a UE_FINAL_AS in a shared header makes the base owner\'s leaf, imported by every other mod')
+
+
+def final_as_foreign():
+    """UE_FINAL_AS over a base this source does not cook. A game Blueprint stays as the game has it - not final, its own
+    subclasses kept - so it is refused. Another mod's UE_CLASS base is final only where its owner says so, in the header
+    it shares (FinalAsShared): written in a mod's own source, the leaf would be pinned beside the owner's base, imported,
+    and never cooked by the owner, so it is refused there."""
+    refused('FinalAsGame', '', 'BP_TutorialComponent_C is the game\'s Blueprint',
+            top='#include "UeApi/Game/BP_TutorialComponent_C.h"\nUE_FINAL_AS(BP_TutorialComponent_C, FagLeaf);\n')
+    refused('FinalAsForeign', '', 'only the UE_FINAL_AS in the header that declares it',
+            top='class FafBase : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/FafOwner/FafBase", "FafBase_C");\n'
+                '  int32 Bump(int32 V);\n};\nUE_FINAL_AS(FafBase, FafLeaf);\n')
+
+
+final_as_foreign()
+print('ok  FinalAsTest: UE_FINAL_AS over a base this mod does not cook is refused, unless written in the header its '
+      'owner shares')
+
+
+def final_as_private_header():
+    """UE_FINAL_AS over another mod's base counts only in the header its owner's own source includes, so that the owner
+    cooks the leaf. A header of this mod's own that re-declares the base with its UE_CLASS is the same text, but the
+    owner never sees it: refused. An owner of several sources, whose UE_MOD_PACKAGE is in one and whose header another
+    includes, is the owner all the same: another mod including that header compiles."""
+    head = '﻿#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\n'
+    base = lambda b, owner: ('class %s : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/%s/%s", "%s_C");\n'
+                             '  int32 Bump(int32 V);\n};\nUE_FINAL_AS(%s, %sLeaf);\n' % (b, owner, b, b, b, b))
+    user = lambda mod, inc, b: (head + '#include "%s"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\nclass %s : public AActor '
+                                '{\npublic:\n  int32 Use(%sLeaf* L) { return L->Bump(1); }\n};\n' % (inc, mod, mod, b))
+    files = {'PvHdr/PvPriv.h': '﻿#pragma once\n' + head[1:] + base('PvBase', 'PvOwner'),
+             'PvHdr/PvHdr.cpp': user('PvHdr', 'PvPriv.h', 'PvBase'),
+             'FapOwner/Shared.h': '﻿#pragma once\n' + head[1:] + base('FapBase', 'FapOwner'),
+             'FapOwner/FapOwner.cpp': head + 'UE_MOD_PACKAGE("/Game/_ElytrasMods/FapOwner");\n',
+             'FapOwner/Part.cpp': head + '#include "Shared.h"\nint32 FapBase::Bump(int32 V) { return V + 1; }\n',
+             'FapUser/FapUser.cpp': user('FapUser', '../FapOwner/Shared.h', 'FapBase')}
+    with tempfile.TemporaryDirectory() as tmp:
+        for rel, text in files.items():
+            os.makedirs(os.path.dirname(os.path.join(tmp, rel)), exist_ok=True)
+            with open(os.path.join(tmp, rel), 'w', encoding='utf-8', newline='\n') as f: f.write(text)
+        out = os.path.join(tmp, 'out')
+        os.makedirs(out)
+        proc = assetgen_compile([os.path.join(tmp, 'FapUser', 'FapUser.cpp'), UEAPI, out])
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        proc = assetgen_compile([os.path.join(tmp, 'PvHdr', 'PvHdr.cpp'), UEAPI, out])
+        assert proc.returncode != 0 and 'only the UE_FINAL_AS in the header that declares it' in proc.stdout, proc.stdout
+
+
+final_as_private_header()
+print('ok  FinalAsTest: UE_FINAL_AS over another mod\'s base in a header of this mod\'s own is refused; in the header its '
+      'owner\'s sources include it is not')
+
+
 # ---- NestedTest
 
 def nested_containers():
@@ -2482,10 +3196,13 @@ def inherited_defaults():
 def run_as(chain, fn, fields, **parms):
     """Runs fn on an object of class chain[0] whose mod ancestors are chain[1:] (package bases) as the VM
     dispatches: a call by name runs the most derived definition, EX_FinalFunction exactly the function its import
-    names. (runscript alone looks both up in the calling package.)"""
+    names. (runscript alone looks both up in the calling package.) A final call goes by its import, (package, index):
+    one package can call two classes' functions of one name, a forwarding override its parent's and a qualified call
+    an ancestor's."""
     import runscript
     names = {b: exports_of(b) for b in chain}
     owner = lambda f: next(b for b in chain if f in names[b])
+    same = lambda a, b: os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
     finals = {}
     for b in chain:
         paths = import_paths(b)
@@ -2493,12 +3210,13 @@ def run_as(chain, fn, fields, **parms):
             for imp in re.findall(r'FinalFunction\s+imp\[(\d+)\]', dump('walkscript.py', b, i)):
                 pkg, _, fname = paths[int(imp)].rpartition(':')
                 if pkg.startswith('/Game/'):                        # a mod function, in a package beside this one
-                    finals[fname] = os.path.join(os.path.dirname(chain[0]), pkg.split('.')[0].rsplit('/', 1)[1])
+                    t = os.path.join(os.path.dirname(chain[0]), pkg.split('.')[0].rsplit('/', 1)[1])
+                    finals[fname] = finals[b, int(imp)] = (next((c for c in chain if same(c, t)), t), fname)
     saved = runscript.run, runscript.params_of, dict(runscript.MATH)
     runscript.run = lambda base, f, self_vars=None, **p: saved[0](owner(f), f, self_vars, **p)
     runscript.params_of = lambda base, f, *flag: saved[1](owner(f), f, *flag)
-    for f, target in finals.items():
-        runscript.MATH[f] = (lambda t, f: lambda *a: saved[0](t, f, fields, **dict(zip(saved[1](t, f), a)))[0])(target, f)
+    for k, (target, f) in finals.items():
+        runscript.MATH[k] = (lambda t, f: lambda *a: saved[0](t, f, fields, **dict(zip(saved[1](t, f), a)))[0])(target, f)
     try:
         return saved[0](owner(fn), fn, fields, **parms)[0]
     finally:
@@ -2600,6 +3318,13 @@ def engine_names():
     assert pflags('Limit') & 0x10 and not any(pflags(p) & 0x10 for p in ('Seed', 'Charges', 'Plain')), props
     assert 'Limit [0] IntProperty size=4: 3' in cdo, cdo
     print('ok  NameTest: a const member is BlueprintReadOnly')
+    # UE_READONLY: BlueprintReadOnly as well, and a write from code is kept (the VM allows it) with a warning.
+    assert pflags('Cap') & 0x10 and 'Cap [0] IntProperty size=4: 5' in cdo, (props, cdo)
+    f = {'Cap': 5}
+    run(base, 'Raise', self_vars=f)
+    assert f == {'Cap': 9}, f
+    assert 'warning: NameTest::Raise: Cap is BlueprintReadOnly' in LOGS['NameTest'], LOGS['NameTest']
+    print('ok  NameTest: a UE_READONLY member is BlueprintReadOnly, and a write to it is kept with a warning')
 
 
 def object_forwards():
@@ -2648,14 +3373,14 @@ def api_stub():
                    for i, e in enumerate(exports) if e['name'].startswith('K2Node_FunctionEntry')}
     category = b'Names|Test'.hex()
     # A private field is left out; the const one is offered read-only (CPF_BlueprintReadOnly 0x10).
-    assert set(variables) == {'Charges', 'Plain', 'Limit'}, set(variables)
+    assert set(variables) == {'Charges', 'Plain', 'Limit', 'Cap'}, set(variables)
     rflags = lambda v: struct.unpack('<Q', bytes.fromhex(re.search(r'PropertyFlags \[0\] UInt64Property size=8: (\w+)', variables[v]).group(1)))[0]
-    assert rflags('Limit') & 0x10 and not rflags('Charges') & 0x10 and not rflags('Plain') & 0x10
+    assert rflags('Limit') & 0x10 and rflags('Cap') & 0x10 and not rflags('Charges') & 0x10 and not rflags('Plain') & 0x10
     # UE_CATEGORY files Charges and Peek; Plain follows UE_CATEGORY("") and has none.
     assert category in variables['Charges'] and 'Category' not in variables['Plain'], variables
     assert category in entries['Peek'] and not any(category in entries[f] for f in entries if f != 'Peek'), entries
     # Every method is offered, its entry node carrying its access specifier and purity (ExtraFlags).
-    assert set(entries) == {'Next', 'Peek', 'SameKind', 'Step', 'Twice', 'Whose'}, set(entries)
+    assert set(entries) == {'Next', 'Peek', 'Raise', 'SameKind', 'Step', 'Twice', 'Whose'}, set(entries)
     extra = lambda f: int(re.search(r'ExtraFlags \[0\] IntProperty size=4: (-?\d+)', entries[f]).group(1))
     for f in entries:
         assert extra(f) & 0xE0000 == {'Step': 0x80000, 'Twice': 0x40000}.get(f, 0x20000), (f, hex(extra(f)))
@@ -3319,6 +4044,7 @@ interface_calls()
 inherited_defaults()
 parent_call()
 pure_virtual()
+func_stub_super()
 engine_names()
 object_forwards()
 api_stub()
@@ -3949,6 +4675,152 @@ def preload_game_parent():
 if preload_game_parent():
     print('ok  PreloadGameParent: a child of a game Blueprint is serialized after every default subobject its parent\'s '
           'CDO exports')
+
+
+def preload_case_kid():
+    """PreloadCaseKid restates the grunt's Temperature by the name UeApi gives it, temperature (the object dump's
+    spelling). FName compares without case, so that is one object: one import row, which is both the override's
+    archetype and a parent subobject the class is serialized after (import_unique, edl_parent_subobjects_serialized)."""
+    if not GAME:
+        print('--  PreloadCaseKid: skipped (needs --game: the parent CDO\'s subobjects are read off the game\'s package)')
+        return False
+    base = asset('PreloadCaseKid')
+    saved = list(invariants.GAME_CONTENT)
+    invariants.GAME_CONTENT[:] = [GAME]
+    try:
+        found = invariants.check(invariants.Package(base), {'import_unique', 'edl_parent_subobjects_serialized'})
+    finally:
+        invariants.GAME_CONTENT[:] = saved
+    assert not found, '; '.join('%s %s: %s' % f for f in found[:3])
+    return True
+
+
+if preload_case_kid():
+    print('ok  PreloadCaseKid: a restated subobject spelled in another case than the parent\'s export is one import')
+
+
+def preload_nested_kid():
+    """PreloadNestedKid's parent, the game's WPN_Pickaxe_C, exports an instanced bonus under each of two default
+    subobjects (Damage:BreakIceBonus_0): the class is serialized after those too, as after every default subobject,
+    since the CDO it makes then copies each from them (edl_parent_subobjects_serialized walks every depth)."""
+    if not GAME:
+        print('--  PreloadNestedKid: skipped (needs --game: the parent CDO\'s subobjects are read off the game\'s package)')
+        return False
+    base = asset('PreloadNestedKid')
+    saved = list(invariants.GAME_CONTENT)
+    invariants.GAME_CONTENT[:] = [GAME]
+    try:
+        found = invariants.check(invariants.Package(base), {'edl_parent_subobjects_serialized', 'import_unique'})
+    finally:
+        invariants.GAME_CONTENT[:] = saved
+    assert not found, '%d findings, e.g. %s' % (len(found), '; '.join('%s %s: %s' % f for f in found[:2]))
+    keeps_invariants(base)
+    return True
+
+
+if preload_nested_kid():
+    print('ok  PreloadNestedKid: a child of a game Blueprint is serialized after its parent CDO\'s nested subobjects too')
+
+
+def ueapi_too_old():
+    """A UeApi that a genueapi older than the compiler wrote is refused, saying to regenerate it, before the compile
+    reads any of it: one made before UeDefaultSubobjects compiles a game Blueprint's child with none of the ordering
+    edges above, and says nothing. Here a UeApi with no Version.json (any made before genueapi stamped one, which has
+    its tables) and one stamped 0."""
+    import tempfile
+    src = os.path.join(TESTS, 'PreloadCaseKid.cpp')
+    for stamp in (None, '{"genueapi": 0}\n'):
+        with tempfile.TemporaryDirectory() as tmp:
+            stale = os.path.join(tmp, 'UeApi')
+            os.makedirs(stale)
+            with open(os.path.join(stale, 'Conv.json'), 'w', encoding='utf-8') as f: f.write('[]\n')
+            if stamp:
+                with open(os.path.join(stale, 'Version.json'), 'w', encoding='utf-8') as f: f.write(stamp)
+            proc = assetgen_compile([src, stale, os.path.join(tmp, 'out')])
+            assert proc.returncode != 0 and 'older genueapi' in proc.stdout and 'regenerate' in proc.stdout, \
+                (stamp, proc.stdout[-500:])
+
+
+ueapi_too_old()
+print('ok  a UeApi older than the compiler, or with no Version.json, is refused, saying to regenerate it')
+
+
+def ueapi_not_one():
+    """A folder that is no UeApi at all - a mod folder, which has no Version.json, Types.json or Conv.json, or a path
+    that does not exist - is reported as such, `missing or invalid <dir>/<File> (run genueapi.py)`, and not as one an
+    older genueapi wrote."""
+    import tempfile
+    src = os.path.join(TESTS, 'PreloadCaseKid.cpp')
+    with tempfile.TemporaryDirectory() as tmp:
+        for api in (os.path.join(AG, 'tests'), os.path.join(tmp, 'NoSuchFolder')):
+            proc = assetgen_compile([src, api, os.path.join(tmp, 'out')])
+            assert proc.returncode != 0 and 'missing or invalid' in proc.stdout and 'run genueapi.py' in proc.stdout \
+                and 'older genueapi' not in proc.stdout, (api, proc.stdout[-500:])
+
+
+ueapi_not_one()
+print('ok  UeApi: a folder that is no UeApi is reported as none, not as an older one')
+
+
+def ueapi_without_game():
+    """genueapi without --game writes no game Blueprint's UeDefaultSubobjects or UeClassTail, which reads as a Blueprint
+    with none: a class deriving from one would compile without a word and load before its parent's subobjects. Its
+    Version.json says "game": false, and such a class is refused, saying to regenerate with --game; one with a native
+    parent still compiles. Here this UeApi's own headers, included by their full path, under tables whose Version.json
+    says false."""
+    import json, shutil, tempfile
+    real = os.path.abspath(UEAPI).replace('\\', '/')
+    with tempfile.TemporaryDirectory() as tmp:
+        api = os.path.join(tmp, 'UeApi')
+        os.makedirs(api)
+        for f in glob.glob(os.path.join(UEAPI, '*.json')):
+            shutil.copy(f, api)
+        stamp = json.load(open(os.path.join(UEAPI, 'Version.json'), encoding='utf-8'))
+        stamp['game'] = False
+        json.dump(stamp, open(os.path.join(api, 'Version.json'), 'w', encoding='utf-8'))
+        for mod, header, parent, ok in (('NoGameKid', 'Game/ENE_Spider_Grunt_Normal_C.h', 'ENE_Spider_Grunt_Normal_C', False),
+                                        ('NoGameActor', 'Engine.h', 'AActor', True)):
+            src = os.path.join(tmp, mod + '.cpp')
+            with open(src, 'w', encoding='utf-8') as f:
+                f.write('#include "%s/UeMeta.h"\n#include "%s/%s"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\n'
+                        'class %s : public %s {\npublic:\n    int32 Count;\n};\n' % (real, real, header, mod, mod, parent))
+            proc = assetgen_compile([src, api, os.path.join(tmp, 'out', mod)])
+            if ok:
+                assert proc.returncode == 0, (mod, proc.stdout[-500:])
+            else:
+                assert proc.returncode != 0 and 'without --game' in proc.stdout and 'regenerate' in proc.stdout, \
+                    (mod, proc.stdout[-500:])
+
+
+ueapi_without_game()
+print('ok  a UeApi made without --game refuses a class deriving from a game Blueprint, saying to regenerate it with '
+      '--game; a native parent still compiles')
+
+
+def subobject_bomber():
+    """SubobjectBomber restates two of ABomber's own members that two default subobjects each fit, neither named for
+    the member: GooSoundComponent is GooAudioComponent, AcidEmitterLeft is GooEmitterLeft, as the game's ENE_Bomber_C
+    default object says. Each override is an export of the subobject's name under the class's CDO, archetyped on
+    Default__Bomber's subobject, and the CDO's tag of the member names it."""
+    import struct
+    base = asset('SubobjectBomber')
+    pkg = invariants.Package(base)
+    cdo = pkg.find('Default__SubobjectBomber_C')
+    for member, sub, value in (('GooSoundComponent', 'GooAudioComponent', ('VolumeMultiplier', 0.5)),
+                               ('AcidEmitterLeft', 'GooEmitterLeft', ('SecondsBeforeInactive', 2.0))):
+        k = next((k for k, e in enumerate(pkg.exports) if e['name'] == sub and e['outer'] == cdo + 1), None)
+        assert k is not None, 'no %s export under the CDO for %s' % (sub, member)
+        assert pkg.path(pkg.exports[k]['tmpl']) == '/Script/FSD.Default__Bomber:' + sub, pkg.path(pkg.exports[k]['tmpl'])
+        t = pkg.tag(cdo, member)
+        assert t and struct.unpack_from('<i', t['value'])[0] == k + 1, (member, t)
+        t = pkg.tag(k, value[0])
+        assert t and struct.unpack_from('<f', t['value'])[0] == value[1], (sub, value[0], t)
+    keeps_invariants(base)
+
+
+subobject_bomber()
+print('ok  SubobjectBomber: a member two subobjects fit, neither named for it, overrides the one the game\'s Blueprint '
+      'names')
 
 
 # ---- TABLES: the package's own tables - names and their numbers, imports, exports, archetypes
@@ -4689,6 +5561,405 @@ print('ok  override refusals: other parameters than a native event\'s, a mod par
       'a name of a native non-event')
 
 
+def func_final_inherited():
+    """FuncFinalInherited (`final`) calls FfBase's AuthOnly, ServerBump and Kept unqualified, FfOwn (`final`) its own
+    AuthOnly, an override, and FfOther AuthOnly through a FuncFinalInherited pointer. None of them is FUNC_Final, so
+    each is a call by name, which finds that same function, no class deriving from a final one (call_opcode_flags:
+    the editor binds a call to a function without FUNC_Final only as a parent call); each runs that function."""
+    kid = asset('FuncFinalInherited')
+    folder = os.path.dirname(kid)
+    base, own, other = (os.path.join(folder, c) for c in ('FfBase', 'FfOwn', 'FfOther'))
+    for b in (kid, own, other): keeps_invariants(b)
+    for chain, fn, want in (([kid, base], 'CallAuth', 3), ([kid, base], 'CallServer', 2), ([own, base], 'CallAuth', 30)):
+        fields = {'Seen': 0}
+        run_as(chain, fn, fields)
+        assert fields['Seen'] == want, (os.path.basename(chain[0]), fn, fields)
+    assert run_as([kid, base], 'CallKept', {}) == 2
+
+
+func_final_inherited()
+print('ok  FuncFinalInherited: a final class calls an inherited or overriding function that is not FUNC_Final by name')
+
+
+def func_inline_parent():
+    """FuncInlineParent: `IpBase::AuthOnly()` in an inline method runs IpBase's AuthOnly in each class its body is
+    copied into - FuncInlineParent and IpKid, below IpMid's AuthOnly; IpDirect, with none between, also on an
+    IpDirectKid, which overrides AuthOnly - bound from that class's own AuthOnly, an override forwarding to its
+    parent's (call_opcode_flags), with no warning. A call by name to AuthOnly still runs the object's own."""
+    top = asset('FuncInlineParent')
+    p = lambda *cs: [os.path.join(os.path.dirname(top), c) for c in cs]
+    mid = p('FuncInlineParent', 'IpMid', 'IpBase')
+    kid, direct = p('IpKid') + mid, p('IpDirect', 'IpBase')
+    dkid = p('IpDirectKid') + direct
+    for b in mid[:2] + kid[:1] + direct[:1] + dkid[:1]: keeps_invariants(b)
+    for chain, fn, want in ((mid, 'Use', 3), (kid, 'Use', 3), (kid, 'UseKid', 3), (direct, 'Use2', 3), (dkid, 'Use2', 3),
+                            (dkid, 'UseKid2', 3), (kid, 'AuthOnly', 7), (dkid, 'AuthOnly', 70)):
+        fields = {'Seen': 0}
+        run_as(chain, fn, fields)
+        assert fields['Seen'] == want, (os.path.basename(chain[0]), fn, fields)
+    assert 'is a call by name' not in LOGS['FuncInlineParent'], LOGS['FuncInlineParent']
+
+
+func_inline_parent()
+print('ok  FuncInlineParent: Base::Fn() in an inline method binds Base\'s from each class the body is copied into')
+
+
+def func_qualified_self():
+    """FuncQualifiedSelf: `FuncQualifiedSelf::H()` in the class's own code runs its own H on an SqKid too, which
+    overrides H: H's body is copied in. Auth's cannot be (authority-only), and a call bound to a function a subclass
+    can override is no Blueprint's, so that one stays a call by name, with a warning."""
+    kid = os.path.join(os.path.dirname(asset('FuncQualifiedSelf')), 'SqKid')
+    chain = [kid, os.path.join(os.path.dirname(kid), 'FuncQualifiedSelf')]
+    for b in chain: keeps_invariants(b)
+    got = run_as(chain, 'CallH', {})
+    assert got == 5, 'FuncQualifiedSelf::H() on an SqKid returned %r' % got
+    log = LOGS['FuncQualifiedSelf']
+    assert 'FuncQualifiedSelf::Auth() is a call by name' in log and 'FuncQualifiedSelf::H()' not in log, log
+
+
+func_qualified_self()
+print('ok  FuncQualifiedSelf: Self::Fn() in its own class runs its own Fn, copied in, or warns')
+
+
+def func_forwarder_order():
+    """FuncForwarderOrder: AaFoKid and ZzFoKid each get an override of Auth forwarding to FoMid's, itself one
+    forwarding to FoRoot's. Each kid's calls the function it overrides, its super, as the editor's call to a parent
+    function does, whichever side of FoMid the kid's name sorts on."""
+    mid = os.path.join(os.path.dirname(asset('FuncForwarderOrder')), 'FoMid')
+    folder = os.path.dirname(mid)
+    for kid in ('AaFoKid', 'ZzFoKid'):
+        base = os.path.join(folder, kid)
+        pkg = invariants.Package(base)
+        sup = pkg.path(pkg.struct(pkg.find('Auth')).super)
+        calls = [where for fn, op, where, flags in func_calls(base) if fn == 'Auth']
+        assert sup.endswith('/FoMid.FoMid_C:Auth') and calls == [sup], (kid, sup, calls)
+        fields = {'Seen': 0}
+        run_as([base, mid, os.path.join(folder, 'FoRoot')], 'KidCall', fields)
+        assert fields['Seen'] == 3, (kid, fields)
+
+
+func_forwarder_order()
+print('ok  FuncForwarderOrder: a forwarding override calls its own super, whatever its class\'s name')
+
+
+def func_iface_inherited():
+    """FuncIfaceInherited implements IFiTell, whose Tell, Kept, Ping, Twice and Auth it inherits from FiRoot. Each of
+    its own calls FiRoot's - Twice, inline, expanded in it; Auth, authority-only, bound and authority-only itself, as an
+    override takes its parent's flags - so a call by name or through the interface runs FiRoot's: either finds the
+    class's own function first (UClass::FindFunctionByName, Class.cpp 5281-5323), and with none would find the
+    interface's empty one before the super's. FiKid's Tell and Auth override those two, and their `FiRoot::` calls run
+    FiRoot's."""
+    kid = asset('FuncIfaceInherited')
+    folder = os.path.dirname(kid)
+    chain = [kid, os.path.join(folder, 'FiRoot')]
+    fikid = [os.path.join(folder, 'FiKid')] + chain
+    for b in (kid, fikid[0]): keeps_invariants(b)
+    assert {'Tell', 'Kept', 'Ping', 'Twice', 'Auth'} <= set(exports_of(kid)), exports_of(kid)
+    got = run_as(chain, 'Tell', {}, V=2), run_as(chain, 'Kept', {}, V=2), run_as(chain, 'Twice', {}, V=2)
+    assert got == (3, 20, 4), 'Tell(2), Kept(2), Twice(2) on a FuncIfaceInherited returned %r, %r, %r' % got
+    for c, fn, parms, want, seen in ((chain, 'Ping', {}, None, 9), (chain, 'Auth', {'V': 2}, 6, 2), (fikid, 'Auth', {'V': 2}, 106, 2)):
+        fields = {'Seen': 0}
+        got = run_as(c, fn, fields, **parms)
+        assert (want is None or got == want) and fields['Seen'] == seen, (os.path.basename(c[0]), fn, got, fields)
+    assert run_as(fikid, 'Tell', {}, V=2) == 103
+    pkg = invariants.Package(kid)
+    assert pkg.struct(pkg.find('Auth')).function_flags & 0x4, 'FuncIfaceInherited::Auth is not BlueprintAuthorityOnly'
+    pkg = invariants.Package(fikid[0])
+    for fn in ('Tell', 'Auth'):
+        sup = pkg.path(pkg.struct(pkg.find(fn)).super)
+        assert sup.endswith('/FuncIfaceInherited.FuncIfaceInherited_C:' + fn), (fn, sup)
+
+
+func_iface_inherited()
+print('ok  FuncIfaceInherited: an interface function an ancestor has runs the ancestor\'s, not an empty stub')
+# A multicast no forwarder can call (it would be sent twice on a server), so the stub would replace it: refused.
+refused('FuncIfaceMulticast', '', 'the IfmRoot::Ping it inherits is a multicast',
+        top='class IIfmPing {\npublic:\n  UE_INTERFACE;\n  void Ping();\n};\n'
+            'class IfmRoot : public AActor {\npublic:\n  int32 Seen = 0;\n  UE_MULTICAST void Ping() { Seen = 1; }\n};\n'
+            'class IfmKid : public IfmRoot, public IIfmPing {\npublic:\n};\n')
+print('ok  FuncIfaceMulticast: an interface function inherited as a multicast, which no override can call, is refused')
+# A static of that name: the class's function of that name, the stub too, is an override of the static to the editor
+# (its super is ParentClass->FindFunctionByName), which refuses a non-static one ("Check flags: Exec, Final, Static").
+refused('FuncIfaceStatic', '', 'the FsRoot::Tell it inherits is static: the editor takes such a function for an override '
+        'of the static and refuses it',
+        top='class IFsTell {\npublic:\n  UE_INTERFACE;\n  int32 Tell(int32 V);\n};\n'
+            'class FsRoot : public AActor {\npublic:\n  static int32 Tell(int32 V) { return V + 1; }\n};\n'
+            'class FsKid : public FsRoot, public IFsTell {\npublic:\n  int32 Ask() { return FsRoot::Tell(4); }\n};\n')
+print('ok  FuncIfaceStatic: an interface function inherited as a static is refused, as the editor refuses its override')
+
+
+def func_static_above():
+    """A function named like a mod ancestor's static is an override of it to the editor (its super is
+    ParentClass->FindFunctionByName, KismetCompiler.cpp 1733-1774), which refuses one that is not static, or a static
+    over one that is not ("Check flags: Exec, Final, Static", 1855-1868): a method of the class's own, an interface
+    implementation it declares, a static over a method. A static over a static splits no caller - each call to either is
+    bound - so FuncStaticHide compiles, its Tell linked to FshRoot's as its super, and each call runs the one it names."""
+    refused('StaticAboveOwn', '', 'SaRoot::Tell is static, and the editor takes a function of that name in a subclass '
+            'for an override of it',
+            top='class SaRoot : public AActor {\npublic:\n  static int32 Tell(int32 V) { return V + 1; }\n};\n'
+                'class SaKid : public SaRoot {\npublic:\n  int32 Tell(int32 V) { return V * 2; }\n};\n')
+    refused('StaticAboveIface', '', 'the SaiRoot::Tell it inherits is static: the editor takes such a function for an '
+            'override of the static and refuses it',
+            top='class ISaiTell {\npublic:\n  UE_INTERFACE;\n  int32 Tell(int32 V);\n};\n'
+                'class SaiRoot : public AActor {\npublic:\n  static int32 Tell(int32 V) { return V + 1; }\n};\n'
+                'class SaiKid : public SaiRoot, public ISaiTell {\npublic:\n  int32 Tell(int32 V) { return V * 4; }\n};\n')
+    refused('StaticOverMethod', '', 'SomKid::Tell is static, and the SomRoot::Tell it hides is not',
+            top='class SomRoot : public AActor {\npublic:\n  int32 Tell(int32 V) { return V + 1; }\n};\n'
+                'class SomKid : public SomRoot {\npublic:\n  static int32 Tell(int32 V) { return V * 3; }\n};\n')
+    kid = asset('FuncStaticHide')
+    root = os.path.join(os.path.dirname(kid), 'FshRoot')
+    for b in (kid, root): keeps_invariants(b)
+    pkg = invariants.Package(kid)
+    st = pkg.struct(pkg.find('Tell'))
+    assert st.super and pkg.path(st.super).endswith('/FshRoot.FshRoot_C:Tell'), 'FuncStaticHide::Tell has no super'
+    assert st.function_flags & 0x2000, 'FuncStaticHide::Tell FunctionFlags %#x is not static' % st.function_flags
+    assert run_as([kid, root], 'Use', {}, V=2) == 603
+
+
+func_static_above()
+print('ok  FuncStaticHide: a function named like a mod ancestor\'s static is refused unless it is a static, whose super '
+      'is that one')
+
+
+def static_above_foreign():
+    """The same rule over another mod's class, pinned by UE_CLASS to its owner: its functions come from the header it
+    shares, so whether one is static is known, and the editor takes a function of its name below for an override of it
+    all the same (its super is ParentClass->FindFunctionByName). A method over its static, and a static over its method,
+    are refused."""
+    refused('StaticAboveForeign', '', 'XafBase::Tell is static, and the editor takes a function of that name in a '
+            'subclass for an override of it',
+            top='class XafBase : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/XafOwner/XafBase", "XafBase_C");\n'
+                '  static int32 Tell(int32 V);\n};\n'
+                'class XafKid : public XafBase {\npublic:\n  int32 Tell(int32 V) { return V * 2; }\n};\n')
+    refused('StaticOverForeign', '', 'XofKid::Tell is static, and the XofBase::Tell it hides is not',
+            top='class XofBase : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/XofOwner/XofBase", "XofBase_C");\n'
+                '  int32 Tell(int32 V);\n};\n'
+                'class XofKid : public XofBase {\npublic:\n  static int32 Tell(int32 V) { return V * 2; }\n};\n')
+
+
+static_above_foreign()
+print('ok  FuncStaticHide: a function named like the static of another mod\'s class, or a static named like its method, '
+      'is refused')
+
+
+def static_over_static():
+    """A static over a mod ancestor's static is C++ name hiding, which no Blueprint can write: the editor refuses a
+    function named like its parent's, as an override of a function that is no BlueprintEvent ("cannot be overridden",
+    KismetCompiler.cpp 3312-3316). Of the same signature it compiles with a `warning:` (FuncStaticHide), its super the
+    one it hides, as FindFunctionByName gives it; of another, that super would carry other parameters, and it is
+    refused."""
+    assert re.search(r'warning: .*FuncStaticHide::Tell hides FshRoot::Tell', LOGS['FuncStaticHide']), LOGS['FuncStaticHide']
+    # UE_CLASS's StaticClass is declared in every class and compiled in none: no function hides another.
+    hid = [m for m, log in LOGS.items() if 'StaticClass hides' in log]
+    assert not hid, hid
+    refused('StaticOverStaticSig', '', 'SssKid::Tell is static and hides SssRoot::Tell, a static of another signature',
+            top='class SssRoot : public AActor {\npublic:\n  static int32 Tell(int32 V) { return V + 1; }\n};\n'
+                'class SssKid : public SssRoot {\npublic:\n  static float Tell(float V) { return V * 3; }\n'
+                '  float Use(float V) { return Tell(V) + SssRoot::Tell(2); }\n};\n')
+
+
+static_over_static()
+print('ok  FuncStaticHide: a static over a static warns, and is refused when its signature differs')
+
+
+def func_declared_only():
+    """FdoRoot declares Tell (a static) and Scale but defines neither, so it compiles no function of those names, and
+    FuncDeclaredOnly's own hide nothing a Blueprint has: no warning, no super to a function FdoRoot lacks
+    (imports_resolve, func_super_link), and each call runs FuncDeclaredOnly's."""
+    base = asset('FuncDeclaredOnly')
+    keeps_invariants(base)
+    keeps_invariants(os.path.join(os.path.dirname(base), 'FdoRoot'))
+    assert 'hides' not in LOGS['FuncDeclaredOnly'], LOGS['FuncDeclaredOnly']
+    for v in (1, 4):
+        got, want = run(base, 'Use', {}, V=v)[0], v * 2 * 100 + v * 3
+        assert got == want, 'FuncDeclaredOnly.Use(%d) = %r, want %r' % (v, got, want)
+
+
+func_declared_only()
+print('ok  FuncDeclaredOnly: a static and a method over an ancestor\'s declared-only ones have no super, and no warning')
+
+
+def func_declared_sig():
+    """FdsRoot declares Scale(int32) and never defines it, so no caller reaches a Scale of its: FuncDeclaredSig's
+    Scale(float) replaces nothing, and its signature is its own, as a static's is (FuncDeclaredOnly)."""
+    base = asset('FuncDeclaredSig')
+    keeps_invariants(base)
+    for v in (1, 4):
+        got = run(base, 'Use', {}, V=v)[0]
+        assert got == v * 3.0, 'FuncDeclaredSig.Use(%d) = %r, want %r' % (v, got, v * 3.0)
+
+
+func_declared_sig()
+print('ok  FuncDeclaredSig: a method of another signature over a declared-only one is its own')
+
+
+def func_declared_called():
+    """A call to a mod class's method that is declared and never defined names a function the class never compiles, and
+    C++ would not link it. By name it lands in a subclass's function of that name, whatever its signature (FdcRoot's
+    int32 laid into FuncDeclaredCalled's float Scale), and on an FdcRoot object FindFunctionChecked finds nothing
+    (execLocalVirtualFunction, ScriptCore.cpp 3012-3016). Refused naming the method, from the class's own code, from
+    another class through a pointer, and whatever the subclass's signature."""
+    root = ('class FdcRoot : public AActor {\npublic:\n  int32 Scale(int32 V);\n'
+            '  int32 Call(int32 V) { return Scale(V) + 1; }\n};\n')
+    why = 'FdcRoot::Scale, which FdcRoot declares and never defines'
+    refused('FuncDeclaredCalled', '  float Scale(float V) { return V * 3.0f; }\n', why, root, 'FdcRoot')
+    refused('FuncDeclaredCalledSame', '  int32 Scale(int32 V) { return V * 3; }\n', why, root, 'FdcRoot')
+    refused('FuncDeclaredCalledOther', '  FdcRoot* P;\n  int32 Call(int32 V) { return P->Scale(V) + 1; }\n', why,
+            'class FdcRoot : public AActor {\npublic:\n  int32 Scale(int32 V);\n};\n'
+            'class FdcKid : public FdcRoot {\npublic:\n  float Scale(float V) { return V * 3.0f; }\n};\n')
+
+
+func_declared_called()
+print('ok  FuncDeclaredCalled: a call to a declared-only method is refused by name, whatever a subclass declares')
+
+
+def func_iface_unnamed():
+    """FuncIfaceUnnamed gets an override of FiuRoot's Tell (for IFiuTell) and of Kept (for its `FiuRoot::Kept` call),
+    each calling FiuRoot's though a parameter of it has no name: the override names it, as an editor override does.
+    An inherited function of another signature, or a final one, cannot implement an interface function of its name,
+    and the refusal says so in the interface's terms; so does one of the class's own that the inherited one's
+    signature would make its super's."""
+    kid = asset('FuncIfaceUnnamed')
+    root = os.path.join(os.path.dirname(kid), 'FiuRoot')
+    assert 'call by name' not in LOGS['FuncIfaceUnnamed'], LOGS['FuncIfaceUnnamed']
+    keeps_invariants(kid)
+    assert {'Tell', 'Kept'} <= set(exports_of(kid)), exports_of(kid)
+    assert runscript.params_of(kid, 'Tell') == ['P0_', 'P0'], runscript.params_of(kid, 'Tell')
+    assert run_as([kid, root], 'Tell', {}, P0_=1, P0=2) == 20
+    fields = {'Seen': 0}
+    assert run_as([kid, root], 'Use', fields) == 14 and fields['Seen'] == 2, fields
+    refused('IfaceSigInherited', '', 'IsiKid implements IIsiTell, whose Tell is int32 (int32), and the IsiRoot::Tell it '
+            'inherits is float (float)',
+            top='class IIsiTell {\npublic:\n  UE_INTERFACE;\n  int32 Tell(int32 V);\n};\n'
+                'class IsiRoot : public AActor {\npublic:\n  float Tell(float V) { return V; }\n};\n'
+                'class IsiKid : public IsiRoot, public IIsiTell {\npublic:\n  int32 Other() { return 0; }\n};\n')
+    refused('IfaceFinalInherited', '', 'the IfiRoot::Tell it inherits is final',
+            top='class IIfiTell {\npublic:\n  UE_INTERFACE;\n  int32 Tell(int32 V);\n};\n'
+                'class IfiRoot : public AActor {\npublic:\n  virtual int32 Tell(int32 V) final { return V; }\n};\n'
+                'class IfiKid : public IfiRoot, public IIfiTell {\npublic:\n  int32 Other() { return 0; }\n};\n')
+    refused('IfaceSigOwn', '', 'and replaces the IsoRoot::Tell it inherits, float (float)',
+            top='class IIsoTell {\npublic:\n  UE_INTERFACE;\n  int32 Tell(int32 V);\n};\n'
+                'class IsoRoot : public AActor {\npublic:\n  float Tell(float V) { return V; }\n};\n'
+                'class IsoKid : public IsoRoot, public IIsoTell {\npublic:\n  int32 Tell(int32 V) { return V; }\n};\n')
+
+
+func_iface_unnamed()
+print('ok  FuncIfaceUnnamed: an inherited function with an unnamed parameter is forwarded; one of another signature, '
+      'or final, is refused in the interface\'s terms')
+
+
+def iface_over_stub_sig():
+    """A mod ancestor that lists a mod interface and leaves its function out has the stub of it, and that stub is the
+    parent function of any function of its name below (ParentClass->FindFunctionByName, KismetCompiler.cpp 1733-1734).
+    The editor refuses an override whose parent has another signature ("Cannot override ... declared in a parent with a
+    different signature", 1993-2011): an implementation of another interface's function of that name, the class's own
+    or the stub of one it leaves out, is refused in the interfaces' terms. So is one over another mod's class, whose
+    shared header gives its functions' signatures."""
+    two = ('class ISsA {\npublic:\n  UE_INTERFACE;\n  float Tell(float V);\n};\n'
+           'class ISsB {\npublic:\n  UE_INTERFACE;\n  int32 Tell(int32 V);\n};\n'
+           'class SsRoot : public AActor, public ISsA {\npublic:\n  int32 Other() { return 0; }\n};\n')
+    refused('IfaceStubSigOwn', '', 'SsKid::Tell implements ISsB::Tell, int32 (int32), and replaces the Tell of ISsA, '
+            'float (float), that SsRoot implements',
+            top=two + 'class SsKid : public SsRoot, public ISsB {\npublic:\n  int32 Tell(int32 V) { return V * 2; }\n};\n')
+    refused('IfaceStubSigStub', '', 'SsKid implements ISsB, whose Tell is int32 (int32), and replaces the Tell of ISsA, '
+            'float (float), that SsRoot implements',
+            top=two + 'class SsKid : public SsRoot, public ISsB {\npublic:\n  int32 Other2() { return 1; }\n};\n')
+    # Another mod's class, from the header it shares, is such an ancestor too: its own method of another signature.
+    other = ('class IXiB {\npublic:\n  UE_INTERFACE;\n  int32 Tell(int32 V);\n};\n'
+             'class XiBase : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/XiOwner/XiBase", "XiBase_C");\n'
+             '  float Tell(float V);\n};\n')
+    refused('IfaceForeignSigOwn', '', 'XmKid::Tell implements IXiB::Tell, int32 (int32), and replaces the XiBase::Tell it '
+            'inherits, float (float)',
+            top=other + 'class XmKid : public XiBase, public IXiB {\npublic:\n  int32 Tell(int32 V) { return V * 2; }\n};\n')
+    refused('IfaceForeignSigStub', '', 'XmKid implements IXiB, whose Tell is int32 (int32), and replaces the XiBase::Tell '
+            'it inherits, float (float)',
+            top=other + 'class XmKid : public XiBase, public IXiB {\npublic:\n  int32 Other() { return 1; }\n};\n')
+
+
+iface_over_stub_sig()
+print('ok  FuncIfaceUnnamed: an implementation over an ancestor\'s interface stub of another signature is refused in '
+      'the interfaces\' terms')
+
+
+def parm_unnamed():
+    """ParmUnnamed: a parameter the source leaves unnamed is cooked under the name the editor's pin and AssetGen's
+    override give it, P<index> (`_` added while another parameter has that name), not as an empty name, None once
+    loaded, which two of them in one function would share. The calls still pass each argument in its place. A local
+    of the body named P0 takes that name first: two properties of one name in a frame resolve to the first
+    (FFieldPath::TryToResolvePath), so Fill's local would write the caller's X through the out parameter."""
+    base = asset('ParmUnnamed')
+    keeps_invariants(base)
+    assert runscript.params_of(base, 'Pick') == ['P0', 'B'], runscript.params_of(base, 'Pick')
+    assert runscript.params_of(base, 'Both') == ['P0', 'P1'], runscript.params_of(base, 'Both')
+    assert run_as([base], 'Use', {}) == 64
+    assert runscript.params_of(base, 'Fill') == ['P0_', 'B'], runscript.params_of(base, 'Fill')
+    got = run_as([base], 'Kept', {'Store': 0})
+    assert got == 706, "Kept() = %r: Fill's local P0 must not reach the caller's X (C++ gives 706)" % got
+    root = os.path.join(os.path.dirname(asset('FuncIfaceUnnamed')), 'FiuRoot')
+    assert runscript.params_of(root, 'Tell') == ['P0_', 'P0'], runscript.params_of(root, 'Tell')
+
+
+parm_unnamed()
+print('ok  ParmUnnamed: an unnamed parameter is cooked as P<index>, as the editor names the pin')
+
+
+def func_own_iface_final():
+    """FuncOwnIfaceFinal: Tell and the stub Left implement IFoiTell, which the class itself lists, keeping the interface
+    function's contract (func_override_flags) - BlueprintEvent, not Final - in a final class and in a UE_FINAL_AS base,
+    and Ask's call to Tell reaches each class's own."""
+    leaf = asset('FuncOwnIfaceFinal')
+    p = lambda c: os.path.join(os.path.dirname(leaf), c)
+    final, base = p('FoiFinal'), p('FoiBase')
+    for b in (final, base, leaf): keeps_invariants(b)
+    for b in (final, base):
+        pkg = invariants.Package(b)
+        for fn in ('Tell', 'Left'):
+            got = pkg.struct(pkg.find(fn)).function_flags
+            assert got & 0x08000000 and not got & 0x1, '%s::%s FunctionFlags %#x' % (os.path.basename(b), fn, got)
+    assert run_as([final], 'Ask', {}, V=2) == 30
+    assert run_as([leaf, base], 'Ask', {}, V=2) == 40
+
+
+func_own_iface_final()
+print('ok  FuncOwnIfaceFinal: an implementation of an interface a final class lists keeps the interface function\'s '
+      'contract, not Final')
+
+
+def func_template_call():
+    """FuncTemplateCall: a member template's body is copied into each caller and read in the class it is written in.
+    `AuthOnly()` in Helper is a call by name from FtKid's Use, so on an FtKid it runs FtMid's override (7), as C++ does,
+    and FtKid, which declares no AuthOnly, gets no function of that name; `FuncTemplateCall::AuthOnly()` in HelperQ runs
+    FuncTemplateCall's (3) on an FtQKid. The inline Plain is the same call, read the same way."""
+    top = asset('FuncTemplateCall')
+    p = lambda *cs: [os.path.join(os.path.dirname(top), c) for c in cs]
+    mid = p('FtMid', 'FuncTemplateCall')
+    kid, qkid = p('FtKid') + mid, p('FtQKid') + mid
+    for b in kid[:1] + qkid[:1] + mid[:1]: keeps_invariants(b)
+    assert 'AuthOnly' not in exports_of(kid[0]), exports_of(kid[0])
+    for chain, fn, want in ((kid, 'Use', 7), (kid, 'UsePlain', 7), (qkid, 'UseQ', 3), (qkid, 'AuthOnly', 7)):
+        fields = {'Seen': 0}
+        run_as(chain, fn, fields)
+        assert fields['Seen'] == want, (os.path.basename(chain[0]), fn, fields)
+
+
+func_template_call()
+print('ok  FuncTemplateCall: an unqualified call in a member template goes by name from each class it is copied into')
+
+
+def ns_parent_call():
+    """NsTest's Pistol: `Weapons::Rifle::Pull(Times)` in its own Pull runs Rifle's, however many parts the qualifier
+    has (5 + 3, then + 100). By name it would be Pistol's own Pull, calling itself forever."""
+    content = os.path.join(ROOT, 'NsTest', 'FSD', 'Content')
+    chain = [os.path.join(content, 'NsTestAbs', 'Pistol'), os.path.join(content, '_ElytrasMods', 'NsTest', 'Weapons', 'Rifle')]
+    fields = dict(Shots=5)
+    got = run_as(chain, 'Pull', fields, Times=3)
+    assert got == 108 and fields == dict(Shots=8), (got, fields)
+
+
+ns_parent_call()
+print('ok  NsTest: Weapons::Rifle::Pull() in Pistol\'s own Pull is the parent\'s, its qualifier in parts')
+
+
 # ---- OPERANDS: operands the VM resolves against the object they run on - jumps, instance variables, calls by name,
 # field paths, object operands, arity, out and reference arguments (invariant_rules/operands.py)
 
@@ -4733,6 +6004,16 @@ def opnd_ref_args():
                 assert (got, mine) == (want, theirs), (fn, parms, start, got, want, mine, theirs)
                 n += 1
     print('ok  OpndRefArgs: reference arguments reach the callee as the local, member, struct member, array element  (%d cases)' % n)
+    # ReadLate: PeekAfter(Member, SetMember(V + 5)) - the const reference is Member itself, read when PeekAfter runs.
+    for v in (0, 7, -40):
+        mine = fields(Member=3)
+        got = run(base, 'ReadLate', self_vars=mine, V=v)[0]
+        assert (got, mine['Member']) == (wrap((v + 5) * 10 + 1), v + 5), ('ReadLate', v, got, mine)
+        vm = VM(base, **fields(Member=3))      # runvm reads it then too
+        vm.ref_params = True
+        got = vm.call('ReadLate', V=v)
+        assert (got, vm.self.vars['Member']) == (wrap((v + 5) * 10 + 1), v + 5), ('runvm ReadLate', v, got, vm.self.vars)
+    print('ok  OpndRefArgs.ReadLate: a const reference argument is read when the callee runs, after the arguments after it')
     # On another object: Virt is found on Other's class by name and runs there, Other->Member is Other's, and the
     # argument Member + X is read on this object (the arguments of a call under EX_Context run on the caller).
     for mine, theirs, x in ((3, 40, 5), (0, -2, 7)):
@@ -4963,11 +6244,23 @@ def typing_iface():
 
 
 def typing_refusals():
-    """`return (void)<value>;` has no Blueprint form: the value would be stepped into the null result a function
-    with no return value has (ScriptCore.cpp 1123-1133)."""
-    refused('TypingVoidCast', '  int32 N;\n  void Cast5() { return (void)5; }\n', 'no Kismet conversion from int to void')
-    refused('TypingVoidCast', '  int32 N;\n  void CastVar() { return (void)N; }\n', 'no Kismet conversion from int to void')
-    print('ok  `return (void)5;` / `return (void)N;` in a void function are refused')
+    """`return (void)<value>;` in a void function evaluates the value and returns, as C++ does. A value that can do
+    nothing is dropped, so none is ever stepped into the null result a function with no return value has
+    (ScriptCore.cpp 1123-1133); the plain return still leaves the function there."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, 'TypingVoidCast.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/TypingVoidCast");\n'
+                    'class TypingVoidCast : public AActor {\npublic:\n  int32 N;\n'
+                    '  void Cast5() { N = 1; return (void)5; N = 2; }\n'
+                    '  void CastVar() { N = 7; return (void)N; N = 8; }\n};\n')
+        proc = assetgen_compile([src, UEAPI, tmp])
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        for fn, want in (('Cast5', 1), ('CastVar', 7)):
+            me = {'N': 0}
+            run(os.path.join(tmp, 'TypingVoidCast'), fn, self_vars=me)
+            assert me['N'] == want, (fn, me)
+    print('ok  `return (void)5;` / `return (void)N;` in a void function return there, no value stepped')
 
 
 def typing_arr_null():
@@ -5188,11 +6481,127 @@ print('ok  LocalCtorFlags: FUNC_HasDefaults on a function with an FHitResult / F
 iface_cast_slot()
 print('ok  IfaceCastSlot: Cast<IHealth> takes the object out of its 16-byte interface value')
 derived_literal('Angle', '/Script/Engine.LightmassDirectionalLightSettings')
-derived_literal('Output', '/Script/Engine.MaterialAttributesInput')
-assert 'FMaterialAttributesInput::PropertyConnectedBitmask is Transient' in LOGS['DerivedLiteral'], LOGS['DerivedLiteral']
-derived_literal('ResetHandle', '/Script/Engine.TimerHandle')
-print("ok  DerivedLiteral: a derived struct literal lists its own members before its super's, and leaves out Transient "
-      "ones (a value given for one is warned about); FTimerHandle() writes no member")
+# What EX_StructConst writes of each struct the Transient tests build, in PropertyLink order: never the Transient member.
+TRANSIENT_LINK = {'MaterialAttributesInput': ['OutputIndex', 'InputName', 'ExpressionName'], 'TimerHandle': []}
+
+
+def derived_literal_transient():
+    """A struct with a Transient member is no literal, whose execStructConst would skip the member: FMaterialAttributesInput's
+    literal (a super's members, then its own Transient one) reads its OutputIndex back, and FTimerHandle() resets a live
+    handle (5) to 0, as C++ does."""
+    import runvm
+    vm = VM(asset('DerivedLiteral'), Handle=runvm.Written(Handle=5))
+    vm.struct_const = lambda name, vals: runvm.Written(zip(TRANSIENT_LINK[name], vals))
+    assert vm.call('Output') == 3, vm.call('Output')
+    vm.call('ResetHandle')
+    # A member a struct value lacks is a zero: FTimerHandle() is a temp the frame constructs, Handle 0.
+    assert vm.self.vars['Handle'].get('Handle', 0) == 0, 'ResetHandle leaves Handle %r, want 0' % (vm.self.vars['Handle'],)
+    assert 'is Transient' not in LOGS['DerivedLiteral'], LOGS['DerivedLiteral']
+
+
+derived_literal_transient()
+print("ok  DerivedLiteral: a derived struct literal lists its own members before its super's; one with a Transient "
+      "member sets it, FTimerHandle() resetting a live handle")
+
+
+def struct_lit_expr():
+    """A whole-struct literal whose members are not all constants - a `?:`, a `&&`, a call, a member of the variable it
+    is assigned to, a value for a Transient member - is what C++ makes of it, in a local, a member variable, an argument,
+    a return value, a nested struct, a TArray's elements and a UE_STRUCT's braces: the members run left to right, each
+    once, and one that reads the destination reads it as it was. execStructConst steps each member straight into the
+    destination the Let names (ScriptCore.cpp 2647-2686, 3376-3405), which runvm models once struct_const names the
+    members."""
+    import runvm
+    base = asset('StructLitExpr')
+    keeps_invariants(base)
+    members = {'Vector2D': ['X', 'Y'], 'IntPoint': ['X', 'Y'], 'Box2D': ['Min', 'Max', 'bIsValid']}
+    cases = {'Local': lambda M: 12.0 + M, 'Paren': lambda M: 21.0 + 10 * M, 'Member': lambda M: 46.0 + 10 * M,
+             'Arg': lambda M: 17.0 + M, 'ArgBraced': lambda M: 71.0 + 10 * M, 'Ret': lambda M: 13.0 + 10 * M,
+             'Nested': lambda M: 42.0 + M, 'Array': lambda M: 42.0 + M, 'Both': lambda M: 10 * M + (0 < M < 5),
+             'Call': lambda M: 20 * M + 1, 'Order': lambda M: 110 if M == 0 else 100, 'Swap': lambda M: 21.0,
+             'SwapMember': lambda M: 21.0, 'ReadBack': lambda M: 31.0, 'Mod': lambda M: 12 + M, 'ModSwap': lambda M: 21,
+             'Transient': lambda M: 43 + 10 * M}
+    for fn, want in cases.items():
+        for m in (0, 1, 7) if fn == 'Both' else (0, 1):
+            vm = VM(base, Count=0)
+            vm.struct_const = lambda name, vals: runvm.Written(zip(members[name], vals))
+            got = vm.call(fn, M=m)
+            assert got == want(m), 'StructLitExpr.%s(%d) = %r, want %r' % (fn, m, got, want(m))
+
+
+struct_lit_expr()
+print('ok  StructLitExpr: a struct literal with a member that is not a constant is a Make Struct, and runs as C++ runs it')
+
+
+def transient_const():
+    """A constant for a native struct literal's Transient member, zero or not, makes the Make Struct a computed one
+    does, which sets it: execStructConst skips the member (ScriptCore.cpp 3376-3405), so a literal of constants would
+    drop the value, and whether it counted would hang on another member. No warning."""
+    import runvm
+    base = asset('TransientConst')
+    keeps_invariants(base)
+    for fn, want in (('AllConst', lambda m: 43 + m), ('ZeroConst', lambda m: 3 + m)):
+        for m in (0, 1):
+            vm = VM(base)
+            vm.struct_const = lambda name, vals: runvm.Written(zip(TRANSIENT_LINK[name], vals))
+            got = vm.call(fn, M=m)
+            assert got == want(m), 'TransientConst.%s(%d) = %r, want %r' % (fn, m, got, want(m))
+    assert 'is Transient' not in LOGS['TransientConst'], LOGS['TransientConst']
+
+
+transient_const()
+print('ok  TransientConst: a constant for a Transient member makes the Make Struct, which sets it')
+
+
+def transient_zero():
+    """A zero for a Transient member, or `T()` / `{}` of a struct whose one member is Transient, sets the member to zero
+    as C++ does, over a member variable that held 4 (or a timer handle 5) and over a loop's local, which a Blueprint
+    does not make afresh each time round: execStructConst skips the member (ScriptCore.cpp 3376-3405) and steps the rest
+    into the destination, which runvm models once struct_const names what a literal writes."""
+    import runvm
+    base = asset('TransientZero')
+    keeps_invariants(base)
+
+    def vm():
+        v = VM(base, Kept=runvm.Written(), Handle=runvm.Written(Handle=5))
+        v.struct_const = lambda name, vals: runvm.Written(zip(TRANSIENT_LINK[name], vals))
+        return v
+    v = vm()
+    got = (v.call('SetFour'), v.call('SetZero'))
+    assert got == (4, 0), 'TransientZero.SetFour, SetZero = %r, want (4, 0)' % (got,)
+    for m in (0, 1):
+        got = vm().call('Loop', M=m)
+        assert got == m, 'TransientZero.Loop(%d) = %r, want %d' % (m, got, m)
+    for fn in ('ResetHandle', 'ClearHandle'):
+        v = vm()
+        v.call(fn)
+        assert v.self.vars['Handle'].get('Handle', 0) == 0, 'TransientZero.%s leaves Handle %r, want 0' % (fn, v.self.vars['Handle'])
+
+
+transient_zero()
+print('ok  TransientZero: a zero for a Transient member, or T() / {} of a struct whose member is Transient, sets it '
+      'over a variable that held another value')
+
+
+def local_by_address():
+    """A local holding a call's result, read once by a container function, stays a local: the Kismet container thunks
+    read the container where it lies (Stack.MostRecentPropertyAddress after StepCompiledIn, execArray_Length and the
+    rest), and a call in its place leaves the address of what the callee's frame read, not a value. An array, a set and
+    a map, by Num, Find and Contains, and an inline function's parameter read so."""
+    base = asset('LocalByAddress')
+    keeps_invariants(base)
+    cases = {'ArrayNum': lambda M: 2 + M, 'ArrayFind': lambda M: 1 + M, 'ArrayContains': lambda M: 10 + M,
+             'SetNum': lambda M: 2 + M, 'MapNum': lambda M: 2 + M, 'MapFind': lambda M: 4 + M,
+             'InlineParm': lambda M: 2 + M}
+    for fn, want in cases.items():
+        for m in (0, 3):
+            got = run(base, fn, M=m)[0]
+            assert got == want(m), 'LocalByAddress.%s(%d) = %r, want %r' % (fn, m, got, want(m))
+
+
+local_by_address()
+print('ok  LocalByAddress: a local a container function reads where it lies stays a variable, an inline function\'s '
+      'parameter too')
 
 
 # ---- UBER: ubergraphs along a class chain, their frames and names, latent resumes, awaits in overrides
@@ -5420,6 +6829,26 @@ print('ok  UberAwaitKid: a parent\'s await in an overridden method resumes in th
 refused('UberShadow', '  int32 X;\n', 'UberShadowKid::ExecuteUbergraph_UberShadowBase: ExecuteUbergraph_<Class> is the name '
         'of a class\'s ubergraph', top=UBER_SHADOW_TOP)
 print('ok  UberShadow: a method named like an ubergraph is refused')
+
+
+def none_names():
+    """FName("None") is NAME_None, whatever its case, and a tag of that name ends the tag list a value is read as (Class.cpp
+    1326-1329): a UE_STRUCT member named None ends a class default's value of the struct, its later members unread, and
+    a class's own member would end its default object's list. The editor refuses the name for a variable or a function
+    ("Name cannot be empty.", FKismetNameValidator::IsValid, Kismet2NameValidators.cpp 135-142), and so is it here: a
+    member, a UE_STRUCT member, a function, a component and an interface's member, in any case."""
+    refused('NoneMember', '  int32 None;\n', 'NoneMember::None: None is UE\'s empty name')
+    refused('NoneStructMember', '  FNoneSlot S;\n', 'FNoneSlot::none: None is UE\'s empty name',
+            'struct FNoneSlot {\n  UE_STRUCT;\n  int32 A = 1;\n  int32 none{};\n  int32 B = 3;\n};\n')
+    refused('NoneFunction', '  int32 NONE() { return 1; }\n', 'NoneFunction::NONE: None is UE\'s empty name')
+    refused('NoneComponent', '  UE_COMPONENT(USceneComponent, None);\n', 'NoneComponent::None: None is UE\'s empty name')
+    refused('NoneIfaceMember', '  int32 Count = 1;\n', 'INoneHeld::none: None is UE\'s empty name',
+            'class INoneHeld {\npublic:\n  UE_INTERFACE;\n  int32 none = 2;\n  void Touch();\n};\n', 'AActor, public INoneHeld')
+
+
+none_names()
+print('ok  Names: a member, a UE_STRUCT member, a function, a component or an interface member named None, in any '
+      'case, is refused')
 
 
 # ---- DELEG: delegates and event dispatchers - signatures, binds, broadcasts, timers by name (invariant_rules/delegates.py)
@@ -5661,6 +7090,241 @@ delegate_var()
 print('ok  DelegateVar: a TDelegate<void()> variable is a DelegateProperty naming its signature, holding OnTimer on this')
 inherited_fire()
 print('ok  DispatchInheritedFire: a child broadcasts its parent\'s dispatcher through the parent\'s signature')
+
+
+def dispatch_other_fire():
+    """DispatchOtherFire broadcasts dispatchers other classes declare, through pointers: its sibling DispatchOtherTarget's
+    OnHit and a game Blueprint's, BP_BurrowComponent_C's OnBurrowComplete. Each broadcast names the declaring class's own
+    <Name>__DelegateSignature, imported, as the editor's Call node does (keeps_invariants: broadcast_matches_signature),
+    and runs what is bound to that object's dispatcher with the arguments; what is bound to another object's dispatcher
+    of the same name does not run."""
+    base = asset('DispatchOtherFire')
+    keeps_invariants(base)
+    sigs = sorted(p for p in import_paths(base) if p.endswith('__DelegateSignature'))
+    assert sigs == ['/Game/Enemies/Spider/BP_BurrowComponent.BP_BurrowComponent_C:OnBurrowComplete__DelegateSignature',
+                    '/Game/_ElytrasMods/DispatchOtherFire/DispatchOtherTarget.DispatchOtherTarget_C:OnHit__DelegateSignature'], sigs
+    vm = VM(base, {}, Got=0, Emerged=False)
+    t, burrow, other = Obj('DispatchOtherTarget_C', Got=0), Obj('BP_BurrowComponent_C'), Obj('DispatchOtherTarget_C', Got=0)
+    vm.self.vars.update(T=t, Burrow=burrow)
+    vm.call('Hook')
+    assert vm.binds == [(t, 'OnHit', 'Mine', vm.self), (burrow, 'OnBurrowComplete', 'Dug', vm.self)], vm.binds
+    vm.binds.append((other, 'OnHit', 'Mine', vm.self))
+    vm.call('Fire', 4)
+    assert vm.self.vars['Got'] == 40 and vm.self.vars['LastTag'] == 'far', vm.self.vars
+    vm.call('FireBurrow')
+    assert vm.self.vars['Emerged'] is True, vm.self.vars
+
+
+def delegate_other_bind():
+    """DelegateOtherBind binds functions of objects other than this one: Add and Remove on its own dispatcher with another
+    class's object (DelegateOtherTarget::Take) and with another instance of its own class (Peer, Mine), Add on Peer's
+    dispatcher with Peer's Peer, a native function on a pawn and a game Blueprint's on a component, and a TDelegate value
+    naming Peer's Ping handed to a timer. The broadcast runs each handler on the object bound, found by name on that
+    object's class (runvm's peer: DelegateOtherTarget's own package), and never on this one; Remove takes the (object,
+    name) binding off; the timer gets Ping bound on Peer. Each binding is EX_BindDelegate into a delegate local, so the
+    object is evaluated where the bind runs (keeps_invariants: delegate_bind_matches_signature checks each bound name
+    against the dispatcher's signature on the class the object's variable declares). With Peer null when BindPeer runs,
+    nothing is bound and the broadcast runs nothing, on this object least of all."""
+    base = asset('DelegateOtherBind')
+    keeps_invariants(base)
+    vm = VM(base, {}, Got=0)
+    vm.classes['DelegateOtherTarget_C'] = os.path.join(os.path.dirname(base), 'DelegateOtherTarget')
+    t, peer, far = Obj('DelegateOtherTarget_C', Got=0), vm.new(Got=0), vm.new(Got=0)
+    pawn, burrow = Obj('Pawn'), Obj('BP_BurrowComponent_C')
+    vm.self.vars.update(T=t, Peer=peer, Pawn=pawn, Burrow=burrow)
+    peer.vars['Peer'] = far
+    vm.call('BindPeer')
+    assert vm.binds == [(vm.self, 'OnScore', 'Mine', peer)], vm.binds
+    vm.call('Fire', 3)
+    assert (vm.self.vars['Got'], peer.vars['Got']) == (0, 30), (vm.self.vars, peer.vars)
+    vm.call('UnbindPeer')
+    assert vm.binds == [], vm.binds
+    vm.call('BindTarget')
+    vm.call('Fire', 5)
+    assert (vm.self.vars['Got'], peer.vars['Got'], t.vars['Got']) == (0, 30, 5), (vm.self.vars, peer.vars, t.vars)
+    vm.binds.clear()
+    vm.call('BindPeersPeer')
+    assert vm.binds == [(peer, 'OnScore', 'Mine', far)], vm.binds
+    vm.broadcast(peer, 'OnScore', 2)
+    assert (peer.vars['Got'], far.vars['Got']) == (30, 20), (peer.vars, far.vars)
+    vm.binds.clear()
+    vm.call('BindNative')
+    vm.call('BindGame')
+    assert vm.binds == [(vm.self, 'OnRate', 'SetActorTickInterval', pawn), (vm.self, 'OnMontage', 'PlayBurrow', burrow)], vm.binds
+    vm.call('ArmPeer')
+    timers = [a for n, c, a in vm.log if n == 'K2_SetTimerDelegate']
+    assert timers == [[('delegate', 'Ping', peer), 1.0, False, 0.0, 0.0]], timers
+    # Peer null when the bind runs: EX_BindDelegate binds the name on no object, AddUnique's CompactInvocationList takes
+    # that binding straight off (ScriptDelegates.h 336-343, 100-103), and the broadcast runs nothing - not Mine on this.
+    vm.binds.clear()
+    vm.self.vars.update(Peer=None, Got=0)
+    vm.call('BindPeer')
+    assert vm.binds == [], vm.binds
+    vm.call('Fire', 3)
+    assert vm.self.vars['Got'] == 0, vm.self.vars
+
+
+def delegate_native_method():
+    """DelegateNativeMethod binds AActor::SetActorTickInterval, a native function, on this object: the class still
+    derives /Script/Engine.Actor (a member pointer does not turn AActor's forward declaration into the class), and the
+    binding names the function on this actor."""
+    base = asset('DelegateNativeMethod')
+    keeps_invariants(base)
+    pkg = invariants.Package(base)
+    ci = next(i for i, st in invariants.classes(pkg))
+    assert pkg.path(pkg.struct(ci).super) == '/Script/Engine.Actor', pkg.path(pkg.struct(ci).super)
+    vm = VM(base, {})
+    vm.call('Hook')
+    assert vm.binds == [(vm.self, 'OnTick', 'SetActorTickInterval', vm.self)], vm.binds
+
+
+def delegate_inherit_bind():
+    """DelegateInheritBind binds a helper's function to a dispatcher its class inherits: its mod parent's OnHit, and
+    DelegateInheritBurrow its game Blueprint parent's OnBurrowComplete. The delegate is typed with the parent's own
+    <Name>__DelegateSignature, imported as the editor's Create Event node names it; the class makes no function of that
+    name, which would hide the parent's with no link to it (keeps_invariants: func_super_link). A TDelegate value handed
+    to a timer in both the parent and the child gets a signature function in each, under two names. The broadcasts
+    reach the helper, and Remove takes the binding off."""
+    base = asset('DelegateInheritBind')
+    here = os.path.dirname(base)
+    burrow = os.path.join(here, 'DelegateInheritBurrow')
+    for b in (base, burrow, os.path.join(here, 'DelegateInheritParent')):
+        keeps_invariants(b)
+    for b, sig in ((base, '/Game/_ElytrasMods/DelegateInheritBind/DelegateInheritParent.DelegateInheritParent_C:OnHit__DelegateSignature'),
+                   (burrow, '/Game/Enemies/Spider/BP_BurrowComponent.BP_BurrowComponent_C:OnBurrowComplete__DelegateSignature')):
+        assert sig in import_paths(b), (os.path.basename(b), import_paths(b))
+        assert sig.rsplit(':', 1)[1] not in exports_of(b), (os.path.basename(b), exports_of(b))
+    for b, fn, helper_got in ((base, 'Fire', 3), (burrow, 'Fire', 1000)):
+        vm = VM(b, {})
+        vm.classes['DelegateInheritHelper_C'] = os.path.join(here, 'DelegateInheritHelper')
+        h = Obj('DelegateInheritHelper_C', Got=0)
+        vm.self.vars['H'] = h
+        vm.call('Bind')
+        assert vm.binds == [(vm.self, 'OnHit' if b == base else 'OnBurrowComplete', 'Take' if b == base else 'Dug', h)], vm.binds
+        vm.call(fn, 3) if b == base else vm.call(fn)
+        assert h.vars['Got'] == helper_got, h.vars
+        if b == base:
+            vm.call('Unbind')
+            assert vm.binds == [], vm.binds
+
+
+def delegate_rpc_refusals():
+    """A native function the engine does not mark BlueprintCallable is one the editor's Create Event node refuses
+    (K2Node_CreateDelegate.cpp 156-164 -> EdGraphSchema_K2.cpp 929-933, 974-985). A server RPC is one, which UeApi's
+    UE_SERVER says: refused on another object and on this one."""
+    refused('DelegateOtherRpc', '  UE_DISPATCHER(OnUse, bool Using);\n  AItem *I = nullptr;\n'
+            '  void F() { OnUse.Add(I, &AItem::Server_StartUsing); }\n', 'Server_StartUsing is not BlueprintCallable')
+    refused('DelegateSelfRpc', '  UE_DISPATCHER(OnUse, bool Using);\n  void F() { OnUse.Add(this, &AItem::Server_StartUsing); }\n',
+            'Server_StartUsing is not BlueprintCallable', base='AItem')
+
+
+def delegate_callable_rpc():
+    """An RPC the engine marks BlueprintCallable is one the editor's Create Event node binds: FunctionCanBeUsedInDelegate
+    asks for BlueprintCallable, not pure, not latent, and nothing about the net flags (K2Node_CreateDelegate.cpp
+    154-161). 49 native functions are both; APlayerController::ClientClearCameraLensEffects binds on another object
+    and AFSDPlayerController::Server_ResetHUD on this one. fix/r5-delegates (cab61cb6) refused both against a UeApi
+    without NotCallable.json, saying they were not BlueprintCallable, as it took every UE_SERVER / UE_CLIENT /
+    UE_MULTICAST for one that is not; NotCallable.json is compulsory now (UeApi version 3)."""
+    base = asset('DelegateCallableRpc')
+    keeps_invariants(base)
+    vm = VM(base, {})
+    pc = Obj('PlayerController')
+    vm.self.vars['PC'] = pc
+    vm.call('Bind')
+    assert vm.binds == [(vm.self, 'OnPing', 'ClientClearCameraLensEffects', pc)], vm.binds
+    kid = os.path.join(os.path.dirname(base), 'DelegateCallableRpcPc')
+    keeps_invariants(kid)
+    vm = VM(kid, {})
+    vm.call('Bind')
+    assert vm.binds == [(vm.self, 'OnReset', 'Server_ResetHUD', vm.self)], vm.binds
+
+
+def delegate_not_callable_refusals():
+    """AActor::OnRep_Instigator is a native function that is not BlueprintCallable, and nothing in its declaration says
+    so: UeApi's NotCallable.json does. Refused on another object and on this one."""
+    refused('DelegateOtherOnRep', '  UE_DISPATCHER(OnPing);\n  AActor *A = nullptr;\n'
+            '  void F() { OnPing.Add(A, &AActor::OnRep_Instigator); }\n', 'OnRep_Instigator is not BlueprintCallable')
+    refused('DelegateSelfOnRep', '  UE_DISPATCHER(OnPing);\n  void F() { OnPing.Add(this, &AActor::OnRep_Instigator); }\n',
+            'OnRep_Instigator is not BlueprintCallable')
+
+
+def dispatch_native_callable():
+    """A native dispatcher the engine marks BlueprintCallable (AFSDGameState::OnTerrainGenerated, one of FSD's 41) is
+    one the editor's Call node takes. UeApi does not say which signature function it names (the dump does not link a
+    delegate property to its signature), so the broadcast names one of the class's own with the same parameters - the
+    layout execCallMulticastDelegate builds and the handlers read (ScriptCore.cpp 3032-3063) - and the compiler warns
+    that it does. The bound handler runs. UeApi's <D>__UeDispatcher marks say which are callable (UeApi version 3)."""
+    base = asset('DispatchNativeCallable')
+    keeps_invariants(base)
+    assert any('warning' in l and 'OnTerrainGenerated' in l for l in LOGS['DispatchNativeCallable'].splitlines()), \
+        LOGS['DispatchNativeCallable']
+    vm = VM(base, {}, Heard=0)
+    state = Obj('FSDGameState')
+    vm.self.vars['State'] = state
+    vm.call('Hook')
+    vm.call('Fire')
+    vm.call('Fire')
+    assert vm.self.vars['Heard'] == 2 and vm.binds == [(state, 'OnTerrainGenerated', 'Generated', vm.self)], \
+        (vm.self.vars, vm.binds)
+    # DispatchNativeKid broadcasts it as well, through a signature function of its own under another name than its
+    # parent's (keeps_invariants: func_super_link); what the parent bound runs.
+    kid = os.path.join(os.path.dirname(base), 'DispatchNativeKid')
+    keeps_invariants(kid)
+    vm = VM(kid, {}, Heard=0)
+    vm.classes['DispatchNativeCallable_C'] = base
+    parent = Obj('DispatchNativeCallable_C', Heard=0)
+    vm.self.vars['State'] = state
+    vm.binds.append((state, 'OnTerrainGenerated', 'Generated', parent))
+    vm.call('FireKid')
+    assert parent.vars['Heard'] == 1, parent.vars
+
+
+def native_dispatcher_refusals():
+    """What the editor's nodes refuse on a native dispatcher (K2Node_MCDelegate.cpp 36-46, 453-462): Call on one that is
+    not BlueprintCallable, none of Engine's being (OnDestroyed), and Add on one that is not BlueprintAssignable (AGameEvent's
+    EventTriggeredDelegate, one of FSD's 17)."""
+    refused('DispatchNativeFire', '  void F() { OnDestroyed.Broadcast(this); }\n',
+            'OnDestroyed is a native dispatcher (AActor::OnDestroyed) that is not BlueprintCallable')
+    refused('DispatchNotAssignable', '  AGameEvent *E = nullptr;\n  void Ping() {}\n'
+            '  void F() { E->EventTriggeredDelegate.Add(this, &DispatchNotAssignable::Ping); }\n',
+            'EventTriggeredDelegate is a native dispatcher that is not BlueprintAssignable')
+
+
+dispatch_other_fire()
+print('ok  DispatchOtherFire: a broadcast on a sibling\'s and a game Blueprint\'s dispatcher through a pointer names its '
+      'class\'s signature and reaches what is bound there')
+delegate_other_bind()
+print('ok  DelegateOtherBind: a function of another object - a sibling\'s, a peer\'s, a native and a game Blueprint\'s - '
+      'is bound by EX_BindDelegate, and the broadcast and the timer reach it on that object')
+delegate_native_method()
+print('ok  DelegateNativeMethod: a member pointer to AActor\'s function keeps AActor the native parent')
+delegate_inherit_bind()
+print('ok  DelegateInheritBind: a function of another object bound to an inherited dispatcher - a mod parent\'s, a game '
+      'Blueprint\'s - is typed with the parent\'s signature, imported, and the broadcast reaches it')
+delegate_rpc_refusals()
+print('ok  delegate RPC refusals: a server RPC is not BlueprintCallable, so it is bound on no object')
+delegate_callable_rpc()
+print('ok  DelegateCallableRpc: an RPC the engine marks BlueprintCallable binds on another object and on this one')
+delegate_not_callable_refusals()
+print('ok  delegate not-callable refusals: OnRep_Instigator, which UeApi\'s NotCallable.json names, is bound on no object')
+dispatch_native_callable()
+native_dispatcher_refusals()
+print('ok  native dispatchers: Broadcast on a BlueprintCallable one names a signature of the class\'s own with its '
+      'parameters and reaches its handler; one the editor\'s nodes refuse is refused')
+# A bound name the object's class does not have: the broadcast or the timer skips it (ScriptDelegates.h 38-49,
+# 479-502). The editor binds only a BlueprintCallable function, never a pure or latent one (K2Node_CreateDelegate.cpp
+# 156-164 -> EdGraphSchema_K2.cpp 929-985): AActor::ReceiveTick is a BlueprintEvent only.
+refused('DelegateOtherForeign', '  UE_DISPATCHER(OnHit, int32 Points);\n  DelegateOtherHolder *H = nullptr;\n'
+        '  void Own(int32 Points) {}\n  void F() { OnHit.Add(H, &DelegateOtherForeign::Own); }\n',
+        'cannot bind DelegateOtherForeign::Own',
+        top='class DelegateOtherHolder : public AActor {\npublic:\n  int32 N = 0;\n};\n')
+refused('DelegateOtherEvent', '  UE_DISPATCHER(OnTick, float Delta);\n  AActor *A = nullptr;\n'
+        '  void F() { OnTick.Add(A, &AActor::ReceiveTick); }\n', 'cannot bind AActor::ReceiveTick')
+refused('DelegateOtherDeclared', '  UE_DISPATCHER(OnHit, int32 Points);\n  DelegateOtherHalf *H = nullptr;\n'
+        '  void F() { OnHit.Add(H, &DelegateOtherHalf::Take); }\n',
+        'DelegateOtherHalf::Take, which DelegateOtherHalf declares and never defines',
+        top='class DelegateOtherHalf : public AActor {\npublic:\n  void Take(int32 Points);\n};\n')
+print('ok  delegate refusals on another object: a name its class lacks, a function the editor cannot bind, one never defined')
 # A method of another class bound with `this`: EX_InstanceDelegate binds the name on this object, whose class has no
 # such function, so the broadcast or the timer silently skips it (ScriptDelegates.h 38-49, 479-502).
 refused('DelegateForeign', '  UE_DISPATCHER(OnHit, int32 Points);\n  void F() { OnHit.Add(this, &DelegateOther::ForeignHit); }\n',
@@ -5823,7 +7487,7 @@ def scs_no_scene_root():
     ExecuteScriptOnActor makes one only when RootNodes is empty, so the SCS must list a scene root (the editor keeps its
     DefaultSceneRoot node in RootNodes until another scene component takes its place). A root node listed for this is a
     node like any other to keeps_invariants: in AllNodes too, with its own VariableGuid (what a subclass's override of
-    it is keyed on); it needs no variable."""
+    it is keyed on), and its variable (CompRootVariable)."""
     b = asset('ScsNoSceneRoot')
     root, attach, made, stored = construct(b)
     assert 'Spinner' in made and stored['Spinner'], (sorted(made), stored)
@@ -6188,6 +7852,73 @@ comp_char_root()
 comp_default_root_inherited()
 
 
+def comp_no_components():
+    """An actor class that declares no UE_COMPONENT and inherits no root ends its construction with the DefaultSceneRoot
+    node's component as its root, as the editor builds it: the editor keeps that node in RootNodes and AllNodes while no
+    scene component takes its place, as 40 of the game's classes save it (ENE_EnemySpawner). That component is named
+    DefaultSceneRoot and net addressable (SCS_Node.cpp 99, 107). With neither list ExecuteScriptOnActor makes a plain
+    SceneComponent instead (SimpleConstructionScript.cpp 690-702), which nothing marks net addressable, so no reference
+    to it crosses the network (ActorComponent.cpp 1901-1913). NoCompKid's Lamp attaches to that root, 40 above it."""
+    base = asset('CompNoComponents')
+    for cls, attached in (('CompNoComponents', {}), ('NoCompKid', {'Lamp': 'DefaultSceneRoot'})):
+        b = os.path.join(os.path.dirname(base), cls)
+        root, attach, made, stored = construct(b)
+        assert root == 'DefaultSceneRoot', 'an actor of %s ends its construction with %s as its root' % (cls, root)
+        assert attach == dict(attached, DefaultSceneRoot=None), (cls, attach)
+        keeps_invariants(b)
+    p, ci = class_pkg(os.path.join(os.path.dirname(base), 'NoCompKid'))
+    assert world_location(p, ci, 'Lamp') == (0.0, 0.0, 40.0), world_location(p, ci, 'Lamp')
+    print('ok  CompNoComponents: an actor with no components gets the DefaultSceneRoot node as its root, as in the '
+          'editor')
+
+
+comp_no_components()
+
+
+def comp_root_variable():
+    """Where an SCS lists its DefaultSceneRoot node, the class has a variable of that name holding the component, as the
+    editor gives each node it lists one (KismetCompiler.cpp 884-898) and 40 of the game's classes have it
+    (ENE_EnemySpawner): ExecuteNodeOnActor stores the component there, where with none it logs on every spawn that the
+    class has no such property (SCS_Node.cpp 159-178). CompRootVariable has no component, RootVarMover a movement
+    component alone, and RootVarKid finds its parent's (FindFProperty walks the supers)."""
+    base = asset('CompRootVariable')
+    for cls in ('CompRootVariable', 'RootVarMover', 'RootVarKid'):
+        b = os.path.join(os.path.dirname(base), cls)
+        root, attach, made, stored = construct(b)
+        assert root == 'DefaultSceneRoot' and stored.get('DefaultSceneRoot'), \
+            '%s: no variable holds its root, the DefaultSceneRoot node\'s component (%s)' % (cls, stored)
+        keeps_invariants(b)
+    print('ok  CompRootVariable: a listed DefaultSceneRoot node has its variable on the class, which holds the root')
+
+
+comp_root_variable()
+
+
+def comp_root_member():
+    """A member named DefaultSceneRoot is refused only where it meets the root's variable: on a class whose SCS lists
+    the DefaultSceneRoot node (a second variable of one name, whatever its type), and below a mod class that lists it,
+    where an object property is the one ExecuteNodeOnActor finds first and stores the root in (SCS_Node.cpp 164) and
+    any other a variable named like a super's (member_names_distinct). CompRootMember's Body takes the root, so it lists
+    no node and keeps its int32, and so does RootMemberKid, below it."""
+    base = asset('CompRootMember')
+    for cls in ('CompRootMember', 'RootMemberKid'):
+        b = os.path.join(os.path.dirname(base), cls)
+        root, attach, made, stored = construct(b)
+        assert root == 'Body' and all(stored.values()) and 'DefaultSceneRoot' not in made, (cls, root, made, stored)
+        keeps_invariants(b)
+    cdo = dump('dumptags.py', base, str(exports_of(base).index('Default__CompRootMember_C')))
+    assert 'DefaultSceneRoot [0] IntProperty size=4: 5' in cdo, cdo
+    refused('RootMemberLists', '  int32 DefaultSceneRoot;\n', 'the variable of the root')
+    for member in ('USceneComponent* DefaultSceneRoot;', 'int32 DefaultSceneRoot;'):
+        refused('RootMemberBelow', '', 'the variable of the root RootBelowBase\'s construction script adds',
+                'class RootBelowBase : public AActor {\npublic:\n  int32 Count;\n};\n'
+                'class RootBelowKid : public RootBelowBase {\npublic:\n  %s\n};\n' % member)
+
+
+comp_root_member()
+print('ok  CompRootMember: a member named DefaultSceneRoot is refused only where it meets the root\'s variable')
+
+
 def comp_attach_inherited():
     """SetupAttachment in UE_DEFAULTS places a component as a constructor does. Attached to an inherited one, it is a
     root node naming that parent: an ancestor Blueprint's node by its variable and class (Glow on AttachBase_C's Lamp),
@@ -6240,6 +7971,61 @@ def comp_attach_inherited():
 comp_attach_inherited()
 
 
+def comp_attach_root():
+    """`Glow->SetupAttachment(RootComponent)` in UE_DEFAULTS puts Glow under the actor's root, whichever component that
+    is, as a constructor's call does. Below a parent that gives the actor a root, ACharacter's capsule (RootChar) or a
+    Blueprint parent's root (RootKid), Glow's node is a root node naming no parent, which ExecuteScriptOnActor attaches
+    to that root (SimpleConstructionScript.cpp 686). With none to inherit, the root is the first of the class's own
+    scene components left alone, Base though Glow is declared first (RootOwn), and with none of those the
+    DefaultSceneRoot node, which keeps Glow as its child, as the editor saves a component added under it
+    (CompAttachRoot). Glow sits 30 above the root, and RootOwn's Base hands its own 50 on to it. At a socket
+    (RootSock), the node keeps it as AttachToName, which ExecuteNodeOnActor passes to SetupAttachment (SCS_Node.cpp
+    152)."""
+    base = asset('CompAttachRoot')
+    folder = os.path.dirname(base)
+    for cls, root in (('RootKid', 'Root'), ('RootOwn', 'Base'), ('CompAttachRoot', 'DefaultSceneRoot')):
+        got, attach, made, stored = construct(os.path.join(folder, cls))
+        assert (got, attach.get('Glow')) == (root, root), '%s: the root is %s and Glow attaches to %s' % (cls, got, attach.get('Glow'))
+    for cls, socket in (('RootChar', None), ('RootSock', 'Sock')):
+        p, ci = class_pkg(os.path.join(folder, cls))
+        si, nodes, roots, dsr = comp.scs(p, ci)
+        glow = node_named(p, ci, 'Glow')
+        assert glow.index in roots and glow.parent == 'None', (cls, glow.parent, [nodes[r].name for r in roots])
+        at = comp.tags_at(p, glow.index).get('AttachToName')
+        assert (at and comp.tag_name(p, at)) == socket, '%s: Glow attaches at socket %r, want %r' % (
+            cls, at and comp.tag_name(p, at), socket)
+    keeps_invariants(os.path.join(folder, 'RootSock'))
+    for cls, want in (('RootChar', 30.0), ('RootKid', 30.0), ('RootOwn', 80.0), ('CompAttachRoot', 30.0)):
+        p, ci = class_pkg(os.path.join(folder, cls))
+        assert world_location(p, ci, 'Glow') == (0.0, 0.0, want), (cls, world_location(p, ci, 'Glow'))
+        keeps_invariants(os.path.join(folder, cls))
+    print('ok  CompAttachRoot: SetupAttachment(RootComponent) puts a component under the actor\'s root, inherited, own or '
+          'the default one, at a socket of it')
+
+
+comp_attach_root()
+
+
+def comp_attach_body():
+    """SetupAttachment in a function attaches at once and keeps the relative transform: K2_AttachToComponent with
+    KeepRelative (0) for location, rotation and scale and no welding, which is what the engine's own call leads to when
+    the component registers (SceneComponent.cpp 667-683). On a component already registered, as an actor's are once it
+    is constructed, the engine's own call does nothing but fail an ensure (1750), so the compiler says, naming the
+    function, that it attached anyway."""
+    base = asset('CompAttachBody')
+    log = LOGS['CompAttachBody']
+    warned = [l for l in log.splitlines() if 'warning:' in l and 'SetupAttachment' in l]
+    assert warned and all('CompAttachBody::ReceiveBeginPlay' in l for l in warned), log
+    vm = VM(base, {}, Pivot=Obj('SceneComponent'), Lamp=Obj('PointLightComponent'))
+    vm.call('ReceiveBeginPlay')
+    assert vm.log == [('K2_AttachToComponent', vm.self.vars['Pivot'], [vm.self.vars['Lamp'], 'None', 0, 0, 0, False])], vm.log
+    print('ok  CompAttachBody: SetupAttachment in a function attaches at once, keeping the relative transform, and warns '
+          'that the engine\'s own would not')
+
+
+comp_attach_body()
+
+
 # ---- Refusals: each of these would build a package the engine mishandles
 
 CLASH_BASE = ('class ClashBase : public AActor {\npublic:\n  UE_COMPONENT(USceneComponent, Root);\n'
@@ -6249,6 +8035,8 @@ for mod, body, why, top in (
         # BPGC-18: the class's own DefaultSceneRoot node and template already have that name.
         ('ClashDefaultRoot', '  UE_COMPONENT(USceneComponent, DefaultSceneRoot);\n  UE_COMPONENT(UStaticMeshComponent, Body);\n',
          'DefaultSceneRoot', ''),
+        # ...and its variable, which ExecuteNodeOnActor stores the root in: a second one, or a subclass's found first.
+        ('ClashRootVariable', '  USceneComponent* DefaultSceneRoot;\n', 'the variable of the root', ''),
         # A parent Blueprint's component: two nodes, one name, and the second rebuilds the first in place.
         ('ClashInherited', '', 'Lamp', CLASH_BASE + 'class ClashKid : public ClashBase {\npublic:\n'
                                                     '  UE_COMPONENT(UPointLightComponent, Lamp);\n};\n'),
@@ -6284,9 +8072,10 @@ for mod, body, why, top in (
         ('AttachSocket', '  UE_COMPONENT(USceneComponent, A);\n  UE_COMPONENT(USceneComponent, B);\n  FName Where;\n'
                          '  UE_DEFAULTS { B->SetupAttachment(A, Where); }\n', 'literal name', '')):
     refused(mod, body, why, top)
-print('ok  refused: component names already taken under the actor (DefaultSceneRoot, a parent Blueprint\'s component,\n'
-      '    a native default subobject or member, a game Blueprint\'s SCS node), a spawn in UserConstructionScript,\n'
-      '    AddComponent by template name, SetupAttachment in a cycle, of an inherited component or at a computed socket')
+print('ok  refused: component names already taken under the actor (DefaultSceneRoot and its variable, a parent\n'
+      '    Blueprint\'s component, a native default subobject or member, a game Blueprint\'s SCS node), a spawn in\n'
+      '    UserConstructionScript, AddComponent by template name, SetupAttachment in a cycle, of an inherited component\n'
+      '    or at a computed socket')
 
 
 def refused_or_warned(mod, body, why, top=''):
@@ -6481,8 +8270,9 @@ def prop_enum_class():
     override's parameter, which then has its native parent's type (FEnumProperty::SameType, EnumProperty.cpp 395-398). A
     namespaced enum (EAttachLocation) stays a ByteProperty. Its tags - the CDO's, a UE_DEFAULTS one on a native
     EnumProperty member, an array's and a map's, a UserDefinedStruct's default and a native struct's member - are
-    EnumProperty tags (the GetID(), PropertyTag.cpp 17, 30-36) naming the enum and holding the enumerator's FName. Its
-    values run as bytes: a switch, a compare, a cast, a map lookup and a native struct literal."""
+    EnumProperty tags (the GetID(), PropertyTag.cpp 17, 30-36) naming the enum and holding the enumerator's FName; an
+    empty array, set or map of it, its counts alone. Its values run as bytes: a switch, a compare, a cast, a map lookup
+    and a native struct literal."""
     import invariants, runvm
     base = asset('PropEnumClass')
     folder = os.path.dirname(base)
@@ -6515,6 +8305,10 @@ def prop_enum_class():
     assert is_enum_class(member, rule_enum, slot), 'the UE_STRUCT member is a %s' % member.type
     t = next(t for t in slot.struct(0).defaults if t['name'].startswith('Rule_'))
     assert (t['type'], t['enum'], fname_at(slot.names, t['value'], 0)) == ('EnumProperty', 'EAttachmentRule', 'eattachmentrule::snaptotarget'), t
+    # Its empty array, set and map of the enum: the default instance tags each with its counts alone.
+    empty = {t['name'].split('_')[0]: t['value'] for t in slot.struct(0).defaults
+             if t['name'].split('_')[0] in ('Vis', 'Met', 'Toll')}
+    assert empty == {'Vis': bytes(4), 'Met': bytes(8), 'Toll': bytes(8)}, empty
 
     cdo = pkg.find('Default__PropEnumClass_C')
     for name, enum, value in (('Rule', 'EAttachmentRule', 'keepworld'), ('Ability', 'EAbilityIndex', 'esecondary'),
@@ -6559,6 +8353,457 @@ prop_set_delta()
 prop_enum_class()
 
 
+def value_init_scalar():
+    """Braces or `T()` around something that is not a struct are C++'s: `E R{}`, `T()` and `{}` the type's zero
+    (value-initialisation), `{V}` the value V - an enum, an own UE_ENUM, an int, an int64, a byte, a float, a bool and an
+    object pointer, in a local, an assignment, an argument, a return value, an array element and a member of a braced
+    UE_STRUCT (`{}` there is the member's zero, not its default, and a member the braces leave out keeps its default,
+    an enum's included: runscript reads a UserDefinedStruct's enum defaults), and as the default of a member and of a UE_STRUCT
+    member (a zero one writes no tag on the class default object; a UserDefinedStruct's default instance tags every
+    member: with no defaults to diff against, Class.cpp 1547 writes each), and as a braced asset's value, where `{}` is
+    written as the zero it is. A UE_STRUCT's `T()` default is its defaults.
+    A `{}` for a member of a class type - an engine struct, a TArray, an FName, a UE_STRUCT - is that type's fresh value
+    too, not the member's default: in a function body (where the UE_STRUCT's frame local starts as its default instance,
+    UUserDefinedStruct::InitializeStruct, so a member left unstored would read its default), in a class default and in
+    a braced asset. An empty container is a value: assigned, passed, constructed and returned."""
+    import struct
+    base = asset('ValueInitScalar')
+    keeps_invariants(base)
+    for fn, want in (('EnumBraces', 0), ('EnumEqBraces', 0), ('EnumParens', 0), ('EnumValue', 1), ('EnumArg', 20),
+                     ('EnumAssign', 0), ('EnumReturn', 10), ('OwnEnum', 20), ('IntBraces', 7), ('IntParens', 0),
+                     ('WideBraces', 0), ('Elements', 10), ('SlotBraces', 0), ('SlotOmit', 215)):
+        for m in (0, 3):
+            got = run(base, fn, {'Held': 1}, M=m)[0]
+            assert got == want + m, 'ValueInitScalar.%s(%d) = %r, want %r' % (fn, m, got, want + m)
+    for fn, want in (('NativeBraces', lambda m: 10 * m), ('NativeDesig', lambda m: 10 * m),
+                     ('NativeOmit', lambda m: 10 * m + 2), ('NativeMacro', lambda m: 10 * m), ('NativeArray', lambda m: m),
+                     ('NativeNested', lambda m: 12 + m),
+                     ('NativeName', lambda m: True), ('EmptyAssign', lambda m: m), ('EmptyArg', lambda m: m)):
+        for m in (0, 3):
+            got = run(base, fn, {'Items': [1, 2]}, M=m)[0]
+            assert got == want(m), 'ValueInitScalar.%s(%d) = %r, want %r' % (fn, m, got, want(m))
+    assert run(base, 'FloatBraces', F=2.0)[0] == 3.5 and run(base, 'BoolBraces', M=1)[0] is False
+    assert run(base, 'ObjBraces', M=0)[0] == 1 and run(base, 'ObjAssign', {'Seen': None}, M=0)[0] == 1
+    pkg = invariants.Package(base)
+    cdo = pkg.find('Default__ValueInitScalar_C')
+    for name in ('Rule', 'Count', 'Who', 'Parens', 'RuleParens', 'Fresh'):
+        assert not pkg.tag(cdo, name), 'the zero default of %s writes a tag: %r' % (name, pkg.tag(cdo, name))
+    cleared = {u['name'].split('_')[0]: u for u in pkg.tags(cdo, pkg.tag(cdo, 'Cleared')['at'])}
+    assert fname_at(pkg.names, cleared['Kept']['value'], 0) == 'eattachmentrule::keeprelative', cleared['Kept']
+    assert struct.unpack('<i', cleared['Five']['value'])[0] == 0, cleared['Five']
+    kept, seven, half = pkg.tag(cdo, 'Kept'), pkg.tag(cdo, 'Seven'), pkg.tag(cdo, 'Half')
+    assert kept and fname_at(pkg.names, kept['value'], 0) == 'eattachmentrule::keepworld', kept
+    assert seven and struct.unpack('<i', seven['value'])[0] == 7, seven
+    assert half and struct.unpack('<f', half['value'])[0] == 0.5, half
+    slot = invariants.Package(os.path.join(os.path.dirname(base), 'FValueSlot'))
+    tags = {t['name'].split('_')[0]: t for t in slot.struct(0).defaults}
+    assert fname_at(slot.names, tags['Zeroed']['value'], 0) == 'eattachmentrule::keeprelative', tags['Zeroed']
+    assert fname_at(slot.names, tags['Kept']['value'], 0) == 'eattachmentrule::keepworld', tags['Kept']
+    assert [struct.unpack('<i', tags[n]['value'])[0] for n in ('Nil', 'Five')] == [0, 5], (tags['Nil'], tags['Five'])
+    asset_pkg = invariants.Package(os.path.join(os.path.dirname(base), 'VD_Braces'))
+    named = {t['name']: t for t in asset_pkg.tags(asset_pkg.find('VD_Braces'))}
+    assert set(named) == {'Count', 'Rule'} and struct.unpack('<i', named['Count']['value'])[0] == 0, named
+    assert fname_at(asset_pkg.names, named['Rule']['value'], 0) == 'eattachmentrule::keeprelative', named['Rule']
+
+    def fresh(pkg, i, tags, where):
+        """V zero, L empty, In FValueIn's own defaults (1, 2), N None: each `{}` of the value tagged in tags."""
+        inner = {u['name'].split('_')[0]: u for u in pkg.tags(i, tags['In']['at'])}
+        assert struct.unpack('<ff', tags['V']['value']) == (0.0, 0.0), (where, tags['V'])
+        assert struct.unpack('<i', tags['L']['value'][:4])[0] == 0, (where, tags['L'])
+        assert [struct.unpack('<i', inner[n]['value'])[0] for n in ('P', 'Q')] == [1, 2], (where, inner)
+        assert fname_at(pkg.names, tags['N']['value'], 0) == 'none', (where, tags['N'])
+    held = {u['name'].split('_')[0]: u for u in pkg.tags(cdo, pkg.tag(cdo, 'NativeHeld')['at'])}
+    assert struct.unpack('<i', held['A']['value'])[0] == 7, held['A']
+    fresh(pkg, cdo, held, 'NativeHeld')
+    native = invariants.Package(os.path.join(os.path.dirname(base), 'VN_Braces'))
+    named = {t['name']: t for t in native.tags(native.find('VN_Braces'))}
+    assert set(named) == {'Count', 'V', 'L', 'In', 'N'}, named
+    fresh(native, native.find('VN_Braces'), named, 'VN_Braces')
+    omit = invariants.Package(os.path.join(os.path.dirname(base), 'VN_Omit'))
+    assert [t['name'] for t in omit.tags(omit.find('VN_Omit'))] == ['Count'], 'a member VN_Omit leaves out is written'
+
+
+value_init_scalar()
+print('ok  ValueInitScalar: braces or T() around an enum, a number or a pointer are its zero, or the value braced; '
+      '{} for a struct, container or name member is its fresh value, not the default; an empty container is a value')
+
+
+def defaults_zero():
+    """UE_DEFAULTS over a parent's non-zero defaults, each member set to its type's zero by `{}`, `T()` or `nullptr`: a
+    subclass's default object deltas against its parent's, so each zero is a tag the loader reads over the parent's
+    value, as `Count = 0;` writes one. A UE_STRUCT's `{}` or `T()` is its own defaults, an engine struct's its zeros."""
+    import struct
+    base = asset('DefaultsZero')
+    keeps_invariants(base)
+    pkg = invariants.Package(base)
+    cdo = pkg.find('Default__DefaultsZero_C')
+    tags = {t['name']: t for t in pkg.tags(cdo)}
+    assert set(tags) == {'Count', 'Rate', 'bOn', 'Rule', 'Who', 'Tag', 'Text', 'Ids', 'V', 'In', 'More', 'W', 'Kept'}, sorted(tags)
+    assert struct.unpack('<i', tags['Count']['value'])[0] == 0, tags['Count']
+    assert struct.unpack('<f', tags['Rate']['value'])[0] == 0.0, tags['Rate']
+    assert tags['bOn']['bool'] == 0, tags['bOn']
+    assert fname_at(pkg.names, tags['Rule']['value'], 0) == 'eattachmentrule::keeprelative', tags['Rule']
+    assert struct.unpack('<i', tags['Who']['value'])[0] == 0, tags['Who']
+    assert fname_at(pkg.names, tags['Tag']['value'], 0) == 'none', tags['Tag']
+    assert struct.unpack('<i', tags['Text']['value'][:4])[0] == 0, tags['Text']
+    for name in ('Ids', 'More'):
+        assert struct.unpack('<i', tags[name]['value'][:4])[0] == 0, tags[name]
+    for name in ('V', 'W'):
+        assert struct.unpack('<ff', tags[name]['value']) == (0.0, 0.0), tags[name]
+    for name in ('In', 'Kept'):
+        inner = {u['name'].split('_')[0]: u for u in pkg.tags(cdo, tags[name]['at'])}
+        assert [struct.unpack('<i', inner[n]['value'])[0] for n in ('P', 'Q')] == [1, 2], (name, inner)
+
+
+defaults_zero()
+print('ok  DefaultsZero: UE_DEFAULTS\' {} / T() / nullptr over a parent\'s default writes the type\'s zero, a '
+      'UE_STRUCT\'s its defaults')
+
+
+def defaults_value_init():
+    """`{}` and `T()` of an engine struct hold what the engine's constructor sets, which no header says: FHitResult's
+    sets Time to 1 (FHitResult::Init, EngineTypes.h), FFindFloorResult's HitResult(1.f) does the same to its member,
+    FTransform's is the identity (TransformVectorized.h 108), and the UeApi's `T() = default;` says none of it. A
+    class's own default starts as that fresh value, so it is kept by tagging none of the struct's members, however
+    deep; over a parent's value, or over a UE_STRUCT member's own initializer, it cannot be written, and is refused. An
+    engine struct whose constructor sets nothing is its zeros (DefaultsZero's FVector2D); FVector4's W 1, which the
+    engine's fresh one lacks, is written (StructCtorValues)."""
+    import struct
+    top = ('struct FHeldHit {\n  UE_STRUCT;\n  FHitResult Hit;\n  int32 N = 0;\n};\n'
+           'class ValueInitParent : public AActor {\npublic:\n  FHitResult Hit;\n  FHeldHit H;\n'
+           '  FFindFloorResult Floor = {true, true, true, 2.0f, 3.0f, {}};\n  FTransform Xf;\n};\n')
+    for mod, assign, path, what in (('ValueInitCtor', 'Hit = FHitResult();', 'Hit', 'FHitResult'),
+                                    ('ValueInitBraces', 'Hit = {};', 'Hit', 'FHitResult'),
+                                    ('ValueInitHeld', 'H = {};', 'H.Hit', 'FHitResult'),
+                                    ('ValueInitFloor', 'Floor = FFindFloorResult();', 'Floor', 'FFindFloorResult'),
+                                    ('ValueInitFloorBraces', 'Floor = {};', 'Floor', 'FFindFloorResult'),
+                                    ('ValueInitXform', 'Xf = FTransform();', 'Xf', 'FTransform')):
+        refused(mod, '  UE_DEFAULTS {\n    %s\n  }\n' % assign,
+                "%s: `%s()` or `{}` holds what the engine's %s constructor sets" % (path, what, what), top, 'ValueInitParent')
+    refused('ValueInitOverInit', '  FHasInit Y = {FHitResult(), 5};\n',
+            "Y.Hit: `FHitResult()` or `{}` holds what the engine's FHitResult constructor sets",
+            'struct FHasInit {\n  UE_STRUCT;\n  FHitResult Hit = {.Time = 0.5f};\n  int32 N = 0;\n};\n')
+    base = asset('DefaultsValueInit')
+    keeps_invariants(base)
+    pkg = invariants.Package(base)
+    cdo = pkg.find('Default__DefaultsValueInit_C')
+
+    def members(at=None):
+        return {t['name'].split('_')[0]: t for t in (pkg.tags(cdo, at) if at is not None else pkg.tags(cdo))}
+
+    def time_of(hit):
+        """Time as the loader leaves it in a fresh FHitResult that this tag (or none) is read over."""
+        inner = members(hit['at']) if hit else {}
+        return struct.unpack('<f', inner['Time']['value'])[0] if 'Time' in inner else 1.0
+    tags = members()
+    for name in ('Own', 'Own2'):
+        held = members(tags[name]['at'])
+        assert struct.unpack('<i', held['N']['value'])[0] == 5, (name, held)
+        assert time_of(held.get('Hit')) == 1.0, '%s.Hit.Time is written %r, where C++ gives 1' % (name, time_of(held.get('Hit')))
+    assert time_of(tags.get('Mine')) == 1.0, 'Mine.Time is written %r, where C++ gives 1' % time_of(tags.get('Mine'))
+    for name, n in (('Floor', 5), ('Floor2', 6)):
+        held = members(tags[name]['at'])
+        assert struct.unpack('<i', held['N']['value'])[0] == n, (name, held)
+        floor = members(held['F']['at']) if 'F' in held else {}
+        got = time_of(floor.get('HitResult')) if 'F' in held else 1.0
+        assert got == 1.0, '%s.F.HitResult.Time is written %r, where C++ gives 1' % (name, got)
+    bare = members(tags['Bare']['at']) if 'Bare' in tags else {}
+    assert ('HitResult' not in bare if 'Bare' in tags else True) or time_of(bare['HitResult']) == 1.0, bare
+    xf = members(tags['Xf']['at']) if 'Xf' in tags else {}
+    scale = struct.unpack('<3f', xf['Scale3D']['value'][:12]) if 'Scale3D' in xf else (1.0, 1.0, 1.0)
+    assert scale == (1.0, 1.0, 1.0), 'Xf.Scale3D is written %r, where FTransform() is the identity' % (scale,)
+
+
+defaults_value_init()
+print('ok  DefaultsValueInit: {} / T() of an engine struct keeps the engine\'s values in a fresh default, however deep, '
+      'and is refused over a value already there, unless its constructor sets nothing')
+
+
+def struct_ctor_values():
+    """`T()`, `T{}` and a declaration with no initializer of an engine struct hold what its constructor makes, in a
+    function as in C++: FTransform's identity (Scale3D 1, Rotation.W 1, TransformVectorized.h 108) as an argument, a
+    local assigned again, a loop's local and a UE_STRUCT's member; FVector4's W 1 (Vector4.h 59), which the engine's own
+    fresh FVector4 lacks (STRUCT_ZeroConstructor, Property.cpp 88-98). runscript constructs a frame's locals as the VM
+    does (frame_defaults). A default holds the same: a class member, its `FVector4()`, the same over a parent's value,
+    and a UE_STRUCT's member the braces leave out."""
+    import struct
+    import runvm
+    base = asset('StructCtorValues')
+    keeps_invariants(base)
+    for fn, want in (('XfLocal', 2), ('XfTemp', 1), ('XfArg', 1), ('XfAssign', 1), ('XfLoop', 6), ('XfBareLoop', 6),
+                     ('XfHeld', 4), ('V4', 1), ('V4Decl', 1), ('V4Braces', 1), ('V4Loop', 6), ('V4Held', 1)):
+        for m in (0, 1):
+            got = run(base, fn, {}, M=m)[0]
+            assert got == want + m, 'StructCtorValues.%s(%d) = %r, C++ gives %r' % (fn, m, got, want + m)
+    # runvm builds a frame's locals the same, and a Let copies a struct: a loop's `FTransform T;` is T = its fresh twin
+    # each round, which the round's `+=` must not reach.
+    for fn, want in (('XfAssign', 1), ('XfLoop', 6), ('XfBareLoop', 6), ('V4Loop', 6)):
+        vm = runvm.VM(base)
+        vm.struct_const = lambda name, vals: (runvm.Written(zip('XYZW', vals)) if name == 'Vector4'
+                                              else runvm.Struct(name, vals))
+        got = vm.call(fn, M=1)
+        assert got == want + 1, 'runvm: StructCtorValues.%s(1) = %r, C++ gives %r' % (fn, got, want + 1)
+    pkg = invariants.Package(base)
+    cdo = pkg.find('Default__StructCtorValues_C')
+    tags = {t['name']: t for t in pkg.tags(cdo)}
+    for name in ('Bare', 'Ctor', 'Over'):
+        got = struct.unpack('<4f', tags[name]['value']) if name in tags else None
+        assert got == (0.0, 0.0, 0.0, 1.0), '%s is written %r, where FVector4() is (0, 0, 0, 1)' % (name, got)
+    held = {t['name'].split('_')[0]: t for t in pkg.tags(cdo, tags['Held']['at'])}
+    assert struct.unpack('<i', held['N']['value'])[0] == 2, held
+    got = struct.unpack('<4f', held['V']['value']) if 'V' in held else None
+    assert got == (0.0, 0.0, 0.0, 1.0), 'Held.V is written %r, where FVector4() is (0, 0, 0, 1)' % (got,)
+
+
+struct_ctor_values()
+print('ok  StructCtorValues: T() / T{} / a bare declaration of an engine struct holds what its constructor makes: '
+      'FTransform\'s identity, FVector4\'s W 1, in a function and in a default')
+
+
+def defaults_braces():
+    """Designated braces of an engine struct whose header declares no constructor leave a member out as the editor's
+    Make Struct does, keeping what the engine's constructor sets (FHitResult's Time 1): untagged in a class's own
+    default, and in UE_DEFAULTS where the parent's value is a fresh one; over another (Hit2's Time 0.5) they are
+    refused, naming Time, the member the parent's braces give (FaceIndex, which both leave out, holds the engine's
+    value in either; fix/r5-leftovers named it). `T = FTimerHandle();` writes nothing, with a warning: Handle, its one member, is
+    Transient, which the loader never reads from a default (Class.cpp 1452)."""
+    import struct
+    base = asset('DefaultsBraces')
+    keeps_invariants(base)
+    pkg = invariants.Package(base)
+    cdo = pkg.find('Default__DefaultsBraces_C')
+
+    def members(at=None):
+        return {t['name'].split('_')[0]: t for t in (pkg.tags(cdo, at) if at is not None else pkg.tags(cdo))}
+    tags = members()
+    for name, given in (('Mine', {'Distance': 5.0}), ('Mine2', {'FaceIndex': 0, 'Time': 0.25}), ('Hit', {'Distance': 6.0})):
+        inner = members(tags[name]['at']) if name in tags else {}
+        got = {n: struct.unpack('<i' if n == 'FaceIndex' else '<f', t['value'])[0] for n, t in inner.items()}
+        assert got == given, '%s is written %r, where the braces give %r and leave the rest the engine\'s' % (name, got, given)
+    assert 'T' not in tags or not members(tags['T']['at']), members(tags['T']['at'])
+    assert re.search(r'warning: T: every member of FTimerHandle is Transient', LOGS['DefaultsBraces']), LOGS['DefaultsBraces']
+    refused('BracesOverValue', '  UE_DEFAULTS {\n    Hit2 = {.Distance = 5.0f};\n  }\n',
+            "Hit2.Time, left out of the braces, holds what the engine's FHitResult constructor sets",
+            'class BovParent : public AActor {\npublic:\n  FHitResult Hit2 = {.Time = 0.5f};\n};\n', 'BovParent')
+
+
+defaults_braces()
+print('ok  DefaultsBraces: an engine struct\'s designated braces leave the rest the engine\'s where the value is fresh, '
+      'and are refused over another; FTimerHandle() writes nothing, with a warning')
+
+
+def defaults_left_out():
+    """A UE_STRUCT's member that braces given in UE_DEFAULTS leave out takes its value-initialisation, or its own `{}`;
+    of an engine struct that is what its constructor sets, which cannot be written over the parent's value. The
+    refusal says the member was left out of the braces, not `FHitResult()` or `{}`, which the user did not write."""
+    for mod, held in (('LeftOutHeld', 'FHitResult Hit;'), ('LeftOutInit', 'FHitResult Hit = {};')):
+        refused(mod, '  UE_DEFAULTS {\n    H = {.N = 5};\n  }\n',
+                "H.Hit, left out of the braces, holds what the engine's FHitResult constructor sets",
+                'struct F%s {\n  UE_STRUCT;\n  %s\n  int32 N = 0;\n};\n'
+                'class %sParent : public AActor {\npublic:\n  F%s H = {{}, 2};\n};\n' % (mod, held, mod, mod), mod + 'Parent')
+
+
+defaults_left_out()
+print('ok  DefaultsLeftOut: a member left out of UE_DEFAULTS\' braces is named as left out when refused')
+
+
+def defaults_braces_nested():
+    """Braces given in UE_DEFAULTS for a UE_STRUCT's member with an initializer of its own (FDbnHeld::Hit's Time 0.5)
+    replace that value: a member they leave out holds what the engine's constructor sets (Time 1), and the parent's
+    value under it is the initializer's, though the parent's H as a whole is fresh. It cannot be written: refused.
+    Where the member has no initializer (DefaultsBraces' FDbHeld::Hit) the parent's value under it is fresh too, and the
+    braces leave the rest untagged. The refusal names Time, the member the initializer gives: FaceIndex, which it
+    leaves out too, is still the fresh one under it (DefaultsNestDeep follows initializers down; fa30eccf named
+    FaceIndex)."""
+    import struct
+    pkg = invariants.Package(asset('DefaultsBraces'))
+    cdo = pkg.find('Default__DefaultsBraces_C')
+    held = {t['name'].split('_')[0]: t for t in pkg.tags(cdo, next(t for t in pkg.tags(cdo) if t['name'] == 'Held')['at'])}
+    hit = {t['name']: struct.unpack('<f', t['value'])[0] for t in pkg.tags(cdo, held['Hit']['at'])}
+    assert hit == {'Distance': 7.0} and struct.unpack('<i', held['N']['value'])[0] == 0, (hit, held)
+    refused('BracesNestInit', '  UE_DEFAULTS {\n    H = {.Hit = {.Distance = 5.0f}};\n  }\n',
+            "H.Hit.Time, left out of the braces, holds what the engine's FHitResult constructor sets",
+            'struct FDbnHeld {\n  UE_STRUCT;\n  FHitResult Hit = {.Time = 0.5f};\n  int32 N = 0;\n};\n'
+            'class DbnParent : public AActor {\npublic:\n  FDbnHeld H;\n};\n', 'DbnParent')
+
+
+defaults_braces_nested()
+print('ok  DefaultsBracesNested: braces over a UE_STRUCT member\'s own initializer are refused, over one with none they '
+      'leave the rest the engine\'s')
+
+
+def defaults_nest_deep():
+    """Braces three deep over a fresh parent O, `O = {.In = {.Hit = {.Distance = 3.0f}}}`: In's initializer
+    ({.K = 4}) leaves Hit out, so the parent's O.In.Hit is the engine's fresh FHitResult, and the braces leave the rest
+    of Hit as that, untagged, as the editor's Make Struct over it would. K, left out of `.In = {...}`, takes its
+    initializer 0 over the parent's 4 ([dcl.init.aggr]/5). Where In's initializer gives Hit a value (Time 0.5), the
+    member the new braces leave out over it is refused by name. Refused on fa30eccf at O.In.Hit.FaceIndex."""
+    import struct
+    base = asset('DefaultsNestDeep')
+    keeps_invariants(base)
+    pkg = invariants.Package(base)
+    cdo = pkg.find('Default__DefaultsNestDeep_C')
+
+    def members(at=None):
+        return {t['name'].split('_')[0]: t for t in (pkg.tags(cdo, at) if at is not None else pkg.tags(cdo))}
+    o = members(members()['O']['at'])
+    inner = members(o['In']['at'])
+    hit = {n: struct.unpack('<f', t['value'])[0] for n, t in members(inner['Hit']['at']).items()}
+    k = struct.unpack('<i', inner['K']['value'])[0] if 'K' in inner else None
+    assert hit == {'Distance': 3.0} and k == 0, 'O.In is written K %r, Hit %r; C++ gives K 0, Hit Distance 3 alone' % (k, hit)
+    refused('NestDeepGiven', '  UE_DEFAULTS {\n    O = {.In = {.Hit = {.Distance = 3.0f}}};\n  }\n',
+            "O.In.Hit.Time, left out of the braces, holds what the engine's FHitResult constructor sets",
+            'struct FNdgInner {\n  UE_STRUCT;\n  int32 K = 0;\n  FHitResult Hit;\n};\n'
+            'struct FNdgOuter {\n  UE_STRUCT;\n  FNdgInner In = {.K = 4, .Hit = {.Time = 0.5f}};\n};\n'
+            'class NdgParent : public AActor {\npublic:\n  FNdgOuter O;\n};\n', 'NdgParent')
+
+
+defaults_nest_deep()
+print('ok  DefaultsNestDeep: braces under a member\'s initializer follow it down to what it leaves fresh')
+
+
+def defaults_other_nest():
+    """A class's own `H = {.Hit = {.Distance = 5.0f}}` where H is another mod's UE_STRUCT_IN struct whose Hit has an
+    initializer of its own (Time 0.5): the braces are a new FHitResult, whose Time is what the engine's constructor sets,
+    not the 0.5 the struct's default holds, so leaving it untagged would load 0.5. Refused by name, as for a UE_STRUCT
+    (LocalNest). Compiled on fa30eccf with Time untagged: another mod's struct counted as an engine struct, whose
+    fresh value is the engine's. The refusal names Time, the member the initializer gives; FaceIndex, which both
+    braces leave out, holds the engine's value either way (DefaultsOwnNest; fix/r5-leftovers named FaceIndex)."""
+    for mod, kind in (('OtherNest', 'UE_STRUCT_IN("/Game/_ElytrasMods/DboOtherMod")'), ('LocalNest', 'UE_STRUCT')):
+        refused(mod, '  F%sHeld H = {.Hit = {.Distance = 5.0f}};\n' % mod,
+                "H.Hit.Time, left out of the braces, holds what the engine's FHitResult constructor sets",
+                'struct F%sHeld {\n  %s;\n  FHitResult Hit = {.Time = 0.5f};\n  int32 N = 0;\n};\n' % (mod, kind))
+
+
+defaults_other_nest()
+print('ok  DefaultsOtherNest: new braces over another mod\'s struct\'s member initializer are refused as over a '
+      'UE_STRUCT\'s')
+
+
+def defaults_braces_twice():
+    """Two UE_DEFAULTS statements on one member: the second is a whole new value, so a member its braces leave out holds
+    the engine's (Time 1), not the first statement's Time 3. The loader applies the CDO's tags in order, each struct
+    tag over the value before it; what they leave in Hit must be the second statement's braces alone."""
+    import struct
+    base = asset('DefaultsBracesTwice')
+    keeps_invariants(base)
+    pkg = invariants.Package(base)
+    cdo = pkg.find('Default__DefaultsBracesTwice_C')
+    loaded = {}
+    for t in pkg.tags(cdo):
+        if t['name'] == 'Hit':
+            loaded.update((m['name'].split('_')[0], struct.unpack('<f', m['value'])[0]) for m in pkg.tags(cdo, t['at']))
+    assert loaded == {'Distance': 6.0}, 'Hit loads %r over the parent\'s fresh value, where C++ gives Distance 6 alone' % loaded
+
+
+defaults_braces_twice()
+print('ok  DefaultsBracesTwice: a second UE_DEFAULTS statement on a member replaces the first')
+
+
+def defaults_braces_other_mod():
+    """Another mod's UE_STRUCT_IN struct is no engine struct: a member its braces leave out has the initializer the
+    shared header gives it (B = 4), written as in C++. DboOtherMod, built beside it, cooks the struct."""
+    import struct
+    asset('DboOtherMod')
+    base = asset('DefaultsBracesOther')
+    keeps_invariants(base)
+    pkg = invariants.Package(base)
+    cdo = pkg.find('Default__DefaultsBracesOther_C')
+    tags = {t['name']: t for t in pkg.tags(cdo)}
+    got = {m['name'].split('_')[0]: struct.unpack('<i', m['value'])[0] for m in pkg.tags(cdo, tags['O']['at'])} if 'O' in tags else None
+    assert got == {'A': 7, 'B': 4}, 'O is written %r, where `O = {.A = 7}` is A 7 and B its initializer 4' % (got,)
+
+
+defaults_braces_other_mod()
+print('ok  DefaultsBracesOther: another mod\'s struct is no engine struct to braces: a member left out takes its initializer')
+
+
+def defaults_other_ctor():
+    """`O = FDboOther();` and `P = {};` of another mod's UE_STRUCT_IN struct are its value-initialisation, which C++
+    makes from each member's initializer (the implicit default constructor, [class.base.init]/9; empty braces of an
+    aggregate, [dcl.init.aggr]/5): A 3 and B 4, written over the parent's (1, 2) and (5, 6). The shared header says
+    every member's value; only an engine struct's constructor is one no header says. Refused on fa30eccf as "holds what
+    the engine's FDboOther constructor sets"."""
+    import struct
+    asset('DboOtherMod')
+    base = asset('DefaultsOtherCtor')
+    keeps_invariants(base)
+    pkg = invariants.Package(base)
+    cdo = pkg.find('Default__DefaultsOtherCtor_C')
+    tags = {t['name']: t for t in pkg.tags(cdo)}
+    for name in ('O', 'P'):
+        got = ({m['name'].split('_')[0]: struct.unpack('<i', m['value'])[0] for m in pkg.tags(cdo, tags[name]['at'])}
+               if name in tags else None)
+        assert got == {'A': 3, 'B': 4}, '%s is written %r, where C++ value-initialises it to A 3, B 4' % (name, got)
+
+
+defaults_other_ctor()
+print('ok  DefaultsOtherCtor: another mod\'s struct\'s T() or {} is its members\' initializers, written')
+
+
+def tenum_value_init():
+    """TEnumValueInit: `{}` and `TEnum<E>()` are a TEnum<E>'s zero enumerator, as they are an E's: assigned (Held's
+    default is Two, Rule's KeepWorld), passed, returned, as a struct literal's member over a non-zero default (P One,
+    R KeepWorld; a member left out keeps its default), as an array's element, as a conditional's arm, and as a game
+    function's TEnum<E> arguments."""
+    base = asset('TEnumValueInit')
+    keeps_invariants(base)
+    for fn, want in (('Assign', lambda m: m), ('AssignParens', lambda m: m), ('Arg', lambda m: 300 + m),
+                     ('Return', lambda m: m), ('Literal', lambda m: (m + 1) * 10), ('Designated', lambda m: 350 + m),
+                     ('Kept', lambda m: 351 + m), ('Elements', lambda m: 20 + m), ('Choose', lambda m: 0 if m == 0 else 2)):
+        for m in (0, 3):
+            got = run(base, fn, {'Held': 2, 'Rule': 1}, M=m)[0]
+            assert got == want(m), 'TEnumValueInit.%s(%d) = %r, want %r' % (fn, m, got, want(m))
+    runscript.MATH['K2_DetachFromActor'] = lambda *a: None
+    try:
+        del runscript.CALLS[:]
+        run(base, 'Detach')
+        assert runscript.CALLS == [('K2_DetachFromActor', (0, 0, 0))], runscript.CALLS
+    finally:
+        del runscript.MATH['K2_DetachFromActor']
+
+
+tenum_value_init()
+print('ok  TEnumValueInit: {} and TEnum<E>() are the zero enumerator wherever a TEnum<E> is assigned, passed or returned')
+
+
+def tenum_holders():
+    """TEnumHolders: a TArray<TEnum<E>> has an array's methods (Add, Num, Contains, on a variable, a local and a
+    parameter), and a dispatcher with a TEnum<E> parameter binds and broadcasts; Name() on an element is still E's."""
+    base = asset('TEnumHolders')
+    keeps_invariants(base)
+    names = []
+    vm = VM(base, {'GetEnumeratorName': lambda vm, ctx, e, v: names.append((e, v)) or 'Three'}, Items=[1, 3], Seen=0)
+    assert vm.call('Fire', 4) == 24 and vm.self.vars['Seen'] == 24, vm.self.vars
+    assert vm.call('Count', 5) == 36 and vm.self.vars['Items'] == [1, 3, 2], vm.self.vars
+    assert vm.call('Local', 5) == 127, vm.call('Local', 5)
+    assert vm.call('NameOf') == 'Three' and names == [('EThPick', 3)], names
+
+
+tenum_holders()
+print('ok  TEnumHolders: a TArray of TEnum<E> and a dispatcher with a TEnum<E> parameter keep their own methods')
+
+
+def tenum_map_key():
+    """TEnumMapKey: a TMap keyed by a TEnum<E> whose value is a template too (TSubclassOf, TEnum, TArray, TSoftObjectPtr)
+    is a map of the enum to that value, as a variable, a local and a parameter."""
+    import invariants
+    base = asset('TEnumMapKey')
+    keeps_invariants(base)
+    pkg = invariants.Package(base)
+    props = {p.name: [s.type for s in p.subs] for p in pkg.struct(pkg.find('TEnumMapKey_C')).props}
+    assert props['Classes'] == ['ByteProperty', 'ClassProperty'], props
+    # A container value is held in the wrapper struct a nested container needs.
+    assert props['Rules'] == ['ByteProperty', 'EnumProperty'] and props['Lists'] == ['ByteProperty', 'StructProperty'], props
+    for fn, vars_, parms, want in (('Rule', {'Rules': {1: 1}}, {}, 1), ('Local', {}, {}, 20), ('Pass', {}, {'R': {2: 2}}, 2)):
+        got = run(base, fn, vars_, M=3, **parms)[0]
+        assert got == want + 3, (fn, got, want + 3)
+
+
+tenum_map_key()
+print('ok  TEnumMapKey: a TMap keyed by a TEnum<E> takes a templated value type')
+
+
 # -- pending
 
 for _mod, _body in (('PropSetBool', '  TSet<bool> Flags;\n'), ('PropMapBool', '  TMap<bool, int32> ByFlag;\n'),
@@ -6569,6 +8814,28 @@ for _mod, _body in (('PropSetBool', '  TSet<bool> Flags;\n'), ('PropMapBool', ' 
     refused(_mod, _body, 'cannot hash, and the engine hashes each one')
 print('ok  a set element / map key that cannot hash is refused: bool, FText, a native struct without GetTypeHash; as '
       'a variable, a local and a parameter')
+
+
+def prop_enum_forms():
+    """A variable of a native enum whose form only a native delegate's parameter or a container's element shows is
+    the property the editor makes of it (KismetCompilerMisc.cpp 1071-1094): an EnumProperty over a ByteProperty for an
+    `enum class`, a ByteProperty naming the enum for a TEnumAsByte one. The forms are the object dump's delegate
+    signatures' and the game's own packages' (PropEnumForms.cpp says where each comes from)."""
+    import invariants
+    base = asset('PropEnumForms')
+    pkg = invariants.Package(base)
+    props = {p.name: p for p in pkg.struct(pkg.find('PropEnumForms_C')).props}
+    want = {'Severity': 'EnumProperty', 'QuartzEvent': 'EnumProperty', 'PurchaseStatus': 'EnumProperty',
+            'Treasure': 'EnumProperty', 'AppState': 'ByteProperty', 'PathEvent': 'ByteProperty',
+            'QueryStatus': 'ByteProperty', 'PurchaseState': 'ByteProperty', 'Cleaned': 'ByteProperty'}
+    got = {n: (props[n].type, [s.type for s in props[n].subs]) for n in want}
+    assert got == {n: (t, ['ByteProperty'] if t == 'EnumProperty' else []) for n, t in want.items()}, got
+    keeps_invariants(base)
+
+
+prop_enum_forms()
+print('ok  PropEnumForms: an enum only a native delegate\'s parameter or a container\'s element shows the form of is '
+      'the property the editor makes')
 
 
 # ---- TYPES: UE_STRUCT default instances, UE_ENUM payloads and names (invariant_rules/user_types.py)
@@ -6606,6 +8873,78 @@ def uds_defaults(base):
     st = pkg.struct(0)
     assert st.kind == 'UserDefinedStruct' and hasattr(st, 'defaults'), (base, st.kind)
     return tag_values(pkg, 0, st.defaults)
+
+
+def defaults_own_nest():
+    """New braces for a struct member with an initializer of its own (`FHitResult Hit = {.Time = 0.5f};`) in a value
+    that starts as the struct's default instance (UUserDefinedStruct::InitializeStruct, UserDefinedStruct.cpp 254): a
+    class's own default of another mod's struct (H) and of a UE_STRUCT (L), a struct's member initializer (FDonOuter::In)
+    and UE_DEFAULTS over a parent declared with braces (P = {.N = 2}). C++: each new Hit is Time 1, Distance 5 and the
+    rest the engine's ([dcl.init.aggr]/5, the editor's Make Struct), which the start value's Hit holds too, so only
+    Time and Distance may be written; N is its initializer 0. Where the new braces leave Time out it would load the
+    initializer's 0.5: refused, naming Time. Refused on fa30eccf + the r5 fixes at Hit.FaceIndex, which needs no tag."""
+    here = os.path.dirname(asset('DefaultsOwnNest'))
+    asset('DboOtherMod')                            # cooks FDonOther, so H's import of it resolves
+    base = os.path.join(here, 'DefaultsOwnNest')
+    keeps_invariants(base)
+    pkg = invariants.Package(base)
+    cdo = pkg.find('Default__DefaultsOwnNest_C')
+    tags = tag_values(pkg, cdo, pkg.tags(cdo))
+    want = {'Time': 1.0, 'Distance': 5.0}
+    for name, start_n in (('H', 0), ('L', 0), ('P', 2)):
+        got = tags.get(name, {})
+        assert got.get('Hit') == want and got.get('N', start_n) == 0, \
+            '%s is written %r; C++ loads Hit Time 1, Distance 5 over the rest the start value holds, N 0' % (name, got)
+    outer = uds_defaults(os.path.join(here, 'FDonOuter'))
+    assert outer.get('In', {}).get('Hit') == want and outer['In'].get('N', 0) == 0, outer
+    hit_half = 'struct FDonHeld {\n  UE_STRUCT;\n  FHitResult Hit = {.Time = 0.5f};\n  int32 N = 0;\n};\n'
+    refused('OwnNestElem', '  TArray<FDonHeld> L = {{.Hit = {.Distance = 5.0f}}};\n',
+            "L.Hit.Time, left out of the braces, holds what the engine's FHitResult constructor sets", hit_half)
+    refused('OwnNestStruct', '  FDonOut O;\n',
+            "In.Hit.Time, left out of the braces, holds what the engine's FHitResult constructor sets",
+            hit_half + 'struct FDonOut {\n  UE_STRUCT;\n  FDonHeld In = {.Hit = {.Distance = 5.0f}};\n};\n')
+
+
+defaults_own_nest()
+print('ok  DefaultsOwnNest: braces in a value that starts as a struct\'s default instance leave out what its initializer '
+      'leaves out, and are refused at what it gives')
+
+
+def asset_over_cdo():
+    """A mod's own asset is made with its class's CDO as its archetype (FObjectInitializer::InitProperties copies it in,
+    UObjectGlobals.cpp 2999), and a struct tag overwrites only the members it lists, so the asset's braces lie over the
+    CDO's values. AS_AocKeep: where the CDO's struct member is as its declaration makes it (H = {.N = 2} leaves Hit its
+    initializer's, F is fresh), a member the new braces leave out holds the same value in both, untagged; N and K are
+    written as 0 over the CDO's 2 and 4. Where the class's braces or a UE_DEFAULTS give the member a value C++'s new
+    braces would not (FaceIndex 3), leaving it untagged would load 3: refused, naming it. fix/r5-leftovers (7159b82b)
+    compiled AssetOverInit with FaceIndex untagged, and AssetOverNoInit, AssetOverEngine and AssetOverDefaults compiled
+    so on main too: the asset's braces were lowered as a value that starts fresh."""
+    here = os.path.dirname(asset('AssetOverCdo'))
+    base = os.path.join(here, 'AS_AocKeep')
+    keeps_invariants(base)
+    pkg = invariants.Package(base)
+    obj = pkg.find('AS_AocKeep')
+    got = tag_values(pkg, obj, pkg.tags(obj))
+    want = {'H': {'Hit': {'Time': 1.0, 'Distance': 5.0}, 'N': 0}, 'F': {'Hit': {'Distance': 3.0}, 'N': 0}, 'K': 0}
+    assert got == want, 'AS_AocKeep is written %r; C++ over the CDO loads %r' % (got, want)
+    face = "H.Hit.FaceIndex, left out of the braces, holds what the engine's FHitResult constructor sets"
+    over = '{.H = {.Hit = {.Time = 1.0f, .Distance = 5.0f}}};\n'
+    for mod, hit in (('AssetOverInit', 'FHitResult Hit = {.Time = 0.5f};'), ('AssetOverNoInit', 'FHitResult Hit;')):
+        refused(mod, '  F%sHeld H = {.Hit = {.FaceIndex = 3, .Time = 2.0f}};\n' % mod, face,
+                'struct F%sHeld {\n  UE_STRUCT;\n  %s\n  int32 N = 0;\n};\n' % (mod, hit), 'UPrimaryDataAsset',
+                '%s AS_%s = %s' % (mod, mod, over))
+    refused('AssetOverEngine', '  FHitResult E = {.FaceIndex = 3};\n',
+            "E.FaceIndex, left out of the braces, holds what the engine's FHitResult constructor sets", '',
+            'UPrimaryDataAsset', 'AssetOverEngine AS_AssetOverEngine = {.E = {.Distance = 2.0f}};\n')
+    refused('AssetOverDefaults', '  UE_DEFAULTS {\n    H = {.Hit = {.FaceIndex = 3}};\n  }\n', face,
+            'struct FAodHeld {\n  UE_STRUCT;\n  FHitResult Hit;\n  int32 N = 0;\n};\n'
+            'class AodParent : public UPrimaryDataAsset {\npublic:\n  FAodHeld H;\n};\n', 'AodParent',
+            'AssetOverDefaults AS_AssetOverDefaults = {{.H = {.Hit = {.Distance = 5.0f}}}};\n')
+
+
+asset_over_cdo()
+print('ok  AssetOverCdo: a mod\'s own asset\'s braces lie over its class\'s CDO: what they leave out stays untagged only '
+      'where the CDO holds what C++ would make it, else it is refused by name')
 
 
 def uds_init_defaults():
@@ -6844,7 +9183,7 @@ def repl_refusals():
 def repl_never():
     base = asset('ReplNever')
     pkg = invariants.Package(base)
-    got = {p.name: (p.cond, p.flags & 0x20) for p in pkg.struct(pkg.find('ReplNever_C')).props}
+    got = {p.name: (p.cond, p.flags & 0x20) for p in pkg.struct(pkg.find('ReplNever_C')).props if p.flags & 0x20}
     assert got == {'Hidden': (15, 0x20), 'NoReplay': (13, 0x20), 'Shown': (0, 0x20)}, \
         'Hidden cooks condition %d, want COND_Never 15: %s' % (got.get('Hidden', (None,))[0], got)
     keeps_invariants(base)
@@ -7192,6 +9531,24 @@ def spawn_abstract():
             OBJECTS + 'class UAbstractSpec : public UObject {\npublic:\n  virtual int32 N() = 0;\n};\n')
     print('ok  SpawnAbstract: spawning an abstract actor class and constructing with no Outer each warn at the '
           'function; constructing an abstract object class is refused')
+
+
+def spawn_abstract_component():
+    """AddComponentByType of an abstract component class ends in NewObject too (AActor::AddComponentByClass,
+    ActorConstruction.cpp 1140-1163), whose allocation asserts in a Development game (UObjectGlobals.cpp 2362), so it is
+    refused as SpawnObject's is: a class with a `= 0` method, and a UE_FINAL_AS base, cooked Abstract, whose message
+    names the leaf to make instead."""
+    refused('SpawnAbstractComp', '  void MakeComp() { AddComponentByType<UAbstractComp>(this); }\n',
+            'MakeComp: UAbstractComp is an abstract class',
+            OBJECTS + 'class UAbstractComp : public UActorComponent {\npublic:\n  virtual int32 N() = 0;\n};\n')
+    refused('SpawnAbstractLeaf', '  void MakeBase() { AddComponentByType<UFaCompBase>(this); }\n',
+            'MakeBase: UFaCompBase is an abstract class (UE_FINAL_AS UFaComp\'s base)',
+            OBJECTS + 'class UFaCompBase : public UActorComponent {\npublic:\n  int32 Seen;\n};\n'
+                      'UE_FINAL_AS(UFaCompBase, UFaComp);\n')
+
+
+spawn_abstract_component()
+print('ok  SpawnAbstract: AddComponentByType of an abstract component class is refused, a UE_FINAL_AS base\'s naming the leaf')
 
 
 def wait_hold():

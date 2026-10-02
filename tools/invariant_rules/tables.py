@@ -345,6 +345,24 @@ def import_chains(pkg):
 
 
 @rule
+def import_unique(pkg):
+    """No two imports name one object: the cook builds the import map from the objects it marked for import, one row
+    each (SavePackage.cpp 3288-3339), and an object is its outer chain of FNames, each compared case-insensitively with
+    its Number exact. Two rows for one object load as one, but each is a dependency of its own, which the cook never
+    writes; the game's 51,579 packages have no such pair."""
+    t = raw_tables(pkg)
+    seen = {}
+    for j in range(len(t.imports)):
+        chain = _import_chain(t, j)
+        if isinstance(chain, str): continue                             # import_chains
+        key = tuple(t.key(t.imports[step]['obj']) for step in chain)
+        if key in seen:
+            yield None, 'imports %s and %s are one object' % (t.path(-seen[key] - 1), t.path(-j - 1))
+        else:
+            seen[key] = j
+
+
+@rule
 def imports_resolve(pkg):
     """An import of an object in another /Game package names an export there: the EDL maps the import's outer chain
     onto the target's exports (the root package is 0) and looks up (ObjectName, outer) in ObjectNameWithOuterToExport,

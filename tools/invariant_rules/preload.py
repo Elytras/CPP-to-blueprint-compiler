@@ -300,7 +300,11 @@ def edl_parent_subobjects_serialized(pkg):
     SavePackage.cpp 4013-4040, not only-if-in-table) and lists it in serialize-before-serialize. edl_class_closure asks
     the same of the subobjects this package exports, through their TemplateIndex; this rule follows the parent class
     into its own package (Package.resolve) and asks it of every subobject there, so one this package does not export,
-    or exports with the wrong TemplateIndex, is asked about too. A parent package that cannot be found is skipped."""
+    or exports with the wrong TemplateIndex, is asked about too. A parent package that cannot be found is skipped.
+    Nested ones as well: the cook's walk takes every object under the CDO, at any depth, that is a default subobject or
+    an archetype (GetObjectsWithOuter includes nested objects, UObjectHash.h 55), such as the instanced bonus under
+    WPN_Pickaxe's Damage, Damage:BreakIceBonus_0, which the child's own Damage gets a copy of; each of the game's
+    child classes lists every one of its parent's."""
     if not pkg.package_flags & 0x80000000: return
     for i, st in classes(pkg):
         sup = pkg.exports[i]['super']
@@ -310,8 +314,13 @@ def edl_parent_subobjects_serialized(pkg):
         ppkg, pk = got
         pst = ppkg.struct(pk)
         if not pst or not hasattr(pst, 'class_flags') or not 0 < pst.cdo <= ppkg.export_count: continue
+
+        def under_cdo(px):
+            up = px['outer']
+            while 0 < up <= ppkg.export_count and up != pst.cdo: up = ppkg.exports[up - 1]['outer']
+            return up == pst.cdo
         for x, px in enumerate(ppkg.exports):
-            if px['outer'] != pst.cdo or not px['flags'] & RF_DefaultSubObject: continue
+            if not px['flags'] & (RF_DefaultSubObject | RF_ArchetypeObject) or not under_cdo(px): continue
             want = ppkg.path(x + 1).lower()
             here = next((j for j in list(range(1, pkg.export_count + 1)) + list(range(-1, -pkg.import_count - 1, -1))
                          if (pkg.path(j) or '').lower() == want), None)

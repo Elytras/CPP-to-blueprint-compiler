@@ -265,7 +265,8 @@ enum, an object, class, soft or interface reference, a struct, or a `TArray`, `T
 the mod is built, so it must be a literal, a constant expression, an enum constant, a braced struct or list, or
 `&Asset`. Anything else is refused with `<Member>: a default is a value known when the mod is built - ...`; set such a
 value in `ReceiveBeginPlay`. A class as the default of a `TSubclassOf` member is not built yet and is refused the same
-way. A `const` member is read-only, and a `static constexpr` or `static inline const` member is a constant with no
+way. A `const` member is read-only. A `UE_READONLY` member is read-only too, but a subclass's `UE_DEFAULTS` can
+still set it, and a write from code compiles with a warning. A `static constexpr` or `static inline const` member is a constant with no
 variable behind it. To change the default of a property that a parent class declares, assign it in `UE_DEFAULTS`,
 which is what editing Class Defaults does.
 
@@ -326,8 +327,10 @@ that does not declare Method, `Base::Method()` copies Base's body in, or, where 
 an override of Method that AssetGen adds to your class, which only calls the parent's; a multicast goes by name with a
 warning.
 Every other call to a method goes by name, so the most derived override runs, also when the parent's own code makes
-the call. A `final` class or method has no override, so its calls go straight to the one function, and on `this` its
-body is copied in.
+the call. A `final` class or method has no override, so its calls reach the one function, and on `this` its
+body is copied in. A call that stays a call is bound only to a function the final class declares new; one it
+overrides or inherits is called by name, as the editor calls a function that is not Final, which with no subclass
+reaches the same body.
 
 `UE_PURE` makes a pure function, drawn without exec pins. A `T&` parameter is an output, a pass-by-reference pin. A
 `static` method runs on the class default object (the instance that holds Class Defaults), which has no world, so give
@@ -442,7 +445,10 @@ run. The first scene component is the root, and every later scene component atta
 write `Tip->SetupAttachment(Glow);` in `UE_DEFAULTS`, as a C++ constructor does: under another of the class's
 components, at a socket with `SetupAttachment(Glow, FName("Muzzle"))`, or under a component the class inherits, from
 a mod or game Blueprint parent or a native one (`SetupAttachment(Mesh)` in an `ACharacter` or `APlayerCharacter`
-child). A component that is not a scene component, such as a movement component, attaches to nothing.
+child), or under the actor's root, whichever that is (`SetupAttachment(RootComponent)`). A component that is not a
+scene component, such as a movement component, attaches to nothing. `SetupAttachment` in a function attaches at once,
+keeping the relative transform, with a warning: the engine's own does nothing once the actor is constructed, so write
+`AttachToComponent` there.
 
 Set a component's defaults in `UE_DEFAULTS`, one `Comp->Field = value;` each, as you would in its Details panel.
 Assign a struct whole (`FVector(...)`, `FColor(R, G, B)`), and an asset with `&Asset`
@@ -496,9 +502,15 @@ Watch for:
   `USceneComponent` root hands them on to the components attached to it. (A class whose parent already has a root,
   such as a Blueprint parent or `ACharacter`, adds no root: its first scene component keeps its transform.) A mesh or a light as the root keeps them,
   and AssetGen warns that they are not applied. Declare a `USceneComponent` first.
-- `UE_DEFAULTS` is read when the mod is built and never runs. A call, an `if`, a `+=`, `nullptr`, or a member path
+- `UE_DEFAULTS` is read when the mod is built and never runs. A call, an `if`, a `+=`, or a member path
   such as `Lamp->RelativeLocation.Z = 50.0f;` is refused; the member path gets a misleading message about genueapi,
   the SDK generator ([The SDK](#the-sdk)). A variable the class declares itself takes an initializer instead.
+  `Target = nullptr;`, `Count = {};` and `Offset = FVector();` write the type's zero over the parent's value.
+  `Hit = FHitResult();` is refused: an FHitResult's values come from the engine's constructor (Time is 1), which
+  no header shows; give the members instead, `Hit = {.Time = 1.0f};`. The same goes for every engine struct but
+  `FVector`, `FVector2D`, `FRotator`, `FLinearColor`, `FColor` and the `FVector_NetQuantize` types (`FTransform()` is the identity, for one), and
+  for a member braces leave out, `Hit = {.Distance = 6.0f};`, unless the parent's `Hit` is a fresh one (declared with
+  no initializer). `FVector4()` is written, W 1.
 - `Weapons::Turret::StaticClass()`, for a mod class in a namespace, names the engine class that `Turret` inherits
   `StaticClass` from, with no message: the qualified form is not built yet. Inside the namespace, write
   `Turret::StaticClass()`. Where the value goes straight into a `TSubclassOf<Weapons::Turret>`, such as the class
@@ -589,8 +601,11 @@ once.
 
 `Add` and `Remove` also work on the game's dispatchers, on this actor, on another object or on a component:
 `OnDestroyed`, `Me->OnFlareThrown`, `Box->OnComponentBeginOverlap`. The handler returns `void` and takes exactly the
-parameters the header declares, spelled the same way, and clang checks this at the `Add`. A function that takes a
-single delegate, such as a timer, takes `{this, &Class::Method}`.
+parameters the header declares, spelled the same way, and clang checks this at the `Add`. It may be another object's:
+`OnScored.Add(Board, &Board::Show)` runs `Show` on Board at each broadcast. A function that takes a single delegate,
+such as a timer, takes `{this, &Class::Method}` or `{Other, &Other::Method}`. `Broadcast` works on a dispatcher of
+this class, of a mod parent, of another mod class or game Blueprint through a pointer (`T->OnHit.Broadcast(3)`), and
+on the few native ones the engine marks BlueprintCallable.
 
 A class with `UE_INTERFACE` is a Blueprint Interface, cooked as an asset of its own. A class implements it by listing
 it after its parent and defining its functions; a function it leaves out gets an empty one that returns zero. The
@@ -643,14 +658,15 @@ public:
 
 Watch for:
 
-- A handler is a method of `this` that is not `inline`. An inline one is refused with
+- A handler is a method that is not `inline`, of the object you bind it on. An inline one is refused with
   ``a delegate cannot bind Handle: an inline function is expanded where it is called, no UFunction (drop `inline`)``.
-  Binding a method of another object is not built yet and is refused with
-  ``TODO: a delegate can only bind a function of `this` ``; bind a method of `this` that forwards the call.
-- `Broadcast` works only on a `UE_DISPATCHER` of the class being compiled. Broadcasting one of the game's dispatchers,
-  or one that a mod parent declares, is not built yet. For a parent's, give the parent a method that broadcasts, and
-  call it. `Clear()` on a game dispatcher also removes the game's own bindings and those of other mods, so use
-  `Remove` there.
+  On another object it must be a function of that object's class that Blueprint code can call: a mod method, a game
+  Blueprint's function or a native BlueprintCallable one. An event the engine calls such as `ReceiveTick`, an RPC
+  such as `Server_StartUsing` and a RepNotify such as `OnRep_Instigator` are refused, on `this` too.
+- `Broadcast` on an engine dispatcher such as `OnDestroyed` is refused, as the editor refuses it: the engine marks
+  none of its dispatchers BlueprintCallable. On one of the game's 41 that are, it compiles with a warning, through a
+  signature function of your class with the same parameters. `Clear()` on a game dispatcher also removes the game's
+  own bindings and those of other mods, so use `Remove` there.
 - An interface function is matched by name only. An implementation marked `inline` compiles with no message and
   leaves the empty function in its place, and one with different parameters also compiles with no message, so copy
   the interface's declaration. Hold interfaces in `TScriptInterface`: `Cast<IScorable>` is refused for a mod
@@ -717,11 +733,13 @@ Full rules: [Replication](REFERENCE.md#replication), [RPCs](REFERENCE.md#rpcs). 
 
 ### Structs, enums and containers
 
-The game's structs are ordinary types. `FVector(1, 2, 3)` makes one value, as a Make node does. Braces, positional or
-with designated members, are the editor's Make Struct: `FHitResult Hit = { .Time = 0.5f };`. Members the braces leave
-out keep their defaults. Member reads and writes, nested to any depth, act on the struct in place. A struct of your own
-carries `UE_STRUCT;` in its body. It is cooked as a Structure asset in the mod package, and its members' initializers
-are its default values.
+The game's structs are ordinary types. `FVector(1, 2, 3)` makes one value, a literal when its members are constants or
+variables, and the editor's Make Struct when one computes something (`FVector2D(X, M ? 1.0f : 2.0f)`), each member then
+its own statement, left to right. Braces, positional or with designated members, are the editor's Make Struct:
+`FHitResult Hit = { .Time = 0.5f };`. Members the braces leave out keep their defaults; a member given `{}` is a fresh
+value of its type, as in C++: zero, empty, None. Member reads and writes, nested to any depth, act on the struct in
+place. A struct of your own carries `UE_STRUCT;` in its body. It is cooked as a Structure asset in the mod package, and
+its members' initializers are its default values.
 
 An enum of your own is an `enum class` with a `uint8`, `int32` or `int64` underlying type, followed by `UE_ENUM(Name);`.
 It is cooked as an Enumeration asset and then works like any Blueprint enum: variables, parameters, constants and
@@ -843,6 +861,9 @@ Watch for:
 - An asset is an object, not a C++ value. `CT_Hard.Waves` is refused ("CT_Hard is an asset, not a value: point at it
   with &CT_Hard"). Write `(&CT_Hard)->Waves`, or keep a pointer. The same holds for game assets, whose values are not
   available when the mod is built.
+- An asset starts as its class's defaults, and its braces are written over them. Braces for an engine struct member
+  such as `FHitResult` that leave a member out are refused, naming it, where the class's defaults give that member a
+  value of their own (`H = {.Hit = {.FaceIndex = 3}}`): give it in the asset's braces too.
 - Paths are not checked at build time, neither in `UE_ASSET_AT` nor in a soft default. A soft class of a Blueprint takes
   the class's full path, ending in `.BP_Name_C`. The short form `"/Game/Dir/Pkg"` means the object `Pkg.Pkg`, which for
   a Blueprint is the asset and not its class.
@@ -963,15 +984,15 @@ public:
 ```
 
 In `mods.yaml`, `needs` builds the owner first, and `embed` packs the owner's assets and registry rows into the user's
-pak, so that one pak works alone. Without `embed`, ship both paks. List the header in `sources`, so that an edit to it
-rebuilds every mod that uses it.
+pak, so that one pak works alone. Without `embed`, ship both paks. An edit to the shared header rebuilds every mod that
+includes it; bpbuild finds the includes itself.
 
 ```yaml
 mods:
   - name: Core
-    sources: [Core.cpp, Shared.h]    # the first source holds the UE_MOD_PACKAGE line
+    sources: [Core.cpp]
   - name: Arena
-    sources: [Arena.cpp, Shared.h]
+    sources: [Arena.cpp]
     needs: [Core]                    # build Core first
     embed: true                      # and pack Core's assets into Arena_P.pak too
 ```
@@ -1060,7 +1081,7 @@ building a mod.
 | Argument | Meaning |
 | --- | --- |
 | `<source.cpp>` | One translation unit. It must contain `UE_MOD_PACKAGE("/Game/...")`, which names the mod's own package folder. |
-| `<include-dir>` | The SDK's `UeApi` folder. It must hold `Conv.json`, `Ops.json`, `Types.json` and `Events.json`; otherwise the compile stops with `missing or invalid <dir>/<file> (run genueapi.py)`. |
+| `<include-dir>` | The SDK's `UeApi` folder. It must hold `Conv.json`, `Ops.json`, `Types.json`, `Events.json` and `NotCallable.json`; otherwise the compile stops with `missing or invalid <dir>/<file> (run genueapi.py)`. Its `Version.json` must name a genueapi this compiler can use; a folder an older one wrote, or one without the file, stops the compile before clang runs, with `<dir> was written by an older genueapi (...) - regenerate it with AssetGen/tools/genueapi.py`. A folder with none of the three (no UeApi at all, or a path that does not exist) stops it with `missing or invalid <dir>/Conv.json (run genueapi.py)`. |
 | `<out-dir>` | Where the mod's own packages go. The compiler creates it, and the folder of every package it writes, when missing. |
 | `--api <api-dir>` | Optional, after the out dir. Also writes an editor stub for each class, struct and enum into this folder (see [Editor API stubs](#editor-api-stubs)). It is an output folder for the editor, not the SDK folder. It must already exist: without it a class gets no stub and prints `<Class> -> no API asset: cannot write .uasset`, and a struct or enum fails the compile. |
 
@@ -1154,11 +1175,11 @@ With fewer than three arguments, bpbuild prints its usage line and stops.
 ```yaml
 mods:
   - name: MathLib                  # -> out/MathLib_P.pak
-    sources: [MathLib.cpp, MathLib.h]
+    sources: [MathLib.cpp]
     generate_api: true             # also write editor stubs
 
   - name: LibraryUser              # -> out/LibraryUser_P.pak
-    sources: [LibraryUser.cpp, MathLib.h]
+    sources: [LibraryUser.cpp]
     needs: [MathLib]               # build MathLib first
     embed: true                    # and pack MathLib's assets into LibraryUser_P.pak too
 ```
@@ -1175,7 +1196,7 @@ Keys of a mod:
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `name` | required | Names the build folder `build/<name>/` and the pak `out/<name>_P.pak`. Other mods refer to the mod by this name in `needs`. |
-| `sources` | required | Files relative to the mods dir. Each `.cpp` is compiled, in order, into the mod's package folder. Any other file only counts for staleness, so list the headers the `.cpp` files include. The **first** entry must hold the mod's `UE_MOD_PACKAGE` line: bpbuild finds it with a text search and stops the whole build with `<file> declares no UE_MOD_PACKAGE` otherwise, so list the `.cpp` first. With `embed`, the same check runs on the first source of each dependency. A mod with no sources, or with a source that does not exist, prints `SKIP - no such source` and counts as failed. |
+| `sources` | required | The mod's `.cpp` files, relative to the mods dir; globs work (`MyMod/*.cpp`, expanded in name order). The `.cpp` files compile into the mod's package folder as **one** translation unit: with more than one, bpbuild writes `build/<name>/<name>.unity.cpp`, which `#include`s each in order, and compiles that. So a mod can keep a header and a `.cpp` per class (`sources: [MyMod/*.cpp]`), `UE_MOD_PACKAGE` is written once in any one of them, and file-local names (`static` functions, anonymous namespaces) must not clash across the files. The headers they `#include "..."`, transitively, count for staleness on their own, except `UeApi/` and `UeAssets/` (the UeApi dir counts as a whole); a header listed here also only counts for staleness. One of the `.cpp` files must hold the mod's `UE_MOD_PACKAGE` line: bpbuild finds the first with a text search and stops the whole build with `<files> declares no UE_MOD_PACKAGE` otherwise. With `embed`, the same check runs on each dependency. A mod with no `.cpp`, or with a listed source that does not exist, prints `SKIP - no such source` and counts as failed. |
 | `needs` | none | Mods to build before this one. An unknown name stops the build with ``mods.yaml: `needs` names an unknown mod: <name>``. A cycle is not an error: bpbuild breaks it, and since every mod compiles before any mod packs, both sides still see each other's assets. |
 | `embed` | `false` | Also packs every mod reachable through `needs`, directly or not, into this mod's pak, and merges their registries into its registry. The pak then works on its own. |
 | `generate_api` | `false` | Also writes the editor stubs for this mod's classes, structs and enums (see [Editor API stubs](#editor-api-stubs)). |
@@ -1232,7 +1253,7 @@ The last line counts the mods built, packed, up to date and failed. The exit sta
 
 | bpbuild... | when |
 | --- | --- |
-| recompiles the mod | `--force` is given; the mod's package folder holds no staged asset yet; `generate_api` is set and a stub folder holds no `.uasset`/`.uexp`; or one of the `sources`, the files directly in the UeApi dir, or the `assetgen` binary is newer than the **oldest** staged asset. |
+| recompiles the mod | `--force` is given; the mod's package folder holds no staged asset yet; `generate_api` is set and a stub folder holds no `.uasset`/`.uexp`; or one of the `sources` or the local headers they include, the files directly in the UeApi dir, or the `assetgen` binary is newer than the **oldest** staged asset. |
 | repacks without recompiling | the newest staged asset of the mod, or of a dependency it embeds, is newer than the mod's pak (not with `--no-pak`). This picks up a dependency that changed, or a pak that an earlier `--no-pak` run skipped. |
 | prints `up to date` | neither applies. |
 
@@ -1337,6 +1358,8 @@ use a newer SDK or regenerate your own.
 | `Containers.h` | The Kismet `Array_*`, `Set_*` and `Map_*` functions, as methods of `TArray`, `TSet` and `TMap`. |
 | `Types.json` | Every enum and struct: package, engine name, size, alignment and fields, and whether an enum is an `enum class` (`form`), read off how the dump's properties of it are reflected. |
 | `Events.json` | The function flags of every `BlueprintEvent`, which an override inherits. |
+| `NotCallable.json` | Every other function the engine does not mark BlueprintCallable (most RPCs, RepNotifies, `ExecuteUbergraph_*`), which a delegate cannot bind. An RPC that is BlueprintCallable is not listed, and binds. |
+| `Version.json` | Which genueapi wrote the folder, and whether it had `--game`, written last. A compiler that needs a later one refuses the folder, saying to regenerate it, rather than compile against what the older one did not write. Without `--game` it refuses a class deriving from a game Blueprint, whose default subobjects the folder then does not list. |
 | `UeMeta.h` | The `UE_*` macros. Written by hand. |
 | `Types.h` | The integer spellings, `FString`, `FName`, `FText` and the container templates. Written by hand. |
 
@@ -1376,16 +1399,17 @@ static constexpr const char* Name_0__UeName = "Name";
 ```
 
 Parameter names keep the C++ spelling, which only an editor stub's pin names would show. The headers carry a few other
-markers of this kind, all written by the generator and read by the compiler. You never write them:
+markers of this kind, all written by the generator and read by the compiler. You never write them, and IntelliSense
+never lists them: each class keeps its markers in a private `struct UeMarkers` at its bottom.
 
 | Marker | What it records |
 | --- | --- |
 | `<Member>__UeName` | The engine's name for a member or function the dumper respelled. |
 | `<Member>__UeScsNode` | The construction-script node of a component that a game Blueprint adds, through which a child class overrides the component's defaults. |
-| `<Member>__UeSubobject` | The default subobject that a native component member points at, which a mod class overrides by that name. |
-| `UeDefaultSubobjects` | Every default subobject a game Blueprint's default object exports, which a child class is loaded after. |
+| `<Member>__UeSubobject` | The default subobject that a native component member points at, which a mod class overrides by that name. Where two of the class's subobjects fit the member's type and neither has its name, the one the game's Blueprints name on their default objects. |
+| `UeDefaultSubobjects` | Every default subobject a game Blueprint's default object exports, and every object nested in one (`Damage:BreakIceBonus_0`), which a child class is loaded after. |
 | `<Member>__Replicated` | That a property replicates, and its RepNotify function. |
-| `<Function>__UeForward` | What `GetOuter`, `GetClass` and `GetName` really call. |
+| `<Function>__UeForward` | What `GetOuter`, `GetClass`, `GetName`, `IsA`, `IsChildOf` and the methods of structs, text and soft pointers really call. |
 
 ### UeAssets/
 
@@ -1421,10 +1445,12 @@ and `Types.h` from the SDK repo, and optionally run `tools/genueassets.py`. What
   `no <path>: run genueapi on the SDK inside its Dumper-7 dump, not a copy of it`. The SDK folder and the object dump
   must come from the same dump.
 - **Give it the game's content with `--game <extracted Content dir>`.** The dump carries neither a class's flags,
-  ClassWithin and config name nor a native class's interfaces. genueapi reads the game's cooked Blueprints for them
-  (about 20 seconds): each game Blueprint's own tail, and the native interfaces a native class implements, as the
-  Blueprints that override one's function show. Without it, a mod deriving from a game Blueprint gets its nearest
-  native ancestor's tail, and an override of a native ancestor's interface function is taken for a new function.
+  ClassWithin and config name, nor the default subobjects a Blueprint's default object exports, nor a native class's
+  interfaces. genueapi reads the game's cooked Blueprints for them (about 20 seconds): each game Blueprint's own tail
+  and default subobjects, and the native interfaces a native class implements, as the Blueprints that override one's
+  function show. Without it, `Version.json` says so and the compiler refuses a class deriving from a game Blueprint,
+  which would otherwise load before its parent's subobjects; an override of a native ancestor's interface function is
+  taken for a new function.
 - **Your own mods are left out.** genueapi skips every class whose package a mod in the folder above `<UeApi dir>`
   cooks (any `.cpp` or `.h` directly in that folder with a `UE_MOD_PACKAGE`), and the shared nested-container structs.
   Keep `UeApi/` inside your mods folder, and a dump taken with your mods loaded does not declare them a second time.
@@ -1444,6 +1470,7 @@ genueapi prints one line per table it writes, then a summary of counts. These li
 | `NOT named back, ...: <n>, e.g. ...` | For these members, the object dump's name at the member's offset is not one that the dumper's renaming rules explain. genueapi writes no `__UeName` rather than a wrong one, and the member keeps the SDK's spelling; if the engine's name really differs, reads, writes and defaults of it miss in game without an error. | This almost always means the SDK folder and the object dump come from different dumps. Dump once and run genueapi on that dump. |
 | `SDK helpers left out, no UFunction behind them: <n> (...)` | Functions in the dump's headers that are the dumper's own C++ helpers, not engine functions. No Blueprint can call them. | Nothing. |
 | `out of reach: <kind> <n>, ...` | Class functions and properties held back because one of their types has no mapping yet, by kind: `enum`, `struct`, `container` or `other`. `UeApi.h` records the same numbers. | Nothing a mod can do. |
+| `no --game: no game Blueprint's default subobjects or tail, so the compiler refuses a class deriving from one` | genueapi ran without `--game`, and its `Version.json` says so. A mod with a native parent compiles against the folder; one deriving from a game Blueprint is refused. | Rerun with `--game <extracted Content dir>`. |
 | `blueprint classes dropped for want of a /Game path: <n> (...)` | The dump was taken without `FullAssetPaths=1`, so these Blueprint classes have no path to import them by. | Set `FullAssetPaths=1` in `Dumper-7.ini`, dump again with the fork, and rerun genueapi. |
 
 genueapi stops with exit status 1 when the object dump is missing, and on
@@ -1460,7 +1487,7 @@ editor can then call your mod's functions from their own Blueprints. At run time
 ```yaml
 mods:
   - name: MathLib
-    sources: [MathLib.cpp, MathLib.h]
+    sources: [MathLib.cpp]
     generate_api: true
     api_dir: D:/UeProjects/MyProject/Content    # optional; the default is out/api/Content in the mods dir
 ```
@@ -1792,7 +1819,9 @@ Each row gives the part of the message to look for, the reason, and what to writ
 | `latent call Delay: a function that resumes later returns nothing and takes no non-const reference parameters` | The code after a wait resumes in the event graph, which has no return value and no out parameters. | Return `void`, take parameters by value or `const&` and keep results in member variables | [Latent calls](REFERENCE.md#latent-calls) |
 | `static Calls lives in the ubergraph's frame, which only a function that makes a latent call runs in; make Calls a member` | A Blueprint function keeps nothing between calls (the ubergraph is the class's event graph). | A member variable | [Latent calls](REFERENCE.md#latent-calls) |
 | ``a delegate cannot bind Handle: an inline function is expanded where it is called, no UFunction (drop `inline`)`` | An inline method is pasted into its callers and is no function of the class. | Drop `inline` from the handler | [Event dispatchers](REFERENCE.md#event-dispatchers) |
-| ``TODO: a delegate can only bind a function of `this` `` | Not yet: the delegate binds the object whose code is running. | Bind a method of `this` that calls the other object: `void Forward(int32 P) { Other->Handle(P); }` | [Event dispatchers](REFERENCE.md#event-dispatchers) |
+| `a delegate on a Helper cannot bind Other::Handle: the engine looks it up by name on that object, whose class has no such function` | A binding is an object and a function name, and the object's class has no function of that name, so the broadcast would skip it. | Bind a function of the object's own class: `OnHit.Add(H, &Helper::Handle)` | [Event dispatchers](REFERENCE.md#event-dispatchers) |
+| `a delegate cannot bind AItem::Server_StartUsing on another object: the editor binds a BlueprintCallable function that is not pure or latent, and Server_StartUsing is not BlueprintCallable` | The editor's Create Event takes only a function Blueprint code can call; an event the engine calls, an RPC or a RepNotify is none. | Bind a method of your own class that calls it | [Event dispatchers](REFERENCE.md#event-dispatchers) |
+| `OnDestroyed.Broadcast: OnDestroyed is a native dispatcher (AActor::OnDestroyed) that is not BlueprintCallable, ...` | The editor's Call node refuses a native dispatcher the engine does not mark BlueprintCallable; only the engine broadcasts it. | Call what makes the event happen, such as `K2_DestroyActor()` | [Event dispatchers](REFERENCE.md#event-dispatchers) |
 | `a container operation needs a variable, not a computed value: Length` | A container node works on a variable, not on the result of a call. | `TArray<int32> L = GetItems(); return L.Num();` | [Containers](REFERENCE.md#containers) |
 | `TODO: unimplemented local Inc: (lambda at ...)` | Lambdas are not compiled, in any form. | An `inline` method or a free `inline` function | [Functions](REFERENCE.md#functions) |
 | `warning: ... reference parameter V is bound to a map element: ... V gets a copy, stored back after the call` | Blueprint has no reference to a map element. | Nothing, unless the callee reads the map while it runs: it sees the old value there | [Functions](REFERENCE.md#functions) |
@@ -1843,11 +1872,6 @@ each topic.
 
 **Refused with a message.** The compile stops, and the section linked says what to write instead.
 
-- Binding a method of another object, `OnHit.Add(Other, &AOther::Handle)` or `{ Other, &AOther::Handle }`. Bind a
-  method of `this` that calls the other object. See [Event dispatchers](REFERENCE.md#event-dispatchers).
-- Broadcast on a dispatcher that the class did not declare with `UE_DISPATCHER`, such as `OnDestroyed` or a parent
-  class's dispatcher. Add, Remove and Clear work on any dispatcher. Give the declaring class a method that broadcasts,
-  and call it. See [Event dispatchers](REFERENCE.md#event-dispatchers).
 - A class as a default: `TSubclassOf<AActor> Kind = AActor::StaticClass();`, or a class value in a data asset's
   braces. Set it in `ReceiveBeginPlay`, or use a `TSoftClassPtr` with a path. See
   [Classes and variables](REFERENCE.md#classes-and-variables).
@@ -1882,8 +1906,6 @@ each topic.
 - Two non-inline methods with the same name. A Blueprint class has one function per name: only the overload with the
   most parameters is cooked, and calls to the other are miscompiled. Rename one, or make the extra overloads `inline`.
   See [Functions](REFERENCE.md#functions).
-- A method declared and never defined. A call to it names a function the class does not have. See
-  [Functions](REFERENCE.md#functions).
 - FString methods such as `S.Len()`. Call `UKismetStringLibrary::Len(S)` and the other string library functions. See
   [Strings and text](REFERENCE.md#strings-and-text).
 - `Weapons::Turret::StaticClass()` for a mod class in a namespace. It names the engine class that Turret inherits
@@ -1933,9 +1955,9 @@ A few mistakes also compile without a message, because the construct itself work
   pointer in the game, or subclass the Blueprint and set its defaults in `UE_DEFAULTS`. See
   [Game assets](REFERENCE.md#game-assets).
 - The form of a game enum that no property uses. genueapi learns whether a game enum is an `enum class` from how the
-  dump's properties of it are reflected, and 249 of the SDK's 1445 enums have none; a variable of one is a Byte, which
-  differs from the editor's Enum variable only in type, and only if the enum is an `enum class`. See
-  [Enums](REFERENCE.md#enums).
+  dump's properties of it and the game's Blueprints are reflected, and 240 of the SDK's 1445 enums have none (the
+  enum's own form is not in the dump yet); a variable of one is a Byte, which differs from the editor's Enum variable
+  only in type, and only if the enum is an `enum class`. See [Enums](REFERENCE.md#enums).
 - Walking a `TSet` in place. A range-for over a `TSet` walks a copy, while a `TMap` walks its own slots. Only the cost
   differs. See [Loops](REFERENCE.md#loops).
 - Reusing a repeated pure call. It is evaluated each time it appears. To compute it once, keep the result in a local.
