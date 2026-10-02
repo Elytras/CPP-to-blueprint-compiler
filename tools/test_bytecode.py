@@ -7217,8 +7217,8 @@ def delegate_callable_rpc():
     154-161). 49 native functions are both; APlayerController::ClientClearCameraLensEffects binds on another object
     and AFSDPlayerController::Server_ResetHUD on this one. fix/r5-delegates (cab61cb6) refused both against a UeApi
     without NotCallable.json, saying they were not BlueprintCallable, as it took every UE_SERVER / UE_CLIENT /
-    UE_MULTICAST for one that is not."""
-    base = pending_asset('DelegateCallableRpc')
+    UE_MULTICAST for one that is not; NotCallable.json is compulsory now (UeApi version 3)."""
+    base = asset('DelegateCallableRpc')
     keeps_invariants(base)
     vm = VM(base, {})
     pc = Obj('PlayerController')
@@ -7241,28 +7241,13 @@ def delegate_not_callable_refusals():
             'OnRep_Instigator is not BlueprintCallable')
 
 
-def ueapi_lists_not_callable():
-    """Whether UeApi names the native functions that are not BlueprintCallable (genueapi's NotCallable.json): without
-    it the compiler tells only an RPC (UE_SERVER, UE_CLIENT, UE_MULTICAST) from a function the editor binds."""
-    return os.path.exists(os.path.join(UEAPI, 'NotCallable.json'))
-
-
-def ueapi_marks_dispatchers():
-    """Whether UeApi says which native dispatchers are BlueprintAssignable / BlueprintCallable (genueapi's
-    <D>__UeDispatcher): one from before that says nothing, and the compiler then takes Add on any native dispatcher and
-    Broadcast on none."""
-    with open(os.path.join(UEAPI, 'Engine.h'), encoding='utf-8-sig', errors='replace') as f:
-        return '__UeDispatcher' in f.read()
-
-
 def dispatch_native_callable():
     """A native dispatcher the engine marks BlueprintCallable (AFSDGameState::OnTerrainGenerated, one of FSD's 41) is
     one the editor's Call node takes. UeApi does not say which signature function it names (the dump does not link a
     delegate property to its signature), so the broadcast names one of the class's own with the same parameters - the
     layout execCallMulticastDelegate builds and the handlers read (ScriptCore.cpp 3032-3063) - and the compiler warns
-    that it does. The bound handler runs. The mod stays in tests/pending: it compiles only against a UeApi that marks
-    callable dispatchers."""
-    base = pending_asset('DispatchNativeCallable')
+    that it does. The bound handler runs. UeApi's <D>__UeDispatcher marks say which are callable (UeApi version 3)."""
+    base = asset('DispatchNativeCallable')
     keeps_invariants(base)
     assert any('warning' in l and 'OnTerrainGenerated' in l for l in LOGS['DispatchNativeCallable'].splitlines()), \
         LOGS['DispatchNativeCallable']
@@ -7311,27 +7296,14 @@ print('ok  DelegateInheritBind: a function of another object bound to an inherit
       'Blueprint\'s - is typed with the parent\'s signature, imported, and the broadcast reaches it')
 delegate_rpc_refusals()
 print('ok  delegate RPC refusals: a server RPC is not BlueprintCallable, so it is bound on no object')
-pending('DelegateCallableRpc: an RPC the engine marks BlueprintCallable binds on another object and on this one',
-        delegate_callable_rpc)
-if ueapi_lists_not_callable():
-    delegate_not_callable_refusals()
-    print('ok  delegate not-callable refusals: OnRep_Instigator, which UeApi\'s NotCallable.json names, is bound on no object')
-else:
-    pending('delegate not-callable refusals: OnRep_Instigator is not BlueprintCallable (needs a UeApi with NotCallable.json)',
-            delegate_not_callable_refusals)
-# Without UeApi's marks the compiler cannot tell a callable native dispatcher from another; it refuses Broadcast on every
-# one, saying so (refused below), and takes Add on any.
-refused('DispatchNativeUnmarked', '  void F() { OnDestroyed.Broadcast(this); }\n', 'OnDestroyed is a native dispatcher')
-if ueapi_marks_dispatchers():
-    dispatch_native_callable()
-    native_dispatcher_refusals()
-    print('ok  native dispatchers: Broadcast on a BlueprintCallable one names a signature of the class\'s own with its '
-          'parameters and reaches its handler; one the editor\'s nodes refuse is refused')
-else:
-    pending('DispatchNativeCallable: Broadcast on a BlueprintCallable native dispatcher (needs a UeApi with __UeDispatcher)',
-            dispatch_native_callable)
-    pending('native dispatcher refusals: Call on a non-BlueprintCallable and Add on a non-BlueprintAssignable one '
-            '(needs a UeApi with __UeDispatcher)', native_dispatcher_refusals)
+delegate_callable_rpc()
+print('ok  DelegateCallableRpc: an RPC the engine marks BlueprintCallable binds on another object and on this one')
+delegate_not_callable_refusals()
+print('ok  delegate not-callable refusals: OnRep_Instigator, which UeApi\'s NotCallable.json names, is bound on no object')
+dispatch_native_callable()
+native_dispatcher_refusals()
+print('ok  native dispatchers: Broadcast on a BlueprintCallable one names a signature of the class\'s own with its '
+      'parameters and reaches its handler; one the editor\'s nodes refuse is refused')
 # A bound name the object's class does not have: the broadcast or the timer skips it (ScriptDelegates.h 38-49,
 # 479-502). The editor binds only a BlueprintCallable function, never a pure or latent one (K2Node_CreateDelegate.cpp
 # 156-164 -> EdGraphSchema_K2.cpp 929-985): AActor::ReceiveTick is a BlueprintEvent only.

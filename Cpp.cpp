@@ -1691,9 +1691,8 @@ private:
     std::map<std::string, int32> EnumConstWidth;      // clang EnumConstantDecl id -> its enum's size, 1 / 4 / 8
     std::map<std::string, uint32> EventFlags;         // UeApi/Events.json: "Package.Class.Function" -> EFunctionFlags
     /* UeApi/NotCallable.json: "Package.Class.Function" of each function the engine does not mark BlueprintCallable and
-       that is no BlueprintEvent (Events.json has those); a UeApi without it does not say (bHaveNotCallable false). */
+       that is no BlueprintEvent (Events.json has those). Every UeApi this compiler takes has it (UeApiVersion 3). */
     std::set<std::string> NotCallable;
-    bool bHaveNotCallable = false;
     /* UeApi/OutArrays.json: "Package.Class.Function" -> bit I for each parameter I of a native that is an out TArray,
        emptied before the call (FCallIR::EmptiedArgs). A UeApi without the file empties nothing, as before. */
     std::map<std::string, uint64> OutArrayArgs;
@@ -3675,8 +3674,8 @@ bool FCompiler::LowerDelegateValue(const Json& Obj, const Json& Fn, const std::s
        EdGraphSchema_K2.cpp 929-933, 974-985): a BlueprintCallable function, not pure, not latent. A mod's method is what
        Generate makes it - BlueprintCallable, unless it overrides an event that is not - and one only declared is no
        function at all. A native or game Blueprint's event says so in Events.json; any other function UeApi lists is
-       BlueprintCallable unless NotCallable.json names it (OnRep_*, RPCs, ExecuteUbergraph_*). A UeApi from before
-       genueapi wrote that table says it only of an RPC, through UE_SERVER / UE_CLIENT / UE_MULTICAST. */
+       BlueprintCallable unless NotCallable.json names it (OnRep_*, most RPCs, ExecuteUbergraph_*). The net flags say
+       nothing here: 49 RPCs are BlueprintCallable (ClientClearCameraLensEffects), and the editor binds them. */
     if (R)
     {
         std::string Why;
@@ -3691,11 +3690,8 @@ bool FCompiler::LowerDelegateValue(const Json& Obj, const Json& Fn, const std::s
         }
         else if (auto E = EventFlags.find(Key); E != EventFlags.end())
             Flags = E->second;
-        else if (bHaveNotCallable)
-            Flags = NotCallable.count(Key) ? 0u : uint32(FUNC_BlueprintCallable);
         else
-            Flags = M != R->Methods.end() && (NetFlagsOf(*M->second) & (FUNC_NetServer | FUNC_NetClient | FUNC_NetMulticast))
-                  ? 0u : uint32(FUNC_BlueprintCallable);
+            Flags = NotCallable.count(Key) ? 0u : uint32(FUNC_BlueprintCallable);
         if (M != R->Methods.end() && IsPureDecl(*M->second)) Flags |= FUNC_BlueprintPure;
         if (!(Flags & FUNC_BlueprintCallable)) Why = FnName + " is not BlueprintCallable";
         else if (Flags & FUNC_BlueprintPure) Why = FnName + " is pure";
@@ -3776,7 +3772,8 @@ bool FCompiler::LowerDispatcherCall(const Json& Call, const Json& Callee, const 
     if (C.Args[0].K != FArgIR::Field) { *Err = "a dispatcher must be a property: " + Method; return false; }
 
     /* Whose dispatcher it is, and what the editor's nodes allow on it. A Blueprint's every dispatcher is both (the game's
-       1404 all are); a native one says through UeApi, and a UeApi from before genueapi wrote that says nothing. */
+       1404 all are); a native one says through UeApi's <D>__UeDispatcher, which every UeApi this compiler takes writes
+       (UeApiVersion 3). */
     const std::string Disp = Name(Obj);
     const FRecord* Owner = DispatcherOwner(Obj);
     const bool bNative = Owner && Owner->IsNative() && Owner->UePackage.compare(0, 6, "/Game/") != 0;
@@ -16467,16 +16464,11 @@ bool FCompiler::LoadTables(const std::string& IncludeDir, std::string* Err)
         if (Out->is_discarded()) { *Err = std::string("missing or invalid ") + IncludeDir + "/" + File + " (run genueapi.py)"; return false; }
         return true;
     };
-    Json ConvDoc, OpsDoc, TypesDoc, EventsDoc;
+    Json ConvDoc, OpsDoc, TypesDoc, EventsDoc, NotCallableDoc;
     if (!Load("Conv.json", &ConvDoc) || !Load("Ops.json", &OpsDoc) || !Load("Types.json", &TypesDoc)
-        || !Load("Events.json", &EventsDoc)) return false;
+        || !Load("Events.json", &EventsDoc) || !Load("NotCallable.json", &NotCallableDoc)) return false;
     for (auto It = EventsDoc.begin(); It != EventsDoc.end(); ++It) EventFlags[It.key()] = It->get<uint32>();
-    const Json NotCallableDoc = Json::parse(ReadText(IncludeDir + "/NotCallable.json"), nullptr, false);
-    if (NotCallableDoc.is_array())
-    {
-        bHaveNotCallable = true;
-        for (const Json& Key : NotCallableDoc) NotCallable.insert(Key.get<std::string>());
-    }
+    for (const Json& Key : NotCallableDoc) NotCallable.insert(Key.get<std::string>());
     const Json OutArraysDoc = Json::parse(ReadText(IncludeDir + "/OutArrays.json"), nullptr, false);
     if (OutArraysDoc.is_object())
         for (auto It = OutArraysDoc.begin(); It != OutArraysDoc.end(); ++It)
@@ -16521,8 +16513,9 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     /* First we check what wrote the UeApi: one older than this compiler compiles without a word wrong (one made before
        UeDefaultSubobjects orders a game Blueprint's child after none of its parent's subobjects), and the merge of a
        genueapi change carries the tracked Types.json but not the ignored headers. genueapi writes Version.json last, so
-       a run that stopped halfway has none either. Bump with genueapi.py's GENUEAPI_VERSION (2: "game"). */
-    constexpr int32 UeApiVersion = 2;
+       a run that stopped halfway has none either. Bump with genueapi.py's GENUEAPI_VERSION (2: "game"; 3: the native
+       dispatchers' marks, NotCallable.json, TEnum spellings). */
+    constexpr int32 UeApiVersion = 3;
     const Json Stamp = Json::parse(ReadText(IncludeDir + "/Version.json"), nullptr, false);
     const int32 Stamped = Stamp.is_object() && Stamp.contains("genueapi") && Stamp["genueapi"].is_number_integer()
                               ? Stamp["genueapi"].get<int32>() : 0;

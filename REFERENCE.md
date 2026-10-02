@@ -3735,7 +3735,8 @@ Notes:
 | `OnHit.Add(H, &Helper::HandleHit);` | Binds HandleHit on the object H points to: the editor's Create Event with its Object pin wired. The binding is made where the Add runs, with H as it is then. HandleHit must be a function of H's class or of an ancestor of it: a mod class's method, a game Blueprint's function, or a native BlueprintCallable one (`OnRate.Add(Pawn, &AActor::SetActorTickInterval)`). Remove takes the same pair off. | Yes |
 | `OnHit.Add(H, &Other::HandleHit);` where H's class has no HandleHit | Refused: "a delegate on a Helper cannot bind Other::HandleHit: the engine looks it up by name on that object, whose class has no such function". The broadcast would skip it. | Refused |
 | `OnTick.Add(A, &AActor::ReceiveTick);` | Refused: "a delegate cannot bind AActor::ReceiveTick on another object: the editor binds a BlueprintCallable function that is not pure or latent, and ReceiveTick is not BlueprintCallable". An event the engine calls is not one Blueprint code can bind, on another object or on `this` ("on this object"), nor a pure or latent function. A mod method that overrides such an event is refused the same. | Refused |
-| `OnUse.Add(Item, &AItem::Server_StartUsing);`, `OnPing.Add(this, &AActor::OnRep_Instigator);` | Refused the same way: "... and Server_StartUsing is not BlueprintCallable". A native function the engine does not mark BlueprintCallable, such as an RPC or a RepNotify, is not one the editor binds. UeApi's `NotCallable.json` names them. A UeApi from before genueapi wrote that file tells only an RPC apart (`UE_SERVER`, `UE_CLIENT`, `UE_MULTICAST`), and then `OnRep_Instigator` is bound; regenerate it with genueapi. | Refused |
+| `OnUse.Add(Item, &AItem::Server_StartUsing);`, `OnPing.Add(this, &AActor::OnRep_Instigator);` | Refused the same way: "... and Server_StartUsing is not BlueprintCallable". A native function the engine does not mark BlueprintCallable, such as an RPC or a RepNotify, is not one the editor binds. UeApi's `NotCallable.json` names them. | Refused |
+| `OnPing.Add(PC, &APlayerController::ClientClearCameraLensEffects);` | Binds it: an RPC the engine marks BlueprintCallable (49 are, `Server_ResetHUD` among them) is one the editor binds, on another object or on `this`. Being an RPC says nothing either way. | Yes |
 | `OnHit.Add(H, &Helper::Half);` where Helper declares Half and never defines it | Refused: "a delegate cannot bind Helper::Half, which Helper declares and never defines". No function of that name exists. | Refused |
 
 ```cpp
@@ -6125,7 +6126,8 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   of the game's are. Fix: none; call what the engine calls to make the event happen (`K2_DestroyActor()`).
 - `<Dispatcher>.Broadcast: <Dispatcher> is a native dispatcher (<Class>::<Dispatcher>) and the editor's Call node takes
   one only when it is BlueprintCallable, which this UeApi does not say (regenerate it with genueapi)`: the UeApi
-  headers predate genueapi's `<Dispatcher>__UeDispatcher` marks. Fix: regenerate them.
+  headers have no `<Dispatcher>__UeDispatcher` mark for it, which genueapi writes for every native dispatcher (since
+  UeApi version 3; an older folder is refused before this), so the header was edited by hand. Fix: regenerate them.
 - `<Dispatcher>.<Add|Remove|Clear>: <Dispatcher> is a native dispatcher that is not BlueprintAssignable
   (<Class>::<Dispatcher>), and the editor's dispatcher nodes refuse one ("Event Dispatcher is not 'BlueprintAssignable'"):
   only the engine's own code binds it`: 17 of the game's dispatchers are not BlueprintAssignable. Fix: none from

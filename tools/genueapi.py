@@ -45,7 +45,8 @@ CONTAINER = re.compile(r"^(?:const\s+)?(TArray|TSet|TMap)<(.*)>\s*&?$")
 # would be the same silent case: the compiler refuses a class deriving from a game Blueprint against it.
 # 1: UeDefaultSubobjects with the nested ones, __UeSubobject markers joined through the game's Blueprints.
 # 2: "game".
-GENUEAPI_VERSION = 2
+# 3: <D>__UeDispatcher on each native dispatcher, NotCallable.json, and main's TEnum spellings of native enum fields.
+GENUEAPI_VERSION = 3
 
 
 def class_refs(t):

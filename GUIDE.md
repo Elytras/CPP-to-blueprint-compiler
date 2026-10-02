@@ -1080,7 +1080,7 @@ building a mod.
 | Argument | Meaning |
 | --- | --- |
 | `<source.cpp>` | One translation unit. It must contain `UE_MOD_PACKAGE("/Game/...")`, which names the mod's own package folder. |
-| `<include-dir>` | The SDK's `UeApi` folder. It must hold `Conv.json`, `Ops.json`, `Types.json` and `Events.json`; otherwise the compile stops with `missing or invalid <dir>/<file> (run genueapi.py)`. Its `Version.json` must name a genueapi this compiler can use; a folder an older one wrote, or one without the file, stops the compile before clang runs, with `<dir> was written by an older genueapi (...) - regenerate it with AssetGen/tools/genueapi.py`. A folder with none of the three (no UeApi at all, or a path that does not exist) stops it with `missing or invalid <dir>/Conv.json (run genueapi.py)`. |
+| `<include-dir>` | The SDK's `UeApi` folder. It must hold `Conv.json`, `Ops.json`, `Types.json`, `Events.json` and `NotCallable.json`; otherwise the compile stops with `missing or invalid <dir>/<file> (run genueapi.py)`. Its `Version.json` must name a genueapi this compiler can use; a folder an older one wrote, or one without the file, stops the compile before clang runs, with `<dir> was written by an older genueapi (...) - regenerate it with AssetGen/tools/genueapi.py`. A folder with none of the three (no UeApi at all, or a path that does not exist) stops it with `missing or invalid <dir>/Conv.json (run genueapi.py)`. |
 | `<out-dir>` | Where the mod's own packages go. The compiler creates it, and the folder of every package it writes, when missing. |
 | `--api <api-dir>` | Optional, after the out dir. Also writes an editor stub for each class, struct and enum into this folder (see [Editor API stubs](#editor-api-stubs)). It is an output folder for the editor, not the SDK folder. It must already exist: without it a class gets no stub and prints `<Class> -> no API asset: cannot write .uasset`, and a struct or enum fails the compile. |
 
@@ -1357,7 +1357,7 @@ use a newer SDK or regenerate your own.
 | `Containers.h` | The Kismet `Array_*`, `Set_*` and `Map_*` functions, as methods of `TArray`, `TSet` and `TMap`. |
 | `Types.json` | Every enum and struct: package, engine name, size, alignment and fields, and whether an enum is an `enum class` (`form`), read off how the dump's properties of it are reflected. |
 | `Events.json` | The function flags of every `BlueprintEvent`, which an override inherits. |
-| `NotCallable.json` | Every other function the engine does not mark BlueprintCallable (RPCs, RepNotifies, `ExecuteUbergraph_*`), which a delegate cannot bind. Without it only an RPC is told apart. |
+| `NotCallable.json` | Every other function the engine does not mark BlueprintCallable (most RPCs, RepNotifies, `ExecuteUbergraph_*`), which a delegate cannot bind. An RPC that is BlueprintCallable is not listed, and binds. |
 | `Version.json` | Which genueapi wrote the folder, and whether it had `--game`, written last. A compiler that needs a later one refuses the folder, saying to regenerate it, rather than compile against what the older one did not write. Without `--game` it refuses a class deriving from a game Blueprint, whose default subobjects the folder then does not list. |
 | `UeMeta.h` | The `UE_*` macros. Written by hand. |
 | `Types.h` | The integer spellings, `FString`, `FName`, `FText` and the container templates. Written by hand. |
