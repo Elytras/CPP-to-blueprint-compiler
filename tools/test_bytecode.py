@@ -5389,6 +5389,19 @@ func_declared_only()
 print('ok  FuncDeclaredOnly: a static and a method over an ancestor\'s declared-only ones have no super, and no warning')
 
 
+def func_declared_sig():
+    """FdsRoot declares Scale(int32) and never defines it, so no caller reaches a Scale of its: FuncDeclaredSig's
+    Scale(float) replaces nothing, and its signature is its own, as a static's is (FuncDeclaredOnly)."""
+    base = pending_asset('FuncDeclaredSig')
+    keeps_invariants(base)
+    for v in (1, 4):
+        got = run(base, 'Use', {}, V=v)[0]
+        assert got == v * 3.0, 'FuncDeclaredSig.Use(%d) = %r, want %r' % (v, got, v * 3.0)
+
+
+pending('FuncDeclaredSig: a method of another signature over a declared-only one is its own', func_declared_sig)
+
+
 def func_iface_unnamed():
     """FuncIfaceUnnamed gets an override of FiuRoot's Tell (for IFiuTell) and of Kept (for its `FiuRoot::Kept` call),
     each calling FiuRoot's though a parameter of it has no name: the override names it, as an editor override does.
@@ -7936,6 +7949,54 @@ def defaults_left_out():
 
 defaults_left_out()
 print('ok  DefaultsLeftOut: a member left out of UE_DEFAULTS\' braces is named as left out when refused')
+
+
+def defaults_braces_nested():
+    """Braces given in UE_DEFAULTS for a UE_STRUCT's member with an initializer of its own (FDbnHeld::Hit's Time 0.5)
+    replace that value: a member they leave out holds what the engine's constructor sets (Time 1), and the parent's
+    value under it is the initializer's, though the parent's H as a whole is fresh. It cannot be written: refused."""
+    refused('BracesNestInit', '  UE_DEFAULTS {\n    H = {.Hit = {.Distance = 5.0f}};\n  }\n',
+            "H.Hit.FaceIndex, left out of the braces, holds what the engine's FHitResult constructor sets",
+            'struct FDbnHeld {\n  UE_STRUCT;\n  FHitResult Hit = {.Time = 0.5f};\n  int32 N = 0;\n};\n'
+            'class DbnParent : public AActor {\npublic:\n  FDbnHeld H;\n};\n', 'DbnParent')
+
+
+pending('DefaultsBracesNested: braces over a UE_STRUCT member\'s own initializer are not over a fresh value',
+        defaults_braces_nested)
+
+
+def defaults_braces_twice():
+    """Two UE_DEFAULTS statements on one member: the second is a whole new value, so a member its braces leave out holds
+    the engine's (Time 1), not the first statement's Time 3. The loader applies the CDO's tags in order, each struct
+    tag over the value before it; what they leave in Hit must be the second statement's braces alone."""
+    import struct
+    base = pending_asset('DefaultsBracesTwice')
+    keeps_invariants(base)
+    pkg = invariants.Package(base)
+    cdo = pkg.find('Default__DefaultsBracesTwice_C')
+    loaded = {}
+    for t in pkg.tags(cdo):
+        if t['name'] == 'Hit':
+            loaded.update((m['name'].split('_')[0], struct.unpack('<f', m['value'])[0]) for m in pkg.tags(cdo, t['at']))
+    assert loaded == {'Distance': 6.0}, 'Hit loads %r over the parent\'s fresh value, where C++ gives Distance 6 alone' % loaded
+
+
+pending('DefaultsBracesTwice: a second UE_DEFAULTS statement on a member replaces the first', defaults_braces_twice)
+
+
+def defaults_braces_other_mod():
+    """Another mod's UE_STRUCT_IN struct is no engine struct: a member its braces leave out has the initializer the
+    shared header gives it (B = 4), written as in C++."""
+    import struct
+    base = pending_asset('DefaultsBracesOther')
+    pkg = invariants.Package(base)
+    cdo = pkg.find('Default__DefaultsBracesOther_C')
+    tags = {t['name']: t for t in pkg.tags(cdo)}
+    got = {m['name'].split('_')[0]: struct.unpack('<i', m['value'])[0] for m in pkg.tags(cdo, tags['O']['at'])} if 'O' in tags else None
+    assert got == {'A': 7, 'B': 4}, 'O is written %r, where `O = {.A = 7}` is A 7 and B its initializer 4' % (got,)
+
+
+pending('DefaultsBracesOther: another mod\'s struct is no engine struct to braces', defaults_braces_other_mod)
 
 
 def tenum_value_init():
