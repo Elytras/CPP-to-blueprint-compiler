@@ -3161,14 +3161,18 @@ bool FCompiler::ZeroArg(const std::string& Type, FBlueprintClass& BP, FArgIR& Ou
     const std::vector<size_t> Order = StructConstOrder(SI->second);
     std::vector<FArgIR> Zeros(SI->second.Fields.size());
     bool bByMembers = CurLocals && Order.size() < Zeros.size();
-    for (size_t I = 0; I < Zeros.size(); ++I)
+    /* The struct, then the literal's members in its order: the imports come in the order a literal always made them. */
+    const FIndex Owner = BP.ScriptStruct(SI->second.Package, SI->second.UeName);
+    std::vector<size_t> Each = Order;
+    for (size_t I = 0; I < Zeros.size(); ++I) if (std::find(Order.begin(), Order.end(), I) == Order.end()) Each.push_back(I);
+    for (size_t I : Each)
     {
         if (!ZeroArg(SI->second.Fields[I].first, BP, Zeros[I], Err)) return false;
         bByMembers = bByMembers || Zeros[I].K == FArgIR::Call;
     }
     if (bByMembers) return LowerStructByMembers(T, SI->second, Zeros, BP, Out, Err);
     Out.K = FArgIR::StructLit;
-    Out.Owner = BP.ScriptStruct(SI->second.Package, SI->second.UeName);
+    Out.Owner = Owner;
     Out.I = SI->second.Size;
     Out.InnerType = T;
     Out.Sub = std::make_shared<FCallIR>();
