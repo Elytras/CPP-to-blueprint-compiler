@@ -84,6 +84,10 @@ const Json* Nth(const Json& N, size_t I)
 std::string StripTypeKeywords(std::string T);
 bool IsTEnumType(std::string T);
 const Json* PeelLvalue(const Json* N);
+bool IsFixedOperand(const Json& N);
+/* `(L[Idx()] = 3) += 1`: AssignedPlace writes an assignment's left side only when it is a plain variable. */
+const char* const kAssignedAssignNoVar = "an assignment assigned to or updated, whose left side is no plain variable, "
+    "which would be evaluated again to write it: assign in a statement of its own, then update what it assigned";
 Json RefToLocal(const std::string& Name, const std::string& Type);
 
 std::string TypeOf(const Json& N)
@@ -1307,6 +1311,7 @@ private:
     void NoteBehind(const Json& Root, std::vector<const Json*>& Added);
     int32 LowerBoundArgs(const Json& Call, FBlueprintClass& BP, FCallIR& Out, std::string* Err);
     bool LowerCommaValue(const Json& N, bool bRead, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
+    bool AssignedPlace(const Json& Place, Json& Pre, Json& Out) const;
     const Json* ReadComma = nullptr;    // LowerArg: the comma or `=` under the LValueToRValue it is lowering, read there
     const Json* CalledDecl(const Json& Call) const;
 
@@ -4764,10 +4769,9 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
                 return true;
             }
         }
-        if (OpName == "operator=")
-        { *Err = "an assignment used as a value in a loop condition, or after something its statement runs first (the "
-                 "right side of && / || / ?:, an argument of a call on another object, a later member of a braced list): "
-                 "assign in a statement of its own, then use what it assigned"; return false; }
+        /* A struct's or an FString's `=` used as a value where HoistComma left it, as a number's (BinaryOperator below). */
+        if (OpName == "operator=" && Lhs && Rhs)
+            return LowerCommaValue(*N, ReadComma == N || N->value("valueCategory", std::string()) != "lvalue", BP, Out, Err);
         if (OpName != "operator+" || !Lhs || !Rhs || StrKindOf(TypeOf(*N)) != SK_Str)
         { *Err = "TODO: unimplemented operator overload " + OpName + " yielding " + TypeOf(*N); return false; }
 
@@ -5655,6 +5659,24 @@ bool FCompiler::DesugarUpdate(const Json& S, Json& Wrap, std::string* Result, st
     const bool bStep = K == "UnaryOperator";
     const Json* Orig = Nth(S, 0);
     if (!Orig || (!bStep && !Nth(S, 1))) { *Err = "`" + Op + "` with no destination"; return false; }
+
+    /* `(Bump(), N) += Y`, `++(Bump(), N)`, `(N = M) += Y`: the update writes N (AssignedPlace). Y first, as C++17
+       sequences it before the left side ([expr.ass]/1), then the comma's left side or the assignment, then the update of
+       N. HoistComma takes apart one whose left side can run as a statement before the one holding it; this is the
+       rest, a loop condition's or one behind Y. */
+    if (Json Lefts = Json::array(), Place; AssignedPlace(*Orig, Lefts, Place))
+    {
+        Json Pre = Json::array(), Again = S, Rest;
+        if (!bStep && !IsFixedOperand(*Nth(S, 1))) Again["inner"][1] = HoistExpr(*Nth(S, 1), Pre, true);
+        for (Json& L : Lefts) Pre.push_back(std::move(L));
+        Again["inner"][0] = Place;
+        if (!DesugarUpdate(Again, Rest, Result, Err)) return false;
+        for (Json& St : Rest["inner"]) Pre.push_back(std::move(St));
+        Wrap = { {"kind", "CompoundStmt"}, {"inner", std::move(Pre)} };
+        return true;
+    }
+    if (const Json* Bare = PeelLvalue(Orig); Bare && Kind(*Bare) == "BinaryOperator" && Bare->value("opcode", std::string()) == "=")
+    { *Err = kAssignedAssignNoVar; return false; }
 
     /* X is located once. C++17 sequences Y before X in `X op= Y`, so a Y that must not move past what locates X
        (its side effects, or an index Y changes) goes first. */
@@ -7817,6 +7839,27 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             }
             if (!Lhs || !Rhs) { *Err = "assignment with a missing side"; bOk = false; return; }
 
+            /* `(Bump(), N) = G();`, `(N = M) = G();`: the store goes to N (AssignedPlace). G() first, as C++17
+               sequences an assignment's right side before its left ([expr.ass]/1), then the comma's left side or the
+               inner assignment, then the store. A class's operator= reads an lvalue right side through its reference
+               when it runs, after both, so that stays where it is. HoistComma takes apart one whose left side can run
+               as a statement first; this is one behind its right side, or the assignment a loop condition's `=` runs
+               (LowerCommaValue). */
+            const size_t At = K == "BinaryOperator" ? 0 : 1;
+            if (Json Lefts = Json::array(), Place; AssignedPlace((*S)["inner"][At], Lefts, Place))
+            {
+                Json Pre = Json::array(), Again = *S;
+                Json& Value = Again["inner"][At + 1];
+                if (!IsFixedOperand(Value) && (K == "BinaryOperator" || Value.value("valueCategory", std::string()) != "lvalue"))
+                    Value = HoistExpr(Value, Pre, true);
+                for (Json& L : Lefts) Pre.push_back(std::move(L));
+                Again["inner"][At] = Place;
+                Pre.push_back(std::move(Again));
+                const Json Wrap = { { "kind", "CompoundStmt" }, { "inner", std::move(Pre) } };
+                bOk = LowerBody(Wrap, BP, Out, Locals, Err);
+                return;
+            }
+
             /* A reference local is the variable it names, or the memory at the address it keeps. */
             while (Kind(*Lhs) == "DeclRefExpr")
             {
@@ -7940,6 +7983,13 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 St.bAssignLocal = St.Var.Base->K == FArgIR::Local;
                 St.bAssignOutParm = St.Var.Base->K == FArgIR::LocalOut;
                 bOk = LowerArg(*Rhs, BP, St.Value, Err);
+            }
+            else if (LK == "BinaryOperator" && Lhs->value("opcode", std::string()) == "=")
+            {
+                /* `(L[Idx()] = 3) = 4`: AssignedPlace takes only a plain variable, which names the same place again. */
+                *Err = kAssignedAssignNoVar;
+                bOk = false;
+                return;
             }
             else
             {
@@ -10193,18 +10243,20 @@ int32 FCompiler::LowerBoundArgs(const Json& Call, FBlueprintClass& BP, FCallIR& 
 }
 
 /*
-A comma, or a plain `=` used as a value (the comma `(A = E, A)`), that HoistComma left where it stands: in a loop
-condition, on the right of && / || or in an arm of ?:, in an argument of a call on another object. An inline body runs
-where its value is needed - every trip of a loop, in the branch that needs it, after a call's object is pinned - so
-the comma is one: its left side as a statement, then a copy of its right side, read right after it, as C++ reads it
-(bRead: an LValueToRValue or a copy over it, or a prvalue comma). Refused where that is not C++'s order or not its
-value: behind an operand its statement evaluates first (Behind), where the body would run ahead of that operand; and
-where its place is used rather than its value (bound to an operator's or a constructor's reference, a member taken of
-it, written), which a copy is not. A call's reference parameter takes the place through LowerBoundArgs.
+A comma, or a `=` used as a value (the comma `(A = E, A)`; a number's, or a struct's or an FString's operator=), that
+HoistComma left where it stands: in a loop condition, on the right of && / || or in an arm of ?:, in an argument of
+a call on another object. An inline body runs where its value is needed - every trip of a loop, in the branch that
+needs it, after a call's object is pinned - so the comma is one: its left side as a statement, then a copy of its right
+side, read right after it, as C++ reads it (bRead: an LValueToRValue or a copy over it, or a prvalue comma). Refused
+where that is not C++'s order or not its value: behind an operand its statement evaluates first (Behind), where the
+body would run ahead of that operand; and where its place is used rather than its value (bound to an operator's or a
+constructor's reference, a member taken of it), which a copy is not. A call's reference parameter takes the place
+through LowerBoundArgs; one assigned to or updated is AssignedPlace's.
 */
 bool FCompiler::LowerCommaValue(const Json& N, bool bRead, FBlueprintClass& BP, FArgIR& Out, std::string* Err)
 {
-    const bool bAssign = N.value("opcode", std::string()) == "=";
+    const bool bOperator = Kind(N) == "CXXOperatorCallExpr";      // a struct's or an FString's operator=
+    const bool bAssign = bOperator || N.value("opcode", std::string()) == "=";
     const std::string What = bAssign ? "an assignment used as a value" : "the comma operator";
     const std::string Fix = bAssign ? "assign in a statement of its own, then use what it assigned"
                                     : "write its left side as a statement of its own";
@@ -10212,22 +10264,27 @@ bool FCompiler::LowerCommaValue(const Json& N, bool bRead, FBlueprintClass& BP, 
     { *Err = What + " after something its statement runs first (a later member of a braced list, an assignment's left "
              "side, the right side of `<<` / `>>`), which its left side would run before: " + Fix; return false; }
     if (!bRead)
-    { *Err = What + " used as a place, not a value (bound to an operator's or a constructor's reference, a member taken "
-             "of it, assigned to), where no statement before this one can hold its left side (a loop condition, the "
+    { *Err = std::string(bAssign ? "an assignment" : "the comma operator") + " used as a place, not a value (bound to an operator's or a constructor's reference, a member taken "
+             "of it), where no statement before this one can hold its left side (a loop condition, the "
              "right side of && / || / ?:, a call on another object): " + Fix; return false; }
     if (!CurLocals) { *Err = "internal: " + What + " outside a function body"; return false; }
-    const Json* Left = Nth(N, 0);
-    const Json* Right = Nth(N, 1);
+    const Json* Left = Nth(N, bOperator ? 1 : 0);
+    const Json* Right = Nth(N, bOperator ? 2 : 1);
     if (!Left || !Right) { *Err = What + " with a missing side"; return false; }
     Json Pre = Json::array();
     const Json* Value = Right;
+    Json Place;
     if (bAssign)
     {
-        if (!IsEagerSafe(*Strip(Left)))
+        /* What is read back is the variable assigned: a comma's right side for `(Bump(), N) = E`, whose left side the
+           assignment's own statement runs (LowerBody's assignment). */
+        Json Unused = Json::array();
+        AssignedPlace(*Left, Unused, Place);
+        if (!IsEagerSafe(*Strip(&Place)))
         { *Err = "an assignment used as a value, whose left side is no plain variable, which would be evaluated again to "
                  "read it: assign in a statement of its own, then use what it assigned"; return false; }
         Pre.push_back(N);
-        Value = Left;
+        Value = &Place;
     }
     else if (!IsEagerSafe(*Strip(Left))) Pre.push_back(*Left);
     const std::string Type = StripTypeKeywords(TypeOf(*Value));
@@ -10249,6 +10306,33 @@ bool FCompiler::LowerCommaValue(const Json& N, bool bRead, FBlueprintClass& BP, 
     (*Out.Sub->Inline)[0].Body = Body;
     Out.Sub->InlineResult = Result;
     Out.Sub->InlineType = Type;
+    return true;
+}
+
+/*
+The place an assignment or an update writes when its left side is a comma or a plain `=`: `(Bump(), N) += 1` writes
+the comma's right side, an lvalue ([expr.comma]); `(N = M) += 1` writes N after the assignment ([expr.ass]: its value is
+its left operand, an lvalue). Out gets that variable, through commas in commas, and Pre what runs first, in order: each
+comma's left side that can do something, or the assignment itself, whose left side must then be a plain variable
+(IsEagerSafe), named twice. The caller puts ahead of them what C++ evaluates before the left side of an assignment, its
+right side ([expr.ass]/1, C++17). False, with Out the place as it is, for anything else: the caller's own lowering
+refuses what it cannot write to. DesugarUpdate, LowerBody's assignment and LowerCommaValue use it.
+*/
+bool FCompiler::AssignedPlace(const Json& Place, Json& Pre, Json& Out) const
+{
+    const Json* Bare = PeelLvalue(&Place);
+    const std::string Op = Bare && Kind(*Bare) == "BinaryOperator" ? Bare->value("opcode", std::string()) : std::string();
+    const Json* Left = Bare ? Nth(*Bare, 0) : nullptr;
+    const Json* Right = Bare ? Nth(*Bare, 1) : nullptr;
+    if (!Left || !Right || (Op != "," && !(Op == "=" && Strip(Left) && IsEagerSafe(*Strip(Left))))) { Out = Place; return false; }
+    if (Op == "=")
+    {
+        Pre.push_back(*Bare);
+        Out = *Left;
+        return true;
+    }
+    if (const Json* L = Strip(Left); L && !IsEagerSafe(*L)) Pre.push_back(*Left);
+    AssignedPlace(*Right, Pre, Out);
     return true;
 }
 

@@ -1220,8 +1220,9 @@ def assign_value():
     arm of ?:, or in an argument of a call on another object. The C++ results: the assignment's value is T itself
     ([expr.ass]), copied into the by-value parameter right after it; a loop condition is evaluated before each trip
     ([stmt.while]); && and ?: evaluate only what the left side / condition picks ([expr.log.and], [expr.cond]); a
-    call's object is sequenced before its arguments ([expr.call] 8), and P is this."""
-    base = pending_asset('AssignValue')
+    call's object is sequenced before its arguments ([expr.call] 8), and P is this. Refused on 9ac803ad, with a message
+    REFERENCE no longer listed."""
+    base = asset('AssignValue')
     keeps_invariants(base)
 
     def loop(m):                                    # `while (UsePairV(T = S) < 100) { S.A += 3; K += 1; }`
@@ -1232,7 +1233,7 @@ def assign_value():
     for m in (0, 1, 7):
         cases = (('While', loop(m)), ('And', ((1000 if m * 10 + 2 > 50 else 0) + m) if m > 0 else 0),
                  ('Cond', (m * 10 + 2) * 100 + m if m > 0 else 500), ('Other', (m * 10 + 2) * 100 + m),
-                 ('StrWhile', (4 if m > 2 else 0) * 10 + 2))
+                 ('StrWhile', (4 if m > 2 else 0) * 10 + 1), ('StrAnd', 11 if m > 0 else 0))
         for fn, want in cases:
             if fn != 'Other':                       # runscript runs no call on another object
                 got = run(base, fn, {'S': {}, 'T': {}, 'Str': ''}, M=m)[0]
@@ -1243,13 +1244,19 @@ def assign_value():
             assert got == want, 'runvm: AssignValue.%s(%d) = %r; C++ %r' % (fn, m, got, want)
 
 
-pending('AssignValue: a struct\'s or an FString\'s = read by value in a loop condition, right of &&, in ?: or in a call '
-        'on another object is a copy of what it assigned', assign_value)
-# A member taken of a struct `=` in a loop condition uses its place, which no statement before the loop can hold.
-pending('AssignMemberPlace', lambda: refused(
-    'AssignMemberPlace', '  FCbPair S;\n  FCbPair T;\n'
-    '  int32 F(int32 M) { S.A = M; int32 K = 0; while ((T = S).A < 9) { S.A += 3; K += 1; } return K; }\n',
-    'an assignment used as a value used as a place, not a value', COMMA_TOP))
+assign_value()
+print('ok  AssignValue: a struct\'s or an FString\'s = read by value in a loop condition, right of &&, in ?: or in a '
+      'call on another object is a copy of what it assigned')
+# A member taken of a struct `=` in a loop condition uses its place, which no statement before the loop can hold; an
+# assignment updated whose left side is no plain variable would locate it twice.
+refused('AssignMemberPlace', '  FCbPair S;\n  FCbPair T;\n'
+        '  int32 F(int32 M) { S.A = M; int32 K = 0; while ((T = S).A < 9) { S.A += 3; K += 1; } return K; }\n',
+        'an assignment used as a place, not a value', COMMA_TOP)
+refused('AssignSlotUpdate', '  TArray<int32> L;\n  int32 Idx() { return 0; }\n'
+        '  int32 F(int32 M) { L = {M}; int32 K = 0; while (((L[Idx()] = M) += 1) < 5) { M += 1; K += 1; } return K; }\n',
+        'an assignment assigned to or updated, whose left side is no plain variable')
+print('ok  AssignMemberPlace, AssignSlotUpdate: a member of a struct = in a loop condition, and an update of an '
+      'assignment to no plain variable, are refused by name')
 
 
 def comma_targets():
@@ -1257,8 +1264,10 @@ def comma_targets():
     whose right side is a call. The C++ results: the comma is its right side, the lvalue N ([expr.comma]), so each
     trip runs Bump, then the update on N; a loop condition is evaluated before each trip ([stmt.while]); && evaluates
     its right side only when the left is true ([expr.log.and]); an assignment's right side is sequenced before its
-    left ([expr.ass]/1, C++17), so G() reads Count before Bump moves it."""
-    base = pending_asset('CommaTargets')
+    left ([expr.ass]/1, C++17), so G() reads Count before Bump moves it. A plain `=` assigned to or updated is its
+    left side after it ([expr.ass]): G() runs before Next(), and OnAssignEq's `N + 1` reads N before `N = M`. Refused
+    on 9ac803ad as "TODO: assignment to BinaryOperator"."""
+    base = asset('CommaTargets')
     keeps_invariants(base)
 
     def loop(m, post=False, by_g=False, limit=5):   # Count bumps once per trip; N moves by 1 (or by G(), Count before it)
@@ -1268,11 +1277,19 @@ def comma_targets():
             v = n
             n += g if by_g else 1
             if not (v if post else n) < limit: return n * 100 + c
-    for m in (0, 3, 7):
+    def on_assign_call(m):                          # `while (((N = Next()) += G()) < 20) K += 1;`, Count from m
+        c, k = m, 0
+        while True:
+            g = c; c += 1; n = c + g
+            if not n < 20: return k * 100 + n
+            k += 1
+    for m in (0, 3, 7, 12):
         cases = (('Compound', loop(m)), ('Pre', loop(m)), ('Post', loop(m, post=True)), ('Assign', loop(m)),
                  ('CompoundCall', loop(m, by_g=True, limit=9)),
                  ('AndRight', ((1000 if m + 1 > 2 else 0) + (m + 1) * 10 + 1) if m > 0 else m * 10),
-                 ('StmtAssign', m * 100 + m + 1), ('StmtCompound', (1 + m) * 100 + m + 1))
+                 ('StmtAssign', m * 100 + m + 1), ('StmtCompound', (1 + m) * 100 + m + 1),
+                 ('OnAssign', max(0, 4 - m) * 100 + max(m + 1, 5)), ('OnAssignEq', 405),
+                 ('OnAssignCall', on_assign_call(m)), ('OnAssignStmt', (2 * m + 1) * 100 + m + 1))
         for fn, want in cases:
             got = run(base, fn, {'Count': 0, 'N': 0}, M=m)[0]
             assert got == want, 'CommaTargets.%s(%d) = %r; C++ %r' % (fn, m, got, want)
@@ -1281,8 +1298,9 @@ def comma_targets():
             assert got == want, 'runvm: CommaTargets.%s(%d) = %r; C++ %r' % (fn, m, got, want)
 
 
-pending('CommaTargets: a comma assigned to or updated in a loop condition, right of &&, or before a call on its right '
-        'runs its left side, then the update on its right side', comma_targets)
+comma_targets()
+print('ok  CommaTargets: a comma or a = assigned to or updated in a loop condition, right of &&, or before a call on its '
+      'right runs its left side, then the update of the variable it names')
 
 
 def comma_ctor_default():
