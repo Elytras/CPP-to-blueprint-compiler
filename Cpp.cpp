@@ -1300,7 +1300,14 @@ private:
     bool ChangesMapCount(const Json& Body, const std::string& MapType) const;
     bool LowerWithoutPrefix(const Json& Stmt, FBlueprintClass& BP, std::vector<FStmtIR>& Out,
                             std::vector<FPropertyDef>& Locals, std::string* Err);
-    int32 HoistComma(const Json& Stmt, Json* Seq, std::string* Err);
+    int32 HoistComma(const Json& Stmt, FBlueprintClass& BP, Json* Seq, std::string* Err);
+    /* The commas, assignments and updates of the statement being lowered that sit behind an operand C++ evaluates
+       before them (NoteBehind), where an inline body would run ahead of that operand. */
+    std::set<const Json*> Behind;
+    void NoteBehind(const Json& Root, std::vector<const Json*>& Added);
+    int32 LowerBoundArgs(const Json& Call, FBlueprintClass& BP, FCallIR& Out, std::string* Err);
+    bool LowerCommaValue(const Json& N, bool bRead, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
+    const Json* ReadComma = nullptr;    // LowerArg: the comma or `=` under the LValueToRValue it is lowering, read there
     const Json* CalledDecl(const Json& Call) const;
 
     /* `inline` functions are the editor's macros: never a UFunction, their body is copied into each caller.
@@ -4345,6 +4352,13 @@ bool FCompiler::LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, 
     }
     const Json* N = Strip(&ArgNode);
     if (!N) { *Err = "empty argument expression"; return false; }
+    /* A comma or a `=` under an LValueToRValue or a copy is read where it stands (LowerCommaValue); without one, its
+       place is what is used. */
+    struct FReadRestore { const Json** Slot; const Json* Old; ~FReadRestore() { *Slot = Old; } } ReadRestore{ &ReadComma, ReadComma };
+    ReadComma = nullptr;
+    for (const Json* W = &ArgNode; W && W != N; W = First(*W))
+        if ((Kind(*W) == "ImplicitCastExpr" && W->value("castKind", std::string()) == "LValueToRValue") || Kind(*W) == "CXXConstructExpr")
+            ReadComma = N;
     /* Arithmetic, a comparison or logic over constants is the constant it comes to: no Kismet call left to run. */
     if (const std::string K = Kind(*N); !bCurNoOpt && (K == "BinaryOperator" || K == "ConditionalOperator"
         || (K == "UnaryOperator" && N->value("opcode", std::string()).find_first_of("&*+") == std::string::npos)))
@@ -5007,25 +5021,11 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         const Json* LhsRaw = Nth(*N, 0);
         const Json* RhsRaw = Nth(*N, 1);
         if (!LhsRaw || !RhsRaw) { *Err = "binary operator with a missing side"; return false; }
-        /* LowerBody takes a comma apart where its left side can run as a statement of its own (HoistComma); one that
-           reaches here is in a loop condition, which reruns it every trip, or behind something its statement runs
-           first, which the left side would then run before. */
-        if (Op == ",")
-        {
-            *Err = "the comma operator in a loop condition, or after something its statement runs first (the right side "
-                   "of && / || / ?:, an argument of a call on another object, a later member of a braced list): write its "
-                   "left side as a statement of its own. It works as a statement (`A, B;`, a for increment) and anywhere "
-                   "else in a statement (`int32 N = (A, B);`, `F((A, B))`, `if (A, B)`)";
-            return false;
-        }
-        /* An assignment used as a value LowerBody's HoistComma did not take apart, as it does `A = B = E`. */
-        if (Op == "=")
-        {
-            *Err = "an assignment used as a value in a loop condition, or after something its statement runs first (the "
-                   "right side of && / || / ?:, an argument of a call on another object, a later member of a braced "
-                   "list): assign in a statement of its own, then use what it assigned";
-            return false;
-        }
+        /* LowerBody takes a comma, or an assignment used as a value, apart where its left side can run as a statement of
+           its own (HoistComma); one that reaches here is in a loop condition, which reruns it every trip, on the right
+           of && / || or in ?:, or in a call on another object: an inline body there. */
+        if (Op == "," || Op == "=")
+            return LowerCommaValue(*N, ReadComma == N || N->value("valueCategory", std::string()) != "lvalue", BP, Out, Err);
         /* `"Kills: " + N`: C++ reads an address N characters into the literal (clang warns, -Wstring-plus-int, and
            compiles it), which nothing in a Blueprint could mean. It is the concat the author wrote. A float or an
            object on the other side never gets here - clang refuses those, so they stay `FString("lit") + X`. */
@@ -5911,6 +5911,8 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
     const bool bIntrinsic = MethodName.size() >= 5
         && MethodName.compare(0, 2, "__") == 0
         && MethodName.compare(MethodName.size() - 2, 2, "__") == 0;
+    /* `IncRef(0, B += 1)` in a loop condition, or on another object: the reference is B itself, not LowerArg's copy. */
+    if (const int32 Bound = bIntrinsic ? 0 : LowerBoundArgs(CallExprNode, BP, Out, Err)) return Bound > 0;
     if (bIntrinsic)
     {
         Out.Intrinsic = MethodName;
@@ -7583,7 +7585,12 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
            statement's expression HoistComma takes it apart: an if / switch condition runs once, so `if (A, B)` is A,
            then `if (B)`, as an init-statement is lowered - which is how `if (bool bOk; Get(Out, bOk), !bOk)` tests an
            out-param - and so is an initialiser, an argument, a return value, where nothing runs before the comma. A
-           loop condition reruns its left side every trip: it reaches LowerArg, which refuses it. */
+           loop condition reruns its left side every trip: it reaches LowerArg, which runs it as an inline body there
+           (LowerCommaValue), unless it sits behind something the statement runs first (NoteBehind). */
+        std::vector<const Json*> Noted;
+        NoteBehind(*S, Noted);
+        struct FUnnote { std::set<const Json*>& Set; const std::vector<const Json*>& Of; ~FUnnote() { for (const Json* P : Of) Set.erase(P); } }
+            Unnote{ Behind, Noted };
         auto IsComma = [](const Json& E) { return Kind(E) == "BinaryOperator" && E.value("opcode", std::string()) == ","; };
         /* A discarded side that can do nothing (`I, J++`) is no statement at all. */
         auto Discarded = [&](std::initializer_list<const Json*> Sides) {
@@ -7608,7 +7615,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             if (!LowerBody(Wrap, BP, Out, Locals, Err)) bOk = false;
             return;
         }
-        if (Json Seq; const int32 Hoisted = HoistComma(*S, &Seq, Err))
+        if (Json Seq; const int32 Hoisted = HoistComma(*S, BP, &Seq, Err))
         {
             Json Wrap = { {"kind", "CompoundStmt"}, {"inner", Seq} };
             if (Hoisted < 0 || !LowerBody(Wrap, BP, Out, Locals, Err)) bOk = false;
@@ -9745,6 +9752,33 @@ const Json* FCompiler::CalledDecl(const Json& Call) const
     return nullptr;
 }
 
+namespace
+{
+/* A CXXOperatorCallExpr's operator, "=" for operator=; empty for anything else. */
+std::string OperatorSymbol(const Json& E)
+{
+    if (Kind(E) != "CXXOperatorCallExpr") return std::string();
+    const Json* Callee = Strip(First(E));
+    const std::string Name = Callee && Callee->contains("referencedDecl") ? (*Callee)["referencedDecl"].value("name", std::string())
+                                                                         : std::string();
+    return Name.compare(0, 8, "operator") == 0 ? Name.substr(8) : std::string();
+}
+
+/* What E is among the expressions that act and are worth a place: "," the comma operator, "=" a plain assignment,
+   "update" a compound assignment or a `++` / `--` (a place only when prefix: its valueCategory says), "" anything else. */
+std::string PlaceOp(const Json& E)
+{
+    const std::string K = Kind(E), Op = E.value("opcode", std::string());
+    if (K == "BinaryOperator" && (Op == "," || Op == "=")) return Op;
+    if (K == "CompoundAssignOperator" || (K == "UnaryOperator" && (Op == "++" || Op == "--"))) return "update";
+    static const std::set<std::string> Compound = { "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=" };
+    const std::string Sym = OperatorSymbol(E);
+    if (Sym == "=" && Nth(E, 2)) return "=";
+    if ((Compound.count(Sym) && Nth(E, 2)) || Sym == "++" || Sym == "--") return "update";
+    return std::string();
+}
+}
+
 /*
 The comma operator inside a statement's expression: `int32 N = (Bump(), M);`, `F((Bump(), M))`, `return (A, B);`,
 `switch (Bump(), T)`. C++ runs the comma's left side, then its right side, whose value the comma is; the editor has no
@@ -9769,7 +9803,7 @@ assignment used as a value, `A = B = E` or `F(B = 1)`, is the comma `(B = E, B)`
 then its left side is read again, which must be a plain variable to give the same place. Returns 1 with Seq set, 0
 for a statement with no such comma, -1 with Err set for one that cannot move.
 */
-int32 FCompiler::HoistComma(const Json& Stmt, Json* Seq, std::string* Err)
+int32 FCompiler::HoistComma(const Json& Stmt, FBlueprintClass& BP, Json* Seq, std::string* Err)
 {
     Json Plain = Stmt;
     struct FLevel { Json* Child; Json* Parent; size_t From; bool bFixed; };     // an unordered operand on the way, from
@@ -9970,15 +10004,45 @@ int32 FCompiler::HoistComma(const Json& Stmt, Json* Seq, std::string* Err)
         }
     if (Moved && !ValueUse(*Moved))
     {
+        /* An overloaded operator's operand is bound to its parameter as a call's argument is (`Get() + (Bump(), L[0])`
+           over FString's `const FString&`): the message names the operator, which the user wrote, not a parameter. */
+        std::string Bound = "written to or bound to a reference (a `T&` or `const T&` parameter)";
+        for (const FLevel& L : Levels)
+            if (L.Child == Moved && Kind(*L.Parent) == "CXXOperatorCallExpr")
+            {
+                const std::string Sym = OperatorSymbol(*L.Parent);
+                if (!Sym.empty()) Bound = "bound to a reference, operator `" + Sym + "`'s `" + TypeOf(*Moved) + " &` operand";
+            }
         if (!(JustTarget(const_cast<Json*>(Moved)) && IsEagerSafe(Right)))
-        { *Err = What + " here is written to or bound to a reference (a `T&` or `const T&` parameter), beside something "
-                 "that may run before it, and its right side is no variable: write its left side as a statement before "
-                 "this one"; return -1; }
+        { *Err = What + " here is " + Bound + ", beside something that may run before it, and its right side is no "
+                 "variable: write its left side as a statement before this one"; return -1; }
         Moved = nullptr;
     }
     *Seq = Pre;
     if (Moved)
     {
+        /* An operand that ends in an implicit conversion to a type no Blueprint variable holds (`(Bump(), M) * (G() +
+           0.5)`, float M made double) moves without it: the conversion stays over the temporary, where the statement
+           meets it as it would without the comma, and whatever it says of it (here that 4.27 has no double math) is
+           about what the user wrote. A type that still cannot be a local is refused as such. */
+        FPropertyDef Probe;
+        std::string NoLocal;
+        /* Only a built-in arithmetic type is asked: a struct's or an object's property would import its type here, ahead
+           of the temporary's own. */
+        static const std::set<std::string> Builtins = { "double", "long double", "float", "short", "unsigned short", "int",
+            "unsigned int", "long", "unsigned long", "long long", "unsigned long long", "char", "signed char",
+            "unsigned char", "wchar_t", "char16_t", "char32_t", "bool", "int8", "uint8", "int16", "uint16", "int32",
+            "uint32", "int64", "uint64" };
+        auto Holdable = [&](const Json& E) {
+            const std::string T = StripTypeKeywords(TypeOf(E));
+            return !Builtins.count(T) || TypeToProperty(T, "__Comma__", 0, What, BP, &Probe, &NoLocal);
+        };
+        while (!Holdable(*Moved) && Kind(*Moved) == "ImplicitCastExpr" && First(*Moved)
+               && Moved->value("castKind", std::string()) != "LValueToRValue" && Moved->value("castKind", std::string()) != "NoOp")
+            Moved = First(*Moved);
+        if (!Holdable(*Moved))
+        { *Err = What + " here would run first, whole, into a temporary, and its value is a " + StripTypeKeywords(TypeOf(*Moved))
+                 + ", which no Blueprint variable can hold: write its left side as a statement before this one"; return -1; }
         /* The operand runs first, whole, into a temporary the statement then reads. */
         const std::string Type = StripTypeKeywords(TypeOf(*Moved));
         const std::string Tmp = "__Comma" + std::to_string(ReadTmpCounter++) + "__";
@@ -10004,6 +10068,188 @@ int32 FCompiler::HoistComma(const Json& Stmt, Json* Seq, std::string* Err)
     }
     Seq->push_back(Plain);
     return 1;
+}
+
+/*
+Which commas, assignments and updates of a statement's expression sit behind an operand C++ evaluates before them that
+is no fixed value (IsFixedOperand): a later member of braces, an assignment's left side (its right side runs first), the
+right side of `<<` / `>>`, a later operand of an overloaded operator that is no arithmetic or comparison. What HoistComma
+leaves in place becomes an inline body (LowerCommaValue, LowerBoundArgs), and an inline body runs before everything
+its statement evaluates: behind such an operand it would run ahead of it, so those are refused. A call's object and an
+index's array are pinned first when an argument hoists (PinObject, PinHolder), and the right side of && / || and the
+arms of ?: hoist into their own branch, so none of those puts what follows behind. A nested statement is left to its
+own lowering. Added gets what this call marked, which the caller unmarks when the statement is lowered: the nodes are
+the statement's, and a later one may reuse their memory.
+*/
+void FCompiler::NoteBehind(const Json& Root, std::vector<const Json*>& Added)
+{
+    static const std::set<std::string> Assigns = { "=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=" };
+    static const std::set<std::string> Unsequenced = { "+", "-", "*", "/", "%", "==", "!=", "<", ">", "<=", ">=",
+                                                       "&", "|", "^", "[]" };
+    std::function<void(const Json&, bool, bool)> Walk = [&](const Json& E, bool bBehind, bool bRoot) {
+        if (!E.is_object()) return;
+        const std::string K = Kind(E);
+        if (!bRoot && K.size() > 4 && K.compare(K.size() - 4, 4, "Stmt") == 0) return;
+        if (bBehind && !PlaceOp(E).empty() && Behind.insert(&E).second) Added.push_back(&E);
+        const auto It = E.find("inner");
+        if (It == E.end() || !It->is_array()) return;
+        const Json& In = *It;
+        /* The operands in the order C++ evaluates them: each one after an earlier that is no fixed value is behind. */
+        auto Order = [&](const std::vector<size_t>& Seq) {
+            std::vector<bool> Seen(In.size());
+            bool bAfter = bBehind;
+            for (size_t I : Seq)
+                if (I < In.size())
+                {
+                    Walk(In[I], bAfter, false);
+                    Seen[I] = true;
+                    bAfter = bAfter || !IsFixedOperand(In[I]);
+                }
+            for (size_t I = 0; I < In.size(); ++I) if (!Seen[I]) Walk(In[I], bBehind, false);
+        };
+        auto From = [&](size_t Start) {
+            std::vector<size_t> Seq;
+            for (size_t I = Start; I < In.size(); ++I) Seq.push_back(I);
+            Order(Seq);
+        };
+        const std::string Op = E.value("opcode", std::string()), Sym = OperatorSymbol(E);
+        if (K == "InitListExpr" || ((K == "CXXConstructExpr" || K == "CXXTemporaryObjectExpr") && E.value("list", false))) From(0);
+        else if ((K == "BinaryOperator" && Op == "=") || K == "CompoundAssignOperator") Order({ 1, 0 });
+        else if (K == "BinaryOperator" && (Op == "<<" || Op == ">>")) Order({ 0, 1 });
+        else if (K == "CXXOperatorCallExpr" && Assigns.count(Sym)) Order({ 2, 1 });
+        else if (K == "CXXOperatorCallExpr" && !Unsequenced.count(Sym)) From(1);
+        else for (const Json& C : In) Walk(C, bBehind, false);
+    };
+    Walk(Root, false, true);
+}
+
+/*
+An argument bound to a reference parameter that is a comma, a plain `=` or an update (`IncRef(0, B += 1)`,
+`IncRef(0, (Bump(), N))`) which HoistComma did not take apart: in a loop condition, on the right of && / || or in an
+arm of ?:, in a call on another object. The parameter is then the comma's right side, or what the assignment wrote,
+itself, which the callee reads and writes after every argument; LowerArg's value of one would be a copy, and the
+callee's write would be lost. So the call becomes an inline body that runs where the call does (every trip of a loop,
+in the branch that runs it): the object pinned first when it is not this, as C++ evaluates it before the arguments;
+then each such argument's left side, or the assignment, as a statement; then the call, with the variable in the
+argument's place. C++ leaves the arguments' order among themselves open, and this runs each such argument whole before
+the rest, one order it allows. The variable must name the same place wherever it is read (IsEagerSafe), as HoistComma
+asks; behind something the statement runs first (Behind) the body would run before that, and both are refused.
+Returns 0 for a call with no such argument, 1 with Out set, -1 with Err set.
+*/
+int32 FCompiler::LowerBoundArgs(const Json& Call, FBlueprintClass& BP, FCallIR& Out, std::string* Err)
+{
+    const std::string K = Kind(Call);
+    if ((K != "CallExpr" && K != "CXXMemberCallExpr") || !Call.contains("inner")) return 0;
+    const Json& In = Call["inner"];
+    std::vector<size_t> Bound;
+    for (size_t I = 1; I < In.size(); ++I)
+        if (const Json* Bare = PeelLvalue(&In[I]); Bare && Bare->value("valueCategory", std::string()) == "lvalue" && !PlaceOp(*Bare).empty())
+            Bound.push_back(I);
+    if (Bound.empty()) return 0;
+    if (!CurLocals) { *Err = "internal: a call outside a function body"; return -1; }
+
+    Json Pre = Json::array(), Again = Call;
+    /* The object first, as C++ evaluates it: a pointer's value into a local, a struct's place fixed. */
+    if (K == "CXXMemberCallExpr" && Kind(In[0]) == "MemberExpr" && First(In[0]))
+        if (const Json* Obj = First(In[0]); Kind(*Strip(Obj)) != "CXXThisExpr")
+            Again["inner"][0]["inner"][0] = In[0].value("isArrow", false) ? HoistExpr(*Obj, Pre, true) : StabilizeLvalue(*Obj, Pre, true);
+    for (size_t I : Bound)
+    {
+        const Json* Bare = PeelLvalue(&In[I]);
+        const std::string Op = PlaceOp(*Bare);
+        const std::string What = Op == "," ? "the comma operator" : Op == "=" ? "an assignment used as a value"
+                               : "an update (`+=`, `++`, ...)";
+        if (Behind.count(Bare))
+        { *Err = What + " passed to a reference parameter after something its statement runs first (a later member of a "
+                 "braced list, an assignment's left side, the right side of `<<` / `>>`), which it would run before: "
+                 "write it as a statement of its own, then pass the variable"; return -1; }
+        const Json* Place = Op == "," ? Nth(*Bare, 1) : Kind(*Bare) == "CXXOperatorCallExpr" ? Nth(*Bare, 1) : Nth(*Bare, 0);
+        if (!Place || !IsEagerSafe(*Strip(Place)))
+        { *Err = What + " passed to a reference parameter, whose " + (Op == "," ? "right" : "left") + " side is no plain "
+                 "variable, where no statement before this one can hold it (a loop condition, the right side of && / || "
+                 "/ ?:, a call on another object): write it as a statement of its own, then pass the variable"; return -1; }
+        if (const Json* Side = Op == "," ? Nth(*Bare, 0) : Bare; Side && !IsEagerSafe(*Strip(Side))) Pre.push_back(*Side);
+        /* The variable stands where the comma or the update stood, under the same casts. */
+        const Json* From = &In[I];
+        Json* To = &Again["inner"][I];
+        while (From != Bare) { From = First(*From); To = &(*To)["inner"][0]; }
+        *To = *Place;
+    }
+    const std::string Type = StripTypeKeywords(TypeOf(Call));
+    std::string Result;
+    if (Type.empty() || Type == "void") Pre.push_back(Again);
+    else Result = SynthLocal(Type, Again, Pre)["inner"][0]["referencedDecl"].value("name", std::string());
+    const Json Wrap = { {"kind", "CompoundStmt"}, {"inner", std::move(Pre)} };
+    auto Body = std::make_shared<std::vector<FStmtIR>>();
+    if (!LowerBody(Wrap, BP, *Body, *CurLocals, Err)) return -1;
+    Out = FCallIR();
+    Out.Intrinsic = "__Inline__";
+    Out.Inline = std::make_shared<std::vector<FStmtIR>>(1);
+    (*Out.Inline)[0].K = FStmtIR::Block;
+    (*Out.Inline)[0].Body = Body;
+    Out.InlineResult = Result;
+    if (!Result.empty()) Out.InlineType = Type;
+    return 1;
+}
+
+/*
+A comma, or a plain `=` used as a value (the comma `(A = E, A)`), that HoistComma left where it stands: in a loop
+condition, on the right of && / || or in an arm of ?:, in an argument of a call on another object. An inline body runs
+where its value is needed - every trip of a loop, in the branch that needs it, after a call's object is pinned - so
+the comma is one: its left side as a statement, then a copy of its right side, read right after it, as C++ reads it
+(bRead: an LValueToRValue or a copy over it, or a prvalue comma). Refused where that is not C++'s order or not its
+value: behind an operand its statement evaluates first (Behind), where the body would run ahead of that operand; and
+where its place is used rather than its value (bound to an operator's or a constructor's reference, a member taken of
+it, written), which a copy is not. A call's reference parameter takes the place through LowerBoundArgs.
+*/
+bool FCompiler::LowerCommaValue(const Json& N, bool bRead, FBlueprintClass& BP, FArgIR& Out, std::string* Err)
+{
+    const bool bAssign = N.value("opcode", std::string()) == "=";
+    const std::string What = bAssign ? "an assignment used as a value" : "the comma operator";
+    const std::string Fix = bAssign ? "assign in a statement of its own, then use what it assigned"
+                                    : "write its left side as a statement of its own";
+    if (Behind.count(&N))
+    { *Err = What + " after something its statement runs first (a later member of a braced list, an assignment's left "
+             "side, the right side of `<<` / `>>`), which its left side would run before: " + Fix; return false; }
+    if (!bRead)
+    { *Err = What + " used as a place, not a value (bound to an operator's or a constructor's reference, a member taken "
+             "of it, assigned to), where no statement before this one can hold its left side (a loop condition, the "
+             "right side of && / || / ?:, a call on another object): " + Fix; return false; }
+    if (!CurLocals) { *Err = "internal: " + What + " outside a function body"; return false; }
+    const Json* Left = Nth(N, 0);
+    const Json* Right = Nth(N, 1);
+    if (!Left || !Right) { *Err = What + " with a missing side"; return false; }
+    Json Pre = Json::array();
+    const Json* Value = Right;
+    if (bAssign)
+    {
+        if (!IsEagerSafe(*Strip(Left)))
+        { *Err = "an assignment used as a value, whose left side is no plain variable, which would be evaluated again to "
+                 "read it: assign in a statement of its own, then use what it assigned"; return false; }
+        Pre.push_back(N);
+        Value = Left;
+    }
+    else if (!IsEagerSafe(*Strip(Left))) Pre.push_back(*Left);
+    const std::string Type = StripTypeKeywords(TypeOf(*Value));
+    FPropertyDef Probe;
+    std::string NoLocal;
+    if (!TypeToProperty(Type, "__Comma__", 0, What, BP, &Probe, &NoLocal))
+    { *Err = What + "'s value here is a " + Type + ", which no Blueprint variable can hold: " + Fix; return false; }
+    const Json Init = Value->value("valueCategory", std::string()) == "lvalue" ? ReadOf(*Value) : *Value;
+    const std::string Result = SynthLocal(Type, Init, Pre)["inner"][0]["referencedDecl"].value("name", std::string());
+    const Json Wrap = { {"kind", "CompoundStmt"}, {"inner", std::move(Pre)} };
+    auto Body = std::make_shared<std::vector<FStmtIR>>();
+    if (!LowerBody(Wrap, BP, *Body, *CurLocals, Err)) return false;
+    Out.K = FArgIR::Call;
+    Out.InnerType = Type;
+    Out.Sub = std::make_shared<FCallIR>();
+    Out.Sub->Intrinsic = "__Inline__";
+    Out.Sub->Inline = std::make_shared<std::vector<FStmtIR>>(1);
+    (*Out.Sub->Inline)[0].K = FStmtIR::Block;
+    (*Out.Sub->Inline)[0].Body = Body;
+    Out.Sub->InlineResult = Result;
+    Out.Sub->InlineType = Type;
+    return true;
 }
 
 /* `for (Elem : Range)` over a TArray / TSet / TMap. CXXForRangeStmt inner is

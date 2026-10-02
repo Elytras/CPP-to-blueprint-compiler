@@ -22,6 +22,7 @@ public:
 
   int32 While(int32 M) { Count = 0; N = M; while ((Bump(), N) < 5) N += 1; return N * 100 + Count; }
   int32 For(int32 M) { Count = 0; int32 I = M; for (; Bump(), I < 5; I += 1) {} return I * 100 + Count; }
+  int32 Do(int32 M) { Count = 0; int32 I = M; do { I += 1; } while ((Bump(), I) < 5); return I * 100 + Count; }
   int32 And(int32 M) { Count = 0; bool R = M > 0 && (Bump(), M > 2); return (R ? 1000 : 0) + Count; }
   int32 Or(int32 M) { Count = 0; bool R = M > 0 || (Bump(), Bump(), M < -1); return (R ? 1000 : 0) + Count; }
   int32 Cond(int32 M) { Count = 0; int32 R = M > 0 ? (Bump(), M + Count) : (Bump(), Bump(), M - Count); return R * 100 + Count; }
