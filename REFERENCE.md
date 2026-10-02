@@ -3187,7 +3187,9 @@ Notes:
 | `GetTypedOuter<AActor>(Obj)` | From `Objects.h`: the nearest outer of `Obj` that is a `T`, or null. `Obj` itself is never a candidate, and a null `Obj` gives null. Each step is one outer read and one Cast. | Yes |
 | `GetOutermostTypedOuter<ULevel>(Obj)` | From `Objects.h`: the same walk, keeping the farthest outer that is a `T`. | Yes |
 | `GetOuter()` or `GetTypedOuter<T>()` in a function that waits (`Delay`, `UE_AWAIT`) | Not yet: refused with "a pointer read in a function that makes a latent call". Do the walk in a separate function that does not wait, or loop over `UKismetSystemLibrary::GetOuterObject`, which is an engine call. | Not yet |
-| `Obj->Class`, `Obj->IsA(AActor::StaticClass())` | Refused by clang: "no member named 'Class' in 'UObject'". The SDK declares none of UObject's raw fields (`Class`, `Outer`, `Name`) and no `IsA`. Use the helpers above, and `Cast<T>` to test a class. | Refused |
+| `Obj->IsA(AActor::StaticClass())` | Get Class, then Class Is Child Of: `UKismetMathLibrary::ClassIsChildOf(UGameplayStatics::GetObjectClass(Obj), Class)`. False on a null object. Needs `UeApi/Engine.h`. | Yes |
+| `Class->IsChildOf(AActor::StaticClass())` | Class Is Child Of (`UKismetMathLibrary::ClassIsChildOf`). False on a null class. | Yes |
+| `Obj->Class` | Refused by clang: "no member named 'Class' in 'UObject'". The SDK declares none of UObject's raw fields (`Class`, `Outer`, `Name`). Use the helpers above. | Refused |
 
 ```cpp
 #include "../include/Objects.h"
@@ -3209,6 +3211,33 @@ Notes:
   itself, or that the outer walk is a `GetOuterObject` call, is out of date.
 - The forwarders need the header that declares their target. Without it the compiler says "which is not declared
   here: include its UeApi header"; `UGameplayStatics` and `UKismetSystemLibrary` are in `UeApi/Engine.h`.
+
+### Methods on structs, text and soft pointers
+
+The editor drags a struct pin out to every library function that takes the struct first. UeApi declares each of those
+as a method of the struct, so calls chain the way the nodes do. FString, FName, FText, `TSoftObjectPtr<T>` and
+`TSoftClassPtr<T>` get them too.
+
+| You write | What it does | Status |
+|---|---|---|
+| `AssetData.GetExportTextName()` | `UAssetRegistryHelpers::GetExportTextName(AssetData)`: the value goes first, the arguments after it. | Yes |
+| `Path.ToSoftClassPtr()`, `V.ToString()` | A one-argument `Conv_XToY` is `To<Y>()`: `Conv_SoftClassPathToSoftClassRef`, `Conv_VectorToString`. | Yes |
+| `Soft.LoadClassAsset_Blocking()` | The same on a soft pointer, `UKismetSystemLibrary::LoadClassAsset_Blocking(Soft)`. | Yes |
+| A library function taking a world context, or a latent one, as a method | Not declared: call the static. | Not yet |
+
+```cpp
+UClass *ClassOf(const FAssetData &AssetData)
+{
+  return AssetData.GetExportTextName().MakeSoftClassPath().ToSoftClassPtr().LoadClassAsset_Blocking();
+}
+```
+
+Notes:
+
+- Hover a method in the editor: the comment above it names the library function and the UeApi header it is in. The
+  call needs that header included; without it the compiler says "which is not declared here: include its UeApi header".
+- One function per name. Where two libraries have one, `/Script/Engine`'s wins; call the other as a static.
+- A function whose first parameter is a non-const reference (it changes the value) is not a method.
 
 ### The player and the game
 
@@ -6063,8 +6092,9 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   for. `Cast<IFoo>(Obj)` to a mod interface reports the type as `int64`. Fix: include the header that defines T, and
   cast only to classes. For an interface, write `TScriptInterface<IFoo> I = Obj;`. See [Types](#types) and
   [Interfaces](#interfaces).
-- `<Method>() is <Target>, which is not declared here: include its UeApi header`: `Obj->GetOuter()`, `GetClass()` or
-  `GetName()` in a source that does not include the header declaring the function the SDK forwards the call to.
+- `<Method>() is <Target>, which is not declared here: include its UeApi header`: `Obj->GetOuter()`, `GetClass()`,
+  `GetName()`, `IsA()`, or a struct, text or soft pointer method (`AssetData.GetExportTextName()`), in a source that
+  does not include the header declaring the function the SDK forwards the call to.
   Fix: include the header that declares `<Target>`; UGameplayStatics and UKismetSystemLibrary are in `UeApi/Engine.h`.
   See [Working with other objects](#working-with-other-objects).
 - `access to an unknown property: <Member>`: a data member of a type AssetGen keeps no record of. It records named

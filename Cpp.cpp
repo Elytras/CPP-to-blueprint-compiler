@@ -2381,7 +2381,16 @@ bool FCompiler::Collect(std::string* Err)
             if (N.value("inline", false) || Inlines.count(PrevId)) Inlines[PrevId] = Inlines[N.value("id", std::string())] = &N;
             return;
         }
-        if (Kind(N) != "CXXRecordDecl" || !N.contains("name") || !N.contains("inner")) return;
+        /* A soft pointer's methods (genueapi's Methods_<T>.inc): a call names its instantiation's, so each
+           instantiation is a record of the template's name, and they all say the same. */
+        if (Kind(N) == "ClassTemplateDecl" && (Name(N) == "TSoftObjectPtr" || Name(N) == "TSoftClassPtr"))
+        {
+            Walk(N, Ns);
+            return;
+        }
+        if ((Kind(N) != "CXXRecordDecl" && (Kind(N) != "ClassTemplateSpecializationDecl" || !Scope.contains("kind")
+                                           || Kind(Scope) != "ClassTemplateDecl"))
+            || !N.contains("name") || !N.contains("inner")) return;
         /* A forward declaration is no record, though it may carry an attribute: `&AActor::F` gives every declaration of
            AActor an implicit MSInheritanceAttr, the `class AActor;` a header has after the definition too, which would
            replace the class with an empty one. */
@@ -2409,7 +2418,14 @@ bool FCompiler::Collect(std::string* Err)
 
         uint32 Access = N.value("tagUsed", std::string()) == "struct" ? FUNC_Public : FUNC_Private;
         std::string Category;       // UE_CATEGORY is positional, like an access specifier
-        ForEach(N, [&](const Json& C) {
+        std::function<void(const Json&)> Member = [&](const Json& C) {
+            /* genueapi puts a class's markers in a private `struct UeMarkers` at its bottom, out of IntelliSense's
+               member list: they are the class's own. */
+            if (Kind(C) == "CXXRecordDecl" && C.value("name", std::string()) == "UeMarkers" && !C.value("isImplicit", false))
+            {
+                ForEach(C, Member);
+                return;
+            }
             if (Kind(C) == "VarDecl" && Name(C).compare(0, 12, "UeCategory__") == 0)
             {
                 Category.clear();
@@ -2553,7 +2569,8 @@ bool FCompiler::Collect(std::string* Err)
                 ForEach(C, [&](const Json& M) {
                     if (Kind(M) == "CXXMethodDecl") TemplateOwner[M.value("id", std::string())] = R.CppName;
                 });
-        });
+        };
+        ForEach(N, Member);
         /* A set is looked up in Replicated by the name it is cooked under, so the marker's C++ key follows. */
         for (const auto& N2 : R.UeNames)
             if (auto Rep = R.Replicated.find(N2.first); Rep != R.Replicated.end())

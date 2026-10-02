@@ -325,7 +325,7 @@ def beside(pkg, target):
     return os.path.relpath(target, os.path.dirname(pkg) or ".").replace(os.sep, "/")
 
 
-def emit_struct(st, conv_names):
+def emit_struct(st, conv_names, methods, spell):
     body = ["struct %s%s" % (st.cpp, (" : public %s" % st.base) if st.base in STRUCTS else ""), "{"]
     base = STRUCTS.get(st.base)
     own = st.fields[len(base.fields):] if base else st.fields
@@ -341,6 +341,10 @@ def emit_struct(st, conv_names):
         body.append("    %s(%s) {}" % (st.cpp, ", ".join(params)))
     if st.cpp in conv_names:
         body.append("    UE_CONV_%s" % st.cpp)
+    lines, marks = method_lines(methods, spell)
+    if lines:
+        body += [""] + lines
+    body += hidden(marks)
     body.append("};")
     return "\n".join(body)
 
@@ -479,12 +483,18 @@ UOBJECT_FORWARDS = (
 # else the call forwards to the inline below, which attaches at once as USceneComponent::OnRegister would have
 # (SceneComponent.cpp 667-683: AttachToComponent with KeepRelativeTransform, which does not weld): a component a
 # function reaches is registered, and the engine's own call then does nothing (it ensures !bRegistered, 1748-1765).
-# class -> [(return, method, its parameters, the free inline function it forwards to)], each inline defined after the
-# package's classes.
+# class -> [(return, method, its parameters, what it forwards to)]: a free inline function, defined after the package's
+# classes (FORWARD_DEFS), or a library static. UClass::IsChildOf is no UFunction either; Blueprint's Class Is Child Of
+# node is UKismetMathLibrary::ClassIsChildOf.
 CLASS_FORWARDS = {
     "USceneComponent": [("void", "SetupAttachment", "class USceneComponent* InParent, FName InSocketName = FName()",
                          "USceneComponent_SetupAttachment")],
+    "UClass": [("bool", "IsChildOf", "class UClass* ParentClass", "UKismetMathLibrary::ClassIsChildOf")],
+    "UObject": [("bool", "IsA", "class UClass* SomeBase", "UObject_IsA")],
 }
+# A free inline whose body needs another package's classes is defined in that package's header, not its class's: package
+# of each such target. UObject_IsA calls Engine's statics, and CoreUObject.h cannot include Engine.h.
+FORWARD_HOME = {"UObject_IsA": "Engine"}
 FORWARD_DEFS = {
     "USceneComponent_SetupAttachment": [
         "inline void USceneComponent_SetupAttachment(class USceneComponent* Child, class USceneComponent* InParent,",
@@ -493,7 +503,125 @@ FORWARD_DEFS = {
         "    Child->K2_AttachToComponent(InParent, InSocketName, EAttachmentRule::KeepRelative, EAttachmentRule::KeepRelative,",
         "                                EAttachmentRule::KeepRelative, false);",
         "}"],
+    # Obj->IsA(Class): what a Blueprint spells Get Class -> Class Is Child Of. Null-safe, as GetObjectClass is.
+    "UObject_IsA": [
+        "inline bool UObject_IsA(class UObject* Obj, class UClass* SomeBase)",
+        "{",
+        "    return UKismetMathLibrary::ClassIsChildOf(UGameplayStatics::GetObjectClass(Obj), SomeBase);",
+        "}"],
 }
+
+
+def hidden(marks):
+    """A class's markers, which only AssetGen reads, at its bottom in a private `struct UeMarkers`: IntelliSense lists
+    none of them, and a mod class deriving it sees none."""
+    return ["private:", "    struct UeMarkers", "    {"] + ["        " + m for m in marks] + ["    };"] if marks else []
+
+
+# ---- struct methods ------------------------------------------------------------------------------------------
+# The editor drags a struct's pin out to every library static that takes the struct first. Here each one is a const
+# method of the struct, `AssetData.GetExportTextName()` for UAssetRegistryHelpers::GetExportTextName(AssetData), with a
+# `<M>__UeForward` marker naming the static, which AssetGen calls with the struct first as it does UObject's
+# (UOBJECT_FORWARDS). A one-parameter Conv_ is `To<Target>()`: `Path.ToSoftClassPtr()`, `Vec.ToString()`. The value
+# types Types.h declares - FString, FName, FText and the soft pointers - get theirs through Methods_<T>.inc, which it
+# includes. A comment above each names the static and its header, which IntelliSense shows on hover: the call needs
+# that header. One function per name, /Script/Engine's first and then by package, as conversions() picks. Left out:
+# operators (Ops.json), the container libraries (Containers.h), a function taking a world context or a latent one (the
+# overloads that leave them out share the name), and a name the type already has.
+TYPE_TAKEN = {"FString": {"Data", "Length", "Capacity", "Len"}, "FName": {"Val"}, "FText": {"Val"},
+              "TSoftObjectPtr": {"Path"}, "TSoftClassPtr": {"Path"}}
+TO_NAMES = {"int": "Int", "int64": "Int64", "uint8": "Byte", "bool": "Bool", "float": "Float", "double": "Double"}
+STRING_TEMPLATES = ("template <class T> struct TArray;", "template <class T> struct TSet;",
+                    "template <class K, class V> struct TMap;", "template <class T> struct TSubclassOf;",
+                    "template <class T> struct TSoftObjectPtr;", "template <class T> struct TSoftClassPtr;",
+                    "template <class T> struct TScriptInterface;", "template <class E> struct TEnum;",
+                    "template <class Sig> struct TDelegate;", "template <class Sig> struct TMulticastInlineDelegate;")
+
+
+def to_name(ret):
+    """`To<Target>` for a Conv_ returning ret: ToString, ToSoftClassPtr, ToVector, ToObject, ToInt."""
+    t = re.sub(r"^const\s+|class\s+|[&*\s]+$", "", ret).split("<", 1)[0].strip()
+    return "To" + TO_NAMES.get(t, t[1:] if len(t) > 1 and t[0] in "FTUAE" and t[1].isupper() else t)
+
+
+def struct_methods(classes):
+    """type -> {method: (library class, its function, return type, the parameters after the value)}, keyed by the
+    struct, FString / FName / FText, or the soft pointer template. Run after write_events, which fills NOT_CALLABLE and
+    REAL_FUNCS."""
+    found = {}
+    for k in sorted(classes, key=lambda k: (k.path != "/Script/Engine", k.path, k.cpp)):
+        if k.is_bp or k.ue_name in CONTAINER_LIBS:
+            continue
+        for is_static, ret, fname, params in k.funcs:
+            real = REAL_FUNCS.get((k.stem, k.cpp, fname)) or (None if REAL_FUNCS else fname)
+            if not (is_static and params and real) or (k.ue_name, real) in NOT_CALLABLE or OP_FN.match(fname):
+                continue
+            s, rest = params[0][0], params[1:]
+            s = s if s in STRUCTS or s in CONV_STRUCTS else s.split("<", 1)[0]
+            if s not in STRUCTS and s not in TYPE_TAKEN:
+                continue
+            name = fname
+            if CONV.match(fname):
+                if rest or fname in CONV_SKIP or ret == "void":
+                    continue
+                name = to_name(ret)
+            if any(t in ("struct FLatentActionInfo", "FLatentActionInfo") or t.startswith("TMulticastSparseDelegate")
+                   or (t == "class UObject*" and n.startswith("WorldContext")) for t, n in rest):
+                continue
+            mine = found.setdefault(s, {})
+            taken = TYPE_TAKEN[s] if s in TYPE_TAKEN else set(n for _, n in STRUCTS[s].fields)
+            if name in taken or name == s or name in mine:
+                continue
+            refs = REF_PARMS.get((k.ue_name, real), ())
+            mine[name] = (k, fname, ret, [(const_ref(t) if n in refs else t, n) for t, n in rest])
+    return found
+
+
+def method_lines(methods, spell):
+    """The declarations of a type's methods (struct_methods), each under a comment naming where it comes from, and
+    their markers for hidden()."""
+    lines, marks = [], []
+    for name in sorted(methods):
+        k, fname, ret, rest = methods[name]
+        lines.append("    // %s::%s (%s.h)" % (k.cpp, fname, k.header))
+        lines.append("    %s %s(%s) const;" % (spell(ret), name, ", ".join("%s %s" % (spell(t), n) for t, n in rest)))
+        marks.append('static constexpr const char* %s__UeForward = "%s::%s";' % (name, k.cpp, fname))
+    return lines, marks
+
+
+def method_types(methods):
+    """Every type a struct's methods name, for the forward declarations their header needs."""
+    return [t for _, _, ret, rest in methods.values() for t in [ret] + [t for t, _ in rest]]
+
+
+def forward_decls(types, pkg=None):
+    """`struct F;` for each struct the types name, and `enum class E : uint8;` for each enum pkg does not define: a
+    method's types may come from a package that includes this one, or be a struct pkg defines further down (FVector's
+    MakeBox returns an FBox). pkg's own enums come before its structs."""
+    words = set(w for t in types for w in re.findall(r"[A-Za-z_]\w*", t))
+    return (["struct %s;" % w for w in sorted(words) if w in STRUCTS]
+            + ["enum class %s : %s;" % (w, ENUMS[w].underlying) for w in sorted(words) if w in ENUMS and ENUMS[w].pkg != pkg])
+
+
+def write_type_methods(methods, spell, out_dir):
+    """Methods.h, the forward declarations Types.h needs ahead of its value types, and Methods_<T>.inc, the methods
+    Types.h includes at the bottom of each (FString, FName, FText, TSoftObjectPtr, TSoftClassPtr)."""
+    types = []
+    for s in sorted(TYPE_TAKEN):
+        lines, marks = method_lines(methods.get(s, {}), spell)
+        types += method_types(methods.get(s, {}))
+        io.open(os.path.join(out_dir, "Methods_%s.inc" % s), "w", encoding="utf-8-sig", newline="\n").write(
+            "\n".join(["/* %s's methods, generated by AssetGen/tools/genueapi.py. Do not edit. Types.h includes this"
+                       " at the bottom of %s. */" % (s, s)] + lines + hidden(marks)) + "\n")
+    refs = sorted(set(c for t in types for c in class_refs(t)))
+    out = ["#pragma once",
+           "/* What the methods of Types.h's value types (Methods_<T>.inc) name, declared ahead of them.",
+           "   Generated by AssetGen/tools/genueapi.py. Do not edit. */"]
+    out += list(STRING_TEMPLATES) + ["class %s;" % c for c in refs] + forward_decls(types)
+    io.open(os.path.join(out_dir, "Methods.h"), "w", encoding="utf-8-sig", newline="\n").write("\n".join(out) + "\n")
+    print("  value-type methods: %d on %d types; %s" % (
+        sum(len(m) for m in methods.values()), sum(1 for m in methods.values() if m),
+        ", ".join("%s %d" % (s, len(methods.get(s, {}))) for s in sorted(TYPE_TAKEN))))
 
 
 # ---- subsystem getters ---------------------------------------------------------------------------------------
@@ -1131,6 +1259,7 @@ IMPURE_PURE = re.compile(r"Random|Now$|Today$|Create|Construct|Spawn|^New|^Make.
 PURE = set()     # (class, function) of every BlueprintPure function, filled by write_events
 NATIVE = set()   # (package leaf, class, function) of every FUNC_Native function, filled by write_events
 MARKS = {}       # (class, function) -> "UE_SERVER UE_RELIABLE " and the like, filled by write_events
+NOT_CALLABLE = set()   # (class, function) of every function neither BlueprintCallable nor a BlueprintEvent, filled by write_events
 MARK_OF = (("NetServer", "UE_SERVER"), ("NetClient", "UE_CLIENT"), ("NetMulticast", "UE_MULTICAST"),
            ("NetReliable", "UE_RELIABLE"), ("BlueprintAuthorityOnly", "UE_AUTHORITY_ONLY"), ("BlueprintCosmetic", "UE_COSMETIC"))
 
@@ -1162,6 +1291,7 @@ def write_events(sdk_dir, out_dir):
                 rows.append('  %s: %d' % (json.dumps("%s.%s.%s" % (pkg, cls, real)), sum(FUNC_BITS[n] for n in names)))
             elif "BlueprintCallable" not in names:
                 not_callable.append("%s.%s.%s" % (pkg, cls, real))
+                NOT_CALLABLE.add((cls, real))
     io.open(os.path.join(out_dir, "Events.json"), "w", encoding="utf-8", newline="\n").write("{\n" + ",\n".join(rows) + "\n}\n")
     io.open(os.path.join(out_dir, "NotCallable.json"), "w", encoding="utf-8", newline="\n").write(
         "[\n" + ",\n".join("  " + json.dumps(k) for k in sorted(set(not_callable))) + "\n]\n")
@@ -1558,6 +1688,12 @@ def main():
         TEnum<E>& (the conversion makes a temporary)."""
         return "TEnum<%s>" % ctype if ctype in ENUMS else ctype
 
+    def spell(ctype):
+        return rewrite(named(ctype))
+
+    methods = struct_methods(ordered)
+    write_type_methods(methods, spell, out_dir)
+
     def short_names(k):
         """A Blueprint class is named by its whole /Game path, which makes a signature unreadable. A class opens
         with `using Leaf = Game::...::Leaf;` for each one its members name, where the leaf is free: one target
@@ -1583,7 +1719,7 @@ def main():
     funcs, fields, aliased, renamed, not_ufunctions, const_refs, getters = 0, 0, 0, 0, [], 0, 0
     kinds = subsystem_kinds(by_name)
     for pkg, members in sorted(by_pkg.items()):
-        body, referenced, get_defs, forward_defs = [], set(), [], []
+        body, referenced, get_defs, forward_defs, typed = [], set(), [], [], []
         defined = set(k.cpp for k in members)
         ns_open = None
         for en in sorted((e for e in ENUMS.values() if e.pkg == pkg), key=lambda e: e.cpp):
@@ -1597,7 +1733,9 @@ def main():
             for d in struct_deps(st):
                 if STRUCTS[d].pkg == pkg:
                     place_struct(STRUCTS[d])
-            body.append(emit_struct(st, conv_structs) + "\n")
+            mine = methods.get(st.cpp, {})
+            typed.extend(method_types(mine))
+            body.append(emit_struct(st, conv_structs, mine, spell) + "\n")
 
         for st in sorted((t for t in STRUCTS.values() if t.pkg == pkg), key=lambda t: t.cpp):
             place_struct(st)
@@ -1623,15 +1761,16 @@ def main():
                         % (k.ue_name if k.is_bp else k.cpp, inherits, k.path, k.ue_name))
             short = short_names(k)
             body += ["    using %s = %s;" % (leaf, short[leaf]) for leaf in sorted(short)]
+            marks = []      # hidden() at the bottom
             if k.cpp in tails:
-                body.append('    static constexpr const char* UeClassTail = "%s";' % tails[k.cpp])
+                marks.append('static constexpr const char* UeClassTail = "%s";' % tails[k.cpp])
             if k.cpp in ifaces:
-                body.append('    static constexpr const char* UeNativeInterfaces = "%s";' % " ".join(ifaces[k.cpp]))
+                marks.append('static constexpr const char* UeNativeInterfaces = "%s";' % " ".join(ifaces[k.cpp]))
             if k.default_subobjects:
                 # Every default subobject this game Blueprint's CDO exports, "<class path> <name>" joined by ';' (a
                 # name can hold a space): a child is serialized after each.
-                body.append('    static constexpr const char* UeDefaultSubobjects = "%s";'
-                            % c_literal(";".join(k.default_subobjects)))
+                marks.append('static constexpr const char* UeDefaultSubobjects = "%s";'
+                             % c_literal(";".join(k.default_subobjects)))
             names = set(f for _, _, f, _ in k.funcs)
             for ftype, fname in k.fields:
                 if fname in names:
@@ -1639,23 +1778,23 @@ def main():
                 body.append("    %s %s;" % (rewrite(named(ftype), short, k), fname))
                 real = real_field(k, fname)
                 if real:
-                    body.append('    static constexpr const char* %s__UeName = "%s";' % (fname, c_literal(real)))
+                    marks.append('static constexpr const char* %s__UeName = "%s";' % (fname, c_literal(real)))
                     renamed += 1
                 if fname in k.scs_nodes:
                     # The key a child Blueprint overrides this component's template by (FComponentKey::AssociatedGuid).
-                    body.append('    static constexpr const char* %s__UeScsNode = "%s";' % (fname, k.scs_nodes[fname]))
+                    marks.append('static constexpr const char* %s__UeScsNode = "%s";' % (fname, k.scs_nodes[fname]))
                 if fname in k.replicated:
                     # What UE_REPLICATED_USING declares for a mod class: AssetGen wakes the actor before a set and
                     # calls the RepNotify function after it, as the editor's Set node does.
-                    body.append('    static constexpr const char* %s__Replicated = "%s:";' % (fname, k.replicated[fname]))
+                    marks.append('static constexpr const char* %s__Replicated = "%s:";' % (fname, k.replicated[fname]))
                 if fname in k.dispatchers:
                     # Which of the editor's dispatcher nodes take it: AssetGen refuses the others, as the editor does.
-                    body.append('    static constexpr const char* %s__UeDispatcher = "%s";' % (fname, k.dispatchers[fname]))
+                    marks.append('static constexpr const char* %s__UeDispatcher = "%s";' % (fname, k.dispatchers[fname]))
                 fields += 1
                 referenced.update(class_refs(ftype))
             for fname in sorted(k.subobjects):
                 # Which default subobject the member is, per class: a subclass can give it another class.
-                body.append('    static constexpr const char* %s__UeSubobject = "%s";' % (fname, k.subobjects[fname]))
+                marks.append('static constexpr const char* %s__UeSubobject = "%s";' % (fname, k.subobjects[fname]))
             for is_static, ret, fname, params in k.funcs:
                 if is_container_method(k, fname):
                     continue
@@ -1698,7 +1837,7 @@ def main():
                                                            rewrite(named(vret), short, k), fname, args,
                                                            " const" if fname in k.const_funcs else ""))
                 if real_fn != fname:
-                    body.append('    static constexpr const char* %s__UeName = "%s";' % (fname, c_literal(real_fn)))
+                    marks.append('static constexpr const char* %s__UeName = "%s";' % (fname, c_literal(real_fn)))
                     renamed += 1
                 funcs += 1
                 for t in [ret] + [t for t, _ in params]:
@@ -1708,18 +1847,22 @@ def main():
                 body.append("       a free inline function - with this object as the first argument. Any object, not only this. */")
                 for ret, name, target in UOBJECT_FORWARDS:
                     body.append("    %s %s();" % (ret, name))
-                    body.append('    static constexpr const char* %s__UeForward = "%s";' % (name, target))
+                    marks.append('static constexpr const char* %s__UeForward = "%s";' % (name, target))
             for ret, name, params, target in CLASS_FORWARDS.get(k.cpp, ()):
                 body.append("    %s %s(%s);" % (ret, name, params))
-                body.append('    static constexpr const char* %s__UeForward = "%s";' % (name, target))
-                forward_defs += FORWARD_DEFS[target]
+                marks.append('static constexpr const char* %s__UeForward = "%s";' % (name, target))
+                if target not in FORWARD_HOME:
+                    forward_defs += FORWARD_DEFS.get(target, [])
             decls, defs = subsystem_get(k, by_name, kinds, rewrite)
             body += decls
             get_defs += defs
             getters += bool(decls)
+            body += hidden(marks)
             body.append("};\n")
         if ns_open:
             body.append(ns_end(ns_open) + "\n")
+        forward_defs += [line for target in sorted(FORWARD_HOME) if FORWARD_HOME[target] == pkg
+                         for line in FORWARD_DEFS[target]]
         if get_defs:
             body += ["/* Each subsystem's Get: the USubsystemBlueprintLibrary getter for its kind, as the editor's Get node. */"]
             body += get_defs + [""]
@@ -1746,6 +1889,9 @@ def main():
                "#include \"%s.h\"" % beside(pkg, "UeMeta")]
         out += ["#include \"%s.h\"" % beside(pkg, d) for d in sorted(deps[pkg])]
         out += [""]
+        referenced.update(c for t in typed for c in class_refs(t))
+        if forward_decls(typed, pkg):
+            out += forward_decls(typed, pkg) + [""]
         fwd = {}
         for c in sorted(referenced - defined):
             target = by_name.get(c)

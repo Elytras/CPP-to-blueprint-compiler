@@ -1398,7 +1398,8 @@ static constexpr const char* Name_0__UeName = "Name";
 ```
 
 Parameter names keep the C++ spelling, which only an editor stub's pin names would show. The headers carry a few other
-markers of this kind, all written by the generator and read by the compiler. You never write them:
+markers of this kind, all written by the generator and read by the compiler. You never write them, and IntelliSense
+never lists them: each class keeps its markers in a private `struct UeMarkers` at its bottom.
 
 | Marker | What it records |
 | --- | --- |
@@ -1407,7 +1408,7 @@ markers of this kind, all written by the generator and read by the compiler. You
 | `<Member>__UeSubobject` | The default subobject that a native component member points at, which a mod class overrides by that name. Where two of the class's subobjects fit the member's type and neither has its name, the one the game's Blueprints name on their default objects. |
 | `UeDefaultSubobjects` | Every default subobject a game Blueprint's default object exports, and every object nested in one (`Damage:BreakIceBonus_0`), which a child class is loaded after. |
 | `<Member>__Replicated` | That a property replicates, and its RepNotify function. |
-| `<Function>__UeForward` | What `GetOuter`, `GetClass` and `GetName` really call. |
+| `<Function>__UeForward` | What `GetOuter`, `GetClass`, `GetName`, `IsA`, `IsChildOf` and the methods of structs, text and soft pointers really call. |
 
 ### UeAssets/
 
