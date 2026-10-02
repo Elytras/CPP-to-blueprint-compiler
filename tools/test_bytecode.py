@@ -7020,6 +7020,23 @@ pending('DispatchOtherFire: Broadcast on a sibling mod class\'s and a game Bluep
         dispatch_other_fire)
 pending('DelegateOtherBind: a delegate binds a function of an object other than this', delegate_other_bind)
 pending('DispatchNativeCallable: Broadcast on a BlueprintCallable native dispatcher', dispatch_native_callable)
+
+
+def delegate_native_method():
+    """DelegateNativeMethod binds AActor::SetActorTickInterval, a native function, on this object: the class still
+    derives /Script/Engine.Actor (a member pointer does not turn AActor's forward declaration into the class), and the
+    binding names the function on this actor."""
+    base = pending_asset('DelegateNativeMethod')
+    keeps_invariants(base)
+    pkg = invariants.Package(base)
+    ci = next(i for i, st in invariants.classes(pkg))
+    assert pkg.path(pkg.struct(ci).super) == '/Script/Engine.Actor', pkg.path(pkg.struct(ci).super)
+    vm = VM(base, {})
+    vm.call('Hook')
+    assert vm.binds == [(vm.self, 'OnTick', 'SetActorTickInterval', vm.self)], vm.binds
+
+
+pending('DelegateNativeMethod: a member pointer to a native class\'s function keeps the class native', delegate_native_method)
 # A bound name the object's class does not have: the broadcast or the timer skips it (ScriptDelegates.h 38-49,
 # 479-502). The editor binds only a BlueprintCallable function, never a pure or latent one (K2Node_CreateDelegate.cpp
 # 156-164 -> EdGraphSchema_K2.cpp 929-985): AActor::ReceiveTick is a BlueprintEvent only.
