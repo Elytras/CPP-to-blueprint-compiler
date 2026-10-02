@@ -679,15 +679,15 @@ def asset(mod):
     return os.path.join(ROOT, mod, 'FSD', 'Content', '_ElytrasMods', mod, mod)
 
 
-def refused(mod, body, why, top='', base='AActor'):
-    """A mod (the class body given, `top` before the class, which derives from `base`) the compiler must refuse, saying
-    why."""
+def refused(mod, body, why, top='', base='AActor', after=''):
+    """A mod (the class body given, `top` before the class, which derives from `base`, `after` after it) the compiler
+    must refuse, saying why."""
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
         src = os.path.join(tmp, mod + '.cpp')
         with open(src, 'w', encoding='utf-8') as f:
             f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/%s");\n%s'
-                    'class %s : public %s {\npublic:\n%s};\n' % (mod, top, mod, base, body))
+                    'class %s : public %s {\npublic:\n%s};\n%s' % (mod, top, mod, base, body, after))
         proc = assetgen_compile([src, UEAPI, tmp])
         assert proc.returncode != 0 and why in proc.stdout, (mod, proc.stdout)
 
@@ -8906,6 +8906,41 @@ def defaults_own_nest():
 defaults_own_nest()
 print('ok  DefaultsOwnNest: braces in a value that starts as a struct\'s default instance leave out what its initializer '
       'leaves out, and are refused at what it gives')
+
+
+def asset_over_cdo():
+    """A mod's own asset is made with its class's CDO as its archetype (FObjectInitializer::InitProperties copies it in,
+    UObjectGlobals.cpp 2999), and a struct tag overwrites only the members it lists, so the asset's braces lie over the
+    CDO's values. AS_AocKeep: where the CDO's struct member is as its declaration makes it (H = {.N = 2} leaves Hit its
+    initializer's, F is fresh), a member the new braces leave out holds the same value in both, untagged; N and K are
+    written as 0 over the CDO's 2 and 4. Where the class's braces or a UE_DEFAULTS give the member a value C++'s new
+    braces would not (FaceIndex 3), leaving it untagged would load 3: refused, naming it. fix/r5-leftovers (7159b82b)
+    compiled AssetOverInit with FaceIndex untagged, and AssetOverNoInit, AssetOverEngine and AssetOverDefaults compiled
+    so on main too: the asset's braces were lowered as a value that starts fresh."""
+    here = os.path.dirname(pending_asset('AssetOverCdo', 'UAocDef'))
+    base = os.path.join(here, 'AS_AocKeep')
+    keeps_invariants(base)
+    pkg = invariants.Package(base)
+    obj = pkg.find('AS_AocKeep')
+    got = tag_values(pkg, obj, pkg.tags(obj))
+    want = {'H': {'Hit': {'Time': 1.0, 'Distance': 5.0}, 'N': 0}, 'F': {'Hit': {'Distance': 3.0}, 'N': 0}, 'K': 0}
+    assert got == want, 'AS_AocKeep is written %r; C++ over the CDO loads %r' % (got, want)
+    face = "H.Hit.FaceIndex, left out of the braces, holds what the engine's FHitResult constructor sets"
+    over = '{.H = {.Hit = {.Time = 1.0f, .Distance = 5.0f}}};\n'
+    for mod, hit in (('AssetOverInit', 'FHitResult Hit = {.Time = 0.5f};'), ('AssetOverNoInit', 'FHitResult Hit;')):
+        refused(mod, '  F%sHeld H = {.Hit = {.FaceIndex = 3, .Time = 2.0f}};\n' % mod, face,
+                'struct F%sHeld {\n  UE_STRUCT;\n  %s\n  int32 N = 0;\n};\n' % (mod, hit), 'UPrimaryDataAsset',
+                '%s AS_%s = %s' % (mod, mod, over))
+    refused('AssetOverEngine', '  FHitResult E = {.FaceIndex = 3};\n',
+            "E.FaceIndex, left out of the braces, holds what the engine's FHitResult constructor sets", '',
+            'UPrimaryDataAsset', 'AssetOverEngine AS_AssetOverEngine = {.E = {.Distance = 2.0f}};\n')
+    refused('AssetOverDefaults', '  UE_DEFAULTS {\n    H = {.Hit = {.FaceIndex = 3}};\n  }\n', face,
+            'struct FAodHeld {\n  UE_STRUCT;\n  FHitResult Hit;\n  int32 N = 0;\n};\n'
+            'class AodParent : public UPrimaryDataAsset {\npublic:\n  FAodHeld H;\n};\n', 'AodParent',
+            'AssetOverDefaults AS_AssetOverDefaults = {{.H = {.Hit = {.Distance = 5.0f}}}};\n')
+
+
+pending('AssetOverCdo: a mod\'s own asset\'s braces lie over its class\'s CDO, not a fresh value', asset_over_cdo)
 
 
 def uds_init_defaults():
