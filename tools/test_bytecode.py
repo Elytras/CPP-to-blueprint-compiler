@@ -1209,6 +1209,76 @@ print('ok  CommaOperand, CommaDouble: a comma refused in an operator\'s referenc
       'whose temporary no variable could hold is refused for what the user wrote')
 
 
+def assign_value():
+    """AssignValue: a struct's or an FString's `=` (operator=) read by value in a loop condition, right of &&, in an
+    arm of ?:, or in an argument of a call on another object. The C++ results: the assignment's value is T itself
+    ([expr.ass]), copied into the by-value parameter right after it; a loop condition is evaluated before each trip
+    ([stmt.while]); && and ?: evaluate only what the left side / condition picks ([expr.log.and], [expr.cond]); a
+    call's object is sequenced before its arguments ([expr.call] 8), and P is this."""
+    base = pending_asset('AssignValue')
+    keeps_invariants(base)
+
+    def loop(m):                                    # `while (UsePairV(T = S) < 100) { S.A += 3; K += 1; }`
+        sa, k = m, 0
+        while True:
+            if not sa * 10 + 2 < 100: return k * 1000 + sa
+            sa += 3; k += 1
+    for m in (0, 1, 7):
+        cases = (('While', loop(m)), ('And', ((1000 if m * 10 + 2 > 50 else 0) + m) if m > 0 else 0),
+                 ('Cond', (m * 10 + 2) * 100 + m if m > 0 else 500), ('Other', (m * 10 + 2) * 100 + m),
+                 ('StrWhile', (4 if m > 2 else 0) * 10 + 2))
+        for fn, want in cases:
+            if fn != 'Other':                       # runscript runs no call on another object
+                got = run(base, fn, {'S': {}, 'T': {}, 'Str': ''}, M=m)[0]
+                assert got == want, 'AssignValue.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+            vm = VM(base, S={}, T={}, Str='')
+            vm.ref_params = True
+            got = vm.call(fn, M=m)
+            assert got == want, 'runvm: AssignValue.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+
+
+pending('AssignValue: a struct\'s or an FString\'s = read by value in a loop condition, right of &&, in ?: or in a call '
+        'on another object is a copy of what it assigned', assign_value)
+# A member taken of a struct `=` in a loop condition uses its place, which no statement before the loop can hold.
+pending('AssignMemberPlace', lambda: refused(
+    'AssignMemberPlace', '  FCbPair S;\n  FCbPair T;\n'
+    '  int32 F(int32 M) { S.A = M; int32 K = 0; while ((T = S).A < 9) { S.A += 3; K += 1; } return K; }\n',
+    'an assignment used as a value used as a place, not a value', COMMA_TOP))
+
+
+def comma_targets():
+    """CommaTargets: the comma operator assigned to or updated, in a loop condition, right of &&, and as a statement
+    whose right side is a call. The C++ results: the comma is its right side, the lvalue N ([expr.comma]), so each
+    trip runs Bump, then the update on N; a loop condition is evaluated before each trip ([stmt.while]); && evaluates
+    its right side only when the left is true ([expr.log.and]); an assignment's right side is sequenced before its
+    left ([expr.ass]/1, C++17), so G() reads Count before Bump moves it."""
+    base = pending_asset('CommaTargets')
+    keeps_invariants(base)
+
+    def loop(m, post=False, by_g=False, limit=5):   # Count bumps once per trip; N moves by 1 (or by G(), Count before it)
+        c, n = 0, m
+        while True:
+            g = c; c += 1
+            v = n
+            n += g if by_g else 1
+            if not (v if post else n) < limit: return n * 100 + c
+    for m in (0, 3, 7):
+        cases = (('Compound', loop(m)), ('Pre', loop(m)), ('Post', loop(m, post=True)), ('Assign', loop(m)),
+                 ('CompoundCall', loop(m, by_g=True, limit=9)),
+                 ('AndRight', ((1000 if m + 1 > 2 else 0) + (m + 1) * 10 + 1) if m > 0 else m * 10),
+                 ('StmtAssign', m * 100 + m + 1), ('StmtCompound', (1 + m) * 100 + m + 1))
+        for fn, want in cases:
+            got = run(base, fn, {'Count': 0, 'N': 0}, M=m)[0]
+            assert got == want, 'CommaTargets.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+            vm = VM(base, Count=0, N=0)
+            got = vm.call(fn, M=m)
+            assert got == want, 'runvm: CommaTargets.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+
+
+pending('CommaTargets: a comma assigned to or updated in a loop condition, right of &&, or before a call on its right '
+        'runs its left side, then the update on its right side', comma_targets)
+
+
 def comma_ctor_default():
     """CommaCtorDefault: a comma among a parenthesised constructor's arguments runs as among a call's (Get before it or
     after it, Y is M); a comma beside nothing but a constant default argument needs no temporary, and its element
