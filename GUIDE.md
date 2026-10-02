@@ -1170,6 +1170,8 @@ python tools/bpbuild.py <mods dir> <UeApi dir> <assetgen> [--force] [--no-pak]
 
 With fewer than three arguments, bpbuild prints its usage line and stops.
 
+The environment variable `BPBUILD_JOBS` sets how many compiles run at once. The default is half the logical CPUs.
+
 #### mods.yaml
 
 ```yaml
@@ -1196,7 +1198,7 @@ Keys of a mod:
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `name` | required | Names the build folder `build/<name>/` and the pak `out/<name>_P.pak`. Other mods refer to the mod by this name in `needs`. |
-| `sources` | required | The mod's `.cpp` files, relative to the mods dir; globs work (`MyMod/*.cpp`, expanded in name order). The `.cpp` files compile into the mod's package folder as **one** translation unit: with more than one, bpbuild writes `build/<name>/<name>.unity.cpp`, which `#include`s each in order, and compiles that. So a mod can keep a header and a `.cpp` per class (`sources: [MyMod/*.cpp]`), `UE_MOD_PACKAGE` is written once in any one of them, and file-local names (`static` functions, anonymous namespaces) must not clash across the files. The headers they `#include "..."`, transitively, count for staleness on their own, except `UeApi/` and `UeAssets/` (the UeApi dir counts as a whole); a header listed here also only counts for staleness. One of the `.cpp` files must hold the mod's `UE_MOD_PACKAGE` line: bpbuild finds the first with a text search and stops the whole build with `<files> declares no UE_MOD_PACKAGE` otherwise. With `embed`, the same check runs on each dependency. A mod with no `.cpp`, or with a listed source that does not exist, prints `SKIP - no such source` and counts as failed. |
+| `sources` | required | The mod's `.cpp` files, relative to the mods dir; globs work (`MyMod/*.cpp`, expanded in name order). The `.cpp` files compile into the mod's package folder as **one** translation unit: with more than one, bpbuild writes `build/<name>/<name>.unity.cpp`, which `#include`s each in order, and compiles that. So a mod can keep a header and a `.cpp` per class (`sources: [MyMod/*.cpp]`), `UE_MOD_PACKAGE` is written once in any one of them, and file-local names (`static` functions, anonymous namespaces) must not clash across the files. The headers they `#include "..."`, transitively, count for staleness on their own, except `UeApi/` and `UeAssets/` (the UeApi dir and the `UeAssets` dir beside it count as a whole, subfolders included); a header listed here also only counts for staleness. One of the `.cpp` files must hold the mod's `UE_MOD_PACKAGE` line: bpbuild finds the first with a text search and stops the whole build with `<files> declares no UE_MOD_PACKAGE` otherwise. With `embed`, the same check runs on each dependency. A mod with no `.cpp`, or with a listed source that does not exist, prints `SKIP - no such source` and counts as failed. |
 | `needs` | none | Mods to build before this one. An unknown name stops the build with ``mods.yaml: `needs` names an unknown mod: <name>``. A cycle is not an error: bpbuild breaks it, and since every mod compiles before any mod packs, both sides still see each other's assets. |
 | `embed` | `false` | Also packs every mod reachable through `needs`, directly or not, into this mod's pak, and merges their registries into its registry. The pak then works on its own. |
 | `generate_api` | `false` | Also writes the editor stubs for this mod's classes, structs and enums (see [Editor API stubs](#editor-api-stubs)). |
@@ -1224,8 +1226,9 @@ api_dir:
 1. **Compile.** Mods are taken in `mods.yaml` order, except that the mods a mod `needs` go first. For each mod that is
    out of date (see below), bpbuild deletes `build/<name>/FSD/Content` and `build/<name>/FSD/AssetRegistry.bin`, then
    runs `assetgen compile <source> <UeApi dir> build/<name>/FSD/Content/<package path>` for each `.cpp`, adding
-   `--api <first api dir>/<package path>` when `generate_api` is set. A failed compile prints `<name> FAILED`, skips the
-   mod's remaining sources and moves on to the next mod.
+   `--api <first api dir>/<package path>` when `generate_api` is set. No compile reads another mod's output, so up to
+   `BPBUILD_JOBS` of them run at once. Each mod's output is still printed whole, in this order. A failed compile prints
+   `<name> FAILED`, and the build moves on.
 2. **Pack.** Every mod's assets exist by now, so an `embed` mod can copy in its dependencies' assets. Each mod whose pak
    is out of date is packed with UnrealPak.
 3. **Check imports between mods.** If nothing failed, bpbuild reads the import table of every `.uasset` in each mod's
@@ -1253,7 +1256,7 @@ The last line counts the mods built, packed, up to date and failed. The exit sta
 
 | bpbuild... | when |
 | --- | --- |
-| recompiles the mod | `--force` is given; the mod's package folder holds no staged asset yet; `generate_api` is set and a stub folder holds no `.uasset`/`.uexp`; or one of the `sources` or the local headers they include, the files directly in the UeApi dir, or the `assetgen` binary is newer than the **oldest** staged asset. |
+| recompiles the mod | `--force` is given; the mod's package folder holds no staged asset yet; `generate_api` is set and a stub folder holds no `.uasset`/`.uexp`; the mod's entry in `mods.yaml`, or the top-level `api_dir` or `game_content`, differs from the last successful compile (kept in `build/<name>/mod.json`), so turning on `embed` repacks; or one of the `sources` or the local headers they include, any file in the UeApi dir or the `UeAssets` dir beside it, or the `assetgen` binary is newer than the **oldest** staged asset. |
 | repacks without recompiling | the newest staged asset of the mod, or of a dependency it embeds, is newer than the mod's pak (not with `--no-pak`). This picks up a dependency that changed, or a pak that an earlier `--no-pak` run skipped. |
 | prints `up to date` | neither applies. |
 

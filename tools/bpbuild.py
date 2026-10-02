@@ -2,12 +2,14 @@
 """usage: bpbuild.py <mods dir (holds mods.yaml) or a parent with BpMods/> <UeApi dir> <assetgen executable> [--force] [--no-pak]"""
 import glob
 import io
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 import yaml
 
@@ -29,6 +31,27 @@ def newest(paths):
 def oldest(paths):
     times = [os.path.getmtime(p) for p in paths if os.path.exists(p)]
     return min(times) if times else 0
+
+
+def tree_files(root):
+    """Every file under root, subfolders included (UeApi/Game/ holds the dumped Blueprint classes)."""
+    return [os.path.join(d, f) for d, _dirs, files in os.walk(root) for f in files]
+
+
+# A compile is one busy core, like the suite's WORKERS; BPBUILD_JOBS overrides it.
+JOBS = int(os.environ.get("BPBUILD_JOBS") or max(1, (os.cpu_count() or 2) // 2))
+
+
+def mod_settings(mod, config):
+    """What mods.yaml says about a mod, as the text its build stamp holds: its own entry (sources, needs,
+    embed, generate_api, api_dir) and the top-level keys a compile reads. A change to any of them restales
+    the mod - turning `embed` on must repack, though no source changed."""
+    return json.dumps({"mod": mod, "api_dir": config.get("api_dir"), "game_content": config.get("game_content")},
+                      sort_keys=True, default=str)
+
+
+def read_text(path):
+    return io.open(path, encoding="utf-8").read() if os.path.exists(path) else None
 
 
 def mod_package(sources):
@@ -221,6 +244,12 @@ def staged_edits(stage_fsd, stage_content, game_dir):
     return out
 
 
+def run_compile(cmd):
+    """One assetgen compile, on a pool thread. Its output is captured, for the caller to print in build order."""
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
+    return proc.returncode == 0, proc.stdout
+
+
 def run_unrealpak(fsd_dir, pak_path):
     if not os.path.exists(UNREALPAK):
         print("  UnrealPak not found at %s - skipping the pak." % UNREALPAK)
@@ -353,17 +382,21 @@ def main():
     game = config.get("game_content")
     game_dir = os.path.abspath(os.path.join(bp, os.path.expandvars(game))) if game else None
 
-    api_headers = [os.path.join(ue_api, f) for f in os.listdir(ue_api)] if os.path.isdir(ue_api) else []
-    toolchain_time = max(newest(api_headers), newest([assetgen]))
+    # The dumped headers mod_sources does not walk: UeApi and its sibling UeAssets, each with its subfolders.
+    ue_assets = os.path.join(os.path.dirname(ue_api), "UeAssets")
+    toolchain_time = max(newest(tree_files(ue_api)), newest(tree_files(ue_assets)), newest([assetgen]))
 
     by_name = dict((m["name"], m) for m in mods)
 
     built, packed, skipped, failed = [], [], [], []
     staged = []
     records = []
+    entries = []
     # Phase 1 - compile every mod. `embed` bakes a dep's cooked assets into the dependent's pak, so
     # all assets must exist before any pak; with mutual embed no build order puts both deps first,
-    # so compiling is a pass of its own, separate from packing (phase 2).
+    # so compiling is a pass of its own, separate from packing (phase 2). No compile reads another
+    # mod's output, so they run side by side.
+    pool = ThreadPoolExecutor(JOBS)
     for mod in order(mods):
         name = mod["name"]
         sources = mod_sources(mod, bp)
@@ -392,9 +425,14 @@ def main():
         # after a game update), or an edit of the old package would ship over the new one.
         edits = staged_edits(stage_fsd, stage_content, game_dir)
         outputs = assets + [s for s, _g in edits]
+        # The stamp sits beside FSD, not in it: the pak takes the whole FSD tree.
+        settings = mod_settings(mod, config)
+        settings_file = os.path.join(bp, "build", name, "mod.json")
         stale = (force or not outputs or api_missing
+                 or read_text(settings_file) != settings
                  or max(newest(sources), toolchain_time) > oldest(outputs)
                  or any(os.path.getmtime(g) > os.path.getmtime(s) for s, g in edits))
+        job = None
         if stale:
             # The pak takes the whole FSD tree, so the whole Content tree goes, not just this package's folder:
             # an asset the sources no longer cook (a struct another mod now owns), a folder left by an earlier
@@ -430,16 +468,26 @@ def main():
                 cmd += ["--api", api_content]
             if game_dir:
                 cmd += ["--game", game_dir]
-            ok = subprocess.run(cmd).returncode == 0
+            job = pool.submit(run_compile, cmd)
+        entries.append((mod, name, package, stage_fsd, stage_content, stale, job, api_contents, settings_file, settings))
+
+    # The compiles run on the pool while the rest of the mods are prepared; their results are taken in
+    # build order, so each mod's output prints whole and the log reads as it did when they ran one by one.
+    for mod, name, package, stage_fsd, stage_content, stale, job, api_contents, settings_file, settings in entries:
+        if job:
+            ok, out = job.result()
+            sys.stdout.write(out)
             if not ok:
                 print("%-16s FAILED" % name)
                 failed.append(name)
                 continue
             for api_dir in api_contents:
-                if api_dir != api_content:
-                    for f in staged_assets(api_content):
+                if api_dir != api_contents[0]:
+                    for f in staged_assets(api_contents[0]):
                         shutil.copy2(f, os.path.join(api_dir, os.path.basename(f)))
                 write_api_manifest(api_dir)
+            # Stamped only once it compiled, so a failed compile stays stale.
+            io.open(settings_file, "w", encoding="utf-8", newline="\n").write(settings)
             print("%-16s compiled -> %s" % (name, package))
             built.append(name)
 
@@ -450,6 +498,7 @@ def main():
             print("%-16s api      -> %s" % (name, shown))
 
         records.append((mod, name, package, stage_fsd, stage_content, stale))
+    pool.shutdown()
 
     # Phase 2 - pack. Every mod's assets now exist, so an `embed` mod can bake in its deps.
     for mod, name, package, stage_fsd, stage_content, stale in records:
