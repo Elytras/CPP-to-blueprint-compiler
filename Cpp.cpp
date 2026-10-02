@@ -11831,8 +11831,16 @@ bool FCompiler::LowerParams(const Json& M, const std::string& Fn, FBlueprintClas
     bool bOk = true;
     /* A parameter the source leaves unnamed is named P<its index>, `_` added while another has that name, as the
        editor names every pin and SynthesizeForwarders names the override's: an empty name is None once loaded, and
-       two such parameters would share it. No body reads it, and callers fill parameters by order. */
-    const std::vector<std::string> Given = ParmNames(M);
+       two such parameters would share it. No body reads it, and callers fill parameters by order. A local of the body
+       may be named P0 too, which C++ allows beside an unnamed parameter; the frame holds both by name, and the engine
+       finds a property by its name, first match (FFieldPath::TryToResolvePath), so the local's name is taken as well. */
+    std::vector<std::string> Given = ParmNames(M);
+    Given.push_back("ReturnValue");
+    std::function<void(const Json&)> Locals = [&](const Json& N) {
+        if (Kind(N) == "VarDecl") Given.push_back(Name(N));
+        ForEach(N, Locals);
+    };
+    Locals(M);
     size_t Index = 0;
     ForEach(M, [&](const Json& C) {
         if (Kind(C) != "ParmVarDecl" || !bOk) return;
@@ -14621,9 +14629,11 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
            whose name a mod ancestor's function has too, that one's own or the stub of another interface's it leaves
            out: that one is its super (FindEvent), so it replaces both, and a caller of either lays out that one's
            parameters. The editor refuses it: "Cannot override ... declared in a parent with a different signature"
-           (KismetCompiler.cpp 1993-2011). */
+           (KismetCompiler.cpp 1993-2011). Another mod's class, from the header it shares, is such an ancestor too: its
+           declarations give the signature, as for the static rule above. */
         if (Replaced && Owner && Owner->bIsInterface && !R.bIsPatch)
-            if (const auto [A, bStatic] = FoundAbove(R, Fn.Name); A && A != Owner && !A->IsNative() && !bStatic)
+            if (const auto [A, bStatic] = FoundAbove(R, Fn.Name);
+                A && A != Owner && A->UePackage.compare(0, 8, "/Script/") != 0 && !bStatic)
             {
                 const FRecord* AboveIface = A->Methods.count(Fn.Name) ? nullptr : ModInterfaceWith(*A, Fn.Name);
                 const Json* AboveDecl = AboveIface ? AboveIface->Methods.at(Fn.Name)

@@ -5371,7 +5371,8 @@ def iface_over_stub_sig():
     parent function of any function of its name below (ParentClass->FindFunctionByName, KismetCompiler.cpp 1733-1734).
     The editor refuses an override whose parent has another signature ("Cannot override ... declared in a parent with a
     different signature", 1993-2011): an implementation of another interface's function of that name, the class's own
-    or the stub of one it leaves out, is refused in the interfaces' terms."""
+    or the stub of one it leaves out, is refused in the interfaces' terms. So is one over another mod's class, whose
+    shared header gives its functions' signatures."""
     two = ('class ISsA {\npublic:\n  UE_INTERFACE;\n  float Tell(float V);\n};\n'
            'class ISsB {\npublic:\n  UE_INTERFACE;\n  int32 Tell(int32 V);\n};\n'
            'class SsRoot : public AActor, public ISsA {\npublic:\n  int32 Other() { return 0; }\n};\n')
@@ -5381,6 +5382,16 @@ def iface_over_stub_sig():
     refused('IfaceStubSigStub', '', 'SsKid implements ISsB, whose Tell is int32 (int32), and replaces the Tell of ISsA, '
             'float (float), that SsRoot implements',
             top=two + 'class SsKid : public SsRoot, public ISsB {\npublic:\n  int32 Other2() { return 1; }\n};\n')
+    # Another mod's class, from the header it shares, is such an ancestor too: its own method of another signature.
+    other = ('class IXiB {\npublic:\n  UE_INTERFACE;\n  int32 Tell(int32 V);\n};\n'
+             'class XiBase : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/XiOwner/XiBase", "XiBase_C");\n'
+             '  float Tell(float V);\n};\n')
+    refused('IfaceForeignSigOwn', '', 'XmKid::Tell implements IXiB::Tell, int32 (int32), and replaces the XiBase::Tell it '
+            'inherits, float (float)',
+            top=other + 'class XmKid : public XiBase, public IXiB {\npublic:\n  int32 Tell(int32 V) { return V * 2; }\n};\n')
+    refused('IfaceForeignSigStub', '', 'XmKid implements IXiB, whose Tell is int32 (int32), and replaces the XiBase::Tell '
+            'it inherits, float (float)',
+            top=other + 'class XmKid : public XiBase, public IXiB {\npublic:\n  int32 Other() { return 1; }\n};\n')
 
 
 iface_over_stub_sig()
@@ -5391,12 +5402,17 @@ print('ok  FuncIfaceUnnamed: an implementation over an ancestor\'s interface stu
 def parm_unnamed():
     """ParmUnnamed: a parameter the source leaves unnamed is cooked under the name the editor's pin and AssetGen's
     override give it, P<index> (`_` added while another parameter has that name), not as an empty name, None once
-    loaded, which two of them in one function would share. The calls still pass each argument in its place."""
+    loaded, which two of them in one function would share. The calls still pass each argument in its place. A local
+    of the body named P0 takes that name first: two properties of one name in a frame resolve to the first
+    (FFieldPath::TryToResolvePath), so Fill's local would write the caller's X through the out parameter."""
     base = asset('ParmUnnamed')
     keeps_invariants(base)
     assert runscript.params_of(base, 'Pick') == ['P0', 'B'], runscript.params_of(base, 'Pick')
     assert runscript.params_of(base, 'Both') == ['P0', 'P1'], runscript.params_of(base, 'Both')
     assert run_as([base], 'Use', {}) == 64
+    assert runscript.params_of(base, 'Fill') == ['P0_', 'B'], runscript.params_of(base, 'Fill')
+    got = run_as([base], 'Kept', {'Store': 0})
+    assert got == 706, "Kept() = %r: Fill's local P0 must not reach the caller's X (C++ gives 706)" % got
     root = os.path.join(os.path.dirname(asset('FuncIfaceUnnamed')), 'FiuRoot')
     assert runscript.params_of(root, 'Tell') == ['P0_', 'P0'], runscript.params_of(root, 'Tell')
 
