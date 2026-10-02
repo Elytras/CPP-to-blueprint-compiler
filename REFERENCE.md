@@ -1488,7 +1488,7 @@ Notes:
 | `IncRef(1, B += 1)`, `Peek(SetB(), ++B)`, where the parameter is `int32&` or `const int32&` | Passed to a reference parameter, a compound assignment or a prefix `++` / `--` is the variable itself, as a plain `=` is: the update runs first, as a statement, and the callee reads, and for `T&` writes, B after every argument. Its left side must be a plain variable (`IncRef(1, L[Idx()] += 1)` is refused). The same holds in a loop condition (`while (IncRef(0, B += 1) < 20)`), on the right of `&&` / `\|\|` or in `?:`, and in a call on another object (`P->IncRef(1, B += 1)`). There the call runs as one block each time C++ runs it: the object first, then the update, then the call on B. Behind something its statement runs first, `{G(), IncRef(0, B += 1)}`, it is refused, since the update would run before G. | Yes |
 | `X++`, `++X`, `X--`, `--X` | The Increment Int and Decrement Int macros, with X located once. Postfix gives the value before the store, prefix the value after. Works on int32, int64, float and uint8 (a uint8 wraps at 255). On a raw pointer it steps by the element size; see [Pointers and memory](#pointers-and-memory). | Yes |
 | `A = B = 0;`, `S1 = S2 = Name;`, `if ((X = Next()) > 3)`, `return A = N;` | A plain `=` used as a value: the assignment runs first, as a statement, and the value is the variable it wrote, read after it. Numbers, strings and structs alike. It works wherever the comma operator does, and like it, passed to a reference parameter (`const T&` included) it is that variable itself, with no copy. In a loop condition (`while ((V = Next()) > 0)`, `while (UsePair(T = S) < 100)` with a struct passed by value), on the right of `&&` / `\|\|` / `?:` or in an argument of a call on another object it runs in place, as the comma does there; a member taken of it in those places, `while ((T = S).X < 9)`, is refused ("an assignment used as a place, not a value ..."). Behind something its statement runs first, `{G(), (A = M)}`, it is refused ("an assignment used as a value after something its statement runs first ..."). The left side must be a plain variable (`A = L[0] = 1` is refused): it is read again. | Yes |
-| `(Bump(), N) += 1`, `while (++(Bump(), N) < 5)`, `(Bump(), N) = G();`, `(N = Next()) += G()` | A comma or a plain `=` assigned to or updated writes the variable it names: the comma's right side, or the `=`'s left side after the assignment. The outer assignment's right side runs first, as C++17 orders it, then the comma's left side (or the inner assignment), then the store: `(Bump(), N) = G()` gives N what G returned before Bump ran. In a loop condition, on the right of `&&` / `\|\|` and as a statement alike. The inner `=`'s left side must be a plain variable (`(L[Idx()] = M) += 1` is refused): it is named twice. | Yes |
+| `(Bump(), N) += 1`, `while (++(Bump(), N) < 5)`, `(Bump(), N) = G();`, `(N = Next()) += G()` | A comma or a plain `=` assigned to or updated writes the variable it names: the comma's right side, or the `=`'s left side after the assignment. The outer assignment's right side runs first, as C++17 orders it, then the comma's left side (or the inner assignment), then the store: `(Bump(), N) = G()` gives N what G returned before Bump ran; a struct's or FString's `=` reads an element on its right through its reference, so `(Bump(), T) = L[Count]` locates L[Count] before Bump and reads it after. In a loop condition, on the right of `&&` / `\|\|` and as a statement alike. The inner `=`'s left side must be a plain variable (`(L[Idx()] = M) += 1` is refused): it is named twice. | Yes |
 
 ### Evaluation order
 
@@ -2001,7 +2001,7 @@ written inside the class does not make a method inline. Only the `inline` keywor
 | `UE_CATEGORY("Teleporter\|Setup");` | The category of the members that follow, written into the editor API stub; see [Classes and variables](#classes-and-variables). | Yes |
 | `UE_AUTHORITY_ONLY` / `UE_COSMETIC` | The editor's Authority Only and Cosmetic function flags; see [RPCs](#rpcs). | Yes |
 | `generate_api: true` in `mods.yaml` | Writes an editor stub of the class, so a Blueprint made in the editor can place call nodes for its functions; see [Editor API stubs](GUIDE.md#editor-api-stubs). | Yes |
-| `int32 Undef(int32 X);` with no body anywhere | Not refused. No function is cooked, but a call to it still compiles to a call by name of a function the class does not have. Give every method a body, or make it `virtual ... = 0` for an empty one. | Not yet |
+| `int32 Undef(int32 X);` with no body anywhere | No function is cooked, and a call to it is refused ("... declares and never defines"), as C++ would not link it. Give every method a body, or make it `virtual ... = 0` for an empty one. | Refused |
 | `AMyActor() { Charges = 5; }` | A constructor body is silently ignored: it makes no function and no default. Use a member initializer or UE_DEFAULTS, and do runtime setup in ReceiveBeginPlay; see [Class defaults](#class-defaults). | Not yet |
 | `int32 Sum() const { ... }` inside a UE_STRUCT | A struct holds no functions. A non-inline struct method is not refused and compiles to a call that cannot work; an inline one is refused (`called on another object`). Write a free inline function that takes the struct: `inline int32 SumOf(const FPair &P)`. | Not yet |
 
@@ -2176,7 +2176,7 @@ Notes:
 | `static int32 Tell(int32 V)` in a class whose mod parent has a static `Tell` too | Hides the parent's, as in C++, with a warning: "... hides Parent::Tell, a static: compiled as C++ name hiding ...". Every call to a static is bound to the one it names, so `Tell(V)` runs this one and `Parent::Tell(V)` the parent's. It is cooked with the parent's static as its super, as the editor links any function named like a parent's; the editor itself would refuse the name ("cannot be overridden"). | Warns |
 | `static float Tell(float V)` over a mod parent's `static int32 Tell(int32)` | Refused: "... is static and hides Parent::Tell, a static of another signature, ...". Its super would be the parent's static, a function of other parameters, which no editor links. Rename this one. | Refused |
 | A method that is not static named like a mod parent's static, or a static named like a parent's method | Refused: "... is static, and the editor takes a function of that name in a subclass for an override of it ..." or "... is static, and the Parent::Tell it hides is not ...". The editor makes a function named like a parent's an override of it, and an override must agree with it on Static. The parent may be another mod's class, from the header it shares. Rename one of them. | Refused |
-| A static or a method named like one a mod parent of this source declares and never defines (no body, not `= 0`) | The parent compiles no function of that name, so this one hides nothing a Blueprint has: no warning, no refusal, no super, and its parameters may differ from the declaration's (`float Scale(float)` over a declared-only `int32 Scale(int32)`). A function above the parent of that name, a native one too, is found as if the parent did not declare it. | Yes |
+| A static or a method named like one a mod parent of this source declares and never defines (no body, not `= 0`) | The parent compiles no function of that name, so this one hides nothing a Blueprint has: no warning, no refusal, no super, and its parameters may differ from the declaration's (`float Scale(float)` over a declared-only `int32 Scale(int32)`): a call to the declared-only one is refused, as C++ would not link it, so none lays out the parent's parameters. A function above the parent of that name, a native one too, is found as if the parent did not declare it. | Yes |
 
 ```cpp
 static int32 Twice(int32 V) { return V * 2; }
@@ -4410,8 +4410,7 @@ Notes:
 - In a class that is neither an actor nor an actor component, an RPC always runs locally.
 - A class with an RPC of its own gets `bReplicates` (see [Replication](#replication)).
 - Give every RPC a body. A method that is declared but never defined is not compiled, so no marker check runs on it,
-  and a call to it becomes a call by name to a function the class does not have, which is a fatal error in the engine.
-  See [Functions](#functions).
+  and a call to it is refused, as C++ would not link it. See [Functions](#functions).
 
 ### Authority-only and cosmetic functions
 
@@ -5681,6 +5680,10 @@ and where the feature is described. In each group, the messages you are most lik
   parameters; declare the same`: an override, or an interface function's implementation, with other parameter
   types than the function it replaces. Names do not count, and `const T&` matches `T`. Fix: copy the declaration. See
   [Overrides and parent calls](#overrides-and-parent-calls).
+- `<Owner>::<Method>, which <Owner> declares and never defines, is no function of the class, and C++ would not link a
+  call to it`: a call to a method of a class this source cooks that has no body and is not `= 0`. By name the call
+  would run a subclass's function of that name, whatever its parameters, and on an object of the class find none,
+  which is fatal. Fix: give the method a body, or `= 0` for an empty one subclasses override.
 - `<Class>::<Function>: <Parent>::<Function> is native and no Blueprint event, so no function replaces it`: a method
   named like an engine function that is not an event, such as `K2_DestroyActor`. C++ and calls bound to it keep
   running the engine's. Fix: rename the method.
@@ -5860,9 +5863,8 @@ and where the feature is described. In each group, the messages you are most lik
   the call. UE_NO_OPTIMIZE on the calling function keeps it. See
   [Calling engine and game functions](#calling-engine-and-game-functions).
 
-These compile with no message and do not work as C++ would: the body of a C++ constructor, which is dropped; a call to
-a method declared and never defined; the shorter of two non-inline methods with one name; a non-inline method of a
-UE_STRUCT; and `S.Len()`, the one FString method the SDK declares. `UKismetSystemLibrary::PrintString` compiles too, but UE 4.27 keeps
+These compile with no message and do not work as C++ would: the body of a C++ constructor, which is dropped; the
+shorter of two non-inline methods with one name; a non-inline method of a UE_STRUCT; and `S.Len()`, the one FString method the SDK declares. `UKismetSystemLibrary::PrintString` compiles too, but UE 4.27 keeps
 its body only outside shipping builds, so the retail game prints nothing. See [Functions](#functions),
 [Strings and text](#strings-and-text) and [Calling engine and game functions](#calling-engine-and-game-functions).
 

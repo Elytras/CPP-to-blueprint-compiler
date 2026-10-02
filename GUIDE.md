@@ -1899,8 +1899,6 @@ each topic.
 - Two non-inline methods with the same name. A Blueprint class has one function per name: only the overload with the
   most parameters is cooked, and calls to the other are miscompiled. Rename one, or make the extra overloads `inline`.
   See [Functions](REFERENCE.md#functions).
-- A method declared and never defined. A call to it names a function the class does not have. See
-  [Functions](REFERENCE.md#functions).
 - FString methods such as `S.Len()`. Call `UKismetStringLibrary::Len(S)` and the other string library functions. See
   [Strings and text](REFERENCE.md#strings-and-text).
 - `Weapons::Turret::StaticClass()` for a mod class in a namespace. It names the engine class that Turret inherits

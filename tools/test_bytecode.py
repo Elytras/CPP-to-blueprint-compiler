@@ -1310,7 +1310,7 @@ def comma_slot_right():
     after both, so a place the comma's left side changes reads changed (PlaceAfter). A loop condition is evaluated
     before each trip ([stmt.while]); && evaluates its right side only when the left is true ([expr.log.and]).
     Compiled on 075e7b28 with L[Count] located after Bump (2001 for SlotStmt)."""
-    base = pending_asset('CommaSlotRight')
+    base = asset('CommaSlotRight')
     keeps_invariants(base)
     for m in (0, 3):
         cases = (('SlotStmt', 1001), ('StrSlotStmt', 101), ('SlotLoop', 2002), ('StrSlotLoop', 202),
@@ -1322,8 +1322,9 @@ def comma_slot_right():
             assert got == want, 'runvm: CommaSlotRight.%s(%d) = %r; C++ %r' % (fn, m, got, want)
 
 
-pending('CommaSlotRight: an element on the right of a struct\'s = onto a comma is located before the comma runs',
-        comma_slot_right)
+comma_slot_right()
+print('ok  CommaSlotRight: an element on the right of a struct\'s or FString\'s = onto a comma is located before the '
+      'comma runs, and read after it')
 
 
 def comma_ctor_default():
@@ -5655,7 +5656,8 @@ def func_declared_called():
             'class FdcKid : public FdcRoot {\npublic:\n  float Scale(float V) { return V * 3.0f; }\n};\n')
 
 
-pending('FuncDeclaredCalled: a call to a declared-only method is refused', func_declared_called)
+func_declared_called()
+print('ok  FuncDeclaredCalled: a call to a declared-only method is refused by name, whatever a subclass declares')
 
 
 def func_iface_unnamed():

@@ -2788,8 +2788,8 @@ std::pair<const FRecord*, const Json*> FCompiler::ReplacedDecl(const FRecord& Se
 {
     for (const FRecord* R = &Self; R; R = R->Base.empty() ? nullptr : Find(R->Base))
     {
-        /* A mod ancestor's function only declared is none of its (CompilesMethod): no caller lays out its parameters.
-           The stub of a mod interface it lists is, below. */
+        /* A mod ancestor's function only declared is none of its (CompilesMethod), and a call to it is refused (LowerCall,
+           as C++ would not link it): no caller lays out its parameters. The stub of a mod interface it lists is, below. */
         if (R != &Self && !R->bIsInterface)
             if (auto M = R->Methods.find(Method); M != R->Methods.end()
                 && (R->IsNative() ? !R->Forwards.count(Method)
@@ -6096,6 +6096,19 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
             *Err = R->CppName + "::" + MethodName + ": TODO: an overload set may not mix inline and non-inline functions";
             return false;
         }
+        /* A method of a class cooked here that is declared and never defined is no function of the class's
+           (CompilesMethod), and C++ would not link a call to it. By name the call would land in a subclass's function of
+           that name, whatever its parameters (ReplacedDecl lets that one's signature be its own), and on an object of
+           the class find none (execLocalVirtualFunction's FindFunctionChecked, ScriptCore.cpp 3012-3016); from another
+           class it imports a function the class never exports. The stub of a mod interface the class lists is one. */
+        if (Decl != R->Methods.end() && !R->IsNative() && !R->bIsInterface && !R->bIsPatch && MethodName != "StaticClass"
+            && !CompilesMethod(*R, MethodName) && !ModInterfaceWith(*R, MethodName))
+        {
+            *Err = R->CppName + "::" + MethodName + ", which " + R->CppName + " declares and never defines, "
+                   "is no function of the class, and C++ would not link a call to it: give it a body, or `= 0` for an "
+                   "empty one";
+            return false;
+        }
 
         /* `Base::Method()` on this, from a class that declares Method itself. C++ name hiding leaves only the qualified
            spelling to reach the ancestor's (clang's JSON drops the qualifier, the referenced decl's owner keeps it), and
@@ -7909,16 +7922,20 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             /* `(Bump(), N) = G();`, `(N = M) = G();`: the store goes to N (AssignedPlace). G() first, as C++17
                sequences an assignment's right side before its left ([expr.ass]/1), then the comma's left side or the
                inner assignment, then the store. A class's operator= reads an lvalue right side through its reference
-               when it runs, after both, so that stays where it is. HoistComma takes apart one whose left side can run
-               as a statement first; this is one behind its right side, or the assignment a loop condition's `=` runs
-               (LowerCommaValue). */
+               when it runs, after both, so only its place is fixed first: `(Bump(), T) = L[Count]` locates L[Count]
+               before Bump ([over.match.oper]/2 orders the operands as the built-in's), and `(BumpS(), T) = S` reads S
+               after it. HoistComma takes apart one whose left side can run as a statement first; this is one behind its
+               right side, or the assignment a loop condition's `=` runs (LowerCommaValue). */
             const size_t At = K == "BinaryOperator" ? 0 : 1;
             if (Json Lefts = Json::array(), Place; AssignedPlace((*S)["inner"][At], Lefts, Place))
             {
                 Json Pre = Json::array(), Again = *S;
                 Json& Value = Again["inner"][At + 1];
-                if (!IsFixedOperand(Value) && (K == "BinaryOperator" || Value.value("valueCategory", std::string()) != "lvalue"))
+                if (IsFixedOperand(Value)) {}
+                else if (K == "BinaryOperator" || Value.value("valueCategory", std::string()) != "lvalue")
                     Value = HoistExpr(Value, Pre, true);
+                else
+                    Value = StabilizeLvalue(Value, Pre, true);
                 for (Json& L : Lefts) Pre.push_back(std::move(L));
                 Again["inner"][At] = Place;
                 Pre.push_back(std::move(Again));
