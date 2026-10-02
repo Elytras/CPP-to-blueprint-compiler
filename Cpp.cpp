@@ -2776,9 +2776,12 @@ std::pair<const FRecord*, const Json*> FCompiler::ReplacedDecl(const FRecord& Se
 {
     for (const FRecord* R = &Self; R; R = R->Base.empty() ? nullptr : Find(R->Base))
     {
+        /* A mod ancestor's function only declared is none of its (CompilesMethod): no caller lays out its parameters.
+           The stub of a mod interface it lists is, below. */
         if (R != &Self && !R->bIsInterface)
             if (auto M = R->Methods.find(Method); M != R->Methods.end()
-                && (R->IsNative() ? !R->Forwards.count(Method) : !IsStaticDecl(*M->second) && !IsInlineMethod(*R, Method)))
+                && (R->IsNative() ? !R->Forwards.count(Method)
+                                  : !IsStaticDecl(*M->second) && !IsInlineMethod(*R, Method) && CompilesMethod(*R, Method)))
                 return { R, M->second };
         for (const std::string& I : R->Interfaces)
             for (const FRecord* IR : InterfaceChain(Find(I)))

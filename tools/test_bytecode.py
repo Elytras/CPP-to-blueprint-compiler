@@ -5392,14 +5392,15 @@ print('ok  FuncDeclaredOnly: a static and a method over an ancestor\'s declared-
 def func_declared_sig():
     """FdsRoot declares Scale(int32) and never defines it, so no caller reaches a Scale of its: FuncDeclaredSig's
     Scale(float) replaces nothing, and its signature is its own, as a static's is (FuncDeclaredOnly)."""
-    base = pending_asset('FuncDeclaredSig')
+    base = asset('FuncDeclaredSig')
     keeps_invariants(base)
     for v in (1, 4):
         got = run(base, 'Use', {}, V=v)[0]
         assert got == v * 3.0, 'FuncDeclaredSig.Use(%d) = %r, want %r' % (v, got, v * 3.0)
 
 
-pending('FuncDeclaredSig: a method of another signature over a declared-only one is its own', func_declared_sig)
+func_declared_sig()
+print('ok  FuncDeclaredSig: a method of another signature over a declared-only one is its own')
 
 
 def func_iface_unnamed():
