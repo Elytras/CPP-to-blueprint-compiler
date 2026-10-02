@@ -1280,7 +1280,7 @@ private:
                    const FPackage& From, const std::string& Where, std::string* Err);
     bool SaveEdits(const std::string& OutDir, std::string* Err);
     bool BracedMembers(const Json& List, const FRecord& Rec, const std::string& Where, FBlueprintClass& BP, bool bKeepZero,
-                       std::vector<FPropertyDef>& Out, std::string* Err);
+                       std::vector<FPropertyDef>& Out, std::string* Err, const FRecord* Archetype = nullptr);
     struct FEdited { std::string Package, Ext; FCookedPackage P; std::vector<std::string> Objects; };
     std::map<std::string, FEdited> Edited;                  // lowercased package name -> the game's package, edited
     FEdited* LoadEdited(const std::string& Package, const std::string& Where, std::string* Err);
@@ -1826,6 +1826,7 @@ private:
     const Json* ParentInit = nullptr;
     const FRecord* ParentInitOf = nullptr;
     bool ParentValueFresh(const FRecord& R, const Json& Lhs, const Json*& Braces, const FRecord*& BracesOf) const;
+    bool ValueFreshFrom(const FRecord* From, const std::string& Id, const Json*& Braces, const FRecord*& BracesOf) const;
     std::map<std::string, std::vector<std::pair<std::string, int64>>> ModEnums;  // UE_ENUM cooked here: enumerators
 
     /* Per-function state reset in Generate: whether this function needs the FDeref scratch
@@ -11905,10 +11906,17 @@ static bool StartsFresh(const Json* I)
 
 bool FCompiler::ParentValueFresh(const FRecord& R, const Json& Lhs, const Json*& Braces, const FRecord*& BracesOf) const
 {
+    return ValueFreshFrom(R.Base.empty() ? nullptr : Find(R.Base), Lhs.value("referencedMemberDecl", std::string()), Braces,
+                          BracesOf);
+}
+
+/* ParentValueFresh's walk, from the class From up: whether From's default object holds the member whose declaration is
+   Id as a fresh value. An asset starts as its class's default object, so its braces lie over From = its class. */
+bool FCompiler::ValueFreshFrom(const FRecord* From, const std::string& Id, const Json*& Braces, const FRecord*& BracesOf) const
+{
     Braces = nullptr;
     BracesOf = nullptr;
-    const std::string Id = Lhs.value("referencedMemberDecl", std::string());
-    for (const FRecord* C = R.Base.empty() ? nullptr : Find(R.Base); C && !Id.empty(); C = C->Base.empty() ? nullptr : Find(C->Base))
+    for (const FRecord* C = From; C && !Id.empty(); C = C->Base.empty() ? nullptr : Find(C->Base))
     {
         if (C->IsNative()) return false;
         bool bSet = false;
@@ -12865,16 +12873,19 @@ bool FCompiler::GenerateEnum(const std::string& Enum, const std::string& OutDir,
 
 /* The members a braced initializer of a Rec names, typed and lowered, in order. Measured on ED_Spider_Grunt: the
    semantic form lists the bases first, then every field in order, so a designator is found by position. A member
-   the braces leave out is skipped. */
+   the braces leave out is skipped. With Archetype, each value is written over that class's default object's, as a
+   UE_DEFAULTS statement's over its parent's: a zero is a value, and a struct member the braces leave out is fresh only
+   where the default object's value of it is (ValueFreshFrom). */
 bool FCompiler::BracedMembers(const Json& List, const FRecord& Rec, const std::string& Where, FBlueprintClass& BP,
-                              bool bKeepZero, std::vector<FPropertyDef>& Out, std::string* Err)
+                              bool bKeepZero, std::vector<FPropertyDef>& Out, std::string* Err, const FRecord* Archetype)
 {
     size_t I = 0;
     if (!Rec.Base.empty())
     {
         const FRecord* B = Find(Rec.Base);
         const Json* Sub = Nth(List, I++);
-        if (B && Sub && Kind(*Sub) == "InitListExpr" && !BracedMembers(*Sub, *B, Where, BP, bKeepZero, Out, Err)) return false;
+        if (B && Sub && Kind(*Sub) == "InitListExpr" && !BracedMembers(*Sub, *B, Where, BP, bKeepZero, Out, Err, Archetype))
+            return false;
     }
     I += Rec.Interfaces.size();
     for (const Json* F : Rec.Fields)
@@ -12883,13 +12894,20 @@ bool FCompiler::BracedMembers(const Json& List, const FRecord& Rec, const std::s
         if (!Init || IsUnsetInit(*Init)) continue;
         FPropertyDef PD;
         if (!TypeToProperty(TypeOf(*F), UeNameOf(&Rec, Name(*F)), 0, Where + "." + Name(*F), BP, &PD, Err)) return false;
-        if (!LowerDefault(*F, PD, BP, Err, Init, bKeepZero)) return false;
+        struct FRestore { bool& Flag; const Json*& Init; const FRecord*& Of; bool WasFlag; const Json* WasInit; const FRecord* WasOf;
+                          ~FRestore() { Flag = WasFlag; Init = WasInit; Of = WasOf; } }
+            Restore{ bParentFresh, ParentInit, ParentInitOf, bParentFresh, ParentInit, ParentInitOf };
+        if (Archetype)
+            bParentFresh = ValueFreshFrom(Archetype, F->value("id", std::string()), ParentInit, ParentInitOf);
+        if (!LowerDefault(*F, PD, BP, Err, Init, bKeepZero || Archetype)) return false;
         Out.push_back(PD);
     }
     return true;
 }
 
-/* Only a field the braces name is written: the rest stay the CDO's. */
+/* Only a field the braces name is written: the rest stay the CDO's. The export is made with the CDO as its archetype
+   (FObjectInitializer::InitProperties copies it in, UObjectGlobals.cpp 2999), so every value is written over the CDO's,
+   as a UE_DEFAULTS statement's is over its parent's (BracedMembers' Archetype). */
 bool FCompiler::GenerateAsset(const Json& Var, const std::string& OutDir, std::string* Err)
 {
     const FRecord* R = Find(StripTypeKeywords(TypeOf(Var)));
@@ -12904,7 +12922,7 @@ bool FCompiler::GenerateAsset(const Json& Var, const std::string& OutDir, std::s
     FBlueprintClass BP(P, AssetName, "", "", false);
 
     std::vector<FPropertyDef> Set;
-    if (!BracedMembers(*BracedInit(Var), *R, AssetName, BP, false, Set, Err)) return false;
+    if (!BracedMembers(*BracedInit(Var), *R, AssetName, BP, false, Set, Err, R)) return false;
     for (const FPropertyDef& PD : Set) BP.AddVariable(PD);
 
     const std::string ClassPkg = PackageOf(*R), ClassName = ClassOf(*R);

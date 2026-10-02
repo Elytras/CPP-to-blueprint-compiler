@@ -860,6 +860,9 @@ Watch for:
 - An asset is an object, not a C++ value. `CT_Hard.Waves` is refused ("CT_Hard is an asset, not a value: point at it
   with &CT_Hard"). Write `(&CT_Hard)->Waves`, or keep a pointer. The same holds for game assets, whose values are not
   available when the mod is built.
+- An asset starts as its class's defaults, and its braces are written over them. Braces for an engine struct member
+  such as `FHitResult` that leave a member out are refused, naming it, where the class's defaults give that member a
+  value of their own (`H = {.Hit = {.FaceIndex = 3}}`): give it in the asset's braces too.
 - Paths are not checked at build time, neither in `UE_ASSET_AT` nor in a soft default. A soft class of a Blueprint takes
   the class's full path, ending in `.BP_Name_C`. The short form `"/Game/Dir/Pkg"` means the object `Pkg.Pkg`, which for
   a Blueprint is the asset and not its class.

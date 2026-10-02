@@ -3399,6 +3399,7 @@ not a C++ value, so point at it with `&`.
 | `UMoodDef MD_Big = {.Health = -500.5f, .Title = "Big"};` | An asset of the class, cooked as `<mod package>/MD_Big`. Only the members the braces name are written, and the rest keep the class defaults. A member named with a zero value is still written. | Yes |
 | `UMoodDef MD_Plain = {};` | An asset with the class defaults only. | Yes |
 | `UMoodDef MD_Zero = {.Health = {}};` | `{}` for a member is its zero, written as `.Health = 0` is. A struct, container or name member's `{}` is written too: zeros, an empty container, None, or a `UE_STRUCT`'s own defaults, not the class default. | Yes |
+| `UHitDef HD_Near = {.H = {.Hit = {.Distance = 5.0f}}};` | An asset starts as its class's default object, so braces for a struct member are written over the default object's value, as a `UE_DEFAULTS` statement's are over a parent's. A member they leave out that the engine's constructor sets (`FHitResult`'s FaceIndex) stays unwritten where the default object's value of it is the engine's too. Where the class's own braces or a `UE_DEFAULTS` gave it another value (`H = {.Hit = {.FaceIndex = 3}}`), or the class is a game or engine class, whose value no header says, it is refused, naming the member. | Yes |
 | `UEnemyDescriptor ED_Mine = {.SpawnSpread = 250.0f, .IdealSpawnSize = 4};` | An asset of a game or engine class. | Yes |
 | `namespace Moods { UMoodDef Angry = {.Health = 50}; }` | A namespace is a folder: the asset is cooked at `<mod package>/Moods/Angry`. See [Mod sources and packages](#mod-sources-and-packages). | Yes |
 | `.Delay = FFloatInterval(1.0f, 5.0f)`, `.Delay = {2.0f, 6.0f}` | A struct member, by constructor or by braces, one value per member, as in any default. | Yes |
@@ -5975,8 +5976,10 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   initializer leaves out too, is still fresh and stays unwritten). A class's own default, a struct's member
   initializer and a container's element say the same where new braces leave out a member that such an initializer
   gives, of a `UE_STRUCT` or another mod's struct (`UE_STRUCT_IN`): `H = {.Hit = {.Distance = 5.0f}}` names
-  `H.Hit.Time`. Fix: give that member in the braces, or leave the statement out to keep the parent's value. See
-  [Class defaults](#class-defaults).
+  `H.Hit.Time`. A mod's own asset's braces say it over the class's default object, which the asset starts as:
+  `{.H = {.Hit = {.Distance = 5.0f}}}` where the class's `H = {.Hit = {.FaceIndex = 3}}` names `H.Hit.FaceIndex`.
+  Fix: give that member in the braces, or leave the statement out to keep the parent's value. See
+  [Class defaults](#class-defaults) and [Data assets](#data-assets).
 - `warning: <Member>: every member of <Struct> is Transient, which the engine never loads from a default: nothing is
   written, and it keeps the parent's value`: `Handle = FTimerHandle();` in UE_DEFAULTS. No tag can set a Transient
   member (the loader skips it), so the default holds the parent's handle. Fix: none needed; drop the statement to

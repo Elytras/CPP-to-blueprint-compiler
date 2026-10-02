@@ -8917,7 +8917,7 @@ def asset_over_cdo():
     braces would not (FaceIndex 3), leaving it untagged would load 3: refused, naming it. fix/r5-leftovers (7159b82b)
     compiled AssetOverInit with FaceIndex untagged, and AssetOverNoInit, AssetOverEngine and AssetOverDefaults compiled
     so on main too: the asset's braces were lowered as a value that starts fresh."""
-    here = os.path.dirname(pending_asset('AssetOverCdo', 'UAocDef'))
+    here = os.path.dirname(asset('AssetOverCdo'))
     base = os.path.join(here, 'AS_AocKeep')
     keeps_invariants(base)
     pkg = invariants.Package(base)
@@ -8940,7 +8940,9 @@ def asset_over_cdo():
             'AssetOverDefaults AS_AssetOverDefaults = {{.H = {.Hit = {.Distance = 5.0f}}}};\n')
 
 
-pending('AssetOverCdo: a mod\'s own asset\'s braces lie over its class\'s CDO, not a fresh value', asset_over_cdo)
+asset_over_cdo()
+print('ok  AssetOverCdo: a mod\'s own asset\'s braces lie over its class\'s CDO: what they leave out stays untagged only '
+      'where the CDO holds what C++ would make it, else it is refused by name')
 
 
 def uds_init_defaults():
