@@ -1459,8 +1459,11 @@ Notes:
 | `A = 1, B = 2;`, `++I, --J` | The comma operator as a statement: each side runs in turn, as two statements. A side that does nothing (`I, J++`) is dropped. A declaration of several variables, `int32 I = 0, J = N;`, is not the comma operator and works too. | Yes |
 | `if (bool bOk; Get(Out, bOk), !bOk)`, `switch (N += 10, N)` | An if or switch condition with a comma: the left side runs once, before the test, as an init-statement does, and the right side is the condition. This is how an out-parameter call is tested in one line. | Yes |
 | `int32 N{(Bump(), M)};`, `F((Bump(), M))`, `return (N += 1, N * 2);`, `switch (Bump(), T)` over a `TEnum<E>`, `S = {(Bump(), M), 2}` | A comma inside a statement's expression: the left side runs first, as a statement of its own, and the comma is worth its right side, read where C++ reads it. This holds wherever nothing in the statement runs before the comma: an initialiser, a return value, an assignment's right side, an argument, a braced list's first member. Beside another argument that is no constant (C++ leaves their order open, a parenthesised constructor's `FVector(Get(), (Bump(), M), 0.f)` included; braces fix theirs) the whole argument holding the comma runs first, into a temporary. A left-out argument whose default is a constant counts as that constant. Passed to a reference parameter, `const T&` included, the comma is its right side's variable itself, which the callee reads when it runs, after every argument: only the left side runs first, and the right side must be a variable (see the refusal below). | Yes |
-| `while (Next(X), X > 0)`, `A && (Bump(), B)`, `Obj->F((Bump(), M))`, `{G(), (Bump(), M)}` | Refused naming the comma operator. C++ allows each, but AssetGen runs a comma's left side as a statement before the one holding it, and these places have none that fits: a loop condition reruns its left side on every trip, the right side of `&&` / `\|\|` / `?:` may not run at all, and the left side must not run before a call's object on another object or an earlier member of braces. Write the left side as a statement of its own (for a loop, before it and at the end of its body), or put both sides in an inline function, `inline bool Step(int32& X) { Next(X); return X > 0; }`, which runs in these places as written. | Not yet |
-| `F(G(), (Bump(), L[I]))` where F takes `int32&` or `const int32&` | Refused: a comma passed to a reference parameter beside an argument that may run first must end in a variable. A temporary would not be the place the callee writes or reads, and `L[I]` located again after G would not be the one C++ binds. | Refused |
+| `while (Next(X), X > 0)`, `while ((Bump(), N) < 5)`, `A && (Bump(), B)`, `C ? (Bump(), X) : Y`, `Obj->F((Bump(), M))` | Where no statement before the one holding the comma fits, the comma runs in place: its left side, then a copy of its right side, read right after it. That is a loop condition, which runs it again on every trip; the right side of `&&` / `\|\|` and an arm of `?:`, which run it only when C++ does; and an argument of a call on another object, whose object C++ evaluates first. Passed to a reference parameter there, `while (IncRef(0, (Bump(), N)) < 20)`, it is the right side's variable itself, which must then be a plain variable. | Yes |
+| `{G(), (Bump(), M)}`, `L[(Bump(), I)] = G()` | Refused ("the comma operator after something its statement runs first ..."). C++ runs G first: braces evaluate their members in order, and an assignment's right side runs before its left. The comma's left side would run before G. Write the left side as a statement of its own. | Refused |
+| `while ((Bump(), S).X < 3)` | Refused ("the comma operator used as a place, not a value ..."): a member taken of the comma, or the comma bound to an operator's or a constructor's reference, needs the place itself, and a loop condition has no statement before it to hold the left side. Write the left side as a statement of its own. A comma assigned to or updated there works: see [Assignment and updates](#assignment-and-updates). | Refused |
+| `F(G(), (Bump(), L[I]))` where F takes `int32&` or `const int32&`, `Get() + (Bump(), L[0])` over FString | Refused: a comma bound to a reference beside an argument that may run first must end in a variable. That covers a call's reference parameter and an operator's reference operand (FString's `+` takes `const FString&`; the message names the operator). A temporary would not be the place the callee writes or reads, and `L[I]` located again after G would not be the one C++ binds. In a loop condition, the right of `&&` / `\|\|` / `?:` or a call on another object, a comma passed to a reference parameter must end in a variable even alone. | Refused |
+| `(Bump(), M) * (G() + 0.5)` | Refused for the double math (`no Kismet conversion from float to double`), as `M * (G() + 0.5)` is. The comma runs first into a temporary, and the conversion to double stays outside it. A comma whose own value is a type no Blueprint variable holds is refused naming that type. | Refused |
 | `int32 D = (1, 4);` as a class default | The right side, when the left side does nothing. A left side that does something would run when the game builds the object, which a default cannot: refused as any computed default. | Yes |
 
 Notes:
@@ -1482,9 +1485,10 @@ Notes:
 | `Spots[Name].X = 1;` | A store into a map value's member is copied out, changed and stored back, as `T E = Map[K]; E.X = 1; Map[K] = E;`, with the key evaluated once. | Yes |
 | `Acc += I;`, and `-=` `*=` `/=` `%=` `&=` `\|=` `^=` `<<=` `>>=` | `X = X op Y`: a math node and a Set. X is located once, so `Slots[NextSlot()] += By` calls NextSlot a single time, and Y is evaluated first. It works on everything plain `=` works on, map values and their members included. `<<=`, `>>=` and int64 `%=` follow the rules of the plain operators. | Yes |
 | `int32 Z = (Y += X) * 10;` | A compound assignment used as a value is X after the store. | Yes |
-| `IncRef(1, B += 1)`, `Peek(SetB(), ++B)`, where the parameter is `int32&` or `const int32&` | Passed to a reference parameter, a compound assignment or a prefix `++` / `--` is the variable itself, as a plain `=` is: the update runs first, as a statement, and the callee reads, and for `T&` writes, B after every argument. Its left side must be a plain variable (`IncRef(1, L[Idx()] += 1)` is refused); in a loop condition it is still a copy the callee's write does not reach (TODO.md). | Yes |
+| `IncRef(1, B += 1)`, `Peek(SetB(), ++B)`, where the parameter is `int32&` or `const int32&` | Passed to a reference parameter, a compound assignment or a prefix `++` / `--` is the variable itself, as a plain `=` is: the update runs first, as a statement, and the callee reads, and for `T&` writes, B after every argument. Its left side must be a plain variable (`IncRef(1, L[Idx()] += 1)` is refused). The same holds in a loop condition (`while (IncRef(0, B += 1) < 20)`), on the right of `&&` / `\|\|` or in `?:`, and in a call on another object (`P->IncRef(1, B += 1)`). There the call runs as one block each time C++ runs it: the object first, then the update, then the call on B. Behind something its statement runs first, `{G(), IncRef(0, B += 1)}`, it is refused, since the update would run before G. | Yes |
 | `X++`, `++X`, `X--`, `--X` | The Increment Int and Decrement Int macros, with X located once. Postfix gives the value before the store, prefix the value after. Works on int32, int64, float and uint8 (a uint8 wraps at 255). On a raw pointer it steps by the element size; see [Pointers and memory](#pointers-and-memory). | Yes |
-| `A = B = 0;`, `S1 = S2 = Name;`, `if ((X = Next()) > 3)`, `return A = N;` | A plain `=` used as a value: the assignment runs first, as a statement, and the value is the variable it wrote, read after it. Numbers, strings and structs alike. It works wherever the comma operator does, and like it, passed to a reference parameter (`const T&` included) it is that variable itself, with no copy. In a loop condition, on the right of `&&` / `\|\|` / `?:` or in an argument of a call on another object it is refused ("an assignment used as a value in a loop condition, ..."); use a declaring condition there, `while (int32 Left = Start - Steps)`. The left side must be a plain variable (`A = L[0] = 1` is refused): it is read again. | Yes |
+| `A = B = 0;`, `S1 = S2 = Name;`, `if ((X = Next()) > 3)`, `return A = N;` | A plain `=` used as a value: the assignment runs first, as a statement, and the value is the variable it wrote, read after it. Numbers, strings and structs alike. It works wherever the comma operator does, and like it, passed to a reference parameter (`const T&` included) it is that variable itself, with no copy. In a loop condition (`while ((V = Next()) > 0)`, `while (UsePair(T = S) < 100)` with a struct passed by value), on the right of `&&` / `\|\|` / `?:` or in an argument of a call on another object it runs in place, as the comma does there; a member taken of it in those places, `while ((T = S).X < 9)`, is refused ("an assignment used as a place, not a value ..."). Behind something its statement runs first, `{G(), (A = M)}`, it is refused ("an assignment used as a value after something its statement runs first ..."). The left side must be a plain variable (`A = L[0] = 1` is refused): it is read again. | Yes |
+| `(Bump(), N) += 1`, `while (++(Bump(), N) < 5)`, `(Bump(), N) = G();`, `(N = Next()) += G()` | A comma or a plain `=` assigned to or updated writes the variable it names: the comma's right side, or the `=`'s left side after the assignment. The outer assignment's right side runs first, as C++17 orders it, then the comma's left side (or the inner assignment), then the store: `(Bump(), N) = G()` gives N what G returned before Bump ran. In a loop condition, on the right of `&&` / `\|\|` and as a statement alike. The inner `=`'s left side must be a plain variable (`(L[Idx()] = M) += 1` is refused): it is named twice. | Yes |
 
 ### Evaluation order
 
@@ -5794,20 +5798,40 @@ and where the feature is described. In each group, the messages you are most lik
   `static int32 Count = 0;`. The message follows the prefix `<Class>::<Function>: inline <Function>: `
   (`inline <Class>::<Method>: ` for a method). A `static constexpr` constant works here. Fix: make it a member of the
   class. See [Latent calls](#latent-calls).
-- `the comma operator in a loop condition, or after something its statement runs first (...): write its left side as a
-  statement of its own. ...`: a comma in a `while` / `for` / `do` condition, which reruns its left side on every
-  trip, or behind something the statement runs first: the right side of `&&` / `||` / `?:`, an argument of a call on
-  another object (`Obj->F((A, B))`), a later member of a braced list. C++ allows these; AssetGen does not take them
-  yet, as no statement before this one can hold the left side. Fix: put the left side in a statement of its own (for
-  a loop, before it and at the end of its body), or both sides in an inline function. See [Operators](#operators).
+- `the comma operator after something its statement runs first (...), which its left side would run before: write its
+  left side as a statement of its own`: a comma behind an operand C++ evaluates before it, `{G(), (A, B)}` (braces
+  run their members in order) or `L[(A, I)] = G()` (an assignment's right side runs first). Fix: as the message says.
+  See [Operators](#operators).
+- `the comma operator used as a place, not a value (...), where no statement before this one can hold its left side
+  (...)`: `while ((A, S).X < 3)`, a member taken of a comma or a comma bound to an operator's or a constructor's
+  reference, in a loop condition, on the right of `&&` / `||` / `?:` or in a call on another object. `an assignment
+  used as a place, not a value (...)` is the same for a `=`, `while ((T = S).X < 9)`. Fix: put the left side, or the
+  assignment, in a statement of its own. See [Operators](#operators).
+- `an assignment assigned to or updated, whose left side is no plain variable, which would be evaluated again to write
+  it: ...`: `(L[Idx()] = M) += 1`. Fix: assign in a statement of its own, then update what it assigned. See
+  [Assignment and updates](#assignment-and-updates).
+- `the comma operator's value here is a <Type>, which no Blueprint variable can hold: ...`: a comma that runs in place
+  (a loop condition, ...) worth a double or another type no Blueprint variable has, `while ((A, 0.5) < X)`. Fix: put
+  the left side in a statement of its own, and use a float. See [Types](#types).
+- `the comma operator here would run first, whole, into a temporary, and its value is a <Type>, which no Blueprint
+  variable can hold: ...`: the same for a comma that moves into a temporary beside an argument that may run first.
+  Fix: as above.
 - ``the comma operator here is written to or bound to a reference (a `T&` or `const T&` parameter), beside something
   that may run before it, and its right side is no variable: ...``: `F(G(), (A, L[0]))` where F takes `int32&` or
   `const int32&`: the argument cannot run first into a temporary, which F would then write, or read with what
-  `L[0]` held before G ran. Fix: put the left side in a statement of its own. See [Operators](#operators).
-- `an assignment used as a value in a loop condition, or after something its statement runs first (...): assign in a
-  statement of its own, then use what it assigned`: a plain `=` used as a value where the comma operator is refused
-  too, `while ((A = Next()) > 0)` or `B && (A = N) > 2`. Fix: as the message says; for a loop, a declaring condition,
-  `while (int32 Left = Next())`. See [Operators](#operators).
+  `L[0]` held before G ran. An operator's reference operand gets the same message naming the operator instead:
+  ``... bound to a reference, operator `+`'s `const FString &` operand, ...`` for `Get() + (A, L[0])` over FString.
+  Fix: put the left side in a statement of its own. See [Operators](#operators).
+- `<what> passed to a reference parameter, whose right side is no plain variable, where no statement before this one
+  can hold it (...)` (`left side` for an update or an assignment): `while (IncRef(0, (A, L[0])) < 20)` or
+  `while (IncRef(0, L[0] += 1) < 20)`, in a loop condition, on the right of `&&` / `||` / `?:` or in a call on
+  another object. The parameter must be a variable, and nothing before the statement can hold the rest. Fix: as the
+  message says. See [Operators](#operators).
+- `<what> passed to a reference parameter after something its statement runs first (...), which it would run before:
+  ...`: `{G(), IncRef(0, B += 1)}`, the update would run before G. Fix: as the message says.
+- `an assignment used as a value after something its statement runs first (...), which its left side would run
+  before: assign in a statement of its own, then use what it assigned`: a plain `=` used as a value where the comma
+  operator is refused for that reason too, `{G(), (A = N)}`. Fix: as the message says. See [Operators](#operators).
 - `an assignment used as a value, whose left side is no plain variable, which would be evaluated again to read it:
   ...`: `A = L[0] = N`. Fix: assign in a statement of its own, then use what it assigned. See [Operators](#operators).
 - `an update (`+=`, `++`, ...) passed to a reference parameter, whose left side is no plain variable, ...`:

@@ -981,14 +981,26 @@ for n in (-3, 0, 4):
     run(asset('FlowTest'), 'ForwardVoid', self_vars=me, N=n)
     assert me['Total'] == 1 + (-n * 100 if n < 0 else n), (n, me)
 print('ok  FlowTest.ForwardVoid: `return F();` of a void F calls it, then returns')
-refused('CommaWhile', '  int32 F(int32 N) { while (N += 1, N < 9) {} return N; }\n', 'the comma operator in a loop condition')
-refused('CommaAnd', '  int32 Count;\n  bool F(int32 M) { return M > 0 && (Count += 1, M > 2); }\n',
-        'the comma operator in a loop condition, or after something its statement runs first')
+# Behind an operand C++ evaluates first (a later braced member, an assignment's left side), the comma's left side would
+# run ahead of it; where its place is used, not its value, and no statement before fits, a copy is not that place.
+COMMA_TOP = 'struct FCbPair {\n  UE_STRUCT;\n  int32 A = 1;\n  int32 B = 2;\n};\n'
+refused('CommaBrace', '  int32 Count;\n  [[gnu::noinline]] int32 G() { return Count; }\n'
+        '  int32 F(int32 M) { FCbPair T = {G(), (Count += 1, M)}; return T.B; }\n',
+        'the comma operator after something its statement runs first', COMMA_TOP)
+refused('CommaAssignLeft', '  int32 Count;\n  TArray<int32> L;\n  [[gnu::noinline]] int32 G() { return Count; }\n'
+        '  int32 F(int32 M) { L = {0}; L[(Count += 1, 0)] = G(); return L[0]; }\n',
+        'the comma operator after something its statement runs first')
+refused('CommaLoopPlace', '  int32 Count;\n  FCbPair S;\n'
+        '  int32 F(int32 M) { int32 N = 0; while ((Count += 1, S).A < M) { S.A += 1; N += 1; } return N; }\n',
+        'the comma operator used as a place, not a value', COMMA_TOP)
 refused('CommaRef', '  void Add(int32 X, int32& Y) { Y += X; }\n  int32 Twice(int32 X) { return X * 2; }\n'
         '  int32 F(int32 M) { TArray<int32> L = {1}; Add(Twice(M), (M += 1, L[0])); return L[0]; }\n',
         'the comma operator here is written to or bound to a reference')
-print('ok  the comma operator in a loop condition, behind something its statement runs first, or bound to a reference '
-      'beside an argument that may run first is refused by name')
+refused('CommaLoopSlot', '  TArray<int32> L;\n  int32 Count;\n  [[gnu::noinline]] int32 IncRef(int32 X, int32& V) { V += 3; return V; }\n'
+        '  int32 F(int32 M) { L = {M}; int32 N = 0; while (IncRef(0, (Count += 1, L[0])) < 20) N += 1; return N; }\n',
+        'the comma operator passed to a reference parameter, whose right side is no plain variable')
+print('ok  the comma operator behind something its statement runs first, used as a place where no statement fits, or '
+      'bound to a reference beside an argument that may run first, its right side no variable, is refused by name')
 
 
 def comma_hoist():
@@ -1091,6 +1103,206 @@ print('ok  UpdateRef: a compound assignment or a prefix ++ passed to a reference
       'written by the callee after every argument')
 
 
+def update_loop():
+    """UpdateLoop: an update passed to a reference parameter in a loop condition, on the right of &&, or in a call on
+    another object is the variable too. The C++ results: a loop condition is a full-expression evaluated before each
+    trip ([stmt.while]), so each trip runs `B += 1`, then IncRef's `V += 3` on B itself, and tests the B it returns;
+    && evaluates its right side only when the left is true ([expr.log.and]); the call's object is sequenced before its
+    arguments ([expr.call] 8, C++17): P is this, and OtherObj's GetP() makes B ten times M before `B += 1` reads it (an
+    update run ahead of the object gives 10M + 13, not 10M + 4). A copy passed instead leaves B 3 short per call (1617,
+    not 420)."""
+    base = asset('UpdateLoop')
+    keeps_invariants(base)
+
+    def loop(m):                                    # `while (IncRef(0, B += 1) < 20) N += 1;`, B starting at m
+        b, n = m, 0
+        while True:
+            b += 1; b += 3
+            if not b < 20: return n * 100 + b
+            n += 1
+    def do_loop(m):                                 # `do { N += 1; } while (IncRef(0, ++B) < 20);`: the test after the body
+        b, n = m, 0
+        while True:
+            n += 1; b += 4
+            if not b < 20: return n * 100 + b
+    for m in (0, 7, -3):
+        cases = (('Loop', loop(m)), ('LoopPre', loop(m)), ('LoopInline', loop(m)), ('LoopLocal', loop(m)),
+                 ('DoLoop', do_loop(m)), ('Arms', (m + 4) * 101 if m > 0 else (1000 + m + 4) * 100 + m + 4),
+                 ('AndRight', (1000 if m > 1 else 0) + m + 4 if m > 0 else m), ('Other', (1000 + m + 4) * 100 + m + 4),
+                 ('OtherObj', (1000 + 10 * m + 4) * 1000 + 10 * m + 4))
+        for fn, want in cases:
+            if not fn.startswith('Other'):          # runscript runs no call on another object
+                got = run(base, fn, {'B': 0}, M=m)[0]
+                assert got == want, 'UpdateLoop.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+            vm = VM(base, B=0)
+            vm.ref_params = True
+            got = vm.call(fn, M=m)
+            assert got == want, 'runvm: UpdateLoop.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+
+
+update_loop()
+print('ok  UpdateLoop: an update bound to a reference in a loop condition, right of &&, or in a call on another object '
+      'is the variable, which the callee writes')
+# Behind a braced member C++ evaluates first, the update would run ahead of it.
+refused('UpdateBrace', '  int32 B;\n  [[gnu::noinline]] int32 G() { return B; }\n'
+        '  [[gnu::noinline]] int32 IncRef(int32 X, int32& V) { V += 3; return V; }\n'
+        '  int32 F(int32 M) { FCbPair T = {G(), IncRef(0, B += 1)}; return T.B; }\n',
+        'an update (`+=`, `++`, ...) passed to a reference parameter after something its statement runs first', COMMA_TOP)
+
+
+def comma_places():
+    """CommaPlaces: the comma operator, and an assignment used as a value, in a loop condition, right of && / ||, in
+    an arm of ?:, and in an argument of a call on another object. The C++ results: the comma runs its left side, then
+    its right, whose value it is ([expr.comma]); a loop condition is evaluated before each trip ([stmt.while]); && / ||
+    and ?: evaluate only what the left side / condition picks ([expr.log.and], [expr.cond]); a call's object is
+    sequenced before its arguments ([expr.call] 8): P is this, and in OtherObj / OtherObjRef GetP()'s `Count *= 10`
+    runs before the comma's Bump (Bump first gives Count 10, not 1). Bound to IncRef's `int32&`, `(Bump(), N)` is N
+    itself, which IncRef's `V += 3` moves."""
+    base = asset('CommaPlaces')
+    keeps_invariants(base)
+
+    def loop_count(m):                              # `while ((Bump(), N) < 5) N += 1;`: N, and how often Bump ran
+        n, c = m, 0
+        while True:
+            c += 1
+            if not n < 5: return n * 100 + c
+            n += 1
+
+    def while_ref(m):                               # `while (IncRef(0, (Bump(), N)) < 20) T += 1;`
+        n, t = m, 0
+        while True:
+            n += 3
+            if not n < 20: return t * 100 + n
+            t += 1
+
+    def while_assign(m):                            # `while ((V = I * 2) < M) I += 1;`
+        i = 0
+        while i * 2 < m: i += 1
+        return i * 100 + i * 2
+    for m in (0, 3, 7, -2):
+        cases = (('While', loop_count(m)), ('For', loop_count(m)),
+                 ('Do', max(m + 1, 5) * 100 + max(m + 1, 5) - m),      # the test runs once per body run
+                 ('And', (1000 if m > 2 else 0) + (1 if m > 0 else 0)),
+                 ('Or', 1000 if m > 0 else (1000 if m < -1 else 0) + 2),
+                 ('Cond', (m + 1) * 100 + 1 if m > 0 else (m - 2) * 100 + 2),
+                 ('Other', (2 * m + 2) * 100 + 1), ('OtherRef', (1000 + m + 3) * 100 + (m + 3) * 10 + 1),
+                 ('OtherObj', (20 * m + 2) * 1000 + 10 * m + 1),
+                 ('OtherObjRef', (1003 + m) * 10000 + (m + 3) * 100 + 1),
+                 ('WhileRef', while_ref(m)), ('WhileAssign', while_assign(m)))
+        for fn, want in cases:
+            if not fn.startswith('Other'):          # runscript runs no call on another object
+                got = run(base, fn, {'Count': 0, 'N': 0}, M=m)[0]
+                assert got == want, 'CommaPlaces.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+            vm = VM(base, Count=0, N=0)
+            vm.ref_params = True
+            got = vm.call(fn, M=m)
+            assert got == want, 'runvm: CommaPlaces.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+
+
+comma_places()
+print('ok  CommaPlaces: a comma or an assignment used as a value in a loop condition, right of && / ||, in ?:, or in a '
+      'call on another object runs as C++ runs it')
+# A comma bound to an operator's `const T&` operand names the operator; a comma moved to a temporary of a type no
+# Blueprint variable holds is refused for what the user wrote, here the double arithmetic, not the temporary's name.
+refused('CommaOperand', '  int32 Count;\n  TArray<FString> L;\n  void Bump() { Count += 1; }\n'
+        '  [[gnu::noinline]] FString Get() { return FString("x"); }\n'
+        '  FString F() { L = {FString("a")}; return Get() + (Bump(), L[0]); }\n',
+        "the comma operator here is bound to a reference, operator `+`'s `const FString &` operand")
+refused('CommaDouble', '  int32 Count;\n  float M;\n  void Bump() { Count += 1; }\n'
+        '  [[gnu::noinline]] float G() { return 1.0f; }\n  float F() { return (Bump(), M) * (G() + 0.5); }\n',
+        'no Kismet conversion from float to double')
+print('ok  CommaOperand, CommaDouble: a comma refused in an operator\'s reference operand names the operator, and one '
+      'whose temporary no variable could hold is refused for what the user wrote')
+
+
+def assign_value():
+    """AssignValue: a struct's or an FString's `=` (operator=) read by value in a loop condition, right of &&, in an
+    arm of ?:, or in an argument of a call on another object. The C++ results: the assignment's value is T itself
+    ([expr.ass]), copied into the by-value parameter right after it; a loop condition is evaluated before each trip
+    ([stmt.while]); && and ?: evaluate only what the left side / condition picks ([expr.log.and], [expr.cond]); a
+    call's object is sequenced before its arguments ([expr.call] 8), and P is this. Refused on 9ac803ad, with a message
+    REFERENCE no longer listed."""
+    base = asset('AssignValue')
+    keeps_invariants(base)
+
+    def loop(m):                                    # `while (UsePairV(T = S) < 100) { S.A += 3; K += 1; }`
+        sa, k = m, 0
+        while True:
+            if not sa * 10 + 2 < 100: return k * 1000 + sa
+            sa += 3; k += 1
+    for m in (0, 1, 7):
+        cases = (('While', loop(m)), ('And', ((1000 if m * 10 + 2 > 50 else 0) + m) if m > 0 else 0),
+                 ('Cond', (m * 10 + 2) * 100 + m if m > 0 else 500), ('Other', (m * 10 + 2) * 100 + m),
+                 ('StrWhile', (4 if m > 2 else 0) * 10 + 1), ('StrAnd', 11 if m > 0 else 0))
+        for fn, want in cases:
+            if fn != 'Other':                       # runscript runs no call on another object
+                got = run(base, fn, {'S': {}, 'T': {}, 'Str': ''}, M=m)[0]
+                assert got == want, 'AssignValue.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+            vm = VM(base, S={}, T={}, Str='')
+            vm.ref_params = True
+            got = vm.call(fn, M=m)
+            assert got == want, 'runvm: AssignValue.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+
+
+assign_value()
+print('ok  AssignValue: a struct\'s or an FString\'s = read by value in a loop condition, right of &&, in ?: or in a '
+      'call on another object is a copy of what it assigned')
+# A member taken of a struct `=` in a loop condition uses its place, which no statement before the loop can hold; an
+# assignment updated whose left side is no plain variable would locate it twice.
+refused('AssignMemberPlace', '  FCbPair S;\n  FCbPair T;\n'
+        '  int32 F(int32 M) { S.A = M; int32 K = 0; while ((T = S).A < 9) { S.A += 3; K += 1; } return K; }\n',
+        'an assignment used as a place, not a value', COMMA_TOP)
+refused('AssignSlotUpdate', '  TArray<int32> L;\n  int32 Idx() { return 0; }\n'
+        '  int32 F(int32 M) { L = {M}; int32 K = 0; while (((L[Idx()] = M) += 1) < 5) { M += 1; K += 1; } return K; }\n',
+        'an assignment assigned to or updated, whose left side is no plain variable')
+print('ok  AssignMemberPlace, AssignSlotUpdate: a member of a struct = in a loop condition, and an update of an '
+      'assignment to no plain variable, are refused by name')
+
+
+def comma_targets():
+    """CommaTargets: the comma operator assigned to or updated, in a loop condition, right of &&, and as a statement
+    whose right side is a call. The C++ results: the comma is its right side, the lvalue N ([expr.comma]), so each
+    trip runs Bump, then the update on N; a loop condition is evaluated before each trip ([stmt.while]); && evaluates
+    its right side only when the left is true ([expr.log.and]); an assignment's right side is sequenced before its
+    left ([expr.ass]/1, C++17), so G() reads Count before Bump moves it. A plain `=` assigned to or updated is its
+    left side after it ([expr.ass]): G() runs before Next(), and OnAssignEq's `N + 1` reads N before `N = M`. Refused
+    on 9ac803ad as "TODO: assignment to BinaryOperator"."""
+    base = asset('CommaTargets')
+    keeps_invariants(base)
+
+    def loop(m, post=False, by_g=False, limit=5):   # Count bumps once per trip; N moves by 1 (or by G(), Count before it)
+        c, n = 0, m
+        while True:
+            g = c; c += 1
+            v = n
+            n += g if by_g else 1
+            if not (v if post else n) < limit: return n * 100 + c
+    def on_assign_call(m):                          # `while (((N = Next()) += G()) < 20) K += 1;`, Count from m
+        c, k = m, 0
+        while True:
+            g = c; c += 1; n = c + g
+            if not n < 20: return k * 100 + n
+            k += 1
+    for m in (0, 3, 7, 12):
+        cases = (('Compound', loop(m)), ('Pre', loop(m)), ('Post', loop(m, post=True)), ('Assign', loop(m)),
+                 ('CompoundCall', loop(m, by_g=True, limit=9)),
+                 ('AndRight', ((1000 if m + 1 > 2 else 0) + (m + 1) * 10 + 1) if m > 0 else m * 10),
+                 ('StmtAssign', m * 100 + m + 1), ('StmtCompound', (1 + m) * 100 + m + 1),
+                 ('OnAssign', max(0, 4 - m) * 100 + max(m + 1, 5)), ('OnAssignEq', 405),
+                 ('OnAssignCall', on_assign_call(m)), ('OnAssignStmt', (2 * m + 1) * 100 + m + 1))
+        for fn, want in cases:
+            got = run(base, fn, {'Count': 0, 'N': 0}, M=m)[0]
+            assert got == want, 'CommaTargets.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+            vm = VM(base, Count=0, N=0)
+            got = vm.call(fn, M=m)
+            assert got == want, 'runvm: CommaTargets.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+
+
+comma_targets()
+print('ok  CommaTargets: a comma or a = assigned to or updated in a loop condition, right of &&, or before a call on its '
+      'right runs its left side, then the update of the variable it names')
+
+
 def comma_ctor_default():
     """CommaCtorDefault: a comma among a parenthesised constructor's arguments runs as among a call's (Get before it or
     after it, Y is M); a comma beside nothing but a constant default argument needs no temporary, and its element
@@ -1138,8 +1350,9 @@ def expr_temps():
     # Read again after the store, the left side must be a plain variable; and where a comma could not move, neither can it.
     refused('AssignElement', '  int32 A;\n  int32 F(int32 M) { TArray<int32> L = {1}; A = L[0] = M; return A; }\n',
             'an assignment used as a value, whose left side is no plain variable')
-    refused('AssignWhile', '  int32 A;\n  int32 F(int32 M) { while ((A = M) < 3) M += 1; return A; }\n',
-            'an assignment used as a value in a loop condition')
+    refused('AssignBrace', '  int32 A;\n  [[gnu::noinline]] int32 G() { return A; }\n'
+            '  int32 F(int32 M) { FCbPair T = {G(), (A = M)}; return T.B; }\n',
+            'an assignment used as a value after something its statement runs first', COMMA_TOP)
 
 
 expr_temps()
