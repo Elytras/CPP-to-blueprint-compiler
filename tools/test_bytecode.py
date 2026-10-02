@@ -7882,6 +7882,7 @@ def struct_ctor_values():
     does (frame_defaults). A default holds the same: a class member, its `FVector4()`, the same over a parent's value,
     and a UE_STRUCT's member the braces leave out."""
     import struct
+    import runvm
     base = asset('StructCtorValues')
     keeps_invariants(base)
     for fn, want in (('XfLocal', 2), ('XfTemp', 1), ('XfArg', 1), ('XfAssign', 1), ('XfLoop', 6), ('XfBareLoop', 6),
