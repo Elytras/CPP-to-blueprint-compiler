@@ -1303,6 +1303,59 @@ print('ok  CommaTargets: a comma or a = assigned to or updated in a loop conditi
       'right runs its left side, then the update of the variable it names')
 
 
+def assigned_comma_stmt():
+    """AssignedCommaStmt: an assignment onto a comma used as a value in a statement, `int32 X = ((Bump(), N) = G());`.
+    The C++ results: the assignment's value is its left operand ([expr.ass]), the comma's right side, the lvalue N
+    ([expr.comma]), or T.A of it ([expr.ref]); C++17 sequences G() before the comma ([expr.ass]/1), so it reads Count
+    before Bump moves it; `(... = G()) += 1` updates N after the assignment. Refused on fa30eccf as "an assignment used
+    as a value, whose left side is no plain variable", where the loop form compiles. An update of an assignment to an
+    element (`(IL[Idx()] = M) += 1;`) would locate the element twice: refused, as in a loop condition."""
+    base = pending_asset('AssignedCommaStmt')
+    keeps_invariants(base)
+    for m in (0, 3):
+        for fn, want in (('Value', 10 * m * 100 + m + 1), ('Member', 10 * m * 100 + m + 1),
+                         ('Update', (10 * m + 1) * 100 + m + 1)):
+            got = run(base, fn, {'Count': 0, 'N': 0, 'T': {}}, M=m)[0]
+            assert got == want, 'AssignedCommaStmt.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+            got = VM(base, Count=0, N=0, T={}).call(fn, M=m)
+            assert got == want, 'runvm: AssignedCommaStmt.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+    refused('SlotUpdStmt', '  int32 Count;\n  TArray<int32> IL;\n  [[gnu::noinline]] int32 Idx() { Count += 1; return 0; }\n'
+            '  int32 F(int32 M) { IL = {0}; (IL[Idx()] = M) += 1; return IL[0]; }\n',
+            'an assignment assigned to or updated, whose left side is no plain variable')
+
+
+pending('AssignedCommaStmt: an assignment onto a comma used as a value in a statement writes the variable it names',
+        assigned_comma_stmt)
+
+
+def member_of_comma():
+    """MemberOfComma: a member or an element of a comma updated or assigned in a loop condition. The C++ results: the
+    comma is its right side, the lvalue T or IL ([expr.comma]), T.A a member of it ([expr.ref]), IL[0] its element
+    after the comma ran (an overloaded operator's operands sequenced as the built-in's, [over.match.oper]/2, [expr.sub]);
+    a loop condition is evaluated before each trip ([stmt.while]); `(Bump(), T).A = T.A + Count` reads its right side
+    first ([expr.ass]/1, C++17), Count before Bump. Refused on fa30eccf as "the comma operator after something its
+    statement runs first", which the user never wrote."""
+    base = pending_asset('MemberOfComma')
+    keeps_invariants(base)
+
+    def loop(m, by_count=False, limit=5):           # Count bumps once per trip; A moves by 1 (or by Count before it)
+        c, a = 0, m
+        while True:
+            g = c; c += 1
+            a += g if by_count else 1
+            if not a < limit: return a * 100 + c
+    for m in (0, 3, 7):
+        for fn, want in (('Member', loop(m)), ('Element', loop(m)), ('Step', loop(m)),
+                         ('Assign', loop(m, by_count=True, limit=9))):
+            got = run(base, fn, {'Count': 0, 'T': {}, 'IL': []}, M=m)[0]
+            assert got == want, 'MemberOfComma.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+            got = VM(base, Count=0, T={}, IL=[]).call(fn, M=m)
+            assert got == want, 'runvm: MemberOfComma.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+
+
+pending('MemberOfComma: a member or an element of a comma updated in a loop condition writes it', member_of_comma)
+
+
 def comma_slot_right():
     """CommaSlotRight: a struct's or FString's `=` onto a comma whose right side is an element, `(Bump(), T) = L[Count]`.
     C++17 sequences the right operand before the left ([expr.ass]/1; an overloaded operator's operands in that order,
@@ -8241,6 +8294,35 @@ print('ok  DefaultsBracesNested: braces over a UE_STRUCT member\'s own initializ
       'leave the rest the engine\'s')
 
 
+def defaults_nest_deep():
+    """Braces three deep over a fresh parent O, `O = {.In = {.Hit = {.Distance = 3.0f}}}`: In's initializer
+    ({.K = 4}) leaves Hit out, so the parent's O.In.Hit is the engine's fresh FHitResult, and the braces leave the rest
+    of Hit as that, untagged, as the editor's Make Struct over it would. K, left out of `.In = {...}`, takes its
+    initializer 0 over the parent's 4 ([dcl.init.aggr]/5). Where In's initializer gives Hit a value (Time 0.5), the
+    member the new braces leave out over it is refused by name. Refused on fa30eccf at O.In.Hit.FaceIndex."""
+    import struct
+    base = pending_asset('DefaultsNestDeep')
+    keeps_invariants(base)
+    pkg = invariants.Package(base)
+    cdo = pkg.find('Default__DefaultsNestDeep_C')
+
+    def members(at=None):
+        return {t['name'].split('_')[0]: t for t in (pkg.tags(cdo, at) if at is not None else pkg.tags(cdo))}
+    o = members(members()['O']['at'])
+    inner = members(o['In']['at'])
+    hit = {n: struct.unpack('<f', t['value'])[0] for n, t in members(inner['Hit']['at']).items()}
+    k = struct.unpack('<i', inner['K']['value'])[0] if 'K' in inner else None
+    assert hit == {'Distance': 3.0} and k == 0, 'O.In is written K %r, Hit %r; C++ gives K 0, Hit Distance 3 alone' % (k, hit)
+    refused('NestDeepGiven', '  UE_DEFAULTS {\n    O = {.In = {.Hit = {.Distance = 3.0f}}};\n  }\n',
+            "O.In.Hit.Time, left out of the braces, holds what the engine's FHitResult constructor sets",
+            'struct FNdgInner {\n  UE_STRUCT;\n  int32 K = 0;\n  FHitResult Hit;\n};\n'
+            'struct FNdgOuter {\n  UE_STRUCT;\n  FNdgInner In = {.K = 4, .Hit = {.Time = 0.5f}};\n};\n'
+            'class NdgParent : public AActor {\npublic:\n  FNdgOuter O;\n};\n', 'NdgParent')
+
+
+pending('DefaultsNestDeep: braces under a member\'s initializer follow it down to what it leaves fresh', defaults_nest_deep)
+
+
 def defaults_braces_twice():
     """Two UE_DEFAULTS statements on one member: the second is a whole new value, so a member its braces leave out holds
     the engine's (Time 1), not the first statement's Time 3. The loader applies the CDO's tags in order, each struct
@@ -8277,6 +8359,28 @@ def defaults_braces_other_mod():
 
 defaults_braces_other_mod()
 print('ok  DefaultsBracesOther: another mod\'s struct is no engine struct to braces: a member left out takes its initializer')
+
+
+def defaults_other_ctor():
+    """`O = FDboOther();` and `P = {};` of another mod's UE_STRUCT_IN struct are its value-initialisation, which C++
+    makes from each member's initializer (the implicit default constructor, [class.base.init]/9; empty braces of an
+    aggregate, [dcl.init.aggr]/5): A 3 and B 4, written over the parent's (1, 2) and (5, 6). The shared header says
+    every member's value; only an engine struct's constructor is one no header says. Refused on fa30eccf as "holds what
+    the engine's FDboOther constructor sets"."""
+    import struct
+    asset('DboOtherMod')
+    base = pending_asset('DefaultsOtherCtor')
+    keeps_invariants(base)
+    pkg = invariants.Package(base)
+    cdo = pkg.find('Default__DefaultsOtherCtor_C')
+    tags = {t['name']: t for t in pkg.tags(cdo)}
+    for name in ('O', 'P'):
+        got = ({m['name'].split('_')[0]: struct.unpack('<i', m['value'])[0] for m in pkg.tags(cdo, tags[name]['at'])}
+               if name in tags else None)
+        assert got == {'A': 3, 'B': 4}, '%s is written %r, where C++ value-initialises it to A 3, B 4' % (name, got)
+
+
+pending('DefaultsOtherCtor: another mod\'s struct\'s T() or {} is its members\' initializers', defaults_other_ctor)
 
 
 def tenum_value_init():
