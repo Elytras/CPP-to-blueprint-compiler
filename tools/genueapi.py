@@ -895,6 +895,11 @@ def parse_field(cur, m, skipped):
     node = re.search(r"ScsNode=([0-9a-f]{32})", flags)
     if node:
         cur.scs_nodes[fname] = node.group(1)
+    # A native dispatcher's BlueprintAssignable / BlueprintCallable: the editor's Bind / Add / Remove / Clear nodes need
+    # the first, its Call node the second (K2Node_MCDelegate.cpp 36-46, 453-462). Of FSD's 1046 native dispatchers 41 are
+    # callable and 17 not assignable; every Blueprint's dispatcher is both, so a Blueprint class needs no mark.
+    if not cur.is_bp and mapped.startswith(("TMulticastInlineDelegate<", "TMulticastSparseDelegate<")):
+        cur.dispatchers[fname] = " ".join(f for f in ("Assignable", "Callable") if re.search(r"\bBlueprint%s\b" % f, flags))
 
 
 class Klass(object):
@@ -914,6 +919,7 @@ class Klass(object):
         self.replicated = {}     # field -> its RepNotify function, "" when none (or the dump predates the name)
         self.offsets = {}        # field -> (offset, ordinal among the members at that offset): the join to REAL_FIELDS
         self.scs_nodes = {}      # component variable -> its SCS node's VariableGuid, 32 hex digits
+        self.dispatchers = {}    # a native class's dispatcher -> "Assignable Callable", what of the two it is
         self.stem = ""           # the SDK file it came from: <stem>_classes.hpp pairs with <stem>_functions.cpp
 
 
@@ -1635,6 +1641,9 @@ def main():
                     # What UE_REPLICATED_USING declares for a mod class: AssetGen wakes the actor before a set and
                     # calls the RepNotify function after it, as the editor's Set node does.
                     body.append('    static constexpr const char* %s__Replicated = "%s:";' % (fname, k.replicated[fname]))
+                if fname in k.dispatchers:
+                    # Which of the editor's dispatcher nodes take it: AssetGen refuses the others, as the editor does.
+                    body.append('    static constexpr const char* %s__UeDispatcher = "%s";' % (fname, k.dispatchers[fname]))
                 fields += 1
                 referenced.update(class_refs(ftype))
             for fname in sorted(k.subobjects):
