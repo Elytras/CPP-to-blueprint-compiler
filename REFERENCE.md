@@ -1481,6 +1481,7 @@ Notes:
 | `Spots[Name].X = 1;` | A store into a map value's member is copied out, changed and stored back, as `T E = Map[K]; E.X = 1; Map[K] = E;`, with the key evaluated once. | Yes |
 | `Acc += I;`, and `-=` `*=` `/=` `%=` `&=` `\|=` `^=` `<<=` `>>=` | `X = X op Y`: a math node and a Set. X is located once, so `Slots[NextSlot()] += By` calls NextSlot a single time, and Y is evaluated first. It works on everything plain `=` works on, map values and their members included. `<<=`, `>>=` and int64 `%=` follow the rules of the plain operators. | Yes |
 | `int32 Z = (Y += X) * 10;` | A compound assignment used as a value is X after the store. | Yes |
+| `IncRef(1, B += 1)`, `Peek(SetB(), ++B)`, where the parameter is `int32&` or `const int32&` | Passed to a reference parameter, a compound assignment or a prefix `++` / `--` is the variable itself, as a plain `=` is: the update runs first, as a statement, and the callee reads, and for `T&` writes, B after every argument. Its left side must be a plain variable (`IncRef(1, L[Idx()] += 1)` is refused); in a loop condition it is still a copy the callee's write does not reach (TODO.md). | Yes |
 | `X++`, `++X`, `X--`, `--X` | The Increment Int and Decrement Int macros, with X located once. Postfix gives the value before the store, prefix the value after. Works on int32, int64, float and uint8 (a uint8 wraps at 255). On a raw pointer it steps by the element size; see [Pointers and memory](#pointers-and-memory). | Yes |
 | `A = B = 0;`, `S1 = S2 = Name;`, `if ((X = Next()) > 3)`, `return A = N;` | A plain `=` used as a value: the assignment runs first, as a statement, and the value is the variable it wrote, read after it. Numbers, strings and structs alike. It works wherever the comma operator does, and like it, passed to a reference parameter (`const T&` included) it is that variable itself, with no copy. In a loop condition, on the right of `&&` / `\|\|` / `?:` or in an argument of a call on another object it is refused ("an assignment used as a value in a loop condition, ..."); use a declaring condition there, `while (int32 Left = Start - Steps)`. The left side must be a plain variable (`A = L[0] = 1` is refused): it is read again. | Yes |
 
@@ -5804,6 +5805,9 @@ and where the feature is described. In each group, the messages you are most lik
   `while (int32 Left = Next())`. See [Operators](#operators).
 - `an assignment used as a value, whose left side is no plain variable, which would be evaluated again to read it:
   ...`: `A = L[0] = N`. Fix: assign in a statement of its own, then use what it assigned. See [Operators](#operators).
+- `an update (`+=`, `++`, ...) passed to a reference parameter, whose left side is no plain variable, ...`:
+  `IncRef(1, L[Idx()] += 1)` where IncRef takes `int32&` or `const int32&`. Fix: update in a statement of its own,
+  then pass the element. See [Operators](#operators).
 - `inline call to <Class>::<Method> with <N> arguments`: a C-style variadic inline function,
   `inline int32 First(int32 N, ...)`, called with extra arguments. Fix: give it a fixed parameter list, or overloads.
   See [Inline functions and templates](#inline-functions-and-templates).

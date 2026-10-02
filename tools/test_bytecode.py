@@ -1050,6 +1050,47 @@ print('ok  CommaConstRef: a comma or an assignment bound to a const T& beside a 
       'when the callee runs')
 
 
+def update_ref():
+    """UpdateRef: a compound assignment or a prefix ++ passed to a reference parameter is the variable itself: the
+    callee's write to an `int32&` lands in B (M + 4 after `IncRef(1, B += 1)`), and beside SetB, which writes B too,
+    the callee reads B after both arguments, in either order C++ may pick. A struct member bound to a `const T&` is
+    read when the callee runs too (Member: 1050, S.A 50). Read's `(B += 1) * 2` is a value, read where it stands. Each
+    case runs under runscript and under runvm with ref_params, the two oracles reading a reference argument alike."""
+    base = asset('UpdateRef')
+    keeps_invariants(base)
+    for m in (0, 7, -3):
+        cases = (('Alone', {(1004 + m, m + 4)}), ('PreAlone', {(1004 + m, m + 4)}),
+                 ('ConstBeside', {(1050, 50), (1051, 51)}), ('PreBeside', {(1050, 50), (1051, 51)}),
+                 ('RefBeside', {(1053, 53), (1054, 54)}), ('Read', {((m + 1) * 200 + m + 1, m + 1)}))
+        for fn, legal in cases:
+            me = {'B': 0, 'S': {}}
+            got = run(base, fn, me, M=m)[0]
+            assert (got, me['B']) in legal, 'UpdateRef.%s(%d) = %r, B %r; C++ allows %r' % (fn, m, got, me['B'], legal)
+            vm = VM(base, B=0, S={})
+            vm.ref_params = True
+            got = vm.call(fn, M=m)
+            assert (got, vm.self.vars['B']) in legal, 'runvm: UpdateRef.%s(%d) = %r, B %r; C++ allows %r' % (
+                fn, m, got, vm.self.vars['B'], legal)
+        a_of = lambda st: next(v for k, v in st.items() if k.split('_')[0] == 'A')    # a UDS member's GUID-suffixed name
+        me = {'B': 0, 'S': {}}
+        got = run(base, 'Member', me, M=m)[0]
+        assert (got, a_of(me['S'])) == (1050, 50), 'UpdateRef.Member(%d) = %r, S %r' % (m, got, me['S'])
+        vm = VM(base, B=0, S={})
+        vm.ref_params = True
+        got = vm.call('Member', M=m)
+        assert (got, a_of(vm.self.vars['S'])) == (1050, 50), 'runvm: UpdateRef.Member(%d) = %r, S %r' % (m, got, vm.self.vars['S'])
+    # Its place found by a call, the update cannot be read again as the variable it wrote.
+    refused('UpdateRefSlot', '  TArray<int32> L;\n  int32 Idx() { return 0; }\n'
+            '  int32 IncRef(int32 X, int32& V) { V += 3; return X * 1000 + V; }\n'
+            '  int32 Slot(int32 M) { L = {M}; return IncRef(1, L[Idx()] += 1); }\n',
+            'an update (`+=`, `++`, ...) passed to a reference parameter, whose left side is no plain variable')
+
+
+update_ref()
+print('ok  UpdateRef: a compound assignment or a prefix ++ passed to a reference parameter is the variable, read and '
+      'written by the callee after every argument')
+
+
 def comma_ctor_default():
     """CommaCtorDefault: a comma among a parenthesised constructor's arguments runs as among a call's (Get before it or
     after it, Y is M); a comma beside nothing but a constant default argument needs no temporary, and its element
@@ -5527,6 +5568,10 @@ def opnd_ref_args():
         mine = fields(Member=3)
         got = run(base, 'ReadLate', self_vars=mine, V=v)[0]
         assert (got, mine['Member']) == (wrap((v + 5) * 10 + 1), v + 5), ('ReadLate', v, got, mine)
+        vm = VM(base, **fields(Member=3))      # runvm reads it then too
+        vm.ref_params = True
+        got = vm.call('ReadLate', V=v)
+        assert (got, vm.self.vars['Member']) == (wrap((v + 5) * 10 + 1), v + 5), ('runvm ReadLate', v, got, vm.self.vars)
     print('ok  OpndRefArgs.ReadLate: a const reference argument is read when the callee runs, after the arguments after it')
     # On another object: Virt is found on Other's class by name and runs there, Other->Member is Other's, and the
     # argument Member + X is read on this object (the arguments of a call under EX_Context run on the caller).

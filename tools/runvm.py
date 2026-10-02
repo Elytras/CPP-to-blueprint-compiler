@@ -202,7 +202,14 @@ class VM:
                     if parm in runscript.params_of(s.base, name, 0x100) and a.op not in runscript.ADDRESSABLE \
                             and not (a.op in (0x19, 0x1A) and a.kids[1].op in runscript.ADDRESSABLE):
                         raise SystemExit('vm: %s: reference parameter %s gets a non-variable (op %02x), which crashes the VM' % (name, parm, a.op))
-                vals, first = [ev(a) for a in n.kids], len(s.env_log)
+                # A reference argument the callee reads through its address is read once every argument has run, as
+                # runscript reads it (read_late): a sibling may write it first.
+                outs = runscript.params_of(s.base, name, 0x100)
+                bound = [i < len(s.script(name)[2]) and s.script(name)[2][i] in outs and runscript.read_late(a)
+                         for i, a in enumerate(n.kids)]
+                vals = [None if b else ev(a) for b, a in zip(bound, n.kids)]
+                vals = [ev(a) if b else v for b, a, v in zip(bound, n.kids, vals)]
+                first = len(s.env_log)
                 r = s.call(name, *vals, on=ctx)
                 if s.ref_params: s.ref_writeback(name, n.kids, s.env_log[first], store)
                 return None if r is STALE and not keep else r

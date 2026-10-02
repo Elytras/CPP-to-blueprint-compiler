@@ -9790,6 +9790,23 @@ int32 FCompiler::HoistComma(const Json& Stmt, Json* Seq, std::string* Err)
         return (K == "BinaryOperator" && E.value("opcode", std::string()) == "=")
             || (K == "CXXOperatorCallExpr" && OperatorOf(E) == "=" && Nth(E, 2));
     };
+    /* A compound assignment or a prefix ++ / -- whose place is not read but bound, to a `T&` or `const T&` parameter
+       (`IncRef(1, B += 1)`): the callee reads and writes the place itself, after every argument, so it is the
+       assignment's `(B += 1, B)` too. LowerArg's value of one (LowerUpdateValue) is a copy, right where it is read. */
+    auto IsUpdate = [&](const Json& E) {
+        const std::string K = Kind(E), Op = E.value("opcode", std::string());
+        if (K == "CompoundAssignOperator") return true;
+        if (K == "UnaryOperator") return (Op == "++" || Op == "--") && !E.value("isPostfix", false);
+        if (K != "CXXOperatorCallExpr") return false;
+        const std::string Sym = OperatorOf(E);
+        return (Assigns.count(Sym) && Sym != "=" && Nth(E, 2)) || ((Sym == "++" || Sym == "--") && !Nth(E, 2));
+    };
+    std::set<const Json*> ReadUpdates;     // updates whose value is read where they stand: LowerArg's
+    auto NoteRead = [&](Json& Operand) {
+        Json* N = &Operand;
+        while (Kind(*N) == "ParenExpr" && N->contains("inner") && !(*N)["inner"].empty()) N = &(*N)["inner"][0];
+        if (IsUpdate(*N)) ReadUpdates.insert(N);
+    };
     /* A left-out argument stands for its parameter's default, which C++ evaluates at the call like any other argument:
        a fixed value there (`int32 By = 5`) is no sibling that could run before the comma. */
     std::set<const Json*> FixedDefaults;
@@ -9806,9 +9823,11 @@ int32 FCompiler::HoistComma(const Json& Stmt, Json* Seq, std::string* Err)
     std::function<Json*(Json&, bool)> Seek = [&](Json& E, bool bRoot) -> Json* {
         if (!E.is_object()) return nullptr;
         const std::string K = Kind(E);
-        if (!bRoot && (IsComma(E) || IsAssign(E))) { Target = &E; return &E; }
+        if (!bRoot && (IsComma(E) || IsAssign(E) || (IsUpdate(E) && !ReadUpdates.count(&E)))) { Target = &E; return &E; }
         if (!E.contains("inner") || !E["inner"].is_array() || E["inner"].empty()) return nullptr;
         Json& In = E["inner"];
+        if ((K == "ImplicitCastExpr" && E.value("castKind", std::string()) == "LValueToRValue") || K == "CXXConstructExpr")
+            for (Json& C : In) NoteRead(C);
         auto Ordered = [&](std::initializer_list<size_t> Order) -> Json* {
             for (size_t I : Order)
             {
@@ -9932,10 +9951,13 @@ int32 FCompiler::HoistComma(const Json& Stmt, Json* Seq, std::string* Err)
     const bool bAssign = !IsComma(*Target);
     const Json Left = bAssign ? *Target : (*Target)["inner"][0];
     const Json Right = !bAssign ? (*Target)["inner"][1] : (*Target)["inner"][Kind(*Target) == "CXXOperatorCallExpr" ? 1 : 0];
+    const bool bUpdate = bAssign && IsUpdate(*Target);
     if (bAssign && !IsEagerSafe(*Strip(&Right)))
-    { *Err = "an assignment used as a value, whose left side is no plain variable, which would be evaluated again to read "
-             "it: assign in a statement of its own, then use what it assigned"; return -1; }
-    const std::string What = bAssign ? "an assignment used as a value" : "the comma operator";
+    { *Err = std::string(bUpdate ? "an update (`+=`, `++`, ...) passed to a reference parameter" : "an assignment used as a value")
+             + ", whose left side is no plain variable, which would be evaluated again to read it: assign in a statement "
+               "of its own, then use what it assigned"; return -1; }
+    const std::string What = !bAssign ? "the comma operator"
+                           : bUpdate ? "an update (`+=`, `++`, ...)" : "an assignment used as a value";
     const Json* Moved = nullptr;
     for (auto L = Levels.rbegin(); L != Levels.rend() && !Moved; ++L)    // outermost first
         if (!L->bFixed)

@@ -330,6 +330,15 @@ INT64_RESULT = {'Conv_IntToInt64', 'FTrunc64', 'Not_Int64'} | {op + '_Int64Int64
 # The operands that leave Stack.MostRecentPropertyAddress, which StructMemberContext and ArrayGetByRef offset into:
 # a call evaluated into nothing leaves none (and a native writes its result through a null RESULT_PARAM).
 ADDRESSABLE = {0, 1, 0x48, 0x42, 0x6B}
+
+
+def read_late(a):
+    """A reference argument whose place is found without running anything: a variable, or a member of one, however
+    deep (execStructMemberContext leaves MostRecentPropertyAddress at the member inside the real struct, ScriptCore.cpp
+    2957). The callee reads such a place through its address after every argument has run (ProcessScriptFunction's
+    out-parm list, EX_LocalOutVariable), so an oracle reads it then too. An element is read in place: its index may
+    run code."""
+    return a.op in (0, 1, 0x48) or (a.op == 0x42 and read_late(a.kids[0]))
 # The arguments a native reads by address: a const reference parameter (P_GET_PROPERTY_REF takes the address the
 # argument left) and a container library's containers (stepped into no buffer, then read where they lie). A call or a
 # cast there leaves the address of whatever ITS operands read last, and the native reads that - an int64 as an FText
@@ -602,7 +611,7 @@ def run(base, function, self_vars=None, **parms):
                     raise SystemExit('%s: reference parameter %s gets a non-variable (op %02x), which crashes the VM' % (n.val, name, a.op))
             # A reference parameter is the caller's variable, which the callee reads through its address (EX_LocalOutVariable,
             # ProcessScriptFunction's out-parm list): what it holds once every argument has run, not when its argument came.
-            bound = [i < len(names) and names[i] in outs and a.op in (0, 1, 0x48) for i, a in enumerate(n.kids)]
+            bound = [i < len(names) and names[i] in outs and read_late(a) for i, a in enumerate(n.kids)]
             vals = [None if b else copy.deepcopy(ev(a)) for b, a in zip(bound, n.kids)]
             vals = [copy.deepcopy(ev(a)) if b else v for b, a, v in zip(bound, n.kids, vals)]
             r, callee = run(base, n.val, self_vars, **dict(zip(names, vals)))
