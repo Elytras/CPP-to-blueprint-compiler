@@ -1091,6 +1091,98 @@ print('ok  UpdateRef: a compound assignment or a prefix ++ passed to a reference
       'written by the callee after every argument')
 
 
+def update_loop():
+    """UpdateLoop: an update passed to a reference parameter in a loop condition, on the right of &&, or in a call on
+    another object is the variable too. The C++ results: a loop condition is a full-expression evaluated before each
+    trip ([stmt.while]), so each trip runs `B += 1`, then IncRef's `V += 3` on B itself, and tests the B it returns;
+    && evaluates its right side only when the left is true ([expr.log.and]); the call's object is sequenced before its
+    arguments ([expr.call] 8, C++17), and P is this. A copy passed instead leaves B 3 short per call (1617, not 420)."""
+    base = pending_asset('UpdateLoop')
+    keeps_invariants(base)
+
+    def loop(m):                                    # `while (IncRef(0, B += 1) < 20) N += 1;`, B starting at m
+        b, n = m, 0
+        while True:
+            b += 1; b += 3
+            if not b < 20: return n * 100 + b
+            n += 1
+    for m in (0, 7, -3):
+        cases = (('Loop', loop(m)), ('LoopPre', loop(m)), ('LoopInline', loop(m)), ('LoopLocal', loop(m)),
+                 ('AndRight', (1000 if m > 1 else 0) + m + 4 if m > 0 else m), ('Other', (1000 + m + 4) * 100 + m + 4))
+        for fn, want in cases:
+            if fn != 'Other':                       # runscript runs no call on another object
+                got = run(base, fn, {'B': 0}, M=m)[0]
+                assert got == want, 'UpdateLoop.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+            vm = VM(base, B=0)
+            vm.ref_params = True
+            got = vm.call(fn, M=m)
+            assert got == want, 'runvm: UpdateLoop.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+
+
+pending('UpdateLoop: an update bound to a reference in a loop condition, right of &&, or in a call on another object '
+        'is the variable', update_loop)
+
+
+def comma_places():
+    """CommaPlaces: the comma operator, and an assignment used as a value, in a loop condition, right of && / ||, in
+    an arm of ?:, and in an argument of a call on another object. The C++ results: the comma runs its left side, then
+    its right, whose value it is ([expr.comma]); a loop condition is evaluated before each trip ([stmt.while]); && / ||
+    and ?: evaluate only what the left side / condition picks ([expr.log.and], [expr.cond]); a call's object is
+    sequenced before its arguments ([expr.call] 8), and P is this. Bound to IncRef's `int32&`, `(Bump(), N)` is N
+    itself, which IncRef's `V += 3` moves."""
+    base = pending_asset('CommaPlaces')
+    keeps_invariants(base)
+
+    def loop_count(m):                              # `while ((Bump(), N) < 5) N += 1;`: N, and how often Bump ran
+        n, c = m, 0
+        while True:
+            c += 1
+            if not n < 5: return n * 100 + c
+            n += 1
+
+    def while_ref(m):                               # `while (IncRef(0, (Bump(), N)) < 20) T += 1;`
+        n, t = m, 0
+        while True:
+            n += 3
+            if not n < 20: return t * 100 + n
+            t += 1
+
+    def while_assign(m):                            # `while ((V = I * 2) < M) I += 1;`
+        i = 0
+        while i * 2 < m: i += 1
+        return i * 100 + i * 2
+    for m in (0, 3, 7, -2):
+        cases = (('While', loop_count(m)), ('For', loop_count(m)),
+                 ('And', (1000 if m > 2 else 0) + (1 if m > 0 else 0)),
+                 ('Or', 1000 if m > 0 else (1000 if m < -1 else 0) + 2),
+                 ('Cond', (m + 1) * 100 + 1 if m > 0 else (m - 2) * 100 + 2),
+                 ('Other', (2 * m + 2) * 100 + 1), ('OtherRef', (1000 + m + 3) * 100 + (m + 3) * 10 + 1),
+                 ('WhileRef', while_ref(m)), ('WhileAssign', while_assign(m)))
+        for fn, want in cases:
+            if not fn.startswith('Other'):          # runscript runs no call on another object
+                got = run(base, fn, {'Count': 0, 'N': 0}, M=m)[0]
+                assert got == want, 'CommaPlaces.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+            vm = VM(base, Count=0, N=0)
+            vm.ref_params = True
+            got = vm.call(fn, M=m)
+            assert got == want, 'runvm: CommaPlaces.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+
+
+pending('CommaPlaces: a comma or an assignment used as a value in a loop condition, right of && / ||, in ?:, or in a '
+        'call on another object runs as C++ runs it', comma_places)
+# A comma bound to an operator's `const T&` operand names the operator; a comma moved to a temporary of a type no
+# Blueprint variable holds is refused for what the user wrote, here the double arithmetic, not the temporary's name.
+pending('CommaOperandMessage', lambda: refused(
+    'CommaOperand', '  int32 Count;\n  TArray<FString> L;\n  void Bump() { Count += 1; }\n'
+    '  [[gnu::noinline]] FString Get() { return FString("x"); }\n'
+    '  FString F() { L = {FString("a")}; return Get() + (Bump(), L[0]); }\n',
+    "the comma operator here is bound to a reference, operator `+`'s `const FString &` operand"))
+pending('CommaDoubleMessage', lambda: refused(
+    'CommaDouble', '  int32 Count;\n  float M;\n  void Bump() { Count += 1; }\n'
+    '  [[gnu::noinline]] float G() { return 1.0f; }\n  float F() { return (Bump(), M) * (G() + 0.5); }\n',
+    'no Kismet conversion from float to double'))
+
+
 def comma_ctor_default():
     """CommaCtorDefault: a comma among a parenthesised constructor's arguments runs as among a call's (Get before it or
     after it, Y is M); a comma beside nothing but a constant default argument needs no temporary, and its element
