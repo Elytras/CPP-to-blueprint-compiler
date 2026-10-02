@@ -1401,6 +1401,53 @@ print('ok  MemberOfComma: the same as statements, an if condition, an initialize
       'side run before the comma')
 
 
+def updated_update():
+    """UpdatedUpdate: an update, or a struct's operator=, itself updated or assigned. The C++ results: a compound
+    assignment's or a prefix `++`'s value is its left operand, an lvalue ([expr.ass], [expr.pre.incr]), and the implicit
+    operator= returns the object assigned, so `(N += G2()) += 1` is `N += G2(); N += 1`, every trip of a loop condition
+    ([stmt.while]); the right side runs first ([expr.ass]/1, C++17), so `(N += G2()) = N + 5` reads N before G2 moves
+    it; `((T = S).A += 1)` copies S, then updates T.A. Refused on fa30eccf + the r5 fixes as "TODO: assignment to
+    CompoundAssignOperator" (Loop, Step, Assigned) and "an assignment used as a value after something its statement
+    runs first" (StructLoop). An update of an update to an element, `(IL[Idx()] += M) += 1;`, would locate the element
+    twice: refused, saying so (it said "passed to a reference parameter")."""
+    base = pending_asset('UpdatedUpdate')
+    keeps_invariants(base)
+
+    def loop(m):                                    # `while (((N += G2()) += 1) < 20) K += 1;`
+        c, n, k = 0, m, 0
+        while True:
+            c += 1; n += c; n += 1
+            if not n < 20: return k * 10000 + n * 100 + c
+            k += 1
+
+    def step(m):                                    # `while (++(N += 1) < 10) K += 1;`
+        n, k = m, 0
+        while True:
+            n += 2
+            if not n < 10: return k * 100 + n
+            k += 1
+
+    def struct_loop(m):                             # `while (((T = S).A += 1) < 5) { S.A += 1; K += 1; }`
+        s, k = m, 0
+        while True:
+            t = s + 1
+            if not t < 5: return k * 10000 + t * 100 + s
+            s += 1; k += 1
+    for m in (0, 3, 7):
+        for fn, want in (('Loop', loop(m)), ('Step', step(m)), ('Assigned', (m + 5) * 100 + 1), ('StructLoop', struct_loop(m))):
+            got = run(base, fn, {'Count': 0, 'N': 0, 'T': {}, 'S': {}}, M=m)[0]
+            assert got == want, 'UpdatedUpdate.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+            got = VM(base, Count=0, N=0, T={}, S={}).call(fn, M=m)
+            assert got == want, 'runvm: UpdatedUpdate.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+    refused('UpdUpdSlot', '  int32 Count;\n  TArray<int32> IL;\n  [[gnu::noinline]] int32 Idx() { Count += 1; return 0; }\n'
+            '  int32 F(int32 M) { IL = {0}; (IL[Idx()] += M) += 1; return IL[0]; }\n',
+            'an update (`+=`, `++`, ...) assigned to or updated, whose left side is no plain variable')
+
+
+pending('UpdatedUpdate: an update or a struct\'s operator= updated or assigned writes the variable it names',
+        updated_update)
+
+
 def comma_slot_right():
     """CommaSlotRight: a struct's or FString's `=` onto a comma whose right side is an element, `(Bump(), T) = L[Count]`.
     C++17 sequences the right operand before the left ([expr.ass]/1; an overloaded operator's operands in that order,
@@ -8581,6 +8628,39 @@ def uds_defaults(base):
     st = pkg.struct(0)
     assert st.kind == 'UserDefinedStruct' and hasattr(st, 'defaults'), (base, st.kind)
     return tag_values(pkg, 0, st.defaults)
+
+
+def defaults_own_nest():
+    """New braces for a struct member with an initializer of its own (`FHitResult Hit = {.Time = 0.5f};`) in a value
+    that starts as the struct's default instance (UUserDefinedStruct::InitializeStruct, UserDefinedStruct.cpp 254): a
+    class's own default of another mod's struct (H) and of a UE_STRUCT (L), a struct's member initializer (FDonOuter::In)
+    and UE_DEFAULTS over a parent declared with braces (P = {.N = 2}). C++: each new Hit is Time 1, Distance 5 and the
+    rest the engine's ([dcl.init.aggr]/5, the editor's Make Struct), which the start value's Hit holds too, so only
+    Time and Distance may be written; N is its initializer 0. Where the new braces leave Time out it would load the
+    initializer's 0.5: refused, naming Time. Refused on fa30eccf + the r5 fixes at Hit.FaceIndex, which needs no tag."""
+    here = os.path.dirname(pending_asset('DefaultsOwnNest'))
+    base = os.path.join(here, 'DefaultsOwnNest')
+    keeps_invariants(base)
+    pkg = invariants.Package(base)
+    cdo = pkg.find('Default__DefaultsOwnNest_C')
+    tags = tag_values(pkg, cdo, pkg.tags(cdo))
+    want = {'Time': 1.0, 'Distance': 5.0}
+    for name, start_n in (('H', 0), ('L', 0), ('P', 2)):
+        got = tags.get(name, {})
+        assert got.get('Hit') == want and got.get('N', start_n) == 0, \
+            '%s is written %r; C++ loads Hit Time 1, Distance 5 over the rest the start value holds, N 0' % (name, got)
+    outer = uds_defaults(os.path.join(here, 'FDonOuter'))
+    assert outer.get('In', {}).get('Hit') == want and outer['In'].get('N', 0) == 0, outer
+    hit_half = 'struct FDonHeld {\n  UE_STRUCT;\n  FHitResult Hit = {.Time = 0.5f};\n  int32 N = 0;\n};\n'
+    refused('OwnNestElem', '  TArray<FDonHeld> L = {{.Hit = {.Distance = 5.0f}}};\n',
+            "L.Hit.Time, left out of the braces, holds what the engine's FHitResult constructor sets", hit_half)
+    refused('OwnNestStruct', '  FDonOut O;\n',
+            "In.Hit.Time, left out of the braces, holds what the engine's FHitResult constructor sets",
+            hit_half + 'struct FDonOut {\n  UE_STRUCT;\n  FDonHeld In = {.Hit = {.Distance = 5.0f}};\n};\n')
+
+
+pending('DefaultsOwnNest: braces in a value that starts as a struct\'s default instance leave out what its initializer '
+        'leaves out', defaults_own_nest)
 
 
 def uds_init_defaults():
