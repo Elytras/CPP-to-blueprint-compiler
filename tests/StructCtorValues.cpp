@@ -57,6 +57,15 @@ public:
     }
     return S + M;
   }
+  float XfBareLoop(int32 M) {
+    float S = 0.0f;
+    for (int32 I = 0; I < 3; ++I) {
+      FTransform T;
+      T.Scale3D.X += 1.0f;
+      S += T.Scale3D.X;
+    }
+    return S + M;
+  }
   float XfHeld(int32 M) { FHoldsXf H = {FTransform(), 3}; return H.Xf.Scale3D.X + H.N + M; }
   float V4(int32 M) { return FVector4().W + M; }
   float V4Decl(int32 M) { FVector4 V; return V.W + M; }

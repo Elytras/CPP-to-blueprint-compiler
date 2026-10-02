@@ -2,6 +2,7 @@
 """A class run the way the Blueprint VM runs it, for what runscript.py alone cannot: latent calls and the ubergraph's
 persistent frame, delegate binds and broadcasts, calls and sets on other objects. Engine calls are logged and answered
 by a test's fakes. Importing this extends runscript's parser with the opcodes those bodies use."""
+import copy
 import os
 import dumpexp
 import runscript
@@ -71,6 +72,15 @@ class Written(dict):
     """What an EX_StructConst writes, member name -> value, when VM.struct_const names its members. execStructConst
     steps each literal into its member of the destination itself (ScriptCore.cpp 3376-3405), so an EX_Let of one
     leaves a member it does not write (a Transient one) as the destination had it."""
+
+
+def by_value(v):
+    """v as a variable takes it: FProperty::CopyCompleteValue copies a struct or container (execLet,
+    ScriptCore.cpp 2647-2686), so its dicts and lists are new, the objects they hold the same."""
+    if not isinstance(v, (dict, list)): return v
+    c = copy.copy(v)
+    for k in (list(c) if isinstance(c, dict) else range(len(c))): c[k] = by_value(c[k])
+    return c
 
 
 class Obj:
@@ -279,18 +289,18 @@ class VM:
                 if not isinstance(dest, dict):
                     dest = Written()
                     put(dest)
-                for member, k in zip(named, n.kids[1].kids): dest[member] = ev(k)
+                for member, k in zip(named, n.kids[1].kids): dest[member] = by_value(ev(k))
             elif o in (0xF, 0x14, 0x5F):
                 # EX_Let steps the value into the destination itself, so a None context's STALE keeps it; EX_LetBool /
                 # EX_LetObj step it into a local that starts false / NULL, then store that (ScriptCore.cpp 2688-2800).
                 put, v = locate(n.kids[0]), ev(n.kids[1], keep=o == 0xF)
                 if isinstance(v, Written) and isinstance(ev(n.kids[0]), dict): v = Written({**ev(n.kids[0]), **v})
-                if v is not STALE: put(False if v is None and o == 0x14 and s.null_rvalues else v)
+                if v is not STALE: put(False if v is None and o == 0x14 and s.null_rvalues else by_value(v))
             elif o == 0x64:                                 # LetValueOnPersistentFrame: into the ubergraph's frame
                 uber = n.owner.split(':', 1)[-1]           # exp[2]:ExecuteUbergraph_A::Gun: a namespaced class's '::'
                 uber = uber.split("'")[1] if "'" in uber else uber
                 assert uber.startswith('ExecuteUbergraph_'), n.owner
-                s.frame(me, uber)[n.val] = ev(n.kids[0])
+                s.frame(me, uber)[n.val] = by_value(ev(n.kids[0]))
             elif o == 0x5C:                                 # AddMulticastDelegate(Obj.Prop, delegate)
                 t = n.kids[0]
                 obj, prop = (ev(t.kids[0]), t.kids[1].val) if t.op == 0x19 else (me, t.val)

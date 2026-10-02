@@ -7883,11 +7883,19 @@ def struct_ctor_values():
     import struct
     base = asset('StructCtorValues')
     keeps_invariants(base)
-    for fn, want in (('XfLocal', 2), ('XfTemp', 1), ('XfArg', 1), ('XfAssign', 1), ('XfLoop', 6), ('XfHeld', 4),
-                     ('V4', 1), ('V4Decl', 1), ('V4Braces', 1), ('V4Loop', 6), ('V4Held', 1)):
+    for fn, want in (('XfLocal', 2), ('XfTemp', 1), ('XfArg', 1), ('XfAssign', 1), ('XfLoop', 6), ('XfBareLoop', 6),
+                     ('XfHeld', 4), ('V4', 1), ('V4Decl', 1), ('V4Braces', 1), ('V4Loop', 6), ('V4Held', 1)):
         for m in (0, 1):
             got = run(base, fn, {}, M=m)[0]
             assert got == want + m, 'StructCtorValues.%s(%d) = %r, C++ gives %r' % (fn, m, got, want + m)
+    # runvm builds a frame's locals the same, and a Let copies a struct: a loop's `FTransform T;` is T = its fresh twin
+    # each round, which the round's `+=` must not reach.
+    for fn, want in (('XfAssign', 1), ('XfLoop', 6), ('XfBareLoop', 6), ('V4Loop', 6)):
+        vm = runvm.VM(base)
+        vm.struct_const = lambda name, vals: (runvm.Written(zip('XYZW', vals)) if name == 'Vector4'
+                                              else runvm.Struct(name, vals))
+        got = vm.call(fn, M=1)
+        assert got == want + 1, 'runvm: StructCtorValues.%s(1) = %r, C++ gives %r' % (fn, got, want + 1)
     pkg = invariants.Package(base)
     cdo = pkg.find('Default__StructCtorValues_C')
     tags = {t['name']: t for t in pkg.tags(cdo)}
