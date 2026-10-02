@@ -6070,7 +6070,8 @@ def derived_literal_transient():
     vm.struct_const = lambda name, vals: runvm.Written(zip(TRANSIENT_LINK[name], vals))
     assert vm.call('Output') == 3, vm.call('Output')
     vm.call('ResetHandle')
-    assert vm.self.vars['Handle'].get('Handle') == 0, 'ResetHandle leaves Handle %r, want 0' % (vm.self.vars['Handle'],)
+    # A member a struct value lacks is a zero: FTimerHandle() is a temp the frame constructs, Handle 0.
+    assert vm.self.vars['Handle'].get('Handle', 0) == 0, 'ResetHandle leaves Handle %r, want 0' % (vm.self.vars['Handle'],)
     assert 'is Transient' not in LOGS['DerivedLiteral'], LOGS['DerivedLiteral']
 
 
@@ -6150,7 +6151,7 @@ def transient_zero():
     for fn in ('ResetHandle', 'ClearHandle'):
         v = vm()
         v.call(fn)
-        assert v.self.vars['Handle'].get('Handle') == 0, 'TransientZero.%s leaves Handle %r, want 0' % (fn, v.self.vars['Handle'])
+        assert v.self.vars['Handle'].get('Handle', 0) == 0, 'TransientZero.%s leaves Handle %r, want 0' % (fn, v.self.vars['Handle'])
 
 
 transient_zero()
@@ -7803,21 +7804,21 @@ print('ok  DefaultsZero: UE_DEFAULTS\' {} / T() / nullptr over a parent\'s defau
 def defaults_value_init():
     """`{}` and `T()` of an engine struct hold what the engine's constructor sets, which no header says: FHitResult's
     sets Time to 1 (FHitResult::Init, EngineTypes.h), FFindFloorResult's HitResult(1.f) does the same to its member,
-    FTransform's is the identity (TransformVectorized.h 108), FVector4's W is 1 (Vector4.h 59), and the UeApi's
-    `T() = default;` says none of it. A class's own default starts as that fresh value, so it is kept by tagging none of
-    the struct's members, however deep; over a parent's value, or over a UE_STRUCT member's own initializer, it cannot
-    be written, and is refused. An engine struct whose constructor sets nothing is its zeros (DefaultsZero's FVector2D)."""
+    FTransform's is the identity (TransformVectorized.h 108), and the UeApi's `T() = default;` says none of it. A
+    class's own default starts as that fresh value, so it is kept by tagging none of the struct's members, however
+    deep; over a parent's value, or over a UE_STRUCT member's own initializer, it cannot be written, and is refused. An
+    engine struct whose constructor sets nothing is its zeros (DefaultsZero's FVector2D); FVector4's W 1, which the
+    engine's fresh one lacks, is written (StructCtorValues)."""
     import struct
     top = ('struct FHeldHit {\n  UE_STRUCT;\n  FHitResult Hit;\n  int32 N = 0;\n};\n'
            'class ValueInitParent : public AActor {\npublic:\n  FHitResult Hit;\n  FHeldHit H;\n'
-           '  FFindFloorResult Floor = {true, true, true, 2.0f, 3.0f, {}};\n  FTransform Xf;\n  FVector4 V4;\n};\n')
+           '  FFindFloorResult Floor = {true, true, true, 2.0f, 3.0f, {}};\n  FTransform Xf;\n};\n')
     for mod, assign, path, what in (('ValueInitCtor', 'Hit = FHitResult();', 'Hit', 'FHitResult'),
                                     ('ValueInitBraces', 'Hit = {};', 'Hit', 'FHitResult'),
                                     ('ValueInitHeld', 'H = {};', 'H.Hit', 'FHitResult'),
                                     ('ValueInitFloor', 'Floor = FFindFloorResult();', 'Floor', 'FFindFloorResult'),
                                     ('ValueInitFloorBraces', 'Floor = {};', 'Floor', 'FFindFloorResult'),
-                                    ('ValueInitXform', 'Xf = FTransform();', 'Xf', 'FTransform'),
-                                    ('ValueInitV4', 'V4 = FVector4();', 'V4', 'FVector4')):
+                                    ('ValueInitXform', 'Xf = FTransform();', 'Xf', 'FTransform')):
         refused(mod, '  UE_DEFAULTS {\n    %s\n  }\n' % assign,
                 "%s: `%s()` or `{}` holds what the engine's %s constructor sets" % (path, what, what), top, 'ValueInitParent')
     refused('ValueInitOverInit', '  FHasInit Y = {FHitResult(), 5};\n',
@@ -7867,7 +7868,7 @@ def struct_ctor_values():
     does (frame_defaults). A default holds the same: a class member, its `FVector4()`, the same over a parent's value,
     and a UE_STRUCT's member the braces leave out."""
     import struct
-    base = pending_asset('StructCtorValues')
+    base = asset('StructCtorValues')
     keeps_invariants(base)
     for fn, want in (('XfLocal', 2), ('XfTemp', 1), ('XfArg', 1), ('XfAssign', 1), ('XfLoop', 6), ('XfHeld', 4),
                      ('V4', 1), ('V4Decl', 1), ('V4Braces', 1), ('V4Loop', 6), ('V4Held', 1)):
@@ -7886,8 +7887,9 @@ def struct_ctor_values():
     assert got == (0.0, 0.0, 0.0, 1.0), 'Held.V is written %r, where FVector4() is (0, 0, 0, 1)' % (got,)
 
 
-pending('StructCtorValues: T() / T{} / a bare declaration of an engine struct holds what its constructor makes',
-        struct_ctor_values)
+struct_ctor_values()
+print('ok  StructCtorValues: T() / T{} / a bare declaration of an engine struct holds what its constructor makes: '
+      'FTransform\'s identity, FVector4\'s W 1, in a function and in a default')
 
 
 def defaults_braces():
@@ -7897,7 +7899,7 @@ def defaults_braces():
     refused, naming the member. `T = FTimerHandle();` writes nothing, with a warning: Handle, its one member, is
     Transient, which the loader never reads from a default (Class.cpp 1452)."""
     import struct
-    base = pending_asset('DefaultsBraces')
+    base = asset('DefaultsBraces')
     keeps_invariants(base)
     pkg = invariants.Package(base)
     cdo = pkg.find('Default__DefaultsBraces_C')
@@ -7916,8 +7918,9 @@ def defaults_braces():
             'class BovParent : public AActor {\npublic:\n  FHitResult Hit2 = {.Time = 0.5f};\n};\n', 'BovParent')
 
 
-pending('DefaultsBraces: an engine struct\'s designated braces leave the rest the engine\'s, and FTimerHandle() writes '
-        'nothing', defaults_braces)
+defaults_braces()
+print('ok  DefaultsBraces: an engine struct\'s designated braces leave the rest the engine\'s where the value is fresh, '
+      'and are refused over another; FTimerHandle() writes nothing, with a warning')
 
 
 def defaults_left_out():
@@ -7931,7 +7934,8 @@ def defaults_left_out():
                 'class %sParent : public AActor {\npublic:\n  F%s H = {{}, 2};\n};\n' % (mod, held, mod, mod), mod + 'Parent')
 
 
-pending('DefaultsLeftOut: a member left out of UE_DEFAULTS\' braces is named as left out when refused', defaults_left_out)
+defaults_left_out()
+print('ok  DefaultsLeftOut: a member left out of UE_DEFAULTS\' braces is named as left out when refused')
 
 
 def tenum_value_init():

@@ -1779,6 +1779,12 @@ private:
        default instance, a container's element - rather than one read over a value already there (UE_DEFAULTS over the
        parent's, an asset edit over the game's). */
     bool bFreshValue = false;
+    /* Set while LowerDefault lowers a member that braces giving others leave out, for ValueInitStruct's message. */
+    bool bLeftOutMember = false;
+    /* Set while a UE_DEFAULTS statement is lowered whose member the parent holds as a fresh value (ParentValueFresh):
+       a member its braces leave out keeps that value, as C++ would make it. */
+    bool bParentFresh = false;
+    bool ParentValueFresh(const FRecord& R, const Json& Lhs) const;
     std::map<std::string, std::vector<std::pair<std::string, int64>>> ModEnums;  // UE_ENUM cooked here: enumerators
 
     /* Per-function state reset in Generate: whether this function needs the FDeref scratch
@@ -3202,6 +3208,36 @@ bool FCompiler::ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgI
     return false;
 }
 
+/* Engine structs whose default constructor sets nothing (`FVector() {}`, Vector.h 1243; Vector2D.h 47, Rotator.h 63,
+   Color.h 45 and 430; the FVector_NetQuantize family over FVector, NetSerialization.h 1983-2120), so the zero a fresh
+   property's memory holds is their value-initialisation. Every other engine
+   constructor may set members (FTransform's is the identity, TransformVectorized.h 108; FVector4's W is 1, Vector4.h
+   59; FFindFloorResult's HitResult has Time 1), and the UeApi header's `T() = default;` says nothing of it: genueapi
+   writes one beside every member-wise constructor. */
+static bool ConstructsNothing(const FRecord& R)
+{
+    static const char* const Names[] = {"FVector", "FVector2D", "FRotator", "FLinearColor", "FColor", "FVector_NetQuantize",
+                                        "FVector_NetQuantize10", "FVector_NetQuantize100", "FVector_NetQuantizeNormal"};
+    return std::any_of(std::begin(Names), std::end(Names), [&](const char* N) { return R.CppName == N; });
+}
+
+/* An engine struct the engine makes as zeros though its C++ constructor sets a member: STRUCT_ZeroConstructor
+   (WithZeroConstructor, Property.cpp 32-373) memzeroes a fresh property and a frame's local (InitializeValue,
+   ScriptCore.cpp 909-916), where FVector4() has W 1 (Vector4.h 59). The rest of those structs construct nothing, or
+   zeros (FRandomStream, FGuid, FTwoVectors). So a value of one is written, member and value said here, and never left
+   to a fresh property or local. */
+struct FCtorOverZeros { const char* Struct; const char* Member; float Value; };
+static const FCtorOverZeros* CtorOverZeros(const std::string& CppName)
+{
+    static const FCtorOverZeros Table[] = { { "FVector4", "W", 1.0f } };
+    for (const FCtorOverZeros& E : Table) if (CppName == E.Struct) return &E;
+    return nullptr;
+}
+
+/* The value-initialisation of Type, `T()` / `{}` in a function: the type's zero; an engine struct's is what its
+   constructor makes. One whose constructor sets nothing is its zeros, a literal; FVector4 the literal its constructor
+   gives (CtorOverZeros); any other the editor's Make Struct with nothing set, a temp the frame constructs as the engine
+   does (InitializeValue: the native constructor, FTransform's identity, FHitResult's Time 1). */
 bool FCompiler::ZeroArg(const std::string& Type, FBlueprintClass& BP, FArgIR& Out, std::string* Err)
 {
     const std::string T = Canon(Type);
@@ -3218,6 +3254,10 @@ bool FCompiler::ZeroArg(const std::string& Type, FBlueprintClass& BP, FArgIR& Ou
     case SK_Object: Out.K = FArgIR::NullObj; return true;
     default: break;
     }
+    const FRecord* R = Find(T);
+    const FCtorOverZeros* Ctor = R ? CtorOverZeros(R->CppName) : nullptr;
+    if (R && R->bIsStruct && R->IsNative() && !ConstructsNothing(*R) && !Ctor)
+        return LowerMakeStruct(R->CppName, nullptr, BP, Out, Err);
     auto SI = Structs.find(T);
     if (SI == Structs.end() || !SI->second.bComplete) { *Err = "no zero literal for " + Type; return false; }
     /* A Transient member, here or in a member struct, is one EX_StructConst skips (ScriptCore.cpp 3376-3405), leaving it
@@ -3233,6 +3273,7 @@ bool FCompiler::ZeroArg(const std::string& Type, FBlueprintClass& BP, FArgIR& Ou
     for (size_t I : Each)
     {
         if (!ZeroArg(SI->second.Fields[I].first, BP, Zeros[I], Err)) return false;
+        if (Ctor && SI->second.Fields[I].second == Ctor->Member) Zeros[I].F = Ctor->Value;
         bByMembers = bByMembers || Zeros[I].K == FArgIR::Call;
     }
     if (bByMembers) return LowerStructByMembers(T, SI->second, Zeros, BP, Out, Err);
@@ -7674,6 +7715,13 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 const Json* Init = Ds.bHasValue ? nullptr : Strip(First(D));
                 /* `FStats S;` carries an implicit argless CXXConstructExpr: no initialiser. */
                 if (Init && Kind(*Init) == "CXXConstructExpr" && !First(*Init)) Init = nullptr;
+                /* So does `FVector4 V;` or `V{}`, whose constructor gives W 1 where the frame makes the local as zeros
+                   (CtorOverZeros): it is given that value, each time a loop comes round too. */
+                if (const FRecord* SR = !Init && !Ds.bHasValue ? Find(VarType) : nullptr; SR && SR->bIsStruct && CtorOverZeros(SR->CppName))
+                {
+                    Ds.bHasValue = true;
+                    if (!ZeroArg(VarType, BP, Ds.Value, Err)) { bOk = false; return; }
+                }
                 const std::string DeclId = D.value("id", std::string());
                 if (Init)
                 {
@@ -11149,30 +11197,38 @@ static void ZeroDefault(FPropertyDef& PD)
     else if (T == "ArrayProperty" || T == "SetProperty" || T == "MapProperty") { D.K = FDefaultValue::Array; D.Items.clear(); }
 }
 
-/* Engine structs whose default constructor sets nothing (`FVector() {}`, Vector.h 1243; Vector2D.h 47, Rotator.h 63,
-   Color.h 45 and 430), so the zero a fresh property's memory holds is their value-initialisation. Every other engine
-   constructor may set members (FTransform's is the identity, TransformVectorized.h 108; FVector4's W is 1, Vector4.h
-   59; FFindFloorResult's HitResult has Time 1), and the UeApi header's `T() = default;` says nothing of it: genueapi
-   writes one beside every member-wise constructor. */
-static bool ConstructsNothing(const FRecord& R)
-{
-    static const char* const Names[] = {"FVector", "FVector2D", "FRotator", "FLinearColor", "FColor"};
-    return std::any_of(std::begin(Names), std::end(Names), [&](const char* N) { return R.CppName == N; });
-}
-
 /* C++'s value-initialisation of a struct SR, `T()` or `{}`, as a default written as a value (LowerDefault's bKeepZero),
    into PD; Path names it for a message. A UE_STRUCT's members are each its initializer, else their own
    value-initialisation. An engine struct whose constructor sets nothing (ConstructsNothing) is its zeros; bZeros says
-   we are inside one. Any other holds what the engine's constructor sets (FHitResult's Time is 1, FHitResult::Init),
-   which no header says and a function body's Make Struct keeps: in a value that starts as the engine's
-   (bFreshValue) no tag keeps it, and over a value already there it cannot be written, so it is refused. */
+   we are inside one. FVector4 is its zeros but the member its constructor sets (CtorOverZeros), always written, as the
+   engine makes a fresh one as zeros. Any other holds what the engine's constructor sets (FHitResult's Time is 1,
+   FHitResult::Init), which no header says and a function body's Make Struct keeps: in a value that starts as the
+   engine's (bFreshValue) no tag keeps it, and over a value already there it cannot be written, so it is refused; a
+   member the braces of a UE_DEFAULTS statement leave out says so (bLeftOutMember). One whose every member is Transient
+   is written as no member at all, with a warning. */
 bool FCompiler::ValueInitStruct(const FRecord& SR, bool bZeros, const std::string& Path, FPropertyDef& PD,
                                 FBlueprintClass& BP, std::string* Err)
 {
-    if (!bZeros && SR.IsNative() && !ConstructsNothing(SR))
+    if (!bZeros && SR.IsNative() && !ConstructsNothing(SR) && !CtorOverZeros(SR.CppName))
     {
         if (bFreshValue) return true;
-        *Err = Path + ": `" + SR.CppName + "()` or `{}` holds what the engine's " + SR.CppName + " constructor sets, which "
+        /* A struct whose every member is Transient (FTimerHandle's Handle) has nothing a default can say: the loader
+           skips a Transient member's tag (Class.cpp 1452). The struct's tag holds no member, and the value stays the
+           parent's. */
+        if (const auto SI = Structs.find(SR.CppName); SI != Structs.end() && !SI->second.Fields.empty()
+            && StructConstOrder(SI->second).empty())
+        {
+            printf("  warning: %s: every member of %s is Transient, which the engine never loads from a default: nothing "
+                   "is written, and it keeps the parent's value\n", Path.c_str(), SR.CppName.c_str());
+            PD.Members = std::make_shared<std::vector<FPropertyDef>>();
+            PD.Default.K = FDefaultValue::Struct;
+            return true;
+        }
+        *Err = bLeftOutMember
+             ? Path + ", left out of the braces, holds what the engine's " + SR.CppName + " constructor sets, which its "
+               "header does not say, so AssetGen cannot write it over the value already there; give it in the braces, or "
+               "leave the statement out to keep that value"
+             : Path + ": `" + SR.CppName + "()` or `{}` holds what the engine's " + SR.CppName + " constructor sets, which "
                "its header does not say, so AssetGen cannot write it over the value already there; leave the statement "
                "out to keep that value, or give the members in braces, `{.Member = value}`";
         return false;
@@ -11192,7 +11248,11 @@ bool FCompiler::ValueInitStruct(const FRecord& SR, bool bZeros, const std::strin
             {
                 if (!LowerDefault(*SF, MD, BP, Err, nullptr, /*bKeepZero=*/true)) return false;
             }
-            else if (MD.Type != "StructProperty") ZeroDefault(MD);
+            else if (MD.Type != "StructProperty")
+            {
+                ZeroDefault(MD);
+                if (const FCtorOverZeros* C = CtorOverZeros(R->CppName); C && Name(*SF) == C->Member) MD.Default.F = C->Value;
+            }
             else if (const FRecord* Sub = Find(StripTypeKeywords(TypeOf(*SF))))
             {
                 if (!ValueInitStruct(*Sub, bZeros, Path + "." + Name(*SF), MD, BP, Err)) return false;
@@ -11205,12 +11265,53 @@ bool FCompiler::ValueInitStruct(const FRecord& SR, bool bZeros, const std::strin
     return true;
 }
 
+/* Whether R's parent holds the member Lhs names (a UE_DEFAULTS statement's left side) as a fresh value, what the engine
+   makes of its type: it is declared in a class cooked here with no initializer, `{}` or `T()`, and no UE_DEFAULTS
+   between sets it. A native class on the way, another mod's too, holds a value no header says. */
+bool FCompiler::ParentValueFresh(const FRecord& R, const Json& Lhs) const
+{
+    const std::string Id = Lhs.value("referencedMemberDecl", std::string());
+    auto Fresh = [](const Json* I) {
+        if (!I) return true;
+        const std::string K = Kind(*I);
+        if (K == "ImplicitValueInitExpr" || K == "CXXScalarValueInitExpr") return true;
+        if (K == "CXXConstructExpr" || K == "CXXTemporaryObjectExpr") return !First(*I);
+        bool bAll = K == "InitListExpr";
+        if (bAll) ForEach(*I, [&](const Json& C) { bAll = bAll && IsUnsetInit(C); });
+        return bAll;
+    };
+    for (const FRecord* C = R.Base.empty() ? nullptr : Find(R.Base); C && !Id.empty(); C = C->Base.empty() ? nullptr : Find(C->Base))
+    {
+        if (C->IsNative()) return false;
+        bool bSet = false;
+        if (C->Defaults)
+            ForEach(*C->Defaults, [&](const Json& B) {
+                if (Kind(B) == "CompoundStmt")
+                    ForEach(B, [&](const Json& S) {
+                        const Json *L = nullptr, *V = nullptr, *Through = nullptr;
+                        bSet = bSet || (DefaultAssignment(S, L, V, Through) && !Through
+                                        && L->value("referencedMemberDecl", std::string()) == Id);
+                    });
+            });
+        if (bSet) return false;
+        for (const Json* F : C->Fields)
+            if (F->value("id", std::string()) == Id) return Fresh(Strip(First(*F)));
+    }
+    return false;
+}
+
 bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& BP, std::string* Err, const Json* Init,
                              bool bKeepZero)
 {
     const Json* const Whole = Init ? Init : First(F);
     Init = Strip(Whole);
-    if (!Init) return true;
+    /* No initializer: the property starts as the engine makes it, which is the C++ constructor's value but for a struct
+       the engine makes as zeros though its constructor sets a member (CtorOverZeros): that value is written. */
+    if (!Init)
+    {
+        const FRecord* SR = PD.Type == "StructProperty" ? Find(StripTypeKeywords(TypeOf(F))) : nullptr;
+        return !SR || !CtorOverZeros(SR->CppName) || ValueInitStruct(*SR, /*bZeros=*/false, Name(F), PD, BP, Err);
+    }
     std::string K = Kind(*Init);
     /* `(A, B)` whose left side does nothing (`(1, 4)`) is its right side; one that does something would run when the
        game does, and is refused below. */
@@ -11332,10 +11433,11 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
     if (!bNeg && (K == "CXXNullPtrLiteralExpr" || K == "ImplicitValueInitExpr" || K == "CXXScalarValueInitExpr"
                   || ((K == "CXXConstructExpr" || K == "CXXTemporaryObjectExpr") && !First(*Init)) || (bBraced && !First(*Init))))
     {
-        if (!bKeepZero) return true;
+        const FRecord* SR = PD.Type == "StructProperty" ? Find(StripTypeKeywords(TypeOf(*Init))) : nullptr;
+        if (PD.Type == "StructProperty" && (!SR || !SR->bIsStruct)) SR = Find(StripTypeKeywords(TypeOf(F)));
+        /* A fresh FVector4 is zeros, its constructor's W 1 (CtorOverZeros): written even where a zero is not. */
+        if (!bKeepZero && !(SR && CtorOverZeros(SR->CppName))) return true;
         if (PD.Type != "StructProperty") { ZeroDefault(PD); return true; }
-        const FRecord* SR = Find(StripTypeKeywords(TypeOf(*Init)));
-        if (!SR || !SR->bIsStruct) SR = Find(StripTypeKeywords(TypeOf(F)));
         if (!SR) { *Err = "unknown struct type in an initializer: " + TypeOf(*Init); return false; }
         return ValueInitStruct(*SR, /*bZeros=*/false, Name(F), PD, BP, Err);
     }
@@ -11364,9 +11466,12 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
             return false;
         }
         /* Without bKeepZero this is a value that starts fresh, and so are its members, however deep. */
-        const bool bWasFresh = bFreshValue;
+        const bool bWasFresh = bFreshValue, bWasLeftOut = bLeftOutMember;
         bFreshValue = bFreshValue || !bKeepZero;
-        struct FRestore { bool& Flag; bool Was; ~FRestore() { Flag = Was; } } Restore{ bFreshValue, bWasFresh };
+        struct FRestore { bool& Flag; bool Was; ~FRestore() { Flag = Was; } } Restore{ bFreshValue, bWasFresh },
+                                                                          RestoreLeftOut{ bLeftOutMember, bWasLeftOut };
+        /* Braces that give some members and leave the rest out (`{.Distance = 5.0f}`; `{}` gives none). */
+        const bool bSomeGiven = std::any_of(Args.begin(), Args.end(), [](const Json* A) { return !IsUnsetInit(*A); });
         auto Members = std::make_shared<std::vector<FPropertyDef>>();
         for (size_t I = 0; I < Args.size(); ++I)
         {
@@ -11378,14 +11483,33 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
             /* Every member is written, so a zero is a value here and not "leave it out". One the braces leave out
                but that has a default of its own (CXXDefaultInitExpr) takes that default, as in C++. */
             const Json* A = Kind(*Args[I]) == "CXXDefaultInitExpr" ? nullptr : Args[I];
+            bLeftOutMember = bSomeGiven && IsUnsetInit(*Args[I]);
             /* A UE_STRUCT's member with an initializer of its own starts as that, not as the engine's value, so a value
-               given for it is written over one already there. */
-            bFreshValue = (bWasFresh || !bKeepZero) && !(A && !SR->IsNative() && First(*SR->Fields[I]));
+               given for it is written over one already there. One the braces of a UE_DEFAULTS statement leave out is
+               over the parent's value, which may be the fresh one (bParentFresh). */
+            bFreshValue = (bWasFresh || !bKeepZero || (bLeftOutMember && bParentFresh))
+                       && !(A && !SR->IsNative() && First(*SR->Fields[I]));
+            /* Braces of an engine struct whose header declares no constructor are the editor's Make Struct: a member
+               they leave out keeps what the engine's constructor sets, which no header says (FHitResult's Time 1). A
+               fresh value holds it with no tag; over another it cannot be written. A struct written as raw bytes
+               (NativeStructSize: FBox, FPlane, whose constructors set nothing) has every member, its zero. */
+            if (bLeftOutMember && SR->IsNative() && !DeclaresCtor(*SR) && !NativeStructSize(PD.StructName))
+            {
+                if (!bFreshValue)
+                {
+                    *Err = Name(F) + "." + Name(*SR->Fields[I]) + ", left out of the braces, holds what the engine's "
+                         + SR->CppName + " constructor sets, which its header does not say, so AssetGen cannot write it "
+                           "over the value already there; give it in the braces, or leave the statement out to keep that value";
+                    return false;
+                }
+                continue;
+            }
             if (!LowerDefault(*SR->Fields[I], MD, BP, Err, A, /*bKeepZero=*/true))
             {
-                /* A message about the member says whose: `H.Hit: ...`. */
+                /* A message about the member says whose: `H.Hit: ...`, `H.Hit, left out ...`. */
                 const std::string Member = Name(*SR->Fields[I]);
-                if (Err->compare(0, Member.size() + 1, Member + ":") == 0 || Err->compare(0, Member.size() + 1, Member + ".") == 0)
+                if (Err->compare(0, Member.size() + 1, Member + ":") == 0 || Err->compare(0, Member.size() + 1, Member + ".") == 0
+                    || Err->compare(0, Member.size() + 1, Member + ",") == 0)
                     *Err = Name(F) + "." + *Err;
                 return false;
             }
@@ -13734,6 +13858,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 /* Zero is a real value here: an archetype deltas against the component CDO (where
                    bVisible is already true) and an inherited property against the parent's CDO,
                    not against the type's zero the way a fresh class variable does. */
+                bParentFresh = !bThroughComponent && ParentValueFresh(R, *Lhs);
+                struct FUnset { bool& Flag; ~FUnset() { Flag = false; } } UnsetParentFresh{ bParentFresh };
                 if (!LowerDefault(*Lhs, PD, BP, Err, Rhs, /*bKeepZero=*/true)) { bOk = false; return; }
                 if (PD.Default.K == FDefaultValue::None)
                 { *Err = Where + ": " + Name(*Lhs) + " needs a literal value"; bOk = false; return; }

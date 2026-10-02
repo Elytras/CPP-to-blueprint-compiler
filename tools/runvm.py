@@ -153,6 +153,17 @@ class VM:
         me = on or s.self
         stmts, at, names = s.script(fn)
         env = s.frame(me, fn) if fn.startswith('ExecuteUbergraph_') else {}   # the persistent frame
+        if not fn.startswith('ExecuteUbergraph_'):
+            # A frame starts zeroed, its locals constructed under FUNC_HasDefaults (ScriptCore.cpp 909-916): a struct
+            # local is a struct of zeros, or what InitializeValue leaves in it (runscript.frame_defaults: FTransform's
+            # identity, FHitResult's Time 1, a UserDefinedStruct's defaults), which a Make Struct's temp holds. A
+            # function base has no export of (a class chain's parent's) is left as it was.
+            try:
+                env.update((p, {}) for p, t in runscript.props_of(s.base, fn).items()
+                           if t == 'StructProperty' and p not in names)
+                env.update((p, v) for p, v in runscript.frame_defaults(s.base, fn).items()
+                           if not isinstance(v, runscript.Unconstructed))
+            except StopIteration: pass
         env.update(zip(names, args)); env.update(parms)
         if s.ref_params: s.env_log.append(env)
 
