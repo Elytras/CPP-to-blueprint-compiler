@@ -2679,6 +2679,20 @@ bool FCompiler::Collect(std::string* Err)
     return true;
 }
 
+/* Whether a class cooked here compiles a function for Method, as Generate decides: one with a body, in the class or out
+   of line, or `= 0` (an empty function). A declaration with neither is no function of the class's, so a subclass's of
+   its name has nothing of the class's above it. */
+static bool CompilesMethod(const FRecord& R, const std::string& Method)
+{
+    const auto M = R.Methods.find(Method);
+    if (M == R.Methods.end()) return false;
+    if (M->second->value("pure", false)) return true;
+    const auto D = R.MethodDefs.find(Method);
+    bool bBody = false;
+    ForEach(D != R.MethodDefs.end() ? *D->second : *M->second, [&](const Json& C) { bBody = bBody || Kind(C) == "CompoundStmt"; });
+    return bBody;
+}
+
 FIndex FCompiler::FindEvent(FBlueprintClass& BP, const std::string& FromRecord, const std::string& Method,
                             uint32* InheritedFlags, bool bFlagsOnly)
 {
@@ -2695,9 +2709,10 @@ FIndex FCompiler::FindEvent(FBlueprintClass& BP, const std::string& FromRecord, 
     {
         /* A mod ancestor's function is a super like a native one, and the nearest wins, as the Kismet compiler takes
            ParentClass->FindFunctionByName. What matters most is its net flags: an override of an RPC is that RPC, and
-           a mismatch "will trigger an assert in Link()" (KismetCompiler.cpp:2019). An inline method is no UFunction. */
+           a mismatch "will trigger an assert in Link()" (KismetCompiler.cpp:2019). An inline method is no UFunction, and
+           neither is one declared and never defined (CompilesMethod). */
         if (R != Self && !R->IsNative() && !R->bIsInterface)
-            if (auto M = R->Methods.find(Method); M != R->Methods.end() && !IsInlineMethod(*R, Method))
+            if (auto M = R->Methods.find(Method); M != R->Methods.end() && !IsInlineMethod(*R, Method) && CompilesMethod(*R, Method))
             {
                 /* A static is found the same. Only a static of Self's own gets here over one (Generate refuses the rest),
                    and it inherits nothing: no caller is split, every call to either being bound, so its flags are its own. */
@@ -2705,10 +2720,11 @@ FIndex FCompiler::FindEvent(FBlueprintClass& BP, const std::string& FromRecord, 
                 *InheritedFlags = ModMethodFlags(*R, Method, BP);
                 return bFlagsOnly ? Null() : BP.EngineFunction(PackageOf(*R), ClassOf(*R), UeMethod);
             }
-        /* A mod ancestor that lists a mod interface and leaves Method out has the empty stub Generate compiles for it,
-           its own function, so that stub is the super ParentClass->FindFunctionByName finds; its flags are a function's
-           declared as the interface declares it. */
-        if (R != Self && !R->IsNative() && !R->bIsInterface && !R->Methods.count(Method))
+        /* A mod ancestor that lists a mod interface and leaves Method out (or only declares it) has the empty stub
+           Generate compiles for it, its own function, so that stub is the super ParentClass->FindFunctionByName finds;
+           its flags are a function's declared as the interface declares it. */
+        if (R != Self && !R->IsNative() && !R->bIsInterface
+            && (!R->Methods.count(Method) || (!IsInlineMethod(*R, Method) && !CompilesMethod(*R, Method))))
             if (const FRecord* IR = ModInterfaceWith(*R, Method))
             {
                 *InheritedFlags = ModMethodFlags(*IR, Method, BP);
@@ -9371,9 +9387,11 @@ std::pair<const FRecord*, bool> FCompiler::FoundAbove(const FRecord& R, const st
     {
         if (!A->IsNative() && !A->bIsInterface)
         {
-            if (auto M = A->Methods.find(Method); M != A->Methods.end() && !IsInlineMethod(*A, Method))
+            /* A function the class compiles: not an inline one, nor one declared and never defined. */
+            if (auto M = A->Methods.find(Method); M != A->Methods.end() && !IsInlineMethod(*A, Method) && CompilesMethod(*A, Method))
                 return { A, IsStaticDecl(*M->second) };
-            if (!A->Methods.count(Method) && ModInterfaceWith(*A, Method)) return { A, false };     // its stub
+            if ((!A->Methods.count(Method) || (!IsInlineMethod(*A, Method) && !CompilesMethod(*A, Method)))
+                && ModInterfaceWith(*A, Method)) return { A, false };     // its stub
         }
         if (A->IsNative() && A->Methods.count(Method) && !A->Forwards.count(Method))
             return { A, IsStaticDecl(*A->Methods.at(Method)) };

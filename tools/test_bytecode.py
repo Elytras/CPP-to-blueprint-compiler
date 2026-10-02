@@ -5376,16 +5376,17 @@ def func_declared_only():
     """FdoRoot declares Tell (a static) and Scale but defines neither, so it compiles no function of those names, and
     FuncDeclaredOnly's own hide nothing a Blueprint has: no warning, no super to a function FdoRoot lacks
     (imports_resolve, func_super_link), and each call runs FuncDeclaredOnly's."""
-    base = pending_asset('FuncDeclaredOnly')
+    base = asset('FuncDeclaredOnly')
     keeps_invariants(base)
-    keeps_invariants(pending_asset('FuncDeclaredOnly', 'FdoRoot'))
+    keeps_invariants(os.path.join(os.path.dirname(base), 'FdoRoot'))
     assert 'hides' not in LOGS['FuncDeclaredOnly'], LOGS['FuncDeclaredOnly']
     for v in (1, 4):
-        got, want = run(base, 'Use', {}, V=v)[0], v * 2 * 100 + v * 3 + (v + 1) * 10000
+        got, want = run(base, 'Use', {}, V=v)[0], v * 2 * 100 + v * 3
         assert got == want, 'FuncDeclaredOnly.Use(%d) = %r, want %r' % (v, got, want)
 
 
-pending('FuncDeclaredOnly: a function over an ancestor\'s declared-only one has no super', func_declared_only)
+func_declared_only()
+print('ok  FuncDeclaredOnly: a static and a method over an ancestor\'s declared-only ones have no super, and no warning')
 
 
 def func_iface_unnamed():
