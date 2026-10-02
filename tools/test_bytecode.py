@@ -8323,6 +8323,22 @@ def defaults_nest_deep():
 pending('DefaultsNestDeep: braces under a member\'s initializer follow it down to what it leaves fresh', defaults_nest_deep)
 
 
+def defaults_other_nest():
+    """A class's own `H = {.Hit = {.Distance = 5.0f}}` where H is another mod's UE_STRUCT_IN struct whose Hit has an
+    initializer of its own (Time 0.5): the braces are a new FHitResult, whose Time is what the engine's constructor sets,
+    not the 0.5 the struct's default holds, so leaving it untagged would load 0.5. Refused by name, as for a UE_STRUCT
+    (LocalNest). Compiled on fa30eccf with Time untagged: another mod's struct counted as an engine struct, whose
+    fresh value is the engine's."""
+    for mod, kind in (('OtherNest', 'UE_STRUCT_IN("/Game/_ElytrasMods/DboOtherMod")'), ('LocalNest', 'UE_STRUCT')):
+        refused(mod, '  F%sHeld H = {.Hit = {.Distance = 5.0f}};\n' % mod,
+                "H.Hit.FaceIndex, left out of the braces, holds what the engine's FHitResult constructor sets",
+                'struct F%sHeld {\n  %s;\n  FHitResult Hit = {.Time = 0.5f};\n  int32 N = 0;\n};\n' % (mod, kind))
+
+
+pending('DefaultsOtherNest: another mod\'s struct\'s member with an initializer is no fresh value under new braces',
+        defaults_other_nest)
+
+
 def defaults_braces_twice():
     """Two UE_DEFAULTS statements on one member: the second is a whole new value, so a member its braces leave out holds
     the engine's (Time 1), not the first statement's Time 3. The loader applies the CDO's tags in order, each struct
