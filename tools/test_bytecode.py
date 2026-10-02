@@ -7211,6 +7211,27 @@ def delegate_rpc_refusals():
             'Server_StartUsing is not BlueprintCallable', base='AItem')
 
 
+def delegate_callable_rpc():
+    """An RPC the engine marks BlueprintCallable is one the editor's Create Event node binds: FunctionCanBeUsedInDelegate
+    asks for BlueprintCallable, not pure, not latent, and nothing about the net flags (K2Node_CreateDelegate.cpp
+    154-161). 49 native functions are both; APlayerController::ClientClearCameraLensEffects binds on another object
+    and AFSDPlayerController::Server_ResetHUD on this one. fix/r5-delegates (cab61cb6) refused both against a UeApi
+    without NotCallable.json, saying they were not BlueprintCallable, as it took every UE_SERVER / UE_CLIENT /
+    UE_MULTICAST for one that is not."""
+    base = pending_asset('DelegateCallableRpc')
+    keeps_invariants(base)
+    vm = VM(base, {})
+    pc = Obj('PlayerController')
+    vm.self.vars['PC'] = pc
+    vm.call('Bind')
+    assert vm.binds == [(vm.self, 'OnPing', 'ClientClearCameraLensEffects', pc)], vm.binds
+    kid = os.path.join(os.path.dirname(base), 'DelegateCallableRpcPc')
+    keeps_invariants(kid)
+    vm = VM(kid, {})
+    vm.call('Bind')
+    assert vm.binds == [(vm.self, 'OnReset', 'Server_ResetHUD', vm.self)], vm.binds
+
+
 def delegate_not_callable_refusals():
     """AActor::OnRep_Instigator is a native function that is not BlueprintCallable, and nothing in its declaration says
     so: UeApi's NotCallable.json does. Refused on another object and on this one."""
@@ -7290,6 +7311,8 @@ print('ok  DelegateInheritBind: a function of another object bound to an inherit
       'Blueprint\'s - is typed with the parent\'s signature, imported, and the broadcast reaches it')
 delegate_rpc_refusals()
 print('ok  delegate RPC refusals: a server RPC is not BlueprintCallable, so it is bound on no object')
+pending('DelegateCallableRpc: an RPC the engine marks BlueprintCallable binds on another object and on this one',
+        delegate_callable_rpc)
 if ueapi_lists_not_callable():
     delegate_not_callable_refusals()
     print('ok  delegate not-callable refusals: OnRep_Instigator, which UeApi\'s NotCallable.json names, is bound on no object')
