@@ -11271,18 +11271,21 @@ bool FCompiler::ValueInitStruct(const FRecord& SR, bool bZeros, const std::strin
 /* Whether R's parent holds the member Lhs names (a UE_DEFAULTS statement's left side) as a fresh value, what the engine
    makes of its type: it is declared in a class cooked here with no initializer, `{}` or `T()`, and no UE_DEFAULTS
    between sets it. A native class on the way, another mod's too, holds a value no header says. */
+/* Whether a member's initializer I (stripped; null for none) leaves it as the engine makes its type: none, `{}`, `T()`. */
+static bool StartsFresh(const Json* I)
+{
+    if (!I) return true;
+    const std::string K = Kind(*I);
+    if (K == "ImplicitValueInitExpr" || K == "CXXScalarValueInitExpr") return true;
+    if (K == "CXXConstructExpr" || K == "CXXTemporaryObjectExpr") return !First(*I);
+    bool bAll = K == "InitListExpr";
+    if (bAll) ForEach(*I, [&](const Json& C) { bAll = bAll && IsUnsetInit(C); });
+    return bAll;
+}
+
 bool FCompiler::ParentValueFresh(const FRecord& R, const Json& Lhs) const
 {
     const std::string Id = Lhs.value("referencedMemberDecl", std::string());
-    auto Fresh = [](const Json* I) {
-        if (!I) return true;
-        const std::string K = Kind(*I);
-        if (K == "ImplicitValueInitExpr" || K == "CXXScalarValueInitExpr") return true;
-        if (K == "CXXConstructExpr" || K == "CXXTemporaryObjectExpr") return !First(*I);
-        bool bAll = K == "InitListExpr";
-        if (bAll) ForEach(*I, [&](const Json& C) { bAll = bAll && IsUnsetInit(C); });
-        return bAll;
-    };
     for (const FRecord* C = R.Base.empty() ? nullptr : Find(R.Base); C && !Id.empty(); C = C->Base.empty() ? nullptr : Find(C->Base))
     {
         if (C->IsNative()) return false;
@@ -11298,7 +11301,7 @@ bool FCompiler::ParentValueFresh(const FRecord& R, const Json& Lhs) const
             });
         if (bSet) return false;
         for (const Json* F : C->Fields)
-            if (F->value("id", std::string()) == Id) return Fresh(Strip(First(*F)));
+            if (F->value("id", std::string()) == Id) return StartsFresh(Strip(First(*F)));
     }
     return false;
 }
@@ -11469,10 +11472,11 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
             return false;
         }
         /* Without bKeepZero this is a value that starts fresh, and so are its members, however deep. */
-        const bool bWasFresh = bFreshValue, bWasLeftOut = bLeftOutMember;
+        const bool bWasFresh = bFreshValue, bWasLeftOut = bLeftOutMember, bWasParentFresh = bParentFresh;
         bFreshValue = bFreshValue || !bKeepZero;
         struct FRestore { bool& Flag; bool Was; ~FRestore() { Flag = Was; } } Restore{ bFreshValue, bWasFresh },
-                                                                          RestoreLeftOut{ bLeftOutMember, bWasLeftOut };
+                                                                          RestoreLeftOut{ bLeftOutMember, bWasLeftOut },
+                                                                          RestoreParentFresh{ bParentFresh, bWasParentFresh };
         /* Braces that give some members and leave the rest out (`{.Distance = 5.0f}`; `{}` gives none). */
         const bool bSomeGiven = std::any_of(Args.begin(), Args.end(), [](const Json* A) { return !IsUnsetInit(*A); });
         auto Members = std::make_shared<std::vector<FPropertyDef>>();
@@ -11487,6 +11491,10 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
                but that has a default of its own (CXXDefaultInitExpr) takes that default, as in C++. */
             const Json* A = Kind(*Args[I]) == "CXXDefaultInitExpr" ? nullptr : Args[I];
             bLeftOutMember = bSomeGiven && IsUnsetInit(*Args[I]);
+            /* The parent's value of a member given here is fresh where the parent's struct is and the member starts as
+               the engine makes it: a UE_STRUCT's member with an initializer of its own (`Hit = {.Time = 0.5f}`) holds
+               that in the parent, and braces given for it are a new value over it. */
+            bParentFresh = bWasParentFresh && (!A || IsUnsetInit(*A) || StartsFresh(Strip(First(*SR->Fields[I]))));
             /* A UE_STRUCT's member with an initializer of its own starts as that, not as the engine's value, so a value
                given for it is written over one already there. One the braces of a UE_DEFAULTS statement leave out is
                over the parent's value, which may be the fresh one (bParentFresh). */
@@ -11495,8 +11503,11 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
             /* Braces of an engine struct whose header declares no constructor are the editor's Make Struct: a member
                they leave out keeps what the engine's constructor sets, which no header says (FHitResult's Time 1). A
                fresh value holds it with no tag; over another it cannot be written. A struct written as raw bytes
-               (NativeStructSize: FBox, FPlane, whose constructors set nothing) has every member, its zero. */
-            if (bLeftOutMember && SR->IsNative() && !DeclaresCtor(*SR) && !NativeStructSize(PD.StructName))
+               (NativeStructSize: FBox, FPlane, whose constructors set nothing) has every member, its zero. Another
+               mod's struct (UE_STRUCT_IN) is no engine struct: its header says each member's value, and one with an
+               initializer (CXXDefaultInitExpr, A null) takes it. */
+            if (bLeftOutMember && A && !SR->IsModStruct() && SR->IsNative() && !DeclaresCtor(*SR)
+                && !NativeStructSize(PD.StructName))
             {
                 if (!bFreshValue)
                 {
@@ -13898,7 +13909,16 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                         break;
                     }
                 }
-                if (!bThroughComponent) { InheritedDefaults.push_back(PD); return; }
+                /* A statement is the member's whole new value, as an assignment is in C++: one before it on the same
+                   member is gone, not a tag under this one's (whose left-out members would load its values). */
+                if (!bThroughComponent)
+                {
+                    InheritedDefaults.erase(std::remove_if(InheritedDefaults.begin(), InheritedDefaults.end(),
+                                                           [&](const FPropertyDef& P) { return P.Name == PD.Name; }),
+                                            InheritedDefaults.end());
+                    InheritedDefaults.push_back(PD);
+                    return;
+                }
                 if (DR == &R) { ComponentDefaults[CompName].push_back(PD); return; }
                 /* A native parent's component is a default subobject, not an SCS node: it is
                    overridden by an export under this class's CDO, with no handler involved. */
