@@ -3119,6 +3119,7 @@ std::string FCompiler::Canon(std::string T) const
 {
     T = StripTypeKeywords(T);
     while (!T.empty() && (T.back() == '&' || T.back() == ' ')) T.pop_back();
+    if (T.size() > 6 && T.compare(T.size() - 6, 6, " const") == 0) T.erase(T.size() - 6);  // `const auto &`: `FAssetData const &`
     if (T.size() > 6 && T.compare(T.size() - 6, 6, "*const") == 0) T.erase(T.size() - 5);  // `const T&` of a pointer T
     T = StripTypeKeywords(T);
     const EStrKind K = StrKindOf(T);
@@ -10829,11 +10830,8 @@ bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vec
        case of its own, as one that falls through to the default throws a script exception first, a logged warning. */
     // ponytail: pass I compares I + 1 cases, N^2/2 in all; past 16 elements the Make Array walk below costs less.
     const Json* Items = InlineListOf(RangeExpr);
-    std::string LoopTy = TypeOf(*LoopDecl);
-    while (!LoopTy.empty() && (LoopTy.back() == '&' || LoopTy.back() == ' ')) LoopTy.pop_back();
-    if (LoopTy.size() > 6 && LoopTy.compare(LoopTy.size() - 6, 6, " const") == 0) LoopTy.erase(LoopTy.size() - 6);  // `auto`: `int const &`
     std::vector<FArgIR> Consts;
-    const bool bConsts = Which == 'A' && Items && Kind(*LoopDecl) == "VarDecl" && Canon(LoopTy) == Canon(Args[0])
+    const bool bConsts = Which == 'A' && Items && Kind(*LoopDecl) == "VarDecl" && Canon(TypeOf(*LoopDecl)) == Canon(Args[0])
                       && InlineConsts(*Items, Args[0], BP, &Consts);
     if (bConsts && Consts.size() <= 16)
     {
