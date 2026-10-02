@@ -8276,7 +8276,9 @@ def defaults_braces_nested():
     replace that value: a member they leave out holds what the engine's constructor sets (Time 1), and the parent's
     value under it is the initializer's, though the parent's H as a whole is fresh. It cannot be written: refused.
     Where the member has no initializer (DefaultsBraces' FDbHeld::Hit) the parent's value under it is fresh too, and the
-    braces leave the rest untagged."""
+    braces leave the rest untagged. The refusal names Time, the member the initializer gives: FaceIndex, which it
+    leaves out too, is still the fresh one under it (DefaultsNestDeep follows initializers down; fa30eccf named
+    FaceIndex)."""
     import struct
     pkg = invariants.Package(asset('DefaultsBraces'))
     cdo = pkg.find('Default__DefaultsBraces_C')
@@ -8284,7 +8286,7 @@ def defaults_braces_nested():
     hit = {t['name']: struct.unpack('<f', t['value'])[0] for t in pkg.tags(cdo, held['Hit']['at'])}
     assert hit == {'Distance': 7.0} and struct.unpack('<i', held['N']['value'])[0] == 0, (hit, held)
     refused('BracesNestInit', '  UE_DEFAULTS {\n    H = {.Hit = {.Distance = 5.0f}};\n  }\n',
-            "H.Hit.FaceIndex, left out of the braces, holds what the engine's FHitResult constructor sets",
+            "H.Hit.Time, left out of the braces, holds what the engine's FHitResult constructor sets",
             'struct FDbnHeld {\n  UE_STRUCT;\n  FHitResult Hit = {.Time = 0.5f};\n  int32 N = 0;\n};\n'
             'class DbnParent : public AActor {\npublic:\n  FDbnHeld H;\n};\n', 'DbnParent')
 
@@ -8301,7 +8303,7 @@ def defaults_nest_deep():
     initializer 0 over the parent's 4 ([dcl.init.aggr]/5). Where In's initializer gives Hit a value (Time 0.5), the
     member the new braces leave out over it is refused by name. Refused on fa30eccf at O.In.Hit.FaceIndex."""
     import struct
-    base = pending_asset('DefaultsNestDeep')
+    base = asset('DefaultsNestDeep')
     keeps_invariants(base)
     pkg = invariants.Package(base)
     cdo = pkg.find('Default__DefaultsNestDeep_C')
@@ -8320,7 +8322,8 @@ def defaults_nest_deep():
             'class NdgParent : public AActor {\npublic:\n  FNdgOuter O;\n};\n', 'NdgParent')
 
 
-pending('DefaultsNestDeep: braces under a member\'s initializer follow it down to what it leaves fresh', defaults_nest_deep)
+defaults_nest_deep()
+print('ok  DefaultsNestDeep: braces under a member\'s initializer follow it down to what it leaves fresh')
 
 
 def defaults_other_nest():
@@ -8335,8 +8338,9 @@ def defaults_other_nest():
                 'struct F%sHeld {\n  %s;\n  FHitResult Hit = {.Time = 0.5f};\n  int32 N = 0;\n};\n' % (mod, kind))
 
 
-pending('DefaultsOtherNest: another mod\'s struct\'s member with an initializer is no fresh value under new braces',
-        defaults_other_nest)
+defaults_other_nest()
+print('ok  DefaultsOtherNest: new braces over another mod\'s struct\'s member initializer are refused as over a '
+      'UE_STRUCT\'s')
 
 
 def defaults_braces_twice():
@@ -8385,7 +8389,7 @@ def defaults_other_ctor():
     the engine's FDboOther constructor sets"."""
     import struct
     asset('DboOtherMod')
-    base = pending_asset('DefaultsOtherCtor')
+    base = asset('DefaultsOtherCtor')
     keeps_invariants(base)
     pkg = invariants.Package(base)
     cdo = pkg.find('Default__DefaultsOtherCtor_C')
@@ -8396,7 +8400,8 @@ def defaults_other_ctor():
         assert got == {'A': 3, 'B': 4}, '%s is written %r, where C++ value-initialises it to A 3, B 4' % (name, got)
 
 
-pending('DefaultsOtherCtor: another mod\'s struct\'s T() or {} is its members\' initializers', defaults_other_ctor)
+defaults_other_ctor()
+print('ok  DefaultsOtherCtor: another mod\'s struct\'s T() or {} is its members\' initializers, written')
 
 
 def tenum_value_init():

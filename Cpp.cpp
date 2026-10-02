@@ -1796,6 +1796,11 @@ private:
     /* Set while a UE_DEFAULTS statement is lowered whose member the parent holds as a fresh value (ParentValueFresh):
        a member its braces leave out keeps that value, as C++ would make it. */
     bool bParentFresh = false;
+    /* With bParentFresh, the braces the parent's value of the struct being lowered was made with, as a member's
+       initializer gave them (`FRvInner In = {.K = 4}`), and that struct's record: its members are fresh where these
+       leave them out. Null: as each member's own declaration makes it. */
+    const Json* ParentInit = nullptr;
+    const FRecord* ParentInitOf = nullptr;
     bool ParentValueFresh(const FRecord& R, const Json& Lhs) const;
     std::map<std::string, std::vector<std::pair<std::string, int64>>> ModEnums;  // UE_ENUM cooked here: enumerators
 
@@ -11555,11 +11560,13 @@ static void ZeroDefault(FPropertyDef& PD)
    FHitResult::Init), which no header says and a function body's Make Struct keeps: in a value that starts as the
    engine's (bFreshValue) no tag keeps it, and over a value already there it cannot be written, so it is refused; a
    member the braces of a UE_DEFAULTS statement leave out says so (bLeftOutMember). One whose every member is Transient
-   is written as no member at all, with a warning. */
+   is written as no member at all, with a warning. Another mod's struct (UE_STRUCT_IN) is no engine struct: its header
+   says each member's value, as a UE_STRUCT's does. */
 bool FCompiler::ValueInitStruct(const FRecord& SR, bool bZeros, const std::string& Path, FPropertyDef& PD,
                                 FBlueprintClass& BP, std::string* Err)
 {
-    if (!bZeros && SR.IsNative() && !ConstructsNothing(SR) && !CtorOverZeros(SR.CppName))
+    const bool bEngine = SR.IsNative() && !SR.IsModStruct();
+    if (!bZeros && bEngine && !ConstructsNothing(SR) && !CtorOverZeros(SR.CppName))
     {
         if (bFreshValue) return true;
         /* A struct whose every member is Transient (FTimerHandle's Handle) has nothing a default can say: the loader
@@ -11583,7 +11590,7 @@ bool FCompiler::ValueInitStruct(const FRecord& SR, bool bZeros, const std::strin
                "out to keep that value, or give the members in braces, `{.Member = value}`";
         return false;
     }
-    bZeros = bZeros || SR.IsNative();
+    bZeros = bZeros || bEngine;
     /* The struct and its supers, topmost first: a super's members are the struct's too. */
     std::vector<const FRecord*> Chain;
     for (const FRecord* R = &SR; R; R = R->Base.empty() ? nullptr : Find(R->Base)) Chain.insert(Chain.begin(), R);
@@ -11824,6 +11831,16 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
         struct FRestore { bool& Flag; bool Was; ~FRestore() { Flag = Was; } } Restore{ bFreshValue, bWasFresh },
                                                                           RestoreLeftOut{ bLeftOutMember, bWasLeftOut },
                                                                           RestoreParentFresh{ bParentFresh, bWasParentFresh };
+        const Json* const WasParentInit = ParentInit;
+        const FRecord* const WasParentInitOf = ParentInitOf;
+        struct FRestoreInit { const Json*& Init; const FRecord*& Of; const Json* WasInit; const FRecord* WasOf;
+                              ~FRestoreInit() { Init = WasInit; Of = WasOf; } }
+            RestoreInit{ ParentInit, ParentInitOf, WasParentInit, WasParentInitOf };
+        /* The parent's value of this struct is fresh as the braces it was made with leave it (ParentInit, a member's
+           initializer further up), else as each member's declaration makes it; braces for another struct say nothing. */
+        const std::vector<const Json*> ParentArgs = bWasParentFresh && WasParentInit && WasParentInitOf == SR
+                                                  ? StructArgs(*WasParentInit, SR, Names) : std::vector<const Json*>();
+        const bool bParentHere = bWasParentFresh && (!WasParentInit || ParentArgs.size() == Names.size());
         /* Braces that give some members and leave the rest out (`{.Distance = 5.0f}`; `{}` gives none). */
         const bool bSomeGiven = std::any_of(Args.begin(), Args.end(), [](const Json* A) { return !IsUnsetInit(*A); });
         auto Members = std::make_shared<std::vector<FPropertyDef>>();
@@ -11840,13 +11857,24 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
             bLeftOutMember = bSomeGiven && IsUnsetInit(*Args[I]);
             /* The parent's value of a member given here is fresh where the parent's struct is and the member starts as
                the engine makes it: a UE_STRUCT's member with an initializer of its own (`Hit = {.Time = 0.5f}`) holds
-               that in the parent, and braces given for it are a new value over it. */
-            bParentFresh = bWasParentFresh && (!A || IsUnsetInit(*A) || StartsFresh(Strip(First(*SR->Fields[I]))));
+               that in the parent, and braces given for it are a new value over it. The parent's member was made by
+               the braces the parent's struct was (ParentArgs) where they give it, else by its declaration; braces
+               there (`In = {.K = 4}`) are followed down, so what they leave out is still fresh under it (In.Hit). */
+            const Json* const Given = I < ParentArgs.size() && ParentArgs[I] && !IsUnsetInit(*ParentArgs[I])
+                                    ? Strip(ParentArgs[I]) : nullptr;
+            const Json* const Made = Given ? Given : Strip(First(*SR->Fields[I]));
+            const FRecord* const MemberStruct = Made && Kind(*Made) == "InitListExpr" && !StartsFresh(Made)
+                                              ? Find(StripTypeKeywords(TypeOf(*SR->Fields[I]))) : nullptr;
+            const bool bFollow = MemberStruct && MemberStruct->bIsStruct;
+            bParentFresh = bParentHere && ((!A || IsUnsetInit(*A)) ? !Given : (StartsFresh(Made) || bFollow));
+            ParentInit = bParentFresh && bFollow ? Made : nullptr;
+            ParentInitOf = ParentInit ? MemberStruct : nullptr;
             /* A UE_STRUCT's member with an initializer of its own starts as that, not as the engine's value, so a value
-               given for it is written over one already there. One the braces of a UE_DEFAULTS statement leave out is
-               over the parent's value, which may be the fresh one (bParentFresh). */
+               given for it is written over one already there; so does one of another mod's struct (UE_STRUCT_IN). One
+               the braces of a UE_DEFAULTS statement leave out is over the parent's value, which may be the fresh one
+               (bParentFresh). */
             bFreshValue = (bWasFresh || !bKeepZero || (bLeftOutMember && bParentFresh))
-                       && !(A && !SR->IsNative() && First(*SR->Fields[I]));
+                       && !(A && (!SR->IsNative() || SR->IsModStruct()) && First(*SR->Fields[I]));
             /* Braces of an engine struct whose header declares no constructor are the editor's Make Struct: a member
                they leave out keeps what the engine's constructor sets, which no header says (FHitResult's Time 1). A
                fresh value holds it with no tag; over another it cannot be written. A struct written as raw bytes
