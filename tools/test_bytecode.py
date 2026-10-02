@@ -1307,25 +1307,41 @@ def assigned_comma_stmt():
     """AssignedCommaStmt: an assignment onto a comma used as a value in a statement, `int32 X = ((Bump(), N) = G());`.
     The C++ results: the assignment's value is its left operand ([expr.ass]), the comma's right side, the lvalue N
     ([expr.comma]), or T.A of it ([expr.ref]); C++17 sequences G() before the comma ([expr.ass]/1), so it reads Count
-    before Bump moves it; `(... = G()) += 1` updates N after the assignment. Refused on fa30eccf as "an assignment used
-    as a value, whose left side is no plain variable", where the loop form compiles. An update of an assignment to an
-    element (`(IL[Idx()] = M) += 1;`) would locate the element twice: refused, as in a loop condition."""
-    base = pending_asset('AssignedCommaStmt')
+    before Bump moves it; `(... = G()) += 1` updates N after the assignment, as a statement and in a loop condition
+    (Loop: 1 first, then G, Bump and the store, then the update, [expr.ass]/1); `(Bump(), IL)[Idx()] = G()` runs G,
+    then Bump, then Idx ([expr.sub]: the array before the index, C++17), so Idx sees Count M + 2. Refused on fa30eccf
+    as "an assignment used as a value, whose left side is no plain variable", where the loop form compiles. An update of
+    an assignment to an element (`(IL[Idx()] = M) += 1;`) would locate the element twice: refused, as in a loop
+    condition, by the same message (fa30eccf said "an assignment used as a value")."""
+    base = asset('AssignedCommaStmt')
     keeps_invariants(base)
-    for m in (0, 3):
+
+    def loop(m):                                    # `while ((((Bump(), N) = G()) += 1) < 50) K += 1;`
+        c, k = m, 0
+        while True:
+            g = c * 10; c += 1; n = g + 1
+            if not n < 50: return k * 1000 + n
+            k += 1
+
+    def slot(m):                                    # `(Bump(), IL)[Idx()] = G();` over IL = {0, 0}
+        il, g = [0, 0], m * 10
+        il[(m + 2) % 2] = g
+        return il[0] * 10000 + il[1] * 100 + m + 2
+    for m in (0, 3, 4):
         for fn, want in (('Value', 10 * m * 100 + m + 1), ('Member', 10 * m * 100 + m + 1),
-                         ('Update', (10 * m + 1) * 100 + m + 1)):
-            got = run(base, fn, {'Count': 0, 'N': 0, 'T': {}}, M=m)[0]
+                         ('Update', (10 * m + 1) * 100 + m + 1), ('Loop', loop(m)), ('Slot', slot(m))):
+            got = run(base, fn, {'Count': 0, 'N': 0, 'T': {}, 'IL': []}, M=m)[0]
             assert got == want, 'AssignedCommaStmt.%s(%d) = %r; C++ %r' % (fn, m, got, want)
-            got = VM(base, Count=0, N=0, T={}).call(fn, M=m)
+            got = VM(base, Count=0, N=0, T={}, IL=[]).call(fn, M=m)
             assert got == want, 'runvm: AssignedCommaStmt.%s(%d) = %r; C++ %r' % (fn, m, got, want)
     refused('SlotUpdStmt', '  int32 Count;\n  TArray<int32> IL;\n  [[gnu::noinline]] int32 Idx() { Count += 1; return 0; }\n'
             '  int32 F(int32 M) { IL = {0}; (IL[Idx()] = M) += 1; return IL[0]; }\n',
             'an assignment assigned to or updated, whose left side is no plain variable')
 
 
-pending('AssignedCommaStmt: an assignment onto a comma used as a value in a statement writes the variable it names',
-        assigned_comma_stmt)
+assigned_comma_stmt()
+print('ok  AssignedCommaStmt: an assignment onto a comma, or a member or element of one, used as a value in a statement '
+      'writes the variable it names; one onto an element, updated, is refused as in a loop condition')
 
 
 def member_of_comma():
@@ -1334,8 +1350,9 @@ def member_of_comma():
     after the comma ran (an overloaded operator's operands sequenced as the built-in's, [over.match.oper]/2, [expr.sub]);
     a loop condition is evaluated before each trip ([stmt.while]); `(Bump(), T).A = T.A + Count` reads its right side
     first ([expr.ass]/1, C++17), Count before Bump. Refused on fa30eccf as "the comma operator after something its
-    statement runs first", which the user never wrote."""
-    base = pending_asset('MemberOfComma')
+    statement runs first" (Element) or "an assignment used as a value, whose left side is no plain variable"
+    (Assign), neither of which the user wrote."""
+    base = asset('MemberOfComma')
     keeps_invariants(base)
 
     def loop(m, by_count=False, limit=5):           # Count bumps once per trip; A moves by 1 (or by Count before it)
@@ -1353,7 +1370,9 @@ def member_of_comma():
             assert got == want, 'runvm: MemberOfComma.%s(%d) = %r; C++ %r' % (fn, m, got, want)
 
 
-pending('MemberOfComma: a member or an element of a comma updated in a loop condition writes it', member_of_comma)
+member_of_comma()
+print('ok  MemberOfComma: a member or an element of a comma updated or assigned in a loop condition writes it, the '
+      'comma\'s left side run first on every trip')
 
 
 def comma_slot_right():

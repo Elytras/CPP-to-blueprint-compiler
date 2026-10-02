@@ -3708,6 +3708,22 @@ const Json* PeelLvalue(const Json* N)
     return N;
 }
 
+bool IsTArrayElement(const Json& N);
+bool IsTMapElement(const Json& N);
+
+/* What a place stands on, past its wrappers, the members taken of it and the elements indexed in it: `T` for `T.A`,
+   `(L = M)` for `(L = M)[0].B`. A pointer's member (`P->A`) stands on the pointer's value, which is no place: it ends there. */
+const Json* PlaceRoot(const Json* N)
+{
+    for (N = PeelLvalue(N); N; N = PeelLvalue(N))
+    {
+        if (Kind(*N) == "MemberExpr" && !N->value("isArrow", false) && First(*N)) N = First(*N);
+        else if ((IsTArrayElement(*N) || IsTMapElement(*N)) && (*N)["inner"].size() == 3) N = &(*N)["inner"][1];
+        else return N;
+    }
+    return N;
+}
+
 /* `Items[i]` on a TArray: a Kismet ArrayGetByRef, not pointer indexing. */
 bool IsTArrayElement(const Json& N)
 {
@@ -5740,7 +5756,7 @@ bool FCompiler::DesugarUpdate(const Json& S, Json& Wrap, std::string* Result, st
         Wrap = { {"kind", "CompoundStmt"}, {"inner", std::move(Pre)} };
         return true;
     }
-    if (const Json* Bare = PeelLvalue(Orig); Bare && Kind(*Bare) == "BinaryOperator" && Bare->value("opcode", std::string()) == "=")
+    if (const Json* Bare = PlaceRoot(Orig); Bare && Kind(*Bare) == "BinaryOperator" && Bare->value("opcode", std::string()) == "=")
     { *Err = kAssignedAssignNoVar; return false; }
 
     /* X is located once. C++17 sequences Y before X in `X op= Y`, so a Y that must not move past what locates X
@@ -9995,6 +10011,7 @@ int32 FCompiler::HoistComma(const Json& Stmt, FBlueprintClass& BP, Json* Seq, st
                     FixedDefaults.insert(&In[J]);
     };
     auto IsFixedSibling = [&](const Json& E) { return IsFixedOperand(E) || FixedDefaults.count(&E) != 0; };
+    std::vector<const Json*> Written;      // the operands assignments and updates write, on the way to the target
     std::function<Json*(Json&, bool)> Seek = [&](Json& E, bool bRoot) -> Json* {
         if (!E.is_object()) return nullptr;
         const std::string K = Kind(E);
@@ -10032,6 +10049,12 @@ int32 FCompiler::HoistComma(const Json& Stmt, FBlueprintClass& BP, Json* Seq, st
             return nullptr;
         };
         const std::string Op = E.value("opcode", std::string());
+        if ((K == "UnaryOperator" && (Op == "++" || Op == "--")) || K == "CompoundAssignOperator"
+            || (K == "BinaryOperator" && Op == "="))
+            Written.push_back(&In[0]);
+        else if (K == "CXXOperatorCallExpr" && In.size() > 1 && (Assigns.count(OperatorOf(E)) || OperatorOf(E) == "++"
+                                                                 || OperatorOf(E) == "--"))
+            Written.push_back(&In[1]);
         if (K == "ImplicitCastExpr" || K == "ParenExpr" || K == "ConstantExpr" || K == "ExprWithCleanups"
             || K == "MaterializeTemporaryExpr" || K == "CXXBindTemporaryExpr" || K == "CXXFunctionalCastExpr"
             || K == "CStyleCastExpr" || K == "CXXStaticCastExpr" || K == "CXXConstCastExpr" || K == "CXXStdInitializerListExpr"
@@ -10125,12 +10148,22 @@ int32 FCompiler::HoistComma(const Json& Stmt, FBlueprintClass& BP, Json* Seq, st
        left side that is no plain variable would run a second time. */
     const bool bAssign = !IsComma(*Target);
     const Json Left = bAssign ? *Target : (*Target)["inner"][0];
-    const Json Right = !bAssign ? (*Target)["inner"][1] : (*Target)["inner"][Kind(*Target) == "CXXOperatorCallExpr" ? 1 : 0];
+    /* What an assignment wrote, read again after it: its left side, or the variable a comma or another assignment there
+       names (AssignedPlace: `((Bump(), N) = G())` is N), which its own statement takes apart. */
+    Json Right = !bAssign ? (*Target)["inner"][1] : (*Target)["inner"][Kind(*Target) == "CXXOperatorCallExpr" ? 1 : 0];
+    if (bAssign) { Json Unused = Json::array(), Named; AssignedPlace(Right, Unused, Named); Right = std::move(Named); }
     const bool bUpdate = bAssign && IsUpdate(*Target);
     if (bAssign && !IsEagerSafe(*Strip(&Right)))
-    { *Err = std::string(bUpdate ? "an update (`+=`, `++`, ...) passed to a reference parameter" : "an assignment used as a value")
+    {
+        /* One that is itself assigned to or updated, `(L[Idx()] = M) += 1`, says so, as it does where no statement
+           before can hold it (DesugarUpdate). */
+        if (!bUpdate && std::any_of(Written.begin(), Written.end(), [&](const Json* N) { return PlaceRoot(N) == Target; }))
+        { *Err = kAssignedAssignNoVar; return -1; }
+        *Err = std::string(bUpdate ? "an update (`+=`, `++`, ...) passed to a reference parameter" : "an assignment used as a value")
              + ", whose left side is no plain variable, which would be evaluated again to read it: assign in a statement "
-               "of its own, then use what it assigned"; return -1; }
+               "of its own, then use what it assigned";
+        return -1;
+    }
     const std::string What = !bAssign ? "the comma operator"
                            : bUpdate ? "an update (`+=`, `++`, ...)" : "an assignment used as a value";
     const Json* Moved = nullptr;
@@ -10406,20 +10439,38 @@ the comma's right side, an lvalue ([expr.comma]); `(N = M) += 1` writes N after 
 its left operand, an lvalue). Out gets that variable, through commas in commas, and Pre what runs first, in order: each
 comma's left side that can do something, or the assignment itself, whose left side must then be a plain variable
 (IsEagerSafe), named twice. The caller puts ahead of them what C++ evaluates before the left side of an assignment, its
-right side ([expr.ass]/1, C++17). False, with Out the place as it is, for anything else: the caller's own lowering
-refuses what it cannot write to. DesugarUpdate, LowerBody's assignment and LowerCommaValue use it.
+right side ([expr.ass]/1, C++17). A member or an element of one, `(Bump(), T).A` or `(Bump(), L)[I]`, is the same member
+or element of the variable ([expr.ref]; an overloaded `[]`'s operands are sequenced as the built-in's, [over.match.oper]/2,
+[expr.sub]: the array first), its index left where it is, to run after. False, with Out the place as it is, for anything
+else: the caller's own lowering refuses what it cannot write to. DesugarUpdate, LowerBody's assignment, LowerCommaValue
+and HoistComma use it.
 */
 bool FCompiler::AssignedPlace(const Json& Place, Json& Pre, Json& Out) const
 {
     const Json* Bare = PeelLvalue(&Place);
+    /* The object a member or an element is taken of: a place too, its own path walked the same way. */
+    const size_t Of = !Bare ? 0 : Kind(*Bare) == "MemberExpr" && !Bare->value("isArrow", false) && First(*Bare) ? 1
+                    : (IsTArrayElement(*Bare) || IsTMapElement(*Bare)) && (*Bare)["inner"].size() == 3 ? 2 : 0;
+    if (Of)
+    {
+        Json Base;
+        if (!AssignedPlace((*Bare)["inner"][Of - 1], Pre, Base)) { Out = Place; return false; }
+        Out = *Bare;
+        Out["inner"][Of - 1] = std::move(Base);
+        return true;
+    }
     const std::string Op = Bare && Kind(*Bare) == "BinaryOperator" ? Bare->value("opcode", std::string()) : std::string();
     const Json* Left = Bare ? Nth(*Bare, 0) : nullptr;
     const Json* Right = Bare ? Nth(*Bare, 1) : nullptr;
-    if (!Left || !Right || (Op != "," && !(Op == "=" && Strip(Left) && IsEagerSafe(*Strip(Left))))) { Out = Place; return false; }
+    /* An assignment's left side, read again after it, must name the same place: a plain variable, or a comma or another
+       assignment that names one, which the assignment's own lowering takes apart. */
+    Json Named, Unused = Json::array();
+    if (Op == "=" && Left) AssignedPlace(*Left, Unused, Named);
+    if (!Left || !Right || (Op != "," && !(Op == "=" && Strip(&Named) && IsEagerSafe(*Strip(&Named))))) { Out = Place; return false; }
     if (Op == "=")
     {
         Pre.push_back(*Bare);
-        Out = *Left;
+        Out = std::move(Named);
         return true;
     }
     if (const Json* L = Strip(Left); L && !IsEagerSafe(*L)) Pre.push_back(*Left);
