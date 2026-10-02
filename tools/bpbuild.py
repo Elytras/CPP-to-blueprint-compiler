@@ -308,10 +308,17 @@ def write_vs_filters(bp):
     project = os.path.join(bp, "BpMods.vcxproj")
     if not os.path.exists(project):
         return
+    # A mod named *Test is a test (CppTest is HelloWorld.cpp): its sources go under Tests, not Mods.
+    manifest = os.path.join(bp, "mods.yaml")
+    mods = (yaml.safe_load(io.open(manifest, encoding="utf-8-sig").read()) or {}).get("mods") or [] \
+        if os.path.exists(manifest) else []
+    tests = {os.path.normcase(os.path.normpath(p)) for m in mods if str(m.get("name", "")).endswith("Test")
+             for s in m.get("sources") or [] for p in glob.glob(os.path.join(bp, s))}
     rows = []
     for f in sorted(os.listdir(bp), key=str.lower):
         if f.endswith(".cpp"):
-            rows.append(("ClCompile", f, "Tests" if f.endswith("Test.cpp") else "Mods"))
+            test = f.endswith("Test.cpp") or os.path.normcase(os.path.normpath(os.path.join(bp, f))) in tests
+            rows.append(("ClCompile", f, "Tests" if test else "Mods"))
         elif f.endswith(".h"):
             rows.append(("ClInclude", f, "Helpers"))
     # A mod in its own folder (`MyMod/`) gets a filter of its own under Mods (`Mods\MyMod`), nested as the folders
@@ -326,12 +333,16 @@ def write_vs_filters(bp):
                 if f.endswith((".cpp", ".h")):
                     rows.append(("ClCompile" if f.endswith(".cpp") else "ClInclude",
                                  os.path.relpath(os.path.join(root, f), bp), folder))
-    # The compiler's own test mods and the headers any mod may include live beside it, in AssetGen.
-    for sub, kind, ext, folder in (("tests", "ClCompile", ".cpp", "Tests"), ("include", "ClInclude", ".h", "Helpers")):
+    # The compiler's own test mods (their headers and tests/ast too, not the test run's build/) and the headers any mod
+    # may include live beside it, in AssetGen.
+    for sub, folder in (("tests", "Tests"), ("include", "Helpers")):
         d = os.path.join(bp, "..", "AssetGen", sub)
-        for f in sorted(os.listdir(d), key=str.lower) if os.path.isdir(d) else []:
-            if f.endswith(ext):
-                rows.append((kind, "..\\AssetGen\\%s\\%s" % (sub, f), folder))
+        for root, dirs, files in os.walk(d):
+            dirs[:] = sorted((x for x in dirs if x != "build"), key=str.lower)
+            for f in sorted(files, key=str.lower):
+                if f.endswith((".cpp", ".h")) and (sub == "tests" or f.endswith(".h")):
+                    rel = os.path.relpath(os.path.join(root, f), os.path.join(bp, ".."))
+                    rows.append(("ClCompile" if f.endswith(".cpp") else "ClInclude", "..\\" + rel, folder))
     api = os.path.join(bp, "UeApi")
     for f in sorted(os.listdir(api), key=str.lower) if os.path.isdir(api) else []:
         if f.endswith(".h"):
