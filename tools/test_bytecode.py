@@ -1375,6 +1375,32 @@ print('ok  MemberOfComma: a member or an element of a comma updated or assigned 
       'comma\'s left side run first on every trip')
 
 
+def member_of_comma_stmt():
+    """MemberOfComma's statement forms: a member or an element of a comma updated or assigned as a statement, in an if
+    condition, as an initializer and as a reference argument. The C++ results: the right side runs before the left
+    ([expr.ass]/1, C++17), so G() reads Count before Bump moves it, and `(Bump(), T).A = T.A + Count` reads Count
+    before Bump; the update's value is T.A itself ([expr.ass]), so IncRef's `int32&` adds 3 to T.A. Each was refused on
+    fa30eccf as "the comma operator after something its statement runs first"; nothing covered them before."""
+    base = asset('MemberOfComma')
+    vm = lambda: VM(base, Count=0, T={}, IL=[], N=0)
+    for m in (0, 3, 7):
+        compound = (1 + 10 * m) * 100 + m + 1
+        for fn, want in (('CompoundStmt', compound), ('AssignStmt', 10 * m * 100 + m + 1), ('ElementStmt', compound),
+                         ('RightReadStmt', (1 + m) * 100 + m + 1), ('StepStmt', 2 * 100 + m + 1),
+                         ('IfCond', 5 * 10000 + compound), ('Value', compound), ('RefArg', (m + 4) * 100 + m + 1)):
+            got = run(base, fn, {'Count': 0, 'T': {}, 'IL': [], 'N': 0}, M=m)[0]
+            assert got == want, 'MemberOfComma.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+            v = vm()
+            v.ref_params = True
+            got = v.call(fn, M=m)
+            assert got == want, 'runvm: MemberOfComma.%s(%d) = %r; C++ %r' % (fn, m, got, want)
+
+
+member_of_comma_stmt()
+print('ok  MemberOfComma: the same as statements, an if condition, an initializer and a reference argument, the right '
+      'side run before the comma')
+
+
 def comma_slot_right():
     """CommaSlotRight: a struct's or FString's `=` onto a comma whose right side is an element, `(Bump(), T) = L[Count]`.
     C++17 sequences the right operand before the left ([expr.ass]/1; an overloaded operator's operands in that order,
