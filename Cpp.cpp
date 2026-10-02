@@ -2353,6 +2353,12 @@ bool FCompiler::Collect(std::string* Err)
             return;
         }
         if (Kind(N) != "CXXRecordDecl" || !N.contains("name") || !N.contains("inner")) return;
+        /* A forward declaration is no record, though it may carry an attribute: `&AActor::F` gives every declaration of
+           AActor an implicit MSInheritanceAttr, the `class AActor;` a header has after the definition too, which would
+           replace the class with an empty one. */
+        bool bOnlyAttrs = true;
+        ForEach(N, [&](const Json& C) { const std::string K = Kind(C); bOnlyAttrs = bOnlyAttrs && K.size() > 4 && K.compare(K.size() - 4, 4, "Attr") == 0; });
+        if (bOnlyAttrs) return;
 
         FRecord R;
         R.CppName = Ns + Name(N);

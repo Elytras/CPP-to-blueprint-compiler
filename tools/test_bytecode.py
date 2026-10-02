@@ -7026,7 +7026,7 @@ def delegate_native_method():
     """DelegateNativeMethod binds AActor::SetActorTickInterval, a native function, on this object: the class still
     derives /Script/Engine.Actor (a member pointer does not turn AActor's forward declaration into the class), and the
     binding names the function on this actor."""
-    base = pending_asset('DelegateNativeMethod')
+    base = asset('DelegateNativeMethod')
     keeps_invariants(base)
     pkg = invariants.Package(base)
     ci = next(i for i, st in invariants.classes(pkg))
@@ -7036,7 +7036,8 @@ def delegate_native_method():
     assert vm.binds == [(vm.self, 'OnTick', 'SetActorTickInterval', vm.self)], vm.binds
 
 
-pending('DelegateNativeMethod: a member pointer to a native class\'s function keeps the class native', delegate_native_method)
+delegate_native_method()
+print('ok  DelegateNativeMethod: a member pointer to AActor\'s function keeps AActor the native parent')
 # A bound name the object's class does not have: the broadcast or the timer skips it (ScriptDelegates.h 38-49,
 # 479-502). The editor binds only a BlueprintCallable function, never a pure or latent one (K2Node_CreateDelegate.cpp
 # 156-164 -> EdGraphSchema_K2.cpp 929-985): AActor::ReceiveTick is a BlueprintEvent only.
