@@ -7016,6 +7016,54 @@ def delegate_native_method():
     assert vm.binds == [(vm.self, 'OnTick', 'SetActorTickInterval', vm.self)], vm.binds
 
 
+def delegate_inherit_bind():
+    """DelegateInheritBind binds a helper's function to a dispatcher its class inherits: its mod parent's OnHit, and
+    DelegateInheritBurrow its game Blueprint parent's OnBurrowComplete. The delegate is typed with the parent's own
+    <Name>__DelegateSignature, imported as the editor's Create Event node names it; the class makes no function of that
+    name, which would hide the parent's with no link to it (keeps_invariants: func_super_link). A TDelegate value handed
+    to a timer in both the parent and the child gets a signature function in each, the child's under a name its parent
+    does not use. The broadcasts reach the helper, and Remove takes the binding off."""
+    base = pending_asset('DelegateInheritBind')
+    here = os.path.dirname(base)
+    burrow = os.path.join(here, 'DelegateInheritBurrow')
+    for b in (base, burrow, os.path.join(here, 'DelegateInheritParent')):
+        keeps_invariants(b)
+    for b, sig in ((base, '/Game/_ElytrasMods/DelegateInheritBind/DelegateInheritParent.DelegateInheritParent_C:OnHit__DelegateSignature'),
+                   (burrow, '/Game/Enemies/Spider/BP_BurrowComponent.BP_BurrowComponent_C:OnBurrowComplete__DelegateSignature')):
+        assert sig in import_paths(b), (os.path.basename(b), import_paths(b))
+        assert sig.rsplit(':', 1)[1] not in exports_of(b), (os.path.basename(b), exports_of(b))
+    for b, fn, helper_got in ((base, 'Fire', 3), (burrow, 'Fire', 1000)):
+        vm = VM(b, {})
+        vm.classes['DelegateInheritHelper_C'] = os.path.join(here, 'DelegateInheritHelper')
+        h = Obj('DelegateInheritHelper_C', Got=0)
+        vm.self.vars['H'] = h
+        vm.call('Bind')
+        assert vm.binds == [(vm.self, 'OnHit' if b == base else 'OnBurrowComplete', 'Take' if b == base else 'Dug', h)], vm.binds
+        vm.call(fn, 3) if b == base else vm.call(fn)
+        assert h.vars['Got'] == helper_got, h.vars
+    vm.call('Unbind')
+    assert vm.binds == [], vm.binds
+
+
+def delegate_rpc_refusals():
+    """A native function the engine does not mark BlueprintCallable is one the editor's Create Event node refuses
+    (K2Node_CreateDelegate.cpp 156-164 -> EdGraphSchema_K2.cpp 929-933, 974-985). A server RPC is one, which UeApi's
+    UE_SERVER says: refused on another object and on this one."""
+    refused('DelegateOtherRpc', '  UE_DISPATCHER(OnUse, bool Using);\n  AItem *I = nullptr;\n'
+            '  void F() { OnUse.Add(I, &AItem::Server_StartUsing); }\n', 'Server_StartUsing is not BlueprintCallable')
+    refused('DelegateSelfRpc', '  UE_DISPATCHER(OnUse, bool Using);\n  void F() { OnUse.Add(this, &AItem::Server_StartUsing); }\n',
+            'Server_StartUsing is not BlueprintCallable', base='AItem')
+
+
+def delegate_not_callable_refusals():
+    """AActor::OnRep_Instigator is a native function that is not BlueprintCallable, and nothing in its declaration says
+    so: UeApi's NotCallable.json does. Refused on another object and on this one."""
+    refused('DelegateOtherOnRep', '  UE_DISPATCHER(OnPing);\n  AActor *A = nullptr;\n'
+            '  void F() { OnPing.Add(A, &AActor::OnRep_Instigator); }\n', 'OnRep_Instigator is not BlueprintCallable')
+    refused('DelegateSelfOnRep', '  UE_DISPATCHER(OnPing);\n  void F() { OnPing.Add(this, &AActor::OnRep_Instigator); }\n',
+            'OnRep_Instigator is not BlueprintCallable')
+
+
 def ueapi_marks_dispatchers():
     """Whether UeApi says which native dispatchers are BlueprintAssignable / BlueprintCallable (genueapi's
     <D>__UeDispatcher): one from before that says nothing, and the compiler then takes Add on any native dispatcher and
@@ -7064,6 +7112,12 @@ print('ok  DelegateOtherBind: a function of another object - a sibling\'s, a pee
       'is bound by EX_BindDelegate, and the broadcast and the timer reach it on that object')
 delegate_native_method()
 print('ok  DelegateNativeMethod: a member pointer to AActor\'s function keeps AActor the native parent')
+pending('DelegateInheritBind: a function of another object bound to an inherited dispatcher names the parent\'s signature',
+        delegate_inherit_bind)
+pending('delegate RPC refusals: a server RPC is not BlueprintCallable, so the editor binds it on no object',
+        delegate_rpc_refusals)
+pending('delegate not-callable refusals: OnRep_Instigator is not BlueprintCallable (needs a UeApi with NotCallable.json)',
+        delegate_not_callable_refusals)
 # Without UeApi's marks the compiler cannot tell a callable native dispatcher from another; it refuses Broadcast on every
 # one, saying so (refused below), and takes Add on any.
 refused('DispatchNativeUnmarked', '  void F() { OnDestroyed.Broadcast(this); }\n', 'OnDestroyed is a native dispatcher')
