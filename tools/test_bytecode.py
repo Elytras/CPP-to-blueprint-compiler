@@ -6970,7 +6970,8 @@ def delegate_other_bind():
     object's class (runvm's peer: DelegateOtherTarget's own package), and never on this one; Remove takes the (object,
     name) binding off; the timer gets Ping bound on Peer. Each binding is EX_BindDelegate into a delegate local, so the
     object is evaluated where the bind runs (keeps_invariants: delegate_bind_matches_signature checks each bound name
-    against the dispatcher's signature on the class the object's variable declares)."""
+    against the dispatcher's signature on the class the object's variable declares). With Peer null when BindPeer runs,
+    nothing is bound and the broadcast runs nothing, on this object least of all."""
     base = asset('DelegateOtherBind')
     keeps_invariants(base)
     vm = VM(base, {}, Got=0)
@@ -7000,6 +7001,14 @@ def delegate_other_bind():
     vm.call('ArmPeer')
     timers = [a for n, c, a in vm.log if n == 'K2_SetTimerDelegate']
     assert timers == [[('delegate', 'Ping', peer), 1.0, False, 0.0, 0.0]], timers
+    # Peer null when the bind runs: EX_BindDelegate binds the name on no object, AddUnique's CompactInvocationList takes
+    # that binding straight off (ScriptDelegates.h 336-343, 100-103), and the broadcast runs nothing - not Mine on this.
+    vm.binds.clear()
+    vm.self.vars.update(Peer=None, Got=0)
+    vm.call('BindPeer')
+    assert vm.binds == [], vm.binds
+    vm.call('Fire', 3)
+    assert vm.self.vars['Got'] == 0, vm.self.vars
 
 
 def delegate_native_method():
