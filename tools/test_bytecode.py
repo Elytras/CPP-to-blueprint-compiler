@@ -981,9 +981,128 @@ for n in (-3, 0, 4):
     run(asset('FlowTest'), 'ForwardVoid', self_vars=me, N=n)
     assert me['Total'] == 1 + (-n * 100 if n < 0 else n), (n, me)
 print('ok  FlowTest.ForwardVoid: `return F();` of a void F calls it, then returns')
-refused('CommaExpr', '  int32 F(int32 N) { return (N += 1, N * 2); }\n', 'the comma operator inside an expression')
-refused('CommaWhile', '  int32 F(int32 N) { while (N += 1, N < 9) {} return N; }\n', 'the comma operator inside an expression')
-print('ok  the comma operator inside an expression or a loop condition is refused by name')
+refused('CommaWhile', '  int32 F(int32 N) { while (N += 1, N < 9) {} return N; }\n', 'the comma operator in a loop condition')
+refused('CommaAnd', '  int32 Count;\n  bool F(int32 M) { return M > 0 && (Count += 1, M > 2); }\n',
+        'the comma operator in a loop condition, or after something its statement runs first')
+refused('CommaRef', '  void Add(int32 X, int32& Y) { Y += X; }\n  int32 Twice(int32 X) { return X * 2; }\n'
+        '  int32 F(int32 M) { TArray<int32> L = {1}; Add(Twice(M), (M += 1, L[0])); return L[0]; }\n',
+        'the comma operator here is written to or bound to a reference')
+print('ok  the comma operator in a loop condition, behind something its statement runs first, or bound to a reference '
+      'beside an argument that may run first is refused by name')
+
+
+def comma_hoist():
+    """CommaHoist: a comma inside an expression runs its left side first, as a statement, wherever nothing in the
+    statement runs before it, and is worth its right side, read where C++ reads it: Count is what Bump left. An
+    initialiser (a TEnum<E>'s too), an argument beside a constant or beside a call, a struct literal's first member, a
+    return value, an assignment's right side, a switch over a TEnum<E>, a reference argument, a comma in a comma. Beside
+    a call that sets what it reads, by value or by reference, it runs whole before the call or after it. The class
+    default `(1, 4)` is 4."""
+    base = asset('CommaHoist')
+    keeps_invariants(base)
+    for fn, want, bumps in (('Brace', lambda m, c: m + c * 100, 1), ('Enum', lambda m, c: m + c * 100, 1),
+                            ('Arg', lambda m, c: 2 * (m + c), 1), ('Beside', lambda m, c: 70 + m + c, 1),
+                            ('BesideCall', lambda m, c: 20 * m + c, 1), ('Literal', lambda m, c: 10 * m + c, 1),
+                            ('Ret', lambda m, c: m + c, 1), ('Assign', lambda m, c: m + c * 100, 1),
+                            ('Pick', lambda m, c: (1000 if m == 1 else 0) + c, 1), ('Ref', lambda m, c: (m + 5) * 100 + c, 1),
+                            ('Nested', lambda m, c: 2 * (10 + m), 2)):
+        for m, c in ((0, 0), (1, 5), (3, -2)):
+            me = {'Count': c}
+            got = run(base, fn, me, M=m)[0]
+            assert got == want(m, c + bumps) and me['Count'] == c + bumps, \
+                'CommaHoist.%s(%d) with Count %d = %r, Count %r; want %r, Count %d' % (fn, m, c, got, me['Count'], want(m, c + bumps), c + bumps)
+    # Beside a call that sets Count, the comma runs whole before it or after it: the (value, Count) pairs C++ allows.
+    # Its left side alone first and its right side read after the call (Interleave 10 * m + 100) is no C++ order, nor
+    # is a reference bound to a copy (RefBeside c + 1 + m, Count 100).
+    for m, c in ((0, 0), (7, 5), (3, -2)):
+        for fn, legal in (('Interleave', {(10 * m + c + 1, 100), (10 * m + 101, 101)}),
+                          ('RefBeside', {(100 + m, 100 + m), (101 + m, 101 + m)})):
+            me = {'Count': c}
+            got = run(base, fn, me, M=m)[0]
+            assert (got, me['Count']) in legal, 'CommaHoist.%s(%d) with Count %d = %r, Count %r; want one of %r' % (
+                fn, m, c, got, me['Count'], sorted(legal))
+    cdo = dump('dumptags.py', base, str(exports_of(base).index('Default__CommaHoist_C')))
+    assert 'D [0] IntProperty size=4: 4' in cdo, cdo
+
+
+comma_hoist()
+print('ok  CommaHoist: a comma inside an expression runs its left side first, as a statement, where nothing runs before it')
+
+
+def comma_const_ref():
+    """CommaConstRef: a comma or an assignment used as a value, bound to a `const T&` beside an argument that writes
+    what it names, is that variable, which the callee reads after every argument: it sees the write (50) whichever
+    order C++ picks. Assign's pairs: `B = M` before SetB (1050, B 50) or after it (1000 + M, B M)."""
+    base = asset('CommaConstRef')
+    keeps_invariants(base)
+    for m in (0, 7, -3):
+        for fn, legal in (('Struct', {(1050, 1)}), ('Int', {(1050, 1)}), ('Ahead', {(1050, 1)})):
+            me = {'Count': 0}
+            got = run(base, fn, me, M=m)[0]
+            assert (got, me['Count']) in legal, 'CommaConstRef.%s(%d) = %r, Count %r; want %r' % (fn, m, got, me['Count'], legal)
+        me = {}
+        got = run(base, 'Assign', me, M=m)[0]
+        assert (got, me.get('B')) in {(1050, 50), (1000 + m, m)}, 'CommaConstRef.Assign(%d) = %r, B %r' % (m, got, me.get('B'))
+
+
+comma_const_ref()
+print('ok  CommaConstRef: a comma or an assignment bound to a const T& beside a writing argument is the variable, read '
+      'when the callee runs')
+
+
+def comma_ctor_default():
+    """CommaCtorDefault: a comma among a parenthesised constructor's arguments runs as among a call's (Get before it or
+    after it, Y is M); a comma beside nothing but a constant default argument needs no temporary, and its element
+    reaches Inc's reference (M + 5)."""
+    base = asset('CommaCtorDefault')
+    keeps_invariants(base)
+    for m, c in ((2, 0), (-1, 4)):
+        me = {'Count': float(c)}
+        got = run(base, 'Ctor', me, M=float(m))[0]
+        assert me['Count'] == c + 1 and got in {(c + 3) * 100 + m, (c + 4) * 100 + m}, ('Ctor', m, c, got, me)
+        me = {'Bumps': c}
+        assert run(base, 'DefaultRef', me, M=m)[0] == m + 5 and me['Bumps'] == c + 1, ('DefaultRef', m, c, me)
+
+
+comma_ctor_default()
+print('ok  CommaCtorDefault: a comma among a parenthesised constructor\'s arguments is a call\'s, and a constant default '
+      'argument beside one runs nothing')
+# Bound to a reference, `const T&` included, a comma whose right side is no variable cannot move into a temporary.
+refused('CommaConstSlot', '  int32 Count;\n  TArray<int32> L;\n  int32 Idx() { Count += 1; return 0; }\n'
+        '  int32 SetL() { L[0] = 50; return 1; }\n  int32 Peek(int32 X, const int32& V) { return X * 1000 + V; }\n'
+        '  int32 F(int32 M) { L = {M}; return Peek(SetL(), (Count += 1, L[Idx()])); }\n',
+        'the comma operator here is written to or bound to a reference (a `T&` or `const T&` parameter)')
+print('ok  CommaConstSlot: a comma bound to a const T& beside an argument that may run first, its right side no '
+      'variable, is refused by name')
+
+
+def expr_temps():
+    """ExprTemps: `TArray<int32>{1, 2, M}` as an argument is that array; a UE_STRUCT's `FEtSlot()` has its members'
+    defaults (A 1, B 2), passed or stored; `A = B = E` sets both, for a number, a string and a struct; `B = A += E`
+    adds first, B getting A's new value."""
+    base = asset('ExprTemps')
+    keeps_invariants(base)
+    for m in (-4, 0, 9):
+        assert run(base, 'ListArg', M=m)[0] == 300 + m, ('ListArg', m)
+        assert run(base, 'StructLocal', M=m)[0] == (1 + m) * 10 + 2, ('StructLocal', m)
+        me = {'A': 0, 'B': 0}
+        assert run(base, 'ChainInt', me, E=m)[0] == m * 11 and me == {'A': m, 'B': m}, ('ChainInt', m, me)
+        me = {'A': 0, 'B': 0}
+        assert run(base, 'ChainCompound', me, E=m)[0] == (5 + m) * 101 and me == {'A': 5 + m, 'B': 5 + m}, ('ChainCompound', m, me)
+        assert run(base, 'ChainStruct', {}, M=m)[0] == (m * 10 + m + 1) * 101, ('ChainStruct', m)
+    assert run(base, 'StructArg')[0] == 12
+    for e in ('', 'ab'):
+        me = {'SA': 'x', 'SB': 'y'}
+        assert run(base, 'ChainString', me, E=e)[0] == e + e and me == {'SA': e, 'SB': e}, ('ChainString', e, me)
+    # Read again after the store, the left side must be a plain variable; and where a comma could not move, neither can it.
+    refused('AssignElement', '  int32 A;\n  int32 F(int32 M) { TArray<int32> L = {1}; A = L[0] = M; return A; }\n',
+            'an assignment used as a value, whose left side is no plain variable')
+    refused('AssignWhile', '  int32 A;\n  int32 F(int32 M) { while ((A = M) < 3) M += 1; return A; }\n',
+            'an assignment used as a value in a loop condition')
+
+
+expr_temps()
+print('ok  ExprTemps: TArray<T>{...} and a UE_STRUCT\'s T() are values, and a chained assignment sets both sides')
 check('FlowTest', 'Classify', classify, [dict(Code=c) for c in range(-2, 8)])
 check('FlowTest', 'NoDefault', no_default, [dict(Code=c) for c in (-1, 0, 1, 9, 10)])
 check('FlowTest', 'NameSet', lambda N: 2 if N.lower() == 'none' else 1, [dict(N=n) for n in ('None', 'none', 'IntProperty', 'x', 'None_1')])
@@ -4125,14 +4244,15 @@ if preload_nested_kid():
 def ueapi_too_old():
     """A UeApi that a genueapi older than the compiler wrote is refused, saying to regenerate it, before the compile
     reads any of it: one made before UeDefaultSubobjects compiles a game Blueprint's child with none of the ordering
-    edges above, and says nothing. Here a UeApi with no Version.json (any made before genueapi stamped one) and one
-    stamped 0."""
+    edges above, and says nothing. Here a UeApi with no Version.json (any made before genueapi stamped one, which has
+    its tables) and one stamped 0."""
     import tempfile
     src = os.path.join(TESTS, 'PreloadCaseKid.cpp')
     for stamp in (None, '{"genueapi": 0}\n'):
         with tempfile.TemporaryDirectory() as tmp:
             stale = os.path.join(tmp, 'UeApi')
             os.makedirs(stale)
+            with open(os.path.join(stale, 'Conv.json'), 'w', encoding='utf-8') as f: f.write('[]\n')
             if stamp:
                 with open(os.path.join(stale, 'Version.json'), 'w', encoding='utf-8') as f: f.write(stamp)
             proc = assetgen_compile([src, stale, os.path.join(tmp, 'out')])
@@ -4142,6 +4262,23 @@ def ueapi_too_old():
 
 ueapi_too_old()
 print('ok  a UeApi older than the compiler, or with no Version.json, is refused, saying to regenerate it')
+
+
+def ueapi_not_one():
+    """A folder that is no UeApi at all - a mod folder, which has no Version.json, Types.json or Conv.json, or a path
+    that does not exist - is reported as such, `missing or invalid <dir>/<File> (run genueapi.py)`, and not as one an
+    older genueapi wrote."""
+    import tempfile
+    src = os.path.join(TESTS, 'PreloadCaseKid.cpp')
+    with tempfile.TemporaryDirectory() as tmp:
+        for api in (os.path.join(AG, 'tests'), os.path.join(tmp, 'NoSuchFolder')):
+            proc = assetgen_compile([src, api, os.path.join(tmp, 'out')])
+            assert proc.returncode != 0 and 'missing or invalid' in proc.stdout and 'run genueapi.py' in proc.stdout \
+                and 'older genueapi' not in proc.stdout, (api, proc.stdout[-500:])
+
+
+ueapi_not_one()
+print('ok  UeApi: a folder that is no UeApi is reported as none, not as an older one')
 
 
 def ueapi_without_game():
@@ -5149,6 +5286,12 @@ def opnd_ref_args():
                 assert (got, mine) == (want, theirs), (fn, parms, start, got, want, mine, theirs)
                 n += 1
     print('ok  OpndRefArgs: reference arguments reach the callee as the local, member, struct member, array element  (%d cases)' % n)
+    # ReadLate: PeekAfter(Member, SetMember(V + 5)) - the const reference is Member itself, read when PeekAfter runs.
+    for v in (0, 7, -40):
+        mine = fields(Member=3)
+        got = run(base, 'ReadLate', self_vars=mine, V=v)[0]
+        assert (got, mine['Member']) == (wrap((v + 5) * 10 + 1), v + 5), ('ReadLate', v, got, mine)
+    print('ok  OpndRefArgs.ReadLate: a const reference argument is read when the callee runs, after the arguments after it')
     # On another object: Virt is found on Other's class by name and runs there, Other->Member is Other's, and the
     # argument Member + X is read on this object (the arguments of a call under EX_Context run on the caller).
     for mine, theirs, x in ((3, 40, 5), (0, -2, 7)):
@@ -6791,6 +6934,31 @@ def comp_root_variable():
 
 
 comp_root_variable()
+
+
+def comp_root_member():
+    """A member named DefaultSceneRoot is refused only where it meets the root's variable: on a class whose SCS lists
+    the DefaultSceneRoot node (a second variable of one name, whatever its type), and below a mod class that lists it,
+    where an object property is the one ExecuteNodeOnActor finds first and stores the root in (SCS_Node.cpp 164) and
+    any other a variable named like a super's (member_names_distinct). CompRootMember's Body takes the root, so it lists
+    no node and keeps its int32, and so does RootMemberKid, below it."""
+    base = asset('CompRootMember')
+    for cls in ('CompRootMember', 'RootMemberKid'):
+        b = os.path.join(os.path.dirname(base), cls)
+        root, attach, made, stored = construct(b)
+        assert root == 'Body' and all(stored.values()) and 'DefaultSceneRoot' not in made, (cls, root, made, stored)
+        keeps_invariants(b)
+    cdo = dump('dumptags.py', base, str(exports_of(base).index('Default__CompRootMember_C')))
+    assert 'DefaultSceneRoot [0] IntProperty size=4: 5' in cdo, cdo
+    refused('RootMemberLists', '  int32 DefaultSceneRoot;\n', 'the variable of the root')
+    for member in ('USceneComponent* DefaultSceneRoot;', 'int32 DefaultSceneRoot;'):
+        refused('RootMemberBelow', '', 'the variable of the root RootBelowBase\'s construction script adds',
+                'class RootBelowBase : public AActor {\npublic:\n  int32 Count;\n};\n'
+                'class RootBelowKid : public RootBelowBase {\npublic:\n  %s\n};\n' % member)
+
+
+comp_root_member()
+print('ok  CompRootMember: a member named DefaultSceneRoot is refused only where it meets the root\'s variable')
 
 
 def comp_attach_inherited():

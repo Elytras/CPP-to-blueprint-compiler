@@ -49,6 +49,12 @@ public:
     return Local + Peek(5) + Peek(V * 2);
   }
 
+  /* A const reference ahead of an argument that writes its variable: the callee reads the variable when it runs, after
+     every argument, so it sees the write (V + 5). */
+  [[gnu::noinline]] int32 PeekAfter(const int32 &V, int32 X) { return V * 10 + X; }
+  int32                   SetMember(int32 V) { Member = V; return 1; }
+  int32                   ReadLate(int32 V) { Member = V; return PeekAfter(Member, SetMember(V + 5)); }
+
   /* Two reference parameters at once, parameters and members both. */
   int32 Swapped(int32 A, int32 B) {
     Swap(A, B);

@@ -1300,11 +1300,16 @@ private:
     bool ChangesMapCount(const Json& Body, const std::string& MapType) const;
     bool LowerWithoutPrefix(const Json& Stmt, FBlueprintClass& BP, std::vector<FStmtIR>& Out,
                             std::vector<FPropertyDef>& Locals, std::string* Err);
+    int32 HoistComma(const Json& Stmt, Json* Seq, std::string* Err);
+    const Json* CalledDecl(const Json& Call) const;
 
     /* `inline` functions are the editor's macros: never a UFunction, their body is copied into each caller.
        `inline` may sit on the declaration or on an out-of-line definition. */
     bool IsInlineMethod(const FRecord& R, const std::string& Method) const;
     bool CheckMemberNames(const FRecord& R, std::string* Err) const;
+    bool IsSceneRecord(const FRecord* C) const;
+    bool RootInheritedBy(const FRecord& R) const;
+    bool ListsDefaultRootOf(const FRecord& R) const;
     bool ExpandInline(const Json& CallNode, const Json& Def, const std::string& Method, bool bMethod, FBlueprintClass& BP,
                       FCallIR& Out, std::string* Err, const Json* Receiver = nullptr, bool bStaticCall = false);
     /* `final`: the class holding the version of Method a call by name reaches on every object of class Of or below,
@@ -4370,6 +4375,16 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         /* `{}` or `TEnum<E>()`: TEnum<E> declares a constructor, so its value-initialisation is an argless construct
            where an E's is a CXXScalarValueInitExpr below. The same zero enumerator. */
         if (!First(*N) && IsTEnumType(TypeOf(*N))) return ZeroArg(StripTypeKeywords(TypeOf(*N)), BP, Out, Err);
+        /* `TArray<int32>{1, 2, M}`: the typed spelling is a CXXTemporaryObjectExpr around the initializer_list, which
+           Strip does not look through as it does `TArray<int32>({1, 2})`'s one-argument construct. The same list. */
+        if (const Json* List = First(*N); List && !Nth(*N, 1) && Kind(*List) == "CXXStdInitializerListExpr"
+            && IsContainerType(TypeOf(*N)))
+            return LowerContainerLiteral(*List, TypeOf(*N), BP, Out, Err);
+        /* `FSlot()` of a UE_STRUCT whose members have defaults: clang calls its implicit constructor, where an aggregate
+           with none gets a CXXScalarValueInitExpr below. Either way the struct with its members' defaults, as
+           `FSlot S{}` has them. */
+        if (const FRecord* R = First(*N) ? nullptr : Find(StripTypeKeywords(TypeOf(*N))); R && R->bIsStruct)
+            return LowerMakeStruct(R->CppName, nullptr, BP, Out, Err);
     }
     /* `T()` of an aggregate - a struct with no constructor declared, which is what lets it take `{ .A = 1 }`. */
     if (const FRecord* R = K == "CXXScalarValueInitExpr" ? Find(StripTypeKeywords(TypeOf(*N))) : nullptr; R && R->bIsStruct)
@@ -4691,6 +4706,10 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
                 return true;
             }
         }
+        if (OpName == "operator=")
+        { *Err = "an assignment used as a value in a loop condition, or after something its statement runs first (the "
+                 "right side of && / || / ?:, an argument of a call on another object, a later member of a braced list): "
+                 "assign in a statement of its own, then use what it assigned"; return false; }
         if (OpName != "operator+" || !Lhs || !Rhs || StrKindOf(TypeOf(*N)) != SK_Str)
         { *Err = "TODO: unimplemented operator overload " + OpName + " yielding " + TypeOf(*N); return false; }
 
@@ -4944,12 +4963,23 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         const Json* LhsRaw = Nth(*N, 0);
         const Json* RhsRaw = Nth(*N, 1);
         if (!LhsRaw || !RhsRaw) { *Err = "binary operator with a missing side"; return false; }
-        /* LowerBody takes a comma apart where its left side can run as a statement of its own; here it would have
-           to be hoisted out of an expression, which nothing does yet. */
+        /* LowerBody takes a comma apart where its left side can run as a statement of its own (HoistComma); one that
+           reaches here is in a loop condition, which reruns it every trip, or behind something its statement runs
+           first, which the left side would then run before. */
         if (Op == ",")
         {
-            *Err = "TODO: the comma operator inside an expression or a loop condition; it works as a statement "
-                   "(`A, B;`, a for increment) and as an if / switch condition (`if (A, B)`)";
+            *Err = "the comma operator in a loop condition, or after something its statement runs first (the right side "
+                   "of && / || / ?:, an argument of a call on another object, a later member of a braced list): write its "
+                   "left side as a statement of its own. It works as a statement (`A, B;`, a for increment) and anywhere "
+                   "else in a statement (`int32 N = (A, B);`, `F((A, B))`, `if (A, B)`)";
+            return false;
+        }
+        /* An assignment used as a value LowerBody's HoistComma did not take apart, as it does `A = B = E`. */
+        if (Op == "=")
+        {
+            *Err = "an assignment used as a value in a loop condition, or after something its statement runs first (the "
+                   "right side of && / || / ?:, an argument of a call on another object, a later member of a braced "
+                   "list): assign in a statement of its own, then use what it assigned";
             return false;
         }
         /* `"Kills: " + N`: C++ reads an address N characters into the literal (clang warns, -Wstring-plus-int, and
@@ -7410,11 +7440,11 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             if (!bCondOk) bOk = false;
             return bCondOk;
         };
-        /* The comma operator. `A, B;` is two statements (a for increment `++I, --J` too, lowered here). An if /
-           switch condition runs once, so `if (A, B)` is A, then `if (B)`, as an init-statement is lowered - which
-           is how `if (bool bOk; Get(Out, bOk), !bOk)` tests an out-param. The casts and parens around the comma
-           stay on B. A loop condition reruns its left side every trip, and a comma inside any other expression
-           would need hoisting: both reach LowerArg, which refuses them. */
+        /* The comma operator. `A, B;` is two statements (a for increment `++I, --J` too, lowered here). Inside the
+           statement's expression HoistComma takes it apart: an if / switch condition runs once, so `if (A, B)` is A,
+           then `if (B)`, as an init-statement is lowered - which is how `if (bool bOk; Get(Out, bOk), !bOk)` tests an
+           out-param - and so is an initialiser, an argument, a return value, where nothing runs before the comma. A
+           loop condition reruns its left side every trip: it reaches LowerArg, which refuses it. */
         auto IsComma = [](const Json& E) { return Kind(E) == "BinaryOperator" && E.value("opcode", std::string()) == ","; };
         /* A discarded side that can do nothing (`I, J++`) is no statement at all. */
         auto Discarded = [&](std::initializer_list<const Json*> Sides) {
@@ -7439,23 +7469,11 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             if (!LowerBody(Wrap, BP, Out, Locals, Err)) bOk = false;
             return;
         }
-        if ((K == "IfStmt" || K == "SwitchStmt") && !S->value("hasInit", false) && !S->value("hasVar", false) && Nth(*S, 0))
+        if (Json Seq; const int32 Hoisted = HoistComma(*S, &Seq, Err))
         {
-            Json Plain = *S;
-            Json* At = &Plain["inner"][0];
-            for (std::string AK = Kind(*At); (AK == "ImplicitCastExpr" || AK == "ParenExpr" || AK == "ExprWithCleanups"
-                 || AK == "ConstantExpr") && At->contains("inner") && !(*At)["inner"].empty(); AK = Kind(*At))
-                At = &(*At)["inner"][0];
-            if (IsComma(*At))
-            {
-                Json Left = (*At)["inner"][0];
-                *At = Json((*At)["inner"][1]);
-                Json Seq = Discarded({ &Left });
-                Seq.push_back(Plain);
-                Json Wrap = { {"kind", "CompoundStmt"}, {"inner", Seq} };
-                if (!LowerBody(Wrap, BP, Out, Locals, Err)) bOk = false;
-                return;
-            }
+            Json Wrap = { {"kind", "CompoundStmt"}, {"inner", Seq} };
+            if (Hoisted < 0 || !LowerBody(Wrap, BP, Out, Locals, Err)) bOk = false;
+            return;
         }
         if (K == "DeclStmt")
         {
@@ -8809,6 +8827,56 @@ static bool RefuseNoneNames(const FRecord& R, std::string* Err)
    editor refuses a duplicate function and renames a clashing variable (KismetCompiler.cpp 570-616, 1737-1747); here
    each is refused: two members of one name (overloads included, inline ones aside, which are no UFunction), two that
    differ only in case, and a member reusing an inherited name - save a function overriding one of the same spelling. */
+/* Whether C is a scene component class: it or a class above it is USceneComponent. */
+bool FCompiler::IsSceneRecord(const FRecord* C) const
+{
+    for (; C; C = C->Base.empty() ? nullptr : Find(C->Base)) if (C->UeName == "SceneComponent") return true;
+    return false;
+}
+
+/* Whether R's actor already has a root when R's SCS runs, so that no component of R's is the root and R's SCS lists no
+   DefaultSceneRoot node: a Blueprint parent's SCS always leaves one (SimpleConstructionScript.cpp 690-702), and a native
+   parent sets one in its constructor (Character.cpp 59) or ExecuteConstruction takes its first unattached native scene
+   component (ActorConstruction.cpp 736-746). The first own scene component then attaches under it (ExecuteScriptOnActor,
+   686) and keeps its transform like the rest. Generate reads it for the class it builds. */
+bool FCompiler::RootInheritedBy(const FRecord& R) const
+{
+    for (const FRecord* A = R.Base.empty() ? nullptr : Find(R.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
+    {
+        if (!A->IsNative() || (A->UeName.size() > 2 && A->UeName.compare(A->UeName.size() - 2, 2, "_C") == 0)) return true;
+        for (const auto& [Member, Spec] : A->Subobjects)
+            if (Spec.rfind('.') != std::string::npos && IsSceneRecord(Find("U" + Spec.substr(Spec.rfind('.') + 1)))) return true;
+    }
+    return false;
+}
+
+/* Whether mod class R's SCS lists the DefaultSceneRoot node, as FBlueprintClass::ListsDefaultRoot decides it when R is
+   generated: an actor whose root no ancestor provides, each of whose own scene components UE_DEFAULTS' SetupAttachment
+   places (under another, or under RootComponent), so none is left to be the root. Generate asks it of a subclass's mod
+   ancestors, whose own generation it does not see. */
+bool FCompiler::ListsDefaultRootOf(const FRecord& R) const
+{
+    bool bActor = false;
+    for (const FRecord* A = &R; A && !bActor; A = A->Base.empty() ? nullptr : Find(A->Base)) bActor = A->UeName == "Actor";
+    if (!bActor || R.IsNative() || RootInheritedBy(R)) return false;
+    std::set<std::string> Placed;
+    if (R.Defaults)
+        ForEach(*R.Defaults, [&](const Json& Body) {
+            if (Kind(Body) != "CompoundStmt") return;
+            ForEach(Body, [&](const Json& S) {
+                const Json *Callee = nullptr, *Child = nullptr, *Parent = nullptr, *Socket = nullptr;
+                if (AttachmentCall(S, Callee, Child, Parent, Socket) && Kind(*Child) == "MemberExpr") Placed.insert(Name(*Child));
+            });
+        });
+    for (const Json* F : R.Fields)
+    {
+        if (!R.Components.count(Name(*F)) || Placed.count(Name(*F))) continue;
+        const size_t Star = TypeOf(*F).find('*');
+        if (Star != std::string::npos && IsSceneRecord(Find(StripTypeKeywords(TypeOf(*F).substr(0, Star))))) return false;
+    }
+    return true;
+}
+
 bool FCompiler::CheckMemberNames(const FRecord& R, std::string* Err) const
 {
     if (!RefuseNoneNames(R, Err)) return false;
@@ -8838,15 +8906,8 @@ bool FCompiler::CheckMemberNames(const FRecord& R, std::string* Err) const
     for (const std::string& C : R.Components)
         if (Lower(C) == "defaultsceneroot")
         { *Err = R.CppName + "::" + C + ": DefaultSceneRoot is the root the construction script adds; rename the component"; return false; }
-    /* ...and the class's variable that holds it, where the SCS lists it (Generate): an actor's member of that name would
-       be a second variable of one name, or, in a subclass, the one FindFProperty finds first, which ExecuteNodeOnActor
-       then stores the root in (SCS_Node.cpp 159-170). */
-    bool bActor = false;
-    for (const FRecord* A = &R; A && !bActor; A = A->Base.empty() ? nullptr : Find(A->Base)) bActor = A->UeName == "Actor";
-    for (const Json* F : R.Fields)
-        if (bActor && Lower(Name(*F)) == "defaultsceneroot")
-        { *Err = R.CppName + "::" + Name(*F) + ": DefaultSceneRoot is the variable of the root an actor's construction script "
-                 "adds; rename it"; return false; }
+    /* (A member named like the variable that holds that root is Generate's to refuse, which knows whether the SCS lists
+       the node.) */
     for (const FRecord* A = R.Base.empty() ? nullptr : Find(R.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
         for (const auto& [Member, Spec] : A->Subobjects)
             for (const std::string& C : R.Components)
@@ -9482,6 +9543,280 @@ bool FCompiler::LowerWithoutPrefix(const Json& Stmt, FBlueprintClass& BP, std::v
     Seq.push_back(Plain);
     Json Wrap = { {"kind", "CompoundStmt"}, {"inner", Seq} };
     return LowerBody(Wrap, BP, Out, Locals, Err);
+}
+
+/* Whether evaluating N can neither do anything nor read anything that something else could change: a literal, an
+   enum constant, `this`, a function's name. Whatever runs before or after it, its value is the same. */
+bool IsFixedOperand(const Json& N)
+{
+    const std::string K = Kind(N);
+    if (K == "IntegerLiteral" || K == "FloatingLiteral" || K == "CXXBoolLiteralExpr" || K == "CharacterLiteral"
+        || K == "StringLiteral" || K == "CXXNullPtrLiteralExpr" || K == "CXXThisExpr") return true;
+    if (K == "ConstantExpr" && N.contains("value")) return true;
+    if (K == "DeclRefExpr")
+    {
+        const std::string DK = N.contains("referencedDecl") ? N["referencedDecl"].value("kind", std::string()) : std::string();
+        return DK == "EnumConstantDecl" || DK == "FunctionDecl" || DK == "CXXMethodDecl";
+    }
+    if (K == "ImplicitCastExpr" || K == "ParenExpr" || K == "ConstantExpr" || K == "CStyleCastExpr"
+        || (K == "UnaryOperator" && (N.value("opcode", std::string()) == "-" || N.value("opcode", std::string()) == "+")))
+        return First(N) && IsFixedOperand(*First(N));
+    return false;
+}
+
+/* The declaration a call names, for its parameters' defaults: an inline free function, or a method of the class being
+   compiled or of an ancestor (its in-class declaration, which holds them). Null for anything else. */
+const Json* FCompiler::CalledDecl(const Json& Call) const
+{
+    const Json* Callee = First(Call) ? Strip(First(Call)) : nullptr;
+    if (!Callee) return nullptr;
+    const std::string Id = Kind(*Callee) == "MemberExpr" ? Callee->value("referencedMemberDecl", std::string())
+                         : Kind(*Callee) == "DeclRefExpr" && Callee->contains("referencedDecl")
+                         ? (*Callee)["referencedDecl"].value("id", std::string()) : std::string();
+    if (Id.empty()) return nullptr;
+    if (const auto F = FreeInlines.find(Id); F != FreeInlines.end()) return F->second;
+    for (const FRecord* R = Cur; R; R = R->Base.empty() ? nullptr : Find(R->Base))
+        for (const Json* M : R->AllMethods) if (M->value("id", std::string()) == Id) return M;
+    return nullptr;
+}
+
+/*
+The comma operator inside a statement's expression: `int32 N = (Bump(), M);`, `F((Bump(), M))`, `return (A, B);`,
+`switch (Bump(), T)`. C++ runs the comma's left side, then its right side, whose value the comma is; the editor has no
+such node, so the left side becomes a statement of its own before the statement, the comma its right side - which is
+only C++'s order where nothing in the statement runs before the comma. HoistComma finds the first comma, in the order
+C++ evaluates, whose place allows that, and rewrites the statement into the statements that replace it (Seq), one step
+at a time: LowerBody lowers them, and a comma left in them is taken apart the same way.
+
+Where the comma sits decides it. Before it, in an operand C++ evaluates first (an assignment's right side runs before
+its left, a call's object before its arguments, braces' members in order), there may be only a fixed value
+(IsFixedOperand): else something the comma's left side could change, or that could change what its right side reads,
+would run after the one and before the other, and the comma stays where it is (LowerArg refuses it). Beside it, as
+another argument of the same call or constructor or the other operand of an arithmetic operator, C++ fixes no
+order: the whole operand holding the comma may run first, so where a sibling is not a fixed value (a left-out argument
+counts as its default) that operand moves to a temporary first (`F(G(), (Bump(), M))` is `T = (Bump(), M); F(G(), T)`),
+unless the operand is the comma itself and both its right side and the siblings only read (IsEagerSafe), where reading
+the right side after the siblings changes nothing. A comma whose value is written or bound to a reference, `const T&`
+included, cannot move to a temporary: the callee reads the place when it runs, after every argument, and a temporary
+would hold what it held before them. Its right side then has to be a variable, which names the same place wherever it
+is read, and only the left side moves. A loop's condition reruns it every trip and is not looked at here. A plain
+assignment used as a value, `A = B = E` or `F(B = 1)`, is the comma `(B = E, B)`: the assignment runs as a statement,
+then its left side is read again, which must be a plain variable to give the same place. Returns 1 with Seq set, 0
+for a statement with no such comma, -1 with Err set for one that cannot move.
+*/
+int32 FCompiler::HoistComma(const Json& Stmt, Json* Seq, std::string* Err)
+{
+    Json Plain = Stmt;
+    struct FLevel { Json* Child; Json* Parent; size_t From; bool bFixed; };     // an unordered operand on the way, from
+    std::vector<FLevel> Levels;                                                 // its parent's From-th; innermost first
+    Json* Target = nullptr;
+    auto IsComma = [](const Json& E) { return Kind(E) == "BinaryOperator" && E.value("opcode", std::string()) == ","; };
+    static const std::set<std::string> Assigns = { "=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>=" };
+    auto OperatorOf = [](const Json& E) {      // a CXXOperatorCallExpr's operator: "=" for operator=
+        const Json* Callee = Strip(First(E));
+        const std::string Name = Callee && Callee->contains("referencedDecl") ? (*Callee)["referencedDecl"].value("name", std::string())
+                                                                             : std::string();
+        return Name.compare(0, 8, "operator") == 0 ? Name.substr(8) : std::string();
+    };
+    /* A plain assignment used as a value, `A = (B = E)`: the assignment, then its left side, as `(B = E, B)` would be.
+       A compound one is a value of LowerArg's already, its place located once (`Slots[Next()] += 1`). */
+    auto IsAssign = [&](const Json& E) {
+        const std::string K = Kind(E);
+        return (K == "BinaryOperator" && E.value("opcode", std::string()) == "=")
+            || (K == "CXXOperatorCallExpr" && OperatorOf(E) == "=" && Nth(E, 2));
+    };
+    /* A left-out argument stands for its parameter's default, which C++ evaluates at the call like any other argument:
+       a fixed value there (`int32 By = 5`) is no sibling that could run before the comma. */
+    std::set<const Json*> FixedDefaults;
+    auto NoteDefaults = [&](const Json& Call) {
+        std::vector<const Json*> Parms;
+        if (const Json* D = CalledDecl(Call)) ForEach(*D, [&](const Json& C) { if (Kind(C) == "ParmVarDecl") Parms.push_back(&C); });
+        const Json& In = Call["inner"];
+        for (size_t J = 1; J < In.size(); ++J)
+            if (Kind(In[J]) == "CXXDefaultArgExpr")
+                if (const Json* V = DefaultedArg(In[J], J - 1 < Parms.size() ? Parms[J - 1] : nullptr); V != &In[J] && IsFixedOperand(*V))
+                    FixedDefaults.insert(&In[J]);
+    };
+    auto IsFixedSibling = [&](const Json& E) { return IsFixedOperand(E) || FixedDefaults.count(&E) != 0; };
+    std::function<Json*(Json&, bool)> Seek = [&](Json& E, bool bRoot) -> Json* {
+        if (!E.is_object()) return nullptr;
+        const std::string K = Kind(E);
+        if (!bRoot && (IsComma(E) || IsAssign(E))) { Target = &E; return &E; }
+        if (!E.contains("inner") || !E["inner"].is_array() || E["inner"].empty()) return nullptr;
+        Json& In = E["inner"];
+        auto Ordered = [&](std::initializer_list<size_t> Order) -> Json* {
+            for (size_t I : Order)
+            {
+                if (I >= In.size()) return nullptr;
+                if (Json* F = Seek(In[I], false)) return F;
+                if (!IsFixedOperand(In[I])) return nullptr;      // it runs first, and could see or change what the comma does
+            }
+            return nullptr;
+        };
+        auto InOrder = [&](size_t From) -> Json* {
+            for (size_t I = From; I < In.size(); ++I)
+            {
+                if (Json* F = Seek(In[I], false)) return F;
+                if (!IsFixedOperand(In[I])) return nullptr;
+            }
+            return nullptr;
+        };
+        auto Unordered = [&](size_t From) -> Json* {
+            for (size_t I = From; I < In.size(); ++I)
+                if (Json* F = Seek(In[I], false))
+                {
+                    bool bFixed = true;
+                    for (size_t J = From; J < In.size(); ++J) if (J != I) bFixed = bFixed && IsFixedSibling(In[J]);
+                    Levels.push_back({ &In[I], &E, From, bFixed });
+                    return F;
+                }
+            return nullptr;
+        };
+        const std::string Op = E.value("opcode", std::string());
+        if (K == "ImplicitCastExpr" || K == "ParenExpr" || K == "ConstantExpr" || K == "ExprWithCleanups"
+            || K == "MaterializeTemporaryExpr" || K == "CXXBindTemporaryExpr" || K == "CXXFunctionalCastExpr"
+            || K == "CStyleCastExpr" || K == "CXXStaticCastExpr" || K == "CXXConstCastExpr" || K == "CXXStdInitializerListExpr"
+            || K == "UnaryOperator" || K == "MemberExpr")
+            return Seek(In[0], false);
+        /* Braces fix their members' order; a parenthesised constructor's arguments are a call's, in no fixed order. */
+        if (K == "InitListExpr" || K == "ArraySubscriptExpr"
+            || ((K == "CXXConstructExpr" || K == "CXXTemporaryObjectExpr") && E.value("list", false)))
+            return InOrder(0);
+        if (K == "CXXConstructExpr" || K == "CXXTemporaryObjectExpr") return Unordered(0);
+        if (K == "CallExpr")
+        {
+            if (In.size() < 2 || !IsFixedOperand(In[0])) return nullptr;
+            NoteDefaults(E);
+            return Unordered(1);
+        }
+        if (K == "CXXMemberCallExpr")
+        {
+            /* The object runs before the arguments: they come into it only when it is this. */
+            Json& Callee = In[0];
+            if (Kind(Callee) != "MemberExpr" || !Callee.contains("inner") || Callee["inner"].empty()) return nullptr;
+            const Json* Obj = Strip(&Callee["inner"][0]);
+            if (Obj && Kind(*Obj) == "CXXThisExpr") { NoteDefaults(E); return Unordered(1); }
+            if (Json* F = Seek(Callee["inner"][0], false)) return F;
+            return nullptr;
+        }
+        if (K == "CXXOperatorCallExpr")
+        {
+            const std::string Sym = OperatorOf(E);
+            static const std::set<std::string> Unsequenced = { "+", "-", "*", "/", "%", "==", "!=", "<", ">", "<=", ">=",
+                                                               "&", "|", "^" };
+            if (Assigns.count(Sym)) return Ordered({ 2, 1 });       // C++17: the right side first
+            if (Sym == "&&" || Sym == "||") return Ordered({ 1 });
+            if (Unsequenced.count(Sym)) return Unordered(1);
+            return InOrder(1);
+        }
+        if (K == "BinaryOperator" || K == "CompoundAssignOperator")
+        {
+            if (K == "CompoundAssignOperator" || Op == "=") return Ordered({ 1, 0 });
+            if (Op == "&&" || Op == "||") return Ordered({ 0 });
+            if (Op == "<<" || Op == ">>") return Ordered({ 0, 1 });
+            return Unordered(0);
+        }
+        if (K == "ConditionalOperator" || K == "BinaryConditionalOperator") return Ordered({ 0 });
+        return nullptr;
+    };
+
+    /* Which expression of the statement: an expression statement's own (whose top is no comma: LowerBody makes that
+       two statements), a return value, an if / switch condition (a loop's reruns), a declaration's initialiser. */
+    const std::string K = Kind(Plain);
+    Json Pre = Json::array();          // declarations of the same statement before the one that holds the comma
+    if (K == "ReturnStmt" || ((K == "IfStmt" || K == "SwitchStmt") && !Plain.value("hasInit", false) && !Plain.value("hasVar", false)))
+    {
+        if (!Plain.contains("inner") || Plain["inner"].empty() || !Seek(Plain["inner"][0], false)) return 0;
+    }
+    else if (K == "DeclStmt")
+    {
+        if (!Plain.contains("inner")) return 0;
+        Json& Decls = Plain["inner"];
+        size_t At = 0;
+        for (; At < Decls.size() && !Target; ++At)
+            if (Kind(Decls[At]) == "VarDecl" && Decls[At].contains("inner") && !Decls[At]["inner"].empty())
+                Seek(Decls[At]["inner"][0], false);
+        if (!Target) return 0;
+        /* The declarations before it run first, as the statement of their own they are: a DeclStmt of several is
+           several, in order. Pointers into Decls stay valid while only the front is cut off by copying. */
+        if (At > 1)
+        {
+            for (size_t I = 0; I + 1 < At; ++I) Pre.push_back(Decls[I]);
+            Pre = Json::array({ Json{ {"kind", "DeclStmt"}, {"inner", Pre} } });
+        }
+    }
+    else if (K.size() > 4 && K.compare(K.size() - 4, 4, "Stmt") == 0) return 0;
+    else if (K.find("Decl") != std::string::npos || !Seek(Plain, true)) return 0;
+
+    /* What an operand's place makes of it: its value read (a copy, an operator's operand, a temporary bound to a
+       `const T&`), or the place itself, written or bound to a reference - a `const T&` too, which the callee reads
+       when it runs, after every argument, where a temporary would hold what the place held before them. */
+    auto ValueUse = [&](const Json& N) {
+        return N.value("valueCategory", std::string()) != "lvalue" || Kind(N) == "MaterializeTemporaryExpr";
+    };
+    /* Down through wrappers only, from an operand to the comma. */
+    auto JustTarget = [&](Json* N) {
+        while (N && N != Target && (Kind(*N) == "ImplicitCastExpr" || Kind(*N) == "ParenExpr" || Kind(*N) == "MaterializeTemporaryExpr"
+                                    || Kind(*N) == "CXXBindTemporaryExpr" || Kind(*N) == "ConstantExpr")
+               && N->contains("inner") && !(*N)["inner"].empty())
+            N = &(*N)["inner"][0];
+        return N == Target;
+    };
+    /* A comma's sides; an assignment is its own left side, and the variable it wrote its right, read again after it. A
+       left side that is no plain variable would run a second time. */
+    const bool bAssign = !IsComma(*Target);
+    const Json Left = bAssign ? *Target : (*Target)["inner"][0];
+    const Json Right = !bAssign ? (*Target)["inner"][1] : (*Target)["inner"][Kind(*Target) == "CXXOperatorCallExpr" ? 1 : 0];
+    if (bAssign && !IsEagerSafe(*Strip(&Right)))
+    { *Err = "an assignment used as a value, whose left side is no plain variable, which would be evaluated again to read "
+             "it: assign in a statement of its own, then use what it assigned"; return -1; }
+    const std::string What = bAssign ? "an assignment used as a value" : "the comma operator";
+    const Json* Moved = nullptr;
+    for (auto L = Levels.rbegin(); L != Levels.rend() && !Moved; ++L)    // outermost first
+        if (!L->bFixed)
+        {
+            bool bSiblingsRead = true;
+            const Json& In = (*L->Parent)["inner"];
+            for (size_t I = L->From; I < In.size(); ++I)
+                if (&In[I] != L->Child && !IsFixedSibling(In[I])) bSiblingsRead = bSiblingsRead && IsEagerSafe(In[I]);
+            if (!(JustTarget(L->Child) && IsEagerSafe(Right) && bSiblingsRead)) Moved = L->Child;
+        }
+    if (Moved && !ValueUse(*Moved))
+    {
+        if (!(JustTarget(const_cast<Json*>(Moved)) && IsEagerSafe(Right)))
+        { *Err = What + " here is written to or bound to a reference (a `T&` or `const T&` parameter), beside something "
+                 "that may run before it, and its right side is no variable: write its left side as a statement before "
+                 "this one"; return -1; }
+        Moved = nullptr;
+    }
+    *Seq = Pre;
+    if (Moved)
+    {
+        /* The operand runs first, whole, into a temporary the statement then reads. */
+        const std::string Type = StripTypeKeywords(TypeOf(*Moved));
+        const std::string Tmp = "__Comma" + std::to_string(ReadTmpCounter++) + "__";
+        Json Var = { {"kind", "VarDecl"}, {"id", "synthetic:" + Tmp}, {"name", Tmp}, {"type", {{"qualType", Type}}},
+                     {"init", "c"}, {"inner", Json::array({ *Moved })} };
+        Seq->push_back(Json{ {"kind", "DeclStmt"}, {"inner", Json::array({ Var })} });
+        Json Ref = RefToLocal(Tmp, Type);
+        Ref["valueCategory"] = "lvalue";
+        *const_cast<Json*>(Moved) = Ref;
+    }
+    else
+    {
+        /* A left side that can do nothing (`(I, J)`) is no statement at all. */
+        if (const Json* L = Strip(&Left); L && !IsEagerSafe(*L)) Seq->push_back(Left);
+        *Target = Right;
+    }
+    if (K == "DeclStmt" && !Pre.empty())
+    {
+        Json Rest = Json::array();
+        const Json& Decls = Plain["inner"];
+        for (size_t I = Pre[0]["inner"].size(); I < Decls.size(); ++I) Rest.push_back(Decls[I]);
+        Plain["inner"] = Rest;
+    }
+    Seq->push_back(Plain);
+    return 1;
 }
 
 /* `for (Elem : Range)` over a TArray / TSet / TMap. CXXForRangeStmt inner is
@@ -10662,6 +10997,11 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
     Init = Strip(Whole);
     if (!Init) return true;
     std::string K = Kind(*Init);
+    /* `(A, B)` whose left side does nothing (`(1, 4)`) is its right side; one that does something would run when the
+       game does, and is refused below. */
+    if (K == "BinaryOperator" && Init->value("opcode", std::string()) == "," && Nth(*Init, 1) && Nth(*Init, 0)
+        && IsEagerSafe(*Strip(Nth(*Init, 0))))
+        return LowerDefault(F, PD, BP, Err, Nth(*Init, 1), bKeepZero);
     if (PD.Type == "StructProperty" && NativeUnwritten(PD.StructName))
     {
         *Err = Name(F) + ": the engine reads a " + PD.StructName + " value in its own binary form, which AssetGen does not "
@@ -13249,22 +13589,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
        would need its own, so that is only warned about. ponytail: a negative scale takes FTransform's matrix path
        and an absolute child ignores its parent; neither is special-cased here. */
     {
-        auto IsScene = [&](const FRecord* C) {
-            for (; C; C = C->Base.empty() ? nullptr : Find(C->Base)) if (C->UeName == "SceneComponent") return true;
-            return false;
-        };
-        /* No root of this class's in a subclass whose actor already has one when its SCS runs: a Blueprint parent's SCS
-           always leaves one (SimpleConstructionScript.cpp 690-702), and a native parent sets one in its constructor
-           (Character.cpp 59) or ExecuteConstruction takes its first unattached native scene component (ActorConstruction.cpp
-           736-746). The first own scene component then attaches under it (ExecuteScriptOnActor, 686) and keeps its
-           transform like the rest. */
-        bool bRootInherited = false;
-        for (const FRecord* A = R.Base.empty() ? nullptr : Find(R.Base); A && !bRootInherited; A = A->Base.empty() ? nullptr : Find(A->Base))
-        {
-            bRootInherited = !A->IsNative() || (A->UeName.size() > 2 && A->UeName.compare(A->UeName.size() - 2, 2, "_C") == 0);
-            for (const auto& [Member, Spec] : A->Subobjects)
-                bRootInherited = bRootInherited || (Spec.rfind('.') != std::string::npos && IsScene(Find("U" + Spec.substr(Spec.rfind('.') + 1))));
-        }
+        auto IsScene = [&](const FRecord* C) { return IsSceneRecord(C); };
+        const bool bRootInherited = RootInheritedBy(R);
         BP.SetRootInherited(bRootInherited);      // and its DefaultSceneRoot node is listed nowhere
         std::vector<std::pair<std::string, const FRecord*>> Scene;     // the root, then the components attached to it
         for (const Json* F : R.Fields)
@@ -13509,7 +13835,24 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     /* Where the SCS lists its DefaultSceneRoot node, the class has a variable of that name, as the editor gives every node
        it lists one (KismetCompiler.cpp 884-898; ENE_EnemySpawner's DefaultSceneRoot, BlueprintVisible | NonTransactional
        | InstancedReference): ExecuteNodeOnActor stores the component there, and with none logs on every spawn that it
-       found no such property (SCS_Node.cpp 159-178). First, where the editor's sits among the class's variables. */
+       found no such property (SCS_Node.cpp 159-178). First, where the editor's sits among the class's variables.
+       A member of that name here would be a second variable of one name, and one below a mod class that lists the node
+       would hide that class's (an object property is the one ExecuteNodeOnActor finds first and stores the root in,
+       SCS_Node.cpp 164; any other is a variable named like a super's, which the editor renames, member_names_distinct).
+       Where neither lists it, a member of that name is a member like any other: no variable of the engine's has it. */
+    const FRecord* RootLister = nullptr;
+    for (const FRecord* A = R.Base.empty() ? nullptr : Find(R.Base); A && !RootLister; A = A->Base.empty() ? nullptr : Find(A->Base))
+        if (!A->IsNative() && ListsDefaultRootOf(*A)) RootLister = A;
+    for (const auto& V : ClassVars)
+    {
+        if (Lower(V.second.Name) != "defaultsceneroot") continue;
+        if (BP.ListsDefaultRoot())
+        { *Err = R.CppName + "::" + V.second.Name + ": DefaultSceneRoot is the variable of the root an actor's construction "
+                 "script adds, and this class has no scene component of its own left to be that root; rename it"; return false; }
+        if (RootLister)
+        { *Err = R.CppName + "::" + V.second.Name + ": DefaultSceneRoot is the variable of the root " + RootLister->CppName
+                 + "'s construction script adds, which a variable of that name here would hide; rename it"; return false; }
+    }
     if (BP.ListsDefaultRoot())
     {
         FPropertyDef PD;
@@ -14998,6 +15341,14 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     const Json Stamp = Json::parse(ReadText(IncludeDir + "/Version.json"), nullptr, false);
     const int32 Stamped = Stamp.is_object() && Stamp.contains("genueapi") && Stamp["genueapi"].is_number_integer()
                               ? Stamp["genueapi"].get<int32>() : 0;
+    /* A folder with no stamp and none of genueapi's tables either is no UeApi at all (a mod folder, a path that does not
+       exist): said as LoadTables says it, not as one an older genueapi wrote. */
+    if (Stamp.is_discarded() && !std::filesystem::exists(IncludeDir + "/Types.json", TmpEc)
+        && !std::filesystem::exists(IncludeDir + "/Conv.json", TmpEc))
+    {
+        *Err = "missing or invalid " + IncludeDir + "/Conv.json (run genueapi.py)";
+        return false;
+    }
     if (Stamped < UeApiVersion)
     {
         *Err = IncludeDir + " was written by an older genueapi (" + (Stamped ? "version " + std::to_string(Stamped)

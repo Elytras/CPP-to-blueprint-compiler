@@ -1156,7 +1156,7 @@ void ZeroAll() {
 | `FVector Offset = {0, 0, 50};` | Positional braces as a default. | Yes |
 | `FNested Deep = {.Inner = {.Time = 1.5f}, .Stamp = 7};` | Designated braces, nested. Members left out are zero, or take their own default initializer. | Yes |
 | `FColor Lamp = FColor(255, 128, 0);` | FColor's argument order holds in defaults too. | Yes |
-| `FStats Fresh = FStats();`, `FStats Cleared = {{}, {}};` | A `UE_STRUCT`'s `T()` is its defaults, and writes nothing. A `{}` for a member is a fresh value of its type (zero, empty, None, a `UE_STRUCT`'s own defaults), written even where the member's default differs. | Yes |
+| `FStats Fresh = FStats();`, `FStats Cleared = {{}, {}};` | A `UE_STRUCT`'s `T()` is its defaults, and writes nothing. A `{}` for a member is a fresh value of its type (zero, empty, None, a `UE_STRUCT`'s own defaults), written even where the member's default differs. In a function, `Code(FStats())` and `FStats S = FStats();` are the Make Struct of its defaults, as `FStats S{}` is. | Yes |
 | `FHitResult Hit = {};`, `FHeld H = {FHitResult(), 5};` | An engine struct whose header declares no constructor, by `{}` or `T()`: none of its members is written, so it holds what the engine's constructor sets (`FHitResult::Time` is 1), as `FHitResult()` does in a function. One whose header declares a constructor (`FFindFloorResult()`) is all zeros, as in a function. In `UE_DEFAULTS` see [Class defaults](#class-defaults). | Yes |
 
 Notes:
@@ -1329,6 +1329,7 @@ Notes:
 | `TArray<int32> L = {4, 5, 6};` in a function | The Make Array node: a temporary filled at once, made afresh each time the code runs. | Yes |
 | `TSet<int32> S = {1, 2};`, `TMap<int32, float> M = {{1, 0.5f}};` in a function | Make Set and Make Map. | Yes |
 | `Items = {};`, `Count({})`, `TArray<int32>()`, `return {};` in a function | An empty container: a Make Array (Set, Map) with no element. | Yes |
+| `Size(TArray<int32>{1, 2, M})`, `TSet<int32>{1, M}`, `TArray<int32>({1, 2})` in a function | The typed list, braced or in parentheses: the same Make Array (Set, Map) as the untyped braces. | Yes |
 
 ```cpp
 TArray<int32> Primes = {2, 3, 5};
@@ -1456,7 +1457,10 @@ Notes:
 | `Add5(C ? A : B)` into a `T&` parameter | The callee gets a copy, stored back into the picked variable after the call, with a warning. See [Functions](#functions). | Warns |
 | `A = 1, B = 2;`, `++I, --J` | The comma operator as a statement: each side runs in turn, as two statements. A side that does nothing (`I, J++`) is dropped. A declaration of several variables, `int32 I = 0, J = N;`, is not the comma operator and works too. | Yes |
 | `if (bool bOk; Get(Out, bOk), !bOk)`, `switch (N += 10, N)` | An if or switch condition with a comma: the left side runs once, before the test, as an init-statement does, and the right side is the condition. This is how an out-parameter call is tested in one line. | Yes |
-| `return (N += 1, N * 2);`, `while (Next(X), X > 0)` | Not yet: a comma inside any other expression, or in a loop condition (which would rerun its left side on every trip), is refused naming the comma operator. Write the left side as a statement of its own, before the loop and at the end of its body for a loop. | Not yet |
+| `int32 N{(Bump(), M)};`, `F((Bump(), M))`, `return (N += 1, N * 2);`, `switch (Bump(), T)` over a `TEnum<E>`, `S = {(Bump(), M), 2}` | A comma inside a statement's expression: the left side runs first, as a statement of its own, and the comma is worth its right side, read where C++ reads it. This holds wherever nothing in the statement runs before the comma: an initialiser, a return value, an assignment's right side, an argument, a braced list's first member. Beside another argument that is no constant (C++ leaves their order open, a parenthesised constructor's `FVector(Get(), (Bump(), M), 0.f)` included; braces fix theirs) the whole argument holding the comma runs first, into a temporary. A left-out argument whose default is a constant counts as that constant. Passed to a reference parameter, `const T&` included, the comma is its right side's variable itself, which the callee reads when it runs, after every argument: only the left side runs first, and the right side must be a variable (see the refusal below). | Yes |
+| `while (Next(X), X > 0)`, `A && (Bump(), B)`, `Obj->F((Bump(), M))`, `{G(), (Bump(), M)}` | Refused naming the comma operator. C++ allows each, but AssetGen runs a comma's left side as a statement before the one holding it, and these places have none that fits: a loop condition reruns its left side on every trip, the right side of `&&` / `\|\|` / `?:` may not run at all, and the left side must not run before a call's object on another object or an earlier member of braces. Write the left side as a statement of its own (for a loop, before it and at the end of its body), or put both sides in an inline function, `inline bool Step(int32& X) { Next(X); return X > 0; }`, which runs in these places as written. | Not yet |
+| `F(G(), (Bump(), L[I]))` where F takes `int32&` or `const int32&` | Refused: a comma passed to a reference parameter beside an argument that may run first must end in a variable. A temporary would not be the place the callee writes or reads, and `L[I]` located again after G would not be the one C++ binds. | Refused |
+| `int32 D = (1, 4);` as a class default | The right side, when the left side does nothing. A left side that does something would run when the game builds the object, which a default cannot: refused as any computed default. | Yes |
 
 Notes:
 
@@ -1478,7 +1482,7 @@ Notes:
 | `Acc += I;`, and `-=` `*=` `/=` `%=` `&=` `\|=` `^=` `<<=` `>>=` | `X = X op Y`: a math node and a Set. X is located once, so `Slots[NextSlot()] += By` calls NextSlot a single time, and Y is evaluated first. It works on everything plain `=` works on, map values and their members included. `<<=`, `>>=` and int64 `%=` follow the rules of the plain operators. | Yes |
 | `int32 Z = (Y += X) * 10;` | A compound assignment used as a value is X after the store. | Yes |
 | `X++`, `++X`, `X--`, `--X` | The Increment Int and Decrement Int macros, with X located once. Postfix gives the value before the store, prefix the value after. Works on int32, int64, float and uint8 (a uint8 wraps at 255). On a raw pointer it steps by the element size; see [Pointers and memory](#pointers-and-memory). | Yes |
-| `A = B = 0;`, `if ((X = Next()) > 3)` | Refused ("unimplemented binary operator = on IntInt", the flavour following the operand type): plain `=` works only as a statement. Use an init-statement, `if (int32 Twice = V * 2; Twice > 10)`, or a declaring condition, `while (int32 Left = Start - Steps)`. | Refused |
+| `A = B = 0;`, `S1 = S2 = Name;`, `if ((X = Next()) > 3)`, `return A = N;` | A plain `=` used as a value: the assignment runs first, as a statement, and the value is the variable it wrote, read after it. Numbers, strings and structs alike. It works wherever the comma operator does, and like it, passed to a reference parameter (`const T&` included) it is that variable itself, with no copy. In a loop condition, on the right of `&&` / `\|\|` / `?:` or in an argument of a call on another object it is refused ("an assignment used as a value in a loop condition, ..."); use a declaring condition there, `while (int32 Left = Start - Steps)`. The left side must be a plain variable (`A = L[0] = 1` is refused): it is read again. | Yes |
 
 ### Evaluation order
 
@@ -5598,8 +5602,6 @@ and where the feature is described. In each group, the messages you are most lik
   `<Flavour>` names them: IntInt, Int64Int64, FloatFloat, ByteByte, BoolBool or ObjectObject. The usual cases:
   - `% on Int64Int64`: `%` or `%=` on int64, which UE 4.27 lacks. Write `A - A / B * B`.
   - `< on ObjectObject` (or `>`, `<=`, `>=`): ordering object pointers. Blueprint has only `==` and `!=` on objects.
-  - `= on IntInt` (or another flavour): `=` used as a value, as in `A = B = 0;` or `if ((X = Next()) > 3)`. Put each
-    assignment in its own statement, or use `if (int32 X = Next(); X > 3)`. `+=`, `++` and `--` work as values.
 
   See [Operators](#operators).
 - `TODO: unimplemented operator overload <Operator> yielding <Type>`, and `TODO: unimplemented operator overload
@@ -5752,9 +5754,22 @@ and where the feature is described. In each group, the messages you are most lik
   `static int32 Count = 0;`. The message follows the prefix `<Class>::<Function>: inline <Function>: `
   (`inline <Class>::<Method>: ` for a method). A `static constexpr` constant works here. Fix: make it a member of the
   class. See [Latent calls](#latent-calls).
-- `TODO: the comma operator inside an expression or a loop condition; ...`: a comma as a value, `return (N += 1,
-  N * 2);` or an argument, or in a `while` / `for` / `do` condition. Fix: put the left side in a statement of its own
-  (for a loop, before it and at the end of its body). See [Operators](#operators).
+- `the comma operator in a loop condition, or after something its statement runs first (...): write its left side as a
+  statement of its own. ...`: a comma in a `while` / `for` / `do` condition, which reruns its left side on every
+  trip, or behind something the statement runs first: the right side of `&&` / `||` / `?:`, an argument of a call on
+  another object (`Obj->F((A, B))`), a later member of a braced list. C++ allows these; AssetGen does not take them
+  yet, as no statement before this one can hold the left side. Fix: put the left side in a statement of its own (for
+  a loop, before it and at the end of its body), or both sides in an inline function. See [Operators](#operators).
+- ``the comma operator here is written to or bound to a reference (a `T&` or `const T&` parameter), beside something
+  that may run before it, and its right side is no variable: ...``: `F(G(), (A, L[0]))` where F takes `int32&` or
+  `const int32&`: the argument cannot run first into a temporary, which F would then write, or read with what
+  `L[0]` held before G ran. Fix: put the left side in a statement of its own. See [Operators](#operators).
+- `an assignment used as a value in a loop condition, or after something its statement runs first (...): assign in a
+  statement of its own, then use what it assigned`: a plain `=` used as a value where the comma operator is refused
+  too, `while ((A = Next()) > 0)` or `B && (A = N) > 2`. Fix: as the message says; for a loop, a declaring condition,
+  `while (int32 Left = Next())`. See [Operators](#operators).
+- `an assignment used as a value, whose left side is no plain variable, which would be evaluated again to read it:
+  ...`: `A = L[0] = N`. Fix: assign in a statement of its own, then use what it assigned. See [Operators](#operators).
 - `inline call to <Class>::<Method> with <N> arguments`: a C-style variadic inline function,
   `inline int32 First(int32 N, ...)`, called with extra arguments. Fix: give it a fixed parameter list, or overloads.
   See [Inline functions and templates](#inline-functions-and-templates).
@@ -5818,9 +5833,15 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   `AddComponentByClass`, or `AddComponentByType<T>(Owner)`. See [Components](#components).
 - `<Class>::DefaultSceneRoot: DefaultSceneRoot is the root the construction script adds; rename the component`: the
   name is taken by the root the engine adds to a class with no scene component of its own. Fix: rename it.
-- `<Class>::DefaultSceneRoot: DefaultSceneRoot is the variable of the root an actor's construction script adds; rename
-  it`: a member of that name in an actor class. The construction script stores the default scene root in the variable
-  named DefaultSceneRoot that it finds first, which would be this one. Fix: rename it.
+- `<Class>::DefaultSceneRoot: DefaultSceneRoot is the variable of the root an actor's construction script adds, and
+  this class has no scene component of its own left to be that root; rename it`: a member of that name in an actor
+  class that gets the DefaultSceneRoot node (no scene component of its own takes the root, none inherited): the class
+  already has a variable of that name, which the construction script stores the root in. Fix: rename it. Where a scene
+  component of the class's own is the root, no such variable exists and the member is a member like any other.
+- `<Class>::DefaultSceneRoot: DefaultSceneRoot is the variable of the root <Ancestor>'s construction script adds, which
+  a variable of that name here would hide; rename it`: a member of that name below a mod class that gets the
+  DefaultSceneRoot node. An object variable here would be the one the root is stored in, the ancestor's left empty;
+  any other would be a variable named like its parent's, which the editor never builds. Fix: rename it.
 - `<Class>::<Component>: <Ancestor> already has a default subobject <Name> (its <Member>); rename the component`: a
   component named like a native parent's own component, such as `CharacterMesh0` or `CollisionCylinder` under an
   ACharacter. The engine finds the objects under an actor by name. Fix: rename it; to change the native one, set
@@ -6256,13 +6277,16 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   fix what clang reports, and check that `clang++` is on `PATH`. See
   [Mod sources and packages](#mod-sources-and-packages).
 - `missing or invalid <IncludeDir>/<File> (run genueapi.py)`: the include-dir argument is not a generated UeApi
-  folder: `Conv.json`, `Ops.json`, `Types.json` or `Events.json` is missing or unreadable. Fix: pass the UeApi folder
-  that genueapi wrote, or regenerate it. See [The SDK](GUIDE.md#the-sdk).
+  folder: `Conv.json`, `Ops.json`, `Types.json` or `Events.json` is missing or unreadable. A folder with no
+  `Version.json` and neither `Types.json` nor `Conv.json` (a mod folder, a path that does not exist) is reported so,
+  naming `Conv.json`, before clang runs. Fix: pass the UeApi folder that genueapi wrote, or regenerate it. See
+  [The SDK](GUIDE.md#the-sdk).
 - `<IncludeDir> was written by an older genueapi (no Version.json, this assetgen needs version <N>) - regenerate it
   with AssetGen/tools/genueapi.py` (or `version <M>` for an older stamp): the UeApi folder comes from a genueapi older
   than this compiler, which would compile against it without a word wrong where it relies on what that one did not
   write (a game Blueprint's child would load before its parent's subobjects). genueapi writes `Version.json` last, so
-  a run that stopped halfway leaves none either. Fix: regenerate UeApi with the genueapi of this AssetGen, or use the
+  a run that stopped halfway leaves none either (a folder with no `Types.json` or `Conv.json` either is no UeApi, the
+  message above). Fix: regenerate UeApi with the genueapi of this AssetGen, or use the
   SDK release made for it. See [The SDK](GUIDE.md#the-sdk).
 - `<Class> derives from the game Blueprint <Parent>, but <IncludeDir> was generated without --game, so it does not list
   the default subobjects that Blueprint's default object exports, which this class must load after - regenerate it

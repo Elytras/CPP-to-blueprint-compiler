@@ -598,7 +598,12 @@ def run(base, function, self_vars=None, **parms):
             for name, a in zip(names, n.kids):
                 if name in outs and a.op not in ADDRESSABLE and not (a.op in (0x19, 0x1A) and a.kids[1].op in ADDRESSABLE):
                     raise SystemExit('%s: reference parameter %s gets a non-variable (op %02x), which crashes the VM' % (n.val, name, a.op))
-            r, callee = run(base, n.val, self_vars, **dict(zip(names, [copy.deepcopy(ev(a)) for a in n.kids])))
+            # A reference parameter is the caller's variable, which the callee reads through its address (EX_LocalOutVariable,
+            # ProcessScriptFunction's out-parm list): what it holds once every argument has run, not when its argument came.
+            bound = [i < len(names) and names[i] in outs and a.op in (0, 1, 0x48) for i, a in enumerate(n.kids)]
+            vals = [None if b else copy.deepcopy(ev(a)) for b, a in zip(bound, n.kids)]
+            vals = [copy.deepcopy(ev(a)) if b else v for b, a, v in zip(bound, n.kids, vals)]
+            r, callee = run(base, n.val, self_vars, **dict(zip(names, vals)))
             for name, a in zip(names, n.kids):                       # a reference parameter is its argument's variable
                 if name in outs and a.op in ADDRESSABLE: store(a, callee.get(name, 0))
             return r
