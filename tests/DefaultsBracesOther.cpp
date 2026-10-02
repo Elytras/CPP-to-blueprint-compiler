@@ -6,7 +6,7 @@ UE_MOD_PACKAGE("/Game/_ElytrasMods/DefaultsBracesOther");
 
 /*
 FDboOther is another mod's struct, from the header the two share (UE_STRUCT_IN): no engine struct, and its header says
-what each member starts as. `O = {.A = 7}` is A 7 and B its initializer 4, written as such (test_bytecode.py's
+what each member starts as (DboOtherMod cooks it). `O = {.A = 7}` is A 7 and B its initializer 4, written as such (test_bytecode.py's
 defaults_braces_other_mod).
 */
 struct FDboOther {

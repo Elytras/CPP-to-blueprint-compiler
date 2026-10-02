@@ -8005,9 +8005,11 @@ print('ok  DefaultsBracesTwice: a second UE_DEFAULTS statement on a member repla
 
 def defaults_braces_other_mod():
     """Another mod's UE_STRUCT_IN struct is no engine struct: a member its braces leave out has the initializer the
-    shared header gives it (B = 4), written as in C++."""
+    shared header gives it (B = 4), written as in C++. DboOtherMod, built beside it, cooks the struct."""
     import struct
+    asset('DboOtherMod')
     base = asset('DefaultsBracesOther')
+    keeps_invariants(base)
     pkg = invariants.Package(base)
     cdo = pkg.find('Default__DefaultsBracesOther_C')
     tags = {t['name']: t for t in pkg.tags(cdo)}
