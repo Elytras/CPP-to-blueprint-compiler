@@ -5372,6 +5372,22 @@ static_over_static()
 print('ok  FuncStaticHide: a static over a static warns, and is refused when its signature differs')
 
 
+def func_declared_only():
+    """FdoRoot declares Tell (a static) and Scale but defines neither, so it compiles no function of those names, and
+    FuncDeclaredOnly's own hide nothing a Blueprint has: no warning, no super to a function FdoRoot lacks
+    (imports_resolve, func_super_link), and each call runs FuncDeclaredOnly's."""
+    base = pending_asset('FuncDeclaredOnly')
+    keeps_invariants(base)
+    keeps_invariants(pending_asset('FuncDeclaredOnly', 'FdoRoot'))
+    assert 'hides' not in LOGS['FuncDeclaredOnly'], LOGS['FuncDeclaredOnly']
+    for v in (1, 4):
+        got, want = run(base, 'Use', {}, V=v)[0], v * 2 * 100 + v * 3 + (v + 1) * 10000
+        assert got == want, 'FuncDeclaredOnly.Use(%d) = %r, want %r' % (v, got, want)
+
+
+pending('FuncDeclaredOnly: a function over an ancestor\'s declared-only one has no super', func_declared_only)
+
+
 def func_iface_unnamed():
     """FuncIfaceUnnamed gets an override of FiuRoot's Tell (for IFiuTell) and of Kept (for its `FiuRoot::Kept` call),
     each calling FiuRoot's though a parameter of it has no name: the override names it, as an editor override does.
@@ -7840,6 +7856,81 @@ def defaults_value_init():
 defaults_value_init()
 print('ok  DefaultsValueInit: {} / T() of an engine struct keeps the engine\'s values in a fresh default, however deep, '
       'and is refused over a value already there, unless its constructor sets nothing')
+
+
+def struct_ctor_values():
+    """`T()`, `T{}` and a declaration with no initializer of an engine struct hold what its constructor makes, in a
+    function as in C++: FTransform's identity (Scale3D 1, Rotation.W 1, TransformVectorized.h 108) as an argument, a
+    local assigned again, a loop's local and a UE_STRUCT's member; FVector4's W 1 (Vector4.h 59), which the engine's own
+    fresh FVector4 lacks (STRUCT_ZeroConstructor, Property.cpp 88-98). runscript constructs a frame's locals as the VM
+    does (frame_defaults). A default holds the same: a class member, its `FVector4()`, the same over a parent's value,
+    and a UE_STRUCT's member the braces leave out."""
+    import struct
+    base = pending_asset('StructCtorValues')
+    keeps_invariants(base)
+    for fn, want in (('XfLocal', 2), ('XfTemp', 1), ('XfArg', 1), ('XfAssign', 1), ('XfLoop', 6), ('XfHeld', 4),
+                     ('V4', 1), ('V4Decl', 1), ('V4Braces', 1), ('V4Loop', 6), ('V4Held', 1)):
+        for m in (0, 1):
+            got = run(base, fn, {}, M=m)[0]
+            assert got == want + m, 'StructCtorValues.%s(%d) = %r, C++ gives %r' % (fn, m, got, want + m)
+    pkg = invariants.Package(base)
+    cdo = pkg.find('Default__StructCtorValues_C')
+    tags = {t['name']: t for t in pkg.tags(cdo)}
+    for name in ('Bare', 'Ctor', 'Over'):
+        got = struct.unpack('<4f', tags[name]['value']) if name in tags else None
+        assert got == (0.0, 0.0, 0.0, 1.0), '%s is written %r, where FVector4() is (0, 0, 0, 1)' % (name, got)
+    held = {t['name'].split('_')[0]: t for t in pkg.tags(cdo, tags['Held']['at'])}
+    assert struct.unpack('<i', held['N']['value'])[0] == 2, held
+    got = struct.unpack('<4f', held['V']['value']) if 'V' in held else None
+    assert got == (0.0, 0.0, 0.0, 1.0), 'Held.V is written %r, where FVector4() is (0, 0, 0, 1)' % (got,)
+
+
+pending('StructCtorValues: T() / T{} / a bare declaration of an engine struct holds what its constructor makes',
+        struct_ctor_values)
+
+
+def defaults_braces():
+    """Designated braces of an engine struct whose header declares no constructor leave a member out as the editor's
+    Make Struct does, keeping what the engine's constructor sets (FHitResult's Time 1): untagged in a class's own
+    default, and in UE_DEFAULTS where the parent's value is a fresh one; over another (Hit2's Time 0.5) they are
+    refused, naming the member. `T = FTimerHandle();` writes nothing, with a warning: Handle, its one member, is
+    Transient, which the loader never reads from a default (Class.cpp 1452)."""
+    import struct
+    base = pending_asset('DefaultsBraces')
+    keeps_invariants(base)
+    pkg = invariants.Package(base)
+    cdo = pkg.find('Default__DefaultsBraces_C')
+
+    def members(at=None):
+        return {t['name'].split('_')[0]: t for t in (pkg.tags(cdo, at) if at is not None else pkg.tags(cdo))}
+    tags = members()
+    for name, given in (('Mine', {'Distance': 5.0}), ('Mine2', {'FaceIndex': 0, 'Time': 0.25}), ('Hit', {'Distance': 6.0})):
+        inner = members(tags[name]['at']) if name in tags else {}
+        got = {n: struct.unpack('<i' if n == 'FaceIndex' else '<f', t['value'])[0] for n, t in inner.items()}
+        assert got == given, '%s is written %r, where the braces give %r and leave the rest the engine\'s' % (name, got, given)
+    assert 'T' not in tags or not members(tags['T']['at']), members(tags['T']['at'])
+    assert re.search(r'warning: T: every member of FTimerHandle is Transient', LOGS['DefaultsBraces']), LOGS['DefaultsBraces']
+    refused('BracesOverValue', '  UE_DEFAULTS {\n    Hit2 = {.Distance = 5.0f};\n  }\n',
+            "Hit2.FaceIndex, left out of the braces, holds what the engine's FHitResult constructor sets",
+            'class BovParent : public AActor {\npublic:\n  FHitResult Hit2 = {.Time = 0.5f};\n};\n', 'BovParent')
+
+
+pending('DefaultsBraces: an engine struct\'s designated braces leave the rest the engine\'s, and FTimerHandle() writes '
+        'nothing', defaults_braces)
+
+
+def defaults_left_out():
+    """A UE_STRUCT's member that braces given in UE_DEFAULTS leave out takes its value-initialisation, or its own `{}`;
+    of an engine struct that is what its constructor sets, which cannot be written over the parent's value. The
+    refusal says the member was left out of the braces, not `FHitResult()` or `{}`, which the user did not write."""
+    for mod, held in (('LeftOutHeld', 'FHitResult Hit;'), ('LeftOutInit', 'FHitResult Hit = {};')):
+        refused(mod, '  UE_DEFAULTS {\n    H = {.N = 5};\n  }\n',
+                "H.Hit, left out of the braces, holds what the engine's FHitResult constructor sets",
+                'struct F%s {\n  UE_STRUCT;\n  %s\n  int32 N = 0;\n};\n'
+                'class %sParent : public AActor {\npublic:\n  F%s H = {{}, 2};\n};\n' % (mod, held, mod, mod), mod + 'Parent')
+
+
+pending('DefaultsLeftOut: a member left out of UE_DEFAULTS\' braces is named as left out when refused', defaults_left_out)
 
 
 def tenum_value_init():
