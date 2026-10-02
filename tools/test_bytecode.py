@@ -5616,11 +5616,26 @@ print('ok  LocalCtorFlags: FUNC_HasDefaults on a function with an FHitResult / F
 iface_cast_slot()
 print('ok  IfaceCastSlot: Cast<IHealth> takes the object out of its 16-byte interface value')
 derived_literal('Angle', '/Script/Engine.LightmassDirectionalLightSettings')
-derived_literal('Output', '/Script/Engine.MaterialAttributesInput')
-assert 'is Transient' not in LOGS['DerivedLiteral'], LOGS['DerivedLiteral']
-derived_literal('ResetHandle', '/Script/Engine.TimerHandle')
-print("ok  DerivedLiteral: a derived struct literal lists its own members before its super's, and leaves out Transient "
-      "ones (a zero given for one keeps the literal); FTimerHandle() writes no member")
+# What EX_StructConst writes of each struct the Transient tests build, in PropertyLink order: never the Transient member.
+TRANSIENT_LINK = {'MaterialAttributesInput': ['OutputIndex', 'InputName', 'ExpressionName'], 'TimerHandle': []}
+
+
+def derived_literal_transient():
+    """A struct with a Transient member is no literal, whose execStructConst would skip the member: FMaterialAttributesInput's
+    literal (a super's members, then its own Transient one) reads its OutputIndex back, and FTimerHandle() resets a live
+    handle (5) to 0, as C++ does."""
+    import runvm
+    vm = VM(asset('DerivedLiteral'), Handle=runvm.Written(Handle=5))
+    vm.struct_const = lambda name, vals: runvm.Written(zip(TRANSIENT_LINK[name], vals))
+    assert vm.call('Output') == 3, vm.call('Output')
+    vm.call('ResetHandle')
+    assert vm.self.vars['Handle'].get('Handle') == 0, 'ResetHandle leaves Handle %r, want 0' % (vm.self.vars['Handle'],)
+    assert 'is Transient' not in LOGS['DerivedLiteral'], LOGS['DerivedLiteral']
+
+
+derived_literal_transient()
+print("ok  DerivedLiteral: a derived struct literal lists its own members before its super's; one with a Transient "
+      "member sets it, FTimerHandle() resetting a live handle")
 
 
 def struct_lit_expr():
@@ -5653,9 +5668,9 @@ print('ok  StructLitExpr: a struct literal with a member that is not a constant 
 
 
 def transient_const():
-    """A non-zero constant for a native struct literal's Transient member makes the Make Struct a computed one does,
-    which sets it: execStructConst skips the member (ScriptCore.cpp 3376-3405), so a literal of constants would drop the
-    value, and whether it counted would hang on another member. A zero there stays a literal, with no warning."""
+    """A constant for a native struct literal's Transient member, zero or not, makes the Make Struct a computed one
+    does, which sets it: execStructConst skips the member (ScriptCore.cpp 3376-3405), so a literal of constants would
+    drop the value, and whether it counted would hang on another member. No warning."""
     import runvm
     base = asset('TransientConst')
     keeps_invariants(base)
@@ -5668,11 +5683,8 @@ def transient_const():
     assert 'is Transient' not in LOGS['TransientConst'], LOGS['TransientConst']
 
 
-# What EX_StructConst writes of each struct the Transient tests build, in PropertyLink order: never the Transient member.
-TRANSIENT_LINK = {'MaterialAttributesInput': ['OutputIndex', 'InputName', 'ExpressionName'], 'TimerHandle': []}
 transient_const()
-print('ok  TransientConst: a non-zero constant for a Transient member makes the Make Struct, which sets it; a zero keeps '
-      'the literal')
+print('ok  TransientConst: a constant for a Transient member makes the Make Struct, which sets it')
 
 
 def transient_zero():
@@ -5681,7 +5693,7 @@ def transient_zero():
     does not make afresh each time round: execStructConst skips the member (ScriptCore.cpp 3376-3405) and steps the rest
     into the destination, which runvm models once struct_const names what a literal writes."""
     import runvm
-    base = pending_asset('TransientZero')
+    base = asset('TransientZero')
     keeps_invariants(base)
 
     def vm():
@@ -5700,8 +5712,9 @@ def transient_zero():
         assert v.self.vars['Handle'].get('Handle') == 0, 'TransientZero.%s leaves Handle %r, want 0' % (fn, v.self.vars['Handle'])
 
 
-pending('TransientZero: a zero for a Transient member, or T() of a struct whose member is Transient, sets it',
-        transient_zero)
+transient_zero()
+print('ok  TransientZero: a zero for a Transient member, or T() / {} of a struct whose member is Transient, sets it '
+      'over a variable that held another value')
 
 
 def local_by_address():

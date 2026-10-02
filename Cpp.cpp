@@ -712,7 +712,6 @@ struct FStructInfo
 };
 
 bool IsVmConstant(const FArgIR& A);
-bool IsZeroConstant(const FArgIR& A);
 bool SteppedInPlace(const FArgIR& A);
 
 /* Each index into SI.Fields EX_StructConst writes, in the order it writes them. */
@@ -3149,25 +3148,32 @@ bool FCompiler::ZeroArg(const std::string& Type, FBlueprintClass& BP, FArgIR& Ou
     }
     auto SI = Structs.find(T);
     if (SI == Structs.end() || !SI->second.bComplete) { *Err = "no zero literal for " + Type; return false; }
+    /* A Transient member, here or in a member struct, is one EX_StructConst skips (ScriptCore.cpp 3376-3405), leaving it
+       as the destination holds it: `Handle = FTimerHandle()` would keep a live handle. In a function the zero is then the
+       editor's Make Struct, which stores every member. */
+    const std::vector<size_t> Order = StructConstOrder(SI->second);
+    std::vector<FArgIR> Zeros(SI->second.Fields.size());
+    bool bByMembers = CurLocals && Order.size() < Zeros.size();
+    for (size_t I = 0; I < Zeros.size(); ++I)
+    {
+        if (!ZeroArg(SI->second.Fields[I].first, BP, Zeros[I], Err)) return false;
+        bByMembers = bByMembers || Zeros[I].K == FArgIR::Call;
+    }
+    if (bByMembers) return LowerStructByMembers(T, SI->second, Zeros, BP, Out, Err);
     Out.K = FArgIR::StructLit;
     Out.Owner = BP.ScriptStruct(SI->second.Package, SI->second.UeName);
     Out.I = SI->second.Size;
     Out.InnerType = T;
     Out.Sub = std::make_shared<FCallIR>();
-    for (size_t I : StructConstOrder(SI->second))
-    {
-        FArgIR M;
-        if (!ZeroArg(SI->second.Fields[I].first, BP, M, Err)) return false;
-        Out.Sub->Args.push_back(M);
-    }
+    for (size_t I : Order) Out.Sub->Args.push_back(Zeros[I]);
     return true;
 }
 
 /* `FVector(1, 2, 3)`: EX_StructConst wants one value per reflected field, in property order, so
    only a struct whose every field is known can be written; argless means all zeros. The arguments come in C++'s order
    (a super's members first) and go out in PropertyLink's (StructConstOrder); one for a Transient member has nowhere to
-   go, execStructConst skipping that member, so only a zero can stay there. A literal with any other member, or any
-   other value for a Transient one, is the editor's Make Struct instead (LowerStructByMembers). */
+   go, execStructConst skipping that member. A literal with any other member, or of a struct with a Transient one, is
+   the editor's Make Struct instead (LowerStructByMembers). */
 bool FCompiler::LowerStructLiteral(const Json& CtorNode, const FStructInfo& SI, FBlueprintClass& BP,
                                    FArgIR& Out, std::string* Err)
 {
@@ -3196,13 +3202,11 @@ bool FCompiler::LowerStructLiteral(const Json& CtorNode, const FStructInfo& SI, 
        read what it has just written, a call there may read the destination too, and a `?:` or an inline call needs
        statements of its own, which nothing would hoist out of the literal. The editor writes a literal for constants
        only, and a Make Struct for the rest: through a temp, one statement per member, left to right as C++ runs a braced
-       list. A Transient member's value, computed or a constant other than its zero, is set there too: the literal
-       would drop it (execStructConst skips the member), so whether it counted would hang on another member. A zero
-       stays in a literal, which leaves the member as the destination holds it. */
-    bool bInPlace = true;
-    for (size_t I = 0; I < Given.size(); ++I)
-        bInPlace = bInPlace && (std::find(Order.begin(), Order.end(), I) != Order.end() ? SteppedInPlace(Given[I])
-                                                                                        : IsZeroConstant(Given[I]));
+       list. A Transient member's value, whatever it is, is set there too: execStructConst skips the member and steps
+       the rest straight into the destination, so a literal would leave it as the destination held it, which is no
+       fresh value when that is a variable assigned again or a local of a loop body. */
+    bool bInPlace = Order.size() == Given.size();
+    for (size_t I : Order) bInPlace = bInPlace && SteppedInPlace(Given[I]);
     if (!bInPlace) return LowerStructByMembers(T, SI, Given, BP, Out, Err);
     for (size_t I : Order) Out.Sub->Args.push_back(Given[I]);
     return true;
@@ -3718,24 +3722,6 @@ bool IsVmConstant(const FArgIR& A)
         return A.Sub && std::all_of(A.Sub->Args.begin(), A.Sub->Args.end(), [](const FArgIR& M) { return IsVmConstant(M); });
     default:
         return false;
-    }
-}
-
-/* Whether A is a constant of its type's zero: 0, false, an empty string or text, None, a null object, or a literal of
-   such. */
-bool IsZeroConstant(const FArgIR& A)
-{
-    switch (A.K)
-    {
-    case FArgIR::Int: case FArgIR::Byte: return A.I == 0;
-    case FArgIR::Int64: return A.I64 == 0;
-    case FArgIR::Float: return A.F == 0.0f;
-    case FArgIR::Bool: return !A.B;
-    case FArgIR::Str: case FArgIR::Text: return A.S.empty();
-    case FArgIR::Name: return A.S.empty() || Lower(A.S) == "none";
-    case FArgIR::NullObj: return true;
-    case FArgIR::StructLit: return A.Sub && std::all_of(A.Sub->Args.begin(), A.Sub->Args.end(), IsZeroConstant);
-    default: return false;
     }
 }
 

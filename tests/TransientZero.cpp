@@ -8,7 +8,8 @@ UE_MOD_PACKAGE("/Game/_ElytrasMods/TransientZero");
 A native struct literal that gives a Transient member zero, or leaves a struct's one Transient member to `T()` / `{}`,
 over a destination that holds something else: a member variable set before, and a local declared in a loop, which a
 Blueprint does not make afresh each time round. execStructConst skips a Transient member (ScriptCore.cpp 3376-3405) and
-steps the rest straight into the destination, so a literal would leave the member as it was; C++ sets it to zero.
+steps the rest straight into the destination, so a literal would leave the member as it was; C++ sets it to zero,
+and so does the Make Struct each of these is, which stores every member.
 */
 class TransientZero : public AActor {
 public:

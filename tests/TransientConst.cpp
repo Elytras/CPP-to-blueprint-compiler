@@ -8,8 +8,8 @@ UE_MOD_PACKAGE("/Game/_ElytrasMods/TransientConst");
 A native struct literal whose Transient member is given a value. execStructConst skips a Transient member
 (ScriptCore.cpp 3376-3405), so a literal of constants cannot set it; a computed member already makes the literal the
 editor's Make Struct, which sets every member. A non-zero constant for the Transient member is a value the literal
-would drop, so it makes the Make Struct too: whether the value counts does not hang on another member. A zero there
-stays a literal, which the member of a fresh value already holds.
+would drop, so it makes the Make Struct too: whether the value counts does not hang on another member. So does a
+zero, which a literal would leave as the destination held it (TransientZero).
 */
 class TransientConst : public AActor {
 public:

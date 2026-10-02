@@ -8,9 +8,9 @@ UE_MOD_PACKAGE("/Game/_ElytrasMods/DerivedLiteral");
 Whole-struct literals of native structs with a super or a Transient member. execStructConst steps one expression
 into each property of the struct's PropertyLink - its own properties first, then its super's - skipping Transient
 ones (ScriptCore.cpp 3376-3405; Class.cpp 944-982). So FLightmassDirectionalLightSettings (own LightSourceAngle;
-super IndirectLightingSaturation, ShadowExponent, bUseAreaShadowsForStationaryLight) takes 4.5 first; a
-FMaterialAttributesInput has three members to write (its own PropertyConnectedBitmask is Transient, given 0 here: a
-value other than zero would make the literal a Make Struct), and an FTimerHandle none (Handle is Transient).
+super IndirectLightingSaturation, ShadowExponent, bUseAreaShadowsForStationaryLight) takes 4.5 first. A struct with a
+Transient member - FMaterialAttributesInput's own PropertyConnectedBitmask, FTimerHandle's one member Handle - is a
+Make Struct instead, which sets that member too, so `Handle = FTimerHandle()` resets a live handle as C++ does.
 */
 class DerivedLiteral : public AActor {
 public:
