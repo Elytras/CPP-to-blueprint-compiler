@@ -8322,7 +8322,8 @@ def defaults_braces():
     """Designated braces of an engine struct whose header declares no constructor leave a member out as the editor's
     Make Struct does, keeping what the engine's constructor sets (FHitResult's Time 1): untagged in a class's own
     default, and in UE_DEFAULTS where the parent's value is a fresh one; over another (Hit2's Time 0.5) they are
-    refused, naming the member. `T = FTimerHandle();` writes nothing, with a warning: Handle, its one member, is
+    refused, naming Time, the member the parent's braces give (FaceIndex, which both leave out, holds the engine's
+    value in either; fix/r5-leftovers named it). `T = FTimerHandle();` writes nothing, with a warning: Handle, its one member, is
     Transient, which the loader never reads from a default (Class.cpp 1452)."""
     import struct
     base = asset('DefaultsBraces')
@@ -8340,7 +8341,7 @@ def defaults_braces():
     assert 'T' not in tags or not members(tags['T']['at']), members(tags['T']['at'])
     assert re.search(r'warning: T: every member of FTimerHandle is Transient', LOGS['DefaultsBraces']), LOGS['DefaultsBraces']
     refused('BracesOverValue', '  UE_DEFAULTS {\n    Hit2 = {.Distance = 5.0f};\n  }\n',
-            "Hit2.FaceIndex, left out of the braces, holds what the engine's FHitResult constructor sets",
+            "Hit2.Time, left out of the braces, holds what the engine's FHitResult constructor sets",
             'class BovParent : public AActor {\npublic:\n  FHitResult Hit2 = {.Time = 0.5f};\n};\n', 'BovParent')
 
 
@@ -8641,6 +8642,7 @@ def defaults_own_nest():
     Time and Distance may be written; N is its initializer 0. Where the new braces leave Time out it would load the
     initializer's 0.5: refused, naming Time. Refused on fa30eccf + the r5 fixes at Hit.FaceIndex, which needs no tag."""
     here = os.path.dirname(asset('DefaultsOwnNest'))
+    asset('DboOtherMod')                            # cooks FDonOther, so H's import of it resolves
     base = os.path.join(here, 'DefaultsOwnNest')
     keeps_invariants(base)
     pkg = invariants.Package(base)

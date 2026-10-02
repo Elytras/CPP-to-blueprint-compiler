@@ -5952,7 +5952,9 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
 - `` <Member>.<Left>, left out of the braces, holds what the engine's <Struct> constructor sets, which its header does
   not say, so AssetGen cannot write it over the value already there ``: braces in UE_DEFAULTS give some members and
   leave `<Left>` out, over a parent's value that is not a fresh one: a member of an engine struct whose header has no
-  constructor (`Hit2 = {.Distance = 5.0f};` leaves `Hit2.FaceIndex` out), or a `UE_STRUCT` value's member of such a
+  constructor (`Hit2 = {.Distance = 5.0f};` leaves `Hit2.FaceIndex` out over a native parent's value, and
+  `Hit2.Time` out over a mod parent's `FHitResult Hit2 = {.Time = 0.5f};`, whose other members are the engine's
+  and stay unwritten), or a `UE_STRUCT` value's member of such a
   struct, with no initializer or `{}` (`H = {.N = 5};` leaves `H.Hit` out), or braces nested for a `UE_STRUCT`
   member with an initializer of its own (`H = {.Hit = {.Distance = 5.0f}};` where the member is `FHitResult Hit =
   {.Time = 0.5f};` leaves `H.Hit.Time` out: the parent's `H.Hit` holds that initializer's Time; FaceIndex, which the
