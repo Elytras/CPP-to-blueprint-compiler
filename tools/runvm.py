@@ -127,8 +127,21 @@ class VM:
         s.accessed_none = []        # (function, mem) of each EX_Context run on None: an 'Accessed None' script warning
         s.ref_params = False        # True: a script callee's reference parameters write back into their arguments (ref_writeback)
         s.env_log = []              # with ref_params, each call's frame as it starts, so ref_writeback finds the callee's
+        s.classes = {}              # another class's name -> the base of its package: what runs on an object of it (peer)
+        s._peers = {}
 
     def new(s, **vars): return Obj(s.self.cls, **vars)
+
+    def peer(s, cls):
+        """The VM of the package of class `cls` (one of `classes`), sharing this one's objects, bindings, latent actions,
+        log and Accessed None list: a call on an object of that class runs that class's function, as a broadcast or a
+        timer finds a bound name on the bound object's own class (FindFunction, ScriptDelegates.h 38-49, 479-502)."""
+        v = s._peers.get(cls)
+        if v is None:
+            v = s._peers[cls] = VM(s.classes[cls], s.natives, s.isa, s.objects)
+            v.binds, v.latent, v.log, v.accessed_none = s.binds, s.latent, s.log, s.accessed_none
+            v.classes, v._peers, v.null_rvalues, v.struct_const = s.classes, s._peers, s.null_rvalues, s.struct_const
+        return v
 
     def ref_writeback(s, fn, args, env, store):
         """A script callee's reference parameter is its argument's own variable: ProcessScriptFunction hands the callee an
@@ -161,6 +174,8 @@ class VM:
 
     def call(s, fn, *args, on=None, **parms):
         me = on or s.self
+        if isinstance(me, Obj) and me.cls != s.self.cls and me.cls in s.classes:
+            return s.peer(me.cls).call(fn, *args, on=me, **parms)
         stmts, at, names = s.script(fn)
         env = s.frame(me, fn) if fn.startswith('ExecuteUbergraph_') else {}   # the persistent frame
         if not fn.startswith('ExecuteUbergraph_'):
@@ -307,7 +322,9 @@ class VM:
                 if obj is None:                             # Accessed None, and no address: nothing added (ScriptCore.cpp 3098)
                     s.accessed_none.append((fn, t.mem)); continue
                 _, dfn, dobj = ev(n.kids[1])
-                if (obj, prop, dfn, dobj) not in s.binds: s.binds.append((obj, prop, dfn, dobj))   # AddUnique
+                # AddUnique, then CompactInvocationList: a delegate bound to no object is compactable, so it is taken
+                # straight off again (ScriptDelegates.h 336-343, IsCompactable 100-103).
+                if dobj is not None and (obj, prop, dfn, dobj) not in s.binds: s.binds.append((obj, prop, dfn, dobj))
             elif o in (0x62, 0x5D):                         # Remove(Obj.Prop, delegate): one match; Clear(Obj.Prop): all
                 t = n.kids[0]
                 obj, prop = (ev(t.kids[0]), t.kids[1].val) if t.op == 0x19 else (me, t.val)
@@ -322,8 +339,8 @@ class VM:
                 t = n.kids[0]
                 obj, prop = (ev(t.kids[0]), t.kids[1].val) if t.op == 0x19 else (me, t.val)
                 vals = [ev(a) for a in n.kids[1:]]
-                for bobj, bprop, dfn, dobj in list(s.binds):
-                    if bobj is obj and bprop == prop: s.call(dfn, *vals, on=dobj)
+                for bobj, bprop, dfn, dobj in list(s.binds):     # each IsBound one (ScriptDelegates.h 479-502)
+                    if bobj is obj and bprop == prop and dobj is not None: s.call(dfn, *vals, on=dobj)
             elif o == 6: pc = at[n.val]
             elif o == 7:
                 if not ev(n.kids[0]): pc = at[n.val]
@@ -338,12 +355,12 @@ class VM:
         one) gets `result`, then CallbackTarget->ProcessEvent(FindFunction(ExecutionFunction), &Linkage)."""
         fn, ctx, (link, uuid, execfn, target), delegate = s.latent.pop(i)
         assert execfn in s.exports, execfn
-        if delegate: s.call(delegate[1], result, on=delegate[2])
+        if delegate and delegate[2] is not None: s.call(delegate[1], result, on=delegate[2])   # ExecuteIfBound
         s.call(execfn, on=target, EntryPoint=link)
 
     def broadcast(s, obj, prop, *args):
         for o, p, fn, bound in list(s.binds):
-            if o is obj and p == prop: s.call(fn, *args, on=bound)
+            if o is obj and p == prop and bound is not None: s.call(fn, *args, on=bound)
 
 
 ALWAYS_NEW = {'LoadAsset', 'LoadAssetClass'}    # "We always spawn a new load" (KismetSystemLibrary.cpp 2662, 2691)

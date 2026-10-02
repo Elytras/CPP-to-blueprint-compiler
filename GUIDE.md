@@ -600,8 +600,11 @@ once.
 
 `Add` and `Remove` also work on the game's dispatchers, on this actor, on another object or on a component:
 `OnDestroyed`, `Me->OnFlareThrown`, `Box->OnComponentBeginOverlap`. The handler returns `void` and takes exactly the
-parameters the header declares, spelled the same way, and clang checks this at the `Add`. A function that takes a
-single delegate, such as a timer, takes `{this, &Class::Method}`.
+parameters the header declares, spelled the same way, and clang checks this at the `Add`. It may be another object's:
+`OnScored.Add(Board, &Board::Show)` runs `Show` on Board at each broadcast. A function that takes a single delegate,
+such as a timer, takes `{this, &Class::Method}` or `{Other, &Other::Method}`. `Broadcast` works on a dispatcher of
+this class, of a mod parent, of another mod class or game Blueprint through a pointer (`T->OnHit.Broadcast(3)`), and
+on the few native ones the engine marks BlueprintCallable.
 
 A class with `UE_INTERFACE` is a Blueprint Interface, cooked as an asset of its own. A class implements it by listing
 it after its parent and defining its functions; a function it leaves out gets an empty one that returns zero. The
@@ -654,14 +657,15 @@ public:
 
 Watch for:
 
-- A handler is a method of `this` that is not `inline`. An inline one is refused with
+- A handler is a method that is not `inline`, of the object you bind it on. An inline one is refused with
   ``a delegate cannot bind Handle: an inline function is expanded where it is called, no UFunction (drop `inline`)``.
-  Binding a method of another object is not built yet and is refused with
-  ``TODO: a delegate can only bind a function of `this` ``; bind a method of `this` that forwards the call.
-- `Broadcast` works only on a `UE_DISPATCHER` of the class being compiled. Broadcasting one of the game's dispatchers,
-  or one that a mod parent declares, is not built yet. For a parent's, give the parent a method that broadcasts, and
-  call it. `Clear()` on a game dispatcher also removes the game's own bindings and those of other mods, so use
-  `Remove` there.
+  On another object it must be a function of that object's class that Blueprint code can call: a mod method, a game
+  Blueprint's function or a native BlueprintCallable one. An event the engine calls such as `ReceiveTick`, an RPC
+  such as `Server_StartUsing` and a RepNotify such as `OnRep_Instigator` are refused, on `this` too.
+- `Broadcast` on an engine dispatcher such as `OnDestroyed` is refused, as the editor refuses it: the engine marks
+  none of its dispatchers BlueprintCallable. On one of the game's 41 that are, it compiles with a warning, through a
+  signature function of your class with the same parameters. `Clear()` on a game dispatcher also removes the game's
+  own bindings and those of other mods, so use `Remove` there.
 - An interface function is matched by name only. An implementation marked `inline` compiles with no message and
   leaves the empty function in its place, and one with different parameters also compiles with no message, so copy
   the interface's declaration. Hold interfaces in `TScriptInterface`: `Cast<IScorable>` is refused for a mod
@@ -1350,6 +1354,7 @@ use a newer SDK or regenerate your own.
 | `Containers.h` | The Kismet `Array_*`, `Set_*` and `Map_*` functions, as methods of `TArray`, `TSet` and `TMap`. |
 | `Types.json` | Every enum and struct: package, engine name, size, alignment and fields, and whether an enum is an `enum class` (`form`), read off how the dump's properties of it are reflected. |
 | `Events.json` | The function flags of every `BlueprintEvent`, which an override inherits. |
+| `NotCallable.json` | Every other function the engine does not mark BlueprintCallable (RPCs, RepNotifies, `ExecuteUbergraph_*`), which a delegate cannot bind. Without it only an RPC is told apart. |
 | `Version.json` | Which genueapi wrote the folder, and whether it had `--game`, written last. A compiler that needs a later one refuses the folder, saying to regenerate it, rather than compile against what the older one did not write. Without `--game` it refuses a class deriving from a game Blueprint, whose default subobjects the folder then does not list. |
 | `UeMeta.h` | The `UE_*` macros. Written by hand. |
 | `Types.h` | The integer spellings, `FString`, `FName`, `FText` and the container templates. Written by hand. |
@@ -1809,7 +1814,9 @@ Each row gives the part of the message to look for, the reason, and what to writ
 | `latent call Delay: a function that resumes later returns nothing and takes no non-const reference parameters` | The code after a wait resumes in the event graph, which has no return value and no out parameters. | Return `void`, take parameters by value or `const&` and keep results in member variables | [Latent calls](REFERENCE.md#latent-calls) |
 | `static Calls lives in the ubergraph's frame, which only a function that makes a latent call runs in; make Calls a member` | A Blueprint function keeps nothing between calls (the ubergraph is the class's event graph). | A member variable | [Latent calls](REFERENCE.md#latent-calls) |
 | ``a delegate cannot bind Handle: an inline function is expanded where it is called, no UFunction (drop `inline`)`` | An inline method is pasted into its callers and is no function of the class. | Drop `inline` from the handler | [Event dispatchers](REFERENCE.md#event-dispatchers) |
-| ``TODO: a delegate can only bind a function of `this` `` | Not yet: the delegate binds the object whose code is running. | Bind a method of `this` that calls the other object: `void Forward(int32 P) { Other->Handle(P); }` | [Event dispatchers](REFERENCE.md#event-dispatchers) |
+| `a delegate on a Helper cannot bind Other::Handle: the engine looks it up by name on that object, whose class has no such function` | A binding is an object and a function name, and the object's class has no function of that name, so the broadcast would skip it. | Bind a function of the object's own class: `OnHit.Add(H, &Helper::Handle)` | [Event dispatchers](REFERENCE.md#event-dispatchers) |
+| `a delegate cannot bind AItem::Server_StartUsing on another object: the editor binds a BlueprintCallable function that is not pure or latent, and Server_StartUsing is not BlueprintCallable` | The editor's Create Event takes only a function Blueprint code can call; an event the engine calls, an RPC or a RepNotify is none. | Bind a method of your own class that calls it | [Event dispatchers](REFERENCE.md#event-dispatchers) |
+| `OnDestroyed.Broadcast: OnDestroyed is a native dispatcher (AActor::OnDestroyed) that is not BlueprintCallable, ...` | The editor's Call node refuses a native dispatcher the engine does not mark BlueprintCallable; only the engine broadcasts it. | Call what makes the event happen, such as `K2_DestroyActor()` | [Event dispatchers](REFERENCE.md#event-dispatchers) |
 | `a container operation needs a variable, not a computed value: Length` | A container node works on a variable, not on the result of a call. | `TArray<int32> L = GetItems(); return L.Num();` | [Containers](REFERENCE.md#containers) |
 | `TODO: unimplemented local Inc: (lambda at ...)` | Lambdas are not compiled, in any form. | An `inline` method or a free `inline` function | [Functions](REFERENCE.md#functions) |
 | `warning: ... reference parameter V is bound to a map element: ... V gets a copy, stored back after the call` | Blueprint has no reference to a map element. | Nothing, unless the callee reads the map while it runs: it sees the old value there | [Functions](REFERENCE.md#functions) |
@@ -1860,11 +1867,6 @@ each topic.
 
 **Refused with a message.** The compile stops, and the section linked says what to write instead.
 
-- Binding a method of another object, `OnHit.Add(Other, &AOther::Handle)` or `{ Other, &AOther::Handle }`. Bind a
-  method of `this` that calls the other object. See [Event dispatchers](REFERENCE.md#event-dispatchers).
-- Broadcast on a dispatcher that the class did not declare with `UE_DISPATCHER`, such as `OnDestroyed` or a parent
-  class's dispatcher. Add, Remove and Clear work on any dispatcher. Give the declaring class a method that broadcasts,
-  and call it. See [Event dispatchers](REFERENCE.md#event-dispatchers).
 - A class as a default: `TSubclassOf<AActor> Kind = AActor::StaticClass();`, or a class value in a data asset's
   braces. Set it in `ReceiveBeginPlay`, or use a `TSoftClassPtr` with a path. See
   [Classes and variables](REFERENCE.md#classes-and-variables).

@@ -155,6 +155,10 @@ public:
 
     /* A delegate bound to self's function by name, with no local. */
     void InstanceDelegate(const std::string& FunctionName);
+    /* KCST_BindDelegate, a statement: binds FunctionName on the object Object leaves into the delegate variable
+       Delegate steps (execBindDelegate, ScriptCore.cpp 3302-3321). */
+    void BindDelegate(const std::string& FunctionName, const std::function<void(FScript&)>& Delegate,
+                      const std::function<void(FScript&)>& Object);
     /* Dispatcher must leave MostRecentProperty on a multicast delegate property: EX_InstanceVariable,
        or an EX_Context whose rvalue is that property. */
     void AddMulticastDelegate(const std::function<void(FScript&)>& Dispatcher,

@@ -3112,7 +3112,7 @@ remember: unlike C++, a read through a null object does not crash; it gives zero
 | `Char->InventoryComponent->MiningItem` | The Get node with a Target pin: the property is read from that object, and a chain reads each object in turn. Properties of game classes, of the mod's other classes and of data assets read the same way. A read through a null object gives zero or empty, and the game logs "Accessed None". | Yes |
 | `Other->Hits += 1;`, `Other->Cursor = Next();` | The Set node with a Target pin. As in C++17, the right side is evaluated before the object is located, so if the right side changes what the pointer names, the write goes to the new object. | Yes |
 | `GetPeer()->Slots.Add(5);`, `GetPeer()->SlotMap[FName("a")] = 7;` | A container on another object is changed where it lives, as the editor's container nodes do with a Target. The object is located before the arguments are evaluated, which is C++ order. | Yes |
-| `GetPeer()->OnPeerHit.Broadcast(3);` | Fires the dispatcher of another object of the same class. Only a dispatcher the class being compiled declares can be broadcast; see [Event dispatchers](#event-dispatchers). | Yes |
+| `GetPeer()->OnPeerHit.Broadcast(3);` | Fires the dispatcher of another object of the same class. Another mod class's, a game Blueprint's and a BlueprintCallable native dispatcher can be broadcast too; see [Event dispatchers](#event-dispatchers). | Yes |
 
 ```cpp
 class Peer : public AActor {
@@ -3606,8 +3606,8 @@ Notes:
 
 An event dispatcher is a list of bindings that its owner calls all at once. This section covers declaring one on a
 mod class, binding handlers to it and to the game's own dispatchers, broadcasting it, and passing a method as a single
-delegate value. The rule to remember: a binding is an object and a function name, so a handler is always a non-inline
-method of `this` whose parameters match the dispatcher's exactly. [examples/Scoreboard.cpp](examples/Scoreboard.cpp)
+delegate value. The rule to remember: a binding is an object and a function name, so a handler is a non-inline method
+of the object you bind (`this` or another) whose parameters match the dispatcher's exactly. [examples/Scoreboard.cpp](examples/Scoreboard.cpp)
 declares, binds and broadcasts one.
 
 ### Declaring a dispatcher
@@ -3644,10 +3644,12 @@ Notes:
 | `OnDestroyed.Add(this, &Scorer::HandleDestroyed);` | Binds to a game or engine dispatcher of this object or of its component, inline or sparse: OnDestroyed, `Box->OnComponentBeginOverlap`. The handler runs whenever the game broadcasts it. | Yes |
 | `C->OnFirePressed.Add(this, &Scorer::OnFire);` | Bind Event with another object as Target, also through a component: `C->InventoryComponent->OnItemEquipped`. The bound function is still this object's own. | Yes |
 | `OnHit.Add(this, &PBase::BaseHandle);` | In a child of a mod class: Add, Remove and Clear work on a dispatcher the mod parent declares, and a handler the parent defines can be bound. | Yes |
+| `OnHit.Add(H, &Helper::Take);` on a dispatcher a mod or game Blueprint parent declares | Binds Take on H, as on a dispatcher of this class. The delegate is typed with the parent's own `OnHit__DelegateSignature`, imported from its package, as the editor's Create Event does on an inherited dispatcher. The class makes no function of that name, which would hide the parent's. | Yes |
 | The same `Add` twice | The handler is bound once. The engine skips a second binding with the same object and function. | Yes |
 | `OnScored.Remove(this, &Scorer::HandleScored);` | Unbind Event from OnScored. Removes the binding that has this object and this function name. It works on every dispatcher Add works on. | Yes |
 | `OnScored.Clear();` | Unbind all Events from OnScored. Empties the whole list. | Yes |
 | `Proxy->OnCompleted.Add(this, &Scorer::Done);` | An async node with its output pins wired to custom events. Each Add binds one outcome, and one method can serve several. | Yes |
+| `E->EventTriggeredDelegate.Add(this, &Scorer::Ping);` on a native dispatcher that is not BlueprintAssignable | Refused: "EventTriggeredDelegate is a native dispatcher that is not BlueprintAssignable (AGameEvent::EventTriggeredDelegate)". The editor's Bind, Unbind and Unbind All nodes refuse one ("Event Dispatcher is not 'BlueprintAssignable'"); only the engine's own code binds it. 17 of the game's are; Remove and Clear are refused the same. A UeApi from before genueapi marked them says nothing, and then Add is taken. | Refused |
 | `OnHit.IsBound()`, `OnHit.AddUnique(...)`, `OnHit.Contains(...)` | Refused by clang: "no member named 'IsBound'". A dispatcher has Add, Remove, Clear and Broadcast, and nothing else. Add already skips a duplicate. To know whether your own dispatcher has listeners, count them where you call Add and Remove. | Refused |
 
 ```cpp
@@ -3726,10 +3728,14 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `void HandleScored(int32 Points, AActor *By)` | A handler is a non-inline member function of the class or of a mod ancestor. It returns void and takes exactly the dispatcher's parameter types. clang checks this at the Add call. | Yes |
+| `void HandleScored(int32 Points, AActor *By)` | A handler bound on `this` is a non-inline member function of the class or of a mod ancestor. It returns void and takes exactly the dispatcher's parameter types. clang checks this at the Add call. An inherited native or game Blueprint function bound on `this` follows the rules of one bound on another object below. | Yes |
 | A `const` handler, or `const FHitResult &Hit` where the header says `FHitResult Hit` | clang error: "no matching member function for call to 'Add'". Copy the parameter list as the header spells it. | Refused |
 | `inline void Handle(int32 Points)` as a handler | Refused: "a delegate cannot bind Handle: an inline function is expanded where it is called". An inline method never becomes a function of the class. Drop `inline`. | Refused |
-| `OnHit.Add(H, &Helper::HandleHit);` | Refused today: "a delegate can only bind a function of `this`". Bind a method of `this` that calls H. | Not yet |
+| `OnHit.Add(H, &Helper::HandleHit);` | Binds HandleHit on the object H points to: the editor's Create Event with its Object pin wired. The binding is made where the Add runs, with H as it is then. HandleHit must be a function of H's class or of an ancestor of it: a mod class's method, a game Blueprint's function, or a native BlueprintCallable one (`OnRate.Add(Pawn, &AActor::SetActorTickInterval)`). Remove takes the same pair off. | Yes |
+| `OnHit.Add(H, &Other::HandleHit);` where H's class has no HandleHit | Refused: "a delegate on a Helper cannot bind Other::HandleHit: the engine looks it up by name on that object, whose class has no such function". The broadcast would skip it. | Refused |
+| `OnTick.Add(A, &AActor::ReceiveTick);` | Refused: "a delegate cannot bind AActor::ReceiveTick on another object: the editor binds a BlueprintCallable function that is not pure or latent, and ReceiveTick is not BlueprintCallable". An event the engine calls is not one Blueprint code can bind, on another object or on `this` ("on this object"), nor a pure or latent function. A mod method that overrides such an event is refused the same. | Refused |
+| `OnUse.Add(Item, &AItem::Server_StartUsing);`, `OnPing.Add(this, &AActor::OnRep_Instigator);` | Refused the same way: "... and Server_StartUsing is not BlueprintCallable". A native function the engine does not mark BlueprintCallable, such as an RPC or a RepNotify, is not one the editor binds. UeApi's `NotCallable.json` names them. A UeApi from before genueapi wrote that file tells only an RPC apart (`UE_SERVER`, `UE_CLIENT`, `UE_MULTICAST`), and then `OnRep_Instigator` is bound; regenerate it with genueapi. | Refused |
+| `OnHit.Add(H, &Helper::Half);` where Helper declares Half and never defines it | Refused: "a delegate cannot bind Helper::Half, which Helper declares and never defines". No function of that name exists. | Refused |
 
 ```cpp
 class Pad : public AActor {
@@ -3745,7 +3751,7 @@ public:
 };
 ```
 
-To have another object handle a broadcast, bind a method of `this` that forwards the call:
+Another object can handle a broadcast itself: bind its method on it.
 
 ```cpp
 class Helper : public AActor {
@@ -3757,22 +3763,27 @@ class Relay : public AActor {
 public:
   UE_DISPATCHER(OnHit, int32 Points);
   Helper *H;
-  void ForwardHit(int32 Points) {
-    if (H != nullptr) H->HandleHit(Points);
+  void ReceiveBeginPlay() {
+    if (H != nullptr) OnHit.Add(H, &Helper::HandleHit);   // each OnHit.Broadcast runs H->HandleHit
   }
-  void ReceiveBeginPlay() { OnHit.Add(this, &Relay::ForwardHit); }
 };
 ```
+
+[tests/DelegateOtherBind.cpp](tests/DelegateOtherBind.cpp) binds a sibling class's, a peer's, a native and a game
+Blueprint's function this way.
 
 Notes:
 
 - A binding stores the object, held weakly, and the function's name. When the dispatcher fires, the engine looks the
   function up by name on that object, so if a subclass overrides the handler, the override runs. A binding whose
   object is gone is skipped and dropped from the list.
-- This is Blueprint dispatch, not a C++ member pointer. A function the object does not have is a fatal error at
-  broadcast time, which is why AssetGen refuses an inline handler.
-- Both refusals are raised in the function that binds, so they print with its `<Class>::<Function>: ` prefix.
-- The same rules hold for a delegate value, `{this, &Class::Method}` (see Delegate values below).
+- This is Blueprint dispatch, not a C++ member pointer. A broadcast silently skips a binding whose object has no
+  function of that name, which is why AssetGen refuses an inline handler and one the object's class lacks.
+- The refusals are raised in the function that binds, so they print with its `<Class>::<Function>: ` prefix.
+- On another object the binding is the editor's: a delegate local the object's function is bound into
+  (EX_BindDelegate), then added. If the object is null when the Add runs, the binding holds no object and the broadcast
+  skips it.
+- The same rules hold for a delegate value, `{this, &Class::Method}` or `{H, &Helper::Method}` (see Delegate values below).
 
 ### Broadcast
 
@@ -3781,8 +3792,10 @@ Notes:
 | `OnScored.Broadcast(N, this);` | Call OnScored. Every bound handler runs right away, one after another, before Broadcast returns. | Yes |
 | `GetPeer()->OnPeerHit.Broadcast(X);` | Fires the dispatcher of another object of the same class. The object is evaluated before the arguments, so an argument that changes what GetPeer() returns does not redirect the broadcast. | Yes |
 | `UE_DISPATCHER(OnList, TArray<int32> &Items);` | A non-const reference parameter. The declaration compiles, but a Broadcast is refused: "Items is a non-const reference, which a Broadcast never writes back to the caller". The engine copies each argument into a parameter block of its own. Take it by value or by `const &`. | Refused |
-| `OnDestroyed.Broadcast(this);` | Refused today: "Broadcast needs the dispatcher's signature function". Only a UE_DISPATCHER of the class being compiled can be broadcast; the game's dispatchers cannot. | Not yet |
 | `OnHit.Broadcast(1);` on a dispatcher a mod parent declares | Broadcasts through the parent's signature function, as the editor's node on a child does. | Yes |
+| `T->OnHit.Broadcast(P);`, `Burrow->OnBurrowComplete.Broadcast(true);` | The Call node with another object as Target: a dispatcher another mod class declares, or a game Blueprint's (every Blueprint dispatcher is BlueprintCallable). It broadcasts through that class's signature function, imported from its package. | Yes |
+| `State->OnTerrainGenerated.Broadcast();` | A native dispatcher the engine marks BlueprintCallable (41 of the game's). UeApi does not say which signature function the engine gives it, so the broadcast names one of the class's own with the same parameters and warns that it does; the handlers get the same arguments. | Warns |
+| `OnDestroyed.Broadcast(this);` | Refused: "OnDestroyed is a native dispatcher (AActor::OnDestroyed) that is not BlueprintCallable". The editor's Call node refuses a native dispatcher without BlueprintCallable ("Event Dispatcher is not 'BlueprintCallable'"), and none of the engine's has it; only the engine's own code broadcasts it. With a UeApi from before genueapi marked them, every native dispatcher is refused this way, the message saying the UeApi does not tell. | Refused |
 
 ```cpp
 class PBase : public AActor {
@@ -3796,7 +3809,7 @@ public:
   void Handle(int32 Points) { Mine = Points; }
   void ReceiveBeginPlay() {
     OnHit.Add(this, &Child::Handle);   // Add, Remove and Clear work on the parent's dispatcher
-    Fire(3);                           // OnHit.Broadcast(3) here would be refused
+    OnHit.Broadcast(3);                // through PBase's OnHit__DelegateSignature, as Fire(3) does
   }
 };
 ```
@@ -3813,10 +3826,11 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `{this, &Scorer::HandleTimer}` | Create Event wired into a delegate pin, written as the argument of a call that takes a TDelegate (timers, engine callbacks). The rules are those of a handler: `this` only, a non-inline method, and the signature of the `TDelegate<...>` in the header. | Yes |
+| `{this, &Scorer::HandleTimer}` | Create Event wired into a delegate pin, written as the argument of a call that takes a TDelegate (timers, engine callbacks). The rules are those of a handler: a non-inline method, and the signature of the `TDelegate<...>` in the header. | Yes |
+| `{Peer, &Scorer::HandleTimer}` | The same with the Object pin wired: HandleTimer bound on Peer, which the timer then calls. The rules are those of a handler on another object. | Yes |
 | `TDelegate<void()>(this, &Scorer::HandleTimer)` | The same value, spelled out. | Yes |
 | `K2_ClearTimerDelegate({})` | Refused: "a delegate value is {this, &Class::Function}". There is no empty or unbound delegate. | Refused |
-| `TDelegate<void()> Callback;` as a class variable, a function parameter or a local | A delegate variable (DelegateProperty). `Callback = {this, &Class::Method};` stores a value, and `Callback` passes it on, to a timer or another function. Its signature function is one the class makes per delegate type, `<Variable>__DelegateSignature`, as the editor makes one per dispatcher. A struct or an interface makes none, so a delegate in one is refused. | Yes |
+| `TDelegate<void()> Callback;` as a class variable, a function parameter or a local | A delegate variable (DelegateProperty). `Callback = {this, &Class::Method};` stores a value, and `Callback` passes it on, to a timer or another function. Its signature function is one the class makes per delegate type, `<Variable>__DelegateSignature`, as the editor makes one per dispatcher, numbered past a name the class or one of its parents already uses. A struct or an interface makes none, so a delegate in one is refused. | Yes |
 
 The timers in [Timers and input](#timers-and-input) show delegate values in use.
 
@@ -6077,8 +6091,22 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   the engine copies each argument into a parameter block of its own, so what the handlers write stays there. Fix:
   take the parameter by value or by `const &`, and hand results back through a member variable.
 - `a delegate on \`this\` cannot bind <Class>::<Function>: the engine looks it up by name on this object, whose class
-  has no such function`: `{this, &Other::F}` where this class is no `Other`. Fix: bind a method of this class, and
-  call the other object from it.
+  has no such function`: `{this, &Other::F}` where this class is no `Other`. Fix: bind it on an `Other` object,
+  `{O, &Other::F}`, or bind a method of this class.
+- `a delegate on a <Type> cannot bind <Class>::<Function>: the engine looks it up by name on that object, whose class
+  has no such function`: `OnHit.Add(H, &Other::F)` where H's type is no `Other`; the broadcast would skip it. Fix:
+  bind a function of H's class, or pass an object that has F. See [Event dispatchers](#event-dispatchers).
+- `a delegate cannot bind <Class>::<Function> on another object: the editor binds a BlueprintCallable function that is
+  not pure or latent, and <Function> is not BlueprintCallable` (or `is pure`, `is latent`; `on this object` for a
+  binding on `this`): the editor's Create Event node lists only such functions of its Object pin's class. An event the
+  engine calls (`AActor::ReceiveTick`) or a mod method that overrides one is none, and neither is a native function
+  the engine does not mark BlueprintCallable: an RPC (`AItem::Server_StartUsing`), a RepNotify
+  (`AActor::OnRep_Instigator`). Fix: bind a method of your own class that calls it. See
+  [Event dispatchers](#event-dispatchers).
+- `a delegate cannot bind <Class>::<Function>, which <Class> declares and never defines`: a binding on another object
+  names a mod method with no body, so no function of that name exists. Fix: define it.
+- `a delegate binds <Function> on an object, through a pointer to its class, not <Type>`: the object half of a binding
+  is no class pointer (an interface, a struct). Fix: pass the object, `I.GetObject()` cast to its class.
 - `<Function>: <Dispatcher>__DelegateSignature is the dispatcher's signature, which does nothing when called; call
   <Dispatcher>.Broadcast(...)`. Fix: broadcast the dispatcher.
 - `<Function>: K2_SetTimer by name <Name> names no function of the class` (or `names an inline method`, or `names a
@@ -6088,15 +6116,17 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
 - `` a delegate cannot bind <Function>: an inline function is expanded where it is called, no UFunction (drop `inline`) ``:
   Add, Remove or a delegate value names an inline method. An inline method is copied into each caller and never
   becomes a function of the class. Fix: drop `inline` from the handler. See [Event dispatchers](#event-dispatchers).
-- `` TODO: a delegate can only bind a function of `this` ``: Not yet. Binding a method of another object,
-  `OnHit.Add(Other, &AOther::Handle);` or `{ Other, &AOther::Handle }`, is refused, because the Blueprint delegate
-  binds the object whose code is running. Fix: bind a method of this class that calls the other object. See
-  [Event dispatchers](#event-dispatchers).
-- `TODO: Broadcast needs the dispatcher's signature function, which only a UE_DISPATCHER of this class has:
-  <Dispatcher>`: Not yet. Broadcast on a dispatcher that the class being compiled did not declare is refused: an
-  engine dispatcher such as `OnDestroyed.Broadcast(this)`, or one a parent mod class declares. Add, Remove and Clear
-  work on any dispatcher. Fix: to fire a parent's dispatcher, give the parent a method that broadcasts it,
-  `void Fire(int32 P) { OnHit.Broadcast(P); }`, and call that. See [Event dispatchers](#event-dispatchers).
+- `<Dispatcher>.Broadcast: <Dispatcher> is a native dispatcher (<Class>::<Dispatcher>) that is not BlueprintCallable,
+  and the editor's Call node refuses one ("Event Dispatcher is not 'BlueprintCallable'"): only the engine's own code
+  broadcasts it`: `OnDestroyed.Broadcast(this)` and the like; none of the engine's dispatchers is BlueprintCallable, 41
+  of the game's are. Fix: none; call what the engine calls to make the event happen (`K2_DestroyActor()`).
+- `<Dispatcher>.Broadcast: <Dispatcher> is a native dispatcher (<Class>::<Dispatcher>) and the editor's Call node takes
+  one only when it is BlueprintCallable, which this UeApi does not say (regenerate it with genueapi)`: the UeApi
+  headers predate genueapi's `<Dispatcher>__UeDispatcher` marks. Fix: regenerate them.
+- `<Dispatcher>.<Add|Remove|Clear>: <Dispatcher> is a native dispatcher that is not BlueprintAssignable
+  (<Class>::<Dispatcher>), and the editor's dispatcher nodes refuse one ("Event Dispatcher is not 'BlueprintAssignable'"):
+  only the engine's own code binds it`: 17 of the game's dispatchers are not BlueprintAssignable. Fix: none from
+  Blueprint code.
 - `a delegate value is {this, &Class::Function}`: a delegate argument built any other way, such as an empty `{}`
   passed to `UKismetSystemLibrary::K2_ClearTimerDelegate`. There is no empty delegate value. Fix: pass
   `{ this, &AMine::Handle }` or `TDelegate<void()>(this, &AMine::Handle)`. See

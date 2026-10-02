@@ -895,6 +895,11 @@ def parse_field(cur, m, skipped):
     node = re.search(r"ScsNode=([0-9a-f]{32})", flags)
     if node:
         cur.scs_nodes[fname] = node.group(1)
+    # A native dispatcher's BlueprintAssignable / BlueprintCallable: the editor's Bind / Add / Remove / Clear nodes need
+    # the first, its Call node the second (K2Node_MCDelegate.cpp 36-46, 453-462). Of FSD's 1046 native dispatchers 41 are
+    # callable and 17 not assignable; every Blueprint's dispatcher is both, so a Blueprint class needs no mark.
+    if not cur.is_bp and mapped.startswith(("TMulticastInlineDelegate<", "TMulticastSparseDelegate<")):
+        cur.dispatchers[fname] = " ".join(f for f in ("Assignable", "Callable") if re.search(r"\bBlueprint%s\b" % f, flags))
 
 
 class Klass(object):
@@ -914,6 +919,7 @@ class Klass(object):
         self.replicated = {}     # field -> its RepNotify function, "" when none (or the dump predates the name)
         self.offsets = {}        # field -> (offset, ordinal among the members at that offset): the join to REAL_FIELDS
         self.scs_nodes = {}      # component variable -> its SCS node's VariableGuid, 32 hex digits
+        self.dispatchers = {}    # a native class's dispatcher -> "Assignable Callable", what of the two it is
         self.stem = ""           # the SDK file it came from: <stem>_classes.hpp pairs with <stem>_functions.cpp
 
 
@@ -1131,8 +1137,10 @@ MARK_OF = (("NetServer", "UE_SERVER"), ("NetClient", "UE_CLIENT"), ("NetMulticas
 def write_events(sdk_dir, out_dir):
     """Events.json: "Package.Class.Function" -> EFunctionFlags of every BlueprintEvent, the functions a Blueprint
     overrides or implements. The compiler copies part of these onto the override (KismetCompiler.cpp).
-    Also collects PURE."""
-    rows = []
+    Also collects PURE, and writes NotCallable.json: "Package.Class.Function" of every function that is neither
+    BlueprintCallable nor a BlueprintEvent (OnRep_*, RPCs, Exec commands, ExecuteUbergraph_*), which the editor's
+    Create Event node does not bind (EdGraphSchema_K2.cpp 929-933, 974-985) and no other flag in UeApi tells apart."""
+    rows, not_callable = [], []
     for name in sorted(f for f in os.listdir(sdk_dir) if f.endswith("_functions.cpp")):
         text = io.open(os.path.join(sdk_dir, name), encoding="utf-8", errors="replace").read()
         stem = name[: -len("_functions.cpp")]
@@ -1151,8 +1159,12 @@ def write_events(sdk_dir, out_dir):
                 MARKS[(cls, real)] = marks
             if "BlueprintEvent" in names:
                 rows.append('  %s: %d' % (json.dumps("%s.%s.%s" % (pkg, cls, real)), sum(FUNC_BITS[n] for n in names)))
+            elif "BlueprintCallable" not in names:
+                not_callable.append("%s.%s.%s" % (pkg, cls, real))
     io.open(os.path.join(out_dir, "Events.json"), "w", encoding="utf-8", newline="\n").write("{\n" + ",\n".join(rows) + "\n}\n")
-    print("  events: %d" % len(rows))
+    io.open(os.path.join(out_dir, "NotCallable.json"), "w", encoding="utf-8", newline="\n").write(
+        "[\n" + ",\n".join("  " + json.dumps(k) for k in sorted(set(not_callable))) + "\n]\n")
+    print("  events: %d, not callable: %d" % (len(rows), len(not_callable)))
 
 
 def write_out_arrays(out_dir):
@@ -1635,6 +1647,9 @@ def main():
                     # What UE_REPLICATED_USING declares for a mod class: AssetGen wakes the actor before a set and
                     # calls the RepNotify function after it, as the editor's Set node does.
                     body.append('    static constexpr const char* %s__Replicated = "%s:";' % (fname, k.replicated[fname]))
+                if fname in k.dispatchers:
+                    # Which of the editor's dispatcher nodes take it: AssetGen refuses the others, as the editor does.
+                    body.append('    static constexpr const char* %s__UeDispatcher = "%s";' % (fname, k.dispatchers[fname]))
                 fields += 1
                 referenced.update(class_refs(ftype))
             for fname in sorted(k.subobjects):
