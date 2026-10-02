@@ -5840,9 +5840,10 @@ and where the feature is described. In each group, the messages you are most lik
   before: assign in a statement of its own, then use what it assigned`: a plain `=` used as a value where the comma
   operator is refused for that reason too, `{G(), (A = N)}`. Fix: as the message says. See [Operators](#operators).
 - `an assignment used as a value, whose left side is no plain variable, which would be evaluated again to read it:
-  ...`: `A = L[0] = N`. A left side that is a comma, or a member or element of one, names its variable and works:
-  `int32 X = ((Bump(), N) = G());`. Fix: assign in a statement of its own, then use what it assigned. See
-  [Operators](#operators).
+  ...`: `A = L[0] = N`. A left side that is a comma, or a member of one, names its variable and works:
+  `int32 X = ((Bump(), N) = G());`, `((Bump(), T).A = G())`. An element of one, `int32 X = ((Bump(), L)[1] = G());`
+  or `while (((Bump(), L)[I] = M) < 0)`, is refused like `A = L[0] = N`: the element would be located again to read
+  it. Fix: assign in a statement of its own, then use what it assigned. See [Operators](#operators).
 - `an update (`+=`, `++`, ...) passed to a reference parameter, whose left side is no plain variable, ...`:
   `IncRef(1, L[Idx()] += 1)` where IncRef takes `int32&` or `const int32&`. Fix: update in a statement of its own,
   then pass the element. See [Operators](#operators).
