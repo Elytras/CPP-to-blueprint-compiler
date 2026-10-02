@@ -49,6 +49,12 @@ protected:
 
   const int32 Limit = 3; // a const member is BlueprintReadOnly: the editor offers a Get and no Set
 
+  /* UE_READONLY is BlueprintReadOnly too, but still written from code - with a warning, as the VM allows it. */
+  UE_READONLY int32 Cap = 5;
+
+public:
+  void Raise() { Cap = 9; }
+
 private:
   int32 Seed;
   int32 Twice() { return Step() + Step(); }

@@ -3318,6 +3318,13 @@ def engine_names():
     assert pflags('Limit') & 0x10 and not any(pflags(p) & 0x10 for p in ('Seed', 'Charges', 'Plain')), props
     assert 'Limit [0] IntProperty size=4: 3' in cdo, cdo
     print('ok  NameTest: a const member is BlueprintReadOnly')
+    # UE_READONLY: BlueprintReadOnly as well, and a write from code is kept (the VM allows it) with a warning.
+    assert pflags('Cap') & 0x10 and 'Cap [0] IntProperty size=4: 5' in cdo, (props, cdo)
+    f = {'Cap': 5}
+    run(base, 'Raise', self_vars=f)
+    assert f == {'Cap': 9}, f
+    assert 'warning: NameTest::Raise: Cap is BlueprintReadOnly' in LOGS['NameTest'], LOGS['NameTest']
+    print('ok  NameTest: a UE_READONLY member is BlueprintReadOnly, and a write to it is kept with a warning')
 
 
 def object_forwards():
@@ -3366,14 +3373,14 @@ def api_stub():
                    for i, e in enumerate(exports) if e['name'].startswith('K2Node_FunctionEntry')}
     category = b'Names|Test'.hex()
     # A private field is left out; the const one is offered read-only (CPF_BlueprintReadOnly 0x10).
-    assert set(variables) == {'Charges', 'Plain', 'Limit'}, set(variables)
+    assert set(variables) == {'Charges', 'Plain', 'Limit', 'Cap'}, set(variables)
     rflags = lambda v: struct.unpack('<Q', bytes.fromhex(re.search(r'PropertyFlags \[0\] UInt64Property size=8: (\w+)', variables[v]).group(1)))[0]
-    assert rflags('Limit') & 0x10 and not rflags('Charges') & 0x10 and not rflags('Plain') & 0x10
+    assert rflags('Limit') & 0x10 and rflags('Cap') & 0x10 and not rflags('Charges') & 0x10 and not rflags('Plain') & 0x10
     # UE_CATEGORY files Charges and Peek; Plain follows UE_CATEGORY("") and has none.
     assert category in variables['Charges'] and 'Category' not in variables['Plain'], variables
     assert category in entries['Peek'] and not any(category in entries[f] for f in entries if f != 'Peek'), entries
     # Every method is offered, its entry node carrying its access specifier and purity (ExtraFlags).
-    assert set(entries) == {'Next', 'Peek', 'SameKind', 'Step', 'Twice', 'Whose'}, set(entries)
+    assert set(entries) == {'Next', 'Peek', 'Raise', 'SameKind', 'Step', 'Twice', 'Whose'}, set(entries)
     extra = lambda f: int(re.search(r'ExtraFlags \[0\] IntProperty size=4: (-?\d+)', entries[f]).group(1))
     for f in entries:
         assert extra(f) & 0xE0000 == {'Step': 0x80000, 'Twice': 0x40000}.get(f, 0x20000), (f, hex(extra(f)))

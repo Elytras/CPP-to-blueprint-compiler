@@ -265,7 +265,8 @@ enum, an object, class, soft or interface reference, a struct, or a `TArray`, `T
 the mod is built, so it must be a literal, a constant expression, an enum constant, a braced struct or list, or
 `&Asset`. Anything else is refused with `<Member>: a default is a value known when the mod is built - ...`; set such a
 value in `ReceiveBeginPlay`. A class as the default of a `TSubclassOf` member is not built yet and is refused the same
-way. A `const` member is read-only, and a `static constexpr` or `static inline const` member is a constant with no
+way. A `const` member is read-only. A `UE_READONLY` member is read-only too, but a subclass's `UE_DEFAULTS` can
+still set it, and a write from code compiles with a warning. A `static constexpr` or `static inline const` member is a constant with no
 variable behind it. To change the default of a property that a parent class declares, assign it in `UE_DEFAULTS`,
 which is what editing Class Defaults does.
 

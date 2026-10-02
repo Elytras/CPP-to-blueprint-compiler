@@ -453,6 +453,7 @@ Notes:
 | `public:`, `protected:`, `private:` before a function | The function is cooked as public, protected or private, and the editor allows or refuses a call node to it the same way. An override keeps its parent's access. Nothing is checked at run time. | Yes |
 | `private:` before a variable | The variable is still cooked on the class, but the editor API stub leaves it out. A Blueprint variable has no other access: a protected one and a public one look the same. | Yes |
 | `const int32 Limit = 3;` | A read-only variable (BlueprintReadOnly): the editor offers a Get node and no Set node. The initializer is the default. clang refuses a write in C++, and the Blueprint VM does not check it. | Yes |
+| `UE_READONLY int32 Cap = 5;` | Read-only the same way (BlueprintReadOnly), but it can still be written: a subclass's `UE_DEFAULTS` may give it a default, and a write from code compiles with `warning: <Class>::<Function>: Cap is BlueprintReadOnly; the editor would not set it`, because the VM allows the write (for example, setting a deferred spawn's members before FinishSpawning). UeApi declares the engine's and game's BlueprintReadOnly properties this way. | Yes |
 | `UE_CATEGORY("Teleporter\|Setup");` | Gives the functions and variables declared after it that category. `\|` starts a subcategory, and `UE_CATEGORY("")` ends the category. It is positional, like an access specifier. | Yes |
 | a keyword or a tooltip for a function | Not yet: there is no macro for it. | Not yet |
 
@@ -5308,6 +5309,7 @@ listed here is refused with "unimplemented intrinsic".
 | `Cast<T>(Obj)` | Cast To: the object if it is a T, otherwise null. To reach an interface, use TScriptInterface. | [Types](#types), [Interfaces](#interfaces) |
 | `__ClassOf__(X)` | The property class name of a parameter or local, such as IntProperty, found at run time by the class's GetParmClassName. | [Intrinsics](#intrinsics) |
 | `const` member, `const int32 Limit = 3;` | A read-only variable (BlueprintReadOnly): a Get node and no Set. Its initializer is the default. | [Classes and variables](#classes-and-variables) |
+| `UE_READONLY int32 Cap = 5;` | BlueprintReadOnly like `const`, but a subclass's `UE_DEFAULTS` may set it, and a write from code compiles with a warning. | [Access, read-only and categories](#access-read-only-and-categories) |
 | `const` method, `int32 Get() const` | A const Blueprint function. | [Functions](#functions) |
 | `consteval` function | Runs while the mod compiles, and only the result is cooked. Its arguments must be constants. | [Constants](#constants) |
 | `constexpr` and `const` variables at namespace scope | Constants: no storage, each use is the value, worked out at build time. | [Constants](#constants) |

@@ -1016,6 +1016,9 @@ def parse_field(cur, m, skipped):
         skipped[mapped if mapped in KINDS else "other"] += 1
         return
     cur.fields.append((mapped, fname))
+    # BlueprintReadOnly: the stub declares it UE_READONLY (`mutable`), so a child's UE_DEFAULTS may still set it.
+    if re.search(r"\bBlueprintReadOnly\b", flags):
+        cur.readonly.add(fname)
     # Dumper-7's flag comment: `Net` marks a replicated property; our fork appends `RepNotifyFunc=<Function>` (the
     # engine's name, which may hold a space) and, for a Blueprint component variable, `ScsNode=<guid>`.
     if re.search(r"\bNet\b", flags):
@@ -1045,6 +1048,7 @@ class Klass(object):
         self.const_funcs = set()
         self.raw_funcs = []      # (return, name, params) as Dumper-7 spelled them, before any mapping
         self.fields = []
+        self.readonly = set()    # the fields Dumper-7 flags BlueprintReadOnly
         self.replicated = {}     # field -> its RepNotify function, "" when none (or the dump predates the name)
         self.offsets = {}        # field -> (offset, ordinal among the members at that offset): the join to REAL_FIELDS
         self.scs_nodes = {}      # component variable -> its SCS node's VariableGuid, 32 hex digits
@@ -1775,7 +1779,7 @@ def main():
             for ftype, fname in k.fields:
                 if fname in names:
                     continue
-                body.append("    %s %s;" % (rewrite(named(ftype), short, k), fname))
+                body.append("    %s%s %s;" % ("UE_READONLY " if fname in k.readonly else "", rewrite(named(ftype), short, k), fname))
                 real = real_field(k, fname)
                 if real:
                     marks.append('static constexpr const char* %s__UeName = "%s";' % (fname, c_literal(real)))

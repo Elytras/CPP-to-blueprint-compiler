@@ -1770,6 +1770,7 @@ private:
     std::map<std::string, std::string> MethodOwner;   // clang decl id -> owning record
     std::map<std::string, std::string> TemplateOwner; // a member template's instantiation's decl id -> its record
     std::map<std::string, std::string> FieldOwner;    // clang decl id -> declaring record
+    std::set<std::string> ReadOnlyFields;             // decl ids of the UE_READONLY (`mutable`) fields, any record's
     std::map<std::string, std::string> Bare;          // unambiguous leaf name -> qualified name
     std::map<std::string, std::string> Aliases;       // a namespace-scope `using A = B;` / typedef: A -> B
     const FRecord* Cur = nullptr;                     // record Generate is working on
@@ -1788,6 +1789,17 @@ private:
         if (!bCurNet || Root->K != FArgIR::LocalOut || !WarnedRefParms.insert(Root->S).second) return;
         printf("  warning: %s::%s: modifying reference parameter %s of an RPC reaches the caller only when the call runs "
                "locally; take it by value or const&\n", Cur ? Cur->CppName.c_str() : "", CurFnName.c_str(), Root->S.c_str());
+    }
+    std::set<std::string> WarnedReadOnly;             // function + field of the read-only writes already warned about
+
+    /* A write to a UE_READONLY member: the editor offers no Set node for it, but the VM checks no flag, so the write is
+       kept - a deferred spawn's defaults before FinishSpawning is the case for it. Warned once per function and field. */
+    void WarnReadOnlyWrite(const Json& Member)
+    {
+        const std::string Id = Member.value("referencedMemberDecl", std::string());
+        if (!ReadOnlyFields.count(Id) || !WarnedReadOnly.insert(CurFnName + "|" + Id).second) return;
+        printf("  warning: %s::%s: %s is BlueprintReadOnly; the editor would not set it\n",
+               Cur ? Cur->CppName.c_str() : "", CurFnName.c_str(), Name(Member).c_str());
     }
     std::string CurrentWco;                           // its WorldContext* parm when it is a static, else empty
     std::vector<FRegistryAsset> RegistryRows;
@@ -2559,6 +2571,7 @@ bool FCompiler::Collect(std::string* Err)
             {
                 R.Fields.push_back(&C);
                 FieldOwner[C.value("id", std::string())] = R.CppName;
+                if (C.value("mutable", false)) ReadOnlyFields.insert(C.value("id", std::string()));
                 if (Access == FUNC_Private) R.PrivateFields.insert(Name(C));
             }
             else if ((Kind(C) == "TypeAliasDecl" || Kind(C) == "TypedefDecl") && C.contains("name"))
@@ -8231,7 +8244,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             {
                 St.K = FStmtIR::Assign;
                 bOk = LowerField(*Lhs, BP, St.Var, Err) && LowerArg(*Rhs, BP, St.Value, Err);
-                if (bOk) { SetOn = RecordOfFieldAccess(*Lhs); SetField = St.Var.S; SetObject = St.Var.Base; }
+                if (bOk) { SetOn = RecordOfFieldAccess(*Lhs); SetField = St.Var.S; SetObject = St.Var.Base; WarnReadOnlyWrite(*Lhs); }
             }
             else if (LK == "DeclRefExpr" && NsVars.count((*Lhs)["referencedDecl"].value("id", std::string())))
             {
@@ -8278,7 +8291,8 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 { *Err = "`[]` on a map needs a map variable, not a computed value"; bOk = false; }
                 if (bOk) WarnRpcRefWrite(St.Call.Args[0]);
                 if (bOk && St.Call.Args[0].K == FArgIR::Field && Strip(Nth(*Lhs, 1)) && Kind(*Strip(Nth(*Lhs, 1))) == "MemberExpr")
-                { SetOn = RecordOfFieldAccess(*Strip(Nth(*Lhs, 1))); SetField = St.Call.Args[0].S; SetObject = St.Call.Args[0].Base; }
+                { SetOn = RecordOfFieldAccess(*Strip(Nth(*Lhs, 1))); SetField = St.Call.Args[0].S; SetObject = St.Call.Args[0].Base;
+                  WarnReadOnlyWrite(*Strip(Nth(*Lhs, 1))); }
             }
             else if (LK == "CXXOperatorCallExpr")
             {
@@ -8291,7 +8305,8 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 if (St.Var.K != FArgIR::Index)
                 { *Err = "TODO: assignment to an operator call that is not an array element"; bOk = false; return; }
                 if (St.Var.Base->K == FArgIR::Field && Strip(Nth(*Lhs, 1)) && Kind(*Strip(Nth(*Lhs, 1))) == "MemberExpr")
-                { SetOn = RecordOfFieldAccess(*Strip(Nth(*Lhs, 1))); SetField = St.Var.Base->S; SetObject = St.Var.Base->Base; }
+                { SetOn = RecordOfFieldAccess(*Strip(Nth(*Lhs, 1))); SetField = St.Var.Base->S; SetObject = St.Var.Base->Base;
+                  WarnReadOnlyWrite(*Strip(Nth(*Lhs, 1))); }
                 St.bAssignLocal = St.Var.Base->K == FArgIR::Local;
                 St.bAssignOutParm = St.Var.Base->K == FArgIR::LocalOut;
                 bOk = LowerArg(*Rhs, BP, St.Value, Err);
@@ -14846,10 +14861,11 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         }
 
         /* CPF_Parm would make it part of the call frame; CPF_BlueprintReadOnly would forbid assignment -
-           except on a `const` field, where the source forbids it anyway, so the flag is the truth. */
+           except on a `const` field, where the source forbids it anyway, and a UE_READONLY (`mutable`) one, whose
+           writes are warned about. */
         PD.PropertyFlags = (PD.PropertyFlags & ~uint64(CPF_Parm | CPF_BlueprintReadOnly))
                          | CPF_Edit | CPF_BlueprintVisible | CPF_DisableEditOnInstance;
-        if (TypeOf(*F).compare(0, 6, "const ") == 0) PD.PropertyFlags |= CPF_BlueprintReadOnly;
+        if (TypeOf(*F).compare(0, 6, "const ") == 0 || F->value("mutable", false)) PD.PropertyFlags |= CPF_BlueprintReadOnly;
         /* A member that refers to a component or holds one is instanced, and then so is the class, or instancing never
            looks at it (KismetCompiler.cpp 2521-2529). */
         FlagInstancing(TypeOf(*F), PD);
