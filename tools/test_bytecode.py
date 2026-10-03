@@ -7415,6 +7415,215 @@ def delegate_not_callable_refusals():
             'OnRep_Instigator is not BlueprintCallable')
 
 
+def delegate_sigs(base):
+    """The signature function each DelegateProperty of the package at base names, by path: {(function, parameter): path}
+    for each parameter and class variable (the class's own name for a variable), and {(function, None): {paths}} for a
+    function's delegate locals, whatever the compiler named them."""
+    import invariants
+    pkg = invariants.Package(base)
+    out = {}
+    for i in range(len(pkg.exports)):
+        if pkg.class_of(i + 1) not in ('Function', 'BlueprintGeneratedClass'): continue
+        for p in pkg.struct(i).props:
+            if p.type != 'DelegateProperty': continue
+            fn = pkg.exports[i]['name']
+            if p.flags & 0x80 or pkg.class_of(i + 1) != 'Function': out[(fn, p.name)] = pkg.path(p.ref)
+            else: out.setdefault((fn, None), set()).add(pkg.path(p.ref))
+    return out
+
+
+def delegate_parm_sig():
+    """DelegateParmSig and DelegateParmZKid override DelegateParmTop's Use(TDelegate D) and Out(TDelegate &O): each
+    override's parameter names the parent parameter's own signature function, imported, as the editor's override copies
+    the parent's parameters (CreatePinsForFunctionEntryExit -> ConvertPropertyToPinType -> CreatePropertyOnScope), so
+    keeps_invariants' func_override_params holds; so does DelegateParmSig's static Arm, which hides its parent's.
+    DelegateParmSig is generated before its parent, DelegateParmZKid after.
+    A value bound on another object and handed to a parameter is typed with that parameter's signature, as a Create
+    Event node wired to the pin is: the parent's Take, the override Use (the parent's), the sibling DelegateParmSib's
+    Sib; assigned to the parent's variable Var, Var's. One of its own function Mine's is its own. Each call still
+    hands the helper's Ping to where it goes: Take and Sib get it, the override sets its timer with it, Var holds it."""
+    base = asset('DelegateParmSig')
+    here = os.path.dirname(base)
+    top, zkid, sib = (os.path.join(here, c) for c in ('DelegateParmTop', 'DelegateParmZKid', 'DelegateParmSib'))
+    for b in (base, top, zkid, sib):
+        keeps_invariants(b)
+    mine, theirs, sibs, zs = delegate_sigs(base), delegate_sigs(top), delegate_sigs(sib), delegate_sigs(zkid)
+    want = {('Use', 'D'): theirs[('Use', 'D')], ('Out', 'O'): theirs[('Out', 'O')], ('Arm', 'A'): theirs[('Arm', 'A')],
+            ('Mine', 'M'): mine[('Mine', 'M')],
+            ('CallTake', None): {theirs[('Take', 'T')]}, ('CallUse', None): {theirs[('Use', 'D')]},
+            ('CallSib', None): {sibs[('Sib', 'S')]}, ('SetVar', None): {theirs[('DelegateParmTop_C', 'Var')]},
+            ('CallMine', None): {mine[('Mine', 'M')]}}
+    got = {k: mine.get(k) for k in want}
+    assert got == want, (got, want)
+    assert zs[('Use', 'D')] == theirs[('Use', 'D')], (zs, theirs)
+    for b, path in ((base, theirs[('Use', 'D')]), (base, sibs[('Sib', 'S')]), (zkid, theirs[('Use', 'D')])):
+        assert path in import_paths(b) and path.rsplit(':', 1)[1] not in exports_of(b), (os.path.basename(b), path)
+    vm = VM(base, {})
+    h, s = Obj('DelegateParmHelper_C', Got=0), Obj('DelegateParmSib_C')
+    vm.self.vars.update(H=h, S=s)
+    ping = ('delegate', 'Ping', h)
+    for fn in ('CallTake', 'CallUse', 'CallSib', 'SetVar'):
+        vm.call(fn)
+    calls = [(n, c, a) for n, c, a in vm.log if n in ('Take', 'Sib', 'K2_SetTimerDelegate')]
+    assert calls == [('Take', vm.self, [ping]), ('K2_SetTimerDelegate', vm.self, [ping, 2.0, False, 0.0, 0.0]),
+                     ('Sib', s, [ping])], calls
+    assert vm.self.vars['Var'] == ping, vm.self.vars
+
+
+def delegate_parm_spell():
+    """One delegate type spelled two ways is one type (DelegateParmSpell): DelegateParmSpellTop spells it
+    TDelegate<void(int32)>, the overrides of Use and Take's out-of-line definition TDelegate<void(int)>, as does the
+    operator= clang declares for `Held = D`, which compiles. Top makes one signature function for it, which its variable,
+    its functions' parameters, the overrides' parameters (DelegateParmSpell is generated before Top, DelegateParmSpellZKid
+    after) and the values handed to Take all name, the subclasses importing it from a Top that exports it
+    (keeps_invariants: imports_resolve, func_override_params). A value bound on another object and assigned to a variable
+    through another object is typed with that variable's signature: Top's Held through Peer and through GetPeer(), the
+    sibling's SibVar through S; so is the local Held is parked in for `GetPeer()->Held = Held`, and the one the comma
+    value `(Bump(), Held)` handed to Peer's Take is held in, if it is kept. Neither subclass makes a signature of its
+    own, named or not. Each value reaches where it goes, and the one stored through GetPeer() binds the H it had before
+    GetPeer replaced it, as C++ sequences the right side first."""
+    base = asset('DelegateParmSpell')
+    here = os.path.dirname(base)
+    top, zkid, sib = (os.path.join(here, c) for c in ('DelegateParmSpellTop', 'DelegateParmSpellZKid', 'DelegateParmSpellSib'))
+    for b in (base, top, zkid, sib):
+        keeps_invariants(b)
+    mine, theirs, sibs, zs = delegate_sigs(base), delegate_sigs(top), delegate_sigs(sib), delegate_sigs(zkid)
+    held, sibvar = theirs[('DelegateParmSpellTop_C', 'Held')], sibs[('DelegateParmSpellSib_C', 'SibVar')]
+    assert {theirs[('Use', 'D')], theirs[('Take', 'T')]} == {held}, theirs
+    assert [e for e in exports_of(top) if e.endswith('__DelegateSignature')] == [held.rsplit(':', 1)[1]], exports_of(top)
+    want = {('Use', 'D'): held, ('CallTake', None): {held}, ('SetPeer', None): {held}, ('SetGotPeer', None): {held},
+            ('CopyGotPeer', None): {held}, ('SetSib', None): {sibvar}}
+    assert {k: mine.get(k) for k in want} == want, (mine, want)
+    assert mine.get(('CommaTake', None), {held}) == {held}, mine
+    want = {('Use', 'D'): held, ('CallTake', None): {held}, ('SetPeer', None): {held}}
+    assert {k: zs.get(k) for k in want} == want, (zs, want)
+    for b in (base, zkid):
+        assert not [e for e in exports_of(b) if e.endswith('__DelegateSignature')], (os.path.basename(b), exports_of(b))
+    h, h2 = Obj('DelegateParmSpellHelper_C', Got=0), Obj('DelegateParmSpellHelper_C', Got=0)
+    s, peer = Obj('DelegateParmSpellSib_C'), Obj('DelegateParmSpellTop_C')
+    ping = ('delegate', 'PingI', h)
+    vm = VM(top, {})
+    vm.call('Take', ping)
+    assert vm.self.vars['Held'] == ping, vm.self.vars
+    vm = VM(base, {})
+    vm.self.vars.update(H=h, H2=h2, S=s, Peer=peer)
+    vm.call('Use', ping)
+    assert vm.self.vars['Held'] == ping, vm.self.vars
+    for fn in ('CallTake', 'SetPeer', 'SetSib'):
+        vm.call(fn)
+    assert [(n, c, a) for n, c, a in vm.log if n == 'Take'] == [('Take', vm.self, [ping])], vm.log
+    assert peer.vars['Held'] == ping and s.vars['SibVar'] == ping, (peer.vars, s.vars)
+    peer.vars.clear()
+    vm.call('SetGotPeer')
+    assert peer.vars['Held'] == ping and vm.self.vars['H'] is h2, (peer.vars, vm.self.vars)
+    peer.vars.clear()
+    vm.call('CopyGotPeer')
+    del vm.log[:]
+    vm.call('CommaTake')
+    assert peer.vars['Held'] == ping and vm.self.vars['Bumps'] == 1, (peer.vars, vm.self.vars)
+    assert [(n, c, a) for n, c, a in vm.log if n == 'Take'] == [('Take', peer, [ping])], vm.log
+    peer.vars.clear()
+    vm = VM(zkid, {})
+    vm.self.vars.update(H=h, Peer=peer)
+    vm.call('CallTake')
+    vm.call('SetPeer')
+    assert [(n, c, a) for n, c, a in vm.log if n == 'Take'] == [('Take', peer, [ping])], vm.log
+    assert peer.vars['Held'] == ping, peer.vars
+
+
+def delegate_sig_parms(base, path):
+    """The properties of the signature function at path, which the package at base exports: [(name, property type, its
+    Parm / OutParm / ReturnParm / ReferenceParm flags, what it holds: an array's element type, a struct's or an enum's
+    path)]."""
+    import invariants
+    pkg = invariants.Package(base)
+    fn = path.rsplit(':', 1)[1]
+    at = [i for i in range(len(pkg.exports)) if pkg.exports[i]['name'] == fn and pkg.class_of(i + 1) == 'Function']
+    assert len(at) == 1, (os.path.basename(base), path)
+    return [(p.name, p.type, p.flags & 0x8000580, p.subs[0].type if p.subs else pkg.path(p.ref) if p.ref else None)
+            for p in pkg.struct(at[0]).props]
+
+
+def delegate_parm_keys():
+    """Which delegate types are one (DelegateParmKeys). A UE_ENUM in a namespace spelled short, qualified and from the
+    global namespace is one type: DelegateParmKeysTop makes one signature function for it, which its variable, its
+    functions' parameters - Take declared short and defined qualified -, the overrides' parameters (DelegateParmKeys is
+    generated before Top, DelegateParmKeysZKid after), the values handed to Take, the one set through Peer and those
+    stored into an element of Top's TArray and TMap, on this object and on Peer, all name, the subclasses importing it
+    from a Top that exports it (keeps_invariants: imports_resolve, func_override_params);
+    `Held = D` across two spellings compiles, and the comma value handed to Take is held in a local of that signature,
+    if one at all. Neither subclass makes a signature of its own. DelegateParmKeysKinds keeps what C++ keeps apart apart,
+    a signature function each, every one named by its variables: int and int64, uint8 and a uint8 enum, two enums, a
+    value and a reference, a reference and a const one, a return value and none; int32 and int, TArray<int32> and
+    TArray<int>, and an enum spelled short and qualified are one each. Each signature's properties are the type's. Each
+    value reaches where it goes."""
+    base = asset('DelegateParmKeys')
+    here = os.path.dirname(base)
+    top, kinds = (os.path.join(here, 'DelegateParmKeysNs', c) for c in ('DelegateParmKeysTop', 'DelegateParmKeysKinds'))
+    zkid = os.path.join(here, 'DelegateParmKeysZKid')
+    for b in (base, top, zkid, kinds):
+        keeps_invariants(b)
+    mine, theirs, zs, ks = delegate_sigs(base), delegate_sigs(top), delegate_sigs(zkid), delegate_sigs(kinds)
+    held = theirs[('DelegateParmKeysTop_C', 'Held')]
+    assert {theirs[('Use', 'D')], theirs[('Take', 'T')]} == {held}, theirs
+    assert [e for e in exports_of(top) if e.endswith('__DelegateSignature')] == [held.rsplit(':', 1)[1]], exports_of(top)
+    want = {('Use', 'D'): held, ('CallTake', None): {held}, ('SetPeer', None): {held}, ('SetPicks', None): {held},
+            ('SetByKey', None): {held}}
+    assert {k: mine.get(k) for k in want} == want, (mine, want)
+    assert mine.get(('CommaTake', None), {held}) == {held}, mine
+    want = {('Use', 'D'): held, ('CallTake', None): {held}}
+    assert {k: zs.get(k) for k in want} == want, (zs, want)
+    for b in (base, zkid):
+        assert not [e for e in exports_of(b) if e.endswith('__DelegateSignature')], (os.path.basename(b), exports_of(b))
+    v = {n: ks[('DelegateParmKeysKinds_C', n)] for n in ('I32', 'I', 'I64', 'U8', 'En', 'Mode', 'ModeQ', 'VecVal', 'VecCRef',
+                                                         'VecRef', 'RetI', 'RetV', 'ArrA', 'ArrB')}
+    assert v['I32'] == v['I'] and v['ArrA'] == v['ArrB'] and v['Mode'] == v['ModeQ'], v
+    apart = [v[n] for n in ('I32', 'I64', 'U8', 'En', 'Mode', 'VecVal', 'VecCRef', 'VecRef', 'RetI', 'RetV', 'ArrA')]
+    assert len(set(apart)) == len(apart), v
+    assert sorted(e for e in exports_of(kinds) if e.endswith('__DelegateSignature')) == sorted(p.rsplit(':', 1)[1] for p in apart), \
+        exports_of(kinds)
+    parm, ref, ret = 0x80, 0x8000180, 0x580
+    sigs = {n: delegate_sig_parms(kinds, v[n]) for n in v}
+    assert sigs['I32'] == [('Param0', 'IntProperty', parm, None)], sigs['I32']
+    assert sigs['I64'] == [('Param0', 'Int64Property', parm, None)], sigs['I64']
+    assert sigs['U8'] == [('Param0', 'ByteProperty', parm, None)], sigs['U8']
+    for n, e in (('En', '.EDpkKey'), ('Mode', '.EDpkMode')):
+        assert [s[:3] for s in sigs[n]] == [('Param0', 'ByteProperty', parm)] and sigs[n][0][3].endswith(e), sigs[n]
+    assert sigs['VecVal'] == [('Param0', 'StructProperty', parm, '/Script/CoreUObject.Vector')], sigs['VecVal']
+    for n in ('VecRef', 'VecCRef'):
+        assert sigs[n] == [('Param0', 'StructProperty', ref, '/Script/CoreUObject.Vector')], sigs[n]
+    assert sigs['RetI'] == [('ReturnValue', 'IntProperty', ret, None)], sigs['RetI']
+    assert sigs['RetV'] == [], sigs['RetV']
+    assert sigs['ArrA'] == [('Param0', 'ArrayProperty', parm, 'IntProperty')], sigs['ArrA']
+    h, peer = Obj('DelegateParmKeysHelper_C', Got=0), Obj('DelegateParmKeysTop_C')
+    pick = ('delegate', 'Pick', h)
+    vm = VM(top, {})
+    vm.call('Take', pick)
+    assert vm.self.vars['Held'] == pick, vm.self.vars
+    vm = VM(base, {})
+    vm.self.vars.update(H=h, Peer=peer)
+    vm.call('Use', pick)
+    assert vm.self.vars['Held'] == pick, vm.self.vars
+    vm.call('CallTake')
+    vm.call('SetPeer')
+    assert peer.vars['Held'] == pick, peer.vars
+    vm.call('CommaTake')
+    assert vm.self.vars['Bumps'] == 1, vm.self.vars
+    assert [(n, c, a) for n, c, a in vm.log if n == 'Take'] == [('Take', peer, [pick])] * 2, vm.log
+    vm.self.vars.update(Picks=[None], ByKey={})
+    peer.vars.update(Picks=[None], ByKey={})
+    vm.call('SetPicks')
+    vm.call('SetByKey')
+    assert vm.self.vars['Picks'] == [pick] and vm.self.vars['ByKey'] == {2: pick}, vm.self.vars
+    assert peer.vars['Picks'] == [pick] and peer.vars['ByKey'] == {1: pick}, peer.vars
+    vm = VM(zkid, {})
+    vm.self.vars.update(H=h, Peer=peer)
+    vm.call('Use', pick)
+    vm.call('CallTake')
+    assert vm.self.vars['Held'] == pick, vm.self.vars
+    assert [(n, c, a) for n, c, a in vm.log if n == 'Take'] == [('Take', peer, [pick])], vm.log
+
+
 def dispatch_native_callable():
     """A native dispatcher the engine marks BlueprintCallable (AFSDGameState::OnTerrainGenerated, one of FSD's 41) is
     one the editor's Call node takes. UeApi does not say which signature function it names (the dump does not link a
@@ -7474,6 +7683,16 @@ delegate_callable_rpc()
 print('ok  DelegateCallableRpc: an RPC the engine marks BlueprintCallable binds on another object and on this one')
 delegate_not_callable_refusals()
 print('ok  delegate not-callable refusals: OnRep_Instigator, which UeApi\'s NotCallable.json names, is bound on no object')
+delegate_parm_sig()
+print('ok  DelegateParmSig: an override\'s TDelegate parameter, and a value handed to a mod parent\'s, a sibling\'s or a '
+      'parent\'s variable, name the declaring class\'s signature, imported, and still reach where they go')
+delegate_parm_spell()
+print('ok  DelegateParmSpell: a delegate type spelled with int32 and with int is one signature function, and a value set '
+      'through another object names its variable\'s')
+delegate_parm_keys()
+print('ok  DelegateParmKeys: an enum spelled short, qualified or from the global namespace is one delegate type, the '
+      'types C++ keeps apart get a signature function each, and a value stored into a parent\'s TArray or TMap names '
+      'its element\'s')
 dispatch_native_callable()
 native_dispatcher_refusals()
 print('ok  native dispatchers: Broadcast on a BlueprintCallable one names a signature of the class\'s own with its '
