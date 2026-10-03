@@ -18,7 +18,8 @@ import yaml
 from bpbuild import GENERATED, MOD_PACKAGE, write_vs_filters
 
 BP = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "BpMods"))
-THEME_FILE = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "bpclass.theme")
+# One Textual theme for every terminal UI of the user's: each reads it on start and writes it when changed.
+THEME_FILE = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"), ".config"), "textual.theme")
 CLASS = re.compile(r'^[ \t]*class\s+(\w+)(?:\s+final)?\s*:\s*(?:public\s+)?(\w+)', re.M)
 API_CLASS = re.compile(r'^class\s+(\w+)\b[^;\n]*$', re.M)
 INCLUDE = re.compile(r'(#include\s+")([^"]+)(")')
