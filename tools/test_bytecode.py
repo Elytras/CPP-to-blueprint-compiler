@@ -9140,6 +9140,45 @@ print('ok  AssetSetFresh: a mod asset\'s TSet / TMap in a struct member its clas
       '`T()`, loads over the UE_STRUCT\'s default instance and drops its elements; so does a child\'s UE_DEFAULTS')
 
 
+def asset_other_class():
+    """An asset of another mod's class loads over that class's CDO, in the owner's package (AssetOtherOwner), whose
+    value of a TSet / TMap the shared header says (AssetOtherShared.h): AS_AouOver's S and M load {3} and {a: 5}, not
+    the union with UAosDef's {1, 2} and {a: 1, c: 3}; AS_AouKid's {5, 6} lies over UAosKid's UE_DEFAULTS {2, 5}, from
+    the header too; AS_AouNamed's class is pinned with UE_CLASS and an initializer. UAouLocal, a class of this mod
+    under UAosDef, starts its UE_DEFAULTS M = {{"c", 4}} from the header's value, and AS_AouLocal from both. A game
+    class's CDO holds what no header says: AS_AouNative and UAouEnemy's UE_DEFAULTS leave its elements to load, and a
+    warning names the member."""
+    user = os.path.dirname(pending_asset('AssetOtherUser', 'AS_AouOver'))
+    owner = os.path.join(os.path.dirname(os.path.dirname(asset('AssetOtherOwner'))), 'AssetOtherOwner')
+
+    def cdo(base, cls, path, kind, start):
+        pkg = invariants.Package(os.path.join(base, cls))
+        return loaded_container(pkg, pkg.find('Default__%s_C' % cls), path, kind, start)
+    base_s, base_m = cdo(owner, 'UAosDef', 'S', 'set', set()), cdo(owner, 'UAosDef', 'M', 'map', {})
+    assert (base_s, base_m) == ({1, 2}, {'a': 1, 'c': 3}), (base_s, base_m)
+    kid_s = cdo(owner, 'UAosKid', 'S', 'set', base_s)
+    local_s, local_m = cdo(user, 'UAouLocal', 'S', 'set', base_s), cdo(user, 'UAouLocal', 'M', 'map', base_m)
+    assert local_m == {'c': 4}, 'UAouLocal\'s CDO loads M = %s over UAosDef\'s %s; C++ says {c: 4}' % (local_m, base_m)
+    for name, path, kind, start, want in (
+            ('AS_AouOver', 'S', 'set', base_s, {3}),
+            ('AS_AouOver', 'M', 'map', base_m, {'a': 5}),
+            ('AS_AouKid', 'S', 'set', kid_s, {5, 6}),
+            ('AS_AouLocal', 'S', 'set', local_s, {7}),
+            ('AS_AouLocal', 'M', 'map', local_m, {'a': 2}),
+            ('AS_AouNamed', 'S', 'set', cdo(owner, 'UAosNamed', 'S', 'set', set()), {3})):
+        base = os.path.join(user, name)
+        keeps_invariants(base)
+        pkg = invariants.Package(base)
+        got = loaded_container(pkg, pkg.find(name), path, kind, start)
+        assert got == want, '%s loads %s = %s over its CDO\'s %s; C++ says %s' % (name, path, got, start, want)
+    for where in ('AS_AouNative.BannedMissionTypes', 'UAouEnemy::UE_DEFAULTS: BannedMissionTypes'):
+        assert 'warning: %s: UEnemyDescriptor\'s default object holds a value' % where in LOGS['AssetOtherUser'], \
+            LOGS['AssetOtherUser']
+
+
+pending('AssetOtherUser', asset_other_class)
+
+
 def uds_init_defaults():
     """Every member initializer of a UE_STRUCT is in its default instance, the Data stream the engine copies into each
     new value of the struct (UUserDefinedStruct::InitializeStruct). A member at its type's default may be left out, and
