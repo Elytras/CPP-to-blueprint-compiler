@@ -9181,6 +9181,31 @@ print('ok  AssetOtherUser: an asset of another mod\'s class, and a UE_DEFAULTS u
       'shared header gives and the braces drop as removed; over a game class\'s CDO a warning names the member')
 
 
+def asset_map_dup_keys():
+    """A key a map's braces give twice holds the last value given, as TMap's initializer-list constructor Adds each pair
+    in order (Map.h 1166-1173). AS_AmdOver's {{"a", 1}, {"a", 2}} over UAmdDef's {a: 2, c: 3} loads {a: 2}, AS_AmdLast's
+    {{"c", 7}, {"c", 3}} loads {c: 3}, and UAmdKid's UE_DEFAULTS {{"a", 5}, {"a", 2}} gives its CDO {a: 2}: checked one
+    pair at a time against the CDO's, the last pair equals it and was dropped, leaving the first. AS_AmdOver's set
+    {3, 3} loads {3}."""
+    here = os.path.dirname(pending_asset('AssetMapDupKeys', 'UAmdDef'))
+    cls = invariants.Package(os.path.join(here, 'UAmdDef'))
+    cdo = cls.find('Default__UAmdDef_C')
+    base_m, base_s = loaded_container(cls, cdo, 'M', 'map', {}), loaded_container(cls, cdo, 'S', 'set', set())
+    for pkg, row, path, kind, start, want in (
+            ('AS_AmdOver', 'AS_AmdOver', 'M', 'map', base_m, {'a': 2}),
+            ('AS_AmdOver', 'AS_AmdOver', 'S', 'set', base_s, {3}),
+            ('AS_AmdLast', 'AS_AmdLast', 'M', 'map', base_m, {'c': 3}),
+            ('UAmdKid', 'Default__UAmdKid_C', 'M', 'map', base_m, {'a': 2})):
+        base = os.path.join(here, pkg)
+        keeps_invariants(base)
+        p = invariants.Package(base)
+        got = loaded_container(p, p.find(row), path, kind, start)
+        assert got == want, '%s loads %s = %s over %s; C++ says %s' % (row, path, got, start, want)
+
+
+pending('AssetMapDupKeys', asset_map_dup_keys)
+
+
 def uds_init_defaults():
     """Every member initializer of a UE_STRUCT is in its default instance, the Data stream the engine copies into each
     new value of the struct (UUserDefinedStruct::InitializeStruct). A member at its type's default may be left out, and
@@ -10012,7 +10037,18 @@ def edit_deps_completed():
     assert not found, '%d findings, e.g. %s' % (len(found), '; '.join(found[:2]))
 
 
-def edit_whole_containers():
+MAP_PATCH_CASES = (('Ids = {7};\n    Score = {{"a", 9}};', {('Ids',): {7}, ('Score',): {'a': 9}}),
+                   ('Ids = {1, 7};\n    Score = {{"a", 1}, {"b", 2}};', {('Ids',): {1, 7}, ('Score',): {'a': 1, 'b': 2}}),
+                   ('Held.Ids = {7};\n    Deep.In.Score = {{"a", 9}};', {('Held', 'Ids'): {7}, ('Deep', 'In', 'Score'): {'a': 9}}),
+                   ('Held = {{1, 7}, {{"a", 1}, {"b", 2}}, 3};\n    Deep = {{{7}, {{"c", 3}}, 3}, 4};',
+                    {('Held', 'Ids'): {1, 7}, ('Held', 'Score'): {'a': 1, 'b': 2}, ('Deep', 'In', 'Ids'): {7},
+                     ('Deep', 'In', 'Score'): {'c': 3}}))
+# A key given twice holds the last value, as TMap's initializer-list constructor Adds each pair in order (Map.h
+# 1166-1173): the second pair equals the archetype's a: 1, and checked alone it was dropped, leaving a: 9.
+MAP_PATCH_DUP_KEYS = (('Score = {{"a", 9}, {"a", 1}};', {('Score',): {'a': 1}}),)
+
+
+def edit_whole_containers(cases=MAP_PATCH_CASES):
     """S38: a patch's whole TSet / TMap is what the edited default object loads. Its tag is a delta against the
     archetype, the parent Blueprint's CDO: the loader copies that value in, takes out the elements the tag lists as
     removed, then adds the rest (PropertySet.cpp 285-358, PropertyMap.cpp 316-400), as for a mod class's own
@@ -10039,12 +10075,7 @@ def edit_whole_containers():
         return {p: loaded_container(child, cc, p, kinds[p], loaded_container(parent, pc, p, kinds[p], set() if kinds[p] == 'set' else {}))
                 for p in paths}
     vanilla = loads(invariants.Package(os.path.join(game, '_ElytrasMods', 'PropSetDelta', 'PropSetDelta')))
-    for body, assigned in (('Ids = {7};\n    Score = {{"a", 9}};', {('Ids',): {7}, ('Score',): {'a': 9}}),
-                           ('Ids = {1, 7};\n    Score = {{"a", 1}, {"b", 2}};', {('Ids',): {1, 7}, ('Score',): {'a': 1, 'b': 2}}),
-                           ('Held.Ids = {7};\n    Deep.In.Score = {{"a", 9}};', {('Held', 'Ids'): {7}, ('Deep', 'In', 'Score'): {'a': 9}}),
-                           ('Held = {{1, 7}, {{"a", 1}, {"b", 2}}, 3};\n    Deep = {{{7}, {{"c", 3}}, 3}, 4};',
-                            {('Held', 'Ids'): {1, 7}, ('Held', 'Score'): {'a': 1, 'b': 2}, ('Deep', 'In', 'Ids'): {7},
-                             ('Deep', 'In', 'Score'): {'c': 3}})):
+    for body, assigned in cases:
         with tempfile.TemporaryDirectory() as tmp:
             proc, content = compile_edit(tmp, 'MapPatch', EDIT_HEAD + 'UE_MOD_PACKAGE("/Game/_ElytrasMods/MapPatch");\n' + decl
                                          + 'class Tweaks : public PropSetDelta {\n  UE_PATCH;\n'
@@ -10296,6 +10327,7 @@ if not globals().get('EDITS_EXPLORE'):     # set by the dev loop's exploration d
     edit_whole_containers()
     print('ok  MapPatch: a patch\'s whole TSet / TMap loads as written, a property or one inside a struct (by a member '
           'path or in a whole struct): the archetype\'s elements it drops are listed as removed')
+    pending('MapPatchDupKeys', lambda: edit_whole_containers(MAP_PATCH_DUP_KEYS))
 
 
 PREFETCH.finish()
