@@ -4180,7 +4180,7 @@ Notes:
 | `int32 GetPriority() { return 1; }` on the interface | A default implementation. A class that leaves the function out gets this body, with `this` being that class, instead of an empty stub. Blueprint Interface functions have no bodies in the editor. | Yes |
 | `class IMarkable : public IAimable { public: UE_INTERFACE; ... };` | An interface that extends one other. A class that lists IMarkable alone implements both: a cast to either succeeds, and it gets stubs for the parent's functions it leaves out. | Yes |
 | `class IPriorityTarget : public ITargetable { public: UE_INTERFACE; ... };` | A mod interface that extends a game interface (FSD's Targetable). An implementer gets the game interface's functions too, checked against Events.json. | Yes |
-| `int32 Marks = 3;` on the interface | A variable on an interface, AssetGen's own feature: the engine's interfaces hold no state. It becomes a property of every class that directly implements the interface, not declared again in their subclasses. The initializer is its default, and the implementer's or a subclass's UE_DEFAULTS can set another; a subclass's TSet or TMap is written over the implementer's value, as any inherited one is. | Yes |
+| `int32 Marks = 3;` on the interface | A variable on an interface, AssetGen's own feature: the engine's interfaces hold no state. It becomes a property of every class that directly implements the interface, not declared again in their subclasses. The initializer is its default, and the implementer's or a subclass's UE_DEFAULTS can set another; a subclass's TSet or TMap is written over the implementer's value, as any inherited one is. Its name is held to the implementer's as its own variables are: one its parents already have (`Tags` on an actor), or that a subclass declares again, is refused. | Yes |
 | `UTurretDef TD_Big = {{}, {.Marks = 5}, 100};` | A data asset of a class that implements IMarkable gives the interface's variables in the interface's own braces, after the base's (here UPrimaryDataAsset's `{}`), then the class's own members. | Yes |
 | `UE_REPLICATED_USING(int32, Score, OnRep_Score);` on the interface | A replicated variable. Each implementing class gets the replicated property and an OnRep_Score of its own: its own definition, else the interface's body, else an empty stub. See [Replication](#replication). | Yes |
 | `TScriptInterface<IMarkable> M = Other; return M->Marks;` | Refused: "Marks is a variable of the interface IMarkable, which holds no state itself". Read it through an object of an implementing class, or declare a getter function on the interface. | Refused |
@@ -5765,7 +5765,9 @@ and where the feature is described. In each group, the messages you are most lik
   NONE. Fix: rename it. See [Overloading](#overloading).
 - `<Class>::<Name>: <Ancestor> already has a variable <Name>, and an FName ignores case; rename it` (or `a function`):
   a member reusing a name the parent chain has, in any case. Overriding a function under its exact name is fine. To
-  change an inherited variable's default, assign it in `UE_DEFAULTS`. See [Class defaults](#class-defaults).
+  change an inherited variable's default, assign it in `UE_DEFAULTS`. A mod interface's variables count as the
+  implementing class's own: one named `Tags` on an actor is refused the same way (`<Class>` is the implementer). See
+  [Class defaults](#class-defaults).
 - `<Class>::<Function>: <N> parameters, the return value included; a function takes at most 255`: the engine counts a
   function's parameters in one byte. Fix: pass a struct instead of the long list.
 - `<Class>::<Function>: its parameters take <N> bytes; a function's parameter block holds at most 65535`: the engine

@@ -9731,7 +9731,9 @@ def interface_var_names():
     refused('IvnKid', '  int32 Level = 0;\n', 'IvnKid::Level: IvnImpl already has a variable Level', top=impl, base='IvnImpl')
 
 
-pending('InterfaceVarNames', interface_var_names)
+interface_var_names()
+print('ok  InterfaceVarNames: a mod interface\'s variable is held to its implementer\'s names, AActor\'s Tags among them, '
+      'and a subclass of the implementer to the interface\'s')
 
 
 def uds_init_defaults():

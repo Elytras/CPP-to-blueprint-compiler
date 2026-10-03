@@ -9672,7 +9672,17 @@ bool FCompiler::CheckMemberNames(const FRecord& R, std::string* Err) const
             : ": differs from " + It->second.first + " only in case, and an FName ignores case; rename one");
         return false;
     };
-    for (const Json* F : R.Fields) if (!Claim(Name(*F), false)) return false;
+    /* A class's variables: its fields, and the variables of each mod interface it lists (or one those extend), which
+       it holds as its own properties (Generate's OwnedFields). */
+    auto Held = [&](const FRecord& C) {
+        std::vector<const Json*> Out(C.Fields.begin(), C.Fields.end());
+        if (!C.bIsInterface)
+            for (const std::string& I : C.Interfaces)
+                for (const FRecord* Link : InterfaceChain(Find(I)))
+                    if (Link->bIsInterface) Out.insert(Out.end(), Link->Fields.begin(), Link->Fields.end());
+        return Out;
+    };
+    for (const Json* F : Held(R)) if (!Claim(Name(*F), false)) return false;
     for (const Json* M : R.AllMethods)
         if (!M->value("inline", false) && !IsInlineMethod(R, Name(*M)) && !Claim(Name(*M), true)) return false;
     /* A class's latent calls resume through its ubergraph, found by name on the object (most derived first), so a
@@ -9707,7 +9717,7 @@ bool FCompiler::CheckMemberNames(const FRecord& R, std::string* Err) const
                  + N + ", and an FName ignores case; rename it";
             return false;
         };
-        for (const Json* F : A->Fields) if (!Inherited(Name(*F), false)) return false;
+        for (const Json* F : Held(*A)) if (!Inherited(Name(*F), false)) return false;
         for (const auto& [N, D] : A->Methods)
             if (!D->value("inline", false) && !IsInlineMethod(*A, N) && !Inherited(N, true)) return false;
     }
