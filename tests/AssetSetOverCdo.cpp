@@ -37,5 +37,7 @@ public:
 UAsocDef AS_AsocOver = {.S = {3}, .M = {{"a", 5}, {"b", 2}}, .H = {.Ids = {2, 3}, .Score = {{"a", 5}, {"b", 2}}, .N = 3}, .A = {3}};
 // C++: S and M empty.
 UAsocDef AS_AsocEmpty = {.S = {}, .M = {}};
+// C++: H.Ids and H.Score empty, as FAsocHeld makes them, over the CDO's {1, 2} and {a: 1, c: 3}.
+UAsocDef AS_AsocLeft = {.H = {.N = 5}};
 // C++: S {5, 6}.
 UAsocKid AS_AsocKid = {{.S = {5, 6}}};

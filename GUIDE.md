@@ -811,7 +811,8 @@ Full rules: [Structs](REFERENCE.md#structs), [Enums](REFERENCE.md#enums), [Conta
 A data asset class is a mod class that derives from `UPrimaryDataAsset` or `UDataAsset`. Keep its members public, so
 that C++ accepts braces for it. A namespace-scope variable of that class with a braced initializer is cooked as an
 asset at `<mod package>/<Name>`, as creating a Data Asset in the Content Browser and filling in its details would. Only
-the members the braces name are written; the rest keep the class defaults. The class can also be a game class, such as
+the members the braces name are written; the rest keep the class defaults. A `TSet` or `TMap` member's braces are its
+whole value, not elements added to the class default's. The class can also be a game class, such as
 `UEnemyDescriptor`. `&Name` points at the asset: in a variable's default, in a container default, or in a function
 body.
 

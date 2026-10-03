@@ -8969,8 +8969,9 @@ def asset_set_over_cdo():
     the cook writes a game object over its archetype that way too (ENE_Spider_Lobber's HealthComponent lists its
     archetype's three Resistances as removed). AS_AsocOver's S, M, and the set and map in its struct member H load as the
     braces give them, not the union with the CDO's; its TArray A is replaced whole (PropertyArray.cpp 199). AS_AsocEmpty's
-    `{}` loads empty, and AS_AsocKid's S lies over its class's UE_DEFAULTS value {2, 5}, not the declaration's."""
-    here = os.path.dirname(pending_asset('AssetSetOverCdo', 'UAsocDef'))
+    `{}` loads empty, AS_AsocLeft's braces for H leave its set and map empty as the struct makes them, and AS_AsocKid's S
+    lies over its class's UE_DEFAULTS value {2, 5}, not the declaration's. Before the fix each loaded the union."""
+    here = os.path.dirname(asset('AssetSetOverCdo'))
     cls, kid = (invariants.Package(os.path.join(here, n)) for n in ('UAsocDef', 'UAsocKid'))
     cdo, kcdo = cls.find('Default__UAsocDef_C'), kid.find('Default__UAsocKid_C')
 
@@ -8983,6 +8984,8 @@ def asset_set_over_cdo():
             ('AS_AsocOver', ('H', 'Score'), 'map', cdo_value(('H', 'Score'), 'map'), {'a': 5, 'b': 2}),
             ('AS_AsocEmpty', ('S',), 'set', cdo_value(('S',), 'set'), set()),
             ('AS_AsocEmpty', ('M',), 'map', cdo_value(('M',), 'map'), {}),
+            ('AS_AsocLeft', ('H', 'Ids'), 'set', cdo_value(('H', 'Ids'), 'set'), set()),
+            ('AS_AsocLeft', ('H', 'Score'), 'map', cdo_value(('H', 'Score'), 'map'), {}),
             ('AS_AsocKid', ('S',), 'set', loaded_container(kid, kcdo, ('S',), 'set', cdo_value(('S',), 'set')), {5, 6})):
         base = os.path.join(here, name)
         keeps_invariants(base)
@@ -8994,7 +8997,9 @@ def asset_set_over_cdo():
     assert struct.unpack('<ii', a['value']) == (1, 3), a['value'].hex()
 
 
-pending('AssetSetOverCdo: a mod asset\'s TSet / TMap lists its CDO\'s elements it drops as removed', asset_set_over_cdo)
+asset_set_over_cdo()
+print('ok  AssetSetOverCdo: a mod asset\'s TSet / TMap, a member or one in a struct member, lists its class\'s CDO\'s '
+      'elements it drops as removed, and loads as its braces say, not the union; a TArray is replaced whole')
 
 
 def uds_init_defaults():

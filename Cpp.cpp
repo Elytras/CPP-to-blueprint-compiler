@@ -1838,6 +1838,8 @@ private:
     const FRecord* ParentInitOf = nullptr;
     bool ParentValueFresh(const FRecord& R, const Json& Lhs, const Json*& Braces, const FRecord*& BracesOf) const;
     bool ValueFreshFrom(const FRecord* From, const std::string& Id, const Json*& Braces, const FRecord*& BracesOf) const;
+    bool DiffAgainstDefaultObject(const FRecord* From, const std::string& Id, FPropertyDef& PD, FBlueprintClass& BP,
+                                  std::string* Err);
     std::map<std::string, std::vector<std::pair<std::string, int64>>> ModEnums;  // UE_ENUM cooked here: enumerators
 
     /* Per-function state reset in Generate: whether this function needs the FDeref scratch
@@ -12028,6 +12030,37 @@ bool FCompiler::ValueFreshFrom(const FRecord* From, const std::string& Id, const
     return false;
 }
 
+/* PD, a value that holds a TSet or TMap (HoldsTaggedSetOrMap) and loads over the default object of From, made the delta
+   the loader reads there (DiffTaggedAgainstParent): a UE_DEFAULTS statement's over its parent's CDO, a mod asset's
+   braces over its class's (the asset's archetype). The default object's value of the member declared as Id is the
+   nearest UE_DEFAULTS from From up that sets it, else its initializer where it is declared. A native class on the way
+   holds one no header says, and there PD stays whole. */
+bool FCompiler::DiffAgainstDefaultObject(const FRecord* From, const std::string& Id, FPropertyDef& PD, FBlueprintClass& BP,
+                                         std::string* Err)
+{
+    FPropertyDef Parent = PD;
+    Parent.Default = FDefaultValue();
+    for (const FRecord* C = From; C && !C->IsNative(); C = C->Base.empty() ? nullptr : Find(C->Base))
+    {
+        const Json *Set = nullptr, *Value = nullptr, *Its = nullptr;
+        if (C->Defaults) ForEach(*C->Defaults, [&](const Json& B) { if (Kind(B) == "CompoundStmt") Its = &B; });
+        if (Its)
+            ForEach(*Its, [&](const Json& S) {
+                const Json *L = nullptr, *V = nullptr, *Through = nullptr;
+                if (DefaultAssignment(S, L, V, Through) && !Through && L->value("referencedMemberDecl", std::string()) == Id)
+                { Set = L; Value = V; }
+            });
+        const Json* Declared = nullptr;
+        for (const Json* F : C->Fields) if (F->value("id", std::string()) == Id) Declared = F;
+        if (!Set && !Declared) continue;
+        if (!(Set ? LowerDefault(*Set, Parent, BP, Err, Value, /*bKeepZero=*/true) : LowerDefault(*Declared, Parent, BP, Err)))
+            return false;
+        DiffTaggedAgainstParent(PD, Parent);
+        return true;
+    }
+    return true;
+}
+
 bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& BP, std::string* Err, const Json* Init,
                              bool bKeepZero)
 {
@@ -12955,8 +12988,9 @@ bool FCompiler::GenerateEnum(const std::string& Enum, const std::string& OutDir,
 /* The members a braced initializer of a Rec names, typed and lowered, in order. Measured on ED_Spider_Grunt: the
    semantic form lists the bases first, then every field in order, so a designator is found by position. A member
    the braces leave out is skipped. With Archetype, each value is written over that class's default object's, as a
-   UE_DEFAULTS statement's over its parent's: a zero is a value, and a struct member the braces leave out is fresh only
-   where the default object's value of it is (ValueFreshFrom). */
+   UE_DEFAULTS statement's over its parent's: a zero is a value, a struct member the braces leave out is fresh only
+   where the default object's value of it is (ValueFreshFrom), and a set or map lists the default object's elements it
+   drops as removed (DiffAgainstDefaultObject). */
 bool FCompiler::BracedMembers(const Json& List, const FRecord& Rec, const std::string& Where, FBlueprintClass& BP,
                               bool bKeepZero, std::vector<FPropertyDef>& Out, std::string* Err, const FRecord* Archetype)
 {
@@ -12981,6 +13015,10 @@ bool FCompiler::BracedMembers(const Json& List, const FRecord& Rec, const std::s
         if (Archetype)
             bParentFresh = ValueFreshFrom(Archetype, F->value("id", std::string()), ParentInit, ParentInitOf);
         if (!LowerDefault(*F, PD, BP, Err, Init, bKeepZero || Archetype)) return false;
+        /* A set or map tag loads as a delta over the default object's value (the loader copies it in, removes, then adds:
+           PropertySet.cpp 285-358, PropertyMap.cpp 316-400), so written whole it would load as the union of both. */
+        if (Archetype && HoldsTaggedSetOrMap(PD) && !DiffAgainstDefaultObject(Archetype, F->value("id", std::string()), PD, BP, Err))
+            return false;
         Out.push_back(PD);
     }
     return true;
@@ -14665,33 +14703,11 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 /* An inherited set or map loads over the parent CDO's value (PropertySet.cpp 285-358, PropertyMap.cpp
                    316-400: copied in, the listed removals taken out, the rest added), so written whole it would load as
                    the union of both; DiffAgainstParent writes it as the editor does. So does one inside an inherited
-                   struct written as tags (DiffTaggedAgainstParent). The parent's value is the nearest UE_DEFAULTS up the
-                   chain that sets the member, else its initializer where it is declared. A native class on the way
-                   holds one no header says, and there it stays whole. */
-                if (!bThroughComponent && HoldsTaggedSetOrMap(PD))
-                {
-                    const std::string Id = Lhs->value("referencedMemberDecl", std::string());
-                    FPropertyDef Parent = PD;
-                    Parent.Default = FDefaultValue();
-                    for (const FRecord* C = Find(R.Base); C && !C->IsNative(); C = C->Base.empty() ? nullptr : Find(C->Base))
-                    {
-                        const Json *Set = nullptr, *Value = nullptr, *Its = nullptr;
-                        if (C->Defaults) ForEach(*C->Defaults, [&](const Json& B) { if (Kind(B) == "CompoundStmt") Its = &B; });
-                        if (Its)
-                            ForEach(*Its, [&](const Json& S2) {
-                                const Json *L = nullptr, *V = nullptr, *Through = nullptr;
-                                if (DefaultAssignment(S2, L, V, Through) && !Through && L->value("referencedMemberDecl", std::string()) == Id)
-                                { Set = L; Value = V; }
-                            });
-                        const Json* Declared = nullptr;
-                        for (const Json* F : C->Fields) if (F->value("id", std::string()) == Id) Declared = F;
-                        if (!Set && !Declared) continue;
-                        if (!(Set ? LowerDefault(*Set, Parent, BP, Err, Value, /*bKeepZero=*/true) : LowerDefault(*Declared, Parent, BP, Err)))
-                        { bOk = false; return; }
-                        DiffTaggedAgainstParent(PD, Parent);
-                        break;
-                    }
-                }
+                   struct written as tags (DiffTaggedAgainstParent). DiffAgainstDefaultObject finds the parent's value. */
+                if (!bThroughComponent && HoldsTaggedSetOrMap(PD)
+                    && !DiffAgainstDefaultObject(R.Base.empty() ? nullptr : Find(R.Base), Lhs->value("referencedMemberDecl", std::string()),
+                                                 PD, BP, Err))
+                { bOk = false; return; }
                 /* A statement is the member's whole new value, as an assignment is in C++: one before it on the same
                    member is gone, not a tag under this one's (whose left-out members would load its values). */
                 if (!bThroughComponent)
