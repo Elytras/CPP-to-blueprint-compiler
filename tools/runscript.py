@@ -352,7 +352,9 @@ NATIVE_REFS = {'Conv_TextToString': (0,), 'Array_Append': (0, 1), 'Array_Identic
                'Conv_SoftClassReferenceToString': (0,), 'Conv_SoftObjectReferenceToObject': (0,),
                'Conv_SoftObjectReferenceToString': (0,), 'EqualEqual_SoftClassReference': (0, 1),
                'NotEqual_SoftClassReference': (0, 1), 'EqualEqual_SoftObjectReference': (0, 1),
-               'NotEqual_SoftObjectReference': (0, 1)}
+               'NotEqual_SoftObjectReference': (0, 1),
+               # KismetNodeHelperLibrary's `int32& Data`: P_GET_PROPERTY_REF, the place it writes
+               'MarkBit': (0,), 'ClearBit': (0,), 'ClearAllBits': (0,)}
 CONSTS = {0x17, 0x1D, 0x1E, 0x1F, 0x21, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2A, 0x2C, 0x2D, 0x34, 0x35}
 
 
@@ -550,6 +552,12 @@ CONTAINERS = {
     'Array_Find': lambda ev, store, a: _find(_made(ev, store, a[0], []), ev(a[1])),
     'Set_Contains': lambda ev, store, a: _has(_made(ev, store, a[0], []), ev(a[1])),
     'Map_Contains': lambda ev, store, a: _has(_made(ev, store, a[0], {}), ev(a[1])),
+    # Not containers, but they write their first argument: KismetNodeHelperLibrary's bit functions (KismetNodeHelperLibrary.cpp
+    # 12-38). An index past 31 does nothing, and BitIsMarked tests `> 0`, so bit 31 never reads as marked.
+    'BitIsMarked': lambda ev, store, a: ev(a[1]) < 32 and i32((1 << ev(a[1])) & ev(a[0])) > 0,
+    'MarkBit': lambda ev, store, a: ev(a[1]) < 32 and store(a[0], i32(ev(a[0]) | 1 << ev(a[1]))),
+    'ClearBit': lambda ev, store, a: ev(a[1]) < 32 and store(a[0], i32(ev(a[0]) & ~(1 << ev(a[1])))),
+    'ClearAllBits': lambda ev, store, a: store(a[0], 0),
 }
 
 # No map value is one of these: a container inside a map is the Value of a wrapper struct.

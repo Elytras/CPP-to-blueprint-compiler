@@ -363,6 +363,7 @@ Notes:
 | `USceneComponent *Spare;`, `TArray<UStaticMeshComponent *> Pieces;`, `FHitResult LastHit;` | A reference to a component or widget, or a container or struct that holds one, is flagged instanced, as the editor flags it, so an actor spawned from the class gets its own copy of what the class default points at, not the default's. | Yes |
 | `TSoftObjectPtr<T>`, `TSoftClassPtr<T>`, `TScriptInterface<I>` | Soft object and soft class references, and an interface reference. | Yes |
 | `TEnum<EMood>` | The enum itself, plus `.Name()` and `.String()`. See [TEnum](#tenum). | Yes |
+| `TEnumMask<EMood>` | An int32 bitmask over the enum, with `.Has()`, `.Add()`, `.Remove()` and `.Clear()`. See [TEnumMask](#tenummask). | Yes |
 | `FVector Home;`, `FAmmo Ammo;` | An engine or game struct, or a mod `UE_STRUCT`. See [Structs](#structs). | Yes |
 | `TArray<FVector>`, `TSet<int32>`, `TMap<FName, int32>` | Array, Set and Map variables. A container inside a container goes through a generated wrapper struct; see [Containers](#containers). | Yes |
 | `TSet<bool>`, `TMap<FText, int32>`, `TSet<FRotator>` | Refused: "cannot hash, and the engine hashes each one". A set element or map key must hash: not a bool, an FText or a delegate, and an engine struct only if it has a GetTypeHash (FVector, FGuid, FGameplayTag and others do; FRotator, FHitResult, FTransform do not). A `UE_STRUCT` always hashes. | Refused |
@@ -1036,6 +1037,31 @@ TEnum<EMood> Mood = EMood::Angry;
 
 FString Describe() { return "Mood: " + Mood.String(); }   // "Mood: Angry"
 FName MoodName(TEnum<EMood> M) { return M.Name(); }        // an EMood argument converts
+```
+
+### TEnumMask
+
+`TEnumMask<E>` (UeApi `Types.h`) is a Blueprint bitmask over an enum: an `int32` to the compiler, the same property the
+editor makes for a Bitmask variable over a Bitmask Flags enum. Bit N stands for the enumerator whose value is N, while
+the enum itself stays 0, 1, 2, ... Its methods are the bit functions of `KismetNodeHelperLibrary`, with the enumerator
+as the bit index. It converts to and from `int32` both ways, so whole masks combine with `|`, `&` and `~`. No editor
+metadata is written, because a cooked package carries none.
+
+| You write | What it does | Status |
+|---|---|---|
+| `TEnumMask<EMood> Moods = 0x21;` | An int32 variable, member, parameter or local. A member's default is the number. | Yes |
+| `Moods.Has(EMood::Angry)` | Whether the enumerator's bit is set: `BitIsMarked`. The engine tests `> 0`, so bit 31 never reads as set. | Yes |
+| `Moods.Add(M)`, `Moods.Remove(M)` | Set or clear the enumerator's bit: `MarkBit`, `ClearBit`. An enumerator past 31 does nothing. | Yes |
+| `Moods.Clear()` | Clear every bit: `ClearAllBits`. | Yes |
+| `int32(Moods)`, `Moods = Other \| 4;`, `if (Moods)` | Plain int32 reads and writes. | Yes |
+| `Map[K].Add(M)`, `GetMask().Clear()` on a `TEnumMask` | Refused ("writes the mask"): the three writers take the mask by reference, and Blueprint has no reference to a map element or a returned value. Copy it to a local, then store it back. | Refused |
+| A native enum whose values are already flags (1, 2, 4, ...) | Not what `TEnumMask` counts: bit N is value N. Test such an enum with `&` on an int32. | No |
+
+```cpp
+TEnumMask<EMood> Allowed = 0x21;                          // Calm (bit 0) and Angry (bit 5)
+
+bool CanBe(EMood M) { return Allowed.Has(M); }
+void Forbid(EMood M) { Allowed.Remove(M); }
 ```
 
 ## Structs
@@ -5438,6 +5464,7 @@ listed here is refused with "unimplemented intrinsic".
 | `UeAssets::<Class>::All` | Every game asset of that class, as soft pointers. | [Game assets](#game-assets) |
 | `UeAssets::<Class>::Game::...::<Name>` | A game asset by its content path, for `&` to point at. | [Game assets](#game-assets) |
 | `TEnum<E>` | An enum that is E to the compiler, with `.Name()` and `.String()`. | [TEnum](#tenum) |
+| `TEnumMask<E>` | An int32 bitmask over E, bit N for the enumerator of value N, with `.Has()`, `.Add()`, `.Remove()`, `.Clear()`. | [TEnumMask](#tenummask) |
 | `using FTarget = AActor;` | An alias of a class. A variable of it is still an object reference. | [Classes and variables](#classes-and-variables) |
 | `virtual` | Accepted and ignored: every mod method is called by name, so the most derived one runs. With `final`, see `final`; with `= 0`, see pure virtual. | [Functions](#functions) |
 | `WorldContextObject` argument left out | Filled with self, as the editor's hidden pin is; in a static function, with its own world context parameter. An inline helper's own WorldContext parameter left at its default gets the same. | [Calling engine and game functions](#calling-engine-and-game-functions) |

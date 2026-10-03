@@ -2756,7 +2756,7 @@ def constants():
     exports = [e['name'] for e in dumpexp.load(base)[5]]
     cdo = dump('dumptags.py', base, str(exports.index('Default__TypesTest_C')))
     for want in ('Seed [0] IntProperty size=4: %d' % fnv('types'), 'Budget [0] IntProperty size=4: 25', 'Reach [0] FloatProperty size=4: 125.0', 'Bits [0] IntProperty size=4: 236',
-                 'Halfway [0] BoolProperty size=0 value=1'):
+                 'Halfway [0] BoolProperty size=0 value=1', 'Moods [0] IntProperty size=4: 33'):
         assert want in cdo, (want, cdo)
     print('ok  TypesTest: a member default is what its constant expression comes to')
     import struct
@@ -2885,6 +2885,26 @@ def types_behaviour():
     print('ok  TypesTest: TEnum<E> switches, compares and assigns as E; Name() / String() are the engine\'s lookups on E')
     assert [vm.call('SleepyCount', l) for l in ([], [6], [0, 6, 5, 6])] == [0, 1, 2]
     print('ok  TypesTest: a global `using` of a template type is that type')
+    # TEnumMask<EMood> is an int32 whose bit N is the enumerator of value N, read and written by the engine's own bit
+    # functions (KismetNodeHelperLibrary.cpp 12-38): bit 31 never reads as marked, and an index past 31 does nothing.
+    has = lambda Mask, M: M < 32 and wrap((1 << M) & Mask) > 0
+    moods, masks = (0, 5, 6, 30, 31, 32, 255), (0, 0x21, -1, -2**31, 0x40000041)
+    check('TypesTest', 'MaskHas', has, [dict(Mask=k, M=m) for k in masks for m in moods])
+    for start in masks:
+        for m in moods:
+            got = run(asset('TypesTest'), 'InMoods', self_vars={'Moods': start}, M=m)[0]
+            assert got == has(start, m), ('InMoods', start, m, got)
+            for op, want in enumerate((wrap(start | 1 << m) if m < 32 else start,
+                                       wrap(start & ~(1 << m)) if m < 32 else start, 0)):
+                f = {'Moods': start}
+                got = run(asset('TypesTest'), 'EditMoods', self_vars=f, M=m, Op=op)[0]
+                assert got == want and f['Moods'] == want, ('EditMoods', start, m, op, got, f)
+    local = lambda A, Extra: (lambda b: b if has(b, 0) else wrap(-b))(wrap(((1 << A) if A < 32 else 0) | 1 << 6 | Extra))
+    check('TypesTest', 'LocalMoods', local, [dict(A=a, Extra=x) for a in moods for x in (0, 1, 0x21, -2**31)])
+    print('ok  TypesTest: TEnumMask<E> is an int32 bitmask; Has / Add / Remove / Clear are the engine\'s bit functions')
+    refused('MaskMap', '  TMap<int32, TEnumMask<EMood>> M;\n  void F() { M[1].Add(EMood::Calm); }\n', 'writes the mask',
+            top='enum class EMood : uint8 { Calm, Angry };\nUE_ENUM(EMood);\n')
+    print('ok  TEnumMask::Add on a map element is refused: Map_Find copies it out, and nothing would store it back')
     check('TypesTest', 'GetIsTargetable', lambda: True, [dict()])
     for r in (0, 4):
         f = {}

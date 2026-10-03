@@ -747,7 +747,8 @@ It is cooked as an Enumeration asset and then works like any Blueprint enum: var
 `UE_ENUM_MAP(E, FName, Names);` declares a `TMap<E, FName>` member and fills in a name table at build time, and
 `UE_ENUM_MAP(FString, E, ByName);` the way back. For enum to name, declare the variable as `TEnum<E>`: it is still an
 E, and `.Name()` / `.String()` ask the engine. The game's enum fields and return values already come as `TEnum<E>` in
-UeApi.
+UeApi. For a bitmask over an enum, the editor's Bitmask variable, declare a `TEnumMask<E>`: an int32 whose bit N is the
+enumerator of value N, with `.Has(E)`, `.Add(E)`, `.Remove(E)` and `.Clear()`.
 
 `TArray`, `TSet` and `TMap` are the Blueprint Array, Set and Map. Their methods are the editor's container nodes, not
 UE's C++ API: `Add`, `Contains`, `Find(Key, Out)`, `Keys(OutArray)`, `Num()` and so on, with results coming back

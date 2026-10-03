@@ -78,6 +78,7 @@ class TypesTest : public AActor, public ITargetable {
   TMap<FString, EMood> MoodsByName = UE_ENUM_MAP(EMood);      // so the table follows the enum
   EMood Mood = EMood::Angry;
   TEnum<EMood> Tagged = EMood::Sleepy;                        // a plain EMood property, with its names on call
+  TEnumMask<EMood> Moods = 0x21;                              // a plain int32 property: Calm (bit 0) and Angry (bit 5)
   ESpan Span = ESpan::Wide;
   EAge Age = EAge::Eon;
 
@@ -165,6 +166,25 @@ public:
     case EMood::Sleepy: return 3;
     default: return Tagged == Mood ? 10 : 0;
     }
+  }
+
+  /* TEnumMask<E> is an int32 whose bit N is the enumerator of value N: Has / Add / Remove / Clear are the engine's bit
+     functions, and it converts to and from int32 both ways. */
+  bool InMoods(EMood M) { return Moods && Moods.Has(M); }
+  bool MaskHas(TEnumMask<EMood> Mask, EMood M) { return Mask.Has(M); }
+  int32 EditMoods(EMood M, int32 Op) {
+    if (Op == 0) Moods.Add(M);
+    else if (Op == 1) Moods.Remove(M);
+    else Moods.Clear();
+    return Moods;
+  }
+  int32 LocalMoods(EMood A, int32 Extra) {
+    TEnumMask<EMood> L{};
+    L.Add(A);
+    L.Add(EMood::Sleepy);
+    L = L | Extra;
+    TEnumMask<EMood> Both = L;
+    return Both.Has(EMood::Calm) ? int32(Both) : -Both;
   }
 
   int32 SpanScore(ESpan S) {

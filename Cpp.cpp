@@ -82,7 +82,7 @@ const Json* Nth(const Json& N, size_t I)
 }
 
 std::string StripTypeKeywords(std::string T);
-bool IsTEnumType(std::string T);
+bool IsTEnumType(std::string T, const std::string& Of = "TEnum");
 const Json* PeelLvalue(const Json* N);
 bool IsFixedOperand(const Json& N);
 /* `(L[Idx()] = 3) += 1`: AssignedPlace writes an assignment's left side only when it is a plain variable. */
@@ -4898,8 +4898,9 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         /* `{}` or `TArray<int32>()` as a value: an empty container, a Make Array (Set, Map) with no element. */
         if (!First(*N) && IsContainerType(TypeOf(*N))) return LowerContainerLiteral(*N, TypeOf(*N), BP, Out, Err);
         /* `{}` or `TEnum<E>()`: TEnum<E> declares a constructor, so its value-initialisation is an argless construct
-           where an E's is a CXXScalarValueInitExpr below. The same zero enumerator. */
-        if (!First(*N) && IsTEnumType(TypeOf(*N))) return ZeroArg(StripTypeKeywords(TypeOf(*N)), BP, Out, Err);
+           where an E's is a CXXScalarValueInitExpr below. The same zero enumerator; a TEnumMask's empty mask. */
+        if (!First(*N) && (IsTEnumType(TypeOf(*N)) || IsTEnumType(TypeOf(*N), "TEnumMask")))
+            return ZeroArg(StripTypeKeywords(TypeOf(*N)), BP, Out, Err);
         /* `TArray<int32>{1, 2, M}`: the typed spelling is a CXXTemporaryObjectExpr around the initializer_list, which
            Strip does not look through as it does `TArray<int32>({1, 2})`'s one-argument construct. The same list. */
         if (const Json* List = First(*N); List && !Nth(*N, 1) && Kind(*List) == "CXXStdInitializerListExpr"
@@ -4982,6 +4983,40 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
                                             Method == "Name" ? "GetEnumeratorName" : "GetEnumeratorUserFriendlyName");
             Out.Sub->bPure = true;
             Out.Sub->Args = { EnumObj, Value };
+            return true;
+        }
+        if (IsTEnumType(TypeOf(*First(*Callee)), "TEnumMask"))
+        {
+            /* TEnumMask<E>'s methods: KismetNodeHelperLibrary's bit functions on the int32 it is, the enumerator's value
+               the bit index, as the editor counts a Bitmask Flags enum's. Has only reads the mask; the other three write
+               it through their `int32&`, so it must be a variable Blueprint can reference - not a map element, which
+               Map_Find copies out. */
+            static const std::map<std::string, const char*> Bits = {
+                { "Has", "BitIsMarked" }, { "Add", "MarkBit" }, { "Remove", "ClearBit" }, { "Clear", "ClearAllBits" } };
+            const std::string Method = Name(*Callee);
+            const auto Fn = Bits.find(Method);
+            if (Fn == Bits.end()) { *Err = "TEnumMask has no method " + Method; return false; }
+            const bool bRead = Method == "Has";
+            FArgIR Mask;
+            if (!LowerArg(*Obj, BP, Mask, Err)) return false;
+            if (!bRead && !IsStored(Mask))
+            {
+                *Err = "TEnumMask::" + Method + " writes the mask, so it needs a variable, not a computed value or a map "
+                       "element: copy it to a local, then store it back";
+                return false;
+            }
+            Out.K = FArgIR::Call;
+            Out.Sub = std::make_shared<FCallIR>();
+            Out.Sub->Fn = BP.EngineFunction("/Script/Engine", "KismetNodeHelperLibrary", Fn->second);
+            Out.Sub->bPure = bRead;
+            Out.Sub->WrittenArgs = bRead ? 0 : 1;
+            Out.Sub->Args.push_back(Mask);
+            if (const Json* Flag = Nth(*N, 1))
+            {
+                FArgIR Bit;
+                if (!LowerArg(*Flag, BP, Bit, Err) || !ConvertArg("int32", BP, Bit, Err)) return false;
+                Out.Sub->Args.push_back(Bit);
+            }
             return true;
         }
         const std::string ObjType = StripTypeKeywords(TypeOf(*Obj));
@@ -11798,22 +11833,24 @@ std::string StripTypeKeywords(std::string T)
     for (const char* Prefix : { "const ", "struct ", "class " })
         if (T.compare(0, strlen(Prefix), Prefix) == 0) T = T.substr(strlen(Prefix));
     while (!T.empty() && (T.back() == ' ' || T.back() == '\t')) T.pop_back();
-    /* TEnum<E> (UeMeta.h) is E to everything but its two methods, which LowerArg reads off the unstripped type. */
+    /* TEnum<E> (UeMeta.h) is E to everything but its two methods, which LowerArg reads off the unstripped type;
+       TEnumMask<E> is int32 to everything but its four. */
     if (IsTEnumType(T) && T.back() == '>') return StripTypeKeywords(T.substr(6, T.size() - 7));
+    if (IsTEnumType(T, "TEnumMask") && T.back() == '>') return "int32";
     return T;
 }
 
-/* T is TEnum<E> itself, `const` and a reference aside: not a type that holds one (`TArray<TEnum<E>>`), nor a list of
-   template arguments that starts with one (`TEnum<A>, TSubclassOf<B>`, a TMap's as TemplateArg hands it on), whose
-   `>` closing the `TEnum<` is not the last. */
-bool IsTEnumType(std::string T)
+/* T is TEnum<E> itself (or Of<E>: TEnumMask), `const` and a reference aside: not a type that holds one
+   (`TArray<TEnum<E>>`), nor a list of template arguments that starts with one (`TEnum<A>, TSubclassOf<B>`, a TMap's as
+   TemplateArg hands it on), whose `>` closing the `TEnum<` is not the last. */
+bool IsTEnumType(std::string T, const std::string& Of)
 {
     for (const char* Prefix : { "const ", "struct ", "class " })
         if (T.compare(0, strlen(Prefix), Prefix) == 0) T = T.substr(strlen(Prefix));
     while (!T.empty() && (T.back() == ' ' || T.back() == '\t' || T.back() == '&')) T.pop_back();
-    if (T.compare(0, 6, "TEnum<") != 0) return false;
+    if (T.compare(0, Of.size(), Of) != 0 || T.compare(Of.size(), 1, "<") != 0) return false;
     int32 Depth = 0;
-    for (size_t I = 5; I < T.size(); ++I)
+    for (size_t I = Of.size(); I < T.size(); ++I)
         if (T[I] == '<') ++Depth;
         else if (T[I] == '>' && --Depth == 0) return I + 1 == T.size();
     return false;
@@ -11864,6 +11901,12 @@ bool FCompiler::FoldConst(const Json& E, FConstVal& Out) const
     }
     if (K == "ParenExpr" || K == "ConstantExpr" || K == "ExprWithCleanups")
         return First(E) && FoldConst(*First(E), Out);
+    /* `TEnumMask<E> M = 0x21;`, `{}`: the int32 it converts, or none. */
+    if (K == "CXXConstructExpr" && IsTEnumType(TypeOf(E), "TEnumMask") && !Nth(E, 1))
+    {
+        if (!First(E)) { Out = {}; return true; }
+        return FoldConst(*First(E), Out) && Fit(Out);
+    }
     if (K == "ImplicitCastExpr" || K == "CStyleCastExpr" || K == "CXXStaticCastExpr" || K == "CXXFunctionalCastExpr")
         return First(E) && FoldConst(*First(E), Out) && Fit(Out);
     if (K == "DeclRefExpr" && E.contains("referencedDecl"))
