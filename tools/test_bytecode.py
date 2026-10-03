@@ -2204,29 +2204,34 @@ namespaces()
 
 
 def registry_rows_name_exports():
-    """Each row of a mod's AssetRegistry.bin names an asset export of its package, of the row's class, as the game's
-    rows do: a Blueprint interface's class row is `<Package>.<I>_C  BlueprintGeneratedClass` (TempRocketInterface,
-    RadarPointInterface), as a class's is; the game's `<Package>.<I>  Blueprint` row beside it is the editor asset, which
-    a cooked package does not hold and AssetGen lists for no class. Every suite mod's registry, IfaceRow's among them;
-    before the fix each mod interface's row was `<Package>.<I>`, which names nothing there."""
+    """A mod's AssetRegistry.bin lists exactly the asset exports of the packages beside it, each row by the export's
+    path and class, as the game's rows do: a Blueprint interface's class row is `<Package>.<I>_C
+    BlueprintGeneratedClass` (TempRocketInterface, RadarPointInterface), as a class's is; the game's `<Package>.<I>
+    Blueprint` row beside it is the editor asset, which a cooked package does not hold and AssetGen lists for no class.
+    Both ways: a row that names no asset export fails, and so does an asset export with no row (one dropped). Every
+    suite mod's registry, IfaceRow's among them; before the fix each mod interface's row was `<Package>.<I>`, which
+    names nothing there, and its `<I>_C` had none."""
     import invariants
     regs = sorted(glob.glob(os.path.join(ROOT, '*', 'FSD', 'AssetRegistry.bin')))
     assert registry_of('IfaceRow') in regs, regs[:3]
     bad = []
     for reg in regs:
         content = os.path.join(os.path.dirname(reg), 'Content')
-        for path, cls in sorted(registry_rows(reg)):
-            package, obj = path.rsplit('.', 1)
-            pkg = invariants.load(os.path.join(content, *package[len('/Game/'):].split('/')))
-            k = pkg.find(obj)
-            if k is None or not pkg.exports[k]['is_asset'] or pkg.class_of(k + 1) != cls:
-                bad.append('%s %s (the package holds %s)' % (path, cls, ', '.join(
-                    '%s %s' % (e['name'], pkg.class_of(i + 1)) for i, e in enumerate(pkg.exports) if e['is_asset'])))
-    assert not bad, '%d registry rows name no asset export of their class: %s' % (len(bad), '; '.join(bad[:3]))
+        assets = set()
+        for ua in glob.glob(os.path.join(content, '**', '*.uasset'), recursive=True):
+            pkg = invariants.load(ua[:-len('.uasset')])
+            name = '/Game/' + os.path.relpath(ua[:-len('.uasset')], content).replace(os.sep, '/')
+            assets |= {('%s.%s' % (name, e['name']), pkg.class_of(i + 1)) for i, e in enumerate(pkg.exports) if e['is_asset']}
+        rows = registry_rows(reg)
+        if rows != assets:
+            bad.append('%s: rows naming no asset export of their class %s, asset exports with no row %s' % (
+                os.path.basename(os.path.dirname(os.path.dirname(reg))), sorted(rows - assets)[:3], sorted(assets - rows)[:3]))
+    assert not bad, '%d registries do not list their asset exports: %s' % (len(bad), '; '.join(bad[:3]))
 
 
 registry_rows_name_exports()
-print('ok  IfaceRow: every registry row names an asset export of its class; a mod interface\'s is <I>_C, as the game\'s are')
+print('ok  IfaceRow: every registry lists exactly its packages\' asset exports, by path and class; a mod interface\'s '
+      'row is <I>_C, as the game\'s are')
 
 
 # ---- OptTest
