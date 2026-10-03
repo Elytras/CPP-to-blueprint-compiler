@@ -9688,7 +9688,7 @@ def asset_delegate_value():
     property took the signature function of the class built last, an export of its package, and the asset's preload
     table listed that index as one of its own exports (edl_preload_arcs, table_bounds). AssetGen wrote no bytes for a
     delegate, so the loader read past each such value."""
-    here = os.path.dirname(pending_asset('AssetDelegateValue', 'UAdvDef'))
+    here = os.path.dirname(asset('AssetDelegateValue'))
     unbound = (0, 'none')
     pkgs = {n: invariants.Package(os.path.join(here, n)) for n in ('UAdvDef', 'AS_AdvOver', 'AS_AdvIface', 'UAdvIfaceData')}
     for n in pkgs: keeps_invariants(os.path.join(here, n))
@@ -9705,9 +9705,17 @@ def asset_delegate_value():
     for k in removed: loaded = {h: v for h, v in loaded.items() if h.lower() != k.lower()}
     for k, v in added: loaded[next((h for h in loaded if h.lower() == k.lower()), k)] = v
     assert loaded == {'a': unbound, 'B': unbound}, (removed, added, loaded)
+    # A struct makes no signature function, so a delegate in one is refused, though the class generated just before it
+    # (by name) left one of that type in DelegateSigs: the struct cooked with that package's index.
+    refused('AdvStructDel', '  TDelegate<void()> Mine;\n',
+            'member D: TDelegate<void ()> needs a signature function, which only a class holds, not a struct or an interface',
+            top='struct FZzAdvHeld {\n  UE_STRUCT;\n  TDelegate<void()> D;\n  int32 N = 0;\n};\n')
 
 
-pending('AssetDelegateValue', asset_delegate_value)
+asset_delegate_value()
+print('ok  AssetDelegateValue: an unbound delegate in an asset\'s braces, a TMap\'s value and a mod interface\'s variable '
+      'is written as an FScriptDelegate, null and None, and the asset names no signature function of another package; '
+      'a UE_STRUCT\'s delegate is refused whatever class was built before it')
 
 
 def uds_init_defaults():

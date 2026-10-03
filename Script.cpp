@@ -251,6 +251,8 @@ void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
         }
         else if (P.Type == "ObjectProperty") V.Idx(D.K == FDefaultValue::Obj ? D.Object : Null());
         else if (P.Type == "ClassProperty" || P.Type == "InterfaceProperty") V.I32(0);
+        else if (P.Type == "DelegateProperty")      // FScriptDelegate: the object, the function's name (ScriptDelegates.h
+        { V.Idx(Null()); V.Name("None"); }           // 138-142); a default is unbound, as a bound one is refused
         else if (P.Type == "SoftObjectProperty" || P.Type == "SoftClassProperty")    // FSoftObjectPath: AssetPathName, SubPathString
         { V.Name(D.K == FDefaultValue::Str && !D.S.empty() ? D.S : std::string("None")); V.I32(0); }
         else if (P.Type == "SetProperty" || P.Type == "MapProperty")

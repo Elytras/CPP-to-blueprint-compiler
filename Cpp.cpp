@@ -1793,6 +1793,7 @@ private:
     std::map<std::string, std::pair<std::string, FIndex>> DelegateSigs;    // Generate: a TDelegate type's DelegateKey ->
                                                                             // its signature function's name and export
     const FBlueprintClass* DelegateSigsIn = nullptr;  // the class Generate is building, while it builds it
+    const FBlueprintClass* TagsOnlyIn = nullptr;      // the asset GenerateAsset is building, whose tags name no function
     /* A class -> the signature functions DelegateSignature made in it, or a class generated before it reserved for it
        (SignatureName): a parent or child generated after it names its own around them (SignatureNameTaken). */
     std::map<std::string, std::set<std::string>> MadeSignatures;
@@ -12800,7 +12801,12 @@ bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& P
     if (Type.compare(0, 10, "TDelegate<") == 0)
     {
         FIndex Sig;
-        if (!DelegateSignature(Type, PName, BP, &Sig, Err)) return false;
+        if (!DelegateSignature(Type, PName, BP, &Sig, Err))
+        {
+            /* Named as the source writes it, not by its cooked name (a struct member's carries a GUID). */
+            if (Err->compare(0, PName.size() + 2, PName + ": ") == 0) *Err = Where + Err->substr(PName.size());
+            return false;
+        }
         *Out = DelegateParam(PName, Sig, ExtraFlags);
         return true;
     }
@@ -12911,10 +12917,14 @@ bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& P
 bool FCompiler::DelegateSignature(const std::string& Type, const std::string& Holder, FBlueprintClass& BP, FIndex* Sig,
                                   std::string* Err)
 {
-    const std::string Key = DelegateKey(Type);
-    if (auto It = DelegateSigs.find(Key); It != DelegateSigs.end()) { *Sig = It->second.second; return true; }
+    /* An asset's tag holds a delegate's value alone, the object and the function's name (ScriptDelegates.h 138-142),
+       and names no signature function: its class made one in its own package, whose index is no export here. */
+    if (TagsOnlyIn == &BP) { *Sig = Null(); return true; }
+    /* DelegateSigs is the last class's still when an asset or a struct asks: its indices are that package's. */
     if (DelegateSigsIn != &BP)
     { *Err = Holder + ": " + Type + " needs a signature function, which only a class holds, not a struct or an interface"; return false; }
+    const std::string Key = DelegateKey(Type);
+    if (auto It = DelegateSigs.find(Key); It != DelegateSigs.end()) { *Sig = It->second.second; return true; }
     const size_t Open = Type.find('('), Close = Type.rfind(')');
     if (Open == std::string::npos || Close == std::string::npos || Close < Open)
     { *Err = "TODO: unimplemented delegate type " + Type + " of " + Holder; return false; }
@@ -13539,6 +13549,8 @@ bool FCompiler::GenerateAsset(const Json& Var, const std::string& OutDir, std::s
     FPackage P(PackageName);
     StampIdentity(P, PackageName);
     FBlueprintClass BP(P, AssetName, "", "", false);
+    struct FTagsScope { const FBlueprintClass*& In; ~FTagsScope() { In = nullptr; } } TagsScope{ TagsOnlyIn };
+    TagsOnlyIn = &BP;
 
     std::vector<FPropertyDef> Set;
     if (!BracedMembers(*BracedInit(Var), *R, AssetName, BP, false, Set, Err, R)) return false;
