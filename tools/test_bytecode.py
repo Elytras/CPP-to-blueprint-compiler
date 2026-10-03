@@ -9332,7 +9332,7 @@ def asset_iface_set():
     variables in the interface's braces, after the base's: AS_AisImpl's Tags {3} and Level 9 load as written over its
     class's {1, 2} and 4 (they were dropped, silently), and AS_AisKid's {7} over UAisKid's {3}."""
     import struct
-    here = os.path.dirname(pending_asset('AssetIfaceSet', 'UAisImpl'))
+    here = os.path.dirname(asset('AssetIfaceSet'))
 
     def cdo(cls):
         pkg = invariants.Package(os.path.join(here, cls))
@@ -9355,7 +9355,9 @@ def asset_iface_set():
     assert not warned, warned
 
 
-pending('AssetIfaceSet', asset_iface_set)
+asset_iface_set()
+print('ok  AssetIfaceSet: a mod interface\'s set loads below its implementer over the implementer\'s value, and an '
+      'asset gives the interface\'s variables in the interface\'s braces')
 
 
 def asset_map_dup_keys():

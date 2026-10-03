@@ -12116,6 +12116,14 @@ FCompiler::FDefaultSource FCompiler::DefaultSource(const FRecord* From, const st
                     { S.Set = L; S.Value = V; }
                 });
             for (const Json* F : C->Fields) if (F->value("id", std::string()) == Id) S.Declared = F;
+            /* A mod interface's variable is a property of the class that lists the interface (InterfaceVarHolder), whose
+               default object holds the interface's initializer, or the class's own UE_DEFAULTS value: the whole value. */
+            if (!S.Declared)
+                for (const std::string& I : C->Interfaces)
+                    for (const FRecord* Link : InterfaceChain(Find(I)))
+                        if (Link->bIsInterface)
+                            for (const Json* F : Link->Fields)
+                                if (F->value("id", std::string()) == Id) { S.Declared = F; S.bHolder = true; }
             if (!S.Set && !S.Declared) continue;
         }
         /* A UE_STRUCT declared with no initializer, `{}` or `T()` gets no tag, and the default object holds the struct's
@@ -13124,7 +13132,16 @@ bool FCompiler::BracedMembers(const Json& List, const FRecord& Rec, const std::s
         if (B && Sub && Kind(*Sub) == "InitListExpr" && !BracedMembers(*Sub, *B, Where, BP, bKeepZero, Out, Err, Archetype))
             return false;
     }
-    I += Rec.Interfaces.size();
+    /* Each implemented interface's braces follow the base's: a mod interface's variables are the implementing class's
+       own properties, named as the interface declares them. */
+    for (const std::string& Iface : Rec.Interfaces)
+    {
+        const FRecord* IR = Find(Iface);
+        const Json* Sub = Nth(List, I++);
+        if (IR && IR->bIsInterface && Sub && Kind(*Sub) == "InitListExpr"
+            && !BracedMembers(*Sub, *IR, Where, BP, bKeepZero, Out, Err, Archetype))
+            return false;
+    }
     for (const Json* F : Rec.Fields)
     {
         const Json* Init = Strip(Nth(List, I++));
