@@ -523,7 +523,7 @@ uint32 NetFlagsOf(const Json& Decl)
 
 /* UE_AUTHORITY_ONLY / UE_COSMETIC, the same way: the VM skips the call where the flag says it should not run. */
 /* A method that overrides nothing. Measured on the DRG dump: a Blueprint-authored function is
-   (Public, BlueprintCallable, BlueprintEvent) - 4624 of them, CD2_Module_C's among them. Without BlueprintCallable
+   (Public, BlueprintCallable, BlueprintEvent) - 4624 of them, every Blueprint function a mod overrides among them. Without BlueprintCallable
    no Blueprint can place a call node, and the API stub, which lists what a Blueprint can call, left every plain
    method out. FUNC_Event stays: it is what every mod was cooked and run with so far. */
 static const uint32 kPlainMethodFlags = FFunctionDef().FunctionFlags | FUNC_BlueprintCallable;
@@ -1635,7 +1635,7 @@ private:
         if (It != Records.end()) return &It->second;
         auto B = Bare.find(CppName);
         if (B != Bare.end()) { It = Records.find(B->second); return It == Records.end() ? nullptr : &It->second; }
-        /* `using JSONValue_C = Game::_AssemblyStorm::Common::JSON::JSONValue_C;` - how a mod names a class two
+        /* `using Gun_C = Game::Weapons::Rifles::Gun_C;` - how a mod names a class two
            packages both have, which the headers can give no short name. clang spells a use as the alias. */
         if (auto S = SlotStructs.find(CppName); S != SlotStructs.end()) return &S->second;
         auto A = Aliases.find(CppName);
@@ -2464,6 +2464,18 @@ bool FCompiler::Collect(std::string* Err)
                     BadClassMeta(R, Err, &bMetaOk);
                 }
             }
+            else if (Kind(C) == "VarDecl" && Name(C) == "UeClassInMeta")
+            {
+                /* UE_CLASS_IN names only the owner's mod package; the class's asset is the path its own C++ name
+                   gives under it, so it cannot disagree with the name the way a hand-written UE_CLASS can. */
+                std::string Owner;
+                if (FindLiteral(C, Owner))
+                {
+                    while (!Owner.empty() && Owner.back() == '/') Owner.pop_back();
+                    R.UePackage = PathIn(Owner, R.CppName);
+                    R.UeName = LeafOf(R.CppName) + "_C";
+                }
+            }
             else if (Kind(C) == "VarDecl" && Name(C) == "UeInterfaceMeta")
             {
                 R.bIsInterface = true;
@@ -2591,8 +2603,8 @@ bool FCompiler::Collect(std::string* Err)
                 R.Replicated[N2.second] = Rep->second;
                 R.Replicated.erase(N2.first);
             }
-        /* genueapi opens a Blueprint class with `using JSONValue_C = Game::...::JSONValue_C;` so its signatures stay
-           readable, and a mod class deriving it writes `JSONValue_C*` through the same names. The nearer one wins. */
+        /* genueapi opens a Blueprint class with `using Gun_C = Game::...::Gun_C;` so its signatures stay
+           readable, and a mod class deriving it writes `Gun_C*` through the same names. The nearer one wins. */
         std::map<std::string, std::string> InScope = R.TypeAliases;
         for (const FRecord* A = R.Base.empty() ? nullptr : Find(R.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
             InScope.insert(A->TypeAliases.begin(), A->TypeAliases.end());
@@ -2610,9 +2622,9 @@ bool FCompiler::Collect(std::string* Err)
     };
     Walk(Doc, std::string());
     if (!bMetaOk) return false;
-    /* A global alias of a template or a class (`using ValueFactory = TScriptInterface<...>;`, `using JSON =
-       Game::...::JSONValue_C;`) is written out in every use, out-of-line method bodies included. Find resolved one of
-       a class but nothing one of a template, and clang desugars only a type's outer layer, so `JSON *` kept its alias
+    /* A global alias of a template or a class (`using TargetRef = TScriptInterface<...>;`, `using Gun =
+       Game::...::Gun_C;`) is written out in every use, out-of-line method bodies included. Find resolved one of
+       a class but nothing one of a template, and clang desugars only a type's outer layer, so `Gun *` kept its alias
        where an override's signature is compared with its parent's. A scalar alias (`using int32 = int;`) stays: the
        lowering reads those spellings. */
     std::map<std::string, std::string> Expand;
@@ -3119,6 +3131,7 @@ std::string FCompiler::Canon(std::string T) const
 {
     T = StripTypeKeywords(T);
     while (!T.empty() && (T.back() == '&' || T.back() == ' ')) T.pop_back();
+    if (T.size() > 6 && T.compare(T.size() - 6, 6, " const") == 0) T.erase(T.size() - 6);  // `const auto &`: `FAssetData const &`
     if (T.size() > 6 && T.compare(T.size() - 6, 6, "*const") == 0) T.erase(T.size() - 5);  // `const T&` of a pointer T
     T = StripTypeKeywords(T);
     const EStrKind K = StrKindOf(T);
@@ -4947,6 +4960,48 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             Out.K = FArgIR::InterfaceCtx;
             Out.Base = std::make_shared<FArgIR>();
             return LowerArg(*Lhs, BP, *Out.Base, Err);
+        }
+        std::string SetElem;
+        if ((OpName == "operator+" || OpName == "operator-" || OpName == "operator&") && Lhs && Rhs
+            && TemplateArg(StripTypeKeywords(TypeOf(*Lhs)), "TSet", &SetElem))
+        {
+            /* `A + B`, `A - B`, `A & B` on sets: Set_Union / Set_Difference / Set_Intersection into a temp, which is the
+               value. Each empties Result first (BlueprintSetLibrary.cpp 162-186), so a temp reused round a loop
+               starts clean. */
+            const char* Fn = OpName == "operator+" ? "Set_Union" : OpName == "operator-" ? "Set_Difference"
+                                                                                         : "Set_Intersection";
+            std::string Type = TypeOf(*N);
+            while (!Type.empty() && (Type.back() == '&' || Type.back() == ' ')) Type.pop_back();
+            Type = StripTypeKeywords(Type);
+            FArgIR A, B;
+            if (!LowerArg(*Lhs, BP, A, Err) || !LowerArg(*Rhs, BP, B, Err)) return false;
+            if (!IsContainerVariable(A) || !IsContainerVariable(B))
+            { *Err = std::string("set `") + OpName.substr(8) + "` needs set variables, not computed values"; return false; }
+            const std::string Tmp = "__SetOp" + std::to_string(ReadTmpCounter++) + "__";
+            FPropertyDef PD;
+            if (!TypeToProperty(Type, Tmp, 0, "a set operation's result", BP, &PD, Err)) return false;
+            PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+            CurLocals->push_back(PD);
+            FArgIR Into;
+            Into.K = FArgIR::Local;
+            Into.S = Tmp;
+            auto Body = std::make_shared<std::vector<FStmtIR>>(1);
+            (*Body)[0].K = FStmtIR::StaticCall;
+            (*Body)[0].Call.Fn = BP.EngineFunction("/Script/Engine", "BlueprintSetLibrary", Fn);
+            (*Body)[0].Call.WrittenArgs = ContainerWrites(Fn);
+            (*Body)[0].Call.bOnArg0 = true;
+            (*Body)[0].Call.Args = { A, B, Into };
+            auto Block = std::make_shared<std::vector<FStmtIR>>(1);
+            (*Block)[0].K = FStmtIR::Block;
+            (*Block)[0].Body = Body;
+            Out.K = FArgIR::Call;
+            Out.InnerType = Type;
+            Out.Sub = std::make_shared<FCallIR>();
+            Out.Sub->Intrinsic = "__Inline__";
+            Out.Sub->Inline = Block;
+            Out.Sub->InlineResult = Tmp;
+            Out.Sub->InlineType = Type;
+            return true;
         }
         if (IsTMapElement(*N) && Rhs)
         {
@@ -10829,11 +10884,8 @@ bool FCompiler::LowerRangeFor(const Json& ForNode, FBlueprintClass& BP, std::vec
        case of its own, as one that falls through to the default throws a script exception first, a logged warning. */
     // ponytail: pass I compares I + 1 cases, N^2/2 in all; past 16 elements the Make Array walk below costs less.
     const Json* Items = InlineListOf(RangeExpr);
-    std::string LoopTy = TypeOf(*LoopDecl);
-    while (!LoopTy.empty() && (LoopTy.back() == '&' || LoopTy.back() == ' ')) LoopTy.pop_back();
-    if (LoopTy.size() > 6 && LoopTy.compare(LoopTy.size() - 6, 6, " const") == 0) LoopTy.erase(LoopTy.size() - 6);  // `auto`: `int const &`
     std::vector<FArgIR> Consts;
-    const bool bConsts = Which == 'A' && Items && Kind(*LoopDecl) == "VarDecl" && Canon(LoopTy) == Canon(Args[0])
+    const bool bConsts = Which == 'A' && Items && Kind(*LoopDecl) == "VarDecl" && Canon(TypeOf(*LoopDecl)) == Canon(Args[0])
                       && InlineConsts(*Items, Args[0], BP, &Consts);
     if (bConsts && Consts.size() <= 16)
     {

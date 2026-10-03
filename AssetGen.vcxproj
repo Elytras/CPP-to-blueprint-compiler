@@ -54,7 +54,7 @@
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <!-- Each call copied in nests LowerBody again: ECD2A's chain, bound by UE_FINAL_AS, needs just over the default
+      <!-- Each call copied in nests LowerBody again: a long call chain bound by UE_FINAL_AS can need just over the default
            1 MB. Reserve only; pages are committed as used. Linux's 8 MB main-thread stack covers the same. -->
       <StackReserveSize>67108864</StackReserveSize>
     </Link>

@@ -472,6 +472,17 @@ def _union(ev, store, a):
         if v not in sets[2]: sets[2].append(copy.deepcopy(v))
 
 
+def _set_filter(keep):
+    """Set_Difference (keep=False) / Set_Intersection (keep=True): A's elements that B lacks / holds, Result emptied
+    first as GenericSet_Difference / GenericSet_Intersect do."""
+    def op(ev, store, a):
+        sets = [_made(ev, store, x, []) for x in a[:3]]
+        picked = [copy.deepcopy(v) for v in sets[0] if _has(sets[1], v) == keep]
+        sets[2].clear()
+        sets[2].extend(picked)
+    return op
+
+
 def _has(c, v):
     """Contains: an FName or FString compares case-insensitively, as its == does (and a cooked name that differs
     from an earlier one only in case is that one's entry)."""
@@ -525,6 +536,8 @@ CONTAINERS = {
     'Array_Get': lambda ev, store, a: store(a[2], copy.deepcopy(ev(a[0])[ev(a[1])])),
     'Array_Append': _append,
     'Set_Union': _union,
+    'Set_Difference': _set_filter(False),
+    'Set_Intersection': _set_filter(True),
     'Set_ToArray': lambda ev, store, a: store(a[1], list(ev(a[0]))),
     'Map_Keys': lambda ev, store, a: store(a[1], list(ev(a[0]).keys())),
     'Map_Find': lambda ev, store, a: (store(a[2], _made(ev, store, a[0], {}).get(ev(a[1]), 0)), ev(a[1]) in ev(a[0]))[1],
