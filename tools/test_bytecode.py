@@ -3073,9 +3073,9 @@ def enum_map_decl():
     """UE_ENUM_MAP(K, V, Name) declares the member itself, `TMap<K, V> Name = UE_ENUM_MAP(E)` without spelling the types
     twice: the enum on either side, FName or FString on the other, a game enum too. Each is a TMap property of those
     types whose default holds one pair per enumerator in order, the C++ name as the text and no _MAX, as the
-    one-argument form's (OldByName, beside them) does."""
+    one-argument form's (OldByName, beside them) does. Before the macro took three arguments, clang refused the mod."""
     import invariants
-    base = pending_asset('EnumMapDecl')
+    base = asset('EnumMapDecl')
     keeps_invariants(base)
     pkg = invariants.Package(base)
     props = {p.name: p for p in pkg.struct(pkg.find('EnumMapDecl_C')).props}
@@ -3096,7 +3096,9 @@ def enum_map_decl():
         assert got == want, '%s holds %s; the enum says %s' % (name, got, want)
 
 
-pending('EnumMapDecl: UE_ENUM_MAP(K, V, Name) declares the member, the enum on either side', enum_map_decl)
+enum_map_decl()
+print('ok  EnumMapDecl: UE_ENUM_MAP(K, V, Name) declares the TMap member and fills it, the enum on either side, FName or '
+      'FString on the other, a game enum too; the one-argument form beside it still fills a member it does not declare')
 
 
 # ---- IfaceTest, OverrideTest, SuperTest, NameTest, AssetTest

@@ -743,10 +743,11 @@ its members' initializers are its default values.
 
 An enum of your own is an `enum class` with a `uint8`, `int32` or `int64` underlying type, followed by `UE_ENUM(Name);`.
 It is cooked as an Enumeration asset and then works like any Blueprint enum: variables, parameters, constants and
-`switch`. Without `UE_ENUM` its constants still fold to numbers, but a variable of it is refused. `UE_ENUM_MAP(E)` as
-the default of a `TMap<E, FName>` member fills in a name table at build time. For enum to name, declare the variable
-as `TEnum<E>`: it is still an E, and `.Name()` / `.String()` ask the engine. The game's enum fields and return values
-already come as `TEnum<E>` in UeApi.
+`switch`. Without `UE_ENUM` its constants still fold to numbers, but a variable of it is refused.
+`UE_ENUM_MAP(E, FName, Names);` declares a `TMap<E, FName>` member and fills in a name table at build time, and
+`UE_ENUM_MAP(FString, E, ByName);` the way back. For enum to name, declare the variable as `TEnum<E>`: it is still an
+E, and `.Name()` / `.String()` ask the engine. The game's enum fields and return values already come as `TEnum<E>` in
+UeApi.
 
 `TArray`, `TSet` and `TMap` are the Blueprint Array, Set and Map. Their methods are the editor's container nodes, not
 UE's C++ API: `Add`, `Contains`, `Find(Key, Out)`, `Keys(OutArray)`, `Num()` and so on, with results coming back

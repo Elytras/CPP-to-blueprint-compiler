@@ -415,7 +415,7 @@ public:
 | `TSoftClassPtr<AActor> Soft = "/Game/A/BP_A.BP_A_C";` | A soft reference's default is its path. `"/Game/Dir/Pkg"` means `Pkg.Pkg`, so write the full path for a Blueprint class. See [Types](#types). | Yes |
 | `TArray<uint8> Payload = __EmbedFile__("data/blob.bin");` | Reads the file when the mod is built, from a path relative to the source's folder, and writes its bytes into the default, one element per byte. The compile prints `embed          -> Payload  (3 bytes)`. The file is not needed at run time. `__EmbedFile__` comes from `Intrin.h` in AssetGen's `include/` folder, included by its path as `Objects.h` is. | Yes |
 | `__EmbedFile__("missing.bin")`, `__EmbedFile__(kPath)` | Refused: a missing or empty file ("cannot read (or empty)"), and a path that is not a string literal ("the path must be a string literal"). It works only as the initializer of a `TArray<uint8>` member; clang refuses it for any other array type. | Refused |
-| `TMap<EMood, FName> Names = UE_ENUM_MAP(EMood);` | A name table that the compiler fills in when the mod is built, as a member default only. See [Enums](#enums). | Yes |
+| `UE_ENUM_MAP(EMood, FName, Names);` | Declares a `TMap<EMood, FName>` member holding a name table that the compiler fills in when the mod is built, as a member default only. See [Enums](#enums). | Yes |
 | `AMyActor() { Charges = 5; }` | A constructor is dropped with no message. See [Class defaults](#class-defaults). | Not yet |
 
 ```cpp
@@ -994,15 +994,18 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `TMap<EMood, FName> MoodNames = UE_ENUM_MAP(EMood);` | A member default the compiler fills in when the mod is built: one pair per enumerator in declaration order, with the C++ name as the text. The closing `_MAX` is left out. | Yes |
-| `TMap<FString, EMood> MoodsByName = UE_ENUM_MAP(EMood);` | The enum can be on either side, with FName or FString on the other. | Yes |
-| `TMap<EEndPlayReason, FName> Reasons = UE_ENUM_MAP(EEndPlayReason);` | Any enum the source can see works, the game's included. | Yes |
-| `TMap<int32, FName> M = UE_ENUM_MAP(EMood);` | Refused by clang: the map must be over that enum. | Refused |
+| `UE_ENUM_MAP(EMood, FName, MoodNames);` | Declares the member `TMap<EMood, FName> MoodNames` with a default the compiler fills in when the mod is built: one pair per enumerator in declaration order, with the C++ name as the text. The closing `_MAX` is left out. | Yes |
+| `UE_ENUM_MAP(FString, EMood, MoodsByName);` | The enum can be on either side, with FName or FString on the other. | Yes |
+| `UE_ENUM_MAP(EEndPlayReason, FName, Reasons);` | Any enum the source can see works, the game's included. | Yes |
+| `TMap<EMood, FName> MoodNames = UE_ENUM_MAP(EMood);` | The default alone, for a member you declare yourself: the same table. | Yes |
+| `UE_ENUM_MAP(int32, FName, M);`, `UE_ENUM_MAP(EMood, EMood, M);` | Refused by clang, "no member named 'Type' in '__EnumMapSide__<...>'": exactly one of the two types is the enum. | Refused |
+| `UE_ENUM_MAP(EMood, int32, M);`, `TMap<int32, FName> M = UE_ENUM_MAP(EMood);` | Refused by clang, "no viable conversion": the other type is FName or FString, and the map is over that enum. | Refused |
+| `UE_ENUM_MAP(FName, EMood);` | Refused by clang: "UE_ENUM_MAP takes (Enum), or (Key, Value, Name) to declare the member". | Refused |
 | `UE_ENUM_MAP(EMood)` in a function body | Not yet: refused with `unimplemented intrinsic __EnumMap__`. Keep the table as a member and read the member. | Not yet |
 
 ```cpp
-TMap<EMood, FName> MoodNames = UE_ENUM_MAP(EMood);    // Calm, Angry, Sleepy
-TMap<FString, EMood> MoodsByName = UE_ENUM_MAP(EMood);
+UE_ENUM_MAP(EMood, FName, MoodNames);      // Calm, Angry, Sleepy
+UE_ENUM_MAP(FString, EMood, MoodsByName);
 
 FName NameOf(EMood M) { return MoodNames[M]; }
 EMood Parse(FString Text) { return MoodsByName[Text]; }  // Calm for an unknown name
@@ -5319,7 +5322,7 @@ listed here is refused with "unimplemented intrinsic".
 | Dispatcher methods, `OnHit.Add(this, &C::F)`, `Remove`, `Clear()`, `Broadcast(...)` | Bind Event, Unbind Event, Unbind all Events and Call. A dispatcher has no other methods. | [Event dispatchers](#event-dispatchers) |
 | Double literal beside a float, `X * 0.5` | Refused: in C++ it is double math, and Blueprint 4.27 has no double. Write `0.5f`. | [Literals and conversions](#literals-and-conversions) |
 | `__EmbedFile__("Path")` | A file's bytes, read at build time, as the default of a `TArray<uint8>` member. | [Classes and variables](#classes-and-variables) |
-| `__EnumMap__`, `__EnumMapInit__` | What UE_ENUM_MAP expands to. Write UE_ENUM_MAP. | [Enums](#enums) |
+| `__EnumMap__`, `__EnumMapInit__`, `__EnumMapSide__` | What UE_ENUM_MAP expands to. Write UE_ENUM_MAP. | [Enums](#enums) |
 | Event override, `void ReceiveBeginPlay()` | Overrides that event, as adding its node in the editor does. Copy the SDK's parameter list: nothing checks it. | [Overrides and parent calls](#overrides-and-parent-calls) |
 | `ExecuteUbergraph_<Class>` | The name of the event graph that holds the methods that wait. A method named so is refused. | [Latent calls](#latent-calls) |
 | `FDeref` | The scratch struct that every read and write through a pointer goes through. AssetGen creates it when the mod declares none. | [Pointers and memory](#pointers-and-memory) |
@@ -5408,7 +5411,7 @@ listed here is refused with "unimplemented intrinsic".
 | `UE_DISPATCHER(Name, Params...)` | An event dispatcher on a mod class, with its parameter list. | [Event dispatchers](#event-dispatchers) |
 | `UE_ENUM(Enum)` | Cooks an `enum class` based on `uint8`, `int32` or `int64` as a UserDefinedEnum (an Enumeration asset). | [Enums](#enums) |
 | `UE_ENUM_IN(Enum, Package)` | UE_ENUM for an enum in a shared header: only the source whose UE_MOD_PACKAGE is exactly Package cooks it. | [Enums](#enums) |
-| `UE_ENUM_MAP(Enum)` | A TMap member default from each enumerator to its name, or back, filled in at build time. | [Enums](#enums) |
+| `UE_ENUM_MAP(Key, Value, Name)`, `UE_ENUM_MAP(Enum)` | A TMap member from each enumerator to its name, or back, filled in at build time: declared by the three-argument form, the default alone by the one-argument form. | [Enums](#enums) |
 | `UE_FINAL_AS(Base, Leaf)` | Declares `class Leaf final : public Base {}`, Base's one subclass: Base is compiled as final and cooked Abstract. | [Classes and variables](#classes-and-variables) |
 | `UE_INTERFACE` | Declares a mod interface, cooked as a Blueprint Interface asset. Its variables go to the classes that implement it. | [Interfaces](#interfaces) |
 | `UE_MOD_PACKAGE(Path)` | The /Game folder that a source's classes, structs, enums, interfaces and assets are cooked into. A namespace is a subfolder. | [Mod sources and packages](#mod-sources-and-packages) |
@@ -5618,7 +5621,7 @@ and where the feature is described. In each group, the messages you are most lik
   explicit value, or the enumerator. See [Enums](#enums).
 - `<Class>::<Function>: TODO: unimplemented intrinsic __EnumMap__`: Not yet. UE_ENUM_MAP in a function body is
   refused. It works only as a member default. Fix: keep the table in a member,
-  `TMap<EMood, FName> Names = UE_ENUM_MAP(EMood);`, and read the member. See [Enums](#enums).
+  `UE_ENUM_MAP(EMood, FName, Names);`, and read the member. See [Enums](#enums).
 - `<Name> is static: name it without the object in front, which would never be evaluated`: an inline class constant
   read through an object that a call computes, `Me()->kHold`. The constant is its initializer, so the call in front
   would never run. `this->kHold` and a variable in front are accepted. Fix: `kHold` or `<Class>::kHold`. See
