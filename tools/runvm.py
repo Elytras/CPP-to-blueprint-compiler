@@ -94,6 +94,11 @@ class Obj:
 
     def __repr__(s): return '<%s>' % s.cls
 
+    # A copy of what holds it - runscript's Map_Add / Array_Add deep-copy the value they store - copies the pointer, or
+    # the FScriptDelegate naming it, by assignment (TProperty::CopyValuesInternal, UnrealType.h 1090-1096): the object
+    # itself is the same one.
+    def __deepcopy__(s, memo): return s
+
 
 class _Stale:
     def __repr__(s): return '<stale: the destination keeps its previous value>'

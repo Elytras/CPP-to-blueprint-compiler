@@ -6,8 +6,8 @@
    bound on another object and assigned to a variable through another object (`Peer->Held = {H, ...}`) is typed with
    the variable's signature, as a Create Event wired to a Set node with its Target wired is (K2Node_CreateDelegate.cpp
    317-331); C++ binds it before `GetPeer()->Held` is located, so on the H that GetPeer replaces. Held parked for
-   `GetPeer()->Held = Held` is of Held's type too. The comma value handed to Peer's Take is held in a local the compiler
-   makes up, of a signature of DelegateParmSpell's own, which is not named after that local. */
+   `GetPeer()->Held = Held` is of Held's type too, and so is the local the compiler holds the comma value handed to
+   Peer's Take in: DelegateParmSpell makes no signature of its own. */
 #include "UeApi/Types.h"
 #include "UeApi/FSD.h"
 

@@ -7327,11 +7327,10 @@ def delegate_parm_spell():
     after) and the values handed to Take all name, the subclasses importing it from a Top that exports it
     (keeps_invariants: imports_resolve, func_override_params). A value bound on another object and assigned to a variable
     through another object is typed with that variable's signature: Top's Held through Peer and through GetPeer(), the
-    sibling's SibVar through S; so is the local Held is parked in for `GetPeer()->Held = Held`. DelegateParmSpellZKid
-    makes no signature of its own, and DelegateParmSpell at most one, for the local the comma value `(Bump(), Held)`
-    handed to Peer's Take is held in, never named after a local the compiler made up. Each value reaches where it goes,
-    and the one stored through GetPeer() binds the H it had before GetPeer replaced it, as C++ sequences the right side
-    first."""
+    sibling's SibVar through S; so is the local Held is parked in for `GetPeer()->Held = Held`, and the one the comma
+    value `(Bump(), Held)` handed to Peer's Take is held in, if it is kept. Neither subclass makes a signature of its
+    own, named or not. Each value reaches where it goes, and the one stored through GetPeer() binds the H it had before
+    GetPeer replaced it, as C++ sequences the right side first."""
     base = asset('DelegateParmSpell')
     here = os.path.dirname(base)
     top, zkid, sib = (os.path.join(here, c) for c in ('DelegateParmSpellTop', 'DelegateParmSpellZKid', 'DelegateParmSpellSib'))
@@ -7344,11 +7343,11 @@ def delegate_parm_spell():
     want = {('Use', 'D'): held, ('CallTake', None): {held}, ('SetPeer', None): {held}, ('SetGotPeer', None): {held},
             ('CopyGotPeer', None): {held}, ('SetSib', None): {sibvar}}
     assert {k: mine.get(k) for k in want} == want, (mine, want)
+    assert mine.get(('CommaTake', None), {held}) == {held}, mine
     want = {('Use', 'D'): held, ('CallTake', None): {held}, ('SetPeer', None): {held}}
     assert {k: zs.get(k) for k in want} == want, (zs, want)
-    assert not [e for e in exports_of(zkid) if e.endswith('__DelegateSignature')], exports_of(zkid)
-    own = [e for e in exports_of(base) if e.endswith('__DelegateSignature')]
-    assert len(own) <= 1 and not [e for e in own if e.startswith('_')], own     # the comma's, never `__Comma____...`
+    for b in (base, zkid):
+        assert not [e for e in exports_of(b) if e.endswith('__DelegateSignature')], (os.path.basename(b), exports_of(b))
     h, h2 = Obj('DelegateParmSpellHelper_C', Got=0), Obj('DelegateParmSpellHelper_C', Got=0)
     s, peer = Obj('DelegateParmSpellSib_C'), Obj('DelegateParmSpellTop_C')
     ping = ('delegate', 'PingI', h)
@@ -7407,7 +7406,7 @@ def delegate_parm_keys():
     value and a reference, a reference and a const one, a return value and none; int32 and int, TArray<int32> and
     TArray<int>, and an enum spelled short and qualified are one each. Each signature's properties are the type's. Each
     value reaches where it goes."""
-    base = pending_asset('DelegateParmKeys')
+    base = asset('DelegateParmKeys')
     here = os.path.dirname(base)
     top, kinds = (os.path.join(here, 'DelegateParmKeysNs', c) for c in ('DelegateParmKeysTop', 'DelegateParmKeysKinds'))
     zkid = os.path.join(here, 'DelegateParmKeysZKid')
@@ -7539,8 +7538,10 @@ print('ok  DelegateParmSig: an override\'s TDelegate parameter, and a value hand
 delegate_parm_spell()
 print('ok  DelegateParmSpell: a delegate type spelled with int32 and with int is one signature function, and a value set '
       'through another object names its variable\'s')
-pending('DelegateParmKeys: an enum spelled short, qualified or from the global namespace is one delegate type, and the '
-        'types C++ keeps apart get a signature function each', delegate_parm_keys)
+delegate_parm_keys()
+print('ok  DelegateParmKeys: an enum spelled short, qualified or from the global namespace is one delegate type, the '
+      'types C++ keeps apart get a signature function each, and a value stored into a parent\'s TArray or TMap names '
+      'its element\'s')
 dispatch_native_callable()
 native_dispatcher_refusals()
 print('ok  native dispatchers: Broadcast on a BlueprintCallable one names a signature of the class\'s own with its '
