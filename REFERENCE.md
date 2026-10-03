@@ -415,7 +415,7 @@ public:
 | `TSoftClassPtr<AActor> Soft = "/Game/A/BP_A.BP_A_C";` | A soft reference's default is its path. `"/Game/Dir/Pkg"` means `Pkg.Pkg`, so write the full path for a Blueprint class. See [Types](#types). | Yes |
 | `TArray<uint8> Payload = __EmbedFile__("data/blob.bin");` | Reads the file when the mod is built, from a path relative to the source's folder, and writes its bytes into the default, one element per byte. The compile prints `embed          -> Payload  (3 bytes)`. The file is not needed at run time. `__EmbedFile__` comes from `Intrin.h` in AssetGen's `include/` folder, included by its path as `Objects.h` is. | Yes |
 | `__EmbedFile__("missing.bin")`, `__EmbedFile__(kPath)` | Refused: a missing or empty file ("cannot read (or empty)"), and a path that is not a string literal ("the path must be a string literal"). It works only as the initializer of a `TArray<uint8>` member; clang refuses it for any other array type. | Refused |
-| `TMap<EMood, FName> Names = UE_ENUM_MAP(EMood);` | A name table that the compiler fills in when the mod is built, as a member default only. See [Enums](#enums). | Yes |
+| `UE_ENUM_MAP(EMood, FName, Names);` | Declares a `TMap<EMood, FName>` member holding a name table that the compiler fills in when the mod is built, as a member default only. See [Enums](#enums). | Yes |
 | `AMyActor() { Charges = 5; }` | A constructor is dropped with no message. See [Class defaults](#class-defaults). | Not yet |
 
 ```cpp
@@ -994,15 +994,19 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `TMap<EMood, FName> MoodNames = UE_ENUM_MAP(EMood);` | A member default the compiler fills in when the mod is built: one pair per enumerator in declaration order, with the C++ name as the text. The closing `_MAX` is left out. | Yes |
-| `TMap<FString, EMood> MoodsByName = UE_ENUM_MAP(EMood);` | The enum can be on either side, with FName or FString on the other. | Yes |
-| `TMap<EEndPlayReason, FName> Reasons = UE_ENUM_MAP(EEndPlayReason);` | Any enum the source can see works, the game's included. | Yes |
-| `TMap<int32, FName> M = UE_ENUM_MAP(EMood);` | Refused by clang: the map must be over that enum. | Refused |
+| `UE_ENUM_MAP(EMood, FName, MoodNames);` | Declares the member `TMap<EMood, FName> MoodNames` with a default the compiler fills in when the mod is built: one pair per enumerator in declaration order, with the C++ name as the text. The closing `_MAX` is left out. | Yes |
+| `UE_ENUM_MAP(FString, EMood, MoodsByName);` | The enum can be on either side, with FName or FString on the other. | Yes |
+| `UE_ENUM_MAP(EEndPlayReason, FName, Reasons);` | Any enum the source can see works, the game's included. | Yes |
+| `TMap<EMood, FName> MoodNames = UE_ENUM_MAP(EMood);` | The default alone, for a member you declare yourself: the same table. | Yes |
+| `UE_ENUM_MAP(int32, FName, M);`, `UE_ENUM_MAP(EMood, EMood, M);`, `UE_ENUM_MAP(EMood, int32, M);` | Refused by clang, naming both types: "static assertion failed due to requirement '__EnumMapPair__<int, FName>': UE_ENUM_MAP(Key, Value, Name): one of Key and Value is an enum and the other FName or FString". | Refused |
+| `UE_ENUM_MAP(TEnum<EMood>, FName, M);` | Refused the same way: write the enum itself, `UE_ENUM_MAP(EMood, FName, M);`. | Refused |
+| `TMap<int32, FName> M = UE_ENUM_MAP(EMood);` | Refused by clang, "no viable conversion from '__EnumMapInit__<EMood>' to 'TMap<int32, FName>'": the one-argument form is the default of a TMap between that enum and FName or FString. | Refused |
+| `UE_ENUM_MAP(FName, EMood);`, `UE_ENUM_MAP(FName, EMood, A, B);` | Refused by clang: "UE_ENUM_MAP takes (Enum), or (Key, Value, Name) to declare the member". Written as an initializer, `= UE_ENUM_MAP(FName, EMood)`, clang says only "expected expression". | Refused |
 | `UE_ENUM_MAP(EMood)` in a function body | Not yet: refused with `unimplemented intrinsic __EnumMap__`. Keep the table as a member and read the member. | Not yet |
 
 ```cpp
-TMap<EMood, FName> MoodNames = UE_ENUM_MAP(EMood);    // Calm, Angry, Sleepy
-TMap<FString, EMood> MoodsByName = UE_ENUM_MAP(EMood);
+UE_ENUM_MAP(EMood, FName, MoodNames);      // Calm, Angry, Sleepy
+UE_ENUM_MAP(FString, EMood, MoodsByName);
 
 FName NameOf(EMood M) { return MoodNames[M]; }
 EMood Parse(FString Text) { return MoodsByName[Text]; }  // Calm for an unknown name
@@ -1329,6 +1333,7 @@ Notes:
 | `Items.Append(Twice());` | A container that a call returns, passed to `Append` or `Union`, is stored in a local first. | Yes |
 | `TArray<int32> Primes = {2, 3, 5};` | A braced member default, written into Class Defaults element by element. | Yes |
 | `TMap<FName, int32> Cost = {{"Gold", 5}};` | A map's elements are `{key, value}` pairs. | Yes |
+| `TMap<FString, int32> M = {{"a", 5}, {"A", 1}};`, `TSet<int32> S = {3, 3};` in a default | A key given twice is written once, where it first appears, holding the last element given, as C++'s value holds it. An FString key compares without case, as an FName does, so this M is `{"A": 1}`. | Yes |
 | `TArray<FVector> Points = {{1, 2, 3}, FVector(4, 5, 6)};` | Struct elements can be braces or constructor calls. | Yes |
 | `TArray<int32> Rolls = {UKismetMathLibrary::RandomInteger(3)};` | Refused: every element of a default must be known when the mod is built. See [Classes and variables](#classes-and-variables). | Refused |
 | `TArray<int32> L = {4, 5, 6};` in a function | The Make Array node: a temporary filled at once, made afresh each time the code runs. | Yes |
@@ -2804,11 +2809,12 @@ component: see [The root and attachment](#the-root-and-attachment).
 | `UE_DEFAULTS { InitialLifeSpan = 3.0f; }` | This class's default for a property a parent declares (an engine, game or mod class), written on its default object as Class Defaults would. No `Super::` is needed. It works in any class, not only an actor. | Yes |
 | `Lamp->Intensity = 1500.0f;` | A default on the template of a component this class declares, as editing the component in the details panel writes it. A zero or `false` is still written, because a template is compared with the component class's own defaults, where `bVisible` is true. | Yes |
 | `Lamp->LightColor = FColor(255, 128, 0);`, `Lamp->LightColor = {255, 128, 0};` | A struct value, by constructor or by braces. Each argument goes to the member its parameter is named after, so `FColor` takes R, G, B, A as in C++, although it stores B, G, R, A. Braces on an SDK struct that has a constructor call that constructor. Only a struct with no constructor is filled by member position. | Yes |
-| `Ids = {2, 3};`, `Score = {{"a", 5}, {"b", 2}};` on a TSet or TMap a parent declares | This class's whole value, as Class Defaults would set it. The default object loads a set or map over its parent's value, so the compiler writes what differs, as the editor saves it: the parent's elements (a map's keys) this value lacks, as removed, then the elements the parent lacks or maps to another value. The parent's value is known when a mod class gives it; below an engine or game class, whose value no header says, the elements are added to that class's own. The same holds for a TSet or TMap inside a UE_STRUCT a parent declares, when you assign the struct whole (`Held = {{2, 3}, 3};`). | Yes |
+| `Ids = {2, 3};`, `Score = {{"a", 5}, {"b", 2}};` on a TSet or TMap a parent declares | This class's whole value, as Class Defaults would set it. The default object loads a set or map over its parent's value, so the compiler writes what differs, as the editor saves it: the parent's elements (a map's keys) this value lacks, as removed, then the elements the parent lacks or maps to another value. The parent's value is known where a header gives it: an initializer, a `UE_DEFAULTS` or a `UE_STRUCT` member's default instance, in a class of this mod or of another mod's shared header (`UE_CLASS_IN`, or `UE_CLASS` where the header gives the member a value). Below an engine or game class, whose value no header says, the elements are added to that class's own, with a warning naming the member, and so below a class whose `UE_DEFAULTS` sets the member over one (its default object holds that class's elements too; the statement's own are still removed). The same holds for a TSet or TMap inside a UE_STRUCT a parent declares, when you assign the struct whole (`Held = {{2, 3}, 3};`). A key given twice holds the last value given, as in C++, and an FString key compares without case: `{{"a", 5}, {"A", 1}}` is `{"A": 1}`. | Yes |
 | `Mesh->StaticMesh = &SM_Crate_B;` | Points an object property at an asset: a `UE_ASSET_AT`, a UeAssets name or an asset the mod cooks. The same as picking the asset in the details panel. | Yes |
 | `Index_0 = 7;`, for a member the SDK spells `Index_0` | Written under the engine's real name, `Index`. See [Classes and variables](#classes-and-variables). | Yes |
 | `Lamp->RelativeLocation.Z = 50.0f;` | Refused. Assign the whole struct: `Lamp->RelativeLocation = FVector(0.0f, 0.0f, 50.0f);`. The message is misleading: it says UeApi "does not say which default subobject RelativeLocation is", and regenerating the SDK does not help. | Refused |
 | `int32 Charges;` with `UE_DEFAULTS { Charges = 3; }` | Refused: "is declared here - give it an initializer instead". Write `int32 Charges = 3;`. | Refused |
+| `UE_DEFAULTS;` in the class, `void UTurret::UeDefaults__() { Charges = 3; }` outside it | Refused: "UE_DEFAULTS has no body in the class". The statements are read where the macro is written, which is also all a mod that includes the class's header sees. Write `UE_DEFAULTS { Charges = 3; }` in the class. | Refused |
 | `Extra->bVisible = false;`, where `Extra` is a plain pointer member | Refused: "is not a UE_COMPONENT". Only a `UE_COMPONENT`, this class's or a parent's, has a template to hold defaults. | Refused |
 | `Lamp->Intensity += 100.0f;`, an `if`, a call such as `K2_DestroyActor();` | Refused: "every statement is `Field = value;`, `Component->Field = value;` or `Component->SetupAttachment(Parent);`". The block never runs, so logic in it could do nothing. | Refused |
 | `Lamp->Intensity = UKismetMathLibrary::RandomFloat();`, `InitialLifeSpan = sizeof(FVector);` | Refused: "a default is a value known when the mod is built". A value here follows the rules for a member's initializer: see [Classes and variables](#classes-and-variables). Compute anything else in `ReceiveBeginPlay` or `UserConstructionScript`. | Refused |
@@ -3436,6 +3442,7 @@ not a C++ value, so point at it with `&`.
 | `namespace Moods { UMoodDef Angry = {.Health = 50}; }` | A namespace is a folder: the asset is cooked at `<mod package>/Moods/Angry`. See [Mod sources and packages](#mod-sources-and-packages). | Yes |
 | `.Delay = FFloatInterval(1.0f, 5.0f)`, `.Delay = {2.0f, 6.0f}` | A struct member, by constructor or by braces, one value per member, as in any default. | Yes |
 | `.Waves = {3, 5, 8}` | A container member takes a braced list. | Yes |
+| `.Ids = {3}`, `.Score = {{"a", 5}}` on a TSet or TMap whose class default is `{1, 2}`, `{{"a", 1}, {"c", 3}}` | The asset's whole value, as C++ means it. The asset loads a set or map over its class default's value, so the compiler writes what differs, as the cooker does: the class default's elements (a map's keys) this value lacks, as removed, then the elements the class default lacks or maps to another value. `.Ids = {}` empties it. The class default is known where a header gives it: an initializer, a `UE_DEFAULTS` on the way or a `UE_STRUCT` member's default instance, in a class of this mod or of another mod's shared header (`UE_CLASS_IN`, or `UE_CLASS` where the header gives the member a value). A game or engine class's value no header says: there the elements are added to that class's own, with a warning naming the member, and so over a class whose `UE_DEFAULTS` sets the member over one. The same holds for a TSet or TMap inside a struct member. A key given twice holds the last value given, as in C++, and an FString key compares without case: `{{"a", 5}, {"A", 1}}` is `{"A": 1}`. A TArray is replaced whole. | Yes |
 | `.Next = &MD_Calm` | One asset pointing at another. | Yes |
 | `.EnemyClass = "/Game/A/BP_A.BP_A_C"` | A soft object or soft class member takes the asset's path as a string, written the way the cooker writes it. The path rules are in [Types](#types). | Yes |
 | `UBigDef MD_Huge = {{.Health = 900}, false};` | Sets a member a mod base class declares: the base gets a brace list of its own as the first element. C++ cannot designate a base's member (`{.Health = 900}` is a clang error), and after a nested base list the class's own members go by position. | Yes |
@@ -3864,7 +3871,9 @@ Notes:
 | `{Peer, &Scorer::HandleTimer}` | The same with the Object pin wired: HandleTimer bound on Peer, which the timer then calls. The rules are those of a handler on another object. | Yes |
 | `TDelegate<void()>(this, &Scorer::HandleTimer)` | The same value, spelled out. | Yes |
 | `K2_ClearTimerDelegate({})` | Refused: "a delegate value is {this, &Class::Function}". There is no empty or unbound delegate. | Refused |
-| `TDelegate<void()> Callback;` as a class variable, a function parameter or a local | A delegate variable (DelegateProperty). `Callback = {this, &Class::Method};` stores a value, and `Callback` passes it on, to a timer or another function. Its signature function is one the class makes per delegate type, `<Variable>__DelegateSignature`, as the editor makes one per dispatcher, numbered past a name the class, a mod or game Blueprint parent, or a mod child compiled with it already uses (not past a native parent's own delegate signatures, such as UWidget's `GetText__DelegateSignature`, which UeApi does not list). A struct or an interface makes none, so a delegate in one is refused. | Yes |
+| `.D = {}` in an asset's braces, `{}` as a map's value in a default (`TMap<FString, TDelegate<void()>> M = {{"A", {}}};`) | An unbound delegate, the one value a default holds (`D = {this, &C::F}` in UE_DEFAULTS is refused: a default is known when the mod is built). Written as the engine writes one, a null object and the name None; an asset's tags name no signature function. | Yes |
+| `TDelegate<void()> Callback;` as a class variable, a function parameter or a local | A delegate variable (DelegateProperty). `Callback = {this, &Class::Method};` stores a value, and `Callback` passes it on, to a timer or another function. Its signature function is one the class makes per delegate type, as the editor makes one per dispatcher. One C++ type is one however it is spelled (`TDelegate<void(int32)>` and `TDelegate<void(int)>`, an enum named short or with its namespace), and two types are two, a reference and a const reference among them (`void(FVector&)`, `void(const FVector&)`). It is named `<Name>__DelegateSignature` after what needs it first: a variable or parameter of the class, the function a value binds, or the class's parameter or variable through which a class compiled with it, and generated before it - a subclass or not -, overrides a function, hands it a value or stores one into it (`Delegate__DelegateSignature` when that is a local the compiler made up). The name is numbered past a name the class, a mod or game Blueprint parent, or a mod child compiled with it already uses (not past a native parent's own delegate signatures, such as UWidget's `GetText__DelegateSignature`, which UeApi does not list). A struct makes none, so a delegate member of one is refused; a mod interface's TDelegate variable is its implementer's property. | Yes |
+| `void Use(TDelegate<void()> D) override` of a mod parent's `Use`; `Take({Peer, &Scorer::Ping})` with Take a mod parent's or a sibling class's of this mod; `ParentVar = {Peer, &Scorer::Ping}`, `Other->Var = {Peer, &Scorer::Ping}`, `ParentArr[0] = {Peer, &Scorer::Ping}`, `Other->Map[K] = {Peer, &Scorer::Ping}` | The override's parameter names the signature function of the class that declares `Use` first, imported from its package, as the editor's override copies its parent's parameters, even where the override spells the type another way (`int` for `int32`, an enum with or without its namespace); a static hiding a parent's static does the same. A value bound on another object is typed with the signature of the parameter or variable it goes to, as a Create Event wired to that pin is, on this object or another, and one stored into an element of such a variable's TArray or a value of its TMap with the element's; a comma value `(Bump(), D)` handed to such a parameter is held in a local of its type. `ParentArr.Add({Peer, &Scorer::Ping})` and the other container functions still type the value with a signature of this class's own, which runs the same. A call whose body is copied in (`Parent::Take(...)`, a static of a class this source cooks) has no parameter to wire, and the value keeps a signature of this class's own. Only classes the same compile cooks: one another mod cooks (UE_CLASS / UE_CLASS_IN) keeps a signature of this class's own, which runs the same, since its name there is not known here. | Yes |
 
 The timers in [Timers and input](#timers-and-input) show delegate values in use.
 
@@ -4165,13 +4174,14 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `class IAimable { public: UE_INTERFACE; void OnAimed(AActor *By); int32 GetPriority(); };` | A Blueprint Interface asset, cooked at `<UE_MOD_PACKAGE>/IAimable` as class IAimable_C, with one empty function per method. Functions can return values and take reference (out) parameters. | Yes |
+| `class IAimable { public: UE_INTERFACE; void OnAimed(AActor *By); int32 GetPriority(); };` | A Blueprint Interface asset, cooked at `<UE_MOD_PACKAGE>/IAimable` as class IAimable_C, with one empty function per method. The asset registry lists `<UE_MOD_PACKAGE>/IAimable.IAimable_C`, as for a class. Functions can return values and take reference (out) parameters. | Yes |
 | `class Turret : public AActor, public IAimable` | Implements it as for a game interface: matched by name, with stubs for the functions left out. There is no Events.json check, because every function of a mod interface can be implemented. | Yes |
 | `virtual int32 GetPriority() = 0;` on the interface | The same as a declaration without a body. A class that leaves it out gets the empty stub and is not cooked Abstract. | Yes |
 | `int32 GetPriority() { return 1; }` on the interface | A default implementation. A class that leaves the function out gets this body, with `this` being that class, instead of an empty stub. Blueprint Interface functions have no bodies in the editor. | Yes |
 | `class IMarkable : public IAimable { public: UE_INTERFACE; ... };` | An interface that extends one other. A class that lists IMarkable alone implements both: a cast to either succeeds, and it gets stubs for the parent's functions it leaves out. | Yes |
 | `class IPriorityTarget : public ITargetable { public: UE_INTERFACE; ... };` | A mod interface that extends a game interface (FSD's Targetable). An implementer gets the game interface's functions too, checked against Events.json. | Yes |
-| `int32 Marks = 3;` on the interface | A variable on an interface, AssetGen's own feature: the engine's interfaces hold no state. It becomes a property of every class that directly implements the interface, not declared again in their subclasses. The initializer is its default, and the implementer's or a subclass's UE_DEFAULTS can set another. | Yes |
+| `int32 Marks = 3;` on the interface | A variable on an interface, AssetGen's own feature: the engine's interfaces hold no state. It becomes a property of every class that directly implements the interface, not declared again in their subclasses. The initializer is its default, and the implementer's or a subclass's UE_DEFAULTS can set another; a subclass's TSet or TMap is written over the implementer's value, as any inherited one is. Its name is held to the implementer's as its own variables are: one its parents already have (`Tags` on an actor), or that a subclass declares again, is refused. | Yes |
+| `UTurretDef TD_Big = {{}, {.Marks = 5}, 100};` | A data asset of a class that implements IMarkable gives the interface's variables in the interface's own braces, after the base's (here UPrimaryDataAsset's `{}`), then the class's own members. | Yes |
 | `UE_REPLICATED_USING(int32, Score, OnRep_Score);` on the interface | A replicated variable. Each implementing class gets the replicated property and an OnRep_Score of its own: its own definition, else the interface's body, else an empty stub. See [Replication](#replication). | Yes |
 | `TScriptInterface<IMarkable> M = Other; return M->Marks;` | Refused: "Marks is a variable of the interface IMarkable, which holds no state itself". Read it through an object of an implementing class, or declare a getter function on the interface. | Refused |
 | `int32 Marks;` in a class that implements IMarkable | Refused: "the variable Marks of the interface IMarkable is declared twice". The interface's variable already is this class's property; set its default in UE_DEFAULTS. | Refused |
@@ -5318,7 +5328,7 @@ listed here is refused with "unimplemented intrinsic".
 | Dispatcher methods, `OnHit.Add(this, &C::F)`, `Remove`, `Clear()`, `Broadcast(...)` | Bind Event, Unbind Event, Unbind all Events and Call. A dispatcher has no other methods. | [Event dispatchers](#event-dispatchers) |
 | Double literal beside a float, `X * 0.5` | Refused: in C++ it is double math, and Blueprint 4.27 has no double. Write `0.5f`. | [Literals and conversions](#literals-and-conversions) |
 | `__EmbedFile__("Path")` | A file's bytes, read at build time, as the default of a `TArray<uint8>` member. | [Classes and variables](#classes-and-variables) |
-| `__EnumMap__`, `__EnumMapInit__` | What UE_ENUM_MAP expands to. Write UE_ENUM_MAP. | [Enums](#enums) |
+| `__EnumMap__`, `__EnumMapInit__`, `__EnumMapSide__`, `__EnumMapCheck__`, `__EnumMapPair__`, `__EnumMapText__`, `__EnumMapNone__`, `__EnumMapSame__`, `__EnumMapEnum__`, `__EnumMapTake__`, `__EnumMapMember__` | What UE_ENUM_MAP expands to. Write UE_ENUM_MAP. | [Enums](#enums) |
 | Event override, `void ReceiveBeginPlay()` | Overrides that event, as adding its node in the editor does. Copy the SDK's parameter list: nothing checks it. | [Overrides and parent calls](#overrides-and-parent-calls) |
 | `ExecuteUbergraph_<Class>` | The name of the event graph that holds the methods that wait. A method named so is refused. | [Latent calls](#latent-calls) |
 | `FDeref` | The scratch struct that every read and write through a pointer goes through. AssetGen creates it when the mod declares none. | [Pointers and memory](#pointers-and-memory) |
@@ -5407,7 +5417,7 @@ listed here is refused with "unimplemented intrinsic".
 | `UE_DISPATCHER(Name, Params...)` | An event dispatcher on a mod class, with its parameter list. | [Event dispatchers](#event-dispatchers) |
 | `UE_ENUM(Enum)` | Cooks an `enum class` based on `uint8`, `int32` or `int64` as a UserDefinedEnum (an Enumeration asset). | [Enums](#enums) |
 | `UE_ENUM_IN(Enum, Package)` | UE_ENUM for an enum in a shared header: only the source whose UE_MOD_PACKAGE is exactly Package cooks it. | [Enums](#enums) |
-| `UE_ENUM_MAP(Enum)` | A TMap member default from each enumerator to its name, or back, filled in at build time. | [Enums](#enums) |
+| `UE_ENUM_MAP(Key, Value, Name)`, `UE_ENUM_MAP(Enum)` | A TMap member from each enumerator to its name, or back, filled in at build time: declared by the three-argument form, the default alone by the one-argument form. | [Enums](#enums) |
 | `UE_FINAL_AS(Base, Leaf)` | Declares `class Leaf final : public Base {}`, Base's one subclass: Base is compiled as final and cooked Abstract. | [Classes and variables](#classes-and-variables) |
 | `UE_INTERFACE` | Declares a mod interface, cooked as a Blueprint Interface asset. Its variables go to the classes that implement it. | [Interfaces](#interfaces) |
 | `UE_MOD_PACKAGE(Path)` | The /Game folder that a source's classes, structs, enums, interfaces and assets are cooked into. A namespace is a subfolder. | [Mod sources and packages](#mod-sources-and-packages) |
@@ -5617,7 +5627,20 @@ and where the feature is described. In each group, the messages you are most lik
   explicit value, or the enumerator. See [Enums](#enums).
 - `<Class>::<Function>: TODO: unimplemented intrinsic __EnumMap__`: Not yet. UE_ENUM_MAP in a function body is
   refused. It works only as a member default. Fix: keep the table in a member,
-  `TMap<EMood, FName> Names = UE_ENUM_MAP(EMood);`, and read the member. See [Enums](#enums).
+  `UE_ENUM_MAP(EMood, FName, Names);`, and read the member. See [Enums](#enums).
+- `static assertion failed due to requirement '__EnumMapPair__<<Key>, <Value>>': UE_ENUM_MAP(Key, Value, Name): one of
+  Key and Value is an enum and the other FName or FString; for a TEnum<E>, write E` (clang, pointing into UeMeta.h,
+  with a note at your line): the three-argument form over two types that are not an enum and FName or FString, such
+  as `UE_ENUM_MAP(int32, FName, M);` or `UE_ENUM_MAP(TEnum<EMood>, FName, M);`. Fix: name the enum itself on one side
+  and FName or FString on the other. See [Enums](#enums).
+- `static assertion failed: UE_ENUM_MAP takes (Enum), or (Key, Value, Name) to declare the member` (clang): UE_ENUM_MAP
+  with two arguments, or none, or more than three, as a member, `UE_ENUM_MAP(FName, EMood);`. As an initializer,
+  `= UE_ENUM_MAP(FName, EMood)`, clang's own "expected expression" comes instead. Fix: `UE_ENUM_MAP(FName, EMood,
+  Moods);` declares the member; `TMap<FName, EMood> Moods = UE_ENUM_MAP(EMood);` gives one you declare its default.
+  See [Enums](#enums).
+- `no viable conversion from '__EnumMapInit__<<Enum>>' to 'TMap<...>'` (clang): the one-argument form as the default
+  of a map that is not between that enum and FName or FString. Fix: declare the map over the enum, or use the
+  three-argument form. See [Enums](#enums).
 - `<Name> is static: name it without the object in front, which would never be evaluated`: an inline class constant
   read through an object that a call computes, `Me()->kHold`. The constant is its initializer, so the call in front
   would never run. `this->kHold` and a variable in front are accepted. Fix: `kHold` or `<Class>::kHold`. See
@@ -5742,7 +5765,9 @@ and where the feature is described. In each group, the messages you are most lik
   NONE. Fix: rename it. See [Overloading](#overloading).
 - `<Class>::<Name>: <Ancestor> already has a variable <Name>, and an FName ignores case; rename it` (or `a function`):
   a member reusing a name the parent chain has, in any case. Overriding a function under its exact name is fine. To
-  change an inherited variable's default, assign it in `UE_DEFAULTS`. See [Class defaults](#class-defaults).
+  change an inherited variable's default, assign it in `UE_DEFAULTS`. A mod interface's variables count as the
+  implementing class's own: one named `Tags` on an actor is refused the same way (`<Class>` is the implementer). See
+  [Class defaults](#class-defaults).
 - `<Class>::<Function>: <N> parameters, the return value included; a function takes at most 255`: the engine counts a
   function's parameters in one byte. Fix: pass a struct instead of the long list.
 - `<Class>::<Function>: its parameters take <N> bytes; a function's parameter block holds at most 65535`: the engine
@@ -5973,6 +5998,10 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   that the same class declares, as in `int32 Health; UE_DEFAULTS { Health = 100; }`. Fix: give the variable its value
   where it is declared, `int32 Health = 100;`. UE_DEFAULTS is for inherited variables and for components. See
   [Class defaults](#class-defaults).
+- ``<Class>: UE_DEFAULTS has no body in the class; AssetGen reads its statements there alone, so write them in it, `UE_DEFAULTS { ... }`: a definition out of the class, `void <Class>::UeDefaults__()`, is never read, nor seen by a mod that includes the class's header``:
+  `UE_DEFAULTS;` declares the block without its statements, which may sit in an out-of-line definition. Those would
+  be dropped, and a mod that includes the class's header could not see them either. Fix: move the statements into
+  the class, `UE_DEFAULTS { Health = 100; }`. See [Class defaults](#class-defaults).
 - `` <Class>::UE_DEFAULTS: every statement is `Field = value;`, `Component->Field = value;` or `Component->SetupAttachment(Parent);` ``:
   a statement in UE_DEFAULTS is not a plain `=` onto a member, nor a SetupAttachment: a call such as
   `K2_DestroyActor();`, `Health += 5;`, a local or an `if`. The block never runs; AssetGen only reads its assignments
@@ -6013,6 +6042,16 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   written, and it keeps the parent's value`: `Handle = FTimerHandle();` in UE_DEFAULTS. No tag can set a Transient
   member (the loader skips it), so the default holds the parent's handle. Fix: none needed; drop the statement to
   silence it.
+- `warning: <Asset>.<Member>: <Class>'s default object holds a value that no header says, so none of its elements is
+  removed: any it has load as well`, or `<Class>::UE_DEFAULTS: <Member>: ...`: a data asset's braces, or a
+  `UE_DEFAULTS` statement, give a TSet or TMap whose class default belongs to an engine class or a game Blueprint,
+  named as the source writes it (`BoolSave_C`, not its `Game::` path), or lies over one: a class whose `UE_DEFAULTS`
+  sets the member is written over that class's value, which its default object then holds too. The loader starts the value from that default
+  and applies what AssetGen writes, so elements the braces leave out stay.
+  A class of a shared header declared with `UE_CLASS` whose member has no initializer gets it too, ending "if a mod
+  cooks <Class>, declare it with UE_CLASS_IN or give the member an initializer": a game Blueprint's header looks the
+  same. Fix: for a game or engine class, none (its value is the game's); for another mod's class, what the message
+  says. See [Data assets](#data-assets).
 - `warning: <Class>::UE_DEFAULTS: <Root> is the actor's root, which the engine puts at the spawn transform, so its
   <Properties> is not applied. A USceneComponent root passes its transform on to the components attached to it.`:
   UE_DEFAULTS sets RelativeLocation, RelativeRotation or RelativeScale3D on the actor's root, and the root is not a
@@ -6165,6 +6204,10 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   passed to `UKismetSystemLibrary::K2_ClearTimerDelegate`. There is no empty delegate value. Fix: pass
   `{ this, &AMine::Handle }` or `TDelegate<void()>(this, &AMine::Handle)`. See
   [Event dispatchers](#event-dispatchers).
+- `<Where>: TDelegate<...> needs a signature function, which only a class holds, not a struct or an interface`
+  (`member D: ...`): a `UE_STRUCT` member of a delegate type. The editor makes a delegate's signature function in a
+  class; a struct has none to name. Fix: keep the delegate in a class variable. A mod interface's TDelegate variable
+  is the implementing class's own property, which makes it. See [Delegate values](#delegate-values).
 - `` a delegate binds `&Class::Function` ``: the function half of a bind is not written as `&Class::Function`, for
   example a member-pointer variable. Fix: write `&Class::Function` in the Add or Remove call itself. See
   [Event dispatchers](#event-dispatchers).
@@ -6638,7 +6681,10 @@ Until it is fixed, write the statement it points at in another form.
   <DeclKind>`, `call to a function on an unknown class: <Class>`, `access to a property of an unknown class: <Member>`,
   `__ClassOf__: no enclosing class in scope`, `hoisting <Intrinsic>: <Reason>`,
   `internal: <Method>'s <Which> is not in the call`,
-  `internal: a TMap walked in place with an element aligned past 8 bytes` and `internal: no exact == for <Type>`.
+  `internal: a TMap walked in place with an element aligned past 8 bytes`, `internal: no exact == for <Type>`,
+  `internal: <Type> of <Holder> outside a class` and `internal: a signature function <Class> was to make for <Type>,
+  <Name>, is imported but never made` (a delegate's signature function another class of the mod names, which the
+  class declaring the delegate did not make: nothing is cooked).
 - **Code lowered outside a function body.** `internal: a call outside a function body`,
   `internal: an inline call outside a function body`, `internal: a struct value outside a function body`,
   `internal: a container value outside a function body`, `internal: Contains outside a function body` and

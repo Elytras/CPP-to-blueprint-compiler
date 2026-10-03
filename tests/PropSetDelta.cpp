@@ -34,6 +34,7 @@ public:
   TMap<FName, int32> Score = {{"a", 1}, {"c", 3}};
   FPropSetHeld Held = {{1, 2}, {{"a", 1}, {"c", 3}}, 3};
   FPropSetDeep Deep = {{{1, 2}, {{"a", 1}, {"c", 3}}, 3}, 4};
+  TMap<FString, int32> Text = {{"A", 1}};   // MapPatch's FString case
 };
 
 class PropSetDelta : public PropSetBase {

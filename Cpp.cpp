@@ -280,11 +280,50 @@ bool AttachmentCall(const Json& S, const Json*& Callee, const Json*& Child, cons
     return Child != nullptr;
 }
 
+/* A set's or map's elements as the braces leave them in C++: each key once, where it first appears, holding the last
+   element given for it, as the initializer-list constructors Add each element in order and Add replaces the whole
+   element, a map's value and the key's own spelling (Map.h 1166-1173; TSet::Emplace, Set.h 625). Keys compare as the
+   engine compares them, by their bytes (KeyDef's), a name by its row in a scratch table, which a name spelled in another
+   case shares; an FString with its case folded, as FString's == and GetTypeHash ignore it (UnrealString.h 1123,
+   Strihash; ASCII letters only, FChar::ToLower). A delta checks one pair at a time against the default object's, so a
+   second pair that matches it would be dropped and the first would win; and a class's own value written with both
+   would load the first spelling. */
+void LastValuePerKey(std::vector<FDefaultValue>& Items, bool bMap, const FPropertyDef& KeyDef)
+{
+    FPackage Scratch("/Scratch");
+    Scratch.SeedNames({});
+    auto Key = [&](const FDefaultValue& V) {
+        FPropertyDef E = KeyDef;
+        E.Default = V;
+        if (KeyDef.Type == "StrProperty") E.Default.S = Lower(V.S);
+        FArc A(&Scratch);
+        WriteDefaultValue(A, E);
+        return A.B;
+    };
+    const size_t Step = bMap ? 2 : 1;
+    std::vector<FDefaultValue> Once;
+    std::vector<std::vector<uint8>> Keys;
+    for (size_t I = 0; I + Step <= Items.size(); I += Step)
+    {
+        std::vector<uint8> K = Key(Items[I]);
+        const auto Had = std::find(Keys.begin(), Keys.end(), K);
+        const auto From = Items.begin() + std::ptrdiff_t(I);
+        if (Had == Keys.end())
+        {
+            Keys.push_back(std::move(K));
+            Once.insert(Once.end(), From, From + std::ptrdiff_t(Step));
+        }
+        else std::copy(From, From + std::ptrdiff_t(Step), Once.begin() + (Had - Keys.begin()) * std::ptrdiff_t(Step));
+    }
+    Items = std::move(Once);
+}
+
 /* An inherited set's or map's default P, made what the editor saves (PropertySet.cpp 359-429, PropertyMap.cpp
    400-472) against Parent, the parent CDO's value it loads over: the parent's elements (a map's keys) P lacks as
    removed, and of P's own only those the parent lacks (a map's pairs whose key it lacks or maps elsewhere). Elements
    compare as the engine reads them, by their bytes: a name by its row in a scratch table, which a name spelled in
-   another case shares, as FName's comparison ignores case. */
+   another case shares, as FName's comparison ignores case. An FString key spelled in another case compares unequal
+   here, though the engine's compare ignores it: listed as removed and added, it loads in the new spelling. */
 void DiffAgainstParent(FPropertyDef& P, const FDefaultValue& Parent)
 {
     if (!P.Inner) return;
@@ -305,6 +344,7 @@ void DiffAgainstParent(FPropertyDef& P, const FDefaultValue& Parent)
         return nullptr;
     };
     FDefaultValue& Mine = P.Default;
+    LastValuePerKey(Mine.Items, bMap, *P.Inner);
     Mine.Removed.clear();
     for (size_t I = 0; I + Step <= Parent.Items.size(); I += Step)
         if (!Find(Mine.Items, Parent.Items[I])) Mine.Removed.push_back(Parent.Items[I]);
@@ -570,6 +610,29 @@ std::vector<std::string> ParmNames(const Json& Decl)
     return Out;
 }
 
+/* Decl's parameter Index, counted as ParmNames counts them; null past the last. */
+const Json* ParmDeclAt(const Json& Decl, size_t Index)
+{
+    const Json* Out = nullptr;
+    size_t At = 0;
+    ForEach(Decl, [&](const Json& C) { if (Kind(C) == "ParmVarDecl" && At++ == Index) Out = &C; });
+    return Out;
+}
+
+/* The type LowerParams makes parameter P's property of: its reference dropped, which *bRef reports. */
+std::string ParmTypeOf(const Json& P, bool* bRef = nullptr)
+{
+    std::string Type = TypeOf(P);
+    bool bAmp = false;
+    while (!Type.empty() && (Type.back() == '&' || Type.back() == ' ' || Type.back() == '\t'))
+    {
+        bAmp = bAmp || Type.back() == '&';
+        Type.pop_back();
+    }
+    if (bRef) *bRef = bAmp;
+    return Type;
+}
+
 /* WorldContextObject, WorldContext, Dumper-7's WorldContextObject_0: the parameter a Blueprint wires to self. */
 bool IsWcoName(const std::string& N) { return N.compare(0, 12, "WorldContext") == 0; }
 
@@ -612,6 +675,7 @@ struct FRecord
     bool bFinalAsLeaf = false;  // UE_FINAL_AS's leaf: its base's one subclass
     std::string FinalAs;        // UE_FINAL_AS(this, Leaf): Leaf's CppName - compiled as final, cooked Abstract
     bool bIsLocal = false;      // UePackage == ModPackage/CppName: cooked here, published at its /Game path
+    bool bClassIn = false;      // UE_CLASS_IN: a mod's own class, cooked by the mod it names from this header
     bool bIsStruct = false;     // UE_STRUCT: cooked as a UserDefinedStruct asset
     bool bIsInterface = false;  // UE_INTERFACE: cooked as a BPGC whose super is UInterface
     bool bIsPatch = false;      // UE_PATCH: not a class of its own; its UE_DEFAULTS edit its parent's, in the parent's package
@@ -1303,6 +1367,28 @@ private:
        is asked for, named after the variable Holder that asked. */
     bool DelegateSignature(const std::string& Type, const std::string& Holder, FBlueprintClass& BP, FIndex* Sig,
                            std::string* Err);
+    /* A delegate type as one key however it is spelled: `TDelegate<void(int32)>` and `TDelegate<void (int)>` are one. */
+    std::string DelegateKey(const std::string& Type) const;
+    /* Whether N names a function class For's own signature functions must stay clear of, up and down its chain. */
+    bool SignatureNameTaken(const FRecord& For, const std::string& N) const;
+    /* The name of the signature function class In gives `TDelegate<...>` Type: the one it made, or the one a class
+       generated before it reserved for it, else a new one named after Holder (Delegate for a local the compiler made
+       up), kept for In from here on. */
+    std::string SignatureName(const FRecord& In, const std::string& Type, const std::string& Holder);
+    /* The signature function the parameter Index of Owner's Method names, when that is another mod class's generated
+       here - an override's parameters are its parent's - imported into BP; false when it is the class's being built,
+       or a class's this compile does not generate. The type is that class's own declaration's. */
+    bool ImportedParamSignature(const FRecord& Owner, const std::string& Method, size_t Index, FBlueprintClass& BP,
+                                FIndex* Sig);
+    /* The same for the TDelegate variable Field a class declares, or with bElement for an element of its TArray or a
+       value of its TMap: its signature function there, when another mod class's. */
+    bool ImportedFieldSignature(const FRecord& Owner, const std::string& Field, bool bElement, FBlueprintClass& BP,
+                                FIndex* Sig);
+    /* The signature function mod class D makes for `TDelegate<...>` Type, which D's own declaration Holder spells,
+       imported into BP: the one D made, or the name reserved for D to make when it is generated later; false when D
+       is generated and made none for Type, so the asker keeps a signature of its own. */
+    bool ForeignSignature(const FRecord& D, const std::string& Type, const std::string& Holder, FBlueprintClass& BP,
+                          FIndex* Sig);
     void FlagInstancing(const std::string& QualType, FPropertyDef& PD) const;
     bool LayoutOf(const std::string& QualType, int32* Size, int32* Align, std::string* Err);
     bool NeedsResultLocal(const std::string& Type, int32 Depth = 0);
@@ -1563,6 +1649,8 @@ private:
     Json StabilizeLvalue(const Json& N, Json& Pre, bool bPin = false);
     Json HoistExpr(const Json& N, Json& Pre, bool bPin = false);
     Json SynthLocal(const std::string& Type, const Json& Init, Json& Pre);
+    /* Delegate value `{Obj, &F}` with Obj parked in a local as HoistExpr does, or null when N is no delegate value. */
+    Json ParkBoundObject(const Json& N, Json& Pre);
     bool LowerUpdateValue(const Json& N, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     /* A written `T&` bound to what the call cannot reach by reference (Refs: each such argument in Call, and its
        parameter's name) gets a hidden local instead, stored back after the call. */
@@ -1702,12 +1790,38 @@ private:
         return It == OutArrayArgs.end() ? 0 : It->second;
     }
     std::map<std::string, FIndex> CurSignatures;      // Generate: dispatcher name -> its signature function export
-    std::map<std::string, std::pair<std::string, FIndex>> DelegateSigs;    // Generate: a TDelegate type -> its signature
-                                                                            // function's name and export
+    std::map<std::string, std::pair<std::string, FIndex>> DelegateSigs;    // Generate: a TDelegate type's DelegateKey ->
+                                                                            // its signature function's name and export
     const FBlueprintClass* DelegateSigsIn = nullptr;  // the class Generate is building, while it builds it
-    /* A class -> the signature functions DelegateSignature made in it: a parent or child generated after it names its
-       own around them (DelegateSignature's Taken). */
+    const FBlueprintClass* TagsOnlyIn = nullptr;      // the asset GenerateAsset is building, whose tags name no function
+    /* A class -> the signature functions DelegateSignature made in it, or a class generated before it reserved for it
+       (SignatureName): a parent or child generated after it names its own around them (SignatureNameTaken). */
     std::map<std::string, std::set<std::string>> MadeSignatures;
+    /* A class -> TDelegate type's DelegateKey -> the name of its signature function there, made or reserved
+       (SignatureName). */
+    std::map<std::string, std::map<std::string, std::string>> SignatureNames;
+    /* A class -> the signature functions DelegateSignature exported from it, and the classes Generate has run for (from
+       its start: none asks about the class it builds): an asker imports from a built class only what it exported
+       (ForeignSignature), and every name reserved for a class is one it exported by the end (CheckReservedSignatures). */
+    std::map<std::string, std::set<std::string>> ExportedSignatures;
+    std::set<std::string> BuiltClasses;
+    bool CheckReservedSignatures(std::string* Err) const;
+    /* A delegate value LowerArgRaw is about to lower, and what gives the signature function its local is typed with -
+       the parameter's or the variable's it goes to, Null for one of this class's own: set by LowerCall and an assignment
+       around one LowerArg, for that node only, and asked only for a value bound on another object, which has a local.
+       An assignment that parks a whole delegate first sets it to the VarDecl of the local it parks it in. */
+    const Json* SigValueNode = nullptr;
+    std::function<FIndex()> SigValueOf;
+    struct FSigValueScope       // SigValueNode / SigValueOf for one LowerArg, as they were after it
+    {
+        FCompiler& C;
+        const Json* OldNode;
+        std::function<FIndex()> OldOf;
+        FSigValueScope(FCompiler& In, const Json* Node, std::function<FIndex()> Of)
+            : C(In), OldNode(In.SigValueNode), OldOf(std::move(In.SigValueOf))
+        { C.SigValueNode = Node; C.SigValueOf = std::move(Of); }
+        ~FSigValueScope() { C.SigValueNode = OldNode; C.SigValueOf = std::move(OldOf); }
+    };
     const FConv* FindConv(const std::string& From, const std::string& To) const;
     const FOpInfo* FindOp(const std::string& Op, const std::string& Lhs, const std::string& Rhs) const;
     void ApplyConv(const FConv& C, FBlueprintClass& BP, FArgIR& Arg);
@@ -1838,6 +1952,23 @@ private:
     const FRecord* ParentInitOf = nullptr;
     bool ParentValueFresh(const FRecord& R, const Json& Lhs, const Json*& Braces, const FRecord*& BracesOf) const;
     bool ValueFreshFrom(const FRecord* From, const std::string& Id, const Json*& Braces, const FRecord*& BracesOf) const;
+    bool DiffAgainstDefaultObject(const FRecord* From, const std::string& Id, const std::string& Named, FPropertyDef& PD,
+                                  FBlueprintClass& BP, std::string* Err);
+    /* Where the default object of From takes its value of the member declared as Id, as the source tells it: At, the
+       nearest class from From up with a say; Set and Value, the UE_DEFAULTS statement there that sets the member;
+       Declared, its declaration there, if At declares it - for a mod interface's variable the interface's field, when
+       At lists the interface and so holds the variable as its own property (InterfaceVarHolder); Struct, a declared
+       UE_STRUCT's record. bUnsaid: At's value is one no header says (an engine class, a game Blueprint, a hand-written
+       UE_CLASS whose member has no initializer). At null: no class on the way has a say. */
+    struct FDefaultSource
+    {
+        const FRecord* At = nullptr;
+        const Json *Set = nullptr, *Value = nullptr, *Declared = nullptr;
+        const FRecord* Struct = nullptr;
+        bool bUnsaid = false;
+    };
+    FDefaultSource DefaultSource(const FRecord* From, const std::string& Id) const;
+    const FRecord* UnsaidDefault(const FRecord* From, const std::string& Id) const;
     std::map<std::string, std::vector<std::pair<std::string, int64>>> ModEnums;  // UE_ENUM cooked here: enumerators
 
     /* Per-function state reset in Generate: whether this function needs the FDeref scratch
@@ -2474,6 +2605,7 @@ bool FCompiler::Collect(std::string* Err)
                     while (!Owner.empty() && Owner.back() == '/') Owner.pop_back();
                     R.UePackage = PathIn(Owner, R.CppName);
                     R.UeName = LeafOf(R.CppName) + "_C";
+                    R.bClassIn = true;
                 }
             }
             else if (Kind(C) == "VarDecl" && Name(C) == "UeInterfaceMeta")
@@ -2765,6 +2897,17 @@ bool FCompiler::Collect(std::string* Err)
         {
             *Err = R.CppName + "::" + R.Replicated.begin()->first + ": UE_REPLICATED on a struct member has no effect: a "
                    "struct replicates whole, through the class variable that holds it; drop the marker";
+            return false;
+        }
+        /* UE_DEFAULTS is read where it is written: a definition out of the class is no part of the declaration Collect
+           keeps, and a mod that includes the class's header never sees it, so its statements would be dropped. */
+        bool bBody = false;
+        if (R.Defaults) ForEach(*R.Defaults, [&](const Json& B) { bBody = bBody || Kind(B) == "CompoundStmt"; });
+        if (R.Defaults && !bBody)
+        {
+            *Err = R.CppName + ": UE_DEFAULTS has no body in the class; AssetGen reads its statements there alone, so write "
+                   "them in it, `UE_DEFAULTS { ... }`: a definition out of the class, `void " + LeafOf(R.CppName)
+                 + "::UeDefaults__()`, is never read, nor seen by a mod that includes the class's header";
             return false;
         }
         if (R.UePackage.empty()) continue;
@@ -3233,6 +3376,9 @@ bool FCompiler::ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgI
         if (const FConv* C = FindConv(From, To)) { ApplyConv(*C, BP, Arg); return true; }
 
     if (To == From || From.empty() || To.empty() || ToKind == SK_Object) return true;
+    /* `Held = D` of two TDelegate<void(int32)>: clang declares the operator= with TDelegate<void (int)>, the same type
+       spelled the canonical way (DelegateKey), so there is nothing to convert. */
+    if (To.find("TDelegate<") != std::string::npos && DelegateKey(To) == DelegateKey(From)) return true;
 
     std::string ToIface, FromIface;
     if (TemplateArg(To, "TScriptInterface", &ToIface))
@@ -4739,7 +4885,9 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         if (!Obj || !Fn) { *Err = "a delegate value is {this, &Class::Function}"; return false; }
         const Json* FnRef = Strip(Fn);
         if (FnRef && Kind(*FnRef) == "UnaryOperator") FnRef = Strip(First(*FnRef));
-        return LowerDelegateValue(*Obj, *Fn, StripTypeKeywords(TypeOf(*N)), Null(),
+        const Json* On = Strip(Obj);
+        const FIndex Sig = SigValueNode == N && SigValueOf && !(On && Kind(*On) == "CXXThisExpr") ? SigValueOf() : Null();
+        return LowerDelegateValue(*Obj, *Fn, StripTypeKeywords(TypeOf(*N)), Sig,
                                   FnRef && FnRef->contains("referencedDecl") ? Name((*FnRef)["referencedDecl"]) : std::string("Bound"),
                                   BP, Out, Err);
     }
@@ -5986,6 +6134,21 @@ Json FCompiler::HoistExpr(const Json& N, Json& Pre, bool bPin)
     return SynthLocal(StripTypeKeywords(TypeOf(N)), N, Pre);
 }
 
+/* An assignment that must evaluate its right side first, and parks it, parks only the object of a delegate value:
+   binding F's name on it reads nothing else, and the value stays one the store types with its variable's signature,
+   as a Create Event wired to the Set node is (LowerBody's assignment), not a local of a delegate type of its own. */
+Json FCompiler::ParkBoundObject(const Json& N, Json& Pre)
+{
+    const Json* V = Strip(&N);
+    const std::string K = V ? Kind(*V) : std::string();
+    if ((K != "CXXConstructExpr" && K != "CXXTemporaryObjectExpr") || !V->contains("inner") || (*V)["inner"].size() != 2
+        || StripTypeKeywords(TypeOf(*V)).compare(0, 10, "TDelegate<") != 0)
+        return Json();
+    Json Out = *V;
+    Out["inner"][0] = HoistExpr(Json(Out["inner"][0]), Pre, true);
+    return Out;
+}
+
 /* The same place as lvalue N, with whatever locates it (an index, a pointer from a call) evaluated into Pre
    once. The place itself is not copied: the store has to land in it. bPin fixes the place for a stretch of
    code that may reassign what locates it (`P = Q` in a range-for body), not just for side effects. */
@@ -6291,6 +6454,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         && MethodName.compare(MethodName.size() - 2, 2, "__") == 0;
     /* `IncRef(0, B += 1)` in a loop condition, or on another object: the reference is B itself, not LowerArg's copy. */
     if (const int32 Bound = bIntrinsic ? 0 : LowerBoundArgs(CallExprNode, BP, Out, Err)) return Bound > 0;
+    const FRecord* ParmsOwner = nullptr;    // the class whose function's parameters the arguments fill, a delegate's below
     if (bIntrinsic)
     {
         Out.Intrinsic = MethodName;
@@ -6517,6 +6681,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
 
         const std::string CalleePackage = PackageOf(*Called), CalleeName = ClassOf(*Called);
         Out.Fn = BP.EngineFunction(CalleePackage, CalleeName, UeNameOf(Called, MethodName));
+        if (!Out.bReceiverIsArg) ParmsOwner = R;
         Out.bScript = CalleePackage.compare(0, 6, "/Game/") == 0;
         Out.bInstance = !bStatic;
         /* Each makes its proxy with NewObject, flags it RF_StrongRefOnFrame and roots it nowhere else
@@ -6561,7 +6726,17 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         if (!bOk) return;
         FArgIR A;
         const size_t I = Defaulted.size();
-        bOk = LowerArg(*DefaultedArg(C, I < CalledParms.size() ? CalledParms[I] : nullptr), BP, A, Err);
+        const Json* Arg = DefaultedArg(C, I < CalledParms.size() ? CalledParms[I] : nullptr);
+        /* A delegate value is typed with its parameter's signature function: another mod class's, imported, as a Create
+           Event wired to that pin is (ImportedParamSignature); else one of this class's, as before. */
+        std::string ParmType = I < CalledParms.size() ? TypeOf(*CalledParms[I]) : std::string();
+        while (!ParmType.empty() && (ParmType.back() == '&' || ParmType.back() == ' ')) ParmType.pop_back();
+        const bool bDelegate = ParmsOwner && StripTypeKeywords(ParmType).compare(0, 10, "TDelegate<") == 0;
+        FSigValueScope SigScope(*this, bDelegate ? Strip(Arg) : nullptr, [this, &BP, Owner = ParmsOwner, Method = MethodName, I] {
+            FIndex Sig;
+            return ImportedParamSignature(*Owner, Method, I, BP, &Sig) ? Sig : Null();
+        });
+        bOk = LowerArg(*Arg, BP, A, Err);
         if (bOk) Out.Args.push_back(A);
         Defaulted.push_back(Kind(C) == "CXXDefaultArgExpr");
     });
@@ -8045,7 +8220,10 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 while (!VarType.empty() && (VarType.back() == '&' || VarType.back() == ' ')) VarType.pop_back();
                 VarType = StripTypeKeywords(VarType);
                 FPropertyDef PD;
-                if (!TypeToProperty(VarType, VarName, 0, "local " + VarName, BP, &PD, Err))
+                /* A delegate an assignment parks for a variable another mod class declares is of that variable's type. */
+                if (FIndex Sig; SigValueNode == &D && SigValueOf && (Sig = SigValueOf()).V)
+                    PD = DelegateParam(VarName, Sig);
+                else if (!TypeToProperty(VarType, VarName, 0, "local " + VarName, BP, &PD, Err))
                 { bOk = false; return; }
                 PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
 
@@ -8228,6 +8406,8 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 Json Pre = Json::array(), Again = *S;
                 Json& Value = Again["inner"][At + 1];
                 if (IsFixedOperand(Value)) {}
+                else if (Json Bound = ParkBoundObject(Value, Pre); !Bound.is_null())
+                    Value = std::move(Bound);
                 else if (K == "BinaryOperator" || Value.value("valueCategory", std::string()) != "lvalue")
                     Value = HoistExpr(Value, Pre, true);
                 else
@@ -8256,12 +8436,32 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             const Json* Root = Lhs;
             while (Kind(*Root) == "MemberExpr" && !Root->value("isArrow", false) && First(*Root)) Root = PeelLvalue(First(*Root));
             bLocReads = bLocReads || (Kind(*Root) == "DeclRefExpr" && RefPlace.count((*Root)["referencedDecl"].value("id", std::string())));
+            /* A TDelegate variable a member assignment sets, or an element of a TArray or a value of a TMap that a
+               variable holds: a delegate value, or the local a delegate is parked in, is typed with that variable's
+               signature function, or its element's - another mod class's, imported, as a Create Event wired to its Set
+               node is (ImportedFieldSignature); else one of this class's, as before. */
+            const bool bElement = Kind(*Lhs) != "MemberExpr" && (IsTMapElement(*Lhs) || Kind(*Lhs) == "CXXOperatorCallExpr")
+                               && Nth(*Lhs, 1);
+            const Json* Holder = bElement ? Strip(Nth(*Lhs, 1)) : Lhs;
+            const auto Of = Holder && Kind(*Holder) == "MemberExpr" ? FieldOwner.find(Holder->value("referencedMemberDecl", std::string()))
+                                                                    : FieldOwner.end();
+            const FRecord* Declarer = Of != FieldOwner.end() && StripTypeKeywords(TypeOf(*Lhs)).compare(0, 10, "TDelegate<") == 0
+                                    ? Find(Of->second) : nullptr;
+            const auto FieldSig = [this, &BP, Declarer, Field = Declarer ? Name(*Holder) : std::string(), bElement] {
+                FIndex Sig;
+                return ImportedFieldSignature(*Declarer, Field, bElement, BP, &Sig) ? Sig : Null();
+            };
             Json Parked;
             if (bLocReads && !IsFixedValue(*Rhs) && (bLocActs || !IsPlainRead(*Rhs)))
             {
                 Json Pre = Json::array();
-                Parked = SynthLocal(StripTypeKeywords(TypeOf(*Rhs)), *Rhs, Pre);
+                /* A delegate value parks only its object (ParkBoundObject); any other delegate is parked whole, in a
+                   local typed as the variable (the VarDecl that declares it is SigValueNode). */
+                Parked = ParkBoundObject(*Rhs, Pre);
+                const bool bWhole = Parked.is_null();
+                if (bWhole) Parked = SynthLocal(StripTypeKeywords(TypeOf(*Rhs)), *Rhs, Pre);
                 const Json Wrap = { { "kind", "CompoundStmt" }, { "inner", std::move(Pre) } };
+                FSigValueScope ParkScope(*this, Declarer && bWhole ? &Wrap["inner"].back()["inner"][0] : nullptr, FieldSig);
                 if (!LowerBody(Wrap, BP, Out, Locals, Err)) { bOk = false; return; }
                 Rhs = &Parked;
             }
@@ -8298,6 +8498,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             else if (LK == "MemberExpr")
             {
                 St.K = FStmtIR::Assign;
+                FSigValueScope SigScope(*this, Declarer ? Strip(Rhs) : nullptr, FieldSig);     // a delegate value's (above)
                 bOk = LowerField(*Lhs, BP, St.Var, Err) && LowerArg(*Rhs, BP, St.Value, Err);
                 if (bOk) { SetOn = RecordOfFieldAccess(*Lhs); SetField = St.Var.S; SetObject = St.Var.Base; WarnReadOnlyWrite(*Lhs); }
             }
@@ -8339,6 +8540,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 St.Call.WrittenArgs = ContainerWrites("Map_Add");
                 St.Call.bOnArg0 = true;
                 St.Call.Args.resize(3);
+                FSigValueScope SigScope(*this, Declarer ? Strip(Rhs) : nullptr, FieldSig);     // a delegate value's (above)
                 bOk = LowerArg(*Nth(*Lhs, 1), BP, St.Call.Args[0], Err) && LowerArg(*Nth(*Lhs, 2), BP, St.Call.Args[1], Err)
                    && LowerArg(*Rhs, BP, St.Call.Args[2], Err);
                 if (bOk && St.Call.Args[0].K != FArgIR::Field && St.Call.Args[0].K != FArgIR::Local
@@ -8364,6 +8566,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                   WarnReadOnlyWrite(*Strip(Nth(*Lhs, 1))); }
                 St.bAssignLocal = St.Var.Base->K == FArgIR::Local;
                 St.bAssignOutParm = St.Var.Base->K == FArgIR::LocalOut;
+                FSigValueScope SigScope(*this, Declarer ? Strip(Rhs) : nullptr, FieldSig);     // a delegate value's (above)
                 bOk = LowerArg(*Rhs, BP, St.Value, Err);
             }
             else if (!AssignedNoVar(*Lhs).empty())
@@ -9469,7 +9672,17 @@ bool FCompiler::CheckMemberNames(const FRecord& R, std::string* Err) const
             : ": differs from " + It->second.first + " only in case, and an FName ignores case; rename one");
         return false;
     };
-    for (const Json* F : R.Fields) if (!Claim(Name(*F), false)) return false;
+    /* A class's variables: its fields, and the variables of each mod interface it lists (or one those extend), which
+       it holds as its own properties (Generate's OwnedFields). */
+    auto Held = [&](const FRecord& C) {
+        std::vector<const Json*> Out(C.Fields.begin(), C.Fields.end());
+        if (!C.bIsInterface)
+            for (const std::string& I : C.Interfaces)
+                for (const FRecord* Link : InterfaceChain(Find(I)))
+                    if (Link->bIsInterface) Out.insert(Out.end(), Link->Fields.begin(), Link->Fields.end());
+        return Out;
+    };
+    for (const Json* F : Held(R)) if (!Claim(Name(*F), false)) return false;
     for (const Json* M : R.AllMethods)
         if (!M->value("inline", false) && !IsInlineMethod(R, Name(*M)) && !Claim(Name(*M), true)) return false;
     /* A class's latent calls resume through its ubergraph, found by name on the object (most derived first), so a
@@ -9504,7 +9717,7 @@ bool FCompiler::CheckMemberNames(const FRecord& R, std::string* Err) const
                  + N + ", and an FName ignores case; rename it";
             return false;
         };
-        for (const Json* F : A->Fields) if (!Inherited(Name(*F), false)) return false;
+        for (const Json* F : Held(*A)) if (!Inherited(Name(*F), false)) return false;
         for (const auto& [N, D] : A->Methods)
             if (!D->value("inline", false) && !IsInlineMethod(*A, N) && !Inherited(N, true)) return false;
     }
@@ -10692,12 +10905,18 @@ bool FCompiler::LowerCommaValue(const Json& N, bool bRead, FBlueprintClass& BP, 
     const std::string Type = StripTypeKeywords(TypeOf(*Value));
     FPropertyDef Probe;
     std::string NoLocal;
-    if (!TypeToProperty(Type, "__Comma__", 0, What, BP, &Probe, &NoLocal))
+    /* Any class holds a TDelegate local, and asked here TypeToProperty would make the class a signature function for
+       it, which the local below may not name. */
+    if (Type.compare(0, 10, "TDelegate<") != 0 && !TypeToProperty(Type, "__Comma__", 0, What, BP, &Probe, &NoLocal))
     { *Err = What + "'s value here is a " + Type + ", which no Blueprint variable can hold: " + Fix; return false; }
     const Json Init = Value->value("valueCategory", std::string()) == "lvalue" ? ReadOf(*Value) : *Value;
     const std::string Result = SynthLocal(Type, Init, Pre)["inner"][0]["referencedDecl"].value("name", std::string());
     const Json Wrap = { {"kind", "CompoundStmt"}, {"inner", std::move(Pre)} };
     auto Body = std::make_shared<std::vector<FStmtIR>>();
+    /* A delegate the comma hands to a parameter or a variable is held in a local of that one's type, as the value
+       itself would be (SigValueNode): the VarDecl SynthLocal made is asked instead of the comma. */
+    FSigValueScope HoldScope(*this, SigValueNode == &N && SigValueOf ? &Wrap["inner"].back()["inner"][0] : SigValueNode,
+                             std::function<FIndex()>(SigValueOf));
     if (!LowerBody(Wrap, BP, *Body, *CurLocals, Err)) return false;
     Out.K = FArgIR::Call;
     Out.InnerType = Type;
@@ -12028,6 +12247,106 @@ bool FCompiler::ValueFreshFrom(const FRecord* From, const std::string& Id, const
     return false;
 }
 
+/* PD, a value that holds a TSet or TMap (HoldsTaggedSetOrMap) and loads over the default object of From, made the delta
+   the loader reads there (DiffTaggedAgainstParent): a UE_DEFAULTS statement's over its parent's CDO, a mod asset's
+   braces over its class's (the asset's archetype). The default object's value of the member declared as Id is the
+   nearest UE_DEFAULTS from From up that sets it, else its initializer where it is declared. Another mod's class holds
+   what the shared header says, as its owner cooked it: one declared with UE_CLASS_IN, or one whose header gives the
+   member a value (an initializer, a UE_DEFAULTS, a UE_STRUCT's default instance), which a game Blueprint's header never
+   does. An engine class or a game Blueprint holds a value no header says: PD stays whole, and a warning names the
+   member (Named), as PatchDefaults' does over a native archetype. So does a UE_DEFAULTS statement over such a value
+   (UnsaidDefault): its elements are removed, the unsaid ones stay, with the warning. */
+FCompiler::FDefaultSource FCompiler::DefaultSource(const FRecord* From, const std::string& Id) const
+{
+    for (const FRecord* C = From; C; C = C->Base.empty() ? nullptr : Find(C->Base))
+    {
+        /* A /Game class this mod does not cook is another mod's, or a game Blueprint, which cannot derive from a mod's:
+           one that neither declares the member nor sets it holds its parent's value. */
+        const bool bOtherMod = C->IsNative() && C->UePackage.compare(0, 6, "/Game/") == 0;
+        FDefaultSource S;
+        S.At = C;
+        if (!C->IsNative() || bOtherMod)
+        {
+            const Json* Its = nullptr;
+            if (C->Defaults) ForEach(*C->Defaults, [&](const Json& B) { if (Kind(B) == "CompoundStmt") Its = &B; });
+            if (Its)
+                ForEach(*Its, [&](const Json& St) {
+                    const Json *L = nullptr, *V = nullptr, *Through = nullptr;
+                    if (DefaultAssignment(St, L, V, Through) && !Through && L->value("referencedMemberDecl", std::string()) == Id)
+                    { S.Set = L; S.Value = V; }
+                });
+            for (const Json* F : C->Fields) if (F->value("id", std::string()) == Id) S.Declared = F;
+            /* A mod interface's variable is a property of the class that lists the interface (InterfaceVarHolder), whose
+               default object holds the interface's initializer, or the class's own UE_DEFAULTS value: the whole value. */
+            if (!S.Declared)
+                for (const std::string& I : C->Interfaces)
+                    for (const FRecord* Link : InterfaceChain(Find(I)))
+                        if (Link->bIsInterface)
+                            for (const Json* F : Link->Fields)
+                                if (F->value("id", std::string()) == Id) S.Declared = F;
+            if (!S.Set && !S.Declared) continue;
+        }
+        /* A UE_STRUCT declared with no initializer, `{}` or `T()` gets no tag, and the default object holds the struct's
+           default instance there: InitNonNativeProperty initialises the property (BlueprintSupport.cpp 2609), and
+           UUserDefinedStruct::InitializeStruct copies the default instance in (UserDefinedStruct.cpp 254). That is each
+           member's initializer (ValueInitStruct), not the empty value LowerDefault leaves the declaration as. */
+        S.Struct = S.Set || !S.Declared ? nullptr : Find(StripTypeKeywords(TypeOf(*S.Declared)));
+        S.bUnsaid = C->IsNative() && !C->bClassIn && !S.Set && !(S.Declared && First(*S.Declared))
+                    && !(S.Struct && S.Struct->IsModStruct());
+        return S;
+    }
+    return FDefaultSource();
+}
+
+/* The class whose default object holds the member declared as Id at a value no header says, as the walk from From up
+   meets it; null where the source says the whole value. A UE_DEFAULTS statement says it only where it could be diffed
+   in turn, against a value said above it, as its own compile (its owner's, for another mod's class) diffed it: over
+   one that is not, that compile wrote it whole and warned, and the default object holds the unsaid elements too. */
+const FRecord* FCompiler::UnsaidDefault(const FRecord* From, const std::string& Id) const
+{
+    const FDefaultSource S = DefaultSource(From, Id);
+    if (S.bUnsaid) return S.At;
+    if (S.Set && !S.Declared) return UnsaidDefault(S.At->Base.empty() ? nullptr : Find(S.At->Base), Id);
+    return nullptr;
+}
+
+bool FCompiler::DiffAgainstDefaultObject(const FRecord* From, const std::string& Id, const std::string& Named, FPropertyDef& PD,
+                                         FBlueprintClass& BP, std::string* Err)
+{
+    const FDefaultSource S = DefaultSource(From, Id);
+    if (!S.At) return true;
+    /* The class as the source names it: its leaf, not a game Blueprint's Game::<path>:: or a namespace. */
+    auto Warn = [&](const FRecord& C) {
+        const bool bHandWritten = C.UePackage.compare(0, 6, "/Game/") == 0 && C.CppName.compare(0, 6, "Game::") != 0;
+        const std::string Class = LeafOf(C.CppName);
+        printf("  warning: %s: %s's default object holds a value that no header says, so none of its elements is "
+               "removed: any it has load as well%s\n", Named.c_str(), Class.c_str(),
+               bHandWritten ? ("; if a mod cooks " + Class + ", declare it with UE_CLASS_IN or give the member "
+                               "an initializer").c_str() : "");
+    };
+    if (S.bUnsaid) { Warn(*S.At); return true; }
+    /* A statement over a value no header says: its own elements are known, and those PD lacks are still removed. One
+       on a member its class declares (its own property, a mod interface's variable it holds) is the whole value. */
+    if (S.Set && !S.Declared)
+        if (const FRecord* U = UnsaidDefault(S.At->Base.empty() ? nullptr : Find(S.At->Base), Id)) Warn(*U);
+    FPropertyDef Parent = PD;
+    Parent.Default = FDefaultValue();
+    bool bOk;
+    if (S.Set) bOk = LowerDefault(*S.Set, Parent, BP, Err, S.Value, /*bKeepZero=*/true);
+    else if (S.Struct && S.Struct->IsModStruct() && StartsFresh(Strip(First(*S.Declared))))
+    {
+        /* A value that starts fresh, so an engine struct inside keeps the engine's value without a word. */
+        const bool bWasFresh = bFreshValue;
+        bFreshValue = true;
+        bOk = ValueInitStruct(*S.Struct, /*bZeros=*/false, Name(*S.Declared), Parent, BP, Err);
+        bFreshValue = bWasFresh;
+    }
+    else bOk = LowerDefault(*S.Declared, Parent, BP, Err);
+    if (!bOk) return false;
+    DiffTaggedAgainstParent(PD, Parent);
+    return true;
+}
+
 bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& BP, std::string* Err, const Json* Init,
                              bool bKeepZero)
 {
@@ -12129,6 +12448,9 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
         });
         if (!bOk && Err->empty()) *Err = "a TMap default is a list of { key, value } pairs: " + Name(F);
         PD.Default.K = FDefaultValue::Array;
+        /* A set or map holds each key once, as the C++ value does: written twice, an FString key in two spellings
+           would load the first one. */
+        if (bOk && PD.Type != "ArrayProperty") LastValuePerKey(PD.Default.Items, bMap, *PD.Inner);
         return bOk;
     }
     if (FIndex Asset; PD.Type == "ObjectProperty" && AssetRef(*Init, BP, &Asset))
@@ -12489,7 +12811,12 @@ bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& P
     if (Type.compare(0, 10, "TDelegate<") == 0)
     {
         FIndex Sig;
-        if (!DelegateSignature(Type, PName, BP, &Sig, Err)) return false;
+        if (!DelegateSignature(Type, PName, BP, &Sig, Err))
+        {
+            /* Named as the source writes it, not by its cooked name (a struct member's carries a GUID). */
+            if (Err->compare(0, PName.size() + 2, PName + ": ") == 0) *Err = Where + Err->substr(PName.size());
+            return false;
+        }
         *Out = DelegateParam(PName, Sig, ExtraFlags);
         return true;
     }
@@ -12600,9 +12927,14 @@ bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& P
 bool FCompiler::DelegateSignature(const std::string& Type, const std::string& Holder, FBlueprintClass& BP, FIndex* Sig,
                                   std::string* Err)
 {
-    if (auto It = DelegateSigs.find(Type); It != DelegateSigs.end()) { *Sig = It->second.second; return true; }
+    /* An asset's tag holds a delegate's value alone, the object and the function's name (ScriptDelegates.h 138-142),
+       and names no signature function: its class made one in its own package, whose index is no export here. */
+    if (TagsOnlyIn == &BP) { *Sig = Null(); return true; }
+    /* DelegateSigs is the last class's still when an asset or a struct asks: its indices are that package's. */
     if (DelegateSigsIn != &BP)
     { *Err = Holder + ": " + Type + " needs a signature function, which only a class holds, not a struct or an interface"; return false; }
+    const std::string Key = DelegateKey(Type);
+    if (auto It = DelegateSigs.find(Key); It != DelegateSigs.end()) { *Sig = It->second.second; return true; }
     const size_t Open = Type.find('('), Close = Type.rfind(')');
     if (Open == std::string::npos || Close == std::string::npos || Close < Open)
     { *Err = "TODO: unimplemented delegate type " + Type + " of " + Holder; return false; }
@@ -12628,41 +12960,250 @@ bool FCompiler::DelegateSignature(const std::string& Type, const std::string& Ho
         PD.PropertyFlags &= ~uint64(CPF_BlueprintVisible | CPF_BlueprintReadOnly);
         Params.push_back(PD);
     }
-    /* Named after the variable asking, numbered past a dispatcher's signature or another type's of that name - this
-       class's, or any class's up or down the chain: one of a child's that a parent has too is no override of it (no
-       super link), and FindFunctionByName on the child finds the child's (invariants.py func_super_link). A class's
-       names are its functions and UE_DISPATCHER signatures (Methods), a game Blueprint's dispatchers' (its
-       TMulticastInlineDelegate fields), and those this made in a mod class generated before it (MadeSignatures):
-       Compile goes by name, so of a parent and a child the first keeps the plain name and the other numbers past it. */
-    auto Has = [&](const FRecord& A, const std::string& N) {
+    if (!Cur) { *Err = "internal: " + Type + " of " + Holder + " outside a class"; return false; }
+    const std::string Made = SignatureName(*Cur, Type, Holder);
+    const bool bOut = std::any_of(Params.begin(), Params.end(), [](const FPropertyDef& P) { return (P.PropertyFlags & CPF_OutParm) != 0; });
+    *Sig = BP.AddFunction(Made, Null(), Params, [](FScript& S, FIndex) { S.Return(); S.EndOfScript(); },
+                          FUNC_Public | FUNC_Delegate | (bOut ? uint32(FUNC_HasOutParms) : 0u));
+    DelegateSigs[Key] = { Made, *Sig };
+    ExportedSignatures[Cur->CppName].insert(Made);
+    return true;
+}
+
+/* clang spells a type as the source did, and one delegate type may be spelled several ways: `TDelegate<void(int32)>`
+   in a parent and `TDelegate<void(int)>` in an override or an out-of-line definition, or in the operator= clang
+   declares for TDelegate, with the specialization's canonical arguments; an enum of a namespace short inside it,
+   qualified outside, or from `::`. So DelegateSigs, SignatureNames and an assignment go by this key, one per C++ type:
+   every alias written out (`int32` is `int`), a class named by its record and an enum by its package and name, then a
+   leading `::`, `class`, `struct`, `enum`, TEnum<E> and the spaces dropped, as SignatureOf compares an override's
+   parameters with its parent's. `const` is dropped too, but not on what a delegate's reference parameter refers to:
+   `void(const FVector&)` and `void(FVector&)` are two types, to which UHT and the editor give two signature functions,
+   the first one's parameter CPF_ConstParm (the game's Blueprint signatures with a const reference have it) - a flag
+   only IsSignatureCompatibleWith reads, and ignores (Class.h 1914-1921). By value it is no part of a function's type,
+   and a Blueprint has no pointer to const. The parameters still come from the type as spelled. */
+std::string FCompiler::DelegateKey(const std::string& Type) const
+{
+    auto IsIdent = [](char C) { return std::isalnum(uint8(C)) || C == '_'; };
+    std::function<std::string(const std::string&, int32)> Spell;
+    /* A delegate's parameter, reference kept, and with it the `const` of what it refers to: one outside every <...> and
+       (...), and after the last `*`. */
+    auto Parm = [&](std::string A, int32 Depth) {
+        bool bRef = false, bConst = false;
+        while (!A.empty() && (A.back() == '&' || A.back() == ' ')) { bRef = bRef || A.back() == '&'; A.pop_back(); }
+        for (size_t I = 0, Nest = 0; bRef && I < A.size(); ++I)
+            if (A[I] == '<' || A[I] == '(') ++Nest;
+            else if ((A[I] == '>' || A[I] == ')') && Nest) --Nest;
+            else if (Nest == 0 && A[I] == '*') bConst = false;
+            else if (Nest == 0 && A.compare(I, 5, "const") == 0 && (I == 0 || !IsIdent(A[I - 1]))
+                     && (I + 5 == A.size() || !IsIdent(A[I + 5])))
+                bConst = true;
+        return (bConst ? "const " : "") + Spell(A, Depth) + (bRef ? "&" : "");
+    };
+    Spell = [&](const std::string& T, int32 Depth) {
+        std::string Out;
+        for (size_t I = 0; I < T.size();)
+        {
+            if (T.compare(I, 2, "::") == 0 && (I == 0 || (!IsIdent(T[I - 1]) && T[I - 1] != '>')))
+            {
+                I += 2;     // `::Ns::E` is Ns::E, the name Records and Enums hold
+                continue;
+            }
+            if (!std::isalpha(uint8(T[I])) && T[I] != '_')
+            {
+                if (T[I] != ' ') Out += T[I];
+                ++I;
+                continue;
+            }
+            size_t E = I;
+            while (E < T.size() && (IsIdent(T[E]) || (T.compare(E, 2, "::") == 0 && E + 2 < T.size())))
+                E += T[E] == ':' ? 2 : 1;
+            const std::string Word = T.substr(I, E - I);
+            I = E;
+            if (Word == "const" || Word == "volatile" || Word == "class" || Word == "struct" || Word == "enum" || Word == "typename")
+                continue;
+            if (Word == "TDelegate" && I < T.size() && T[I] == '<')
+            {
+                size_t Close = I;
+                for (int32 Nest = 0; Close < T.size(); ++Close)
+                    if (T[Close] == '<') ++Nest;
+                    else if (T[Close] == '>' && --Nest == 0) break;
+                const size_t Open = T.find('(', I), Shut = Close < T.size() ? T.rfind(')', Close) : std::string::npos;
+                if (Close < T.size() && Open < Shut && Shut != std::string::npos)
+                {
+                    Out += "TDelegate<" + Spell(T.substr(I + 1, Open - I - 1), Depth) + "(";
+                    const std::string List = T.substr(Open + 1, Shut - Open - 1);
+                    for (size_t From = 0, At = 0, Nest = 0; At <= List.size(); ++At)
+                        if (At == List.size() || (List[At] == ',' && Nest == 0))
+                        {
+                            if (From > 0) Out += ',';
+                            if (List.find_first_not_of(' ') != std::string::npos) Out += Parm(List.substr(From, At - From), Depth);
+                            From = At + 1;
+                        }
+                        else if (List[At] == '<' || List[At] == '(') ++Nest;
+                        else if ((List[At] == '>' || List[At] == ')') && Nest) --Nest;
+                    Out += ")" + Spell(T.substr(Shut + 1, Close - Shut - 1), Depth) + ">";
+                    I = Close + 1;
+                    continue;
+                }
+            }
+            if (const auto A = Aliases.find(Word); A != Aliases.end() && A->second != Word && Depth < 8)
+            {
+                Out += Spell(A->second, Depth + 1);
+                continue;
+            }
+            if (const auto En = Enums.find(Word); En != Enums.end())
+            {
+                Out += "enum:" + En->second.Package + "." + En->second.UeName;
+                continue;
+            }
+            const FRecord* R = Find(Word);
+            Out += R ? R->CppName : Word;
+        }
+        return Out;
+    };
+    std::string Out = Spell(Type, 0);
+    for (size_t At = 0; (At = Out.find("TEnum<", At)) != std::string::npos;)
+    {
+        if (At > 0 && (std::isalnum(uint8(Out[At - 1])) || Out[At - 1] == '_')) { At += 6; continue; }
+        int32 Depth = 0;
+        size_t Close = At + 5;
+        for (; Close < Out.size(); ++Close)
+            if (Out[Close] == '<') ++Depth;
+            else if (Out[Close] == '>' && --Depth == 0) break;
+        if (Close >= Out.size()) break;
+        Out.erase(Close, 1).erase(At, 6);
+    }
+    return Out;
+}
+
+/* A signature function is named after the variable asking, numbered past a dispatcher's signature or another type's of
+   that name - this class's, or any class's up or down the chain: one of a child's that a parent has too is no override
+   of it (no super link), and FindFunctionByName on the child finds the child's (invariants.py func_super_link). A
+   class's names are its functions and UE_DISPATCHER signatures (Methods), a game Blueprint's dispatchers' (its
+   TMulticastInlineDelegate fields), and those made in or reserved for a mod class (MadeSignatures): Compile goes by
+   name, so of a parent and a child the first generated keeps the plain name and the other numbers past it. */
+bool FCompiler::SignatureNameTaken(const FRecord& For, const std::string& N) const
+{
+    auto Has = [&](const FRecord& A) {
         if (A.Methods.count(N)) return true;
         if (const auto M = MadeSignatures.find(A.CppName); M != MadeSignatures.end() && M->second.count(N)) return true;
         return std::any_of(A.Fields.begin(), A.Fields.end(), [&](const Json* F) {
             return Name(*F) + "__DelegateSignature" == N
                 && StripTypeKeywords(TypeOf(*F)).compare(0, 25, "TMulticastInlineDelegate<") == 0; });
     };
-    auto Taken = [&](const std::string& N) {
-        if (std::any_of(CurSignatures.begin(), CurSignatures.end(), [&](const auto& D) { return D.first + "__DelegateSignature" == N; })
-            || std::any_of(DelegateSigs.begin(), DelegateSigs.end(), [&](const auto& D) { return D.second.first == N; }))
-            return true;
-        if (!Cur) return false;
-        for (const FRecord* A = Cur->Base.empty() ? nullptr : Find(Cur->Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
-            if (Has(*A, N)) return true;
-        for (const auto& [CppName, D] : Records)
-        {
-            if (&D == Cur || !D.IsGenerated() || D.bIsStruct || D.bIsInterface) continue;
-            for (const FRecord* A = D.Base.empty() ? nullptr : Find(D.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
-                if (A == Cur) { if (Has(D, N)) return true; break; }
-        }
+    if (&For == Cur && (std::any_of(CurSignatures.begin(), CurSignatures.end(), [&](const auto& D) { return D.first + "__DelegateSignature" == N; })
+                        || std::any_of(DelegateSigs.begin(), DelegateSigs.end(), [&](const auto& D) { return D.second.first == N; })))
+        return true;
+    if (Has(For)) return true;
+    for (const FRecord* A = For.Base.empty() ? nullptr : Find(For.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
+        if (Has(*A)) return true;
+    for (const auto& [CppName, D] : Records)
+    {
+        if (&D == &For || !D.IsGenerated() || D.bIsStruct || D.bIsInterface) continue;
+        for (const FRecord* A = D.Base.empty() ? nullptr : Find(D.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
+            if (A == &For) { if (Has(D)) return true; break; }
+    }
+    return false;
+}
+
+std::string FCompiler::SignatureName(const FRecord& In, const std::string& Type, const std::string& Holder)
+{
+    auto& Names = SignatureNames[In.CppName];
+    const std::string Key = DelegateKey(Type);
+    if (const auto It = Names.find(Key); It != Names.end()) return It->second;
+    /* A local the compiler makes up (`__Upd0__` parking a value, `__Comma__` probing a type) names nothing the source
+       has, so the signature takes the name of what it is. */
+    const std::string Base = Holder.compare(0, 2, "__") == 0 ? std::string("Delegate") : Holder;
+    std::string Made = Base + "__DelegateSignature";
+    for (int32 N = 2; SignatureNameTaken(In, Made); ++N) Made = Base + "_" + std::to_string(N) + "__DelegateSignature";
+    MadeSignatures[In.CppName].insert(Made);
+    return Names[Key] = Made;
+}
+
+/* The editor's override copies its parent function's parameters: the entry node's pins are made from the parent's
+   properties (K2Node_FunctionEntry::AllocateDefaultPins -> CreatePinsForFunctionEntryExit, K2Node.cpp 308-345), a
+   delegate pin carrying the property's SignatureFunction (ConvertPropertyToPinType, EdGraphSchema_K2.cpp 3411-3415),
+   and the override's FDelegateProperty gets that pin's (CreatePropertyOnScope, KismetCompilerMisc.cpp 1189-1197). So
+   down a chain of overrides every one names the signature of the class that declares the function first, and a Create
+   Event node wired to such a pin types its delegate with it too (K2Node_CreateDelegate.cpp 317-331,
+   DelegateNodeHandlers.cpp 258-262). A static hiding a static has that one for its super as well (FindEvent), and is
+   held to its parameters the same (invariants.py func_override_params). Up mod classes only: a native's or another
+   mod's parameter names a signature UeApi does not, and the class keeps its own there. The type is the declaring
+   class's own parameter's, from the declaration its Generate lowers (Fn.Def: the out-of-line definition, else the one in
+   the class), never the asker's spelling of it (ForeignSignature). */
+bool FCompiler::ImportedParamSignature(const FRecord& Owner, const std::string& Method, size_t Index, FBlueprintClass& BP,
+                                       FIndex* Sig)
+{
+    const FRecord* D = &Owner;
+    for (const FRecord* A = Owner.Base.empty() ? nullptr : Find(Owner.Base); A && !A->IsNative() && !A->bIsInterface;
+         A = A->Base.empty() ? nullptr : Find(A->Base))
+        if (!IsInlineMethod(*A, Method) && CompilesMethod(*A, Method)) D = A;
+    if (D == Cur || D->IsNative() || !D->IsGenerated() || D->bIsStruct || D->bIsInterface || IsInlineMethod(*D, Method)
+        || !CompilesMethod(*D, Method))
         return false;
-    };
-    std::string Made = Holder + "__DelegateSignature";
-    for (int32 N = 2; Taken(Made); ++N) Made = Holder + "_" + std::to_string(N) + "__DelegateSignature";
-    const bool bOut = std::any_of(Params.begin(), Params.end(), [](const FPropertyDef& P) { return (P.PropertyFlags & CPF_OutParm) != 0; });
-    *Sig = BP.AddFunction(Made, Null(), Params, [](FScript& S, FIndex) { S.Return(); S.EndOfScript(); },
-                          FUNC_Public | FUNC_Delegate | (bOut ? uint32(FUNC_HasOutParms) : 0u));
-    DelegateSigs[Type] = { Made, *Sig };
-    if (Cur) MadeSignatures[Cur->CppName].insert(Made);
+    const auto Def = D->MethodDefs.find(Method);
+    const Json* P = ParmDeclAt(Def != D->MethodDefs.end() ? *Def->second : *D->Methods.at(Method), Index);
+    const std::string Type = P ? StripTypeKeywords(ParmTypeOf(*P)) : std::string();
+    if (Type.compare(0, 10, "TDelegate<") != 0) return false;
+    return ForeignSignature(*D, Type, Name(*P).empty() ? "P" + std::to_string(Index) : Name(*P), BP, Sig);
+}
+
+/* A variable's Set node takes the variable's own property type, so the Create Event wired to it is typed with the
+   variable's signature function, the declaring class's: the type its own declaration gives, as for a parameter. An
+   element's Set Array Elem or Add node has its wildcard pin typed from the container's inner property [I], whose
+   signature is the one TypeToProperty makes for the element or value type as it hands that on. */
+bool FCompiler::ImportedFieldSignature(const FRecord& Owner, const std::string& Field, bool bElement, FBlueprintClass& BP,
+                                       FIndex* Sig)
+{
+    if (&Owner == Cur || Owner.IsNative() || !Owner.IsGenerated() || Owner.bIsStruct || Owner.bIsInterface) return false;
+    const auto F = std::find_if(Owner.Fields.begin(), Owner.Fields.end(), [&](const Json* Decl) { return Name(*Decl) == Field; });
+    std::string Type = F == Owner.Fields.end() ? std::string() : StripTypeKeywords(TypeOf(**F)), Inner;
+    if (bElement)
+        Type = TemplateArg(Type, "TArray", &Inner) || TemplateArg(Type, "TMap", &Inner)
+             ? StripTypeKeywords(SplitTemplateArgs(Inner).back()) : std::string();
+    if (Type.compare(0, 10, "TDelegate<") != 0) return false;
+    return ForeignSignature(Owner, Type, Field, BP, Sig);
+}
+
+/* An asker imports a signature function of D's by name, and the name must be one D exports, or the import loads as
+   null. So Type is D's own declaration's, the very string D's DelegateSignature keys its function by. A D generated
+   before the asker gives the name it made for it, or none if it made none - the asker then keeps one of its own,
+   conformance lost, never an import that does not resolve; a D generated after it is reserved the name, which it makes
+   when it lowers that declaration (CheckReservedSignatures holds it to that). */
+bool FCompiler::ForeignSignature(const FRecord& D, const std::string& Type, const std::string& Holder, FBlueprintClass& BP,
+                                 FIndex* Sig)
+{
+    std::string Made;
+    if (BuiltClasses.count(D.CppName))
+    {
+        const auto Names = SignatureNames.find(D.CppName);
+        const auto Exported = ExportedSignatures.find(D.CppName);
+        if (Names == SignatureNames.end() || Exported == ExportedSignatures.end()) return false;
+        const auto It = Names->second.find(DelegateKey(Type));
+        if (It == Names->second.end() || !Exported->second.count(It->second)) return false;
+        Made = It->second;
+    }
+    else Made = SignatureName(D, Type, Holder);
+    *Sig = BP.EngineFunction(PackageOf(D), ClassOf(D), Made);
+    return true;
+}
+
+/* After every mod class is generated: a name reserved for a class (ForeignSignature) that the class never exported
+   would be an import that loads as null in whatever reserved it. Reserved from the class's own declarations, each is
+   made when the class lowers them; a compile where one is not fails here instead of cooking that import. */
+bool FCompiler::CheckReservedSignatures(std::string* Err) const
+{
+    for (const auto& [Class, Names] : SignatureNames)
+    {
+        const auto Exported = ExportedSignatures.find(Class);
+        for (const auto& [Key, Made] : Names)
+            if (Exported == ExportedSignatures.end() || !Exported->second.count(Made))
+            {
+                *Err = "internal: a signature function " + Class + " was to make for " + Key + ", " + Made
+                     + ", is imported but never made";
+                return false;
+            }
+    }
     return true;
 }
 
@@ -12793,20 +13334,20 @@ bool FCompiler::LowerParams(const Json& M, const std::string& Fn, FBlueprintClas
     size_t Index = 0;
     ForEach(M, [&](const Json& C) {
         if (Kind(C) != "ParmVarDecl" || !bOk) return;
-        std::string Type = TypeOf(C);
+        bool bOutParm = false;
+        const std::string Type = ParmTypeOf(C, &bOutParm);
         std::string PName = Name(C);
         if (PName.empty())
             for (PName = "P" + std::to_string(Index); std::count(Given.begin(), Given.end(), PName);) PName += "_";
         ++Index;
-        bool bOutParm = false;
-        while (!Type.empty() && (Type.back() == '&' || Type.back() == ' ' || Type.back() == '\t'))
-        {
-            if (Type.back() == '&') bOutParm = true;
-            Type.pop_back();
-        }
         FPropertyDef PD;
-        bOk = TypeToProperty(Type, PName, bOutParm ? uint64(CPF_OutParm | CPF_ReferenceParm) : 0,
-                             "parameter " + PName + " on " + Fn, BP, &PD, Err);
+        const uint64 Flags = bOutParm ? uint64(CPF_OutParm | CPF_ReferenceParm) : 0;
+        /* An override's delegate parameter is its parent's: that one's signature function (ImportedParamSignature). */
+        if (FIndex Sig; Cur && StripTypeKeywords(Type).compare(0, 10, "TDelegate<") == 0
+                        && ImportedParamSignature(*Cur, Fn, Index - 1, BP, &Sig))
+            PD = DelegateParam(PName, Sig, Flags);
+        else
+            bOk = TypeToProperty(Type, PName, Flags, "parameter " + PName + " on " + Fn, BP, &PD, Err);
         if (!bOk) return;
         Params.push_back(PD);
         if (bOutParm) CurrentOutParms.insert(PName);
@@ -12889,7 +13430,9 @@ bool FCompiler::GenerateInterface(const FRecord& R, const std::string& OutDir, s
 
     BP.Finish();
     if (!SavePackage(P, OutDir, PackageName, Err)) return false;
-    RegistryRows.push_back({ PackageName, LeafOf(R.CppName), "BlueprintGeneratedClass" });
+    /* The class, `<I>_C`, as a class's row names it and the game's Blueprint interfaces' rows do (TempRocketInterface);
+       their `<I>` row is the editor's Blueprint asset, which a cooked package does not hold. */
+    RegistryRows.push_back({ PackageName, ClassOf(R), "BlueprintGeneratedClass" });
     printf("  %-14s -> %s.uasset  (interface, %d functions)\n", R.CppName.c_str(), Shown(PackageName).c_str(),
            int32(R.Methods.size()));
     return true;
@@ -12955,8 +13498,9 @@ bool FCompiler::GenerateEnum(const std::string& Enum, const std::string& OutDir,
 /* The members a braced initializer of a Rec names, typed and lowered, in order. Measured on ED_Spider_Grunt: the
    semantic form lists the bases first, then every field in order, so a designator is found by position. A member
    the braces leave out is skipped. With Archetype, each value is written over that class's default object's, as a
-   UE_DEFAULTS statement's over its parent's: a zero is a value, and a struct member the braces leave out is fresh only
-   where the default object's value of it is (ValueFreshFrom). */
+   UE_DEFAULTS statement's over its parent's: a zero is a value, a struct member the braces leave out is fresh only
+   where the default object's value of it is (ValueFreshFrom), and a set or map lists the default object's elements it
+   drops as removed (DiffAgainstDefaultObject). */
 bool FCompiler::BracedMembers(const Json& List, const FRecord& Rec, const std::string& Where, FBlueprintClass& BP,
                               bool bKeepZero, std::vector<FPropertyDef>& Out, std::string* Err, const FRecord* Archetype)
 {
@@ -12968,7 +13512,16 @@ bool FCompiler::BracedMembers(const Json& List, const FRecord& Rec, const std::s
         if (B && Sub && Kind(*Sub) == "InitListExpr" && !BracedMembers(*Sub, *B, Where, BP, bKeepZero, Out, Err, Archetype))
             return false;
     }
-    I += Rec.Interfaces.size();
+    /* Each implemented interface's braces follow the base's: a mod interface's variables are the implementing class's
+       own properties, named as the interface declares them. */
+    for (const std::string& Iface : Rec.Interfaces)
+    {
+        const FRecord* IR = Find(Iface);
+        const Json* Sub = Nth(List, I++);
+        if (IR && IR->bIsInterface && Sub && Kind(*Sub) == "InitListExpr"
+            && !BracedMembers(*Sub, *IR, Where, BP, bKeepZero, Out, Err, Archetype))
+            return false;
+    }
     for (const Json* F : Rec.Fields)
     {
         const Json* Init = Strip(Nth(List, I++));
@@ -12981,6 +13534,11 @@ bool FCompiler::BracedMembers(const Json& List, const FRecord& Rec, const std::s
         if (Archetype)
             bParentFresh = ValueFreshFrom(Archetype, F->value("id", std::string()), ParentInit, ParentInitOf);
         if (!LowerDefault(*F, PD, BP, Err, Init, bKeepZero || Archetype)) return false;
+        /* A set or map tag loads as a delta over the default object's value (the loader copies it in, removes, then adds:
+           PropertySet.cpp 285-358, PropertyMap.cpp 316-400), so written whole it would load as the union of both. */
+        if (Archetype && HoldsTaggedSetOrMap(PD)
+            && !DiffAgainstDefaultObject(Archetype, F->value("id", std::string()), Where + "." + Name(*F), PD, BP, Err))
+            return false;
         Out.push_back(PD);
     }
     return true;
@@ -13001,6 +13559,8 @@ bool FCompiler::GenerateAsset(const Json& Var, const std::string& OutDir, std::s
     FPackage P(PackageName);
     StampIdentity(P, PackageName);
     FBlueprintClass BP(P, AssetName, "", "", false);
+    struct FTagsScope { const FBlueprintClass*& In; ~FTagsScope() { In = nullptr; } } TagsScope{ TagsOnlyIn };
+    TagsOnlyIn = &BP;
 
     std::vector<FPropertyDef> Set;
     if (!BracedMembers(*BracedInit(Var), *R, AssetName, BP, false, Set, Err, R)) return false;
@@ -13762,6 +14322,7 @@ bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object,
             WriteDefaultValue(A, Element);
             return A.B;
         };
+        LastValuePerKey(D.Default.Items, bMap, *D.Inner);
         FDefaultValue Delta = D.Default;
         Delta.Items.clear();
         Delta.Removed.clear();
@@ -14407,6 +14968,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         return false;
     }
     Cur = &R;
+    BuiltClasses.insert(R.CppName);
 
     const std::string PackageName = PackageOf(R);
     FPackage P(PackageName);
@@ -14665,33 +15227,11 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 /* An inherited set or map loads over the parent CDO's value (PropertySet.cpp 285-358, PropertyMap.cpp
                    316-400: copied in, the listed removals taken out, the rest added), so written whole it would load as
                    the union of both; DiffAgainstParent writes it as the editor does. So does one inside an inherited
-                   struct written as tags (DiffTaggedAgainstParent). The parent's value is the nearest UE_DEFAULTS up the
-                   chain that sets the member, else its initializer where it is declared. A native class on the way
-                   holds one no header says, and there it stays whole. */
-                if (!bThroughComponent && HoldsTaggedSetOrMap(PD))
-                {
-                    const std::string Id = Lhs->value("referencedMemberDecl", std::string());
-                    FPropertyDef Parent = PD;
-                    Parent.Default = FDefaultValue();
-                    for (const FRecord* C = Find(R.Base); C && !C->IsNative(); C = C->Base.empty() ? nullptr : Find(C->Base))
-                    {
-                        const Json *Set = nullptr, *Value = nullptr, *Its = nullptr;
-                        if (C->Defaults) ForEach(*C->Defaults, [&](const Json& B) { if (Kind(B) == "CompoundStmt") Its = &B; });
-                        if (Its)
-                            ForEach(*Its, [&](const Json& S2) {
-                                const Json *L = nullptr, *V = nullptr, *Through = nullptr;
-                                if (DefaultAssignment(S2, L, V, Through) && !Through && L->value("referencedMemberDecl", std::string()) == Id)
-                                { Set = L; Value = V; }
-                            });
-                        const Json* Declared = nullptr;
-                        for (const Json* F : C->Fields) if (F->value("id", std::string()) == Id) Declared = F;
-                        if (!Set && !Declared) continue;
-                        if (!(Set ? LowerDefault(*Set, Parent, BP, Err, Value, /*bKeepZero=*/true) : LowerDefault(*Declared, Parent, BP, Err)))
-                        { bOk = false; return; }
-                        DiffTaggedAgainstParent(PD, Parent);
-                        break;
-                    }
-                }
+                   struct written as tags (DiffTaggedAgainstParent). DiffAgainstDefaultObject finds the parent's value. */
+                if (!bThroughComponent && HoldsTaggedSetOrMap(PD)
+                    && !DiffAgainstDefaultObject(R.Base.empty() ? nullptr : Find(R.Base), Lhs->value("referencedMemberDecl", std::string()),
+                                                 Where + ": " + Name(*Lhs), PD, BP, Err))
+                { bOk = false; return; }
                 /* A statement is the member's whole new value, as an assignment is in C++: one before it on the same
                    member is gone, not a tag under this one's (whose left-out members would load its values). */
                 if (!bThroughComponent)
@@ -16718,6 +17258,13 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     }
 
     int32 Generated = 0;
+    /* Remove every generated asset. */
+    auto RemoveGenerated = [&] {
+        for (const auto& Other : Records)
+            if (Other.second.IsGenerated())
+                for (const char* Ext : { ".uasset", ".uexp" })
+                    remove((FileOf(OutDir, PackageOf(Other.second)).string() + Ext).c_str());
+    };
     for (const auto& Entry : Records)
     {
         const FRecord& R = Entry.second;
@@ -16726,15 +17273,12 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
               : R.bIsInterface  ? GenerateInterface(R, OutDir, Err)
                                 : Generate(R, OutDir, Err)))
         {
-            /* Remove every generated asset. */
-            for (const auto& Other : Records)
-                if (Other.second.IsGenerated())
-                    for (const char* Ext : { ".uasset", ".uexp" })
-                        remove((FileOf(OutDir, PackageOf(Other.second)).string() + Ext).c_str());
+            RemoveGenerated();
             return false;
         }
         ++Generated;
     }
+    if (!CheckReservedSignatures(Err)) { RemoveGenerated(); return false; }
     /* The patches here, not after the edits: lowering a patch's methods discovers what the loops below cook, as the
        classes' lowering does (a global's class, the deref, a slot struct). */
     for (const auto& Entry : Records)

@@ -743,10 +743,11 @@ its members' initializers are its default values.
 
 An enum of your own is an `enum class` with a `uint8`, `int32` or `int64` underlying type, followed by `UE_ENUM(Name);`.
 It is cooked as an Enumeration asset and then works like any Blueprint enum: variables, parameters, constants and
-`switch`. Without `UE_ENUM` its constants still fold to numbers, but a variable of it is refused. `UE_ENUM_MAP(E)` as
-the default of a `TMap<E, FName>` member fills in a name table at build time. For enum to name, declare the variable
-as `TEnum<E>`: it is still an E, and `.Name()` / `.String()` ask the engine. The game's enum fields and return values
-already come as `TEnum<E>` in UeApi.
+`switch`. Without `UE_ENUM` its constants still fold to numbers, but a variable of it is refused.
+`UE_ENUM_MAP(E, FName, Names);` declares a `TMap<E, FName>` member and fills in a name table at build time, and
+`UE_ENUM_MAP(FString, E, ByName);` the way back. For enum to name, declare the variable as `TEnum<E>`: it is still an
+E, and `.Name()` / `.String()` ask the engine. The game's enum fields and return values already come as `TEnum<E>` in
+UeApi.
 
 `TArray`, `TSet` and `TMap` are the Blueprint Array, Set and Map. Their methods are the editor's container nodes, not
 UE's C++ API: `Add`, `Contains`, `Find(Key, Out)`, `Keys(OutArray)`, `Num()` and so on, with results coming back
@@ -811,9 +812,13 @@ Full rules: [Structs](REFERENCE.md#structs), [Enums](REFERENCE.md#enums), [Conta
 A data asset class is a mod class that derives from `UPrimaryDataAsset` or `UDataAsset`. Keep its members public, so
 that C++ accepts braces for it. A namespace-scope variable of that class with a braced initializer is cooked as an
 asset at `<mod package>/<Name>`, as creating a Data Asset in the Content Browser and filling in its details would. Only
-the members the braces name are written; the rest keep the class defaults. The class can also be a game class, such as
-`UEnemyDescriptor`. `&Name` points at the asset: in a variable's default, in a container default, or in a function
-body.
+the members the braces name are written; the rest keep the class defaults. A `TSet` or `TMap` member's braces are its
+whole value, not elements added to the class default's, wherever a header says that default: a class of yours or of
+another mod's shared header. The class can also be a game class, such as `UEnemyDescriptor`; a game or engine class's
+default is the game's, which no header says, so a set or map's braces add to whatever elements it has, and a warning
+names the member. So does a class whose `UE_DEFAULTS` sets such a member: its default object holds the game's
+elements as well as the statement's. `&Name` points at the asset: in a variable's default, in a container default, or
+in a function body.
 
 A game asset is named with `UE_ASSET_AT(Class, Name, "/Game/Path/Package")`, after which `&Name` points at it as well.
 The UeAssets headers (see [The SDK](#the-sdk)) declare the game's assets this way, in namespaces that follow their

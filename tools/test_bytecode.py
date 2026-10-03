@@ -2203,6 +2203,37 @@ def namespaces():
 namespaces()
 
 
+def registry_rows_name_exports():
+    """A mod's AssetRegistry.bin lists exactly the asset exports of the packages beside it, each row by the export's
+    path and class, as the game's rows do: a Blueprint interface's class row is `<Package>.<I>_C
+    BlueprintGeneratedClass` (TempRocketInterface, RadarPointInterface), as a class's is; the game's `<Package>.<I>
+    Blueprint` row beside it is the editor asset, which a cooked package does not hold and AssetGen lists for no class.
+    Both ways: a row that names no asset export fails, and so does an asset export with no row (one dropped). Every
+    suite mod's registry, IfaceRow's among them; before the fix each mod interface's row was `<Package>.<I>`, which
+    names nothing there, and its `<I>_C` had none."""
+    import invariants
+    regs = sorted(glob.glob(os.path.join(ROOT, '*', 'FSD', 'AssetRegistry.bin')))
+    assert registry_of('IfaceRow') in regs, regs[:3]
+    bad = []
+    for reg in regs:
+        content = os.path.join(os.path.dirname(reg), 'Content')
+        assets = set()
+        for ua in glob.glob(os.path.join(content, '**', '*.uasset'), recursive=True):
+            pkg = invariants.load(ua[:-len('.uasset')])
+            name = '/Game/' + os.path.relpath(ua[:-len('.uasset')], content).replace(os.sep, '/')
+            assets |= {('%s.%s' % (name, e['name']), pkg.class_of(i + 1)) for i, e in enumerate(pkg.exports) if e['is_asset']}
+        rows = registry_rows(reg)
+        if rows != assets:
+            bad.append('%s: rows naming no asset export of their class %s, asset exports with no row %s' % (
+                os.path.basename(os.path.dirname(os.path.dirname(reg))), sorted(rows - assets)[:3], sorted(assets - rows)[:3]))
+    assert not bad, '%d registries do not list their asset exports: %s' % (len(bad), '; '.join(bad[:3]))
+
+
+registry_rows_name_exports()
+print('ok  IfaceRow: every registry lists exactly its packages\' asset exports, by path and class; a mod interface\'s '
+      'row is <I>_C, as the game\'s are')
+
+
 # ---- OptTest
 
 check('OptTest', 'Drop', lambda A, B: i32(A * B * 2), [dict(A=a, B=b) for a, b in ((2, 3), (-4, 5), (0, 0), (2**16, 2**15), (-2**31, 1))])
@@ -3045,6 +3076,60 @@ string_behaviour()
 struct_behaviour()
 check('StructTest', 'MakeNative', lambda D: D + 0.5, [dict(D=d) for d in (0.0, 4.0)])
 pointer_behaviour()
+
+
+def map_pairs(pkg, tag):
+    """A TMap tag's (key, value) pairs in order, each FName (an enum's, as a ByteProperty in a container writes it, too)
+    or FString as text; it lists no removals."""
+    import struct
+    raw, o = tag['value'], 0
+
+    def item(kind):
+        nonlocal o
+        if kind == 'StrProperty':
+            n = struct.unpack_from('<i', raw, o)[0]
+            v = raw[o + 4:o + 3 + n].decode(); o += 4 + n
+            return v
+        assert kind in ('NameProperty', 'ByteProperty', 'EnumProperty'), kind
+        i, n = struct.unpack_from('<ii', raw, o); o += 8
+        return pkg.names[i] + ('_%d' % (n - 1) if n else '')
+    removed, count = struct.unpack_from('<ii', raw, 0); o = 8
+    assert removed == 0, removed
+    out = [(item(tag['inner']), item(tag['value_type'])) for _ in range(count)]
+    assert o == len(raw), raw.hex()
+    return out
+
+
+def enum_map_decl():
+    """UE_ENUM_MAP(K, V, Name) declares the member itself, `TMap<K, V> Name = UE_ENUM_MAP(E)` without spelling the types
+    twice: the enum on either side, FName or FString on the other, a game enum too. Each is a TMap property of those
+    types whose default holds one pair per enumerator in order, the C++ name as the text and no _MAX, as the
+    one-argument form's (OldByName, beside them) does. Before the macro took three arguments, clang refused the mod."""
+    import invariants
+    base = asset('EnumMapDecl')
+    keeps_invariants(base)
+    pkg = invariants.Package(base)
+    props = {p.name: p for p in pkg.struct(pkg.find('EnumMapDecl_C')).props}
+    cdo = pkg.find('Default__EnumMapDecl_C')
+    moods = ['Calm', 'Angry', 'Sleepy']
+    reasons = ['Destroyed', 'LevelTransition', 'EndPlayInEditor', 'RemovedFromWorld', 'Quit']
+    by_name = [(m, 'EEmdMood::' + m) for m in moods]
+    for name, key, value, want in (
+            ('MoodsByName', 'StrProperty', 'ByteProperty', by_name),
+            ('MoodsByFName', 'NameProperty', 'ByteProperty', by_name),
+            ('MoodNames', 'ByteProperty', 'NameProperty', [(e, m) for m, e in by_name]),
+            ('MoodTexts', 'ByteProperty', 'StrProperty', [(e, m) for m, e in by_name]),
+            ('Reasons', 'ByteProperty', 'NameProperty', [('EEndPlayReason::' + r, r) for r in reasons]),
+            ('OldByName', 'StrProperty', 'ByteProperty', by_name)):
+        p = props[name]
+        assert (p.type, [s.type for s in p.subs]) == ('MapProperty', [key, value]), (name, p.type, p.subs)
+        got = map_pairs(pkg, pkg.tag(cdo, name))
+        assert got == want, '%s holds %s; the enum says %s' % (name, got, want)
+
+
+enum_map_decl()
+print('ok  EnumMapDecl: UE_ENUM_MAP(K, V, Name) declares the TMap member and fills it, the enum on either side, FName or '
+      'FString on the other, a game enum too; the one-argument form beside it still fills a member it does not declare')
 
 
 # ---- IfaceTest, OverrideTest, SuperTest, NameTest, AssetTest
@@ -4941,6 +5026,72 @@ def refused_naming(mod, body, pattern, top=''):
                     'class %s : public AActor {\npublic:\n%s};\n' % (mod, top, mod, body))
         proc = assetgen_compile([src, UEAPI, tmp])
         assert proc.returncode != 0 and re.search(pattern, proc.stdout + proc.stderr), (mod, proc.stdout, proc.stderr)
+
+
+def enum_map_misuse():
+    """UE_ENUM_MAP written wrong is refused by clang with UeMeta.h's own words, naming what was written: a three-argument
+    form whose two types are not an enum and FName or FString (none, two enums, an enum and an int32, a TEnum<E> in
+    place of E) names both types; a count of arguments other than one or three, as a member, names the two forms; the
+    one-argument form over a map of another type is clang's "no viable conversion", naming that map."""
+    pair = (r"requirement '__EnumMapPair__<%s>'.*UE_ENUM_MAP\(Key, Value, Name\): one of Key and Value is an enum and "
+            r"the other FName or FString")
+    forms = r'UE_ENUM_MAP takes \(Enum\), or \(Key, Value, Name\) to declare the member'
+    for mod, body, pattern in (('EmNoEnum', 'UE_ENUM_MAP(int32, FName, M);', pair % 'int, FName'),
+                               ('EmTwoEnums', 'UE_ENUM_MAP(EKind, EKind, M);', pair % 'EKind, EKind'),
+                               ('EmIntValue', 'UE_ENUM_MAP(EKind, int32, M);', pair % 'EKind, int'),
+                               ('EmTEnum', 'UE_ENUM_MAP(TEnum<EKind>, FName, M);',
+                                pair % 'TEnum<EKind>, FName' + '; for a TEnum<E>, write E'),
+                               ('EmTwo', 'UE_ENUM_MAP(FName, EKind);', forms),
+                               ('EmFour', 'UE_ENUM_MAP(FName, EKind, A, B);', forms),
+                               ('EmNone', 'UE_ENUM_MAP();', forms),
+                               ('EmOldOther', 'TMap<int32, FName> M = UE_ENUM_MAP(EKind);',
+                                r"no viable conversion from '__EnumMapInit__<EKind>' to 'TMap<int32, FName>'")):
+        refused_naming(mod, '  %s\n' % body, pattern, top='enum class EKind : uint8 { A, B };\nUE_ENUM(EKind);\n')
+
+
+enum_map_misuse()
+print('ok  UE_ENUM_MAP misuse: two types that are not an enum and FName or FString, a TEnum<E>, and a wrong count of '
+      'arguments are refused naming what was written')
+
+
+def msvc_cl():
+    """The newest installed MSVC's cl.exe and the INCLUDE path for its own headers and the UCRT's, found on disk with no
+    process started; (None, None) when there is none."""
+    vs = os.environ.get('ProgramFiles', r'C:\Program Files')
+    kits = os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)')
+    cls = sorted(glob.glob(os.path.join(vs, 'Microsoft Visual Studio', '*', '*', 'VC', 'Tools', 'MSVC', '*', 'bin', 'Hostx64',
+                                        'x64', 'cl.exe')))
+    ucrt = sorted(glob.glob(os.path.join(kits, 'Windows Kits', '10', 'Include', '*', 'ucrt')))
+    if not cls or not ucrt: return None, None
+    return cls[-1], os.path.normpath(os.path.join(os.path.dirname(cls[-1]), '..', '..', '..', 'include')) + ';' + ucrt[-1]
+
+
+def ue_meta_under_msvc():
+    """UeMeta.h is read by MSVC's IntelliSense as well as by AssetGen's clang: BpMods.vcxproj gives it /std:c++20, no
+    defines and MSVC's traditional preprocessor (no /Zc:preprocessor), where a clang-only builtin or __VA_OPT__ is an
+    error in every mod file, each reaching UeMeta.h through the UeApi headers. cl.exe in that mode compiles a file using
+    the one-argument UE_ENUM_MAP and the three-argument one both ways, each declared member of the type written."""
+    cl, include = msvc_cl()
+    if not cl: return False
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, 'Meta.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/UeMeta.h"\nenum class EMood : uint8 { Calm, Angry };\n'
+                    'struct UOne { TMap<FString, EMood> ByName = UE_ENUM_MAP(EMood); };\n'
+                    'struct UThree {\n  UE_ENUM_MAP(FName, EMood, Moods);\n  UE_ENUM_MAP(EMood, FString, Names);\n};\n'
+                    'static_assert(__EnumMapSame__<decltype(UThree::Moods), TMap<FName, EMood>>);\n'
+                    'static_assert(__EnumMapSame__<decltype(UThree::Names), TMap<EMood, FString>>);\n')
+        proc = subprocess.run([cl, '/nologo', '/Zs', '/std:c++20', '/I' + os.path.dirname(UEAPI), '/I' + UEAPI, src],
+                              capture_output=True, encoding='utf-8', errors='replace', cwd=tmp,
+                              env=dict(os.environ, INCLUDE=include))
+        assert proc.returncode == 0, 'cl.exe, as IntelliSense reads UeMeta.h:\n' + (proc.stdout + proc.stderr)[-3000:]
+    return True
+
+
+if ue_meta_under_msvc():
+    print('ok  UeMeta.h compiles under cl.exe as BpMods.vcxproj\'s IntelliSense reads it, UE_ENUM_MAP\'s forms included')
+else:
+    print('--  UeMeta.h under cl.exe: skipped (no MSVC with the Windows SDK\'s UCRT headers installed)')
 
 
 def abstract_instances():
@@ -7264,6 +7415,215 @@ def delegate_not_callable_refusals():
             'OnRep_Instigator is not BlueprintCallable')
 
 
+def delegate_sigs(base):
+    """The signature function each DelegateProperty of the package at base names, by path: {(function, parameter): path}
+    for each parameter and class variable (the class's own name for a variable), and {(function, None): {paths}} for a
+    function's delegate locals, whatever the compiler named them."""
+    import invariants
+    pkg = invariants.Package(base)
+    out = {}
+    for i in range(len(pkg.exports)):
+        if pkg.class_of(i + 1) not in ('Function', 'BlueprintGeneratedClass'): continue
+        for p in pkg.struct(i).props:
+            if p.type != 'DelegateProperty': continue
+            fn = pkg.exports[i]['name']
+            if p.flags & 0x80 or pkg.class_of(i + 1) != 'Function': out[(fn, p.name)] = pkg.path(p.ref)
+            else: out.setdefault((fn, None), set()).add(pkg.path(p.ref))
+    return out
+
+
+def delegate_parm_sig():
+    """DelegateParmSig and DelegateParmZKid override DelegateParmTop's Use(TDelegate D) and Out(TDelegate &O): each
+    override's parameter names the parent parameter's own signature function, imported, as the editor's override copies
+    the parent's parameters (CreatePinsForFunctionEntryExit -> ConvertPropertyToPinType -> CreatePropertyOnScope), so
+    keeps_invariants' func_override_params holds; so does DelegateParmSig's static Arm, which hides its parent's.
+    DelegateParmSig is generated before its parent, DelegateParmZKid after.
+    A value bound on another object and handed to a parameter is typed with that parameter's signature, as a Create
+    Event node wired to the pin is: the parent's Take, the override Use (the parent's), the sibling DelegateParmSib's
+    Sib; assigned to the parent's variable Var, Var's. One of its own function Mine's is its own. Each call still
+    hands the helper's Ping to where it goes: Take and Sib get it, the override sets its timer with it, Var holds it."""
+    base = asset('DelegateParmSig')
+    here = os.path.dirname(base)
+    top, zkid, sib = (os.path.join(here, c) for c in ('DelegateParmTop', 'DelegateParmZKid', 'DelegateParmSib'))
+    for b in (base, top, zkid, sib):
+        keeps_invariants(b)
+    mine, theirs, sibs, zs = delegate_sigs(base), delegate_sigs(top), delegate_sigs(sib), delegate_sigs(zkid)
+    want = {('Use', 'D'): theirs[('Use', 'D')], ('Out', 'O'): theirs[('Out', 'O')], ('Arm', 'A'): theirs[('Arm', 'A')],
+            ('Mine', 'M'): mine[('Mine', 'M')],
+            ('CallTake', None): {theirs[('Take', 'T')]}, ('CallUse', None): {theirs[('Use', 'D')]},
+            ('CallSib', None): {sibs[('Sib', 'S')]}, ('SetVar', None): {theirs[('DelegateParmTop_C', 'Var')]},
+            ('CallMine', None): {mine[('Mine', 'M')]}}
+    got = {k: mine.get(k) for k in want}
+    assert got == want, (got, want)
+    assert zs[('Use', 'D')] == theirs[('Use', 'D')], (zs, theirs)
+    for b, path in ((base, theirs[('Use', 'D')]), (base, sibs[('Sib', 'S')]), (zkid, theirs[('Use', 'D')])):
+        assert path in import_paths(b) and path.rsplit(':', 1)[1] not in exports_of(b), (os.path.basename(b), path)
+    vm = VM(base, {})
+    h, s = Obj('DelegateParmHelper_C', Got=0), Obj('DelegateParmSib_C')
+    vm.self.vars.update(H=h, S=s)
+    ping = ('delegate', 'Ping', h)
+    for fn in ('CallTake', 'CallUse', 'CallSib', 'SetVar'):
+        vm.call(fn)
+    calls = [(n, c, a) for n, c, a in vm.log if n in ('Take', 'Sib', 'K2_SetTimerDelegate')]
+    assert calls == [('Take', vm.self, [ping]), ('K2_SetTimerDelegate', vm.self, [ping, 2.0, False, 0.0, 0.0]),
+                     ('Sib', s, [ping])], calls
+    assert vm.self.vars['Var'] == ping, vm.self.vars
+
+
+def delegate_parm_spell():
+    """One delegate type spelled two ways is one type (DelegateParmSpell): DelegateParmSpellTop spells it
+    TDelegate<void(int32)>, the overrides of Use and Take's out-of-line definition TDelegate<void(int)>, as does the
+    operator= clang declares for `Held = D`, which compiles. Top makes one signature function for it, which its variable,
+    its functions' parameters, the overrides' parameters (DelegateParmSpell is generated before Top, DelegateParmSpellZKid
+    after) and the values handed to Take all name, the subclasses importing it from a Top that exports it
+    (keeps_invariants: imports_resolve, func_override_params). A value bound on another object and assigned to a variable
+    through another object is typed with that variable's signature: Top's Held through Peer and through GetPeer(), the
+    sibling's SibVar through S; so is the local Held is parked in for `GetPeer()->Held = Held`, and the one the comma
+    value `(Bump(), Held)` handed to Peer's Take is held in, if it is kept. Neither subclass makes a signature of its
+    own, named or not. Each value reaches where it goes, and the one stored through GetPeer() binds the H it had before
+    GetPeer replaced it, as C++ sequences the right side first."""
+    base = asset('DelegateParmSpell')
+    here = os.path.dirname(base)
+    top, zkid, sib = (os.path.join(here, c) for c in ('DelegateParmSpellTop', 'DelegateParmSpellZKid', 'DelegateParmSpellSib'))
+    for b in (base, top, zkid, sib):
+        keeps_invariants(b)
+    mine, theirs, sibs, zs = delegate_sigs(base), delegate_sigs(top), delegate_sigs(sib), delegate_sigs(zkid)
+    held, sibvar = theirs[('DelegateParmSpellTop_C', 'Held')], sibs[('DelegateParmSpellSib_C', 'SibVar')]
+    assert {theirs[('Use', 'D')], theirs[('Take', 'T')]} == {held}, theirs
+    assert [e for e in exports_of(top) if e.endswith('__DelegateSignature')] == [held.rsplit(':', 1)[1]], exports_of(top)
+    want = {('Use', 'D'): held, ('CallTake', None): {held}, ('SetPeer', None): {held}, ('SetGotPeer', None): {held},
+            ('CopyGotPeer', None): {held}, ('SetSib', None): {sibvar}}
+    assert {k: mine.get(k) for k in want} == want, (mine, want)
+    assert mine.get(('CommaTake', None), {held}) == {held}, mine
+    want = {('Use', 'D'): held, ('CallTake', None): {held}, ('SetPeer', None): {held}}
+    assert {k: zs.get(k) for k in want} == want, (zs, want)
+    for b in (base, zkid):
+        assert not [e for e in exports_of(b) if e.endswith('__DelegateSignature')], (os.path.basename(b), exports_of(b))
+    h, h2 = Obj('DelegateParmSpellHelper_C', Got=0), Obj('DelegateParmSpellHelper_C', Got=0)
+    s, peer = Obj('DelegateParmSpellSib_C'), Obj('DelegateParmSpellTop_C')
+    ping = ('delegate', 'PingI', h)
+    vm = VM(top, {})
+    vm.call('Take', ping)
+    assert vm.self.vars['Held'] == ping, vm.self.vars
+    vm = VM(base, {})
+    vm.self.vars.update(H=h, H2=h2, S=s, Peer=peer)
+    vm.call('Use', ping)
+    assert vm.self.vars['Held'] == ping, vm.self.vars
+    for fn in ('CallTake', 'SetPeer', 'SetSib'):
+        vm.call(fn)
+    assert [(n, c, a) for n, c, a in vm.log if n == 'Take'] == [('Take', vm.self, [ping])], vm.log
+    assert peer.vars['Held'] == ping and s.vars['SibVar'] == ping, (peer.vars, s.vars)
+    peer.vars.clear()
+    vm.call('SetGotPeer')
+    assert peer.vars['Held'] == ping and vm.self.vars['H'] is h2, (peer.vars, vm.self.vars)
+    peer.vars.clear()
+    vm.call('CopyGotPeer')
+    del vm.log[:]
+    vm.call('CommaTake')
+    assert peer.vars['Held'] == ping and vm.self.vars['Bumps'] == 1, (peer.vars, vm.self.vars)
+    assert [(n, c, a) for n, c, a in vm.log if n == 'Take'] == [('Take', peer, [ping])], vm.log
+    peer.vars.clear()
+    vm = VM(zkid, {})
+    vm.self.vars.update(H=h, Peer=peer)
+    vm.call('CallTake')
+    vm.call('SetPeer')
+    assert [(n, c, a) for n, c, a in vm.log if n == 'Take'] == [('Take', peer, [ping])], vm.log
+    assert peer.vars['Held'] == ping, peer.vars
+
+
+def delegate_sig_parms(base, path):
+    """The properties of the signature function at path, which the package at base exports: [(name, property type, its
+    Parm / OutParm / ReturnParm / ReferenceParm flags, what it holds: an array's element type, a struct's or an enum's
+    path)]."""
+    import invariants
+    pkg = invariants.Package(base)
+    fn = path.rsplit(':', 1)[1]
+    at = [i for i in range(len(pkg.exports)) if pkg.exports[i]['name'] == fn and pkg.class_of(i + 1) == 'Function']
+    assert len(at) == 1, (os.path.basename(base), path)
+    return [(p.name, p.type, p.flags & 0x8000580, p.subs[0].type if p.subs else pkg.path(p.ref) if p.ref else None)
+            for p in pkg.struct(at[0]).props]
+
+
+def delegate_parm_keys():
+    """Which delegate types are one (DelegateParmKeys). A UE_ENUM in a namespace spelled short, qualified and from the
+    global namespace is one type: DelegateParmKeysTop makes one signature function for it, which its variable, its
+    functions' parameters - Take declared short and defined qualified -, the overrides' parameters (DelegateParmKeys is
+    generated before Top, DelegateParmKeysZKid after), the values handed to Take, the one set through Peer and those
+    stored into an element of Top's TArray and TMap, on this object and on Peer, all name, the subclasses importing it
+    from a Top that exports it (keeps_invariants: imports_resolve, func_override_params);
+    `Held = D` across two spellings compiles, and the comma value handed to Take is held in a local of that signature,
+    if one at all. Neither subclass makes a signature of its own. DelegateParmKeysKinds keeps what C++ keeps apart apart,
+    a signature function each, every one named by its variables: int and int64, uint8 and a uint8 enum, two enums, a
+    value and a reference, a reference and a const one, a return value and none; int32 and int, TArray<int32> and
+    TArray<int>, and an enum spelled short and qualified are one each. Each signature's properties are the type's. Each
+    value reaches where it goes."""
+    base = asset('DelegateParmKeys')
+    here = os.path.dirname(base)
+    top, kinds = (os.path.join(here, 'DelegateParmKeysNs', c) for c in ('DelegateParmKeysTop', 'DelegateParmKeysKinds'))
+    zkid = os.path.join(here, 'DelegateParmKeysZKid')
+    for b in (base, top, zkid, kinds):
+        keeps_invariants(b)
+    mine, theirs, zs, ks = delegate_sigs(base), delegate_sigs(top), delegate_sigs(zkid), delegate_sigs(kinds)
+    held = theirs[('DelegateParmKeysTop_C', 'Held')]
+    assert {theirs[('Use', 'D')], theirs[('Take', 'T')]} == {held}, theirs
+    assert [e for e in exports_of(top) if e.endswith('__DelegateSignature')] == [held.rsplit(':', 1)[1]], exports_of(top)
+    want = {('Use', 'D'): held, ('CallTake', None): {held}, ('SetPeer', None): {held}, ('SetPicks', None): {held},
+            ('SetByKey', None): {held}}
+    assert {k: mine.get(k) for k in want} == want, (mine, want)
+    assert mine.get(('CommaTake', None), {held}) == {held}, mine
+    want = {('Use', 'D'): held, ('CallTake', None): {held}}
+    assert {k: zs.get(k) for k in want} == want, (zs, want)
+    for b in (base, zkid):
+        assert not [e for e in exports_of(b) if e.endswith('__DelegateSignature')], (os.path.basename(b), exports_of(b))
+    v = {n: ks[('DelegateParmKeysKinds_C', n)] for n in ('I32', 'I', 'I64', 'U8', 'En', 'Mode', 'ModeQ', 'VecVal', 'VecCRef',
+                                                         'VecRef', 'RetI', 'RetV', 'ArrA', 'ArrB')}
+    assert v['I32'] == v['I'] and v['ArrA'] == v['ArrB'] and v['Mode'] == v['ModeQ'], v
+    apart = [v[n] for n in ('I32', 'I64', 'U8', 'En', 'Mode', 'VecVal', 'VecCRef', 'VecRef', 'RetI', 'RetV', 'ArrA')]
+    assert len(set(apart)) == len(apart), v
+    assert sorted(e for e in exports_of(kinds) if e.endswith('__DelegateSignature')) == sorted(p.rsplit(':', 1)[1] for p in apart), \
+        exports_of(kinds)
+    parm, ref, ret = 0x80, 0x8000180, 0x580
+    sigs = {n: delegate_sig_parms(kinds, v[n]) for n in v}
+    assert sigs['I32'] == [('Param0', 'IntProperty', parm, None)], sigs['I32']
+    assert sigs['I64'] == [('Param0', 'Int64Property', parm, None)], sigs['I64']
+    assert sigs['U8'] == [('Param0', 'ByteProperty', parm, None)], sigs['U8']
+    for n, e in (('En', '.EDpkKey'), ('Mode', '.EDpkMode')):
+        assert [s[:3] for s in sigs[n]] == [('Param0', 'ByteProperty', parm)] and sigs[n][0][3].endswith(e), sigs[n]
+    assert sigs['VecVal'] == [('Param0', 'StructProperty', parm, '/Script/CoreUObject.Vector')], sigs['VecVal']
+    for n in ('VecRef', 'VecCRef'):
+        assert sigs[n] == [('Param0', 'StructProperty', ref, '/Script/CoreUObject.Vector')], sigs[n]
+    assert sigs['RetI'] == [('ReturnValue', 'IntProperty', ret, None)], sigs['RetI']
+    assert sigs['RetV'] == [], sigs['RetV']
+    assert sigs['ArrA'] == [('Param0', 'ArrayProperty', parm, 'IntProperty')], sigs['ArrA']
+    h, peer = Obj('DelegateParmKeysHelper_C', Got=0), Obj('DelegateParmKeysTop_C')
+    pick = ('delegate', 'Pick', h)
+    vm = VM(top, {})
+    vm.call('Take', pick)
+    assert vm.self.vars['Held'] == pick, vm.self.vars
+    vm = VM(base, {})
+    vm.self.vars.update(H=h, Peer=peer)
+    vm.call('Use', pick)
+    assert vm.self.vars['Held'] == pick, vm.self.vars
+    vm.call('CallTake')
+    vm.call('SetPeer')
+    assert peer.vars['Held'] == pick, peer.vars
+    vm.call('CommaTake')
+    assert vm.self.vars['Bumps'] == 1, vm.self.vars
+    assert [(n, c, a) for n, c, a in vm.log if n == 'Take'] == [('Take', peer, [pick])] * 2, vm.log
+    vm.self.vars.update(Picks=[None], ByKey={})
+    peer.vars.update(Picks=[None], ByKey={})
+    vm.call('SetPicks')
+    vm.call('SetByKey')
+    assert vm.self.vars['Picks'] == [pick] and vm.self.vars['ByKey'] == {2: pick}, vm.self.vars
+    assert peer.vars['Picks'] == [pick] and peer.vars['ByKey'] == {1: pick}, peer.vars
+    vm = VM(zkid, {})
+    vm.self.vars.update(H=h, Peer=peer)
+    vm.call('Use', pick)
+    vm.call('CallTake')
+    assert vm.self.vars['Held'] == pick, vm.self.vars
+    assert [(n, c, a) for n, c, a in vm.log if n == 'Take'] == [('Take', peer, [pick])], vm.log
+
+
 def dispatch_native_callable():
     """A native dispatcher the engine marks BlueprintCallable (AFSDGameState::OnTerrainGenerated, one of FSD's 41) is
     one the editor's Call node takes. UeApi does not say which signature function it names (the dump does not link a
@@ -7323,6 +7683,16 @@ delegate_callable_rpc()
 print('ok  DelegateCallableRpc: an RPC the engine marks BlueprintCallable binds on another object and on this one')
 delegate_not_callable_refusals()
 print('ok  delegate not-callable refusals: OnRep_Instigator, which UeApi\'s NotCallable.json names, is bound on no object')
+delegate_parm_sig()
+print('ok  DelegateParmSig: an override\'s TDelegate parameter, and a value handed to a mod parent\'s, a sibling\'s or a '
+      'parent\'s variable, name the declaring class\'s signature, imported, and still reach where they go')
+delegate_parm_spell()
+print('ok  DelegateParmSpell: a delegate type spelled with int32 and with int is one signature function, and a value set '
+      'through another object names its variable\'s')
+delegate_parm_keys()
+print('ok  DelegateParmKeys: an enum spelled short, qualified or from the global namespace is one delegate type, the '
+      'types C++ keeps apart get a signature function each, and a value stored into a parent\'s TArray or TMap names '
+      'its element\'s')
 dispatch_native_callable()
 native_dispatcher_refusals()
 print('ok  native dispatchers: Broadcast on a BlueprintCallable one names a signature of the class\'s own with its '
@@ -8228,30 +8598,71 @@ def fname_at(names, raw, o):
     return (names[i] + ('_%d' % (n - 1) if n else '')).lower()
 
 
-def loaded_container(pkg, cdo, name, kind, start):
+def loaded_container(pkg, cdo, name, kind, start, fresh=None):
     """The value the loader leaves for tag `name` of CDO export cdo, from `start` - the parent CDO's loaded value for an
     inherited property, empty for the class's own (UnrealType.h 439-446: a defaults pointer only inside the parent's
     layout): the listed removals taken out, then each element added (a set, PropertySet.cpp 285-358) or each pair set
     (a map, PropertyMap.cpp 316-400). `name` may be a tuple, a property and then members of structs written as tags: a
     struct loads each member over the parent's struct's (Class.cpp 2775), so the same reading holds there. No tag (or
-    no member's tag): start unchanged. TSet<int32> and TMap<FName, int32> only."""
-    import struct
+    no member's tag): what the object held before its tags loaded. That is start for an inherited property, copied from
+    the archetype; for the class's own, `fresh` when given: InitNonNativeProperty initialised it (BlueprintSupport.cpp
+    2609), so a member of a UE_STRUCT holds the struct's default instance's value (uds_default). TSet<int32> and
+    TMap<FName, int32>, and the FString kinds container_over reads."""
     path = (name,) if isinstance(name, str) else name
     t = pkg.tag(cdo, path[0])
     for member in path[1:]:
         if t is None: break
         t = next((x for x in pkg.tags(cdo, t['at']) if x['name'] == member), None)
-    if t is None: return start
+    if t is None: return start if fresh is None else fresh
+    return container_over(pkg, t, kind, start, name)
+
+
+def uds_default(base, member, kind):
+    """A UE_STRUCT's default instance's value of its TSet<int32> / TMap<FName, int32> member: what a new value of the
+    struct holds, UUserDefinedStruct::InitializeStruct copying the default instance in (UserDefinedStruct.cpp 254). The
+    default instance loads over nothing (UUserDefinedStruct::Serialize passes no defaults), and the member is found by
+    the name its tag is written under, the cooked property's `_<n>_<GUID>` suffix stripped. base is the struct's
+    package."""
+    import invariants
+    pkg = invariants.Package(base)
+    i = pkg.find(os.path.basename(base))
+    t = next((t for t in pkg.struct(i).defaults if re.sub(r'_\d+_[0-9A-F]{32}$', '', t['name']) == member), None)
+    empty = set() if kind == 'set' else {}
+    return empty if t is None else container_over(pkg, t, kind, empty, member)
+
+
+def container_over(pkg, t, kind, start, name):
+    """A TSet<int32> / TMap<FName, int32> tag t of pkg loaded over start, as loaded_container reads it. 'strset' and
+    'strmap' are a TSet<FString> and a TMap<FString, int32>, whose keys the engine compares ignoring case (FString's ==
+    and GetTypeHash, Strihash): an element found that way keeps the spelling it holds, a map's taking the new value
+    (FindOrAdd, PropertyMap.cpp 392), a set's skipping the new one (FindElementIndex, PropertySet.cpp 348)."""
+    import struct
     raw, o = t['value'], 0
-    out = set(start) if kind == 'set' else dict(start)
+    text = kind in ('strset', 'strmap')
+    out = set(start) if kind in ('set', 'strset') else dict(start)
+
+    def key(o):
+        if text: return fstring_at(raw, o)
+        if kind == 'set': return struct.unpack_from('<i', raw, o)[0], o + 4
+        return fname_at(pkg.names, raw, o), o + 8
+
+    def held(k):
+        return next((h for h in out if h.lower() == k.lower()), None) if text else (k if k in out else None)
     removed = struct.unpack_from('<i', raw, o)[0]; o += 4
     for _ in range(removed):
-        if kind == 'set': out.discard(struct.unpack_from('<i', raw, o)[0]); o += 4
-        else: out.pop(fname_at(pkg.names, raw, o), None); o += 8
+        k, o = key(o)
+        h = held(k)
+        if h is not None:
+            if isinstance(out, set): out.discard(h)
+            else: out.pop(h)
     n = struct.unpack_from('<i', raw, o)[0]; o += 4
     for _ in range(n):
-        if kind == 'set': out.add(struct.unpack_from('<i', raw, o)[0]); o += 4
-        else: out[fname_at(pkg.names, raw, o)] = struct.unpack_from('<i', raw, o + 8)[0]; o += 12
+        k, o = key(o)
+        h = held(k)
+        if isinstance(out, set):
+            if h is None: out.add(k)
+        else:
+            out[k if h is None else h] = struct.unpack_from('<i', raw, o)[0]; o += 4
     assert o == len(raw), (name, raw.hex())
     return out
 
@@ -8961,6 +9372,368 @@ def asset_over_cdo():
 asset_over_cdo()
 print('ok  AssetOverCdo: a mod\'s own asset\'s braces lie over its class\'s CDO: what they leave out stays untagged only '
       'where the CDO holds what C++ would make it, else it is refused by name')
+
+
+def asset_set_over_cdo():
+    """A mod's own asset loads over its class's CDO (its archetype, the Defaults SerializeScriptProperties hands every
+    tag, Obj.cpp 1450-1467), so a TSet / TMap tag of it is a delta there, read as loaded_container reads a child CDO's:
+    the cook writes a game object over its archetype that way too (ENE_Spider_Lobber's HealthComponent lists its
+    archetype's three Resistances as removed). AS_AsocOver's S, M, and the set and map in its struct member H load as the
+    braces give them, not the union with the CDO's; its TArray A is replaced whole (PropertyArray.cpp 199). AS_AsocEmpty's
+    `{}` loads empty, AS_AsocLeft's braces for H leave its set and map empty as the struct makes them, and AS_AsocKid's S
+    lies over its class's UE_DEFAULTS value {2, 5}, not the declaration's. Before the fix each loaded the union."""
+    here = os.path.dirname(asset('AssetSetOverCdo'))
+    cls, kid = (invariants.Package(os.path.join(here, n)) for n in ('UAsocDef', 'UAsocKid'))
+    cdo, kcdo = cls.find('Default__UAsocDef_C'), kid.find('Default__UAsocKid_C')
+
+    def cdo_value(path, kind):
+        fresh = uds_default(os.path.join(here, 'FAsocHeld'), path[1], kind) if len(path) == 2 else None
+        return loaded_container(cls, cdo, path, kind, set() if kind == 'set' else {}, fresh)
+    for name, path, kind, start, want in (
+            ('AS_AsocOver', ('S',), 'set', cdo_value(('S',), 'set'), {3}),
+            ('AS_AsocOver', ('M',), 'map', cdo_value(('M',), 'map'), {'a': 5, 'b': 2}),
+            ('AS_AsocOver', ('H', 'Ids'), 'set', cdo_value(('H', 'Ids'), 'set'), {2, 3}),
+            ('AS_AsocOver', ('H', 'Score'), 'map', cdo_value(('H', 'Score'), 'map'), {'a': 5, 'b': 2}),
+            ('AS_AsocEmpty', ('S',), 'set', cdo_value(('S',), 'set'), set()),
+            ('AS_AsocEmpty', ('M',), 'map', cdo_value(('M',), 'map'), {}),
+            ('AS_AsocLeft', ('H', 'Ids'), 'set', cdo_value(('H', 'Ids'), 'set'), set()),
+            ('AS_AsocLeft', ('H', 'Score'), 'map', cdo_value(('H', 'Score'), 'map'), {}),
+            ('AS_AsocKid', ('S',), 'set', loaded_container(kid, kcdo, ('S',), 'set', cdo_value(('S',), 'set')), {5, 6})):
+        base = os.path.join(here, name)
+        keeps_invariants(base)
+        pkg = invariants.Package(base)
+        got = loaded_container(pkg, pkg.find(name), path, kind, start)
+        assert got == want, '%s loads %s = %s over its CDO\'s %s; C++ says %s' % (name, '.'.join(path), got, start, want)
+    pkg = invariants.Package(os.path.join(here, 'AS_AsocOver'))
+    a = next(t for t in pkg.tags(pkg.find('AS_AsocOver')) if t['name'].lower() == 'a')
+    assert struct.unpack('<ii', a['value']) == (1, 3), a['value'].hex()
+
+
+asset_set_over_cdo()
+print('ok  AssetSetOverCdo: a mod asset\'s TSet / TMap, a member or one in a struct member, lists its class\'s CDO\'s '
+      'elements it drops as removed, and loads as its braces say, not the union; a TArray is replaced whole')
+
+
+def asset_set_fresh():
+    """A struct member a mod class declares with no initializer (H) or as `T()` (HV) has no tag in the CDO, which then
+    holds the UE_STRUCT's default instance there: Ids {7}, Score {z: 9} (loaded_container's fresh, uds_default). An
+    asset's braces for its set and map load over that, so AS_AsfOver's H loads {3} and {a: 1}, not {3, 7} and
+    {z: 9, a: 1}, and its HV {8} and {a: 1}; AS_AsfEmpty's `{}` loads empty. A child class's UE_DEFAULTS
+    statement for H loads over its parent's CDO the same way: UAsfKid's CDO holds {5} and {k: 2}."""
+    here = os.path.dirname(asset('AssetSetFresh'))
+    held = os.path.join(here, 'FAsfHeld')
+    assert uds_default(held, 'Ids', 'set') == {7} and uds_default(held, 'Score', 'map') == {'z': 9}
+    cls = invariants.Package(os.path.join(here, 'UAsfDef'))
+    cdo = cls.find('Default__UAsfDef_C')
+
+    def cdo_value(path, kind):
+        return loaded_container(cls, cdo, path, kind, set() if kind == 'set' else {}, uds_default(held, path[1], kind))
+    for pkg, row, path, kind, start, want in (
+            ('AS_AsfOver', 'AS_AsfOver', ('H', 'Ids'), 'set', cdo_value(('H', 'Ids'), 'set'), {3}),
+            ('AS_AsfOver', 'AS_AsfOver', ('H', 'Score'), 'map', cdo_value(('H', 'Score'), 'map'), {'a': 1}),
+            ('AS_AsfOver', 'AS_AsfOver', ('HV', 'Ids'), 'set', cdo_value(('HV', 'Ids'), 'set'), {8}),
+            ('AS_AsfOver', 'AS_AsfOver', ('HV', 'Score'), 'map', cdo_value(('HV', 'Score'), 'map'), {'a': 1}),
+            ('AS_AsfEmpty', 'AS_AsfEmpty', ('H', 'Ids'), 'set', cdo_value(('H', 'Ids'), 'set'), set()),
+            ('AS_AsfEmpty', 'AS_AsfEmpty', ('H', 'Score'), 'map', cdo_value(('H', 'Score'), 'map'), {}),
+            ('UAsfKid', 'Default__UAsfKid_C', ('H', 'Ids'), 'set', cdo_value(('H', 'Ids'), 'set'), {5}),
+            ('UAsfKid', 'Default__UAsfKid_C', ('H', 'Score'), 'map', cdo_value(('H', 'Score'), 'map'), {'k': 2})):
+        base = os.path.join(here, pkg)
+        keeps_invariants(base)
+        p = invariants.Package(base)
+        got = loaded_container(p, p.find(row), path, kind, start)
+        assert got == want, '%s loads %s = %s over %s; C++ says %s' % (row, '.'.join(path), got, start, want)
+
+
+asset_set_fresh()
+print('ok  AssetSetFresh: a mod asset\'s TSet / TMap in a struct member its class declares with no initializer, or as '
+      '`T()`, loads over the UE_STRUCT\'s default instance and drops its elements; so does a child\'s UE_DEFAULTS')
+
+
+def asset_other_class():
+    """An asset of another mod's class loads over that class's CDO, in the owner's package (AssetOtherOwner), whose
+    value of a TSet / TMap the shared header says (AssetOtherShared.h): AS_AouOver's S and M load {3} and {a: 5}, not
+    the union with UAosDef's {1, 2} and {a: 1, c: 3}; AS_AouKid's {5, 6} lies over UAosKid's UE_DEFAULTS {2, 5}, from
+    the header too; AS_AouNamed's class is pinned with UE_CLASS and an initializer. UAouLocal, a class of this mod
+    under UAosDef, starts its UE_DEFAULTS M = {{"c", 4}} from the header's value, and AS_AouLocal from both. A game
+    class's CDO holds what no header says: AS_AouNative and UAouEnemy's UE_DEFAULTS leave its elements to load, and a
+    warning names the member. So does AS_AouHand's class, a hand-written UE_CLASS whose S has no initializer: its
+    warning, checked whole, names the class as the source writes it (UAosHand, not AosHand::UAosHand) and advises."""
+    user = os.path.dirname(asset('AssetOtherUser'))
+    owner = os.path.join(os.path.dirname(os.path.dirname(asset('AssetOtherOwner'))), 'AssetOtherOwner')
+
+    def cdo(base, cls, path, kind, start):
+        pkg = invariants.Package(os.path.join(base, cls))
+        return loaded_container(pkg, pkg.find('Default__%s_C' % cls), path, kind, start)
+    base_s, base_m = cdo(owner, 'UAosDef', 'S', 'set', set()), cdo(owner, 'UAosDef', 'M', 'map', {})
+    assert (base_s, base_m) == ({1, 2}, {'a': 1, 'c': 3}), (base_s, base_m)
+    kid_s = cdo(owner, 'UAosKid', 'S', 'set', base_s)
+    local_s, local_m = cdo(user, 'UAouLocal', 'S', 'set', base_s), cdo(user, 'UAouLocal', 'M', 'map', base_m)
+    assert local_m == {'c': 4}, 'UAouLocal\'s CDO loads M = %s over UAosDef\'s %s; C++ says {c: 4}' % (local_m, base_m)
+    for name, path, kind, start, want in (
+            ('AS_AouOver', 'S', 'set', base_s, {3}),
+            ('AS_AouOver', 'M', 'map', base_m, {'a': 5}),
+            ('AS_AouKid', 'S', 'set', kid_s, {5, 6}),
+            ('AS_AouLocal', 'S', 'set', local_s, {7}),
+            ('AS_AouLocal', 'M', 'map', local_m, {'a': 2}),
+            ('AS_AouNamed', 'S', 'set', cdo(owner, 'UAosNamed', 'S', 'set', set()), {3})):
+        base = os.path.join(user, name)
+        keeps_invariants(base)
+        pkg = invariants.Package(base)
+        got = loaded_container(pkg, pkg.find(name), path, kind, start)
+        assert got == want, '%s loads %s = %s over its CDO\'s %s; C++ says %s' % (name, path, got, start, want)
+    for where in ('AS_AouNative.BannedMissionTypes', 'UAouEnemy::UE_DEFAULTS: BannedMissionTypes'):
+        assert 'warning: %s: UEnemyDescriptor\'s default object holds a value' % where in LOGS['AssetOtherUser'], \
+            LOGS['AssetOtherUser']
+    line = ('warning: AS_AouHand.S: UAosHand\'s default object holds a value that no header says, so none of its '
+            'elements is removed: any it has load as well; if a mod cooks UAosHand, declare it with UE_CLASS_IN or give '
+            'the member an initializer')
+    assert line in LOGS['AssetOtherUser'], 'no "%s" in:\n%s' % (line, LOGS['AssetOtherUser'])
+
+
+asset_other_class()
+print('ok  AssetOtherUser: an asset of another mod\'s class, and a UE_DEFAULTS under one, lists the CDO\'s elements the '
+      'shared header gives and the braces drop as removed; over a game class\'s CDO a warning names the member')
+
+
+
+def name_map_delta(pkg, t):
+    """A TMap<FName, FName> tag t of pkg as written: the keys it lists as removed, then the pairs it adds."""
+    import struct
+    raw = t['value']
+    n, o = struct.unpack_from('<i', raw, 0)[0], 4
+    removed = [fname_at(pkg.names, raw, o + 8 * k) for k in range(n)]
+    o += 8 * n
+    n, o = struct.unpack_from('<i', raw, o)[0], o + 4
+    added = [(fname_at(pkg.names, raw, o + 16 * k), fname_at(pkg.names, raw, o + 16 * k + 8)) for k in range(n)]
+    o += 16 * n
+    assert o == len(raw), raw.hex()
+    return removed, added
+
+
+def asset_chain_unsaid():
+    """A UE_DEFAULTS that sets a set or map an engine or game class declares is written whole by its owner, over that
+    class's value, which no header says, with a warning (AssetOtherUser's UAouEnemy): the CDO holds that value's
+    elements as well. So an asset of such a class of another mod's (AS_AcuNodes, over AssetChainShared.h's UAcsNodes),
+    an asset of a class of this mod below it (AS_AcuLocal) and a UE_DEFAULTS below it (UAcuKid) load over a value no
+    header says either: each warns, naming the member and the engine class. The pairs the header does say are still
+    listed as removed: o, of UAcsNodes's {o: x}."""
+    asset('AssetChainOwner')
+    user = os.path.dirname(asset('AssetChainUser'))
+    for where in ('AS_AcuNodes.SourceToTarget', 'AS_AcuLocal.SourceToTarget', 'UAcuKid::UE_DEFAULTS: SourceToTarget'):
+        line = 'warning: %s: UNodeMappingContainer\'s default object holds a value that no header says' % where
+        assert line in LOGS['AssetChainUser'], 'no "%s" in:\n%s' % (line, LOGS['AssetChainUser'])
+    for name in ('AS_AcuNodes', 'AS_AcuLocal'):
+        base = os.path.join(user, name)
+        keeps_invariants(base)
+        pkg = invariants.Package(base)
+        delta = name_map_delta(pkg, pkg.tag(pkg.find(name), 'SourceToTarget'))
+        assert delta == (['o'], [('u', 'y')]), '%s writes SourceToTarget as %s' % (name, delta)
+
+
+asset_chain_unsaid()
+print('ok  AssetChainUser: a set or map over another mod\'s UE_DEFAULTS of an engine class\'s member warns, as over the '
+      'engine class itself, and still lists the elements the header says as removed')
+
+
+def asset_iface_set():
+    """A mod interface's variable is a property of the class that implements it, so that class's default object holds
+    the interface's initializer (UAisImpl: Tags {1, 2}) or its own UE_DEFAULTS value (UAisImpl5: {5}). A subclass's
+    UE_DEFAULTS loads over that: UAisKid's {3} and UAisKid6's {6}, not the union, and with no warning naming an engine
+    class above the implementer, whose default object has no such property. An asset gives an implemented interface's
+    variables in the interface's braces, after the base's: AS_AisImpl's Tags {3} and Level 9 load as written over its
+    class's {1, 2} and 4 (they were dropped, silently), and AS_AisKid's {7} over UAisKid's {3}."""
+    import struct
+    here = os.path.dirname(asset('AssetIfaceSet'))
+
+    def cdo(cls):
+        pkg = invariants.Package(os.path.join(here, cls))
+        return pkg, pkg.find('Default__%s_C' % cls)
+    impl, impl5 = loaded_container(*cdo('UAisImpl'), 'Tags', 'set', set()), loaded_container(*cdo('UAisImpl5'), 'Tags', 'set', set())
+    assert (impl, impl5) == ({1, 2}, {5}), (impl, impl5)
+    kid = loaded_container(*cdo('UAisKid'), 'Tags', 'set', impl)
+    for name, got, want in (('UAisKid', kid, {3}), ('UAisKid6', loaded_container(*cdo('UAisKid6'), 'Tags', 'set', impl5), {6})):
+        assert got == want, '%s\'s CDO loads Tags = %s; C++ says %s' % (name, got, want)
+    for name, start, want, level in (('AS_AisImpl', impl, {3}, 9), ('AS_AisKid', kid, {7}, None)):
+        base = os.path.join(here, name)
+        keeps_invariants(base)
+        pkg = invariants.Package(base)
+        row = pkg.find(name)
+        got = loaded_container(pkg, row, 'Tags', 'set', start)
+        assert got == want, '%s loads Tags = %s over %s; C++ says %s' % (name, got, start, want)
+        t = pkg.tag(row, 'Level')
+        assert (t and struct.unpack('<i', t['value'])[0]) == level or (level is None and t is None), (name, t)
+    warned = [l for l in LOGS['AssetIfaceSet'].splitlines() if 'warning' in l]
+    assert not warned, warned
+
+
+asset_iface_set()
+print('ok  AssetIfaceSet: a mod interface\'s set loads below its implementer over the implementer\'s value, and an '
+      'asset gives the interface\'s variables in the interface\'s braces')
+
+
+def defaults_out_of_class():
+    """UE_DEFAULTS is read where it is written, in the class. `UE_DEFAULTS;` there with its statements in an out-of-line
+    `void UOolDef::UeDefaults__() { S = {9}; }` was dropped, silently: the class cooked its parent's {1, 2}. A mod that
+    includes the class's header sees no statement at all, so it would take the parent's value too. Both refused,
+    naming the class and what to write; the bare declaration as well."""
+    base = 'class UOolBase : public UPrimaryDataAsset {\npublic:\n  TSet<int32> S = {1, 2};\n};\n'
+    why = 'UE_DEFAULTS has no body in the class'
+    refused('UOolDef', '  UE_DEFAULTS;\n', 'UOolDef: ' + why, top=base, base='UOolBase',
+            after='void UOolDef::UeDefaults__() { S = {9}; }\n')
+    refused('UOolBare', '  UE_DEFAULTS;\n', 'UOolBare: ' + why, top=base, base='UOolBase')
+
+
+defaults_out_of_class()
+print('ok  DefaultsOutOfClass: UE_DEFAULTS with no body in the class is refused, its statements defined out of '
+      'it or not at all')
+
+
+def asset_map_dup_keys():
+    """A key a map's braces give twice holds the last value given, as TMap's initializer-list constructor Adds each pair
+    in order (Map.h 1166-1173). AS_AmdOver's {{"a", 1}, {"a", 2}} over UAmdDef's {a: 2, c: 3} loads {a: 2}, AS_AmdLast's
+    {{"c", 7}, {"c", 3}} loads {c: 3}, and UAmdKid's UE_DEFAULTS {{"a", 5}, {"a", 2}} gives its CDO {a: 2}: checked one
+    pair at a time against the CDO's, the last pair equals it and was dropped, leaving the first. A set's repeat is not
+    checked here: the loader skips an element the set holds (PropertySet.cpp 348), so {3, 3} loads {3} written either
+    way; AssetMapStrCase's {"a", "A"} is a repeat that changes what loads."""
+    here = os.path.dirname(asset('AssetMapDupKeys'))
+    cls = invariants.Package(os.path.join(here, 'UAmdDef'))
+    cdo = cls.find('Default__UAmdDef_C')
+    base_m = loaded_container(cls, cdo, 'M', 'map', {})
+    for pkg, row, path, kind, start, want in (
+            ('AS_AmdOver', 'AS_AmdOver', 'M', 'map', base_m, {'a': 2}),
+            ('AS_AmdLast', 'AS_AmdLast', 'M', 'map', base_m, {'c': 3}),
+            ('UAmdKid', 'Default__UAmdKid_C', 'M', 'map', base_m, {'a': 2})):
+        base = os.path.join(here, pkg)
+        keeps_invariants(base)
+        p = invariants.Package(base)
+        got = loaded_container(p, p.find(row), path, kind, start)
+        assert got == want, '%s loads %s = %s over %s; C++ says %s' % (row, path, got, start, want)
+
+
+asset_map_dup_keys()
+print('ok  AssetMapDupKeys: a key a map\'s braces give twice holds the last value given, in an asset\'s delta over its '
+      'class\'s CDO and a UE_DEFAULTS\' over its parent\'s')
+
+
+def asset_map_str_case():
+    """An FString key compares without case (FString's == and GetTypeHash), so a key the braces give twice in two
+    spellings is one element, the last pair's spelling and value, as TMap's and TSet's initializer-list constructors Add
+    each element in order and Add replaces the whole element (TSet::Emplace, Set.h 625). AS_AmsDup's
+    {{"a", 5}, {"A", 1}} over UAmsDef's {"A": 1} loads {"A": 1}, its set {"a", "A"} over an empty one {"A"}, and UAmsKid's
+    UE_DEFAULTS gives its CDO {"A": 1}: compared by their bytes, ("a", 5) was written over the CDO's "A", whose value
+    the loader replaced (FindOrAdd ignores case too), and the set loaded the first spelling. A key spelled anew is
+    another element: AS_AmsSpell's {{"a", 1}} lists "A" removed and loads {"a": 1}. An FName key is one element too.
+    A class's own value loads over nothing, each pair in the order written: UAmsDef's W, {{"b", 2}, {"B", 3}}, holds
+    {"B": 3} in C++, and written with both pairs it loaded {"b": 3}."""
+    here = os.path.dirname(asset('AssetMapStrCase'))
+    cls = invariants.Package(os.path.join(here, 'UAmsDef'))
+    cdo = cls.find('Default__UAmsDef_C')
+    base_t, base_n = loaded_container(cls, cdo, 'T', 'strmap', {}), loaded_container(cls, cdo, 'N', 'map', {})
+    base_u = loaded_container(cls, cdo, 'U', 'strset', set())
+    assert (base_t, base_u, base_n) == ({'A': 1}, set(), {'a': 1}), (base_t, base_u, base_n)
+    base_w = loaded_container(cls, cdo, 'W', 'strmap', {})
+    assert base_w == {'B': 3}, 'UAmsDef\'s CDO loads W = %s; C++ says {"B": 3}' % base_w
+    for pkg, row, path, kind, start, want in (
+            ('AS_AmsDup', 'AS_AmsDup', 'T', 'strmap', base_t, {'A': 1}),
+            ('AS_AmsDup', 'AS_AmsDup', 'U', 'strset', base_u, {'A'}),
+            ('AS_AmsDup', 'AS_AmsDup', 'N', 'map', base_n, {'a': 1}),
+            ('AS_AmsSpell', 'AS_AmsSpell', 'T', 'strmap', base_t, {'a': 1}),
+            ('UAmsKid', 'Default__UAmsKid_C', 'T', 'strmap', base_t, {'A': 1})):
+        base = os.path.join(here, pkg)
+        keeps_invariants(base)
+        p = invariants.Package(base)
+        got = loaded_container(p, p.find(row), path, kind, start)
+        assert got == want, '%s loads %s = %s over %s; C++ says %s' % (row, path, got, start, want)
+
+
+asset_map_str_case()
+print('ok  AssetMapStrCase: an FString key given twice in two spellings is one element, the last one given, in a '
+      'class\'s own value, an asset\'s delta over its CDO and a UE_DEFAULTS\' over its parent\'s; one spelled anew is '
+      'another element')
+
+
+def delegate_value_at(pkg, raw, o):
+    """An FScriptDelegate at raw[o:] as its operator<< writes it (ScriptDelegates.h 138-142): the object, a package
+    index, then the function's name. ((object, name), the offset past it)."""
+    import struct
+    return (struct.unpack_from('<i', raw, o)[0], fname_at(pkg.names, raw, o + 4)), o + 12
+
+
+def str_delegate_map(pkg, t):
+    """A TMap<FString, TDelegate<...>> tag t of pkg as written: the keys it lists as removed, then its (key, delegate)
+    pairs; every byte read."""
+    import struct
+    raw = t['value']
+    n, o = struct.unpack_from('<i', raw, 0)[0], 4
+    removed = []
+    for _ in range(n):
+        k, o = fstring_at(raw, o)
+        removed.append(k)
+    n, o = struct.unpack_from('<i', raw, o)[0], o + 4
+    added = []
+    for _ in range(n):
+        k, o = fstring_at(raw, o)
+        v, o = delegate_value_at(pkg, raw, o)
+        added.append((k, v))
+    assert o == len(raw), (t['name'], raw.hex())
+    return removed, added
+
+
+def asset_delegate_value():
+    """A TDelegate value is an FScriptDelegate, 12 bytes (the object, the function's name), and a default can only be
+    unbound: null and None. AS_AdvOver's D `{}` and the unbound values of its TMap<FString, TDelegate> M, of UAdvDef's
+    CDO's M, and AS_AdvIface's OnIt, a mod interface's variable given in the interface's braces, each read so, every
+    byte of their tags. M loads over the CDO's {"A"} as a delta: "A" listed removed, as the braces' "a" is another
+    spelling the engine's FindOrAdd would keep, so {"a", "B"}. The packages break no invariant: the asset's delegate
+    property took the signature function of the class built last, an export of its package, and the asset's preload
+    table listed that index as one of its own exports (edl_preload_arcs, table_bounds). AssetGen wrote no bytes for a
+    delegate, so the loader read past each such value."""
+    here = os.path.dirname(asset('AssetDelegateValue'))
+    unbound = (0, 'none')
+    pkgs = {n: invariants.Package(os.path.join(here, n)) for n in ('UAdvDef', 'AS_AdvOver', 'AS_AdvIface', 'UAdvIfaceData')}
+    for n in pkgs: keeps_invariants(os.path.join(here, n))
+    cls, over, iface = pkgs['UAdvDef'], pkgs['AS_AdvOver'], pkgs['AS_AdvIface']
+    cdo = cls.find('Default__UAdvDef_C')
+    assert str_delegate_map(cls, cls.tag(cdo, 'M')) == ([], [('A', unbound)]), cls.tag(cdo, 'M')
+    row = over.find('AS_AdvOver')
+    for pkg, i, name in ((over, row, 'D'), (iface, iface.find('AS_AdvIface'), 'OnIt')):
+        t = pkg.tag(i, name)
+        assert t and t['type'] == 'DelegateProperty' and len(t['value']) == 12, (name, t)
+        assert delegate_value_at(pkg, t['value'], 0)[0] == unbound, (name, t['value'].hex())
+    removed, added = str_delegate_map(over, over.tag(row, 'M'))
+    loaded = {'A': unbound}
+    for k in removed: loaded = {h: v for h, v in loaded.items() if h.lower() != k.lower()}
+    for k, v in added: loaded[next((h for h in loaded if h.lower() == k.lower()), k)] = v
+    assert loaded == {'a': unbound, 'B': unbound}, (removed, added, loaded)
+    # A struct makes no signature function, so a delegate in one is refused, though the class generated just before it
+    # (by name) left one of that type in DelegateSigs: the struct cooked with that package's index.
+    refused('AdvStructDel', '  TDelegate<void()> Mine;\n',
+            'member D: TDelegate<void ()> needs a signature function, which only a class holds, not a struct or an interface',
+            top='struct FZzAdvHeld {\n  UE_STRUCT;\n  TDelegate<void()> D;\n  int32 N = 0;\n};\n')
+
+
+asset_delegate_value()
+print('ok  AssetDelegateValue: an unbound delegate in an asset\'s braces, a TMap\'s value and a mod interface\'s variable '
+      'is written as an FScriptDelegate, null and None, and the asset names no signature function of another package; '
+      'a UE_STRUCT\'s delegate is refused whatever class was built before it')
+
+
+def interface_var_names():
+    """A mod interface's variable is a property of each class that implements it, so it is held to the names that
+    class's own variables are: AActor already has a variable Tags, and a class extending the implementer has the
+    interface's Level. Neither was checked: the implementer cooked a second Tags beside AActor's (invariants'
+    member_names_distinct), and the subclass a second Level. Each refused, naming the class and the name."""
+    iface = 'class IIvnTagged {\npublic:\n  UE_INTERFACE;\n  TSet<int32> Tags;\n  int32 Level = 4;\n  void Touch();\n};\n'
+    refused('IvnShadow', '  void Touch() {}\n', 'IvnShadow::Tags: AActor already has a variable Tags', top=iface,
+            base='AActor, public IIvnTagged')
+    impl = iface.replace('TSet<int32> Tags', 'TSet<int32> Marks') + \
+        'class IvnImpl : public AActor, public IIvnTagged {\npublic:\n  void Touch() {}\n};\n'
+    refused('IvnKid', '  int32 Level = 0;\n', 'IvnKid::Level: IvnImpl already has a variable Level', top=impl, base='IvnImpl')
+
+
+interface_var_names()
+print('ok  InterfaceVarNames: a mod interface\'s variable is held to its implementer\'s names, AActor\'s Tags among them, '
+      'and a subclass of the implementer to the interface\'s')
 
 
 def uds_init_defaults():
@@ -9794,6 +10567,16 @@ def edit_deps_completed():
     assert not found, '%d findings, e.g. %s' % (len(found), '; '.join(found[:2]))
 
 
+MAP_PATCH_CASES = (('Ids = {7};\n    Score = {{"a", 9}};', {('Ids',): {7}, ('Score',): {'a': 9}}),
+                   ('Ids = {1, 7};\n    Score = {{"a", 1}, {"b", 2}};', {('Ids',): {1, 7}, ('Score',): {'a': 1, 'b': 2}}),
+                   ('Held.Ids = {7};\n    Deep.In.Score = {{"a", 9}};', {('Held', 'Ids'): {7}, ('Deep', 'In', 'Score'): {'a': 9}}),
+                   ('Held = {{1, 7}, {{"a", 1}, {"b", 2}}, 3};\n    Deep = {{{7}, {{"c", 3}}, 3}, 4};',
+                    {('Held', 'Ids'): {1, 7}, ('Held', 'Score'): {'a': 1, 'b': 2}, ('Deep', 'In', 'Ids'): {7},
+                     ('Deep', 'In', 'Score'): {'c': 3}}),
+                   ('Score = {{"a", 9}, {"a", 1}};', {('Score',): {'a': 1}}),
+                   ('Text = {{"a", 5}, {"A", 1}};', {('Text',): {'A': 1}}))
+
+
 def edit_whole_containers():
     """S38: a patch's whole TSet / TMap is what the edited default object loads. Its tag is a delta against the
     archetype, the parent Blueprint's CDO: the loader copies that value in, takes out the elements the tag lists as
@@ -9803,30 +10586,31 @@ def edit_whole_containers():
     or map inside a struct written as tags loads the same way, each member over the archetype's struct's (Class.cpp
     2775): by a member path (Held.Ids, and Deep.In.Score, where the CDO has no Deep tag of its own) and inside a whole
     struct (Held, Deep). Written as additions only, the CDO would load the union. What a case does not assign keeps
-    what the unpatched CDO loads."""
+    what the unpatched CDO loads. A key given twice holds the last value, as TMap's initializer-list constructor Adds
+    each pair in order (Map.h 1166-1173): `{{"a", 9}, {"a", 1}}` loads {a: 1}, though its last pair is the archetype's
+    own, which a delta checking one pair at a time dropped. An FString key compares without case, so Text's
+    `{{"a", 5}, {"A", 1}}` over the archetype's {"A": 1} loads {"A": 1}, not 5 under "A"."""
     game = os.path.join(ROOT, 'PropSetDelta', 'FSD', 'Content')
     decl = ('struct FPropSetHeld {\n  UE_STRUCT_IN("/Game/_ElytrasMods/PropSetDelta");\n  TSet<int32> Ids;\n'
             '  TMap<FName, int32> Score;\n  int32 N;\n};\n'
             'struct FPropSetDeep {\n  UE_STRUCT_IN("/Game/_ElytrasMods/PropSetDelta");\n  FPropSetHeld In;\n  int32 M;\n};\n'
             'class PropSetBase : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/PropSetDelta/PropSetBase", "PropSetBase_C");\n'
-            '  TSet<int32> Ids;\n  TMap<FName, int32> Score;\n  FPropSetHeld Held;\n  FPropSetDeep Deep;\n};\n'
+            '  TSet<int32> Ids;\n  TMap<FName, int32> Score;\n  FPropSetHeld Held;\n  FPropSetDeep Deep;\n'
+            '  TMap<FString, int32> Text;\n};\n'
             'class PropSetDelta : public PropSetBase {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/PropSetDelta/PropSetDelta", "PropSetDelta_C");\n};\n')
-    paths = (('Ids',), ('Score',), ('Held', 'Ids'), ('Held', 'Score'), ('Deep', 'In', 'Ids'), ('Deep', 'In', 'Score'))
+    paths = (('Ids',), ('Score',), ('Held', 'Ids'), ('Held', 'Score'), ('Deep', 'In', 'Ids'), ('Deep', 'In', 'Score'),
+             ('Text',))
     parent = invariants.Package(os.path.join(game, '_ElytrasMods', 'PropSetDelta', 'PropSetBase'))
     pc = parent.find('Default__PropSetBase_C')
 
     def loads(child):
         cc = child.find('Default__PropSetDelta_C')
-        kinds = {p: 'set' if p[-1] == 'Ids' else 'map' for p in paths}
+        kinds = {p: 'set' if p[-1] == 'Ids' else 'strmap' if p[-1] == 'Text' else 'map' for p in paths}
         return {p: loaded_container(child, cc, p, kinds[p], loaded_container(parent, pc, p, kinds[p], set() if kinds[p] == 'set' else {}))
                 for p in paths}
     vanilla = loads(invariants.Package(os.path.join(game, '_ElytrasMods', 'PropSetDelta', 'PropSetDelta')))
-    for body, assigned in (('Ids = {7};\n    Score = {{"a", 9}};', {('Ids',): {7}, ('Score',): {'a': 9}}),
-                           ('Ids = {1, 7};\n    Score = {{"a", 1}, {"b", 2}};', {('Ids',): {1, 7}, ('Score',): {'a': 1, 'b': 2}}),
-                           ('Held.Ids = {7};\n    Deep.In.Score = {{"a", 9}};', {('Held', 'Ids'): {7}, ('Deep', 'In', 'Score'): {'a': 9}}),
-                           ('Held = {{1, 7}, {{"a", 1}, {"b", 2}}, 3};\n    Deep = {{{7}, {{"c", 3}}, 3}, 4};',
-                            {('Held', 'Ids'): {1, 7}, ('Held', 'Score'): {'a': 1, 'b': 2}, ('Deep', 'In', 'Ids'): {7},
-                             ('Deep', 'In', 'Score'): {'c': 3}})):
+    assert vanilla[('Text',)] == {'A': 1}, vanilla
+    for body, assigned in MAP_PATCH_CASES:
         with tempfile.TemporaryDirectory() as tmp:
             proc, content = compile_edit(tmp, 'MapPatch', EDIT_HEAD + 'UE_MOD_PACKAGE("/Game/_ElytrasMods/MapPatch");\n' + decl
                                          + 'class Tweaks : public PropSetDelta {\n  UE_PATCH;\n'
@@ -10077,7 +10861,8 @@ if not globals().get('EDITS_EXPLORE'):     # set by the dev loop's exploration d
           'completes: the super serialized first, a new local\'s type serialized and created first')
     edit_whole_containers()
     print('ok  MapPatch: a patch\'s whole TSet / TMap loads as written, a property or one inside a struct (by a member '
-          'path or in a whole struct): the archetype\'s elements it drops are listed as removed')
+          'path or in a whole struct): the archetype\'s elements it drops are listed as removed; a key given twice '
+          'holds its last value, an FString key compared without case')
 
 
 PREFETCH.finish()
