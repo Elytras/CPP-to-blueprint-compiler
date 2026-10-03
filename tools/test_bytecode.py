@@ -9718,6 +9718,22 @@ print('ok  AssetDelegateValue: an unbound delegate in an asset\'s braces, a TMap
       'a UE_STRUCT\'s delegate is refused whatever class was built before it')
 
 
+def interface_var_names():
+    """A mod interface's variable is a property of each class that implements it, so it is held to the names that
+    class's own variables are: AActor already has a variable Tags, and a class extending the implementer has the
+    interface's Level. Neither was checked: the implementer cooked a second Tags beside AActor's (invariants'
+    member_names_distinct), and the subclass a second Level. Each refused, naming the class and the name."""
+    iface = 'class IIvnTagged {\npublic:\n  UE_INTERFACE;\n  TSet<int32> Tags;\n  int32 Level = 4;\n  void Touch();\n};\n'
+    refused('IvnShadow', '  void Touch() {}\n', 'IvnShadow::Tags: AActor already has a variable Tags', top=iface,
+            base='AActor, public IIvnTagged')
+    impl = iface.replace('TSet<int32> Tags', 'TSet<int32> Marks') + \
+        'class IvnImpl : public AActor, public IIvnTagged {\npublic:\n  void Touch() {}\n};\n'
+    refused('IvnKid', '  int32 Level = 0;\n', 'IvnKid::Level: IvnImpl already has a variable Level', top=impl, base='IvnImpl')
+
+
+pending('InterfaceVarNames', interface_var_names)
+
+
 def uds_init_defaults():
     """Every member initializer of a UE_STRUCT is in its default instance, the Data stream the engine copies into each
     new value of the struct (UUserDefinedStruct::InitializeStruct). A member at its type's default may be left out, and
