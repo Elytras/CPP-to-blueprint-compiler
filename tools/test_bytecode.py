@@ -9372,7 +9372,9 @@ def defaults_out_of_class():
     refused('UOolBare', '  UE_DEFAULTS;\n', 'UOolBare: ' + why, top=base, base='UOolBase')
 
 
-pending('DefaultsOutOfClass', defaults_out_of_class)
+defaults_out_of_class()
+print('ok  DefaultsOutOfClass: UE_DEFAULTS with no body in the class is refused, its statements defined out of '
+      'it or not at all')
 
 
 def asset_map_dup_keys():

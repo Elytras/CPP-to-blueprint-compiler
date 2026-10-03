@@ -2814,6 +2814,7 @@ component: see [The root and attachment](#the-root-and-attachment).
 | `Index_0 = 7;`, for a member the SDK spells `Index_0` | Written under the engine's real name, `Index`. See [Classes and variables](#classes-and-variables). | Yes |
 | `Lamp->RelativeLocation.Z = 50.0f;` | Refused. Assign the whole struct: `Lamp->RelativeLocation = FVector(0.0f, 0.0f, 50.0f);`. The message is misleading: it says UeApi "does not say which default subobject RelativeLocation is", and regenerating the SDK does not help. | Refused |
 | `int32 Charges;` with `UE_DEFAULTS { Charges = 3; }` | Refused: "is declared here - give it an initializer instead". Write `int32 Charges = 3;`. | Refused |
+| `UE_DEFAULTS;` in the class, `void UTurret::UeDefaults__() { Charges = 3; }` outside it | Refused: "UE_DEFAULTS has no body in the class". The statements are read where the macro is written, which is also all a mod that includes the class's header sees. Write `UE_DEFAULTS { Charges = 3; }` in the class. | Refused |
 | `Extra->bVisible = false;`, where `Extra` is a plain pointer member | Refused: "is not a UE_COMPONENT". Only a `UE_COMPONENT`, this class's or a parent's, has a template to hold defaults. | Refused |
 | `Lamp->Intensity += 100.0f;`, an `if`, a call such as `K2_DestroyActor();` | Refused: "every statement is `Field = value;`, `Component->Field = value;` or `Component->SetupAttachment(Parent);`". The block never runs, so logic in it could do nothing. | Refused |
 | `Lamp->Intensity = UKismetMathLibrary::RandomFloat();`, `InitialLifeSpan = sizeof(FVector);` | Refused: "a default is a value known when the mod is built". A value here follows the rules for a member's initializer: see [Classes and variables](#classes-and-variables). Compute anything else in `ReceiveBeginPlay` or `UserConstructionScript`. | Refused |
@@ -5993,6 +5994,10 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   that the same class declares, as in `int32 Health; UE_DEFAULTS { Health = 100; }`. Fix: give the variable its value
   where it is declared, `int32 Health = 100;`. UE_DEFAULTS is for inherited variables and for components. See
   [Class defaults](#class-defaults).
+- ``<Class>: UE_DEFAULTS has no body in the class; AssetGen reads its statements there alone, so write them in it, `UE_DEFAULTS { ... }`: a definition out of the class, `void <Class>::UeDefaults__()`, is never read, nor seen by a mod that includes the class's header``:
+  `UE_DEFAULTS;` declares the block without its statements, which may sit in an out-of-line definition. Those would
+  be dropped, and a mod that includes the class's header could not see them either. Fix: move the statements into
+  the class, `UE_DEFAULTS { Health = 100; }`. See [Class defaults](#class-defaults).
 - `` <Class>::UE_DEFAULTS: every statement is `Field = value;`, `Component->Field = value;` or `Component->SetupAttachment(Parent);` ``:
   a statement in UE_DEFAULTS is not a plain `=` onto a member, nor a SetupAttachment: a call such as
   `K2_DestroyActor();`, `Health += 5;`, a local or an `if`. The block never runs; AssetGen only reads its assignments

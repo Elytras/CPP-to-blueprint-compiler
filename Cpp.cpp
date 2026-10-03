@@ -2826,6 +2826,17 @@ bool FCompiler::Collect(std::string* Err)
                    "struct replicates whole, through the class variable that holds it; drop the marker";
             return false;
         }
+        /* UE_DEFAULTS is read where it is written: a definition out of the class is no part of the declaration Collect
+           keeps, and a mod that includes the class's header never sees it, so its statements would be dropped. */
+        bool bBody = false;
+        if (R.Defaults) ForEach(*R.Defaults, [&](const Json& B) { bBody = bBody || Kind(B) == "CompoundStmt"; });
+        if (R.Defaults && !bBody)
+        {
+            *Err = R.CppName + ": UE_DEFAULTS has no body in the class; AssetGen reads its statements there alone, so write "
+                   "them in it, `UE_DEFAULTS { ... }`: a definition out of the class, `void " + LeafOf(R.CppName)
+                 + "::UeDefaults__()`, is never read, nor seen by a mod that includes the class's header";
+            return false;
+        }
         if (R.UePackage.empty()) continue;
         if (R.UePackage != PathIn(ModPackage, R.CppName)) continue;
         if (!R.bIsStruct && R.UeName != LeafOf(R.CppName) + "_C")
