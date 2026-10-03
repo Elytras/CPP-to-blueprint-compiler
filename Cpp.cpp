@@ -2464,6 +2464,18 @@ bool FCompiler::Collect(std::string* Err)
                     BadClassMeta(R, Err, &bMetaOk);
                 }
             }
+            else if (Kind(C) == "VarDecl" && Name(C) == "UeClassInMeta")
+            {
+                /* UE_CLASS_IN names only the owner's mod package; the class's asset is the path its own C++ name
+                   gives under it, so it cannot disagree with the name the way a hand-written UE_CLASS can. */
+                std::string Owner;
+                if (FindLiteral(C, Owner))
+                {
+                    while (!Owner.empty() && Owner.back() == '/') Owner.pop_back();
+                    R.UePackage = PathIn(Owner, R.CppName);
+                    R.UeName = LeafOf(R.CppName) + "_C";
+                }
+            }
             else if (Kind(C) == "VarDecl" && Name(C) == "UeInterfaceMeta")
             {
                 R.bIsInterface = true;

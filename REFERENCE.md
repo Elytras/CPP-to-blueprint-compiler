@@ -174,6 +174,7 @@ Notes:
 | You write | What it does | Status |
 |---|---|---|
 | `UE_CLASS("/Game/_MyMods/Turrets/UTurretDef", "UTurretDef_C");` in a class of a shared header | Records the class's package and its UE name. A source cooks the class only when that package is exactly the path the source would give it: its `UE_MOD_PACKAGE`, then any namespace, then the class name. Every other source that includes the header imports the class and cooks no copy. | Yes |
+| `UE_CLASS_IN("/Game/_MyMods/Turrets");` in UTurretDef | The same as the row above, the class written once: it names the owning mod's `UE_MOD_PACKAGE`, and the compiler appends the namespaces and class name for the package and `_C` for the UE name. Use it for a mod's own classes; `UE_CLASS` stays for an engine class or a name that differs from the C++ one. | Yes |
 | `UE_CLASS("/Game/_MyMods/Turrets", "UTurretDef_C");` | The package names the folder, not the class's own asset. Refused: "does not end in the asset that declares UTurretDef_C", with the path it should be. | Refused |
 | `UE_CLASS("/Game/_MyMods/Turrets/UTurretDef", "UTurretDef");` in the mod that cooks it | A cooked Blueprint class is named `<Class>_C`. Refused: "cooking it here requires", with the right name. | Refused |
 | `UE_CLASS("/Script/Engine", "KismetSystemLibrary");` | Names an engine class: a `/Script` package and the native name, with no `_C`. The class is imported, never cooked, and needs no base. The SDK headers declare every class this way. Write one by hand for an engine class or function the SDK leaves out. | Yes |
@@ -5428,6 +5429,7 @@ listed here is refused with "unimplemented intrinsic".
 | `UE_REPLICATED_USING_IF(Type, Name, OnRep, Cond)` | RepNotify and a replication condition on one variable. | [Replication](#replication) |
 | `UE_SERVER` | Run on Server RPC: called on the owning client, it runs on the server. | [RPCs](#rpcs) |
 | `UE_STRUCT` | Cooks a struct as a UserDefinedStruct (a Structure asset). | [Structs](#structs) |
+| `UE_CLASS_IN(ModPackage)` | UE_CLASS for a mod's own class, named by its owner's UE_MOD_PACKAGE: the package is ModPackage plus namespaces plus the class name, the UE name the class name plus `_C`. | [Mod sources and packages](#mod-sources-and-packages) |
 | `UE_STRUCT_IN(Package)` | UE_STRUCT for a struct in a shared header: only the source whose UE_MOD_PACKAGE is exactly Package cooks it. | [Structs](#structs) |
 | `UeAssets::<Class>::All` | Every game asset of that class, as soft pointers. | [Game assets](#game-assets) |
 | `UeAssets::<Class>::Game::...::<Name>` | A game asset by its content path, for `&` to point at. | [Game assets](#game-assets) |
