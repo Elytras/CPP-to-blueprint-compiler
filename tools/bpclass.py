@@ -24,6 +24,8 @@ CLASS = re.compile(r'^[ \t]*class\s+(\w+)(?:\s+final)?\s*:\s*(?:public\s+)?(\w+)
 API_CLASS = re.compile(r'^class\s+(\w+)\b[^;\n]*$', re.M)
 INCLUDE = re.compile(r'(#include\s+")([^"]+)(")')
 IDENT = re.compile(r'[A-Za-z_]\w*')
+ENGINE_DECL = re.compile(r'UE_CLASS\s*\(\s*"/Script/')
+MANIFEST = os.path.join(BP, "mods.yaml")
 
 
 @dataclass
@@ -32,6 +34,7 @@ class ClassInfo:
     base: str
     file: str
     line: int
+    hidden: str = ""  # why the tree leaves it out: "engine" (a /Script declaration) or "test" (only test mods)
 
 
 # --- files -----------------------------------------------------------------------------------------------------------
@@ -64,13 +67,20 @@ def all_sources():
 
 def scan():
     """Folder -> the classes its sources declare, in file order. Empty folders are kept so they can take a class."""
-    found = {}
+    found, mods = {}, load_mods()
     for root, files in walk():
         found[root] = []
         for path in files:
             text = read(path)[0]
-            for m in CLASS.finditer(text):
-                found[root].append(ClassInfo(m.group(1), m.group(2), path, text.count("\n", 0, m.start()) + 1))
+            # Only test mods compile it (a mod named *Test, bpbuild's rule), so it is not a class to manage.
+            owners = mods_of(path, mods)
+            test = bool(owners) and all(o.endswith("Test") for o in owners)
+            ms = list(CLASS.finditer(text))
+            for i, m in enumerate(ms):
+                # An engine class redeclared for a call (UE_CLASS("/Script/...")) is imported, never a mod's own.
+                engine = ENGINE_DECL.search(text, m.end(), ms[i + 1].start() if i + 1 < len(ms) else len(text))
+                found[root].append(ClassInfo(m.group(1), m.group(2), path, text.count("\n", 0, m.start()) + 1,
+                                             "engine" if engine else "test" if test else ""))
     return found
 
 
@@ -109,9 +119,67 @@ def inside_bp(folder):
     return folder
 
 
-def mods_of(cpp):
+def load_mods():
+    return (yaml.safe_load(read(MANIFEST)[0]) or {}).get("mods") or []
+
+
+# The keys the mod form edits; any other (api_dir, nested lists) is left as written.
+MOD_KEYS = ("sources", "needs", "embed", "generate_api")
+ITEM = re.compile(r'^  - name:\s*(\S+)\s*$')
+
+
+def mod_span(lines, name):
+    """[start, end) of the mod's lines in mods.yaml: its `- name:` line to its last own line, so the comment and
+    blank lines that head the next mod stay with it."""
+    start = next((i for i, l in enumerate(lines) if (m := ITEM.match(l)) and m.group(1) == name), None)
+    if start is None:
+        return None
+    end = start + 1
+    for i in range(start + 1, len(lines)):
+        l = lines[i]
+        if l.startswith("  -") or l.startswith("  #") or (l.strip() and not l.startswith(" ")):
+            break
+        if l.strip():
+            end = i + 1
+    return start, end
+
+
+def yaml_value(v):
+    return "[%s]" % ", ".join(v) if isinstance(v, list) else "true" if v is True else str(v)
+
+
+def set_mod(text, old, name, values):
+    """mods.yaml with mod `old` (None: a new one, appended) named `name` and its MOD_KEYS set from values: an empty
+    list or False drops the key. Text edits, so every comment and every other mod stays byte for byte."""
+    nl = "\r\n" if "\r\n" in text else "\n"
+    lines = text.split(nl)
+    span = mod_span(lines, old) if old else None
+    if old and not span:
+        raise ValueError("mods.yaml has no mod %s" % old)
+    if name != old and mod_span(lines, name):
+        raise ValueError("mods.yaml already has a mod %s" % name)
+    if not span:
+        while lines and not lines[-1].strip():
+            lines.pop()
+        lines += [""]
+        span = (len(lines), len(lines))
+    body = ["  - name: " + name]
+    kept = [l for l in lines[span[0] + 1:span[1]]
+            if not any(re.match(r'^    %s:' % k, l) for k in MOD_KEYS)]
+    body += ["    %s: %s" % (k, yaml_value(values[k])) for k in MOD_KEYS if values.get(k) not in (None, [], False, "")]
+    lines[span[0]:span[1]] = body + kept
+    return nl.join(lines if lines[-1] == "" else lines + [""])
+
+
+def save_mod(old, name, values):
+    text, bom = read(MANIFEST)
+    write(MANIFEST, set_mod(text, old, name, values), bom)
+    return ["mods.yaml: %s %s" % ("updated" if old else "added", name)]
+
+
+def mods_of(cpp, mods=None):
     """The mods in mods.yaml whose sources take this .cpp (it need not exist yet)."""
-    mods = (yaml.safe_load(read(os.path.join(BP, "mods.yaml"))[0]) or {}).get("mods") or []
+    mods = load_mods() if mods is None else mods
     target = os.path.normcase(os.path.abspath(cpp))
     return [m["name"] for m in mods for s in m.get("sources") or []
             if glob_match(target, os.path.normcase(os.path.abspath(os.path.join(BP, s))))]
@@ -305,7 +373,9 @@ def tui():
         #dialog { width: 80; height: auto; max-height: 80%; padding: 1 2; border: thick $accent; background: $surface; }
         """
         BINDINGS = [("n", "new", "New"), ("r", "rename", "Rename"), ("m", "move", "Move"), ("d", "delete", "Delete"),
-                    ("o", "open", "Open"), ("f5", "rescan", "Rescan"), ("q", "quit", "Quit")]
+                    ("c", "mod", "Mod config"), ("h", "hidden", "Show hidden"), ("o", "open", "Open"),
+                    ("f5", "rescan", "Rescan"), ("q", "quit", "Quit")]
+        show_hidden = False
 
         def compose(self):
             yield Header()
@@ -341,6 +411,8 @@ def tui():
                 if folder != BP:
                     nodes[folder] = nodes[os.path.dirname(folder)].add(os.path.basename(folder), data=folder, expand=True)
                 for c in classes:
+                    if c.hidden and not self.show_hidden:
+                        continue
                     nodes[folder].add_leaf("%s [dim]: %s[/dim]" % (c.name, c.base), data=c)
 
         def on_tree_node_highlighted(self, event):
@@ -412,6 +484,41 @@ def tui():
 
         def action_rescan(self):
             self.rescan()
+
+        def action_hidden(self):
+            """Engine declarations (UE_CLASS("/Script/...")) and test-only classes, shown or not."""
+            self.show_hidden = not self.show_hidden
+            self.rescan()
+            self.notify("hidden classes %s" % ("shown" if self.show_hidden else "hidden"))
+
+        def action_mod(self):
+            """Edits the mods.yaml entry that compiles the selection, or makes one: a class's own .cpp, a folder's
+            *.cpp. Lists are comma separated; embed and generate_api take y/n."""
+            d = self.selected()
+            folder = os.path.dirname(d.file) if isinstance(d, ClassInfo) else d
+            own = [os.path.splitext(d.file)[0] + ".cpp"] if isinstance(d, ClassInfo) else []
+            mods = load_mods()
+            names = [m["name"] for m in mods]
+            current = set(folder_mods(folder) if not own else mods_of(own[0], mods))
+            mod = next((m for m in mods if m["name"] in current), None)
+            if mod:
+                sources = ", ".join(mod.get("sources") or [])
+            else:
+                src = own[0] if own and os.path.exists(own[0]) else os.path.join(folder, "*.cpp")
+                sources = rel(src).replace("\\", "/")
+            yn = lambda k: "y" if mod and mod.get(k) else "n"
+            fields = [("Mod name", mod["name"] if mod else "", names), ("Sources, comma separated", sources, None),
+                      ("Needs, comma separated", ", ".join(mod.get("needs") or []) if mod else "", names),
+                      ("Embed y/n", yn("embed"), None), ("Generate API y/n", yn("generate_api"), None)]
+            split = lambda v: [x.strip() for x in v.split(",") if x.strip()]
+
+            def done(v):
+                if not v or not v[0]:
+                    return
+                values = {"sources": split(v[1]), "needs": split(v[2]),
+                          "embed": v[3].lower().startswith("y"), "generate_api": v[4].lower().startswith("y")}
+                self.apply(save_mod, mod["name"] if mod else None, v[0], values)
+            self.push_screen(Form("%s mod in mods.yaml" % ("Edit" if mod else "New"), fields), done)
 
     BpClassApp().run()
 
