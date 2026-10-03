@@ -140,7 +140,7 @@ def create(folder, name, base, found, api):
     local = next((c.file for cs in found.values() for c in cs if c.name == base and c.file.endswith(".h")), None)
     include = os.path.relpath(local, folder).replace("\\", "/") if local else api.get(base, "Engine.h")
     pkg = package(folder)
-    body = '    UE_CLASS("%s/%s", "%s_C");\n' % (pkg, name, name) if pkg else ""
+    body = '    UE_CLASS_IN("%s");\n' % pkg if pkg else ""
     write(h, '#pragma once\n#include "%s"\n\nclass %s : public %s\n{\npublic:\n%s};\n' % (include, name, base, body))
     write(cpp, '#include "%s.h"\n' % name)
     return ["created %s and %s.cpp" % (rel(h), name)] + unpicked_note(cpp)
@@ -193,6 +193,7 @@ def move(c, dest, found):
         text, bom = read(p)
         text = INCLUDE.sub(retarget(src, dest), text)
         if pkg:
+            text = re.sub(r'(UE_CLASS_IN\s*\(\s*")[^"]*"', r'\g<1>%s"' % pkg, text)
             text = re.sub(r'(UE_CLASS\s*\(\s*")[^"]*/%s"' % re.escape(c.name), r'\g<1>%s/%s"' % (pkg, c.name), text)
         write(moved[os.path.normcase(p)], text, bom)
         os.remove(p)
