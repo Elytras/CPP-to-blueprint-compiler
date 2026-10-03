@@ -12111,10 +12111,12 @@ bool FCompiler::DiffAgainstDefaultObject(const FRecord* From, const std::string&
         const FRecord* const SR = Set || !Declared ? nullptr : Find(StripTypeKeywords(TypeOf(*Declared)));
         if (C->IsNative() && !C->bClassIn && !Set && !(Declared && First(*Declared)) && !(SR && SR->IsModStruct()))
         {
+            /* The class as the source names it: its leaf, not a game Blueprint's Game::<path>:: or a namespace. */
             const bool bHandWritten = bOtherMod && C->CppName.compare(0, 6, "Game::") != 0;
+            const std::string Class = LeafOf(C->CppName);
             printf("  warning: %s: %s's default object holds a value that no header says, so none of its elements is "
-                   "removed: any it has load as well%s\n", Named.c_str(), C->CppName.c_str(),
-                   bHandWritten ? ("; if a mod cooks " + C->CppName + ", declare it with UE_CLASS_IN or give the member "
+                   "removed: any it has load as well%s\n", Named.c_str(), Class.c_str(),
+                   bHandWritten ? ("; if a mod cooks " + Class + ", declare it with UE_CLASS_IN or give the member "
                                    "an initializer").c_str() : "");
             return true;
         }

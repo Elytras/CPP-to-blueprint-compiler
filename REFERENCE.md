@@ -6034,8 +6034,9 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   silence it.
 - `warning: <Asset>.<Member>: <Class>'s default object holds a value that no header says, so none of its elements is
   removed: any it has load as well`, or `<Class>::UE_DEFAULTS: <Member>: ...`: a data asset's braces, or a
-  `UE_DEFAULTS` statement, give a TSet or TMap whose class default belongs to an engine class or a game Blueprint. The
-  loader starts the value from that default and applies what AssetGen writes, so elements the braces leave out stay.
+  `UE_DEFAULTS` statement, give a TSet or TMap whose class default belongs to an engine class or a game Blueprint,
+  named as the source writes it (`BoolSave_C`, not its `Game::` path). The loader starts the value from that default
+  and applies what AssetGen writes, so elements the braces leave out stay.
   A class of a shared header declared with `UE_CLASS` whose member has no initializer gets it too, ending "if a mod
   cooks <Class>, declare it with UE_CLASS_IN or give the member an initializer": a game Blueprint's header looks the
   same. Fix: for a game or engine class, none (its value is the game's); for another mod's class, what the message

@@ -9245,7 +9245,8 @@ def asset_other_class():
     the header too; AS_AouNamed's class is pinned with UE_CLASS and an initializer. UAouLocal, a class of this mod
     under UAosDef, starts its UE_DEFAULTS M = {{"c", 4}} from the header's value, and AS_AouLocal from both. A game
     class's CDO holds what no header says: AS_AouNative and UAouEnemy's UE_DEFAULTS leave its elements to load, and a
-    warning names the member."""
+    warning names the member. So does AS_AouHand's class, a hand-written UE_CLASS whose S has no initializer: its
+    warning, checked whole, names the class as the source writes it (UAosHand, not AosHand::UAosHand) and advises."""
     user = os.path.dirname(asset('AssetOtherUser'))
     owner = os.path.join(os.path.dirname(os.path.dirname(asset('AssetOtherOwner'))), 'AssetOtherOwner')
 
@@ -9272,25 +9273,16 @@ def asset_other_class():
     for where in ('AS_AouNative.BannedMissionTypes', 'UAouEnemy::UE_DEFAULTS: BannedMissionTypes'):
         assert 'warning: %s: UEnemyDescriptor\'s default object holds a value' % where in LOGS['AssetOtherUser'], \
             LOGS['AssetOtherUser']
-
-
-asset_other_class()
-print('ok  AssetOtherUser: an asset of another mod\'s class, and a UE_DEFAULTS under one, lists the CDO\'s elements the '
-      'shared header gives and the braces drop as removed; over a game class\'s CDO a warning names the member')
-
-
-def asset_other_hand_warning():
-    """The warning over a class whose default no header says names the class as the source writes it, not its C++
-    path: AS_AouHand's class is AssetOtherShared.h's hand-written UE_CLASS AosHand::UAosHand, whose S has no initializer,
-    and the warning's advice for that case is checked whole."""
-    asset('AssetOtherUser')
     line = ('warning: AS_AouHand.S: UAosHand\'s default object holds a value that no header says, so none of its '
             'elements is removed: any it has load as well; if a mod cooks UAosHand, declare it with UE_CLASS_IN or give '
             'the member an initializer')
     assert line in LOGS['AssetOtherUser'], 'no "%s" in:\n%s' % (line, LOGS['AssetOtherUser'])
 
 
-pending('AssetOtherHandWarning', asset_other_hand_warning)
+asset_other_class()
+print('ok  AssetOtherUser: an asset of another mod\'s class, and a UE_DEFAULTS under one, lists the CDO\'s elements the '
+      'shared header gives and the braces drop as removed; over a game class\'s CDO a warning names the member')
+
 
 
 def name_map_delta(pkg, t):
