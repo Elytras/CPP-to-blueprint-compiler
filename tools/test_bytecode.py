@@ -9283,15 +9283,15 @@ def asset_map_dup_keys():
     """A key a map's braces give twice holds the last value given, as TMap's initializer-list constructor Adds each pair
     in order (Map.h 1166-1173). AS_AmdOver's {{"a", 1}, {"a", 2}} over UAmdDef's {a: 2, c: 3} loads {a: 2}, AS_AmdLast's
     {{"c", 7}, {"c", 3}} loads {c: 3}, and UAmdKid's UE_DEFAULTS {{"a", 5}, {"a", 2}} gives its CDO {a: 2}: checked one
-    pair at a time against the CDO's, the last pair equals it and was dropped, leaving the first. AS_AmdOver's set
-    {3, 3} loads {3}."""
+    pair at a time against the CDO's, the last pair equals it and was dropped, leaving the first. A set's repeat is not
+    checked here: the loader skips an element the set holds (PropertySet.cpp 348), so {3, 3} loads {3} written either
+    way; AssetMapStrCase's {"a", "A"} is a repeat that changes what loads."""
     here = os.path.dirname(asset('AssetMapDupKeys'))
     cls = invariants.Package(os.path.join(here, 'UAmdDef'))
     cdo = cls.find('Default__UAmdDef_C')
-    base_m, base_s = loaded_container(cls, cdo, 'M', 'map', {}), loaded_container(cls, cdo, 'S', 'set', set())
+    base_m = loaded_container(cls, cdo, 'M', 'map', {})
     for pkg, row, path, kind, start, want in (
             ('AS_AmdOver', 'AS_AmdOver', 'M', 'map', base_m, {'a': 2}),
-            ('AS_AmdOver', 'AS_AmdOver', 'S', 'set', base_s, {3}),
             ('AS_AmdLast', 'AS_AmdLast', 'M', 'map', base_m, {'c': 3}),
             ('UAmdKid', 'Default__UAmdKid_C', 'M', 'map', base_m, {'a': 2})):
         base = os.path.join(here, pkg)
@@ -9313,13 +9313,17 @@ def asset_map_str_case():
     {{"a", 5}, {"A", 1}} over UAmsDef's {"A": 1} loads {"A": 1}, its set {"a", "A"} over an empty one {"A"}, and UAmsKid's
     UE_DEFAULTS gives its CDO {"A": 1}: compared by their bytes, ("a", 5) was written over the CDO's "A", whose value
     the loader replaced (FindOrAdd ignores case too), and the set loaded the first spelling. A key spelled anew is
-    another element: AS_AmsSpell's {{"a", 1}} lists "A" removed and loads {"a": 1}. An FName key is one element too."""
-    here = os.path.dirname(pending_asset('AssetMapStrCase', 'UAmsDef'))
+    another element: AS_AmsSpell's {{"a", 1}} lists "A" removed and loads {"a": 1}. An FName key is one element too.
+    A class's own value loads over nothing, each pair in the order written: UAmsDef's W, {{"b", 2}, {"B", 3}}, holds
+    {"B": 3} in C++, and written with both pairs it loaded {"b": 3}."""
+    here = os.path.dirname(asset('AssetMapStrCase'))
     cls = invariants.Package(os.path.join(here, 'UAmsDef'))
     cdo = cls.find('Default__UAmsDef_C')
     base_t, base_n = loaded_container(cls, cdo, 'T', 'strmap', {}), loaded_container(cls, cdo, 'N', 'map', {})
     base_u = loaded_container(cls, cdo, 'U', 'strset', set())
     assert (base_t, base_u, base_n) == ({'A': 1}, set(), {'a': 1}), (base_t, base_u, base_n)
+    base_w = loaded_container(cls, cdo, 'W', 'strmap', {})
+    assert base_w == {'B': 3}, 'UAmsDef\'s CDO loads W = %s; C++ says {"B": 3}' % base_w
     for pkg, row, path, kind, start, want in (
             ('AS_AmsDup', 'AS_AmsDup', 'T', 'strmap', base_t, {'A': 1}),
             ('AS_AmsDup', 'AS_AmsDup', 'U', 'strset', base_u, {'A'}),
@@ -9333,7 +9337,10 @@ def asset_map_str_case():
         assert got == want, '%s loads %s = %s over %s; C++ says %s' % (row, path, got, start, want)
 
 
-pending('AssetMapStrCase', asset_map_str_case)
+asset_map_str_case()
+print('ok  AssetMapStrCase: an FString key given twice in two spellings is one element, the last one given, in a '
+      'class\'s own value, an asset\'s delta over its CDO and a UE_DEFAULTS\' over its parent\'s; one spelled anew is '
+      'another element')
 
 
 def uds_init_defaults():
@@ -10173,12 +10180,11 @@ MAP_PATCH_CASES = (('Ids = {7};\n    Score = {{"a", 9}};', {('Ids',): {7}, ('Sco
                    ('Held = {{1, 7}, {{"a", 1}, {"b", 2}}, 3};\n    Deep = {{{7}, {{"c", 3}}, 3}, 4};',
                     {('Held', 'Ids'): {1, 7}, ('Held', 'Score'): {'a': 1, 'b': 2}, ('Deep', 'In', 'Ids'): {7},
                      ('Deep', 'In', 'Score'): {'c': 3}}),
-                   ('Score = {{"a", 9}, {"a", 1}};', {('Score',): {'a': 1}}))
-# An FString key ignores case (FString's == and GetTypeHash): "a" and "A" are one key, the last pair's.
-MAP_PATCH_STR_CASE = (('Text = {{"a", 5}, {"A", 1}};', {('Text',): {'A': 1}}),)
+                   ('Score = {{"a", 9}, {"a", 1}};', {('Score',): {'a': 1}}),
+                   ('Text = {{"a", 5}, {"A", 1}};', {('Text',): {'A': 1}}))
 
 
-def edit_whole_containers(cases=MAP_PATCH_CASES):
+def edit_whole_containers():
     """S38: a patch's whole TSet / TMap is what the edited default object loads. Its tag is a delta against the
     archetype, the parent Blueprint's CDO: the loader copies that value in, takes out the elements the tag lists as
     removed, then adds the rest (PropertySet.cpp 285-358, PropertyMap.cpp 316-400), as for a mod class's own
@@ -10189,7 +10195,8 @@ def edit_whole_containers(cases=MAP_PATCH_CASES):
     struct (Held, Deep). Written as additions only, the CDO would load the union. What a case does not assign keeps
     what the unpatched CDO loads. A key given twice holds the last value, as TMap's initializer-list constructor Adds
     each pair in order (Map.h 1166-1173): `{{"a", 9}, {"a", 1}}` loads {a: 1}, though its last pair is the archetype's
-    own, which a delta checking one pair at a time dropped."""
+    own, which a delta checking one pair at a time dropped. An FString key compares without case, so Text's
+    `{{"a", 5}, {"A", 1}}` over the archetype's {"A": 1} loads {"A": 1}, not 5 under "A"."""
     game = os.path.join(ROOT, 'PropSetDelta', 'FSD', 'Content')
     decl = ('struct FPropSetHeld {\n  UE_STRUCT_IN("/Game/_ElytrasMods/PropSetDelta");\n  TSet<int32> Ids;\n'
             '  TMap<FName, int32> Score;\n  int32 N;\n};\n'
@@ -10210,7 +10217,7 @@ def edit_whole_containers(cases=MAP_PATCH_CASES):
                 for p in paths}
     vanilla = loads(invariants.Package(os.path.join(game, '_ElytrasMods', 'PropSetDelta', 'PropSetDelta')))
     assert vanilla[('Text',)] == {'A': 1}, vanilla
-    for body, assigned in cases:
+    for body, assigned in MAP_PATCH_CASES:
         with tempfile.TemporaryDirectory() as tmp:
             proc, content = compile_edit(tmp, 'MapPatch', EDIT_HEAD + 'UE_MOD_PACKAGE("/Game/_ElytrasMods/MapPatch");\n' + decl
                                          + 'class Tweaks : public PropSetDelta {\n  UE_PATCH;\n'
@@ -10462,8 +10469,7 @@ if not globals().get('EDITS_EXPLORE'):     # set by the dev loop's exploration d
     edit_whole_containers()
     print('ok  MapPatch: a patch\'s whole TSet / TMap loads as written, a property or one inside a struct (by a member '
           'path or in a whole struct): the archetype\'s elements it drops are listed as removed; a key given twice '
-          'holds its last value')
-    pending('MapPatchStrCase', lambda: edit_whole_containers(MAP_PATCH_STR_CASE))
+          'holds its last value, an FString key compared without case')
 
 
 PREFETCH.finish()

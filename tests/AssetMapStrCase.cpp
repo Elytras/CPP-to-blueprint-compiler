@@ -14,6 +14,7 @@ public:
     TMap<FString, int32> T = {{"A", 1}};
     TSet<FString> U;
     TMap<FName, int32> N = {{"A", 1}};
+    TMap<FString, int32> W = {{"b", 2}, {"B", 3}};    // C++: {"B": 3}; written twice, it loaded {"b": 3}
 };
 
 class UAmsKid : public UAmsDef

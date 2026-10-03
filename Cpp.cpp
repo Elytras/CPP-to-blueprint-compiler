@@ -280,12 +280,26 @@ bool AttachmentCall(const Json& S, const Json*& Callee, const Json*& Child, cons
     return Child != nullptr;
 }
 
-/* A set's or map's elements as the braces leave them in C++: each key once, where it first appears, a map's with the
-   last value given for it, as the initializer-list constructors Add each element in order and Add replaces what a key
-   already holds (Map.h 1166-1173). Key is an element's bytes, as the engine compares them. A delta checks one pair at
-   a time against the default object's, so a second pair that matches it would be dropped and the first would win. */
-void LastValuePerKey(std::vector<FDefaultValue>& Items, bool bMap, const std::function<std::vector<uint8>(const FDefaultValue&)>& Key)
+/* A set's or map's elements as the braces leave them in C++: each key once, where it first appears, holding the last
+   element given for it, as the initializer-list constructors Add each element in order and Add replaces the whole
+   element, a map's value and the key's own spelling (Map.h 1166-1173; TSet::Emplace, Set.h 625). Keys compare as the
+   engine compares them, by their bytes (KeyDef's), a name by its row in a scratch table, which a name spelled in another
+   case shares; an FString with its case folded, as FString's == and GetTypeHash ignore it (UnrealString.h 1123,
+   Strihash; ASCII letters only, FChar::ToLower). A delta checks one pair at a time against the default object's, so a
+   second pair that matches it would be dropped and the first would win; and a class's own value written with both
+   would load the first spelling. */
+void LastValuePerKey(std::vector<FDefaultValue>& Items, bool bMap, const FPropertyDef& KeyDef)
 {
+    FPackage Scratch("/Scratch");
+    Scratch.SeedNames({});
+    auto Key = [&](const FDefaultValue& V) {
+        FPropertyDef E = KeyDef;
+        E.Default = V;
+        if (KeyDef.Type == "StrProperty") E.Default.S = Lower(V.S);
+        FArc A(&Scratch);
+        WriteDefaultValue(A, E);
+        return A.B;
+    };
     const size_t Step = bMap ? 2 : 1;
     std::vector<FDefaultValue> Once;
     std::vector<std::vector<uint8>> Keys;
@@ -293,12 +307,13 @@ void LastValuePerKey(std::vector<FDefaultValue>& Items, bool bMap, const std::fu
     {
         std::vector<uint8> K = Key(Items[I]);
         const auto Had = std::find(Keys.begin(), Keys.end(), K);
+        const auto From = Items.begin() + std::ptrdiff_t(I);
         if (Had == Keys.end())
         {
             Keys.push_back(std::move(K));
-            Once.insert(Once.end(), Items.begin() + std::ptrdiff_t(I), Items.begin() + std::ptrdiff_t(I + Step));
+            Once.insert(Once.end(), From, From + std::ptrdiff_t(Step));
         }
-        else if (bMap) Once[size_t(Had - Keys.begin()) * 2 + 1] = Items[I + 1];
+        else std::copy(From, From + std::ptrdiff_t(Step), Once.begin() + (Had - Keys.begin()) * std::ptrdiff_t(Step));
     }
     Items = std::move(Once);
 }
@@ -307,7 +322,8 @@ void LastValuePerKey(std::vector<FDefaultValue>& Items, bool bMap, const std::fu
    400-472) against Parent, the parent CDO's value it loads over: the parent's elements (a map's keys) P lacks as
    removed, and of P's own only those the parent lacks (a map's pairs whose key it lacks or maps elsewhere). Elements
    compare as the engine reads them, by their bytes: a name by its row in a scratch table, which a name spelled in
-   another case shares, as FName's comparison ignores case. */
+   another case shares, as FName's comparison ignores case. An FString key spelled in another case compares unequal
+   here, though the engine's compare ignores it: listed as removed and added, it loads in the new spelling. */
 void DiffAgainstParent(FPropertyDef& P, const FDefaultValue& Parent)
 {
     if (!P.Inner) return;
@@ -328,7 +344,7 @@ void DiffAgainstParent(FPropertyDef& P, const FDefaultValue& Parent)
         return nullptr;
     };
     FDefaultValue& Mine = P.Default;
-    LastValuePerKey(Mine.Items, bMap, [&](const FDefaultValue& K) { return Bytes(*P.Inner, K); });
+    LastValuePerKey(Mine.Items, bMap, *P.Inner);
     Mine.Removed.clear();
     for (size_t I = 0; I + Step <= Parent.Items.size(); I += Step)
         if (!Find(Mine.Items, Parent.Items[I])) Mine.Removed.push_back(Parent.Items[I]);
@@ -12220,6 +12236,9 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
         });
         if (!bOk && Err->empty()) *Err = "a TMap default is a list of { key, value } pairs: " + Name(F);
         PD.Default.K = FDefaultValue::Array;
+        /* A set or map holds each key once, as the C++ value does: written twice, an FString key in two spellings
+           would load the first one. */
+        if (bOk && PD.Type != "ArrayProperty") LastValuePerKey(PD.Default.Items, bMap, *PD.Inner);
         return bOk;
     }
     if (FIndex Asset; PD.Type == "ObjectProperty" && AssetRef(*Init, BP, &Asset))
@@ -13861,7 +13880,7 @@ bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object,
             WriteDefaultValue(A, Element);
             return A.B;
         };
-        LastValuePerKey(D.Default.Items, bMap, [&](const FDefaultValue& K) { return Bytes(*D.Inner, K); });
+        LastValuePerKey(D.Default.Items, bMap, *D.Inner);
         FDefaultValue Delta = D.Default;
         Delta.Items.clear();
         Delta.Removed.clear();
