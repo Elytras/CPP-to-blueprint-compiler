@@ -5207,14 +5207,8 @@ Notes:
 | `__RefAt__(Addr)` | Passes the memory at Addr by reference to an engine function whose native code steps its wildcard argument itself (a CustomThunk). The function sees Addr, not the address of a temporary copy. Read as a plain value, it is 8 bytes of int64. | Yes |
 
 ```cpp
-#include "../include/Intrin.h"   // AssetGen's include/Intrin.h
-
-// At namespace scope: the engine function, with an int64 in place of its wildcard parameter.
-class WildcardSystemSetters : public UBlueprintFunctionLibrary {
-public:
-  UE_CLASS("/Script/Engine", "KismetSystemLibrary");
-  static void SetStructurePropertyByName(class UObject *Object, FName PropertyName, int64 Value);
-};
+#include "../include/Wildcard.h"   // AssetGen's include/Wildcard.h: the engine's wildcard setters, int64 in place
+                                   // of the wildcard parameter (and Intrin.h, for __RefAt__)
 
 // In your class:
 void Copy(AActor *To, FName ToField, int64 Addr) {
