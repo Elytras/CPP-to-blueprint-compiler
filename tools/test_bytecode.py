@@ -9279,6 +9279,20 @@ print('ok  AssetOtherUser: an asset of another mod\'s class, and a UE_DEFAULTS u
       'shared header gives and the braces drop as removed; over a game class\'s CDO a warning names the member')
 
 
+def asset_other_hand_warning():
+    """The warning over a class whose default no header says names the class as the source writes it, not its C++
+    path: AS_AouHand's class is AssetOtherShared.h's hand-written UE_CLASS AosHand::UAosHand, whose S has no initializer,
+    and the warning's advice for that case is checked whole."""
+    asset('AssetOtherUser')
+    line = ('warning: AS_AouHand.S: UAosHand\'s default object holds a value that no header says, so none of its '
+            'elements is removed: any it has load as well; if a mod cooks UAosHand, declare it with UE_CLASS_IN or give '
+            'the member an initializer')
+    assert line in LOGS['AssetOtherUser'], 'no "%s" in:\n%s' % (line, LOGS['AssetOtherUser'])
+
+
+pending('AssetOtherHandWarning', asset_other_hand_warning)
+
+
 def name_map_delta(pkg, t):
     """A TMap<FName, FName> tag t of pkg as written: the keys it lists as removed, then the pairs it adds."""
     import struct

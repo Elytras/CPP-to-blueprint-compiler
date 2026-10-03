@@ -35,3 +35,5 @@ UAouLocal AS_AouLocal = {{.S = {7}, .M = {{"a", 2}}}};
 UAosNamed AS_AouNamed = {.S = {3}};
 // C++: BannedMissionTypes empty; the game's CDO's value is unknown here: warned.
 UEnemyDescriptor AS_AouNative = {.BannedMissionTypes = {}};
+// C++: S {3}; UAosHand's CDO's value is unknown here (no initializer): warned.
+AosHand::UAosHand AS_AouHand = {.S = {3}};
