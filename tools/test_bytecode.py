@@ -3047,6 +3047,58 @@ check('StructTest', 'MakeNative', lambda D: D + 0.5, [dict(D=d) for d in (0.0, 4
 pointer_behaviour()
 
 
+def map_pairs(pkg, tag):
+    """A TMap tag's (key, value) pairs in order, each FName (an enum's, as a ByteProperty in a container writes it, too)
+    or FString as text; it lists no removals."""
+    import struct
+    raw, o = tag['value'], 0
+
+    def item(kind):
+        nonlocal o
+        if kind == 'StrProperty':
+            n = struct.unpack_from('<i', raw, o)[0]
+            v = raw[o + 4:o + 3 + n].decode(); o += 4 + n
+            return v
+        assert kind in ('NameProperty', 'ByteProperty', 'EnumProperty'), kind
+        i, n = struct.unpack_from('<ii', raw, o); o += 8
+        return pkg.names[i] + ('_%d' % (n - 1) if n else '')
+    removed, count = struct.unpack_from('<ii', raw, 0); o = 8
+    assert removed == 0, removed
+    out = [(item(tag['inner']), item(tag['value_type'])) for _ in range(count)]
+    assert o == len(raw), raw.hex()
+    return out
+
+
+def enum_map_decl():
+    """UE_ENUM_MAP(K, V, Name) declares the member itself, `TMap<K, V> Name = UE_ENUM_MAP(E)` without spelling the types
+    twice: the enum on either side, FName or FString on the other, a game enum too. Each is a TMap property of those
+    types whose default holds one pair per enumerator in order, the C++ name as the text and no _MAX, as the
+    one-argument form's (OldByName, beside them) does."""
+    import invariants
+    base = pending_asset('EnumMapDecl')
+    keeps_invariants(base)
+    pkg = invariants.Package(base)
+    props = {p.name: p for p in pkg.struct(pkg.find('EnumMapDecl_C')).props}
+    cdo = pkg.find('Default__EnumMapDecl_C')
+    moods = ['Calm', 'Angry', 'Sleepy']
+    reasons = ['Destroyed', 'LevelTransition', 'EndPlayInEditor', 'RemovedFromWorld', 'Quit']
+    by_name = [(m, 'EEmdMood::' + m) for m in moods]
+    for name, key, value, want in (
+            ('MoodsByName', 'StrProperty', 'ByteProperty', by_name),
+            ('MoodsByFName', 'NameProperty', 'ByteProperty', by_name),
+            ('MoodNames', 'ByteProperty', 'NameProperty', [(e, m) for m, e in by_name]),
+            ('MoodTexts', 'ByteProperty', 'StrProperty', [(e, m) for m, e in by_name]),
+            ('Reasons', 'ByteProperty', 'NameProperty', [('EEndPlayReason::' + r, r) for r in reasons]),
+            ('OldByName', 'StrProperty', 'ByteProperty', by_name)):
+        p = props[name]
+        assert (p.type, [s.type for s in p.subs]) == ('MapProperty', [key, value]), (name, p.type, p.subs)
+        got = map_pairs(pkg, pkg.tag(cdo, name))
+        assert got == want, '%s holds %s; the enum says %s' % (name, got, want)
+
+
+pending('EnumMapDecl: UE_ENUM_MAP(K, V, Name) declares the member, the enum on either side', enum_map_decl)
+
+
 # ---- IfaceTest, OverrideTest, SuperTest, NameTest, AssetTest
 
 def interfaces():
