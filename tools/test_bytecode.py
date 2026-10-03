@@ -9288,14 +9288,13 @@ print('ok  AssetOtherUser: an asset of another mod\'s class, and a UE_DEFAULTS u
 def name_map_delta(pkg, t):
     """A TMap<FName, FName> tag t of pkg as written: the keys it lists as removed, then the pairs it adds."""
     import struct
-    raw, o = t['value'], 0
-    removed = []
-    for _ in range(struct.unpack_from('<i', raw, o)[0]):
-        removed.append(fname_at(pkg.names, raw, o + 4)); o += 8
-    o += 4
-    added = []
-    for _ in range(struct.unpack_from('<i', raw, o - 4)[0]):
-        added.append((fname_at(pkg.names, raw, o), fname_at(pkg.names, raw, o + 8))); o += 16
+    raw = t['value']
+    n, o = struct.unpack_from('<i', raw, 0)[0], 4
+    removed = [fname_at(pkg.names, raw, o + 8 * k) for k in range(n)]
+    o += 8 * n
+    n, o = struct.unpack_from('<i', raw, o)[0], o + 4
+    added = [(fname_at(pkg.names, raw, o + 16 * k), fname_at(pkg.names, raw, o + 16 * k + 8)) for k in range(n)]
+    o += 16 * n
     assert o == len(raw), raw.hex()
     return removed, added
 
@@ -9307,8 +9306,8 @@ def asset_chain_unsaid():
     an asset of a class of this mod below it (AS_AcuLocal) and a UE_DEFAULTS below it (UAcuKid) load over a value no
     header says either: each warns, naming the member and the engine class. The pairs the header does say are still
     listed as removed: o, of UAcsNodes's {o: x}."""
-    pending_asset('AssetChainOwner', 'UAcsNodes')
-    user = os.path.dirname(pending_asset('AssetChainUser', 'UAcuLocal'))
+    asset('AssetChainOwner')
+    user = os.path.dirname(asset('AssetChainUser'))
     for where in ('AS_AcuNodes.SourceToTarget', 'AS_AcuLocal.SourceToTarget', 'UAcuKid::UE_DEFAULTS: SourceToTarget'):
         line = 'warning: %s: UNodeMappingContainer\'s default object holds a value that no header says' % where
         assert line in LOGS['AssetChainUser'], 'no "%s" in:\n%s' % (line, LOGS['AssetChainUser'])
@@ -9320,7 +9319,9 @@ def asset_chain_unsaid():
         assert delta == (['o'], [('u', 'y')]), '%s writes SourceToTarget as %s' % (name, delta)
 
 
-pending('AssetChainUnsaid', asset_chain_unsaid)
+asset_chain_unsaid()
+print('ok  AssetChainUser: a set or map over another mod\'s UE_DEFAULTS of an engine class\'s member warns, as over the '
+      'engine class itself, and still lists the elements the header says as removed')
 
 
 def asset_iface_set():

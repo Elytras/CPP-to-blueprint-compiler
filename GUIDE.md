@@ -816,8 +816,9 @@ the members the braces name are written; the rest keep the class defaults. A `TS
 whole value, not elements added to the class default's, wherever a header says that default: a class of yours or of
 another mod's shared header. The class can also be a game class, such as `UEnemyDescriptor`; a game or engine class's
 default is the game's, which no header says, so a set or map's braces add to whatever elements it has, and a warning
-names the member. `&Name` points at the asset: in a variable's default, in a container default, or in a function
-body.
+names the member. So does a class whose `UE_DEFAULTS` sets such a member: its default object holds the game's
+elements as well as the statement's. `&Name` points at the asset: in a variable's default, in a container default, or
+in a function body.
 
 A game asset is named with `UE_ASSET_AT(Class, Name, "/Game/Path/Package")`, after which `&Name` points at it as well.
 The UeAssets headers (see [The SDK](#the-sdk)) declare the game's assets this way, in namespaces that follow their

@@ -1881,6 +1881,21 @@ private:
     bool ValueFreshFrom(const FRecord* From, const std::string& Id, const Json*& Braces, const FRecord*& BracesOf) const;
     bool DiffAgainstDefaultObject(const FRecord* From, const std::string& Id, const std::string& Named, FPropertyDef& PD,
                                   FBlueprintClass& BP, std::string* Err);
+    /* Where the default object of From takes its value of the member declared as Id, as the source tells it: At, the
+       nearest class from From up with a say; Set and Value, the UE_DEFAULTS statement there that sets the member, else
+       Declared, its declaration - for a mod interface's variable the interface's field, when At lists the interface
+       and so holds the variable as its own property (bHolder, InterfaceVarHolder); Struct, a declared UE_STRUCT's
+       record. bUnsaid: At's value is one no header says (an engine class, a game Blueprint, a hand-written UE_CLASS
+       whose member has no initializer). At null: no class on the way has a say. */
+    struct FDefaultSource
+    {
+        const FRecord* At = nullptr;
+        const Json *Set = nullptr, *Value = nullptr, *Declared = nullptr;
+        const FRecord* Struct = nullptr;
+        bool bHolder = false, bUnsaid = false;
+    };
+    FDefaultSource DefaultSource(const FRecord* From, const std::string& Id) const;
+    const FRecord* UnsaidDefault(const FRecord* From, const std::string& Id) const;
     std::map<std::string, std::vector<std::pair<std::string, int64>>> ModEnums;  // UE_ENUM cooked here: enumerators
 
     /* Per-function state reset in Generate: whether this function needs the FDeref scratch
@@ -12079,61 +12094,87 @@ bool FCompiler::ValueFreshFrom(const FRecord* From, const std::string& Id, const
    what the shared header says, as its owner cooked it: one declared with UE_CLASS_IN, or one whose header gives the
    member a value (an initializer, a UE_DEFAULTS, a UE_STRUCT's default instance), which a game Blueprint's header never
    does. An engine class or a game Blueprint holds a value no header says: PD stays whole, and a warning names the
-   member (Named), as PatchDefaults' does over a native archetype. */
-bool FCompiler::DiffAgainstDefaultObject(const FRecord* From, const std::string& Id, const std::string& Named, FPropertyDef& PD,
-                                         FBlueprintClass& BP, std::string* Err)
+   member (Named), as PatchDefaults' does over a native archetype. So does a UE_DEFAULTS statement over such a value
+   (UnsaidDefault): its elements are removed, the unsaid ones stay, with the warning. */
+FCompiler::FDefaultSource FCompiler::DefaultSource(const FRecord* From, const std::string& Id) const
 {
-    FPropertyDef Parent = PD;
-    Parent.Default = FDefaultValue();
     for (const FRecord* C = From; C; C = C->Base.empty() ? nullptr : Find(C->Base))
     {
         /* A /Game class this mod does not cook is another mod's, or a game Blueprint, which cannot derive from a mod's:
            one that neither declares the member nor sets it holds its parent's value. */
         const bool bOtherMod = C->IsNative() && C->UePackage.compare(0, 6, "/Game/") == 0;
-        const Json *Set = nullptr, *Value = nullptr, *Its = nullptr, *Declared = nullptr;
+        FDefaultSource S;
+        S.At = C;
         if (!C->IsNative() || bOtherMod)
         {
+            const Json* Its = nullptr;
             if (C->Defaults) ForEach(*C->Defaults, [&](const Json& B) { if (Kind(B) == "CompoundStmt") Its = &B; });
             if (Its)
-                ForEach(*Its, [&](const Json& S) {
+                ForEach(*Its, [&](const Json& St) {
                     const Json *L = nullptr, *V = nullptr, *Through = nullptr;
-                    if (DefaultAssignment(S, L, V, Through) && !Through && L->value("referencedMemberDecl", std::string()) == Id)
-                    { Set = L; Value = V; }
+                    if (DefaultAssignment(St, L, V, Through) && !Through && L->value("referencedMemberDecl", std::string()) == Id)
+                    { S.Set = L; S.Value = V; }
                 });
-            for (const Json* F : C->Fields) if (F->value("id", std::string()) == Id) Declared = F;
-            if (!Set && !Declared) continue;
+            for (const Json* F : C->Fields) if (F->value("id", std::string()) == Id) S.Declared = F;
+            if (!S.Set && !S.Declared) continue;
         }
         /* A UE_STRUCT declared with no initializer, `{}` or `T()` gets no tag, and the default object holds the struct's
            default instance there: InitNonNativeProperty initialises the property (BlueprintSupport.cpp 2609), and
            UUserDefinedStruct::InitializeStruct copies the default instance in (UserDefinedStruct.cpp 254). That is each
-           member's initializer (ValueInitStruct), not the empty value LowerDefault leaves the declaration as. A value
-           that starts fresh, so an engine struct inside keeps the engine's value without a word. */
-        const FRecord* const SR = Set || !Declared ? nullptr : Find(StripTypeKeywords(TypeOf(*Declared)));
-        if (C->IsNative() && !C->bClassIn && !Set && !(Declared && First(*Declared)) && !(SR && SR->IsModStruct()))
-        {
-            /* The class as the source names it: its leaf, not a game Blueprint's Game::<path>:: or a namespace. */
-            const bool bHandWritten = bOtherMod && C->CppName.compare(0, 6, "Game::") != 0;
-            const std::string Class = LeafOf(C->CppName);
-            printf("  warning: %s: %s's default object holds a value that no header says, so none of its elements is "
-                   "removed: any it has load as well%s\n", Named.c_str(), Class.c_str(),
-                   bHandWritten ? ("; if a mod cooks " + Class + ", declare it with UE_CLASS_IN or give the member "
-                                   "an initializer").c_str() : "");
-            return true;
-        }
-        bool bOk;
-        if (Set) bOk = LowerDefault(*Set, Parent, BP, Err, Value, /*bKeepZero=*/true);
-        else if (SR && SR->IsModStruct() && StartsFresh(Strip(First(*Declared))))
-        {
-            const bool bWasFresh = bFreshValue;
-            bFreshValue = true;
-            bOk = ValueInitStruct(*SR, /*bZeros=*/false, Name(*Declared), Parent, BP, Err);
-            bFreshValue = bWasFresh;
-        }
-        else bOk = LowerDefault(*Declared, Parent, BP, Err);
-        if (!bOk) return false;
-        DiffTaggedAgainstParent(PD, Parent);
-        return true;
+           member's initializer (ValueInitStruct), not the empty value LowerDefault leaves the declaration as. */
+        S.Struct = S.Set || !S.Declared ? nullptr : Find(StripTypeKeywords(TypeOf(*S.Declared)));
+        S.bUnsaid = C->IsNative() && !C->bClassIn && !S.Set && !(S.Declared && First(*S.Declared))
+                    && !(S.Struct && S.Struct->IsModStruct());
+        return S;
     }
+    return FDefaultSource();
+}
+
+/* The class whose default object holds the member declared as Id at a value no header says, as the walk from From up
+   meets it; null where the source says the whole value. A UE_DEFAULTS statement says it only where it could be diffed
+   in turn, against a value said above it, as its own compile (its owner's, for another mod's class) diffed it: over
+   one that is not, that compile wrote it whole and warned, and the default object holds the unsaid elements too. */
+const FRecord* FCompiler::UnsaidDefault(const FRecord* From, const std::string& Id) const
+{
+    const FDefaultSource S = DefaultSource(From, Id);
+    if (S.bUnsaid) return S.At;
+    if (S.Set && !S.bHolder) return UnsaidDefault(S.At->Base.empty() ? nullptr : Find(S.At->Base), Id);
+    return nullptr;
+}
+
+bool FCompiler::DiffAgainstDefaultObject(const FRecord* From, const std::string& Id, const std::string& Named, FPropertyDef& PD,
+                                         FBlueprintClass& BP, std::string* Err)
+{
+    const FDefaultSource S = DefaultSource(From, Id);
+    if (!S.At) return true;
+    /* The class as the source names it: its leaf, not a game Blueprint's Game::<path>:: or a namespace. */
+    auto Warn = [&](const FRecord& C) {
+        const bool bHandWritten = C.UePackage.compare(0, 6, "/Game/") == 0 && C.CppName.compare(0, 6, "Game::") != 0;
+        const std::string Class = LeafOf(C.CppName);
+        printf("  warning: %s: %s's default object holds a value that no header says, so none of its elements is "
+               "removed: any it has load as well%s\n", Named.c_str(), Class.c_str(),
+               bHandWritten ? ("; if a mod cooks " + Class + ", declare it with UE_CLASS_IN or give the member "
+                               "an initializer").c_str() : "");
+    };
+    if (S.bUnsaid) { Warn(*S.At); return true; }
+    /* A statement over a value no header says: its own elements are known, and those PD lacks are still removed. */
+    if (S.Set && !S.bHolder)
+        if (const FRecord* U = UnsaidDefault(S.At->Base.empty() ? nullptr : Find(S.At->Base), Id)) Warn(*U);
+    FPropertyDef Parent = PD;
+    Parent.Default = FDefaultValue();
+    bool bOk;
+    if (S.Set) bOk = LowerDefault(*S.Set, Parent, BP, Err, S.Value, /*bKeepZero=*/true);
+    else if (S.Struct && S.Struct->IsModStruct() && StartsFresh(Strip(First(*S.Declared))))
+    {
+        /* A value that starts fresh, so an engine struct inside keeps the engine's value without a word. */
+        const bool bWasFresh = bFreshValue;
+        bFreshValue = true;
+        bOk = ValueInitStruct(*S.Struct, /*bZeros=*/false, Name(*S.Declared), Parent, BP, Err);
+        bFreshValue = bWasFresh;
+    }
+    else bOk = LowerDefault(*S.Declared, Parent, BP, Err);
+    if (!bOk) return false;
+    DiffTaggedAgainstParent(PD, Parent);
     return true;
 }
 
