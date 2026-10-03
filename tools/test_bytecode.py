@@ -8631,14 +8631,6 @@ def uds_default(base, member, kind):
     return empty if t is None else container_over(pkg, t, kind, empty, member)
 
 
-def fstring_at(raw, o):
-    """The FString at raw[o:] and the offset past it: a length counting the terminator, negative for UTF-16."""
-    import struct
-    n = struct.unpack_from('<i', raw, o)[0]
-    if n >= 0: return raw[o + 4:o + 4 + max(n - 1, 0)].decode('latin-1'), o + 4 + n
-    return raw[o + 4:o + 4 - 2 * n - 2].decode('utf-16-le'), o + 4 - 2 * n
-
-
 def container_over(pkg, t, kind, start, name):
     """A TSet<int32> / TMap<FName, int32> tag t of pkg loaded over start, as loaded_container reads it. 'strset' and
     'strmap' are a TSet<FString> and a TMap<FString, int32>, whose keys the engine compares ignoring case (FString's ==
@@ -9658,6 +9650,64 @@ asset_map_str_case()
 print('ok  AssetMapStrCase: an FString key given twice in two spellings is one element, the last one given, in a '
       'class\'s own value, an asset\'s delta over its CDO and a UE_DEFAULTS\' over its parent\'s; one spelled anew is '
       'another element')
+
+
+def delegate_value_at(pkg, raw, o):
+    """An FScriptDelegate at raw[o:] as its operator<< writes it (ScriptDelegates.h 138-142): the object, a package
+    index, then the function's name. ((object, name), the offset past it)."""
+    import struct
+    return (struct.unpack_from('<i', raw, o)[0], fname_at(pkg.names, raw, o + 4)), o + 12
+
+
+def str_delegate_map(pkg, t):
+    """A TMap<FString, TDelegate<...>> tag t of pkg as written: the keys it lists as removed, then its (key, delegate)
+    pairs; every byte read."""
+    import struct
+    raw = t['value']
+    n, o = struct.unpack_from('<i', raw, 0)[0], 4
+    removed = []
+    for _ in range(n):
+        k, o = fstring_at(raw, o)
+        removed.append(k)
+    n, o = struct.unpack_from('<i', raw, o)[0], o + 4
+    added = []
+    for _ in range(n):
+        k, o = fstring_at(raw, o)
+        v, o = delegate_value_at(pkg, raw, o)
+        added.append((k, v))
+    assert o == len(raw), (t['name'], raw.hex())
+    return removed, added
+
+
+def asset_delegate_value():
+    """A TDelegate value is an FScriptDelegate, 12 bytes (the object, the function's name), and a default can only be
+    unbound: null and None. AS_AdvOver's D `{}` and the unbound values of its TMap<FString, TDelegate> M, of UAdvDef's
+    CDO's M, and AS_AdvIface's OnIt, a mod interface's variable given in the interface's braces, each read so, every
+    byte of their tags. M loads over the CDO's {"A"} as a delta: "A" listed removed, as the braces' "a" is another
+    spelling the engine's FindOrAdd would keep, so {"a", "B"}. The packages break no invariant: the asset's delegate
+    property took the signature function of the class built last, an export of its package, and the asset's preload
+    table listed that index as one of its own exports (edl_preload_arcs, table_bounds). AssetGen wrote no bytes for a
+    delegate, so the loader read past each such value."""
+    here = os.path.dirname(pending_asset('AssetDelegateValue', 'UAdvDef'))
+    unbound = (0, 'none')
+    pkgs = {n: invariants.Package(os.path.join(here, n)) for n in ('UAdvDef', 'AS_AdvOver', 'AS_AdvIface', 'UAdvIfaceData')}
+    for n in pkgs: keeps_invariants(os.path.join(here, n))
+    cls, over, iface = pkgs['UAdvDef'], pkgs['AS_AdvOver'], pkgs['AS_AdvIface']
+    cdo = cls.find('Default__UAdvDef_C')
+    assert str_delegate_map(cls, cls.tag(cdo, 'M')) == ([], [('A', unbound)]), cls.tag(cdo, 'M')
+    row = over.find('AS_AdvOver')
+    for pkg, i, name in ((over, row, 'D'), (iface, iface.find('AS_AdvIface'), 'OnIt')):
+        t = pkg.tag(i, name)
+        assert t and t['type'] == 'DelegateProperty' and len(t['value']) == 12, (name, t)
+        assert delegate_value_at(pkg, t['value'], 0)[0] == unbound, (name, t['value'].hex())
+    removed, added = str_delegate_map(over, over.tag(row, 'M'))
+    loaded = {'A': unbound}
+    for k in removed: loaded = {h: v for h, v in loaded.items() if h.lower() != k.lower()}
+    for k, v in added: loaded[next((h for h in loaded if h.lower() == k.lower()), k)] = v
+    assert loaded == {'a': unbound, 'B': unbound}, (removed, added, loaded)
+
+
+pending('AssetDelegateValue', asset_delegate_value)
 
 
 def uds_init_defaults():
