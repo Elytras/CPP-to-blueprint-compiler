@@ -998,9 +998,10 @@ Notes:
 | `UE_ENUM_MAP(FString, EMood, MoodsByName);` | The enum can be on either side, with FName or FString on the other. | Yes |
 | `UE_ENUM_MAP(EEndPlayReason, FName, Reasons);` | Any enum the source can see works, the game's included. | Yes |
 | `TMap<EMood, FName> MoodNames = UE_ENUM_MAP(EMood);` | The default alone, for a member you declare yourself: the same table. | Yes |
-| `UE_ENUM_MAP(int32, FName, M);`, `UE_ENUM_MAP(EMood, EMood, M);` | Refused by clang, "no member named 'Type' in '__EnumMapSide__<...>'": exactly one of the two types is the enum. | Refused |
-| `UE_ENUM_MAP(EMood, int32, M);`, `TMap<int32, FName> M = UE_ENUM_MAP(EMood);` | Refused by clang, "no viable conversion": the other type is FName or FString, and the map is over that enum. | Refused |
-| `UE_ENUM_MAP(FName, EMood);` | Refused by clang: "UE_ENUM_MAP takes (Enum), or (Key, Value, Name) to declare the member". | Refused |
+| `UE_ENUM_MAP(int32, FName, M);`, `UE_ENUM_MAP(EMood, EMood, M);`, `UE_ENUM_MAP(EMood, int32, M);` | Refused by clang, naming both types: "static assertion failed due to requirement '__EnumMapPair__<int, FName>': UE_ENUM_MAP(Key, Value, Name): one of Key and Value is an enum and the other FName or FString". | Refused |
+| `UE_ENUM_MAP(TEnum<EMood>, FName, M);` | Refused the same way: write the enum itself, `UE_ENUM_MAP(EMood, FName, M);`. | Refused |
+| `TMap<int32, FName> M = UE_ENUM_MAP(EMood);` | Refused by clang, "no viable conversion from '__EnumMapInit__<EMood>' to 'TMap<int32, FName>'": the one-argument form is the default of a TMap between that enum and FName or FString. | Refused |
+| `UE_ENUM_MAP(FName, EMood);`, `UE_ENUM_MAP(FName, EMood, A, B);` | Refused by clang: "UE_ENUM_MAP takes (Enum), or (Key, Value, Name) to declare the member". Written as an initializer, `= UE_ENUM_MAP(FName, EMood)`, clang says only "expected expression". | Refused |
 | `UE_ENUM_MAP(EMood)` in a function body | Not yet: refused with `unimplemented intrinsic __EnumMap__`. Keep the table as a member and read the member. | Not yet |
 
 ```cpp
@@ -5322,7 +5323,7 @@ listed here is refused with "unimplemented intrinsic".
 | Dispatcher methods, `OnHit.Add(this, &C::F)`, `Remove`, `Clear()`, `Broadcast(...)` | Bind Event, Unbind Event, Unbind all Events and Call. A dispatcher has no other methods. | [Event dispatchers](#event-dispatchers) |
 | Double literal beside a float, `X * 0.5` | Refused: in C++ it is double math, and Blueprint 4.27 has no double. Write `0.5f`. | [Literals and conversions](#literals-and-conversions) |
 | `__EmbedFile__("Path")` | A file's bytes, read at build time, as the default of a `TArray<uint8>` member. | [Classes and variables](#classes-and-variables) |
-| `__EnumMap__`, `__EnumMapInit__`, `__EnumMapSide__` | What UE_ENUM_MAP expands to. Write UE_ENUM_MAP. | [Enums](#enums) |
+| `__EnumMap__`, `__EnumMapInit__`, `__EnumMapSide__`, `__EnumMapCheck__`, `__EnumMapPair__`, `__EnumMapText__`, `__EnumMapNone__` | What UE_ENUM_MAP expands to. Write UE_ENUM_MAP. | [Enums](#enums) |
 | Event override, `void ReceiveBeginPlay()` | Overrides that event, as adding its node in the editor does. Copy the SDK's parameter list: nothing checks it. | [Overrides and parent calls](#overrides-and-parent-calls) |
 | `ExecuteUbergraph_<Class>` | The name of the event graph that holds the methods that wait. A method named so is refused. | [Latent calls](#latent-calls) |
 | `FDeref` | The scratch struct that every read and write through a pointer goes through. AssetGen creates it when the mod declares none. | [Pointers and memory](#pointers-and-memory) |
@@ -5622,6 +5623,19 @@ and where the feature is described. In each group, the messages you are most lik
 - `<Class>::<Function>: TODO: unimplemented intrinsic __EnumMap__`: Not yet. UE_ENUM_MAP in a function body is
   refused. It works only as a member default. Fix: keep the table in a member,
   `UE_ENUM_MAP(EMood, FName, Names);`, and read the member. See [Enums](#enums).
+- `static assertion failed due to requirement '__EnumMapPair__<<Key>, <Value>>': UE_ENUM_MAP(Key, Value, Name): one of
+  Key and Value is an enum and the other FName or FString; for a TEnum<E>, write E` (clang, pointing into UeMeta.h,
+  with a note at your line): the three-argument form over two types that are not an enum and FName or FString, such
+  as `UE_ENUM_MAP(int32, FName, M);` or `UE_ENUM_MAP(TEnum<EMood>, FName, M);`. Fix: name the enum itself on one side
+  and FName or FString on the other. See [Enums](#enums).
+- `static assertion failed: UE_ENUM_MAP takes (Enum), or (Key, Value, Name) to declare the member` (clang): UE_ENUM_MAP
+  with two arguments, or none, or more than three, as a member, `UE_ENUM_MAP(FName, EMood);`. As an initializer,
+  `= UE_ENUM_MAP(FName, EMood)`, clang's own "expected expression" comes instead. Fix: `UE_ENUM_MAP(FName, EMood,
+  Moods);` declares the member; `TMap<FName, EMood> Moods = UE_ENUM_MAP(EMood);` gives one you declare its default.
+  See [Enums](#enums).
+- `no viable conversion from '__EnumMapInit__<<Enum>>' to 'TMap<...>'` (clang): the one-argument form as the default
+  of a map that is not between that enum and FName or FString. Fix: declare the map over the enum, or use the
+  three-argument form. See [Enums](#enums).
 - `<Name> is static: name it without the object in front, which would never be evaluated`: an inline class constant
   read through an object that a call computes, `Me()->kHold`. The constant is its initializer, so the call in front
   would never run. `this->kHold` and a variable in front are accepted. Fix: `kHold` or `<Class>::kHold`. See

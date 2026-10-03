@@ -5028,6 +5028,32 @@ def refused_naming(mod, body, pattern, top=''):
         assert proc.returncode != 0 and re.search(pattern, proc.stdout + proc.stderr), (mod, proc.stdout, proc.stderr)
 
 
+def enum_map_misuse():
+    """UE_ENUM_MAP written wrong is refused by clang with UeMeta.h's own words, naming what was written: a three-argument
+    form whose two types are not an enum and FName or FString (none, two enums, an enum and an int32, a TEnum<E> in
+    place of E) names both types; a count of arguments other than one or three, as a member, names the two forms; the
+    one-argument form over a map of another type is clang's "no viable conversion", naming that map."""
+    pair = (r"requirement '__EnumMapPair__<%s>'.*UE_ENUM_MAP\(Key, Value, Name\): one of Key and Value is an enum and "
+            r"the other FName or FString")
+    forms = r'UE_ENUM_MAP takes \(Enum\), or \(Key, Value, Name\) to declare the member'
+    for mod, body, pattern in (('EmNoEnum', 'UE_ENUM_MAP(int32, FName, M);', pair % 'int, FName'),
+                               ('EmTwoEnums', 'UE_ENUM_MAP(EKind, EKind, M);', pair % 'EKind, EKind'),
+                               ('EmIntValue', 'UE_ENUM_MAP(EKind, int32, M);', pair % 'EKind, int'),
+                               ('EmTEnum', 'UE_ENUM_MAP(TEnum<EKind>, FName, M);',
+                                pair % 'TEnum<EKind>, FName' + '; for a TEnum<E>, write E'),
+                               ('EmTwo', 'UE_ENUM_MAP(FName, EKind);', forms),
+                               ('EmFour', 'UE_ENUM_MAP(FName, EKind, A, B);', forms),
+                               ('EmNone', 'UE_ENUM_MAP();', forms),
+                               ('EmOldOther', 'TMap<int32, FName> M = UE_ENUM_MAP(EKind);',
+                                r"no viable conversion from '__EnumMapInit__<EKind>' to 'TMap<int32, FName>'")):
+        refused_naming(mod, '  %s\n' % body, pattern, top='enum class EKind : uint8 { A, B };\nUE_ENUM(EKind);\n')
+
+
+enum_map_misuse()
+print('ok  UE_ENUM_MAP misuse: two types that are not an enum and FName or FString, a TEnum<E>, and a wrong count of '
+      'arguments are refused naming what was written')
+
+
 def abstract_instances():
     """A class left abstract is never instanced: the loader constructs every non-CDO export, and StaticAllocateObject
     check()s !CLASS_Abstract (UObjectGlobals.cpp 2362). An asset of an abstract mod class - one this mod would cook,
