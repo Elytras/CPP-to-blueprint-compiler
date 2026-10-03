@@ -612,6 +612,7 @@ struct FRecord
     bool bFinalAsLeaf = false;  // UE_FINAL_AS's leaf: its base's one subclass
     std::string FinalAs;        // UE_FINAL_AS(this, Leaf): Leaf's CppName - compiled as final, cooked Abstract
     bool bIsLocal = false;      // UePackage == ModPackage/CppName: cooked here, published at its /Game path
+    bool bClassIn = false;      // UE_CLASS_IN: a mod's own class, cooked by the mod it names from this header
     bool bIsStruct = false;     // UE_STRUCT: cooked as a UserDefinedStruct asset
     bool bIsInterface = false;  // UE_INTERFACE: cooked as a BPGC whose super is UInterface
     bool bIsPatch = false;      // UE_PATCH: not a class of its own; its UE_DEFAULTS edit its parent's, in the parent's package
@@ -1838,8 +1839,8 @@ private:
     const FRecord* ParentInitOf = nullptr;
     bool ParentValueFresh(const FRecord& R, const Json& Lhs, const Json*& Braces, const FRecord*& BracesOf) const;
     bool ValueFreshFrom(const FRecord* From, const std::string& Id, const Json*& Braces, const FRecord*& BracesOf) const;
-    bool DiffAgainstDefaultObject(const FRecord* From, const std::string& Id, FPropertyDef& PD, FBlueprintClass& BP,
-                                  std::string* Err);
+    bool DiffAgainstDefaultObject(const FRecord* From, const std::string& Id, const std::string& Named, FPropertyDef& PD,
+                                  FBlueprintClass& BP, std::string* Err);
     std::map<std::string, std::vector<std::pair<std::string, int64>>> ModEnums;  // UE_ENUM cooked here: enumerators
 
     /* Per-function state reset in Generate: whether this function needs the FDeref scratch
@@ -2476,6 +2477,7 @@ bool FCompiler::Collect(std::string* Err)
                     while (!Owner.empty() && Owner.back() == '/') Owner.pop_back();
                     R.UePackage = PathIn(Owner, R.CppName);
                     R.UeName = LeafOf(R.CppName) + "_C";
+                    R.bClassIn = true;
                 }
             }
             else if (Kind(C) == "VarDecl" && Name(C) == "UeInterfaceMeta")
@@ -12033,32 +12035,49 @@ bool FCompiler::ValueFreshFrom(const FRecord* From, const std::string& Id, const
 /* PD, a value that holds a TSet or TMap (HoldsTaggedSetOrMap) and loads over the default object of From, made the delta
    the loader reads there (DiffTaggedAgainstParent): a UE_DEFAULTS statement's over its parent's CDO, a mod asset's
    braces over its class's (the asset's archetype). The default object's value of the member declared as Id is the
-   nearest UE_DEFAULTS from From up that sets it, else its initializer where it is declared. A native class on the way
-   holds one no header says, and there PD stays whole. */
-bool FCompiler::DiffAgainstDefaultObject(const FRecord* From, const std::string& Id, FPropertyDef& PD, FBlueprintClass& BP,
-                                         std::string* Err)
+   nearest UE_DEFAULTS from From up that sets it, else its initializer where it is declared. Another mod's class holds
+   what the shared header says, as its owner cooked it: one declared with UE_CLASS_IN, or one whose header gives the
+   member a value (an initializer, a UE_DEFAULTS, a UE_STRUCT's default instance), which a game Blueprint's header never
+   does. An engine class or a game Blueprint holds a value no header says: PD stays whole, and a warning names the
+   member (Named), as PatchDefaults' does over a native archetype. */
+bool FCompiler::DiffAgainstDefaultObject(const FRecord* From, const std::string& Id, const std::string& Named, FPropertyDef& PD,
+                                         FBlueprintClass& BP, std::string* Err)
 {
     FPropertyDef Parent = PD;
     Parent.Default = FDefaultValue();
-    for (const FRecord* C = From; C && !C->IsNative(); C = C->Base.empty() ? nullptr : Find(C->Base))
+    for (const FRecord* C = From; C; C = C->Base.empty() ? nullptr : Find(C->Base))
     {
-        const Json *Set = nullptr, *Value = nullptr, *Its = nullptr;
-        if (C->Defaults) ForEach(*C->Defaults, [&](const Json& B) { if (Kind(B) == "CompoundStmt") Its = &B; });
-        if (Its)
-            ForEach(*Its, [&](const Json& S) {
-                const Json *L = nullptr, *V = nullptr, *Through = nullptr;
-                if (DefaultAssignment(S, L, V, Through) && !Through && L->value("referencedMemberDecl", std::string()) == Id)
-                { Set = L; Value = V; }
-            });
-        const Json* Declared = nullptr;
-        for (const Json* F : C->Fields) if (F->value("id", std::string()) == Id) Declared = F;
-        if (!Set && !Declared) continue;
+        /* A /Game class this mod does not cook is another mod's, or a game Blueprint, which cannot derive from a mod's:
+           one that neither declares the member nor sets it holds its parent's value. */
+        const bool bOtherMod = C->IsNative() && C->UePackage.compare(0, 6, "/Game/") == 0;
+        const Json *Set = nullptr, *Value = nullptr, *Its = nullptr, *Declared = nullptr;
+        if (!C->IsNative() || bOtherMod)
+        {
+            if (C->Defaults) ForEach(*C->Defaults, [&](const Json& B) { if (Kind(B) == "CompoundStmt") Its = &B; });
+            if (Its)
+                ForEach(*Its, [&](const Json& S) {
+                    const Json *L = nullptr, *V = nullptr, *Through = nullptr;
+                    if (DefaultAssignment(S, L, V, Through) && !Through && L->value("referencedMemberDecl", std::string()) == Id)
+                    { Set = L; Value = V; }
+                });
+            for (const Json* F : C->Fields) if (F->value("id", std::string()) == Id) Declared = F;
+            if (!Set && !Declared) continue;
+        }
         /* A UE_STRUCT declared with no initializer, `{}` or `T()` gets no tag, and the default object holds the struct's
            default instance there: InitNonNativeProperty initialises the property (BlueprintSupport.cpp 2609), and
            UUserDefinedStruct::InitializeStruct copies the default instance in (UserDefinedStruct.cpp 254). That is each
            member's initializer (ValueInitStruct), not the empty value LowerDefault leaves the declaration as. A value
            that starts fresh, so an engine struct inside keeps the engine's value without a word. */
-        const FRecord* const SR = Set ? nullptr : Find(StripTypeKeywords(TypeOf(*Declared)));
+        const FRecord* const SR = Set || !Declared ? nullptr : Find(StripTypeKeywords(TypeOf(*Declared)));
+        if (C->IsNative() && !C->bClassIn && !Set && !(Declared && First(*Declared)) && !(SR && SR->IsModStruct()))
+        {
+            const bool bHandWritten = bOtherMod && C->CppName.compare(0, 6, "Game::") != 0;
+            printf("  warning: %s: %s's default object holds a value that no header says, so none of its elements is "
+                   "removed: any it has load as well%s\n", Named.c_str(), C->CppName.c_str(),
+                   bHandWritten ? ("; if a mod cooks " + C->CppName + ", declare it with UE_CLASS_IN or give the member "
+                                   "an initializer").c_str() : "");
+            return true;
+        }
         bool bOk;
         if (Set) bOk = LowerDefault(*Set, Parent, BP, Err, Value, /*bKeepZero=*/true);
         else if (SR && SR->IsModStruct() && StartsFresh(Strip(First(*Declared))))
@@ -13034,7 +13053,8 @@ bool FCompiler::BracedMembers(const Json& List, const FRecord& Rec, const std::s
         if (!LowerDefault(*F, PD, BP, Err, Init, bKeepZero || Archetype)) return false;
         /* A set or map tag loads as a delta over the default object's value (the loader copies it in, removes, then adds:
            PropertySet.cpp 285-358, PropertyMap.cpp 316-400), so written whole it would load as the union of both. */
-        if (Archetype && HoldsTaggedSetOrMap(PD) && !DiffAgainstDefaultObject(Archetype, F->value("id", std::string()), PD, BP, Err))
+        if (Archetype && HoldsTaggedSetOrMap(PD)
+            && !DiffAgainstDefaultObject(Archetype, F->value("id", std::string()), Where + "." + Name(*F), PD, BP, Err))
             return false;
         Out.push_back(PD);
     }
@@ -14723,7 +14743,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                    struct written as tags (DiffTaggedAgainstParent). DiffAgainstDefaultObject finds the parent's value. */
                 if (!bThroughComponent && HoldsTaggedSetOrMap(PD)
                     && !DiffAgainstDefaultObject(R.Base.empty() ? nullptr : Find(R.Base), Lhs->value("referencedMemberDecl", std::string()),
-                                                 PD, BP, Err))
+                                                 Where + ": " + Name(*Lhs), PD, BP, Err))
                 { bOk = false; return; }
                 /* A statement is the member's whole new value, as an assignment is in C++: one before it on the same
                    member is gone, not a tag under this one's (whose left-out members would load its values). */

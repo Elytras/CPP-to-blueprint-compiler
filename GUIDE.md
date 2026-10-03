@@ -813,8 +813,10 @@ A data asset class is a mod class that derives from `UPrimaryDataAsset` or `UDat
 that C++ accepts braces for it. A namespace-scope variable of that class with a braced initializer is cooked as an
 asset at `<mod package>/<Name>`, as creating a Data Asset in the Content Browser and filling in its details would. Only
 the members the braces name are written; the rest keep the class defaults. A `TSet` or `TMap` member's braces are its
-whole value, not elements added to the class default's. The class can also be a game class, such as
-`UEnemyDescriptor`. `&Name` points at the asset: in a variable's default, in a container default, or in a function
+whole value, not elements added to the class default's, wherever a header says that default: a class of yours or of
+another mod's shared header. The class can also be a game class, such as `UEnemyDescriptor`; a game or engine class's
+default is the game's, which no header says, so a set or map's braces add to whatever elements it has, and a warning
+names the member. `&Name` points at the asset: in a variable's default, in a container default, or in a function
 body.
 
 A game asset is named with `UE_ASSET_AT(Class, Name, "/Game/Path/Package")`, after which `&Name` points at it as well.

@@ -9148,7 +9148,7 @@ def asset_other_class():
     under UAosDef, starts its UE_DEFAULTS M = {{"c", 4}} from the header's value, and AS_AouLocal from both. A game
     class's CDO holds what no header says: AS_AouNative and UAouEnemy's UE_DEFAULTS leave its elements to load, and a
     warning names the member."""
-    user = os.path.dirname(pending_asset('AssetOtherUser', 'AS_AouOver'))
+    user = os.path.dirname(asset('AssetOtherUser'))
     owner = os.path.join(os.path.dirname(os.path.dirname(asset('AssetOtherOwner'))), 'AssetOtherOwner')
 
     def cdo(base, cls, path, kind, start):
@@ -9176,7 +9176,9 @@ def asset_other_class():
             LOGS['AssetOtherUser']
 
 
-pending('AssetOtherUser', asset_other_class)
+asset_other_class()
+print('ok  AssetOtherUser: an asset of another mod\'s class, and a UE_DEFAULTS under one, lists the CDO\'s elements the '
+      'shared header gives and the braces drop as removed; over a game class\'s CDO a warning names the member')
 
 
 def uds_init_defaults():

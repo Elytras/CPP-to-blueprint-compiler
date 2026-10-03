@@ -7,7 +7,7 @@
 
 #include "UeApi/FSD.h"
 
-#include "../AssetOtherShared.h"
+#include "AssetOtherShared.h"
 
 UE_MOD_PACKAGE("/Game/_ElytrasMods/AssetOtherUser");
 
