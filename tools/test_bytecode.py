@@ -7381,6 +7381,91 @@ def delegate_parm_spell():
     assert peer.vars['Held'] == ping, peer.vars
 
 
+def delegate_sig_parms(base, path):
+    """The properties of the signature function at path, which the package at base exports: [(name, property type, its
+    Parm / OutParm / ReturnParm / ReferenceParm flags, what it holds: an array's element type, a struct's or an enum's
+    path)]."""
+    import invariants
+    pkg = invariants.Package(base)
+    fn = path.rsplit(':', 1)[1]
+    at = [i for i in range(len(pkg.exports)) if pkg.exports[i]['name'] == fn and pkg.class_of(i + 1) == 'Function']
+    assert len(at) == 1, (os.path.basename(base), path)
+    return [(p.name, p.type, p.flags & 0x8000580, p.subs[0].type if p.subs else pkg.path(p.ref) if p.ref else None)
+            for p in pkg.struct(at[0]).props]
+
+
+def delegate_parm_keys():
+    """Which delegate types are one (DelegateParmKeys). A UE_ENUM in a namespace spelled short, qualified and from the
+    global namespace is one type: DelegateParmKeysTop makes one signature function for it, which its variable, its
+    functions' parameters - Take declared short and defined qualified -, the overrides' parameters (DelegateParmKeys is
+    generated before Top, DelegateParmKeysZKid after), the values handed to Take and the one set through Peer all name,
+    the subclasses importing it from a Top that exports it (keeps_invariants: imports_resolve, func_override_params);
+    `Held = D` across two spellings compiles, and the comma value handed to Take is held in a local of that signature,
+    if one at all. Neither subclass makes a signature of its own. DelegateParmKeysKinds keeps what C++ keeps apart apart,
+    a signature function each, every one named by its variables: int and int64, uint8 and a uint8 enum, two enums, a
+    value and a reference, a reference and a const one, a return value and none; int32 and int, TArray<int32> and
+    TArray<int>, and an enum's three spellings are one each. Each signature's properties are the type's. Each value
+    reaches where it goes."""
+    base = pending_asset('DelegateParmKeys')
+    here = os.path.dirname(base)
+    top, kinds = (os.path.join(here, 'DelegateParmKeysNs', c) for c in ('DelegateParmKeysTop', 'DelegateParmKeysKinds'))
+    zkid = os.path.join(here, 'DelegateParmKeysZKid')
+    for b in (base, top, zkid, kinds):
+        keeps_invariants(b)
+    mine, theirs, zs, ks = delegate_sigs(base), delegate_sigs(top), delegate_sigs(zkid), delegate_sigs(kinds)
+    held = theirs[('DelegateParmKeysTop_C', 'Held')]
+    assert {theirs[('Use', 'D')], theirs[('Take', 'T')]} == {held}, theirs
+    assert [e for e in exports_of(top) if e.endswith('__DelegateSignature')] == [held.rsplit(':', 1)[1]], exports_of(top)
+    want = {('Use', 'D'): held, ('CallTake', None): {held}, ('SetPeer', None): {held}}
+    assert {k: mine.get(k) for k in want} == want, (mine, want)
+    assert mine.get(('CommaTake', None), {held}) == {held}, mine
+    want = {('Use', 'D'): held, ('CallTake', None): {held}}
+    assert {k: zs.get(k) for k in want} == want, (zs, want)
+    for b in (base, zkid):
+        assert not [e for e in exports_of(b) if e.endswith('__DelegateSignature')], (os.path.basename(b), exports_of(b))
+    v = {n: ks[('DelegateParmKeysKinds_C', n)] for n in ('I32', 'I', 'I64', 'U8', 'En', 'Mode', 'ModeQ', 'ModeG', 'VecVal',
+                                                         'VecCRef', 'VecRef', 'RetI', 'RetV', 'ArrA', 'ArrB')}
+    assert v['I32'] == v['I'] and v['ArrA'] == v['ArrB'] and v['Mode'] == v['ModeQ'] == v['ModeG'], v
+    apart = [v[n] for n in ('I32', 'I64', 'U8', 'En', 'Mode', 'VecVal', 'VecCRef', 'VecRef', 'RetI', 'RetV', 'ArrA')]
+    assert len(set(apart)) == len(apart), v
+    assert sorted(e for e in exports_of(kinds) if e.endswith('__DelegateSignature')) == sorted(p.rsplit(':', 1)[1] for p in apart), \
+        exports_of(kinds)
+    parm, ref, ret = 0x80, 0x8000180, 0x580
+    sigs = {n: delegate_sig_parms(kinds, v[n]) for n in v}
+    assert sigs['I32'] == [('Param0', 'IntProperty', parm, None)], sigs['I32']
+    assert sigs['I64'] == [('Param0', 'Int64Property', parm, None)], sigs['I64']
+    assert sigs['U8'] == [('Param0', 'ByteProperty', parm, None)], sigs['U8']
+    for n, e in (('En', '.EDpkKey'), ('Mode', '.EDpkMode')):
+        assert [s[:3] for s in sigs[n]] == [('Param0', 'ByteProperty', parm)] and sigs[n][0][3].endswith(e), sigs[n]
+    assert sigs['VecVal'] == [('Param0', 'StructProperty', parm, '/Script/CoreUObject.Vector')], sigs['VecVal']
+    for n in ('VecRef', 'VecCRef'):
+        assert sigs[n] == [('Param0', 'StructProperty', ref, '/Script/CoreUObject.Vector')], sigs[n]
+    assert sigs['RetI'] == [('ReturnValue', 'IntProperty', ret, None)], sigs['RetI']
+    assert sigs['RetV'] == [], sigs['RetV']
+    assert sigs['ArrA'] == [('Param0', 'ArrayProperty', parm, 'IntProperty')], sigs['ArrA']
+    h, peer = Obj('DelegateParmKeysHelper_C', Got=0), Obj('DelegateParmKeysTop_C')
+    pick = ('delegate', 'Pick', h)
+    vm = VM(top, {})
+    vm.call('Take', pick)
+    assert vm.self.vars['Held'] == pick, vm.self.vars
+    vm = VM(base, {})
+    vm.self.vars.update(H=h, Peer=peer)
+    vm.call('Use', pick)
+    assert vm.self.vars['Held'] == pick, vm.self.vars
+    vm.call('CallTake')
+    vm.call('SetPeer')
+    assert peer.vars['Held'] == pick, peer.vars
+    vm.call('CommaTake')
+    assert vm.self.vars['Bumps'] == 1, vm.self.vars
+    assert [(n, c, a) for n, c, a in vm.log if n == 'Take'] == [('Take', peer, [pick])] * 2, vm.log
+    vm = VM(zkid, {})
+    vm.self.vars.update(H=h, Peer=peer)
+    vm.call('Use', pick)
+    vm.call('CallTake')
+    assert vm.self.vars['Held'] == pick, vm.self.vars
+    assert [(n, c, a) for n, c, a in vm.log if n == 'Take'] == [('Take', peer, [pick])], vm.log
+
+
 def dispatch_native_callable():
     """A native dispatcher the engine marks BlueprintCallable (AFSDGameState::OnTerrainGenerated, one of FSD's 41) is
     one the editor's Call node takes. UeApi does not say which signature function it names (the dump does not link a
@@ -7446,6 +7531,8 @@ print('ok  DelegateParmSig: an override\'s TDelegate parameter, and a value hand
 delegate_parm_spell()
 print('ok  DelegateParmSpell: a delegate type spelled with int32 and with int is one signature function, and a value set '
       'through another object names its variable\'s')
+pending('DelegateParmKeys: an enum spelled short, qualified or from the global namespace is one delegate type, and the '
+        'types C++ keeps apart get a signature function each', delegate_parm_keys)
 dispatch_native_callable()
 native_dispatcher_refusals()
 print('ok  native dispatchers: Broadcast on a BlueprintCallable one names a signature of the class\'s own with its '
