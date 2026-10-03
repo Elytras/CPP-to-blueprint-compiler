@@ -1303,6 +1303,19 @@ private:
        is asked for, named after the variable Holder that asked. */
     bool DelegateSignature(const std::string& Type, const std::string& Holder, FBlueprintClass& BP, FIndex* Sig,
                            std::string* Err);
+    /* Whether N names a function class For's own signature functions must stay clear of, up and down its chain. */
+    bool SignatureNameTaken(const FRecord& For, const std::string& N) const;
+    /* The name of the signature function class In gives `TDelegate<...>` Type: the one it made, or the one a class
+       generated before it reserved for it, else a new one named after Holder, kept for In from here on. */
+    std::string SignatureName(const FRecord& In, const std::string& Type, const std::string& Holder);
+    /* The signature function the parameter Index of Owner's Method names, when that is another mod class's generated
+       here - an override's parameters are its parent's - imported into BP; false when it is the class's being built,
+       or a class's this compile does not generate. */
+    bool ImportedParamSignature(const FRecord& Owner, const std::string& Method, size_t Index, const std::string& Type,
+                                FBlueprintClass& BP, FIndex* Sig);
+    /* The same for a TDelegate variable a class declares: its signature function there, when another mod class's. */
+    bool ImportedFieldSignature(const FRecord& Owner, const std::string& Type, const std::string& Field, FBlueprintClass& BP,
+                                FIndex* Sig);
     void FlagInstancing(const std::string& QualType, FPropertyDef& PD) const;
     bool LayoutOf(const std::string& QualType, int32* Size, int32* Align, std::string* Err);
     bool NeedsResultLocal(const std::string& Type, int32 Depth = 0);
@@ -1705,9 +1718,26 @@ private:
     std::map<std::string, std::pair<std::string, FIndex>> DelegateSigs;    // Generate: a TDelegate type -> its signature
                                                                             // function's name and export
     const FBlueprintClass* DelegateSigsIn = nullptr;  // the class Generate is building, while it builds it
-    /* A class -> the signature functions DelegateSignature made in it: a parent or child generated after it names its
-       own around them (DelegateSignature's Taken). */
+    /* A class -> the signature functions DelegateSignature made in it, or a class generated before it reserved for it
+       (SignatureName): a parent or child generated after it names its own around them (SignatureNameTaken). */
     std::map<std::string, std::set<std::string>> MadeSignatures;
+    /* A class -> TDelegate type -> the name of its signature function there, made or reserved (SignatureName). */
+    std::map<std::string, std::map<std::string, std::string>> SignatureNames;
+    /* A delegate value LowerArgRaw is about to lower, and what gives the signature function its local is typed with -
+       the parameter's or the variable's it goes to, Null for one of this class's own: set by LowerCall and an assignment
+       around one LowerArg, for that node only, and asked only for a value bound on another object, which has a local. */
+    const Json* SigValueNode = nullptr;
+    std::function<FIndex()> SigValueOf;
+    struct FSigValueScope       // SigValueNode / SigValueOf for one LowerArg, as they were after it
+    {
+        FCompiler& C;
+        const Json* OldNode;
+        std::function<FIndex()> OldOf;
+        FSigValueScope(FCompiler& In, const Json* Node, std::function<FIndex()> Of)
+            : C(In), OldNode(In.SigValueNode), OldOf(std::move(In.SigValueOf))
+        { C.SigValueNode = Node; C.SigValueOf = std::move(Of); }
+        ~FSigValueScope() { C.SigValueNode = OldNode; C.SigValueOf = std::move(OldOf); }
+    };
     const FConv* FindConv(const std::string& From, const std::string& To) const;
     const FOpInfo* FindOp(const std::string& Op, const std::string& Lhs, const std::string& Rhs) const;
     void ApplyConv(const FConv& C, FBlueprintClass& BP, FArgIR& Arg);
@@ -4739,7 +4769,9 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         if (!Obj || !Fn) { *Err = "a delegate value is {this, &Class::Function}"; return false; }
         const Json* FnRef = Strip(Fn);
         if (FnRef && Kind(*FnRef) == "UnaryOperator") FnRef = Strip(First(*FnRef));
-        return LowerDelegateValue(*Obj, *Fn, StripTypeKeywords(TypeOf(*N)), Null(),
+        const Json* On = Strip(Obj);
+        const FIndex Sig = SigValueNode == N && SigValueOf && !(On && Kind(*On) == "CXXThisExpr") ? SigValueOf() : Null();
+        return LowerDelegateValue(*Obj, *Fn, StripTypeKeywords(TypeOf(*N)), Sig,
                                   FnRef && FnRef->contains("referencedDecl") ? Name((*FnRef)["referencedDecl"]) : std::string("Bound"),
                                   BP, Out, Err);
     }
@@ -6291,6 +6323,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         && MethodName.compare(MethodName.size() - 2, 2, "__") == 0;
     /* `IncRef(0, B += 1)` in a loop condition, or on another object: the reference is B itself, not LowerArg's copy. */
     if (const int32 Bound = bIntrinsic ? 0 : LowerBoundArgs(CallExprNode, BP, Out, Err)) return Bound > 0;
+    const FRecord* ParmsOwner = nullptr;    // the class whose function's parameters the arguments fill, a delegate's below
     if (bIntrinsic)
     {
         Out.Intrinsic = MethodName;
@@ -6517,6 +6550,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
 
         const std::string CalleePackage = PackageOf(*Called), CalleeName = ClassOf(*Called);
         Out.Fn = BP.EngineFunction(CalleePackage, CalleeName, UeNameOf(Called, MethodName));
+        if (!Out.bReceiverIsArg) ParmsOwner = R;
         Out.bScript = CalleePackage.compare(0, 6, "/Game/") == 0;
         Out.bInstance = !bStatic;
         /* Each makes its proxy with NewObject, flags it RF_StrongRefOnFrame and roots it nowhere else
@@ -6561,7 +6595,17 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         if (!bOk) return;
         FArgIR A;
         const size_t I = Defaulted.size();
-        bOk = LowerArg(*DefaultedArg(C, I < CalledParms.size() ? CalledParms[I] : nullptr), BP, A, Err);
+        const Json* Arg = DefaultedArg(C, I < CalledParms.size() ? CalledParms[I] : nullptr);
+        /* A delegate value is typed with its parameter's signature function: another mod class's, imported, as a Create
+           Event wired to that pin is (ImportedParamSignature); else one of this class's, as before. */
+        std::string ParmType = I < CalledParms.size() ? TypeOf(*CalledParms[I]) : std::string();
+        while (!ParmType.empty() && (ParmType.back() == '&' || ParmType.back() == ' ')) ParmType.pop_back();
+        const bool bDelegate = ParmsOwner && StripTypeKeywords(ParmType).compare(0, 10, "TDelegate<") == 0;
+        FSigValueScope SigScope(*this, bDelegate ? Strip(Arg) : nullptr, [this, &BP, Owner = ParmsOwner, Method = MethodName, I, ParmType] {
+            FIndex Sig;
+            return ImportedParamSignature(*Owner, Method, I, ParmType, BP, &Sig) ? Sig : Null();
+        });
+        bOk = LowerArg(*Arg, BP, A, Err);
         if (bOk) Out.Args.push_back(A);
         Defaulted.push_back(Kind(C) == "CXXDefaultArgExpr");
     });
@@ -8298,6 +8342,16 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             else if (LK == "MemberExpr")
             {
                 St.K = FStmtIR::Assign;
+                /* A delegate value is typed with the variable's signature function: another mod class's, imported, as a
+                   Create Event wired to its Set node is (ImportedFieldSignature); else one of this class's, as before. */
+                const auto Of = FieldOwner.find(Lhs->value("referencedMemberDecl", std::string()));
+                const FRecord* Declarer = Of == FieldOwner.end() ? nullptr : Find(Of->second);
+                const std::string FieldType = TypeOf(*Lhs);
+                const bool bDelegate = Declarer && StripTypeKeywords(FieldType).compare(0, 10, "TDelegate<") == 0;
+                FSigValueScope SigScope(*this, bDelegate ? Strip(Rhs) : nullptr, [this, &BP, Declarer, FieldType, Field = Name(*Lhs)] {
+                    FIndex Sig;
+                    return ImportedFieldSignature(*Declarer, FieldType, Field, BP, &Sig) ? Sig : Null();
+                });
                 bOk = LowerField(*Lhs, BP, St.Var, Err) && LowerArg(*Rhs, BP, St.Value, Err);
                 if (bOk) { SetOn = RecordOfFieldAccess(*Lhs); SetField = St.Var.S; SetObject = St.Var.Base; WarnReadOnlyWrite(*Lhs); }
             }
@@ -12628,41 +12682,87 @@ bool FCompiler::DelegateSignature(const std::string& Type, const std::string& Ho
         PD.PropertyFlags &= ~uint64(CPF_BlueprintVisible | CPF_BlueprintReadOnly);
         Params.push_back(PD);
     }
-    /* Named after the variable asking, numbered past a dispatcher's signature or another type's of that name - this
-       class's, or any class's up or down the chain: one of a child's that a parent has too is no override of it (no
-       super link), and FindFunctionByName on the child finds the child's (invariants.py func_super_link). A class's
-       names are its functions and UE_DISPATCHER signatures (Methods), a game Blueprint's dispatchers' (its
-       TMulticastInlineDelegate fields), and those this made in a mod class generated before it (MadeSignatures):
-       Compile goes by name, so of a parent and a child the first keeps the plain name and the other numbers past it. */
-    auto Has = [&](const FRecord& A, const std::string& N) {
+    if (!Cur) { *Err = "internal: " + Type + " of " + Holder + " outside a class"; return false; }
+    const std::string Made = SignatureName(*Cur, Type, Holder);
+    const bool bOut = std::any_of(Params.begin(), Params.end(), [](const FPropertyDef& P) { return (P.PropertyFlags & CPF_OutParm) != 0; });
+    *Sig = BP.AddFunction(Made, Null(), Params, [](FScript& S, FIndex) { S.Return(); S.EndOfScript(); },
+                          FUNC_Public | FUNC_Delegate | (bOut ? uint32(FUNC_HasOutParms) : 0u));
+    DelegateSigs[Type] = { Made, *Sig };
+    return true;
+}
+
+/* A signature function is named after the variable asking, numbered past a dispatcher's signature or another type's of
+   that name - this class's, or any class's up or down the chain: one of a child's that a parent has too is no override
+   of it (no super link), and FindFunctionByName on the child finds the child's (invariants.py func_super_link). A
+   class's names are its functions and UE_DISPATCHER signatures (Methods), a game Blueprint's dispatchers' (its
+   TMulticastInlineDelegate fields), and those made in or reserved for a mod class (MadeSignatures): Compile goes by
+   name, so of a parent and a child the first generated keeps the plain name and the other numbers past it. */
+bool FCompiler::SignatureNameTaken(const FRecord& For, const std::string& N) const
+{
+    auto Has = [&](const FRecord& A) {
         if (A.Methods.count(N)) return true;
         if (const auto M = MadeSignatures.find(A.CppName); M != MadeSignatures.end() && M->second.count(N)) return true;
         return std::any_of(A.Fields.begin(), A.Fields.end(), [&](const Json* F) {
             return Name(*F) + "__DelegateSignature" == N
                 && StripTypeKeywords(TypeOf(*F)).compare(0, 25, "TMulticastInlineDelegate<") == 0; });
     };
-    auto Taken = [&](const std::string& N) {
-        if (std::any_of(CurSignatures.begin(), CurSignatures.end(), [&](const auto& D) { return D.first + "__DelegateSignature" == N; })
-            || std::any_of(DelegateSigs.begin(), DelegateSigs.end(), [&](const auto& D) { return D.second.first == N; }))
-            return true;
-        if (!Cur) return false;
-        for (const FRecord* A = Cur->Base.empty() ? nullptr : Find(Cur->Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
-            if (Has(*A, N)) return true;
-        for (const auto& [CppName, D] : Records)
-        {
-            if (&D == Cur || !D.IsGenerated() || D.bIsStruct || D.bIsInterface) continue;
-            for (const FRecord* A = D.Base.empty() ? nullptr : Find(D.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
-                if (A == Cur) { if (Has(D, N)) return true; break; }
-        }
-        return false;
-    };
+    if (&For == Cur && (std::any_of(CurSignatures.begin(), CurSignatures.end(), [&](const auto& D) { return D.first + "__DelegateSignature" == N; })
+                        || std::any_of(DelegateSigs.begin(), DelegateSigs.end(), [&](const auto& D) { return D.second.first == N; })))
+        return true;
+    if (Has(For)) return true;
+    for (const FRecord* A = For.Base.empty() ? nullptr : Find(For.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
+        if (Has(*A)) return true;
+    for (const auto& [CppName, D] : Records)
+    {
+        if (&D == &For || !D.IsGenerated() || D.bIsStruct || D.bIsInterface) continue;
+        for (const FRecord* A = D.Base.empty() ? nullptr : Find(D.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
+            if (A == &For) { if (Has(D)) return true; break; }
+    }
+    return false;
+}
+
+std::string FCompiler::SignatureName(const FRecord& In, const std::string& Type, const std::string& Holder)
+{
+    auto& Names = SignatureNames[In.CppName];
+    if (const auto It = Names.find(Type); It != Names.end()) return It->second;
     std::string Made = Holder + "__DelegateSignature";
-    for (int32 N = 2; Taken(Made); ++N) Made = Holder + "_" + std::to_string(N) + "__DelegateSignature";
-    const bool bOut = std::any_of(Params.begin(), Params.end(), [](const FPropertyDef& P) { return (P.PropertyFlags & CPF_OutParm) != 0; });
-    *Sig = BP.AddFunction(Made, Null(), Params, [](FScript& S, FIndex) { S.Return(); S.EndOfScript(); },
-                          FUNC_Public | FUNC_Delegate | (bOut ? uint32(FUNC_HasOutParms) : 0u));
-    DelegateSigs[Type] = { Made, *Sig };
-    if (Cur) MadeSignatures[Cur->CppName].insert(Made);
+    for (int32 N = 2; SignatureNameTaken(In, Made); ++N) Made = Holder + "_" + std::to_string(N) + "__DelegateSignature";
+    MadeSignatures[In.CppName].insert(Made);
+    return Names[Type] = Made;
+}
+
+/* The editor's override copies its parent function's parameters: the entry node's pins are made from the parent's
+   properties (K2Node_FunctionEntry::AllocateDefaultPins -> CreatePinsForFunctionEntryExit, K2Node.cpp 308-345), a
+   delegate pin carrying the property's SignatureFunction (ConvertPropertyToPinType, EdGraphSchema_K2.cpp 3411-3415),
+   and the override's FDelegateProperty gets that pin's (CreatePropertyOnScope, KismetCompilerMisc.cpp 1189-1197). So
+   down a chain of overrides every one names the signature of the class that declares the function first, and a Create
+   Event node wired to such a pin types its delegate with it too (K2Node_CreateDelegate.cpp 317-331,
+   DelegateNodeHandlers.cpp 258-262). A static hiding a static has that one for its super as well (FindEvent), and is
+   held to its parameters the same (invariants.py func_override_params). Up mod classes only: a native's or another
+   mod's parameter names a signature UeApi does not, and the class keeps its own there. A class generated before the
+   declaring one reserves the name the declaring class then makes (SignatureName). */
+bool FCompiler::ImportedParamSignature(const FRecord& Owner, const std::string& Method, size_t Index, const std::string& Type,
+                                       FBlueprintClass& BP, FIndex* Sig)
+{
+    const FRecord* D = &Owner;
+    for (const FRecord* A = Owner.Base.empty() ? nullptr : Find(Owner.Base); A && !A->IsNative() && !A->bIsInterface;
+         A = A->Base.empty() ? nullptr : Find(A->Base))
+        if (!IsInlineMethod(*A, Method) && CompilesMethod(*A, Method)) D = A;
+    if (D == Cur || D->IsNative() || !D->IsGenerated() || D->bIsStruct || D->bIsInterface || !D->Methods.count(Method)) return false;
+    const auto Def = D->MethodDefs.find(Method);
+    const std::vector<std::string> Names = ParmNames(Def != D->MethodDefs.end() ? *Def->second : *D->Methods.at(Method));
+    const std::string Holder = Index < Names.size() && !Names[Index].empty() ? Names[Index] : "P" + std::to_string(Index);
+    *Sig = BP.EngineFunction(PackageOf(*D), ClassOf(*D), SignatureName(*D, StripTypeKeywords(Type), Holder));
+    return true;
+}
+
+/* A variable's Set node takes the variable's own property type, so the Create Event wired to it is typed with the
+   variable's signature function, the declaring class's. */
+bool FCompiler::ImportedFieldSignature(const FRecord& Owner, const std::string& Type, const std::string& Field, FBlueprintClass& BP,
+                                       FIndex* Sig)
+{
+    if (&Owner == Cur || Owner.IsNative() || !Owner.IsGenerated() || Owner.bIsStruct || Owner.bIsInterface) return false;
+    *Sig = BP.EngineFunction(PackageOf(Owner), ClassOf(Owner), SignatureName(Owner, StripTypeKeywords(Type), Field));
     return true;
 }
 
@@ -12805,8 +12905,13 @@ bool FCompiler::LowerParams(const Json& M, const std::string& Fn, FBlueprintClas
             Type.pop_back();
         }
         FPropertyDef PD;
-        bOk = TypeToProperty(Type, PName, bOutParm ? uint64(CPF_OutParm | CPF_ReferenceParm) : 0,
-                             "parameter " + PName + " on " + Fn, BP, &PD, Err);
+        const uint64 Flags = bOutParm ? uint64(CPF_OutParm | CPF_ReferenceParm) : 0;
+        /* An override's delegate parameter is its parent's: that one's signature function (ImportedParamSignature). */
+        if (FIndex Sig; Cur && StripTypeKeywords(Type).compare(0, 10, "TDelegate<") == 0
+                        && ImportedParamSignature(*Cur, Fn, Index - 1, Type, BP, &Sig))
+            PD = DelegateParam(PName, Sig, Flags);
+        else
+            bOk = TypeToProperty(Type, PName, Flags, "parameter " + PName + " on " + Fn, BP, &PD, Err);
         if (!bOk) return;
         Params.push_back(PD);
         if (bOutParm) CurrentOutParms.insert(PName);

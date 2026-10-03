@@ -7285,19 +7285,20 @@ def delegate_parm_sig():
     """DelegateParmSig and DelegateParmZKid override DelegateParmTop's Use(TDelegate D) and Out(TDelegate &O): each
     override's parameter names the parent parameter's own signature function, imported, as the editor's override copies
     the parent's parameters (CreatePinsForFunctionEntryExit -> ConvertPropertyToPinType -> CreatePropertyOnScope), so
-    keeps_invariants' func_override_params holds; DelegateParmSig is generated before its parent, DelegateParmZKid after.
+    keeps_invariants' func_override_params holds; so does DelegateParmSig's static Arm, which hides its parent's.
+    DelegateParmSig is generated before its parent, DelegateParmZKid after.
     A value bound on another object and handed to a parameter is typed with that parameter's signature, as a Create
     Event node wired to the pin is: the parent's Take, the override Use (the parent's), the sibling DelegateParmSib's
     Sib; assigned to the parent's variable Var, Var's. One of its own function Mine's is its own. Each call still
-    hands the helper's Ping to where it goes: Take gets it, the override and the sibling set their timers with it, Var
-    holds it."""
-    base = pending_asset('DelegateParmSig')
+    hands the helper's Ping to where it goes: Take and Sib get it, the override sets its timer with it, Var holds it."""
+    base = asset('DelegateParmSig')
     here = os.path.dirname(base)
     top, zkid, sib = (os.path.join(here, c) for c in ('DelegateParmTop', 'DelegateParmZKid', 'DelegateParmSib'))
     for b in (base, top, zkid, sib):
         keeps_invariants(b)
     mine, theirs, sibs, zs = delegate_sigs(base), delegate_sigs(top), delegate_sigs(sib), delegate_sigs(zkid)
-    want = {('Use', 'D'): theirs[('Use', 'D')], ('Out', 'O'): theirs[('Out', 'O')], ('Mine', 'M'): mine[('Mine', 'M')],
+    want = {('Use', 'D'): theirs[('Use', 'D')], ('Out', 'O'): theirs[('Out', 'O')], ('Arm', 'A'): theirs[('Arm', 'A')],
+            ('Mine', 'M'): mine[('Mine', 'M')],
             ('CallTake', None): {theirs[('Take', 'T')]}, ('CallUse', None): {theirs[('Use', 'D')]},
             ('CallSib', None): {sibs[('Sib', 'S')]}, ('SetVar', None): {theirs[('DelegateParmTop_C', 'Var')]},
             ('CallMine', None): {mine[('Mine', 'M')]}}
@@ -7307,15 +7308,14 @@ def delegate_parm_sig():
     for b, path in ((base, theirs[('Use', 'D')]), (base, sibs[('Sib', 'S')]), (zkid, theirs[('Use', 'D')])):
         assert path in import_paths(b) and path.rsplit(':', 1)[1] not in exports_of(b), (os.path.basename(b), path)
     vm = VM(base, {})
-    vm.classes['DelegateParmSib_C'] = sib
     h, s = Obj('DelegateParmHelper_C', Got=0), Obj('DelegateParmSib_C')
     vm.self.vars.update(H=h, S=s)
     ping = ('delegate', 'Ping', h)
     for fn in ('CallTake', 'CallUse', 'CallSib', 'SetVar'):
         vm.call(fn)
-    calls = [(n, c, a) for n, c, a in vm.log if n in ('Take', 'K2_SetTimerDelegate')]
+    calls = [(n, c, a) for n, c, a in vm.log if n in ('Take', 'Sib', 'K2_SetTimerDelegate')]
     assert calls == [('Take', vm.self, [ping]), ('K2_SetTimerDelegate', vm.self, [ping, 2.0, False, 0.0, 0.0]),
-                     ('K2_SetTimerDelegate', s, [ping, 3.0, False, 0.0, 0.0])], calls
+                     ('Sib', s, [ping])], calls
     assert vm.self.vars['Var'] == ping, vm.self.vars
 
 
@@ -7378,8 +7378,9 @@ delegate_callable_rpc()
 print('ok  DelegateCallableRpc: an RPC the engine marks BlueprintCallable binds on another object and on this one')
 delegate_not_callable_refusals()
 print('ok  delegate not-callable refusals: OnRep_Instigator, which UeApi\'s NotCallable.json names, is bound on no object')
-pending('DelegateParmSig: an override\'s TDelegate parameter, and a value handed to a mod parent\'s, a sibling\'s or a '
-        'variable, name the declaring class\'s signature', delegate_parm_sig)
+delegate_parm_sig()
+print('ok  DelegateParmSig: an override\'s TDelegate parameter, and a value handed to a mod parent\'s, a sibling\'s or a '
+      'parent\'s variable, name the declaring class\'s signature, imported, and still reach where they go')
 dispatch_native_callable()
 native_dispatcher_refusals()
 print('ok  native dispatchers: Broadcast on a BlueprintCallable one names a signature of the class\'s own with its '
