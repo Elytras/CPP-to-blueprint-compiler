@@ -1882,17 +1882,17 @@ private:
     bool DiffAgainstDefaultObject(const FRecord* From, const std::string& Id, const std::string& Named, FPropertyDef& PD,
                                   FBlueprintClass& BP, std::string* Err);
     /* Where the default object of From takes its value of the member declared as Id, as the source tells it: At, the
-       nearest class from From up with a say; Set and Value, the UE_DEFAULTS statement there that sets the member, else
-       Declared, its declaration - for a mod interface's variable the interface's field, when At lists the interface
-       and so holds the variable as its own property (bHolder, InterfaceVarHolder); Struct, a declared UE_STRUCT's
-       record. bUnsaid: At's value is one no header says (an engine class, a game Blueprint, a hand-written UE_CLASS
-       whose member has no initializer). At null: no class on the way has a say. */
+       nearest class from From up with a say; Set and Value, the UE_DEFAULTS statement there that sets the member;
+       Declared, its declaration there, if At declares it - for a mod interface's variable the interface's field, when
+       At lists the interface and so holds the variable as its own property (InterfaceVarHolder); Struct, a declared
+       UE_STRUCT's record. bUnsaid: At's value is one no header says (an engine class, a game Blueprint, a hand-written
+       UE_CLASS whose member has no initializer). At null: no class on the way has a say. */
     struct FDefaultSource
     {
         const FRecord* At = nullptr;
         const Json *Set = nullptr, *Value = nullptr, *Declared = nullptr;
         const FRecord* Struct = nullptr;
-        bool bHolder = false, bUnsaid = false;
+        bool bUnsaid = false;
     };
     FDefaultSource DefaultSource(const FRecord* From, const std::string& Id) const;
     const FRecord* UnsaidDefault(const FRecord* From, const std::string& Id) const;
@@ -12134,7 +12134,7 @@ FCompiler::FDefaultSource FCompiler::DefaultSource(const FRecord* From, const st
                     for (const FRecord* Link : InterfaceChain(Find(I)))
                         if (Link->bIsInterface)
                             for (const Json* F : Link->Fields)
-                                if (F->value("id", std::string()) == Id) { S.Declared = F; S.bHolder = true; }
+                                if (F->value("id", std::string()) == Id) S.Declared = F;
             if (!S.Set && !S.Declared) continue;
         }
         /* A UE_STRUCT declared with no initializer, `{}` or `T()` gets no tag, and the default object holds the struct's
@@ -12157,7 +12157,7 @@ const FRecord* FCompiler::UnsaidDefault(const FRecord* From, const std::string& 
 {
     const FDefaultSource S = DefaultSource(From, Id);
     if (S.bUnsaid) return S.At;
-    if (S.Set && !S.bHolder) return UnsaidDefault(S.At->Base.empty() ? nullptr : Find(S.At->Base), Id);
+    if (S.Set && !S.Declared) return UnsaidDefault(S.At->Base.empty() ? nullptr : Find(S.At->Base), Id);
     return nullptr;
 }
 
@@ -12176,8 +12176,9 @@ bool FCompiler::DiffAgainstDefaultObject(const FRecord* From, const std::string&
                                "an initializer").c_str() : "");
     };
     if (S.bUnsaid) { Warn(*S.At); return true; }
-    /* A statement over a value no header says: its own elements are known, and those PD lacks are still removed. */
-    if (S.Set && !S.bHolder)
+    /* A statement over a value no header says: its own elements are known, and those PD lacks are still removed. One
+       on a member its class declares (its own property, a mod interface's variable it holds) is the whole value. */
+    if (S.Set && !S.Declared)
         if (const FRecord* U = UnsaidDefault(S.At->Base.empty() ? nullptr : Find(S.At->Base), Id)) Warn(*U);
     FPropertyDef Parent = PD;
     Parent.Default = FDefaultValue();
