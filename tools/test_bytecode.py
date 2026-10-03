@@ -9279,6 +9279,44 @@ print('ok  AssetOtherUser: an asset of another mod\'s class, and a UE_DEFAULTS u
       'shared header gives and the braces drop as removed; over a game class\'s CDO a warning names the member')
 
 
+def name_map_delta(pkg, t):
+    """A TMap<FName, FName> tag t of pkg as written: the keys it lists as removed, then the pairs it adds."""
+    import struct
+    raw, o = t['value'], 0
+    removed = []
+    for _ in range(struct.unpack_from('<i', raw, o)[0]):
+        removed.append(fname_at(pkg.names, raw, o + 4)); o += 8
+    o += 4
+    added = []
+    for _ in range(struct.unpack_from('<i', raw, o - 4)[0]):
+        added.append((fname_at(pkg.names, raw, o), fname_at(pkg.names, raw, o + 8))); o += 16
+    assert o == len(raw), raw.hex()
+    return removed, added
+
+
+def asset_chain_unsaid():
+    """A UE_DEFAULTS that sets a set or map an engine or game class declares is written whole by its owner, over that
+    class's value, which no header says, with a warning (AssetOtherUser's UAouEnemy): the CDO holds that value's
+    elements as well. So an asset of such a class of another mod's (AS_AcuNodes, over AssetChainShared.h's UAcsNodes),
+    an asset of a class of this mod below it (AS_AcuLocal) and a UE_DEFAULTS below it (UAcuKid) load over a value no
+    header says either: each warns, naming the member and the engine class. The pairs the header does say are still
+    listed as removed: o, of UAcsNodes's {o: x}."""
+    pending_asset('AssetChainOwner', 'UAcsNodes')
+    user = os.path.dirname(pending_asset('AssetChainUser', 'UAcuLocal'))
+    for where in ('AS_AcuNodes.SourceToTarget', 'AS_AcuLocal.SourceToTarget', 'UAcuKid::UE_DEFAULTS: SourceToTarget'):
+        line = 'warning: %s: UNodeMappingContainer\'s default object holds a value that no header says' % where
+        assert line in LOGS['AssetChainUser'], 'no "%s" in:\n%s' % (line, LOGS['AssetChainUser'])
+    for name in ('AS_AcuNodes', 'AS_AcuLocal'):
+        base = os.path.join(user, name)
+        keeps_invariants(base)
+        pkg = invariants.Package(base)
+        delta = name_map_delta(pkg, pkg.tag(pkg.find(name), 'SourceToTarget'))
+        assert delta == (['o'], [('u', 'y')]), '%s writes SourceToTarget as %s' % (name, delta)
+
+
+pending('AssetChainUnsaid', asset_chain_unsaid)
+
+
 def asset_map_dup_keys():
     """A key a map's braces give twice holds the last value given, as TMap's initializer-list constructor Adds each pair
     in order (Map.h 1166-1173). AS_AmdOver's {{"a", 1}, {"a", 2}} over UAmdDef's {a: 2, c: 3} loads {a: 2}, AS_AmdLast's
