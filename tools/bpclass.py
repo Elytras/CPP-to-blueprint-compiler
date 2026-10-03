@@ -18,6 +18,7 @@ import yaml
 from bpbuild import GENERATED, MOD_PACKAGE, write_vs_filters
 
 BP = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "BpMods"))
+THEME_FILE = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"), "bpclass.theme")
 CLASS = re.compile(r'^[ \t]*class\s+(\w+)(?:\s+final)?\s*:\s*(?:public\s+)?(\w+)', re.M)
 API_CLASS = re.compile(r'^class\s+(\w+)\b[^;\n]*$', re.M)
 INCLUDE = re.compile(r'(#include\s+")([^"]+)(")')
@@ -313,8 +314,21 @@ def tui():
             yield Footer()
 
         def on_mount(self):
+            # The theme picked in the command palette (ctrl+p), kept across runs; Textual itself forgets it.
+            try:
+                saved = open(THEME_FILE, encoding="utf-8").read().strip()
+                if saved in self.available_themes:
+                    self.theme = saved
+            except OSError:
+                pass
             self.api = api_classes()
             self.rescan()
+
+        def watch_theme(self, theme):
+            try:
+                open(THEME_FILE, "w", encoding="utf-8").write(theme)
+            except OSError:
+                pass
 
         def rescan(self):
             self.found = scan()
