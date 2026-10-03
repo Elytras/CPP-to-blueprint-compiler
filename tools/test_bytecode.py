@@ -7398,14 +7398,15 @@ def delegate_parm_keys():
     """Which delegate types are one (DelegateParmKeys). A UE_ENUM in a namespace spelled short, qualified and from the
     global namespace is one type: DelegateParmKeysTop makes one signature function for it, which its variable, its
     functions' parameters - Take declared short and defined qualified -, the overrides' parameters (DelegateParmKeys is
-    generated before Top, DelegateParmKeysZKid after), the values handed to Take and the one set through Peer all name,
-    the subclasses importing it from a Top that exports it (keeps_invariants: imports_resolve, func_override_params);
+    generated before Top, DelegateParmKeysZKid after), the values handed to Take, the one set through Peer and those
+    stored into an element of Top's TArray and TMap, on this object and on Peer, all name, the subclasses importing it
+    from a Top that exports it (keeps_invariants: imports_resolve, func_override_params);
     `Held = D` across two spellings compiles, and the comma value handed to Take is held in a local of that signature,
     if one at all. Neither subclass makes a signature of its own. DelegateParmKeysKinds keeps what C++ keeps apart apart,
     a signature function each, every one named by its variables: int and int64, uint8 and a uint8 enum, two enums, a
     value and a reference, a reference and a const one, a return value and none; int32 and int, TArray<int32> and
-    TArray<int>, and an enum's three spellings are one each. Each signature's properties are the type's. Each value
-    reaches where it goes."""
+    TArray<int>, and an enum spelled short and qualified are one each. Each signature's properties are the type's. Each
+    value reaches where it goes."""
     base = pending_asset('DelegateParmKeys')
     here = os.path.dirname(base)
     top, kinds = (os.path.join(here, 'DelegateParmKeysNs', c) for c in ('DelegateParmKeysTop', 'DelegateParmKeysKinds'))
@@ -7416,16 +7417,17 @@ def delegate_parm_keys():
     held = theirs[('DelegateParmKeysTop_C', 'Held')]
     assert {theirs[('Use', 'D')], theirs[('Take', 'T')]} == {held}, theirs
     assert [e for e in exports_of(top) if e.endswith('__DelegateSignature')] == [held.rsplit(':', 1)[1]], exports_of(top)
-    want = {('Use', 'D'): held, ('CallTake', None): {held}, ('SetPeer', None): {held}}
+    want = {('Use', 'D'): held, ('CallTake', None): {held}, ('SetPeer', None): {held}, ('SetPicks', None): {held},
+            ('SetByKey', None): {held}}
     assert {k: mine.get(k) for k in want} == want, (mine, want)
     assert mine.get(('CommaTake', None), {held}) == {held}, mine
     want = {('Use', 'D'): held, ('CallTake', None): {held}}
     assert {k: zs.get(k) for k in want} == want, (zs, want)
     for b in (base, zkid):
         assert not [e for e in exports_of(b) if e.endswith('__DelegateSignature')], (os.path.basename(b), exports_of(b))
-    v = {n: ks[('DelegateParmKeysKinds_C', n)] for n in ('I32', 'I', 'I64', 'U8', 'En', 'Mode', 'ModeQ', 'ModeG', 'VecVal',
-                                                         'VecCRef', 'VecRef', 'RetI', 'RetV', 'ArrA', 'ArrB')}
-    assert v['I32'] == v['I'] and v['ArrA'] == v['ArrB'] and v['Mode'] == v['ModeQ'] == v['ModeG'], v
+    v = {n: ks[('DelegateParmKeysKinds_C', n)] for n in ('I32', 'I', 'I64', 'U8', 'En', 'Mode', 'ModeQ', 'VecVal', 'VecCRef',
+                                                         'VecRef', 'RetI', 'RetV', 'ArrA', 'ArrB')}
+    assert v['I32'] == v['I'] and v['ArrA'] == v['ArrB'] and v['Mode'] == v['ModeQ'], v
     apart = [v[n] for n in ('I32', 'I64', 'U8', 'En', 'Mode', 'VecVal', 'VecCRef', 'VecRef', 'RetI', 'RetV', 'ArrA')]
     assert len(set(apart)) == len(apart), v
     assert sorted(e for e in exports_of(kinds) if e.endswith('__DelegateSignature')) == sorted(p.rsplit(':', 1)[1] for p in apart), \
@@ -7458,6 +7460,12 @@ def delegate_parm_keys():
     vm.call('CommaTake')
     assert vm.self.vars['Bumps'] == 1, vm.self.vars
     assert [(n, c, a) for n, c, a in vm.log if n == 'Take'] == [('Take', peer, [pick])] * 2, vm.log
+    vm.self.vars.update(Picks=[None], ByKey={})
+    peer.vars.update(Picks=[None], ByKey={})
+    vm.call('SetPicks')
+    vm.call('SetByKey')
+    assert vm.self.vars['Picks'] == [pick] and vm.self.vars['ByKey'] == {2: pick}, vm.self.vars
+    assert peer.vars['Picks'] == [pick] and peer.vars['ByKey'] == {1: pick}, peer.vars
     vm = VM(zkid, {})
     vm.self.vars.update(H=h, Peer=peer)
     vm.call('Use', pick)
