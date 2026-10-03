@@ -5,7 +5,9 @@
    whichever class is generated first (DelegateParmSpell sorts before its parent, DelegateParmSpellZKid after). A value
    bound on another object and assigned to a variable through another object (`Peer->Held = {H, ...}`) is typed with
    the variable's signature, as a Create Event wired to a Set node with its Target wired is (K2Node_CreateDelegate.cpp
-   317-331); C++ binds it before `GetPeer()->Held` is located, so on the H that GetPeer replaces. */
+   317-331); C++ binds it before `GetPeer()->Held` is located, so on the H that GetPeer replaces. Held parked for
+   `GetPeer()->Held = Held` is of Held's type too. The comma value handed to Peer's Take is held in a local the compiler
+   makes up, of a signature of DelegateParmSpell's own, which is not named after that local. */
 #include "UeApi/Types.h"
 #include "UeApi/FSD.h"
 
@@ -36,12 +38,16 @@ class DelegateParmSpell : public DelegateParmSpellTop {
 public:
   DelegateParmSpellHelper *H2 = nullptr;
   DelegateParmSpellSib *S = nullptr;
+  int32 Bumps = 0;
   void Use(TDelegate<void(int)> D) override { Held = D; }
   DelegateParmSpellTop *GetPeer() { H = H2; return Peer; }
+  int32 Bump() { Bumps += 1; return Bumps; }
   void CallTake() { Take({H, &DelegateParmSpellHelper::PingI}); }
   void SetPeer() { Peer->Held = {H, &DelegateParmSpellHelper::PingI}; }
   void SetGotPeer() { GetPeer()->Held = {H, &DelegateParmSpellHelper::PingI}; }
+  void CopyGotPeer() { GetPeer()->Held = Held; }
   void SetSib() { S->SibVar = {H, &DelegateParmSpellHelper::PingI}; }
+  void CommaTake() { Peer->Take((Bump(), Held)); }
 };
 
 class DelegateParmSpellZKid : public DelegateParmSpellTop {

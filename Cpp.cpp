@@ -1303,10 +1303,13 @@ private:
        is asked for, named after the variable Holder that asked. */
     bool DelegateSignature(const std::string& Type, const std::string& Holder, FBlueprintClass& BP, FIndex* Sig,
                            std::string* Err);
+    /* A delegate type as one key however it is spelled: `TDelegate<void(int32)>` and `TDelegate<void (int)>` are one. */
+    std::string DelegateKey(const std::string& Type) const;
     /* Whether N names a function class For's own signature functions must stay clear of, up and down its chain. */
     bool SignatureNameTaken(const FRecord& For, const std::string& N) const;
     /* The name of the signature function class In gives `TDelegate<...>` Type: the one it made, or the one a class
-       generated before it reserved for it, else a new one named after Holder, kept for In from here on. */
+       generated before it reserved for it, else a new one named after Holder (Delegate for a local the compiler made
+       up), kept for In from here on. */
     std::string SignatureName(const FRecord& In, const std::string& Type, const std::string& Holder);
     /* The signature function the parameter Index of Owner's Method names, when that is another mod class's generated
        here - an override's parameters are its parent's - imported into BP; false when it is the class's being built,
@@ -1576,6 +1579,8 @@ private:
     Json StabilizeLvalue(const Json& N, Json& Pre, bool bPin = false);
     Json HoistExpr(const Json& N, Json& Pre, bool bPin = false);
     Json SynthLocal(const std::string& Type, const Json& Init, Json& Pre);
+    /* Delegate value `{Obj, &F}` with Obj parked in a local as HoistExpr does, or null when N is no delegate value. */
+    Json ParkBoundObject(const Json& N, Json& Pre);
     bool LowerUpdateValue(const Json& N, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     /* A written `T&` bound to what the call cannot reach by reference (Refs: each such argument in Call, and its
        parameter's name) gets a hidden local instead, stored back after the call. */
@@ -1715,17 +1720,19 @@ private:
         return It == OutArrayArgs.end() ? 0 : It->second;
     }
     std::map<std::string, FIndex> CurSignatures;      // Generate: dispatcher name -> its signature function export
-    std::map<std::string, std::pair<std::string, FIndex>> DelegateSigs;    // Generate: a TDelegate type -> its signature
-                                                                            // function's name and export
+    std::map<std::string, std::pair<std::string, FIndex>> DelegateSigs;    // Generate: a TDelegate type's DelegateKey ->
+                                                                            // its signature function's name and export
     const FBlueprintClass* DelegateSigsIn = nullptr;  // the class Generate is building, while it builds it
     /* A class -> the signature functions DelegateSignature made in it, or a class generated before it reserved for it
        (SignatureName): a parent or child generated after it names its own around them (SignatureNameTaken). */
     std::map<std::string, std::set<std::string>> MadeSignatures;
-    /* A class -> TDelegate type -> the name of its signature function there, made or reserved (SignatureName). */
+    /* A class -> TDelegate type's DelegateKey -> the name of its signature function there, made or reserved
+       (SignatureName). */
     std::map<std::string, std::map<std::string, std::string>> SignatureNames;
     /* A delegate value LowerArgRaw is about to lower, and what gives the signature function its local is typed with -
        the parameter's or the variable's it goes to, Null for one of this class's own: set by LowerCall and an assignment
-       around one LowerArg, for that node only, and asked only for a value bound on another object, which has a local. */
+       around one LowerArg, for that node only, and asked only for a value bound on another object, which has a local.
+       An assignment that parks a whole delegate first sets it to the VarDecl of the local it parks it in. */
     const Json* SigValueNode = nullptr;
     std::function<FIndex()> SigValueOf;
     struct FSigValueScope       // SigValueNode / SigValueOf for one LowerArg, as they were after it
@@ -3263,6 +3270,9 @@ bool FCompiler::ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgI
         if (const FConv* C = FindConv(From, To)) { ApplyConv(*C, BP, Arg); return true; }
 
     if (To == From || From.empty() || To.empty() || ToKind == SK_Object) return true;
+    /* `Held = D` of two TDelegate<void(int32)>: clang declares the operator= with TDelegate<void (int)>, the same type
+       spelled the canonical way (DelegateKey), so there is nothing to convert. */
+    if (To.find("TDelegate<") != std::string::npos && DelegateKey(To) == DelegateKey(From)) return true;
 
     std::string ToIface, FromIface;
     if (TemplateArg(To, "TScriptInterface", &ToIface))
@@ -6018,6 +6028,21 @@ Json FCompiler::HoistExpr(const Json& N, Json& Pre, bool bPin)
     return SynthLocal(StripTypeKeywords(TypeOf(N)), N, Pre);
 }
 
+/* An assignment that must evaluate its right side first, and parks it, parks only the object of a delegate value:
+   binding F's name on it reads nothing else, and the value stays one the store types with its variable's signature,
+   as a Create Event wired to the Set node is (LowerBody's assignment), not a local of a delegate type of its own. */
+Json FCompiler::ParkBoundObject(const Json& N, Json& Pre)
+{
+    const Json* V = Strip(&N);
+    const std::string K = V ? Kind(*V) : std::string();
+    if ((K != "CXXConstructExpr" && K != "CXXTemporaryObjectExpr") || !V->contains("inner") || (*V)["inner"].size() != 2
+        || StripTypeKeywords(TypeOf(*V)).compare(0, 10, "TDelegate<") != 0)
+        return Json();
+    Json Out = *V;
+    Out["inner"][0] = HoistExpr(Json(Out["inner"][0]), Pre, true);
+    return Out;
+}
+
 /* The same place as lvalue N, with whatever locates it (an index, a pointer from a call) evaluated into Pre
    once. The place itself is not copied: the store has to land in it. bPin fixes the place for a stretch of
    code that may reassign what locates it (`P = Q` in a range-for body), not just for side effects. */
@@ -8089,7 +8114,10 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 while (!VarType.empty() && (VarType.back() == '&' || VarType.back() == ' ')) VarType.pop_back();
                 VarType = StripTypeKeywords(VarType);
                 FPropertyDef PD;
-                if (!TypeToProperty(VarType, VarName, 0, "local " + VarName, BP, &PD, Err))
+                /* A delegate an assignment parks for a variable another mod class declares is of that variable's type. */
+                if (FIndex Sig; SigValueNode == &D && SigValueOf && (Sig = SigValueOf()).V)
+                    PD = DelegateParam(VarName, Sig);
+                else if (!TypeToProperty(VarType, VarName, 0, "local " + VarName, BP, &PD, Err))
                 { bOk = false; return; }
                 PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
 
@@ -8272,6 +8300,8 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 Json Pre = Json::array(), Again = *S;
                 Json& Value = Again["inner"][At + 1];
                 if (IsFixedOperand(Value)) {}
+                else if (Json Bound = ParkBoundObject(Value, Pre); !Bound.is_null())
+                    Value = std::move(Bound);
                 else if (K == "BinaryOperator" || Value.value("valueCategory", std::string()) != "lvalue")
                     Value = HoistExpr(Value, Pre, true);
                 else
@@ -8300,12 +8330,27 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             const Json* Root = Lhs;
             while (Kind(*Root) == "MemberExpr" && !Root->value("isArrow", false) && First(*Root)) Root = PeelLvalue(First(*Root));
             bLocReads = bLocReads || (Kind(*Root) == "DeclRefExpr" && RefPlace.count((*Root)["referencedDecl"].value("id", std::string())));
+            /* A TDelegate variable a member assignment sets: a delegate value, or the local a delegate is parked in, is
+               typed with that variable's signature function - another mod class's, imported, as a Create Event wired to
+               its Set node is (ImportedFieldSignature); else one of this class's, as before. */
+            const auto Of = Kind(*Lhs) == "MemberExpr" ? FieldOwner.find(Lhs->value("referencedMemberDecl", std::string())) : FieldOwner.end();
+            const FRecord* Declarer = Of != FieldOwner.end() && StripTypeKeywords(TypeOf(*Lhs)).compare(0, 10, "TDelegate<") == 0
+                                    ? Find(Of->second) : nullptr;
+            const auto FieldSig = [this, &BP, Declarer, FieldType = TypeOf(*Lhs), Field = Name(*Lhs)] {
+                FIndex Sig;
+                return ImportedFieldSignature(*Declarer, FieldType, Field, BP, &Sig) ? Sig : Null();
+            };
             Json Parked;
             if (bLocReads && !IsFixedValue(*Rhs) && (bLocActs || !IsPlainRead(*Rhs)))
             {
                 Json Pre = Json::array();
-                Parked = SynthLocal(StripTypeKeywords(TypeOf(*Rhs)), *Rhs, Pre);
+                /* A delegate value parks only its object (ParkBoundObject); any other delegate is parked whole, in a
+                   local typed as the variable (the VarDecl that declares it is SigValueNode). */
+                Parked = ParkBoundObject(*Rhs, Pre);
+                const bool bWhole = Parked.is_null();
+                if (bWhole) Parked = SynthLocal(StripTypeKeywords(TypeOf(*Rhs)), *Rhs, Pre);
                 const Json Wrap = { { "kind", "CompoundStmt" }, { "inner", std::move(Pre) } };
+                FSigValueScope ParkScope(*this, Declarer && bWhole ? &Wrap["inner"].back()["inner"][0] : nullptr, FieldSig);
                 if (!LowerBody(Wrap, BP, Out, Locals, Err)) { bOk = false; return; }
                 Rhs = &Parked;
             }
@@ -8342,16 +8387,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             else if (LK == "MemberExpr")
             {
                 St.K = FStmtIR::Assign;
-                /* A delegate value is typed with the variable's signature function: another mod class's, imported, as a
-                   Create Event wired to its Set node is (ImportedFieldSignature); else one of this class's, as before. */
-                const auto Of = FieldOwner.find(Lhs->value("referencedMemberDecl", std::string()));
-                const FRecord* Declarer = Of == FieldOwner.end() ? nullptr : Find(Of->second);
-                const std::string FieldType = TypeOf(*Lhs);
-                const bool bDelegate = Declarer && StripTypeKeywords(FieldType).compare(0, 10, "TDelegate<") == 0;
-                FSigValueScope SigScope(*this, bDelegate ? Strip(Rhs) : nullptr, [this, &BP, Declarer, FieldType, Field = Name(*Lhs)] {
-                    FIndex Sig;
-                    return ImportedFieldSignature(*Declarer, FieldType, Field, BP, &Sig) ? Sig : Null();
-                });
+                FSigValueScope SigScope(*this, Declarer ? Strip(Rhs) : nullptr, FieldSig);     // a delegate value's (above)
                 bOk = LowerField(*Lhs, BP, St.Var, Err) && LowerArg(*Rhs, BP, St.Value, Err);
                 if (bOk) { SetOn = RecordOfFieldAccess(*Lhs); SetField = St.Var.S; SetObject = St.Var.Base; WarnReadOnlyWrite(*Lhs); }
             }
@@ -12654,7 +12690,8 @@ bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& P
 bool FCompiler::DelegateSignature(const std::string& Type, const std::string& Holder, FBlueprintClass& BP, FIndex* Sig,
                                   std::string* Err)
 {
-    if (auto It = DelegateSigs.find(Type); It != DelegateSigs.end()) { *Sig = It->second.second; return true; }
+    const std::string Key = DelegateKey(Type);
+    if (auto It = DelegateSigs.find(Key); It != DelegateSigs.end()) { *Sig = It->second.second; return true; }
     if (DelegateSigsIn != &BP)
     { *Err = Holder + ": " + Type + " needs a signature function, which only a class holds, not a struct or an interface"; return false; }
     const size_t Open = Type.find('('), Close = Type.rfind(')');
@@ -12687,8 +12724,58 @@ bool FCompiler::DelegateSignature(const std::string& Type, const std::string& Ho
     const bool bOut = std::any_of(Params.begin(), Params.end(), [](const FPropertyDef& P) { return (P.PropertyFlags & CPF_OutParm) != 0; });
     *Sig = BP.AddFunction(Made, Null(), Params, [](FScript& S, FIndex) { S.Return(); S.EndOfScript(); },
                           FUNC_Public | FUNC_Delegate | (bOut ? uint32(FUNC_HasOutParms) : 0u));
-    DelegateSigs[Type] = { Made, *Sig };
+    DelegateSigs[Key] = { Made, *Sig };
     return true;
+}
+
+/* clang spells a type as the source did, and one delegate type may be spelled two ways: `TDelegate<void(int32)>` in
+   a parent and `TDelegate<void(int)>` in an override or an out-of-line definition, or in the operator= clang declares
+   for TDelegate, with the specialization's canonical arguments. So DelegateSigs, SignatureNames and an assignment go
+   by this key, where C++ sees one type: every alias written out (`int32` is `int`) and a class named by its record,
+   then `const`, `class`, `struct`, `enum`, TEnum<E> and the spaces dropped, as SignatureOf compares an override's
+   parameters with its parent's. The parameters still come from the type as spelled. */
+std::string FCompiler::DelegateKey(const std::string& Type) const
+{
+    std::function<std::string(const std::string&, int32)> Spell = [&](const std::string& T, int32 Depth) {
+        std::string Out;
+        for (size_t I = 0; I < T.size();)
+        {
+            if (!std::isalpha(uint8(T[I])) && T[I] != '_')
+            {
+                if (T[I] != ' ') Out += T[I];
+                ++I;
+                continue;
+            }
+            size_t E = I;
+            while (E < T.size() && (std::isalnum(uint8(T[E])) || T[E] == '_' || (T.compare(E, 2, "::") == 0 && E + 2 < T.size())))
+                E += T[E] == ':' ? 2 : 1;
+            const std::string Word = T.substr(I, E - I);
+            I = E;
+            if (Word == "const" || Word == "volatile" || Word == "class" || Word == "struct" || Word == "enum" || Word == "typename")
+                continue;
+            if (const auto A = Aliases.find(Word); A != Aliases.end() && A->second != Word && Depth < 8)
+            {
+                Out += Spell(A->second, Depth + 1);
+                continue;
+            }
+            const FRecord* R = Find(Word);
+            Out += R ? R->CppName : Word;
+        }
+        return Out;
+    };
+    std::string Out = Spell(Type, 0);
+    for (size_t At = 0; (At = Out.find("TEnum<", At)) != std::string::npos;)
+    {
+        if (At > 0 && (std::isalnum(uint8(Out[At - 1])) || Out[At - 1] == '_')) { At += 6; continue; }
+        int32 Depth = 0;
+        size_t Close = At + 5;
+        for (; Close < Out.size(); ++Close)
+            if (Out[Close] == '<') ++Depth;
+            else if (Out[Close] == '>' && --Depth == 0) break;
+        if (Close >= Out.size()) break;
+        Out.erase(Close, 1).erase(At, 6);
+    }
+    return Out;
 }
 
 /* A signature function is named after the variable asking, numbered past a dispatcher's signature or another type's of
@@ -12724,11 +12811,15 @@ bool FCompiler::SignatureNameTaken(const FRecord& For, const std::string& N) con
 std::string FCompiler::SignatureName(const FRecord& In, const std::string& Type, const std::string& Holder)
 {
     auto& Names = SignatureNames[In.CppName];
-    if (const auto It = Names.find(Type); It != Names.end()) return It->second;
-    std::string Made = Holder + "__DelegateSignature";
-    for (int32 N = 2; SignatureNameTaken(In, Made); ++N) Made = Holder + "_" + std::to_string(N) + "__DelegateSignature";
+    const std::string Key = DelegateKey(Type);
+    if (const auto It = Names.find(Key); It != Names.end()) return It->second;
+    /* A local the compiler makes up (`__Upd0__` parking a value, `__Comma__` probing a type) names nothing the source
+       has, so the signature takes the name of what it is. */
+    const std::string Base = Holder.compare(0, 2, "__") == 0 ? std::string("Delegate") : Holder;
+    std::string Made = Base + "__DelegateSignature";
+    for (int32 N = 2; SignatureNameTaken(In, Made); ++N) Made = Base + "_" + std::to_string(N) + "__DelegateSignature";
     MadeSignatures[In.CppName].insert(Made);
-    return Names[Type] = Made;
+    return Names[Key] = Made;
 }
 
 /* The editor's override copies its parent function's parameters: the entry node's pins are made from the parent's
