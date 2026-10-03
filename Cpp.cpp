@@ -280,6 +280,29 @@ bool AttachmentCall(const Json& S, const Json*& Callee, const Json*& Child, cons
     return Child != nullptr;
 }
 
+/* A set's or map's elements as the braces leave them in C++: each key once, where it first appears, a map's with the
+   last value given for it, as the initializer-list constructors Add each element in order and Add replaces what a key
+   already holds (Map.h 1166-1173). Key is an element's bytes, as the engine compares them. A delta checks one pair at
+   a time against the default object's, so a second pair that matches it would be dropped and the first would win. */
+void LastValuePerKey(std::vector<FDefaultValue>& Items, bool bMap, const std::function<std::vector<uint8>(const FDefaultValue&)>& Key)
+{
+    const size_t Step = bMap ? 2 : 1;
+    std::vector<FDefaultValue> Once;
+    std::vector<std::vector<uint8>> Keys;
+    for (size_t I = 0; I + Step <= Items.size(); I += Step)
+    {
+        std::vector<uint8> K = Key(Items[I]);
+        const auto Had = std::find(Keys.begin(), Keys.end(), K);
+        if (Had == Keys.end())
+        {
+            Keys.push_back(std::move(K));
+            Once.insert(Once.end(), Items.begin() + std::ptrdiff_t(I), Items.begin() + std::ptrdiff_t(I + Step));
+        }
+        else if (bMap) Once[size_t(Had - Keys.begin()) * 2 + 1] = Items[I + 1];
+    }
+    Items = std::move(Once);
+}
+
 /* An inherited set's or map's default P, made what the editor saves (PropertySet.cpp 359-429, PropertyMap.cpp
    400-472) against Parent, the parent CDO's value it loads over: the parent's elements (a map's keys) P lacks as
    removed, and of P's own only those the parent lacks (a map's pairs whose key it lacks or maps elsewhere). Elements
@@ -305,6 +328,7 @@ void DiffAgainstParent(FPropertyDef& P, const FDefaultValue& Parent)
         return nullptr;
     };
     FDefaultValue& Mine = P.Default;
+    LastValuePerKey(Mine.Items, bMap, [&](const FDefaultValue& K) { return Bytes(*P.Inner, K); });
     Mine.Removed.clear();
     for (size_t I = 0; I + Step <= Parent.Items.size(); I += Step)
         if (!Find(Mine.Items, Parent.Items[I])) Mine.Removed.push_back(Parent.Items[I]);
@@ -13837,6 +13861,7 @@ bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object,
             WriteDefaultValue(A, Element);
             return A.B;
         };
+        LastValuePerKey(D.Default.Items, bMap, [&](const FDefaultValue& K) { return Bytes(*D.Inner, K); });
         FDefaultValue Delta = D.Default;
         Delta.Items.clear();
         Delta.Removed.clear();
