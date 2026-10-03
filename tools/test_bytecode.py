@@ -2203,6 +2203,31 @@ def namespaces():
 namespaces()
 
 
+def registry_rows_name_exports():
+    """Each row of a mod's AssetRegistry.bin names an asset export of its package, of the row's class, as the game's
+    rows do: a Blueprint interface's class row is `<Package>.<I>_C  BlueprintGeneratedClass` (TempRocketInterface,
+    RadarPointInterface), as a class's is; the game's `<Package>.<I>  Blueprint` row beside it is the editor asset, which
+    a cooked package does not hold and AssetGen lists for no class. IfaceRow's, and every suite mod's registry."""
+    import invariants
+    base = pending_asset('IfaceRow')
+    regs = [os.path.join(base.split(os.sep + 'Content' + os.sep)[0], 'AssetRegistry.bin')]
+    regs += sorted(glob.glob(os.path.join(ROOT, '*', 'FSD', 'AssetRegistry.bin')))
+    bad = []
+    for reg in regs:
+        content = os.path.join(os.path.dirname(reg), 'Content')
+        for path, cls in sorted(registry_rows(reg)):
+            package, obj = path.rsplit('.', 1)
+            pkg = invariants.load(os.path.join(content, *package[len('/Game/'):].split('/')))
+            k = pkg.find(obj)
+            if k is None or not pkg.exports[k]['is_asset'] or pkg.class_of(k + 1) != cls:
+                bad.append('%s %s (the package holds %s)' % (path, cls, ', '.join(
+                    '%s %s' % (e['name'], pkg.class_of(i + 1)) for i, e in enumerate(pkg.exports) if e['is_asset'])))
+    assert not bad, '%d registry rows name no asset export of their class: %s' % (len(bad), '; '.join(bad[:3]))
+
+
+pending('IfaceRow: a mod interface\'s registry row names its class <I>_C, as the game\'s do', registry_rows_name_exports)
+
+
 # ---- OptTest
 
 check('OptTest', 'Drop', lambda A, B: i32(A * B * 2), [dict(A=a, B=b) for a, b in ((2, 3), (-4, 5), (0, 0), (2**16, 2**15), (-2**31, 1))])
