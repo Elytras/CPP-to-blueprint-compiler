@@ -8308,20 +8308,42 @@ def fname_at(names, raw, o):
     return (names[i] + ('_%d' % (n - 1) if n else '')).lower()
 
 
-def loaded_container(pkg, cdo, name, kind, start):
+def loaded_container(pkg, cdo, name, kind, start, fresh=None):
     """The value the loader leaves for tag `name` of CDO export cdo, from `start` - the parent CDO's loaded value for an
     inherited property, empty for the class's own (UnrealType.h 439-446: a defaults pointer only inside the parent's
     layout): the listed removals taken out, then each element added (a set, PropertySet.cpp 285-358) or each pair set
     (a map, PropertyMap.cpp 316-400). `name` may be a tuple, a property and then members of structs written as tags: a
     struct loads each member over the parent's struct's (Class.cpp 2775), so the same reading holds there. No tag (or
-    no member's tag): start unchanged. TSet<int32> and TMap<FName, int32> only."""
-    import struct
+    no member's tag): what the object held before its tags loaded. That is start for an inherited property, copied from
+    the archetype; for the class's own, `fresh` when given: InitNonNativeProperty initialised it (BlueprintSupport.cpp
+    2609), so a member of a UE_STRUCT holds the struct's default instance's value (uds_default). TSet<int32> and
+    TMap<FName, int32> only."""
     path = (name,) if isinstance(name, str) else name
     t = pkg.tag(cdo, path[0])
     for member in path[1:]:
         if t is None: break
         t = next((x for x in pkg.tags(cdo, t['at']) if x['name'] == member), None)
-    if t is None: return start
+    if t is None: return start if fresh is None else fresh
+    return container_over(pkg, t, kind, start, name)
+
+
+def uds_default(base, member, kind):
+    """A UE_STRUCT's default instance's value of its TSet<int32> / TMap<FName, int32> member: what a new value of the
+    struct holds, UUserDefinedStruct::InitializeStruct copying the default instance in (UserDefinedStruct.cpp 254). The
+    default instance loads over nothing (UUserDefinedStruct::Serialize passes no defaults), and the member is found by
+    the name its tag is written under, the cooked property's `_<n>_<GUID>` suffix stripped. base is the struct's
+    package."""
+    import invariants
+    pkg = invariants.Package(base)
+    i = pkg.find(os.path.basename(base))
+    t = next((t for t in pkg.struct(i).defaults if re.sub(r'_\d+_[0-9A-F]{32}$', '', t['name']) == member), None)
+    empty = set() if kind == 'set' else {}
+    return empty if t is None else container_over(pkg, t, kind, empty, member)
+
+
+def container_over(pkg, t, kind, start, name):
+    """A TSet<int32> / TMap<FName, int32> tag t of pkg loaded over start, as loaded_container reads it."""
+    import struct
     raw, o = t['value'], 0
     out = set(start) if kind == 'set' else dict(start)
     removed = struct.unpack_from('<i', raw, o)[0]; o += 4
@@ -9056,7 +9078,8 @@ def asset_set_over_cdo():
     cdo, kcdo = cls.find('Default__UAsocDef_C'), kid.find('Default__UAsocKid_C')
 
     def cdo_value(path, kind):
-        return loaded_container(cls, cdo, path, kind, set() if kind == 'set' else {})
+        fresh = uds_default(os.path.join(here, 'FAsocHeld'), path[1], kind) if len(path) == 2 else None
+        return loaded_container(cls, cdo, path, kind, set() if kind == 'set' else {}, fresh)
     for name, path, kind, start, want in (
             ('AS_AsocOver', ('S',), 'set', cdo_value(('S',), 'set'), {3}),
             ('AS_AsocOver', ('M',), 'map', cdo_value(('M',), 'map'), {'a': 5, 'b': 2}),
@@ -9080,6 +9103,39 @@ def asset_set_over_cdo():
 asset_set_over_cdo()
 print('ok  AssetSetOverCdo: a mod asset\'s TSet / TMap, a member or one in a struct member, lists its class\'s CDO\'s '
       'elements it drops as removed, and loads as its braces say, not the union; a TArray is replaced whole')
+
+
+def asset_set_fresh():
+    """A struct member a mod class declares with no initializer (H) or as `T()` (HV) has no tag in the CDO, which then
+    holds the UE_STRUCT's default instance there: Ids {7}, Score {z: 9} (loaded_container's fresh, uds_default). An
+    asset's braces for its set and map load over that, so AS_AsfOver's H loads {3} and {a: 1}, not {3, 7} and
+    {z: 9, a: 1}; its HV keeps the 7 and z it gives; AS_AsfEmpty's `{}` loads empty. A child class's UE_DEFAULTS
+    statement for H loads over its parent's CDO the same way: UAsfKid's CDO holds {5} and {k: 2}."""
+    here = os.path.dirname(pending_asset('AssetSetFresh', 'UAsfDef'))
+    held = os.path.join(here, 'FAsfHeld')
+    assert uds_default(held, 'Ids', 'set') == {7} and uds_default(held, 'Score', 'map') == {'z': 9}
+    cls = invariants.Package(os.path.join(here, 'UAsfDef'))
+    cdo = cls.find('Default__UAsfDef_C')
+
+    def cdo_value(path, kind):
+        return loaded_container(cls, cdo, path, kind, set() if kind == 'set' else {}, uds_default(held, path[1], kind))
+    for pkg, row, path, kind, start, want in (
+            ('AS_AsfOver', 'AS_AsfOver', ('H', 'Ids'), 'set', cdo_value(('H', 'Ids'), 'set'), {3}),
+            ('AS_AsfOver', 'AS_AsfOver', ('H', 'Score'), 'map', cdo_value(('H', 'Score'), 'map'), {'a': 1}),
+            ('AS_AsfOver', 'AS_AsfOver', ('HV', 'Ids'), 'set', cdo_value(('HV', 'Ids'), 'set'), {3, 7}),
+            ('AS_AsfOver', 'AS_AsfOver', ('HV', 'Score'), 'map', cdo_value(('HV', 'Score'), 'map'), {'z': 9, 'a': 1}),
+            ('AS_AsfEmpty', 'AS_AsfEmpty', ('H', 'Ids'), 'set', cdo_value(('H', 'Ids'), 'set'), set()),
+            ('AS_AsfEmpty', 'AS_AsfEmpty', ('H', 'Score'), 'map', cdo_value(('H', 'Score'), 'map'), {}),
+            ('UAsfKid', 'Default__UAsfKid_C', ('H', 'Ids'), 'set', cdo_value(('H', 'Ids'), 'set'), {5}),
+            ('UAsfKid', 'Default__UAsfKid_C', ('H', 'Score'), 'map', cdo_value(('H', 'Score'), 'map'), {'k': 2})):
+        base = os.path.join(here, pkg)
+        keeps_invariants(base)
+        p = invariants.Package(base)
+        got = loaded_container(p, p.find(row), path, kind, start)
+        assert got == want, '%s loads %s = %s over %s; C++ says %s' % (row, '.'.join(path), got, start, want)
+
+
+pending('AssetSetFresh', asset_set_fresh)
 
 
 def uds_init_defaults():
