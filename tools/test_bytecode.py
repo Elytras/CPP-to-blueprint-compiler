@@ -5088,8 +5088,8 @@ def ue_meta_under_msvc():
     return True
 
 
-if msvc_cl()[0]:
-    pending('UeMetaMsvc', ue_meta_under_msvc)
+if ue_meta_under_msvc():
+    print('ok  UeMeta.h compiles under cl.exe as BpMods.vcxproj\'s IntelliSense reads it, UE_ENUM_MAP\'s forms included')
 else:
     print('--  UeMeta.h under cl.exe: skipped (no MSVC with the Windows SDK\'s UCRT headers installed)')
 

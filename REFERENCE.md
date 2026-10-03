@@ -5323,7 +5323,7 @@ listed here is refused with "unimplemented intrinsic".
 | Dispatcher methods, `OnHit.Add(this, &C::F)`, `Remove`, `Clear()`, `Broadcast(...)` | Bind Event, Unbind Event, Unbind all Events and Call. A dispatcher has no other methods. | [Event dispatchers](#event-dispatchers) |
 | Double literal beside a float, `X * 0.5` | Refused: in C++ it is double math, and Blueprint 4.27 has no double. Write `0.5f`. | [Literals and conversions](#literals-and-conversions) |
 | `__EmbedFile__("Path")` | A file's bytes, read at build time, as the default of a `TArray<uint8>` member. | [Classes and variables](#classes-and-variables) |
-| `__EnumMap__`, `__EnumMapInit__`, `__EnumMapSide__`, `__EnumMapCheck__`, `__EnumMapPair__`, `__EnumMapText__`, `__EnumMapNone__` | What UE_ENUM_MAP expands to. Write UE_ENUM_MAP. | [Enums](#enums) |
+| `__EnumMap__`, `__EnumMapInit__`, `__EnumMapSide__`, `__EnumMapCheck__`, `__EnumMapPair__`, `__EnumMapText__`, `__EnumMapNone__`, `__EnumMapSame__`, `__EnumMapEnum__`, `__EnumMapTake__`, `__EnumMapMember__` | What UE_ENUM_MAP expands to. Write UE_ENUM_MAP. | [Enums](#enums) |
 | Event override, `void ReceiveBeginPlay()` | Overrides that event, as adding its node in the editor does. Copy the SDK's parameter list: nothing checks it. | [Overrides and parent calls](#overrides-and-parent-calls) |
 | `ExecuteUbergraph_<Class>` | The name of the event graph that holds the methods that wait. A method named so is refused. | [Latent calls](#latent-calls) |
 | `FDeref` | The scratch struct that every read and write through a pointer goes through. AssetGen creates it when the mod declares none. | [Pointers and memory](#pointers-and-memory) |
