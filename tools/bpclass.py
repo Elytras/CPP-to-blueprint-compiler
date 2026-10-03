@@ -1,7 +1,8 @@
 """bpclass - browse and manage the Blueprint classes of BpMods in a terminal UI.
 
   bpclass.py                               the UI: folders and their classes; n new, r rename, m move, d delete, o open
-  bpclass.py new <dir> <Class> [: Base]    create one class without the UI (a VS External Tool passes "$(ItemDir).")
+  bpclass.py new <dir> <Class> [: Base]    create one class without the UI (a VS External Tool passes "$(ItemDir).");
+                                           a <dir> that does not exist is made
 
 Every change rewrites the VS project's file list (bpbuild's write_vs_filters), so Visual Studio reloads the project
 with the files under the filter of their folder.
@@ -84,13 +85,26 @@ def api_classes():
 
 
 def package(folder):
-    """The folder's UE_MOD_PACKAGE, from the first of its .cpp files that declares one."""
-    for path in sorted(os.listdir(folder)):
-        if path.endswith(".cpp"):
-            m = MOD_PACKAGE.search(read(os.path.join(folder, path))[0])
-            if m:
-                return m.group(1)
+    """The folder's UE_MOD_PACKAGE, from the first of its .cpp files that declares one, else its nearest parent's
+    inside BpMods: a subfolder (ECD2A/Handlers) is the same mod, and a class's asset path ignores its folder."""
+    while os.path.normcase(folder).startswith(os.path.normcase(BP)):
+        for path in sorted(os.listdir(folder)) if os.path.isdir(folder) else []:
+            if path.endswith(".cpp"):
+                m = MOD_PACKAGE.search(read(os.path.join(folder, path))[0])
+                if m:
+                    return m.group(1)
+        if os.path.normcase(folder) == os.path.normcase(BP):
+            break
+        folder = os.path.dirname(folder)
     return None
+
+
+def inside_bp(folder):
+    """The absolute folder, which must be BpMods or under it; it need not exist yet."""
+    folder = os.path.abspath(os.path.join(BP, folder))
+    if os.path.splitdrive(folder)[0].lower() != os.path.splitdrive(BP)[0].lower()             or os.path.normcase(os.path.relpath(folder, BP)).startswith(".."):
+        raise ValueError("%s is not inside %s" % (folder, BP))
+    return folder
 
 
 def mods_of(cpp):
@@ -98,7 +112,14 @@ def mods_of(cpp):
     mods = (yaml.safe_load(read(os.path.join(BP, "mods.yaml"))[0]) or {}).get("mods") or []
     target = os.path.normcase(os.path.abspath(cpp))
     return [m["name"] for m in mods for s in m.get("sources") or []
-            if fnmatch.fnmatch(target, os.path.normcase(os.path.abspath(os.path.join(BP, s))))]
+            if glob_match(target, os.path.normcase(os.path.abspath(os.path.join(BP, s))))]
+
+
+def glob_match(path, pattern):
+    """fnmatch as bpbuild's glob.glob means it: a wildcard stays within one folder, so ECD2A/*.cpp does not take
+    ECD2A/Handlers/X.cpp (plain fnmatch's * crosses separators)."""
+    a, b = path.split(os.sep), pattern.split(os.sep)
+    return len(a) == len(b) and all(fnmatch.fnmatch(x, y) for x, y in zip(a, b))
 
 
 def folder_mods(folder):
@@ -128,14 +149,14 @@ def unpicked_note(cpp):
 # --- operations: each returns notes for the user, or raises ValueError ----------------------------------------------
 
 def create(folder, name, base, found, api):
-    folder = os.path.abspath(folder)
-    if not os.path.normcase(folder).startswith(os.path.normcase(BP)):
-        raise ValueError("%s is not inside %s" % (folder, BP))
+    """X.h / X.cpp in the folder, made (with any missing parents) if it does not exist."""
+    folder = inside_bp(folder)
     check_new_name(name, found)
     h, cpp = (os.path.join(folder, name + e) for e in (".h", ".cpp"))
     for f in (h, cpp):
         if os.path.exists(f):
             raise ValueError("%s already exists" % rel(f))
+    os.makedirs(folder, exist_ok=True)
     # A base from BpMods is included by its header's path; one from the dump by its UeApi header.
     local = next((c.file for cs in found.values() for c in cs if c.name == base and c.file.endswith(".h")), None)
     include = os.path.relpath(local, folder).replace("\\", "/") if local else api.get(base, "Engine.h")
@@ -170,7 +191,9 @@ def rename(c, new, found):
 
 
 def move(c, dest, found):
-    """Moves X.h / X.cpp, points UE_CLASS at the new folder's package, and fixes every relative include."""
+    """Moves X.h / X.cpp, points UE_CLASS at the new folder's package, and fixes every relative include. A destination
+    that does not exist is made."""
+    dest = inside_bp(dest)
     files, src = own_files(c), os.path.dirname(c.file)
     if os.path.normcase(dest) == os.path.normcase(src):
         raise ValueError("%s is already in %s" % (c.name, rel(dest)))
@@ -178,6 +201,7 @@ def move(c, dest, found):
     for p in moved.values():
         if os.path.exists(p):
             raise ValueError("%s already exists" % rel(p))
+    os.makedirs(dest, exist_ok=True)
 
     def retarget(from_dir, to_dir):
         def fix(m):
@@ -234,7 +258,7 @@ def tui():
     from textual.containers import Horizontal, Vertical
     from textual.screen import ModalScreen
     from textual.suggester import SuggestFromList
-    from textual.widgets import Footer, Header, Input, Label, OptionList, Static, Tree
+    from textual.widgets import Footer, Header, Input, Label, Static, Tree
 
     class Form(ModalScreen):
         """Asks for a few values in turn; Enter moves on, Enter on the last returns them all, Esc cancels."""
@@ -270,27 +294,12 @@ def tui():
             with Vertical(id="dialog"):
                 yield Label(self.text + "\n\n[b]y[/b] yes    [b]n[/b] no")
 
-    class Pick(ModalScreen):
-        BINDINGS = [("escape", "dismiss(None)", "Cancel")]
-
-        def __init__(self, prompt, options):
-            super().__init__()
-            self.prompt, self.options = prompt, options
-
-        def compose(self):
-            with Vertical(id="dialog"):
-                yield Label(self.prompt)
-                yield OptionList(*self.options)
-
-        def on_option_list_option_selected(self, event):
-            self.dismiss(self.options[event.option_index])
-
     class BpClassApp(App):
         TITLE = "bpclass"
         CSS = """
         #tree { width: 50%; }
         #info { padding: 1 2; }
-        Form, Confirm, Pick { align: center middle; }
+        Form, Confirm { align: center middle; }
         #dialog { width: 80; height: auto; max-height: 80%; padding: 1 2; border: thick $accent; background: $surface; }
         """
         BINDINGS = [("n", "new", "New"), ("r", "rename", "Rename"), ("m", "move", "Move"), ("d", "delete", "Delete"),
@@ -353,10 +362,15 @@ def tui():
                 self.notify(n, timeout=10)
 
         def action_new(self):
-            folder = self.selected_folder()
+            folder = rel(self.selected_folder())
             bases = sorted({c.name for cs in self.found.values() for c in cs} | set(self.api))
-            self.push_screen(Form("New class in %s" % rel(folder), [("Class name", "", None), ("Base (UObject)", "", bases)]),
-                             lambda v: v and v[0] and self.apply(create, folder, v[0], v[1] or "UObject", self.found, self.api))
+            self.push_screen(Form("New class (a folder that does not exist is made)",
+                                  [("Folder, under BpMods", "" if folder == "." else folder, self.folders()),
+                                   ("Class name", "", None), ("Base (UObject)", "", bases)]),
+                             lambda v: v and v[1] and self.apply(create, v[0], v[1], v[2] or "UObject", self.found, self.api))
+
+        def folders(self):
+            return [rel(f) for f in self.found if f != BP]
 
         def action_rename(self):
             c = self.selected_class()
@@ -367,9 +381,9 @@ def tui():
         def action_move(self):
             c = self.selected_class()
             if c:
-                targets = {rel(f): f for f in self.found if os.path.normcase(f) != os.path.normcase(os.path.dirname(c.file))}
-                self.push_screen(Pick("Move %s to" % c.name, list(targets)),
-                                 lambda v: v and self.apply(move, c, targets[v], self.found))
+                self.push_screen(Form("Move %s to (a folder that does not exist is made)" % c.name,
+                                      [("Folder, under BpMods", rel(os.path.dirname(c.file)), self.folders())]),
+                                 lambda v: v and self.apply(move, c, v[0] or ".", self.found))
 
         def action_delete(self):
             c = self.selected_class()
@@ -394,7 +408,7 @@ def main():
     if args[0] != "new" or len(args) < 3:
         sys.exit(__doc__.strip())
     try:
-        notes = create(args[1], args[2], args[3] if len(args) > 3 else "UObject", scan(), api_classes())
+        notes = create(os.path.abspath(args[1]), args[2], args[3] if len(args) > 3 else "UObject", scan(), api_classes())
     except ValueError as e:
         sys.exit(str(e))
     write_vs_filters(BP)
