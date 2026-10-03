@@ -9317,6 +9317,40 @@ def asset_chain_unsaid():
 pending('AssetChainUnsaid', asset_chain_unsaid)
 
 
+def asset_iface_set():
+    """A mod interface's variable is a property of the class that implements it, so that class's default object holds
+    the interface's initializer (UAisImpl: Tags {1, 2}) or its own UE_DEFAULTS value (UAisImpl5: {5}). A subclass's
+    UE_DEFAULTS loads over that: UAisKid's {3} and UAisKid6's {6}, not the union, and with no warning naming an engine
+    class above the implementer, whose default object has no such property. An asset gives an implemented interface's
+    variables in the interface's braces, after the base's: AS_AisImpl's Tags {3} and Level 9 load as written over its
+    class's {1, 2} and 4 (they were dropped, silently), and AS_AisKid's {7} over UAisKid's {3}."""
+    import struct
+    here = os.path.dirname(pending_asset('AssetIfaceSet', 'UAisImpl'))
+
+    def cdo(cls):
+        pkg = invariants.Package(os.path.join(here, cls))
+        return pkg, pkg.find('Default__%s_C' % cls)
+    impl, impl5 = loaded_container(*cdo('UAisImpl'), 'Tags', 'set', set()), loaded_container(*cdo('UAisImpl5'), 'Tags', 'set', set())
+    assert (impl, impl5) == ({1, 2}, {5}), (impl, impl5)
+    kid = loaded_container(*cdo('UAisKid'), 'Tags', 'set', impl)
+    for name, got, want in (('UAisKid', kid, {3}), ('UAisKid6', loaded_container(*cdo('UAisKid6'), 'Tags', 'set', impl5), {6})):
+        assert got == want, '%s\'s CDO loads Tags = %s; C++ says %s' % (name, got, want)
+    for name, start, want, level in (('AS_AisImpl', impl, {3}, 9), ('AS_AisKid', kid, {7}, None)):
+        base = os.path.join(here, name)
+        keeps_invariants(base)
+        pkg = invariants.Package(base)
+        row = pkg.find(name)
+        got = loaded_container(pkg, row, 'Tags', 'set', start)
+        assert got == want, '%s loads Tags = %s over %s; C++ says %s' % (name, got, start, want)
+        t = pkg.tag(row, 'Level')
+        assert (t and struct.unpack('<i', t['value'])[0]) == level or (level is None and t is None), (name, t)
+    warned = [l for l in LOGS['AssetIfaceSet'].splitlines() if 'warning' in l]
+    assert not warned, warned
+
+
+pending('AssetIfaceSet', asset_iface_set)
+
+
 def asset_map_dup_keys():
     """A key a map's braces give twice holds the last value given, as TMap's initializer-list constructor Adds each pair
     in order (Map.h 1166-1173). AS_AmdOver's {{"a", 1}, {"a", 2}} over UAmdDef's {a: 2, c: 3} loads {a: 2}, AS_AmdLast's
