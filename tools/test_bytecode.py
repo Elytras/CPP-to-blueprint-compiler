@@ -8963,6 +8963,40 @@ print('ok  AssetOverCdo: a mod\'s own asset\'s braces lie over its class\'s CDO:
       'where the CDO holds what C++ would make it, else it is refused by name')
 
 
+def asset_set_over_cdo():
+    """A mod's own asset loads over its class's CDO (its archetype, the Defaults SerializeScriptProperties hands every
+    tag, Obj.cpp 1450-1467), so a TSet / TMap tag of it is a delta there, read as loaded_container reads a child CDO's:
+    the cook writes a game object over its archetype that way too (ENE_Spider_Lobber's HealthComponent lists its
+    archetype's three Resistances as removed). AS_AsocOver's S, M, and the set and map in its struct member H load as the
+    braces give them, not the union with the CDO's; its TArray A is replaced whole (PropertyArray.cpp 199). AS_AsocEmpty's
+    `{}` loads empty, and AS_AsocKid's S lies over its class's UE_DEFAULTS value {2, 5}, not the declaration's."""
+    here = os.path.dirname(pending_asset('AssetSetOverCdo', 'UAsocDef'))
+    cls, kid = (invariants.Package(os.path.join(here, n)) for n in ('UAsocDef', 'UAsocKid'))
+    cdo, kcdo = cls.find('Default__UAsocDef_C'), kid.find('Default__UAsocKid_C')
+
+    def cdo_value(path, kind):
+        return loaded_container(cls, cdo, path, kind, set() if kind == 'set' else {})
+    for name, path, kind, start, want in (
+            ('AS_AsocOver', ('S',), 'set', cdo_value(('S',), 'set'), {3}),
+            ('AS_AsocOver', ('M',), 'map', cdo_value(('M',), 'map'), {'a': 5, 'b': 2}),
+            ('AS_AsocOver', ('H', 'Ids'), 'set', cdo_value(('H', 'Ids'), 'set'), {2, 3}),
+            ('AS_AsocOver', ('H', 'Score'), 'map', cdo_value(('H', 'Score'), 'map'), {'a': 5, 'b': 2}),
+            ('AS_AsocEmpty', ('S',), 'set', cdo_value(('S',), 'set'), set()),
+            ('AS_AsocEmpty', ('M',), 'map', cdo_value(('M',), 'map'), {}),
+            ('AS_AsocKid', ('S',), 'set', loaded_container(kid, kcdo, ('S',), 'set', cdo_value(('S',), 'set')), {5, 6})):
+        base = os.path.join(here, name)
+        keeps_invariants(base)
+        pkg = invariants.Package(base)
+        got = loaded_container(pkg, pkg.find(name), path, kind, start)
+        assert got == want, '%s loads %s = %s over its CDO\'s %s; C++ says %s' % (name, '.'.join(path), got, start, want)
+    pkg = invariants.Package(os.path.join(here, 'AS_AsocOver'))
+    a = next(t for t in pkg.tags(pkg.find('AS_AsocOver')) if t['name'].lower() == 'a')
+    assert struct.unpack('<ii', a['value']) == (1, 3), a['value'].hex()
+
+
+pending('AssetSetOverCdo: a mod asset\'s TSet / TMap lists its CDO\'s elements it drops as removed', asset_set_over_cdo)
+
+
 def uds_init_defaults():
     """Every member initializer of a UE_STRUCT is in its default instance, the Data stream the engine copies into each
     new value of the struct (UUserDefinedStruct::InitializeStruct). A member at its type's default may be left out, and
