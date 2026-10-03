@@ -9360,6 +9360,21 @@ print('ok  AssetIfaceSet: a mod interface\'s set loads below its implementer ove
       'asset gives the interface\'s variables in the interface\'s braces')
 
 
+def defaults_out_of_class():
+    """UE_DEFAULTS is read where it is written, in the class. `UE_DEFAULTS;` there with its statements in an out-of-line
+    `void UOolDef::UeDefaults__() { S = {9}; }` was dropped, silently: the class cooked its parent's {1, 2}. A mod that
+    includes the class's header sees no statement at all, so it would take the parent's value too. Both refused,
+    naming the class and what to write; the bare declaration as well."""
+    base = 'class UOolBase : public UPrimaryDataAsset {\npublic:\n  TSet<int32> S = {1, 2};\n};\n'
+    why = 'UE_DEFAULTS has no body in the class'
+    refused('UOolDef', '  UE_DEFAULTS;\n', 'UOolDef: ' + why, top=base, base='UOolBase',
+            after='void UOolDef::UeDefaults__() { S = {9}; }\n')
+    refused('UOolBare', '  UE_DEFAULTS;\n', 'UOolBare: ' + why, top=base, base='UOolBase')
+
+
+pending('DefaultsOutOfClass', defaults_out_of_class)
+
+
 def asset_map_dup_keys():
     """A key a map's braces give twice holds the last value given, as TMap's initializer-list constructor Adds each pair
     in order (Map.h 1166-1173). AS_AmdOver's {{"a", 1}, {"a", 2}} over UAmdDef's {a: 2, c: 3} loads {a: 2}, AS_AmdLast's
