@@ -9109,9 +9109,9 @@ def asset_set_fresh():
     """A struct member a mod class declares with no initializer (H) or as `T()` (HV) has no tag in the CDO, which then
     holds the UE_STRUCT's default instance there: Ids {7}, Score {z: 9} (loaded_container's fresh, uds_default). An
     asset's braces for its set and map load over that, so AS_AsfOver's H loads {3} and {a: 1}, not {3, 7} and
-    {z: 9, a: 1}; its HV keeps the 7 and z it gives; AS_AsfEmpty's `{}` loads empty. A child class's UE_DEFAULTS
+    {z: 9, a: 1}, and its HV {8} and {a: 1}; AS_AsfEmpty's `{}` loads empty. A child class's UE_DEFAULTS
     statement for H loads over its parent's CDO the same way: UAsfKid's CDO holds {5} and {k: 2}."""
-    here = os.path.dirname(pending_asset('AssetSetFresh', 'UAsfDef'))
+    here = os.path.dirname(asset('AssetSetFresh'))
     held = os.path.join(here, 'FAsfHeld')
     assert uds_default(held, 'Ids', 'set') == {7} and uds_default(held, 'Score', 'map') == {'z': 9}
     cls = invariants.Package(os.path.join(here, 'UAsfDef'))
@@ -9122,8 +9122,8 @@ def asset_set_fresh():
     for pkg, row, path, kind, start, want in (
             ('AS_AsfOver', 'AS_AsfOver', ('H', 'Ids'), 'set', cdo_value(('H', 'Ids'), 'set'), {3}),
             ('AS_AsfOver', 'AS_AsfOver', ('H', 'Score'), 'map', cdo_value(('H', 'Score'), 'map'), {'a': 1}),
-            ('AS_AsfOver', 'AS_AsfOver', ('HV', 'Ids'), 'set', cdo_value(('HV', 'Ids'), 'set'), {3, 7}),
-            ('AS_AsfOver', 'AS_AsfOver', ('HV', 'Score'), 'map', cdo_value(('HV', 'Score'), 'map'), {'z': 9, 'a': 1}),
+            ('AS_AsfOver', 'AS_AsfOver', ('HV', 'Ids'), 'set', cdo_value(('HV', 'Ids'), 'set'), {8}),
+            ('AS_AsfOver', 'AS_AsfOver', ('HV', 'Score'), 'map', cdo_value(('HV', 'Score'), 'map'), {'a': 1}),
             ('AS_AsfEmpty', 'AS_AsfEmpty', ('H', 'Ids'), 'set', cdo_value(('H', 'Ids'), 'set'), set()),
             ('AS_AsfEmpty', 'AS_AsfEmpty', ('H', 'Score'), 'map', cdo_value(('H', 'Score'), 'map'), {}),
             ('UAsfKid', 'Default__UAsfKid_C', ('H', 'Ids'), 'set', cdo_value(('H', 'Ids'), 'set'), {5}),
@@ -9135,7 +9135,9 @@ def asset_set_fresh():
         assert got == want, '%s loads %s = %s over %s; C++ says %s' % (row, '.'.join(path), got, start, want)
 
 
-pending('AssetSetFresh', asset_set_fresh)
+asset_set_fresh()
+print('ok  AssetSetFresh: a mod asset\'s TSet / TMap in a struct member its class declares with no initializer, or as '
+      '`T()`, loads over the UE_STRUCT\'s default instance and drops its elements; so does a child\'s UE_DEFAULTS')
 
 
 def uds_init_defaults():

@@ -31,7 +31,7 @@ public:
     }
 };
 
-// C++: H.Ids {3}, H.Score {a: 1}; HV.Ids {3, 7}, HV.Score {z: 9, a: 1}.
-UAsfDef AS_AsfOver = {.H = {.Ids = {3}, .Score = {{"a", 1}}}, .HV = {.Ids = {3, 7}, .Score = {{"z", 9}, {"a", 1}}}};
+// C++: H.Ids {3}, H.Score {a: 1}; HV.Ids {8}, HV.Score {a: 1}.
+UAsfDef AS_AsfOver = {.H = {.Ids = {3}, .Score = {{"a", 1}}}, .HV = {.Ids = {8}, .Score = {{"a", 1}}}};
 // C++: H.Ids and H.Score empty.
 UAsfDef AS_AsfEmpty = {.H = {.Ids = {}, .Score = {}}};

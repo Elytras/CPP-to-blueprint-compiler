@@ -12053,8 +12053,23 @@ bool FCompiler::DiffAgainstDefaultObject(const FRecord* From, const std::string&
         const Json* Declared = nullptr;
         for (const Json* F : C->Fields) if (F->value("id", std::string()) == Id) Declared = F;
         if (!Set && !Declared) continue;
-        if (!(Set ? LowerDefault(*Set, Parent, BP, Err, Value, /*bKeepZero=*/true) : LowerDefault(*Declared, Parent, BP, Err)))
-            return false;
+        /* A UE_STRUCT declared with no initializer, `{}` or `T()` gets no tag, and the default object holds the struct's
+           default instance there: InitNonNativeProperty initialises the property (BlueprintSupport.cpp 2609), and
+           UUserDefinedStruct::InitializeStruct copies the default instance in (UserDefinedStruct.cpp 254). That is each
+           member's initializer (ValueInitStruct), not the empty value LowerDefault leaves the declaration as. A value
+           that starts fresh, so an engine struct inside keeps the engine's value without a word. */
+        const FRecord* const SR = Set ? nullptr : Find(StripTypeKeywords(TypeOf(*Declared)));
+        bool bOk;
+        if (Set) bOk = LowerDefault(*Set, Parent, BP, Err, Value, /*bKeepZero=*/true);
+        else if (SR && SR->IsModStruct() && StartsFresh(Strip(First(*Declared))))
+        {
+            const bool bWasFresh = bFreshValue;
+            bFreshValue = true;
+            bOk = ValueInitStruct(*SR, /*bZeros=*/false, Name(*Declared), Parent, BP, Err);
+            bFreshValue = bWasFresh;
+        }
+        else bOk = LowerDefault(*Declared, Parent, BP, Err);
+        if (!bOk) return false;
         DiffTaggedAgainstParent(PD, Parent);
         return true;
     }
