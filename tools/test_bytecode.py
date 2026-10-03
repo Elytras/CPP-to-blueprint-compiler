@@ -5054,6 +5054,46 @@ print('ok  UE_ENUM_MAP misuse: two types that are not an enum and FName or FStri
       'arguments are refused naming what was written')
 
 
+def msvc_cl():
+    """The newest installed MSVC's cl.exe and the INCLUDE path for its own headers and the UCRT's, found on disk with no
+    process started; (None, None) when there is none."""
+    vs = os.environ.get('ProgramFiles', r'C:\Program Files')
+    kits = os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)')
+    cls = sorted(glob.glob(os.path.join(vs, 'Microsoft Visual Studio', '*', '*', 'VC', 'Tools', 'MSVC', '*', 'bin', 'Hostx64',
+                                        'x64', 'cl.exe')))
+    ucrt = sorted(glob.glob(os.path.join(kits, 'Windows Kits', '10', 'Include', '*', 'ucrt')))
+    if not cls or not ucrt: return None, None
+    return cls[-1], os.path.normpath(os.path.join(os.path.dirname(cls[-1]), '..', '..', '..', 'include')) + ';' + ucrt[-1]
+
+
+def ue_meta_under_msvc():
+    """UeMeta.h is read by MSVC's IntelliSense as well as by AssetGen's clang: BpMods.vcxproj gives it /std:c++20, no
+    defines and MSVC's traditional preprocessor (no /Zc:preprocessor), where a clang-only builtin or __VA_OPT__ is an
+    error in every mod file, each reaching UeMeta.h through the UeApi headers. cl.exe in that mode compiles a file using
+    the one-argument UE_ENUM_MAP and the three-argument one both ways, each declared member of the type written."""
+    cl, include = msvc_cl()
+    if not cl: return False
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, 'Meta.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/UeMeta.h"\nenum class EMood : uint8 { Calm, Angry };\n'
+                    'struct UOne { TMap<FString, EMood> ByName = UE_ENUM_MAP(EMood); };\n'
+                    'struct UThree {\n  UE_ENUM_MAP(FName, EMood, Moods);\n  UE_ENUM_MAP(EMood, FString, Names);\n};\n'
+                    'static_assert(__EnumMapSame__<decltype(UThree::Moods), TMap<FName, EMood>>);\n'
+                    'static_assert(__EnumMapSame__<decltype(UThree::Names), TMap<EMood, FString>>);\n')
+        proc = subprocess.run([cl, '/nologo', '/Zs', '/std:c++20', '/I' + os.path.dirname(UEAPI), '/I' + UEAPI, src],
+                              capture_output=True, encoding='utf-8', errors='replace', cwd=tmp,
+                              env=dict(os.environ, INCLUDE=include))
+        assert proc.returncode == 0, 'cl.exe, as IntelliSense reads UeMeta.h:\n' + (proc.stdout + proc.stderr)[-3000:]
+    return True
+
+
+if msvc_cl()[0]:
+    pending('UeMetaMsvc', ue_meta_under_msvc)
+else:
+    print('--  UeMeta.h under cl.exe: skipped (no MSVC with the Windows SDK\'s UCRT headers installed)')
+
+
 def abstract_instances():
     """A class left abstract is never instanced: the loader constructs every non-CDO export, and StaticAllocateObject
     check()s !CLASS_Abstract (UObjectGlobals.cpp 2362). An asset of an abstract mod class - one this mod would cook,
