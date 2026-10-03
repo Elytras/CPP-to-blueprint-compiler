@@ -523,7 +523,7 @@ uint32 NetFlagsOf(const Json& Decl)
 
 /* UE_AUTHORITY_ONLY / UE_COSMETIC, the same way: the VM skips the call where the flag says it should not run. */
 /* A method that overrides nothing. Measured on the DRG dump: a Blueprint-authored function is
-   (Public, BlueprintCallable, BlueprintEvent) - 4624 of them, CD2_Module_C's among them. Without BlueprintCallable
+   (Public, BlueprintCallable, BlueprintEvent) - 4624 of them, every Blueprint function a mod overrides among them. Without BlueprintCallable
    no Blueprint can place a call node, and the API stub, which lists what a Blueprint can call, left every plain
    method out. FUNC_Event stays: it is what every mod was cooked and run with so far. */
 static const uint32 kPlainMethodFlags = FFunctionDef().FunctionFlags | FUNC_BlueprintCallable;
@@ -1635,7 +1635,7 @@ private:
         if (It != Records.end()) return &It->second;
         auto B = Bare.find(CppName);
         if (B != Bare.end()) { It = Records.find(B->second); return It == Records.end() ? nullptr : &It->second; }
-        /* `using JSONValue_C = Game::_AssemblyStorm::Common::JSON::JSONValue_C;` - how a mod names a class two
+        /* `using Gun_C = Game::Weapons::Rifles::Gun_C;` - how a mod names a class two
            packages both have, which the headers can give no short name. clang spells a use as the alias. */
         if (auto S = SlotStructs.find(CppName); S != SlotStructs.end()) return &S->second;
         auto A = Aliases.find(CppName);
@@ -2603,8 +2603,8 @@ bool FCompiler::Collect(std::string* Err)
                 R.Replicated[N2.second] = Rep->second;
                 R.Replicated.erase(N2.first);
             }
-        /* genueapi opens a Blueprint class with `using JSONValue_C = Game::...::JSONValue_C;` so its signatures stay
-           readable, and a mod class deriving it writes `JSONValue_C*` through the same names. The nearer one wins. */
+        /* genueapi opens a Blueprint class with `using Gun_C = Game::...::Gun_C;` so its signatures stay
+           readable, and a mod class deriving it writes `Gun_C*` through the same names. The nearer one wins. */
         std::map<std::string, std::string> InScope = R.TypeAliases;
         for (const FRecord* A = R.Base.empty() ? nullptr : Find(R.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
             InScope.insert(A->TypeAliases.begin(), A->TypeAliases.end());
@@ -2622,9 +2622,9 @@ bool FCompiler::Collect(std::string* Err)
     };
     Walk(Doc, std::string());
     if (!bMetaOk) return false;
-    /* A global alias of a template or a class (`using ValueFactory = TScriptInterface<...>;`, `using JSON =
-       Game::...::JSONValue_C;`) is written out in every use, out-of-line method bodies included. Find resolved one of
-       a class but nothing one of a template, and clang desugars only a type's outer layer, so `JSON *` kept its alias
+    /* A global alias of a template or a class (`using TargetRef = TScriptInterface<...>;`, `using Gun =
+       Game::...::Gun_C;`) is written out in every use, out-of-line method bodies included. Find resolved one of
+       a class but nothing one of a template, and clang desugars only a type's outer layer, so `Gun *` kept its alias
        where an override's signature is compared with its parent's. A scalar alias (`using int32 = int;`) stays: the
        lowering reads those spellings. */
     std::map<std::string, std::string> Expand;

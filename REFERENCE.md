@@ -455,13 +455,13 @@ Notes:
 | `private:` before a variable | The variable is still cooked on the class, but the editor API stub leaves it out. A Blueprint variable has no other access: a protected one and a public one look the same. | Yes |
 | `const int32 Limit = 3;` | A read-only variable (BlueprintReadOnly): the editor offers a Get node and no Set node. The initializer is the default. clang refuses a write in C++, and the Blueprint VM does not check it. | Yes |
 | `UE_READONLY int32 Cap = 5;` | Read-only the same way (BlueprintReadOnly), but it can still be written: a subclass's `UE_DEFAULTS` may give it a default, and a write from code compiles with `warning: <Class>::<Function>: Cap is BlueprintReadOnly; the editor would not set it`, because the VM allows the write (for example, setting a deferred spawn's members before FinishSpawning). UeApi declares the engine's and game's BlueprintReadOnly properties this way. | Yes |
-| `UE_CATEGORY("Teleporter\|Setup");` | Gives the functions and variables declared after it that category. `\|` starts a subcategory, and `UE_CATEGORY("")` ends the category. It is positional, like an access specifier. | Yes |
+| `UE_CATEGORY("Turret\|Setup");` | Gives the functions and variables declared after it that category. `\|` starts a subcategory, and `UE_CATEGORY("")` ends the category. It is positional, like an access specifier. | Yes |
 | a keyword or a tooltip for a function | Not yet: there is no macro for it. | Not yet |
 
 ```cpp
-class Teleporter : public AActor {
+class Turret : public AActor {
 public:
-  UE_CATEGORY("Teleporter|Setup");
+  UE_CATEGORY("Turret|Setup");
   void Configure() {}
   int32 Charges;
   UE_CATEGORY("");                  // back to none
@@ -2002,7 +2002,7 @@ written inside the class does not make a method inline. Only the `inline` keywor
 | `virtual int32 Step() final` | No subclass has a Step of its own: the function is cooked Final, and calls to it are direct, as in a `final` class. A subclass method named Step is refused. C++ allows `final` only on a virtual method. | Yes |
 | `virtual int32 Score() = 0;` | An empty function that returns the default: 0, false, None or empty. A subclass's Score overrides it and names it as its super. A class that declares one, or inherits one with no version of its own, is cooked Abstract, which SpawnActor and CreateWidget refuse, as they refuse a class the editor marks Generate Abstract Class. `NewObject` and `AddComponentByClass` do not check the flag in a game, so a call to Score on such an object gets the default. A `SpawnActor` that names such a class warns, and a `NewObject` that names it is refused ([Objects and widgets](#objects-and-widgets)). | Yes |
 | `public:` / `protected:` / `private:` | Become the function's Public, Protected or Private flag, which the editor honours; see [Classes and variables](#classes-and-variables). | Yes |
-| `UE_CATEGORY("Teleporter\|Setup");` | The category of the members that follow, written into the editor API stub; see [Classes and variables](#classes-and-variables). | Yes |
+| `UE_CATEGORY("Turret\|Setup");` | The category of the members that follow, written into the editor API stub; see [Classes and variables](#classes-and-variables). | Yes |
 | `UE_AUTHORITY_ONLY` / `UE_COSMETIC` | The editor's Authority Only and Cosmetic function flags; see [RPCs](#rpcs). | Yes |
 | `generate_api: true` in `mods.yaml` | Writes an editor stub of the class, so a Blueprint made in the editor can place call nodes for its functions; see [Editor API stubs](GUIDE.md#editor-api-stubs). | Yes |
 | `int32 Undef(int32 X);` with no body anywhere | No function is cooked, and a call to it is refused ("... declares and never defines"), as C++ would not link it. Give every method a body, or make it `virtual ... = 0` for an empty one. | Refused |

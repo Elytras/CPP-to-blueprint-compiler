@@ -1512,12 +1512,12 @@ A class stub holds:
   Content Browser lists the asset.
 
 For example, with `--api` this class gets a stub with the variable `Charges` and the functions `Recharge` and `Left`,
-all three carrying the category `Teleporter`:
+all three carrying the category `Turret`:
 
 ```cpp
 class StubDemo : public AActor {
 public:
-  UE_CATEGORY("Teleporter");
+  UE_CATEGORY("Turret");
   int32 Charges = 3;                          // a variable: in the stub, with its default
   void Recharge(int32 By) { Charges += By; }  // a function graph with one input
   UE_PURE int32 Left() { return Charges; }    // pure: no exec pins

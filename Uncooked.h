@@ -28,7 +28,7 @@ struct FApiFunction
 
 struct FApiClass
 {
-    std::string PackageName;                 // /Game/_ElytrasMods/ReadProperty
+    std::string PackageName;                 // /Game/_MyMods/Turrets
     std::string AssetName;                   // ReadProperty (the .uasset)
     std::string ParentPackage, ParentClass;  // /Script/Engine, BlueprintFunctionLibrary
     std::vector<FApiFunction> Functions;
@@ -52,7 +52,7 @@ name, so the editor's GetGuidFromName resolves the member to the same GUID our b
 */
 struct FApiStruct
 {
-    std::string PackageName;            // /Game/_ElytrasMods/StructTest/FStats  (same path the cooked asset uses)
+    std::string PackageName;            // /Game/_MyMods/Turrets/FStats  (same path the cooked asset uses)
     std::string StructName;             // FStats (the .uasset)
     std::vector<FPropertyDef> Members;  // GUID-suffixed compiled names, exactly as the cooked layout
     uint32 Guid[4] = { 0, 0, 0, 0 };    // the struct Guid tag, matching the cooked FinishStruct
@@ -65,7 +65,7 @@ bool WriteApiStructAsset(const FApiStruct& Struct, const FPackage& Source, const
    sentinel - so a mod's own bytecode, which uses ordinals, and a consumer's editor pin agree. */
 struct FApiEnum
 {
-    std::string PackageName;                            // /Game/_ElytrasMods/StructTest/EMood
+    std::string PackageName;                            // /Game/_MyMods/Turrets/EMood
     std::string EnumName;                               // EMood (the .uasset)
     std::vector<std::pair<std::string, int64>> Entries; // enumerator name -> value, in declaration order
 };

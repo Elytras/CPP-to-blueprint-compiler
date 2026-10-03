@@ -3882,7 +3882,7 @@ def path_edits():
 
 def game_edits():
     """S38 on the game's own packages (--game): ED_Spider_Grunt and the grunt Blueprint's class defaults, edited as
-    BpMods' GruntTweaks does. Only the named tags differ from the cook's; every other export is its bytes."""
+    a UE_PATCH mod does. Only the named tags differ from the cook's; every other export is its bytes."""
     if not GAME or not os.path.exists(os.path.join(UEAPI, 'Game', 'ENE_Spider_Grunt_Normal_C.h')):
         print('--  S38 on the game\'s own packages: skipped (needs --game <extracted pak>/FSD/Content and UeApi/Game)')
         return
