@@ -2207,11 +2207,11 @@ def registry_rows_name_exports():
     """Each row of a mod's AssetRegistry.bin names an asset export of its package, of the row's class, as the game's
     rows do: a Blueprint interface's class row is `<Package>.<I>_C  BlueprintGeneratedClass` (TempRocketInterface,
     RadarPointInterface), as a class's is; the game's `<Package>.<I>  Blueprint` row beside it is the editor asset, which
-    a cooked package does not hold and AssetGen lists for no class. IfaceRow's, and every suite mod's registry."""
+    a cooked package does not hold and AssetGen lists for no class. Every suite mod's registry, IfaceRow's among them;
+    before the fix each mod interface's row was `<Package>.<I>`, which names nothing there."""
     import invariants
-    base = pending_asset('IfaceRow')
-    regs = [os.path.join(base.split(os.sep + 'Content' + os.sep)[0], 'AssetRegistry.bin')]
-    regs += sorted(glob.glob(os.path.join(ROOT, '*', 'FSD', 'AssetRegistry.bin')))
+    regs = sorted(glob.glob(os.path.join(ROOT, '*', 'FSD', 'AssetRegistry.bin')))
+    assert registry_of('IfaceRow') in regs, regs[:3]
     bad = []
     for reg in regs:
         content = os.path.join(os.path.dirname(reg), 'Content')
@@ -2225,7 +2225,8 @@ def registry_rows_name_exports():
     assert not bad, '%d registry rows name no asset export of their class: %s' % (len(bad), '; '.join(bad[:3]))
 
 
-pending('IfaceRow: a mod interface\'s registry row names its class <I>_C, as the game\'s do', registry_rows_name_exports)
+registry_rows_name_exports()
+print('ok  IfaceRow: every registry row names an asset export of its class; a mod interface\'s is <I>_C, as the game\'s are')
 
 
 # ---- OptTest

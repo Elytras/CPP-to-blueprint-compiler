@@ -12922,7 +12922,9 @@ bool FCompiler::GenerateInterface(const FRecord& R, const std::string& OutDir, s
 
     BP.Finish();
     if (!SavePackage(P, OutDir, PackageName, Err)) return false;
-    RegistryRows.push_back({ PackageName, LeafOf(R.CppName), "BlueprintGeneratedClass" });
+    /* The class, `<I>_C`, as a class's row names it and the game's Blueprint interfaces' rows do (TempRocketInterface);
+       their `<I>` row is the editor's Blueprint asset, which a cooked package does not hold. */
+    RegistryRows.push_back({ PackageName, ClassOf(R), "BlueprintGeneratedClass" });
     printf("  %-14s -> %s.uasset  (interface, %d functions)\n", R.CppName.c_str(), Shown(PackageName).c_str(),
            int32(R.Methods.size()));
     return true;
