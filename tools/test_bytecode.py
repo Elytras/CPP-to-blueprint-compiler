@@ -8388,7 +8388,7 @@ def loaded_container(pkg, cdo, name, kind, start, fresh=None):
     no member's tag): what the object held before its tags loaded. That is start for an inherited property, copied from
     the archetype; for the class's own, `fresh` when given: InitNonNativeProperty initialised it (BlueprintSupport.cpp
     2609), so a member of a UE_STRUCT holds the struct's default instance's value (uds_default). TSet<int32> and
-    TMap<FName, int32> only."""
+    TMap<FName, int32>, and the FString kinds container_over reads."""
     path = (name,) if isinstance(name, str) else name
     t = pkg.tag(cdo, path[0])
     for member in path[1:]:
@@ -8412,19 +8412,46 @@ def uds_default(base, member, kind):
     return empty if t is None else container_over(pkg, t, kind, empty, member)
 
 
+def fstring_at(raw, o):
+    """The FString at raw[o:] and the offset past it: a length counting the terminator, negative for UTF-16."""
+    import struct
+    n = struct.unpack_from('<i', raw, o)[0]
+    if n >= 0: return raw[o + 4:o + 4 + max(n - 1, 0)].decode('latin-1'), o + 4 + n
+    return raw[o + 4:o + 4 - 2 * n - 2].decode('utf-16-le'), o + 4 - 2 * n
+
+
 def container_over(pkg, t, kind, start, name):
-    """A TSet<int32> / TMap<FName, int32> tag t of pkg loaded over start, as loaded_container reads it."""
+    """A TSet<int32> / TMap<FName, int32> tag t of pkg loaded over start, as loaded_container reads it. 'strset' and
+    'strmap' are a TSet<FString> and a TMap<FString, int32>, whose keys the engine compares ignoring case (FString's ==
+    and GetTypeHash, Strihash): an element found that way keeps the spelling it holds, a map's taking the new value
+    (FindOrAdd, PropertyMap.cpp 392), a set's skipping the new one (FindElementIndex, PropertySet.cpp 348)."""
     import struct
     raw, o = t['value'], 0
-    out = set(start) if kind == 'set' else dict(start)
+    text = kind in ('strset', 'strmap')
+    out = set(start) if kind in ('set', 'strset') else dict(start)
+
+    def key(o):
+        if text: return fstring_at(raw, o)
+        if kind == 'set': return struct.unpack_from('<i', raw, o)[0], o + 4
+        return fname_at(pkg.names, raw, o), o + 8
+
+    def held(k):
+        return next((h for h in out if h.lower() == k.lower()), None) if text else (k if k in out else None)
     removed = struct.unpack_from('<i', raw, o)[0]; o += 4
     for _ in range(removed):
-        if kind == 'set': out.discard(struct.unpack_from('<i', raw, o)[0]); o += 4
-        else: out.pop(fname_at(pkg.names, raw, o), None); o += 8
+        k, o = key(o)
+        h = held(k)
+        if h is not None:
+            if isinstance(out, set): out.discard(h)
+            else: out.pop(h)
     n = struct.unpack_from('<i', raw, o)[0]; o += 4
     for _ in range(n):
-        if kind == 'set': out.add(struct.unpack_from('<i', raw, o)[0]); o += 4
-        else: out[fname_at(pkg.names, raw, o)] = struct.unpack_from('<i', raw, o + 8)[0]; o += 12
+        k, o = key(o)
+        h = held(k)
+        if isinstance(out, set):
+            if h is None: out.add(k)
+        else:
+            out[k if h is None else h] = struct.unpack_from('<i', raw, o)[0]; o += 4
     assert o == len(raw), (name, raw.hex())
     return out
 
@@ -9279,6 +9306,36 @@ print('ok  AssetMapDupKeys: a key a map\'s braces give twice holds the last valu
       'class\'s CDO and a UE_DEFAULTS\' over its parent\'s')
 
 
+def asset_map_str_case():
+    """An FString key compares without case (FString's == and GetTypeHash), so a key the braces give twice in two
+    spellings is one element, the last pair's spelling and value, as TMap's and TSet's initializer-list constructors Add
+    each element in order and Add replaces the whole element (TSet::Emplace, Set.h 625). AS_AmsDup's
+    {{"a", 5}, {"A", 1}} over UAmsDef's {"A": 1} loads {"A": 1}, its set {"a", "A"} over an empty one {"A"}, and UAmsKid's
+    UE_DEFAULTS gives its CDO {"A": 1}: compared by their bytes, ("a", 5) was written over the CDO's "A", whose value
+    the loader replaced (FindOrAdd ignores case too), and the set loaded the first spelling. A key spelled anew is
+    another element: AS_AmsSpell's {{"a", 1}} lists "A" removed and loads {"a": 1}. An FName key is one element too."""
+    here = os.path.dirname(pending_asset('AssetMapStrCase', 'UAmsDef'))
+    cls = invariants.Package(os.path.join(here, 'UAmsDef'))
+    cdo = cls.find('Default__UAmsDef_C')
+    base_t, base_n = loaded_container(cls, cdo, 'T', 'strmap', {}), loaded_container(cls, cdo, 'N', 'map', {})
+    base_u = loaded_container(cls, cdo, 'U', 'strset', set())
+    assert (base_t, base_u, base_n) == ({'A': 1}, set(), {'a': 1}), (base_t, base_u, base_n)
+    for pkg, row, path, kind, start, want in (
+            ('AS_AmsDup', 'AS_AmsDup', 'T', 'strmap', base_t, {'A': 1}),
+            ('AS_AmsDup', 'AS_AmsDup', 'U', 'strset', base_u, {'A'}),
+            ('AS_AmsDup', 'AS_AmsDup', 'N', 'map', base_n, {'a': 1}),
+            ('AS_AmsSpell', 'AS_AmsSpell', 'T', 'strmap', base_t, {'a': 1}),
+            ('UAmsKid', 'Default__UAmsKid_C', 'T', 'strmap', base_t, {'A': 1})):
+        base = os.path.join(here, pkg)
+        keeps_invariants(base)
+        p = invariants.Package(base)
+        got = loaded_container(p, p.find(row), path, kind, start)
+        assert got == want, '%s loads %s = %s over %s; C++ says %s' % (row, path, got, start, want)
+
+
+pending('AssetMapStrCase', asset_map_str_case)
+
+
 def uds_init_defaults():
     """Every member initializer of a UE_STRUCT is in its default instance, the Data stream the engine copies into each
     new value of the struct (UUserDefinedStruct::InitializeStruct). A member at its type's default may be left out, and
@@ -10117,9 +10174,11 @@ MAP_PATCH_CASES = (('Ids = {7};\n    Score = {{"a", 9}};', {('Ids',): {7}, ('Sco
                     {('Held', 'Ids'): {1, 7}, ('Held', 'Score'): {'a': 1, 'b': 2}, ('Deep', 'In', 'Ids'): {7},
                      ('Deep', 'In', 'Score'): {'c': 3}}),
                    ('Score = {{"a", 9}, {"a", 1}};', {('Score',): {'a': 1}}))
+# An FString key ignores case (FString's == and GetTypeHash): "a" and "A" are one key, the last pair's.
+MAP_PATCH_STR_CASE = (('Text = {{"a", 5}, {"A", 1}};', {('Text',): {'A': 1}}),)
 
 
-def edit_whole_containers():
+def edit_whole_containers(cases=MAP_PATCH_CASES):
     """S38: a patch's whole TSet / TMap is what the edited default object loads. Its tag is a delta against the
     archetype, the parent Blueprint's CDO: the loader copies that value in, takes out the elements the tag lists as
     removed, then adds the rest (PropertySet.cpp 285-358, PropertyMap.cpp 316-400), as for a mod class's own
@@ -10136,19 +10195,22 @@ def edit_whole_containers():
             '  TMap<FName, int32> Score;\n  int32 N;\n};\n'
             'struct FPropSetDeep {\n  UE_STRUCT_IN("/Game/_ElytrasMods/PropSetDelta");\n  FPropSetHeld In;\n  int32 M;\n};\n'
             'class PropSetBase : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/PropSetDelta/PropSetBase", "PropSetBase_C");\n'
-            '  TSet<int32> Ids;\n  TMap<FName, int32> Score;\n  FPropSetHeld Held;\n  FPropSetDeep Deep;\n};\n'
+            '  TSet<int32> Ids;\n  TMap<FName, int32> Score;\n  FPropSetHeld Held;\n  FPropSetDeep Deep;\n'
+            '  TMap<FString, int32> Text;\n};\n'
             'class PropSetDelta : public PropSetBase {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/PropSetDelta/PropSetDelta", "PropSetDelta_C");\n};\n')
-    paths = (('Ids',), ('Score',), ('Held', 'Ids'), ('Held', 'Score'), ('Deep', 'In', 'Ids'), ('Deep', 'In', 'Score'))
+    paths = (('Ids',), ('Score',), ('Held', 'Ids'), ('Held', 'Score'), ('Deep', 'In', 'Ids'), ('Deep', 'In', 'Score'),
+             ('Text',))
     parent = invariants.Package(os.path.join(game, '_ElytrasMods', 'PropSetDelta', 'PropSetBase'))
     pc = parent.find('Default__PropSetBase_C')
 
     def loads(child):
         cc = child.find('Default__PropSetDelta_C')
-        kinds = {p: 'set' if p[-1] == 'Ids' else 'map' for p in paths}
+        kinds = {p: 'set' if p[-1] == 'Ids' else 'strmap' if p[-1] == 'Text' else 'map' for p in paths}
         return {p: loaded_container(child, cc, p, kinds[p], loaded_container(parent, pc, p, kinds[p], set() if kinds[p] == 'set' else {}))
                 for p in paths}
     vanilla = loads(invariants.Package(os.path.join(game, '_ElytrasMods', 'PropSetDelta', 'PropSetDelta')))
-    for body, assigned in MAP_PATCH_CASES:
+    assert vanilla[('Text',)] == {'A': 1}, vanilla
+    for body, assigned in cases:
         with tempfile.TemporaryDirectory() as tmp:
             proc, content = compile_edit(tmp, 'MapPatch', EDIT_HEAD + 'UE_MOD_PACKAGE("/Game/_ElytrasMods/MapPatch");\n' + decl
                                          + 'class Tweaks : public PropSetDelta {\n  UE_PATCH;\n'
@@ -10401,6 +10463,7 @@ if not globals().get('EDITS_EXPLORE'):     # set by the dev loop's exploration d
     print('ok  MapPatch: a patch\'s whole TSet / TMap loads as written, a property or one inside a struct (by a member '
           'path or in a whole struct): the archetype\'s elements it drops are listed as removed; a key given twice '
           'holds its last value')
+    pending('MapPatchStrCase', lambda: edit_whole_containers(MAP_PATCH_STR_CASE))
 
 
 PREFETCH.finish()
