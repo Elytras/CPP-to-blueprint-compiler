@@ -7319,6 +7319,58 @@ def delegate_parm_sig():
     assert vm.self.vars['Var'] == ping, vm.self.vars
 
 
+def delegate_parm_spell():
+    """One delegate type spelled two ways is one type (DelegateParmSpell): DelegateParmSpellTop spells it
+    TDelegate<void(int32)>, the overrides of Use and Take's out-of-line definition TDelegate<void(int)>, as does the
+    operator= clang declares for `Held = D`, which compiles. Top makes one signature function for it, which its variable,
+    its functions' parameters, the overrides' parameters (DelegateParmSpell is generated before Top, DelegateParmSpellZKid
+    after) and the values handed to Take all name, the subclasses importing it from a Top that exports it
+    (keeps_invariants: imports_resolve, func_override_params). A value bound on another object and assigned to a variable
+    through another object is typed with that variable's signature: Top's Held through Peer and through GetPeer(), the
+    sibling's SibVar through S. Neither subclass makes a signature of its own. Each value reaches where it goes, and the
+    one stored through GetPeer() binds the H it had before GetPeer replaced it, as C++ sequences the right side first."""
+    base = pending_asset('DelegateParmSpell')
+    here = os.path.dirname(base)
+    top, zkid, sib = (os.path.join(here, c) for c in ('DelegateParmSpellTop', 'DelegateParmSpellZKid', 'DelegateParmSpellSib'))
+    for b in (base, top, zkid, sib):
+        keeps_invariants(b)
+    mine, theirs, sibs, zs = delegate_sigs(base), delegate_sigs(top), delegate_sigs(sib), delegate_sigs(zkid)
+    held, sibvar = theirs[('DelegateParmSpellTop_C', 'Held')], sibs[('DelegateParmSpellSib_C', 'SibVar')]
+    assert {theirs[('Use', 'D')], theirs[('Take', 'T')]} == {held}, theirs
+    assert [e for e in exports_of(top) if e.endswith('__DelegateSignature')] == [held.rsplit(':', 1)[1]], exports_of(top)
+    want = {('Use', 'D'): held, ('CallTake', None): {held}, ('SetPeer', None): {held}, ('SetGotPeer', None): {held},
+            ('SetSib', None): {sibvar}}
+    assert {k: mine.get(k) for k in want} == want, (mine, want)
+    want = {('Use', 'D'): held, ('CallTake', None): {held}, ('SetPeer', None): {held}}
+    assert {k: zs.get(k) for k in want} == want, (zs, want)
+    for b in (base, zkid):
+        assert not [e for e in exports_of(b) if e.endswith('__DelegateSignature')], (os.path.basename(b), exports_of(b))
+    h, h2 = Obj('DelegateParmSpellHelper_C', Got=0), Obj('DelegateParmSpellHelper_C', Got=0)
+    s, peer = Obj('DelegateParmSpellSib_C'), Obj('DelegateParmSpellTop_C')
+    ping = ('delegate', 'PingI', h)
+    vm = VM(top, {})
+    vm.call('Take', ping)
+    assert vm.self.vars['Held'] == ping, vm.self.vars
+    vm = VM(base, {})
+    vm.self.vars.update(H=h, H2=h2, S=s, Peer=peer)
+    vm.call('Use', ping)
+    assert vm.self.vars['Held'] == ping, vm.self.vars
+    for fn in ('CallTake', 'SetPeer', 'SetSib'):
+        vm.call(fn)
+    assert [(n, c, a) for n, c, a in vm.log if n == 'Take'] == [('Take', vm.self, [ping])], vm.log
+    assert peer.vars['Held'] == ping and s.vars['SibVar'] == ping, (peer.vars, s.vars)
+    peer.vars.clear()
+    vm.call('SetGotPeer')
+    assert peer.vars['Held'] == ping and vm.self.vars['H'] is h2, (peer.vars, vm.self.vars)
+    peer.vars.clear()
+    vm = VM(zkid, {})
+    vm.self.vars.update(H=h, Peer=peer)
+    vm.call('CallTake')
+    vm.call('SetPeer')
+    assert [(n, c, a) for n, c, a in vm.log if n == 'Take'] == [('Take', peer, [ping])], vm.log
+    assert peer.vars['Held'] == ping, peer.vars
+
+
 def dispatch_native_callable():
     """A native dispatcher the engine marks BlueprintCallable (AFSDGameState::OnTerrainGenerated, one of FSD's 41) is
     one the editor's Call node takes. UeApi does not say which signature function it names (the dump does not link a
@@ -7381,6 +7433,8 @@ print('ok  delegate not-callable refusals: OnRep_Instigator, which UeApi\'s NotC
 delegate_parm_sig()
 print('ok  DelegateParmSig: an override\'s TDelegate parameter, and a value handed to a mod parent\'s, a sibling\'s or a '
       'parent\'s variable, name the declaring class\'s signature, imported, and still reach where they go')
+pending('DelegateParmSpell: a delegate type spelled with int32 and with int is one signature function, and a value set '
+        'through another object names its variable\'s', delegate_parm_spell)
 dispatch_native_callable()
 native_dispatcher_refusals()
 print('ok  native dispatchers: Broadcast on a BlueprintCallable one names a signature of the class\'s own with its '
