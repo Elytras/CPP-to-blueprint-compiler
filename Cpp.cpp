@@ -1967,6 +1967,7 @@ private:
     /* Whether Generate cooks A's Method FUNC_Final: A or the method is `final`, and it replaces no function (FindEvent),
        whose flags it would take instead. */
     bool IsFinalFunction(const FRecord& A, const std::string& Method) const;
+    bool IsNativeEvent(const FRecord& A, const std::string& Method) const;
     /* The definition a call (Call, to the declaration clang picked, Picked) to In's Method may be expanded from in
        place of the call, or null. See LowerCall. */
     const Json* Expandable(const FRecord& In, const std::string& Method, const Json& Call, const Json* Picked) const;
@@ -8607,7 +8608,12 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
            form routes them too. */
         const bool bImportedScript = R->IsNative() && R->UePackage.compare(0, 6, "/Game/") == 0 && !Out.bReceiverIsArg
                                   && !bNamesQualified && !IsFinalFunction(*R, MethodName);
-        if ((!R->IsNative() || bImportedScript) && !bStatic && !bParentCall && !Bound)
+        /* A native BlueprintEvent is overridden by script: EX_FinalFunction on the engine's UFunction runs its thunk, which
+           for a BlueprintNativeEvent calls _Implementation straight (UHT's execFoo) and for an implementable one is empty,
+           so a subclass's override would never run. The editor calls it by name (backend 1222, 1253-1282); a qualified
+           or parent call stays final. */
+        const bool bNativeEvent = !bStatic && !bParentCall && !bNamesQualified && !Out.bReceiverIsArg && IsNativeEvent(*R, MethodName);
+        if ((!R->IsNative() || bImportedScript || bNativeEvent) && !bStatic && !bParentCall && !Bound)
             Out.VirtualName = UeNameOf(R, MethodName);      // an override of `Set is Extruded` is found by that name
         Out.bLocal = (!Out.VirtualName.empty() || Bound) && bLocal;
         /* A call whose one body is known here - bound on `this`, a parent's, or a static of this mod - is that body,
@@ -12161,6 +12167,15 @@ bool FCompiler::IsFinalFunction(const FRecord& A, const std::string& Method) con
             if (const FRecord* IR = Find(I); IR && IR->IsNative() && IR->Methods.count(Method)) return false;
     }
     return true;
+}
+
+/* Whether A's Method is a native BlueprintEvent (a BlueprintImplementableEvent or BlueprintNativeEvent of an engine class,
+   Events.json), which a Blueprint subclass may override. */
+bool FCompiler::IsNativeEvent(const FRecord& A, const std::string& Method) const
+{
+    if (A.UePackage.compare(0, 8, "/Script/") != 0 || !A.Methods.count(Method)) return false;
+    const auto It = EventFlags.find(A.UePackage.substr(A.UePackage.rfind('/') + 1) + "." + A.UeName + "." + UeNameOf(&A, Method));
+    return It != EventFlags.end() && (It->second & FUNC_BlueprintEvent) && !(It->second & FUNC_Final);
 }
 
 /* Every call whose body is known here expands, unless: the function is not a Blueprint function of this mod with a
