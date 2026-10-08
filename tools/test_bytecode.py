@@ -11024,6 +11024,20 @@ delegate_return()
 print('ok  DelegateReturn: a function returning a TDelegate returns the delegate, with or without parameters')
 
 
+def delegate_return_override():
+    """An override of a function returning a TDelegate has its parent's signature function on its ReturnValue, as a
+    parameter has (func_override_params), and a call through the parent's pointer reaches the override. DelegateReturnKid's
+    DrkKid::Get returns OnTimer bound on this; DrkUser::Use hands what Other->Get() returns to a timer."""
+    base = pending_asset('DelegateReturnKid', 'DrkKid')
+    keeps_invariants(base)
+    here = os.path.dirname(base)
+    keeps_invariants(os.path.join(here, 'DrkBase'))
+    keeps_invariants(os.path.join(here, 'DrkUser'))
+
+
+pending('DelegateReturnOverride', delegate_return_override)
+
+
 PREFETCH.finish()
 print('ok  %d known gaps, each a failing test of something AssetGen does not do yet' % len(GAPS))
 assert not FIXED, 'these pass now, move them in with the others: ' + ', '.join(FIXED)
