@@ -512,6 +512,8 @@ Notes:
 | <a id="names.class-gr-e-public-aactor"></a>`class Größe : public AActor { FName Umlaut = "Größe"; };` | Non-ASCII class, member and asset names, and non-ASCII name and string defaults, are cooked and registered correctly. | Yes |
 | <a id="names.using-ftarget-aactor"></a>`using FTarget = AActor;`, then `FTarget *Aimed;` | An alias of a UObject class is still an object reference, not an address. It works at namespace scope and at class scope. | Yes |
 | <a id="names.using-fmoods-tarray-emood"></a>`using FMoods = TArray<EMood>;`, `using Factory = TScriptInterface<IFoo>;` | A global alias of a template type is that type wherever it is used, in out-of-line method definitions too. A global alias of a class is that class the same way, so an override may spell a parameter through it. | Yes |
+| <a id="names.using-emodealias-emode"></a>`using EModeAlias = EMode;`, `typedef EMode EModeAlias;` at namespace scope | A global alias of an enum is that enum wherever it is used. | Yes |
+| <a id="names.emode-m"></a>`::EMode M;`, `TArray<::FPair> Pairs;`, `(::int32)X` | A type spelled from the global namespace is that type: the leading `::` is dropped. | Yes |
 | <a id="names.using-grapple-game-weaponsntools"></a>`using Grapple = Game::WeaponsNTools::GrapplingGun::WPN_GrapplingGun_C;` | An alias to a game class's full `Game::` path. The SDK gives a game class a short name at global scope only when no other game package has a class of that name. For one that does, write such an alias. | Yes |
 
 ```cpp
@@ -2005,6 +2007,7 @@ Notes:
 | You write | What it does | Status |
 |---|---|---|
 | <a id="other-declarations.using-t-int32-t-a"></a>`using T = int32; T A = X;`, `typedef TArray<T> FList;` | An alias declared inside a function means its type from the declaration to the end of the block holding it, as in C++. The alias itself compiles to nothing. | Yes |
+| <a id="other-declarations.auto-twice-int32-v-const"></a>`auto Twice(int32 V) const -> int32` | A trailing return type is the function's return type, as the leading spelling is. | Yes |
 | <a id="other-declarations.auto-a-b-point"></a>`auto [A, B] = Point;` | Refused outside a TMap range-for ("a declaration statement declares nothing usable"). Read the members: `int32 A = Point.X;`. | Refused |
 | <a id="other-declarations.auto-inc-int32-v-return"></a>`auto Inc = [](int32 V) { return V + 1; };` | A lambda is refused; see [Functions](#functions). | Refused |
 

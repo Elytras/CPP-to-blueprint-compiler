@@ -14867,6 +14867,38 @@ delegate_return_override()
 print('ok  DelegateReturnKid: an override'+chr(39)+'s TDelegate return value names its parent'+chr(39)+'s signature function')
 
 
+def global_scope_types():
+    """A type spelled from the global namespace is the type: GlobalScope's `::EGsMode`, `::FGsPair`, `::int32` and
+    `::TArray<::FGsPair>` members and parameters, and Body's casts and locals, cook as their unqualified spellings do."""
+    base = asset('GlobalScope')
+    keeps_invariants(base)
+    vm = VM(base, {}, N=3, L=[])
+    assert vm.call('Twice', In=5) == 15 and vm.call('Pick', In=2) == 2
+    assert vm.call('Which', I=5) == 2 and vm.call('Which', I=0) == 0
+    assert vm.call('Count') == 2
+
+
+proves('names.emode-m')
+global_scope_types()
+print('ok  GlobalScope: a type spelled from the global namespace (::EMode, ::int32, TArray<::FPair>) cooks as its plain spelling does')
+
+
+def spelling_forms():
+    """A global alias of an enum cooks as the enum, a trailing return type is the function's return type, and
+    FString::Len() on a parameter and on a member is the string's length."""
+    base = asset('SpellingForms')
+    keeps_invariants(base)
+    vm = VM(base, {}, Mem='abc')
+    assert vm.call('Flip', In=0) == 1 and vm.call('Flip', In=1) == 0
+    assert vm.call('Twice', V=5) == 10 and vm.call('Half', V=5.0) == 2.5
+    assert vm.call('LenOf', In='hello') == 5 and vm.call('LenMem') == 3
+
+
+proves('names.using-emodealias-emode', 'other-declarations.auto-twice-int32-v-const')
+spelling_forms()
+print('ok  SpellingForms: an enum alias, a trailing return type and FString::Len() cook as their plain spellings do')
+
+
 PREFETCH.finish()
 print('ok  %d known gaps, each a failing test of something AssetGen does not do yet' % len(GAPS))
 assert not FIXED, 'these pass now, move them in with the others: ' + ', '.join(FIXED)
