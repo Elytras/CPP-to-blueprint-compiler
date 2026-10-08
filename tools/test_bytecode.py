@@ -14780,6 +14780,24 @@ asset_import_dropped()
 print('ok  AssetImportDropped: an element an asset'+chr(39)+'s braces share with its class'+chr(39)+'s default object leaves no import of its own')
 
 
+def const_cast():
+    """A cast over a constant is folded: a consteval call's answer under any spelling of cast, and a uint64 literal past
+    INT64_MAX cast to a float (its unsigned value, not the low 32 bits of the int64). ConstCast's Whole is -16 (the
+    bits), Word 4000000000, Static 4000000001, Local -16, Wide and WideVar the float C++ gives."""
+    import struct
+    base = asset('ConstCast')
+    f32 = lambda v: struct.unpack('<f', struct.pack('<f', v))[0]
+    for fn, parms, want in (('Whole', {}, -16), ('Word', {}, 4000000000), ('Static', {}, 4000000001), ('Local', {}, -16),
+                            ('Wide', {}, f32(1.8446744073709552e19)), ('WideVar', dict(Y=1.0), f32(1.0 + f32(2.0**63)))):
+        got = run(base, fn, **parms)[0]
+        assert got == want, 'ConstCast.%s() = %r, C++ says %r' % (fn, got, want)
+
+
+const_cast()
+print('ok  ConstCast: a cast over a consteval call folds, whatever its spelling, and a uint64 literal past INT64_MAX cast to a float is its unsigned value')
+proves('constant-folding.int64-ccbig')
+
+
 PREFETCH.finish()
 print('ok  %d known gaps, each a failing test of something AssetGen does not do yet' % len(GAPS))
 assert not FIXED, 'these pass now, move them in with the others: ' + ', '.join(FIXED)
