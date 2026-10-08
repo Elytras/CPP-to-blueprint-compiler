@@ -187,7 +187,8 @@ bool IsUnsetInit(const Json& E)
 
 /* Every type spelling under N with the aliases in scope written out. clang spells a use as the source did, and a
    class-scope alias means what it says only inside that class and the ones deriving it - so it is expanded there,
-   once, before anything reads a type. A name already qualified (`A::Leaf`) is left alone. */
+   once, before anything reads a type. A name already qualified (`A::Leaf`) is left alone. A `::` that starts a name
+   (`::EMode`, `TArray<::FPair>`) is the global scope, which is where a mod's types are named from: it is dropped. */
 void ExpandAliases(Json& N, const std::map<std::string, std::string>& InScope)
 {
     if (!N.is_structured()) return;
@@ -198,6 +199,12 @@ void ExpandAliases(Json& N, const std::map<std::string, std::string>& InScope)
         std::string Out;
         for (size_t I = 0; I < Q.size();)
         {
+            if (Q.compare(I, 2, "::") == 0 && (Out.empty() || !(std::isalnum(uint8(Out.back())) || Out.back() == '_' || Out.back() == '>')))
+            {
+                I += 2;
+                if (Out.size() >= 2 && Out.back() == ' ' && Out[Out.size() - 2] == '<') Out.pop_back();   // clang spells `<::` as `< ::`
+                continue;
+            }
             if (!std::isalpha(uint8(Q[I])) && Q[I] != '_') { Out += Q[I++]; continue; }
             size_t E = I;
             while (E < Q.size() && (std::isalnum(uint8(Q[E])) || Q[E] == '_')) ++E;
@@ -2753,6 +2760,10 @@ bool FCompiler::Collect(std::string* Err)
                 });
         };
         ForEach(N, Member);
+        /* FString::Len is written out in Types.h (genueapi leaves the name to it), so no Methods_FString.inc marker
+           names the library function that does it: UKismetStringLibrary::Len(S). */
+        if (R.CppName == "FString" && R.Methods.count("Len") && !R.Forwards.count("Len"))
+            R.Forwards["Len"] = "UKismetStringLibrary::Len";
         /* A set is looked up in Replicated by the name it is cooked under, so the marker's C++ key follows. */
         for (const auto& N2 : R.UeNames)
             if (auto Rep = R.Replicated.find(N2.first); Rep != R.Replicated.end())
@@ -2786,8 +2797,8 @@ bool FCompiler::Collect(std::string* Err)
        lowering reads those spellings. */
     std::map<std::string, std::string> Expand;
     for (const auto& [A, T] : GlobalAliases)
-        if (T.find('<') != std::string::npos || Records.count(StripTypeKeywords(T))) Expand[A] = T;
-    if (!Expand.empty()) ExpandAliases(const_cast<Json&>(Doc), Expand);
+        if (T.find('<') != std::string::npos || Records.count(StripTypeKeywords(T)) || EnumDecls.count(StripTypeKeywords(T))) Expand[A] = T;
+    ExpandAliases(const_cast<Json&>(Doc), Expand);   // with none to expand it still drops a global `::`
     /* UE_FINAL_AS: the leaf's base is final in all but name. Its own code runs only on the leaf, which brings nothing
        of its own, so the base is compiled as `final` (FinalOwner, FUNC_Final) and cooked Abstract; a second subclass,
        here or in a mod that includes the header, would break that, so it is refused. */
@@ -3021,14 +3032,24 @@ FIndex FCompiler::FindEvent(FBlueprintClass& BP, const std::string& FromRecord, 
 }
 
 /* The return part of a function type, `int32` of `int32 (int32) const` and `TDelegate<void ()>` of `TDelegate<void ()> ()`:
-   up to the '(' that opens the parameter list, the first outside the angle brackets of a template argument. */
+   up to the '(' that opens the parameter list, the first outside the angle brackets of a template argument. A trailing
+   return, `auto (int32) const -> int32`, is what follows the arrow. */
 static std::string ReturnPartOf(const std::string& FnType)
 {
     int32 Depth = 0;
     for (size_t I = 0; I < FnType.size(); ++I)
         if (FnType[I] == '<') ++Depth;
         else if (FnType[I] == '>') --Depth;
-        else if (FnType[I] == '(' && Depth <= 0) return FnType.substr(0, I);
+        else if (FnType[I] == '(' && Depth <= 0)
+        {
+            std::string Head = FnType.substr(0, I);
+            while (!Head.empty() && Head.back() == ' ') Head.pop_back();
+            const size_t Arrow = FnType.rfind("->");
+            if (Head != "auto" || Arrow == std::string::npos || Arrow < I) return FnType.substr(0, I);
+            std::string Tail = FnType.substr(Arrow + 2);
+            Tail.erase(0, Tail.find_first_not_of(' '));
+            return Tail;
+        }
     return FnType;
 }
 
