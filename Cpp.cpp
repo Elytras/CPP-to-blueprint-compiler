@@ -4811,6 +4811,13 @@ bool FCompiler::HoistOperand(FArgIR& Operand, FBlueprintClass& BP, std::vector<F
     return true;
 }
 
+/* A cast of any spelling, or parentheses: what a consteval call's answer can sit under (LowerArg). */
+static bool IsCastOrParen(const Json& N)
+{
+    const std::string K = Kind(N);
+    return K == "ImplicitCastExpr" || K == "CStyleCastExpr" || K == "CXXStaticCastExpr" || K == "CXXFunctionalCastExpr" || K == "ParenExpr";
+}
+
 /* The outer (pre-Strip) type is the slot the value lands in; a string-kind mismatch against the
    value's own type becomes a Kismet conversion, so `FName n = Str + Count` just works. */
 bool FCompiler::LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, std::string* Err)
@@ -4826,7 +4833,7 @@ bool FCompiler::LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, 
             && ConvertArg(OuterType, BP, Out, Err);
     }
     /* A consteval call: clang ran it and left the answer on the ConstantExpr around it, which Strip would drop. */
-    for (const Json* W = &ArgNode; W; W = Kind(*W) == "ImplicitCastExpr" || Kind(*W) == "ParenExpr" ? First(*W) : nullptr)
+    for (const Json* W = &ArgNode; W; W = IsCastOrParen(*W) ? First(*W) : nullptr)
         if (FConstVal V; Kind(*W) == "ConstantExpr" && W->contains("value") && FoldConst(ArgNode, V) && ConstToArg(V, OuterType, Out))
             return true;
     /* Strip peels every cast, but one that changes the value - to bool, to a narrower integer, float to integer - must
@@ -4849,6 +4856,10 @@ bool FCompiler::LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, 
     /* Arithmetic, a comparison or logic over constants is the constant it comes to: no Kismet call left to run. */
     if (const std::string K = Kind(*N); !bCurNoOpt && (K == "BinaryOperator" || K == "ConditionalOperator"
         || (K == "UnaryOperator" && N->value("opcode", std::string()).find_first_of("&*+") == std::string::npos)))
+        if (FConstVal V; FoldConst(ArgNode, V) && ConstToArg(V, OuterType, Out)) return true;
+    /* A uint64 literal past INT64_MAX under a cast to a float: there is no int64-to-float in UE 4.27, which would keep the
+       low 32 bits, so the constant is converted here. */
+    if (N != &ArgNode && Kind(*N) == "IntegerLiteral" && IsUnsigned64Type(StripTypeKeywords(TypeOf(*N))))
         if (FConstVal V; FoldConst(ArgNode, V) && ConstToArg(V, OuterType, Out)) return true;
     if (!LowerArgRaw(*N, OuterType, BP, Out, Err)) return false;
     if (Out.InnerType.empty()) Out.InnerType = TypeOf(*N);
@@ -11949,7 +11960,17 @@ bool FCompiler::FoldConst(const Json& E, FConstVal& Out) const
         return FoldConst(*First(E), Out) && Fit(Out);
     }
     if (K == "ImplicitCastExpr" || K == "CStyleCastExpr" || K == "CXXStaticCastExpr" || K == "CXXFunctionalCastExpr")
-        return First(E) && FoldConst(*First(E), Out) && Fit(Out);
+    {
+        if (!First(E) || !FoldConst(*First(E), Out)) return false;
+        /* A uint64 past INT64_MAX is a negative int64 here; as a float it is its unsigned value. */
+        if (const std::string To = StripTypeKeywords(TypeOf(E));
+            !Out.bFloat && Out.I < 0 && IsUnsigned64Type(StripTypeKeywords(TypeOf(*First(E)))) && (To == "float" || To == "double"))
+        {
+            Out.F = double(uint64(Out.I));
+            Out.bFloat = true;
+        }
+        return Fit(Out);
+    }
     if (K == "DeclRefExpr" && E.contains("referencedDecl"))
     {
         const std::string Id = E["referencedDecl"].value("id", std::string());

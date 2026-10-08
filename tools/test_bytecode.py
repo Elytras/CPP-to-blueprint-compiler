@@ -10963,7 +10963,7 @@ def const_cast():
     INT64_MAX cast to a float (its unsigned value, not the low 32 bits of the int64). ConstCast's Whole is -16 (the
     bits), Word 4000000000, Static 4000000001, Local -16, Wide and WideVar the float C++ gives."""
     import struct
-    base = pending_asset('ConstCast')
+    base = asset('ConstCast')
     f32 = lambda v: struct.unpack('<f', struct.pack('<f', v))[0]
     for fn, parms, want in (('Whole', {}, -16), ('Word', {}, 4000000000), ('Static', {}, 4000000001), ('Local', {}, -16),
                             ('Wide', {}, f32(1.8446744073709552e19)), ('WideVar', dict(Y=1.0), f32(1.0 + f32(2.0**63)))):
@@ -10971,7 +10971,8 @@ def const_cast():
         assert got == want, 'ConstCast.%s() = %r, C++ says %r' % (fn, got, want)
 
 
-pending('ConstCast', const_cast)
+const_cast()
+print('ok  ConstCast: a cast over a consteval call folds, whatever its spelling, and a uint64 literal past INT64_MAX cast to a float is its unsigned value')
 
 
 PREFETCH.finish()
