@@ -3947,6 +3947,18 @@ FIndex FCompiler::FindEvent(FBlueprintClass& BP, const std::string& FromRecord, 
     return Null();      // not an override
 }
 
+/* The return part of a function type, `int32` of `int32 (int32) const` and `TDelegate<void ()>` of `TDelegate<void ()> ()`:
+   up to the '(' that opens the parameter list, the first outside the angle brackets of a template argument. */
+static std::string ReturnPartOf(const std::string& FnType)
+{
+    int32 Depth = 0;
+    for (size_t I = 0; I < FnType.size(); ++I)
+        if (FnType[I] == '<') ++Depth;
+        else if (FnType[I] == '>') --Depth;
+        else if (FnType[I] == '(' && Depth <= 0) return FnType.substr(0, I);
+    return FnType;
+}
+
 /* A node's type with every typedef and alias resolved, as clang's canonical type spells it. */
 std::string DesugaredTypeOf(const Json& N)
 {
@@ -4041,7 +4053,7 @@ std::vector<std::string> FCompiler::SignatureOf(const Json& Fn) const
         return T;
     };
     const std::string FnType = DesugaredTypeOf(Fn);
-    std::vector<std::string> Out{ Norm(FnType.substr(0, FnType.find('(')), false) };
+    std::vector<std::string> Out{ Norm(ReturnPartOf(FnType), false) };
     ForEach(Fn, [&](const Json& C) { if (Kind(C) == "ParmVarDecl") Out.push_back(Norm(DesugaredTypeOf(C), true)); });
     return Out;
 }
@@ -8356,7 +8368,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
                 if (auto M = A->Methods.find(Target); M != A->Methods.end()) { Found = M->second; In = A; }
             /* The engine's test is ParmsSize > 0, and a return value is a parameter there too. */
             std::string Ret = Found ? TypeOf(*Found) : std::string();
-            Ret = Ret.substr(0, Ret.find('('));
+            Ret = ReturnPartOf(Ret);
             while (!Ret.empty() && Ret.back() == ' ') Ret.pop_back();
             const char* Why = !Found ? "names no function of the class"
                             : IsInlineMethod(*In, Target) ? "names an inline method, which is no function of the class"
@@ -8496,7 +8508,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         if (FullDecl && IsSingleNative(*R))
         {
             std::string Ret = TypeOf(*FullDecl);
-            Ret = Ret.substr(0, Ret.find('('));
+            Ret = ReturnPartOf(Ret);
             while (!Ret.empty() && Ret.back() == ' ') Ret.pop_back();
             Out.bSingleResult = StripTypeKeywords(Ret) == "float";
         }
@@ -11642,7 +11654,7 @@ bool FCompiler::AddInputBindings(const FRecord& R, bool bIsActor, FBlueprintClas
             return Refuse("on an inline method, which is expanded where it is called, no function for the input to call; drop inline");
         if (!CompilesMethod(R, M.Method)) return Refuse("on a method with no body, no function for the input to call");
         std::string Ret = TypeOf(*M.Decl);
-        Ret = Ret.substr(0, Ret.find('('));
+        Ret = ReturnPartOf(Ret);
         while (!Ret.empty() && Ret.back() == ' ') Ret.pop_back();
         if (Ret != "void") return Refuse("on a method returning " + Ret + ": the engine passes the key alone, with no room for a result; return void");
         const size_t NumParms = ParmNames(*M.Decl).size();
@@ -11960,7 +11972,7 @@ bool FCompiler::AddTimelines(const FRecord& R, bool bIsActor, FBlueprintClass& B
             return Refuse("on an inline method, which is expanded where it is called, no function for the timeline to call; drop inline");
         if (!CompilesMethod(R, M.Method)) return Refuse("on a method with no body, no function for the timeline to call");
         std::string Ret = TypeOf(*M.Decl);
-        Ret = Ret.substr(0, Ret.find('('));
+        Ret = ReturnPartOf(Ret);
         while (!Ret.empty() && Ret.back() == ' ') Ret.pop_back();
         if (Ret != "void") return Refuse("on a method returning " + Ret + ": the engine calls it with nothing and takes nothing back; return void");
         if (const size_t NumParms = ParmNames(*M.Decl).size(); NumParms > 0)
@@ -12431,7 +12443,7 @@ void FCompiler::SynthesizeForwarders()
                 if (const Json T = NearDecl.value("type", Json::object()); T.contains(Field))
                 {
                     std::string S = T[Field].get<std::string>();
-                    S = S.substr(0, S.find('('));
+                    S = ReturnPartOf(S);
                     while (!S.empty() && S.back() == ' ') S.pop_back();
                     RetType[Field] = S;
                 }
@@ -12712,7 +12724,7 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
     Rename(*Body);
 
     std::string RetType = Def["type"].value("qualType", std::string());
-    RetType = RetType.substr(0, RetType.find('('));
+    RetType = ReturnPartOf(RetType);
     while (!RetType.empty() && (RetType.back() == ' ' || RetType.back() == '&')) RetType.pop_back();
     RetType = StripTypeKeywords(RetType);
     const bool bValue = !RetType.empty() && RetType != "void";
@@ -16874,8 +16886,7 @@ bool FCompiler::GenerateInterface(const FRecord& R, const std::string& OutDir, s
         if (!LowerParams(*Entry.second, Entry.first, BP, Params, Err)) return false;
 
         const std::string FnQual = (*Entry.second)["type"].value("qualType", std::string());
-        const size_t LParen = FnQual.find('(');
-        std::string RetType = LParen == std::string::npos ? FnQual : FnQual.substr(0, LParen);
+        std::string RetType = ReturnPartOf(FnQual);
         while (!RetType.empty() && (RetType.back() == ' ' || RetType.back() == '\t')) RetType.pop_back();
         if (!RetType.empty() && RetType != "void")
         {
@@ -20711,8 +20722,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         const std::string FnQual = M["type"].value("qualType", std::string());
         std::string RetType;
         {
-            const size_t LParen = FnQual.find('(');
-            RetType = LParen == std::string::npos ? FnQual : FnQual.substr(0, LParen);
+            RetType = ReturnPartOf(FnQual);
             while (!RetType.empty() && (RetType.back() == ' ' || RetType.back() == '\t'))
                 RetType.pop_back();
         }

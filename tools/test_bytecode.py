@@ -14826,6 +14826,29 @@ patch_import_kept()
 print('ok  PatchImportKept: a patch'+chr(39)+'s delta imports only what it writes: an element it shares with the archetype leaves no import')
 
 
+def delegate_return():
+    """A function returning a TDelegate: its ReturnValue is a DelegateProperty naming a delegate signature function
+    (keeps_invariants), and what a caller gets is the delegate the function returns. DelegateReturn's Make returns OnTimer
+    bound on this, Get the stored one (what Use hands K2_SetTimerDelegate after Arm); GetSink returns a delegate with a
+    parameter."""
+    base = asset('DelegateReturn')
+    keeps_invariants(base)
+    vm = VM(base, {}, Fired=0)
+    bound = ('delegate', 'OnTimer', vm.self)
+    assert vm.call('Make') == bound, vm.call('Make')
+    vm.call('Arm')
+    assert vm.call('Get') == bound, vm.call('Get')
+    vm.call('Use')
+    calls = [(n, a) for n, c, a in vm.log if n == 'K2_SetTimerDelegate']
+    assert calls == [('K2_SetTimerDelegate', [bound, 1.0, False, 0.0, 0.0])], calls
+    assert vm.call('GetSink') == ('delegate', 'OnInt', vm.self), vm.call('GetSink')
+
+
+proves('delegate-values.tdelegate-void-make-return-this')
+delegate_return()
+print('ok  DelegateReturn: a function returning a TDelegate returns the delegate, with or without parameters')
+
+
 PREFETCH.finish()
 print('ok  %d known gaps, each a failing test of something AssetGen does not do yet' % len(GAPS))
 assert not FIXED, 'these pass now, move them in with the others: ' + ', '.join(FIXED)
