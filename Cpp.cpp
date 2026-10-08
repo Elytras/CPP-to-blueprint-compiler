@@ -1896,6 +1896,12 @@ private:
        or a class's this compile does not generate. The type is that class's own declaration's. */
     bool ImportedParamSignature(const FRecord& Owner, const std::string& Method, size_t Index, FBlueprintClass& BP,
                                 FIndex* Sig);
+    /* The same for Method's return value: an override's is its parent's, the first mod class above that declares it. */
+    bool ImportedReturnSignature(const FRecord& Owner, const std::string& Method, FBlueprintClass& BP, FIndex* Sig);
+    /* The mod class that declares Method first up from Owner (Owner itself when none above does), or null when it is the
+       class being built, native, not generated here, a struct or interface, inline, or never compiled: the class whose
+       signature functions an override's delegate parameter or return value names. */
+    const FRecord* SignatureDeclarer(const FRecord& Owner, const std::string& Method) const;
     /* The same for the TDelegate variable Field a class declares, or with bElement for an element of its TArray or a
        value of its TMap: its signature function there, when another mod class's. */
     bool ImportedFieldSignature(const FRecord& Owner, const std::string& Field, bool bElement, FBlueprintClass& BP,
@@ -16565,8 +16571,7 @@ std::string FCompiler::SignatureName(const FRecord& In, const std::string& Type,
    mod's parameter names a signature UeApi does not, and the class keeps its own there. The type is the declaring
    class's own parameter's, from the declaration its Generate lowers (Fn.Def: the out-of-line definition, else the one in
    the class), never the asker's spelling of it (ForeignSignature). */
-bool FCompiler::ImportedParamSignature(const FRecord& Owner, const std::string& Method, size_t Index, FBlueprintClass& BP,
-                                       FIndex* Sig)
+const FRecord* FCompiler::SignatureDeclarer(const FRecord& Owner, const std::string& Method) const
 {
     const FRecord* D = &Owner;
     for (const FRecord* A = Owner.Base.empty() ? nullptr : Find(Owner.Base); A && !A->IsNative() && !A->bIsInterface;
@@ -16574,7 +16579,26 @@ bool FCompiler::ImportedParamSignature(const FRecord& Owner, const std::string& 
         if (!IsInlineMethod(*A, Method) && CompilesMethod(*A, Method)) D = A;
     if (D == Cur || D->IsNative() || !D->IsGenerated() || D->bIsStruct || D->bIsInterface || IsInlineMethod(*D, Method)
         || !CompilesMethod(*D, Method))
-        return false;
+        return nullptr;
+    return D;
+}
+
+bool FCompiler::ImportedReturnSignature(const FRecord& Owner, const std::string& Method, FBlueprintClass& BP, FIndex* Sig)
+{
+    const FRecord* D = SignatureDeclarer(Owner, Method);
+    if (!D) return false;
+    const auto Def = D->MethodDefs.find(Method);
+    const Json& Fn = Def != D->MethodDefs.end() ? *Def->second : *D->Methods.at(Method);
+    const std::string Type = StripTypeKeywords(ReturnPartOf(Fn.value("type", Json::object()).value("qualType", std::string())));
+    if (Type.compare(0, 10, "TDelegate<") != 0) return false;
+    return ForeignSignature(*D, Type, "ReturnValue", BP, Sig);
+}
+
+bool FCompiler::ImportedParamSignature(const FRecord& Owner, const std::string& Method, size_t Index, FBlueprintClass& BP,
+                                       FIndex* Sig)
+{
+    const FRecord* D = SignatureDeclarer(Owner, Method);
+    if (!D) return false;
     const auto Def = D->MethodDefs.find(Method);
     const Json* P = ParmDeclAt(Def != D->MethodDefs.end() ? *Def->second : *D->Methods.at(Method), Index);
     const std::string Type = P ? StripTypeKeywords(ParmTypeOf(*P)) : std::string();
@@ -20746,8 +20770,11 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         {
             FPropertyDef PD;
             std::string PErr;
-            if (!TypeToProperty(RetType, "ReturnValue", CPF_ReturnParm | CPF_OutParm,
-                                "return type on " + Fn.Name, BP, &PD, &PErr))
+            /* An override's delegate return value is its parent's: that one's signature function. */
+            if (FIndex Sig; StripTypeKeywords(RetType).compare(0, 10, "TDelegate<") == 0 && ImportedReturnSignature(R, Fn.Name, BP, &Sig))
+                PD = DelegateParam("ReturnValue", Sig, CPF_ReturnParm | CPF_OutParm);
+            else if (!TypeToProperty(RetType, "ReturnValue", CPF_ReturnParm | CPF_OutParm,
+                                     "return type on " + Fn.Name, BP, &PD, &PErr))
             { *Err = PErr; return false; }
             /* Measured on BP_SentryGun_MoveMarker: a Blueprint ReturnValue is Parm | OutParm | ReturnParm only. */
             PD.PropertyFlags &= ~uint64(CPF_BlueprintVisible | CPF_BlueprintReadOnly);
