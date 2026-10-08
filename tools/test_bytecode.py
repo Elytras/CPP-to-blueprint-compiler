@@ -10896,7 +10896,7 @@ def key_str_struct():
     UKsDef's M and U (a class's own value) write one element, the "A"; UKsKid's UE_DEFAULTS give the parent's own {"A", 1},
     so M and U write no element and no removal (or no tag at all)."""
     import struct
-    here = os.path.dirname(pending_asset('KeyStrStruct', 'UKsDef'))
+    here = os.path.dirname(asset('KeyStrStruct'))
     spelt = lambda s: struct.pack('<i', len(s) + 1) + s.encode() + b'\x00'
     for cls, added in (('UKsDef', 1), ('UKsKid', 0)):
         base = os.path.join(here, cls)
@@ -10912,7 +10912,9 @@ def key_str_struct():
             if added: assert spelt('A') in raw and spelt('a') not in raw, '%s.%s holds the first spelling' % (cls, name)
 
 
-pending('KeyStrStruct', key_str_struct)
+key_str_struct()
+print("ok  KeyStrStruct: a struct key holding an FString given twice in two spellings is one element, in a class's own "
+      "value and a UE_DEFAULTS' delta over its parent's")
 
 
 PREFETCH.finish()
