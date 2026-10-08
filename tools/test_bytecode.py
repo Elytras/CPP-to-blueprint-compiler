@@ -10923,7 +10923,7 @@ def native_event_call():
     _Implementation straight and for an implementable one has no body, so a Blueprint subclass's override never runs.
     NativeEventCall's CallSelf, CallOther and CallOtherActor call AActor's ReceiveBeginPlay, CallArgs its
     ReceiveAnyDamage with arguments; the sweep's call_opcode_flags holds for the package."""
-    base = pending_asset('NativeEventCall')
+    base = asset('NativeEventCall')
     exports = exports_of(base)
     for fn, event in (('CallSelf', 'ReceiveBeginPlay'), ('CallOther', 'ReceiveBeginPlay'),
                       ('CallOtherActor', 'ReceiveBeginPlay'), ('CallArgs', 'ReceiveAnyDamage')):
@@ -10932,7 +10932,8 @@ def native_event_call():
     keeps_invariants(base)
 
 
-pending('NativeEventCall', native_event_call)
+native_event_call()
+print('ok  NativeEventCall: a call to a native BlueprintEvent is by name, EX_VirtualFunction, so a subclass'+chr(39)+'s override runs')
 
 
 PREFETCH.finish()
