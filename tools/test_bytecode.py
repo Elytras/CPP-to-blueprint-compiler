@@ -11028,14 +11028,17 @@ def delegate_return_override():
     """An override of a function returning a TDelegate has its parent's signature function on its ReturnValue, as a
     parameter has (func_override_params), and a call through the parent's pointer reaches the override. DelegateReturnKid's
     DrkKid::Get returns OnTimer bound on this; DrkUser::Use hands what Other->Get() returns to a timer."""
-    base = pending_asset('DelegateReturnKid', 'DrkKid')
+    base = os.path.join(os.path.dirname(asset('DelegateReturnKid')), 'DrkKid')
     keeps_invariants(base)
     here = os.path.dirname(base)
     keeps_invariants(os.path.join(here, 'DrkBase'))
     keeps_invariants(os.path.join(here, 'DrkUser'))
+    vm = VM(base, {}, Fired=0)
+    assert vm.call('Get') == ('delegate', 'OnTimer', vm.self), vm.call('Get')
 
 
-pending('DelegateReturnOverride', delegate_return_override)
+delegate_return_override()
+print('ok  DelegateReturnKid: an override'+chr(39)+'s TDelegate return value names its parent'+chr(39)+'s signature function')
 
 
 PREFETCH.finish()
