@@ -79,6 +79,7 @@ struct FImport
     std::string ClassName;
     FIndex Outer;
     std::string ObjectName;
+    bool bDroppable = false;    // Save leaves the row out when no payload, header field or dependency names it (Asset)
 };
 
 /* One AssetRegistryData row: what the content browser shows without loading the package. Cooked
@@ -113,6 +114,10 @@ public:
     int32 AddImport(const FImport& In);
     int32 AddExport(FExport&& In);
     FIndex ImportIndex(int32 Row) const { return Imp(Row); }
+    int32 NumImports() const { return int32(Imports.size()); }
+    /* Row (an AddImport result) is left out of the saved table if nothing names it: a value lowered into the package that
+       a delta then dropped (an element of a set or map the archetype already holds) imported it for nothing. */
+    void SetDroppable(int32 Row) { Imports[size_t(Row)].bDroppable = true; }
 
     /* Pass one registers and returns 0; pass two resolves to the sorted table index. */
     int32 NameIndex(const std::string& S);
@@ -170,6 +175,11 @@ private:
     /* While Save runs: each import row's FPackageIndex as written (FoldOwnImports). Empty otherwise. */
     mutable std::vector<int32> ImportFold;
     void FoldOwnImports() const;
+    /* Save's first pass over the imports: each row of Imports that is droppable and that nothing written names (DropUnusedImports).
+       While it serializes the payloads, Written marks the rows they name here. */
+    mutable std::vector<bool>* CountingRefs = nullptr;
+    mutable std::vector<bool> UnusedImports;
+    void DropUnusedImports() const;
     /* The FPackageIndex V is written as: through RemapIndex, then onto the import rows Save keeps. */
     FIndex Written(FIndex V) const;
 };

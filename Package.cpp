@@ -319,11 +319,54 @@ any other package's, through imports, so Save writes each import of an object th
 drops the import of the package itself they hang off, and closes up the rows it keeps. An import no export answers is
 kept, outers and all. The rows in memory keep their numbering (WriteApi reads them after Save).
 */
+/*
+An import a Blueprint lowers for a value that is never written is dead weight in the table: AssetRef imports an asset the
+moment a default names it, and a set's or map's delta then drops the elements the archetype already holds. A row marked
+droppable is left out when no payload writes it (the pass runs each Serialize once more, counting), no export row or
+dependency list names it, and no kept import hangs off it. Only marked rows can go, so nothing else changes.
+*/
+void FPackage::DropUnusedImports() const
+{
+    UnusedImports.assign(Imports.size(), false);
+    if (std::none_of(Imports.begin(), Imports.end(), [](const FImport& I) { return I.bDroppable; })) return;
+    std::vector<bool> Used(Imports.size(), false);
+    const auto Mark = [&](int32 V) { if (V < 0 && size_t(-V - 1) < Used.size()) Used[size_t(-V - 1)] = true; };
+    for (const FExport& E : Exports)
+    {
+        for (FIndex Ref : { E.ClassIndex, E.SuperIndex, E.TemplateIndex, E.OuterIndex }) Mark(Ref.V);
+        for (const std::vector<int32>* List : { &E.SerBeforeSer, &E.CreateBeforeSer, &E.SerBeforeCreate, &E.CreateBeforeCreate })
+            for (int32 V : *List) Mark(V);
+    }
+    CountingRefs = &Used;
+    for (const FExport& E : Exports)
+    {
+        FArc Discard(const_cast<FPackage*>(this));
+        E.Serialize(Discard);
+    }
+    CountingRefs = nullptr;
+    /* A kept import keeps its outers; an outer may itself be droppable, so repeat until none more is kept. */
+    for (bool bChanged = true; bChanged;)
+    {
+        bChanged = false;
+        for (size_t I = 0; I < Imports.size(); ++I)
+        {
+            if (Imports[I].bDroppable && !Used[I]) continue;
+            const int32 O = Imports[I].Outer.V;
+            if (O < 0 && size_t(-O - 1) < Used.size() && !Used[size_t(-O - 1)]) { Used[size_t(-O - 1)] = true; bChanged = true; }
+        }
+    }
+    for (size_t I = 0; I < Imports.size(); ++I) UnusedImports[I] = Imports[I].bDroppable && !Used[I];
+}
+
 void FPackage::FoldOwnImports() const
 {
     constexpr int32 Kept = -1;
     std::vector<int32> Target(Imports.size(), Kept);
+    /* A dropped row is written nowhere: 0 is the value no entry holds (a null index). */
+    for (size_t I = 0; I < Imports.size(); ++I)
+        if (I < UnusedImports.size() && UnusedImports[I]) Target[I] = 0;
     std::vector<bool> Done(Imports.size(), false);
+    for (size_t I = 0; I < Imports.size(); ++I) Done[I] = Target[I] == 0;
     const std::string Own = Lower(PackageName);
     /* What import I is written as: 0 for this package, an export's FPackageIndex, or Kept. Outers come first. */
     std::function<int32(size_t)> Resolve = [&](size_t I) {
@@ -353,6 +396,7 @@ void FPackage::FoldOwnImports() const
 FIndex FPackage::Written(FIndex V) const
 {
     if (RemapIndex) V = RemapIndex(V);
+    if (CountingRefs && V.V < 0 && size_t(-V.V - 1) < CountingRefs->size()) (*CountingRefs)[size_t(-V.V - 1)] = true;
     if (V.V < 0 && size_t(-V.V - 1) < ImportFold.size()) V.V = ImportFold[size_t(-V.V - 1)];
     return V;
 }
@@ -404,8 +448,9 @@ bool FPackage::Save(const std::string& OutBaseNoExt, std::string* Err) const
     FPackage* Self = const_cast<FPackage*>(this);
     Self->NameIndex(PackageName);
 
+    DropUnusedImports();
     FoldOwnImports();
-    struct FUnfold { std::vector<int32>& Fold; ~FUnfold() { Fold.clear(); } } Unfold{ ImportFold };
+    struct FUnfold { std::vector<int32>& Fold; std::vector<bool>& Unused; ~FUnfold() { Fold.clear(); Unused.clear(); } } Unfold{ ImportFold, UnusedImports };
     const int32 NumImports = int32(std::count_if(ImportFold.begin(), ImportFold.end(), [](int32 V) { return V < 0; }));
 
     // Pass one: run every payload only to collect FNames.
