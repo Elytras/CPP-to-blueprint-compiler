@@ -20,6 +20,14 @@ public:
     UObject *Best = nullptr;
 };
 
+class UAidKid : public UAidDef
+{
+public:
+    UE_DEFAULTS {
+        Peers = {&ED_B};    // C++: this CDO's Peers is {B}: A is listed removed, B is its parent's, so written nowhere
+    }
+};
+
 // C++: Peers {B}. A is listed removed; B is the CDO's, so it is written nowhere.
 UAidDef AS_AidSet = {.Peers = {&ED_B}, .Named = {{"a", &ED_A}, {"b", &ED_B}}};
 // C++: Named {"b": B}: "a" is listed removed (a name), B's pair is the CDO's. Nothing names A or B.

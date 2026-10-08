@@ -100,9 +100,15 @@ FIndex FBlueprintClass::Asset(const std::string& ClassPackage, const std::string
     if (It != ImportCache.end()) return Imp(It->second);
 
     EngineClass(ClassPackage, ClassName_);      // the linker resolves an import's class through its own import
-    const int32 Row = P.AddImport({ ClassPackage, ClassName_, PackageImport(AssetPackage), AssetName });
+    const int32 Before = P.NumImports();
+    const FIndex Outer = PackageImport(AssetPackage);
+    const int32 Row = P.AddImport({ ClassPackage, ClassName_, Outer, AssetName });
     ImportCache.emplace(Key, Row);
     CallImports.push_back(Imp(Row).V);
+    /* A default that names the asset is lowered before a set's or map's delta drops the elements the archetype holds:
+       the rows go if nothing written names them (FPackage::DropUnusedImports). */
+    P.SetDroppable(Row);
+    if (Before < P.NumImports() - 1) P.SetDroppable(Before);       // the package, when this call made it
     return Imp(Row);
 }
 
