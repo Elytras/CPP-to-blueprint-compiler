@@ -3014,6 +3014,18 @@ FIndex FCompiler::FindEvent(FBlueprintClass& BP, const std::string& FromRecord, 
     return Null();      // not an override
 }
 
+/* The return part of a function type, `int32` of `int32 (int32) const` and `TDelegate<void ()>` of `TDelegate<void ()> ()`:
+   up to the '(' that opens the parameter list, the first outside the angle brackets of a template argument. */
+static std::string ReturnPartOf(const std::string& FnType)
+{
+    int32 Depth = 0;
+    for (size_t I = 0; I < FnType.size(); ++I)
+        if (FnType[I] == '<') ++Depth;
+        else if (FnType[I] == '>') --Depth;
+        else if (FnType[I] == '(' && Depth <= 0) return FnType.substr(0, I);
+    return FnType;
+}
+
 /* A node's type with every typedef and alias resolved, as clang's canonical type spells it. */
 std::string DesugaredTypeOf(const Json& N)
 {
@@ -3085,7 +3097,7 @@ std::vector<std::string> SignatureOf(const Json& Fn)
         return T;
     };
     const std::string FnType = DesugaredTypeOf(Fn);
-    std::vector<std::string> Out{ Norm(FnType.substr(0, FnType.find('(')), false) };
+    std::vector<std::string> Out{ Norm(ReturnPartOf(FnType), false) };
     ForEach(Fn, [&](const Json& C) { if (Kind(C) == "ParmVarDecl") Out.push_back(Norm(DesugaredTypeOf(C), true)); });
     return Out;
 }
@@ -10085,7 +10097,7 @@ void FCompiler::SynthesizeForwarders()
                 if (const Json T = NearDecl.value("type", Json::object()); T.contains(Field))
                 {
                     std::string S = T[Field].get<std::string>();
-                    S = S.substr(0, S.find('('));
+                    S = ReturnPartOf(S);
                     while (!S.empty() && S.back() == ' ') S.pop_back();
                     RetType[Field] = S;
                 }
@@ -10362,7 +10374,7 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
     Rename(*Body);
 
     std::string RetType = Def["type"].value("qualType", std::string());
-    RetType = RetType.substr(0, RetType.find('('));
+    RetType = ReturnPartOf(RetType);
     while (!RetType.empty() && (RetType.back() == ' ' || RetType.back() == '&')) RetType.pop_back();
     RetType = StripTypeKeywords(RetType);
     const bool bValue = !RetType.empty() && RetType != "void";
@@ -13512,8 +13524,7 @@ bool FCompiler::GenerateInterface(const FRecord& R, const std::string& OutDir, s
         if (!LowerParams(*Entry.second, Entry.first, BP, Params, Err)) return false;
 
         const std::string FnQual = (*Entry.second)["type"].value("qualType", std::string());
-        const size_t LParen = FnQual.find('(');
-        std::string RetType = LParen == std::string::npos ? FnQual : FnQual.substr(0, LParen);
+        std::string RetType = ReturnPartOf(FnQual);
         while (!RetType.empty() && (RetType.back() == ' ' || RetType.back() == '\t')) RetType.pop_back();
         if (!RetType.empty() && RetType != "void")
         {
@@ -14477,17 +14488,6 @@ bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object,
         if (bTagged) Visit(E.Chain[E.Path.size()], Path);
     }
 
-    /* Each assignment's bytes, written against P's names (a name P lacks is appended), then read back as P's own.
-       Fresh[K] is the tag holding only the path below step K, for each K it can be one (every step on is a member of a
-       struct written as tags): Fresh[0] the member's own tag, whole when there is no path. Leaf is the value's bytes
-       when the path ends in a native struct or at an element. */
-    std::vector<std::string> Texts;
-    for (const FCookedName& N : P.Names) Texts.push_back(N.Text);
-    FPackage Sink(Package);
-    Sink.SeedNames(Texts);
-    auto Bytes = [&](const auto& Write) { FArc Ar(&Sink); Write(Ar); return Ar.B; };
-    std::vector<std::vector<std::vector<uint8>>> Fresh(Edits.size());
-    std::vector<std::vector<uint8>> Leaf(Edits.size());
     /* The values as written, made P's: only the objects they name (a removed element's too) become P's imports, each
        an edge the object is created before it is serialized. */
     std::string RebaseErr;
@@ -14518,6 +14518,17 @@ bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object,
         if (const int32 Mine = ImportCooked(P, Package, Work, Package, Type, &RebaseErr)) Deps.push_back(Mine);
         else { *Err = Where + ": " + RebaseErr; return false; }
 
+    /* Each assignment's bytes, written against P's names (a name P lacks is appended), then read back as P's own.
+       Fresh[K] is the tag holding only the path below step K, for each K it can be one (every step on is a member of a
+       struct written as tags): Fresh[0] the member's own tag, whole when there is no path. Leaf is the value's bytes
+       when the path ends in a native struct or at an element. */
+    std::vector<std::string> Texts;
+    for (const FCookedName& N : P.Names) Texts.push_back(N.Text);
+    FPackage Sink(Package);
+    Sink.SeedNames(Texts);
+    auto Bytes = [&](const auto& Write) { FArc Ar(&Sink); Write(Ar); return Ar.B; };
+    std::vector<std::vector<std::vector<uint8>>> Fresh(Edits.size());
+    std::vector<std::vector<uint8>> Leaf(Edits.size());
     for (size_t I = 0; I < Edits.size(); ++I)
     {
         const FEditDef& E = Edits[I];
@@ -16057,8 +16068,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         const std::string FnQual = M["type"].value("qualType", std::string());
         std::string RetType;
         {
-            const size_t LParen = FnQual.find('(');
-            RetType = LParen == std::string::npos ? FnQual : FnQual.substr(0, LParen);
+            RetType = ReturnPartOf(FnQual);
             while (!RetType.empty() && (RetType.back() == ' ' || RetType.back() == '\t'))
                 RetType.pop_back();
         }

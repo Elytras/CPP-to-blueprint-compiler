@@ -11007,7 +11007,7 @@ def delegate_return():
     (keeps_invariants), and what a caller gets is the delegate the function returns. DelegateReturn's Make returns OnTimer
     bound on this, Get the stored one (what Use hands K2_SetTimerDelegate after Arm); GetSink returns a delegate with a
     parameter."""
-    base = pending_asset('DelegateReturn')
+    base = asset('DelegateReturn')
     keeps_invariants(base)
     vm = VM(base, {}, Fired=0)
     bound = ('delegate', 'OnTimer', vm.self)
@@ -11020,7 +11020,8 @@ def delegate_return():
     assert vm.call('GetSink') == ('delegate', 'OnInt', vm.self), vm.call('GetSink')
 
 
-pending('DelegateReturn', delegate_return)
+delegate_return()
+print('ok  DelegateReturn: a function returning a TDelegate returns the delegate, with or without parameters')
 
 
 PREFETCH.finish()
