@@ -3137,6 +3137,13 @@ bool IsInt64Type(const std::string& QualType)
         || QualType.find("__int64") != std::string::npos;
 }
 
+/* An unsigned 64-bit type: FoldConst keeps its value as the int64 with the same bits, so a division, a remainder and a
+   right shift must read it back as unsigned. */
+bool IsUnsigned64Type(const std::string& QualType)
+{
+    return IsInt64Type(QualType) && (QualType.find("unsigned") != std::string::npos || QualType.find("uint64") != std::string::npos);
+}
+
 bool IsObjectType(const std::string& QualType)
 {
     return !QualType.empty() && QualType.back() == '*';
@@ -11896,6 +11903,7 @@ bool FCompiler::FoldConst(const Json& E, FConstVal& Out) const
         Out = {};
         if (V == "true" || V == "false") Out.I = V == "true";
         else if (V.find_first_of(".eEn") != std::string::npos) { Out.bFloat = true; Out.F = std::strtod(V.c_str(), nullptr); }
+        else if (V[0] != '-') Out.I = int64(std::strtoull(V.c_str(), nullptr, 10));     // a uint64 past INT64_MAX: its bits
         else Out.I = std::strtoll(V.c_str(), nullptr, 10);
         return Fit(Out);
     }
@@ -11961,7 +11969,7 @@ bool FCompiler::FoldConst(const Json& E, FConstVal& Out) const
     {
         /* Both sides already have their common type; a uint64 beyond INT64_MAX would compare as negative. */
         const std::string T = TypeOf(*Nth(E, 0));
-        if (IsInt64Type(T) && (T.find("unsigned") != std::string::npos || T.find("uint64") != std::string::npos)) return false;
+        if (IsUnsigned64Type(T)) return false;
         const int32 Cmp = L.bFloat || R.bFloat ? (L.Num() < R.Num() ? -1 : L.Num() > R.Num() ? 1 : L.Num() == R.Num() ? 0 : 2)
                                                : (L.I < R.I ? -1 : L.I > R.I ? 1 : 0);
         Out.I = Op == "<" ? Cmp == -1 : Op == ">" ? Cmp == 1 : Op == "<=" ? Cmp == -1 || Cmp == 0
@@ -11978,16 +11986,18 @@ bool FCompiler::FoldConst(const Json& E, FConstVal& Out) const
         else return false;
         return Fit(Out);
     }
+    /* / % >> of an unsigned 64-bit result (a shift's is its left side's type) read the bits as unsigned. */
+    const bool bU64 = IsUnsigned64Type(StripTypeKeywords(TypeOf(E)));
     if (Op == "+") Out.I = L.I + R.I;
     else if (Op == "-") Out.I = L.I - R.I;
     else if (Op == "*") Out.I = L.I * R.I;
-    else if (Op == "/" && R.I != 0) Out.I = L.I / R.I;
-    else if (Op == "%" && R.I != 0) Out.I = L.I % R.I;
+    else if (Op == "/" && R.I != 0) Out.I = bU64 ? int64(uint64(L.I) / uint64(R.I)) : L.I / R.I;
+    else if (Op == "%" && R.I != 0) Out.I = bU64 ? int64(uint64(L.I) % uint64(R.I)) : L.I % R.I;
     else if (Op == "&") Out.I = L.I & R.I;
     else if (Op == "|") Out.I = L.I | R.I;
     else if (Op == "^") Out.I = L.I ^ R.I;
     else if (Op == "<<" && R.I >= 0 && R.I < 64) Out.I = int64(uint64(L.I) << R.I);
-    else if (Op == ">>" && R.I >= 0 && R.I < 64) Out.I = L.I >> R.I;
+    else if (Op == ">>" && R.I >= 0 && R.I < 64) Out.I = bU64 ? int64(uint64(L.I) >> R.I) : L.I >> R.I;
     else return false;
     return Fit(Out);
 }

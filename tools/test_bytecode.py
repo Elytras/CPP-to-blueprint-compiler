@@ -2828,6 +2828,11 @@ def types_behaviour():
     check('TypesTest', 'I64ToFloat', lambda X: float(wrap(X)), [dict(X=x) for x in (0, -3, 7, -2**31, 2**32 + 5, -2**32 - 7)])
     check('TypesTest', 'TruncViaI64', lambda G: float(int(G)), [dict(G=g) for g in (0.0, 2.75, -2.75, 1e6 + 0.5)])
     check('TypesTest', 'AllOnes', lambda: -1, [dict()])
+    # FoldConst divides, takes the remainder of and shifts a uint64 past INT64_MAX as C++ does, unsigned; a consteval
+    # call's answer past INT64_MAX keeps its bits (FoldU64.cpp).
+    for fn, want in (('Div', 0x0FFFFFFFFFFFFFFF), ('Mod', 5), ('Shr', 0x0FFFFFFFFFFFFFFF), ('ConstVar', 0x0FFFFFFFFFFFFFFF),
+                     ('Eval', 0x0FFFFFFFFFFFFFFF)):
+        check('FoldU64', fn, lambda want=want: want, [dict()])
     check('TypesTest', 'Huge', lambda: float('inf'), [dict()])
     check('TypesTest', 'PlusChar', lambda X: wrap(X + 128), [dict(X=x) for x in EDGE])
     check('TypesTest', 'ShiftByLL', lambda X, M: wrap(X << 2) if M == 0 else X >> (1 if M == 1 else 3),
@@ -10883,19 +10888,6 @@ if not globals().get('EDITS_EXPLORE'):     # set by the dev loop's exploration d
     print('ok  MapPatch: a patch\'s whole TSet / TMap loads as written, a property or one inside a struct (by a member '
           'path or in a whole struct): the archetype\'s elements it drops are listed as removed; a key given twice '
           'holds its last value, an FString key compared without case')
-
-
-def fold_u64():
-    """FoldConst divides, takes the remainder of and shifts a uint64 past INT64_MAX as C++ does, unsigned: FoldU64's
-    Div, Shr, ConstVar and Eval are 0x0FFFFFFFFFFFFFFF, Mod is 5."""
-    base = pending_asset('FoldU64')
-    for fn, want in (('Div', 0x0FFFFFFFFFFFFFFF), ('Mod', 5), ('Shr', 0x0FFFFFFFFFFFFFFF), ('ConstVar', 0x0FFFFFFFFFFFFFFF),
-                     ('Eval', 0x0FFFFFFFFFFFFFFF)):
-        got = run(base, fn)[0]
-        assert got == want, 'FoldU64.%s() = %r, C++ says %r' % (fn, got, want)
-
-
-pending('FoldU64', fold_u64)
 
 
 PREFETCH.finish()
