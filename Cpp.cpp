@@ -389,6 +389,24 @@ bool WidgetLayoutStatement(const Json& S)
     return N && (Kind(*N) == "CXXMemberCallExpr" || Kind(*N) == "DeclStmt" || !LayoutHelperCall(S).empty());
 }
 
+/* D, a value of Def's type, with the case of every FString in it folded, so two values the engine's comparison calls equal
+   (FString's == ignores case; a struct compares member by member, Identical) write the same bytes. Only for comparing. */
+void FoldStringCase(FDefaultValue& D, const FPropertyDef& Def)
+{
+    if (Def.Type == "StrProperty") D.S = Lower(D.S);
+    else if (Def.Type == "StructProperty" && !NativeStructSize(Def.StructName))
+    {
+        const auto& Members = D.Members ? D.Members : Def.Members;      // as WriteValue picks them
+        if (!Members) return;
+        auto Folded = std::make_shared<std::vector<FPropertyDef>>(*Members);
+        for (FPropertyDef& M : *Folded) FoldStringCase(M.Default, M);
+        D.Members = std::move(Folded);
+    }
+    else if (Def.Inner)
+        for (size_t I = 0; I < D.Items.size(); ++I)
+            FoldStringCase(D.Items[I], Def.Value && I % 2 ? *Def.Value : *Def.Inner);
+}
+
 /* A set's or map's elements as the braces leave them in C++: each key once, where it first appears, holding the last
    element given for it, as the initializer-list constructors Add each element in order and Add replaces the whole
    element, a map's value and the key's own spelling (Map.h 1166-1173; TSet::Emplace, Set.h 625). Keys compare as the
@@ -404,7 +422,7 @@ void LastValuePerKey(std::vector<FDefaultValue>& Items, bool bMap, const FProper
     auto Key = [&](const FDefaultValue& V) {
         FPropertyDef E = KeyDef;
         E.Default = V;
-        if (KeyDef.Type == "StrProperty") E.Default.S = Lower(V.S);
+        FoldStringCase(E.Default, E);
         FArc A(&Scratch);
         WriteDefaultValue(A, E);
         return A.B;
@@ -18047,7 +18065,7 @@ bool FCompiler::MergeElement(const FCookedPackage& P, int32 Export, FEditDef& Ed
     auto KeyOf = [&](const FDefaultValue& V) {
         FPropertyDef E = *Had.Inner;
         E.Default = V;
-        if (E.Type == "StrProperty") E.Default.S = Lower(V.S);
+        FoldStringCase(E.Default, E);
         FArc A(&Scratch);
         WriteDefaultValue(A, E);
         return A.B;
