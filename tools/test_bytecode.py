@@ -3430,6 +3430,12 @@ def types_behaviour():
     proves('number-literals.int64-18446744073709551615ull')
     check('TypesTest', 'AllOnes', lambda: -1, [dict()])
     proves('number-literals.float-reach-300-f')
+    # FoldConst divides, takes the remainder of and shifts a uint64 past INT64_MAX as C++ does, unsigned; a consteval
+    # call's answer past INT64_MAX keeps its bits (FoldU64.cpp).
+    proves('constant-folding.int64-0xfffffffffffffff0ull')
+    for fn, want in (('Div', 0x0FFFFFFFFFFFFFFF), ('Mod', 5), ('Shr', 0x0FFFFFFFFFFFFFFF), ('ConstVar', 0x0FFFFFFFFFFFFFFF),
+                     ('Eval', 0x0FFFFFFFFFFFFFFF)):
+        check('FoldU64', fn, lambda want=want: want, [dict()])
     check('TypesTest', 'Huge', lambda: float('inf'), [dict()])
     proves('number-literals.a', 'arithmetic.x-1')
     check('TypesTest', 'PlusChar', lambda X: wrap(X + 128), [dict(X=x) for x in EDGE])

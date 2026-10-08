@@ -2024,6 +2024,7 @@ pure call whose result is unused is dropped.
 | <a id="constant-folding.n-3-8-19"></a>`N * 3 + 8 + 19` | Only constant subexpressions fold. C++ groups `+` from the left, so both additions stay; `N * 3 + (8 + 19)` has one. | Yes |
 | <a id="constant-folding.x-0"></a>`X + 0`, `X - 0`, `X * 1`, `X / 1`, `X \| 0`, `X ^ 0` | Compile to X with no node. A float keeps its + and -, because -0.0f + 0 is +0.0f. | Yes |
 | <a id="constant-folding.x-0-2"></a>`X / 0` | A division or modulo by a constant zero is not folded. It runs and gives 0, and clang warns -Wdivision-by-zero. | Yes |
+| <a id="constant-folding.int64-0xfffffffffffffff0ull"></a>`(int64)(0xFFFFFFFFFFFFFFF0ULL / 16ULL)`, `kBig / 16ULL`, `FuBig() >> 4` | A `uint64` constant past INT64_MAX divides, takes a remainder and shifts right as unsigned, as C++ does: the first is 0x0FFFFFFFFFFFFFFF. A constant or consteval result past INT64_MAX keeps its bits. | Yes |
 
 ```cpp
 static constexpr int32 kStep = 3;
