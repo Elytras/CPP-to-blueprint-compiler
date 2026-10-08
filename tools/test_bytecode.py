@@ -14849,6 +14849,24 @@ delegate_return()
 print('ok  DelegateReturn: a function returning a TDelegate returns the delegate, with or without parameters')
 
 
+def delegate_return_override():
+    """An override of a function returning a TDelegate has its parent's signature function on its ReturnValue, as a
+    parameter has (func_override_params), and a call through the parent's pointer reaches the override. DelegateReturnKid's
+    DrkKid::Get returns OnTimer bound on this; DrkUser::Use hands what Other->Get() returns to a timer."""
+    base = os.path.join(os.path.dirname(asset('DelegateReturnKid')), 'DrkKid')
+    keeps_invariants(base)
+    here = os.path.dirname(base)
+    keeps_invariants(os.path.join(here, 'DrkBase'))
+    keeps_invariants(os.path.join(here, 'DrkUser'))
+    vm = VM(base, {}, Fired=0)
+    assert vm.call('Get') == ('delegate', 'OnTimer', vm.self), vm.call('Get')
+
+
+proves('delegate-values.tdelegate-void-make-return-this')
+delegate_return_override()
+print('ok  DelegateReturnKid: an override'+chr(39)+'s TDelegate return value names its parent'+chr(39)+'s signature function')
+
+
 PREFETCH.finish()
 print('ok  %d known gaps, each a failing test of something AssetGen does not do yet' % len(GAPS))
 assert not FIXED, 'these pass now, move them in with the others: ' + ', '.join(FIXED)
