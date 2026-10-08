@@ -10917,6 +10917,24 @@ print("ok  KeyStrStruct: a struct key holding an FString given twice in two spel
       "value and a UE_DEFAULTS' delta over its parent's")
 
 
+def native_event_call():
+    """A native BlueprintEvent is overridden by script, so a call to one is by name, EX_VirtualFunction, as the editor
+    makes it: EX_FinalFunction on the engine's UFunction runs its thunk, which for a BlueprintNativeEvent calls
+    _Implementation straight and for an implementable one has no body, so a Blueprint subclass's override never runs.
+    NativeEventCall's CallSelf, CallOther and CallOtherActor call AActor's ReceiveBeginPlay, CallArgs its
+    ReceiveAnyDamage with arguments; the sweep's call_opcode_flags holds for the package."""
+    base = pending_asset('NativeEventCall')
+    exports = exports_of(base)
+    for fn, event in (('CallSelf', 'ReceiveBeginPlay'), ('CallOther', 'ReceiveBeginPlay'),
+                      ('CallOtherActor', 'ReceiveBeginPlay'), ('CallArgs', 'ReceiveAnyDamage')):
+        w = dump('walkscript.py', base, exports.index(fn))
+        assert re.search(r'VirtualFunction\s+%s\b' % event, w) and 'FinalFunction' not in w, '%s calls %s by pointer:\n%s' % (fn, event, w)
+    keeps_invariants(base)
+
+
+pending('NativeEventCall', native_event_call)
+
+
 PREFETCH.finish()
 print('ok  %d known gaps, each a failing test of something AssetGen does not do yet' % len(GAPS))
 assert not FIXED, 'these pass now, move them in with the others: ' + ', '.join(FIXED)
