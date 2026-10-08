@@ -17838,27 +17838,19 @@ bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object,
         return false;
     }
 
-    /* From's imports, made again in P. From has no exports - every object a default can name is an import (AssetRef). */
+    /* From's imports, made again in P. From has no exports - every object a default can name is an import (AssetRef).
+       They are made in Work, a copy of P the diff against the archetype imports into freely (it must see every element
+       it compares, the archetype's too); what the written values name is made P's after it (Rebase), so an element the
+       delta leaves out leaves no import and no dependency edge. */
+    FCookedPackage Work = P;
     std::map<int32, int32> Moved;
     std::string MoveErr;
-    auto Move = [&](int32 Index) { return ImportInto(P, Package, From, Index, Moved, &MoveErr); };
-    /* Each object a value names is created before the object is serialized, as the cook lists it: bar one in
-       /Script/CoreUObject (a class such as UObject's), which nothing waits on (SavePackage.cpp 3899). */
-    auto InCoreUObject = [&](int32 Index) {
-        const FImport* I = From.ImportAt(FIndex{ Index });
-        while (I && I->Outer.V < 0) I = From.ImportAt(I->Outer);
-        return I && I->ObjectName == "/Script/CoreUObject";
-    };
+    auto Move = [&](int32 Index) { return ImportInto(Work, Package, From, Index, Moved, &MoveErr); };
     /* A deep copy on the way: members and elements are shared_ptrs a type's other properties may hold too. */
-    std::vector<int32> Deps;
+    std::vector<int32> Deps, NamedTypes;
     std::function<void(FPropertyDef&)> MoveDef;
     std::function<void(FDefaultValue&)> MoveValue = [&](FDefaultValue& V) {
-        if (V.K == FDefaultValue::Obj && V.Object.V != 0)
-        {
-            const bool bCore = InCoreUObject(V.Object.V);
-            V.Object.V = Move(V.Object.V);
-            if (!bCore) Deps.push_back(V.Object.V);
-        }
+        if (V.K == FDefaultValue::Obj && V.Object.V != 0) V.Object.V = Move(V.Object.V);
         for (FDefaultValue& Item : V.Items) MoveValue(Item);
         if (V.Members)
         {
@@ -17882,7 +17874,7 @@ bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object,
             MoveDef(D);
             const FImport* Named = From.ImportAt(D.Extra);
             if (Named && (Named->ClassName == "UserDefinedStruct" || Named->ClassName == "UserDefinedEnum"))
-                Deps.push_back(Move(D.Extra.V));
+                NamedTypes.push_back(Move(D.Extra.V));
         }
     if (!MoveErr.empty()) { *Err = Where + ": " + MoveErr; return false; }
 
@@ -17916,7 +17908,7 @@ bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object,
         std::vector<FLoadedElement> Had;
         bool bNativeDefault = false;
         std::string Why;
-        if (!LoadedElements(P, Package, P, Package, Export, Path, false, Load, Cmp, Had, bNativeDefault, 0, &Why))
+        if (!LoadedElements(Work, Package, Work, Package, Export, Path, false, Load, Cmp, Had, bNativeDefault, 0, &Why))
         {
             printf("  warning: %s: %s: the archetype's value does not read (%s), so none of its elements is removed: the "
                    "object loads them as well\n", Where.c_str(), Named.c_str(), Why.c_str());
@@ -17948,10 +17940,7 @@ bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object,
         }
         for (const FLoadedElement& H : Had)
             if (std::find(Keys.begin(), Keys.end(), H.KeyBytes) == Keys.end())
-            {
                 Delta.Removed.push_back(H.Key.Default);
-                DefaultRefs(H.Key.Default, Deps);
-            }
         D.Default = std::move(Delta);
     };
     /* Every set or map in D's value at Path, down through the members of structs written as tags. MoveDef made the
@@ -17980,6 +17969,41 @@ bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object,
         }
         if (bTagged) Visit(E.Chain[E.Path.size()], Path);
     }
+
+    /* The values as written, made P's: only the objects they name (a removed element's too) become P's imports, each
+       an edge the object is created before it is serialized, bar one in /Script/CoreUObject (a class such as UObject's),
+       which nothing waits on (SavePackage.cpp 3899). Before P's names seed the encoder below: an import adds names. */
+    auto InCoreUObject = [&](int32 V) {
+        while (V < 0 && P.Imports[size_t(-V - 1)].Outer != 0) V = P.Imports[size_t(-V - 1)].Outer;
+        return V < 0 && P.SameName(P.Imports[size_t(-V - 1)].ObjectName, "/Script/CoreUObject");
+    };
+    std::string RebaseErr;
+    std::function<void(const FDefaultValue&)> Refs = [&](const FDefaultValue& V) {
+        if (V.K == FDefaultValue::Obj && V.Object.V != 0 && !InCoreUObject(V.Object.V)
+            && std::find(Deps.begin(), Deps.end(), V.Object.V) == Deps.end())
+            Deps.push_back(V.Object.V);
+        for (const std::vector<FDefaultValue>* List : { &V.Items, &V.Removed })
+            for (const FDefaultValue& Item : *List) Refs(Item);
+        if (V.Members) for (const FPropertyDef& M : *V.Members) Refs(M.Default);
+    };
+    std::function<bool(FPropertyDef&)> Rebase = [&](FPropertyDef& D) {
+        if (D.Members)
+        {
+            D.Members = std::make_shared<std::vector<FPropertyDef>>(*D.Members);
+            for (FPropertyDef& M : *D.Members) if (!Rebase(M)) return false;
+        }
+        for (std::shared_ptr<FPropertyDef>* Sub : { &D.Inner, &D.Value })
+            if (*Sub) { *Sub = std::make_shared<FPropertyDef>(**Sub); if (!Rebase(**Sub)) return false; }
+        if (!ImportCookedValue(P, Package, Work, Package, D.Default, &RebaseErr)) return false;
+        Refs(D.Default);
+        return true;
+    };
+    for (FEditDef& E : Edits)
+        for (FPropertyDef& D : E.Chain)
+            if (!Rebase(D)) { *Err = Where + ": " + RebaseErr; return false; }
+    for (int32 Type : NamedTypes)
+        if (const int32 Mine = ImportCooked(P, Package, Work, Package, Type, &RebaseErr)) Deps.push_back(Mine);
+        else { *Err = Where + ": " + RebaseErr; return false; }
 
     /* Each assignment's bytes, written against P's names (a name P lacks is appended), then read back as P's own.
        Fresh[K] is the tag holding only the path below step K, for each K it can be one (every step on is a member of a

@@ -14798,6 +14798,34 @@ print('ok  ConstCast: a cast over a consteval call folds, whatever its spelling,
 proves('constant-folding.int64-ccbig')
 
 
+def patch_import_kept():
+    """A patch's assignment of a whole TSet is a delta against the archetype's value, so an element it shares with the
+    archetype is written nowhere and needs no import: the patched child of PatchPeers (Peers = {B} over the archetype's
+    {A, B}) lists A removed and imports A, not B. Move imported every object the braces name, and LoadedElements
+    every one the archetype's value holds, into the game's own package: B's package and object stayed in the table, and
+    an EDL edge made the child's CDO wait for B."""
+    game = os.path.join(ROOT, 'PatchPeers', 'FSD', 'Content')
+    decl = ('UE_ASSET_AT(UEnemyDescriptor, PpA, "/Game/Enemies/Spider/Grunt/ED_Spider_Grunt");\n'
+            'UE_ASSET_AT(UEnemyDescriptor, PpB, "/Game/Enemies/Spider/Exploder/ED_Spider_Exploder");\n'
+            'class PatchPeersBase : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/PatchPeers/PatchPeersBase", "PatchPeersBase_C");\n'
+            '  TSet<UObject *> Peers;\n};\n'
+            'class PatchPeersKid : public PatchPeersBase {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/PatchPeers/PatchPeersKid", "PatchPeersKid_C");\n'
+            '  int32 Marker;\n};\n')
+    with tempfile.TemporaryDirectory() as tmp:
+        proc, content = compile_edit(tmp, 'PatchPeersEdit', EDIT_HEAD + 'UE_MOD_PACKAGE("/Game/_ElytrasMods/PatchPeersEdit");\n' + decl
+                                     + 'class Tweaks : public PatchPeersKid {\n  UE_PATCH;\n  UE_DEFAULTS {\n    Peers = {&PpB};\n  }\n};\n', game)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        paths = import_paths(os.path.join(content, '_ElytrasMods', 'PatchPeers', 'PatchPeersKid'))
+    for obj, want in (('ED_Spider_Grunt', True), ('ED_Spider_Exploder', False)):
+        has = any(obj in p for p in paths)
+        assert has == want, 'the patched child %s an import of %s' % ('has' if has else 'has no', obj)
+
+
+proves('patching-a-game.peers-b')
+patch_import_kept()
+print('ok  PatchImportKept: a patch'+chr(39)+'s delta imports only what it writes: an element it shares with the archetype leaves no import')
+
+
 PREFETCH.finish()
 print('ok  %d known gaps, each a failing test of something AssetGen does not do yet' % len(GAPS))
 assert not FIXED, 'these pass now, move them in with the others: ' + ', '.join(FIXED)
