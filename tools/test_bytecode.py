@@ -10890,6 +10890,31 @@ if not globals().get('EDITS_EXPLORE'):     # set by the dev loop's exploration d
           'holds its last value, an FString key compared without case')
 
 
+def key_str_struct():
+    """A struct key holding an FString is compared member by member (Identical), its FString without case, as a lone
+    FString key is (asset_map_str_case): KeyStrStruct's {FKsKey{"a", 1}, FKsKey{"A", 1}} is one key, the last given.
+    UKsDef's M and U (a class's own value) write one element, the "A"; UKsKid's UE_DEFAULTS give the parent's own {"A", 1},
+    so M and U write no element and no removal (or no tag at all)."""
+    import struct
+    here = os.path.dirname(pending_asset('KeyStrStruct', 'UKsDef'))
+    spelt = lambda s: struct.pack('<i', len(s) + 1) + s.encode() + b'\x00'
+    for cls, added in (('UKsDef', 1), ('UKsKid', 0)):
+        base = os.path.join(here, cls)
+        keeps_invariants(base)
+        pkg = invariants.Package(base)
+        cdo = pkg.find('Default__%s_C' % cls)
+        for name in ('M', 'U'):
+            t = pkg.tag(cdo, name)
+            if t is None and not added: continue
+            raw = t['value']
+            removed, n = struct.unpack_from('<i', raw, 0)[0], struct.unpack_from('<i', raw, 4)[0]
+            assert removed == 0 and n == added, '%s.%s lists %d removed and %d added; C++ says 0 and %d' % (cls, name, removed, n, added)
+            if added: assert spelt('A') in raw and spelt('a') not in raw, '%s.%s holds the first spelling' % (cls, name)
+
+
+pending('KeyStrStruct', key_str_struct)
+
+
 PREFETCH.finish()
 print('ok  %d known gaps, each a failing test of something AssetGen does not do yet' % len(GAPS))
 assert not FIXED, 'these pass now, move them in with the others: ' + ', '.join(FIXED)
