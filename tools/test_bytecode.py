@@ -14757,6 +14757,29 @@ native_event_call()
 print('ok  NativeEventCall: a call to a native BlueprintEvent is by name, EX_VirtualFunction, so a subclass'+chr(39)+'s override runs')
 
 
+def asset_import_dropped():
+    """An element an asset's braces share with its class's default object is written nowhere (the delta carries only
+    additions and changes, and a drop is listed as removed), so an object only that element names is no import of the
+    package: the loader would resolve a package and an object for nothing. AS_AidSet's Peers {B} over the CDO's {A, B}
+    imports A (listed removed) and not B; AS_AidMap's Named {"b": B} over {"a": A, "b": B}, with Peers the CDO's, imports
+    neither; AS_AidKeep is AS_AidSet with Best = B, which a tag names, so B stays; UAidKid's UE_DEFAULTS Peers = {B} over
+    its parent's {A, B} is AS_AidSet's case in a class."""
+    here = os.path.dirname(asset('AssetImportDropped'))
+    grunt, exploder = 'ED_Spider_Grunt', 'ED_Spider_Exploder'
+    for name, a, b in (('AS_AidSet', True, False), ('AS_AidMap', False, False), ('AS_AidKeep', True, True), ('UAidKid', True, False)):
+        base = os.path.join(here, name)
+        keeps_invariants(base)
+        paths = import_paths(base)
+        for obj, want in ((grunt, a), (exploder, b)):
+            has = any(obj in p for p in paths)
+            assert has == want, '%s %s an import of %s' % (name, 'has' if has else 'has no', obj)
+
+
+proves('declaring-data-assets.peers-b')
+asset_import_dropped()
+print('ok  AssetImportDropped: an element an asset'+chr(39)+'s braces share with its class'+chr(39)+'s default object leaves no import of its own')
+
+
 PREFETCH.finish()
 print('ok  %d known gaps, each a failing test of something AssetGen does not do yet' % len(GAPS))
 assert not FIXED, 'these pass now, move them in with the others: ' + ', '.join(FIXED)
