@@ -10885,6 +10885,19 @@ if not globals().get('EDITS_EXPLORE'):     # set by the dev loop's exploration d
           'holds its last value, an FString key compared without case')
 
 
+def fold_u64():
+    """FoldConst divides, takes the remainder of and shifts a uint64 past INT64_MAX as C++ does, unsigned: FoldU64's
+    Div, Shr, ConstVar and Eval are 0x0FFFFFFFFFFFFFFF, Mod is 5."""
+    base = pending_asset('FoldU64')
+    for fn, want in (('Div', 0x0FFFFFFFFFFFFFFF), ('Mod', 5), ('Shr', 0x0FFFFFFFFFFFFFFF), ('ConstVar', 0x0FFFFFFFFFFFFFFF),
+                     ('Eval', 0x0FFFFFFFFFFFFFFF)):
+        got = run(base, fn)[0]
+        assert got == want, 'FoldU64.%s() = %r, C++ says %r' % (fn, got, want)
+
+
+pending('FoldU64', fold_u64)
+
+
 PREFETCH.finish()
 print('ok  %d known gaps, each a failing test of something AssetGen does not do yet' % len(GAPS))
 assert not FIXED, 'these pass now, move them in with the others: ' + ', '.join(FIXED)
