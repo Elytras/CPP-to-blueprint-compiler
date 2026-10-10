@@ -131,7 +131,6 @@ reference-locals.int32-alias-count
 reference-locals.int32-r-other-score
 reference-locals.float-x-other-loc-x
 other-declarations.auto-a-b-point
-other-declarations.auto-inc-int32-v-return
 constant-folding.n-kstep-kslots-2-1
 constant-folding.false-x
 constant-folding.n-3-8-19
@@ -156,7 +155,6 @@ parameters-and-return.int32-byval-tarray-int32-a
 reference-parameters-and.bump-p
 overloading.int32-ov-int32-a
 overloading.int32-get
-lambdas-function.auto-l-x-int32-y
 lambdas-function.auto-p-inc1-return-p
 lambdas-function.inline-fpairx-operator-fpairx-l
 engine-and-game.k2-setactorlocation-home-false
