@@ -372,7 +372,8 @@ Watch for:
 - A Blueprint class has one function per name. Two non-inline methods with the same name are refused ("a second
   function of that name"). Rename one, or make the extra overloads `inline`.
 - A function outside a class must be `inline`. Without it the call is refused with
-  `call to an unknown function: Helper`. Lambdas and function pointers are refused.
+  `call to an unknown function: Helper`. A lambda is expanded where it is called (`[&]`, `[=]`, `mutable`, init-captures,
+  passed to an inline template; see [Lambdas](REFERENCE.md#lambdas)); function pointers are refused.
 
 Full rules: [Functions](REFERENCE.md#functions), [Overrides and parent calls](REFERENCE.md#overrides-and-parent-calls),
 [Inline functions and templates](REFERENCE.md#inline-functions-and-templates). Examples:
@@ -1832,7 +1833,9 @@ Each row gives the part of the message to look for, the reason, and what to writ
 | `a delegate cannot bind AItem::Server_StartUsing on another object: the editor binds a BlueprintCallable function that is not pure or latent, and Server_StartUsing is not BlueprintCallable` | The editor's Create Event takes only a function Blueprint code can call; an event the engine calls, an RPC or a RepNotify is none. | Bind a method of your own class that calls it | [Event dispatchers](REFERENCE.md#event-dispatchers) |
 | `OnDestroyed.Broadcast: OnDestroyed is a native dispatcher (AActor::OnDestroyed) that is not BlueprintCallable, ...` | The editor's Call node refuses a native dispatcher the engine does not mark BlueprintCallable; only the engine broadcasts it. | Call what makes the event happen, such as `K2_DestroyActor()` | [Event dispatchers](REFERENCE.md#event-dispatchers) |
 | `a container operation needs a variable, not a computed value: Length` | A container node works on a variable, not on the result of a call. | `TArray<int32> L = GetItems(); return L.Num();` | [Containers](REFERENCE.md#containers) |
-| `TODO: unimplemented local Inc: (lambda at ...)` | Lambdas are not compiled, in any form. | An `inline` method or a free `inline` function | [Functions](REFERENCE.md#functions) |
+| `TODO: lambda L used as a value: ...` | A lambda was passed to a function that is not expanded, stored or returned: it is a body expanded at each call, not a value. | Call it where it is, or pass it to an inline function or template | [Lambdas](REFERENCE.md#lambdas) |
+| `TODO: the lambda (lambda at ...) calls itself: ...` | A lambda that recurses (the `auto Self` trick) cannot be expanded. | A method | [Lambdas](REFERENCE.md#lambdas) |
+| `TODO: unimplemented local P: int (*)(int32)` | A function pointer, a lambda converted with `+[]{}` included, has no Blueprint form. | An `inline` method, or a template parameter | [Functions](REFERENCE.md#functions) |
 | `warning: ... reference parameter V is bound to a map element: ... V gets a copy, stored back after the call` | Blueprint has no reference to a map element. | Nothing, unless the callee reads the map while it runs: it sees the old value there | [Functions](REFERENCE.md#functions) |
 | `warning: <Class>::UE_DEFAULTS: Body is the actor's root, ... so its RelativeScale3D is not applied` | The engine puts the root component at the spawn transform. | Declare `UE_COMPONENT(USceneComponent, Root);` first, so the other components attach to it | [Components](REFERENCE.md#components) |
 | `warning: LatentJob::Run waits, and an object of this class finds its world only through its Outer ...` | A plain `UObject` has no world of its own, and a wait needs one. | Create it with an actor or a component as Outer: `NewObject<LatentJob>(this)` from `Objects.h` | [Latent calls](REFERENCE.md#latent-calls) |

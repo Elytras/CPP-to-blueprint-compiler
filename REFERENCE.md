@@ -1905,7 +1905,7 @@ Notes:
 |---|---|---|
 | `using T = int32; T A = X;` | A local whose type is spelled through an alias declared inside the function is refused today ("unimplemented local A: T"). The alias itself compiles to nothing. Spell the type out. | Not yet |
 | `auto [A, B] = Point;` | Refused outside a TMap range-for ("a declaration statement declares nothing usable"). Read the members: `int32 A = Point.X;`. | Refused |
-| `auto Inc = [](int32 V) { return V + 1; };` | A lambda is refused; see [Functions](#functions). | Refused |
+| `auto Inc = [](int32 V) { return V + 1; };` | A lambda is no object and no property: the declaration stores what it copies and each call expands the body; see [Lambdas](#lambdas). | Yes |
 
 ## The optimizer
 
@@ -2283,11 +2283,44 @@ inline int32 Get(int32 A) { return A + 1; }     // expanded beside it
 int32 Use(int32 V) { return Pick(V) + Pick(true) + Get(V) + Get(V, 2); }
 ```
 
-### Lambdas, function pointers and operators
+### Lambdas
+
+A lambda is expanded where it is called, the way an inline function is, and for the same reason a variable that holds
+one is no property: there is no closure object. The captured variables are the declaring function's own locals, so a
+capture by reference costs nothing, and one by value costs the local that holds its copy. Every call is a full copy of
+the body, as for an inline function.
 
 | You write | What it does | Status |
 |---|---|---|
-| `auto L = [X](int32 Y) { return X + Y; };` | Refused, as are an immediately invoked lambda and a lambda passed to an inline template, each with its own `unimplemented` message. Write an inline method or a free inline function. | Refused |
+| `auto L = [&](int32 A) { X += A; return X; };` then `L(3)` | A by-reference capture (`[&]`, `[&X]`) is the variable itself: the body reads and writes the function's own X. | Yes |
+| `auto L = [=](int32 A) { return X + A; };` | A by-value capture (`[=]`, `[X]`) is X as it was where the lambda was declared. A local assigned after the declaration gets a snapshot local, stored there; a constant, or a variable nothing writes, is used in place and costs nothing. | Yes |
+| `[C](int32 A) mutable { C += A; return C; }` | The copy is the lambda's own state, kept from call to call, as a snapshot local that the declaration assigns again each time it is reached; the variable is untouched. | Yes |
+| `[Z = X + 1](int32 A) { return Z * A; }`, `[&R = X]` | An init-capture is a snapshot local made from the initialiser; `&R = X` is another name for the place X. The capture list is read off the mod's own sources, so a lambda written in a macro or in a header cannot have one. | Yes |
+| `[this](int32 A) { M += A; return M; }`, members | `this` is the object. The body names what it names where it was written: the class, and a call's world context, are those of the lambda's own function, whichever function it is called from. | Yes |
+| `const int32 R = [&] { return V * 2; }();` | A lambda called where it is written expands in place, and its value is the return. | Yes |
+| `Apply(5, [&](int32 A) { X += A; return X; })` | A lambda passed to an inline function or template binds its parameter, whatever `F`, `F&` or `const F&` it is: no local and no copy, and each call of the parameter expands the lambda. A lambda that captures by reference makes the call keep a caller's variable out of a parameter that only reads it, as a reference parameter does. | Yes |
+| `[](auto A, auto B) { return A + B; }` | A generic lambda expands as the specialization each call names. | Yes |
+| A lambda calling, or capturing, another lambda | Each is expanded where its call is written. A mutable one cannot be captured by value. | Yes |
+| `UKismetSystemLibrary::Delay(0.5f);` in the body | The function that calls it becomes latent, and a snapshot lives in the frame across the wait. | Yes |
+| A lambda calling itself (`Fact(Fact, N - 1)`), `static` in its body | Refused: "calls itself ... write a method", and "static N in an inline function". | Refused |
+| `auto L2 = L;` or `Use(L)` by value of a `mutable` lambda, `[*this]` | Refused: copying it would fork its state ("bind a reference"), and a Blueprint cannot copy its object. | Refused |
+| A lambda returned from a function, kept in a container or struct, passed to a function that is not expanded, `+[](int32 A) {}`, `L.operator()(X)` | Refused, each with its own message: a lambda is a body to expand at a call, not a value that outlives its function. Write an inline method, or pass `{this, &C::F}` as a delegate. | Refused |
+
+```cpp
+int32 Total(int32 Base) {
+  int32 Sum = 0;
+  auto Add = [&](int32 A) { Sum += A; };                  // [&]: Sum itself
+  auto Scaled = [=](int32 A) { return A * Base; };        // [=]: Base, in place while nothing writes it
+  Add(Scaled(2));
+  Base = 100;                                             // after the declaration: Scaled kept the old Base
+  return Sum + Scaled(1) + [&] { return Sum * 2; }();
+}
+```
+
+### Function pointers and operators
+
+| You write | What it does | Status |
+|---|---|---|
 | `auto *P = &Inc1; return P(X);` | Refused (`unimplemented local`): a Blueprint has no function pointers. To call a function later, bind it to a dispatcher or pass it as a delegate (`{this, &AMine::Handle}`); see [Event dispatchers](#event-dispatchers). | Refused |
 | `inline FPairX operator+(FPairX L, FPairX R)` | Refused where it is used (`unimplemented operator overload`). Only the engine's operators that UeApi lists, and string `+`, are lowered. Write a named inline function. | Refused |
 
@@ -5377,7 +5410,8 @@ listed here is refused with "unimplemented intrinsic".
 | `InitCave`, `InitSpacerig` | The class names the game spawns from a mod: InitSpacerig in the Space Rig, InitCave in a mission. | [Running in the game](GUIDE.md#running-in-the-game) |
 | `inline` functions and templates | Expanded at each call like an editor macro, with no Blueprint function of its own. A free function or template must be `inline`. | [Inline functions and templates](#inline-functions-and-templates) |
 | `(int64)Obj`, `(uint8 *)Obj` | The object's address, as an int64 or as a pointer. | [Pointers and memory](#pointers-and-memory) |
-| Lambdas, function pointers, operator overloads | Refused, all three: a Blueprint has no lambda, no function pointer and no operator of a mod's own. Write an inline function, or pass `{this, &C::F}` as a delegate. | [Functions](#functions) |
+| Lambdas | Expanded where they are called, with no closure object: a capture by reference is the variable itself, one by value a snapshot local. | [Lambdas](#lambdas) |
+| Function pointers, operator overloads | Refused, both: a Blueprint has no function pointer and no operator of a mod's own. Write an inline function, or pass `{this, &C::F}` as a delegate. | [Functions](#functions) |
 | LoadAsset, `UKismetSystemLibrary::LoadAsset(Soft)`, `LoadAssetClass(Soft)` | Async Load Asset and Async Load Class Asset: the function waits, and the call's value is what loaded, or null. | [Latent calls](#latent-calls) |
 | `Map[Key]` | Read: Find, the value type's default for a missing key. Write: Add. | [Containers](#containers) |
 | `__NameCase__` | What UE_NAME_CASE expands to: a hash of the text, for clang. Write UE_NAME_CASE. | [Statements and control flow](#statements-and-control-flow) |
@@ -5573,7 +5607,7 @@ and where the feature is described. In each group, the messages you are most lik
 - `TODO: unimplemented <Where>: <Type>`: a variable, parameter, return value or container element of a type that a
   Blueprint variable cannot have. `<Where>` says which, such as `property Mask`, `local D`, `parameter X on F`,
   `return type on F` or `member A`. The usual types are `double`, `int8`, `int16`, `uint16`, `uint32` and `uint64`; a
-  mod enum without UE_ENUM; a class held by value in a UE_STRUCT; a lambda or a function pointer in a local; the
+  mod enum without UE_ENUM; a class held by value in a UE_STRUCT; a function pointer in a local; the
   `std::initializer_list` that `auto L = { 1, 2, 3 };` makes; and a local whose type is a `using` alias declared
   inside the function. Fix: use float, int32, int64, bool, uint8, FString, FName, FText, a uint8, int32 or int64 enum,
   an engine struct or UE_STRUCT, an object pointer, a TSubclassOf, TSoftObjectPtr, TSoftClassPtr or TScriptInterface
@@ -5719,8 +5753,7 @@ and where the feature is described. In each group, the messages you are most lik
   See [Operators](#operators).
 - `TODO: unimplemented operator overload <Operator> yielding <Type>`, and `TODO: unimplemented operator overload
   <Operator>` for a statement: an overloaded operator with no Kismet node. As a value, this is an operator a mod
-  declares for its own struct, `A + B` with `inline FPair operator+(FPair L, FPair R)`, or a lambda called in place
-  (`operator()`). As a statement, it is a `[]` whose value is dropped, `Items[0];`. Fix: call a named inline function
+  declares for its own struct, `A + B` with `inline FPair operator+(FPair L, FPair R)`. As a statement, it is a `[]` whose value is dropped, `Items[0];`. Fix: call a named inline function
   instead of your operator, and use the value of `[]` or drop the statement. See [Operators](#operators).
 - `TODO: unimplemented statement <Kind>`: a statement with no Blueprint form. `<Kind>` is clang's name for it:
   - `CXXTryStmt`: try and catch. Blueprint has no exceptions.
@@ -5946,12 +5979,32 @@ and where the feature is described. In each group, the messages you are most lik
 - `inline call to <Class>::<Method> with <N> arguments`: a C-style variadic inline function,
   `inline int32 First(int32 N, ...)`, called with extra arguments. Fix: give it a fixed parameter list, or overloads.
   See [Inline functions and templates](#inline-functions-and-templates).
-- `TODO: unimplemented local <Name>: (lambda at <File>:<Line>:<Column>)`,
-  `TODO: unimplemented operator overload operator() yielding <Type>` and `TODO: unimplemented argument LambdaExpr`: a
-  lambda in a local, called in place, or passed as an argument. A function pointer in a local gives
-  `TODO: unimplemented local <Name>: <Type> (*)(<Parms>)`. A Blueprint has neither. Fix: write an inline method or a
-  free inline function. To call something later, bind a method to a dispatcher or a delegate parameter,
-  `{ this, &AMine::Handle }`. See [Functions](#functions).
+- `TODO: lambda <Name> used as a value: ...` and `TODO: a lambda expression used as a value: ...`: a lambda used for
+  something other than a call or an argument of an inline function or template that is expanded: passed to a function
+  that is not expanded, stored in a member or a container, or compared. A lambda has no value that outlives where it
+  is called. Fix: call it where it is, or pass it to an inline function or template. See [Lambdas](#lambdas).
+- `TODO: a lambda returned from a function: ...`, `TODO: <lambda> is called on something that is not a lambda variable
+  or parameter` and `TODO: a lambda's operator() called by name: ...`: a lambda that leaves the function that declares
+  it, or is called by a spelling other than `L(args)`. Fix: write an inline method that returns the value, or call
+  `L(args)`. See [Lambdas](#lambdas).
+- `TODO: the lambda <(lambda at File:Line:Col)> calls itself: a lambda cannot recurse here, write a method` and
+  `static <Name> in an inline function: each expansion would keep its own`: a lambda that calls itself (the
+  `auto Self` trick), or declares a `static`. Fix: write a method, which may recurse where a Blueprint function can.
+  See [Lambdas](#lambdas).
+- `TODO: lambda <Name> is a copy of a mutable lambda, which would fork its state: bind a reference`,
+  `TODO: <Function> takes a mutable lambda by value, which copies its state: pass it by reference`, `<lambda>: it
+  copies the mutable lambda <L>, which would fork its state: capture it by reference` and `[*this] copies the object
+  into the lambda, which a Blueprint cannot`: a copy of a `mutable` lambda would be two states, which the expansion
+  has no way to keep apart; and the object cannot be copied. Fix: bind `auto &L2 = L;`, take the parameter by
+  reference, capture it by reference, or capture `this`. See [Lambdas](#lambdas).
+- `an init-capture whose capture list cannot be read from the mod's own sources (a lambda in a macro or in a header)`
+  and `TODO: a lambda converted to a function pointer: ...`: an init-capture (`[Z = X + 1]`) in a lambda written in a
+  macro or a header, whose capture list the compiler reads off the mod's sources; and `+[](...) {}` or a lambda handed
+  to a function pointer. Fix: capture the variable by name, or declare the variable beside the lambda; for a function
+  pointer, pass the lambda to an inline function or template. See [Lambdas](#lambdas).
+- `TODO: unimplemented local <Name>: <Type> (*)(<Parms>)`: a function pointer in a local. A Blueprint has none. Fix:
+  write an inline method or a free inline function. To call something later, bind a method to a dispatcher or a
+  delegate parameter, `{ this, &AMine::Handle }`. See [Functions](#functions).
 - `TODO: unimplemented argument <Kind>`: an expression with no Blueprint form, named by clang's kind, such as
   `CXXNewExpr` for `new`. Fix: create objects with the helpers in `Objects.h`, such as `NewObject<T>` and
   `SpawnActor<T>`. See [Creating objects](#creating-objects).
