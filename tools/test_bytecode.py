@@ -14899,6 +14899,111 @@ spelling_forms()
 print('ok  SpellingForms: an enum alias, a trailing return type and FString::Len() cook as their plain spellings do')
 
 
+def lambdas():
+    """LambdaTest: every form of lambda AssetGen expands in place. A lambda is no object: a by-reference capture is the
+    variable itself, a by-value capture of a variable written after the declaration, an init-capture and a mutable
+    lambda's state are snapshot locals, and a call is the body copied in. Values and members both, at the edges of the
+    cases that tell a snapshot from the variable."""
+    base = asset('LambdaTest')
+    kid = os.path.join(os.path.dirname(base), 'LambdaKid')
+    keeps_invariants(base)
+    keeps_invariants(kid)
+    sign = lambda n: (n > 0) - (n < 0)
+    forms = [
+        ('ByRef', lambda V: (V + 3 + V + 7) * 100 + V + 7),
+        ('ByValue', lambda V: V + 1 + 100),
+        ('ByValueRead', lambda V: V * 4 + 3),
+        ('Mutable', lambda V: ((V + 1) + (V + 3)) * 100 + V),
+        ('InitCapture', lambda V: (V + 1) * 7),
+        ('InitCaptures', lambda V: ((V * 10 + V * 2) + (V + V * 2)) * 100 + V + 2),
+        ('InitUnused', lambda V: V * 3 + 1),
+        ('Immediate', lambda V: V * 5),
+        ('ImmediateInCondition', lambda V: 1 if V > 3 else 0),
+        ('ToTemplate', lambda V: (V + 5) * 2 + 1 + V + 5),
+        ('ToTemplateVar', lambda V: ((V + 2) + 1 + (V + 5) + 1) * 100 + V + 5),
+        ('ToTemplateRef', lambda V: (V * 3 + 1) * 3 + 1),
+        ('EachOf', lambda V: ((1 + V) * 10 + 2 + V) * 10 + 3 + V),
+        ('VarsInPlace', lambda V: V),                       # the parameter is the argument's value, not what [&] stored
+        ('ArgWritten', lambda V: V * 100 + 9),
+        ('Generic', lambda V: (V + 2) * 10 + 2),
+        ('Nested', lambda V: (V + 1) * 2 + V + 1),
+        ('Body', lambda V: sum(range(min(max(V, 0), 10))) + 1),
+        ('Returns', lambda V: sign(V) * 10 + sign(V - 5)),
+        ('WithParam', lambda V: V * 3),
+        ('ParamWritten', lambda V: V * 3 + V + 100),
+        ('TwoShadows', lambda V: (V + 1) * 1000 + V * 2 + 1),
+        ('InLoop', lambda V: sum(i * 10 + V for i in range(3))),
+        ('ConstCapture', lambda V: V * 5),
+        ('Defaults', lambda V: V * 12),
+        ('ArrayRef', lambda V: 200 + V + 1),
+        ('ReferenceVar', lambda V: (V + 1) * 100 + 50),
+        ('CommaArg', lambda V: (V + 1) * 10 + 3),
+        ('InCondition', lambda V: V + V % 2 if V > 0 else 0),
+        ('RefToLambda', lambda V: V + 1),
+        ('RefArg', lambda V: V + 3),
+    ]
+    for fn, want in forms:
+        for v in (-5, 0, 3, 8):
+            got = run(base, fn, V=v)[0]
+            assert got == want(v), '%s(%d) = %r, want %r' % (fn, v, got, want(v))
+    for v in (-5, 0, 3, 8):
+        assert run(base, 'ThisMember', V=v, self_vars=dict(M=7))[0] == (7 + v) * 100 + 7 + v + 1
+        assert run(base, 'GenericFloat', V=float(v))[0] == v + 0.5 + 2
+        assert run(base, 'StructCapture', P=dict(X=float(v), Y=4.0, Z=0.0))[0] == v * 2.0 + 4.0
+        assert run(kid, 'Use', V=v, self_vars=dict(M=7))[0] == (v + 7) * 100 + v + 8
+        out = run(base, 'RefParam', V=v, Out=10)
+        assert out[0] == 11 + v and out[1]['Out'] == 11 + v, out
+    # `this` is the object: the member the lambda wrote is the object's
+    vm = VM(base, {}, M=7)
+    assert vm.call('ThisMember', V=3) == 1011 and vm.self.vars['M'] == 11, vm.self.vars
+    # a wait in the body parks the function, and the snapshot it took lives in the frame
+    vm = VM(base, {'Delay': latent_call}, Stage=0, Log=[])
+    vm.call('Waits', Tag=5)
+    assert vm.self.vars == dict(Stage=0, Log=[]) and len(vm.latent) == 1, vm.self.vars
+    vm.fire(0)
+    assert vm.self.vars == dict(Stage=0, Log=[6]) and len(vm.latent) == 1, vm.self.vars
+    vm.fire(0)
+    assert vm.self.vars == dict(Stage=5, Log=[6, 7]) and not vm.latent, vm.self.vars
+
+
+lambdas()
+print('ok  LambdaTest: by-ref, by-value, mutable, init-captures, this, immediate, generic, nested, passed to a template, '
+      'in loops and with a wait, as the expanded body')
+
+
+def lambda_refusals():
+    """What cannot be expanded in place says why, each with its own message."""
+    src = 'auto L = [V](int32 A) mutable { V += A; return V; };'
+    for mod, top, body, why in (
+        ('LamRecursive', '', 'int32 F(int32 V) { auto Fact = [&](auto Self, int32 N) -> int32 { return N <= 1 ? 1 : N * Self(Self, N - 1); }; return Fact(Fact, V); }',
+         'calls itself: a lambda cannot recurse here, write a method'),
+        ('LamCopyMutable', '', 'int32 F(int32 V) { %s auto L2 = L; return L2(1) + L(2); }' % src,
+         'is a copy of a mutable lambda, which would fork its state'),
+        ('LamPassMutable', 'template <class G> inline int32 Use(G Fn) { return Fn(1); }', 'int32 F(int32 V) { %s return Use(L); }' % src,
+         'takes a mutable lambda by value, which copies its state'),
+        ('LamCaptureMutable', '', 'int32 F(int32 V) { %s auto K = [=](int32 A) mutable { return L(A); }; return K(1); }' % src,
+         'which would fork its state: capture it by reference'),
+        ('LamStatic', '', 'int32 F(int32 V) { auto L = [](int32 A) { static int32 N = 0; N += A; return N; }; return L(V); }',
+         'static N in an inline function'),
+        ('LamReturned', '', 'int32 F(int32 V) { auto Make = [](int32 V) { return [V](int32 A) { return A + V; }; }; return Make(1)(V); }',
+         'returned from a function'),
+        ('LamExplicitCall', '', 'int32 F(int32 V) { auto L = [](int32 A) { return A + 1; }; return L.operator()(V); }',
+         'a lambda\'s operator() called by name'),
+        ('LamCopyThis', '', 'int32 M = 0; int32 F(int32 V) { auto L = [*this](int32 A) { return A + M; }; return L(V); }',
+         '[*this] copies the object'),
+        ('LamStored', '', 'int32 F(int32 V) { auto L = [](int32 A) { return A; }; TArray<decltype(L)> Arr; return V; }',
+         'unimplemented local'),
+        ('LamStaticVar', '', 'int32 F(int32 V) { static auto L = [V](int32 A) mutable { V += A; return V; }; return L(1); }',
+         'static lambda L'),
+    ):
+        refused(mod, body, why, top=top)
+    print('ok  lambdas: recursion, copying or capturing a mutable lambda, a static, returning one, calling operator() by '
+          'name, [*this] and storing one are refused with their own messages')
+
+
+lambda_refusals()
+
+
 PREFETCH.finish()
 print('ok  %d known gaps, each a failing test of something AssetGen does not do yet' % len(GAPS))
 assert not FIXED, 'these pass now, move them in with the others: ' + ', '.join(FIXED)

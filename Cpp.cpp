@@ -100,6 +100,13 @@ std::string TypeOf(const Json& N)
     return It == N.end() ? std::string() : It->value("qualType", std::string());
 }
 
+/* A closure type's spelling, `(lambda at File:Line:Col)`, under any const or reference. */
+bool IsClosureType(std::string T)
+{
+    while (T.compare(0, 6, "const ") == 0) T.erase(0, 6);
+    return T.compare(0, 11, "(lambda at ") == 0;
+}
+
 /* A namespace is a folder: `A::B::X` is <Package>/A/B/X. One that starts at Game is a /Game path of its own, `Game::A::X`
    being /Game/A/X, which is where genueapi puts a game Blueprint's class too. */
 std::string PathIn(const std::string& Package, const std::string& Qualified)
@@ -2074,6 +2081,42 @@ private:
     bool FreeLibrary(const FFreeFn& F, std::string* Err);
     std::map<std::string, const Json*> MemberTemplates;                 // decl id -> a member template's instantiation,
                                                                         // expanded inline like an inline method
+
+    /* Lambdas (REFERENCE.md, "Lambdas"). No closure object exists: a lambda is an inline function local to the one
+       that declares it, expanded where it is called, its captures the declaring function's own locals. A call
+       `L(x)` is rewritten at index time into a CallExpr on the closure's operator(), which FreeInlines holds like any
+       inline function, the object it is called on kept aside (see RewriteLambdaCalls, "lambdaObj"). What the object
+       is - which captures, their snapshot locals, the world context and class it was written in - is an FLambda,
+       found through the variable or closure-typed parameter that names it. */
+    struct FLambdaCapture
+    {
+        std::string DeclId;         // the declaration the body names the capture by: the captured variable, or an init-capture's
+        std::string Shadow;         // the snapshot local the body reads and writes in its place; empty: the variable itself
+        bool bRefInit = false;      // `[&R = V]`: R is another name for the place Alias is
+        Json Alias;
+    };
+    struct FLambda
+    {
+        std::string Where;                          // "(lambda at File:Line:Col)", for messages
+        std::vector<FLambdaCapture> Caps;
+        std::string Wco;                            // CurrentWco where it was written: its calls leave out the world
+        const FRecord* Written = nullptr;           // the class it was written in (NamesQualified)
+        bool bMutable = false;                      // by-value captures are its own state, kept from call to call
+        bool bRefCapture = false;                   // it can write a local of the declaring function
+    };
+    std::map<std::string, std::shared_ptr<FLambda>> LambdaOf;           // a closure variable's or parameter's decl id
+    std::set<std::string> LambdaOps;                                    // decl ids of the closures' operator() bodies
+    std::map<std::string, std::string> LambdaOwner;                     // such an operator()'s id -> the class it was written in
+    const Json* CurFnBody = nullptr;                                    // the body of the function being compiled
+    void IndexLambdas(const Json& N);
+    void RewriteLambdaCalls(Json& N);
+    bool CaptureNames(const Json& Lambda, const std::vector<const Json*>& Inits, std::vector<std::string>* Names,
+                      std::vector<char>* Kinds, std::string* Err) const;
+    bool DeclareLambda(const Json& LambdaExpr, FBlueprintClass& BP, std::vector<FStmtIR>& Out,
+                       std::shared_ptr<FLambda>* Info, std::string* Err);
+    bool ResolveLambda(const Json& Operand, FBlueprintClass& BP, std::vector<FStmtIR>* Out, std::shared_ptr<FLambda>* Info,
+                       bool* bCopy, std::string* Err);
+    bool ReadOnlyInScope(const std::string& DeclId) const;
     /* The class a field access `Obj->Field` / `Field` reads from: Obj's static type, or the class being generated. */
     /* An interface and the interfaces it extends, nearest first. A native one has no base in UeApi. */
     std::vector<const FRecord*> InterfaceChain(const FRecord* I) const
@@ -6801,6 +6844,13 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         Out.K = int64(Out.I) == V ? FArgIR::Int : FArgIR::Int64;
         return true;
     }
+    if (K == "LambdaExpr")
+    {
+        *Err = "TODO: a lambda expression used as a value: it can be declared and called, called in place, or passed "
+               "to an inline function or template that is expanded; it cannot be passed to a function that is not "
+               "expanded, stored or returned";
+        return false;
+    }
     if (K == "CharacterLiteral") { Out.K = FArgIR::Int; Out.I = int32(CharValue(*N)); Out.I64 = Out.I; return true; }
     /* strtof, not stof: a double literal past float's range is inf, as (float)1e39 is in C++, not an exception. */
     if (K == "FloatingLiteral")
@@ -6826,6 +6876,13 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             Out.I = int32(V->second);
             Out.I64 = V->second;
             return true;
+        }
+        /* A lambda is called, or handed to an inline function that is expanded; it has no value to read. */
+        if ((RefKind == "VarDecl" || RefKind == "ParmVarDecl") && (LambdaOf.count(Ref.value("id", std::string())) || IsClosureType(TypeOf(*N))))
+        {
+            *Err = "TODO: lambda " + Name(Ref) + " used as a value: it can be called, or passed to an inline function or "
+                   "template that is expanded; it cannot be passed to a function that is not expanded, stored or returned";
+            return false;
         }
         /* A reference local (or a range-for binding) is the variable it names, the place it walks, or the value at the
            address it keeps. */
@@ -8347,6 +8404,13 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         if (Kind(*Callee) != "MemberExpr") { *Err = "TODO: unimplemented callee " + Kind(*Callee); return false; }
         DeclId = Callee->value("referencedMemberDecl", std::string());
         MethodName = Name(*Callee);
+        /* `+[](int X) { ... }`, or a lambda handed to a function pointer: the conversion function of a closure. */
+        if (MethodName.compare(0, 9, "operator ") == 0 && MethodName.find("(*)") != std::string::npos)
+        {
+            *Err = "TODO: a lambda converted to a function pointer: a Blueprint has no function pointer, call the "
+                   "lambda or pass it to an inline function or template";
+            return false;
+        }
     }
     else
     {
@@ -10267,6 +10331,24 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 }
                 if (!bOk || DK != "VarDecl") return;
                 bAny = true;
+                /* A closure variable is no property: it is the lambda itself, its captures' snapshots stored here
+                   (DeclareLambda), a call of it the expansion of its body. A reference or a copy of another is the
+                   same lambda; a copy of a mutable one would fork its state, which has no representation. */
+                if (IsClosureType(TypeOf(D)))
+                {
+                    std::shared_ptr<FLambda> Lam;
+                    bool bCopy = false;
+                    if (IsStaticDecl(D))
+                    { *Err = "TODO: static lambda " + Name(D) + ": each expansion would keep its own state; declare it without static"; bOk = false; return; }
+                    if (!First(D)) { *Err = "TODO: lambda " + Name(D) + " declared with no initialiser"; bOk = false; return; }
+                    if (!ResolveLambda(*First(D), BP, &Out, &Lam, &bCopy, Err)) { bOk = false; return; }
+                    if (!Lam)
+                    { *Err = "TODO: lambda " + Name(D) + " is initialised from something that is not a lambda"; bOk = false; return; }
+                    if (bCopy && Lam->bMutable && Kind(*Strip(First(D))) != "LambdaExpr")
+                    { *Err = "TODO: lambda " + Name(D) + " is a copy of a mutable lambda, which would fork its state: bind a reference"; bOk = false; return; }
+                    LambdaOf[D.value("id", std::string())] = Lam;
+                    return;
+                }
                 const std::string VarName = LocalName(D);
                 std::string VarType = TypeOf(D);
                 FStmtIR Ds;
@@ -10669,6 +10751,13 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 bOk = false;
                 return;
             }
+        }
+        else if (K == "ReturnStmt" && First(*S) && IsClosureType(TypeOf(*First(*S))))
+        {
+            *Err = "TODO: a lambda returned from a function: a lambda has no value that outlives the function that "
+                   "declares it, it is expanded where it is called";
+            bOk = false;
+            return;
         }
         else if (K == "ReturnStmt" && !InlineResults.empty())
         {
@@ -12323,6 +12412,7 @@ const FRecord* FCompiler::DeclaredIn(const Json& Inline) const
     const std::string Id = Inline.value("id", std::string());
     if (auto O = MethodOwner.find(Id); O != MethodOwner.end()) return Find(O->second);
     if (auto T = TemplateOwner.find(Id); T != TemplateOwner.end()) return Find(T->second);
+    if (auto L = LambdaOwner.find(Id); L != LambdaOwner.end()) return Find(L->second);
     return nullptr;
 }
 
@@ -12586,18 +12676,406 @@ bool FCompiler::ResumesLater(const Json& N, std::set<const Json*>& Seen) const
     return bFound;
 }
 
+/* Every closure's operator() with a body is an inline function like any other, called by its decl id (LowerCall finds
+   it in FreeInlines): a generic lambda's, each specialization a call names, which carries a TemplateArgument. */
+void FCompiler::IndexLambdas(const Json& N)
+{
+    if (!N.is_object()) return;
+    if (Kind(N) == "LambdaExpr")
+    {
+        auto Register = [&](const Json& M) {
+            bool bBody = false;
+            ForEach(M, [&](const Json& B) { bBody = bBody || Kind(B) == "CompoundStmt"; });
+            if (!bBody) return;
+            const std::string Id = M.value("id", std::string());
+            LambdaOps.insert(Id);
+            FreeInlines[Id] = &M;
+        };
+        ForEach(N, [&](const Json& C) {
+            if (Kind(C) != "CXXRecordDecl") return;
+            ForEach(C, [&](const Json& M) {
+                if (Kind(M) == "CXXMethodDecl" && Name(M) == "operator()") Register(M);
+                if (Kind(M) != "FunctionTemplateDecl") return;
+                ForEach(M, [&](const Json& X) {
+                    bool bSpecialization = false;
+                    ForEach(X, [&](const Json& A) { bSpecialization = bSpecialization || Kind(A) == "TemplateArgument"; });
+                    if (Kind(X) == "CXXMethodDecl" && Name(X) == "operator()" && bSpecialization) Register(X);
+                });
+            });
+        });
+    }
+    ForEach(N, [&](const Json& C) { IndexLambdas(C); });
+}
+
+/* `L(x)` is a CXXOperatorCallExpr [operator(), L, x]. Rewritten here, once, into the CallExpr [operator(), x] of an
+   ordinary inline call, the object L kept in "lambdaObj" (ExpandInline reads what it is): so HoistComma, the
+   impurity and eager-safety predicates, ResumesLater and the argument-order code see an inline call, which is what
+   it is, and none of them has a lambda case. Run after IndexLambdas has seen every closure. */
+void FCompiler::RewriteLambdaCalls(Json& N)
+{
+    if (!N.is_object()) return;
+    if (auto In = N.find("inner"); In != N.end() && In->is_array())
+        for (Json& C : *In) RewriteLambdaCalls(C);
+    if (Kind(N) != "CXXOperatorCallExpr" || !N.contains("inner") || N["inner"].size() < 2) return;
+    const Json* Callee = Strip(&N["inner"][0]);
+    if (!Callee || Kind(*Callee) != "DeclRefExpr" || !Callee->contains("referencedDecl")) return;
+    if (!LambdaOps.count((*Callee)["referencedDecl"].value("id", std::string()))) return;
+    N["lambdaObj"] = std::move(N["inner"][1]);
+    N["inner"].erase(N["inner"].begin() + 1);
+    N["kind"] = "CallExpr";
+}
+
+/* The explicit captures of a lambda, by name, read off the capture list where it is written: clang's AST names a
+   by-value capture by the variable it copies (the body's DeclRefExpr), but an init-capture's own variable is
+   anonymous in it, and two of them cannot be told apart by anything but their order and spelling.
+   Names[I] and Kinds[I] are for the I-th capture (the closure's I-th FieldDecl): 'p' a variable by name, 't' this,
+   'i' `N = E`, 'r' `&N = E`, 'd' implicit (default-captured: after every explicit one). Each source of the mod is
+   tried where the lambda's range begins and one has to read as a capture list that agrees with the AST: a plain
+   entry names the variable its initialiser is. The text of a lambda in a macro or a header is not here. */
+bool FCompiler::CaptureNames(const Json& L, const std::vector<const Json*>& Inits, std::vector<std::string>* Names,
+                             std::vector<char>* Kinds, std::string* Err) const
+{
+    const Json Begin = L.value("range", Json::object()).value("begin", Json::object());
+    if (Begin.contains("spellingLoc") || !Begin.contains("offset"))
+    {
+        *Err = "an init-capture in a lambda written in a macro: its capture list cannot be read; capture the variable by "
+               "name, or declare the variable beside the lambda";
+        return false;
+    }
+    const size_t Off = Begin["offset"].get<size_t>();
+    auto Ident = [](char C) { return std::isalnum(uint8(C)) || C == '_'; };
+    for (const std::string& T : ModSources())
+    {
+        if (Off >= T.size() || T[Off] != '[') continue;
+        std::vector<std::string> Entries;
+        std::string Cur;
+        int32 Depth = 0, Angle = 0;
+        bool bClosed = false, bInit = false;
+        for (size_t P = Off + 1; P < T.size(); ++P)
+        {
+            const char C = T[P];
+            if (C == '"' || C == '\'')
+            {
+                Cur += C;
+                for (++P; P < T.size() && T[P] != C; ++P)
+                {
+                    Cur += T[P];
+                    if (T[P] == '\\' && P + 1 < T.size()) Cur += T[++P];
+                }
+                if (P < T.size()) Cur += T[P];
+                continue;
+            }
+            if (C == '(' || C == '{' || C == '[') ++Depth;
+            else if (C == ')' || C == '}') --Depth;
+            else if (C == ']')
+            {
+                if (Depth == 0) { bClosed = true; break; }
+                --Depth;
+            }
+            else if (C == '=' && Depth == 0) bInit = true;
+            else if (C == '<' && bInit && Depth == 0) ++Angle;
+            else if (C == '>' && Angle > 0) --Angle;
+            else if (C == ',' && Depth == 0 && Angle == 0) { Entries.push_back(Cur); Cur.clear(); bInit = false; continue; }
+            Cur += C;
+        }
+        if (!bClosed) continue;
+        Entries.push_back(Cur);
+        std::vector<std::string> N;
+        std::vector<char> K;
+        bool bFits = true;
+        for (std::string E : Entries)
+        {
+            const size_t A = E.find_first_not_of(" \t\r\n"), Z = E.find_last_not_of(" \t\r\n");
+            E = A == std::string::npos ? std::string() : E.substr(A, Z - A + 1);
+            if (E.empty() || E == "=" || E == "&") continue;                // none, or the default
+            if (E == "this") { N.push_back(""); K.push_back('t'); continue; }
+            if (E == "*this")
+            { *Err = "[*this] copies the object into the lambda, which a Blueprint cannot"; return false; }
+            if (E.size() > 3 && E.compare(E.size() - 3, 3, "...") == 0)
+            { *Err = "a pack in a lambda's capture list"; return false; }
+            size_t P = 0;
+            const bool bRef = E[P] == '&';
+            if (bRef) { ++P; while (P < E.size() && E[P] == ' ') ++P; }
+            const size_t Start = P;
+            while (P < E.size() && Ident(E[P])) ++P;
+            if (P == Start) { bFits = false; break; }
+            const std::string Id = E.substr(Start, P - Start);
+            while (P < E.size() && (E[P] == ' ' || E[P] == '\t')) ++P;
+            if (P == E.size()) { N.push_back(Id); K.push_back('p'); }
+            else if (E[P] == '=' || E[P] == '{' || E[P] == '(') { N.push_back(Id); K.push_back(bRef ? 'r' : 'i'); }
+            else { bFits = false; break; }
+        }
+        if (!bFits || N.size() > Inits.size()) continue;
+        /* A plain entry has to be the variable its initialiser is, by name. */
+        for (size_t I = 0; I < N.size() && bFits; ++I)
+        {
+            const Json* Src = Strip(Inits[I]);
+            if (K[I] == 't') bFits = Src && Kind(*Src) == "CXXThisExpr";
+            else if (K[I] == 'p')
+                bFits = Src && Kind(*Src) == "DeclRefExpr" && Src->contains("referencedDecl")
+                     && (*Src)["referencedDecl"].value("name", std::string()) == N[I];
+        }
+        if (!bFits) continue;
+        N.resize(Inits.size());
+        K.resize(Inits.size(), 'd');
+        *Names = std::move(N);
+        *Kinds = std::move(K);
+        return true;
+    }
+    *Err = "an init-capture whose capture list cannot be read from the mod's own sources (a lambda in a macro or in a "
+           "header); capture the variable by name, or declare the variable beside the lambda";
+    return false;
+}
+
+/* Whether the declaration is only ever read in the function whose own local it is, so its value is its initialiser's
+   wherever a later statement reads it: ReadOnlyLocal, but over the whole function and not the innermost block (a
+   lambda sits in a block of its own, and a write after that block is not in CurBody). The function's body, or the
+   body of an inline function expanding in it, whichever names the declaration. */
+bool FCompiler::ReadOnlyInScope(const std::string& DeclId) const
+{
+    std::vector<const Json*> Scopes;
+    if (CurFnBody) Scopes.push_back(CurFnBody);
+    for (const Json* D : InlineStack)
+        ForEach(*D, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Scopes.push_back(&C); });
+    for (const Json* S : Scopes)
+        if (UsesOf(*S, DeclId) > 0) return OnlyRead(*S, DeclId);
+    return false;
+}
+
+/* The state a lambda expression makes where it is written, as its VarDecl, a call's object or an argument:
+     - a by-reference capture is nothing: the body names the variable itself, and writes to it are the function's own
+       (OnlyRead already sees them: it walks the lambda's body as part of the function's);
+     - a by-value capture of a variable that is a constant or is never written is that variable, in place;
+     - any other by-value capture, a mutable lambda's, an init-capture, gets a snapshot local, assigned here, which the
+       body reads and writes instead of the variable while it runs (ExpandInline binds the rename for the body only:
+       LocalRename is flat and two lambdas may copy the same variable);
+     - `this` is the object: nothing.
+   The world context and class it was written in are saved, as its calls run in the body of whatever function they
+   are reached from. Snapshots are appended to Out, in the order C++ evaluates the capture list. */
+bool FCompiler::DeclareLambda(const Json& L, FBlueprintClass& BP, std::vector<FStmtIR>& Out,
+                              std::shared_ptr<FLambda>* Info, std::string* Err)
+{
+    if (!CurLocals) { *Err = "internal: a lambda outside a function body"; return false; }
+    auto Lam = std::make_shared<FLambda>();
+    Lam->Where = StripTypeKeywords(TypeOf(L));
+    Lam->Wco = CurrentWco;
+    Lam->Written = Cur;
+    if (!InlineStack.empty())
+        if (const FRecord* In = DeclaredIn(*InlineStack.back())) Lam->Written = In;
+
+    /* Its parts: the closure record (operator() and one FieldDecl per capture), the capture initialisers in order,
+       and the body again as the last child. */
+    const Json* Closure = nullptr;
+    const Json* Body = nullptr;
+    std::vector<const Json*> Inits, Kids;
+    ForEach(L, [&](const Json& C) { Kids.push_back(&C); });
+    for (size_t I = 0; I < Kids.size(); ++I)
+    {
+        if (!Closure && Kind(*Kids[I]) == "CXXRecordDecl") Closure = Kids[I];
+        else if (I + 1 == Kids.size() && Kind(*Kids[I]) == "CompoundStmt") Body = Kids[I];
+        else Inits.push_back(Kids[I]);
+    }
+    std::vector<std::string> FieldTypes;
+    const Json* Op = nullptr;
+    if (Closure)
+        ForEach(*Closure, [&](const Json& C) {
+            if (Kind(C) == "FieldDecl") FieldTypes.push_back(TypeOf(C));
+            else if (!Op && Kind(C) == "CXXMethodDecl" && Name(C) == "operator()") Op = &C;
+            else if (!Op && Kind(C) == "FunctionTemplateDecl")
+                ForEach(C, [&](const Json& X) { if (!Op && Kind(X) == "CXXMethodDecl") Op = &X; });
+        });
+    if (!Closure || !Body || FieldTypes.size() != Inits.size())
+    { *Err = "internal: " + Lam->Where + " has captures this compiler cannot pair with its fields"; return false; }
+    Lam->bMutable = Op && TypeOf(*Op).find(") const") == std::string::npos;
+
+    /* What the body names that is not its own: a captured variable, or an init-capture's variable, which no
+       declaration in the AST holds. */
+    std::map<std::string, std::string> Free;            // decl id -> name
+    std::set<std::string> Own;
+    std::function<void(const Json&)> Walk = [&](const Json& N) {
+        if (!N.is_object()) return;
+        const std::string K = Kind(N);
+        if ((K == "VarDecl" || K == "ParmVarDecl" || K == "BindingDecl" || K == "DecompositionDecl") && N.contains("id"))
+            Own.insert(N.value("id", std::string()));
+        if (K == "DeclRefExpr" && N.contains("referencedDecl"))
+        {
+            const Json& R = N["referencedDecl"];
+            const std::string RK = R.value("kind", std::string());
+            if (RK == "VarDecl" || RK == "ParmVarDecl") Free[R.value("id", std::string())] = R.value("name", std::string());
+        }
+        ForEach(N, Walk);
+    };
+    Walk(*Body);
+    if (Op) ForEach(*Op, [&](const Json& C) { if (Kind(C) == "ParmVarDecl") Own.insert(C.value("id", std::string())); });
+    /* ... of which the enclosing functions declare theirs; what no function declares is an init-capture's. */
+    std::set<std::string> Declared;
+    std::function<void(const Json&)> Declares = [&](const Json& N) {
+        if (!N.is_object()) return;
+        const std::string K = Kind(N);
+        if ((K == "VarDecl" || K == "ParmVarDecl" || K == "BindingDecl") && N.contains("id")) Declared.insert(N.value("id", std::string()));
+        ForEach(N, Declares);
+    };
+    if (CurFnDef) Declares(*CurFnDef);
+    for (const Json* D : InlineStack) Declares(*D);
+    std::vector<std::string> Anonymous;                 // ids the body names that nothing declares
+    for (const auto& [Id, Nm] : Free)
+        if (!Own.count(Id) && !Declared.count(Id) && !ConstVars.count(Id) && !NsVars.count(Id) && !MutableStatics.count(Id))
+            Anonymous.push_back(Id);
+
+    std::vector<const Json*> Srcs(Inits.size());
+    bool bNeedNames = !Anonymous.empty();
+    for (size_t I = 0; I < Inits.size(); ++I)
+    {
+        Srcs[I] = PeelLvalue(Strip(Inits[I]));
+        const bool bThis = Srcs[I] && Kind(*Srcs[I]) == "CXXThisExpr";
+        const bool bPlain = Srcs[I] && Kind(*Srcs[I]) == "DeclRefExpr" && Srcs[I]->contains("referencedDecl")
+                         && Free.count((*Srcs[I])["referencedDecl"].value("id", std::string()));
+        if (!bThis && !bPlain) bNeedNames = true;
+    }
+    std::vector<std::string> Names(Inits.size());
+    std::vector<char> Kinds(Inits.size(), 'd');
+    if (bNeedNames && !CaptureNames(L, Inits, &Names, &Kinds, Err)) return false;
+
+    std::vector<FStmtIR>& Snapshots = Out;
+    for (size_t I = 0; I < Inits.size(); ++I)
+    {
+        const std::string FT = FieldTypes[I];
+        const bool bRefField = !FT.empty() && FT.back() == '&';
+        FLambdaCapture Cap;
+        const char Kd = Kinds[I];
+        if (Kd == 't' || (Srcs[I] && Kind(*Srcs[I]) == "CXXThisExpr" && Kd != 'i' && Kd != 'r')) continue;
+        if (Kd == 'r')
+        {
+            const Json* Place = PeelLvalue(Inits[I]);
+            if (!Place || !IsAliasable(*Place) || IsDerefLvalue(*Place))
+            { *Err = Lam->Where + ": the init-capture `&" + Names[I] + " = ...` has to name a variable or a place under one"; return false; }
+            for (const std::string& Id : Anonymous)
+                if (Free[Id] == Names[I]) Cap.DeclId = Id;
+            Cap.bRefInit = true;
+            Cap.Alias = *Place;
+            Lam->bRefCapture = true;
+            if (!Cap.DeclId.empty()) Lam->Caps.push_back(std::move(Cap));
+            continue;
+        }
+        bool bSnapshot = true;
+        if (Kd == 'i')
+        {
+            std::vector<std::string> Same;
+            for (const std::string& Id : Anonymous) if (Free[Id] == Names[I]) Same.push_back(Id);
+            if (Same.size() > 1)
+            { *Err = Lam->Where + ": more than one variable named " + Names[I] + " in an init-capture's scope"; return false; }
+            Cap.DeclId = Same.empty() ? std::string() : Same[0];
+        }
+        else
+        {
+            if (!Srcs[I] || Kind(*Srcs[I]) != "DeclRefExpr" || !Srcs[I]->contains("referencedDecl"))
+            { *Err = Lam->Where + ": a capture this compiler cannot tell from the AST"; return false; }
+            Cap.DeclId = (*Srcs[I])["referencedDecl"].value("id", std::string());
+            /* A lambda captured is the same lambda, named from inside the body by the variable that holds it. A
+               mutable one copied by value would fork its state. */
+            if (IsClosureType(FT))
+            {
+                const auto Held = LambdaOf.find(Cap.DeclId);
+                if (Held != LambdaOf.end() && Held->second->bRefCapture) Lam->bRefCapture = true;
+                if (Held != LambdaOf.end() && Held->second->bMutable && !bRefField)
+                { *Err = Lam->Where + ": it copies the mutable lambda " + Held->second->Where + ", which would fork its state: capture it by reference"; return false; }
+                continue;
+            }
+            if (bRefField) { Lam->bRefCapture = true; continue; }
+            /* A constant, or a variable nothing writes, is its own snapshot. A reference variable names a place that
+               may change under it, so it is copied. */
+            const bool bPlaceVar = RefAlias.count(Cap.DeclId) || RefPlace.count(Cap.DeclId) || RefAddr.count(Cap.DeclId);
+            if (!Lam->bMutable && !bPlaceVar && (ParmConst.count(Cap.DeclId) || ReadOnlyInScope(Cap.DeclId))) bSnapshot = false;
+        }
+        if (bRefField) { Lam->bRefCapture = true; continue; }
+        if (!bSnapshot) continue;
+
+        std::string Type = FT;
+        while (!Type.empty() && (Type.back() == '&' || Type.back() == ' ')) Type.pop_back();
+        Type = StripTypeKeywords(Type);
+        FArgIR Value;
+        if (!LowerArg(*Inits[I], BP, Value, Err)) return false;
+        const std::string Of = !Names[I].empty() ? Names[I] : Free.count(Cap.DeclId) ? Free[Cap.DeclId] : std::string("Var");
+        const std::string Shadow = "__Cap" + std::to_string(ReadTmpCounter++) + "_" + Of;
+        FPropertyDef PD;
+        if (!TypeToProperty(Type, Shadow, 0, "a lambda capture", BP, &PD, Err)) return false;
+        PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+        CurLocals->push_back(PD);
+        if (Value.Class && !Cap.DeclId.empty() && ReadOnlyInScope(Cap.DeclId)) LocalClass[Shadow] = Value.Class;
+        else LocalClass.erase(Shadow);
+        FStmtIR Bind;
+        Bind.K = FStmtIR::Assign;
+        Bind.Var.K = FArgIR::Local;
+        Bind.Var.S = Shadow;
+        Bind.Var.LetOp = LetOpFor(Type);
+        Bind.bAssignLocal = true;
+        Bind.Value = std::move(Value);
+        Snapshots.push_back(std::move(Bind));
+        Cap.Shadow = Shadow;
+        if (!Cap.DeclId.empty()) Lam->Caps.push_back(std::move(Cap));
+    }
+    *Info = std::move(Lam);
+    return true;
+}
+
+/* What closure an expression is: the lambda written there (declared into Out, which a temporary needs), or the
+   variable or parameter that names one. Null Info for anything else. bCopy: it went through a copy construction, as a
+   closure passed or bound by value does. */
+bool FCompiler::ResolveLambda(const Json& Operand, FBlueprintClass& BP, std::vector<FStmtIR>* Out,
+                              std::shared_ptr<FLambda>* Info, bool* bCopy, std::string* Err)
+{
+    Info->reset();
+    *bCopy = false;
+    const Json* N = &Operand;
+    while (N)
+    {
+        const std::string K = Kind(*N);
+        if (K == "CXXConstructExpr") { if (!First(*N)) return true; *bCopy = true; }
+        else if (K != "ImplicitCastExpr" && K != "ParenExpr" && K != "ConstantExpr" && K != "ExprWithCleanups"
+                 && K != "CXXBindTemporaryExpr" && K != "MaterializeTemporaryExpr" && K != "CXXFunctionalCastExpr"
+                 && K != "CXXStaticCastExpr" && K != "CXXConstCastExpr")
+            break;
+        N = First(*N);
+    }
+    if (!N) return true;
+    if (Kind(*N) == "LambdaExpr")
+    {
+        if (!Out) { *Err = "internal: a lambda expression where nothing can hold its captures"; return false; }
+        return DeclareLambda(*N, BP, *Out, Info, Err);
+    }
+    if (Kind(*N) == "DeclRefExpr" && N->contains("referencedDecl"))
+        if (auto L = LambdaOf.find((*N)["referencedDecl"].value("id", std::string())); L != LambdaOf.end())
+            *Info = L->second;
+    return true;
+}
+
 /* The call becomes one Block statement in Out.Inline:
        <each by-value parameter> = <its argument>;
        <the body, locals renamed __Inl<N>_<name>, `return X` as `__Inl<N>_ReturnValue = X` + a jump to the end>
    A reference parameter bound to a place (a variable, `O->A`, `Arr[I]`) is another name for it; bound to a map element
    or `C ? X : Y`, a copy stored back after the body when the body writes it; bound to a value, a copy.
    Only calls on `this` (or a static) expand, since the body's `this` stays the caller's self. */
-bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::string& Method, bool bMethod, FBlueprintClass& BP,
+bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::string& MethodName, bool bMethod, FBlueprintClass& BP,
                              FCallIR& Out, std::string* Err, const Json* Receiver, bool bStaticCall)
 {
     if (!CurLocals) { *Err = "internal: an inline call outside a function body"; return false; }
+    /* A lambda's call is an inline call of its operator(): named by where it is written in a message. */
+    const bool bLambdaOp = LambdaOps.count(Def.value("id", std::string())) != 0;
+    const bool bLambdaCall = CallNode.contains("lambdaObj");
+    std::string Method = MethodName;
+    if (bLambdaOp && bLambdaCall)
+    {
+        Method = StripTypeKeywords(TypeOf(CallNode["lambdaObj"]));
+        while (!Method.empty() && Method.back() != ')') Method.pop_back();
+    }
+    if (bLambdaOp && !bLambdaCall)
+    { *Err = "TODO: a lambda's operator() called by name: call the lambda, `L(args)`"; return false; }
     if (std::find(InlineStack.begin(), InlineStack.end(), &Def) != InlineStack.end())
-    { *Err = "inline function " + Method + " calls itself"; return false; }
+    {
+        *Err = bLambdaOp ? "TODO: the lambda " + Method + " calls itself: a lambda cannot recurse here, write a method"
+                         : "inline function " + Method + " calls itself";
+        return false;
+    }
     if (bMethod && Kind(CallNode) == "CXXMemberCallExpr")
     {
         const Json* Callee = Strip(First(CallNode));
@@ -12637,9 +13115,36 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
     std::vector<bool> WcoDefault(Args.size());
     for (size_t I = 0; I < Args.size(); ++I) WcoDefault[I] = Kind(*Args[I]) == "CXXDefaultArgExpr" && IsWcoName(Name(*Parms[I]));
     for (size_t I = 0; I < Args.size(); ++I) Args[I] = DefaultedArg(*Args[I], Parms[I]);
+    /* A lambda being called is the object `lambdaObj` (RewriteLambdaCalls). A closure passed as an argument is no
+       value either: the parameter it binds is that lambda, with no local and no copy, and each call of the parameter
+       expands the lambda's body (a closure type is only ever a template's or an `auto` parameter, which expand). */
+    std::shared_ptr<FLambda> Lam;
+    std::vector<std::shared_ptr<FLambda>> LamArg(Parms.size());
+    std::vector<FStmtIR> LamStmts;      // the snapshots of lambdas written in place, after the parameters' binds
+    if (bLambdaOp)
+    {
+        bool bCopy = false;
+        if (!ResolveLambda(CallNode["lambdaObj"], BP, &LamStmts, &Lam, &bCopy, Err)) return false;
+        if (!Lam) {
+            *Err = "TODO: " + Method + " is called on something that is not a lambda variable or parameter (a lambda returned "
+                   "from a function has no value that outlives it)";
+            return false;
+        }
+    }
+    for (size_t I = 0; I < Args.size(); ++I)
+    {
+        if (!IsClosureType(TypeOf(*Args[I])) && !IsClosureType(TypeOf(*Parms[I]))) continue;
+        bool bCopy = false;
+        if (!ResolveLambda(*Args[I], BP, &LamStmts, &LamArg[I], &bCopy, Err)) return false;
+        if (!LamArg[I])
+        { *Err = "TODO: a lambda passed to " + Method + " is not one this compiler can see: a variable or a parameter that holds a lambda, or the lambda itself"; return false; }
+        if (bCopy && LamArg[I]->bMutable)
+        { *Err = "TODO: " + Method + " takes a mutable lambda by value, which copies its state: pass it by reference"; return false; }
+    }
     /* A reference parameter is another name for a variable, or for a place under an object or an index (`O->A`,
        `Arr[F()]`, `O->S.X`) fixed at the call, as binding a reference fixes it. */
     auto Aliased = [&](size_t I) -> const Json* {
+        if (LamArg[I]) return nullptr;
         const std::string Type = TypeOf(*Parms[I]);
         const Json* Bare = PeelLvalue(Args[I]);
         if (Type.empty() || Type.back() != '&' || !Bare || IsDerefLvalue(*Bare)) return nullptr;
@@ -12649,7 +13154,7 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
        after the body. */
     std::vector<std::pair<const Json*, std::string>> CopyBacks;
     for (size_t I = 0; I < Parms.size(); ++I)
-        if (const Json* Bare = PeelLvalue(Args[I]); IsMutableRef(TypeOf(*Parms[I])) && Bare && !Aliased(I) && !IsDerefLvalue(*Bare)
+        if (const Json* Bare = PeelLvalue(Args[I]); !LamArg[I] && IsMutableRef(TypeOf(*Parms[I])) && Bare && !Aliased(I) && !IsDerefLvalue(*Bare)
             && !OnlyRead(*Body, Parms[I]->value("id", std::string())))
             CopyBacks.emplace_back(Args[I], Name(*Parms[I]));
     if (!CopyBacks.empty()) return LowerCopyBack(CallNode, CopyBacks, Method, BP, Out, Err);
@@ -12667,6 +13172,7 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
             const Json Wrap = { {"kind", "CompoundStmt"}, {"inner", std::move(Pre)} };
             if (!LowerBody(Wrap, BP, Pins[I], Locals, Err)) return false;
         }
+        else if (LamArg[I]) {}
         else if (WcoDefault[I]) { if (!CurrentWco.empty()) { Values[I].K = FArgIR::Local; Values[I].S = CurrentWco; } }
         else if (!LowerArg(*Args[I], BP, Values[I], Err)) return false;
     /* The caller's own local can stand in for a parameter the body only reads, as a constant does, when nothing could
@@ -12676,19 +13182,25 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
        outer inline's alias) may name anything, so one bound to a reference parameter keeps every local out. The
        caller's own reference parameter (LocalOut) never stands in: it may be an object's property the body writes. */
     bool bVarsInPlace = !bCurNoOpt;
+    /* A lambda that captures by reference is a second way for a body to reach a caller's local: `Apply(X, [&] { X = 5; })`
+       would read 5 through a parameter that stands for X, and so would a call of such a lambda itself with an argument
+       that is a local it writes. */
+    if (Lam && Lam->bRefCapture) bVarsInPlace = false;
+    for (const std::shared_ptr<FLambda>& A : LamArg)
+        if (A && A->bRefCapture) bVarsInPlace = false;
     std::set<std::string> RefBound;
     std::function<void(const Json&)> NamedIn = [&](const Json& N) {
         if (Kind(N) == "DeclRefExpr" && N.contains("referencedDecl")) RefBound.insert(N["referencedDecl"].value("id", std::string()));
         ForEach(N, NamedIn);
     };
     for (size_t I = 0; I < Parms.size(); ++I)
-        if (IsMutableRef(TypeOf(*Parms[I]))) NamedIn(*Args[I]);
+        if (!LamArg[I] && IsMutableRef(TypeOf(*Parms[I]))) NamedIn(*Args[I]);
     for (const std::string& Id : RefBound) bVarsInPlace = bVarsInPlace && !RefAlias.count(Id);
     std::vector<bool> InPlace(Parms.size());
     for (size_t I = 0; I < Parms.size(); ++I)
     {
         const Json* D = Strip(Args[I]);
-        const std::string Id = D && Kind(*D) == "DeclRefExpr" ? (*D)["referencedDecl"].value("id", std::string()) : std::string();
+        const std::string Id = D && Kind(*D) == "DeclRefExpr" && !LamArg[I] ? (*D)["referencedDecl"].value("id", std::string()) : std::string();
         const FArgIR& X = Values[I];
         InPlace[I] = bVarsInPlace && !Id.empty() && !RefBound.count(Id) && !RefAlias.count(Id) && X.K == FArgIR::Local && !X.Base;
         for (size_t J = 0; J < Parms.size() && InPlace[I]; ++J)
@@ -12703,6 +13215,8 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
         RefAlias.erase(Id);
         LocalRename.erase(Id);
         ParmConst.erase(Id);
+        LambdaOf.erase(Id);
+        if (LamArg[I]) { LambdaOf[Id] = LamArg[I]; continue; }
         while (!Type.empty() && (Type.back() == '&' || Type.back() == ' ')) Type.pop_back();
         Type = StripTypeKeywords(Type);
         /* A pack's parameters all have the pack's name (`const A&... Args`): each gets its own local, by position. */
@@ -12736,6 +13250,7 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
         BindIds.push_back(Id);
         LocalRename[Id] = Local;
     }
+    for (FStmtIR& S : LamStmts) B.Body->push_back(std::move(S));
 
     /* Every local the body declares gets the expansion's prefix. */
     std::function<void(const Json&)> Rename = [&](const Json& N) {
@@ -12771,8 +13286,47 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
             Wco = C->second.K == FArgIR::Local ? C->second.S : std::string();
         break;
     }
+    /* A lambda's calls leave the world context out as its own function's do: where it was written, not where it is
+       called (a template that took it may be another function's), and so for the class it was written in. */
+    if (Lam)
+    {
+        Wco = Lam->Wco;
+        if (Lam->Written) LambdaOwner[Def.value("id", std::string())] = Lam->Written->CppName;
+    }
     const std::string SavedWco = CurrentWco;
     CurrentWco = Wco;
+
+    /* The body names a by-value capture by the variable it copies. Bound for this expansion only (LocalRename is
+       flat, and another lambda may copy the same variable): the snapshot in the variable's place, and an init-capture's
+       reference as the place it names. What the declaration was bound to before comes back after the body. */
+    struct FSavedBinding
+    {
+        std::string Id;
+        std::optional<std::string> Rename;
+        std::optional<FArgIR> Const, Place;
+        std::optional<Json> Alias;
+        std::optional<std::string> Addr;
+    };
+    std::vector<FSavedBinding> SavedCaps;
+    if (Lam)
+        for (const FLambdaCapture& Cap : Lam->Caps)
+        {
+            FSavedBinding S;
+            S.Id = Cap.DeclId;
+            if (auto It = LocalRename.find(Cap.DeclId); It != LocalRename.end()) S.Rename = It->second;
+            if (auto It = ParmConst.find(Cap.DeclId); It != ParmConst.end()) S.Const = It->second;
+            if (auto It = RefPlace.find(Cap.DeclId); It != RefPlace.end()) S.Place = It->second;
+            if (auto It = RefAlias.find(Cap.DeclId); It != RefAlias.end()) S.Alias = It->second;
+            if (auto It = RefAddr.find(Cap.DeclId); It != RefAddr.end()) S.Addr = It->second;
+            SavedCaps.push_back(std::move(S));
+            ParmConst.erase(Cap.DeclId);
+            RefPlace.erase(Cap.DeclId);
+            RefAlias.erase(Cap.DeclId);
+            RefAddr.erase(Cap.DeclId);
+            LocalRename.erase(Cap.DeclId);
+            if (Cap.bRefInit) RefAlias[Cap.DeclId] = Cap.Alias;
+            else if (!Cap.Shadow.empty()) LocalRename[Cap.DeclId] = Cap.Shadow;
+        }
 
     InlineStack.push_back(&Def);
     InlineResults.emplace_back(Out.InlineResult, RetType);
@@ -12791,6 +13345,18 @@ bool FCompiler::ExpandInline(const Json& CallNode, const Json& Def, const std::s
     bBodyHasGoto = HasGoto(*Body);
     bFnHasGoto |= bBodyHasGoto;
     const bool bOk = LowerBody(*Body, BP, *B.Body, Locals, Err);
+    for (const FSavedBinding& S : SavedCaps)
+    {
+        auto Put = [&](auto& Map, const auto& Saved) {
+            if (Saved) Map[S.Id] = *Saved;
+            else Map.erase(S.Id);
+        };
+        Put(LocalRename, S.Rename);
+        Put(ParmConst, S.Const);
+        Put(RefPlace, S.Place);
+        Put(RefAlias, S.Alias);
+        Put(RefAddr, S.Addr);
+    }
     CurrentWco = SavedWco;
     LoopDepth = SavedLoops;
     ReEntered = SavedReEntered;
@@ -20826,6 +21392,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         RefPlace.clear();
         LocalRename.clear();
         ParmConst.clear();
+        LambdaOf.clear();
+        CurFnBody = Fn.Body;
         CurLocals = &Locals;
         LoopDepth = 0;
         SwitchDepth = 0;
@@ -21424,10 +21992,10 @@ private:
 };
 
 /* Builds the DOM of clang's AST dump as it streams in, without what nothing reads: source locations (all but a
-   DeclRefExpr's range begin offset and token length, and its end's in a macro, see NamedQualifier, a MemberExpr's
-   whole range, see MemberQualifier and WrittenQualifier, and a braced value's, see IsUnsetInit), mangled names, a
-   record's definitionData and a few flags are most of the dump, and building them was most of a compile. A key read
-   later must be in neither DroppedAstKey nor key()'s own rules. */
+   DeclRefExpr's or LambdaExpr's range begin offset and token length, and its end's in a macro, see NamedQualifier and
+   CaptureNames, a MemberExpr's whole range, see MemberQualifier and WrittenQualifier, and a braced value's, see
+   IsUnsetInit), mangled names, a record's definitionData and a few flags are most of the dump, and building them was
+   most of a compile. A key read later must be in neither DroppedAstKey nor key()'s own rules. */
 class FAstSax : public nlohmann::json_sax<Json>
 {
 public:
@@ -21441,7 +22009,7 @@ public:
     bool string(string_t& V) override
     {
         if (bKindNext && !Skipped)          // "kind" comes before "range"; a TypeTraitExpr's begin is its trait (FoldConst)
-            Ranged.back() = V == "DeclRefExpr" || V == "TypeTraitExpr" ? ERange::Begin
+            Ranged.back() = V == "DeclRefExpr" || V == "TypeTraitExpr" || V == "LambdaExpr" ? ERange::Begin
                           : V == "MemberExpr" || V == "InitListExpr" || V == "CXXConstructExpr" ? ERange::Whole : ERange::None;
         if (bTypeNext) V = Unrooted(std::move(V));
         return Value(std::move(V));
@@ -21478,8 +22046,8 @@ public:
     bool parse_error(size_t, const std::string&, const nlohmann::detail::exception&) override { return false; }
 
 private:
-    /* What of an open node's range is kept: none, its begin (a DeclRefExpr, a TypeTraitExpr), or the whole range (a
-       MemberExpr, or a braced value: an InitListExpr or CXXConstructExpr). */
+    /* What of an open node's range is kept: none, its begin (a DeclRefExpr, a TypeTraitExpr, a LambdaExpr), or the
+       whole range (a MemberExpr, or a braced value: an InitListExpr or CXXConstructExpr). */
     enum class ERange : uint8 { None, Begin, Whole };
     Json& Root;
     const bool bFrozenKeys;         // astcheck's reference parse
@@ -22218,6 +22786,22 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         for (const auto& M : Entry.second.Methods) NormalizePointers(const_cast<Json&>(*M.second));
         for (const auto& M : Entry.second.MethodDefs) NormalizePointers(const_cast<Json&>(*M.second));
         for (const auto& M : Entry.second.Inlines) NormalizePointers(const_cast<Json&>(*M.second));
+    }
+    /* Lambdas, in every body a call can reach or a function is compiled from: first each closure's operator() is
+       registered as an inline function, then each call of one is rewritten into a call of that (RewriteLambdaCalls). */
+    {
+        std::vector<Json*> Bodies;
+        for (const auto& F : FreeInlines) Bodies.push_back(const_cast<Json*>(F.second));
+        for (const auto& M : MemberTemplates) Bodies.push_back(const_cast<Json*>(M.second));
+        for (const auto& Entry : Records)
+        {
+            if (!Entry.second.IsGenerated() && !Entry.second.IsModStruct()) continue;
+            for (const auto& M : Entry.second.Methods) Bodies.push_back(const_cast<Json*>(M.second));
+            for (const auto& M : Entry.second.MethodDefs) Bodies.push_back(const_cast<Json*>(M.second));
+            for (const auto& M : Entry.second.Inlines) Bodies.push_back(const_cast<Json*>(M.second));
+        }
+        for (const Json* B : Bodies) IndexLambdas(*B);
+        for (Json* B : Bodies) RewriteLambdaCalls(*B);
     }
     /* After that, as they copy the types it settled; before any Generate, as a subclass's super may be one. */
     SynthesizeForwarders();
