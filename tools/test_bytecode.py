@@ -14793,9 +14793,9 @@ def const_cast():
         assert got == want, 'ConstCast.%s() = %r, C++ says %r' % (fn, got, want)
 
 
+proves('constant-folding.int64-ccbig')
 const_cast()
 print('ok  ConstCast: a cast over a consteval call folds, whatever its spelling, and a uint64 literal past INT64_MAX cast to a float is its unsigned value')
-proves('constant-folding.int64-ccbig')
 
 
 def patch_import_kept():
@@ -14942,6 +14942,9 @@ def lambdas():
         ('RefToLambda', lambda V: V + 1),
         ('RefArg', lambda V: V + 3),
     ]
+    proves('other-declarations.auto-inc-int32-v-return', 'lambdas.auto-l-int32-a-x', 'lambdas-function.auto-l-x-int32-y',
+           'lambdas.c-int32-a-mutable-c', 'lambdas.z-x-1-int32-a', 'lambdas.const-int32-r-return-v', 'lambdas.apply-5-int32-a-x',
+           'lambdas.auto-a-auto-b-return', 'lambdas.a-lambda-calling-or-capturing')
     for fn, want in forms:
         for v in (-5, 0, 3, 8):
             got = run(base, fn, V=v)[0]
@@ -14954,9 +14957,11 @@ def lambdas():
         out = run(base, 'RefParam', V=v, Out=10)
         assert out[0] == 11 + v and out[1]['Out'] == 11 + v, out
     # `this` is the object: the member the lambda wrote is the object's
+    proves('lambdas.this-int32-a-m-a')
     vm = VM(base, {}, M=7)
     assert vm.call('ThisMember', V=3) == 1011 and vm.self.vars['M'] == 11, vm.self.vars
     # a wait in the body parks the function, and the snapshot it took lives in the frame
+    proves('lambdas.ukismetsystemlibrary-delay-0-5f')
     vm = VM(base, {'Delay': latent_call}, Stage=0, Log=[])
     vm.call('Waits', Tag=5)
     assert vm.self.vars == dict(Stage=0, Log=[]) and len(vm.latent) == 1, vm.self.vars
@@ -14996,6 +15001,7 @@ def lambda_refusals():
         ('LamStaticVar', '', 'int32 F(int32 V) { static auto L = [V](int32 A) mutable { V += A; return V; }; return L(1); }',
          'static lambda L'),
     ):
+        proves('lambdas.fact-fact-n-1', 'lambdas.auto-l2-l', 'lambdas.int32-a')
         refused(mod, body, why, top=top)
     print('ok  lambdas: recursion, copying or capturing a mutable lambda, a static, returning one, calling operator() by '
           'name, [*this] and storing one are refused with their own messages')
