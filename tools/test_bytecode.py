@@ -11139,6 +11139,12 @@ def lambdas():
     assert vm.self.vars == dict(Stage=0, Log=[6]) and len(vm.latent) == 1, vm.self.vars
     vm.fire(0)
     assert vm.self.vars == dict(Stage=5, Log=[6, 7]) and not vm.latent, vm.self.vars
+    # a static in a lambda's body is one for the lambda, shared by every call of it and kept in the waiting method's frame
+    vm = VM(base, {'Delay': latent_call}, Stage=0, Log=[])
+    vm.call('StaticsAcrossCalls')
+    assert vm.self.vars['Log'] == [101, 1] and len(vm.latent) == 1, vm.self.vars
+    vm.fire(0)
+    assert vm.self.vars['Log'] == [101, 1, 111, 2, 211] and not vm.latent, vm.self.vars
 
 
 lambdas()
@@ -11159,6 +11165,8 @@ def lambda_refusals():
         ('LamCaptureMutable', '', 'int32 F(int32 V) { %s auto K = [=](int32 A) mutable { return L(A); }; return K(1); }' % src,
          'which would fork its state: capture it by reference'),
         ('LamStatic', '', 'int32 F(int32 V) { auto L = [](int32 A) { static int32 N = 0; N += A; return N; }; return L(V); }',
+         "static N lives in the ubergraph's frame"),
+        ('LamInlineStatic', 'inline int32 G(int32 A) { static int32 N = 0; N += A; return N; }', 'int32 F(int32 V) { auto L = [&](int32 A) { return G(A); }; return L(V); }',
          'static N in an inline function'),
         ('LamReturned', '', 'int32 F(int32 V) { auto Make = [](int32 V) { return [V](int32 A) { return A + V; }; }; return Make(1)(V); }',
          'returned from a function'),

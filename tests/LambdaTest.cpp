@@ -310,6 +310,26 @@ public:
     L(2);
     Stage = 5;
   }
+
+  /* a static in the body is the lambda's own, one for every call of it: kept in the frame of a method that waits */
+  void StaticsAcrossCalls() {
+    auto Next = [](int32 Step) {
+      static int32 Total = 100;
+      Total += Step;
+      return Total;
+    };
+    auto Tick = [] {
+      static int32 N;
+      N += 1;
+      return N;
+    };
+    Log.Add(Next(1));
+    Log.Add(Tick());
+    UKismetSystemLibrary::Delay(0.5f);
+    Log.Add(Next(10));
+    Log.Add(Tick());
+    Log.Add(Next(100));
+  }
 };
 
 class LambdaKid : public LambdaTest {

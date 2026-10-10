@@ -2302,7 +2302,8 @@ the body, as for an inline function.
 | `[](auto A, auto B) { return A + B; }` | A generic lambda expands as the specialization each call names. | Yes |
 | A lambda calling, or capturing, another lambda | Each is expanded where its call is written. A mutable one cannot be captured by value. | Yes |
 | `UKismetSystemLibrary::Delay(0.5f);` in the body | The function that calls it becomes latent, and a snapshot lives in the frame across the wait. | Yes |
-| A lambda calling itself (`Fact(Fact, N - 1)`), `static` in its body | Refused: "calls itself ... write a method", and "static N in an inline function". | Refused |
+| `static int32 N = 100;` in the body | One for the lambda, shared by every call of it, initialised once, as in C++. It is a local of the method's ubergraph frame, as any function-local static is, so it keeps its value only in a method that waits; in one that does not, it is refused: "static N lives in the ubergraph's frame ... make N a member". | Yes |
+| A lambda calling itself (`Fact(Fact, N - 1)`) | Refused: "calls itself ... write a method". | Refused |
 | `auto L2 = L;` or `Use(L)` by value of a `mutable` lambda, `[*this]` | Refused: copying it would fork its state ("bind a reference"), and a Blueprint cannot copy its object. | Refused |
 | A lambda returned from a function, kept in a container or struct, passed to a function that is not expanded, `+[](int32 A) {}`, `L.operator()(X)` | Refused, each with its own message: a lambda is a body to expand at a call, not a value that outlives its function. Write an inline method, or pass `{this, &C::F}` as a delegate. | Refused |
 
@@ -5987,9 +5988,8 @@ and where the feature is described. In each group, the messages you are most lik
   or parameter` and `TODO: a lambda's operator() called by name: ...`: a lambda that leaves the function that declares
   it, or is called by a spelling other than `L(args)`. Fix: write an inline method that returns the value, or call
   `L(args)`. See [Lambdas](#lambdas).
-- `TODO: the lambda <(lambda at File:Line:Col)> calls itself: a lambda cannot recurse here, write a method` and
-  `static <Name> in an inline function: each expansion would keep its own`: a lambda that calls itself (the
-  `auto Self` trick), or declares a `static`. Fix: write a method, which may recurse where a Blueprint function can.
+- `TODO: the lambda <(lambda at File:Line:Col)> calls itself: a lambda cannot recurse here, write a method`: a lambda
+  that calls itself (the `auto Self` trick). Fix: write a method, which may recurse where a Blueprint function can.
   See [Lambdas](#lambdas).
 - `TODO: lambda <Name> is a copy of a mutable lambda, which would fork its state: bind a reference`,
   `TODO: <Function> takes a mutable lambda by value, which copies its state: pass it by reference`, `<lambda>: it

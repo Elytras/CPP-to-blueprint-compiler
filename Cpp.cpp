@@ -2056,6 +2056,8 @@ private:
     std::string LatentRefusal;                        // why that method cannot make a latent call, or empty
     bool bMadeLatentCall = false;                     // LowerCall: it made one, so it moves into the ubergraph
     std::string StaticLocal;                          // LowerBody: a static it keeps in the ubergraph's frame, or empty
+    std::map<std::string, std::pair<std::string, std::string>> StaticKept;   // a lambda's static's decl id -> its local and its
+                                                                             // once flag, shared by every expansion of the lambda
     int32 LatentCount = 0;
     /* A generated event a latent call's completion delegate binds: it stores its parameter into the frame local
        the call's value is read from after the resume. */
@@ -8464,22 +8466,37 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                    writes is that constant, kept or not. */
                 if (IsStaticDecl(D) && !(Ds.bHasValue && IsFoldableConst(Ds.Value) && ReadOnlyLocal(DeclId)))
                 {
-                    if (!InlineStack.empty())
+                    /* An inline function's static would be one per expansion here, where C++ has one for all its
+                       calls, so it is refused. A lambda's is one per lambda, and every expansion of the lambda is
+                       its operator() run again: they share the local and the flag, made at the first, which is
+                       what C++ does for a lambda's copies. */
+                    const bool bLambdaBody = !InlineStack.empty() && LambdaOps.count(InlineStack.back()->value("id", std::string()));
+                    if (!InlineStack.empty() && !bLambdaBody)
                     { *Err = "static " + Name(D) + " in an inline function: each expansion would keep its own"; bOk = false; return; }
                     if (StaticLocal.empty()) StaticLocal = Name(D);
-                    const std::string N = std::to_string(ReadTmpCounter++);
-                    const std::string Kept = "__Static" + N + "_" + Name(D), Flag = "__Once" + N;
+                    const auto Known = StaticKept.find(DeclId);
+                    const bool bFirst = Known == StaticKept.end();
+                    const std::string N = bFirst ? std::to_string(ReadTmpCounter++) : std::string();
+                    const std::string Kept = bFirst ? "__Static" + N + "_" + Name(D) : Known->second.first;
+                    const std::string Flag = bFirst ? "__Once" + N : Known->second.second;
+                    if (bFirst) StaticKept[DeclId] = { Kept, Flag };
                     LocalRename[DeclId] = Kept;
                     Ds.Var.S = Kept;
-                    FPropertyDef KeptPD;
-                    if (!TypeToProperty(VarType, Kept, 0, "static " + Name(D), BP, &KeptPD, Err)) { bOk = false; return; }
-                    KeptPD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
-                    Locals.push_back(KeptPD);
+                    if (bFirst)
+                    {
+                        FPropertyDef KeptPD;
+                        if (!TypeToProperty(VarType, Kept, 0, "static " + Name(D), BP, &KeptPD, Err)) { bOk = false; return; }
+                        KeptPD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+                        Locals.push_back(KeptPD);
+                    }
                     if (!Ds.bHasValue) return;
-                    FPropertyDef FlagPD;
-                    if (!TypeToProperty("bool", Flag, 0, "static " + Name(D), BP, &FlagPD, Err)) { bOk = false; return; }
-                    FlagPD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
-                    Locals.push_back(FlagPD);
+                    if (bFirst)
+                    {
+                        FPropertyDef FlagPD;
+                        if (!TypeToProperty("bool", Flag, 0, "static " + Name(D), BP, &FlagPD, Err)) { bOk = false; return; }
+                        FlagPD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+                        Locals.push_back(FlagPD);
+                    }
                     FStmtIR Once, Set;
                     Once.K = FStmtIR::If;
                     Once.Cond.K = FArgIR::Local;
@@ -16750,6 +16767,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         WarnedRefParms.clear();
         bMadeLatentCall = false;
         StaticLocal.clear();
+        StaticKept.clear();
         LatentCount = 0;
         Completions.clear();
         SourceLocals.clear();
