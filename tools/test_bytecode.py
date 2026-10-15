@@ -1247,6 +1247,13 @@ def assign_value():
 assign_value()
 print('ok  AssignValue: a struct\'s or an FString\'s = read by value in a loop condition, right of &&, in ?: or in a '
       'call on another object is a copy of what it assigned')
+# `S.Len()` is UKismetStringLibrary::Len(S); it used to compile into a call to a function the game does not have.
+assert '/Script/Engine.KismetStringLibrary:Len' in import_paths(asset('StringLen')), import_paths(asset('StringLen'))
+for s in ('', 'a', 'gold', 'héllo wörld'):
+    assert run(asset('StringLen'), 'Param', S=s)[0] == len(s), s
+    assert run(asset('StringLen'), 'Member', {'Name': ''}, S=s)[0] == len(s), s
+    assert run(asset('StringLen'), 'Concat', A=s, B='xy')[0] == len(s) + 2, s
+print('ok  StringLen: S.Len() is the Len node')
 # A member taken of a struct `=` in a loop condition uses its place, which no statement before the loop can hold; an
 # assignment updated whose left side is no plain variable would locate it twice.
 refused('AssignMemberPlace', '  FCbPair S;\n  FCbPair T;\n'

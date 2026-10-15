@@ -440,7 +440,7 @@ def int64_to_text(v, sign, grouping, lo, hi):
 # running object, None is null. A few engine calls the test mods make are stubbed: MESSAGES collects PostGameMessage.
 SELF, GAME_STATE, MESSAGES = 'Self', 'GameState', []
 MATH.update({
-    'Concat_StrStr': lambda a, b: a + b, 'EqualEqual_StriStri': lambda a, b: a.lower() == b.lower(),
+    'Concat_StrStr': lambda a, b: a + b, 'Len': len, 'EqualEqual_StriStri': lambda a, b: a.lower() == b.lower(),
     'Conv_IntToString': str, 'Conv_FloatToString': sanitize_float, 'Conv_BoolToString': lambda b: 'true' if b else 'false',
     'Conv_StringToInt': atoi, 'Conv_Int64ToText': int64_to_text, 'Conv_ObjectToString': lambda o: str(o) if o else 'None',
     'Conv_StringToName': str, 'Conv_NameToString': str, 'Conv_NameToText': str, 'Conv_StringToText': str, 'Conv_TextToString': str,

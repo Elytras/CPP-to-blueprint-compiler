@@ -813,11 +813,7 @@ FName MakeKey(FText Prefix, int32 Index) { return Prefix + "_" + Index; }
 | You write | What it does | Status |
 |---|---|---|
 | `UKismetStringLibrary::Len(S)` | The Len node. Every string operation is a `UKismetStringLibrary` static: `Mid`, `Replace`, `ToUpper`, `ParseIntoArray` and the rest. | Yes |
-| `S.Len()` | Not yet. It compiles with no error and no warning, into a call that cannot work in the game. Call `UKismetStringLibrary::Len(S)`. | Not yet |
-
-Notes:
-- The SDK declares `Len()` on FString only so that the struct type-checks. No other FString method is declared, so any
-  other method call is a clang error.
+| `S.Len()`, `S.ToUpper()` | The same nodes as methods, with the string first: `S.Len()` is `UKismetStringLibrary::Len(S)`. See [Methods on structs, text and soft pointers](#methods-on-structs-text-and-soft-pointers). | Yes |
 
 ## Constants
 
@@ -5365,7 +5361,7 @@ listed here is refused with "unimplemented intrinsic".
 | `FKey{"F5"}` | A key for the player controller's key queries, such as IsInputKeyDown. Write it with braces: `FKey("F5")` is refused today. | [Timers and input](#timers-and-input) |
 | `FLatentActionInfo` | Leave it out of a latent call. The compiler supplies it. | [Latent calls](#latent-calls) |
 | `for (auto &X : Items)`, `for (auto &[Key, Value] : Map)` | Range-for: a TArray by index, a TSet through a copy, a TMap by key and value. | [Loops](#loops) |
-| FString methods, `S.Len()` | Not yet: `S.Len()` compiles into a call that cannot work. String functions are UKismetStringLibrary statics, `UKismetStringLibrary::Len(S)`. | [Strings and text](#strings-and-text) |
+| FString methods, `S.Len()` | UKismetStringLibrary statics as methods, the string first: `S.Len()` is `UKismetStringLibrary::Len(S)`. | [Strings and text](#strings-and-text) |
 | `GetClass()`, `GetName()` | Get Class and Get Object Name, on this or any object. | [Working with other objects](#working-with-other-objects) |
 | `GetOuter()` | The object's outer, read from memory. Not on a null object, and not in a function that waits. | [Working with other objects](#working-with-other-objects) |
 | `GetOutermostTypedOuter<T>(Obj)` | The farthest outer of Obj that is a T, or null. | [Working with other objects](#working-with-other-objects) |
@@ -5967,7 +5963,7 @@ and where the feature is described. In each group, the messages you are most lik
   [Calling engine and game functions](#calling-engine-and-game-functions).
 
 These compile with no message and do not work as C++ would: the body of a C++ constructor, which is dropped; the
-shorter of two non-inline methods with one name; a non-inline method of a UE_STRUCT; and `S.Len()`, the one FString method the SDK declares. `UKismetSystemLibrary::PrintString` compiles too, but UE 4.27 keeps
+shorter of two non-inline methods with one name; and a non-inline method of a UE_STRUCT. `UKismetSystemLibrary::PrintString` compiles too, but UE 4.27 keeps
 its body only outside shipping builds, so the retail game prints nothing. See [Functions](#functions),
 [Strings and text](#strings-and-text) and [Calling engine and game functions](#calling-engine-and-game-functions).
 

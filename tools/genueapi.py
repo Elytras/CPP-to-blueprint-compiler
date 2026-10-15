@@ -528,7 +528,7 @@ def hidden(marks):
 # that header. One function per name, /Script/Engine's first and then by package, as conversions() picks. Left out:
 # operators (Ops.json), the container libraries (Containers.h), a function taking a world context or a latent one (the
 # overloads that leave them out share the name), and a name the type already has.
-TYPE_TAKEN = {"FString": {"Data", "Length", "Capacity", "Len"}, "FName": {"Val"}, "FText": {"Val"},
+TYPE_TAKEN = {"FString": {"Data", "Length", "Capacity"}, "FName": {"Val"}, "FText": {"Val"},
               "TSoftObjectPtr": {"Path"}, "TSoftClassPtr": {"Path"}}
 TO_NAMES = {"int": "Int", "int64": "Int64", "uint8": "Byte", "bool": "Bool", "float": "Float", "double": "Double"}
 STRING_TEMPLATES = ("template <class T> struct TArray;", "template <class T> struct TSet;",
