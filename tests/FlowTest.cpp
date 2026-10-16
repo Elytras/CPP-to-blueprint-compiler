@@ -269,6 +269,28 @@ public:
   inline int32 SumTo(int32 N) { int32 S = 0; for (int32 I = 0; I < N; ++I) S += TwicePlus(I); return S; }
   int32 LoopInline(int32 N) { return SumTo(N) * 100 + SumTo(TwicePlus(N)); }
 
+  /* Step is set before the loop and read last inside it, and T is first mentioned after that read: the next pass
+     reads Step again, so T must not take its property. */
+  int32 BackEdge(int32 N) {
+    int32 Step = N * 3 + 1;
+    int32 Sum = 0;
+    for (int32 I = 0; I < 3; ++I) {
+      Sum += Step * 100 + Step;
+      int32 T = I + 5;
+      Sum += T * T;
+    }
+    return Sum;
+  }
+
+  /* `Dmg = 10` is overwritten when bCrit holds, but not on the else path, so it must stay (DropOverwritten). */
+  int32 DropElse(bool bCrit) {
+    int32 Other = 0;
+    int32 Dmg = 10;
+    if (bCrit) Dmg = 30;
+    else Other = 2;
+    return Dmg + Other * 100;
+  }
+
   /* A local declared without an initializer is empty / zero on every expansion, shared property or not. */
   inline int32 TwoOf(int32 V) { TArray<int32> Acc; int32 Seen; Seen += V; Acc.Add(V); Acc.Add(Seen); return Acc.Num() * 100 + Seen - V; }
   int32 FreshLocals(int32 N) {

@@ -1713,6 +1713,8 @@ check('FlowTest', 'ConstexprPick', lambda: 84, [dict()])
 check('FlowTest', 'CoalesceLoop', lambda N: sum((2 * i + 1) + (2 * (i + 1) + 1) for i in range(2 * N + 1)) * 1000 + 2 * N + 1,
       [dict(N=n) for n in (-1, 0, 1, 3)])
 check('FlowTest', 'LoopInline', lambda N: max(N, 0) ** 2 * 100 + max(2 * N + 1, 0) ** 2, [dict(N=n) for n in (-3, 0, 1, 4)])
+check('FlowTest', 'BackEdge', lambda N: 3 * 101 * (3 * N + 1) + 5 * 5 + 6 * 6 + 7 * 7, [dict(N=n) for n in (-2, 0, 4)])
+check('FlowTest', 'DropElse', lambda bCrit: 30 if bCrit else 210, [dict(bCrit=c) for c in (True, False)])
 check('FlowTest', 'FreshLocals', lambda N: 400 + 200 * max(N, 0), [dict(N=n) for n in (0, 1, 3)])
 check('FlowTest', 'FreshInLoop', lambda N: 200 * max(N, 0), [dict(N=n) for n in (0, 1, 3)])
 check('FlowTest', 'SafeRatio', lambda X: X != 0 and cdiv(10, X) > 2, [dict(X=x) for x in (-2, 0, 1, 3, 4)])
@@ -2978,7 +2980,8 @@ def string_behaviour():
     cdo = dump('dumptags.py', base, [e['name'] for e in dumpexp.load(base)[5]].index('Default__StringTest_C'))
     assert 'Umlaut [0] NameProperty size=8: Größe' in cdo, cdo
     check('StringTest', 'IsUmlaut', lambda S: S.lower() == 'größe', [dict(S=s) for s in ('Größe', 'GRößE', 'Grösse', '')])
-    print('ok  StringTest: a non-ASCII FName reads back as written, in the CDO and the bytecode')
+    check('StringTest', 'UmlautText', lambda: 'Größe', [dict()])
+    print('ok  StringTest: a non-ASCII FName or FText reads back as written, in the CDO and the bytecode')
 
     class Trace(dict):
         """The object's fields, recording every store in order."""
