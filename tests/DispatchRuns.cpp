@@ -54,6 +54,17 @@ public:
     OnNote.Add(this, &DispatchRuns::HandleNote);
     OnNote.Broadcast(N, N);
   }
+  /* A call's result for the const reference: the broadcast reads it where it lies, so it needs a variable. */
+  [[gnu::noinline]] FDispatchNote MakeNote(int32 P) {
+    FDispatchNote N;
+    N.Points = P;
+    N.Tag = "made";
+    return N;
+  }
+  void FireMade(int32 P) {
+    OnNote.Add(this, &DispatchRuns::HandleNote);
+    OnNote.Broadcast(MakeNote(P), MakeNote(P + 1));
+  }
   void PingTwice() {
     OnPing.Add(this, &DispatchRuns::HandlePing);
     OnPing.Broadcast();

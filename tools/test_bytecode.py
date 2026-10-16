@@ -4412,7 +4412,8 @@ def delegate_targets():
 
 def repl_runs():
     """ReplTest as the server runs it: a replicated write wakes the object first, a RepNotify variable's OnRep runs right
-    after the write (on the object written), an RPC called on the authority runs its body."""
+    after the write (on the object written; a game Blueprint's variable is a Blueprint's too), an RPC called on the
+    authority runs its body."""
     vm = VM(asset('ReplTest'), Score=5, Slots=[])
     vm.call('ReceiveBeginPlay')
     assert vm.self.vars == dict(Score=6, Slots=[4], bOpen=False, Local=1, Notified=12), vm.self.vars
@@ -4430,6 +4431,12 @@ def repl_runs():
     assert trace == [('FlushNetDormancy', True, None), ('set', True, 'bOpen'), ('set', True, 'Notified'),
                      ('set', True, 'Local'), ('FlushNetDormancy', False, None),
                      ('set', False, 'bReplicateMovement')], trace       # a native RepNotify is for clients: no call
+    vm = VM(asset('ReplTest'))
+    glass = vm.self.vars['Glass'] = Obj('Bar_Glass_Physics_C', Thrown=False)
+    vm.call('SetGlass')
+    trace = [(l[0], l[1] is glass, l[2] if l[0] == 'set' else None) for l in vm.log]
+    assert glass.vars['Thrown'] is True and trace == [('FlushNetDormancy', True, None), ('set', True, 'Thrown'),
+                                                      ('OnRep_Thrown', True, None)], trace
     for fn, parms, want in (('ClientPing', dict(Seq=42), dict(Local=42)), ('AuthOnly', {}, dict(Local=3)),
                             ('Pretty', {}, dict(Local=4)), ('OnRep_Open', {}, dict(Notified=1)),
                             ('OnRep_Slots', {}, dict(Notified=10))):
@@ -4445,7 +4452,8 @@ def repl_runs():
                             ('MultiBoom', {}, 9), ('OnRep_Open', {}, 10)):
         kid.call(fn, **parms)
         assert kid.self.vars['Seen'] == seen, (fn, kid.self.vars)
-    print('ok  ReplTest: wake before a replicated write, OnRep after it, RPC bodies; ReplKid overrides')
+    print('ok  ReplTest: wake before a replicated write, OnRep after it (a game Blueprint\'s too), RPC bodies; '
+          'ReplKid overrides')
 
 
 def rpc_routing():
@@ -7109,8 +7117,9 @@ def dispatch_facts():
 def dispatch_runs():
     """DispatchRuns as the VM runs it. Add binds (object, name) once - AddUnique - Remove drops that binding, Clear
     drops all, Broadcast runs each bound handler on its object with the arguments (a struct by value and by const
-    reference among them); with nothing bound it does nothing. A binding on another object's dispatcher runs when
-    that object broadcasts, on the object that bound it."""
+    reference among them, and a call's result for the reference, which the broadcast reads where it lies,
+    ScriptCore.cpp 3042-3054: so from a variable); with nothing bound it does nothing. A binding on another object's
+    dispatcher runs when that object broadcasts, on the object that bound it."""
     base = asset('DispatchRuns')
 
     def fresh():
@@ -7124,6 +7133,9 @@ def dispatch_runs():
     vm = fresh()
     vm.call('FireNote', 7)
     assert vm.self.vars['Total'] == 707 and vm.self.vars['LastTag'] == 'hit', vm.self.vars
+    vm = fresh()
+    vm.call('FireMade', 7)      # runvm passes MakeNote's result by value; sweep()'s rules check it is a variable
+    assert vm.self.vars['Total'] == 708 and vm.self.vars['LastTag'] == 'made', vm.self.vars
     vm = fresh()
     vm.call('PingTwice')
     assert vm.self.vars['Pings'] == 2, vm.self.vars
@@ -10207,9 +10219,10 @@ def await_fakes():
 def await_paths():
     """UE_AWAIT on an async action activates it once, after its dispatchers are bound, on whichever path runs
     (K2Node_BaseAsyncTask.cpp 410-467): the else branch's await as well as the then branch's, and an await inside a
-    loop on its first round only - a second Activate starts an action like AsyncLoadPrimaryAsset again. An await some
-    paths reach with the action activated and some without is refused: keeping its Activate starts the action twice
-    on one path, dropping it never on the other."""
+    loop on its first round only - a second Activate starts an action like AsyncLoadPrimaryAsset again. A variable
+    assigned a new action holds a fresh one, which its next await activates. An await some paths reach with the
+    action activated and some without is refused: keeping its Activate starts the action twice on one path,
+    dropping it never on the other."""
     def once(activated, task, disp, what):
         """The task was activated exactly once, with the dispatcher awaited already bound (others may be too)."""
         mine = [bound for t, bound in activated if t is task]
@@ -10241,6 +10254,16 @@ def await_paths():
     vm.call('Until', 'u')                                   # the first round breaks: nothing bound, nothing activated
     assert not activated and not vm.binds and vm.self.vars == dict(Rounds=2), (activated, vm.binds, vm.self.vars)
     print('ok  AwaitPaths.Twice / Until: a UE_AWAIT in a loop activates its async action once, on the first round')
+
+    made, activated, natives = await_fakes()
+    vm = VM(asset('AwaitPaths'), natives, Rounds=0)
+    vm.call('Again', 'u')
+    vm.broadcast(made[0], 'OnSuccess', 't1')                # resumes: T holds a second task, awaited in turn
+    assert len(made) == 2, made
+    vm.broadcast(made[1], 'OnSuccess', 't2')
+    assert vm.self.vars == dict(Rounds=2, Image='t2'), vm.self.vars
+    for task in made: once(activated, task, 'OnSuccess', 'Again')
+    print('ok  AwaitPaths.Again: a variable assigned a new async action after an await activates that one too')
 
     umg, task = '#include "UeApi/UMG.h"\n', '    UAsyncTaskDownloadImage* T = UAsyncTaskDownloadImage::DownloadImage(Url);\n'
     for mod, body in (('AwaitSkips', '    for (int32 I = 0; I < 3; ++I) { if (Stop) continue; UE_AWAIT(T->OnSuccess); }\n'),
