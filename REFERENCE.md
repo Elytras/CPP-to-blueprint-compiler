@@ -3084,9 +3084,8 @@ Notes:
   nothing registered. The helpers' type constraints are what stop that.
 - `HudClass` has to hold a concrete widget class when the call runs. A null or abstract class makes no widget. A
   widget class of your own is described in [Classes and variables](#classes-and-variables).
-- The engine marks `Create` cosmetic, but AssetGen calls it directly, so unlike the editor's node it also runs on a
-  dedicated server. Guard it if a server can run the code; see
-  [Working with other objects](#working-with-other-objects).
+- The engine marks `Create` cosmetic, so on a dedicated server the call is skipped and returns None, as the editor's
+  node's is; see [Working with other objects](#working-with-other-objects).
 
 ### StaticClass on the mod's classes
 
@@ -3344,8 +3343,8 @@ Notes:
 | `GetAllActorsWithInterface(ITargetable::StaticClass(), Found)` | Get All Actors With Interface: every actor that implements the interface. | Yes |
 | `UGameplayStatics::GetActorOfClass(AMyManager::StaticClass())` | Get Actor Of Class: the first actor of the class (subclasses included) that the world's actor iterator reaches, or null. With several actors of the class, which one comes back depends on that order, so use it for a class the world holds one of. | Yes |
 | `A->GetComponentByClass(UHealthComponentBase::StaticClass())` | Get Component by Class: the actor's first component of that class, or null. It is typed `UActorComponent*`, so Cast it. `K2_GetComponentsByClass(Class)` returns all of them, and `GetComponentsByTag(Class, Tag)` also filters by component tag. | Yes |
-| `UActorFunctionLibrary::GetPlayersInRange(K2_GetActorLocation(), 1000.0f, true)` | DRG's getter for the player characters within a radius, as a `TArray<APlayerCharacter *>` that needs no cast. The last argument is MustBeAlive. DRG marks it authority-only: call it on the host. | Yes |
-| an engine or game static marked `UE_AUTHORITY_ONLY` or `UE_COSMETIC` | Not yet. The editor's node for such a function is skipped where it should not run: an authority-only one on a client, a cosmetic one on a dedicated server. AssetGen calls every engine and game static directly, so it runs everywhere, with no warning. Guard the call with `HasAuthority()` or `UKismetSystemLibrary::IsServer(this)`. | Not yet |
+| `UActorFunctionLibrary::GetPlayersInRange(K2_GetActorLocation(), 1000.0f, true)` | DRG's getter for the player characters within a radius, as a `TArray<APlayerCharacter *>` that needs no cast. The last argument is MustBeAlive. DRG marks it authority-only: on a client the call is skipped and returns an empty array. | Yes |
+| an engine or game static marked `UE_AUTHORITY_ONLY` or `UE_COSMETIC` | Called on its class's default object, as the editor's node calls it, so the engine decides where it runs. For a static of a function library, an actor or a component class, which is nearly all of them, an authority-only one is skipped on a client and a cosmetic one on a dedicated server. A skipped call returns zero or None and leaves its output parameters as they were. | Yes |
 
 ```cpp
 #include "../include/Objects.h"
@@ -3403,12 +3402,12 @@ Notes:
   `Char->InventoryComponent`.
 - In multiplayer, find or spawn a shared actor on the host. A spawned actor reaches the clients only if its class
   replicates; see [Replication](#replication).
-- The statics that run everywhere include `UGameplayStatics::ApplyDamage`, `ApplyPointDamage` and
+- The statics the engine skips this way include `UGameplayStatics::ApplyDamage`, `ApplyPointDamage` and
   `ApplyRadialDamage`, `GetPlayersInRange`, `LockCharacters`, `DropToTarget`, the `SpawnEnemies` statics and
-  `PlayCueOnAll` (authority-only), and `UWidgetBlueprintLibrary::Create` (`CreateWidget`), the `SetInputMode` statics,
-  `RemoveAllWidgets`, `SpawnSound2D`, `PlaySound2D` and `SpawnDecalAtLocation` (cosmetic). A mod's own
-  `UE_AUTHORITY_ONLY` and `UE_COSMETIC` functions, and the engine's member functions, are skipped as the editor's are:
-  see [RPCs](#rpcs).
+  `PlayCueOnAll` on a client (authority-only), and `UWidgetBlueprintLibrary::Create` (`CreateWidget`), the
+  `SetInputMode` statics, `RemoveAllWidgets`, `SpawnSound2D`, `PlaySound2D` and `SpawnDecalAtLocation` on a dedicated
+  server (cosmetic). A mod's own `UE_AUTHORITY_ONLY` and `UE_COSMETIC` functions, and the engine's member functions,
+  are skipped as the editor's are: see [RPCs](#rpcs).
 
 ### Subsystems
 
@@ -4561,8 +4560,8 @@ Notes:
 
 - The engine skips a call only on an actor or a component of one. On any other object the function always runs.
 - UeApi marks the engine's and the game's functions the same way, and a call to one of their member functions is
-  skipped the same way. An engine or game static marked authority-only or cosmetic is called directly and is not
-  skipped; the list and the guard are in [Working with other objects](#working-with-other-objects).
+  skipped the same way. So is a call to an engine or game static marked authority-only or cosmetic, which goes to its
+  class's default object; the list is in [Working with other objects](#working-with-other-objects).
 
 ### Calling RPCs
 
@@ -5484,14 +5483,14 @@ listed here is refused with "unimplemented intrinsic".
 | `TSubclassOf<T>`, `UClass *` | Class References. `TSubclassOf<T>` takes T and its subclasses. | [Types](#types) |
 | `UE_ASSET_ALL(Class)` | Declares `All`: soft pointers to every UE_ASSET_AT of Class or a subclass in this namespace and the ones inside it, filled in at build time. | [Game assets](#game-assets) |
 | `UE_ASSET_AT(Class, Name, Path)` | Names an asset that another package holds, the game's or another mod's, so that `&Name` points at it. | [Game assets](#game-assets) |
-| `UE_AUTHORITY_ONLY` | Authority Only (BlueprintAuthorityOnly): on an actor or its component, a call on a machine without authority is skipped. An engine or game static with this mark is not skipped. | [RPCs](#rpcs) |
+| `UE_AUTHORITY_ONLY` | Authority Only (BlueprintAuthorityOnly): on an actor or its component, a call on a machine without authority is skipped; an engine or game static with this mark, on a client. | [RPCs](#rpcs) |
 | `UE_AWAIT(Dispatcher)` | The rest of the function runs when the dispatcher next fires. Its value is the dispatcher's parameter when it has exactly one. | [Waiting on events](#waiting-on-events) |
 | `UE_CATEGORY("Setup\|Doors")` | The editor category of the functions and variables that follow it, `\|` starting a subcategory. It is written into the editor API stub only. | [Classes and variables](#classes-and-variables) |
 | `UE_CATEGORY__JOIN`, `UE_CATEGORY__JOIN2` | Internal to UE_CATEGORY. Not written in a mod. | [Classes and variables](#classes-and-variables) |
 | `UE_CLASS(Package, UeName)` | The package and UE name of a class. In a shared header it names the one source that cooks the class, the one whose UE_MOD_PACKAGE, namespaces and class name give exactly that path; every other source imports it. The SDK declares each engine and game class with it. | [Mod sources and packages](#mod-sources-and-packages) |
 | `UE_CLIENT` | Run on owning Client RPC: called on the server, it runs on the client that owns the actor. | [RPCs](#rpcs) |
 | `UE_COMPONENT(Type, Name)` | A component of a mod actor, of an engine or game component class, as added in the Components panel. The first scene component is the root. | [Components](#components) |
-| `UE_COSMETIC` | Cosmetic (BlueprintCosmetic): on an actor or its component, a call on a dedicated server is skipped. | [RPCs](#rpcs) |
+| `UE_COSMETIC` | Cosmetic (BlueprintCosmetic): on an actor or its component, and for an engine or game static with this mark, a call on a dedicated server is skipped. | [RPCs](#rpcs) |
 | `UE_DEFAULTS { ... }` | Defaults of components and of inherited properties, as the Details panel and Class Defaults set them. Read at build time, never run. | [Class defaults](#class-defaults) |
 | `UE_DISPATCHER(Name, Params...)` | An event dispatcher on a mod class, with its parameter list. | [Event dispatchers](#event-dispatchers) |
 | `UE_ENUM(Enum)` | Cooks an `enum class` based on `uint8`, `int32` or `int64` as a UserDefinedEnum (an Enumeration asset). | [Enums](#enums) |

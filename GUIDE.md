@@ -426,9 +426,9 @@ Watch for:
   function's body is compiled out of it. Use `PostGameMessage`.
 - An engine or game static that UeApi marks `UE_AUTHORITY_ONLY` or `UE_COSMETIC`, such as
   `UGameplayStatics::ApplyDamage`, `UActorFunctionLibrary::GetPlayersInRange` or `UWidgetBlueprintLibrary::Create`
-  (which `CreateWidget` calls), runs on every machine. The editor's node skips an authority-only call on a client and
-  a cosmetic one on a dedicated server; AssetGen does not do this yet, and prints nothing. Guard such a call with
-  `HasAuthority()` or `UKismetSystemLibrary::IsServer(this)` (see [Multiplayer](#multiplayer)).
+  (which `CreateWidget` calls), does not run everywhere. As from the editor's node, an authority-only call is skipped
+  on a client and a cosmetic one on a dedicated server, and a skipped call returns zero or None (see
+  [Multiplayer](#multiplayer)).
 - A pure function whose result you do not use is removed, and clang warns
   `ignoring return value of function declared with pure attribute`. An array the engine fills must have the
   parameter's exact type: `TArray<AActor *>`, not `TArray<APlayerCharacter *>`.
@@ -1913,10 +1913,6 @@ each topic.
   object's type does not declare Bump itself. The qualifier cannot be read back there, so the call goes by name and
   reaches the object's override. Written on a variable, `Other->SuperBase::Bump(1)`, it is refused. See
   [Overrides and parent calls](REFERENCE.md#overrides-and-parent-calls).
-- An engine or game static marked authority-only or cosmetic, such as `UGameplayStatics::ApplyDamage` or
-  `UGameplayStatics::PlaySound2D`. The editor's node skips an authority-only function on a client and a cosmetic one
-  on a dedicated server; AssetGen's call runs both on every machine. Guard such a call with `HasAuthority()` or
-  `UKismetSystemLibrary::IsServer(this)`. See [Working with other objects](REFERENCE.md#working-with-other-objects).
 - `UE_AWAIT` on a dispatcher with two or more parameters. The method resumes, but the values are not available. Bind
   a handler to read them. See [Waiting on events](REFERENCE.md#waiting-on-events).
 
