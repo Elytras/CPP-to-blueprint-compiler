@@ -9832,6 +9832,32 @@ print('ok  UnlikeCppRefusals: a UE_STRUCT method that is not inline, and a quali
       'name, a call or a cast, are refused')
 
 
+def widget_no_tree_warns():
+    """A widget shows its tree's root (UserWidget.cpp 745), and the engine makes a tree only for a
+    WidgetBlueprintGeneratedClass (Initialize, 109-151). Every widget class AssetGen cooks is a BlueprintGeneratedClass,
+    so it starts with an empty tree, under a game widget Blueprint (WtGameKid) too: the compile warns, unless the class
+    or a mod class above it sets WidgetTree->RootWidget (WtTree, WtTreeKid) or overrides OnPaint (WtPaint)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, 'WtBare.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\n#include "UeApi/UMG.h"\n'
+                    '#include "UeApi/Game/UI_AvailablePerkPoints_C.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/WtBare");\n'
+                    'class UWtBare : public UUserWidget {\npublic:\n  int32 Shown = 0;\n  void Construct() { Shown += 1; }\n};\n'
+                    'class UWtGameKid : public Game::UI::HUD_SpaceRig::KPI::UI_AvailablePerkPoints_C {};\n'
+                    'class UWtTree : public UUserWidget {\npublic:\n  void OnInitialized() {\n    WidgetTree->RootWidget = '
+                    'Cast<UTextBlock>(UGameplayStatics::SpawnObject(UTextBlock::StaticClass(), WidgetTree));\n  }\n};\n'
+                    'class UWtTreeKid : public UWtTree {};\n'
+                    'class UWtPaint : public UUserWidget {\npublic:\n  void OnPaint(FPaintContext &Context) const {}\n};\n')
+        proc = assetgen_compile([src, UEAPI, tmp])
+        assert proc.returncode == 0, proc.stdout
+        warned = set(re.findall(r'warning: (\w+): a widget class AssetGen cooks has no widget tree', proc.stdout))
+        assert warned == {'UWtBare', 'UWtGameKid'}, proc.stdout
+
+
+widget_no_tree_warns()
+print('ok  WidgetNoTree: a widget class that neither sets its tree\'s root nor paints warns that it shows nothing')
+
+
 def asset_map_dup_keys():
     """A key a map's braces give twice holds the last value given, as TMap's initializer-list constructor Adds each pair
     in order (Map.h 1166-1173). AS_AmdOver's {{"a", 1}, {"a", 2}} over UAmdDef's {a: 2, c: 3} loads {a: 2}, AS_AmdLast's

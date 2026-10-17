@@ -281,7 +281,7 @@ Notes:
 | `: public UActorComponent`, `: public USceneComponent` | A component Blueprint, with the component class flags. Add one to an actor at run time with `AddComponentByType<T>(Owner)`, the editor's Add Component by Class node. Its own events to override are `ReceiveBeginPlay`, `ReceiveEndPlay` and `ReceiveTick`. It cannot be a `UE_COMPONENT` of a mod actor, which takes engine component classes only; see [Components](#components). | Yes |
 | `void ReceiveTick(float DeltaSeconds)` in a component class | Turns the component's ticking on: it sets `PrimaryComponentTick.bCanEverTick` on the class default object, as the editor's compiler does. UActorComponent leaves it off. | Yes |
 | `: public UUserWidget` | A widget with logic and no layout. `CreateWidget<T>` makes one. Its events, such as `Construct`, are overrides. `Tick` runs only if `bHasScriptImplementedTick` is set in `UE_DEFAULTS`, which the editor's widget compiler would do. | Yes |
-| a designer layout (a widget tree) for a mod widget | Not yet, and nothing warns. A mod widget has no widget tree, so it shows nothing of its own. For visible UI, create one of the game's widget Blueprints. | Not yet |
+| a designer layout (a widget tree) for a mod widget | Not yet. The engine makes a widget's tree only for a widget Blueprint's own class, from its layout or its nearest parent's, and AssetGen cooks a plain Blueprint class. So a mod widget's tree starts empty, under a game widget Blueprint parent too, and it shows nothing of its own: AssetGen warns, "has no widget tree", unless the class or a mod class above it sets `WidgetTree->RootWidget` (in `OnInitialized`, before the widget is first shown) or overrides `OnPaint`. For a designed layout, create one of the game's widget Blueprints. | Warns |
 
 ```cpp
 class Turret : public AActor { public: int32 Shots = 0; };
@@ -311,10 +311,10 @@ public:
 };
 ```
 
-A widget class and the actor that shows it:
+A widget class with logic only, and the actor that adds it to the viewport:
 
 ```cpp
-class UScoreWidget : public UUserWidget {
+class UScoreWidget : public UUserWidget {             // no tree, so it shows nothing: AssetGen warns
   UE_DEFAULTS { bHasScriptImplementedTick = true; }   // needed only if you override Tick
 public:
   int32 Shown = 0;
@@ -6054,6 +6054,12 @@ so the retail game prints nothing. See [Strings and text](#strings-and-text) and
   ... construct <Leaf>`). SpawnObject and AddComponentByClass make one with NewObject, in a Shipping game, and assert
   in a Development one. Fix: construct a subclass that defines every `= 0` method, or the leaf. See
   [Objects and widgets](#objects-and-widgets).
+- `warning: <Class>: a widget class AssetGen cooks has no widget tree, so it shows nothing of its own, not even a widget
+  Blueprint parent's layout`: a class that derives `UUserWidget`, or a game widget Blueprint, whose code never sets
+  `WidgetTree->RootWidget` and which overrides no `OnPaint`, nor does a mod class above it. The engine makes a tree only
+  for a widget Blueprint's own class, and AssetGen cooks a plain Blueprint class. The build goes on. Fix: build the tree
+  in `OnInitialized`, draw in `OnPaint`, or create one of the game's widget Blueprints. See
+  [Classes and variables](#classes-and-variables).
 - `warning: <Class>::<Function>: SpawnObject with no Outer (None) makes nothing and returns None`: `NewObject<T>(nullptr)`.
   The build goes on. Fix: pass the object that owns it, such as `this`. See [Objects and widgets](#objects-and-widgets).
 - `warning: <Function>: a deferred spawn (SpawnActorDeferred, BeginDeferredActorSpawnFromClass) is not finished in

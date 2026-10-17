@@ -15411,6 +15411,28 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     const bool bIsActor = std::find(Ancestry.begin(), Ancestry.end(), "Actor") != Ancestry.end();
     BP.SetIsActor(bIsActor);
     BP.SetIsComponent(std::find(Ancestry.begin(), Ancestry.end(), "ActorComponent") != Ancestry.end());
+    /* A widget shows its tree's root (UUserWidget::RebuildWidget, UserWidget.cpp 745), and a tree is made only for a
+       WidgetBlueprintGeneratedClass, from its designer layout or the nearest parent's (Initialize, 125-143). AssetGen
+       cooks a BlueprintGeneratedClass, so a mod widget's tree starts empty, under a game widget Blueprint too. It shows
+       something only if the class or a mod class above it sets the root itself or paints (NativePaint, 1600-1611). */
+    if (!R.bIsPatch && std::find(Ancestry.begin(), Ancestry.end(), "UserWidget") != Ancestry.end())
+    {
+        bool bDraws = false;
+        std::function<void(const Json&)> Scan = [&](const Json& N) {
+            if (Kind(N) == "MemberExpr" && N.value("name", std::string()) == "RootWidget") bDraws = true;
+            if (!bDraws) ForEach(N, Scan);
+        };
+        for (const FRecord* A = &R; A && !A->IsNative() && !bDraws; A = A->Base.empty() ? nullptr : Find(A->Base))
+        {
+            bDraws = A->Methods.count("OnPaint") != 0;
+            for (const Json* M : A->AllMethods) Scan(*M);
+            for (const auto& [Name, Def] : A->MethodDefs) Scan(*Def);
+        }
+        if (!bDraws)
+            printf("  warning: %s: a widget class AssetGen cooks has no widget tree, so it shows nothing of its own, not "
+                   "even a widget Blueprint parent's layout: set WidgetTree->RootWidget in OnInitialized or draw in "
+                   "OnPaint, or create one of the game's widget Blueprints instead\n", R.CppName.c_str());
+    }
     /* Abstract: the nearest declaration of some method along the class chain is `= 0`. SpawnActor and CreateWidget
        refuse the class, as they do one the editor marks Generate Abstract Class. An interface's `= 0` does not count,
        since an implementer that leaves it out gets a stub, and clang's own isAbstract never reaches here (FAstSax). */

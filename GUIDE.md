@@ -1907,8 +1907,6 @@ each topic.
 
 **Compiled with no message, but wrong.** Nothing catches these yet, so avoid them.
 
-- A mod widget class. It has no designer layout, so it shows nothing of its own. For visible UI, create one of the
-  game's widget Blueprints. See [Classes and variables](REFERENCE.md#classes-and-variables).
 - `UE_AWAIT` on a dispatcher with two or more parameters. The method resumes, but the values are not available. Bind
   a handler to read them. See [Waiting on events](REFERENCE.md#waiting-on-events).
 - A qualified call whose qualifier a macro takes as an argument, `#define ON(O, Q) O->Q::Bump(1)`. The qualifier is not
@@ -1932,6 +1930,9 @@ A few mistakes also compile without a message, because the construct itself work
 
 **Missing, with nothing to write yet.**
 
+- A designer layout for a mod widget. A widget class AssetGen cooks starts with an empty widget tree, under a game
+  widget Blueprint parent too, and the compile warns when the class neither builds one in code nor paints. For a
+  designed layout, create one of the game's widget Blueprints. See [Classes and variables](REFERENCE.md#classes-and-variables).
 - Editor stubs for the mod's interfaces. A Blueprint made in the editor cannot implement an interface that the mod
   declares; a C++ class can. See [Editor API stubs](#editor-api-stubs).
 - A check of a game component class's own native data. A `UE_COMPONENT` of one of the game's component classes gets
