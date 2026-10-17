@@ -2506,12 +2506,12 @@ Notes:
 |---|---|---|
 | `SuperBase::ReceiveBeginPlay();` inside an override | Runs the parent's own implementation once and comes back: the editor's "Add call to parent function". Write the class you derive from; C++ has no `Super`. | Yes |
 | `AActor::ReceiveBeginPlay();` | Calls the engine's function. For a BlueprintImplementableEvent it does nothing, because there is no parent body. For a BlueprintNativeEvent it runs the C++ default. | Yes |
-| `SuperBase::Twice(1)` in a class that does not declare Twice | SuperBase's Twice, its body copied in: C++ runs that function without dispatch, so an object of a subclass that overrides Twice does not reach its own. | Yes |
+| `SuperBase::Twice(1)` in a class that does not declare Twice | SuperBase's Twice, its body copied in: C++ runs that function without dispatch, so an object of a subclass that overrides Twice does not reach its own. `this->SuperBase::Twice(1)` is the same call. | Yes |
 | The same call to a function whose body cannot be copied in: authority-only, cosmetic, a server or client RPC, `noinline`, one that waits, one whose body makes such a call itself, or any from a `UE_NO_OPTIMIZE` caller | SuperBase's function, without dispatch. Blueprint calls a parent's function that way only from a class that has its own function of that name, so AssetGen adds one to your class: an override of the method that only calls the nearest parent's version with the same arguments, compiled like one you write, with an override's flags and super. The call is then bound to SuperBase's function, and a subclass's override of the method overrides the added one. A call by name runs what it ran before: the added override passes it on, and the engine routes both calls the same way. | Yes |
 | The same call to a multicast RPC | A call by name, with a warning: an object of a subclass that overrides the function runs its override. On a server a multicast runs locally and is also sent, so an added override would send it once, then again when it calls the parent's. An override you declare yourself does that too, as an editor override that calls its parent does. | Warns |
 | `SuperTest::Thrice(1)` in SuperTest's own code | SuperTest's own Thrice, its body copied in: C++ runs that one without dispatch, also on an object of a subclass that overrides Thrice. | Yes |
 | The same call to one of the class's own functions whose body cannot be copied in | A call by name, with a warning: on an object of a subclass that overrides the function, the override runs. A Blueprint calls its own class's function without dispatch only when that function is `final`, and then the call is bound to it. | Warns |
-| `Other->SuperBase::Bump(1)` | Refused: "runs SuperBase's Bump on another object without dispatch". C++ runs SuperBase's own Bump there; a Blueprint calls a function that way only as self's parent call, and by name the call would reach Other's override. Seen when Other's type declares a Bump of its own, or when the qualifier follows a plain chain of names (`Other`, `this->Other`, `A->B`). After a call or a cast, `GetOther()->SuperBase::Bump(1)`, it cannot be read back, and goes by name with no message. Call it by name, or put the code in a function of another name. | Refused |
+| `Other->SuperBase::Bump(1)` | Refused: "runs SuperBase's Bump on another object without dispatch". C++ runs SuperBase's own Bump there; a Blueprint calls a function that way only as self's parent call, and by name the call would reach Other's override. The same however the object is written: a variable, `this->Other`, a call, `GetOther()->SuperBase::Bump(1)`, or a cast, `Cast<SuperBase>(A)->SuperBase::Bump(1)`. Call it by name, or put the code in a function of another name. Only a qualifier that a macro takes as an argument, `#define ON(O, Q) O->Q::Bump(1)`, is not read: that call goes by name with no message. | Refused |
 
 ```cpp
 class SuperBase : public AActor {
@@ -5904,7 +5904,8 @@ and where the feature is described. In each group, the messages you are most lik
   a method of a UE_STRUCT that is not inline. A Blueprint struct has no functions, so a call to it named one that exists
   nowhere. Fix: `inline int32 SumOf(const FPair &P) { return P.A + P.B; }`. See [Functions](#functions).
 - `` `Obj-><Class>::<Method>()` runs <Class>'s <Method> on another object without dispatch, which a Blueprint does only as self's parent call ``:
-  a call on another object written with a qualifier, `Other->SuperBase::Bump(1)`. C++ runs that class's own version;
+  a call on another object written with a qualifier, `Other->SuperBase::Bump(1)` or `GetOther()->SuperBase::Bump(1)`.
+  C++ runs that class's own version;
   by name the call would reach the object's override. Fix: call it by name if the override is what you want, or move
   the code into a function of another name and call that. See [Overrides and parent calls](#overrides-and-parent-calls).
 - `<Class>::<Function> returns <Type>: a reference return is refused until what it means to a C++ caller is specified;
@@ -6030,11 +6031,9 @@ and where the feature is described. In each group, the messages you are most lik
   the call. UE_NO_OPTIMIZE on the calling function keeps it. See
   [Calling engine and game functions](#calling-engine-and-game-functions).
 
-This compiles with no message and does not work as C++ would: a qualified call on another object whose qualifier
-cannot be read back, `GetOther()->SuperBase::Bump(1)` where Other's type does not declare Bump itself, which goes by
-name. `UKismetSystemLibrary::PrintString` compiles too, but UE 4.27 keeps
-its body only outside shipping builds, so the retail game prints nothing. See [Overrides and parent calls](#overrides-and-parent-calls),
-[Strings and text](#strings-and-text) and [Calling engine and game functions](#calling-engine-and-game-functions).
+`UKismetSystemLibrary::PrintString` compiles with no message, but UE 4.27 keeps its body only outside shipping builds,
+so the retail game prints nothing. See [Strings and text](#strings-and-text) and
+[Calling engine and game functions](#calling-engine-and-game-functions).
 
 ### Components, defaults, assets and other objects
 

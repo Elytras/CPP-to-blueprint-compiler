@@ -1697,6 +1697,8 @@ private:
     const FRecord* StaticClassOf(const Json& Callee, const std::string& Slot) const;
     /* `Base::Method()` on this: the record the qualifier names, read back the same way, else null. */
     const FRecord* MemberQualifier(const Json& Member) const;
+    /* The qualifier written right before a member's name, whatever the object is written as, else empty. */
+    std::string WrittenQualifier(const Json& Member) const;
     /* Whether a call on `this` to R's Method, written in class Written, names R's own: the forwarder's call, one
        written `R::Method()` (MemberQualifier), or one past a declaration of Method from Written up to R, which in C++
        hides R's from an unqualified call - so it got there through a qualifier, however spelled (`this->R::Method()`).
@@ -6251,25 +6253,64 @@ const FRecord* FCompiler::StaticClassOf(const Json& Callee, const std::string& S
 /* A MemberExpr on an implicit this begins at its qualifier when it has one and at the member's own name when not
    (clang's MemberExpr::getBeginLoc), so `QcParent::Plain()` is told from `Plain()` by what is written where its range
    begins: `<Record>::<member>`, tried in each of the mod's sources as NamedQualifier does.
-   The record's name may come in parts, `Weapons::Rifle::Pull`.
-   ponytail: `this->QcParent::Plain()` begins at `this` and a qualifier written in a macro has spelling locations; both
-   read as unqualified here, a call by name, unless a class on the way declares Plain (NamesQualified). */
+   The record's name may come in parts, `Weapons::Rifle::Pull`. `this->QcParent::Plain()` begins at `this`, and a
+   qualifier written in a macro has spelling locations: there it is read back from the member's name
+   (WrittenQualifier). */
 const FRecord* FCompiler::MemberQualifier(const Json& Member) const
 {
     const Json Begin = Member.value("range", Json::object()).value("begin", Json::object());
-    if (!Begin.contains("offset") || !Begin.contains("tokLen")) return nullptr;
-    const size_t Off = Begin["offset"].get<size_t>(), Len = Begin["tokLen"].get<size_t>();
+    if (Begin.contains("offset") && Begin.contains("tokLen"))
+    {
+        const size_t Off = Begin["offset"].get<size_t>(), Len = Begin["tokLen"].get<size_t>();
+        const std::string Method = Member.value("name", std::string());
+        for (const std::string& T : ModSources())
+            if (const std::string Q = QualifierBefore(T, Off, Len, Method); !Q.empty())
+                if (const FRecord* R = Find(Q)) return R;
+    }
+    const std::string Q = WrittenQualifier(Member);
+    return Q.empty() ? nullptr : Find(Q);
+}
+
+/* A MemberExpr's range ends at its member's name (MemberExpr::getEndLoc), and a qualifier is written right before it,
+   `GetOther()->SuperBase::Bump`, so it is read back from there whatever comes before it: a name, a call or a cast. Each
+   of the mod's sources is tried at that offset, as NamedQualifier does; a hit needs the member's name there and a
+   record that the qualifier names, in as many parts as it is written with. In a macro the name is where it is spelled.
+   ponytail: a member written with template arguments ends at its `>`, and a qualifier can be a macro's parameter or
+   come from a macro outside the mod's sources: these read as unqualified here. */
+std::string FCompiler::WrittenQualifier(const Json& Member) const
+{
+    Json End = Member.value("range", Json::object()).value("end", Json::object());
+    if (End.contains("spellingLoc")) End = End["spellingLoc"];
+    if (!End.contains("offset") || !End.contains("tokLen")) return std::string();
+    const size_t Off = End["offset"].get<size_t>(), Len = End["tokLen"].get<size_t>();
     const std::string Method = Member.value("name", std::string());
+    auto Ident = [](char C) { return std::isalnum(uint8(C)) || C == '_'; };
+    auto Blank = [](char C) { return C == ' ' || C == '\t'; };
     for (const std::string& T : ModSources())
-        if (const std::string Q = QualifierBefore(T, Off, Len, Method); !Q.empty())
-            if (const FRecord* R = Find(Q)) return R;
-    return nullptr;
+    {
+        if (Len != Method.size() || Off + Len > T.size() || T.compare(Off, Len, Method) != 0) continue;
+        std::string Q;
+        for (size_t P = Off;;)
+        {
+            while (P > 0 && Blank(T[P - 1])) --P;
+            if (P < 2 || T.compare(P - 2, 2, "::") != 0) break;
+            P -= 2;
+            while (P > 0 && Blank(T[P - 1])) --P;
+            size_t B = P;
+            while (B > 0 && Ident(T[B - 1])) --B;
+            if (B == P) break;
+            Q = T.substr(B, P - B) + (Q.empty() ? "" : "::" + Q);
+            P = B;
+        }
+        if (!Q.empty() && Find(Q)) return Q;
+    }
+    return std::string();
 }
 
 /* clang's JSON keeps no qualifier, so it shows two ways. The method called is declared above the nearest declaration of
    its name from Obj's type up, which an unqualified call would have found (Obj a Kid, which declares Method too). Or the
-   source says so where the member begins, which is where Obj is written: read when Obj is a plain chain of names
-   (`Other`, `this->Other`, `A->B`), and given up after a call or a cast, as it then cannot be read. */
+   source says so right before the member's name, whatever Obj is written as: a name, a call or a cast
+   (WrittenQualifier). */
 std::string FCompiler::QualifiedOnOther(const Json& Callee, const Json& Obj, const FRecord& R, const std::string& Method) const
 {
     std::string Of = StripTypeKeywords(TypeOf(Obj));
@@ -6280,28 +6321,7 @@ std::string FCompiler::QualifiedOnOther(const Json& Callee, const Json& Obj, con
             if (A != &R) return R.CppName;
             break;
         }
-    const Json Begin = Callee.value("range", Json::object()).value("begin", Json::object());
-    if (!Begin.contains("offset")) return std::string();
-    const size_t Off = Begin["offset"].get<size_t>();
-    auto Ident = [](char C) { return std::isalnum(uint8(C)) || C == '_'; };
-    for (const std::string& T : ModSources())
-    {
-        std::string Q;          // the names joined by `::` since the last `->` or `.`
-        for (size_t P = Off; P < T.size();)
-        {
-            while (P < T.size() && (T[P] == ' ' || T[P] == '\t')) ++P;
-            size_t E = P;
-            while (E < T.size() && Ident(T[E])) ++E;
-            if (E == P) break;
-            const std::string Id = T.substr(P, E - P);
-            while (E < T.size() && (T[E] == ' ' || T[E] == '\t')) ++E;
-            if (T.compare(E, 2, "::") == 0) { Q += (Q.empty() ? "" : "::") + Id; P = E + 2; continue; }
-            if (T.compare(E, 2, "->") == 0 || T.compare(E, 1, ".") == 0) { Q.clear(); P = E + (T[E] == '.' ? 1 : 2); continue; }
-            if (Id == Method && !Q.empty() && Find(Q)) return Q;
-            break;
-        }
-    }
-    return std::string();
+    return WrittenQualifier(Callee);
 }
 
 bool FCompiler::NamesQualified(const Json& Callee, const FRecord* Written, const FRecord& R, const std::string& Method) const
@@ -16944,10 +16964,10 @@ private:
 };
 
 /* Builds the DOM of clang's AST dump as it streams in, without what nothing reads: source locations (all but a
-   DeclRefExpr's or MemberExpr's range begin offset and token length, and its end's in a macro, see NamedQualifier and
-   MemberQualifier, and a braced value's whole range, see IsUnsetInit), mangled names, a record's definitionData and
-   a few flags are most of the dump, and building them was most of a compile. A key read later must be in neither
-   DroppedAstKey nor key()'s own rules. */
+   DeclRefExpr's range begin offset and token length, and its end's in a macro, see NamedQualifier, a MemberExpr's
+   whole range, see MemberQualifier and WrittenQualifier, and a braced value's, see IsUnsetInit), mangled names, a
+   record's definitionData and a few flags are most of the dump, and building them was most of a compile. A key read
+   later must be in neither DroppedAstKey nor key()'s own rules. */
 class FAstSax : public nlohmann::json_sax<Json>
 {
 public:
@@ -16961,8 +16981,8 @@ public:
     bool string(string_t& V) override
     {
         if (bKindNext && !Skipped)          // "kind" comes before "range"
-            Ranged.back() = V == "DeclRefExpr" || V == "MemberExpr" ? ERange::Begin
-                          : V == "InitListExpr" || V == "CXXConstructExpr" ? ERange::Whole : ERange::None;
+            Ranged.back() = V == "DeclRefExpr" ? ERange::Begin
+                          : V == "MemberExpr" || V == "InitListExpr" || V == "CXXConstructExpr" ? ERange::Whole : ERange::None;
         return Value(std::move(V));
     }
     bool binary(binary_t& V) override { return Value(std::move(V)); }
@@ -16974,8 +16994,9 @@ public:
     {
         if (Skipped) return true;
         /* A spellingLoc only gets here inside a range kept (every other loc and range is skipped whole). A DeclRefExpr's
-           or MemberExpr's end is kept only for a qualifier written in a macro (NamedQualifier); a braced value's, always:
-           IsUnsetInit tells a `{}` written from a member the braces leave out by it. */
+           end is kept only for a qualifier written in a macro (NamedQualifier); a MemberExpr's, which is its member's
+           name, always: WrittenQualifier reads the qualifier back from there. A braced value's, always too: IsUnsetInit
+           tells a `{}` written from a member the braces leave out by it. */
         const bool bMacroEnd = K == "end" && Stack.back()->is_object() && Stack.back()->contains("begin")
                             && (*Stack.back())["begin"].contains("spellingLoc");
         const bool bWholeEnd = K == "end" && Ranged.size() >= 2 && Ranged[Ranged.size() - 2] == ERange::Whole;
@@ -16995,8 +17016,8 @@ public:
     bool parse_error(size_t, const std::string&, const nlohmann::detail::exception&) override { return false; }
 
 private:
-    /* What of an open node's range is kept: none, its begin (a DeclRefExpr or MemberExpr), or the whole range (a braced
-       value: an InitListExpr or CXXConstructExpr). */
+    /* What of an open node's range is kept: none, its begin (a DeclRefExpr), or the whole range (a MemberExpr, or a
+       braced value: an InitListExpr or CXXConstructExpr). */
     enum class ERange : uint8 { None, Begin, Whole };
     Json& Root;
     const bool bFrozenKeys;         // astcheck's reference parse

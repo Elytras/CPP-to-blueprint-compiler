@@ -5656,7 +5656,9 @@ def func_qualified_call():
     A body making such a call is not copied into a subclass's function, where the call would be the subclass's: a
     QcRelayKid, which overrides AuthOnly, still runs QcParent's through FuncQualifiedCall::CallParentAuth, and its call
     to QcRelay::RelayServer leaves RelayServer's parent call bound from QcRelay, which has a ServerBump. Copied into
-    QcFinalPlain, CallParentPlain's `QcParent::Plain()` is still QcParent's, not QcFinalPlain's final Plain."""
+    QcFinalPlain, CallParentPlain's `QcParent::Plain()` is still QcParent's, not QcFinalPlain's final Plain.
+    CallThisPlain's `this->QcParent::Plain()` and CallMacroPlain's, written in a macro, are the same call, the qualifier
+    read back from Plain: both used to go by name and run QcKid's Plain (50)."""
     folder = os.path.dirname(asset('FuncQualifiedCall'))
     chain = [os.path.join(folder, c) for c in ('QcKid', 'FuncQualifiedCall', 'QcParent')]
     relay = [os.path.join(folder, c) for c in ('QcRelayKid', 'QcRelay')] + chain[1:]
@@ -5667,7 +5669,7 @@ def func_qualified_call():
         assert fields.get('Seen') == want, (fn, fields)
     got = run_as(final, 'CallRelayPlain', {})
     assert got == 5, 'QcParent::Plain() copied into QcFinalPlain returned %r' % got
-    for fn in ('CallParentPlain', 'CallParentPlainSlow'):
+    for fn in ('CallParentPlain', 'CallParentPlainSlow', 'CallThisPlain', 'CallMacroPlain'):
         got = run_as(chain, fn, {})
         assert got == 5, '%s: QcParent::Plain() on a QcKid returned %r' % (fn, got)
     assert run_as(chain, 'CallParentKept', {}) == 2
@@ -9800,7 +9802,9 @@ def unlike_cpp_refusals():
     """Calls that used to compile into something other than what C++ runs. A UE_STRUCT's method that is not inline named
     a function that exists nowhere, as a Blueprint struct holds none. `Other->QoBase::Bump(1)` went by name and reached
     Other's own override, where C++ runs QoBase's: seen when Other's type declares Bump too (QoKid), and when the source
-    spells the qualifier after a plain chain of names (`this->Other->QoBase::Bump`)."""
+    spells the qualifier, which is read back from Bump whatever the object is written as: a chain of names
+    (`this->Other->QoBase::Bump`), a call (`GetOther()->`) or a cast (`Cast<QoBase>(A)->`), in a macro's body too. By
+    name, each compiles."""
     refused('StructFn', '  FStructFn P;\n  int32 Use() { return P.Sum(); }\n', 'FStructFn::Sum: a UE_STRUCT holds no functions',
             top='struct FStructFn {\n  UE_STRUCT;\n  int32 A = 1;\n  int32 Sum() const { return A + 1; }\n};\n')
     sup = ('class QoBase : public AActor {\npublic:\n  int32 Bump(int32 V) { return V + 1; }\n};\n'
@@ -9808,10 +9812,24 @@ def unlike_cpp_refusals():
     why = "`Obj->QoBase::Bump()` runs QoBase's Bump on another object without dispatch"
     refused('QoKidRef', '  QoKid *Other;\n  int32 Go() { return Other->QoBase::Bump(1); }\n', why, top=sup)
     refused('QoBaseRef', '  QoBase *Other;\n  int32 Go() { return this->Other->QoBase::Bump(1); }\n', why, top=sup)
+    refused('QoCallRef', '  QoBase *Other;\n  QoBase *GetOther() { return Other; }\n'
+            '  int32 Go() { return GetOther()->QoBase::Bump(1); }\n', why, top=sup)
+    refused('QoCastRef', '  int32 Go(AActor *A) { return Cast<QoBase>(A)->QoBase::Bump(1); }\n', why, top=sup)
+    refused('QoMacroRef', '  QoBase *Other;\n  int32 Go() { return BUMP(Other); }\n', why,
+            top=sup + '#define BUMP(O) O->QoBase::Bump(1)\n')
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, 'QoByName.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/QoByName");\n' + sup +
+                    'class QoByName : public AActor {\npublic:\n  QoBase *Other;\n  QoBase *GetOther() { return Other; }\n'
+                    '  int32 Go(AActor *A) { return Other->Bump(1) + GetOther()->Bump(1) + Cast<QoBase>(A)->Bump(1); }\n};\n')
+        proc = assetgen_compile([src, UEAPI, tmp])
+        assert proc.returncode == 0, proc.stdout
 
 
 unlike_cpp_refusals()
-print('ok  UnlikeCppRefusals: a UE_STRUCT method that is not inline, and a qualified call on another object, are refused')
+print('ok  UnlikeCppRefusals: a UE_STRUCT method that is not inline, and a qualified call on another object, through a '
+      'name, a call or a cast, are refused')
 
 
 def asset_map_dup_keys():

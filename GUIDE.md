@@ -1909,12 +1909,11 @@ each topic.
 
 - A mod widget class. It has no designer layout, so it shows nothing of its own. For visible UI, create one of the
   game's widget Blueprints. See [Classes and variables](REFERENCE.md#classes-and-variables).
-- `GetOther()->SuperBase::Bump(1)`, a qualified call on another object reached through a call or a cast, where the
-  object's type does not declare Bump itself. The qualifier cannot be read back there, so the call goes by name and
-  reaches the object's override. Written on a variable, `Other->SuperBase::Bump(1)`, it is refused. See
-  [Overrides and parent calls](REFERENCE.md#overrides-and-parent-calls).
 - `UE_AWAIT` on a dispatcher with two or more parameters. The method resumes, but the values are not available. Bind
   a handler to read them. See [Waiting on events](REFERENCE.md#waiting-on-events).
+- A qualified call whose qualifier a macro takes as an argument, `#define ON(O, Q) O->Q::Bump(1)`. The qualifier is not
+  read, so the call goes by name and reaches the object's override. Write the qualifier in the macro's body, or call
+  by name. See [Overrides and parent calls](REFERENCE.md#overrides-and-parent-calls).
 
 A few mistakes also compile without a message, because the construct itself works:
 
