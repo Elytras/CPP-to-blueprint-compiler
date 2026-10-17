@@ -258,13 +258,16 @@ bool AssignmentSides(const Json& S, const Json*& Lhs, const Json*& Rhs)
 }
 
 /* One UE_DEFAULTS statement, `Field = value;` or `Component->Field = value;`: the field's MemberExpr, the value, and
-   the component's MemberExpr it reaches through (null for none). False for any other statement. */
+   the component's MemberExpr it reaches through (null for none). False for any other statement, among them part of a
+   struct (`Hit.Distance = 5.0f;`, which is no component's member) and a member of anything but this object
+   (`GetOwner()->InitialLifeSpan`, which is no default of its class's). */
 bool DefaultAssignment(const Json& S, const Json*& Lhs, const Json*& Rhs, const Json*& Through)
 {
     if (!AssignmentSides(S, Lhs, Rhs) || Kind(*Lhs) != "MemberExpr") return false;
     const Json* Owner = Strip(First(*Lhs));
-    Through = Owner && Kind(*Owner) == "MemberExpr" ? Owner : nullptr;
-    return true;
+    Through = Owner && Kind(*Owner) == "MemberExpr" && Lhs->value("isArrow", false) ? Owner : nullptr;
+    const Json* Self = Through ? Strip(First(*Through)) : Owner;
+    return Self && Kind(*Self) == "CXXThisExpr";
 }
 
 /* A UE_DEFAULTS statement `Comp->SetupAttachment(Parent, Socket)`: the call's MemberExpr, the object it is called on,
@@ -649,6 +652,7 @@ struct FRecord
     std::vector<const Json*> AllMethods;            // every in-class method decl, overloads included, in order
     std::vector<const Json*> Fields;
     std::vector<const Json*> Ctors;                 // CXXConstructorDecls: their parameter names place a value's arguments
+    const Json* Dtor = nullptr;                     // the destructor the source declares, if any (LowerCtor refuses it)
     std::vector<std::string> Interfaces;            // every base after the first; a native class's from UeNativeInterfaces
     std::string Tail;                               // genueapi's UeClassTail: "<ScriptInherit flags> <ClassWithin> <ConfigName>"
     std::map<std::string, std::string> Replicated;  // UE_REPLICATED*: variable -> "Notify:Condition"
@@ -1322,6 +1326,8 @@ public:
 
 private:
     bool Collect(std::string* Err);
+    bool LowerCtor(FRecord& R, std::string* Err);
+    std::deque<Json> CtorDefaults;              // the UE_DEFAULTS LowerCtor makes, which the records point into
     bool Generate(const FRecord& R, const std::string& OutDir, std::string* Err);
     /* The native default subobjects a class's UE_DEFAULTS restates: each component member -> the record declaring it. */
     std::map<std::string, const FRecord*> RestatedSubobjects(const FRecord& R) const;
@@ -2711,6 +2717,8 @@ bool FCompiler::Collect(std::string* Err)
             }
             else if (Kind(C) == "CXXConstructorDecl")
                 R.Ctors.push_back(&C);
+            else if (Kind(C) == "CXXDestructorDecl" && !C.contains("explicitlyDefaulted"))    // clang's own is defaulted
+                R.Dtor = &C;
             else if (Kind(C) == "FieldDecl" && C.contains("name"))
             {
                 R.Fields.push_back(&C);
@@ -2910,6 +2918,14 @@ bool FCompiler::Collect(std::string* Err)
                  + "::UeDefaults__()`, is never read, nor seen by a mod that includes the class's header";
             return false;
         }
+        /* Neither cooks a default object of its own: GenerateStruct and GenerateInterface never read the block. */
+        if (R.Defaults && (R.bIsStruct || R.bIsInterface))
+        {
+            *Err = R.CppName + ": a " + (R.bIsStruct ? "UE_STRUCT" : "UE_INTERFACE") + " has no UE_DEFAULTS, so its "
+                   "statements would be dropped; give each variable its initializer"
+                 + (R.bIsInterface ? ", and set an inherited one in the UE_DEFAULTS of a class that implements it" : "");
+            return false;
+        }
         if (R.UePackage.empty()) continue;
         if (R.UePackage != PathIn(ModPackage, R.CppName)) continue;
         if (!R.bIsStruct && R.UeName != LeafOf(R.CppName) + "_C")
@@ -2920,6 +2936,121 @@ bool FCompiler::Collect(std::string* Err)
         }
         R.bIsLocal = true;
     }
+    /* After bIsLocal, which IsGenerated reads: each class this source cooks, and another mod's, whose defaults a subclass
+       here reads off the same header. */
+    for (auto& It : Records)
+    {
+        FRecord& R = It.second;
+        const bool bOtherMod = R.IsNative() && R.UePackage.compare(0, 6, "/Game/") == 0;
+        if (!R.IsGenerated() && !R.bIsPatch && !bOtherMod) continue;
+        if (!LowerCtor(R, Err)) return false;
+    }
+    return true;
+}
+
+/* A cooked class's constructor, which the engine never runs: a Blueprint object is a copy of its class's default object.
+   So the default constructor is read as that object's values, as in-class initializers and UE_DEFAULTS are. A member
+   initializer, or an assignment to one of the class's own variables, becomes that variable's initializer, the last one
+   written winning as in C++ (a default reads no member, FoldConst says, so none can see an earlier value). Any other
+   statement, on an inherited member or through a component, joins UE_DEFAULTS after its own statements; a UE_STRUCT or a
+   UE_INTERFACE has no UE_DEFAULTS, so there it is refused. It is read where it is written, as UE_DEFAULTS is: a mod that
+   includes the class's header never sees a definition out of it. A UE_STRUCT's constructor with parameters places a
+   value's arguments (StructArgs); a class's would never be called, and is refused. So is a destructor that does
+   something: the engine frees the object without it. */
+bool FCompiler::LowerCtor(FRecord& R, std::string* Err)
+{
+    const std::string Leaf = LeafOf(R.CppName);
+    if (R.Dtor)
+    {
+        const Json* Body = nullptr;
+        ForEach(*R.Dtor, [&](const Json& B) { if (Kind(B) == "CompoundStmt") Body = &B; });
+        if (!Body || First(*Body))
+        {
+            *Err = R.CppName + "::~" + Leaf + "(): a destructor never runs in the game, which frees the object without it; "
+                   "drop it, and do teardown in ReceiveEndPlay";
+            return false;
+        }
+    }
+    const std::string Where = R.CppName + "::" + Leaf + "()";
+    const Json* Ctor = nullptr;
+    for (const Json* C : R.Ctors)
+    {
+        if (C->value("isImplicit", false) || C->contains("explicitlyDefaulted") || C->value("explicitlyDeleted", false)) continue;
+        if (ParmNames(*C).empty()) { Ctor = C; continue; }
+        if (R.bIsStruct) continue;
+        std::string Parms;
+        for (const std::string& P : ParmNames(*C)) Parms += (Parms.empty() ? "" : ", ") + P;
+        *Err = R.CppName + "::" + Leaf + "(" + Parms + "): the engine makes a Blueprint class's objects "
+               "with no arguments, so this constructor is never called; only one that takes none is read, as the class's "
+               "defaults";
+        return false;
+    }
+    if (!Ctor) return true;
+    const Json* Body = nullptr;
+    ForEach(*Ctor, [&](const Json& B) { if (Kind(B) == "CompoundStmt") Body = &B; });
+    if (!Body)
+    {
+        *Err = Where + " has no body in the class; AssetGen reads a constructor there alone, so write it in it: a definition "
+               "out of the class is never read, nor seen by a mod that includes the class's header";
+        return false;
+    }
+    auto OwnField = [&](const std::string& Id) -> Json* {
+        for (const Json* F : R.Fields) if (F->value("id", std::string()) == Id) return const_cast<Json*>(F);
+        return nullptr;
+    };
+    auto SetInit = [](Json& F, const Json& V) {
+        Json& In = F["inner"];
+        if (!In.is_array()) In = Json::array();
+        if (F.value("hasInClassInitializer", false) && !In.empty()) In[0] = V;
+        else In.insert(In.begin(), V);
+        F["hasInClassInitializer"] = true;
+    };
+    ForEach(*Ctor, [&](const Json& I) {
+        if (Kind(I) != "CXXCtorInitializer" || !I.contains("anyInit")) return;      // the parent's: its own defaults
+        Json* F = OwnField(I["anyInit"].value("id", std::string()));
+        const Json* V = First(I);
+        /* clang's own for a member nobody named: the in-class initializer, or the type's default. */
+        if (!F || !V || Kind(*V) == "CXXDefaultInitExpr" || (!F->value("hasInClassInitializer", false) && IsUnsetInit(*V)))
+            return;
+        SetInit(*F, *V);
+    });
+    Json Moved = Json::array();
+    bool bOk = true;
+    ForEach(*Body, [&](const Json& S) {
+        if (!bOk || Kind(S) == "NullStmt") return;
+        const Json *Lhs = nullptr, *Rhs = nullptr, *Through = nullptr;
+        const Json *Callee = nullptr, *Child = nullptr, *Parent = nullptr, *Socket = nullptr;
+        const bool bAssign = DefaultAssignment(S, Lhs, Rhs, Through);
+        if (!bAssign && !AttachmentCall(S, Callee, Child, Parent, Socket) && !R.bIsPatch)     // a patch's may set part of one
+        {
+            *Err = Where + ": a constructor never runs in the game, so its statements are read as the class's defaults: each "
+                   "is `Field = value;`, `Component->Field = value;` or `Component->SetupAttachment(Parent);`, on this "
+                   "object's members, each set whole. Do run-time setup in ReceiveBeginPlay";
+            bOk = false;
+            return;
+        }
+        if (Json* F = bAssign && !Through ? OwnField(Lhs->value("referencedMemberDecl", std::string())) : nullptr)
+        {
+            SetInit(*F, *Rhs);
+            return;
+        }
+        if (R.bIsStruct || R.bIsInterface)
+        {
+            *Err = Where + ": a " + (R.bIsStruct ? "UE_STRUCT" : "UE_INTERFACE") + "'s constructor sets its own members, the "
+                   "only defaults it has";
+            bOk = false;
+            return;
+        }
+        Moved.push_back(S);
+        Moved.back()["ueWhere"] = Where;
+    });
+    if (!bOk || Moved.empty()) return bOk;
+    Json Block = { { "kind", "CompoundStmt" }, { "inner", Json::array() } };
+    if (R.Defaults)
+        ForEach(*R.Defaults, [&](const Json& B) { if (Kind(B) == "CompoundStmt" && B.contains("inner")) Block["inner"] = B["inner"]; });
+    for (Json& S : Moved) Block["inner"].push_back(std::move(S));
+    R.Defaults = &CtorDefaults.emplace_back(
+        Json{ { "kind", "CXXMethodDecl" }, { "name", "UeDefaults__" }, { "inner", Json::array({ std::move(Block) }) } });
     return true;
 }
 
@@ -15131,7 +15262,9 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     std::map<std::string, FBlueprintClass::FAttachment> Attachments;    // a UE_COMPONENT -> where SetupAttachment puts it
     if (R.Defaults && !R.bIsPatch)      // a patch's defaults are tags of the game's own package (GeneratePatch)
     {
-        const std::string Where = R.CppName + "::UE_DEFAULTS";
+        /* A statement LowerCtor brought from the constructor is named as the constructor's. */
+        const std::string Block = R.CppName + "::UE_DEFAULTS";
+        std::string Where = Block;
         auto OwnerOf = [&](const Json& M) {
             auto It = FieldOwner.find(M.value("referencedMemberDecl", std::string()));
             return It == FieldOwner.end() ? std::string() : It->second;
@@ -15212,6 +15345,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         if (Body)
             ForEach(*Body, [&](const Json& S) {
                 if (!bOk) return;
+                Where = S.value("ueWhere", Block);
                 const Json *Callee = nullptr, *Child = nullptr, *Parent = nullptr, *Socket = nullptr;
                 if (AttachmentCall(S, Callee, Child, Parent, Socket))
                 {
@@ -15226,7 +15360,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 const Json *Lhs = nullptr, *Rhs = nullptr, *Owner = nullptr;
                 if (!DefaultAssignment(S, Lhs, Rhs, Owner))
                 { *Err = Where + ": every statement is `Field = value;`, `Component->Field = value;` or "
-                         "`Component->SetupAttachment(Parent);`"; bOk = false; return; }
+                         "`Component->SetupAttachment(Parent);`, on this object's members, each set whole (not "
+                         "`Field.X = value;`)"; bOk = false; return; }
 
                 /* `Comp->Field` reaches through a component; a bare `Field` targets this class's
                    own CDO. Which of the three destinations a statement means is decided by who

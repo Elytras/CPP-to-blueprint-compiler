@@ -9630,6 +9630,106 @@ print('ok  DefaultsOutOfClass: UE_DEFAULTS with no body in the class is refused,
       'it or not at all')
 
 
+CTOR_TWIN = '''#include "UeApi/Types.h"
+#include "UeApi/Engine.h"
+UE_MOD_PACKAGE("/Game/_ElytrasMods/CtorDefaults");
+struct FCtorStats { UE_STRUCT; int32 HP = 50; float Speed = 2.5f; };
+class CtorDefaults : public AActor {
+public:
+  UE_COMPONENT(USceneComponent, Root);
+  UE_COMPONENT(UPointLightComponent, Lamp);
+  int32 Charges = 5;
+  int32 Plain = 7;
+  float Range = 20.0f;
+  FString Label = "lit";
+  TSet<int32> Marks = {1, 2, 3};
+  FCtorStats Stats;
+  UE_DEFAULTS { InitialLifeSpan = 9.0f; InitialLifeSpan = 2.0f; Lamp->Intensity = 250.0f; Lamp->SetupAttachment(Root); }
+};
+class CtorDefaultsKid : public CtorDefaults {
+public:
+  UE_DEFAULTS { Marks = {2, 3, 4}; Charges = 0; Lamp->Intensity = 100.0f; }
+};
+'''
+
+
+def ctor_defaults():
+    """CtorDefaults: a default constructor is the class's defaults. Each package is byte for byte what the same classes
+    written with initializers and UE_DEFAULTS cook (CTOR_TWIN), and the values are C++'s: the last assignment wins, the
+    constructor's statements come after UE_DEFAULTS' own (InitialLifeSpan 2, not 9), Lamp hangs from Root, a UE_STRUCT's
+    constructor makes its default instance, and a subclass's constructor writes over its parent's values: Charges' zero
+    is a tag, and Marks loads {2, 3, 4} over the parent's {1, 2, 3}."""
+    import struct, tempfile
+    here = os.path.dirname(asset('CtorDefaults'))
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, 'CtorTwin.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write(CTOR_TWIN)
+        proc = assetgen_compile([src, UEAPI, tmp])
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        for cls in ('CtorDefaults', 'CtorDefaultsKid', 'FCtorStats'):
+            for ext in ('.uasset', '.uexp'):
+                mine, twin = (open(os.path.join(d, cls + ext), 'rb').read() for d in (here, tmp))
+                assert mine == twin, '%s%s differs from the class written with initializers and UE_DEFAULTS' % (cls, ext)
+    base = os.path.join(here, 'CtorDefaults')
+    keeps_invariants(base)
+    pkg = invariants.Package(base)
+    cdo = pkg.find('Default__CtorDefaults_C')
+    num = lambda p, i, n, f: struct.unpack(f, p.tag(i, n)['value'])[0]
+    got = tuple(num(pkg, cdo, n, f) for n, f in (('Charges', '<i'), ('Plain', '<i'), ('Range', '<f'), ('InitialLifeSpan', '<f')))
+    assert got == (5, 7, 20.0, 2.0), got
+    assert num(pkg, pkg.find('Lamp_GEN_VARIABLE'), 'Intensity', '<f') == 250.0
+    marks = loaded_container(pkg, cdo, 'Marks', 'set', set())
+    assert marks == {1, 2, 3}, marks
+    children, roots, _ = scs_tree(base)
+    assert roots == ['Root'] and children['Root'] == ['Lamp'], (roots, children)
+    kid = invariants.Package(os.path.join(here, 'CtorDefaultsKid'))
+    kcdo = kid.find('Default__CtorDefaultsKid_C')
+    assert num(kid, kcdo, 'Charges', '<i') == 0
+    assert loaded_container(kid, kcdo, 'Marks', 'set', marks) == {2, 3, 4}
+    stats = invariants.Package(os.path.join(here, 'FCtorStats'))
+    inst = {re.sub(r'_\d+_[0-9A-F]{32}$', '', t['name']): t['value'] for t in stats.struct(stats.find('FCtorStats')).defaults}
+    assert struct.unpack('<i', inst['HP'])[0] == 50 and struct.unpack('<f', inst['Speed'])[0] == 2.5, inst
+
+
+ctor_defaults()
+print('ok  CtorDefaults: a default constructor cooks what the same initializers and UE_DEFAULTS cook, last write winning')
+
+
+def ctor_refusals():
+    """What a constructor cannot be is refused, where it used to be dropped without a word: one with parameters, which
+    the engine never calls; one defined out of the class, which a mod including the header never sees; a statement that
+    is no default (a call, part of a struct); a destructor that does something. So is what UE_DEFAULTS used to get
+    wrong: a statement on another object's member, read as this class's own; one on part of a component's struct, read
+    as a component of that name; and the block in a UE_STRUCT or a UE_INTERFACE, which was dropped (a class
+    implementing DefIface loaded Marks 1, not 5)."""
+    run = "CtorCall::CtorCall(): a constructor never runs in the game"
+    refused('CtorParms', '  int32 N;\n  CtorParms(int32 InN) : N(InN) {}\n',
+            "CtorParms::CtorParms(InN): the engine makes a Blueprint class's objects with no arguments")
+    refused('CtorOut', '  int32 N;\n  CtorOut();\n', 'CtorOut::CtorOut() has no body in the class',
+            after='CtorOut::CtorOut() { N = 4; }\n')
+    refused('CtorCall', '  int32 N;\n  CtorCall() { N = 4; K2_DestroyActor(); }\n', run)
+    refused('CtorPart', '  FVector Home;\n  CtorPart() { Home.Z = 5.0f; }\n', run.replace('CtorCall', 'CtorPart'))
+    refused('DtorBody', '  int32 N;\n  ~DtorBody() { N = 0; }\n', 'DtorBody::~DtorBody(): a destructor never runs in the game')
+    refused('CtorIface', '  UE_INTERFACE;\n  CtorIface() { Marks = 2; }\n',
+            "CtorIface::CtorIface(): a UE_INTERFACE's constructor sets its own members",
+            top='class ICtorBase {\n  UE_INTERFACE;\npublic:\n  int32 Marks = 1;\n};\n', base='ICtorBase')
+    every = '::UE_DEFAULTS: every statement is'
+    refused('DefOther', '  UE_DEFAULTS { GetOwner()->InitialLifeSpan = 5.0f; }\n', 'DefOther' + every)
+    refused('DefPart', '  UE_COMPONENT(UPointLightComponent, Lamp);\n  UE_DEFAULTS { Lamp->RelativeLocation.Z = 5.0f; }\n',
+            'DefPart' + every)
+    refused('DefIface', '  UE_INTERFACE;\n  UE_DEFAULTS { Marks = 5; }\n', 'DefIface: a UE_INTERFACE has no UE_DEFAULTS',
+            top='class IDefBase {\n  UE_INTERFACE;\npublic:\n  int32 Marks = 1;\n};\n', base='IDefBase')
+    refused('DefStruct', '  FDefStruct S;\n', 'FDefStruct: a UE_STRUCT has no UE_DEFAULTS',
+            top='struct FDefStruct {\n  UE_STRUCT;\n  int32 A = 1;\n  UE_DEFAULTS { A = 5; }\n};\n')
+
+
+ctor_refusals()
+print('ok  CtorRefusals: a constructor with parameters or defined out of the class, a statement no default can say, a '
+      'destructor with a body, a UE_DEFAULTS statement on part of a struct or on another object, and UE_DEFAULTS in a '
+      'UE_STRUCT or UE_INTERFACE are refused')
+
+
 def asset_map_dup_keys():
     """A key a map's braces give twice holds the last value given, as TMap's initializer-list constructor Adds each pair
     in order (Map.h 1166-1173). AS_AmdOver's {{"a", 1}, {"a", 2}} over UAmdDef's {a: 2, c: 3} loads {a: 2}, AS_AmdLast's

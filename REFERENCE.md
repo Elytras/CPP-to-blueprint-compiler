@@ -417,7 +417,7 @@ public:
 | `TArray<uint8> Payload = __EmbedFile__("data/blob.bin");` | Reads the file when the mod is built, from a path relative to the source's folder, and writes its bytes into the default, one element per byte. The compile prints `embed          -> Payload  (3 bytes)`. The file is not needed at run time. `__EmbedFile__` comes from `Intrin.h` in AssetGen's `include/` folder, included by its path as `Objects.h` is. | Yes |
 | `__EmbedFile__("missing.bin")`, `__EmbedFile__(kPath)` | Refused: a missing or empty file ("cannot read (or empty)"), and a path that is not a string literal ("the path must be a string literal"). It works only as the initializer of a `TArray<uint8>` member; clang refuses it for any other array type. | Refused |
 | `UE_ENUM_MAP(EMood, FName, Names);` | Declares a `TMap<EMood, FName>` member holding a name table that the compiler fills in when the mod is built, as a member default only. See [Enums](#enums). | Yes |
-| `AMyActor() { Charges = 5; }` | A constructor is dropped with no message. See [Class defaults](#class-defaults). | Not yet |
+| `AMyActor() { Charges = 5; }`, `AMyActor() : Charges(5) {}` | The same as `int32 Charges = 5;`: a default constructor is read as the class's defaults. See [Constructors](#constructors). | Yes |
 
 ```cpp
 // in a class; EMood is a UE_ENUM
@@ -2033,7 +2033,7 @@ written inside the class does not make a method inline. Only the `inline` keywor
 | `UE_AUTHORITY_ONLY` / `UE_COSMETIC` | The editor's Authority Only and Cosmetic function flags; see [RPCs](#rpcs). | Yes |
 | `generate_api: true` in `mods.yaml` | Writes an editor stub of the class, so a Blueprint made in the editor can place call nodes for its functions; see [Editor API stubs](GUIDE.md#editor-api-stubs). | Yes |
 | `int32 Undef(int32 X);` with no body anywhere | No function is cooked, and a call to it is refused ("... declares and never defines"), as C++ would not link it. Give every method a body, or make it `virtual ... = 0` for an empty one. | Refused |
-| `AMyActor() { Charges = 5; }` | A constructor body is silently ignored: it makes no function and no default. Use a member initializer or UE_DEFAULTS, and do runtime setup in ReceiveBeginPlay; see [Class defaults](#class-defaults). | Not yet |
+| `AMyActor() { Charges = 5; }` | No function: a default constructor is read as the class's defaults, and one that takes parameters is refused. A destructor that does something is refused too, as the engine never runs it. See [Constructors](#constructors); do run-time setup in ReceiveBeginPlay. | Yes |
 | `int32 Sum() const { ... }` inside a UE_STRUCT | A struct holds no functions. A non-inline struct method is not refused and compiles to a call that cannot work; an inline one is refused (`called on another object`). Write a free inline function that takes the struct: `inline int32 SumOf(const FPair &P)`. | Not yet |
 
 ```cpp
@@ -2822,7 +2822,8 @@ properties a parent class declares. It is what editing a component or Class Defa
 block is data: AssetGen reads its assignments when it compiles, and nothing in it ever runs. The rule to remember:
 every statement is `Field = value;` or `Component->Field = value;`, and a variable the class declares takes its default
 from its own initializer instead. The one call it takes is `Component->SetupAttachment(Parent);`, which places a
-component: see [The root and attachment](#the-root-and-attachment).
+component: see [The root and attachment](#the-root-and-attachment). A default constructor is read the same way, as C++
+would leave the object: see [Constructors](#constructors).
 
 ### UE_DEFAULTS
 
@@ -2834,9 +2835,11 @@ component: see [The root and attachment](#the-root-and-attachment).
 | `Ids = {2, 3};`, `Score = {{"a", 5}, {"b", 2}};` on a TSet or TMap a parent declares | This class's whole value, as Class Defaults would set it. The default object loads a set or map over its parent's value, so the compiler writes what differs, as the editor saves it: the parent's elements (a map's keys) this value lacks, as removed, then the elements the parent lacks or maps to another value. The parent's value is known where a header gives it: an initializer, a `UE_DEFAULTS` or a `UE_STRUCT` member's default instance, in a class of this mod or of another mod's shared header (`UE_CLASS_IN`, or `UE_CLASS` where the header gives the member a value). Below an engine or game class, whose value no header says, the elements are added to that class's own, with a warning naming the member, and so below a class whose `UE_DEFAULTS` sets the member over one (its default object holds that class's elements too; the statement's own are still removed). The same holds for a TSet or TMap inside a UE_STRUCT a parent declares, when you assign the struct whole (`Held = {{2, 3}, 3};`). A key given twice holds the last value given, as in C++, and an FString key compares without case: `{{"a", 5}, {"A", 1}}` is `{"A": 1}`. | Yes |
 | `Mesh->StaticMesh = &SM_Crate_B;` | Points an object property at an asset: a `UE_ASSET_AT`, a UeAssets name or an asset the mod cooks. The same as picking the asset in the details panel. | Yes |
 | `Index_0 = 7;`, for a member the SDK spells `Index_0` | Written under the engine's real name, `Index`. See [Classes and variables](#classes-and-variables). | Yes |
-| `Lamp->RelativeLocation.Z = 50.0f;` | Refused. Assign the whole struct: `Lamp->RelativeLocation = FVector(0.0f, 0.0f, 50.0f);`. The message is misleading: it says UeApi "does not say which default subobject RelativeLocation is", and regenerating the SDK does not help. | Refused |
+| `Lamp->RelativeLocation.Z = 50.0f;`, `Home.Z = 5.0f;` | Refused: "every statement is ... each set whole". Assign the whole struct: `Lamp->RelativeLocation = FVector(0.0f, 0.0f, 50.0f);`. | Refused |
+| `GetOwner()->InitialLifeSpan = 5.0f;` | Refused: "every statement is ...". A member of another object is no default of this class's. It used to compile as this class's own `InitialLifeSpan`. | Refused |
 | `int32 Charges;` with `UE_DEFAULTS { Charges = 3; }` | Refused: "is declared here - give it an initializer instead". Write `int32 Charges = 3;`. | Refused |
 | `UE_DEFAULTS;` in the class, `void UTurret::UeDefaults__() { Charges = 3; }` outside it | Refused: "UE_DEFAULTS has no body in the class". The statements are read where the macro is written, which is also all a mod that includes the class's header sees. Write `UE_DEFAULTS { Charges = 3; }` in the class. | Refused |
+| `UE_DEFAULTS { ... }` in a `UE_STRUCT` or a `UE_INTERFACE` | Refused: "has no UE_DEFAULTS". Neither cooks a default object of its own, and the block used to be dropped. Give each variable its initializer; set an interface's inherited variable in the `UE_DEFAULTS` of a class that implements it. | Refused |
 | `Extra->bVisible = false;`, where `Extra` is a plain pointer member | Refused: "is not a UE_COMPONENT". Only a `UE_COMPONENT`, this class's or a parent's, has a template to hold defaults. | Refused |
 | `Lamp->Intensity += 100.0f;`, an `if`, a call such as `K2_DestroyActor();` | Refused: "every statement is `Field = value;`, `Component->Field = value;` or `Component->SetupAttachment(Parent);`". The block never runs, so logic in it could do nothing. | Refused |
 | `Lamp->Intensity = UKismetMathLibrary::RandomFloat();`, `InitialLifeSpan = sizeof(FVector);` | Refused: "a default is a value known when the mod is built". A value here follows the rules for a member's initializer: see [Classes and variables](#classes-and-variables). Compute anything else in `ReceiveBeginPlay` or `UserConstructionScript`. | Refused |
@@ -2845,7 +2848,7 @@ component: see [The root and attachment](#the-root-and-attachment).
 | `Hit = {.Distance = 6.0f};` | The members given are written. One the braces leave out holds what the engine's constructor sets, which no header says: it is left unwritten where the parent's value is a fresh one (declared in a mod parent with no initializer, `{}` or `T()`, or with braces that leave it out, followed down, and set by no `UE_DEFAULTS` on the way), and refused over any other value: "Hit.FaceIndex, left out of the braces, holds what the engine's FHitResult constructor sets". Give every member, or leave the statement out. A `UE_STRUCT` value's braces, `H = {.N = 5};`, refuse a member of such a struct they leave out the same way. Braces nested for a `UE_STRUCT`'s member, `H = {.Hit = {.Distance = 5.0f}};`, are over a fresh value where that member has no initializer of its own, or one whose braces, followed down, leave it out: with `FInner In = {.K = 4};`, `O = {.In = {.Hit = {.Distance = 3.0f}}};` leaves the rest of Hit unwritten, and where the initializer gives Hit `{.Time = 0.5f}`, the Time the new braces leave out is refused. Another mod's struct (`UE_STRUCT_IN`) is no engine struct: a member its braces leave out takes the initializer its header gives it, written. | Yes |
 | `Hit = {.Time = 3.0f};` then `Hit = {.Distance = 6.0f};` | The last statement on a member is its value, as the last assignment is in C++: the earlier one writes nothing, so `Hit` is Distance 6 with Time the engine's 1, not 3. | Yes |
 | `Handle = FTimerHandle();` | Writes nothing, with a warning: FTimerHandle's one member is Transient, which the engine never loads from a default, so the value stays the parent's. | Warns |
-| `Lantern() { InitialLifeSpan = 5.0f; }` | Not yet: a constructor is dropped with no message. It makes no function and writes no default. Use initializers and `UE_DEFAULTS`, and do run-time setup in `ReceiveBeginPlay`. | Not yet |
+| `Lantern() { InitialLifeSpan = 5.0f; }` | A `UE_DEFAULTS` statement, written in the constructor: see [Constructors](#constructors). | Yes |
 
 ```cpp
 UE_ASSET_AT(UStaticMesh, SM_Crate_B, "/Game/Art/Environments/SpaceRig/SM_Crate_B");
@@ -2884,6 +2887,26 @@ Notes:
   EditDefaultsOnly ones.
 - A class has one `UE_DEFAULTS` block.
 - The path of a `UE_ASSET_AT` is not checked when the mod is built: see [Game assets](#game-assets).
+
+### Constructors
+
+The engine never runs a Blueprint class's constructor: a new object starts as a copy of its class's default object. So
+a default constructor is read as that object's values, what C++ would leave in it. A member initializer, or an
+assignment to a variable the class declares, is that variable's initializer. Any other statement is a `UE_DEFAULTS`
+statement, under the same rules, read after the class's own `UE_DEFAULTS` block.
+
+| You write | What it does | Status |
+|---|---|---|
+| `Lantern() : Charges(5) { Range = 10.0f; Range = 20.0f; }` | The same as `int32 Charges = 5;` and `float Range = 20.0f;`: each replaces the variable's in-class initializer, and the last one written wins, as in C++. | Yes |
+| `Lantern() { InitialLifeSpan = 2.0f; Lamp->Intensity = 250.0f; Lamp->SetupAttachment(Root); }` | The same as these statements in `UE_DEFAULTS`. A class that also has a `UE_DEFAULTS` block reads the constructor's after it, so on the same member the constructor's value wins. | Yes |
+| `FStats() : Speed(2.5f) { HP = 50; }` in a `UE_STRUCT` | The struct's default instance, as `int32 HP = 50;` and `float Speed = 2.5f;` would make it. A `UE_STRUCT`'s constructor with parameters still places a value's arguments: see [Structs](#structs). | Yes |
+| `Lantern() = default;`, `virtual ~Lantern() {}` | Nothing to read. | Yes |
+| `Lantern(int32 InCharges) : Charges(InCharges) {}` | Refused: "the engine makes a Blueprint class's objects with no arguments". Nothing would ever call it. | Refused |
+| `Lantern();` in the class, `Lantern::Lantern() { ... }` outside it | Refused: "has no body in the class". As with `UE_DEFAULTS`, a mod that includes the class's header sees only the class. | Refused |
+| `Lantern() { K2_DestroyActor(); }`, `Lantern() { Home.Z = 5.0f; }`, a local, an `if` | Refused: "a constructor never runs in the game". Each statement must be one `UE_DEFAULTS` takes, on a member set whole. Do run-time setup in `ReceiveBeginPlay`. | Refused |
+| `Lantern() { Charges = Max + 1; }` | Refused: "a default is a value known when the mod is built". A value follows the rules for an initializer, so it cannot read a member, even one the constructor set before it. | Refused |
+| `~Lantern() { ... }` | Refused: "a destructor never runs in the game". The engine frees the object without it. Do teardown in `ReceiveEndPlay`. | Refused |
+| A `UE_INTERFACE`'s constructor setting a variable of the interface it extends | Refused: "a UE_INTERFACE's constructor sets its own members". An interface has no `UE_DEFAULTS`. | Refused |
 
 ### The root's transform
 
@@ -5342,7 +5365,7 @@ listed here is refused with "unimplemented intrinsic".
 | `consteval` function | Runs while the mod compiles, and only the result is cooked. Its arguments must be constants. | [Constants](#constants) |
 | `constexpr` and `const` variables at namespace scope | Constants: no storage, each use is the value, worked out at build time. | [Constants](#constants) |
 | `constexpr` function | Not run at build time. A method is an ordinary Blueprint function, and a free one needs `inline`. For build time, write `consteval`. | [Inline functions and templates](#inline-functions-and-templates) |
-| Constructor, `MyMod() { ... }` | Not compiled, and nothing says so. Use initializers, UE_DEFAULTS and ReceiveBeginPlay. | [Class defaults](#class-defaults) |
+| Constructor, `MyMod() { ... }` | Read as the class's defaults, never run: its member initializers and assignments as initializers, its other statements as UE_DEFAULTS. One with parameters is refused, and so is a destructor that does something. | [Constructors](#constructors) |
 | Container methods, `Items.Add(X)`, `Map.Find(Key, Out)` | The Array, Set and Map nodes, called as methods. `Num()` is Length, and a TArray's `Remove(I)` removes the element at index I. | [Containers](#containers) |
 | `CreateWidget<T>(OwningPlayer)` | Create Widget: a widget of T, or of a class you pass, owned by a player controller. | [Creating objects](#creating-objects) |
 | Delay, `UKismetSystemLibrary::Delay(Seconds)` | A latent call: the function stops there and goes on when the delay ends. Every function with an FLatentActionInfo parameter works this way. | [Latent calls](#latent-calls) |
@@ -5962,7 +5985,7 @@ and where the feature is described. In each group, the messages you are most lik
   the call. UE_NO_OPTIMIZE on the calling function keeps it. See
   [Calling engine and game functions](#calling-engine-and-game-functions).
 
-These compile with no message and do not work as C++ would: the body of a C++ constructor, which is dropped; the
+These compile with no message and do not work as C++ would: the
 shorter of two non-inline methods with one name; and a non-inline method of a UE_STRUCT. `UKismetSystemLibrary::PrintString` compiles too, but UE 4.27 keeps
 its body only outside shipping builds, so the retail game prints nothing. See [Functions](#functions),
 [Strings and text](#strings-and-text) and [Calling engine and game functions](#calling-engine-and-game-functions).
@@ -6025,13 +6048,32 @@ its body only outside shipping builds, so the retail game prints nothing. See [F
   `UE_DEFAULTS;` declares the block without its statements, which may sit in an out-of-line definition. Those would
   be dropped, and a mod that includes the class's header could not see them either. Fix: move the statements into
   the class, `UE_DEFAULTS { Health = 100; }`. See [Class defaults](#class-defaults).
-- `` <Class>::UE_DEFAULTS: every statement is `Field = value;`, `Component->Field = value;` or `Component->SetupAttachment(Parent);` ``:
-  a statement in UE_DEFAULTS is not a plain `=` onto a member, nor a SetupAttachment: a call such as
-  `K2_DestroyActor();`, `Health += 5;`, a local or an `if`. The block never runs; AssetGen only reads its assignments
-  and attachments. A value computed at run time is refused with the
+- `` <Class>::UE_DEFAULTS: every statement is `Field = value;`, `Component->Field = value;` or `Component->SetupAttachment(Parent);`, on this object's members, each set whole (not `Field.X = value;`) ``:
+  a statement in UE_DEFAULTS is not a plain `=` onto a member of this object, nor a SetupAttachment: a call such as
+  `K2_DestroyActor();`, `Health += 5;`, a local, an `if`, part of a struct (`Lamp->RelativeLocation.Z = 50.0f;`) or
+  another object's member (`GetOwner()->InitialLifeSpan = 5.0f;`). The block never runs; AssetGen only reads its
+  assignments and attachments. A value computed at run time is refused with the
   member-default message that starts `<Member>: a default is a value known when the mod is built`. Fix: keep only
-  assignments of build-time values in UE_DEFAULTS, and move the rest to ReceiveBeginPlay or UserConstructionScript.
-  See [Class defaults](#class-defaults).
+  assignments of build-time values in UE_DEFAULTS, a struct given whole, and move the rest to ReceiveBeginPlay or
+  UserConstructionScript. See [Class defaults](#class-defaults).
+- `<Struct>: a UE_STRUCT has no UE_DEFAULTS, so its statements would be dropped; give each variable its initializer`,
+  and the same for a UE_INTERFACE: neither cooks a default object of its own. Fix: give each variable its
+  initializer; set a variable an interface inherits in the UE_DEFAULTS of a class that implements it. See
+  [Class defaults](#class-defaults).
+- `<Class>::<Class>(<Parameters>): the engine makes a Blueprint class's objects with no arguments, so this constructor
+  is never called`: a mod class's constructor takes parameters. Fix: drop it; a constructor that takes none is read as
+  the class's defaults. See [Constructors](#constructors).
+- `<Class>::<Class>() has no body in the class`: the constructor is defined out of the class, or nowhere. AssetGen
+  reads it in the class alone, as UE_DEFAULTS. Fix: write its body in the class. See [Constructors](#constructors).
+- `<Class>::<Class>(): a constructor never runs in the game, so its statements are read as the class's defaults`: a
+  statement that is not one UE_DEFAULTS takes, such as a call, a local or `Home.Z = 5.0f;`. Fix: move run-time setup
+  to ReceiveBeginPlay, and set a struct whole. See [Constructors](#constructors).
+- `<Class>::<Class>(): a UE_STRUCT's constructor sets its own members, the only defaults it has`, and the same for a
+  UE_INTERFACE: the constructor sets something else, such as a variable of an interface the interface extends. Fix:
+  set that in the UE_DEFAULTS of a class that implements it. See [Constructors](#constructors).
+- `<Class>::~<Class>(): a destructor never runs in the game, which frees the object without it`: a destructor with a
+  body, or one defined out of the class. Fix: drop it, and do teardown in ReceiveEndPlay. See
+  [Constructors](#constructors).
 - `<Class>::UE_DEFAULTS: <Member> needs a literal value`: the value writes nothing: `{}` or `T()` of a type AssetGen
   writes no zero for. `nullptr`, `{}` and `T()` of a number, an enum, a name, a string, an object, a container or a
   struct are written as that type's zero. Fix: write an explicit value, or leave the statement out to

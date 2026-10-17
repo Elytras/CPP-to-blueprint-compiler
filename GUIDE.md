@@ -49,8 +49,8 @@ equivalents the same way; [Writing mods](#writing-mods) takes them one at a time
 
 The source is C++, but what runs is a Blueprint. These are the differences that catch a C++ programmer:
 
-- **Your C++ never runs as C++.** A constructor is dropped without a message; member initializers and `UE_DEFAULTS`
-  are read when the mod is built, and run-time setup goes in `ReceiveBeginPlay`. See
+- **Your C++ never runs as C++.** Member initializers, `UE_DEFAULTS` and a default constructor are read when the mod
+  is built, as the class's defaults, and run-time setup goes in `ReceiveBeginPlay`. See
   [Classes and variables](#classes-and-variables).
 - **A method is a Blueprint function unless it is `inline`**, and a free function must be `inline`. See
   [Functions and events](#functions-and-events).
@@ -299,8 +299,9 @@ With `UE_MOD_PACKAGE("/Game/_MyMods/Turrets")` this writes `/Game/_MyMods/Turret
 
 Watch for:
 
-- A constructor is ignored, with no message. Set defaults with initializers and `UE_DEFAULTS`, and do run-time setup
-  in `ReceiveBeginPlay`.
+- A constructor never runs. A default constructor is read as the class's defaults, `Lantern() : Charges(5) {}` as
+  `int32 Charges = 5;`, and its other statements as `UE_DEFAULTS`; anything else in it is refused. Do run-time setup
+  in `ReceiveBeginPlay`. See [Constructors](REFERENCE.md#constructors).
 - Redeclaring an inherited property, such as `float InitialLifeSpan = 3.0f;` in a class derived from `AActor`,
   compiles with no warning. It adds a second variable that hides the parent's, and the engine never reads it. Use
   `UE_DEFAULTS`.
@@ -502,9 +503,9 @@ Watch for:
   `USceneComponent` root hands them on to the components attached to it. (A class whose parent already has a root,
   such as a Blueprint parent or `ACharacter`, adds no root: its first scene component keeps its transform.) A mesh or a light as the root keeps them,
   and AssetGen warns that they are not applied. Declare a `USceneComponent` first.
-- `UE_DEFAULTS` is read when the mod is built and never runs. A call, an `if`, a `+=`, or a member path
-  such as `Lamp->RelativeLocation.Z = 50.0f;` is refused; the member path gets a misleading message about genueapi,
-  the SDK generator ([The SDK](#the-sdk)). A variable the class declares itself takes an initializer instead.
+- `UE_DEFAULTS` is read when the mod is built and never runs. A call, an `if`, a `+=`, part of a struct such as
+  `Lamp->RelativeLocation.Z = 50.0f;`, or another object's member is refused: set a struct whole. A variable the class
+  declares itself takes an initializer instead.
   `Target = nullptr;`, `Count = {};` and `Offset = FVector();` write the type's zero over the parent's value.
   `Hit = FHitResult();` is refused: an FHitResult's values come from the engine's constructor (Time is 1), which
   no header shows; give the members instead, `Hit = {.Time = 1.0f};`. The same goes for every engine struct but
@@ -1825,6 +1826,7 @@ Each row gives the part of the message to look for, the reason, and what to writ
 | clang: `only virtual member functions can be marked 'override'` | The SDK declares engine functions non-virtual. The method's name alone makes the override. | `void ReceiveTick(float DeltaSeconds) { ... }` | [Overrides and parent calls](REFERENCE.md#overrides-and-parent-calls) |
 | `<Member>: a default is a value known when the mod is built - ...` | A member initializer is read when the mod is built and never runs, so it takes only a value known then. A class reference is not one yet. | Set it in `ReceiveBeginPlay`: `Kind = AActor::StaticClass();` | [Classes and variables](REFERENCE.md#classes-and-variables) |
 | `<Class>::UE_DEFAULTS: Charges is declared here - give it an initializer instead` | `UE_DEFAULTS` sets inherited variables and components, not the class's own. | `int32 Charges = 3;` | [Class defaults](REFERENCE.md#class-defaults) |
+| `<Class>::<Class>(): a constructor never runs in the game, so its statements are read as the class's defaults` | A default constructor is read, not run: each statement must be one `UE_DEFAULTS` takes. | Move the call or the logic to `ReceiveBeginPlay` | [Constructors](REFERENCE.md#constructors) |
 | `latent call Delay: a function that resumes later returns nothing and takes no non-const reference parameters` | The code after a wait resumes in the event graph, which has no return value and no out parameters. | Return `void`, take parameters by value or `const&` and keep results in member variables | [Latent calls](REFERENCE.md#latent-calls) |
 | `static Calls lives in the ubergraph's frame, which only a function that makes a latent call runs in; make Calls a member` | A Blueprint function keeps nothing between calls (the ubergraph is the class's event graph). | A member variable | [Latent calls](REFERENCE.md#latent-calls) |
 | ``a delegate cannot bind Handle: an inline function is expanded where it is called, no UFunction (drop `inline`)`` | An inline method is pasted into its callers and is no function of the class. | Drop `inline` from the handler | [Event dispatchers](REFERENCE.md#event-dispatchers) |
@@ -1908,8 +1910,6 @@ each topic.
 
 **Compiled with no message, but wrong.** Nothing catches these yet, so avoid them.
 
-- A constructor. Its body is dropped: it makes no function and no default. Use member initializers, `UE_DEFAULTS` and
-  `ReceiveBeginPlay`. See [Class defaults](REFERENCE.md#class-defaults).
 - A method of a `UE_STRUCT` that is not inline. A Blueprint struct holds no functions, so the call names a function
   that exists nowhere. Write a free `inline` function that takes the struct. See [Functions](REFERENCE.md#functions).
 - Two non-inline methods with the same name. A Blueprint class has one function per name: only the overload with the
