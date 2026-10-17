@@ -4391,6 +4391,35 @@ def await_runs():
     print('ok  AsyncTest: binds, one Activate after the first bind, each await resuming with its value')
 
 
+def await_values():
+    """AwaitValues: an await on a dispatcher of two or more parameters resumes with each value in the name bound to it,
+    and a later broadcast with that one's values; the names outlive a second await. One written as a statement waits
+    and keeps none. `auto V = UE_AWAIT(...)` of such a dispatcher is refused, naming the binding to write."""
+    hit = {'X': 1.0, 'Y': 2.0, 'Z': 3.0}
+    vm = VM(asset('AwaitValues'), {}, Total=0, Hurt=0.0, Woken=0)
+    vm.call('WaitScore')
+    assert vm.self.vars == dict(Total=0, Hurt=0.0, Woken=0), vm.self.vars
+    vm.broadcast(vm.self, 'OnScored', 'dwarf', 5)
+    assert vm.self.vars['Last'] == 'dwarf' and vm.self.vars['Total'] == 5, vm.self.vars
+    vm.broadcast(vm.self, 'OnScored', 'scout', 2)
+    assert vm.self.vars['Last'] == 'scout' and vm.self.vars['Total'] == 7, vm.self.vars
+    vm = VM(asset('AwaitValues'), {}, Total=0, Hurt=0.0, Woken=0)
+    vm.call('WaitHitThenScore')
+    vm.broadcast(vm.self, 'OnHit', 'dwarf', hit, 2.5)
+    assert vm.self.vars == dict(Total=0, Hurt=2.5, Woken=0, At=hit), vm.self.vars
+    vm.broadcast(vm.self, 'OnScored', 'scout', 4)
+    assert vm.self.vars['Total'] == 0, vm.self.vars
+    vm.broadcast(vm.self, 'OnScored', 'dwarf', 3)
+    assert vm.self.vars['Total'] == 30, vm.self.vars
+    vm = VM(asset('AwaitValues'), {}, Total=0, Hurt=0.0, Woken=0)
+    vm.call('WaitAny')
+    vm.broadcast(vm.self, 'OnHit', 'dwarf', hit, 2.5)
+    assert vm.self.vars == dict(Total=0, Hurt=0.0, Woken=1), vm.self.vars
+    refused('AwaitWhole', '  UE_DISPATCHER(OnScored, AActor *Who, int32 Points);\n  int32 Total;\n'
+            '  void F() { auto V = UE_AWAIT(OnScored); Total = 1; }\n', 'one name each, `auto [Who, Points]')
+    print('ok  AwaitValues: each of a dispatcher\'s values resumes in the name bound to it; `auto V =` of them is refused')
+
+
 def delegate_targets():
     """Every function a delegate is bound to by name exists in the class and takes the one parameter its dispatcher passes."""
     for mod in ('AsyncTest', 'LatentTest'):
@@ -4579,6 +4608,7 @@ latent_runs()
 latent_links()
 static_locals()
 await_runs()
+await_values()
 delegate_targets()
 spawn_runs()
 spawn_relative()

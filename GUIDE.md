@@ -540,8 +540,9 @@ events fire only once it receives input: set `AutoReceiveInput = EAutoReceiveInp
 call `EnableInput(PC)`; a possessed pawn and a player controller need neither. To read a key's state instead, poll the
 player controller in `ReceiveTick` with `IsInputKeyDown`, the key written with braces and the engine's key name,
 `FKey{"F5"}` (`"LeftShift"`, `"SpaceBar"`, `"One"`); `FKey("F5")` is not built yet and is refused with
-`no Kismet conversion from FString to FKey`. To wait for an event rather than a time, `UE_AWAIT(Obj->Dispatcher)` continues the method at the dispatcher's next broadcast and, for
-a dispatcher with one parameter, gives its value: `Image = UE_AWAIT(Task->OnSuccess);`. It stays bound, so a later
+`no Kismet conversion from FString to FKey`. To wait for an event rather than a time, `UE_AWAIT(Obj->Dispatcher)`
+continues the method at the dispatcher's next broadcast with its value, `Image = UE_AWAIT(Task->OnSuccess);`, or a
+name for each of two or more, `auto [Who, Points] = UE_AWAIT(OnScored);`. It stays bound, so a later
 broadcast runs the rest of the method again. `UKismetSystemLibrary::LoadAsset(Soft)` waits for an async load and
 returns the object.
 
@@ -1907,8 +1908,6 @@ each topic.
 
 **Compiled with no message, but wrong.** Nothing catches these yet, so avoid them.
 
-- `UE_AWAIT` on a dispatcher with two or more parameters. The method resumes, but the values are not available. Bind
-  a handler to read them. See [Waiting on events](REFERENCE.md#waiting-on-events).
 - A qualified call whose qualifier a macro takes as an argument, `#define ON(O, Q) O->Q::Bump(1)`. The qualifier is not
   read, so the call goes by name and reaches the object's override. Write the qualifier in the macro's body, or call
   by name. See [Overrides and parent calls](REFERENCE.md#overrides-and-parent-calls).

@@ -2016,13 +2016,13 @@ private:
     bool bMadeLatentCall = false;                     // LowerCall: it made one, so it moves into the ubergraph
     std::string StaticLocal;                          // LowerBody: a static it keeps in the ubergraph's frame, or empty
     int32 LatentCount = 0;
-    /* A generated event a latent call's completion delegate binds: it stores its parameter into the frame local
-       the call's value is read from after the resume. */
+    /* A generated event a latent call's completion delegate binds: it stores its parameters into the frame locals
+       the call's value, or an await's bound values, are read from after the resume. */
     struct FCompletion
     {
         std::string Event;
         std::vector<FPropertyDef> Parms;
-        std::string Local;                            // where Parms[0] is stored, or empty
+        std::vector<std::string> Locals;              // where each of Parms is stored; empty, or an empty name, for none
         std::shared_ptr<int32> Resume;                // an await's: the event then re-enters the ubergraph here
     };
     std::string FreshEventName(const std::string& Stem);
@@ -7191,7 +7191,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
             FCompletion C;
             C.Event = Event;
             ResultLocal = "__Async" + std::to_string(ReadTmpCounter++) + "__";
-            C.Local = ResultLocal;
+            C.Locals = { ResultLocal };
             FPropertyDef Local;
             C.Parms.emplace_back();
             if (!TypeToProperty(ResultType, "Value", 0, "the result of " + MethodName, BP, &C.Parms[0], Err)
@@ -7452,7 +7452,7 @@ void FCompiler::DropUnusedLocals(std::vector<FStmtIR>& Stmts, std::vector<FPrope
     {
         std::set<std::string> Read;
         NamesRead(Stmts, Read);
-        for (const FCompletion& C : Completions) Read.insert(C.Local);     // its event stores there
+        for (const FCompletion& C : Completions) Read.insert(C.Locals.begin(), C.Locals.end());    // its event stores there
         std::set<std::string> Unread;
         for (const FPropertyDef& L : Locals) if (!Read.count(L.Name)) Unread.insert(L.Name);
         if (Unread.empty()) return;
@@ -7823,12 +7823,15 @@ bool FCompiler::LowerAwait(const Json& CallNode, FBlueprintClass& BP, FCallIR& O
             if (!TypeToProperty(T, "Value" + std::to_string(C.Parms.size() - 1), 0, "UE_AWAIT on " + Disp.S, BP, &C.Parms.back(), Err))
                 return false;
         }
-    const std::string ResultType = StripTypeKeywords(TypeOf(CallNode));
+    /* One value is the await's own; two or more come as TAwaitValues (UeMeta.h), which only `auto [A, B] = ...`
+       reads, and that binding gives the event its stores (LowerBody). */
+    std::string ResultType = StripTypeKeywords(TypeOf(CallNode));
+    if (ResultType.compare(0, 13, "TAwaitValues<") == 0) ResultType = "void";
     if (ResultType != "void")
     {
-        C.Local = "__Await" + std::to_string(ReadTmpCounter++) + "__";
+        C.Locals = { "__Await" + std::to_string(ReadTmpCounter++) + "__" };
         FPropertyDef Local;
-        if (!TypeToProperty(ResultType, C.Local, 0, "UE_AWAIT on " + Disp.S, BP, &Local, Err)) return false;
+        if (!TypeToProperty(ResultType, C.Locals[0], 0, "UE_AWAIT on " + Disp.S, BP, &Local, Err)) return false;
         Local.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
         CurLocals->push_back(Local);
     }
@@ -7891,7 +7894,7 @@ bool FCompiler::LowerAwait(const Json& CallNode, FBlueprintClass& BP, FCallIR& O
     (*Block)[0].Body = Body;
     Out.Intrinsic = "__Inline__";
     Out.Inline = Block;
-    Out.InlineResult = C.Local;
+    Out.InlineResult = C.Locals.empty() ? std::string() : C.Locals[0];
     Out.InlineType = ResultType;
     return true;
 }
@@ -8375,7 +8378,7 @@ void FCompiler::WarnFrameWeakLocals(const std::vector<FStmtIR>& Stmts, const std
     if (Classes.empty()) return;
     std::map<std::string, std::string> LoadedInto;      // a latent load's completion event -> the local it stores into
     for (const FCompletion& C : Completions)
-        if (!C.Resume && !C.Local.empty()) LoadedInto[C.Event] = C.Local;
+        if (!C.Resume && !C.Locals.empty()) LoadedInto[C.Event] = C.Locals[0];
 
     enum : uint8 { Made = 1, Crossed = 2 };
     std::set<std::string> Warned;
@@ -8505,6 +8508,40 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 const std::string DK = Kind(D);
                 if (DK == "TypeAliasDecl" || DK == "TypedefDecl" || DK == "UsingDecl" || DK == "UsingEnumDecl"
                     || DK == "StaticAssertDecl") { bAny = true; return; }   // compile-time names only
+                /* `auto [Who, Points] = UE_AWAIT(OnScored);`: the await, each name a frame local its event stores one
+                   of the dispatcher's values into, as the editor's async node gives each output pin a variable
+                   (K2Node_BaseAsyncTask.cpp 410-467). A later broadcast stores the next values there. */
+                const Json* AwaitCall = DK == "DecompositionDecl" ? Strip(First(D)) : nullptr;
+                const Json* AwaitFn = AwaitCall && Kind(*AwaitCall) == "CallExpr" ? Strip(First(*AwaitCall)) : nullptr;
+                if (bOk && AwaitFn && Kind(*AwaitFn) == "DeclRefExpr" && AwaitFn->contains("referencedDecl")
+                    && Name((*AwaitFn)["referencedDecl"]) == "__Await__")
+                {
+                    bAny = true;
+                    FCallIR Await;
+                    if (!LowerCall(*AwaitCall, BP, Await, Err)) { bOk = false; return; }
+                    FCompletion& C = Completions.back();
+                    C.Locals.assign(C.Parms.size(), std::string());
+                    size_t I = 0;
+                    ForEach(D, [&](const Json& B) {
+                        if (!bOk || Kind(B) != "BindingDecl" || I >= C.Parms.size()) return;
+                        std::string T = First(B) ? StripTypeKeywords(TypeOf(*First(B))) : std::string();
+                        while (!T.empty() && (T.back() == '&' || T.back() == ' ')) T.pop_back();
+                        FPropertyDef PD;
+                        const std::string Kept = "__Await" + std::to_string(ReadTmpCounter++) + "_" + Name(B);
+                        if (!TypeToProperty(T, Kept, 0, "UE_AWAIT's " + Name(B), BP, &PD, Err)) { bOk = false; return; }
+                        PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+                        Locals.push_back(PD);
+                        C.Locals[I++] = Kept;
+                        FArgIR Place;
+                        Place.K = FArgIR::Local;
+                        Place.S = Kept;
+                        Place.LetOp = LetOpFor(T);
+                        Place.InnerType = T;
+                        RefPlace[B.value("id", std::string())] = Place;
+                    });
+                    if (bOk && Await.Inline) for (FStmtIR& St : *Await.Inline) Out.push_back(std::move(St));
+                    return;
+                }
                 if (!bOk || DK != "VarDecl") return;
                 bAny = true;
                 const std::string VarName = LocalName(D);
@@ -13307,6 +13344,8 @@ bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& P
         *Out = StructParam(PName, BP.ScriptStruct(PackageOf(*SR), ClassOf(*SR)), ClassOf(*SR), Size, ExtraFlags);
         return true;
     }
+    if (Type.compare(0, 13, "TAwaitValues<") == 0)
+    { *Err = Where + ": UE_AWAIT gives a dispatcher's two or more values one name each, `auto [Who, Points] = UE_AWAIT(OnScored);`"; return false; }
 
     /* Object pointer, spelled `[const] class X *`. UClass* is a reflected UClass reference,
        so it emits an FClassProperty (PropertyClass = UClass, MetaClass = UObject "any class")
@@ -16801,12 +16840,13 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         for (const FSegment& Seg : Segments)
             for (const FCompletion& C : Seg.Completions)
             {
-                const std::string To = C.Local.empty() ? std::string() : Seg.Rename.at(C.Local);
-                const std::string From = C.Parms.empty() ? std::string() : C.Parms[0].Name;
+                std::vector<std::pair<std::string, std::string>> Stores;    // (frame local, the parameter it keeps)
+                for (size_t I = 0; I < C.Locals.size() && I < C.Parms.size(); ++I)
+                    if (!C.Locals[I].empty()) Stores.emplace_back(Seg.Rename.at(C.Locals[I]), C.Parms[I].Name);
                 const std::shared_ptr<int32> Resume = C.Resume;
-                BP.AddFunction(C.Event, Null(), C.Parms, [To, From, Resume, Uber](FScript& S, FIndex SelfExp) {
-                    if (!To.empty())
-                        S.LetValueOnPersistentFrame(To, Uber, [&](FScript& V) { V.LocalVariable(From, SelfExp); });
+                BP.AddFunction(C.Event, Null(), C.Parms, [Stores, Resume, Uber](FScript& S, FIndex SelfExp) {
+                    for (const auto& Store : Stores)
+                        S.LetValueOnPersistentFrame(Store.first, Uber, [&](FScript& V) { V.LocalVariable(Store.second, SelfExp); });
                     if (Resume)
                     {
                         S.LocalFinalFunction(Uber);

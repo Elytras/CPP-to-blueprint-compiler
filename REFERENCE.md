@@ -4815,7 +4815,7 @@ void Plain() {
 ## Waiting on events
 
 `UE_AWAIT(Obj->Dispatcher)` waits in the middle of a method until a dispatcher next fires, then continues there with
-the value it carries, as the editor's async action node continues from an output pin. The method becomes latent, so
+the values it carries, as the editor's async action node continues from an output pin. The method becomes latent, so
 everything in [Latent calls](#latent-calls) applies to it. The rule to remember: the binding stays, and every later
 broadcast runs the code after the await again. [examples/AwaitEvents.cpp](examples/AwaitEvents.cpp) waits this way on
 the game's dispatchers and one of its own, and its comments show the async-action form.
@@ -4827,11 +4827,11 @@ the game's dispatchers and one of its own, and its comments show the async-actio
 | `FName Notify = UE_AWAIT(Proxy->OnCompleted);` | Binds a generated event to the dispatcher and returns to the caller. When the dispatcher fires, the event stores its one parameter, and the method resumes after the await with that value. | Yes |
 | `Image = UE_AWAIT(Task->OnSuccess);` on an async action | For a `UBlueprintAsyncActionBase`, such as `UAsyncTaskDownloadImage`, AssetGen calls `Activate()` right after the bind, as the editor's async node does, at the first await of that variable on each path the method runs: in whichever branch of an `if` runs, and in a loop on the first round only. A later await on the same variable does not activate it again, until the variable is assigned a new action. An object that is not an async action, such as the montage proxy, is never activated: its factory already started the work. | Yes |
 | `if (Stop) UE_AWAIT(T->OnSuccess);` then `UE_AWAIT(T->OnFail);` | Refused: `some paths reach it with T's async action already activated and some without`. Keeping the second await's `Activate()` would start the action twice on one path, dropping it would never start it on the other. The same for a loop that can skip its await, such as with `continue` before it. | Refused |
-| `UE_AWAIT(Target->OnDestroyed);` | As a statement: waits for the dispatcher and drops its value. | Yes |
+| `UE_AWAIT(Target->OnDestroyed);` | As a statement: waits for the dispatcher and drops its values. | Yes |
 | `UE_AWAIT(Task->OnSuccess);` with `Task` None | The bind, and `Activate()` for an async action, run only when the object passes IsValid, as the editor's async node tests its proxy. A None or pending-kill object binds nothing and logs no "Accessed None"; the method stays parked at the await. | Yes |
 | `int32 Code = UE_AWAIT(OnReady);` | The object in front of the dispatcher may be self, a member or a local. | Yes |
 | the code after the await, on a later broadcast | The generated event stays bound, so each later broadcast runs the code after the await again: it acts as a handler, not a one-shot wait. The event has no name you can write, so only `Clear()` on the dispatcher stops it, and that drops every binding. | Yes |
-| `UE_AWAIT(OnScored);` on a dispatcher of two or more parameters | Compiles as a statement and resumes, but the values are dropped: `UE_AWAIT` has a value only for a dispatcher of exactly one parameter. Bind a handler to read them. | Not yet |
+| `auto [Who, Points] = UE_AWAIT(OnScored);` on a dispatcher of two or more parameters | Each name gets one of the dispatcher's values, in order, as the editor's async node gives each output a pin of its own; a later broadcast gives them its values. `const auto& [Who, Points]` is the same. `UE_AWAIT(OnScored);` as a statement waits and keeps none of them. `auto V = UE_AWAIT(OnScored);` is refused: `UE_AWAIT gives a dispatcher's two or more values one name each`. | Yes |
 | `bool WaitDone() { UE_AWAIT(Proxy->OnCompleted); return true; }` | Refused with the latent messages ("a function that resumes later returns nothing and takes no non-const reference parameters"; for a static method, "a static function has no object whose ubergraph frame could keep its locals"). A method that awaits returns `void`, takes no non-const reference parameters and is not `static`. | Refused |
 | `UE_AWAIT(UAsyncTaskDownloadImage::DownloadImage(Url)->OnSuccess);` | Refused: "keep the object in a variable, it is used twice", once for the bind and once for `Activate()`. | Refused |
 | `UE_AWAIT(Temp);` on a local delegate | Refused: `UE_AWAIT` takes a dispatcher property of an object. A multicast delegate as a local or a parameter is refused before `UE_AWAIT` sees it ("unimplemented local"). A single-cast `TDelegate` cannot be awaited at all. | Refused |
@@ -4850,7 +4850,9 @@ public:
   FName Last;
   int32 Kills;
   int32 Result;
+  int32 Score;
   UE_DISPATCHER(OnReady, int32 Code);
+  UE_DISPATCHER(OnScored, AActor *Who, int32 Points);
 
   void PlayThen() {
     UPlayMontageCallbackProxy *Proxy =
@@ -4865,6 +4867,10 @@ public:
   void WaitReady() {
     int32 Code = UE_AWAIT(OnReady);                // this object's own dispatcher
     Result = Code;                                 // runs again on every later OnReady.Broadcast
+  }
+  void WaitScore() {
+    auto [Who, Points] = UE_AWAIT(OnScored);       // two values, a name for each
+    if (Who == Target) Score += Points;
   }
   void CountKill() {
     UE_AWAIT(Target->OnDestroyed);                 // the value is dropped
@@ -5484,7 +5490,7 @@ listed here is refused with "unimplemented intrinsic".
 | `UE_ASSET_ALL(Class)` | Declares `All`: soft pointers to every UE_ASSET_AT of Class or a subclass in this namespace and the ones inside it, filled in at build time. | [Game assets](#game-assets) |
 | `UE_ASSET_AT(Class, Name, Path)` | Names an asset that another package holds, the game's or another mod's, so that `&Name` points at it. | [Game assets](#game-assets) |
 | `UE_AUTHORITY_ONLY` | Authority Only (BlueprintAuthorityOnly): on an actor or its component, a call on a machine without authority is skipped; an engine or game static with this mark, on a client. | [RPCs](#rpcs) |
-| `UE_AWAIT(Dispatcher)` | The rest of the function runs when the dispatcher next fires. Its value is the dispatcher's parameter when it has exactly one. | [Waiting on events](#waiting-on-events) |
+| `UE_AWAIT(Dispatcher)` | The rest of the function runs when the dispatcher next fires. Its value is the dispatcher's parameter when it has exactly one; two or more are bound one name each, `auto [Who, Points] = UE_AWAIT(OnScored);`. | [Waiting on events](#waiting-on-events) |
 | `UE_CATEGORY("Setup\|Doors")` | The editor category of the functions and variables that follow it, `\|` starting a subcategory. It is written into the editor API stub only. | [Classes and variables](#classes-and-variables) |
 | `UE_CATEGORY__JOIN`, `UE_CATEGORY__JOIN2` | Internal to UE_CATEGORY. Not written in a mod. | [Classes and variables](#classes-and-variables) |
 | `UE_CLASS(Package, UeName)` | The package and UE name of a class. In a shared header it names the one source that cooks the class, the one whose UE_MOD_PACKAGE, namespaces and class name give exactly that path; every other source imports it. The SDK declares each engine and game class with it. | [Mod sources and packages](#mod-sources-and-packages) |
@@ -6508,6 +6514,9 @@ so the retail game prints nothing. See [Strings and text](#strings-and-text) and
 - `UE_AWAIT: cannot read the signature of <Type>`: the dispatcher's C++ type does not spell out
   `TMulticastInlineDelegate<void(...)>`, so AssetGen cannot read its parameters. Fix: declare the dispatcher with
   `UE_DISPATCHER(Name, Params...)`. See [Waiting on events](#waiting-on-events).
+- `local <Name>: UE_AWAIT gives a dispatcher's two or more values one name each`: `auto V = UE_AWAIT(OnScored);` on
+  a dispatcher of two or more parameters. Fix: bind one name per value, `auto [Who, Points] = UE_AWAIT(OnScored);`.
+  See [Waiting on events](#waiting-on-events).
 - `<Class>::ExecuteUbergraph_<Name>: ExecuteUbergraph_<Class> is the name of a class's ubergraph, whose latent calls
   resume through it; rename it`: the engine resumes a class's waits through that function, found by name on the
   object, so a method of that name would catch them. `<Class> declares ExecuteUbergraph_<Class>, the ubergraph's own
