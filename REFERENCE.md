@@ -412,7 +412,8 @@ public:
 | `int32 Hits{};`, `EMood Mood = EMood();`, `int32 Budget{25};` | `{}` and `T()` are the zero, and write nothing; braces around one value are that value. | Yes |
 | `int32 X = UKismetMathLibrary::RandomInteger(5);` | Refused: "a default is a value known when the mod is built". Set such a value in `ReceiveBeginPlay` or `UserConstructionScript`. | Refused |
 | `static constexpr int32 kSeed = Fnv("types");` then `int32 Seed = kSeed;` | A call counts as a default only through a `consteval` function, which clang runs itself. A call to a plain `constexpr` function is refused like any call. See [Constants](#constants). | Yes |
-| `TSubclassOf<AActor> Kind = AActor::StaticClass();` | Not yet. A class reference has no build-time value, so a `TSubclassOf` or `UClass*` member always starts null, and this initializer is refused with the build-time message. `= nullptr` compiles. Set the class in `ReceiveBeginPlay`, or use a `TSoftClassPtr` member, which takes a path. | Not yet |
+| `TSubclassOf<AActor> Kind = AActor::StaticClass();`, `UClass *Any = AMyEnemy::StaticClass();` | The class is the default, as picking it under Class Defaults makes it: an engine or game class, a game Blueprint, or one of the mod's own classes, this one included. The same holds in a container's braces, a struct value, a `UE_DEFAULTS` statement and an asset's braces. `= nullptr` is the zero. | Yes |
+| `TSubclassOf<APawn> Kind = AActor::StaticClass();` | Refused: "a TSubclassOf<APawn> holds APawn or a subclass of it, and AActor is neither". C++ converts any class to a `TSubclassOf`, but the editor's class picker offers only those. | Refused |
 | `TSoftClassPtr<AActor> Soft = "/Game/A/BP_A.BP_A_C";` | A soft reference's default is its path. `"/Game/Dir/Pkg"` means `Pkg.Pkg`, so write the full path for a Blueprint class. See [Types](#types). | Yes |
 | `TArray<uint8> Payload = __EmbedFile__("data/blob.bin");` | Reads the file when the mod is built, from a path relative to the source's folder, and writes its bytes into the default, one element per byte. The compile prints `embed          -> Payload  (3 bytes)`. The file is not needed at run time. `__EmbedFile__` comes from `Intrin.h` in AssetGen's `include/` folder, included by its path as `Objects.h` is. | Yes |
 | `__EmbedFile__("missing.bin")`, `__EmbedFile__(kPath)` | Refused: a missing or empty file ("cannot read (or empty)"), and a path that is not a string literal ("the path must be a string literal"). It works only as the initializer of a `TArray<uint8>` member; clang refuses it for any other array type. | Refused |
@@ -607,7 +608,7 @@ Notes:
 | `TSubclassOf<AActor> Kind;` | A Class Reference limited to `AActor` and its subclasses. | Yes |
 | `UClass *Raw;` | A Class Reference that takes any class. | Yes |
 | `Raw = Kind; Kind = Raw;` | Each converts to the other. Nothing checks at run time that the class in `Raw` derives from `AActor`. | Yes |
-| `TSubclassOf<AActor> Kind = AActor::StaticClass();` | Not yet: a class reference member starts null, and a class as its default is refused ("a default is a value known when the mod is built"). `= nullptr` compiles. See [Classes and variables](#classes-and-variables). | Not yet |
+| `TSubclassOf<AActor> Kind = AActor::StaticClass();` | The class as the default. `TSubclassOf<APawn> Kind = AActor::StaticClass();` is refused: a class the `TSubclassOf` does not take. See [Classes and variables](#classes-and-variables). | Yes |
 | `TScriptInterface<IHealth> Health;` | An Interface variable: [Interfaces](#interfaces). | Yes |
 | `TWeakObjectPtr<AActor> Last;` | Refused by clang (`no template named 'TWeakObjectPtr'`): the SDK has no weak or lazy pointer. Keep an object pointer and test it with `if (Obj)`, or keep a soft reference. | Refused |
 
@@ -3488,7 +3489,7 @@ not a C++ value, so point at it with `&`.
 | `.Next = &MD_Calm` | One asset pointing at another. | Yes |
 | `.EnemyClass = "/Game/A/BP_A.BP_A_C"` | A soft object or soft class member takes the asset's path as a string, written the way the cooker writes it. The path rules are in [Types](#types). | Yes |
 | `UBigDef MD_Huge = {{.Health = 900}, false};` | Sets a member a mod base class declares: the base gets a brace list of its own as the first element. C++ cannot designate a base's member (`{.Health = 900}` is a clang error), and after a nested base list the class's own members go by position. | Yes |
-| `.SpawnClass = AMyEnemy::StaticClass()`, on a `TSubclassOf` member | Not yet: a class reference has no build-time value, so this is refused with "a default is a value known when the mod is built". Use a `TSoftClassPtr` member with a path, or set the class at run time. See [Classes and variables](#classes-and-variables). | Not yet |
+| `.SpawnClass = AMyEnemy::StaticClass()`, on a `TSubclassOf` member | The class, as picking it in the asset's details does. `UE_ASSET_EDIT` takes one the same way. See [Classes and variables](#classes-and-variables). | Yes |
 
 ```cpp
 class UMoodDef : public UPrimaryDataAsset {
@@ -5443,7 +5444,7 @@ listed here is refused with "unimplemented intrinsic".
 | `TScriptInterface<I>` | An interface value. Assigning an object casts it, and `GetObject()` gives the object back. | [Interfaces](#interfaces) |
 | `(T *)Soft` | Resolve Soft Reference: the object or class, null unless it is loaded. | [Types](#types) |
 | `TSoftObjectPtr<T>`, `TSoftClassPtr<T>` | Soft Object and Soft Class References. A default is the asset's path. | [Types](#types) |
-| `T::StaticClass()` | The class as a constant. On a mod class, that class. Write it unqualified: `Ns::T::StaticClass()` names the class it inherits StaticClass from, with no message. | [Types](#types), [Creating objects](#creating-objects) |
+| `T::StaticClass()` | The class as a constant, and as a default. On a mod class, that class, its name qualified or not (`Ns::T::StaticClass()`). | [Types](#types), [Creating objects](#creating-objects), [Classes and variables](#classes-and-variables) |
 | `TSubclassOf<T>`, `UClass *` | Class References. `TSubclassOf<T>` takes T and its subclasses. | [Types](#types) |
 | `UE_ASSET_ALL(Class)` | Declares `All`: soft pointers to every UE_ASSET_AT of Class or a subclass in this namespace and the ones inside it, filled in at build time. | [Game assets](#game-assets) |
 | `UE_ASSET_AT(Class, Name, Path)` | Names an asset that another package holds, the game's or another mod's, so that `&Name` points at it. | [Game assets](#game-assets) |
@@ -5528,16 +5529,18 @@ and where the feature is described. In each group, the messages you are most lik
   UE_STRUCT or a UE_ENUM in it. A file of shared helpers belongs in a header that the mod's sources include, not in the
   mod's `sources` list in `mods.yaml`. See [Mod sources and packages](#mod-sources-and-packages).
 - `` <Member>: a default is a value known when the mod is built - a literal, a constant expression over literals, enum
-  constants and constexpr variables, a braced struct, or an &Asset. A function call counts only through
-  `constexpr T k = F();` with F consteval, which clang runs itself. Anything computed when the game runs belongs in
-  ReceiveBeginPlay or UserConstructionScript ``: a member's initializer that AssetGen cannot work out when it builds the
-  mod: a call such as `int32 Roll = UKismetMathLibrary::RandomInteger(3);`, a call to a plain `constexpr` function, or
-  `sizeof`. A value in UE_DEFAULTS gets the same message. Not yet: a class as the default of a `TSubclassOf` or
-  `UClass*` member, `TSubclassOf<AActor> Kind = AActor::StaticClass();`, is refused with this message too. Fix: use a
-  literal or a constant expression, compute a constant with a `consteval` function through a `constexpr` variable, or
-  set the value in ReceiveBeginPlay or UserConstructionScript. A class reference member starts null: set it at run
-  time, or use a `TSoftClassPtr` member, which takes a path as its default. See
+  constants and constexpr variables, a braced struct, an &Asset or a class, X::StaticClass(). A function call counts
+  only through `constexpr T k = F();` with F consteval, which clang runs itself. Anything computed when the game runs
+  belongs in ReceiveBeginPlay or UserConstructionScript ``: a member's initializer that AssetGen cannot work out when
+  it builds the mod: a call such as `int32 Roll = UKismetMathLibrary::RandomInteger(3);`, a call to a plain
+  `constexpr` function, `sizeof`, or a class read off an object, `GetClass()`. A value in UE_DEFAULTS gets the same
+  message. Fix: use a literal or a constant expression, compute a constant with a `consteval` function through a
+  `constexpr` variable, or set the value in ReceiveBeginPlay or UserConstructionScript. See
   [Classes and variables](#classes-and-variables).
+- `<Member>: a TSubclassOf<<Class>> holds <Class> or a subclass of it, and <Other> is neither`: a class as the default
+  of a `TSubclassOf` that does not take it, `TSubclassOf<APawn> Kind = AActor::StaticClass();`. C++ converts any class
+  to a `TSubclassOf`, but the editor's class picker offers only those. Fix: name a class the member takes, or widen the
+  member's type. See [Classes and variables](#classes-and-variables).
 - `` <Member>: a container default is a braced list, `= { 1, 2 }`, of values a lone member could take ``: a TArray,
   TSet or TMap member initialized with something other than braces, such as a call, `TArray<int32> Ids = MakeIds();`.
   Fix: list the elements in braces, `TArray<int32> Ids = { 1, 2 };`, each a value that a single variable of the element

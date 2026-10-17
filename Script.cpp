@@ -249,8 +249,8 @@ void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
             V.I32(bText ? 1 : 0);
             if (bText) WriteFStringValue(V, D.S);
         }
-        else if (P.Type == "ObjectProperty") V.Idx(D.K == FDefaultValue::Obj ? D.Object : Null());
-        else if (P.Type == "ClassProperty" || P.Type == "InterfaceProperty") V.I32(0);
+        else if (P.Type == "ObjectProperty" || P.Type == "ClassProperty") V.Idx(D.K == FDefaultValue::Obj ? D.Object : Null());
+        else if (P.Type == "InterfaceProperty") V.I32(0);
         else if (P.Type == "DelegateProperty")      // FScriptDelegate: the object, the function's name (ScriptDelegates.h
         { V.Idx(Null()); V.Name("None"); }           // 138-142); a default is unbound, as a bound one is refused
         else if (P.Type == "SoftObjectProperty" || P.Type == "SoftClassProperty")    // FSoftObjectPath: AssetPathName, SubPathString

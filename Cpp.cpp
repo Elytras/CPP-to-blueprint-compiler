@@ -1671,6 +1671,8 @@ private:
 
     /* `X::StaticClass()`: the record X names, read back from the mod's sources (clang's JSON keeps no qualifier). */
     const FRecord* NamedQualifier(const Json& Ref) const;
+    /* The class a StaticClass call names, Callee its DeclRefExpr and Slot the type it fills; null when unknown. */
+    const FRecord* StaticClassOf(const Json& Callee, const std::string& Slot) const;
     /* `Base::Method()` on this: the record the qualifier names, read back the same way, else null. */
     const FRecord* MemberQualifier(const Json& Member) const;
     /* Whether a call on `this` to R's Method, written in class Written, names R's own: the forwarder's call, one
@@ -5538,15 +5540,7 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             : std::string();
         if (CalleeName == "StaticClass")
         {
-            /* StaticClass is declared once, by UE_CLASS on a native class, so the decl names AActor for every mod
-               actor that inherits it. The class meant is the qualifier (`AMine::StaticClass()`), else the class a
-               TSubclassOf<X> slot around it asks for (NewObject<T>'s default argument), when that is more derived. */
-            auto Owner = MethodOwner.find((*CalleeNode)["referencedDecl"].value("id", std::string()));
-            const FRecord* R = Owner == MethodOwner.end() ? nullptr : Find(Owner->second);
-            std::string Slot;
-            if (const FRecord* Q = NamedQualifier(*CalleeNode)) R = Q;
-            else if (TemplateArg(StripTypeKeywords(OuterType), "TSubclassOf", &Slot))
-                if (const FRecord* S = Find(StripTypeKeywords(Slot)); S && R && S != R && IsSubclassOf(*S, *R)) R = S;
+            const FRecord* R = StaticClassOf(*CalleeNode, OuterType);
             if (!R) { *Err = "StaticClass() on an unknown class"; return false; }
             Out.K = FArgIR::ObjConst;
             Out.Owner = ClassImportOf(*R, BP);
@@ -6178,6 +6172,20 @@ const FRecord* FCompiler::NamedQualifier(const Json& Ref) const
         if (bBody && Off + Len <= T.size() && (Off == 0 || !Ident(T[Off - 1])) && (Off + Len == T.size() || !Ident(T[Off + Len])))
             if (const FRecord* R = Find(T.substr(Off, Len))) return R;
     return nullptr;
+}
+
+/* StaticClass is declared once, by UE_CLASS on a native class, so the decl names AActor for every mod actor that
+   inherits it. The class meant is the qualifier (`AMine::StaticClass()`), else the class a TSubclassOf<X> Slot asks for
+   (NewObject<T>'s default argument), when that is more derived. Lowering a call and a default both ask here. */
+const FRecord* FCompiler::StaticClassOf(const Json& Callee, const std::string& Slot) const
+{
+    auto Owner = MethodOwner.find(Callee["referencedDecl"].value("id", std::string()));
+    const FRecord* R = Owner == MethodOwner.end() ? nullptr : Find(Owner->second);
+    std::string Arg;
+    if (const FRecord* Q = NamedQualifier(Callee)) R = Q;
+    else if (TemplateArg(StripTypeKeywords(Slot), "TSubclassOf", &Arg))
+        if (const FRecord* S = Find(StripTypeKeywords(Arg)); S && R && S != R && IsSubclassOf(*S, *R)) R = S;
+    return R;
 }
 
 /* A MemberExpr on an implicit this begins at its qualifier when it has one and at the member's own name when not
@@ -12689,6 +12697,28 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
         PD.Default.Object = Asset;
         return true;
     }
+    /* `X::StaticClass()`: the class, as the cook writes one picked in Class Defaults (BP_SpaceRig_Gamemode's
+       GameSessionClass, UPG_Bosco_ElectricDamage's NativeClass): a reference to its import, /Script/<Module>.<Class> or a
+       Blueprint's /Game/<Path>.<Name>_C, or to this class's own export. A TSubclassOf takes its class or a subclass, all
+       the editor's class picker offers; UeApi's converts from any class, so the rest is refused here. */
+    if (const Json* Callee = PD.Type == "ClassProperty" && K == "CallExpr" ? Strip(First(*Init)) : nullptr;
+        Callee && Kind(*Callee) == "DeclRefExpr" && (*Callee)["referencedDecl"].value("name", std::string()) == "StaticClass")
+    {
+        /* The slot: what the value converts to (an element's TSubclassOf), else the member's own type. */
+        std::string Slot = TypeOf(*Whole), Meta;
+        if (!TemplateArg(Slot, "TSubclassOf", &Meta)) Slot = TypeOf(F);
+        const FRecord* C = StaticClassOf(*Callee, Slot);
+        if (!C) { *Err = Name(F) + ": StaticClass() on an unknown class"; return false; }
+        if (const FRecord* M = TemplateArg(Slot, "TSubclassOf", &Meta) ? Find(Meta) : nullptr; M && !IsSubclassOf(*C, *M))
+        {
+            *Err = Name(F) + ": a TSubclassOf<" + LeafOf(M->CppName) + "> holds " + LeafOf(M->CppName) + " or a subclass of it, and "
+                 + LeafOf(C->CppName) + " is neither";
+            return false;
+        }
+        PD.Default.K = FDefaultValue::Obj;
+        PD.Default.Object = ClassImportOf(*C, BP);
+        return true;
+    }
     /* A soft pointer's default is its path, "/Game/Dir/Pkg" meaning Pkg.Pkg as UE_ASSET_AT's does. */
     if (std::string Path; (PD.Type == "SoftObjectProperty" || PD.Type == "SoftClassProperty") && FindLiteral(*Init, Path))
     {
@@ -12861,9 +12891,9 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
         return true;
     }
     *Err = Name(F) + ": a default is a value known when the mod is built - a literal, a constant expression over "
-           "literals, enum constants and constexpr variables, a braced struct, or an &Asset. A function call counts only "
-           "through `constexpr T k = F();` with F consteval, which clang runs itself. Anything computed when the game "
-           "runs belongs in ReceiveBeginPlay or UserConstructionScript";
+           "literals, enum constants and constexpr variables, a braced struct, an &Asset or a class, X::StaticClass(). A "
+           "function call counts only through `constexpr T k = F();` with F consteval, which clang runs itself. Anything "
+           "computed when the game runs belongs in ReceiveBeginPlay or UserConstructionScript";
     return false;
 }
 
@@ -14473,11 +14503,23 @@ bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object,
     std::map<int32, int32> Moved;
     std::string MoveErr;
     auto Move = [&](int32 Index) { return ImportInto(P, Package, From, Index, Moved, &MoveErr); };
+    /* Each object a value names is created before the object is serialized, as the cook lists it: bar one in
+       /Script/CoreUObject (a class such as UObject's), which nothing waits on (SavePackage.cpp 3899). */
+    auto InCoreUObject = [&](int32 Index) {
+        const FImport* I = From.ImportAt(FIndex{ Index });
+        while (I && I->Outer.V < 0) I = From.ImportAt(I->Outer);
+        return I && I->ObjectName == "/Script/CoreUObject";
+    };
     /* A deep copy on the way: members and elements are shared_ptrs a type's other properties may hold too. */
     std::vector<int32> Deps;
     std::function<void(FPropertyDef&)> MoveDef;
     std::function<void(FDefaultValue&)> MoveValue = [&](FDefaultValue& V) {
-        if (V.K == FDefaultValue::Obj && V.Object.V != 0) Deps.push_back(V.Object.V = Move(V.Object.V));
+        if (V.K == FDefaultValue::Obj && V.Object.V != 0)
+        {
+            const bool bCore = InCoreUObject(V.Object.V);
+            V.Object.V = Move(V.Object.V);
+            if (!bCore) Deps.push_back(V.Object.V);
+        }
         for (FDefaultValue& Item : V.Items) MoveValue(Item);
         if (V.Members)
         {

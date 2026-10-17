@@ -262,10 +262,9 @@ class with no base is plain C++ and is not cooked.
 Each non-static data member is a Blueprint variable, and its initializer is its default under Class Defaults. A
 variable has one of Blueprint's types: `bool`, `uint8`, `int32`, `int64`, `float`, `FName`, `FString`, `FText`, an
 enum, an object, class, soft or interface reference, a struct, or a `TArray`, `TSet` or `TMap`. A default is read when
-the mod is built, so it must be a literal, a constant expression, an enum constant, a braced struct or list, or
-`&Asset`. Anything else is refused with `<Member>: a default is a value known when the mod is built - ...`; set such a
-value in `ReceiveBeginPlay`. A class as the default of a `TSubclassOf` member is not built yet and is refused the same
-way. A `const` member is read-only. A `UE_READONLY` member is read-only too, but a subclass's `UE_DEFAULTS` can
+the mod is built, so it must be a literal, a constant expression, an enum constant, a braced struct or list,
+`&Asset`, or a class, `AActor::StaticClass()`. Anything else is refused with `<Member>: a default is a value known when
+the mod is built - ...`; set such a value in `ReceiveBeginPlay`. A `const` member is read-only. A `UE_READONLY` member is read-only too, but a subclass's `UE_DEFAULTS` can
 still set it, and a write from code compiles with a warning. A `static constexpr` or `static inline const` member is a constant with no
 variable behind it. To change the default of a property that a parent class declares, assign it in `UE_DEFAULTS`,
 which is what editing Class Defaults does.
@@ -281,7 +280,7 @@ public:
   AActor *Target = nullptr;               // an object reference
   TArray<AActor *> Seen;
   TMap<FName, int32> HitsByName;
-  TSubclassOf<AActor> Projectile;         // a class reference; it starts null
+  TSubclassOf<AActor> Projectile = AActor::StaticClass(); // a class reference
 
   UE_DEFAULTS {
     InitialLifeSpan = 120.0f;             // a property that AActor declares
@@ -1748,7 +1747,7 @@ The start of the message says where the problem is:
   inside an inline function that the body calls, `inline <Class>::<Method>: ` follows and names the inline function.
 - `<Class>::UE_DEFAULTS: ` for a statement in a `UE_DEFAULTS` block, and `<Class>::<Member>: ` for a declaration such
   as a `UE_COMPONENT` or a replicated variable.
-- the member's name alone for a default value (`Kind: a default is a value known when the mod is built - ...`), and
+- the member's name alone for a default value (`Roll: a default is a value known when the mod is built - ...`), and
   nothing at all for some member types (`TODO: unimplemented property Mask: uint32`).
 
 A message with `TODO:` in it names a construct that AssetGen has no translation for. Some of these are gaps that may
@@ -1820,7 +1819,7 @@ Each row gives the part of the message to look for, the reason, and what to writ
 | `call to an unknown function: Helper` | A Blueprint has no free functions. A free function or template without `inline` is not compiled. | `inline int32 Helper(int32 X) { ... }`, or a method of the class | [Inline functions and templates](REFERENCE.md#inline-functions-and-templates) |
 | clang: `use of undeclared identifier 'FMath'`, `no member named 'min' in namespace 'std'` | There is no FMath and no standard library. | `UKismetMathLibrary::FClamp(V, 0.0f, 10.0f)`, `UKismetMathLibrary::Min(A, B)` | [Calling engine and game functions](REFERENCE.md#calling-engine-and-game-functions) |
 | clang: `only virtual member functions can be marked 'override'` | The SDK declares engine functions non-virtual. The method's name alone makes the override. | `void ReceiveTick(float DeltaSeconds) { ... }` | [Overrides and parent calls](REFERENCE.md#overrides-and-parent-calls) |
-| `<Member>: a default is a value known when the mod is built - ...` | A member initializer is read when the mod is built and never runs, so it takes only a value known then. A class reference is not one yet. | Set it in `ReceiveBeginPlay`: `Kind = AActor::StaticClass();` | [Classes and variables](REFERENCE.md#classes-and-variables) |
+| `<Member>: a default is a value known when the mod is built - ...` | A member initializer is read when the mod is built and never runs, so it takes only a value known then. A call's result is not one. | Set it in `ReceiveBeginPlay`: `Roll = UKismetMathLibrary::RandomInteger(3);` | [Classes and variables](REFERENCE.md#classes-and-variables) |
 | `<Class>::UE_DEFAULTS: Charges is declared here - give it an initializer instead` | `UE_DEFAULTS` sets inherited variables and components, not the class's own. | `int32 Charges = 3;` | [Class defaults](REFERENCE.md#class-defaults) |
 | `<Class>::<Class>(): a constructor never runs in the game, so its statements are read as the class's defaults` | A default constructor is read, not run: each statement must be one `UE_DEFAULTS` takes. | Move the call or the logic to `ReceiveBeginPlay` | [Constructors](REFERENCE.md#constructors) |
 | `latent call Delay: a function that resumes later returns nothing and takes no non-const reference parameters` | The code after a wait resumes in the event graph, which has no return value and no out parameters. | Return `void`, take parameters by value or `const&` and keep results in member variables | [Latent calls](REFERENCE.md#latent-calls) |
@@ -1879,9 +1878,6 @@ each topic.
 
 **Refused with a message.** The compile stops, and the section linked says what to write instead.
 
-- A class as a default: `TSubclassOf<AActor> Kind = AActor::StaticClass();`, or a class value in a data asset's
-  braces. Set it in `ReceiveBeginPlay`, or use a `TSoftClassPtr` with a path. See
-  [Classes and variables](REFERENCE.md#classes-and-variables).
 - `UE_ENUM_MAP` inside a function body. Keep the table in a member and read the member. See
   [Enums](REFERENCE.md#enums).
 - A shift by a named constant, `X << kShift`: only a bare integer literal is accepted as the amount. See

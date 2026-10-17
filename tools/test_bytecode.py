@@ -9317,12 +9317,16 @@ from invariant_rules import user_types as types_rules
 
 def tag_values(pkg, i, tags):
     """A tag list as {name without the member suffix: value}, the way the engine reads it back: ints, floats, bools,
-    names, strings, an enum value as its name, an engine vector as a tuple, an int array as a list, and a struct value
-    as a dict of its own tags. An enum value is its short name, which it loads by as well as by the full one."""
+    names, strings, an enum value as its name, an engine vector as a tuple, an int array as a list, an object or class
+    reference as its path (None for null), an array of them as a list, and a struct value as a dict of its own tags. An
+    enum value is its short name, which it loads by as well as by the full one."""
     out = {}
     for t in tags:
         ty, v = t['type'], bytes(t['value'])
         if ty == 'IntProperty': x = struct.unpack('<i', v)[0]
+        elif ty == 'ObjectProperty': x = pkg.path(struct.unpack('<i', v)[0])
+        elif ty == 'ArrayProperty' and t['inner'] == 'ObjectProperty':
+            x = [pkg.path(r) for r in struct.unpack_from('<%di' % struct.unpack_from('<i', v)[0], v, 4)]
         elif ty == 'FloatProperty': x = struct.unpack('<f', v)[0]
         elif ty == 'BoolProperty': x = bool(t['bool'])
         elif ty == 'NameProperty' or ty in ('ByteProperty', 'EnumProperty') and t['size'] == 8:
@@ -9729,6 +9733,63 @@ ctor_refusals()
 print('ok  CtorRefusals: a constructor with parameters or defined out of the class, a statement no default can say, a '
       'destructor with a body, a UE_DEFAULTS statement on part of a struct or on another object, and UE_DEFAULTS in a '
       'UE_STRUCT or UE_INTERFACE are refused')
+
+CD_ACTOR, CD_PLAYER, CD_OBJECT = '/Script/Engine.Actor', '/Script/FSD.PlayerCharacter', '/Script/CoreUObject.Object'
+CD_GRUNT = '/Game/Enemies/Spider/Grunt/ENE_Spider_Grunt_Normal.ENE_Spider_Grunt_Normal_C'
+
+
+def cd_class(name):
+    """The path of ClassDefaults' class `name`_C."""
+    return '/Game/_ElytrasMods/ClassDefaults/%s.%s_C' % (name, name)
+
+
+def class_defaults():
+    """ClassDefaults: `X::StaticClass()` is a class reference's default, written as the cook writes a class picked in
+    Class Defaults (BP_SpaceRig_Gamemode's GameSessionClass, UPG_Bosco_ElectricDamage's NativeClass): a tag naming the
+    class - an engine or game class's /Script import, a game Blueprint's or another mod class's /Game import, the class's
+    own export - so it loads as that class. So in an initializer, a TArray's and a TMap's braces, a UE_STRUCT's default
+    instance and a struct value, a subclass's UE_DEFAULTS (where a nullptr over the parent's class is a tag too) and an
+    asset's braces. The object holding the value lists each class as created before it is serialized (the cook's
+    DependsMap), bar its own class, serialized before its default object is made, and a /Script/CoreUObject one, which
+    nothing waits on (SavePackage.cpp 3899, 4104-4117). A TSubclassOf takes its class or a subclass, as the editor's class
+    picker does; UeApi's converts from any class, so another is refused."""
+    here = os.path.dirname(asset('ClassDefaults'))
+    for name in ('ClassDefaults', 'ClassDefaultsKid', 'CdOther', 'FCdSpawn', 'UCdDef', 'CD_Asset'):
+        keeps_invariants(os.path.join(here, name))
+    created = lambda p, i: {p.path(d) for d in p.exports[i]['deps'][1]}
+    pkg = invariants.Package(asset('ClassDefaults'))
+    cdo = pkg.find('Default__ClassDefaults_C')
+    got = tag_values(pkg, cdo, pkg.tags(cdo))
+    want = {'Kind': CD_ACTOR, 'Pawn': CD_PLAYER, 'Grunt': CD_GRUNT, 'Mine': cd_class('CdOther'),
+            'Self': cd_class('ClassDefaults'), 'Any': CD_OBJECT, 'Kinds': [CD_ACTOR, cd_class('CdOther')]}
+    assert {k: got.get(k) for k in want} == want and 'Empty' not in got, got
+    assert got['Twin'].get('Kind') == cd_class('CdOther') and 'Spawn' not in got, got
+    removed, pairs, key, num, value = struct.unpack_from('<5i', bytes(pkg.tag(cdo, 'ByName')['value']))
+    assert (removed, pairs, pkg.names[key].lower(), num, pkg.path(value)) == (0, 1, 'spider', 0, CD_GRUNT), pkg.tag(cdo, 'ByName')
+    deps = pkg.exports[cdo]['deps']
+    assert {CD_ACTOR, CD_PLAYER, CD_GRUNT, cd_class('CdOther')} == created(pkg, cdo), deps
+    assert cd_class('ClassDefaults') in {pkg.path(d) for d in deps[2]}, deps
+    assert CD_OBJECT not in {pkg.path(d) for l in deps for d in l}, deps
+    kid = invariants.Package(os.path.join(here, 'ClassDefaultsKid'))
+    kcdo = kid.find('Default__ClassDefaultsKid_C')
+    got = tag_values(kid, kcdo, kid.tags(kcdo))
+    assert {k: got.get(k, 'unset') for k in ('Kind', 'Pawn')} == {'Kind': cd_class('ClassDefaultsKid'), 'Pawn': None}, got
+    spawn = uds_defaults(os.path.join(here, 'FCdSpawn'))
+    assert spawn.get('Kind') == CD_PLAYER and spawn.get('Count') == 2, spawn
+    st = invariants.Package(os.path.join(here, 'FCdSpawn'))
+    assert CD_PLAYER in created(st, 0), st.exports[0]['deps']
+    a = invariants.Package(os.path.join(here, 'CD_Asset'))
+    ai = a.find('CD_Asset')
+    assert tag_values(a, ai, a.tags(ai)) == {'SpawnClass': cd_class('CdOther'), 'Any': CD_ACTOR}, a.tags(ai)
+    assert {cd_class('CdOther'), CD_ACTOR} <= created(a, ai), a.exports[ai]['deps']
+    refused('CdWrongSlot', '  TSubclassOf<APawn> P = AActor::StaticClass();\n',
+            'P: a TSubclassOf<APawn> holds APawn or a subclass of it, and AActor is neither')
+    refused('CdGetClass', '  TSubclassOf<AActor> K = GetClass();\n', 'K: a default is a value known when the mod is built')
+
+
+class_defaults()
+print('ok  ClassDefaults: a class is a default - in a member, a container, a UE_STRUCT, a struct value, UE_DEFAULTS and an '
+      "asset - written as the class's import or own export, created first; a class a TSubclassOf does not take is refused")
 
 
 def unlike_cpp_refusals():
@@ -11020,6 +11081,42 @@ def edit_cooked_unlisted_cases():
           'leaves no stale cooked data')
 
 
+def class_default_edits():
+    """A class as an edit's value, ClassDefaults' output standing in for the game. UE_ASSET_EDIT of CD_Asset sets
+    SpawnClass to a /Script class the package did not import, appended and created before the asset is serialized, and
+    Any to UObject's, which nothing waits on. A UE_PATCH of ClassDefaults sets Kind to the patched class itself: its own
+    export, which is serialized before its default object is made, so the edit adds no edge; Mine's class was imported
+    and listed already."""
+    game = os.path.join(ROOT, 'ClassDefaults', 'FSD', 'Content')
+    body = ('class UCdDef : public UPrimaryDataAsset {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/ClassDefaults/UCdDef", "UCdDef_C");\n'
+            '  TSubclassOf<AActor> SpawnClass;\n  UClass *Any;\n};\n'
+            'UE_ASSET_AT(UCdDef, CD_Asset, "/Game/_ElytrasMods/ClassDefaults/CD_Asset");\n'
+            'UE_ASSET_EDIT(CD_Asset) {.SpawnClass = APlayerCharacter::StaticClass(), .Any = UObject::StaticClass()};\n'
+            'class ClassDefaults : public AActor {\npublic:\n'
+            '  UE_CLASS("/Game/_ElytrasMods/ClassDefaults/ClassDefaults", "ClassDefaults_C");\n'
+            '  TSubclassOf<AActor> Kind;\n  TSubclassOf<AActor> Mine;\n};\n'
+            'class CdPatch : public ClassDefaults {\n  UE_PATCH;\n'
+            '  UE_DEFAULTS { Kind = ClassDefaults::StaticClass(); Mine = APlayerCharacter::StaticClass(); }\n};\n')
+    with tempfile.TemporaryDirectory() as tmp:
+        proc, content = compile_edit(tmp, 'CdEdit', EDIT_HEAD + 'UE_MOD_PACKAGE("/Game/_ElytrasMods/CdEdit");\n' + body, game)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        at = lambda root, name: os.path.join(root, '_ElytrasMods', 'ClassDefaults', name)
+        for name in ('CD_Asset', 'ClassDefaults'):
+            keeps_invariants_but(at(content, name), game)
+            keeps_edit_invariants(at(content, name), game)
+        a = invariants.Package(at(content, 'CD_Asset'))
+        ai = a.find('CD_Asset')
+        assert tag_values(a, ai, a.tags(ai)) == {'SpawnClass': CD_PLAYER, 'Any': CD_OBJECT}, a.tags(ai)
+        lists = a.exports[ai]['deps']
+        assert CD_PLAYER in {a.path(d) for d in lists[1]} and CD_OBJECT not in {a.path(d) for l in lists for d in l}, lists
+        p, was = (invariants.Package(at(root, 'ClassDefaults')) for root in (content, game))
+        cdo = p.find('Default__ClassDefaults_C')
+        got = tag_values(p, cdo, p.tags(cdo))
+        assert got['Kind'] == cd_class('ClassDefaults') and got['Mine'] == CD_PLAYER, got
+        assert struct.unpack('<i', bytes(p.tag(cdo, 'Kind')['value']))[0] == p.find('ClassDefaults_C') + 1, p.tag(cdo, 'Kind')
+        assert p.exports[cdo]['deps'] == was.exports[was.find('Default__ClassDefaults_C')]['deps'], p.exports[cdo]['deps']
+
+
 if not globals().get('EDITS_EXPLORE'):     # set by the dev loop's exploration driver, which reuses the cases above
     edit_invariants_suite()
     edit_invariants_game()
@@ -11039,6 +11136,9 @@ if not globals().get('EDITS_EXPLORE'):     # set by the dev loop's exploration d
     print('ok  MapPatch: a patch\'s whole TSet / TMap loads as written, a property or one inside a struct (by a member '
           'path or in a whole struct): the archetype\'s elements it drops are listed as removed; a key given twice '
           'holds its last value, an FString key compared without case')
+    class_default_edits()
+    print("ok  ClassDefaults: UE_ASSET_EDIT and UE_PATCH write a class into a cooked package: a new import created first, "
+          "the patched class's own as its export")
 
 
 PREFETCH.finish()
