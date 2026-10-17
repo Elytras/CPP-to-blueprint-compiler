@@ -1906,22 +1906,16 @@ each topic.
 
 **Compiled with no message, but wrong.** Nothing catches these yet, so avoid them.
 
-- A method of a `UE_STRUCT` that is not inline. A Blueprint struct holds no functions, so the call names a function
-  that exists nowhere. Write a free `inline` function that takes the struct. See [Functions](REFERENCE.md#functions).
-- Two non-inline methods with the same name. A Blueprint class has one function per name: only the overload with the
-  most parameters is cooked, and calls to the other are miscompiled. Rename one, or make the extra overloads `inline`.
-  See [Functions](REFERENCE.md#functions).
 - A mod widget class. It has no designer layout, so it shows nothing of its own. For visible UI, create one of the
   game's widget Blueprints. See [Classes and variables](REFERENCE.md#classes-and-variables).
-- An RPC, authority-only or cosmetic marker on an `inline` method. The marker is ignored, and the call runs locally.
-  See [RPCs](REFERENCE.md#rpcs).
+- `GetOther()->SuperBase::Bump(1)`, a qualified call on another object reached through a call or a cast, where the
+  object's type does not declare Bump itself. The qualifier cannot be read back there, so the call goes by name and
+  reaches the object's override. Written on a variable, `Other->SuperBase::Bump(1)`, it is refused. See
+  [Overrides and parent calls](REFERENCE.md#overrides-and-parent-calls).
 - An engine or game static marked authority-only or cosmetic, such as `UGameplayStatics::ApplyDamage` or
   `UGameplayStatics::PlaySound2D`. The editor's node skips an authority-only function on a client and a cosmetic one
   on a dedicated server; AssetGen's call runs both on every machine. Guard such a call with `HasAuthority()` or
   `UKismetSystemLibrary::IsServer(this)`. See [Working with other objects](REFERENCE.md#working-with-other-objects).
-- `UKismetSystemLibrary::Delay(1.0f, Info)`. Passing the `FLatentActionInfo` without the world context compiles into
-  a broken call. Leave the `FLatentActionInfo` out: the compiler supplies it. See
-  [Latent calls](REFERENCE.md#latent-calls).
 - `UE_AWAIT` on a dispatcher with two or more parameters. The method resumes, but the values are not available. Bind
   a handler to read them. See [Waiting on events](REFERENCE.md#waiting-on-events).
 

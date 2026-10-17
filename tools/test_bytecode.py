@@ -9731,6 +9731,24 @@ print('ok  CtorRefusals: a constructor with parameters or defined out of the cla
       'UE_STRUCT or UE_INTERFACE are refused')
 
 
+def unlike_cpp_refusals():
+    """Calls that used to compile into something other than what C++ runs. A UE_STRUCT's method that is not inline named
+    a function that exists nowhere, as a Blueprint struct holds none. `Other->QoBase::Bump(1)` went by name and reached
+    Other's own override, where C++ runs QoBase's: seen when Other's type declares Bump too (QoKid), and when the source
+    spells the qualifier after a plain chain of names (`this->Other->QoBase::Bump`)."""
+    refused('StructFn', '  FStructFn P;\n  int32 Use() { return P.Sum(); }\n', 'FStructFn::Sum: a UE_STRUCT holds no functions',
+            top='struct FStructFn {\n  UE_STRUCT;\n  int32 A = 1;\n  int32 Sum() const { return A + 1; }\n};\n')
+    sup = ('class QoBase : public AActor {\npublic:\n  int32 Bump(int32 V) { return V + 1; }\n};\n'
+           'class QoKid : public QoBase {\npublic:\n  int32 Bump(int32 V) { return V + 2; }\n};\n')
+    why = "`Obj->QoBase::Bump()` runs QoBase's Bump on another object without dispatch"
+    refused('QoKidRef', '  QoKid *Other;\n  int32 Go() { return Other->QoBase::Bump(1); }\n', why, top=sup)
+    refused('QoBaseRef', '  QoBase *Other;\n  int32 Go() { return this->Other->QoBase::Bump(1); }\n', why, top=sup)
+
+
+unlike_cpp_refusals()
+print('ok  UnlikeCppRefusals: a UE_STRUCT method that is not inline, and a qualified call on another object, are refused')
+
+
 def asset_map_dup_keys():
     """A key a map's braces give twice holds the last value given, as TMap's initializer-list constructor Adds each pair
     in order (Map.h 1166-1173). AS_AmdOver's {{"a", 1}, {"a", 2}} over UAmdDef's {a: 2, c: 3} loads {a: 2}, AS_AmdLast's
@@ -10186,7 +10204,11 @@ print('ok  replication refusals: UE_REPLICATED on a struct member, replication o
 for _mod, _mark in (('RpcInline', 'UE_SERVER'), ('AuthInline', 'UE_AUTHORITY_ONLY'), ('CosInline', 'UE_COSMETIC')):
     refused(_mod, '  int32 Pings;\n  %s inline void Ping() { Pings += 1; }\n  void Go() { Ping(); }\n' % _mark,
             '%s::Ping: an RPC, authority-only or cosmetic marker on an inline method does nothing' % _mod)
-print('ok  a net, authority-only or cosmetic marker on an inline method is refused')
+# The marker on the definition out of the class, the declaration plain: it was read there for a call's routing, not here.
+refused('RpcInlineDef', '  int32 Pings;\n  void Ping();\n  void Go() { Ping(); }\n',
+        'RpcInlineDef::Ping: an RPC, authority-only or cosmetic marker on an inline method does nothing',
+        after='UE_SERVER inline void RpcInlineDef::Ping() { Pings += 1; }\n')
+print('ok  a net, authority-only or cosmetic marker on an inline method is refused, on its declaration or definition')
 
 
 # ---- LATENT: latent calls, async actions, deferred spawn / construct warnings (invariant_rules/latent.py)

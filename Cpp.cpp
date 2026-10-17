@@ -1678,6 +1678,8 @@ private:
        hides R's from an unqualified call - so it got there through a qualifier, however spelled (`this->R::Method()`).
        A forwarder is no declaration of the source's, so this answers the same before and after SynthesizeForwarders. */
     bool NamesQualified(const Json& Callee, const FRecord* Written, const FRecord& R, const std::string& Method) const;
+    /* `Other->Base::Method()`: the qualifier a call on another object is written with, else empty. */
+    std::string QualifiedOnOther(const Json& Callee, const Json& Obj, const FRecord& R, const std::string& Method) const;
     const std::vector<std::string>& ModSources() const;
     bool IsSubclassOf(const FRecord& Child, const FRecord& Parent) const;
     /* The nearest declaration of some method along R's chain is `= 0`: the class Generate cooks CLASS_Abstract. */
@@ -2944,6 +2946,17 @@ bool FCompiler::Collect(std::string* Err)
         const bool bOtherMod = R.IsNative() && R.UePackage.compare(0, 6, "/Game/") == 0;
         if (!R.IsGenerated() && !R.bIsPatch && !bOtherMod) continue;
         if (!LowerCtor(R, Err)) return false;
+        /* A Blueprint struct holds no functions, so a call to one of its methods would name a function that exists
+           nowhere. An inline one is expanded where it is called instead (a static one anywhere: it needs no object). */
+        if (R.bIsStruct)
+            for (const Json* M : R.AllMethods)
+                if (!IsInlineMethod(R, Name(*M)))
+                {
+                    *Err = R.CppName + "::" + Name(*M) + ": a UE_STRUCT holds no functions, so nothing could run a call to "
+                           "it; write a free inline function that takes the struct, `inline ... " + Name(*M) + "(const "
+                         + LeafOf(R.CppName) + "& S)`";
+                    return false;
+                }
     }
     return true;
 }
@@ -6185,6 +6198,44 @@ const FRecord* FCompiler::MemberQualifier(const Json& Member) const
     return nullptr;
 }
 
+/* clang's JSON keeps no qualifier, so it shows two ways. The method called is declared above the nearest declaration of
+   its name from Obj's type up, which an unqualified call would have found (Obj a Kid, which declares Method too). Or the
+   source says so where the member begins, which is where Obj is written: read when Obj is a plain chain of names
+   (`Other`, `this->Other`, `A->B`), and given up after a call or a cast, as it then cannot be read. */
+std::string FCompiler::QualifiedOnOther(const Json& Callee, const Json& Obj, const FRecord& R, const std::string& Method) const
+{
+    std::string Of = StripTypeKeywords(TypeOf(Obj));
+    while (!Of.empty() && (Of.back() == '*' || Of.back() == ' ')) Of.pop_back();
+    for (const FRecord* A = Find(Of); A; A = A->Base.empty() ? nullptr : Find(A->Base))
+        if (A->Methods.count(Method) && !A->Forwarders.count(Method))
+        {
+            if (A != &R) return R.CppName;
+            break;
+        }
+    const Json Begin = Callee.value("range", Json::object()).value("begin", Json::object());
+    if (!Begin.contains("offset")) return std::string();
+    const size_t Off = Begin["offset"].get<size_t>();
+    auto Ident = [](char C) { return std::isalnum(uint8(C)) || C == '_'; };
+    for (const std::string& T : ModSources())
+    {
+        std::string Q;          // the names joined by `::` since the last `->` or `.`
+        for (size_t P = Off; P < T.size();)
+        {
+            while (P < T.size() && (T[P] == ' ' || T[P] == '\t')) ++P;
+            size_t E = P;
+            while (E < T.size() && Ident(T[E])) ++E;
+            if (E == P) break;
+            const std::string Id = T.substr(P, E - P);
+            while (E < T.size() && (T[E] == ' ' || T[E] == '\t')) ++E;
+            if (T.compare(E, 2, "::") == 0) { Q += (Q.empty() ? "" : "::") + Id; P = E + 2; continue; }
+            if (T.compare(E, 2, "->") == 0 || T.compare(E, 1, ".") == 0) { Q.clear(); P = E + (T[E] == '.' ? 1 : 2); continue; }
+            if (Id == Method && !Q.empty() && Find(Q)) return Q;
+            break;
+        }
+    }
+    return std::string();
+}
+
 bool FCompiler::NamesQualified(const Json& Callee, const FRecord* Written, const FRecord& R, const std::string& Method) const
 {
     if (Callee.value("forwards", false)) return true;
@@ -6758,6 +6809,18 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
                 bQualified = !bParentCall && !R->IsNative();
                 bNamesQualified = true;
             }
+            /* C++ runs that Method on Other without dispatch. A Blueprint calls a function so only as self's parent call
+               (K2Node_CallParentFunction), and a body copied in runs on self; by name the call would reach Other's own
+               override. Static, final and in a final class, the two are one. */
+            else if (Obj && Kind(*Obj) != "CXXThisExpr" && !R->IsNative() && !bStatic && !R->bFinal
+                     && !R->FinalMethods.count(MethodName))
+                if (const std::string Q = QualifiedOnOther(*Callee, *Obj, *R, MethodName); !Q.empty())
+                {
+                    *Err = "`Obj->" + Q + "::" + MethodName + "()` runs " + Q + "'s " + MethodName + " on another object "
+                           "without dispatch, which a Blueprint does only as self's parent call; call it by name, which runs "
+                           "the object's own version, or move what it does into a function of another name";
+                    return false;
+                }
         }
         /* `final` (FinalOwner): the one version of the method every object the call can run on reaches, called as
            that function instead of by name. On `this` the class asked is the one being compiled, not the one the call
@@ -16052,11 +16115,17 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         { *Err = R.CppName + ": " + What + " does nothing, since only an actor or an actor component replicates"; return false; }
     }
     /* The engine routes a call by the called UFunction's flags (CallFunction, GetFunctionCallspace); an inline method is
-       none, its body copied into each caller, so its marker would go nowhere. */
+       none, its body copied into each caller, so its marker would go nowhere, written on its declaration or on its
+       definition out of the class. */
     for (const Json* M : R.AllMethods)
-        if ((M->value("inline", false) || IsInlineMethod(R, Name(*M))) && (NetFlagsOf(*M) | AccessFlagsOf(*M)))
+    {
+        const auto D = R.MethodDefs.find(Name(*M));
+        const uint32 Marks = NetFlagsOf(*M) | AccessFlagsOf(*M)
+                           | (D != R.MethodDefs.end() ? NetFlagsOf(*D->second) | AccessFlagsOf(*D->second) : 0);
+        if ((M->value("inline", false) || IsInlineMethod(R, Name(*M))) && Marks)
         { *Err = R.CppName + "::" + Name(*M) + ": an RPC, authority-only or cosmetic marker on an inline method does nothing, "
                  "since no call to it is routed; drop inline"; return false; }
+    }
     struct FSegment
     {
         std::string Name;

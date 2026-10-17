@@ -2034,7 +2034,7 @@ written inside the class does not make a method inline. Only the `inline` keywor
 | `generate_api: true` in `mods.yaml` | Writes an editor stub of the class, so a Blueprint made in the editor can place call nodes for its functions; see [Editor API stubs](GUIDE.md#editor-api-stubs). | Yes |
 | `int32 Undef(int32 X);` with no body anywhere | No function is cooked, and a call to it is refused ("... declares and never defines"), as C++ would not link it. Give every method a body, or make it `virtual ... = 0` for an empty one. | Refused |
 | `AMyActor() { Charges = 5; }` | No function: a default constructor is read as the class's defaults, and one that takes parameters is refused. A destructor that does something is refused too, as the engine never runs it. See [Constructors](#constructors); do run-time setup in ReceiveBeginPlay. | Yes |
-| `int32 Sum() const { ... }` inside a UE_STRUCT | A struct holds no functions. A non-inline struct method is not refused and compiles to a call that cannot work; an inline one is refused (`called on another object`). Write a free inline function that takes the struct: `inline int32 SumOf(const FPair &P)`. | Not yet |
+| `int32 Sum() const { ... }` inside a UE_STRUCT | Refused: "a UE_STRUCT holds no functions". A Blueprint struct has none, so a call to it could not run; it used to compile into one. An inline method is refused where it is called (`called on another object`), and an inline static one works. Write a free inline function that takes the struct: `inline int32 SumOf(const FPair &P)`. | Refused |
 
 ```cpp
 class AMyActor : public AActor {
@@ -2337,7 +2337,7 @@ Notes:
 | The same call inside a static that has a `WorldContextObject` parameter | Passes the static's own parameter. | Yes |
 | `UGameplayStatics::GetPlayerPawn(nullptr, 0)` | An explicit argument, `nullptr` included, is kept. | Yes |
 | `UKismetSystemLibrary::Delay(0.5f)` | A latent function's `FLatentActionInfo` is left out as well, and the compiler fills it in. Never pass it yourself: with the world context written too it is refused (`leave the FLatentActionInfo argument out`); see [Latent calls](#latent-calls). | Yes |
-| `UKismetSystemLibrary::Delay(0.5f, Info)`, the latent info passed without the world context | Not caught: it compiles with no diagnostic, and 0.5 is passed as the world context. Leave the FLatentActionInfo out. See [Latent calls](#latent-calls). | Not yet |
+| `UKismetSystemLibrary::Delay(0.5f, Info)`, the latent info passed without the world context | Refused: `leave the FLatentActionInfo argument out`, as with the world context written. See [Latent calls](#latent-calls). | Refused |
 
 ```cpp
 APawn *Mine() { return UGameplayStatics::GetPlayerPawn(0); }            // this
@@ -2510,7 +2510,7 @@ Notes:
 | The same call to a multicast RPC | A call by name, with a warning: an object of a subclass that overrides the function runs its override. On a server a multicast runs locally and is also sent, so an added override would send it once, then again when it calls the parent's. An override you declare yourself does that too, as an editor override that calls its parent does. | Warns |
 | `SuperTest::Thrice(1)` in SuperTest's own code | SuperTest's own Thrice, its body copied in: C++ runs that one without dispatch, also on an object of a subclass that overrides Thrice. | Yes |
 | The same call to one of the class's own functions whose body cannot be copied in | A call by name, with a warning: on an object of a subclass that overrides the function, the override runs. A Blueprint calls its own class's function without dispatch only when that function is `final`, and then the call is bound to it. | Warns |
-| `Other->SuperBase::Bump(1)` | Not what C++ does. The qualifier is recognised only on `this`, so this is a call by name that reaches Other's most derived Bump. | Not yet |
+| `Other->SuperBase::Bump(1)` | Refused: "runs SuperBase's Bump on another object without dispatch". C++ runs SuperBase's own Bump there; a Blueprint calls a function that way only as self's parent call, and by name the call would reach Other's override. Seen when Other's type declares a Bump of its own, or when the qualifier follows a plain chain of names (`Other`, `this->Other`, `A->B`). After a call or a cast, `GetOther()->SuperBase::Bump(1)`, it cannot be read back, and goes by name with no message. Call it by name, or put the code in a function of another name. | Refused |
 
 ```cpp
 class SuperBase : public AActor {
@@ -4476,7 +4476,7 @@ put these markers only on an ordinary method with a body, neither `inline` nor `
 | `UE_SERVER void ServerBump(int32 &Count) { Count += 1; }` | Warns once per parameter it writes: "reaches the caller only when the call runs locally". The receiving machine works on a copy, so the caller sees the write only when the call ran locally, as when the server calls its own Server RPC. Take the parameter by value or `const &`. | Warns |
 | `UE_SERVER void ServerSync(TMap<FName, int32> Scores) { Kept = Scores; }` | Refused: "an RPC parameter cannot be a TMap or TSet". The engine sends nothing for either, so the argument would arrive empty. Pass two arrays, keys and values. | Refused |
 | `UE_SERVER void Send(FBag Sack)`, where `FBag` holds a `TMap`; `UE_SERVER void S(TScriptInterface<IMark> T)` | Refused: "an RPC parameter cannot hold what does not replicate". A struct is sent member by member, and neither a TMap nor an interface sends anything. Pass the object as a `UObject*` or an actor pointer instead of an interface. | Refused |
-| `UE_SERVER inline void ServerPing() { Pings += 1; }` | Refused: "an RPC, authority-only or cosmetic marker on an inline method does nothing". An inline method is expanded at each call and is no Blueprint function, so no call to it is routed. The same holds for `UE_AUTHORITY_ONLY` and `UE_COSMETIC`. Drop `inline`. | Refused |
+| `UE_SERVER inline void ServerPing() { Pings += 1; }` | Refused: "an RPC, authority-only or cosmetic marker on an inline method does nothing". An inline method is expanded at each call and is no Blueprint function, so no call to it is routed. The same holds for `UE_AUTHORITY_ONLY` and `UE_COSMETIC`, and for a marker on the method's definition out of the class, `UE_SERVER inline void AMine::ServerPing() { ... }`, which used to compile. Drop `inline`. | Refused |
 | `UE_SERVER static void S(int32 X) { }` | Refused: "a static function cannot be an RPC". The engine routes a static function without looking at its net flags, so it would run locally and never be sent. Use a member function. | Refused |
 | `UE_MULTICAST UE_SERVER void Also() { }` | Refused: "an RPC goes one way". The sender picks one direction and the receiver checks its own, so a second marker would drop the call on one side. `UE_MULTICAST UE_CLIENT` is refused the same way. | Refused |
 
@@ -5857,8 +5857,16 @@ and where the feature is described. In each group, the messages you are most lik
   `if (C) Add5(M[K()]); else Add5(X);`. See [Functions](#functions).
 - `TODO: inline function <Class>::<Method> called on another object (only this)`: an inline method called on another
   object, `Other->Twice(3)`, or an inline method of a UE_STRUCT. An inline body runs with the caller's `this`. Fix: drop
-  `inline`, so that the method is a Blueprint function any object can run, or write a free inline function that takes
-  the object as a parameter. See [Inline functions and templates](#inline-functions-and-templates).
+  `inline` from a class's method, so that it is a Blueprint function any object can run, or write a free inline
+  function that takes the object or the struct as a parameter. See
+  [Inline functions and templates](#inline-functions-and-templates).
+- ``<Struct>::<Method>: a UE_STRUCT holds no functions, so nothing could run a call to it; write a free inline function that takes the struct``:
+  a method of a UE_STRUCT that is not inline. A Blueprint struct has no functions, so a call to it named one that exists
+  nowhere. Fix: `inline int32 SumOf(const FPair &P) { return P.A + P.B; }`. See [Functions](#functions).
+- `` `Obj-><Class>::<Method>()` runs <Class>'s <Method> on another object without dispatch, which a Blueprint does only as self's parent call ``:
+  a call on another object written with a qualifier, `Other->SuperBase::Bump(1)`. C++ runs that class's own version;
+  by name the call would reach the object's override. Fix: call it by name if the override is what you want, or move
+  the code into a function of another name and call that. See [Overrides and parent calls](#overrides-and-parent-calls).
 - `<Class>::<Function> returns <Type>: a reference return is refused until what it means to a C++ caller is specified;
   return a value or a pointer`: Not yet. A method that returns `T&`, such as `int32 &Slot(int32 I)` or
   `int32 &Get(int32 *P) { return *P; }`. Fix: return a value, or a pointer. See [Functions](#functions).
@@ -5982,9 +5990,10 @@ and where the feature is described. In each group, the messages you are most lik
   the call. UE_NO_OPTIMIZE on the calling function keeps it. See
   [Calling engine and game functions](#calling-engine-and-game-functions).
 
-These compile with no message and do not work as C++ would: the
-shorter of two non-inline methods with one name; and a non-inline method of a UE_STRUCT. `UKismetSystemLibrary::PrintString` compiles too, but UE 4.27 keeps
-its body only outside shipping builds, so the retail game prints nothing. See [Functions](#functions),
+This compiles with no message and does not work as C++ would: a qualified call on another object whose qualifier
+cannot be read back, `GetOther()->SuperBase::Bump(1)` where Other's type does not declare Bump itself, which goes by
+name. `UKismetSystemLibrary::PrintString` compiles too, but UE 4.27 keeps
+its body only outside shipping builds, so the retail game prints nothing. See [Overrides and parent calls](#overrides-and-parent-calls),
 [Strings and text](#strings-and-text) and [Calling engine and game functions](#calling-engine-and-game-functions).
 
 ### Components, defaults, assets and other objects
