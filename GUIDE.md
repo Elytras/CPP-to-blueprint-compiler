@@ -532,10 +532,15 @@ stops the timer. The method takes no parameters and must not be `inline`. Settin
 restarts it and returns a new handle. Use `ReceiveTick` for work every frame, a `Delay` loop to wait for something and
 then carry on, and a timer for a fixed rate that you pause or stop.
 
-Key events are not built yet: poll the player controller in `ReceiveTick` with `WasInputKeyJustPressed` or
-`IsInputKeyDown`. Write the key with braces and the engine's key name, `FKey{"F5"}` (`"LeftShift"`, `"SpaceBar"`,
-`"One"`); `FKey("F5")` is not built yet and is refused with `no Kismet conversion from FString to FKey`. To wait for an
-event rather than a time, `UE_AWAIT(Obj->Dispatcher)` continues the method at the dispatcher's next broadcast and, for
+A key calls a method marked `UE_INPUT_KEY("F5")`, the editor's InputKey event; `UE_INPUT_ACTION("Use")` is an
+InputAction event, which fires on whatever key the player mapped to the game's action. The method returns void and
+takes nothing or `FKey Key`. Options after the name pick the edge (`Released`, or `Pressed, Released` for both), the
+modifiers (`Ctrl`, `Shift`, `Alt`, `Cmd`) and the node's settings (`NoConsume`, `WhenPaused`, `KeepParent`). An actor's
+events fire only once it receives input: set `AutoReceiveInput = EAutoReceiveInput::Player0;` in its `UE_DEFAULTS`, or
+call `EnableInput(PC)`; a possessed pawn and a player controller need neither. To read a key's state instead, poll the
+player controller in `ReceiveTick` with `IsInputKeyDown`, the key written with braces and the engine's key name,
+`FKey{"F5"}` (`"LeftShift"`, `"SpaceBar"`, `"One"`); `FKey("F5")` is not built yet and is refused with
+`no Kismet conversion from FString to FKey`. To wait for an event rather than a time, `UE_AWAIT(Obj->Dispatcher)` continues the method at the dispatcher's next broadcast and, for
 a dispatcher with one parameter, gives its value: `Image = UE_AWAIT(Task->OnSuccess);`. It stays bound, so a later
 broadcast runs the rest of the method again. `UKismetSystemLibrary::LoadAsset(Soft)` waits for an async load and
 returns the object.
@@ -546,6 +551,8 @@ public:
   UE_COMPONENT(USceneComponent, Root);
   UE_COMPONENT(UPointLightComponent, Lamp);
   FTimerHandle Blink;
+
+  UE_DEFAULTS { AutoReceiveInput = EAutoReceiveInput::Player0; }   // so that its key events fire
 
   void ReceiveBeginPlay() {
     APlayerCharacter *Me = UGameFunctionLibrary::GetLocalPlayerCharacter();
@@ -560,10 +567,8 @@ public:
 
   void Toggle() { Lamp->ToggleVisibility(false); }   // every 0.5 s while the timer runs
 
-  void ReceiveTick(float DeltaSeconds) {             // no key events: poll the key
-    APlayerController *PC = UGameplayStatics::GetPlayerController(0);
-    if (PC && PC->WasInputKeyJustPressed(FKey{"F5"}))
-      UKismetSystemLibrary::K2_ClearAndInvalidateTimerHandle(Blink);
+  UE_INPUT_KEY("F5") void Stop() {                   // each time F5 goes down
+    UKismetSystemLibrary::K2_ClearAndInvalidateTimerHandle(Blink);
   }
 };
 ```
@@ -582,10 +587,13 @@ Watch for:
 - A timer set by name, `K2_SetTimer(this, "Poll", ...)`, is not checked: an inline, misspelled or parameter-taking
   method compiles and sets no timer. The `{this, &Class::Method}` form is checked. A time of zero or less sets no
   timer.
+- A key event takes its key from the game: while the actor has input, whatever the game does with F5 stops. Add
+  `NoConsume` to share the key. A key or action name the engine does not know compiles and never fires.
 
 Full rules: [Latent calls](REFERENCE.md#latent-calls), [Timers and input](REFERENCE.md#timers-and-input),
 [Waiting on events](REFERENCE.md#waiting-on-events). Examples: [examples/WaitForPlayer.cpp](examples/WaitForPlayer.cpp),
-[examples/Beacon.cpp](examples/Beacon.cpp), [examples/AwaitEvents.cpp](examples/AwaitEvents.cpp).
+[examples/Beacon.cpp](examples/Beacon.cpp), [examples/AwaitEvents.cpp](examples/AwaitEvents.cpp),
+[examples/HotKeys.cpp](examples/HotKeys.cpp).
 
 ### Dispatchers and interfaces
 
@@ -1891,9 +1899,6 @@ each topic.
   [Pointers and memory](REFERENCE.md#pointers-and-memory).
 - A one-argument struct constructor in parentheses, `FKey("F5")` or `FFrameNumber(5)`. Write the braces out:
   `FKey{"F5"}`. See [Timers and input](REFERENCE.md#timers-and-input).
-- Key and input-action events. `BindKey` and `BindAction` are not in the SDK, so clang rejects them. Poll the player
-  controller in `ReceiveTick`, `PC->WasInputKeyJustPressed(FKey{"F5"})`, or bind the player character's action
-  dispatchers, such as `OnFirePressed`. See [Timers and input](REFERENCE.md#timers-and-input).
 - A type alias declared inside a function, used as a local's type: `using T = int32; T A = X;`. See
   [Locals](REFERENCE.md#locals).
 - A game asset's values as build-time constants. The `UeAssets` headers name every asset but hold none of its values.

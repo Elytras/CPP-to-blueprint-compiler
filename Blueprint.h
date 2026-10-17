@@ -149,6 +149,20 @@ public:
        cannot express: declaring the name again would shadow it with a second property. */
     void AddCdoDefault(const FPropertyDef& Var) { CdoDefaults.push_back(Var); }
 
+    /* One editor InputKey or InputAction node: an entry of the class's InputKeyDelegateBinding or
+       InputActionDelegateBinding object, which UInputDelegateBinding::BindInputDelegates binds to the actor's input
+       component, calling Function on the actor by name (InputKeyDelegateBinding.cpp 12-45). Name is the key or the
+       action. Event is an EInputEvent: 0 pressed, 1 released, 2 repeat, 3 double click. */
+    struct FInputBinding
+    {
+        bool bAction = false;
+        std::string Name, Function;
+        uint8 Event = 0;
+        bool bShift = false, bCtrl = false, bAlt = false, bCmd = false;
+        bool bConsumeInput = true, bExecuteWhenPaused = false, bOverrideParentBinding = true;
+    };
+    void AddInputBinding(const FInputBinding& Binding) { InputBindings.push_back(Binding); }
+
     /* The actor has a root before this class's SCS runs: a Blueprint parent's SCS leaves one, and a native parent's
        constructor sets one or ExecuteConstruction takes its first native scene component. Then the DefaultSceneRoot
        node is in neither RootNodes nor AllNodes, as the editor saves it (ValidateSceneRootNodes). */
@@ -230,6 +244,7 @@ private:
     };
     std::vector<FComponentOverride> ComponentOverrides;
     std::vector<FPropertyDef> CdoDefaults;
+    std::vector<FInputBinding> InputBindings;
 
     struct FSubobjectOverride
     {

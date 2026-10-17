@@ -264,7 +264,17 @@ void FBlueprintClass::Finish()
     /* A native parent's overridden subobjects sit right after the functions, before anything the
        actor shape adds, so a non-actor class reaches them too. */
     const int32 RowFirstSubobject = RowFirstFunction + int32(Functions.size());
-    const int32 RowRootTemplate = RowFirstSubobject + int32(SubobjectOverrides.size());
+    /* Then the input binding objects, an InputKeyDelegateBinding and an InputActionDelegateBinding, each when the class
+       has a binding of its kind. */
+    std::vector<std::vector<FInputBinding>> BindingKinds;
+    for (const bool bAction : { false, true })
+    {
+        std::vector<FInputBinding> Of;
+        for (const FInputBinding& B : InputBindings) if (B.bAction == bAction) Of.push_back(B);
+        if (!Of.empty()) BindingKinds.push_back(Of);
+    }
+    const int32 RowFirstBinding = RowFirstSubobject + int32(SubobjectOverrides.size());
+    const int32 RowRootTemplate = RowFirstBinding + int32(BindingKinds.size());
     const int32 RowScsNode = RowRootTemplate + 1;
     /* Each UE_COMPONENT takes two rows, archetype then node, so the SCS lands after them all. */
     const int32 RowFirstComponent = RowScsNode + 1;
@@ -321,6 +331,12 @@ void FBlueprintClass::Finish()
         if (const FIndex Sub = ParentSubobjectAt(S.Name); Sub.V != 0) Class.SerBeforeSer.push_back(Sub.V);
     Class.SerBeforeCreate = { BpgcClass.V, BpgcCdo.V };
     Class.CreateBeforeCreate = { ParentIdx.V };
+    std::vector<FIndex> Bindings;               // DynamicBindingObjects, listed first as BP_PlayerControllerBase_C lists them
+    for (size_t I = 0; I < BindingKinds.size(); ++I)
+    {
+        Bindings.push_back(Exp(RowFirstBinding + int32(I)));
+        Class.CreateBeforeSer.push_back(Bindings.back().V);
+    }
     for (int32 I = 0; I < NumFunctions; ++I)
         Class.CreateBeforeSer.push_back(Exp(RowFirstFunction + I).V);
     for (const FPropertyDef& V : Vars)      // a dispatcher's Extra is a function listed above
@@ -344,6 +360,12 @@ void FBlueprintClass::Finish()
     Class.Serialize = [=](FArc& Ar) {
         if (NumReplicated > 0)
             Tag(Ar, "NumReplicatedProperties", "IntProperty", [=](FArc& V) { V.I32(NumReplicated); });
+        /* UBlueprintGeneratedClass::GetDynamicBindingObject looks a binding object up here by its class. */
+        if (!Bindings.empty())
+            Tag(Ar, "DynamicBindingObjects", "ArrayProperty", [=](FArc& V) {
+                V.I32(int32(Bindings.size()));
+                for (const FIndex& B : Bindings) V.Idx(B);
+            }, "ObjectProperty");
         if (bActor)
             Tag(Ar, "SimpleConstructionScript", "ObjectProperty",
                 [=](FArc& V) { V.Idx(ScsIdx); });
@@ -460,6 +482,66 @@ void FBlueprintClass::Finish()
             EndComponent(Ar, Tail);
         };
         P.AddExport(std::move(Sub));
+    }
+
+    /* Measured on BP_PlayerCameraDrone's InputKeyDelegateBinding_0 and BP_PlayerControllerBase's
+       InputActionDelegateBinding_0: the class's subobject with no object flags, and every field of every entry written,
+       as the cook saves an array's structs whole (no defaults to leave a field out against). The fields go in the
+       struct's link order, its own before FBlueprintInputDelegateBinding's three flags. */
+    for (const std::vector<FInputBinding>& Of : BindingKinds)
+    {
+        const bool bAction = Of.front().bAction;
+        const std::string Kind = bAction ? "InputActionDelegateBinding" : "InputKeyDelegateBinding";
+        const FIndex KindClass = EngineClass("/Script/Engine", Kind);
+        const FIndex KindCdo = ClassDefaultObject("/Script/Engine", Kind);
+        FExport Binding;
+        Binding.ClassIndex = KindClass;
+        Binding.TemplateIndex = KindCdo;
+        Binding.OuterIndex = Exp(RowClass);
+        Binding.ObjectName = Kind + "_0";
+        Binding.SerBeforeCreate = { KindClass.V, KindCdo.V };
+        Binding.CreateBeforeCreate = { Exp(RowClass).V };
+        Binding.Serialize = [=](FArc& Ar) {
+            static const char* const Events[] = { "IE_Pressed", "IE_Released", "IE_Repeat", "IE_DoubleClick" };
+            Tag(Ar, Kind + "s", "ArrayProperty", [=](FArc& V) {
+                FArc Elements(V.Owner());
+                for (const FInputBinding& B : Of)
+                {
+                    if (bAction)
+                        Tag(Elements, "InputActionName", "NameProperty", [=](FArc& E) { E.Name(B.Name); });
+                    else
+                        Tag(Elements, "InputChord", "StructProperty", [=](FArc& E) {
+                            Tag(E, "Key", "StructProperty", [=](FArc& K) {
+                                Tag(K, "KeyName", "NameProperty", [=](FArc& N) { N.Name(B.Name); });
+                                TagEnd(K);
+                            }, "Key");
+                            TagBool(E, "bShift", B.bShift);
+                            TagBool(E, "bCtrl", B.bCtrl);
+                            TagBool(E, "bAlt", B.bAlt);
+                            TagBool(E, "bCmd", B.bCmd);
+                            TagEnd(E);
+                        }, "InputChord");
+                    Tag(Elements, "InputKeyEvent", "ByteProperty", [=](FArc& E) { E.Name(Events[B.Event]); }, "EInputEvent");
+                    Tag(Elements, "FunctionNameToBind", "NameProperty", [=](FArc& E) { E.Name(B.Function); });
+                    TagBool(Elements, "bConsumeInput", B.bConsumeInput);
+                    TagBool(Elements, "bExecuteWhenPaused", B.bExecuteWhenPaused);
+                    TagBool(Elements, "bOverrideParentBinding", B.bOverrideParentBinding);
+                    TagEnd(Elements);
+                }
+                V.I32(int32(Of.size()));
+                V.Name(Kind + "s");             // the inner FPropertyTag, its Size the elements' bytes (see Records below)
+                V.Name("StructProperty");
+                V.I32(int32(Elements.B.size()));
+                V.I32(0);                       // ArrayIndex
+                V.Name("Blueprint" + Kind);
+                for (int32 I = 0; I < 4; ++I) V.U32(0);      // StructGuid
+                V.U8(0);                        // HasPropertyGuid
+                V.Append(Elements);
+            }, "StructProperty");
+            TagEnd(Ar);
+            Ar.Bool(false);
+        };
+        P.AddExport(std::move(Binding));
     }
 
     if (!bIsActor) return;

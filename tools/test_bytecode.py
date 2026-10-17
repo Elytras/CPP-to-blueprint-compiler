@@ -5109,7 +5109,8 @@ def ue_meta_under_msvc():
     """UeMeta.h is read by MSVC's IntelliSense as well as by AssetGen's clang: BpMods.vcxproj gives it /std:c++20, no
     defines and MSVC's traditional preprocessor (no /Zc:preprocessor), where a clang-only builtin or __VA_OPT__ is an
     error in every mod file, each reaching UeMeta.h through the UeApi headers. cl.exe in that mode compiles a file using
-    the one-argument UE_ENUM_MAP and the three-argument one both ways, each declared member of the type written."""
+    the one-argument UE_ENUM_MAP and the three-argument one both ways, each declared member of the type written, and
+    UE_INPUT_KEY / UE_INPUT_ACTION with options and without (an empty __VA_ARGS__)."""
     cl, include = msvc_cl()
     if not cl: return False
     with tempfile.TemporaryDirectory() as tmp:
@@ -5119,7 +5120,9 @@ def ue_meta_under_msvc():
                     'struct UOne { TMap<FString, EMood> ByName = UE_ENUM_MAP(EMood); };\n'
                     'struct UThree {\n  UE_ENUM_MAP(FName, EMood, Moods);\n  UE_ENUM_MAP(EMood, FString, Names);\n};\n'
                     'static_assert(__EnumMapSame__<decltype(UThree::Moods), TMap<FName, EMood>>);\n'
-                    'static_assert(__EnumMapSame__<decltype(UThree::Names), TMap<EMood, FString>>);\n')
+                    'static_assert(__EnumMapSame__<decltype(UThree::Names), TMap<EMood, FString>>);\n'
+                    'struct AKeys {\n  UE_INPUT_KEY("F5") void A();\n  UE_INPUT_KEY("S", Ctrl, Shift) void B();\n'
+                    '  UE_INPUT_ACTION("Use") void C();\n  UE_INPUT_ACTION("Use", Released, NoConsume) void D();\n};\n')
         proc = subprocess.run([cl, '/nologo', '/Zs', '/std:c++20', '/I' + os.path.dirname(UEAPI), '/I' + UEAPI, src],
                               capture_output=True, encoding='utf-8', errors='replace', cwd=tmp,
                               env=dict(os.environ, INCLUDE=include))
@@ -5128,7 +5131,8 @@ def ue_meta_under_msvc():
 
 
 if ue_meta_under_msvc():
-    print('ok  UeMeta.h compiles under cl.exe as BpMods.vcxproj\'s IntelliSense reads it, UE_ENUM_MAP\'s forms included')
+    print('ok  UeMeta.h compiles under cl.exe as BpMods.vcxproj\'s IntelliSense reads it, UE_ENUM_MAP\'s and UE_INPUT_KEY\'s '
+          'forms included')
 else:
     print('--  UeMeta.h under cl.exe: skipped (no MSVC with the Windows SDK\'s UCRT headers installed)')
 
@@ -10599,6 +10603,106 @@ proxy_frame_held()
 deferred_left()
 spawn_abstract()
 wait_hold()
+
+
+# ---- INPUT: key and input-action events, UE_INPUT_KEY / UE_INPUT_ACTION (what each binding names, invariant_rules/
+# edits.py's dynamic_binding_names_resolve)
+
+def input_bindings(base):
+    """A class's input bindings as the engine reads them: GetDynamicBindingObject takes the DynamicBindingObjects entry of
+    each binding class, BindToInputComponent its array's entries (InputKeyDelegateBinding.cpp 12-45). {binding class:
+    [entry as tag_values reads it]}, in a fixed order; {} for a class with none."""
+    p, ci = class_pkg(base)
+    t = p.tag(ci, 'DynamicBindingObjects')
+    out = {}
+    for b in (struct.unpack_from('<%di' % struct.unpack_from('<i', t['value'])[0], t['value'], 4) if t else ()):
+        assert b > 0 and p.exports[b - 1]['outer'] == ci + 1, (base, p.path(b))     # the class's own subobject
+        kind = p.class_of(b)
+        arr = p.tag(b - 1, kind + 's')
+        at, entries = arr['at'] + 4 + 49, []                                         # past the count and the inner tag
+        for _ in range(struct.unpack_from('<i', arr['value'])[0]):
+            tl = p.tags(b - 1, at)
+            entries.append(tag_values(p, b - 1, tl))
+            at = tl.end
+        out[kind] = sorted(entries, key=lambda e: json.dumps(e, sort_keys=True))
+    return out
+
+
+def input_entry(fn, event='IE_Pressed', consume=True, paused=False, override=True, key=None, mods=(), action=None):
+    """An entry as input_bindings reads it, its options defaulted as the editor's node defaults them."""
+    what = dict(InputActionName=action) if action else dict(InputChord=dict(
+        Key=dict(KeyName=key), **{'b' + m: m in mods for m in ('Shift', 'Ctrl', 'Alt', 'Cmd')}))
+    return dict(what, InputKeyEvent=event, FunctionNameToBind=fn, bConsumeInput=consume, bExecuteWhenPaused=paused,
+                bOverrideParentBinding=override)
+
+
+def input_events():
+    """UE_INPUT_KEY / UE_INPUT_ACTION cook what the editor's InputKey and InputAction nodes do: the class lists an
+    InputKeyDelegateBinding and an InputActionDelegateBinding of its own in DynamicBindingObjects, whose entries hold the
+    key and its modifiers or the action, the event (one entry per edge marked, Pressed when none is), the method's name
+    to call it by, and the node's three options, defaulted as the node defaults them. A subclass lists only its own: the
+    engine binds each class's up the chain, and the parent's binding of a method the child overrides calls the child's.
+    Each method runs with the key it is handed. The HotKeys example's actor gets input through AutoReceiveInput, as its
+    comments say."""
+    folder = os.path.dirname(asset('InputEvents'))
+    base, child, plain = (os.path.join(folder, n) for n in ('InputEvents', 'InputEventsChild', 'InputEventsPlain'))
+    canon = lambda es: sorted(es, key=lambda e: json.dumps(e, sort_keys=True))
+    want = {'InputKeyDelegateBinding': canon([
+                input_entry('Toggle', key='F5'), input_entry('Stop', 'IE_Released', key='F5'),
+                input_entry('Save', key='S', mods=('Shift', 'Ctrl')),
+                input_entry('Hold', key='G'), input_entry('Hold', 'IE_Released', key='G')]),
+            'InputActionDelegateBinding': [input_entry('Used', consume=False, paused=True, override=False, action='Use')]}
+    assert input_bindings(base) == want, input_bindings(base)
+    assert input_bindings(child) == {'InputActionDelegateBinding': [input_entry('Fired', action='Fire')]}, input_bindings(child)
+    assert input_bindings(plain) == {}, input_bindings(plain)
+    hot = os.path.join(ROOT, 'HotKeys', 'FSD', 'Content', '_AssetGenExamples', 'HotKeys', 'HotKeys')
+    assert os.path.exists(hot + '.uasset'), 'the examples are not built under ' + ROOT
+    assert input_bindings(hot) == {'InputKeyDelegateBinding': canon([
+        input_entry('Count', key='F5'), input_entry('Reset', key='F5', mods=('Ctrl',)),
+        input_entry('Down', key='G', consume=False), input_entry('Up', 'IE_Released', key='G', consume=False)])}, input_bindings(hot)
+    for b in (base, hot):
+        p, ci = class_pkg(b)
+        cdo = p.struct(ci).cdo - 1
+        assert tag_values(p, cdo, p.tags(cdo)).get('AutoReceiveInput') == 'Player0', (os.path.basename(b), 'no AutoReceiveInput')
+    for b in (base, child, plain, hot):
+        keeps_invariants(b)
+    fields = {'bOn': False, 'Presses': 2}
+    run(base, 'Toggle', self_vars=fields)
+    assert fields == {'bOn': True, 'Presses': 3}, fields
+    fields = {'Last': 'None', 'Presses': 0}
+    run(base, 'Hold', self_vars=fields, Key={'KeyName': 'G'})
+    assert fields == {'Last': 'G', 'Presses': 0}, fields
+    run(base, 'Used', self_vars=fields, Key={'KeyName': 'E'})
+    assert fields == {'Last': 'E', 'Presses': 10}, fields
+    fields = {'Presses': 5}
+    run(child, 'Toggle', self_vars=fields)          # what the parent's F5 binding reaches on a child, by name
+    assert fields == {'Presses': 105}, fields
+
+
+def input_refusals():
+    """A marker the engine could not honour is refused: one on a class that gets no input, on a method that is no
+    function of the object (static, inline), on one returning a value or taking more than the key - ProcessEvent would
+    hand it the key's bytes as its own -, an unknown option, a modifier on an action, and one that marks no method."""
+    for mod, body, why, base in (
+            ('InputNoActor', '  UE_INPUT_KEY("F5") void F() {}\n', 'on a class that is no actor', 'UActorComponent'),
+            ('InputStatic', '  UE_INPUT_KEY("F5") static void F() {}\n', 'on a static method', 'AActor'),
+            ('InputInline', '  UE_INPUT_KEY("F5") inline void F() {}\n', 'on an inline method', 'AActor'),
+            ('InputReturn', '  UE_INPUT_KEY("F5") int32 F() { return 1; }\n', 'return void', 'AActor'),
+            ('InputParms', '  UE_INPUT_KEY("F5") void F(int32 N) {}\n', 'it takes nothing, or the key', 'AActor'),
+            ('InputOutKey', '  UE_INPUT_KEY("F5") void F(FKey &Key) {}\n', 'it takes nothing, or the key', 'AActor'),
+            ('InputOption', '  UE_INPUT_KEY("F5", Relased) void F() {}\n', 'unknown option Relased', 'AActor'),
+            ('InputActionMod', '  UE_INPUT_ACTION("Use", Ctrl) void F() {}\n', 'takes no Ctrl', 'AActor'),
+            ('InputMisplaced', '  UE_INPUT_KEY("F5") int32 N = 0;\n', 'marks no method', 'AActor'),
+            ('InputLast', '  void F() {}\n  UE_INPUT_KEY("F5")\n', 'marks no method', 'AActor')):
+        refused(mod, body, why, base=base)
+
+
+input_events()
+print('ok  InputEvents: UE_INPUT_KEY / UE_INPUT_ACTION list the class\'s own key and action bindings - key, modifiers or '
+      'action, edge, the method, the node\'s options - and each method runs with the key it is handed (and HotKeys)')
+input_refusals()
+print('ok  InputRefusals: a key or action marker on no actor, a static or inline method, one returning a value or taking '
+      'more than the key, an unknown option or an action\'s modifier, or marking no method is refused')
 
 
 # ---- EDITS: invariants on the packages UE_PATCH / UE_ASSET_EDITS produce from the game (invariant_rules/edits.py)

@@ -639,6 +639,25 @@ std::string ParmTypeOf(const Json& P, bool* bRef = nullptr)
 /* WorldContextObject, WorldContext, Dumper-7's WorldContextObject_0: the parameter a Blueprint wires to self. */
 bool IsWcoName(const std::string& N) { return N.compare(0, 12, "WorldContext") == 0; }
 
+/* UE_INPUT_KEY / UE_INPUT_ACTION on the method that follows it: the key or the action, then the options, as
+   `<name>|<options>` (UeMeta.h). */
+struct FInputMark
+{
+    std::string Method;
+    const Json* Decl = nullptr;
+    bool bAction = false;
+    std::string Spec;
+};
+
+/* The marker as written, for a message. */
+static std::string InputMarkText(const FInputMark& M)
+{
+    const size_t Bar = std::min(M.Spec.find('|'), M.Spec.size());
+    const std::string Options = Bar < M.Spec.size() ? M.Spec.substr(Bar + 1) : std::string();
+    return std::string(M.bAction ? "UE_INPUT_ACTION" : "UE_INPUT_KEY") + "(\"" + M.Spec.substr(0, Bar) + "\""
+         + (Options.empty() ? "" : ", " + Options) + ")";
+}
+
 struct FRecord
 {
     std::string CppName;
@@ -674,6 +693,8 @@ struct FRecord
     std::map<std::string, std::string> TypeAliases; // `using Leaf = Game::...::Leaf;` in the class body
     std::set<std::string> FinalMethods;             // `virtual T F() final`: no subclass has an F of its own
     std::set<std::string> Forwarders;               // Methods AssetGen declared, not the source: see SynthesizeForwarders
+    std::vector<FInputMark> InputMarks;             // UE_INPUT_KEY / UE_INPUT_ACTION, in the order written
+    std::string InputMisplaced;                     // the first of them no method follows, as written
     const Json* Defaults = nullptr;                 // UE_DEFAULTS: the static-init block, never lowered
     bool bFinal = false;        // `class X final`: X has no subclass
     bool bFinalAsLeaf = false;  // UE_FINAL_AS's leaf: its base's one subclass
@@ -1425,6 +1446,7 @@ private:
     /* `inline` functions are the editor's macros: never a UFunction, their body is copied into each caller.
        `inline` may sit on the declaration or on an out-of-line definition. */
     bool IsInlineMethod(const FRecord& R, const std::string& Method) const;
+    bool AddInputBindings(const FRecord& R, bool bIsActor, FBlueprintClass& BP, std::string* Err) const;
     bool CheckMemberNames(const FRecord& R, std::string* Err) const;
     bool IsSceneRecord(const FRecord* C) const;
     bool RootInheritedBy(const FRecord& R) const;
@@ -2571,6 +2593,7 @@ bool FCompiler::Collect(std::string* Err)
 
         uint32 Access = N.value("tagUsed", std::string()) == "struct" ? FUNC_Public : FUNC_Private;
         std::string Category;       // UE_CATEGORY is positional, like an access specifier
+        std::vector<FInputMark> PendingInput;   // UE_INPUT_KEY / UE_INPUT_ACTION mark the member that follows them
         std::function<void(const Json&)> Member = [&](const Json& C) {
             /* genueapi puts a class's markers in a private `struct UeMarkers` at its bottom, out of IntelliSense's
                member list: they are the class's own. */
@@ -2578,6 +2601,27 @@ bool FCompiler::Collect(std::string* Err)
             {
                 ForEach(C, Member);
                 return;
+            }
+            if (Kind(C) == "VarDecl" && (Name(C).compare(0, 12, "UeInputKey__") == 0 || Name(C).compare(0, 15, "UeInputAction__") == 0))
+            {
+                FInputMark M;
+                M.bAction = Name(C)[7] == 'A';
+                FindLiteral(C, M.Spec);
+                PendingInput.push_back(M);
+                return;
+            }
+            if (!PendingInput.empty() && !C.value("isImplicit", false))
+            {
+                if (Kind(C) == "CXXMethodDecl" && C.contains("name") && Name(C) != "UeDefaults__")
+                    for (FInputMark& M : PendingInput)
+                    {
+                        M.Method = Name(C);
+                        M.Decl = &C;
+                        R.InputMarks.push_back(M);
+                    }
+                else if (R.InputMisplaced.empty())
+                    R.InputMisplaced = InputMarkText(PendingInput.front());
+                PendingInput.clear();
             }
             if (Kind(C) == "VarDecl" && Name(C).compare(0, 12, "UeCategory__") == 0)
             {
@@ -2740,6 +2784,7 @@ bool FCompiler::Collect(std::string* Err)
                 });
         };
         ForEach(N, Member);
+        if (!PendingInput.empty() && R.InputMisplaced.empty()) R.InputMisplaced = InputMarkText(PendingInput.front());
         /* A set is looked up in Replicated by the name it is cooked under, so the marker's C++ key follows. */
         for (const auto& N2 : R.UeNames)
             if (auto Rep = R.Replicated.find(N2.first); Rep != R.Replicated.end())
@@ -2928,6 +2973,21 @@ bool FCompiler::Collect(std::string* Err)
             *Err = R.CppName + ": a " + (R.bIsStruct ? "UE_STRUCT" : "UE_INTERFACE") + " has no UE_DEFAULTS, so its "
                    "statements would be dropped; give each variable its initializer"
                  + (R.bIsInterface ? ", and set an inherited one in the UE_DEFAULTS of a class that implements it" : "");
+            return false;
+        }
+        if (!R.InputMisplaced.empty())
+        {
+            *Err = R.CppName + ": " + R.InputMisplaced + " marks no method: write it right before the method the input "
+                   "calls, `" + R.InputMisplaced + " void OnInput();`";
+            return false;
+        }
+        /* The binding objects hang off a class of the mod's own (AddInputBindings). */
+        if (!R.InputMarks.empty() && (R.bIsStruct || R.bIsInterface || R.bIsPatch))
+        {
+            const FInputMark& M = R.InputMarks.front();
+            *Err = R.CppName + "::" + M.Method + ": " + InputMarkText(M) + (R.bIsStruct ? " on a UE_STRUCT, which holds no functions"
+                 : R.bIsInterface ? " on a UE_INTERFACE: mark the method in the class that implements it"
+                 : " on a UE_PATCH, which edits its parent's defaults and nothing else: input needs a class of the mod's own");
             return false;
         }
         if (R.UePackage.empty()) continue;
@@ -9816,6 +9876,75 @@ bool FCompiler::IsInlineMethod(const FRecord& R, const std::string& Method) cons
         || (Def != R.MethodDefs.end() && Def->second->value("inline", false));
 }
 
+/* UE_INPUT_KEY / UE_INPUT_ACTION: what the editor's InputKey and InputAction nodes cook, an entry of the class's
+   InputKeyDelegateBinding or InputActionDelegateBinding object. UInputDelegateBinding::BindInputDelegates binds it to the
+   actor's input component by FunctionNameToBind (InputKeyDelegateBinding.cpp 12-45), and the input calls that through
+   ProcessEvent with the key as its one argument (FInputActionHandlerDynamicSignature, InputComponent.h): the marked
+   method is the event itself, where the editor's InpActEvt_ function only jumps into the ubergraph at the node's pin.
+   ProcessEvent copies the callee's ParmsSize bytes out of that argument, so a method taking anything but the key, or
+   returning a value, would be handed the key's bytes as its own. */
+bool FCompiler::AddInputBindings(const FRecord& R, bool bIsActor, FBlueprintClass& BP, std::string* Err) const
+{
+    for (const FInputMark& M : R.InputMarks)
+    {
+        auto Refuse = [&](const std::string& Why) { *Err = R.CppName + "::" + M.Method + ": " + InputMarkText(M) + " " + Why; return false; };
+        if (!bIsActor)
+            return Refuse("on a class that is no actor: only an actor gets input, a pawn while possessed and a player "
+                          "controller always, any other once it enables input");
+        if (IsStaticDecl(*M.Decl)) return Refuse("on a static method: the engine calls it on the actor; drop static");
+        if (IsInlineMethod(R, M.Method))
+            return Refuse("on an inline method, which is expanded where it is called, no function for the input to call; drop inline");
+        if (!CompilesMethod(R, M.Method)) return Refuse("on a method with no body, no function for the input to call");
+        std::string Ret = TypeOf(*M.Decl);
+        Ret = Ret.substr(0, Ret.find('('));
+        while (!Ret.empty() && Ret.back() == ' ') Ret.pop_back();
+        if (Ret != "void") return Refuse("on a method returning " + Ret + ": the engine passes the key alone, with no room for a result; return void");
+        const size_t NumParms = ParmNames(*M.Decl).size();
+        bool bRef = false;
+        const std::string Parm = NumParms == 1 ? ParmTypeOf(*ParmDeclAt(*M.Decl, 0), &bRef) : std::string();
+        if (NumParms > 1 || (NumParms == 1 && (StripTypeKeywords(Parm) != "FKey" || (bRef && Parm.compare(0, 6, "const ") != 0))))
+        {
+            std::string Took;
+            for (size_t I = 0; I < NumParms; ++I) Took += (I ? ", " : "") + TypeOf(*ParmDeclAt(*M.Decl, I));
+            return Refuse("on a method taking (" + Took + "): it takes nothing, or the key that fired it, `FKey Key`");
+        }
+
+        const size_t Bar = std::min(M.Spec.find('|'), M.Spec.size());
+        FBlueprintClass::FInputBinding B;
+        B.bAction = M.bAction;
+        B.Name = M.Spec.substr(0, Bar);
+        B.Function = UeNameOf(&R, M.Method);
+        if (B.Name.empty()) return Refuse(std::string("names no ") + (M.bAction ? "action" : "key"));
+        uint32 Events = 0;                      // bit 0 pressed, bit 1 released: EInputEvent's IE_Pressed, IE_Released
+        const std::string Options = Bar < M.Spec.size() ? M.Spec.substr(Bar + 1) : std::string();
+        for (size_t At = 0, End; At < Options.size(); At = End + 1)
+        {
+            End = std::min(Options.find(',', At), Options.size());
+            std::string O = Options.substr(At, End - At);
+            O.erase(0, std::min(O.find_first_not_of(' '), O.size()));
+            while (!O.empty() && O.back() == ' ') O.pop_back();
+            const bool bModifier = O == "Shift" || O == "Ctrl" || O == "Alt" || O == "Cmd";
+            if (O.empty()) continue;
+            if (O == "Pressed" || O == "Released") Events |= O == "Pressed" ? 1u : 2u;
+            else if (bModifier && M.bAction)
+                return Refuse("takes no " + O + ": an action's keys and their modifiers are the game's input settings'");
+            else if (bModifier) (O == "Shift" ? B.bShift : O == "Ctrl" ? B.bCtrl : O == "Alt" ? B.bAlt : B.bCmd) = true;
+            else if (O == "NoConsume") B.bConsumeInput = false;
+            else if (O == "WhenPaused") B.bExecuteWhenPaused = true;
+            else if (O == "KeepParent") B.bOverrideParentBinding = false;
+            else return Refuse("has an unknown option " + O + ": the options are Pressed, Released, "
+                               + (M.bAction ? "" : "Shift, Ctrl, Alt, Cmd, ") + "NoConsume, WhenPaused and KeepParent");
+        }
+        for (uint8 E = 0; E < 2; ++E)           // one binding per event, as the editor's node makes one per pin it wires
+            if ((Events ? Events : 1u) & (1u << E))
+            {
+                B.Event = E;
+                BP.AddInputBinding(B);
+            }
+    }
+    return true;
+}
+
 /* FName("None") is NAME_None, whatever its case. The editor refuses it as a variable's or a function's name ("Name
    cannot be empty.", FKismetNameValidator::IsValid, Kismet2NameValidators.cpp 135-142), and a tag of that name ends the
    tag list a value is read as (Class.cpp 1326-1329): a UE_STRUCT member's tag in a class default carries its bare
@@ -15316,6 +15445,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                         { *Err = R.CppName + " implements " + Other + " and " + I + ", which both extend " + Mine->CppName; return false; }
         BP.AddInterface(ClassImportOf(*IR, BP));
     }
+    if (!AddInputBindings(R, bIsActor, BP, Err)) return false;
 
     auto LowerParams = [&](const Json& M, const std::string& Fn, std::vector<FPropertyDef>& Params) {
         return this->LowerParams(M, Fn, BP, Params, Err);

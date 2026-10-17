@@ -3923,9 +3923,11 @@ The timers in [Timers and input](#timers-and-input) show delegate values in use.
 ## Timers and input
 
 A timer calls a method of `this` after a delay or at a fixed rate. It is an engine call that takes a delegate value.
-AssetGen has no input events, so a mod polls the player controller for keys, or binds the game's own action
+A key or an input action calls a method marked `UE_INPUT_KEY` or `UE_INPUT_ACTION`, the editor's InputKey and InputAction
+events, once the actor receives input; a mod can also poll the player controller, or bind the game's own action
 dispatchers. The rule to remember: the engine keeps at most one timer per object and method, so setting a timer again
-restarts it. [examples/Beacon.cpp](examples/Beacon.cpp) runs a looping timer.
+restarts it. [examples/Beacon.cpp](examples/Beacon.cpp) runs a looping timer, and
+[examples/HotKeys.cpp](examples/HotKeys.cpp) reacts to keys.
 
 ### Timers
 
@@ -4032,15 +4034,31 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
+| `UE_INPUT_KEY("F5") void Toggle();` | An InputKey event: the engine calls Toggle each time F5 goes down while the actor receives input. The method returns void and takes nothing, or `FKey Key`, the key that fired it. | Yes |
+| `UE_INPUT_KEY("F5", Released)`, `UE_INPUT_KEY("F5", Pressed, Released)` | The key coming up; both edges, a call for each. Pressed alone is the default. These are the node's Pressed and Released pins. | Yes |
+| `UE_INPUT_KEY("S", Ctrl, Shift)` | A chord: the node's Shift, Ctrl, Alt and Cmd tick boxes. The modifiers named must be held. | Yes |
+| `UE_INPUT_ACTION("Use") void Used(FKey Key);` | An InputAction event: the game's Use action, whichever key the player has mapped to it. It takes the same edges and options as a key, but no modifiers. | Yes |
+| `NoConsume`, `WhenPaused`, `KeepParent` | Options, written after the key or action like an edge: the node's Consume Input unticked, Execute when Paused ticked, Override Parent Binding unticked. | Yes |
+| `UE_DEFAULTS { AutoReceiveInput = EAutoReceiveInput::Player0; }` | Auto Receive Input in the class defaults: the actor enables input for the first player as it is spawned. Without it, or a call to `EnableInput(PC)`, an actor's input events never fire. | Yes |
 | `PC->WasInputKeyJustPressed(ToggleKey)` in ReceiveTick | Polls the local player controller. True during the one input frame in which the key went down, so check it every tick. | Yes |
 | `PC->IsInputKeyDown(K)`, `PC->WasInputKeyJustReleased(K)`, `PC->GetInputKeyTimeDown(K)` | True while the key is held; true during the frame in which it comes up; how long it has been held. | Yes |
 | `FKey{"F5"}`, `FKey{FName("F5")}` | A key value, named by the engine's key names. It works as an argument, a local, a class variable and a `static inline const` member. | Yes |
 | `FKey("F5")`, `FKey(FName("F5"))`, `FKey K{FName("F5")};`, `FKey K = {"F5"};` | Refused today: "no Kismet conversion from FString to FKey". Write `FKey{...}` out in full. | Not yet |
 | `PC->WasInputKeyJustPressed("F5")` | clang error: "no viable conversion from 'const char[3]' to 'FKey'". | Refused |
 | `C->OnFirePressed.Add(this, &Toggler::OnFire)` | For the player's own actions, bind the game's dispatchers on APlayerCharacter: OnFirePressed, OnFireReleased, OnJumpPressed, OnSecondaryFirePressed, OnLaserPointerPressed, OnTerrainScannerPressed and others. They fire for whatever key the player has mapped to that action. | Yes |
-| Key events, input-action events, `InputComponent->BindKey(...)` | Not built. AssetGen writes none of the binding objects that the editor's key and InputAction nodes become, and has no syntax for an input event. BindKey and BindAction are native C++ only and absent from the SDK, so clang rejects them: "no member named 'BindKey' in 'UInputComponent'". Poll the player controller or bind the action dispatchers instead. | Not yet |
+| `InputComponent->BindKey(...)`, `BindAction(...)` | clang error: "no member named 'BindKey' in 'UInputComponent'". They are native C++ only and absent from the SDK; mark a method instead. | Refused |
 
 ```cpp
+class Hotkey : public AActor {
+  UE_DEFAULTS { AutoReceiveInput = EAutoReceiveInput::Player0; }
+public:
+  bool bOn = false;
+  FName LastUsed;
+  UE_INPUT_KEY("F5") void Toggle() { bOn = !bOn; }
+  UE_INPUT_KEY("F5", Ctrl) void Off() { bOn = false; }
+  UE_INPUT_ACTION("Use", NoConsume) void Used(FKey Key) { LastUsed = Key.KeyName; }
+};
+
 class Toggler : public AActor {
 public:
   FKey ToggleKey = FKey{"F5"};
@@ -4057,16 +4075,34 @@ public:
 
 Notes:
 
+- A marked method is the event itself. AssetGen writes what the editor writes for the node, an entry of the class's
+  InputKeyDelegateBinding or InputActionDelegateBinding object naming the method, and the engine binds it when the
+  actor's input is enabled and calls the method by name. So a subclass's override of a marked method is what a key
+  calls on the subclass, and a subclass need not repeat its parent's markers: the engine binds each class's events up
+  the chain.
+- Only an actor gets input. A possessed pawn and a player controller bind their events by themselves; any other actor
+  binds them when it enables input, through Auto Receive Input in its defaults or `EnableInput(PC)` from code.
+  `DisableInput(PC)` stops them. A marker on a class that is no actor is refused.
+- The method returns void and takes nothing, or the key as `FKey Key` or `const FKey& Key`. Anything else is refused:
+  the engine hands the method the key's bytes as its parameters, so a parameter of another type, or a result, would
+  read them as its own. A static or inline method is refused too: neither is a function of the object to call.
+- An actor that enables input gets it first, before the player controller and the pawn, and a binding consumes its
+  key by default: the game's own use of F5 stops while the actor has input, and an action consumes the keys mapped to
+  it. Write NoConsume to leave the input to the game as well.
+- A chord masks the plain key: with both `UE_INPUT_KEY("F5")` and `UE_INPUT_KEY("F5", Ctrl)`, Ctrl+F5 calls only the
+  Ctrl one. Without modifiers, a key fires whatever modifiers are held.
+- Override Parent Binding, on unless KeepParent says otherwise, drops the bindings of the same key or action and edge
+  made on the actor's input component before this class's: a parent class's, and on a pawn its native ones, which the
+  pawn binds first (Pawn.cpp 378-386).
 - Name keys by the engine's names: "F5", "LeftShift", "SpaceBar", "LeftMouseButton", "A". The digit keys are "Zero",
-  "One", "Two" and so on, not "1". AssetGen does not check the name: one the engine does not know compiles.
+  "One", "Two" and so on, not "1". AssetGen does not check the name: one the engine does not know compiles, and never
+  fires. An action is one of the game's input settings, unchecked the same way.
 - A class variable such as ToggleKey is written into the class defaults. `FKey ToggleKey = {"F5"};` is refused with
   the default-value message; write `FKey{"F5"}`.
 - Other one-argument struct constructors in parentheses are refused the same way: `FFrameNumber(5)` and
   `FBoneReference(FName("hand_r"))`. The braced forms `FFrameNumber{5}` and `FBoneReference{"hand_r"}` compile. See
   [Structs](#structs).
 - The key state read is the player controller's. A key that an open menu or text box takes may never reach it.
-- `EnableInput(PC)` on its own compiles, as a call to AActor::EnableInput. It gives the actor an input component, but
-  AssetGen binds nothing to it.
 
 ## Interfaces
 
@@ -5462,6 +5498,8 @@ listed here is refused with "unimplemented intrinsic".
 | `UE_ENUM_IN(Enum, Package)` | UE_ENUM for an enum in a shared header: only the source whose UE_MOD_PACKAGE is exactly Package cooks it. | [Enums](#enums) |
 | `UE_ENUM_MAP(Key, Value, Name)`, `UE_ENUM_MAP(Enum)` | A TMap member from each enumerator to its name, or back, filled in at build time: declared by the three-argument form, the default alone by the one-argument form. | [Enums](#enums) |
 | `UE_FINAL_AS(Base, Leaf)` | Declares `class Leaf final : public Base {}`, Base's one subclass: Base is compiled as final and cooked Abstract. | [Classes and variables](#classes-and-variables) |
+| `UE_INPUT_ACTION("Action", Options...)` | Makes the method after it an InputAction event of an actor: the engine calls it on that action of the game's input settings. | [Timers and input](#timers-and-input) |
+| `UE_INPUT_KEY("Key", Options...)` | Makes the method after it an InputKey event of an actor: the engine calls it on that key, pressed by default; the options name the edges, modifiers and the node's other settings. | [Timers and input](#timers-and-input) |
 | `UE_INTERFACE` | Declares a mod interface, cooked as a Blueprint Interface asset. Its variables go to the classes that implement it. | [Interfaces](#interfaces) |
 | `UE_MOD_PACKAGE(Path)` | The /Game folder that a source's classes, structs, enums, interfaces and assets are cooked into. A namespace is a subfolder. | [Mod sources and packages](#mod-sources-and-packages) |
 | `UE_MULTICAST` | Multicast RPC: called on the server, it runs on the server and on every client. | [RPCs](#rpcs) |
@@ -6304,10 +6342,25 @@ its body only outside shipping builds, so the retail game prints nothing. See [O
   makes an FKey. `FKey K = {"F5"};` is refused the same way, and so are other one-argument struct constructors, such as
   `FFrameNumber(5)`. Fix: write the braces out in full, `FKey{"F5"}`, `FFrameNumber{5}`. See
   [Timers and input](#timers-and-input).
-- `no member named 'BindKey' in 'UInputComponent'`: clang's message. Not yet: AssetGen has no key or input-action
-  events, and BindKey and BindAction are native C++ only and absent from the SDK. Fix: poll the player controller in
-  ReceiveTick, `PC->WasInputKeyJustPressed(FKey{"F5"})`, or bind the game's action dispatchers on the player
-  character, such as OnFirePressed. See [Timers and input](#timers-and-input).
+- `no member named 'BindKey' in 'UInputComponent'`: clang's message. BindKey and BindAction are native C++ only and
+  absent from the SDK. Fix: mark the method, `UE_INPUT_KEY("F5") void OnF5();`, or poll the player controller in
+  ReceiveTick. See [Timers and input](#timers-and-input).
+- `<Class>::<Method>: UE_INPUT_KEY("F5") on a class that is no actor`: only an actor gets input. Fix: mark a method
+  of an actor, such as the component's owner, and have it call the component. See [Timers and input](#timers-and-input).
+- `... on a static method`, `... on an inline method`, `... on a method with no body`: the engine calls the marked
+  method on the actor by its name, so it must be a function of the object. Fix: drop `static` or `inline`, or give the
+  method its body. See [Timers and input](#timers-and-input).
+- `... on a method returning <Type>`, `... on a method taking (<Types>)`: the engine hands the method the key and
+  nothing else, and would hand those bytes to any other parameter or result. Fix: return void and take nothing, or
+  `FKey Key`. See [Timers and input](#timers-and-input).
+- `... has an unknown option <Option>`, `UE_INPUT_ACTION("Use", Ctrl) ... takes no Ctrl`: an option the marker does
+  not have (the message lists them), or a modifier on an action, whose keys and modifiers the game's input settings
+  give. See [Timers and input](#timers-and-input).
+- `<Class>: UE_INPUT_KEY("F5") marks no method`: the marker is followed by a variable, another kind of declaration or
+  the end of the class. Fix: write it right before the method the input calls. See [Timers and input](#timers-and-input).
+- `... on a UE_STRUCT`, `... on a UE_INTERFACE`, `... on a UE_PATCH`: input binds to a class of the mod's own. Fix:
+  mark the method in the class that implements the interface; a patch cannot add input to a game class. See
+  [Timers and input](#timers-and-input).
 
 ### Interfaces
 
