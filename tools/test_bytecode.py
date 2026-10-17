@@ -4509,6 +4509,7 @@ def spawn_runs():
     assert len(vm.log) == log, vm.log[log:]
     assert vm.call('OwnClass') == 'SpawnTest_C'
     assert vm.call('OwnClassByMacro') == 'SpawnTest_C'
+    assert vm.call('GearClass') == 'USpawnGear_C'       # named in parts, not the UObject it inherits StaticClass from
     probe = vm.call('MakeProbe')
     assert (probe.cls, probe.vars['args']) == ('USpawnProbe_C', ('USpawnProbe_C', me)), probe.vars
     print('ok  SpawnTest: spawn / construct / add-component calls, their classes and the deferred-set order')

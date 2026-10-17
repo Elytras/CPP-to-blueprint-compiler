@@ -512,10 +512,6 @@ Watch for:
   `FVector`, `FVector2D`, `FRotator`, `FLinearColor`, `FColor` and the `FVector_NetQuantize` types (`FTransform()` is the identity, for one), and
   for a member braces leave out, `Hit = {.Distance = 6.0f};`, unless the parent's `Hit` is a fresh one (declared with
   no initializer). `FVector4()` is written, W 1.
-- `Weapons::Turret::StaticClass()`, for a mod class in a namespace, names the engine class that `Turret` inherits
-  `StaticClass` from, with no message: the qualified form is not built yet. Inside the namespace, write
-  `Turret::StaticClass()`. Where the value goes straight into a `TSubclassOf<Weapons::Turret>`, such as the class
-  argument of `SpawnActor<Weapons::Turret>`, it comes out right.
 
 Full rules: [Components](REFERENCE.md#components), [Class defaults](REFERENCE.md#class-defaults),
 [Creating objects](REFERENCE.md#creating-objects). Example: [examples/Beacon.cpp](examples/Beacon.cpp).
@@ -1915,9 +1911,6 @@ each topic.
 - Two non-inline methods with the same name. A Blueprint class has one function per name: only the overload with the
   most parameters is cooked, and calls to the other are miscompiled. Rename one, or make the extra overloads `inline`.
   See [Functions](REFERENCE.md#functions).
-- `Weapons::Turret::StaticClass()` for a mod class in a namespace. It names the engine class that Turret inherits
-  `StaticClass` from. Write `Turret::StaticClass()` inside the namespace, or let a `TSubclassOf<Weapons::Turret>`
-  parameter, such as SpawnActor's, supply the class. See [Creating objects](REFERENCE.md#creating-objects).
 - A mod widget class. It has no designer layout, so it shows nothing of its own. For visible UI, create one of the
   game's widget Blueprints. See [Classes and variables](REFERENCE.md#classes-and-variables).
 - An RPC, authority-only or cosmetic marker on an `inline` method. The marker is ignored, and the call runs locally.

@@ -6103,13 +6103,35 @@ std::vector<bool> FCompiler::FinalAsSites(const std::string& Base, const std::st
     return Sites;
 }
 
+/* What T has written from Off, the Len-byte token there, up to `::<Name>`: the record's name in as many parts as it is
+   written with (`Weapons::Rifle` before `::StaticClass`). Empty when Name does not follow. */
+static std::string QualifierBefore(const std::string& T, size_t Off, size_t Len, const std::string& Name)
+{
+    if (Off + Len > T.size()) return std::string();
+    auto Ident = [](char C) { return std::isalnum(uint8(C)) || C == '_'; };
+    std::string Qualifier = T.substr(Off, Len);
+    for (size_t P = Off + Len;;)
+    {
+        while (P < T.size() && (T[P] == ' ' || T[P] == '\t')) ++P;
+        if (T.compare(P, 2, "::") != 0) return std::string();
+        P += 2;
+        while (P < T.size() && (T[P] == ' ' || T[P] == '\t')) ++P;
+        size_t End = P;
+        while (End < T.size() && Ident(T[End])) ++End;
+        if (End == P) return std::string();
+        if (End - P == Name.size() && T.compare(P, End - P, Name) == 0) return Qualifier;
+        Qualifier += "::" + T.substr(P, End - P);
+        P = End;
+    }
+}
+
 /* The qualifier token is where a qualified DeclRefExpr's range begins; the JSON gives its byte offset and length but
    not its file (that is only written when it changes, and Json's sorted keys lose the order). So each of the mod's own
-   sources is tried at that offset, and a hit counts only when `<Record>::StaticClass` is what is written there.
+   sources is tried at that offset, and a hit counts only when `<Record>::StaticClass` is what is written there, the
+   record's name in as many parts as it is written with (`Weapons::Rifle::StaticClass()`).
    In a macro (`#define CLS(X) X::StaticClass()`) the range has spelling locations instead: the qualifier where the
    argument is written, StaticClass in the macro's body, which has to be `::StaticClass` then.
-   ponytail: a namespace-qualified `Ns::X::StaticClass()` begins at Ns and falls back to the declaring class; so does
-   a macro defined outside the mod's own sources (a UeApi header). */
+   ponytail: a macro defined outside the mod's own sources (a UeApi header) falls back to the declaring class. */
 const FRecord* FCompiler::NamedQualifier(const Json& Ref) const
 {
     const Json Range = Ref.value("range", Json::object());
@@ -6126,16 +6148,8 @@ const FRecord* FCompiler::NamedQualifier(const Json& Ref) const
     if (End.is_null())
     {
         for (const std::string& T : SourceTexts)
-        {
-            if (Off + Len > T.size()) continue;
-            size_t P = Off + Len;
-            while (P < T.size() && (T[P] == ' ' || T[P] == '\t')) ++P;
-            if (T.compare(P, 2, "::") != 0) continue;
-            P += 2;
-            while (P < T.size() && (T[P] == ' ' || T[P] == '\t')) ++P;
-            if (T.compare(P, 11, "StaticClass") != 0) continue;
-            if (const FRecord* R = Find(T.substr(Off, Len))) return R;
-        }
+            if (const std::string Q = QualifierBefore(T, Off, Len, "StaticClass"); !Q.empty())
+                if (const FRecord* R = Find(Q)) return R;
         return nullptr;
     }
     /* In a macro: its body has `::StaticClass` at End, and the qualifier is the whole identifier at Off. */
@@ -6165,30 +6179,9 @@ const FRecord* FCompiler::MemberQualifier(const Json& Member) const
     if (!Begin.contains("offset") || !Begin.contains("tokLen")) return nullptr;
     const size_t Off = Begin["offset"].get<size_t>(), Len = Begin["tokLen"].get<size_t>();
     const std::string Method = Member.value("name", std::string());
-    auto Ident = [](char C) { return std::isalnum(uint8(C)) || C == '_'; };
     for (const std::string& T : ModSources())
-    {
-        if (Off + Len > T.size()) continue;
-        /* `<Record>::<member>`, the record's name in as many parts as it is written with: `Weapons::Rifle::Pull`. */
-        std::string Qualifier = T.substr(Off, Len);
-        for (size_t P = Off + Len;;)
-        {
-            while (P < T.size() && (T[P] == ' ' || T[P] == '\t')) ++P;
-            if (T.compare(P, 2, "::") != 0) break;
-            P += 2;
-            while (P < T.size() && (T[P] == ' ' || T[P] == '\t')) ++P;
-            size_t End = P;
-            while (End < T.size() && Ident(T[End])) ++End;
-            if (End == P) break;
-            if (T.compare(P, End - P, Method) == 0 && End - P == Method.size())
-            {
-                if (const FRecord* R = Find(Qualifier)) return R;
-                break;
-            }
-            Qualifier += "::" + T.substr(P, End - P);
-            P = End;
-        }
-    }
+        if (const std::string Q = QualifierBefore(T, Off, Len, Method); !Q.empty())
+            if (const FRecord* R = Find(Q)) return R;
     return nullptr;
 }
 

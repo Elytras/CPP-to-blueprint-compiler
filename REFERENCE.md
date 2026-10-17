@@ -3093,7 +3093,7 @@ Notes:
 |---|---|---|
 | `Spawner::StaticClass()`, on one of the mod's own classes | Names that class (`Spawner_C`), as the editor's class picker does, although C++ finds the `StaticClass` of the engine parent. It also works written through a macro in the mod's own source. | Yes |
 | `NewObject<UEnemyContext>(this)` | A helper's default `T::StaticClass()` argument names `T`. | Yes |
-| `Weapons::Rifle::StaticClass()` | Not yet: a namespace-qualified name is not recognised, and the call names the class that `Rifle` inherits `StaticClass` from (`AActor` here; for a child of a game Blueprint, that Blueprint class), with no message. Write `Rifle::StaticClass()` inside the namespace, or, outside it, name the class through an alias: `using RifleT = Weapons::Rifle;`, then `RifleT::StaticClass()`, as [examples/GameBlueprintChild.cpp](examples/GameBlueprintChild.cpp) does. In a `TSubclassOf<Weapons::Rifle>` slot, such as `SpawnActor<Weapons::Rifle>`'s class argument, the result is right, because the slot's type decides. | Not yet |
+| `Weapons::Rifle::StaticClass()` | Names `Rifle_C`: the qualifier is read in as many parts as it is written with. So does an alias, `using RifleT = Weapons::Rifle;` then `RifleT::StaticClass()`, as [examples/GameBlueprintChild.cpp](examples/GameBlueprintChild.cpp) does. | Yes |
 
 ```cpp
 #include "../include/Objects.h"
@@ -3109,18 +3109,15 @@ using RifleT = Weapons::Rifle;
 
 class Armory : public AActor {
 public:
-  UClass *Wrong() { return Weapons::Rifle::StaticClass(); } // AActor: the qualified name is not recognised
+  UClass *Named() { return Weapons::Rifle::StaticClass(); } // Rifle_C
   UClass *ViaAlias() { return RifleT::StaticClass(); }      // Rifle_C
-  Weapons::Rifle *Make(FTransform Where) {
-    return SpawnActor<Weapons::Rifle>(Weapons::Rifle::StaticClass(), Where); // Rifle_C: the slot's type wins
-  }
 };
 ```
 
 Notes:
 
-- A `StaticClass()` call written through a macro that a `UeApi` header defines has the same problem as a qualified
-  name.
+- A `StaticClass()` call written through a macro that a `UeApi` header defines names the engine class that declares
+  `StaticClass`, not the mod's class. Write the call in the mod's own source, or through a macro defined there.
 - `StaticClass()` on engine and game classes, and `GetClass()`, are in [Types](#types).
 
 ### Helpers of your own
