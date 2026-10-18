@@ -10756,7 +10756,8 @@ def input_events():
 def input_refusals():
     """A marker the engine could not honour is refused: one on a class that gets no input, on a method that is no
     function of the object (static, inline), on one returning a value or taking more than the key - ProcessEvent would
-    hand it the key's bytes as its own -, an unknown option, a modifier on an action, and one that marks no method."""
+    hand it the key's bytes as its own -, an unknown option, a modifier on an action, a key the engine has no key of
+    (naming the closest: SpaceBar for Space, One for 1), and one that marks no method."""
     for mod, body, why, base in (
             ('InputNoActor', '  UE_INPUT_KEY("F5") void F() {}\n', 'on a class that is no actor', 'UActorComponent'),
             ('InputStatic', '  UE_INPUT_KEY("F5") static void F() {}\n', 'on a static method', 'AActor'),
@@ -10766,9 +10767,43 @@ def input_refusals():
             ('InputOutKey', '  UE_INPUT_KEY("F5") void F(FKey &Key) {}\n', 'it takes nothing, or the key', 'AActor'),
             ('InputOption', '  UE_INPUT_KEY("F5", Relased) void F() {}\n', 'unknown option Relased', 'AActor'),
             ('InputActionMod', '  UE_INPUT_ACTION("Use", Ctrl) void F() {}\n', 'takes no Ctrl', 'AActor'),
+            ('InputKeyName', '  UE_INPUT_KEY("Space") void F() {}\n', 'never fire: the closest is SpaceBar', 'AActor'),
+            ('InputKeyDigit', '  UE_INPUT_KEY("1") void F() {}\n', 'never fire: the closest is One', 'AActor'),
             ('InputMisplaced', '  UE_INPUT_KEY("F5") int32 N = 0;\n', 'marks no method', 'AActor'),
             ('InputLast', '  void F() {}\n  UE_INPUT_KEY("F5")\n', 'marks no method', 'AActor')):
         refused(mod, body, why, base=base)
+
+
+def input_key_names():
+    """A key is named as the engine names it, case aside (FName's match): EKeys', or an input plugin's DRG ships, its
+    FSDRawInput's GenericUSBController keys among them; or by its character, as a non-US layout names a key it has no
+    name for. Each compiles, as a marker and as an FKey{"..."} literal, and a literal of no key warns, naming the
+    closest. The control is DRG's DefaultInput.ini (with --game): every key it binds compiles but "`", which Windows
+    names Tilde (GenericPlatformInput.cpp's character map), so that console key never matches there either."""
+    keys = ['spacebar', 'GAMEPAD_FACEBUTTON_BOTTOM', 'MouseX', 'Touch10', 'GenericUSBController_Button9', '+', 'æ']
+    ini = os.path.join(GAME, '..', 'Config', 'DefaultInput.ini') if GAME else ''
+    if os.path.exists(ini):
+        text = open(ini, encoding='utf-8-sig').read()
+        bound = set(re.findall(r'\b(?:Key|ButtonKey)=([^,)\s]+)', text)) | set(re.findall(r'(?m)^[+-]ConsoleKeys=(.+?)\s*$', text))
+        assert '`' in bound and len(bound) > 50, sorted(bound)
+        keys += sorted(bound - {'`'})
+        refused('InputKeyTick', '  UE_INPUT_KEY("`") void F() {}\n', 'never fire: the closest is Tilde')
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, 'InputKeyNames.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/InputKeyNames");\n'
+                    'class InputKeyNames : public AActor {\npublic:\n'
+                    '  FKey Typo = FKey{"LeftShfit"};\n  FKey Known = FKey{"leftshift"};\n  FKey Nothing = FKey{""};\n'
+                    '  bool Held(APlayerController *PC) {\n'
+                    '    return PC->IsInputKeyDown(FKey{FName("Ctrl")}) || PC->IsInputKeyDown(FKey{"F5"});\n  }\n'
+                    + ''.join('  UE_INPUT_KEY("%s") void K%d() {}\n' % (k, i) for i, k in enumerate(keys)) + '};\n')
+        code, log = latent_compile_log(src)
+    assert code == 0, log
+    warned = re.findall(r'warning: (\S+): FKey\{"(.*?)"\} names no key the engine has, so no input matches it: '
+                        r'the closest is (\w+)', log)
+    assert sorted(warned) == [('InputKeyNames::Held', 'Ctrl', 'LeftControl'),
+                              ('InputKeyNames::Typo', 'LeftShfit', 'LeftShift')], log
+    return os.path.exists(ini)
 
 
 input_events()
@@ -10776,7 +10811,13 @@ print('ok  InputEvents: UE_INPUT_KEY / UE_INPUT_ACTION list the class\'s own key
       'action, edge, the method, the node\'s options - and each method runs with the key it is handed (and HotKeys)')
 input_refusals()
 print('ok  InputRefusals: a key or action marker on no actor, a static or inline method, one returning a value or taking '
-      'more than the key, an unknown option or an action\'s modifier, or marking no method is refused')
+      'more than the key, an unknown option or an action\'s modifier, a key the engine does not have, or marking no '
+      'method is refused')
+with_ini = input_key_names()
+print('ok  InputKeyNames: a key the engine has compiles whatever its case, a character key too, and its FKey literal '
+      'says nothing; a literal of no key warns, naming the closest; ' + (
+          'every key DRG\'s DefaultInput.ini binds compiles, but "`", refused as Tilde' if with_ini
+          else 'DRG\'s DefaultInput.ini skipped (needs --game)'))
 
 
 # ---- EDITS: invariants on the packages UE_PATCH / UE_ASSET_EDITS produce from the game (invariant_rules/edits.py)

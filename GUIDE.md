@@ -589,7 +589,9 @@ Watch for:
   method compiles and sets no timer. The `{this, &Class::Method}` form is checked. A time of zero or less sets no
   timer.
 - A key event takes its key from the game: while the actor has input, whatever the game does with F5 stops. Add
-  `NoConsume` to share the key. A key or action name the engine does not know compiles and never fires.
+  `NoConsume` to share the key. A key the engine does not have is refused with the closest it has,
+  `UE_INPUT_KEY("Space")` naming SpaceBar, and `FKey{"Space"}` warns the same way. An action is one of the game's
+  input settings, which AssetGen cannot read: a misspelt one compiles and never fires.
 
 Full rules: [Latent calls](REFERENCE.md#latent-calls), [Timers and input](REFERENCE.md#timers-and-input),
 [Waiting on events](REFERENCE.md#waiting-on-events). Examples: [examples/WaitForPlayer.cpp](examples/WaitForPlayer.cpp),

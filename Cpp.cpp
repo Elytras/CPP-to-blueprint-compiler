@@ -658,6 +658,181 @@ static std::string InputMarkText(const FInputMark& M)
          + (Options.empty() ? "" : ", " + Options) + ")";
 }
 
+/* The engine's names of the keys DRG has, FKey::KeyName: UE 4.27's EKeys (InputCoreTypes.cpp 14-430, and Touch1 to
+   Touch10, which its FKeyInitializer names, 217-227), the GenericUSBController keys of FSDRawInput, DRG's copy of the
+   engine's RawInput plugin (RawInput.cpp 15-43), and the OculusInput and SteamVR plugins' own (OculusInput.cpp 20-69,
+   SteamVRControllerKeys.h 36-93). Each is a string of FSD-Win64-Shipping.exe but the letters and the touch keys, and
+   no other plugin's key is. Sorted, case aside. */
+const char* const kKeyNames[] = {
+    "A", "A_AccentGrave", "Acceleration", "Add", "Ampersand", "Android_Back", "Android_Menu", "Android_Volume_Down",
+    "Android_Volume_Up", "AnyKey", "Apostrophe", "Asterix", "B", "Backslash", "BackSpace", "C", "C_Cedille",
+    "CapsLock", "Caret", "Colon", "Comma", "Cosmos_Left_Bumper_Click", "Cosmos_Left_Grip_Axis",
+    "Cosmos_Left_Grip_Click", "Cosmos_Left_Menu_Click", "Cosmos_Left_Thumbstick_Click", "Cosmos_Left_Thumbstick_Down",
+    "Cosmos_Left_Thumbstick_Left", "Cosmos_Left_Thumbstick_Right", "Cosmos_Left_Thumbstick_Touch",
+    "Cosmos_Left_Thumbstick_Up", "Cosmos_Left_Thumbstick_Vector", "Cosmos_Left_Thumbstick_X",
+    "Cosmos_Left_Thumbstick_Y", "Cosmos_Left_Trigger_Axis", "Cosmos_Left_Trigger_Click", "Cosmos_Left_Trigger_Touch",
+    "Cosmos_Left_X_Click", "Cosmos_Left_X_Touch", "Cosmos_Left_Y_Click", "Cosmos_Left_Y_Touch", "Cosmos_Right_A_Click",
+    "Cosmos_Right_A_Touch", "Cosmos_Right_B_Click", "Cosmos_Right_B_Touch", "Cosmos_Right_Bumper_Click",
+    "Cosmos_Right_Grip_Axis", "Cosmos_Right_Grip_Click", "Cosmos_Right_System_Click", "Cosmos_Right_Thumbstick_Click",
+    "Cosmos_Right_Thumbstick_Down", "Cosmos_Right_Thumbstick_Left", "Cosmos_Right_Thumbstick_Right",
+    "Cosmos_Right_Thumbstick_Touch", "Cosmos_Right_Thumbstick_Up", "Cosmos_Right_Thumbstick_Vector",
+    "Cosmos_Right_Thumbstick_X", "Cosmos_Right_Thumbstick_Y", "Cosmos_Right_Trigger_Axis",
+    "Cosmos_Right_Trigger_Click", "Cosmos_Right_Trigger_Touch", "D", "Daydream_Left_Select_Click",
+    "Daydream_Left_Trackpad_Click", "Daydream_Left_Trackpad_Touch", "Daydream_Left_Trackpad_X",
+    "Daydream_Left_Trackpad_Y", "Daydream_Right_Select_Click", "Daydream_Right_Trackpad_Click",
+    "Daydream_Right_Trackpad_Touch", "Daydream_Right_Trackpad_X", "Daydream_Right_Trackpad_Y", "Decimal", "Delete",
+    "Divide", "Dollar", "Down", "E", "E_AccentAigu", "E_AccentGrave", "Eight", "End", "Enter", "Equals", "Escape",
+    "Exclamation", "F", "F1", "F10", "F11", "F12", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "Five", "Four", "G",
+    "Gamepad_DPad_Down", "Gamepad_DPad_Left", "Gamepad_DPad_Right", "Gamepad_DPad_Up", "Gamepad_FaceButton_Bottom",
+    "Gamepad_FaceButton_Left", "Gamepad_FaceButton_Right", "Gamepad_FaceButton_Top", "Gamepad_Left2D",
+    "Gamepad_LeftShoulder", "Gamepad_LeftStick_Down", "Gamepad_LeftStick_Left", "Gamepad_LeftStick_Right",
+    "Gamepad_LeftStick_Up", "Gamepad_LeftThumbstick", "Gamepad_LeftTrigger", "Gamepad_LeftTriggerAxis",
+    "Gamepad_LeftX", "Gamepad_LeftY", "Gamepad_Right2D", "Gamepad_RightShoulder", "Gamepad_RightStick_Down",
+    "Gamepad_RightStick_Left", "Gamepad_RightStick_Right", "Gamepad_RightStick_Up", "Gamepad_RightThumbstick",
+    "Gamepad_RightTrigger", "Gamepad_RightTriggerAxis", "Gamepad_RightX", "Gamepad_RightY", "Gamepad_Special_Left",
+    "Gamepad_Special_Left_X", "Gamepad_Special_Left_Y", "Gamepad_Special_Right", "GenericUSBController_Axis1",
+    "GenericUSBController_Axis2", "GenericUSBController_Axis3", "GenericUSBController_Axis4",
+    "GenericUSBController_Axis5", "GenericUSBController_Axis6", "GenericUSBController_Axis7",
+    "GenericUSBController_Axis8", "GenericUSBController_Button1", "GenericUSBController_Button10",
+    "GenericUSBController_Button11", "GenericUSBController_Button12", "GenericUSBController_Button13",
+    "GenericUSBController_Button14", "GenericUSBController_Button15", "GenericUSBController_Button16",
+    "GenericUSBController_Button17", "GenericUSBController_Button18", "GenericUSBController_Button19",
+    "GenericUSBController_Button2", "GenericUSBController_Button20", "GenericUSBController_Button3",
+    "GenericUSBController_Button4", "GenericUSBController_Button5", "GenericUSBController_Button6",
+    "GenericUSBController_Button7", "GenericUSBController_Button8", "GenericUSBController_Button9", "Gesture_Flick",
+    "Gesture_Pinch", "Gesture_Rotate", "Global_Back", "Global_Menu", "Global_Pause", "Global_Play", "Global_View",
+    "Gravity", "H", "Home", "Hyphen", "I", "Insert", "J", "K", "L", "Left", "LeftAlt", "LeftBracket", "LeftCommand",
+    "LeftControl", "LeftMouseButton", "LeftParantheses", "LeftShift", "M", "MiddleMouseButton",
+    "MixedReality_Left_Grip_Click", "MixedReality_Left_Menu_Click", "MixedReality_Left_Thumbstick_Click",
+    "MixedReality_Left_Thumbstick_Down", "MixedReality_Left_Thumbstick_Left", "MixedReality_Left_Thumbstick_Right",
+    "MixedReality_Left_Thumbstick_Up", "MixedReality_Left_Thumbstick_X", "MixedReality_Left_Thumbstick_Y",
+    "MixedReality_Left_Trackpad_Click", "MixedReality_Left_Trackpad_Down", "MixedReality_Left_Trackpad_Left",
+    "MixedReality_Left_Trackpad_Right", "MixedReality_Left_Trackpad_Touch", "MixedReality_Left_Trackpad_Up",
+    "MixedReality_Left_Trackpad_X", "MixedReality_Left_Trackpad_Y", "MixedReality_Left_Trigger_Axis",
+    "MixedReality_Left_Trigger_Click", "MixedReality_Right_Grip_Click", "MixedReality_Right_Menu_Click",
+    "MixedReality_Right_Thumbstick_Click", "MixedReality_Right_Thumbstick_Down", "MixedReality_Right_Thumbstick_Left",
+    "MixedReality_Right_Thumbstick_Right", "MixedReality_Right_Thumbstick_Up", "MixedReality_Right_Thumbstick_X",
+    "MixedReality_Right_Thumbstick_Y", "MixedReality_Right_Trackpad_Click", "MixedReality_Right_Trackpad_Down",
+    "MixedReality_Right_Trackpad_Left", "MixedReality_Right_Trackpad_Right", "MixedReality_Right_Trackpad_Touch",
+    "MixedReality_Right_Trackpad_Up", "MixedReality_Right_Trackpad_X", "MixedReality_Right_Trackpad_Y",
+    "MixedReality_Right_Trigger_Axis", "MixedReality_Right_Trigger_Click", "Mouse2D", "MouseScrollDown",
+    "MouseScrollUp", "MouseWheelAxis", "MouseX", "MouseY", "Multiply", "N", "Nine", "NumLock", "NumPadEight",
+    "NumPadFive", "NumPadFour", "NumPadNine", "NumPadOne", "NumPadSeven", "NumPadSix", "NumPadThree", "NumPadTwo",
+    "NumPadZero", "O", "OculusHand_Left_IndexPinch", "OculusHand_Left_IndexPinchStrength",
+    "OculusHand_Left_MiddlePinch", "OculusHand_Left_MiddlePinchStrength", "OculusHand_Left_PinkPinch",
+    "OculusHand_Left_PinkPinchStrength", "OculusHand_Left_RingPinch", "OculusHand_Left_RingPinchStrength",
+    "OculusHand_Left_SystemGesture", "OculusHand_Left_ThumbPinch", "OculusHand_Left_ThumbPinchStrength",
+    "OculusHand_Right_IndexPinch", "OculusHand_Right_IndexPinchStrength", "OculusHand_Right_MiddlePinch",
+    "OculusHand_Right_MiddlePinchStrength", "OculusHand_Right_PinkPinch", "OculusHand_Right_PinkPinchStrength",
+    "OculusHand_Right_RingPinch", "OculusHand_Right_RingPinchStrength", "OculusHand_Right_SystemGesture",
+    "OculusHand_Right_ThumbPinch", "OculusHand_Right_ThumbPinchStrength", "OculusRemote_Back",
+    "OculusRemote_DPad_Down", "OculusRemote_DPad_Left", "OculusRemote_DPad_Right", "OculusRemote_DPad_Up",
+    "OculusRemote_Enter", "OculusRemote_Home", "OculusRemote_VolumeDown", "OculusRemote_VolumeUp",
+    "OculusTouch_Left_FaceButton1", "OculusTouch_Left_FaceButton2", "OculusTouch_Left_Grip_Axis",
+    "OculusTouch_Left_Grip_Click", "OculusTouch_Left_IndexPointing", "OculusTouch_Left_Menu_Click",
+    "OculusTouch_Left_Thumbstick", "OculusTouch_Left_Thumbstick_Click", "OculusTouch_Left_Thumbstick_Down",
+    "OculusTouch_Left_Thumbstick_Left", "OculusTouch_Left_Thumbstick_Right", "OculusTouch_Left_Thumbstick_Touch",
+    "OculusTouch_Left_Thumbstick_Up", "OculusTouch_Left_Thumbstick_X", "OculusTouch_Left_Thumbstick_Y",
+    "OculusTouch_Left_ThumbUp", "OculusTouch_Left_Trigger", "OculusTouch_Left_Trigger_Axis",
+    "OculusTouch_Left_Trigger_Click", "OculusTouch_Left_Trigger_Touch", "OculusTouch_Left_X_Click",
+    "OculusTouch_Left_X_Touch", "OculusTouch_Left_Y_Click", "OculusTouch_Left_Y_Touch", "OculusTouch_Right_A_Click",
+    "OculusTouch_Right_A_Touch", "OculusTouch_Right_B_Click", "OculusTouch_Right_B_Touch",
+    "OculusTouch_Right_FaceButton1", "OculusTouch_Right_FaceButton2", "OculusTouch_Right_Grip_Axis",
+    "OculusTouch_Right_Grip_Click", "OculusTouch_Right_IndexPointing", "OculusTouch_Right_System_Click",
+    "OculusTouch_Right_Thumbstick", "OculusTouch_Right_Thumbstick_Click", "OculusTouch_Right_Thumbstick_Down",
+    "OculusTouch_Right_Thumbstick_Left", "OculusTouch_Right_Thumbstick_Right", "OculusTouch_Right_Thumbstick_Touch",
+    "OculusTouch_Right_Thumbstick_Up", "OculusTouch_Right_Thumbstick_X", "OculusTouch_Right_Thumbstick_Y",
+    "OculusTouch_Right_ThumbUp", "OculusTouch_Right_Trigger", "OculusTouch_Right_Trigger_Axis",
+    "OculusTouch_Right_Trigger_Click", "OculusTouch_Right_Trigger_Touch", "One", "P", "PageDown", "PageUp", "Pause",
+    "Period", "PS4_Special", "Q", "Quote", "R", "Right", "RightAlt", "RightBracket", "RightCommand", "RightControl",
+    "RightMouseButton", "RightParantheses", "RightShift", "RotationRate", "S", "ScrollLock", "Section", "Semicolon",
+    "Seven", "Six", "Slash", "SpaceBar", "Steam_Back_Left", "Steam_Back_Right", "Steam_Touch_0", "Steam_Touch_1",
+    "Steam_Touch_2", "Steam_Touch_3", "SteamVR_HMD_Proximity", "SteamVR_MotionController_None", "Subtract", "T", "Tab",
+    "Three", "ThumbMouseButton", "ThumbMouseButton2", "Tilde", "Tilt", "Touch1", "Touch10", "Touch2", "Touch3",
+    "Touch4", "Touch5", "Touch6", "Touch7", "Touch8", "Touch9", "Two", "U", "Underscore", "Up", "V",
+    "ValveIndex_Left_A_Click", "ValveIndex_Left_A_Touch", "ValveIndex_Left_B_Click", "ValveIndex_Left_B_Touch",
+    "ValveIndex_Left_Grip_Axis", "ValveIndex_Left_Grip_Force", "ValveIndex_Left_Grip_Grab",
+    "ValveIndex_Left_Pinch_Grab", "ValveIndex_Left_System_Click", "ValveIndex_Left_System_Touch",
+    "ValveIndex_Left_Thumbstick_Click", "ValveIndex_Left_Thumbstick_Down", "ValveIndex_Left_Thumbstick_Left",
+    "ValveIndex_Left_Thumbstick_Right", "ValveIndex_Left_Thumbstick_Touch", "ValveIndex_Left_Thumbstick_Up",
+    "ValveIndex_Left_Thumbstick_X", "ValveIndex_Left_Thumbstick_Y", "ValveIndex_Left_Trackpad_Down",
+    "ValveIndex_Left_Trackpad_Force", "ValveIndex_Left_Trackpad_Left", "ValveIndex_Left_Trackpad_Right",
+    "ValveIndex_Left_Trackpad_Touch", "ValveIndex_Left_Trackpad_Up", "ValveIndex_Left_Trackpad_X",
+    "ValveIndex_Left_Trackpad_Y", "ValveIndex_Left_Trigger_Axis", "ValveIndex_Left_Trigger_Click",
+    "ValveIndex_Left_Trigger_Touch", "ValveIndex_Right_A_Click", "ValveIndex_Right_A_Touch",
+    "ValveIndex_Right_B_Click", "ValveIndex_Right_B_Touch", "ValveIndex_Right_Grip_Axis",
+    "ValveIndex_Right_Grip_Force", "ValveIndex_Right_Grip_Grab", "ValveIndex_Right_Pinch_Grab",
+    "ValveIndex_Right_System_Click", "ValveIndex_Right_System_Touch", "ValveIndex_Right_Thumbstick_Click",
+    "ValveIndex_Right_Thumbstick_Down", "ValveIndex_Right_Thumbstick_Left", "ValveIndex_Right_Thumbstick_Right",
+    "ValveIndex_Right_Thumbstick_Touch", "ValveIndex_Right_Thumbstick_Up", "ValveIndex_Right_Thumbstick_X",
+    "ValveIndex_Right_Thumbstick_Y", "ValveIndex_Right_Trackpad_Down", "ValveIndex_Right_Trackpad_Force",
+    "ValveIndex_Right_Trackpad_Left", "ValveIndex_Right_Trackpad_Right", "ValveIndex_Right_Trackpad_Touch",
+    "ValveIndex_Right_Trackpad_Up", "ValveIndex_Right_Trackpad_X", "ValveIndex_Right_Trackpad_Y",
+    "ValveIndex_Right_Trigger_Axis", "ValveIndex_Right_Trigger_Click", "ValveIndex_Right_Trigger_Touch",
+    "Vive_Left_Grip_Click", "Vive_Left_Menu_Click", "Vive_Left_System_Click", "Vive_Left_Trackpad_Click",
+    "Vive_Left_Trackpad_Down", "Vive_Left_Trackpad_Left", "Vive_Left_Trackpad_Right", "Vive_Left_Trackpad_Touch",
+    "Vive_Left_Trackpad_Up", "Vive_Left_Trackpad_X", "Vive_Left_Trackpad_Y", "Vive_Left_Trigger_Axis",
+    "Vive_Left_Trigger_Click", "Vive_Right_Grip_Click", "Vive_Right_Menu_Click", "Vive_Right_System_Click",
+    "Vive_Right_Trackpad_Click", "Vive_Right_Trackpad_Down", "Vive_Right_Trackpad_Left", "Vive_Right_Trackpad_Right",
+    "Vive_Right_Trackpad_Touch", "Vive_Right_Trackpad_Up", "Vive_Right_Trackpad_X", "Vive_Right_Trackpad_Y",
+    "Vive_Right_Trigger_Axis", "Vive_Right_Trigger_Click", "W", "X", "Y", "Z", "Zero",
+};
+
+/* The characters FGenericPlatformInput::GetStandardPrintableKeyMap names a key by, digits first, letters aside, which
+   are keys of their own name (GenericPlatformInput.cpp 11-111). The engine reads the key typing one of them as that key
+   (FInputKeyManager::InitKeyMappings), so no key is named by one of these characters. */
+const std::pair<const char*, const char*> kCharKeys[] = {
+    { "0", "Zero" }, { "1", "One" }, { "2", "Two" }, { "3", "Three" }, { "4", "Four" }, { "5", "Five" }, { "6", "Six" },
+    { "7", "Seven" }, { "8", "Eight" }, { "9", "Nine" }, { ";", "Semicolon" }, { "=", "Equals" }, { ",", "Comma" },
+    { "-", "Hyphen" }, { ".", "Period" }, { "/", "Slash" }, { "`", "Tilde" }, { "[", "LeftBracket" },
+    { "\\", "Backslash" }, { "]", "RightBracket" }, { "'", "Apostrophe" }, { " ", "SpaceBar" }, { "&", "Ampersand" },
+    { "*", "Asterix" }, { "^", "Caret" }, { ":", "Colon" }, { "$", "Dollar" }, { "!", "Exclamation" },
+    { "(", "LeftParantheses" }, { ")", "RightParantheses" }, { "\"", "Quote" }, { "_", "Underscore" },
+    { "\xC3\xA0", "A_AccentGrave" }, { "\xC3\xA7", "C_Cedille" }, { "\xC3\xA9", "E_AccentAigu" },
+    { "\xC3\xA8", "E_AccentGrave" }, { "\xC2\xA7", "Section" },
+};
+
+/* "" when the engine has a key of this name, else the key it most likely means. An FName ignores case, and so does
+   the lookup. One character is a key unless kCharKeys names it (`1` is One): Windows names the key that types any
+   other after it, on the player's layout, as it starts (FWindowsPlatformInput::GetKeyMap, WindowsPlatformInput.cpp
+   85-115), "+" on a German one. Otherwise the key meant is the shortest that holds the name's letters in order, its
+   digits spelled out (`Space` is SpaceBar, `Ctrl` LeftControl, `Numpad1` NumPadOne), else the fewest edits away. */
+static std::string MisnamedKey(const std::string& Name)
+{
+    const std::string L = Lower(Name);
+    if (std::any_of(std::begin(kKeyNames), std::end(kKeyNames), [&](const char* K) { return Lower(K) == L; }))
+        return std::string();
+    for (const auto& [Char, Key] : kCharKeys)
+        if (Name == Char) return Key;
+    const uint8 Lead = Name.empty() ? 0 : uint8(Name[0]);      // a UTF-8 sequence's first byte says its length
+    if (Lead > ' ' && Name.size() == (Lead < 0x80 ? 1u : Lead < 0xE0 ? 2u : Lead < 0xF0 ? 3u : 4u))
+        return std::string();
+
+    std::string Spelled;
+    for (const char C : L) Spelled += C >= '0' && C <= '9' ? Lower(kCharKeys[C - '0'].second) : std::string(1, C);
+    std::string Meant;
+    size_t Best = ~size_t(0);
+    for (const char* K : kKeyNames)
+    {
+        const std::string LK = Lower(K);
+        size_t Held = 0;
+        for (const char C : LK)
+            if (Held < Spelled.size() && C == Spelled[Held]) ++Held;
+        std::vector<size_t> Row(LK.size() + 1);    // edits from L to LK's first J letters, a row of L at a time
+        for (size_t J = 0; J <= LK.size(); ++J) Row[J] = J;
+        for (size_t I = 0; I < L.size(); ++I)
+            for (size_t J = 0, Diag = Row[0]++; J < LK.size(); ++J)
+            {
+                const size_t Up = Row[J + 1];
+                Row[J + 1] = std::min({ Up + 1, Row[J] + 1, Diag + size_t(L[I] != LK[J]) });
+                Diag = Up;
+            }
+        const size_t Score = Held == Spelled.size() ? LK.size() : 1000 + Row[LK.size()];
+        if (Score < Best) { Meant = K; Best = Score; }
+    }
+    return Meant;
+}
+
 struct FRecord
 {
     std::string CppName;
@@ -9972,6 +10147,10 @@ bool FCompiler::AddInputBindings(const FRecord& R, bool bIsActor, FBlueprintClas
         B.Name = M.Spec.substr(0, Bar);
         B.Function = UeNameOf(&R, M.Method);
         if (B.Name.empty()) return Refuse(std::string("names no ") + (M.bAction ? "action" : "key"));
+        /* The engine binds the key by its name and says nothing of one it has no key of, so the method would never
+           run. An action is one of the game's input settings, which the compiler cannot read. */
+        if (const std::string Meant = M.bAction ? std::string() : MisnamedKey(B.Name); !Meant.empty())
+            return Refuse("names no key the engine has, so it would never fire: the closest is " + Meant);
         uint32 Events = 0;                      // bit 0 pressed, bit 1 released: EInputEvent's IE_Pressed, IE_Released
         const std::string Options = Bar < M.Spec.size() ? M.Spec.substr(Bar + 1) : std::string();
         for (size_t At = 0, End; At < Options.size(); At = End + 1)
@@ -17714,6 +17893,34 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         if (It != N.end()) for (Json& C : *It) IndexInlines(C);
     };
     IndexInlines(Doc);
+    /* `FKey{"Space"}` names no key, so no input ever matches it. A warning, not a refusal: code may compare it with a
+       key the engine makes up as it runs (FInputKeyManager::GetKeyFromCodes) or another module adds, and FKey{""} is
+       the engine's own "no key". Each literal once, where the source writes it: the classes' methods, members and
+       UE_DEFAULTS, the constants, the inline functions. */
+    std::set<const Json*> KeyLiterals;
+    std::function<void(const Json&, const std::string&)> WarnKeyLiterals = [&](const Json& N, const std::string& Where) {
+        const std::string K = Kind(N);
+        const Json* L = (K == "CXXTemporaryObjectExpr" || K == "CXXConstructExpr" || K == "InitListExpr")
+                            && StripTypeKeywords(TypeOf(N)) == "FKey" ? Strip(First(N)) : nullptr;
+        if (L && Kind(*L) == "StringLiteral" && KeyLiterals.insert(L).second)
+        {
+            const std::string Key = Unquote(L->value("value", std::string())), Meant = MisnamedKey(Key);
+            if (!Meant.empty() && !Key.empty() && Lower(Key) != "none")
+                printf("  warning: %s: FKey{\"%s\"} names no key the engine has, so no input matches it: the closest is "
+                       "%s\n", Where.c_str(), Key.c_str(), Meant.c_str());
+        }
+        ForEach(N, [&](const Json& C) { WarnKeyLiterals(C, Where); });
+    };
+    for (const auto& [Cpp, R] : Records)
+        if (R.IsGenerated() || R.bIsPatch)
+        {
+            for (const Json* M : R.AllMethods) WarnKeyLiterals(*M, Cpp + "::" + Name(*M));
+            for (const auto& [Method, Def] : R.MethodDefs) WarnKeyLiterals(*Def, Cpp + "::" + Method);
+            for (const Json* F : R.Fields) WarnKeyLiterals(*F, Cpp + "::" + Name(*F));
+            if (R.Defaults) WarnKeyLiterals(*R.Defaults, Cpp + "::UE_DEFAULTS");
+        }
+    for (const auto& [Id, Var] : ConstVars) WarnKeyLiterals(*Var, Name(*Var));
+    for (const Json* F : FreeInlineOrder) WarnKeyLiterals(*F, Name(*F));
     /* Before anything reads a type: a raw pointer is an int64 from here on (see IsRawPointer). */
     for (const auto& Entry : Records)
     {

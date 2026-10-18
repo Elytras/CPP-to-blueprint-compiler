@@ -4036,12 +4036,14 @@ Notes:
 | `UE_INPUT_KEY("F5") void Toggle();` | An InputKey event: the engine calls Toggle each time F5 goes down while the actor receives input. The method returns void and takes nothing, or `FKey Key`, the key that fired it. | Yes |
 | `UE_INPUT_KEY("F5", Released)`, `UE_INPUT_KEY("F5", Pressed, Released)` | The key coming up; both edges, a call for each. Pressed alone is the default. These are the node's Pressed and Released pins. | Yes |
 | `UE_INPUT_KEY("S", Ctrl, Shift)` | A chord: the node's Shift, Ctrl, Alt and Cmd tick boxes. The modifiers named must be held. | Yes |
+| `UE_INPUT_KEY("Space") void Jump();` | Refused: "names no key the engine has, so it would never fire: the closest is SpaceBar". The engine binds a key by its name and says nothing of a name it has no key of. | Refused |
 | `UE_INPUT_ACTION("Use") void Used(FKey Key);` | An InputAction event: the game's Use action, whichever key the player has mapped to it. It takes the same edges and options as a key, but no modifiers. | Yes |
 | `NoConsume`, `WhenPaused`, `KeepParent` | Options, written after the key or action like an edge: the node's Consume Input unticked, Execute when Paused ticked, Override Parent Binding unticked. | Yes |
 | `UE_DEFAULTS { AutoReceiveInput = EAutoReceiveInput::Player0; }` | Auto Receive Input in the class defaults: the actor enables input for the first player as it is spawned. Without it, or a call to `EnableInput(PC)`, an actor's input events never fire. | Yes |
 | `PC->WasInputKeyJustPressed(ToggleKey)` in ReceiveTick | Polls the local player controller. True during the one input frame in which the key went down, so check it every tick. | Yes |
 | `PC->IsInputKeyDown(K)`, `PC->WasInputKeyJustReleased(K)`, `PC->GetInputKeyTimeDown(K)` | True while the key is held; true during the frame in which it comes up; how long it has been held. | Yes |
 | `FKey{"F5"}`, `FKey{FName("F5")}` | A key value, named by the engine's key names. It works as an argument, a local, a class variable and a `static inline const` member. | Yes |
+| `FKey{"Space"}` | Compiles, with a warning naming the closest key, SpaceBar: no input matches it. It is not refused, as code may compare it with a key the engine makes up as it runs. | Warns |
 | `FKey("F5")`, `FKey(FName("F5"))`, `FKey K{FName("F5")};`, `FKey K = {"F5"};` | Refused today: "no Kismet conversion from FString to FKey". Write `FKey{...}` out in full. | Not yet |
 | `PC->WasInputKeyJustPressed("F5")` | clang error: "no viable conversion from 'const char[3]' to 'FKey'". | Refused |
 | `C->OnFirePressed.Add(this, &Toggler::OnFire)` | For the player's own actions, bind the game's dispatchers on APlayerCharacter: OnFirePressed, OnFireReleased, OnJumpPressed, OnSecondaryFirePressed, OnLaserPointerPressed, OnTerrainScannerPressed and others. They fire for whatever key the player has mapped to that action. | Yes |
@@ -4093,9 +4095,14 @@ Notes:
 - Override Parent Binding, on unless KeepParent says otherwise, drops the bindings of the same key or action and edge
   made on the actor's input component before this class's: a parent class's, and on a pawn its native ones, which the
   pawn binds first (Pawn.cpp 378-386).
-- Name keys by the engine's names: "F5", "LeftShift", "SpaceBar", "LeftMouseButton", "A". The digit keys are "Zero",
-  "One", "Two" and so on, not "1". AssetGen does not check the name: one the engine does not know compiles, and never
-  fires. An action is one of the game's input settings, unchecked the same way.
+- Name keys by the engine's names: "F5", "LeftShift", "SpaceBar", "LeftMouseButton", "A", "Gamepad_FaceButton_Bottom".
+  The digit keys are "Zero", "One", "Two" and so on, not "1", and the backtick is "Tilde". Case does not matter, as
+  it does not to the engine. A key a keyboard layout has no name for is named by its character, such as "+" or "æ".
+  The names are UE 4.27's and those of the input plugins the game ships: keyboard, mouse, gamepad, touch, Oculus and
+  SteamVR controllers, and FSDRawInput's GenericUSBController keys. A name the engine has no key of is refused on a
+  marker, with the closest it has, and an `FKey{...}` of one warns the same way.
+- An action is one of the game's input settings, which AssetGen cannot read, so its name is not checked: one the game
+  does not have compiles, and never fires.
 - A class variable such as ToggleKey is written into the class defaults. `FKey ToggleKey = {"F5"};` is refused with
   the default-value message; write `FKey{"F5"}`.
 - Other one-argument struct constructors in parentheses are refused the same way: `FFrameNumber(5)` and
@@ -6366,6 +6373,13 @@ so the retail game prints nothing. See [Strings and text](#strings-and-text) and
 - `... has an unknown option <Option>`, `UE_INPUT_ACTION("Use", Ctrl) ... takes no Ctrl`: an option the marker does
   not have (the message lists them), or a modifier on an action, whose keys and modifiers the game's input settings
   give. See [Timers and input](#timers-and-input).
+- `<Class>::<Method>: UE_INPUT_KEY("Space") names no key the engine has, so it would never fire: the closest is
+  SpaceBar`: the engine binds the key by its name, and a name it has no key of matches no input. Fix: write the name
+  the message gives, or another of the engine's key names. See [Timers and input](#timers-and-input).
+- `warning: <Class>::<Function>: FKey{"Space"} names no key the engine has, so no input matches it: the closest is
+  SpaceBar`: the same name in a key value, in a method, a member's initializer (`<Class>::<Member>`), a UE_DEFAULTS or
+  a constant (named alone). It compiles, as code may compare it with a key the engine makes up as it runs. Fix: write
+  the name the message gives. See [Timers and input](#timers-and-input).
 - `<Class>: UE_INPUT_KEY("F5") marks no method`: the marker is followed by a variable, another kind of declaration or
   the end of the class. Fix: write it right before the method the input calls. See [Timers and input](#timers-and-input).
 - `... on a UE_STRUCT`, `... on a UE_INTERFACE`, `... on a UE_PATCH`: input binds to a class of the mod's own. Fix:
