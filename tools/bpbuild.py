@@ -439,9 +439,10 @@ def main():
         # The stamp sits beside FSD, not in it: the pak takes the whole FSD tree.
         settings = mod_settings(mod, config)
         settings_file = os.path.join(bp, "build", name, "mod.json")
+        inputs_time = max(newest(sources), toolchain_time)
         stale = (force or not outputs or api_missing
                  or read_text(settings_file) != settings
-                 or max(newest(sources), toolchain_time) > oldest(outputs)
+                 or inputs_time > oldest(outputs)
                  or any(os.path.getmtime(g) > os.path.getmtime(s) for s, g in edits))
         job = None
         if stale:
@@ -480,11 +481,13 @@ def main():
             if game_dir:
                 cmd += ["--game", game_dir]
             job = pool.submit(run_compile, cmd)
-        entries.append((mod, name, package, stage_fsd, stage_content, stale, job, api_contents, settings_file, settings))
+        entries.append((mod, name, package, stage_fsd, stage_content, stale, job, api_contents, settings_file, settings,
+                        inputs_time))
 
     # The compiles run on the pool while the rest of the mods are prepared; their results are taken in
     # build order, so each mod's output prints whole and the log reads as it did when they ran one by one.
-    for mod, name, package, stage_fsd, stage_content, stale, job, api_contents, settings_file, settings in entries:
+    for (mod, name, package, stage_fsd, stage_content, stale, job, api_contents, settings_file, settings,
+         inputs_time) in entries:
         if job:
             ok, out = job.result()
             sys.stdout.write(out)
@@ -497,8 +500,12 @@ def main():
                     for f in staged_assets(api_contents[0]):
                         shutil.copy2(f, os.path.join(api_dir, os.path.basename(f)))
                 write_api_manifest(api_dir)
-            # Stamped only once it compiled, so a failed compile stays stale.
-            io.open(settings_file, "w", encoding="utf-8", newline="\n").write(settings)
+            # Stamped only once it compiled, so a failed compile stays stale; and only when no source was saved while
+            # it compiled (an editor's save, widgetloop --watch), which the assets, newer than that save, would hide.
+            if max(newest(mod_sources(mod, bp)), toolchain_time) == inputs_time:
+                io.open(settings_file, "w", encoding="utf-8", newline="\n").write(settings)
+            elif os.path.exists(settings_file):
+                os.remove(settings_file)
             print("%-16s compiled -> %s" % (name, package))
             built.append(name)
 
