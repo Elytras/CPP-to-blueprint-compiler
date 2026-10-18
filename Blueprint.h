@@ -26,6 +26,10 @@ public:
     FIndex Subobject(const std::string& ClassPackage, const std::string& ClassName_, FIndex Outer,
                      const std::string& ObjectName);
     FIndex EngineClass(const std::string& PackageName, const std::string& ClassName);
+    /* What a game Blueprint's package exports it as, where that is not a BlueprintGeneratedClass: "<package>.<class>"
+       -> (class package, class name), such as a widget Blueprint's (/Script/UMG, WidgetBlueprintGeneratedClass).
+       EngineClass names it as the import row's class. Null, or a class it does not hold: BlueprintGeneratedClass. */
+    const std::map<std::string, std::pair<std::string, std::string>>* GameClassKinds = nullptr;
     FIndex ScriptStruct(const std::string& PackageName, const std::string& StructName);
     FIndex Enum(const std::string& PackageName, const std::string& EnumName);
     FIndex EngineFunction(const std::string& PackageName, const std::string& OwningClass,

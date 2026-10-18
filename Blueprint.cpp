@@ -56,12 +56,15 @@ FIndex FBlueprintClass::EngineClass(const std::string& PackageName, const std::s
     auto It = ImportCache.find(Key);
     if (It != ImportCache.end()) return Imp(It->second);
 
-    // A /Game class is a BlueprintGeneratedClass, not a Class; the wrong row fails at load, not write.
+    // A /Game class is a BlueprintGeneratedClass or the kind GameClassKinds gives, not a Class; the wrong row fails at
+    // load, not write.
     const bool bBlueprint = PackageName.compare(0, 6, "/Game/") == 0;
+    std::pair<std::string, std::string> Kind = bBlueprint ? std::make_pair(std::string("/Script/Engine"), std::string("BlueprintGeneratedClass"))
+                                                          : std::make_pair(std::string("/Script/CoreUObject"), std::string("Class"));
+    if (bBlueprint && GameClassKinds)
+        if (auto K = GameClassKinds->find(PackageName + "." + ClassName_); K != GameClassKinds->end()) Kind = K->second;
     const FIndex Outer = PackageImport(PackageName);
-    const int32 Row = P.AddImport({ bBlueprint ? "/Script/Engine" : "/Script/CoreUObject",
-                                    bBlueprint ? "BlueprintGeneratedClass" : "Class",
-                                    Outer, ClassName_ });
+    const int32 Row = P.AddImport({ Kind.first, Kind.second, Outer, ClassName_ });
     ImportCache.emplace(Key, Row);
     return Imp(Row);
 }

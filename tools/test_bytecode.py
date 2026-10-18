@@ -9971,6 +9971,46 @@ print('ok  WidgetEventFlags: a widget class\'s Tick and OnPaint flags are on exa
       'itself, as the editor sets them; an inherited one warns, UE_DEFAULTS can only repeat them, a patch\'s added events do')
 
 
+def game_blueprint_kinds():
+    """An import of a game Blueprint class names, as its row's class, the class the game's package exports it as, as the
+    cook writes it: a widget Blueprint's /Script/UMG.WidgetBlueprintGeneratedClass, an anim Blueprint's
+    /Script/Engine.AnimBlueprintGeneratedClass, any other's /Script/Engine.BlueprintGeneratedClass. The cooked loader
+    compares the two names where the package is loaded already, and logs an Error on a mismatch (AsyncLoading.cpp
+    1625-1677). UGkTab's parent is a game widget Blueprint, UGkKid's is UGkTab, which AssetGen cooks as a plain
+    BlueprintGeneratedClass, and GkUser names a widget, an anim and an actor Blueprint in class defaults."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, 'GkKinds.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\n#include "UeApi/UMG.h"\n'
+                    '#include "UeApi/Game/ABP_SpiderHoarder_C.h"\n#include "UeApi/Game/BP_LiftPod_C.h"\n'
+                    '#include "UeApi/Game/UI_KPI_Tab_C.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/GkKinds");\n'
+                    'class UGkTab : public UI_KPI_Tab_C {};\n'
+                    'class UGkKid : public UGkTab {};\n'
+                    'class GkUser : public AActor {\npublic:\n'
+                    '  TSubclassOf<UUserWidget> Tab = UI_KPI_Tab_C::StaticClass();\n'
+                    '  TSubclassOf<UAnimInstance> Anim = ABP_SpiderHoarder_C::StaticClass();\n'
+                    '  TSubclassOf<AActor> Pod = BP_LiftPod_C::StaticClass();\n};\n')
+        out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'GkKinds')
+        os.makedirs(out)
+        proc = assetgen_compile([src, UEAPI, out])
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+
+        def row(cls, name):
+            p, _ = class_pkg(os.path.join(out, cls))
+            return next((im['class_package'], im['class_name']) for im in p.imports if im['name'] == name)
+        widget, plain = ('/Script/UMG', 'WidgetBlueprintGeneratedClass'), ('/Script/Engine', 'BlueprintGeneratedClass')
+        got = {'UGkTab': row('UGkTab', 'UI_KPI_Tab_C'), 'UGkKid': row('UGkKid', 'UGkTab_C'),
+               'Tab': row('GkUser', 'UI_KPI_Tab_C'), 'Anim': row('GkUser', 'ABP_SpiderHoarder_C'),
+               'Pod': row('GkUser', 'BP_LiftPod_C')}
+        assert got == {'UGkTab': widget, 'UGkKid': plain, 'Tab': widget,
+                       'Anim': ('/Script/Engine', 'AnimBlueprintGeneratedClass'), 'Pod': plain}, got
+
+
+game_blueprint_kinds()
+print('ok  GameBlueprintKinds: an import of a game widget or anim Blueprint class names that kind as its class, as the '
+      'cook writes it; a mod\'s own widget class and other game Blueprints stay BlueprintGeneratedClass')
+
+
 def asset_map_dup_keys():
     """A key a map's braces give twice holds the last value given, as TMap's initializer-list constructor Adds each pair
     in order (Map.h 1166-1173). AS_AmdOver's {{"a", 1}, {"a", 2}} over UAmdDef's {a: 2, c: 3} loads {a: 2}, AS_AmdLast's

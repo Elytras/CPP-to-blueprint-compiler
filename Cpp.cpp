@@ -2090,6 +2090,7 @@ private:
     mutable FRecord SynthDeref;
     mutable bool    bSynthDeref = false;
     std::map<std::string, FRecord> Records;
+    std::map<std::string, std::pair<std::string, std::string>> GameClassKinds;   // FBlueprintClass's, filled by Run
     std::map<std::string, std::string> MethodOwner;   // clang decl id -> owning record
     std::map<std::string, std::string> TemplateOwner; // a member template's instantiation's decl id -> its record
     std::map<std::string, std::string> FieldOwner;    // clang decl id -> declaring record
@@ -14007,6 +14008,7 @@ bool FCompiler::GenerateInterface(const FRecord& R, const std::string& OutDir, s
     { *Err = R.CppName + " extends " + R.Base + ", which is not an interface"; return false; }
     const std::string ParentPkg = !Parent ? "/Script/CoreUObject" : PackageOf(*Parent);
     FBlueprintClass BP(P, ClassOf(R), ParentPkg, !Parent ? "Interface" : ClassOf(*Parent), ParentPkg.compare(0, 6, "/Game/") == 0);
+    BP.GameClassKinds = &GameClassKinds;
     BP.SetIsActor(false);
     BP.SetClassFlags(CLASS_Parsed | CLASS_Interface | CLASS_CompiledFromBlueprint);
 
@@ -14072,6 +14074,7 @@ bool FCompiler::GenerateStruct(const FRecord& R, const std::string& OutDir, std:
     FPackage P(PackageName);
     StampIdentity(P, PackageName);
     FBlueprintClass BP(P, ClassOf(R), "", "", false);
+    BP.GameClassKinds = &GameClassKinds;
     if (!RefuseNoneNames(R, Err)) return false;
 
     for (const Json* F : R.Fields)
@@ -14186,6 +14189,7 @@ bool FCompiler::GenerateAsset(const Json& Var, const std::string& OutDir, std::s
     FPackage P(PackageName);
     StampIdentity(P, PackageName);
     FBlueprintClass BP(P, AssetName, "", "", false);
+    BP.GameClassKinds = &GameClassKinds;
     struct FTagsScope { const FBlueprintClass*& In; ~FTagsScope() { In = nullptr; } } TagsScope{ TagsOnlyIn };
     TagsOnlyIn = &BP;
 
@@ -14234,6 +14238,7 @@ bool FCompiler::GenerateEdit(const std::string& Key, const Json& Var, std::strin
     const std::string Object = SplitAssetPath(Package);
     FPackage Scratch(Package);
     FBlueprintClass BP(Scratch, Object, "", "", false);
+    BP.GameClassKinds = &GameClassKinds;
     std::vector<FPropertyDef> Defs;
     /* An explicit zero is written: the asset's own value is what it replaces, not the class default. */
     if (!BracedMembers(*BracedInit(Var), *R, Qual, BP, /*bKeepZero=*/true, Defs, Err)) return false;
@@ -14294,6 +14299,7 @@ bool FCompiler::PatchDefaults(const FRecord& Bp, const Json& Body, const std::st
     while (Engine && PackageOf(*Engine).compare(0, 8, "/Script/") != 0) Engine = Engine->Base.empty() ? nullptr : Find(Engine->Base);
     FPackage Scratch(Package);
     FBlueprintClass BP(Scratch, Class, "", "", false);
+    BP.GameClassKinds = &GameClassKinds;
     std::map<std::string, std::vector<FEditDef>> Objects;          // an export, as ApplyEdit names it -> its assignments
     auto DeclarerOf = [&](const Json& M) {
         const auto Owner = FieldOwner.find(M.value("referencedMemberDecl", std::string()));
@@ -15561,6 +15567,7 @@ bool FCompiler::GenerateNestedWrappers(const std::string& OutDir, std::string* E
             FPackage P(PackageName);
             StampIdentity(P, PackageName);
             FBlueprintClass BP(P, Name, "", "", false);
+            BP.GameClassKinds = &GameClassKinds;
             FPropertyDef PD;
             if (!TypeToProperty(Type, "Value", 0, "nested container " + Type, BP, &PD, Err)) return false;
             PD.PropertyFlags = CPF_Edit | CPF_BlueprintVisible;
@@ -15642,6 +15649,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
        BP_ThornsComponent). */
     const std::string ParentPkg = PackageOf(*B);
     FBlueprintClass BP(P, ClassOf(R), ParentPkg, ClassOf(*B), ParentPkg.compare(0, 6, "/Game/") == 0);
+    BP.GameClassKinds = &GameClassKinds;
     /* A TDelegate's signature function is made in this class while it is built (DelegateSignature), in no other. */
     struct FSigScope { const FBlueprintClass*& In; ~FSigScope() { In = nullptr; } } SigScope{ DelegateSigsIn };
     DelegateSigs.clear();
@@ -18033,6 +18041,31 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
                "name the class's owner where it is declared, e.g. UE_CLASS(\"" + Path.substr(0, Path.rfind('/') + 1) + Leaf
              + "\", \"" + Leaf + "_C\")";
         return false;
+    }
+
+    /* The class each game Blueprint's package exports it as, where that is not a BlueprintGeneratedClass: a widget
+       Blueprint's WidgetBlueprintGeneratedClass, an anim Blueprint's AnimBlueprintGeneratedClass. An import of one names
+       that as its row's class, as the cook writes it (`[V]` the game's 137 widget Blueprints below another and 20 anim
+       Blueprints below another). The cooked loader compares the two names where the package is loaded already, and a
+       mismatch is an Error, the object kept (FAsyncPackage::FindExistingImport, AsyncLoading.cpp 1625-1677). `[V]` Against
+       the dump, 2,110 of the 2,114 header classes below UUserWidget are WidgetBlueprintGeneratedClasses and all 320 below
+       UAnimInstance AnimBlueprintGeneratedClasses.
+       ponytail: decided by ancestry. The other four below UUserWidget are macro libraries, plain BlueprintGeneratedClasses,
+       and so would be a class AssetGen cooked, should a dump hold one: naming one a widget class fails its import, since
+       FindImportFast looks for an object of the row's class (BlueprintSupport.cpp 2321-2332). The dump names every class's
+       own class (GObjects-Dump.txt), for genueapi to carry into the header if such a class is ever referenced. */
+    for (const auto& Entry : Records)
+    {
+        const FRecord& A = Entry.second;
+        if (!A.IsNative() || A.CppName.compare(0, 6, "Game::") != 0 || PackageOf(A).compare(0, 6, "/Game/") != 0) continue;
+        for (const FRecord* Up = &A; Up; Up = Up->Base.empty() ? nullptr : Find(Up->Base))
+            if (Up->UeName == "UserWidget" || Up->UeName == "AnimInstance")
+            {
+                GameClassKinds[PackageOf(A) + "." + ClassOf(A)] =
+                    Up->UeName == "UserWidget" ? std::make_pair(std::string("/Script/UMG"), std::string("WidgetBlueprintGeneratedClass"))
+                                               : std::make_pair(std::string("/Script/Engine"), std::string("AnimBlueprintGeneratedClass"));
+                break;
+            }
     }
 
     int32 Generated = 0;
