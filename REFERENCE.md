@@ -350,7 +350,9 @@ Notes:
 - A latent call such as `Delay` finds its world by itself in an actor, actor component, user widget, game instance or
   subsystem class. In any other class the compiler warns, because the object finds its world only through its Outer.
   See [Latent calls](#latent-calls).
-- The component and widget behaviour above follows from the engine's source. No mod component or widget has run yet.
+- The widget events have run in game: in DRG, a widget's own `Tick` and `OnPaint` run, an inherited one does not,
+  and a `Tick` below a game widget Blueprint without one runs. The component behaviour above follows from the
+  engine's source; no mod component has run yet.
 
 ### Member variables
 
