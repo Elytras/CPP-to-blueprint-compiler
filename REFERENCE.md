@@ -16,7 +16,7 @@ and a compiler message in [Diagnostics](#diagnostics).
 | Code | [Operators](#operators), [Statements and control flow](#statements-and-control-flow), [Loops](#loops), [Locals](#locals), [The optimizer](#the-optimizer) |
 | Functions | [Functions](#functions), [Calling engine and game functions](#calling-engine-and-game-functions), [Overrides and parent calls](#overrides-and-parent-calls), [Inline functions and templates](#inline-functions-and-templates) |
 | Objects | [Components](#components), [Class defaults](#class-defaults), [Creating objects](#creating-objects), [Working with other objects](#working-with-other-objects), [Data assets](#data-assets), [Game assets](#game-assets), [Editing game packages](#editing-game-packages) |
-| Events and waiting | [Event dispatchers](#event-dispatchers), [Latent calls](#latent-calls), [Waiting on events](#waiting-on-events), [Timers and input](#timers-and-input), [Interfaces](#interfaces) |
+| Events and waiting | [Event dispatchers](#event-dispatchers), [Latent calls](#latent-calls), [Waiting on events](#waiting-on-events), [Timers and input](#timers-and-input), [Timelines](#timelines), [Interfaces](#interfaces) |
 | Network | [Replication](#replication), [RPCs](#rpcs) |
 | Low level | [Pointers and memory](#pointers-and-memory), [Intrinsics](#intrinsics) |
 | Lookup | [Macro and intrinsic index](#macro-and-intrinsic-index), [Diagnostics](#diagnostics) |
@@ -4240,6 +4240,87 @@ Notes:
   [Structs](#structs).
 - The key state read is the player controller's. A key that an open menu or text box takes may never reach it.
 
+## Timelines
+
+A timeline plays curves over time, as the editor's Timeline node does. While it plays, the engine writes each track's
+value at the current time into a variable of the actor every frame, then calls the timeline's update method. It calls
+the finished method at the end, and an event track's method each time the timeline passes one of its times. The rule
+to remember: a timeline is a component the engine makes as the actor spawns, so start it from code or with AutoPlay,
+and read its tracks' variables in the update method. [examples/FadingLamp.cpp](examples/FadingLamp.cpp) fades and
+lifts a light.
+
+### Declaring a timeline
+
+| You write | What it does | Status |
+|---|---|---|
+| `UE_TIMELINE(Fade, 2.0f);` | A timeline 2 seconds long: the Timeline node's template. `Fade` is a `UTimelineComponent *` variable. The engine makes the component as the actor spawns, before the construction script and BeginPlay, and stores it there. | Yes |
+| `UE_TIMELINE(Fade, 2.0f, AutoPlay, Loop);` | Options after the length, the template's tick boxes: AutoPlay (plays from the start as the actor spawns), Loop, Replicated (the component replicates its play state), IgnoreTimeDilation, and LastKeyframe (the length is the time of the last key of any track, the editor's Use Last Keyframe). | Yes |
+| `UE_FLOAT_TRACK(Fade, Alpha, (0, 0), (1, 1, Cubic), (2, 0));` | A float track of Fade and its curve. Each key is `(time, value)`, interpolated Linear to the next key unless Cubic or Constant follows the value, as the curve editor's key menu sets it. A Cubic key's tangents are the editor's Auto ones. The macro declares `float Alpha`, which the timeline sets every frame it plays. | Yes |
+| `UE_VECTOR_TRACK(Fade, Lift, (0, 0, 0, 0), (2, 0, 0, 100));` | A vector track: each key is `(time, x, y, z)`. Declares `FVector Lift`. | Yes |
+| `UE_COLOR_TRACK(Fade, Tint, (0, 1, 1, 1, 1), (2, 1, 0, 0, 1));` | A linear color track: each key is `(time, r, g, b, a)`. Declares `FLinearColor Tint`. | Yes |
+| `UE_TIMELINE_UPDATE(Fade) void OnFade();` | The node's Update pin: the engine calls OnFade every frame the timeline plays, after it has written the tracks' variables, and when SetNewTime moves it. | Yes |
+| `UE_TIMELINE_FINISHED(Fade) void OnFaded();` | The Finished pin: called when the timeline reaches its end playing forward, or its start playing in reverse. A looping timeline never finishes. | Yes |
+| `UE_TIMELINE_EVENT(Fade, 0.5, 1.5) void Blink();` | An event track: the engine calls Blink each time the timeline passes 0.5 s and 1.5 s, forward or in reverse. | Yes |
+| A track over a curve asset, the editor's External Curve | Not yet: a track's curve is the keys written in its macro. Hand the timeline a game curve at run time instead, `Fade->SetFloatCurve(Curve, "Alpha")`, with the track named like its variable. | Not yet |
+
+```cpp
+class FadingLamp : public AActor {
+public:
+  UE_COMPONENT(UPointLightComponent, Lamp);
+  UE_TIMELINE(Fade, 2.0f);
+  UE_FLOAT_TRACK(Fade, Brightness, (0, 0), (1, 5000, Cubic), (2, 0));
+  UE_VECTOR_TRACK(Fade, Lift, (0, 0, 0, 0), (2, 0, 0, 100));
+  int32 Peaks = 0, Runs = 0;
+
+  UE_TIMELINE_UPDATE(Fade) void OnFade() {
+    FHitResult Hit;
+    Lamp->SetIntensity(Brightness);
+    Lamp->K2_SetRelativeLocation(Lift, false, Hit, false);
+  }
+  UE_TIMELINE_FINISHED(Fade) void OnFaded() {   // three runs, then it stays dark
+    Runs = Runs + 1;
+    if (Runs < 3) Fade->PlayFromStart();
+  }
+  UE_TIMELINE_EVENT(Fade, 1.0) void Peak() { Peaks = Peaks + 1; }
+  void ReceiveBeginPlay() { Fade->PlayFromStart(); }
+};
+```
+
+### Playing a timeline
+
+The node's input pins are functions of the component, called on the timeline's variable.
+
+| You write | What it does | Status |
+|---|---|---|
+| `Fade->Play()` | Play: plays forward from where the timeline is. | Yes |
+| `Fade->PlayFromStart()` | Play from Start: back to time 0, then forward. | Yes |
+| `Fade->Reverse()`, `Fade->ReverseFromEnd()` | Reverse from where it is; or from the end. | Yes |
+| `Fade->Stop()` | Stop: halts it where it is. Play goes on from there. | Yes |
+| `Fade->SetNewTime(1.0f)` | Set New Time: moves it to 1 s without passing the event tracks' times, and calls the update method. | Yes |
+| `Fade->SetPlayRate(2.0f)`, `Fade->SetLooping(true)`, `Fade->SetTimelineLength(3.0f)` | The component's settings, changed as it runs. | Yes |
+| `Fade->GetPlaybackPosition()`, `Fade->IsPlaying()`, `Fade->IsReversing()` | Where it is and how it plays. IsReversing is the node's Direction output: true while it plays backward. | Yes |
+
+Notes:
+
+- AssetGen writes what the editor compiles the node into: a TimelineTemplate in the class's Timelines list, a curve
+  object per track (CurveFloat, CurveVector or CurveLinearColor, a CurveFloat of event keys for an event track), the
+  timeline's variable and one per track, and the direction variable the engine writes as it plays
+  (`Fade__Direction_<guid>`). The engine makes the component from the template as each actor spawns
+  (UBlueprintGeneratedClass::CreateTimelineComponent) and binds the marked methods by name.
+- The editor makes a stub event function for each pin that jumps into the event graph. A marked method is the event
+  itself, so a subclass's override of it is what the timeline calls on the subclass. A pin with no method marked calls
+  nothing.
+- The marked methods return void and take nothing: the engine calls them through a delegate with no parameters. One
+  method may serve several timelines and event tracks.
+- Only an actor has timelines, and only a class of the mod's own: the engine makes them from the actor's class while
+  it spawns. A subclass gets its parent's timelines as well, and may declare its own.
+- The track's variable is an ordinary variable between frames: code may read it anywhere, and the timeline overwrites
+  what code writes to it the next frame it plays.
+- The length is where the timeline stops, or wraps when it loops, whatever the keys say. A key past the end is never
+  reached, and a track holds its last key's value after it. Keys are sorted by time, as the editor sorts them.
+- A key's time and values are numbers, written as C++ literals: `1`, `0.5`, `-2.5f`. AssetGen reads them itself, so
+  a constant's name or an expression is refused.
+
 ## Interfaces
 
 An interface is a set of functions that unrelated classes implement. This section covers holding an object through an
@@ -5635,6 +5716,7 @@ listed here is refused with "unimplemented intrinsic".
 | `UE_CATEGORY__JOIN`, `UE_CATEGORY__JOIN2` | Internal to UE_CATEGORY. Not written in a mod. | [Classes and variables](#classes-and-variables) |
 | `UE_CLASS(Package, UeName)` | The package and UE name of a class. In a shared header it names the one source that cooks the class, the one whose UE_MOD_PACKAGE, namespaces and class name give exactly that path; every other source imports it. The SDK declares each engine and game class with it. | [Mod sources and packages](#mod-sources-and-packages) |
 | `UE_CLIENT` | Run on owning Client RPC: called on the server, it runs on the client that owns the actor. | [RPCs](#rpcs) |
+| `UE_COLOR_TRACK(Timeline, Name, Keys...)` | A linear color track of a UE_TIMELINE: declares `FLinearColor Name`, which the timeline sets each frame it plays, and its curve, keys `(time, r, g, b, a)`. | [Timelines](#timelines) |
 | `UE_COMPONENT(Type, Name)` | A component of a mod actor, of an engine or game component class, as added in the Components panel. The first scene component is the root. | [Components](#components) |
 | `UE_COSMETIC` | Cosmetic (BlueprintCosmetic): on an actor or its component, and for an engine or game static with this mark, a call on a dedicated server is skipped. | [RPCs](#rpcs) |
 | `UE_DEFAULTS { ... }` | Defaults of components and of inherited properties, as the Details panel and Class Defaults set them. Read at build time, never run. | [Class defaults](#class-defaults) |
@@ -5643,6 +5725,7 @@ listed here is refused with "unimplemented intrinsic".
 | `UE_ENUM_IN(Enum, Package)` | UE_ENUM for an enum in a shared header: only the source whose UE_MOD_PACKAGE is exactly Package cooks it. | [Enums](#enums) |
 | `UE_ENUM_MAP(Key, Value, Name)`, `UE_ENUM_MAP(Enum)` | A TMap member from each enumerator to its name, or back, filled in at build time: declared by the three-argument form, the default alone by the one-argument form. | [Enums](#enums) |
 | `UE_FINAL_AS(Base, Leaf)` | Declares `class Leaf final : public Base {}`, Base's one subclass: Base is compiled as final and cooked Abstract. | [Classes and variables](#classes-and-variables) |
+| `UE_FLOAT_TRACK(Timeline, Name, Keys...)` | A float track of a UE_TIMELINE: declares `float Name`, which the timeline sets each frame it plays, and its curve, keys `(time, value)` with an optional Cubic or Constant. | [Timelines](#timelines) |
 | `UE_INPUT_ACTION("Action", Options...)` | Makes the method after it an InputAction event of an actor: the engine calls it on that action of the game's input settings. | [Timers and input](#timers-and-input) |
 | `UE_INPUT_KEY("Key", Options...)` | Makes the method after it an InputKey event of an actor: the engine calls it on that key, pressed by default; the options name the edges, modifiers and the node's other settings. | [Timers and input](#timers-and-input) |
 | `UE_INTERFACE` | Declares a mod interface, cooked as a Blueprint Interface asset. Its variables go to the classes that implement it. | [Interfaces](#interfaces) |
@@ -5660,6 +5743,11 @@ listed here is refused with "unimplemented intrinsic".
 | `UE_REPLICATED_USING_IF(Type, Name, OnRep, Cond)` | RepNotify and a replication condition on one variable. | [Replication](#replication) |
 | `UE_SERVER` | Run on Server RPC: called on the owning client, it runs on the server. | [RPCs](#rpcs) |
 | `UE_STRUCT` | Cooks a struct as a UserDefinedStruct (a Structure asset). | [Structs](#structs) |
+| `UE_TIMELINE(Name, Length, Options...)` | A Timeline of a mod actor: declares `UTimelineComponent *Name`, the component the engine makes from the template as the actor spawns. The options are the template's AutoPlay, Loop, Replicated, IgnoreTimeDilation and LastKeyframe. | [Timelines](#timelines) |
+| `UE_TIMELINE_EVENT(Timeline, Times...)` | Makes the method after it an event track of the timeline: called each time the timeline passes one of the times. | [Timelines](#timelines) |
+| `UE_TIMELINE_FINISHED(Timeline)` | Makes the method after it the timeline's Finished pin: called when it reaches its end, or its start in reverse. | [Timelines](#timelines) |
+| `UE_TIMELINE_UPDATE(Timeline)` | Makes the method after it the timeline's Update pin: called each frame it plays, after its tracks are written. | [Timelines](#timelines) |
+| `UE_VECTOR_TRACK(Timeline, Name, Keys...)` | A vector track of a UE_TIMELINE: declares `FVector Name`, which the timeline sets each frame it plays, and its curve, keys `(time, x, y, z)`. | [Timelines](#timelines) |
 | `UE_CLASS_IN(ModPackage)` | UE_CLASS for a mod's own class, named by its owner's UE_MOD_PACKAGE: the package is ModPackage plus namespaces plus the class name, the UE name the class name plus `_C`. | [Mod sources and packages](#mod-sources-and-packages) |
 | `UE_STRUCT_IN(Package)` | UE_STRUCT for a struct in a shared header: only the source whose UE_MOD_PACKAGE is exactly Package cooks it. | [Structs](#structs) |
 | `UeAssets::<Class>::All` | Every game asset of that class, as soft pointers. | [Game assets](#game-assets) |
@@ -6567,6 +6655,30 @@ so the retail game prints nothing. See [Strings and text](#strings-and-text) and
 - `... on a UE_STRUCT`, `... on a UE_INTERFACE`, `... on a UE_PATCH`: input binds to a class of the mod's own. Fix:
   mark the method in the class that implements the interface; a patch cannot add input to a game class. See
   [Timers and input](#timers-and-input).
+
+- `<Class>::<Timeline>: UE_TIMELINE on a class that is no actor`: the engine makes a timeline's component from the
+  actor's class as the actor spawns, and no other object has one. `... on a UE_STRUCT`, `... on a UE_INTERFACE`,
+  `... on a UE_PATCH` likewise. Fix: declare it on an actor class of the mod's own. See [Timelines](#timelines).
+- `<Class>::<Timeline>: UE_TIMELINE(Fade, <Length>) has a length that is not a number of seconds above 0`, `... has an
+  unknown option <Option>`: the length is a number literal, `2.0f`, and the options are AutoPlay, Loop, Replicated,
+  IgnoreTimeDilation and LastKeyframe. See [Timelines](#timelines).
+- `<Class>::<Name>: UE_FLOAT_TRACK names <Timeline>, which is no UE_TIMELINE of the class`, and the same for the other
+  tracks and the method markers: the timeline is declared with UE_TIMELINE in the same class, and a subclass cannot add
+  tracks to its parent's. Fix: name one of the class's own timelines, or declare one. See [Timelines](#timelines).
+- `<Class>::<Name>: UE_FLOAT_TRACK has no keys`, `... has the key <Key>, which is not (time, value) of number
+  literals`, and `(time, x, y, z)` or `(time, r, g, b, a)` for a vector or color track: each key is a parenthesised
+  list of number literals, with Cubic or Constant after the values for a key that is not Linear. See
+  [Timelines](#timelines).
+- `<Class>::<Method>: UE_TIMELINE_EVENT(Fade) has no times`, `... has the time <Text>, which is not a number literal`:
+  list the times after the timeline, `UE_TIMELINE_EVENT(Fade, 0.5, 1.5)`. See [Timelines](#timelines).
+- `<Class>::<Method>: UE_TIMELINE_UPDATE(Fade) on a static method`, `... on an inline method`, `... on a method with
+  no body`, `... on a method returning <Type>`, `... on a method taking (<Types>)`: the engine calls the method by its
+  name on the actor, with nothing, and takes nothing back. Fix: a method of the object that returns void and takes
+  nothing. See [Timelines](#timelines).
+- `<Class>::<Method>: UE_TIMELINE_UPDATE(Fade) marks a second method of Fade, after <Other>: a timeline calls one`: a
+  timeline calls one update method and one finished method. Fix: call the second from the first. See [Timelines](#timelines).
+- `<Class>: UE_TIMELINE_UPDATE(Fade) marks no method`: the marker is followed by a variable, another kind of
+  declaration or the end of the class. Fix: write it right before the method. See [Timelines](#timelines).
 
 ### Interfaces
 

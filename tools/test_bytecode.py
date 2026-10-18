@@ -10984,6 +10984,169 @@ print('ok  InputKeyNames: a key the engine has compiles whatever its case, a cha
           else 'DRG\'s DefaultInput.ini skipped (needs --game)'))
 
 
+# ---- TIMELINES: UE_TIMELINE, its tracks and its methods (Timelines.cpp, the FadingLamp example)
+
+def curve_channels(p, i):
+    """A curve export's channels as the engine reads them: UCurveFloat's FloatCurve, UCurveVector's FloatCurves[3] and
+    UCurveLinearColor's FloatCurves[4] by ArrayIndex, each its FRichCurve's keys as FRichCurveKey::Serialize reads them
+    (RichCurve.cpp 160-180): (interp mode, time, value, arrive tangent, leave tangent), the weights left out, which no
+    timeline key sets."""
+    out = {}
+    for t in p.tags(i):
+        if t['type'] != 'StructProperty' or t['struct'] != 'RichCurve': continue
+        keys = next(k for k in p.tags(i, t['at']) if k['name'] == 'Keys')
+        v, at, got = keys['value'], 4 + 49, []                 # past the count and the inner tag
+        for _ in range(struct.unpack_from('<i', v)[0]):
+            interp, tangent_mode, weight_mode = v[at], v[at + 1], v[at + 2]
+            time, value, arrive, arrive_w, leave, leave_w = struct.unpack_from('<6f', v, at + 3)
+            assert (tangent_mode, weight_mode, arrive_w, leave_w) == (0, 0, 0.0, 0.0), (p.base, i)   # Auto, unweighted
+            got.append((('Linear', 'Constant', 'Cubic')[interp], time, value, arrive, leave))
+            at += 27
+        assert at == len(v), (p.base, i)
+        out[t['index']] = got
+    return [out[k] for k in sorted(out)]
+
+
+def timelines_of(base):
+    """A class's timelines as UBlueprintGeneratedClass::CreateTimelineComponent reads them: each entry of its Timelines
+    list, a subobject of the class, by VariableName - the template's tags (tag_values), each track list as
+    {track name: (the curve's class, its channels)} with the track struct's other fields, and whether the curve is the
+    class's own subobject. {} for a class with none."""
+    p, ci = class_pkg(base)
+    t = p.tag(ci, 'Timelines')
+    out = {}
+    for ref in (struct.unpack_from('<%di' % struct.unpack_from('<i', t['value'])[0], t['value'], 4) if t else ()):
+        assert ref > 0 and p.exports[ref - 1]['outer'] == ci + 1 and p.class_of(ref) == 'TimelineTemplate', (base, p.path(ref))
+        i = ref - 1
+        vals = {}
+        for tag in p.tags(i):
+            if tag['type'] == 'ArrayProperty' and tag['inner'] == 'StructProperty':
+                at, tracks = tag['at'] + 4 + 49, {}
+                for _ in range(struct.unpack_from('<i', tag['value'])[0]):
+                    tl = p.tags(i, at)
+                    entry, curve = {}, None
+                    for f in tl:
+                        if f['type'] == 'ObjectProperty':
+                            c = struct.unpack('<i', f['value'])[0]
+                            assert c > 0 and p.exports[c - 1]['outer'] == ci + 1, (base, p.path(c))
+                            curve = (f['name'], p.class_of(c), curve_channels(p, c - 1), p.tag(c - 1, 'bIsEventCurve') is not None)
+                        else:
+                            entry.update(tag_values(p, i, [f]))
+                    name = entry.pop('TrackName')       # before the copy: an assignment's value is evaluated first
+                    tracks[name] = dict(entry, Curve=curve)
+                    at = tl.end
+                vals[tag['name']] = tracks
+            elif tag['name'] == 'TimelineGuid':
+                vals['TimelineGuid'] = '%08X%08X%08X%08X' % struct.unpack('<4I', tag['value'])
+            else:
+                vals.update(tag_values(p, i, [tag]))
+        assert p.exports[i]['name'] == vals['VariableName'] + '_Template', (base, p.exports[i]['name'])
+        out[vals.pop('VariableName')] = vals
+    return out
+
+
+def timelines():
+    """UE_TIMELINE cooks what the editor's Timeline node does: a TimelineTemplate in the class's Timelines with the
+    length and options set (5 seconds and none left out, as the engine's defaults), a curve per track - a CurveFloat,
+    CurveVector or CurveLinearColor, and an event curve for an event track - each the class's own, its keys sorted by
+    time with the editor's Auto tangents on a cubic key; each track naming the variable it sets, and the template naming
+    the update and finished methods and the direction variable. The class has the timeline's component variable, the
+    tracks' and the direction one with the editor's flags. A subclass lists its own timelines only; the methods run."""
+    folder = os.path.dirname(asset('Timelines'))
+    base, child, plain = (os.path.join(folder, n) for n in ('Timelines', 'TimelinesChild', 'TimelinesPlain'))
+    got = timelines_of(base)
+    fade, pulse = got.pop('Fade'), got.pop('Pulse')
+    assert got == {}, got
+    channel = lambda *keys: [list(keys)]
+    assert fade['FloatTracks'] == {'Alpha': dict(PropertyName='Alpha', bIsExternalCurve=False, Curve=('CurveFloat', 'CurveFloat',
+        channel(('Linear', 0.0, 0.0, 0.0, 0.0), ('Cubic', 1.0, 1.0, 2.0, 2.0), ('Linear', 2.0, 4.0, 0.0, 0.0)), False))}, fade['FloatTracks']
+    lift = fade['VectorTracks']['Lift']['Curve']
+    assert lift[:2] == ('CurveVector', 'CurveVector') and lift[2] == [
+        [('Constant', 0.0, c0, 0.0, 0.0), ('Linear', 2.0, c2, 0.0, 0.0)] for c0, c2 in ((1.0, 0.0), (2.0, 0.0), (3.0, 100.0))], lift
+    tint = fade['LinearColorTracks']['Tint']['Curve']
+    assert tint[:2] == ('CurveLinearColor', 'CurveLinearColor') and tint[2] == [
+        [('Linear', 0.0, a, 0.0, 0.0), ('Linear', 1.5, b, 0.0, 0.0)] for a, b in ((1.0, 1.0), (1.0, 0.0), (1.0, 0.0), (1.0, 0.5))], tint
+    assert fade['EventTracks'] == {'Blink': dict(FunctionName='Blink', bIsExternalCurve=False, Curve=('CurveKeys', 'CurveFloat',
+        channel(('Linear', 0.5, 0.0, 0.0, 0.0), ('Linear', 1.5, 0.0, 0.0, 0.0)), True))}, fade['EventTracks']
+    assert {k: fade[k] for k in fade if not k.endswith('Tracks')} == dict(
+        TimelineLength=2.0, TimelineGuid=fade['TimelineGuid'], DirectionPropertyName='Fade__Direction_' + fade['TimelineGuid'],
+        UpdateFunctionName='OnFade', FinishedFunctionName='OnFaded'), fade
+    assert pulse['FloatTracks']['Beat']['Curve'][2] == channel(('Cubic', 0.0, 1.0, -4.0, -4.0), ('Linear', 0.25, 0.0, 0.0, 0.0))
+    assert {k: pulse[k] for k in pulse if k != 'FloatTracks'} == dict(
+        LengthMode='TL_LastKeyFrame', bAutoPlay=True, bLoop=True, bReplicated=True, bIgnoreTimeDilation=True,
+        TimelineGuid=pulse['TimelineGuid'], DirectionPropertyName='Pulse__Direction_' + pulse['TimelineGuid']), pulse
+    assert fade['TimelineGuid'] != pulse['TimelineGuid']
+
+    p, ci = class_pkg(base)
+    props = {q.name: q for q in p.struct(ci).props}
+    for tl in (fade, pulse):
+        d = props[tl['DirectionPropertyName']]
+        assert (d.type, d.flags, p.path(d.ref)) == ('ByteProperty', 0, '/Script/Engine.ETimelineDirection'), (d, p.path(d.ref))
+    for name in ('Fade', 'Pulse'):
+        assert (props[name].type, props[name].flags, p.path(props[name].ref)) == (
+            'ObjectProperty', 0x80004, '/Script/Engine.TimelineComponent'), name    # BlueprintVisible | InstancedReference
+    assert [(props[n].type, props[n].flags) for n in ('Alpha', 'Lift', 'Tint', 'Beat')] == [
+        ('FloatProperty', 0), ('StructProperty', 0), ('StructProperty', 0), ('FloatProperty', 0)]
+
+    kid = timelines_of(child)
+    assert list(kid) == ['Spin'] and kid['Spin']['UpdateFunctionName'] == 'OnSpin' and 'FinishedFunctionName' not in kid['Spin'], kid
+    assert timelines_of(plain) == {}
+    lamp = os.path.join(ROOT, 'FadingLamp', 'FSD', 'Content', '_AssetGenExamples', 'FadingLamp', 'FadingLamp')
+    assert os.path.exists(lamp + '.uasset'), 'the examples are not built under ' + ROOT
+    lit = timelines_of(lamp)
+    assert list(lit) == ['Fade'] and (lit['Fade']['UpdateFunctionName'], lit['Fade']['FinishedFunctionName']) == ('OnFade', 'OnFaded'), lit
+    for b in (base, child, plain, lamp):
+        keeps_invariants(b)
+
+    fields = {'Updates': 2, 'Alpha': 0.75, 'Seen': 0.0}
+    run(base, 'OnFade', self_vars=fields)
+    assert fields == {'Updates': 3, 'Alpha': 0.75, 'Seen': 0.75}, fields
+    fields = {'Updates': 2}
+    run(child, 'OnFade', self_vars=fields)          # what the parent's template binds by name, on a child
+    assert fields == {'Updates': 102}, fields
+    fields = {'Blinks': 1}
+    run(base, 'Blink', self_vars=fields)
+    assert fields == {'Blinks': 2}, fields
+
+
+def timeline_refusals():
+    """What the engine could not honour is refused: a timeline on a class that is no actor, a length or option it does
+    not have, a track or method naming no timeline of the class, a key that is not the track's shape, a track with no
+    keys or an event with no times, a method that is no function of the object or takes or returns anything, a second
+    update method, and a marker that marks no method."""
+    for mod, body, why, base in (
+            ('TlNoActor', '  UE_TIMELINE(T, 1);\n', 'UE_TIMELINE on a class that is no actor', 'UActorComponent'),
+            ('TlLength', '  UE_TIMELINE(T, 0);\n', 'has a length that is not a number of seconds above 0', 'AActor'),
+            ('TlLengthName', '  static constexpr float L = 1;\n  UE_TIMELINE(T, L);\n', 'has a length that is not', 'AActor'),
+            ('TlOption', '  UE_TIMELINE(T, 1, Looping);\n', 'unknown option Looping', 'AActor'),
+            ('TlTrackOf', '  UE_TIMELINE(T, 1);\n  UE_FLOAT_TRACK(U, A, (0, 0));\n', 'names U, which is no UE_TIMELINE', 'AActor'),
+            ('TlKeyShape', '  UE_TIMELINE(T, 1);\n  UE_VECTOR_TRACK(T, A, (0, 1, 2));\n', 'which is not (time, x, y, z)', 'AActor'),
+            ('TlKeyMode', '  UE_TIMELINE(T, 1);\n  UE_FLOAT_TRACK(T, A, (0, 0, Smooth));\n', 'which is not (time, value)', 'AActor'),
+            ('TlNoKeys', '  UE_TIMELINE(T, 1);\n  UE_FLOAT_TRACK(T, A);\n', 'UE_FLOAT_TRACK has no keys', 'AActor'),
+            ('TlNoTimes', '  UE_TIMELINE(T, 1);\n  UE_TIMELINE_EVENT(T) void F() {}\n', 'has no times', 'AActor'),
+            ('TlTime', '  UE_TIMELINE(T, 1);\n  UE_TIMELINE_EVENT(T, half) void F() {}\n', 'the time half', 'AActor'),
+            ('TlMarkOf', '  UE_TIMELINE(T, 1);\n  UE_TIMELINE_UPDATE(U) void F() {}\n', 'names U, which is no UE_TIMELINE', 'AActor'),
+            ('TlStatic', '  UE_TIMELINE(T, 1);\n  UE_TIMELINE_UPDATE(T) static void F() {}\n', 'on a static method', 'AActor'),
+            ('TlInline', '  UE_TIMELINE(T, 1);\n  UE_TIMELINE_UPDATE(T) inline void F() {}\n', 'on an inline method', 'AActor'),
+            ('TlReturn', '  UE_TIMELINE(T, 1);\n  UE_TIMELINE_FINISHED(T) int32 F() { return 1; }\n', 'return void', 'AActor'),
+            ('TlParms', '  UE_TIMELINE(T, 1);\n  UE_TIMELINE_UPDATE(T) void F(float X) {}\n', 'so it takes nothing', 'AActor'),
+            ('TlSecond', '  UE_TIMELINE(T, 1);\n  UE_TIMELINE_UPDATE(T) void F() {}\n  UE_TIMELINE_UPDATE(T) void G() {}\n',
+             'marks a second method of T, after F', 'AActor'),
+            ('TlMisplaced', '  UE_TIMELINE(T, 1);\n  UE_TIMELINE_UPDATE(T) int32 N = 0;\n', 'marks no method', 'AActor'),
+            ('TlLast', '  UE_TIMELINE(T, 1);\n  void F() {}\n  UE_TIMELINE_FINISHED(T)\n', 'marks no method', 'AActor')):
+        refused(mod, body, why, base=base)
+
+
+timelines()
+print('ok  Timelines: UE_TIMELINE cooks the template - length, options, the methods by name, the direction variable - '
+      'and a curve per track with its keys sorted and the editor\'s Auto tangents, the component, track and direction '
+      'variables with the editor\'s flags; a subclass lists its own; the methods run (and FadingLamp)')
+timeline_refusals()
+print('ok  TimelineRefusals: a timeline on no actor, a bad length or option, a track or method of no timeline, a key '
+      'of the wrong shape, no keys or times, a method that is no function of the object or takes or returns anything, '
+      'a second update method, or marking no method is refused')
+
+
 # ---- EDITS: invariants on the packages UE_PATCH / UE_ASSET_EDITS produce from the game (invariant_rules/edits.py)
 # sweep() never reaches those, so each check here runs invariants.py's rules on them itself. A game package's own findings
 # are not the edit's: for those only what the edit adds counts. The mods are inline, as edits()'s are: an S38 mod

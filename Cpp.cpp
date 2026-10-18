@@ -685,6 +685,24 @@ static std::string InputMarkText(const FInputMark& M)
          + (Options.empty() ? "" : ", " + Options) + ")";
 }
 
+/* UE_TIMELINE_UPDATE / UE_TIMELINE_FINISHED / UE_TIMELINE_EVENT on the method that follows it: the timeline, then an
+   event track's times, as `<timeline>|<times>` (UeMeta.h). Kind is 'U', 'F' or 'E'. */
+struct FTimelineMark
+{
+    std::string Method;
+    const Json* Decl = nullptr;
+    char Kind = 'U';
+    std::string Spec;
+};
+
+static std::string TimelineMarkText(const FTimelineMark& M)
+{
+    const size_t Bar = std::min(M.Spec.find('|'), M.Spec.size());
+    const std::string Times = Bar < M.Spec.size() ? M.Spec.substr(Bar + 1) : std::string();
+    return std::string(M.Kind == 'U' ? "UE_TIMELINE_UPDATE" : M.Kind == 'F' ? "UE_TIMELINE_FINISHED" : "UE_TIMELINE_EVENT")
+         + "(" + M.Spec.substr(0, Bar) + (Times.empty() ? "" : ", " + Times) + ")";
+}
+
 /* The engine's names of the keys DRG has, FKey::KeyName: UE 4.27's EKeys (InputCoreTypes.cpp 14-430, and Touch1 to
    Touch10, which its FKeyInitializer names, 217-227), the GenericUSBController keys of FSDRawInput, DRG's copy of the
    engine's RawInput plugin (RawInput.cpp 15-43), and the OculusInput and SteamVR plugins' own (OculusInput.cpp 20-69,
@@ -897,7 +915,11 @@ struct FRecord
     std::set<std::string> Forwarders;               // Methods AssetGen declared, not the source: see SynthesizeForwarders
     std::vector<FInputMark> InputMarks;             // UE_INPUT_KEY / UE_INPUT_ACTION, in the order written
     std::string InputMisplaced;                     // the first of them no method follows, as written
-    const Json* Defaults = nullptr;                 // UE_DEFAULTS: the static-init block, never lowered
+    std::map<std::string, std::string> Timelines;   // `<X>__UeTimeline`: UE_TIMELINE's variable -> "<length>|<options>"
+    std::vector<std::pair<std::string, std::string>> Tracks;    // `<X>__UeTrack`: a track's variable -> "<timeline>|<keys>"
+    std::vector<FTimelineMark> TimelineMarks;       // UE_TIMELINE_UPDATE / _FINISHED / _EVENT, in the order written
+    std::string TimelineMisplaced;                  // the first of them no method follows, as written
+    const Json* Defaults = nullptr;                // UE_DEFAULTS: the static-init block, never lowered
     bool bFinal = false;        // `class X final`: X has no subclass
     bool bFinalAsLeaf = false;  // UE_FINAL_AS's leaf: its base's one subclass
     std::string FinalAs;        // UE_FINAL_AS(this, Leaf): Leaf's CppName - compiled as final, cooked Abstract
@@ -1649,6 +1671,7 @@ private:
        `inline` may sit on the declaration or on an out-of-line definition. */
     bool IsInlineMethod(const FRecord& R, const std::string& Method) const;
     bool AddInputBindings(const FRecord& R, bool bIsActor, FBlueprintClass& BP, std::string* Err) const;
+    bool AddTimelines(const FRecord& R, bool bIsActor, FBlueprintClass& BP, std::string* Err) const;
     bool CheckMemberNames(const FRecord& R, std::string* Err) const;
     bool IsSceneRecord(const FRecord* C) const;
     bool RootInheritedBy(const FRecord& R) const;
@@ -2804,6 +2827,7 @@ bool FCompiler::Collect(std::string* Err)
         uint32 Access = N.value("tagUsed", std::string()) == "struct" ? FUNC_Public : FUNC_Private;
         std::string Category;       // UE_CATEGORY is positional, like an access specifier
         std::vector<FInputMark> PendingInput;   // UE_INPUT_KEY / UE_INPUT_ACTION mark the member that follows them
+        std::vector<FTimelineMark> PendingTimeline;     // and so do UE_TIMELINE_UPDATE / _FINISHED / _EVENT
         std::function<void(const Json&)> Member = [&](const Json& C) {
             /* genueapi puts a class's markers in a private `struct UeMarkers` at its bottom, out of IntelliSense's
                member list: they are the class's own. */
@@ -2820,18 +2844,27 @@ bool FCompiler::Collect(std::string* Err)
                 PendingInput.push_back(M);
                 return;
             }
-            if (!PendingInput.empty() && !C.value("isImplicit", false))
+            if (Kind(C) == "VarDecl" && (Name(C).compare(0, 18, "UeTimelineUpdate__") == 0
+                                         || Name(C).compare(0, 20, "UeTimelineFinished__") == 0
+                                         || Name(C).compare(0, 17, "UeTimelineEvent__") == 0))
             {
-                if (Kind(C) == "CXXMethodDecl" && C.contains("name") && Name(C) != "UeDefaults__")
-                    for (FInputMark& M : PendingInput)
-                    {
-                        M.Method = Name(C);
-                        M.Decl = &C;
-                        R.InputMarks.push_back(M);
-                    }
-                else if (R.InputMisplaced.empty())
-                    R.InputMisplaced = InputMarkText(PendingInput.front());
+                FTimelineMark M;
+                M.Kind = Name(C)[10];
+                FindLiteral(C, M.Spec);
+                PendingTimeline.push_back(M);
+                return;
+            }
+            if ((!PendingInput.empty() || !PendingTimeline.empty()) && !C.value("isImplicit", false))
+            {
+                const bool bMethod = Kind(C) == "CXXMethodDecl" && C.contains("name") && Name(C) != "UeDefaults__";
+                for (FInputMark& M : PendingInput)
+                    if (bMethod) { M.Method = Name(C); M.Decl = &C; R.InputMarks.push_back(M); }
+                    else if (R.InputMisplaced.empty()) R.InputMisplaced = InputMarkText(M);
+                for (FTimelineMark& M : PendingTimeline)
+                    if (bMethod) { M.Method = Name(C); M.Decl = &C; R.TimelineMarks.push_back(M); }
+                    else if (R.TimelineMisplaced.empty()) R.TimelineMisplaced = TimelineMarkText(M);
                 PendingInput.clear();
+                PendingTimeline.clear();
             }
             if (Kind(C) == "VarDecl" && Name(C).compare(0, 12, "UeCategory__") == 0)
             {
@@ -2957,6 +2990,18 @@ bool FCompiler::Collect(std::string* Err)
             {
                 R.Components.insert(Name(C).substr(0, Name(C).size() - 13));
             }
+            else if (Kind(C) == "VarDecl" && Name(C).size() > 12 && Name(C).compare(Name(C).size() - 12, 12, "__UeTimeline") == 0)
+            {
+                std::string Spec;
+                FindLiteral(C, Spec);
+                R.Timelines[Name(C).substr(0, Name(C).size() - 12)] = Spec;
+            }
+            else if (Kind(C) == "VarDecl" && Name(C).size() > 9 && Name(C).compare(Name(C).size() - 9, 9, "__UeTrack") == 0)
+            {
+                std::string Spec;
+                FindLiteral(C, Spec);
+                R.Tracks.emplace_back(Name(C).substr(0, Name(C).size() - 9), Spec);
+            }
             else if (Kind(C) == "CXXMethodDecl" && Name(C) == "UeDefaults__")
             {
                 /* Not a UFunction: AssetGen reads its assignments as defaults, never lowers them. */
@@ -2995,6 +3040,7 @@ bool FCompiler::Collect(std::string* Err)
         };
         ForEach(N, Member);
         if (!PendingInput.empty() && R.InputMisplaced.empty()) R.InputMisplaced = InputMarkText(PendingInput.front());
+        if (!PendingTimeline.empty() && R.TimelineMisplaced.empty()) R.TimelineMisplaced = TimelineMarkText(PendingTimeline.front());
         /* A set is looked up in Replicated by the name it is cooked under, so the marker's C++ key follows. */
         for (const auto& N2 : R.UeNames)
             if (auto Rep = R.Replicated.find(N2.first); Rep != R.Replicated.end())
@@ -3198,6 +3244,23 @@ bool FCompiler::Collect(std::string* Err)
             *Err = R.CppName + "::" + M.Method + ": " + InputMarkText(M) + (R.bIsStruct ? " on a UE_STRUCT, which holds no functions"
                  : R.bIsInterface ? " on a UE_INTERFACE: mark the method in the class that implements it"
                  : " on a UE_PATCH, which edits its parent's defaults and nothing else: input needs a class of the mod's own");
+            return false;
+        }
+        if (!R.TimelineMisplaced.empty())
+        {
+            *Err = R.CppName + ": " + R.TimelineMisplaced + " marks no method: write it right before the method the "
+                   "timeline calls, `" + R.TimelineMisplaced + " void OnFade();`";
+            return false;
+        }
+        /* The templates hang off a class of the mod's own (AddTimelines). */
+        if ((!R.Timelines.empty() || !R.Tracks.empty() || !R.TimelineMarks.empty()) && (R.bIsStruct || R.bIsInterface || R.bIsPatch))
+        {
+            const std::string What = !R.Timelines.empty() ? R.Timelines.begin()->first + ": UE_TIMELINE"
+                                   : !R.Tracks.empty() ? R.Tracks.front().first + ": a timeline track"
+                                   : R.TimelineMarks.front().Method + ": " + TimelineMarkText(R.TimelineMarks.front());
+            *Err = R.CppName + "::" + What + (R.bIsStruct ? " on a UE_STRUCT, which holds no functions"
+                 : R.bIsInterface ? " on a UE_INTERFACE: declare it in the class that implements it"
+                 : " on a UE_PATCH, which edits its parent's defaults and nothing else: a timeline needs a class of the mod's own");
             return false;
         }
         if (R.UePackage.empty()) continue;
@@ -10307,6 +10370,160 @@ bool FCompiler::AddInputBindings(const FRecord& R, bool bIsActor, FBlueprintClas
     return true;
 }
 
+/* A number literal as a timeline macro stringizes it: `2`, `0.5`, `-1.5f`. */
+static bool TimelineNumber(std::string S, float& Out)
+{
+    S.erase(0, std::min(S.find_first_not_of(' '), S.size()));
+    while (!S.empty() && S.back() == ' ') S.pop_back();
+    if (!S.empty() && (S.back() == 'f' || S.back() == 'F')) S.pop_back();
+    if (S.empty()) return false;
+    char* End = nullptr;
+    Out = strtof(S.c_str(), &End);
+    return End == S.c_str() + S.size() && std::isfinite(Out);
+}
+
+/* A comma list as the macros stringize it, each item trimmed; a comma inside parentheses stays in its item. */
+static std::vector<std::string> TimelineItems(const std::string& S)
+{
+    std::vector<std::string> Out;
+    std::string Item;
+    int32 Depth = 0;
+    for (const char C : S + ",")
+    {
+        Depth += C == '(' ? 1 : C == ')' ? -1 : 0;
+        if (C != ',' || Depth > 0) { Item += C; continue; }
+        Item.erase(0, std::min(Item.find_first_not_of(' '), Item.size()));
+        while (!Item.empty() && Item.back() == ' ') Item.pop_back();
+        if (!Item.empty()) Out.push_back(Item);
+        Item.clear();
+    }
+    return Out;
+}
+
+/* UE_TIMELINE and its tracks and methods: what the editor's Timeline node compiles to, a TimelineTemplate of the class
+   with a curve per track, from which UBlueprintGeneratedClass::CreateTimelineComponent makes the actor's
+   UTimelineComponent as it spawns (BlueprintGeneratedClass.cpp 1077-1195): it stores the component in the timeline's
+   variable, sets each track's variable by name every frame it plays (FTimeline::SetPlaybackPosition), and binds the
+   update, finished and event-track functions by name through FOnTimelineEvent, a delegate of no parameters. The marked
+   method is the event itself, where the editor's __UpdateFunc stub only jumps into the ubergraph at the node's pin. */
+bool FCompiler::AddTimelines(const FRecord& R, bool bIsActor, FBlueprintClass& BP, std::string* Err) const
+{
+    std::map<std::string, FBlueprintClass::FTimeline> Timelines;
+    for (const auto& [Name_, Spec] : R.Timelines)
+    {
+        auto Refuse = [&](const std::string& Why) { *Err = R.CppName + "::" + Name_ + ": UE_TIMELINE" + Why; return false; };
+        if (!bIsActor)
+            return Refuse(" on a class that is no actor: the engine makes a timeline's component from the actor's class as "
+                          "the actor spawns, and no other object has one");
+        const size_t Bar = std::min(Spec.find('|'), Spec.size());
+        FBlueprintClass::FTimeline T;
+        T.Name = Name_;
+        T.DirectionProperty = Name_ + "__Direction_" + TimelineGuid(ClassOf(R), Name_, T.Guid);
+        if (!TimelineNumber(Spec.substr(0, Bar), T.Length) || T.Length <= 0.0f)
+            return Refuse("(" + Name_ + ", " + Spec.substr(0, Bar) + ") has a length that is not a number of seconds above 0");
+        for (const std::string& O : TimelineItems(Bar < Spec.size() ? Spec.substr(Bar + 1) : std::string()))
+            if (O == "AutoPlay") T.bAutoPlay = true;
+            else if (O == "Loop") T.bLoop = true;
+            else if (O == "Replicated") T.bReplicated = true;
+            else if (O == "IgnoreTimeDilation") T.bIgnoreTimeDilation = true;
+            else if (O == "LastKeyframe") T.bLastKeyframe = true;
+            else return Refuse("(" + Name_ + ") has an unknown option " + O + ": the options are AutoPlay, Loop, Replicated, "
+                               "IgnoreTimeDilation and LastKeyframe");
+        Timelines.emplace(Name_, T);
+    }
+
+    for (const auto& [Field, Spec] : R.Tracks)
+    {
+        const auto F = std::find_if(R.Fields.begin(), R.Fields.end(), [&](const Json* D) { return Name(*D) == Field; });
+        const std::string Type = F == R.Fields.end() ? std::string() : StripTypeKeywords(TypeOf(**F));
+        const char Kind = Type == "FVector" ? 'V' : Type == "FLinearColor" ? 'C' : 'F';
+        const char* const Macro = Kind == 'V' ? "UE_VECTOR_TRACK" : Kind == 'C' ? "UE_COLOR_TRACK" : "UE_FLOAT_TRACK";
+        const char* const Shape = Kind == 'V' ? "(time, x, y, z)" : Kind == 'C' ? "(time, r, g, b, a)" : "(time, value)";
+        const int32 Channels = Kind == 'V' ? 3 : Kind == 'C' ? 4 : 1;
+        auto Refuse = [&](const std::string& Why) { *Err = R.CppName + "::" + Field + ": " + Macro + " " + Why; return false; };
+        const size_t Bar = std::min(Spec.find('|'), Spec.size());
+        const auto T = Timelines.find(Spec.substr(0, Bar));
+        if (T == Timelines.end())
+            return Refuse("names " + Spec.substr(0, Bar) + ", which is no UE_TIMELINE of the class");
+        FBlueprintClass::FTimelineTrack Track;
+        Track.Kind = Kind;
+        Track.Name = Field;
+        for (std::string Key : TimelineItems(Bar < Spec.size() ? Spec.substr(Bar + 1) : std::string()))
+        {
+            std::vector<std::string> Parts;
+            if (Key.size() >= 2 && Key.front() == '(' && Key.back() == ')') Parts = TimelineItems(Key.substr(1, Key.size() - 2));
+            FBlueprintClass::FTimelineKey K;
+            if (!Parts.empty() && (Parts.back() == "Linear" || Parts.back() == "Constant" || Parts.back() == "Cubic"))
+            {
+                K.Interp = Parts.back() == "Linear" ? 0 : Parts.back() == "Constant" ? 1 : 2;
+                Parts.pop_back();
+            }
+            bool bOk = int32(Parts.size()) == 1 + Channels;
+            for (int32 I = 0; bOk && I <= Channels; ++I)
+                bOk = TimelineNumber(Parts[size_t(I)], I == 0 ? K.Time : K.Values[I - 1]);
+            if (!bOk)
+                return Refuse(std::string("has the key ") + Key + ", which is not " + Shape + " of number literals, with Cubic or "
+                              "Constant after the values for a key that is not Linear");
+            Track.Keys.push_back(K);
+        }
+        if (Track.Keys.empty()) return Refuse("has no keys: write them after the name, " + std::string(Shape) + ", ...");
+        /* The curve editor keeps a curve's keys sorted by time (FRichCurve::AddKey), and the engine evaluates them so. */
+        std::stable_sort(Track.Keys.begin(), Track.Keys.end(), [](const auto& A, const auto& B) { return A.Time < B.Time; });
+        T->second.Tracks.push_back(Track);
+    }
+
+    for (const FTimelineMark& M : R.TimelineMarks)
+    {
+        auto Refuse = [&](const std::string& Why) { *Err = R.CppName + "::" + M.Method + ": " + TimelineMarkText(M) + " " + Why; return false; };
+        const size_t Bar = std::min(M.Spec.find('|'), M.Spec.size());
+        const auto T = Timelines.find(M.Spec.substr(0, Bar));
+        if (T == Timelines.end()) return Refuse("names " + M.Spec.substr(0, Bar) + ", which is no UE_TIMELINE of the class");
+        if (IsStaticDecl(*M.Decl)) return Refuse("on a static method: the engine calls it on the actor; drop static");
+        if (IsInlineMethod(R, M.Method))
+            return Refuse("on an inline method, which is expanded where it is called, no function for the timeline to call; drop inline");
+        if (!CompilesMethod(R, M.Method)) return Refuse("on a method with no body, no function for the timeline to call");
+        std::string Ret = TypeOf(*M.Decl);
+        Ret = Ret.substr(0, Ret.find('('));
+        while (!Ret.empty() && Ret.back() == ' ') Ret.pop_back();
+        if (Ret != "void") return Refuse("on a method returning " + Ret + ": the engine calls it with nothing and takes nothing back; return void");
+        if (const size_t NumParms = ParmNames(*M.Decl).size(); NumParms > 0)
+        {
+            std::string Took;
+            for (size_t I = 0; I < NumParms; ++I) Took += (I ? ", " : "") + TypeOf(*ParmDeclAt(*M.Decl, I));
+            return Refuse("on a method taking (" + Took + "): the engine calls it with nothing, so it takes nothing");
+        }
+        const std::string Function = UeNameOf(&R, M.Method);
+        if (M.Kind == 'E')
+        {
+            FBlueprintClass::FTimelineTrack Track;
+            Track.Kind = 'E';
+            Track.Name = Function;
+            for (const std::string& Time : TimelineItems(Bar < M.Spec.size() ? M.Spec.substr(Bar + 1) : std::string()))
+            {
+                FBlueprintClass::FTimelineKey K;
+                if (!TimelineNumber(Time, K.Time)) return Refuse("has the time " + Time + ", which is not a number literal");
+                Track.Keys.push_back(K);
+            }
+            if (Track.Keys.empty()) return Refuse("has no times: list them after the timeline, `UE_TIMELINE_EVENT(" + T->first + ", 0.5, 1.5)`");
+            /* The track's name is the method's, so a method marked twice on one timeline would be two tracks of one name. */
+            for (const auto& Other : T->second.Tracks)
+                if (Lower(Other.Name) == Lower(Track.Name))
+                    return Refuse("marks a track named like another of " + T->first + "'s: list every time in one marker");
+            std::stable_sort(Track.Keys.begin(), Track.Keys.end(), [](const auto& A, const auto& B) { return A.Time < B.Time; });
+            T->second.Tracks.push_back(Track);
+            continue;
+        }
+        std::string& Pin = M.Kind == 'U' ? T->second.Update : T->second.Finished;
+        if (!Pin.empty()) return Refuse("marks a second method of " + T->first + ", after " + Pin + ": a timeline calls one");
+        Pin = Function;
+    }
+
+    /* In declaration order, as the editor lists its timelines in the order they were added. */
+    for (const Json* F : R.Fields)
+        if (auto T = Timelines.find(Name(*F)); T != Timelines.end()) BP.AddTimeline(T->second);
+    return true;
+}
+
 /* FName("None") is NAME_None, whatever its case. The editor refuses it as a variable's or a function's name ("Name
    cannot be empty.", FKismetNameValidator::IsValid, Kismet2NameValidators.cpp 135-142), and a tag of that name ends the
    tag list a value is read as (Class.cpp 1326-1329): a UE_STRUCT member's tag in a class default carries its bare
@@ -15933,6 +16150,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         BP.AddInterface(ClassImportOf(*IR, BP));
     }
     if (!AddInputBindings(R, bIsActor, BP, Err)) return false;
+    if (!AddTimelines(R, bIsActor, BP, Err)) return false;
 
     auto LowerParams = [&](const Json& M, const std::string& Fn, std::vector<FPropertyDef>& Params) {
         return this->LowerParams(M, Fn, BP, Params, Err);
@@ -16374,6 +16592,12 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
            looks at it (KismetCompiler.cpp 2521-2529). */
         FlagInstancing(TypeOf(*F), PD);
         if (PD.PropertyFlags & (CPF_InstancedReference | CPF_ContainsInstancedReference)) BP.AddClassFlags(CLASS_HasInstancedReference);
+        /* A timeline's variable and its tracks' have the editor's flags (KismetCompiler.cpp 818-870, measured on
+           BP_Refinery_LandingZone_C): the component's BlueprintVisible and instanced, a track's none. */
+        if (&Decl == &R && R.Timelines.count(FieldName))
+            PD.PropertyFlags = CPF_BlueprintVisible | (PD.PropertyFlags & CPF_InstancedReference);
+        else if (&Decl == &R && std::any_of(R.Tracks.begin(), R.Tracks.end(), [&](const auto& T) { return T.first == FieldName; }))
+            PD.PropertyFlags = 0;
         PD.bApiHidden = Decl.PrivateFields.count(Name(*F)) != 0;
         if (auto Cat = Decl.Categories.find(Name(*F)); Cat != Decl.Categories.end()) BP.ApiCategory[PD.Name] = Cat->second;
         if (&Decl == &R && R.Components.count(FieldName))
@@ -16450,6 +16674,18 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             bReplicatesAnything = true;
         }
         AddVariable(TypeOf(*F), PD);
+    }
+    /* Each timeline's direction variable, which the engine sets as it plays (FTimeline::SetPlaybackPosition), and
+       without which it logs that it found none on every frame: the editor's ByteProperty over ETimelineDirection. */
+    for (const auto& Timeline : R.Timelines)
+    {
+        uint32 Guid[4];
+        FPropertyDef PD = ByteParam(Timeline.first + "__Direction_" + TimelineGuid(ClassOf(R), Timeline.first, Guid));
+        PD.PropertyFlags = 0;
+        PD.Extra = BP.Enum("/Script/Engine", "ETimelineDirection");
+        PD.StructName = "ETimelineDirection";
+        PD.bApiHidden = true;
+        AddVariable("uint8", PD);
     }
     /* Where the SCS lists its DefaultSceneRoot node, the class has a variable of that name, as the editor gives every node
        it lists one (KismetCompiler.cpp 884-898; ENE_EnemySpawner's DefaultSceneRoot, BlueprintVisible | NonTransactional

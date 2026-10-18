@@ -52,7 +52,7 @@ private:
 /* One FPropertyTag + value. Value runs into a scratch archive first so the tag's Size is measured.
    StructName is the tag's type-specific name: the struct, the enum, a container's inner type ("Key,Value" for a map). */
 void Tag(FArc& Ar, const std::string& Name, const std::string& Type,
-         const std::function<void(FArc&)>& Value, const std::string& StructName = "");
+         const std::function<void(FArc&)>& Value, const std::string& StructName = "", int32 ArrayIndex = 0);
 
 /* A bool's value lives in the tag (BoolVal) with zero payload; writing one via Tag() loads as false. */
 void TagBool(FArc& Ar, const std::string& Name, bool Value);

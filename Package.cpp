@@ -200,7 +200,7 @@ static std::string TagId(const std::string& Type)
 }
 
 void Tag(FArc& Ar, const std::string& Name, const std::string& Type,
-         const std::function<void(FArc&)>& Value, const std::string& StructName)
+         const std::function<void(FArc&)>& Value, const std::string& StructName, int32 ArrayIndex)
 {
     FArc Scratch(Ar.Owner());
     Value(Scratch);
@@ -208,7 +208,7 @@ void Tag(FArc& Ar, const std::string& Name, const std::string& Type,
     Ar.Name(Name);
     Ar.Name(TagId(Type));
     Ar.I32(int32(Scratch.B.size()));
-    Ar.I32(0);                                    // ArrayIndex
+    Ar.I32(ArrayIndex);                           // a static array's element: FloatCurves[2]
     if (Type == "StructProperty")
     {
         Ar.Name(StructName);

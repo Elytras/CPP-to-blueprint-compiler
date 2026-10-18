@@ -14,6 +14,11 @@ namespace Uasset
    both sides derive it from the same seed rather than reading the parent asset back. */
 void ScsNodeGuid(const std::string& ClassName, const std::string& ComponentName, uint32 (&Out)[4]);
 
+/* A timeline's TimelineGuid, by class and timeline name, and its direction variable's name: the editor's
+   `<Timeline>__Direction_<guid>` (UTimelineTemplate::UpdateCachedNames, TimelineTemplate.cpp 55-67). The editor's GUID
+   is random; this one is seeded like ScsNodeGuid, so a recompile writes the same names. */
+std::string TimelineGuid(const std::string& ClassName, const std::string& Timeline, uint32 (&Out)[4]);
+
 class FBlueprintClass
 {
 public:
@@ -167,6 +172,35 @@ public:
     };
     void AddInputBinding(const FInputBinding& Binding) { InputBindings.push_back(Binding); }
 
+    /* One editor Timeline node: a TimelineTemplate in the class's Timelines and a curve object per track, of which
+       UBlueprintGeneratedClass::CreateTimelineComponent makes a UTimelineComponent on each actor, stores it in the
+       variable Name and binds Update, Finished and each event track's function by name (BlueprintGeneratedClass.cpp
+       1077-1195). A track's Name is its TrackName and the variable it sets each frame, or an event track's function.
+       A key holds its time and one value per channel (an event's none, a float's one, a vector's three, a color's
+       four); Interp is an ERichCurveInterpMode, 0 linear, 1 constant, 2 cubic. Kind: 'E' event, 'F' float, 'V' vector,
+       'C' linear color. */
+    struct FTimelineKey
+    {
+        float Time = 0.0f;
+        float Values[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        uint8 Interp = 0;
+    };
+    struct FTimelineTrack
+    {
+        char Kind = 'F';
+        std::string Name;
+        std::vector<FTimelineKey> Keys;
+    };
+    struct FTimeline
+    {
+        std::string Name, DirectionProperty, Update, Finished;
+        float Length = 5.0f;
+        bool bAutoPlay = false, bLoop = false, bReplicated = false, bIgnoreTimeDilation = false, bLastKeyframe = false;
+        uint32 Guid[4] = { 0, 0, 0, 0 };
+        std::vector<FTimelineTrack> Tracks;
+    };
+    void AddTimeline(const FTimeline& Timeline) { Timelines.push_back(Timeline); }
+
     /* The actor has a root before this class's SCS runs: a Blueprint parent's SCS leaves one, and a native parent's
        constructor sets one or ExecuteConstruction takes its first native scene component. Then the DefaultSceneRoot
        node is in neither RootNodes nor AllNodes, as the editor saves it (ValidateSceneRootNodes). */
@@ -249,6 +283,7 @@ private:
     std::vector<FComponentOverride> ComponentOverrides;
     std::vector<FPropertyDef> CdoDefaults;
     std::vector<FInputBinding> InputBindings;
+    std::vector<FTimeline> Timelines;
 
     struct FSubobjectOverride
     {

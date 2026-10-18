@@ -532,6 +532,15 @@ stops the timer. The method takes no parameters and must not be `inline`. Settin
 restarts it and returns a new handle. Use `ReceiveTick` for work every frame, a `Delay` loop to wait for something and
 then carry on, and a timer for a fixed rate that you pause or stop.
 
+A timeline plays curves over time, as the Timeline node does. `UE_TIMELINE(Fade, 2.0f);` declares a 2-second timeline,
+which the engine makes as the actor spawns and stores in the `UTimelineComponent *Fade` variable;
+`UE_FLOAT_TRACK(Fade, Alpha, (0, 0), (1, 1, Cubic), (2, 0));` gives it a track whose keys are `(time, value)`, with
+Cubic or Constant after a key that is not Linear, and declares the `float Alpha` the timeline sets each frame it plays
+(`UE_VECTOR_TRACK` and `UE_COLOR_TRACK` take `(time, x, y, z)` and `(time, r, g, b, a)`). The node's pins are marks on
+methods: `UE_TIMELINE_UPDATE(Fade)` is called every frame it plays, `UE_TIMELINE_FINISHED(Fade)` at its end, and
+`UE_TIMELINE_EVENT(Fade, 0.5, 1.5)` each time it passes those times. Start it with `Fade->PlayFromStart()`, or add
+`AutoPlay` after the length.
+
 A key calls a method marked `UE_INPUT_KEY("F5")`, the editor's InputKey event; `UE_INPUT_ACTION("Use")` is an
 InputAction event, which fires on whatever key the player mapped to the game's action. The method returns void and
 takes nothing or `FKey Key`. Options after the name pick the edge (`Released`, or `Pressed, Released` for both), the
@@ -591,11 +600,14 @@ Watch for:
   `NoConsume` to share the key. A key the engine does not have is refused with the closest it has,
   `UE_INPUT_KEY("Space")` naming SpaceBar, and `FKey{"Space"}` warns the same way. An action is one of the game's
   input settings, which AssetGen cannot read: a misspelt one compiles and never fires.
+- Only a mod actor has timelines. A timeline's marked methods return void and take nothing, and the length is where
+  it stops whatever its keys say. A track's keys are number literals, not constants.
 
 Full rules: [Latent calls](REFERENCE.md#latent-calls), [Timers and input](REFERENCE.md#timers-and-input),
-[Waiting on events](REFERENCE.md#waiting-on-events). Examples: [examples/WaitForPlayer.cpp](examples/WaitForPlayer.cpp),
-[examples/Beacon.cpp](examples/Beacon.cpp), [examples/AwaitEvents.cpp](examples/AwaitEvents.cpp),
-[examples/HotKeys.cpp](examples/HotKeys.cpp).
+[Timelines](REFERENCE.md#timelines), [Waiting on events](REFERENCE.md#waiting-on-events). Examples:
+[examples/WaitForPlayer.cpp](examples/WaitForPlayer.cpp), [examples/Beacon.cpp](examples/Beacon.cpp),
+[examples/AwaitEvents.cpp](examples/AwaitEvents.cpp), [examples/HotKeys.cpp](examples/HotKeys.cpp),
+[examples/FadingLamp.cpp](examples/FadingLamp.cpp).
 
 ### Dispatchers and interfaces
 
@@ -1965,6 +1977,10 @@ A few mistakes also compile without a message, because the construct itself work
   [Mod sources and packages](REFERENCE.md#mod-sources-and-packages).
 
 **Missing, with nothing to write yet.**
+
+- A timeline track over a curve asset, the editor's External Curve. A track's curve is the keys in its macro; hand
+  the timeline a game curve at run time with `Fade->SetFloatCurve(Curve, "Alpha")`. See
+  [Timelines](REFERENCE.md#timelines).
 
 - A designer layout for a mod widget. A widget class AssetGen cooks starts with an empty widget tree, under a game
   widget Blueprint parent too, and the compile warns when the class neither builds one in code nor paints. For a

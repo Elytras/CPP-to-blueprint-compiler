@@ -23,6 +23,87 @@ void ScsNodeGuid(const std::string& ClassName, const std::string& ComponentName,
     Out[3] = Strihash(Seed + "\x02") | 1u;
 }
 
+std::string TimelineGuid(const std::string& ClassName, const std::string& Timeline, uint32 (&Out)[4])
+{
+    ScsNodeGuid(ClassName, "timeline." + Timeline, Out);
+    char Hex[33];
+    snprintf(Hex, sizeof(Hex), "%08X%08X%08X%08X", Out[0], Out[1], Out[2], Out[3]);   // FGuid::ToString, EGuidFormats::Digits
+    return Hex;
+}
+
+/* An array of structs as the cook writes one: the count, one inner FPropertyTag whose Size is all the elements' bytes,
+   then the elements, each written whole (no defaults to leave a field out against). */
+static void StructArray(FArc& V, const std::string& Name, const std::string& StructName, int32 Count, const FArc& Elements)
+{
+    V.I32(Count);
+    V.Name(Name);
+    V.Name("StructProperty");
+    V.I32(int32(Elements.B.size()));
+    V.I32(0);                       // ArrayIndex
+    V.Name(StructName);
+    for (int32 I = 0; I < 4; ++I) V.U32(0);      // StructGuid
+    V.U8(0);                        // HasPropertyGuid
+    V.Append(Elements);
+}
+
+/* FRichCurve::AutoSetTangents (RichCurve.cpp 623-711) at the editor's tension 0, over one channel of keys sorted by
+   time, which the curve editor runs after every edit: a cubic key's Auto tangents. Engine evaluation reads the stored
+   tangents, so they are what the curve plays. Out holds each key's arrive and leave tangent. */
+static void AutoTangents(const std::vector<FBlueprintClass::FTimelineKey>& Keys, int32 Channel,
+                         std::vector<std::pair<float, float>>& Out)
+{
+    const int32 N = int32(Keys.size());
+    Out.assign(size_t(N), { 0.0f, 0.0f });
+    auto V = [&](int32 K) { return Keys[size_t(K)].Values[Channel]; };
+    for (int32 K = 0; K < N; ++K)
+    {
+        const uint8 Interp = Keys[size_t(K)].Interp;
+        float Arrive = 0.0f, Leave = 0.0f;
+        int32 Prev = K, Cur = K, Next = K;
+        bool bCompute = false;
+        if (K == 0)
+        {
+            if (N > 1 && Interp == 2) { Next = 1; Cur = 1; bCompute = true; }
+        }
+        else if (K < N - 1)
+        {
+            Prev = K - 1;
+            if (Interp == 2) { Next = K + 1; bCompute = true; }
+            /* Linear and constant keys keep the zero tangents a new key starts with. */
+        }
+        else if (Interp == 2) { Prev = K - 1; bCompute = true; }
+        if (bCompute)
+        {
+            /* ComputeCurveTangent: (1 - Tension) * ((P - PrevP) + (NextP - P)) / max(KINDA_SMALL_NUMBER, NextT - PrevT). */
+            const float Tangent = 1.0f * ((V(Cur) - V(Prev)) + (V(Next) - V(Cur)));
+            Arrive = Tangent / std::max(1.e-4f, Keys[size_t(Next)].Time - Keys[size_t(Prev)].Time);
+            Leave = Arrive;
+        }
+        Out[size_t(K)] = { Arrive, Leave };
+    }
+}
+
+/* One channel as an FRichCurve value: its Keys, each FRichCurveKey in its native 27 bytes (RichCurve.cpp 160-180), and
+   nothing else, as the cook leaves DefaultValue and the extrapolations at their defaults. */
+static void RichCurve(FArc& Ar, const std::vector<FBlueprintClass::FTimelineKey>& Keys, int32 Channel)
+{
+    std::vector<std::pair<float, float>> Tangents;
+    AutoTangents(Keys, Channel, Tangents);
+    Tag(Ar, "Keys", "ArrayProperty", [&](FArc& V) {
+        FArc Elements(V.Owner());
+        for (size_t K = 0; K < Keys.size(); ++K)
+        {
+            const float Fields[6] = { Keys[K].Time, Keys[K].Values[Channel], Tangents[K].first, 0.0f, Tangents[K].second, 0.0f };
+            Elements.U8(Keys[K].Interp);
+            Elements.U8(0);                 // TangentMode RCTM_Auto
+            Elements.U8(0);                 // TangentWeightMode RCTWM_WeightedNone
+            Elements.Raw(Fields, sizeof(Fields));     // Time, Value, ArriveTangent, ArriveTangentWeight, LeaveTangent, LeaveTangentWeight
+        }
+        StructArray(V, "Keys", "RichCurveKey", int32(Keys.size()), Elements);
+    }, "StructProperty");
+    TagEnd(Ar);
+}
+
 FIndex FBlueprintClass::Subobject(const std::string& ClassPackage, const std::string& ClassName_,
                                   FIndex Outer, const std::string& ObjectName)
 {
@@ -277,7 +358,16 @@ void FBlueprintClass::Finish()
         if (!Of.empty()) BindingKinds.push_back(Of);
     }
     const int32 RowFirstBinding = RowFirstSubobject + int32(SubobjectOverrides.size());
-    const int32 RowRootTemplate = RowFirstBinding + int32(BindingKinds.size());
+    /* Then each timeline's template, followed by its tracks' curves. */
+    const int32 RowFirstTimeline = RowFirstBinding + int32(BindingKinds.size());
+    std::vector<int32> TimelineRows;
+    int32 NumTimelineRows = 0;
+    for (const FTimeline& T : Timelines)
+    {
+        TimelineRows.push_back(RowFirstTimeline + NumTimelineRows);
+        NumTimelineRows += 1 + int32(T.Tracks.size());
+    }
+    const int32 RowRootTemplate = RowFirstTimeline + NumTimelineRows;
     const int32 RowScsNode = RowRootTemplate + 1;
     /* Each UE_COMPONENT takes two rows, archetype then node, so the SCS lands after them all. */
     const int32 RowFirstComponent = RowScsNode + 1;
@@ -340,6 +430,12 @@ void FBlueprintClass::Finish()
         Bindings.push_back(Exp(RowFirstBinding + int32(I)));
         Class.CreateBeforeSer.push_back(Bindings.back().V);
     }
+    std::vector<FIndex> Templates;              // the Timelines list, after the bindings as BP_FragilePlatform_C lists them
+    for (const int32 Row : TimelineRows)
+    {
+        Templates.push_back(Exp(Row));
+        Class.CreateBeforeSer.push_back(Exp(Row).V);
+    }
     for (int32 I = 0; I < NumFunctions; ++I)
         Class.CreateBeforeSer.push_back(Exp(RowFirstFunction + I).V);
     for (const FPropertyDef& V : Vars)      // a dispatcher's Extra is a function listed above
@@ -368,6 +464,12 @@ void FBlueprintClass::Finish()
             Tag(Ar, "DynamicBindingObjects", "ArrayProperty", [=](FArc& V) {
                 V.I32(int32(Bindings.size()));
                 for (const FIndex& B : Bindings) V.Idx(B);
+            }, "ObjectProperty");
+        /* AActor::ExecuteConstruction makes a component of each (UBlueprintGeneratedClass::CreateComponentsForActor). */
+        if (!Templates.empty())
+            Tag(Ar, "Timelines", "ArrayProperty", [=](FArc& V) {
+                V.I32(int32(Templates.size()));
+                for (const FIndex& T : Templates) V.Idx(T);
             }, "ObjectProperty");
         if (bActor)
             Tag(Ar, "SimpleConstructionScript", "ObjectProperty",
@@ -531,20 +633,108 @@ void FBlueprintClass::Finish()
                     TagBool(Elements, "bOverrideParentBinding", B.bOverrideParentBinding);
                     TagEnd(Elements);
                 }
-                V.I32(int32(Of.size()));
-                V.Name(Kind + "s");             // the inner FPropertyTag, its Size the elements' bytes (see Records below)
-                V.Name("StructProperty");
-                V.I32(int32(Elements.B.size()));
-                V.I32(0);                       // ArrayIndex
-                V.Name("Blueprint" + Kind);
-                for (int32 I = 0; I < 4; ++I) V.U32(0);      // StructGuid
-                V.U8(0);                        // HasPropertyGuid
-                V.Append(Elements);
+                StructArray(V, Kind + "s", "Blueprint" + Kind, int32(Of.size()), Elements);
             }, "StructProperty");
             TagEnd(Ar);
             Ar.Bool(false);
         };
         P.AddExport(std::move(Binding));
+    }
+
+    /* Measured on BP_LostPackStart's LightTimeline_Template and its CurveFloat_0 / CurveFloat_1, BP_DorettaHead's
+       CurveVector_0: the template is the class's subobject <Timeline>_Template, flag Transactional, and each curve the
+       class's subobject too, Public | Transactional, named as MakeUniqueCurveName numbers them, by curve class. The
+       template's tags go in declaration order and leave what is at the engine's defaults out (a length of 5, no
+       options); each track struct is written whole. */
+    std::map<std::string, int32> CurveNumbers;
+    for (size_t TI = 0; TI < Timelines.size(); ++TI)
+    {
+        const FTimeline T = Timelines[TI];
+        const int32 Row = TimelineRows[TI];
+        std::vector<FIndex> Curves;
+        for (size_t K = 0; K < T.Tracks.size(); ++K) Curves.push_back(Exp(Row + 1 + int32(K)));
+
+        const FIndex TemplateClass = EngineClass("/Script/Engine", "TimelineTemplate");
+        const FIndex TemplateCdo = ClassDefaultObject("/Script/Engine", "TimelineTemplate");
+        FExport Template;
+        Template.ClassIndex = TemplateClass;
+        Template.TemplateIndex = TemplateCdo;
+        Template.OuterIndex = Exp(RowClass);
+        Template.ObjectName = T.Name + "_Template";
+        Template.ObjectFlags = RF_Transactional;
+        Template.SerBeforeCreate = { TemplateClass.V, TemplateCdo.V };
+        Template.CreateBeforeCreate = { Exp(RowClass).V };
+        for (const FIndex C : Curves) Template.CreateBeforeSer.push_back(C.V);
+        Template.Serialize = [=](FArc& Ar) {
+            if (T.Length != 5.0f) Tag(Ar, "TimelineLength", "FloatProperty", [=](FArc& V) { V.Raw(&T.Length, 4); });
+            if (T.bLastKeyframe)
+                Tag(Ar, "LengthMode", "ByteProperty", [](FArc& V) { V.Name("TL_LastKeyFrame"); }, "ETimelineLengthMode");
+            if (T.bAutoPlay) TagBool(Ar, "bAutoPlay", true);
+            if (T.bLoop) TagBool(Ar, "bLoop", true);
+            if (T.bReplicated) TagBool(Ar, "bReplicated", true);
+            if (T.bIgnoreTimeDilation) TagBool(Ar, "bIgnoreTimeDilation", true);
+            /* FTTEventTrack, FTTFloatTrack, FTTVectorTrack, FTTLinearColorTrack: the struct's own fields, then
+               FTTPropertyTrack's PropertyName, then FTTTrackBase's. */
+            static const struct { char Kind; const char *Array, *Struct, *Curve; } Kinds[] = {
+                { 'E', "EventTracks", "TTEventTrack", "CurveKeys" }, { 'F', "FloatTracks", "TTFloatTrack", "CurveFloat" },
+                { 'V', "VectorTracks", "TTVectorTrack", "CurveVector" }, { 'C', "LinearColorTracks", "TTLinearColorTrack", "CurveLinearColor" } };
+            for (const auto& Of : Kinds)
+            {
+                FArc Elements(Ar.Owner());
+                int32 Count = 0;
+                for (size_t K = 0; K < T.Tracks.size(); ++K)
+                {
+                    const FTimelineTrack& Track = T.Tracks[K];
+                    if (Track.Kind != Of.Kind) continue;
+                    ++Count;
+                    if (Of.Kind == 'E') Tag(Elements, "FunctionName", "NameProperty", [&](FArc& E) { E.Name(Track.Name); });
+                    Tag(Elements, Of.Curve, "ObjectProperty", [&](FArc& E) { E.Idx(Curves[K]); });
+                    if (Of.Kind != 'E') Tag(Elements, "PropertyName", "NameProperty", [&](FArc& E) { E.Name(Track.Name); });
+                    Tag(Elements, "TrackName", "NameProperty", [&](FArc& E) { E.Name(Track.Name); });
+                    TagBool(Elements, "bIsExternalCurve", false);
+                    TagEnd(Elements);
+                }
+                if (Count > 0)
+                    Tag(Ar, Of.Array, "ArrayProperty", [&](FArc& V) { StructArray(V, Of.Array, Of.Struct, Count, Elements); },
+                        "StructProperty");
+            }
+            Tag(Ar, "TimelineGuid", "StructProperty", [=](FArc& V) { V.Guid(T.Guid); }, "Guid");
+            Tag(Ar, "VariableName", "NameProperty", [=](FArc& V) { V.Name(T.Name); });
+            Tag(Ar, "DirectionPropertyName", "NameProperty", [=](FArc& V) { V.Name(T.DirectionProperty); });
+            /* A pin with no method names none: the engine's ExecuteIfBound then calls nothing. */
+            if (!T.Update.empty()) Tag(Ar, "UpdateFunctionName", "NameProperty", [=](FArc& V) { V.Name(T.Update); });
+            if (!T.Finished.empty()) Tag(Ar, "FinishedFunctionName", "NameProperty", [=](FArc& V) { V.Name(T.Finished); });
+            TagEnd(Ar);
+            Ar.Bool(false);
+        };
+        P.AddExport(std::move(Template));
+
+        for (const FTimelineTrack& Track : T.Tracks)
+        {
+            const std::string CurveClass = Track.Kind == 'V' ? "CurveVector" : Track.Kind == 'C' ? "CurveLinearColor" : "CurveFloat";
+            const FIndex KindClass = EngineClass("/Script/Engine", CurveClass);
+            const FIndex KindCdo = ClassDefaultObject("/Script/Engine", CurveClass);
+            FExport Curve;
+            Curve.ClassIndex = KindClass;
+            Curve.TemplateIndex = KindCdo;
+            Curve.OuterIndex = Exp(RowClass);
+            Curve.ObjectName = CurveClass + "_" + std::to_string(CurveNumbers[CurveClass]++);
+            Curve.ObjectFlags = RF_Public | RF_Transactional;
+            Curve.SerBeforeCreate = { KindClass.V, KindCdo.V };
+            Curve.CreateBeforeCreate = { Exp(RowClass).V };
+            Curve.Serialize = [Track](FArc& Ar) {
+                /* UCurveFloat's FloatCurve; UCurveVector's FloatCurves[3] and UCurveLinearColor's FloatCurves[4], one
+                   tag per channel. */
+                const int32 Channels = Track.Kind == 'V' ? 3 : Track.Kind == 'C' ? 4 : 1;
+                for (int32 Ch = 0; Ch < Channels; ++Ch)
+                    Tag(Ar, Channels == 1 ? "FloatCurve" : "FloatCurves", "StructProperty",
+                        [&](FArc& V) { RichCurve(V, Track.Keys, Ch); }, "RichCurve", Ch);
+                if (Track.Kind == 'E') TagBool(Ar, "bIsEventCurve", true);
+                TagEnd(Ar);
+                Ar.Bool(false);
+            };
+            P.AddExport(std::move(Curve));
+        }
     }
 
     if (!bIsActor) return;
