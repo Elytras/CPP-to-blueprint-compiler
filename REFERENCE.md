@@ -2899,6 +2899,12 @@ Notes:
 - The text is culture-invariant, as a literal in code is: it is not gathered for translation.
 - A layout can be checked without the editor: the `wrender` command of the framework DLL draws a widget class to a PNG
   and writes each widget's box to a JSON beside it.
+- `python tools/widgetloop.py <mod dir> <Class> [<w> <h> | desired] --watch --open` is the live editor: each time a
+  source of the mod is saved, it cooks the mod, swaps its pak into the running game (`pak reload`, no restart) and
+  draws the class again, a few seconds after the save. It prints each widget that was added, removed, moved or
+  resized, with its old box; when the compile fails, it prints clang's error and the last good picture stays.
+  `--open` shows the PNG in the browser, on a page that reloads it as it changes. Without `--watch` it runs one turn
+  and prints every box.
 
 ## Class defaults
 
