@@ -880,8 +880,8 @@ Watch for:
 - Paths are not checked at build time, neither in `UE_ASSET_AT` nor in a soft default. A soft class of a Blueprint takes
   the class's full path, ending in `.BP_Name_C`. The short form `"/Game/Dir/Pkg"` means the object `Pkg.Pkg`, which for
   a Blueprint is the asset and not its class.
-- Not yet: cooking a changed copy of a game data asset. Write the loaded asset's members through its pointer at run
-  time, or extend a game Blueprint and set its defaults.
+- To change a game asset's own values, rather than read them, edit it in the pak: see
+  [Editing the game's assets and Blueprints](#editing-the-games-assets-and-blueprints).
 
 Full rules: [Data assets](REFERENCE.md#data-assets), [Game assets](REFERENCE.md#game-assets),
 [Types](REFERENCE.md#types) (soft references), [Latent calls](REFERENCE.md#latent-calls) (the loads). Example:
@@ -934,11 +934,47 @@ Watch for:
   has these markers. Without one, the override is refused: "... its header does not say which SCS node it is -
   re-dump the game with the Dumper-7 fork (ScsNode=) and regenerate UeApi".
 - Your class is a new class. The game keeps spawning its own, so spawn yours yourself (see
-  [Components and spawning](#components-and-spawning)). Not yet: changing the game Blueprint's own defaults in the pak.
+  [Components and spawning](#components-and-spawning)). To change what the game spawns, patch its Blueprint instead:
+  see the next section.
 
 Full rules: [Overrides and parent calls](REFERENCE.md#overrides-and-parent-calls),
 [Class defaults](REFERENCE.md#class-defaults), [Mod sources and packages](REFERENCE.md#mod-sources-and-packages).
 Example: [examples/GameBlueprintChild.cpp](examples/GameBlueprintChild.cpp).
+
+### Editing the game's assets and Blueprints
+
+A mod can also change what the game already has. `UE_ASSET_EDIT(Asset) { .Member = value };` changes a game data
+asset's values, and `UE_ASSET_EDITS { Asset.Member[1].Field = value; }` changes parts of them by path. A class with
+`UE_PATCH;` among its members is a patch of the game Blueprint it derives from: its `UE_DEFAULTS` set that Blueprint's
+own class defaults and its components', and a method replaces the Blueprint's function of the same name, with
+`Parent::Method()` running the game's body. The compiler reads each package from the extracted game pak, changes only
+what the source names, and writes the whole package back at its own path, so the mod's pak replaces the game's copy.
+Pass the extracted pak's `Content` folder as `--game` (bpbuild: `game_content` in `mods.yaml`).
+
+```cpp
+#include "UeApi/Game/ENE_Spider_Grunt_Normal_C.h"
+#include "UeAssets/UEnemyDescriptor.h"
+
+UE_ASSET_EDIT(UeAssets::UEnemyDescriptor::Game::Enemies::Spider::Grunt::ED_Spider_Grunt) {.SpawnSpread = 800.0f};
+
+class SlowGrunt : public ENE_Spider_Grunt_Normal_C {
+  UE_PATCH;
+  UE_DEFAULTS {
+    CustomTimeDilation = 0.5f;            // every grunt spawned from this Blueprint moves at half speed
+    HealthComponent->MaxHealth = 180.0f;
+  }
+};
+```
+
+Watch for:
+
+- A patch is not a class: a variable or an interface of its own is refused, and so is a method that waits.
+- A replacement takes the game function's parameters exactly: copy them from the SDK header.
+- Extract the pak again after a game update. bpbuild then rebuilds the mod, so the edit starts from the new package.
+- Two paks that edit the same asset each carry the whole package, and the game loads only one. Keep the edits of an
+  asset in one mod.
+
+Full rules: [Editing game packages](REFERENCE.md#editing-game-packages).
 
 ### Several mods and shared code
 
@@ -1080,10 +1116,14 @@ runs `assetgen compile` once per source, and you run that by hand to look at wha
 ### assetgen
 
 ```
-assetgen compile <source.cpp> <include-dir> <out-dir> [--api <api-dir>]
+assetgen compile <source.cpp> <include-dir> <out-dir> [--api <api-dir>] [--game <folder /Game is in>]
 assetgen registry <out AssetRegistry.bin> <AssetRegistry.bin>...
 assetgen verify <out-dir> <reference-dir>
+assetgen roundtrip <dir>
 ```
+
+`roundtrip` reads every cooked package under a folder and writes it back in memory, reporting any that does not come
+back byte-identical: the check behind [Editing the game's assets and Blueprints](#editing-the-games-assets-and-blueprints).
 
 With no arguments, or too few, `assetgen` prints this usage and exits with 2. `compile` and `registry` exit with 0 on
 success. On failure they print `FAILED: <reason>` and exit with 1, and an unexpected error inside the compiler is
@@ -1097,6 +1137,7 @@ building a mod.
 | `<include-dir>` | The SDK's `UeApi` folder. It must hold `Conv.json`, `Ops.json`, `Types.json`, `Events.json` and `NotCallable.json`; otherwise the compile stops with `missing or invalid <dir>/<file> (run genueapi.py)`. Its `Version.json` must name a genueapi this compiler can use; a folder an older one wrote, or one without the file, stops the compile before clang runs, with `<dir> was written by an older genueapi (...) - regenerate it with AssetGen/tools/genueapi.py`. A folder with none of the three (no UeApi at all, or a path that does not exist) stops it with `missing or invalid <dir>/Conv.json (run genueapi.py)`. |
 | `<out-dir>` | Where the mod's own packages go. The compiler creates it, and the folder of every package it writes, when missing. |
 | `--api <api-dir>` | Optional, after the out dir. Also writes an editor stub for each class, struct and enum into this folder (see [Editor API stubs](#editor-api-stubs)). It is an output folder for the editor, not the SDK folder. It must already exist: without it a class gets no stub and prints `<Class> -> no API asset: cannot write .uasset`, and a struct or enum fails the compile. |
+| `--game <folder /Game is in>` | Optional, after the out dir. The `Content` folder of the extracted game pak, which `UE_ASSET_EDIT`, `UE_ASSET_EDITS` and `UE_PATCH` read the game's packages from. Without it, an edit is refused. |
 
 **Parsing.** AssetGen runs `clang++` from `PATH` with `-std=c++20 -fsyntax-only` and reads the syntax tree that clang
 dumps as JSON. The include dir and its parent are both on the include path, so `#include "Engine.h"` and
@@ -1115,6 +1156,7 @@ hundreds of MB; it streams from clang through a pipe and is never written to dis
 | `<Ns>__<Name>`, a class whose default object holds a namespace-scope variable | when a function uses the variable |
 | `FDeref`, the scratch struct that raw pointer reads go through | when the source reads through a pointer and does not declare `FDeref` itself |
 | two structs per map type walked in place, `FMapSlot_TMap_<K>_<V>` and `FMapSlots_TMap_<K>_<V>`, and a wrapper struct per container nested in another container | when the code needs one |
+| each game package an edit names, at its own path, printed as `edit -> <package>.uasset (the game's, edited: ...)` | when the source has a `UE_ASSET_EDIT`, `UE_ASSET_EDITS` or `UE_PATCH` |
 
 It prints one line per package and one for the registry. Compiled into the bpbuild layout, a source with one class
 prints:
@@ -1126,7 +1168,8 @@ prints:
 
 `extends BP <Class>` marks a Blueprint parent, and a struct prints `(struct, N members)`.
 
-A source with nothing to cook fails with `the source declares no UE_STRUCT, UE_ENUM or class deriving from a UE class`.
+A source with nothing to cook fails with `the source declares no UE_STRUCT, UE_ENUM, class deriving from a UE class,
+asset or edit`.
 Two declarations that would land in the same package fail with `<A> and <B> would both be cooked as <package>`; package
 names are compared ignoring case. [What a failed compile leaves behind](#what-a-failed-compile-leaves-behind) says
 what a failure deletes.
@@ -1205,6 +1248,7 @@ Top-level keys:
 | --- | --- |
 | `mods` | The list of mods. If it is empty or missing, bpbuild prints `mods.yaml lists no mods.` and exits with 0. |
 | `api_dir` | The default `api_dir` for every mod that sets `generate_api`. |
+| `game_content` | The `Content` folder of the extracted game pak, passed to every compile as `--game`, for the mods that edit the game's packages. An edited package counts as the mod's output, so a newer copy of it here rebuilds the mod. |
 
 Keys of a mod:
 
@@ -1239,7 +1283,7 @@ api_dir:
 1. **Compile.** Mods are taken in `mods.yaml` order, except that the mods a mod `needs` go first. For each mod that is
    out of date (see below), bpbuild deletes `build/<name>/FSD/Content` and `build/<name>/FSD/AssetRegistry.bin`, then
    runs `assetgen compile <source> <UeApi dir> build/<name>/FSD/Content/<package path>` for each `.cpp`, adding
-   `--api <first api dir>/<package path>` when `generate_api` is set. No compile reads another mod's output, so up to
+   `--api <first api dir>/<package path>` when `generate_api` is set and `--game <game_content>` when that is. No compile reads another mod's output, so up to
    `BPBUILD_JOBS` of them run at once. Each mod's output is still printed whole, in this order. A failed compile prints
    `<name> FAILED`, and the build moves on.
 2. **Pack.** Every mod's assets exist by now, so an `embed` mod can copy in its dependencies' assets. Each mod whose pak
@@ -1943,9 +1987,6 @@ A few mistakes also compile without a message, because the construct itself work
   [Components](REFERENCE.md#components).
 - Keywords and a ToolTip for a function in the editor stub. `UeMeta.h` has no macro for them. See
   [Classes and variables](REFERENCE.md#classes-and-variables).
-- Changing a game data asset, or a game Blueprint's defaults, in place in the pak. Change the loaded asset through its
-  pointer in the game, or subclass the Blueprint and set its defaults in `UE_DEFAULTS`. See
-  [Game assets](REFERENCE.md#game-assets).
 - The form of a game enum that no property uses. genueapi learns whether a game enum is an `enum class` from how the
   dump's properties of it and the game's Blueprints are reflected, and 240 of the SDK's 1445 enums have none (the
   enum's own form is not in the dump yet); a variable of one is a Byte, which differs from the editor's Enum variable

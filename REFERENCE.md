@@ -15,7 +15,7 @@ and a compiler message in [Diagnostics](#diagnostics).
 | Types | [Types](#types), [Literals and conversions](#literals-and-conversions), [Strings and text](#strings-and-text), [Constants](#constants), [Enums](#enums), [Structs](#structs), [Containers](#containers) |
 | Code | [Operators](#operators), [Statements and control flow](#statements-and-control-flow), [Loops](#loops), [Locals](#locals), [The optimizer](#the-optimizer) |
 | Functions | [Functions](#functions), [Calling engine and game functions](#calling-engine-and-game-functions), [Overrides and parent calls](#overrides-and-parent-calls), [Inline functions and templates](#inline-functions-and-templates) |
-| Objects | [Components](#components), [Class defaults](#class-defaults), [Creating objects](#creating-objects), [Working with other objects](#working-with-other-objects), [Data assets](#data-assets), [Game assets](#game-assets) |
+| Objects | [Components](#components), [Class defaults](#class-defaults), [Creating objects](#creating-objects), [Working with other objects](#working-with-other-objects), [Data assets](#data-assets), [Game assets](#game-assets), [Editing game packages](#editing-game-packages) |
 | Events and waiting | [Event dispatchers](#event-dispatchers), [Latent calls](#latent-calls), [Waiting on events](#waiting-on-events), [Timers and input](#timers-and-input), [Interfaces](#interfaces) |
 | Network | [Replication](#replication), [RPCs](#rpcs) |
 | Low level | [Pointers and memory](#pointers-and-memory), [Intrinsics](#intrinsics) |
@@ -97,7 +97,7 @@ the one its `UE_CLASS` names. The others import it.
 | `UE_MOD_PACKAGE("/Game/_MyMods/Hello");` | Names the `/Game` folder for everything the source cooks. Write it once, at file scope. It is the only place the path is written: the bpbuild manifest does not repeat it. | Yes |
 | a source with no `UE_MOD_PACKAGE` | Refused: "the source declares no UE_MOD_PACKAGE". | Refused |
 | a second `UE_MOD_PACKAGE` in one source | Refused by clang: "redefinition of 'UeModPackage'". The macro declares a variable. | Refused |
-| a source with nothing to cook | Refused: "the source declares no UE_STRUCT, UE_ENUM or class deriving from a UE class". A class with no base does not count. | Refused |
+| a source with nothing to cook | Refused: "the source declares no UE_STRUCT, UE_ENUM, class deriving from a UE class, asset or edit". A class with no base does not count. | Refused |
 | `class Hello : public AActor {};` | One package per class, named after it: `/Game/_MyMods/Hello/Hello`. The class inside is `Hello_C`, as the editor names a Blueprint's generated class, and the asset registry lists `/Game/_MyMods/Hello/Hello.Hello_C`. The name is the C++ name as written, prefix included: `UTurretDef` becomes `UTurretDef_C`. | Yes |
 | several classes in one source | Each class is its own package in the mod folder. The classes can name each other's types and share [global variables](#global-variables). | Yes |
 | two declarations that land on one package | Refused, naming both: "would both be cooked as". Package names are compared ignoring case. | Refused |
@@ -3491,7 +3491,7 @@ not a C++ value, so point at it with `&`.
 | `.Next = &MD_Calm` | One asset pointing at another. | Yes |
 | `.EnemyClass = "/Game/A/BP_A.BP_A_C"` | A soft object or soft class member takes the asset's path as a string, written the way the cooker writes it. The path rules are in [Types](#types). | Yes |
 | `UBigDef MD_Huge = {{.Health = 900}, false};` | Sets a member a mod base class declares: the base gets a brace list of its own as the first element. C++ cannot designate a base's member (`{.Health = 900}` is a clang error), and after a nested base list the class's own members go by position. | Yes |
-| `.SpawnClass = AMyEnemy::StaticClass()`, on a `TSubclassOf` member | The class, as picking it in the asset's details does. `UE_ASSET_EDIT` takes one the same way. See [Classes and variables](#classes-and-variables). | Yes |
+| `.SpawnClass = AMyEnemy::StaticClass()`, on a `TSubclassOf` member | The class, as picking it in the asset's details does. `UE_ASSET_EDIT` takes one the same way ([Editing game packages](#editing-game-packages)). See [Classes and variables](#classes-and-variables). | Yes |
 
 ```cpp
 class UMoodDef : public UPrimaryDataAsset {
@@ -3588,7 +3588,7 @@ path is not checked when the mod is built, so a wrong path compiles.
 | `(&ED_Spider_Grunt)->SpawnAmountModifier` | Reads the game asset's value when the game runs. | Yes |
 | `ED_Spider_Grunt.SpawnAmountModifier * 2` | Not yet: the SDK names game assets but carries none of their values, so a value cannot be used when the mod is built. Refused with "is an asset, not a value". Read the value at run time through the pointer. | Not yet |
 | `&OtherData`, another mod's asset of a class that a shared header declares without `UE_CLASS` | Refused: each mod that includes the header cooks its own copy of the class, so the reference "would load as null". The message prints the `UE_CLASS` line that pins the class to its owner; see [Mod sources and packages](#mod-sources-and-packages). | Refused |
-| changing a game data asset, or a game Blueprint's defaults, in the pak | Not yet: there is no syntax for it. Change the loaded asset at run time through its pointer, or derive from the game Blueprint and set defaults in `UE_DEFAULTS` ([Class defaults](#class-defaults)). | Not yet |
+| changing a game data asset, or a game Blueprint's defaults or functions, in the pak | `UE_ASSET_EDIT`, `UE_ASSET_EDITS` and `UE_PATCH`: see [Editing game packages](#editing-game-packages). | Yes |
 
 ```cpp
 UE_ASSET_AT(UEnemyDescriptor, ED_Spider_Grunt, "/Game/Enemies/Spider/Grunt/ED_Spider_Grunt");
@@ -3686,6 +3686,128 @@ Notes:
   [Latent calls](#latent-calls).
 - A list can be big: `UeAssets::USoundWave::All` holds 15,156 paths, a 1.8 MB package that takes about 4.7 s to
   compile.
+
+## Editing game packages
+
+A mod can change an asset or a Blueprint the game already has, rather than add one beside it. `UE_ASSET_EDIT` and
+`UE_ASSET_EDITS` change a game data asset's values, and a class marked `UE_PATCH` changes a game Blueprint's class
+defaults, its components' defaults and its functions. The compiler reads the package as the game cooked it, changes
+only what the source names, and writes the package back at its own path, so the mod's pak holds a copy that replaces
+the game's. The rule to remember: an edit starts from the game's own package, so every compile that edits needs
+`--game <the folder /Game is in>`, the `Content` folder of the extracted game pak (bpbuild: `game_content` in
+`mods.yaml`).
+
+### Editing a game asset: UE_ASSET_EDIT
+
+| You write | What it does | Status |
+|---|---|---|
+| `UE_ASSET_EDIT(ED_Spider_Grunt) {.SpawnSpread = 800.0f, .IdealSpawnSize = 12};` at namespace scope | Edits a game asset that a `UE_ASSET_AT` names, every one in the `UeAssets` headers included. Each member the braces name replaces the asset's value, or is added where the asset had none. The members the braces leave out keep the asset's values, and every other byte of the package stays the game's. | Yes |
+| `.CanBeUsedForConstantPressure = false`, `.Count = 0` | A zero is written like any other value, since it replaces the asset's own. | Yes |
+| `.VeteranClasses = {&ED_Spider_Grunt, &ED_Spider_Exploder}`, `.SpawnClass = APlayerCharacter::StaticClass()` | A container member is replaced whole. An object or class the package did not reference before is added to its imports. | Yes |
+| `UE_ASSET_EDITS { ED_Spider_Grunt.SpawnRarityModifiers[1].Rarity = 2.0f; }` | Assigns part of a member's value by path: the rest of the array, and of that element, keeps its bytes. A step is `.Member` or `[i]`, a `TArray` element whose index is a constant, to any depth. | Yes |
+| `UE_ASSET_EDITS { ED_Spider_Exploder.SpawnSpread = 100.0f; ED_Spider_Grunt.IdealSpawnSize = 12; }` | A block can assign whole members too, of several assets. Its statements apply in order, so a later one lands on what an earlier one wrote. | Yes |
+| `UE_ASSET_EDIT` and `UE_ASSET_EDITS` of one asset in one source | Both land in the one edited package. | Yes |
+| `PrimaryActorTick.bCanEverTick = true`, a path into a member the object has no value of | The object takes that member from its class (its archetype), so the new value holds only the path, and the engine fills in the rest. This works through members of structs written as tags. Through a native struct (FVector, FRotator, ...) or an array element, the value's other parts are unknown when the mod is built: refused with "is not set on". Assign the whole member. | Yes |
+| `Points[2].X = 1.0f` on an array of two | Refused: "Points has 2 elements". | Refused |
+| `Score["a"] = 1`, an element of a `TMap` or `TSet` | Not yet: refused with "only a TArray's element can be assigned on its own; assign the whole map". Assign the whole container. | Not yet |
+| `UE_ASSET_EDIT(MD_Big) {...}`, an asset the mod cooks itself | Refused: "the target is a UE_ASSET_AT ...; a mod's own asset takes its values where it is declared". Set the value in the asset's own braces. | Refused |
+| any edit without `--game` | Refused: "an edit starts from the game's own package: pass the folder /Game is in". | Refused |
+
+```cpp
+#include "UeAssets/UEnemyDescriptor.h"
+
+using namespace UeAssets::UEnemyDescriptor::Game::Enemies::Spider;
+
+UE_ASSET_EDIT(Grunt::ED_Spider_Grunt) {.SpawnSpread = 800.0f, .IdealSpawnSize = 12};
+
+UE_ASSET_EDITS {
+  Exploder::ED_Spider_Exploder.SpawnSpread = 100.0f;            // a whole member
+  Grunt::ED_Spider_Grunt.SpawnRarityModifiers[1].Rarity = 2.0f; // one member of one element
+}
+```
+
+Notes:
+
+- `UE_ASSET_EDIT`'s braces take whole members. To change part of one, assign it by path in `UE_ASSET_EDITS`.
+- An edit adds no registry rows (`registry -> none`): the game's registry already lists the asset.
+
+### Patching a game Blueprint: UE_PATCH
+
+A class with `UE_PATCH;` among its members is not a class of its own. It derives from the game Blueprint it edits, and
+its `UE_DEFAULTS` and methods are written into that Blueprint's own package.
+
+| You write | What it does | Status |
+|---|---|---|
+| `class SlowGrunt : public ENE_Spider_Grunt_Normal_C { UE_PATCH; UE_DEFAULTS { CustomTimeDilation = 0.5f; } };` | Edits the Blueprint's class defaults: the tags of its default object, `Default__<Name>_C`. A member of the Blueprint or of any class above it can be set, and a zero is written like any value. | Yes |
+| `HealthComponent->MaxHealth = 180.0f;`, a component a native class declares | Edits the default subobject the engine copies that component from. | Yes |
+| `MeleeAttack->CenterOnTarget = true;`, a component the Blueprint adds | Edits its template in the Blueprint's Components panel. | Yes |
+| `Comp->Field = value;`, a parent Blueprint's component that this Blueprint overrides | Edits this Blueprint's override of the component, as setting it in this Blueprint's Components panel does. | Yes |
+| a parent Blueprint's component that this Blueprint does not override | Not yet: the package has no template of it to edit. Refused with "the class does not override that inherited component". Patch the Blueprint that declares the component, which changes every child that does not override it too. | Not yet |
+| `Loose->bVisible = false;`, a member that is no component of the Blueprint | Refused: "Loose is not one of <Class>'s components (UeApi gives it no SCS node)". | Refused |
+| `PrimaryActorTick.bCanEverTick = true;`, `MeleeAttack->Montages[0] = &ANIM_Attack;` | Paths into a value, by the rules of `UE_ASSET_EDITS` above. | Yes |
+| `Ids = {7};`, `Score = {{"a", 9}};` on a `TSet` or `TMap` | The default object loads exactly that value: the elements the parent's value has and this one drops are written as removed, as the cook writes a set or map. `Ids = {}` empties it. The same holds for one inside a struct, by path or in a whole struct. A key given twice holds the last value, and an FString key compares without case. | Yes |
+| `class Tweaks : public AActor { UE_PATCH; ... };` | Refused: "a patch derives from the game Blueprint it edits (a class in a /Game package); a native class's defaults come from its C++ constructor, not from a package". | Refused |
+| `int32 Extra;` or an interface in a patch | Not yet: refused with "a member or an interface of its own is not built yet". | Not yet |
+| a patch with neither `UE_DEFAULTS` nor methods | Refused: "nothing to edit". | Refused |
+
+### Replacing a game Blueprint's functions
+
+| You write | What it does | Status |
+|---|---|---|
+| `void GetEnemySpawnedCount(int32 &SpawnCount) { SpawnCount = 42; }` in a patch | Replaces the Blueprint's own function of that name. The function keeps the game's flags and parameters, so every caller still fits, and takes the method's locals and code. | Yes |
+| `ENE_Spider_Grunt_Normal_C::GetEnemySpawnedCount(SpawnCount);` in the replacement | Runs the game's body, which the package keeps beside it as `<Function>__Vanilla`. An RPC's body runs there as a plain function, where the RPC has already arrived. | Yes |
+| a method the Blueprint does not define | Added to it: a helper that the other methods call, or an override of a function it inherits, such as `void ReceiveTick(float DeltaSeconds)`. An override changes this Blueprint and its children only; patch the parent that defines the function to change them all. | Yes |
+| `void ReceiveTick(float DeltaSeconds)` added to an actor that never ticks | Also sets `PrimaryActorTick.bCanEverTick` on the default object, as the editor does for a class that gains the event. A widget's added `Tick` or `OnPaint` sets its flag the same way. | Yes |
+| a variable at namespace scope that a patch's method uses | Kept as any namespace-scope variable is: its class is cooked into the mod's own package. See [Global variables](#global-variables). | Yes |
+| a method whose parameters differ from the game function's | Refused: "its parameters ... are not the game function's ...; a replacement takes the same ones, in the same order". Copy them from the SDK header: the type, the name and the direction (a Blueprint output is `T &`). | Refused |
+| a method that the SDK header declares and the game's package lacks | Refused: "has no function of that name of its own, though its declaration has one: the declaration is not the game's". Regenerate the SDK from the same game build as the extracted pak. | Refused |
+| `UKismetSystemLibrary::Delay(1.0f);` in a patch's method | Not yet: refused with "a patched function that waits (a latent call) needs an ubergraph of its own in the game's class; not built yet". | Not yet |
+
+```cpp
+#include "UeApi/Game/ENE_Spider_Grunt_Normal_C.h"
+
+class SlowGrunt : public ENE_Spider_Grunt_Normal_C {
+  UE_PATCH;
+  UE_DEFAULTS {
+    CustomTimeDilation = 0.5f;            // the Blueprint's class defaults
+    HealthComponent->MaxHealth = 180.0f;  // a native component's default subobject
+    PrimaryActorTick.bCanEverTick = true; // one member of a struct
+  }
+  void GetEnemySpawnedCount(int32 &SpawnCount) {
+    ENE_Spider_Grunt_Normal_C::GetEnemySpawnedCount(SpawnCount); // the game's body
+    SpawnCount = SpawnCount + 1;
+  }
+};
+```
+
+Notes:
+
+- A component whose cooked data lists the properties the engine copies from its template keeps that list valid: an
+  edit of a listed property keeps it, and any other edit makes the engine copy the whole template.
+- Functions that a timeline or a component event calls by name stay bound to the same functions after a patch
+  replaces them.
+- A patch cannot add input: see [Timers and input](#timers-and-input).
+
+### Building edits
+
+| You write | What it does | Status |
+|---|---|---|
+| `assetgen compile <source> <UeApi> <out-dir> --game <extracted pak>/FSD/Content` | Reads each package an edit names from that folder and writes the edited copy at the same path under the `Content` folder the out dir sits in, as for a class in a `Game::` namespace (see [Building mods](GUIDE.md#building-mods)). It prints one line per package: `edit -> <package>.uasset (the game's, edited: ...)`. | Yes |
+| `game_content: <extracted pak>/FSD/Content` in `mods.yaml` | bpbuild passes it to every compile as `--game`. An edited package counts as the mod's output, so a newer copy of it in `game_content`, from a new extract after a game update, rebuilds the mod. | Yes |
+
+Notes:
+
+- Extract the pak with UE 4.27's own UnrealPak: `UnrealPak.exe FSD-WindowsNoEditor.pak -Extract <dir>`, then pass
+  `<dir>/FSD/Content`. Extract it again after every game update, so the edit starts from the current package.
+- The edited package is the whole package, so of two paks that edit the same asset, the game loads only one copy.
+  Put every edit of an asset in one mod.
+- The compiler reads each edited value and function back before it writes the package. The test suite also reads
+  every edited package back whole (`assetgen roundtrip`), checks that only the named values differ and every other
+  export is byte-identical, and runs the replaced functions in its offline VM.
+  Loaded in the game so far: a data asset's members, a Blueprint's class defaults and a native component's. A component
+  template's edit, a path, a set or map delta and a replaced function are checked offline only.
+- A Blueprint that derives from a patched one, and an asset that references it, are not rebuilt. Both are expected to
+  keep working while the names and types the patch keeps stay the same; this is not checked yet.
 
 ## Event dispatchers
 
@@ -5499,6 +5621,9 @@ listed here is refused with "unimplemented intrinsic".
 | `TSubclassOf<T>`, `UClass *` | Class References. `TSubclassOf<T>` takes T and its subclasses. | [Types](#types) |
 | `UE_ASSET_ALL(Class)` | Declares `All`: soft pointers to every UE_ASSET_AT of Class or a subclass in this namespace and the ones inside it, filled in at build time. | [Game assets](#game-assets) |
 | `UE_ASSET_AT(Class, Name, Path)` | Names an asset that another package holds, the game's or another mod's, so that `&Name` points at it. | [Game assets](#game-assets) |
+| `UE_ASSET_EDIT(Asset) { .Member = value };` | Edits a game asset that a UE_ASSET_AT names: the members the braces name, written into the asset's own package. | [Editing game packages](#editing-game-packages) |
+| `UE_ASSET_EDIT__`, `UE_ASSET_EDIT__CAT`, `UE_ASSET_EDIT__CAT2` | Internal to UE_ASSET_EDIT and UE_ASSET_EDITS. Not written in a mod. | [Editing game packages](#editing-game-packages) |
+| `UE_ASSET_EDITS { Asset.Member[1].Field = value; }` | Edits game assets by path: each statement changes one member, or one part of a member's value. | [Editing game packages](#editing-game-packages) |
 | `UE_AUTHORITY_ONLY` | Authority Only (BlueprintAuthorityOnly): on an actor or its component, a call on a machine without authority is skipped; an engine or game static with this mark, on a client. | [RPCs](#rpcs) |
 | `UE_AWAIT(Dispatcher)` | The rest of the function runs when the dispatcher next fires. Its value is the dispatcher's parameter when it has exactly one; two or more are bound one name each, `auto [Who, Points] = UE_AWAIT(OnScored);`. | [Waiting on events](#waiting-on-events) |
 | `UE_CATEGORY("Setup\|Doors")` | The editor category of the functions and variables that follow it, `\|` starting a subcategory. It is written into the editor API stub only. | [Classes and variables](#classes-and-variables) |
@@ -5521,6 +5646,7 @@ listed here is refused with "unimplemented intrinsic".
 | `UE_NAME_CASE("Text")` | A case of UE_NAME_SWITCH. Every case of one must be written this way. | [Statements and control flow](#statements-and-control-flow) |
 | `UE_NAME_SWITCH(Name)` | `switch` on an FName, the editor's Switch on Name. | [Statements and control flow](#statements-and-control-flow) |
 | `UE_NO_OPTIMIZE` | Compiles the function as written: unused pure calls, unread locals and constant branches stay. | [The optimizer](#the-optimizer) |
+| `UE_PATCH` | Makes the class a patch of the game Blueprint it derives from: its UE_DEFAULTS and methods are written into that Blueprint's own package. | [Editing game packages](#editing-game-packages) |
 | `UE_PURE` | A pure function (BlueprintPure), drawn without exec pins. It must return a value. | [Functions](#functions) |
 | `UE_RELIABLE` | Makes a UE_SERVER, UE_CLIENT or UE_MULTICAST RPC reliable. Refused on a method that is not an RPC. | [RPCs](#rpcs) |
 | `UE_REPLICATED(Type, Name)` | A replicated variable. The initializer after the macro is its default, and the class gets bReplicates. | [Replication](#replication) |
@@ -5577,7 +5703,7 @@ and where the feature is described. In each group, the messages you are most lik
 - `the source declares no UE_MOD_PACKAGE, so its classes have no /Game path`: the source and the headers it includes
   have no `UE_MOD_PACKAGE("/Game/...");` line. Fix: add `UE_MOD_PACKAGE("/Game/_MyMods/<ModName>");` after the
   includes. Namespaces then become folders under that path. See [Mod sources and packages](#mod-sources-and-packages).
-- `the source declares no UE_STRUCT, UE_ENUM or class deriving from a UE class`: nothing in the source would be cooked,
+- `the source declares no UE_STRUCT, UE_ENUM, class deriving from a UE class, asset or edit`: nothing in the source would be cooked,
   for example a file that holds only inline helper functions. Fix: declare a class that derives from a UE class, a
   UE_STRUCT or a UE_ENUM in it. A file of shared helpers belongs in a header that the mod's sources include, not in the
   mod's `sources` list in `mods.yaml`. See [Mod sources and packages](#mod-sources-and-packages).
@@ -6303,6 +6429,47 @@ so the retail game prints nothing. See [Strings and text](#strings-and-text) and
   something other than a member call. C++ allows only member calls, so ordinary code does not reach it. Fix: call it
   on an object, `Obj->GetOuter()`, or as `GetName()` on this. See
   [Working with other objects](#working-with-other-objects).
+- `<Where>: an edit starts from the game's own package: pass the folder /Game is in (assetgen compile --game
+  <extracted pak>/FSD/Content; bpbuild: game_content in mods.yaml)`: a `UE_ASSET_EDIT`, `UE_ASSET_EDITS` or
+  `UE_PATCH` compiled without `--game`. Fix: pass the extracted pak's `Content` folder. See
+  [Editing game packages](#editing-game-packages).
+- `UE_ASSET_EDIT(<Asset>): the target is a UE_ASSET_AT (every asset in UeAssets/ is one); a mod's own asset takes its
+  values where it is declared`, and `UE_ASSET_EDITS: <Asset> is not a UE_ASSET_AT ...`: an edit of an asset the mod
+  cooks itself. Fix: set the value in that asset's own braces. See [Editing game packages](#editing-game-packages).
+- `... <Array> has <N> elements`: a path's index past the end of the array the game's package holds. Fix: index
+  an element the array has, or assign the whole array. See [Editing game packages](#editing-game-packages).
+- `<Where>: <Member> is not set on <Object> (it takes the archetype's), and the path goes through a native struct or an
+  element, whose other parts are unknown here: assign the whole of <Member>`: the object has no value of the member,
+  so the rest of a native struct or an element around the path is unknown. Fix: assign the whole member. See
+  [Editing game packages](#editing-game-packages).
+- `<Where>: <Path>: only a TArray's element can be assigned on its own; assign the whole map` (or `set`, or `value`):
+  a path step `[...]` into a `TMap`, a `TSet` or a value that is no array. Fix: assign the whole container. See
+  [Editing game packages](#editing-game-packages).
+- `<Class> (UE_PATCH): a patch derives from the game Blueprint it edits (a class in a /Game package); a native class's
+  defaults come from its C++ constructor, not from a package`: a patch of an engine or game C++ class. Fix: patch a
+  game Blueprint, or derive a class of your own. See [Editing game packages](#editing-game-packages).
+- `<Class> (UE_PATCH): a patch edits its parent's defaults and replaces its functions; a member or an interface of its
+  own is not built yet`: a patch that declares a variable or implements an interface. Fix: keep the state in another
+  class of the mod. See [Editing game packages](#editing-game-packages).
+- `<Class> (UE_PATCH): nothing to edit - a patch's defaults go in UE_DEFAULTS { Field = value; }, and its methods
+  replace the Blueprint's functions of the same name`: a patch with neither. See
+  [Editing game packages](#editing-game-packages).
+- `<Class> (UE_PATCH): <Package> holds no <Class>:<Component>_GEN_VARIABLE - the class does not override that
+  inherited component. Patch the Blueprint that declares it instead (every child that does not override it changes
+  too); adding an override record here is not built yet`: a parent Blueprint's component this Blueprint never
+  overrides. Fix: patch the parent that declares it. See [Editing game packages](#editing-game-packages).
+- `<Class> (UE_PATCH): <Component> is not one of <Blueprint>'s components (UeApi gives it no SCS node)`: a
+  `Comp->Field` through a member that is not a component the Blueprint adds. Fix: set it on a component, or set the
+  member itself. See [Editing game packages](#editing-game-packages).
+- `<Class> (UE_PATCH)::<Function>: its parameters <ours> are not the game function's <theirs>; a replacement takes
+  the same ones, in the same order`: a replacement whose parameters differ in type, name or direction. Fix: copy them
+  from the SDK header. See [Editing game packages](#editing-game-packages).
+- `<Class> (UE_PATCH)::<Function>: <Blueprint> has no function of that name of its own, though its declaration has
+  one: the declaration is not the game's`: the SDK header and the extracted package come from different game builds.
+  Fix: regenerate the SDK, or extract the pak again. See [Editing game packages](#editing-game-packages).
+- `<Class> (UE_PATCH)::<Function>: a patched function that waits (a latent call) needs an ubergraph of its own in the
+  game's class; not built yet`: a Delay or another latent call in a patch's method. Fix: wait in a class of the mod's
+  own. See [Editing game packages](#editing-game-packages).
 
 ### Event dispatchers, timers and input
 
