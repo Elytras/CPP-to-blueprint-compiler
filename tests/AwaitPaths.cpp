@@ -6,7 +6,8 @@ path reaches the node (K2Node_BaseAsyncTask.cpp 410-467): Activate may broadcast
 Activate starts its work (AsyncActionLoadPrimaryAsset.cpp 6-35) runs it again on a second call. The compiler places
 each await's Activate by the order the awaits run, not the order it lowers them: the else branch's await activates its
 task as the then branch's does, and an await inside a loop activates it on the first round only (the loop's first
-round runs as a copy before it, whose await resumes in the loop).
+round runs as a copy before it, whose await resumes in the loop). A variable assigned again holds a new action, which
+its next await activates in turn.
 */
 #include "UeApi/Types.h"
 
@@ -49,5 +50,14 @@ public:
       Image = UE_AWAIT(T->OnSuccess);
       ++Rounds;
     }
+  }
+
+  /* T assigned a second task after the first one's await: the second is a new action, activated as the first was. */
+  void Again(FString Url) {
+    UAsyncTaskDownloadImage *T = UAsyncTaskDownloadImage::DownloadImage(Url);
+    Image = UE_AWAIT(T->OnSuccess);
+    T = UAsyncTaskDownloadImage::DownloadImage(Url);
+    Image = UE_AWAIT(T->OnSuccess);
+    Rounds = 2;
   }
 };

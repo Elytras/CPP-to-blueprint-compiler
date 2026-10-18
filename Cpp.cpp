@@ -82,7 +82,7 @@ const Json* Nth(const Json& N, size_t I)
 }
 
 std::string StripTypeKeywords(std::string T);
-bool IsTEnumType(std::string T);
+bool IsTEnumType(std::string T, const std::string& Of = "TEnum");
 const Json* PeelLvalue(const Json* N);
 bool IsFixedOperand(const Json& N);
 /* `(L[Idx()] = 3) += 1`: AssignedPlace writes an assignment's left side only when it is a plain variable. */
@@ -188,9 +188,8 @@ bool IsUnsetInit(const Json& E)
 /* Every type spelling under N with the aliases in scope written out. clang spells a use as the source did, and a
    class-scope alias means what it says only inside that class and the ones deriving it - so it is expanded there,
    once, before anything reads a type. A name already qualified (`A::Leaf`) is left alone. */
-void ExpandAliases(Json& N, const std::map<std::string, std::string>& InScope)
+static void ExpandAliasesAt(Json& N, const std::map<std::string, std::string>& InScope)
 {
-    if (!N.is_structured()) return;
     auto T = N.is_object() ? N.find("type") : N.end();
     if (T != N.end() && T->is_object() && T->contains("qualType"))
     {
@@ -208,7 +207,35 @@ void ExpandAliases(Json& N, const std::map<std::string, std::string>& InScope)
         }
         if (Out != Q) (*T)["qualType"] = Out;
     }
+}
+
+void ExpandAliases(Json& N, const std::map<std::string, std::string>& InScope)
+{
+    if (!N.is_structured()) return;
+    ExpandAliasesAt(N, InScope);
     for (Json& C : N) ExpandAliases(C, InScope);
+}
+
+/* The same for an alias declared in a function, `using T = int32;` or a typedef: it means what it says from its
+   declaration to the end of the block holding it, nested blocks included. */
+void ExpandLocalAliases(Json& N, const std::map<std::string, std::string>& InScope)
+{
+    if (!N.is_structured()) return;
+    if (!InScope.empty()) ExpandAliasesAt(N, InScope);
+    if (N.is_object() && N.value("kind", std::string()) == "CompoundStmt" && N.contains("inner"))
+    {
+        std::map<std::string, std::string> Block = InScope;
+        for (Json& S : N["inner"])
+        {
+            ExpandLocalAliases(S, Block);
+            if (S.value("kind", std::string()) == "DeclStmt" && S.contains("inner"))
+                for (const Json& D : S["inner"])
+                    if ((Kind(D) == "TypeAliasDecl" || Kind(D) == "TypedefDecl") && D.contains("name"))
+                        Block[Name(D)] = StripTypeKeywords(TypeOf(D));
+        }
+        return;
+    }
+    for (Json& C : N) ExpandLocalAliases(C, InScope);
 }
 
 /* A CXXOperatorCallExpr whose callee is operator=: struct assignment, which clang does not spell
@@ -258,13 +285,16 @@ bool AssignmentSides(const Json& S, const Json*& Lhs, const Json*& Rhs)
 }
 
 /* One UE_DEFAULTS statement, `Field = value;` or `Component->Field = value;`: the field's MemberExpr, the value, and
-   the component's MemberExpr it reaches through (null for none). False for any other statement. */
+   the component's MemberExpr it reaches through (null for none). False for any other statement, among them part of a
+   struct (`Hit.Distance = 5.0f;`, which is no component's member) and a member of anything but this object
+   (`GetOwner()->InitialLifeSpan`, which is no default of its class's). */
 bool DefaultAssignment(const Json& S, const Json*& Lhs, const Json*& Rhs, const Json*& Through)
 {
     if (!AssignmentSides(S, Lhs, Rhs) || Kind(*Lhs) != "MemberExpr") return false;
     const Json* Owner = Strip(First(*Lhs));
-    Through = Owner && Kind(*Owner) == "MemberExpr" ? Owner : nullptr;
-    return true;
+    Through = Owner && Kind(*Owner) == "MemberExpr" && Lhs->value("isArrow", false) ? Owner : nullptr;
+    const Json* Self = Through ? Strip(First(*Through)) : Owner;
+    return Self && Kind(*Self) == "CXXThisExpr";
 }
 
 /* A UE_DEFAULTS statement `Comp->SetupAttachment(Parent, Socket)`: the call's MemberExpr, the object it is called on,
@@ -278,6 +308,26 @@ bool AttachmentCall(const Json& S, const Json*& Callee, const Json*& Child, cons
     Parent = Strip(Nth(*Call, 1));
     Socket = Nth(*Call, 2);
     return Child != nullptr;
+}
+
+/* UE_SLOT's and UE_BIND's call (UeMeta.h), "UeSlot__" or "UeBind__", or "" for any other statement. */
+std::string LayoutHelperCall(const Json& S)
+{
+    const Json* N = Strip(&S);
+    const Json* Fn = N && Kind(*N) == "CallExpr" ? Strip(First(*N)) : nullptr;
+    const std::string Name = Fn && Kind(*Fn) == "DeclRefExpr" ? Fn->value("referencedDecl", Json::object()).value("name", std::string())
+                                                               : std::string();
+    return Name == "UeSlot__" || Name == "UeBind__" ? Name : std::string();
+}
+
+/* S39: a statement of a widget class's layout by its shape alone, `Root->AddChildToCanvas(Title)->SetPosition(...);`,
+   `Title->SetText(...);`, `Play->OnClicked.Add(this, &UMyCard::OnPlay);`, `UCanvasPanelSlot* At = Root->AddChildToCanvas(Title);`
+   or a UE_SLOT or UE_BIND: a method call, a local or a layout helper. Generate reads what it means and refuses what it
+   cannot. */
+bool WidgetLayoutStatement(const Json& S)
+{
+    const Json* N = Strip(&S);
+    return N && (Kind(*N) == "CXXMemberCallExpr" || Kind(*N) == "DeclStmt" || !LayoutHelperCall(S).empty());
 }
 
 /* A set's or map's elements as the braces leave them in C++: each key once, where it first appears, holding the last
@@ -636,6 +686,218 @@ std::string ParmTypeOf(const Json& P, bool* bRef = nullptr)
 /* WorldContextObject, WorldContext, Dumper-7's WorldContextObject_0: the parameter a Blueprint wires to self. */
 bool IsWcoName(const std::string& N) { return N.compare(0, 12, "WorldContext") == 0; }
 
+/* UE_INPUT_KEY / UE_INPUT_ACTION on the method that follows it: the key or the action, then the options, as
+   `<name>|<options>` (UeMeta.h). */
+struct FInputMark
+{
+    std::string Method;
+    const Json* Decl = nullptr;
+    bool bAction = false;
+    std::string Spec;
+};
+
+/* The marker as written, for a message. */
+static std::string InputMarkText(const FInputMark& M)
+{
+    const size_t Bar = std::min(M.Spec.find('|'), M.Spec.size());
+    const std::string Options = Bar < M.Spec.size() ? M.Spec.substr(Bar + 1) : std::string();
+    return std::string(M.bAction ? "UE_INPUT_ACTION" : "UE_INPUT_KEY") + "(\"" + M.Spec.substr(0, Bar) + "\""
+         + (Options.empty() ? "" : ", " + Options) + ")";
+}
+
+/* UE_TIMELINE_UPDATE / UE_TIMELINE_FINISHED / UE_TIMELINE_EVENT on the method that follows it: the timeline, then an
+   event track's times, as `<timeline>|<times>` (UeMeta.h). Kind is 'U', 'F' or 'E'. */
+struct FTimelineMark
+{
+    std::string Method;
+    const Json* Decl = nullptr;
+    char Kind = 'U';
+    std::string Spec;
+};
+
+static std::string TimelineMarkText(const FTimelineMark& M)
+{
+    const size_t Bar = std::min(M.Spec.find('|'), M.Spec.size());
+    const std::string Times = Bar < M.Spec.size() ? M.Spec.substr(Bar + 1) : std::string();
+    return std::string(M.Kind == 'U' ? "UE_TIMELINE_UPDATE" : M.Kind == 'F' ? "UE_TIMELINE_FINISHED" : "UE_TIMELINE_EVENT")
+         + "(" + M.Spec.substr(0, Bar) + (Times.empty() ? "" : ", " + Times) + ")";
+}
+
+/* The engine's names of the keys DRG has, FKey::KeyName: UE 4.27's EKeys (InputCoreTypes.cpp 14-430, and Touch1 to
+   Touch10, which its FKeyInitializer names, 217-227), the GenericUSBController keys of FSDRawInput, DRG's copy of the
+   engine's RawInput plugin (RawInput.cpp 15-43), and the OculusInput and SteamVR plugins' own (OculusInput.cpp 20-69,
+   SteamVRControllerKeys.h 36-93). Each is a string of FSD-Win64-Shipping.exe but the letters and the touch keys, and
+   no other plugin's key is. Sorted, case aside. */
+const char* const kKeyNames[] = {
+    "A", "A_AccentGrave", "Acceleration", "Add", "Ampersand", "Android_Back", "Android_Menu", "Android_Volume_Down",
+    "Android_Volume_Up", "AnyKey", "Apostrophe", "Asterix", "B", "Backslash", "BackSpace", "C", "C_Cedille",
+    "CapsLock", "Caret", "Colon", "Comma", "Cosmos_Left_Bumper_Click", "Cosmos_Left_Grip_Axis",
+    "Cosmos_Left_Grip_Click", "Cosmos_Left_Menu_Click", "Cosmos_Left_Thumbstick_Click", "Cosmos_Left_Thumbstick_Down",
+    "Cosmos_Left_Thumbstick_Left", "Cosmos_Left_Thumbstick_Right", "Cosmos_Left_Thumbstick_Touch",
+    "Cosmos_Left_Thumbstick_Up", "Cosmos_Left_Thumbstick_Vector", "Cosmos_Left_Thumbstick_X",
+    "Cosmos_Left_Thumbstick_Y", "Cosmos_Left_Trigger_Axis", "Cosmos_Left_Trigger_Click", "Cosmos_Left_Trigger_Touch",
+    "Cosmos_Left_X_Click", "Cosmos_Left_X_Touch", "Cosmos_Left_Y_Click", "Cosmos_Left_Y_Touch", "Cosmos_Right_A_Click",
+    "Cosmos_Right_A_Touch", "Cosmos_Right_B_Click", "Cosmos_Right_B_Touch", "Cosmos_Right_Bumper_Click",
+    "Cosmos_Right_Grip_Axis", "Cosmos_Right_Grip_Click", "Cosmos_Right_System_Click", "Cosmos_Right_Thumbstick_Click",
+    "Cosmos_Right_Thumbstick_Down", "Cosmos_Right_Thumbstick_Left", "Cosmos_Right_Thumbstick_Right",
+    "Cosmos_Right_Thumbstick_Touch", "Cosmos_Right_Thumbstick_Up", "Cosmos_Right_Thumbstick_Vector",
+    "Cosmos_Right_Thumbstick_X", "Cosmos_Right_Thumbstick_Y", "Cosmos_Right_Trigger_Axis",
+    "Cosmos_Right_Trigger_Click", "Cosmos_Right_Trigger_Touch", "D", "Daydream_Left_Select_Click",
+    "Daydream_Left_Trackpad_Click", "Daydream_Left_Trackpad_Touch", "Daydream_Left_Trackpad_X",
+    "Daydream_Left_Trackpad_Y", "Daydream_Right_Select_Click", "Daydream_Right_Trackpad_Click",
+    "Daydream_Right_Trackpad_Touch", "Daydream_Right_Trackpad_X", "Daydream_Right_Trackpad_Y", "Decimal", "Delete",
+    "Divide", "Dollar", "Down", "E", "E_AccentAigu", "E_AccentGrave", "Eight", "End", "Enter", "Equals", "Escape",
+    "Exclamation", "F", "F1", "F10", "F11", "F12", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "Five", "Four", "G",
+    "Gamepad_DPad_Down", "Gamepad_DPad_Left", "Gamepad_DPad_Right", "Gamepad_DPad_Up", "Gamepad_FaceButton_Bottom",
+    "Gamepad_FaceButton_Left", "Gamepad_FaceButton_Right", "Gamepad_FaceButton_Top", "Gamepad_Left2D",
+    "Gamepad_LeftShoulder", "Gamepad_LeftStick_Down", "Gamepad_LeftStick_Left", "Gamepad_LeftStick_Right",
+    "Gamepad_LeftStick_Up", "Gamepad_LeftThumbstick", "Gamepad_LeftTrigger", "Gamepad_LeftTriggerAxis",
+    "Gamepad_LeftX", "Gamepad_LeftY", "Gamepad_Right2D", "Gamepad_RightShoulder", "Gamepad_RightStick_Down",
+    "Gamepad_RightStick_Left", "Gamepad_RightStick_Right", "Gamepad_RightStick_Up", "Gamepad_RightThumbstick",
+    "Gamepad_RightTrigger", "Gamepad_RightTriggerAxis", "Gamepad_RightX", "Gamepad_RightY", "Gamepad_Special_Left",
+    "Gamepad_Special_Left_X", "Gamepad_Special_Left_Y", "Gamepad_Special_Right", "GenericUSBController_Axis1",
+    "GenericUSBController_Axis2", "GenericUSBController_Axis3", "GenericUSBController_Axis4",
+    "GenericUSBController_Axis5", "GenericUSBController_Axis6", "GenericUSBController_Axis7",
+    "GenericUSBController_Axis8", "GenericUSBController_Button1", "GenericUSBController_Button10",
+    "GenericUSBController_Button11", "GenericUSBController_Button12", "GenericUSBController_Button13",
+    "GenericUSBController_Button14", "GenericUSBController_Button15", "GenericUSBController_Button16",
+    "GenericUSBController_Button17", "GenericUSBController_Button18", "GenericUSBController_Button19",
+    "GenericUSBController_Button2", "GenericUSBController_Button20", "GenericUSBController_Button3",
+    "GenericUSBController_Button4", "GenericUSBController_Button5", "GenericUSBController_Button6",
+    "GenericUSBController_Button7", "GenericUSBController_Button8", "GenericUSBController_Button9", "Gesture_Flick",
+    "Gesture_Pinch", "Gesture_Rotate", "Global_Back", "Global_Menu", "Global_Pause", "Global_Play", "Global_View",
+    "Gravity", "H", "Home", "Hyphen", "I", "Insert", "J", "K", "L", "Left", "LeftAlt", "LeftBracket", "LeftCommand",
+    "LeftControl", "LeftMouseButton", "LeftParantheses", "LeftShift", "M", "MiddleMouseButton",
+    "MixedReality_Left_Grip_Click", "MixedReality_Left_Menu_Click", "MixedReality_Left_Thumbstick_Click",
+    "MixedReality_Left_Thumbstick_Down", "MixedReality_Left_Thumbstick_Left", "MixedReality_Left_Thumbstick_Right",
+    "MixedReality_Left_Thumbstick_Up", "MixedReality_Left_Thumbstick_X", "MixedReality_Left_Thumbstick_Y",
+    "MixedReality_Left_Trackpad_Click", "MixedReality_Left_Trackpad_Down", "MixedReality_Left_Trackpad_Left",
+    "MixedReality_Left_Trackpad_Right", "MixedReality_Left_Trackpad_Touch", "MixedReality_Left_Trackpad_Up",
+    "MixedReality_Left_Trackpad_X", "MixedReality_Left_Trackpad_Y", "MixedReality_Left_Trigger_Axis",
+    "MixedReality_Left_Trigger_Click", "MixedReality_Right_Grip_Click", "MixedReality_Right_Menu_Click",
+    "MixedReality_Right_Thumbstick_Click", "MixedReality_Right_Thumbstick_Down", "MixedReality_Right_Thumbstick_Left",
+    "MixedReality_Right_Thumbstick_Right", "MixedReality_Right_Thumbstick_Up", "MixedReality_Right_Thumbstick_X",
+    "MixedReality_Right_Thumbstick_Y", "MixedReality_Right_Trackpad_Click", "MixedReality_Right_Trackpad_Down",
+    "MixedReality_Right_Trackpad_Left", "MixedReality_Right_Trackpad_Right", "MixedReality_Right_Trackpad_Touch",
+    "MixedReality_Right_Trackpad_Up", "MixedReality_Right_Trackpad_X", "MixedReality_Right_Trackpad_Y",
+    "MixedReality_Right_Trigger_Axis", "MixedReality_Right_Trigger_Click", "Mouse2D", "MouseScrollDown",
+    "MouseScrollUp", "MouseWheelAxis", "MouseX", "MouseY", "Multiply", "N", "Nine", "NumLock", "NumPadEight",
+    "NumPadFive", "NumPadFour", "NumPadNine", "NumPadOne", "NumPadSeven", "NumPadSix", "NumPadThree", "NumPadTwo",
+    "NumPadZero", "O", "OculusHand_Left_IndexPinch", "OculusHand_Left_IndexPinchStrength",
+    "OculusHand_Left_MiddlePinch", "OculusHand_Left_MiddlePinchStrength", "OculusHand_Left_PinkPinch",
+    "OculusHand_Left_PinkPinchStrength", "OculusHand_Left_RingPinch", "OculusHand_Left_RingPinchStrength",
+    "OculusHand_Left_SystemGesture", "OculusHand_Left_ThumbPinch", "OculusHand_Left_ThumbPinchStrength",
+    "OculusHand_Right_IndexPinch", "OculusHand_Right_IndexPinchStrength", "OculusHand_Right_MiddlePinch",
+    "OculusHand_Right_MiddlePinchStrength", "OculusHand_Right_PinkPinch", "OculusHand_Right_PinkPinchStrength",
+    "OculusHand_Right_RingPinch", "OculusHand_Right_RingPinchStrength", "OculusHand_Right_SystemGesture",
+    "OculusHand_Right_ThumbPinch", "OculusHand_Right_ThumbPinchStrength", "OculusRemote_Back",
+    "OculusRemote_DPad_Down", "OculusRemote_DPad_Left", "OculusRemote_DPad_Right", "OculusRemote_DPad_Up",
+    "OculusRemote_Enter", "OculusRemote_Home", "OculusRemote_VolumeDown", "OculusRemote_VolumeUp",
+    "OculusTouch_Left_FaceButton1", "OculusTouch_Left_FaceButton2", "OculusTouch_Left_Grip_Axis",
+    "OculusTouch_Left_Grip_Click", "OculusTouch_Left_IndexPointing", "OculusTouch_Left_Menu_Click",
+    "OculusTouch_Left_Thumbstick", "OculusTouch_Left_Thumbstick_Click", "OculusTouch_Left_Thumbstick_Down",
+    "OculusTouch_Left_Thumbstick_Left", "OculusTouch_Left_Thumbstick_Right", "OculusTouch_Left_Thumbstick_Touch",
+    "OculusTouch_Left_Thumbstick_Up", "OculusTouch_Left_Thumbstick_X", "OculusTouch_Left_Thumbstick_Y",
+    "OculusTouch_Left_ThumbUp", "OculusTouch_Left_Trigger", "OculusTouch_Left_Trigger_Axis",
+    "OculusTouch_Left_Trigger_Click", "OculusTouch_Left_Trigger_Touch", "OculusTouch_Left_X_Click",
+    "OculusTouch_Left_X_Touch", "OculusTouch_Left_Y_Click", "OculusTouch_Left_Y_Touch", "OculusTouch_Right_A_Click",
+    "OculusTouch_Right_A_Touch", "OculusTouch_Right_B_Click", "OculusTouch_Right_B_Touch",
+    "OculusTouch_Right_FaceButton1", "OculusTouch_Right_FaceButton2", "OculusTouch_Right_Grip_Axis",
+    "OculusTouch_Right_Grip_Click", "OculusTouch_Right_IndexPointing", "OculusTouch_Right_System_Click",
+    "OculusTouch_Right_Thumbstick", "OculusTouch_Right_Thumbstick_Click", "OculusTouch_Right_Thumbstick_Down",
+    "OculusTouch_Right_Thumbstick_Left", "OculusTouch_Right_Thumbstick_Right", "OculusTouch_Right_Thumbstick_Touch",
+    "OculusTouch_Right_Thumbstick_Up", "OculusTouch_Right_Thumbstick_X", "OculusTouch_Right_Thumbstick_Y",
+    "OculusTouch_Right_ThumbUp", "OculusTouch_Right_Trigger", "OculusTouch_Right_Trigger_Axis",
+    "OculusTouch_Right_Trigger_Click", "OculusTouch_Right_Trigger_Touch", "One", "P", "PageDown", "PageUp", "Pause",
+    "Period", "PS4_Special", "Q", "Quote", "R", "Right", "RightAlt", "RightBracket", "RightCommand", "RightControl",
+    "RightMouseButton", "RightParantheses", "RightShift", "RotationRate", "S", "ScrollLock", "Section", "Semicolon",
+    "Seven", "Six", "Slash", "SpaceBar", "Steam_Back_Left", "Steam_Back_Right", "Steam_Touch_0", "Steam_Touch_1",
+    "Steam_Touch_2", "Steam_Touch_3", "SteamVR_HMD_Proximity", "SteamVR_MotionController_None", "Subtract", "T", "Tab",
+    "Three", "ThumbMouseButton", "ThumbMouseButton2", "Tilde", "Tilt", "Touch1", "Touch10", "Touch2", "Touch3",
+    "Touch4", "Touch5", "Touch6", "Touch7", "Touch8", "Touch9", "Two", "U", "Underscore", "Up", "V",
+    "ValveIndex_Left_A_Click", "ValveIndex_Left_A_Touch", "ValveIndex_Left_B_Click", "ValveIndex_Left_B_Touch",
+    "ValveIndex_Left_Grip_Axis", "ValveIndex_Left_Grip_Force", "ValveIndex_Left_Grip_Grab",
+    "ValveIndex_Left_Pinch_Grab", "ValveIndex_Left_System_Click", "ValveIndex_Left_System_Touch",
+    "ValveIndex_Left_Thumbstick_Click", "ValveIndex_Left_Thumbstick_Down", "ValveIndex_Left_Thumbstick_Left",
+    "ValveIndex_Left_Thumbstick_Right", "ValveIndex_Left_Thumbstick_Touch", "ValveIndex_Left_Thumbstick_Up",
+    "ValveIndex_Left_Thumbstick_X", "ValveIndex_Left_Thumbstick_Y", "ValveIndex_Left_Trackpad_Down",
+    "ValveIndex_Left_Trackpad_Force", "ValveIndex_Left_Trackpad_Left", "ValveIndex_Left_Trackpad_Right",
+    "ValveIndex_Left_Trackpad_Touch", "ValveIndex_Left_Trackpad_Up", "ValveIndex_Left_Trackpad_X",
+    "ValveIndex_Left_Trackpad_Y", "ValveIndex_Left_Trigger_Axis", "ValveIndex_Left_Trigger_Click",
+    "ValveIndex_Left_Trigger_Touch", "ValveIndex_Right_A_Click", "ValveIndex_Right_A_Touch",
+    "ValveIndex_Right_B_Click", "ValveIndex_Right_B_Touch", "ValveIndex_Right_Grip_Axis",
+    "ValveIndex_Right_Grip_Force", "ValveIndex_Right_Grip_Grab", "ValveIndex_Right_Pinch_Grab",
+    "ValveIndex_Right_System_Click", "ValveIndex_Right_System_Touch", "ValveIndex_Right_Thumbstick_Click",
+    "ValveIndex_Right_Thumbstick_Down", "ValveIndex_Right_Thumbstick_Left", "ValveIndex_Right_Thumbstick_Right",
+    "ValveIndex_Right_Thumbstick_Touch", "ValveIndex_Right_Thumbstick_Up", "ValveIndex_Right_Thumbstick_X",
+    "ValveIndex_Right_Thumbstick_Y", "ValveIndex_Right_Trackpad_Down", "ValveIndex_Right_Trackpad_Force",
+    "ValveIndex_Right_Trackpad_Left", "ValveIndex_Right_Trackpad_Right", "ValveIndex_Right_Trackpad_Touch",
+    "ValveIndex_Right_Trackpad_Up", "ValveIndex_Right_Trackpad_X", "ValveIndex_Right_Trackpad_Y",
+    "ValveIndex_Right_Trigger_Axis", "ValveIndex_Right_Trigger_Click", "ValveIndex_Right_Trigger_Touch",
+    "Vive_Left_Grip_Click", "Vive_Left_Menu_Click", "Vive_Left_System_Click", "Vive_Left_Trackpad_Click",
+    "Vive_Left_Trackpad_Down", "Vive_Left_Trackpad_Left", "Vive_Left_Trackpad_Right", "Vive_Left_Trackpad_Touch",
+    "Vive_Left_Trackpad_Up", "Vive_Left_Trackpad_X", "Vive_Left_Trackpad_Y", "Vive_Left_Trigger_Axis",
+    "Vive_Left_Trigger_Click", "Vive_Right_Grip_Click", "Vive_Right_Menu_Click", "Vive_Right_System_Click",
+    "Vive_Right_Trackpad_Click", "Vive_Right_Trackpad_Down", "Vive_Right_Trackpad_Left", "Vive_Right_Trackpad_Right",
+    "Vive_Right_Trackpad_Touch", "Vive_Right_Trackpad_Up", "Vive_Right_Trackpad_X", "Vive_Right_Trackpad_Y",
+    "Vive_Right_Trigger_Axis", "Vive_Right_Trigger_Click", "W", "X", "Y", "Z", "Zero",
+};
+
+/* The characters FGenericPlatformInput::GetStandardPrintableKeyMap names a key by, digits first, letters aside, which
+   are keys of their own name (GenericPlatformInput.cpp 11-111). The engine reads the key typing one of them as that key
+   (FInputKeyManager::InitKeyMappings), so no key is named by one of these characters. */
+const std::pair<const char*, const char*> kCharKeys[] = {
+    { "0", "Zero" }, { "1", "One" }, { "2", "Two" }, { "3", "Three" }, { "4", "Four" }, { "5", "Five" }, { "6", "Six" },
+    { "7", "Seven" }, { "8", "Eight" }, { "9", "Nine" }, { ";", "Semicolon" }, { "=", "Equals" }, { ",", "Comma" },
+    { "-", "Hyphen" }, { ".", "Period" }, { "/", "Slash" }, { "`", "Tilde" }, { "[", "LeftBracket" },
+    { "\\", "Backslash" }, { "]", "RightBracket" }, { "'", "Apostrophe" }, { " ", "SpaceBar" }, { "&", "Ampersand" },
+    { "*", "Asterix" }, { "^", "Caret" }, { ":", "Colon" }, { "$", "Dollar" }, { "!", "Exclamation" },
+    { "(", "LeftParantheses" }, { ")", "RightParantheses" }, { "\"", "Quote" }, { "_", "Underscore" },
+    { "\xC3\xA0", "A_AccentGrave" }, { "\xC3\xA7", "C_Cedille" }, { "\xC3\xA9", "E_AccentAigu" },
+    { "\xC3\xA8", "E_AccentGrave" }, { "\xC2\xA7", "Section" },
+};
+
+/* "" when the engine has a key of this name, else the key it most likely means. An FName ignores case, and so does
+   the lookup. One character is a key unless kCharKeys names it (`1` is One): Windows names the key that types any
+   other after it, on the player's layout, as it starts (FWindowsPlatformInput::GetKeyMap, WindowsPlatformInput.cpp
+   85-115), "+" on a German one. Otherwise the key meant is the shortest that holds the name's letters in order, its
+   digits spelled out (`Space` is SpaceBar, `Ctrl` LeftControl, `Numpad1` NumPadOne), else the fewest edits away. */
+static std::string MisnamedKey(const std::string& Name)
+{
+    const std::string L = Lower(Name);
+    if (std::any_of(std::begin(kKeyNames), std::end(kKeyNames), [&](const char* K) { return Lower(K) == L; }))
+        return std::string();
+    for (const auto& [Char, Key] : kCharKeys)
+        if (Name == Char) return Key;
+    const uint8 Lead = Name.empty() ? 0 : uint8(Name[0]);      // a UTF-8 sequence's first byte says its length
+    if (Lead > ' ' && Name.size() == (Lead < 0x80 ? 1u : Lead < 0xE0 ? 2u : Lead < 0xF0 ? 3u : 4u))
+        return std::string();
+
+    std::string Spelled;
+    for (const char C : L) Spelled += C >= '0' && C <= '9' ? Lower(kCharKeys[C - '0'].second) : std::string(1, C);
+    std::string Meant;
+    size_t Best = ~size_t(0);
+    for (const char* K : kKeyNames)
+    {
+        const std::string LK = Lower(K);
+        size_t Held = 0;
+        for (const char C : LK)
+            if (Held < Spelled.size() && C == Spelled[Held]) ++Held;
+        std::vector<size_t> Row(LK.size() + 1);    // edits from L to LK's first J letters, a row of L at a time
+        for (size_t J = 0; J <= LK.size(); ++J) Row[J] = J;
+        for (size_t I = 0; I < L.size(); ++I)
+            for (size_t J = 0, Diag = Row[0]++; J < LK.size(); ++J)
+            {
+                const size_t Up = Row[J + 1];
+                Row[J + 1] = std::min({ Up + 1, Row[J] + 1, Diag + size_t(L[I] != LK[J]) });
+                Diag = Up;
+            }
+        const size_t Score = Held == Spelled.size() ? LK.size() : 1000 + Row[LK.size()];
+        if (Score < Best) { Meant = K; Best = Score; }
+    }
+    return Meant;
+}
+
 struct FRecord
 {
     std::string CppName;
@@ -649,10 +911,12 @@ struct FRecord
     std::vector<const Json*> AllMethods;            // every in-class method decl, overloads included, in order
     std::vector<const Json*> Fields;
     std::vector<const Json*> Ctors;                 // CXXConstructorDecls: their parameter names place a value's arguments
+    const Json* Dtor = nullptr;                     // the destructor the source declares, if any (LowerCtor refuses it)
     std::vector<std::string> Interfaces;            // every base after the first; a native class's from UeNativeInterfaces
     std::string Tail;                               // genueapi's UeClassTail: "<ScriptInherit flags> <ClassWithin> <ConfigName>"
     std::map<std::string, std::string> Replicated;  // UE_REPLICATED*: variable -> "Notify:Condition"
     std::set<std::string> Components;               // UE_COMPONENT: variables that are also SCS nodes
+    std::vector<std::string> Widgets;               // UE_WIDGET, in declaration order: variables that are also widgets of the tree, the first its root
     /* genueapi's `<X>__UeName`: the engine's name of a member or function Dumper-7 had to respell (`Name_0` is
        `Name`, `Audio_Flying` is `Audio Flying`). C++ keeps its spelling; everything cooked goes through UeNameOf. */
     std::map<std::string, std::string> UeNames;
@@ -670,7 +934,13 @@ struct FRecord
     std::map<std::string, std::string> TypeAliases; // `using Leaf = Game::...::Leaf;` in the class body
     std::set<std::string> FinalMethods;             // `virtual T F() final`: no subclass has an F of its own
     std::set<std::string> Forwarders;               // Methods AssetGen declared, not the source: see SynthesizeForwarders
-    const Json* Defaults = nullptr;                 // UE_DEFAULTS: the static-init block, never lowered
+    std::vector<FInputMark> InputMarks;             // UE_INPUT_KEY / UE_INPUT_ACTION, in the order written
+    std::string InputMisplaced;                     // the first of them no method follows, as written
+    std::map<std::string, std::string> Timelines;   // `<X>__UeTimeline`: UE_TIMELINE's variable -> "<length>|<options>"
+    std::vector<std::pair<std::string, std::string>> Tracks;    // `<X>__UeTrack`: a track's variable -> "<timeline>|<keys>"
+    std::vector<FTimelineMark> TimelineMarks;       // UE_TIMELINE_UPDATE / _FINISHED / _EVENT, in the order written
+    std::string TimelineMisplaced;                  // the first of them no method follows, as written
+    const Json* Defaults = nullptr;                // UE_DEFAULTS: the static-init block, never lowered
     bool bFinal = false;        // `class X final`: X has no subclass
     bool bFinalAsLeaf = false;  // UE_FINAL_AS's leaf: its base's one subclass
     std::string FinalAs;        // UE_FINAL_AS(this, Leaf): Leaf's CppName - compiled as final, cooked Abstract
@@ -1322,6 +1592,8 @@ public:
 
 private:
     bool Collect(std::string* Err);
+    bool LowerCtor(FRecord& R, std::string* Err);
+    std::deque<Json> CtorDefaults;              // the UE_DEFAULTS LowerCtor makes, which the records point into
     bool Generate(const FRecord& R, const std::string& OutDir, std::string* Err);
     /* The native default subobjects a class's UE_DEFAULTS restates: each component member -> the record declaring it. */
     std::map<std::string, const FRecord*> RestatedSubobjects(const FRecord& R) const;
@@ -1419,8 +1691,17 @@ private:
     /* `inline` functions are the editor's macros: never a UFunction, their body is copied into each caller.
        `inline` may sit on the declaration or on an out-of-line definition. */
     bool IsInlineMethod(const FRecord& R, const std::string& Method) const;
+    bool AddInputBindings(const FRecord& R, bool bIsActor, FBlueprintClass& BP, std::string* Err) const;
+    bool AddTimelines(const FRecord& R, bool bIsActor, FBlueprintClass& BP, std::string* Err) const;
     bool CheckMemberNames(const FRecord& R, std::string* Err) const;
     bool IsSceneRecord(const FRecord* C) const;
+    /* S39: R or a mod class above it declares a UE_WIDGET, so R is a WidgetBlueprintGeneratedClass. */
+    bool HasWidgetTree(const FRecord& R) const
+    {
+        for (const FRecord* A = &R; A && !A->IsNative(); A = A->Base.empty() ? nullptr : Find(A->Base))
+            if (!A->Widgets.empty()) return true;
+        return false;
+    }
     bool RootInheritedBy(const FRecord& R) const;
     bool ListsDefaultRootOf(const FRecord& R) const;
     bool ExpandInline(const Json& CallNode, const Json& Def, const std::string& Method, bool bMethod, FBlueprintClass& BP,
@@ -1470,7 +1751,10 @@ private:
        initializer must be const for nothing to write it. Refused where it is used (StaticRefusal). */
     std::map<std::string, const Json*> MutableStatics;
     bool LowerInlineVar(const Json& Var, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
-    bool LowerContainerLiteral(const Json& List, const std::string& Type, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
+    bool LowerContainerLiteral(const Json& List, const std::string& Type, FBlueprintClass& BP, FArgIR& Out, std::string* Err,
+                               const std::vector<FArgIR>* Given = nullptr);
+    bool EnumMapEntries(const std::string& CppEnum, std::vector<std::pair<std::string, int64>>& Out) const;
+    bool LowerEnumMap(const std::string& Type, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     /* The braced list of the inline variable E names (`kPrimes`, `this->kPrimes`), else null; and its elements as VM
        constants of type Elem, false when one is not. A range-for and Contains over one make no array. */
     const Json* InlineListOf(const Json* E) const;
@@ -1494,8 +1778,10 @@ private:
     struct FConstVal { bool bFloat = false; double F = 0; int64 I = 0; double Num() const { return bFloat ? F : double(I); } };
     bool FoldConst(const Json& E, FConstVal& Out) const;
     const Json* ValueCastBelow(const Json& N) const;
+    const Json* StructConversionBelow(const Json& N) const;
     bool FreeNegation(const Json& C, Json& Out) const;
     bool ConstToArg(const FConstVal& V, const std::string& Type, FArgIR& Out) const;
+    std::map<std::string, const Json*> TemplateOf;                      // an instantiation's decl id -> its FunctionTemplateDecl
     std::map<std::string, const Json*> FreeInlines;                     // decl id -> an inline free function's definition
                                                                         // (a template's: each instantiation)
     std::vector<const Json*> FreeInlineOrder;                           // the same definitions in document order: an id is
@@ -1665,13 +1951,19 @@ private:
 
     /* `X::StaticClass()`: the record X names, read back from the mod's sources (clang's JSON keeps no qualifier). */
     const FRecord* NamedQualifier(const Json& Ref) const;
+    /* The class a StaticClass call names, Callee its DeclRefExpr and Slot the type it fills; null when unknown. */
+    const FRecord* StaticClassOf(const Json& Callee, const std::string& Slot) const;
     /* `Base::Method()` on this: the record the qualifier names, read back the same way, else null. */
     const FRecord* MemberQualifier(const Json& Member) const;
+    /* The qualifier written right before a member's name, whatever the object is written as, else empty. */
+    std::string WrittenQualifier(const Json& Member) const;
     /* Whether a call on `this` to R's Method, written in class Written, names R's own: the forwarder's call, one
        written `R::Method()` (MemberQualifier), or one past a declaration of Method from Written up to R, which in C++
        hides R's from an unqualified call - so it got there through a qualifier, however spelled (`this->R::Method()`).
        A forwarder is no declaration of the source's, so this answers the same before and after SynthesizeForwarders. */
     bool NamesQualified(const Json& Callee, const FRecord* Written, const FRecord& R, const std::string& Method) const;
+    /* `Other->Base::Method()`: the qualifier a call on another object is written with, else empty. */
+    std::string QualifiedOnOther(const Json& Callee, const Json& Obj, const FRecord& R, const std::string& Method) const;
     const std::vector<std::string>& ModSources() const;
     bool IsSubclassOf(const FRecord& Child, const FRecord& Parent) const;
     /* The nearest declaration of some method along R's chain is `= 0`: the class Generate cooks CLASS_Abstract. */
@@ -1881,6 +2173,7 @@ private:
     mutable FRecord SynthDeref;
     mutable bool    bSynthDeref = false;
     std::map<std::string, FRecord> Records;
+    std::map<std::string, std::pair<std::string, std::string>> GameClassKinds;   // FBlueprintClass's, filled by Run
     std::map<std::string, std::string> MethodOwner;   // clang decl id -> owning record
     std::map<std::string, std::string> TemplateOwner; // a member template's instantiation's decl id -> its record
     std::map<std::string, std::string> FieldOwner;    // clang decl id -> declaring record
@@ -1982,13 +2275,13 @@ private:
     bool bMadeLatentCall = false;                     // LowerCall: it made one, so it moves into the ubergraph
     std::string StaticLocal;                          // LowerBody: a static it keeps in the ubergraph's frame, or empty
     int32 LatentCount = 0;
-    /* A generated event a latent call's completion delegate binds: it stores its parameter into the frame local
-       the call's value is read from after the resume. */
+    /* A generated event a latent call's completion delegate binds: it stores its parameters into the frame locals
+       the call's value, or an await's bound values, are read from after the resume. */
     struct FCompletion
     {
         std::string Event;
         std::vector<FPropertyDef> Parms;
-        std::string Local;                            // where Parms[0] is stored, or empty
+        std::vector<std::string> Locals;              // where each of Parms is stored; empty, or an empty name, for none
         std::shared_ptr<int32> Resume;                // an await's: the event then re-enters the ubergraph here
     };
     std::string FreshEventName(const std::string& Stem);
@@ -2561,6 +2854,8 @@ bool FCompiler::Collect(std::string* Err)
 
         uint32 Access = N.value("tagUsed", std::string()) == "struct" ? FUNC_Public : FUNC_Private;
         std::string Category;       // UE_CATEGORY is positional, like an access specifier
+        std::vector<FInputMark> PendingInput;   // UE_INPUT_KEY / UE_INPUT_ACTION mark the member that follows them
+        std::vector<FTimelineMark> PendingTimeline;     // and so do UE_TIMELINE_UPDATE / _FINISHED / _EVENT
         std::function<void(const Json&)> Member = [&](const Json& C) {
             /* genueapi puts a class's markers in a private `struct UeMarkers` at its bottom, out of IntelliSense's
                member list: they are the class's own. */
@@ -2568,6 +2863,36 @@ bool FCompiler::Collect(std::string* Err)
             {
                 ForEach(C, Member);
                 return;
+            }
+            if (Kind(C) == "VarDecl" && (Name(C).compare(0, 12, "UeInputKey__") == 0 || Name(C).compare(0, 15, "UeInputAction__") == 0))
+            {
+                FInputMark M;
+                M.bAction = Name(C)[7] == 'A';
+                FindLiteral(C, M.Spec);
+                PendingInput.push_back(M);
+                return;
+            }
+            if (Kind(C) == "VarDecl" && (Name(C).compare(0, 18, "UeTimelineUpdate__") == 0
+                                         || Name(C).compare(0, 20, "UeTimelineFinished__") == 0
+                                         || Name(C).compare(0, 17, "UeTimelineEvent__") == 0))
+            {
+                FTimelineMark M;
+                M.Kind = Name(C)[10];
+                FindLiteral(C, M.Spec);
+                PendingTimeline.push_back(M);
+                return;
+            }
+            if ((!PendingInput.empty() || !PendingTimeline.empty()) && !C.value("isImplicit", false))
+            {
+                const bool bMethod = Kind(C) == "CXXMethodDecl" && C.contains("name") && Name(C) != "UeDefaults__";
+                for (FInputMark& M : PendingInput)
+                    if (bMethod) { M.Method = Name(C); M.Decl = &C; R.InputMarks.push_back(M); }
+                    else if (R.InputMisplaced.empty()) R.InputMisplaced = InputMarkText(M);
+                for (FTimelineMark& M : PendingTimeline)
+                    if (bMethod) { M.Method = Name(C); M.Decl = &C; R.TimelineMarks.push_back(M); }
+                    else if (R.TimelineMisplaced.empty()) R.TimelineMisplaced = TimelineMarkText(M);
+                PendingInput.clear();
+                PendingTimeline.clear();
             }
             if (Kind(C) == "VarDecl" && Name(C).compare(0, 12, "UeCategory__") == 0)
             {
@@ -2693,6 +3018,22 @@ bool FCompiler::Collect(std::string* Err)
             {
                 R.Components.insert(Name(C).substr(0, Name(C).size() - 13));
             }
+            else if (Kind(C) == "VarDecl" && Name(C).size() > 12 && Name(C).compare(Name(C).size() - 12, 12, "__UeTimeline") == 0)
+            {
+                std::string Spec;
+                FindLiteral(C, Spec);
+                R.Timelines[Name(C).substr(0, Name(C).size() - 12)] = Spec;
+            }
+            else if (Kind(C) == "VarDecl" && Name(C).size() > 9 && Name(C).compare(Name(C).size() - 9, 9, "__UeTrack") == 0)
+            {
+                std::string Spec;
+                FindLiteral(C, Spec);
+                R.Tracks.emplace_back(Name(C).substr(0, Name(C).size() - 9), Spec);
+            }
+            else if (Kind(C) == "VarDecl" && Name(C).size() > 10 && Name(C).compare(Name(C).size() - 10, 10, "__UeWidget") == 0)
+            {
+                R.Widgets.push_back(Name(C).substr(0, Name(C).size() - 10));
+            }
             else if (Kind(C) == "CXXMethodDecl" && Name(C) == "UeDefaults__")
             {
                 /* Not a UFunction: AssetGen reads its assignments as defaults, never lowers them. */
@@ -2711,6 +3052,8 @@ bool FCompiler::Collect(std::string* Err)
             }
             else if (Kind(C) == "CXXConstructorDecl")
                 R.Ctors.push_back(&C);
+            else if (Kind(C) == "CXXDestructorDecl" && !C.contains("explicitlyDefaulted"))    // clang's own is defaulted
+                R.Dtor = &C;
             else if (Kind(C) == "FieldDecl" && C.contains("name"))
             {
                 R.Fields.push_back(&C);
@@ -2728,6 +3071,8 @@ bool FCompiler::Collect(std::string* Err)
                 });
         };
         ForEach(N, Member);
+        if (!PendingInput.empty() && R.InputMisplaced.empty()) R.InputMisplaced = InputMarkText(PendingInput.front());
+        if (!PendingTimeline.empty() && R.TimelineMisplaced.empty()) R.TimelineMisplaced = TimelineMarkText(PendingTimeline.front());
         /* A set is looked up in Replicated by the name it is cooked under, so the marker's C++ key follows. */
         for (const auto& N2 : R.UeNames)
             if (auto Rep = R.Replicated.find(N2.first); Rep != R.Replicated.end())
@@ -2910,6 +3255,46 @@ bool FCompiler::Collect(std::string* Err)
                  + "::UeDefaults__()`, is never read, nor seen by a mod that includes the class's header";
             return false;
         }
+        /* Neither cooks a default object of its own: GenerateStruct and GenerateInterface never read the block. */
+        if (R.Defaults && (R.bIsStruct || R.bIsInterface))
+        {
+            *Err = R.CppName + ": a " + (R.bIsStruct ? "UE_STRUCT" : "UE_INTERFACE") + " has no UE_DEFAULTS, so its "
+                   "statements would be dropped; give each variable its initializer"
+                 + (R.bIsInterface ? ", and set an inherited one in the UE_DEFAULTS of a class that implements it" : "");
+            return false;
+        }
+        if (!R.InputMisplaced.empty())
+        {
+            *Err = R.CppName + ": " + R.InputMisplaced + " marks no method: write it right before the method the input "
+                   "calls, `" + R.InputMisplaced + " void OnInput();`";
+            return false;
+        }
+        /* The binding objects hang off a class of the mod's own (AddInputBindings). */
+        if (!R.InputMarks.empty() && (R.bIsStruct || R.bIsInterface || R.bIsPatch))
+        {
+            const FInputMark& M = R.InputMarks.front();
+            *Err = R.CppName + "::" + M.Method + ": " + InputMarkText(M) + (R.bIsStruct ? " on a UE_STRUCT, which holds no functions"
+                 : R.bIsInterface ? " on a UE_INTERFACE: mark the method in the class that implements it"
+                 : " on a UE_PATCH, which edits its parent's defaults and nothing else: input needs a class of the mod's own");
+            return false;
+        }
+        if (!R.TimelineMisplaced.empty())
+        {
+            *Err = R.CppName + ": " + R.TimelineMisplaced + " marks no method: write it right before the method the "
+                   "timeline calls, `" + R.TimelineMisplaced + " void OnFade();`";
+            return false;
+        }
+        /* The templates hang off a class of the mod's own (AddTimelines). */
+        if ((!R.Timelines.empty() || !R.Tracks.empty() || !R.TimelineMarks.empty()) && (R.bIsStruct || R.bIsInterface || R.bIsPatch))
+        {
+            const std::string What = !R.Timelines.empty() ? R.Timelines.begin()->first + ": UE_TIMELINE"
+                                   : !R.Tracks.empty() ? R.Tracks.front().first + ": a timeline track"
+                                   : R.TimelineMarks.front().Method + ": " + TimelineMarkText(R.TimelineMarks.front());
+            *Err = R.CppName + "::" + What + (R.bIsStruct ? " on a UE_STRUCT, which holds no functions"
+                 : R.bIsInterface ? " on a UE_INTERFACE: declare it in the class that implements it"
+                 : " on a UE_PATCH, which edits its parent's defaults and nothing else: a timeline needs a class of the mod's own");
+            return false;
+        }
         if (R.UePackage.empty()) continue;
         if (R.UePackage != PathIn(ModPackage, R.CppName)) continue;
         if (!R.bIsStruct && R.UeName != LeafOf(R.CppName) + "_C")
@@ -2920,6 +3305,133 @@ bool FCompiler::Collect(std::string* Err)
         }
         R.bIsLocal = true;
     }
+    /* After bIsLocal, which IsGenerated reads: each class this source cooks, and another mod's, whose defaults a subclass
+       here reads off the same header. */
+    for (auto& It : Records)
+    {
+        FRecord& R = It.second;
+        const bool bOtherMod = R.IsNative() && R.UePackage.compare(0, 6, "/Game/") == 0;
+        if (!R.IsGenerated() && !R.bIsPatch && !bOtherMod) continue;
+        if (!LowerCtor(R, Err)) return false;
+        /* A Blueprint struct holds no functions, so a call to one of its methods would name a function that exists
+           nowhere. An inline one is expanded where it is called instead (a static one anywhere: it needs no object). */
+        if (R.bIsStruct)
+            for (const Json* M : R.AllMethods)
+                if (!IsInlineMethod(R, Name(*M)))
+                {
+                    *Err = R.CppName + "::" + Name(*M) + ": a UE_STRUCT holds no functions, so nothing could run a call to "
+                           "it; write a free inline function that takes the struct, `inline ... " + Name(*M) + "(const "
+                         + LeafOf(R.CppName) + "& S)`";
+                    return false;
+                }
+    }
+    return true;
+}
+
+/* A cooked class's constructor, which the engine never runs: a Blueprint object is a copy of its class's default object.
+   So the default constructor is read as that object's values, as in-class initializers and UE_DEFAULTS are. A member
+   initializer, or an assignment to one of the class's own variables, becomes that variable's initializer, the last one
+   written winning as in C++ (a default reads no member, FoldConst says, so none can see an earlier value). Any other
+   statement, on an inherited member or through a component, joins UE_DEFAULTS after its own statements; a UE_STRUCT or a
+   UE_INTERFACE has no UE_DEFAULTS, so there it is refused. It is read where it is written, as UE_DEFAULTS is: a mod that
+   includes the class's header never sees a definition out of it. A UE_STRUCT's constructor with parameters places a
+   value's arguments (StructArgs); a class's would never be called, and is refused. So is a destructor that does
+   something: the engine frees the object without it. */
+bool FCompiler::LowerCtor(FRecord& R, std::string* Err)
+{
+    const std::string Leaf = LeafOf(R.CppName);
+    if (R.Dtor)
+    {
+        const Json* Body = nullptr;
+        ForEach(*R.Dtor, [&](const Json& B) { if (Kind(B) == "CompoundStmt") Body = &B; });
+        if (!Body || First(*Body))
+        {
+            *Err = R.CppName + "::~" + Leaf + "(): a destructor never runs in the game, which frees the object without it; "
+                   "drop it, and do teardown in ReceiveEndPlay";
+            return false;
+        }
+    }
+    const std::string Where = R.CppName + "::" + Leaf + "()";
+    const Json* Ctor = nullptr;
+    for (const Json* C : R.Ctors)
+    {
+        if (C->value("isImplicit", false) || C->contains("explicitlyDefaulted") || C->value("explicitlyDeleted", false)) continue;
+        if (ParmNames(*C).empty()) { Ctor = C; continue; }
+        if (R.bIsStruct) continue;
+        std::string Parms;
+        for (const std::string& P : ParmNames(*C)) Parms += (Parms.empty() ? "" : ", ") + P;
+        *Err = R.CppName + "::" + Leaf + "(" + Parms + "): the engine makes a Blueprint class's objects "
+               "with no arguments, so this constructor is never called; only one that takes none is read, as the class's "
+               "defaults";
+        return false;
+    }
+    if (!Ctor) return true;
+    const Json* Body = nullptr;
+    ForEach(*Ctor, [&](const Json& B) { if (Kind(B) == "CompoundStmt") Body = &B; });
+    if (!Body)
+    {
+        *Err = Where + " has no body in the class; AssetGen reads a constructor there alone, so write it in it: a definition "
+               "out of the class is never read, nor seen by a mod that includes the class's header";
+        return false;
+    }
+    auto OwnField = [&](const std::string& Id) -> Json* {
+        for (const Json* F : R.Fields) if (F->value("id", std::string()) == Id) return const_cast<Json*>(F);
+        return nullptr;
+    };
+    auto SetInit = [](Json& F, const Json& V) {
+        Json& In = F["inner"];
+        if (!In.is_array()) In = Json::array();
+        if (F.value("hasInClassInitializer", false) && !In.empty()) In[0] = V;
+        else In.insert(In.begin(), V);
+        F["hasInClassInitializer"] = true;
+    };
+    ForEach(*Ctor, [&](const Json& I) {
+        if (Kind(I) != "CXXCtorInitializer" || !I.contains("anyInit")) return;      // the parent's: its own defaults
+        Json* F = OwnField(I["anyInit"].value("id", std::string()));
+        const Json* V = First(I);
+        /* clang's own for a member nobody named: the in-class initializer, or the type's default. */
+        if (!F || !V || Kind(*V) == "CXXDefaultInitExpr" || (!F->value("hasInClassInitializer", false) && IsUnsetInit(*V)))
+            return;
+        SetInit(*F, *V);
+    });
+    Json Moved = Json::array();
+    bool bOk = true;
+    ForEach(*Body, [&](const Json& S) {
+        if (!bOk || Kind(S) == "NullStmt") return;
+        const Json *Lhs = nullptr, *Rhs = nullptr, *Through = nullptr;
+        const Json *Callee = nullptr, *Child = nullptr, *Parent = nullptr, *Socket = nullptr;
+        const bool bAssign = DefaultAssignment(S, Lhs, Rhs, Through);
+        if (!bAssign && !AttachmentCall(S, Callee, Child, Parent, Socket) && !R.bIsPatch     // a patch's may set part of one
+            && !(!R.Widgets.empty() && WidgetLayoutStatement(S)))
+        {
+            *Err = Where + ": a constructor never runs in the game, so its statements are read as the class's defaults: each "
+                   "is `Field = value;`, `Component->Field = value;` or `Component->SetupAttachment(Parent);`, on this "
+                   "object's members, each set whole. Do run-time setup in ReceiveBeginPlay";
+            bOk = false;
+            return;
+        }
+        if (Json* F = bAssign && !Through ? OwnField(Lhs->value("referencedMemberDecl", std::string())) : nullptr)
+        {
+            SetInit(*F, *Rhs);
+            return;
+        }
+        if (R.bIsStruct || R.bIsInterface)
+        {
+            *Err = Where + ": a " + (R.bIsStruct ? "UE_STRUCT" : "UE_INTERFACE") + "'s constructor sets its own members, the "
+                   "only defaults it has";
+            bOk = false;
+            return;
+        }
+        Moved.push_back(S);
+        Moved.back()["ueWhere"] = Where;
+    });
+    if (!bOk || Moved.empty()) return bOk;
+    Json Block = { { "kind", "CompoundStmt" }, { "inner", Json::array() } };
+    if (R.Defaults)
+        ForEach(*R.Defaults, [&](const Json& B) { if (Kind(B) == "CompoundStmt" && B.contains("inner")) Block["inner"] = B["inner"]; });
+    for (Json& S : Moved) Block["inner"].push_back(std::move(S));
+    R.Defaults = &CtorDefaults.emplace_back(
+        Json{ { "kind", "CXXMethodDecl" }, { "name", "UeDefaults__" }, { "inner", Json::array({ std::move(Block) }) } });
     return true;
 }
 
@@ -3000,6 +3512,31 @@ std::string DesugaredTypeOf(const Json& N)
 {
     auto It = N.find("type");
     return It == N.end() ? std::string() : It->value("desugaredQualType", It->value("qualType", std::string()));
+}
+
+/* A type node (a TypeTraitExpr's operand) as its canonical type: sugar - an alias, a typedef, an elaborated or a
+   substituted type - looked through, a class or an enum named by its declaration, so two keys are equal exactly when the
+   types are. Empty for a type still dependent, or of a kind not read here. */
+std::string CanonTypeKey(const Json& T)
+{
+    const std::string K = Kind(T);
+    const Json* In = First(T);
+    if (K == "BuiltinType") return TypeOf(T);
+    if (K == "RecordType" || K == "EnumType") return T.contains("decl") ? "decl " + T["decl"].value("id", std::string()) : std::string();
+    if (K == "ElaboratedType" || K == "TypedefType" || K == "UsingType" || K == "SubstTemplateTypeParmType" || K == "ParenType")
+        return In ? CanonTypeKey(*In) : std::string();
+    /* The arguments as written, then the type they make: the last. */
+    if (K == "TemplateSpecializationType")
+    {
+        const Json* Last = nullptr;
+        ForEach(T, [&](const Json& C) { Last = &C; });
+        return Last && Kind(*Last) != "TemplateArgument" ? CanonTypeKey(*Last) : std::string();
+    }
+    std::string Of = In ? CanonTypeKey(*In) : std::string();
+    if (Of.empty()) return Of;
+    if (K == "QualType") return T.value("qualifiers", std::string()) + " " + Of;
+    if (K == "PointerType" || K == "LValueReferenceType" || K == "RValueReferenceType") return K + "(" + Of + ")";
+    return std::string();
 }
 
 const FRecord* FCompiler::ModInterfaceWith(const FRecord& R, const std::string& Method) const
@@ -3685,8 +4222,10 @@ bool FCompiler::LowerMakeStruct(const std::string& Type, const Json* List, FBlue
 /* `{ 1, 2 }` made into a TArray, TSet or TMap in a function: the editor's Make Array / Make Set / Make Map, a temp the
    frame keeps, filled whole by EX_SetArray / EX_SetSet / EX_SetMap (`[S]` KismetCompilerVMBackend.cpp:1635), which
    empty it first (ScriptCore.cpp:3409), so a loop that comes round again makes it afresh. A set's and a map's count is
-   its elements' (a map's pairs'). List is the CXXStdInitializerListExpr; a map's elements are `{ key, value }`. */
-bool FCompiler::LowerContainerLiteral(const Json& List, const std::string& Type, FBlueprintClass& BP, FArgIR& Out, std::string* Err)
+   its elements' (a map's pairs'). List is the CXXStdInitializerListExpr; a map's elements are `{ key, value }`. Given,
+   when there is one, holds the elements already lowered (a map's keys and values in turn), and List is not read. */
+bool FCompiler::LowerContainerLiteral(const Json& List, const std::string& Type, FBlueprintClass& BP, FArgIR& Out, std::string* Err,
+                                      const std::vector<FArgIR>* Given)
 {
     const std::string T = StripTypeKeywords(Type);
     std::string Of;
@@ -3710,7 +4249,8 @@ bool FCompiler::LowerContainerLiteral(const Json& List, const std::string& Type,
     const Json* Items = &List;
     while (Items && Kind(*Items) != "InitListExpr") Items = First(*Items);
     bool bOk = true;
-    if (Items)
+    if (Given) Fill.Args.insert(Fill.Args.end(), Given->begin(), Given->end());
+    else if (Items)
         ForEach(*Items, [&](const Json& E) {
             if (!bOk) return;
             const Json* Pair = Op == "__SetMap__" ? Strip(&E) : nullptr;
@@ -3732,6 +4272,57 @@ bool FCompiler::LowerContainerLiteral(const Json& List, const std::string& Type,
     Out.Sub->InlineResult = Tmp;
     Out.Sub->InlineType = T;
     return true;
+}
+
+/* UE_ENUM_MAP(E)'s pairs: E's enumerators by their C++ names, in order, without the closing enumerator UHT and the
+   cooker add, which is not one of the enum's values (`PF_MAX_0` is Dumper-7's spelling of a PF_MAX that collided).
+   False when no enum has that C++ name. */
+bool FCompiler::EnumMapEntries(const std::string& CppEnum, std::vector<std::pair<std::string, int64>>& Out) const
+{
+    const std::vector<std::pair<std::string, int64>>* Names = nullptr;
+    for (const auto& E : EnumDecls)
+        if (E.first == CppEnum || (E.first.size() > CppEnum.size() + 2
+            && E.first.compare(E.first.size() - CppEnum.size() - 2, std::string::npos, "::" + CppEnum) == 0))
+            Names = &E.second;
+    if (!Names) return false;
+    for (const auto& Entry : *Names)
+    {
+        std::string Closer = Entry.first;
+        while (!Closer.empty() && std::isdigit(uint8(Closer.back()))) Closer.pop_back();
+        if (Closer.size() > 5 && Closer.back() == '_' && Closer.compare(Closer.size() - 5, 5, "_MAX_") == 0) continue;
+        if (Entry.first.size() > 4 && Entry.first.compare(Entry.first.size() - 4, 4, "_MAX") == 0) continue;
+        Out.push_back(Entry);
+    }
+    return true;
+}
+
+/* `TMap<EMood, FName> Names = UE_ENUM_MAP(EMood);` in a function: the same pairs a member's default gets, the enum on
+   whichever side the map has it, made as the braced map `{ { EMood::Calm, "Calm" }, ... }` would be. */
+bool FCompiler::LowerEnumMap(const std::string& Type, FBlueprintClass& BP, FArgIR& Out, std::string* Err)
+{
+    std::string Inner;
+    const std::vector<std::string> KV = TemplateArg(StripTypeKeywords(Type), "TMap", &Inner) ? SplitTemplateArgs(Inner)
+                                                                                            : std::vector<std::string>();
+    const bool bEnumKey = KV.size() == 2 && Enums.count(StripTypeKeywords(KV[0]));
+    const std::string CppEnum = KV.size() != 2 ? std::string() : StripTypeKeywords(KV[bEnumKey ? 0 : 1]);
+    const std::string Text = KV.size() != 2 ? std::string() : Canon(KV[bEnumKey ? 1 : 0]);
+    const auto E = Enums.find(CppEnum);
+    std::vector<std::pair<std::string, int64>> Names;
+    if (E == Enums.end() || (Text != "FName" && Text != "FString") || !EnumMapEntries(CppEnum, Names))
+    { *Err = "UE_ENUM_MAP makes a TMap between an enum and FName or FString, not a " + Type; return false; }
+    std::vector<FArgIR> Items;
+    for (const auto& [Enumerator, Value] : Names)
+    {
+        FConstVal V;
+        V.I = Value;
+        FArgIR Num, Str;
+        if (!ConstToArg(V, E->second.Underlying, Num)) { *Err = "UE_ENUM_MAP over " + CppEnum + ": its values are " + E->second.Underlying; return false; }
+        Str.K = Text == "FName" ? FArgIR::Name : FArgIR::Str;
+        Str.S = Enumerator;
+        Items.push_back(bEnumKey ? Num : Str);
+        Items.push_back(bEnumKey ? Str : Num);
+    }
+    return LowerContainerLiteral(Json::object(), Type, BP, Out, Err, &Items);
 }
 
 /* A constant or an inline class variable has no storage in a Blueprint: each use is its initializer, lowered where it
@@ -4813,6 +5404,8 @@ bool FCompiler::LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, 
     }
     const Json* N = Strip(&ArgNode);
     if (!N) { *Err = "empty argument expression"; return false; }
+    if (const Json* Made = StructConversionBelow(ArgNode))
+        return LowerArgRaw(*Made, OuterType, BP, Out, Err) && ConvertArg(OuterType, BP, Out, Err);
     /* A comma or a `=` under an LValueToRValue or a copy is read where it stands (LowerCommaValue); without one, its
        place is what is used. */
     struct FReadRestore { const Json** Slot; const Json* Old; ~FReadRestore() { *Slot = Old; } } ReadRestore{ &ReadComma, ReadComma };
@@ -4898,8 +5491,9 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         /* `{}` or `TArray<int32>()` as a value: an empty container, a Make Array (Set, Map) with no element. */
         if (!First(*N) && IsContainerType(TypeOf(*N))) return LowerContainerLiteral(*N, TypeOf(*N), BP, Out, Err);
         /* `{}` or `TEnum<E>()`: TEnum<E> declares a constructor, so its value-initialisation is an argless construct
-           where an E's is a CXXScalarValueInitExpr below. The same zero enumerator. */
-        if (!First(*N) && IsTEnumType(TypeOf(*N))) return ZeroArg(StripTypeKeywords(TypeOf(*N)), BP, Out, Err);
+           where an E's is a CXXScalarValueInitExpr below. The same zero enumerator; a TEnumMask's empty mask. */
+        if (!First(*N) && (IsTEnumType(TypeOf(*N)) || IsTEnumType(TypeOf(*N), "TEnumMask")))
+            return ZeroArg(StripTypeKeywords(TypeOf(*N)), BP, Out, Err);
         /* `TArray<int32>{1, 2, M}`: the typed spelling is a CXXTemporaryObjectExpr around the initializer_list, which
            Strip does not look through as it does `TArray<int32>({1, 2})`'s one-argument construct. The same list. */
         if (const Json* List = First(*N); List && !Nth(*N, 1) && Kind(*List) == "CXXStdInitializerListExpr"
@@ -4942,6 +5536,8 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         {
             const Json* Obj = First(*Callee);
             if (!Obj) { *Err = "conversion operator with no object"; return false; }
+            if (const Json* Map = Strip(Obj); Map && Kind(*Map) == "CallExpr" && CallsFunction(*Map, "__EnumMap__"))
+                return LowerEnumMap(TypeOf(*N), BP, Out, Err);
             if (Canon(TypeOf(*Obj)) == "FName" && Canon(TypeOf(*N)) == "bool")
             {
                 /* `if (Name)`: Kismet has no Conv_NameToBool, so it is Name != None. */
@@ -4982,6 +5578,40 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
                                             Method == "Name" ? "GetEnumeratorName" : "GetEnumeratorUserFriendlyName");
             Out.Sub->bPure = true;
             Out.Sub->Args = { EnumObj, Value };
+            return true;
+        }
+        if (IsTEnumType(TypeOf(*First(*Callee)), "TEnumMask"))
+        {
+            /* TEnumMask<E>'s methods: KismetNodeHelperLibrary's bit functions on the int32 it is, the enumerator's value
+               the bit index, as the editor counts a Bitmask Flags enum's. Has only reads the mask; the other three write
+               it through their `int32&`, so it must be a variable Blueprint can reference - not a map element, which
+               Map_Find copies out. */
+            static const std::map<std::string, const char*> Bits = {
+                { "Has", "BitIsMarked" }, { "Add", "MarkBit" }, { "Remove", "ClearBit" }, { "Clear", "ClearAllBits" } };
+            const std::string Method = Name(*Callee);
+            const auto Fn = Bits.find(Method);
+            if (Fn == Bits.end()) { *Err = "TEnumMask has no method " + Method; return false; }
+            const bool bRead = Method == "Has";
+            FArgIR Mask;
+            if (!LowerArg(*Obj, BP, Mask, Err)) return false;
+            if (!bRead && !IsStored(Mask))
+            {
+                *Err = "TEnumMask::" + Method + " writes the mask, so it needs a variable, not a computed value or a map "
+                       "element: copy it to a local, then store it back";
+                return false;
+            }
+            Out.K = FArgIR::Call;
+            Out.Sub = std::make_shared<FCallIR>();
+            Out.Sub->Fn = BP.EngineFunction("/Script/Engine", "KismetNodeHelperLibrary", Fn->second);
+            Out.Sub->bPure = bRead;
+            Out.Sub->WrittenArgs = bRead ? 0 : 1;
+            Out.Sub->Args.push_back(Mask);
+            if (const Json* Flag = Nth(*N, 1))
+            {
+                FArgIR Bit;
+                if (!LowerArg(*Flag, BP, Bit, Err) || !ConvertArg("int32", BP, Bit, Err)) return false;
+                Out.Sub->Args.push_back(Bit);
+            }
             return true;
         }
         const std::string ObjType = StripTypeKeywords(TypeOf(*Obj));
@@ -5359,15 +5989,7 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             : std::string();
         if (CalleeName == "StaticClass")
         {
-            /* StaticClass is declared once, by UE_CLASS on a native class, so the decl names AActor for every mod
-               actor that inherits it. The class meant is the qualifier (`AMine::StaticClass()`), else the class a
-               TSubclassOf<X> slot around it asks for (NewObject<T>'s default argument), when that is more derived. */
-            auto Owner = MethodOwner.find((*CalleeNode)["referencedDecl"].value("id", std::string()));
-            const FRecord* R = Owner == MethodOwner.end() ? nullptr : Find(Owner->second);
-            std::string Slot;
-            if (const FRecord* Q = NamedQualifier(*CalleeNode)) R = Q;
-            else if (TemplateArg(StripTypeKeywords(OuterType), "TSubclassOf", &Slot))
-                if (const FRecord* S = Find(StripTypeKeywords(Slot)); S && R && S != R && IsSubclassOf(*S, *R)) R = S;
+            const FRecord* R = StaticClassOf(*CalleeNode, OuterType);
             if (!R) { *Err = "StaticClass() on an unknown class"; return false; }
             Out.K = FArgIR::ObjConst;
             Out.Owner = ClassImportOf(*R, BP);
@@ -5650,11 +6272,18 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         else                                                 Flavour = "IntInt";
         if (Op == "<<" || Op == ">>")
         {
-            if (Kind(*RhsRaw) != "IntegerLiteral")
+            /* The amount is any constant C++ knows here: a literal, a constexpr, an enumerator, a cast, or a `sizeof`,
+               which only lowering sizes (the game's layout). */
+            FConstVal Amount;
+            FArgIR Lowered;
+            if (FoldConst(*RhsRaw, Amount) && !Amount.bFloat) {}
+            else if (LowerArg(*RhsRaw, BP, Lowered, Err) && (Lowered.K == FArgIR::Int || Lowered.K == FArgIR::Byte || Lowered.K == FArgIR::Int64))
+                Amount.I = Lowered.K == FArgIR::Int64 ? Lowered.I64 : Lowered.I;
+            else
             { *Err = "bit shift with a non-constant amount (Kismet has no shift op; use explicit multiply/divide)"; return false; }
             /* A shift has the promoted LHS type (no usual arithmetic conversions): `int >> 1LL` is int32 math. */
             const bool bWide = IsInt64Type(LhsC);
-            const int N = std::stoi(RhsRaw->value("value", std::string("0")));
+            const int64 N = Amount.I;
             if (N < 0 || N > (bWide ? 63 : 31))
             { *Err = "bit shift amount out of range: " + std::to_string(N); return false; }
             const std::string Suffix = bWide ? "Int64Int64" : "IntInt";
@@ -5760,6 +6389,9 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
     /* A container's braced list: Strip took the constructor it is the one argument of, whose type is the slot's. */
     if (K == "CXXStdInitializerListExpr") return LowerContainerLiteral(*N, OuterType, BP, Out, Err);
     if (K == "CompoundAssignOperator") return LowerUpdateValue(*N, BP, Out, Err);
+    /* `__is_same(A, B)`, `sizeof...(V)` and a template's value parameter are constants C++ knows here. */
+    if (K == "TypeTraitExpr" || K == "SizeOfPackExpr" || K == "SubstNonTypeTemplateParmExpr")
+        if (FConstVal V; FoldConst(*N, V) && (ConstToArg(V, OuterType, Out) || ConstToArg(V, TypeOf(*N), Out))) return true;
 
     *Err = "TODO: unimplemented argument " + K;
     return false;
@@ -5937,13 +6569,35 @@ std::vector<bool> FCompiler::FinalAsSites(const std::string& Base, const std::st
     return Sites;
 }
 
+/* What T has written from Off, the Len-byte token there, up to `::<Name>`: the record's name in as many parts as it is
+   written with (`Weapons::Rifle` before `::StaticClass`). Empty when Name does not follow. */
+static std::string QualifierBefore(const std::string& T, size_t Off, size_t Len, const std::string& Name)
+{
+    if (Off + Len > T.size()) return std::string();
+    auto Ident = [](char C) { return std::isalnum(uint8(C)) || C == '_'; };
+    std::string Qualifier = T.substr(Off, Len);
+    for (size_t P = Off + Len;;)
+    {
+        while (P < T.size() && (T[P] == ' ' || T[P] == '\t')) ++P;
+        if (T.compare(P, 2, "::") != 0) return std::string();
+        P += 2;
+        while (P < T.size() && (T[P] == ' ' || T[P] == '\t')) ++P;
+        size_t End = P;
+        while (End < T.size() && Ident(T[End])) ++End;
+        if (End == P) return std::string();
+        if (End - P == Name.size() && T.compare(P, End - P, Name) == 0) return Qualifier;
+        Qualifier += "::" + T.substr(P, End - P);
+        P = End;
+    }
+}
+
 /* The qualifier token is where a qualified DeclRefExpr's range begins; the JSON gives its byte offset and length but
    not its file (that is only written when it changes, and Json's sorted keys lose the order). So each of the mod's own
-   sources is tried at that offset, and a hit counts only when `<Record>::StaticClass` is what is written there.
+   sources is tried at that offset, and a hit counts only when `<Record>::StaticClass` is what is written there, the
+   record's name in as many parts as it is written with (`Weapons::Rifle::StaticClass()`).
    In a macro (`#define CLS(X) X::StaticClass()`) the range has spelling locations instead: the qualifier where the
    argument is written, StaticClass in the macro's body, which has to be `::StaticClass` then.
-   ponytail: a namespace-qualified `Ns::X::StaticClass()` begins at Ns and falls back to the declaring class; so does
-   a macro defined outside the mod's own sources (a UeApi header). */
+   ponytail: a macro defined outside the mod's own sources (a UeApi header) falls back to the declaring class. */
 const FRecord* FCompiler::NamedQualifier(const Json& Ref) const
 {
     const Json Range = Ref.value("range", Json::object());
@@ -5960,16 +6614,8 @@ const FRecord* FCompiler::NamedQualifier(const Json& Ref) const
     if (End.is_null())
     {
         for (const std::string& T : SourceTexts)
-        {
-            if (Off + Len > T.size()) continue;
-            size_t P = Off + Len;
-            while (P < T.size() && (T[P] == ' ' || T[P] == '\t')) ++P;
-            if (T.compare(P, 2, "::") != 0) continue;
-            P += 2;
-            while (P < T.size() && (T[P] == ' ' || T[P] == '\t')) ++P;
-            if (T.compare(P, 11, "StaticClass") != 0) continue;
-            if (const FRecord* R = Find(T.substr(Off, Len))) return R;
-        }
+            if (const std::string Q = QualifierBefore(T, Off, Len, "StaticClass"); !Q.empty())
+                if (const FRecord* R = Find(Q)) return R;
         return nullptr;
     }
     /* In a macro: its body has `::StaticClass` at End, and the qualifier is the whole identifier at Off. */
@@ -5987,43 +6633,92 @@ const FRecord* FCompiler::NamedQualifier(const Json& Ref) const
     return nullptr;
 }
 
+/* StaticClass is declared once, by UE_CLASS on a native class, so the decl names AActor for every mod actor that
+   inherits it. The class meant is the qualifier (`AMine::StaticClass()`), else the class a TSubclassOf<X> Slot asks for
+   (NewObject<T>'s default argument), when that is more derived. Lowering a call and a default both ask here. */
+const FRecord* FCompiler::StaticClassOf(const Json& Callee, const std::string& Slot) const
+{
+    auto Owner = MethodOwner.find(Callee["referencedDecl"].value("id", std::string()));
+    const FRecord* R = Owner == MethodOwner.end() ? nullptr : Find(Owner->second);
+    std::string Arg;
+    if (const FRecord* Q = NamedQualifier(Callee)) R = Q;
+    else if (TemplateArg(StripTypeKeywords(Slot), "TSubclassOf", &Arg))
+        if (const FRecord* S = Find(StripTypeKeywords(Arg)); S && R && S != R && IsSubclassOf(*S, *R)) R = S;
+    return R;
+}
+
 /* A MemberExpr on an implicit this begins at its qualifier when it has one and at the member's own name when not
    (clang's MemberExpr::getBeginLoc), so `QcParent::Plain()` is told from `Plain()` by what is written where its range
    begins: `<Record>::<member>`, tried in each of the mod's sources as NamedQualifier does.
-   The record's name may come in parts, `Weapons::Rifle::Pull`.
-   ponytail: `this->QcParent::Plain()` begins at `this` and a qualifier written in a macro has spelling locations; both
-   read as unqualified here, a call by name, unless a class on the way declares Plain (NamesQualified). */
+   The record's name may come in parts, `Weapons::Rifle::Pull`. `this->QcParent::Plain()` begins at `this`, and a
+   qualifier written in a macro has spelling locations: there it is read back from the member's name
+   (WrittenQualifier). */
 const FRecord* FCompiler::MemberQualifier(const Json& Member) const
 {
     const Json Begin = Member.value("range", Json::object()).value("begin", Json::object());
-    if (!Begin.contains("offset") || !Begin.contains("tokLen")) return nullptr;
-    const size_t Off = Begin["offset"].get<size_t>(), Len = Begin["tokLen"].get<size_t>();
+    if (Begin.contains("offset") && Begin.contains("tokLen"))
+    {
+        const size_t Off = Begin["offset"].get<size_t>(), Len = Begin["tokLen"].get<size_t>();
+        const std::string Method = Member.value("name", std::string());
+        for (const std::string& T : ModSources())
+            if (const std::string Q = QualifierBefore(T, Off, Len, Method); !Q.empty())
+                if (const FRecord* R = Find(Q)) return R;
+    }
+    const std::string Q = WrittenQualifier(Member);
+    return Q.empty() ? nullptr : Find(Q);
+}
+
+/* A MemberExpr's range ends at its member's name (MemberExpr::getEndLoc), and a qualifier is written right before it,
+   `GetOther()->SuperBase::Bump`, so it is read back from there whatever comes before it: a name, a call or a cast. Each
+   of the mod's sources is tried at that offset, as NamedQualifier does; a hit needs the member's name there and a
+   record that the qualifier names, in as many parts as it is written with. In a macro the name is where it is spelled.
+   ponytail: a member written with template arguments ends at its `>`, and a qualifier can be a macro's parameter or
+   come from a macro outside the mod's sources: these read as unqualified here. */
+std::string FCompiler::WrittenQualifier(const Json& Member) const
+{
+    Json End = Member.value("range", Json::object()).value("end", Json::object());
+    if (End.contains("spellingLoc")) End = End["spellingLoc"];
+    if (!End.contains("offset") || !End.contains("tokLen")) return std::string();
+    const size_t Off = End["offset"].get<size_t>(), Len = End["tokLen"].get<size_t>();
     const std::string Method = Member.value("name", std::string());
     auto Ident = [](char C) { return std::isalnum(uint8(C)) || C == '_'; };
+    auto Blank = [](char C) { return C == ' ' || C == '\t'; };
     for (const std::string& T : ModSources())
     {
-        if (Off + Len > T.size()) continue;
-        /* `<Record>::<member>`, the record's name in as many parts as it is written with: `Weapons::Rifle::Pull`. */
-        std::string Qualifier = T.substr(Off, Len);
-        for (size_t P = Off + Len;;)
+        if (Len != Method.size() || Off + Len > T.size() || T.compare(Off, Len, Method) != 0) continue;
+        std::string Q;
+        for (size_t P = Off;;)
         {
-            while (P < T.size() && (T[P] == ' ' || T[P] == '\t')) ++P;
-            if (T.compare(P, 2, "::") != 0) break;
-            P += 2;
-            while (P < T.size() && (T[P] == ' ' || T[P] == '\t')) ++P;
-            size_t End = P;
-            while (End < T.size() && Ident(T[End])) ++End;
-            if (End == P) break;
-            if (T.compare(P, End - P, Method) == 0 && End - P == Method.size())
-            {
-                if (const FRecord* R = Find(Qualifier)) return R;
-                break;
-            }
-            Qualifier += "::" + T.substr(P, End - P);
-            P = End;
+            while (P > 0 && Blank(T[P - 1])) --P;
+            if (P < 2 || T.compare(P - 2, 2, "::") != 0) break;
+            P -= 2;
+            while (P > 0 && Blank(T[P - 1])) --P;
+            size_t B = P;
+            while (B > 0 && Ident(T[B - 1])) --B;
+            if (B == P) break;
+            Q = T.substr(B, P - B) + (Q.empty() ? "" : "::" + Q);
+            P = B;
         }
+        if (!Q.empty() && Find(Q)) return Q;
     }
-    return nullptr;
+    return std::string();
+}
+
+/* clang's JSON keeps no qualifier, so it shows two ways. The method called is declared above the nearest declaration of
+   its name from Obj's type up, which an unqualified call would have found (Obj a Kid, which declares Method too). Or the
+   source says so right before the member's name, whatever Obj is written as: a name, a call or a cast
+   (WrittenQualifier). */
+std::string FCompiler::QualifiedOnOther(const Json& Callee, const Json& Obj, const FRecord& R, const std::string& Method) const
+{
+    std::string Of = StripTypeKeywords(TypeOf(Obj));
+    while (!Of.empty() && (Of.back() == '*' || Of.back() == ' ')) Of.pop_back();
+    for (const FRecord* A = Find(Of); A; A = A->Base.empty() ? nullptr : Find(A->Base))
+        if (A->Methods.count(Method) && !A->Forwarders.count(Method))
+        {
+            if (A != &R) return R.CppName;
+            break;
+        }
+    return WrittenQualifier(Callee);
 }
 
 bool FCompiler::NamesQualified(const Json& Callee, const FRecord* Written, const FRecord& R, const std::string& Method) const
@@ -6599,6 +7294,18 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
                 bQualified = !bParentCall && !R->IsNative();
                 bNamesQualified = true;
             }
+            /* C++ runs that Method on Other without dispatch. A Blueprint calls a function so only as self's parent call
+               (K2Node_CallParentFunction), and a body copied in runs on self; by name the call would reach Other's own
+               override. Static, final and in a final class, the two are one. */
+            else if (Obj && Kind(*Obj) != "CXXThisExpr" && !R->IsNative() && !bStatic && !R->bFinal
+                     && !R->FinalMethods.count(MethodName))
+                if (const std::string Q = QualifiedOnOther(*Callee, *Obj, *R, MethodName); !Q.empty())
+                {
+                    *Err = "`Obj->" + Q + "::" + MethodName + "()` runs " + Q + "'s " + MethodName + " on another object "
+                           "without dispatch, which a Blueprint does only as self's parent call; call it by name, which runs "
+                           "the object's own version, or move what it does into a function of another name";
+                    return false;
+                }
         }
         /* `final` (FinalOwner): the one version of the method every object the call can run on reaches, called as
            that function instead of by name. On `this` the class asked is the one being compiled, not the one the call
@@ -6881,7 +7588,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
             FCompletion C;
             C.Event = Event;
             ResultLocal = "__Async" + std::to_string(ReadTmpCounter++) + "__";
-            C.Local = ResultLocal;
+            C.Locals = { ResultLocal };
             FPropertyDef Local;
             C.Parms.emplace_back();
             if (!TypeToProperty(ResultType, "Value", 0, "the result of " + MethodName, BP, &C.Parms[0], Err)
@@ -7142,7 +7849,7 @@ void FCompiler::DropUnusedLocals(std::vector<FStmtIR>& Stmts, std::vector<FPrope
     {
         std::set<std::string> Read;
         NamesRead(Stmts, Read);
-        for (const FCompletion& C : Completions) Read.insert(C.Local);     // its event stores there
+        for (const FCompletion& C : Completions) Read.insert(C.Locals.begin(), C.Locals.end());    // its event stores there
         std::set<std::string> Unread;
         for (const FPropertyDef& L : Locals) if (!Read.count(L.Name)) Unread.insert(L.Name);
         if (Unread.empty()) return;
@@ -7513,12 +8220,15 @@ bool FCompiler::LowerAwait(const Json& CallNode, FBlueprintClass& BP, FCallIR& O
             if (!TypeToProperty(T, "Value" + std::to_string(C.Parms.size() - 1), 0, "UE_AWAIT on " + Disp.S, BP, &C.Parms.back(), Err))
                 return false;
         }
-    const std::string ResultType = StripTypeKeywords(TypeOf(CallNode));
+    /* One value is the await's own; two or more come as TAwaitValues (UeMeta.h), which only `auto [A, B] = ...`
+       reads, and that binding gives the event its stores (LowerBody). */
+    std::string ResultType = StripTypeKeywords(TypeOf(CallNode));
+    if (ResultType.compare(0, 13, "TAwaitValues<") == 0) ResultType = "void";
     if (ResultType != "void")
     {
-        C.Local = "__Await" + std::to_string(ReadTmpCounter++) + "__";
+        C.Locals = { "__Await" + std::to_string(ReadTmpCounter++) + "__" };
         FPropertyDef Local;
-        if (!TypeToProperty(ResultType, C.Local, 0, "UE_AWAIT on " + Disp.S, BP, &Local, Err)) return false;
+        if (!TypeToProperty(ResultType, C.Locals[0], 0, "UE_AWAIT on " + Disp.S, BP, &Local, Err)) return false;
         Local.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
         CurLocals->push_back(Local);
     }
@@ -7581,7 +8291,7 @@ bool FCompiler::LowerAwait(const Json& CallNode, FBlueprintClass& BP, FCallIR& O
     (*Block)[0].Body = Body;
     Out.Intrinsic = "__Inline__";
     Out.Inline = Block;
-    Out.InlineResult = C.Local;
+    Out.InlineResult = C.Locals.empty() ? std::string() : C.Locals[0];
     Out.InlineType = ResultType;
     return true;
 }
@@ -8065,7 +8775,7 @@ void FCompiler::WarnFrameWeakLocals(const std::vector<FStmtIR>& Stmts, const std
     if (Classes.empty()) return;
     std::map<std::string, std::string> LoadedInto;      // a latent load's completion event -> the local it stores into
     for (const FCompletion& C : Completions)
-        if (!C.Resume && !C.Local.empty()) LoadedInto[C.Event] = C.Local;
+        if (!C.Resume && !C.Locals.empty()) LoadedInto[C.Event] = C.Locals[0];
 
     enum : uint8 { Made = 1, Crossed = 2 };
     std::set<std::string> Warned;
@@ -8195,6 +8905,40 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 const std::string DK = Kind(D);
                 if (DK == "TypeAliasDecl" || DK == "TypedefDecl" || DK == "UsingDecl" || DK == "UsingEnumDecl"
                     || DK == "StaticAssertDecl") { bAny = true; return; }   // compile-time names only
+                /* `auto [Who, Points] = UE_AWAIT(OnScored);`: the await, each name a frame local its event stores one
+                   of the dispatcher's values into, as the editor's async node gives each output pin a variable
+                   (K2Node_BaseAsyncTask.cpp 410-467). A later broadcast stores the next values there. */
+                const Json* AwaitCall = DK == "DecompositionDecl" ? Strip(First(D)) : nullptr;
+                const Json* AwaitFn = AwaitCall && Kind(*AwaitCall) == "CallExpr" ? Strip(First(*AwaitCall)) : nullptr;
+                if (bOk && AwaitFn && Kind(*AwaitFn) == "DeclRefExpr" && AwaitFn->contains("referencedDecl")
+                    && Name((*AwaitFn)["referencedDecl"]) == "__Await__")
+                {
+                    bAny = true;
+                    FCallIR Await;
+                    if (!LowerCall(*AwaitCall, BP, Await, Err)) { bOk = false; return; }
+                    FCompletion& C = Completions.back();
+                    C.Locals.assign(C.Parms.size(), std::string());
+                    size_t I = 0;
+                    ForEach(D, [&](const Json& B) {
+                        if (!bOk || Kind(B) != "BindingDecl" || I >= C.Parms.size()) return;
+                        std::string T = First(B) ? StripTypeKeywords(TypeOf(*First(B))) : std::string();
+                        while (!T.empty() && (T.back() == '&' || T.back() == ' ')) T.pop_back();
+                        FPropertyDef PD;
+                        const std::string Kept = "__Await" + std::to_string(ReadTmpCounter++) + "_" + Name(B);
+                        if (!TypeToProperty(T, Kept, 0, "UE_AWAIT's " + Name(B), BP, &PD, Err)) { bOk = false; return; }
+                        PD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
+                        Locals.push_back(PD);
+                        C.Locals[I++] = Kept;
+                        FArgIR Place;
+                        Place.K = FArgIR::Local;
+                        Place.S = Kept;
+                        Place.LetOp = LetOpFor(T);
+                        Place.InnerType = T;
+                        RefPlace[B.value("id", std::string())] = Place;
+                    });
+                    if (bOk && Await.Inline) for (FStmtIR& St : *Await.Inline) Out.push_back(std::move(St));
+                    return;
+                }
                 if (!bOk || DK != "VarDecl") return;
                 bAny = true;
                 const std::string VarName = LocalName(D);
@@ -9584,6 +10328,233 @@ bool FCompiler::IsInlineMethod(const FRecord& R, const std::string& Method) cons
     auto Def = R.MethodDefs.find(Method);
     return (Decl != R.Methods.end() && Decl->second->value("inline", false))
         || (Def != R.MethodDefs.end() && Def->second->value("inline", false));
+}
+
+/* UE_INPUT_KEY / UE_INPUT_ACTION: what the editor's InputKey and InputAction nodes cook, an entry of the class's
+   InputKeyDelegateBinding or InputActionDelegateBinding object. UInputDelegateBinding::BindInputDelegates binds it to the
+   actor's input component by FunctionNameToBind (InputKeyDelegateBinding.cpp 12-45), and the input calls that through
+   ProcessEvent with the key as its one argument (FInputActionHandlerDynamicSignature, InputComponent.h): the marked
+   method is the event itself, where the editor's InpActEvt_ function only jumps into the ubergraph at the node's pin.
+   ProcessEvent copies the callee's ParmsSize bytes out of that argument, so a method taking anything but the key, or
+   returning a value, would be handed the key's bytes as its own. */
+bool FCompiler::AddInputBindings(const FRecord& R, bool bIsActor, FBlueprintClass& BP, std::string* Err) const
+{
+    for (const FInputMark& M : R.InputMarks)
+    {
+        auto Refuse = [&](const std::string& Why) { *Err = R.CppName + "::" + M.Method + ": " + InputMarkText(M) + " " + Why; return false; };
+        if (!bIsActor)
+            return Refuse("on a class that is no actor: only an actor gets input, a pawn while possessed and a player "
+                          "controller always, any other once it enables input");
+        if (IsStaticDecl(*M.Decl)) return Refuse("on a static method: the engine calls it on the actor; drop static");
+        if (IsInlineMethod(R, M.Method))
+            return Refuse("on an inline method, which is expanded where it is called, no function for the input to call; drop inline");
+        if (!CompilesMethod(R, M.Method)) return Refuse("on a method with no body, no function for the input to call");
+        std::string Ret = TypeOf(*M.Decl);
+        Ret = Ret.substr(0, Ret.find('('));
+        while (!Ret.empty() && Ret.back() == ' ') Ret.pop_back();
+        if (Ret != "void") return Refuse("on a method returning " + Ret + ": the engine passes the key alone, with no room for a result; return void");
+        const size_t NumParms = ParmNames(*M.Decl).size();
+        bool bRef = false;
+        const std::string Parm = NumParms == 1 ? ParmTypeOf(*ParmDeclAt(*M.Decl, 0), &bRef) : std::string();
+        if (NumParms > 1 || (NumParms == 1 && (StripTypeKeywords(Parm) != "FKey" || (bRef && Parm.compare(0, 6, "const ") != 0))))
+        {
+            std::string Took;
+            for (size_t I = 0; I < NumParms; ++I) Took += (I ? ", " : "") + TypeOf(*ParmDeclAt(*M.Decl, I));
+            return Refuse("on a method taking (" + Took + "): it takes nothing, or the key that fired it, `FKey Key`");
+        }
+
+        const size_t Bar = std::min(M.Spec.find('|'), M.Spec.size());
+        FBlueprintClass::FInputBinding B;
+        B.bAction = M.bAction;
+        B.Name = M.Spec.substr(0, Bar);
+        B.Function = UeNameOf(&R, M.Method);
+        if (B.Name.empty()) return Refuse(std::string("names no ") + (M.bAction ? "action" : "key"));
+        /* The engine binds the key by its name and says nothing of one it has no key of, so the method would never
+           run. An action is one of the game's input settings, which the compiler cannot read. */
+        if (const std::string Meant = M.bAction ? std::string() : MisnamedKey(B.Name); !Meant.empty())
+            return Refuse("names no key the engine has, so it would never fire: the closest is " + Meant);
+        uint32 Events = 0;                      // bit 0 pressed, bit 1 released: EInputEvent's IE_Pressed, IE_Released
+        const std::string Options = Bar < M.Spec.size() ? M.Spec.substr(Bar + 1) : std::string();
+        for (size_t At = 0, End; At < Options.size(); At = End + 1)
+        {
+            End = std::min(Options.find(',', At), Options.size());
+            std::string O = Options.substr(At, End - At);
+            O.erase(0, std::min(O.find_first_not_of(' '), O.size()));
+            while (!O.empty() && O.back() == ' ') O.pop_back();
+            const bool bModifier = O == "Shift" || O == "Ctrl" || O == "Alt" || O == "Cmd";
+            if (O.empty()) continue;
+            if (O == "Pressed" || O == "Released") Events |= O == "Pressed" ? 1u : 2u;
+            else if (bModifier && M.bAction)
+                return Refuse("takes no " + O + ": an action's keys and their modifiers are the game's input settings'");
+            else if (bModifier) (O == "Shift" ? B.bShift : O == "Ctrl" ? B.bCtrl : O == "Alt" ? B.bAlt : B.bCmd) = true;
+            else if (O == "NoConsume") B.bConsumeInput = false;
+            else if (O == "WhenPaused") B.bExecuteWhenPaused = true;
+            else if (O == "KeepParent") B.bOverrideParentBinding = false;
+            else return Refuse("has an unknown option " + O + ": the options are Pressed, Released, "
+                               + (M.bAction ? "" : "Shift, Ctrl, Alt, Cmd, ") + "NoConsume, WhenPaused and KeepParent");
+        }
+        for (uint8 E = 0; E < 2; ++E)           // one binding per event, as the editor's node makes one per pin it wires
+            if ((Events ? Events : 1u) & (1u << E))
+            {
+                B.Event = E;
+                BP.AddInputBinding(B);
+            }
+    }
+    return true;
+}
+
+/* A number literal as a timeline macro stringizes it: `2`, `0.5`, `-1.5f`. */
+static bool TimelineNumber(std::string S, float& Out)
+{
+    S.erase(0, std::min(S.find_first_not_of(' '), S.size()));
+    while (!S.empty() && S.back() == ' ') S.pop_back();
+    if (!S.empty() && (S.back() == 'f' || S.back() == 'F')) S.pop_back();
+    if (S.empty()) return false;
+    char* End = nullptr;
+    Out = strtof(S.c_str(), &End);
+    return End == S.c_str() + S.size() && std::isfinite(Out);
+}
+
+/* A comma list as the macros stringize it, each item trimmed; a comma inside parentheses stays in its item. */
+static std::vector<std::string> TimelineItems(const std::string& S)
+{
+    std::vector<std::string> Out;
+    std::string Item;
+    int32 Depth = 0;
+    for (const char C : S + ",")
+    {
+        Depth += C == '(' ? 1 : C == ')' ? -1 : 0;
+        if (C != ',' || Depth > 0) { Item += C; continue; }
+        Item.erase(0, std::min(Item.find_first_not_of(' '), Item.size()));
+        while (!Item.empty() && Item.back() == ' ') Item.pop_back();
+        if (!Item.empty()) Out.push_back(Item);
+        Item.clear();
+    }
+    return Out;
+}
+
+/* UE_TIMELINE and its tracks and methods: what the editor's Timeline node compiles to, a TimelineTemplate of the class
+   with a curve per track, from which UBlueprintGeneratedClass::CreateTimelineComponent makes the actor's
+   UTimelineComponent as it spawns (BlueprintGeneratedClass.cpp 1077-1195): it stores the component in the timeline's
+   variable, sets each track's variable by name every frame it plays (FTimeline::SetPlaybackPosition), and binds the
+   update, finished and event-track functions by name through FOnTimelineEvent, a delegate of no parameters. The marked
+   method is the event itself, where the editor's __UpdateFunc stub only jumps into the ubergraph at the node's pin. */
+bool FCompiler::AddTimelines(const FRecord& R, bool bIsActor, FBlueprintClass& BP, std::string* Err) const
+{
+    std::map<std::string, FBlueprintClass::FTimeline> Timelines;
+    for (const auto& [Name_, Spec] : R.Timelines)
+    {
+        auto Refuse = [&](const std::string& Why) { *Err = R.CppName + "::" + Name_ + ": UE_TIMELINE" + Why; return false; };
+        if (!bIsActor)
+            return Refuse(" on a class that is no actor: the engine makes a timeline's component from the actor's class as "
+                          "the actor spawns, and no other object has one");
+        const size_t Bar = std::min(Spec.find('|'), Spec.size());
+        FBlueprintClass::FTimeline T;
+        T.Name = Name_;
+        T.DirectionProperty = Name_ + "__Direction_" + TimelineGuid(ClassOf(R), Name_, T.Guid);
+        if (!TimelineNumber(Spec.substr(0, Bar), T.Length) || T.Length <= 0.0f)
+            return Refuse("(" + Name_ + ", " + Spec.substr(0, Bar) + ") has a length that is not a number of seconds above 0");
+        for (const std::string& O : TimelineItems(Bar < Spec.size() ? Spec.substr(Bar + 1) : std::string()))
+            if (O == "AutoPlay") T.bAutoPlay = true;
+            else if (O == "Loop") T.bLoop = true;
+            else if (O == "Replicated") T.bReplicated = true;
+            else if (O == "IgnoreTimeDilation") T.bIgnoreTimeDilation = true;
+            else if (O == "LastKeyframe") T.bLastKeyframe = true;
+            else return Refuse("(" + Name_ + ") has an unknown option " + O + ": the options are AutoPlay, Loop, Replicated, "
+                               "IgnoreTimeDilation and LastKeyframe");
+        Timelines.emplace(Name_, T);
+    }
+
+    for (const auto& [Field, Spec] : R.Tracks)
+    {
+        const auto F = std::find_if(R.Fields.begin(), R.Fields.end(), [&](const Json* D) { return Name(*D) == Field; });
+        const std::string Type = F == R.Fields.end() ? std::string() : StripTypeKeywords(TypeOf(**F));
+        const char Kind = Type == "FVector" ? 'V' : Type == "FLinearColor" ? 'C' : 'F';
+        const char* const Macro = Kind == 'V' ? "UE_VECTOR_TRACK" : Kind == 'C' ? "UE_COLOR_TRACK" : "UE_FLOAT_TRACK";
+        const char* const Shape = Kind == 'V' ? "(time, x, y, z)" : Kind == 'C' ? "(time, r, g, b, a)" : "(time, value)";
+        const int32 Channels = Kind == 'V' ? 3 : Kind == 'C' ? 4 : 1;
+        auto Refuse = [&](const std::string& Why) { *Err = R.CppName + "::" + Field + ": " + Macro + " " + Why; return false; };
+        const size_t Bar = std::min(Spec.find('|'), Spec.size());
+        const auto T = Timelines.find(Spec.substr(0, Bar));
+        if (T == Timelines.end())
+            return Refuse("names " + Spec.substr(0, Bar) + ", which is no UE_TIMELINE of the class");
+        FBlueprintClass::FTimelineTrack Track;
+        Track.Kind = Kind;
+        Track.Name = Field;
+        for (std::string Key : TimelineItems(Bar < Spec.size() ? Spec.substr(Bar + 1) : std::string()))
+        {
+            std::vector<std::string> Parts;
+            if (Key.size() >= 2 && Key.front() == '(' && Key.back() == ')') Parts = TimelineItems(Key.substr(1, Key.size() - 2));
+            FBlueprintClass::FTimelineKey K;
+            if (!Parts.empty() && (Parts.back() == "Linear" || Parts.back() == "Constant" || Parts.back() == "Cubic"))
+            {
+                K.Interp = Parts.back() == "Linear" ? 0 : Parts.back() == "Constant" ? 1 : 2;
+                Parts.pop_back();
+            }
+            bool bOk = int32(Parts.size()) == 1 + Channels;
+            for (int32 I = 0; bOk && I <= Channels; ++I)
+                bOk = TimelineNumber(Parts[size_t(I)], I == 0 ? K.Time : K.Values[I - 1]);
+            if (!bOk)
+                return Refuse(std::string("has the key ") + Key + ", which is not " + Shape + " of number literals, with Cubic or "
+                              "Constant after the values for a key that is not Linear");
+            Track.Keys.push_back(K);
+        }
+        if (Track.Keys.empty()) return Refuse("has no keys: write them after the name, " + std::string(Shape) + ", ...");
+        /* The curve editor keeps a curve's keys sorted by time (FRichCurve::AddKey), and the engine evaluates them so. */
+        std::stable_sort(Track.Keys.begin(), Track.Keys.end(), [](const auto& A, const auto& B) { return A.Time < B.Time; });
+        T->second.Tracks.push_back(Track);
+    }
+
+    for (const FTimelineMark& M : R.TimelineMarks)
+    {
+        auto Refuse = [&](const std::string& Why) { *Err = R.CppName + "::" + M.Method + ": " + TimelineMarkText(M) + " " + Why; return false; };
+        const size_t Bar = std::min(M.Spec.find('|'), M.Spec.size());
+        const auto T = Timelines.find(M.Spec.substr(0, Bar));
+        if (T == Timelines.end()) return Refuse("names " + M.Spec.substr(0, Bar) + ", which is no UE_TIMELINE of the class");
+        if (IsStaticDecl(*M.Decl)) return Refuse("on a static method: the engine calls it on the actor; drop static");
+        if (IsInlineMethod(R, M.Method))
+            return Refuse("on an inline method, which is expanded where it is called, no function for the timeline to call; drop inline");
+        if (!CompilesMethod(R, M.Method)) return Refuse("on a method with no body, no function for the timeline to call");
+        std::string Ret = TypeOf(*M.Decl);
+        Ret = Ret.substr(0, Ret.find('('));
+        while (!Ret.empty() && Ret.back() == ' ') Ret.pop_back();
+        if (Ret != "void") return Refuse("on a method returning " + Ret + ": the engine calls it with nothing and takes nothing back; return void");
+        if (const size_t NumParms = ParmNames(*M.Decl).size(); NumParms > 0)
+        {
+            std::string Took;
+            for (size_t I = 0; I < NumParms; ++I) Took += (I ? ", " : "") + TypeOf(*ParmDeclAt(*M.Decl, I));
+            return Refuse("on a method taking (" + Took + "): the engine calls it with nothing, so it takes nothing");
+        }
+        const std::string Function = UeNameOf(&R, M.Method);
+        if (M.Kind == 'E')
+        {
+            FBlueprintClass::FTimelineTrack Track;
+            Track.Kind = 'E';
+            Track.Name = Function;
+            for (const std::string& Time : TimelineItems(Bar < M.Spec.size() ? M.Spec.substr(Bar + 1) : std::string()))
+            {
+                FBlueprintClass::FTimelineKey K;
+                if (!TimelineNumber(Time, K.Time)) return Refuse("has the time " + Time + ", which is not a number literal");
+                Track.Keys.push_back(K);
+            }
+            if (Track.Keys.empty()) return Refuse("has no times: list them after the timeline, `UE_TIMELINE_EVENT(" + T->first + ", 0.5, 1.5)`");
+            /* The track's name is the method's, so a method marked twice on one timeline would be two tracks of one name. */
+            for (const auto& Other : T->second.Tracks)
+                if (Lower(Other.Name) == Lower(Track.Name))
+                    return Refuse("marks a track named like another of " + T->first + "'s: list every time in one marker");
+            std::stable_sort(Track.Keys.begin(), Track.Keys.end(), [](const auto& A, const auto& B) { return A.Time < B.Time; });
+            T->second.Tracks.push_back(Track);
+            continue;
+        }
+        std::string& Pin = M.Kind == 'U' ? T->second.Update : T->second.Finished;
+        if (!Pin.empty()) return Refuse("marks a second method of " + T->first + ", after " + Pin + ": a timeline calls one");
+        Pin = Function;
+    }
+
+    /* In declaration order, as the editor lists its timelines in the order they were added. */
+    for (const Json* F : R.Fields)
+        if (auto T = Timelines.find(Name(*F)); T != Timelines.end()) BP.AddTimeline(T->second);
+    return true;
 }
 
 /* FName("None") is NAME_None, whatever its case. The editor refuses it as a variable's or a function's name ("Name
@@ -11798,32 +12769,34 @@ std::string StripTypeKeywords(std::string T)
     for (const char* Prefix : { "const ", "struct ", "class " })
         if (T.compare(0, strlen(Prefix), Prefix) == 0) T = T.substr(strlen(Prefix));
     while (!T.empty() && (T.back() == ' ' || T.back() == '\t')) T.pop_back();
-    /* TEnum<E> (UeMeta.h) is E to everything but its two methods, which LowerArg reads off the unstripped type. */
+    /* TEnum<E> (UeMeta.h) is E to everything but its two methods, which LowerArg reads off the unstripped type;
+       TEnumMask<E> is int32 to everything but its four. */
     if (IsTEnumType(T) && T.back() == '>') return StripTypeKeywords(T.substr(6, T.size() - 7));
+    if (IsTEnumType(T, "TEnumMask") && T.back() == '>') return "int32";
     return T;
 }
 
-/* T is TEnum<E> itself, `const` and a reference aside: not a type that holds one (`TArray<TEnum<E>>`), nor a list of
-   template arguments that starts with one (`TEnum<A>, TSubclassOf<B>`, a TMap's as TemplateArg hands it on), whose
-   `>` closing the `TEnum<` is not the last. */
-bool IsTEnumType(std::string T)
+/* T is TEnum<E> itself (or Of<E>: TEnumMask), `const` and a reference aside: not a type that holds one
+   (`TArray<TEnum<E>>`), nor a list of template arguments that starts with one (`TEnum<A>, TSubclassOf<B>`, a TMap's as
+   TemplateArg hands it on), whose `>` closing the `TEnum<` is not the last. */
+bool IsTEnumType(std::string T, const std::string& Of)
 {
     for (const char* Prefix : { "const ", "struct ", "class " })
         if (T.compare(0, strlen(Prefix), Prefix) == 0) T = T.substr(strlen(Prefix));
     while (!T.empty() && (T.back() == ' ' || T.back() == '\t' || T.back() == '&')) T.pop_back();
-    if (T.compare(0, 6, "TEnum<") != 0) return false;
+    if (T.compare(0, Of.size(), Of) != 0 || T.compare(Of.size(), 1, "<") != 0) return false;
     int32 Depth = 0;
-    for (size_t I = 5; I < T.size(); ++I)
+    for (size_t I = Of.size(); I < T.size(); ++I)
         if (T[I] == '<') ++Depth;
         else if (T[I] == '>' && --Depth == 0) return I + 1 == T.size();
     return false;
 }
 
 /* The number a constant expression comes to: literals, enum constants, ConstVars, the constants inlined parameters
-   and read-only locals stand for (ParmConst), casts, and arithmetic, comparisons, `&&`, `||` and `?:` over them, each
-   step rounded to the type clang gave it so `2 * 50.f` and `1 << 31` come out as C++ has them. `false && X`,
-   `true || X` and `?:` need only the side C++ evaluates. False for anything else (a call, sizeof) and for a division
-   by zero. */
+   and read-only locals stand for (ParmConst), a template's value parameter, `__is_same`, `sizeof...`, casts, and
+   arithmetic, comparisons, `&&`, `||` and `?:` over them, each step rounded to the type clang gave it so `2 * 50.f` and
+   `1 << 31` come out as C++ has them. `false && X`, `true || X` and `?:` need only the side C++ evaluates. False for
+   anything else (a call, sizeof) and for a division by zero. */
 bool FCompiler::FoldConst(const Json& E, FConstVal& Out) const
 {
     const std::string K = Kind(E);
@@ -11864,6 +12837,14 @@ bool FCompiler::FoldConst(const Json& E, FConstVal& Out) const
     }
     if (K == "ParenExpr" || K == "ConstantExpr" || K == "ExprWithCleanups")
         return First(E) && FoldConst(*First(E), Out);
+    /* A template's value parameter, `template <int32 S>`: its declaration, then the argument it stands for. */
+    if (K == "SubstNonTypeTemplateParmExpr") return Nth(E, 1) && FoldConst(*Nth(E, 1), Out) && Fit(Out);
+    /* `TEnumMask<E> M = 0x21;`, `{}`: the int32 it converts, or none. */
+    if (K == "CXXConstructExpr" && IsTEnumType(TypeOf(E), "TEnumMask") && !Nth(E, 1))
+    {
+        if (!First(E)) { Out = {}; return true; }
+        return FoldConst(*First(E), Out) && Fit(Out);
+    }
     if (K == "ImplicitCastExpr" || K == "CStyleCastExpr" || K == "CXXStaticCastExpr" || K == "CXXFunctionalCastExpr")
         return First(E) && FoldConst(*First(E), Out) && Fit(Out);
     if (K == "DeclRefExpr" && E.contains("referencedDecl"))
@@ -11883,6 +12864,58 @@ bool FCompiler::FoldConst(const Json& E, FConstVal& Out) const
         }
         auto C = ConstVars.find(Id);
         return C != ConstVars.end() && First(*C->second) && FoldConst(*First(*C->second), Out) && Fit(Out);
+    }
+    /* `__is_same(A, B)`. The JSON names no trait, but the range begins at the trait's keyword, and of clang's traits
+       over two types only __is_same is spelled in 9 characters. The two are the same when their canonical types are. */
+    if (K == "TypeTraitExpr")
+    {
+        Json Begin = E.value("range", Json::object()).value("begin", Json::object());
+        if (Begin.contains("spellingLoc")) Begin = Begin["spellingLoc"];
+        const Json* A = Nth(E, 0);
+        const Json* B = Nth(E, 1);
+        if (Begin.value("tokLen", 0) != 9 || !A || !B || Nth(E, 2)) return false;
+        const std::string KA = CanonTypeKey(*A), KB = CanonTypeKey(*B);
+        if (KA.empty() || KB.empty()) return false;
+        Out = {};
+        Out.I = KA == KB;
+        return true;
+    }
+    /* `sizeof...(P)` in the template instantiation being expanded: a template parameter pack is the arguments clang put
+       at its place, a function parameter pack the parameters it gave the pack's name (none for an empty pack). */
+    if (K == "SizeOfPackExpr")
+    {
+        const Json* Def = InlineStack.empty() ? nullptr : InlineStack.back();
+        const auto T = Def ? TemplateOf.find(Def->value("id", std::string())) : TemplateOf.end();
+        if (T == TemplateOf.end()) return false;
+        const std::string Pack = E.value("name", std::string());
+        int64 At = 0, Count = -1;
+        ForEach(*T->second, [&](const Json& P) {
+            const std::string PK = Kind(P);
+            if (PK != "TemplateTypeParmDecl" && PK != "NonTypeTemplateParmDecl" && PK != "TemplateTemplateParmDecl") return;
+            if (Name(P) == Pack && P.value("isParameterPack", false))
+            {
+                int64 I = 0;
+                ForEach(*Def, [&](const Json& Arg) {
+                    if (Kind(Arg) == "TemplateArgument" && I++ == At) { Count = 0; ForEach(Arg, [&](const Json&) { ++Count; }); }
+                });
+            }
+            ++At;
+        });
+        bool bFunctionPack = false;
+        ForEach(*T->second, [&](const Json& Pattern) {
+            ForEach(Pattern, [&](const Json& P) {
+                bFunctionPack = bFunctionPack || (Kind(P) == "ParmVarDecl" && Name(P) == Pack && P.value("isParameterPack", false));
+            });
+        });
+        if (Count < 0 && bFunctionPack)
+        {
+            Count = 0;
+            ForEach(*Def, [&](const Json& P) { Count += Kind(P) == "ParmVarDecl" && Name(P) == Pack; });
+        }
+        if (Count < 0) return false;
+        Out = {};
+        Out.I = Count;
+        return Fit(Out);
     }
     if (K == "UnaryOperator")
     {
@@ -11947,6 +12980,23 @@ bool FCompiler::FoldConst(const Json& E, FConstVal& Out) const
     else if (Op == ">>" && R.I >= 0 && R.I < 64) Out.I = L.I >> R.I;
     else return false;
     return Fit(Out);
+}
+
+/* `FKey("F5")`, `FKey K{FName("F5")}`: the constructor UeApi declares for each one-member struct, taking that member,
+   among the nodes Strip peels off N. It makes the struct from its argument, as the braced `FKey{"F5"}` does; null if
+   there is none. A copy is none, and neither is a Kismet conversion UeApi spells as a constructor (UE_CONV_*,
+   `FTransform(const FVector&)`), which ConvertArg makes. */
+const Json* FCompiler::StructConversionBelow(const Json& N) const
+{
+    const Json* Leaf = Strip(&N);
+    for (const Json* W = &N; W && W != Leaf; W = First(*W))
+    {
+        const std::string T = StripTypeKeywords(TypeOf(*W));
+        const FRecord* R = Kind(*W) == "CXXConstructExpr" && First(*W) && !Nth(*W, 1) && Structs.count(T) ? Find(T) : nullptr;
+        if (R && R->Fields.size() == 1 && Canon(StripTypeKeywords(TypeOf(*R->Fields[0]))) == Canon(StripTypeKeywords(TypeOf(*First(*W)))))
+            return W;
+    }
+    return nullptr;
 }
 
 /* The outermost cast below N, among those Strip peels off it, that changes the value it passes on: to bool, float to
@@ -12351,7 +13401,8 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
                              bool bKeepZero)
 {
     const Json* const Whole = Init ? Init : First(F);
-    Init = Strip(Whole);
+    Init = Whole ? StructConversionBelow(*Whole) : nullptr;
+    if (!Init) Init = Strip(Whole);
     /* No initializer: the property starts as the engine makes it, which is the C++ constructor's value but for a struct
        the engine makes as zeros though its constructor sets a member (CtorOverZeros): that value is written. */
     if (!Init)
@@ -12400,20 +13451,11 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
         /* StructName is the engine's name (`TextureGroup`); the declaration is found by the C++ one (`ETextureGroup`). */
         std::string CppEnum = EnumSide.StructName;
         for (const auto& E : Enums) if (E.second.UeName == EnumSide.StructName) CppEnum = E.first;
-        const std::vector<std::pair<std::string, int64>>* Names = nullptr;
-        for (const auto& E : EnumDecls)
-            if (E.first == CppEnum || (E.first.size() > CppEnum.size() + 2
-                && E.first.compare(E.first.size() - CppEnum.size() - 2, std::string::npos, "::" + CppEnum) == 0))
-                Names = &E.second;
-        if (!Names || EnumSide.StructName.empty()) { *Err = "UE_ENUM_MAP: " + Name(F) + " is not a map over an enum"; return false; }
-        for (const auto& Entry : *Names)
+        std::vector<std::pair<std::string, int64>> Names;
+        if (!EnumMapEntries(CppEnum, Names) || EnumSide.StructName.empty())
+        { *Err = "UE_ENUM_MAP: " + Name(F) + " is not a map over an enum"; return false; }
+        for (const auto& Entry : Names)
         {
-            /* UHT's and the cooker's own closing enumerator is not one of the enum's values. */
-            /* `PF_MAX_0` is Dumper-7's spelling of a PF_MAX that collided. */
-            std::string Closer = Entry.first;
-            while (!Closer.empty() && std::isdigit(uint8(Closer.back()))) Closer.pop_back();
-            if (Closer.size() > 5 && Closer.back() == '_' && Closer.compare(Closer.size() - 5, 5, "_MAX_") == 0) continue;
-            if (Entry.first.size() > 4 && Entry.first.compare(Entry.first.size() - 4, 4, "_MAX") == 0) continue;
             FDefaultValue Enum, Text;
             Enum.K = Text.K = FDefaultValue::Str;
             Enum.S = EnumSide.StructName + "::" + Entry.first;
@@ -12457,6 +13499,28 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
     {
         PD.Default.K = FDefaultValue::Obj;
         PD.Default.Object = Asset;
+        return true;
+    }
+    /* `X::StaticClass()`: the class, as the cook writes one picked in Class Defaults (BP_SpaceRig_Gamemode's
+       GameSessionClass, UPG_Bosco_ElectricDamage's NativeClass): a reference to its import, /Script/<Module>.<Class> or a
+       Blueprint's /Game/<Path>.<Name>_C, or to this class's own export. A TSubclassOf takes its class or a subclass, all
+       the editor's class picker offers; UeApi's converts from any class, so the rest is refused here. */
+    if (const Json* Callee = PD.Type == "ClassProperty" && K == "CallExpr" ? Strip(First(*Init)) : nullptr;
+        Callee && Kind(*Callee) == "DeclRefExpr" && (*Callee)["referencedDecl"].value("name", std::string()) == "StaticClass")
+    {
+        /* The slot: what the value converts to (an element's TSubclassOf), else the member's own type. */
+        std::string Slot = TypeOf(*Whole), Meta;
+        if (!TemplateArg(Slot, "TSubclassOf", &Meta)) Slot = TypeOf(F);
+        const FRecord* C = StaticClassOf(*Callee, Slot);
+        if (!C) { *Err = Name(F) + ": StaticClass() on an unknown class"; return false; }
+        if (const FRecord* M = TemplateArg(Slot, "TSubclassOf", &Meta) ? Find(Meta) : nullptr; M && !IsSubclassOf(*C, *M))
+        {
+            *Err = Name(F) + ": a TSubclassOf<" + LeafOf(M->CppName) + "> holds " + LeafOf(M->CppName) + " or a subclass of it, and "
+                 + LeafOf(C->CppName) + " is neither";
+            return false;
+        }
+        PD.Default.K = FDefaultValue::Obj;
+        PD.Default.Object = ClassImportOf(*C, BP);
         return true;
     }
     /* A soft pointer's default is its path, "/Game/Dir/Pkg" meaning Pkg.Pkg as UE_ASSET_AT's does. */
@@ -12631,9 +13695,9 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
         return true;
     }
     *Err = Name(F) + ": a default is a value known when the mod is built - a literal, a constant expression over "
-           "literals, enum constants and constexpr variables, a braced struct, or an &Asset. A function call counts only "
-           "through `constexpr T k = F();` with F consteval, which clang runs itself. Anything computed when the game "
-           "runs belongs in ReceiveBeginPlay or UserConstructionScript";
+           "literals, enum constants and constexpr variables, a braced struct, an &Asset or a class, X::StaticClass(). A "
+           "function call counts only through `constexpr T k = F();` with F consteval, which clang runs itself. Anything "
+           "computed when the game runs belongs in ReceiveBeginPlay or UserConstructionScript";
     return false;
 }
 
@@ -12898,6 +13962,8 @@ bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& P
         *Out = StructParam(PName, BP.ScriptStruct(PackageOf(*SR), ClassOf(*SR)), ClassOf(*SR), Size, ExtraFlags);
         return true;
     }
+    if (Type.compare(0, 13, "TAwaitValues<") == 0)
+    { *Err = Where + ": UE_AWAIT gives a dispatcher's two or more values one name each, `auto [Who, Points] = UE_AWAIT(OnScored);`"; return false; }
 
     /* Object pointer, spelled `[const] class X *`. UClass* is a reflected UClass reference,
        so it emits an FClassProperty (PropertyClass = UClass, MetaClass = UObject "any class")
@@ -13380,6 +14446,7 @@ bool FCompiler::GenerateInterface(const FRecord& R, const std::string& OutDir, s
     { *Err = R.CppName + " extends " + R.Base + ", which is not an interface"; return false; }
     const std::string ParentPkg = !Parent ? "/Script/CoreUObject" : PackageOf(*Parent);
     FBlueprintClass BP(P, ClassOf(R), ParentPkg, !Parent ? "Interface" : ClassOf(*Parent), ParentPkg.compare(0, 6, "/Game/") == 0);
+    BP.GameClassKinds = &GameClassKinds;
     BP.SetIsActor(false);
     BP.SetClassFlags(CLASS_Parsed | CLASS_Interface | CLASS_CompiledFromBlueprint);
 
@@ -13445,6 +14512,7 @@ bool FCompiler::GenerateStruct(const FRecord& R, const std::string& OutDir, std:
     FPackage P(PackageName);
     StampIdentity(P, PackageName);
     FBlueprintClass BP(P, ClassOf(R), "", "", false);
+    BP.GameClassKinds = &GameClassKinds;
     if (!RefuseNoneNames(R, Err)) return false;
 
     for (const Json* F : R.Fields)
@@ -13559,6 +14627,7 @@ bool FCompiler::GenerateAsset(const Json& Var, const std::string& OutDir, std::s
     FPackage P(PackageName);
     StampIdentity(P, PackageName);
     FBlueprintClass BP(P, AssetName, "", "", false);
+    BP.GameClassKinds = &GameClassKinds;
     struct FTagsScope { const FBlueprintClass*& In; ~FTagsScope() { In = nullptr; } } TagsScope{ TagsOnlyIn };
     TagsOnlyIn = &BP;
 
@@ -13607,6 +14676,7 @@ bool FCompiler::GenerateEdit(const std::string& Key, const Json& Var, std::strin
     const std::string Object = SplitAssetPath(Package);
     FPackage Scratch(Package);
     FBlueprintClass BP(Scratch, Object, "", "", false);
+    BP.GameClassKinds = &GameClassKinds;
     std::vector<FPropertyDef> Defs;
     /* An explicit zero is written: the asset's own value is what it replaces, not the class default. */
     if (!BracedMembers(*BracedInit(Var), *R, Qual, BP, /*bKeepZero=*/true, Defs, Err)) return false;
@@ -13667,6 +14737,7 @@ bool FCompiler::PatchDefaults(const FRecord& Bp, const Json& Body, const std::st
     while (Engine && PackageOf(*Engine).compare(0, 8, "/Script/") != 0) Engine = Engine->Base.empty() ? nullptr : Find(Engine->Base);
     FPackage Scratch(Package);
     FBlueprintClass BP(Scratch, Class, "", "", false);
+    BP.GameClassKinds = &GameClassKinds;
     std::map<std::string, std::vector<FEditDef>> Objects;          // an export, as ApplyEdit names it -> its assignments
     auto DeclarerOf = [&](const Json& M) {
         const auto Owner = FieldOwner.find(M.value("referencedMemberDecl", std::string()));
@@ -14243,11 +15314,23 @@ bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object,
     std::map<int32, int32> Moved;
     std::string MoveErr;
     auto Move = [&](int32 Index) { return ImportInto(P, Package, From, Index, Moved, &MoveErr); };
+    /* Each object a value names is created before the object is serialized, as the cook lists it: bar one in
+       /Script/CoreUObject (a class such as UObject's), which nothing waits on (SavePackage.cpp 3899). */
+    auto InCoreUObject = [&](int32 Index) {
+        const FImport* I = From.ImportAt(FIndex{ Index });
+        while (I && I->Outer.V < 0) I = From.ImportAt(I->Outer);
+        return I && I->ObjectName == "/Script/CoreUObject";
+    };
     /* A deep copy on the way: members and elements are shared_ptrs a type's other properties may hold too. */
     std::vector<int32> Deps;
     std::function<void(FPropertyDef&)> MoveDef;
     std::function<void(FDefaultValue&)> MoveValue = [&](FDefaultValue& V) {
-        if (V.K == FDefaultValue::Obj && V.Object.V != 0) Deps.push_back(V.Object.V = Move(V.Object.V));
+        if (V.K == FDefaultValue::Obj && V.Object.V != 0)
+        {
+            const bool bCore = InCoreUObject(V.Object.V);
+            V.Object.V = Move(V.Object.V);
+            if (!bCore) Deps.push_back(V.Object.V);
+        }
         for (FDefaultValue& Item : V.Items) MoveValue(Item);
         if (V.Members)
         {
@@ -14514,6 +15597,15 @@ static bool ForEachFieldPath(const std::vector<uint8>& B, size_t Begin, size_t E
     while (bOk && O < End) Expr();
     return bOk && O == End;
 }
+
+/* A widget's two events that the engine calls only while a flag on its default object is set: NativeTick calls Tick
+   while bHasScriptImplementedTick is, NativePaint calls OnPaint while bHasScriptImplementedPaint is (UserWidget.cpp 1377,
+   1602). UUserWidget's constructor sets both (68-69). The editor's widget compiler sets them again on every compile,
+   after the class defaults: each true where the class has that event of its own, else false. A parent's does not count,
+   since FindOverriddenImplementableEvent looks in the class alone (WidgetBlueprintCompiler.cpp 466-487,
+   KismetCompilerMisc.cpp 634-644). Measured on the game's 1,484 widget Blueprints: each holds its flags so. */
+static const std::pair<const char*, const char*> kWidgetEvents[] = { { "Tick", "bHasScriptImplementedTick" },
+                                                                     { "OnPaint", "bHasScriptImplementedPaint" } };
 
 /*
 S38 - a patch's methods, compiled by Generate as a scratch child class of the Blueprint B (each an override of B's
@@ -14862,7 +15954,23 @@ bool FCompiler::TransplantFunctions(const FRecord& R, const FRecord& B, const FP
             if (!ApplyEdit(Package, "Default__" + Class, { FEditDef{ { Tick, Can }, { Step } } }, Scratch, Where, Err)) return false;
         }
     }
-    return true;
+    /* So is a Tick or OnPaint the patch adds to a widget: the class now has that event of its own, and the editor's widget
+       compiler sets its flag for one (kWidgetEvents).
+       ponytail: only B's package is edited, so a game subclass whose default object has no tag for the flag (it held B's
+       value) now inherits it and runs the added event, where the editor would recompile that subclass with the flag off.
+       Editing those subclasses' packages too would match the editor. */
+    bool bWidget = false;
+    for (const FRecord* A = &B; A && !bWidget; A = A->Base.empty() ? nullptr : Find(A->Base)) bWidget = A->UeName == "UserWidget";
+    std::vector<FEditDef> Flags;
+    for (const auto& [Event, Flag] : kWidgetEvents)
+        if (bWidget && Added.count(Lower(Event)))
+        {
+            FPropertyDef On = BoolParam(Flag);
+            On.Default.K = FDefaultValue::Bool;
+            On.Default.I = 1;
+            Flags.push_back(FEditDef{ { On }, {} });
+        }
+    return Flags.empty() || ApplyEdit(Package, "Default__" + Class, Flags, Scratch, Where, Err);
 }
 
 /* The edited packages, each at its own /Game path under the Content folder OutDir is in: the mod pak's copy is the one
@@ -14897,6 +16005,7 @@ bool FCompiler::GenerateNestedWrappers(const std::string& OutDir, std::string* E
             FPackage P(PackageName);
             StampIdentity(P, PackageName);
             FBlueprintClass BP(P, Name, "", "", false);
+            BP.GameClassKinds = &GameClassKinds;
             FPropertyDef PD;
             if (!TypeToProperty(Type, "Value", 0, "nested container " + Type, BP, &PD, Err)) return false;
             PD.PropertyFlags = CPF_Edit | CPF_BlueprintVisible;
@@ -14978,6 +16087,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
        BP_ThornsComponent). */
     const std::string ParentPkg = PackageOf(*B);
     FBlueprintClass BP(P, ClassOf(R), ParentPkg, ClassOf(*B), ParentPkg.compare(0, 6, "/Game/") == 0);
+    BP.GameClassKinds = &GameClassKinds;
     /* A TDelegate's signature function is made in this class while it is built (DelegateSignature), in no other. */
     struct FSigScope { const FBlueprintClass*& In; ~FSigScope() { In = nullptr; } } SigScope{ DelegateSigsIn };
     DelegateSigs.clear();
@@ -14990,6 +16100,38 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     const bool bIsActor = std::find(Ancestry.begin(), Ancestry.end(), "Actor") != Ancestry.end();
     BP.SetIsActor(bIsActor);
     BP.SetIsComponent(std::find(Ancestry.begin(), Ancestry.end(), "ActorComponent") != Ancestry.end());
+    /* Whether A has a function of its own named Event, where the editor's widget compiler looks for one (kWidgetEvents):
+       a method a class cooked here compiles, or one a game Blueprint's header (or another mod's) lists. */
+    auto OwnEvent = [&](const FRecord& A, const char* Event) {
+        return A.IsNative() ? A.Methods.count(Event) != 0 : !IsInlineMethod(A, Event) && CompilesMethod(A, Event);
+    };
+    const bool bIsWidget = !R.bIsPatch && std::find(Ancestry.begin(), Ancestry.end(), "UserWidget") != Ancestry.end();
+    /* A widget shows its tree's root (UUserWidget::RebuildWidget, UserWidget.cpp 745), and a tree is made only for a
+       WidgetBlueprintGeneratedClass, from its designer layout or the nearest parent's (Initialize, 125-143). AssetGen
+       cooks one for a class with UE_WIDGETs or below one (S39), and a BlueprintGeneratedClass otherwise, whose tree
+       starts empty, under a game widget Blueprint too. It shows
+       something only if the class or a mod class above it sets the root itself, or the class paints: OnPaint runs only
+       for a class with an OnPaint of its own (NativePaint, 1600-1611; kWidgetEvents). */
+    if (!R.Widgets.empty() && !bIsWidget)
+    { *Err = R.CppName + "::" + R.Widgets.front() + ": a UE_WIDGET is a widget of a UUserWidget's tree; this class is none"; return false; }
+    BP.SetWidgetClass(bIsWidget && HasWidgetTree(R));
+    if (bIsWidget && !HasWidgetTree(R))
+    {
+        bool bDraws = OwnEvent(R, "OnPaint");
+        std::function<void(const Json&)> Scan = [&](const Json& N) {
+            if (Kind(N) == "MemberExpr" && N.value("name", std::string()) == "RootWidget") bDraws = true;
+            if (!bDraws) ForEach(N, Scan);
+        };
+        for (const FRecord* A = &R; A && !A->IsNative() && !bDraws; A = A->Base.empty() ? nullptr : Find(A->Base))
+        {
+            for (const Json* M : A->AllMethods) Scan(*M);
+            for (const auto& [Name, Def] : A->MethodDefs) Scan(*Def);
+        }
+        if (!bDraws)
+            printf("  warning: %s: a widget class AssetGen cooks has no widget tree unless it declares one with UE_WIDGET, "
+                   "so it shows nothing of its own, not even a widget Blueprint parent's layout: declare its widgets, set "
+                   "WidgetTree->RootWidget in OnInitialized or draw in OnPaint\n", R.CppName.c_str());
+    }
     /* Abstract: the nearest declaration of some method along the class chain is `= 0`. SpawnActor and CreateWidget
        refuse the class, as they do one the editor marks Generate Abstract Class. An interface's `= 0` does not count,
        since an implementer that leaves it out gets a stub, and clang's own isAbstract never reaches here (FAstSax). */
@@ -15044,6 +16186,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                         { *Err = R.CppName + " implements " + Other + " and " + I + ", which both extend " + Mine->CppName; return false; }
         BP.AddInterface(ClassImportOf(*IR, BP));
     }
+    if (!AddInputBindings(R, bIsActor, BP, Err)) return false;
+    if (!AddTimelines(R, bIsActor, BP, Err)) return false;
 
     auto LowerParams = [&](const Json& M, const std::string& Fn, std::vector<FPropertyDef>& Params) {
         return this->LowerParams(M, Fn, BP, Params, Err);
@@ -15086,9 +16230,44 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     std::vector<FPropertyDef> InheritedDefaults;
     std::map<std::string, FPropertyDef> InterfaceVarDefaults;     // a default for a variable an implemented interface declares
     std::map<std::string, FBlueprintClass::FAttachment> Attachments;    // a UE_COMPONENT -> where SetupAttachment puts it
+    /* S39: a UE_WIDGET's defaults, and the slots the layout's AddChild calls make, in the order written. A canvas slot's
+       setters each set part of its LayoutData, kept per member path ("Offsets.Left", "Anchors.Minimum.X") until the tag
+       is made after the walk. */
+    std::map<std::string, std::vector<FPropertyDef>> WidgetDefaults;
+    struct FLayoutSlot
+    {
+        std::string Panel, Child;
+        const FRecord* Class = nullptr;
+        std::vector<FPropertyDef> Defaults;
+        std::map<std::string, double> Layout;
+    };
+    std::vector<FLayoutSlot> LayoutSlots;
+    /* UE_SLOT(Host->Slot, Content): Content, a widget of this tree, in the named slot Slot (its engine name) of Host. */
+    struct FSlotFill { std::string Host, Slot, Content; };
+    std::vector<FSlotFill> SlotFills;
+    auto IsWidgetOf =[](const FRecord& Of, const std::string& N) {
+        return std::find(Of.Widgets.begin(), Of.Widgets.end(), N) != Of.Widgets.end();
+    };
+    auto Derives = [&](const FRecord* C, const char* UeName) {
+        for (; C; C = C->Base.empty() ? nullptr : Find(C->Base))
+            if (C->UeName == UeName) return true;
+        return false;
+    };
+    /* The class a pointer type names: `class UCanvasPanelSlot *` -> UCanvasPanelSlot. */
+    auto PointeeOf = [&](const std::string& Type) -> const FRecord* {
+        const size_t Star = Type.find('*');
+        return Star == std::string::npos ? nullptr : Find(StripTypeKeywords(Type.substr(0, Star)));
+    };
+    auto WidgetClassOf = [&](const std::string& Widget) -> const FRecord* {
+        for (const Json* F : R.Fields)
+            if (Name(*F) == Widget) return PointeeOf(TypeOf(*F));
+        return nullptr;
+    };
     if (R.Defaults && !R.bIsPatch)      // a patch's defaults are tags of the game's own package (GeneratePatch)
     {
-        const std::string Where = R.CppName + "::UE_DEFAULTS";
+        /* A statement LowerCtor brought from the constructor is named as the constructor's. */
+        const std::string Block = R.CppName + "::UE_DEFAULTS";
+        std::string Where = Block;
         auto OwnerOf = [&](const Json& M) {
             auto It = FieldOwner.find(M.value("referencedMemberDecl", std::string()));
             return It == FieldOwner.end() ? std::string() : It->second;
@@ -15163,12 +16342,291 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             Attachments[Comp] = A;
             return true;
         };
+
+        /* S39: a widget class's layout, read and never called, as SetupAttachment is. A UE_WIDGET named as this class's
+           member, `Title`, or "" for anything else. */
+        auto WidgetNamed = [&](const Json* E) -> std::string {
+            E = Strip(E);
+            if (!E || Kind(*E) != "MemberExpr" || OwnerOf(*E) != R.CppName || !IsWidgetOf(R, Name(*E))) return {};
+            const Json* Self = Strip(First(*E));
+            return Self && Kind(*Self) == "CXXThisExpr" ? Name(*E) : std::string();
+        };
+        /* `Panel->AddChild...(Child)` or `Panel->SetContent(Child)`: the slot it makes, as an index into LayoutSlots; -2
+           for a call of any other method, -1 with Err set for one this refuses. The slot's class is the one the call
+           returns, as UE's typed adders say it (AddChildToCanvas: UCanvasPanelSlot); the untyped AddChild and SetContent
+           return a UPanelSlot, so there it is the panel's own, `<Panel>Slot` up its class chain, as each panel's
+           GetSlotClass makes it (Button: ButtonSlot). */
+        std::function<int32(const Json*)> AddCall = [&](const Json* Call) -> int32 {
+            Call = Strip(Call);
+            /* `Cast<UButtonSlot>(Play->SetContent(Label))`, the untyped call's slot as its class: that class must be it. */
+            if (const Json* Fn = Call && Kind(*Call) == "CallExpr" ? Strip(First(*Call)) : nullptr;
+                Fn && Kind(*Fn) == "DeclRefExpr" && Fn->value("referencedDecl", Json::object()).value("name", std::string()) == "Cast")
+            {
+                const int32 At = Nth(*Call, 1) ? AddCall(Nth(*Call, 1)) : -2;
+                const FRecord* To = PointeeOf(TypeOf(*Call));
+                if (At >= 0 && !(To && Derives(LayoutSlots[At].Class, To->UeName.c_str())))
+                {
+                    *Err = Where + ": " + LayoutSlots[At].Panel + "'s slot is a " + LayoutSlots[At].Class->CppName + ", so this Cast is null";
+                    return -1;
+                }
+                return At;
+            }
+            const Json* Callee = Call && Kind(*Call) == "CXXMemberCallExpr" ? Strip(First(*Call)) : nullptr;
+            const std::string Fn = Callee && Kind(*Callee) == "MemberExpr" ? Name(*Callee) : std::string();
+            if (Fn.compare(0, 8, "AddChild") != 0 && Fn != "SetContent") return -2;
+            const std::string Panel = WidgetNamed(First(*Callee)), Child = WidgetNamed(Nth(*Call, 1));
+            auto Refuse = [&](const std::string& Why) { *Err = Where + ": " + Why; return -1; };
+            if (Panel.empty() || Child.empty())
+                return Refuse(Fn + " adds one of this class's UE_WIDGETs to another, each by its member name: "
+                              "`Root->AddChildToCanvas(Title)`");
+            for (size_t I = 2; Nth(*Call, I); ++I)
+                if (Kind(*Nth(*Call, I)) != "CXXDefaultArgExpr")
+                    return Refuse(Panel + "->" + Fn + ": the slot's other values are its setters', `->SetPadding(...)`; "
+                                  "add the widget with its one argument");
+            if (Child == R.Widgets.front())
+                return Refuse(Child + " is the tree's root, the first UE_WIDGET, which no panel holds");
+            if (Child == Panel) return Refuse(Child + " is added to itself");
+            for (const FLayoutSlot& S : LayoutSlots)
+                if (S.Child == Child) return Refuse(Child + " is added to " + S.Panel + " already; a widget has one parent");
+            for (const FSlotFill& F : SlotFills)
+                if (F.Content == Child) return Refuse(Child + " fills " + F.Host + "'s slot " + F.Slot + " already; a widget has one parent");
+            const FRecord* PanelClass = WidgetClassOf(Panel);
+            if (!Derives(PanelClass, "PanelWidget")) return Refuse(Panel + " is no panel, so it holds no widget");
+            if (Derives(PanelClass, "ContentWidget"))
+                for (const FLayoutSlot& S : LayoutSlots)
+                    if (S.Panel == Panel)
+                        return Refuse(Panel + " holds one widget, " + S.Child + "; put both in a panel that holds more");
+            const FRecord* SlotClass = PointeeOf(TypeOf(*Call));
+            if (SlotClass && SlotClass->UeName == "PanelSlot")
+            {
+                SlotClass = nullptr;
+                static const std::map<std::string, std::string> Unlike = { { "GridPanel", "GridSlot" },
+                                                                           { "UniformGridPanel", "UniformGridSlot" } };
+                for (const FRecord* A = PanelClass; A && !SlotClass; A = A->Base.empty() ? nullptr : Find(A->Base))
+                {
+                    const auto U = Unlike.find(A->UeName);
+                    SlotClass = Find("U" + (U != Unlike.end() ? U->second : A->UeName + "Slot"));
+                }
+            }
+            if (!SlotClass || !Derives(SlotClass, "PanelSlot"))
+                return Refuse("cannot tell the slot class of " + Panel + "; add the widget with the panel's own "
+                              "AddChildTo... call, which returns it");
+            LayoutSlots.push_back(FLayoutSlot{ Panel, Child, SlotClass, {}, {} });
+            return int32(LayoutSlots.size() - 1);
+        };
+        /* `X->SetFoo(Value)` on a widget or a slot, read as the property it sets: `Foo` or `bFoo` of the setter's
+           argument type on X's class. A canvas slot's position, size, offsets, anchors and alignment are parts of its
+           LayoutData instead (CanvasPanelSlot.cpp's setters). */
+        auto MemberF = [](const FPropertyDef& S, const std::string& Path) {
+            std::function<double(const FPropertyDef&, const std::string&)> Walk = [&](const FPropertyDef& Of, const std::string& P) {
+                const size_t Dot = P.find('.');
+                const auto& Ms = Of.Default.Members ? Of.Default.Members : Of.Members;
+                if (Ms)
+                    for (const FPropertyDef& M : *Ms)
+                        if (M.Name == P.substr(0, Dot))
+                            return Dot != std::string::npos ? Walk(M, P.substr(Dot + 1))
+                                 : M.Default.K == FDefaultValue::Int ? double(M.Default.I) : M.Default.F;
+                return 0.0;
+            };
+            return Walk(S, Path);
+        };
+        auto Setter = [&](const FRecord* Class, const std::string& Of, const Json& Call, std::vector<FPropertyDef>& Into,
+                          std::map<std::string, double>* Layout) {
+            const Json* Callee = Strip(First(Call));
+            const std::string Fn = Name(*Callee);
+            const Json* Arg = Nth(Call, 1);
+            if (Fn.compare(0, 3, "Set") != 0 || !Arg || Nth(Call, 2))
+            { *Err = Where + ": " + Of + "->" + Fn + ": a layout statement adds a widget or calls a one-argument setter"; return false; }
+            auto Lower = [&](const std::string& Type, const std::string& TagName, FPropertyDef& PD) {
+                if (!TypeToProperty(Type, TagName, 0, Where, BP, &PD, Err) || !LowerDefault(*Arg, PD, BP, Err, Arg, /*bKeepZero=*/true))
+                    return false;
+                if (PD.Default.K == FDefaultValue::None) { *Err = Where + ": " + Of + "->" + Fn + " needs a literal value"; return false; }
+                return true;
+            };
+            static const std::map<std::string, std::pair<const char*, std::vector<std::pair<std::string, std::string>>>> Canvas = {
+                { "SetPosition", { "FVector2D", { { "Offsets.Left", "X" }, { "Offsets.Top", "Y" } } } },
+                { "SetSize", { "FVector2D", { { "Offsets.Right", "X" }, { "Offsets.Bottom", "Y" } } } },
+                { "SetOffsets", { "FMargin", { { "Offsets.Left", "Left" }, { "Offsets.Top", "Top" }, { "Offsets.Right", "Right" },
+                                              { "Offsets.Bottom", "Bottom" } } } },
+                { "SetMinimum", { "FVector2D", { { "Anchors.Minimum.X", "X" }, { "Anchors.Minimum.Y", "Y" } } } },
+                { "SetMaximum", { "FVector2D", { { "Anchors.Maximum.X", "X" }, { "Anchors.Maximum.Y", "Y" } } } },
+                { "SetAnchors", { "FAnchors", { { "Anchors.Minimum.X", "Minimum.X" }, { "Anchors.Minimum.Y", "Minimum.Y" },
+                                               { "Anchors.Maximum.X", "Maximum.X" }, { "Anchors.Maximum.Y", "Maximum.Y" } } } },
+                { "SetAlignment", { "FVector2D", { { "Alignment.X", "X" }, { "Alignment.Y", "Y" } } } },
+                { "SetLayout", { "FAnchorData", { { "Offsets.Left", "Offsets.Left" }, { "Offsets.Top", "Offsets.Top" },
+                    { "Offsets.Right", "Offsets.Right" }, { "Offsets.Bottom", "Offsets.Bottom" },
+                    { "Anchors.Minimum.X", "Anchors.Minimum.X" }, { "Anchors.Minimum.Y", "Anchors.Minimum.Y" },
+                    { "Anchors.Maximum.X", "Anchors.Maximum.X" }, { "Anchors.Maximum.Y", "Anchors.Maximum.Y" },
+                    { "Alignment.X", "Alignment.X" }, { "Alignment.Y", "Alignment.Y" } } } } };
+            if (const auto C = Canvas.find(Fn); Layout && C != Canvas.end() && Derives(Class, "CanvasPanelSlot"))
+            {
+                FPropertyDef PD;
+                if (!Lower(C->second.first, "Value", PD)) return false;
+                for (const auto& [To, From] : C->second.second) (*Layout)[To] = MemberF(PD, From);
+                return true;
+            }
+            auto Bare = [&](std::string T) {
+                T = StripTypeKeywords(T);
+                if (!T.empty() && T.back() == '&') T.pop_back();
+                T.erase(std::remove(T.begin(), T.end(), ' '), T.end());
+                return T;
+            };
+            const std::string Prop = Fn.substr(3);
+            for (const FRecord* A = Class; A; A = A->Base.empty() ? nullptr : Find(A->Base))
+                for (const Json* F : A->Fields)
+                    if ((Name(*F) == Prop || Name(*F) == "b" + Prop) && Bare(TypeOf(*F)) == Bare(TypeOf(*Arg)))
+                    {
+                        FPropertyDef PD;
+                        if (!Lower(TypeOf(*F), UeNameOf(A, Name(*F)), PD)) return false;
+                        Into.push_back(PD);
+                        return true;
+                    }
+            *Err = Where + ": " + Of + "->" + Fn + ": AssetGen reads a setter as the property it sets, and "
+                 + (Class ? Class->CppName : std::string("its class")) + " has no " + Prop + " of its argument's type"
+                 + (Layout ? "" : "; assign the member, `" + Of + "->Field = value;`");
+            return false;
+        };
+        std::map<std::string, size_t> SlotLocals;      // `UCanvasPanelSlot* At = Root->AddChildToCanvas(Title);`: At's decl id -> its slot
+        auto Layout = [&](const Json& S) {
+            const Json* N = Strip(&S);
+            if (Kind(*N) == "DeclStmt")
+            {
+                const Json* Var = First(*N);
+                const int32 At = Var && Kind(*Var) == "VarDecl" && !Nth(*N, 1) ? AddCall(First(*Var)) : -2;
+                if (At == -2) *Err = Where + ": a local of a widget class's layout holds the slot an AddChild call returns, "
+                                     "`UCanvasPanelSlot* At = Root->AddChildToCanvas(Title);`";
+                if (At < 0) return false;
+                SlotLocals[Var->value("id", std::string())] = size_t(At);
+                return true;
+            }
+            /* The object a member expression is reached through, `Card` of `Card->Body`, as the UE_WIDGET it names. */
+            auto WidgetOfMember = [&](const Json* M) {
+                M = Strip(M);
+                return M && Kind(*M) == "MemberExpr" ? WidgetNamed(First(*M)) : std::string();
+            };
+            /* UE_SLOT(Card->Body, Inner): Inner, in no panel, fills the named slot Body of the nested user widget Card.
+               UUserWidget::InitializeNamedSlots finds the UNamedSlot by Body's name on Card's class and adds Inner to it;
+               a mod class's slot must be a widget of its tree, or that variable is null there. */
+            const std::string Helper = LayoutHelperCall(*N);
+            if (Helper == "UeSlot__")
+            {
+                const Json* SlotE = Strip(Nth(*N, 1));
+                const std::string Host = WidgetOfMember(SlotE), Content = WidgetNamed(Nth(*N, 2));
+                if (Host.empty() || Content.empty())
+                { *Err = Where + ": UE_SLOT fills a named slot of one of this class's UE_WIDGETs with another, each by its "
+                         "member name: `UE_SLOT(Frame->Body, Inner)`"; return false; }
+                const std::string Slot = Name(*SlotE);
+                const FRecord* SlotOwner = Find(OwnerOf(*SlotE));
+                if (!Derives(WidgetClassOf(Host), "UserWidget"))
+                { *Err = Where + ": " + Host + " is no user widget, so it has no named slot to fill"; return false; }
+                if (SlotOwner && !SlotOwner->IsNative() && !IsWidgetOf(*SlotOwner, Slot))
+                { *Err = Where + ": " + SlotOwner->CppName + "::" + Slot + " is no UE_WIDGET, so no slot of " + SlotOwner->CppName
+                         + "'s tree; declare it `UE_WIDGET(UNamedSlot, " + Slot + ")`"; return false; }
+                if (Content == R.Widgets.front()) { *Err = Where + ": " + Content + " is the tree's root, which nothing holds"; return false; }
+                if (Content == Host) { *Err = Where + ": " + Content + " fills its own slot"; return false; }
+                for (const FLayoutSlot& S : LayoutSlots)
+                    if (S.Child == Content)
+                    { *Err = Where + ": " + Content + " is added to " + S.Panel + " already; a widget has one parent"; return false; }
+                const std::string SlotName = SlotOwner ? UeNameOf(SlotOwner, Slot) : Slot;
+                for (const FSlotFill& F : SlotFills)
+                {
+                    if (F.Content == Content)
+                    { *Err = Where + ": " + Content + " fills " + F.Host + "'s slot " + F.Slot + " already; a widget has one parent"; return false; }
+                    if (F.Host == Host && F.Slot == SlotName)
+                    { *Err = Where + ": " + Host + "'s slot " + SlotName + " holds " + F.Content + " already; a named slot holds one widget"; return false; }
+                }
+                SlotFills.push_back({ Host, SlotName, Content });
+                return true;
+            }
+            /* UE_BIND(Title, Text, &UMyCard::GetScore): an entry of the class's Bindings, Title's TextDelegate bound to a
+               function of this class. UeMeta.h's overloads have already held the function to the property's type and no
+               parameters. */
+            if (Helper == "UeBind__")
+            {
+                const std::string W = WidgetOfMember(Nth(*N, 1));
+                const Json* PropE = Strip(Nth(*N, 2));
+                const Json* Fn = Strip(Nth(*N, 3));
+                if (Fn && Kind(*Fn) == "UnaryOperator") Fn = Strip(First(*Fn));
+                if (W.empty() || !PropE || Kind(*PropE) != "MemberExpr" || !Fn || Kind(*Fn) != "DeclRefExpr")
+                { *Err = Where + ": UE_BIND binds a property of one of this class's UE_WIDGETs to a function of this class: "
+                         "`UE_BIND(Title, Text, &UMyCard::GetScore)`"; return false; }
+                const Json& Ref = (*Fn)["referencedDecl"];
+                const std::string FnName = Name(Ref);
+                const auto M = MethodOwner.find(Ref.value("id", std::string()));
+                const FRecord* FnOwner = M == MethodOwner.end() ? nullptr : Find(M->second);
+                bool bMine = false;
+                for (const FRecord* A = &R; A && FnOwner && !bMine; A = A->Base.empty() ? nullptr : Find(A->Base)) bMine = A == FnOwner;
+                if (!bMine)
+                { *Err = Where + ": UE_BIND's " + FnName + " is a function of this class or of a class above it, which the "
+                         "engine calls on this widget by name"; return false; }
+                if (!FnOwner->IsNative() && (IsInlineMethod(*FnOwner, FnName) || !CompilesMethod(*FnOwner, FnName)))
+                { *Err = Where + ": UE_BIND's " + FnOwner->CppName + "::" + FnName + " is no function the class has (an inline "
+                         "one is expanded where it is called; one only declared is none)"; return false; }
+                const FRecord* PropOwner = Find(OwnerOf(*PropE));
+                BP.AddPropertyBinding({ W, PropOwner ? UeNameOf(PropOwner, Name(*PropE)) : Name(*PropE), UeNameOf(FnOwner, FnName) });
+                return true;
+            }
+            /* `Play->OnClicked.Add(this, &UMyCard::OnPlay)`: an entry of the class's ComponentDelegateBinding, which
+               BindDynamicDelegates adds to the widget's dispatcher as each widget is made, the designer's "On Clicked"
+               node. LowerDelegateValue holds the function to what the editor binds. */
+            if (const Json* Callee = Strip(First(*N)); Callee && Kind(*Callee) == "MemberExpr" && Name(*Callee) == "Add")
+            {
+                const Json* Disp = Strip(First(*Callee));
+                if (const std::string W = WidgetOfMember(Disp); !W.empty())
+                {
+                    const Json* Self = Strip(Nth(*N, 1));
+                    if (!Self || Kind(*Self) != "CXXThisExpr" || !Nth(*N, 2))
+                    { *Err = Where + ": a layout binds " + W + "'s " + Name(*Disp) + " to a function of this widget: `" + W + "->"
+                             + Name(*Disp) + ".Add(this, &" + R.CppName + "::OnPlay)`"; return false; }
+                    const FRecord* DOwner = DispatcherOwner(*Disp);
+                    const bool bNative = DOwner && DOwner->IsNative() && DOwner->UePackage.compare(0, 6, "/Game/") != 0;
+                    if (const auto Marked = bNative ? DOwner->Dispatchers.find(Name(*Disp)) : std::map<std::string, std::string>::const_iterator();
+                        bNative && Marked != DOwner->Dispatchers.end() && (" " + Marked->second + " ").find(" Assignable ") == std::string::npos)
+                    { *Err = Where + ": " + W + "->" + Name(*Disp) + " is a native dispatcher that is not BlueprintAssignable, and the "
+                             "editor binds none such"; return false; }
+                    FArgIR Bound;
+                    if (!LowerDelegateValue(*Self, *Nth(*N, 2), std::string(), Null(), Name(*Disp), BP, Bound, Err))
+                    { *Err = Where + ": " + *Err; return false; }
+                    BP.AddComponentBinding({ W, DOwner ? UeNameOf(DOwner, Name(*Disp)) : Name(*Disp), Bound.S });
+                    return true;
+                }
+            }
+            const int32 Added = AddCall(N);
+            if (Added != -2) return Added >= 0;
+            const Json* Obj = Strip(First(*Strip(First(*N))));
+            if (Obj && (Kind(*Obj) == "CXXMemberCallExpr" || Kind(*Obj) == "CallExpr"))
+            {
+                const int32 At = AddCall(Obj);
+                if (At == -2) *Err = Where + ": a setter in a widget's layout is called on a UE_WIDGET or on the slot an "
+                                     "AddChild call returns";
+                return At >= 0 && Setter(LayoutSlots[At].Class, LayoutSlots[At].Child + "'s slot", *N,
+                                         LayoutSlots[At].Defaults, &LayoutSlots[At].Layout);
+            }
+            if (Obj && Kind(*Obj) == "DeclRefExpr")
+                if (const auto L = SlotLocals.find(Obj->value("referencedDecl", Json::object()).value("id", std::string()));
+                    L != SlotLocals.end())
+                {
+                    FLayoutSlot& At = LayoutSlots[L->second];
+                    return Setter(At.Class, At.Child + "'s slot", *N, At.Defaults, &At.Layout);
+                }
+            if (const std::string W = WidgetNamed(Obj); !W.empty())
+                return Setter(WidgetClassOf(W), W, *N, WidgetDefaults[W], nullptr);
+            *Err = Where + ": a widget class's layout adds UE_WIDGETs to panels and calls setters on them and on their "
+                   "slots; this call is neither";
+            return false;
+        };
         const Json* Body = nullptr;
         ForEach(*R.Defaults, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Body = &C; });
         bool bOk = true;
         if (Body)
             ForEach(*Body, [&](const Json& S) {
                 if (!bOk) return;
+                Where = S.value("ueWhere", Block);
+                if (!R.Widgets.empty() && WidgetLayoutStatement(S))
+                {
+                    bOk = Layout(S);
+                    return;
+                }
                 const Json *Callee = nullptr, *Child = nullptr, *Parent = nullptr, *Socket = nullptr;
                 if (AttachmentCall(S, Callee, Child, Parent, Socket))
                 {
@@ -15183,7 +16641,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 const Json *Lhs = nullptr, *Rhs = nullptr, *Owner = nullptr;
                 if (!DefaultAssignment(S, Lhs, Rhs, Owner))
                 { *Err = Where + ": every statement is `Field = value;`, `Component->Field = value;` or "
-                         "`Component->SetupAttachment(Parent);`"; bOk = false; return; }
+                         "`Component->SetupAttachment(Parent);`, on this object's members, each set whole (not "
+                         "`Field.X = value;`)"; bOk = false; return; }
 
                 /* `Comp->Field` reaches through a component; a bare `Field` targets this class's
                    own CDO. Which of the three destinations a statement means is decided by who
@@ -15194,7 +16653,11 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 const FRecord* DR = Declarer.empty() ? nullptr : Find(Declarer);
                 if (!DR)
                 { *Err = Where + ": cannot tell which class declares " + Name(*Lhs); bOk = false; return; }
-                if (bThroughComponent && !DR->Components.count(CompName) && !DR->IsNative())
+                /* A UE_WIDGET's member: a tag of its export in the tree. One of a tree above is that class's. */
+                const bool bWidget = bThroughComponent && !DR->IsNative() && IsWidgetOf(*DR, CompName);
+                if (bWidget && DR != &R)
+                { *Err = Where + ": " + CompName + " is a widget of " + DR->CppName + "'s tree; set it there"; bOk = false; return; }
+                if (bThroughComponent && !DR->Components.count(CompName) && !DR->IsNative() && !bWidget)
                 { *Err = Where + ": " + CompName + " is not a UE_COMPONENT"; bOk = false; return; }
                 if (!bThroughComponent && DR == &R)
                 { *Err = Where + ": " + Name(*Lhs) + " is declared here - give it an initializer instead"; bOk = false; return; }
@@ -15222,6 +16685,25 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 if (!LowerDefault(*Lhs, PD, BP, Err, Rhs, /*bKeepZero=*/true)) { bOk = false; return; }
                 if (PD.Default.K == FDefaultValue::None)
                 { *Err = Where + ": " + Name(*Lhs) + " needs a literal value"; bOk = false; return; }
+                /* A widget's event flags are the compiler's, set below from the class's own events (kWidgetEvents). A line
+                   that says the same changes nothing, and this reference long asked for one beside a Tick override, so it
+                   warns; one that says otherwise would be undone, as the editor's compile undoes it, so it is refused. */
+                for (const auto& [Event, Flag] : kWidgetEvents)
+                    if (!bThroughComponent && DR->UeName == "UserWidget" && Name(*Lhs) == Flag)
+                    {
+                        const bool bOwn = OwnEvent(R, Event);
+                        const std::string Why = std::string(Flag) + " follows whether the class overrides " + Event + " itself, "
+                                                "as the editor's widget compiler sets it on every compile";
+                        if ((PD.Default.I != 0) == bOwn)
+                        {
+                            printf("  warning: %s: %s, so this line changes nothing; drop it\n", Where.c_str(), Why.c_str());
+                            return;
+                        }
+                        *Err = Where + ": " + Why + "; " + (bOwn ? "drop the " + std::string(Event) + " override to turn it off"
+                                                                 : "override " + std::string(Event) + " for it to run");
+                        bOk = false;
+                        return;
+                    }
                 if (bInterfaceVar) { InterfaceVarDefaults[Name(*Lhs)] = PD; return; }
 
                 /* An inherited set or map loads over the parent CDO's value (PropertySet.cpp 285-358, PropertyMap.cpp
@@ -15242,7 +16724,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                     InheritedDefaults.push_back(PD);
                     return;
                 }
-                if (DR == &R) { ComponentDefaults[CompName].push_back(PD); return; }
+                if (DR == &R) { (bWidget ? WidgetDefaults : ComponentDefaults)[CompName].push_back(PD); return; }
                 /* A native parent's component is a default subobject, not an SCS node: it is
                    overridden by an export under this class's CDO, with no handler involved. */
                 /* A game Blueprint's component is an SCS node too, and overriding it takes the node's guid, which only
@@ -15462,6 +16944,12 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
            looks at it (KismetCompiler.cpp 2521-2529). */
         FlagInstancing(TypeOf(*F), PD);
         if (PD.PropertyFlags & (CPF_InstancedReference | CPF_ContainsInstancedReference)) BP.AddClassFlags(CLASS_HasInstancedReference);
+        /* A timeline's variable and its tracks' have the editor's flags (KismetCompiler.cpp 818-870, measured on
+           BP_Refinery_LandingZone_C): the component's BlueprintVisible and instanced, a track's none. */
+        if (&Decl == &R && R.Timelines.count(FieldName))
+            PD.PropertyFlags = CPF_BlueprintVisible | (PD.PropertyFlags & CPF_InstancedReference);
+        else if (&Decl == &R && std::any_of(R.Tracks.begin(), R.Tracks.end(), [&](const auto& T) { return T.first == FieldName; }))
+            PD.PropertyFlags = 0;
         PD.bApiHidden = Decl.PrivateFields.count(Name(*F)) != 0;
         if (auto Cat = Decl.Categories.find(Name(*F)); Cat != Decl.Categories.end()) BP.ApiCategory[PD.Name] = Cat->second;
         if (&Decl == &R && R.Components.count(FieldName))
@@ -15499,6 +16987,23 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             BP.AddComponent(FieldName, CompClass, CompCdo, bIsScene, ComponentDefaults[FieldName], NativeTail(CR));
             if (auto At = Attachments.find(FieldName); At != Attachments.end()) BP.AttachComponent(FieldName, At->second);
             ComponentDefaults.erase(FieldName);
+        }
+        /* A UE_WIDGET: an export of the tree, archetyped on its class's default object like the cook's. The variable stays
+           an ordinary ObjectProperty, which InitializeWidgetStatic sets by name to the widget it instanced. */
+        if (&Decl == &R && IsWidgetOf(R, FieldName))
+        {
+            const FRecord* CR = WidgetClassOf(FieldName);
+            if (!Derives(CR, "Widget"))
+            { *Err = R.CppName + "::" + FieldName + ": a UE_WIDGET names a UWidget class"; return false; }
+            std::set<std::string> NearestOfWidget;
+            for (const FRecord* A = CR; A && !A->IsNative(); A = A->Base.empty() ? nullptr : Find(A->Base))
+                for (const auto& [Method, MDecl] : A->Methods)
+                    if (NearestOfWidget.insert(Method).second && MDecl->value("pure", false))
+                    { *Err = R.CppName + "::" + FieldName + ": " + CR->CppName + " is abstract (" + A->CppName + "::" + Method
+                             + " is = 0), and an abstract class is never instanced"; return false; }
+            const FIndex WClass = BP.EngineClass(PackageOf(*CR), ClassOf(*CR));
+            const FIndex WCdo = BP.ClassDefaultObject(PackageOf(*CR), ClassOf(*CR));
+            BP.AddWidget(FieldName, WClass, WCdo, WidgetDefaults[FieldName]);
         }
         if (auto Rep = Decl.Replicated.find(FieldName); Rep != Decl.Replicated.end())
         {
@@ -15539,6 +17044,18 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         }
         AddVariable(TypeOf(*F), PD);
     }
+    /* Each timeline's direction variable, which the engine sets as it plays (FTimeline::SetPlaybackPosition), and
+       without which it logs that it found none on every frame: the editor's ByteProperty over ETimelineDirection. */
+    for (const auto& Timeline : R.Timelines)
+    {
+        uint32 Guid[4];
+        FPropertyDef PD = ByteParam(Timeline.first + "__Direction_" + TimelineGuid(ClassOf(R), Timeline.first, Guid));
+        PD.PropertyFlags = 0;
+        PD.Extra = BP.Enum("/Script/Engine", "ETimelineDirection");
+        PD.StructName = "ETimelineDirection";
+        PD.bApiHidden = true;
+        AddVariable("uint8", PD);
+    }
     /* Where the SCS lists its DefaultSceneRoot node, the class has a variable of that name, as the editor gives every node
        it lists one (KismetCompiler.cpp 884-898; ENE_EnemySpawner's DefaultSceneRoot, BlueprintVisible | NonTransactional
        | InstancedReference): ExecuteNodeOnActor stores the component there, and with none logs on every spawn that it
@@ -15573,9 +17090,111 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     std::stable_sort(ClassVars.begin(), ClassVars.end(), [](const auto& A, const auto& B) { return A.first > B.first; });
     for (const auto& V : ClassVars) BP.AddVariable(V.second);
 
+    /* S39: each widget but the root sits in a panel or fills a nested widget's named slot, and that one in the tree. One
+       nothing holds, or a ring of them holding one another, is out of the tree the engine walks from its root
+       (UWidgetTree::ForEachWidget, which goes into a named slot's content through GetContentForSlot). */
+    for (const std::string& W : R.Widgets)
+    {
+        std::string At = W;
+        for (size_t Steps = 0; At != R.Widgets.front(); ++Steps)
+        {
+            const auto S = std::find_if(LayoutSlots.begin(), LayoutSlots.end(), [&](const FLayoutSlot& L) { return L.Child == At; });
+            const auto F = std::find_if(SlotFills.begin(), SlotFills.end(), [&](const FSlotFill& L) { return L.Content == At; });
+            if (S == LayoutSlots.end() && F == SlotFills.end())
+            { *Err = R.CppName + "::" + W + ": " + (At == W ? std::string("no panel holds it") : "it sits in " + At + ", which no panel holds")
+                     + ", so it is out of the tree, whose root is " + R.Widgets.front() + "; add it to a panel in the constructor, "
+                     "`Root->AddChildToCanvas(" + At + ")`"; return false; }
+            if (Steps == R.Widgets.size())
+            { *Err = R.CppName + "::" + W + ": its panels hold one another in a ring, which the tree's root never reaches"; return false; }
+            At = S != LayoutSlots.end() ? S->Panel : F->Host;
+        }
+    }
+    /* The class's NamedSlots: its UNamedSlot widgets in the order ForEachWidget meets them, as the editor's compile lists
+       them (a widget, then the contents of its named slots, then its panel's children). */
+    if (!R.Widgets.empty())
+    {
+        std::vector<std::string> Slots;
+        std::function<void(const std::string&)> Walk = [&](const std::string& W) {
+            if (Derives(WidgetClassOf(W), "NamedSlot")) Slots.push_back(W);
+            for (const FSlotFill& F : SlotFills) if (F.Host == W) Walk(F.Content);
+            for (const FLayoutSlot& S : LayoutSlots) if (S.Panel == W) Walk(S.Child);
+        };
+        Walk(R.Widgets.front());
+        BP.SetNamedSlots(Slots);
+    }
+    for (const FSlotFill& F : SlotFills) BP.AddWidgetSlotFill(F.Host, F.Slot, F.Content);
+    /* A canvas slot's LayoutData, of the parts its setters set: tags of an FAnchorData (Offsets, Anchors and Alignment,
+       the first two tagged structs and the last a raw Vector2D), a part left unset keeping the slot's default value. */
+    for (FLayoutSlot& S : LayoutSlots)
+    {
+        if (!S.Layout.empty())
+        {
+            auto Float = [](const std::string& N, double V) {
+                FPropertyDef P;
+                P.Type = "FloatProperty";
+                P.Name = N;
+                P.Default.K = FDefaultValue::Float;
+                P.Default.F = V;
+                return P;
+            };
+            auto Struct = [](const std::string& N, const std::string& Of, std::vector<FPropertyDef> Members) {
+                FPropertyDef P;
+                P.Type = "StructProperty";
+                P.Name = N;
+                P.StructName = Of;
+                P.Default.K = FDefaultValue::Struct;
+                P.Members = std::make_shared<std::vector<FPropertyDef>>(std::move(Members));
+                return P;
+            };
+            auto Pair = [&](const std::string& N, const std::string& Path) -> std::optional<FPropertyDef> {
+                const auto X = S.Layout.find(Path + ".X"), Y = S.Layout.find(Path + ".Y");
+                if (X == S.Layout.end() || Y == S.Layout.end()) return std::nullopt;     // the setters set both
+                return Struct(N, "Vector2D", { Float("X", X->second), Float("Y", Y->second) });
+            };
+            std::vector<FPropertyDef> Data, Offsets, Anchors;
+            for (const char* Side : { "Left", "Top", "Right", "Bottom" })
+                if (const auto V = S.Layout.find(std::string("Offsets.") + Side); V != S.Layout.end()) Offsets.push_back(Float(Side, V->second));
+            for (const char* End : { "Minimum", "Maximum" })
+                if (auto V = Pair(End, std::string("Anchors.") + End)) Anchors.push_back(*V);
+            if (!Offsets.empty()) Data.push_back(Struct("Offsets", "Margin", Offsets));
+            if (!Anchors.empty()) Data.push_back(Struct("Anchors", "Anchors", Anchors));
+            if (auto V = Pair("Alignment", "Alignment")) Data.push_back(*V);
+            S.Defaults.insert(S.Defaults.begin(), Struct("LayoutData", "AnchorData", Data));
+        }
+        const FIndex SClass = BP.EngineClass(PackageOf(*S.Class), ClassOf(*S.Class));
+        const FIndex SCdo = BP.ClassDefaultObject(PackageOf(*S.Class), ClassOf(*S.Class));
+        BP.AddWidgetSlot(S.Panel, S.Child, SClass, SCdo, S.Defaults);
+    }
+
     if (!ComponentDefaults.empty())
     { *Err = R.CppName + "::UE_DEFAULTS: " + ComponentDefaults.begin()->first + " is not declared with UE_COMPONENT"; return false; }
     for (const FPropertyDef& V : InheritedDefaults) BP.AddCdoDefault(V);
+    /* A widget's event flags, as the editor's widget compiler sets them (kWidgetEvents). Each is a tag where it differs
+       from the parent default object's: true below an engine class, as UUserWidget's constructor leaves it, and below a
+       Blueprint that Blueprint's own event, its compile having set the flag the same way. An event a Blueprint above has
+       of its own then runs on that class's objects and never on this one's, as in the editor, so that is warned. */
+    auto IsEngine = [&](const FRecord& A) { return PackageOf(A).compare(0, 8, "/Script/") == 0; };
+    for (const auto& [Event, Flag] : kWidgetEvents)
+    {
+        if (!bIsWidget) continue;
+        const bool bOwn = OwnEvent(R, Event);
+        if (bOwn != (IsEngine(*B) || OwnEvent(*B, Event)))
+        {
+            FPropertyDef Set = BoolParam(Flag);
+            Set.Default.K = FDefaultValue::Bool;
+            Set.Default.I = bOwn;
+            BP.AddCdoDefault(Set);
+        }
+        const FRecord* Above = B;
+        while (Above && !IsEngine(*Above) && !OwnEvent(*Above, Event)) Above = Above->Base.empty() ? nullptr : Find(Above->Base);
+        if (!bOwn && !bAbstract && Above && !IsEngine(*Above))
+        {
+            const std::string Of = LeafOf(Above->CppName);
+            printf("  warning: %s: the %s it inherits from %s never runs, since a widget calls %s only for a class that "
+                   "overrides it itself, as the editor's widget compiler decides; override %s, calling %s::%s\n",
+                   R.CppName.c_str(), Event, Of.c_str(), Event, Event, Of.c_str(), Event);
+        }
+    }
     /* Resolving the component class from the declaring record's own field, the same walk the
        UE_COMPONENT registration does - a native subobject has no marker to read it off. */
     auto ComponentClassOf = [&](const FRecord& Owner, const std::string& Field) -> const FRecord* {
@@ -15881,11 +17500,17 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         { *Err = R.CppName + ": " + What + " does nothing, since only an actor or an actor component replicates"; return false; }
     }
     /* The engine routes a call by the called UFunction's flags (CallFunction, GetFunctionCallspace); an inline method is
-       none, its body copied into each caller, so its marker would go nowhere. */
+       none, its body copied into each caller, so its marker would go nowhere, written on its declaration or on its
+       definition out of the class. */
     for (const Json* M : R.AllMethods)
-        if ((M->value("inline", false) || IsInlineMethod(R, Name(*M))) && (NetFlagsOf(*M) | AccessFlagsOf(*M)))
+    {
+        const auto D = R.MethodDefs.find(Name(*M));
+        const uint32 Marks = NetFlagsOf(*M) | AccessFlagsOf(*M)
+                           | (D != R.MethodDefs.end() ? NetFlagsOf(*D->second) | AccessFlagsOf(*D->second) : 0);
+        if ((M->value("inline", false) || IsInlineMethod(R, Name(*M))) && Marks)
         { *Err = R.CppName + "::" + Name(*M) + ": an RPC, authority-only or cosmetic marker on an inline method does nothing, "
                  "since no call to it is routed; drop inline"; return false; }
+    }
     struct FSegment
     {
         std::string Name;
@@ -16347,12 +17972,13 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         for (const FSegment& Seg : Segments)
             for (const FCompletion& C : Seg.Completions)
             {
-                const std::string To = C.Local.empty() ? std::string() : Seg.Rename.at(C.Local);
-                const std::string From = C.Parms.empty() ? std::string() : C.Parms[0].Name;
+                std::vector<std::pair<std::string, std::string>> Stores;    // (frame local, the parameter it keeps)
+                for (size_t I = 0; I < C.Locals.size() && I < C.Parms.size(); ++I)
+                    if (!C.Locals[I].empty()) Stores.emplace_back(Seg.Rename.at(C.Locals[I]), C.Parms[I].Name);
                 const std::shared_ptr<int32> Resume = C.Resume;
-                BP.AddFunction(C.Event, Null(), C.Parms, [To, From, Resume, Uber](FScript& S, FIndex SelfExp) {
-                    if (!To.empty())
-                        S.LetValueOnPersistentFrame(To, Uber, [&](FScript& V) { V.LocalVariable(From, SelfExp); });
+                BP.AddFunction(C.Event, Null(), C.Parms, [Stores, Resume, Uber](FScript& S, FIndex SelfExp) {
+                    for (const auto& Store : Stores)
+                        S.LetValueOnPersistentFrame(Store.first, Uber, [&](FScript& V) { V.LocalVariable(Store.second, SelfExp); });
                     if (Resume)
                     {
                         S.LocalFinalFunction(Uber);
@@ -16386,7 +18012,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         printf("  %-14s -> no API asset: %s\n", R.CppName.c_str(), Err->c_str());
         Err->clear();
     }
-    RegistryRows.push_back({ PackageName, ClassOf(R), "BlueprintGeneratedClass" });
+    RegistryRows.push_back({ PackageName, ClassOf(R), HasWidgetTree(R) ? "WidgetBlueprintGeneratedClass" : "BlueprintGeneratedClass" });
     printf("  %-14s -> %s.uasset  (%s %s)\n", R.CppName.c_str(), Shown(PackageName).c_str(),
            B->IsNative() ? "extends" : "extends BP", R.Base.c_str());
     return true;
@@ -16532,10 +18158,10 @@ private:
 };
 
 /* Builds the DOM of clang's AST dump as it streams in, without what nothing reads: source locations (all but a
-   DeclRefExpr's or MemberExpr's range begin offset and token length, and its end's in a macro, see NamedQualifier and
-   MemberQualifier, and a braced value's whole range, see IsUnsetInit), mangled names, a record's definitionData and
-   a few flags are most of the dump, and building them was most of a compile. A key read later must be in neither
-   DroppedAstKey nor key()'s own rules. */
+   DeclRefExpr's range begin offset and token length, and its end's in a macro, see NamedQualifier, a MemberExpr's
+   whole range, see MemberQualifier and WrittenQualifier, and a braced value's, see IsUnsetInit), mangled names, a
+   record's definitionData and a few flags are most of the dump, and building them was most of a compile. A key read
+   later must be in neither DroppedAstKey nor key()'s own rules. */
 class FAstSax : public nlohmann::json_sax<Json>
 {
 public:
@@ -16548,9 +18174,9 @@ public:
     bool number_float(number_float_t V, const string_t&) override { return Value(V); }
     bool string(string_t& V) override
     {
-        if (bKindNext && !Skipped)          // "kind" comes before "range"
-            Ranged.back() = V == "DeclRefExpr" || V == "MemberExpr" ? ERange::Begin
-                          : V == "InitListExpr" || V == "CXXConstructExpr" ? ERange::Whole : ERange::None;
+        if (bKindNext && !Skipped)          // "kind" comes before "range"; a TypeTraitExpr's begin is its trait (FoldConst)
+            Ranged.back() = V == "DeclRefExpr" || V == "TypeTraitExpr" ? ERange::Begin
+                          : V == "MemberExpr" || V == "InitListExpr" || V == "CXXConstructExpr" ? ERange::Whole : ERange::None;
         return Value(std::move(V));
     }
     bool binary(binary_t& V) override { return Value(std::move(V)); }
@@ -16562,8 +18188,9 @@ public:
     {
         if (Skipped) return true;
         /* A spellingLoc only gets here inside a range kept (every other loc and range is skipped whole). A DeclRefExpr's
-           or MemberExpr's end is kept only for a qualifier written in a macro (NamedQualifier); a braced value's, always:
-           IsUnsetInit tells a `{}` written from a member the braces leave out by it. */
+           end is kept only for a qualifier written in a macro (NamedQualifier); a MemberExpr's, which is its member's
+           name, always: WrittenQualifier reads the qualifier back from there. A braced value's, always too: IsUnsetInit
+           tells a `{}` written from a member the braces leave out by it. */
         const bool bMacroEnd = K == "end" && Stack.back()->is_object() && Stack.back()->contains("begin")
                             && (*Stack.back())["begin"].contains("spellingLoc");
         const bool bWholeEnd = K == "end" && Ranged.size() >= 2 && Ranged[Ranged.size() - 2] == ERange::Whole;
@@ -16583,8 +18210,8 @@ public:
     bool parse_error(size_t, const std::string&, const nlohmann::detail::exception&) override { return false; }
 
 private:
-    /* What of an open node's range is kept: none, its begin (a DeclRefExpr or MemberExpr), or the whole range (a braced
-       value: an InitListExpr or CXXConstructExpr). */
+    /* What of an open node's range is kept: none, its begin (a DeclRefExpr, a TypeTraitExpr), or the whole range (a
+       MemberExpr, or a braced value: an InitListExpr or CXXConstructExpr). */
     enum class ERange : uint8 { None, Begin, Whole };
     Json& Root;
     const bool bFrozenKeys;         // astcheck's reference parse
@@ -17180,9 +18807,14 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
             ForEach(N, [&](const Json& C) { IndexConsts(C, K == "CXXRecordDecl"); });
     };
     IndexConsts(Doc, false);
+    /* `sizeof...` reads a pack's template parameter off its template (FoldConst). */
+    auto IndexTemplate = [&](const Json& T) {
+        ForEach(T, [&](const Json& M) { TemplateOf[M.value("id", std::string())] = &T; });
+    };
     std::function<void(Json&)> IndexInlines = [&](Json& N) {
         if (!N.is_object()) return;
         const std::string K = Kind(N);
+        if (K == "FunctionTemplateDecl") IndexTemplate(N);
         if (K == "CXXRecordDecl")
         {
             /* Class bodies are the records', except member templates: no UFunction per instantiation, so each
@@ -17190,6 +18822,7 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
             ForEach(N, [&](const Json& C) {
                 if (Kind(C) == "CXXRecordDecl") IndexInlines(const_cast<Json&>(C));
                 if (Kind(C) != "FunctionTemplateDecl") return;
+                IndexTemplate(C);
                 for (Json& M : const_cast<Json&>(C)["inner"])
                 {
                     bool bBody = false;
@@ -17219,6 +18852,42 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         if (It != N.end()) for (Json& C : *It) IndexInlines(C);
     };
     IndexInlines(Doc);
+    /* Each body that is compiled gets its own aliases written out before anything reads a local's type. */
+    for (auto& [Cpp, R] : Records)
+    {
+        for (const Json* M : R.AllMethods) ExpandLocalAliases(const_cast<Json&>(*M), {});
+        for (const auto& [Method, Def] : R.MethodDefs) ExpandLocalAliases(const_cast<Json&>(*Def), {});
+    }
+    for (const Json* F : FreeInlineOrder) ExpandLocalAliases(const_cast<Json&>(*F), {});
+    for (const auto& [Id, M] : MemberTemplates) ExpandLocalAliases(const_cast<Json&>(*M), {});
+    /* `FKey{"Space"}` names no key, so no input ever matches it. A warning, not a refusal: code may compare it with a
+       key the engine makes up as it runs (FInputKeyManager::GetKeyFromCodes) or another module adds, and FKey{""} is
+       the engine's own "no key". Each literal once, where the source writes it: the classes' methods, members and
+       UE_DEFAULTS, the constants, the inline functions. */
+    std::set<const Json*> KeyLiterals;
+    std::function<void(const Json&, const std::string&)> WarnKeyLiterals = [&](const Json& N, const std::string& Where) {
+        const std::string K = Kind(N);
+        const Json* L = (K == "CXXTemporaryObjectExpr" || K == "CXXConstructExpr" || K == "InitListExpr")
+                            && StripTypeKeywords(TypeOf(N)) == "FKey" ? Strip(First(N)) : nullptr;
+        if (L && Kind(*L) == "StringLiteral" && KeyLiterals.insert(L).second)
+        {
+            const std::string Key = Unquote(L->value("value", std::string())), Meant = MisnamedKey(Key);
+            if (!Meant.empty() && !Key.empty() && Lower(Key) != "none")
+                printf("  warning: %s: FKey{\"%s\"} names no key the engine has, so no input matches it: the closest is "
+                       "%s\n", Where.c_str(), Key.c_str(), Meant.c_str());
+        }
+        ForEach(N, [&](const Json& C) { WarnKeyLiterals(C, Where); });
+    };
+    for (const auto& [Cpp, R] : Records)
+        if (R.IsGenerated() || R.bIsPatch)
+        {
+            for (const Json* M : R.AllMethods) WarnKeyLiterals(*M, Cpp + "::" + Name(*M));
+            for (const auto& [Method, Def] : R.MethodDefs) WarnKeyLiterals(*Def, Cpp + "::" + Method);
+            for (const Json* F : R.Fields) WarnKeyLiterals(*F, Cpp + "::" + Name(*F));
+            if (R.Defaults) WarnKeyLiterals(*R.Defaults, Cpp + "::UE_DEFAULTS");
+        }
+    for (const auto& [Id, Var] : ConstVars) WarnKeyLiterals(*Var, Name(*Var));
+    for (const Json* F : FreeInlineOrder) WarnKeyLiterals(*F, Name(*F));
     /* Before anything reads a type: a raw pointer is an int64 from here on (see IsRawPointer). */
     for (const auto& Entry : Records)
     {
@@ -17256,6 +18925,35 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
              + "\", \"" + Leaf + "_C\")";
         return false;
     }
+
+    /* The class each game Blueprint's package exports it as, where that is not a BlueprintGeneratedClass: a widget
+       Blueprint's WidgetBlueprintGeneratedClass, an anim Blueprint's AnimBlueprintGeneratedClass. An import of one names
+       that as its row's class, as the cook writes it (`[V]` the game's 137 widget Blueprints below another and 20 anim
+       Blueprints below another). The cooked loader compares the two names where the package is loaded already, and a
+       mismatch is an Error, the object kept (FAsyncPackage::FindExistingImport, AsyncLoading.cpp 1625-1677). `[V]` Against
+       the dump, 2,110 of the 2,114 header classes below UUserWidget are WidgetBlueprintGeneratedClasses and all 320 below
+       UAnimInstance AnimBlueprintGeneratedClasses.
+       ponytail: decided by ancestry. The other four below UUserWidget are macro libraries, plain BlueprintGeneratedClasses,
+       and so would be a class AssetGen cooked, should a dump hold one: naming one a widget class fails its import, since
+       FindImportFast looks for an object of the row's class (BlueprintSupport.cpp 2321-2332). The dump names every class's
+       own class (GObjects-Dump.txt), for genueapi to carry into the header if such a class is ever referenced. */
+    for (const auto& Entry : Records)
+    {
+        const FRecord& A = Entry.second;
+        if (!A.IsNative() || A.CppName.compare(0, 6, "Game::") != 0 || PackageOf(A).compare(0, 6, "/Game/") != 0) continue;
+        for (const FRecord* Up = &A; Up; Up = Up->Base.empty() ? nullptr : Find(Up->Base))
+            if (Up->UeName == "UserWidget" || Up->UeName == "AnimInstance")
+            {
+                GameClassKinds[PackageOf(A) + "." + ClassOf(A)] =
+                    Up->UeName == "UserWidget" ? std::make_pair(std::string("/Script/UMG"), std::string("WidgetBlueprintGeneratedClass"))
+                                               : std::make_pair(std::string("/Script/Engine"), std::string("AnimBlueprintGeneratedClass"));
+                break;
+            }
+    }
+    /* A mod's widget class with a tree is one too (S39), and so is every class below it. */
+    for (const auto& Entry : Records)
+        if (!Entry.second.IsNative() && !Entry.second.bIsStruct && HasWidgetTree(Entry.second))
+            GameClassKinds[PackageOf(Entry.second) + "." + ClassOf(Entry.second)] = { "/Script/UMG", "WidgetBlueprintGeneratedClass" };
 
     int32 Generated = 0;
     /* Remove every generated asset. */

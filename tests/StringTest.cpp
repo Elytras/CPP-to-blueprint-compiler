@@ -48,4 +48,11 @@ public:
     FName Literal = "Größe";
     return FromString == Literal;
   }
+
+  /* A non-ASCII FText literal in code is EX_TextConst's UTF-16 string: the ANSI form would read each UTF-8 byte as a
+     character. */
+  FString UmlautText() {
+    FText Literal = "Größe";
+    return UKismetTextLibrary::Conv_TextToString(Literal);
+  }
 };

@@ -23,6 +23,87 @@ void ScsNodeGuid(const std::string& ClassName, const std::string& ComponentName,
     Out[3] = Strihash(Seed + "\x02") | 1u;
 }
 
+std::string TimelineGuid(const std::string& ClassName, const std::string& Timeline, uint32 (&Out)[4])
+{
+    ScsNodeGuid(ClassName, "timeline." + Timeline, Out);
+    char Hex[33];
+    snprintf(Hex, sizeof(Hex), "%08X%08X%08X%08X", Out[0], Out[1], Out[2], Out[3]);   // FGuid::ToString, EGuidFormats::Digits
+    return Hex;
+}
+
+/* An array of structs as the cook writes one: the count, one inner FPropertyTag whose Size is all the elements' bytes,
+   then the elements, each written whole (no defaults to leave a field out against). */
+static void StructArray(FArc& V, const std::string& Name, const std::string& StructName, int32 Count, const FArc& Elements)
+{
+    V.I32(Count);
+    V.Name(Name);
+    V.Name("StructProperty");
+    V.I32(int32(Elements.B.size()));
+    V.I32(0);                       // ArrayIndex
+    V.Name(StructName);
+    for (int32 I = 0; I < 4; ++I) V.U32(0);      // StructGuid
+    V.U8(0);                        // HasPropertyGuid
+    V.Append(Elements);
+}
+
+/* FRichCurve::AutoSetTangents (RichCurve.cpp 623-711) at the editor's tension 0, over one channel of keys sorted by
+   time, which the curve editor runs after every edit: a cubic key's Auto tangents. Engine evaluation reads the stored
+   tangents, so they are what the curve plays. Out holds each key's arrive and leave tangent. */
+static void AutoTangents(const std::vector<FBlueprintClass::FTimelineKey>& Keys, int32 Channel,
+                         std::vector<std::pair<float, float>>& Out)
+{
+    const int32 N = int32(Keys.size());
+    Out.assign(size_t(N), { 0.0f, 0.0f });
+    auto V = [&](int32 K) { return Keys[size_t(K)].Values[Channel]; };
+    for (int32 K = 0; K < N; ++K)
+    {
+        const uint8 Interp = Keys[size_t(K)].Interp;
+        float Arrive = 0.0f, Leave = 0.0f;
+        int32 Prev = K, Cur = K, Next = K;
+        bool bCompute = false;
+        if (K == 0)
+        {
+            if (N > 1 && Interp == 2) { Next = 1; Cur = 1; bCompute = true; }
+        }
+        else if (K < N - 1)
+        {
+            Prev = K - 1;
+            if (Interp == 2) { Next = K + 1; bCompute = true; }
+            /* Linear and constant keys keep the zero tangents a new key starts with. */
+        }
+        else if (Interp == 2) { Prev = K - 1; bCompute = true; }
+        if (bCompute)
+        {
+            /* ComputeCurveTangent: (1 - Tension) * ((P - PrevP) + (NextP - P)) / max(KINDA_SMALL_NUMBER, NextT - PrevT). */
+            const float Tangent = 1.0f * ((V(Cur) - V(Prev)) + (V(Next) - V(Cur)));
+            Arrive = Tangent / std::max(1.e-4f, Keys[size_t(Next)].Time - Keys[size_t(Prev)].Time);
+            Leave = Arrive;
+        }
+        Out[size_t(K)] = { Arrive, Leave };
+    }
+}
+
+/* One channel as an FRichCurve value: its Keys, each FRichCurveKey in its native 27 bytes (RichCurve.cpp 160-180), and
+   nothing else, as the cook leaves DefaultValue and the extrapolations at their defaults. */
+static void RichCurve(FArc& Ar, const std::vector<FBlueprintClass::FTimelineKey>& Keys, int32 Channel)
+{
+    std::vector<std::pair<float, float>> Tangents;
+    AutoTangents(Keys, Channel, Tangents);
+    Tag(Ar, "Keys", "ArrayProperty", [&](FArc& V) {
+        FArc Elements(V.Owner());
+        for (size_t K = 0; K < Keys.size(); ++K)
+        {
+            const float Fields[6] = { Keys[K].Time, Keys[K].Values[Channel], Tangents[K].first, 0.0f, Tangents[K].second, 0.0f };
+            Elements.U8(Keys[K].Interp);
+            Elements.U8(0);                 // TangentMode RCTM_Auto
+            Elements.U8(0);                 // TangentWeightMode RCTWM_WeightedNone
+            Elements.Raw(Fields, sizeof(Fields));     // Time, Value, ArriveTangent, ArriveTangentWeight, LeaveTangent, LeaveTangentWeight
+        }
+        StructArray(V, "Keys", "RichCurveKey", int32(Keys.size()), Elements);
+    }, "StructProperty");
+    TagEnd(Ar);
+}
+
 FIndex FBlueprintClass::Subobject(const std::string& ClassPackage, const std::string& ClassName_,
                                   FIndex Outer, const std::string& ObjectName)
 {
@@ -56,12 +137,15 @@ FIndex FBlueprintClass::EngineClass(const std::string& PackageName, const std::s
     auto It = ImportCache.find(Key);
     if (It != ImportCache.end()) return Imp(It->second);
 
-    // A /Game class is a BlueprintGeneratedClass, not a Class; the wrong row fails at load, not write.
+    // A /Game class is a BlueprintGeneratedClass or the kind GameClassKinds gives, not a Class; the wrong row fails at
+    // load, not write.
     const bool bBlueprint = PackageName.compare(0, 6, "/Game/") == 0;
+    std::pair<std::string, std::string> Kind = bBlueprint ? std::make_pair(std::string("/Script/Engine"), std::string("BlueprintGeneratedClass"))
+                                                          : std::make_pair(std::string("/Script/CoreUObject"), std::string("Class"));
+    if (bBlueprint && GameClassKinds)
+        if (auto K = GameClassKinds->find(PackageName + "." + ClassName_); K != GameClassKinds->end()) Kind = K->second;
     const FIndex Outer = PackageImport(PackageName);
-    const int32 Row = P.AddImport({ bBlueprint ? "/Script/Engine" : "/Script/CoreUObject",
-                                    bBlueprint ? "BlueprintGeneratedClass" : "Class",
-                                    Outer, ClassName_ });
+    const int32 Row = P.AddImport({ Kind.first, Kind.second, Outer, ClassName_ });
     ImportCache.emplace(Key, Row);
     return Imp(Row);
 }
@@ -225,18 +309,40 @@ void FBlueprintClass::AddComponentOverride(const std::string& Name, FIndex Compo
     ComponentOverrides.push_back(std::move(O));
 }
 
+void FBlueprintClass::AddWidget(const std::string& Name, FIndex Class, FIndex Cdo, const std::vector<FPropertyDef>& Defaults)
+{
+    Widgets.push_back(FWidget{ Name, Class, Cdo, Defaults });
+}
+
+void FBlueprintClass::AddWidgetSlot(const std::string& Panel, const std::string& Child, FIndex Class, FIndex Cdo,
+                                    const std::vector<FPropertyDef>& Defaults)
+{
+    WidgetSlots.push_back(FWidgetSlot{ Panel, Child, Class, Cdo, Defaults });
+}
+
+/* The objects a default's tags name, a lone struct's members included, which the export creates before it is
+   serialized (as ButtonText lists its font). */
+static void TagRefs(const FPropertyDef& P, std::vector<int32>& Out)
+{
+    DefaultRefs(P.Default, Out);
+    if (P.Members) for (const FPropertyDef& M : *P.Members) TagRefs(M, Out);
+}
+
 void FBlueprintClass::Finish()
 {
     const std::string CDOName = "Default__" + ClassName;
 
-    const FIndex BpgcClass = EngineClass("/Script/Engine", "BlueprintGeneratedClass");
+    const FIndex BpgcClass = bWidgetClass ? EngineClass("/Script/UMG", "WidgetBlueprintGeneratedClass")
+                                          : EngineClass("/Script/Engine", "BlueprintGeneratedClass");
     const bool bWithinObject = WithinPackage == "/Script/CoreUObject" && WithinClass == "Object";
     const FIndex ObjectClass = bWithinObject ? EngineClass("/Script/CoreUObject", "Object") : Null();
     const FIndex FunctionClass = EngineClass("/Script/CoreUObject", "Function");
     const FIndex EnginePkg = PackageImport("/Script/Engine");
     const FIndex CorePkg = PackageImport("/Script/CoreUObject");
-    const FIndex BpgcCdo = Imp(P.AddImport({ "/Script/Engine", "BlueprintGeneratedClass",
-                                             EnginePkg, "Default__BlueprintGeneratedClass" }));
+    const FIndex BpgcCdo = bWidgetClass ? Imp(P.AddImport({ "/Script/UMG", "WidgetBlueprintGeneratedClass", PackageImport("/Script/UMG"),
+                                                            "Default__WidgetBlueprintGeneratedClass" }))
+                                        : Imp(P.AddImport({ "/Script/Engine", "BlueprintGeneratedClass",
+                                                            EnginePkg, "Default__BlueprintGeneratedClass" }));
     const FIndex FunctionCdo = Imp(P.AddImport({ "/Script/CoreUObject", "Function",
                                                  CorePkg, "Default__Function" }));
 
@@ -264,7 +370,33 @@ void FBlueprintClass::Finish()
     /* A native parent's overridden subobjects sit right after the functions, before anything the
        actor shape adds, so a non-actor class reaches them too. */
     const int32 RowFirstSubobject = RowFirstFunction + int32(Functions.size());
-    const int32 RowRootTemplate = RowFirstSubobject + int32(SubobjectOverrides.size());
+    /* Then the input binding objects, an InputKeyDelegateBinding and an InputActionDelegateBinding, each when the class
+       has a binding of its kind. */
+    std::vector<std::vector<FInputBinding>> BindingKinds;
+    for (const bool bAction : { false, true })
+    {
+        std::vector<FInputBinding> Of;
+        for (const FInputBinding& B : InputBindings) if (B.bAction == bAction) Of.push_back(B);
+        if (!Of.empty()) BindingKinds.push_back(Of);
+    }
+    const int32 RowFirstBinding = RowFirstSubobject + int32(SubobjectOverrides.size());
+    /* Then a widget class's ComponentDelegateBinding, when its layout binds a widget's event (S39). */
+    const int32 RowComponentBinding = RowFirstBinding + int32(BindingKinds.size());
+    /* Then each timeline's template, followed by its tracks' curves. */
+    const int32 RowFirstTimeline = RowComponentBinding + (ComponentBindings.empty() ? 0 : 1);
+    std::vector<int32> TimelineRows;
+    int32 NumTimelineRows = 0;
+    for (const FTimeline& T : Timelines)
+    {
+        TimelineRows.push_back(RowFirstTimeline + NumTimelineRows);
+        NumTimelineRows += 1 + int32(T.Tracks.size());
+    }
+    /* Then a widget class's tree: the WidgetTree, its widgets in declaration order, their slots. */
+    const int32 RowTree = RowFirstTimeline + NumTimelineRows;
+    const int32 RowFirstWidget = RowTree + 1;
+    const int32 RowFirstWidgetSlot = RowFirstWidget + int32(Widgets.size());
+    const int32 NumTreeRows = Widgets.empty() ? 0 : 1 + int32(Widgets.size() + WidgetSlots.size());
+    const int32 RowRootTemplate = RowTree + NumTreeRows;
     const int32 RowScsNode = RowRootTemplate + 1;
     /* Each UE_COMPONENT takes two rows, archetype then node, so the SCS lands after them all. */
     const int32 RowFirstComponent = RowScsNode + 1;
@@ -321,6 +453,25 @@ void FBlueprintClass::Finish()
         if (const FIndex Sub = ParentSubobjectAt(S.Name); Sub.V != 0) Class.SerBeforeSer.push_back(Sub.V);
     Class.SerBeforeCreate = { BpgcClass.V, BpgcCdo.V };
     Class.CreateBeforeCreate = { ParentIdx.V };
+    std::vector<FIndex> Bindings;               // DynamicBindingObjects, listed first as BP_PlayerControllerBase_C lists them
+    for (size_t I = 0; I < BindingKinds.size(); ++I)
+    {
+        Bindings.push_back(Exp(RowFirstBinding + int32(I)));
+        Class.CreateBeforeSer.push_back(Bindings.back().V);
+    }
+    if (!ComponentBindings.empty())
+    {
+        Bindings.push_back(Exp(RowComponentBinding));
+        Class.CreateBeforeSer.push_back(Bindings.back().V);
+    }
+    const bool bHasTree = !Widgets.empty();
+    if (bHasTree) Class.CreateBeforeSer.push_back(Exp(RowTree).V);      // listed first, as Basic_FlatButton_C lists it
+    std::vector<FIndex> Templates;              // the Timelines list, after the bindings as BP_FragilePlatform_C lists them
+    for (const int32 Row : TimelineRows)
+    {
+        Templates.push_back(Exp(Row));
+        Class.CreateBeforeSer.push_back(Exp(Row).V);
+    }
     for (int32 I = 0; I < NumFunctions; ++I)
         Class.CreateBeforeSer.push_back(Exp(RowFirstFunction + I).V);
     for (const FPropertyDef& V : Vars)      // a dispatcher's Extra is a function listed above
@@ -341,9 +492,57 @@ void FBlueprintClass::Finish()
     const int32 NumOverrides = int32(ComponentOverrides.size());
     const int32 NumReplicated = int32(std::count_if(Vars.begin(), Vars.end(),
                                                     [](const FPropertyDef& V) { return (V.PropertyFlags & CPF_Net) != 0; }));
+    const std::vector<FPropertyBinding> WidgetBindings = PropertyBindings;
+    const std::vector<std::string> SlotNames = NamedSlots;
     Class.Serialize = [=](FArc& Ar) {
+        /* UWidgetBlueprintGeneratedClass's own properties, so before UBlueprintGeneratedClass's, as the cook orders them. */
+        if (bHasTree) Tag(Ar, "WidgetTree", "ObjectProperty", [=](FArc& V) { V.Idx(Exp(RowTree)); });
+        /* Measured on Basic_DropdownItem_C's: each FDelegateRuntimeBinding written whole, its SourcePath one segment
+           naming the function. InitializeBindingsStatic binds through that path when a native binder takes the property
+           (a text, a color, a brush), and to FunctionName by name otherwise. */
+        if (!WidgetBindings.empty())
+            Tag(Ar, "Bindings", "ArrayProperty", [=](FArc& V) {
+                FArc Elements(V.Owner());
+                for (const FPropertyBinding& B : WidgetBindings)
+                {
+                    Tag(Elements, "ObjectName", "StrProperty", [=](FArc& E) { E.Str(B.Widget); });    // a C++ name, so ASCII
+                    Tag(Elements, "PropertyName", "NameProperty", [=](FArc& E) { E.Name(B.Property); });
+                    Tag(Elements, "FunctionName", "NameProperty", [=](FArc& E) { E.Name(B.Function); });
+                    Tag(Elements, "SourcePath", "StructProperty", [=](FArc& E) {
+                        Tag(E, "Segments", "ArrayProperty", [=](FArc& S) {
+                            FArc Segment(S.Owner());
+                            Tag(Segment, "Name", "NameProperty", [=](FArc& N) { N.Name(B.Function); });
+                            Tag(Segment, "ArrayIndex", "IntProperty", [](FArc& N) { N.I32(-1); });
+                            TagEnd(Segment);
+                            StructArray(S, "Segments", "PropertyPathSegment", 1, Segment);
+                        }, "StructProperty");
+                        Tag(E, "CachedFunction", "ObjectProperty", [](FArc& N) { N.Idx(Null()); });
+                        TagEnd(E);
+                    }, "DynamicPropertyPath");
+                    Tag(Elements, "Kind", "EnumProperty", [](FArc& E) { E.Name("EBindingKind::Function"); }, "EBindingKind");
+                    TagEnd(Elements);
+                }
+                StructArray(V, "Bindings", "DelegateRuntimeBinding", int32(WidgetBindings.size()), Elements);
+            }, "StructProperty");
+        if (!SlotNames.empty())
+            Tag(Ar, "NamedSlots", "ArrayProperty", [=](FArc& V) {
+                V.I32(int32(SlotNames.size()));
+                for (const std::string& N : SlotNames) V.Name(N);
+            }, "NameProperty");
         if (NumReplicated > 0)
             Tag(Ar, "NumReplicatedProperties", "IntProperty", [=](FArc& V) { V.I32(NumReplicated); });
+        /* UBlueprintGeneratedClass::GetDynamicBindingObject looks a binding object up here by its class. */
+        if (!Bindings.empty())
+            Tag(Ar, "DynamicBindingObjects", "ArrayProperty", [=](FArc& V) {
+                V.I32(int32(Bindings.size()));
+                for (const FIndex& B : Bindings) V.Idx(B);
+            }, "ObjectProperty");
+        /* AActor::ExecuteConstruction makes a component of each (UBlueprintGeneratedClass::CreateComponentsForActor). */
+        if (!Templates.empty())
+            Tag(Ar, "Timelines", "ArrayProperty", [=](FArc& V) {
+                V.I32(int32(Templates.size()));
+                for (const FIndex& T : Templates) V.Idx(T);
+            }, "ObjectProperty");
         if (bActor)
             Tag(Ar, "SimpleConstructionScript", "ObjectProperty",
                 [=](FArc& V) { V.Idx(ScsIdx); });
@@ -460,6 +659,297 @@ void FBlueprintClass::Finish()
             EndComponent(Ar, Tail);
         };
         P.AddExport(std::move(Sub));
+    }
+
+    /* Measured on BP_PlayerCameraDrone's InputKeyDelegateBinding_0 and BP_PlayerControllerBase's
+       InputActionDelegateBinding_0: the class's subobject with no object flags, and every field of every entry written,
+       as the cook saves an array's structs whole (no defaults to leave a field out against). The fields go in the
+       struct's link order, its own before FBlueprintInputDelegateBinding's three flags. */
+    for (const std::vector<FInputBinding>& Of : BindingKinds)
+    {
+        const bool bAction = Of.front().bAction;
+        const std::string Kind = bAction ? "InputActionDelegateBinding" : "InputKeyDelegateBinding";
+        const FIndex KindClass = EngineClass("/Script/Engine", Kind);
+        const FIndex KindCdo = ClassDefaultObject("/Script/Engine", Kind);
+        FExport Binding;
+        Binding.ClassIndex = KindClass;
+        Binding.TemplateIndex = KindCdo;
+        Binding.OuterIndex = Exp(RowClass);
+        Binding.ObjectName = Kind + "_0";
+        Binding.SerBeforeCreate = { KindClass.V, KindCdo.V };
+        Binding.CreateBeforeCreate = { Exp(RowClass).V };
+        Binding.Serialize = [=](FArc& Ar) {
+            static const char* const Events[] = { "IE_Pressed", "IE_Released", "IE_Repeat", "IE_DoubleClick" };
+            Tag(Ar, Kind + "s", "ArrayProperty", [=](FArc& V) {
+                FArc Elements(V.Owner());
+                for (const FInputBinding& B : Of)
+                {
+                    if (bAction)
+                        Tag(Elements, "InputActionName", "NameProperty", [=](FArc& E) { E.Name(B.Name); });
+                    else
+                        Tag(Elements, "InputChord", "StructProperty", [=](FArc& E) {
+                            Tag(E, "Key", "StructProperty", [=](FArc& K) {
+                                Tag(K, "KeyName", "NameProperty", [=](FArc& N) { N.Name(B.Name); });
+                                TagEnd(K);
+                            }, "Key");
+                            TagBool(E, "bShift", B.bShift);
+                            TagBool(E, "bCtrl", B.bCtrl);
+                            TagBool(E, "bAlt", B.bAlt);
+                            TagBool(E, "bCmd", B.bCmd);
+                            TagEnd(E);
+                        }, "InputChord");
+                    Tag(Elements, "InputKeyEvent", "ByteProperty", [=](FArc& E) { E.Name(Events[B.Event]); }, "EInputEvent");
+                    Tag(Elements, "FunctionNameToBind", "NameProperty", [=](FArc& E) { E.Name(B.Function); });
+                    TagBool(Elements, "bConsumeInput", B.bConsumeInput);
+                    TagBool(Elements, "bExecuteWhenPaused", B.bExecuteWhenPaused);
+                    TagBool(Elements, "bOverrideParentBinding", B.bOverrideParentBinding);
+                    TagEnd(Elements);
+                }
+                StructArray(V, Kind + "s", "Blueprint" + Kind, int32(Of.size()), Elements);
+            }, "StructProperty");
+            TagEnd(Ar);
+            Ar.Bool(false);
+        };
+        P.AddExport(std::move(Binding));
+    }
+
+    /* Measured on Basic_FlatButton's ComponentDelegateBinding_0: the class's subobject with no object flags, each
+       FBlueprintComponentDelegateBinding written whole. */
+    if (!ComponentBindings.empty())
+    {
+        const FIndex KindClass = EngineClass("/Script/Engine", "ComponentDelegateBinding");
+        const FIndex KindCdo = ClassDefaultObject("/Script/Engine", "ComponentDelegateBinding");
+        FExport Binding;
+        Binding.ClassIndex = KindClass;
+        Binding.TemplateIndex = KindCdo;
+        Binding.OuterIndex = Exp(RowClass);
+        Binding.ObjectName = "ComponentDelegateBinding_0";
+        Binding.SerBeforeCreate = { KindClass.V, KindCdo.V };
+        Binding.CreateBeforeCreate = { Exp(RowClass).V };
+        Binding.Serialize = [Of = ComponentBindings](FArc& Ar) {
+            Tag(Ar, "ComponentDelegateBindings", "ArrayProperty", [&](FArc& V) {
+                FArc Elements(V.Owner());
+                for (const FComponentBinding& B : Of)
+                {
+                    Tag(Elements, "ComponentPropertyName", "NameProperty", [&](FArc& E) { E.Name(B.Component); });
+                    Tag(Elements, "DelegatePropertyName", "NameProperty", [&](FArc& E) { E.Name(B.Delegate); });
+                    Tag(Elements, "FunctionNameToBind", "NameProperty", [&](FArc& E) { E.Name(B.Function); });
+                    TagEnd(Elements);
+                }
+                StructArray(V, "ComponentDelegateBindings", "BlueprintComponentDelegateBinding", int32(Of.size()), Elements);
+            }, "StructProperty");
+            TagEnd(Ar);
+            Ar.Bool(false);
+        };
+        P.AddExport(std::move(Binding));
+    }
+
+    /* Measured on BP_LostPackStart's LightTimeline_Template and its CurveFloat_0 / CurveFloat_1, BP_DorettaHead's
+       CurveVector_0: the template is the class's subobject <Timeline>_Template, flag Transactional, and each curve the
+       class's subobject too, Public | Transactional, named as MakeUniqueCurveName numbers them, by curve class. The
+       template's tags go in declaration order and leave what is at the engine's defaults out (a length of 5, no
+       options); each track struct is written whole. */
+    std::map<std::string, int32> CurveNumbers;
+    for (size_t TI = 0; TI < Timelines.size(); ++TI)
+    {
+        const FTimeline T = Timelines[TI];
+        const int32 Row = TimelineRows[TI];
+        std::vector<FIndex> Curves;
+        for (size_t K = 0; K < T.Tracks.size(); ++K) Curves.push_back(Exp(Row + 1 + int32(K)));
+
+        const FIndex TemplateClass = EngineClass("/Script/Engine", "TimelineTemplate");
+        const FIndex TemplateCdo = ClassDefaultObject("/Script/Engine", "TimelineTemplate");
+        FExport Template;
+        Template.ClassIndex = TemplateClass;
+        Template.TemplateIndex = TemplateCdo;
+        Template.OuterIndex = Exp(RowClass);
+        Template.ObjectName = T.Name + "_Template";
+        Template.ObjectFlags = RF_Transactional;
+        Template.SerBeforeCreate = { TemplateClass.V, TemplateCdo.V };
+        Template.CreateBeforeCreate = { Exp(RowClass).V };
+        for (const FIndex C : Curves) Template.CreateBeforeSer.push_back(C.V);
+        Template.Serialize = [=](FArc& Ar) {
+            if (T.Length != 5.0f) Tag(Ar, "TimelineLength", "FloatProperty", [=](FArc& V) { V.Raw(&T.Length, 4); });
+            if (T.bLastKeyframe)
+                Tag(Ar, "LengthMode", "ByteProperty", [](FArc& V) { V.Name("TL_LastKeyFrame"); }, "ETimelineLengthMode");
+            if (T.bAutoPlay) TagBool(Ar, "bAutoPlay", true);
+            if (T.bLoop) TagBool(Ar, "bLoop", true);
+            if (T.bReplicated) TagBool(Ar, "bReplicated", true);
+            if (T.bIgnoreTimeDilation) TagBool(Ar, "bIgnoreTimeDilation", true);
+            /* FTTEventTrack, FTTFloatTrack, FTTVectorTrack, FTTLinearColorTrack: the struct's own fields, then
+               FTTPropertyTrack's PropertyName, then FTTTrackBase's. */
+            static const struct { char Kind; const char *Array, *Struct, *Curve; } Kinds[] = {
+                { 'E', "EventTracks", "TTEventTrack", "CurveKeys" }, { 'F', "FloatTracks", "TTFloatTrack", "CurveFloat" },
+                { 'V', "VectorTracks", "TTVectorTrack", "CurveVector" }, { 'C', "LinearColorTracks", "TTLinearColorTrack", "CurveLinearColor" } };
+            for (const auto& Of : Kinds)
+            {
+                FArc Elements(Ar.Owner());
+                int32 Count = 0;
+                for (size_t K = 0; K < T.Tracks.size(); ++K)
+                {
+                    const FTimelineTrack& Track = T.Tracks[K];
+                    if (Track.Kind != Of.Kind) continue;
+                    ++Count;
+                    if (Of.Kind == 'E') Tag(Elements, "FunctionName", "NameProperty", [&](FArc& E) { E.Name(Track.Name); });
+                    Tag(Elements, Of.Curve, "ObjectProperty", [&](FArc& E) { E.Idx(Curves[K]); });
+                    if (Of.Kind != 'E') Tag(Elements, "PropertyName", "NameProperty", [&](FArc& E) { E.Name(Track.Name); });
+                    Tag(Elements, "TrackName", "NameProperty", [&](FArc& E) { E.Name(Track.Name); });
+                    TagBool(Elements, "bIsExternalCurve", false);
+                    TagEnd(Elements);
+                }
+                if (Count > 0)
+                    Tag(Ar, Of.Array, "ArrayProperty", [&](FArc& V) { StructArray(V, Of.Array, Of.Struct, Count, Elements); },
+                        "StructProperty");
+            }
+            Tag(Ar, "TimelineGuid", "StructProperty", [=](FArc& V) { V.Guid(T.Guid); }, "Guid");
+            Tag(Ar, "VariableName", "NameProperty", [=](FArc& V) { V.Name(T.Name); });
+            Tag(Ar, "DirectionPropertyName", "NameProperty", [=](FArc& V) { V.Name(T.DirectionProperty); });
+            /* A pin with no method names none: the engine's ExecuteIfBound then calls nothing. */
+            if (!T.Update.empty()) Tag(Ar, "UpdateFunctionName", "NameProperty", [=](FArc& V) { V.Name(T.Update); });
+            if (!T.Finished.empty()) Tag(Ar, "FinishedFunctionName", "NameProperty", [=](FArc& V) { V.Name(T.Finished); });
+            TagEnd(Ar);
+            Ar.Bool(false);
+        };
+        P.AddExport(std::move(Template));
+
+        for (const FTimelineTrack& Track : T.Tracks)
+        {
+            const std::string CurveClass = Track.Kind == 'V' ? "CurveVector" : Track.Kind == 'C' ? "CurveLinearColor" : "CurveFloat";
+            const FIndex KindClass = EngineClass("/Script/Engine", CurveClass);
+            const FIndex KindCdo = ClassDefaultObject("/Script/Engine", CurveClass);
+            FExport Curve;
+            Curve.ClassIndex = KindClass;
+            Curve.TemplateIndex = KindCdo;
+            Curve.OuterIndex = Exp(RowClass);
+            Curve.ObjectName = CurveClass + "_" + std::to_string(CurveNumbers[CurveClass]++);
+            Curve.ObjectFlags = RF_Public | RF_Transactional;
+            Curve.SerBeforeCreate = { KindClass.V, KindCdo.V };
+            Curve.CreateBeforeCreate = { Exp(RowClass).V };
+            Curve.Serialize = [Track](FArc& Ar) {
+                /* UCurveFloat's FloatCurve; UCurveVector's FloatCurves[3] and UCurveLinearColor's FloatCurves[4], one
+                   tag per channel. */
+                const int32 Channels = Track.Kind == 'V' ? 3 : Track.Kind == 'C' ? 4 : 1;
+                for (int32 Ch = 0; Ch < Channels; ++Ch)
+                    Tag(Ar, Channels == 1 ? "FloatCurve" : "FloatCurves", "StructProperty",
+                        [&](FArc& V) { RichCurve(V, Track.Keys, Ch); }, "RichCurve", Ch);
+                if (Track.Kind == 'E') TagBool(Ar, "bIsEventCurve", true);
+                TagEnd(Ar);
+                Ar.Bool(false);
+            };
+            P.AddExport(std::move(Curve));
+        }
+    }
+
+    /* S39: the widget tree, as DRG's cook writes Basic_FlatButton's (DESIGN.md → S39). Every widget's outer is the tree,
+       every slot's its panel; the hierarchy is the slots' Parent and Content, the panel's Slots and the child's Slot, all
+       three written. All are RF_Transactional alone. Each export creates first the objects its tags name but its outer:
+       the tree its root, a widget its slots, a slot its content. */
+    if (bHasTree)
+    {
+        auto WidgetRow = [&](const std::string& Name) {
+            return RowFirstWidget + int32(std::find_if(Widgets.begin(), Widgets.end(),
+                                                        [&](const FWidget& W) { return W.Name == Name; }) - Widgets.begin());
+        };
+        const FIndex TreeClass = EngineClass("/Script/UMG", "WidgetTree");
+        const FIndex TreeCdo = Imp(P.AddImport({ "/Script/UMG", "WidgetTree", PackageImport("/Script/UMG"), "Default__WidgetTree" }));
+        FExport Tree;
+        Tree.ClassIndex = TreeClass;
+        Tree.TemplateIndex = TreeCdo;
+        Tree.OuterIndex = Exp(RowClass);
+        Tree.ObjectName = "WidgetTree";
+        Tree.ObjectFlags = RF_Transactional;
+        Tree.CreateBeforeSer = { Exp(RowFirstWidget).V };
+        Tree.SerBeforeCreate = { TreeClass.V, TreeCdo.V };
+        Tree.CreateBeforeCreate = { Exp(RowClass).V };
+        Tree.Serialize = [=](FArc& Ar) {
+            Tag(Ar, "RootWidget", "ObjectProperty", [=](FArc& V) { V.Idx(Exp(RowFirstWidget)); });
+            TagEnd(Ar);
+            Ar.Bool(false);
+        };
+        P.AddExport(std::move(Tree));
+
+        /* A slot is named <SlotClass>_<n>, counted per panel and class (CanvasPanelSlot_0, OverlaySlot_1). */
+        std::vector<std::string> SlotNames;
+        std::map<std::string, int32> Counts;
+        for (const FWidgetSlot& S : WidgetSlots)
+        {
+            const std::string Of = P.ImportAt(S.Class)->ObjectName;
+            SlotNames.push_back(Of + "_" + std::to_string(Counts[S.Panel + "." + Of]++));
+        }
+        for (const FWidget& W : Widgets)
+        {
+            std::vector<FIndex> Slots;
+            FIndex Own;
+            for (size_t I = 0; I < WidgetSlots.size(); ++I)
+            {
+                if (WidgetSlots[I].Panel == W.Name) Slots.push_back(Exp(RowFirstWidgetSlot + int32(I)));
+                if (WidgetSlots[I].Child == W.Name) Own = Exp(RowFirstWidgetSlot + int32(I));
+            }
+            /* A nested user widget's named slots this tree fills, {slot name, content}. */
+            std::vector<std::pair<std::string, FIndex>> Fills;
+            for (const FWidgetSlotFill& F : WidgetSlotFills)
+                if (F.Host == W.Name) Fills.push_back({ F.Slot, Exp(WidgetRow(F.Content)) });
+            FExport E;
+            E.ClassIndex = W.Class;
+            E.TemplateIndex = W.Cdo;
+            E.OuterIndex = Exp(RowTree);
+            E.ObjectName = W.Name;
+            E.ObjectFlags = RF_Transactional;
+            for (const FIndex& S : Slots) E.CreateBeforeSer.push_back(S.V);
+            for (const auto& F : Fills) E.CreateBeforeSer.push_back(F.second.V);      // as Screen_CharacterInfo's TopLeftCurve
+            if (Own.V != 0) E.CreateBeforeSer.push_back(Own.V);
+            for (const FPropertyDef& D : W.Defaults) TagRefs(D, E.CreateBeforeSer);
+            E.SerBeforeCreate = { W.Class.V, W.Cdo.V };
+            E.CreateBeforeCreate = { Exp(RowTree).V };
+            /* Its own class's properties first, then UUserWidget's NamedSlotBindings (measured on Screen_CharacterInfo,
+               each FNamedSlotBinding whole), UPanelWidget's Slots and UWidget's Slot, the cook's order. */
+            E.Serialize = [=, Defaults = W.Defaults](FArc& Ar) {
+                for (const FPropertyDef& D : Defaults) WriteDefaultTag(Ar, D);
+                if (!Fills.empty())
+                    Tag(Ar, "NamedSlotBindings", "ArrayProperty", [&](FArc& V) {
+                        FArc Elements(V.Owner());
+                        for (const auto& F : Fills)
+                        {
+                            Tag(Elements, "Name", "NameProperty", [&](FArc& N) { N.Name(F.first); });
+                            Tag(Elements, "Content", "ObjectProperty", [&](FArc& N) { N.Idx(F.second); });
+                            TagEnd(Elements);
+                        }
+                        StructArray(V, "NamedSlotBindings", "NamedSlotBinding", int32(Fills.size()), Elements);
+                    }, "StructProperty");
+                if (!Slots.empty())
+                    Tag(Ar, "Slots", "ArrayProperty", [=](FArc& V) {
+                        V.I32(int32(Slots.size()));
+                        for (const FIndex& S : Slots) V.Idx(S);
+                    }, "ObjectProperty");
+                if (Own.V != 0) Tag(Ar, "Slot", "ObjectProperty", [=](FArc& V) { V.Idx(Own); });
+                TagEnd(Ar);
+                Ar.Bool(false);
+            };
+            P.AddExport(std::move(E));
+        }
+        for (size_t I = 0; I < WidgetSlots.size(); ++I)
+        {
+            const FWidgetSlot& S = WidgetSlots[I];
+            const FIndex Panel = Exp(WidgetRow(S.Panel)), Content = Exp(WidgetRow(S.Child));
+            FExport E;
+            E.ClassIndex = S.Class;
+            E.TemplateIndex = S.Cdo;
+            E.OuterIndex = Panel;
+            E.ObjectName = SlotNames[I];
+            E.ObjectFlags = RF_Transactional;
+            E.CreateBeforeSer = { Content.V };
+            for (const FPropertyDef& D : S.Defaults) TagRefs(D, E.CreateBeforeSer);
+            E.SerBeforeCreate = { S.Class.V, S.Cdo.V };
+            E.CreateBeforeCreate = { Panel.V };
+            E.Serialize = [=, Defaults = S.Defaults](FArc& Ar) {
+                for (const FPropertyDef& D : Defaults) WriteDefaultTag(Ar, D);
+                Tag(Ar, "Parent", "ObjectProperty", [=](FArc& V) { V.Idx(Panel); });
+                Tag(Ar, "Content", "ObjectProperty", [=](FArc& V) { V.Idx(Content); });
+                TagEnd(Ar);
+                Ar.Bool(false);
+            };
+            P.AddExport(std::move(E));
+        }
     }
 
     if (!bIsActor) return;

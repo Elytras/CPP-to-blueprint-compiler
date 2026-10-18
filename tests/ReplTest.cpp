@@ -1,6 +1,7 @@
 ﻿#include "UeApi/Types.h"
 
 #include "UeApi/FSD.h"
+#include "UeApi/Game/Bar_Glass_Physics_C.h"
 
 UE_MOD_PACKAGE("/Game/_ElytrasMods/ReplTest");
 
@@ -41,6 +42,9 @@ public:
     Other->Local = 2;
     bReplicateMovement = true;
   }
+  /* A game Blueprint's RepNotify variable is a Blueprint class's: the set calls its OnRep, as for this class's own. */
+  Bar_Glass_Physics_C *Glass;
+  void SetGlass() { Glass->Thrown = true; }
 
   int32 Calls;
   /* A replicated write names its object for the wake, the write and the OnRep: a computed one is evaluated once. */

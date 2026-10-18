@@ -14,6 +14,11 @@ namespace Uasset
    both sides derive it from the same seed rather than reading the parent asset back. */
 void ScsNodeGuid(const std::string& ClassName, const std::string& ComponentName, uint32 (&Out)[4]);
 
+/* A timeline's TimelineGuid, by class and timeline name, and its direction variable's name: the editor's
+   `<Timeline>__Direction_<guid>` (UTimelineTemplate::UpdateCachedNames, TimelineTemplate.cpp 55-67). The editor's GUID
+   is random; this one is seeded like ScsNodeGuid, so a recompile writes the same names. */
+std::string TimelineGuid(const std::string& ClassName, const std::string& Timeline, uint32 (&Out)[4]);
+
 class FBlueprintClass
 {
 public:
@@ -26,6 +31,10 @@ public:
     FIndex Subobject(const std::string& ClassPackage, const std::string& ClassName_, FIndex Outer,
                      const std::string& ObjectName);
     FIndex EngineClass(const std::string& PackageName, const std::string& ClassName);
+    /* What a game Blueprint's package exports it as, where that is not a BlueprintGeneratedClass: "<package>.<class>"
+       -> (class package, class name), such as a widget Blueprint's (/Script/UMG, WidgetBlueprintGeneratedClass).
+       EngineClass names it as the import row's class. Null, or a class it does not hold: BlueprintGeneratedClass. */
+    const std::map<std::string, std::pair<std::string, std::string>>* GameClassKinds = nullptr;
     FIndex ScriptStruct(const std::string& PackageName, const std::string& StructName);
     FIndex Enum(const std::string& PackageName, const std::string& EnumName);
     FIndex EngineFunction(const std::string& PackageName, const std::string& OwningClass,
@@ -149,6 +158,76 @@ public:
        cannot express: declaring the name again would shadow it with a second property. */
     void AddCdoDefault(const FPropertyDef& Var) { CdoDefaults.push_back(Var); }
 
+    /* One editor InputKey or InputAction node: an entry of the class's InputKeyDelegateBinding or
+       InputActionDelegateBinding object, which UInputDelegateBinding::BindInputDelegates binds to the actor's input
+       component, calling Function on the actor by name (InputKeyDelegateBinding.cpp 12-45). Name is the key or the
+       action. Event is an EInputEvent: 0 pressed, 1 released, 2 repeat, 3 double click. */
+    struct FInputBinding
+    {
+        bool bAction = false;
+        std::string Name, Function;
+        uint8 Event = 0;
+        bool bShift = false, bCtrl = false, bAlt = false, bCmd = false;
+        bool bConsumeInput = true, bExecuteWhenPaused = false, bOverrideParentBinding = true;
+    };
+    void AddInputBinding(const FInputBinding& Binding) { InputBindings.push_back(Binding); }
+
+    /* One editor Timeline node: a TimelineTemplate in the class's Timelines and a curve object per track, of which
+       UBlueprintGeneratedClass::CreateTimelineComponent makes a UTimelineComponent on each actor, stores it in the
+       variable Name and binds Update, Finished and each event track's function by name (BlueprintGeneratedClass.cpp
+       1077-1195). A track's Name is its TrackName and the variable it sets each frame, or an event track's function.
+       A key holds its time and one value per channel (an event's none, a float's one, a vector's three, a color's
+       four); Interp is an ERichCurveInterpMode, 0 linear, 1 constant, 2 cubic. Kind: 'E' event, 'F' float, 'V' vector,
+       'C' linear color. */
+    struct FTimelineKey
+    {
+        float Time = 0.0f;
+        float Values[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        uint8 Interp = 0;
+    };
+    struct FTimelineTrack
+    {
+        char Kind = 'F';
+        std::string Name;
+        std::vector<FTimelineKey> Keys;
+    };
+    struct FTimeline
+    {
+        std::string Name, DirectionProperty, Update, Finished;
+        float Length = 5.0f;
+        bool bAutoPlay = false, bLoop = false, bReplicated = false, bIgnoreTimeDilation = false, bLastKeyframe = false;
+        uint32 Guid[4] = { 0, 0, 0, 0 };
+        std::vector<FTimelineTrack> Tracks;
+    };
+    void AddTimeline(const FTimeline& Timeline) { Timelines.push_back(Timeline); }
+    /* S39: a widget class with a designer tree, or below a mod class that has one. It is exported as a
+       WidgetBlueprintGeneratedClass, the only kind UUserWidget::Initialize builds a tree for (UserWidget.cpp 125-143). */
+    void SetWidgetClass(bool bValue) { bWidgetClass = bValue; }
+    /* One UE_WIDGET: an export under the class's WidgetTree, archetyped on its class's CDO, its Defaults as tags. The
+       first one added is the tree's RootWidget. InitializeWidgetStatic finds the class variable of the same name. */
+    void AddWidget(const std::string& Name, FIndex Class, FIndex Cdo, const std::vector<FPropertyDef>& Defaults);
+    /* Child in Panel, as `Panel->AddChild(Child)` makes it: a slot export of Class under the panel, holding Parent and
+       Content, listed in the panel's Slots and named by the child's Slot. Both widgets are added with AddWidget. */
+    void AddWidgetSlot(const std::string& Panel, const std::string& Child, FIndex Class, FIndex Cdo,
+                       const std::vector<FPropertyDef>& Defaults);
+    /* Content, a widget of this tree in no panel, fills the named slot Slot of the nested user widget Host: an entry of
+       Host's NamedSlotBindings, which UUserWidget::InitializeNamedSlots adds to the UNamedSlot variable of that name. */
+    void AddWidgetSlotFill(const std::string& Host, const std::string& Slot, const std::string& Content)
+    {
+        WidgetSlotFills.push_back({ Host, Slot, Content });
+    }
+    /* The class's NamedSlots: the names of its tree's UNamedSlot widgets, which UUserWidget::GetSlotNames answers. */
+    void SetNamedSlots(const std::vector<std::string>& Names) { NamedSlots = Names; }
+    /* An entry of the class's ComponentDelegateBinding: Function on the widget object bound to the multicast delegate
+       Delegate of the widget the variable Component holds (ComponentDelegateBinding.cpp 12-38), as the designer's
+       "On Clicked (Play)" node is. */
+    struct FComponentBinding { std::string Component, Delegate, Function; };
+    void AddComponentBinding(const FComponentBinding& Binding) { ComponentBindings.push_back(Binding); }
+    /* An entry of the class's Bindings: the property Property of the widget variable Widget, read from Function each
+       time it is drawn (InitializeBindingsStatic binds the widget's <Property>Delegate). */
+    struct FPropertyBinding { std::string Widget, Property, Function; };
+    void AddPropertyBinding(const FPropertyBinding& Binding) { PropertyBindings.push_back(Binding); }
+
     /* The actor has a root before this class's SCS runs: a Blueprint parent's SCS leaves one, and a native parent's
        constructor sets one or ExecuteConstruction takes its first native scene component. Then the DefaultSceneRoot
        node is in neither RootNodes nor AllNodes, as the editor saves it (ValidateSceneRootNodes). */
@@ -230,6 +309,8 @@ private:
     };
     std::vector<FComponentOverride> ComponentOverrides;
     std::vector<FPropertyDef> CdoDefaults;
+    std::vector<FInputBinding> InputBindings;
+    std::vector<FTimeline> Timelines;
 
     struct FSubobjectOverride
     {
@@ -246,6 +327,27 @@ private:
         std::string Name, ClassPackage, ClassName;
     };
     std::vector<FParentSubobject> ParentSubobjects;
+
+    bool bWidgetClass = false;
+    struct FWidget
+    {
+        std::string Name;
+        FIndex Class, Cdo;
+        std::vector<FPropertyDef> Defaults;
+    };
+    std::vector<FWidget> Widgets;
+    struct FWidgetSlot
+    {
+        std::string Panel, Child;
+        FIndex Class, Cdo;
+        std::vector<FPropertyDef> Defaults;
+    };
+    std::vector<FWidgetSlot> WidgetSlots;
+    struct FWidgetSlotFill { std::string Host, Slot, Content; };
+    std::vector<FWidgetSlotFill> WidgetSlotFills;
+    std::vector<std::string> NamedSlots;
+    std::vector<FComponentBinding> ComponentBindings;
+    std::vector<FPropertyBinding> PropertyBindings;
 
     int32 ClassRow = 0;
 };

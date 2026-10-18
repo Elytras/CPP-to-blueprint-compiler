@@ -18,6 +18,8 @@ QcRelayKid one of RelayServer, whose parent call is bound from QcRelay's own Ser
 CallParentPlain's body is copied into QcFinalPlain's CallRelayPlain, and its call is still QcParent's Plain, not
 QcFinalPlain's final one.
 */
+#define QC_PLAIN() QcParent::Plain()
+
 class QcParent : public AActor {
 public:
   int32 Seen = 0;
@@ -33,6 +35,8 @@ public:
   void  CallParentServer() { QcParent::ServerBump(4); }
   int32 CallParentKept() { return QcParent::Kept(1); }
   int32 CallParentPlain() { return QcParent::Plain(); }
+  int32 CallThisPlain() { return this->QcParent::Plain(); }   // the qualifier read back from Plain, not from `this`
+  int32 CallMacroPlain() { return QC_PLAIN(); }                // ... and from where Plain is spelled
   UE_NO_OPTIMIZE int32 CallParentPlainSlow() { return QcParent::Plain(); }
   void  CallAuth() { AuthOnly(); }      // unqualified: the object's own AuthOnly
 };

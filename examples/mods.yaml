@@ -19,6 +19,10 @@ mods:
     sources: [AwaitEvents.cpp]
   - name: MemoryRead
     sources: [MemoryRead.cpp]
+  - name: HotKeys
+    sources: [HotKeys.cpp]
+  - name: FadingLamp
+    sources: [FadingLamp.cpp]
   - name: MathLib
     sources: [MathLib.cpp]
     generate_api: true

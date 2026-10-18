@@ -1247,6 +1247,13 @@ def assign_value():
 assign_value()
 print('ok  AssignValue: a struct\'s or an FString\'s = read by value in a loop condition, right of &&, in ?: or in a '
       'call on another object is a copy of what it assigned')
+# `S.Len()` is UKismetStringLibrary::Len(S); it used to compile into a call to a function the game does not have.
+assert '/Script/Engine.KismetStringLibrary:Len' in import_paths(asset('StringLen')), import_paths(asset('StringLen'))
+for s in ('', 'a', 'gold', 'héllo wörld'):
+    assert run(asset('StringLen'), 'Param', S=s)[0] == len(s), s
+    assert run(asset('StringLen'), 'Member', {'Name': ''}, S=s)[0] == len(s), s
+    assert run(asset('StringLen'), 'Concat', A=s, B='xy')[0] == len(s) + 2, s
+print('ok  StringLen: S.Len() is the Len node')
 # A member taken of a struct `=` in a loop condition uses its place, which no statement before the loop can hold; an
 # assignment updated whose left side is no plain variable would locate it twice.
 refused('AssignMemberPlace', '  FCbPair S;\n  FCbPair T;\n'
@@ -1706,6 +1713,8 @@ check('FlowTest', 'ConstexprPick', lambda: 84, [dict()])
 check('FlowTest', 'CoalesceLoop', lambda N: sum((2 * i + 1) + (2 * (i + 1) + 1) for i in range(2 * N + 1)) * 1000 + 2 * N + 1,
       [dict(N=n) for n in (-1, 0, 1, 3)])
 check('FlowTest', 'LoopInline', lambda N: max(N, 0) ** 2 * 100 + max(2 * N + 1, 0) ** 2, [dict(N=n) for n in (-3, 0, 1, 4)])
+check('FlowTest', 'BackEdge', lambda N: 3 * 101 * (3 * N + 1) + 5 * 5 + 6 * 6 + 7 * 7, [dict(N=n) for n in (-2, 0, 4)])
+check('FlowTest', 'DropElse', lambda bCrit: 30 if bCrit else 210, [dict(bCrit=c) for c in (True, False)])
 check('FlowTest', 'FreshLocals', lambda N: 400 + 200 * max(N, 0), [dict(N=n) for n in (0, 1, 3)])
 check('FlowTest', 'FreshInLoop', lambda N: 200 * max(N, 0), [dict(N=n) for n in (0, 1, 3)])
 check('FlowTest', 'SafeRatio', lambda X: X != 0 and cdiv(10, X) > 2, [dict(X=x) for x in (-2, 0, 1, 3, 4)])
@@ -2756,7 +2765,7 @@ def constants():
     exports = [e['name'] for e in dumpexp.load(base)[5]]
     cdo = dump('dumptags.py', base, str(exports.index('Default__TypesTest_C')))
     for want in ('Seed [0] IntProperty size=4: %d' % fnv('types'), 'Budget [0] IntProperty size=4: 25', 'Reach [0] FloatProperty size=4: 125.0', 'Bits [0] IntProperty size=4: 236',
-                 'Halfway [0] BoolProperty size=0 value=1'):
+                 'Halfway [0] BoolProperty size=0 value=1', 'Moods [0] IntProperty size=4: 33'):
         assert want in cdo, (want, cdo)
     print('ok  TypesTest: a member default is what its constant expression comes to')
     import struct
@@ -2885,6 +2894,26 @@ def types_behaviour():
     print('ok  TypesTest: TEnum<E> switches, compares and assigns as E; Name() / String() are the engine\'s lookups on E')
     assert [vm.call('SleepyCount', l) for l in ([], [6], [0, 6, 5, 6])] == [0, 1, 2]
     print('ok  TypesTest: a global `using` of a template type is that type')
+    # TEnumMask<EMood> is an int32 whose bit N is the enumerator of value N, read and written by the engine's own bit
+    # functions (KismetNodeHelperLibrary.cpp 12-38): bit 31 never reads as marked, and an index past 31 does nothing.
+    has = lambda Mask, M: M < 32 and wrap((1 << M) & Mask) > 0
+    moods, masks = (0, 5, 6, 30, 31, 32, 255), (0, 0x21, -1, -2**31, 0x40000041)
+    check('TypesTest', 'MaskHas', has, [dict(Mask=k, M=m) for k in masks for m in moods])
+    for start in masks:
+        for m in moods:
+            got = run(asset('TypesTest'), 'InMoods', self_vars={'Moods': start}, M=m)[0]
+            assert got == has(start, m), ('InMoods', start, m, got)
+            for op, want in enumerate((wrap(start | 1 << m) if m < 32 else start,
+                                       wrap(start & ~(1 << m)) if m < 32 else start, 0)):
+                f = {'Moods': start}
+                got = run(asset('TypesTest'), 'EditMoods', self_vars=f, M=m, Op=op)[0]
+                assert got == want and f['Moods'] == want, ('EditMoods', start, m, op, got, f)
+    local = lambda A, Extra: (lambda b: b if has(b, 0) else wrap(-b))(wrap(((1 << A) if A < 32 else 0) | 1 << 6 | Extra))
+    check('TypesTest', 'LocalMoods', local, [dict(A=a, Extra=x) for a in moods for x in (0, 1, 0x21, -2**31)])
+    print('ok  TypesTest: TEnumMask<E> is an int32 bitmask; Has / Add / Remove / Clear are the engine\'s bit functions')
+    refused('MaskMap', '  TMap<int32, TEnumMask<EMood>> M;\n  void F() { M[1].Add(EMood::Calm); }\n', 'writes the mask',
+            top='enum class EMood : uint8 { Calm, Angry };\nUE_ENUM(EMood);\n')
+    print('ok  TEnumMask::Add on a map element is refused: Map_Find copies it out, and nothing would store it back')
     check('TypesTest', 'GetIsTargetable', lambda: True, [dict()])
     for r in (0, 4):
         f = {}
@@ -2951,7 +2980,8 @@ def string_behaviour():
     cdo = dump('dumptags.py', base, [e['name'] for e in dumpexp.load(base)[5]].index('Default__StringTest_C'))
     assert 'Umlaut [0] NameProperty size=8: Größe' in cdo, cdo
     check('StringTest', 'IsUmlaut', lambda S: S.lower() == 'größe', [dict(S=s) for s in ('Größe', 'GRößE', 'Grösse', '')])
-    print('ok  StringTest: a non-ASCII FName reads back as written, in the CDO and the bytecode')
+    check('StringTest', 'UmlautText', lambda: 'Größe', [dict()])
+    print('ok  StringTest: a non-ASCII FName or FText reads back as written, in the CDO and the bytecode')
 
     class Trace(dict):
         """The object's fields, recording every store in order."""
@@ -4361,6 +4391,35 @@ def await_runs():
     print('ok  AsyncTest: binds, one Activate after the first bind, each await resuming with its value')
 
 
+def await_values():
+    """AwaitValues: an await on a dispatcher of two or more parameters resumes with each value in the name bound to it,
+    and a later broadcast with that one's values; the names outlive a second await. One written as a statement waits
+    and keeps none. `auto V = UE_AWAIT(...)` of such a dispatcher is refused, naming the binding to write."""
+    hit = {'X': 1.0, 'Y': 2.0, 'Z': 3.0}
+    vm = VM(asset('AwaitValues'), {}, Total=0, Hurt=0.0, Woken=0)
+    vm.call('WaitScore')
+    assert vm.self.vars == dict(Total=0, Hurt=0.0, Woken=0), vm.self.vars
+    vm.broadcast(vm.self, 'OnScored', 'dwarf', 5)
+    assert vm.self.vars['Last'] == 'dwarf' and vm.self.vars['Total'] == 5, vm.self.vars
+    vm.broadcast(vm.self, 'OnScored', 'scout', 2)
+    assert vm.self.vars['Last'] == 'scout' and vm.self.vars['Total'] == 7, vm.self.vars
+    vm = VM(asset('AwaitValues'), {}, Total=0, Hurt=0.0, Woken=0)
+    vm.call('WaitHitThenScore')
+    vm.broadcast(vm.self, 'OnHit', 'dwarf', hit, 2.5)
+    assert vm.self.vars == dict(Total=0, Hurt=2.5, Woken=0, At=hit), vm.self.vars
+    vm.broadcast(vm.self, 'OnScored', 'scout', 4)
+    assert vm.self.vars['Total'] == 0, vm.self.vars
+    vm.broadcast(vm.self, 'OnScored', 'dwarf', 3)
+    assert vm.self.vars['Total'] == 30, vm.self.vars
+    vm = VM(asset('AwaitValues'), {}, Total=0, Hurt=0.0, Woken=0)
+    vm.call('WaitAny')
+    vm.broadcast(vm.self, 'OnHit', 'dwarf', hit, 2.5)
+    assert vm.self.vars == dict(Total=0, Hurt=0.0, Woken=1), vm.self.vars
+    refused('AwaitWhole', '  UE_DISPATCHER(OnScored, AActor *Who, int32 Points);\n  int32 Total;\n'
+            '  void F() { auto V = UE_AWAIT(OnScored); Total = 1; }\n', 'one name each, `auto [Who, Points]')
+    print('ok  AwaitValues: each of a dispatcher\'s values resumes in the name bound to it; `auto V =` of them is refused')
+
+
 def delegate_targets():
     """Every function a delegate is bound to by name exists in the class and takes the one parameter its dispatcher passes."""
     for mod in ('AsyncTest', 'LatentTest'):
@@ -4382,7 +4441,8 @@ def delegate_targets():
 
 def repl_runs():
     """ReplTest as the server runs it: a replicated write wakes the object first, a RepNotify variable's OnRep runs right
-    after the write (on the object written), an RPC called on the authority runs its body."""
+    after the write (on the object written; a game Blueprint's variable is a Blueprint's too), an RPC called on the
+    authority runs its body."""
     vm = VM(asset('ReplTest'), Score=5, Slots=[])
     vm.call('ReceiveBeginPlay')
     assert vm.self.vars == dict(Score=6, Slots=[4], bOpen=False, Local=1, Notified=12), vm.self.vars
@@ -4400,6 +4460,12 @@ def repl_runs():
     assert trace == [('FlushNetDormancy', True, None), ('set', True, 'bOpen'), ('set', True, 'Notified'),
                      ('set', True, 'Local'), ('FlushNetDormancy', False, None),
                      ('set', False, 'bReplicateMovement')], trace       # a native RepNotify is for clients: no call
+    vm = VM(asset('ReplTest'))
+    glass = vm.self.vars['Glass'] = Obj('Bar_Glass_Physics_C', Thrown=False)
+    vm.call('SetGlass')
+    trace = [(l[0], l[1] is glass, l[2] if l[0] == 'set' else None) for l in vm.log]
+    assert glass.vars['Thrown'] is True and trace == [('FlushNetDormancy', True, None), ('set', True, 'Thrown'),
+                                                      ('OnRep_Thrown', True, None)], trace
     for fn, parms, want in (('ClientPing', dict(Seq=42), dict(Local=42)), ('AuthOnly', {}, dict(Local=3)),
                             ('Pretty', {}, dict(Local=4)), ('OnRep_Open', {}, dict(Notified=1)),
                             ('OnRep_Slots', {}, dict(Notified=10))):
@@ -4415,7 +4481,8 @@ def repl_runs():
                             ('MultiBoom', {}, 9), ('OnRep_Open', {}, 10)):
         kid.call(fn, **parms)
         assert kid.self.vars['Seen'] == seen, (fn, kid.self.vars)
-    print('ok  ReplTest: wake before a replicated write, OnRep after it, RPC bodies; ReplKid overrides')
+    print('ok  ReplTest: wake before a replicated write, OnRep after it (a game Blueprint\'s too), RPC bodies; '
+          'ReplKid overrides')
 
 
 def rpc_routing():
@@ -4471,6 +4538,7 @@ def spawn_runs():
     assert len(vm.log) == log, vm.log[log:]
     assert vm.call('OwnClass') == 'SpawnTest_C'
     assert vm.call('OwnClassByMacro') == 'SpawnTest_C'
+    assert vm.call('GearClass') == 'USpawnGear_C'       # named in parts, not the UObject it inherits StaticClass from
     probe = vm.call('MakeProbe')
     assert (probe.cls, probe.vars['args']) == ('USpawnProbe_C', ('USpawnProbe_C', me)), probe.vars
     print('ok  SpawnTest: spawn / construct / add-component calls, their classes and the deferred-set order')
@@ -4540,6 +4608,7 @@ latent_runs()
 latent_links()
 static_locals()
 await_runs()
+await_values()
 delegate_targets()
 spawn_runs()
 spawn_relative()
@@ -5070,7 +5139,8 @@ def ue_meta_under_msvc():
     """UeMeta.h is read by MSVC's IntelliSense as well as by AssetGen's clang: BpMods.vcxproj gives it /std:c++20, no
     defines and MSVC's traditional preprocessor (no /Zc:preprocessor), where a clang-only builtin or __VA_OPT__ is an
     error in every mod file, each reaching UeMeta.h through the UeApi headers. cl.exe in that mode compiles a file using
-    the one-argument UE_ENUM_MAP and the three-argument one both ways, each declared member of the type written."""
+    the one-argument UE_ENUM_MAP and the three-argument one both ways, each declared member of the type written, and
+    UE_INPUT_KEY / UE_INPUT_ACTION with options and without (an empty __VA_ARGS__)."""
     cl, include = msvc_cl()
     if not cl: return False
     with tempfile.TemporaryDirectory() as tmp:
@@ -5080,7 +5150,9 @@ def ue_meta_under_msvc():
                     'struct UOne { TMap<FString, EMood> ByName = UE_ENUM_MAP(EMood); };\n'
                     'struct UThree {\n  UE_ENUM_MAP(FName, EMood, Moods);\n  UE_ENUM_MAP(EMood, FString, Names);\n};\n'
                     'static_assert(__EnumMapSame__<decltype(UThree::Moods), TMap<FName, EMood>>);\n'
-                    'static_assert(__EnumMapSame__<decltype(UThree::Names), TMap<EMood, FString>>);\n')
+                    'static_assert(__EnumMapSame__<decltype(UThree::Names), TMap<EMood, FString>>);\n'
+                    'struct AKeys {\n  UE_INPUT_KEY("F5") void A();\n  UE_INPUT_KEY("S", Ctrl, Shift) void B();\n'
+                    '  UE_INPUT_ACTION("Use") void C();\n  UE_INPUT_ACTION("Use", Released, NoConsume) void D();\n};\n')
         proc = subprocess.run([cl, '/nologo', '/Zs', '/std:c++20', '/I' + os.path.dirname(UEAPI), '/I' + UEAPI, src],
                               capture_output=True, encoding='utf-8', errors='replace', cwd=tmp,
                               env=dict(os.environ, INCLUDE=include))
@@ -5089,7 +5161,8 @@ def ue_meta_under_msvc():
 
 
 if ue_meta_under_msvc():
-    print('ok  UeMeta.h compiles under cl.exe as BpMods.vcxproj\'s IntelliSense reads it, UE_ENUM_MAP\'s forms included')
+    print('ok  UeMeta.h compiles under cl.exe as BpMods.vcxproj\'s IntelliSense reads it, UE_ENUM_MAP\'s and UE_INPUT_KEY\'s '
+          'forms included')
 else:
     print('--  UeMeta.h under cl.exe: skipped (no MSVC with the Windows SDK\'s UCRT headers installed)')
 
@@ -5613,7 +5686,9 @@ def func_qualified_call():
     A body making such a call is not copied into a subclass's function, where the call would be the subclass's: a
     QcRelayKid, which overrides AuthOnly, still runs QcParent's through FuncQualifiedCall::CallParentAuth, and its call
     to QcRelay::RelayServer leaves RelayServer's parent call bound from QcRelay, which has a ServerBump. Copied into
-    QcFinalPlain, CallParentPlain's `QcParent::Plain()` is still QcParent's, not QcFinalPlain's final Plain."""
+    QcFinalPlain, CallParentPlain's `QcParent::Plain()` is still QcParent's, not QcFinalPlain's final Plain.
+    CallThisPlain's `this->QcParent::Plain()` and CallMacroPlain's, written in a macro, are the same call, the qualifier
+    read back from Plain: both used to go by name and run QcKid's Plain (50)."""
     folder = os.path.dirname(asset('FuncQualifiedCall'))
     chain = [os.path.join(folder, c) for c in ('QcKid', 'FuncQualifiedCall', 'QcParent')]
     relay = [os.path.join(folder, c) for c in ('QcRelayKid', 'QcRelay')] + chain[1:]
@@ -5624,7 +5699,7 @@ def func_qualified_call():
         assert fields.get('Seen') == want, (fn, fields)
     got = run_as(final, 'CallRelayPlain', {})
     assert got == 5, 'QcParent::Plain() copied into QcFinalPlain returned %r' % got
-    for fn in ('CallParentPlain', 'CallParentPlainSlow'):
+    for fn in ('CallParentPlain', 'CallParentPlainSlow', 'CallThisPlain', 'CallMacroPlain'):
         got = run_as(chain, fn, {})
         assert got == 5, '%s: QcParent::Plain() on a QcKid returned %r' % (fn, got)
     assert run_as(chain, 'CallParentKept', {}) == 2
@@ -7079,8 +7154,9 @@ def dispatch_facts():
 def dispatch_runs():
     """DispatchRuns as the VM runs it. Add binds (object, name) once - AddUnique - Remove drops that binding, Clear
     drops all, Broadcast runs each bound handler on its object with the arguments (a struct by value and by const
-    reference among them); with nothing bound it does nothing. A binding on another object's dispatcher runs when
-    that object broadcasts, on the object that bound it."""
+    reference among them, and a call's result for the reference, which the broadcast reads where it lies,
+    ScriptCore.cpp 3042-3054: so from a variable); with nothing bound it does nothing. A binding on another object's
+    dispatcher runs when that object broadcasts, on the object that bound it."""
     base = asset('DispatchRuns')
 
     def fresh():
@@ -7094,6 +7170,9 @@ def dispatch_runs():
     vm = fresh()
     vm.call('FireNote', 7)
     assert vm.self.vars['Total'] == 707 and vm.self.vars['LastTag'] == 'hit', vm.self.vars
+    vm = fresh()
+    vm.call('FireMade', 7)      # runvm passes MakeNote's result by value; sweep()'s rules check it is a variable
+    assert vm.self.vars['Total'] == 708 and vm.self.vars['LastTag'] == 'made', vm.self.vars
     vm = fresh()
     vm.call('PingTwice')
     assert vm.self.vars['Pings'] == 2, vm.self.vars
@@ -8855,6 +8934,47 @@ print('ok  ValueInitScalar: braces or T() around an enum, a number or a pointer 
       '{} for a struct, container or name member is its fresh value, not the default; an empty container is a value')
 
 
+def const_forms():
+    """Constants C++ knows when it compiles, written other than as a literal, are their values: a shift by a constexpr,
+    a parenthesised literal, a sizeof, an enumerator, a template's value parameter, an inline function's parameter and
+    a const local; a type spelled through a local alias, in a nested block too; __is_same as a value, in a plain if and
+    in a template; sizeof... of a type pack and of a parameter pack, an empty one too; UE_ENUM_MAP in a body, the enum
+    on either side, and passed on. A key made from a name in each spelling is that key, a run-time string's too, and as
+    a member's default, and a misnamed one warns; another one-member struct's constructor in parentheses makes it too.
+    A trait other than __is_same is still refused as a value."""
+    import struct, runvm
+    base = asset('ConstForms')
+    keeps_invariants(base)
+    vm = runvm.VM(base)
+    members = {'Key': ['KeyName'], 'FrameNumber': ['Value']}
+    vm.struct_const = lambda name, vals: runvm.Written(zip(members[name], vals))
+    keys = [vm.call(f) for f in ('KeyCall', 'KeyOfName', 'KeyBraced', 'KeyCopyList')]
+    assert keys == ['F5', 'F6', 'F7', 'F8'], keys
+    assert vm.call('KeyRuntime', S='Hello') == 'Hello' and vm.call('KeyFromString', S='LeftShift') == 'LeftShift'
+    assert vm.call('Frame', V=4) == 12
+    pkg = invariants.Package(base)
+    cdo = pkg.find('Default__ConstForms_C')
+    held = pkg.tag(cdo, 'Held')
+    key = {t['name']: t for t in pkg.tags(cdo, held['at'])}['KeyName']
+    assert pkg.names[struct.unpack_from('<i', key['value'])[0]] == 'LeftShift', key
+    assert 'warning: ConstForms::KeyTypo: FKey{"LeftShfit"} names no key the engine has' in LOGS['ConstForms'], LOGS['ConstForms']
+    for x in (5, -9, 1000):
+        assert vm.call('ShiftNamed', X=x) == x << 3 and vm.call('ShiftParen', X=x) == x >> 2, x
+        assert vm.call('ShiftUpdate', X=x) == (x << 3) >> 4, x
+        want = (x << 4) + (x << 4) + (x << 2) + ((x * 64) >> 3) + (x << 1)
+        assert vm.call('ShiftForms', X=x) == want, (x, vm.call('ShiftForms', X=x), want)
+        assert vm.call('Alias', X=x) == x + 2 and vm.call('AliasNested', X=x) == 2 * x + 1, x
+    assert [vm.call(f) for f in ('SameValue', 'SameIf', 'SameTernary', 'PackCount')] == [True, 2, 3, 33]
+    assert [run(base, 'TintName', M=m)[0] for m in (0, 4, 5)] == ['Pale', 'Warm', 'Deep']
+    assert run(base, 'TintCount')[0] == 305 and run(base, 'TintTable')[0] == 3
+    refused('TraitOther', '  bool F() { return __is_base_of(AActor, APawn); }\n', 'unimplemented argument TypeTraitExpr')
+
+
+const_forms()
+print('ok  ConstForms: a shift by any constant, a local alias, __is_same, sizeof... and a template\'s value parameter '
+      'are their values; UE_ENUM_MAP works in a body; FKey("F5") and its spellings are the key, a string\'s at run time')
+
+
 def defaults_zero():
     """UE_DEFAULTS over a parent's non-zero defaults, each member set to its type's zero by `{}`, `T()` or `nullptr`: a
     subclass's default object deltas against its parent's, so each zero is a tag the loader reads over the parent's
@@ -9274,12 +9394,16 @@ from invariant_rules import user_types as types_rules
 
 def tag_values(pkg, i, tags):
     """A tag list as {name without the member suffix: value}, the way the engine reads it back: ints, floats, bools,
-    names, strings, an enum value as its name, an engine vector as a tuple, an int array as a list, and a struct value
-    as a dict of its own tags. An enum value is its short name, which it loads by as well as by the full one."""
+    names, strings, an enum value as its name, an engine vector as a tuple, an int array as a list, an object or class
+    reference as its path (None for null), an array of them as a list, and a struct value as a dict of its own tags. An
+    enum value is its short name, which it loads by as well as by the full one."""
     out = {}
     for t in tags:
         ty, v = t['type'], bytes(t['value'])
         if ty == 'IntProperty': x = struct.unpack('<i', v)[0]
+        elif ty == 'ObjectProperty': x = pkg.path(struct.unpack('<i', v)[0])
+        elif ty == 'ArrayProperty' and t['inner'] == 'ObjectProperty':
+            x = [pkg.path(r) for r in struct.unpack_from('<%di' % struct.unpack_from('<i', v)[0], v, 4)]
         elif ty == 'FloatProperty': x = struct.unpack('<f', v)[0]
         elif ty == 'BoolProperty': x = bool(t['bool'])
         elif ty == 'NameProperty' or ty in ('ByteProperty', 'EnumProperty') and t['size'] == 8:
@@ -9586,6 +9710,471 @@ def defaults_out_of_class():
 defaults_out_of_class()
 print('ok  DefaultsOutOfClass: UE_DEFAULTS with no body in the class is refused, its statements defined out of '
       'it or not at all')
+
+
+CTOR_TWIN = '''#include "UeApi/Types.h"
+#include "UeApi/Engine.h"
+UE_MOD_PACKAGE("/Game/_ElytrasMods/CtorDefaults");
+struct FCtorStats { UE_STRUCT; int32 HP = 50; float Speed = 2.5f; };
+class CtorDefaults : public AActor {
+public:
+  UE_COMPONENT(USceneComponent, Root);
+  UE_COMPONENT(UPointLightComponent, Lamp);
+  int32 Charges = 5;
+  int32 Plain = 7;
+  float Range = 20.0f;
+  FString Label = "lit";
+  TSet<int32> Marks = {1, 2, 3};
+  FCtorStats Stats;
+  UE_DEFAULTS { InitialLifeSpan = 9.0f; InitialLifeSpan = 2.0f; Lamp->Intensity = 250.0f; Lamp->SetupAttachment(Root); }
+};
+class CtorDefaultsKid : public CtorDefaults {
+public:
+  UE_DEFAULTS { Marks = {2, 3, 4}; Charges = 0; Lamp->Intensity = 100.0f; }
+};
+'''
+
+
+def ctor_defaults():
+    """CtorDefaults: a default constructor is the class's defaults. Each package is byte for byte what the same classes
+    written with initializers and UE_DEFAULTS cook (CTOR_TWIN), and the values are C++'s: the last assignment wins, the
+    constructor's statements come after UE_DEFAULTS' own (InitialLifeSpan 2, not 9), Lamp hangs from Root, a UE_STRUCT's
+    constructor makes its default instance, and a subclass's constructor writes over its parent's values: Charges' zero
+    is a tag, and Marks loads {2, 3, 4} over the parent's {1, 2, 3}."""
+    import struct, tempfile
+    here = os.path.dirname(asset('CtorDefaults'))
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, 'CtorTwin.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write(CTOR_TWIN)
+        proc = assetgen_compile([src, UEAPI, tmp])
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        for cls in ('CtorDefaults', 'CtorDefaultsKid', 'FCtorStats'):
+            for ext in ('.uasset', '.uexp'):
+                mine, twin = (open(os.path.join(d, cls + ext), 'rb').read() for d in (here, tmp))
+                assert mine == twin, '%s%s differs from the class written with initializers and UE_DEFAULTS' % (cls, ext)
+    base = os.path.join(here, 'CtorDefaults')
+    keeps_invariants(base)
+    pkg = invariants.Package(base)
+    cdo = pkg.find('Default__CtorDefaults_C')
+    num = lambda p, i, n, f: struct.unpack(f, p.tag(i, n)['value'])[0]
+    got = tuple(num(pkg, cdo, n, f) for n, f in (('Charges', '<i'), ('Plain', '<i'), ('Range', '<f'), ('InitialLifeSpan', '<f')))
+    assert got == (5, 7, 20.0, 2.0), got
+    assert num(pkg, pkg.find('Lamp_GEN_VARIABLE'), 'Intensity', '<f') == 250.0
+    marks = loaded_container(pkg, cdo, 'Marks', 'set', set())
+    assert marks == {1, 2, 3}, marks
+    children, roots, _ = scs_tree(base)
+    assert roots == ['Root'] and children['Root'] == ['Lamp'], (roots, children)
+    kid = invariants.Package(os.path.join(here, 'CtorDefaultsKid'))
+    kcdo = kid.find('Default__CtorDefaultsKid_C')
+    assert num(kid, kcdo, 'Charges', '<i') == 0
+    assert loaded_container(kid, kcdo, 'Marks', 'set', marks) == {2, 3, 4}
+    stats = invariants.Package(os.path.join(here, 'FCtorStats'))
+    inst = {re.sub(r'_\d+_[0-9A-F]{32}$', '', t['name']): t['value'] for t in stats.struct(stats.find('FCtorStats')).defaults}
+    assert struct.unpack('<i', inst['HP'])[0] == 50 and struct.unpack('<f', inst['Speed'])[0] == 2.5, inst
+
+
+ctor_defaults()
+print('ok  CtorDefaults: a default constructor cooks what the same initializers and UE_DEFAULTS cook, last write winning')
+
+
+def ctor_refusals():
+    """What a constructor cannot be is refused, where it used to be dropped without a word: one with parameters, which
+    the engine never calls; one defined out of the class, which a mod including the header never sees; a statement that
+    is no default (a call, part of a struct); a destructor that does something. So is what UE_DEFAULTS used to get
+    wrong: a statement on another object's member, read as this class's own; one on part of a component's struct, read
+    as a component of that name; and the block in a UE_STRUCT or a UE_INTERFACE, which was dropped (a class
+    implementing DefIface loaded Marks 1, not 5)."""
+    run = "CtorCall::CtorCall(): a constructor never runs in the game"
+    refused('CtorParms', '  int32 N;\n  CtorParms(int32 InN) : N(InN) {}\n',
+            "CtorParms::CtorParms(InN): the engine makes a Blueprint class's objects with no arguments")
+    refused('CtorOut', '  int32 N;\n  CtorOut();\n', 'CtorOut::CtorOut() has no body in the class',
+            after='CtorOut::CtorOut() { N = 4; }\n')
+    refused('CtorCall', '  int32 N;\n  CtorCall() { N = 4; K2_DestroyActor(); }\n', run)
+    refused('CtorPart', '  FVector Home;\n  CtorPart() { Home.Z = 5.0f; }\n', run.replace('CtorCall', 'CtorPart'))
+    refused('DtorBody', '  int32 N;\n  ~DtorBody() { N = 0; }\n', 'DtorBody::~DtorBody(): a destructor never runs in the game')
+    refused('CtorIface', '  UE_INTERFACE;\n  CtorIface() { Marks = 2; }\n',
+            "CtorIface::CtorIface(): a UE_INTERFACE's constructor sets its own members",
+            top='class ICtorBase {\n  UE_INTERFACE;\npublic:\n  int32 Marks = 1;\n};\n', base='ICtorBase')
+    every = '::UE_DEFAULTS: every statement is'
+    refused('DefOther', '  UE_DEFAULTS { GetOwner()->InitialLifeSpan = 5.0f; }\n', 'DefOther' + every)
+    refused('DefPart', '  UE_COMPONENT(UPointLightComponent, Lamp);\n  UE_DEFAULTS { Lamp->RelativeLocation.Z = 5.0f; }\n',
+            'DefPart' + every)
+    refused('DefIface', '  UE_INTERFACE;\n  UE_DEFAULTS { Marks = 5; }\n', 'DefIface: a UE_INTERFACE has no UE_DEFAULTS',
+            top='class IDefBase {\n  UE_INTERFACE;\npublic:\n  int32 Marks = 1;\n};\n', base='IDefBase')
+    refused('DefStruct', '  FDefStruct S;\n', 'FDefStruct: a UE_STRUCT has no UE_DEFAULTS',
+            top='struct FDefStruct {\n  UE_STRUCT;\n  int32 A = 1;\n  UE_DEFAULTS { A = 5; }\n};\n')
+
+
+ctor_refusals()
+print('ok  CtorRefusals: a constructor with parameters or defined out of the class, a statement no default can say, a '
+      'destructor with a body, a UE_DEFAULTS statement on part of a struct or on another object, and UE_DEFAULTS in a '
+      'UE_STRUCT or UE_INTERFACE are refused')
+
+CD_ACTOR, CD_PLAYER, CD_OBJECT = '/Script/Engine.Actor', '/Script/FSD.PlayerCharacter', '/Script/CoreUObject.Object'
+CD_GRUNT = '/Game/Enemies/Spider/Grunt/ENE_Spider_Grunt_Normal.ENE_Spider_Grunt_Normal_C'
+
+
+def cd_class(name):
+    """The path of ClassDefaults' class `name`_C."""
+    return '/Game/_ElytrasMods/ClassDefaults/%s.%s_C' % (name, name)
+
+
+def class_defaults():
+    """ClassDefaults: `X::StaticClass()` is a class reference's default, written as the cook writes a class picked in
+    Class Defaults (BP_SpaceRig_Gamemode's GameSessionClass, UPG_Bosco_ElectricDamage's NativeClass): a tag naming the
+    class - an engine or game class's /Script import, a game Blueprint's or another mod class's /Game import, the class's
+    own export - so it loads as that class. So in an initializer, a TArray's and a TMap's braces, a UE_STRUCT's default
+    instance and a struct value, a subclass's UE_DEFAULTS (where a nullptr over the parent's class is a tag too) and an
+    asset's braces. The object holding the value lists each class as created before it is serialized (the cook's
+    DependsMap), bar its own class, serialized before its default object is made, and a /Script/CoreUObject one, which
+    nothing waits on (SavePackage.cpp 3899, 4104-4117). A TSubclassOf takes its class or a subclass, as the editor's class
+    picker does; UeApi's converts from any class, so another is refused."""
+    here = os.path.dirname(asset('ClassDefaults'))
+    for name in ('ClassDefaults', 'ClassDefaultsKid', 'CdOther', 'FCdSpawn', 'UCdDef', 'CD_Asset'):
+        keeps_invariants(os.path.join(here, name))
+    created = lambda p, i: {p.path(d) for d in p.exports[i]['deps'][1]}
+    pkg = invariants.Package(asset('ClassDefaults'))
+    cdo = pkg.find('Default__ClassDefaults_C')
+    got = tag_values(pkg, cdo, pkg.tags(cdo))
+    want = {'Kind': CD_ACTOR, 'Pawn': CD_PLAYER, 'Grunt': CD_GRUNT, 'Mine': cd_class('CdOther'),
+            'Self': cd_class('ClassDefaults'), 'Any': CD_OBJECT, 'Kinds': [CD_ACTOR, cd_class('CdOther')]}
+    assert {k: got.get(k) for k in want} == want and 'Empty' not in got, got
+    assert got['Twin'].get('Kind') == cd_class('CdOther') and 'Spawn' not in got, got
+    removed, pairs, key, num, value = struct.unpack_from('<5i', bytes(pkg.tag(cdo, 'ByName')['value']))
+    assert (removed, pairs, pkg.names[key].lower(), num, pkg.path(value)) == (0, 1, 'spider', 0, CD_GRUNT), pkg.tag(cdo, 'ByName')
+    deps = pkg.exports[cdo]['deps']
+    assert {CD_ACTOR, CD_PLAYER, CD_GRUNT, cd_class('CdOther')} == created(pkg, cdo), deps
+    assert cd_class('ClassDefaults') in {pkg.path(d) for d in deps[2]}, deps
+    assert CD_OBJECT not in {pkg.path(d) for l in deps for d in l}, deps
+    kid = invariants.Package(os.path.join(here, 'ClassDefaultsKid'))
+    kcdo = kid.find('Default__ClassDefaultsKid_C')
+    got = tag_values(kid, kcdo, kid.tags(kcdo))
+    assert {k: got.get(k, 'unset') for k in ('Kind', 'Pawn')} == {'Kind': cd_class('ClassDefaultsKid'), 'Pawn': None}, got
+    spawn = uds_defaults(os.path.join(here, 'FCdSpawn'))
+    assert spawn.get('Kind') == CD_PLAYER and spawn.get('Count') == 2, spawn
+    st = invariants.Package(os.path.join(here, 'FCdSpawn'))
+    assert CD_PLAYER in created(st, 0), st.exports[0]['deps']
+    a = invariants.Package(os.path.join(here, 'CD_Asset'))
+    ai = a.find('CD_Asset')
+    assert tag_values(a, ai, a.tags(ai)) == {'SpawnClass': cd_class('CdOther'), 'Any': CD_ACTOR}, a.tags(ai)
+    assert {cd_class('CdOther'), CD_ACTOR} <= created(a, ai), a.exports[ai]['deps']
+    refused('CdWrongSlot', '  TSubclassOf<APawn> P = AActor::StaticClass();\n',
+            'P: a TSubclassOf<APawn> holds APawn or a subclass of it, and AActor is neither')
+    refused('CdGetClass', '  TSubclassOf<AActor> K = GetClass();\n', 'K: a default is a value known when the mod is built')
+
+
+class_defaults()
+print('ok  ClassDefaults: a class is a default - in a member, a container, a UE_STRUCT, a struct value, UE_DEFAULTS and an '
+      "asset - written as the class's import or own export, created first; a class a TSubclassOf does not take is refused")
+
+
+def unlike_cpp_refusals():
+    """Calls that used to compile into something other than what C++ runs. A UE_STRUCT's method that is not inline named
+    a function that exists nowhere, as a Blueprint struct holds none. `Other->QoBase::Bump(1)` went by name and reached
+    Other's own override, where C++ runs QoBase's: seen when Other's type declares Bump too (QoKid), and when the source
+    spells the qualifier, which is read back from Bump whatever the object is written as: a chain of names
+    (`this->Other->QoBase::Bump`), a call (`GetOther()->`) or a cast (`Cast<QoBase>(A)->`), in a macro's body too. By
+    name, each compiles."""
+    refused('StructFn', '  FStructFn P;\n  int32 Use() { return P.Sum(); }\n', 'FStructFn::Sum: a UE_STRUCT holds no functions',
+            top='struct FStructFn {\n  UE_STRUCT;\n  int32 A = 1;\n  int32 Sum() const { return A + 1; }\n};\n')
+    sup = ('class QoBase : public AActor {\npublic:\n  int32 Bump(int32 V) { return V + 1; }\n};\n'
+           'class QoKid : public QoBase {\npublic:\n  int32 Bump(int32 V) { return V + 2; }\n};\n')
+    why = "`Obj->QoBase::Bump()` runs QoBase's Bump on another object without dispatch"
+    refused('QoKidRef', '  QoKid *Other;\n  int32 Go() { return Other->QoBase::Bump(1); }\n', why, top=sup)
+    refused('QoBaseRef', '  QoBase *Other;\n  int32 Go() { return this->Other->QoBase::Bump(1); }\n', why, top=sup)
+    refused('QoCallRef', '  QoBase *Other;\n  QoBase *GetOther() { return Other; }\n'
+            '  int32 Go() { return GetOther()->QoBase::Bump(1); }\n', why, top=sup)
+    refused('QoCastRef', '  int32 Go(AActor *A) { return Cast<QoBase>(A)->QoBase::Bump(1); }\n', why, top=sup)
+    refused('QoMacroRef', '  QoBase *Other;\n  int32 Go() { return BUMP(Other); }\n', why,
+            top=sup + '#define BUMP(O) O->QoBase::Bump(1)\n')
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, 'QoByName.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/QoByName");\n' + sup +
+                    'class QoByName : public AActor {\npublic:\n  QoBase *Other;\n  QoBase *GetOther() { return Other; }\n'
+                    '  int32 Go(AActor *A) { return Other->Bump(1) + GetOther()->Bump(1) + Cast<QoBase>(A)->Bump(1); }\n};\n')
+        proc = assetgen_compile([src, UEAPI, tmp])
+        assert proc.returncode == 0, proc.stdout
+
+
+unlike_cpp_refusals()
+print('ok  UnlikeCppRefusals: a UE_STRUCT method that is not inline, and a qualified call on another object, through a '
+      'name, a call or a cast, are refused')
+
+
+def widget_no_tree_warns():
+    """A widget shows its tree's root (UserWidget.cpp 745), and the engine makes a tree only for a
+    WidgetBlueprintGeneratedClass (Initialize, 109-151). Every widget class AssetGen cooks is a BlueprintGeneratedClass,
+    so it starts with an empty tree, under a game widget Blueprint (WtGameKid) too: the compile warns, unless the class
+    or a mod class above it sets WidgetTree->RootWidget (WtTree, WtTreeKid) or overrides OnPaint (WtPaint)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, 'WtBare.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\n#include "UeApi/UMG.h"\n'
+                    '#include "UeApi/Game/UI_AvailablePerkPoints_C.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/WtBare");\n'
+                    'class UWtBare : public UUserWidget {\npublic:\n  int32 Shown = 0;\n  void Construct() { Shown += 1; }\n};\n'
+                    'class UWtGameKid : public Game::UI::HUD_SpaceRig::KPI::UI_AvailablePerkPoints_C {};\n'
+                    'class UWtTree : public UUserWidget {\npublic:\n  void OnInitialized() {\n    WidgetTree->RootWidget = '
+                    'Cast<UTextBlock>(UGameplayStatics::SpawnObject(UTextBlock::StaticClass(), WidgetTree));\n  }\n};\n'
+                    'class UWtTreeKid : public UWtTree {};\n'
+                    'class UWtPaint : public UUserWidget {\npublic:\n  void OnPaint(FPaintContext &Context) const {}\n};\n')
+        proc = assetgen_compile([src, UEAPI, tmp])
+        assert proc.returncode == 0, proc.stdout
+        warned = set(re.findall(r'warning: (\w+): a widget class AssetGen cooks has no widget tree', proc.stdout))
+        assert warned == {'UWtBare', 'UWtGameKid'}, proc.stdout
+
+
+widget_no_tree_warns()
+print('ok  WidgetNoTree: a widget class that neither sets its tree\'s root nor paints warns that it shows nothing')
+
+
+def widget_tree():
+    """S39: a widget class's designer tree from its constructor (tests/WidgetTree.cpp). Read as the engine reads it: the
+    class is a WidgetBlueprintGeneratedClass, the only kind UUserWidget::Initialize instances a tree for, whose WidgetTree
+    names a tree whose RootWidget is the first UE_WIDGET; from there each panel's Slots lead to its children, every slot
+    holding Parent and Content and every child naming its slot back. Each widget is the class variable of its name
+    (InitializeWidgetStatic sets it by name). A canvas slot's LayoutData holds the offsets its setters gave (position and
+    size, or SetOffsets'), a button slot its alignment, a widget its text. A class below declares no widgets, stays a
+    widget class and imports its parent as one. The layout's mistakes are refused.
+    The layout's other lines, as the engine reads them. UE_SLOT: the nested UWtFrame lists Note in its NamedSlotBindings
+    under Body, which InitializeNamedSlots finds as UWtFrame's variable and whose class's NamedSlots names it (GetSlotNames,
+    which ForEachWidget walks into, so Note is a variable of the card too); Note sits in no panel. Play->OnClicked.Add:
+    the class's ComponentDelegateBinding, in DynamicBindingObjects, binds Play's OnClicked to OnPlay, a function of the
+    class (BindDynamicDelegates). UE_BIND: a Bindings entry naming Title, Text and GetScoreText, its SourcePath that
+    function, a function of the class returning a text."""
+    folder = os.path.join(ROOT, 'WidgetTree', 'FSD', 'Content', '_ElytrasMods', 'WidgetTree')
+    p, ci = class_pkg(os.path.join(folder, 'UWtCard'))
+    obj = lambda t: struct.unpack('<i', t['value'][:4])[0]
+    assert p.class_of(ci + 1) == 'WidgetBlueprintGeneratedClass', p.class_of(ci + 1)
+    tree = obj(p.tag(ci, 'WidgetTree')) - 1
+    assert p.class_of(tree + 1) == 'WidgetTree' and p.exports[tree]['outer'] == ci + 1
+    root = obj(p.tag(tree, 'RootWidget')) - 1
+
+    def structs(pk, i, t):
+        """An array of structs' elements, each as tag_values reads it: past the count and the inner tag."""
+        at, out = t['at'] + 4 + 49, []
+        for _ in range(struct.unpack_from('<i', t['value'])[0]):
+            tl = pk.tags(i, at)
+            out.append(tag_values(pk, i, tl))
+            at = tl.end
+        return out
+
+    def walk(w, path):
+        """{path: (class, its slot's export)} of w and the widgets below it, each check made on the way: a nested
+        widget's named slot content as <path>[<slot>]/<content>, with no slot of its own."""
+        out = {path: (p.class_of(w + 1), None)}
+        assert p.exports[w]['outer'] == tree + 1, path
+        fills = p.tag(w, 'NamedSlotBindings')
+        for b in structs(p, w, fills) if fills else ():
+            content = p.find(b['Content'].split(':')[-1])
+            assert p.exports[content]['outer'] == tree + 1 and not p.tag(content, 'Slot'), path
+            out.update(walk(content, '%s[%s]/%s' % (path, b['Name'], p.exports[content]['name'])))
+        slots = p.tag(w, 'Slots')
+        for k in range(struct.unpack('<i', slots['value'][:4])[0] if slots else 0):
+            s = struct.unpack('<i', slots['value'][4 + 4 * k:8 + 4 * k])[0] - 1
+            child = obj(p.tag(s, 'Content')) - 1
+            assert obj(p.tag(s, 'Parent')) == w + 1 and p.exports[s]['outer'] == w + 1, path
+            assert obj(p.tag(child, 'Slot')) == s + 1, path
+            below = walk(child, path + '/' + p.exports[child]['name'])
+            below[path + '/' + p.exports[child]['name']] = (below[path + '/' + p.exports[child]['name']][0], s)
+            out.update(below)
+        return out
+
+    got = walk(root, 'Root')
+    assert {k: v[0] for k, v in got.items()} == {'Root': 'CanvasPanel', 'Root/Title': 'TextBlock', 'Root/Play': 'Button',
+                                                  'Root/Play/Label': 'TextBlock', 'Root/Frame': 'UWtFrame_C',
+                                                  'Root/Frame[Body]/Note': 'TextBlock'}, got
+    variables = {pr.name: p.path(pr.ref) for pr in p.struct(ci).props if pr.type == 'ObjectProperty'}
+    assert variables == {'Root': '/Script/UMG.CanvasPanel', 'Title': '/Script/UMG.TextBlock', 'Play': '/Script/UMG.Button',
+                         'Label': '/Script/UMG.TextBlock', 'Frame': '/Game/_ElytrasMods/WidgetTree/UWtFrame.UWtFrame_C',
+                         'Note': '/Script/UMG.TextBlock'}, variables
+    fp, fci = class_pkg(os.path.join(folder, 'UWtFrame'))
+    named = fp.tag(fci, 'NamedSlots')
+    assert [fp.names[n] for n in struct.unpack_from('<%di' % (2 * struct.unpack_from('<i', named['value'])[0]),
+                                                    named['value'], 4)[::2]] == ['Body'], named
+    assert {pr.name: fp.path(pr.ref) for pr in fp.struct(fci).props if pr.type == 'ObjectProperty'}['Body'] == '/Script/UMG.NamedSlot'
+    keeps_invariants(os.path.join(folder, 'UWtFrame'))
+
+    bound =[struct.unpack_from('<i', p.tag(ci, 'DynamicBindingObjects')['value'], 4)[0]]
+    assert [p.class_of(b) for b in bound] == ['ComponentDelegateBinding'] and p.exports[bound[0] - 1]['outer'] == ci + 1
+    assert structs(p, bound[0] - 1, p.tag(bound[0] - 1, 'ComponentDelegateBindings')) == [
+        dict(ComponentPropertyName='Play', DelegatePropertyName='OnClicked', FunctionNameToBind='OnPlay')]
+    bindings = structs(p, ci, p.tag(ci, 'Bindings'))
+    assert [{k: b[k] for k in ('ObjectName', 'PropertyName', 'FunctionName', 'Kind')} for b in bindings] == [
+        dict(ObjectName='Title', PropertyName='Text', FunctionName='GetScoreText', Kind='Function')], bindings
+    first = p.tags(ci, p.tag(ci, 'Bindings')['at'] + 4 + 49)            # the one entry's own tags
+    source = p.tags(ci, next(t for t in first if t['name'] == 'SourcePath')['at'])
+    assert [s['Name'] for s in structs(p, ci, next(t for t in source if t['name'] == 'Segments'))] == ['GetScoreText']
+    for fn, ret in (('OnPlay', []), ('GetScoreText', ['TextProperty'])):     # what FindFunctionByName finds
+        f = p.find(fn)
+        assert f is not None and p.exports[f]['outer'] == ci + 1, fn
+        assert [pr.type for pr in p.struct(f).props if pr.name == 'ReturnValue'] == ret, fn
+
+    def offsets(s):
+        layout = p.tag(s, 'LayoutData')
+        off = next(t for t in p.tags(s, layout['at']) if t['name'] == 'Offsets')
+        return {t['name']: struct.unpack('<f', t['value'])[0] for t in p.tags(s, off['at'])}
+
+    assert offsets(got['Root/Title'][1]) == {'Left': 20, 'Top': 10, 'Right': 200, 'Bottom': 40}
+    assert offsets(got['Root/Play'][1]) == {'Left': 20, 'Top': 60, 'Right': 160, 'Bottom': 48}
+    align = p.tag(got['Root/Play/Label'][1], 'HorizontalAlignment')
+    assert p.names[struct.unpack('<i', align['value'][:4])[0]].endswith('HAlign_Center'), align
+    for w, text in (('Title', 'Score'), ('Label', 'Play')):
+        assert text.encode() in p.tag(p.find(w), 'Text')['value'], w
+    keeps_invariants(os.path.join(folder, 'UWtCard'))
+
+    kid, kci = class_pkg(os.path.join(folder, 'UWtCardKid'))
+    assert kid.class_of(kci + 1) == 'WidgetBlueprintGeneratedClass' and not kid.tag(kci, 'WidgetTree')
+    assert kid.class_of(kid.exports[kci]['super']) == 'WidgetBlueprintGeneratedClass'
+    keeps_invariants(os.path.join(folder, 'UWtCardKid'))
+
+    widgets = '  UE_WIDGET(UCanvasPanel, Root);\n  UE_WIDGET(UTextBlock, Title);\n'
+    refused('WtLoose', widgets, 'Title: no panel holds it', base='UUserWidget')
+    refused('WtTwice', widgets + '  UE_WIDGET(UVerticalBox, Box);\n'
+            '  WtTwice() { Root->AddChildToCanvas(Box); Root->AddChildToCanvas(Title); Box->AddChildToVerticalBox(Title); }\n',
+            'Title is added to Root already', base='UUserWidget')
+    refused('WtNoProp', widgets + '  WtNoProp() { Root->AddChildToCanvas(Title); Title->SetOpacity(0.5f); }\n',
+            'has no Opacity of its argument\'s type', base='UUserWidget')
+    # A named slot's content has one parent; a game widget's slot is its variable (UI_CurvedCanvas_C::Content).
+    refused('WtSlotTwice', widgets + '  UE_WIDGET(UI_CurvedCanvas_C, Curve);\n  WtSlotTwice() { Root->AddChildToCanvas(Curve); '
+            'Root->AddChildToCanvas(Title); UE_SLOT(Curve->Content, Title); }\n', 'Title is added to Root already',
+            top='#include "UeApi/Game/UI_CurvedCanvas_C.h"\n', base='UUserWidget')
+    refused('WtNotSlot', widgets + '  UE_WIDGET(UWtHost, Host);\n  WtNotSlot() { Root->AddChildToCanvas(Host); '
+            'UE_SLOT(Host->Loose, Title); }\n', 'UWtHost::Loose is no UE_WIDGET',
+            top='class UWtHost : public UUserWidget {\npublic:\n  UE_WIDGET(UNamedSlot, Body);\n  UNamedSlot *Loose;\n};\n',
+            base='UUserWidget')
+    refused('WtBindOther', widgets + '  UE_WIDGET(UButton, Play);\n  void OnPlay() {}\n  WtBindOther() { Root->AddChildToCanvas(Title); '
+            'Root->AddChildToCanvas(Play); Play->OnClicked.Add(Root, &WtBindOther::OnPlay); }\n',
+            'to a function of this widget', base='UUserWidget')
+    refused('WtBindFar', widgets + '  WtBindFar() { Root->AddChildToCanvas(Title); UE_BIND(Title, Text, &UWtOther::Get); }\n',
+            'is a function of this class or of a class above it',
+            top='class UWtOther : public UUserWidget {\npublic:\n  FText Get() const { return FText("x"); }\n};\n', base='UUserWidget')
+    print('ok  WidgetTree: a widget class\'s constructor cooks its tree, slots and their layout, as the engine walks it')
+
+
+def widget_event_flags():
+    """NativeTick calls a widget's Tick, and NativePaint its OnPaint, only while its default object's
+    bHasScriptImplementedTick or bHasScriptImplementedPaint is set (UserWidget.cpp 1377, 1602). UUserWidget's constructor
+    sets both; the editor's widget compiler sets each on every compile to whether the class overrides that event itself,
+    a parent's override not counting (WidgetBlueprintCompiler.cpp 466-487). Each flag is read as the default object loads
+    it: its tag, else its parent's value, up to the engine class. WfBare overrides neither event, WfTick and WfPaint one
+    each. A Tick override below a game widget Blueprint that has none, so holds its flag off (UI_KPI_Tab_C), turns it
+    on (WfTabTick), as below one that has its own (WfPerkTick). A class that only inherits a Tick, from a mod class
+    (WfKid) or a game Blueprint (WfPerkKid), holds the flag off, as the editor would, and the compile warns. A UE_DEFAULTS
+    or constructor line setting a flag to what the class's events give warns that it changes nothing (WfSaid, WfSaidCtor);
+    one setting the other value is refused. A patch that adds Tick and OnPaint to UI_KPI_Tab_C turns both on there."""
+    flags = ('bHasScriptImplementedTick', 'bHasScriptImplementedPaint')
+
+    def loads(p, ci, flag):
+        while True:
+            st = p.struct(ci)
+            t = p.tag(st.cdo - 1, flag)
+            if t: return t['bool']
+            up = p.resolve(st.super)
+            if up is None: return 1                 # an engine class: UUserWidget's constructor set it
+            p, ci = up
+
+    tick = '  void Tick(FGeometry MyGeometry, float InDeltaTime) {}\n'
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, 'WfFlags.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\n#include "UeApi/UMG.h"\n'
+                    '#include "UeApi/Game/UI_AvailablePerkPoints_C.h"\n#include "UeApi/Game/UI_KPI_Tab_C.h"\n'
+                    'UE_MOD_PACKAGE("/Game/_ElytrasMods/WfFlags");\n'
+                    'class UWfBare : public UUserWidget {};\n'
+                    'class UWfTick : public UUserWidget {\npublic:\n' + tick + '};\n'
+                    'class UWfPaint : public UUserWidget {\npublic:\n  void OnPaint(FPaintContext &Context) const {}\n};\n'
+                    'class UWfKid : public UWfTick {};\n'
+                    'class UWfTabTick : public UI_KPI_Tab_C {\npublic:\n' + tick + '};\n'
+                    'class UWfPerkTick : public UI_AvailablePerkPoints_C {\npublic:\n' + tick + '};\n'
+                    'class UWfPerkKid : public UI_AvailablePerkPoints_C {};\n'
+                    'class UWfSaid : public UUserWidget {\npublic:\n  UE_DEFAULTS { bHasScriptImplementedTick = true; }\n'
+                    + tick + '};\n'
+                    'class UWfSaidCtor : public UUserWidget {\npublic:\n  UWfSaidCtor() { bHasScriptImplementedPaint = false; }\n};\n')
+        out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'WfFlags')
+        os.makedirs(out)
+        proc = assetgen_compile([src, UEAPI, out])
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        said = set(re.findall(r'warning: (\w+)::[\w()]+: (\w+) follows whether .*, so this line changes nothing', proc.stdout))
+        assert said == {('UWfSaid', 'bHasScriptImplementedTick'), ('UWfSaidCtor', 'bHasScriptImplementedPaint')}, proc.stdout
+        want = {'UWfBare': (0, 0), 'UWfTick': (1, 0), 'UWfPaint': (0, 1), 'UWfKid': (0, 0), 'UWfSaid': (1, 0),
+                'UWfSaidCtor': (0, 0)}
+        if GAME: want.update({'UWfTabTick': (1, 0), 'UWfPerkTick': (1, 0), 'UWfPerkKid': (0, 0)})
+        got = {}
+        for cls in want:
+            p, ci = class_pkg(os.path.join(out, cls))
+            got[cls] = tuple(loads(p, ci, flag) for flag in flags)
+        assert got == want, got
+        warned = set(re.findall(r'warning: (\w+): the (\w+) it inherits from (\w+) never runs', proc.stdout))
+        assert warned == {('UWfKid', 'Tick', 'UWfTick'), ('UWfPerkKid', 'Tick', 'UI_AvailablePerkPoints_C')}, proc.stdout
+
+        if GAME:
+            src = os.path.join(tmp, 'WfPatch.cpp')
+            with open(src, 'w', encoding='utf-8') as f:
+                f.write('#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\n#include "UeApi/UMG.h"\n'
+                        '#include "UeApi/Game/UI_KPI_Tab_C.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/WfPatch");\n'
+                        'class TabTicks : public UI_KPI_Tab_C {\n  UE_PATCH;\n' + tick
+                        + '  void OnPaint(FPaintContext &Context) const {}\n};\n')
+            out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'WfPatch')
+            os.makedirs(out)
+            proc = assetgen_compile([src, UEAPI, out, '--game', GAME])
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+            for content, on in ((GAME, 0), (os.path.join(tmp, 'FSD', 'Content'), 1)):
+                p, ci = class_pkg(os.path.join(content, 'UI', 'HUD_SpaceRig', 'KPI', 'UI_KPI_Tab'))
+                assert all(loads(p, ci, flag) == on for flag in flags), (content, [loads(p, ci, f) for f in flags])
+    refused('UWfSet', '  UE_DEFAULTS { bHasScriptImplementedTick = true; }\n',
+            'follows whether the class overrides Tick itself, as the editor\'s widget compiler sets it on every compile; '
+            'override Tick for it to run', base='UUserWidget')
+    refused('UWfSet', '  UWfSet() { bHasScriptImplementedPaint = false; }\n  void OnPaint(FPaintContext &Context) const {}\n',
+            'follows whether the class overrides OnPaint itself, as the editor\'s widget compiler sets it on every compile; '
+            'drop the OnPaint override to turn it off', base='UUserWidget')
+
+
+widget_tree()
+widget_event_flags()
+print('ok  WidgetEventFlags: a widget class\'s Tick and OnPaint flags are on exactly where it overrides the event '
+      'itself, as the editor sets them; an inherited one warns, UE_DEFAULTS can only repeat them, a patch\'s added events do')
+
+
+def game_blueprint_kinds():
+    """An import of a game Blueprint class names, as its row's class, the class the game's package exports it as, as the
+    cook writes it: a widget Blueprint's /Script/UMG.WidgetBlueprintGeneratedClass, an anim Blueprint's
+    /Script/Engine.AnimBlueprintGeneratedClass, any other's /Script/Engine.BlueprintGeneratedClass. The cooked loader
+    compares the two names where the package is loaded already, and logs an Error on a mismatch (AsyncLoading.cpp
+    1625-1677). UGkTab's parent is a game widget Blueprint, UGkKid's is UGkTab, which AssetGen cooks as a plain
+    BlueprintGeneratedClass, and GkUser names a widget, an anim and an actor Blueprint in class defaults."""
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, 'GkKinds.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\n#include "UeApi/UMG.h"\n'
+                    '#include "UeApi/Game/ABP_SpiderHoarder_C.h"\n#include "UeApi/Game/BP_LiftPod_C.h"\n'
+                    '#include "UeApi/Game/UI_KPI_Tab_C.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/GkKinds");\n'
+                    'class UGkTab : public UI_KPI_Tab_C {};\n'
+                    'class UGkKid : public UGkTab {};\n'
+                    'class GkUser : public AActor {\npublic:\n'
+                    '  TSubclassOf<UUserWidget> Tab = UI_KPI_Tab_C::StaticClass();\n'
+                    '  TSubclassOf<UAnimInstance> Anim = ABP_SpiderHoarder_C::StaticClass();\n'
+                    '  TSubclassOf<AActor> Pod = BP_LiftPod_C::StaticClass();\n};\n')
+        out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'GkKinds')
+        os.makedirs(out)
+        proc = assetgen_compile([src, UEAPI, out])
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+
+        def row(cls, name):
+            p, _ = class_pkg(os.path.join(out, cls))
+            return next((im['class_package'], im['class_name']) for im in p.imports if im['name'] == name)
+        widget, plain = ('/Script/UMG', 'WidgetBlueprintGeneratedClass'), ('/Script/Engine', 'BlueprintGeneratedClass')
+        got = {'UGkTab': row('UGkTab', 'UI_KPI_Tab_C'), 'UGkKid': row('UGkKid', 'UGkTab_C'),
+               'Tab': row('GkUser', 'UI_KPI_Tab_C'), 'Anim': row('GkUser', 'ABP_SpiderHoarder_C'),
+               'Pod': row('GkUser', 'BP_LiftPod_C')}
+        assert got == {'UGkTab': widget, 'UGkKid': plain, 'Tab': widget,
+                       'Anim': ('/Script/Engine', 'AnimBlueprintGeneratedClass'), 'Pod': plain}, got
+
+
+game_blueprint_kinds()
+print('ok  GameBlueprintKinds: an import of a game widget or anim Blueprint class names that kind as its class, as the '
+      'cook writes it; a mod\'s own widget class and other game Blueprints stay BlueprintGeneratedClass')
 
 
 def asset_map_dup_keys():
@@ -10043,7 +10632,11 @@ print('ok  replication refusals: UE_REPLICATED on a struct member, replication o
 for _mod, _mark in (('RpcInline', 'UE_SERVER'), ('AuthInline', 'UE_AUTHORITY_ONLY'), ('CosInline', 'UE_COSMETIC')):
     refused(_mod, '  int32 Pings;\n  %s inline void Ping() { Pings += 1; }\n  void Go() { Ping(); }\n' % _mark,
             '%s::Ping: an RPC, authority-only or cosmetic marker on an inline method does nothing' % _mod)
-print('ok  a net, authority-only or cosmetic marker on an inline method is refused')
+# The marker on the definition out of the class, the declaration plain: it was read there for a call's routing, not here.
+refused('RpcInlineDef', '  int32 Pings;\n  void Ping();\n  void Go() { Ping(); }\n',
+        'RpcInlineDef::Ping: an RPC, authority-only or cosmetic marker on an inline method does nothing',
+        after='UE_SERVER inline void RpcInlineDef::Ping() { Pings += 1; }\n')
+print('ok  a net, authority-only or cosmetic marker on an inline method is refused, on its declaration or definition')
 
 
 # ---- LATENT: latent calls, async actions, deferred spawn / construct warnings (invariant_rules/latent.py)
@@ -10177,9 +10770,10 @@ def await_fakes():
 def await_paths():
     """UE_AWAIT on an async action activates it once, after its dispatchers are bound, on whichever path runs
     (K2Node_BaseAsyncTask.cpp 410-467): the else branch's await as well as the then branch's, and an await inside a
-    loop on its first round only - a second Activate starts an action like AsyncLoadPrimaryAsset again. An await some
-    paths reach with the action activated and some without is refused: keeping its Activate starts the action twice
-    on one path, dropping it never on the other."""
+    loop on its first round only - a second Activate starts an action like AsyncLoadPrimaryAsset again. A variable
+    assigned a new action holds a fresh one, which its next await activates. An await some paths reach with the
+    action activated and some without is refused: keeping its Activate starts the action twice on one path,
+    dropping it never on the other."""
     def once(activated, task, disp, what):
         """The task was activated exactly once, with the dispatcher awaited already bound (others may be too)."""
         mine = [bound for t, bound in activated if t is task]
@@ -10211,6 +10805,16 @@ def await_paths():
     vm.call('Until', 'u')                                   # the first round breaks: nothing bound, nothing activated
     assert not activated and not vm.binds and vm.self.vars == dict(Rounds=2), (activated, vm.binds, vm.self.vars)
     print('ok  AwaitPaths.Twice / Until: a UE_AWAIT in a loop activates its async action once, on the first round')
+
+    made, activated, natives = await_fakes()
+    vm = VM(asset('AwaitPaths'), natives, Rounds=0)
+    vm.call('Again', 'u')
+    vm.broadcast(made[0], 'OnSuccess', 't1')                # resumes: T holds a second task, awaited in turn
+    assert len(made) == 2, made
+    vm.broadcast(made[1], 'OnSuccess', 't2')
+    assert vm.self.vars == dict(Rounds=2, Image='t2'), vm.self.vars
+    for task in made: once(activated, task, 'OnSuccess', 'Again')
+    print('ok  AwaitPaths.Again: a variable assigned a new async action after an await activates that one too')
 
     umg, task = '#include "UeApi/UMG.h"\n', '    UAsyncTaskDownloadImage* T = UAsyncTaskDownloadImage::DownloadImage(Url);\n'
     for mod, body in (('AwaitSkips', '    for (int32 I = 0; I < 3; ++I) { if (Stop) continue; UE_AWAIT(T->OnSuccess); }\n'),
@@ -10362,6 +10966,310 @@ proxy_frame_held()
 deferred_left()
 spawn_abstract()
 wait_hold()
+
+
+# ---- INPUT: key and input-action events, UE_INPUT_KEY / UE_INPUT_ACTION (what each binding names, invariant_rules/
+# edits.py's dynamic_binding_names_resolve)
+
+def input_bindings(base):
+    """A class's input bindings as the engine reads them: GetDynamicBindingObject takes the DynamicBindingObjects entry of
+    each binding class, BindToInputComponent its array's entries (InputKeyDelegateBinding.cpp 12-45). {binding class:
+    [entry as tag_values reads it]}, in a fixed order; {} for a class with none."""
+    p, ci = class_pkg(base)
+    t = p.tag(ci, 'DynamicBindingObjects')
+    out = {}
+    for b in (struct.unpack_from('<%di' % struct.unpack_from('<i', t['value'])[0], t['value'], 4) if t else ()):
+        assert b > 0 and p.exports[b - 1]['outer'] == ci + 1, (base, p.path(b))     # the class's own subobject
+        kind = p.class_of(b)
+        arr = p.tag(b - 1, kind + 's')
+        at, entries = arr['at'] + 4 + 49, []                                         # past the count and the inner tag
+        for _ in range(struct.unpack_from('<i', arr['value'])[0]):
+            tl = p.tags(b - 1, at)
+            entries.append(tag_values(p, b - 1, tl))
+            at = tl.end
+        out[kind] = sorted(entries, key=lambda e: json.dumps(e, sort_keys=True))
+    return out
+
+
+def input_entry(fn, event='IE_Pressed', consume=True, paused=False, override=True, key=None, mods=(), action=None):
+    """An entry as input_bindings reads it, its options defaulted as the editor's node defaults them."""
+    what = dict(InputActionName=action) if action else dict(InputChord=dict(
+        Key=dict(KeyName=key), **{'b' + m: m in mods for m in ('Shift', 'Ctrl', 'Alt', 'Cmd')}))
+    return dict(what, InputKeyEvent=event, FunctionNameToBind=fn, bConsumeInput=consume, bExecuteWhenPaused=paused,
+                bOverrideParentBinding=override)
+
+
+def input_events():
+    """UE_INPUT_KEY / UE_INPUT_ACTION cook what the editor's InputKey and InputAction nodes do: the class lists an
+    InputKeyDelegateBinding and an InputActionDelegateBinding of its own in DynamicBindingObjects, whose entries hold the
+    key and its modifiers or the action, the event (one entry per edge marked, Pressed when none is), the method's name
+    to call it by, and the node's three options, defaulted as the node defaults them. A subclass lists only its own: the
+    engine binds each class's up the chain, and the parent's binding of a method the child overrides calls the child's.
+    Each method runs with the key it is handed. The HotKeys example's actor gets input through AutoReceiveInput, as its
+    comments say."""
+    folder = os.path.dirname(asset('InputEvents'))
+    base, child, plain = (os.path.join(folder, n) for n in ('InputEvents', 'InputEventsChild', 'InputEventsPlain'))
+    canon = lambda es: sorted(es, key=lambda e: json.dumps(e, sort_keys=True))
+    want = {'InputKeyDelegateBinding': canon([
+                input_entry('Toggle', key='F5'), input_entry('Stop', 'IE_Released', key='F5'),
+                input_entry('Save', key='S', mods=('Shift', 'Ctrl')),
+                input_entry('Hold', key='G'), input_entry('Hold', 'IE_Released', key='G')]),
+            'InputActionDelegateBinding': [input_entry('Used', consume=False, paused=True, override=False, action='Use')]}
+    assert input_bindings(base) == want, input_bindings(base)
+    assert input_bindings(child) == {'InputActionDelegateBinding': [input_entry('Fired', action='Fire')]}, input_bindings(child)
+    assert input_bindings(plain) == {}, input_bindings(plain)
+    hot = os.path.join(ROOT, 'HotKeys', 'FSD', 'Content', '_AssetGenExamples', 'HotKeys', 'HotKeys')
+    assert os.path.exists(hot + '.uasset'), 'the examples are not built under ' + ROOT
+    assert input_bindings(hot) == {'InputKeyDelegateBinding': canon([
+        input_entry('Count', key='F5'), input_entry('Reset', key='F5', mods=('Ctrl',)),
+        input_entry('Down', key='G', consume=False), input_entry('Up', 'IE_Released', key='G', consume=False)])}, input_bindings(hot)
+    for b in (base, hot):
+        p, ci = class_pkg(b)
+        cdo = p.struct(ci).cdo - 1
+        assert tag_values(p, cdo, p.tags(cdo)).get('AutoReceiveInput') == 'Player0', (os.path.basename(b), 'no AutoReceiveInput')
+    for b in (base, child, plain, hot):
+        keeps_invariants(b)
+    fields = {'bOn': False, 'Presses': 2}
+    run(base, 'Toggle', self_vars=fields)
+    assert fields == {'bOn': True, 'Presses': 3}, fields
+    fields = {'Last': 'None', 'Presses': 0}
+    run(base, 'Hold', self_vars=fields, Key={'KeyName': 'G'})
+    assert fields == {'Last': 'G', 'Presses': 0}, fields
+    run(base, 'Used', self_vars=fields, Key={'KeyName': 'E'})
+    assert fields == {'Last': 'E', 'Presses': 10}, fields
+    fields = {'Presses': 5}
+    run(child, 'Toggle', self_vars=fields)          # what the parent's F5 binding reaches on a child, by name
+    assert fields == {'Presses': 105}, fields
+
+
+def input_refusals():
+    """A marker the engine could not honour is refused: one on a class that gets no input, on a method that is no
+    function of the object (static, inline), on one returning a value or taking more than the key - ProcessEvent would
+    hand it the key's bytes as its own -, an unknown option, a modifier on an action, a key the engine has no key of
+    (naming the closest: SpaceBar for Space, One for 1), and one that marks no method."""
+    for mod, body, why, base in (
+            ('InputNoActor', '  UE_INPUT_KEY("F5") void F() {}\n', 'on a class that is no actor', 'UActorComponent'),
+            ('InputStatic', '  UE_INPUT_KEY("F5") static void F() {}\n', 'on a static method', 'AActor'),
+            ('InputInline', '  UE_INPUT_KEY("F5") inline void F() {}\n', 'on an inline method', 'AActor'),
+            ('InputReturn', '  UE_INPUT_KEY("F5") int32 F() { return 1; }\n', 'return void', 'AActor'),
+            ('InputParms', '  UE_INPUT_KEY("F5") void F(int32 N) {}\n', 'it takes nothing, or the key', 'AActor'),
+            ('InputOutKey', '  UE_INPUT_KEY("F5") void F(FKey &Key) {}\n', 'it takes nothing, or the key', 'AActor'),
+            ('InputOption', '  UE_INPUT_KEY("F5", Relased) void F() {}\n', 'unknown option Relased', 'AActor'),
+            ('InputActionMod', '  UE_INPUT_ACTION("Use", Ctrl) void F() {}\n', 'takes no Ctrl', 'AActor'),
+            ('InputKeyName', '  UE_INPUT_KEY("Space") void F() {}\n', 'never fire: the closest is SpaceBar', 'AActor'),
+            ('InputKeyDigit', '  UE_INPUT_KEY("1") void F() {}\n', 'never fire: the closest is One', 'AActor'),
+            ('InputMisplaced', '  UE_INPUT_KEY("F5") int32 N = 0;\n', 'marks no method', 'AActor'),
+            ('InputLast', '  void F() {}\n  UE_INPUT_KEY("F5")\n', 'marks no method', 'AActor')):
+        refused(mod, body, why, base=base)
+
+
+def input_key_names():
+    """A key is named as the engine names it, case aside (FName's match): EKeys', or an input plugin's DRG ships, its
+    FSDRawInput's GenericUSBController keys among them; or by its character, as a non-US layout names a key it has no
+    name for. Each compiles, as a marker and as an FKey{"..."} literal, and a literal of no key warns, naming the
+    closest. The control is DRG's DefaultInput.ini (with --game): every key it binds compiles but "`", which Windows
+    names Tilde (GenericPlatformInput.cpp's character map), so that console key never matches there either."""
+    keys = ['spacebar', 'GAMEPAD_FACEBUTTON_BOTTOM', 'MouseX', 'Touch10', 'GenericUSBController_Button9', '+', 'æ']
+    ini = os.path.join(GAME, '..', 'Config', 'DefaultInput.ini') if GAME else ''
+    if os.path.exists(ini):
+        text = open(ini, encoding='utf-8-sig').read()
+        bound = set(re.findall(r'\b(?:Key|ButtonKey)=([^,)\s]+)', text)) | set(re.findall(r'(?m)^[+-]ConsoleKeys=(.+?)\s*$', text))
+        assert '`' in bound and len(bound) > 50, sorted(bound)
+        keys += sorted(bound - {'`'})
+        refused('InputKeyTick', '  UE_INPUT_KEY("`") void F() {}\n', 'never fire: the closest is Tilde')
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, 'InputKeyNames.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/InputKeyNames");\n'
+                    'class InputKeyNames : public AActor {\npublic:\n'
+                    '  FKey Typo = FKey{"LeftShfit"};\n  FKey Known = FKey{"leftshift"};\n  FKey Nothing = FKey{""};\n'
+                    '  bool Held(APlayerController *PC) {\n'
+                    '    return PC->IsInputKeyDown(FKey{FName("Ctrl")}) || PC->IsInputKeyDown(FKey{"F5"});\n  }\n'
+                    + ''.join('  UE_INPUT_KEY("%s") void K%d() {}\n' % (k, i) for i, k in enumerate(keys)) + '};\n')
+        code, log = latent_compile_log(src)
+    assert code == 0, log
+    warned = re.findall(r'warning: (\S+): FKey\{"(.*?)"\} names no key the engine has, so no input matches it: '
+                        r'the closest is (\w+)', log)
+    assert sorted(warned) == [('InputKeyNames::Held', 'Ctrl', 'LeftControl'),
+                              ('InputKeyNames::Typo', 'LeftShfit', 'LeftShift')], log
+    return os.path.exists(ini)
+
+
+input_events()
+print('ok  InputEvents: UE_INPUT_KEY / UE_INPUT_ACTION list the class\'s own key and action bindings - key, modifiers or '
+      'action, edge, the method, the node\'s options - and each method runs with the key it is handed (and HotKeys)')
+input_refusals()
+print('ok  InputRefusals: a key or action marker on no actor, a static or inline method, one returning a value or taking '
+      'more than the key, an unknown option or an action\'s modifier, a key the engine does not have, or marking no '
+      'method is refused')
+with_ini = input_key_names()
+print('ok  InputKeyNames: a key the engine has compiles whatever its case, a character key too, and its FKey literal '
+      'says nothing; a literal of no key warns, naming the closest; ' + (
+          'every key DRG\'s DefaultInput.ini binds compiles, but "`", refused as Tilde' if with_ini
+          else 'DRG\'s DefaultInput.ini skipped (needs --game)'))
+
+
+# ---- TIMELINES: UE_TIMELINE, its tracks and its methods (Timelines.cpp, the FadingLamp example)
+
+def curve_channels(p, i):
+    """A curve export's channels as the engine reads them: UCurveFloat's FloatCurve, UCurveVector's FloatCurves[3] and
+    UCurveLinearColor's FloatCurves[4] by ArrayIndex, each its FRichCurve's keys as FRichCurveKey::Serialize reads them
+    (RichCurve.cpp 160-180): (interp mode, time, value, arrive tangent, leave tangent), the weights left out, which no
+    timeline key sets."""
+    out = {}
+    for t in p.tags(i):
+        if t['type'] != 'StructProperty' or t['struct'] != 'RichCurve': continue
+        keys = next(k for k in p.tags(i, t['at']) if k['name'] == 'Keys')
+        v, at, got = keys['value'], 4 + 49, []                 # past the count and the inner tag
+        for _ in range(struct.unpack_from('<i', v)[0]):
+            interp, tangent_mode, weight_mode = v[at], v[at + 1], v[at + 2]
+            time, value, arrive, arrive_w, leave, leave_w = struct.unpack_from('<6f', v, at + 3)
+            assert (tangent_mode, weight_mode, arrive_w, leave_w) == (0, 0, 0.0, 0.0), (p.base, i)   # Auto, unweighted
+            got.append((('Linear', 'Constant', 'Cubic')[interp], time, value, arrive, leave))
+            at += 27
+        assert at == len(v), (p.base, i)
+        out[t['index']] = got
+    return [out[k] for k in sorted(out)]
+
+
+def timelines_of(base):
+    """A class's timelines as UBlueprintGeneratedClass::CreateTimelineComponent reads them: each entry of its Timelines
+    list, a subobject of the class, by VariableName - the template's tags (tag_values), each track list as
+    {track name: (the curve's class, its channels)} with the track struct's other fields, and whether the curve is the
+    class's own subobject. {} for a class with none."""
+    p, ci = class_pkg(base)
+    t = p.tag(ci, 'Timelines')
+    out = {}
+    for ref in (struct.unpack_from('<%di' % struct.unpack_from('<i', t['value'])[0], t['value'], 4) if t else ()):
+        assert ref > 0 and p.exports[ref - 1]['outer'] == ci + 1 and p.class_of(ref) == 'TimelineTemplate', (base, p.path(ref))
+        i = ref - 1
+        vals = {}
+        for tag in p.tags(i):
+            if tag['type'] == 'ArrayProperty' and tag['inner'] == 'StructProperty':
+                at, tracks = tag['at'] + 4 + 49, {}
+                for _ in range(struct.unpack_from('<i', tag['value'])[0]):
+                    tl = p.tags(i, at)
+                    entry, curve = {}, None
+                    for f in tl:
+                        if f['type'] == 'ObjectProperty':
+                            c = struct.unpack('<i', f['value'])[0]
+                            assert c > 0 and p.exports[c - 1]['outer'] == ci + 1, (base, p.path(c))
+                            curve = (f['name'], p.class_of(c), curve_channels(p, c - 1), p.tag(c - 1, 'bIsEventCurve') is not None)
+                        else:
+                            entry.update(tag_values(p, i, [f]))
+                    name = entry.pop('TrackName')       # before the copy: an assignment's value is evaluated first
+                    tracks[name] = dict(entry, Curve=curve)
+                    at = tl.end
+                vals[tag['name']] = tracks
+            elif tag['name'] == 'TimelineGuid':
+                vals['TimelineGuid'] = '%08X%08X%08X%08X' % struct.unpack('<4I', tag['value'])
+            else:
+                vals.update(tag_values(p, i, [tag]))
+        assert p.exports[i]['name'] == vals['VariableName'] + '_Template', (base, p.exports[i]['name'])
+        out[vals.pop('VariableName')] = vals
+    return out
+
+
+def timelines():
+    """UE_TIMELINE cooks what the editor's Timeline node does: a TimelineTemplate in the class's Timelines with the
+    length and options set (5 seconds and none left out, as the engine's defaults), a curve per track - a CurveFloat,
+    CurveVector or CurveLinearColor, and an event curve for an event track - each the class's own, its keys sorted by
+    time with the editor's Auto tangents on a cubic key; each track naming the variable it sets, and the template naming
+    the update and finished methods and the direction variable. The class has the timeline's component variable, the
+    tracks' and the direction one with the editor's flags. A subclass lists its own timelines only; the methods run."""
+    folder = os.path.dirname(asset('Timelines'))
+    base, child, plain = (os.path.join(folder, n) for n in ('Timelines', 'TimelinesChild', 'TimelinesPlain'))
+    got = timelines_of(base)
+    fade, pulse = got.pop('Fade'), got.pop('Pulse')
+    assert got == {}, got
+    channel = lambda *keys: [list(keys)]
+    assert fade['FloatTracks'] == {'Alpha': dict(PropertyName='Alpha', bIsExternalCurve=False, Curve=('CurveFloat', 'CurveFloat',
+        channel(('Linear', 0.0, 0.0, 0.0, 0.0), ('Cubic', 1.0, 1.0, 2.0, 2.0), ('Linear', 2.0, 4.0, 0.0, 0.0)), False))}, fade['FloatTracks']
+    lift = fade['VectorTracks']['Lift']['Curve']
+    assert lift[:2] == ('CurveVector', 'CurveVector') and lift[2] == [
+        [('Constant', 0.0, c0, 0.0, 0.0), ('Linear', 2.0, c2, 0.0, 0.0)] for c0, c2 in ((1.0, 0.0), (2.0, 0.0), (3.0, 100.0))], lift
+    tint = fade['LinearColorTracks']['Tint']['Curve']
+    assert tint[:2] == ('CurveLinearColor', 'CurveLinearColor') and tint[2] == [
+        [('Linear', 0.0, a, 0.0, 0.0), ('Linear', 1.5, b, 0.0, 0.0)] for a, b in ((1.0, 1.0), (1.0, 0.0), (1.0, 0.0), (1.0, 0.5))], tint
+    assert fade['EventTracks'] == {'Blink': dict(FunctionName='Blink', bIsExternalCurve=False, Curve=('CurveKeys', 'CurveFloat',
+        channel(('Linear', 0.5, 0.0, 0.0, 0.0), ('Linear', 1.5, 0.0, 0.0, 0.0)), True))}, fade['EventTracks']
+    assert {k: fade[k] for k in fade if not k.endswith('Tracks')} == dict(
+        TimelineLength=2.0, TimelineGuid=fade['TimelineGuid'], DirectionPropertyName='Fade__Direction_' + fade['TimelineGuid'],
+        UpdateFunctionName='OnFade', FinishedFunctionName='OnFaded'), fade
+    assert pulse['FloatTracks']['Beat']['Curve'][2] == channel(('Cubic', 0.0, 1.0, -4.0, -4.0), ('Linear', 0.25, 0.0, 0.0, 0.0))
+    assert {k: pulse[k] for k in pulse if k != 'FloatTracks'} == dict(
+        LengthMode='TL_LastKeyFrame', bAutoPlay=True, bLoop=True, bReplicated=True, bIgnoreTimeDilation=True,
+        TimelineGuid=pulse['TimelineGuid'], DirectionPropertyName='Pulse__Direction_' + pulse['TimelineGuid']), pulse
+    assert fade['TimelineGuid'] != pulse['TimelineGuid']
+
+    p, ci = class_pkg(base)
+    props = {q.name: q for q in p.struct(ci).props}
+    for tl in (fade, pulse):
+        d = props[tl['DirectionPropertyName']]
+        assert (d.type, d.flags, p.path(d.ref)) == ('ByteProperty', 0, '/Script/Engine.ETimelineDirection'), (d, p.path(d.ref))
+    for name in ('Fade', 'Pulse'):
+        assert (props[name].type, props[name].flags, p.path(props[name].ref)) == (
+            'ObjectProperty', 0x80004, '/Script/Engine.TimelineComponent'), name    # BlueprintVisible | InstancedReference
+    assert [(props[n].type, props[n].flags) for n in ('Alpha', 'Lift', 'Tint', 'Beat')] == [
+        ('FloatProperty', 0), ('StructProperty', 0), ('StructProperty', 0), ('FloatProperty', 0)]
+
+    kid = timelines_of(child)
+    assert list(kid) == ['Spin'] and kid['Spin']['UpdateFunctionName'] == 'OnSpin' and 'FinishedFunctionName' not in kid['Spin'], kid
+    assert timelines_of(plain) == {}
+    lamp = os.path.join(ROOT, 'FadingLamp', 'FSD', 'Content', '_AssetGenExamples', 'FadingLamp', 'FadingLamp')
+    assert os.path.exists(lamp + '.uasset'), 'the examples are not built under ' + ROOT
+    lit = timelines_of(lamp)
+    assert list(lit) == ['Fade'] and (lit['Fade']['UpdateFunctionName'], lit['Fade']['FinishedFunctionName']) == ('OnFade', 'OnFaded'), lit
+    for b in (base, child, plain, lamp):
+        keeps_invariants(b)
+
+    fields = {'Updates': 2, 'Alpha': 0.75, 'Seen': 0.0}
+    run(base, 'OnFade', self_vars=fields)
+    assert fields == {'Updates': 3, 'Alpha': 0.75, 'Seen': 0.75}, fields
+    fields = {'Updates': 2}
+    run(child, 'OnFade', self_vars=fields)          # what the parent's template binds by name, on a child
+    assert fields == {'Updates': 102}, fields
+    fields = {'Blinks': 1}
+    run(base, 'Blink', self_vars=fields)
+    assert fields == {'Blinks': 2}, fields
+
+
+def timeline_refusals():
+    """What the engine could not honour is refused: a timeline on a class that is no actor, a length or option it does
+    not have, a track or method naming no timeline of the class, a key that is not the track's shape, a track with no
+    keys or an event with no times, a method that is no function of the object or takes or returns anything, a second
+    update method, and a marker that marks no method."""
+    for mod, body, why, base in (
+            ('TlNoActor', '  UE_TIMELINE(T, 1);\n', 'UE_TIMELINE on a class that is no actor', 'UActorComponent'),
+            ('TlLength', '  UE_TIMELINE(T, 0);\n', 'has a length that is not a number of seconds above 0', 'AActor'),
+            ('TlLengthName', '  static constexpr float L = 1;\n  UE_TIMELINE(T, L);\n', 'has a length that is not', 'AActor'),
+            ('TlOption', '  UE_TIMELINE(T, 1, Looping);\n', 'unknown option Looping', 'AActor'),
+            ('TlTrackOf', '  UE_TIMELINE(T, 1);\n  UE_FLOAT_TRACK(U, A, (0, 0));\n', 'names U, which is no UE_TIMELINE', 'AActor'),
+            ('TlKeyShape', '  UE_TIMELINE(T, 1);\n  UE_VECTOR_TRACK(T, A, (0, 1, 2));\n', 'which is not (time, x, y, z)', 'AActor'),
+            ('TlKeyMode', '  UE_TIMELINE(T, 1);\n  UE_FLOAT_TRACK(T, A, (0, 0, Smooth));\n', 'which is not (time, value)', 'AActor'),
+            ('TlNoKeys', '  UE_TIMELINE(T, 1);\n  UE_FLOAT_TRACK(T, A);\n', 'UE_FLOAT_TRACK has no keys', 'AActor'),
+            ('TlNoTimes', '  UE_TIMELINE(T, 1);\n  UE_TIMELINE_EVENT(T) void F() {}\n', 'has no times', 'AActor'),
+            ('TlTime', '  UE_TIMELINE(T, 1);\n  UE_TIMELINE_EVENT(T, half) void F() {}\n', 'the time half', 'AActor'),
+            ('TlMarkOf', '  UE_TIMELINE(T, 1);\n  UE_TIMELINE_UPDATE(U) void F() {}\n', 'names U, which is no UE_TIMELINE', 'AActor'),
+            ('TlStatic', '  UE_TIMELINE(T, 1);\n  UE_TIMELINE_UPDATE(T) static void F() {}\n', 'on a static method', 'AActor'),
+            ('TlInline', '  UE_TIMELINE(T, 1);\n  UE_TIMELINE_UPDATE(T) inline void F() {}\n', 'on an inline method', 'AActor'),
+            ('TlReturn', '  UE_TIMELINE(T, 1);\n  UE_TIMELINE_FINISHED(T) int32 F() { return 1; }\n', 'return void', 'AActor'),
+            ('TlParms', '  UE_TIMELINE(T, 1);\n  UE_TIMELINE_UPDATE(T) void F(float X) {}\n', 'so it takes nothing', 'AActor'),
+            ('TlSecond', '  UE_TIMELINE(T, 1);\n  UE_TIMELINE_UPDATE(T) void F() {}\n  UE_TIMELINE_UPDATE(T) void G() {}\n',
+             'marks a second method of T, after F', 'AActor'),
+            ('TlMisplaced', '  UE_TIMELINE(T, 1);\n  UE_TIMELINE_UPDATE(T) int32 N = 0;\n', 'marks no method', 'AActor'),
+            ('TlLast', '  UE_TIMELINE(T, 1);\n  void F() {}\n  UE_TIMELINE_FINISHED(T)\n', 'marks no method', 'AActor')):
+        refused(mod, body, why, base=base)
+
+
+timelines()
+print('ok  Timelines: UE_TIMELINE cooks the template - length, options, the methods by name, the direction variable - '
+      'and a curve per track with its keys sorted and the editor\'s Auto tangents, the component, track and direction '
+      'variables with the editor\'s flags; a subclass lists its own; the methods run (and FadingLamp)')
+timeline_refusals()
+print('ok  TimelineRefusals: a timeline on no actor, a bad length or option, a track or method of no timeline, a key '
+      'of the wrong shape, no keys or times, a method that is no function of the object or takes or returns anything, '
+      'a second update method, or marking no method is refused')
 
 
 # ---- EDITS: invariants on the packages UE_PATCH / UE_ASSET_EDITS produce from the game (invariant_rules/edits.py)
@@ -10844,6 +11752,42 @@ def edit_cooked_unlisted_cases():
           'leaves no stale cooked data')
 
 
+def class_default_edits():
+    """A class as an edit's value, ClassDefaults' output standing in for the game. UE_ASSET_EDIT of CD_Asset sets
+    SpawnClass to a /Script class the package did not import, appended and created before the asset is serialized, and
+    Any to UObject's, which nothing waits on. A UE_PATCH of ClassDefaults sets Kind to the patched class itself: its own
+    export, which is serialized before its default object is made, so the edit adds no edge; Mine's class was imported
+    and listed already."""
+    game = os.path.join(ROOT, 'ClassDefaults', 'FSD', 'Content')
+    body = ('class UCdDef : public UPrimaryDataAsset {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/ClassDefaults/UCdDef", "UCdDef_C");\n'
+            '  TSubclassOf<AActor> SpawnClass;\n  UClass *Any;\n};\n'
+            'UE_ASSET_AT(UCdDef, CD_Asset, "/Game/_ElytrasMods/ClassDefaults/CD_Asset");\n'
+            'UE_ASSET_EDIT(CD_Asset) {.SpawnClass = APlayerCharacter::StaticClass(), .Any = UObject::StaticClass()};\n'
+            'class ClassDefaults : public AActor {\npublic:\n'
+            '  UE_CLASS("/Game/_ElytrasMods/ClassDefaults/ClassDefaults", "ClassDefaults_C");\n'
+            '  TSubclassOf<AActor> Kind;\n  TSubclassOf<AActor> Mine;\n};\n'
+            'class CdPatch : public ClassDefaults {\n  UE_PATCH;\n'
+            '  UE_DEFAULTS { Kind = ClassDefaults::StaticClass(); Mine = APlayerCharacter::StaticClass(); }\n};\n')
+    with tempfile.TemporaryDirectory() as tmp:
+        proc, content = compile_edit(tmp, 'CdEdit', EDIT_HEAD + 'UE_MOD_PACKAGE("/Game/_ElytrasMods/CdEdit");\n' + body, game)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        at = lambda root, name: os.path.join(root, '_ElytrasMods', 'ClassDefaults', name)
+        for name in ('CD_Asset', 'ClassDefaults'):
+            keeps_invariants_but(at(content, name), game)
+            keeps_edit_invariants(at(content, name), game)
+        a = invariants.Package(at(content, 'CD_Asset'))
+        ai = a.find('CD_Asset')
+        assert tag_values(a, ai, a.tags(ai)) == {'SpawnClass': CD_PLAYER, 'Any': CD_OBJECT}, a.tags(ai)
+        lists = a.exports[ai]['deps']
+        assert CD_PLAYER in {a.path(d) for d in lists[1]} and CD_OBJECT not in {a.path(d) for l in lists for d in l}, lists
+        p, was = (invariants.Package(at(root, 'ClassDefaults')) for root in (content, game))
+        cdo = p.find('Default__ClassDefaults_C')
+        got = tag_values(p, cdo, p.tags(cdo))
+        assert got['Kind'] == cd_class('ClassDefaults') and got['Mine'] == CD_PLAYER, got
+        assert struct.unpack('<i', bytes(p.tag(cdo, 'Kind')['value']))[0] == p.find('ClassDefaults_C') + 1, p.tag(cdo, 'Kind')
+        assert p.exports[cdo]['deps'] == was.exports[was.find('Default__ClassDefaults_C')]['deps'], p.exports[cdo]['deps']
+
+
 if not globals().get('EDITS_EXPLORE'):     # set by the dev loop's exploration driver, which reuses the cases above
     edit_invariants_suite()
     edit_invariants_game()
@@ -10863,6 +11807,9 @@ if not globals().get('EDITS_EXPLORE'):     # set by the dev loop's exploration d
     print('ok  MapPatch: a patch\'s whole TSet / TMap loads as written, a property or one inside a struct (by a member '
           'path or in a whole struct): the archetype\'s elements it drops are listed as removed; a key given twice '
           'holds its last value, an FString key compared without case')
+    class_default_edits()
+    print("ok  ClassDefaults: UE_ASSET_EDIT and UE_PATCH write a class into a cooked package: a new import created first, "
+          "the patched class's own as its export")
 
 
 PREFETCH.finish()

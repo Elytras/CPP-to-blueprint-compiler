@@ -22,6 +22,14 @@ public:
   int32 Value;
 };
 
+/* A mod class in a namespace: its StaticClass is named in parts, `Gear::USpawnGear::StaticClass()`. */
+namespace Gear {
+class USpawnGear : public UObject {
+public:
+  int32 Teeth;
+};
+} // namespace Gear
+
 class SpawnTest : public AActor {
   AActor *Spawned;
   UObject *Made;
@@ -51,6 +59,7 @@ public:
   /* StaticClass is declared once, on the native class; the one meant is the qualifier / NewObject's T. */
   UClass *OwnClass() { return SpawnTest::StaticClass(); }
   UClass *OwnClassByMacro() { return CLASS_OF(SpawnTest); }
+  UClass *GearClass() { return Gear::USpawnGear::StaticClass(); }
   UObject *MakeProbe() { return NewObject<USpawnProbe>(this); }
 
   /* The outer walks: an actor's nearest and farthest outer of a kind. */
