@@ -9929,6 +9929,72 @@ widget_no_tree_warns()
 print('ok  WidgetNoTree: a widget class that neither sets its tree\'s root nor paints warns that it shows nothing')
 
 
+def widget_tree():
+    """S39: a widget class's designer tree from its constructor (tests/WidgetTree.cpp). Read as the engine reads it: the
+    class is a WidgetBlueprintGeneratedClass, the only kind UUserWidget::Initialize instances a tree for, whose WidgetTree
+    names a tree whose RootWidget is the first UE_WIDGET; from there each panel's Slots lead to its children, every slot
+    holding Parent and Content and every child naming its slot back. Each widget is the class variable of its name
+    (InitializeWidgetStatic sets it by name). A canvas slot's LayoutData holds the offsets its setters gave (position and
+    size, or SetOffsets'), a button slot its alignment, a widget its text. A class below declares no widgets, stays a
+    widget class and imports its parent as one. The layout's mistakes are refused."""
+    folder = os.path.join(ROOT, 'WidgetTree', 'FSD', 'Content', '_ElytrasMods', 'WidgetTree')
+    p, ci = class_pkg(os.path.join(folder, 'UWtCard'))
+    obj = lambda t: struct.unpack('<i', t['value'][:4])[0]
+    assert p.class_of(ci + 1) == 'WidgetBlueprintGeneratedClass', p.class_of(ci + 1)
+    tree = obj(p.tag(ci, 'WidgetTree')) - 1
+    assert p.class_of(tree + 1) == 'WidgetTree' and p.exports[tree]['outer'] == ci + 1
+    root = obj(p.tag(tree, 'RootWidget')) - 1
+
+    def walk(w, path):
+        """{path: (class, its slot's export)} of w and the widgets below it, each check made on the way."""
+        out = {path: (p.class_of(w + 1), None)}
+        assert p.exports[w]['outer'] == tree + 1, path
+        slots = p.tag(w, 'Slots')
+        for k in range(struct.unpack('<i', slots['value'][:4])[0] if slots else 0):
+            s = struct.unpack('<i', slots['value'][4 + 4 * k:8 + 4 * k])[0] - 1
+            child = obj(p.tag(s, 'Content')) - 1
+            assert obj(p.tag(s, 'Parent')) == w + 1 and p.exports[s]['outer'] == w + 1, path
+            assert obj(p.tag(child, 'Slot')) == s + 1, path
+            below = walk(child, path + '/' + p.exports[child]['name'])
+            below[path + '/' + p.exports[child]['name']] = (below[path + '/' + p.exports[child]['name']][0], s)
+            out.update(below)
+        return out
+
+    got = walk(root, 'Root')
+    assert {k: v[0] for k, v in got.items()} == {'Root': 'CanvasPanel', 'Root/Title': 'TextBlock', 'Root/Play': 'Button',
+                                                  'Root/Play/Label': 'TextBlock'}, got
+    variables = {pr.name: p.path(pr.ref) for pr in p.struct(ci).props if pr.type == 'ObjectProperty'}
+    assert variables == {'Root': '/Script/UMG.CanvasPanel', 'Title': '/Script/UMG.TextBlock', 'Play': '/Script/UMG.Button',
+                         'Label': '/Script/UMG.TextBlock'}, variables
+
+    def offsets(s):
+        layout = p.tag(s, 'LayoutData')
+        off = next(t for t in p.tags(s, layout['at']) if t['name'] == 'Offsets')
+        return {t['name']: struct.unpack('<f', t['value'])[0] for t in p.tags(s, off['at'])}
+
+    assert offsets(got['Root/Title'][1]) == {'Left': 20, 'Top': 10, 'Right': 200, 'Bottom': 40}
+    assert offsets(got['Root/Play'][1]) == {'Left': 20, 'Top': 60, 'Right': 160, 'Bottom': 48}
+    align = p.tag(got['Root/Play/Label'][1], 'HorizontalAlignment')
+    assert p.names[struct.unpack('<i', align['value'][:4])[0]].endswith('HAlign_Center'), align
+    for w, text in (('Title', 'Score'), ('Label', 'Play')):
+        assert text.encode() in p.tag(p.find(w), 'Text')['value'], w
+    keeps_invariants(os.path.join(folder, 'UWtCard'))
+
+    kid, kci = class_pkg(os.path.join(folder, 'UWtCardKid'))
+    assert kid.class_of(kci + 1) == 'WidgetBlueprintGeneratedClass' and not kid.tag(kci, 'WidgetTree')
+    assert kid.class_of(kid.exports[kci]['super']) == 'WidgetBlueprintGeneratedClass'
+    keeps_invariants(os.path.join(folder, 'UWtCardKid'))
+
+    widgets = '  UE_WIDGET(UCanvasPanel, Root);\n  UE_WIDGET(UTextBlock, Title);\n'
+    refused('WtLoose', widgets, 'Title: no panel holds it', base='UUserWidget')
+    refused('WtTwice', widgets + '  UE_WIDGET(UVerticalBox, Box);\n'
+            '  WtTwice() { Root->AddChildToCanvas(Box); Root->AddChildToCanvas(Title); Box->AddChildToVerticalBox(Title); }\n',
+            'Title is added to Root already', base='UUserWidget')
+    refused('WtNoProp', widgets + '  WtNoProp() { Root->AddChildToCanvas(Title); Title->SetOpacity(0.5f); }\n',
+            'has no Opacity of its argument\'s type', base='UUserWidget')
+    print('ok  WidgetTree: a widget class\'s constructor cooks its tree, slots and their layout, as the engine walks it')
+
+
 def widget_event_flags():
     """NativeTick calls a widget's Tick, and NativePaint its OnPaint, only while its default object's
     bHasScriptImplementedTick or bHasScriptImplementedPaint is set (UserWidget.cpp 1377, 1602). UUserWidget's constructor
@@ -10007,6 +10073,7 @@ def widget_event_flags():
             'drop the OnPaint override to turn it off', base='UUserWidget')
 
 
+widget_tree()
 widget_event_flags()
 print('ok  WidgetEventFlags: a widget class\'s Tick and OnPaint flags are on exactly where it overrides the event '
       'itself, as the editor sets them; an inherited one warns, UE_DEFAULTS can only repeat them, a patch\'s added events do')

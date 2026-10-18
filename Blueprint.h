@@ -200,6 +200,16 @@ public:
         std::vector<FTimelineTrack> Tracks;
     };
     void AddTimeline(const FTimeline& Timeline) { Timelines.push_back(Timeline); }
+    /* S39: a widget class with a designer tree, or below a mod class that has one. It is exported as a
+       WidgetBlueprintGeneratedClass, the only kind UUserWidget::Initialize builds a tree for (UserWidget.cpp 125-143). */
+    void SetWidgetClass(bool bValue) { bWidgetClass = bValue; }
+    /* One UE_WIDGET: an export under the class's WidgetTree, archetyped on its class's CDO, its Defaults as tags. The
+       first one added is the tree's RootWidget. InitializeWidgetStatic finds the class variable of the same name. */
+    void AddWidget(const std::string& Name, FIndex Class, FIndex Cdo, const std::vector<FPropertyDef>& Defaults);
+    /* Child in Panel, as `Panel->AddChild(Child)` makes it: a slot export of Class under the panel, holding Parent and
+       Content, listed in the panel's Slots and named by the child's Slot. Both widgets are added with AddWidget. */
+    void AddWidgetSlot(const std::string& Panel, const std::string& Child, FIndex Class, FIndex Cdo,
+                       const std::vector<FPropertyDef>& Defaults);
 
     /* The actor has a root before this class's SCS runs: a Blueprint parent's SCS leaves one, and a native parent's
        constructor sets one or ExecuteConstruction takes its first native scene component. Then the DefaultSceneRoot
@@ -300,6 +310,22 @@ private:
         std::string Name, ClassPackage, ClassName;
     };
     std::vector<FParentSubobject> ParentSubobjects;
+
+    bool bWidgetClass = false;
+    struct FWidget
+    {
+        std::string Name;
+        FIndex Class, Cdo;
+        std::vector<FPropertyDef> Defaults;
+    };
+    std::vector<FWidget> Widgets;
+    struct FWidgetSlot
+    {
+        std::string Panel, Child;
+        FIndex Class, Cdo;
+        std::vector<FPropertyDef> Defaults;
+    };
+    std::vector<FWidgetSlot> WidgetSlots;
 
     int32 ClassRow = 0;
 };

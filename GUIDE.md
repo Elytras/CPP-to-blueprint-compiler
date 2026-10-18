@@ -1982,9 +1982,9 @@ A few mistakes also compile without a message, because the construct itself work
   the timeline a game curve at run time with `Fade->SetFloatCurve(Curve, "Alpha")`. See
   [Timelines](REFERENCE.md#timelines).
 
-- A designer layout for a mod widget. A widget class AssetGen cooks starts with an empty widget tree, under a game
-  widget Blueprint parent too, and the compile warns when the class neither builds one in code nor paints. For a
-  designed layout, create one of the game's widget Blueprints. See [Classes and variables](REFERENCE.md#classes-and-variables).
+- Parts of a widget layout beyond the tree: a button event bound in the layout, a named slot filled from outside, a
+  property binding, an animation. The tree itself is declared with `UE_WIDGET`; bind events at run time. See
+  [Widget layouts](REFERENCE.md#widget-layouts).
 - Editor stubs for the mod's interfaces. A Blueprint made in the editor cannot implement an interface that the mod
   declares; a C++ class can. See [Editor API stubs](#editor-api-stubs).
 - A check of a game component class's own native data. A `UE_COMPONENT` of one of the game's component classes gets

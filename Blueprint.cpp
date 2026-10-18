@@ -309,18 +309,40 @@ void FBlueprintClass::AddComponentOverride(const std::string& Name, FIndex Compo
     ComponentOverrides.push_back(std::move(O));
 }
 
+void FBlueprintClass::AddWidget(const std::string& Name, FIndex Class, FIndex Cdo, const std::vector<FPropertyDef>& Defaults)
+{
+    Widgets.push_back(FWidget{ Name, Class, Cdo, Defaults });
+}
+
+void FBlueprintClass::AddWidgetSlot(const std::string& Panel, const std::string& Child, FIndex Class, FIndex Cdo,
+                                    const std::vector<FPropertyDef>& Defaults)
+{
+    WidgetSlots.push_back(FWidgetSlot{ Panel, Child, Class, Cdo, Defaults });
+}
+
+/* The objects a default's tags name, a lone struct's members included, which the export creates before it is
+   serialized (as ButtonText lists its font). */
+static void TagRefs(const FPropertyDef& P, std::vector<int32>& Out)
+{
+    DefaultRefs(P.Default, Out);
+    if (P.Members) for (const FPropertyDef& M : *P.Members) TagRefs(M, Out);
+}
+
 void FBlueprintClass::Finish()
 {
     const std::string CDOName = "Default__" + ClassName;
 
-    const FIndex BpgcClass = EngineClass("/Script/Engine", "BlueprintGeneratedClass");
+    const FIndex BpgcClass = bWidgetClass ? EngineClass("/Script/UMG", "WidgetBlueprintGeneratedClass")
+                                          : EngineClass("/Script/Engine", "BlueprintGeneratedClass");
     const bool bWithinObject = WithinPackage == "/Script/CoreUObject" && WithinClass == "Object";
     const FIndex ObjectClass = bWithinObject ? EngineClass("/Script/CoreUObject", "Object") : Null();
     const FIndex FunctionClass = EngineClass("/Script/CoreUObject", "Function");
     const FIndex EnginePkg = PackageImport("/Script/Engine");
     const FIndex CorePkg = PackageImport("/Script/CoreUObject");
-    const FIndex BpgcCdo = Imp(P.AddImport({ "/Script/Engine", "BlueprintGeneratedClass",
-                                             EnginePkg, "Default__BlueprintGeneratedClass" }));
+    const FIndex BpgcCdo = bWidgetClass ? Imp(P.AddImport({ "/Script/UMG", "WidgetBlueprintGeneratedClass", PackageImport("/Script/UMG"),
+                                                            "Default__WidgetBlueprintGeneratedClass" }))
+                                        : Imp(P.AddImport({ "/Script/Engine", "BlueprintGeneratedClass",
+                                                            EnginePkg, "Default__BlueprintGeneratedClass" }));
     const FIndex FunctionCdo = Imp(P.AddImport({ "/Script/CoreUObject", "Function",
                                                  CorePkg, "Default__Function" }));
 
@@ -367,7 +389,12 @@ void FBlueprintClass::Finish()
         TimelineRows.push_back(RowFirstTimeline + NumTimelineRows);
         NumTimelineRows += 1 + int32(T.Tracks.size());
     }
-    const int32 RowRootTemplate = RowFirstTimeline + NumTimelineRows;
+    /* Then a widget class's tree: the WidgetTree, its widgets in declaration order, their slots. */
+    const int32 RowTree = RowFirstTimeline + NumTimelineRows;
+    const int32 RowFirstWidget = RowTree + 1;
+    const int32 RowFirstWidgetSlot = RowFirstWidget + int32(Widgets.size());
+    const int32 NumTreeRows = Widgets.empty() ? 0 : 1 + int32(Widgets.size() + WidgetSlots.size());
+    const int32 RowRootTemplate = RowTree + NumTreeRows;
     const int32 RowScsNode = RowRootTemplate + 1;
     /* Each UE_COMPONENT takes two rows, archetype then node, so the SCS lands after them all. */
     const int32 RowFirstComponent = RowScsNode + 1;
@@ -430,6 +457,8 @@ void FBlueprintClass::Finish()
         Bindings.push_back(Exp(RowFirstBinding + int32(I)));
         Class.CreateBeforeSer.push_back(Bindings.back().V);
     }
+    const bool bHasTree = !Widgets.empty();
+    if (bHasTree) Class.CreateBeforeSer.push_back(Exp(RowTree).V);      // listed first, as Basic_FlatButton_C lists it
     std::vector<FIndex> Templates;              // the Timelines list, after the bindings as BP_FragilePlatform_C lists them
     for (const int32 Row : TimelineRows)
     {
@@ -457,6 +486,8 @@ void FBlueprintClass::Finish()
     const int32 NumReplicated = int32(std::count_if(Vars.begin(), Vars.end(),
                                                     [](const FPropertyDef& V) { return (V.PropertyFlags & CPF_Net) != 0; }));
     Class.Serialize = [=](FArc& Ar) {
+        /* UWidgetBlueprintGeneratedClass's own property, so before UBlueprintGeneratedClass's, as the cook orders them. */
+        if (bHasTree) Tag(Ar, "WidgetTree", "ObjectProperty", [=](FArc& V) { V.Idx(Exp(RowTree)); });
         if (NumReplicated > 0)
             Tag(Ar, "NumReplicatedProperties", "IntProperty", [=](FArc& V) { V.I32(NumReplicated); });
         /* UBlueprintGeneratedClass::GetDynamicBindingObject looks a binding object up here by its class. */
@@ -734,6 +765,101 @@ void FBlueprintClass::Finish()
                 Ar.Bool(false);
             };
             P.AddExport(std::move(Curve));
+        }
+    }
+
+    /* S39: the widget tree, as DRG's cook writes Basic_FlatButton's (DESIGN.md → S39). Every widget's outer is the tree,
+       every slot's its panel; the hierarchy is the slots' Parent and Content, the panel's Slots and the child's Slot, all
+       three written. All are RF_Transactional alone. Each export creates first the objects its tags name but its outer:
+       the tree its root, a widget its slots, a slot its content. */
+    if (bHasTree)
+    {
+        auto WidgetRow = [&](const std::string& Name) {
+            return RowFirstWidget + int32(std::find_if(Widgets.begin(), Widgets.end(),
+                                                        [&](const FWidget& W) { return W.Name == Name; }) - Widgets.begin());
+        };
+        const FIndex TreeClass = EngineClass("/Script/UMG", "WidgetTree");
+        const FIndex TreeCdo = Imp(P.AddImport({ "/Script/UMG", "WidgetTree", PackageImport("/Script/UMG"), "Default__WidgetTree" }));
+        FExport Tree;
+        Tree.ClassIndex = TreeClass;
+        Tree.TemplateIndex = TreeCdo;
+        Tree.OuterIndex = Exp(RowClass);
+        Tree.ObjectName = "WidgetTree";
+        Tree.ObjectFlags = RF_Transactional;
+        Tree.CreateBeforeSer = { Exp(RowFirstWidget).V };
+        Tree.SerBeforeCreate = { TreeClass.V, TreeCdo.V };
+        Tree.CreateBeforeCreate = { Exp(RowClass).V };
+        Tree.Serialize = [=](FArc& Ar) {
+            Tag(Ar, "RootWidget", "ObjectProperty", [=](FArc& V) { V.Idx(Exp(RowFirstWidget)); });
+            TagEnd(Ar);
+            Ar.Bool(false);
+        };
+        P.AddExport(std::move(Tree));
+
+        /* A slot is named <SlotClass>_<n>, counted per panel and class (CanvasPanelSlot_0, OverlaySlot_1). */
+        std::vector<std::string> SlotNames;
+        std::map<std::string, int32> Counts;
+        for (const FWidgetSlot& S : WidgetSlots)
+        {
+            const std::string Of = P.ImportAt(S.Class)->ObjectName;
+            SlotNames.push_back(Of + "_" + std::to_string(Counts[S.Panel + "." + Of]++));
+        }
+        for (const FWidget& W : Widgets)
+        {
+            std::vector<FIndex> Slots;
+            FIndex Own;
+            for (size_t I = 0; I < WidgetSlots.size(); ++I)
+            {
+                if (WidgetSlots[I].Panel == W.Name) Slots.push_back(Exp(RowFirstWidgetSlot + int32(I)));
+                if (WidgetSlots[I].Child == W.Name) Own = Exp(RowFirstWidgetSlot + int32(I));
+            }
+            FExport E;
+            E.ClassIndex = W.Class;
+            E.TemplateIndex = W.Cdo;
+            E.OuterIndex = Exp(RowTree);
+            E.ObjectName = W.Name;
+            E.ObjectFlags = RF_Transactional;
+            for (const FIndex& S : Slots) E.CreateBeforeSer.push_back(S.V);
+            if (Own.V != 0) E.CreateBeforeSer.push_back(Own.V);
+            for (const FPropertyDef& D : W.Defaults) TagRefs(D, E.CreateBeforeSer);
+            E.SerBeforeCreate = { W.Class.V, W.Cdo.V };
+            E.CreateBeforeCreate = { Exp(RowTree).V };
+            /* Its own class's properties first, then UPanelWidget's Slots and UWidget's Slot, the cook's order. */
+            E.Serialize = [=, Defaults = W.Defaults](FArc& Ar) {
+                for (const FPropertyDef& D : Defaults) WriteDefaultTag(Ar, D);
+                if (!Slots.empty())
+                    Tag(Ar, "Slots", "ArrayProperty", [=](FArc& V) {
+                        V.I32(int32(Slots.size()));
+                        for (const FIndex& S : Slots) V.Idx(S);
+                    }, "ObjectProperty");
+                if (Own.V != 0) Tag(Ar, "Slot", "ObjectProperty", [=](FArc& V) { V.Idx(Own); });
+                TagEnd(Ar);
+                Ar.Bool(false);
+            };
+            P.AddExport(std::move(E));
+        }
+        for (size_t I = 0; I < WidgetSlots.size(); ++I)
+        {
+            const FWidgetSlot& S = WidgetSlots[I];
+            const FIndex Panel = Exp(WidgetRow(S.Panel)), Content = Exp(WidgetRow(S.Child));
+            FExport E;
+            E.ClassIndex = S.Class;
+            E.TemplateIndex = S.Cdo;
+            E.OuterIndex = Panel;
+            E.ObjectName = SlotNames[I];
+            E.ObjectFlags = RF_Transactional;
+            E.CreateBeforeSer = { Content.V };
+            for (const FPropertyDef& D : S.Defaults) TagRefs(D, E.CreateBeforeSer);
+            E.SerBeforeCreate = { S.Class.V, S.Cdo.V };
+            E.CreateBeforeCreate = { Panel.V };
+            E.Serialize = [=, Defaults = S.Defaults](FArc& Ar) {
+                for (const FPropertyDef& D : Defaults) WriteDefaultTag(Ar, D);
+                Tag(Ar, "Parent", "ObjectProperty", [=](FArc& V) { V.Idx(Panel); });
+                Tag(Ar, "Content", "ObjectProperty", [=](FArc& V) { V.Idx(Content); });
+                TagEnd(Ar);
+                Ar.Bool(false);
+            };
+            P.AddExport(std::move(E));
         }
     }
 

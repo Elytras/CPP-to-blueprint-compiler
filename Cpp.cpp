@@ -310,6 +310,15 @@ bool AttachmentCall(const Json& S, const Json*& Callee, const Json*& Child, cons
     return Child != nullptr;
 }
 
+/* S39: a statement of a widget class's layout by its shape alone, `Root->AddChildToCanvas(Title)->SetPosition(...);`,
+   `Title->SetText(...);` or `UCanvasPanelSlot* At = Root->AddChildToCanvas(Title);`: a method call or a local. Generate
+   reads what it means and refuses what it cannot. */
+bool WidgetLayoutStatement(const Json& S)
+{
+    const Json* N = Strip(&S);
+    return N && (Kind(*N) == "CXXMemberCallExpr" || Kind(*N) == "DeclStmt");
+}
+
 /* A set's or map's elements as the braces leave them in C++: each key once, where it first appears, holding the last
    element given for it, as the initializer-list constructors Add each element in order and Add replaces the whole
    element, a map's value and the key's own spelling (Map.h 1166-1173; TSet::Emplace, Set.h 625). Keys compare as the
@@ -896,6 +905,7 @@ struct FRecord
     std::string Tail;                               // genueapi's UeClassTail: "<ScriptInherit flags> <ClassWithin> <ConfigName>"
     std::map<std::string, std::string> Replicated;  // UE_REPLICATED*: variable -> "Notify:Condition"
     std::set<std::string> Components;               // UE_COMPONENT: variables that are also SCS nodes
+    std::vector<std::string> Widgets;               // UE_WIDGET, in declaration order: variables that are also widgets of the tree, the first its root
     /* genueapi's `<X>__UeName`: the engine's name of a member or function Dumper-7 had to respell (`Name_0` is
        `Name`, `Audio_Flying` is `Audio Flying`). C++ keeps its spelling; everything cooked goes through UeNameOf. */
     std::map<std::string, std::string> UeNames;
@@ -1674,6 +1684,13 @@ private:
     bool AddTimelines(const FRecord& R, bool bIsActor, FBlueprintClass& BP, std::string* Err) const;
     bool CheckMemberNames(const FRecord& R, std::string* Err) const;
     bool IsSceneRecord(const FRecord* C) const;
+    /* S39: R or a mod class above it declares a UE_WIDGET, so R is a WidgetBlueprintGeneratedClass. */
+    bool HasWidgetTree(const FRecord& R) const
+    {
+        for (const FRecord* A = &R; A && !A->IsNative(); A = A->Base.empty() ? nullptr : Find(A->Base))
+            if (!A->Widgets.empty()) return true;
+        return false;
+    }
     bool RootInheritedBy(const FRecord& R) const;
     bool ListsDefaultRootOf(const FRecord& R) const;
     bool ExpandInline(const Json& CallNode, const Json& Def, const std::string& Method, bool bMethod, FBlueprintClass& BP,
@@ -3002,6 +3019,10 @@ bool FCompiler::Collect(std::string* Err)
                 FindLiteral(C, Spec);
                 R.Tracks.emplace_back(Name(C).substr(0, Name(C).size() - 9), Spec);
             }
+            else if (Kind(C) == "VarDecl" && Name(C).size() > 10 && Name(C).compare(Name(C).size() - 10, 10, "__UeWidget") == 0)
+            {
+                R.Widgets.push_back(Name(C).substr(0, Name(C).size() - 10));
+            }
             else if (Kind(C) == "CXXMethodDecl" && Name(C) == "UeDefaults__")
             {
                 /* Not a UFunction: AssetGen reads its assignments as defaults, never lowers them. */
@@ -3369,7 +3390,8 @@ bool FCompiler::LowerCtor(FRecord& R, std::string* Err)
         const Json *Lhs = nullptr, *Rhs = nullptr, *Through = nullptr;
         const Json *Callee = nullptr, *Child = nullptr, *Parent = nullptr, *Socket = nullptr;
         const bool bAssign = DefaultAssignment(S, Lhs, Rhs, Through);
-        if (!bAssign && !AttachmentCall(S, Callee, Child, Parent, Socket) && !R.bIsPatch)     // a patch's may set part of one
+        if (!bAssign && !AttachmentCall(S, Callee, Child, Parent, Socket) && !R.bIsPatch     // a patch's may set part of one
+            && !(!R.Widgets.empty() && WidgetLayoutStatement(S)))
         {
             *Err = Where + ": a constructor never runs in the game, so its statements are read as the class's defaults: each "
                    "is `Field = value;`, `Component->Field = value;` or `Component->SetupAttachment(Parent);`, on this "
@@ -16075,10 +16097,14 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     const bool bIsWidget = !R.bIsPatch && std::find(Ancestry.begin(), Ancestry.end(), "UserWidget") != Ancestry.end();
     /* A widget shows its tree's root (UUserWidget::RebuildWidget, UserWidget.cpp 745), and a tree is made only for a
        WidgetBlueprintGeneratedClass, from its designer layout or the nearest parent's (Initialize, 125-143). AssetGen
-       cooks a BlueprintGeneratedClass, so a mod widget's tree starts empty, under a game widget Blueprint too. It shows
+       cooks one for a class with UE_WIDGETs or below one (S39), and a BlueprintGeneratedClass otherwise, whose tree
+       starts empty, under a game widget Blueprint too. It shows
        something only if the class or a mod class above it sets the root itself, or the class paints: OnPaint runs only
        for a class with an OnPaint of its own (NativePaint, 1600-1611; kWidgetEvents). */
-    if (bIsWidget)
+    if (!R.Widgets.empty() && !bIsWidget)
+    { *Err = R.CppName + "::" + R.Widgets.front() + ": a UE_WIDGET is a widget of a UUserWidget's tree; this class is none"; return false; }
+    BP.SetWidgetClass(bIsWidget && HasWidgetTree(R));
+    if (bIsWidget && !HasWidgetTree(R))
     {
         bool bDraws = OwnEvent(R, "OnPaint");
         std::function<void(const Json&)> Scan = [&](const Json& N) {
@@ -16091,9 +16117,9 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             for (const auto& [Name, Def] : A->MethodDefs) Scan(*Def);
         }
         if (!bDraws)
-            printf("  warning: %s: a widget class AssetGen cooks has no widget tree, so it shows nothing of its own, not "
-                   "even a widget Blueprint parent's layout: set WidgetTree->RootWidget in OnInitialized or draw in "
-                   "OnPaint, or create one of the game's widget Blueprints instead\n", R.CppName.c_str());
+            printf("  warning: %s: a widget class AssetGen cooks has no widget tree unless it declares one with UE_WIDGET, "
+                   "so it shows nothing of its own, not even a widget Blueprint parent's layout: declare its widgets, set "
+                   "WidgetTree->RootWidget in OnInitialized or draw in OnPaint\n", R.CppName.c_str());
     }
     /* Abstract: the nearest declaration of some method along the class chain is `= 0`. SpawnActor and CreateWidget
        refuse the class, as they do one the editor marks Generate Abstract Class. An interface's `= 0` does not count,
@@ -16193,6 +16219,36 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     std::vector<FPropertyDef> InheritedDefaults;
     std::map<std::string, FPropertyDef> InterfaceVarDefaults;     // a default for a variable an implemented interface declares
     std::map<std::string, FBlueprintClass::FAttachment> Attachments;    // a UE_COMPONENT -> where SetupAttachment puts it
+    /* S39: a UE_WIDGET's defaults, and the slots the layout's AddChild calls make, in the order written. A canvas slot's
+       setters each set part of its LayoutData, kept per member path ("Offsets.Left", "Anchors.Minimum.X") until the tag
+       is made after the walk. */
+    std::map<std::string, std::vector<FPropertyDef>> WidgetDefaults;
+    struct FLayoutSlot
+    {
+        std::string Panel, Child;
+        const FRecord* Class = nullptr;
+        std::vector<FPropertyDef> Defaults;
+        std::map<std::string, double> Layout;
+    };
+    std::vector<FLayoutSlot> LayoutSlots;
+    auto IsWidgetOf = [](const FRecord& Of, const std::string& N) {
+        return std::find(Of.Widgets.begin(), Of.Widgets.end(), N) != Of.Widgets.end();
+    };
+    auto Derives = [&](const FRecord* C, const char* UeName) {
+        for (; C; C = C->Base.empty() ? nullptr : Find(C->Base))
+            if (C->UeName == UeName) return true;
+        return false;
+    };
+    /* The class a pointer type names: `class UCanvasPanelSlot *` -> UCanvasPanelSlot. */
+    auto PointeeOf = [&](const std::string& Type) -> const FRecord* {
+        const size_t Star = Type.find('*');
+        return Star == std::string::npos ? nullptr : Find(StripTypeKeywords(Type.substr(0, Star)));
+    };
+    auto WidgetClassOf = [&](const std::string& Widget) -> const FRecord* {
+        for (const Json* F : R.Fields)
+            if (Name(*F) == Widget) return PointeeOf(TypeOf(*F));
+        return nullptr;
+    };
     if (R.Defaults && !R.bIsPatch)      // a patch's defaults are tags of the game's own package (GeneratePatch)
     {
         /* A statement LowerCtor brought from the constructor is named as the constructor's. */
@@ -16272,6 +16328,185 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             Attachments[Comp] = A;
             return true;
         };
+
+        /* S39: a widget class's layout, read and never called, as SetupAttachment is. A UE_WIDGET named as this class's
+           member, `Title`, or "" for anything else. */
+        auto WidgetNamed = [&](const Json* E) -> std::string {
+            E = Strip(E);
+            if (!E || Kind(*E) != "MemberExpr" || OwnerOf(*E) != R.CppName || !IsWidgetOf(R, Name(*E))) return {};
+            const Json* Self = Strip(First(*E));
+            return Self && Kind(*Self) == "CXXThisExpr" ? Name(*E) : std::string();
+        };
+        /* `Panel->AddChild...(Child)` or `Panel->SetContent(Child)`: the slot it makes, as an index into LayoutSlots; -2
+           for a call of any other method, -1 with Err set for one this refuses. The slot's class is the one the call
+           returns, as UE's typed adders say it (AddChildToCanvas: UCanvasPanelSlot); the untyped AddChild and SetContent
+           return a UPanelSlot, so there it is the panel's own, `<Panel>Slot` up its class chain, as each panel's
+           GetSlotClass makes it (Button: ButtonSlot). */
+        std::function<int32(const Json*)> AddCall = [&](const Json* Call) -> int32 {
+            Call = Strip(Call);
+            /* `Cast<UButtonSlot>(Play->SetContent(Label))`, the untyped call's slot as its class: that class must be it. */
+            if (const Json* Fn = Call && Kind(*Call) == "CallExpr" ? Strip(First(*Call)) : nullptr;
+                Fn && Kind(*Fn) == "DeclRefExpr" && Fn->value("referencedDecl", Json::object()).value("name", std::string()) == "Cast")
+            {
+                const int32 At = Nth(*Call, 1) ? AddCall(Nth(*Call, 1)) : -2;
+                const FRecord* To = PointeeOf(TypeOf(*Call));
+                if (At >= 0 && !(To && Derives(LayoutSlots[At].Class, To->UeName.c_str())))
+                {
+                    *Err = Where + ": " + LayoutSlots[At].Panel + "'s slot is a " + LayoutSlots[At].Class->CppName + ", so this Cast is null";
+                    return -1;
+                }
+                return At;
+            }
+            const Json* Callee = Call && Kind(*Call) == "CXXMemberCallExpr" ? Strip(First(*Call)) : nullptr;
+            const std::string Fn = Callee && Kind(*Callee) == "MemberExpr" ? Name(*Callee) : std::string();
+            if (Fn.compare(0, 8, "AddChild") != 0 && Fn != "SetContent") return -2;
+            const std::string Panel = WidgetNamed(First(*Callee)), Child = WidgetNamed(Nth(*Call, 1));
+            auto Refuse = [&](const std::string& Why) { *Err = Where + ": " + Why; return -1; };
+            if (Panel.empty() || Child.empty())
+                return Refuse(Fn + " adds one of this class's UE_WIDGETs to another, each by its member name: "
+                              "`Root->AddChildToCanvas(Title)`");
+            for (size_t I = 2; Nth(*Call, I); ++I)
+                if (Kind(*Nth(*Call, I)) != "CXXDefaultArgExpr")
+                    return Refuse(Panel + "->" + Fn + ": the slot's other values are its setters', `->SetPadding(...)`; "
+                                  "add the widget with its one argument");
+            if (Child == R.Widgets.front())
+                return Refuse(Child + " is the tree's root, the first UE_WIDGET, which no panel holds");
+            if (Child == Panel) return Refuse(Child + " is added to itself");
+            for (const FLayoutSlot& S : LayoutSlots)
+                if (S.Child == Child) return Refuse(Child + " is added to " + S.Panel + " already; a widget has one parent");
+            const FRecord* PanelClass = WidgetClassOf(Panel);
+            if (!Derives(PanelClass, "PanelWidget")) return Refuse(Panel + " is no panel, so it holds no widget");
+            if (Derives(PanelClass, "ContentWidget"))
+                for (const FLayoutSlot& S : LayoutSlots)
+                    if (S.Panel == Panel)
+                        return Refuse(Panel + " holds one widget, " + S.Child + "; put both in a panel that holds more");
+            const FRecord* SlotClass = PointeeOf(TypeOf(*Call));
+            if (SlotClass && SlotClass->UeName == "PanelSlot")
+            {
+                SlotClass = nullptr;
+                static const std::map<std::string, std::string> Unlike = { { "GridPanel", "GridSlot" },
+                                                                           { "UniformGridPanel", "UniformGridSlot" } };
+                for (const FRecord* A = PanelClass; A && !SlotClass; A = A->Base.empty() ? nullptr : Find(A->Base))
+                {
+                    const auto U = Unlike.find(A->UeName);
+                    SlotClass = Find("U" + (U != Unlike.end() ? U->second : A->UeName + "Slot"));
+                }
+            }
+            if (!SlotClass || !Derives(SlotClass, "PanelSlot"))
+                return Refuse("cannot tell the slot class of " + Panel + "; add the widget with the panel's own "
+                              "AddChildTo... call, which returns it");
+            LayoutSlots.push_back(FLayoutSlot{ Panel, Child, SlotClass, {}, {} });
+            return int32(LayoutSlots.size() - 1);
+        };
+        /* `X->SetFoo(Value)` on a widget or a slot, read as the property it sets: `Foo` or `bFoo` of the setter's
+           argument type on X's class. A canvas slot's position, size, offsets, anchors and alignment are parts of its
+           LayoutData instead (CanvasPanelSlot.cpp's setters). */
+        auto MemberF = [](const FPropertyDef& S, const std::string& Path) {
+            std::function<double(const FPropertyDef&, const std::string&)> Walk = [&](const FPropertyDef& Of, const std::string& P) {
+                const size_t Dot = P.find('.');
+                const auto& Ms = Of.Default.Members ? Of.Default.Members : Of.Members;
+                if (Ms)
+                    for (const FPropertyDef& M : *Ms)
+                        if (M.Name == P.substr(0, Dot))
+                            return Dot != std::string::npos ? Walk(M, P.substr(Dot + 1))
+                                 : M.Default.K == FDefaultValue::Int ? double(M.Default.I) : M.Default.F;
+                return 0.0;
+            };
+            return Walk(S, Path);
+        };
+        auto Setter = [&](const FRecord* Class, const std::string& Of, const Json& Call, std::vector<FPropertyDef>& Into,
+                          std::map<std::string, double>* Layout) {
+            const Json* Callee = Strip(First(Call));
+            const std::string Fn = Name(*Callee);
+            const Json* Arg = Nth(Call, 1);
+            if (Fn.compare(0, 3, "Set") != 0 || !Arg || Nth(Call, 2))
+            { *Err = Where + ": " + Of + "->" + Fn + ": a layout statement adds a widget or calls a one-argument setter"; return false; }
+            auto Lower = [&](const std::string& Type, const std::string& TagName, FPropertyDef& PD) {
+                if (!TypeToProperty(Type, TagName, 0, Where, BP, &PD, Err) || !LowerDefault(*Arg, PD, BP, Err, Arg, /*bKeepZero=*/true))
+                    return false;
+                if (PD.Default.K == FDefaultValue::None) { *Err = Where + ": " + Of + "->" + Fn + " needs a literal value"; return false; }
+                return true;
+            };
+            static const std::map<std::string, std::pair<const char*, std::vector<std::pair<std::string, std::string>>>> Canvas = {
+                { "SetPosition", { "FVector2D", { { "Offsets.Left", "X" }, { "Offsets.Top", "Y" } } } },
+                { "SetSize", { "FVector2D", { { "Offsets.Right", "X" }, { "Offsets.Bottom", "Y" } } } },
+                { "SetOffsets", { "FMargin", { { "Offsets.Left", "Left" }, { "Offsets.Top", "Top" }, { "Offsets.Right", "Right" },
+                                              { "Offsets.Bottom", "Bottom" } } } },
+                { "SetMinimum", { "FVector2D", { { "Anchors.Minimum.X", "X" }, { "Anchors.Minimum.Y", "Y" } } } },
+                { "SetMaximum", { "FVector2D", { { "Anchors.Maximum.X", "X" }, { "Anchors.Maximum.Y", "Y" } } } },
+                { "SetAnchors", { "FAnchors", { { "Anchors.Minimum.X", "Minimum.X" }, { "Anchors.Minimum.Y", "Minimum.Y" },
+                                               { "Anchors.Maximum.X", "Maximum.X" }, { "Anchors.Maximum.Y", "Maximum.Y" } } } },
+                { "SetAlignment", { "FVector2D", { { "Alignment.X", "X" }, { "Alignment.Y", "Y" } } } },
+                { "SetLayout", { "FAnchorData", { { "Offsets.Left", "Offsets.Left" }, { "Offsets.Top", "Offsets.Top" },
+                    { "Offsets.Right", "Offsets.Right" }, { "Offsets.Bottom", "Offsets.Bottom" },
+                    { "Anchors.Minimum.X", "Anchors.Minimum.X" }, { "Anchors.Minimum.Y", "Anchors.Minimum.Y" },
+                    { "Anchors.Maximum.X", "Anchors.Maximum.X" }, { "Anchors.Maximum.Y", "Anchors.Maximum.Y" },
+                    { "Alignment.X", "Alignment.X" }, { "Alignment.Y", "Alignment.Y" } } } } };
+            if (const auto C = Canvas.find(Fn); Layout && C != Canvas.end() && Derives(Class, "CanvasPanelSlot"))
+            {
+                FPropertyDef PD;
+                if (!Lower(C->second.first, "Value", PD)) return false;
+                for (const auto& [To, From] : C->second.second) (*Layout)[To] = MemberF(PD, From);
+                return true;
+            }
+            auto Bare = [&](std::string T) {
+                T = StripTypeKeywords(T);
+                if (!T.empty() && T.back() == '&') T.pop_back();
+                T.erase(std::remove(T.begin(), T.end(), ' '), T.end());
+                return T;
+            };
+            const std::string Prop = Fn.substr(3);
+            for (const FRecord* A = Class; A; A = A->Base.empty() ? nullptr : Find(A->Base))
+                for (const Json* F : A->Fields)
+                    if ((Name(*F) == Prop || Name(*F) == "b" + Prop) && Bare(TypeOf(*F)) == Bare(TypeOf(*Arg)))
+                    {
+                        FPropertyDef PD;
+                        if (!Lower(TypeOf(*F), UeNameOf(A, Name(*F)), PD)) return false;
+                        Into.push_back(PD);
+                        return true;
+                    }
+            *Err = Where + ": " + Of + "->" + Fn + ": AssetGen reads a setter as the property it sets, and "
+                 + (Class ? Class->CppName : std::string("its class")) + " has no " + Prop + " of its argument's type"
+                 + (Layout ? "" : "; assign the member, `" + Of + "->Field = value;`");
+            return false;
+        };
+        std::map<std::string, size_t> SlotLocals;      // `UCanvasPanelSlot* At = Root->AddChildToCanvas(Title);`: At's decl id -> its slot
+        auto Layout = [&](const Json& S) {
+            const Json* N = Strip(&S);
+            if (Kind(*N) == "DeclStmt")
+            {
+                const Json* Var = First(*N);
+                const int32 At = Var && Kind(*Var) == "VarDecl" && !Nth(*N, 1) ? AddCall(First(*Var)) : -2;
+                if (At == -2) *Err = Where + ": a local of a widget class's layout holds the slot an AddChild call returns, "
+                                     "`UCanvasPanelSlot* At = Root->AddChildToCanvas(Title);`";
+                if (At < 0) return false;
+                SlotLocals[Var->value("id", std::string())] = size_t(At);
+                return true;
+            }
+            const int32 Added = AddCall(N);
+            if (Added != -2) return Added >= 0;
+            const Json* Obj = Strip(First(*Strip(First(*N))));
+            if (Obj && (Kind(*Obj) == "CXXMemberCallExpr" || Kind(*Obj) == "CallExpr"))
+            {
+                const int32 At = AddCall(Obj);
+                if (At == -2) *Err = Where + ": a setter in a widget's layout is called on a UE_WIDGET or on the slot an "
+                                     "AddChild call returns";
+                return At >= 0 && Setter(LayoutSlots[At].Class, LayoutSlots[At].Child + "'s slot", *N,
+                                         LayoutSlots[At].Defaults, &LayoutSlots[At].Layout);
+            }
+            if (Obj && Kind(*Obj) == "DeclRefExpr")
+                if (const auto L = SlotLocals.find(Obj->value("referencedDecl", Json::object()).value("id", std::string()));
+                    L != SlotLocals.end())
+                {
+                    FLayoutSlot& At = LayoutSlots[L->second];
+                    return Setter(At.Class, At.Child + "'s slot", *N, At.Defaults, &At.Layout);
+                }
+            if (const std::string W = WidgetNamed(Obj); !W.empty())
+                return Setter(WidgetClassOf(W), W, *N, WidgetDefaults[W], nullptr);
+            *Err = Where + ": a widget class's layout adds UE_WIDGETs to panels and calls setters on them and on their "
+                   "slots; this call is neither";
+            return false;
+        };
         const Json* Body = nullptr;
         ForEach(*R.Defaults, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Body = &C; });
         bool bOk = true;
@@ -16279,6 +16514,11 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             ForEach(*Body, [&](const Json& S) {
                 if (!bOk) return;
                 Where = S.value("ueWhere", Block);
+                if (!R.Widgets.empty() && WidgetLayoutStatement(S))
+                {
+                    bOk = Layout(S);
+                    return;
+                }
                 const Json *Callee = nullptr, *Child = nullptr, *Parent = nullptr, *Socket = nullptr;
                 if (AttachmentCall(S, Callee, Child, Parent, Socket))
                 {
@@ -16305,7 +16545,11 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 const FRecord* DR = Declarer.empty() ? nullptr : Find(Declarer);
                 if (!DR)
                 { *Err = Where + ": cannot tell which class declares " + Name(*Lhs); bOk = false; return; }
-                if (bThroughComponent && !DR->Components.count(CompName) && !DR->IsNative())
+                /* A UE_WIDGET's member: a tag of its export in the tree. One of a tree above is that class's. */
+                const bool bWidget = bThroughComponent && !DR->IsNative() && IsWidgetOf(*DR, CompName);
+                if (bWidget && DR != &R)
+                { *Err = Where + ": " + CompName + " is a widget of " + DR->CppName + "'s tree; set it there"; bOk = false; return; }
+                if (bThroughComponent && !DR->Components.count(CompName) && !DR->IsNative() && !bWidget)
                 { *Err = Where + ": " + CompName + " is not a UE_COMPONENT"; bOk = false; return; }
                 if (!bThroughComponent && DR == &R)
                 { *Err = Where + ": " + Name(*Lhs) + " is declared here - give it an initializer instead"; bOk = false; return; }
@@ -16372,7 +16616,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                     InheritedDefaults.push_back(PD);
                     return;
                 }
-                if (DR == &R) { ComponentDefaults[CompName].push_back(PD); return; }
+                if (DR == &R) { (bWidget ? WidgetDefaults : ComponentDefaults)[CompName].push_back(PD); return; }
                 /* A native parent's component is a default subobject, not an SCS node: it is
                    overridden by an export under this class's CDO, with no handler involved. */
                 /* A game Blueprint's component is an SCS node too, and overriding it takes the node's guid, which only
@@ -16636,6 +16880,23 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             if (auto At = Attachments.find(FieldName); At != Attachments.end()) BP.AttachComponent(FieldName, At->second);
             ComponentDefaults.erase(FieldName);
         }
+        /* A UE_WIDGET: an export of the tree, archetyped on its class's default object like the cook's. The variable stays
+           an ordinary ObjectProperty, which InitializeWidgetStatic sets by name to the widget it instanced. */
+        if (&Decl == &R && IsWidgetOf(R, FieldName))
+        {
+            const FRecord* CR = WidgetClassOf(FieldName);
+            if (!Derives(CR, "Widget"))
+            { *Err = R.CppName + "::" + FieldName + ": a UE_WIDGET names a UWidget class"; return false; }
+            std::set<std::string> NearestOfWidget;
+            for (const FRecord* A = CR; A && !A->IsNative(); A = A->Base.empty() ? nullptr : Find(A->Base))
+                for (const auto& [Method, MDecl] : A->Methods)
+                    if (NearestOfWidget.insert(Method).second && MDecl->value("pure", false))
+                    { *Err = R.CppName + "::" + FieldName + ": " + CR->CppName + " is abstract (" + A->CppName + "::" + Method
+                             + " is = 0), and an abstract class is never instanced"; return false; }
+            const FIndex WClass = BP.EngineClass(PackageOf(*CR), ClassOf(*CR));
+            const FIndex WCdo = BP.ClassDefaultObject(PackageOf(*CR), ClassOf(*CR));
+            BP.AddWidget(FieldName, WClass, WCdo, WidgetDefaults[FieldName]);
+        }
         if (auto Rep = Decl.Replicated.find(FieldName); Rep != Decl.Replicated.end())
         {
             /* Measured on BP_LiftPod.IsLaunchEnabled: the editor's flags plus CPF_Net, and CPF_RepNotify with the
@@ -16720,6 +16981,66 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     }
     std::stable_sort(ClassVars.begin(), ClassVars.end(), [](const auto& A, const auto& B) { return A.first > B.first; });
     for (const auto& V : ClassVars) BP.AddVariable(V.second);
+
+    /* S39: each widget but the root sits in a panel, and that panel in the tree. One no panel holds, or a ring of panels
+       holding one another, is out of the tree the engine walks from its root (UWidgetTree::ForEachWidget). */
+    for (const std::string& W : R.Widgets)
+    {
+        std::string At = W;
+        for (size_t Steps = 0; At != R.Widgets.front(); ++Steps)
+        {
+            const auto S = std::find_if(LayoutSlots.begin(), LayoutSlots.end(), [&](const FLayoutSlot& L) { return L.Child == At; });
+            if (S == LayoutSlots.end())
+            { *Err = R.CppName + "::" + W + ": " + (At == W ? std::string("no panel holds it") : "it sits in " + At + ", which no panel holds")
+                     + ", so it is out of the tree, whose root is " + R.Widgets.front() + "; add it to a panel in the constructor, "
+                     "`Root->AddChildToCanvas(" + At + ")`"; return false; }
+            if (Steps == R.Widgets.size())
+            { *Err = R.CppName + "::" + W + ": its panels hold one another in a ring, which the tree's root never reaches"; return false; }
+            At = S->Panel;
+        }
+    }
+    /* A canvas slot's LayoutData, of the parts its setters set: tags of an FAnchorData (Offsets, Anchors and Alignment,
+       the first two tagged structs and the last a raw Vector2D), a part left unset keeping the slot's default value. */
+    for (FLayoutSlot& S : LayoutSlots)
+    {
+        if (!S.Layout.empty())
+        {
+            auto Float = [](const std::string& N, double V) {
+                FPropertyDef P;
+                P.Type = "FloatProperty";
+                P.Name = N;
+                P.Default.K = FDefaultValue::Float;
+                P.Default.F = V;
+                return P;
+            };
+            auto Struct = [](const std::string& N, const std::string& Of, std::vector<FPropertyDef> Members) {
+                FPropertyDef P;
+                P.Type = "StructProperty";
+                P.Name = N;
+                P.StructName = Of;
+                P.Default.K = FDefaultValue::Struct;
+                P.Members = std::make_shared<std::vector<FPropertyDef>>(std::move(Members));
+                return P;
+            };
+            auto Pair = [&](const std::string& N, const std::string& Path) -> std::optional<FPropertyDef> {
+                const auto X = S.Layout.find(Path + ".X"), Y = S.Layout.find(Path + ".Y");
+                if (X == S.Layout.end() || Y == S.Layout.end()) return std::nullopt;     // the setters set both
+                return Struct(N, "Vector2D", { Float("X", X->second), Float("Y", Y->second) });
+            };
+            std::vector<FPropertyDef> Data, Offsets, Anchors;
+            for (const char* Side : { "Left", "Top", "Right", "Bottom" })
+                if (const auto V = S.Layout.find(std::string("Offsets.") + Side); V != S.Layout.end()) Offsets.push_back(Float(Side, V->second));
+            for (const char* End : { "Minimum", "Maximum" })
+                if (auto V = Pair(End, std::string("Anchors.") + End)) Anchors.push_back(*V);
+            if (!Offsets.empty()) Data.push_back(Struct("Offsets", "Margin", Offsets));
+            if (!Anchors.empty()) Data.push_back(Struct("Anchors", "Anchors", Anchors));
+            if (auto V = Pair("Alignment", "Alignment")) Data.push_back(*V);
+            S.Defaults.insert(S.Defaults.begin(), Struct("LayoutData", "AnchorData", Data));
+        }
+        const FIndex SClass = BP.EngineClass(PackageOf(*S.Class), ClassOf(*S.Class));
+        const FIndex SCdo = BP.ClassDefaultObject(PackageOf(*S.Class), ClassOf(*S.Class));
+        BP.AddWidgetSlot(S.Panel, S.Child, SClass, SCdo, S.Defaults);
+    }
 
     if (!ComponentDefaults.empty())
     { *Err = R.CppName + "::UE_DEFAULTS: " + ComponentDefaults.begin()->first + " is not declared with UE_COMPONENT"; return false; }
@@ -17567,7 +17888,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         printf("  %-14s -> no API asset: %s\n", R.CppName.c_str(), Err->c_str());
         Err->clear();
     }
-    RegistryRows.push_back({ PackageName, ClassOf(R), "BlueprintGeneratedClass" });
+    RegistryRows.push_back({ PackageName, ClassOf(R), HasWidgetTree(R) ? "WidgetBlueprintGeneratedClass" : "BlueprintGeneratedClass" });
     printf("  %-14s -> %s.uasset  (%s %s)\n", R.CppName.c_str(), Shown(PackageName).c_str(),
            B->IsNative() ? "extends" : "extends BP", R.Base.c_str());
     return true;
@@ -18505,6 +18826,10 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
                 break;
             }
     }
+    /* A mod's widget class with a tree is one too (S39), and so is every class below it. */
+    for (const auto& Entry : Records)
+        if (!Entry.second.IsNative() && !Entry.second.bIsStruct && HasWidgetTree(Entry.second))
+            GameClassKinds[PackageOf(Entry.second) + "." + ClassOf(Entry.second)] = { "/Script/UMG", "WidgetBlueprintGeneratedClass" };
 
     int32 Generated = 0;
     /* Remove every generated asset. */

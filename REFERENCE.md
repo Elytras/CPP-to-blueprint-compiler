@@ -15,7 +15,7 @@ and a compiler message in [Diagnostics](#diagnostics).
 | Types | [Types](#types), [Literals and conversions](#literals-and-conversions), [Strings and text](#strings-and-text), [Constants](#constants), [Enums](#enums), [Structs](#structs), [Containers](#containers) |
 | Code | [Operators](#operators), [Statements and control flow](#statements-and-control-flow), [Loops](#loops), [Locals](#locals), [The optimizer](#the-optimizer) |
 | Functions | [Functions](#functions), [Calling engine and game functions](#calling-engine-and-game-functions), [Overrides and parent calls](#overrides-and-parent-calls), [Inline functions and templates](#inline-functions-and-templates) |
-| Objects | [Components](#components), [Class defaults](#class-defaults), [Creating objects](#creating-objects), [Working with other objects](#working-with-other-objects), [Data assets](#data-assets), [Game assets](#game-assets), [Editing game packages](#editing-game-packages) |
+| Objects | [Components](#components), [Widget layouts](#widget-layouts), [Class defaults](#class-defaults), [Creating objects](#creating-objects), [Working with other objects](#working-with-other-objects), [Data assets](#data-assets), [Game assets](#game-assets), [Editing game packages](#editing-game-packages) |
 | Events and waiting | [Event dispatchers](#event-dispatchers), [Latent calls](#latent-calls), [Waiting on events](#waiting-on-events), [Timers and input](#timers-and-input), [Timelines](#timelines), [Interfaces](#interfaces) |
 | Network | [Replication](#replication), [RPCs](#rpcs) |
 | Low level | [Pointers and memory](#pointers-and-memory), [Intrinsics](#intrinsics) |
@@ -282,7 +282,7 @@ Notes:
 | `void ReceiveTick(float DeltaSeconds)` in a component class | Turns the component's ticking on: it sets `PrimaryComponentTick.bCanEverTick` on the class default object, as the editor's compiler does. UActorComponent leaves it off. | Yes |
 | `: public UUserWidget` | A widget with logic and no layout. `CreateWidget<T>` makes one. Its events, such as `Construct`, are overrides. | Yes |
 | `void Tick(FGeometry MyGeometry, float InDeltaTime)` or `void OnPaint(FPaintContext &Context) const` in a widget class | Turns that event on for the class. The engine calls a widget's `Tick` and `OnPaint` only while `bHasScriptImplementedTick` and `bHasScriptImplementedPaint` are set on its class default object, and AssetGen sets each where the class overrides the event itself, as the editor's widget compiler does. A parent's override does not count: in a subclass without one of its own the event never runs, the parent's version included. AssetGen warns, "the Tick it inherits from ... never runs": override it in the subclass and call the parent's. | Yes |
-| a designer layout (a widget tree) for a mod widget | Not yet. The engine makes a widget's tree only for a widget Blueprint's own class, from its layout or its nearest parent's, and AssetGen cooks a plain Blueprint class. So a mod widget's tree starts empty, under a game widget Blueprint parent too, and it shows nothing of its own: AssetGen warns, "has no widget tree", unless the class or a mod class above it sets `WidgetTree->RootWidget` (in `OnInitialized`, before the widget is first shown), or the class itself overrides `OnPaint`. For a designed layout, create one of the game's widget Blueprints. | Warns |
+| a designer layout (a widget tree) for a mod widget | Declared with `UE_WIDGET` and laid out in the constructor: see [Widget layouts](#widget-layouts). A widget class with none starts with an empty tree, under a game widget Blueprint parent too, and shows nothing of its own: AssetGen warns, "has no widget tree", unless the class or a mod class above it sets `WidgetTree->RootWidget` (in `OnInitialized`, before the widget is first shown), or the class itself overrides `OnPaint`. | Yes |
 
 ```cpp
 class Turret : public AActor { public: int32 Shots = 0; };
@@ -2820,6 +2820,62 @@ Notes:
   function), where the finish may be.
 - The usage comment at the top of `Objects.h` writes `GetRootComponent()`, which the SDK does not declare. Write
   `K2_GetRootComponent()`.
+
+## Widget layouts
+
+A widget class's designer layout, its widget tree, is declared in the class with `UE_WIDGET` and laid out in its
+constructor, as a UMG widget's C++ `RebuildWidget` would: the widgets are added to panels, and each setter is read as
+the property it sets. The constructor never runs; AssetGen cooks what it says as the widget Blueprint the editor's
+designer would save. The rule to remember: the first `UE_WIDGET` is the tree's root, and every other one sits in a
+panel.
+
+| You write | What it does | Status |
+|---|---|---|
+| `UE_WIDGET(UCanvasPanel, Root);` in a `UUserWidget` class | Adds a widget to the class's tree, as dropping one in the designer does, and makes `Root` a variable of the class (the designer's Is Variable). When a widget of the class is made, `Root` holds its own copy. The first `UE_WIDGET` is the tree's root. The class is cooked as a widget Blueprint's class (WidgetBlueprintGeneratedClass). | Yes |
+| `Root->AddChildToCanvas(Title);` in the constructor | Puts Title in the canvas, as dragging it there in the designer does: a slot of the panel's slot class (`UCanvasPanelSlot`) holds it. `AddChildToVerticalBox`, `AddChildToOverlay` and the other panels' adders work the same way. | Yes |
+| `Root->AddChild(Box);`, `Play->SetContent(Label);` | The same through the untyped adders. The slot is the panel's own kind, `<Panel>Slot` (`ButtonSlot` for a button), as the panel makes it. Take it as its class with `Cast<UButtonSlot>(Play->SetContent(Label))`; a cast to another slot class is refused, since it would be null. | Yes |
+| `Root->AddChildToCanvas(Title)->SetPosition(FVector2D(20, 10));` | Sets the slot's layout: `SetPosition` and `SetSize` are the canvas slot's offsets (left and top, width and height), `SetOffsets`, `SetAnchors`, `SetMinimum`, `SetMaximum`, `SetAlignment` and `SetLayout` the rest of its LayoutData. The parts no setter gives keep the slot's default. | Yes |
+| `UCanvasPanelSlot* At = Root->AddChildToCanvas(Title);` then `At->SetSize(FVector2D(200, 40));` | Several setters on one slot, through a local. | Yes |
+| `Cast<UVerticalBoxSlot>(Box->AddChild(Hint))->SetPadding(FMargin(4, 4, 4, 4));`, `->SetHorizontalAlignment(...)` | Any other slot setter, `SetPadding`, `SetHorizontalAlignment`, `SetVerticalAlignment`, `SetSize(FSlateChildSize)`, `SetZOrder`, `SetAutoSize`: read as the property it sets, `Foo` or `bFoo` of the slot's class, of the argument's type. | Yes |
+| `Title->SetText(FText("Score"));`, `Title->Text = FText("Score");` | A widget's own defaults, set by a setter (read the same way, on the widget's class) or assigned as a member, as `UE_DEFAULTS` sets a component's. | Yes |
+| `UE_WIDGET(UWtCard, Card);`, a widget class of the mod or the game | A user widget inside this one. It is made from its own class, its own tree included. | Yes |
+| a class below a mod widget class with `UE_WIDGET`s, declaring none | Shows its parent's tree, as a widget Blueprint below another does: it is cooked as a widget Blueprint's class too, and its parent's variables hold its widgets. | Yes |
+| a `UE_WIDGET` no `AddChild` call puts in a panel, or a ring of panels holding one another | Refused: "no panel holds it". The engine walks the tree from its root, and would never reach it. | Refused |
+| a widget added twice, the root added, a second child of a content widget (`UButton`, `USizeBox`, `UBorder`) | Refused: a widget has one parent, the root none, and a content widget holds one child. | Refused |
+| `Title->SetOpacity(0.5f);`, a setter with no property of its name and type | Refused: "AssetGen reads a setter as the property it sets, and ... has no Opacity of its argument's type". Assign the member instead. | Refused |
+| an adder's other arguments, `Grid->AddChildToGrid(Cell, 1, 2)` | Refused: set them with the slot's setters. | Refused |
+| `UE_WIDGET` in a class that is not a `UUserWidget` | Refused: "a UE_WIDGET is a widget of a UUserWidget's tree". | Refused |
+| a widget's button event bound in the layout, a `UNamedSlot` filled from outside, a property binding, an animation | Not yet. Bind an event at run time, `Play->OnClicked.Add(this, &UScoreCard::OnPlay)` in `Construct`. | Not yet |
+
+```cpp
+class UScoreCard : public UUserWidget {
+public:
+  UE_WIDGET(UCanvasPanel, Root);                     // the root
+  UE_WIDGET(UTextBlock, Title);
+  UE_WIDGET(UButton, Play);
+  UE_WIDGET(UTextBlock, Label);
+
+  UScoreCard() {
+    UCanvasPanelSlot *At = Root->AddChildToCanvas(Title);
+    At->SetPosition(FVector2D(20, 10));
+    At->SetSize(FVector2D(200, 40));
+    Root->AddChildToCanvas(Play)->SetOffsets(FMargin(20, 60, 160, 48));   // left, top, width, height
+    Cast<UButtonSlot>(Play->SetContent(Label))->SetHorizontalAlignment(EHorizontalAlignment::HAlign_Center);
+    Title->SetText(FText("Score"));
+    Label->Text = FText("Play");
+  }
+};
+```
+
+Notes:
+
+- `CreateWidget<UScoreCard>(Player, UScoreCard::StaticClass())` makes one, and `AddToViewport` shows it. Each widget's
+  variable holds that widget's own copy from `Construct` on.
+- A setter is read as one property, so one that does more than set it (a text block's `SetOpacity`, which changes its
+  colour) is refused rather than half done.
+- The text is culture-invariant, as a literal in code is: it is not gathered for translation.
+- A layout can be checked without the editor: the `wrender` command of the framework DLL draws a widget class to a PNG
+  and writes each widget's box to a JSON beside it.
 
 ## Class defaults
 
@@ -5750,6 +5806,7 @@ listed here is refused with "unimplemented intrinsic".
 | `UE_VECTOR_TRACK(Timeline, Name, Keys...)` | A vector track of a UE_TIMELINE: declares `FVector Name`, which the timeline sets each frame it plays, and its curve, keys `(time, x, y, z)`. | [Timelines](#timelines) |
 | `UE_CLASS_IN(ModPackage)` | UE_CLASS for a mod's own class, named by its owner's UE_MOD_PACKAGE: the package is ModPackage plus namespaces plus the class name, the UE name the class name plus `_C`. | [Mod sources and packages](#mod-sources-and-packages) |
 | `UE_STRUCT_IN(Package)` | UE_STRUCT for a struct in a shared header: only the source whose UE_MOD_PACKAGE is exactly Package cooks it. | [Structs](#structs) |
+| `UE_WIDGET(Type, Name)` | A widget of a UUserWidget class's designer tree and a variable of the class; the first is the root. The constructor's AddChild calls and setters lay the tree out. | [Widget layouts](#widget-layouts) |
 | `UeAssets::<Class>::All` | Every game asset of that class, as soft pointers. | [Game assets](#game-assets) |
 | `UeAssets::<Class>::Game::...::<Name>` | A game asset by its content path, for `&` to point at. | [Game assets](#game-assets) |
 | `TEnum<E>` | An enum that is E to the compiler, with `.Name()` and `.String()`. | [TEnum](#tenum) |
@@ -6286,12 +6343,12 @@ so the retail game prints nothing. See [Strings and text](#strings-and-text) and
   ... construct <Leaf>`). SpawnObject and AddComponentByClass make one with NewObject, in a Shipping game, and assert
   in a Development one. Fix: construct a subclass that defines every `= 0` method, or the leaf. See
   [Objects and widgets](#objects-and-widgets).
-- `warning: <Class>: a widget class AssetGen cooks has no widget tree, so it shows nothing of its own, not even a widget
-  Blueprint parent's layout`: a class that derives `UUserWidget`, or a game widget Blueprint, which has no `OnPaint` of
-  its own and whose code never sets `WidgetTree->RootWidget`, nor does a mod class above it. The engine makes a tree only
-  for a widget Blueprint's own class, and AssetGen cooks a plain Blueprint class. The build goes on. Fix: build the tree
-  in `OnInitialized`, draw in `OnPaint`, or create one of the game's widget Blueprints. See
-  [Classes and variables](#classes-and-variables).
+- `warning: <Class>: a widget class AssetGen cooks has no widget tree unless it declares one with UE_WIDGET, so it
+  shows nothing of its own, not even a widget Blueprint parent's layout`: a class that derives `UUserWidget`, or a game
+  widget Blueprint, which declares no `UE_WIDGET`, nor does a mod class above it, has no `OnPaint` of its own and whose
+  code never sets `WidgetTree->RootWidget`. The engine makes a tree only from a widget Blueprint's class. The build
+  goes on. Fix: declare the layout with `UE_WIDGET`, build the tree in `OnInitialized`, or draw in `OnPaint`. See
+  [Widget layouts](#widget-layouts).
 - `warning: <Class>: the <Event> it inherits from <Parent> never runs, since a widget calls <Event> only for a class that
   overrides it itself, as the editor's widget compiler decides`: `<Event>` is `Tick` or `OnPaint`, which a Blueprint
   class above overrides and this widget class does not. The engine calls it only where the class's own override set
