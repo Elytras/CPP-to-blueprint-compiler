@@ -280,8 +280,9 @@ Notes:
 | `: public USaveGame`, `: public UFSDSaveGame` | A save game class. | Yes |
 | `: public UActorComponent`, `: public USceneComponent` | A component Blueprint, with the component class flags. Add one to an actor at run time with `AddComponentByType<T>(Owner)`, the editor's Add Component by Class node. Its own events to override are `ReceiveBeginPlay`, `ReceiveEndPlay` and `ReceiveTick`. It cannot be a `UE_COMPONENT` of a mod actor, which takes engine component classes only; see [Components](#components). | Yes |
 | `void ReceiveTick(float DeltaSeconds)` in a component class | Turns the component's ticking on: it sets `PrimaryComponentTick.bCanEverTick` on the class default object, as the editor's compiler does. UActorComponent leaves it off. | Yes |
-| `: public UUserWidget` | A widget with logic and no layout. `CreateWidget<T>` makes one. Its events, such as `Construct`, are overrides. `Tick` runs only if `bHasScriptImplementedTick` is set in `UE_DEFAULTS`, which the editor's widget compiler would do. | Yes |
-| a designer layout (a widget tree) for a mod widget | Not yet. The engine makes a widget's tree only for a widget Blueprint's own class, from its layout or its nearest parent's, and AssetGen cooks a plain Blueprint class. So a mod widget's tree starts empty, under a game widget Blueprint parent too, and it shows nothing of its own: AssetGen warns, "has no widget tree", unless the class or a mod class above it sets `WidgetTree->RootWidget` (in `OnInitialized`, before the widget is first shown) or overrides `OnPaint`. For a designed layout, create one of the game's widget Blueprints. | Warns |
+| `: public UUserWidget` | A widget with logic and no layout. `CreateWidget<T>` makes one. Its events, such as `Construct`, are overrides. | Yes |
+| `void Tick(FGeometry MyGeometry, float InDeltaTime)` or `void OnPaint(FPaintContext &Context) const` in a widget class | Turns that event on for the class. The engine calls a widget's `Tick` and `OnPaint` only while `bHasScriptImplementedTick` and `bHasScriptImplementedPaint` are set on its class default object, and AssetGen sets each where the class overrides the event itself, as the editor's widget compiler does. A parent's override does not count: in a subclass without one of its own the event never runs, the parent's version included. AssetGen warns, "the Tick it inherits from ... never runs": override it in the subclass and call the parent's. | Yes |
+| a designer layout (a widget tree) for a mod widget | Not yet. The engine makes a widget's tree only for a widget Blueprint's own class, from its layout or its nearest parent's, and AssetGen cooks a plain Blueprint class. So a mod widget's tree starts empty, under a game widget Blueprint parent too, and it shows nothing of its own: AssetGen warns, "has no widget tree", unless the class or a mod class above it sets `WidgetTree->RootWidget` (in `OnInitialized`, before the widget is first shown), or the class itself overrides `OnPaint`. For a designed layout, create one of the game's widget Blueprints. | Warns |
 
 ```cpp
 class Turret : public AActor { public: int32 Shots = 0; };
@@ -315,12 +316,11 @@ A widget class with logic only, and the actor that adds it to the viewport:
 
 ```cpp
 class UScoreWidget : public UUserWidget {             // no tree, so it shows nothing: AssetGen warns
-  UE_DEFAULTS { bHasScriptImplementedTick = true; }   // needed only if you override Tick
 public:
   int32 Shown = 0;
   float Elapsed = 0;
   void Construct() { Shown += 1; }
-  void Tick(FGeometry MyGeometry, float InDeltaTime) { Elapsed += InDeltaTime; }
+  void Tick(FGeometry MyGeometry, float InDeltaTime) { Elapsed += InDeltaTime; }   // overriding it turns Tick on
 };
 
 class Hud : public AActor {
@@ -2448,6 +2448,7 @@ the function it replaces is refused.
 |---|---|---|
 | `void ReceiveBeginPlay() { ... }` | Overrides the parent's event, like adding the event node in the editor. The engine calls it. | Yes |
 | `void ReceiveTick(float DeltaSeconds)` | Also turns ticking on: it sets `PrimaryActorTick.bCanEverTick` on an actor's class default object, `PrimaryComponentTick.bCanEverTick` on a component's, as the editor's compiler does. AActor and UActorComponent leave ticking off by default. | Yes |
+| `void Tick(FGeometry MyGeometry, float InDeltaTime)`, `void OnPaint(FPaintContext &Context) const` in a widget class | Also turns that event on, for this class alone: a subclass runs it only through an override of its own. See [Parent classes](#parent-classes). | Yes |
 | `void OnJumped() { ACharacter::OnJumped(); ... }` | Overrides a BlueprintNativeEvent (an event with a C++ default). The Blueprint version replaces the default, and the parent call runs it. | Yes |
 | `bool CanJumpInternal() const` | An override copies its parent's access, event, net, authority, cosmetic, const and pure flags, whatever section it is written in. It drops Native, because the Blueprint version is script. | Yes |
 | A class in `namespace Game::...` deriving a game Blueprint, redefining one of its functions | An override the game's code reaches by name, with the parent function's flags; see [examples/GameBlueprintChild.cpp](examples/GameBlueprintChild.cpp). | Yes |
@@ -2849,6 +2850,8 @@ would leave the object: see [Constructors](#constructors).
 | `Hit = {.Distance = 6.0f};` | The members given are written. One the braces leave out holds what the engine's constructor sets, which no header says: it is left unwritten where the parent's value is a fresh one (declared in a mod parent with no initializer, `{}` or `T()`, or with braces that leave it out, followed down, and set by no `UE_DEFAULTS` on the way), and refused over any other value: "Hit.FaceIndex, left out of the braces, holds what the engine's FHitResult constructor sets". Give every member, or leave the statement out. A `UE_STRUCT` value's braces, `H = {.N = 5};`, refuse a member of such a struct they leave out the same way. Braces nested for a `UE_STRUCT`'s member, `H = {.Hit = {.Distance = 5.0f}};`, are over a fresh value where that member has no initializer of its own, or one whose braces, followed down, leave it out: with `FInner In = {.K = 4};`, `O = {.In = {.Hit = {.Distance = 3.0f}}};` leaves the rest of Hit unwritten, and where the initializer gives Hit `{.Time = 0.5f}`, the Time the new braces leave out is refused. Another mod's struct (`UE_STRUCT_IN`) is no engine struct: a member its braces leave out takes the initializer its header gives it, written. | Yes |
 | `Hit = {.Time = 3.0f};` then `Hit = {.Distance = 6.0f};` | The last statement on a member is its value, as the last assignment is in C++: the earlier one writes nothing, so `Hit` is Distance 6 with Time the engine's 1, not 3. | Yes |
 | `Handle = FTimerHandle();` | Writes nothing, with a warning: FTimerHandle's one member is Transient, which the engine never loads from a default, so the value stays the parent's. | Warns |
+| `bHasScriptImplementedTick = true;` in a widget class that overrides `Tick`, `bHasScriptImplementedPaint = false;` in one that does not override `OnPaint` | Changes nothing, with a warning: "so this line changes nothing". AssetGen sets both flags from the class's own `Tick` and `OnPaint`, as the editor's widget compiler does on every compile. Drop the line. | Warns |
+| `bHasScriptImplementedTick = true;` in a widget class that does not override `Tick`, `bHasScriptImplementedPaint = false;` in one that overrides `OnPaint` | Refused: "follows whether the class overrides Tick itself", since the compile sets the flag back. Override the event for it to run, or drop the override to turn it off: see [Parent classes](#parent-classes). | Refused |
 | `Lantern() { InitialLifeSpan = 5.0f; }` | A `UE_DEFAULTS` statement, written in the constructor: see [Constructors](#constructors). | Yes |
 
 ```cpp
@@ -6068,11 +6071,26 @@ so the retail game prints nothing. See [Strings and text](#strings-and-text) and
   in a Development one. Fix: construct a subclass that defines every `= 0` method, or the leaf. See
   [Objects and widgets](#objects-and-widgets).
 - `warning: <Class>: a widget class AssetGen cooks has no widget tree, so it shows nothing of its own, not even a widget
-  Blueprint parent's layout`: a class that derives `UUserWidget`, or a game widget Blueprint, whose code never sets
-  `WidgetTree->RootWidget` and which overrides no `OnPaint`, nor does a mod class above it. The engine makes a tree only
+  Blueprint parent's layout`: a class that derives `UUserWidget`, or a game widget Blueprint, which has no `OnPaint` of
+  its own and whose code never sets `WidgetTree->RootWidget`, nor does a mod class above it. The engine makes a tree only
   for a widget Blueprint's own class, and AssetGen cooks a plain Blueprint class. The build goes on. Fix: build the tree
   in `OnInitialized`, draw in `OnPaint`, or create one of the game's widget Blueprints. See
   [Classes and variables](#classes-and-variables).
+- `warning: <Class>: the <Event> it inherits from <Parent> never runs, since a widget calls <Event> only for a class that
+  overrides it itself, as the editor's widget compiler decides`: `<Event>` is `Tick` or `OnPaint`, which a Blueprint
+  class above overrides and this widget class does not. The engine calls it only where the class's own override set
+  its flag on the class default object. The build goes on. Fix: override `<Event>` in `<Class>` and call
+  `<Parent>::<Event>`. See [Parent classes](#parent-classes).
+- `warning: <Class>::UE_DEFAULTS: bHasScriptImplementedTick follows whether the class overrides Tick itself, as the
+  editor's widget compiler sets it on every compile, so this line changes nothing; drop it`, and the same for
+  `bHasScriptImplementedPaint` and `OnPaint`, or with `<Class>::<Class>()` for a constructor: a widget class's
+  `UE_DEFAULTS` or constructor sets one of the two flags to the value AssetGen gives it anyway. The build goes on. Fix:
+  drop the line.
+- `<Class>::UE_DEFAULTS: bHasScriptImplementedTick follows whether the class overrides Tick itself, as the editor's
+  widget compiler sets it on every compile; override Tick for it to run`, or `...; drop the Tick override to turn it
+  off`, and the same for `bHasScriptImplementedPaint` and `OnPaint`: the line sets the flag to the other value than
+  the class's own events give it, which the compile would set back. Fix: override the event for it to run, or drop the
+  override for it not to.
 - `warning: <Class>::<Function>: SpawnObject with no Outer (None) makes nothing and returns None`: `NewObject<T>(nullptr)`.
   The build goes on. Fix: pass the object that owns it, such as `this`. See [Objects and widgets](#objects-and-widgets).
 - `warning: <Function>: a deferred spawn (SpawnActorDeferred, BeginDeferredActorSpawnFromClass) is not finished in

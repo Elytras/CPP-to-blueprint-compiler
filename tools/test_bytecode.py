@@ -9888,6 +9888,89 @@ widget_no_tree_warns()
 print('ok  WidgetNoTree: a widget class that neither sets its tree\'s root nor paints warns that it shows nothing')
 
 
+def widget_event_flags():
+    """NativeTick calls a widget's Tick, and NativePaint its OnPaint, only while its default object's
+    bHasScriptImplementedTick or bHasScriptImplementedPaint is set (UserWidget.cpp 1377, 1602). UUserWidget's constructor
+    sets both; the editor's widget compiler sets each on every compile to whether the class overrides that event itself,
+    a parent's override not counting (WidgetBlueprintCompiler.cpp 466-487). Each flag is read as the default object loads
+    it: its tag, else its parent's value, up to the engine class. WfBare overrides neither event, WfTick and WfPaint one
+    each. A Tick override below a game widget Blueprint that has none, so holds its flag off (UI_KPI_Tab_C), turns it
+    on (WfTabTick), as below one that has its own (WfPerkTick). A class that only inherits a Tick, from a mod class
+    (WfKid) or a game Blueprint (WfPerkKid), holds the flag off, as the editor would, and the compile warns. A UE_DEFAULTS
+    or constructor line setting a flag to what the class's events give warns that it changes nothing (WfSaid, WfSaidCtor);
+    one setting the other value is refused. A patch that adds Tick and OnPaint to UI_KPI_Tab_C turns both on there."""
+    flags = ('bHasScriptImplementedTick', 'bHasScriptImplementedPaint')
+
+    def loads(p, ci, flag):
+        while True:
+            st = p.struct(ci)
+            t = p.tag(st.cdo - 1, flag)
+            if t: return t['bool']
+            up = p.resolve(st.super)
+            if up is None: return 1                 # an engine class: UUserWidget's constructor set it
+            p, ci = up
+
+    tick = '  void Tick(FGeometry MyGeometry, float InDeltaTime) {}\n'
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, 'WfFlags.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\n#include "UeApi/UMG.h"\n'
+                    '#include "UeApi/Game/UI_AvailablePerkPoints_C.h"\n#include "UeApi/Game/UI_KPI_Tab_C.h"\n'
+                    'UE_MOD_PACKAGE("/Game/_ElytrasMods/WfFlags");\n'
+                    'class UWfBare : public UUserWidget {};\n'
+                    'class UWfTick : public UUserWidget {\npublic:\n' + tick + '};\n'
+                    'class UWfPaint : public UUserWidget {\npublic:\n  void OnPaint(FPaintContext &Context) const {}\n};\n'
+                    'class UWfKid : public UWfTick {};\n'
+                    'class UWfTabTick : public UI_KPI_Tab_C {\npublic:\n' + tick + '};\n'
+                    'class UWfPerkTick : public UI_AvailablePerkPoints_C {\npublic:\n' + tick + '};\n'
+                    'class UWfPerkKid : public UI_AvailablePerkPoints_C {};\n'
+                    'class UWfSaid : public UUserWidget {\npublic:\n  UE_DEFAULTS { bHasScriptImplementedTick = true; }\n'
+                    + tick + '};\n'
+                    'class UWfSaidCtor : public UUserWidget {\npublic:\n  UWfSaidCtor() { bHasScriptImplementedPaint = false; }\n};\n')
+        out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'WfFlags')
+        os.makedirs(out)
+        proc = assetgen_compile([src, UEAPI, out])
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        said = set(re.findall(r'warning: (\w+)::[\w()]+: (\w+) follows whether .*, so this line changes nothing', proc.stdout))
+        assert said == {('UWfSaid', 'bHasScriptImplementedTick'), ('UWfSaidCtor', 'bHasScriptImplementedPaint')}, proc.stdout
+        want = {'UWfBare': (0, 0), 'UWfTick': (1, 0), 'UWfPaint': (0, 1), 'UWfKid': (0, 0), 'UWfSaid': (1, 0),
+                'UWfSaidCtor': (0, 0)}
+        if GAME: want.update({'UWfTabTick': (1, 0), 'UWfPerkTick': (1, 0), 'UWfPerkKid': (0, 0)})
+        got = {}
+        for cls in want:
+            p, ci = class_pkg(os.path.join(out, cls))
+            got[cls] = tuple(loads(p, ci, flag) for flag in flags)
+        assert got == want, got
+        warned = set(re.findall(r'warning: (\w+): the (\w+) it inherits from (\w+) never runs', proc.stdout))
+        assert warned == {('UWfKid', 'Tick', 'UWfTick'), ('UWfPerkKid', 'Tick', 'UI_AvailablePerkPoints_C')}, proc.stdout
+
+        if GAME:
+            src = os.path.join(tmp, 'WfPatch.cpp')
+            with open(src, 'w', encoding='utf-8') as f:
+                f.write('#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\n#include "UeApi/UMG.h"\n'
+                        '#include "UeApi/Game/UI_KPI_Tab_C.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/WfPatch");\n'
+                        'class TabTicks : public UI_KPI_Tab_C {\n  UE_PATCH;\n' + tick
+                        + '  void OnPaint(FPaintContext &Context) const {}\n};\n')
+            out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'WfPatch')
+            os.makedirs(out)
+            proc = assetgen_compile([src, UEAPI, out, '--game', GAME])
+            assert proc.returncode == 0, proc.stdout + proc.stderr
+            for content, on in ((GAME, 0), (os.path.join(tmp, 'FSD', 'Content'), 1)):
+                p, ci = class_pkg(os.path.join(content, 'UI', 'HUD_SpaceRig', 'KPI', 'UI_KPI_Tab'))
+                assert all(loads(p, ci, flag) == on for flag in flags), (content, [loads(p, ci, f) for f in flags])
+    refused('UWfSet', '  UE_DEFAULTS { bHasScriptImplementedTick = true; }\n',
+            'follows whether the class overrides Tick itself, as the editor\'s widget compiler sets it on every compile; '
+            'override Tick for it to run', base='UUserWidget')
+    refused('UWfSet', '  UWfSet() { bHasScriptImplementedPaint = false; }\n  void OnPaint(FPaintContext &Context) const {}\n',
+            'follows whether the class overrides OnPaint itself, as the editor\'s widget compiler sets it on every compile; '
+            'drop the OnPaint override to turn it off', base='UUserWidget')
+
+
+widget_event_flags()
+print('ok  WidgetEventFlags: a widget class\'s Tick and OnPaint flags are on exactly where it overrides the event '
+      'itself, as the editor sets them; an inherited one warns, UE_DEFAULTS can only repeat them, a patch\'s added events do')
+
+
 def asset_map_dup_keys():
     """A key a map's braces give twice holds the last value given, as TMap's initializer-list constructor Adds each pair
     in order (Map.h 1166-1173). AS_AmdOver's {{"a", 1}, {"a", 2}} over UAmdDef's {a: 2, c: 3} loads {a: 2}, AS_AmdLast's

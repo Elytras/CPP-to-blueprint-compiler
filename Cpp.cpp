@@ -15154,6 +15154,15 @@ static bool ForEachFieldPath(const std::vector<uint8>& B, size_t Begin, size_t E
     return bOk && O == End;
 }
 
+/* A widget's two events that the engine calls only while a flag on its default object is set: NativeTick calls Tick
+   while bHasScriptImplementedTick is, NativePaint calls OnPaint while bHasScriptImplementedPaint is (UserWidget.cpp 1377,
+   1602). UUserWidget's constructor sets both (68-69). The editor's widget compiler sets them again on every compile,
+   after the class defaults: each true where the class has that event of its own, else false. A parent's does not count,
+   since FindOverriddenImplementableEvent looks in the class alone (WidgetBlueprintCompiler.cpp 466-487,
+   KismetCompilerMisc.cpp 634-644). Measured on the game's 1,484 widget Blueprints: each holds its flags so. */
+static const std::pair<const char*, const char*> kWidgetEvents[] = { { "Tick", "bHasScriptImplementedTick" },
+                                                                     { "OnPaint", "bHasScriptImplementedPaint" } };
+
 /*
 S38 - a patch's methods, compiled by Generate as a scratch child class of the Blueprint B (each an override of B's
 function), written over B's own functions in B's package. The export row stays, so the class's function list, its
@@ -15501,7 +15510,23 @@ bool FCompiler::TransplantFunctions(const FRecord& R, const FRecord& B, const FP
             if (!ApplyEdit(Package, "Default__" + Class, { FEditDef{ { Tick, Can }, { Step } } }, Scratch, Where, Err)) return false;
         }
     }
-    return true;
+    /* So is a Tick or OnPaint the patch adds to a widget: the class now has that event of its own, and the editor's widget
+       compiler sets its flag for one (kWidgetEvents).
+       ponytail: only B's package is edited, so a game subclass whose default object has no tag for the flag (it held B's
+       value) now inherits it and runs the added event, where the editor would recompile that subclass with the flag off.
+       Editing those subclasses' packages too would match the editor. */
+    bool bWidget = false;
+    for (const FRecord* A = &B; A && !bWidget; A = A->Base.empty() ? nullptr : Find(A->Base)) bWidget = A->UeName == "UserWidget";
+    std::vector<FEditDef> Flags;
+    for (const auto& [Event, Flag] : kWidgetEvents)
+        if (bWidget && Added.count(Lower(Event)))
+        {
+            FPropertyDef On = BoolParam(Flag);
+            On.Default.K = FDefaultValue::Bool;
+            On.Default.I = 1;
+            Flags.push_back(FEditDef{ { On }, {} });
+        }
+    return Flags.empty() || ApplyEdit(Package, "Default__" + Class, Flags, Scratch, Where, Err);
 }
 
 /* The edited packages, each at its own /Game path under the Content folder OutDir is in: the mod pak's copy is the one
@@ -15629,20 +15654,26 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     const bool bIsActor = std::find(Ancestry.begin(), Ancestry.end(), "Actor") != Ancestry.end();
     BP.SetIsActor(bIsActor);
     BP.SetIsComponent(std::find(Ancestry.begin(), Ancestry.end(), "ActorComponent") != Ancestry.end());
+    /* Whether A has a function of its own named Event, where the editor's widget compiler looks for one (kWidgetEvents):
+       a method a class cooked here compiles, or one a game Blueprint's header (or another mod's) lists. */
+    auto OwnEvent = [&](const FRecord& A, const char* Event) {
+        return A.IsNative() ? A.Methods.count(Event) != 0 : !IsInlineMethod(A, Event) && CompilesMethod(A, Event);
+    };
+    const bool bIsWidget = !R.bIsPatch && std::find(Ancestry.begin(), Ancestry.end(), "UserWidget") != Ancestry.end();
     /* A widget shows its tree's root (UUserWidget::RebuildWidget, UserWidget.cpp 745), and a tree is made only for a
        WidgetBlueprintGeneratedClass, from its designer layout or the nearest parent's (Initialize, 125-143). AssetGen
        cooks a BlueprintGeneratedClass, so a mod widget's tree starts empty, under a game widget Blueprint too. It shows
-       something only if the class or a mod class above it sets the root itself or paints (NativePaint, 1600-1611). */
-    if (!R.bIsPatch && std::find(Ancestry.begin(), Ancestry.end(), "UserWidget") != Ancestry.end())
+       something only if the class or a mod class above it sets the root itself, or the class paints: OnPaint runs only
+       for a class with an OnPaint of its own (NativePaint, 1600-1611; kWidgetEvents). */
+    if (bIsWidget)
     {
-        bool bDraws = false;
+        bool bDraws = OwnEvent(R, "OnPaint");
         std::function<void(const Json&)> Scan = [&](const Json& N) {
             if (Kind(N) == "MemberExpr" && N.value("name", std::string()) == "RootWidget") bDraws = true;
             if (!bDraws) ForEach(N, Scan);
         };
         for (const FRecord* A = &R; A && !A->IsNative() && !bDraws; A = A->Base.empty() ? nullptr : Find(A->Base))
         {
-            bDraws = A->Methods.count("OnPaint") != 0;
             for (const Json* M : A->AllMethods) Scan(*M);
             for (const auto& [Name, Def] : A->MethodDefs) Scan(*Def);
         }
@@ -15888,6 +15919,25 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 if (!LowerDefault(*Lhs, PD, BP, Err, Rhs, /*bKeepZero=*/true)) { bOk = false; return; }
                 if (PD.Default.K == FDefaultValue::None)
                 { *Err = Where + ": " + Name(*Lhs) + " needs a literal value"; bOk = false; return; }
+                /* A widget's event flags are the compiler's, set below from the class's own events (kWidgetEvents). A line
+                   that says the same changes nothing, and this reference long asked for one beside a Tick override, so it
+                   warns; one that says otherwise would be undone, as the editor's compile undoes it, so it is refused. */
+                for (const auto& [Event, Flag] : kWidgetEvents)
+                    if (!bThroughComponent && DR->UeName == "UserWidget" && Name(*Lhs) == Flag)
+                    {
+                        const bool bOwn = OwnEvent(R, Event);
+                        const std::string Why = std::string(Flag) + " follows whether the class overrides " + Event + " itself, "
+                                                "as the editor's widget compiler sets it on every compile";
+                        if ((PD.Default.I != 0) == bOwn)
+                        {
+                            printf("  warning: %s: %s, so this line changes nothing; drop it\n", Where.c_str(), Why.c_str());
+                            return;
+                        }
+                        *Err = Where + ": " + Why + "; " + (bOwn ? "drop the " + std::string(Event) + " override to turn it off"
+                                                                 : "override " + std::string(Event) + " for it to run");
+                        bOk = false;
+                        return;
+                    }
                 if (bInterfaceVar) { InterfaceVarDefaults[Name(*Lhs)] = PD; return; }
 
                 /* An inherited set or map loads over the parent CDO's value (PropertySet.cpp 285-358, PropertyMap.cpp
@@ -16242,6 +16292,32 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     if (!ComponentDefaults.empty())
     { *Err = R.CppName + "::UE_DEFAULTS: " + ComponentDefaults.begin()->first + " is not declared with UE_COMPONENT"; return false; }
     for (const FPropertyDef& V : InheritedDefaults) BP.AddCdoDefault(V);
+    /* A widget's event flags, as the editor's widget compiler sets them (kWidgetEvents). Each is a tag where it differs
+       from the parent default object's: true below an engine class, as UUserWidget's constructor leaves it, and below a
+       Blueprint that Blueprint's own event, its compile having set the flag the same way. An event a Blueprint above has
+       of its own then runs on that class's objects and never on this one's, as in the editor, so that is warned. */
+    auto IsEngine = [&](const FRecord& A) { return PackageOf(A).compare(0, 8, "/Script/") == 0; };
+    for (const auto& [Event, Flag] : kWidgetEvents)
+    {
+        if (!bIsWidget) continue;
+        const bool bOwn = OwnEvent(R, Event);
+        if (bOwn != (IsEngine(*B) || OwnEvent(*B, Event)))
+        {
+            FPropertyDef Set = BoolParam(Flag);
+            Set.Default.K = FDefaultValue::Bool;
+            Set.Default.I = bOwn;
+            BP.AddCdoDefault(Set);
+        }
+        const FRecord* Above = B;
+        while (Above && !IsEngine(*Above) && !OwnEvent(*Above, Event)) Above = Above->Base.empty() ? nullptr : Find(Above->Base);
+        if (!bOwn && !bAbstract && Above && !IsEngine(*Above))
+        {
+            const std::string Of = LeafOf(Above->CppName);
+            printf("  warning: %s: the %s it inherits from %s never runs, since a widget calls %s only for a class that "
+                   "overrides it itself, as the editor's widget compiler decides; override %s, calling %s::%s\n",
+                   R.CppName.c_str(), Event, Of.c_str(), Event, Event, Of.c_str(), Event);
+        }
+    }
     /* Resolving the component class from the declaring record's own field, the same walk the
        UE_COMPONENT registration does - a native subobject has no marker to read it off. */
     auto ComponentClassOf = [&](const FRecord& Owner, const std::string& Field) -> const FRecord* {
