@@ -9936,7 +9936,13 @@ def widget_tree():
     holding Parent and Content and every child naming its slot back. Each widget is the class variable of its name
     (InitializeWidgetStatic sets it by name). A canvas slot's LayoutData holds the offsets its setters gave (position and
     size, or SetOffsets'), a button slot its alignment, a widget its text. A class below declares no widgets, stays a
-    widget class and imports its parent as one. The layout's mistakes are refused."""
+    widget class and imports its parent as one. The layout's mistakes are refused.
+    The layout's other lines, as the engine reads them. UE_SLOT: the nested UWtFrame lists Note in its NamedSlotBindings
+    under Body, which InitializeNamedSlots finds as UWtFrame's variable and whose class's NamedSlots names it (GetSlotNames,
+    which ForEachWidget walks into, so Note is a variable of the card too); Note sits in no panel. Play->OnClicked.Add:
+    the class's ComponentDelegateBinding, in DynamicBindingObjects, binds Play's OnClicked to OnPlay, a function of the
+    class (BindDynamicDelegates). UE_BIND: a Bindings entry naming Title, Text and GetScoreText, its SourcePath that
+    function, a function of the class returning a text."""
     folder = os.path.join(ROOT, 'WidgetTree', 'FSD', 'Content', '_ElytrasMods', 'WidgetTree')
     p, ci = class_pkg(os.path.join(folder, 'UWtCard'))
     obj = lambda t: struct.unpack('<i', t['value'][:4])[0]
@@ -9945,10 +9951,25 @@ def widget_tree():
     assert p.class_of(tree + 1) == 'WidgetTree' and p.exports[tree]['outer'] == ci + 1
     root = obj(p.tag(tree, 'RootWidget')) - 1
 
+    def structs(pk, i, t):
+        """An array of structs' elements, each as tag_values reads it: past the count and the inner tag."""
+        at, out = t['at'] + 4 + 49, []
+        for _ in range(struct.unpack_from('<i', t['value'])[0]):
+            tl = pk.tags(i, at)
+            out.append(tag_values(pk, i, tl))
+            at = tl.end
+        return out
+
     def walk(w, path):
-        """{path: (class, its slot's export)} of w and the widgets below it, each check made on the way."""
+        """{path: (class, its slot's export)} of w and the widgets below it, each check made on the way: a nested
+        widget's named slot content as <path>[<slot>]/<content>, with no slot of its own."""
         out = {path: (p.class_of(w + 1), None)}
         assert p.exports[w]['outer'] == tree + 1, path
+        fills = p.tag(w, 'NamedSlotBindings')
+        for b in structs(p, w, fills) if fills else ():
+            content = p.find(b['Content'].split(':')[-1])
+            assert p.exports[content]['outer'] == tree + 1 and not p.tag(content, 'Slot'), path
+            out.update(walk(content, '%s[%s]/%s' % (path, b['Name'], p.exports[content]['name'])))
         slots = p.tag(w, 'Slots')
         for k in range(struct.unpack('<i', slots['value'][:4])[0] if slots else 0):
             s = struct.unpack('<i', slots['value'][4 + 4 * k:8 + 4 * k])[0] - 1
@@ -9962,10 +9983,33 @@ def widget_tree():
 
     got = walk(root, 'Root')
     assert {k: v[0] for k, v in got.items()} == {'Root': 'CanvasPanel', 'Root/Title': 'TextBlock', 'Root/Play': 'Button',
-                                                  'Root/Play/Label': 'TextBlock'}, got
+                                                  'Root/Play/Label': 'TextBlock', 'Root/Frame': 'UWtFrame_C',
+                                                  'Root/Frame[Body]/Note': 'TextBlock'}, got
     variables = {pr.name: p.path(pr.ref) for pr in p.struct(ci).props if pr.type == 'ObjectProperty'}
     assert variables == {'Root': '/Script/UMG.CanvasPanel', 'Title': '/Script/UMG.TextBlock', 'Play': '/Script/UMG.Button',
-                         'Label': '/Script/UMG.TextBlock'}, variables
+                         'Label': '/Script/UMG.TextBlock', 'Frame': '/Game/_ElytrasMods/WidgetTree/UWtFrame.UWtFrame_C',
+                         'Note': '/Script/UMG.TextBlock'}, variables
+    fp, fci = class_pkg(os.path.join(folder, 'UWtFrame'))
+    named = fp.tag(fci, 'NamedSlots')
+    assert [fp.names[n] for n in struct.unpack_from('<%di' % (2 * struct.unpack_from('<i', named['value'])[0]),
+                                                    named['value'], 4)[::2]] == ['Body'], named
+    assert {pr.name: fp.path(pr.ref) for pr in fp.struct(fci).props if pr.type == 'ObjectProperty'}['Body'] == '/Script/UMG.NamedSlot'
+    keeps_invariants(os.path.join(folder, 'UWtFrame'))
+
+    bound =[struct.unpack_from('<i', p.tag(ci, 'DynamicBindingObjects')['value'], 4)[0]]
+    assert [p.class_of(b) for b in bound] == ['ComponentDelegateBinding'] and p.exports[bound[0] - 1]['outer'] == ci + 1
+    assert structs(p, bound[0] - 1, p.tag(bound[0] - 1, 'ComponentDelegateBindings')) == [
+        dict(ComponentPropertyName='Play', DelegatePropertyName='OnClicked', FunctionNameToBind='OnPlay')]
+    bindings = structs(p, ci, p.tag(ci, 'Bindings'))
+    assert [{k: b[k] for k in ('ObjectName', 'PropertyName', 'FunctionName', 'Kind')} for b in bindings] == [
+        dict(ObjectName='Title', PropertyName='Text', FunctionName='GetScoreText', Kind='Function')], bindings
+    first = p.tags(ci, p.tag(ci, 'Bindings')['at'] + 4 + 49)            # the one entry's own tags
+    source = p.tags(ci, next(t for t in first if t['name'] == 'SourcePath')['at'])
+    assert [s['Name'] for s in structs(p, ci, next(t for t in source if t['name'] == 'Segments'))] == ['GetScoreText']
+    for fn, ret in (('OnPlay', []), ('GetScoreText', ['TextProperty'])):     # what FindFunctionByName finds
+        f = p.find(fn)
+        assert f is not None and p.exports[f]['outer'] == ci + 1, fn
+        assert [pr.type for pr in p.struct(f).props if pr.name == 'ReturnValue'] == ret, fn
 
     def offsets(s):
         layout = p.tag(s, 'LayoutData')
@@ -9992,6 +10036,20 @@ def widget_tree():
             'Title is added to Root already', base='UUserWidget')
     refused('WtNoProp', widgets + '  WtNoProp() { Root->AddChildToCanvas(Title); Title->SetOpacity(0.5f); }\n',
             'has no Opacity of its argument\'s type', base='UUserWidget')
+    # A named slot's content has one parent; a game widget's slot is its variable (UI_CurvedCanvas_C::Content).
+    refused('WtSlotTwice', widgets + '  UE_WIDGET(UI_CurvedCanvas_C, Curve);\n  WtSlotTwice() { Root->AddChildToCanvas(Curve); '
+            'Root->AddChildToCanvas(Title); UE_SLOT(Curve->Content, Title); }\n', 'Title is added to Root already',
+            top='#include "UeApi/Game/UI_CurvedCanvas_C.h"\n', base='UUserWidget')
+    refused('WtNotSlot', widgets + '  UE_WIDGET(UWtHost, Host);\n  WtNotSlot() { Root->AddChildToCanvas(Host); '
+            'UE_SLOT(Host->Loose, Title); }\n', 'UWtHost::Loose is no UE_WIDGET',
+            top='class UWtHost : public UUserWidget {\npublic:\n  UE_WIDGET(UNamedSlot, Body);\n  UNamedSlot *Loose;\n};\n',
+            base='UUserWidget')
+    refused('WtBindOther', widgets + '  UE_WIDGET(UButton, Play);\n  void OnPlay() {}\n  WtBindOther() { Root->AddChildToCanvas(Title); '
+            'Root->AddChildToCanvas(Play); Play->OnClicked.Add(Root, &WtBindOther::OnPlay); }\n',
+            'to a function of this widget', base='UUserWidget')
+    refused('WtBindFar', widgets + '  WtBindFar() { Root->AddChildToCanvas(Title); UE_BIND(Title, Text, &UWtOther::Get); }\n',
+            'is a function of this class or of a class above it',
+            top='class UWtOther : public UUserWidget {\npublic:\n  FText Get() const { return FText("x"); }\n};\n', base='UUserWidget')
     print('ok  WidgetTree: a widget class\'s constructor cooks its tree, slots and their layout, as the engine walks it')
 
 

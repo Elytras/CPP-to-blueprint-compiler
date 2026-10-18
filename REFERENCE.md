@@ -2845,15 +2845,30 @@ panel.
 | `Title->SetOpacity(0.5f);`, a setter with no property of its name and type | Refused: "AssetGen reads a setter as the property it sets, and ... has no Opacity of its argument's type". Assign the member instead. | Refused |
 | an adder's other arguments, `Grid->AddChildToGrid(Cell, 1, 2)` | Refused: set them with the slot's setters. | Refused |
 | `UE_WIDGET` in a class that is not a `UUserWidget` | Refused: "a UE_WIDGET is a widget of a UUserWidget's tree". | Refused |
-| a widget's button event bound in the layout, a `UNamedSlot` filled from outside, a property binding, an animation | Not yet. Bind an event at run time, `Play->OnClicked.Add(this, &UScoreCard::OnPlay)` in `Construct`. | Not yet |
+| `Play->OnClicked.Add(this, &UScoreCard::OnPlay);` in the constructor | Binds a widget's event, as the designer's "On Clicked (Play)" node does: each widget of the class made calls OnPlay when its own Play is clicked. Any widget dispatcher the editor can bind (`OnHovered`, a mod widget's `UE_DISPATCHER`), to a function of this class. A class below inherits it. | Yes |
+| `UE_WIDGET(UNamedSlot, Body);` | A named slot: a place in this widget's layout that a widget nesting this one fills. The class lists it in its named slots. | Yes |
+| `UE_SLOT(Frame->Body, Inner);` in the constructor | Fills the named slot Body of the nested user widget Frame with Inner, a `UE_WIDGET` of this class that sits in no panel, as dropping a widget on a named slot in the designer does. Inner is still this class's variable. Body is a named slot of Frame's class: a `UE_WIDGET(UNamedSlot, ...)` of a mod class, a named slot variable of a game one. | Yes |
+| `UE_BIND(Title, Text, &UScoreCard::GetScore);` in the constructor | Binds Title's Text to GetScore, as the designer's Bind button does: the widget reads it from GetScore each time it is drawn. GetScore returns the property's type (`FText` here) and takes nothing; the widget must have a binding for it (`TextDelegate`), which clang checks. | Yes |
+| a `UE_SLOT` content in a panel too, a slot no `UE_WIDGET` of the mod class it is on, an event bound to another object's function, a `UE_BIND` to a function of a class this one is not | Refused: a widget has one parent; a mod class's slot that is not in its tree is null where the engine looks for it; the engine finds the bound function on this widget, by name. | Refused |
+| an animation | Not yet. | Not yet |
 
 ```cpp
+class UFrame : public UUserWidget {                  // a box with a named slot that whoever nests it fills
+public:
+  UE_WIDGET(UVerticalBox, Box);
+  UE_WIDGET(UNamedSlot, Body);
+
+  UFrame() { Box->AddChildToVerticalBox(Body); }
+};
+
 class UScoreCard : public UUserWidget {
 public:
   UE_WIDGET(UCanvasPanel, Root);                     // the root
   UE_WIDGET(UTextBlock, Title);
   UE_WIDGET(UButton, Play);
   UE_WIDGET(UTextBlock, Label);
+  UE_WIDGET(UFrame, Frame);
+  UE_WIDGET(UTextBlock, Hint);
 
   UScoreCard() {
     UCanvasPanelSlot *At = Root->AddChildToCanvas(Title);
@@ -2861,9 +2876,17 @@ public:
     At->SetSize(FVector2D(200, 40));
     Root->AddChildToCanvas(Play)->SetOffsets(FMargin(20, 60, 160, 48));   // left, top, width, height
     Cast<UButtonSlot>(Play->SetContent(Label))->SetHorizontalAlignment(EHorizontalAlignment::HAlign_Center);
-    Title->SetText(FText("Score"));
+    Root->AddChildToCanvas(Frame)->SetPosition(FVector2D(20, 120));
+    UE_SLOT(Frame->Body, Hint);                     // Hint sits in Frame's Body
     Label->Text = FText("Play");
+    Hint->Text = FText("Click to score");
+    Play->OnClicked.Add(this, &UScoreCard::OnPlay);
+    UE_BIND(Title, Text, &UScoreCard::GetScore);
   }
+
+  int32 Score = 0;
+  void OnPlay() { Score += 1; }
+  FText GetScore() const { return UKismetTextLibrary::Conv_IntToText(Score, false, true, 1, 324); }
 };
 ```
 
@@ -5807,6 +5830,8 @@ listed here is refused with "unimplemented intrinsic".
 | `UE_CLASS_IN(ModPackage)` | UE_CLASS for a mod's own class, named by its owner's UE_MOD_PACKAGE: the package is ModPackage plus namespaces plus the class name, the UE name the class name plus `_C`. | [Mod sources and packages](#mod-sources-and-packages) |
 | `UE_STRUCT_IN(Package)` | UE_STRUCT for a struct in a shared header: only the source whose UE_MOD_PACKAGE is exactly Package cooks it. | [Structs](#structs) |
 | `UE_WIDGET(Type, Name)` | A widget of a UUserWidget class's designer tree and a variable of the class; the first is the root. The constructor's AddChild calls and setters lay the tree out. | [Widget layouts](#widget-layouts) |
+| `UE_SLOT(Widget->Slot, Content)` | In a widget class's constructor: Content fills the named slot Slot of the nested user widget Widget. | [Widget layouts](#widget-layouts) |
+| `UE_BIND(Widget, Property, &Class::Function)` | In a widget class's constructor: Widget's Property is read from Function each time it is drawn. | [Widget layouts](#widget-layouts) |
 | `UeAssets::<Class>::All` | Every game asset of that class, as soft pointers. | [Game assets](#game-assets) |
 | `UeAssets::<Class>::Game::...::<Name>` | A game asset by its content path, for `&` to point at. | [Game assets](#game-assets) |
 | `TEnum<E>` | An enum that is E to the compiler, with `.Name()` and `.String()`. | [TEnum](#tenum) |

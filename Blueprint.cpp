@@ -380,8 +380,10 @@ void FBlueprintClass::Finish()
         if (!Of.empty()) BindingKinds.push_back(Of);
     }
     const int32 RowFirstBinding = RowFirstSubobject + int32(SubobjectOverrides.size());
+    /* Then a widget class's ComponentDelegateBinding, when its layout binds a widget's event (S39). */
+    const int32 RowComponentBinding = RowFirstBinding + int32(BindingKinds.size());
     /* Then each timeline's template, followed by its tracks' curves. */
-    const int32 RowFirstTimeline = RowFirstBinding + int32(BindingKinds.size());
+    const int32 RowFirstTimeline = RowComponentBinding + (ComponentBindings.empty() ? 0 : 1);
     std::vector<int32> TimelineRows;
     int32 NumTimelineRows = 0;
     for (const FTimeline& T : Timelines)
@@ -457,6 +459,11 @@ void FBlueprintClass::Finish()
         Bindings.push_back(Exp(RowFirstBinding + int32(I)));
         Class.CreateBeforeSer.push_back(Bindings.back().V);
     }
+    if (!ComponentBindings.empty())
+    {
+        Bindings.push_back(Exp(RowComponentBinding));
+        Class.CreateBeforeSer.push_back(Bindings.back().V);
+    }
     const bool bHasTree = !Widgets.empty();
     if (bHasTree) Class.CreateBeforeSer.push_back(Exp(RowTree).V);      // listed first, as Basic_FlatButton_C lists it
     std::vector<FIndex> Templates;              // the Timelines list, after the bindings as BP_FragilePlatform_C lists them
@@ -485,9 +492,43 @@ void FBlueprintClass::Finish()
     const int32 NumOverrides = int32(ComponentOverrides.size());
     const int32 NumReplicated = int32(std::count_if(Vars.begin(), Vars.end(),
                                                     [](const FPropertyDef& V) { return (V.PropertyFlags & CPF_Net) != 0; }));
+    const std::vector<FPropertyBinding> WidgetBindings = PropertyBindings;
+    const std::vector<std::string> SlotNames = NamedSlots;
     Class.Serialize = [=](FArc& Ar) {
-        /* UWidgetBlueprintGeneratedClass's own property, so before UBlueprintGeneratedClass's, as the cook orders them. */
+        /* UWidgetBlueprintGeneratedClass's own properties, so before UBlueprintGeneratedClass's, as the cook orders them. */
         if (bHasTree) Tag(Ar, "WidgetTree", "ObjectProperty", [=](FArc& V) { V.Idx(Exp(RowTree)); });
+        /* Measured on Basic_DropdownItem_C's: each FDelegateRuntimeBinding written whole, its SourcePath one segment
+           naming the function. InitializeBindingsStatic binds through that path when a native binder takes the property
+           (a text, a color, a brush), and to FunctionName by name otherwise. */
+        if (!WidgetBindings.empty())
+            Tag(Ar, "Bindings", "ArrayProperty", [=](FArc& V) {
+                FArc Elements(V.Owner());
+                for (const FPropertyBinding& B : WidgetBindings)
+                {
+                    Tag(Elements, "ObjectName", "StrProperty", [=](FArc& E) { E.Str(B.Widget); });    // a C++ name, so ASCII
+                    Tag(Elements, "PropertyName", "NameProperty", [=](FArc& E) { E.Name(B.Property); });
+                    Tag(Elements, "FunctionName", "NameProperty", [=](FArc& E) { E.Name(B.Function); });
+                    Tag(Elements, "SourcePath", "StructProperty", [=](FArc& E) {
+                        Tag(E, "Segments", "ArrayProperty", [=](FArc& S) {
+                            FArc Segment(S.Owner());
+                            Tag(Segment, "Name", "NameProperty", [=](FArc& N) { N.Name(B.Function); });
+                            Tag(Segment, "ArrayIndex", "IntProperty", [](FArc& N) { N.I32(-1); });
+                            TagEnd(Segment);
+                            StructArray(S, "Segments", "PropertyPathSegment", 1, Segment);
+                        }, "StructProperty");
+                        Tag(E, "CachedFunction", "ObjectProperty", [](FArc& N) { N.Idx(Null()); });
+                        TagEnd(E);
+                    }, "DynamicPropertyPath");
+                    Tag(Elements, "Kind", "EnumProperty", [](FArc& E) { E.Name("EBindingKind::Function"); }, "EBindingKind");
+                    TagEnd(Elements);
+                }
+                StructArray(V, "Bindings", "DelegateRuntimeBinding", int32(WidgetBindings.size()), Elements);
+            }, "StructProperty");
+        if (!SlotNames.empty())
+            Tag(Ar, "NamedSlots", "ArrayProperty", [=](FArc& V) {
+                V.I32(int32(SlotNames.size()));
+                for (const std::string& N : SlotNames) V.Name(N);
+            }, "NameProperty");
         if (NumReplicated > 0)
             Tag(Ar, "NumReplicatedProperties", "IntProperty", [=](FArc& V) { V.I32(NumReplicated); });
         /* UBlueprintGeneratedClass::GetDynamicBindingObject looks a binding object up here by its class. */
@@ -672,6 +713,37 @@ void FBlueprintClass::Finish()
         P.AddExport(std::move(Binding));
     }
 
+    /* Measured on Basic_FlatButton's ComponentDelegateBinding_0: the class's subobject with no object flags, each
+       FBlueprintComponentDelegateBinding written whole. */
+    if (!ComponentBindings.empty())
+    {
+        const FIndex KindClass = EngineClass("/Script/Engine", "ComponentDelegateBinding");
+        const FIndex KindCdo = ClassDefaultObject("/Script/Engine", "ComponentDelegateBinding");
+        FExport Binding;
+        Binding.ClassIndex = KindClass;
+        Binding.TemplateIndex = KindCdo;
+        Binding.OuterIndex = Exp(RowClass);
+        Binding.ObjectName = "ComponentDelegateBinding_0";
+        Binding.SerBeforeCreate = { KindClass.V, KindCdo.V };
+        Binding.CreateBeforeCreate = { Exp(RowClass).V };
+        Binding.Serialize = [Of = ComponentBindings](FArc& Ar) {
+            Tag(Ar, "ComponentDelegateBindings", "ArrayProperty", [&](FArc& V) {
+                FArc Elements(V.Owner());
+                for (const FComponentBinding& B : Of)
+                {
+                    Tag(Elements, "ComponentPropertyName", "NameProperty", [&](FArc& E) { E.Name(B.Component); });
+                    Tag(Elements, "DelegatePropertyName", "NameProperty", [&](FArc& E) { E.Name(B.Delegate); });
+                    Tag(Elements, "FunctionNameToBind", "NameProperty", [&](FArc& E) { E.Name(B.Function); });
+                    TagEnd(Elements);
+                }
+                StructArray(V, "ComponentDelegateBindings", "BlueprintComponentDelegateBinding", int32(Of.size()), Elements);
+            }, "StructProperty");
+            TagEnd(Ar);
+            Ar.Bool(false);
+        };
+        P.AddExport(std::move(Binding));
+    }
+
     /* Measured on BP_LostPackStart's LightTimeline_Template and its CurveFloat_0 / CurveFloat_1, BP_DorettaHead's
        CurveVector_0: the template is the class's subobject <Timeline>_Template, flag Transactional, and each curve the
        class's subobject too, Public | Transactional, named as MakeUniqueCurveName numbers them, by curve class. The
@@ -813,6 +885,10 @@ void FBlueprintClass::Finish()
                 if (WidgetSlots[I].Panel == W.Name) Slots.push_back(Exp(RowFirstWidgetSlot + int32(I)));
                 if (WidgetSlots[I].Child == W.Name) Own = Exp(RowFirstWidgetSlot + int32(I));
             }
+            /* A nested user widget's named slots this tree fills, {slot name, content}. */
+            std::vector<std::pair<std::string, FIndex>> Fills;
+            for (const FWidgetSlotFill& F : WidgetSlotFills)
+                if (F.Host == W.Name) Fills.push_back({ F.Slot, Exp(WidgetRow(F.Content)) });
             FExport E;
             E.ClassIndex = W.Class;
             E.TemplateIndex = W.Cdo;
@@ -820,13 +896,26 @@ void FBlueprintClass::Finish()
             E.ObjectName = W.Name;
             E.ObjectFlags = RF_Transactional;
             for (const FIndex& S : Slots) E.CreateBeforeSer.push_back(S.V);
+            for (const auto& F : Fills) E.CreateBeforeSer.push_back(F.second.V);      // as Screen_CharacterInfo's TopLeftCurve
             if (Own.V != 0) E.CreateBeforeSer.push_back(Own.V);
             for (const FPropertyDef& D : W.Defaults) TagRefs(D, E.CreateBeforeSer);
             E.SerBeforeCreate = { W.Class.V, W.Cdo.V };
             E.CreateBeforeCreate = { Exp(RowTree).V };
-            /* Its own class's properties first, then UPanelWidget's Slots and UWidget's Slot, the cook's order. */
+            /* Its own class's properties first, then UUserWidget's NamedSlotBindings (measured on Screen_CharacterInfo,
+               each FNamedSlotBinding whole), UPanelWidget's Slots and UWidget's Slot, the cook's order. */
             E.Serialize = [=, Defaults = W.Defaults](FArc& Ar) {
                 for (const FPropertyDef& D : Defaults) WriteDefaultTag(Ar, D);
+                if (!Fills.empty())
+                    Tag(Ar, "NamedSlotBindings", "ArrayProperty", [&](FArc& V) {
+                        FArc Elements(V.Owner());
+                        for (const auto& F : Fills)
+                        {
+                            Tag(Elements, "Name", "NameProperty", [&](FArc& N) { N.Name(F.first); });
+                            Tag(Elements, "Content", "ObjectProperty", [&](FArc& N) { N.Idx(F.second); });
+                            TagEnd(Elements);
+                        }
+                        StructArray(V, "NamedSlotBindings", "NamedSlotBinding", int32(Fills.size()), Elements);
+                    }, "StructProperty");
                 if (!Slots.empty())
                     Tag(Ar, "Slots", "ArrayProperty", [=](FArc& V) {
                         V.I32(int32(Slots.size()));

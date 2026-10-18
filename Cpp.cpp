@@ -310,13 +310,24 @@ bool AttachmentCall(const Json& S, const Json*& Callee, const Json*& Child, cons
     return Child != nullptr;
 }
 
+/* UE_SLOT's and UE_BIND's call (UeMeta.h), "UeSlot__" or "UeBind__", or "" for any other statement. */
+std::string LayoutHelperCall(const Json& S)
+{
+    const Json* N = Strip(&S);
+    const Json* Fn = N && Kind(*N) == "CallExpr" ? Strip(First(*N)) : nullptr;
+    const std::string Name = Fn && Kind(*Fn) == "DeclRefExpr" ? Fn->value("referencedDecl", Json::object()).value("name", std::string())
+                                                               : std::string();
+    return Name == "UeSlot__" || Name == "UeBind__" ? Name : std::string();
+}
+
 /* S39: a statement of a widget class's layout by its shape alone, `Root->AddChildToCanvas(Title)->SetPosition(...);`,
-   `Title->SetText(...);` or `UCanvasPanelSlot* At = Root->AddChildToCanvas(Title);`: a method call or a local. Generate
-   reads what it means and refuses what it cannot. */
+   `Title->SetText(...);`, `Play->OnClicked.Add(this, &UMyCard::OnPlay);`, `UCanvasPanelSlot* At = Root->AddChildToCanvas(Title);`
+   or a UE_SLOT or UE_BIND: a method call, a local or a layout helper. Generate reads what it means and refuses what it
+   cannot. */
 bool WidgetLayoutStatement(const Json& S)
 {
     const Json* N = Strip(&S);
-    return N && (Kind(*N) == "CXXMemberCallExpr" || Kind(*N) == "DeclStmt");
+    return N && (Kind(*N) == "CXXMemberCallExpr" || Kind(*N) == "DeclStmt" || !LayoutHelperCall(S).empty());
 }
 
 /* A set's or map's elements as the braces leave them in C++: each key once, where it first appears, holding the last
@@ -16231,7 +16242,10 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         std::map<std::string, double> Layout;
     };
     std::vector<FLayoutSlot> LayoutSlots;
-    auto IsWidgetOf = [](const FRecord& Of, const std::string& N) {
+    /* UE_SLOT(Host->Slot, Content): Content, a widget of this tree, in the named slot Slot (its engine name) of Host. */
+    struct FSlotFill { std::string Host, Slot, Content; };
+    std::vector<FSlotFill> SlotFills;
+    auto IsWidgetOf =[](const FRecord& Of, const std::string& N) {
         return std::find(Of.Widgets.begin(), Of.Widgets.end(), N) != Of.Widgets.end();
     };
     auto Derives = [&](const FRecord* C, const char* UeName) {
@@ -16374,6 +16388,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             if (Child == Panel) return Refuse(Child + " is added to itself");
             for (const FLayoutSlot& S : LayoutSlots)
                 if (S.Child == Child) return Refuse(Child + " is added to " + S.Panel + " already; a widget has one parent");
+            for (const FSlotFill& F : SlotFills)
+                if (F.Content == Child) return Refuse(Child + " fills " + F.Host + "'s slot " + F.Slot + " already; a widget has one parent");
             const FRecord* PanelClass = WidgetClassOf(Panel);
             if (!Derives(PanelClass, "PanelWidget")) return Refuse(Panel + " is no panel, so it holds no widget");
             if (Derives(PanelClass, "ContentWidget"))
@@ -16482,6 +16498,98 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 if (At < 0) return false;
                 SlotLocals[Var->value("id", std::string())] = size_t(At);
                 return true;
+            }
+            /* The object a member expression is reached through, `Card` of `Card->Body`, as the UE_WIDGET it names. */
+            auto WidgetOfMember = [&](const Json* M) {
+                M = Strip(M);
+                return M && Kind(*M) == "MemberExpr" ? WidgetNamed(First(*M)) : std::string();
+            };
+            /* UE_SLOT(Card->Body, Inner): Inner, in no panel, fills the named slot Body of the nested user widget Card.
+               UUserWidget::InitializeNamedSlots finds the UNamedSlot by Body's name on Card's class and adds Inner to it;
+               a mod class's slot must be a widget of its tree, or that variable is null there. */
+            const std::string Helper = LayoutHelperCall(*N);
+            if (Helper == "UeSlot__")
+            {
+                const Json* SlotE = Strip(Nth(*N, 1));
+                const std::string Host = WidgetOfMember(SlotE), Content = WidgetNamed(Nth(*N, 2));
+                if (Host.empty() || Content.empty())
+                { *Err = Where + ": UE_SLOT fills a named slot of one of this class's UE_WIDGETs with another, each by its "
+                         "member name: `UE_SLOT(Frame->Body, Inner)`"; return false; }
+                const std::string Slot = Name(*SlotE);
+                const FRecord* SlotOwner = Find(OwnerOf(*SlotE));
+                if (!Derives(WidgetClassOf(Host), "UserWidget"))
+                { *Err = Where + ": " + Host + " is no user widget, so it has no named slot to fill"; return false; }
+                if (SlotOwner && !SlotOwner->IsNative() && !IsWidgetOf(*SlotOwner, Slot))
+                { *Err = Where + ": " + SlotOwner->CppName + "::" + Slot + " is no UE_WIDGET, so no slot of " + SlotOwner->CppName
+                         + "'s tree; declare it `UE_WIDGET(UNamedSlot, " + Slot + ")`"; return false; }
+                if (Content == R.Widgets.front()) { *Err = Where + ": " + Content + " is the tree's root, which nothing holds"; return false; }
+                if (Content == Host) { *Err = Where + ": " + Content + " fills its own slot"; return false; }
+                for (const FLayoutSlot& S : LayoutSlots)
+                    if (S.Child == Content)
+                    { *Err = Where + ": " + Content + " is added to " + S.Panel + " already; a widget has one parent"; return false; }
+                const std::string SlotName = SlotOwner ? UeNameOf(SlotOwner, Slot) : Slot;
+                for (const FSlotFill& F : SlotFills)
+                {
+                    if (F.Content == Content)
+                    { *Err = Where + ": " + Content + " fills " + F.Host + "'s slot " + F.Slot + " already; a widget has one parent"; return false; }
+                    if (F.Host == Host && F.Slot == SlotName)
+                    { *Err = Where + ": " + Host + "'s slot " + SlotName + " holds " + F.Content + " already; a named slot holds one widget"; return false; }
+                }
+                SlotFills.push_back({ Host, SlotName, Content });
+                return true;
+            }
+            /* UE_BIND(Title, Text, &UMyCard::GetScore): an entry of the class's Bindings, Title's TextDelegate bound to a
+               function of this class. UeMeta.h's overloads have already held the function to the property's type and no
+               parameters. */
+            if (Helper == "UeBind__")
+            {
+                const std::string W = WidgetOfMember(Nth(*N, 1));
+                const Json* PropE = Strip(Nth(*N, 2));
+                const Json* Fn = Strip(Nth(*N, 3));
+                if (Fn && Kind(*Fn) == "UnaryOperator") Fn = Strip(First(*Fn));
+                if (W.empty() || !PropE || Kind(*PropE) != "MemberExpr" || !Fn || Kind(*Fn) != "DeclRefExpr")
+                { *Err = Where + ": UE_BIND binds a property of one of this class's UE_WIDGETs to a function of this class: "
+                         "`UE_BIND(Title, Text, &UMyCard::GetScore)`"; return false; }
+                const Json& Ref = (*Fn)["referencedDecl"];
+                const std::string FnName = Name(Ref);
+                const auto M = MethodOwner.find(Ref.value("id", std::string()));
+                const FRecord* FnOwner = M == MethodOwner.end() ? nullptr : Find(M->second);
+                bool bMine = false;
+                for (const FRecord* A = &R; A && FnOwner && !bMine; A = A->Base.empty() ? nullptr : Find(A->Base)) bMine = A == FnOwner;
+                if (!bMine)
+                { *Err = Where + ": UE_BIND's " + FnName + " is a function of this class or of a class above it, which the "
+                         "engine calls on this widget by name"; return false; }
+                if (!FnOwner->IsNative() && (IsInlineMethod(*FnOwner, FnName) || !CompilesMethod(*FnOwner, FnName)))
+                { *Err = Where + ": UE_BIND's " + FnOwner->CppName + "::" + FnName + " is no function the class has (an inline "
+                         "one is expanded where it is called; one only declared is none)"; return false; }
+                const FRecord* PropOwner = Find(OwnerOf(*PropE));
+                BP.AddPropertyBinding({ W, PropOwner ? UeNameOf(PropOwner, Name(*PropE)) : Name(*PropE), UeNameOf(FnOwner, FnName) });
+                return true;
+            }
+            /* `Play->OnClicked.Add(this, &UMyCard::OnPlay)`: an entry of the class's ComponentDelegateBinding, which
+               BindDynamicDelegates adds to the widget's dispatcher as each widget is made, the designer's "On Clicked"
+               node. LowerDelegateValue holds the function to what the editor binds. */
+            if (const Json* Callee = Strip(First(*N)); Callee && Kind(*Callee) == "MemberExpr" && Name(*Callee) == "Add")
+            {
+                const Json* Disp = Strip(First(*Callee));
+                if (const std::string W = WidgetOfMember(Disp); !W.empty())
+                {
+                    const Json* Self = Strip(Nth(*N, 1));
+                    if (!Self || Kind(*Self) != "CXXThisExpr" || !Nth(*N, 2))
+                    { *Err = Where + ": a layout binds " + W + "'s " + Name(*Disp) + " to a function of this widget: `" + W + "->"
+                             + Name(*Disp) + ".Add(this, &" + R.CppName + "::OnPlay)`"; return false; }
+                    const FRecord* DOwner = DispatcherOwner(*Disp);
+                    const bool bNative = DOwner && DOwner->IsNative() && DOwner->UePackage.compare(0, 6, "/Game/") != 0;
+                    if (const auto Marked = bNative ? DOwner->Dispatchers.find(Name(*Disp)) : std::map<std::string, std::string>::const_iterator();
+                        bNative && Marked != DOwner->Dispatchers.end() && (" " + Marked->second + " ").find(" Assignable ") == std::string::npos)
+                    { *Err = Where + ": " + W + "->" + Name(*Disp) + " is a native dispatcher that is not BlueprintAssignable, and the "
+                             "editor binds none such"; return false; }
+                    FArgIR Bound;
+                    if (!LowerDelegateValue(*Self, *Nth(*N, 2), std::string(), Null(), Name(*Disp), BP, Bound, Err))
+                    { *Err = Where + ": " + *Err; return false; }
+                    BP.AddComponentBinding({ W, DOwner ? UeNameOf(DOwner, Name(*Disp)) : Name(*Disp), Bound.S });
+                    return true;
+                }
             }
             const int32 Added = AddCall(N);
             if (Added != -2) return Added >= 0;
@@ -16982,23 +17090,39 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     std::stable_sort(ClassVars.begin(), ClassVars.end(), [](const auto& A, const auto& B) { return A.first > B.first; });
     for (const auto& V : ClassVars) BP.AddVariable(V.second);
 
-    /* S39: each widget but the root sits in a panel, and that panel in the tree. One no panel holds, or a ring of panels
-       holding one another, is out of the tree the engine walks from its root (UWidgetTree::ForEachWidget). */
+    /* S39: each widget but the root sits in a panel or fills a nested widget's named slot, and that one in the tree. One
+       nothing holds, or a ring of them holding one another, is out of the tree the engine walks from its root
+       (UWidgetTree::ForEachWidget, which goes into a named slot's content through GetContentForSlot). */
     for (const std::string& W : R.Widgets)
     {
         std::string At = W;
         for (size_t Steps = 0; At != R.Widgets.front(); ++Steps)
         {
             const auto S = std::find_if(LayoutSlots.begin(), LayoutSlots.end(), [&](const FLayoutSlot& L) { return L.Child == At; });
-            if (S == LayoutSlots.end())
+            const auto F = std::find_if(SlotFills.begin(), SlotFills.end(), [&](const FSlotFill& L) { return L.Content == At; });
+            if (S == LayoutSlots.end() && F == SlotFills.end())
             { *Err = R.CppName + "::" + W + ": " + (At == W ? std::string("no panel holds it") : "it sits in " + At + ", which no panel holds")
                      + ", so it is out of the tree, whose root is " + R.Widgets.front() + "; add it to a panel in the constructor, "
                      "`Root->AddChildToCanvas(" + At + ")`"; return false; }
             if (Steps == R.Widgets.size())
             { *Err = R.CppName + "::" + W + ": its panels hold one another in a ring, which the tree's root never reaches"; return false; }
-            At = S->Panel;
+            At = S != LayoutSlots.end() ? S->Panel : F->Host;
         }
     }
+    /* The class's NamedSlots: its UNamedSlot widgets in the order ForEachWidget meets them, as the editor's compile lists
+       them (a widget, then the contents of its named slots, then its panel's children). */
+    if (!R.Widgets.empty())
+    {
+        std::vector<std::string> Slots;
+        std::function<void(const std::string&)> Walk = [&](const std::string& W) {
+            if (Derives(WidgetClassOf(W), "NamedSlot")) Slots.push_back(W);
+            for (const FSlotFill& F : SlotFills) if (F.Host == W) Walk(F.Content);
+            for (const FLayoutSlot& S : LayoutSlots) if (S.Panel == W) Walk(S.Child);
+        };
+        Walk(R.Widgets.front());
+        BP.SetNamedSlots(Slots);
+    }
+    for (const FSlotFill& F : SlotFills) BP.AddWidgetSlotFill(F.Host, F.Slot, F.Content);
     /* A canvas slot's LayoutData, of the parts its setters set: tags of an FAnchorData (Offsets, Anchors and Alignment,
        the first two tagged structs and the last a raw Vector2D), a part left unset keeping the slot's default value. */
     for (FLayoutSlot& S : LayoutSlots)

@@ -210,6 +210,23 @@ public:
        Content, listed in the panel's Slots and named by the child's Slot. Both widgets are added with AddWidget. */
     void AddWidgetSlot(const std::string& Panel, const std::string& Child, FIndex Class, FIndex Cdo,
                        const std::vector<FPropertyDef>& Defaults);
+    /* Content, a widget of this tree in no panel, fills the named slot Slot of the nested user widget Host: an entry of
+       Host's NamedSlotBindings, which UUserWidget::InitializeNamedSlots adds to the UNamedSlot variable of that name. */
+    void AddWidgetSlotFill(const std::string& Host, const std::string& Slot, const std::string& Content)
+    {
+        WidgetSlotFills.push_back({ Host, Slot, Content });
+    }
+    /* The class's NamedSlots: the names of its tree's UNamedSlot widgets, which UUserWidget::GetSlotNames answers. */
+    void SetNamedSlots(const std::vector<std::string>& Names) { NamedSlots = Names; }
+    /* An entry of the class's ComponentDelegateBinding: Function on the widget object bound to the multicast delegate
+       Delegate of the widget the variable Component holds (ComponentDelegateBinding.cpp 12-38), as the designer's
+       "On Clicked (Play)" node is. */
+    struct FComponentBinding { std::string Component, Delegate, Function; };
+    void AddComponentBinding(const FComponentBinding& Binding) { ComponentBindings.push_back(Binding); }
+    /* An entry of the class's Bindings: the property Property of the widget variable Widget, read from Function each
+       time it is drawn (InitializeBindingsStatic binds the widget's <Property>Delegate). */
+    struct FPropertyBinding { std::string Widget, Property, Function; };
+    void AddPropertyBinding(const FPropertyBinding& Binding) { PropertyBindings.push_back(Binding); }
 
     /* The actor has a root before this class's SCS runs: a Blueprint parent's SCS leaves one, and a native parent's
        constructor sets one or ExecuteConstruction takes its first native scene component. Then the DefaultSceneRoot
@@ -326,6 +343,11 @@ private:
         std::vector<FPropertyDef> Defaults;
     };
     std::vector<FWidgetSlot> WidgetSlots;
+    struct FWidgetSlotFill { std::string Host, Slot, Content; };
+    std::vector<FWidgetSlotFill> WidgetSlotFills;
+    std::vector<std::string> NamedSlots;
+    std::vector<FComponentBinding> ComponentBindings;
+    std::vector<FPropertyBinding> PropertyBindings;
 
     int32 ClassRow = 0;
 };
