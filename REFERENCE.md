@@ -716,7 +716,7 @@ Notes:
 | `Sum / N` with two int32 | Integer division, as in C++. Each operation takes the type C++ promotes to: float if either side is float, otherwise int64 if either side is int64, otherwise int32. | Yes |
 | `A / B` with `int32 A`, `float B` | `A` converts to float, then a float divide. | Yes |
 | `(bool)F`, `bool B = Count;` | True when nonzero, as in C++. An int32 goes through ToBool (integer) (Conv_IntToBool); a float, int64, byte or enum is compared with zero, so a NaN is true. Conditions of every type: [Statements and control flow](#statements-and-control-flow). | Yes |
-| `+`, `%`, `<<`, `~` and the other operators | The Kismet math nodes: [Operators](#operators). A shift amount must be a bare integer literal, and `%` on int64 is refused. | Yes |
+| `+`, `%`, `<<`, `~` and the other operators | The Kismet math nodes: [Operators](#operators). A shift amount must be a constant, and `%` on int64 is refused. | Yes |
 
 ```cpp
 int32 Count;
@@ -1002,7 +1002,7 @@ Notes:
 | `UE_ENUM_MAP(TEnum<EMood>, FName, M);` | Refused the same way: write the enum itself, `UE_ENUM_MAP(EMood, FName, M);`. | Refused |
 | `TMap<int32, FName> M = UE_ENUM_MAP(EMood);` | Refused by clang, "no viable conversion from '__EnumMapInit__<EMood>' to 'TMap<int32, FName>'": the one-argument form is the default of a TMap between that enum and FName or FString. | Refused |
 | `UE_ENUM_MAP(FName, EMood);`, `UE_ENUM_MAP(FName, EMood, A, B);` | Refused by clang: "UE_ENUM_MAP takes (Enum), or (Key, Value, Name) to declare the member". Written as an initializer, `= UE_ENUM_MAP(FName, EMood)`, clang says only "expected expression". | Refused |
-| `UE_ENUM_MAP(EMood)` in a function body | Not yet: refused with `unimplemented intrinsic __EnumMap__`. Keep the table as a member and read the member. | Not yet |
+| `TMap<EMood, FName> Names = UE_ENUM_MAP(EMood);` in a function body | The same table, made where it is written as the braced map `{ { EMood::Calm, "Calm" }, ... }` would be: the enum on either side, FName or FString on the other. It is made each time the line runs, so a table read often is cheaper as a member. | Yes |
 
 ```cpp
 UE_ENUM_MAP(EMood, FName, MoodNames);      // Calm, Angry, Sleepy
@@ -1453,16 +1453,16 @@ Notes:
 | `Hi << 16` | Kismet has no shift node. `X << N` is a multiply by 2^N, which wraps as a shift does. | Yes |
 | `X >> 1` | Clears the low N bits and then divides, so it floors as C++ does: -3 >> 1 is -2 and -7 >> 1 is -4. A uint8 is promoted to int first, so 255 >> 1 is 127. | Yes |
 | `X << 3LL`, `X << SHIFT` | The amount may be any integer literal, with any suffix, or a macro that expands to one. The width comes from the left side alone, so `int32 >> 1LL` is int32 math. | Yes |
-| `1 << kShift` | When both sides are constants the whole shift folds to a constant before the amount is checked, so a named amount works here. | Yes |
+| `X << kShift`, `X >> (2)` | The amount may be any constant C++ knows when it compiles: a constexpr or const variable, a const local, an enumerator, a cast such as `(int32)3`, `sizeof(...)`, a template's value parameter, and an inline function's parameter when the caller passes a constant. | Yes |
+| `1 << kShift` | When both sides are constants the whole shift folds to a constant. | Yes |
 | `X << 32` | Refused ("bit shift amount out of range"). The amount must be 0..31 for an int32 and 0..63 for an int64 left side. | Refused |
 | `X << N`, `X <<= N` with a variable N | Refused ("bit shift with a non-constant amount"): Kismet has no shift node, and a run-time amount cannot become a constant multiplier. Multiply or divide by a power of two instead. | Refused |
-| `X << kShift`, `X >> (2)` | Refused today with the same message, although the amount is a constant: only a bare integer literal is read as the amount. The same goes for a constexpr or const variable, a const local, an enumerator, a cast such as `(int32)3`, `sizeof(...)`, a template parameter and an inline function's parameter, even when the caller passes a literal. Write the literal. | Not yet |
 
 ```cpp
 static constexpr int32 kShift = 3;
 int32 Pack(int32 Hi, int32 Lo) { return (Hi << 16) | (Lo & 0xFFFF); }
 int32 Half(int32 X) { return X >> 1; }                    // -3 >> 1 is -2, as in C++
-int32 Eight(int32 X) { return (X << 3) | (1 << kShift); } // 1 << kShift folds to 8
+int32 Eight(int32 X) { return (X << kShift) | (1 << kShift); } // 1 << kShift folds to 8
 ```
 
 Notes:
@@ -1902,7 +1902,7 @@ Notes:
 
 | You write | What it does | Status |
 |---|---|---|
-| `using T = int32; T A = X;` | A local whose type is spelled through an alias declared inside the function is refused today ("unimplemented local A: T"). The alias itself compiles to nothing. Spell the type out. | Not yet |
+| `using T = int32; T A = X;`, `typedef TArray<T> FList;` | An alias declared inside a function means its type from the declaration to the end of the block holding it, as in C++. The alias itself compiles to nothing. | Yes |
 | `auto [A, B] = Point;` | Refused outside a TMap range-for ("a declaration statement declares nothing usable"). Read the members: `int32 A = Point.X;`. | Refused |
 | `auto Inc = [](int32 V) { return V + 1; };` | A lambda is refused; see [Functions](#functions). | Refused |
 
@@ -2387,7 +2387,8 @@ Notes:
 | `FMath::Clamp(V, 0, 10)` | clang error `use of undeclared identifier 'FMath'`: FMath is not part of the reflected API, so UeApi does not declare it. Use UKismetMathLibrary. | Refused |
 | `std::min(A, B)`, `std::sqrt(X)`, `__builtin_sqrtf(X)` | Refused, even with `#include <algorithm>` or `<cmath>` (`call to an unknown function`): a mod has no C++ standard library to call into. Use UKismetMathLibrary, or write the helper as an inline function. | Refused |
 | `if constexpr (__is_same(T, int32))`, `static_assert(__is_same(int32, int))` | clang's type-trait builtins work in place of `<type_traits>` where clang decides them at build time. | Yes |
-| `bool B = __is_same(A, B);`, `if (__is_same(A, B))`, `return __is_same(A, B) ? 1 : 0;` | Refused ("unimplemented argument TypeTraitExpr"), even in a `constexpr bool` local. Put the test in `if constexpr`. | Not yet |
+| `bool B = __is_same(A, B);`, `if (__is_same(A, B))`, `return __is_same(A, B) ? 1 : 0;` | The constant true or false, compared through aliases and typedefs as clang compares types: `__is_same(int32, int)` is true. | Yes |
+| `bool B = __is_base_of(AActor, T);` and the other traits | Refused as a value ("unimplemented argument TypeTraitExpr"). Put the test in `if constexpr` or a `requires` clause. | Refused |
 
 ```cpp
 int32 Clamped(int32 V) { return UKismetMathLibrary::Clamp(V, 0, 10); }
@@ -2638,7 +2639,8 @@ Notes:
 | `inline auto TwiceN(Number auto V)`, or `int32 AutoP(auto V)` in a class | An `auto` parameter makes the function a template, expanded at each call. A free one needs `inline`. | Yes |
 | `template <class T> concept Number = requires(T A) { A + A; };` | Concepts and requires-clauses are checked by clang and cost nothing at run time. A wrong type is a "constraints not satisfied" error on the calling line. | Yes |
 | `template <class... T> inline int32 Fwd(T... V) { return Sum2(V...); }` | Pack expansion into a call works. | Yes |
-| `sizeof...(V)` | Refused: `unimplemented argument SizeOfPackExpr`. | Not yet |
+| `sizeof...(V)`, `sizeof...(T)` | The number of arguments in the pack, of a parameter pack or of a template's type pack, as a constant; 0 for an empty pack. | Yes |
+| `template <int32 N> inline int32 Times(int32 X) { return X * N; }` | A template's value parameter is the constant the call gave it. | Yes |
 | `if constexpr (sizeof(T) == 8)` | Only the branch clang kept is compiled; no test or jump is left in the bytecode. | Yes |
 
 ```cpp
@@ -2662,7 +2664,7 @@ Notes:
 
 - A mod has no C++ standard library, so use clang builtins such as `__is_base_of(Base, T)` and `__is_same(A, B)`
   rather than `<concepts>` or `<type_traits>`. They compile where clang decides them at build time (`if constexpr`,
-  `static_assert`); used as a run-time value they are refused ("unimplemented argument TypeTraitExpr").
+  `static_assert`). As a value only `__is_same` is read; any other is refused ("unimplemented argument TypeTraitExpr").
 
 ### constexpr and consteval functions
 
@@ -4171,7 +4173,8 @@ Notes:
 | `PC->IsInputKeyDown(K)`, `PC->WasInputKeyJustReleased(K)`, `PC->GetInputKeyTimeDown(K)` | True while the key is held; true during the frame in which it comes up; how long it has been held. | Yes |
 | `FKey{"F5"}`, `FKey{FName("F5")}` | A key value, named by the engine's key names. It works as an argument, a local, a class variable and a `static inline const` member. | Yes |
 | `FKey{"Space"}` | Compiles, with a warning naming the closest key, SpaceBar: no input matches it. It is not refused, as code may compare it with a key the engine makes up as it runs. | Warns |
-| `FKey("F5")`, `FKey(FName("F5"))`, `FKey K{FName("F5")};`, `FKey K = {"F5"};` | Refused today: "no Kismet conversion from FString to FKey". Write `FKey{...}` out in full. | Not yet |
+| `FKey("F5")`, `FKey(FName("F5"))`, `FKey K{FName("F5")};`, `FKey K = {"F5"};` | The same key as `FKey{"F5"}`, and the same warning for a name the engine has no key of. So is any one-member struct's constructor in parentheses, `FFrameNumber(5)`. | Yes |
+| `FKey(Name)`, `FKey(FName(S))`, `FKey(S)` with a run-time FName or FString | The key of that name, made when the line runs: a string is made a name first (Conv_StringToName), as FKey's own constructor takes one. No warning can be given for a name not known when the mod is built. | Yes |
 | `PC->WasInputKeyJustPressed("F5")` | clang error: "no viable conversion from 'const char[3]' to 'FKey'". | Refused |
 | `C->OnFirePressed.Add(this, &Toggler::OnFire)` | For the player's own actions, bind the game's dispatchers on APlayerCharacter: OnFirePressed, OnFireReleased, OnJumpPressed, OnSecondaryFirePressed, OnLaserPointerPressed, OnTerrainScannerPressed and others. They fire for whatever key the player has mapped to that action. | Yes |
 | `InputComponent->BindKey(...)`, `BindAction(...)` | clang error: "no member named 'BindKey' in 'UInputComponent'". They are native C++ only and absent from the SDK; mark a method instead. | Refused |
@@ -5554,7 +5557,7 @@ listed here is refused with "unimplemented intrinsic".
 | `final` | On a class or a virtual method: no subclass has a version of its own. The functions are cooked Final, and calls to them are direct and, on `this`, copied in. | [Calling your own functions](#calling-your-own-functions) |
 | `FinishComponent(Owner, Component)` | Registers a component that AddComponentDeferred held back. | [Components](#components) |
 | `FinishSpawning(Actor, Transform)` | Finishes an actor that SpawnActorDeferred began: its construction script and BeginPlay run. | [Creating objects](#creating-objects) |
-| `FKey{"F5"}` | A key for the player controller's key queries, such as IsInputKeyDown. Write it with braces: `FKey("F5")` is refused today. | [Timers and input](#timers-and-input) |
+| `FKey{"F5"}`, `FKey("F5")` | A key for the player controller's key queries, such as IsInputKeyDown. | [Timers and input](#timers-and-input) |
 | `FLatentActionInfo` | Leave it out of a latent call. The compiler supplies it. | [Latent calls](#latent-calls) |
 | `for (auto &X : Items)`, `for (auto &[Key, Value] : Map)` | Range-for: a TArray by index, a TSet through a copy, a TMap by key and value. | [Loops](#loops) |
 | FString methods, `S.Len()` | UKismetStringLibrary statics as methods, the string first: `S.Len()` is `UKismetStringLibrary::Len(S)`. | [Strings and text](#strings-and-text) |
@@ -5852,9 +5855,6 @@ and where the feature is described. In each group, the messages you are most lik
 - `UE_ENUM(<Enum>): <Enum>_MAX is the sentinel the engine adds, one past the largest value; leave it out or give it
   that value`: the enum declares its own `_MAX` with another value, as in `{ A, B, EGear_MAX = 7 }`. Fix: drop the
   explicit value, or the enumerator. See [Enums](#enums).
-- `<Class>::<Function>: TODO: unimplemented intrinsic __EnumMap__`: Not yet. UE_ENUM_MAP in a function body is
-  refused. It works only as a member default. Fix: keep the table in a member,
-  `UE_ENUM_MAP(EMood, FName, Names);`, and read the member. See [Enums](#enums).
 - `static assertion failed due to requirement '__EnumMapPair__<<Key>, <Value>>': UE_ENUM_MAP(Key, Value, Name): one of
   Key and Value is an enum and the other FName or FString; for a TEnum<E>, write E` (clang, pointing into UeMeta.h,
   with a note at your line): the three-argument form over two types that are not an enum and FName or FString, such
@@ -5893,7 +5893,8 @@ and where the feature is described. In each group, the messages you are most lik
   [Containers](#containers).
 - `a braced list makes a TArray, TSet or TMap here, not a <Type>`, `unknown struct type in an initializer: <Type>`,
   `<Name> is inline, so it needs its initializer where it is declared`
-  and `UE_ENUM_MAP: <Member> is not a map over an enum`: checks behind clang's and AssetGen's earlier ones, which a
+  `UE_ENUM_MAP: <Member> is not a map over an enum` and `UE_ENUM_MAP makes a TMap between an enum and FName or
+  FString, not a <Type>`: checks behind clang's and AssetGen's earlier ones, which a
   source rarely reaches. Fix: name the container type of a braced list, `TArray<int32> L = { 1, 2, 3 };`; include the
   header that declares a struct; give an inline constant its value where it is declared; use
   UE_ENUM_MAP only on a `TMap<E, FName>`, `TMap<FName, E>`, `TMap<E, FString>` or `TMap<FString, E>`. See
@@ -5902,12 +5903,11 @@ and where the feature is described. In each group, the messages you are most lik
 ### Operators, statements and loops
 
 - `bit shift with a non-constant amount (Kismet has no shift op; use explicit multiply/divide)`: Blueprint has no shift
-  node. AssetGen turns a shift into a multiply or divide only when the amount is an integer literal written in place.
-  A variable, `X <<= N`, a `constexpr` or `const` constant, an enumerator, a cast, `sizeof` and a parenthesized `(2)`
-  all get this message, though C++ treats several of them as constants. A macro that expands to a literal works. A
-  shift whose two sides are both constants is worked out first, so `1 << kShift` works. Fix: write the literal,
-  `X << 3`, or multiply or divide by a power of two. See [Operators](#operators).
-- `bit shift amount out of range: <N>`: a literal amount at or past the width of the left side: more than 31 on an
+  node. AssetGen turns a shift into a multiply or divide only when the amount is a constant: a literal, a `constexpr`
+  or `const` variable, an enumerator, a cast of one, `sizeof`, a template's value parameter. A variable amount, in
+  `X << N` or `X <<= N`, gets this message. Fix: make the amount a constant, or multiply or divide by a power of two. See
+  [Operators](#operators).
+- `bit shift amount out of range: <N>`: a constant amount at or past the width of the left side: more than 31 on an
   int32, more than 63 on an int64, as in `X << 32` with an int32 `X`. The width comes from the left side only. Fix: keep
   the amount in 0..31 for an int32 and 0..63 for an int64, and widen the left side first for a larger shift,
   `(int64)X << 40`. See [Operators](#operators).
@@ -6541,11 +6541,6 @@ so the retail game prints nothing. See [Strings and text](#strings-and-text) and
 - `a dispatcher must be a property: <Method>`: Add, Remove, Clear or Broadcast on a dispatcher that is not reached as
   a property of an object. Fix: declare the dispatcher on a class with `UE_DISPATCHER(Name, Params...)` and call it
   through the object. See [Event dispatchers](#event-dispatchers).
-- `no Kismet conversion from FString to FKey`: a key written with parentheses, `FKey("F5")` or
-  `FKey(FName("F5"))`. A one-argument constructor in parentheses is read as a conversion, and no Kismet conversion
-  makes an FKey. `FKey K = {"F5"};` is refused the same way, and so are other one-argument struct constructors, such as
-  `FFrameNumber(5)`. Fix: write the braces out in full, `FKey{"F5"}`, `FFrameNumber{5}`. See
-  [Timers and input](#timers-and-input).
 - `no member named 'BindKey' in 'UInputComponent'`: clang's message. BindKey and BindAction are native C++ only and
   absent from the SDK. Fix: mark the method, `UE_INPUT_KEY("F5") void OnF5();`, or poll the player controller in
   ReceiveTick. See [Timers and input](#timers-and-input).

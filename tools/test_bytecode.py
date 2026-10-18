@@ -8934,6 +8934,47 @@ print('ok  ValueInitScalar: braces or T() around an enum, a number or a pointer 
       '{} for a struct, container or name member is its fresh value, not the default; an empty container is a value')
 
 
+def const_forms():
+    """Constants C++ knows when it compiles, written other than as a literal, are their values: a shift by a constexpr,
+    a parenthesised literal, a sizeof, an enumerator, a template's value parameter, an inline function's parameter and
+    a const local; a type spelled through a local alias, in a nested block too; __is_same as a value, in a plain if and
+    in a template; sizeof... of a type pack and of a parameter pack, an empty one too; UE_ENUM_MAP in a body, the enum
+    on either side, and passed on. A key made from a name in each spelling is that key, a run-time string's too, and as
+    a member's default, and a misnamed one warns; another one-member struct's constructor in parentheses makes it too.
+    A trait other than __is_same is still refused as a value."""
+    import struct, runvm
+    base = asset('ConstForms')
+    keeps_invariants(base)
+    vm = runvm.VM(base)
+    members = {'Key': ['KeyName'], 'FrameNumber': ['Value']}
+    vm.struct_const = lambda name, vals: runvm.Written(zip(members[name], vals))
+    keys = [vm.call(f) for f in ('KeyCall', 'KeyOfName', 'KeyBraced', 'KeyCopyList')]
+    assert keys == ['F5', 'F6', 'F7', 'F8'], keys
+    assert vm.call('KeyRuntime', S='Hello') == 'Hello' and vm.call('KeyFromString', S='LeftShift') == 'LeftShift'
+    assert vm.call('Frame', V=4) == 12
+    pkg = invariants.Package(base)
+    cdo = pkg.find('Default__ConstForms_C')
+    held = pkg.tag(cdo, 'Held')
+    key = {t['name']: t for t in pkg.tags(cdo, held['at'])}['KeyName']
+    assert pkg.names[struct.unpack_from('<i', key['value'])[0]] == 'LeftShift', key
+    assert 'warning: ConstForms::KeyTypo: FKey{"LeftShfit"} names no key the engine has' in LOGS['ConstForms'], LOGS['ConstForms']
+    for x in (5, -9, 1000):
+        assert vm.call('ShiftNamed', X=x) == x << 3 and vm.call('ShiftParen', X=x) == x >> 2, x
+        assert vm.call('ShiftUpdate', X=x) == (x << 3) >> 4, x
+        want = (x << 4) + (x << 4) + (x << 2) + ((x * 64) >> 3) + (x << 1)
+        assert vm.call('ShiftForms', X=x) == want, (x, vm.call('ShiftForms', X=x), want)
+        assert vm.call('Alias', X=x) == x + 2 and vm.call('AliasNested', X=x) == 2 * x + 1, x
+    assert [vm.call(f) for f in ('SameValue', 'SameIf', 'SameTernary', 'PackCount')] == [True, 2, 3, 33]
+    assert [run(base, 'TintName', M=m)[0] for m in (0, 4, 5)] == ['Pale', 'Warm', 'Deep']
+    assert run(base, 'TintCount')[0] == 305 and run(base, 'TintTable')[0] == 3
+    refused('TraitOther', '  bool F() { return __is_base_of(AActor, APawn); }\n', 'unimplemented argument TypeTraitExpr')
+
+
+const_forms()
+print('ok  ConstForms: a shift by any constant, a local alias, __is_same, sizeof... and a template\'s value parameter '
+      'are their values; UE_ENUM_MAP works in a body; FKey("F5") and its spellings are the key, a string\'s at run time')
+
+
 def defaults_zero():
     """UE_DEFAULTS over a parent's non-zero defaults, each member set to its type's zero by `{}`, `T()` or `nullptr`: a
     subclass's default object deltas against its parent's, so each zero is a tag the loader reads over the parent's

@@ -538,9 +538,8 @@ takes nothing or `FKey Key`. Options after the name pick the edge (`Released`, o
 modifiers (`Ctrl`, `Shift`, `Alt`, `Cmd`) and the node's settings (`NoConsume`, `WhenPaused`, `KeepParent`). An actor's
 events fire only once it receives input: set `AutoReceiveInput = EAutoReceiveInput::Player0;` in its `UE_DEFAULTS`, or
 call `EnableInput(PC)`; a possessed pawn and a player controller need neither. To read a key's state instead, poll the
-player controller in `ReceiveTick` with `IsInputKeyDown`, the key written with braces and the engine's key name,
-`FKey{"F5"}` (`"LeftShift"`, `"SpaceBar"`, `"One"`); `FKey("F5")` is not built yet and is refused with
-`no Kismet conversion from FString to FKey`. To wait for an event rather than a time, `UE_AWAIT(Obj->Dispatcher)`
+player controller in `ReceiveTick` with `IsInputKeyDown`, the key named as the engine names it,
+`FKey{"F5"}` or `FKey("F5")` (`"LeftShift"`, `"SpaceBar"`, `"One"`). To wait for an event rather than a time, `UE_AWAIT(Obj->Dispatcher)`
 continues the method at the dispatcher's next broadcast with its value, `Image = UE_AWAIT(Task->OnSuccess);`, or a
 name for each of two or more, `auto [Who, Points] = UE_AWAIT(OnScored);`. It stays bound, so a later
 broadcast runs the rest of the method again. `UKismetSystemLibrary::LoadAsset(Soft)` waits for an async load and
@@ -1933,10 +1932,6 @@ each topic.
 
 **Refused with a message.** The compile stops, and the section linked says what to write instead.
 
-- `UE_ENUM_MAP` inside a function body. Keep the table in a member and read the member. See
-  [Enums](REFERENCE.md#enums).
-- A shift by a named constant, `X << kShift`: only a bare integer literal is accepted as the amount. See
-  [Operators](REFERENCE.md#operators).
 - The address of a struct member, `&S.Member` or `&Pv->X`. Through a pointer, add the member's offset yourself:
   `(int64)Pv + 4` is the address of `Pv->Y` for an `FVector *Pv`. See
   [Pointers and memory](REFERENCE.md#pointers-and-memory).
@@ -1944,10 +1939,6 @@ each topic.
 - A read through a pointer, `GetOuter()` and `GetTypedOuter` included, in a function that also waits. Read in a
   separate method that does not wait, or keep the value in a member before the wait. See
   [Pointers and memory](REFERENCE.md#pointers-and-memory).
-- A one-argument struct constructor in parentheses, `FKey("F5")` or `FFrameNumber(5)`. Write the braces out:
-  `FKey{"F5"}`. See [Timers and input](REFERENCE.md#timers-and-input).
-- A type alias declared inside a function, used as a local's type: `using T = int32; T A = X;`. See
-  [Locals](REFERENCE.md#locals).
 - A game asset's values as build-time constants. The `UeAssets` headers name every asset but hold none of its values.
   Read a value in the game through the asset's pointer, `(&UeAssets::...::ED_Spider_Grunt)->SpawnAmountModifier`. See
   [Game assets](REFERENCE.md#game-assets).
@@ -2022,7 +2013,7 @@ write once and the method to paste.
   `sizeof`, `long` and `wchar_t` mean what they mean in the game. That target has no C++ standard library on Linux:
   `<initializer_list>`, which the SDK needs and AssetGen supplies, is the only standard header a mod can include
   there. On any system, a call into the standard library is refused, even with its header included. Use clang builtins
-  such as `__is_same(A, B)` in `if constexpr` or `static_assert` in place of `<type_traits>`, and `UKismetMathLibrary`
+  in place of `<type_traits>`: `__is_same(A, B)` anywhere, the others in `if constexpr` or `static_assert`; and `UKismetMathLibrary`
   for math. See
   [Calling engine and game functions](REFERENCE.md#calling-engine-and-game-functions).
 - **Packing on Linux.** bpbuild needs UE 4.27's UnrealPak: a native Linux build on `PATH`, or the Windows

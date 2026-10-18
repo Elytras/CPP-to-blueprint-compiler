@@ -188,9 +188,8 @@ bool IsUnsetInit(const Json& E)
 /* Every type spelling under N with the aliases in scope written out. clang spells a use as the source did, and a
    class-scope alias means what it says only inside that class and the ones deriving it - so it is expanded there,
    once, before anything reads a type. A name already qualified (`A::Leaf`) is left alone. */
-void ExpandAliases(Json& N, const std::map<std::string, std::string>& InScope)
+static void ExpandAliasesAt(Json& N, const std::map<std::string, std::string>& InScope)
 {
-    if (!N.is_structured()) return;
     auto T = N.is_object() ? N.find("type") : N.end();
     if (T != N.end() && T->is_object() && T->contains("qualType"))
     {
@@ -208,7 +207,35 @@ void ExpandAliases(Json& N, const std::map<std::string, std::string>& InScope)
         }
         if (Out != Q) (*T)["qualType"] = Out;
     }
+}
+
+void ExpandAliases(Json& N, const std::map<std::string, std::string>& InScope)
+{
+    if (!N.is_structured()) return;
+    ExpandAliasesAt(N, InScope);
     for (Json& C : N) ExpandAliases(C, InScope);
+}
+
+/* The same for an alias declared in a function, `using T = int32;` or a typedef: it means what it says from its
+   declaration to the end of the block holding it, nested blocks included. */
+void ExpandLocalAliases(Json& N, const std::map<std::string, std::string>& InScope)
+{
+    if (!N.is_structured()) return;
+    if (!InScope.empty()) ExpandAliasesAt(N, InScope);
+    if (N.is_object() && N.value("kind", std::string()) == "CompoundStmt" && N.contains("inner"))
+    {
+        std::map<std::string, std::string> Block = InScope;
+        for (Json& S : N["inner"])
+        {
+            ExpandLocalAliases(S, Block);
+            if (S.value("kind", std::string()) == "DeclStmt" && S.contains("inner"))
+                for (const Json& D : S["inner"])
+                    if ((Kind(D) == "TypeAliasDecl" || Kind(D) == "TypedefDecl") && D.contains("name"))
+                        Block[Name(D)] = StripTypeKeywords(TypeOf(D));
+        }
+        return;
+    }
+    for (Json& C : N) ExpandLocalAliases(C, InScope);
 }
 
 /* A CXXOperatorCallExpr whose callee is operator=: struct assignment, which clang does not spell
@@ -1673,7 +1700,10 @@ private:
        initializer must be const for nothing to write it. Refused where it is used (StaticRefusal). */
     std::map<std::string, const Json*> MutableStatics;
     bool LowerInlineVar(const Json& Var, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
-    bool LowerContainerLiteral(const Json& List, const std::string& Type, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
+    bool LowerContainerLiteral(const Json& List, const std::string& Type, FBlueprintClass& BP, FArgIR& Out, std::string* Err,
+                               const std::vector<FArgIR>* Given = nullptr);
+    bool EnumMapEntries(const std::string& CppEnum, std::vector<std::pair<std::string, int64>>& Out) const;
+    bool LowerEnumMap(const std::string& Type, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     /* The braced list of the inline variable E names (`kPrimes`, `this->kPrimes`), else null; and its elements as VM
        constants of type Elem, false when one is not. A range-for and Contains over one make no array. */
     const Json* InlineListOf(const Json* E) const;
@@ -1697,8 +1727,10 @@ private:
     struct FConstVal { bool bFloat = false; double F = 0; int64 I = 0; double Num() const { return bFloat ? F : double(I); } };
     bool FoldConst(const Json& E, FConstVal& Out) const;
     const Json* ValueCastBelow(const Json& N) const;
+    const Json* StructConversionBelow(const Json& N) const;
     bool FreeNegation(const Json& C, Json& Out) const;
     bool ConstToArg(const FConstVal& V, const std::string& Type, FArgIR& Out) const;
+    std::map<std::string, const Json*> TemplateOf;                      // an instantiation's decl id -> its FunctionTemplateDecl
     std::map<std::string, const Json*> FreeInlines;                     // decl id -> an inline free function's definition
                                                                         // (a template's: each instantiation)
     std::vector<const Json*> FreeInlineOrder;                           // the same definitions in document order: an id is
@@ -3386,6 +3418,31 @@ std::string DesugaredTypeOf(const Json& N)
     return It == N.end() ? std::string() : It->value("desugaredQualType", It->value("qualType", std::string()));
 }
 
+/* A type node (a TypeTraitExpr's operand) as its canonical type: sugar - an alias, a typedef, an elaborated or a
+   substituted type - looked through, a class or an enum named by its declaration, so two keys are equal exactly when the
+   types are. Empty for a type still dependent, or of a kind not read here. */
+std::string CanonTypeKey(const Json& T)
+{
+    const std::string K = Kind(T);
+    const Json* In = First(T);
+    if (K == "BuiltinType") return TypeOf(T);
+    if (K == "RecordType" || K == "EnumType") return T.contains("decl") ? "decl " + T["decl"].value("id", std::string()) : std::string();
+    if (K == "ElaboratedType" || K == "TypedefType" || K == "UsingType" || K == "SubstTemplateTypeParmType" || K == "ParenType")
+        return In ? CanonTypeKey(*In) : std::string();
+    /* The arguments as written, then the type they make: the last. */
+    if (K == "TemplateSpecializationType")
+    {
+        const Json* Last = nullptr;
+        ForEach(T, [&](const Json& C) { Last = &C; });
+        return Last && Kind(*Last) != "TemplateArgument" ? CanonTypeKey(*Last) : std::string();
+    }
+    std::string Of = In ? CanonTypeKey(*In) : std::string();
+    if (Of.empty()) return Of;
+    if (K == "QualType") return T.value("qualifiers", std::string()) + " " + Of;
+    if (K == "PointerType" || K == "LValueReferenceType" || K == "RValueReferenceType") return K + "(" + Of + ")";
+    return std::string();
+}
+
 const FRecord* FCompiler::ModInterfaceWith(const FRecord& R, const std::string& Method) const
 {
     for (const std::string& I : R.Interfaces)
@@ -4069,8 +4126,10 @@ bool FCompiler::LowerMakeStruct(const std::string& Type, const Json* List, FBlue
 /* `{ 1, 2 }` made into a TArray, TSet or TMap in a function: the editor's Make Array / Make Set / Make Map, a temp the
    frame keeps, filled whole by EX_SetArray / EX_SetSet / EX_SetMap (`[S]` KismetCompilerVMBackend.cpp:1635), which
    empty it first (ScriptCore.cpp:3409), so a loop that comes round again makes it afresh. A set's and a map's count is
-   its elements' (a map's pairs'). List is the CXXStdInitializerListExpr; a map's elements are `{ key, value }`. */
-bool FCompiler::LowerContainerLiteral(const Json& List, const std::string& Type, FBlueprintClass& BP, FArgIR& Out, std::string* Err)
+   its elements' (a map's pairs'). List is the CXXStdInitializerListExpr; a map's elements are `{ key, value }`. Given,
+   when there is one, holds the elements already lowered (a map's keys and values in turn), and List is not read. */
+bool FCompiler::LowerContainerLiteral(const Json& List, const std::string& Type, FBlueprintClass& BP, FArgIR& Out, std::string* Err,
+                                      const std::vector<FArgIR>* Given)
 {
     const std::string T = StripTypeKeywords(Type);
     std::string Of;
@@ -4094,7 +4153,8 @@ bool FCompiler::LowerContainerLiteral(const Json& List, const std::string& Type,
     const Json* Items = &List;
     while (Items && Kind(*Items) != "InitListExpr") Items = First(*Items);
     bool bOk = true;
-    if (Items)
+    if (Given) Fill.Args.insert(Fill.Args.end(), Given->begin(), Given->end());
+    else if (Items)
         ForEach(*Items, [&](const Json& E) {
             if (!bOk) return;
             const Json* Pair = Op == "__SetMap__" ? Strip(&E) : nullptr;
@@ -4116,6 +4176,57 @@ bool FCompiler::LowerContainerLiteral(const Json& List, const std::string& Type,
     Out.Sub->InlineResult = Tmp;
     Out.Sub->InlineType = T;
     return true;
+}
+
+/* UE_ENUM_MAP(E)'s pairs: E's enumerators by their C++ names, in order, without the closing enumerator UHT and the
+   cooker add, which is not one of the enum's values (`PF_MAX_0` is Dumper-7's spelling of a PF_MAX that collided).
+   False when no enum has that C++ name. */
+bool FCompiler::EnumMapEntries(const std::string& CppEnum, std::vector<std::pair<std::string, int64>>& Out) const
+{
+    const std::vector<std::pair<std::string, int64>>* Names = nullptr;
+    for (const auto& E : EnumDecls)
+        if (E.first == CppEnum || (E.first.size() > CppEnum.size() + 2
+            && E.first.compare(E.first.size() - CppEnum.size() - 2, std::string::npos, "::" + CppEnum) == 0))
+            Names = &E.second;
+    if (!Names) return false;
+    for (const auto& Entry : *Names)
+    {
+        std::string Closer = Entry.first;
+        while (!Closer.empty() && std::isdigit(uint8(Closer.back()))) Closer.pop_back();
+        if (Closer.size() > 5 && Closer.back() == '_' && Closer.compare(Closer.size() - 5, 5, "_MAX_") == 0) continue;
+        if (Entry.first.size() > 4 && Entry.first.compare(Entry.first.size() - 4, 4, "_MAX") == 0) continue;
+        Out.push_back(Entry);
+    }
+    return true;
+}
+
+/* `TMap<EMood, FName> Names = UE_ENUM_MAP(EMood);` in a function: the same pairs a member's default gets, the enum on
+   whichever side the map has it, made as the braced map `{ { EMood::Calm, "Calm" }, ... }` would be. */
+bool FCompiler::LowerEnumMap(const std::string& Type, FBlueprintClass& BP, FArgIR& Out, std::string* Err)
+{
+    std::string Inner;
+    const std::vector<std::string> KV = TemplateArg(StripTypeKeywords(Type), "TMap", &Inner) ? SplitTemplateArgs(Inner)
+                                                                                            : std::vector<std::string>();
+    const bool bEnumKey = KV.size() == 2 && Enums.count(StripTypeKeywords(KV[0]));
+    const std::string CppEnum = KV.size() != 2 ? std::string() : StripTypeKeywords(KV[bEnumKey ? 0 : 1]);
+    const std::string Text = KV.size() != 2 ? std::string() : Canon(KV[bEnumKey ? 1 : 0]);
+    const auto E = Enums.find(CppEnum);
+    std::vector<std::pair<std::string, int64>> Names;
+    if (E == Enums.end() || (Text != "FName" && Text != "FString") || !EnumMapEntries(CppEnum, Names))
+    { *Err = "UE_ENUM_MAP makes a TMap between an enum and FName or FString, not a " + Type; return false; }
+    std::vector<FArgIR> Items;
+    for (const auto& [Enumerator, Value] : Names)
+    {
+        FConstVal V;
+        V.I = Value;
+        FArgIR Num, Str;
+        if (!ConstToArg(V, E->second.Underlying, Num)) { *Err = "UE_ENUM_MAP over " + CppEnum + ": its values are " + E->second.Underlying; return false; }
+        Str.K = Text == "FName" ? FArgIR::Name : FArgIR::Str;
+        Str.S = Enumerator;
+        Items.push_back(bEnumKey ? Num : Str);
+        Items.push_back(bEnumKey ? Str : Num);
+    }
+    return LowerContainerLiteral(Json::object(), Type, BP, Out, Err, &Items);
 }
 
 /* A constant or an inline class variable has no storage in a Blueprint: each use is its initializer, lowered where it
@@ -5197,6 +5308,8 @@ bool FCompiler::LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, 
     }
     const Json* N = Strip(&ArgNode);
     if (!N) { *Err = "empty argument expression"; return false; }
+    if (const Json* Made = StructConversionBelow(ArgNode))
+        return LowerArgRaw(*Made, OuterType, BP, Out, Err) && ConvertArg(OuterType, BP, Out, Err);
     /* A comma or a `=` under an LValueToRValue or a copy is read where it stands (LowerCommaValue); without one, its
        place is what is used. */
     struct FReadRestore { const Json** Slot; const Json* Old; ~FReadRestore() { *Slot = Old; } } ReadRestore{ &ReadComma, ReadComma };
@@ -5327,6 +5440,8 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         {
             const Json* Obj = First(*Callee);
             if (!Obj) { *Err = "conversion operator with no object"; return false; }
+            if (const Json* Map = Strip(Obj); Map && Kind(*Map) == "CallExpr" && CallsFunction(*Map, "__EnumMap__"))
+                return LowerEnumMap(TypeOf(*N), BP, Out, Err);
             if (Canon(TypeOf(*Obj)) == "FName" && Canon(TypeOf(*N)) == "bool")
             {
                 /* `if (Name)`: Kismet has no Conv_NameToBool, so it is Name != None. */
@@ -6061,11 +6176,18 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         else                                                 Flavour = "IntInt";
         if (Op == "<<" || Op == ">>")
         {
-            if (Kind(*RhsRaw) != "IntegerLiteral")
+            /* The amount is any constant C++ knows here: a literal, a constexpr, an enumerator, a cast, or a `sizeof`,
+               which only lowering sizes (the game's layout). */
+            FConstVal Amount;
+            FArgIR Lowered;
+            if (FoldConst(*RhsRaw, Amount) && !Amount.bFloat) {}
+            else if (LowerArg(*RhsRaw, BP, Lowered, Err) && (Lowered.K == FArgIR::Int || Lowered.K == FArgIR::Byte || Lowered.K == FArgIR::Int64))
+                Amount.I = Lowered.K == FArgIR::Int64 ? Lowered.I64 : Lowered.I;
+            else
             { *Err = "bit shift with a non-constant amount (Kismet has no shift op; use explicit multiply/divide)"; return false; }
             /* A shift has the promoted LHS type (no usual arithmetic conversions): `int >> 1LL` is int32 math. */
             const bool bWide = IsInt64Type(LhsC);
-            const int N = std::stoi(RhsRaw->value("value", std::string("0")));
+            const int64 N = Amount.I;
             if (N < 0 || N > (bWide ? 63 : 31))
             { *Err = "bit shift amount out of range: " + std::to_string(N); return false; }
             const std::string Suffix = bWide ? "Int64Int64" : "IntInt";
@@ -6171,6 +6293,9 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
     /* A container's braced list: Strip took the constructor it is the one argument of, whose type is the slot's. */
     if (K == "CXXStdInitializerListExpr") return LowerContainerLiteral(*N, OuterType, BP, Out, Err);
     if (K == "CompoundAssignOperator") return LowerUpdateValue(*N, BP, Out, Err);
+    /* `__is_same(A, B)`, `sizeof...(V)` and a template's value parameter are constants C++ knows here. */
+    if (K == "TypeTraitExpr" || K == "SizeOfPackExpr" || K == "SubstNonTypeTemplateParmExpr")
+        if (FConstVal V; FoldConst(*N, V) && (ConstToArg(V, OuterType, Out) || ConstToArg(V, TypeOf(*N), Out))) return true;
 
     *Err = "TODO: unimplemented argument " + K;
     return false;
@@ -12418,10 +12543,10 @@ bool IsTEnumType(std::string T, const std::string& Of)
 }
 
 /* The number a constant expression comes to: literals, enum constants, ConstVars, the constants inlined parameters
-   and read-only locals stand for (ParmConst), casts, and arithmetic, comparisons, `&&`, `||` and `?:` over them, each
-   step rounded to the type clang gave it so `2 * 50.f` and `1 << 31` come out as C++ has them. `false && X`,
-   `true || X` and `?:` need only the side C++ evaluates. False for anything else (a call, sizeof) and for a division
-   by zero. */
+   and read-only locals stand for (ParmConst), a template's value parameter, `__is_same`, `sizeof...`, casts, and
+   arithmetic, comparisons, `&&`, `||` and `?:` over them, each step rounded to the type clang gave it so `2 * 50.f` and
+   `1 << 31` come out as C++ has them. `false && X`, `true || X` and `?:` need only the side C++ evaluates. False for
+   anything else (a call, sizeof) and for a division by zero. */
 bool FCompiler::FoldConst(const Json& E, FConstVal& Out) const
 {
     const std::string K = Kind(E);
@@ -12462,6 +12587,8 @@ bool FCompiler::FoldConst(const Json& E, FConstVal& Out) const
     }
     if (K == "ParenExpr" || K == "ConstantExpr" || K == "ExprWithCleanups")
         return First(E) && FoldConst(*First(E), Out);
+    /* A template's value parameter, `template <int32 S>`: its declaration, then the argument it stands for. */
+    if (K == "SubstNonTypeTemplateParmExpr") return Nth(E, 1) && FoldConst(*Nth(E, 1), Out) && Fit(Out);
     /* `TEnumMask<E> M = 0x21;`, `{}`: the int32 it converts, or none. */
     if (K == "CXXConstructExpr" && IsTEnumType(TypeOf(E), "TEnumMask") && !Nth(E, 1))
     {
@@ -12487,6 +12614,58 @@ bool FCompiler::FoldConst(const Json& E, FConstVal& Out) const
         }
         auto C = ConstVars.find(Id);
         return C != ConstVars.end() && First(*C->second) && FoldConst(*First(*C->second), Out) && Fit(Out);
+    }
+    /* `__is_same(A, B)`. The JSON names no trait, but the range begins at the trait's keyword, and of clang's traits
+       over two types only __is_same is spelled in 9 characters. The two are the same when their canonical types are. */
+    if (K == "TypeTraitExpr")
+    {
+        Json Begin = E.value("range", Json::object()).value("begin", Json::object());
+        if (Begin.contains("spellingLoc")) Begin = Begin["spellingLoc"];
+        const Json* A = Nth(E, 0);
+        const Json* B = Nth(E, 1);
+        if (Begin.value("tokLen", 0) != 9 || !A || !B || Nth(E, 2)) return false;
+        const std::string KA = CanonTypeKey(*A), KB = CanonTypeKey(*B);
+        if (KA.empty() || KB.empty()) return false;
+        Out = {};
+        Out.I = KA == KB;
+        return true;
+    }
+    /* `sizeof...(P)` in the template instantiation being expanded: a template parameter pack is the arguments clang put
+       at its place, a function parameter pack the parameters it gave the pack's name (none for an empty pack). */
+    if (K == "SizeOfPackExpr")
+    {
+        const Json* Def = InlineStack.empty() ? nullptr : InlineStack.back();
+        const auto T = Def ? TemplateOf.find(Def->value("id", std::string())) : TemplateOf.end();
+        if (T == TemplateOf.end()) return false;
+        const std::string Pack = E.value("name", std::string());
+        int64 At = 0, Count = -1;
+        ForEach(*T->second, [&](const Json& P) {
+            const std::string PK = Kind(P);
+            if (PK != "TemplateTypeParmDecl" && PK != "NonTypeTemplateParmDecl" && PK != "TemplateTemplateParmDecl") return;
+            if (Name(P) == Pack && P.value("isParameterPack", false))
+            {
+                int64 I = 0;
+                ForEach(*Def, [&](const Json& Arg) {
+                    if (Kind(Arg) == "TemplateArgument" && I++ == At) { Count = 0; ForEach(Arg, [&](const Json&) { ++Count; }); }
+                });
+            }
+            ++At;
+        });
+        bool bFunctionPack = false;
+        ForEach(*T->second, [&](const Json& Pattern) {
+            ForEach(Pattern, [&](const Json& P) {
+                bFunctionPack = bFunctionPack || (Kind(P) == "ParmVarDecl" && Name(P) == Pack && P.value("isParameterPack", false));
+            });
+        });
+        if (Count < 0 && bFunctionPack)
+        {
+            Count = 0;
+            ForEach(*Def, [&](const Json& P) { Count += Kind(P) == "ParmVarDecl" && Name(P) == Pack; });
+        }
+        if (Count < 0) return false;
+        Out = {};
+        Out.I = Count;
+        return Fit(Out);
     }
     if (K == "UnaryOperator")
     {
@@ -12551,6 +12730,23 @@ bool FCompiler::FoldConst(const Json& E, FConstVal& Out) const
     else if (Op == ">>" && R.I >= 0 && R.I < 64) Out.I = L.I >> R.I;
     else return false;
     return Fit(Out);
+}
+
+/* `FKey("F5")`, `FKey K{FName("F5")}`: the constructor UeApi declares for each one-member struct, taking that member,
+   among the nodes Strip peels off N. It makes the struct from its argument, as the braced `FKey{"F5"}` does; null if
+   there is none. A copy is none, and neither is a Kismet conversion UeApi spells as a constructor (UE_CONV_*,
+   `FTransform(const FVector&)`), which ConvertArg makes. */
+const Json* FCompiler::StructConversionBelow(const Json& N) const
+{
+    const Json* Leaf = Strip(&N);
+    for (const Json* W = &N; W && W != Leaf; W = First(*W))
+    {
+        const std::string T = StripTypeKeywords(TypeOf(*W));
+        const FRecord* R = Kind(*W) == "CXXConstructExpr" && First(*W) && !Nth(*W, 1) && Structs.count(T) ? Find(T) : nullptr;
+        if (R && R->Fields.size() == 1 && Canon(StripTypeKeywords(TypeOf(*R->Fields[0]))) == Canon(StripTypeKeywords(TypeOf(*First(*W)))))
+            return W;
+    }
+    return nullptr;
 }
 
 /* The outermost cast below N, among those Strip peels off it, that changes the value it passes on: to bool, float to
@@ -12955,7 +13151,8 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
                              bool bKeepZero)
 {
     const Json* const Whole = Init ? Init : First(F);
-    Init = Strip(Whole);
+    Init = Whole ? StructConversionBelow(*Whole) : nullptr;
+    if (!Init) Init = Strip(Whole);
     /* No initializer: the property starts as the engine makes it, which is the C++ constructor's value but for a struct
        the engine makes as zeros though its constructor sets a member (CtorOverZeros): that value is written. */
     if (!Init)
@@ -13004,20 +13201,11 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
         /* StructName is the engine's name (`TextureGroup`); the declaration is found by the C++ one (`ETextureGroup`). */
         std::string CppEnum = EnumSide.StructName;
         for (const auto& E : Enums) if (E.second.UeName == EnumSide.StructName) CppEnum = E.first;
-        const std::vector<std::pair<std::string, int64>>* Names = nullptr;
-        for (const auto& E : EnumDecls)
-            if (E.first == CppEnum || (E.first.size() > CppEnum.size() + 2
-                && E.first.compare(E.first.size() - CppEnum.size() - 2, std::string::npos, "::" + CppEnum) == 0))
-                Names = &E.second;
-        if (!Names || EnumSide.StructName.empty()) { *Err = "UE_ENUM_MAP: " + Name(F) + " is not a map over an enum"; return false; }
-        for (const auto& Entry : *Names)
+        std::vector<std::pair<std::string, int64>> Names;
+        if (!EnumMapEntries(CppEnum, Names) || EnumSide.StructName.empty())
+        { *Err = "UE_ENUM_MAP: " + Name(F) + " is not a map over an enum"; return false; }
+        for (const auto& Entry : Names)
         {
-            /* UHT's and the cooker's own closing enumerator is not one of the enum's values. */
-            /* `PF_MAX_0` is Dumper-7's spelling of a PF_MAX that collided. */
-            std::string Closer = Entry.first;
-            while (!Closer.empty() && std::isdigit(uint8(Closer.back()))) Closer.pop_back();
-            if (Closer.size() > 5 && Closer.back() == '_' && Closer.compare(Closer.size() - 5, 5, "_MAX_") == 0) continue;
-            if (Entry.first.size() > 4 && Entry.first.compare(Entry.first.size() - 4, 4, "_MAX") == 0) continue;
             FDefaultValue Enum, Text;
             Enum.K = Text.K = FDefaultValue::Str;
             Enum.S = EnumSide.StructName + "::" + Entry.first;
@@ -17305,8 +17493,8 @@ public:
     bool number_float(number_float_t V, const string_t&) override { return Value(V); }
     bool string(string_t& V) override
     {
-        if (bKindNext && !Skipped)          // "kind" comes before "range"
-            Ranged.back() = V == "DeclRefExpr" ? ERange::Begin
+        if (bKindNext && !Skipped)          // "kind" comes before "range"; a TypeTraitExpr's begin is its trait (FoldConst)
+            Ranged.back() = V == "DeclRefExpr" || V == "TypeTraitExpr" ? ERange::Begin
                           : V == "MemberExpr" || V == "InitListExpr" || V == "CXXConstructExpr" ? ERange::Whole : ERange::None;
         return Value(std::move(V));
     }
@@ -17341,8 +17529,8 @@ public:
     bool parse_error(size_t, const std::string&, const nlohmann::detail::exception&) override { return false; }
 
 private:
-    /* What of an open node's range is kept: none, its begin (a DeclRefExpr), or the whole range (a MemberExpr, or a
-       braced value: an InitListExpr or CXXConstructExpr). */
+    /* What of an open node's range is kept: none, its begin (a DeclRefExpr, a TypeTraitExpr), or the whole range (a
+       MemberExpr, or a braced value: an InitListExpr or CXXConstructExpr). */
     enum class ERange : uint8 { None, Begin, Whole };
     Json& Root;
     const bool bFrozenKeys;         // astcheck's reference parse
@@ -17938,9 +18126,14 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
             ForEach(N, [&](const Json& C) { IndexConsts(C, K == "CXXRecordDecl"); });
     };
     IndexConsts(Doc, false);
+    /* `sizeof...` reads a pack's template parameter off its template (FoldConst). */
+    auto IndexTemplate = [&](const Json& T) {
+        ForEach(T, [&](const Json& M) { TemplateOf[M.value("id", std::string())] = &T; });
+    };
     std::function<void(Json&)> IndexInlines = [&](Json& N) {
         if (!N.is_object()) return;
         const std::string K = Kind(N);
+        if (K == "FunctionTemplateDecl") IndexTemplate(N);
         if (K == "CXXRecordDecl")
         {
             /* Class bodies are the records', except member templates: no UFunction per instantiation, so each
@@ -17948,6 +18141,7 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
             ForEach(N, [&](const Json& C) {
                 if (Kind(C) == "CXXRecordDecl") IndexInlines(const_cast<Json&>(C));
                 if (Kind(C) != "FunctionTemplateDecl") return;
+                IndexTemplate(C);
                 for (Json& M : const_cast<Json&>(C)["inner"])
                 {
                     bool bBody = false;
@@ -17977,6 +18171,14 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         if (It != N.end()) for (Json& C : *It) IndexInlines(C);
     };
     IndexInlines(Doc);
+    /* Each body that is compiled gets its own aliases written out before anything reads a local's type. */
+    for (auto& [Cpp, R] : Records)
+    {
+        for (const Json* M : R.AllMethods) ExpandLocalAliases(const_cast<Json&>(*M), {});
+        for (const auto& [Method, Def] : R.MethodDefs) ExpandLocalAliases(const_cast<Json&>(*Def), {});
+    }
+    for (const Json* F : FreeInlineOrder) ExpandLocalAliases(const_cast<Json&>(*F), {});
+    for (const auto& [Id, M] : MemberTemplates) ExpandLocalAliases(const_cast<Json&>(*M), {});
     /* `FKey{"Space"}` names no key, so no input ever matches it. A warning, not a refusal: code may compare it with a
        key the engine makes up as it runs (FInputKeyManager::GetKeyFromCodes) or another module adds, and FKey{""} is
        the engine's own "no key". Each literal once, where the source writes it: the classes' methods, members and
