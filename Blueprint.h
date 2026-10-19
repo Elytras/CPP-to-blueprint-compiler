@@ -121,6 +121,11 @@ public:
     };
     void AttachComponent(const std::string& Name, const FAttachment& Attachment);
 
+    /* The SCS node's VariableGuid for a component added above, as the class's `<Comp>__UeScsNode` gives it: a class
+       rebuilt from a cooked one keeps the guid its subclasses' override records name (FComponentKey's AssociatedGuid),
+       which a subclass still shipped as cooked matches the node by. Without one the guid is ScsNodeGuid's. */
+    void SetComponentGuid(const std::string& Name, const uint32 (&Guid)[4]);
+
     /* Whether the SCS lists its DefaultSceneRoot node, in RootNodes and AllNodes: the actor has no root before it runs
        and no scene component of the class's own is left to be the root - none, or each attached somewhere. The editor
        keeps the node there exactly then (ValidateSceneRootNodes, SimpleConstructionScript.cpp 1132-1150), and gives the
@@ -304,6 +309,8 @@ private:
         std::vector<FPropertyDef> Defaults;
         std::vector<uint8> NativeTail;
         FAttachment Attachment;
+        bool bGuid = false;             // SetComponentGuid: the node's VariableGuid as given, not ScsNodeGuid's
+        uint32 Guid[4] = {};
     };
     std::vector<FComponent> Components;
 

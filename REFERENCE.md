@@ -2146,7 +2146,7 @@ Notes:
 | `const FString &Name() { return Names[0]; }` | Returns a copy: the function's ReturnValue is an FString. The build warns ("returns const FString&: a Blueprint function returns a copy"): a caller that keeps the reference does not see the original change later. | Warns |
 | `int32 ByVal(TArray<int32> A)` | An input pin. The callee gets its own copy, containers and structs included, and its writes stay in the callee. | Yes |
 | `void Around(int32 A, int32 &Lo, int32 &Hi)` | A pass-by-reference pin: writes reach the caller's variable, member or array element. This is how a function returns several values. | Yes |
-| `int32 Plus1(const int32 &A)` | Passed by reference, with no copy. A literal or computed argument is first stored in a hidden local, as the editor's compiler does, because the VM needs an address. | Yes |
+| `int32 Plus1(const int32 &A)` | Passed by reference, with no copy. A literal or computed argument is first stored in a hidden local, as the editor's compiler does, because the VM needs an address. The parameter is marked const (`CPF_ConstParm`), as the editor marks a const reference pin; `AActor *const &A` is the same. | Yes |
 | `int32 Times(int32 X, int32 By = 3)` | A call that leaves the argument out passes the default expression, evaluated at that call each time, as in C++. This holds for Blueprint functions and inline ones. | Yes |
 | A function that calls Delay or UE_AWAIT and returns a value or takes a non-const `T&` | Refused: `a function that resumes later returns nothing and takes no non-const reference parameters`. Store the result in a member; see [Latent calls](#latent-calls). | Refused |
 
@@ -4052,7 +4052,9 @@ Notes:
 | You write | What it does | Status |
 |---|---|---|
 | `void HandleScored(int32 Points, AActor *By)` | A handler bound on `this` is a non-inline member function of the class or of a mod ancestor. It returns void and takes exactly the dispatcher's parameter types. clang checks this at the Add call. An inherited native or game Blueprint function bound on `this` follows the rules of one bound on another object below. | Yes |
-| A `const` handler, or `const FHitResult &Hit` where the header says `FHitResult Hit` | clang error: "no matching member function for call to 'Add'". Copy the parameter list as the header spells it. | Refused |
+| `const FHitResult &Hit` where the header says `FHitResult Hit` | Binds: a parameter may be the header's type by value or by `const&`. A native signature's UeApi spelling does not say which the engine's is (the dump keeps no reference flag), and the engine hands the handler the value either way. `TSubclassOf<UObject>` and `UClass*` match the same way, and so do `TEnum<E>` and `E`. | Yes |
+| A `const` handler, or a parameter of another type | clang error: "no matching member function for call to 'Add'". Copy the parameter list as the header spells it. | Refused |
+| `OnHit.Add(Held);`, `OnHit.Remove(Held);` with `TDelegate<void(int32 Points)> Held` | Adds or removes the delegate value as it is: the editor's Add / Remove node fed a delegate pin. Its parameters match the dispatcher's as a handler's do. | Yes |
 | `inline void Handle(int32 Points)` as a handler | Refused: "a delegate cannot bind Handle: an inline function is expanded where it is called". An inline method never becomes a function of the class. Drop `inline`. | Refused |
 | `OnHit.Add(H, &Helper::HandleHit);` | Binds HandleHit on the object H points to: the editor's Create Event with its Object pin wired. The binding is made where the Add runs, with H as it is then. HandleHit must be a function of H's class or of an ancestor of it: a mod class's method, a game Blueprint's function, or a native BlueprintCallable one (`OnRate.Add(Pawn, &AActor::SetActorTickInterval)`). Remove takes the same pair off. | Yes |
 | `OnHit.Add(H, &Other::HandleHit);` where H's class has no HandleHit | Refused: "a delegate on a Helper cannot bind Other::HandleHit: the engine looks it up by name on that object, whose class has no such function". The broadcast would skip it. | Refused |
@@ -5989,8 +5991,9 @@ and where the feature is described. In each group, the messages you are most lik
   owner where it is declared, e.g. UE_CLASS("<Folder>/<Class>", "<Class>_C")`: the source uses another mod's asset
   through UE_ASSET_AT, and the asset's class comes from a shared header without UE_CLASS. This mod would then cook its
   own copy of the class, and the other mod's asset is not an instance of that copy. Only an asset the source uses is
-  checked. Fix: add the UE_CLASS the message prints to the class's declaration in the shared header. Every mod but the
-  owner then imports the class instead of cooking it. See [Mod sources and packages](#mod-sources-and-packages) and
+  checked. A class the mod cooks under a root of its own (`namespace Game::...`, a second /Game folder) is not
+  checked: that copy is the one the asset was saved with. Fix: add the UE_CLASS the message prints to the class's
+  declaration in the shared header. Every mod but the owner then imports the class instead of cooking it. See [Mod sources and packages](#mod-sources-and-packages) and
   [Game assets](#game-assets).
 - `<Name> is declared extern but not defined in this source; a mod's global is defined where it is used`: a function
   uses a namespace-scope variable that this source only declares, `extern int32 Shared;`, with the definition in

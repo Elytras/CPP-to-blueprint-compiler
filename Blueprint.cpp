@@ -288,6 +288,12 @@ void FBlueprintClass::AddComponent(const std::string& Name, FIndex ComponentClas
     Components.push_back(FComponent{ Name, ComponentClass, ComponentCdo, bIsSceneComponent, Defaults, NativeTail, {} });
 }
 
+void FBlueprintClass::SetComponentGuid(const std::string& Name, const uint32 (&Guid)[4])
+{
+    for (FComponent& C : Components)
+        if (C.Name == Name) { C.bGuid = true; std::copy(std::begin(Guid), std::end(Guid), C.Guid); }
+}
+
 void FBlueprintClass::AttachComponent(const std::string& Name, const FAttachment& Attachment)
 {
     for (FComponent& C : Components)
@@ -1089,7 +1095,8 @@ void FBlueprintClass::Finish()
         P.AddExport(std::move(Template));
 
         uint32 NodeGuid[4];
-        ScsNodeGuid(ClassName, C.Name, NodeGuid);
+        if (C.bGuid) std::copy(std::begin(C.Guid), std::end(C.Guid), NodeGuid);
+        else ScsNodeGuid(ClassName, C.Name, NodeGuid);
         std::vector<FIndex> Children;
         for (size_t J = 0; J < Components.size(); ++J)
             if (ParentOf[J] == int32(I)) Children.push_back(Exp(RowFirstComponent + 2 * int32(J) + 1));

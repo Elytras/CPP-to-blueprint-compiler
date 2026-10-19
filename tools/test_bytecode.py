@@ -3840,8 +3840,20 @@ def asset_elsewhere():
         assert not os.path.exists(os.path.join(tmp, 'UOtherDef.uasset')), os.listdir(tmp)
         imports = dict(import_paths(os.path.join(tmp, 'AssetPinned'), classes=True))
         assert imports['/Game/_ElytrasMods/Other/OtherData.OtherData'] == '/Game/_ElytrasMods/Other/UOtherDef.UOtherDef_C', imports
+    # A class in a `Game::` namespace is cooked at its own /Game path, the one the asset's import names: no copy, so no
+    # refusal (a recovered mod with a second root, whose kept assets are instances of classes it cooks there).
+    with tempfile.TemporaryDirectory(dir=TESTS) as tmp:
+        with open(os.path.join(tmp, 'AssetSecondRoot.cpp'), 'w') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/AssetSecondRoot");\n'
+                    'namespace Game::_ElytrasMods::Other {\n' + top % '' + '}\n'
+                    'class AssetSecondRoot : public AActor {\npublic:\n'
+                    '  Game::_ElytrasMods::Other::UOtherDef *Picked = &Game::_ElytrasMods::Other::OtherData;\n};\n')
+        proc = assetgen_compile([os.path.join(tmp, 'AssetSecondRoot.cpp'), UEAPI, tmp])
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        imports = dict(import_paths(os.path.join(tmp, 'AssetSecondRoot'), classes=True))
+        assert imports['/Game/_ElytrasMods/Other/OtherData.OtherData'] == '/Game/_ElytrasMods/Other/UOtherDef.UOtherDef_C', imports
     print("ok  AssetTest: another mod's asset of a class this mod would cook is refused; with the class pinned to its "
-          "owner, the import names the owner's class")
+          "owner, the import names the owner's class, as it does for a class cooked at its own /Game path")
 
 
 def global_default(folder, cls, member):
@@ -7654,6 +7666,18 @@ def delegate_var():
     calls = [(n, a) for n, c, a in vm.log if n == 'K2_SetTimerDelegate']
     assert calls == [('K2_SetTimerDelegate', [bound, 0.5, False, 0.0, 0.0]),
                      ('K2_SetTimerDelegate', [bound, 2.0, True, 0.0, 0.0])] and vm.self.vars['Stored'] == bound, (calls, vm.self.vars)
+    # A dispatcher takes a delegate value as it is, Add and Remove; and a native dispatcher's handler may take by const
+    # reference what UeApi spells by value (UeSameParams, Types.h).
+    vm = VM(base, {}, Fired=0, Got=0)
+    vm.call('Hook')
+    assert vm.binds == [(vm.self, 'OnHit', 'Take', vm.self)], vm.binds
+    vm.call('Fire', 3)
+    vm.call('Unhook')
+    vm.call('Fire', 5)
+    assert vm.self.vars['Got'] == 3 and not vm.binds, (vm.self.vars, vm.binds)
+    vm.self.vars['Box'] = vm.new()
+    vm.call('HookBox')
+    assert [b[1:3] for b in vm.binds] == [('OnComponentHit', 'Bumped')], vm.binds
 
 
 def inherited_fire():
@@ -8544,6 +8568,34 @@ def comp_override_chain():
     print('ok  CompOverrideChain: an override template is archetyped on the nearest ancestor\'s override, and loads its values')
 
 
+def mod_component():
+    """ModComponent: a UE_COMPONENT of the mod's own component class is an SCS node whose template is of that class,
+    archetyped on its default object, as the editor's node for a component Blueprint. `Field.Member = value;` writes
+    that member alone into the struct's tag, which the loader reads over the parent's value: Part's Range keeps the
+    class default's Min, McBase's Max and its own Steps; Hit holds the later Distance and Time, nothing else."""
+    folder = os.path.dirname(asset('ModComponent'))
+    base, bi = class_pkg(os.path.join(folder, 'McBase'))
+    part = template(base, bi, 'Part')
+    assert base.class_of(part + 1) == 'UMcPart_C', base.class_of(part + 1)
+    assert base.path(base.exports[part]['tmpl']) == '/Game/_ElytrasMods/ModComponent/UMcPart.Default__UMcPart_C', \
+        base.path(base.exports[part]['tmpl'])
+    tags = lambda b, name: dump('dumptags.py', b, export_index(b, name))
+    t = tags(os.path.join(folder, 'McBase'), 'Part_GEN_VARIABLE')
+    assert 'Power [0] FloatProperty size=4: 5.0' in t and re.search(r'Range \[0\] StructProperty .*\n    Max \[0\] FloatProperty size=4: 9.0\n?$', t), t
+    t = tags(os.path.join(folder, 'ModComponent'), 'Part_GEN_VARIABLE')
+    assert re.search(r'Range \[0\] StructProperty .*\n    Steps \[0\] IntProperty size=4: 7\n?$', t) and 'Max' not in t, t
+    t = tags(os.path.join(folder, 'ModComponent'), 'Default__ModComponent_C')
+    assert re.search(r'Reach \[0\] StructProperty .*\n    Min \[0\] FloatProperty size=4: 4.0\n', t), t
+    assert re.search(r'Hit \[0\] StructProperty .*\n    Distance \[0\] FloatProperty size=4: 8.0\n    Time \[0\] FloatProperty size=4: 0.5', t), t
+    assert t.count('Distance') == 1 and 'Max' not in t and 'Steps' not in t, t
+    kid, ki = class_pkg(os.path.join(folder, 'ModComponent'))
+    assert kid.path(kid.exports[template(kid, ki, 'Part')]['tmpl']) == '/Game/_ElytrasMods/ModComponent/McBase.McBase_C:Part_GEN_VARIABLE'
+    for cls in ('ModComponent', 'McBase', 'UMcPart'): keeps_invariants(os.path.join(folder, cls))
+    refused('McBytes', '  UE_DEFAULTS { Hit.ImpactPoint.X = 1.0f; }\n', 'written as bytes',
+            top='class McHolder : public AActor {\npublic:\n  FHitResult Hit;\n};\n', base='McHolder')
+    print('ok  ModComponent: a mod component class as a UE_COMPONENT, and UE_DEFAULTS that set part of a struct')
+
+
 def world_location(p, ci, var):
     """Where component `var` of class ci ends up relative to the spawned actor, as the SCS builds it: its
     RelativeLocation plus its parent's, up the ChildNodes. A root node naming a parent hangs off that ancestor
@@ -8647,6 +8699,7 @@ comp_tick()
 comp_tick_component()
 comp_tick_patch()
 comp_override_chain()
+mod_component()
 comp_root_keep()
 comp_char_root()
 comp_default_root_inherited()

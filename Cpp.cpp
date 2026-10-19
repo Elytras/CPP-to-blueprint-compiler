@@ -479,6 +479,33 @@ bool DefaultPath(const Json& S, const Json*& Root, const Json*& Rhs, const Json*
     return true;
 }
 
+/* A `<Comp>__UeScsNode` guid, 32 hex digits: its 16 bytes as the engine holds them, which is four little-endian words
+   on disk as well. False for any other text. */
+bool ParseNodeGuid(const std::string& Hex, uint32 (&Out)[4])
+{
+    if (Hex.size() != 32 || Hex.find_first_not_of("0123456789abcdefABCDEF") != std::string::npos) return false;
+    std::fill(std::begin(Out), std::end(Out), 0u);
+    for (int B = 0; B < 16; ++B)
+        Out[B / 4] |= uint32(std::stoul(Hex.substr(size_t(B) * 2, 2), nullptr, 16)) << (8 * (B % 4));
+    return true;
+}
+
+/* A class's UE_DEFAULTS statement that sets part of a struct member, `Field.Member = value;` or
+   `Component->Field.Member.Sub = value;`: Root the member's MemberExpr, Through the component's (null for none), Steps
+   each `.Member` into its value, from the root out. The editor saves just this much: a struct written as tags holds
+   only the members that differ from the archetype's, and the loader reads them over the parent's value
+   (FStructProperty::SerializeItem passes the defaults on, PropertyStruct.cpp 148-153). False for any other statement,
+   an `[i]` step or an element call among them, and for a member of anything but this object. */
+bool DefaultMemberPath(const Json& S, const Json*& Root, const Json*& Rhs, const Json*& Through, std::vector<const Json*>& Steps)
+{
+    const Json *L = nullptr, *R = nullptr;
+    if (!AssignmentSides(S, L, R) || !DefaultPath(S, Root, Rhs, Through, Steps) || Steps.empty()) return false;
+    for (const Json* St : Steps) if (Kind(*St) != "MemberExpr") return false;
+    if (Through && !Root->value("isArrow", false)) return false;
+    const Json* Self = Strip(First(Through ? *Through : *Root));
+    return Self && Kind(*Self) == "CXXThisExpr";
+}
+
 /* A UE_ASSET_EDITS statement: `Asset.Member = value`, then any `.Member` and `[i]` into the member's value. Asset is
    the DeclRefExpr naming the asset's variable, Root the member's MemberExpr, Steps as DefaultPath's. */
 bool AssetPath(const Json& S, const Json*& Asset, const Json*& Root, const Json*& Rhs, std::vector<const Json*>& Steps)
@@ -965,6 +992,7 @@ struct FRecord
     bool bIsStruct = false;     // UE_STRUCT: cooked as a UserDefinedStruct asset
     bool bIsInterface = false;  // UE_INTERFACE: cooked as a BPGC whose super is UInterface
     bool bIsPatch = false;      // UE_PATCH: not a class of its own; its UE_DEFAULTS edit its parent's, in the parent's package
+    bool bCooked = false;       // UE_COOKED: shipped as the cooked package it was built from; imported here, never cooked
 
     bool IsNative() const { return !UePackage.empty() && !bIsLocal; }
     bool IsGenerated() const { return !IsNative() && !bIsPatch && (bIsStruct || bIsInterface || !Base.empty()); }
@@ -1647,6 +1675,8 @@ private:
                   FValueStep& Out, FPropertyDef& Reached, std::string* Err);
     bool EditAssignment(const Json& Root, const FRecord& Declarer, const std::vector<const Json*>& Steps, const Json* Rhs,
                         const std::string& Where, FBlueprintClass& BP, FEditDef& Out, std::string* Err);
+    bool LowerMemberPath(FPropertyDef& Root, const std::vector<const Json*>& Steps, const Json* Rhs, const std::string& Where,
+                         FBlueprintClass& BP, std::string* Err);
     bool GenerateAssetEdits(const Json& Block, std::string* Err);
     std::vector<const Json*> AssetEditBlocks;               // UE_ASSET_EDITS: each block's function
     bool ApplyEdit(const std::string& Package, const std::string& Object, std::vector<FEditDef> Edits,
@@ -3060,6 +3090,10 @@ bool FCompiler::Collect(std::string* Err)
             {
                 R.bIsPatch = true;
             }
+            else if (Kind(C) == "VarDecl" && Name(C) == "UeCookedMeta")
+            {
+                R.bCooked = true;
+            }
             else if (Kind(C) == "VarDecl" && Name(C) == "UeClassTail")
             {
                 FindLiteral(C, R.Tail);
@@ -3433,7 +3467,7 @@ bool FCompiler::Collect(std::string* Err)
                  : " on a UE_PATCH, which edits its parent's defaults and nothing else: a timeline needs a class of the mod's own");
             return false;
         }
-        if (R.UePackage.empty()) continue;
+        if (R.UePackage.empty() || R.bCooked) continue;          // a UE_COOKED class is imported, as another mod's is
         if (R.UePackage != PathIn(ModPackage, R.CppName)) continue;
         if (!R.bIsStruct && R.UeName != LeafOf(R.CppName) + "_C")
         {
@@ -4723,6 +4757,8 @@ bool FCompiler::LowerDispatcherCall(const Json& Call, const Json& Callee, const 
         if (Method == "Clear") { C.Intrinsic = "__ClearDelegate__"; return true; }
         C.Intrinsic = Method == "Add" ? "__AddDelegate__" : "__RemoveDelegate__";
         C.Args.emplace_back();
+        /* A delegate value bound already, `D.Add(Stored)`: the editor's Add node fed a delegate pin, which passes it as is. */
+        if (Args.size() == 1) return LowerArg(*Args[0], BP, C.Args[1], Err);
         /* A function of another object goes through a delegate local, which the editor's Create Event types with the
            dispatcher's own signature: this class's export, or the declaring Blueprint's - a mod parent's or sibling's,
            a game Blueprint's - imported from its package, as Broadcast names it below. A function of its own of that
@@ -14077,8 +14113,9 @@ bool FCompiler::ValueFreshFrom(const FRecord* From, const std::string& Id, const
                 if (Kind(B) == "CompoundStmt")
                     ForEach(B, [&](const Json& S) {
                         const Json *L = nullptr, *V = nullptr, *Through = nullptr;
-                        bSet = bSet || (DefaultAssignment(S, L, V, Through) && !Through
-                                        && L->value("referencedMemberDecl", std::string()) == Id);
+                        std::vector<const Json*> Steps;
+                        bSet = bSet || ((DefaultAssignment(S, L, V, Through) || DefaultMemberPath(S, L, V, Through, Steps))
+                                        && !Through && L->value("referencedMemberDecl", std::string()) == Id);
                     });
             });
         if (bSet) return false;
@@ -15255,7 +15292,11 @@ bool FCompiler::LowerParams(const Json& M, const std::string& Fn, FBlueprintClas
             for (PName = "P" + std::to_string(Index); std::count(Given.begin(), Given.end(), PName);) PName += "_";
         ++Index;
         FPropertyDef PD;
-        const uint64 Flags = bOutParm ? uint64(CPF_OutParm | CPF_ReferenceParm) : 0;
+        /* `const T&` (and `T* const&`) is CPF_ConstParm too, as the editor marks a const reference pin - an input; only
+           IsSignatureCompatibleWith reads it, and ignores it (Class.h 1914-1921). A pointer to const is no Blueprint type. */
+        const bool bConstRef = bOutParm && ((Type.compare(0, 6, "const ") == 0 && Type.back() != '*')
+                                            || (Type.size() >= 5 && Type.compare(Type.size() - 5, 5, "const") == 0));
+        const uint64 Flags = bOutParm ? uint64(CPF_OutParm | CPF_ReferenceParm | (bConstRef ? CPF_ConstParm : 0)) : 0;
         /* An override's delegate parameter is its parent's: that one's signature function (ImportedParamSignature). */
         if (FIndex Sig; Cur && StripTypeKeywords(Type).compare(0, 10, "TDelegate<") == 0
                         && ImportedParamSignature(*Cur, Fn, Index - 1, BP, &Sig))
@@ -15853,6 +15894,60 @@ bool FCompiler::GenerateAssetEdits(const Json& Block, std::string* Err)
         if (!ApplyEdit(T.Package, T.Object, std::move(T.Edits), *T.Scratch, Where + " " + Qual, Err)) return false;
     }
     return true;
+}
+
+/* A class's UE_DEFAULTS `Field.Member.Sub = value` (DefaultMemberPath), into Root, Field's def: Root holds only Member,
+   which holds only Sub, which holds the value. Each step is a member of a struct written as tags, which the loader reads
+   member by member over the parent's value; a native struct written as bytes (FVector's X) has no such form. */
+bool FCompiler::LowerMemberPath(FPropertyDef& Root, const std::vector<const Json*>& Steps, const Json* Rhs,
+                                const std::string& Where, FBlueprintClass& BP, std::string* Err)
+{
+    std::vector<FPropertyDef> Chain{ Root };
+    std::string Path = Where;
+    for (const Json* Step : Steps)
+    {
+        Path += "." + Name(*Step);
+        FValueStep At;
+        FPropertyDef Reached;
+        if (!EditStep(*Step, Chain.back(), Path, BP, At, Reached, Err)) return false;
+        if (!At.IsTaggedMember())
+        {
+            *Err = Path + ": part of a " + Chain.back().StructName + ", which is written as bytes, not member by member; "
+                   "set the whole value";
+            return false;
+        }
+        Chain.push_back(std::move(Reached));
+    }
+    if (!LowerDefault(*Steps.back(), Chain.back(), BP, Err, Rhs, /*bKeepZero=*/true)) return false;
+    if (Chain.back().Default.K == FDefaultValue::None) { *Err = Path + " needs a literal value"; return false; }
+    for (size_t I = Chain.size() - 1; I > 0; --I)
+    {
+        FPropertyDef& Up = Chain[I - 1];
+        Up.Default = FDefaultValue{};
+        Up.Default.K = FDefaultValue::Struct;
+        Up.Members = std::make_shared<std::vector<FPropertyDef>>(1, Chain[I]);
+    }
+    Root = Chain.front();
+    return true;
+}
+
+/* Part, LowerMemberPath's value for a member Depth steps deep, joined to Defs, the statements of one object so far: the
+   member's tag gains the path's member, which replaces one of its name there (a later statement wins, as it would run
+   later), down to the value. A whole value of the member before it is merged into the same way. */
+void MergeMemberPath(std::vector<FPropertyDef>& Defs, const FPropertyDef& Part, size_t Depth)
+{
+    const auto Had = std::find_if(Defs.rbegin(), Defs.rend(), [&](const FPropertyDef& D) { return D.Name == Part.Name; });
+    if (Had == Defs.rend()) { Defs.push_back(Part); return; }
+    std::function<void(FPropertyDef&, const FPropertyDef&, size_t)> Merge = [&](FPropertyDef& Into, const FPropertyDef& P, size_t D) {
+        if (D == 0 || Into.Default.K != FDefaultValue::Struct || !Into.Members) { Into = P; return; }
+        auto Members = std::make_shared<std::vector<FPropertyDef>>(*Into.Members);     // its own: a type may share them
+        const FPropertyDef& M = P.Members->front();
+        const auto Same = std::find_if(Members->begin(), Members->end(), [&](const FPropertyDef& X) { return X.Name == M.Name; });
+        if (Same == Members->end()) Members->push_back(M);
+        else Merge(*Same, M, D - 1);
+        Into.Members = Members;
+    };
+    Merge(*Had, Part, Depth);
 }
 
 /* S38: one step of a UE_DEFAULTS path into the value Parent is the def of: a `.Member` MemberExpr, or a TArray's
@@ -17779,10 +17874,11 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                     }
                 }
                 const Json *Lhs = nullptr, *Rhs = nullptr, *Owner = nullptr;
-                if (!DefaultAssignment(S, Lhs, Rhs, Owner))
-                { *Err = Where + ": every statement is `Field = value;`, `Component->Field = value;` or "
-                         "`Component->SetupAttachment(Parent);`, on this object's members, each set whole (not "
-                         "`Field.X = value;`)"; bOk = false; return; }
+                std::vector<const Json*> Steps;         // `Field.Member = value;`: each step into Field's value
+                if (!DefaultAssignment(S, Lhs, Rhs, Owner) && !DefaultMemberPath(S, Lhs, Rhs, Owner, Steps))
+                { *Err = Where + ": every statement is `Field = value;`, `Component->Field = value;`, part of a struct "
+                         "member, `Field.Member = value;`, or `Component->SetupAttachment(Parent);`, on this object's "
+                         "members"; bOk = false; return; }
 
                 /* `Comp->Field` reaches through a component; a bare `Field` targets this class's
                    own CDO. Which of the three destinations a statement means is decided by who
@@ -17818,11 +17914,15 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 /* Zero is a real value here: an archetype deltas against the component CDO (where
                    bVisible is already true) and an inherited property against the parent's CDO,
                    not against the type's zero the way a fresh class variable does. */
-                bParentFresh = !bThroughComponent && ParentValueFresh(R, *Lhs, ParentInit, ParentInitOf);
+                bParentFresh = Steps.empty() && !bThroughComponent && ParentValueFresh(R, *Lhs, ParentInit, ParentInitOf);
                 struct FUnset { bool& Flag; const Json*& Init; const FRecord*& Of;
                                 ~FUnset() { Flag = false; Init = nullptr; Of = nullptr; } }
                     UnsetParentFresh{ bParentFresh, ParentInit, ParentInitOf };
-                if (!LowerDefault(*Lhs, PD, BP, Err, Rhs, /*bKeepZero=*/true)) { bOk = false; return; }
+                if (!Steps.empty())
+                {
+                    if (!LowerMemberPath(PD, Steps, Rhs, Where + ": " + Name(*Lhs), BP, Err)) { bOk = false; return; }
+                }
+                else if (!LowerDefault(*Lhs, PD, BP, Err, Rhs, /*bKeepZero=*/true)) { bOk = false; return; }
                 if (PD.Default.K == FDefaultValue::None)
                 { *Err = Where + ": " + Name(*Lhs) + " needs a literal value"; bOk = false; return; }
                 /* A widget's event flags are the compiler's, set below from the class's own events (kWidgetEvents). A line
@@ -17855,16 +17955,23 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                                                  Where + ": " + Name(*Lhs), PD, BP, Err))
                 { bOk = false; return; }
                 /* A statement is the member's whole new value, as an assignment is in C++: one before it on the same
-                   member is gone, not a tag under this one's (whose left-out members would load its values). */
+                   member is gone, not a tag under this one's (whose left-out members would load its values). One that
+                   sets part of it joins the member's tag instead (MergeMemberPath). */
+                const size_t Depth = Steps.size();
                 if (!bThroughComponent)
                 {
+                    if (Depth) { MergeMemberPath(InheritedDefaults, PD, Depth); return; }
                     InheritedDefaults.erase(std::remove_if(InheritedDefaults.begin(), InheritedDefaults.end(),
                                                            [&](const FPropertyDef& P) { return P.Name == PD.Name; }),
                                             InheritedDefaults.end());
                     InheritedDefaults.push_back(PD);
                     return;
                 }
-                if (DR == &R) { (bWidget ? WidgetDefaults : ComponentDefaults)[CompName].push_back(PD); return; }
+                auto Put = [&](std::vector<FPropertyDef>& Defs) {
+                    if (Depth) MergeMemberPath(Defs, PD, Depth);
+                    else Defs.push_back(PD);
+                };
+                if (DR == &R) { Put((bWidget ? WidgetDefaults : ComponentDefaults)[CompName]); return; }
                 /* A native parent's component is a default subobject, not an SCS node: it is
                    overridden by an export under this class's CDO, with no handler involved. */
                 /* A game Blueprint's component is an SCS node too, and overriding it takes the node's guid, which only
@@ -17883,12 +17990,12 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 {
                     FOverride& Sub = SubobjectDefaults[CompName];
                     Sub.Owner = DR;
-                    Sub.Defaults.push_back(PD);
+                    Put(Sub.Defaults);
                     return;
                 }
                 FOverride& O = ComponentOverrides[CompName];
                 O.Owner = DR;
-                O.Defaults.push_back(PD);
+                Put(O.Defaults);
             });
         if (!bOk) return false;
         /* Attached to one another, this class's components must still form a tree: a node in a cycle is no root node
@@ -18108,8 +18215,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                     if (NearestOfComp.insert(Method).second && Decl->value("pure", false))
                     { *Err = R.CppName + "::" + FieldName + ": " + CR->CppName + " is abstract (" + A->CppName + "::" + Method
                              + " is = 0), and an abstract class is never instanced, so it has no component template"; return false; }
-            if (!CR || !CR->IsNative())
-            { *Err = R.CppName + "::" + FieldName + ": a UE_COMPONENT names an engine component class"; return false; }
+            if (!CR) { *Err = R.CppName + "::" + FieldName + ": a UE_COMPONENT names a component class"; return false; }
             bool bIsScene = false, bIsComponent = false;
             for (const FRecord* A = CR; A; A = A->Base.empty() ? nullptr : Find(A->Base))
             {
@@ -18122,10 +18228,19 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             if (!bIsComponent) { *Err = R.CppName + "::" + FieldName + ": " + CR->CppName + " is not a UActorComponent"; return false; }
             /* The variable stays an ordinary ObjectProperty: ExecuteNodeOnActor finds it by name and
                assigns the instance it built from the archetype. The class and its CDO are imported in two
-               statements: as two arguments of one call, the compiler picks which row is added first. */
-            const FIndex CompClass = BP.EngineClass(CR->UePackage, CR->UeName);
-            const FIndex CompCdo = BP.ClassDefaultObject(CR->UePackage, CR->UeName);
+               statements: as two arguments of one call, the compiler picks which row is added first. A component
+               class of the mod's own is imported from the package it is cooked to, as the editor's SCS node names
+               a component Blueprint's generated class. */
+            const FIndex CompClass = BP.EngineClass(PackageOf(*CR), ClassOf(*CR));
+            const FIndex CompCdo = BP.ClassDefaultObject(PackageOf(*CR), ClassOf(*CR));
             BP.AddComponent(FieldName, CompClass, CompCdo, bIsScene, ComponentDefaults[FieldName], NativeTail(CR));
+            if (auto Node = R.ScsNodes.find(FieldName); Node != R.ScsNodes.end())
+            {
+                uint32 Guid[4] = {};
+                if (!ParseNodeGuid(Node->second, Guid))
+                { *Err = R.CppName + "::" + FieldName + "__UeScsNode is not 32 hex digits"; return false; }
+                BP.SetComponentGuid(FieldName, Guid);
+            }
             if (auto At = Attachments.find(FieldName); At != Attachments.end()) BP.AttachComponent(FieldName, At->second);
             ComponentDefaults.erase(FieldName);
         }
@@ -18410,19 +18525,15 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
            the tags this class writes on top of it are exactly the overridden values. */
         const FRecord& Owner = *Entry.second.Owner;
         const FRecord* CR = ComponentClassOf(Owner, Entry.first);
-        if (!CR || !CR->IsNative())
-        { *Err = R.CppName + "::UE_DEFAULTS: cannot resolve the class of " + Entry.first; return false; }
+        if (!CR) { *Err = R.CppName + "::UE_DEFAULTS: cannot resolve the class of " + Entry.first; return false; }
 
         const std::string OwnerPkg = PackageOf(Owner), OwnerCls = ClassOf(Owner);
         uint32 NodeGuid[4] = {};
         const std::string VarName = UeNameOf(&Owner, Entry.first);      // the node's name: `Audio Flying`, spaces and all
         if (auto Node = Owner.ScsNodes.find(Entry.first); Node != Owner.ScsNodes.end())
         {
-            /* The guid's 16 bytes as the engine holds them, which is four little-endian words on disk as well. */
-            if (Node->second.size() != 32)
+            if (!ParseNodeGuid(Node->second, NodeGuid))
             { *Err = R.CppName + "::UE_DEFAULTS: " + Entry.first + "__UeScsNode is not 32 hex digits"; return false; }
-            for (int B = 0; B < 16; ++B)
-                NodeGuid[B / 4] |= uint32(std::stoul(Node->second.substr(size_t(B) * 2, 2), nullptr, 16)) << (8 * (B % 4));
         }
         else
             ScsNodeGuid(OwnerCls, Entry.first, NodeGuid);
@@ -18438,15 +18549,17 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             if (Body)
                 ForEach(*Body, [&](const Json& S) {
                     const Json *Lhs = nullptr, *Rhs = nullptr, *Through = nullptr;
-                    bHit = bHit || (DefaultAssignment(S, Lhs, Rhs, Through) && Through && Name(*Through) == Entry.first);
+                    std::vector<const Json*> Steps;
+                    bHit = bHit || ((DefaultAssignment(S, Lhs, Rhs, Through) || DefaultMemberPath(S, Lhs, Rhs, Through, Steps))
+                                    && Through && Name(*Through) == Entry.first);
                 });
             return bHit;
         };
         FIndex ArchetypeClass = OwnerClass;
         for (const FRecord* A = Find(R.Base); A && A != &Owner; A = A->Base.empty() ? nullptr : Find(A->Base))
             if (Overrides(*A)) { ArchetypeClass = BP.EngineClass(PackageOf(*A), ClassOf(*A)); break; }
-        BP.AddComponentOverride(VarName, BP.EngineClass(CR->UePackage, CR->UeName),
-                                BP.Subobject(CR->UePackage, CR->UeName, ArchetypeClass,
+        BP.AddComponentOverride(VarName, BP.EngineClass(PackageOf(*CR), ClassOf(*CR)),
+                                BP.Subobject(PackageOf(*CR), ClassOf(*CR), ArchetypeClass,
                                              VarName + "_GEN_VARIABLE"),
                                 OwnerClass, NodeGuid, Entry.second.Defaults, NativeTail(CR));
     }
@@ -19366,6 +19479,7 @@ public:
         if (bKindNext && !Skipped)          // "kind" comes before "range"; a TypeTraitExpr's begin is its trait (FoldConst)
             Ranged.back() = V == "DeclRefExpr" || V == "TypeTraitExpr" ? ERange::Begin
                           : V == "MemberExpr" || V == "InitListExpr" || V == "CXXConstructExpr" ? ERange::Whole : ERange::None;
+        if (bTypeNext) V = Unrooted(std::move(V));
         return Value(std::move(V));
     }
     bool binary(binary_t& V) override { return Value(std::move(V)); }
@@ -19393,6 +19507,7 @@ public:
                  || ((K == "isUsed" || K == "isReferenced") && Stack.back()->value("kind", std::string()) != "VarDecl")
                  || (K == "range" && Ranged.back() == ERange::None);
         bKindNext = K == "kind";
+        bTypeNext = K == "qualType" || K == "desugaredQualType";
         if (!bSkipNext) Slot = &(*Stack.back())[std::move(K)];
         return true;
     }
@@ -19410,6 +19525,22 @@ private:
     int32 Skipped = 0;              // depth inside a dropped object or array
     bool bSkipNext = false;         // the next value is a dropped key's
     bool bKindNext = false;         // ... or "kind"'s
+    bool bTypeNext = false;         // ... or a type's text
+
+    /* A type written from the global namespace, `::Game::X` (genueapi roots every Blueprint's, inside which a bare
+       `Game::` would find a Blueprint's own Game namespace): clang's text keeps the `::` as written, and every lookup
+       here names a type by its qualified name without it. */
+    static string_t Unrooted(string_t T)
+    {
+        for (size_t At = 0; (At = T.find("::", At)) != string_t::npos;)
+            if (At == 0 || std::strchr("<(, *&", T[At - 1]))
+            {
+                T.erase(At, 2);
+                if (At >= 2 && T[At - 1] == ' ' && T[At - 2] == '<') T.erase(--At, 1);   // `TSubclassOf< ::X>`, clang's way past `<:`
+            }
+            else At += 2;
+        return T;
+    }
 
     Json* Place(Json&& V)
     {
@@ -19420,14 +19551,14 @@ private:
     bool Value(Json&& V)
     {
         if (!Skipped && !bSkipNext) Place(std::move(V));
-        bSkipNext = bKindNext = false;
+        bSkipNext = bKindNext = bTypeNext = false;
         return true;
     }
     bool Open(Json::value_t T)
     {
         if (Skipped || bSkipNext) ++Skipped;
         else { Stack.push_back(Place(Json(T))); Ranged.push_back(ERange::None); }
-        bSkipNext = bKindNext = false;
+        bSkipNext = bKindNext = bTypeNext = false;
         return true;
     }
     bool Close()
@@ -20120,6 +20251,9 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         /* An asset in this mod's own folder (one bpbuild ships as cooked, `kept:`) is an instance of the class this
            mod cooks: its import names the class at the same path. */
         if (Lower(Path).rfind(Lower(ModPackage) + "/", 0) == 0) continue;
+        /* Nor is one of a class in a `Game::` namespace: that is cooked at its own /Game path (PathIn), the class
+           the asset's import names, whichever mod cooks it - a mod with a second root, as a recovered one has. */
+        if (R->CppName.compare(0, 6, "Game::") == 0) continue;
         const std::string Leaf = LeafOf(R->CppName);
         *Err = Qual + " at " + Path + " is a " + R->CppName + ", which this mod cooks its own copy of, so it would load as null: "
                "name the class's owner where it is declared, e.g. UE_CLASS(\"" + Path.substr(0, Path.rfind('/') + 1) + Leaf

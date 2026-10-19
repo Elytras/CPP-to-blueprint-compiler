@@ -21,4 +21,22 @@ public:
     TDelegate<void()> Local = {this, &DelegateVar::OnTimer};
     UKismetSystemLibrary::K2_SetTimerDelegate(Local, 2.0f, true, 0.0f, 0.0f);
   }
+
+  /* A dispatcher takes a delegate value as it is: the editor's Add / Remove node fed a delegate pin. */
+  UE_DISPATCHER(OnHit, int32 Points);
+  int32 Got = 0;
+  TDelegate<void(int32 Points)> Held;
+  void Take(int32 Points) { Got += Points; }
+  void Hook() {
+    Held = {this, &DelegateVar::Take};
+    OnHit.Add(Held);
+  }
+  void Unhook() { OnHit.Remove(Held); }
+  void Fire(int32 Points) { OnHit.Broadcast(Points); }
+
+  /* A native dispatcher's handler may take a parameter by const reference where UeApi spells it by value. */
+  UE_COMPONENT(UBoxComponent, Box);
+  void Bumped(UPrimitiveComponent *Hit, AActor *Other, UPrimitiveComponent *OtherComp, FVector Impulse,
+              const FHitResult &Result) {}
+  void HookBox() { Box->OnComponentHit.Add(this, &DelegateVar::Bumped); }
 };
