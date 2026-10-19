@@ -48,7 +48,8 @@ CONTAINER = re.compile(r"^(?:const\s+)?(TArray|TSet|TMap)<(.*)>\s*&?$")
 # 1: UeDefaultSubobjects with the nested ones, __UeSubobject markers joined through the game's Blueprints.
 # 2: "game".
 # 3: <D>__UeDispatcher on each native dispatcher, NotCallable.json, and main's TEnum spellings of native enum fields.
-GENUEAPI_VERSION = 3
+# 4: UeTemplateSubobjects, the objects instanced under a game Blueprint's component templates.
+GENUEAPI_VERSION = 4
 
 
 def dump_identity(sdk_dir):
@@ -1355,6 +1356,7 @@ def write_out_arrays(out_dir):
 SCRIPT_INHERIT = 0x4AA1364E         # CLASS_ScriptInherit, ObjectMacros.h:249-259
 RF_ARCHETYPE_OBJECT, RF_DEFAULT_SUBOBJECT = 0x20, 0x40000
 GAME_SUBOBJECTS = {}                # game Blueprint class path -> ["<class path> <name>"] under its CDO (scan_game)
+GAME_TEMPLATE_SUBOBJECTS = {}       # game Blueprint class path -> ["<class path> <Var>_GEN_VARIABLE:<name>"] (scan_game)
 GAME_MEMBER_SUBOBJECTS = {}         # (native class path, member's engine name lowered) -> {subobject names} (scan_game)
 OBJECT_PATH = "/Script/CoreUObject.Object"
 DEFAULT_TAIL = (0, OBJECT_PATH, "Engine")   # UObject's: Object.h:57-60
@@ -1387,6 +1389,12 @@ def scan_game(content, container_members):
             up = p.exports[up - 1]["outer"]
         return up == cdo
 
+    def template_of(p, k, cls):
+        """The export right under the class that export k sits under."""
+        while p.exports[k - 1]["outer"] != cls:
+            k = p.exports[k - 1]["outer"]
+        return k
+
     def name_path(p, k, cdo):
         x = p.exports[k - 1]
         return x["name"] if x["outer"] == cdo else name_path(p, x["outer"], cdo) + ":" + x["name"]
@@ -1408,6 +1416,14 @@ def scan_game(content, container_members):
                     GAME_SUBOBJECTS[p.path(i + 1)] = [
                         "%s %s" % (p.path(x["cls"]), name_path(p, k + 1, st.cdo)) for k, x in enumerate(p.exports)
                         if x["flags"] & (RF_DEFAULT_SUBOBJECT | RF_ARCHETYPE_OBJECT) and under(p, x, st.cdo)]
+                    # And every object instanced under one of its component templates, `<Var>_GEN_VARIABLE` under the
+                    # class (its own SCS nodes' and its overrides of inherited ones): a child's object of the same name
+                    # and class there is archetyped on it (UObjectArchetype.cpp 64-83), ProjectileAttack_GEN_VARIABLE:
+                    # NormalProjectileAttack_0 in ENE_ShootingPlant_C.
+                    GAME_TEMPLATE_SUBOBJECTS[p.path(i + 1)] = [
+                        "%s %s" % (p.path(x["cls"]), name_path(p, k + 1, i + 1)) for k, x in enumerate(p.exports)
+                        if x["flags"] & RF_ARCHETYPE_OBJECT and x["outer"] != i + 1 and under(p, x, i + 1)
+                        and p.exports[template_of(p, k + 1, i + 1) - 1]["name"].endswith("_GEN_VARIABLE")]
                     for prop in st.props:
                         enum_kinds(p, prop)
                     # A Blueprint's default object holds a tag for each component member, naming the default subobject
@@ -1651,6 +1667,7 @@ def main():
     read_enum_forms(sdk_dir, game_enums)
     for k in classes:
         k.default_subobjects = GAME_SUBOBJECTS.get(k.path + "." + k.ue_name, []) if k.is_bp else []
+        k.template_subobjects = GAME_TEMPLATE_SUBOBJECTS.get(k.path + "." + k.ue_name, []) if k.is_bp else []
     tails = class_tails(classes, by_name, game)
     ifaces = native_interfaces(classes, by_name, game, overrides)
     ordered, seen = [], set()
@@ -1819,6 +1836,10 @@ def main():
                 # name can hold a space): a child is serialized after each.
                 marks.append('static constexpr const char* UeDefaultSubobjects = "%s";'
                              % c_literal(";".join(k.default_subobjects)))
+            if k.template_subobjects:
+                # The objects instanced under its component templates, "<class path> <Var>_GEN_VARIABLE:<name>", ';'.
+                marks.append('static constexpr const char* UeTemplateSubobjects = "%s";'
+                             % c_literal(";".join(k.template_subobjects)))
             names = set(f for _, _, f, _ in k.funcs)
             for ftype, fname in k.fields:
                 if fname in names:
