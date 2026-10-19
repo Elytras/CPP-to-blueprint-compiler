@@ -2930,8 +2930,9 @@ properties a parent class declares. It is what editing a component or Class Defa
 block is data: AssetGen reads its assignments when it compiles, and nothing in it ever runs. The rule to remember:
 every statement is `Field = value;` or `Component->Field = value;`, and a variable the class declares takes its default
 from its own initializer instead. The one call it takes is `Component->SetupAttachment(Parent);`, which places a
-component: see [The root and attachment](#the-root-and-attachment). A default constructor is read the same way, as C++
-would leave the object: see [Constructors](#constructors).
+component: see [The root and attachment](#the-root-and-attachment). An object instanced in a default, such as a status
+effect's items, is made with `UE_INSTANCED` and may be held in a local: see [Instanced objects](#instanced-objects). A
+default constructor is read the same way, as C++ would leave the object: see [Constructors](#constructors).
 
 ### UE_DEFAULTS
 
@@ -3105,6 +3106,65 @@ Notes:
   dump made with the Dumper-7 fork. See [The SDK](GUIDE.md#the-sdk).
 - [examples/GameBlueprintChild.cpp](examples/GameBlueprintChild.cpp) extends a game Blueprint and sets inherited
   defaults.
+
+### Instanced objects
+
+Some properties hold an object made for the class itself rather than an asset: a status effect's `StatusEffects`, a
+projectile attack component's `Projectiles`, a damage component's bonuses (the editor's Instanced, EditInlineNew
+values). In the editor you pick a class in the details panel and fill in its fields. `UE_INSTANCED(Type, Outer, "Name")`
+is that object. The cook writes it as an export of its own under `Outer`, with its own defaults, and the property points
+at it.
+
+| You write | What it does | Status |
+|---|---|---|
+| `StatusEffects = {UE_INSTANCED(UStatChangeStatusEffectItem, this, "Slow")};` | A new object of that class under the default object, which the property points at. It starts from its class's defaults. | Yes |
+| `UDotStatusEffectItem *Burn = UE_INSTANCED(UDotStatusEffectItem, this, "Burn");` then `Burn->damageAmount = FRandRange{2.0f, 3.0f};` and `StatusEffects = {Burn};` | A local holds the object so its own members can be set: each `Burn->Field = value;` is a default of that object, under the same rules as any `UE_DEFAULTS` statement. | Yes |
+| `Burn->DamageImpulseOverride = UE_INSTANCED(UDamageImpulse, Burn, "Impulse");` | An object under another instanced object, nested as deep as needed. | Yes |
+| `Attack->Projectiles = {UE_INSTANCED(UNormalProjectileAttack, Attack, "Shot")};` | An object under a component's template: the class's own `UE_COMPONENT`, a component a parent declares (mod or game Blueprint), or a C++ parent's default subobject. | Yes |
+| `UE_INSTANCED(UDotStatusEffectItem, this, "DotStatusEffectItem_0")` in a child of `STE_Spider_Shooter_Acid_C` | Named as an object the parent already holds there, it is this class's copy of that one: the engine finds it as its archetype, so a member the child leaves unset keeps the parent's value. This works for a mod parent and a game Blueprint, under the default object or under a component the parent sets up (the SDK lists a game Blueprint's objects as `UeDefaultSubobjects` and `UeTemplateSubobjects`). The parent's object must be of the same class. | Yes |
+| A name the parent holds, with another class | Refused: "DotStatusEffectItem_0 is a /Script/FSD.DotStatusEffectItem in STE_Spider_Shooter_Acid_C, which UStatChangeStatusEffectItem's DotStatusEffectItem_0 would be a copy of; make it that class, or name it otherwise for an object of its own". | Refused |
+| `UE_INSTANCED(UDotStatusEffectItem, this)`, or a name that is not a string literal | Refused: "UE_INSTANCED names its object". The name is the export's, and it is how a subclass reaches the object. The editor's own names are `<Class>_<N>`, such as `DotStatusEffectItem_0`. | Refused |
+| Two `UE_INSTANCED` of one name under one outer | Refused: "makes Burn twice; one object holds one name under its outer". | Refused |
+| `UE_INSTANCED(..., GetOwner(), ...)`, or a local that holds no `UE_INSTANCED` | Refused: "UE_INSTANCED's outer is `this`, one of the class's components, or a local holding another UE_INSTANCED". | Refused |
+| `UE_INSTANCED(...);` as a statement of its own | Refused: "UE_INSTANCED makes an object a default points at". An object nothing points at would be a default that does nothing. | Refused |
+| `UE_INSTANCED` in a member initializer | Refused: "UE_INSTANCED makes an object in a class's UE_DEFAULTS, pointed at by one of its defaults". | Refused |
+| `UE_INSTANCED` in a function | Refused: "call to an unknown function: UeInstanced__". At run time, make an object with `NewObject`: see [Creating objects](#creating-objects). | Refused |
+| An object under a game Blueprint's component, with an SDK from genueapi older than version 4 | Refused: "UeApi was written by a genueapi older than version 4". Regenerate the SDK. | Refused |
+
+```cpp
+#include "UeApi/Game/ENE_ShootingPlant_C.h"
+
+class ToxicSlow : public UStatusEffect {
+  UE_DEFAULTS {
+    UDotStatusEffectItem *Burn = UE_INSTANCED(UDotStatusEffectItem, this, "Burn");
+    Burn->damageAmount = FRandRange{2.0f, 3.0f};
+    Burn->DamageImpulseOverride = UE_INSTANCED(UDamageImpulse, Burn, "Impulse");
+    StatusEffects = {Burn, UE_INSTANCED(UStatChangeStatusEffectItem, this, "Slow")};
+  }
+};
+
+class ToxicSlowKid : public ToxicSlow {
+  UE_DEFAULTS {
+    UDotStatusEffectItem *Burn = UE_INSTANCED(UDotStatusEffectItem, this, "Burn");  // the parent's Burn, copied
+    Burn->OverrideDamageImpulse = true;                                             // its damage stays 2 to 3
+    StatusEffects = {Burn};
+  }
+};
+
+class SteadyPlant : public Game::Enemies::ShootingPlant::ENE_ShootingPlant_C {
+  UE_DEFAULTS {
+    UNormalProjectileAttack *Shot = UE_INSTANCED(UNormalProjectileAttack, ProjectileAttack, "NormalProjectileAttack_0");
+    Shot->RandomAngle = 5.0f;                                                       // the rest stays the game's
+    ProjectileAttack->Projectiles = {Shot};
+  }
+};
+```
+
+Notes:
+
+- A class's objects are only those its `UE_DEFAULTS` make. A child that wants the parent's object with a change names it
+  again; a child that leaves the property alone keeps the parent's list, and the engine gives it copies when it loads.
+- bpdecomp writes a cooked class's instanced objects this way, one local per object, under its export's name.
 
 ## Creating objects
 

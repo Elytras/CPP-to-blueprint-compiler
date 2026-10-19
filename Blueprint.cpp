@@ -190,6 +190,16 @@ FIndex FBlueprintClass::ClassDefaultObject(const std::string& PackageName,
     return Idx;
 }
 
+FIndex FBlueprintClass::DefaultObject(const std::string& PackageName, const std::string& ClassName_)
+{
+    const std::string Key = "cdo:" + PackageName + "." + ClassName_;     // ClassDefaultObject's row
+    auto It = ImportCache.find(Key);
+    if (It == ImportCache.end())
+        It = ImportCache.emplace(Key, P.AddImport({ PackageName, ClassName_, PackageImport(PackageName),
+                                                    "Default__" + ClassName_ })).first;
+    return Imp(It->second);
+}
+
 FIndex FBlueprintClass::Asset(const std::string& ClassPackage, const std::string& ClassName_,
                               const std::string& AssetPackage, const std::string& AssetName)
 {
@@ -348,6 +358,20 @@ static void TagRefs(const FPropertyDef& P, std::vector<int32>& Out)
     if (P.Members) for (const FPropertyDef& M : *P.Members) TagRefs(M, Out);
 }
 
+/* A default that points at an object instanced in the defaults, pointed at its export: the AddInstanced id's row. */
+static void PointAtInstanced(FPropertyDef& P, int32 FirstRow);
+static void PointAtInstanced(FDefaultValue& D, int32 FirstRow)
+{
+    if (D.Instanced) D.Object = Exp(FirstRow + D.Instanced - 1);
+    for (FDefaultValue& I : D.Items) PointAtInstanced(I, FirstRow);
+    if (D.Members) for (FPropertyDef& M : *D.Members) PointAtInstanced(M, FirstRow);
+}
+static void PointAtInstanced(FPropertyDef& P, int32 FirstRow)
+{
+    PointAtInstanced(P.Default, FirstRow);
+    if (P.Members) for (FPropertyDef& M : *P.Members) PointAtInstanced(M, FirstRow);
+}
+
 void FBlueprintClass::Finish()
 {
     const std::string CDOName = "Default__" + ClassName;
@@ -367,9 +391,7 @@ void FBlueprintClass::Finish()
                                                  CorePkg, "Default__Function" }));
 
     const FIndex ParentIdx = EngineClass(ParentPackage, ParentClass);
-    const FIndex ParentCdo = Imp(P.AddImport({ ParentPackage, ParentClass,
-                                               PackageImport(ParentPackage),
-                                               "Default__" + ParentClass }));
+    const FIndex ParentCdo = DefaultObject(ParentPackage, ParentClass);
     /* An overridden default subobject's archetype is the object of its name under its outer's archetype - the parent
        CDO's subobject (GetArchetypeFromRequiredInfo rule 1, UObjectArchetype.cpp 64-83) - and the cook writes it as the
        export's TemplateIndex: Ene_Butterfly's HealthComponent names
@@ -435,6 +457,67 @@ void FBlueprintClass::Finish()
     const int32 RowFirstOverride = RowIch + 1;
     const FIndex ScsIdx = bIsActor ? Exp(RowScs) : Null();
     ClassRow = RowClass;
+    /* Last, the objects instanced in the defaults (AddInstanced), in the order added: an outer comes before what it
+       holds. Each default that points at one is pointed at its export now, before the exports copy their defaults. */
+    const int32 RowFirstInstanced = !bIsActor ? RowRootTemplate
+                                  : RowIch + (ComponentOverrides.empty() ? 0 : 1 + int32(ComponentOverrides.size()));
+    for (FPropertyDef& V : Vars) PointAtInstanced(V, RowFirstInstanced);
+    for (FPropertyDef& V : CdoDefaults) PointAtInstanced(V, RowFirstInstanced);
+    for (FComponent& C : Components) for (FPropertyDef& V : C.Defaults) PointAtInstanced(V, RowFirstInstanced);
+    for (FComponentOverride& O : ComponentOverrides) for (FPropertyDef& V : O.Defaults) PointAtInstanced(V, RowFirstInstanced);
+    for (FSubobjectOverride& O : SubobjectOverrides) for (FPropertyDef& V : O.Defaults) PointAtInstanced(V, RowFirstInstanced);
+    for (FInstanced& I : Instanced) for (FPropertyDef& V : I.Defaults) PointAtInstanced(V, RowFirstInstanced);
+    auto OuterRow = [&](const FInstanced& I) {
+        auto At = [](const auto& List, const std::string& Name) {
+            return int32(std::find_if(List.begin(), List.end(), [&](const auto& X) { return X.Name == Name; }) - List.begin());
+        };
+        switch (I.Outer)
+        {
+        case FInstanced::Component: return RowFirstComponent + 2 * At(Components, I.OuterName);
+        case FInstanced::ComponentOverride: return RowFirstOverride + At(ComponentOverrides, I.OuterName);
+        case FInstanced::SubobjectOverride: return RowFirstSubobject + At(SubobjectOverrides, I.OuterName);
+        case FInstanced::Instanced: return RowFirstInstanced + I.OuterId - 1;
+        default: return RowCdo;
+        }
+    };
+    /* Archetyped on a parent's object, not on its class's CDO. */
+    auto InheritsArchetype = [&](const FInstanced& I) {
+        return I.Archetype.V < 0 && P.ImportAt(I.Archetype)->ObjectName.compare(0, 9, "Default__") != 0;
+    };
+    /* What an export the cook writes with instanced objects under it lists (STE_Slow20's CDO, ENE_ShootingPlant_Inferno's
+       ProjectileAttack_GEN_VARIABLE): each of them created before it is serialized, and each archetype it copies one
+       from serialized before it is created, as its own archetype is. */
+    auto HoldsInstanced = [&](FExport& Outer, int32 Row) {
+        for (size_t K = 0; K < Instanced.size(); ++K)
+        {
+            if (OuterRow(Instanced[K]) != Row) continue;
+            Outer.CreateBeforeSer.push_back(Exp(RowFirstInstanced + int32(K)).V);
+            if (InheritsArchetype(Instanced[K])) Outer.SerBeforeCreate.push_back(Instanced[K].Archetype.V);
+        }
+    };
+    auto AddInstancedExports = [&]() {
+        for (size_t K = 0; K < Instanced.size(); ++K)
+        {
+            const FInstanced& I = Instanced[K];
+            const int32 Row = RowFirstInstanced + int32(K);
+            FExport Object;
+            Object.ClassIndex = I.Class;
+            Object.TemplateIndex = I.Archetype;
+            Object.OuterIndex = Exp(OuterRow(I));
+            Object.ObjectName = I.Name;
+            Object.ObjectFlags = RF_Public | RF_Transactional | RF_ArchetypeObject;
+            Object.SerBeforeSer = { Object.OuterIndex.V };
+            for (const FPropertyDef& V : I.Defaults) TagRefs(V, Object.CreateBeforeSer);
+            Object.SerBeforeCreate = { I.Class.V, I.Archetype.V };
+            HoldsInstanced(Object, Row);
+            Object.CreateBeforeCreate = { Object.OuterIndex.V };
+            Object.Serialize = [Defaults = I.Defaults, Tail = I.NativeTail](FArc& Ar) {
+                for (const FPropertyDef& V : Defaults) WriteDefaultTag(Ar, V);
+                EndComponent(Ar, Tail);
+            };
+            P.AddExport(std::move(Object));
+        }
+    };
 
     std::vector<std::string> FunctionNames;
     for (const FPending& F : Functions) FunctionNames.push_back(F.Def.Name);
@@ -480,6 +563,11 @@ void FBlueprintClass::Finish()
     };
     for (const FParentSubobject& S : ParentSubobjects)
         if (const FIndex Sub = ParentSubobjectAt(S.Name); Sub.V != 0) Class.SerBeforeSer.push_back(Sub.V);
+    /* And each parent's instanced object one of this class's is copied from (STE_Slow20_C lists
+       Default__STE_Spider_Shooter_Acid_C:DotStatusEffectItem_0). */
+    for (const FInstanced& I : Instanced)
+        if (InheritsArchetype(I) && std::find(Class.SerBeforeSer.begin(), Class.SerBeforeSer.end(), I.Archetype.V) == Class.SerBeforeSer.end())
+            Class.SerBeforeSer.push_back(I.Archetype.V);
     Class.SerBeforeCreate = { BpgcClass.V, BpgcCdo.V };
     Class.CreateBeforeCreate = { ParentIdx.V };
     std::vector<FIndex> Bindings;               // DynamicBindingObjects, listed first as BP_PlayerControllerBase_C lists them
@@ -653,6 +741,7 @@ void FBlueprintClass::Finish()
     std::vector<std::string> SubobjectNames;
     for (const FSubobjectOverride& O : SubobjectOverrides) SubobjectNames.push_back(O.Property);
     for (size_t I = 0; I < SubobjectOverrides.size(); ++I) Cdo.CreateBeforeSer.push_back(Exp(RowFirstSubobject + int32(I)).V);
+    HoldsInstanced(Cdo, RowCdo);
     Cdo.Serialize = [=](FArc& Ar) {
         if (bCdoReplicates) TagBool(Ar, "bReplicates", true);
         if (bOverridesTick)
@@ -703,6 +792,7 @@ void FBlueprintClass::Finish()
         Sub.ObjectFlags = RF_Public | RF_Transactional | RF_ArchetypeObject | RF_DefaultSubObject;
         Sub.SerBeforeCreate = { O.Class.V, Sub.TemplateIndex.V };      // as the cook lists class and template
         Sub.CreateBeforeCreate = { Exp(RowCdo).V };
+        HoldsInstanced(Sub, RowFirstSubobject + int32(I));
         Sub.Serialize = [Defaults, Tail = O.NativeTail](FArc& Ar) {
             for (const FPropertyDef& V : Defaults) WriteDefaultTag(Ar, V);
             EndComponent(Ar, Tail);
@@ -1170,7 +1260,7 @@ void FBlueprintClass::Finish()
         }
     }
 
-    if (!bIsActor) return;
+    if (!bIsActor) { AddInstancedExports(); return; }
 
     const FIndex SceneCompClass = EngineClass("/Script/Engine", "SceneComponent");
     const FIndex ScsNodeClass = EngineClass("/Script/Engine", "SCS_Node");
@@ -1288,6 +1378,7 @@ void FBlueprintClass::Finish()
         Template.SerBeforeSer = { Exp(RowClass).V };
         Template.SerBeforeCreate = { C.Class.V, C.Cdo.V };
         Template.CreateBeforeCreate = { Exp(RowClass).V };
+        HoldsInstanced(Template, RowTemplate);
         Template.Serialize = [Defaults, Tail = C.NativeTail](FArc& Ar) {
             for (const FPropertyDef& V : Defaults) WriteDefaultTag(Ar, V);
             EndComponent(Ar, Tail);
@@ -1379,7 +1470,7 @@ void FBlueprintClass::Finish()
     };
     P.AddExport(std::move(Scs));
 
-    if (ComponentOverrides.empty()) return;
+    if (ComponentOverrides.empty()) { AddInstancedExports(); return; }
 
     /*
     The editor's "override an inherited component's defaults". UInheritableComponentHandler holds one
@@ -1438,8 +1529,9 @@ void FBlueprintClass::Finish()
     };
     P.AddExport(std::move(Ich));
 
-    for (const FComponentOverride& O : Overrides)
+    for (size_t K = 0; K < Overrides.size(); ++K)
     {
+        const FComponentOverride& O = Overrides[K];
         const std::vector<FPropertyDef> Defaults = O.Defaults;
         FExport Template;
         Template.ClassIndex = O.Class;
@@ -1456,12 +1548,14 @@ void FBlueprintClass::Finish()
         Template.CreateBeforeSer = { O.OwnerClass.V };
         Template.SerBeforeCreate = { O.Class.V, O.ParentTemplate.V };
         Template.CreateBeforeCreate = { Exp(RowClass).V };
+        HoldsInstanced(Template, RowFirstOverride + int32(K));
         Template.Serialize = [Defaults, Tail = O.NativeTail](FArc& Ar) {
             for (const FPropertyDef& V : Defaults) WriteDefaultTag(Ar, V);
             EndComponent(Ar, Tail);
         };
         P.AddExport(std::move(Template));
     }
+    AddInstancedExports();
 }
 
 /* Measured on DRG's MM_ResourceInfo: Guid tag, empty UStruct body, StructFlags 0, then the default

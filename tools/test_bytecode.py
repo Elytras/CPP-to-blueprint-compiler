@@ -5432,6 +5432,103 @@ def subobject_chain():
     print("ok  SubobjectChain: an override's archetype is the parent CDO's subobject of its name, a /Game one serialized "
           "before create; a parent that leaves it alone exports it for its subclass")
 
+INSTANCED_PLANT = '''#include "UeApi/Types.h"
+#include "UeApi/FSD.h"
+#include "UeApi/Game/ENE_ShootingPlant_C.h"
+UE_MOD_PACKAGE("/Game/_ElytrasMods/InstancedPlant");
+class InstancedPlant : public Game::Enemies::ShootingPlant::ENE_ShootingPlant_C {
+  UE_DEFAULTS {
+    UNormalProjectileAttack *Shot = UE_INSTANCED(UNormalProjectileAttack, ProjectileAttack, "NormalProjectileAttack_0");
+    Shot->RandomAngle = 5.0f;
+    ProjectileAttack->Projectiles = {Shot, UE_INSTANCED(UNormalProjectileAttack, ProjectileAttack, "Extra")};
+  }
+};
+'''
+
+
+def instanced_defaults():
+    """InstancedDefaults: an object UE_INSTANCED makes is an export under its outer - the CDO, another instanced object,
+    a component override - that the outer's tag points at, flagged an archetype, with its own tags. Its archetype is the
+    object of its name under the outer's archetype (the parent's, a game Blueprint's or a game component template's),
+    else its class's CDO, and it is created after that archetype is serialized. The kid's copy holds only the tags it
+    sets: the rest it takes off the base's. Named as the parent's but of another class, it is refused. InstancedPlant
+    (under ENE_ShootingPlant_C's ProjectileAttack template) needs a UeApi genueapi 4 wrote, which lists a game
+    template's objects; an older one is refused, saying to regenerate it."""
+    RF_ARCH, RF_DSO, RF_CDO = 0x20, 0x8000000, 0x10
+    base = asset('InstancedDefaults')
+    folder = os.path.dirname(base)
+    own = '/Game/_ElytrasMods/InstancedDefaults/'
+
+    def check(b, outer_path, tag, names, want):
+        """The tag `tag` on the export at outer_path points at exports named `names`, each under it, of the class and
+        with the archetype `want` gives, flagged an archetype and no default subobject, its archetype serialized
+        before it is created. Returns the package and {name: export row}."""
+        p = invariants.Package(b)
+        at = {p.path(k + 1): k for k in range(p.export_count)}
+        o = at[outer_path]
+        tags = {t['name']: t for t in p.tags(o)}
+        v = tags[tag]['value']
+        got = ([struct.unpack_from('<i', v, 4 + 4 * j)[0] for j in range(struct.unpack_from('<i', v)[0])]
+               if tags[tag]['type'] == 'ArrayProperty' else [struct.unpack('<i', v)[0]])
+        assert [p.path(x).rsplit(':', 1)[-1] for x in got] == names, (os.path.basename(b), tag, [p.path(x) for x in got])
+        out = {}
+        for x, n in zip(got, names):
+            e = p.exports[x - 1]
+            assert x > 0 and e['outer'] == o + 1, (n, 'not an export under ' + outer_path)
+            assert e['flags'] & RF_ARCH and not e['flags'] & (RF_DSO | RF_CDO), (n, hex(e['flags']))
+            cls, tmpl = want[n]
+            assert p.path(e['cls']).endswith('.' + cls), (n, p.path(e['cls']))
+            assert p.path(e['tmpl']) == tmpl, (n, p.path(e['tmpl']))
+            assert e['tmpl'] in e['deps'][2], (n, 'its archetype is not serialized before it is created')
+            out[n] = x - 1
+        return p, out
+
+    dot, slow = '/Script/FSD.Default__DotStatusEffectItem', '/Script/FSD.Default__StatChangeStatusEffectItem'
+    cdo = own + 'InstancedDefaults.Default__InstancedDefaults_C'
+    p, got = check(base, cdo, 'StatusEffects', ['Burn', 'Slow'],
+                   {'Burn': ('DotStatusEffectItem', dot), 'Slow': ('StatChangeStatusEffectItem', slow)})
+    assert 'damageAmount' in {t['name'] for t in p.tags(got['Burn'])}, 'Burn lost its damage'
+    check(base, cdo + ':Burn', 'DamageImpulseOverride', ['Impulse'],
+          {'Impulse': ('DamageImpulse', '/Script/FSD.Default__DamageImpulse')})
+
+    kid = os.path.join(folder, 'InstancedDefaultsKid')
+    p, got = check(kid, own + 'InstancedDefaultsKid.Default__InstancedDefaultsKid_C', 'StatusEffects', ['Burn'],
+                   {'Burn': ('DotStatusEffectItem', cdo + ':Burn')})
+    assert {t['name'] for t in p.tags(got['Burn'])} == {'OverrideDamageImpulse'}, 'the kid restates its base\'s damage'
+
+    acid = '/Game/Enemies/Spider/Shooter/STE_Spider_Shooter_Acid.Default__STE_Spider_Shooter_Acid_C:DotStatusEffectItem_0'
+    check(os.path.join(folder, 'InstancedDefaultsAcid'), own + 'InstancedDefaultsAcid.Default__InstancedDefaultsAcid_C',
+          'StatusEffects', ['DotStatusEffectItem_0'], {'DotStatusEffectItem_0': ('DotStatusEffectItem', acid)})
+    for n in ('InstancedDefaults', 'InstancedDefaultsKid', 'InstancedDefaultsAcid'):
+        keeps_invariants(os.path.join(folder, n))
+
+    refused('InstancedClash', '  UE_DEFAULTS {\n    StatusEffects = {UE_INSTANCED(UStatChangeStatusEffectItem, this, '
+            '"DotStatusEffectItem_0")};\n  }\n', 'make it that class',
+            top='#include "UeApi/Game/STE_Spider_Shooter_Acid_C.h"\n',
+            base='Game::Enemies::Spider::Shooter::STE_Spider_Shooter_Acid_C')
+
+    stamp = json.load(open(os.path.join(UEAPI, 'Version.json'), encoding='utf-8')).get('genueapi', 0)
+    if stamp < 4:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, 'InstancedPlant.cpp')
+            with open(src, 'w', encoding='utf-8') as f: f.write(INSTANCED_PLANT)
+            proc = assetgen_compile([src, UEAPI, tmp])
+        assert proc.returncode != 0 and 'genueapi' in proc.stdout and 'regenerate' in proc.stdout, proc.stdout[-500:]
+        return 'InstancedPlant refused, as this UeApi predates genueapi 4'
+    tmp, out, _ = compile_to(INSTANCED_PLANT, 'InstancedPlant')
+    b = os.path.join(out, 'InstancedPlant')
+    comp = '/Game/_ElytrasMods/InstancedPlant/InstancedPlant.InstancedPlant_C:ProjectileAttack_GEN_VARIABLE'
+    shot = '/Game/Enemies/ShootingPlant/ENE_ShootingPlant.ENE_ShootingPlant_C:ProjectileAttack_GEN_VARIABLE:' \
+           'NormalProjectileAttack_0'
+    p, got = check(b, comp, 'Projectiles', ['NormalProjectileAttack_0', 'Extra'],
+                   {'NormalProjectileAttack_0': ('NormalProjectileAttack', shot),
+                    'Extra': ('NormalProjectileAttack', '/Script/FSD.Default__NormalProjectileAttack')})
+    angle = next(t for t in p.tags(got['NormalProjectileAttack_0']) if t['name'] == 'RandomAngle')['value']
+    assert struct.unpack('<f', angle)[0] == 5.0, angle
+    keeps_invariants(b)
+    shutil.rmtree(tmp, ignore_errors=True)
+    return 'and InstancedPlant, under a game component template'
+
 
 def self_ref_import():
     """SelfRefImport: a member of the mod's own class and a call to its own function on another instance reference
@@ -5693,6 +5790,8 @@ name_numbers()
 name_suffix()
 subobject_template()
 subobject_chain()
+print('ok  InstancedDefaults: an instanced object is an export under its outer, its tag that export, its archetype the '
+      'outer archetype\'s object of its name or its class\'s CDO; %s' % instanced_defaults())
 self_ref_import()
 abstract_instances()
 refused('AbstractComp', '  UE_COMPONENT(UPureComp, Comp);\n', 'abstract', top=ABSTRACT_COMP)

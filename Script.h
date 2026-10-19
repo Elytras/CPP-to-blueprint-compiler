@@ -34,6 +34,7 @@ struct FDefaultValue
     double F = 0.0;                     // Float
     std::string S;                      // Str: UTF-8, for StrProperty / NameProperty / TextProperty
     FIndex Object;                      // Obj: the asset an ObjectProperty points at
+    int32 Instanced = 0;                // Obj: an object instanced in the defaults, FBlueprintClass::AddInstanced's id (Finish sets Object)
     std::vector<FDefaultValue> Items;   // Array (also a set / map): one value per element, typed by the property's Inner; a map alternates key, value
     std::shared_ptr<std::vector<struct FPropertyDef>> Members;  // Struct, as a container's element: its own members (a lone struct's are FPropertyDef::Members)
     std::vector<FDefaultValue> Removed; // a set / map read over the parent's value: its elements (a map's keys) taken out first

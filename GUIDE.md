@@ -952,6 +952,17 @@ Watch for:
   member as `<Comp>__UeScsNode`. Only an SDK generated from a [Dumper-7 fork](https://github.com/Elytras/Dumper-7) dump
   has these markers. Without one, the override is refused: "... its header does not say which SCS node it is -
   re-dump the game with the Dumper-7 fork (ScsNode=) and regenerate UeApi".
+- A property that holds an object made for the class, such as a status effect's `StatusEffects` or a projectile
+  attack's `Projectiles`, takes `UE_INSTANCED(Type, Outer, "Name")`. Hold it in a local to set its fields, and give it
+  the name the parent's object has to change that one rather than add another:
+
+  ```cpp
+  UNormalProjectileAttack *Shot = UE_INSTANCED(UNormalProjectileAttack, ProjectileAttack, "NormalProjectileAttack_0");
+  Shot->RandomAngle = 5.0f;                    // the rest of the game's NormalProjectileAttack_0 stays as it is
+  ProjectileAttack->Projectiles = {Shot};
+  ```
+
+  See [Instanced objects](REFERENCE.md#instanced-objects).
 - Your class is a new class. The game keeps spawning its own, so spawn yours yourself (see
   [Components and spawning](#components-and-spawning)). To change what the game spawns, patch its Blueprint instead:
   see the next section.

@@ -1004,6 +1004,7 @@ struct FRecord
     std::map<std::string, std::string> Subobjects;  // `<X>__UeSubobject`: a native component -> "<name> <class path>" on this CDO
     std::map<std::string, std::string> Dispatchers; // `<X>__UeDispatcher`: a native dispatcher -> "Assignable Callable", what of them it is
     std::vector<std::pair<std::string, std::string>> DefaultSubobjects;    // UeDefaultSubobjects: (name, class path), a game Blueprint CDO's
+    std::vector<std::pair<std::string, std::string>> TemplateSubobjects;   // UeTemplateSubobjects: (path under the class, class path)
     std::map<std::string, std::string> TypeAliases; // `using Leaf = Game::...::Leaf;` in the class body
     std::set<std::string> FinalMethods;             // `virtual T F() final`: no subclass has an F of its own
     std::set<std::string> Forwarders;               // Methods AssetGen declared, not the source: see SynthesizeForwarders
@@ -1692,6 +1693,22 @@ private:
     /* The native default subobjects a class's UE_DEFAULTS restates: each component member -> the record declaring it. */
     std::map<std::string, const FRecord*> RestatedSubobjects(const FRecord& R) const;
     std::map<std::string, const FRecord*> SubobjectsRestatedBelow(const FRecord& R) const;
+    /* One UE_INSTANCED of a class's UE_DEFAULTS, in the order written. Where it hangs: under the CDO (Root empty) or
+       the component template <Root>_GEN_VARIABLE (Root the SCS node's name), at Path below it - a native subobject's
+       name first when that is its outer (Damage:DamageBonus_0), an outer instanced object's path before its own. */
+    struct FInstSpec
+    {
+        enum EOuter { This, OwnComponent, InheritedComponent, NativeSubobject, InInstanced } Outer = This;
+        std::string Call, Local;            // the UeInstanced__ call's node id; the local holding it (VarDecl id), or ""
+        const FRecord* Class = nullptr;
+        std::string Name, Root, Path;
+        std::string Component;              // the outer component's member, as C++ names it
+        const FRecord* Declarer = nullptr;  // the class declaring that member
+        std::string Subobject;              // NativeSubobject: its object name and class path, "<name> <class path>"
+        int32 Parent = -1;                  // Local: the spec of the object it hangs under
+        std::string Where;
+    };
+    bool ScanInstanced(const FRecord& A, std::vector<FInstSpec>& Out, std::string* Err) const;
     /* S38: UE_ASSET_EDIT and UE_PATCH, the game's own packages with only the named tags changed. */
     bool GenerateEdit(const std::string& Key, const Json& Var, std::string* Err);
     bool GeneratePatch(const FRecord& R, std::string* Err);
@@ -2271,6 +2288,10 @@ private:
     /* The UeApi folder when genueapi wrote it without --game (Version.json "game": false), else empty: it then lists
        no game Blueprint's default subobjects or tail, so Generate refuses a class deriving from one. */
     std::string UeApiWithoutGame;
+    int32 UeApiStamp = 0;       // Version.json's genueapi: 4 lists UeTemplateSubobjects, which UE_INSTANCED reads
+    /* While a UE_DEFAULTS block is lowered: a value that is an object instanced there (UE_INSTANCED, or a local holding
+       one) -> its FDefaultValue (Instanced set); false for any other value, with Err set for one it refuses. */
+    std::function<bool(const Json&, FDefaultValue&, bool&)> InstancedValue;
     /* A container inside a container: UE has no such property, so the inner one is the single member (Value) of a
        wrapper struct, <wrapper name> -> the container type. The wrapper has the container's layout. */
     std::map<std::string, std::string> NestedWrappers;
@@ -3155,17 +3176,20 @@ bool FCompiler::Collect(std::string* Err)
                         if (End > At) R.Interfaces.push_back(List.substr(At, End - At));
                     }
             }
-            else if (Kind(C) == "VarDecl" && Name(C) == "UeDefaultSubobjects")
+            else if (Kind(C) == "VarDecl" && (Name(C) == "UeDefaultSubobjects" || Name(C) == "UeTemplateSubobjects"))
             {
                 /* Every default subobject and archetype a game Blueprint's CDO exports, at any depth, "<class path>
-                   <name>" joined by ';', a nested one's name its path under the CDO (Damage:BreakIceBonus_0). */
+                   <name>" joined by ';', a nested one's name its path under the CDO (Damage:BreakIceBonus_0). Or the
+                   objects instanced under its component templates, by their path under the class
+                   (ProjectileAttack_GEN_VARIABLE:NormalProjectileAttack_0). */
+                auto& Into = Name(C) == "UeDefaultSubobjects" ? R.DefaultSubobjects : R.TemplateSubobjects;
                 std::string List;
                 if (FindLiteral(C, List))
                     for (size_t At = 0, End; At < List.size(); At = End + 1)
                     {
                         End = std::min(List.find(';', At), List.size());
                         const size_t Space = List.find(' ', At);
-                        if (Space < End) R.DefaultSubobjects.emplace_back(List.substr(Space + 1, End - Space - 1), List.substr(At, Space - At));
+                        if (Space < End) Into.emplace_back(List.substr(Space + 1, End - Space - 1), List.substr(At, Space - At));
                     }
             }
             else if (Kind(C) == "VarDecl" && Name(C) == "UeStructMeta")
@@ -3627,7 +3651,8 @@ bool FCompiler::LowerCtor(FRecord& R, std::string* Err)
         const bool bAssign = DefaultAssignment(S, Lhs, Rhs, Through, &Part);
         std::vector<const Json*> SlotPart;
         if (!bAssign && !AttachmentCall(S, Callee, Child, Parent, Socket) && !R.bIsPatch     // a patch's may set part of one
-            && !(!R.Widgets.empty() && (WidgetLayoutStatement(S) || LocalMemberAssignment(S, Lhs, Rhs, SlotPart))))
+            && !(!R.Widgets.empty() && (WidgetLayoutStatement(S) || LocalMemberAssignment(S, Lhs, Rhs, SlotPart)))
+            && !CallsFunction(S, "UeInstanced__") && !LocalMemberAssignment(S, Lhs, Rhs, SlotPart))     // UE_INSTANCED, its local's
         {
             *Err = Where + ": a constructor never runs in the game, so its statements are read as the class's defaults: each "
                    "is `Field = value;`, `Component->Field = value;` or `Component->SetupAttachment(Parent);`, on this "
@@ -14620,6 +14645,14 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
         if (bOk && PD.Type != "ArrayProperty") LastValuePerKey(PD.Default.Items, bMap, *PD.Inner);
         return bOk;
     }
+    /* UE_INSTANCED, or a local of UE_DEFAULTS holding one: the object's export, made with the class (Generate). */
+    if (bool bFailed = false; PD.Type == "ObjectProperty" && (CallsFunction(*Init, "UeInstanced__") || K == "DeclRefExpr"))
+    {
+        if (InstancedValue && InstancedValue(*Init, PD.Default, bFailed)) return true;
+        if (bFailed) return false;
+        if (K != "DeclRefExpr")
+        { *Err = Name(F) + ": UE_INSTANCED makes an object in a class's UE_DEFAULTS, pointed at by one of its defaults"; return false; }
+    }
     if (FIndex Asset; PD.Type == "ObjectProperty" && AssetRef(*Init, BP, &Asset))
     {
         PD.Default.K = FDefaultValue::Obj;
@@ -17516,7 +17549,108 @@ std::map<std::string, const FRecord*> FCompiler::RestatedSubobjects(const FRecor
         const bool bBlueprint = DR && DR->UeName.size() > 2 && DR->UeName.compare(DR->UeName.size() - 2, 2, "_C") == 0;
         if (DR && DR->IsNative() && !bBlueprint) Out.emplace(Name(*Through), DR);
     });
+    /* A native subobject an object is instanced under is exported too, as its outer. */
+    std::vector<FInstSpec> Specs;
+    std::string Ignored;
+    ScanInstanced(R, Specs, &Ignored);
+    for (const FInstSpec& S : Specs)
+        if (S.Outer == FInstSpec::NativeSubobject) Out.emplace(S.Component, S.Declarer);
     return Out;
+}
+
+/* Every UE_INSTANCED of A's UE_DEFAULTS, read for where it hangs (FInstSpec): its outer is `this`, a component member,
+   or a local holding an earlier one; its name a literal. Generate lowers A's own; a subclass reads its parents' to find
+   the object an instanced one of its own is archetyped on. */
+bool FCompiler::ScanInstanced(const FRecord& A, std::vector<FInstSpec>& Out, std::string* Err) const
+{
+    if (!A.Defaults || A.bIsPatch) return true;
+    const Json* Body = nullptr;
+    ForEach(*A.Defaults, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Body = &C; });
+    if (!Body) return true;
+    const std::string Block = A.CppName + "::UE_DEFAULTS";
+    bool bOk = true;
+    std::string Where = Block;
+    auto Refuse = [&](const std::string& Why) { if (bOk) *Err = Where + ": " + Why; bOk = false; };
+    /* Local: the VarDecl whose initializer this is, passed down through the casts around it only. */
+    std::function<void(const Json&, const std::string&)> Walk = [&](const Json& N, const std::string& Local) {
+        if (!bOk) return;
+        const std::string K = Kind(N);
+        const Json* Fn = K == "CallExpr" ? Strip(First(N)) : nullptr;
+        if (!Fn || Kind(*Fn) != "DeclRefExpr" || Fn->value("referencedDecl", Json::object()).value("name", std::string()) != "UeInstanced__")
+        {
+            const bool bPass = K == "VarDecl" || K == "ImplicitCastExpr" || K == "ExprWithCleanups" || K == "CStyleCastExpr";
+            ForEach(N, [&](const Json& C) { Walk(C, K == "VarDecl" ? N.value("id", std::string()) : bPass ? Local : std::string()); });
+            return;
+        }
+        FInstSpec S;
+        S.Call = N.value("id", std::string());
+        S.Local = Local;
+        S.Where = Where;
+        const std::string Type = TypeOf(N);
+        const size_t Star = Type.find('*');
+        S.Class = Star == std::string::npos ? nullptr : Find(StripTypeKeywords(Type.substr(0, Star)));
+        if (!S.Class) return Refuse("UE_INSTANCED of an unknown class, " + Type);
+        if (!Nth(N, 2) || !FindLiteral(*Nth(N, 2), S.Name) || S.Name.empty())
+            return Refuse("UE_INSTANCED names its object, `UE_INSTANCED(" + LeafOf(S.Class->CppName) + ", this, \""
+                          + S.Class->UeName + "_0\")`: a subclass reaches it by that name");
+        const Json* Of = Strip(Nth(N, 1));
+        const std::string OK = Of ? Kind(*Of) : std::string();
+        if (OK == "CXXThisExpr")
+        {
+            S.Path = S.Name;
+        }
+        else if (const Json* Self = OK == "MemberExpr" ? Strip(First(*Of)) : nullptr; Self && Kind(*Self) == "CXXThisExpr")
+        {
+            S.Component = Name(*Of);
+            const auto Own = FieldOwner.find(Of->value("referencedMemberDecl", std::string()));
+            S.Declarer = Own == FieldOwner.end() ? nullptr : Find(Own->second);
+            const FRecord* DR = S.Declarer;
+            const bool bBlueprint = DR && DR->IsNative() && DR->UeName.size() > 2 && DR->UeName.compare(DR->UeName.size() - 2, 2, "_C") == 0;
+            if (DR == &A && A.Components.count(S.Component))
+            {
+                S.Outer = FInstSpec::OwnComponent;
+                S.Root = S.Component;
+            }
+            else if (DR && DR != &A && (!DR->IsNative() || bBlueprint))
+            {
+                S.Outer = FInstSpec::InheritedComponent;
+                S.Root = UeNameOf(DR, S.Component);
+            }
+            else if (DR && DR->IsNative() && !bBlueprint)
+            {
+                /* A native default subobject, by its object name: the nearest engine class's CDO has it, UeApi says. */
+                const FRecord* Engine = A.Base.empty() ? nullptr : Find(A.Base);
+                while (Engine && Engine->UePackage.compare(0, 8, "/Script/") != 0) Engine = Find(Engine->Base);
+                const auto Sub = Engine ? Engine->Subobjects.find(S.Component) : std::map<std::string, std::string>::const_iterator();
+                if (!Engine || Sub == Engine->Subobjects.end() || Sub->second.find(' ') == std::string::npos)
+                    return Refuse("UeApi does not say which default subobject " + S.Component + " is - regenerate it with "
+                                  "genueapi, which reads that off the object dump");
+                S.Outer = FInstSpec::NativeSubobject;
+                S.Subobject = Sub->second;
+                S.Path = Sub->second.substr(0, Sub->second.find(' ')) + ":" + S.Name;
+            }
+            else return Refuse("UE_INSTANCED's outer " + S.Component + " is no component of this class or one above it");
+            if (S.Path.empty()) S.Path = S.Name;
+        }
+        else if (OK == "DeclRefExpr")
+        {
+            const std::string Id = Of->value("referencedDecl", Json::object()).value("id", std::string());
+            for (size_t I = 0; I < Out.size(); ++I)
+                if (!Id.empty() && Out[I].Local == Id) S.Parent = int32(I);
+            if (S.Parent < 0) return Refuse("UE_INSTANCED's outer is a local holding an earlier UE_INSTANCED");
+            S.Outer = FInstSpec::InInstanced;
+            S.Root = Out[size_t(S.Parent)].Root;
+            S.Path = Out[size_t(S.Parent)].Path + ":" + S.Name;
+        }
+        else return Refuse("UE_INSTANCED's outer is `this`, one of the class's components, or a local holding another "
+                           "UE_INSTANCED");
+        for (const FInstSpec& O : Out)
+            if (Lower(O.Root) == Lower(S.Root) && Lower(O.Path) == Lower(S.Path))
+                return Refuse("UE_INSTANCED makes " + S.Path + " twice; one object holds one name under its outer");
+        Out.push_back(S);
+    };
+    ForEach(*Body, [&](const Json& S) { Where = S.value("ueWhere", Block); Walk(S, std::string()); });
+    return bOk;
 }
 
 /* RestatedSubobjects of every class cooked here below R, its subclasses and theirs. R's CDO exports these too, so that
@@ -17706,6 +17840,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     std::map<std::string, FOverride> ComponentOverrides;
     std::map<std::string, FOverride> SubobjectDefaults;
     std::vector<FPropertyDef> InheritedDefaults;
+    std::vector<FInstSpec> Insts;                       // UE_INSTANCED, in the order written
+    std::vector<std::vector<FPropertyDef>> InstDefaults;    // each one's tags
     std::map<std::string, FPropertyDef> InterfaceVarDefaults;     // a default for a variable an implemented interface declares
     std::map<std::string, FBlueprintClass::FAttachment> Attachments;    // a UE_COMPONENT -> where SetupAttachment puts it
     /* S39: a UE_WIDGET's defaults, and the slots the layout's AddChild calls make, in the order written. A canvas slot's
@@ -18125,6 +18261,43 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                    "slots; this call is neither";
             return false;
         };
+        /* UE_INSTANCED: the objects instanced in the defaults (ScanInstanced), each given the tags its local's statements
+           set. A default that points at one is lowered to its export (InstancedValue). Its outer is exported whatever
+           else the block says of it: an inherited component's override record, a native subobject's override. */
+        if (!ScanInstanced(R, Insts, Err)) return false;
+        InstDefaults.assign(Insts.size(), {});
+        for (const FInstSpec& S : Insts)
+        {
+            if (S.Outer == FInstSpec::NativeSubobject && !SubobjectDefaults.count(S.Component))
+                SubobjectDefaults[S.Component].Owner = S.Declarer;
+            if (S.Outer != FInstSpec::InheritedComponent || ComponentOverrides.count(S.Component)) continue;
+            if (S.Declarer->IsNative() && !S.Declarer->ScsNodes.count(S.Component))
+            { *Err = S.Where + ": " + S.Component + " is a component of the Blueprint " + S.Declarer->UeName + ", and its header "
+                     "does not say which SCS node it is - re-dump the game with the Dumper-7 fork (ScsNode=) and regenerate UeApi";
+              return false; }
+            ComponentOverrides[S.Component].Owner = S.Declarer;
+        }
+        InstancedValue = [&](const Json& E, FDefaultValue& D, bool& bFailed) {
+            const Json* N = Strip(&E);
+            const bool bCall = N && Kind(*N) == "CallExpr";
+            const std::string Id = !N ? std::string() : bCall ? N->value("id", std::string())
+                                 : N->value("referencedDecl", Json::object()).value("id", std::string());
+            for (size_t I = 0; I < Insts.size(); ++I)
+                if (!Id.empty() && (bCall ? Insts[I].Call : Insts[I].Local) == Id)
+                {
+                    D = FDefaultValue();
+                    D.K = FDefaultValue::Obj;
+                    D.Instanced = int32(I + 1);
+                    return true;
+                }
+            if (bCall) { *Err = Where + ": UE_INSTANCED here is none ScanInstanced read"; bFailed = true; }
+            return false;
+        };
+        struct FUnhook { std::function<bool(const Json&, FDefaultValue&, bool&)>& F; ~FUnhook() { F = nullptr; } } Unhook{ InstancedValue };
+        auto InstLocal = [&](const std::string& Id) {
+            for (size_t I = 0; I < Insts.size(); ++I) if (!Id.empty() && Insts[I].Local == Id) return int32(I);
+            return -1;
+        };
         const Json* Body = nullptr;
         ForEach(*R.Defaults, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Body = &C; });
         bool bOk = true;
@@ -18132,6 +18305,14 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             ForEach(*Body, [&](const Json& S) {
                 if (!bOk) return;
                 Where = S.value("ueWhere", Block);
+                /* `UDotStatusEffectItem* Burn = UE_INSTANCED(...);`: made where a default points at it. One nothing points at
+                   would be an object no one reaches; the editor keeps none such. */
+                if (const Json* N = Strip(&S); N && Kind(*N) == "DeclStmt")
+                    if (const Json* Var = First(*N); Var && Kind(*Var) == "VarDecl" && InstLocal(Var->value("id", std::string())) >= 0)
+                        return;
+                if (CallsFunction(S, "UeInstanced__") && Kind(*Strip(&S)) == "CallExpr")
+                { *Err = Where + ": UE_INSTANCED makes an object a default points at: `StatusEffects = {UE_INSTANCED(...)};`, or a "
+                         "local that one does"; bOk = false; return; }
                 if (!R.Widgets.empty() && WidgetLayoutStatement(S))
                 {
                     bOk = Layout(S);
@@ -18151,16 +18332,20 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 const Json *Lhs = nullptr, *Rhs = nullptr, *Owner = nullptr;
                 std::vector<const Json*> Part;      // `Comp->Style.Normal.DrawAs = value;`: Normal, DrawAs
                 FLayoutSlot* SlotOf = nullptr;      // `At->Padding.Top = value;`: the slot the layout's local At holds
+                std::vector<FPropertyDef>* InstOf = nullptr;    // `Burn->DamageAmount = value;`: the UE_INSTANCED local Burn's tags
                 const bool bDefault = DefaultAssignment(S, Lhs, Rhs, Owner, &Part);
                 if (!bDefault)
-                    if (const Json* Local = R.Widgets.empty() ? nullptr : LocalMemberAssignment(S, Lhs, Rhs, Part))
-                        if (const auto L = SlotLocals.find(Local->value("referencedDecl", Json::object()).value("id", std::string()));
-                            L != SlotLocals.end())
+                    if (const Json* Local = LocalMemberAssignment(S, Lhs, Rhs, Part))
+                    {
+                        const std::string Id = Local->value("referencedDecl", Json::object()).value("id", std::string());
+                        if (const auto L = SlotLocals.find(Id); L != SlotLocals.end() && !R.Widgets.empty())
                             SlotOf = &LayoutSlots[L->second];
-                if (!bDefault && !SlotOf)
+                        if (const int32 I = InstLocal(Id); I >= 0) InstOf = &InstDefaults[size_t(I)];
+                    }
+                if (!bDefault && !SlotOf && !InstOf)
                 { *Err = Where + ": every statement is `Field = value;`, `Component->Field = value;` or "
                          "`Component->SetupAttachment(Parent);`, on this object's members or the members of a struct "
-                         "they hold, `Field.X = value;`"; bOk = false; return; }
+                         "they hold, `Field.X = value;`, or sets a member of an object a UE_INSTANCED local holds"; bOk = false; return; }
 
                 /* `Comp->Field` reaches through a component; a bare `Field` targets this class's
                    own CDO. Which of the three destinations a statement means is decided by who
@@ -18196,7 +18381,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 /* Zero is a real value here: an archetype deltas against the component CDO (where
                    bVisible is already true) and an inherited property against the parent's CDO,
                    not against the type's zero the way a fresh class variable does. */
-                bParentFresh = !bThroughComponent && !SlotOf && ParentValueFresh(R, *Lhs, ParentInit, ParentInitOf);
+                bParentFresh = !bThroughComponent && !SlotOf && !InstOf && ParentValueFresh(R, *Lhs, ParentInit, ParentInitOf);
                 struct FUnset { bool& Flag; const Json*& Init; const FRecord*& Of;
                                 ~FUnset() { Flag = false; Init = nullptr; Of = nullptr; } }
                     UnsetParentFresh{ bParentFresh, ParentInit, ParentInitOf };
@@ -18260,6 +18445,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                     else Merge(*At, PD);
                 };
                 if (SlotOf) { Put(SlotOf->Defaults); return; }      // a tag of the slot's export, as its setter's
+                if (InstOf) { Put(*InstOf); return; }               // a tag of the instanced object's export
                 /* A widget's event flags are the compiler's, set below from the class's own events (kWidgetEvents). A line
                    that says the same changes nothing, and this reference long asked for one beside a Tick override, so it
                    warns; one that says otherwise would be undone, as the editor's compile undoes it, so it is refused. */
@@ -18853,7 +19039,30 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             if (Space == std::string::npos || Dot == std::string::npos || Dot < Space) continue;
             BP.AddParentSubobject(Sub.substr(0, Space), Sub.substr(Space + 1, Dot - Space - 1), Sub.substr(Dot + 1));
         }
+        /* And the objects its UE_DEFAULTS instance under its CDO, at any depth: this class's CDO copies each. */
+        std::vector<FInstSpec> Specs;
+        if (!ScanInstanced(*B, Specs, Err)) return false;
+        for (const FInstSpec& S : Specs)
+            if (S.Root.empty()) BP.AddParentSubobject(S.Path, PackageOf(*S.Class), ClassOf(*S.Class));
     }
+    /* Whether A, a mod class (cooked here, or a UE_COOKED or another mod's one read off its header), has a record of
+       its own for Owner's component Comp: its UE_DEFAULTS reach through it, or instance an object under it. */
+    auto OverridesComponent = [&](const FRecord& A, const FRecord& Owner, const std::string& Comp) {
+        const Json* Body = nullptr;
+        if (A.Defaults && !A.bIsPatch) ForEach(*A.Defaults, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Body = &C; });
+        bool bHit = false;
+        if (Body)
+            ForEach(*Body, [&](const Json& S) {
+                const Json *Lhs = nullptr, *Rhs = nullptr, *Through = nullptr;
+                std::vector<const Json*> Steps;
+                bHit = bHit || (DefaultAssignment(S, Lhs, Rhs, Through, &Steps) && Through && Name(*Through) == Comp);
+            });
+        std::vector<FInstSpec> Specs;
+        std::string Ignored;
+        ScanInstanced(A, Specs, &Ignored);
+        for (const FInstSpec& S : Specs) bHit = bHit || (!S.Root.empty() && Lower(S.Root) == Lower(UeNameOf(&Owner, Comp)));
+        return bHit;
+    };
     for (const auto& Entry : ComponentOverrides)
     {
         /* The parent's own archetype, imported as a subobject of its class, is the record's template:
@@ -18877,26 +19086,132 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
            Owner whose UE_DEFAULTS reach through the component has a record of its own, whose template GetArchetype
            finds first (UObjectArchetype.cpp 83-108) and the loader builds this one from (AsyncLoading.cpp 2954-2964).
            Archetyped on Owner's instead, a value only the class between sets would be lost here. */
-        auto Overrides = [&](const FRecord& A) {
-            const Json* Body = nullptr;
-            if (A.Defaults && !A.bIsPatch) ForEach(*A.Defaults, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Body = &C; });
-            bool bHit = false;
-            if (Body)
-                ForEach(*Body, [&](const Json& S) {
-                    const Json *Lhs = nullptr, *Rhs = nullptr, *Through = nullptr;
-                    std::vector<const Json*> Steps;
-                    bHit = bHit || (DefaultAssignment(S, Lhs, Rhs, Through, &Steps)
-                                    && Through && Name(*Through) == Entry.first);
-                });
-            return bHit;
-        };
         FIndex ArchetypeClass = OwnerClass;
         for (const FRecord* A = Find(R.Base); A && A != &Owner; A = A->Base.empty() ? nullptr : Find(A->Base))
-            if (Overrides(*A)) { ArchetypeClass = BP.EngineClass(PackageOf(*A), ClassOf(*A)); break; }
+            if (OverridesComponent(*A, Owner, Entry.first)) { ArchetypeClass = BP.EngineClass(PackageOf(*A), ClassOf(*A)); break; }
         BP.AddComponentOverride(VarName, BP.EngineClass(PackageOf(*CR), ClassOf(*CR)),
                                 BP.Subobject(PackageOf(*CR), ClassOf(*CR), ArchetypeClass,
                                              VarName + "_GEN_VARIABLE"),
                                 OwnerClass, NodeGuid, Entry.second.Defaults, NativeTail(CR));
+    }
+
+    /* UE_INSTANCED's objects, each archetyped as the engine finds its archetype (UObjectArchetype.cpp 64-83): the object
+       of its name and class under its outer's archetype, else its class's CDO. The outer's archetype is the parent CDO,
+       the nearest ancestor's template of an overridden component, a native subobject under the parent CDO, or an outer
+       instanced object's archetype, so each is looked up by its path under the CDO or the template. A class cooked here
+       exports the objects its own UE_DEFAULTS make there; one that makes none of that name inherits it, so the class
+       above is asked next. A game Blueprint's package exports every one it has, which UeApi lists. Found, it is an
+       import; this class's own copy loads from it what its tags leave unset. */
+    for (size_t I = 0; I < Insts.size(); ++I)
+    {
+        const FInstSpec& S = Insts[I];
+        const FInstSpec* Top = &S;
+        while (Top->Outer == FInstSpec::InInstanced) Top = &Insts[size_t(Top->Parent)];
+        const std::string ClassPath = PackageOf(*S.Class) + "." + ClassOf(*S.Class);
+        const FRecord* TemplateClass = Top->Outer == FInstSpec::InheritedComponent || Top->Outer == FInstSpec::OwnComponent
+                                     ? ComponentClassOf(*Top->Declarer, Top->Component) : nullptr;
+        if (!TemplateClass && !S.Root.empty())
+        { *Err = S.Where + ": cannot resolve the class of " + Top->Component; return false; }
+        /* S's archetype in the package of Of, or Null() when Of exports none; false with Err when Of's is no S.Class. */
+        auto ArchetypeIn = [&](const FRecord& Of, FIndex& Out) {
+            Out = Null();
+            auto Wrong = [&](const std::string& Has) {
+                *Err = S.Where + ": " + S.Path + " is a " + Has + " in " + Of.UeName + ", which " + LeafOf(S.Class->CppName)
+                     + "'s " + S.Name + " would be a copy of; make it that class, or name it otherwise for an object of its own";
+                return false;
+            };
+            auto Template = [&]() {
+                return BP.Subobject(PackageOf(*TemplateClass), ClassOf(*TemplateClass), BP.EngineClass(PackageOf(Of), ClassOf(Of)),
+                                    S.Root + "_GEN_VARIABLE");
+            };
+            if (!Of.IsNative() || Of.Defaults)     // a mod class: cooked here, UE_COOKED, or another mod's
+            {
+                std::vector<FInstSpec> Specs;
+                if (!ScanInstanced(Of, Specs, Err)) return false;
+                std::function<FIndex(size_t)> ImportOf = [&](size_t K) -> FIndex {
+                    const FInstSpec& T = Specs[K];
+                    FIndex At = T.Outer == FInstSpec::InInstanced ? ImportOf(size_t(T.Parent)) : !T.Root.empty() ? Template()
+                              : BP.DefaultObject(PackageOf(Of), ClassOf(Of));
+                    if (T.Outer == FInstSpec::NativeSubobject)
+                    {
+                        const std::string& Sub = T.Subobject;
+                        const size_t Space = Sub.find(' '), Dot = Sub.rfind('.');
+                        At = BP.Subobject(Sub.substr(Space + 1, Dot - Space - 1), Sub.substr(Dot + 1), At, Sub.substr(0, Space));
+                    }
+                    return BP.Subobject(PackageOf(*T.Class), ClassOf(*T.Class), At, T.Name);
+                };
+                for (size_t K = 0; K < Specs.size(); ++K)
+                    if (Lower(Specs[K].Root) == Lower(S.Root) && Lower(Specs[K].Path) == Lower(S.Path))
+                    {
+                        if (Specs[K].Class != S.Class) return Wrong(Specs[K].Class->CppName);
+                        Out = ImportOf(K);
+                    }
+                return true;
+            }
+            if (!S.Root.empty() && UeApiStamp < 4)
+            {
+                *Err = S.Where + ": UeApi was written by a genueapi older than version 4, which lists no object "
+                       "instanced under a game Blueprint's component - regenerate it with AssetGen/tools/genueapi.py";
+                return false;
+            }
+            const auto& List = S.Root.empty() ? Of.DefaultSubobjects : Of.TemplateSubobjects;
+            const std::string Prefix = S.Root.empty() ? std::string() : S.Root + "_GEN_VARIABLE:";
+            auto ClassAt = [&](const std::string& Path) -> const std::string* {
+                for (const auto& [N, C] : List) if (Lower(N) == Lower(Prefix + Path)) return &C;
+                return nullptr;
+            };
+            const std::string* Has = ClassAt(S.Path);
+            if (!Has) return true;
+            if (Lower(*Has) != Lower(ClassPath)) return Wrong(*Has);
+            for (size_t Colon = S.Path.find(':'); Colon != std::string::npos; Colon = S.Path.find(':', Colon + 1))
+                if (!ClassAt(S.Path.substr(0, Colon))) return true;     // a path the list does not hold whole: none to name
+            FIndex At = S.Root.empty() ? BP.DefaultObject(PackageOf(Of), ClassOf(Of)) : Template();
+            for (size_t From = 0, Colon; From <= S.Path.size(); From = Colon + 1)
+            {
+                Colon = std::min(S.Path.find(':', From), S.Path.size());
+                const std::string* C = ClassAt(S.Path.substr(0, Colon));
+                const size_t Dot = C->rfind('.');
+                At = BP.Subobject(C->substr(0, Dot), C->substr(Dot + 1), At, S.Path.substr(From, Colon - From));
+            }
+            Out = At;
+            return true;
+        };
+        FIndex Archetype = Null();
+        if (Top->Outer != FInstSpec::OwnComponent)
+        {
+            /* The classes whose packages may hold it, nearest first: for one under the CDO, every ancestor up to a game
+               Blueprint; under an inherited component's template, the classes between with a record of their own for
+               it, then the class whose node it is. */
+            std::vector<const FRecord*> Ask;
+            for (const FRecord* A = Find(R.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
+            {
+                const bool bMod = !A->IsNative() || A->Defaults;
+                const bool bGame = !bMod && A->UeName.size() > 2 && A->UeName.compare(A->UeName.size() - 2, 2, "_C") == 0;
+                if (!bMod && !bGame) break;
+                if (Top->Outer == FInstSpec::InheritedComponent && A != Top->Declarer
+                    && !OverridesComponent(*A, *Top->Declarer, Top->Component)) continue;
+                Ask.push_back(A);
+                if (bGame || A == Top->Declarer) break;
+            }
+            for (const FRecord* A : Ask)
+            {
+                if (!ArchetypeIn(*A, Archetype)) return false;
+                if (Archetype.V != 0) break;
+            }
+        }
+        FBlueprintClass::FInstanced O;
+        O.Outer = S.Outer == FInstSpec::OwnComponent ? FBlueprintClass::FInstanced::Component
+                : S.Outer == FInstSpec::InheritedComponent ? FBlueprintClass::FInstanced::ComponentOverride
+                : S.Outer == FInstSpec::NativeSubobject ? FBlueprintClass::FInstanced::SubobjectOverride
+                : S.Outer == FInstSpec::InInstanced ? FBlueprintClass::FInstanced::Instanced : FBlueprintClass::FInstanced::Cdo;
+        O.OuterName = S.Outer == FInstSpec::NativeSubobject ? S.Subobject.substr(0, S.Subobject.find(' ')) : S.Root;
+        O.OuterId = S.Parent + 1;
+        O.Name = S.Name;
+        O.Class = BP.EngineClass(PackageOf(*S.Class), ClassOf(*S.Class));
+        O.Archetype = Archetype.V != 0 ? Archetype : BP.DefaultObject(PackageOf(*S.Class), ClassOf(*S.Class));
+        O.Defaults = InstDefaults[I];
+        O.NativeTail = NativeTail(S.Class);
+        BP.AddInstanced(O);
     }
 
     /* The OOL definition carries body/parms; only the in-class decl carries storageClass. */
@@ -20436,6 +20751,7 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         *Err = "missing or invalid " + IncludeDir + "/Conv.json (run genueapi.py)";
         return false;
     }
+    UeApiStamp = Stamped;
     if (Stamped < UeApiVersion)
     {
         *Err = IncludeDir + " was written by an older genueapi (" + (Stamped ? "version " + std::to_string(Stamped)

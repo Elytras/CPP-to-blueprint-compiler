@@ -161,6 +161,29 @@ public:
         ParentSubobjects.push_back(FParentSubobject{ Name, ClassPackage, ClassName_ });
     }
 
+    /*
+    UE_INSTANCED: an object instanced in a default, an export Name of Class under its outer - the CDO, one of the
+    class's UE_COMPONENT templates, an override of an inherited component (AddComponentOverride's Name), a native
+    subobject's override (AddSubobjectOverride's Name), or another instanced object (its id) - its Defaults as tags.
+    Archetype is the object of its name under the outer's archetype, imported, or Class's CDO (UObjectArchetype.cpp
+    64-83), which the loader builds it from. Measured on EEE's STE_Slow20 and ENE_ShootingPlant_Inferno. Returns the
+    id a default's FDefaultValue::Instanced names it by; Finish points the tag at the export.
+    */
+    struct FInstanced
+    {
+        enum EOuter { Cdo, Component, ComponentOverride, SubobjectOverride, Instanced } Outer = Cdo;
+        std::string OuterName;      // Component, ComponentOverride, SubobjectOverride
+        int32 OuterId = 0;          // Instanced
+        std::string Name;
+        FIndex Class, Archetype;
+        std::vector<FPropertyDef> Defaults;
+        std::vector<uint8> NativeTail;
+    };
+    int32 AddInstanced(const FInstanced& Object) { Instanced.push_back(Object); return int32(Instanced.size()); }
+    /* A class's default object as an import, with no load dependency recorded (ClassDefaultObject's): an instanced
+       object's archetype, or its outer's. */
+    FIndex DefaultObject(const std::string& PackageName, const std::string& ClassName_);
+
     /* A tag on this class's CDO for a property an ancestor declares, which a member initializer
        cannot express: declaring the name again would shadow it with a second property. */
     void AddCdoDefault(const FPropertyDef& Var) { CdoDefaults.push_back(Var); }
@@ -366,6 +389,7 @@ private:
         std::string Name, ClassPackage, ClassName;
     };
     std::vector<FParentSubobject> ParentSubobjects;
+    std::vector<FInstanced> Instanced;
 
     bool bWidgetClass = false;
     struct FWidget
