@@ -19,6 +19,7 @@ import io
 import json
 import os
 import re
+import shutil
 import sys
 
 DECL = re.compile(r"^\t(static\s+)?([A-Za-z_][\w:<>,\s\*&]*?)\s+(\w+)\((.*)\)(\s*const)?;\s*$")
@@ -1950,6 +1951,12 @@ def main():
                 "*/"]
     umbrella += ["#include \"%s.h\"" % pkg for pkg in sorted(by_pkg) if not pkg.startswith("Game/")]
     io.open(os.path.join(out_dir, "UeApi.h"), "w", encoding="utf-8-sig", newline="\n").write("\n".join(umbrella) + "\n")
+    # The two hand-written headers include this folder's generated ones (Conv.h, Methods.h, ...) by relative path, so a
+    # UeApi outside BpMods/UeApi (RC's, S40) gets its own copy, never a forwarder to DRG's.
+    hand = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "BpMods", "UeApi")
+    if os.path.normcase(os.path.realpath(hand)) != os.path.normcase(os.path.realpath(out_dir)):
+        for name in ("UeMeta.h", "Types.h"):
+            shutil.copyfile(os.path.join(hand, name), os.path.join(out_dir, name))
     io.open(os.path.join(out_dir, "Version.json"), "w", encoding="utf-8", newline="\n").write(
         '{"genueapi": %d, "game": %s, "ue": "%s", "project": "%s"}\n'
         % ((GENUEAPI_VERSION, "true" if game_dir else "false") + dump_identity(sdk_dir)))
