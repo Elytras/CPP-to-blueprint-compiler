@@ -208,6 +208,25 @@ def embed_deps(dep_stages, stage_fsd, assetgen):
     return True
 
 
+def bundle_files(mod, bp):
+    """The files a mod's `bundle:` folders hold, each as (the file, its path under the FSD tree). A folder is laid out
+    like a staged FSD tree (`Content/...`), so the relative path is the one the pak ships it at."""
+    out = []
+    for folder in mod.get("bundle") or []:
+        root = os.path.join(bp, folder)
+        out += [(os.path.join(dirpath, f), os.path.relpath(os.path.join(dirpath, f), root))
+                for dirpath, _dirs, files in os.walk(root) for f in files]
+    return out
+
+
+def stage_bundle(files, stage_fsd):
+    """Copy a mod's bundle into its FSD tree to ship verbatim: copy2 only, nothing reads or rewrites the bytes."""
+    for src, rel in files:
+        to = os.path.join(stage_fsd, rel)
+        os.makedirs(os.path.dirname(to), exist_ok=True)
+        shutil.copy2(src, to)
+
+
 def staged_assets(stage_content):
     if not os.path.isdir(stage_content):
         return []
@@ -546,12 +565,14 @@ def main():
         embed = bool(mod.get("embed"))
         dep_stages = [dep_stage(d, by_name, bp) for d in transitive_needs(name, by_name)] if embed else []
         dep_assets = [f for content, _p, _f in dep_stages for f in cooked_assets(content)]
+        bundle = bundle_files(mod, bp)
         assets = cooked_assets(stage_content) + [s for s, _g in staged_edits(stage_fsd, stage_content, game_dir)]
         pak = os.path.join(bp, "out", name + "_P.pak")
         # A dep's assets are baked into this pak, so a change to one restales it; likewise our own
         # assets after a --no-pak run. Judged on our sources alone the old pak would ship, and a mod
         # calling a function it lacks crashes on the null UFunction.
-        unpacked = not no_pak and max(newest(assets), newest(dep_assets)) > newest([pak])
+        # A bundle's files are baked in the same way, so they count with the deps.
+        unpacked = not no_pak and max(newest(assets), newest(dep_assets + [src for src, _rel in bundle])) > newest([pak])
         if not stale and not unpacked:
             print("%-16s up to date" % name)
             skipped.append(name)
@@ -561,6 +582,7 @@ def main():
         if embed and not embed_deps(dep_stages, stage_fsd, assetgen):
             failed.append(name)
             continue
+        stage_bundle(bundle, stage_fsd)
         if not os.path.isdir(os.path.dirname(pak)):
             os.makedirs(os.path.dirname(pak))
         if run_unrealpak(stage_fsd, pak):
