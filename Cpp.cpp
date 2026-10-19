@@ -18050,7 +18050,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         }
         FPropertyDef PD;
         std::string PErr;
-        if (!TypeToProperty(TypeOf(*F), FieldName, 0, "property " + FieldName, BP, &PD, &PErr))
+        /* Named by its `__UeName` marker where it has one: a variable rebuilt from an editor's ("Log Service"). */
+        if (!TypeToProperty(TypeOf(*F), UeNameOf(&Decl, FieldName), 0, "property " + FieldName, BP, &PD, &PErr))
         { *Err = PErr; return false; }
         if (!LowerDefault(*F, PD, BP, Err)) return false;
         /* UE_DEFAULTS naming an interface's variable is this class's own default for it. */
