@@ -60,9 +60,15 @@ def emit_enum(run, a):
     lines = [HEADER_BANNER % a.path, '#pragma once\n', ns_open(a.ns)]
     lines.append('enum class %s : uint8 {\n' % a.cpp)
     raw = run.enum_raw(a)
+    disp = run.model.display_names(a)
+    keep = []
     for (name, v), r in zip(run.enum_entries(a), raw):
-        lines.append('    %s = %d,%s\n' % (name, v, '' if name == r else ''))
+        lines.append('    %s = %d,\n' % (name, v))
+        if name != r or disp.get(r, r) != name:
+            keep.append('%s=%s' % (name, r) + ('=' + disp[r] if r in disp and disp[r] != name else ''))
     lines.append('};\nUE_ENUM(%s);\n' % a.cpp)
+    if keep:      # the names the editor cooked it with, which kept assets and saved games hold, and its display names
+        lines.append('static constexpr const char* %s__UeEnumNames = %s;\n' % (a.cpp, B.cstring('|'.join(keep))))
     lines.append(ns_close(a.ns))
     o.header = ''.join(lines)
     return o
@@ -95,6 +101,9 @@ def emit_struct(run, a):
             v = vals.tag(a.pkg, t, p, a)
             if v is not None and not is_zero(v): init = ' = ' + v
         lines.append('    %s%s;\n' % (prop_decl(run, a, p), init))
+    # the members' editor names, `Kills_3_<guid>`, which kept assets and saved games hold
+    lines.append('private:\n    struct UeMarkers {\n%s    };\n' % ''.join(
+        '        static constexpr const char* %s__UeName = "%s";\n' % (ident(authored(p.name)), p.name) for p in st.props))
     lines.append('};\n')
     lines.append(ns_close(a.ns))
     o.header = ''.join(lines)

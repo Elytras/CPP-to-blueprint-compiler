@@ -190,11 +190,16 @@ class Model:
         return out
 
     def display_names(s, a):
-        """name -> display name of an enum's entries, off the uncooked asset's DisplayNameMap (cooking drops it)."""
-        if not s.names_dir: return {}
+        """name -> display name of an enum's entries, off its DisplayNameMap: the cooked package's (cooking keeps it),
+        else the uncooked asset's under --names."""
+        out = s._display_map(a.pkg)
+        if out or not s.names_dir: return out
         base = s.names_dir.rstrip('/\\') + a.path[len('/Game'):]
         if not os.path.exists(base + '.uasset'): return {}
-        pkg = invariants.load(base)
+        return s._display_map(invariants.load(base))
+
+    @staticmethod
+    def _display_map(pkg):
         out = {}
         for i, e in enumerate(pkg.exports):
             if pkg.class_of(i + 1) != 'UserDefinedEnum': continue
