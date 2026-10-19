@@ -193,6 +193,14 @@ public:
     std::map<int32, int32> GotoLabelAt;
     std::vector<std::pair<int32, int32>> GotoPatches;       // {label, patch position}
 
+    /* A patch's ubergraph has no persistent frame (the engine keeps one per class, for the class's own ubergraph), so its
+       frame locals are members of the class: each local of FrameOwner named here is read as MemberClass's, and stored
+       into with its Let op. */
+    std::shared_ptr<const std::map<std::string, EExprToken>> FrameMembers;
+    FIndex FrameOwner, MemberClass;
+    bool IsFrameMember(const std::string& Name, FIndex Owner) const
+    { return FrameMembers && Owner.V == FrameOwner.V && FrameMembers->count(Name); }
+
     void FieldPath(const std::string& PropertyName, FIndex Owner);
     void FieldPath(const std::vector<std::string>& Path, FIndex Owner);     // innermost first: {"Items", "Items"} is an array's element
     void NullFieldPath();

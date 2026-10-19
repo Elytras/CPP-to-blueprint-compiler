@@ -3858,8 +3858,13 @@ its `UE_DEFAULTS` and methods are written into that Blueprint's own package.
 | `Score["a"] = 9;`, `Ids.Add(7);`, `Score.Remove("b");` | One element, merged into the default object's value as in `UE_ASSET_EDITS` above. | Yes |
 | `Ids = {7};`, `Score = {{"a", 9}};` on a `TSet` or `TMap` | The default object loads exactly that value: the elements the parent's value has and this one drops are written as removed, as the cook writes a set or map. `Ids = {}` empties it. The same holds for one inside a struct, by path or in a whole struct. A key given twice holds the last value, and an FString key compares without case. | Yes |
 | `class Tweaks : public AActor { UE_PATCH; ... };` | Refused: "a patch derives from the game Blueprint it edits (a class in a /Game package); a native class's defaults come from its C++ constructor, not from a package". | Refused |
-| `int32 Extra;` or an interface in a patch | Not yet: refused with "a member or an interface of its own is not built yet". | Not yet |
-| a patch with neither `UE_DEFAULTS` nor methods | Refused: "nothing to edit". | Refused |
+| `int32 Extra = 4;` in a patch | A variable added to the Blueprint, after its own: its methods and the patch's read and write it, and the initializer is a tag of its default object, which every instance and a game subclass start from. A `UE_DEFAULTS` value of it wins over the initializer, as the constructor's would. | Yes |
+| `class Tweaks : public BP_Turret_C, public IPoke { UE_PATCH; ... };` | The Blueprint implements the interface: listed in its Interfaces as the editor lists one, with the patch's methods for it, an empty one for each it leaves out, and the interface's variables as the class's own. | Yes |
+| `int32 count;` beside the Blueprint's `Count` | Refused: "already has a variable Count, and an FName ignores case; rename it". | Refused |
+| `UE_REPLICATED(int32, Extra);` in a patch | Refused: "a patch's own member does not replicate". It would renumber the class's replicated properties against a player without the mod. | Refused |
+| `UE_COMPONENT(...)`, `UE_WIDGET(...)` or `UE_DISPATCHER(...)` in a patch | Refused: "a patch adds no component or widget" / "no dispatcher". The construction script and widget tree stay the game's. Spawn one at run time, or declare a class of your own. | Refused |
+| an interface whose function the Blueprint already has, left out of the patch | Refused: "would replace with an empty one; write the method in the patch". `Parent::Fn()` in that method runs the game's. | Refused |
+| a patch with neither `UE_DEFAULTS`, methods nor members | Refused: "nothing to edit". | Refused |
 
 ### Replacing a game Blueprint's functions
 
@@ -3872,7 +3877,7 @@ its `UE_DEFAULTS` and methods are written into that Blueprint's own package.
 | a variable at namespace scope that a patch's method uses | Kept as any namespace-scope variable is: its class is cooked into the mod's own package. See [Global variables](#global-variables). | Yes |
 | a method whose parameters differ from the game function's | Refused: "its parameters ... are not the game function's ...; a replacement takes the same ones, in the same order". Copy them from the SDK header: the type, the name and the direction (a Blueprint output is `T &`). | Refused |
 | a method that the SDK header declares and the game's package lacks | Refused: "has no function of that name of its own, though its declaration has one: the declaration is not the game's". Regenerate the SDK from the same game build as the extracted pak. | Refused |
-| `UKismetSystemLibrary::Delay(1.0f);` in a patch's method | Not yet: refused with "a patched function that waits (a latent call) needs an ubergraph of its own in the game's class; not built yet". | Not yet |
+| `UKismetSystemLibrary::Delay(1.0f);` in a patch's method, or another latent call | Waits, as in a class of your own. The code after the wait runs from an ubergraph the patch adds to the Blueprint, `ExecuteUbergraph_<Patch>`; the Blueprint's own stays the game's. The engine keeps a frame across a wait only for a class's own ubergraph, so what the method keeps across it (its locals, its parameters) are transient variables of the Blueprint, `<Method>_<Name>`. A second call while the first waits shares them, as a Blueprint's event graph does. | Yes |
 
 ```cpp
 #include "UeApi/Game/ENE_Spider_Grunt_Normal_C.h"
@@ -6724,9 +6729,19 @@ so the retail game prints nothing. See [Strings and text](#strings-and-text) and
 - `<Class> (UE_PATCH)::<Function>: <Blueprint> has no function of that name of its own, though its declaration has
   one: the declaration is not the game's`: the SDK header and the extracted package come from different game builds.
   Fix: regenerate the SDK, or extract the pak again. See [Editing game packages](#editing-game-packages).
-- `<Class> (UE_PATCH)::<Function>: a patched function that waits (a latent call) needs an ubergraph of its own in the
-  game's class; not built yet`: a Delay or another latent call in a patch's method. Fix: wait in a class of the mod's
-  own. See [Editing game packages](#editing-game-packages).
+- `<Class> (UE_PATCH)::<Member>: a patch's own member does not replicate: it would renumber the class's replicated
+  properties against an unpatched client's or server's; leave out UE_REPLICATED`. Fix: keep the member unreplicated,
+  or send it with an RPC of the game's. See [Editing game packages](#editing-game-packages).
+- `<Class> (UE_PATCH)::<Member>: a patch adds no component or widget to the game's class` / `a patch adds no
+  dispatcher to the game's class`: the Blueprint's construction script and widget tree stay the game's. Fix: spawn the
+  component at run time, or declare a class of your own. See [Editing game packages](#editing-game-packages).
+- `<Class> (UE_PATCH)::<Member>: <Blueprint> already has a variable <Name>; rename it`: the game's package has a
+  variable of that name that the SDK header does not list. Fix: rename the member. See
+  [Editing game packages](#editing-game-packages).
+- `<Class> (UE_PATCH): <Blueprint> has a function <Fn> already, which the interface the patch adds would replace with
+  an empty one`: an interface function the patch leaves out. Fix: write the method in the patch; `Parent::<Fn>()` in it
+  runs the game's. See [Editing game packages](#editing-game-packages).
+- `<Class> (UE_PATCH): <Blueprint> implements <Interface> already`. Fix: leave the interface out of the patch's bases.
 
 ### Event dispatchers, timers and input
 

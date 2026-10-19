@@ -480,6 +480,15 @@ def is_ubergraph(pkg, i):
     return pkg.class_of(i + 1) == 'Function' and pkg.struct(i).function_flags & 0x8000
 
 
+def resumable(pkg, i):
+    """An ubergraph, or a function that enters as one does: its first statement an EX_ComputedJump, which the VM runs
+    unchecked whatever the flags (a patch's ubergraph, which is not its class's UberGraphFunction and so lacks the flag:
+    AssetGen's Generate)."""
+    if is_ubergraph(pkg, i): return True
+    top = pkg.script(i) if pkg.class_of(i + 1) == 'Function' else []
+    return bool(top) and top[0].op == 0x4E
+
+
 def entries(pkg, i):
     """The offsets the VM may enter ubergraph export i at: its top-level statements, less the prologue up to and
     including its EX_ComputedJump and less EX_EndOfScript."""
@@ -574,7 +583,7 @@ def latent_linkage_offsets(pkg):
         for n in (x for t in pkg.script(i) for x in t.walk()):
             if n.op == 0x5B:
                 stat('latent_linkage_offsets', 'SkipOffsetConsts')
-                if not is_ubergraph(pkg, i): yield i, 'EX_SkipOffsetConst at mem %d outside an ubergraph' % n.mem
+                if not resumable(pkg, i): yield i, 'EX_SkipOffsetConst at mem %d outside an ubergraph' % n.mem
                 elif n.ops[0][1] not in entries(pkg, i):
                     yield i, 'EX_SkipOffsetConst at mem %d is %d, not a statement after the prologue' % (n.mem, n.ops[0][1])
             if n.op != 0x2F or pkg.path(n.ops[0][1]) != '/Script/Engine.LatentActionInfo': continue
@@ -587,7 +596,7 @@ def latent_linkage_offsets(pkg):
                 if kids[0].op == 0x5B:
                     yield i, 'LatentActionInfo at mem %d resumes %s with an offset into %s' % (n.mem, fn, name)
                 else: stat('latent_linkage_offsets', 'IntConst linkage into another function')
-            elif not is_ubergraph(pkg, i):
+            elif not resumable(pkg, i):
                 yield i, 'LatentActionInfo at mem %d resumes %s, which is no ubergraph: %d is only its first parameter' % (
                     n.mem, fn, link)
             elif link not in entries(pkg, i):

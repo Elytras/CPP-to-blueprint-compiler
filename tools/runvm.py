@@ -171,6 +171,18 @@ class VM:
         types = runscript.props_of(s.base, owner) if owner in s.exports else {}
         return cleared(types.get(n.rvalue.split('.')[-1]))
 
+    def is_ubergraph(s, fn, _cache={}):
+        """Whether fn runs on the persistent frame: an ExecuteUbergraph_ with FUNC_UbergraphFunction, as ProcessEvent and
+        CallFunction look for one (ScriptCore.cpp). A patch's ubergraph has none: it is not its class's UberGraphFunction,
+        so the engine would hand it a fresh frame (GetPersistentUberGraphFrame), and its frame is members of the class."""
+        if not fn.startswith('ExecuteUbergraph_'): return False
+        if (s.base, fn) not in _cache:
+            import invariants
+            p = invariants.Package(s.base)
+            st = p.struct(p.find(fn))
+            _cache[s.base, fn] = bool(st and st.function_flags & 0x8000)
+        return _cache[s.base, fn]
+
     def script(s, fn):
         if fn not in s.scripts:
             stmts = runscript.script_of(s.base, fn)
@@ -182,8 +194,9 @@ class VM:
         if isinstance(me, Obj) and me.cls != s.self.cls and me.cls in s.classes:
             return s.peer(me.cls).call(fn, *args, on=me, **parms)
         stmts, at, names = s.script(fn)
-        env = s.frame(me, fn) if fn.startswith('ExecuteUbergraph_') else {}   # the persistent frame
-        if not fn.startswith('ExecuteUbergraph_'):
+        persistent = s.is_ubergraph(fn)
+        env = s.frame(me, fn) if persistent else {}   # the persistent frame
+        if not persistent:
             # A frame starts zeroed, its locals constructed under FUNC_HasDefaults (ScriptCore.cpp 909-916): a struct
             # local is a struct of zeros, or what InitializeValue leaves in it (runscript.frame_defaults: FTransform's
             # identity, FHitResult's Time 1, a UserDefinedStruct's defaults), which a Make Struct's temp holds. A

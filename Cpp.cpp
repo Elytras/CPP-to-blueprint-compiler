@@ -1621,8 +1621,15 @@ private:
        then holds the member and the def each step of Path reaches, the last the value written. The last carries the
        value either way. */
     /* Op: the whole value at the path replaced, or one element of the TMap or TSet there put, added or removed (its
-       key, and a map's value, in the last def's Default.Items). */
-    struct FEditDef { std::vector<FPropertyDef> Chain; std::vector<FValueStep> Path; enum EOp : uint8 { Assign, Put, Add, Remove } Op = Assign; };
+       key, and a map's value, in the last def's Default.Items). bFresh: a patch's own member, which no archetype has, so
+       a set or map in it is written whole. */
+    struct FEditDef
+    {
+        std::vector<FPropertyDef> Chain;
+        std::vector<FValueStep> Path;
+        enum EOp : uint8 { Assign, Put, Add, Remove } Op = Assign;
+        bool bFresh = false;
+    };
     bool EditStep(const Json& Step, const FPropertyDef& Parent, const std::string& Where, FBlueprintClass& BP,
                   FValueStep& Out, FPropertyDef& Reached, std::string* Err);
     bool EditAssignment(const Json& Root, const FRecord& Declarer, const std::vector<const Json*>& Steps, const Json* Rhs,
@@ -1641,6 +1648,8 @@ private:
     bool TransplantFunctions(const FRecord& R, const FRecord& B, const FPackage& Scratch, FIndex ScratchClass,
                              std::string* Err);
     std::map<std::string, FIndex> PatchSupers;              // "Patch::Method" -> what it would override, in its scratch
+    std::vector<FPropertyDef> PatchVars;                    // the patch Generate compiles: its own variables, in its scratch
+    std::vector<FIndex> PatchInterfaces;                    // and the interfaces it implements
     std::map<std::string, const Json*> EditTargets;         // UE_ASSET_EDIT: Ns + its number -> `&Asset`'s variable
     std::vector<std::pair<std::string, const Json*>> Edits; // ... -> the braced variable holding the edit
     bool GenerateStruct(const FRecord& R, const std::string& OutDir, std::string* Err);
@@ -15500,11 +15509,29 @@ bool FCompiler::GeneratePatch(const FRecord& R, std::string* Err)
     }
     /* Every one the patch declares: Collect leaves out the implicit ones. */
     const bool bMethods = !R.Methods.empty();
-    if (!R.Fields.empty() || !R.Interfaces.empty())
-    { *Err = Where + ": a patch edits its parent's defaults and replaces its functions; a member or an interface of its own is not built yet"; return false; }
+    /* A variable of its own is a property added to the game's class (TransplantFunctions); one the class's construction
+       script or widget tree would have to make, or the replication layout would have to list, is not. */
+    if (!R.Components.empty() || !R.Widgets.empty())
+    {
+        *Err = Where + "::" + (R.Components.empty() ? R.Widgets.front() : *R.Components.begin()) + ": a patch adds no "
+               "component or widget to the game's class (its construction script and widget tree stay the game's); spawn "
+               "one at run time, or declare a class of your own";
+        return false;
+    }
+    for (const Json* F : R.Fields)
+    {
+        if (StripTypeKeywords(TypeOf(*F)).compare(0, 25, "TMulticastInlineDelegate<") == 0)
+        { *Err = Where + "::" + Name(*F) + ": a patch adds no dispatcher to the game's class; declare a class of your own"; return false; }
+        if (R.Replicated.count(Name(*F)))
+        {
+            *Err = Where + "::" + Name(*F) + ": a patch's own member does not replicate: it would renumber the class's "
+                   "replicated properties against an unpatched client's or server's; leave out UE_REPLICATED";
+            return false;
+        }
+    }
     const Json* Body = nullptr;
     if (R.Defaults) ForEach(*R.Defaults, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Body = &C; });
-    if (!Body && !bMethods)
+    if (!Body && !bMethods && R.Fields.empty() && R.Interfaces.empty())
     {
         *Err = Where + ": nothing to edit - a patch's defaults go in UE_DEFAULTS { Field = value; }, and its methods replace "
                "the Blueprint's functions of the same name";
@@ -15512,7 +15539,9 @@ bool FCompiler::GeneratePatch(const FRecord& R, std::string* Err)
     }
     /* The defaults first: the functions' names are written against the table the tags leave. */
     if (Body && !PatchDefaults(*B, *Body, Where, Err)) return false;
-    return !bMethods || Generate(R, std::string(), Err);
+    PatchVars.clear();
+    PatchInterfaces.clear();
+    return (!bMethods && R.Fields.empty() && R.Interfaces.empty()) || Generate(R, std::string(), Err);
 }
 
 /* The patch's UE_DEFAULTS, as tags of the Blueprint Bp's own package. */
@@ -15574,6 +15603,7 @@ bool FCompiler::PatchDefaults(const FRecord& Bp, const Json& Body, const std::st
         if (!DR) { *Err = Where + ": cannot tell which class declares " + Name(*Lhs); bOk = false; return; }
         FEditDef Edit;
         bOk = EditAssignment(*Lhs, *DR, Steps, Rhs, Where, BP, Edit, Err);
+        Edit.bFresh = DR->bIsPatch;         // the patch's own member, added to the class (TransplantFunctions)
         if (bOk) Objects[Object].push_back(std::move(Edit));
     });
     if (!bOk) return false;
@@ -16282,7 +16312,7 @@ bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object,
     };
     for (FEditDef& E : Edits)
     {
-        if (E.Op != FEditDef::Assign) continue;         // merged into the object's own value below
+        if (E.Op != FEditDef::Assign || E.bFresh) continue;     // merged into the object's own value below; or no archetype has it
         std::vector<std::string> Path{ E.Chain[0].Name };
         bool bTagged = true;
         for (const FValueStep& S : E.Path)
@@ -16594,6 +16624,15 @@ bool FCompiler::TransplantFunctions(const FRecord& R, const FRecord& B, const FP
     {
         if (!IsFunction(F)) continue;
         const int32 Fn = P.FindExport(F.ObjectName, ClassExport + 1);
+        /* An interface the patch adds gives the scratch a stub of each function the patch leaves out: one the class has
+           already would replace the game's body with nothing. */
+        if (Fn >= 0 && std::none_of(R.Methods.begin(), R.Methods.end(), [&](const auto& M) { return Lower(UeNameOf(&R, M.first)) == Lower(F.ObjectName); }))
+        {
+            *Err = Where + ": " + Class + " has a function " + F.ObjectName + " already, which the interface the patch adds "
+                   "would replace with an empty one; write the method in the patch (`Parent::" + F.ObjectName + "()` runs "
+                   "the game's)";
+            return false;
+        }
         if (Fn >= 0 && P.ClassNameOf(P.Exports[size_t(Fn)].Class) == "Function") continue;
         if (Fn >= 0)
         {
@@ -16631,6 +16670,13 @@ bool FCompiler::TransplantFunctions(const FRecord& R, const FRecord& B, const FP
                 for (const FIndex I : { F.ClassIndex, F.TemplateIndex, SuperOf(F) }) if (I.V < 0) Named.insert(I.V);
             }
         Named.insert(InBodies.begin(), InBodies.end());
+        {
+            FPackage Types(Package);        // what the patch's own variables name: a struct, a class, an enum
+            Types.RemapIndex = [&](FIndex V) { if (V.V < 0) Named.insert(V.V); return V; };
+            FArc Ar(&Types);
+            for (const FPropertyDef& V : PatchVars) WriteProperty(Ar, V);
+            for (const FIndex I : PatchInterfaces) if (I.V < 0) Named.insert(I.V);
+        }
         for (int32 I : Named)
             if (!IsOwn(FIndex{ I }) && !ImportInto(P, Package, Scratch, I, Moved, &Bad)) { *Err = Where + ": " + Bad; return false; }
     }
@@ -16851,6 +16897,73 @@ bool FCompiler::TransplantFunctions(const FRecord& R, const FRecord& B, const FP
         Out.resize(Out.size() + 8, 0);                                                      // no event-graph link
         P.Exports[size_t(Fn)].Payload = std::move(Out);
         Ed->Objects.push_back(Class + "::" + F.ObjectName + " (replaced)");
+    }
+
+    /* The patch's own variables, appended to the class's ChildProperties: a cooked property carries no offset, and
+       Link lays the class out again as it loads, the class's own after its parent's (FProperty::SetupOffset), and each
+       game subclass after it. Its interfaces join the class's Interfaces list as the editor writes one (PointerOffset 0,
+       bImplementedByK2). Each value an initializer gives is a tag of the default object, which a subclass's default
+       object and every instance start from. */
+    if (!PatchVars.empty() || !PatchInterfaces.empty())
+    {
+        FClassLayout L;
+        if (!ReadClassLayout(P, P.Exports[size_t(ClassExport)].Payload, L))
+        { *Err = Where + ": " + Class + "'s payload does not read as a cooked class"; return false; }
+        for (const FPropertyDef& V : PatchVars)
+            for (const auto& Fd : L.Fields)
+                if (Lower(P.NameOf(Fd.Name)) == Lower(V.Name))
+                { *Err = Where + "::" + V.Name + ": " + Class + " already has a variable " + P.NameOf(Fd.Name) + "; rename it"; return false; }
+        Replacing = ClassExport + 1;
+        FArc Ar(&Sink);
+        std::vector<int32> Named;
+        Sink.Recording = &Named;
+        for (const FPropertyDef& V : PatchVars) WriteProperty(Ar, V);
+        const size_t PropBytes = Ar.B.size();
+        for (const FIndex I : PatchInterfaces) { Ar.Idx(I); Ar.I32(0); Ar.Bool(true); }
+        Sink.Recording = nullptr;
+        if (!Bad.empty()) { *Err = Where + ": " + Bad; return false; }
+        for (size_t I = P.Names.size(); I < Sink.NameTable().size(); ++I) P.Names.push_back({ Sink.NameTable()[I] });
+        std::vector<uint8>& Cls = P.Exports[size_t(ClassExport)].Payload;
+        /* The Interfaces count: past the FuncMap, ClassFlags, ClassWithin, ClassConfigName and ClassGeneratedBy. */
+        const size_t IfaceCount = L.AfterFuncMap + 20;
+        int32 Ifaces = 0;
+        std::memcpy(&Ifaces, Cls.data() + IfaceCount, 4);
+        for (size_t K = 0; K < PatchInterfaces.size(); ++K)
+            for (int32 J = 0; J < Ifaces; ++J)
+                if (std::memcmp(Cls.data() + IfaceCount + 4 + size_t(J) * 12, Ar.B.data() + PropBytes + K * 12, 4) == 0)
+                { *Err = Where + ": " + Class + " implements " + Scratch.ImportAt(PatchInterfaces[K])->ObjectName + " already"; return false; }
+        Cls.insert(Cls.begin() + std::ptrdiff_t(IfaceCount + 4 + size_t(Ifaces) * 12), Ar.B.begin() + std::ptrdiff_t(PropBytes), Ar.B.end());
+        const int32 NewIfaces = Ifaces + int32(PatchInterfaces.size());
+        std::memcpy(Cls.data() + IfaceCount, &NewIfaces, 4);
+        Cls.insert(Cls.begin() + std::ptrdiff_t(L.Script), Ar.B.begin(), Ar.B.begin() + std::ptrdiff_t(PropBytes));
+        const int32 Props = int32(L.Fields.size() + PatchVars.size());
+        std::memcpy(Cls.data() + L.Properties, &Props, 4);
+        /* What the new bytes name is created before the class is serialized, as Save lists what a payload names. */
+        std::array<std::vector<int32>, 4> Deps = P.Dependencies(ClassExport);
+        for (int32 V : Named)
+            if (V != 0 && V != Replacing && !InCoreUObject(V) && std::find(Deps[1].begin(), Deps[1].end(), V) == Deps[1].end()
+                && std::find(Deps[2].begin(), Deps[2].end(), V) == Deps[2].end())
+                Deps[1].push_back(V);
+        P.SetDependencies(ClassExport, Deps);
+        for (const FPropertyDef& V : PatchVars) Ed->Objects.push_back(Class + "::" + V.Name + " (added, a variable)");
+        for (const FIndex I : PatchInterfaces) Ed->Objects.push_back(Class + " implements " + Scratch.ImportAt(I)->ObjectName + " (added)");
+
+        /* Their initializers, unless the patch's UE_DEFAULTS set the member already (it runs as the constructor would,
+           after them). */
+        std::vector<FTag> Tags;
+        size_t At = 0;
+        const int32 Cdo = P.FindExport("Default__" + Class);
+        if (Cdo < 0 || !ReadTags(P, P.Exports[size_t(Cdo)].Payload, At, Tags))
+        { *Err = Where + ": " + Package + "'s Default__" + Class + " does not read"; return false; }
+        std::vector<FEditDef> Inits;
+        for (const FPropertyDef& V : PatchVars)
+            if (V.Default.K != FDefaultValue::None
+                && std::none_of(Tags.begin(), Tags.end(), [&](const FTag& T) { return Lower(P.NameOf(T.Name)) == Lower(V.Name); }))
+            {
+                Inits.push_back(FEditDef{ { V }, {} });
+                Inits.back().bFresh = true;
+            }
+        if (!Inits.empty() && !ApplyEdit(Package, "Default__" + Class, Inits, Scratch, Where, Err)) return false;
     }
 
     /* A ReceiveTick the patch adds is an event the class did not have, and the editor's compiler sets the default
@@ -17110,6 +17223,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                         if (Mine == Theirs)
                         { *Err = R.CppName + " implements " + Other + " and " + I + ", which both extend " + Mine->CppName; return false; }
         BP.AddInterface(ClassImportOf(*IR, BP));
+        if (R.bIsPatch) PatchInterfaces.push_back(ClassImportOf(*IR, BP));
     }
     if (!AddInputBindings(R, bIsActor, BP, Err)) return false;
     if (!AddTimelines(R, bIsActor, BP, Err)) return false;
@@ -18014,6 +18128,10 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     }
     std::stable_sort(ClassVars.begin(), ClassVars.end(), [](const auto& A, const auto& B) { return A.first > B.first; });
     for (const auto& V : ClassVars) BP.AddVariable(V.second);
+    if (R.bIsPatch)     // its own and its interfaces' variables, not a DefaultSceneRoot the game's class already has
+        for (const auto& V : ClassVars)
+            if (std::any_of(OwnedFields.begin(), OwnedFields.end(), [&](const FOwnedField& O) { return Name(*O.F) == V.second.Name; }))
+                PatchVars.push_back(V.second);
 
     /* S39: each widget but the root sits in a panel or fills a nested widget's named slot, and that one in the tree. One
        nothing holds, or a ring of them holding one another, is out of the tree the engine walks from its root
@@ -18602,7 +18720,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
            wait dies with the call, after which a collection takes the proxy and its dispatchers never fire; so it is
            stored into a transient member too, one per local, as the editor's frame keeps one per node. A waiting
            function's locals are the frame's already. */
-        if (!bMadeLatentCall && !R.bIsPatch)
+        if (!bMadeLatentCall)
             ForEachStmt(Stmts, [&](std::vector<FStmtIR>& List, size_t I) {
                 const FStmtIR& St = List[I];
                 if ((St.K != FStmtIR::Decl && St.K != FStmtIR::Assign) || St.Var.K != FArgIR::Local
@@ -18823,12 +18941,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     }
 
     for (const FPropertyDef& Held : HeldProxies) BP.AddVariable(Held);
-    if (!Segments.empty() && R.bIsPatch)
-    {
-        *Err = R.CppName + " (UE_PATCH)::" + Segments.front().Name + ": a patched function that waits (a latent call) needs "
-               "an ubergraph of its own in the game's class; not built yet";
-        return false;
-    }
+    if (R.bIsPatch)
+        for (const FPropertyDef& Held : HeldProxies) PatchVars.push_back(Held);
     if (!Segments.empty())
     {
         const std::string UberName = "ExecuteUbergraph_" + R.CppName;    // CheckMemberNames refuses a member named so
@@ -18863,11 +18977,43 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 }
             FLocalRenamer{ Seg.Rename }.List(Seg.Stmts);
         }
+        /* A patch's ubergraph is not the class's: the engine keeps a persistent frame for that one alone
+           (UBlueprintGeneratedClass::GetPersistentUberGraphFrame matches UberGraphFunction), and calls any other with a
+           fresh one, so what must last across a wait would be lost. Its frame is members of the class instead, transient
+           as the frame is: each read of one is EX_InstanceVariable, each store an EX_Let of it (FScript::FrameMembers).
+           Only EntryPoint, its parameter, stays a property of the function. A second wait on one object while the first
+           is pending shares them, as a Blueprint's ubergraph frame is shared. */
+        std::shared_ptr<std::map<std::string, EExprToken>> AsMembers;
+        if (R.bIsPatch)
+        {
+            AsMembers = std::make_shared<std::map<std::string, EExprToken>>();
+            for (size_t I = 1; I < Frame.size(); ++I)
+            {
+                FPropertyDef M = Frame[I];
+                M.PropertyFlags |= CPF_Transient | CPF_DuplicateTransient;
+                M.Default = {};
+                const std::string& T = M.Type;
+                (*AsMembers)[M.Name] = T == "BoolProperty" ? EX_LetBool : T == "ObjectProperty" || T == "ClassProperty" ? EX_LetObj
+                                     : T == "WeakObjectProperty" ? EX_LetWeakObjPtr : T == "DelegateProperty" ? EX_LetDelegate
+                                     : T == "MulticastInlineDelegateProperty" ? EX_LetMulticastDelegate : EX_Let;
+                BP.AddVariable(M);
+                PatchVars.push_back(M);
+            }
+            Frame.resize(1);
+        }
+        const FIndex Members = R.bIsPatch ? BP.ClassIndex() : FIndex{};
+        auto Redirect = [AsMembers, Members](FScript& S, FIndex Uber) {
+            S.FrameMembers = AsMembers;
+            S.FrameOwner = Uber;
+            S.MemberClass = Members;
+        };
 
         /* Measured: a computed jump on EntryPoint, each event's code at the offset its stub passes. A segment ends in
            a return where the editor pops back to its one pushed return. */
         auto Entries = std::make_shared<std::vector<int32>>(Segments.size());
-        const FIndex Uber = BP.AddFunction(UberName, Null(), Frame, [Segments, Entries](FScript& S, FIndex SelfExp) {
+        const uint32 UberFlags = R.bIsPatch ? uint32(FUNC_Final) : uint32(FUNC_UbergraphFunction | FUNC_HasDefaults | FUNC_Final);
+        const FIndex Uber = BP.AddFunction(UberName, Null(), Frame, [Segments, Entries, Redirect](FScript& S, FIndex SelfExp) {
+            Redirect(S, SelfExp);
             S.ComputedJump([SelfExp](FScript& C) { C.LocalVariable("EntryPoint", SelfExp); });
             for (size_t I = 0; I < Segments.size(); ++I)
             {
@@ -18876,7 +19022,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 S.Return();
             }
             S.EndOfScript();
-        }, FUNC_UbergraphFunction | FUNC_HasDefaults | FUNC_Final);
+        }, UberFlags);
 
         /* The stubs follow the ubergraph, so its body (and Entries) is written first. Measured on BP_LiftPod's
            OnCompleted_*: each parm copied into the frame, then EX_LocalFinalFunction ExecuteUbergraph(offset). A const
@@ -18888,7 +19034,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             for (const FPropertyDef& P : Segments[I].Parms)
                 Copies.emplace_back(P.Name, Segments[I].Rename.at(P.Name), (P.PropertyFlags & CPF_OutParm) != 0);
             BP.AddFunction(UeNameOf(&R, Segments[I].Name), Segments[I].Super, Segments[I].Parms,
-                           [Copies, Uber, Entries, I](FScript& S, FIndex SelfExp) {
+                           [Copies, Uber, Entries, I, Redirect](FScript& S, FIndex SelfExp) {
+                Redirect(S, Uber);
                 for (const auto& [From, To, bRef] : Copies)
                     S.LetValueOnPersistentFrame(To, Uber, [&, From, bRef](FScript& V) {
                         if (bRef) V.LocalOutVariable(From, SelfExp); else V.LocalVariable(From, SelfExp); });
@@ -18910,7 +19057,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 for (size_t I = 0; I < C.Locals.size() && I < C.Parms.size(); ++I)
                     if (!C.Locals[I].empty()) Stores.emplace_back(Seg.Rename.at(C.Locals[I]), C.Parms[I].Name);
                 const std::shared_ptr<int32> Resume = C.Resume;
-                BP.AddFunction(C.Event, Null(), C.Parms, [Stores, Resume, Uber](FScript& S, FIndex SelfExp) {
+                BP.AddFunction(C.Event, Null(), C.Parms, [Stores, Resume, Uber, Redirect](FScript& S, FIndex SelfExp) {
+                    Redirect(S, Uber);
                     for (const auto& Store : Stores)
                         S.LetValueOnPersistentFrame(Store.first, Uber, [&](FScript& V) { V.LocalVariable(Store.second, SelfExp); });
                     if (Resume)
@@ -18925,15 +19073,18 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             }
 
         /* Measured on BP_LiftPod: a transient FPointerToUberGraphFrame the class links by this name. */
-        FPropertyDef FramePtr;
-        FramePtr.Type = "StructProperty";
-        FramePtr.Name = "UberGraphFrame";
-        FramePtr.ElementSize = 16;
-        FramePtr.PropertyFlags = CPF_Transient | CPF_DuplicateTransient;
-        FramePtr.Extra = BP.ScriptStruct("/Script/Engine", "PointerToUberGraphFrame");
-        FramePtr.StructName = "PointerToUberGraphFrame";
-        BP.AddVariable(FramePtr);
-        BP.SetUberGraphFunction(Uber);
+        if (!R.bIsPatch)
+        {
+            FPropertyDef FramePtr;
+            FramePtr.Type = "StructProperty";
+            FramePtr.Name = "UberGraphFrame";
+            FramePtr.ElementSize = 16;
+            FramePtr.PropertyFlags = CPF_Transient | CPF_DuplicateTransient;
+            FramePtr.Extra = BP.ScriptStruct("/Script/Engine", "PointerToUberGraphFrame");
+            FramePtr.StructName = "PointerToUberGraphFrame";
+            BP.AddVariable(FramePtr);
+            BP.SetUberGraphFunction(Uber);
+        }
     }
 
     if (bReplicatesAnything) BP.SetReplicates(true);

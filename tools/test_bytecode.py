@@ -3902,6 +3902,72 @@ def asset_values():
           'where this mod edits it, or where UeApi disagrees with the package; bpbuild restales on the packages read')
 
 
+def patch_members(comp_game):
+    """A UE_PATCH's own members are variables added to the game's class (CompTest standing in for a game Blueprint):
+    the patched method reads and writes them, the class lists each after the game's, and its default object holds each
+    initializer, or the patch's UE_DEFAULTS value over it. An interface of its own is added to the class's Interfaces,
+    the methods it names added, one the patch leaves out as the empty stub a class of its own would get, and the
+    interface's variable is the class's too."""
+    import invariants, struct
+    decl = ('#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/MemEdit");\n'
+            'class CompTest : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/CompTest/CompTest", "CompTest_C");\n'
+            '  int32 Ticks;\n  void ReceiveBeginPlay();\n};\n'
+            'class IPoke {\npublic:\n  UE_INTERFACE;\n  int32 Level = 4;\n  int32 Poke(int32 X);\n  void Ping();\n};\n'
+            'class Tweaks : public CompTest%s {\n  UE_PATCH;\npublic:\n%s};\n')
+    for bases, body, want in (
+            ('', '  int32 Extra = 4;\n  FVector Where = {1, 2, 3};\n  TSet<int32> Seen = {7};\n  int32 Zero;\n'
+                 '  void ReceiveBeginPlay() { Ticks = Ticks + Extra; Extra = Extra + 1; }\n',
+             {'Extra': 4, 'Where': (1.0, 2.0, 3.0), 'Seen': [7]}),
+            ('', '  int32 Extra = 4;\n  UE_DEFAULTS { Extra = 9; }\n', {'Extra': 9}),
+            (', public IPoke', '  int32 Poke(int32 X) { return X + Level + Ticks; }\n', {'Level': 4})):
+        tmp, out, _ = compile_to(decl % (bases, body), 'MemEdit', ['--game', comp_game])
+        try:
+            b = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'CompTest', 'CompTest')
+            a = invariants.Package(os.path.join(comp_game, '_ElytrasMods', 'CompTest', 'CompTest'))
+            p = invariants.Package(b)
+            st, was = p.struct(p.find('CompTest_C')), a.struct(a.find('CompTest_C'))
+            added = [x.name for x in st.props[len(was.props):]]
+            assert [repr(x) for x in st.props[:len(was.props)]] == [repr(x) for x in was.props], st.props
+            assert sorted(added) == sorted(set(want) | ({'Zero'} if 'Zero' in body else set())), added
+            cdo = p.find('Default__CompTest_C')
+            got = {}
+            for t in p.tags(cdo):
+                v = bytes(t['value'])
+                got[t['name']] = (struct.unpack('<i', v)[0] if t['type'] == 'IntProperty' else
+                                  struct.unpack('<3f', v) if t['type'] == 'StructProperty' else
+                                  list(struct.unpack('<%di' % (len(v) // 4 - 2), v[8:])))     # removed 0, then the elements
+            assert got == want, got
+            if 'Extra' in want and 'ReceiveBeginPlay' in body:
+                me = {'Ticks': 1, 'Extra': 4}
+                run(b, 'ReceiveBeginPlay', self_vars=me)
+                assert me == {'Ticks': 5, 'Extra': 5}, me
+            if bases:
+                assert [p.path(i[0]) for i in st.interfaces] == ['/Game/_ElytrasMods/MemEdit/IPoke.IPoke_C'] \
+                    and was.interfaces == [], st.interfaces
+                r, _ = run(b, 'Poke', self_vars={'Ticks': 2, 'Level': 4}, X=1)
+                assert r == 7, r
+                me = {'Ticks': 2, 'Level': 4}
+                run(b, 'Ping', self_vars=me)                        # the stub: does nothing
+                assert me == {'Ticks': 2, 'Level': 4}, me
+            proc = subprocess.run([ASSETGEN, 'roundtrip', tmp], capture_output=True, encoding='utf-8')
+            assert proc.returncode == 0 and 'classes whose payload reads exactly (ReadClassLayout)' in proc.stdout \
+                and ' 0 differ' in proc.stdout, proc.stdout
+            keeps_invariants(b)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    # A component or a dispatcher of its own is refused: the construction script stays the game's.
+    for body, why in (('  UE_COMPONENT(USceneComponent, Pivot);\n', 'a patch adds no component or widget'),
+                      ('  UE_DISPATCHER(OnHit, int32 Damage);\n', 'a patch adds no dispatcher')):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'MemEdit.cpp')
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(decl % ('', body))
+            proc = assetgen_compile([path, UEAPI, tmp, '--game', comp_game])
+            assert proc.returncode != 0 and why in proc.stdout, (body, proc.stdout)
+    print('ok  EditTest: a UE_PATCH\'s own members are variables added to the game\'s class, its initializers (or its '
+          'UE_DEFAULTS) on the default object, and an interface of its own is added with its methods and variables')
+
+
 def edits():
     """EditTest (S38): UE_ASSET_EDIT and UE_PATCH rewrite AssetTest's cooked packages in place. Only the named tags
     change (replaced where they were, or appended); every name and import the package had keeps its index, a new one
@@ -3952,8 +4018,10 @@ def edits():
              ['--game', game_dir]),
             ('EditNative', 'class Tweaks : public AActor {\n  UE_PATCH;\n  UE_DEFAULTS { bHidden = true; }\n};\n',
              'a patch derives from the game Blueprint it edits', ['--game', game_dir]),
-            ('EditMember', 'class Tweaks : public UMoodDef {\n  UE_PATCH;\n  int32 Extra;\n  UE_DEFAULTS { Count = 1; }\n};\n',
-             'a member or an interface of its own is not built yet', ['--game', game_dir]),
+            ('EditMember', 'class Tweaks : public UMoodDef {\n  UE_PATCH;\n  UE_REPLICATED(int32, Extra);\n};\n',
+             'a patch\'s own member does not replicate', ['--game', game_dir]),
+            ('EditClash', 'class Tweaks : public UMoodDef {\n  UE_PATCH;\n  int32 count;\n};\n',
+             'already has a variable Count', ['--game', game_dir]),
             ('EditNoGame', 'class Tweaks : public UMoodDef {\n  UE_PATCH;\n  UE_DEFAULTS { Count = 1; }\n};\n',
              'pass the folder /Game is in', [])):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3965,8 +4033,8 @@ def edits():
                         '  UE_CLASS("/Game/_ElytrasMods/AssetTest/UMoodDef", "UMoodDef_C");\n  int32 Count;\n};\n%s' % (name, src))
             proc = assetgen_compile([path, UEAPI, tmp] + flags)
             assert proc.returncode != 0 and why in proc.stdout, (name, proc.stdout)
-    print('ok  EditTest: an edit of a mod\'s own asset, a patch of a native class, a patch with a member of its own, and '
-          'no --game are refused')
+    print('ok  EditTest: an edit of a mod\'s own asset, a patch of a native class, a replicated member of a patch\'s own, '
+          'one named like the game\'s, and no --game are refused')
 
     # A component's defaults. CompTest stands in for a game Blueprint, declared as UeApi declares one, and Lamp for one of
     # its own SCS components: the patch lands in the Lamp's template. A parent Blueprint's component the class does not
@@ -4094,6 +4162,7 @@ def edits():
     print('ok  EditTest: a UE_PATCH method replaces the Blueprint\'s function of that name, Parent:: reaching the game\'s body '
           '(an RPC\'s as a plain function), or is added to it (a helper, an override); a stale declaration and other '
           'parameters are refused')
+    patch_members(comp_game)
 
     # A namespace-scope variable a patch's method uses is the one member of a class of its own (LowerGlobal), cooked into
     # the mod's package as a class's global is: the patched function reads and writes that class's default object.
@@ -10901,20 +10970,48 @@ def latent_refusals():
             'leave the FLatentActionInfo argument out')
     refused('WaitUberName', '  void ExecuteUbergraph_WaitUberName(int32 EntryPoint) {}\n'
             '  void F() { UKismetSystemLibrary::Delay(1.0f); }\n', "is the name of a class's ubergraph")
-    # A UE_PATCH of AssetTest's AssetUser, AssetTest's output standing in for the game as EditTest has it.
-    import tempfile
-    with tempfile.TemporaryDirectory() as tmp:
-        src = os.path.join(tmp, 'WaitPatch.cpp')
-        with open(src, 'w', encoding='utf-8') as f:
-            f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/WaitPatch");\n'
-                    'class AssetUser : public AActor {\npublic:\n'
-                    '  UE_CLASS("/Game/_ElytrasMods/AssetTest/AssetUser", "AssetUser_C");\n};\n'
-                    'class UserWaits : public AssetUser {\n  UE_PATCH;\npublic:\n'
-                    '  void ReceiveBeginPlay() { UKismetSystemLibrary::Delay(1.0f); }\n};\n')
-        code, log = latent_compile_log(src, os.path.join(ROOT, 'AssetTest', 'FSD', 'Content'))
-        assert code and 'a patched function that waits' in log, log
     print('ok  a function that waits: refused when static, returning, by reference, passing its own FLatentActionInfo, '
-          'shadowing the ubergraph, or patched into a game class')
+          'or shadowing the ubergraph')
+
+
+def patch_waits():
+    """A UE_PATCH method that waits, in CompTest (standing in for a game Blueprint): its code after the wait runs from an
+    ubergraph of the patch's own, added to the class. Only the class's own ubergraph gets a persistent frame (runvm, as
+    GetPersistentUberGraphFrame), so what the method keeps across the wait - a local, its parameter - is a member of the
+    class: the resumed half reads what the first half left, though the game changed Ticks meanwhile. The class's own
+    ubergraph, if any, stays the game's."""
+    comp_game = os.path.join(ROOT, 'CompTest', 'FSD', 'Content')
+    src = ('#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/WaitPatch");\n'
+           'class CompTest : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/CompTest/CompTest", "CompTest_C");\n'
+           '  int32 Ticks;\n  void ReceiveBeginPlay();\n};\n'
+           'class Tweaks : public CompTest {\n  UE_PATCH;\npublic:\n  int32 Extra = 3;\n'
+           '  void ReceiveBeginPlay() { int32 Before = Ticks; UKismetSystemLibrary::Delay(1.0f); Ticks = Before + Extra; '
+           'Wait2(Before); }\n'
+           '  void Wait2(int32 From) { UKismetSystemLibrary::Delay(0.5f); Ticks = Ticks + From * 100; }\n};\n')
+    tmp, out, _ = compile_to(src, 'WaitPatch', ['--game', comp_game])
+    try:
+        import invariants
+        b = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'CompTest', 'CompTest')
+        vm = VM(b, {'Delay': latent_call}, Ticks=1, Extra=3)
+        vm.call('ReceiveBeginPlay')
+        assert vm.self.vars['Ticks'] == 1 and len(vm.latent) == 1, vm.self.vars
+        vm.self.vars['Ticks'] = 50                              # the game moves on while the patch waits
+        vm.fire(0)
+        assert vm.self.vars['Ticks'] == 4 and len(vm.latent) == 1, vm.self.vars    # Before (1) + Extra, then Wait2 waits
+        vm.fire(0)
+        assert vm.self.vars['Ticks'] == 104, vm.self.vars      # Wait2's From, kept across its own wait
+        a = invariants.Package(os.path.join(comp_game, '_ElytrasMods', 'CompTest', 'CompTest'))
+        p = invariants.Package(b)
+        ci = p.find('CompTest_C')
+        assert p.tag(ci, 'UberGraphFunction') == a.tag(a.find('CompTest_C'), 'UberGraphFunction'), 'the class\'s ubergraph moved'
+        assert 'UberGraphFrame' not in [x.name for x in p.struct(ci).props[len(a.struct(a.find('CompTest_C')).props):]]
+        keeps_invariants(b)
+        proc = subprocess.run([ASSETGEN, 'roundtrip', tmp], capture_output=True, encoding='utf-8')
+        assert proc.returncode == 0 and ' 0 differ' in proc.stdout, proc.stdout
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print('ok  a UE_PATCH method that waits resumes from an ubergraph of the patch\'s own, its locals kept as members of '
+          'the game\'s class across the wait')
 
 
 def latent_info_written():
@@ -11174,6 +11271,7 @@ def wait_hold():
 
 
 latent_refusals()
+patch_waits()
 latent_info_written()
 latent_worlds()
 latent_repeats()

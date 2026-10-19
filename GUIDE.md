@@ -963,8 +963,9 @@ Example: [examples/GameBlueprintChild.cpp](examples/GameBlueprintChild.cpp).
 A mod can also change what the game already has. `UE_ASSET_EDIT(Asset) { .Member = value };` changes a game data
 asset's values, and `UE_ASSET_EDITS { Asset.Member[1].Field = value; }` changes parts of them by path. A class with
 `UE_PATCH;` among its members is a patch of the game Blueprint it derives from: its `UE_DEFAULTS` set that Blueprint's
-own class defaults and its components', and a method replaces the Blueprint's function of the same name, with
-`Parent::Method()` running the game's body. The compiler reads each package from the extracted game pak, changes only
+own class defaults and its components', a method replaces the Blueprint's function of the same name, with
+`Parent::Method()` running the game's body, and a member of its own (`int32 Hits = 0;`) or an interface it lists is
+added to the Blueprint. A method may wait (`Delay`) as in a class of your own. The compiler reads each package from the extracted game pak, changes only
 what the source names, and writes the whole package back at its own path, so the mod's pak replaces the game's copy.
 Pass the extracted pak's `Content` folder as `--game` (bpbuild: `game_content` in `mods.yaml`).
 
@@ -985,7 +986,10 @@ class SlowGrunt : public ENE_Spider_Grunt_Normal_C {
 
 Watch for:
 
-- A patch is not a class: a variable or an interface of its own is refused, and so is a method that waits.
+- A patch is not a class: it adds no component, widget or dispatcher, and its variables do not replicate (they would
+  renumber the class's replicated properties against a player without the mod).
+- What a waiting method keeps across the wait lives in variables of the Blueprint, so two waits of it on one object
+  at once share them, as the Blueprint's own event graph does.
 - A replacement takes the game function's parameters exactly: copy them from the SDK header.
 - Extract the pak again after a game update. bpbuild then rebuilds the mod, so the edit starts from the new package.
 - Two paks that edit the same asset each carry the whole package, and the game loads only one. Keep the edits of an
