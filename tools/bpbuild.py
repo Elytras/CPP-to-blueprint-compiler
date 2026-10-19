@@ -147,7 +147,19 @@ def write_api_manifest(api_content):
         "".join(os.path.basename(f) + "\n" for f in sorted(staged_assets(api_content))))
 
 
-API_UE_VERSION = "4.27"  # AssetGen writes UE4.27 packages; a UE5 project needs its own writer.
+API_UE_VERSION = "4.27"  # the editor stubs (Uncooked.cpp) are 4.27 only; cooked output follows the UeApi (S40)
+
+# The game's project folder, which a pak's tree and mount point are named after (FSD/Content, RogueCore/Content):
+# the UeApi's Version.json "project", which genueapi reads off the dump. Set by main.
+PROJECT = "FSD"
+
+
+def ueapi_project(ue_api):
+    """The project a UeApi was generated for; one from before S40 carries none and is DRG's."""
+    try:
+        return json.load(io.open(os.path.join(ue_api, "Version.json"), encoding="utf-8")).get("project") or "FSD"
+    except (OSError, ValueError):
+        return "FSD"
 
 
 def api_roots(mod, config, bp):
@@ -184,7 +196,7 @@ def dep_stage(dep, by_name, bp):
     """Where dep's cooked assets sit - the import path (its UE_MOD_PACKAGE) plus its build dir,
     both known from the manifest, so nothing needs threading through the build loop."""
     package = mod_package(mod_sources(by_name[dep], bp))
-    fsd = os.path.join(bp, "build", dep, "FSD")
+    fsd = os.path.join(bp, "build", dep, PROJECT)
     return content_dir(fsd, package), package, fsd
 
 
@@ -292,7 +304,7 @@ def run_unrealpak(fsd_dir, pak_path):
 
     response = os.path.join(os.path.dirname(fsd_dir), "autogen.txt")
     io.open(response, "w", encoding="utf-8", newline="\n").write(
-        '"%s" "..\\..\\..\\FSD\\*.*"\n' % os.path.join(fsd_dir, "*.*"))
+        '"%s" "..\\..\\..\\%s\\*.*"\n' % (os.path.join(fsd_dir, "*.*"), PROJECT))
 
     cmd = [UNREALPAK, pak_path, "-platform=Windows", "-create=" + response, "-compress"]
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -408,6 +420,8 @@ def main():
         sys.exit(__doc__.strip().splitlines()[-1])
     # Absolute: subprocess resolves a relative exe against PATH, not the cwd.
     repo, ue_api, assetgen = (os.path.abspath(p) for p in sys.argv[1:4])
+    global PROJECT
+    PROJECT = ueapi_project(ue_api)
     force = "--force" in sys.argv[4:]
     no_pak = "--no-pak" in sys.argv[4:]
 
@@ -453,7 +467,7 @@ def main():
             continue
 
         package = mod_package(sources)
-        stage_fsd = os.path.join(bp, "build", name, "FSD")
+        stage_fsd = os.path.join(bp, "build", name, PROJECT)
         stage_content = os.path.join(stage_fsd, "Content", *package.replace("/Game/", "").split("/"))
         assets = cooked_assets(stage_content)
         staged.append((name, stage_content, package))
