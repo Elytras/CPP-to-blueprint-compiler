@@ -10987,7 +10987,8 @@ def patch_waits():
            'class Tweaks : public CompTest {\n  UE_PATCH;\npublic:\n  int32 Extra = 3;\n'
            '  void ReceiveBeginPlay() { int32 Before = Ticks; UKismetSystemLibrary::Delay(1.0f); Ticks = Before + Extra; '
            'Wait2(Before); }\n'
-           '  void Wait2(int32 From) { UKismetSystemLibrary::Delay(0.5f); Ticks = Ticks + From * 100; }\n};\n')
+           '  void Wait2(int32 From) { UKismetSystemLibrary::Delay(0.5f); Ticks = Ticks + From * 100; }\n'
+           '  void ReceiveTick(float DeltaSeconds) { UKismetSystemLibrary::Delay(0.5f); Ticks = Ticks + 1000; }\n};\n')
     tmp, out, _ = compile_to(src, 'WaitPatch', ['--game', comp_game])
     try:
         import invariants
@@ -11005,6 +11006,8 @@ def patch_waits():
         ci = p.find('CompTest_C')
         assert p.tag(ci, 'UberGraphFunction') == a.tag(a.find('CompTest_C'), 'UberGraphFunction'), 'the class\'s ubergraph moved'
         assert 'UberGraphFrame' not in [x.name for x in p.struct(ci).props[len(a.struct(a.find('CompTest_C')).props):]]
+        # An added override that waits is still an override: its stub links to the event it overrides.
+        assert p.path(p.struct(p.find('ReceiveTick')).super) == '/Script/Engine.Actor:ReceiveTick', p.struct(p.find('ReceiveTick')).super
         keeps_invariants(b)
         proc = subprocess.run([ASSETGEN, 'roundtrip', tmp], capture_output=True, encoding='utf-8')
         assert proc.returncode == 0 and ' 0 differ' in proc.stdout, proc.stdout

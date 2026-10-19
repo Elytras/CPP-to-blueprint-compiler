@@ -19033,7 +19033,9 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             std::vector<std::tuple<std::string, std::string, bool>> Copies;
             for (const FPropertyDef& P : Segments[I].Parms)
                 Copies.emplace_back(P.Name, Segments[I].Rename.at(P.Name), (P.PropertyFlags & CPF_OutParm) != 0);
-            BP.AddFunction(UeNameOf(&R, Segments[I].Name), Segments[I].Super, Segments[I].Parms,
+            /* A patch's stub takes the game function's super, or the one it overrides, in TransplantFunctions. */
+            if (R.bIsPatch) PatchSupers[R.CppName + "::" + UeNameOf(&R, Segments[I].Name)] = Segments[I].Super;
+            BP.AddFunction(UeNameOf(&R, Segments[I].Name), R.bIsPatch ? Null() : Segments[I].Super, Segments[I].Parms,
                            [Copies, Uber, Entries, I, Redirect](FScript& S, FIndex SelfExp) {
                 Redirect(S, Uber);
                 for (const auto& [From, To, bRef] : Copies)
