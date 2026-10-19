@@ -593,6 +593,9 @@ void FBlueprintClass::Finish()
         Ar.Name("None");
         Ar.Bool(true);                              // bCooked
         Ar.Idx(Exp(RowCdo));                        // ClassDefaultObject
+        // 5.6 UBlueprintGeneratedClass::Serialize, once FilterEditorOnly: CookedEditorTags, a TMap<FName, FString>
+        // the runtime reads and drops (the editor writes BlueprintType). Leaving it out reads past the payload.
+        if (IsUE5()) Ar.I32(0);
     };
     P.AddExport(std::move(Class));
 
@@ -639,6 +642,9 @@ void FBlueprintClass::Finish()
             Tag(Ar, SubobjectNames[I], "ObjectProperty",
                 [=](FArc& V) { V.Idx(Exp(RowFirstSubobject + int32(I))); });
         TagEnd(Ar);                                 // a CDO omits the lazy-object guid
+        // 5.6 UBlueprintGeneratedClass::SerializeDefaultObject then reads SparseClassDataStruct; null makes the loader
+        // seek to the export's end. Leaving it out reads the next export's first bytes as an object index.
+        if (IsUE5()) Ar.Idx(Null());
     };
     P.AddExport(std::move(Cdo));
 
