@@ -261,7 +261,9 @@ Notes:
 - The compiler cooks any class that has a base, not only one with a UE base. A class that derives from a plain C++
   class compiles with no warning, but its parent is a Blueprint that is never written. Derive from a UE class, or from
   a mod class that has one.
-- An unqualified call reaches the most-derived override, and `Base::Method()` runs the parent's body. See
+- An unqualified call reaches the most-derived override, and `Base::Method()` runs the parent's body. A method
+  whose every path calls itself, such as `void PreConstruct(bool D) { PreConstruct(D); ... }` meant as the parent
+  call, is refused ("all paths through this function will call itself"): in the game it overflows the stack. See
   [Overrides and parent calls](#overrides-and-parent-calls) and
   [examples/GameBlueprintChild.cpp](examples/GameBlueprintChild.cpp).
 - A child changes an inherited default, including one of a component that a game Blueprint parent adds, in

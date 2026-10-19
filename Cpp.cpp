@@ -19939,8 +19939,10 @@ std::string ClangCommand(const std::string& SourcePath, const std::string& Inclu
     /* Both the UeApi dir and its parent are include paths, so "FSD.h" and "UeApi/FSD.h" both resolve. Absolute
        first: a relative "UeApi" has an empty parent, and -I"" swallows the next argument. */
     const std::string Parent = std::filesystem::absolute(IncludeDir, TmpEc).parent_path().string();
-    /* -Wno-string-plus-int: `"lit" + N` is a Concat_StrStr here, not pointer arithmetic. */
-    std::string Cmd = "clang++ -std=c++20 -Wno-string-plus-int -fsyntax-only -Xclang -ast-dump=json";
+    /* -Wno-string-plus-int: `"lit" + N` is a Concat_StrStr here, not pointer arithmetic.
+       -Werror=infinite-recursion: a method whose every path calls itself (a parent call written `Fn()`, not
+       `Base::Fn()`) overflows the game thread's stack. */
+    std::string Cmd = "clang++ -std=c++20 -Wno-string-plus-int -Werror=infinite-recursion -fsyntax-only -Xclang -ast-dump=json";
 #ifndef _WIN32
     /* Parse with the game's ABI, not the host's: on x86-64 Linux size_t is `unsigned long`, so sizeof has no
        Kismet conversion. The msvc target finds no C++ headers here and the SDK needs only <initializer_list>,
