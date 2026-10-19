@@ -624,7 +624,9 @@ void FBlueprintClass::Finish()
     const char* const TickProperty = bIsActor ? "PrimaryActorTick" : "PrimaryComponentTick";
     const char* const TickStruct = bIsActor ? "ActorTickFunction" : "ActorComponentTickFunction";
 
-    const bool bCdoReplicates = bReplicates;
+    /* A UE_DEFAULTS bReplicates of its own wins: one tag, the class's word (a component the editor left unreplicated). */
+    const bool bCdoReplicates = bReplicates && std::none_of(CdoDefaults.begin(), CdoDefaults.end(),
+        [](const FPropertyDef& V) { return V.Name == "bReplicates"; });
     const std::vector<FPropertyDef> Inherited = CdoDefaults;
     std::vector<std::string> SubobjectNames;
     for (const FSubobjectOverride& O : SubobjectOverrides) SubobjectNames.push_back(O.Property);

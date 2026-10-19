@@ -4949,7 +4949,10 @@ def repl_defaults():
         cdo = dump('dumptags.py', base, names.index('Default__%s_C' % name))
         if own: assert re.search(r'bReplicates \[0\] BoolProperty size=0 value=1', cdo) and 'Score [0] IntProperty size=4: 5' in cdo, cdo
         else: assert 'bReplicates' not in cdo and 'Score' not in cdo, cdo
-    print('ok  ReplTest: the CDO replicates and holds Score = 5; ReplKid inherits them')
+    base = os.path.join(folder, 'ReplQuiet')
+    cdo = dump('dumptags.py', base, [e['name'] for e in dumpexp.load(base)[5]].index('Default__ReplQuiet_C'))
+    assert cdo.count('bReplicates') == 1 and re.search(r'bReplicates \[0\] BoolProperty size=0 value=0', cdo), cdo
+    print('ok  ReplTest: the CDO replicates and holds Score = 5; ReplKid inherits them; ReplQuiet keeps its own false')
 
 
 replication()
