@@ -9,7 +9,7 @@ import invariants
 import bpdecomp_flow as F
 import bpdecomp_body as B
 from bpdecomp_model import *
-from bpdecomp import Run, Ctx, Values, CallInfo
+from bpdecomp import Run, Ctx, Values, CallInfo, instanced_export
 from bpdecomp_emit_util import split_top
 
 HEADER_BANNER = '// Decompiled from %s by AssetGen/tools/bpdecomp.py; edit freely, it is source now.\n'
@@ -46,6 +46,7 @@ def field_assigns(lhs, v, partial=False, skip_zero=False):
     mod struct) becomes one assignment per field. `partial`: a mod struct's too - a value read over an archetype's
     (an inherited default, a component template) holds only the members that differ from it, which UE_DEFAULTS says
     member by member; braces would give the others the struct's own defaults instead."""
+    if partial and re.fullmatch(r'[\w:]+\{\}', v): return []     # a struct tag holding no member: nothing differs
     d = designated(v)
     if d is None or ('::' in d[0] and not partial): return [] if skip_zero and is_zero(v) else ['%s = %s;' % (lhs, v)]
     return [x for f, val in d[1] for x in field_assigns('%s.%s' % (lhs, f), val, partial, skip_zero)]   # a tag holds only what differs
@@ -157,6 +158,8 @@ class ClassEmit:
         s.const_dropped = []  # Const functions declared without const
         s.notes = run.notes
         s.notes_from = len(run.notes)
+        s.inst_locals = {}    # an instanced object's export -> the UE_DEFAULTS local holding it
+        s.cx.instanced = s.instanced
 
     def run_all(s):
         a, pkg, st = s.a, s.pkg, s.st
@@ -263,7 +266,7 @@ class ClassEmit:
         makes the object, so it is no default to restate."""
         if t['type'] != 'ObjectProperty' or len(bytes(t['value'])) != 4: return None
         idx = struct.unpack('<i', bytes(t['value']))[0]
-        if idx <= 0: return None
+        if idx <= 0 or instanced_export(s.pkg, idx - 1): return None
         outer = s.pkg.exports[idx - 1]['outer']
         return idx - 1 if outer in (s.st.cdo, s.a.export + 1) and outer else None
 
@@ -276,7 +279,7 @@ class ClassEmit:
             if cdo and e['outer'] == cdo:
                 name = subs.get(i)
                 if name is None:
-                    if pkg.tags(i):
+                    if pkg.tags(i) and not instanced_export(pkg, i):     # an instanced one is written where it is pointed at
                         s.notes.append('%s: default subobject %s has defaults but no member points at it; dropped'
                                        % (s.a.path, e['name']))
                     continue
@@ -303,9 +306,38 @@ class ClassEmit:
             if t['name'] in ('CreationMethod', 'UCSSerializationIndex', 'UCSModifiedProperties'): continue
             if t['type'] == 'ObjectProperty' and len(bytes(t['value'])) == 4:
                 idx = struct.unpack('<i', bytes(t['value']))[0]
-                if idx > 0 and s.pkg.exports[idx - 1]['outer'] in (s.st.cdo, s.a.export + 1): continue
+                if idx > 0 and s.pkg.exports[idx - 1]['outer'] in (s.st.cdo, s.a.export + 1) \
+                        and not instanced_export(s.pkg, idx - 1): continue
             v = vals.tag(s.pkg, t, s.class_prop(s.pkg.exports[i]['cls'], t['name']), s.a)
             if v is not None: s.defaults += field_assigns('%s->%s' % (cpp, ident(t['name'])), v, partial=True)
+
+    def instanced(s, i):
+        """Export i, an object instanced in the defaults, as the UE_DEFAULTS local holding it: its UE_INSTANCED line and
+        its own tags go in first, before the default that points at it, and an object under it before its own line that
+        does. Its outer is `this`, the component whose template holds it, or another such local."""
+        if i in s.inst_locals: return s.inst_locals[i]
+        pkg, e = s.pkg, s.pkg.exports[i]
+        o = e['outer'] - 1
+        oe = pkg.exports[o]
+        if o + 1 == s.st.cdo: outer = 'this'
+        elif instanced_export(pkg, o): outer = s.instanced(o)
+        elif oe['name'].endswith('_GEN_VARIABLE'):
+            var = oe['name'][:-len('_GEN_VARIABLE')]
+            outer = ident(var) if var in s.component_vars else (s.member_cpp(var) or ident(var))
+        else:       # a default subobject: the member of the CDO that points at it
+            tag = next((t for t in pkg.tags(s.st.cdo - 1) if t['type'] == 'ObjectProperty' and len(bytes(t['value'])) == 4
+                        and struct.unpack('<i', bytes(t['value']))[0] == o + 1), None)
+            if tag is None: raise ValueError('instanced %s is under %s, which no member points at' % (e['name'], oe['name']))
+            outer = s.member_cpp(tag['name']) or ident(tag['name'])
+        cls = s.run.types.cls(pkg, e['cls'], s.a)
+        local, n = ident(e['name']), 2
+        while local in s.inst_locals.values(): local, n = '%s_%d' % (ident(e['name']), n), n + 1
+        s.inst_locals[i] = local
+        h = s.run.api.header_of(cls)
+        if h: s.run.extra_includes.setdefault(s.a.mod.name, set()).add(h)
+        s.defaults.append('%s *%s = UE_INSTANCED(%s, %s, %s);' % (cls, local, cls, outer, B.cstring(e['name'])))
+        s.object_defaults(i, local)
+        return local
 
     def class_prop(s, cls, name):
         """Property `name` of the Blueprint class the FPackageIndex cls names, or of a parent of it; None for a native
@@ -634,8 +666,8 @@ class ClassEmit:
                 deps_of_type(s.run, s.pkg, p, d)
             decls.append('    %s %s;' % (ty, s.cx.local_ident(body, name)))
         for n in body.notes: s.notes.append('%s: %s' % (s.a.path, n))
-        for name, lines in body.latent_helpers:
-            s.methods.append(('private', 'void %s();' % name, B.render(B.tidy(lines))))
+        for name, helper in body.latent_helpers:
+            s.methods.append(('private', 'void %s();' % name, B.render(B.tidy(helper))))
         return list(extra_first) + decls + lines
 
     def plain_method(s, i, st):
@@ -686,8 +718,8 @@ class ClassEmit:
         a, st, pkg = s.a, s.st, s.pkg
         o = s.out
         mine = s.notes[s.notes_from:]
-        if any('an instanced subobject' in n or 'has defaults but no member points at it' in n for n in mine):
-            o.cooked = 'its defaults hold instanced subobjects, which AssetGen cannot write yet'
+        if any('has defaults but no member points at it' in n for n in mine):
+            o.cooked = 'its defaults hold a subobject no member points at, which AssetGen cannot write'
         elif any(' not rendered (' in n or ': inherited default ' in n for n in mine):
             # dropping it would ship the class without it (a Niagara component's parameter store: the user parameters
             # read as unset)

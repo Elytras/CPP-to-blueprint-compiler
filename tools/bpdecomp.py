@@ -40,6 +40,24 @@ def fmt_num(v):
     return B.cfloat(v) if isinstance(v, float) else str(v)
 
 
+RF_ArchetypeObject, RF_DefaultSubObject = 0x20, 0x40000
+
+
+def instanced_export(pkg, i):
+    """Whether export i is an object instanced in a class's defaults (UE_INSTANCED): an archetype under the CDO, under
+    a component template (<Var>_GEN_VARIABLE), or under another such object, and neither a default subobject nor a
+    template itself."""
+    e = pkg.exports[i]
+    if not e['outer'] or not e['flags'] & RF_ArchetypeObject or e['flags'] & RF_DefaultSubObject \
+            or e['name'].endswith('_GEN_VARIABLE'):
+        return False
+    o = pkg.exports[e['outer'] - 1] if e['outer'] > 0 else None
+    while o is not None and not (o['name'].startswith('Default__') or o['name'].endswith('_GEN_VARIABLE')):
+        if not o['outer'] or o['outer'] < 0: return False
+        o = pkg.exports[o['outer'] - 1]
+    return o is not None
+
+
 class Values:
     """Renders FPropertyTag values as C++ initializers."""
     def __init__(s, cx):
@@ -149,10 +167,13 @@ class Values:
         return out, o
 
     def object(s, pkg, idx, cur):
-        """An object value. One of the package's own subobjects (an instanced object, such as a damage component's
-        bonus) has no asset path to name it by, and AssetGen writes no instanced object yet: the tag is noted."""
+        """An object value. One of the package's own objects instanced in the defaults (a damage component's bonus) has
+        no asset path to name it by: the class emitter writes it as a UE_INSTANCED local and this is that local. Any
+        other subobject is noted."""
         if idx > 0 and pkg.exports[idx - 1]['outer']:
-            raise ValueError('an instanced subobject %s, which AssetGen cannot write yet' % pkg.exports[idx - 1]['name'])
+            hook = getattr(s.cx, 'instanced', None)
+            if hook and instanced_export(pkg, idx - 1): return hook(idx - 1)
+            raise ValueError('a subobject %s, which AssetGen cannot point at' % pkg.exports[idx - 1]['name'])
         return s.cx.object_ref_static(pkg, idx, cur)
 
     def _looks_tag(s, pkg, b, o):
