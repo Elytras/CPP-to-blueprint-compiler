@@ -69,6 +69,8 @@ def emit_enum(run, a):
         lines.append('    %s = %d,\n' % (name, v))
         if name != r or disp.get(r, r) != name:
             keep.append('%s=%s' % (name, r) + ('=' + disp[r] if r in disp and disp[r] != name else ''))
+    # the sentinel the engine adds, which a default may hold (EEE's ETemperature_MAX, its "unset")
+    lines.append('    %s_MAX = %d,\n' % (a.cpp, max([v for _, v in run.enum_entries(a)] + [-1]) + 1))
     lines.append('};\nUE_ENUM(%s);\n' % a.cpp)
     if keep:      # the names the editor cooked it with, which kept assets and saved games hold, and its display names
         lines.append('static constexpr const char* %s__UeEnumNames = %s;\n' % (a.cpp, B.cstring('|'.join(keep))))
@@ -298,19 +300,39 @@ class ClassEmit:
             if t['type'] == 'ObjectProperty' and len(bytes(t['value'])) == 4:
                 idx = struct.unpack('<i', bytes(t['value']))[0]
                 if idx > 0 and s.pkg.exports[idx - 1]['outer'] in (s.st.cdo, s.a.export + 1): continue
-            v = vals.tag(s.pkg, t, None, s.a)
+            v = vals.tag(s.pkg, t, s.class_prop(s.pkg.exports[i]['cls'], t['name']), s.a)
             if v is not None: s.defaults += field_assigns('%s->%s' % (cpp, ident(t['name'])), v, partial=True)
 
-    def inherited_prop(s, name):
-        st = s.st
-        pkg = s.pkg
+    def class_prop(s, cls, name):
+        """Property `name` of the Blueprint class the FPackageIndex cls names, or of a parent of it; None for a native
+        one, whose members the tags' own types render."""
+        at = s.pkg.resolve(cls)
+        st = at and at[0].struct(at[1])
+        if st is None: return None
+        p = next((q for q in st.props if q.name == name), None)
+        if p:
+            def mark(q):
+                q._tpkg = at[0]
+                for r in q.subs or []: mark(r)
+            mark(p)
+            return p
+        return s.inherited_prop(name, st, at[0])
+
+    def inherited_prop(s, name, st=None, pkg=None):
+        st = st or s.st
+        pkg = pkg or s.pkg
         while st is not None and st.super:
             at = pkg.resolve(st.super)
             if not at: return None
             pkg, k = at
             st = pkg.struct(k)
             p = next((q for q in st.props if q.name == name), None)
-            if p: return p
+            if p:       # its type's indices (a struct's, an enum's) are that parent's package's, as struct_members marks
+                def mark(q):
+                    q._tpkg = pkg
+                    for r in q.subs or []: mark(r)
+                mark(p)
+                return p
         return None
 
     def cdo_tags(s):
@@ -492,6 +514,13 @@ class ClassEmit:
         s.methods.append((access, pre + decl + post + ';', lines, decl, post))
 
     def class_defaults(s):
+        # AssetGen turns bReplicates on for a class with a replicated variable or an RPC of its own; the editor does
+        # that for an actor only, and a cooked CDO without the tag holds its native parent's false (EEE_BaseComponent)
+        replicates = any('UE_REPLICATED' in m for _, m in s.members) or \
+            any(re.search(r'\bUE_(SERVER|CLIENT|MULTICAST) ', m[1]) for m in s.methods)
+        if replicates and 'bReplicates' not in s.cdo_tags() and s.st.super < 0 and \
+                s.pkg.path(s.st.super).startswith('/Script/'):
+            s.defaults.insert(0, 'bReplicates = false;')
         if s.ucs:
             has = any(m[1].split('(')[0].endswith(' UserConstructionScript') for m in s.methods)
             if has:
@@ -511,6 +540,10 @@ class ClassEmit:
         mine = s.notes[s.notes_from:]
         if any('an instanced subobject' in n or 'has defaults but no member points at it' in n for n in mine):
             o.cooked = 'its defaults hold instanced subobjects, which AssetGen cannot write yet'
+        elif any(' not rendered (' in n or ': inherited default ' in n for n in mine):
+            # dropping it would ship the class without it (a Niagara component's parameter store: the user parameters
+            # read as unset)
+            o.cooked = 'a default of it bpdecomp cannot render yet (NOTES.md names it)'
         elif a.path in s.run.cook:      # --cook: what its source needs that AssetGen cannot compile yet
             o.cooked = s.run.cook[a.path]
         if o.cooked: s.notes.append('%s: shipped as its cooked package (UE_COOKED): %s' % (a.path, o.cooked))

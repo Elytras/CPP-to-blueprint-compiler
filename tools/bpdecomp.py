@@ -54,6 +54,7 @@ class Values:
         try:
             return s.value(pkg, t['type'], bytes(t['value']), prop, cur, t)
         except Exception as e:
+            if os.environ.get('BPDECOMP_TRACE'): import traceback; traceback.print_exc()
             s.cx.notes.append('%s: default %s not rendered (%s)' % (cur.path, t['name'], e))
             return None
 
@@ -108,7 +109,7 @@ class Values:
             if sname not in IMMUTABLE and n and o + 8 <= len(b) and s._looks_tag(pkg, b, o):
                 # an array of structs leads with one tag for its inner property
                 tl = s.read_tag(pkg, b, o)
-                o = tl['next']
+                o = tl['next'] - tl['size']     # its size spans the elements, which follow it
             for _ in range(n):
                 if sname in IMMUTABLE:
                     fmt, cpp = IMMUTABLE[sname]
@@ -331,6 +332,8 @@ class Ctx:
                 if a is not None:
                     for (n, val), raw in zip(s.run.enum_entries(a), s.run.enum_raw(a)):
                         if raw == short: return '%s::%s' % (s.types.spell_mod(a, s.asset), n)
+                    if short == a.name + '_MAX':    # the sentinel past the last entry, which emit_enum declares
+                        return '%s::%s' % (s.types.spell_mod(a, s.asset), short)
                     return '/* bpdecomp: %s */ {}' % entry
                 top, _, name = path.partition('.')
                 cpp = s.api.enums.get((top, name), (name,))[0]
