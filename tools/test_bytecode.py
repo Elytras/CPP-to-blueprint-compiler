@@ -577,6 +577,9 @@ def assetgen_compile(args, cwd=None):
     return PREFETCH.compile(args, cwd)
 
 
+AGAINST_ASSET_TEST = ('EditTest', 'AssetValues')     # compiled with --game at AssetTest's output
+
+
 def build():
     """Each test compiles into build/<Test>/FSD/Content/<its package>, the layout bpbuild stages a mod in. The examples
     the docs point at compile the same way, so one the compiler stops accepting fails here rather than for a reader."""
@@ -587,11 +590,12 @@ def build():
         package = re.search(r'UE_MOD_PACKAGE\s*\(\s*"/Game/([^"]+)"', open(src, encoding='utf-8-sig').read()).group(1)
         out = os.path.join(ROOT, mod, 'FSD', 'Content', *package.split('/'))
         os.makedirs(out)
-        game = ['--game', os.path.join(ROOT, 'AssetTest', 'FSD', 'Content')] if mod == 'EditTest' else []
+        game = ['--game', os.path.join(ROOT, 'AssetTest', 'FSD', 'Content')] if mod in AGAINST_ASSET_TEST else []
         return mod, assetgen_compile([src, UEAPI, out] + game)
     srcs = sorted(glob.glob(os.path.join(TESTS, '*.cpp'))) + sorted(glob.glob(os.path.join(AG, 'examples', '*.cpp')))
-    # EditTest edits AssetTest's cooked assets as if they were the game's, so it compiles once AssetTest has.
-    edits = [s for s in srcs if os.path.basename(s) == 'EditTest.cpp']
+    # EditTest edits AssetTest's cooked assets as if they were the game's, and AssetValues reads their values, so they
+    # compile once AssetTest has.
+    edits = [s for s in srcs if os.path.splitext(os.path.basename(s))[0] in AGAINST_ASSET_TEST]
     for mod, proc in parallel(compile_mod, [s for s in srcs if s not in edits]) + [compile_mod(s) for s in edits]:
         assert proc.returncode == 0, '%s:\n%s%s' % (mod, proc.stdout, proc.stderr)
         LOGS[mod] = proc.stdout
@@ -3840,6 +3844,64 @@ def globals_():
     print('ok  GlobalTest: both classes read and write the one object: =, op=, ++ and a postfix value')
 
 
+def asset_values():
+    """AssetValues (S38): a game asset's member read by value is the value its package holds, a constant when the mod is
+    built. The "game" is AssetTest: an asset's own value, one it leaves to its archetype (the class's default object, in
+    another package), an explicit zero, an element, a Blueprint class's own false (its default object has no tag of
+    it), a native class's asset; in the code (run) and in defaults (the CDO's tags). Refused: a value no package holds
+    (a native class's C++ default), an element past the end, a reference, a value this mod's own edit changes, a member
+    UeApi types otherwise than the package (an SDK from another build), and a compile without --game. bpbuild records
+    the packages a compile read and restales the mod when the game's copy is newer."""
+    base = asset('AssetValues')
+    got = {f: run(base, f)[0] for f in ('BigHealth', 'PlainHealth', 'CalmCount', 'BigWave', 'PlainBig', 'Spread')}
+    assert got == {'BigHealth': -1001.0, 'PlainHealth': 100.0, 'CalmCount': 1, 'BigWave': 8, 'PlainBig': False,
+                   'Spread': 250.0}, got
+    tag_line = re.compile(r'^  (\w+) \[0\] \w+ size=\d+[^:]*: ?(.*)$', re.M)
+    cdo = {m.group(1): m.group(2) for m in tag_line.finditer(dump('dumptags.py', base, 1))}
+    assert cdo == {'Twice': '200.0', 'Title': "'Big'", 'Label': 'big', 'Size': '4'}, cdo
+    reads = sorted(set(re.findall(r'(?m)^  value +<- (\S+)', LOGS['AssetValues'])))
+    assert reads == ['/Game/_ElytrasMods/AssetTest/' + a for a in ('ED_AssetTest', 'MD_Big', 'MD_Calm', 'MD_Plain')], reads
+
+    game = os.path.join(ROOT, 'AssetTest', 'FSD', 'Content')
+    head = (EDIT_HEAD + 'UE_MOD_PACKAGE("/Game/_ElytrasMods/AvRefused");\n'
+            'class UMoodDef : public UPrimaryDataAsset {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/AssetTest/UMoodDef", "UMoodDef_C");\n'
+            '  %s Health;\n  TArray<int32> Waves;\n  UMoodDef *Next;\n};\n'
+            'UE_ASSET_AT(UMoodDef, MD_Plain, "/Game/_ElytrasMods/AssetTest/MD_Plain");\n'
+            'UE_ASSET_AT(UEnemyDescriptor, ED_AssetTest, "/Game/_ElytrasMods/AssetTest/ED_AssetTest");\n')
+    for health, body, why in (
+            ('float', 'float F() { return ED_AssetTest.SpawnAmountModifier; }',
+             "ED_AssetTest.SpawnAmountModifier: the game's ED_AssetTest sets no value of its own, so it holds "
+             "EnemyDescriptor's C++ default, which no package holds"),
+            ('float', 'int32 F() { return MD_Plain.Waves[0]; }', "MD_Plain.Waves[0]: the game's array has 0 elements"),
+            ('float', 'bool F() { return MD_Plain.Next == nullptr; }', 'MD_Plain.Next: only a number, a bool, an enum'),
+            ('float', 'float F() { return MD_Plain.Health; }\n};\nUE_ASSET_EDIT(MD_Plain) {.Health = 7.0f};\nclass B : public AActor {',
+             "MD_Plain.Health: this mod's edit changes the value read when the mod is built"),
+            ('int32', 'int32 F() { return MD_Plain.Health; }',
+             'the game\'s package holds a FloatProperty there, where UeApi declares a IntProperty')):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc, _ = compile_edit(tmp, 'AvRefused', head % health + 'class AvRefused : public AActor {\npublic:\n  '
+                                   + body + '\n};\n', game)
+        assert proc.returncode != 0 and why in proc.stdout, (body, proc.stdout)
+    refused('AvNoGame', '  float F() { return ED_AssetTest.SpawnSpread; }\n',
+            "a game asset's value is read off its package when the mod is built: pass the folder /Game is in",
+            top='UE_ASSET_AT(UEnemyDescriptor, ED_AssetTest, "/Game/_ElytrasMods/AssetTest/ED_AssetTest");\n')
+
+    sys.path.insert(0, HERE)
+    import bpbuild
+    with tempfile.TemporaryDirectory() as tmp:
+        assert bpbuild.value_reads(LOGS['AssetValues']) == reads
+        listed = os.path.join(tmp, 'reads.txt')
+        with open(listed, 'w') as f:
+            f.write('\n'.join(reads) + '\n/Game/_ElytrasMods/AssetTest/Gone\n')
+        files = bpbuild.read_files(listed, game)
+        assert sorted(os.path.basename(f) for f in files) == sorted(a + e for a in ('ED_AssetTest', 'MD_Big', 'MD_Calm', 'MD_Plain')
+                                                                    for e in ('.uasset', '.uexp')), files
+        assert bpbuild.read_files(listed, None) == [] and bpbuild.read_files(os.path.join(tmp, 'none.txt'), game) == []
+    print('ok  AssetValues: a game asset\'s values, read off its package when the mod is built - its own, its archetype\'s, '
+          'an element, a Blueprint class\'s untagged zero - in code and defaults; refused where no package holds the value, '
+          'where this mod edits it, or where UeApi disagrees with the package; bpbuild restales on the packages read')
+
+
 def edits():
     """EditTest (S38): UE_ASSET_EDIT and UE_PATCH rewrite AssetTest's cooked packages in place. Only the named tags
     change (replaced where they were, or appended); every name and import the package had keeps its index, a new one
@@ -4321,6 +4383,7 @@ static_assets()
 ue_assets()
 asset_elsewhere()
 globals_()
+asset_values()
 edits()
 path_edits()
 game_edits()
@@ -11706,7 +11769,17 @@ MAP_PATCH_CASES = (('Ids = {7};\n    Score = {{"a", 9}};', {('Ids',): {7}, ('Sco
                     {('Held', 'Ids'): {1, 7}, ('Held', 'Score'): {'a': 1, 'b': 2}, ('Deep', 'In', 'Ids'): {7},
                      ('Deep', 'In', 'Score'): {'c': 3}}),
                    ('Score = {{"a", 9}, {"a", 1}};', {('Score',): {'a': 1}}),
-                   ('Text = {{"a", 5}, {"A", 1}};', {('Text',): {'A': 1}}))
+                   ('Text = {{"a", 5}, {"A", 1}};', {('Text',): {'A': 1}}),
+                   # One element at a time, merged into the value the CDO holds (PropSetDelta's {2, 3}, {a: 5, b: 2}),
+                   # or, where it has no tag (Deep), into the archetype's, as a C++ map's operator[], Add and Remove do.
+                   ('Score["c"] = 7;\n    Ids.Add(9);\n    Ids.Add(2);\n    Score.Remove("b");',
+                    {('Score',): {'a': 5, 'c': 7}, ('Ids',): {2, 3, 9}}),
+                   ('Score["a"] = 1;\n    Ids.Remove(3);\n    Ids.Remove(8);', {('Score',): {'a': 1, 'b': 2}, ('Ids',): {2}}),
+                   ('Deep.In.Score["d"] = 4;\n    Deep.In.Ids.Remove(1);\n    Held.Score.Add("c", 3);\n    Held.Ids.Add(5);',
+                    {('Deep', 'In', 'Score'): {'a': 1, 'c': 3, 'd': 4}, ('Deep', 'In', 'Ids'): {2},
+                     ('Held', 'Score'): {'a': 5, 'b': 2, 'c': 3}, ('Held', 'Ids'): {2, 3, 5}}),
+                   ('Score["z"] = 1;\n    Score.Remove("z");\n    Text["a"] = 9;', {('Score',): {'a': 5, 'b': 2}, ('Text',): {'A': 9}}),
+                   ('Score = {{"x", 1}};\n    Score["y"] = 2;', {('Score',): {'x': 1, 'y': 2}}))
 
 
 def edit_whole_containers():
@@ -11751,6 +11824,48 @@ def edit_whole_containers():
             got = loads(invariants.Package(os.path.join(content, '_ElytrasMods', 'PropSetDelta', 'PropSetDelta')))
         want = {**vanilla, **assigned}
         assert got == want, 'the patched CDO loads %s; the patch says %s, so it should load %s' % (got, body, want)
+
+
+def edit_elements():
+    """S38: UE_ASSET_EDITS changes one element of an asset's TMap or TSet, `Score["c"] = 3`, `Ids.Add(4)`,
+    `Score.Remove("a")`, merged into the asset's own delta: the asset loads its archetype's value (the class's CDO),
+    takes out what it lists as removed, adds the rest. ED_Elem's own Score {b: 2} over the CDO's {a: 1} becomes {b: 2,
+    c: 3}; its Ids, which it has no tag of, the CDO's {1} plus 4. A map inside an array's element is refused, and the
+    message says to assign the whole element."""
+    import invariants
+    with tempfile.TemporaryDirectory() as tmp:
+        game_src = os.path.join(tmp, 'ElemGame.cpp')
+        with open(game_src, 'w', encoding='utf-8') as f:
+            f.write(EDIT_HEAD + 'UE_MOD_PACKAGE("/Game/_ElytrasMods/ElemGame");\n'
+                    'struct FElemHolder {\n  UE_STRUCT_IN("/Game/_ElytrasMods/ElemGame");\n  TMap<FName, int32> In;\n};\n'
+                    'class UElemDef : public UPrimaryDataAsset {\npublic:\n  TMap<FName, int32> Score = {{"a", 1}};\n'
+                    '  TSet<int32> Ids = {1};\n  TArray<FElemHolder> Arr;\n};\n'
+                    'UElemDef ED_Elem = {.Score = {{"b", 2}}, .Arr = {{{{"q", 1}}}}};\n')
+        game = os.path.join(tmp, 'game', 'FSD', 'Content')
+        os.makedirs(os.path.join(game, '_ElytrasMods', 'ElemGame'))
+        proc = assetgen_compile([game_src, UEAPI, os.path.join(game, '_ElytrasMods', 'ElemGame')])
+        assert proc.returncode == 0, proc.stdout
+        decl = ('struct FElemHolder {\n  UE_STRUCT_IN("/Game/_ElytrasMods/ElemGame");\n  TMap<FName, int32> In;\n};\n'
+                'class UElemDef : public UPrimaryDataAsset {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/ElemGame/UElemDef", "UElemDef_C");\n'
+                '  TMap<FName, int32> Score;\n  TSet<int32> Ids;\n  TArray<FElemHolder> Arr;\n};\n'
+                'UE_ASSET_AT(UElemDef, ED_Elem, "/Game/_ElytrasMods/ElemGame/ED_Elem");\n')
+        head = EDIT_HEAD + 'UE_MOD_PACKAGE("/Game/_ElytrasMods/ElemEdit");\n' + decl
+        os.makedirs(os.path.join(tmp, 'a'))
+        proc, content = compile_edit(os.path.join(tmp, 'a'), 'ElemEdit', head + 'UE_ASSET_EDITS {\n  ED_Elem.Score["c"] = 3;\n'
+                                     '  ED_Elem.Ids.Add(4);\n  ED_Elem.Score.Remove("a");\n}\n', game)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        cls = invariants.Package(os.path.join(game, '_ElytrasMods', 'ElemGame', 'UElemDef'))
+        cdo = cls.find('Default__UElemDef_C')
+        asset = invariants.Package(os.path.join(content, '_ElytrasMods', 'ElemGame', 'ED_Elem'))
+        ai = asset.find('ED_Elem')
+        got = {p: loaded_container(asset, ai, p, k, loaded_container(cls, cdo, p, k, set() if k == 'set' else {}))
+               for p, k in (('Score', 'map'), ('Ids', 'set'))}
+        assert got == {'Score': {'b': 2, 'c': 3}, 'Ids': {1, 4}}, got
+        os.makedirs(os.path.join(tmp, 'b'))
+        proc, _ = compile_edit(os.path.join(tmp, 'b'), 'ElemEdit', head + 'UE_ASSET_EDITS { ED_Elem.Arr[0].In["x"] = 1; }\n', game)
+        assert proc.returncode != 0 and 'inside an array\'s element or a native struct cannot be changed on its own yet; assign the whole element' in proc.stdout, proc.stdout
+    print('ok  ElemEdit: UE_ASSET_EDITS puts, adds and removes one element of an asset\'s TMap / TSet, merged into its delta '
+          'over the archetype; one inside an array\'s element is refused')
 
 
 GRUNT = '#include "UeApi/Game/ENE_Spider_Grunt_Normal_C.h"\n'
@@ -12030,7 +12145,9 @@ if not globals().get('EDITS_EXPLORE'):     # set by the dev loop's exploration d
     edit_whole_containers()
     print('ok  MapPatch: a patch\'s whole TSet / TMap loads as written, a property or one inside a struct (by a member '
           'path or in a whole struct): the archetype\'s elements it drops are listed as removed; a key given twice '
-          'holds its last value, an FString key compared without case')
+          'holds its last value, an FString key compared without case; one element put, added or removed loads as '
+          'the C++ map\'s operator[], Add and Remove leave it')
+    edit_elements()
     class_default_edits()
     print("ok  ClassDefaults: UE_ASSET_EDIT and UE_PATCH write a class into a cooked package: a new import created first, "
           "the patched class's own as its export")

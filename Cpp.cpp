@@ -445,10 +445,22 @@ void DiffTaggedAgainstParent(FPropertyDef& P, const FPropertyDef& Parent)
 /* A patch's UE_DEFAULTS statement, which may also assign part of a member's value: DefaultAssignment's `Field` or
    `Component->Field`, then any `.Member` and `[i]` into it (`PrimaryActorTick.bCanEverTick = v`, `Spans[1].Max = v`).
    Root is the field's MemberExpr, Steps each `.Member`'s MemberExpr or `[i]`'s operator call, from the root out. */
+/* `Score.Add("a", 1);`, `Ids.Add(7);`, `Score.Remove("a");`: a TMap's or TSet's Add or Remove, the container it is
+   called on, and the call itself. */
+bool ElementCall(const Json& S, const Json*& Container, const Json*& Call)
+{
+    Call = Strip(&S);
+    const Json* Callee = Call && Kind(*Call) == "CXXMemberCallExpr" ? Strip(First(*Call)) : nullptr;
+    if (!Callee || Kind(*Callee) != "MemberExpr" || (Name(*Callee) != "Add" && Name(*Callee) != "Remove")) return false;
+    Container = Strip(First(*Callee));
+    const std::string T = Container ? StripTypeKeywords(TypeOf(*Container)) : std::string();
+    return T.compare(0, 5, "TMap<") == 0 || T.compare(0, 5, "TSet<") == 0;
+}
+
 bool DefaultPath(const Json& S, const Json*& Root, const Json*& Rhs, const Json*& Through, std::vector<const Json*>& Steps)
 {
     const Json* E = nullptr;
-    if (!AssignmentSides(S, E, Rhs)) return false;
+    if (!AssignmentSides(S, E, Rhs) && !ElementCall(S, E, Rhs)) return false;
     Steps.clear();
     for (;;)
     {
@@ -471,7 +483,7 @@ bool DefaultPath(const Json& S, const Json*& Root, const Json*& Rhs, const Json*
 bool AssetPath(const Json& S, const Json*& Asset, const Json*& Root, const Json*& Rhs, std::vector<const Json*>& Steps)
 {
     const Json* E = nullptr;
-    if (!AssignmentSides(S, E, Rhs)) return false;
+    if (!AssignmentSides(S, E, Rhs) && !ElementCall(S, E, Rhs)) return false;
     Steps.clear();
     for (;;)
     {
@@ -1608,7 +1620,9 @@ private:
     /* One assignment of an edit: to a member (Path empty, Chain the member alone), or to part of its value - Chain
        then holds the member and the def each step of Path reaches, the last the value written. The last carries the
        value either way. */
-    struct FEditDef { std::vector<FPropertyDef> Chain; std::vector<FValueStep> Path; };
+    /* Op: the whole value at the path replaced, or one element of the TMap or TSet there put, added or removed (its
+       key, and a map's value, in the last def's Default.Items). */
+    struct FEditDef { std::vector<FPropertyDef> Chain; std::vector<FValueStep> Path; enum EOp : uint8 { Assign, Put, Add, Remove } Op = Assign; };
     bool EditStep(const Json& Step, const FPropertyDef& Parent, const std::string& Where, FBlueprintClass& BP,
                   FValueStep& Out, FPropertyDef& Reached, std::string* Err);
     bool EditAssignment(const Json& Root, const FRecord& Declarer, const std::vector<const Json*>& Steps, const Json* Rhs,
@@ -1617,6 +1631,7 @@ private:
     std::vector<const Json*> AssetEditBlocks;               // UE_ASSET_EDITS: each block's function
     bool ApplyEdit(const std::string& Package, const std::string& Object, std::vector<FEditDef> Edits,
                    const FPackage& From, const std::string& Where, std::string* Err);
+    bool MergeElement(const FCookedPackage& P, int32 Export, FEditDef& Edit, const std::string& Where, std::string* Err) const;
     bool SaveEdits(const std::string& OutDir, std::string* Err);
     bool BracedMembers(const Json& List, const FRecord& Rec, const std::string& Where, FBlueprintClass& BP, bool bKeepZero,
                        std::vector<FPropertyDef>& Out, std::string* Err, const FRecord* Archetype = nullptr);
@@ -1787,7 +1802,15 @@ private:
     const Json* StructConversionBelow(const Json& N) const;
     bool FreeNegation(const Json& C, Json& Out) const;
     bool ConstToArg(const FConstVal& V, const std::string& Type, FArgIR& Out) const;
-    std::map<std::string, const Json*> TemplateOf;                      // an instantiation's decl id -> its FunctionTemplateDecl
+    /* S38: a game asset's value read when the mod is built (AssetValueOf): a number (an enum's too), a bool, a name or a
+       string, and S the enumerator, name or string as the package holds it. */
+    struct FAssetRead { bool bString = false, bName = false; FConstVal Num; std::string S, Shown; };
+    bool AssetValueOf(const Json& E, FAssetRead& Out, bool bEdited = false);
+    mutable std::string AssetValueWhy;                                  // why the last asset value read refused, if it did
+    std::map<const Json*, FAssetRead> AssetReads;                       // each value read, checked again after the edits
+    std::map<std::string, FCookedPackage> ValuePackages;          // the game packages they were read from
+    bool CheckAssetReads(std::string* Err);
+    std::map<std::string, const Json*> TemplateOf;                     // an instantiation's decl id -> its FunctionTemplateDecl
     std::map<std::string, const Json*> FreeInlines;                     // decl id -> an inline free function's definition
                                                                         // (a template's: each instantiation)
     std::vector<const Json*> FreeInlineOrder;                           // the same definitions in document order: an id is
@@ -5600,6 +5623,18 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
     const Json* N = &Node;
     const EStrKind Slot = StrKindOf(OuterType);
     const std::string K = Kind(*N);
+    if (K == "MemberExpr" || K == "CXXMemberCallExpr" || (K == "CXXOperatorCallExpr" && IsIndexOperatorCall(*N)))
+    {
+        AssetValueWhy.clear();
+        if (FAssetRead A; AssetValueOf(*N, A))
+        {
+            if (!A.bString) return ConstToArg(A.Num, TypeOf(*N), Out) || (*Err = A.Shown + ": internal: no constant of its type", false);
+            Out.K = A.bName ? FArgIR::Name : FArgIR::Str;
+            Out.S = A.S;
+            return true;
+        }
+        if (!AssetValueWhy.empty()) { *Err = AssetValueWhy; return false; }
+    }
     if (K == "MemberExpr")
     {
         /* `this->X` of an inline class variable is X: the object says nothing about it, so it must not run anything. */
@@ -13213,6 +13248,9 @@ bool FCompiler::FoldConst(const Json& E, FConstVal& Out) const
         else if (T == "unsigned short" || T == "uint16") V.I = uint16(V.I);
         return true;
     };
+    /* A game asset's value, read off its package (AssetValueOf). */
+    if (K == "MemberExpr" || K == "CXXMemberCallExpr" || (K == "CXXOperatorCallExpr" && IsIndexOperatorCall(E)))
+        if (FAssetRead A; const_cast<FCompiler*>(this)->AssetValueOf(E, A)) { Out = A.Num; return !A.bString && Fit(Out); }
     if (K == "IntegerLiteral") { Out = {}; Out.I = int64(std::strtoull(E.value("value", std::string("0")).c_str(), nullptr, 10)); return true; }
     if (K == "CharacterLiteral") { Out = {}; Out.I = CharValue(E); return true; }
     if (K == "FloatingLiteral") { Out = {}; Out.bFloat = true; Out.F = std::strtod(E.value("value", std::string("0")).c_str(), nullptr); return true; }
@@ -13509,6 +13547,276 @@ bool FCompiler::LowerGlobal(const Json& Decl, FBlueprintClass& BP, FArgIR& Out, 
     return true;
 }
 
+/*
+S38 - `ED_Spider_Grunt.SpawnSpread`, a member of a game asset (a UE_ASSET_AT) read by value, then any `.Member` and
+`[i]` into it: the value the asset's package holds, read off GameDir when the mod is built, so FoldConst and the code
+take it as a constant. The SDK names the asset and types the path but carries no value, so a value can only come from
+the package the game loads, never from a header gone stale. The package keeps only what differs from the object's
+archetype (its TemplateIndex), so a member it has no tag of is the archetype's, followed through the game's packages;
+at a native class the value is its C++ default, which no package holds, and that is refused. So is a value whose tag is
+not the type UeApi gives the member (UeApi from another game build), one inside a map or a text, and a reference.
+False with AssetValueWhy empty when E is no such read; false with it set when the read is refused. bEdited reads the
+packages this compile edits as edited (CheckAssetReads); otherwise the read is recorded, and its package printed for
+bpbuild, which restales the mod when the game's copy is newer.
+*/
+bool FCompiler::AssetValueOf(const Json& E, FAssetRead& Out, bool bEdited)
+{
+    std::vector<const Json*> Steps;                 // from the asset out; the first a member
+    const Json* N = &E;
+    /* A TEnum<E> member reads through its conversion to E. */
+    if (Kind(E) == "CXXMemberCallExpr")
+    {
+        const Json* Callee = Strip(First(E));
+        if (!Callee || Kind(*Callee) != "MemberExpr" || Name(*Callee).compare(0, 9, "operator ") != 0 || !First(*Callee)) return false;
+        N = Strip(First(*Callee));
+    }
+    for (;;)
+    {
+        const std::string K = Kind(*N);
+        const Json* Next = K == "MemberExpr" && !N->value("isArrow", false) ? Strip(First(*N))
+                         : K == "CXXOperatorCallExpr" && IsIndexOperatorCall(*N) ? Strip(Nth(*N, 1)) : nullptr;
+        if (!Next) break;
+        Steps.insert(Steps.begin(), N);
+        N = Next;
+    }
+    if (Kind(*N) != "DeclRefExpr" || !N->contains("referencedDecl") || Steps.empty() || Kind(*Steps[0]) != "MemberExpr") return false;
+    const Json& D = (*N)["referencedDecl"];
+    const std::string Id = D.value("id", std::string());
+    if (!NsVars.count(Id)) return false;
+    const auto Scope = VarScope.find(Id);
+    const std::string Qual = (Scope == VarScope.end() ? std::string() : Scope->second) + Name(D);
+    const auto Path = AssetPaths.find(Qual);
+    if (Path == AssetPaths.end()) return false;
+
+    /* The path typed off UeApi, as an edit's: the member's def, each step's. */
+    std::string Shown = Name(D);
+    auto Refuse = [&](const std::string& Why) { AssetValueWhy = Shown + ": " + Why; return false; };
+    FPackage Scratch("/Scratch");
+    FBlueprintClass BP(Scratch, "Scratch", "", "", false);
+    BP.GameClassKinds = &GameClassKinds;
+    const auto Owner = FieldOwner.find(Steps[0]->value("referencedMemberDecl", std::string()));
+    const FRecord* DR = Owner == FieldOwner.end() ? nullptr : Find(Owner->second);
+    Shown += "." + Name(*Steps[0]);
+    if (!DR) return Refuse("cannot tell which class declares " + Name(*Steps[0]));
+    std::vector<FPropertyDef> Chain(1);
+    std::vector<FValueStep> Walk;
+    std::string Why;
+    if (!TypeToProperty(TypeOf(*Steps[0]), UeNameOf(DR, Name(*Steps[0])), 0, Shown, BP, &Chain[0], &Why)) { AssetValueWhy = Why; return false; }
+    for (size_t K = 1; K < Steps.size(); ++K)
+    {
+        FConstVal I;
+        const Json* Index = Kind(*Steps[K]) == "MemberExpr" ? nullptr : Nth(*Steps[K], 2);
+        Shown += Index ? "[" + (FoldConst(*Index, I) ? std::to_string(I.I) : std::string("...")) + "]" : "." + Name(*Steps[K]);
+        if (Index && Chain.back().Type != "ArrayProperty")
+            return Refuse("only a TArray's element is read when the mod is built; read a map's value when the game runs, through (&"
+                          + Name(D) + ")");
+        FPropertyDef Reached;
+        if (!EditStep(*Steps[K], Chain.back(), Shown, BP, Walk.emplace_back(), Reached, &Why)) { AssetValueWhy = Why; return false; }
+        Chain.push_back(std::move(Reached));
+    }
+    const FPropertyDef& Leaf = Chain.back();
+    const std::string& LT = Leaf.Type;
+    const bool bEnum = (LT == "ByteProperty" || LT == "EnumProperty") && !Leaf.StructName.empty();
+    if (LT != "FloatProperty" && LT != "DoubleProperty" && LT != "IntProperty" && LT != "Int64Property" && LT != "ByteProperty"
+        && LT != "EnumProperty" && LT != "BoolProperty" && LT != "NameProperty" && LT != "StrProperty")
+        return Refuse("only a number, a bool, an enum, a name or a string is read when the mod is built, and this is a "
+                      + StripTypeKeywords(TypeOf(E)) + "; read it when the game runs, through (&" + Name(D) + ")");
+    if (GameDir.empty())
+        return Refuse("a game asset's value is read off its package when the mod is built: pass the folder /Game is in "
+                      "(assetgen compile --game <extracted pak>/FSD/Content; bpbuild: game_content in mods.yaml)");
+
+    const std::function<const FCookedPackage*(const std::string&, std::string*)> Load = [&](const std::string& Name, std::string* LoadErr) -> const FCookedPackage* {
+        if (bEdited)
+            if (auto Slot = Edited.find(Lower(Name)); Slot != Edited.end()) return &Slot->second.P;
+        if (auto Slot = ValuePackages.find(Lower(Name)); Slot != ValuePackages.end()) return &Slot->second;
+        if (Name.compare(0, 6, "/Game/") != 0) { *LoadErr = Name + " is not a /Game package"; return nullptr; }
+        const std::string Base = (std::filesystem::u8path(GameDir) / std::filesystem::u8path(Name.substr(6))).u8string();
+        FCookedPackage Q;
+        for (const char* Ext : { ".uasset", ".umap" })
+            if (std::filesystem::exists(std::filesystem::u8path(Base + Ext)))
+                return Q.Load(Base + Ext, LoadErr) ? &(ValuePackages[Lower(Name)] = std::move(Q)) : nullptr;
+        *LoadErr = Name + " is not in " + GameDir + " (an asset of a mod pak has no package there)";
+        return nullptr;
+    };
+
+    /* The value at Walk in row X of Q, else in its archetype. */
+    FDefaultValue Value;
+    std::string ReadType;                           // the type the package's tag gives the leaf
+    std::function<bool(const FCookedPackage&, const std::string&, int32, int32)> ReadAt =
+        [&](const FCookedPackage& Q, const std::string& QName, int32 X, int32 Depth) -> bool {
+        if (Depth > 64) return Refuse("the archetype chain does not end");
+        const FCookedExport& Self = Q.Exports[size_t(X)];
+        std::vector<FTag> Tags;
+        size_t At = 0;
+        if (!ReadTags(Q, Self.Payload, At, Tags)) return Refuse(QName + ": " + Q.NameOf(Self.ObjectName) + "'s values do not read");
+        const auto Tag = std::find_if(Tags.begin(), Tags.end(), [&](const FTag& T) { return T.ArrayIndex == 0 && Q.SameName(T.Name, Chain[0].Name); });
+        if (Tag != Tags.end())
+        {
+            FPropertyDef Read;
+            if (!ReadTagValue(Q, *Tag, Read, &Why)) return Refuse(QName + "'s value does not read (" + Why + ")");
+            FDefaultValue V = Read.Default;
+            std::shared_ptr<FPropertyDef> Of = std::make_shared<FPropertyDef>(Read);
+            bool bElement = false, bMissing = false;
+            for (size_t K = 0; K < Walk.size() && !bMissing; ++K)
+            {
+                const FValueStep& S = Walk[K];
+                if (S.Element >= 0)
+                {
+                    if (V.K != FDefaultValue::Array || !Of->Inner) return Refuse(QName + " holds no array there");
+                    if (size_t(S.Element) >= V.Items.size())
+                        return Refuse("the game's array has " + std::to_string(V.Items.size()) + " elements");
+                    const FDefaultValue Item = V.Items[size_t(S.Element)];
+                    V = Item;
+                    Of = Of->Inner;
+                    bElement = true;
+                }
+                else if (V.K != FDefaultValue::Struct || !V.Members) return Refuse(QName + " holds no struct there");
+                else if (S.Offset >= 0)
+                {
+                    /* A native struct's bytes, as 4-byte chunks (ReadTagValue): the member's own. */
+                    if (S.Size != 4 || S.Offset % 4 || size_t(S.Offset / 4) >= V.Members->size() || K + 1 != Walk.size())
+                        return Refuse("only a 4-byte member of a native struct is read when the mod is built");
+                    const uint32 Bits = uint32((*V.Members)[size_t(S.Offset / 4)].Default.I);
+                    V = FDefaultValue{};
+                    if (LT == "FloatProperty") { float F; std::memcpy(&F, &Bits, 4); V.K = FDefaultValue::Float; V.F = F; }
+                    else if (LT == "IntProperty") { V.K = FDefaultValue::Int; V.I = int32(Bits); }
+                    else return Refuse("only a float or an int32 member of a native struct is read when the mod is built");
+                    Of = std::make_shared<FPropertyDef>(Leaf);
+                }
+                else
+                {
+                    const auto M = std::find_if(V.Members->begin(), V.Members->end(), [&](const FPropertyDef& P) { return Lower(P.Name) == Lower(S.Member); });
+                    /* A struct property loads each member over its archetype's struct; an element over its struct's
+                       defaults, which no package holds. */
+                    if (M == V.Members->end() && bElement)
+                        return Refuse("the game's element sets no " + S.Member + ", so it holds its struct's default, which no "
+                                      "package holds; read it when the game runs, through (&" + Name(D) + ")");
+                    if (M == V.Members->end()) { bMissing = true; break; }
+                    Of = std::make_shared<FPropertyDef>(*M);
+                    const FDefaultValue Member = M->Default;
+                    V = Member;
+                }
+            }
+            if (!bMissing)
+            {
+                Value = V;
+                ReadType = Of->Type;
+                return true;
+            }
+        }
+        /* Not set here: the archetype's value. */
+        if (Self.Template > 0) return ReadAt(Q, QName, Self.Template - 1, Depth + 1);
+        std::vector<std::string> Arch;              // the archetype first, its package last
+        for (int32 I = Self.Template; I < 0; I = Q.Imports[size_t(-I - 1)].Outer) Arch.push_back(Q.NameOf(Q.Imports[size_t(-I - 1)].ObjectName));
+        if (Arch.empty() || Arch.back().compare(0, 8, "/Script/") == 0)
+        {
+            /* A Blueprint class's own property starts as zero under its native parent, and the cook leaves a zero out
+               (measured: 247 of the 387 own int, float and bool variables of the game's Enemies classes have no tag on
+               their default object). So a member the topmost Blueprint class declares, untagged, is zero. */
+            FClassLayout L;
+            bool bDeclared = false;
+            if (Self.Class > 0 && ReadClassLayout(Q, Q.Exports[size_t(Self.Class - 1)].Payload, L))
+                for (const FClassLayout::FField& F : L.Fields) bDeclared = bDeclared || Q.SameName(F.Name, Chain[0].Name);
+            if (bDeclared && !Walk.empty() && Walk[0].Element >= 0) return Refuse("the game's array has 0 elements");
+            bDeclared = bDeclared && Walk.empty();
+            if (bDeclared)
+            {
+                Value = FDefaultValue{};
+                Value.K = LT == "FloatProperty" || LT == "DoubleProperty" ? FDefaultValue::Float
+                        : LT == "BoolProperty" ? FDefaultValue::Bool : LT == "NameProperty" || LT == "StrProperty" ? FDefaultValue::Str
+                        : FDefaultValue::Int;
+                if (LT == "NameProperty") Value.S = "None";
+                ReadType = LT;
+                return true;
+            }
+            const std::string Class = Arch.size() > 1 ? Arch.front().substr(Arch.front().compare(0, 9, "Default__") == 0 ? 9 : 0) : "its class";
+            return Refuse("the game's " + Q.NameOf(Self.ObjectName) + " sets no value of its own, so it holds " + Class
+                          + "'s C++ default, which no package holds; read it when the game runs, through (&" + Name(D) + ")");
+        }
+        const FCookedPackage* Next = Load(Arch.back(), &Why);
+        if (!Next) return Refuse(Why);
+        int32 Row = -1;
+        for (size_t K = Arch.size() - 1; K-- > 0 && (Row = Next->FindExport(Arch[K], Row + 1)) >= 0;) {}
+        if (Row < 0) return Refuse(Arch.back() + " holds no " + Arch.front());
+        return ReadAt(*Next, Arch.back(), Row, Depth + 1);
+    };
+    std::string Package = Path->second;
+    const std::string Object = SplitAssetPath(Package);
+    const FCookedPackage* Q = Load(Package, &Why);
+    if (!Q) return Refuse(Why);
+    const int32 Row = Q->FindExport(Object);
+    if (Row < 0) return Refuse(Package + " holds no " + Object);
+    if (!ReadAt(*Q, Package, Row, 0)) return false;
+
+    /* The tag's type is the member's, or UeApi was made from another game build than the package. */
+    const bool bEnumTag = ReadType == "EnumProperty" || ReadType == "ByteProperty";
+    if (ReadType != LT && !(bEnum && bEnumTag))
+        return Refuse("the game's package holds a " + ReadType + " there, where UeApi declares a " + LT + ": regenerate UeApi "
+                      "from the same game build as the extracted pak");
+    Out = FAssetRead{};
+    Out.Shown = Shown;
+    if (Value.K == FDefaultValue::Float) { Out.Num.bFloat = true; Out.Num.F = Value.F; }
+    else if (Value.K == FDefaultValue::Int || Value.K == FDefaultValue::Bool)
+    {
+        Out.Num.I = Value.I;
+        /* A zero enum (an untagged Blueprint variable): named for a default as a tag names it. */
+        std::vector<std::pair<std::string, int64>> Entries;
+        if (bEnum && (EnumMapEntries(StripTypeKeywords(TypeOf(E)), Entries) || EnumMapEntries(Leaf.StructName, Entries)))
+            for (const auto& [EName, EValue] : Entries)
+                if (EValue == Value.I && Out.S.empty())
+                    Out.S = Leaf.StructName + "::" + EName.substr(EName.rfind(':') == std::string::npos ? 0 : EName.rfind(':') + 1);
+    }
+    else if (Value.K == FDefaultValue::Str && bEnum)
+    {
+        /* An enumerator by name, "EEnum::Name": its value off the enum UeApi declares. */
+        Out.S = Value.S;
+        const std::string Want = Value.S.substr(Value.S.rfind(':') == std::string::npos ? 0 : Value.S.rfind(':') + 1);
+        std::vector<std::pair<std::string, int64>> Entries;
+        bool bFound = false;
+        if (EnumMapEntries(StripTypeKeywords(TypeOf(E)), Entries) || EnumMapEntries(Leaf.StructName, Entries))
+            for (const auto& [EName, EValue] : Entries)
+                if (!bFound && EName.substr(EName.rfind(':') == std::string::npos ? 0 : EName.rfind(':') + 1) == Want)
+                { Out.Num.I = EValue; bFound = true; }
+        if (!bFound) return Refuse("the game's value is " + Value.S + ", which UeApi's " + StripTypeKeywords(TypeOf(E))
+                                   + " does not declare: regenerate UeApi from the same game build as the extracted pak");
+    }
+    else if (Value.K == FDefaultValue::Str && (LT == "NameProperty" || LT == "StrProperty"))
+    {
+        Out.bString = true;
+        Out.bName = LT == "NameProperty";
+        Out.S = Value.S;
+    }
+    else return Refuse("the game's value does not read as a " + LT);
+    if (!bEdited && AssetReads.emplace(&E, Out).second)
+    {
+        char Num[32];
+        snprintf(Num, sizeof Num, Out.Num.bFloat ? "%.9g" : "%.0f", Out.Num.Num());
+        const std::string V = Out.bString ? "\"" + Out.S + "\"" : !Out.S.empty() ? Out.S : std::string(Num);
+        printf("  %-14s <- %s  (%s = %s, read when the mod is built)\n", "value", Package.c_str(), Shown.c_str(), V.c_str());
+    }
+    return true;
+}
+
+/* A value read when the mod is built is the game's, before this mod's own edits, which are written after the classes
+   that read them. Where an edit of this compile changes one, the game loads the edited value: refused, rather than
+   compiled in as the old one. */
+bool FCompiler::CheckAssetReads(std::string* Err)
+{
+    for (const auto& [E, Was] : AssetReads)
+    {
+        FAssetRead Now;
+        AssetValueWhy.clear();
+        if (!AssetValueOf(*E, Now, /*bEdited=*/true)) { *Err = AssetValueWhy; return false; }
+        if (Now.S != Was.S || Now.Num.Num() != Was.Num.Num())
+        {
+            *Err = Was.Shown + ": this mod's edit changes the value read when the mod is built, and the game loads the edited "
+                   "one: read it when the game runs, through the asset's pointer, or use the edit's value itself";
+            return false;
+        }
+    }
+    return true;
+}
+
 bool FCompiler::AssetRef(const Json& N, FBlueprintClass& BP, FIndex* Out)
 {
     if (Kind(N) != "UnaryOperator" || N.value("opcode", std::string()) != "&") return false;
@@ -13793,6 +14101,7 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
                              bool bKeepZero)
 {
     const Json* const Whole = Init ? Init : First(F);
+    AssetValueWhy.clear();
     Init = Whole ? StructConversionBelow(*Whole) : nullptr;
     if (!Init) Init = Strip(Whole);
     /* No initializer: the property starts as the engine makes it, which is the C++ constructor's value but for a struct
@@ -14086,6 +14395,17 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
         D.K = !bKeepZero && D.S.empty() ? FDefaultValue::None : FDefaultValue::Str;
         return true;
     }
+    /* A game asset's name, string or enumerator, read off its package (AssetValueOf); a number went through FoldConst. */
+    if (FAssetRead A; !bNeg && AssetValueOf(*Init, A))
+    {
+        if (A.bString ? T == "StrProperty" || T == "NameProperty" : (T == "ByteProperty" || T == "EnumProperty") && !A.S.empty())
+        {
+            D.S = A.S;
+            D.K = !bKeepZero && (A.bString ? D.S.empty() : D.S == PD.EnumZero) ? FDefaultValue::None : FDefaultValue::Str;
+            return true;
+        }
+    }
+    if (!AssetValueWhy.empty()) { *Err = Name(F) + ": " + AssetValueWhy; return false; }
     *Err = Name(F) + ": a default is a value known when the mod is built - a literal, a constant expression over "
            "literals, enum constants and constexpr variables, a braced struct, an &Asset or a class, X::StaticClass(). A "
            "function call counts only through `constexpr T k = F();` with F consteval, which clang runs itself. Anything "
@@ -15220,7 +15540,8 @@ bool FCompiler::PatchDefaults(const FRecord& Bp, const Json& Body, const std::st
         if (!DefaultPath(S, Lhs, Rhs, Through, Steps))
         {
             *Err = Where + ": every statement is `Field = value;` or `Component->Field = value;`, or assigns part of one: "
-                   "`Field.Member = value;`, `Field[2] = value;`";
+                   "`Field.Member = value;`, `Field[2] = value;`, or changes one element of a map or set: `Map[Key] = value;`, "
+                   "`Set.Add(Item);`, `Map.Remove(Key);`";
             bOk = false;
             return;
         }
@@ -15271,14 +15592,63 @@ bool FCompiler::EditAssignment(const Json& Root, const FRecord& Declarer, const 
     Out.Chain.emplace_back();
     if (!TypeToProperty(TypeOf(Root), UeNameOf(&Declarer, Name(Root)), 0, Where, BP, &Out.Chain.back(), Err)) return false;
     std::string Path = Name(Root);
-    for (const Json* Step : Steps)
+    /* One element of a TMap or TSet: `Score["a"] = 1` (the last step a map's key), `Score.Add("a", 1)`, `Ids.Add(7)`,
+       `X.Remove(Key)` (Rhs the call). */
+    const Json* Key = nullptr;
+    const Json* Value = nullptr;
+    const Json *Container = nullptr, *Call = nullptr;
+    if (Rhs && ElementCall(*Rhs, Container, Call))
     {
+        Out.Op = Name(*Strip(First(*Call))) == "Remove" ? FEditDef::Remove : FEditDef::Add;
+        Key = Nth(*Call, 1);
+        Value = Out.Op == FEditDef::Add ? Nth(*Call, 2) : nullptr;
+    }
+    for (size_t S = 0; S < Steps.size(); ++S)
+    {
+        const Json* Step = Steps[S];
         FConstVal I;
         const Json* Index = Kind(*Step) == "MemberExpr" ? nullptr : Nth(*Step, 2);
+        if (Index && Out.Chain.back().Type == "MapProperty")
+        {
+            Path += "[...]";
+            if (S + 1 != Steps.size() || Out.Op != FEditDef::Assign)
+            { *Err = Where + ": " + Path + ": a map's value is assigned whole, `Map[Key] = value;`"; return false; }
+            Out.Op = FEditDef::Put;
+            Key = Index;
+            Value = Rhs;
+            break;
+        }
         Path += Index ? "[" + (FoldConst(*Index, I) ? std::to_string(I.I) : std::string("...")) + "]" : "." + Name(*Step);
         FPropertyDef Reached;
         if (!EditStep(*Step, Out.Chain.back(), Where + ": " + Path, BP, Out.Path.emplace_back(), Reached, Err)) return false;
         Out.Chain.push_back(std::move(Reached));
+    }
+    if (Out.Op != FEditDef::Assign)
+    {
+        FPropertyDef& C = Out.Chain.back();
+        const bool bMap = C.Type == "MapProperty" && C.Value;
+        if ((!bMap && C.Type != "SetProperty") || !C.Inner || !Key || (Out.Op != FEditDef::Remove && bMap && !Value))
+        { *Err = Where + ": " + Path + ": an element is a TMap's or a TSet's"; return false; }
+        /* Through members of structs written as tags alone: an element is merged into the value the object holds. */
+        for (const FValueStep& Step : Out.Path)
+            if (!Step.IsTaggedMember())
+            {
+                *Err = Where + ": " + Path + ": an element of a map or set inside an array's element or a native struct "
+                       "cannot be changed on its own yet; assign the whole element";
+                return false;
+            }
+        const Json& Decl = Steps.empty() ? Root : *Steps.back();
+        C.Default = FDefaultValue{};
+        C.Default.K = FDefaultValue::Array;
+        for (const auto& [Def, E] : { std::pair<const FPropertyDef*, const Json*>{ C.Inner.get(), Key }, { C.Value.get(), Value } })
+        {
+            if (!E) continue;
+            FPropertyDef Element = *Def;
+            if (!LowerDefault(Decl, Element, BP, Err, Strip(E), /*bKeepZero=*/true)) return false;
+            C.Default.Items.push_back(Element.Default);
+            C.Default.Items.back().Members = Element.Members;      // a struct element's members travel with it
+        }
+        return true;
     }
     if (!LowerDefault(Steps.empty() ? Root : *Steps.back(), Out.Chain.back(), BP, Err, Rhs, /*bKeepZero=*/true)) return false;
     if (Out.Chain.back().Default.K == FDefaultValue::None) { *Err = Where + ": " + Path + " needs a literal value"; return false; }
@@ -15314,7 +15684,8 @@ bool FCompiler::GenerateAssetEdits(const Json& Block, std::string* Err)
         if (!AssetPath(S, Asset, Root, Rhs, Steps) || !Asset->contains("referencedDecl"))
         {
             *Err = Where + ": every statement assigns an asset's member, or part of one: `Asset.Member = value;`, "
-                   "`Asset.Member[2].Field = value;`";
+                   "`Asset.Member[2].Field = value;`, or changes one element of a map or set: `Asset.Map[Key] = value;`, "
+                   "`Asset.Set.Add(Item);`, `Asset.Map.Remove(Key);`";
             bOk = false;
             return;
         }
@@ -15911,6 +16282,7 @@ bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object,
     };
     for (FEditDef& E : Edits)
     {
+        if (E.Op != FEditDef::Assign) continue;         // merged into the object's own value below
         std::vector<std::string> Path{ E.Chain[0].Name };
         bool bTagged = true;
         for (const FValueStep& S : E.Path)
@@ -15932,8 +16304,7 @@ bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object,
     auto Bytes = [&](const auto& Write) { FArc Ar(&Sink); Write(Ar); return Ar.B; };
     std::vector<std::vector<std::vector<uint8>>> Fresh(Edits.size());
     std::vector<std::vector<uint8>> Leaf(Edits.size());
-    for (size_t I = 0; I < Edits.size(); ++I)
-    {
+    auto Encode = [&](size_t I) {
         const FEditDef& E = Edits[I];
         const size_t N = E.Path.size();
         Fresh[I].resize(N + 1);
@@ -15953,7 +16324,9 @@ bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object,
                 Fresh[I][K] = Bytes([&](FArc& Ar) { WriteDefaultTag(Ar, Tree); TagEnd(Ar); });
         }
         if (N && !E.Path.back().IsTaggedMember()) Leaf[I] = Bytes([&](FArc& Ar) { WriteDefaultValue(Ar, E.Chain[N]); });
-    }
+    };
+    for (size_t I = 0; I < Edits.size(); ++I)
+        if (Edits[I].Op == FEditDef::Assign) Encode(I);
     for (size_t I = P.Names.size(); I < Sink.NameTable().size(); ++I) P.Names.push_back({ Sink.NameTable()[I] });
 
     /* In statement order, so a later assignment lands on what an earlier one wrote. */
@@ -15961,6 +16334,15 @@ bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object,
     bool bWhole = true;
     for (size_t I = 0; I < Edits.size(); ++I)
     {
+        if (Edits[I].Op != FEditDef::Assign && !MergeElement(P, Export, Edits[I], Where, Err)) return false;
+        if (Edits[I].Op != FEditDef::Assign)
+        {
+            Texts.clear();
+            for (const FCookedName& N : P.Names) Texts.push_back(N.Text);
+            Sink.SeedNames(Texts);
+            Encode(I);
+            for (size_t K = P.Names.size(); K < Sink.NameTable().size(); ++K) P.Names.push_back({ Sink.NameTable()[K] });
+        }
         if (Edits[I].Path.empty())
         {
             std::vector<FTag> Tags;
@@ -15980,6 +16362,80 @@ bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object,
     Ed->Objects.push_back(Object + " (" + std::to_string(Edits.size()) + (Edits.size() == 1 ? " assignment)" : " assignments)"));
     for (const std::string& D : Dropped)
         Ed->Objects.push_back(D + " (its cooked instancing data for " + Object + " no longer valid: it did not list the edit)");
+    return true;
+}
+
+/*
+S38: an element of a TMap or TSet put, added or removed (Edit.Op), as the set or map the path names in export row Export
+of P stands: its tag, whole. That tag is a delta over the archetype's value (removed keys, then the elements added or
+changed: PropertySet.cpp 285-358, PropertyMap.cpp 316-400), so the element is merged into it: a put or an add replaces
+the element of that key, else is added after the rest (a set's element already there stays); a remove drops it from the
+added ones and lists the key as removed, which takes the archetype's out too and is harmless where it has none. Where
+the object has no tag of the value, it holds the archetype's whole, and the delta of the one element is all the tag
+says. Keys compare as LastValuePerKey compares them. Edit's last def becomes the merged value, for ApplyEdit to write.
+*/
+bool FCompiler::MergeElement(const FCookedPackage& P, int32 Export, FEditDef& Edit, const std::string& Where, std::string* Err) const
+{
+    FPropertyDef& Want = Edit.Chain.back();
+    /* The tag there, through the members of structs written as tags (EditAssignment refuses any other path). */
+    std::vector<FTag> Tags;
+    size_t At = 0;
+    if (!ReadTags(P, P.Exports[size_t(Export)].Payload, At, Tags)) { *Err = Where + ": the object's tags do not read"; return false; }
+    const FTag* Found = nullptr;
+    std::vector<FTag> Inside;
+    for (size_t K = 0; K <= Edit.Path.size(); ++K)
+    {
+        const std::string& Member = K == 0 ? Edit.Chain[0].Name : Edit.Path[K - 1].Member;
+        const auto It = std::find_if(Tags.begin(), Tags.end(), [&](const FTag& T) { return T.ArrayIndex == 0 && P.SameName(T.Name, Member); });
+        Found = It == Tags.end() ? nullptr : &*It;
+        if (!Found || K == Edit.Path.size()) break;
+        Inside.clear();
+        At = 0;
+        if (!ReadTags(P, Found->Value, At, Inside)) { *Err = Where + ": " + Member + " is not a struct written as tags"; return false; }
+        Tags = std::move(Inside);
+    }
+    FPropertyDef Had;
+    std::string Why;
+    if (Found && !ReadTagValue(P, *Found, Had, &Why))
+    { *Err = Where + ": " + Want.Name + ": the value the object holds does not read (" + Why + "), so an element cannot be merged into it"; return false; }
+    if (!Found)
+    {
+        Had = Want;
+        Had.Default = FDefaultValue{};
+        Had.Default.K = FDefaultValue::Array;
+    }
+    const bool bMap = Had.Type == "MapProperty" && Had.Value;
+    if (!Had.Inner || (Had.Type != "MapProperty" && Had.Type != "SetProperty"))
+    { *Err = Where + ": " + Want.Name + " holds a " + Had.Type + " there, not a map or a set"; return false; }
+
+    FPackage Scratch("/Scratch");
+    Scratch.SeedNames({});
+    auto KeyOf = [&](const FDefaultValue& V) {
+        FPropertyDef E = *Had.Inner;
+        E.Default = V;
+        if (E.Type == "StrProperty") E.Default.S = Lower(V.S);
+        FArc A(&Scratch);
+        WriteDefaultValue(A, E);
+        return A.B;
+    };
+    std::vector<FDefaultValue>& Items = Had.Default.Items;
+    const std::vector<uint8> Key = KeyOf(Want.Default.Items[0]);
+    if (Edit.Op == FEditDef::Remove)
+    {
+        const size_t Step = bMap ? 2 : 1;
+        for (size_t I = 0; I + Step <= Items.size();)
+            if (KeyOf(Items[I]) == Key) Items.erase(Items.begin() + std::ptrdiff_t(I), Items.begin() + std::ptrdiff_t(I + Step));
+            else I += Step;
+        if (std::none_of(Had.Default.Removed.begin(), Had.Default.Removed.end(), [&](const FDefaultValue& R) { return KeyOf(R) == Key; }))
+            Had.Default.Removed.push_back(Want.Default.Items[0]);
+    }
+    else
+    {
+        Items.insert(Items.end(), Want.Default.Items.begin(), Want.Default.Items.end());
+        LastValuePerKey(Items, bMap, *Had.Inner);
+    }
+    Had.Name = Want.Name;
+    Want = std::move(Had);
     return true;
 }
 
@@ -19489,7 +19945,7 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         if (!GenerateEdit(Key, *Var, Err)) return false;
     for (const Json* Block : AssetEditBlocks)
         if (!GenerateAssetEdits(*Block, Err)) return false;
-    if (!SaveEdits(OutDir, Err)) return false;
+    if (!CheckAssetReads(Err) || !SaveEdits(OutDir, Err)) return false;
     if (Generated == 0 && RegistryRows.empty() && Edited.empty())
     { *Err = "the source declares no UE_STRUCT, UE_ENUM, class deriving from a UE class, asset or edit"; return false; }
     if (!GenerateNestedWrappers(OutDir, Err)) return false;

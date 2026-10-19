@@ -842,7 +842,9 @@ in a function body.
 A game asset is named with `UE_ASSET_AT(Class, Name, "/Game/Path/Package")`, after which `&Name` points at it as well.
 The UeAssets headers (see [The SDK](#the-sdk)) declare the game's assets this way, in namespaces that follow their
 folders: `&UeAssets::UEnemyDescriptor::Game::Enemies::Spider::Grunt::ED_Spider_Grunt`. A game asset's values are read at
-run time, through the pointer.
+run time, through the pointer, or when the mod is built: `ED_Grunt.SpawnSpread * 2` is the value the game's package
+holds, read off the extracted game pak (`--game`, bpbuild's `game_content`) and compiled in as a constant, in code or
+in a default.
 
 A `TSoftObjectPtr<T>` or `TSoftClassPtr<T>` holds a path and loads nothing with the class. Its default is the path as a
 string. `(T *)Soft` gives the object only if it is already loaded, and null otherwise. `UKismetSystemLibrary::LoadAsset`
@@ -872,6 +874,7 @@ class CaveRules : public AActor {
 public:
   void ReceiveBeginPlay() {
     Spread = (&ED_Grunt)->SpawnSpread;                        // a game asset's value, read at run time
+    Spread = ED_Grunt.SpawnSpread * 2;                        // the same, read when the mod is built (--game)
     IconObj = UKismetSystemLibrary::LoadAsset(Tuning->Icon);   // waits here until the texture loads
   }
 };
@@ -882,9 +885,12 @@ A data asset class declared in a header that several mods include needs an owner
 
 Watch for:
 
-- An asset is an object, not a C++ value. `CT_Hard.Waves` is refused ("CT_Hard is an asset, not a value: point at it
-  with &CT_Hard"). Write `(&CT_Hard)->Waves`, or keep a pointer. The same holds for game assets, whose values are not
-  available when the mod is built.
+- A mod's own asset is an object, not a C++ value. `CT_Hard.Waves` is refused ("CT_Hard is an asset, not a value:
+  point at it with &CT_Hard"). Write `(&CT_Hard)->Waves`, or keep a pointer.
+- A game asset's value read when the mod is built is the extracted pak's. One the asset leaves to its native class is
+  that class's C++ default, which no package holds, and is refused: read it through the pointer. After a game update,
+  extract the pak again; bpbuild rebuilds the mods that read a changed package. A value the mod's own edit changes is
+  refused, since the game loads the edited one.
 - An asset starts as its class's defaults, and its braces are written over them. Braces for an engine struct member
   such as `FHitResult` that leave a member out are refused, naming it, where the class's defaults give that member a
   value of their own (`H = {.Hit = {.FaceIndex = 3}}`): give it in the asset's braces too.
@@ -1148,7 +1154,7 @@ building a mod.
 | `<include-dir>` | The SDK's `UeApi` folder. It must hold `Conv.json`, `Ops.json`, `Types.json`, `Events.json` and `NotCallable.json`; otherwise the compile stops with `missing or invalid <dir>/<file> (run genueapi.py)`. Its `Version.json` must name a genueapi this compiler can use; a folder an older one wrote, or one without the file, stops the compile before clang runs, with `<dir> was written by an older genueapi (...) - regenerate it with AssetGen/tools/genueapi.py`. A folder with none of the three (no UeApi at all, or a path that does not exist) stops it with `missing or invalid <dir>/Conv.json (run genueapi.py)`. |
 | `<out-dir>` | Where the mod's own packages go. The compiler creates it, and the folder of every package it writes, when missing. |
 | `--api <api-dir>` | Optional, after the out dir. Also writes an editor stub for each class, interface, struct and enum into this folder (see [Editor API stubs](#editor-api-stubs)). It is an output folder for the editor, not the SDK folder. It must already exist: without it a class gets no stub and prints `<Class> -> no API asset: cannot write .uasset`, and a struct or enum fails the compile. |
-| `--game <folder /Game is in>` | Optional, after the out dir. The `Content` folder of the extracted game pak, which `UE_ASSET_EDIT`, `UE_ASSET_EDITS` and `UE_PATCH` read the game's packages from. Without it, an edit is refused. |
+| `--game <folder /Game is in>` | Optional, after the out dir. The `Content` folder of the extracted game pak, which `UE_ASSET_EDIT`, `UE_ASSET_EDITS` and `UE_PATCH` read the game's packages from, and a game asset's values read when the mod is built. Without it, an edit or such a read is refused. |
 
 **Parsing.** AssetGen runs `clang++` from `PATH` with `-std=c++20 -fsyntax-only` and reads the syntax tree that clang
 dumps as JSON. The include dir and its parent are both on the include path, so `#include "Engine.h"` and
@@ -1169,6 +1175,7 @@ hundreds of MB; it streams from clang through a pipe and is never written to dis
 | `FDerefView_<Struct>`, the view a whole struct is read and written through | when the source reads or writes that struct whole through a pointer |
 | two structs per map type walked in place, `FMapSlot_TMap_<K>_<V>` and `FMapSlots_TMap_<K>_<V>`, and a wrapper struct per container nested in another container | when the code needs one |
 | each game package an edit names, at its own path, printed as `edit -> <package>.uasset (the game's, edited: ...)` | when the source has a `UE_ASSET_EDIT`, `UE_ASSET_EDITS` or `UE_PATCH` |
+| nothing; a line `value <- <package> (<path> = <value>, read when the mod is built)` for each game asset's value read | when the source reads one, `ED_Grunt.SpawnSpread`; bpbuild keeps the list in `build/<mod>/reads.txt` |
 
 It prints one line per package and one for the registry. Compiled into the bpbuild layout, a source with one class
 prints:
@@ -1955,9 +1962,9 @@ each topic.
 
 **Refused with a message.** The compile stops, and the section linked says what to write instead.
 
-- A game asset's values as build-time constants. The `UeAssets` headers name every asset but hold none of its values.
-  Read a value in the game through the asset's pointer, `(&UeAssets::...::ED_Spider_Grunt)->SpawnAmountModifier`. See
-  [Game assets](REFERENCE.md#game-assets).
+- A game asset's value that it leaves to a native class, `ED_Spider_Grunt.SpawnAmountModifier`, as a build-time
+  constant. It is the class's C++ default, which no package holds. Read it in the game through the asset's pointer,
+  `(&ED_Spider_Grunt)->SpawnAmountModifier`. See [Game assets](REFERENCE.md#game-assets).
 
 **Compiled with no message, but wrong.** Nothing catches these yet, so avoid them.
 

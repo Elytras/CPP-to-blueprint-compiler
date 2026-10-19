@@ -244,6 +244,20 @@ def staged_edits(stage_fsd, stage_content, game_dir):
     return out
 
 
+def value_reads(out):
+    """The game packages a compile read values off when the mod was built: each `value <- <package>` line it printed."""
+    return sorted(set(re.findall(r"^  value +<- (\S+)", out, re.M)))
+
+
+def read_files(reads_file, game_dir):
+    """The game's files of the packages reads_file lists (value_reads, one a line), as game_content holds them now."""
+    if not game_dir or not os.path.exists(reads_file):
+        return []
+    return [os.path.join(game_dir, *p[len("/Game/"):].split("/")) + ext
+            for p in read_text(reads_file).split() for ext in (".uasset", ".uexp", ".umap")
+            if os.path.exists(os.path.join(game_dir, *p[len("/Game/"):].split("/")) + ext)]
+
+
 def run_compile(cmd):
     """One assetgen compile, on a pool thread. Its output is captured, for the caller to print in build order."""
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
@@ -439,11 +453,14 @@ def main():
         # The stamp sits beside FSD, not in it: the pak takes the whole FSD tree.
         settings = mod_settings(mod, config)
         settings_file = os.path.join(bp, "build", name, "mod.json")
+        # A value the compile read off a game package is baked into the mod: a newer game copy restales it too.
+        reads_file = os.path.join(bp, "build", name, "reads.txt")
         inputs_time = max(newest(sources), toolchain_time)
         stale = (force or not outputs or api_missing
                  or read_text(settings_file) != settings
                  or inputs_time > oldest(outputs)
-                 or any(os.path.getmtime(g) > os.path.getmtime(s) for s, g in edits))
+                 or any(os.path.getmtime(g) > os.path.getmtime(s) for s, g in edits)
+                 or newest(read_files(reads_file, game_dir)) > oldest(outputs))
         job = None
         if stale:
             # The pak takes the whole FSD tree, so the whole Content tree goes, not just this package's folder:
@@ -500,6 +517,12 @@ def main():
                     for f in staged_assets(api_contents[0]):
                         shutil.copy2(f, os.path.join(api_dir, os.path.basename(f)))
                 write_api_manifest(api_dir)
+            reads = value_reads(out)
+            reads_file = os.path.join(bp, "build", name, "reads.txt")
+            if reads:
+                io.open(reads_file, "w", encoding="utf-8", newline="\n").write("\n".join(reads) + "\n")
+            elif os.path.exists(reads_file):
+                os.remove(reads_file)
             # Stamped only once it compiled, so a failed compile stays stale; and only when no source was saved while
             # it compiled (an editor's save, widgetloop --watch), which the assets, newer than that save, would hide.
             if max(newest(mod_sources(mod, bp)), toolchain_time) == inputs_time:

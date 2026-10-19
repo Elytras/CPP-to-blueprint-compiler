@@ -3687,7 +3687,12 @@ path is not checked when the mod is built, so a wrong path compiles.
 | `"/Game/Dir/Package.Object"` | Names an object whose name is not its package's. In the game's content the difference is mostly letter case. | Yes |
 | `UE_ASSET_AT(UEnemyDescriptor, Spider, ...)` in two namespaces | Two different assets: an asset is keyed by its qualified name. | Yes |
 | `(&ED_Spider_Grunt)->SpawnAmountModifier` | Reads the game asset's value when the game runs. | Yes |
-| `ED_Spider_Grunt.SpawnAmountModifier * 2` | Not yet: the SDK names game assets but carries none of their values, so a value cannot be used when the mod is built. Refused with "is an asset, not a value". Read the value at run time through the pointer. | Not yet |
+| `ED_Spider_Grunt.SpawnSpread * 2`, `ED_Spider_Grunt.SpawnRarityModifiers[1].Rarity` | A member read by value is the value the asset's package holds, read when the mod is built off the extracted game pak (`--game`; bpbuild: `game_content`), and a constant there: in code, and in a default. A number, a bool, an enum, a name or a string. A step is `.Member` or a `TArray`'s `[i]`, as in `UE_ASSET_EDITS`. A member the asset has no value of is its archetype's, its class's default object, followed through the game's packages; a Blueprint class's own variable that its default object leaves out is zero. The SDK carries no values, so none can go stale with it. The compile prints each value it reads, `value <- <package> (<path> = <value>, ...)`, and bpbuild rebuilds a mod when the game's copy of a package it read is newer, after a re-extract. | Yes |
+| `ED_Spider_Grunt.SpawnAmountModifier`, a member the asset leaves to a native class | Refused: "sets no value of its own, so it holds EnemyDescriptor's C++ default, which no package holds". That value is the C++ constructor's, in the game's code. Read it when the game runs, `(&ED_Spider_Grunt)->SpawnAmountModifier`. | Refused |
+| a member whose type UeApi gives otherwise than the package, an enumerator UeApi's enum lacks | Refused: "the game's package holds a FloatProperty there, where UeApi declares a IntProperty: regenerate UeApi from the same game build as the extracted pak". A stale SDK never compiles in a value it misreads. | Refused |
+| a reference, a text, a map's value, an element past the end of the game's array, an asset of a mod pak | Refused, each with its reason ("only a number, a bool, an enum, a name or a string is read when the mod is built", "the game's array has 0 elements", "is not in <game folder>"). Read it when the game runs, through the pointer. | Refused |
+| a value that this mod's own `UE_ASSET_EDIT` or `UE_ASSET_EDITS` changes | Refused: "this mod's edit changes the value read when the mod is built". The game loads the edited value. | Refused |
+| a value read without `--game` | Refused: "a game asset's value is read off its package when the mod is built: pass the folder /Game is in". | Refused |
 | `&OtherData`, another mod's asset of a class that a shared header declares without `UE_CLASS` | Refused: each mod that includes the header cooks its own copy of the class, so the reference "would load as null". The message prints the `UE_CLASS` line that pins the class to its owner; see [Mod sources and packages](#mod-sources-and-packages). | Refused |
 | changing a game data asset, or a game Blueprint's defaults or functions, in the pak | `UE_ASSET_EDIT`, `UE_ASSET_EDITS` and `UE_PATCH`: see [Editing game packages](#editing-game-packages). | Yes |
 
@@ -3709,12 +3714,15 @@ public:
   UEnemyDescriptor *B = &Spiders::Exploder::Spider;
 
   float Modifier() { return (&ED_Spider_Grunt)->SpawnAmountModifier; } // read when the game runs
+  float Spread() { return ED_Spider_Grunt.SpawnSpread * 2; }             // read when the mod is built (--game)
 };
 ```
 
 Notes:
 
 - A wrong path compiles, and the reference can then only load as null.
+- A value read when the mod is built is the game's as the extracted pak holds it. After a game update, extract the pak
+  again; bpbuild then rebuilds every mod that read a changed package. A lone `assetgen compile` does not check.
 - Inside a namespace that has the class's name, as in the `UeAssets` headers, spell the class `::UEnemyDescriptor`.
 - The unpinned-class check looks only at a `UE_ASSET_AT` the source uses, and not at an asset the same source
   defines.
@@ -3810,7 +3818,8 @@ the game's. The rule to remember: an edit starts from the game's own package, so
 | `UE_ASSET_EDIT` and `UE_ASSET_EDITS` of one asset in one source | Both land in the one edited package. | Yes |
 | `PrimaryActorTick.bCanEverTick = true`, a path into a member the object has no value of | The object takes that member from its class (its archetype), so the new value holds only the path, and the engine fills in the rest. This works through members of structs written as tags. Through a native struct (FVector, FRotator, ...) or an array element, the value's other parts are unknown when the mod is built: refused with "is not set on". Assign the whole member. | Yes |
 | `Points[2].X = 1.0f` on an array of two | Refused: "Points has 2 elements". | Refused |
-| `Score["a"] = 1`, an element of a `TMap` or `TSet` | Not yet: refused with "only a TArray's element can be assigned on its own; assign the whole map". Assign the whole container. | Not yet |
+| `UE_ASSET_EDITS { Def.Score["a"] = 1; Def.Ids.Add(7); Def.Score.Remove("b"); }` | One element of a `TMap` or `TSet` put, added or removed, as C++'s `operator[]`, `Add` and `Remove` leave the container: merged into the value the asset holds, so its other elements stay. The tag is a delta over the archetype's value, so a key removed is listed as removed, and an asset with no value of its own gets a tag of the one element. An FString key compares without case. A path through members of structs written as tags reaches one too (`Def.Held.Score["a"] = 1`), and so does a patch's `UE_DEFAULTS`. | Yes |
+| `Def.Arr[0].Score["a"] = 1`, `Def.Score["a"].X = 1` | Refused: a map inside an array's element or a native struct "cannot be changed on its own yet; assign the whole element"; a map's value "is assigned whole, `Map[Key] = value;`". | Refused |
 | `UE_ASSET_EDIT(MD_Big) {...}`, an asset the mod cooks itself | Refused: "the target is a UE_ASSET_AT ...; a mod's own asset takes its values where it is declared". Set the value in the asset's own braces. | Refused |
 | any edit without `--game` | Refused: "an edit starts from the game's own package: pass the folder /Game is in". | Refused |
 
@@ -3846,6 +3855,7 @@ its `UE_DEFAULTS` and methods are written into that Blueprint's own package.
 | a parent Blueprint's component that this Blueprint does not override | Not yet: the package has no template of it to edit. Refused with "the class does not override that inherited component". Patch the Blueprint that declares the component, which changes every child that does not override it too. | Not yet |
 | `Loose->bVisible = false;`, a member that is no component of the Blueprint | Refused: "Loose is not one of <Class>'s components (UeApi gives it no SCS node)". | Refused |
 | `PrimaryActorTick.bCanEverTick = true;`, `MeleeAttack->Montages[0] = &ANIM_Attack;` | Paths into a value, by the rules of `UE_ASSET_EDITS` above. | Yes |
+| `Score["a"] = 9;`, `Ids.Add(7);`, `Score.Remove("b");` | One element, merged into the default object's value as in `UE_ASSET_EDITS` above. | Yes |
 | `Ids = {7};`, `Score = {{"a", 9}};` on a `TSet` or `TMap` | The default object loads exactly that value: the elements the parent's value has and this one drops are written as removed, as the cook writes a set or map. `Ids = {}` empties it. The same holds for one inside a struct, by path or in a whole struct. A key given twice holds the last value, and an FString key compares without case. | Yes |
 | `class Tweaks : public AActor { UE_PATCH; ... };` | Refused: "a patch derives from the game Blueprint it edits (a class in a /Game package); a native class's defaults come from its C++ constructor, not from a package". | Refused |
 | `int32 Extra;` or an interface in a patch | Not yet: refused with "a member or an interface of its own is not built yet". | Not yet |
@@ -5947,11 +5957,9 @@ and where the feature is described. In each group, the messages you are most lik
   type could take as its default, or fill the container in ReceiveBeginPlay. See
   [Classes and variables](#classes-and-variables).
 - `<Name> is an asset, not a value: point at it with &<Name>`: a function uses a namespace-scope variable of a UObject
-  class by value. That is a game asset named with UE_ASSET_AT, a braced data asset of the mod, or a variable such as
-  `UMoodDef GlobalDef;`. For example, with
-  `UE_ASSET_AT(UEnemyDescriptor, ED_Grunt, "/Game/Enemies/Spider/Grunt/ED_Spider_Grunt");`, the read
-  `ED_Grunt.SpawnSpread` is refused. Reading a game asset's values when the mod is built is Not yet, and is refused
-  with this message. Fix: take the address, `(&ED_Grunt)->SpawnSpread`, or keep `&ED_Grunt` in a
+  class by value. That is a braced data asset of the mod (`CT_Hard.Waves`), a variable such as `UMoodDef GlobalDef;`,
+  or a game asset named with UE_ASSET_AT used whole rather than through a member (a member of one is read when the mod
+  is built, see [Game assets](#game-assets)). Fix: take the address, `(&CT_Hard)->Waves`, or keep `&CT_Hard` in a
   pointer member. Instead of a variable of your own, declare a braced data asset or name an existing asset with
   UE_ASSET_AT. See [Global variables](#global-variables), [Data assets](#data-assets) and [Game assets](#game-assets).
 - `<Class> and <Other> would both be cooked as <Package>`: two classes land on one package. Package names are compared
@@ -6666,9 +6674,34 @@ so the retail game prints nothing. See [Strings and text](#strings-and-text) and
   element, whose other parts are unknown here: assign the whole of <Member>`: the object has no value of the member,
   so the rest of a native struct or an element around the path is unknown. Fix: assign the whole member. See
   [Editing game packages](#editing-game-packages).
-- `<Where>: <Path>: only a TArray's element can be assigned on its own; assign the whole map` (or `set`, or `value`):
-  a path step `[...]` into a `TMap`, a `TSet` or a value that is no array. Fix: assign the whole container. See
+- `<Where>: <Path>: only a TArray's element can be assigned on its own; assign the whole value`: a path step `[...]`
+  into a value that is no array. Fix: assign the whole value. See [Editing game packages](#editing-game-packages).
+- `<Where>: <Path>: a map's value is assigned whole, `` `Map[Key] = value;` ``: a path past a map's key,
+  `Score["a"].X = 1`. Fix: assign the element's whole value. See [Editing game packages](#editing-game-packages).
+- `<Where>: <Path>: an element of a map or set inside an array's element or a native struct cannot be changed on its
+  own yet; assign the whole element`: `Arr[0].Score["a"] = 1`. Fix: assign the array's whole element. See
   [Editing game packages](#editing-game-packages).
+- `<Where>: <Member>: the value the object holds does not read (<why>), so an element cannot be merged into it`: the
+  game's map or set is in a form AssetGen's reader does not hold (a struct key written natively, ...). Fix: assign the
+  whole container. See [Editing game packages](#editing-game-packages).
+- `<Asset>.<Path>: the game's <Object> sets no value of its own, so it holds <Class>'s C++ default, which no package
+  holds; read it when the game runs, through (&<Asset>)`: a member read when the mod is built that the asset, and its
+  archetypes up to a native class, leave unset. Fix: read it at run time, `(&Asset)->Member`. See
+  [Game assets](#game-assets).
+- `<Asset>.<Path>: the game's package holds a <Type> there, where UeApi declares a <Type>: regenerate UeApi from the
+  same game build as the extracted pak` (and `the game's value is <E::Name>, which UeApi's <E> does not declare`): the
+  SDK and the extracted pak come from different game builds. Fix: regenerate UeApi, or extract the pak again. See
+  [Game assets](#game-assets).
+- `<Asset>.<Path>: only a number, a bool, an enum, a name or a string is read when the mod is built, and this is a
+  <Type>; read it when the game runs, through (&<Asset>)`, `<Asset>.<Path>: the game's array has <N> elements`,
+  `<Asset>.<Path>: <Package> is not in <folder> (an asset of a mod pak has no package there)`: a value that cannot be
+  read when the mod is built. Fix: read it at run time through the pointer. See [Game assets](#game-assets).
+- `<Asset>.<Path>: this mod's edit changes the value read when the mod is built, and the game loads the edited one:
+  read it when the game runs, through the asset's pointer, or use the edit's value itself`. Fix: as it says. See
+  [Game assets](#game-assets).
+- `<Asset>.<Path>: a game asset's value is read off its package when the mod is built: pass the folder /Game is in
+  (assetgen compile --game <extracted pak>/FSD/Content; bpbuild: game_content in mods.yaml)`. Fix: pass it. See
+  [Game assets](#game-assets).
 - `<Class> (UE_PATCH): a patch derives from the game Blueprint it edits (a class in a /Game package); a native class's
   defaults come from its C++ constructor, not from a package`: a patch of an engine or game C++ class. Fix: patch a
   game Blueprint, or derive a class of your own. See [Editing game packages](#editing-game-packages).
