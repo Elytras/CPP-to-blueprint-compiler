@@ -16,7 +16,14 @@ constexpr int32 kFNameSize = 12;    // sizeof(FScriptName): the in-memory byteco
 
 /* ---- properties ---- */
 
+/* A Blueprint real: a double under UE5's large world coordinates (S40), as the editor makes every float variable. */
 FPropertyDef FloatParam(const std::string& Name, uint64 ExtraFlags)
+{
+    return FPropertyDef{ IsUE5() ? "DoubleProperty" : "FloatProperty", Name, RF_Public, 1, IsUE5() ? 8 : 4,
+                         CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, Null() };
+}
+
+FPropertyDef SingleParam(const std::string& Name, uint64 ExtraFlags)
 {
     return FPropertyDef{ "FloatProperty", Name, RF_Public, 1, 4,
                          CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly | ExtraFlags, Null() };
@@ -234,6 +241,7 @@ void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
         if (P.Type == "IntProperty") V.I32(int32(D.I));
         else if (P.Type == "BoolProperty") V.U8(bSet && D.I != 0 ? 1 : 0);     // an element; a bool member is its tag
         else if (P.Type == "FloatProperty") { const float F = float(D.F); V.Raw(&F, 4); }
+        else if (P.Type == "DoubleProperty") V.Raw(&D.F, 8);
         else if (P.Type == "Int64Property") V.I64(D.I);
         else if (P.Type == "EnumProperty") V.Name(D.K == FDefaultValue::Str ? D.S : P.EnumZero);
         else if (P.Type == "ByteProperty") { if (P.StructName.empty()) V.U8(uint8(D.I)); else V.Name(D.K == FDefaultValue::Str ? D.S : P.EnumZero); }   // an enum byte is its enumerator's name
@@ -342,6 +350,12 @@ int32 NativeStructSize(const std::string& StructName)
         { "Plane", 16 }, { "Matrix", 64 }, { "Color", 4 }, { "LinearColor", 16 }, { "IntPoint", 8 },
         { "IntVector", 12 }, { "Guid", 16 }, { "DateTime", 8 }, { "Timespan", 8 }, { "Box", 25 },
         { "Box2D", 17 }, { "FrameNumber", 4 } };
+    /* UE5's large world coordinates make the math structs' components doubles (S40): the rest keep their 4.27 size. */
+    static const std::map<std::string, int32> Lwc = {
+        { "Vector", 24 }, { "Vector2D", 16 }, { "Vector4", 32 }, { "Rotator", 24 }, { "Quat", 32 },
+        { "Plane", 32 }, { "Matrix", 128 }, { "Box", 49 }, { "Box2D", 33 } };
+    if (IsUE5())
+        if (const auto L = Lwc.find(StructName); L != Lwc.end()) return L->second;
     const auto N = Native.find(StructName);
     return N == Native.end() ? 0 : N->second;
 }
@@ -364,7 +378,7 @@ int32 FixedValueSize(const FPropertyDef& P)
     if (T == "BoolProperty") return 1;
     if (T == "IntProperty" || T == "FloatProperty" || T == "ObjectProperty" || T == "ClassProperty" || T == "InterfaceProperty")
         return 4;
-    if (T == "Int64Property" || T == "EnumProperty" || T == "NameProperty") return 8;
+    if (T == "Int64Property" || T == "DoubleProperty" || T == "EnumProperty" || T == "NameProperty") return 8;
     if (T == "ByteProperty") return P.StructName.empty() ? 1 : 8;
     if (T == "StructProperty") return NativeStructSize(P.StructName);
     return 0;
@@ -619,7 +633,15 @@ void FScript::ThreadJumps()
     }
 }
 
-void FScript::FloatConst(float Value)
+void FScript::FloatConst(double Value)
+{
+    if (!IsUE5()) { SingleConst(float(Value)); return; }
+    Op(EX_DoubleConst);
+    Ar.Raw(&Value, 8);
+    Memory += 8;
+}
+
+void FScript::SingleConst(float Value)
 {
     Op(EX_FloatConst);
     Ar.Raw(&Value, 4);

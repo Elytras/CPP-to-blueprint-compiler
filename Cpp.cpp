@@ -1049,9 +1049,12 @@ struct FArgIR
                  ObjConst, SoftPath, DynCast, Index, Delegate, InterfaceCtx, LatentInfo } K = Self;
     int32 I = 0;            // Int / Byte: the value; StructLit: the struct's size
     int64 I64 = 0;
-    float F = 0.0f;
+    double F = 0.0;         // Float: a Blueprint real, a double on UE5 (S40) and rounded to float when written for 4.27
     bool B = false;
     bool bWide = false;     // Str: emit EX_UnicodeStringConst
+    /* UE5 only (S40), where a Blueprint real is a double: Float, a constant for a native `float` parameter
+       (EX_FloatConst); Field / Member, a native 4-byte float property; any other, a value already a 4-byte float. */
+    bool bSingle = false;
     std::string S;          // Str: the literal; Field/Local/LocalOut/Member: the property name; Delegate: the bound function
     FIndex Owner;           // Field: declaring class; Member / StructLit: the struct; ObjConst / DynCast: the class (locals are owned by the function, resolved at emit)
     EExprToken LetOp = EX_Let;
@@ -1175,7 +1178,8 @@ FArgIR ConstArg(const Json& E)
 {
     FArgIR X;
     if (E.is_boolean())         { X.K = FArgIR::Bool;  X.B = E.get<bool>(); }
-    else if (E.is_number_float()) { X.K = FArgIR::Float; X.F = E.get<float>(); }
+    else if (E.is_number_float()) { X.K = FArgIR::Float; X.F = IsUE5() ? E.get<double>() : E.get<float>(); }
+    else if (E.is_object() && E.contains("float")) { X.K = FArgIR::Float; X.F = E["float"].get<float>(); X.bSingle = true; }
     else                        { X.K = FArgIR::Int;   X.I = E.get<int32>(); }
     return X;
 }
@@ -1207,6 +1211,7 @@ struct FCallIR
     std::shared_ptr<int32> Resume;      // __AwaitPoint__: receives the ubergraph offset the awaited event re-enters at
     bool bStrongOnFrame = false;        // its result is RF_StrongRefOnFrame, so a persistent frame holding it keeps it
     bool bFrameHeld = false;            // ... and nothing else does: see HeldProxies
+    bool bSingleResult = false;         // UE5: a native returning a 4-byte float, which a read converts to the real (S40)
     std::shared_ptr<FArgIR> Target;     // the object an instance call runs against; null = self
     std::vector<FArgIR> Args;
 };
@@ -1311,7 +1316,7 @@ bool EmitArg(FScript& S, const FArgIR& A, FIndex SelfExp, std::string* Err)
     case FArgIR::NullObj: if (A.CastOp == EX_NoInterface) S.NoInterface(); else S.NoObject(); return true;
     case FArgIR::Int:   S.IntConst(A.I); return true;
     case FArgIR::Int64: S.Int64Const(A.I64); return true;
-    case FArgIR::Float: S.FloatConst(A.F); return true;
+    case FArgIR::Float: if (A.bSingle) S.SingleConst(float(A.F)); else S.FloatConst(A.F); return true;
     case FArgIR::Bool:  A.B ? S.True() : S.False(); return true;
     case FArgIR::Byte:  S.ByteConst(uint8(A.I)); return true;
     case FArgIR::ObjConst: S.ObjectConst(A.Owner); return true;
@@ -1942,6 +1947,13 @@ private:
     bool LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     bool LowerArgRaw(const Json& N, const std::string& OuterType, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     bool ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgIR& Arg, std::string* Err);
+    /* S40, UE5 only: where the Blueprint real (a double) meets a native 4-byte float. */
+    bool IsSingleNative(const FRecord& R) const;
+    bool NativeParmIsSingle(const FRecord& Owner, const std::string& Method, size_t Index);
+    void ToSingle(FArgIR& A, FBlueprintClass& BP);
+    void ToReal(FArgIR& A, FBlueprintClass& BP);
+    bool SingleArg(const std::string& ParmType, const std::string& Fn, FBlueprintClass& BP, FArgIR& A, std::string* Err);
+    void SingleStores(std::vector<FStmtIR>& Stmts, FBlueprintClass& BP);
     bool LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     bool LowerMakeStruct(const std::string& Type, const Json* List, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     bool MakeTemp(const std::string& Type, FBlueprintClass& BP, std::string* Tmp, std::string* Err);
@@ -2317,6 +2329,7 @@ private:
     std::map<std::string, std::string> Aliases;       // a namespace-scope `using A = B;` / typedef: A -> B
     const FRecord* Cur = nullptr;                     // record Generate is working on
     std::set<std::string> CurrentOutParms;            // T& parm names of the function being lowered
+    std::set<std::string> SingleParms;                // UE5: its parameters a native parent makes 4-byte floats (S40)
     bool bCurNet = false;                             // the function being lowered is an RPC
     bool bCurNoOpt = false;                           // ... is UE_NO_OPTIMIZE: no drops, no && / || fold
     const Json* CurBody = nullptr;                    // the body LowerBody is walking: scope of the locals it declares
@@ -3891,7 +3904,25 @@ bool IsObjectType(const std::string& QualType)
     return !QualType.empty() && QualType.back() == '*';
 }
 
+/* S40: KismetMathLibrary's UE5 name for a 4.27 X_FloatFloat (X_DoubleDouble), from the UeApi's Version.json "math"; a
+   name UE5 kept (Percent_FloatFloat) is not in it. Empty for a 4.27 UeApi. */
+std::map<std::string, std::string> GRealMath;
+
+std::string RealMath(const std::string& Fn)
+{
+    const auto It = GRealMath.find(Fn);
+    return It == GRealMath.end() ? Fn : It->second;
+}
+
+std::string MathFuncFor427(const std::string& Op, const std::string& Flavour);
+
 std::string MathFuncFor(const std::string& Op, const std::string& Flavour)
+{
+    const std::string Fn = MathFuncFor427(Op, Flavour);
+    return Flavour == "FloatFloat" ? RealMath(Fn) : Fn;
+}
+
+std::string MathFuncFor427(const std::string& Op, const std::string& Flavour)
 {
     if (Flavour == "ObjectObject")
     {
@@ -3929,7 +3960,7 @@ EStrKind StrKindOf(const std::string& QualType)
     if (T == "FText")                                                 return SK_Text;
     if (T == "int" || T == "int32")                                   return SK_Int;
     if (IsInt64Type(T))                                               return SK_Int64;
-    if (T == "float")                                                 return SK_Float;
+    if (T == "float" || (IsUE5() && T == "double"))                   return SK_Float;     // S40: UE5's real
     if (T == "bool")                                                  return SK_Bool;
     if (T == "uint8" || T == "unsigned char")                         return SK_Byte;
     if (!T.empty() && T.back() == '*')                                return SK_Object;
@@ -4111,7 +4142,7 @@ bool FCompiler::ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgI
     if (ToKind == SK_Bool && (FromNum == SK_Int64 || (FromNum == SK_Float && Arg.K != FArgIR::Float) || FromNum == SK_Byte))
     {
         WrapInCall(Arg, BP.EngineFunction("/Script/Engine", "KismetMathLibrary", FromNum == SK_Int64 ? "NotEqual_Int64Int64"
-                                          : FromNum == SK_Float ? "NotEqual_FloatFloat" : "NotEqual_ByteByte"));
+                                          : FromNum == SK_Float ? RealMath("NotEqual_FloatFloat") : "NotEqual_ByteByte"));
         FArgIR Zero;
         Zero.K = FromNum == SK_Int64 ? FArgIR::Int64 : FromNum == SK_Float ? FArgIR::Float : FArgIR::Byte;
         Arg.Sub->Args.push_back(Zero);
@@ -4162,7 +4193,7 @@ bool FCompiler::ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgI
     if (Arg.K == FArgIR::Str && !Arg.bWide && ToKind == SK_Name) { Arg.K = FArgIR::Name; return true; }
     if (Arg.K == FArgIR::Str && ToKind == SK_Text) { Arg.K = FArgIR::Text; return true; }
     if (Arg.K == FArgIR::Int && ToKind == SK_Int64) { Arg.K = FArgIR::Int64; Arg.I64 = Arg.I; return true; }
-    if (Arg.K == FArgIR::Int && ToKind == SK_Float) { Arg.K = FArgIR::Float; Arg.F = float(Arg.I); return true; }
+    if (Arg.K == FArgIR::Int && ToKind == SK_Float) { Arg.K = FArgIR::Float; Arg.F = IsUE5() ? double(Arg.I) : float(Arg.I); return true; }
     if (Arg.K == FArgIR::Int && ToKind == SK_Bool)  { Arg.K = FArgIR::Bool;  Arg.B = Arg.I != 0; return true; }
     if (Arg.K == FArgIR::Float && ToKind == SK_Bool) { Arg.K = FArgIR::Bool; Arg.B = Arg.F != 0; return true; }
     if (Arg.K == FArgIR::Int && ToKind == SK_Byte)  { Arg.K = FArgIR::Byte; return true; }
@@ -4207,6 +4238,70 @@ bool FCompiler::ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgI
     if (Structs.count(From) && Structs.count(To)) return true;
     *Err = "no Kismet conversion from " + From + " to " + To;
     return false;
+}
+
+/*
+S40, UE5 only. A Blueprint real is a double there (LWC), so a mod's float is one, but an engine function, property or event
+parameter declared `float` is still a 4-byte FloatProperty, which no double may be stepped into (the VM copies the
+property's own size). Where the two meet, the value goes through KismetMathLibrary's Conv_DoubleToFloat or
+Conv_FloatToDouble, as the editor's implicit casts do, and a constant for a float slot is an EX_FloatConst. Only
+/Script/ classes: a Blueprint's own reals are doubles, and a mod's UE_CLASS spells them float.
+*/
+bool FCompiler::IsSingleNative(const FRecord& R) const
+{
+    return IsUE5() && R.IsNative() && R.UePackage.compare(0, 8, "/Script/") == 0;
+}
+
+/* Whether parameter Index of Owner's Method overrides a native one declared float (AActor::ReceiveTick's DeltaSeconds). */
+bool FCompiler::NativeParmIsSingle(const FRecord& Owner, const std::string& Method, size_t Index)
+{
+    for (const FRecord* A = Owner.Base.empty() ? nullptr : Find(Owner.Base); A; A = A->Base.empty() ? nullptr : Find(A->Base))
+    {
+        const auto M = A->Methods.find(Method);
+        if (M == A->Methods.end()) continue;
+        if (!IsSingleNative(*A)) return false;
+        const Json* P = ParmDeclAt(*M->second, Index);
+        return P && StripTypeKeywords(ParmTypeOf(*P)) == "float";
+    }
+    return false;
+}
+
+void FCompiler::ToSingle(FArgIR& A, FBlueprintClass& BP)
+{
+    if (A.bSingle) return;
+    if (A.K == FArgIR::Float) { A.bSingle = true; return; }
+    WrapInCall(A, BP.EngineFunction("/Script/Engine", "KismetMathLibrary", "Conv_DoubleToFloat"));
+    A.InnerType = "float";
+    A.bSingle = true;
+}
+
+/* A value just read: a native float made the real. */
+void FCompiler::ToReal(FArgIR& A, FBlueprintClass& BP)
+{
+    const bool bSingle = ((A.K == FArgIR::Field || A.K == FArgIR::Member) && A.bSingle)
+                      || (A.K == FArgIR::Call && A.Sub && A.Sub->bSingleResult)
+                      || (A.K == FArgIR::Local && SingleParms.count(A.S));
+    if (!bSingle) return;
+    const std::string Type = A.InnerType;
+    WrapInCall(A, BP.EngineFunction("/Script/Engine", "KismetMathLibrary", "Conv_FloatToDouble"));
+    A.InnerType = Type;
+}
+
+/* An argument for a native parameter of ParmType: a float one takes a 4-byte float. */
+bool FCompiler::SingleArg(const std::string& ParmType, const std::string& Fn, FBlueprintClass& BP, FArgIR& A, std::string* Err)
+{
+    std::string T = ParmType;
+    const bool bRef = !T.empty() && T.back() == '&';
+    while (!T.empty() && (T.back() == '&' || T.back() == ' ')) T.pop_back();
+    if (StripTypeKeywords(T) != "float") return true;
+    if (bRef && T.compare(0, 6, "const ") != 0)
+    {
+        *Err = Fn + ": TODO: a native float& parameter on UE5, where the mod's float is a double (S40); pass a struct "
+               "or call a function that returns the value";
+        return false;
+    }
+    ToSingle(A, BP);
+    return true;
 }
 
 /* Engine structs whose default constructor sets nothing (`FVector() {}`, Vector.h 1243; Vector2D.h 47, Rotator.h 63,
@@ -4313,7 +4408,10 @@ bool FCompiler::LowerStructLiteral(const Json& CtorNode, const FStructInfo& SI, 
     Out.Sub = std::make_shared<FCallIR>();
     std::vector<FArgIR> Given(Args.size());
     for (size_t I = 0; I < Args.size(); ++I)
+    {
         if (!LowerArg(*Args[I], BP, Given[I], Err)) return false;
+        if (IsUE5() && StripTypeKeywords(SI.Fields[I].first) == "float") ToSingle(Given[I], BP);
+    }
     const std::vector<size_t> Order = StructConstOrder(SI);
     /* First we see whether EX_StructConst can take the members as they are. execLet hands it the destination's own
        address and it steps each member straight in (ScriptCore.cpp 2647-2686, 3376-3405), so `V = {V.Y, V.X}` would
@@ -4357,6 +4455,7 @@ bool FCompiler::LowerStructByMembers(const std::string& Type, const FStructInfo&
         Set.Var.S = DeclRec ? UeNameOf(DeclRec, SI.Fields[I].second) : SI.Fields[I].second;
         Set.Var.Owner = BP.ScriptStruct(Decl->Package, Decl->UeName);
         Set.Var.LetOp = LetOpFor(SI.Fields[I].first);
+        Set.Var.bSingle = IsUE5() && StripTypeKeywords(SI.Fields[I].first) == "float";
         Set.Var.Base = std::make_shared<FArgIR>();
         Set.Var.Base->K = FArgIR::Local;
         Set.Var.Base->S = Tmp;
@@ -4575,6 +4674,7 @@ bool FCompiler::LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& 
                     : ModFieldNameOf(*R, PackageOf(*R), Name(MemberNode));
         Out.Owner = BP.ScriptStruct(PackageOf(*R), ClassOf(*R));
         Out.LetOp = LetOpFor(TypeOf(MemberNode));
+        Out.bSingle = IsSingleNative(*R) && StripTypeKeywords(TypeOf(MemberNode)) == "float";
         Out.Base = std::make_shared<FArgIR>();
         /* `P->X` and `(*P).X`: StructMember offsets into the memory P points at. The base is only offset into,
            never copied, so the int64 view serves a struct of any size. */
@@ -4615,6 +4715,7 @@ bool FCompiler::LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& 
     Out.S = UeNameOf(R, Name(MemberNode));      // `Name_0` is the engine's `Name`: see FRecord::UeNames
     Out.Owner = !R->IsNative() && R == Cur ? BP.ClassIndex() : BP.PropertyOwner(PackageOf(*R), ClassOf(*R));
     Out.LetOp = LetOpFor(TypeOf(MemberNode));
+    Out.bSingle = IsSingleNative(*R) && StripTypeKeywords(TypeOf(MemberNode)) == "float";
     const Json* Obj = Strip(ObjRaw);
     if (!Obj) { *Err = "property access with no object: " + Name(MemberNode); return false; }
     if (Kind(*Obj) == "CXXThisExpr") return true;
@@ -5122,7 +5223,7 @@ bool FCompiler::ExactEqual(const std::string& Type, FArgIR A, FArgIR B, FBluepri
     const char* Flavour = IsObjectType(T) ? "ObjectObject" : T == "float" ? "FloatFloat" : T == "int64" ? "Int64Int64"
                         : T == "uint8" ? "ByteByte" : T == "bool" ? "BoolBool" : T == "int" ? "IntInt" : nullptr;
     if (!Flavour) return false;
-    Out.Sub->Fn = BP.EngineFunction("/Script/Engine", "KismetMathLibrary", std::string("EqualEqual_") + Flavour);
+    Out.Sub->Fn = BP.EngineFunction("/Script/Engine", "KismetMathLibrary", RealMath(std::string("EqualEqual_") + Flavour));
     Out.Sub->bScript = false;
     return true;
 }
@@ -5401,7 +5502,7 @@ const FReadViewSpec* FCompiler::ViewFor(const std::string& PointeeType)
              : StripTypeKeywords(P.substr(0, P.size() - 1)) == "UClass" ? "__ReadClass__" : "__ReadObject__";
     else if (P == "int64" || P == "uint64" || P == "long long" || P == "unsigned long long") Read = "__Read64__";
     else if (P == "int" || P == "int32" || P == "uint32" || P == "unsigned int") Read = "__Read32__";
-    else if (P == "float") Read = "__ReadFloat__";
+    else if (P == "float" && !IsUE5()) Read = "__ReadFloat__";     // S40: no UE5 real view yet
     else if (P == "uint8" || P == "int8" || P == "unsigned char" || P == "signed char" || P == "char" || P == "bool")
         Read = "__ReadByte__";
     else if (auto E = Enums.find(P); E != Enums.end())
@@ -5436,7 +5537,7 @@ const char* IsWideScalar(const std::string& P)
 {
     if (P == "uint16" || P == "unsigned short") return "__ReadU16__";
     if (P == "int16" || P == "short") return "__ReadI16__";
-    return P == "double" ? "__ReadF64__" : nullptr;
+    return P == "double" && !IsUE5() ? "__ReadF64__" : nullptr;
 }
 
 /* The value at Addr: a __Read*__, which the hoist pass loads into a temp. */
@@ -5747,6 +5848,7 @@ bool FCompiler::LowerArg(const Json& ArgNode, FBlueprintClass& BP, FArgIR& Out, 
         if (FConstVal V; FoldConst(ArgNode, V) && ConstToArg(V, OuterType, Out)) return true;
     if (!LowerArgRaw(*N, OuterType, BP, Out, Err)) return false;
     if (Out.InnerType.empty()) Out.InnerType = TypeOf(*N);
+    if (IsUE5()) ToReal(Out, BP);
     /* Strip looked through the casts, but an explicit narrowing inside a wider slot (`(uint8)*P + 1`
        of a sign-extended byte, `(uint8)X` returned as int) still wraps, innermost first. So does a soft pointer made on
        the way: `FString(TSoftClassPtr<AItem>(Cls))` is the class's path, where Cls to FString would be its name. */
@@ -6284,7 +6386,13 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
     }
     if (K == "CharacterLiteral") { Out.K = FArgIR::Int; Out.I = int32(CharValue(*N)); Out.I64 = Out.I; return true; }
     /* strtof, not stof: a double literal past float's range is inf, as (float)1e39 is in C++, not an exception. */
-    if (K == "FloatingLiteral") { Out.K = FArgIR::Float; Out.F = std::strtof(N->value("value", std::string("0")).c_str(), nullptr); return true; }
+    if (K == "FloatingLiteral")
+    {
+        const std::string V = N->value("value", std::string("0"));
+        Out.K = FArgIR::Float;
+        Out.F = IsUE5() && StripTypeKeywords(TypeOf(*N)) == "double" ? std::strtod(V.c_str(), nullptr) : std::strtof(V.c_str(), nullptr);
+        return true;
+    }
     if (K == "CXXBoolLiteralExpr") { Out.K = FArgIR::Bool; Out.B = N->value("value", false); return true; }
     if (K == "DeclRefExpr")
     {
@@ -6473,7 +6581,7 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             Zero.K = bFloat ? FArgIR::Float : bInt64 ? FArgIR::Int64 : FArgIR::Int;
             Zero.F = -0.0f;
             Out.Sub->Fn = BP.EngineFunction("/Script/Engine", "KismetMathLibrary",
-                                            bFloat ? "Subtract_FloatFloat" : bInt64 ? "Subtract_Int64Int64" : "Subtract_IntInt");
+                                            bFloat ? RealMath("Subtract_FloatFloat") : bInt64 ? "Subtract_Int64Int64" : "Subtract_IntInt");
             Out.Sub->Args = { Zero, A };
             return true;
         }
@@ -7510,6 +7618,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
     /* `IncRef(0, B += 1)` in a loop condition, or on another object: the reference is B itself, not LowerArg's copy. */
     if (const int32 Bound = bIntrinsic ? 0 : LowerBoundArgs(CallExprNode, BP, Out, Err)) return Bound > 0;
     const FRecord* ParmsOwner = nullptr;    // the class whose function's parameters the arguments fill, a delegate's below
+    bool bSingleParms = false;              // UE5: a native's, whose float parameters take 4-byte floats (S40)
     if (bIntrinsic)
     {
         Out.Intrinsic = MethodName;
@@ -7591,6 +7700,13 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         }
         const bool bStatic = Decl != R->Methods.end() && IsStaticDecl(*Decl->second);
         if (Decl != R->Methods.end()) FullDecl = Decl->second;
+        if (FullDecl && IsSingleNative(*R))
+        {
+            std::string Ret = TypeOf(*FullDecl);
+            Ret = Ret.substr(0, Ret.find('('));
+            while (!Ret.empty() && Ret.back() == ' ') Ret.pop_back();
+            Out.bSingleResult = StripTypeKeywords(Ret) == "float";
+        }
         if (Decl != R->Methods.end())
         {
             auto Def = R->MethodDefs.find(MethodName);
@@ -7749,6 +7865,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         const std::string CalleePackage = PackageOf(*Called), CalleeName = ClassOf(*Called);
         Out.Fn = BP.EngineFunction(CalleePackage, CalleeName, UeNameOf(Called, MethodName));
         if (!Out.bReceiverIsArg) ParmsOwner = R;
+        bSingleParms = IsSingleNative(*R);
         Out.bScript = CalleePackage.compare(0, 6, "/Game/") == 0;
         Out.bInstance = !bStatic;
         /* Each makes its proxy with NewObject, flags it RF_StrongRefOnFrame and roots it nowhere else
@@ -7804,6 +7921,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
             return ImportedParamSignature(*Owner, Method, I, BP, &Sig) ? Sig : Null();
         });
         bOk = LowerArg(*Arg, BP, A, Err);
+        if (bOk && bSingleParms && I < CalledParms.size()) bOk = SingleArg(TypeOf(*CalledParms[I]), MethodName, BP, A, Err);
         if (bOk) Out.Args.push_back(A);
         Defaulted.push_back(Kind(C) == "CXXDefaultArgExpr");
     });
@@ -8011,7 +8129,7 @@ over garbage. Every type below fits the buffer.
 */
 bool IsDiscardable(const FPropertyDef& P)
 {
-    static const std::set<std::string> Simple = { "IntProperty", "Int64Property", "FloatProperty", "BoolProperty",
+    static const std::set<std::string> Simple = { "IntProperty", "Int64Property", "FloatProperty", "DoubleProperty", "BoolProperty",
                                                   "ByteProperty", "EnumProperty", "NameProperty", "ObjectProperty",
                                                   "ClassProperty" };
     return Simple.count(P.Type) != 0;
@@ -8273,7 +8391,7 @@ static bool ZeroOf(const FPropertyDef& P, FArgIR& Out)
     Out = FArgIR();
     if (P.Type == "IntProperty") Out.K = FArgIR::Int;
     else if (P.Type == "Int64Property") Out.K = FArgIR::Int64;
-    else if (P.Type == "FloatProperty") Out.K = FArgIR::Float;
+    else if (P.Type == "FloatProperty" || P.Type == "DoubleProperty") Out.K = FArgIR::Float;
     else if (P.Type == "BoolProperty") Out.K = FArgIR::Bool;
     else if (P.Type == "ByteProperty") Out.K = FArgIR::Byte;
     else if (P.Type == "EnumProperty" && P.Inner && P.Inner->Type == "ByteProperty") Out.K = FArgIR::Byte;  // EX_ByteConst
@@ -8926,6 +9044,17 @@ std::vector<FStmtIR> Unlooped(const std::vector<FStmtIR>& Stmts, const std::shar
     return Out;
 }
 }   // namespace
+
+/* Each store into a native float property, Stmts' nested lists included, takes a 4-byte float. */
+void FCompiler::SingleStores(std::vector<FStmtIR>& Stmts, FBlueprintClass& BP)
+{
+    ForEachStmt(Stmts, [&](std::vector<FStmtIR>& L, size_t I) {
+        FStmtIR& St = L[I];
+        if (St.K == FStmtIR::Assign && St.Var.bSingle && (St.Var.K == FArgIR::Field || St.Var.K == FArgIR::Member))
+            ToSingle(St.Value, BP);
+    });
+}
+
 
 /*
 A loop whose await finds its action fresh on the first round and active on the rest cannot keep or drop that await's
@@ -10158,6 +10287,7 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             Out.push_back(std::move(Flush));
         }
         if (bOk && St.K == FStmtIR::Assign) WarnRpcRefWrite(St.Var);
+        if (bOk && IsUE5()) { std::vector<FStmtIR> One{ St }; SingleStores(One, BP); St = One[0]; }
         if (bOk) Out.push_back(St);
         if (!Notify.empty())
         {
@@ -13773,7 +13903,7 @@ bool FCompiler::ConstToArg(const FConstVal& V, const std::string& Type, FArgIR& 
     Out = FArgIR();
     Out.K = VK == SK_Float ? FArgIR::Float : VK == SK_Bool ? FArgIR::Bool : VK == SK_Byte ? FArgIR::Byte
           : VK == SK_Int64 ? FArgIR::Int64 : FArgIR::Int;
-    Out.F = float(V.Num());
+    Out.F = IsUE5() ? V.Num() : float(V.Num());
     Out.B = V.Num() != 0;
     Out.I = int32(V.I);
     Out.I64 = V.I;
@@ -14150,7 +14280,7 @@ static void ZeroDefault(FPropertyDef& PD)
     FDefaultValue& D = PD.Default;
     const std::string& T = PD.Type;
     if (T == "IntProperty" || T == "Int64Property" || (T == "ByteProperty" && PD.StructName.empty())) { D.K = FDefaultValue::Int; D.I = 0; }
-    else if (T == "FloatProperty") { D.K = FDefaultValue::Float; D.F = 0.0; }
+    else if (T == "FloatProperty" || T == "DoubleProperty") { D.K = FDefaultValue::Float; D.F = 0.0; }
     else if (T == "BoolProperty") { D.K = FDefaultValue::Bool; D.I = 0; }
     else if (T == "ByteProperty" || T == "EnumProperty") { D.K = FDefaultValue::Str; D.S = PD.EnumZero; }
     else if (T == "NameProperty") { D.K = FDefaultValue::Str; D.S = "None"; }
@@ -14667,11 +14797,11 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
     /* A number is whatever the initializer comes to: `40`, `-1.5f`, `kMax * 2 + 1`, `1 << 3 | 2`. An enum-typed
        byte keeps its named-constant path below. */
     if (FConstVal V; (T == "IntProperty" || T == "Int64Property" || (T == "ByteProperty" && PD.StructName.empty())
-                      || T == "FloatProperty" || T == "BoolProperty") && FoldConst(*Whole, V))
+                      || T == "FloatProperty" || T == "DoubleProperty" || T == "BoolProperty") && FoldConst(*Whole, V))
     {
         const double Num = V.Num();
         const int64 Int = V.bFloat ? int64(V.F) : V.I;
-        if (T == "FloatProperty") { D.K = bKeepZero || Num != 0.0 ? FDefaultValue::Float : FDefaultValue::None; D.F = Num; }
+        if (T == "FloatProperty" || T == "DoubleProperty") { D.K = bKeepZero || Num != 0.0 ? FDefaultValue::Float : FDefaultValue::None; D.F = Num; }
         else if (T == "BoolProperty") { D.K = bKeepZero || Num != 0.0 ? FDefaultValue::Bool : FDefaultValue::None; D.I = Num != 0.0; }
         else { D.K = bKeepZero || Int != 0 ? FDefaultValue::Int : FDefaultValue::None; D.I = Int; }
         return true;
@@ -14911,7 +15041,7 @@ bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& P
         *Out = ClassParam(PName, UClassImp, UObjectImp, ExtraFlags);
         return true;
     }
-    if (Type == "float") { *Out = FloatParam(PName, ExtraFlags); return true; }
+    if (Type == "float" || (IsUE5() && Type == "double")) { *Out = FloatParam(PName, ExtraFlags); return true; }
     if (Type == "int" || Type == "int32") { *Out = IntParam(PName, ExtraFlags); return true; }
     if (Type == "int64" || Type == "long long") { *Out = Int64Param(PName, ExtraFlags); return true; }
     if (Type == "bool") { *Out = BoolParam(PName, ExtraFlags); return true; }
@@ -15378,6 +15508,7 @@ bool FCompiler::StructLayout(const FRecord& R, int32* Size, int32* Align, std::s
     {
         int32 S = 0, A = 1;
         if (!LayoutOf(TypeOf(*F), &S, &A, Err)) return false;
+        if (IsUE5() && !R.IsNative() && StripTypeKeywords(TypeOf(*F)) == "float") S = A = 8;     // S40: a DoubleProperty
         Offset = (Offset + A - 1) / A * A + S;
         MaxAlign = std::max(MaxAlign, A);
     }
@@ -15424,6 +15555,7 @@ bool FCompiler::LowerParams(const Json& M, const std::string& Fn, FBlueprintClas
                             std::vector<FPropertyDef>& Params, std::string* Err)
 {
     CurrentOutParms.clear();
+    SingleParms.clear();
     bool bOk = true;
     /* A parameter the source leaves unnamed is named P<its index>, `_` added while another has that name, as the
        editor names every pin and SynthesizeForwarders names the override's: an empty name is None once loaded, and
@@ -15456,6 +15588,11 @@ bool FCompiler::LowerParams(const Json& M, const std::string& Fn, FBlueprintClas
         if (FIndex Sig; Cur && StripTypeKeywords(Type).compare(0, 10, "TDelegate<") == 0
                         && ImportedParamSignature(*Cur, Fn, Index - 1, BP, &Sig))
             PD = DelegateParam(PName, Sig, Flags);
+        else if (Cur && StripTypeKeywords(Type) == "float" && NativeParmIsSingle(*Cur, Fn, Index - 1))
+        {
+            PD = SingleParam(PName, Flags);     // the native event's 4-byte float, read as the real (ToReal)
+            SingleParms.insert(PName);
+        }
         else
             bOk = TypeToProperty(Type, PName, Flags, "parameter " + PName + " on " + Fn, BP, &PD, Err);
         if (!bOk) return;
@@ -16810,8 +16947,11 @@ static bool ForEachFieldPath(const std::vector<uint8>& B, size_t Begin, size_t E
         case 0x1F: while (O < End && B[O]) ++O; Skip(1); break;
         case 0x34: while (O + 1 < End && (B[O] || B[O + 1])) O += 2; Skip(2); break;
         case 0x21: case 0x4B: Skip(8); break;
-        case 0x22: case 0x23: Skip(12); break;
-        case 0x2B: Skip(40); break;
+        case 0x22: case 0x23: Skip(IsUE5() ? 24 : 12); break;                                  // UE5: doubles (LWC)
+        case 0x2B: Skip(IsUE5() ? 80 : 40); break;
+        case 0x37: if (!IsUE5()) bOk = false; else Skip(8); break;                             // EX_DoubleConst
+        case 0x41: if (!IsUE5()) bOk = false; else Skip(12); break;                            // EX_Vector3fConst
+        case 0x0C: if (!IsUE5()) bOk = false; else Skip(4); break;                             // EX_NothingInt32
         case 0x24: case 0x2C: Skip(1); break;
         case 0x29:                                                                              // EX_TextConst
         {
@@ -20316,6 +20456,10 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         return false;
     }
     Uasset::GEngine = Engine == "5.6" ? Uasset::EEngine::UE56 : Uasset::EEngine::UE427;
+    GRealMath.clear();
+    if (Stamp.contains("math") && Stamp["math"].is_object())
+        for (auto It = Stamp["math"].begin(); It != Stamp["math"].end(); ++It)
+            if (It->is_string()) GRealMath[It.key()] = It->get<std::string>();
     if (!ParseClangAst(ClangCommand(SourcePath, IncludeDir), SourcePath, &Doc, Err)) return false;
 
     if (!LoadTables(IncludeDir, Err)) return false;

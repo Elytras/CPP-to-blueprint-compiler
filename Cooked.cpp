@@ -969,6 +969,7 @@ bool ReadValueOf(const FCookedPackage& P, FReader& R, FPropertyDef& T, FDefaultV
     if (Ty == "IntProperty") { D.K = FDefaultValue::Int; D.I = R.I32(); }
     else if (Ty == "Int64Property") { D.K = FDefaultValue::Int; D.I = R.I64(); }
     else if (Ty == "FloatProperty") { D.K = FDefaultValue::Float; D.F = R.Get<float>(); }
+    else if (Ty == "DoubleProperty") { D.K = FDefaultValue::Float; D.F = R.Get<double>(); }     // a UE5 real (S40)
     else if (Ty == "BoolProperty")
     {
         D.K = FDefaultValue::Bool;

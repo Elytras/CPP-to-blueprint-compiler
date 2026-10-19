@@ -64,6 +64,8 @@ struct FPropertyDef
 };
 
 FPropertyDef FloatParam(const std::string& Name, uint64 ExtraFlags = 0);
+/* A FloatProperty whatever the engine: a UE5 native event's float parameter (S40). */
+FPropertyDef SingleParam(const std::string& Name, uint64 ExtraFlags = 0);
 FPropertyDef IntParam(const std::string& Name, uint64 ExtraFlags = 0);
 FPropertyDef Int64Param(const std::string& Name, uint64 ExtraFlags = 0);
 FPropertyDef BoolParam(const std::string& Name, uint64 ExtraFlags = 0);
@@ -96,7 +98,8 @@ void WriteProperty(FArc& Ar, const FPropertyDef& P, bool bUncooked = false);
 void WriteDefaultTag(FArc& Ar, const FPropertyDef& P);
 /* P.Default alone, as a tag's value or a container element holds it: no tag around it. */
 void WriteDefaultValue(FArc& Ar, const FPropertyDef& P);
-/* The bytes a struct the engine serializes natively takes (FVector's three floats: 12), or 0 for one written as tags. */
+/* The bytes a struct the engine serializes natively takes (FVector's three floats: 12, UE5's three doubles: 24), or 0
+   for one written as tags. */
 int32 NativeStructSize(const std::string& StructName);
 /* The bytes WriteDefaultValue writes for P whatever the value, or 0 when that depends on the value (a string, a text, a
    soft path, a struct written as tags, a container). */
@@ -134,7 +137,10 @@ public:
     void IntConst(int32 Value);
     void Int64Const(int64 Value);
     void ByteConst(uint8 Value);
-    void FloatConst(float Value);
+    /* A Blueprint real: EX_FloatConst on 4.27, EX_DoubleConst on UE5 (LWC). */
+    void FloatConst(double Value);
+    /* EX_FloatConst whatever the engine: a UE5 native `float` parameter. */
+    void SingleConst(float Value);
     void NameConst(const std::string& NameStr);
     void StringConst(const std::string& Value);             // ANSI
     void UnicodeStringConst(const std::u16string& Value);   // UCS-2
