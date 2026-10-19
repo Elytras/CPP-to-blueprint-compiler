@@ -502,8 +502,9 @@ Watch for:
   `USceneComponent` root hands them on to the components attached to it. (A class whose parent already has a root,
   such as a Blueprint parent or `ACharacter`, adds no root: its first scene component keeps its transform.) A mesh or a light as the root keeps them,
   and AssetGen warns that they are not applied. Declare a `USceneComponent` first.
-- `UE_DEFAULTS` is read when the mod is built and never runs. A call, an `if`, a `+=`, part of a struct such as
-  `Lamp->RelativeLocation.Z = 50.0f;`, or another object's member is refused: set a struct whole. A variable the class
+- `UE_DEFAULTS` is read when the mod is built and never runs. A call, an `if`, a `+=`, part of a struct written as
+  bytes such as `Lamp->RelativeLocation.Z = 50.0f;` (FVector, FRotator), or another object's member is refused: set
+  that struct whole. A variable the class
   declares itself takes an initializer instead.
   `Target = nullptr;`, `Count = {};` and `Offset = FVector();` write the type's zero over the parent's value.
   `Hit = FHitResult();` is refused: an FHitResult's values come from the engine's constructor (Time is 1), which

@@ -2939,7 +2939,7 @@ would leave the object: see [Constructors](#constructors).
 | `Ids = {2, 3};`, `Score = {{"a", 5}, {"b", 2}};` on a TSet or TMap a parent declares | This class's whole value, as Class Defaults would set it. The default object loads a set or map over its parent's value, so the compiler writes what differs, as the editor saves it: the parent's elements (a map's keys) this value lacks, as removed, then the elements the parent lacks or maps to another value. The parent's value is known where a header gives it: an initializer, a `UE_DEFAULTS` or a `UE_STRUCT` member's default instance, in a class of this mod or of another mod's shared header (`UE_CLASS_IN`, or `UE_CLASS` where the header gives the member a value). Below an engine or game class, whose value no header says, the elements are added to that class's own, with a warning naming the member, and so below a class whose `UE_DEFAULTS` sets the member over one (its default object holds that class's elements too; the statement's own are still removed). The same holds for a TSet or TMap inside a UE_STRUCT a parent declares, when you assign the struct whole (`Held = {{2, 3}, 3};`). A key given twice holds the last value given, as in C++, and an FString key compares without case: `{{"a", 5}, {"A", 1}}` is `{"A": 1}`. | Yes |
 | `Mesh->StaticMesh = &SM_Crate_B;` | Points an object property at an asset: a `UE_ASSET_AT`, a UeAssets name or an asset the mod cooks. The same as picking the asset in the details panel. | Yes |
 | `Index_0 = 7;`, for a member the SDK spells `Index_0` | Written under the engine's real name, `Index`. See [Classes and variables](#classes-and-variables). | Yes |
-| `Lamp->RelativeLocation.Z = 50.0f;`, `Home.Z = 5.0f;` | Refused: "every statement is ... each set whole". Assign the whole struct: `Lamp->RelativeLocation = FVector(0.0f, 0.0f, 50.0f);`. | Refused |
+| `Lamp->RelativeLocation.Z = 50.0f;`, `Home.Z = 5.0f;` | Refused: "part of a Vector, which is written as bytes, not member by member; set the whole value". Assign the whole struct: `Lamp->RelativeLocation = FVector(0.0f, 0.0f, 50.0f);`. | Refused |
 | `GetOwner()->InitialLifeSpan = 5.0f;` | Refused: "every statement is ...". A member of another object is no default of this class's. It used to compile as this class's own `InitialLifeSpan`. | Refused |
 | `int32 Charges;` with `UE_DEFAULTS { Charges = 3; }` | Refused: "is declared here - give it an initializer instead". Write `int32 Charges = 3;`. | Refused |
 | `UE_DEFAULTS;` in the class, `void UTurret::UeDefaults__() { Charges = 3; }` outside it | Refused: "UE_DEFAULTS has no body in the class". The statements are read where the macro is written, which is also all a mod that includes the class's header sees. Write `UE_DEFAULTS { Charges = 3; }` in the class. | Refused |
@@ -6500,9 +6500,9 @@ so the retail game prints nothing. See [Strings and text](#strings-and-text) and
   `UE_DEFAULTS;` declares the block without its statements, which may sit in an out-of-line definition. Those would
   be dropped, and a mod that includes the class's header could not see them either. Fix: move the statements into
   the class, `UE_DEFAULTS { Health = 100; }`. See [Class defaults](#class-defaults).
-- `` <Class>::UE_DEFAULTS: every statement is `Field = value;`, `Component->Field = value;` or `Component->SetupAttachment(Parent);`, on this object's members, each set whole (not `Field.X = value;`) ``:
+- `` <Class>::UE_DEFAULTS: every statement is `Field = value;`, `Component->Field = value;`, part of a struct member, `Field.Member = value;`, or `Component->SetupAttachment(Parent);`, on this object's members ``:
   a statement in UE_DEFAULTS is not a plain `=` onto a member of this object, nor a SetupAttachment: a call such as
-  `K2_DestroyActor();`, `Health += 5;`, a local, an `if`, part of a struct (`Lamp->RelativeLocation.Z = 50.0f;`) or
+  `K2_DestroyActor();`, `Health += 5;`, a local, an `if`, or
   another object's member (`GetOwner()->InitialLifeSpan = 5.0f;`). The block never runs; AssetGen only reads its
   assignments and attachments. A value computed at run time is refused with the
   member-default message that starts `<Member>: a default is a value known when the mod is built`. Fix: keep only
@@ -6584,8 +6584,7 @@ so the retail game prints nothing. See [Strings and text](#strings-and-text) and
   of that name. The headers come from an older genueapi, or the member is a plain pointer and not a default subobject,
   or two of the class's subobjects fit it and neither its name, nor the class that declares it, nor a game Blueprint
   deriving from the class (which genueapi reads with `--game`) tells which.
-  The same message appears for a path one level too deep, `Lamp->RelativeLocation.Z = 50.0f;`, which it misreads as a
-  component called RelativeLocation; regenerating does not help there. Fix: regenerate UeApi with genueapi from a dump
+  Fix: regenerate UeApi with genueapi from a dump
   that has `GObjects-Dump-WithProperties.txt`; assign whole values,
   `Lamp->RelativeLocation = FVector(0.0f, 0.0f, 50.0f);`; set a member that is not a default subobject at run time.
   See [Class defaults](#class-defaults). The same message, ending "a member that is no default subobject is attached

@@ -8594,8 +8594,9 @@ def mod_component():
     kid, ki = class_pkg(os.path.join(folder, 'ModComponent'))
     assert kid.path(kid.exports[template(kid, ki, 'Part')]['tmpl']) == '/Game/_ElytrasMods/ModComponent/McBase.McBase_C:Part_GEN_VARIABLE'
     for cls in ('ModComponent', 'McBase', 'UMcPart'): keeps_invariants(os.path.join(folder, cls))
-    refused('McBytes', '  UE_DEFAULTS { Hit.ImpactPoint.X = 1.0f; }\n', 'written as bytes',
-            top='class McHolder : public AActor {\npublic:\n  FHitResult Hit;\n};\n', base='McHolder')
+    # FVector, not FHitResult's ImpactPoint: FVector_NetQuantize is a plain USTRUCT, written as tags
+    refused('McBytes', '  UE_DEFAULTS { Spot.X = 1.0f; }\n', 'written as bytes',
+            top='class McHolder : public AActor {\npublic:\n  FVector Spot;\n};\n', base='McHolder')
     print('ok  ModComponent: a mod component class as a UE_COMPONENT, and UE_DEFAULTS that set part of a struct')
 
 
@@ -10190,7 +10191,7 @@ def ctor_refusals():
     every = '::UE_DEFAULTS: every statement is'
     refused('DefOther', '  UE_DEFAULTS { GetOwner()->InitialLifeSpan = 5.0f; }\n', 'DefOther' + every)
     refused('DefPart', '  UE_COMPONENT(UPointLightComponent, Lamp);\n  UE_DEFAULTS { Lamp->RelativeLocation.Z = 5.0f; }\n',
-            'DefPart' + every)
+            'RelativeLocation.Z: part of a Vector, which is written as bytes')
     refused('DefIface', '  UE_INTERFACE;\n  UE_DEFAULTS { Marks = 5; }\n', 'DefIface: a UE_INTERFACE has no UE_DEFAULTS',
             top='class IDefBase {\n  UE_INTERFACE;\npublic:\n  int32 Marks = 1;\n};\n', base='IDefBase')
     refused('DefStruct', '  FDefStruct S;\n', 'FDefStruct: a UE_STRUCT has no UE_DEFAULTS',
