@@ -297,7 +297,9 @@ class Types:
             meta = s.cls(pkg, p.meta, cur)
             return 'UClass*' if meta == 'UObject' else 'TSubclassOf<%s>' % meta
         if t == 'SoftObjectProperty': return 'TSoftObjectPtr<%s>' % s.cls(pkg, p.ref, cur)
-        if t == 'SoftClassProperty': return 'TSoftClassPtr<%s>' % s.cls(pkg, p.meta, cur)
+        if t == 'SoftClassProperty':        # UeApi spells the any-class soft reference TSoftClassPtr<UClass>
+            meta = s.cls(pkg, p.meta, cur)
+            return 'TSoftClassPtr<%s>' % ('UClass' if meta == 'UObject' else meta)
         if t == 'InterfaceProperty': return 'TScriptInterface<%s>' % s.cls(pkg, p.ref, cur)
         if t == 'StructProperty': return s.struct(pkg, p.ref, cur)
         if t == 'ArrayProperty': return 'TArray<%s>' % s.of(pkg, p.subs[0], cur)

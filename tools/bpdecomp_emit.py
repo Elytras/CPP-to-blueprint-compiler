@@ -43,10 +43,10 @@ def is_zero(v):
 
 def field_assigns(lhs, v):
     """`lhs = v;` as statements; a native struct's designated initializer (an aggregate to the compiler only for a
-    mod struct) becomes one assignment per field, its zero fields left out."""
+    mod struct) becomes one assignment per field."""
     d = designated(v)
     if d is None or '::' in d[0]: return ['%s = %s;' % (lhs, v)]
-    return [x for f, val in d[1] if not is_zero(val) for x in field_assigns('%s.%s' % (lhs, f), val)]
+    return [x for f, val in d[1] for x in field_assigns('%s.%s' % (lhs, f), val)]   # a tag holds only what differs
 
 
 class Out:
@@ -416,6 +416,10 @@ class ClassEmit:
             lines.append('class %s%s {\npublic:\n    UE_INTERFACE;\n' % (a.cpp, ' : public ' + iparent[0] if iparent else ''))
         else:
             lines.append('class %s : %s {\n' % (a.cpp, ', '.join('public ' + b for b in bases)))
+        partial = [d for d in s.defaults if re.match(r'^[\w>-]+\.\w', d)]
+        for d in partial:          # UE_DEFAULTS sets a member whole; a native struct's single field has no spelling
+            s.notes.append('%s: default `%s` dropped: UE_DEFAULTS cannot set one field of a native struct' % (a.path, d))
+        s.defaults = [d for d in s.defaults if d not in partial]
         if s.defaults and not is_iface:
             lines.append('    UE_DEFAULTS {\n%s    }\n' % ''.join('        %s\n' % d for d in s.defaults))
         for access in ('public', 'protected', 'private'):
