@@ -12921,9 +12921,14 @@ bool FCompiler::HoistWideRead(FArgIR& A, FBlueprintClass& BP, std::vector<FPrope
     FArgIR AnyMantissa = Math("NotEqual_IntInt", { Math("Or_IntInt", { Math("And_IntInt", { Hi, IntK(0xFFFFF) }), Lo }), IntK(0) });
     AnyMantissa.InnerType = "bool";
     const FArgIR NanOrInf = Math("Or_IntInt", { IntK(0x7F800000), Select(IntK(0x400000), IntK(0), AnyMantissa) });
-    const FArgIR Magnitude = Select(NanOrInf, Select(IntK(0x7F800000), Select(IntK(0), Body, Cmp("LessEqual_IntInt", 1023 - 127)),
-                                                     Cmp("GreaterEqual_IntInt", 1023 + 128)),
-                                    Cmp("EqualEqual_IntInt", 0x7FF));
+    /* Each Cmp adds an import, and Select is a call, whose arguments run in the compiler's order: one per statement,
+       so the import rows come out the same from MSVC and clang. This is the order MSVC evaluated the nested arguments
+       in (right to left), so its output does not move. */
+    const FArgIR IsNanOrInf = Cmp("EqualEqual_IntInt", 0x7FF);
+    const FArgIR Overflows = Cmp("GreaterEqual_IntInt", 1023 + 128);
+    const FArgIR Underflows = Cmp("LessEqual_IntInt", 1023 - 127);
+    const FArgIR Magnitude = Select(NanOrInf, Select(IntK(0x7F800000), Select(IntK(0), Body, Underflows), Overflows),
+                                    IsNanOrInf);
     FArgIR Bits = Math("Or_IntInt", { Magnitude, Math("And_IntInt", { Hi, IntK(int32(0x80000000u)) }) });
     A = IntrinsicK("__AsFloat__", std::move(Bits), "float", BP.ScriptStruct("/Script/CoreUObject", "Vector"));
     return HoistReadsInArg(A, BP, Locals, OutPre, Err);
