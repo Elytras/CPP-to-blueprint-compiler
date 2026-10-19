@@ -593,9 +593,10 @@ Watch for:
   resumes starts it over with the new arguments, and its `Delay` is ignored while the first one is pending, so in
   `ReceiveTick` the code after a `Delay` runs at most once per delay. A local declared without an initializer keeps
   what the previous call left in it, so initialize it.
-- A timer set by name, `K2_SetTimer(this, "Poll", ...)`, is not checked: an inline, misspelled or parameter-taking
-  method compiles and sets no timer. The `{this, &Class::Method}` form is checked. A time of zero or less sets no
-  timer.
+- A timer set by name is checked only in the form `K2_SetTimer(this, "Poll", ...)`: there AssetGen refuses a name that
+  is misspelled, inline, or a method that takes parameters or returns a value, none of which would set a timer. With
+  another object or a name that is not a literal, nothing is checked. The `{this, &Class::Method}` form is always
+  checked. A time of zero or less sets no timer.
 - A key event takes its key from the game: while the actor has input, whatever the game does with F5 stops. Add
   `NoConsume` to share the key. A key the engine does not have is refused with the closest it has,
   `UE_INPUT_KEY("Space")` naming SpaceBar, and `FKey{"Space"}` warns the same way. An action is one of the game's
@@ -1973,8 +1974,9 @@ A few mistakes also compile without a message, because the construct itself work
   copy the signature from the header. See [Interfaces](REFERENCE.md#interfaces).
 - `Items.Remove(2)` on a `TArray`. It is the Remove Index node; `RemoveItem(2)` removes the elements equal to 2. See
   [Containers](REFERENCE.md#containers).
-- `UKismetSystemLibrary::K2_SetTimer(this, "Poll", ...)` naming an inline method, a method that takes parameters or a
-  misspelled name. The engine sets no timer. Prefer `K2_SetTimerDelegate({ this, &AMine::Poll }, ...)`, which clang
+- `UKismetSystemLibrary::K2_SetTimer(obj, "Poll", ...)` naming an inline method, a method that takes parameters or
+  returns a value, or a misspelled name. The engine sets no timer. AssetGen refuses these when the object is `this`
+  and the name a literal, and cannot check any other form. Prefer `K2_SetTimerDelegate({ this, &AMine::Poll }, ...)`, which clang
   and AssetGen check. See [Timers and input](REFERENCE.md#timers-and-input).
 - A `UE_CLASS` path that leaves out the class's namespace folder. The owning mod imports the class instead of cooking
   it. bpbuild reports the import that no mod produces; a lone `assetgen compile` does not. See

@@ -4165,7 +4165,7 @@ restarts it. [examples/Beacon.cpp](examples/Beacon.cpp) runs a looping timer, an
 | `K2_ClearTimerDelegate({this, &Pulser::OnPulse})` | Clear Timer by Event. Stops the timer without a handle. | Yes |
 | `K2_PauseTimerHandle(Pulse)`, `K2_UnPauseTimerHandle(Pulse)` | Pause and resume the timer. AssetGen fills the world context in as self. | Yes |
 | `K2_IsTimerActiveHandle(Pulse)`, `K2_GetTimerRemainingTimeHandle(Pulse)`, `K2_IsValidTimerHandle(Pulse)` | Ask about the timer. The first two get self as world context; K2_IsValidTimerHandle takes only the handle. | Yes |
-| `K2_SetTimer(this, "Poll", 1.0f, true, 0.0f, 0.0f)` | Set Timer by Function Name. AssetGen passes the name as a plain string and does not check it. The engine looks the method up by that name at run time. | Yes |
+| `K2_SetTimer(this, "Poll", 1.0f, true, 0.0f, 0.0f)` | Set Timer by Function Name. AssetGen passes the name as a plain string. The engine looks the method up by that name at run time. With `this` and a literal name, AssetGen checks the method the way the engine will (see below). | Yes |
 | `K2_ClearTimer(this, "Poll")` | Clear Timer by Function Name. K2_PauseTimer, K2_UnPauseTimer, K2_IsTimerActive, K2_GetTimerRemainingTime and the other by-name calls find the timer by the same name. | Yes |
 | `UFSDWidgetBlueprintLibrary::SetTimerForNextTick({this, &Pulser::Later})` | DRG's own next-frame timer. It takes a delegate value, returns a handle, and gets self as world context. | Yes |
 
@@ -4205,11 +4205,13 @@ Notes:
 - A looping timer shorter than a frame runs several times in that frame to catch up.
 - The timer holds its object weakly. Once the actor is gone, a looping timer is not re-armed.
 - Prefer the delegate form to the by-name form. With `{this, &Class::Method}`, clang checks that the method exists and
-  takes no parameters, and AssetGen refuses an inline method. With a name, all three mistakes compile with no warning
-  and fail at run time. An inline method never becomes a function of the class, and a misspelled name matches nothing,
-  so the engine logs "SetTimer passed a bad function (...) or object (...)" and returns an invalid handle. A method
-  that takes parameters is found, but the engine refuses it with "SetTimer passed a function (...) that expects
-  parameters." In each case no timer is set.
+  takes no parameters, and AssetGen refuses an inline method. With a name, the engine finds these mistakes only at run
+  time. An inline method never becomes a function of the class, and a misspelled name matches nothing, so the engine
+  logs "SetTimer passed a bad function (...) or object (...)" and returns an invalid handle. A method that takes
+  parameters or returns a value is found, but the engine refuses it with "SetTimer passed a function (...) that
+  expects parameters.": its test is the function's parameter size, which counts the return value. In each case no
+  timer is set. AssetGen refuses all four when the object is `this` and the name a literal; any other by-name call
+  compiles unchecked.
 - SetTimerForNextTick is DRG's function, and only compiling it was checked. Going by its name and by the engine's
   FTimerManager function of the same name, it calls the method once on the next frame. The engine libraries in the
   SDK have no next-tick timer of their own.
@@ -6719,10 +6721,10 @@ so the retail game prints nothing. See [Strings and text](#strings-and-text) and
   is no class pointer (an interface, a struct). Fix: pass the object, `I.GetObject()` cast to its class.
 - `<Function>: <Dispatcher>__DelegateSignature is the dispatcher's signature, which does nothing when called; call
   <Dispatcher>.Broadcast(...)`. Fix: broadcast the dispatcher.
-- `<Function>: K2_SetTimer by name <Name> names no function of the class` (or `names an inline method`, or `names a
-  function that takes parameters`)`, so the engine sets no timer`: the engine finds the function by name when the
-  timer is set, and only calls one without parameters. Fix: name a method of the class that takes none, or pass a
-  delegate with `K2_SetTimerDelegate`.
+- `<Function>: K2_SetTimer by name <Name> names no function of the class` (or `names an inline method`, `names a
+  function that takes parameters`, or `names a function that returns a value`)`, so the engine sets no timer`: the
+  engine finds the function by name when the timer is set, and only calls one with no parameters and no return
+  value. Fix: name a void method of the class that takes none, or pass a delegate with `K2_SetTimerDelegate`.
 - `` a delegate cannot bind <Function>: an inline function is expanded where it is called, no UFunction (drop `inline`) ``:
   Add, Remove or a delegate value names an inline method. An inline method is copied into each caller and never
   becomes a function of the class. Fix: drop `inline` from the handler. See [Event dispatchers](#event-dispatchers).
