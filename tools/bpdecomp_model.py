@@ -87,8 +87,8 @@ class Api:
         s.convs = {c['fn']: c for c in json.load(open(os.path.join(ueapi, 'Conv.json'), encoding='utf-8'))}
 
     CLASS_RE = re.compile(r'^class (\w+)\b[^;{\n]*\n?\{\s*public:\s*UE_CLASS\("([^"]+)", "([^"]+)"\)', re.M)
-    ALIAS_RE = re.compile(r'^using (\w+) = ((?:\w+::)+\w+);', re.M)
-    BASE_RE = re.compile(r'^class (\w+) : public (\w+)', re.M)
+    ALIAS_RE = re.compile(r'^using (\w+) = ((?:::)?(?:\w+::)+\w+);', re.M)
+    BASE_RE = re.compile(r'^class (\w+) : public (?:::)?(?:\w+::)*(\w+)', re.M)   # a Blueprint base is qualified
     NS_RE = re.compile(r'^namespace Game \{(.*?)\{\s*$', re.M)
 
     def _scan(s, rel):
@@ -98,12 +98,52 @@ class Api:
         for cpp, base in s.BASE_RE.findall(text): s.bases.setdefault(cpp, base)
         for cpp, package, name in s.CLASS_RE.findall(text):
             if package.startswith('/Game/'):
-                ns = 'Game::' + '::'.join(package.split('/')[2:-1])
+                ns = '::Game::' + '::'.join(package.split('/')[2:-1])   # rooted: Game::Game would hide a bare Game::
                 spelled = cpp if aliases.get(cpp) == cpp else ns + '::' + cpp
                 s.classes[(package, name)] = spelled
             else:
                 s.classes[(package, name)] = cpp
             s.headers.setdefault(cpp, rel)
+
+    MEMBER_RE = re.compile(r'^\s+(?:class\s+|struct\s+|enum\s+class\s+)?[\w:<>,* ]+?[\s*&](\w+)(?:\[\d+\])?;', re.M)
+    MARK_RE = re.compile(r'(\w+)__UeName = "([^"]*)"')
+
+    def members(s, cpp):
+        """Class cpp's data members as its UeApi header declares them: the engine's name, lowercased -> the C++ one."""
+        cache = s.__dict__.setdefault('_members', {})
+        if cpp in cache: return cache[cpp]
+        out = {}
+        rel = s.headers.get(cpp)
+        text = s._text.get(rel, '') if rel else ''
+        m = re.search(r'\nclass %s\b[^{;]*\{(.*?)\n\};' % re.escape(cpp), text, re.S)
+        if m:
+            body = m.group(1)
+            for name in s.MEMBER_RE.findall(body): out.setdefault(name.lower(), name)
+            for c, real in s.MARK_RE.findall(body): out[real.lower()] = c
+        cache[cpp] = out
+        return out
+
+    BNDEVT_RE = re.compile(r'\bBndEvt__\w*?_K2Node_ComponentBoundEvent_\d+_(\w+?__DelegateSignature)\(([^)]*)\)')
+
+    def delegate_sig(s, name):
+        """`void(float Health)` of a native delegate signature function (HealthChangedSig__DelegateSignature), which no
+        UeApi declaration names, read off a game Blueprint's bound event of it, which has its parameters."""
+        if not hasattr(s, '_sigs'):
+            s._sigs = {}
+            for text in s._text.values():
+                for sig, params in s.BNDEVT_RE.findall(text): s._sigs.setdefault(sig, 'void(%s)' % params.strip())
+        return s._sigs.get(name)
+
+    def member_type(s, cpp, name):
+        """The C++ type class cpp's UeApi header gives data member `name` (the engine's name, any case), or None."""
+        rel = s.headers.get(cpp)
+        text = s._text.get(rel, '') if rel else ''
+        m = re.search(r'\nclass %s\b[^{;]*\{(.*?)\n\};' % re.escape(cpp), text, re.S)
+        if not m: return None
+        real = s.members(cpp).get(name.lower())
+        if not real: return None
+        t = re.search(r'^\s+(?:UE_\w+\s+)*((?:class\s+)?[\w:<>,* ]+?)\s*\b%s(?:\[\d+\])?;' % re.escape(real), m.group(1), re.M)
+        return t.group(1).replace('class ', '').strip() if t else None
 
     def header_of(s, cpp):
         return s.headers.get(cpp.split('::')[-1])
@@ -151,11 +191,17 @@ class Model:
     def __init__(s, content, mods, names_dir=None, api=None):
         s.content = content.replace('\\', '/').rstrip('/')
         s.api = api or Api()
-        s.mods = [Mod(r.rstrip('/'), n) for r, n in mods]
+        # A name given twice is one mod over two roots: the first is its UE_MOD_PACKAGE, and an asset under another
+        # sits in a `Game::...` namespace, which AssetGen cooks at that /Game path whatever the mod's package.
+        s.mods, roots = [], []
+        for r, n in mods:
+            m = next((x for x in s.mods if x.name == n), None)
+            if m is None: m = Mod(r.rstrip('/'), n); s.mods.append(m)
+            roots.append((r.rstrip('/'), m))
         s.assets = OrderedDict()     # package path -> Asset
         s.names_dir = names_dir
-        for mod in s.mods:
-            folder = s.content + mod.root[len('/Game'):]
+        for root, mod in roots:
+            folder = s.content + root[len('/Game'):]
             for dp, dn, fn in os.walk(folder):
                 dn.sort()
                 for f in sorted(fn):
@@ -166,13 +212,24 @@ class Model:
                     kind, i = classify(pkg)
                     a = Asset(pkg, path, kind, i)
                     a.mod = mod
-                    a.ns = [ident(p) for p in path[len(mod.root) + 1:].split('/')[:-1]]
+                    a.ns = [ident(p) for p in path[len(mod.root) + 1:].split('/')[:-1]] if root == mod.root else                         ['Game'] + [ident(p) for p in path[len('/Game/'):].split('/')[:-1]]
                     mod.assets.append(a)
                     s.assets[path] = a
 
     def asset_of_object(s, objpath):
         """The mod asset an object path lies in (/Game/A/B.B_C -> /Game/A/B), or None."""
         return s.assets.get(objpath.split('.', 1)[0])
+
+    def var_names(s):
+        """Every name a mod function gives a parameter or local, as C++ spells it."""
+        if not hasattr(s, '_var_names'):
+            s._var_names = set()
+            for a in s.assets.values():
+                for i, _e in enumerate(a.pkg.exports):
+                    if a.pkg.class_of(i + 1) == 'Function':
+                        st = a.pkg.struct(i)
+                        if st: s._var_names.update(ident(p.name) for p in st.props)
+        return s._var_names
 
     def ancestors(s, name):
         """The C++ class names (last component) class `name` derives from, itself first."""
@@ -248,9 +305,11 @@ class Types:
         return p
 
     def spell_mod(s, target, cur):
-        """A mod asset's C++ name as seen from asset cur: bare inside the same namespace, else fully qualified."""
-        if cur is not None and target.ns == cur.ns: return target.cpp
-        return '::'.join(target.ns + [target.cpp])
+        """A mod asset's C++ name as seen from asset cur: bare inside the same namespace, else fully qualified. Also
+        qualified when some function names a parameter or local so (`EEE_Manager*& EEE_Manager`): there the bare
+        name is the variable."""
+        if cur is not None and target.ns == cur.ns and target.cpp not in s.m.var_names(): return target.cpp
+        return '::' + '::'.join(target.ns + [target.cpp]) if target.ns else target.cpp
 
     def cls(s, pkg, idx, cur):
         """The C++ name of the class an FPackageIndex names."""
@@ -336,6 +395,7 @@ class Types:
     def signature(s, pkg, idx, cur):
         """`void(int32 Points, AActor* By)` of a delegate's signature function."""
         r = s.params(pkg, idx, cur) if idx else None
-        if r is None: return 'void()'
+        if r is None:
+            return (idx and s.api.delegate_sig(pkg.obj(idx)['name'])) or 'void()'
         ret, ps = r
         return '%s(%s)' % (ret, ', '.join('%s %s' % (t, ident(n)) for t, n, _ in ps))

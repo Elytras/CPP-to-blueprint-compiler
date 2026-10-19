@@ -1524,9 +1524,9 @@ def native_interfaces(classes, by_name, game, overrides):
 
 def write_containers(classes, sdk_dir, out_dir):
     """Containers.h: one UE_CONTAINER_<Template> macro of method declarations per library.
-    A method is const when its function is BlueprintPure."""
-    # ponytail: Keys / Values / ToArray / the set operations / RandomFromStream leave the container alone
-    # but are BlueprintCallable in 4.27, so a const container cannot call them. A name list if that bites.
+    A method is const when its function is BlueprintPure, or reads the container into an out parameter: Keys / Values
+    / ToArray / the set operations are BlueprintCallable in 4.27 but leave it alone, and a const function calls them."""
+    reads = {"Map_Keys", "Map_Values", "Set_ToArray", "Set_Union", "Set_Difference", "Set_Intersection"}
     text = io.open(os.path.join(sdk_dir, "Engine_functions.cpp"), encoding="utf-8", errors="replace").read()
     flags = dict(((m.group(1), m.group(2)), m.group(3)) for m in FUNC_FLAGS.finditer(text))
     macros, structs, count = [], set(), 0
@@ -1548,7 +1548,8 @@ def write_containers(classes, sdk_dir, out_dir):
                 continue
             structs.update(w for t, _ in args for w in re.findall(r"\bF\w+", t) if w in STRUCTS)
             members.append("    %s %s(%s)%s;" % (ret, fname[len(prefix):], ", ".join("%s %s" % a for a in args),
-                                                 " const" if "BlueprintPure" in flags.get((k.ue_name, fname), "") else ""))
+                                                 " const" if fname in reads or "BlueprintPure" in flags.get((k.ue_name, fname), "")
+                                                 else ""))
         count += len(members)
         macros.append("#define UE_CONTAINER_%s \\\n%s\n" % (tpl, " \\\n".join(members)))
     out = ["#pragma once",
@@ -1610,7 +1611,8 @@ def main():
     name_count = collections.Counter(k.ue_name for k in classes)
     for k in classes:
         k.ns = namespace_of(k.path) if k.is_bp else ""
-        k.emit = (k.ns + "::" + k.ue_name) if k.ns else (k.ue_name if k.is_bp else k.cpp)
+        # Rooted: a /Game/Game Blueprint opens Game::Game, inside which a bare `Game::X` finds that inner Game.
+        k.emit = ("::" + k.ns + "::" + k.ue_name) if k.ns else (k.ue_name if k.is_bp else k.cpp)
         k.header = ("Game/" + k.ue_name) if k.is_bp else k.path[len("/Script/"):]
     unique = set(n for n, c in name_count.items() if c == 1)
 

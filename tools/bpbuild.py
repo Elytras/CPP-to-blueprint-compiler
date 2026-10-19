@@ -375,6 +375,10 @@ def check_mod_imports(staged, mod_packages):
         return sorted(os.path.relpath(f, content).replace(os.sep, "/")
                       for f in cooked_assets(content) if f.endswith(".uasset"))
 
+    # A mod may cook under a second root (`namespace Game::...`, as EEE does), beside its package's folder: look at
+    # its whole Content folder, which holds what it ships, kept packages included.
+    staged = [(mod, os.path.normpath(os.path.join(content, *[".."] * (package.count("/") - 1))), "/Game")
+              for mod, content, package in staged]
     produced = set()
     for _mod, content, package in staged:
         produced.update(package + "/" + f[:-len(".uasset")] for f in packages(content))
