@@ -1623,7 +1623,7 @@ An interface stub is a Blueprint Interface asset with one function graph per fun
 included. A Blueprint made in the editor lists it under Class Settings > Implemented Interfaces and implements its
 functions as it would any interface's. Cooked by the editor, that Blueprint names the interface the mod's pak cooks, so
 mount the mod's pak beside it: a call through the interface, from the mod's code or from a Blueprint, then reaches the
-editor Blueprint's implementation. The interface's variables are AssetGen's own idea and are left out of the stub, so
+editor Blueprint's implementation (checked in the editor, not yet in the game). The interface's variables are AssetGen's own idea and are left out of the stub, so
 an editor Blueprint that implements the interface does not get them. An interface that extends another of the mod's
 has that one's stub as its parent.
 
