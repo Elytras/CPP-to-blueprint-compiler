@@ -1247,7 +1247,7 @@ python tools/bpbuild.py <mods dir> <UeApi dir> <assetgen> [--force] [--no-pak]
 | `<UeApi dir>` | The include dir that every compile gets. |
 | `<assetgen>` | The compiler. bpbuild makes the path absolute first, so a relative one works. |
 | `--force` | Recompile every mod, changed or not. |
-| `--no-pak` | Compile only, and leave the staged files for you to pack. `embed` is not applied either: dependencies are copied in only when a pak is made. |
+| `--no-pak` | Compile only, and leave the staged files for you to pack. `embed` and `bundle` are not applied either: dependencies and bundle files are copied in only when a pak is made. |
 
 With fewer than three arguments, bpbuild prints its usage line and stops.
 
@@ -1283,6 +1283,7 @@ Keys of a mod:
 | `sources` | required | The mod's `.cpp` files, relative to the mods dir; globs work (`MyMod/*.cpp`, expanded in name order). The `.cpp` files compile into the mod's package folder as **one** translation unit: with more than one, bpbuild writes `build/<name>/<name>.unity.cpp`, which `#include`s each in order, and compiles that. So a mod can keep a header and a `.cpp` per class (`sources: [MyMod/*.cpp]`), `UE_MOD_PACKAGE` is written once in any one of them, and file-local names (`static` functions, anonymous namespaces) must not clash across the files. The headers they `#include "..."`, transitively, count for staleness on their own, except `UeApi/` and `UeAssets/` (the UeApi dir and the `UeAssets` dir beside it count as a whole, subfolders included); a header listed here also only counts for staleness. One of the `.cpp` files must hold the mod's `UE_MOD_PACKAGE` line: bpbuild finds the first with a text search and stops the whole build with `<files> declares no UE_MOD_PACKAGE` otherwise. With `embed`, the same check runs on each dependency. A mod with no `.cpp`, or with a listed source that does not exist, prints `SKIP - no such source` and counts as failed. |
 | `needs` | none | Mods to build before this one. An unknown name stops the build with ``mods.yaml: `needs` names an unknown mod: <name>``. A cycle is not an error: bpbuild breaks it, and since every mod compiles before any mod packs, both sides still see each other's assets. |
 | `embed` | `false` | Also packs every mod reachable through `needs`, directly or not, into this mod's pak, and merges their registries into its registry. The pak then works on its own. |
+| `bundle` | none | A list of folders, relative to the mods dir, each laid out like a staged FSD tree (`Content/...`). Every file in them is copied unchanged into the mod's pak at its path under the folder: `MyMod/Bundle/Content/_Shared/Lib.uasset` ships as `FSD/Content/_Shared/Lib.uasset`. It is for assets the mod calls but must not cook, such as a shared framework that other mods ship the same copy of. Nothing reads or rewrites the bytes. A listed entry that is not an existing folder stops the build with ``mods.yaml: a `bundle` entry is not a folder: <entry>``. `embed` does not carry a dependency's bundle: a mod that needs those files lists the folder in its own `bundle`. |
 | `generate_api` | `false` | Also writes the editor stubs for this mod's classes, interfaces, structs and enums (see [Editor API stubs](#editor-api-stubs)). |
 | `api_dir` | top-level `api_dir`, else `<mods dir>/out/api/Content` | Where the stubs go: the `Content` folder of a UE project. A mod's stubs land in `<api_dir>/<package path without /Game>/`. Only read when `generate_api` is set. |
 
@@ -1312,7 +1313,8 @@ api_dir:
    `BPBUILD_JOBS` of them run at once. Each mod's output is still printed whole, in this order. A failed compile prints
    `<name> FAILED`, and the build moves on.
 2. **Pack.** Every mod's assets exist by now, so an `embed` mod can copy in its dependencies' assets. Each mod whose pak
-   is out of date is packed with UnrealPak.
+   is out of date is packed with UnrealPak. Just before UnrealPak runs, the `embed` copy is made, and then the `bundle`
+   folders are copied into `build/<name>/FSD` as they are (a bundle file replaces a staged file at the same path).
 3. **Check imports between mods.** If nothing failed, bpbuild reads the import table of every `.uasset` in each mod's
    package folder, namespace subfolders included. An import of a package inside one of this build's mod folders that no mod produced fails the
    build with `<asset> imports <package>, which no mod in this build produces`. In game, such an import loads without an
@@ -1339,7 +1341,7 @@ The last line counts the mods built, packed, up to date and failed. The exit sta
 | bpbuild... | when |
 | --- | --- |
 | recompiles the mod | `--force` is given; the mod's package folder holds no staged asset yet; `generate_api` is set and a stub folder holds no `.uasset`/`.uexp`; the mod's entry in `mods.yaml`, or the top-level `api_dir` or `game_content`, differs from the last successful compile (kept in `build/<name>/mod.json`), so turning on `embed` repacks; or one of the `sources` or the local headers they include, any file in the UeApi dir or the `UeAssets` dir beside it, or the `assetgen` binary is newer than the **oldest** staged asset. |
-| repacks without recompiling | the newest staged asset of the mod, or of a dependency it embeds, is newer than the mod's pak (not with `--no-pak`). This picks up a dependency that changed, or a pak that an earlier `--no-pak` run skipped. |
+| repacks without recompiling | the newest staged asset of the mod, of a dependency it embeds, or of its `bundle` folders is newer than the mod's pak (not with `--no-pak`). This picks up a dependency or bundle file that changed, or a pak that an earlier `--no-pak` run skipped. |
 | prints `up to date` | neither applies. |
 
 The oldest asset is the reference, not the newest, so a half-finished earlier run does not look current.
@@ -1354,6 +1356,7 @@ The oldest asset is the reference, not the newest, so a half-finished earlier ru
     FSD/AssetRegistry.bin                the pak's one registry
     FSD/Content/<package path>/*.uasset|*.uexp
     FSD/Content/<dependency package>/... copied in at pack time when embed is set
+    FSD/<bundle file path>               copied in at pack time when bundle is set
   out/<name>_P.pak
   out/api/Content/<package path>/        default stub folder, with a .assetgen list of the stubs written there
 ```

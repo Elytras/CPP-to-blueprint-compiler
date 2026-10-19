@@ -214,6 +214,8 @@ def bundle_files(mod, bp):
     out = []
     for folder in mod.get("bundle") or []:
         root = os.path.join(bp, folder)
+        if not os.path.isdir(root):
+            sys.exit("mods.yaml: a `bundle` entry is not a folder: %s" % folder)
         out += [(os.path.join(dirpath, f), os.path.relpath(os.path.join(dirpath, f), root))
                 for dirpath, _dirs, files in os.walk(root) for f in files]
     return out
