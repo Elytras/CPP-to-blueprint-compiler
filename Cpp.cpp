@@ -7340,12 +7340,17 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
             const FRecord* In = nullptr;
             for (const FRecord* A = Cur; A && !Found; A = A->Base.empty() ? nullptr : Find(A->Base))
                 if (auto M = A->Methods.find(Target); M != A->Methods.end()) { Found = M->second; In = A; }
+            /* The engine's test is ParmsSize > 0, and a return value is a parameter there too. */
+            std::string Ret = Found ? TypeOf(*Found) : std::string();
+            Ret = Ret.substr(0, Ret.find('('));
+            while (!Ret.empty() && Ret.back() == ' ') Ret.pop_back();
             const char* Why = !Found ? "names no function of the class"
                             : IsInlineMethod(*In, Target) ? "names an inline method, which is no function of the class"
-                            : !ParmNames(*Found).empty() ? "names a function that takes parameters" : nullptr;
+                            : !ParmNames(*Found).empty() ? "names a function that takes parameters"
+                            : Ret != "void" ? "names a function that returns a value" : nullptr;
             if (Why)
             { *Err = CurFnName + ": K2_SetTimer by name " + Target + " " + Why + ", so the engine sets no timer; "
-                     "name a method without parameters, or pass a delegate"; return false; }
+                     "name a void method without parameters, or pass a delegate"; return false; }
         }
     }
 
@@ -12965,9 +12970,14 @@ bool FCompiler::HoistWideRead(FArgIR& A, FBlueprintClass& BP, std::vector<FPrope
     FArgIR AnyMantissa = Math("NotEqual_IntInt", { Math("Or_IntInt", { Math("And_IntInt", { Hi, IntK(0xFFFFF) }), Lo }), IntK(0) });
     AnyMantissa.InnerType = "bool";
     const FArgIR NanOrInf = Math("Or_IntInt", { IntK(0x7F800000), Select(IntK(0x400000), IntK(0), AnyMantissa) });
-    const FArgIR Magnitude = Select(NanOrInf, Select(IntK(0x7F800000), Select(IntK(0), Body, Cmp("LessEqual_IntInt", 1023 - 127)),
-                                                     Cmp("GreaterEqual_IntInt", 1023 + 128)),
-                                    Cmp("EqualEqual_IntInt", 0x7FF));
+    /* Each Cmp adds an import, and Select is a call, whose arguments run in the compiler's order: one per statement,
+       so the import rows come out the same from MSVC and clang. This is the order MSVC evaluated the nested arguments
+       in (right to left), so its output does not move. */
+    const FArgIR IsNanOrInf = Cmp("EqualEqual_IntInt", 0x7FF);
+    const FArgIR Overflows = Cmp("GreaterEqual_IntInt", 1023 + 128);
+    const FArgIR Underflows = Cmp("LessEqual_IntInt", 1023 - 127);
+    const FArgIR Magnitude = Select(NanOrInf, Select(IntK(0x7F800000), Select(IntK(0), Body, Underflows), Overflows),
+                                    IsNanOrInf);
     FArgIR Bits = Math("Or_IntInt", { Magnitude, Math("And_IntInt", { Hi, IntK(int32(0x80000000u)) }) });
     A = IntrinsicK("__AsFloat__", std::move(Bits), "float", BP.ScriptStruct("/Script/CoreUObject", "Vector"));
     return HoistReadsInArg(A, BP, Locals, OutPre, Err);

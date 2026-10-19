@@ -8126,8 +8126,12 @@ refused('TimerByNameInline', '  int32 N;\n  inline void Blink() { N = 2; }\n'
 refused('TimerByNameMissing', '  int32 N;\n  void Tock() { N = 3; }\n'
         '  void Start() { UKismetSystemLibrary::K2_SetTimer(this, "Tik", 1.0f, true, 0.0f, 0.0f); }\n',
         'K2_SetTimer by name Tik names no function of the class')
+# The engine's test is ParmsSize > 0, which counts the return value: a method that returns one sets no timer either.
+refused('TimerByNameReturns', '  int32 N;\n  int32 Poll() { return ++N; }\n'
+        '  void Start() { UKismetSystemLibrary::K2_SetTimer(this, "Poll", 1.0f, true, 0.0f, 0.0f); }\n',
+        'K2_SetTimer by name Poll names a function that returns a value')
 print('ok  delegate refusals: a bind of another class\'s method on this, a call to a dispatcher\'s signature, a timer by a '
-      'name with parameters, inline or missing')
+      'name with parameters, a return value, inline or missing')
 
 
 # ---- SCS: the SimpleConstructionScript, its nodes, the component templates and the inheritable component handler
