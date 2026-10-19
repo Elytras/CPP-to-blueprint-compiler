@@ -4281,7 +4281,15 @@ def path_edits():
             assert points(b) == (1, 2, 3, 4, 50, 6) and spans(b) == [['1.0', '9.0'], ['3.0', '4.0']], (points(b), spans(b))
             la, lb = dumpexp.load(a), dumpexp.load(b)
             cdo = [e['name'] for e in la[5]].index('Default__TypesTest_C')
-            other = lambda base: [l for l in dump('dumptags.py', base, cdo).splitlines() if not l.startswith(('  Points ', '  Spans '))]
+            def other(base):
+                """The default object's tags but Points and Spans, with their element lines indented under them."""
+                keep, edited = [], False
+                for l in dump('dumptags.py', base, cdo).splitlines():
+                    if not l.startswith('    '):
+                        edited = l.startswith(('  Points ', '  Spans '))
+                    if not edited:
+                        keep.append(l)
+                return keep
             assert other(a) == other(b), 'another tag changed'
             assert all(i == cdo or blob(la, x) == blob(lb, y) for i, (x, y) in enumerate(zip(la[5], lb[5]))), 'another export changed'
             proc = subprocess.run([ASSETGEN, 'roundtrip', tmp], capture_output=True, encoding='utf-8')
