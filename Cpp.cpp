@@ -14919,10 +14919,20 @@ bool FCompiler::GenerateInterface(const FRecord& R, const std::string& OutDir, s
                        [](FScript& S, FIndex) { S.Return(); S.EndOfScript(); },
                        FUNC_Public | FUNC_BlueprintCallable | FUNC_BlueprintEvent
                            | (bOut ? FUNC_HasOutParms : 0));
+        if (auto Cat = R.Categories.find(Entry.first); Cat != R.Categories.end()) BP.ApiCategory[Entry.first] = Cat->second;
+        if (auto Doc = R.Docs.find(Entry.first); Doc != R.Docs.end()) BP.ApiDocs[Entry.first] = Doc->second;
     }
 
     BP.Finish();
     if (!SavePackage(P, OutDir, PackageName, Err)) return false;
+    /* The editor's side, so a Blueprint made there can implement it: a Blueprint Interface asset with a function graph
+       per function, as the editor saves one. Its variables, AssetGen's own idea, are not there: the editor's interfaces
+       hold none. */
+    if (ApiDir && !BP.WriteApi(*ApiDir, Err))
+    {
+        printf("  %-14s -> no API asset: %s\n", R.CppName.c_str(), Err->c_str());
+        Err->clear();
+    }
     /* The class, `<I>_C`, as a class's row names it and the game's Blueprint interfaces' rows do (TempRocketInterface);
        their `<I>` row is the editor's Blueprint asset, which a cooked package does not hold. */
     RegistryRows.push_back({ PackageName, ClassOf(R), "BlueprintGeneratedClass" });

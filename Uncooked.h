@@ -35,6 +35,7 @@ struct FApiClass
     std::vector<FPropertyDef> Variables;
     std::map<std::string, std::string> Categories;   // function or variable -> its editor category, "A|B"
     std::map<std::string, std::pair<std::string, std::string>> Docs;   // function -> (tooltip, keywords)
+    bool bInterface = false;                 // a UE_INTERFACE: written as a Blueprint Interface
 };
 
 /*

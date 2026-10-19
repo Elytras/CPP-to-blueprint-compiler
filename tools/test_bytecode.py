@@ -3617,6 +3617,45 @@ def api_stub():
     print('ok  NameTest: the API stub carries UE_CATEGORY, UE_TOOLTIP, UE_KEYWORDS, access and purity, and leaves a private field out')
 
 
+def api_stub_interface():
+    """The editor API stub of a mod interface (IfaceStub): a Blueprint Interface, as the UE 4.27 editor saves one - the
+    Blueprint's type BPTYPE_Interface, its parent the engine's Interface (or the interface it extends), a function graph
+    per function whose entry has the editor's flags for one (Public | BlueprintCallable | BlueprintEvent), and a generated
+    class flagged CLASS_Interface. Its variables, which the editor's interfaces cannot hold, are left out. The editor
+    loads it, and a Blueprint made there implements it (DESIGN.md)."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        os.makedirs(os.path.join(tmp, 'cooked'))
+        os.makedirs(os.path.join(tmp, 'api'))
+        proc = assetgen_compile([os.path.join(TESTS, 'IfaceStub.cpp'), UEAPI, os.path.join(tmp, 'cooked'),
+                                 '--api', os.path.join(tmp, 'api')])
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        got = {}
+        for name in ('IStubPing', 'IStubLoud'):
+            base = os.path.join(tmp, 'api', name)
+            exports = dumpexp.load(base)[5]
+            imports = import_paths(base)
+            bp = dump('dumptags.py', base, 0)
+            parent = int(re.search(r'ParentClass \[0\] ObjectProperty size=4: index (-?\d+)', bp).group(1))
+            graphs = {exports[e['outer'] - 1]['name']: dump('dumptags.py', base, i)
+                      for i, e in enumerate(exports) if e['name'].startswith('K2Node_FunctionEntry')}
+            cls = next(i for i, e in enumerate(exports) if e['name'] == name + '_C')
+            got[name] = dict(parent=imports[-parent - 1], graphs=graphs, bp=bp,
+                             flags=re.search(r'ClassFlags (0x[0-9a-f]+)', dump('dumpstruct.py', base, cls)).group(1))
+    ping = got['IStubPing']
+    assert 'BPTYPE_Interface' in ping['bp'] and 'NewVariables' not in ping['bp'], ping['bp']    # Marks left out
+    assert ping['parent'] == '/Script/CoreUObject.Interface', ping['parent']
+    assert got['IStubLoud']['parent'] == '/Game/_ElytrasMods/IfaceStub/IStubPing.IStubPing_C', got['IStubLoud']['parent']
+    assert set(ping['graphs']) == {'Ping', 'Note'} and set(got['IStubLoud']['graphs']) == {'Shout'}, ping['graphs']
+    for g in list(ping['graphs'].values()) + list(got['IStubLoud']['graphs'].values()):
+        assert int(re.search(r'ExtraFlags \[0\] IntProperty size=4: (-?\d+)', g).group(1)) == 0x0C020000, g
+    assert all(got[n]['flags'] == '0x44010' for n in got), got     # CLASS_Parsed | CLASS_Interface | CLASS_CompiledFromBlueprint
+    for text in (b'Answers a ping with a number.', b'echo reply'):
+        assert text.hex() in ping['graphs']['Ping'] and text.hex() not in ping['graphs']['Note'], text
+    print('ok  IfaceStub: a mod interface\'s API stub is a Blueprint Interface with a graph per function, its flags, '
+          'parent and tooltip, and no variables')
+
+
 def static_assets():
     """AssetTest: namespace-scope objects cook as assets of their class holding exactly the members their braces
     name; `&Asset` anywhere is a reference to that asset's package path."""
@@ -4277,6 +4316,7 @@ func_stub_super()
 engine_names()
 object_forwards()
 api_stub()
+api_stub_interface()
 static_assets()
 ue_assets()
 asset_elsewhere()

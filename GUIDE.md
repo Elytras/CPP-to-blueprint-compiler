@@ -1147,7 +1147,7 @@ building a mod.
 | `<source.cpp>` | One translation unit. It must contain `UE_MOD_PACKAGE("/Game/...")`, which names the mod's own package folder. |
 | `<include-dir>` | The SDK's `UeApi` folder. It must hold `Conv.json`, `Ops.json`, `Types.json`, `Events.json` and `NotCallable.json`; otherwise the compile stops with `missing or invalid <dir>/<file> (run genueapi.py)`. Its `Version.json` must name a genueapi this compiler can use; a folder an older one wrote, or one without the file, stops the compile before clang runs, with `<dir> was written by an older genueapi (...) - regenerate it with AssetGen/tools/genueapi.py`. A folder with none of the three (no UeApi at all, or a path that does not exist) stops it with `missing or invalid <dir>/Conv.json (run genueapi.py)`. |
 | `<out-dir>` | Where the mod's own packages go. The compiler creates it, and the folder of every package it writes, when missing. |
-| `--api <api-dir>` | Optional, after the out dir. Also writes an editor stub for each class, struct and enum into this folder (see [Editor API stubs](#editor-api-stubs)). It is an output folder for the editor, not the SDK folder. It must already exist: without it a class gets no stub and prints `<Class> -> no API asset: cannot write .uasset`, and a struct or enum fails the compile. |
+| `--api <api-dir>` | Optional, after the out dir. Also writes an editor stub for each class, interface, struct and enum into this folder (see [Editor API stubs](#editor-api-stubs)). It is an output folder for the editor, not the SDK folder. It must already exist: without it a class gets no stub and prints `<Class> -> no API asset: cannot write .uasset`, and a struct or enum fails the compile. |
 | `--game <folder /Game is in>` | Optional, after the out dir. The `Content` folder of the extracted game pak, which `UE_ASSET_EDIT`, `UE_ASSET_EDITS` and `UE_PATCH` read the game's packages from. Without it, an edit is refused. |
 
 **Parsing.** AssetGen runs `clang++` from `PATH` with `-std=c++20 -fsyntax-only` and reads the syntax tree that clang
@@ -1270,7 +1270,7 @@ Keys of a mod:
 | `sources` | required | The mod's `.cpp` files, relative to the mods dir; globs work (`MyMod/*.cpp`, expanded in name order). The `.cpp` files compile into the mod's package folder as **one** translation unit: with more than one, bpbuild writes `build/<name>/<name>.unity.cpp`, which `#include`s each in order, and compiles that. So a mod can keep a header and a `.cpp` per class (`sources: [MyMod/*.cpp]`), `UE_MOD_PACKAGE` is written once in any one of them, and file-local names (`static` functions, anonymous namespaces) must not clash across the files. The headers they `#include "..."`, transitively, count for staleness on their own, except `UeApi/` and `UeAssets/` (the UeApi dir and the `UeAssets` dir beside it count as a whole, subfolders included); a header listed here also only counts for staleness. One of the `.cpp` files must hold the mod's `UE_MOD_PACKAGE` line: bpbuild finds the first with a text search and stops the whole build with `<files> declares no UE_MOD_PACKAGE` otherwise. With `embed`, the same check runs on each dependency. A mod with no `.cpp`, or with a listed source that does not exist, prints `SKIP - no such source` and counts as failed. |
 | `needs` | none | Mods to build before this one. An unknown name stops the build with ``mods.yaml: `needs` names an unknown mod: <name>``. A cycle is not an error: bpbuild breaks it, and since every mod compiles before any mod packs, both sides still see each other's assets. |
 | `embed` | `false` | Also packs every mod reachable through `needs`, directly or not, into this mod's pak, and merges their registries into its registry. The pak then works on its own. |
-| `generate_api` | `false` | Also writes the editor stubs for this mod's classes, structs and enums (see [Editor API stubs](#editor-api-stubs)). |
+| `generate_api` | `false` | Also writes the editor stubs for this mod's classes, interfaces, structs and enums (see [Editor API stubs](#editor-api-stubs)). |
 | `api_dir` | top-level `api_dir`, else `<mods dir>/out/api/Content` | Where the stubs go: the `Content` folder of a UE project. A mod's stubs land in `<api_dir>/<package path without /Game>/`. Only read when `generate_api` is set. |
 
 `api_dir` takes any of these forms:
@@ -1553,8 +1553,9 @@ Run with fewer than two arguments, it prints only the last sentence of its help 
 ## Editor API stubs
 
 `generate_api: true` in `mods.yaml`, or `--api <dir>` on `assetgen compile`, also writes the editor side of a mod: one
-uncooked UE 4.27 package per class, struct and enum, with signatures and no bodies. Someone working in the UE 4.27
-editor can then call your mod's functions from their own Blueprints. At run time, your mod's pak supplies the bodies.
+uncooked UE 4.27 package per class, interface, struct and enum, with signatures and no bodies. Someone working in the
+UE 4.27 editor can then call your mod's functions from their own Blueprints, and implement its interfaces in them. At
+run time, your mod's pak supplies the bodies.
 
 ```yaml
 mods:
@@ -1616,14 +1617,22 @@ The compile prints a line for each thing a stub leaves out, and none of them fai
   since they add nothing. A struct or enum stub that cannot be written, by contrast, fails the compile.
 
 No stub is written for the compiler's own helper structs (`FDeref`, the `TMap` walk structs and the nested-container
-wrappers). Not yet: a stub for an interface the mod declares, so a Blueprint made in the editor cannot implement one; a
-mod class written in C++ can.
+wrappers).
+
+An interface stub is a Blueprint Interface asset with one function graph per function, its tooltip and keywords
+included. A Blueprint made in the editor lists it under Class Settings > Implemented Interfaces and implements its
+functions as it would any interface's. Cooked by the editor, that Blueprint names the interface the mod's pak cooks, so
+mount the mod's pak beside it: a call through the interface, from the mod's code or from a Blueprint, then reaches the
+editor Blueprint's implementation. The interface's variables are AssetGen's own idea and are left out of the stub, so
+an editor Blueprint that implements the interface does not get them. An interface that extends another of the mod's
+has that one's stub as its parent.
 
 To use the stubs:
 
 1. Point `api_dir` at your UE 4.27 project's `Content` folder, or copy the stubs from `out/api/Content`.
-2. Open the project. Stubs of a function library, of actor classes, and of structs and enums have been loaded and
-   re-saved in UE 4.27.2 with no errors.
+2. Open the project. Stubs of a function library, of actor and object classes, of interfaces, and of structs and enums
+   have been loaded and re-saved in UE 4.27.2 with no errors. A Blueprint made in the editor against an interface stub
+   implements it, compiles and cooks.
 3. Call the mod's functions from your Blueprints.
 4. Do not ship the stubs. Keep their folder out of your cook, and install the mod's own pak beside yours. UE's
    "Directories to never cook" packaging setting should keep them out; that has not been tested.
@@ -1975,8 +1984,6 @@ A few mistakes also compile without a message, because the construct itself work
 
 - A widget animation. The layout itself, its events, named slots and property bindings included, is declared with
   `UE_WIDGET` and the constructor. See [Widget layouts](REFERENCE.md#widget-layouts).
-- Editor stubs for the mod's interfaces. A Blueprint made in the editor cannot implement an interface that the mod
-  declares; a C++ class can. See [Editor API stubs](#editor-api-stubs).
 - A check of a game component class's own native data. A `UE_COMPONENT` of one of the game's component classes gets
   the native data of its engine ancestors, which matches every game component class that appears as a template in the
   game's content. 177 never appear there, mostly abstract bases, objectives and character states; one of those that

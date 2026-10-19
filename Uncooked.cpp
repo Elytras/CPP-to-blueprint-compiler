@@ -315,7 +315,10 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
     const FIndex ImpSchema = Object("/Script/BlueprintGraph", "Class", "EdGraphSchema_K2");
     const FIndex ImpEntry = Object("/Script/BlueprintGraph", "Class", "K2Node_FunctionEntry");
     const FIndex ImpResult = Object("/Script/BlueprintGraph", "Class", "K2Node_FunctionResult");
-    const FIndex ImpParent = Object(Class.ParentPackage, "Class", Class.ParentClass);
+    /* A mod parent (an interface extending another of the mod's) is a Blueprint's generated class. */
+    const bool bModParent = Class.ParentPackage.compare(0, 6, "/Game/") == 0;
+    const FIndex ImpParent = bModParent ? Object(Class.ParentPackage, "BlueprintGeneratedClass", Class.ParentClass, "/Script/Engine")
+                                        : Object(Class.ParentPackage, "Class", Class.ParentClass);
     const FIndex ImpBpgc = Object("/Script/Engine", "Class", "BlueprintGeneratedClass");
     const FIndex ImpObjectClass = Object("/Script/CoreUObject", "Class", "Object");
     const FIndex ImpParentCdo = Object(Class.ParentPackage, Class.ParentClass,
@@ -479,9 +482,9 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
     const std::vector<int32> GraphRows = GraphExports;
     Blueprint.Serialize = [=](FArc& Ar) {
         Tag(Ar, "ParentClass", "ObjectProperty", [=](FArc& V) { V.Idx(ImpParent); });
-        if (bFunctionLibrary)
+        if (bFunctionLibrary || Class.bInterface)
             Tag(Ar, "BlueprintType", "ByteProperty",
-                [](FArc& V) { V.Name("BPTYPE_FunctionLibrary"); }, "EBlueprintType");
+                [&](FArc& V) { V.Name(Class.bInterface ? "BPTYPE_Interface" : "BPTYPE_FunctionLibrary"); }, "EBlueprintType");
         Tag(Ar, "BlueprintSystemVersion", "IntProperty", [](FArc& V) { V.I32(2); });
         if (!GraphRows.empty())
             Tag(Ar, "FunctionGraphs", "ArrayProperty", [=](FArc& V) {
@@ -652,7 +655,9 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
         Ar.I32(0);                                  // script storage size
 
         Ar.I32(0);                                  // FuncMap
-        Ar.U32(0x00040010);                         // CLASS_Parsed | CLASS_CompiledFromBlueprint
+        /* CLASS_Parsed | CLASS_CompiledFromBlueprint, and CLASS_Interface on a Blueprint Interface (measured on an
+           editor-made one, 0x44010). */
+        Ar.U32(Class.bInterface ? 0x00044010 : 0x00040010);
         Ar.Idx(ImpObjectClass);                     // ClassWithin
         Ar.Name("Engine");                          // ClassConfigName
         Ar.Idx(Exp(ExBlueprint));                   // ClassGeneratedBy
@@ -678,7 +683,7 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
     Row.ClassName = "Blueprint";
     const std::string ParentPath = "Class'" + Class.ParentPackage + "." + Class.ParentClass + "'";
     Row.Tags = {
-        { "BlueprintType", bFunctionLibrary ? "BPTYPE_FunctionLibrary" : "BPTYPE_Normal" },
+        { "BlueprintType", Class.bInterface ? "BPTYPE_Interface" : bFunctionLibrary ? "BPTYPE_FunctionLibrary" : "BPTYPE_Normal" },
         { "ParentClass", ParentPath },
         { "NativeParentClass", ParentPath },
         { "GeneratedClass", "BlueprintGeneratedClass'" + P.Name() + "." + ClassName + "'" },

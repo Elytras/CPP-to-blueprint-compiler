@@ -1259,6 +1259,7 @@ bool FBlueprintClass::WriteApi(const std::string& OutDir, std::string* Err) cons
         Api.Functions.push_back({ Fn.Def.Name, Fn.Def.Params, Fn.Def.FunctionFlags });
     Api.Categories = ApiCategory;
     Api.Docs = ApiDocs;
+    Api.bInterface = (ClassFlags & CLASS_Interface) != 0;
     /* Only what the outside can see. The rest - the UberGraphFrame pointer above all - is
        compiler plumbing that would show up as a broken variable in the editor. */
     for (const FPropertyDef& Var : Vars)

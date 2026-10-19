@@ -488,8 +488,9 @@ Notes:
   variable there is left out of the API stub.
 - Categories and access matter for the editor API stub that `generate_api` writes, so that a Blueprint made in the
   editor can call the mod. `UE_CATEGORY` is written only there, as the category of each variable and function, and so
-  are `UE_TOOLTIP` and `UE_KEYWORDS`: the cooked class has no categories, and without `generate_api` the macro does nothing. The stub keeps a private function,
-  flagged private, and leaves out interfaces the mod declares. Whether the editor lists the members under their
+  are `UE_TOOLTIP` and `UE_KEYWORDS`: the cooked class has no categories, and without `generate_api` the macros do
+  nothing. The stub keeps a private function, flagged private. A stub's tooltip and keywords have been checked in UE
+  4.27.2: they are the compiled function's ToolTip and Keywords. Whether the editor lists the members under their
   category has not been checked. See [Editor API stubs](GUIDE.md#editor-api-stubs).
 
 ### Names
@@ -4593,7 +4594,7 @@ Notes:
 | `class IBoth : public IAimable, public IMarkable` | Refused: "an interface extends one interface at most". A UClass has one super. | Refused |
 | `class IActorish : public AActor { public: UE_INTERFACE; };` | Refused: "IActorish extends AActor, which is not an interface". An interface's only base is another interface, the mod's or the game's. | Refused |
 | `UE_COMPONENT(UStaticMeshComponent, Hull);` on an interface | Refused: "an interface cannot declare a UE_COMPONENT". Declare it on the implementing actor. | Refused |
-| Implementing a mod interface from an editor Blueprint | Not built. The editor API stubs cover a mod's classes, structs and enums, not its interfaces. See [Editor API stubs](GUIDE.md#editor-api-stubs). | Not yet |
+| `generate_api: true` with a `UE_INTERFACE` | The interface's editor API stub is a Blueprint Interface asset at the interface's own path, so a Blueprint made in the UE 4.27 editor can list it under Implemented Interfaces and implement its functions. Cooked by the editor, that Blueprint uses the interface the mod's pak cooks: a call through the interface, from the mod or from another Blueprint, runs its implementation. The interface's variables are not in the stub, since the editor's interfaces hold none, so an editor Blueprint that implements it does not have them. See [Editor API stubs](GUIDE.md#editor-api-stubs). | Yes |
 
 ```cpp
 class IAimable {
