@@ -604,21 +604,12 @@ class Run:
             cls = '::' + s.types.spell_mod(a, None) if a else \
                 s.api.classes.get(('/Script/' + o['class_package'].split('/')[-1], o['class_name'])) or \
                 s.api.classes.get((o['class_package'], o['class_name'])) or 'UObject'   # the modded dump has it too
-        cast = None
-        mods = {x.cpp for x in s.model.assets.values() if x.kind in ('class', 'widget') and getattr(x, 'cpp', None)}
-        if cls and cls.split('::')[-1] in mods:
-            # A kept asset of a class the mod cooks: AssetGen refuses that UE_ASSET_AT (it takes the asset for another
-            # mod's, built against its own copy of the class). This one was built against the class at the very path
-            # the rebuilt mod cooks it to, so it is named by its first native ancestor, which the engine's import check
-            # (IsA) accepts, and cast back where it is used.
-            cast = cls.lstrip(':')
-            cls = next((c for c in s.model.ancestors(cls.split('::')[-1]) if c not in mods), 'UObject')
         ns = ['Assets'] + [ident(p) for p in package.split('/')[2:-1]]
         name = ident(obj)
         mod = cur.mod.name if cur is not None else ''
         s.assets_used[mod][path] = (cls, ns, name)
         text = '::'.join(ns + [name])
-        return '(%s*)&%s' % (cast, text) if cast else '&' + text
+        return '&' + text
 
 
 def split_params(text):

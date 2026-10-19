@@ -20104,6 +20104,9 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         const Json& T = D->second->contains("type") ? (*D->second)["type"] : Json::object();
         const FRecord* R = Find(StripTypeKeywords(T.value("desugaredQualType", T.value("qualType", std::string()))));
         if (!R || R->bIsStruct || !R->IsGenerated()) continue;
+        /* An asset in this mod's own folder (one bpbuild ships as cooked, `kept:`) is an instance of the class this
+           mod cooks: its import names the class at the same path. */
+        if (Lower(Path).rfind(Lower(ModPackage) + "/", 0) == 0) continue;
         const std::string Leaf = LeafOf(R->CppName);
         *Err = Qual + " at " + Path + " is a " + R->CppName + ", which this mod cooks its own copy of, so it would load as null: "
                "name the class's owner where it is declared, e.g. UE_CLASS(\"" + Path.substr(0, Path.rfind('/') + 1) + Leaf
