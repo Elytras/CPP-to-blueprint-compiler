@@ -1380,8 +1380,11 @@ void FBlueprintClass::FinishCurve(FIndex Class, FIndex ClassCdo, const FTimeline
 /* Measured on DRG's ENU_TextCase: the tags (the editor's DisplayNameMap), no GUID, then UEnum::Names as
    (FName, int64) pairs ending in the _MAX entry, then CppForm 1 (Namespaced). Nothing outside WITH_EDITOR
    reads the names' shape, so they are the C++ ones rather than the editor's NewEnumeratorN.
-   ponytail: no DisplayNameMap; UEnum::GetDisplayNameTextByIndex falls back to the enumerator's own name. */
-void FBlueprintClass::FinishEnum(const std::vector<std::pair<std::string, int64>>& Enumerators)
+   No DisplayNameMap unless an enumerator is cooked under another name (`__UeEnumNames`): UEnum::GetDisplayNameTextByIndex
+   then falls back to the enumerator's own name. With one, each renamed enumerator's display name is its C++ name, the
+   map's text as the editor writes it (no flags, a Base history: empty namespace, a 32-hex key, the string). */
+void FBlueprintClass::FinishEnum(const std::vector<std::pair<std::string, int64>>& Enumerators,
+                                 const std::vector<std::pair<std::string, std::string>>& DisplayNames)
 {
     const FIndex EnumClass = EngineClass("/Script/Engine", "UserDefinedEnum");
     const FIndex EnumCdo = ClassDefaultObject("/Script/Engine", "UserDefinedEnum");
@@ -1399,7 +1402,25 @@ void FBlueprintClass::FinishEnum(const std::vector<std::pair<std::string, int64>
     for (const auto& En : Enumerators) Max = std::max(Max, En.second + 1);
     const std::string Prefix = ClassName;
     const auto Names = Enumerators;
+    const std::string Seed = P.Name() + "." + ClassName;
     E.Serialize = [=](FArc& Ar) {
+        if (!DisplayNames.empty())
+            Tag(Ar, "DisplayNameMap", "MapProperty", [&](FArc& M) {
+                M.I32(0);                                   // keys to remove
+                M.I32(int32(DisplayNames.size()));
+                for (const auto& [Key, Shown] : DisplayNames)
+                {
+                    M.Name(Key);
+                    M.U32(0);                               // flags
+                    M.U8(0);                                // ETextHistoryType::Base
+                    M.Str("");                              // namespace
+                    char Hex[33];
+                    const uint32 H = StrCrc32(Seed + "::" + Key);
+                    snprintf(Hex, sizeof(Hex), "%08X%08X%08X%08X", H, ~H, H * 2654435761u, H ^ 0x9E3779B9u);
+                    M.Str(Hex);                             // key
+                    M.Str(Shown);                           // source string
+                }
+            }, "NameProperty,TextProperty");
         TagEnd(Ar);
         Ar.Bool(false);
         Ar.I32(int32(Names.size() + 1));

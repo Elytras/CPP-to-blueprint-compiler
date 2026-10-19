@@ -972,6 +972,14 @@ struct FRecord
     bool IsModStruct() const { return bIsStruct && (UePackage.empty() || UePackage.compare(0, 6, "/Game/") == 0); }
 };
 
+/* A UE_STRUCT member's cooked name: its `<Member>__UeName` marker when it has one - a struct rebuilt from an editor's,
+   keeping the names that editor minted, which saved games and assets cooked against it hold - else ModFieldName's. */
+std::string ModFieldNameOf(const FRecord& R, const std::string& StructPkg, const std::string& Field)
+{
+    if (const auto It = R.UeNames.find(Field); It != R.UeNames.end()) return It->second;
+    return ModFieldName(StructPkg, Field);
+}
+
 struct FCallIR;
 
 struct FArgIR
@@ -1031,6 +1039,10 @@ struct FEnumInfo
 {
     std::string Package, UeName, Underlying, First;     // First: the enumerator a zero is written as
     bool bEnumClass = false;    // a native `enum class` (Types.json "form"), whose properties are EnumProperties
+    std::map<std::string, std::string> UeEntries;       // a UE_ENUM's `__UeEnumNames`: C++ enumerator -> cooked name
+    std::map<std::string, std::string> UeDisplay;       // and -> display name, where it gives one
+    /* The enumerator's cooked name (without the `Enum::`): the C++ one unless `__UeEnumNames` renames it. */
+    std::string UeEntry(const std::string& Cpp) const { const auto It = UeEntries.find(Cpp); return It == UeEntries.end() ? Cpp : It->second; }
 };
 
 bool IsContainerType(const std::string& T)
@@ -2041,6 +2053,15 @@ private:
     /* The engine's name for the member or function C++ spells `Cpp`, as seen from R: R's own marker, else an
        ancestor's or an interface's. A mod's own names have no marker and are their C++ spelling; Dumper-7 keeps a
        spelling unique along a class chain, so the first marker found is the one. */
+    /* The FEnumInfo of the enum cooked as UeName (a property's StructName); an empty one for a native enum. */
+    const FEnumInfo& EnumNamed(const std::string& UeName) const
+    {
+        static const FEnumInfo None;
+        if (const auto It = Enums.find(UeName); It != Enums.end() && It->second.UeName == UeName) return It->second;
+        for (const auto& E : Enums) if (E.second.UeName == UeName) return E.second;
+        return None;
+    }
+
     std::string UeNameOf(const FRecord* R, const std::string& Cpp, int Depth = 0) const
     {
         for (; R && Depth < 64; R = R->Base.empty() ? nullptr : Find(R->Base), ++Depth)
@@ -2118,6 +2139,8 @@ private:
     std::map<std::string, FStructInfo> Structs;
     std::map<std::string, int64> EnumValues;          // clang EnumConstantDecl id -> value
     std::map<std::string, std::vector<std::pair<std::string, int64>>> EnumDecls;   // C++ name -> its enumerators, in order
+    std::map<std::string, std::map<std::string, std::string>> EnumUeNames;        // `<Enum>__UeEnumNames`: C++ -> cooked
+    std::map<std::string, std::map<std::string, std::string>> EnumUeDisplay;      // and C++ -> display
     std::map<std::string, int32> EnumConstWidth;      // clang EnumConstantDecl id -> its enum's size, 1 / 4 / 8
     std::map<std::string, uint32> EventFlags;         // UeApi/Events.json: "Package.Class.Function" -> EFunctionFlags
     /* UeApi/NotCallable.json: "Package.Class.Function" of each function the engine does not mark BlueprintCallable and
@@ -2853,6 +2876,30 @@ bool FCompiler::Collect(std::string* Err)
             ForEach(N, [&](const Json& C) { if (Kind(C) == "EnumConstantDecl") EnumConstWidth[C.value("id", std::string())] = Width; });
             return;
         }
+        /* `static constexpr const char *EMood__UeEnumNames = "Calm=NewEnumerator0|Very_Angry=NewEnumerator1=Very Angry";`:
+           the names an enum rebuilt from an editor's is cooked with, which assets and saved games cooked against it
+           hold, and the display names (DisplayNameMap) it had, the C++ names where none is given. */
+        if (Kind(N) == "VarDecl" && N.contains("name") && Name(N).size() > 13
+            && Name(N).compare(Name(N).size() - 13, 13, "__UeEnumNames") == 0)
+        {
+            std::string List;
+            FindLiteral(N, List);
+            const std::string Enum = Ns + Name(N).substr(0, Name(N).size() - 13);
+            for (size_t P = 0; P < List.size();)
+            {
+                size_t E = List.find('|', P);
+                if (E == std::string::npos) E = List.size();
+                const std::string Entry = List.substr(P, E - P);
+                const size_t Eq = Entry.find('='), Eq2 = Entry.find('=', Eq + 1);
+                if (Eq != std::string::npos)
+                {
+                    EnumUeNames[Enum][Entry.substr(0, Eq)] = Entry.substr(Eq + 1, Eq2 == std::string::npos ? std::string::npos : Eq2 - Eq - 1);
+                    if (Eq2 != std::string::npos) EnumUeDisplay[Enum][Entry.substr(0, Eq)] = Entry.substr(Eq2 + 1);
+                }
+                P = E + 1;
+            }
+            return;
+        }
         if (Kind(N) == "VarDecl" && N.contains("name") && Name(N).size() > 8 && Name(N).compare(Name(N).size() - 8, 8, "__UeEnum") == 0)
         {
             std::string Owner;
@@ -3305,6 +3352,15 @@ bool FCompiler::Collect(std::string* Err)
         std::string First = D->second.front().first;
         for (const auto& En : D->second) if (En.second == 0) { First = En.first; break; }
         Enums[Enum] = { PathIn(Owner.empty() ? ModPackage : Owner, Enum), Leaf, U, First };
+        if (const auto R = EnumUeNames.find(Enum); R != EnumUeNames.end())
+        {
+            for (const auto& [Cpp, Ue] : R->second)
+                if (std::none_of(D->second.begin(), D->second.end(), [&](const auto& En) { return En.first == Cpp; }))
+                { *Err = "UE_ENUM(" + Enum + "): __UeEnumNames renames " + Cpp + ", which is no enumerator of it"; return false; }
+            Enums[Enum].UeEntries = R->second;
+            Enums[Enum].UeDisplay = EnumUeDisplay[Enum];
+            Enums[Enum].First = Enums[Enum].UeEntry(First);
+        }
         if (Leaf != Enum && Leaves[Leaf] == 1) Enums.emplace(Leaf, Enums[Enum]);
         if (Owner.empty() || Owner == ModPackage) ModEnums[Enum] = D->second;
     }
@@ -4280,7 +4336,7 @@ bool FCompiler::LowerMakeStruct(const std::string& Type, const Json* List, FBlue
             FStmtIR Set;
             Set.K = FStmtIR::Assign;
             Set.Var.K = FArgIR::Member;
-            Set.Var.S = bPlainName ? UeNameOf(R, Name(F)) : ModFieldName(PackageOf(*R), Name(F));
+            Set.Var.S = bPlainName ? UeNameOf(R, Name(F)) : ModFieldNameOf(*R, PackageOf(*R), Name(F));
             Set.Var.Owner = Struct;
             Set.Var.LetOp = LetOpFor(TypeOf(F));
             Set.Var.Base = std::make_shared<FArgIR>();
@@ -4438,7 +4494,7 @@ bool FCompiler::LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& 
         Out.K = FArgIR::Member;
         Out.S = (R->IsNative() || IsInternalViewStruct(R->CppName))
                     ? UeNameOf(R, Name(MemberNode))
-                    : ModFieldName(PackageOf(*R), Name(MemberNode));
+                    : ModFieldNameOf(*R, PackageOf(*R), Name(MemberNode));
         Out.Owner = BP.ScriptStruct(PackageOf(*R), ClassOf(*R));
         Out.LetOp = LetOpFor(TypeOf(MemberNode));
         Out.Base = std::make_shared<FArgIR>();
@@ -14192,7 +14248,7 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
         {
             FDefaultValue Enum, Text;
             Enum.K = Text.K = FDefaultValue::Str;
-            Enum.S = EnumSide.StructName + "::" + Entry.first;
+            Enum.S = EnumSide.StructName + "::" + EnumNamed(EnumSide.StructName).UeEntry(Entry.first);
             Text.S = Entry.first;
             PD.Default.Items.push_back(bEnumKey ? Enum : Text);
             PD.Default.Items.push_back(bEnumKey ? Text : Enum);
@@ -14418,7 +14474,7 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
     if (!bNeg && K == "DeclRefExpr" && (T == "ByteProperty" || T == "EnumProperty") && !PD.StructName.empty()
         && (*Init)["referencedDecl"].value("kind", std::string()) == "EnumConstantDecl")
     {
-        D.S = PD.StructName + "::" + Name((*Init)["referencedDecl"]);
+        D.S = PD.StructName + "::" + EnumNamed(PD.StructName).UeEntry(Name((*Init)["referencedDecl"]));
         D.K = !bKeepZero && D.S == PD.EnumZero ? FDefaultValue::None : FDefaultValue::Str;
         return true;
     }
@@ -15308,7 +15364,7 @@ bool FCompiler::GenerateStruct(const FRecord& R, const std::string& OutDir, std:
     {
         FPropertyDef PD;
         const std::string Field = IsInternalViewStruct(R.CppName) ? Name(*F)
-                                                                  : ModFieldName(PackageName, Name(*F));
+                                                                  : ModFieldNameOf(R, PackageName, Name(*F));
         if (!TypeToProperty(TypeOf(*F), Field, 0, "member " + Name(*F), BP, &PD, Err)) return false;
         /* The struct's default instance carries every member's value, so a member no value can be written for is none. */
         if (PD.Type == "StructProperty" && NativeUnwritten(PD.StructName))
@@ -15345,7 +15401,15 @@ bool FCompiler::GenerateEnum(const std::string& Enum, const std::string& OutDir,
     StampIdentity(P, PackageName);
     FBlueprintClass BP(P, Name, "", "", false);
     if (ApiDir && !BP.WriteApiEnum(*ApiDir, ModEnums[Enum], Err)) return false;
-    BP.FinishEnum(ModEnums[Enum]);
+    std::vector<std::pair<std::string, int64>> Cooked;
+    std::vector<std::pair<std::string, std::string>> Display;     // cooked name -> display name, for a renamed one
+    for (const auto& [Cpp, Value] : ModEnums[Enum])
+    {
+        Cooked.push_back({ Enums[Enum].UeEntry(Cpp), Value });
+        const auto Shown = Enums[Enum].UeDisplay.find(Cpp);
+        if (Cooked.back().first != Cpp) Display.push_back({ Cooked.back().first, Shown != Enums[Enum].UeDisplay.end() ? Shown->second : Cpp });
+    }
+    BP.FinishEnum(Cooked, Display);
     if (!SavePackage(P, OutDir, PackageName, Err)) return false;
     RegistryRows.push_back({ PackageName, Name, "UserDefinedEnum" });
     printf("  %-14s -> %s.uasset  (enum, %d enumerators)\n", Enum.c_str(), Shown(PackageName).c_str(), int32(ModEnums[Enum].size()));
