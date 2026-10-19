@@ -192,6 +192,7 @@ public:
         char Kind = 'F';
         std::string Name;
         std::vector<FTimelineKey> Keys;
+        FIndex External;            // a curve asset the track plays, the editor's External Curve; null: its own Keys
     };
     struct FTimeline
     {
@@ -257,6 +258,10 @@ public:
 
     /* Writes the package as one instance of Class (a data asset): a tag per AddVariable(), each holding its Default. */
     void FinishAsset(FIndex Class, FIndex ClassCdo);
+
+    /* Writes the package as one curve asset of Class (CurveFloat, CurveVector, CurveLinearColor) holding Curve's keys,
+       the body a timeline track's own curve has. */
+    void FinishCurve(FIndex Class, FIndex ClassCdo, const FTimelineTrack& Curve);
 
     FIndex ClassIndex() const { return Exp(ClassRow); }
 

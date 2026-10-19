@@ -104,6 +104,19 @@ static void RichCurve(FArc& Ar, const std::vector<FBlueprintClass::FTimelineKey>
     TagEnd(Ar);
 }
 
+/* A curve object's body: UCurveFloat's FloatCurve; UCurveVector's FloatCurves[3] and UCurveLinearColor's FloatCurves[4],
+   one tag per channel; an event curve's flag. A track's own curve and a curve asset (Hologram_FadeIn) alike. */
+static void CurveBody(FArc& Ar, const FBlueprintClass::FTimelineTrack& Track)
+{
+    const int32 Channels = Track.Kind == 'V' ? 3 : Track.Kind == 'C' ? 4 : 1;
+    for (int32 Ch = 0; Ch < Channels; ++Ch)
+        Tag(Ar, Channels == 1 ? "FloatCurve" : "FloatCurves", "StructProperty",
+            [&](FArc& V) { RichCurve(V, Track.Keys, Ch); }, "RichCurve", Ch);
+    if (Track.Kind == 'E') TagBool(Ar, "bIsEventCurve", true);
+    TagEnd(Ar);
+    Ar.Bool(false);
+}
+
 FIndex FBlueprintClass::Subobject(const std::string& ClassPackage, const std::string& ClassName_,
                                   FIndex Outer, const std::string& ObjectName)
 {
@@ -389,7 +402,7 @@ void FBlueprintClass::Finish()
     for (const FTimeline& T : Timelines)
     {
         TimelineRows.push_back(RowFirstTimeline + NumTimelineRows);
-        NumTimelineRows += 1 + int32(T.Tracks.size());
+        NumTimelineRows += 1 + int32(std::count_if(T.Tracks.begin(), T.Tracks.end(), [](const FTimelineTrack& K) { return !K.External.V; }));
     }
     /* Then a widget class's tree: the WidgetTree, its widgets in declaration order, their slots. */
     const int32 RowTree = RowFirstTimeline + NumTimelineRows;
@@ -754,8 +767,10 @@ void FBlueprintClass::Finish()
     {
         const FTimeline T = Timelines[TI];
         const int32 Row = TimelineRows[TI];
+        /* A track over a curve asset names its import, and only the others have a curve export of their own. */
         std::vector<FIndex> Curves;
-        for (size_t K = 0; K < T.Tracks.size(); ++K) Curves.push_back(Exp(Row + 1 + int32(K)));
+        int32 Own = 0;
+        for (const FTimelineTrack& Track : T.Tracks) Curves.push_back(Track.External.V ? Track.External : Exp(Row + 1 + Own++));
 
         const FIndex TemplateClass = EngineClass("/Script/Engine", "TimelineTemplate");
         const FIndex TemplateCdo = ClassDefaultObject("/Script/Engine", "TimelineTemplate");
@@ -794,7 +809,7 @@ void FBlueprintClass::Finish()
                     Tag(Elements, Of.Curve, "ObjectProperty", [&](FArc& E) { E.Idx(Curves[K]); });
                     if (Of.Kind != 'E') Tag(Elements, "PropertyName", "NameProperty", [&](FArc& E) { E.Name(Track.Name); });
                     Tag(Elements, "TrackName", "NameProperty", [&](FArc& E) { E.Name(Track.Name); });
-                    TagBool(Elements, "bIsExternalCurve", false);
+                    TagBool(Elements, "bIsExternalCurve", Track.External.V != 0);
                     TagEnd(Elements);
                 }
                 if (Count > 0)
@@ -814,6 +829,7 @@ void FBlueprintClass::Finish()
 
         for (const FTimelineTrack& Track : T.Tracks)
         {
+            if (Track.External.V) continue;
             const std::string CurveClass = Track.Kind == 'V' ? "CurveVector" : Track.Kind == 'C' ? "CurveLinearColor" : "CurveFloat";
             const FIndex KindClass = EngineClass("/Script/Engine", CurveClass);
             const FIndex KindCdo = ClassDefaultObject("/Script/Engine", CurveClass);
@@ -825,17 +841,7 @@ void FBlueprintClass::Finish()
             Curve.ObjectFlags = RF_Public | RF_Transactional;
             Curve.SerBeforeCreate = { KindClass.V, KindCdo.V };
             Curve.CreateBeforeCreate = { Exp(RowClass).V };
-            Curve.Serialize = [Track](FArc& Ar) {
-                /* UCurveFloat's FloatCurve; UCurveVector's FloatCurves[3] and UCurveLinearColor's FloatCurves[4], one
-                   tag per channel. */
-                const int32 Channels = Track.Kind == 'V' ? 3 : Track.Kind == 'C' ? 4 : 1;
-                for (int32 Ch = 0; Ch < Channels; ++Ch)
-                    Tag(Ar, Channels == 1 ? "FloatCurve" : "FloatCurves", "StructProperty",
-                        [&](FArc& V) { RichCurve(V, Track.Keys, Ch); }, "RichCurve", Ch);
-                if (Track.Kind == 'E') TagBool(Ar, "bIsEventCurve", true);
-                TagEnd(Ar);
-                Ar.Bool(false);
-            };
+            Curve.Serialize = [Track](FArc& Ar) { CurveBody(Ar, Track); };
             P.AddExport(std::move(Curve));
         }
     }
@@ -1345,6 +1351,22 @@ void FBlueprintClass::FinishAsset(FIndex Class, FIndex ClassCdo)
         TagEnd(Ar);
         Ar.Bool(false);
     };
+    P.AddExport(std::move(A));
+}
+
+/* Measured on DRG's Hologram_FadeIn: one export of the curve class, flags Public | Standalone | Transactional, its
+   preload edges serBeforeCreate {class, CDO}, the body a track's curve has. */
+void FBlueprintClass::FinishCurve(FIndex Class, FIndex ClassCdo, const FTimelineTrack& Curve)
+{
+    ClassRow = 0;
+    FExport A;
+    A.ClassIndex = Class;
+    A.TemplateIndex = ClassCdo;
+    A.ObjectName = ClassName;
+    A.ObjectFlags = RF_Public | RF_Standalone | RF_Transactional;
+    A.bIsAsset = true;
+    A.SerBeforeCreate = { Class.V, ClassCdo.V };
+    A.Serialize = [Curve](FArc& Ar) { CurveBody(Ar, Curve); };
     P.AddExport(std::move(A));
 }
 

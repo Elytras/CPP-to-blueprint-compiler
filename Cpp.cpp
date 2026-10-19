@@ -938,6 +938,7 @@ struct FRecord
     std::string InputMisplaced;                     // the first of them no method follows, as written
     std::map<std::string, std::string> Timelines;   // `<X>__UeTimeline`: UE_TIMELINE's variable -> "<length>|<options>"
     std::vector<std::pair<std::string, std::string>> Tracks;    // `<X>__UeTrack`: a track's variable -> "<timeline>|<keys>"
+    std::map<std::string, const Json*> TrackCurves; // `<X>__UeTrackCurve`: a track's variable -> its `&Curve` asset pointer
     std::vector<FTimelineMark> TimelineMarks;       // UE_TIMELINE_UPDATE / _FINISHED / _EVENT, in the order written
     std::string TimelineMisplaced;                  // the first of them no method follows, as written
     std::map<std::string, std::pair<std::string, std::string>> Docs;   // UE_TOOLTIP / UE_KEYWORDS: method -> (tooltip, keywords)
@@ -1695,7 +1696,9 @@ private:
        `inline` may sit on the declaration or on an out-of-line definition. */
     bool IsInlineMethod(const FRecord& R, const std::string& Method) const;
     bool AddInputBindings(const FRecord& R, bool bIsActor, FBlueprintClass& BP, std::string* Err) const;
-    bool AddTimelines(const FRecord& R, bool bIsActor, FBlueprintClass& BP, std::string* Err) const;
+    bool AddTimelines(const FRecord& R, bool bIsActor, FBlueprintClass& BP, std::string* Err);
+    static bool CurveKeys(const std::string& Spec, char Kind, std::vector<FBlueprintClass::FTimelineKey>& Keys, std::string& Bad);
+    bool GenerateCurve(const std::string& Qual, const std::string& OutDir, std::string* Err);
     bool CheckMemberNames(const FRecord& R, std::string* Err) const;
     bool IsSceneRecord(const FRecord* C) const;
     /* S39: R or a mod class above it declares a UE_WIDGET, so R is a WidgetBlueprintGeneratedClass. */
@@ -2226,6 +2229,7 @@ private:
     std::vector<FRegistryAsset> RegistryRows;
     std::vector<const Json*> AssetDecls;        // namespace-scope variables brace-initialized, see GenerateAsset
     std::map<std::string, std::string> AssetPaths;  // UE_ASSET_AT: Ns::variable -> the path of an asset cooked elsewhere
+    std::map<std::string, std::string> ModCurves;   // UE_FLOAT_CURVE and kin: Ns::variable -> "<kind F/V/C>|<keys>"
     std::map<std::string, std::string> VarScope;    // a namespace-scope variable's decl id -> its namespace, "A::B::"
     std::map<std::string, const Json*> NsVars;      // a namespace-scope variable's decl id -> the decl
     std::map<std::string, const Json*> NsVarNamed;  // Ns::variable -> the decl
@@ -2779,6 +2783,11 @@ bool FCompiler::Collect(std::string* Err)
             AssetAlls.insert(Ns + Name(N).substr(0, Name(N).size() - 12));
             return;
         }
+        if (Kind(N) == "VarDecl" && Name(N).size() > 9 && Name(N).compare(Name(N).size() - 9, 9, "__UeCurve") == 0)
+        {
+            FindLiteral(N, ModCurves[Ns + Name(N).substr(0, Name(N).size() - 9)]);
+            return;
+        }
         if (Kind(N) == "VarDecl" && Name(N).size() > 9 && Name(N).compare(Name(N).size() - 9, 9, "__UeAsset") == 0)
         {
             FindLiteral(N, AssetPaths[Ns + Name(N).substr(0, Name(N).size() - 9)]);
@@ -3054,6 +3063,8 @@ bool FCompiler::Collect(std::string* Err)
                 FindLiteral(C, Spec);
                 R.Timelines[Name(C).substr(0, Name(C).size() - 12)] = Spec;
             }
+            else if (Kind(C) == "VarDecl" && Name(C).size() > 14 && Name(C).compare(Name(C).size() - 14, 14, "__UeTrackCurve") == 0)
+                R.TrackCurves[Name(C).substr(0, Name(C).size() - 14)] = &C;
             else if (Kind(C) == "VarDecl" && Name(C).size() > 9 && Name(C).compare(Name(C).size() - 9, 9, "__UeTrack") == 0)
             {
                 std::string Spec;
@@ -10604,7 +10615,32 @@ static std::vector<std::string> TimelineItems(const std::string& S)
    variable, sets each track's variable by name every frame it plays (FTimeline::SetPlaybackPosition), and binds the
    update, finished and event-track functions by name through FOnTimelineEvent, a delegate of no parameters. The marked
    method is the event itself, where the editor's __UpdateFunc stub only jumps into the ubergraph at the node's pin. */
-bool FCompiler::AddTimelines(const FRecord& R, bool bIsActor, FBlueprintClass& BP, std::string* Err) const
+/* A track's or a UE_FLOAT_CURVE's keys as their macro stringizes them, `(time, values..., Interp)`, sorted by time as the
+   curve editor keeps them (FRichCurve::AddKey) and the engine evaluates them. Bad is the first key that is not one. */
+bool FCompiler::CurveKeys(const std::string& Spec, char Kind, std::vector<FBlueprintClass::FTimelineKey>& Keys, std::string& Bad)
+{
+    const int32 Channels = Kind == 'V' ? 3 : Kind == 'C' ? 4 : 1;
+    for (std::string Key : TimelineItems(Spec))
+    {
+        std::vector<std::string> Parts;
+        if (Key.size() >= 2 && Key.front() == '(' && Key.back() == ')') Parts = TimelineItems(Key.substr(1, Key.size() - 2));
+        FBlueprintClass::FTimelineKey K;
+        if (!Parts.empty() && (Parts.back() == "Linear" || Parts.back() == "Constant" || Parts.back() == "Cubic"))
+        {
+            K.Interp = Parts.back() == "Linear" ? 0 : Parts.back() == "Constant" ? 1 : 2;
+            Parts.pop_back();
+        }
+        bool bOk = int32(Parts.size()) == 1 + Channels;
+        for (int32 I = 0; bOk && I <= Channels; ++I)
+            bOk = TimelineNumber(Parts[size_t(I)], I == 0 ? K.Time : K.Values[I - 1]);
+        if (!bOk) { Bad = Key; return false; }
+        Keys.push_back(K);
+    }
+    std::stable_sort(Keys.begin(), Keys.end(), [](const auto& A, const auto& B) { return A.Time < B.Time; });
+    return true;
+}
+
+bool FCompiler::AddTimelines(const FRecord& R, bool bIsActor, FBlueprintClass& BP, std::string* Err)
 {
     std::map<std::string, FBlueprintClass::FTimeline> Timelines;
     for (const auto& [Name_, Spec] : R.Timelines)
@@ -10635,9 +10671,10 @@ bool FCompiler::AddTimelines(const FRecord& R, bool bIsActor, FBlueprintClass& B
         const auto F = std::find_if(R.Fields.begin(), R.Fields.end(), [&](const Json* D) { return Name(*D) == Field; });
         const std::string Type = F == R.Fields.end() ? std::string() : StripTypeKeywords(TypeOf(**F));
         const char Kind = Type == "FVector" ? 'V' : Type == "FLinearColor" ? 'C' : 'F';
-        const char* const Macro = Kind == 'V' ? "UE_VECTOR_TRACK" : Kind == 'C' ? "UE_COLOR_TRACK" : "UE_FLOAT_TRACK";
+        const auto Curve = R.TrackCurves.find(Field);
+        const std::string Macro = std::string(Kind == 'V' ? "UE_VECTOR_TRACK" : Kind == 'C' ? "UE_COLOR_TRACK" : "UE_FLOAT_TRACK")
+                                + (Curve != R.TrackCurves.end() ? "_CURVE" : "");
         const char* const Shape = Kind == 'V' ? "(time, x, y, z)" : Kind == 'C' ? "(time, r, g, b, a)" : "(time, value)";
-        const int32 Channels = Kind == 'V' ? 3 : Kind == 'C' ? 4 : 1;
         auto Refuse = [&](const std::string& Why) { *Err = R.CppName + "::" + Field + ": " + Macro + " " + Why; return false; };
         const size_t Bar = std::min(Spec.find('|'), Spec.size());
         const auto T = Timelines.find(Spec.substr(0, Bar));
@@ -10646,27 +10683,38 @@ bool FCompiler::AddTimelines(const FRecord& R, bool bIsActor, FBlueprintClass& B
         FBlueprintClass::FTimelineTrack Track;
         Track.Kind = Kind;
         Track.Name = Field;
-        for (std::string Key : TimelineItems(Bar < Spec.size() ? Spec.substr(Bar + 1) : std::string()))
+        if (Curve != R.TrackCurves.end())
         {
-            std::vector<std::string> Parts;
-            if (Key.size() >= 2 && Key.front() == '(' && Key.back() == ')') Parts = TimelineItems(Key.substr(1, Key.size() - 2));
-            FBlueprintClass::FTimelineKey K;
-            if (!Parts.empty() && (Parts.back() == "Linear" || Parts.back() == "Constant" || Parts.back() == "Cubic"))
-            {
-                K.Interp = Parts.back() == "Linear" ? 0 : Parts.back() == "Constant" ? 1 : 2;
-                Parts.pop_back();
-            }
-            bool bOk = int32(Parts.size()) == 1 + Channels;
-            for (int32 I = 0; bOk && I <= Channels; ++I)
-                bOk = TimelineNumber(Parts[size_t(I)], I == 0 ? K.Time : K.Values[I - 1]);
-            if (!bOk)
-                return Refuse(std::string("has the key ") + Key + ", which is not " + Shape + " of number literals, with Cubic or "
-                              "Constant after the values for a key that is not Linear");
-            Track.Keys.push_back(K);
+            /* The editor's External Curve, measured on BP_Refinery_LandingZone's Timeline_0: the track's curve tag names
+               the asset's import, bIsExternalCurve is set, and the template creates the import before it serializes.
+               The class has no curve object of its own for it. */
+            const char* const Want = Kind == 'V' ? "UCurveVector" : Kind == 'C' ? "UCurveLinearColor" : "UCurveFloat";
+            std::function<const Json*(const Json&)> AddrOf = [&](const Json& N) -> const Json* {
+                if (N.value("kind", std::string()) == "UnaryOperator" && N.value("opcode", std::string()) == "&") return &N;
+                const Json* Found = nullptr;
+                ForEach(N, [&](const Json& C) { if (!Found) Found = AddrOf(C); });
+                return Found;
+            };
+            const Json* Addr = AddrOf(*Curve->second);
+            const Json* Ref = Addr ? Strip(First(*Addr)) : nullptr;
+            const Json* D = Ref && Ref->contains("referencedDecl") ? &(*Ref)["referencedDecl"] : nullptr;
+            const Json& DT = D && D->contains("type") ? (*D)["type"] : Json::object();
+            const FRecord* Of = Find(StripTypeKeywords(DT.value("desugaredQualType", DT.value("qualType", std::string()))));
+            const FRecord* Wanted = Find(Want);
+            if (!Addr || !Of || !Wanted || !AssetRef(*Addr, BP, &Track.External))
+                return Refuse("names no curve asset: name a UE_ASSET_AT of the game's or another mod's curve (the UeAssets "
+                              "headers name the game's), or a UE_FLOAT_CURVE, UE_VECTOR_CURVE or UE_COLOR_CURVE of this mod");
+            if (Of != Wanted && !IsSubclassOf(*Of, *Wanted))
+                return Refuse("names " + Name(*D) + ", a " + Of->CppName + ": the track's " + Type + " is played from a " + Want);
         }
-        if (Track.Keys.empty()) return Refuse("has no keys: write them after the name, " + std::string(Shape) + ", ...");
-        /* The curve editor keeps a curve's keys sorted by time (FRichCurve::AddKey), and the engine evaluates them so. */
-        std::stable_sort(Track.Keys.begin(), Track.Keys.end(), [](const auto& A, const auto& B) { return A.Time < B.Time; });
+        else
+        {
+            std::string Bad;
+            if (!CurveKeys(Bar < Spec.size() ? Spec.substr(Bar + 1) : std::string(), Kind, Track.Keys, Bad))
+                return Refuse(std::string("has the key ") + Bad + ", which is not " + Shape + " of number literals, with Cubic or "
+                              "Constant after the values for a key that is not Linear");
+            if (Track.Keys.empty()) return Refuse("has no keys: write them after the name, " + std::string(Shape) + ", ...");
+        }
         T->second.Tracks.push_back(Track);
     }
 
@@ -13478,7 +13526,7 @@ bool FCompiler::AssetRef(const Json& N, FBlueprintClass& BP, FIndex* Out)
     const std::string Qual = (Scope == VarScope.end() ? std::string() : Scope->second) + Var;
     if (auto At = AssetPaths.find(Qual); At != AssetPaths.end())
         Package = At->second;
-    else if (std::any_of(AssetDecls.begin(), AssetDecls.end(), [&](const Json* A) { return Name(*A) == Var; }))
+    else if (ModCurves.count(Qual) || std::any_of(AssetDecls.begin(), AssetDecls.end(), [&](const Json* A) { return Name(*A) == Var; }))
         Package = PathIn(ModPackage, Qual);
     else return false;
 
@@ -15020,6 +15068,39 @@ bool FCompiler::GenerateAsset(const Json& Var, const std::string& OutDir, std::s
     if (!SavePackage(P, OutDir, PackageName, Err)) return false;
     RegistryRows.push_back({ PackageName, AssetName, ClassName });
     printf("  %-14s -> %s.uasset  (asset, a %s)\n", AssetName.c_str(), Shown(PackageName).c_str(), R->CppName.c_str());
+    return true;
+}
+
+/* UE_FLOAT_CURVE / UE_VECTOR_CURVE / UE_COLOR_CURVE: a curve asset of the mod's own, as the Content Browser's Miscellaneous >
+   Curve makes one, at <mod package>/<namespace folders>/<Name>. Its keys are a timeline track's. */
+bool FCompiler::GenerateCurve(const std::string& Qual, const std::string& OutDir, std::string* Err)
+{
+    const std::string& Spec = ModCurves[Qual];
+    const char Kind = Spec.empty() ? 'F' : Spec[0];
+    const char* const Macro = Kind == 'V' ? "UE_VECTOR_CURVE" : Kind == 'C' ? "UE_COLOR_CURVE" : "UE_FLOAT_CURVE";
+    const char* const Shape = Kind == 'V' ? "(time, x, y, z)" : Kind == 'C' ? "(time, r, g, b, a)" : "(time, value)";
+    FBlueprintClass::FTimelineTrack Curve;
+    Curve.Kind = Kind;
+    std::string Bad;
+    if (!CurveKeys(Spec.size() > 2 ? Spec.substr(2) : std::string(), Kind, Curve.Keys, Bad))
+    {
+        *Err = Qual + ": " + Macro + " has the key " + Bad + ", which is not " + Shape + " of number literals, with Cubic or "
+               "Constant after the values for a key that is not Linear";
+        return false;
+    }
+    if (Curve.Keys.empty()) { *Err = Qual + ": " + Macro + " has no keys: write them after the name, " + Shape + ", ..."; return false; }
+
+    const std::string PackageName = PathIn(ModPackage, Qual), AssetName = LeafOf(Qual);
+    const std::string ClassName = Kind == 'V' ? "CurveVector" : Kind == 'C' ? "CurveLinearColor" : "CurveFloat";
+    FPackage P(PackageName);
+    StampIdentity(P, PackageName);
+    FBlueprintClass BP(P, AssetName, "", "", false);
+    const FIndex Cdo = BP.ClassDefaultObject("/Script/Engine", ClassName);
+    BP.FinishCurve(BP.EngineClass("/Script/Engine", ClassName), Cdo, Curve);
+    if (!SavePackage(P, OutDir, PackageName, Err)) return false;
+    RegistryRows.push_back({ PackageName, AssetName, ClassName });
+    printf("  %-14s -> %s.uasset  (curve, %d key%s)\n", AssetName.c_str(), Shown(PackageName).c_str(), int32(Curve.Keys.size()),
+           Curve.Keys.size() == 1 ? "" : "s");
     return true;
 }
 
@@ -19392,6 +19473,8 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     }
     for (const Json* Var : AssetDecls)
         if (!GenerateAsset(*Var, OutDir, Err)) return false;
+    for (const auto& Entry : ModCurves)
+        if (!GenerateCurve(Entry.first, OutDir, Err)) return false;
     for (const auto& [Key, Var] : Edits)
         if (!GenerateEdit(Key, *Var, Err)) return false;
     for (const Json* Block : AssetEditBlocks)

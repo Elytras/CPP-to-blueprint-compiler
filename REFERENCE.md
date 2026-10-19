@@ -4357,9 +4357,15 @@ lifts a light.
 | `UE_TIMELINE_UPDATE(Fade) void OnFade();` | The node's Update pin: the engine calls OnFade every frame the timeline plays, after it has written the tracks' variables, and when SetNewTime moves it. | Yes |
 | `UE_TIMELINE_FINISHED(Fade) void OnFaded();` | The Finished pin: called when the timeline reaches its end playing forward, or its start playing in reverse. A looping timeline never finishes. | Yes |
 | `UE_TIMELINE_EVENT(Fade, 0.5, 1.5) void Blink();` | An event track: the engine calls Blink each time the timeline passes 0.5 s and 1.5 s, forward or in reverse. | Yes |
-| A track over a curve asset, the editor's External Curve | Not yet: a track's curve is the keys written in its macro. Hand the timeline a game curve at run time instead, `Fade->SetFloatCurve(Curve, "Alpha")`, with the track named like its variable. | Not yet |
+| `UE_FLOAT_TRACK_CURVE(Fade, Alpha, UeAssets::UCurveFloat::Game::LevelElements::Blueprints::Hologram_FadeIn);` | A track over a curve asset, the editor's External Curve: the timeline plays the asset's keys as the game has them. The curve is any UE_ASSET_AT of a curve, so the game's (the UeAssets headers name them all) or another mod's, or a curve of this mod's own. Declares `float Alpha`, as UE_FLOAT_TRACK does. | Yes |
+| `UE_VECTOR_TRACK_CURVE(Fade, Lift, Path);`, `UE_COLOR_TRACK_CURVE(Fade, Tint, Glow);` | A vector track over a UCurveVector, a color track over a UCurveLinearColor. | Yes |
+| `UE_FLOAT_CURVE(Ramp, (0, 0), (1, 1, Cubic));` at namespace scope | A curve asset of the mod's own, as the Content Browser's Miscellaneous > Curve makes one: a UCurveFloat cooked at `<mod package>/Ramp`, its keys written as a track's are. `UE_VECTOR_CURVE` and `UE_COLOR_CURVE` make a UCurveVector and a UCurveLinearColor. `&Ramp` points at it in a track, a default or code, and another mod names it with UE_ASSET_AT. In a namespace, it goes to that folder. | Yes |
+| `UE_FLOAT_TRACK_CURVE(Fade, Alpha, Path)` where Path is a UCurveVector | Refused: "a UCurveVector: the track's float is played from a UCurveFloat". | Refused |
 
 ```cpp
+#include "UeAssets/UCurveFloat.h"
+UE_FLOAT_CURVE(Ramp, (0, 0), (1, 1, Cubic), (2, 0));   // a curve asset of the mod's own
+
 class FadingLamp : public AActor {
 public:
   UE_COMPONENT(UPointLightComponent, Lamp);
@@ -4378,6 +4384,9 @@ public:
     if (Runs < 3) Fade->PlayFromStart();
   }
   UE_TIMELINE_EVENT(Fade, 1.0) void Peak() { Peaks = Peaks + 1; }
+  UE_TIMELINE(Glow, 2.0f);                      // two tracks over curve assets
+  UE_FLOAT_TRACK_CURVE(Glow, Fog, UeAssets::UCurveFloat::Game::LevelElements::Blueprints::Hologram_FadeIn);
+  UE_FLOAT_TRACK_CURVE(Glow, Pulse, Ramp);
   void ReceiveBeginPlay() { Fade->PlayFromStart(); }
 };
 ```
@@ -4416,6 +4425,10 @@ Notes:
   reached, and a track holds its last key's value after it. Keys are sorted by time, as the editor sorts them.
 - A key's time and values are numbers, written as C++ literals: `1`, `0.5`, `-2.5f`. AssetGen reads them itself, so
   a constant's name or an expression is refused.
+- A track over a curve asset names it, as the editor's External Curve does: the class holds no curve of its own for
+  it, and the asset loads with the class. Its keys are the asset's, so a game curve plays what the game has. The
+  timeline's length is still its own (or its last key's, with LastKeyframe), not the curve's.
+- `Fade->SetFloatCurve(Curve, "Alpha")` hands a track another curve at run time, the track named like its variable.
 
 ## Interfaces
 
@@ -5818,7 +5831,9 @@ listed here is refused with "unimplemented intrinsic".
 | `UE_CATEGORY__JOIN`, `UE_CATEGORY__JOIN2` | Internal to UE_CATEGORY. Not written in a mod. | [Classes and variables](#classes-and-variables) |
 | `UE_CLASS(Package, UeName)` | The package and UE name of a class. In a shared header it names the one source that cooks the class, the one whose UE_MOD_PACKAGE, namespaces and class name give exactly that path; every other source imports it. The SDK declares each engine and game class with it. | [Mod sources and packages](#mod-sources-and-packages) |
 | `UE_CLIENT` | Run on owning Client RPC: called on the server, it runs on the client that owns the actor. | [RPCs](#rpcs) |
+| `UE_COLOR_CURVE(Name, Keys...)` | A UCurveLinearColor asset of the mod's own, at namespace scope, keys `(time, r, g, b, a)`. | [Timelines](#timelines) |
 | `UE_COLOR_TRACK(Timeline, Name, Keys...)` | A linear color track of a UE_TIMELINE: declares `FLinearColor Name`, which the timeline sets each frame it plays, and its curve, keys `(time, r, g, b, a)`. | [Timelines](#timelines) |
+| `UE_COLOR_TRACK_CURVE(Timeline, Name, Curve)` | A color track of a UE_TIMELINE over a UCurveLinearColor asset, the editor's External Curve: declares `FLinearColor Name`. | [Timelines](#timelines) |
 | `UE_COMPONENT(Type, Name)` | A component of a mod actor, of an engine or game component class, as added in the Components panel. The first scene component is the root. | [Components](#components) |
 | `UE_COSMETIC` | Cosmetic (BlueprintCosmetic): on an actor or its component, and for an engine or game static with this mark, a call on a dedicated server is skipped. | [RPCs](#rpcs) |
 | `UE_DEFAULTS { ... }` | Defaults of components and of inherited properties, as the Details panel and Class Defaults set them. Read at build time, never run. | [Class defaults](#class-defaults) |
@@ -5827,7 +5842,9 @@ listed here is refused with "unimplemented intrinsic".
 | `UE_ENUM_IN(Enum, Package)` | UE_ENUM for an enum in a shared header: only the source whose UE_MOD_PACKAGE is exactly Package cooks it. | [Enums](#enums) |
 | `UE_ENUM_MAP(Key, Value, Name)`, `UE_ENUM_MAP(Enum)` | A TMap member from each enumerator to its name, or back, filled in at build time: declared by the three-argument form, the default alone by the one-argument form. | [Enums](#enums) |
 | `UE_FINAL_AS(Base, Leaf)` | Declares `class Leaf final : public Base {}`, Base's one subclass: Base is compiled as final and cooked Abstract. | [Classes and variables](#classes-and-variables) |
+| `UE_FLOAT_CURVE(Name, Keys...)` | A UCurveFloat asset of the mod's own, at namespace scope, keys `(time, value)` as a track's. `&Name` points at it. | [Timelines](#timelines) |
 | `UE_FLOAT_TRACK(Timeline, Name, Keys...)` | A float track of a UE_TIMELINE: declares `float Name`, which the timeline sets each frame it plays, and its curve, keys `(time, value)` with an optional Cubic or Constant. | [Timelines](#timelines) |
+| `UE_FLOAT_TRACK_CURVE(Timeline, Name, Curve)` | A float track of a UE_TIMELINE over a UCurveFloat asset, the editor's External Curve: declares `float Name`. | [Timelines](#timelines) |
 | `UE_INPUT_ACTION("Action", Options...)` | Makes the method after it an InputAction event of an actor: the engine calls it on that action of the game's input settings. | [Timers and input](#timers-and-input) |
 | `UE_INPUT_KEY("Key", Options...)` | Makes the method after it an InputKey event of an actor: the engine calls it on that key, pressed by default; the options name the edges, modifiers and the node's other settings. | [Timers and input](#timers-and-input) |
 | `UE_INTERFACE` | Declares a mod interface, cooked as a Blueprint Interface asset. Its variables go to the classes that implement it. | [Interfaces](#interfaces) |
@@ -5851,7 +5868,9 @@ listed here is refused with "unimplemented intrinsic".
 | `UE_TIMELINE_FINISHED(Timeline)` | Makes the method after it the timeline's Finished pin: called when it reaches its end, or its start in reverse. | [Timelines](#timelines) |
 | `UE_TIMELINE_UPDATE(Timeline)` | Makes the method after it the timeline's Update pin: called each frame it plays, after its tracks are written. | [Timelines](#timelines) |
 | `UE_TOOLTIP("Text")` | The tooltip of the method after it, written into the editor API stub only. | [Classes and variables](#classes-and-variables) |
+| `UE_VECTOR_CURVE(Name, Keys...)` | A UCurveVector asset of the mod's own, at namespace scope, keys `(time, x, y, z)`. | [Timelines](#timelines) |
 | `UE_VECTOR_TRACK(Timeline, Name, Keys...)` | A vector track of a UE_TIMELINE: declares `FVector Name`, which the timeline sets each frame it plays, and its curve, keys `(time, x, y, z)`. | [Timelines](#timelines) |
+| `UE_VECTOR_TRACK_CURVE(Timeline, Name, Curve)` | A vector track of a UE_TIMELINE over a UCurveVector asset, the editor's External Curve: declares `FVector Name`. | [Timelines](#timelines) |
 | `UE_CLASS_IN(ModPackage)` | UE_CLASS for a mod's own class, named by its owner's UE_MOD_PACKAGE: the package is ModPackage plus namespaces plus the class name, the UE name the class name plus `_C`. | [Mod sources and packages](#mod-sources-and-packages) |
 | `UE_STRUCT_IN(Package)` | UE_STRUCT for a struct in a shared header: only the source whose UE_MOD_PACKAGE is exactly Package cooks it. | [Structs](#structs) |
 | `UE_WIDGET(Type, Name)` | A widget of a UUserWidget class's designer tree and a variable of the class; the first is the root. The constructor's AddChild calls and setters lay the tree out. | [Widget layouts](#widget-layouts) |
@@ -6795,6 +6814,12 @@ so the retail game prints nothing. See [Strings and text](#strings-and-text) and
   timeline calls one update method and one finished method. Fix: call the second from the first. See [Timelines](#timelines).
 - `<Class>: UE_TIMELINE_UPDATE(Fade) marks no method`: the marker is followed by a variable, another kind of
   declaration or the end of the class. Fix: write it right before the method. See [Timelines](#timelines).
+- `<Class>::<Name>: UE_FLOAT_TRACK_CURVE names no curve asset`: the curve is not an asset: a UE_ASSET_AT, a UeAssets
+  curve or a UE_FLOAT_CURVE of this mod. `... names <Curve>, a UCurveVector: the track's float is played from a
+  UCurveFloat`: a float track plays a UCurveFloat, a vector track a UCurveVector, a color track a UCurveLinearColor.
+  See [Timelines](#timelines).
+- `<Curve>: UE_FLOAT_CURVE has no keys`, `... has the key <Key>, which is not (time, value) of number literals`, and
+  the same for UE_VECTOR_CURVE and UE_COLOR_CURVE: a curve's keys are a track's. See [Timelines](#timelines).
 
 ### Interfaces
 

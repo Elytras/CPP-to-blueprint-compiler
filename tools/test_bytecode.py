@@ -11270,6 +11270,9 @@ def timelines_of(base):
                     for f in tl:
                         if f['type'] == 'ObjectProperty':
                             c = struct.unpack('<i', f['value'])[0]
+                            if c < 0:       # a curve asset (External Curve): its class and path
+                                curve = (f['name'], p.class_of(c), p.path(c))
+                                continue
                             assert c > 0 and p.exports[c - 1]['outer'] == ci + 1, (base, p.path(c))
                             curve = (f['name'], p.class_of(c), curve_channels(p, c - 1), p.tag(c - 1, 'bIsEventCurve') is not None)
                         else:
@@ -11387,6 +11390,70 @@ timeline_refusals()
 print('ok  TimelineRefusals: a timeline on no actor, a bad length or option, a track or method of no timeline, a key '
       'of the wrong shape, no keys or times, a method that is no function of the object or takes or returns anything, '
       'a second update method, or marking no method is refused')
+
+
+def timeline_curves():
+    """A track over a curve asset (the editor's External Curve, as BP_Refinery_LandingZone's Timeline_0 is cooked): its
+    curve is the asset's import and bIsExternalCurve is set, with no curve of the class's own, and the template creates
+    the import before it serializes. UE_FLOAT_CURVE and kin cook curve assets of the mod's own, as the game's
+    Hologram_FadeIn is: one export of the curve class, Public | Standalone, its keys sorted with Auto tangents, a row of
+    the registry, and `&Ramp` points at it from a default."""
+    base = asset('TimelineCurves')
+    folder = os.path.dirname(base)
+    mod = '/Game/_ElytrasMods/TimelineCurves/'
+    fade = timelines_of(base).pop('Fade')
+    ext = lambda name, cls, path: dict(PropertyName=name, bIsExternalCurve=True, Curve=(cls, cls, path))
+    assert fade['FloatTracks'] == {
+        'Alpha': ext('Alpha', 'CurveFloat', mod + 'Ramp.Ramp'),
+        'Fog': ext('Fog', 'CurveFloat', '/Game/LevelElements/Blueprints/Hologram_FadeIn.Hologram_FadeIn'),
+        'Own': dict(PropertyName='Own', bIsExternalCurve=False, Curve=('CurveFloat', 'CurveFloat',
+                    [[('Linear', 0.0, 0.0, 0.0, 0.0), ('Linear', 2.0, 1.0, 0.0, 0.0)]], False))}, fade['FloatTracks']
+    assert fade['VectorTracks'] == {'Lift': ext('Lift', 'CurveVector', mod + 'Curves/Path.Path')}, fade['VectorTracks']
+    assert fade['LinearColorTracks'] == {'Tint': ext('Tint', 'CurveLinearColor', mod + 'Curves/Glow.Glow')}, fade
+    edl = dump('dumpedl.py', base + '.uasset')
+    before = re.search(r'\] Fade_Template\n\s+CreateBeforeSer  (.*)', edl).group(1)
+    for c in ('Ramp(CurveFloat)', 'Path(CurveVector)', 'Glow(CurveLinearColor)', 'Hologram_FadeIn(CurveFloat)'):
+        assert 'imp:' + c in before, before
+    p, ci = class_pkg(base)
+    cdo = next(i for i, e in enumerate(p.exports) if e['name'] == 'Default__TimelineCurves_C')
+    assert tag_values(p, cdo, [p.tag(cdo, 'Picked')]) == {'Picked': mod + 'Ramp.Ramp'}
+
+    lin, cub = (lambda t, v: ('Linear', t, v, 0.0, 0.0)), (lambda t, v, g: ('Cubic', t, v, g, g))
+    for name, cls, channels in (
+            ('Ramp', 'CurveFloat', [[lin(0.0, 0.0), cub(1.0, 2.0, 4.0), lin(2.0, 8.0)]]),
+            ('Curves/Path', 'CurveVector', [[lin(0.0, 0.0), lin(2.0, z)] for z in (0.0, 0.0, 50.0)]),
+            ('Curves/Glow', 'CurveLinearColor', [[lin(0.0, 1.0), lin(2.0, c)] for c in (1.0, 0.0, 0.0, 1.0)])):
+        c = invariants.Package(os.path.join(folder, *name.split('/')))
+        assert [(e['name'], c.class_of(i + 1), e['flags'] & 0xF) for i, e in enumerate(c.exports)] == [
+            (name.split('/')[-1], cls, 0xB)], c.exports      # Public | Standalone | Transactional
+        assert curve_channels(c, 0) == channels, (name, curve_channels(c, 0))
+        assert (mod + name + '.' + name.split('/')[-1], cls) in registry_rows(registry_of('TimelineCurves')), name
+        keeps_invariants(c.base)
+    keeps_invariants(base)
+
+    fields = {'Alpha': 0.5, 'Fog': 0.25, 'Seen': 0.0}
+    run(base, 'OnFade', self_vars=fields)
+    assert fields['Seen'] == 0.75, fields
+
+
+def timeline_curve_refusals():
+    """A curve track names a curve asset of its own kind; a mod curve's keys are a track's."""
+    for mod, top, body, why in (
+            ('TcKind', 'UE_VECTOR_CURVE(P, (0, 0, 0, 0));\n', '  UE_TIMELINE(T, 1);\n  UE_FLOAT_TRACK_CURVE(T, A, P);\n',
+             'UE_FLOAT_TRACK_CURVE names P, a UCurveVector: the track\'s float is played from a UCurveFloat'),
+            ('TcNone', 'UCurveFloat *Loose = nullptr;\n', '  UE_TIMELINE(T, 1);\n  UE_FLOAT_TRACK_CURVE(T, A, Loose);\n',
+             'UE_FLOAT_TRACK_CURVE names no curve asset'),
+            ('TcKey', 'UE_FLOAT_CURVE(R, (0));\n', '', 'R: UE_FLOAT_CURVE has the key (0), which is not (time, value)'),
+            ('TcNoKeys', 'UE_COLOR_CURVE(R);\n', '', 'R: UE_COLOR_CURVE has no keys')):
+        refused(mod, body, why, top=top)
+
+
+timeline_curves()
+print('ok  TimelineCurves: a track over a curve asset names its import as an External Curve, a game one or one of the '
+      'mod\'s own, which cooks as the game\'s curve assets are, keys sorted with Auto tangents')
+timeline_curve_refusals()
+print('ok  TimelineCurveRefusals: a curve track of the wrong kind or over no curve asset, and a mod curve with a bad key '
+      'or none, is refused')
 
 
 # ---- EDITS: invariants on the packages UE_PATCH / UE_ASSET_EDITS produce from the game (invariant_rules/edits.py)
