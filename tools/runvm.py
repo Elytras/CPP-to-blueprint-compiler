@@ -179,8 +179,10 @@ class VM:
         if (s.base, fn) not in _cache:
             import invariants
             p = invariants.Package(s.base)
-            st = p.struct(p.find(fn))
-            _cache[s.base, fn] = bool(st and st.function_flags & 0x8000)
+            i = p.find(fn)
+            st = p.struct(i) if i is not None else None
+            # One of another package (a parent's, run on a subclass's object) is a class's own, as the editor makes it.
+            _cache[s.base, fn] = st is None or bool(st.function_flags & 0x8000)
         return _cache[s.base, fn]
 
     def script(s, fn):

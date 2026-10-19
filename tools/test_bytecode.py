@@ -730,6 +730,33 @@ def keeps_invariants(base):
     assert not found, '%s breaks %s' % (os.path.basename(base), '; '.join('%s %s: %s' % f for f in found[:3]))
 
 
+EDIT_HEAD = '#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\n#include "UeApi/FSD.h"\n'
+
+
+def compile_edit(tmp, mod, src, game):
+    """Compiles an S38 mod (its whole source) against `game`, the folder /Game is in, into tmp; returns the process and
+    the Content folder the edited packages are written to, each at its own /Game path."""
+    path = os.path.join(tmp, mod + '.cpp')
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(src)
+    out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', mod)
+    os.makedirs(out)
+    proc = assetgen_compile([path, UEAPI, out, '--game', game])
+    return proc, os.path.join(tmp, 'FSD', 'Content')
+
+
+def compile_to(src_text, mod, extra=()):
+    """Compiles a source text as tests/<mod>.cpp would be, into a fresh temp dir: (dir, the package folder, stdout)."""
+    tmp = tempfile.mkdtemp()
+    src = os.path.join(tmp, mod + '.cpp')
+    with open(src, 'w', encoding='utf-8') as f: f.write(src_text)
+    out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', mod)
+    os.makedirs(out)
+    proc = assetgen_compile([src, UEAPI, out] + list(extra))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    return tmp, out, proc.stdout
+
+
 def pending(name, test):
     """A test of something AssetGen does not do yet. It fails today - refused, or compiled but not behaving as the
     engine needs - and prints as a known gap. The day it passes, the feature has landed and the run fails until the
@@ -8308,18 +8335,6 @@ def node_named(p, ci, var):
     return next((n for n in s[1].values() if n.name == var), None) if s else None
 
 
-def compile_to(src_text, mod, extra=()):
-    """Compiles a source text as tests/<mod>.cpp would be, into a fresh temp dir: (dir, the package folder, stdout)."""
-    tmp = tempfile.mkdtemp()
-    src = os.path.join(tmp, mod + '.cpp')
-    with open(src, 'w', encoding='utf-8') as f: f.write(src_text)
-    out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', mod)
-    os.makedirs(out)
-    proc = assetgen_compile([src, UEAPI, out] + list(extra))
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    return tmp, out, proc.stdout
-
-
 # ---- CompTwoSet: two defaults on one inherited component, and a parent's rebuild
 
 def comp_two_set():
@@ -11670,7 +11685,6 @@ import invariants
 from invariant_rules import edits as edits_rules
 
 
-EDIT_HEAD = '#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\n#include "UeApi/FSD.h"\n'
 COOKED_RULES = {'cooked_instancing_flags', 'cooked_instancing_scopes', 'cooked_template_tags_listed', 'edited_template_changes_listed'}
 
 
@@ -11678,18 +11692,6 @@ def pinned_elsewhere(f):
     """A finding a pending test below pins, which the behaviour checks leave to it. None now: EditAddTick, which pinned
     COMP's receive_tick_sets_can_ever_tick, passes (a ReceiveTick a patch adds turns the class's tick on)."""
     return False
-
-
-def compile_edit(tmp, mod, src, game):
-    """Compiles an S38 mod (its whole source) against `game`, the folder /Game is in, into tmp; returns the process and
-    the Content folder the edited packages are written to, each at its own /Game path."""
-    path = os.path.join(tmp, mod + '.cpp')
-    with open(path, 'w', encoding='utf-8') as f:
-        f.write(src)
-    out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', mod)
-    os.makedirs(out)
-    proc = assetgen_compile([path, UEAPI, out, '--game', game])
-    return proc, os.path.join(tmp, 'FSD', 'Content')
 
 
 def edit_findings(edited, game_root, only=None, pinned=lambda f: False):
