@@ -989,7 +989,8 @@ Watch for:
 - A patch is not a class: it adds no component, widget or dispatcher, and its variables do not replicate (they would
   renumber the class's replicated properties against a player without the mod).
 - What a waiting method keeps across the wait lives in variables of the Blueprint, so two waits of it on one object
-  at once share them, as the Blueprint's own event graph does.
+  at once share them, as the Blueprint's own event graph does. A patch's added variables load in the game; a waiting
+  method and an added interface have only been checked offline so far.
 - A replacement takes the game function's parameters exactly: copy them from the SDK header.
 - Extract the pak again after a game update. bpbuild then rebuilds the mod, so the edit starts from the new package.
 - Two paks that edit the same asset each carry the whole package, and the game loads only one. Keep the edits of an
