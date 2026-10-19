@@ -289,13 +289,33 @@ bool AssignmentSides(const Json& S, const Json*& Lhs, const Json*& Rhs)
    the component's MemberExpr it reaches through (null for none). False for any other statement, among them part of a
    struct (`Hit.Distance = 5.0f;`, which is no component's member) and a member of anything but this object
    (`GetOwner()->InitialLifeSpan`, which is no default of its class's). */
-bool DefaultAssignment(const Json& S, const Json*& Lhs, const Json*& Rhs, const Json*& Through)
+/* The member `Field` or `Comp->Field` names, on this object or on one of its components, Through the component's. */
+static bool DefaultTarget(const Json* Lhs, const Json*& Through)
 {
-    if (!AssignmentSides(S, Lhs, Rhs) || Kind(*Lhs) != "MemberExpr") return false;
+    if (!Lhs || Kind(*Lhs) != "MemberExpr") return false;
     const Json* Owner = Strip(First(*Lhs));
     Through = Owner && Kind(*Owner) == "MemberExpr" && Lhs->value("isArrow", false) ? Owner : nullptr;
     const Json* Self = Through ? Strip(First(*Through)) : Owner;
     return Self && Kind(*Self) == "CXXThisExpr";
+}
+
+bool DefaultAssignment(const Json& S, const Json*& Lhs, const Json*& Rhs, const Json*& Through,
+                       std::vector<const Json*>* Path = nullptr);
+
+/* `Field = value;` or `Comp->Field = value;`. With Path, also a part of the member, `Comp->Style.Normal.DrawAs = value;`:
+   Lhs is then the member (Style) and Path the member expressions below it, Normal then DrawAs, each reached with `.`. */
+bool DefaultAssignment(const Json& S, const Json*& Lhs, const Json*& Rhs, const Json*& Through, std::vector<const Json*>* Path)
+{
+    if (!AssignmentSides(S, Lhs, Rhs) || Kind(*Lhs) != "MemberExpr") return false;
+    if (Path) Path->clear();
+    while (!DefaultTarget(Lhs, Through))
+    {
+        const Json* Base = Strip(First(*Lhs));
+        if (!Path || Lhs->value("isArrow", false) || !Base || Kind(*Base) != "MemberExpr") return false;
+        Path->insert(Path->begin(), Lhs);
+        Lhs = Base;
+    }
+    return true;
 }
 
 /* A UE_DEFAULTS statement `Comp->SetupAttachment(Parent, Socket)`: the call's MemberExpr, the object it is called on,
@@ -311,20 +331,38 @@ bool AttachmentCall(const Json& S, const Json*& Callee, const Json*& Child, cons
     return Child != nullptr;
 }
 
-/* UE_SLOT's and UE_BIND's call (UeMeta.h), "UeSlot__" or "UeBind__", or "" for any other statement. */
+/* UE_SLOT's, UE_BIND's and UE_KEYS' call (UeMeta.h), "UeSlot__", "UeBind__" or "UeKeys__", or "" for any other statement. */
 std::string LayoutHelperCall(const Json& S)
 {
     const Json* N = Strip(&S);
     const Json* Fn = N && Kind(*N) == "CallExpr" ? Strip(First(*N)) : nullptr;
     const std::string Name = Fn && Kind(*Fn) == "DeclRefExpr" ? Fn->value("referencedDecl", Json::object()).value("name", std::string())
                                                                : std::string();
-    return Name == "UeSlot__" || Name == "UeBind__" ? Name : std::string();
+    return Name == "UeSlot__" || Name == "UeBind__" || Name == "UeKeys__" ? Name : std::string();
 }
 
 /* S39: a statement of a widget class's layout by its shape alone, `Root->AddChildToCanvas(Title)->SetPosition(...);`,
    `Title->SetText(...);`, `Play->OnClicked.Add(this, &UMyCard::OnPlay);`, `UCanvasPanelSlot* At = Root->AddChildToCanvas(Title);`
    or a UE_SLOT or UE_BIND: a method call, a local or a layout helper. Generate reads what it means and refuses what it
    cannot. */
+/* `At->Padding.Top = value;`, a member of what a local points at, or a part of one: Lhs is the member reached through the
+   local (Padding), Path the parts below it (Top), and the local's DeclRefExpr is returned; null for any other statement.
+   A widget layout's way to set a part of a slot's struct, which a setter sets whole. */
+const Json* LocalMemberAssignment(const Json& S, const Json*& Lhs, const Json*& Rhs, std::vector<const Json*>& Path)
+{
+    if (!AssignmentSides(S, Lhs, Rhs) || Kind(*Lhs) != "MemberExpr") return nullptr;
+    Path.clear();
+    while (!Lhs->value("isArrow", false))
+    {
+        const Json* Base = Strip(First(*Lhs));
+        if (!Base || Kind(*Base) != "MemberExpr") return nullptr;
+        Path.insert(Path.begin(), Lhs);
+        Lhs = Base;
+    }
+    const Json* Local = Strip(First(*Lhs));
+    return Local && Kind(*Local) == "DeclRefExpr" ? Local : nullptr;
+}
+
 bool WidgetLayoutStatement(const Json& S)
 {
     const Json* N = Strip(&S);
@@ -720,6 +758,15 @@ static std::string InputMarkText(const FInputMark& M)
 
 /* UE_TIMELINE_UPDATE / UE_TIMELINE_FINISHED / UE_TIMELINE_EVENT on the method that follows it: the timeline, then an
    event track's times, as `<timeline>|<times>` (UeMeta.h). Kind is 'U', 'F' or 'E'. */
+/* UE_KEYS(Anim, Widget->RenderTransform.<Channel>, keys...): a channel of a widget an animation keys, its keys as
+   written; Channel indexes FBlueprintClass::FAnimTrack's Channels. Where is the statement, for an error. */
+struct FAnimationKeys
+{
+    std::string Animation, Widget;
+    int32 Channel = 0;
+    std::string Keys, Where;
+};
+
 struct FTimelineMark
 {
     std::string Method;
@@ -930,6 +977,7 @@ struct FRecord
     std::map<std::string, std::string> Replicated;  // UE_REPLICATED*: variable -> "Notify:Condition"
     std::set<std::string> Components;               // UE_COMPONENT: variables that are also SCS nodes
     std::vector<std::string> Widgets;               // UE_WIDGET, in declaration order: variables that are also widgets of the tree, the first its root
+    std::vector<std::pair<std::string, std::string>> Animations;   // UE_ANIMATION: its variable -> its length as written, or ""
     /* genueapi's `<X>__UeName`: the engine's name of a member or function Dumper-7 had to respell (`Name_0` is
        `Name`, `Audio_Flying` is `Audio Flying`). C++ keeps its spelling; everything cooked goes through UeNameOf. */
     std::map<std::string, std::string> UeNames;
@@ -1735,6 +1783,7 @@ private:
     bool AddInputBindings(const FRecord& R, bool bIsActor, FBlueprintClass& BP, std::string* Err) const;
     bool AddTimelines(const FRecord& R, bool bIsActor, FBlueprintClass& BP, std::string* Err);
     static bool CurveKeys(const std::string& Spec, char Kind, std::vector<FBlueprintClass::FTimelineKey>& Keys, std::string& Bad);
+    bool AddAnimations(const FRecord& R, const std::vector<FAnimationKeys>& Keyed, FBlueprintClass& BP, std::string* Err);
     bool GenerateCurve(const std::string& Qual, const std::string& OutDir, std::string* Err);
     bool CheckMemberNames(const FRecord& R, std::string* Err) const;
     bool IsSceneRecord(const FRecord* C) const;
@@ -3155,6 +3204,12 @@ bool FCompiler::Collect(std::string* Err)
             {
                 R.Widgets.push_back(Name(C).substr(0, Name(C).size() - 10));
             }
+            else if (Kind(C) == "VarDecl" && Name(C).size() > 13 && Name(C).compare(Name(C).size() - 13, 13, "__UeAnimation") == 0)
+            {
+                std::string Spec;
+                FindLiteral(C, Spec);
+                R.Animations.emplace_back(Name(C).substr(0, Name(C).size() - 13), Spec);
+            }
             else if (Kind(C) == "CXXMethodDecl" && Name(C) == "UeDefaults__")
             {
                 /* Not a UFunction: AssetGen reads its assignments as defaults, never lowers them. */
@@ -3538,17 +3593,19 @@ bool FCompiler::LowerCtor(FRecord& R, std::string* Err)
         if (!bOk || Kind(S) == "NullStmt") return;
         const Json *Lhs = nullptr, *Rhs = nullptr, *Through = nullptr;
         const Json *Callee = nullptr, *Child = nullptr, *Parent = nullptr, *Socket = nullptr;
-        const bool bAssign = DefaultAssignment(S, Lhs, Rhs, Through);
+        std::vector<const Json*> Part;
+        const bool bAssign = DefaultAssignment(S, Lhs, Rhs, Through, &Part);
+        std::vector<const Json*> SlotPart;
         if (!bAssign && !AttachmentCall(S, Callee, Child, Parent, Socket) && !R.bIsPatch     // a patch's may set part of one
-            && !(!R.Widgets.empty() && WidgetLayoutStatement(S)))
+            && !(!R.Widgets.empty() && (WidgetLayoutStatement(S) || LocalMemberAssignment(S, Lhs, Rhs, SlotPart))))
         {
             *Err = Where + ": a constructor never runs in the game, so its statements are read as the class's defaults: each "
                    "is `Field = value;`, `Component->Field = value;` or `Component->SetupAttachment(Parent);`, on this "
-                   "object's members, each set whole. Do run-time setup in ReceiveBeginPlay";
+                   "object's members or the members of a struct they hold. Do run-time setup in ReceiveBeginPlay";
             bOk = false;
             return;
         }
-        if (Json* F = bAssign && !Through ? OwnField(Lhs->value("referencedMemberDecl", std::string())) : nullptr)
+        if (Json* F = bAssign && !Through && Part.empty() ? OwnField(Lhs->value("referencedMemberDecl", std::string())) : nullptr)
         {
             SetInit(*F, *Rhs);
             return;
@@ -10762,6 +10819,121 @@ bool FCompiler::CurveKeys(const std::string& Spec, char Kind, std::vector<FBluep
     return true;
 }
 
+/* UE_ANIMATION and its UE_KEYS: what the widget designer's Animations panel compiles to (FBlueprintClass::FAnimation).
+   A key's time becomes a frame of the MovieScene's 60000 a second; its interpolation and tangents become the channel's
+   FMovieSceneFloatValue, the Auto tangents computed here as the editor computes them after each edit, since the engine
+   plays the stored ones (FMovieSceneFloatChannel::AutoSetTangents, MovieSceneFloatChannel.cpp 713-805, with the
+   Sequencer.AutoTangentNew default of 1 and tension 0). A slope after Cubic is a User tangent on both sides. The
+   playback range ends with the last key, as the editor's did for each of BasicCheckbox's animations, unless a length
+   is given. */
+bool FCompiler::AddAnimations(const FRecord& R, const std::vector<FAnimationKeys>& Keyed, FBlueprintClass& BP, std::string* Err)
+{
+    constexpr double TicksPerSecond = 60000.0;
+    auto WidgetClass = [&](const std::string& Widget) -> const FRecord* {
+        for (const Json* F : R.Fields)
+            if (Name(*F) == Widget)
+            {
+                const std::string T = TypeOf(*F);
+                return T.find('*') == std::string::npos ? nullptr : Find(StripTypeKeywords(T.substr(0, T.find('*'))));
+            }
+        return nullptr;
+    };
+    for (const auto& [Anim, Length] : R.Animations)
+    {
+        auto Refuse = [&](const std::string& Why) { *Err = R.CppName + "::" + Anim + ": UE_ANIMATION " + Why; return false; };
+        if (R.Widgets.empty())
+            return Refuse("on a class with no UE_WIDGET: an animation keys widgets of the class's own tree, by name");
+        FBlueprintClass::FAnimation A;
+        A.Name = Anim;
+        int32 Last = -1;
+        for (const FAnimationKeys& K : Keyed)
+        {
+            if (K.Animation != Anim) continue;
+            auto Track = std::find_if(A.Tracks.begin(), A.Tracks.end(), [&](const auto& T) { return T.Widget == K.Widget; });
+            if (Track == A.Tracks.end())
+            {
+                const FRecord* WC = WidgetClass(K.Widget);
+                if (!WC) { *Err = K.Where + ": cannot tell the class of " + K.Widget; return false; }
+                FBlueprintClass::FAnimTrack T;
+                T.Widget = K.Widget;
+                T.WidgetClass = BP.EngineClass(PackageOf(*WC), ClassOf(*WC));
+                A.Tracks.push_back(T);
+                Track = A.Tracks.end() - 1;
+            }
+            std::vector<FBlueprintClass::FAnimKey>& Out = Track->Channels[K.Channel];
+            for (std::string Key : TimelineItems(K.Keys))
+            {
+                std::vector<std::string> Parts;
+                if (Key.size() >= 2 && Key.front() == '(' && Key.back() == ')') Parts = TimelineItems(Key.substr(1, Key.size() - 2));
+                FBlueprintClass::FAnimKey Made;
+                float Time = 0.0f, Slope = 0.0f;
+                bool bOk = Parts.size() >= 2 && Parts.size() <= 4 && TimelineNumber(Parts[0], Time) && TimelineNumber(Parts[1], Made.Value)
+                        && Time >= 0.0f;
+                if (bOk && Parts.size() >= 3)
+                {
+                    bOk = Parts[2] == "Linear" || Parts[2] == "Constant" || Parts[2] == "Cubic";
+                    Made.Interp = Parts[2] == "Linear" ? 0 : Parts[2] == "Constant" ? 1 : 2;     // ERichCurveInterpMode
+                }
+                if (bOk && Parts.size() == 4)
+                {
+                    bOk = Made.Interp == 2 && TimelineNumber(Parts[3], Slope);
+                    Made.TangentMode = 1;                   // RCTM_User
+                    Made.Arrive = Made.Leave = float(Slope / TicksPerSecond);
+                }
+                if (!bOk)
+                { *Err = K.Where + ": UE_KEYS has the key " + Key + ", which is not (time, value) of number literals, the time not "
+                         "below 0, with Cubic or Constant after the value for a key that is not Linear, and a slope after Cubic"; return false; }
+                Made.Frame = int32(std::lround(double(Time) * TicksPerSecond));
+                if (std::any_of(Out.begin(), Out.end(), [&](const auto& O) { return O.Frame == Made.Frame; }))
+                { *Err = K.Where + ": UE_KEYS has two keys at " + Parts[0] + " s"; return false; }
+                Out.push_back(Made);
+                Last = std::max(Last, Made.Frame);
+            }
+            std::sort(Out.begin(), Out.end(), [](const auto& X, const auto& Y) { return X.Frame < Y.Frame; });
+            if (Out.empty()) { *Err = K.Where + ": UE_KEYS has no keys: write them after the channel, (time, value), ..."; return false; }
+            /* AutoSetTangents: the ends of a channel of two or more keys, then the cubic Auto keys between them. */
+            const size_t NK = Out.size();
+            auto Gap = [&](size_t X, size_t Y) { return std::max(1.e-4, double(Out[Y].Frame - Out[X].Frame)); };   // KINDA_SMALL_NUMBER
+            if (NK >= 2)
+            {
+                if (Out[0].Interp == 0) Out[0].Leave = float((Out[1].Value - Out[0].Value) / Gap(0, 1));
+                else if (Out[0].Interp == 2 && Out[0].TangentMode == 0) Out[0].Arrive = Out[0].Leave = 0.0f;
+                if (Out[NK - 1].Interp == 0) Out[NK - 1].Arrive = float((Out[NK - 1].Value - Out[NK - 2].Value) / Gap(NK - 2, NK - 1));
+                else if (Out[NK - 1].Interp == 2 && Out[NK - 1].TangentMode == 0) Out[NK - 1].Arrive = Out[NK - 1].Leave = 0.0f;
+                for (size_t I = 1; I + 1 < NK; ++I)
+                {
+                    FBlueprintClass::FAnimKey& This = Out[I];
+                    if (This.Interp != 2 || This.TangentMode != 0) continue;
+                    const float Prev = Out[I - 1].Value, Next = Out[I + 1].Value;
+                    float Tangent = 0.0f;
+                    if ((This.Value > Prev && This.Value < Next) || (This.Value < Prev && This.Value > Next))
+                    {
+                        Tangent = float(((This.Value - Prev) + (Next - This.Value)) / Gap(I - 1, I + 1));     // AutoCalcTangent
+                        const float Average = 0.85f;
+                        float Perc = std::abs(This.Value - Prev) / std::abs(Next - Prev);
+                        if (Perc > Average) Tangent *= 1.0f - (Perc - Average) / (1.0f - Average);
+                        else if (Perc < 1.0f - Average) Tangent *= Perc / (1.0f - Average);
+                    }
+                    This.Arrive = This.Leave = Tangent;
+                }
+            }
+        }
+        if (!Length.empty())
+        {
+            float Seconds = 0.0f;
+            if (!TimelineNumber(Length, Seconds) || Seconds <= 0.0f)
+                return Refuse("(" + Anim + ", " + Length + ") has a length that is not a number of seconds above 0");
+            A.EndFrame = int32(std::lround(double(Seconds) * TicksPerSecond));
+        }
+        else if (Last < 0)
+            return Refuse("(" + Anim + ") keys nothing and has no length: key a widget's channel with UE_KEYS in the constructor");
+        else
+            A.EndFrame = Last + 1;      // the last key's frame, inclusive
+        BP.AddAnimation(A);
+    }
+    return true;
+}
+
 bool FCompiler::AddTimelines(const FRecord& R, bool bIsActor, FBlueprintClass& BP, std::string* Err)
 {
     std::map<std::string, FBlueprintClass::FTimeline> Timelines;
@@ -17385,6 +17557,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     /* UE_SLOT(Host->Slot, Content): Content, a widget of this tree, in the named slot Slot (its engine name) of Host. */
     struct FSlotFill { std::string Host, Slot, Content; };
     std::vector<FSlotFill> SlotFills;
+    std::vector<FAnimationKeys> AnimationKeys;      // UE_KEYS, in the order written
     auto IsWidgetOf =[](const FRecord& Of, const std::string& N) {
         return std::find(Of.Widgets.begin(), Of.Widgets.end(), N) != Of.Widgets.end();
     };
@@ -17678,6 +17851,37 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 SlotFills.push_back({ Host, SlotName, Content });
                 return true;
             }
+            /* UE_KEYS(Pop, Icon->RenderTransform.Scale.X, keys...): Pop keys that channel of Icon, a UE_WIDGET of this
+               class; a 2D transform track of Pop plays it, binding Icon by its name. */
+            if (Helper == "UeKeys__")
+            {
+                const Json* AnimE = Strip(Nth(*N, 1));
+                const std::string Anim = AnimE && Kind(*AnimE) == "MemberExpr" && OwnerOf(*AnimE) == R.CppName ? Name(*AnimE) : std::string();
+                if (std::none_of(R.Animations.begin(), R.Animations.end(), [&](const auto& A) { return A.first == Anim; }))
+                { *Err = Where + ": UE_KEYS keys a UE_ANIMATION of this class, by its member name: "
+                         "`UE_KEYS(Pop, Icon->RenderTransform.Scale.X, (0, 1), (0.25, 1.2))`"; return false; }
+                std::string Widget, Path;
+                for (const Json* E = Strip(Nth(*N, 2)); E && Kind(*E) == "MemberExpr"; E = Strip(First(*E)))
+                {
+                    if (!(Widget = WidgetNamed(E)).empty()) break;
+                    Path = Name(*E) + (Path.empty() ? "" : "." + Path);
+                }
+                static const char* const Channels[7] = { "RenderTransform.Translation.X", "RenderTransform.Translation.Y",
+                    "RenderTransform.Angle", "RenderTransform.Scale.X", "RenderTransform.Scale.Y", "RenderTransform.Shear.X",
+                    "RenderTransform.Shear.Y" };
+                const auto Channel = std::find(std::begin(Channels), std::end(Channels), Path);
+                if (Widget.empty() || Channel == std::end(Channels))
+                { *Err = Where + ": UE_KEYS keys a channel of one of this class's UE_WIDGETs' RenderTransform: Translation.X, "
+                         "Translation.Y, Angle, Scale.X, Scale.Y, Shear.X or Shear.Y, `Icon->RenderTransform.Scale.X`"; return false; }
+                FAnimationKeys K{ Anim, Widget, int32(Channel - std::begin(Channels)), std::string(), Where };
+                const Json* KeysE = Nth(*N, 3);
+                if (!KeysE || !FindLiteral(*KeysE, K.Keys)) { *Err = Where + ": UE_KEYS has no keys"; return false; }
+                for (const FAnimationKeys& O : AnimationKeys)
+                    if (O.Animation == Anim && O.Widget == Widget && O.Channel == K.Channel)
+                    { *Err = Where + ": " + Anim + " keys " + Widget + "->" + Path + " already; write its keys in one UE_KEYS"; return false; }
+                AnimationKeys.push_back(K);
+                return true;
+            }
             /* UE_BIND(Title, Text, &UMyCard::GetScore): an entry of the class's Bindings, Title's TextDelegate bound to a
                function of this class. UeMeta.h's overloads have already held the function to the property's type and no
                parameters. */
@@ -17779,10 +17983,18 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                     }
                 }
                 const Json *Lhs = nullptr, *Rhs = nullptr, *Owner = nullptr;
-                if (!DefaultAssignment(S, Lhs, Rhs, Owner))
+                std::vector<const Json*> Part;      // `Comp->Style.Normal.DrawAs = value;`: Normal, DrawAs
+                FLayoutSlot* SlotOf = nullptr;      // `At->Padding.Top = value;`: the slot the layout's local At holds
+                const bool bDefault = DefaultAssignment(S, Lhs, Rhs, Owner, &Part);
+                if (!bDefault)
+                    if (const Json* Local = R.Widgets.empty() ? nullptr : LocalMemberAssignment(S, Lhs, Rhs, Part))
+                        if (const auto L = SlotLocals.find(Local->value("referencedDecl", Json::object()).value("id", std::string()));
+                            L != SlotLocals.end())
+                            SlotOf = &LayoutSlots[L->second];
+                if (!bDefault && !SlotOf)
                 { *Err = Where + ": every statement is `Field = value;`, `Component->Field = value;` or "
-                         "`Component->SetupAttachment(Parent);`, on this object's members, each set whole (not "
-                         "`Field.X = value;`)"; bOk = false; return; }
+                         "`Component->SetupAttachment(Parent);`, on this object's members or the members of a struct "
+                         "they hold, `Field.X = value;`"; bOk = false; return; }
 
                 /* `Comp->Field` reaches through a component; a bare `Field` targets this class's
                    own CDO. Which of the three destinations a statement means is decided by who
@@ -17818,13 +18030,70 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 /* Zero is a real value here: an archetype deltas against the component CDO (where
                    bVisible is already true) and an inherited property against the parent's CDO,
                    not against the type's zero the way a fresh class variable does. */
-                bParentFresh = !bThroughComponent && ParentValueFresh(R, *Lhs, ParentInit, ParentInitOf);
+                bParentFresh = !bThroughComponent && !SlotOf && ParentValueFresh(R, *Lhs, ParentInit, ParentInitOf);
                 struct FUnset { bool& Flag; const Json*& Init; const FRecord*& Of;
                                 ~FUnset() { Flag = false; Init = nullptr; Of = nullptr; } }
                     UnsetParentFresh{ bParentFresh, ParentInit, ParentInitOf };
-                if (!LowerDefault(*Lhs, PD, BP, Err, Rhs, /*bKeepZero=*/true)) { bOk = false; return; }
+                /* A part of a struct member is a tag of that struct holding only the part, as the cook writes a struct that
+                   differs from its default in one member: on load the rest keeps the archetype's value. Only a struct
+                   written as tags has parts; one with a native Serialize (Vector2D, LinearColor) is written whole. */
+                const Json* Leaf = Part.empty() ? Lhs : Part.back();
+                std::vector<FPropertyDef> Outer;    // the structs above the part, the member first
+                if (!Part.empty())
+                {
+                    Outer.push_back(PD);
+                    for (size_t I = 0; I + 1 < Part.size(); ++I)
+                    {
+                        FPropertyDef M;
+                        const std::string MD = OwnerOf(*Part[I]);
+                        if (!TypeToProperty(TypeOf(*Part[I]), UeNameOf(MD.empty() ? nullptr : Find(MD), Name(*Part[I])), 0, Where, BP, &M, Err))
+                        { bOk = false; return; }
+                        Outer.push_back(M);
+                    }
+                    for (size_t I = 0; I < Outer.size(); ++I)
+                        if (Outer[I].Type != "StructProperty" || NativeStructSize(Outer[I].StructName) != 0)
+                        { *Err = Where + ": " + (I ? Name(*Part[I - 1]) : Name(*Lhs)) + " is " + (Outer[I].Type == "StructProperty"
+                                 ? "a " + Outer[I].StructName + ", which is written whole: assign all of it" : "no struct"); bOk = false; return; }
+                    const std::string LD = OwnerOf(*Leaf);
+                    PD = FPropertyDef();
+                    if (!TypeToProperty(TypeOf(*Leaf), UeNameOf(LD.empty() ? nullptr : Find(LD), Name(*Leaf)), 0, Where, BP, &PD, Err))
+                    { bOk = false; return; }
+                }
+                if (!LowerDefault(*Leaf, PD, BP, Err, Rhs, /*bKeepZero=*/true)) { bOk = false; return; }
                 if (PD.Default.K == FDefaultValue::None)
-                { *Err = Where + ": " + Name(*Lhs) + " needs a literal value"; bOk = false; return; }
+                { *Err = Where + ": " + Name(*Leaf) + " needs a literal value"; bOk = false; return; }
+                for (size_t I = Outer.size(); I-- > 0;)
+                {
+                    FPropertyDef Up = Outer[I];
+                    Up.Default = FDefaultValue();
+                    Up.Default.K = FDefaultValue::Struct;
+                    Up.Members = std::make_shared<std::vector<FPropertyDef>>(std::vector<FPropertyDef>{ PD });     // a lone struct's own
+                    PD = Up;
+                }
+                /* Two statements on one member, a part after the whole or two parts, make one tag, the later one's
+                   values over the earlier's, as the assignments run in C++. */
+                std::function<void(FPropertyDef&, const FPropertyDef&)> Merge = [&](FPropertyDef& Into, const FPropertyDef& From) {
+                    const bool bParts = !Part.empty() && Into.Type == "StructProperty" && From.Type == "StructProperty"
+                                     && Into.Default.K == FDefaultValue::Struct && From.Default.K == FDefaultValue::Struct
+                                     && NativeStructSize(Into.StructName) == 0;
+                    if (!bParts) { Into = From; return; }
+                    auto Members = std::make_shared<std::vector<FPropertyDef>>(Into.Default.Members ? *Into.Default.Members
+                                                                              : Into.Members ? *Into.Members : std::vector<FPropertyDef>());
+                    for (const FPropertyDef& M : From.Default.Members ? *From.Default.Members : *From.Members)
+                    {
+                        auto At = std::find_if(Members->begin(), Members->end(), [&](const FPropertyDef& X) { return X.Name == M.Name; });
+                        if (At == Members->end()) Members->push_back(M);
+                        else Merge(*At, M);
+                    }
+                    Into.Members = Members;
+                    Into.Default.Members = nullptr;
+                };
+                auto Put = [&](std::vector<FPropertyDef>& Into) {
+                    auto At = std::find_if(Into.begin(), Into.end(), [&](const FPropertyDef& X) { return X.Name == PD.Name; });
+                    if (At == Into.end()) Into.push_back(PD);
+                    else Merge(*At, PD);
+                };
+                if (SlotOf) { Put(SlotOf->Defaults); return; }      // a tag of the slot's export, as its setter's
                 /* A widget's event flags are the compiler's, set below from the class's own events (kWidgetEvents). A line
                    that says the same changes nothing, and this reference long asked for one beside a Tick override, so it
                    warns; one that says otherwise would be undone, as the editor's compile undoes it, so it is refused. */
@@ -17858,13 +18127,14 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                    member is gone, not a tag under this one's (whose left-out members would load its values). */
                 if (!bThroughComponent)
                 {
-                    InheritedDefaults.erase(std::remove_if(InheritedDefaults.begin(), InheritedDefaults.end(),
-                                                           [&](const FPropertyDef& P) { return P.Name == PD.Name; }),
-                                            InheritedDefaults.end());
-                    InheritedDefaults.push_back(PD);
+                    if (Part.empty())
+                        InheritedDefaults.erase(std::remove_if(InheritedDefaults.begin(), InheritedDefaults.end(),
+                                                               [&](const FPropertyDef& P) { return P.Name == PD.Name; }),
+                                                InheritedDefaults.end());
+                    Put(InheritedDefaults);
                     return;
                 }
-                if (DR == &R) { (bWidget ? WidgetDefaults : ComponentDefaults)[CompName].push_back(PD); return; }
+                if (DR == &R) { Put((bWidget ? WidgetDefaults : ComponentDefaults)[CompName]); return; }
                 /* A native parent's component is a default subobject, not an SCS node: it is
                    overridden by an export under this class's CDO, with no handler involved. */
                 /* A game Blueprint's component is an SCS node too, and overriding it takes the node's guid, which only
@@ -17883,12 +18153,12 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 {
                     FOverride& Sub = SubobjectDefaults[CompName];
                     Sub.Owner = DR;
-                    Sub.Defaults.push_back(PD);
+                    Put(Sub.Defaults);
                     return;
                 }
                 FOverride& O = ComponentOverrides[CompName];
                 O.Owner = DR;
-                O.Defaults.push_back(PD);
+                Put(O.Defaults);
             });
         if (!bOk) return false;
         /* Attached to one another, this class's components must still form a tree: a node in a cycle is no root node
@@ -18089,6 +18359,10 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
            BP_Refinery_LandingZone_C): the component's BlueprintVisible and instanced, a track's none. */
         if (&Decl == &R && R.Timelines.count(FieldName))
             PD.PropertyFlags = CPF_BlueprintVisible | (PD.PropertyFlags & CPF_InstancedReference);
+        /* A widget animation's variable, as the widget compiler declares it (measured on BasicCheckbox_C's AnimateXHover):
+           read-only, transient, skipped by replication. InitializeWidgetStatic sets it by the MovieScene's name. */
+        else if (&Decl == &R && std::any_of(R.Animations.begin(), R.Animations.end(), [&](const auto& A) { return A.first == FieldName; }))
+            PD.PropertyFlags = CPF_BlueprintVisible | CPF_BlueprintReadOnly | CPF_Transient | CPF_RepSkip;
         else if (&Decl == &R && std::any_of(R.Tracks.begin(), R.Tracks.end(), [&](const auto& T) { return T.first == FieldName; }))
             PD.PropertyFlags = 0;
         PD.bApiHidden = Decl.PrivateFields.count(Name(*F)) != 0;
@@ -18268,6 +18542,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         BP.SetNamedSlots(Slots);
     }
     for (const FSlotFill& F : SlotFills) BP.AddWidgetSlotFill(F.Host, F.Slot, F.Content);
+    if (!AddAnimations(R, AnimationKeys, BP, Err)) return false;
     /* A canvas slot's LayoutData, of the parts its setters set: tags of an FAnchorData (Offsets, Anchors and Alignment,
        the first two tagged structs and the last a raw Vector2D), a part left unset keeping the slot's default value. */
     for (FLayoutSlot& S : LayoutSlots)

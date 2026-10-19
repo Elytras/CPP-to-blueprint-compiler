@@ -230,6 +230,30 @@ public:
        time it is drawn (InitializeBindingsStatic binds the widget's <Property>Delegate). */
     struct FPropertyBinding { std::string Widget, Property, Function; };
     void AddPropertyBinding(const FPropertyBinding& Binding) { PropertyBindings.push_back(Binding); }
+    /* One UE_ANIMATION: a WidgetAnimation of the class, in its Animations, with its MovieScene, which binds each widget it
+       animates by name (AnimationBindings) to a RenderTransform track of one section keying the channels given. Times
+       are frames at the MovieScene's tick resolution, 60000 a second; EndFrame is the playback range's exclusive end.
+       Channels: Translation X and Y, Rotation, Scale X and Y, Shear X and Y, the section's FMovieSceneFloatChannels.
+       A key's tangents are value per frame; Interp an ERichCurveInterpMode, TangentMode an ERichCurveTangentMode. */
+    struct FAnimKey
+    {
+        int32 Frame = 0;
+        float Value = 0.0f, Arrive = 0.0f, Leave = 0.0f;
+        uint8 Interp = 0, TangentMode = 0;
+    };
+    struct FAnimTrack
+    {
+        std::string Widget;
+        FIndex WidgetClass;
+        std::vector<FAnimKey> Channels[7];
+    };
+    struct FAnimation
+    {
+        std::string Name;
+        int32 EndFrame = 0;
+        std::vector<FAnimTrack> Tracks;
+    };
+    void AddAnimation(const FAnimation& Animation) { Animations.push_back(Animation); }
 
     /* The actor has a root before this class's SCS runs: a Blueprint parent's SCS leaves one, and a native parent's
        constructor sets one or ExecuteConstruction takes its first native scene component. Then the DefaultSceneRoot
@@ -356,6 +380,7 @@ private:
     std::vector<std::string> NamedSlots;
     std::vector<FComponentBinding> ComponentBindings;
     std::vector<FPropertyBinding> PropertyBindings;
+    std::vector<FAnimation> Animations;
 
     int32 ClassRow = 0;
 };

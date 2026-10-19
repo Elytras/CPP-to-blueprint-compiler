@@ -502,9 +502,10 @@ Watch for:
   `USceneComponent` root hands them on to the components attached to it. (A class whose parent already has a root,
   such as a Blueprint parent or `ACharacter`, adds no root: its first scene component keeps its transform.) A mesh or a light as the root keeps them,
   and AssetGen warns that they are not applied. Declare a `USceneComponent` first.
-- `UE_DEFAULTS` is read when the mod is built and never runs. A call, an `if`, a `+=`, part of a struct such as
-  `Lamp->RelativeLocation.Z = 50.0f;`, or another object's member is refused: set a struct whole. A variable the class
-  declares itself takes an initializer instead.
+- `UE_DEFAULTS` is read when the mod is built and never runs. A call, an `if`, a `+=`, or another object's member is
+  refused. A part of a struct, `PrimaryActorTick.bStartWithTickEnabled = false;`, sets that part alone; a vector or a
+  color is one value, so `Lamp->RelativeLocation.Z = 50.0f;` is refused: set it whole. A variable the class declares
+  itself takes an initializer instead.
   `Target = nullptr;`, `Count = {};` and `Offset = FVector();` write the type's zero over the parent's value.
   `Hit = FHitResult();` is refused: an FHitResult's values come from the engine's constructor (Time is 1), which
   no header shows; give the members instead, `Hit = {.Time = 1.0f};`. The same goes for every engine struct but
@@ -1999,8 +2000,9 @@ A few mistakes also compile without a message, because the construct itself work
 
 **Missing, with nothing to write yet.**
 
-- A widget animation. The layout itself, its events, named slots and property bindings included, is declared with
-  `UE_WIDGET` and the constructor. See [Widget layouts](REFERENCE.md#widget-layouts).
+- A widget animation of anything but the render transform (opacity, colors). The layout itself, its events, named
+  slots, property bindings and render-transform animations included, is declared with `UE_WIDGET`, `UE_ANIMATION`
+  and the constructor. See [Widget layouts](REFERENCE.md#widget-layouts).
 - A check of a game component class's own native data. A `UE_COMPONENT` of one of the game's component classes gets
   the native data of its engine ancestors, which matches every game component class that appears as a template in the
   game's content. 177 never appear there, mostly abstract bases, objectives and character states; one of those that

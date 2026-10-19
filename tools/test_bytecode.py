@@ -9746,6 +9746,7 @@ def tag_values(pkg, i, tags):
             if ty != 'NameProperty': x = x.split('::')[-1]   # an enum value loads by either name (UEnum::GetIndexByName)
         elif ty == 'StrProperty': x = v[4:-1].decode('latin-1')
         elif ty == 'StructProperty' and t['struct'] == 'Vector': x = struct.unpack('<3f', v)
+        elif ty == 'StructProperty' and t['struct'] in ('Guid', 'Vector2D', 'LinearColor'): x = v   # native: raw bytes
         elif ty == 'StructProperty': x = tag_values(pkg, i, pkg.tags(i, t['at']))
         elif ty == 'ArrayProperty' and t['inner'] == 'IntProperty': x = list(struct.unpack_from('<%di' % struct.unpack_from('<i', v)[0], v, 4))
         else: x = ('?', ty)
@@ -10116,9 +10117,9 @@ print('ok  CtorDefaults: a default constructor cooks what the same initializers 
 def ctor_refusals():
     """What a constructor cannot be is refused, where it used to be dropped without a word: one with parameters, which
     the engine never calls; one defined out of the class, which a mod including the header never sees; a statement that
-    is no default (a call, part of a struct); a destructor that does something. So is what UE_DEFAULTS used to get
-    wrong: a statement on another object's member, read as this class's own; one on part of a component's struct, read
-    as a component of that name; and the block in a UE_STRUCT or a UE_INTERFACE, which was dropped (a class
+    is no default (a call, part of its own member, which takes an initializer); a destructor that does something. So is
+    what UE_DEFAULTS used to get wrong: a statement on another object's member, read as this class's own; one on part of
+    a component's native struct (a Vector, written whole), once read as a component of that name; and the block in a UE_STRUCT or a UE_INTERFACE, which was dropped (a class
     implementing DefIface loaded Marks 1, not 5)."""
     run = "CtorCall::CtorCall(): a constructor never runs in the game"
     refused('CtorParms', '  int32 N;\n  CtorParms(int32 InN) : N(InN) {}\n',
@@ -10126,7 +10127,7 @@ def ctor_refusals():
     refused('CtorOut', '  int32 N;\n  CtorOut();\n', 'CtorOut::CtorOut() has no body in the class',
             after='CtorOut::CtorOut() { N = 4; }\n')
     refused('CtorCall', '  int32 N;\n  CtorCall() { N = 4; K2_DestroyActor(); }\n', run)
-    refused('CtorPart', '  FVector Home;\n  CtorPart() { Home.Z = 5.0f; }\n', run.replace('CtorCall', 'CtorPart'))
+    refused('CtorPart', '  FVector Home;\n  CtorPart() { Home.Z = 5.0f; }\n', 'CtorPart::CtorPart(): Home is declared here')
     refused('DtorBody', '  int32 N;\n  ~DtorBody() { N = 0; }\n', 'DtorBody::~DtorBody(): a destructor never runs in the game')
     refused('CtorIface', '  UE_INTERFACE;\n  CtorIface() { Marks = 2; }\n',
             "CtorIface::CtorIface(): a UE_INTERFACE's constructor sets its own members",
@@ -10134,7 +10135,7 @@ def ctor_refusals():
     every = '::UE_DEFAULTS: every statement is'
     refused('DefOther', '  UE_DEFAULTS { GetOwner()->InitialLifeSpan = 5.0f; }\n', 'DefOther' + every)
     refused('DefPart', '  UE_COMPONENT(UPointLightComponent, Lamp);\n  UE_DEFAULTS { Lamp->RelativeLocation.Z = 5.0f; }\n',
-            'DefPart' + every)
+            'RelativeLocation is a Vector, which is written whole')
     refused('DefIface', '  UE_INTERFACE;\n  UE_DEFAULTS { Marks = 5; }\n', 'DefIface: a UE_INTERFACE has no UE_DEFAULTS',
             top='class IDefBase {\n  UE_INTERFACE;\npublic:\n  int32 Marks = 1;\n};\n', base='IDefBase')
     refused('DefStruct', '  FDefStruct S;\n', 'FDefStruct: a UE_STRUCT has no UE_DEFAULTS',
@@ -10143,7 +10144,7 @@ def ctor_refusals():
 
 ctor_refusals()
 print('ok  CtorRefusals: a constructor with parameters or defined out of the class, a statement no default can say, a '
-      'destructor with a body, a UE_DEFAULTS statement on part of a struct or on another object, and UE_DEFAULTS in a '
+      'destructor with a body, a UE_DEFAULTS statement on part of a native struct or on another object, and UE_DEFAULTS in a '
       'UE_STRUCT or UE_INTERFACE are refused')
 
 CD_ACTOR, CD_PLAYER, CD_OBJECT = '/Script/Engine.Actor', '/Script/FSD.PlayerCharacter', '/Script/CoreUObject.Object'
@@ -10466,7 +10467,128 @@ def widget_event_flags():
             'drop the OnPaint override to turn it off', base='UUserWidget')
 
 
+def float_channel(v):
+    """An FMovieSceneFloatChannel tag's value as FMovieSceneFloatChannel::Serialize wrote it: [(frame, value, arrive,
+    leave, interp)], at its tick resolution, which must be the MovieScene's 60000."""
+    pre, post = v[0], v[1]
+    size, n = struct.unpack_from('<ii', v, 2)
+    frames = struct.unpack_from('<%di' % n, v, 10)
+    at = 10 + 4 * n
+    size, m = struct.unpack_from('<ii', v, at)
+    at += 8
+    assert size == 28 and m == n and pre == post == 4, (size, m, n, pre, post)     # RCCE_Constant on both sides
+    keys = []
+    for k in range(n):
+        value, arrive, leave, _aw, _lw, _twm, interp = struct.unpack_from('<5fBxxxB', v, at + 28 * k)
+        keys.append((frames[k], value, arrive, leave, interp))
+    assert struct.unpack_from('<ii', v, at + 28 * n + 8) == (60000, 1)
+    return keys
+
+
+def channel_at(keys, frame):
+    """FMovieSceneFloatChannel::Evaluate at frame for unweighted keys: constant past either end, then the left key's
+    interpolation, a cubic one the Bezier of the two keys' leave and arrive tangents (EvalForTwoKeys)."""
+    if frame <= keys[0][0]: return keys[0][1]
+    if frame >= keys[-1][0]: return keys[-1][1]
+    k = max(i for i in range(len(keys)) if keys[i][0] <= frame)
+    (t1, v1, _a1, l1, interp), (t2, v2, a2, _l2, _i2) = keys[k], keys[k + 1]
+    if interp == 1: return v1
+    u = (frame - t1) / (t2 - t1)
+    if interp == 0: return v1 + (v2 - v1) * u
+    p1, p2 = v1 + l1 * (t2 - t1) / 3, v2 - a2 * (t2 - t1) / 3
+    return (1 - u) ** 3 * v1 + 3 * (1 - u) ** 2 * u * p1 + 3 * (1 - u) * u ** 2 * p2 + u ** 3 * v2
+
+
+def struct_elements(pk, i, t):
+    """An array of structs' elements, each as tag_values reads it: past the count and the inner tag."""
+    at, out = t['at'] + 4 + 49, []
+    for _ in range(struct.unpack_from('<i', t['value'])[0]):
+        tl = pk.tags(i, at)
+        out.append(tag_values(pk, i, tl))
+        at = tl.end
+    return out
+
+
+def widget_animation():
+    """Widget animations (tests/WidgetTree.cpp's UWtPulse), read as the engine reads them. InitializeWidgetStatic sets
+    each WidgetAnimation the class's Animations lists into the variable of its MovieScene's name; LocateBoundObjects finds
+    each widget its AnimationBindings names by that name in the tree, under the GUID that the MovieScene possesses and
+    binds its track to. The track drives RenderTransform; its one section's channels play the keys: evaluated as
+    FMovieSceneFloatChannel::Evaluate does, Pop's scale runs 0.5 to 0.7 in a quarter second, leaving with the slope given
+    and arriving flat, and Spin holds Box's angle at 0, ramps it to 360 over the second second and holds it. Every signed
+    object has a signature, which no fresh compiled-data entry has, so the first play compiles them. The mistakes are
+    refused."""
+    base = os.path.join(ROOT, 'WidgetTree', 'FSD', 'Content', '_ElytrasMods', 'WidgetTree', 'UWtPulse')
+    p, ci = class_pkg(base)
+    obj = lambda t: struct.unpack('<i', bytes(t['value'])[:4])[0]
+    signed = lambda i: bytes(p.tag(i, 'Signature')['value']) != bytes(16)
+    anims = bytes(p.tag(ci, 'Animations')['value'])
+    insts = struct.unpack_from('<%di' % struct.unpack_from('<i', anims)[0], anims, 4)
+    variables = {pr.name: p.path(pr.ref) for pr in p.struct(ci).props}
+    tree = [i for i, e in enumerate(p.exports) if e['outer'] and p.class_of(e['outer']) == 'WidgetTree']
+    got = {}
+    for inst in insts:
+        assert p.class_of(inst) == 'WidgetAnimation' and p.exports[inst - 1]['outer'] == ci + 1 and signed(inst - 1)
+        scene = obj(p.tag(inst - 1, 'MovieScene')) - 1
+        name = p.exports[scene]['name']
+        assert p.class_of(scene + 1) == 'MovieScene' and signed(scene), name
+        assert variables[name] == '/Script/UMG.WidgetAnimation', name
+        bound = {b['WidgetName']: b['AnimationGuid'] for b in struct_elements(p, inst - 1, p.tag(inst - 1, 'AnimationBindings'))}
+        possessed = {x['Name']: x['Guid'] for x in struct_elements(p, scene, p.tag(scene, 'Possessables'))}
+        assert bound == possessed and set(bound) <= {p.exports[i]['name'] for i in tree}, (bound, possessed)
+        lower, start, upper, end = struct.unpack_from('<BiBi', bytes(p.tag(scene, 'PlaybackRange')['value']))
+        assert (lower, start, upper) == (1, 0, 0), (lower, start, upper)             # [0, end)
+        got[(name, 'end')] = end
+        for b in struct_elements(p, scene, p.tag(scene, 'ObjectBindings')):
+            assert b['ObjectGuid'] == possessed[b['BindingName']]
+            for track in b['Tracks']:
+                ti = next(i for i in range(len(p.exports)) if p.exports[i]['outer'] == scene + 1 and p.path(i + 1) == track)
+                assert p.class_of(ti + 1) == 'MovieScene2DTransformTrack' and signed(ti)
+                assert tag_values(p, ti, p.tags(ti, p.tag(ti, 'PropertyBinding')['at']))['PropertyName'] == 'RenderTransform'
+                si = struct.unpack_from('<i', bytes(p.tag(ti, 'Sections')['value']), 4)[0] - 1
+                assert struct.unpack_from('<BiBi', bytes(p.tag(si, 'SectionRange')['value'])) == (1, 0, 0, end)
+                for t in p.tags(si):
+                    if t['type'] == 'StructProperty' and t.get('struct') == 'MovieSceneFloatChannel':
+                        got[(name, b['BindingName'], t['name'], t['index'])] = float_channel(bytes(t['value']))
+    assert sorted(k for k in got if len(k) == 4) == [('Pop', 'Mark', 'Scale', 0), ('Pop', 'Mark', 'Scale', 1),
+                                                    ('Spin', 'Box', 'Rotation', 0)], sorted(got)
+    assert got[('Pop', 'end')] == 15001 and got[('Spin', 'end')] == 120000      # the last key's frame; a length
+    for k in (0, 1):
+        pop = got[('Pop', 'Mark', 'Scale', k)]
+        at = lambda s: channel_at(pop, s * 60000)
+        assert abs(at(0) - 0.5) < 1e-6 and abs(at(0.25) - 0.7) < 1e-6 and abs(at(1) - 0.7) < 1e-6
+        assert abs(pop[0][3] * 60000 - 1.159) < 1e-4 and pop[1][2] == 0, pop     # the slope given; Auto at the end: flat
+        samples = [at(s / 400) for s in range(101)]
+        assert all(b >= a for a, b in zip(samples, samples[1:])), samples
+    spin = got[('Spin', 'Box', 'Rotation', 0)]
+    for s, want in ((0, 0), (0.4, 0), (0.5, 0), (1.0, 180), (1.5, 360), (2, 360)):
+        assert abs(channel_at(spin, s * 60000) - want) < 1e-3, (s, channel_at(spin, s * 60000))
+    mark = p.find('Mark')
+    brush = p.tags(mark, p.tag(mark, 'Background')['at'])     # a part of a struct: only the parts set, as the cook writes it
+    assert [(t['name'], t['type']) for t in brush] == [('ImageSize', 'StructProperty'), ('DrawAs', 'ByteProperty')], brush
+    assert struct.unpack('<ff', bytes(brush[0]['value'])) == (32, 32) and p.names[struct.unpack_from('<i', bytes(brush[1]['value']))[0]].endswith('Image')
+    slot, = [i for i in range(len(p.exports)) if p.class_of(i + 1) == 'OverlaySlot']     # `At->Padding.Top = 6.0f;`
+    pad = p.tags(slot, p.tag(slot, 'Padding')['at'])
+    assert [(t['name'], struct.unpack('<f', bytes(t['value']))[0]) for t in pad] == [('Top', 6.0)], pad
+    keeps_invariants(base)
+
+    widgets = '  UE_WIDGET(UCanvasPanel, Root);\n  UE_WIDGET(UTextBlock, Title);\n  UE_ANIMATION(Pop);\n'
+    refused('WaNoKeys', widgets + '  WaNoKeys() { Root->AddChildToCanvas(Title); }\n', 'keys nothing and has no length',
+            base='UUserWidget')
+    refused('WaTwice', widgets + '  WaTwice() { Root->AddChildToCanvas(Title); UE_KEYS(Pop, Title->RenderTransform.Angle, (0, 0)); '
+            'UE_KEYS(Pop, Title->RenderTransform.Angle, (1, 0)); }\n', 'write its keys in one UE_KEYS', base='UUserWidget')
+    refused('WaBadKey', widgets + '  WaBadKey() { Root->AddChildToCanvas(Title); '
+            'UE_KEYS(Pop, Title->RenderTransform.Angle, (0, 0, Linear, 1)); }\n', 'and a slope after Cubic', base='UUserWidget')
+    refused('WaChannel', widgets + '  WaChannel() { Root->AddChildToCanvas(Title); UE_KEYS(Pop, Title->RenderOpacity, (0, 0)); }\n',
+            'Translation.X, Translation.Y, Angle', base='UUserWidget')
+    refused('WaWhole', widgets + '  WaWhole() { Root->AddChildToCanvas(Title); Title->RenderTransform.Scale.X = 2; }\n',
+            'Scale is a Vector2D, which is written whole', base='UUserWidget')
+    refused('WaNoTree', '  UE_ANIMATION(Pop, 1.0f);\n', 'on a class with no UE_WIDGET', base='UUserWidget')
+    print('ok  WidgetAnimation: UE_ANIMATION and UE_KEYS cook animations the engine binds by name and plays as keyed')
+
+
 widget_tree()
+widget_animation()
 widget_event_flags()
 print('ok  WidgetEventFlags: a widget class\'s Tick and OnPaint flags are on exactly where it overrides the event '
       'itself, as the editor sets them; an inherited one warns, UE_DEFAULTS can only repeat them, a patch\'s added events do')
