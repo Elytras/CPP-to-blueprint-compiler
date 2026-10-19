@@ -422,6 +422,8 @@ class Ctx:
             if fname in ('Map_Keys', 'Map_Values', 'Set_ToArray'): info.out.add(1)
         info.pure = info.lib in B.PURE_MATH or (info.container and fname.split('_', 1)[1] in
                                                   ('Length', 'Get', 'Contains', 'Find', 'IsValidIndex', 'LastIndex'))
+        if obj is None and not info.static and fname == body.method:
+            info.super_call = True      # Parent: PreConstruct, an engine class's event; unqualified it would recurse
         return info
 
     def apply_mod_sig(s, body, info, fpkg, st):
