@@ -1247,6 +1247,13 @@ void FBlueprintClass::Finish()
         Template.OuterIndex = Exp(RowClass);
         Template.ObjectName = O.Name + "_GEN_VARIABLE";
         Template.ObjectFlags = RF_Public | RF_ArchetypeObject | RF_InheritableComponentTemplate;
+        /* Its class serialized first, as an SCS template's is, and the class that owns the overridden component created:
+           the cooker's order (EEE's BP_ElectricCloud). Without the first, the loader may serialize the template while
+           its class is only created; the template's ConditionalPostLoadSubobjects then post-loads its outer, the class,
+           with no SuperStruct yet: "Can't find ClassConstructor" (Obj.cpp ConditionalPostLoadSubobjects, Class.cpp
+           UClass::Bind). A late pak mount loads the class first and never shows it; startup force-loading does. */
+        Template.SerBeforeSer = { Exp(RowClass).V };
+        Template.CreateBeforeSer = { O.OwnerClass.V };
         Template.SerBeforeCreate = { O.Class.V, O.ParentTemplate.V };
         Template.CreateBeforeCreate = { Exp(RowClass).V };
         Template.Serialize = [Defaults, Tail = O.NativeTail](FArc& Ar) {

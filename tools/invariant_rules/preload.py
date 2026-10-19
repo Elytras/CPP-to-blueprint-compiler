@@ -203,6 +203,23 @@ def edl_super_serialized(pkg):
             if msg: yield k, msg
 
 
+@rule
+def edl_template_class_serialized(pkg):
+    """A component template outered to a class of this package (an SCS node's `<Name>_GEN_VARIABLE`, an inherited
+    component's override, RF_ArchetypeObject) is serialized after its class is. Serializing it runs
+    ConditionalPostLoadSubobjects, which post-loads its outer first (Obj.cpp ConditionalPostLoadSubobjects): a class
+    post-loaded before its own serialize has no SuperStruct, and UClass::Bind stops the game with "Can't find
+    ClassConstructor". The cook lists the class in each template's serialize-before-serialize (EEE's BP_ElectricCloud,
+    every one of its nine)."""
+    if not pkg.package_flags & 0x80000000: return
+    for k, e in enumerate(pkg.exports):
+        o = e['outer']
+        if e['flags'] & RF_ArchetypeObject and not e['flags'] & RF_ClassDefaultObject and o > 0 and \
+                pkg.class_of(o) in EDL_BPGC:
+            msg = edl_needs(pkg, o, 'S', k, 'S', 'outer class')
+            if msg: yield k, msg
+
+
 def edl_parent_cdo(pkg, sup):
     """The FPackageIndex of Default__<Parent> for a class whose super is `sup`: an import or export of that name
     beside the parent (same outer), or None."""
