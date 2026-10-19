@@ -450,10 +450,15 @@ class ClassEmit:
                     elif isinstance(x, B.CWhile): fix(x.body)
             fix(tree)
         decls = []
+        lines = B.render(tree)
+        text = '\n'.join(lines)
         for name in sorted(body.locals_used):
             if name in body.frame: continue
             p = local_props.get(name)
             if p is None or (p.flags & CPF_Parm and not p.flags & CPF_ReturnParm): continue
+            # The return value is a local only where the body names it: `return X;` alone needs none.
+            if p.flags & CPF_ReturnParm and not re.search(r'\b%s\b' % re.escape(s.cx.local_ident(body, name)), text):
+                continue
             ty = s.run.types.of(s.pkg, p, s.a)
             for d in [set()]:
                 deps_of_type(s.run, s.pkg, p, d)
@@ -461,7 +466,7 @@ class ClassEmit:
         for n in body.notes: s.notes.append('%s: %s' % (s.a.path, n))
         for name, lines in body.latent_helpers:
             s.methods.append(('private', 'void %s();' % name, B.render(B.tidy(lines))))
-        return list(extra_first) + decls + B.render(tree)
+        return list(extra_first) + decls + lines
 
     def plain_method(s, i, st):
         decl, retname, rettype = signature(s.run, s.a, i, st)
