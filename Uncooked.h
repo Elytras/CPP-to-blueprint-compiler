@@ -34,6 +34,7 @@ struct FApiClass
     std::vector<FApiFunction> Functions;
     std::vector<FPropertyDef> Variables;
     std::map<std::string, std::string> Categories;   // function or variable -> its editor category, "A|B"
+    std::map<std::string, std::pair<std::string, std::string>> Docs;   // function -> (tooltip, keywords)
 };
 
 /*

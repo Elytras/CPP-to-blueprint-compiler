@@ -77,6 +77,8 @@ public:
     */
     /* UE_CATEGORY: a function's or variable's editor category. Editor metadata, so only the API stub carries it. */
     std::map<std::string, std::string> ApiCategory;
+    /* UE_TOOLTIP / UE_KEYWORDS: a function's (tooltip, keywords), editor metadata likewise. */
+    std::map<std::string, std::pair<std::string, std::string>> ApiDocs;
 
     FIndex AddFunction(const std::string& Name, FIndex Super,
                        const std::vector<FPropertyDef>& Params,

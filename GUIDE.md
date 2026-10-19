@@ -1575,19 +1575,20 @@ A class stub holds:
 - one function graph per function a Blueprint can call, with an entry node for the inputs and a result node for the
   outputs. A `UE_PURE` function has no exec pins. The graphs are empty; the editor recompiles them when it loads the
   asset. Static functions have no world-context parameter, because the editor adds its own hidden one;
-- each function's access, static, const and net flags, and its `UE_CATEGORY`;
+- each function's access, static, const and net flags, its `UE_CATEGORY`, and its `UE_TOOLTIP` and `UE_KEYWORDS`;
 - the class's variables that are not private, with their flags, replication, RepNotify, category and literal defaults;
 - an empty generated class and default object, which the editor fills in on load, and registry tags, so that the
   Content Browser lists the asset.
 
 For example, with `--api` this class gets a stub with the variable `Charges` and the functions `Recharge` and `Left`,
-all three carrying the category `Turret`:
+all three carrying the category `Turret`, and `Recharge` its tooltip:
 
 ```cpp
 class StubDemo : public AActor {
 public:
   UE_CATEGORY("Turret");
   int32 Charges = 3;                          // a variable: in the stub, with its default
+  UE_TOOLTIP("Adds By charges.")
   void Recharge(int32 By) { Charges += By; }  // a function graph with one input
   UE_PURE int32 Left() { return Charges; }    // pure: no exec pins
   UE_CATEGORY("");
@@ -1985,8 +1986,6 @@ A few mistakes also compile without a message, because the construct itself work
   game's content. 177 never appear there, mostly abstract bases, objectives and character states; one of those that
   serialized more data would fail to load *(inferred)*, and nothing checks for this. See
   [Components](REFERENCE.md#components).
-- Keywords and a ToolTip for a function in the editor stub. `UeMeta.h` has no macro for them. See
-  [Classes and variables](REFERENCE.md#classes-and-variables).
 - The form of a game enum that no property uses. genueapi learns whether a game enum is an `enum class` from how the
   dump's properties of it and the game's Blueprints are reflected, and 240 of the SDK's 1445 enums have none (the
   enum's own form is not in the dump yet); a variable of one is a Byte, which differs from the editor's Enum variable

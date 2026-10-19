@@ -3594,7 +3594,13 @@ def api_stub():
             variables[re.search(r'VarName \[0\] NameProperty size=8: (\w+)', '\n'.join(v)).group(1)] = '\n'.join(v)
         entries = {exports[e['outer'] - 1]['name']: dump('dumptags.py', base, i)
                    for i, e in enumerate(exports) if e['name'].startswith('K2Node_FunctionEntry')}
+        cooked = b''.join(open(f, 'rb').read() for f in glob.glob(os.path.join(tmp, 'cooked', '**', '*.u*'), recursive=True))
     category = b'Names|Test'.hex()
+    # UE_TOOLTIP / UE_KEYWORDS reach Raise's entry node (its MetaData's ToolTip and Keywords), no other entry, and not
+    # the cooked package: a cooked game keeps no editor metadata.
+    for text in (b'Lifts the cap to nine.', b'raise lift cap'):
+        assert text.hex() in entries['Raise'] and not any(text.hex() in entries[f] for f in entries if f != 'Raise'), entries
+        assert text not in cooked, text
     # A private field is left out; the const one is offered read-only (CPF_BlueprintReadOnly 0x10).
     assert set(variables) == {'Charges', 'Plain', 'Limit', 'Cap'}, set(variables)
     rflags = lambda v: struct.unpack('<Q', bytes.fromhex(re.search(r'PropertyFlags \[0\] UInt64Property size=8: (\w+)', variables[v]).group(1)))[0]
@@ -3608,7 +3614,7 @@ def api_stub():
     for f in entries:
         assert extra(f) & 0xE0000 == {'Step': 0x80000, 'Twice': 0x40000}.get(f, 0x20000), (f, hex(extra(f)))
         assert bool(extra(f) & 0x10000000) == (f == 'Peek'), (f, hex(extra(f)))
-    print('ok  NameTest: the API stub carries UE_CATEGORY, access and purity, and leaves a private field out')
+    print('ok  NameTest: the API stub carries UE_CATEGORY, UE_TOOLTIP, UE_KEYWORDS, access and purity, and leaves a private field out')
 
 
 def static_assets():
@@ -11167,7 +11173,10 @@ def input_refusals():
             ('InputKeyName', '  UE_INPUT_KEY("Space") void F() {}\n', 'never fire: the closest is SpaceBar', 'AActor'),
             ('InputKeyDigit', '  UE_INPUT_KEY("1") void F() {}\n', 'never fire: the closest is One', 'AActor'),
             ('InputMisplaced', '  UE_INPUT_KEY("F5") int32 N = 0;\n', 'marks no method', 'AActor'),
-            ('InputLast', '  void F() {}\n  UE_INPUT_KEY("F5")\n', 'marks no method', 'AActor')):
+            ('InputLast', '  void F() {}\n  UE_INPUT_KEY("F5")\n', 'marks no method', 'AActor'),
+            # UE_TOOLTIP and UE_KEYWORDS describe the method that follows them the same way.
+            ('DocMisplaced', '  UE_TOOLTIP("Count") int32 N = 0;\n', 'UE_TOOLTIP("Count") marks no method', 'AActor'),
+            ('DocLast', '  void F() {}\n  UE_KEYWORDS("a b")\n', 'UE_KEYWORDS("a b") marks no method', 'AActor')):
         refused(mod, body, why, base=base)
 
 

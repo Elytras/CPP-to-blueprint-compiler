@@ -53,6 +53,8 @@ protected:
   UE_READONLY int32 Cap = 5;
 
 public:
+  /* UE_TOOLTIP and UE_KEYWORDS: the function's tooltip and search words in the editor, carried by the API stub alone. */
+  UE_TOOLTIP("Lifts the cap to nine.") UE_KEYWORDS("raise lift cap")
   void Raise() { Cap = 9; }
 
 private:

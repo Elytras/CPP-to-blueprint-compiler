@@ -940,7 +940,9 @@ struct FRecord
     std::vector<std::pair<std::string, std::string>> Tracks;    // `<X>__UeTrack`: a track's variable -> "<timeline>|<keys>"
     std::vector<FTimelineMark> TimelineMarks;       // UE_TIMELINE_UPDATE / _FINISHED / _EVENT, in the order written
     std::string TimelineMisplaced;                  // the first of them no method follows, as written
-    const Json* Defaults = nullptr;                // UE_DEFAULTS: the static-init block, never lowered
+    std::map<std::string, std::pair<std::string, std::string>> Docs;   // UE_TOOLTIP / UE_KEYWORDS: method -> (tooltip, keywords)
+    std::string DocMisplaced;                       // the first of them no method follows, as written
+    const Json* Defaults = nullptr;               // UE_DEFAULTS: the static-init block, never lowered
     bool bFinal = false;        // `class X final`: X has no subclass
     bool bFinalAsLeaf = false;  // UE_FINAL_AS's leaf: its base's one subclass
     std::string FinalAs;        // UE_FINAL_AS(this, Leaf): Leaf's CppName - compiled as final, cooked Abstract
@@ -2869,6 +2871,7 @@ bool FCompiler::Collect(std::string* Err)
         std::string Category;       // UE_CATEGORY is positional, like an access specifier
         std::vector<FInputMark> PendingInput;   // UE_INPUT_KEY / UE_INPUT_ACTION mark the member that follows them
         std::vector<FTimelineMark> PendingTimeline;     // and so do UE_TIMELINE_UPDATE / _FINISHED / _EVENT
+        std::vector<std::pair<bool, std::string>> PendingDocs;  // and UE_TOOLTIP (true) / UE_KEYWORDS (false)
         std::function<void(const Json&)> Member = [&](const Json& C) {
             /* genueapi puts a class's markers in a private `struct UeMarkers` at its bottom, out of IntelliSense's
                member list: they are the class's own. */
@@ -2894,6 +2897,20 @@ bool FCompiler::Collect(std::string* Err)
                 FindLiteral(C, M.Spec);
                 PendingTimeline.push_back(M);
                 return;
+            }
+            if (Kind(C) == "VarDecl" && (Name(C).compare(0, 11, "UeToolTip__") == 0 || Name(C).compare(0, 12, "UeKeywords__") == 0))
+            {
+                PendingDocs.emplace_back(Name(C)[2] == 'T', std::string());
+                FindLiteral(C, PendingDocs.back().second);
+                return;
+            }
+            if (!PendingDocs.empty() && !C.value("isImplicit", false))
+            {
+                const bool bMethod = Kind(C) == "CXXMethodDecl" && C.contains("name") && Name(C) != "UeDefaults__";
+                for (const auto& [bToolTip, Text] : PendingDocs)
+                    if (bMethod) (bToolTip ? R.Docs[Name(C)].first : R.Docs[Name(C)].second) = Text;
+                    else if (R.DocMisplaced.empty()) R.DocMisplaced = std::string(bToolTip ? "UE_TOOLTIP" : "UE_KEYWORDS") + "(\"" + Text + "\")";
+                PendingDocs.clear();
             }
             if ((!PendingInput.empty() || !PendingTimeline.empty()) && !C.value("isImplicit", false))
             {
@@ -3086,6 +3103,8 @@ bool FCompiler::Collect(std::string* Err)
         ForEach(N, Member);
         if (!PendingInput.empty() && R.InputMisplaced.empty()) R.InputMisplaced = InputMarkText(PendingInput.front());
         if (!PendingTimeline.empty() && R.TimelineMisplaced.empty()) R.TimelineMisplaced = TimelineMarkText(PendingTimeline.front());
+        if (!PendingDocs.empty() && R.DocMisplaced.empty())
+            R.DocMisplaced = std::string(PendingDocs.front().first ? "UE_TOOLTIP" : "UE_KEYWORDS") + "(\"" + PendingDocs.front().second + "\")";
         /* A set is looked up in Replicated by the name it is cooked under, so the marker's C++ key follows. */
         for (const auto& N2 : R.UeNames)
             if (auto Rep = R.Replicated.find(N2.first); Rep != R.Replicated.end())
@@ -3289,6 +3308,12 @@ bool FCompiler::Collect(std::string* Err)
             *Err = R.CppName + "::" + M.Method + ": " + InputMarkText(M) + (R.bIsStruct ? " on a UE_STRUCT, which holds no functions"
                  : R.bIsInterface ? " on a UE_INTERFACE: mark the method in the class that implements it"
                  : " on a UE_PATCH, which edits its parent's defaults and nothing else: input needs a class of the mod's own");
+            return false;
+        }
+        if (!R.DocMisplaced.empty())
+        {
+            *Err = R.CppName + ": " + R.DocMisplaced + " marks no method: write it right before the method it describes, `"
+                   + R.DocMisplaced + " void Recharge();`";
             return false;
         }
         if (!R.TimelineMisplaced.empty())
@@ -18226,6 +18251,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         }
 
         if (auto Cat = R.Categories.find(Fn.Name); Cat != R.Categories.end()) BP.ApiCategory[UeNameOf(&R, Fn.Name)] = Cat->second;
+        if (auto Doc = R.Docs.find(Fn.Name); Doc != R.Docs.end()) BP.ApiDocs[UeNameOf(&R, Fn.Name)] = Doc->second;
         /* A patch's method is written over the function it overrides (TransplantFunctions), which keeps its own super:
            naming it here would make the function its own parent. One B lacks is added with this super. */
         if (R.bIsPatch) PatchSupers[R.CppName + "::" + UeNameOf(&R, Fn.Name)] = Super;

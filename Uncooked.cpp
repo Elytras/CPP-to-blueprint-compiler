@@ -7,6 +7,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <tuple>
 
 namespace Uasset
 {
@@ -323,7 +324,7 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
     struct FGraph
     {
         std::string Name;
-        std::string Category;
+        std::string Category, ToolTip, Keywords;
         uint32 Flags = 0;
         bool bPure = false;
         std::vector<FPinDef> EntryPins, ResultPins;
@@ -338,6 +339,7 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
         FGraph G;
         G.Name = Fn.Name;
         if (auto Cat = Class.Categories.find(Fn.Name); Cat != Class.Categories.end()) G.Category = Cat->second;
+        if (auto Doc = Class.Docs.find(Fn.Name); Doc != Class.Docs.end()) std::tie(G.ToolTip, G.Keywords) = Doc->second;
         G.Flags = Fn.Flags;
         /* A pure function draws without exec pins, so UE_PURE decides the node shape here and
            not just the flag: an entry node with a `then` pin would compile back as impure. */
@@ -580,7 +582,7 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
         Entry.ObjectName = "K2Node_FunctionEntry_0";
         Entry.ObjectFlags = RF_Transactional;
         const std::string FnName = G.Name;
-        const std::string FnCategory = G.Category;
+        const std::string FnCategory = G.Category, FnToolTip = G.ToolTip, FnKeywords = G.Keywords;
         Entry.Serialize = [=](FArc& Ar) {
             /* Not decoration: ConformFunctionNames renames a graph to its entry node's member name
                on load, so an entry without one turns every function into "None". */
@@ -588,9 +590,12 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
                 Tag(V, "MemberName", "NameProperty", [=](FArc& N) { N.Name(FnName); });
                 TagEnd(V);
             }, "MemberReference");
-            if (!FnCategory.empty())    // UK2Node_FunctionEntry::MetaData, an FKismetUserDeclaredFunctionMetadata
+            /* UK2Node_FunctionEntry::MetaData, an FKismetUserDeclaredFunctionMetadata, its fields in declaration order. */
+            if (!FnCategory.empty() || !FnToolTip.empty() || !FnKeywords.empty())
                 Tag(Ar, "MetaData", "StructProperty", [=](FArc& V) {
-                    Tag(V, "Category", "TextProperty", [=](FArc& T) { WriteText(T, FnCategory); });
+                    if (!FnToolTip.empty()) Tag(V, "ToolTip", "TextProperty", [=](FArc& T) { WriteText(T, FnToolTip); });
+                    if (!FnCategory.empty()) Tag(V, "Category", "TextProperty", [=](FArc& T) { WriteText(T, FnCategory); });
+                    if (!FnKeywords.empty()) Tag(V, "Keywords", "TextProperty", [=](FArc& T) { WriteText(T, FnKeywords); });
                     TagEnd(V);
                 }, "KismetUserDeclaredFunctionMetadata");
             Tag(Ar, "ExtraFlags", "IntProperty", [=](FArc& V) { V.I32(int32(EntryFlags)); });

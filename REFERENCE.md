@@ -460,7 +460,8 @@ Notes:
 | `const int32 Limit = 3;` | A read-only variable (BlueprintReadOnly): the editor offers a Get node and no Set node. The initializer is the default. clang refuses a write in C++, and the Blueprint VM does not check it. | Yes |
 | `UE_READONLY int32 Cap = 5;` | Read-only the same way (BlueprintReadOnly), but it can still be written: a subclass's `UE_DEFAULTS` may give it a default, and a write from code compiles with `warning: <Class>::<Function>: Cap is BlueprintReadOnly; the editor would not set it`, because the VM allows the write (for example, setting a deferred spawn's members before FinishSpawning). UeApi declares the engine's and game's BlueprintReadOnly properties this way. | Yes |
 | `UE_CATEGORY("Turret\|Setup");` | Gives the functions and variables declared after it that category. `\|` starts a subcategory, and `UE_CATEGORY("")` ends the category. It is positional, like an access specifier. | Yes |
-| a keyword or a tooltip for a function | Not yet: there is no macro for it. | Not yet |
+| `UE_TOOLTIP("Adds charges.") UE_KEYWORDS("refill reload") void Recharge(int32 By);` | The function's tooltip, shown over its call node and in the action menu, and extra words the action menu's search finds it by: the Description and Keywords of the editor's function details. Like a category, they reach the editor API stub only. The cooked game keeps no editor metadata, so the pak carries neither, and nothing changes in game. | Yes |
+| `UE_TOOLTIP("Count") int32 N;` | Refused: "marks no method". They describe the method that follows them. | Refused |
 
 ```cpp
 class Turret : public AActor {
@@ -470,6 +471,8 @@ public:
   int32 Charges;
   UE_CATEGORY("");                  // back to none
   int32 Plain;
+  UE_TOOLTIP("Fires once.") UE_KEYWORDS("shoot shot")
+  void Fire() {}
   const int32 Limit = 3;            // Get node only
 protected:
   int32 Step() { return 1; }
@@ -484,8 +487,8 @@ Notes:
 - A C++ `class` starts private. A function declared before the first `public:` is a private Blueprint function, and a
   variable there is left out of the API stub.
 - Categories and access matter for the editor API stub that `generate_api` writes, so that a Blueprint made in the
-  editor can call the mod. `UE_CATEGORY` is written only there, as the category of each variable and function: the
-  cooked class has no categories, and without `generate_api` the macro does nothing. The stub keeps a private function,
+  editor can call the mod. `UE_CATEGORY` is written only there, as the category of each variable and function, and so
+  are `UE_TOOLTIP` and `UE_KEYWORDS`: the cooked class has no categories, and without `generate_api` the macro does nothing. The stub keeps a private function,
   flagged private, and leaves out interfaces the mod declares. Whether the editor lists the members under their
   category has not been checked. See [Editor API stubs](GUIDE.md#editor-api-stubs).
 
@@ -2035,6 +2038,7 @@ written inside the class does not make a method inline. Only the `inline` keywor
 | `virtual int32 Score() = 0;` | An empty function that returns the default: 0, false, None or empty. A subclass's Score overrides it and names it as its super. A class that declares one, or inherits one with no version of its own, is cooked Abstract, which SpawnActor and CreateWidget refuse, as they refuse a class the editor marks Generate Abstract Class. `NewObject` and `AddComponentByClass` do not check the flag in a game, so a call to Score on such an object gets the default. A `SpawnActor` that names such a class warns, and a `NewObject` that names it is refused ([Objects and widgets](#objects-and-widgets)). | Yes |
 | `public:` / `protected:` / `private:` | Become the function's Public, Protected or Private flag, which the editor honours; see [Classes and variables](#classes-and-variables). | Yes |
 | `UE_CATEGORY("Turret\|Setup");` | The category of the members that follow, written into the editor API stub; see [Classes and variables](#classes-and-variables). | Yes |
+| `UE_TOOLTIP("...") UE_KEYWORDS("...")` | The function's tooltip and search keywords, written into the editor API stub; see [Classes and variables](#classes-and-variables). | Yes |
 | `UE_AUTHORITY_ONLY` / `UE_COSMETIC` | The editor's Authority Only and Cosmetic function flags; see [RPCs](#rpcs). | Yes |
 | `generate_api: true` in `mods.yaml` | Writes an editor stub of the class, so a Blueprint made in the editor can place call nodes for its functions; see [Editor API stubs](GUIDE.md#editor-api-stubs). | Yes |
 | `int32 Undef(int32 X);` with no body anywhere | No function is cooked, and a call to it is refused ("... declares and never defines"), as C++ would not link it. Give every method a body, or make it `virtual ... = 0` for an empty one. | Refused |
@@ -5827,6 +5831,7 @@ listed here is refused with "unimplemented intrinsic".
 | `UE_INPUT_ACTION("Action", Options...)` | Makes the method after it an InputAction event of an actor: the engine calls it on that action of the game's input settings. | [Timers and input](#timers-and-input) |
 | `UE_INPUT_KEY("Key", Options...)` | Makes the method after it an InputKey event of an actor: the engine calls it on that key, pressed by default; the options name the edges, modifiers and the node's other settings. | [Timers and input](#timers-and-input) |
 | `UE_INTERFACE` | Declares a mod interface, cooked as a Blueprint Interface asset. Its variables go to the classes that implement it. | [Interfaces](#interfaces) |
+| `UE_KEYWORDS("Words")` | Search keywords of the method after it, written into the editor API stub only. | [Classes and variables](#classes-and-variables) |
 | `UE_MOD_PACKAGE(Path)` | The /Game folder that a source's classes, structs, enums, interfaces and assets are cooked into. A namespace is a subfolder. | [Mod sources and packages](#mod-sources-and-packages) |
 | `UE_MULTICAST` | Multicast RPC: called on the server, it runs on the server and on every client. | [RPCs](#rpcs) |
 | `UE_NAME_CASE("Text")` | A case of UE_NAME_SWITCH. Every case of one must be written this way. | [Statements and control flow](#statements-and-control-flow) |
@@ -5845,6 +5850,7 @@ listed here is refused with "unimplemented intrinsic".
 | `UE_TIMELINE_EVENT(Timeline, Times...)` | Makes the method after it an event track of the timeline: called each time the timeline passes one of the times. | [Timelines](#timelines) |
 | `UE_TIMELINE_FINISHED(Timeline)` | Makes the method after it the timeline's Finished pin: called when it reaches its end, or its start in reverse. | [Timelines](#timelines) |
 | `UE_TIMELINE_UPDATE(Timeline)` | Makes the method after it the timeline's Update pin: called each frame it plays, after its tracks are written. | [Timelines](#timelines) |
+| `UE_TOOLTIP("Text")` | The tooltip of the method after it, written into the editor API stub only. | [Classes and variables](#classes-and-variables) |
 | `UE_VECTOR_TRACK(Timeline, Name, Keys...)` | A vector track of a UE_TIMELINE: declares `FVector Name`, which the timeline sets each frame it plays, and its curve, keys `(time, x, y, z)`. | [Timelines](#timelines) |
 | `UE_CLASS_IN(ModPackage)` | UE_CLASS for a mod's own class, named by its owner's UE_MOD_PACKAGE: the package is ModPackage plus namespaces plus the class name, the UE name the class name plus `_C`. | [Mod sources and packages](#mod-sources-and-packages) |
 | `UE_STRUCT_IN(Package)` | UE_STRUCT for a struct in a shared header: only the source whose UE_MOD_PACKAGE is exactly Package cooks it. | [Structs](#structs) |
@@ -6759,6 +6765,9 @@ so the retail game prints nothing. See [Strings and text](#strings-and-text) and
   the name the message gives. See [Timers and input](#timers-and-input).
 - `<Class>: UE_INPUT_KEY("F5") marks no method`: the marker is followed by a variable, another kind of declaration or
   the end of the class. Fix: write it right before the method the input calls. See [Timers and input](#timers-and-input).
+- `<Class>: UE_TOOLTIP("...") marks no method`, and the same for UE_KEYWORDS: the marker is followed by a variable,
+  another kind of declaration or the end of the class. Fix: write it right before the method it describes. See
+  [Classes and variables](#classes-and-variables).
 - `... on a UE_STRUCT`, `... on a UE_INTERFACE`, `... on a UE_PATCH`: input binds to a class of the mod's own. Fix:
   mark the method in the class that implements the interface; a patch cannot add input to a game class. See
   [Timers and input](#timers-and-input).
