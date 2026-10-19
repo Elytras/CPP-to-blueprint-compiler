@@ -45,6 +45,7 @@ def summary(ua):
     if ue5: r.o += 16 + 4                           # cell exports/imports, MetaDataOffset
     r.o += 4 + 8 + 4 + 4                            # depends, soft package references, searchable names, thumbnails
     if not ue5: r.o += 16                           # guid
+    if not (flags & 0x80000000): r.o += 16          # PersistentGuid: an editor package (the uncooked API stubs)
     def skip(size):                                 # a counted array of fixed-size rows. Not `r.o += size * r.i32()`:
         n = r.i32(); r.o += size * n                # that reads r.o first, and drops the count's own 4 bytes
     skip(8)                                         # generations
@@ -103,7 +104,7 @@ def preload(base):
     serialize, serialize-before-create, create-before-create. A cooked package only (the summary walk of Cooked.cpp)."""
     ua = open(base + ".uasset", "rb").read()
     sm = summary(ua)
-    deps = struct.unpack_from('<%di' % sm["pcount"], ua, sm["poff"])
+    deps = struct.unpack_from('<%di' % max(sm["pcount"], 0), ua, sm["poff"])   # an editor package has -1
     out = []
     for k in range(sm["ecount"]):
         first, *counts = struct.unpack_from('<5i', ua, sm["eoff"] + sm["erow"] * k + sm["edeps"])
