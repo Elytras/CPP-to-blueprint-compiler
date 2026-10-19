@@ -82,6 +82,7 @@ const Json* Nth(const Json& N, size_t I)
 }
 
 std::string StripTypeKeywords(std::string T);
+std::string WithoutElaboration(std::string T);
 bool IsTEnumType(std::string T, const std::string& Of = "TEnum");
 const Json* PeelLvalue(const Json* N);
 bool IsFixedOperand(const Json& N);
@@ -3994,6 +3995,9 @@ bool FCompiler::ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgI
         if (const FConv* C = FindConv(From, To)) { ApplyConv(*C, BP, Arg); return true; }
 
     if (To == From || From.empty() || To.empty() || ToKind == SK_Object) return true;
+    /* One type spelled two ways: clang keeps `class X` inside template arguments as written, and UeApi writes
+       `TSoftClassPtr<class UClass>`, where a source writes `TArray<TSoftClassPtr<UClass>>`. */
+    if (WithoutElaboration(To) == WithoutElaboration(From)) return true;
     /* `Held = D` of two TDelegate<void(int32)>: clang declares the operator= with TDelegate<void (int)>, the same type
        spelled the canonical way (DelegateKey), so there is nothing to convert. */
     if (To.find("TDelegate<") != std::string::npos && DelegateKey(To) == DelegateKey(From)) return true;
@@ -13208,6 +13212,16 @@ bool FCompiler::HoistReadsInList(std::vector<FStmtIR>& Stmts, FBlueprintClass& B
     }
     Stmts = std::move(Out);
     return true;
+}
+
+/* T with every elaborated-type keyword taken out, wherever it stands: `TMap<class A*, struct B>` is `TMap<A*, B>`. */
+std::string WithoutElaboration(std::string T)
+{
+    for (const char* K : { "class ", "struct ", "enum " })
+        for (size_t P = 0; (P = T.find(K, P)) != std::string::npos;)
+            if (P == 0 || !(isalnum((unsigned char)T[P - 1]) || T[P - 1] == '_')) T.erase(P, strlen(K));
+            else ++P;
+    return T;
 }
 
 std::string StripTypeKeywords(std::string T)
