@@ -10212,6 +10212,25 @@ print('ok  CtorRefusals: a constructor with parameters or defined out of the cla
       'destructor with a body, a UE_DEFAULTS statement on part of a native struct or on another object, and UE_DEFAULTS in a '
       'UE_STRUCT or UE_INTERFACE are refused')
 
+
+def self_call():
+    """A method whose every path calls itself, as `Parent: ReceiveBeginPlay` written without `AActor::`, is refused by
+    clang: in the game it overflows the stack (ElytrasModManager's BasicCheckbox::PreConstruct, 2026-10-19)."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        src = os.path.join(tmp, 'SelfCall.cpp')
+        with open(src, 'w', encoding='utf-8') as f:
+            f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/SelfCall");\n'
+                    'class SelfCall : public AActor {\npublic:\n'
+                    '  void ReceiveBeginPlay() { ReceiveBeginPlay(); K2_DestroyActor(); }\n};\n')
+        proc = assetgen_compile([src, UEAPI, tmp])
+        assert proc.returncode != 0 and 'all paths through this function will call itself' in proc.stderr, \
+            (proc.stdout, proc.stderr)
+
+
+self_call()
+print('ok  SelfCall: a method that calls itself on every path is refused')
+
 CD_ACTOR, CD_PLAYER, CD_OBJECT = '/Script/Engine.Actor', '/Script/FSD.PlayerCharacter', '/Script/CoreUObject.Object'
 CD_GRUNT = '/Game/Enemies/Spider/Grunt/ENE_Spider_Grunt_Normal.ENE_Spider_Grunt_Normal_C'
 
