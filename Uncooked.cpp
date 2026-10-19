@@ -7,6 +7,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <tuple>
 
 namespace Uasset
 {
@@ -314,7 +315,10 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
     const FIndex ImpSchema = Object("/Script/BlueprintGraph", "Class", "EdGraphSchema_K2");
     const FIndex ImpEntry = Object("/Script/BlueprintGraph", "Class", "K2Node_FunctionEntry");
     const FIndex ImpResult = Object("/Script/BlueprintGraph", "Class", "K2Node_FunctionResult");
-    const FIndex ImpParent = Object(Class.ParentPackage, "Class", Class.ParentClass);
+    /* A mod parent (an interface extending another of the mod's) is a Blueprint's generated class. */
+    const bool bModParent = Class.ParentPackage.compare(0, 6, "/Game/") == 0;
+    const FIndex ImpParent = bModParent ? Object(Class.ParentPackage, "BlueprintGeneratedClass", Class.ParentClass, "/Script/Engine")
+                                        : Object(Class.ParentPackage, "Class", Class.ParentClass);
     const FIndex ImpBpgc = Object("/Script/Engine", "Class", "BlueprintGeneratedClass");
     const FIndex ImpObjectClass = Object("/Script/CoreUObject", "Class", "Object");
     const FIndex ImpParentCdo = Object(Class.ParentPackage, Class.ParentClass,
@@ -323,7 +327,7 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
     struct FGraph
     {
         std::string Name;
-        std::string Category;
+        std::string Category, ToolTip, Keywords;
         uint32 Flags = 0;
         bool bPure = false;
         std::vector<FPinDef> EntryPins, ResultPins;
@@ -338,6 +342,7 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
         FGraph G;
         G.Name = Fn.Name;
         if (auto Cat = Class.Categories.find(Fn.Name); Cat != Class.Categories.end()) G.Category = Cat->second;
+        if (auto Doc = Class.Docs.find(Fn.Name); Doc != Class.Docs.end()) std::tie(G.ToolTip, G.Keywords) = Doc->second;
         G.Flags = Fn.Flags;
         /* A pure function draws without exec pins, so UE_PURE decides the node shape here and
            not just the flag: an entry node with a `then` pin would compile back as impure. */
@@ -477,9 +482,9 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
     const std::vector<int32> GraphRows = GraphExports;
     Blueprint.Serialize = [=](FArc& Ar) {
         Tag(Ar, "ParentClass", "ObjectProperty", [=](FArc& V) { V.Idx(ImpParent); });
-        if (bFunctionLibrary)
+        if (bFunctionLibrary || Class.bInterface)
             Tag(Ar, "BlueprintType", "ByteProperty",
-                [](FArc& V) { V.Name("BPTYPE_FunctionLibrary"); }, "EBlueprintType");
+                [&](FArc& V) { V.Name(Class.bInterface ? "BPTYPE_Interface" : "BPTYPE_FunctionLibrary"); }, "EBlueprintType");
         Tag(Ar, "BlueprintSystemVersion", "IntProperty", [](FArc& V) { V.I32(2); });
         if (!GraphRows.empty())
             Tag(Ar, "FunctionGraphs", "ArrayProperty", [=](FArc& V) {
@@ -580,7 +585,7 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
         Entry.ObjectName = "K2Node_FunctionEntry_0";
         Entry.ObjectFlags = RF_Transactional;
         const std::string FnName = G.Name;
-        const std::string FnCategory = G.Category;
+        const std::string FnCategory = G.Category, FnToolTip = G.ToolTip, FnKeywords = G.Keywords;
         Entry.Serialize = [=](FArc& Ar) {
             /* Not decoration: ConformFunctionNames renames a graph to its entry node's member name
                on load, so an entry without one turns every function into "None". */
@@ -588,9 +593,12 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
                 Tag(V, "MemberName", "NameProperty", [=](FArc& N) { N.Name(FnName); });
                 TagEnd(V);
             }, "MemberReference");
-            if (!FnCategory.empty())    // UK2Node_FunctionEntry::MetaData, an FKismetUserDeclaredFunctionMetadata
+            /* UK2Node_FunctionEntry::MetaData, an FKismetUserDeclaredFunctionMetadata, its fields in declaration order. */
+            if (!FnCategory.empty() || !FnToolTip.empty() || !FnKeywords.empty())
                 Tag(Ar, "MetaData", "StructProperty", [=](FArc& V) {
-                    Tag(V, "Category", "TextProperty", [=](FArc& T) { WriteText(T, FnCategory); });
+                    if (!FnToolTip.empty()) Tag(V, "ToolTip", "TextProperty", [=](FArc& T) { WriteText(T, FnToolTip); });
+                    if (!FnCategory.empty()) Tag(V, "Category", "TextProperty", [=](FArc& T) { WriteText(T, FnCategory); });
+                    if (!FnKeywords.empty()) Tag(V, "Keywords", "TextProperty", [=](FArc& T) { WriteText(T, FnKeywords); });
                     TagEnd(V);
                 }, "KismetUserDeclaredFunctionMetadata");
             Tag(Ar, "ExtraFlags", "IntProperty", [=](FArc& V) { V.I32(int32(EntryFlags)); });
@@ -647,7 +655,9 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
         Ar.I32(0);                                  // script storage size
 
         Ar.I32(0);                                  // FuncMap
-        Ar.U32(0x00040010);                         // CLASS_Parsed | CLASS_CompiledFromBlueprint
+        /* CLASS_Parsed | CLASS_CompiledFromBlueprint, and CLASS_Interface on a Blueprint Interface (measured on an
+           editor-made one, 0x44010). */
+        Ar.U32(Class.bInterface ? 0x00044010 : 0x00040010);
         Ar.Idx(ImpObjectClass);                     // ClassWithin
         Ar.Name("Engine");                          // ClassConfigName
         Ar.Idx(Exp(ExBlueprint));                   // ClassGeneratedBy
@@ -673,7 +683,7 @@ bool FApiWriter::Write(const std::string& OutDir, std::string* Err)
     Row.ClassName = "Blueprint";
     const std::string ParentPath = "Class'" + Class.ParentPackage + "." + Class.ParentClass + "'";
     Row.Tags = {
-        { "BlueprintType", bFunctionLibrary ? "BPTYPE_FunctionLibrary" : "BPTYPE_Normal" },
+        { "BlueprintType", Class.bInterface ? "BPTYPE_Interface" : bFunctionLibrary ? "BPTYPE_FunctionLibrary" : "BPTYPE_Normal" },
         { "ParentClass", ParentPath },
         { "NativeParentClass", ParentPath },
         { "GeneratedClass", "BlueprintGeneratedClass'" + P.Name() + "." + ClassName + "'" },

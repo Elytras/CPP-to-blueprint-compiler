@@ -593,9 +593,10 @@ Watch for:
   resumes starts it over with the new arguments, and its `Delay` is ignored while the first one is pending, so in
   `ReceiveTick` the code after a `Delay` runs at most once per delay. A local declared without an initializer keeps
   what the previous call left in it, so initialize it.
-- A timer set by name, `K2_SetTimer(this, "Poll", ...)`, is not checked: an inline, misspelled or parameter-taking
-  method compiles and sets no timer. The `{this, &Class::Method}` form is checked. A time of zero or less sets no
-  timer.
+- A timer set by name is checked only in the form `K2_SetTimer(this, "Poll", ...)`: there AssetGen refuses a name that
+  is misspelled, inline, or a method that takes parameters or returns a value, none of which would set a timer. With
+  another object or a name that is not a literal, nothing is checked. The `{this, &Class::Method}` form is always
+  checked. A time of zero or less sets no timer.
 - A key event takes its key from the game: while the actor has input, whatever the game does with F5 stops. Add
   `NoConsume` to share the key. A key the engine does not have is refused with the closest it has,
   `UE_INPUT_KEY("Space")` naming SpaceBar, and `FKey{"Space"}` warns the same way. An action is one of the game's
@@ -842,7 +843,9 @@ in a function body.
 A game asset is named with `UE_ASSET_AT(Class, Name, "/Game/Path/Package")`, after which `&Name` points at it as well.
 The UeAssets headers (see [The SDK](#the-sdk)) declare the game's assets this way, in namespaces that follow their
 folders: `&UeAssets::UEnemyDescriptor::Game::Enemies::Spider::Grunt::ED_Spider_Grunt`. A game asset's values are read at
-run time, through the pointer.
+run time, through the pointer, or when the mod is built: `ED_Grunt.SpawnSpread * 2` is the value the game's package
+holds, read off the extracted game pak (`--game`, bpbuild's `game_content`) and compiled in as a constant, in code or
+in a default.
 
 A `TSoftObjectPtr<T>` or `TSoftClassPtr<T>` holds a path and loads nothing with the class. Its default is the path as a
 string. `(T *)Soft` gives the object only if it is already loaded, and null otherwise. `UKismetSystemLibrary::LoadAsset`
@@ -872,6 +875,7 @@ class CaveRules : public AActor {
 public:
   void ReceiveBeginPlay() {
     Spread = (&ED_Grunt)->SpawnSpread;                        // a game asset's value, read at run time
+    Spread = ED_Grunt.SpawnSpread * 2;                        // the same, read when the mod is built (--game)
     IconObj = UKismetSystemLibrary::LoadAsset(Tuning->Icon);   // waits here until the texture loads
   }
 };
@@ -882,9 +886,12 @@ A data asset class declared in a header that several mods include needs an owner
 
 Watch for:
 
-- An asset is an object, not a C++ value. `CT_Hard.Waves` is refused ("CT_Hard is an asset, not a value: point at it
-  with &CT_Hard"). Write `(&CT_Hard)->Waves`, or keep a pointer. The same holds for game assets, whose values are not
-  available when the mod is built.
+- A mod's own asset is an object, not a C++ value. `CT_Hard.Waves` is refused ("CT_Hard is an asset, not a value:
+  point at it with &CT_Hard"). Write `(&CT_Hard)->Waves`, or keep a pointer.
+- A game asset's value read when the mod is built is the extracted pak's. One the asset leaves to its native class is
+  that class's C++ default, which no package holds, and is refused: read it through the pointer. After a game update,
+  extract the pak again; bpbuild rebuilds the mods that read a changed package. A value the mod's own edit changes is
+  refused, since the game loads the edited one.
 - An asset starts as its class's defaults, and its braces are written over them. Braces for an engine struct member
   such as `FHitResult` that leave a member out are refused, naming it, where the class's defaults give that member a
   value of their own (`H = {.Hit = {.FaceIndex = 3}}`): give it in the asset's braces too.
@@ -957,8 +964,9 @@ Example: [examples/GameBlueprintChild.cpp](examples/GameBlueprintChild.cpp).
 A mod can also change what the game already has. `UE_ASSET_EDIT(Asset) { .Member = value };` changes a game data
 asset's values, and `UE_ASSET_EDITS { Asset.Member[1].Field = value; }` changes parts of them by path. A class with
 `UE_PATCH;` among its members is a patch of the game Blueprint it derives from: its `UE_DEFAULTS` set that Blueprint's
-own class defaults and its components', and a method replaces the Blueprint's function of the same name, with
-`Parent::Method()` running the game's body. The compiler reads each package from the extracted game pak, changes only
+own class defaults and its components', a method replaces the Blueprint's function of the same name, with
+`Parent::Method()` running the game's body, and a member of its own (`int32 Hits = 0;`) or an interface it lists is
+added to the Blueprint. A method may wait (`Delay`) as in a class of your own. The compiler reads each package from the extracted game pak, changes only
 what the source names, and writes the whole package back at its own path, so the mod's pak replaces the game's copy.
 Pass the extracted pak's `Content` folder as `--game` (bpbuild: `game_content` in `mods.yaml`).
 
@@ -979,7 +987,11 @@ class SlowGrunt : public ENE_Spider_Grunt_Normal_C {
 
 Watch for:
 
-- A patch is not a class: a variable or an interface of its own is refused, and so is a method that waits.
+- A patch is not a class: it adds no component, widget or dispatcher, and its variables do not replicate (they would
+  renumber the class's replicated properties against a player without the mod).
+- What a waiting method keeps across the wait lives in variables of the Blueprint, so two waits of it on one object
+  at once share them, as the Blueprint's own event graph does. A patch's added variables and a waiting method have
+  run in the game; an added interface has only been checked offline so far.
 - A replacement takes the game function's parameters exactly: copy them from the SDK header.
 - Extract the pak again after a game update. bpbuild then rebuilds the mod, so the edit starts from the new package.
 - Two paks that edit the same asset each carry the whole package, and the game loads only one. Keep the edits of an
@@ -1084,11 +1096,13 @@ object's address, and `(AActor *)Addr` reads an address back as an object. `size
 layout, so pointer arithmetic steps by the game's sizes. `&Items[I]` is the address of a `TArray` element. For explicit
 reads and casts, AssetGen's `include/Intrin.h` adds `__PtrCast__`, `__AddrOf__` and the `__Read64__` family.
 
-A read takes the pointee's size. `int32`, `int64`, `float`, `uint8`, `bool`, enums, `FName`, `FString`, `FText` and
-object or class pointers can be read. A whole struct can be neither read nor written; reach its members with `P->X`,
-which touches only that member. A `uint32` read is refused, since Blueprint has no unsigned 32-bit integer. A Blueprint
-variable has no address, so `&Local` is refused. Every access goes through a small scratch struct, `FDeref`, which the
-compiler cooks beside your class the first time you use a pointer; you do not declare it.
+A read takes the pointee's size. `int32`, `int64`, `float`, `uint8`, `bool`, enums, `FName`, `FString`, `FText`,
+object or class pointers and whole structs can be read and written; `P->X` touches only that member, and `&P->X` is
+its address. A `uint16` or `int16` reads as an int32 and a `double` as the nearest float, since Blueprint has neither
+type. A `uint32` read is refused, since Blueprint has no unsigned 32-bit integer. A Blueprint variable has no address,
+so `&Local` is refused. A function returning `T&` returns an address, and its call is the memory there. Every access
+goes through a small scratch struct, `FDeref`, which the compiler cooks beside your class the first time you use a
+pointer; you do not declare it.
 
 ```cpp
 TArray<FVector> Points = {{1, 2, 3}, {4, 5, 6}};
@@ -1109,8 +1123,6 @@ Watch for:
 
 - Nothing checks an address. A wrong address or offset reads garbage or crashes the game, with no soft failure. Take
   offsets from the game you target, and prefer a reflected property or function whenever one exists.
-- A pointer read in a function that makes a latent call (`Delay`, `LoadAsset`, `UE_AWAIT`) is refused. Move the read
-  into a function that does not wait, and call it.
 - `&Obj->Member`, `FText` through a pointer and `__ClassOf__` call helper code that AssetGen does not ship.
   [Pointers and memory](REFERENCE.md#pointers-and-memory) says what to supply. Without it, only `&Obj->Member` fails
   the build; the other two compile without a warning.
@@ -1147,8 +1159,8 @@ building a mod.
 | `<source.cpp>` | One translation unit. It must contain `UE_MOD_PACKAGE("/Game/...")`, which names the mod's own package folder. |
 | `<include-dir>` | The SDK's `UeApi` folder. It must hold `Conv.json`, `Ops.json`, `Types.json`, `Events.json` and `NotCallable.json`; otherwise the compile stops with `missing or invalid <dir>/<file> (run genueapi.py)`. Its `Version.json` must name a genueapi this compiler can use; a folder an older one wrote, or one without the file, stops the compile before clang runs, with `<dir> was written by an older genueapi (...) - regenerate it with AssetGen/tools/genueapi.py`. A folder with none of the three (no UeApi at all, or a path that does not exist) stops it with `missing or invalid <dir>/Conv.json (run genueapi.py)`. |
 | `<out-dir>` | Where the mod's own packages go. The compiler creates it, and the folder of every package it writes, when missing. |
-| `--api <api-dir>` | Optional, after the out dir. Also writes an editor stub for each class, struct and enum into this folder (see [Editor API stubs](#editor-api-stubs)). It is an output folder for the editor, not the SDK folder. It must already exist: without it a class gets no stub and prints `<Class> -> no API asset: cannot write .uasset`, and a struct or enum fails the compile. |
-| `--game <folder /Game is in>` | Optional, after the out dir. The `Content` folder of the extracted game pak, which `UE_ASSET_EDIT`, `UE_ASSET_EDITS` and `UE_PATCH` read the game's packages from. Without it, an edit is refused. |
+| `--api <api-dir>` | Optional, after the out dir. Also writes an editor stub for each class, interface, struct and enum into this folder (see [Editor API stubs](#editor-api-stubs)). It is an output folder for the editor, not the SDK folder. It must already exist: without it a class gets no stub and prints `<Class> -> no API asset: cannot write .uasset`, and a struct or enum fails the compile. |
+| `--game <folder /Game is in>` | Optional, after the out dir. The `Content` folder of the extracted game pak, which `UE_ASSET_EDIT`, `UE_ASSET_EDITS` and `UE_PATCH` read the game's packages from, and a game asset's values read when the mod is built. Without it, an edit or such a read is refused. |
 
 **Parsing.** AssetGen runs `clang++` from `PATH` with `-std=c++20 -fsyntax-only` and reads the syntax tree that clang
 dumps as JSON. The include dir and its parent are both on the include path, so `#include "Engine.h"` and
@@ -1166,8 +1178,10 @@ hundreds of MB; it streams from clang through a pipe and is never written to dis
 | each namespace-scope data asset (`UCaveTuning CT_Easy = {...};`) | always |
 | `<Ns>__<Name>`, a class whose default object holds a namespace-scope variable | when a function uses the variable |
 | `FDeref`, the scratch struct that raw pointer reads go through | when the source reads through a pointer and does not declare `FDeref` itself |
+| `FDerefView_<Struct>`, the view a whole struct is read and written through | when the source reads or writes that struct whole through a pointer |
 | two structs per map type walked in place, `FMapSlot_TMap_<K>_<V>` and `FMapSlots_TMap_<K>_<V>`, and a wrapper struct per container nested in another container | when the code needs one |
 | each game package an edit names, at its own path, printed as `edit -> <package>.uasset (the game's, edited: ...)` | when the source has a `UE_ASSET_EDIT`, `UE_ASSET_EDITS` or `UE_PATCH` |
+| nothing; a line `value <- <package> (<path> = <value>, read when the mod is built)` for each game asset's value read | when the source reads one, `ED_Grunt.SpawnSpread`; bpbuild keeps the list in `build/<mod>/reads.txt` |
 
 It prints one line per package and one for the registry. Compiled into the bpbuild layout, a source with one class
 prints:
@@ -1233,7 +1247,7 @@ python tools/bpbuild.py <mods dir> <UeApi dir> <assetgen> [--force] [--no-pak]
 | `<UeApi dir>` | The include dir that every compile gets. |
 | `<assetgen>` | The compiler. bpbuild makes the path absolute first, so a relative one works. |
 | `--force` | Recompile every mod, changed or not. |
-| `--no-pak` | Compile only, and leave the staged files for you to pack. `embed` is not applied either: dependencies are copied in only when a pak is made. |
+| `--no-pak` | Compile only, and leave the staged files for you to pack. `embed` and `bundle` are not applied either: dependencies and bundle files are copied in only when a pak is made. |
 
 With fewer than three arguments, bpbuild prints its usage line and stops.
 
@@ -1269,7 +1283,8 @@ Keys of a mod:
 | `sources` | required | The mod's `.cpp` files, relative to the mods dir; globs work (`MyMod/*.cpp`, expanded in name order). The `.cpp` files compile into the mod's package folder as **one** translation unit: with more than one, bpbuild writes `build/<name>/<name>.unity.cpp`, which `#include`s each in order, and compiles that. So a mod can keep a header and a `.cpp` per class (`sources: [MyMod/*.cpp]`), `UE_MOD_PACKAGE` is written once in any one of them, and file-local names (`static` functions, anonymous namespaces) must not clash across the files. The headers they `#include "..."`, transitively, count for staleness on their own, except `UeApi/` and `UeAssets/` (the UeApi dir and the `UeAssets` dir beside it count as a whole, subfolders included); a header listed here also only counts for staleness. One of the `.cpp` files must hold the mod's `UE_MOD_PACKAGE` line: bpbuild finds the first with a text search and stops the whole build with `<files> declares no UE_MOD_PACKAGE` otherwise. With `embed`, the same check runs on each dependency. A mod with no `.cpp`, or with a listed source that does not exist, prints `SKIP - no such source` and counts as failed. |
 | `needs` | none | Mods to build before this one. An unknown name stops the build with ``mods.yaml: `needs` names an unknown mod: <name>``. A cycle is not an error: bpbuild breaks it, and since every mod compiles before any mod packs, both sides still see each other's assets. |
 | `embed` | `false` | Also packs every mod reachable through `needs`, directly or not, into this mod's pak, and merges their registries into its registry. The pak then works on its own. |
-| `generate_api` | `false` | Also writes the editor stubs for this mod's classes, structs and enums (see [Editor API stubs](#editor-api-stubs)). |
+| `bundle` | none | A list of folders, relative to the mods dir, each laid out like a staged FSD tree (`Content/...`). Every file in them is copied unchanged into the mod's pak at its path under the folder: `MyMod/Bundle/Content/_Shared/Lib.uasset` ships as `FSD/Content/_Shared/Lib.uasset`. It is for assets the mod calls but must not cook, such as a shared framework that other mods ship the same copy of. Nothing reads or rewrites the bytes. A listed entry that is not an existing folder stops the build with ``mods.yaml: a `bundle` entry is not a folder: <entry>``. `embed` does not carry a dependency's bundle: a mod that needs those files lists the folder in its own `bundle`. |
+| `generate_api` | `false` | Also writes the editor stubs for this mod's classes, interfaces, structs and enums (see [Editor API stubs](#editor-api-stubs)). |
 | `api_dir` | top-level `api_dir`, else `<mods dir>/out/api/Content` | Where the stubs go: the `Content` folder of a UE project. A mod's stubs land in `<api_dir>/<package path without /Game>/`. Only read when `generate_api` is set. |
 
 `api_dir` takes any of these forms:
@@ -1298,7 +1313,8 @@ api_dir:
    `BPBUILD_JOBS` of them run at once. Each mod's output is still printed whole, in this order. A failed compile prints
    `<name> FAILED`, and the build moves on.
 2. **Pack.** Every mod's assets exist by now, so an `embed` mod can copy in its dependencies' assets. Each mod whose pak
-   is out of date is packed with UnrealPak.
+   is out of date is packed with UnrealPak. Just before UnrealPak runs, the `embed` copy is made, and then the `bundle`
+   folders are copied into `build/<name>/FSD` as they are (a bundle file replaces a staged file at the same path).
 3. **Check imports between mods.** If nothing failed, bpbuild reads the import table of every `.uasset` in each mod's
    package folder, namespace subfolders included. An import of a package inside one of this build's mod folders that no mod produced fails the
    build with `<asset> imports <package>, which no mod in this build produces`. In game, such an import loads without an
@@ -1325,7 +1341,7 @@ The last line counts the mods built, packed, up to date and failed. The exit sta
 | bpbuild... | when |
 | --- | --- |
 | recompiles the mod | `--force` is given; the mod's package folder holds no staged asset yet; `generate_api` is set and a stub folder holds no `.uasset`/`.uexp`; the mod's entry in `mods.yaml`, or the top-level `api_dir` or `game_content`, differs from the last successful compile (kept in `build/<name>/mod.json`), so turning on `embed` repacks; or one of the `sources` or the local headers they include, any file in the UeApi dir or the `UeAssets` dir beside it, or the `assetgen` binary is newer than the **oldest** staged asset. |
-| repacks without recompiling | the newest staged asset of the mod, or of a dependency it embeds, is newer than the mod's pak (not with `--no-pak`). This picks up a dependency that changed, or a pak that an earlier `--no-pak` run skipped. |
+| repacks without recompiling | the newest staged asset of the mod, of a dependency it embeds, or of its `bundle` folders is newer than the mod's pak (not with `--no-pak`). This picks up a dependency or bundle file that changed, or a pak that an earlier `--no-pak` run skipped. |
 | prints `up to date` | neither applies. |
 
 The oldest asset is the reference, not the newest, so a half-finished earlier run does not look current.
@@ -1340,6 +1356,7 @@ The oldest asset is the reference, not the newest, so a half-finished earlier ru
     FSD/AssetRegistry.bin                the pak's one registry
     FSD/Content/<package path>/*.uasset|*.uexp
     FSD/Content/<dependency package>/... copied in at pack time when embed is set
+    FSD/<bundle file path>               copied in at pack time when bundle is set
   out/<name>_P.pak
   out/api/Content/<package path>/        default stub folder, with a .assetgen list of the stubs written there
 ```
@@ -1552,8 +1569,9 @@ Run with fewer than two arguments, it prints only the last sentence of its help 
 ## Editor API stubs
 
 `generate_api: true` in `mods.yaml`, or `--api <dir>` on `assetgen compile`, also writes the editor side of a mod: one
-uncooked UE 4.27 package per class, struct and enum, with signatures and no bodies. Someone working in the UE 4.27
-editor can then call your mod's functions from their own Blueprints. At run time, your mod's pak supplies the bodies.
+uncooked UE 4.27 package per class, interface, struct and enum, with signatures and no bodies. Someone working in the
+UE 4.27 editor can then call your mod's functions from their own Blueprints, and implement its interfaces in them. At
+run time, your mod's pak supplies the bodies.
 
 ```yaml
 mods:
@@ -1574,19 +1592,20 @@ A class stub holds:
 - one function graph per function a Blueprint can call, with an entry node for the inputs and a result node for the
   outputs. A `UE_PURE` function has no exec pins. The graphs are empty; the editor recompiles them when it loads the
   asset. Static functions have no world-context parameter, because the editor adds its own hidden one;
-- each function's access, static, const and net flags, and its `UE_CATEGORY`;
+- each function's access, static, const and net flags, its `UE_CATEGORY`, and its `UE_TOOLTIP` and `UE_KEYWORDS`;
 - the class's variables that are not private, with their flags, replication, RepNotify, category and literal defaults;
 - an empty generated class and default object, which the editor fills in on load, and registry tags, so that the
   Content Browser lists the asset.
 
 For example, with `--api` this class gets a stub with the variable `Charges` and the functions `Recharge` and `Left`,
-all three carrying the category `Turret`:
+all three carrying the category `Turret`, and `Recharge` its tooltip:
 
 ```cpp
 class StubDemo : public AActor {
 public:
   UE_CATEGORY("Turret");
   int32 Charges = 3;                          // a variable: in the stub, with its default
+  UE_TOOLTIP("Adds By charges.")
   void Recharge(int32 By) { Charges += By; }  // a function graph with one input
   UE_PURE int32 Left() { return Charges; }    // pure: no exec pins
   UE_CATEGORY("");
@@ -1614,14 +1633,22 @@ The compile prints a line for each thing a stub leaves out, and none of them fai
   since they add nothing. A struct or enum stub that cannot be written, by contrast, fails the compile.
 
 No stub is written for the compiler's own helper structs (`FDeref`, the `TMap` walk structs and the nested-container
-wrappers). Not yet: a stub for an interface the mod declares, so a Blueprint made in the editor cannot implement one; a
-mod class written in C++ can.
+wrappers).
+
+An interface stub is a Blueprint Interface asset with one function graph per function, its tooltip and keywords
+included. A Blueprint made in the editor lists it under Class Settings > Implemented Interfaces and implements its
+functions as it would any interface's. Cooked by the editor, that Blueprint names the interface the mod's pak cooks, so
+mount the mod's pak beside it: a call through the interface, from the mod's code or from a Blueprint, then reaches the
+editor Blueprint's implementation; this has been run in DRG. The interface's variables are AssetGen's own idea and are left out of the stub, so
+an editor Blueprint that implements the interface does not get them. An interface that extends another of the mod's
+has that one's stub as its parent.
 
 To use the stubs:
 
 1. Point `api_dir` at your UE 4.27 project's `Content` folder, or copy the stubs from `out/api/Content`.
-2. Open the project. Stubs of a function library, of actor classes, and of structs and enums have been loaded and
-   re-saved in UE 4.27.2 with no errors.
+2. Open the project. Stubs of a function library, of actor and object classes, of interfaces, and of structs and enums
+   have been loaded and re-saved in UE 4.27.2 with no errors. A Blueprint made in the editor against an interface stub
+   has been cooked and run in the game, its implementation called by the mod through the interface.
 3. Call the mod's functions from your Blueprints.
 4. Do not ship the stubs. Keep their folder out of your cook, and install the mod's own pak beside yours. UE's
    "Directories to never cook" packaging setting should keep them out; that has not been tested.
@@ -1944,16 +1971,9 @@ each topic.
 
 **Refused with a message.** The compile stops, and the section linked says what to write instead.
 
-- The address of a struct member, `&S.Member` or `&Pv->X`. Through a pointer, add the member's offset yourself:
-  `(int64)Pv + 4` is the address of `Pv->Y` for an `FVector *Pv`. See
-  [Pointers and memory](REFERENCE.md#pointers-and-memory).
-- A reference return, `int32 &Slot(int32 I)`. Return a value or a pointer. See [Functions](REFERENCE.md#functions).
-- A read through a pointer, `GetOuter()` and `GetTypedOuter` included, in a function that also waits. Read in a
-  separate method that does not wait, or keep the value in a member before the wait. See
-  [Pointers and memory](REFERENCE.md#pointers-and-memory).
-- A game asset's values as build-time constants. The `UeAssets` headers name every asset but hold none of its values.
-  Read a value in the game through the asset's pointer, `(&UeAssets::...::ED_Spider_Grunt)->SpawnAmountModifier`. See
-  [Game assets](REFERENCE.md#game-assets).
+- A game asset's value that it leaves to a native class, `ED_Spider_Grunt.SpawnAmountModifier`, as a build-time
+  constant. It is the class's C++ default, which no package holds. Read it in the game through the asset's pointer,
+  `(&ED_Spider_Grunt)->SpawnAmountModifier`. See [Game assets](REFERENCE.md#game-assets).
 
 **Compiled with no message, but wrong.** Nothing catches these yet, so avoid them.
 
@@ -1969,8 +1989,9 @@ A few mistakes also compile without a message, because the construct itself work
   copy the signature from the header. See [Interfaces](REFERENCE.md#interfaces).
 - `Items.Remove(2)` on a `TArray`. It is the Remove Index node; `RemoveItem(2)` removes the elements equal to 2. See
   [Containers](REFERENCE.md#containers).
-- `UKismetSystemLibrary::K2_SetTimer(this, "Poll", ...)` naming an inline method, a method that takes parameters or a
-  misspelled name. The engine sets no timer. Prefer `K2_SetTimerDelegate({ this, &AMine::Poll }, ...)`, which clang
+- `UKismetSystemLibrary::K2_SetTimer(obj, "Poll", ...)` naming an inline method, a method that takes parameters or
+  returns a value, or a misspelled name. The engine sets no timer. AssetGen refuses these when the object is `this`
+  and the name a literal, and cannot check any other form. Prefer `K2_SetTimerDelegate({ this, &AMine::Poll }, ...)`, which clang
   and AssetGen check. See [Timers and input](REFERENCE.md#timers-and-input).
 - A `UE_CLASS` path that leaves out the class's namespace folder. The owning mod imports the class instead of cooking
   it. bpbuild reports the import that no mod produces; a lone `assetgen compile` does not. See
@@ -1978,21 +1999,13 @@ A few mistakes also compile without a message, because the construct itself work
 
 **Missing, with nothing to write yet.**
 
-- A timeline track over a curve asset, the editor's External Curve. A track's curve is the keys in its macro; hand
-  the timeline a game curve at run time with `Fade->SetFloatCurve(Curve, "Alpha")`. See
-  [Timelines](REFERENCE.md#timelines).
-
 - A widget animation. The layout itself, its events, named slots and property bindings included, is declared with
   `UE_WIDGET` and the constructor. See [Widget layouts](REFERENCE.md#widget-layouts).
-- Editor stubs for the mod's interfaces. A Blueprint made in the editor cannot implement an interface that the mod
-  declares; a C++ class can. See [Editor API stubs](#editor-api-stubs).
 - A check of a game component class's own native data. A `UE_COMPONENT` of one of the game's component classes gets
   the native data of its engine ancestors, which matches every game component class that appears as a template in the
   game's content. 177 never appear there, mostly abstract bases, objectives and character states; one of those that
   serialized more data would fail to load *(inferred)*, and nothing checks for this. See
   [Components](REFERENCE.md#components).
-- Keywords and a ToolTip for a function in the editor stub. `UeMeta.h` has no macro for them. See
-  [Classes and variables](REFERENCE.md#classes-and-variables).
 - The form of a game enum that no property uses. genueapi learns whether a game enum is an `enum class` from how the
   dump's properties of it and the game's Blueprints are reflected, and 240 of the SDK's 1445 enums have none (the
   enum's own form is not in the dump yet); a variable of one is a Byte, which differs from the editor's Enum variable

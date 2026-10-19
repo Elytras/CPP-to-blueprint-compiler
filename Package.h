@@ -1,5 +1,5 @@
 ﻿#pragma once
-// Cooked UE4.27 package writer. Unversioned (FileVersionUE4 = 0), tagged properties (not
+// Cooked UE4.27 or UE5.6 package writer. Unversioned (no file versions), tagged properties (not
 // PKG_UnversionedProperties), PKG_FilterEditorOnly (drops LocalizationId/PersistentGuid).
 #include <functional>
 #include <string>
@@ -11,6 +11,13 @@
 
 namespace Uasset
 {
+/* S40: the engine every package of this compile is laid out for, from the UeApi's Version.json ("ue"). An unversioned
+   package is read at the running engine's version, so each field must be where that engine writes it (DESIGN.md S40).
+   ponytail: one global, because one compile is one game; a per-package field when a compile ever mixes engines. */
+enum class EEngine { UE427, UE56 };
+extern EEngine GEngine;
+inline bool IsUE5() { return GEngine == EEngine::UE56; }
+
 /* FPackageIndex: 0 null, +n Exports[n-1], -n Imports[n-1]. Build via Exp()/Imp(). */
 struct FIndex
 {
@@ -44,6 +51,9 @@ public:
 
     FPackage* Owner() const { return Pkg; }
     std::vector<uint8> B;
+    /* Where the first tag list written straight into this archive ends (past its None): an export's own properties.
+       UE5's export row records it (ScriptSerializationEndOffset). Set by TagEnd. */
+    int64 PropsEnd = -1;
 
 private:
     FPackage* Pkg = nullptr;
@@ -57,7 +67,11 @@ void Tag(FArc& Ar, const std::string& Name, const std::string& Type,
 /* A bool's value lives in the tag (BoolVal) with zero payload; writing one via Tag() loads as false. */
 void TagBool(FArc& Ar, const std::string& Name, bool Value);
 
-inline void TagEnd(FArc& Ar) { Ar.Name("None"); }
+inline void TagEnd(FArc& Ar)
+{
+    Ar.Name("None");
+    if (Ar.PropsEnd < 0) Ar.PropsEnd = int64(Ar.B.size());
+}
 
 struct FImport
 {

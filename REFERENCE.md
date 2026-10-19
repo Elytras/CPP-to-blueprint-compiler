@@ -460,7 +460,8 @@ Notes:
 | `const int32 Limit = 3;` | A read-only variable (BlueprintReadOnly): the editor offers a Get node and no Set node. The initializer is the default. clang refuses a write in C++, and the Blueprint VM does not check it. | Yes |
 | `UE_READONLY int32 Cap = 5;` | Read-only the same way (BlueprintReadOnly), but it can still be written: a subclass's `UE_DEFAULTS` may give it a default, and a write from code compiles with `warning: <Class>::<Function>: Cap is BlueprintReadOnly; the editor would not set it`, because the VM allows the write (for example, setting a deferred spawn's members before FinishSpawning). UeApi declares the engine's and game's BlueprintReadOnly properties this way. | Yes |
 | `UE_CATEGORY("Turret\|Setup");` | Gives the functions and variables declared after it that category. `\|` starts a subcategory, and `UE_CATEGORY("")` ends the category. It is positional, like an access specifier. | Yes |
-| a keyword or a tooltip for a function | Not yet: there is no macro for it. | Not yet |
+| `UE_TOOLTIP("Adds charges.") UE_KEYWORDS("refill reload") void Recharge(int32 By);` | The function's tooltip, shown over its call node and in the action menu, and extra words the action menu's search finds it by: the Description and Keywords of the editor's function details. Like a category, they reach the editor API stub only. The cooked game keeps no editor metadata, so the pak carries neither, and nothing changes in game. | Yes |
+| `UE_TOOLTIP("Count") int32 N;` | Refused: "marks no method". They describe the method that follows them. | Refused |
 
 ```cpp
 class Turret : public AActor {
@@ -470,6 +471,8 @@ public:
   int32 Charges;
   UE_CATEGORY("");                  // back to none
   int32 Plain;
+  UE_TOOLTIP("Fires once.") UE_KEYWORDS("shoot shot")
+  void Fire() {}
   const int32 Limit = 3;            // Get node only
 protected:
   int32 Step() { return 1; }
@@ -484,9 +487,10 @@ Notes:
 - A C++ `class` starts private. A function declared before the first `public:` is a private Blueprint function, and a
   variable there is left out of the API stub.
 - Categories and access matter for the editor API stub that `generate_api` writes, so that a Blueprint made in the
-  editor can call the mod. `UE_CATEGORY` is written only there, as the category of each variable and function: the
-  cooked class has no categories, and without `generate_api` the macro does nothing. The stub keeps a private function,
-  flagged private, and leaves out interfaces the mod declares. Whether the editor lists the members under their
+  editor can call the mod. `UE_CATEGORY` is written only there, as the category of each variable and function, and so
+  are `UE_TOOLTIP` and `UE_KEYWORDS`: the cooked class has no categories, and without `generate_api` the macros do
+  nothing. The stub keeps a private function, flagged private. A stub's tooltip and keywords have been checked in UE
+  4.27.2: they are the compiled function's ToolTip and Keywords. Whether the editor lists the members under their
   category has not been checked. See [Editor API stubs](GUIDE.md#editor-api-stubs).
 
 ### Names
@@ -1077,7 +1081,8 @@ copies it, as in C++.
 | `Home.Z = Twice.X + 1;` | Reads and writes a member in place (Break Struct, Set Members in Struct). | Yes |
 | `Nested.Inner.Kills += 1;` | Nested members work to any depth, in place. | Yes |
 | `K2_GetActorLocation().X` | A member of a struct a call returns. The value is stored in a temporary and read from there. | Yes |
-| `&S.Kills` | Not yet: a Blueprint variable has no address. See [Pointers and memory](#pointers-and-memory). | Not yet |
+| `&S.Kills` with a member `S` | The address of S, found at run time through the ReadProperty helper as `&Member` is, plus Kills' offset in the struct. Without the helper the build stops ("include ReadProperty.h"). See [Pointers and memory](#pointers-and-memory). | Yes |
+| `&S.Kills` with a local or parameter `S` | Refused: a Blueprint variable has no address ("a Blueprint variable has none the VM hands out"). | Refused |
 
 ### Making struct values
 
@@ -1868,7 +1873,7 @@ function then has two properties both named X.
 | `int32 &Slot = Slots[I];` | A TArray element (of this object or another), `*P` or `P[I]`: the reference keeps the place's address in a hidden int64 local, and reads and writes go straight to that memory. | Yes |
 | `const FVector &Home = K2_GetActorLocation();` | A `const T&` bound to a temporary is a copy, which lives as long as the reference. | Yes |
 | `int32 &R = Other->Score;` | Another object's field has no Blueprint reference, so R keeps the field's address, found by name at run time as `&Other->Score` is. That needs the ReadProperty class you supply (see [Pointers and memory](#pointers-and-memory)); without one the build stops ("include ReadProperty.h"). The `const` and `auto &` forms, and `O->Score` through a local pointer, are the same. Without the helper, write to the field directly, or pass it to an inline function's `T&` parameter, which binds the field itself. | Yes |
-| `float &X = Other->Loc.X;` | Refused ("the address of MemberExpr"): a member of another object's struct has no address the VM hands out. | Refused |
+| `float &X = Other->Loc.X;` | X keeps the address of Loc, found by name at run time as `&Other->Loc` is, plus X's offset. That needs the ReadProperty class, as the row above does. | Yes |
 
 ```cpp
 int32 Count;
@@ -1894,9 +1899,10 @@ Notes:
 
 - A reference that holds an address behaves like C++'s. If the array grows or shrinks after the reference is taken,
   it may point at freed memory. Take the reference after any Add or Remove, or index the array again.
-- A reference that holds the address of a struct or a TArray is usable only through its members. With
-  `FVector &V = Pts[0];`, `V.X = 2.f` works, but `FVector C = V;` is refused ("a whole FVector through a pointer"), and
-  so is a TArray function called on a `TArray<int32> &`.
+- A reference that holds the address of a struct reads and writes it as `*P` does: with `FVector &V = Pts[0];`,
+  `V.X = 2.f` writes the member and `FVector C = V;` copies the struct. A reference to a TArray is usable only through
+  its elements: a TArray function called on a `TArray<int32> &` is refused ("a whole TArray<int32> through a
+  pointer").
 
 ### Other declarations
 
@@ -2033,6 +2039,7 @@ written inside the class does not make a method inline. Only the `inline` keywor
 | `virtual int32 Score() = 0;` | An empty function that returns the default: 0, false, None or empty. A subclass's Score overrides it and names it as its super. A class that declares one, or inherits one with no version of its own, is cooked Abstract, which SpawnActor and CreateWidget refuse, as they refuse a class the editor marks Generate Abstract Class. `NewObject` and `AddComponentByClass` do not check the flag in a game, so a call to Score on such an object gets the default. A `SpawnActor` that names such a class warns, and a `NewObject` that names it is refused ([Objects and widgets](#objects-and-widgets)). | Yes |
 | `public:` / `protected:` / `private:` | Become the function's Public, Protected or Private flag, which the editor honours; see [Classes and variables](#classes-and-variables). | Yes |
 | `UE_CATEGORY("Turret\|Setup");` | The category of the members that follow, written into the editor API stub; see [Classes and variables](#classes-and-variables). | Yes |
+| `UE_TOOLTIP("...") UE_KEYWORDS("...")` | The function's tooltip and search keywords, written into the editor API stub; see [Classes and variables](#classes-and-variables). | Yes |
 | `UE_AUTHORITY_ONLY` / `UE_COSMETIC` | The editor's Authority Only and Cosmetic function flags; see [RPCs](#rpcs). | Yes |
 | `generate_api: true` in `mods.yaml` | Writes an editor stub of the class, so a Blueprint made in the editor can place call nodes for its functions; see [Editor API stubs](GUIDE.md#editor-api-stubs). | Yes |
 | `int32 Undef(int32 X);` with no body anywhere | No function is cooked, and a call to it is refused ("... declares and never defines"), as C++ would not link it. Give every method a body, or make it `virtual ... = 0` for an empty one. | Refused |
@@ -2134,7 +2141,9 @@ Notes:
 |---|---|---|
 | `FVector Offset(float Up) { return ...; }` | The return type becomes the function's ReturnValue output. Any type a variable can have may be returned, and a caller can read a member of a returned struct directly: `GetTransform().Translation.Y`. | Yes |
 | `auto Half(int32 V) { return V / 2; }` | A deduced return type becomes the Blueprint function's return type. | Yes |
-| `int32 &Slot(int32 I)` | Refused: `a reference return is refused until what it means to a C++ caller is specified`. Return a value or a pointer. | Not yet |
+| `int32 &Slot(int32 I) { return Slots[I]; }` | Returns the address of what it returns, and each call is the memory there, as `*P` is: `Slot(2) = 7` writes the element, `Slot(2) += 1` calls Slot once, `int32 &R = Slot(2);` keeps the address, `Slot(2).X` reaches a member. The returned thing needs an address: a TArray element, memory through a pointer, a member of either, another object's member (through ReadProperty). A Blueprint caller, such as the editor, sees an int64: the address. | Yes |
+| `int32 &Bad() { int32 L = 3; return L; }` | Refused: "returns a reference to L, a local: a Blueprint variable has no address to return". A by-value parameter and a `T&` parameter are refused the same way. Return a value or a pointer. | Refused |
+| `const FString &Name() { return Names[0]; }` | Returns a copy: the function's ReturnValue is an FString. The build warns ("returns const FString&: a Blueprint function returns a copy"): a caller that keeps the reference does not see the original change later. | Warns |
 | `int32 ByVal(TArray<int32> A)` | An input pin. The callee gets its own copy, containers and structs included, and its writes stay in the callee. | Yes |
 | `void Around(int32 A, int32 &Lo, int32 &Hi)` | A pass-by-reference pin: writes reach the caller's variable, member or array element. This is how a function returns several values. | Yes |
 | `int32 Plus1(const int32 &A)` | Passed by reference, with no copy. A literal or computed argument is first stored in a hidden local, as the editor's compiler does, because the VM needs an address. | Yes |
@@ -2164,6 +2173,9 @@ Notes:
   runs RandomInteger at each call that leaves `Max` out.
 - A `T&` parameter bound to another object's member (`Add5(O->N)`) is passed through that object, which the engine
   treats as a reference. This case has not been run.
+- What a reference return means follows the declaration, not the body, so a class shared through `UE_CLASS` returns the
+  same thing to every mod that calls it. An inline function that returns `T&` is expanded instead, and its call is the
+  place it returns, as before.
 
 ### Reference parameters and copy-back
 
@@ -2899,6 +2911,12 @@ Notes:
 - The text is culture-invariant, as a literal in code is: it is not gathered for translation.
 - A layout can be checked without the editor: the `wrender` command of the framework DLL draws a widget class to a PNG
   and writes each widget's box to a JSON beside it.
+- `python tools/widgetloop.py <mod dir> <Class> [<w> <h> | desired] --watch --open` is the live editor: each time a
+  source of the mod is saved, it cooks the mod, swaps its pak into the running game (`pak reload`, no restart) and
+  draws the class again, a few seconds after the save. It prints each widget that was added, removed, moved or
+  resized, with its old box; when the compile fails, it prints clang's error and the last good picture stays.
+  `--open` shows the PNG in the browser, on a page that reloads it as it changes. Without `--watch` it runs one turn
+  and prints every box.
 
 ## Class defaults
 
@@ -3323,7 +3341,7 @@ Notes:
 | `Obj->GetOuter()` | Reads the object's outer pointer from memory, with no engine call. On a null object it crashes, as in C++. For a null-safe call, use `UKismetSystemLibrary::GetOuterObject(Obj)`. | Yes |
 | `GetTypedOuter<AActor>(Obj)` | From `Objects.h`: the nearest outer of `Obj` that is a `T`, or null. `Obj` itself is never a candidate, and a null `Obj` gives null. Each step is one outer read and one Cast. | Yes |
 | `GetOutermostTypedOuter<ULevel>(Obj)` | From `Objects.h`: the same walk, keeping the farthest outer that is a `T`. | Yes |
-| `GetOuter()` or `GetTypedOuter<T>()` in a function that waits (`Delay`, `UE_AWAIT`) | Not yet: refused with "a pointer read in a function that makes a latent call". Do the walk in a separate function that does not wait, or loop over `UKismetSystemLibrary::GetOuterObject`, which is an engine call. | Not yet |
+| `GetOuter()` or `GetTypedOuter<T>()` in a function that waits (`Delay`, `UE_AWAIT`) | Reads the outer when the line runs, before the wait or after the function resumes. | Yes |
 | `Obj->IsA(AActor::StaticClass())` | Get Class, then Class Is Child Of: `UKismetMathLibrary::ClassIsChildOf(UGameplayStatics::GetObjectClass(Obj), Class)`. False on a null object. Needs `UeApi/Engine.h`. | Yes |
 | `Class->IsChildOf(AActor::StaticClass())` | Class Is Child Of (`UKismetMathLibrary::ClassIsChildOf`). False on a null class. | Yes |
 | `Obj->Class` | Refused by clang: "no member named 'Class' in 'UObject'". The SDK declares none of UObject's raw fields (`Class`, `Outer`, `Name`). Use the helpers above. | Refused |
@@ -3669,7 +3687,12 @@ path is not checked when the mod is built, so a wrong path compiles.
 | `"/Game/Dir/Package.Object"` | Names an object whose name is not its package's. In the game's content the difference is mostly letter case. | Yes |
 | `UE_ASSET_AT(UEnemyDescriptor, Spider, ...)` in two namespaces | Two different assets: an asset is keyed by its qualified name. | Yes |
 | `(&ED_Spider_Grunt)->SpawnAmountModifier` | Reads the game asset's value when the game runs. | Yes |
-| `ED_Spider_Grunt.SpawnAmountModifier * 2` | Not yet: the SDK names game assets but carries none of their values, so a value cannot be used when the mod is built. Refused with "is an asset, not a value". Read the value at run time through the pointer. | Not yet |
+| `ED_Spider_Grunt.SpawnSpread * 2`, `ED_Spider_Grunt.SpawnRarityModifiers[1].Rarity` | A member read by value is the value the asset's package holds, read when the mod is built off the extracted game pak (`--game`; bpbuild: `game_content`), and a constant there: in code, and in a default. A number, a bool, an enum, a name or a string. A step is `.Member` or a `TArray`'s `[i]`, as in `UE_ASSET_EDITS`. A member the asset has no value of is its archetype's, its class's default object, followed through the game's packages; a Blueprint class's own variable that its default object leaves out is zero. The SDK carries no values, so none can go stale with it. The compile prints each value it reads, `value <- <package> (<path> = <value>, ...)`, and bpbuild rebuilds a mod when the game's copy of a package it read is newer, after a re-extract. | Yes |
+| `ED_Spider_Grunt.SpawnAmountModifier`, a member the asset leaves to a native class | Refused: "sets no value of its own, so it holds EnemyDescriptor's C++ default, which no package holds". That value is the C++ constructor's, in the game's code. Read it when the game runs, `(&ED_Spider_Grunt)->SpawnAmountModifier`. | Refused |
+| a member whose type UeApi gives otherwise than the package, an enumerator UeApi's enum lacks | Refused: "the game's package holds a FloatProperty there, where UeApi declares a IntProperty: regenerate UeApi from the same game build as the extracted pak". A stale SDK never compiles in a value it misreads. | Refused |
+| a reference, a text, a map's value, an element past the end of the game's array, an asset of a mod pak | Refused, each with its reason ("only a number, a bool, an enum, a name or a string is read when the mod is built", "the game's array has 0 elements", "is not in <game folder>"). Read it when the game runs, through the pointer. | Refused |
+| a value that this mod's own `UE_ASSET_EDIT` or `UE_ASSET_EDITS` changes | Refused: "this mod's edit changes the value read when the mod is built". The game loads the edited value. | Refused |
+| a value read without `--game` | Refused: "a game asset's value is read off its package when the mod is built: pass the folder /Game is in". | Refused |
 | `&OtherData`, another mod's asset of a class that a shared header declares without `UE_CLASS` | Refused: each mod that includes the header cooks its own copy of the class, so the reference "would load as null". The message prints the `UE_CLASS` line that pins the class to its owner; see [Mod sources and packages](#mod-sources-and-packages). | Refused |
 | changing a game data asset, or a game Blueprint's defaults or functions, in the pak | `UE_ASSET_EDIT`, `UE_ASSET_EDITS` and `UE_PATCH`: see [Editing game packages](#editing-game-packages). | Yes |
 
@@ -3691,12 +3714,15 @@ public:
   UEnemyDescriptor *B = &Spiders::Exploder::Spider;
 
   float Modifier() { return (&ED_Spider_Grunt)->SpawnAmountModifier; } // read when the game runs
+  float Spread() { return ED_Spider_Grunt.SpawnSpread * 2; }             // read when the mod is built (--game)
 };
 ```
 
 Notes:
 
 - A wrong path compiles, and the reference can then only load as null.
+- A value read when the mod is built is the game's as the extracted pak holds it. After a game update, extract the pak
+  again; bpbuild then rebuilds every mod that read a changed package. A lone `assetgen compile` does not check.
 - Inside a namespace that has the class's name, as in the `UeAssets` headers, spell the class `::UEnemyDescriptor`.
 - The unpinned-class check looks only at a `UE_ASSET_AT` the source uses, and not at an asset the same source
   defines.
@@ -3792,7 +3818,8 @@ the game's. The rule to remember: an edit starts from the game's own package, so
 | `UE_ASSET_EDIT` and `UE_ASSET_EDITS` of one asset in one source | Both land in the one edited package. | Yes |
 | `PrimaryActorTick.bCanEverTick = true`, a path into a member the object has no value of | The object takes that member from its class (its archetype), so the new value holds only the path, and the engine fills in the rest. This works through members of structs written as tags. Through a native struct (FVector, FRotator, ...) or an array element, the value's other parts are unknown when the mod is built: refused with "is not set on". Assign the whole member. | Yes |
 | `Points[2].X = 1.0f` on an array of two | Refused: "Points has 2 elements". | Refused |
-| `Score["a"] = 1`, an element of a `TMap` or `TSet` | Not yet: refused with "only a TArray's element can be assigned on its own; assign the whole map". Assign the whole container. | Not yet |
+| `UE_ASSET_EDITS { Def.Score["a"] = 1; Def.Ids.Add(7); Def.Score.Remove("b"); }` | One element of a `TMap` or `TSet` put, added or removed, as C++'s `operator[]`, `Add` and `Remove` leave the container: merged into the value the asset holds, so its other elements stay. The tag is a delta over the archetype's value, so a key removed is listed as removed, and an asset with no value of its own gets a tag of the one element. An FString key compares without case. A path through members of structs written as tags reaches one too (`Def.Held.Score["a"] = 1`), and so does a patch's `UE_DEFAULTS`. | Yes |
+| `Def.Arr[0].Score["a"] = 1`, `Def.Score["a"].X = 1` | Refused: a map inside an array's element or a native struct "cannot be changed on its own yet; assign the whole element"; a map's value "is assigned whole, `Map[Key] = value;`". | Refused |
 | `UE_ASSET_EDIT(MD_Big) {...}`, an asset the mod cooks itself | Refused: "the target is a UE_ASSET_AT ...; a mod's own asset takes its values where it is declared". Set the value in the asset's own braces. | Refused |
 | any edit without `--game` | Refused: "an edit starts from the game's own package: pass the folder /Game is in". | Refused |
 
@@ -3828,10 +3855,16 @@ its `UE_DEFAULTS` and methods are written into that Blueprint's own package.
 | a parent Blueprint's component that this Blueprint does not override | Not yet: the package has no template of it to edit. Refused with "the class does not override that inherited component". Patch the Blueprint that declares the component, which changes every child that does not override it too. | Not yet |
 | `Loose->bVisible = false;`, a member that is no component of the Blueprint | Refused: "Loose is not one of <Class>'s components (UeApi gives it no SCS node)". | Refused |
 | `PrimaryActorTick.bCanEverTick = true;`, `MeleeAttack->Montages[0] = &ANIM_Attack;` | Paths into a value, by the rules of `UE_ASSET_EDITS` above. | Yes |
+| `Score["a"] = 9;`, `Ids.Add(7);`, `Score.Remove("b");` | One element, merged into the default object's value as in `UE_ASSET_EDITS` above. | Yes |
 | `Ids = {7};`, `Score = {{"a", 9}};` on a `TSet` or `TMap` | The default object loads exactly that value: the elements the parent's value has and this one drops are written as removed, as the cook writes a set or map. `Ids = {}` empties it. The same holds for one inside a struct, by path or in a whole struct. A key given twice holds the last value, and an FString key compares without case. | Yes |
 | `class Tweaks : public AActor { UE_PATCH; ... };` | Refused: "a patch derives from the game Blueprint it edits (a class in a /Game package); a native class's defaults come from its C++ constructor, not from a package". | Refused |
-| `int32 Extra;` or an interface in a patch | Not yet: refused with "a member or an interface of its own is not built yet". | Not yet |
-| a patch with neither `UE_DEFAULTS` nor methods | Refused: "nothing to edit". | Refused |
+| `int32 Extra = 4;` in a patch | A variable added to the Blueprint, after its own: its methods and the patch's read and write it, and the initializer is a tag of its default object, which every instance and a game subclass start from. A `UE_DEFAULTS` value of it wins over the initializer, as the constructor's would. | Yes |
+| `class Tweaks : public BP_Turret_C, public IPoke { UE_PATCH; ... };` | The Blueprint implements the interface: listed in its Interfaces as the editor lists one, with the patch's methods for it, an empty one for each it leaves out, and the interface's variables as the class's own. Checked offline; not run in the game yet. | Yes |
+| `int32 count;` beside the Blueprint's `Count` | Refused: "already has a variable Count, and an FName ignores case; rename it". | Refused |
+| `UE_REPLICATED(int32, Extra);` in a patch | Refused: "a patch's own member does not replicate". It would renumber the class's replicated properties against a player without the mod. | Refused |
+| `UE_COMPONENT(...)`, `UE_WIDGET(...)` or `UE_DISPATCHER(...)` in a patch | Refused: "a patch adds no component or widget" / "no dispatcher". The construction script and widget tree stay the game's. Spawn one at run time, or declare a class of your own. | Refused |
+| an interface whose function the Blueprint already has, left out of the patch | Refused: "would replace with an empty one; write the method in the patch". `Parent::Fn()` in that method runs the game's. | Refused |
+| a patch with neither `UE_DEFAULTS`, methods nor members | Refused: "nothing to edit". | Refused |
 
 ### Replacing a game Blueprint's functions
 
@@ -3844,7 +3877,7 @@ its `UE_DEFAULTS` and methods are written into that Blueprint's own package.
 | a variable at namespace scope that a patch's method uses | Kept as any namespace-scope variable is: its class is cooked into the mod's own package. See [Global variables](#global-variables). | Yes |
 | a method whose parameters differ from the game function's | Refused: "its parameters ... are not the game function's ...; a replacement takes the same ones, in the same order". Copy them from the SDK header: the type, the name and the direction (a Blueprint output is `T &`). | Refused |
 | a method that the SDK header declares and the game's package lacks | Refused: "has no function of that name of its own, though its declaration has one: the declaration is not the game's". Regenerate the SDK from the same game build as the extracted pak. | Refused |
-| `UKismetSystemLibrary::Delay(1.0f);` in a patch's method | Not yet: refused with "a patched function that waits (a latent call) needs an ubergraph of its own in the game's class; not built yet". | Not yet |
+| `UKismetSystemLibrary::Delay(1.0f);` in a patch's method, or another latent call | Waits, as in a class of your own. The code after the wait runs from an ubergraph the patch adds to the Blueprint, `ExecuteUbergraph_<Patch>`; the Blueprint's own stays the game's. The engine keeps a frame across a wait only for a class's own ubergraph, so what the method keeps across it (its locals, its parameters) are transient variables of the Blueprint, `<Method>_<Name>`. A second call while the first waits shares them, as a Blueprint's event graph does. Checked in DRG: a patched grunt's `ReceiveBeginPlay` waited and resumed with its local intact. | Yes |
 
 ```cpp
 #include "UeApi/Game/ENE_Spider_Grunt_Normal_C.h"
@@ -4147,7 +4180,7 @@ restarts it. [examples/Beacon.cpp](examples/Beacon.cpp) runs a looping timer, an
 | `K2_ClearTimerDelegate({this, &Pulser::OnPulse})` | Clear Timer by Event. Stops the timer without a handle. | Yes |
 | `K2_PauseTimerHandle(Pulse)`, `K2_UnPauseTimerHandle(Pulse)` | Pause and resume the timer. AssetGen fills the world context in as self. | Yes |
 | `K2_IsTimerActiveHandle(Pulse)`, `K2_GetTimerRemainingTimeHandle(Pulse)`, `K2_IsValidTimerHandle(Pulse)` | Ask about the timer. The first two get self as world context; K2_IsValidTimerHandle takes only the handle. | Yes |
-| `K2_SetTimer(this, "Poll", 1.0f, true, 0.0f, 0.0f)` | Set Timer by Function Name. AssetGen passes the name as a plain string and does not check it. The engine looks the method up by that name at run time. | Yes |
+| `K2_SetTimer(this, "Poll", 1.0f, true, 0.0f, 0.0f)` | Set Timer by Function Name. AssetGen passes the name as a plain string. The engine looks the method up by that name at run time. With `this` and a literal name, AssetGen checks the method the way the engine will (see below). | Yes |
 | `K2_ClearTimer(this, "Poll")` | Clear Timer by Function Name. K2_PauseTimer, K2_UnPauseTimer, K2_IsTimerActive, K2_GetTimerRemainingTime and the other by-name calls find the timer by the same name. | Yes |
 | `UFSDWidgetBlueprintLibrary::SetTimerForNextTick({this, &Pulser::Later})` | DRG's own next-frame timer. It takes a delegate value, returns a handle, and gets self as world context. | Yes |
 
@@ -4187,11 +4220,13 @@ Notes:
 - A looping timer shorter than a frame runs several times in that frame to catch up.
 - The timer holds its object weakly. Once the actor is gone, a looping timer is not re-armed.
 - Prefer the delegate form to the by-name form. With `{this, &Class::Method}`, clang checks that the method exists and
-  takes no parameters, and AssetGen refuses an inline method. With a name, all three mistakes compile with no warning
-  and fail at run time. An inline method never becomes a function of the class, and a misspelled name matches nothing,
-  so the engine logs "SetTimer passed a bad function (...) or object (...)" and returns an invalid handle. A method
-  that takes parameters is found, but the engine refuses it with "SetTimer passed a function (...) that expects
-  parameters." In each case no timer is set.
+  takes no parameters, and AssetGen refuses an inline method. With a name, the engine finds these mistakes only at run
+  time. An inline method never becomes a function of the class, and a misspelled name matches nothing, so the engine
+  logs "SetTimer passed a bad function (...) or object (...)" and returns an invalid handle. A method that takes
+  parameters or returns a value is found, but the engine refuses it with "SetTimer passed a function (...) that
+  expects parameters.": its test is the function's parameter size, which counts the return value. In each case no
+  timer is set. AssetGen refuses all four when the object is `this` and the name a literal; any other by-name call
+  compiles unchecked.
 - SetTimerForNextTick is DRG's function, and only compiling it was checked. Going by its name and by the engine's
   FTimerManager function of the same name, it calls the method once on the next frame. The engine libraries in the
   SDK have no next-tick timer of their own.
@@ -4340,9 +4375,15 @@ lifts a light.
 | `UE_TIMELINE_UPDATE(Fade) void OnFade();` | The node's Update pin: the engine calls OnFade every frame the timeline plays, after it has written the tracks' variables, and when SetNewTime moves it. | Yes |
 | `UE_TIMELINE_FINISHED(Fade) void OnFaded();` | The Finished pin: called when the timeline reaches its end playing forward, or its start playing in reverse. A looping timeline never finishes. | Yes |
 | `UE_TIMELINE_EVENT(Fade, 0.5, 1.5) void Blink();` | An event track: the engine calls Blink each time the timeline passes 0.5 s and 1.5 s, forward or in reverse. | Yes |
-| A track over a curve asset, the editor's External Curve | Not yet: a track's curve is the keys written in its macro. Hand the timeline a game curve at run time instead, `Fade->SetFloatCurve(Curve, "Alpha")`, with the track named like its variable. | Not yet |
+| `UE_FLOAT_TRACK_CURVE(Fade, Alpha, UeAssets::UCurveFloat::Game::LevelElements::Blueprints::Hologram_FadeIn);` | A track over a curve asset, the editor's External Curve: the timeline plays the asset's keys as the game has them. The curve is any UE_ASSET_AT of a curve, so the game's (the UeAssets headers name them all) or another mod's, or a curve of this mod's own. Declares `float Alpha`, as UE_FLOAT_TRACK does. | Yes |
+| `UE_VECTOR_TRACK_CURVE(Fade, Lift, Path);`, `UE_COLOR_TRACK_CURVE(Fade, Tint, Glow);` | A vector track over a UCurveVector, a color track over a UCurveLinearColor. | Yes |
+| `UE_FLOAT_CURVE(Ramp, (0, 0), (1, 1, Cubic));` at namespace scope | A curve asset of the mod's own, as the Content Browser's Miscellaneous > Curve makes one: a UCurveFloat cooked at `<mod package>/Ramp`, its keys written as a track's are. `UE_VECTOR_CURVE` and `UE_COLOR_CURVE` make a UCurveVector and a UCurveLinearColor. `&Ramp` points at it in a track, a default or code, and another mod names it with UE_ASSET_AT. In a namespace, it goes to that folder. | Yes |
+| `UE_FLOAT_TRACK_CURVE(Fade, Alpha, Path)` where Path is a UCurveVector | Refused: "a UCurveVector: the track's float is played from a UCurveFloat". | Refused |
 
 ```cpp
+#include "UeAssets/UCurveFloat.h"
+UE_FLOAT_CURVE(Ramp, (0, 0), (1, 1, Cubic), (2, 0));   // a curve asset of the mod's own
+
 class FadingLamp : public AActor {
 public:
   UE_COMPONENT(UPointLightComponent, Lamp);
@@ -4361,6 +4402,9 @@ public:
     if (Runs < 3) Fade->PlayFromStart();
   }
   UE_TIMELINE_EVENT(Fade, 1.0) void Peak() { Peaks = Peaks + 1; }
+  UE_TIMELINE(Glow, 2.0f);                      // two tracks over curve assets
+  UE_FLOAT_TRACK_CURVE(Glow, Fog, UeAssets::UCurveFloat::Game::LevelElements::Blueprints::Hologram_FadeIn);
+  UE_FLOAT_TRACK_CURVE(Glow, Pulse, Ramp);
   void ReceiveBeginPlay() { Fade->PlayFromStart(); }
 };
 ```
@@ -4399,6 +4443,11 @@ Notes:
   reached, and a track holds its last key's value after it. Keys are sorted by time, as the editor sorts them.
 - A key's time and values are numbers, written as C++ literals: `1`, `0.5`, `-2.5f`. AssetGen reads them itself, so
   a constant's name or an expression is refused.
+- A track over a curve asset names it, as the editor's External Curve does: the class holds no curve of its own for
+  it, and the asset loads with the class. Its keys are the asset's, so a game curve plays what the game has. The
+  timeline's length is still its own (or its last key's, with LastKeyframe), not the curve's. Such a track and a curve
+  of the mod's own have been loaded in DRG, each external track holding its asset.
+- `Fade->SetFloatCurve(Curve, "Alpha")` hands a track another curve at run time, the track named like its variable.
 
 ## Interfaces
 
@@ -4563,7 +4612,7 @@ Notes:
 | `class IBoth : public IAimable, public IMarkable` | Refused: "an interface extends one interface at most". A UClass has one super. | Refused |
 | `class IActorish : public AActor { public: UE_INTERFACE; };` | Refused: "IActorish extends AActor, which is not an interface". An interface's only base is another interface, the mod's or the game's. | Refused |
 | `UE_COMPONENT(UStaticMeshComponent, Hull);` on an interface | Refused: "an interface cannot declare a UE_COMPONENT". Declare it on the implementing actor. | Refused |
-| Implementing a mod interface from an editor Blueprint | Not built. The editor API stubs cover a mod's classes, structs and enums, not its interfaces. See [Editor API stubs](GUIDE.md#editor-api-stubs). | Not yet |
+| `generate_api: true` with a `UE_INTERFACE` | The interface's editor API stub is a Blueprint Interface asset at the interface's own path, so a Blueprint made in the UE 4.27 editor can list it under Implemented Interfaces and implement its functions. Cooked by the editor, that Blueprint uses the interface the mod's pak cooks: a call through the interface, from the mod or from another Blueprint, runs its implementation. In DRG, a mod's call through the interface ran an editor-made Blueprint's implementation. The interface's variables are not in the stub, since the editor's interfaces hold none, so an editor Blueprint that implements it does not have them. See [Editor API stubs](GUIDE.md#editor-api-stubs). | Yes |
 
 ```cpp
 class IAimable {
@@ -5017,7 +5066,7 @@ Notes:
 | `void SayLater(const FString &Msg)` with a Delay inside | Msg is copied into the event graph's frame when the method is called, through EX_LocalOutVariable, as the editor's event stubs copy one (a ReceiveHit's `const FHitResult &Hit`); the code after the wait reads that copy. | Yes |
 | `void FillLater(int32 &Out)` with a Delay inside | Refused with the CountLater message: a write after the wait would land in the frame's copy, the caller having gone on. Store the result in a member. | Refused |
 | a Delay in a `UObject` child class | Warns: "finds its world only through its Outer". Actor, ActorComponent, UserWidget, GameInstance and Subsystem classes have a world of their own; any other object uses its Outer's. Make the object with an actor or component as its Outer, or the wait does nothing and the method never resumes. The editor offers Delay only where the class has a world. | Warns |
-| `V = __Read64__(Addr);` in a method that waits | Refused: "a pointer read in a function that makes a latent call". Move the read into a separate non-inline method that does not wait, and call that. See [Pointers and memory](#pointers-and-memory). `GetOuter()` and `GetTypedOuter` read memory too and are refused the same way (see [Working with other objects](#working-with-other-objects)). | Not yet |
+| `V = __Read64__(Addr);` in a method that waits | Reads the memory when the line runs: a read after the wait sees what the memory holds then. Writes through a pointer, `GetOuter()` and `GetTypedOuter` work the same way. See [Pointers and memory](#pointers-and-memory). | Yes |
 | `void ExecuteUbergraph_Door(int32 EntryPoint);` | Refused: "ExecuteUbergraph_<Class> is the name of a class's ubergraph". The engine resumes a class's latent calls through that function, found by name on the object, so a method of that name in the class or a subclass would catch them. | Refused |
 
 ```cpp
@@ -5225,7 +5274,10 @@ Notes:
 | `(int64)*(void **)Addr` | A pointer to a raw pointer reads a plain int64 address. | Yes |
 | `int64 V = *(uint32 *)Addr;` | Not built: Kismet has no unsigned 32-bit integer, and an int32 read would make 0xFFFFFFFF compare as -1. Refused with "reading a uint32 through a pointer". Read an int32 and mask it, as below. | Not yet |
 | `*(uint32 *)Addr = 5;` | Refused with "no Kismet conversion from int to uint32". Write through an int32 pointer: `*(int32 *)Addr = 5;`. | Refused |
-| `FVector V = *Pv;`, `*Pv = FVector(1.0f, 2.0f, 3.0f);` | A whole struct has no read or write through a pointer, and neither do a double and a uint16. Refused with "a whole FVector through a pointer" ("a whole double", ...). Read and write the members with `Pv->X`. | Not yet |
+| `FVector V = *Pv;`, `*Pv = FVector(1.0f, 2.0f, 3.0f);`, `Pv[1] = *Pv;` | Reads, writes or copies the whole struct, at its size in the game: 12 bytes for an FVector. A struct holding an FString or a TArray is copied deeply, as C++'s copy is. Any struct a variable can be works, the mod's own included. | Yes |
+| `int32 V = *P16;`, `*P16 = 7;` with `uint16 *P16` or `int16 *P16` | Two bytes. A read is an int32, since Blueprint has no 16-bit integer: 0 to 65535 for uint16, sign-extended for int16. A write stores the value's low 16 bits and touches nothing past them. | Yes |
+| `float F = (float)*Pd;`, `*Pd = F;` with `double *Pd` | Blueprint has no double, so a read gives the float nearest the double, rounded as C++ converts it, and a write stores the float widened to a double. A value below the smallest normal float (about 1.2e-38) reads as 0 and is written as 0, where C++ keeps a denormal. | Yes |
+| `TArray<int32> A = *Pa;`, `TSet`, `TMap` | Refused with "a whole TArray<int32> through a pointer". Index the elements through the pointer's own data, or copy the container in a function that owns it. | Refused |
 
 ```cpp
 TArray<int32> Items;
@@ -5249,8 +5301,12 @@ int64 Unsigned(uint32 *P) {
 
 Notes:
 
-- A read takes the pointee's size in the game: 8 bytes for int64, uint64, FName and any pointer; 4 for int32 and
-  float; 1 for int8, uint8 and bool; an enum's underlying size (1, 4 or 8); 16 for FString; 24 for FText.
+- A read takes the pointee's size in the game: 8 bytes for int64, uint64, double, FName and any pointer; 4 for int32
+  and float; 2 for int16 and uint16; 1 for int8, uint8 and bool; an enum's underlying size (1, 4 or 8); 16 for
+  FString; 24 for FText; a struct's size (see sizeof below).
+- A whole struct goes through a struct the compiler cooks beside the class, `FDerefView_<Struct>`, as it cooks
+  FDeref. Ship it with the class.
+- A double is converted with integer math on its two halves, about 35 Kismet calls a read.
 - The uint32 message also suggests an int64 read. An int64 read takes 8 bytes, so it includes the 4 bytes after the
   value. Use it only when the 8 bytes really are an int64.
 
@@ -5268,7 +5324,7 @@ float Lift() {
   Points.Add(FVector(1.0f, 2.0f, 3.0f));
   FVector *V = &Points[0];
   V->Z = V->Z + 100.0f;                 // writes Points[0].Z in place
-  float *Y = (float *)((int64)V + 4);   // FVector::Y is 4 bytes in
+  float *Y = &V->Y;                     // 4 bytes in
   return *Y + (*V).X;
 }
 ```
@@ -5295,8 +5351,10 @@ Notes:
 | `&MakeArr()[0]` | Refused with "the address of an element needs an array variable". Store the array in a local first. | Refused |
 | `&*P`, `&P[I]` | P itself, and P + I × sizeof(pointee). Nothing is read. | Yes |
 | `&Obj->Member`, `&Member` | The address of an object's property (`&Member` is one of the class's own), looked up by name at run time. Needs a class named ReadProperty that you supply (see Helper code you supply, below). The result is 0 when the object's class has no such property. | Yes |
-| `&V.X`, `&Pv->X` | The address of a struct member is not built. Refused with "the address of MemberExpr" for a struct variable, and "the address of a member of int64" through a pointer. Add the offset yourself: `(int64)Pv + 4` is the address of `Pv->Y` for an FVector. | Not yet |
-| `&Local`, `&Param` | A local or a parameter is a Blueprint variable, which has no address the VM hands out. Refused with "a Blueprint variable has none the VM hands out". Point into an object, a TArray element or memory through a pointer instead. | Refused |
+| `&Pv->Y`, `&(*Pv).Y`, `&Items[I].Y`, `&R.Y` | The address of a struct member: where the struct sits plus the member's offset in the game's layout, through any number of members (`&P[I].Inner.Y`). The struct may be memory through a pointer, a TArray element, a reference that keeps an address, or a call that returns a reference. | Yes |
+| `&Obj->Loc.Y`, `&Loc.Y` | The same, with the struct's address found at run time through ReadProperty, as `&Obj->Member`'s is. | Yes |
+| `&H->Distance` with `FHitResult *H` | An engine struct's members are placed from its reflected ones, which is right only when nothing unreflected sits between them. When they do not add up to the struct's size, the build stops: "FHitResult's reflected members take 112 bytes and it takes 136 in the game". Add the offset yourself, from the game's SDK. | Refused |
+| `&Local`, `&Param`, `&V.X` of a local struct | A local or a parameter is a Blueprint variable, which has no address the VM hands out. Refused with "a Blueprint variable has none the VM hands out". Point into an object, a TArray element or memory through a pointer instead. | Refused |
 | `&this->K` with `static inline int32 K = 3;` | An inline class variable has no storage: each use is its initializer. Refused with "a static variable has no address". A bare `&K` gets the Blueprint-variable message instead. | Refused |
 
 ```cpp
@@ -5318,7 +5376,8 @@ Notes:
   function's world-context parameter, or self when it has none. `&Member` on the class's own object passes self as Obj.
 - Without a class named ReadProperty in scope, the build fails with "`&Obj->Member` finds the member at run time
   through ReadProperty::GetPropertyAddress: include ReadProperty.h". The build does not check the function it calls.
-- Only an object's members have a run-time lookup. A struct member's address is the "Not yet" row above.
+- Only an object's members have a run-time lookup. A struct member's offset is known when the mod is built: from the
+  mod's own layout for its structs, from the reflected members for an engine struct.
 - `float &R = Other->CustomTimeDilation;` makes the same GetPropertyAddress call and keeps the address it returns.
   Without a ReadProperty class it is refused with the same message, after `reference R: `. Reference locals are in
   [Locals](#locals).
@@ -5331,7 +5390,7 @@ Notes:
 | `int32 &Alias = Local;` | Another name for the variable, with no storage of its own. Writes reach the original. | Yes |
 | `const FString &R = MakeName();` | A `const T&` bound to a temporary is an ordinary local holding a copy. | Yes |
 | `Bump(*P);` with `void Bump(int32 &V)` | Passes the memory itself, so the callee's writes land at the address. A T& parameter of a mod function is an out-parameter in the Blueprint. | Yes |
-| `int32 &Get(int32 *P) { return *P; }` | A reference return is not built. Refused with "a reference return is refused"; return a value or a pointer. | Not yet |
+| `int32 &Get(int32 *P) { return *P; }` | Returns the address P holds, so `Get(P) = 5` writes there and `Get(P)` reads there. Reference returns are in [Functions](#parameters-and-return-values). | Yes |
 
 ```cpp
 void Bump(int32 &V) { V = V + 1; }
@@ -5392,17 +5451,16 @@ Notes:
 | You write | What it does | Status |
 |---|---|---|
 | `while (*Q != 0) { ++Q; }` | A condition that reads memory is read again before every iteration, as in C++. The compiler writes the loop as `while (true) { if (!Cond) break; ... }`. | Yes |
-| `Value = *P;` in a function that also calls `Delay(1.0f)` | A function that makes a latent call runs in a generated event graph, where a memory read is not built. Refused with "a pointer read in a function that makes a latent call". Do the read in a function that does not wait and is not `inline`, and call it. An inline function is expanded into the caller, so its read is refused the same way. | Not yet |
+| `Value = *P;` in a function that also calls `Delay(1.0f)` | Reads when the line runs. A function that waits runs in a generated event graph, and its locals, P included, live in that graph's frame, so a read after the wait uses the same P. Writes and inline functions work the same way. | Yes |
 
 ```cpp
 int64 Addr = 0;
 int64 Value = 0;
 
-int64 ReadNow() { return *(int64 *)Addr; }
-
 void Poll() {
-  Value = ReadNow();   // the read runs in a function that does not wait
+  Value = *(int64 *)Addr;    // now
   UKismetSystemLibrary::Delay(1.0f);
+  Value = *(int64 *)Addr;    // a second later
 }
 
 int32 CountNonZero(int32 *Q) {
@@ -5417,10 +5475,8 @@ int32 CountNonZero(int32 *Q) {
 
 Notes:
 
-- The refusal covers a read such as `*P`, the `__Read*__` intrinsics, and `Obj->GetOuter()`, which reads the outer
-  from memory (see [Working with other objects](#working-with-other-objects)). A write through a pointer and a
-  `P->X` read are not refused in such a function, but nothing has checked how they behave there. Latent functions
-  are in [Latent calls](#latent-calls).
+- The memory can change while the function waits, as it can in C++ between two reads. Latent functions are in
+  [Latent calls](#latent-calls).
 - Reads and writes are not checked. The VM does no bounds or validity check, so a wrong address reads garbage or
   raises an access violation in the game process. There is no soft failure. Check what you can first: that an object
   is valid, and that a property exists and has the type you expect.
@@ -5558,8 +5614,7 @@ UClass *ClassOfObject(UObject *Obj) {
 
 Notes:
 
-- The reads work exactly like `*P` on the matching pointer type, with the same rules: nothing checks the address,
-  and a function that makes a latent call cannot contain one.
+- The reads work exactly like `*P` on the matching pointer type, with the same rules: nothing checks the address.
 
 ### __PtrCast__
 
@@ -5795,7 +5850,9 @@ listed here is refused with "unimplemented intrinsic".
 | `UE_CATEGORY__JOIN`, `UE_CATEGORY__JOIN2` | Internal to UE_CATEGORY. Not written in a mod. | [Classes and variables](#classes-and-variables) |
 | `UE_CLASS(Package, UeName)` | The package and UE name of a class. In a shared header it names the one source that cooks the class, the one whose UE_MOD_PACKAGE, namespaces and class name give exactly that path; every other source imports it. The SDK declares each engine and game class with it. | [Mod sources and packages](#mod-sources-and-packages) |
 | `UE_CLIENT` | Run on owning Client RPC: called on the server, it runs on the client that owns the actor. | [RPCs](#rpcs) |
+| `UE_COLOR_CURVE(Name, Keys...)` | A UCurveLinearColor asset of the mod's own, at namespace scope, keys `(time, r, g, b, a)`. | [Timelines](#timelines) |
 | `UE_COLOR_TRACK(Timeline, Name, Keys...)` | A linear color track of a UE_TIMELINE: declares `FLinearColor Name`, which the timeline sets each frame it plays, and its curve, keys `(time, r, g, b, a)`. | [Timelines](#timelines) |
+| `UE_COLOR_TRACK_CURVE(Timeline, Name, Curve)` | A color track of a UE_TIMELINE over a UCurveLinearColor asset, the editor's External Curve: declares `FLinearColor Name`. | [Timelines](#timelines) |
 | `UE_COMPONENT(Type, Name)` | A component of a mod actor, of an engine or game component class, as added in the Components panel. The first scene component is the root. | [Components](#components) |
 | `UE_COSMETIC` | Cosmetic (BlueprintCosmetic): on an actor or its component, and for an engine or game static with this mark, a call on a dedicated server is skipped. | [RPCs](#rpcs) |
 | `UE_DEFAULTS { ... }` | Defaults of components and of inherited properties, as the Details panel and Class Defaults set them. Read at build time, never run. | [Class defaults](#class-defaults) |
@@ -5804,10 +5861,13 @@ listed here is refused with "unimplemented intrinsic".
 | `UE_ENUM_IN(Enum, Package)` | UE_ENUM for an enum in a shared header: only the source whose UE_MOD_PACKAGE is exactly Package cooks it. | [Enums](#enums) |
 | `UE_ENUM_MAP(Key, Value, Name)`, `UE_ENUM_MAP(Enum)` | A TMap member from each enumerator to its name, or back, filled in at build time: declared by the three-argument form, the default alone by the one-argument form. | [Enums](#enums) |
 | `UE_FINAL_AS(Base, Leaf)` | Declares `class Leaf final : public Base {}`, Base's one subclass: Base is compiled as final and cooked Abstract. | [Classes and variables](#classes-and-variables) |
+| `UE_FLOAT_CURVE(Name, Keys...)` | A UCurveFloat asset of the mod's own, at namespace scope, keys `(time, value)` as a track's. `&Name` points at it. | [Timelines](#timelines) |
 | `UE_FLOAT_TRACK(Timeline, Name, Keys...)` | A float track of a UE_TIMELINE: declares `float Name`, which the timeline sets each frame it plays, and its curve, keys `(time, value)` with an optional Cubic or Constant. | [Timelines](#timelines) |
+| `UE_FLOAT_TRACK_CURVE(Timeline, Name, Curve)` | A float track of a UE_TIMELINE over a UCurveFloat asset, the editor's External Curve: declares `float Name`. | [Timelines](#timelines) |
 | `UE_INPUT_ACTION("Action", Options...)` | Makes the method after it an InputAction event of an actor: the engine calls it on that action of the game's input settings. | [Timers and input](#timers-and-input) |
 | `UE_INPUT_KEY("Key", Options...)` | Makes the method after it an InputKey event of an actor: the engine calls it on that key, pressed by default; the options name the edges, modifiers and the node's other settings. | [Timers and input](#timers-and-input) |
 | `UE_INTERFACE` | Declares a mod interface, cooked as a Blueprint Interface asset. Its variables go to the classes that implement it. | [Interfaces](#interfaces) |
+| `UE_KEYWORDS("Words")` | Search keywords of the method after it, written into the editor API stub only. | [Classes and variables](#classes-and-variables) |
 | `UE_MOD_PACKAGE(Path)` | The /Game folder that a source's classes, structs, enums, interfaces and assets are cooked into. A namespace is a subfolder. | [Mod sources and packages](#mod-sources-and-packages) |
 | `UE_MULTICAST` | Multicast RPC: called on the server, it runs on the server and on every client. | [RPCs](#rpcs) |
 | `UE_NAME_CASE("Text")` | A case of UE_NAME_SWITCH. Every case of one must be written this way. | [Statements and control flow](#statements-and-control-flow) |
@@ -5826,7 +5886,10 @@ listed here is refused with "unimplemented intrinsic".
 | `UE_TIMELINE_EVENT(Timeline, Times...)` | Makes the method after it an event track of the timeline: called each time the timeline passes one of the times. | [Timelines](#timelines) |
 | `UE_TIMELINE_FINISHED(Timeline)` | Makes the method after it the timeline's Finished pin: called when it reaches its end, or its start in reverse. | [Timelines](#timelines) |
 | `UE_TIMELINE_UPDATE(Timeline)` | Makes the method after it the timeline's Update pin: called each frame it plays, after its tracks are written. | [Timelines](#timelines) |
+| `UE_TOOLTIP("Text")` | The tooltip of the method after it, written into the editor API stub only. | [Classes and variables](#classes-and-variables) |
+| `UE_VECTOR_CURVE(Name, Keys...)` | A UCurveVector asset of the mod's own, at namespace scope, keys `(time, x, y, z)`. | [Timelines](#timelines) |
 | `UE_VECTOR_TRACK(Timeline, Name, Keys...)` | A vector track of a UE_TIMELINE: declares `FVector Name`, which the timeline sets each frame it plays, and its curve, keys `(time, x, y, z)`. | [Timelines](#timelines) |
+| `UE_VECTOR_TRACK_CURVE(Timeline, Name, Curve)` | A vector track of a UE_TIMELINE over a UCurveVector asset, the editor's External Curve: declares `FVector Name`. | [Timelines](#timelines) |
 | `UE_CLASS_IN(ModPackage)` | UE_CLASS for a mod's own class, named by its owner's UE_MOD_PACKAGE: the package is ModPackage plus namespaces plus the class name, the UE name the class name plus `_C`. | [Mod sources and packages](#mod-sources-and-packages) |
 | `UE_STRUCT_IN(Package)` | UE_STRUCT for a struct in a shared header: only the source whose UE_MOD_PACKAGE is exactly Package cooks it. | [Structs](#structs) |
 | `UE_WIDGET(Type, Name)` | A widget of a UUserWidget class's designer tree and a variable of the class; the first is the root. The constructor's AddChild calls and setters lay the tree out. | [Widget layouts](#widget-layouts) |
@@ -5901,11 +5964,9 @@ and where the feature is described. In each group, the messages you are most lik
   type could take as its default, or fill the container in ReceiveBeginPlay. See
   [Classes and variables](#classes-and-variables).
 - `<Name> is an asset, not a value: point at it with &<Name>`: a function uses a namespace-scope variable of a UObject
-  class by value. That is a game asset named with UE_ASSET_AT, a braced data asset of the mod, or a variable such as
-  `UMoodDef GlobalDef;`. For example, with
-  `UE_ASSET_AT(UEnemyDescriptor, ED_Grunt, "/Game/Enemies/Spider/Grunt/ED_Spider_Grunt");`, the read
-  `ED_Grunt.SpawnSpread` is refused. Reading a game asset's values when the mod is built is Not yet, and is refused
-  with this message. Fix: take the address, `(&ED_Grunt)->SpawnSpread`, or keep `&ED_Grunt` in a
+  class by value. That is a braced data asset of the mod (`CT_Hard.Waves`), a variable such as `UMoodDef GlobalDef;`,
+  or a game asset named with UE_ASSET_AT used whole rather than through a member (a member of one is read when the mod
+  is built, see [Game assets](#game-assets)). Fix: take the address, `(&CT_Hard)->Waves`, or keep `&CT_Hard` in a
   pointer member. Instead of a variable of your own, declare a braced data asset or name an existing asset with
   UE_ASSET_AT. See [Global variables](#global-variables), [Data assets](#data-assets) and [Game assets](#game-assets).
 - `<Class> and <Other> would both be cooked as <Package>`: two classes land on one package. Package names are compared
@@ -6222,9 +6283,15 @@ and where the feature is described. In each group, the messages you are most lik
   C++ runs that class's own version;
   by name the call would reach the object's override. Fix: call it by name if the override is what you want, or move
   the code into a function of another name and call that. See [Overrides and parent calls](#overrides-and-parent-calls).
-- `<Class>::<Function> returns <Type>: a reference return is refused until what it means to a C++ caller is specified;
-  return a value or a pointer`: Not yet. A method that returns `T&`, such as `int32 &Slot(int32 I)` or
-  `int32 &Get(int32 *P) { return *P; }`. Fix: return a value, or a pointer. See [Functions](#functions).
+- `<Class>::<Function>: returns a reference to <Name>, a local` (or `a parameter`)`: a Blueprint variable has no
+  address to return; ...`: a function returning `T&` whose `return` names a local or a parameter. C++ would dangle
+  for a local or a by-value parameter; a `T&` parameter's address is not one a Blueprint can hand out. Fix: return a
+  pointer, a value, or a reference into memory, a TArray element or an object's member. See [Functions](#functions).
+- `<Class>::<Function>: a reference return gives the address of what it returns: <why>`: the returned expression has
+  no address, such as a call's value. `<why>` says what was missing. Fix: as above.
+- `warning: <Class>::<Function> returns const <Type>&: a Blueprint function returns a copy`: a `const T&` return. The
+  value is right at the call; a caller keeping the reference does not see the original change. Fix: nothing, or
+  return a non-const reference or a pointer if the caller must follow the original.
 - `<Class>::<Method>: TODO: an overload set may not mix inline and non-inline functions`: a call to a non-inline
   overload of a name whose overload with the most parameters is inline. A name keeps one Blueprint function, the
   overload with the most parameters. When that overload is inline, the class makes no Blueprint function for the name,
@@ -6614,9 +6681,34 @@ so the retail game prints nothing. See [Strings and text](#strings-and-text) and
   element, whose other parts are unknown here: assign the whole of <Member>`: the object has no value of the member,
   so the rest of a native struct or an element around the path is unknown. Fix: assign the whole member. See
   [Editing game packages](#editing-game-packages).
-- `<Where>: <Path>: only a TArray's element can be assigned on its own; assign the whole map` (or `set`, or `value`):
-  a path step `[...]` into a `TMap`, a `TSet` or a value that is no array. Fix: assign the whole container. See
+- `<Where>: <Path>: only a TArray's element can be assigned on its own; assign the whole value`: a path step `[...]`
+  into a value that is no array. Fix: assign the whole value. See [Editing game packages](#editing-game-packages).
+- `<Where>: <Path>: a map's value is assigned whole, `` `Map[Key] = value;` ``: a path past a map's key,
+  `Score["a"].X = 1`. Fix: assign the element's whole value. See [Editing game packages](#editing-game-packages).
+- `<Where>: <Path>: an element of a map or set inside an array's element or a native struct cannot be changed on its
+  own yet; assign the whole element`: `Arr[0].Score["a"] = 1`. Fix: assign the array's whole element. See
   [Editing game packages](#editing-game-packages).
+- `<Where>: <Member>: the value the object holds does not read (<why>), so an element cannot be merged into it`: the
+  game's map or set is in a form AssetGen's reader does not hold (a struct key written natively, ...). Fix: assign the
+  whole container. See [Editing game packages](#editing-game-packages).
+- `<Asset>.<Path>: the game's <Object> sets no value of its own, so it holds <Class>'s C++ default, which no package
+  holds; read it when the game runs, through (&<Asset>)`: a member read when the mod is built that the asset, and its
+  archetypes up to a native class, leave unset. Fix: read it at run time, `(&Asset)->Member`. See
+  [Game assets](#game-assets).
+- `<Asset>.<Path>: the game's package holds a <Type> there, where UeApi declares a <Type>: regenerate UeApi from the
+  same game build as the extracted pak` (and `the game's value is <E::Name>, which UeApi's <E> does not declare`): the
+  SDK and the extracted pak come from different game builds. Fix: regenerate UeApi, or extract the pak again. See
+  [Game assets](#game-assets).
+- `<Asset>.<Path>: only a number, a bool, an enum, a name or a string is read when the mod is built, and this is a
+  <Type>; read it when the game runs, through (&<Asset>)`, `<Asset>.<Path>: the game's array has <N> elements`,
+  `<Asset>.<Path>: <Package> is not in <folder> (an asset of a mod pak has no package there)`: a value that cannot be
+  read when the mod is built. Fix: read it at run time through the pointer. See [Game assets](#game-assets).
+- `<Asset>.<Path>: this mod's edit changes the value read when the mod is built, and the game loads the edited one:
+  read it when the game runs, through the asset's pointer, or use the edit's value itself`. Fix: as it says. See
+  [Game assets](#game-assets).
+- `<Asset>.<Path>: a game asset's value is read off its package when the mod is built: pass the folder /Game is in
+  (assetgen compile --game <extracted pak>/FSD/Content; bpbuild: game_content in mods.yaml)`. Fix: pass it. See
+  [Game assets](#game-assets).
 - `<Class> (UE_PATCH): a patch derives from the game Blueprint it edits (a class in a /Game package); a native class's
   defaults come from its C++ constructor, not from a package`: a patch of an engine or game C++ class. Fix: patch a
   game Blueprint, or derive a class of your own. See [Editing game packages](#editing-game-packages).
@@ -6639,9 +6731,19 @@ so the retail game prints nothing. See [Strings and text](#strings-and-text) and
 - `<Class> (UE_PATCH)::<Function>: <Blueprint> has no function of that name of its own, though its declaration has
   one: the declaration is not the game's`: the SDK header and the extracted package come from different game builds.
   Fix: regenerate the SDK, or extract the pak again. See [Editing game packages](#editing-game-packages).
-- `<Class> (UE_PATCH)::<Function>: a patched function that waits (a latent call) needs an ubergraph of its own in the
-  game's class; not built yet`: a Delay or another latent call in a patch's method. Fix: wait in a class of the mod's
-  own. See [Editing game packages](#editing-game-packages).
+- `<Class> (UE_PATCH)::<Member>: a patch's own member does not replicate: it would renumber the class's replicated
+  properties against an unpatched client's or server's; leave out UE_REPLICATED`. Fix: keep the member unreplicated,
+  or send it with an RPC of the game's. See [Editing game packages](#editing-game-packages).
+- `<Class> (UE_PATCH)::<Member>: a patch adds no component or widget to the game's class` / `a patch adds no
+  dispatcher to the game's class`: the Blueprint's construction script and widget tree stay the game's. Fix: spawn the
+  component at run time, or declare a class of your own. See [Editing game packages](#editing-game-packages).
+- `<Class> (UE_PATCH)::<Member>: <Blueprint> already has a variable <Name>; rename it`: the game's package has a
+  variable of that name that the SDK header does not list. Fix: rename the member. See
+  [Editing game packages](#editing-game-packages).
+- `<Class> (UE_PATCH): <Blueprint> has a function <Fn> already, which the interface the patch adds would replace with
+  an empty one`: an interface function the patch leaves out. Fix: write the method in the patch; `Parent::<Fn>()` in it
+  runs the game's. See [Editing game packages](#editing-game-packages).
+- `<Class> (UE_PATCH): <Blueprint> implements <Interface> already`. Fix: leave the interface out of the patch's bases.
 
 ### Event dispatchers, timers and input
 
@@ -6667,10 +6769,10 @@ so the retail game prints nothing. See [Strings and text](#strings-and-text) and
   is no class pointer (an interface, a struct). Fix: pass the object, `I.GetObject()` cast to its class.
 - `<Function>: <Dispatcher>__DelegateSignature is the dispatcher's signature, which does nothing when called; call
   <Dispatcher>.Broadcast(...)`. Fix: broadcast the dispatcher.
-- `<Function>: K2_SetTimer by name <Name> names no function of the class` (or `names an inline method`, or `names a
-  function that takes parameters`)`, so the engine sets no timer`: the engine finds the function by name when the
-  timer is set, and only calls one without parameters. Fix: name a method of the class that takes none, or pass a
-  delegate with `K2_SetTimerDelegate`.
+- `<Function>: K2_SetTimer by name <Name> names no function of the class` (or `names an inline method`, `names a
+  function that takes parameters`, or `names a function that returns a value`)`, so the engine sets no timer`: the
+  engine finds the function by name when the timer is set, and only calls one with no parameters and no return
+  value. Fix: name a void method of the class that takes none, or pass a delegate with `K2_SetTimerDelegate`.
 - `` a delegate cannot bind <Function>: an inline function is expanded where it is called, no UFunction (drop `inline`) ``:
   Add, Remove or a delegate value names an inline method. An inline method is copied into each caller and never
   becomes a function of the class. Fix: drop `inline` from the handler. See [Event dispatchers](#event-dispatchers).
@@ -6734,6 +6836,9 @@ so the retail game prints nothing. See [Strings and text](#strings-and-text) and
   the name the message gives. See [Timers and input](#timers-and-input).
 - `<Class>: UE_INPUT_KEY("F5") marks no method`: the marker is followed by a variable, another kind of declaration or
   the end of the class. Fix: write it right before the method the input calls. See [Timers and input](#timers-and-input).
+- `<Class>: UE_TOOLTIP("...") marks no method`, and the same for UE_KEYWORDS: the marker is followed by a variable,
+  another kind of declaration or the end of the class. Fix: write it right before the method it describes. See
+  [Classes and variables](#classes-and-variables).
 - `... on a UE_STRUCT`, `... on a UE_INTERFACE`, `... on a UE_PATCH`: input binds to a class of the mod's own. Fix:
   mark the method in the class that implements the interface; a patch cannot add input to a game class. See
   [Timers and input](#timers-and-input).
@@ -6761,6 +6866,12 @@ so the retail game prints nothing. See [Strings and text](#strings-and-text) and
   timeline calls one update method and one finished method. Fix: call the second from the first. See [Timelines](#timelines).
 - `<Class>: UE_TIMELINE_UPDATE(Fade) marks no method`: the marker is followed by a variable, another kind of
   declaration or the end of the class. Fix: write it right before the method. See [Timelines](#timelines).
+- `<Class>::<Name>: UE_FLOAT_TRACK_CURVE names no curve asset`: the curve is not an asset: a UE_ASSET_AT, a UeAssets
+  curve or a UE_FLOAT_CURVE of this mod. `... names <Curve>, a UCurveVector: the track's float is played from a
+  UCurveFloat`: a float track plays a UCurveFloat, a vector track a UCurveVector, a color track a UCurveLinearColor.
+  See [Timelines](#timelines).
+- `<Curve>: UE_FLOAT_CURVE has no keys`, `... has the key <Key>, which is not (time, value) of number literals`, and
+  the same for UE_VECTOR_CURVE and UE_COLOR_CURVE: a curve's keys are a track's. See [Timelines](#timelines).
 
 ### Interfaces
 
@@ -6914,21 +7025,22 @@ so the retail game prints nothing. See [Strings and text](#strings-and-text) and
 
 ### Pointers, memory and intrinsics
 
-- `TODO: a whole <Type> through a pointer; P->Member reaches its members`: a whole struct or container read, written
-  or passed through a raw pointer, as in `FVector V = *Pv;` or `*Pv = FVector(1.0f, 2.0f, 3.0f);`. Only integers,
-  float, bool, enums, FName, FString, FText and pointers are read whole. Fix: go member by member, `Pv->X = 1.0f;`.
+- `TODO: a whole <Type> through a pointer; P->Member reaches its members`: a whole container read, written or
+  passed through a raw pointer or a reference that keeps an address, as in `TArray<int32> A = *Pa;` or `R.Num()` with
+  `TArray<int32> &R = *Pa;`. Structs, integers, float, double, bool, enums, FName, FString, FText and pointers are
+  read whole. Fix: reach the elements through the container's data, or work on the container where it is a variable.
   See [Pointers and memory](#pointers-and-memory).
 - ``TODO: the address of <ExprKind>: a Blueprint variable has none the VM hands out; point into an object
   (`(uint8*)Obj`), a TArray element (`&Items[I]`) or memory through a pointer``: the address of a local, a parameter
-  or a member of a struct value, as in `&Count` or `&V.X`. `<ExprKind>` is clang's name for the expression, such as
-  DeclRefExpr or MemberExpr. The address of a struct member is Not yet: it is refused with this message. Fix: point
-  into an object, an array element or memory through a pointer, as the message says. For a struct reached through a
-  pointer, add the member's offset yourself: `(int64)Pv + 4` is the address of `Pv->Y`. See
+  or a member of a local struct, as in `&Count` or `&V.X`. `<ExprKind>` is clang's name for the expression, such as
+  DeclRefExpr. Fix: point into an object, an array element or memory through a pointer, as the message says. See
   [Pointers and memory](#pointers-and-memory).
-- `TODO: the address of a member of <Type>, which is not an object class`: Not yet. `&Pv->X` through a struct
-  pointer. The message names `int64`, because AssetGen holds the pointer as an address. Fix: add the member's offset
-  to the pointer, `(int64)Pv + 4` for FVector's Y, or read and write `Pv->X` directly. See
-  [Pointers and memory](#pointers-and-memory).
+- `TODO: the address of <Struct>::<Member>: <Struct>'s reflected members take <N> bytes and it takes <M> in the game,
+  so something unreflected moves them; add the member's offset to the struct's address yourself`: `&P->Member` on an
+  engine struct whose reflected members do not account for its whole layout, such as FHitResult. Fix: take the
+  offset from the game's SDK dump and add it, `(int64)H + 8`. See [Pointers and memory](#pointers-and-memory).
+- `TODO: the address of a member of <Type>, which is not a struct`: `&X.M` where the compiler knows X's type as
+  neither a struct nor an object class. Fix: give the pointer its real type.
 - `` `&Obj->Member` finds the member at run time through ReadProperty::GetPropertyAddress: include ReadProperty.h ``:
   `&Obj->Member`, or `&Member` on the object itself, with no class named ReadProperty in scope. A cooked property
   carries no offset, so the address is looked up at run time by a function of that class, which AssetGen does not
@@ -6937,10 +7049,6 @@ so the retail game prints nothing. See [Strings and text](#strings-and-text) and
   `int64 GetPropertyAddress(UObject *Target, FName PropName, UObject *WorldContextObject = nullptr)`, and build the mod
   that defines it. For a reference, read the member into a local instead. See
   [Pointers and memory](#pointers-and-memory).
-- `<Class>::<Function>: TODO: a pointer read in a function that makes a latent call`: Not yet. A read through a
-  pointer (`*P`, a `__Read*__` intrinsic, or `GetOuter()`, which reads memory) in a method that also makes a latent
-  call or uses UE_AWAIT is refused. Fix: do the read in a separate method with no latent call and call it, or store
-  the value in a member before the wait. See [Pointers and memory](#pointers-and-memory).
 - `TODO: reading a uint32 through a pointer (Kismet has no unsigned 32-bit int); read it as int32 or int64`: `*P` on a
   `uint32 *`. Reading it as an int64 reads 8 bytes, which is only right when the memory really holds an int64. Fix:
   read it as int32 and accept the sign, or widen and mask it:

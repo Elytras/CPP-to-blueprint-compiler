@@ -7,7 +7,8 @@
 implements (UeNativeInterfaces, see native_interfaces), which subobject a component member points at where the types
 cannot tell (map_subobjects), and the form of an enum only a local or a container element shows (scan_game).
 
-The output's Version.json, written last, says which genueapi wrote it (GENUEAPI_VERSION) and whether it had --game;
+The output's Version.json, written last, says which genueapi wrote it (GENUEAPI_VERSION), whether it had --game, and
+the engine and project the dump is of (dump_identity);
 the compiler refuses a UeApi older than it needs, and a class deriving from a game Blueprint against one without
 --game.
 
@@ -18,6 +19,7 @@ import io
 import json
 import os
 import re
+import shutil
 import sys
 
 DECL = re.compile(r"^\t(static\s+)?([A-Za-z_][\w:<>,\s\*&]*?)\s+(\w+)\((.*)\)(\s*const)?;\s*$")
@@ -47,6 +49,16 @@ CONTAINER = re.compile(r"^(?:const\s+)?(TArray|TSet|TMap)<(.*)>\s*&?$")
 # 2: "game".
 # 3: <D>__UeDispatcher on each native dispatcher, NotCallable.json, and main's TEnum spellings of native enum fields.
 GENUEAPI_VERSION = 3
+
+
+def dump_identity(sdk_dir):
+    """The engine ("4.27", "5.6") and project ("FSD", "RogueCore") of a Dumper-7 dump, from the name Dumper-7 gives its
+    folder, <engine>.<patch>-<CL>+<branch>-<Project> (C:/Dumper-7/5.6.1-158178+main-RogueCore/SDK/SDK). The compiler
+    lays packages out for that engine (DESIGN.md S40) and bpbuild stages them under that project. ponytail: a dump
+    renamed or copied elsewhere reads as DRG's 4.27, which is what every UeApi was before S40."""
+    m = re.match(r"(\d+)\.(\d+)\.\d+-\d+\+[^-]+-(\w+)", os.path.basename(os.path.dirname(os.path.dirname(
+        os.path.abspath(sdk_dir)))).replace("_OLD", ""))
+    return ("%s.%s" % (m.group(1), m.group(2)), m.group(3)) if m else ("4.27", "FSD")
 
 
 def class_refs(t):
@@ -235,7 +247,9 @@ def parse_structs(path, pkg):
                 cur_enum.values.append((m.group(1), int(m.group(2))))
         elif cur_struct is not None and "//" in line:
             m = FIELD.match(line)
-            if m and not m.group(2).startswith(("Pad_", "BitPad_")):
+            # A member Dumper-7 adds by hand (UE5's FInstancedStruct: ScriptStruct, uint8* StructMemory) is no FProperty,
+            # so neither a field EX_StructConst writes nor one a stub can declare (`uint8*` reads as an out-parm).
+            if m and not m.group(2).startswith(("Pad_", "BitPad_")) and "NOT AUTO-GENERATED PROPERTY" not in line:
                 # The flag comment, `(Edit, Transient, ...)`, or a bitfield's `(BitIndex: .., PropSize: .. (flags))`.
                 transient = bool(TRANSIENT.search(line[line.index("//"):]))
                 cur_struct.raw_fields.append(("bool" if m.group(3) else m.group(1), m.group(2), transient))
@@ -1756,8 +1770,8 @@ def main():
                 body.append("/* Obj->GetOuter() is OuterPrivate read straight off the object - UObject on UE 4.27 x64: vtable 0x0, ObjectFlags")
                 body.append("   0x8, InternalIndex 0xC, ClassPrivate 0x10, NamePrivate 0x18, OuterPrivate 0x20 (the dump's Basic.hpp says so) -")
                 body.append("   through the read intrinsics: one ArrayGetByRef, no engine call. As in C++, Obj must not be null (a read at")
-                body.append("   0x20 is a crash), and as with any pointer read the mod declares FDeref (Intrin.h) and the function is not")
-                body.append("   latent. UKismetSystemLibrary::GetOuterObject is the engine call it replaces, null-safe, if either bites. */")
+                body.append("   0x20 is a crash). UKismetSystemLibrary::GetOuterObject is the engine call it replaces, null-safe, if that")
+                body.append("   bites. */")
                 body.append("int64 __AddrOf__(class UObject *Ref);")
                 body.append("class UObject *__ReadObject__(int64 Addr);")
                 body.append("inline class UObject *UObject_GetOuter(class UObject *Obj) { return __ReadObject__(__AddrOf__(Obj) + 0x20); }\n")
@@ -1937,8 +1951,15 @@ def main():
                 "*/"]
     umbrella += ["#include \"%s.h\"" % pkg for pkg in sorted(by_pkg) if not pkg.startswith("Game/")]
     io.open(os.path.join(out_dir, "UeApi.h"), "w", encoding="utf-8-sig", newline="\n").write("\n".join(umbrella) + "\n")
+    # The two hand-written headers include this folder's generated ones (Conv.h, Methods.h, ...) by relative path, so a
+    # UeApi outside BpMods/UeApi (RC's, S40) gets its own copy, never a forwarder to DRG's.
+    hand = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "BpMods", "UeApi")
+    if os.path.normcase(os.path.realpath(hand)) != os.path.normcase(os.path.realpath(out_dir)):
+        for name in ("UeMeta.h", "Types.h"):
+            shutil.copyfile(os.path.join(hand, name), os.path.join(out_dir, name))
     io.open(os.path.join(out_dir, "Version.json"), "w", encoding="utf-8", newline="\n").write(
-        '{"genueapi": %d, "game": %s}\n' % (GENUEAPI_VERSION, "true" if game_dir else "false"))
+        '{"genueapi": %d, "game": %s, "ue": "%s", "project": "%s"}\n'
+        % ((GENUEAPI_VERSION, "true" if game_dir else "false") + dump_identity(sdk_dir)))
     if not game_dir:
         print("  no --game: no game Blueprint's default subobjects or tail, so the compiler refuses a class deriving "
               "from one")

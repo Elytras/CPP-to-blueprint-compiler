@@ -66,7 +66,7 @@ std::string ModFieldName(const std::string& StructPkg, const std::string& Field)
 bool IsInternalViewStruct(const std::string& CppName)
 {
     return CppName == "FDeref" || CppName == "FDerefTextView" || CppName.compare(0, 9, "FMapSlot_") == 0
-        || CppName.compare(0, 10, "FMapSlots_") == 0;
+        || CppName.compare(0, 10, "FMapSlots_") == 0 || CppName.compare(0, 11, "FDerefView_") == 0;
 }
 
 const Json* First(const Json& N)
@@ -82,6 +82,7 @@ const Json* Nth(const Json& N, size_t I)
 }
 
 std::string StripTypeKeywords(std::string T);
+std::string WithoutElaboration(std::string T);
 bool IsTEnumType(std::string T, const std::string& Of = "TEnum");
 const Json* PeelLvalue(const Json* N);
 bool IsFixedOperand(const Json& N);
@@ -445,10 +446,22 @@ void DiffTaggedAgainstParent(FPropertyDef& P, const FPropertyDef& Parent)
 /* A patch's UE_DEFAULTS statement, which may also assign part of a member's value: DefaultAssignment's `Field` or
    `Component->Field`, then any `.Member` and `[i]` into it (`PrimaryActorTick.bCanEverTick = v`, `Spans[1].Max = v`).
    Root is the field's MemberExpr, Steps each `.Member`'s MemberExpr or `[i]`'s operator call, from the root out. */
+/* `Score.Add("a", 1);`, `Ids.Add(7);`, `Score.Remove("a");`: a TMap's or TSet's Add or Remove, the container it is
+   called on, and the call itself. */
+bool ElementCall(const Json& S, const Json*& Container, const Json*& Call)
+{
+    Call = Strip(&S);
+    const Json* Callee = Call && Kind(*Call) == "CXXMemberCallExpr" ? Strip(First(*Call)) : nullptr;
+    if (!Callee || Kind(*Callee) != "MemberExpr" || (Name(*Callee) != "Add" && Name(*Callee) != "Remove")) return false;
+    Container = Strip(First(*Callee));
+    const std::string T = Container ? StripTypeKeywords(TypeOf(*Container)) : std::string();
+    return T.compare(0, 5, "TMap<") == 0 || T.compare(0, 5, "TSet<") == 0;
+}
+
 bool DefaultPath(const Json& S, const Json*& Root, const Json*& Rhs, const Json*& Through, std::vector<const Json*>& Steps)
 {
     const Json* E = nullptr;
-    if (!AssignmentSides(S, E, Rhs)) return false;
+    if (!AssignmentSides(S, E, Rhs) && !ElementCall(S, E, Rhs)) return false;
     Steps.clear();
     for (;;)
     {
@@ -471,7 +484,7 @@ bool DefaultPath(const Json& S, const Json*& Root, const Json*& Rhs, const Json*
 bool AssetPath(const Json& S, const Json*& Asset, const Json*& Root, const Json*& Rhs, std::vector<const Json*>& Steps)
 {
     const Json* E = nullptr;
-    if (!AssignmentSides(S, E, Rhs)) return false;
+    if (!AssignmentSides(S, E, Rhs) && !ElementCall(S, E, Rhs)) return false;
     Steps.clear();
     for (;;)
     {
@@ -938,9 +951,12 @@ struct FRecord
     std::string InputMisplaced;                     // the first of them no method follows, as written
     std::map<std::string, std::string> Timelines;   // `<X>__UeTimeline`: UE_TIMELINE's variable -> "<length>|<options>"
     std::vector<std::pair<std::string, std::string>> Tracks;    // `<X>__UeTrack`: a track's variable -> "<timeline>|<keys>"
+    std::map<std::string, const Json*> TrackCurves; // `<X>__UeTrackCurve`: a track's variable -> its `&Curve` asset pointer
     std::vector<FTimelineMark> TimelineMarks;       // UE_TIMELINE_UPDATE / _FINISHED / _EVENT, in the order written
     std::string TimelineMisplaced;                  // the first of them no method follows, as written
-    const Json* Defaults = nullptr;                // UE_DEFAULTS: the static-init block, never lowered
+    std::map<std::string, std::pair<std::string, std::string>> Docs;   // UE_TOOLTIP / UE_KEYWORDS: method -> (tooltip, keywords)
+    std::string DocMisplaced;                       // the first of them no method follows, as written
+    const Json* Defaults = nullptr;               // UE_DEFAULTS: the static-init block, never lowered
     bool bFinal = false;        // `class X final`: X has no subclass
     bool bFinalAsLeaf = false;  // UE_FINAL_AS's leaf: its base's one subclass
     std::string FinalAs;        // UE_FINAL_AS(this, Leaf): Leaf's CppName - compiled as final, cooked Abstract
@@ -955,6 +971,14 @@ struct FRecord
     /* A UserDefinedStruct: cooked here, or cooked by the mod its UE_STRUCT_IN names and imported. */
     bool IsModStruct() const { return bIsStruct && (UePackage.empty() || UePackage.compare(0, 6, "/Game/") == 0); }
 };
+
+/* A UE_STRUCT member's cooked name: its `<Member>__UeName` marker when it has one - a struct rebuilt from an editor's,
+   keeping the names that editor minted, which saved games and assets cooked against it hold - else ModFieldName's. */
+std::string ModFieldNameOf(const FRecord& R, const std::string& StructPkg, const std::string& Field)
+{
+    if (const auto It = R.UeNames.find(Field); It != R.UeNames.end()) return It->second;
+    return ModFieldName(StructPkg, Field);
+}
 
 struct FCallIR;
 
@@ -1015,6 +1039,10 @@ struct FEnumInfo
 {
     std::string Package, UeName, Underlying, First;     // First: the enumerator a zero is written as
     bool bEnumClass = false;    // a native `enum class` (Types.json "form"), whose properties are EnumProperties
+    std::map<std::string, std::string> UeEntries;       // a UE_ENUM's `__UeEnumNames`: C++ enumerator -> cooked name
+    std::map<std::string, std::string> UeDisplay;       // and -> display name, where it gives one
+    /* The enumerator's cooked name (without the `Enum::`): the C++ one unless `__UeEnumNames` renames it. */
+    std::string UeEntry(const std::string& Cpp) const { const auto It = UeEntries.find(Cpp); return It == UeEntries.end() ? Cpp : It->second; }
 };
 
 bool IsContainerType(const std::string& T)
@@ -1114,7 +1142,7 @@ struct FCallIR
     uint64 EmptiedArgs = 0;             // bit I: argument I is a native's out TArray, emptied just before the call: see HoistCallArgs
     std::string VirtualName;            // a generated class's own instance method: EX_VirtualFunction resolves it by name at run time
     bool bLocal = false;                // EX_LocalVirtualFunction / EX_LocalFinalFunction: a script function that is no RPC
-    std::string View;                   // __RefAtInline__: the TArray field of the view struct in Extra
+    std::string View;                   // __RefAtInline__, __DerefRead*__: the TArray field of the view struct in Extra
     std::shared_ptr<int32> Resume;      // __AwaitPoint__: receives the ubergraph offset the awaited event re-enters at
     bool bStrongOnFrame = false;        // its result is RF_StrongRefOnFrame, so a persistent frame holding it keeps it
     bool bFrameHeld = false;            // ... and nothing else does: see HeldProxies
@@ -1208,6 +1236,7 @@ const char* ViewFieldOf(const std::string& DerefIntrinsic)
                                                    "Kilobyte";
 }
 
+bool IsReinterpret(const std::string& Intrinsic);
 /* SelfExp: the enclosing function's export index, FFieldPath owner of its params and locals. */
 bool EmitArgs(FScript& S, const std::vector<FArgIR>& Args, FIndex SelfExp, std::string* Err);
 FArgIR NotOf(FArgIR V, FBlueprintClass& BP);
@@ -1315,13 +1344,13 @@ bool EmitArg(FScript& S, const FArgIR& A, FIndex SelfExp, std::string* Err)
             S.ObjectConst(SelfExp);
             return true;
         }
-        if (A.Sub->Intrinsic == "__AddrOf__" || A.Sub->Intrinsic == "__NameIndex__" || A.Sub->Intrinsic == "__AsObject__")
+        if (IsReinterpret(A.Sub->Intrinsic))
         {
             /* StructMember with a donor field at Offset_Internal=0 copies ElementSize bytes straight out
                of the argument's own storage: ScreenMessageString.Key (8) / IntPoint.X (4 = ComparisonIndex) /
                DebugDisplayProperty.obj (8, an int64 read back as a UObject*). */
             const std::string InnerField = A.Sub->Intrinsic == "__AddrOf__" ? "Key"
-                                         : A.Sub->Intrinsic == "__AsObject__" ? "obj" : "X";
+                                         : A.Sub->Intrinsic == "__AsObject__" ? "obj" : "X";     // IntPoint.X, Vector.X
             if (A.Sub->Args.size() != 1)
             {
                 if (Err) *Err = A.Sub->Intrinsic + " takes exactly one argument";
@@ -1335,21 +1364,19 @@ bool EmitArg(FScript& S, const FArgIR& A, FIndex SelfExp, std::string* Err)
             if (!bInnerOk) { if (Err) *Err = SubErr; return false; }
             return true;
         }
-        if (A.Sub->Intrinsic == "__DerefReadI64__" || A.Sub->Intrinsic == "__DerefReadI32__"
-            || A.Sub->Intrinsic == "__DerefReadF__" || A.Sub->Intrinsic == "__DerefReadU8__"
-            || A.Sub->Intrinsic == "__DerefReadStr__" || A.Sub->Intrinsic == "__DerefReadText__")
+        if (A.Sub->Intrinsic.compare(0, 11, "__DerefRead") == 0)
         {
             /* Hoisted Read: outer StructMember reads the view struct's TArray<T> at offset 0 out of
                the caller's FDeref __DerefScratch__ (Num=1, Data=<addr>). ArrayGetByRef then copies
                InnerProp.ElementSize bytes from Data[0] into the caller's dest. No class-owner check
                is involved (StructMemberContext + ArrayGetByRef are both guard-free). */
-            const char* ViewField = ViewFieldOf(A.Sub->Intrinsic);
+            const std::string ViewField = A.Sub->View;
             const FIndex ViewStruct = A.Sub->Extra;
             S.ArrayGetByRef(
                 [&](FScript& O)
                 {
                     O.StructMember(ViewField, ViewStruct,
-                        [&](FScript& I) { I.LocalVariable("__DerefScratch__", SelfExp); });
+                        [&](FScript& I) { I.LocalVariable(A.S, SelfExp); });
                 },
                 [&](FScript& I) { I.IntZero(); });
             return true;
@@ -1547,6 +1574,7 @@ struct FReadViewSpec
     const char* ResultType;         // C++ type of the tmp local receiving the read
     const char* ViewStructPkg;
     const char* ViewStructName;     // an engine ScriptStruct whose first member is TArray<T>
+    const char* ViewField = nullptr;    // that TArray member, when ViewFieldOf(DerefIntrinsic) does not name it
 };
 
 /* __ReadObject__ / __ReadName__ share the int64 view: both are 8-byte scalars whose
@@ -1605,7 +1633,16 @@ private:
     /* One assignment of an edit: to a member (Path empty, Chain the member alone), or to part of its value - Chain
        then holds the member and the def each step of Path reaches, the last the value written. The last carries the
        value either way. */
-    struct FEditDef { std::vector<FPropertyDef> Chain; std::vector<FValueStep> Path; };
+    /* Op: the whole value at the path replaced, or one element of the TMap or TSet there put, added or removed (its
+       key, and a map's value, in the last def's Default.Items). bFresh: a patch's own member, which no archetype has, so
+       a set or map in it is written whole. */
+    struct FEditDef
+    {
+        std::vector<FPropertyDef> Chain;
+        std::vector<FValueStep> Path;
+        enum EOp : uint8 { Assign, Put, Add, Remove } Op = Assign;
+        bool bFresh = false;
+    };
     bool EditStep(const Json& Step, const FPropertyDef& Parent, const std::string& Where, FBlueprintClass& BP,
                   FValueStep& Out, FPropertyDef& Reached, std::string* Err);
     bool EditAssignment(const Json& Root, const FRecord& Declarer, const std::vector<const Json*>& Steps, const Json* Rhs,
@@ -1614,6 +1651,7 @@ private:
     std::vector<const Json*> AssetEditBlocks;               // UE_ASSET_EDITS: each block's function
     bool ApplyEdit(const std::string& Package, const std::string& Object, std::vector<FEditDef> Edits,
                    const FPackage& From, const std::string& Where, std::string* Err);
+    bool MergeElement(const FCookedPackage& P, int32 Export, FEditDef& Edit, const std::string& Where, std::string* Err) const;
     bool SaveEdits(const std::string& OutDir, std::string* Err);
     bool BracedMembers(const Json& List, const FRecord& Rec, const std::string& Where, FBlueprintClass& BP, bool bKeepZero,
                        std::vector<FPropertyDef>& Out, std::string* Err, const FRecord* Archetype = nullptr);
@@ -1623,6 +1661,8 @@ private:
     bool TransplantFunctions(const FRecord& R, const FRecord& B, const FPackage& Scratch, FIndex ScratchClass,
                              std::string* Err);
     std::map<std::string, FIndex> PatchSupers;              // "Patch::Method" -> what it would override, in its scratch
+    std::vector<FPropertyDef> PatchVars;                    // the patch Generate compiles: its own variables, in its scratch
+    std::vector<FIndex> PatchInterfaces;                    // and the interfaces it implements
     std::map<std::string, const Json*> EditTargets;         // UE_ASSET_EDIT: Ns + its number -> `&Asset`'s variable
     std::vector<std::pair<std::string, const Json*>> Edits; // ... -> the braced variable holding the edit
     bool GenerateStruct(const FRecord& R, const std::string& OutDir, std::string* Err);
@@ -1665,6 +1705,7 @@ private:
     bool LayoutOf(const std::string& QualType, int32* Size, int32* Align, std::string* Err);
     bool NeedsResultLocal(const std::string& Type, int32 Depth = 0);
     bool StructLayout(const FRecord& R, int32* Size, int32* Align, std::string* Err);
+    bool MemberOffset(const std::string& StructType, const std::string& Member, int32* Offset, std::string* Err);
     bool LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FStmtIR>& Out,
                    std::vector<FPropertyDef>& Locals, std::string* Err);
 
@@ -1692,7 +1733,9 @@ private:
        `inline` may sit on the declaration or on an out-of-line definition. */
     bool IsInlineMethod(const FRecord& R, const std::string& Method) const;
     bool AddInputBindings(const FRecord& R, bool bIsActor, FBlueprintClass& BP, std::string* Err) const;
-    bool AddTimelines(const FRecord& R, bool bIsActor, FBlueprintClass& BP, std::string* Err) const;
+    bool AddTimelines(const FRecord& R, bool bIsActor, FBlueprintClass& BP, std::string* Err);
+    static bool CurveKeys(const std::string& Spec, char Kind, std::vector<FBlueprintClass::FTimelineKey>& Keys, std::string& Bad);
+    bool GenerateCurve(const std::string& Qual, const std::string& OutDir, std::string* Err);
     bool CheckMemberNames(const FRecord& R, std::string* Err) const;
     bool IsSceneRecord(const FRecord* C) const;
     /* S39: R or a mod class above it declares a UE_WIDGET, so R is a WidgetBlueprintGeneratedClass. */
@@ -1781,7 +1824,15 @@ private:
     const Json* StructConversionBelow(const Json& N) const;
     bool FreeNegation(const Json& C, Json& Out) const;
     bool ConstToArg(const FConstVal& V, const std::string& Type, FArgIR& Out) const;
-    std::map<std::string, const Json*> TemplateOf;                      // an instantiation's decl id -> its FunctionTemplateDecl
+    /* S38: a game asset's value read when the mod is built (AssetValueOf): a number (an enum's too), a bool, a name or a
+       string, and S the enumerator, name or string as the package holds it. */
+    struct FAssetRead { bool bString = false, bName = false; FConstVal Num; std::string S, Shown; };
+    bool AssetValueOf(const Json& E, FAssetRead& Out, bool bEdited = false);
+    mutable std::string AssetValueWhy;                                  // why the last asset value read refused, if it did
+    std::map<const Json*, FAssetRead> AssetReads;                       // each value read, checked again after the edits
+    std::map<std::string, FCookedPackage> ValuePackages;          // the game packages they were read from
+    bool CheckAssetReads(std::string* Err);
+    std::map<std::string, const Json*> TemplateOf;                     // an instantiation's decl id -> its FunctionTemplateDecl
     std::map<std::string, const Json*> FreeInlines;                     // decl id -> an inline free function's definition
                                                                         // (a template's: each instantiation)
     std::vector<const Json*> FreeInlineOrder;                           // the same definitions in document order: an id is
@@ -1846,10 +1897,17 @@ private:
     bool IsRawPointer(std::string QualType) const;
     void NormalizePointers(Json& N) const;
     bool IsDerefLvalue(const Json& N) const;
+    std::string RefReturnOf(const Json& Call) const;
+    bool LowerRefReturn(const Json& Value, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
+    std::string CurRefReturn;           // the function being lowered returns this as a non-const T&: its address
     bool IsEagerSafe(const Json& N) const;
     void ArgumentsInPlace(std::vector<FStmtIR>& Body, const std::vector<std::string>& Binds, const Json& Def,
                           const std::vector<std::string>& BindIds, std::vector<FPropertyDef>& Locals);
-    const FReadViewSpec* ViewFor(const std::string& Pointee) const;
+    const FReadViewSpec* ViewFor(const std::string& Pointee);
+    /* A whole struct through a pointer: the view `FDerefView_<T> { TArray<T> __View_<T>__; }`, cooked beside the class
+       like the map-slot views, since no engine struct starts with a TArray of the mod's (or most engine) structs. */
+    struct FStructView { std::string Type, Pkg, Name, Field; FReadViewSpec Spec; };
+    std::map<std::string, FStructView> StructViews;     // pointee -> its view
     bool LowerAddress(const Json& Lvalue, FBlueprintClass& BP, FArgIR& Out, std::string* Pointee, std::string* Err);
     bool ReadThrough(FArgIR Addr, const std::string& Pointee, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     bool RefThrough(FArgIR Addr, const std::string& Pointee, FArgIR& Out, std::string* Err);
@@ -1924,6 +1982,10 @@ private:
                        std::vector<FStmtIR>& OutPre, std::string* Err);
     bool HoistRefAt(FArgIR& A, FBlueprintClass& BP, std::vector<FPropertyDef>& Locals,
                     std::vector<FStmtIR>& OutPre, std::string* Err);
+    bool HoistWideRead(FArgIR& A, FBlueprintClass& BP, std::vector<FPropertyDef>& Locals,
+                       std::vector<FStmtIR>& OutPre, std::string* Err);
+    bool SplitWideWrite(FStmtIR& St, FBlueprintClass& BP, std::vector<FPropertyDef>& Locals,
+                        std::vector<FStmtIR>& Out, std::string* Err);
     bool HoistBranch(FArgIR& A, FBlueprintClass& BP, std::vector<FPropertyDef>& Locals,
                      std::vector<FStmtIR>& OutPre, std::string* Err, const FArgIR* Dest = nullptr,
                      const FPropertyDef* DestProp = nullptr);
@@ -1991,6 +2053,15 @@ private:
     /* The engine's name for the member or function C++ spells `Cpp`, as seen from R: R's own marker, else an
        ancestor's or an interface's. A mod's own names have no marker and are their C++ spelling; Dumper-7 keeps a
        spelling unique along a class chain, so the first marker found is the one. */
+    /* The FEnumInfo of the enum cooked as UeName (a property's StructName); an empty one for a native enum. */
+    const FEnumInfo& EnumNamed(const std::string& UeName) const
+    {
+        static const FEnumInfo None;
+        if (const auto It = Enums.find(UeName); It != Enums.end() && It->second.UeName == UeName) return It->second;
+        for (const auto& E : Enums) if (E.second.UeName == UeName) return E.second;
+        return None;
+    }
+
     std::string UeNameOf(const FRecord* R, const std::string& Cpp, int Depth = 0) const
     {
         for (; R && Depth < 64; R = R->Base.empty() ? nullptr : Find(R->Base), ++Depth)
@@ -2068,6 +2139,8 @@ private:
     std::map<std::string, FStructInfo> Structs;
     std::map<std::string, int64> EnumValues;          // clang EnumConstantDecl id -> value
     std::map<std::string, std::vector<std::pair<std::string, int64>>> EnumDecls;   // C++ name -> its enumerators, in order
+    std::map<std::string, std::map<std::string, std::string>> EnumUeNames;        // `<Enum>__UeEnumNames`: C++ -> cooked
+    std::map<std::string, std::map<std::string, std::string>> EnumUeDisplay;      // and C++ -> display
     std::map<std::string, int32> EnumConstWidth;      // clang EnumConstantDecl id -> its enum's size, 1 / 4 / 8
     std::map<std::string, uint32> EventFlags;         // UeApi/Events.json: "Package.Class.Function" -> EFunctionFlags
     /* UeApi/NotCallable.json: "Package.Class.Function" of each function the engine does not mark BlueprintCallable and
@@ -2212,6 +2285,7 @@ private:
     std::vector<FRegistryAsset> RegistryRows;
     std::vector<const Json*> AssetDecls;        // namespace-scope variables brace-initialized, see GenerateAsset
     std::map<std::string, std::string> AssetPaths;  // UE_ASSET_AT: Ns::variable -> the path of an asset cooked elsewhere
+    std::map<std::string, std::string> ModCurves;   // UE_FLOAT_CURVE and kin: Ns::variable -> "<kind F/V/C>|<keys>"
     std::map<std::string, std::string> VarScope;    // a namespace-scope variable's decl id -> its namespace, "A::B::"
     std::map<std::string, const Json*> NsVars;      // a namespace-scope variable's decl id -> the decl
     std::map<std::string, const Json*> NsVarNamed;  // Ns::variable -> the decl
@@ -2598,7 +2672,8 @@ struct FLocalRenamer
         if (!Seen.insert(&A).second) return;
         if (A.K == FArgIR::LocalOut && To.count(A.S)) A.K = FArgIR::Local;
         if (A.K == FArgIR::Local || A.K == FArgIR::LocalOut
-            || (A.K == FArgIR::Call && A.Sub && A.Sub->Intrinsic == "__RefAtInline__")) Name(A.S);
+            || (A.K == FArgIR::Call && A.Sub && (A.Sub->Intrinsic == "__RefAtInline__"
+                                                 || A.Sub->Intrinsic.compare(0, 11, "__DerefRead") == 0))) Name(A.S);
         if (A.Sub) Call(*A.Sub);
         if (A.Base) Arg(*A.Base);
     }
@@ -2764,6 +2839,11 @@ bool FCompiler::Collect(std::string* Err)
             AssetAlls.insert(Ns + Name(N).substr(0, Name(N).size() - 12));
             return;
         }
+        if (Kind(N) == "VarDecl" && Name(N).size() > 9 && Name(N).compare(Name(N).size() - 9, 9, "__UeCurve") == 0)
+        {
+            FindLiteral(N, ModCurves[Ns + Name(N).substr(0, Name(N).size() - 9)]);
+            return;
+        }
         if (Kind(N) == "VarDecl" && Name(N).size() > 9 && Name(N).compare(Name(N).size() - 9, 9, "__UeAsset") == 0)
         {
             FindLiteral(N, AssetPaths[Ns + Name(N).substr(0, Name(N).size() - 9)]);
@@ -2794,6 +2874,30 @@ bool FCompiler::Collect(std::string* Err)
             for (const auto& En : Mine) bWide |= En.second < INT32_MIN || En.second > INT32_MAX;
             const int32 Width = Under.empty() ? (bWide ? 8 : 4) : Canon == "uint8" ? 1 : Canon == "int64" ? 8 : 4;
             ForEach(N, [&](const Json& C) { if (Kind(C) == "EnumConstantDecl") EnumConstWidth[C.value("id", std::string())] = Width; });
+            return;
+        }
+        /* `static constexpr const char *EMood__UeEnumNames = "Calm=NewEnumerator0|Very_Angry=NewEnumerator1=Very Angry";`:
+           the names an enum rebuilt from an editor's is cooked with, which assets and saved games cooked against it
+           hold, and the display names (DisplayNameMap) it had, the C++ names where none is given. */
+        if (Kind(N) == "VarDecl" && N.contains("name") && Name(N).size() > 13
+            && Name(N).compare(Name(N).size() - 13, 13, "__UeEnumNames") == 0)
+        {
+            std::string List;
+            FindLiteral(N, List);
+            const std::string Enum = Ns + Name(N).substr(0, Name(N).size() - 13);
+            for (size_t P = 0; P < List.size();)
+            {
+                size_t E = List.find('|', P);
+                if (E == std::string::npos) E = List.size();
+                const std::string Entry = List.substr(P, E - P);
+                const size_t Eq = Entry.find('='), Eq2 = Entry.find('=', Eq + 1);
+                if (Eq != std::string::npos)
+                {
+                    EnumUeNames[Enum][Entry.substr(0, Eq)] = Entry.substr(Eq + 1, Eq2 == std::string::npos ? std::string::npos : Eq2 - Eq - 1);
+                    if (Eq2 != std::string::npos) EnumUeDisplay[Enum][Entry.substr(0, Eq)] = Entry.substr(Eq2 + 1);
+                }
+                P = E + 1;
+            }
             return;
         }
         if (Kind(N) == "VarDecl" && N.contains("name") && Name(N).size() > 8 && Name(N).compare(Name(N).size() - 8, 8, "__UeEnum") == 0)
@@ -2856,6 +2960,7 @@ bool FCompiler::Collect(std::string* Err)
         std::string Category;       // UE_CATEGORY is positional, like an access specifier
         std::vector<FInputMark> PendingInput;   // UE_INPUT_KEY / UE_INPUT_ACTION mark the member that follows them
         std::vector<FTimelineMark> PendingTimeline;     // and so do UE_TIMELINE_UPDATE / _FINISHED / _EVENT
+        std::vector<std::pair<bool, std::string>> PendingDocs;  // and UE_TOOLTIP (true) / UE_KEYWORDS (false)
         std::function<void(const Json&)> Member = [&](const Json& C) {
             /* genueapi puts a class's markers in a private `struct UeMarkers` at its bottom, out of IntelliSense's
                member list: they are the class's own. */
@@ -2881,6 +2986,20 @@ bool FCompiler::Collect(std::string* Err)
                 FindLiteral(C, M.Spec);
                 PendingTimeline.push_back(M);
                 return;
+            }
+            if (Kind(C) == "VarDecl" && (Name(C).compare(0, 11, "UeToolTip__") == 0 || Name(C).compare(0, 12, "UeKeywords__") == 0))
+            {
+                PendingDocs.emplace_back(Name(C)[2] == 'T', std::string());
+                FindLiteral(C, PendingDocs.back().second);
+                return;
+            }
+            if (!PendingDocs.empty() && !C.value("isImplicit", false))
+            {
+                const bool bMethod = Kind(C) == "CXXMethodDecl" && C.contains("name") && Name(C) != "UeDefaults__";
+                for (const auto& [bToolTip, Text] : PendingDocs)
+                    if (bMethod) (bToolTip ? R.Docs[Name(C)].first : R.Docs[Name(C)].second) = Text;
+                    else if (R.DocMisplaced.empty()) R.DocMisplaced = std::string(bToolTip ? "UE_TOOLTIP" : "UE_KEYWORDS") + "(\"" + Text + "\")";
+                PendingDocs.clear();
             }
             if ((!PendingInput.empty() || !PendingTimeline.empty()) && !C.value("isImplicit", false))
             {
@@ -3024,6 +3143,8 @@ bool FCompiler::Collect(std::string* Err)
                 FindLiteral(C, Spec);
                 R.Timelines[Name(C).substr(0, Name(C).size() - 12)] = Spec;
             }
+            else if (Kind(C) == "VarDecl" && Name(C).size() > 14 && Name(C).compare(Name(C).size() - 14, 14, "__UeTrackCurve") == 0)
+                R.TrackCurves[Name(C).substr(0, Name(C).size() - 14)] = &C;
             else if (Kind(C) == "VarDecl" && Name(C).size() > 9 && Name(C).compare(Name(C).size() - 9, 9, "__UeTrack") == 0)
             {
                 std::string Spec;
@@ -3073,6 +3194,8 @@ bool FCompiler::Collect(std::string* Err)
         ForEach(N, Member);
         if (!PendingInput.empty() && R.InputMisplaced.empty()) R.InputMisplaced = InputMarkText(PendingInput.front());
         if (!PendingTimeline.empty() && R.TimelineMisplaced.empty()) R.TimelineMisplaced = TimelineMarkText(PendingTimeline.front());
+        if (!PendingDocs.empty() && R.DocMisplaced.empty())
+            R.DocMisplaced = std::string(PendingDocs.front().first ? "UE_TOOLTIP" : "UE_KEYWORDS") + "(\"" + PendingDocs.front().second + "\")";
         /* A set is looked up in Replicated by the name it is cooked under, so the marker's C++ key follows. */
         for (const auto& N2 : R.UeNames)
             if (auto Rep = R.Replicated.find(N2.first); Rep != R.Replicated.end())
@@ -3229,6 +3352,15 @@ bool FCompiler::Collect(std::string* Err)
         std::string First = D->second.front().first;
         for (const auto& En : D->second) if (En.second == 0) { First = En.first; break; }
         Enums[Enum] = { PathIn(Owner.empty() ? ModPackage : Owner, Enum), Leaf, U, First };
+        if (const auto R = EnumUeNames.find(Enum); R != EnumUeNames.end())
+        {
+            for (const auto& [Cpp, Ue] : R->second)
+                if (std::none_of(D->second.begin(), D->second.end(), [&](const auto& En) { return En.first == Cpp; }))
+                { *Err = "UE_ENUM(" + Enum + "): __UeEnumNames renames " + Cpp + ", which is no enumerator of it"; return false; }
+            Enums[Enum].UeEntries = R->second;
+            Enums[Enum].UeDisplay = EnumUeDisplay[Enum];
+            Enums[Enum].First = Enums[Enum].UeEntry(First);
+        }
         if (Leaf != Enum && Leaves[Leaf] == 1) Enums.emplace(Leaf, Enums[Enum]);
         if (Owner.empty() || Owner == ModPackage) ModEnums[Enum] = D->second;
     }
@@ -3276,6 +3408,12 @@ bool FCompiler::Collect(std::string* Err)
             *Err = R.CppName + "::" + M.Method + ": " + InputMarkText(M) + (R.bIsStruct ? " on a UE_STRUCT, which holds no functions"
                  : R.bIsInterface ? " on a UE_INTERFACE: mark the method in the class that implements it"
                  : " on a UE_PATCH, which edits its parent's defaults and nothing else: input needs a class of the mod's own");
+            return false;
+        }
+        if (!R.DocMisplaced.empty())
+        {
+            *Err = R.CppName + ": " + R.DocMisplaced + " marks no method: write it right before the method it describes, `"
+                   + R.DocMisplaced + " void Recharge();`";
             return false;
         }
         if (!R.TimelineMisplaced.empty())
@@ -3913,6 +4051,9 @@ bool FCompiler::ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgI
         if (const FConv* C = FindConv(From, To)) { ApplyConv(*C, BP, Arg); return true; }
 
     if (To == From || From.empty() || To.empty() || ToKind == SK_Object) return true;
+    /* One type spelled two ways: clang keeps `class X` inside template arguments as written, and UeApi writes
+       `TSoftClassPtr<class UClass>`, where a source writes `TArray<TSoftClassPtr<UClass>>`. */
+    if (WithoutElaboration(To) == WithoutElaboration(From)) return true;
     /* `Held = D` of two TDelegate<void(int32)>: clang declares the operator= with TDelegate<void (int)>, the same type
        spelled the canonical way (DelegateKey), so there is nothing to convert. */
     if (To.find("TDelegate<") != std::string::npos && DelegateKey(To) == DelegateKey(From)) return true;
@@ -3929,6 +4070,10 @@ bool FCompiler::ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgI
         const FRecord* IR = Find(ToIface);
         if (!IR || (!bFromIface && FromKind != SK_Object)) { *Err = "no conversion from " + From + " to " + To; return false; }
         if (bFromIface && Find(FromIface) == IR) return true;
+        /* Every interface is an IInterface (Conv_InterfaceToObject's parameter), and the value goes as it is, as the
+           Kismet compiler passes it. A cast would null it: ImplementsInterface is false for UInterface itself
+           (Class.cpp 4651), which emptied ElytrasModManager's interface registry. */
+        if (bFromIface && IR->UePackage == "/Script/CoreUObject" && IR->UeName == "Interface") return true;
         FArgIR Operand = Arg;
         Arg = FArgIR();
         Arg.K = FArgIR::DynCast;
@@ -4195,7 +4340,7 @@ bool FCompiler::LowerMakeStruct(const std::string& Type, const Json* List, FBlue
             FStmtIR Set;
             Set.K = FStmtIR::Assign;
             Set.Var.K = FArgIR::Member;
-            Set.Var.S = bPlainName ? UeNameOf(R, Name(F)) : ModFieldName(PackageOf(*R), Name(F));
+            Set.Var.S = bPlainName ? UeNameOf(R, Name(F)) : ModFieldNameOf(*R, PackageOf(*R), Name(F));
             Set.Var.Owner = Struct;
             Set.Var.LetOp = LetOpFor(TypeOf(F));
             Set.Var.Base = std::make_shared<FArgIR>();
@@ -4353,7 +4498,7 @@ bool FCompiler::LowerField(const Json& MemberNode, FBlueprintClass& BP, FArgIR& 
         Out.K = FArgIR::Member;
         Out.S = (R->IsNative() || IsInternalViewStruct(R->CppName))
                     ? UeNameOf(R, Name(MemberNode))
-                    : ModFieldName(PackageOf(*R), Name(MemberNode));
+                    : ModFieldNameOf(*R, PackageOf(*R), Name(MemberNode));
         Out.Owner = BP.ScriptStruct(PackageOf(*R), ClassOf(*R));
         Out.LetOp = LetOpFor(TypeOf(MemberNode));
         Out.Base = std::make_shared<FArgIR>();
@@ -4783,7 +4928,8 @@ bool IsUnreferenceable(const Json& Parm, const Json& Arg)
 /* The intrinsics that read their operand's storage through a StructMember donor field. */
 bool IsReinterpret(const std::string& Intrinsic)
 {
-    return Intrinsic == "__AddrOf__" || Intrinsic == "__AsObject__" || Intrinsic == "__NameIndex__";
+    return Intrinsic == "__AddrOf__" || Intrinsic == "__AsObject__" || Intrinsic == "__NameIndex__"
+        || Intrinsic == "__AsFloat__" || Intrinsic == "__FloatBits__";
 }
 
 /* Whether an operand leaves MostRecentProperty and its storage behind, as a StructMember reinterpretation
@@ -5117,10 +5263,49 @@ bool FCompiler::IsEagerSafe(const Json& N) const
     return false;
 }
 
-/* `*P`, `P[i]` on a raw pointer, `__PtrCast__<T&>(A)`, and a reference local that keeps an address. */
+/* A call of a mod function that returns a non-const T& (DESIGN.md, "Reference returns"): its Blueprint function returns
+   the address, so the call is memory, as `*P` is. The pointee, else empty. */
+std::string FCompiler::RefReturnOf(const Json& Call) const
+{
+    const std::string K = Kind(Call);
+    if ((K != "CallExpr" && K != "CXXMemberCallExpr") || Call.value("valueCategory", std::string()) != "lvalue") return std::string();
+    const std::string T = TypeOf(Call);
+    if (T.compare(0, 6, "const ") == 0) return std::string();
+    const Json* Callee = Strip(First(Call));
+    const std::string Id = !Callee ? std::string()
+                         : Kind(*Callee) == "MemberExpr" ? Callee->value("referencedMemberDecl", std::string())
+                         : Kind(*Callee) == "DeclRefExpr" ? (*Callee)["referencedDecl"].value("id", std::string()) : std::string();
+    const auto Owner = MethodOwner.find(Id);
+    const FRecord* R = Owner == MethodOwner.end() ? nullptr : Find(Owner->second);
+    const std::string Fn = Kind(*Callee) == "MemberExpr" ? Name(*Callee) : Name((*Callee)["referencedDecl"]);
+    if (!R || R->UePackage.compare(0, 8, "/Script/") == 0 || R->Inlines.count(Id) || !R->Methods.count(Fn) || IsInlineMethod(*R, Fn)) return std::string();
+    return StripTypeKeywords(T);
+}
+
+/* `return E;` in a function that returns a non-const T&: the address of E. A Blueprint variable has none to give, and
+   in C++ the reference would dangle (a local, a by-value parameter) or be the caller's variable (a T& parameter). */
+bool FCompiler::LowerRefReturn(const Json& Value, FBlueprintClass& BP, FArgIR& Out, std::string* Err)
+{
+    const Json* Bare = PeelLvalue(&Value);
+    std::string Pointee;
+    if (Bare && LowerAddress(*Bare, BP, Out, &Pointee, Err)) return true;
+    const Json* Root = Bare ? PlaceRoot(Bare) : nullptr;
+    const Json* D = Root && Kind(*Root) == "DeclRefExpr" ? &(*Root)["referencedDecl"] : nullptr;
+    if (D && (Kind(*D) == "ParmVarDecl" || Kind(*D) == "VarDecl") && !RefAddr.count(D->value("id", std::string())))
+        *Err = "returns a reference to " + Name(*D) + ", a " + (Kind(*D) == "ParmVarDecl" ? "parameter" : "local")
+             + ": a Blueprint variable has no address to return; return a pointer, or a value, or a reference into "
+               "memory, a TArray element or an object's member";
+    else
+        *Err = "a reference return gives the address of what it returns: " + *Err;
+    return false;
+}
+
+/* `*P`, `P[i]` on a raw pointer, `__PtrCast__<T&>(A)`, a reference local that keeps an address, and a call that
+   returns a reference. */
 bool FCompiler::IsDerefLvalue(const Json& N) const
 {
     const std::string K = Kind(N);
+    if (!RefReturnOf(N).empty()) return true;
     if (K == "UnaryOperator") return N.value("opcode", std::string()) == "*";
     if (K == "ArraySubscriptExpr") return true;
     if (K == "DeclRefExpr") return RefAddr.count(N["referencedDecl"].value("id", std::string())) != 0;
@@ -5131,7 +5316,7 @@ bool FCompiler::IsDerefLvalue(const Json& N) const
 
 /* The __Read*__ that loads a Pointee. It also sizes a __RefAt__'s view: a callee copying the view's element
    into a buffer sized for the Pointee needs the two to agree, so no view means no whole-value access. */
-const FReadViewSpec* FCompiler::ViewFor(const std::string& PointeeType) const
+const FReadViewSpec* FCompiler::ViewFor(const std::string& PointeeType)
 {
     const std::string P = StripTypeKeywords(PointeeType);
     const char* Read = nullptr;
@@ -5149,15 +5334,53 @@ const FReadViewSpec* FCompiler::ViewFor(const std::string& PointeeType) const
     else if (P == "FName") Read = "__ReadName__";
     else if (P == "FString") Read = "__ReadString__";
     else if (P == "FText") Read = "__ReadText__";
-    return Read ? FindReadView(Read) : nullptr;
+    if (Read) return FindReadView(Read);
+    const FRecord* SR = Structs.count(P) ? nullptr : Find(P);
+    if (!Structs.count(P) && !(SR && SR->bIsStruct && !IsInternalViewStruct(SR->CppName))) return nullptr;
+    if (auto It = StructViews.find(P); It != StructViews.end()) return &It->second.Spec;
+    const std::string Tag = TypeTag(P);
+    FStructView& V = StructViews[P];
+    V.Type = P;
+    V.Name = "FDerefView_" + Tag;
+    V.Pkg = ModPackage + "/" + V.Name;
+    V.Field = "__View_" + Tag + "__";
+    V.Spec = { "__ReadStruct__", "__DerefReadView__", V.Type.c_str(), V.Pkg.c_str(), V.Name.c_str(), V.Field.c_str() };
+    SlotAst[V.Name] = Json::array({ Json{ { "kind", "FieldDecl" }, { "name", V.Field },
+                                          { "type", Json{ { "qualType", "TArray<" + P + ">" } } } } });
+    FRecord& R = SlotStructs[V.Name];
+    R.CppName = R.UeName = V.Name;
+    R.UePackage = V.Pkg;
+    R.bIsStruct = R.bIsLocal = true;
+    for (const Json& F : SlotAst[V.Name]) R.Fields.push_back(&F);
+    return &V.Spec;
+}
+
+/* A pointee with no view of its own: its read intrinsic (HoistWideRead), else null. */
+const char* IsWideScalar(const std::string& P)
+{
+    if (P == "uint16" || P == "unsigned short") return "__ReadU16__";
+    if (P == "int16" || P == "short") return "__ReadI16__";
+    return P == "double" ? "__ReadF64__" : nullptr;
 }
 
 /* The value at Addr: a __Read*__, which the hoist pass loads into a temp. */
 bool FCompiler::ReadThrough(FArgIR Addr, const std::string& Pointee, FBlueprintClass& BP, FArgIR& Out, std::string* Err)
 {
     const FReadViewSpec* V = ViewFor(Pointee);
-    if (!V) { *Err = "TODO: a whole " + Pointee + " through a pointer; P->Member reaches its members"; return false; }
     const std::string P = StripTypeKeywords(Pointee);
+    /* No engine struct starts with a TArray of these, and Kismet has neither type: a 16-bit value is two byte reads, a
+       double its two int32 halves made into a float (HoistWideRead). */
+    if (const char* Wide = IsWideScalar(P))
+    {
+        Out = FArgIR();
+        Out.K = FArgIR::Call;
+        Out.InnerType = std::strcmp(Wide, "__ReadF64__") == 0 ? "float" : "int32";
+        Out.Sub = std::make_shared<FCallIR>();
+        Out.Sub->Intrinsic = Wide;
+        Out.Sub->Args.push_back(std::move(Addr));
+        return true;
+    }
+    if (!V) { *Err = "TODO: a whole " + Pointee + " through a pointer; P->Member reaches its members"; return false; }
     /* The int32 view would read it signed: 0xFFFFFFFF would widen and compare as -1. */
     if (P == "uint32" || P == "unsigned int")
     { *Err = "TODO: reading a uint32 through a pointer (Kismet has no unsigned 32-bit int); read it as int32 or int64"; return false; }
@@ -5194,7 +5417,8 @@ bool FCompiler::ReadThrough(FArgIR Addr, const std::string& Pointee, FBlueprintC
 /* The memory at Addr as an lvalue: a __RefAt__, whose hoist types its view by the Pointee. */
 bool FCompiler::RefThrough(FArgIR Addr, const std::string& Pointee, FArgIR& Out, std::string* Err)
 {
-    if (!ViewFor(Pointee)) { *Err = "TODO: a whole " + Pointee + " through a pointer; P->Member reaches its members"; return false; }
+    if (!IsWideScalar(StripTypeKeywords(Pointee)) && !ViewFor(Pointee))
+    { *Err = "TODO: a whole " + Pointee + " through a pointer; P->Member reaches its members"; return false; }
     Out = FArgIR();
     Out.K = FArgIR::Call;
     Out.InnerType = StripTypeKeywords(Pointee);
@@ -5260,6 +5484,16 @@ bool FCompiler::LowerAddress(const Json& Lvalue, FBlueprintClass& BP, FArgIR& Ou
         PlusOffset(std::move(Ptr), std::move(Offset));
         return true;
     }
+    if (const std::string Ref = N ? RefReturnOf(*N) : std::string(); !Ref.empty())
+    {
+        *Pointee = Ref;
+        Out = FArgIR();
+        Out.K = FArgIR::Call;
+        Out.Sub = std::make_shared<FCallIR>();
+        if (!LowerCall(*N, BP, *Out.Sub, Err)) return false;
+        Out.InnerType = "int64";
+        return true;
+    }
     if (K == "CallExpr" && IsDerefLvalue(*N))
     {
         *Pointee = StripTypeKeywords(TypeOf(*N));
@@ -5290,6 +5524,24 @@ bool FCompiler::LowerAddress(const Json& Lvalue, FBlueprintClass& BP, FArgIR& Ou
         Array.InnerType = "class UObject *";    // a TArray's first 8 bytes are its Data pointer, read as __AddrOf__ reads one
         if (!ConvertArg("int64", BP, Array, Err)) return false;
         PlusOffset(std::move(Array), std::move(Offset));
+        return true;
+    }
+    /* `&S.Member`, `&P->Member`: where S sits (or what P holds) plus the member's offset in the game's layout. A struct
+       that is a Blueprint variable has no address, and LowerAddress of it says so. */
+    if (const Json* Base = K == "MemberExpr" ? Nth(*N, 0) : nullptr;
+        Base && (!N->value("isArrow", false) || !PointeeOf(*Base).empty()))
+    {
+        FArgIR At;
+        std::string Struct;
+        if (N->value("isArrow", false)) { Struct = PointeeOf(*Base); if (!LowerArg(*Base, BP, At, Err)) return false; }
+        else if (!LowerAddress(*Base, BP, At, &Struct, Err)) return false;
+        FArgIR Offset;
+        Offset.K = FArgIR::Int64;
+        int32 Off = 0;
+        if (!MemberOffset(Struct, N->value("name", std::string()), &Off, Err)) return false;
+        Offset.I64 = Off;
+        PlusOffset(std::move(At), std::move(Offset));
+        *Pointee = StripTypeKeywords(TypeOf(*N));
         return true;
     }
     if (K == "MemberExpr" && N->value("isArrow", false))
@@ -5444,6 +5696,18 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
     const Json* N = &Node;
     const EStrKind Slot = StrKindOf(OuterType);
     const std::string K = Kind(*N);
+    if (K == "MemberExpr" || K == "CXXMemberCallExpr" || (K == "CXXOperatorCallExpr" && IsIndexOperatorCall(*N)))
+    {
+        AssetValueWhy.clear();
+        if (FAssetRead A; AssetValueOf(*N, A))
+        {
+            if (!A.bString) return ConstToArg(A.Num, TypeOf(*N), Out) || (*Err = A.Shown + ": internal: no constant of its type", false);
+            Out.K = A.bName ? FArgIR::Name : FArgIR::Str;
+            Out.S = A.S;
+            return true;
+        }
+        if (!AssetValueWhy.empty()) { *Err = AssetValueWhy; return false; }
+    }
     if (K == "MemberExpr")
     {
         /* `this->X` of an inline class variable is X: the object says nothing about it, so it must not run anything. */
@@ -5458,6 +5722,12 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
     }
     if (K == "CXXThisExpr") { Out.K = FArgIR::Self; return true; }
     if (K == "CXXNullPtrLiteralExpr") { Out.K = FArgIR::NullObj; return true; }
+    if (!RefReturnOf(*N).empty())
+    {
+        FArgIR Addr;
+        std::string Pointee;
+        return LowerAddress(*N, BP, Addr, &Pointee, Err) && ReadThrough(std::move(Addr), Pointee, BP, Out, Err);
+    }
     if (K == "UnaryExprOrTypeTraitExpr" && (N->value("name", std::string()) == "sizeof" || N->value("name", std::string()) == "alignof"))
     {
         /* The game's layout, not the host compiler's: clang sizes the UeApi stand-ins, which are not the real types. */
@@ -6452,24 +6722,54 @@ std::vector<uint8> FCompiler::NativeTail(const FRecord* Component) const
 /* The mod directory's .h / .cpp sources, read on the first call, in the order of their names' UTF-8 bytes.
    NamedQualifier takes the first source that fits, so the order cannot be directory_iterator's: that is the
    filesystem's, sorted on NTFS but hashed on ext4. */
+static std::string CanonicalPath(const std::filesystem::path& P)
+{
+    std::error_code Ec;
+    return std::filesystem::weakly_canonical(P, Ec).string();
+}
+
+/* The files Root reaches by quoted includes, Root among them, by canonical path: each one's path and text. A UeApi
+   header is generated and no mod's, so a path through a UeApi folder is not followed. */
+static std::map<std::string, std::pair<std::filesystem::path, std::string>> ReachedByIncludes(const std::filesystem::path& Root)
+{
+    namespace fs = std::filesystem;
+    std::map<std::string, std::pair<fs::path, std::string>> Reached;
+    for (std::vector<fs::path> Todo{ Root }; !Todo.empty();)
+    {
+        const fs::path File = Todo.back();
+        Todo.pop_back();
+        std::error_code Ec;
+        if (!fs::is_regular_file(File, Ec) || Reached.count(CanonicalPath(File))) continue;
+        if (std::any_of(File.begin(), File.end(), [](const fs::path& Part) { return Part == "UeApi"; })) continue;
+        const std::string Text = ReadText(File.string());
+        for (size_t At = 0; (At = Text.find("#include", At)) != std::string::npos; At += 8)
+        {
+            const size_t Open = Text.find_first_of("\"<\n", At + 8);
+            if (Open == std::string::npos || Text[Open] != '"') continue;
+            const size_t Close = Text.find('"', Open + 1);
+            if (Close != std::string::npos) Todo.push_back(File.parent_path() / fs::path(Text.substr(Open + 1, Close - Open - 1)));
+        }
+        Reached[CanonicalPath(File)] = { File, Text };
+    }
+    return Reached;
+}
+
+/* The mod's own sources: those beside the compiled one, and those it reaches by quoted includes. bpbuild compiles a
+   unity file that includes each .cpp of a mod by its absolute path, so a mod in subfolders is only found that way. */
 const std::vector<std::string>& FCompiler::ModSources() const
 {
     if (SourceTexts.empty())
     {
         std::error_code Ec;
-        std::vector<std::pair<std::string, std::filesystem::path>> Files;
+        std::map<std::string, std::filesystem::path> Files;     // by canonical path: a file in both lists is read once
         for (const auto& E : std::filesystem::directory_iterator(SourceDir, Ec))
         {
             const std::string Ext = E.path().extension().string();
             if (!E.is_regular_file() || (Ext != ".h" && Ext != ".hpp" && Ext != ".cpp")) continue;
-            Files.emplace_back(E.path().filename().u8string(), E.path());
+            Files.emplace(CanonicalPath(E.path()), E.path());
         }
-        std::sort(Files.begin(), Files.end());
-        for (const auto& File : Files)
-        {
-            std::ifstream F(File.second, std::ios::binary);
-            SourceTexts.emplace_back(std::istreambuf_iterator<char>(F), std::istreambuf_iterator<char>());
-        }
+        for (const auto& [Key, Entry] : ReachedByIncludes(SourceFile)) Files.emplace(Key, Entry.first);
+        for (const auto& File : Files) SourceTexts.push_back(ReadText(File.second.string()));
     }
     return SourceTexts;
 }
@@ -6477,7 +6777,7 @@ const std::vector<std::string>& FCompiler::ModSources() const
 /* The AST keeps no file of a declaration (DroppedAstKey), and the leaf UE_FINAL_AS declares is spelled in UeMeta.h, so
    the text says where the macro was written: the compiled source and the files it includes by a quoted path that
    resolves beside the including one (bpbuild's unity file includes each .cpp of a mod by its absolute path), read as
-   text. A UeApi header is generated and no mod's, so a path through a UeApi folder is not followed. A macro written
+   text (ReachedByIncludes). A macro written
    through another macro is not found; the caller then takes the compiler's old answer.
    A site is the shared one when the owner sees it too: a header that a source of the owner's, beside it and outside
    this compile, includes. A source is the owner's when its UE_MOD_PACKAGE is Owner, or when it has none and every
@@ -6495,29 +6795,8 @@ std::vector<bool> FCompiler::FinalAsSites(const std::string& Base, const std::st
         while (Begin > 0 && IsIdent(S[Begin - 1])) --Begin;
         return S.substr(Begin, End - Begin);
     };
-    auto Canonical = [](const fs::path& P) { std::error_code Ec; return fs::weakly_canonical(P, Ec).string(); };
-    /* The files Root reaches by quoted includes, Root among them, by canonical path. */
-    auto Reach = [&](const fs::path& Root) {
-        std::map<std::string, std::pair<fs::path, std::string>> Reached;
-        for (std::vector<fs::path> Todo{ Root }; !Todo.empty();)
-        {
-            const fs::path File = Todo.back();
-            Todo.pop_back();
-            std::error_code Ec;
-            if (!fs::is_regular_file(File, Ec) || Reached.count(Canonical(File))) continue;
-            if (std::any_of(File.begin(), File.end(), [](const fs::path& Part) { return Part == "UeApi"; })) continue;
-            const std::string Text = ReadText(File.string());
-            for (size_t At = 0; (At = Text.find("#include", At)) != std::string::npos; At += 8)
-            {
-                const size_t Open = Text.find_first_of("\"<\n", At + 8);
-                if (Open == std::string::npos || Text[Open] != '"') continue;
-                const size_t Close = Text.find('"', Open + 1);
-                if (Close != std::string::npos) Todo.push_back(File.parent_path() / fs::path(Text.substr(Open + 1, Close - Open - 1)));
-            }
-            Reached[Canonical(File)] = { File, Text };
-        }
-        return Reached;
-    };
+    auto Canonical = CanonicalPath;
+    auto Reach = ReachedByIncludes;
     /* The path a source's UE_MOD_PACKAGE names, or empty. */
     auto PackageIn = [&](const std::string& Text) {
         for (size_t At = 0; (At = Text.find("UE_MOD_PACKAGE", At)) != std::string::npos; At += 14)
@@ -7134,12 +7413,17 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
             const FRecord* In = nullptr;
             for (const FRecord* A = Cur; A && !Found; A = A->Base.empty() ? nullptr : Find(A->Base))
                 if (auto M = A->Methods.find(Target); M != A->Methods.end()) { Found = M->second; In = A; }
+            /* The engine's test is ParmsSize > 0, and a return value is a parameter there too. */
+            std::string Ret = Found ? TypeOf(*Found) : std::string();
+            Ret = Ret.substr(0, Ret.find('('));
+            while (!Ret.empty() && Ret.back() == ' ') Ret.pop_back();
             const char* Why = !Found ? "names no function of the class"
                             : IsInlineMethod(*In, Target) ? "names an inline method, which is no function of the class"
-                            : !ParmNames(*Found).empty() ? "names a function that takes parameters" : nullptr;
+                            : !ParmNames(*Found).empty() ? "names a function that takes parameters"
+                            : Ret != "void" ? "names a function that returns a value" : nullptr;
             if (Why)
             { *Err = CurFnName + ": K2_SetTimer by name " + Target + " " + Why + ", so the engine sets no timer; "
-                     "name a method without parameters, or pass a delegate"; return false; }
+                     "name a void method without parameters, or pass a delegate"; return false; }
         }
     }
 
@@ -8945,7 +9229,11 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 std::string VarType = TypeOf(D);
                 FStmtIR Ds;
                 const Json* RefInit = First(D) ? PeelLvalue(First(D)) : nullptr;
-                if (!VarType.empty() && VarType.back() == '&' && RefInit && Kind(*RefInit) != "MaterializeTemporaryExpr")
+                /* A const T& bound to a call that returns a copy (any but a reference return) is a copy. */
+                const bool bCopiedCall = RefInit && VarType.compare(0, 6, "const ") == 0 && RefReturnOf(*RefInit).empty()
+                                      && (Kind(*RefInit) == "CallExpr" || Kind(*RefInit) == "CXXMemberCallExpr");
+                if (!VarType.empty() && VarType.back() == '&' && RefInit && Kind(*RefInit) != "MaterializeTemporaryExpr"
+                    && !bCopiedCall)
                 {
                     /* `T& R = V` is another name for V; `T& R = *P` keeps the address in an int64 local. A `const T& R`
                        bound to a temporary falls through to a copy, which lives as long. */
@@ -9216,8 +9504,16 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 FArgIR Addr;
                 std::string Pointee;
                 St.K = FStmtIR::Assign;
-                bOk = LowerAddress(*Lhs, BP, Addr, &Pointee, Err) && RefThrough(std::move(Addr), Pointee, St.Var, Err)
-                   && LowerArg(*Rhs, BP, St.Value, Err);
+                bOk = LowerAddress(*Lhs, BP, Addr, &Pointee, Err) && RefThrough(std::move(Addr), Pointee, St.Var, Err);
+                /* A 16-bit or double store takes an int32 or a float (SplitWideWrite), which no Kismet type narrows or
+                   widens to: the conversion C++ makes to the pointee is the store itself. */
+                const Json* Value = Rhs;
+                if (IsWideScalar(StripTypeKeywords(Pointee)))
+                    while ((Kind(*Value) == "ImplicitCastExpr" || Kind(*Value) == "CStyleCastExpr" || Kind(*Value) == "CXXStaticCastExpr"
+                            || Kind(*Value) == "CXXFunctionalCastExpr" || Kind(*Value) == "ParenExpr")
+                           && First(*Value) && StripTypeKeywords(TypeOf(*Value)) == StripTypeKeywords(Pointee))
+                        Value = First(*Value);
+                bOk = bOk && LowerArg(*Value, BP, St.Value, Err);
             }
             else if (const Json* Elem = LK == "MemberExpr" ? MapElementUnder(Rooted) : nullptr)
             {
@@ -9352,13 +9648,15 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             if (First(*S))
             {
                 St.bHasValue = true;
-                bOk = LowerArg(*First(*S), BP, St.Value, Err);
+                bOk = CurRefReturn.empty() ? LowerArg(*First(*S), BP, St.Value, Err)
+                                           : LowerRefReturn(*First(*S), BP, St.Value, Err);
             }
             /* Leaving by-reference TMap range-fors: the value is taken first (it may still change theirs), then each
                loop's value goes back into its map, innermost first. */
             if (bOk && !WriteBacks.empty())
             {
-                const std::string RetTy = St.bHasValue ? StripTypeKeywords(TypeOf(*First(*S))) : std::string();
+                const std::string RetTy = !St.bHasValue ? std::string() : !CurRefReturn.empty() ? std::string("int64")
+                                        : StripTypeKeywords(TypeOf(*First(*S)));
                 if (!RetTy.empty() && RetTy != "void")
                 {
                     const std::string Temp = "__Ret" + std::to_string(ReadTmpCounter++) + "__";
@@ -10439,7 +10737,32 @@ static std::vector<std::string> TimelineItems(const std::string& S)
    variable, sets each track's variable by name every frame it plays (FTimeline::SetPlaybackPosition), and binds the
    update, finished and event-track functions by name through FOnTimelineEvent, a delegate of no parameters. The marked
    method is the event itself, where the editor's __UpdateFunc stub only jumps into the ubergraph at the node's pin. */
-bool FCompiler::AddTimelines(const FRecord& R, bool bIsActor, FBlueprintClass& BP, std::string* Err) const
+/* A track's or a UE_FLOAT_CURVE's keys as their macro stringizes them, `(time, values..., Interp)`, sorted by time as the
+   curve editor keeps them (FRichCurve::AddKey) and the engine evaluates them. Bad is the first key that is not one. */
+bool FCompiler::CurveKeys(const std::string& Spec, char Kind, std::vector<FBlueprintClass::FTimelineKey>& Keys, std::string& Bad)
+{
+    const int32 Channels = Kind == 'V' ? 3 : Kind == 'C' ? 4 : 1;
+    for (std::string Key : TimelineItems(Spec))
+    {
+        std::vector<std::string> Parts;
+        if (Key.size() >= 2 && Key.front() == '(' && Key.back() == ')') Parts = TimelineItems(Key.substr(1, Key.size() - 2));
+        FBlueprintClass::FTimelineKey K;
+        if (!Parts.empty() && (Parts.back() == "Linear" || Parts.back() == "Constant" || Parts.back() == "Cubic"))
+        {
+            K.Interp = Parts.back() == "Linear" ? 0 : Parts.back() == "Constant" ? 1 : 2;
+            Parts.pop_back();
+        }
+        bool bOk = int32(Parts.size()) == 1 + Channels;
+        for (int32 I = 0; bOk && I <= Channels; ++I)
+            bOk = TimelineNumber(Parts[size_t(I)], I == 0 ? K.Time : K.Values[I - 1]);
+        if (!bOk) { Bad = Key; return false; }
+        Keys.push_back(K);
+    }
+    std::stable_sort(Keys.begin(), Keys.end(), [](const auto& A, const auto& B) { return A.Time < B.Time; });
+    return true;
+}
+
+bool FCompiler::AddTimelines(const FRecord& R, bool bIsActor, FBlueprintClass& BP, std::string* Err)
 {
     std::map<std::string, FBlueprintClass::FTimeline> Timelines;
     for (const auto& [Name_, Spec] : R.Timelines)
@@ -10470,9 +10793,10 @@ bool FCompiler::AddTimelines(const FRecord& R, bool bIsActor, FBlueprintClass& B
         const auto F = std::find_if(R.Fields.begin(), R.Fields.end(), [&](const Json* D) { return Name(*D) == Field; });
         const std::string Type = F == R.Fields.end() ? std::string() : StripTypeKeywords(TypeOf(**F));
         const char Kind = Type == "FVector" ? 'V' : Type == "FLinearColor" ? 'C' : 'F';
-        const char* const Macro = Kind == 'V' ? "UE_VECTOR_TRACK" : Kind == 'C' ? "UE_COLOR_TRACK" : "UE_FLOAT_TRACK";
+        const auto Curve = R.TrackCurves.find(Field);
+        const std::string Macro = std::string(Kind == 'V' ? "UE_VECTOR_TRACK" : Kind == 'C' ? "UE_COLOR_TRACK" : "UE_FLOAT_TRACK")
+                                + (Curve != R.TrackCurves.end() ? "_CURVE" : "");
         const char* const Shape = Kind == 'V' ? "(time, x, y, z)" : Kind == 'C' ? "(time, r, g, b, a)" : "(time, value)";
-        const int32 Channels = Kind == 'V' ? 3 : Kind == 'C' ? 4 : 1;
         auto Refuse = [&](const std::string& Why) { *Err = R.CppName + "::" + Field + ": " + Macro + " " + Why; return false; };
         const size_t Bar = std::min(Spec.find('|'), Spec.size());
         const auto T = Timelines.find(Spec.substr(0, Bar));
@@ -10481,27 +10805,38 @@ bool FCompiler::AddTimelines(const FRecord& R, bool bIsActor, FBlueprintClass& B
         FBlueprintClass::FTimelineTrack Track;
         Track.Kind = Kind;
         Track.Name = Field;
-        for (std::string Key : TimelineItems(Bar < Spec.size() ? Spec.substr(Bar + 1) : std::string()))
+        if (Curve != R.TrackCurves.end())
         {
-            std::vector<std::string> Parts;
-            if (Key.size() >= 2 && Key.front() == '(' && Key.back() == ')') Parts = TimelineItems(Key.substr(1, Key.size() - 2));
-            FBlueprintClass::FTimelineKey K;
-            if (!Parts.empty() && (Parts.back() == "Linear" || Parts.back() == "Constant" || Parts.back() == "Cubic"))
-            {
-                K.Interp = Parts.back() == "Linear" ? 0 : Parts.back() == "Constant" ? 1 : 2;
-                Parts.pop_back();
-            }
-            bool bOk = int32(Parts.size()) == 1 + Channels;
-            for (int32 I = 0; bOk && I <= Channels; ++I)
-                bOk = TimelineNumber(Parts[size_t(I)], I == 0 ? K.Time : K.Values[I - 1]);
-            if (!bOk)
-                return Refuse(std::string("has the key ") + Key + ", which is not " + Shape + " of number literals, with Cubic or "
-                              "Constant after the values for a key that is not Linear");
-            Track.Keys.push_back(K);
+            /* The editor's External Curve, measured on BP_Refinery_LandingZone's Timeline_0: the track's curve tag names
+               the asset's import, bIsExternalCurve is set, and the template creates the import before it serializes.
+               The class has no curve object of its own for it. */
+            const char* const Want = Kind == 'V' ? "UCurveVector" : Kind == 'C' ? "UCurveLinearColor" : "UCurveFloat";
+            std::function<const Json*(const Json&)> AddrOf = [&](const Json& N) -> const Json* {
+                if (N.value("kind", std::string()) == "UnaryOperator" && N.value("opcode", std::string()) == "&") return &N;
+                const Json* Found = nullptr;
+                ForEach(N, [&](const Json& C) { if (!Found) Found = AddrOf(C); });
+                return Found;
+            };
+            const Json* Addr = AddrOf(*Curve->second);
+            const Json* Ref = Addr ? Strip(First(*Addr)) : nullptr;
+            const Json* D = Ref && Ref->contains("referencedDecl") ? &(*Ref)["referencedDecl"] : nullptr;
+            const Json& DT = D && D->contains("type") ? (*D)["type"] : Json::object();
+            const FRecord* Of = Find(StripTypeKeywords(DT.value("desugaredQualType", DT.value("qualType", std::string()))));
+            const FRecord* Wanted = Find(Want);
+            if (!Addr || !Of || !Wanted || !AssetRef(*Addr, BP, &Track.External))
+                return Refuse("names no curve asset: name a UE_ASSET_AT of the game's or another mod's curve (the UeAssets "
+                              "headers name the game's), or a UE_FLOAT_CURVE, UE_VECTOR_CURVE or UE_COLOR_CURVE of this mod");
+            if (Of != Wanted && !IsSubclassOf(*Of, *Wanted))
+                return Refuse("names " + Name(*D) + ", a " + Of->CppName + ": the track's " + Type + " is played from a " + Want);
         }
-        if (Track.Keys.empty()) return Refuse("has no keys: write them after the name, " + std::string(Shape) + ", ...");
-        /* The curve editor keeps a curve's keys sorted by time (FRichCurve::AddKey), and the engine evaluates them so. */
-        std::stable_sort(Track.Keys.begin(), Track.Keys.end(), [](const auto& A, const auto& B) { return A.Time < B.Time; });
+        else
+        {
+            std::string Bad;
+            if (!CurveKeys(Bar < Spec.size() ? Spec.substr(Bar + 1) : std::string(), Kind, Track.Keys, Bad))
+                return Refuse(std::string("has the key ") + Bad + ", which is not " + Shape + " of number literals, with Cubic or "
+                              "Constant after the values for a key that is not Linear");
+            if (Track.Keys.empty()) return Refuse("has no keys: write them after the name, " + std::string(Shape) + ", ...");
+        }
         T->second.Tracks.push_back(Track);
     }
 
@@ -12372,6 +12707,24 @@ bool FCompiler::HoistReadCall(FArgIR& A, const FReadViewSpec& V, FBlueprintClass
     TmpPD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
     Locals.push_back(TmpPD);
 
+    /* A waiting function has no prologue: its code starts at whichever segment its stub enters, and the scratch is
+       renamed into the ubergraph's frame with the segment's other locals. So each read primes Num itself. */
+    if (bMadeLatentCall)
+    {
+        FStmtIR Num;
+        Num.K = FStmtIR::Assign;
+        Num.Var.K = FArgIR::Member;
+        Num.Var.S = "Num";
+        Num.Var.Owner = DerefStruct;
+        Num.Var.LetOp = EX_Let;
+        Num.Var.Base = std::make_shared<FArgIR>();
+        Num.Var.Base->K = FArgIR::Local;
+        Num.Var.Base->S = "__DerefScratch__";
+        Num.Value.K = FArgIR::Int;
+        Num.Value.I = 1;
+        OutPre.push_back(std::move(Num));
+    }
+
     /* Statement 1: __DerefScratch__.Data = <Addr>. */
     FStmtIR WriteData;
     WriteData.K = FStmtIR::Assign;
@@ -12394,7 +12747,9 @@ bool FCompiler::HoistReadCall(FArgIR& A, const FReadViewSpec& V, FBlueprintClass
     ReadTmp.bAssignLocal = true;
     ReadTmp.Value.K = FArgIR::Call;
     ReadTmp.Value.Sub = std::make_shared<FCallIR>();
+    ReadTmp.Value.S = "__DerefScratch__";      // the scratch it reads, renamed with the locals in a waiting function
     ReadTmp.Value.Sub->Intrinsic = V.DerefIntrinsic;
+    ReadTmp.Value.Sub->View = V.ViewField ? V.ViewField : ViewFieldOf(V.DerefIntrinsic);
     ReadTmp.Value.Sub->Extra = BP.ScriptStruct(V.ViewStructPkg, V.ViewStructName);
     /* ponytail: a mod-owned view is { TArray<T> Data; }, 16 bytes. */
     if (std::strncmp(V.ViewStructPkg, "/Game/", 6) == 0) KeepStructLoaded(ReadTmp.Value.Sub->Extra, V.ViewStructName, 16);
@@ -12454,10 +12809,12 @@ bool FCompiler::HoistReadsInArg(FArgIR& A, FBlueprintClass& BP,
        an already-materialised inner temp. */
     if (!HoistCallArgs(*A.Sub, BP, Locals, OutPre, Err)) return false;
 
-    if (const FReadViewSpec* V = FindReadView(A.Sub->Intrinsic))
+    if (const FReadViewSpec* V = A.Sub->Intrinsic == "__ReadStruct__" ? ViewFor(A.InnerType) : FindReadView(A.Sub->Intrinsic))
         return HoistReadCall(A, *V, BP, Locals, OutPre, Err);
     if (A.Sub->Intrinsic == "__RefAt__")
         return HoistRefAt(A, BP, Locals, OutPre, Err);
+    if (A.Sub->Intrinsic == "__ReadU16__" || A.Sub->Intrinsic == "__ReadI16__" || A.Sub->Intrinsic == "__ReadF64__")
+        return HoistWideRead(A, BP, Locals, OutPre, Err);
     if (IsReinterpret(A.Sub->Intrinsic) && A.Sub->Args.size() == 1)
         return HoistOperand(A.Sub->Args[0], BP, Locals, OutPre, Err);
     return true;
@@ -12555,6 +12912,10 @@ bool FCompiler::HoistRefAt(FArgIR& A, FBlueprintClass& BP, std::vector<FProperty
         return false;
     }
     if (!HasDerefStruct(Err)) return false;
+    /* SplitWideWrite takes their stores; any other use of the place would get the 8-byte view below. */
+    if (IsWideScalar(StripTypeKeywords(A.InnerType)))
+    { *Err = "a " + StripTypeKeywords(A.InnerType) + " through a pointer is read or assigned, not passed by reference: "
+             "pass its value"; return false; }
     const FIndex DerefStruct = BP.ScriptStruct(ModPackage + "/FDeref", "FDeref");
     const std::string Scratch = "__RefScratch" + std::to_string(ReadTmpCounter++) + "__";
     FPropertyDef PD = StructParam(Scratch, DerefStruct, "FDeref", 16, 0);
@@ -12593,8 +12954,149 @@ bool FCompiler::HoistRefAt(FArgIR& A, FBlueprintClass& BP, std::vector<FProperty
     A.Sub = std::make_shared<FCallIR>();
     A.Sub->Intrinsic = "__RefAtInline__";
     A.Sub->Extra = BP.ScriptStruct(V->ViewStructPkg, V->ViewStructName);
-    A.Sub->View = ViewFieldOf(V->DerefIntrinsic);
+    A.Sub->View = V->ViewField ? V->ViewField : ViewFieldOf(V->DerefIntrinsic);
     if (std::strncmp(V->ViewStructPkg, "/Game/", 6) == 0) KeepStructLoaded(A.Sub->Extra, V->ViewStructName, 16);
+    return true;
+}
+
+/* Kismet int32 math for the wide reads and writes below. */
+FArgIR IntK(int32 V) { FArgIR A; A.K = FArgIR::Int; A.I = V; A.InnerType = "int32"; return A; }
+FArgIR MathK(FBlueprintClass& BP, const char* Fn, std::vector<FArgIR> Args, const char* Type = "int32")
+{
+    FArgIR C;
+    C.K = FArgIR::Call;
+    C.InnerType = Type;
+    C.Sub = std::make_shared<FCallIR>();
+    C.Sub->Fn = BP.EngineFunction("/Script/Engine", "KismetMathLibrary", Fn);
+    C.Sub->bPure = true;
+    C.Sub->Args = std::move(Args);
+    return C;
+}
+FArgIR IntrinsicK(const char* Name, FArgIR Arg, const char* Type, FIndex Extra = {})
+{
+    FArgIR C;
+    C.K = FArgIR::Call;
+    C.InnerType = Type;
+    C.Sub = std::make_shared<FCallIR>();
+    C.Sub->Intrinsic = Name;
+    C.Sub->Extra = Extra;
+    C.Sub->Args.push_back(std::move(Arg));
+    return C;
+}
+/* The address plus Off bytes. */
+FArgIR AtK(FBlueprintClass& BP, const FArgIR& Addr, int64 Off)
+{
+    if (Off == 0) return Addr;
+    FArgIR O;
+    O.K = FArgIR::Int64;
+    O.I64 = Off;
+    return MathK(BP, "Add_Int64Int64", { Addr, O }, "int64");
+}
+
+/* A 16-bit value or a double through a pointer, which no view reads: a uint16 is its low byte plus 256 times its high
+   one (an int16 then sign-extended), and a double is made into the float nearest it from its two int32 halves, as
+   C++'s conversion does. The address is evaluated once. */
+bool FCompiler::HoistWideRead(FArgIR& A, FBlueprintClass& BP, std::vector<FPropertyDef>& Locals,
+                              std::vector<FStmtIR>& OutPre, std::string* Err)
+{
+    const std::string Which = A.Sub->Intrinsic;
+    FArgIR Addr = std::move(A.Sub->Args[0]);
+    Addr.InnerType = "int64";
+    if (!HoistOperand(Addr, BP, Locals, OutPre, Err)) return false;
+    auto Math = [&](const char* Fn, std::vector<FArgIR> Args) { return MathK(BP, Fn, std::move(Args)); };
+    if (Which != "__ReadF64__")
+    {
+        auto Byte = [&](int64 Off) { return Math("Conv_ByteToInt", { IntrinsicK("__ReadByte__", AtK(BP, Addr, Off), "uint8") }); };
+        A = Math("Add_IntInt", { Byte(0), Math("Multiply_IntInt", { Byte(1), IntK(256) }) });
+        if (Which == "__ReadI16__") A = Math("Subtract_IntInt", { Math("Xor_IntInt", { A, IntK(0x8000) }), IntK(0x8000) });
+        return HoistReadsInArg(A, BP, Locals, OutPre, Err);
+    }
+    /* Each half once, and the exponent once: they are read in several places below. */
+    FArgIR Lo = IntrinsicK("__Read32__", AtK(BP, Addr, 0), "int32"), Hi = IntrinsicK("__Read32__", AtK(BP, Addr, 4), "int32");
+    if (!HoistReadsInArg(Lo, BP, Locals, OutPre, Err) || !HoistReadsInArg(Hi, BP, Locals, OutPre, Err)) return false;
+    Lo.InnerType = Hi.InnerType = "int32";
+    FArgIR E = Math("Divide_IntInt", { Math("And_IntInt", { Hi, IntK(0x7FF00000) }), IntK(0x100000) });
+    if (!HoistOperand(E, BP, Locals, OutPre, Err, true)) return false;
+    /* The float's 23 mantissa bits are the double's top 23 (Hi's 20, then Lo's top 3), rounded to nearest, a tie to
+       even: the next bit is added unless it is a tie (nothing set below it) and the kept bits are already even. A carry
+       out of them steps the exponent, which the sum below does by itself.
+       ponytail: a result below FLT_MIN reads as 0, not as the denormal C++ gives. */
+    FArgIR Halfway = Math("Divide_IntInt", { Math("And_IntInt", { Lo, IntK(0x10000000) }), IntK(0x10000000) });
+    FArgIR Sticky = Math("NotEqual_IntInt", { Math("And_IntInt", { Lo, IntK(0x0FFFFFFF) }), IntK(0) });
+    FArgIR Odd = Math("NotEqual_IntInt", { Math("And_IntInt", { Lo, IntK(0x20000000) }), IntK(0) });
+    Sticky.InnerType = Odd.InnerType = "bool";
+    FArgIR NotTie = Math("BooleanOR", { Sticky, Odd });
+    NotTie.InnerType = "bool";
+    const FArgIR M = Math("Add_IntInt", {
+        Math("Add_IntInt", { Math("Multiply_IntInt", { Math("And_IntInt", { Hi, IntK(0xFFFFF) }), IntK(8) }),
+                             Math("And_IntInt", { Math("Divide_IntInt", { Math("And_IntInt", { Lo, IntK(int32(0xE0000000u)) }),
+                                                                         IntK(0x20000000) }), IntK(7) }) }),
+        Math("SelectInt", { Halfway, IntK(0), NotTie }) });
+    const FArgIR Body = Math("Add_IntInt", { Math("Multiply_IntInt", { Math("Subtract_IntInt", { E, IntK(1023 - 127) }),
+                                                                       IntK(0x800000) }), M });
+    auto Select = [&](FArgIR Picked, FArgIR Other, FArgIR Cond)
+    {
+        FArgIR C = Math("SelectInt", { std::move(Picked), std::move(Other), std::move(Cond) });
+        return C;
+    };
+    auto Cmp = [&](const char* Fn, int32 V) { FArgIR C = Math(Fn, { E, IntK(V) }); C.InnerType = "bool"; return C; };
+    FArgIR AnyMantissa = Math("NotEqual_IntInt", { Math("Or_IntInt", { Math("And_IntInt", { Hi, IntK(0xFFFFF) }), Lo }), IntK(0) });
+    AnyMantissa.InnerType = "bool";
+    const FArgIR NanOrInf = Math("Or_IntInt", { IntK(0x7F800000), Select(IntK(0x400000), IntK(0), AnyMantissa) });
+    /* Each Cmp adds an import, and Select is a call, whose arguments run in the compiler's order: one per statement,
+       so the import rows come out the same from MSVC and clang. This is the order MSVC evaluated the nested arguments
+       in (right to left), so its output does not move. */
+    const FArgIR IsNanOrInf = Cmp("EqualEqual_IntInt", 0x7FF);
+    const FArgIR Overflows = Cmp("GreaterEqual_IntInt", 1023 + 128);
+    const FArgIR Underflows = Cmp("LessEqual_IntInt", 1023 - 127);
+    const FArgIR Magnitude = Select(NanOrInf, Select(IntK(0x7F800000), Select(IntK(0), Body, Underflows), Overflows),
+                                    IsNanOrInf);
+    FArgIR Bits = Math("Or_IntInt", { Magnitude, Math("And_IntInt", { Hi, IntK(int32(0x80000000u)) }) });
+    A = IntrinsicK("__AsFloat__", std::move(Bits), "float", BP.ScriptStruct("/Script/CoreUObject", "Vector"));
+    return HoistReadsInArg(A, BP, Locals, OutPre, Err);
+}
+
+/* `*P = V` of a 16-bit value (its two bytes) or a double (the float V widened, written as its two int32 halves). V is
+   evaluated first, then the address, as C++17 orders an assignment. The parts are plain statements for the caller to
+   hoist. */
+bool FCompiler::SplitWideWrite(FStmtIR& St, FBlueprintClass& BP, std::vector<FPropertyDef>& Locals,
+                               std::vector<FStmtIR>& Out, std::string* Err)
+{
+    const bool bDouble = StripTypeKeywords(St.Var.InnerType) == "double";
+    FArgIR Value = std::move(St.Value), Addr = std::move(St.Var.Sub->Args[0]);
+    Value.InnerType = bDouble ? "float" : "int32";
+    Addr.InnerType = "int64";
+    if (!HoistOperand(Value, BP, Locals, Out, Err, true) || !HoistOperand(Addr, BP, Locals, Out, Err, true)) return false;
+    auto Math = [&](const char* Fn, std::vector<FArgIR> Args) { return MathK(BP, Fn, std::move(Args)); };
+    auto Store = [&](int64 Off, const char* Type, FArgIR V)
+    {
+        FStmtIR W;
+        W.K = FStmtIR::Assign;
+        W.Var = IntrinsicK("__RefAt__", AtK(BP, Addr, Off), Type);
+        W.Value = std::move(V);
+        Out.push_back(std::move(W));
+    };
+    if (!bDouble)
+    {
+        /* The high byte is V >> 8 as C++ shifts: the low bits cleared, then divided. */
+        Store(0, "uint8", MathK(BP, "Conv_IntToByte", { Value }, "uint8"));
+        Store(1, "uint8", MathK(BP, "Conv_IntToByte", { Math("Divide_IntInt", { Math("And_IntInt", { Value, IntK(int32(0xFFFFFF00u)) }),
+                                                                                IntK(256) }) }, "uint8"));
+        return true;
+    }
+    FArgIR Bits = IntrinsicK("__FloatBits__", Value, "int32", BP.ScriptStruct("/Script/CoreUObject", "IntPoint"));
+    if (!HoistOperand(Bits, BP, Locals, Out, Err, true)) return false;
+    FArgIR E = Math("Divide_IntInt", { Math("And_IntInt", { Bits, IntK(0x7F800000) }), IntK(0x800000) });
+    if (!HoistOperand(E, BP, Locals, Out, Err, true)) return false;
+    auto Is = [&](int32 V) { FArgIR C = Math("EqualEqual_IntInt", { E, IntK(V) }); C.InnerType = "bool"; return C; };
+    /* ponytail: a float below FLT_MIN is written as 0, not as the double it widens to. */
+    const FArgIR Mantissa = Math("SelectInt", { IntK(0), Math("And_IntInt", { Bits, IntK(0x7FFFFF) }), Is(0) });
+    const FArgIR Exp = Math("SelectInt", { IntK(0x7FF), Math("SelectInt", { IntK(0), Math("Add_IntInt", { E, IntK(1023 - 127) }), Is(0) }),
+                                           Is(0xFF) });
+    Store(0, "int32", Math("Multiply_IntInt", { Math("And_IntInt", { Mantissa, IntK(7) }), IntK(0x20000000) }));
+    Store(4, "int32", Math("Or_IntInt", { Math("Or_IntInt", { Math("And_IntInt", { Bits, IntK(int32(0x80000000u)) }),
+                                                              Math("Multiply_IntInt", { Exp, IntK(0x100000) }) }),
+                                          Math("Divide_IntInt", { Mantissa, IntK(8) }) }));
     return true;
 }
 
@@ -12606,7 +13108,9 @@ bool ContainsRead(const FArgIR& A)
     if (A.K == FArgIR::DynCast && A.Sub) return ContainsRead(A.Sub->Args[0]);
     if (A.K != FArgIR::Call || !A.Sub) return false;
     if (A.Sub->Target && ContainsRead(*A.Sub->Target)) return true;
-    if (FindReadView(A.Sub->Intrinsic) || A.Sub->Intrinsic == "__RefAt__" || IsBranch(A.Sub->Intrinsic)
+    if (FindReadView(A.Sub->Intrinsic) || A.Sub->Intrinsic == "__ReadStruct__" || A.Sub->Intrinsic == "__RefAt__"
+        || A.Sub->Intrinsic == "__ReadU16__" || A.Sub->Intrinsic == "__ReadI16__" || A.Sub->Intrinsic == "__ReadF64__"
+        || IsBranch(A.Sub->Intrinsic)
         || A.Sub->Intrinsic == "__Inline__") return true;
     if (IsReinterpret(A.Sub->Intrinsic) && A.Sub->Args.size() == 1 && !IsStored(A.Sub->Args[0])) return true;
     for (const FArgIR& CA : A.Sub->Args) if (ContainsRead(CA)) return true;
@@ -12756,12 +13260,37 @@ bool FCompiler::HoistReadsInList(std::vector<FStmtIR>& Stmts, FBlueprintClass& B
             if (St.Value.K != FArgIR::Local || St.Value.S != St.Var.S) Out.push_back(std::move(St));
             continue;
         }
+        /* `*P = V` of a 16-bit value or a double: statements of their own, each then hoisted as any other. */
+        if (St.K == FStmtIR::Assign && St.Var.K == FArgIR::Call && St.Var.Sub && St.Var.Sub->Intrinsic == "__RefAt__"
+            && IsWideScalar(St.Var.InnerType))
+        {
+            std::vector<FStmtIR> Split;
+            if (!SplitWideWrite(St, BP, Locals, Split, Err)) return false;
+            for (FStmtIR& Part : Split)
+            {
+                std::vector<FStmtIR> PartPre;
+                if (!HoistReadsInStmt(Part, BP, Locals, PartPre, Err)) return false;
+                for (FStmtIR& P : PartPre) Out.push_back(std::move(P));
+                Out.push_back(std::move(Part));
+            }
+            continue;
+        }
         if (!HoistReadsInStmt(St, BP, Locals, Pre, Err)) return false;
         for (FStmtIR& P : Pre) Out.push_back(std::move(P));
         Out.push_back(std::move(St));
     }
     Stmts = std::move(Out);
     return true;
+}
+
+/* T with every elaborated-type keyword taken out, wherever it stands: `TMap<class A*, struct B>` is `TMap<A*, B>`. */
+std::string WithoutElaboration(std::string T)
+{
+    for (const char* K : { "class ", "struct ", "enum " })
+        for (size_t P = 0; (P = T.find(K, P)) != std::string::npos;)
+            if (P == 0 || !(isalnum((unsigned char)T[P - 1]) || T[P - 1] == '_')) T.erase(P, strlen(K));
+            else ++P;
+    return T;
 }
 
 std::string StripTypeKeywords(std::string T)
@@ -12821,6 +13350,9 @@ bool FCompiler::FoldConst(const Json& E, FConstVal& Out) const
         else if (T == "unsigned short" || T == "uint16") V.I = uint16(V.I);
         return true;
     };
+    /* A game asset's value, read off its package (AssetValueOf). */
+    if (K == "MemberExpr" || K == "CXXMemberCallExpr" || (K == "CXXOperatorCallExpr" && IsIndexOperatorCall(E)))
+        if (FAssetRead A; const_cast<FCompiler*>(this)->AssetValueOf(E, A)) { Out = A.Num; return !A.bString && Fit(Out); }
     if (K == "IntegerLiteral") { Out = {}; Out.I = int64(std::strtoull(E.value("value", std::string("0")).c_str(), nullptr, 10)); return true; }
     if (K == "CharacterLiteral") { Out = {}; Out.I = CharValue(E); return true; }
     if (K == "FloatingLiteral") { Out = {}; Out.bFloat = true; Out.F = std::strtod(E.value("value", std::string("0")).c_str(), nullptr); return true; }
@@ -13117,6 +13649,276 @@ bool FCompiler::LowerGlobal(const Json& Decl, FBlueprintClass& BP, FArgIR& Out, 
     return true;
 }
 
+/*
+S38 - `ED_Spider_Grunt.SpawnSpread`, a member of a game asset (a UE_ASSET_AT) read by value, then any `.Member` and
+`[i]` into it: the value the asset's package holds, read off GameDir when the mod is built, so FoldConst and the code
+take it as a constant. The SDK names the asset and types the path but carries no value, so a value can only come from
+the package the game loads, never from a header gone stale. The package keeps only what differs from the object's
+archetype (its TemplateIndex), so a member it has no tag of is the archetype's, followed through the game's packages;
+at a native class the value is its C++ default, which no package holds, and that is refused. So is a value whose tag is
+not the type UeApi gives the member (UeApi from another game build), one inside a map or a text, and a reference.
+False with AssetValueWhy empty when E is no such read; false with it set when the read is refused. bEdited reads the
+packages this compile edits as edited (CheckAssetReads); otherwise the read is recorded, and its package printed for
+bpbuild, which restales the mod when the game's copy is newer.
+*/
+bool FCompiler::AssetValueOf(const Json& E, FAssetRead& Out, bool bEdited)
+{
+    std::vector<const Json*> Steps;                 // from the asset out; the first a member
+    const Json* N = &E;
+    /* A TEnum<E> member reads through its conversion to E. */
+    if (Kind(E) == "CXXMemberCallExpr")
+    {
+        const Json* Callee = Strip(First(E));
+        if (!Callee || Kind(*Callee) != "MemberExpr" || Name(*Callee).compare(0, 9, "operator ") != 0 || !First(*Callee)) return false;
+        N = Strip(First(*Callee));
+    }
+    for (;;)
+    {
+        const std::string K = Kind(*N);
+        const Json* Next = K == "MemberExpr" && !N->value("isArrow", false) ? Strip(First(*N))
+                         : K == "CXXOperatorCallExpr" && IsIndexOperatorCall(*N) ? Strip(Nth(*N, 1)) : nullptr;
+        if (!Next) break;
+        Steps.insert(Steps.begin(), N);
+        N = Next;
+    }
+    if (Kind(*N) != "DeclRefExpr" || !N->contains("referencedDecl") || Steps.empty() || Kind(*Steps[0]) != "MemberExpr") return false;
+    const Json& D = (*N)["referencedDecl"];
+    const std::string Id = D.value("id", std::string());
+    if (!NsVars.count(Id)) return false;
+    const auto Scope = VarScope.find(Id);
+    const std::string Qual = (Scope == VarScope.end() ? std::string() : Scope->second) + Name(D);
+    const auto Path = AssetPaths.find(Qual);
+    if (Path == AssetPaths.end()) return false;
+
+    /* The path typed off UeApi, as an edit's: the member's def, each step's. */
+    std::string Shown = Name(D);
+    auto Refuse = [&](const std::string& Why) { AssetValueWhy = Shown + ": " + Why; return false; };
+    FPackage Scratch("/Scratch");
+    FBlueprintClass BP(Scratch, "Scratch", "", "", false);
+    BP.GameClassKinds = &GameClassKinds;
+    const auto Owner = FieldOwner.find(Steps[0]->value("referencedMemberDecl", std::string()));
+    const FRecord* DR = Owner == FieldOwner.end() ? nullptr : Find(Owner->second);
+    Shown += "." + Name(*Steps[0]);
+    if (!DR) return Refuse("cannot tell which class declares " + Name(*Steps[0]));
+    std::vector<FPropertyDef> Chain(1);
+    std::vector<FValueStep> Walk;
+    std::string Why;
+    if (!TypeToProperty(TypeOf(*Steps[0]), UeNameOf(DR, Name(*Steps[0])), 0, Shown, BP, &Chain[0], &Why)) { AssetValueWhy = Why; return false; }
+    for (size_t K = 1; K < Steps.size(); ++K)
+    {
+        FConstVal I;
+        const Json* Index = Kind(*Steps[K]) == "MemberExpr" ? nullptr : Nth(*Steps[K], 2);
+        Shown += Index ? "[" + (FoldConst(*Index, I) ? std::to_string(I.I) : std::string("...")) + "]" : "." + Name(*Steps[K]);
+        if (Index && Chain.back().Type != "ArrayProperty")
+            return Refuse("only a TArray's element is read when the mod is built; read a map's value when the game runs, through (&"
+                          + Name(D) + ")");
+        FPropertyDef Reached;
+        if (!EditStep(*Steps[K], Chain.back(), Shown, BP, Walk.emplace_back(), Reached, &Why)) { AssetValueWhy = Why; return false; }
+        Chain.push_back(std::move(Reached));
+    }
+    const FPropertyDef& Leaf = Chain.back();
+    const std::string& LT = Leaf.Type;
+    const bool bEnum = (LT == "ByteProperty" || LT == "EnumProperty") && !Leaf.StructName.empty();
+    if (LT != "FloatProperty" && LT != "DoubleProperty" && LT != "IntProperty" && LT != "Int64Property" && LT != "ByteProperty"
+        && LT != "EnumProperty" && LT != "BoolProperty" && LT != "NameProperty" && LT != "StrProperty")
+        return Refuse("only a number, a bool, an enum, a name or a string is read when the mod is built, and this is a "
+                      + StripTypeKeywords(TypeOf(E)) + "; read it when the game runs, through (&" + Name(D) + ")");
+    if (GameDir.empty())
+        return Refuse("a game asset's value is read off its package when the mod is built: pass the folder /Game is in "
+                      "(assetgen compile --game <extracted pak>/FSD/Content; bpbuild: game_content in mods.yaml)");
+
+    const std::function<const FCookedPackage*(const std::string&, std::string*)> Load = [&](const std::string& Name, std::string* LoadErr) -> const FCookedPackage* {
+        if (bEdited)
+            if (auto Slot = Edited.find(Lower(Name)); Slot != Edited.end()) return &Slot->second.P;
+        if (auto Slot = ValuePackages.find(Lower(Name)); Slot != ValuePackages.end()) return &Slot->second;
+        if (Name.compare(0, 6, "/Game/") != 0) { *LoadErr = Name + " is not a /Game package"; return nullptr; }
+        const std::string Base = (std::filesystem::u8path(GameDir) / std::filesystem::u8path(Name.substr(6))).u8string();
+        FCookedPackage Q;
+        for (const char* Ext : { ".uasset", ".umap" })
+            if (std::filesystem::exists(std::filesystem::u8path(Base + Ext)))
+                return Q.Load(Base + Ext, LoadErr) ? &(ValuePackages[Lower(Name)] = std::move(Q)) : nullptr;
+        *LoadErr = Name + " is not in " + GameDir + " (an asset of a mod pak has no package there)";
+        return nullptr;
+    };
+
+    /* The value at Walk in row X of Q, else in its archetype. */
+    FDefaultValue Value;
+    std::string ReadType;                           // the type the package's tag gives the leaf
+    std::function<bool(const FCookedPackage&, const std::string&, int32, int32)> ReadAt =
+        [&](const FCookedPackage& Q, const std::string& QName, int32 X, int32 Depth) -> bool {
+        if (Depth > 64) return Refuse("the archetype chain does not end");
+        const FCookedExport& Self = Q.Exports[size_t(X)];
+        std::vector<FTag> Tags;
+        size_t At = 0;
+        if (!ReadTags(Q, Self.Payload, At, Tags)) return Refuse(QName + ": " + Q.NameOf(Self.ObjectName) + "'s values do not read");
+        const auto Tag = std::find_if(Tags.begin(), Tags.end(), [&](const FTag& T) { return T.ArrayIndex == 0 && Q.SameName(T.Name, Chain[0].Name); });
+        if (Tag != Tags.end())
+        {
+            FPropertyDef Read;
+            if (!ReadTagValue(Q, *Tag, Read, &Why)) return Refuse(QName + "'s value does not read (" + Why + ")");
+            FDefaultValue V = Read.Default;
+            std::shared_ptr<FPropertyDef> Of = std::make_shared<FPropertyDef>(Read);
+            bool bElement = false, bMissing = false;
+            for (size_t K = 0; K < Walk.size() && !bMissing; ++K)
+            {
+                const FValueStep& S = Walk[K];
+                if (S.Element >= 0)
+                {
+                    if (V.K != FDefaultValue::Array || !Of->Inner) return Refuse(QName + " holds no array there");
+                    if (size_t(S.Element) >= V.Items.size())
+                        return Refuse("the game's array has " + std::to_string(V.Items.size()) + " elements");
+                    const FDefaultValue Item = V.Items[size_t(S.Element)];
+                    V = Item;
+                    Of = Of->Inner;
+                    bElement = true;
+                }
+                else if (V.K != FDefaultValue::Struct || !V.Members) return Refuse(QName + " holds no struct there");
+                else if (S.Offset >= 0)
+                {
+                    /* A native struct's bytes, as 4-byte chunks (ReadTagValue): the member's own. */
+                    if (S.Size != 4 || S.Offset % 4 || size_t(S.Offset / 4) >= V.Members->size() || K + 1 != Walk.size())
+                        return Refuse("only a 4-byte member of a native struct is read when the mod is built");
+                    const uint32 Bits = uint32((*V.Members)[size_t(S.Offset / 4)].Default.I);
+                    V = FDefaultValue{};
+                    if (LT == "FloatProperty") { float F; std::memcpy(&F, &Bits, 4); V.K = FDefaultValue::Float; V.F = F; }
+                    else if (LT == "IntProperty") { V.K = FDefaultValue::Int; V.I = int32(Bits); }
+                    else return Refuse("only a float or an int32 member of a native struct is read when the mod is built");
+                    Of = std::make_shared<FPropertyDef>(Leaf);
+                }
+                else
+                {
+                    const auto M = std::find_if(V.Members->begin(), V.Members->end(), [&](const FPropertyDef& P) { return Lower(P.Name) == Lower(S.Member); });
+                    /* A struct property loads each member over its archetype's struct; an element over its struct's
+                       defaults, which no package holds. */
+                    if (M == V.Members->end() && bElement)
+                        return Refuse("the game's element sets no " + S.Member + ", so it holds its struct's default, which no "
+                                      "package holds; read it when the game runs, through (&" + Name(D) + ")");
+                    if (M == V.Members->end()) { bMissing = true; break; }
+                    Of = std::make_shared<FPropertyDef>(*M);
+                    const FDefaultValue Member = M->Default;
+                    V = Member;
+                }
+            }
+            if (!bMissing)
+            {
+                Value = V;
+                ReadType = Of->Type;
+                return true;
+            }
+        }
+        /* Not set here: the archetype's value. */
+        if (Self.Template > 0) return ReadAt(Q, QName, Self.Template - 1, Depth + 1);
+        std::vector<std::string> Arch;              // the archetype first, its package last
+        for (int32 I = Self.Template; I < 0; I = Q.Imports[size_t(-I - 1)].Outer) Arch.push_back(Q.NameOf(Q.Imports[size_t(-I - 1)].ObjectName));
+        if (Arch.empty() || Arch.back().compare(0, 8, "/Script/") == 0)
+        {
+            /* A Blueprint class's own property starts as zero under its native parent, and the cook leaves a zero out
+               (measured: 247 of the 387 own int, float and bool variables of the game's Enemies classes have no tag on
+               their default object). So a member the topmost Blueprint class declares, untagged, is zero. */
+            FClassLayout L;
+            bool bDeclared = false;
+            if (Self.Class > 0 && ReadClassLayout(Q, Q.Exports[size_t(Self.Class - 1)].Payload, L))
+                for (const FClassLayout::FField& F : L.Fields) bDeclared = bDeclared || Q.SameName(F.Name, Chain[0].Name);
+            if (bDeclared && !Walk.empty() && Walk[0].Element >= 0) return Refuse("the game's array has 0 elements");
+            bDeclared = bDeclared && Walk.empty();
+            if (bDeclared)
+            {
+                Value = FDefaultValue{};
+                Value.K = LT == "FloatProperty" || LT == "DoubleProperty" ? FDefaultValue::Float
+                        : LT == "BoolProperty" ? FDefaultValue::Bool : LT == "NameProperty" || LT == "StrProperty" ? FDefaultValue::Str
+                        : FDefaultValue::Int;
+                if (LT == "NameProperty") Value.S = "None";
+                ReadType = LT;
+                return true;
+            }
+            const std::string Class = Arch.size() > 1 ? Arch.front().substr(Arch.front().compare(0, 9, "Default__") == 0 ? 9 : 0) : "its class";
+            return Refuse("the game's " + Q.NameOf(Self.ObjectName) + " sets no value of its own, so it holds " + Class
+                          + "'s C++ default, which no package holds; read it when the game runs, through (&" + Name(D) + ")");
+        }
+        const FCookedPackage* Next = Load(Arch.back(), &Why);
+        if (!Next) return Refuse(Why);
+        int32 Row = -1;
+        for (size_t K = Arch.size() - 1; K-- > 0 && (Row = Next->FindExport(Arch[K], Row + 1)) >= 0;) {}
+        if (Row < 0) return Refuse(Arch.back() + " holds no " + Arch.front());
+        return ReadAt(*Next, Arch.back(), Row, Depth + 1);
+    };
+    std::string Package = Path->second;
+    const std::string Object = SplitAssetPath(Package);
+    const FCookedPackage* Q = Load(Package, &Why);
+    if (!Q) return Refuse(Why);
+    const int32 Row = Q->FindExport(Object);
+    if (Row < 0) return Refuse(Package + " holds no " + Object);
+    if (!ReadAt(*Q, Package, Row, 0)) return false;
+
+    /* The tag's type is the member's, or UeApi was made from another game build than the package. */
+    const bool bEnumTag = ReadType == "EnumProperty" || ReadType == "ByteProperty";
+    if (ReadType != LT && !(bEnum && bEnumTag))
+        return Refuse("the game's package holds a " + ReadType + " there, where UeApi declares a " + LT + ": regenerate UeApi "
+                      "from the same game build as the extracted pak");
+    Out = FAssetRead{};
+    Out.Shown = Shown;
+    if (Value.K == FDefaultValue::Float) { Out.Num.bFloat = true; Out.Num.F = Value.F; }
+    else if (Value.K == FDefaultValue::Int || Value.K == FDefaultValue::Bool)
+    {
+        Out.Num.I = Value.I;
+        /* A zero enum (an untagged Blueprint variable): named for a default as a tag names it. */
+        std::vector<std::pair<std::string, int64>> Entries;
+        if (bEnum && (EnumMapEntries(StripTypeKeywords(TypeOf(E)), Entries) || EnumMapEntries(Leaf.StructName, Entries)))
+            for (const auto& [EName, EValue] : Entries)
+                if (EValue == Value.I && Out.S.empty())
+                    Out.S = Leaf.StructName + "::" + EName.substr(EName.rfind(':') == std::string::npos ? 0 : EName.rfind(':') + 1);
+    }
+    else if (Value.K == FDefaultValue::Str && bEnum)
+    {
+        /* An enumerator by name, "EEnum::Name": its value off the enum UeApi declares. */
+        Out.S = Value.S;
+        const std::string Want = Value.S.substr(Value.S.rfind(':') == std::string::npos ? 0 : Value.S.rfind(':') + 1);
+        std::vector<std::pair<std::string, int64>> Entries;
+        bool bFound = false;
+        if (EnumMapEntries(StripTypeKeywords(TypeOf(E)), Entries) || EnumMapEntries(Leaf.StructName, Entries))
+            for (const auto& [EName, EValue] : Entries)
+                if (!bFound && EName.substr(EName.rfind(':') == std::string::npos ? 0 : EName.rfind(':') + 1) == Want)
+                { Out.Num.I = EValue; bFound = true; }
+        if (!bFound) return Refuse("the game's value is " + Value.S + ", which UeApi's " + StripTypeKeywords(TypeOf(E))
+                                   + " does not declare: regenerate UeApi from the same game build as the extracted pak");
+    }
+    else if (Value.K == FDefaultValue::Str && (LT == "NameProperty" || LT == "StrProperty"))
+    {
+        Out.bString = true;
+        Out.bName = LT == "NameProperty";
+        Out.S = Value.S;
+    }
+    else return Refuse("the game's value does not read as a " + LT);
+    if (!bEdited && AssetReads.emplace(&E, Out).second)
+    {
+        char Num[32];
+        snprintf(Num, sizeof Num, Out.Num.bFloat ? "%.9g" : "%.0f", Out.Num.Num());
+        const std::string V = Out.bString ? "\"" + Out.S + "\"" : !Out.S.empty() ? Out.S : std::string(Num);
+        printf("  %-14s <- %s  (%s = %s, read when the mod is built)\n", "value", Package.c_str(), Shown.c_str(), V.c_str());
+    }
+    return true;
+}
+
+/* A value read when the mod is built is the game's, before this mod's own edits, which are written after the classes
+   that read them. Where an edit of this compile changes one, the game loads the edited value: refused, rather than
+   compiled in as the old one. */
+bool FCompiler::CheckAssetReads(std::string* Err)
+{
+    for (const auto& [E, Was] : AssetReads)
+    {
+        FAssetRead Now;
+        AssetValueWhy.clear();
+        if (!AssetValueOf(*E, Now, /*bEdited=*/true)) { *Err = AssetValueWhy; return false; }
+        if (Now.S != Was.S || Now.Num.Num() != Was.Num.Num())
+        {
+            *Err = Was.Shown + ": this mod's edit changes the value read when the mod is built, and the game loads the edited "
+                   "one: read it when the game runs, through the asset's pointer, or use the edit's value itself";
+            return false;
+        }
+    }
+    return true;
+}
+
 bool FCompiler::AssetRef(const Json& N, FBlueprintClass& BP, FIndex* Out)
 {
     if (Kind(N) != "UnaryOperator" || N.value("opcode", std::string()) != "&") return false;
@@ -13134,7 +13936,7 @@ bool FCompiler::AssetRef(const Json& N, FBlueprintClass& BP, FIndex* Out)
     const std::string Qual = (Scope == VarScope.end() ? std::string() : Scope->second) + Var;
     if (auto At = AssetPaths.find(Qual); At != AssetPaths.end())
         Package = At->second;
-    else if (std::any_of(AssetDecls.begin(), AssetDecls.end(), [&](const Json* A) { return Name(*A) == Var; }))
+    else if (ModCurves.count(Qual) || std::any_of(AssetDecls.begin(), AssetDecls.end(), [&](const Json* A) { return Name(*A) == Var; }))
         Package = PathIn(ModPackage, Qual);
     else return false;
 
@@ -13401,6 +14203,7 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
                              bool bKeepZero)
 {
     const Json* const Whole = Init ? Init : First(F);
+    AssetValueWhy.clear();
     Init = Whole ? StructConversionBelow(*Whole) : nullptr;
     if (!Init) Init = Strip(Whole);
     /* No initializer: the property starts as the engine makes it, which is the C++ constructor's value but for a struct
@@ -13458,7 +14261,7 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
         {
             FDefaultValue Enum, Text;
             Enum.K = Text.K = FDefaultValue::Str;
-            Enum.S = EnumSide.StructName + "::" + Entry.first;
+            Enum.S = EnumSide.StructName + "::" + EnumNamed(EnumSide.StructName).UeEntry(Entry.first);
             Text.S = Entry.first;
             PD.Default.Items.push_back(bEnumKey ? Enum : Text);
             PD.Default.Items.push_back(bEnumKey ? Text : Enum);
@@ -13684,7 +14487,7 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
     if (!bNeg && K == "DeclRefExpr" && (T == "ByteProperty" || T == "EnumProperty") && !PD.StructName.empty()
         && (*Init)["referencedDecl"].value("kind", std::string()) == "EnumConstantDecl")
     {
-        D.S = PD.StructName + "::" + Name((*Init)["referencedDecl"]);
+        D.S = PD.StructName + "::" + EnumNamed(PD.StructName).UeEntry(Name((*Init)["referencedDecl"]));
         D.K = !bKeepZero && D.S == PD.EnumZero ? FDefaultValue::None : FDefaultValue::Str;
         return true;
     }
@@ -13694,6 +14497,17 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
         D.K = !bKeepZero && D.S.empty() ? FDefaultValue::None : FDefaultValue::Str;
         return true;
     }
+    /* A game asset's name, string or enumerator, read off its package (AssetValueOf); a number went through FoldConst. */
+    if (FAssetRead A; !bNeg && AssetValueOf(*Init, A))
+    {
+        if (A.bString ? T == "StrProperty" || T == "NameProperty" : (T == "ByteProperty" || T == "EnumProperty") && !A.S.empty())
+        {
+            D.S = A.S;
+            D.K = !bKeepZero && (A.bString ? D.S.empty() : D.S == PD.EnumZero) ? FDefaultValue::None : FDefaultValue::Str;
+            return true;
+        }
+    }
+    if (!AssetValueWhy.empty()) { *Err = Name(F) + ": " + AssetValueWhy; return false; }
     *Err = Name(F) + ": a default is a value known when the mod is built - a literal, a constant expression over "
            "literals, enum constants and constexpr variables, a braced struct, an &Asset or a class, X::StaticClass(). A "
            "function call counts only through `constexpr T k = F();` with F consteval, which clang runs itself. Anything "
@@ -14380,6 +15194,40 @@ bool FCompiler::StructLayout(const FRecord& R, int32* Size, int32* Align, std::s
     return true;
 }
 
+/* Where Member sits in a struct: its members at their natural alignment, as UStruct::Link lays out a mod's (StructLayout).
+   An engine struct's are its reflected members, laid out the same way, which is right only when nothing unreflected sits
+   between them: trusted when they add up to the struct's size in the game. */
+bool FCompiler::MemberOffset(const std::string& StructType, const std::string& Member, int32* Offset, std::string* Err)
+{
+    const std::string T = StripTypeKeywords(StructType);
+    std::vector<std::pair<std::string, std::string>> Fields;     // (type, name)
+    int32 GameSize = -1;
+    if (auto S = Structs.find(T); S != Structs.end()) { Fields = S->second.Fields; GameSize = S->second.Size; }
+    else if (const FRecord* R = Find(T); R && R->bIsStruct)
+        for (const Json* F : R->Fields) Fields.emplace_back(TypeOf(*F), Name(*F));
+    else { *Err = "TODO: the address of a member of " + T + ", which is not a struct"; return false; }
+    int32 At = 0, MaxAlign = 1, Found = -1;
+    for (const auto& [Type, Name] : Fields)
+    {
+        int32 Size = 0, Align = 1;
+        if (!LayoutOf(Type, &Size, &Align, Err)) return false;
+        At = (At + Align - 1) / Align * Align;
+        if (Name == Member) Found = At;
+        At += Size;
+        MaxAlign = std::max(MaxAlign, Align);
+    }
+    if (Found < 0) { *Err = "the address of " + T + "::" + Member + ", a member the compiler does not see in " + T; return false; }
+    if (const int32 Size = std::max(1, (At + MaxAlign - 1) / MaxAlign * MaxAlign); GameSize >= 0 && Size != GameSize)
+    {
+        *Err = "TODO: the address of " + T + "::" + Member + ": " + T + "'s reflected members take " + std::to_string(Size)
+             + " bytes and it takes " + std::to_string(GameSize) + " in the game, so something unreflected moves them; add "
+               "the member's offset to the struct's address yourself";
+        return false;
+    }
+    *Offset = Found;
+    return true;
+}
+
 bool FCompiler::LowerParams(const Json& M, const std::string& Fn, FBlueprintClass& BP,
                             std::vector<FPropertyDef>& Params, std::string* Err)
 {
@@ -14493,10 +15341,20 @@ bool FCompiler::GenerateInterface(const FRecord& R, const std::string& OutDir, s
                        [](FScript& S, FIndex) { S.Return(); S.EndOfScript(); },
                        FUNC_Public | FUNC_BlueprintCallable | FUNC_BlueprintEvent
                            | (bOut ? FUNC_HasOutParms : 0));
+        if (auto Cat = R.Categories.find(Entry.first); Cat != R.Categories.end()) BP.ApiCategory[Entry.first] = Cat->second;
+        if (auto Doc = R.Docs.find(Entry.first); Doc != R.Docs.end()) BP.ApiDocs[Entry.first] = Doc->second;
     }
 
     BP.Finish();
     if (!SavePackage(P, OutDir, PackageName, Err)) return false;
+    /* The editor's side, so a Blueprint made there can implement it: a Blueprint Interface asset with a function graph
+       per function, as the editor saves one. Its variables, AssetGen's own idea, are not there: the editor's interfaces
+       hold none. */
+    if (ApiDir && !BP.WriteApi(*ApiDir, Err))
+    {
+        printf("  %-14s -> no API asset: %s\n", R.CppName.c_str(), Err->c_str());
+        Err->clear();
+    }
     /* The class, `<I>_C`, as a class's row names it and the game's Blueprint interfaces' rows do (TempRocketInterface);
        their `<I>` row is the editor's Blueprint asset, which a cooked package does not hold. */
     RegistryRows.push_back({ PackageName, ClassOf(R), "BlueprintGeneratedClass" });
@@ -14519,7 +15377,7 @@ bool FCompiler::GenerateStruct(const FRecord& R, const std::string& OutDir, std:
     {
         FPropertyDef PD;
         const std::string Field = IsInternalViewStruct(R.CppName) ? Name(*F)
-                                                                  : ModFieldName(PackageName, Name(*F));
+                                                                  : ModFieldNameOf(R, PackageName, Name(*F));
         if (!TypeToProperty(TypeOf(*F), Field, 0, "member " + Name(*F), BP, &PD, Err)) return false;
         /* The struct's default instance carries every member's value, so a member no value can be written for is none. */
         if (PD.Type == "StructProperty" && NativeUnwritten(PD.StructName))
@@ -14556,7 +15414,15 @@ bool FCompiler::GenerateEnum(const std::string& Enum, const std::string& OutDir,
     StampIdentity(P, PackageName);
     FBlueprintClass BP(P, Name, "", "", false);
     if (ApiDir && !BP.WriteApiEnum(*ApiDir, ModEnums[Enum], Err)) return false;
-    BP.FinishEnum(ModEnums[Enum]);
+    std::vector<std::pair<std::string, int64>> Cooked;
+    std::vector<std::pair<std::string, std::string>> Display;     // cooked name -> display name, for a renamed one
+    for (const auto& [Cpp, Value] : ModEnums[Enum])
+    {
+        Cooked.push_back({ Enums[Enum].UeEntry(Cpp), Value });
+        const auto Shown = Enums[Enum].UeDisplay.find(Cpp);
+        if (Cooked.back().first != Cpp) Display.push_back({ Cooked.back().first, Shown != Enums[Enum].UeDisplay.end() ? Shown->second : Cpp });
+    }
+    BP.FinishEnum(Cooked, Display);
     if (!SavePackage(P, OutDir, PackageName, Err)) return false;
     RegistryRows.push_back({ PackageName, Name, "UserDefinedEnum" });
     printf("  %-14s -> %s.uasset  (enum, %d enumerators)\n", Enum.c_str(), Shown(PackageName).c_str(), int32(ModEnums[Enum].size()));
@@ -14645,6 +15511,39 @@ bool FCompiler::GenerateAsset(const Json& Var, const std::string& OutDir, std::s
     return true;
 }
 
+/* UE_FLOAT_CURVE / UE_VECTOR_CURVE / UE_COLOR_CURVE: a curve asset of the mod's own, as the Content Browser's Miscellaneous >
+   Curve makes one, at <mod package>/<namespace folders>/<Name>. Its keys are a timeline track's. */
+bool FCompiler::GenerateCurve(const std::string& Qual, const std::string& OutDir, std::string* Err)
+{
+    const std::string& Spec = ModCurves[Qual];
+    const char Kind = Spec.empty() ? 'F' : Spec[0];
+    const char* const Macro = Kind == 'V' ? "UE_VECTOR_CURVE" : Kind == 'C' ? "UE_COLOR_CURVE" : "UE_FLOAT_CURVE";
+    const char* const Shape = Kind == 'V' ? "(time, x, y, z)" : Kind == 'C' ? "(time, r, g, b, a)" : "(time, value)";
+    FBlueprintClass::FTimelineTrack Curve;
+    Curve.Kind = Kind;
+    std::string Bad;
+    if (!CurveKeys(Spec.size() > 2 ? Spec.substr(2) : std::string(), Kind, Curve.Keys, Bad))
+    {
+        *Err = Qual + ": " + Macro + " has the key " + Bad + ", which is not " + Shape + " of number literals, with Cubic or "
+               "Constant after the values for a key that is not Linear";
+        return false;
+    }
+    if (Curve.Keys.empty()) { *Err = Qual + ": " + Macro + " has no keys: write them after the name, " + Shape + ", ..."; return false; }
+
+    const std::string PackageName = PathIn(ModPackage, Qual), AssetName = LeafOf(Qual);
+    const std::string ClassName = Kind == 'V' ? "CurveVector" : Kind == 'C' ? "CurveLinearColor" : "CurveFloat";
+    FPackage P(PackageName);
+    StampIdentity(P, PackageName);
+    FBlueprintClass BP(P, AssetName, "", "", false);
+    const FIndex Cdo = BP.ClassDefaultObject("/Script/Engine", ClassName);
+    BP.FinishCurve(BP.EngineClass("/Script/Engine", ClassName), Cdo, Curve);
+    if (!SavePackage(P, OutDir, PackageName, Err)) return false;
+    RegistryRows.push_back({ PackageName, AssetName, ClassName });
+    printf("  %-14s -> %s.uasset  (curve, %d key%s)\n", AssetName.c_str(), Shown(PackageName).c_str(), int32(Curve.Keys.size()),
+           Curve.Keys.size() == 1 ? "" : "s");
+    return true;
+}
+
 /*
 S38 - UE_ASSET_EDIT(Asset) { .Member = value, ... }: the members the braces name, written into Asset's own package as
 the game cooked it. The target is a UE_ASSET_AT; a mod's own asset takes its values where it is declared.
@@ -14711,11 +15610,29 @@ bool FCompiler::GeneratePatch(const FRecord& R, std::string* Err)
     }
     /* Every one the patch declares: Collect leaves out the implicit ones. */
     const bool bMethods = !R.Methods.empty();
-    if (!R.Fields.empty() || !R.Interfaces.empty())
-    { *Err = Where + ": a patch edits its parent's defaults and replaces its functions; a member or an interface of its own is not built yet"; return false; }
+    /* A variable of its own is a property added to the game's class (TransplantFunctions); one the class's construction
+       script or widget tree would have to make, or the replication layout would have to list, is not. */
+    if (!R.Components.empty() || !R.Widgets.empty())
+    {
+        *Err = Where + "::" + (R.Components.empty() ? R.Widgets.front() : *R.Components.begin()) + ": a patch adds no "
+               "component or widget to the game's class (its construction script and widget tree stay the game's); spawn "
+               "one at run time, or declare a class of your own";
+        return false;
+    }
+    for (const Json* F : R.Fields)
+    {
+        if (StripTypeKeywords(TypeOf(*F)).compare(0, 25, "TMulticastInlineDelegate<") == 0)
+        { *Err = Where + "::" + Name(*F) + ": a patch adds no dispatcher to the game's class; declare a class of your own"; return false; }
+        if (R.Replicated.count(Name(*F)))
+        {
+            *Err = Where + "::" + Name(*F) + ": a patch's own member does not replicate: it would renumber the class's "
+                   "replicated properties against an unpatched client's or server's; leave out UE_REPLICATED";
+            return false;
+        }
+    }
     const Json* Body = nullptr;
     if (R.Defaults) ForEach(*R.Defaults, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Body = &C; });
-    if (!Body && !bMethods)
+    if (!Body && !bMethods && R.Fields.empty() && R.Interfaces.empty())
     {
         *Err = Where + ": nothing to edit - a patch's defaults go in UE_DEFAULTS { Field = value; }, and its methods replace "
                "the Blueprint's functions of the same name";
@@ -14723,7 +15640,9 @@ bool FCompiler::GeneratePatch(const FRecord& R, std::string* Err)
     }
     /* The defaults first: the functions' names are written against the table the tags leave. */
     if (Body && !PatchDefaults(*B, *Body, Where, Err)) return false;
-    return !bMethods || Generate(R, std::string(), Err);
+    PatchVars.clear();
+    PatchInterfaces.clear();
+    return (!bMethods && R.Fields.empty() && R.Interfaces.empty()) || Generate(R, std::string(), Err);
 }
 
 /* The patch's UE_DEFAULTS, as tags of the Blueprint Bp's own package. */
@@ -14751,7 +15670,8 @@ bool FCompiler::PatchDefaults(const FRecord& Bp, const Json& Body, const std::st
         if (!DefaultPath(S, Lhs, Rhs, Through, Steps))
         {
             *Err = Where + ": every statement is `Field = value;` or `Component->Field = value;`, or assigns part of one: "
-                   "`Field.Member = value;`, `Field[2] = value;`";
+                   "`Field.Member = value;`, `Field[2] = value;`, or changes one element of a map or set: `Map[Key] = value;`, "
+                   "`Set.Add(Item);`, `Map.Remove(Key);`";
             bOk = false;
             return;
         }
@@ -14784,6 +15704,7 @@ bool FCompiler::PatchDefaults(const FRecord& Bp, const Json& Body, const std::st
         if (!DR) { *Err = Where + ": cannot tell which class declares " + Name(*Lhs); bOk = false; return; }
         FEditDef Edit;
         bOk = EditAssignment(*Lhs, *DR, Steps, Rhs, Where, BP, Edit, Err);
+        Edit.bFresh = DR->bIsPatch;         // the patch's own member, added to the class (TransplantFunctions)
         if (bOk) Objects[Object].push_back(std::move(Edit));
     });
     if (!bOk) return false;
@@ -14802,14 +15723,63 @@ bool FCompiler::EditAssignment(const Json& Root, const FRecord& Declarer, const 
     Out.Chain.emplace_back();
     if (!TypeToProperty(TypeOf(Root), UeNameOf(&Declarer, Name(Root)), 0, Where, BP, &Out.Chain.back(), Err)) return false;
     std::string Path = Name(Root);
-    for (const Json* Step : Steps)
+    /* One element of a TMap or TSet: `Score["a"] = 1` (the last step a map's key), `Score.Add("a", 1)`, `Ids.Add(7)`,
+       `X.Remove(Key)` (Rhs the call). */
+    const Json* Key = nullptr;
+    const Json* Value = nullptr;
+    const Json *Container = nullptr, *Call = nullptr;
+    if (Rhs && ElementCall(*Rhs, Container, Call))
     {
+        Out.Op = Name(*Strip(First(*Call))) == "Remove" ? FEditDef::Remove : FEditDef::Add;
+        Key = Nth(*Call, 1);
+        Value = Out.Op == FEditDef::Add ? Nth(*Call, 2) : nullptr;
+    }
+    for (size_t S = 0; S < Steps.size(); ++S)
+    {
+        const Json* Step = Steps[S];
         FConstVal I;
         const Json* Index = Kind(*Step) == "MemberExpr" ? nullptr : Nth(*Step, 2);
+        if (Index && Out.Chain.back().Type == "MapProperty")
+        {
+            Path += "[...]";
+            if (S + 1 != Steps.size() || Out.Op != FEditDef::Assign)
+            { *Err = Where + ": " + Path + ": a map's value is assigned whole, `Map[Key] = value;`"; return false; }
+            Out.Op = FEditDef::Put;
+            Key = Index;
+            Value = Rhs;
+            break;
+        }
         Path += Index ? "[" + (FoldConst(*Index, I) ? std::to_string(I.I) : std::string("...")) + "]" : "." + Name(*Step);
         FPropertyDef Reached;
         if (!EditStep(*Step, Out.Chain.back(), Where + ": " + Path, BP, Out.Path.emplace_back(), Reached, Err)) return false;
         Out.Chain.push_back(std::move(Reached));
+    }
+    if (Out.Op != FEditDef::Assign)
+    {
+        FPropertyDef& C = Out.Chain.back();
+        const bool bMap = C.Type == "MapProperty" && C.Value;
+        if ((!bMap && C.Type != "SetProperty") || !C.Inner || !Key || (Out.Op != FEditDef::Remove && bMap && !Value))
+        { *Err = Where + ": " + Path + ": an element is a TMap's or a TSet's"; return false; }
+        /* Through members of structs written as tags alone: an element is merged into the value the object holds. */
+        for (const FValueStep& Step : Out.Path)
+            if (!Step.IsTaggedMember())
+            {
+                *Err = Where + ": " + Path + ": an element of a map or set inside an array's element or a native struct "
+                       "cannot be changed on its own yet; assign the whole element";
+                return false;
+            }
+        const Json& Decl = Steps.empty() ? Root : *Steps.back();
+        C.Default = FDefaultValue{};
+        C.Default.K = FDefaultValue::Array;
+        for (const auto& [Def, E] : { std::pair<const FPropertyDef*, const Json*>{ C.Inner.get(), Key }, { C.Value.get(), Value } })
+        {
+            if (!E) continue;
+            FPropertyDef Element = *Def;
+            if (!LowerDefault(Decl, Element, BP, Err, Strip(E), /*bKeepZero=*/true)) return false;
+            C.Default.Items.push_back(Element.Default);
+            C.Default.Items.back().Members = Element.Members;      // a struct element's members travel with it
+        }
+        return true;
     }
     if (!LowerDefault(Steps.empty() ? Root : *Steps.back(), Out.Chain.back(), BP, Err, Rhs, /*bKeepZero=*/true)) return false;
     if (Out.Chain.back().Default.K == FDefaultValue::None) { *Err = Where + ": " + Path + " needs a literal value"; return false; }
@@ -14845,7 +15815,8 @@ bool FCompiler::GenerateAssetEdits(const Json& Block, std::string* Err)
         if (!AssetPath(S, Asset, Root, Rhs, Steps) || !Asset->contains("referencedDecl"))
         {
             *Err = Where + ": every statement assigns an asset's member, or part of one: `Asset.Member = value;`, "
-                   "`Asset.Member[2].Field = value;`";
+                   "`Asset.Member[2].Field = value;`, or changes one element of a map or set: `Asset.Map[Key] = value;`, "
+                   "`Asset.Set.Add(Item);`, `Asset.Map.Remove(Key);`";
             bOk = false;
             return;
         }
@@ -15442,6 +16413,7 @@ bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object,
     };
     for (FEditDef& E : Edits)
     {
+        if (E.Op != FEditDef::Assign || E.bFresh) continue;     // merged into the object's own value below; or no archetype has it
         std::vector<std::string> Path{ E.Chain[0].Name };
         bool bTagged = true;
         for (const FValueStep& S : E.Path)
@@ -15463,8 +16435,7 @@ bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object,
     auto Bytes = [&](const auto& Write) { FArc Ar(&Sink); Write(Ar); return Ar.B; };
     std::vector<std::vector<std::vector<uint8>>> Fresh(Edits.size());
     std::vector<std::vector<uint8>> Leaf(Edits.size());
-    for (size_t I = 0; I < Edits.size(); ++I)
-    {
+    auto Encode = [&](size_t I) {
         const FEditDef& E = Edits[I];
         const size_t N = E.Path.size();
         Fresh[I].resize(N + 1);
@@ -15484,7 +16455,9 @@ bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object,
                 Fresh[I][K] = Bytes([&](FArc& Ar) { WriteDefaultTag(Ar, Tree); TagEnd(Ar); });
         }
         if (N && !E.Path.back().IsTaggedMember()) Leaf[I] = Bytes([&](FArc& Ar) { WriteDefaultValue(Ar, E.Chain[N]); });
-    }
+    };
+    for (size_t I = 0; I < Edits.size(); ++I)
+        if (Edits[I].Op == FEditDef::Assign) Encode(I);
     for (size_t I = P.Names.size(); I < Sink.NameTable().size(); ++I) P.Names.push_back({ Sink.NameTable()[I] });
 
     /* In statement order, so a later assignment lands on what an earlier one wrote. */
@@ -15492,6 +16465,15 @@ bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object,
     bool bWhole = true;
     for (size_t I = 0; I < Edits.size(); ++I)
     {
+        if (Edits[I].Op != FEditDef::Assign && !MergeElement(P, Export, Edits[I], Where, Err)) return false;
+        if (Edits[I].Op != FEditDef::Assign)
+        {
+            Texts.clear();
+            for (const FCookedName& N : P.Names) Texts.push_back(N.Text);
+            Sink.SeedNames(Texts);
+            Encode(I);
+            for (size_t K = P.Names.size(); K < Sink.NameTable().size(); ++K) P.Names.push_back({ Sink.NameTable()[K] });
+        }
         if (Edits[I].Path.empty())
         {
             std::vector<FTag> Tags;
@@ -15511,6 +16493,80 @@ bool FCompiler::ApplyEdit(const std::string& Package, const std::string& Object,
     Ed->Objects.push_back(Object + " (" + std::to_string(Edits.size()) + (Edits.size() == 1 ? " assignment)" : " assignments)"));
     for (const std::string& D : Dropped)
         Ed->Objects.push_back(D + " (its cooked instancing data for " + Object + " no longer valid: it did not list the edit)");
+    return true;
+}
+
+/*
+S38: an element of a TMap or TSet put, added or removed (Edit.Op), as the set or map the path names in export row Export
+of P stands: its tag, whole. That tag is a delta over the archetype's value (removed keys, then the elements added or
+changed: PropertySet.cpp 285-358, PropertyMap.cpp 316-400), so the element is merged into it: a put or an add replaces
+the element of that key, else is added after the rest (a set's element already there stays); a remove drops it from the
+added ones and lists the key as removed, which takes the archetype's out too and is harmless where it has none. Where
+the object has no tag of the value, it holds the archetype's whole, and the delta of the one element is all the tag
+says. Keys compare as LastValuePerKey compares them. Edit's last def becomes the merged value, for ApplyEdit to write.
+*/
+bool FCompiler::MergeElement(const FCookedPackage& P, int32 Export, FEditDef& Edit, const std::string& Where, std::string* Err) const
+{
+    FPropertyDef& Want = Edit.Chain.back();
+    /* The tag there, through the members of structs written as tags (EditAssignment refuses any other path). */
+    std::vector<FTag> Tags;
+    size_t At = 0;
+    if (!ReadTags(P, P.Exports[size_t(Export)].Payload, At, Tags)) { *Err = Where + ": the object's tags do not read"; return false; }
+    const FTag* Found = nullptr;
+    std::vector<FTag> Inside;
+    for (size_t K = 0; K <= Edit.Path.size(); ++K)
+    {
+        const std::string& Member = K == 0 ? Edit.Chain[0].Name : Edit.Path[K - 1].Member;
+        const auto It = std::find_if(Tags.begin(), Tags.end(), [&](const FTag& T) { return T.ArrayIndex == 0 && P.SameName(T.Name, Member); });
+        Found = It == Tags.end() ? nullptr : &*It;
+        if (!Found || K == Edit.Path.size()) break;
+        Inside.clear();
+        At = 0;
+        if (!ReadTags(P, Found->Value, At, Inside)) { *Err = Where + ": " + Member + " is not a struct written as tags"; return false; }
+        Tags = std::move(Inside);
+    }
+    FPropertyDef Had;
+    std::string Why;
+    if (Found && !ReadTagValue(P, *Found, Had, &Why))
+    { *Err = Where + ": " + Want.Name + ": the value the object holds does not read (" + Why + "), so an element cannot be merged into it"; return false; }
+    if (!Found)
+    {
+        Had = Want;
+        Had.Default = FDefaultValue{};
+        Had.Default.K = FDefaultValue::Array;
+    }
+    const bool bMap = Had.Type == "MapProperty" && Had.Value;
+    if (!Had.Inner || (Had.Type != "MapProperty" && Had.Type != "SetProperty"))
+    { *Err = Where + ": " + Want.Name + " holds a " + Had.Type + " there, not a map or a set"; return false; }
+
+    FPackage Scratch("/Scratch");
+    Scratch.SeedNames({});
+    auto KeyOf = [&](const FDefaultValue& V) {
+        FPropertyDef E = *Had.Inner;
+        E.Default = V;
+        if (E.Type == "StrProperty") E.Default.S = Lower(V.S);
+        FArc A(&Scratch);
+        WriteDefaultValue(A, E);
+        return A.B;
+    };
+    std::vector<FDefaultValue>& Items = Had.Default.Items;
+    const std::vector<uint8> Key = KeyOf(Want.Default.Items[0]);
+    if (Edit.Op == FEditDef::Remove)
+    {
+        const size_t Step = bMap ? 2 : 1;
+        for (size_t I = 0; I + Step <= Items.size();)
+            if (KeyOf(Items[I]) == Key) Items.erase(Items.begin() + std::ptrdiff_t(I), Items.begin() + std::ptrdiff_t(I + Step));
+            else I += Step;
+        if (std::none_of(Had.Default.Removed.begin(), Had.Default.Removed.end(), [&](const FDefaultValue& R) { return KeyOf(R) == Key; }))
+            Had.Default.Removed.push_back(Want.Default.Items[0]);
+    }
+    else
+    {
+        Items.insert(Items.end(), Want.Default.Items.begin(), Want.Default.Items.end());
+        LastValuePerKey(Items, bMap, *Had.Inner);
+    }
+    Had.Name = Want.Name;
+    Want = std::move(Had);
     return true;
 }
 
@@ -15669,6 +16725,15 @@ bool FCompiler::TransplantFunctions(const FRecord& R, const FRecord& B, const FP
     {
         if (!IsFunction(F)) continue;
         const int32 Fn = P.FindExport(F.ObjectName, ClassExport + 1);
+        /* An interface the patch adds gives the scratch a stub of each function the patch leaves out: one the class has
+           already would replace the game's body with nothing. */
+        if (Fn >= 0 && std::none_of(R.Methods.begin(), R.Methods.end(), [&](const auto& M) { return Lower(UeNameOf(&R, M.first)) == Lower(F.ObjectName); }))
+        {
+            *Err = Where + ": " + Class + " has a function " + F.ObjectName + " already, which the interface the patch adds "
+                   "would replace with an empty one; write the method in the patch (`Parent::" + F.ObjectName + "()` runs "
+                   "the game's)";
+            return false;
+        }
         if (Fn >= 0 && P.ClassNameOf(P.Exports[size_t(Fn)].Class) == "Function") continue;
         if (Fn >= 0)
         {
@@ -15706,6 +16771,13 @@ bool FCompiler::TransplantFunctions(const FRecord& R, const FRecord& B, const FP
                 for (const FIndex I : { F.ClassIndex, F.TemplateIndex, SuperOf(F) }) if (I.V < 0) Named.insert(I.V);
             }
         Named.insert(InBodies.begin(), InBodies.end());
+        {
+            FPackage Types(Package);        // what the patch's own variables name: a struct, a class, an enum
+            Types.RemapIndex = [&](FIndex V) { if (V.V < 0) Named.insert(V.V); return V; };
+            FArc Ar(&Types);
+            for (const FPropertyDef& V : PatchVars) WriteProperty(Ar, V);
+            for (const FIndex I : PatchInterfaces) if (I.V < 0) Named.insert(I.V);
+        }
         for (int32 I : Named)
             if (!IsOwn(FIndex{ I }) && !ImportInto(P, Package, Scratch, I, Moved, &Bad)) { *Err = Where + ": " + Bad; return false; }
     }
@@ -15926,6 +16998,73 @@ bool FCompiler::TransplantFunctions(const FRecord& R, const FRecord& B, const FP
         Out.resize(Out.size() + 8, 0);                                                      // no event-graph link
         P.Exports[size_t(Fn)].Payload = std::move(Out);
         Ed->Objects.push_back(Class + "::" + F.ObjectName + " (replaced)");
+    }
+
+    /* The patch's own variables, appended to the class's ChildProperties: a cooked property carries no offset, and
+       Link lays the class out again as it loads, the class's own after its parent's (FProperty::SetupOffset), and each
+       game subclass after it. Its interfaces join the class's Interfaces list as the editor writes one (PointerOffset 0,
+       bImplementedByK2). Each value an initializer gives is a tag of the default object, which a subclass's default
+       object and every instance start from. */
+    if (!PatchVars.empty() || !PatchInterfaces.empty())
+    {
+        FClassLayout L;
+        if (!ReadClassLayout(P, P.Exports[size_t(ClassExport)].Payload, L))
+        { *Err = Where + ": " + Class + "'s payload does not read as a cooked class"; return false; }
+        for (const FPropertyDef& V : PatchVars)
+            for (const auto& Fd : L.Fields)
+                if (Lower(P.NameOf(Fd.Name)) == Lower(V.Name))
+                { *Err = Where + "::" + V.Name + ": " + Class + " already has a variable " + P.NameOf(Fd.Name) + "; rename it"; return false; }
+        Replacing = ClassExport + 1;
+        FArc Ar(&Sink);
+        std::vector<int32> Named;
+        Sink.Recording = &Named;
+        for (const FPropertyDef& V : PatchVars) WriteProperty(Ar, V);
+        const size_t PropBytes = Ar.B.size();
+        for (const FIndex I : PatchInterfaces) { Ar.Idx(I); Ar.I32(0); Ar.Bool(true); }
+        Sink.Recording = nullptr;
+        if (!Bad.empty()) { *Err = Where + ": " + Bad; return false; }
+        for (size_t I = P.Names.size(); I < Sink.NameTable().size(); ++I) P.Names.push_back({ Sink.NameTable()[I] });
+        std::vector<uint8>& Cls = P.Exports[size_t(ClassExport)].Payload;
+        /* The Interfaces count: past the FuncMap, ClassFlags, ClassWithin, ClassConfigName and ClassGeneratedBy. */
+        const size_t IfaceCount = L.AfterFuncMap + 20;
+        int32 Ifaces = 0;
+        std::memcpy(&Ifaces, Cls.data() + IfaceCount, 4);
+        for (size_t K = 0; K < PatchInterfaces.size(); ++K)
+            for (int32 J = 0; J < Ifaces; ++J)
+                if (std::memcmp(Cls.data() + IfaceCount + 4 + size_t(J) * 12, Ar.B.data() + PropBytes + K * 12, 4) == 0)
+                { *Err = Where + ": " + Class + " implements " + Scratch.ImportAt(PatchInterfaces[K])->ObjectName + " already"; return false; }
+        Cls.insert(Cls.begin() + std::ptrdiff_t(IfaceCount + 4 + size_t(Ifaces) * 12), Ar.B.begin() + std::ptrdiff_t(PropBytes), Ar.B.end());
+        const int32 NewIfaces = Ifaces + int32(PatchInterfaces.size());
+        std::memcpy(Cls.data() + IfaceCount, &NewIfaces, 4);
+        Cls.insert(Cls.begin() + std::ptrdiff_t(L.Script), Ar.B.begin(), Ar.B.begin() + std::ptrdiff_t(PropBytes));
+        const int32 Props = int32(L.Fields.size() + PatchVars.size());
+        std::memcpy(Cls.data() + L.Properties, &Props, 4);
+        /* What the new bytes name is created before the class is serialized, as Save lists what a payload names. */
+        std::array<std::vector<int32>, 4> Deps = P.Dependencies(ClassExport);
+        for (int32 V : Named)
+            if (V != 0 && V != Replacing && !InCoreUObject(V) && std::find(Deps[1].begin(), Deps[1].end(), V) == Deps[1].end()
+                && std::find(Deps[2].begin(), Deps[2].end(), V) == Deps[2].end())
+                Deps[1].push_back(V);
+        P.SetDependencies(ClassExport, Deps);
+        for (const FPropertyDef& V : PatchVars) Ed->Objects.push_back(Class + "::" + V.Name + " (added, a variable)");
+        for (const FIndex I : PatchInterfaces) Ed->Objects.push_back(Class + " implements " + Scratch.ImportAt(I)->ObjectName + " (added)");
+
+        /* Their initializers, unless the patch's UE_DEFAULTS set the member already (it runs as the constructor would,
+           after them). */
+        std::vector<FTag> Tags;
+        size_t At = 0;
+        const int32 Cdo = P.FindExport("Default__" + Class);
+        if (Cdo < 0 || !ReadTags(P, P.Exports[size_t(Cdo)].Payload, At, Tags))
+        { *Err = Where + ": " + Package + "'s Default__" + Class + " does not read"; return false; }
+        std::vector<FEditDef> Inits;
+        for (const FPropertyDef& V : PatchVars)
+            if (V.Default.K != FDefaultValue::None
+                && std::none_of(Tags.begin(), Tags.end(), [&](const FTag& T) { return Lower(P.NameOf(T.Name)) == Lower(V.Name); }))
+            {
+                Inits.push_back(FEditDef{ { V }, {} });
+                Inits.back().bFresh = true;
+            }
+        if (!Inits.empty() && !ApplyEdit(Package, "Default__" + Class, Inits, Scratch, Where, Err)) return false;
     }
 
     /* A ReceiveTick the patch adds is an event the class did not have, and the editor's compiler sets the default
@@ -16185,6 +17324,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                         if (Mine == Theirs)
                         { *Err = R.CppName + " implements " + Other + " and " + I + ", which both extend " + Mine->CppName; return false; }
         BP.AddInterface(ClassImportOf(*IR, BP));
+        if (R.bIsPatch) PatchInterfaces.push_back(ClassImportOf(*IR, BP));
     }
     if (!AddInputBindings(R, bIsActor, BP, Err)) return false;
     if (!AddTimelines(R, bIsActor, BP, Err)) return false;
@@ -16923,7 +18063,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         }
         FPropertyDef PD;
         std::string PErr;
-        if (!TypeToProperty(TypeOf(*F), FieldName, 0, "property " + FieldName, BP, &PD, &PErr))
+        /* Named by its `__UeName` marker where it has one: a variable rebuilt from an editor's ("Log Service"). */
+        if (!TypeToProperty(TypeOf(*F), UeNameOf(&Decl, FieldName), 0, "property " + FieldName, BP, &PD, &PErr))
         { *Err = PErr; return false; }
         if (!LowerDefault(*F, PD, BP, Err)) return false;
         /* UE_DEFAULTS naming an interface's variable is this class's own default for it. */
@@ -17089,6 +18230,10 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     }
     std::stable_sort(ClassVars.begin(), ClassVars.end(), [](const auto& A, const auto& B) { return A.first > B.first; });
     for (const auto& V : ClassVars) BP.AddVariable(V.second);
+    if (R.bIsPatch)     // its own and its interfaces' variables, not a DefaultSceneRoot the game's class already has
+        for (const auto& V : ClassVars)
+            if (std::any_of(OwnedFields.begin(), OwnedFields.end(), [&](const FOwnedField& O) { return Name(*O.F) == V.second.Name; }))
+                PatchVars.push_back(V.second);
 
     /* S39: each widget but the root sits in a panel or fills a nested widget's named slot, and that one in the tree. One
        nothing holds, or a ring of them holding one another, is out of the tree the engine walks from its root
@@ -17549,11 +18694,21 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             while (!RetType.empty() && (RetType.back() == ' ' || RetType.back() == '\t'))
                 RetType.pop_back();
         }
+        /* A reference return (DESIGN.md): a non-const T& returns the address, and every call is memory at it; a const T&
+           returns a copy. */
+        CurRefReturn.clear();
         if (!RetType.empty() && RetType.back() == '&')
         {
-            *Err = R.CppName + "::" + Fn.Name + " returns " + RetType + ": a reference return is refused until what it "
-                   "means to a C++ caller is specified; return a value or a pointer";
-            return false;
+            RetType.pop_back();
+            while (!RetType.empty() && RetType.back() == ' ') RetType.pop_back();
+            if (RetType.compare(0, 6, "const ") == 0)
+                printf("  warning: %s::%s returns %s&: a Blueprint function returns a copy, which a caller keeping the "
+                       "reference does not see change\n", R.CppName.c_str(), Fn.Name.c_str(), RetType.c_str());
+            else
+            {
+                CurRefReturn = StripTypeKeywords(RetType);
+                RetType = "int64";
+            }
         }
         if (!RetType.empty() && RetType != "void")
         {
@@ -17667,7 +18822,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
            wait dies with the call, after which a collection takes the proxy and its dispatchers never fire; so it is
            stored into a transient member too, one per local, as the editor's frame keeps one per node. A waiting
            function's locals are the frame's already. */
-        if (!bMadeLatentCall && !R.bIsPatch)
+        if (!bMadeLatentCall)
             ForEachStmt(Stmts, [&](std::vector<FStmtIR>& List, size_t I) {
                 const FStmtIR& St = List[I];
                 if ((St.K != FStmtIR::Decl && St.K != FStmtIR::Assign) || St.Var.K != FArgIR::Local
@@ -17855,8 +19010,6 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 printf("  warning: %s::%s waits, and an object of this class finds its world only through its Outer: make "
                        "it with an actor or component as Outer, or the call does nothing and the function never resumes\n",
                        R.CppName.c_str(), Fn.Name.c_str());
-            if (bScratchNeeded)
-            { *Err = R.CppName + "::" + Fn.Name + ": TODO: a pointer read in a function that makes a latent call"; return false; }
             WarnFrameWeakLocals(Stmts, R.CppName + "::" + Fn.Name);
             FSegment Seg{ Fn.Name, Super, {}, Locals, Stmts, Flags, {}, Completions };
             Seg.Parms.assign(Params.begin(), Params.end() - Locals.size());
@@ -17865,6 +19018,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         }
 
         if (auto Cat = R.Categories.find(Fn.Name); Cat != R.Categories.end()) BP.ApiCategory[UeNameOf(&R, Fn.Name)] = Cat->second;
+        if (auto Doc = R.Docs.find(Fn.Name); Doc != R.Docs.end()) BP.ApiDocs[UeNameOf(&R, Fn.Name)] = Doc->second;
         /* A patch's method is written over the function it overrides (TransplantFunctions), which keeps its own super:
            naming it here would make the function its own parent. One B lacks is added with this super. */
         if (R.bIsPatch) PatchSupers[R.CppName + "::" + UeNameOf(&R, Fn.Name)] = Super;
@@ -17889,12 +19043,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
     }
 
     for (const FPropertyDef& Held : HeldProxies) BP.AddVariable(Held);
-    if (!Segments.empty() && R.bIsPatch)
-    {
-        *Err = R.CppName + " (UE_PATCH)::" + Segments.front().Name + ": a patched function that waits (a latent call) needs "
-               "an ubergraph of its own in the game's class; not built yet";
-        return false;
-    }
+    if (R.bIsPatch)
+        for (const FPropertyDef& Held : HeldProxies) PatchVars.push_back(Held);
     if (!Segments.empty())
     {
         const std::string UberName = "ExecuteUbergraph_" + R.CppName;    // CheckMemberNames refuses a member named so
@@ -17929,11 +19079,43 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 }
             FLocalRenamer{ Seg.Rename }.List(Seg.Stmts);
         }
+        /* A patch's ubergraph is not the class's: the engine keeps a persistent frame for that one alone
+           (UBlueprintGeneratedClass::GetPersistentUberGraphFrame matches UberGraphFunction), and calls any other with a
+           fresh one, so what must last across a wait would be lost. Its frame is members of the class instead, transient
+           as the frame is: each read of one is EX_InstanceVariable, each store an EX_Let of it (FScript::FrameMembers).
+           Only EntryPoint, its parameter, stays a property of the function. A second wait on one object while the first
+           is pending shares them, as a Blueprint's ubergraph frame is shared. */
+        std::shared_ptr<std::map<std::string, EExprToken>> AsMembers;
+        if (R.bIsPatch)
+        {
+            AsMembers = std::make_shared<std::map<std::string, EExprToken>>();
+            for (size_t I = 1; I < Frame.size(); ++I)
+            {
+                FPropertyDef M = Frame[I];
+                M.PropertyFlags |= CPF_Transient | CPF_DuplicateTransient;
+                M.Default = {};
+                const std::string& T = M.Type;
+                (*AsMembers)[M.Name] = T == "BoolProperty" ? EX_LetBool : T == "ObjectProperty" || T == "ClassProperty" ? EX_LetObj
+                                     : T == "WeakObjectProperty" ? EX_LetWeakObjPtr : T == "DelegateProperty" ? EX_LetDelegate
+                                     : T == "MulticastInlineDelegateProperty" ? EX_LetMulticastDelegate : EX_Let;
+                BP.AddVariable(M);
+                PatchVars.push_back(M);
+            }
+            Frame.resize(1);
+        }
+        const FIndex Members = R.bIsPatch ? BP.ClassIndex() : FIndex{};
+        auto Redirect = [AsMembers, Members](FScript& S, FIndex Uber) {
+            S.FrameMembers = AsMembers;
+            S.FrameOwner = Uber;
+            S.MemberClass = Members;
+        };
 
         /* Measured: a computed jump on EntryPoint, each event's code at the offset its stub passes. A segment ends in
            a return where the editor pops back to its one pushed return. */
         auto Entries = std::make_shared<std::vector<int32>>(Segments.size());
-        const FIndex Uber = BP.AddFunction(UberName, Null(), Frame, [Segments, Entries](FScript& S, FIndex SelfExp) {
+        const uint32 UberFlags = R.bIsPatch ? uint32(FUNC_Final) : uint32(FUNC_UbergraphFunction | FUNC_HasDefaults | FUNC_Final);
+        const FIndex Uber = BP.AddFunction(UberName, Null(), Frame, [Segments, Entries, Redirect](FScript& S, FIndex SelfExp) {
+            Redirect(S, SelfExp);
             S.ComputedJump([SelfExp](FScript& C) { C.LocalVariable("EntryPoint", SelfExp); });
             for (size_t I = 0; I < Segments.size(); ++I)
             {
@@ -17942,7 +19124,7 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 S.Return();
             }
             S.EndOfScript();
-        }, FUNC_UbergraphFunction | FUNC_HasDefaults | FUNC_Final);
+        }, UberFlags);
 
         /* The stubs follow the ubergraph, so its body (and Entries) is written first. Measured on BP_LiftPod's
            OnCompleted_*: each parm copied into the frame, then EX_LocalFinalFunction ExecuteUbergraph(offset). A const
@@ -17953,8 +19135,11 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             std::vector<std::tuple<std::string, std::string, bool>> Copies;
             for (const FPropertyDef& P : Segments[I].Parms)
                 Copies.emplace_back(P.Name, Segments[I].Rename.at(P.Name), (P.PropertyFlags & CPF_OutParm) != 0);
-            BP.AddFunction(UeNameOf(&R, Segments[I].Name), Segments[I].Super, Segments[I].Parms,
-                           [Copies, Uber, Entries, I](FScript& S, FIndex SelfExp) {
+            /* A patch's stub takes the game function's super, or the one it overrides, in TransplantFunctions. */
+            if (R.bIsPatch) PatchSupers[R.CppName + "::" + UeNameOf(&R, Segments[I].Name)] = Segments[I].Super;
+            BP.AddFunction(UeNameOf(&R, Segments[I].Name), R.bIsPatch ? Null() : Segments[I].Super, Segments[I].Parms,
+                           [Copies, Uber, Entries, I, Redirect](FScript& S, FIndex SelfExp) {
+                Redirect(S, Uber);
                 for (const auto& [From, To, bRef] : Copies)
                     S.LetValueOnPersistentFrame(To, Uber, [&, From, bRef](FScript& V) {
                         if (bRef) V.LocalOutVariable(From, SelfExp); else V.LocalVariable(From, SelfExp); });
@@ -17976,7 +19161,8 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 for (size_t I = 0; I < C.Locals.size() && I < C.Parms.size(); ++I)
                     if (!C.Locals[I].empty()) Stores.emplace_back(Seg.Rename.at(C.Locals[I]), C.Parms[I].Name);
                 const std::shared_ptr<int32> Resume = C.Resume;
-                BP.AddFunction(C.Event, Null(), C.Parms, [Stores, Resume, Uber](FScript& S, FIndex SelfExp) {
+                BP.AddFunction(C.Event, Null(), C.Parms, [Stores, Resume, Uber, Redirect](FScript& S, FIndex SelfExp) {
+                    Redirect(S, Uber);
                     for (const auto& Store : Stores)
                         S.LetValueOnPersistentFrame(Store.first, Uber, [&](FScript& V) { V.LocalVariable(Store.second, SelfExp); });
                     if (Resume)
@@ -17991,15 +19177,18 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             }
 
         /* Measured on BP_LiftPod: a transient FPointerToUberGraphFrame the class links by this name. */
-        FPropertyDef FramePtr;
-        FramePtr.Type = "StructProperty";
-        FramePtr.Name = "UberGraphFrame";
-        FramePtr.ElementSize = 16;
-        FramePtr.PropertyFlags = CPF_Transient | CPF_DuplicateTransient;
-        FramePtr.Extra = BP.ScriptStruct("/Script/Engine", "PointerToUberGraphFrame");
-        FramePtr.StructName = "PointerToUberGraphFrame";
-        BP.AddVariable(FramePtr);
-        BP.SetUberGraphFunction(Uber);
+        if (!R.bIsPatch)
+        {
+            FPropertyDef FramePtr;
+            FramePtr.Type = "StructProperty";
+            FramePtr.Name = "UberGraphFrame";
+            FramePtr.ElementSize = 16;
+            FramePtr.PropertyFlags = CPF_Transient | CPF_DuplicateTransient;
+            FramePtr.Extra = BP.ScriptStruct("/Script/Engine", "PointerToUberGraphFrame");
+            FramePtr.StructName = "PointerToUberGraphFrame";
+            BP.AddVariable(FramePtr);
+            BP.SetUberGraphFunction(Uber);
+        }
     }
 
     if (bReplicatesAnything) BP.SetReplicates(true);
@@ -18790,6 +19979,15 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
        UeDefaultSubobjects and no UeClassTail, which reads the same as a Blueprint with none of either. */
     UeApiWithoutGame = Stamp.contains("game") && Stamp["game"].is_boolean() && Stamp["game"].get<bool>() ? std::string()
                                                                                                           : IncludeDir;
+    /* S40: the engine the UeApi's dump is of, which every package this compile writes is laid out for. A stamp from
+       before S40 has none and is DRG's 4.27. */
+    const std::string Engine = Stamp.contains("ue") && Stamp["ue"].is_string() ? Stamp["ue"].get<std::string>() : "4.27";
+    if (Engine != "4.27" && Engine != "5.6")
+    {
+        *Err = IncludeDir + " is a UE " + Engine + " UeApi; assetgen writes UE 4.27 and 5.6 packages only";
+        return false;
+    }
+    Uasset::GEngine = Engine == "5.6" ? Uasset::EEngine::UE56 : Uasset::EEngine::UE427;
     if (!ParseClangAst(ClangCommand(SourcePath, IncludeDir), SourcePath, &Doc, Err)) return false;
 
     if (!LoadTables(IncludeDir, Err)) return false;
@@ -18919,6 +20117,9 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
         const Json& T = D->second->contains("type") ? (*D->second)["type"] : Json::object();
         const FRecord* R = Find(StripTypeKeywords(T.value("desugaredQualType", T.value("qualType", std::string()))));
         if (!R || R->bIsStruct || !R->IsGenerated()) continue;
+        /* An asset in this mod's own folder (one bpbuild ships as cooked, `kept:`) is an instance of the class this
+           mod cooks: its import names the class at the same path. */
+        if (Lower(Path).rfind(Lower(ModPackage) + "/", 0) == 0) continue;
         const std::string Leaf = LeafOf(R->CppName);
         *Err = Qual + " at " + Path + " is a " + R->CppName + ", which this mod cooks its own copy of, so it would load as null: "
                "name the class's owner where it is declared, e.g. UE_CLASS(\"" + Path.substr(0, Path.rfind('/') + 1) + Leaf
@@ -19005,11 +20206,13 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     }
     for (const Json* Var : AssetDecls)
         if (!GenerateAsset(*Var, OutDir, Err)) return false;
+    for (const auto& Entry : ModCurves)
+        if (!GenerateCurve(Entry.first, OutDir, Err)) return false;
     for (const auto& [Key, Var] : Edits)
         if (!GenerateEdit(Key, *Var, Err)) return false;
     for (const Json* Block : AssetEditBlocks)
         if (!GenerateAssetEdits(*Block, Err)) return false;
-    if (!SaveEdits(OutDir, Err)) return false;
+    if (!CheckAssetReads(Err) || !SaveEdits(OutDir, Err)) return false;
     if (Generated == 0 && RegistryRows.empty() && Edited.empty())
     { *Err = "the source declares no UE_STRUCT, UE_ENUM, class deriving from a UE class, asset or edit"; return false; }
     if (!GenerateNestedWrappers(OutDir, Err)) return false;
@@ -19024,6 +20227,13 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     if (RegistryRows.empty())
     {
         printf("  %-14s -> none (no assets of its own)\n", "registry");
+        return true;
+    }
+    /* S40: the registry writer is 4.27's format, and RC's community mod paks ship none (their classes are found by a
+       ScanPathsSynchronous over the mounted packages, DESIGN.md S40). One in a pak would shadow the game's. */
+    if (Uasset::IsUE5())
+    {
+        printf("  %-14s -> none (UE5: the mounted packages are scanned instead)\n", "registry");
         return true;
     }
     std::string RegistryDir = OutDir;

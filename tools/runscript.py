@@ -98,7 +98,7 @@ class P(W):
         elif op == 0x35: n.val = struct.unpack_from('<q', s.b, s.o)[0]; s.raw(8)
         elif op == 0x4C: n.val = s.i32()
         elif op == 0x21: n.val = s.name()
-        elif op == 0x42: n.val = s.fieldpath().split('@')[0]; k.append(s.node())
+        elif op == 0x42: n.val, n.owner = (s.fieldpath().split('@') + [''])[:2]; k.append(s.node())
         elif op == 0x69:                                             # SwitchValue: each skip is where the VM goes on
             cnt = s.u16(); end = s.i32(); k.append(s.node())
             n.val = []
@@ -396,21 +396,51 @@ MATH = {
     'Conv_BoolToInt': int, 'Multiply_Int64Int64': lambda a, b: a * b, 'Conv_IntToInt64': int, 'Conv_Int64ToInt': lambda a: i32(a),
     'InRange_IntInt': lambda v, lo, hi, imin, imax: (v >= lo if imin else v > lo) and (v <= hi if imax else v < hi),
     'Abs_Int': lambda a: i32(abs(a)), 'RandomInteger': lambda a: 0,     # RandomInteger: a stand-in; CALLS shows it ran
+    'SelectInt': lambda a, b, pick: a if pick else b,
 }
 CALLS = []     # every library call run, as (name, args): a test can see an impure or kept call happen
 # The process memory a raw pointer reads and writes, address -> byte (unset bytes read 0). A deref is an
 # ArrayGetByRef of a view struct's TArray field over the FDeref scratch; the field decides the element's size
 # and signedness, as the engine's TArray<uint8> / <int32> / <int64> does.
 MEM = {}
-VIEWS = {'Kilobyte': (1, False), 'Mapping': (4, True), 'NameHashes': (8, True)}
+VIEWS = {'Kilobyte': (1, False), 'Mapping': (4, True), 'NameHashes': (8, True), 'Data': (4, 'f')}
+# A whole struct through a pointer reads through the compiler's FDerefView_<T>, whose one field is __View_<T>__: the
+# struct's members, by the names its dict uses, with their offsets and struct-module formats. A test adds its own.
+STRUCT_VIEWS = {'FVector': (12, [('X', 0, '<f'), ('Y', 4, '<f'), ('Z', 8, '<f')])}
+
+
+def mod_field(pkg, field):
+    """A mod struct member's cooked name, as the compiler's ModFieldName mints it from the struct's package."""
+    import zlib
+    h = zlib.crc32((pkg + '.' + field).encode('utf-32-le'))
+    return '%s_%d_%08X%08X%08X%08X' % (field, h % 1000000, ~h & 0xFFFFFFFF, h * 2654435761 & 0xFFFFFFFF, h ^ 0x9E3779B9, h)
 
 
 def mem_read(addr, size, signed):
+    if signed == 'f': return struct.unpack('<f', bytes(MEM.get(addr + i, 0) for i in range(4)))[0]
     return int.from_bytes(bytes(MEM.get(addr + i, 0) for i in range(size)), 'little', signed=signed)
 
 
 def mem_write(addr, size, v):
-    for i, b in enumerate((int(v) & ((1 << 8 * size) - 1)).to_bytes(size, 'little')): MEM[addr + i] = b
+    data = struct.pack('<f', v) if isinstance(v, float) and size == 4 else (int(v) & ((1 << 8 * size) - 1)).to_bytes(size, 'little')
+    for i, b in enumerate(data): MEM[addr + i] = b
+
+
+def view_of(field):
+    """(element size, read(addr), write(addr, v)) of a deref view's TArray field, or None."""
+    if field in VIEWS:
+        size, signed = VIEWS[field]
+        return size, lambda a: mem_read(a, size, signed), lambda a, v: mem_write(a, size, v)
+    if field.startswith('__View_') and field[7:-2] in STRUCT_VIEWS:
+        size, members = STRUCT_VIEWS[field[7:-2]]
+        def read(a):
+            return {m: struct.unpack(f, bytes(MEM.get(a + o + i, 0) for i in range(struct.calcsize(f))))[0]
+                    for m, o, f in members}
+        def write(a, v):
+            for m, o, f in members:
+                for i, b in enumerate(struct.pack(f, v.get(m, 0) if isinstance(v, dict) else 0)): MEM[a + o + i] = b
+        return size, read, write
+    return None
 
 
 # A native int32 / uint8 parameter receives the low bytes of whatever the VM copies into it, so a wider value
@@ -599,6 +629,12 @@ def run(base, function, self_vars=None, **parms):
             if isinstance(s, (Slot, Free)): return s[n.val]
             if n.val == 'Value': return s                            # a nested container's wrapper is its Value
             if n.val == '__Slots__': return slots_of(s)
+            # A donor member at offset 0 reads the operand's own 4 bytes: Vector.X an int32's as a float, IntPoint.X a
+            # float's as an int32 (the compiler's __AsFloat__ / __FloatBits__).
+            if n.val == 'X' and "'Vector'" in n.owner and isinstance(s, int) and not isinstance(s, bool):
+                return struct.unpack('<f', struct.pack('<i', i32(s)))[0]
+            if n.val == 'X' and "'IntPoint'" in n.owner and isinstance(s, float):
+                return struct.unpack('<i', struct.pack('<f', s))[0]
             return s.get(n.val, 0) if isinstance(s, dict) else 0     # a struct is a dict; an unset member reads 0
         if o in (0x1F, 0x34): return n.val
         if o == 0x2F:                                                # an IMMUTABLE engine struct's literal: a dict
@@ -618,9 +654,9 @@ def run(base, function, self_vars=None, **parms):
         if o == 0x26: return 1
         if o == 0x27: return True
         if o == 0x28: return False
-        if o == 0x6B and n.kids[0].op == 0x42 and n.kids[0].val in VIEWS:
-            size, signed = VIEWS[n.kids[0].val]
-            return mem_read(ev(n.kids[0].kids[0])['Data'] + ev(n.kids[1]) * size, size, signed)
+        if o == 0x6B and n.kids[0].op == 0x42 and view_of(n.kids[0].val):
+            size, read, _ = view_of(n.kids[0].val)
+            return read(ev(n.kids[0].kids[0])['Data'] + ev(n.kids[1]) * size)
         if o == 0x6B: return ev(n.kids[0])[ev(n.kids[1])]
         if o in (0x1B, 0x45) or n.own:                               # the class's own function: a frame of its own
             names = params_of(base, n.val)
@@ -672,7 +708,7 @@ def run(base, function, self_vars=None, **parms):
         elif dest.op == 0x42: _made(ev, store, dest.kids[0], {})[dest.val] = v
         elif dest.op in (0, 0x48): env[dest.val] = v
         elif dest.op == 1: self_vars[dest.val] = v
-        elif dest.op == 0x6B and dest.kids[0].op == 0x42 and dest.kids[0].val in VIEWS: locate(dest)(v)
+        elif dest.op == 0x6B and dest.kids[0].op == 0x42 and view_of(dest.kids[0].val): locate(dest)(v)
         elif dest.op == 0x6B: ev(dest.kids[0])[ev(dest.kids[1])] = v
         else: raise SystemExit('unsupported destination op %02x' % dest.op)
 
@@ -687,10 +723,10 @@ def run(base, function, self_vars=None, **parms):
         if dest.op == 0x42:
             s = _made(ev, store, dest.kids[0], {})
             return lambda v: s.__setitem__(dest.val, copy.deepcopy(v))
-        if dest.op == 0x6B and dest.kids[0].op == 0x42 and dest.kids[0].val in VIEWS:
-            size = VIEWS[dest.kids[0].val][0]
+        if dest.op == 0x6B and dest.kids[0].op == 0x42 and view_of(dest.kids[0].val):
+            size, _, write = view_of(dest.kids[0].val)
             at = ev(dest.kids[0].kids[0])['Data'] + ev(dest.kids[1]) * size
-            return lambda v: mem_write(at, size, v)
+            return lambda v: write(at, v)
         if dest.op == 0x6B:
             arr, i = ev(dest.kids[0]), ev(dest.kids[1])
             return lambda v: arr.__setitem__(i, copy.deepcopy(v))

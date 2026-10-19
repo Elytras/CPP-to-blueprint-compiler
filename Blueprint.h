@@ -77,6 +77,8 @@ public:
     */
     /* UE_CATEGORY: a function's or variable's editor category. Editor metadata, so only the API stub carries it. */
     std::map<std::string, std::string> ApiCategory;
+    /* UE_TOOLTIP / UE_KEYWORDS: a function's (tooltip, keywords), editor metadata likewise. */
+    std::map<std::string, std::pair<std::string, std::string>> ApiDocs;
 
     FIndex AddFunction(const std::string& Name, FIndex Super,
                        const std::vector<FPropertyDef>& Params,
@@ -190,6 +192,7 @@ public:
         char Kind = 'F';
         std::string Name;
         std::vector<FTimelineKey> Keys;
+        FIndex External;            // a curve asset the track plays, the editor's External Curve; null: its own Keys
     };
     struct FTimeline
     {
@@ -247,7 +250,8 @@ public:
     bool WriteApiStruct(const std::string& OutDir, const uint32 (&Guid)[4], std::string* Err) const;
 
     /* Writes the package as one UserDefinedEnum export: <ClassName>::<Enumerator> = value, then <ClassName>_MAX. */
-    void FinishEnum(const std::vector<std::pair<std::string, int64>>& Enumerators);
+    void FinishEnum(const std::vector<std::pair<std::string, int64>>& Enumerators,
+                    const std::vector<std::pair<std::string, std::string>>& DisplayNames = {});
 
     /* The editor-side stub of this enum: an uncooked UserDefinedEnum with the same "<Enum>::<Entry>" names. */
     bool WriteApiEnum(const std::string& OutDir, const std::vector<std::pair<std::string, int64>>& Enumerators,
@@ -255,6 +259,10 @@ public:
 
     /* Writes the package as one instance of Class (a data asset): a tag per AddVariable(), each holding its Default. */
     void FinishAsset(FIndex Class, FIndex ClassCdo);
+
+    /* Writes the package as one curve asset of Class (CurveFloat, CurveVector, CurveLinearColor) holding Curve's keys,
+       the body a timeline track's own curve has. */
+    void FinishCurve(FIndex Class, FIndex ClassCdo, const FTimelineTrack& Curve);
 
     FIndex ClassIndex() const { return Exp(ClassRow); }
 

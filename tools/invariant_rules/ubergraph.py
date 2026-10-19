@@ -435,6 +435,14 @@ def find_function(pkg, ci, name):
     return None if chain_complete(pkg, ci) else 'unknown'
 
 
+def frameless_resume(pkg, i):
+    """Function export i enters as an ubergraph does (its first statement an EX_ComputedJump) and keeps nothing on its
+    frame but that first parameter, EntryPoint: a patch's ubergraph (AssetGen's Generate), whose waiting code keeps its
+    locals in members of the class, since the engine gives a fresh frame to every ubergraph but the class's own."""
+    st, top = pkg.struct(i), pkg.script(i)
+    return bool(top) and top[0].op == 0x4E and len(st.props) == 1 and st.props[0].flags & 0x80 != 0     # CPF_Parm
+
+
 @rule
 def uber_latent_resume_target(pkg):
     """A latent call that resumes (Linkage not -1) names, as ExecutionFunction, a function that FindFunction finds
@@ -455,7 +463,7 @@ def uber_latent_resume_target(pkg):
             m, link = members(n), linkage_of(pkg, i, n)
             if link in (None, -1) or len(m) != 4 or m[2].op != 0x21: continue
             name = m[2].ops[0][1]
-            if c is None or uber_tag(pkg, c) != i + 1:
+            if c is None or uber_tag(pkg, c) != i + 1 and not frameless_resume(pkg, i):
                 yield i, 'latent call at mem %d resumes, from a function that is not its class\'s ubergraph' % n.mem; continue
             f = find_function(pkg, c, name)
             if f == 'unknown': continue

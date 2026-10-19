@@ -147,7 +147,19 @@ def write_api_manifest(api_content):
         "".join(os.path.basename(f) + "\n" for f in sorted(staged_assets(api_content))))
 
 
-API_UE_VERSION = "4.27"  # AssetGen writes UE4.27 packages; a UE5 project needs its own writer.
+API_UE_VERSION = "4.27"  # the editor stubs (Uncooked.cpp) are 4.27 only; cooked output follows the UeApi (S40)
+
+# The game's project folder, which a pak's tree and mount point are named after (FSD/Content, RogueCore/Content):
+# the UeApi's Version.json "project", which genueapi reads off the dump. Set by main.
+PROJECT = "FSD"
+
+
+def ueapi_project(ue_api):
+    """The project a UeApi was generated for; one from before S40 carries none and is DRG's."""
+    try:
+        return json.load(io.open(os.path.join(ue_api, "Version.json"), encoding="utf-8")).get("project") or "FSD"
+    except (OSError, ValueError):
+        return "FSD"
 
 
 def api_roots(mod, config, bp):
@@ -184,7 +196,7 @@ def dep_stage(dep, by_name, bp):
     """Where dep's cooked assets sit - the import path (its UE_MOD_PACKAGE) plus its build dir,
     both known from the manifest, so nothing needs threading through the build loop."""
     package = mod_package(mod_sources(by_name[dep], bp))
-    fsd = os.path.join(bp, "build", dep, "FSD")
+    fsd = os.path.join(bp, "build", dep, PROJECT)
     return content_dir(fsd, package), package, fsd
 
 
@@ -206,6 +218,80 @@ def embed_deps(dep_stages, stage_fsd, assetgen):
                 [assetgen, "registry", os.path.join(stage_fsd, "AssetRegistry.bin"), registry]).returncode != 0:
             return False
     return True
+
+
+def bundle_files(mod, bp):
+    """The files a mod's `bundle:` folders hold, each as (the file, its path under the FSD tree). A folder is laid out
+    like a staged FSD tree (`Content/...`), so the relative path is the one the pak ships it at."""
+    out = []
+    for folder in mod.get("bundle") or []:
+        root = os.path.join(bp, folder)
+        if not os.path.isdir(root):
+            sys.exit("mods.yaml: a `bundle` entry is not a folder: %s" % folder)
+        out += [(os.path.join(dirpath, f), os.path.relpath(os.path.join(dirpath, f), root))
+                for dirpath, _dirs, files in os.walk(root) for f in files]
+    return out
+
+
+def stage_bundle(files, stage_fsd):
+    """Copy a mod's bundle into its FSD tree to ship verbatim: copy2 only, nothing reads or rewrites the bytes."""
+    for src, rel in files:
+        to = os.path.join(stage_fsd, rel)
+        os.makedirs(os.path.dirname(to), exist_ok=True)
+        shutil.copy2(src, to)
+
+
+def kept_source(mod, bp):
+    """The Content folder a mod's `kept` packages come from: `kept.from` itself, or, for a .pak, its extraction under
+    build/<mod>/kept, made once and again only when the pak changes."""
+    src = os.path.abspath(os.path.join(bp, os.path.expandvars(mod["kept"]["from"])))
+    if os.path.isdir(src):
+        root = src
+    else:
+        root = os.path.join(bp, "build", mod["name"], "kept")
+        stamp = os.path.join(root, ".pak")
+        want = "%s %d %d" % (src, os.path.getsize(src), int(os.path.getmtime(src)))
+        if read_text(stamp) != want:
+            shutil.rmtree(root, ignore_errors=True)
+            os.makedirs(root)
+            proc = subprocess.run([UNREALPAK, src, "-Extract", root], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                  text=True, errors="replace")
+            if proc.returncode != 0:
+                sys.exit("kept: UnrealPak could not extract %s:\n%s" % (src, proc.stdout[-2000:]))
+            io.open(stamp, "w", encoding="utf-8").write(want)
+    for sub in ("Content", os.path.join("FSD", "Content")):
+        if os.path.isdir(os.path.join(root, sub)):
+            return os.path.join(root, sub)
+    return root
+
+
+def place_kept(mod, bp, stage_fsd):
+    """A mod's `kept` packages - assets it ships as they were cooked, which no source of it builds (textures, fonts,
+    a widget with animations) - into its FSD tree for the pak. `paths` lists /Game package paths or folders. Hard
+    links where the volume allows: a texture folder runs to gigabytes. Returns how many files it placed."""
+    kept = mod.get("kept")
+    if not kept:
+        return 0
+    content = kept_source(mod, bp)
+    n = 0
+    for path in kept.get("paths") or []:
+        rel = path[len("/Game/"):] if path.startswith("/Game/") else path.lstrip("/")
+        base = os.path.join(content, *rel.split("/"))
+        files = [os.path.join(r, f) for r, _d, fs in os.walk(base) for f in fs] if os.path.isdir(base) else \
+            [base + ext for ext in (".uasset", ".uexp", ".ubulk", ".umap") if os.path.exists(base + ext)]
+        if not files:
+            sys.exit("%s: kept path %s is not in %s" % (mod["name"], path, content))
+        for f in files:
+            to = os.path.join(stage_fsd, "Content", os.path.relpath(f, content))
+            os.makedirs(os.path.dirname(to), exist_ok=True)
+            if os.path.exists(to):
+                os.remove(to)
+            try:
+                os.link(f, to)
+            except OSError:
+                shutil.copy2(f, to)
+            n += 1
+    return n
 
 
 def staged_assets(stage_content):
@@ -244,6 +330,20 @@ def staged_edits(stage_fsd, stage_content, game_dir):
     return out
 
 
+def value_reads(out):
+    """The game packages a compile read values off when the mod was built: each `value <- <package>` line it printed."""
+    return sorted(set(re.findall(r"^  value +<- (\S+)", out, re.M)))
+
+
+def read_files(reads_file, game_dir):
+    """The game's files of the packages reads_file lists (value_reads, one a line), as game_content holds them now."""
+    if not game_dir or not os.path.exists(reads_file):
+        return []
+    return [os.path.join(game_dir, *p[len("/Game/"):].split("/")) + ext
+            for p in read_text(reads_file).split() for ext in (".uasset", ".uexp", ".umap")
+            if os.path.exists(os.path.join(game_dir, *p[len("/Game/"):].split("/")) + ext)]
+
+
 def run_compile(cmd):
     """One assetgen compile, on a pool thread. Its output is captured, for the caller to print in build order."""
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
@@ -257,7 +357,7 @@ def run_unrealpak(fsd_dir, pak_path):
 
     response = os.path.join(os.path.dirname(fsd_dir), "autogen.txt")
     io.open(response, "w", encoding="utf-8", newline="\n").write(
-        '"%s" "..\\..\\..\\FSD\\*.*"\n' % os.path.join(fsd_dir, "*.*"))
+        '"%s" "..\\..\\..\\%s\\*.*"\n' % (os.path.join(fsd_dir, "*.*"), PROJECT))
 
     cmd = [UNREALPAK, pak_path, "-platform=Windows", "-create=" + response, "-compress"]
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -373,6 +473,8 @@ def main():
         sys.exit(__doc__.strip().splitlines()[-1])
     # Absolute: subprocess resolves a relative exe against PATH, not the cwd.
     repo, ue_api, assetgen = (os.path.abspath(p) for p in sys.argv[1:4])
+    global PROJECT
+    PROJECT = ueapi_project(ue_api)
     force = "--force" in sys.argv[4:]
     no_pak = "--no-pak" in sys.argv[4:]
 
@@ -418,7 +520,7 @@ def main():
             continue
 
         package = mod_package(sources)
-        stage_fsd = os.path.join(bp, "build", name, "FSD")
+        stage_fsd = os.path.join(bp, "build", name, PROJECT)
         stage_content = os.path.join(stage_fsd, "Content", *package.replace("/Game/", "").split("/"))
         assets = cooked_assets(stage_content)
         staged.append((name, stage_content, package))
@@ -439,10 +541,14 @@ def main():
         # The stamp sits beside FSD, not in it: the pak takes the whole FSD tree.
         settings = mod_settings(mod, config)
         settings_file = os.path.join(bp, "build", name, "mod.json")
+        # A value the compile read off a game package is baked into the mod: a newer game copy restales it too.
+        reads_file = os.path.join(bp, "build", name, "reads.txt")
+        inputs_time = max(newest(sources), toolchain_time)
         stale = (force or not outputs or api_missing
                  or read_text(settings_file) != settings
-                 or max(newest(sources), toolchain_time) > oldest(outputs)
-                 or any(os.path.getmtime(g) > os.path.getmtime(s) for s, g in edits))
+                 or inputs_time > oldest(outputs)
+                 or any(os.path.getmtime(g) > os.path.getmtime(s) for s, g in edits)
+                 or newest(read_files(reads_file, game_dir)) > oldest(outputs))
         job = None
         if stale:
             # The pak takes the whole FSD tree, so the whole Content tree goes, not just this package's folder:
@@ -468,7 +574,11 @@ def main():
             # they share, the last one's copy winning with only its own bodies. So several .cpp files compile as
             # a generated file that #includes them all - each still resolves its quoted includes from its own folder.
             # ponytail: a unity build, so file-local names (static, anonymous namespaces) must not clash across files.
-            cpps = [s for s in sources if s.endswith(".cpp")]
+            # The listed .cpp files only: one reached through an #include (a mod whose main file takes in the
+            # rest) is in `sources` for staleness, and compiled where it is included.
+            listed = {os.path.normcase(os.path.abspath(p)) for e in mod.get("sources") or []
+                      for p in (glob.glob(os.path.join(bp, e)) if glob.has_magic(e) else [os.path.join(bp, e)])}
+            cpps = [s for s in sources if s.endswith(".cpp") and os.path.normcase(os.path.abspath(s)) in listed]
             unit = cpps[0]
             if len(cpps) > 1:
                 unit = os.path.join(bp, "build", name, name + ".unity.cpp")
@@ -480,11 +590,13 @@ def main():
             if game_dir:
                 cmd += ["--game", game_dir]
             job = pool.submit(run_compile, cmd)
-        entries.append((mod, name, package, stage_fsd, stage_content, stale, job, api_contents, settings_file, settings))
+        entries.append((mod, name, package, stage_fsd, stage_content, stale, job, api_contents, settings_file, settings,
+                        inputs_time))
 
     # The compiles run on the pool while the rest of the mods are prepared; their results are taken in
     # build order, so each mod's output prints whole and the log reads as it did when they ran one by one.
-    for mod, name, package, stage_fsd, stage_content, stale, job, api_contents, settings_file, settings in entries:
+    for (mod, name, package, stage_fsd, stage_content, stale, job, api_contents, settings_file, settings,
+         inputs_time) in entries:
         if job:
             ok, out = job.result()
             sys.stdout.write(out)
@@ -497,8 +609,18 @@ def main():
                     for f in staged_assets(api_contents[0]):
                         shutil.copy2(f, os.path.join(api_dir, os.path.basename(f)))
                 write_api_manifest(api_dir)
-            # Stamped only once it compiled, so a failed compile stays stale.
-            io.open(settings_file, "w", encoding="utf-8", newline="\n").write(settings)
+            reads = value_reads(out)
+            reads_file = os.path.join(bp, "build", name, "reads.txt")
+            if reads:
+                io.open(reads_file, "w", encoding="utf-8", newline="\n").write("\n".join(reads) + "\n")
+            elif os.path.exists(reads_file):
+                os.remove(reads_file)
+            # Stamped only once it compiled, so a failed compile stays stale; and only when no source was saved while
+            # it compiled (an editor's save, widgetloop --watch), which the assets, newer than that save, would hide.
+            if max(newest(mod_sources(mod, bp)), toolchain_time) == inputs_time:
+                io.open(settings_file, "w", encoding="utf-8", newline="\n").write(settings)
+            elif os.path.exists(settings_file):
+                os.remove(settings_file)
             print("%-16s compiled -> %s" % (name, package))
             built.append(name)
 
@@ -516,12 +638,14 @@ def main():
         embed = bool(mod.get("embed"))
         dep_stages = [dep_stage(d, by_name, bp) for d in transitive_needs(name, by_name)] if embed else []
         dep_assets = [f for content, _p, _f in dep_stages for f in cooked_assets(content)]
+        bundle = bundle_files(mod, bp)
         assets = cooked_assets(stage_content) + [s for s, _g in staged_edits(stage_fsd, stage_content, game_dir)]
         pak = os.path.join(bp, "out", name + "_P.pak")
         # A dep's assets are baked into this pak, so a change to one restales it; likewise our own
         # assets after a --no-pak run. Judged on our sources alone the old pak would ship, and a mod
         # calling a function it lacks crashes on the null UFunction.
-        unpacked = not no_pak and max(newest(assets), newest(dep_assets)) > newest([pak])
+        # A bundle's files are baked in the same way, so they count with the deps.
+        unpacked = not no_pak and max(newest(assets), newest(dep_assets + [src for src, _rel in bundle])) > newest([pak])
         if not stale and not unpacked:
             print("%-16s up to date" % name)
             skipped.append(name)
@@ -531,6 +655,9 @@ def main():
         if embed and not embed_deps(dep_stages, stage_fsd, assetgen):
             failed.append(name)
             continue
+        stage_bundle(bundle, stage_fsd)
+        if mod.get("kept"):     # after the deps: a kept package wins over a rebuilt one of the same path
+            print("%-16s kept     %d files" % (name, place_kept(mod, bp, stage_fsd)))
         if not os.path.isdir(os.path.dirname(pak)):
             os.makedirs(os.path.dirname(pak))
         if run_unrealpak(stage_fsd, pak):

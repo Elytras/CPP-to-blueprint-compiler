@@ -22,21 +22,56 @@ class R:
 class Imp(str):
     """An import as the dumps print it, Class'Name'; .outer is its outer's FPackageIndex."""
 
-def load(base):
-    ua = open(base + ".uasset", "rb").read()
-    try: ue = open(base + ".uexp", "rb").read()
-    except FileNotFoundError: ue = b""
+def summary(ua):
+    """The FPackageFileSummary fields the dumps need, for a 4.27 package or a 5.6 one (LegacyFileVersion -9, S40),
+    which is read at 5.6's own version when unversioned, as the engine does. Also each row's size."""
     r = R(ua, 4)
     legacy = r.i32()
     if legacy != -4: r.i32()
-    r.i32(); r.i32()
+    r.i32()
+    ue5 = legacy <= -8
+    if ue5: r.i32()                                 # FileVersionUE5
+    r.i32()                                         # licensee
+    if ue5: r.o += 20; total = r.i32()              # SavedHash, TotalHeaderSize
     for _ in range(r.i32()): r.o += 20
-    total = r.i32(); r.fstr(); flags = r.u32()
+    if not ue5: total = r.i32()
+    r.fstr(); flags = r.u32()
     ncount, noff = r.i32(), r.i32()
+    if ue5: r.o += 8                                # soft object paths
     if not (flags & 0x80000000): r.fstr()
     r.i32(); r.i32()
     ecount, eoff = r.i32(), r.i32()
     icount, ioff = r.i32(), r.i32()
+    if ue5: r.o += 16 + 4                           # cell exports/imports, MetaDataOffset
+    r.o += 4 + 8 + 4 + 4                            # depends, soft package references, searchable names, thumbnails
+    if not ue5: r.o += 16                           # guid
+    if not (flags & 0x80000000): r.o += 16          # PersistentGuid: an editor package (the uncooked API stubs)
+    def skip(size):                                 # a counted array of fixed-size rows. Not `r.o += size * r.i32()`:
+        n = r.i32(); r.o += size * n                # that reads r.o first, and drops the count's own 4 bytes
+    skip(8)                                         # generations
+    for _ in range(2):                              # saved-by and compatible-with engine versions
+        r.o += 10; r.fstr()
+    r.u32(); skip(16)                               # compression flags, compressed chunks
+    r.u32()                                         # PackageSource
+    for _ in range(r.i32()): r.fstr()               # additional packages to cook
+    r.i32(); r.i64(); r.i32()                       # asset registry, bulk data start, world tile info
+    skip(4)                                         # chunk ids
+    pcount, poff = r.i32(), r.i32()
+    tagged = not flags & 0x2000
+    # 5.6 rows (ObjectResource.cpp): an import gains bImportOptional; an export loses its PackageGuid, gains
+    # bIsInheritedInstance and bGeneratePublicHash, and in a tagged package the script start/end (two int64).
+    erow = (96 + (16 if tagged else 0)) if ue5 else 104
+    return dict(ue5=ue5, total=total, flags=flags, ncount=ncount, noff=noff, ecount=ecount, eoff=eoff,
+                icount=icount, ioff=ioff, pcount=pcount, poff=poff, erow=erow,
+                edeps=(erow - 36 if tagged else erow - 20) if ue5 else 84)
+
+def load(base):
+    ua = open(base + ".uasset", "rb").read()
+    try: ue = open(base + ".uexp", "rb").read()
+    except FileNotFoundError: ue = b""
+    sm = summary(ua)
+    total, flags, ue5 = sm["total"], sm["flags"], sm["ue5"]
+    ncount, noff, ecount, eoff, icount, ioff = (sm[k] for k in ("ncount", "noff", "ecount", "eoff", "icount", "ioff"))
 
     names = []
     n = R(ua, noff)
@@ -49,15 +84,15 @@ def load(base):
         outer = im.i32(); obj = names[im.i32()]; im.o += 4
         # Uncooked: FObjectImport carries an editor-only PackageName FName (VER_UE4_NON_OUTER_PACKAGE_IMPORT).
         if not (flags & 0x80000000): im.o += 8
+        if ue5: im.o += 4                           # bImportOptional
         imports.append(Imp(f"{cls}'{obj}'")); imports[-1].outer = outer
     exports = []
-    ex = R(ua, eoff)
-    for _ in range(ecount):
+    for k in range(ecount):
+        ex = R(ua, eoff + sm["erow"] * k)
         ci, si, ti, oi = ex.i32(), ex.i32(), ex.i32(), ex.i32()
         nm = names[ex.i32()]; num = ex.i32()
         if num: nm = f"{nm}_{num-1}"
         fl = ex.u32(); size, off = ex.i64(), ex.i64()
-        ex.o += 12 + 20 + 8 + 4 + 16
         exports.append(dict(name=nm, cls=ci, super=si, tmpl=ti, outer=oi, flags=fl, size=size, off=off))
     # An uncooked package is one file: payloads sit in the .uasset at absolute offsets, so hand
     # callers the same (blob, base) pair a cooked pair gives them.
@@ -68,28 +103,11 @@ def preload(base):
     """Each export's EDL preload dependencies, as FPackageIndex lists: serialize-before-serialize, create-before-
     serialize, serialize-before-create, create-before-create. A cooked package only (the summary walk of Cooked.cpp)."""
     ua = open(base + ".uasset", "rb").read()
-    r = R(ua, 8)                                # past the tag and LegacyFileVersion (-7)
-    def skip(size):                             # a counted array of fixed-size rows. Not `r.o += size * r.i32()`:
-        n = r.i32(); r.o += size * n            # that reads r.o first, and drops the count's own 4 bytes
-    r.o += 12                                  # LegacyUE3Version, FileVersionUE4, licensee
-    skip(20)                                    # custom versions
-    r.i32(); r.fstr(); r.u32()                  # TotalHeaderSize, FolderName, PackageFlags
-    r.o += 16                                   # names, gatherable text
-    ecount, eoff = r.i32(), r.i32()
-    r.o += 8 + 4 + 8 + 4 + 4 + 16               # imports, depends, soft package references, searchable names, thumbnails, guid
-    skip(8)                                     # generations
-    for _ in range(2):                          # saved-by and compatible-with engine versions
-        r.o += 10; r.fstr()
-    r.u32(); skip(16)                           # compression flags, compressed chunks
-    r.u32()                                     # PackageSource
-    for _ in range(r.i32()): r.fstr()           # additional packages to cook
-    r.i32(); r.i64(); r.i32()                   # asset registry, bulk data start, world tile info
-    skip(4)                                     # chunk ids
-    count, off = r.i32(), r.i32()
-    deps = struct.unpack_from('<%di' % count, ua, off)
+    sm = summary(ua)
+    deps = struct.unpack_from('<%di' % max(sm["pcount"], 0), ua, sm["poff"])   # an editor package has -1
     out = []
-    for k in range(ecount):
-        first, *counts = struct.unpack_from('<5i', ua, eoff + 104 * k + 84)
+    for k in range(sm["ecount"]):
+        first, *counts = struct.unpack_from('<5i', ua, sm["eoff"] + sm["erow"] * k + sm["edeps"])
         lists, at = [], first
         for n in counts:
             lists.append(list(deps[at:at + n]) if first >= 0 else [])

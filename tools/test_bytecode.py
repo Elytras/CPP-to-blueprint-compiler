@@ -577,6 +577,9 @@ def assetgen_compile(args, cwd=None):
     return PREFETCH.compile(args, cwd)
 
 
+AGAINST_ASSET_TEST = ('EditTest', 'AssetValues')     # compiled with --game at AssetTest's output
+
+
 def build():
     """Each test compiles into build/<Test>/FSD/Content/<its package>, the layout bpbuild stages a mod in. The examples
     the docs point at compile the same way, so one the compiler stops accepting fails here rather than for a reader."""
@@ -587,11 +590,12 @@ def build():
         package = re.search(r'UE_MOD_PACKAGE\s*\(\s*"/Game/([^"]+)"', open(src, encoding='utf-8-sig').read()).group(1)
         out = os.path.join(ROOT, mod, 'FSD', 'Content', *package.split('/'))
         os.makedirs(out)
-        game = ['--game', os.path.join(ROOT, 'AssetTest', 'FSD', 'Content')] if mod == 'EditTest' else []
+        game = ['--game', os.path.join(ROOT, 'AssetTest', 'FSD', 'Content')] if mod in AGAINST_ASSET_TEST else []
         return mod, assetgen_compile([src, UEAPI, out] + game)
     srcs = sorted(glob.glob(os.path.join(TESTS, '*.cpp'))) + sorted(glob.glob(os.path.join(AG, 'examples', '*.cpp')))
-    # EditTest edits AssetTest's cooked assets as if they were the game's, so it compiles once AssetTest has.
-    edits = [s for s in srcs if os.path.basename(s) == 'EditTest.cpp']
+    # EditTest edits AssetTest's cooked assets as if they were the game's, and AssetValues reads their values, so they
+    # compile once AssetTest has.
+    edits = [s for s in srcs if os.path.splitext(os.path.basename(s))[0] in AGAINST_ASSET_TEST]
     for mod, proc in parallel(compile_mod, [s for s in srcs if s not in edits]) + [compile_mod(s) for s in edits]:
         assert proc.returncode == 0, '%s:\n%s%s' % (mod, proc.stdout, proc.stderr)
         LOGS[mod] = proc.stdout
@@ -724,6 +728,33 @@ def keeps_invariants(base):
     import invariants
     found = [f for f in invariants.check(invariants.Package(base)) if f[0] not in KNOWN_RULES]
     assert not found, '%s breaks %s' % (os.path.basename(base), '; '.join('%s %s: %s' % f for f in found[:3]))
+
+
+EDIT_HEAD = '#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\n#include "UeApi/FSD.h"\n'
+
+
+def compile_edit(tmp, mod, src, game):
+    """Compiles an S38 mod (its whole source) against `game`, the folder /Game is in, into tmp; returns the process and
+    the Content folder the edited packages are written to, each at its own /Game path."""
+    path = os.path.join(tmp, mod + '.cpp')
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(src)
+    out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', mod)
+    os.makedirs(out)
+    proc = assetgen_compile([path, UEAPI, out, '--game', game])
+    return proc, os.path.join(tmp, 'FSD', 'Content')
+
+
+def compile_to(src_text, mod, extra=()):
+    """Compiles a source text as tests/<mod>.cpp would be, into a fresh temp dir: (dir, the package folder, stdout)."""
+    tmp = tempfile.mkdtemp()
+    src = os.path.join(tmp, mod + '.cpp')
+    with open(src, 'w', encoding='utf-8') as f: f.write(src_text)
+    out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', mod)
+    os.makedirs(out)
+    proc = assetgen_compile([src, UEAPI, out] + list(extra))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    return tmp, out, proc.stdout
 
 
 def pending(name, test):
@@ -3097,6 +3128,113 @@ def pointer_behaviour():
     print('ok  PointerTest: Advance, Bump (out-parm), Check, signed byte reads, discarded intrinsics, uint32 reads refused; FDeref synthesized')
 
 
+def pointer_more():
+    """PointerMore: a whole struct, a 16-bit value and a double through a pointer; the address of a struct member; a
+    reference return as an address the call reads and writes through; memory reads before and after a latent wait."""
+    import math, runscript, struct
+    from runvm import VM, Obj, latent_call
+    base, A = asset('PointerMore'), 0x7FF600001000
+
+    def put(a, fmt, *v):
+        for i, b in enumerate(struct.pack(fmt, *v)): runscript.MEM[a + i] = b
+
+    def get(a, fmt): return struct.unpack(fmt, bytes(runscript.MEM.get(a + i, 0) for i in range(struct.calcsize(fmt))))
+    runscript.MEM.clear()
+    # Whole structs: a copy out, a store in, element I, a copy between two places, a mod struct with padding.
+    put(A, '<fff', 1.5, 2.5, 3.5)
+    assert run(base, 'ReadVec', P=A)[0] == {'X': 1.5, 'Y': 2.5, 'Z': 3.5}
+    run(base, 'WriteVec', P=A + 12, X=7.0)
+    assert get(A + 12, '<fff') == (7.0, 8.0, 9.0) and get(A, '<fff') == (1.5, 2.5, 3.5)
+    assert run(base, 'SumAt', P=A, I=1)[0] == 24.0
+    run(base, 'CopyVec', To=A + 24, From=A)
+    assert get(A + 24, '<fff') == (1.5, 2.5, 3.5)
+    pkg = '/Game/_ElytrasMods/PointerMore/FPair'
+    fa, fb = runscript.mod_field(pkg, 'A'), runscript.mod_field(pkg, 'B')
+    runscript.STRUCT_VIEWS['FPair'] = (16, [(fa, 0, '<i'), (fb, 8, '<q')])
+    put(A + 40, '<iiq', 5, -1, 1 << 40 | 9)      # the padding after A is not a member
+    assert run(base, 'ReadPair', P=A + 40)[0] == {fa: 5, fb: 1 << 40 | 9}
+    run(base, 'SwapPair', P=A + 40)
+    assert get(A + 40, '<i')[0] == 9 and get(A + 48, '<q')[0] == 5
+    # 16-bit values: two bytes, an int16 sign-extended; a store writes two bytes and no more.
+    for v in (0, 1, 0x7FFF, 0x8000, 0xFFFF, 0x1234):
+        runscript.MEM.clear()
+        put(A, '<HH', v, 0xFFFF - v)
+        assert run(base, 'ReadU16', P=A)[0] == v, v
+        assert run(base, 'ReadI16', P=A, I=1)[0] == struct.unpack('<h', struct.pack('<H', 0xFFFF - v))[0], v
+        put(A + 8, '<I', 0xAAAAAAAA)
+        run(base, 'WriteU16', P=A + 8, V=v - 70000)
+        assert get(A + 8, '<HH') == ((v - 70000) & 0xFFFF, 0xAAAA), v
+    for v in (-1, 0, 0x7FFF, -0x8000):
+        put(A, '<h', v)
+        run(base, 'BumpI16', P=A)
+        assert get(A, '<h')[0] == (v + 1 + 0x8000) % 0x10000 - 0x8000, v
+
+    # A double reads as the float nearest it, as C++'s conversion gives (a tie to even); one below FLT_MIN reads 0.
+    def f32(d):
+        try: f = struct.unpack('<f', struct.pack('<f', d))[0]
+        except OverflowError: return math.copysign(math.inf, d)
+        return math.copysign(0.0, d) if 0 < abs(f) < 2.0 ** -126 else f
+    same = lambda x, y: x == y and math.copysign(1, x) == math.copysign(1, y)
+    for d in (0.0, -0.0, 1.0, -2.5, math.pi, 0.1, 1e-30, 1e30, 3.4028235e38, 3.5e38, 1e300, -1e-300, 1e-40, math.inf,
+              -math.inf, 2.0 ** -126, 16777217.0, 16777219.0, 1.0000000596046448, 1.0000001788139343, 3.4028235677973366e38):
+        put(A, '<d', d)
+        assert same(run(base, 'ReadDouble', P=A)[0], f32(d)), d
+    put(A, '<d', math.nan)
+    assert math.isnan(run(base, 'ReadDouble', P=A)[0])
+    for f in (0.0, -0.0, 1.0, -2.5, 0.1, 3.4e38, 2.0 ** -126, math.inf, -math.inf):
+        run(base, 'WriteDouble', P=A, V=f32(f))
+        assert same(get(A, '<d')[0], f32(f)), f
+    # The address of a struct member: its offset in the game's layout, through any number of members and elements.
+    assert [run(base, fn, P=A)[0] - A for fn in ('AddrOfY', 'AddrOfB', 'AddrOfNested', 'AddrThroughRef')] == [4, 8, 12, 4]
+    assert run(base, 'AddrOfElementMember', P=A, I=2)[0] - A == 2 * 16 + 4 + 4
+    put(A, '<fff', 1.0, 2.0, 3.0)
+    run(base, 'SetZ', P=A, Z=9.0)
+    assert get(A, '<fff') == (1.0, 2.0, 9.0)
+    # A reference return is the place: assigned, updated once, bound to a reference, read.
+    runscript.MEM.clear()
+    put(A, '<iii', 10, 20, 30)
+    assert run(base, 'SlotUse', P=A)[0] == 7 + 40 and get(A, '<iii') == (15, 40, 7)
+    put(A, '<ffffff', 1, 2, 3, 4, 5, 6)
+    assert run(base, 'VecAtUse', P=A)[0] == 44.0 and get(A, '<ffffff') == (4, 40, 6, 4, 5, 6)
+    # A const T& return is a copy: the value at the call.
+    put(A, '<i', 21)
+    assert run(base, 'ConstRefUse', P=A)[0] == 42
+    # Reads in a function that waits, one before the wait and one after it, of memory that changed in between; writes.
+    runscript.MEM.clear()
+    put(A, '<ii', 11, 22)
+    vm = VM(base, {'Delay': latent_call})
+    vm.call('ReadAcrossDelay', P=A)
+    assert vm.self.vars == {'Seen': 11} and len(vm.latent) == 1, vm.self.vars
+    put(A, '<ii', 33, 44)
+    vm.fire()
+    assert vm.self.vars == {'Seen': 11, 'SeenLater': 44}, vm.self.vars
+    assert get(A + 8, '<i')[0] == 45 and get(A + 12, '<fff') == (11.0, 0.5, 0.25)
+    kinds = {'Pawn': {'Pawn', 'Actor'}}
+    far = Obj('Actor', Obj('Level')); near = Obj('Pawn', far); comp = Obj('SceneComponent', near)
+    vm = VM(base, {'Delay': latent_call}, isa=lambda o, c: isinstance(o, Obj) and c in kinds.get(o.cls, {o.cls}))
+    vm.call('OuterAcrossDelay', comp)
+    assert not vm.self.vars
+    vm.fire()
+    assert vm.self.vars['OuterSeen'] is near and vm.self.vars['OwnerSeen'] is near, vm.self.vars
+    runscript.MEM.clear()
+    # What the game checks (bpcheck): the Self* functions point into a TArray of their own, which runscript's MEM does
+    # not hold, so their cases are C++'s answers, written here.
+    if '--cases' in sys.argv:
+        cls = '/Game/_ElytrasMods/PointerMore/PointerMore'
+        CASES.extend({'mod': 'PointerMore', 'class': cls, 'fn': fn, 'args': {}, 'self': {}, 'ret': ret, 'env': {}}
+                     for fn, ret in (('SelfWhole', 604.0), ('SelfMemberAddr', 25), ('SelfRefReturn', 32.0)))
+    # The refusals that stay: a Blueprint variable has no address, to take or to return; an engine struct whose
+    # reflected members do not add up to its size has no member offsets to trust.
+    refused('RefLocal', '  int32 &Bad() { int32 L = 3; return L; }\n', 'returns a reference to L, a local')
+    refused('RefParm', '  int32 &Bad(int32 &V) { return V; }\n', 'returns a reference to V, a parameter')
+    refused('AddrLocalMember', '  int64 Bad() { FVector V; return (int64)&V.Y; }\n', 'a Blueprint variable has none')
+    refused('AddrHitMember', '  int64 Bad(FHitResult *H) { return (int64)&H->Distance; }\n',
+            "the address of FHitResult::Distance: FHitResult's reflected members take")
+    assert 'PointerMore::FirstOf returns const int32&: a Blueprint function returns a copy' in LOGS['PointerMore']
+    print('ok  PointerMore: whole structs, 16-bit values and doubles through a pointer, struct member addresses, '
+          'reference returns, memory reads across a latent wait; the refusals that stay')
+
+
 mod_enum()
 constants()
 types_behaviour()
@@ -3106,6 +3244,7 @@ string_behaviour()
 struct_behaviour()
 check('StructTest', 'MakeNative', lambda D: D + 0.5, [dict(D=d) for d in (0.0, 4.0)])
 pointer_behaviour()
+pointer_more()
 
 
 def map_pairs(pkg, tag):
@@ -3252,6 +3391,18 @@ def interface_calls():
     assert len(reads) == 2 and {import_paths(base)[int(i)] for i in reads} == {'/Game/_ElytrasMods/IfaceTest/Beacon.Beacon_C'}, w
     assert re.search(r'Context\s+skip \d+ Marks@[^\n]*\n[^\n]*LocalVariable\s+Other@', w) and 'Add_IntInt' in w, w
     print('ok  IfaceTest: interface calls go by name; the cast names ITargetable; Marks is read where Beacon holds it')
+
+
+def interface_to_object():
+    """IfaceTest: Spotter.Tracks hands an interface value to Conv_InterfaceToObject as it is. A cast to UInterface
+    on the way would come out empty, ImplementsInterface being false for it, which once emptied ElytrasModManager's
+    interface registry in game."""
+    vm = VM(os.path.join(os.path.dirname(asset('IfaceTest')), 'Spotter'),
+            {'Conv_InterfaceToObject': lambda vm, ctx, i: i},
+            isa=lambda o, cls: isinstance(o, Obj) and cls in ('ITargetable_C', o.cls))
+    assert vm.call('Tracks', Other=Obj('Turret_C')) is True
+    assert vm.call('Tracks', Other=None) is False
+    print('ok  IfaceTest: an interface value reaches Conv_InterfaceToObject uncast')
 
 
 def inherited_defaults():
@@ -3486,7 +3637,13 @@ def api_stub():
             variables[re.search(r'VarName \[0\] NameProperty size=8: (\w+)', '\n'.join(v)).group(1)] = '\n'.join(v)
         entries = {exports[e['outer'] - 1]['name']: dump('dumptags.py', base, i)
                    for i, e in enumerate(exports) if e['name'].startswith('K2Node_FunctionEntry')}
+        cooked = b''.join(open(f, 'rb').read() for f in glob.glob(os.path.join(tmp, 'cooked', '**', '*.u*'), recursive=True))
     category = b'Names|Test'.hex()
+    # UE_TOOLTIP / UE_KEYWORDS reach Raise's entry node (its MetaData's ToolTip and Keywords), no other entry, and not
+    # the cooked package: a cooked game keeps no editor metadata.
+    for text in (b'Lifts the cap to nine.', b'raise lift cap'):
+        assert text.hex() in entries['Raise'] and not any(text.hex() in entries[f] for f in entries if f != 'Raise'), entries
+        assert text not in cooked, text
     # A private field is left out; the const one is offered read-only (CPF_BlueprintReadOnly 0x10).
     assert set(variables) == {'Charges', 'Plain', 'Limit', 'Cap'}, set(variables)
     rflags = lambda v: struct.unpack('<Q', bytes.fromhex(re.search(r'PropertyFlags \[0\] UInt64Property size=8: (\w+)', variables[v]).group(1)))[0]
@@ -3500,7 +3657,46 @@ def api_stub():
     for f in entries:
         assert extra(f) & 0xE0000 == {'Step': 0x80000, 'Twice': 0x40000}.get(f, 0x20000), (f, hex(extra(f)))
         assert bool(extra(f) & 0x10000000) == (f == 'Peek'), (f, hex(extra(f)))
-    print('ok  NameTest: the API stub carries UE_CATEGORY, access and purity, and leaves a private field out')
+    print('ok  NameTest: the API stub carries UE_CATEGORY, UE_TOOLTIP, UE_KEYWORDS, access and purity, and leaves a private field out')
+
+
+def api_stub_interface():
+    """The editor API stub of a mod interface (IfaceStub): a Blueprint Interface, as the UE 4.27 editor saves one - the
+    Blueprint's type BPTYPE_Interface, its parent the engine's Interface (or the interface it extends), a function graph
+    per function whose entry has the editor's flags for one (Public | BlueprintCallable | BlueprintEvent), and a generated
+    class flagged CLASS_Interface. Its variables, which the editor's interfaces cannot hold, are left out. The editor
+    loads it, and a Blueprint made there implements it (DESIGN.md)."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        os.makedirs(os.path.join(tmp, 'cooked'))
+        os.makedirs(os.path.join(tmp, 'api'))
+        proc = assetgen_compile([os.path.join(TESTS, 'IfaceStub.cpp'), UEAPI, os.path.join(tmp, 'cooked'),
+                                 '--api', os.path.join(tmp, 'api')])
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        got = {}
+        for name in ('IStubPing', 'IStubLoud'):
+            base = os.path.join(tmp, 'api', name)
+            exports = dumpexp.load(base)[5]
+            imports = import_paths(base)
+            bp = dump('dumptags.py', base, 0)
+            parent = int(re.search(r'ParentClass \[0\] ObjectProperty size=4: index (-?\d+)', bp).group(1))
+            graphs = {exports[e['outer'] - 1]['name']: dump('dumptags.py', base, i)
+                      for i, e in enumerate(exports) if e['name'].startswith('K2Node_FunctionEntry')}
+            cls = next(i for i, e in enumerate(exports) if e['name'] == name + '_C')
+            got[name] = dict(parent=imports[-parent - 1], graphs=graphs, bp=bp,
+                             flags=re.search(r'ClassFlags (0x[0-9a-f]+)', dump('dumpstruct.py', base, cls)).group(1))
+    ping = got['IStubPing']
+    assert 'BPTYPE_Interface' in ping['bp'] and 'NewVariables' not in ping['bp'], ping['bp']    # Marks left out
+    assert ping['parent'] == '/Script/CoreUObject.Interface', ping['parent']
+    assert got['IStubLoud']['parent'] == '/Game/_ElytrasMods/IfaceStub/IStubPing.IStubPing_C', got['IStubLoud']['parent']
+    assert set(ping['graphs']) == {'Ping', 'Note'} and set(got['IStubLoud']['graphs']) == {'Shout'}, ping['graphs']
+    for g in list(ping['graphs'].values()) + list(got['IStubLoud']['graphs'].values()):
+        assert int(re.search(r'ExtraFlags \[0\] IntProperty size=4: (-?\d+)', g).group(1)) == 0x0C020000, g
+    assert all(got[n]['flags'] == '0x44010' for n in got), got     # CLASS_Parsed | CLASS_Interface | CLASS_CompiledFromBlueprint
+    for text in (b'Answers a ping with a number.', b'echo reply'):
+        assert text.hex() in ping['graphs']['Ping'] and text.hex() not in ping['graphs']['Note'], text
+    print('ok  IfaceStub: a mod interface\'s API stub is a Blueprint Interface with a graph per function, its flags, '
+          'parent and tooltip, and no variables')
 
 
 def static_assets():
@@ -3687,6 +3883,130 @@ def globals_():
     print('ok  GlobalTest: both classes read and write the one object: =, op=, ++ and a postfix value')
 
 
+def asset_values():
+    """AssetValues (S38): a game asset's member read by value is the value its package holds, a constant when the mod is
+    built. The "game" is AssetTest: an asset's own value, one it leaves to its archetype (the class's default object, in
+    another package), an explicit zero, an element, a Blueprint class's own false (its default object has no tag of
+    it), a native class's asset; in the code (run) and in defaults (the CDO's tags). Refused: a value no package holds
+    (a native class's C++ default), an element past the end, a reference, a value this mod's own edit changes, a member
+    UeApi types otherwise than the package (an SDK from another build), and a compile without --game. bpbuild records
+    the packages a compile read and restales the mod when the game's copy is newer."""
+    base = asset('AssetValues')
+    got = {f: run(base, f)[0] for f in ('BigHealth', 'PlainHealth', 'CalmCount', 'BigWave', 'PlainBig', 'Spread')}
+    assert got == {'BigHealth': -1001.0, 'PlainHealth': 100.0, 'CalmCount': 1, 'BigWave': 8, 'PlainBig': False,
+                   'Spread': 250.0}, got
+    tag_line = re.compile(r'^  (\w+) \[0\] \w+ size=\d+[^:]*: ?(.*)$', re.M)
+    cdo = {m.group(1): m.group(2) for m in tag_line.finditer(dump('dumptags.py', base, 1))}
+    assert cdo == {'Twice': '200.0', 'Title': "'Big'", 'Label': 'big', 'Size': '4'}, cdo
+    reads = sorted(set(re.findall(r'(?m)^  value +<- (\S+)', LOGS['AssetValues'])))
+    assert reads == ['/Game/_ElytrasMods/AssetTest/' + a for a in ('ED_AssetTest', 'MD_Big', 'MD_Calm', 'MD_Plain')], reads
+
+    game = os.path.join(ROOT, 'AssetTest', 'FSD', 'Content')
+    head = (EDIT_HEAD + 'UE_MOD_PACKAGE("/Game/_ElytrasMods/AvRefused");\n'
+            'class UMoodDef : public UPrimaryDataAsset {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/AssetTest/UMoodDef", "UMoodDef_C");\n'
+            '  %s Health;\n  TArray<int32> Waves;\n  UMoodDef *Next;\n};\n'
+            'UE_ASSET_AT(UMoodDef, MD_Plain, "/Game/_ElytrasMods/AssetTest/MD_Plain");\n'
+            'UE_ASSET_AT(UEnemyDescriptor, ED_AssetTest, "/Game/_ElytrasMods/AssetTest/ED_AssetTest");\n')
+    for health, body, why in (
+            ('float', 'float F() { return ED_AssetTest.SpawnAmountModifier; }',
+             "ED_AssetTest.SpawnAmountModifier: the game's ED_AssetTest sets no value of its own, so it holds "
+             "EnemyDescriptor's C++ default, which no package holds"),
+            ('float', 'int32 F() { return MD_Plain.Waves[0]; }', "MD_Plain.Waves[0]: the game's array has 0 elements"),
+            ('float', 'bool F() { return MD_Plain.Next == nullptr; }', 'MD_Plain.Next: only a number, a bool, an enum'),
+            ('float', 'float F() { return MD_Plain.Health; }\n};\nUE_ASSET_EDIT(MD_Plain) {.Health = 7.0f};\nclass B : public AActor {',
+             "MD_Plain.Health: this mod's edit changes the value read when the mod is built"),
+            ('int32', 'int32 F() { return MD_Plain.Health; }',
+             'the game\'s package holds a FloatProperty there, where UeApi declares a IntProperty')):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc, _ = compile_edit(tmp, 'AvRefused', head % health + 'class AvRefused : public AActor {\npublic:\n  '
+                                   + body + '\n};\n', game)
+        assert proc.returncode != 0 and why in proc.stdout, (body, proc.stdout)
+    refused('AvNoGame', '  float F() { return ED_AssetTest.SpawnSpread; }\n',
+            "a game asset's value is read off its package when the mod is built: pass the folder /Game is in",
+            top='UE_ASSET_AT(UEnemyDescriptor, ED_AssetTest, "/Game/_ElytrasMods/AssetTest/ED_AssetTest");\n')
+
+    sys.path.insert(0, HERE)
+    import bpbuild
+    with tempfile.TemporaryDirectory() as tmp:
+        assert bpbuild.value_reads(LOGS['AssetValues']) == reads
+        listed = os.path.join(tmp, 'reads.txt')
+        with open(listed, 'w') as f:
+            f.write('\n'.join(reads) + '\n/Game/_ElytrasMods/AssetTest/Gone\n')
+        files = bpbuild.read_files(listed, game)
+        assert sorted(os.path.basename(f) for f in files) == sorted(a + e for a in ('ED_AssetTest', 'MD_Big', 'MD_Calm', 'MD_Plain')
+                                                                    for e in ('.uasset', '.uexp')), files
+        assert bpbuild.read_files(listed, None) == [] and bpbuild.read_files(os.path.join(tmp, 'none.txt'), game) == []
+    print('ok  AssetValues: a game asset\'s values, read off its package when the mod is built - its own, its archetype\'s, '
+          'an element, a Blueprint class\'s untagged zero - in code and defaults; refused where no package holds the value, '
+          'where this mod edits it, or where UeApi disagrees with the package; bpbuild restales on the packages read')
+
+
+def patch_members(comp_game):
+    """A UE_PATCH's own members are variables added to the game's class (CompTest standing in for a game Blueprint):
+    the patched method reads and writes them, the class lists each after the game's, and its default object holds each
+    initializer, or the patch's UE_DEFAULTS value over it. An interface of its own is added to the class's Interfaces,
+    the methods it names added, one the patch leaves out as the empty stub a class of its own would get, and the
+    interface's variable is the class's too."""
+    import invariants, struct
+    decl = ('#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/MemEdit");\n'
+            'class CompTest : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/CompTest/CompTest", "CompTest_C");\n'
+            '  int32 Ticks;\n  void ReceiveBeginPlay();\n};\n'
+            'class IPoke {\npublic:\n  UE_INTERFACE;\n  int32 Level = 4;\n  int32 Poke(int32 X);\n  void Ping();\n};\n'
+            'class Tweaks : public CompTest%s {\n  UE_PATCH;\npublic:\n%s};\n')
+    for bases, body, want in (
+            ('', '  int32 Extra = 4;\n  FVector Where = {1, 2, 3};\n  TSet<int32> Seen = {7};\n  int32 Zero;\n'
+                 '  void ReceiveBeginPlay() { Ticks = Ticks + Extra; Extra = Extra + 1; }\n',
+             {'Extra': 4, 'Where': (1.0, 2.0, 3.0), 'Seen': [7]}),
+            ('', '  int32 Extra = 4;\n  UE_DEFAULTS { Extra = 9; }\n', {'Extra': 9}),
+            (', public IPoke', '  int32 Poke(int32 X) { return X + Level + Ticks; }\n', {'Level': 4})):
+        tmp, out, _ = compile_to(decl % (bases, body), 'MemEdit', ['--game', comp_game])
+        try:
+            b = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'CompTest', 'CompTest')
+            a = invariants.Package(os.path.join(comp_game, '_ElytrasMods', 'CompTest', 'CompTest'))
+            p = invariants.Package(b)
+            st, was = p.struct(p.find('CompTest_C')), a.struct(a.find('CompTest_C'))
+            added = [x.name for x in st.props[len(was.props):]]
+            assert [repr(x) for x in st.props[:len(was.props)]] == [repr(x) for x in was.props], st.props
+            assert sorted(added) == sorted(set(want) | ({'Zero'} if 'Zero' in body else set())), added
+            cdo = p.find('Default__CompTest_C')
+            got = {}
+            for t in p.tags(cdo):
+                v = bytes(t['value'])
+                got[t['name']] = (struct.unpack('<i', v)[0] if t['type'] == 'IntProperty' else
+                                  struct.unpack('<3f', v) if t['type'] == 'StructProperty' else
+                                  list(struct.unpack('<%di' % (len(v) // 4 - 2), v[8:])))     # removed 0, then the elements
+            assert got == want, got
+            if 'Extra' in want and 'ReceiveBeginPlay' in body:
+                me = {'Ticks': 1, 'Extra': 4}
+                run(b, 'ReceiveBeginPlay', self_vars=me)
+                assert me == {'Ticks': 5, 'Extra': 5}, me
+            if bases:
+                assert [p.path(i[0]) for i in st.interfaces] == ['/Game/_ElytrasMods/MemEdit/IPoke.IPoke_C'] \
+                    and was.interfaces == [], st.interfaces
+                r, _ = run(b, 'Poke', self_vars={'Ticks': 2, 'Level': 4}, X=1)
+                assert r == 7, r
+                me = {'Ticks': 2, 'Level': 4}
+                run(b, 'Ping', self_vars=me)                        # the stub: does nothing
+                assert me == {'Ticks': 2, 'Level': 4}, me
+            proc = subprocess.run([ASSETGEN, 'roundtrip', tmp], capture_output=True, encoding='utf-8')
+            assert proc.returncode == 0 and 'classes whose payload reads exactly (ReadClassLayout)' in proc.stdout \
+                and ' 0 differ' in proc.stdout, proc.stdout
+            keeps_invariants(b)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+    # A component or a dispatcher of its own is refused: the construction script stays the game's.
+    for body, why in (('  UE_COMPONENT(USceneComponent, Pivot);\n', 'a patch adds no component or widget'),
+                      ('  UE_DISPATCHER(OnHit, int32 Damage);\n', 'a patch adds no dispatcher')):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, 'MemEdit.cpp')
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(decl % ('', body))
+            proc = assetgen_compile([path, UEAPI, tmp, '--game', comp_game])
+            assert proc.returncode != 0 and why in proc.stdout, (body, proc.stdout)
+    print('ok  EditTest: a UE_PATCH\'s own members are variables added to the game\'s class, its initializers (or its '
+          'UE_DEFAULTS) on the default object, and an interface of its own is added with its methods and variables')
+
+
 def edits():
     """EditTest (S38): UE_ASSET_EDIT and UE_PATCH rewrite AssetTest's cooked packages in place. Only the named tags
     change (replaced where they were, or appended); every name and import the package had keeps its index, a new one
@@ -3737,8 +4057,10 @@ def edits():
              ['--game', game_dir]),
             ('EditNative', 'class Tweaks : public AActor {\n  UE_PATCH;\n  UE_DEFAULTS { bHidden = true; }\n};\n',
              'a patch derives from the game Blueprint it edits', ['--game', game_dir]),
-            ('EditMember', 'class Tweaks : public UMoodDef {\n  UE_PATCH;\n  int32 Extra;\n  UE_DEFAULTS { Count = 1; }\n};\n',
-             'a member or an interface of its own is not built yet', ['--game', game_dir]),
+            ('EditMember', 'class Tweaks : public UMoodDef {\n  UE_PATCH;\n  UE_REPLICATED(int32, Extra);\n};\n',
+             'a patch\'s own member does not replicate', ['--game', game_dir]),
+            ('EditClash', 'class Tweaks : public UMoodDef {\n  UE_PATCH;\n  int32 count;\n};\n',
+             'already has a variable Count', ['--game', game_dir]),
             ('EditNoGame', 'class Tweaks : public UMoodDef {\n  UE_PATCH;\n  UE_DEFAULTS { Count = 1; }\n};\n',
              'pass the folder /Game is in', [])):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3750,8 +4072,8 @@ def edits():
                         '  UE_CLASS("/Game/_ElytrasMods/AssetTest/UMoodDef", "UMoodDef_C");\n  int32 Count;\n};\n%s' % (name, src))
             proc = assetgen_compile([path, UEAPI, tmp] + flags)
             assert proc.returncode != 0 and why in proc.stdout, (name, proc.stdout)
-    print('ok  EditTest: an edit of a mod\'s own asset, a patch of a native class, a patch with a member of its own, and '
-          'no --game are refused')
+    print('ok  EditTest: an edit of a mod\'s own asset, a patch of a native class, a replicated member of a patch\'s own, '
+          'one named like the game\'s, and no --game are refused')
 
     # A component's defaults. CompTest stands in for a game Blueprint, declared as UeApi declares one, and Lamp for one of
     # its own SCS components: the patch lands in the Lamp's template. A parent Blueprint's component the class does not
@@ -3879,6 +4201,7 @@ def edits():
     print('ok  EditTest: a UE_PATCH method replaces the Blueprint\'s function of that name, Parent:: reaching the game\'s body '
           '(an RPC\'s as a plain function), or is added to it (a helper, an override); a stale declaration and other '
           'parameters are refused')
+    patch_members(comp_game)
 
     # A namespace-scope variable a patch's method uses is the one member of a class of its own (LowerGlobal), cooked into
     # the mod's package as a class's global is: the patched function reads and writes that class's default object.
@@ -4156,6 +4479,7 @@ def edit_staleness():
 interfaces()
 interface_bodies()
 interface_calls()
+interface_to_object()
 inherited_defaults()
 parent_call()
 pure_virtual()
@@ -4163,10 +4487,12 @@ func_stub_super()
 engine_names()
 object_forwards()
 api_stub()
+api_stub_interface()
 static_assets()
 ue_assets()
 asset_elsewhere()
 globals_()
+asset_values()
 edits()
 path_edits()
 game_edits()
@@ -4555,6 +4881,22 @@ def spawn_relative():
     print('ok  SpawnTest: a bare relative source path finds X::StaticClass() qualifiers')
 
 
+def spawn_unity():
+    """Compiled through a unity file elsewhere that includes SpawnTest.cpp by its absolute path, as bpbuild compiles a
+    mod: the qualifiers are read from the included source, so `Gear::USpawnGear::StaticClass()` is still the mod class
+    and not the UObject it inherits StaticClass from (the bug that made a mod's memberless base class cook as AActor)."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        unity = os.path.join(tmp, 'SpawnTest.unity.cpp')
+        with open(unity, 'w', encoding='utf-8') as f:
+            f.write('#include "%s"\n' % os.path.join(TESTS, 'SpawnTest.cpp').replace('\\', '/'))
+        proc = assetgen_compile([unity, UEAPI, tmp])
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        vm = VM(os.path.join(tmp, 'SpawnTest'), {})
+        assert (vm.call('OwnClass'), vm.call('GearClass')) == ('SpawnTest_C', 'USpawnGear_C')
+    print('ok  SpawnTest: a unity file that includes the source finds X::StaticClass() qualifiers')
+
+
 def outer_runs():
     """GetTypedOuter / GetOutermostTypedOuter over a faked outer chain: nearest / farthest outer of the kind, the
     object itself never a candidate, null when there is none; and no function of their own."""
@@ -4612,6 +4954,7 @@ await_values()
 delegate_targets()
 spawn_runs()
 spawn_relative()
+spawn_unity()
 outer_runs()
 
 
@@ -7813,8 +8156,12 @@ refused('TimerByNameInline', '  int32 N;\n  inline void Blink() { N = 2; }\n'
 refused('TimerByNameMissing', '  int32 N;\n  void Tock() { N = 3; }\n'
         '  void Start() { UKismetSystemLibrary::K2_SetTimer(this, "Tik", 1.0f, true, 0.0f, 0.0f); }\n',
         'K2_SetTimer by name Tik names no function of the class')
+# The engine's test is ParmsSize > 0, which counts the return value: a method that returns one sets no timer either.
+refused('TimerByNameReturns', '  int32 N;\n  int32 Poll() { return ++N; }\n'
+        '  void Start() { UKismetSystemLibrary::K2_SetTimer(this, "Poll", 1.0f, true, 0.0f, 0.0f); }\n',
+        'K2_SetTimer by name Poll names a function that returns a value')
 print('ok  delegate refusals: a bind of another class\'s method on this, a call to a dispatcher\'s signature, a timer by a '
-      'name with parameters, inline or missing')
+      'name with parameters, a return value, inline or missing')
 
 
 # ---- SCS: the SimpleConstructionScript, its nodes, the component templates and the inheritable component handler
@@ -8020,18 +8367,6 @@ def effective(p, i, prop):
 def node_named(p, ci, var):
     s = comp.scs(p, ci)
     return next((n for n in s[1].values() if n.name == var), None) if s else None
-
-
-def compile_to(src_text, mod, extra=()):
-    """Compiles a source text as tests/<mod>.cpp would be, into a fresh temp dir: (dir, the package folder, stdout)."""
-    tmp = tempfile.mkdtemp()
-    src = os.path.join(tmp, mod + '.cpp')
-    with open(src, 'w', encoding='utf-8') as f: f.write(src_text)
-    out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', mod)
-    os.makedirs(out)
-    proc = assetgen_compile([src, UEAPI, out] + list(extra))
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    return tmp, out, proc.stdout
 
 
 # ---- CompTwoSet: two defaults on one inherited component, and a parent's rebuild
@@ -10684,20 +11019,51 @@ def latent_refusals():
             'leave the FLatentActionInfo argument out')
     refused('WaitUberName', '  void ExecuteUbergraph_WaitUberName(int32 EntryPoint) {}\n'
             '  void F() { UKismetSystemLibrary::Delay(1.0f); }\n', "is the name of a class's ubergraph")
-    # A UE_PATCH of AssetTest's AssetUser, AssetTest's output standing in for the game as EditTest has it.
-    import tempfile
-    with tempfile.TemporaryDirectory() as tmp:
-        src = os.path.join(tmp, 'WaitPatch.cpp')
-        with open(src, 'w', encoding='utf-8') as f:
-            f.write('#include "UeApi/Types.h"\n#include "UeApi/FSD.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/WaitPatch");\n'
-                    'class AssetUser : public AActor {\npublic:\n'
-                    '  UE_CLASS("/Game/_ElytrasMods/AssetTest/AssetUser", "AssetUser_C");\n};\n'
-                    'class UserWaits : public AssetUser {\n  UE_PATCH;\npublic:\n'
-                    '  void ReceiveBeginPlay() { UKismetSystemLibrary::Delay(1.0f); }\n};\n')
-        code, log = latent_compile_log(src, os.path.join(ROOT, 'AssetTest', 'FSD', 'Content'))
-        assert code and 'a patched function that waits' in log, log
     print('ok  a function that waits: refused when static, returning, by reference, passing its own FLatentActionInfo, '
-          'shadowing the ubergraph, or patched into a game class')
+          'or shadowing the ubergraph')
+
+
+def patch_waits():
+    """A UE_PATCH method that waits, in CompTest (standing in for a game Blueprint): its code after the wait runs from an
+    ubergraph of the patch's own, added to the class. Only the class's own ubergraph gets a persistent frame (runvm, as
+    GetPersistentUberGraphFrame), so what the method keeps across the wait - a local, its parameter - is a member of the
+    class: the resumed half reads what the first half left, though the game changed Ticks meanwhile. The class's own
+    ubergraph, if any, stays the game's."""
+    comp_game = os.path.join(ROOT, 'CompTest', 'FSD', 'Content')
+    src = ('#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/WaitPatch");\n'
+           'class CompTest : public AActor {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/CompTest/CompTest", "CompTest_C");\n'
+           '  int32 Ticks;\n  void ReceiveBeginPlay();\n};\n'
+           'class Tweaks : public CompTest {\n  UE_PATCH;\npublic:\n  int32 Extra = 3;\n'
+           '  void ReceiveBeginPlay() { int32 Before = Ticks; UKismetSystemLibrary::Delay(1.0f); Ticks = Before + Extra; '
+           'Wait2(Before); }\n'
+           '  void Wait2(int32 From) { UKismetSystemLibrary::Delay(0.5f); Ticks = Ticks + From * 100; }\n'
+           '  void ReceiveTick(float DeltaSeconds) { UKismetSystemLibrary::Delay(0.5f); Ticks = Ticks + 1000; }\n};\n')
+    tmp, out, _ = compile_to(src, 'WaitPatch', ['--game', comp_game])
+    try:
+        import invariants
+        b = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', 'CompTest', 'CompTest')
+        vm = VM(b, {'Delay': latent_call}, Ticks=1, Extra=3)
+        vm.call('ReceiveBeginPlay')
+        assert vm.self.vars['Ticks'] == 1 and len(vm.latent) == 1, vm.self.vars
+        vm.self.vars['Ticks'] = 50                              # the game moves on while the patch waits
+        vm.fire(0)
+        assert vm.self.vars['Ticks'] == 4 and len(vm.latent) == 1, vm.self.vars    # Before (1) + Extra, then Wait2 waits
+        vm.fire(0)
+        assert vm.self.vars['Ticks'] == 104, vm.self.vars      # Wait2's From, kept across its own wait
+        a = invariants.Package(os.path.join(comp_game, '_ElytrasMods', 'CompTest', 'CompTest'))
+        p = invariants.Package(b)
+        ci = p.find('CompTest_C')
+        assert p.tag(ci, 'UberGraphFunction') == a.tag(a.find('CompTest_C'), 'UberGraphFunction'), 'the class\'s ubergraph moved'
+        assert 'UberGraphFrame' not in [x.name for x in p.struct(ci).props[len(a.struct(a.find('CompTest_C')).props):]]
+        # An added override that waits is still an override: its stub links to the event it overrides.
+        assert p.path(p.struct(p.find('ReceiveTick')).super) == '/Script/Engine.Actor:ReceiveTick', p.struct(p.find('ReceiveTick')).super
+        keeps_invariants(b)
+        proc = subprocess.run([ASSETGEN, 'roundtrip', tmp], capture_output=True, encoding='utf-8')
+        assert proc.returncode == 0 and ' 0 differ' in proc.stdout, proc.stdout
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print('ok  a UE_PATCH method that waits resumes from an ubergraph of the patch\'s own, its locals kept as members of '
+          'the game\'s class across the wait')
 
 
 def latent_info_written():
@@ -10957,6 +11323,7 @@ def wait_hold():
 
 
 latent_refusals()
+patch_waits()
 latent_info_written()
 latent_worlds()
 latent_repeats()
@@ -11059,7 +11426,10 @@ def input_refusals():
             ('InputKeyName', '  UE_INPUT_KEY("Space") void F() {}\n', 'never fire: the closest is SpaceBar', 'AActor'),
             ('InputKeyDigit', '  UE_INPUT_KEY("1") void F() {}\n', 'never fire: the closest is One', 'AActor'),
             ('InputMisplaced', '  UE_INPUT_KEY("F5") int32 N = 0;\n', 'marks no method', 'AActor'),
-            ('InputLast', '  void F() {}\n  UE_INPUT_KEY("F5")\n', 'marks no method', 'AActor')):
+            ('InputLast', '  void F() {}\n  UE_INPUT_KEY("F5")\n', 'marks no method', 'AActor'),
+            # UE_TOOLTIP and UE_KEYWORDS describe the method that follows them the same way.
+            ('DocMisplaced', '  UE_TOOLTIP("Count") int32 N = 0;\n', 'UE_TOOLTIP("Count") marks no method', 'AActor'),
+            ('DocLast', '  void F() {}\n  UE_KEYWORDS("a b")\n', 'UE_KEYWORDS("a b") marks no method', 'AActor')):
         refused(mod, body, why, base=base)
 
 
@@ -11153,6 +11523,9 @@ def timelines_of(base):
                     for f in tl:
                         if f['type'] == 'ObjectProperty':
                             c = struct.unpack('<i', f['value'])[0]
+                            if c < 0:       # a curve asset (External Curve): its class and path
+                                curve = (f['name'], p.class_of(c), p.path(c))
+                                continue
                             assert c > 0 and p.exports[c - 1]['outer'] == ci + 1, (base, p.path(c))
                             curve = (f['name'], p.class_of(c), curve_channels(p, c - 1), p.tag(c - 1, 'bIsEventCurve') is not None)
                         else:
@@ -11272,6 +11645,70 @@ print('ok  TimelineRefusals: a timeline on no actor, a bad length or option, a t
       'a second update method, or marking no method is refused')
 
 
+def timeline_curves():
+    """A track over a curve asset (the editor's External Curve, as BP_Refinery_LandingZone's Timeline_0 is cooked): its
+    curve is the asset's import and bIsExternalCurve is set, with no curve of the class's own, and the template creates
+    the import before it serializes. UE_FLOAT_CURVE and kin cook curve assets of the mod's own, as the game's
+    Hologram_FadeIn is: one export of the curve class, Public | Standalone, its keys sorted with Auto tangents, a row of
+    the registry, and `&Ramp` points at it from a default."""
+    base = asset('TimelineCurves')
+    folder = os.path.dirname(base)
+    mod = '/Game/_ElytrasMods/TimelineCurves/'
+    fade = timelines_of(base).pop('Fade')
+    ext = lambda name, cls, path: dict(PropertyName=name, bIsExternalCurve=True, Curve=(cls, cls, path))
+    assert fade['FloatTracks'] == {
+        'Alpha': ext('Alpha', 'CurveFloat', mod + 'Ramp.Ramp'),
+        'Fog': ext('Fog', 'CurveFloat', '/Game/LevelElements/Blueprints/Hologram_FadeIn.Hologram_FadeIn'),
+        'Own': dict(PropertyName='Own', bIsExternalCurve=False, Curve=('CurveFloat', 'CurveFloat',
+                    [[('Linear', 0.0, 0.0, 0.0, 0.0), ('Linear', 2.0, 1.0, 0.0, 0.0)]], False))}, fade['FloatTracks']
+    assert fade['VectorTracks'] == {'Lift': ext('Lift', 'CurveVector', mod + 'Curves/Path.Path')}, fade['VectorTracks']
+    assert fade['LinearColorTracks'] == {'Tint': ext('Tint', 'CurveLinearColor', mod + 'Curves/Glow.Glow')}, fade
+    edl = dump('dumpedl.py', base + '.uasset')
+    before = re.search(r'\] Fade_Template\n\s+CreateBeforeSer  (.*)', edl).group(1)
+    for c in ('Ramp(CurveFloat)', 'Path(CurveVector)', 'Glow(CurveLinearColor)', 'Hologram_FadeIn(CurveFloat)'):
+        assert 'imp:' + c in before, before
+    p, ci = class_pkg(base)
+    cdo = next(i for i, e in enumerate(p.exports) if e['name'] == 'Default__TimelineCurves_C')
+    assert tag_values(p, cdo, [p.tag(cdo, 'Picked')]) == {'Picked': mod + 'Ramp.Ramp'}
+
+    lin, cub = (lambda t, v: ('Linear', t, v, 0.0, 0.0)), (lambda t, v, g: ('Cubic', t, v, g, g))
+    for name, cls, channels in (
+            ('Ramp', 'CurveFloat', [[lin(0.0, 0.0), cub(1.0, 2.0, 4.0), lin(2.0, 8.0)]]),
+            ('Curves/Path', 'CurveVector', [[lin(0.0, 0.0), lin(2.0, z)] for z in (0.0, 0.0, 50.0)]),
+            ('Curves/Glow', 'CurveLinearColor', [[lin(0.0, 1.0), lin(2.0, c)] for c in (1.0, 0.0, 0.0, 1.0)])):
+        c = invariants.Package(os.path.join(folder, *name.split('/')))
+        assert [(e['name'], c.class_of(i + 1), e['flags'] & 0xF) for i, e in enumerate(c.exports)] == [
+            (name.split('/')[-1], cls, 0xB)], c.exports      # Public | Standalone | Transactional
+        assert curve_channels(c, 0) == channels, (name, curve_channels(c, 0))
+        assert (mod + name + '.' + name.split('/')[-1], cls) in registry_rows(registry_of('TimelineCurves')), name
+        keeps_invariants(c.base)
+    keeps_invariants(base)
+
+    fields = {'Alpha': 0.5, 'Fog': 0.25, 'Seen': 0.0}
+    run(base, 'OnFade', self_vars=fields)
+    assert fields['Seen'] == 0.75, fields
+
+
+def timeline_curve_refusals():
+    """A curve track names a curve asset of its own kind; a mod curve's keys are a track's."""
+    for mod, top, body, why in (
+            ('TcKind', 'UE_VECTOR_CURVE(P, (0, 0, 0, 0));\n', '  UE_TIMELINE(T, 1);\n  UE_FLOAT_TRACK_CURVE(T, A, P);\n',
+             'UE_FLOAT_TRACK_CURVE names P, a UCurveVector: the track\'s float is played from a UCurveFloat'),
+            ('TcNone', 'UCurveFloat *Loose = nullptr;\n', '  UE_TIMELINE(T, 1);\n  UE_FLOAT_TRACK_CURVE(T, A, Loose);\n',
+             'UE_FLOAT_TRACK_CURVE names no curve asset'),
+            ('TcKey', 'UE_FLOAT_CURVE(R, (0));\n', '', 'R: UE_FLOAT_CURVE has the key (0), which is not (time, value)'),
+            ('TcNoKeys', 'UE_COLOR_CURVE(R);\n', '', 'R: UE_COLOR_CURVE has no keys')):
+        refused(mod, body, why, top=top)
+
+
+timeline_curves()
+print('ok  TimelineCurves: a track over a curve asset names its import as an External Curve, a game one or one of the '
+      'mod\'s own, which cooks as the game\'s curve assets are, keys sorted with Auto tangents')
+timeline_curve_refusals()
+print('ok  TimelineCurveRefusals: a curve track of the wrong kind or over no curve asset, and a mod curve with a bad key '
+      'or none, is refused')
+
+
 # ---- EDITS: invariants on the packages UE_PATCH / UE_ASSET_EDITS produce from the game (invariant_rules/edits.py)
 # sweep() never reaches those, so each check here runs invariants.py's rules on them itself. A game package's own findings
 # are not the edit's: for those only what the edit adds counts. The mods are inline, as edits()'s are: an S38 mod
@@ -11282,7 +11719,6 @@ import invariants
 from invariant_rules import edits as edits_rules
 
 
-EDIT_HEAD = '#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\n#include "UeApi/FSD.h"\n'
 COOKED_RULES = {'cooked_instancing_flags', 'cooked_instancing_scopes', 'cooked_template_tags_listed', 'edited_template_changes_listed'}
 
 
@@ -11290,18 +11726,6 @@ def pinned_elsewhere(f):
     """A finding a pending test below pins, which the behaviour checks leave to it. None now: EditAddTick, which pinned
     COMP's receive_tick_sets_can_ever_tick, passes (a ReceiveTick a patch adds turns the class's tick on)."""
     return False
-
-
-def compile_edit(tmp, mod, src, game):
-    """Compiles an S38 mod (its whole source) against `game`, the folder /Game is in, into tmp; returns the process and
-    the Content folder the edited packages are written to, each at its own /Game path."""
-    path = os.path.join(tmp, mod + '.cpp')
-    with open(path, 'w', encoding='utf-8') as f:
-        f.write(src)
-    out = os.path.join(tmp, 'FSD', 'Content', '_ElytrasMods', mod)
-    os.makedirs(out)
-    proc = assetgen_compile([path, UEAPI, out, '--game', game])
-    return proc, os.path.join(tmp, 'FSD', 'Content')
 
 
 def edit_findings(edited, game_root, only=None, pinned=lambda f: False):
@@ -11482,7 +11906,17 @@ MAP_PATCH_CASES = (('Ids = {7};\n    Score = {{"a", 9}};', {('Ids',): {7}, ('Sco
                     {('Held', 'Ids'): {1, 7}, ('Held', 'Score'): {'a': 1, 'b': 2}, ('Deep', 'In', 'Ids'): {7},
                      ('Deep', 'In', 'Score'): {'c': 3}}),
                    ('Score = {{"a", 9}, {"a", 1}};', {('Score',): {'a': 1}}),
-                   ('Text = {{"a", 5}, {"A", 1}};', {('Text',): {'A': 1}}))
+                   ('Text = {{"a", 5}, {"A", 1}};', {('Text',): {'A': 1}}),
+                   # One element at a time, merged into the value the CDO holds (PropSetDelta's {2, 3}, {a: 5, b: 2}),
+                   # or, where it has no tag (Deep), into the archetype's, as a C++ map's operator[], Add and Remove do.
+                   ('Score["c"] = 7;\n    Ids.Add(9);\n    Ids.Add(2);\n    Score.Remove("b");',
+                    {('Score',): {'a': 5, 'c': 7}, ('Ids',): {2, 3, 9}}),
+                   ('Score["a"] = 1;\n    Ids.Remove(3);\n    Ids.Remove(8);', {('Score',): {'a': 1, 'b': 2}, ('Ids',): {2}}),
+                   ('Deep.In.Score["d"] = 4;\n    Deep.In.Ids.Remove(1);\n    Held.Score.Add("c", 3);\n    Held.Ids.Add(5);',
+                    {('Deep', 'In', 'Score'): {'a': 1, 'c': 3, 'd': 4}, ('Deep', 'In', 'Ids'): {2},
+                     ('Held', 'Score'): {'a': 5, 'b': 2, 'c': 3}, ('Held', 'Ids'): {2, 3, 5}}),
+                   ('Score["z"] = 1;\n    Score.Remove("z");\n    Text["a"] = 9;', {('Score',): {'a': 5, 'b': 2}, ('Text',): {'A': 9}}),
+                   ('Score = {{"x", 1}};\n    Score["y"] = 2;', {('Score',): {'x': 1, 'y': 2}}))
 
 
 def edit_whole_containers():
@@ -11527,6 +11961,48 @@ def edit_whole_containers():
             got = loads(invariants.Package(os.path.join(content, '_ElytrasMods', 'PropSetDelta', 'PropSetDelta')))
         want = {**vanilla, **assigned}
         assert got == want, 'the patched CDO loads %s; the patch says %s, so it should load %s' % (got, body, want)
+
+
+def edit_elements():
+    """S38: UE_ASSET_EDITS changes one element of an asset's TMap or TSet, `Score["c"] = 3`, `Ids.Add(4)`,
+    `Score.Remove("a")`, merged into the asset's own delta: the asset loads its archetype's value (the class's CDO),
+    takes out what it lists as removed, adds the rest. ED_Elem's own Score {b: 2} over the CDO's {a: 1} becomes {b: 2,
+    c: 3}; its Ids, which it has no tag of, the CDO's {1} plus 4. A map inside an array's element is refused, and the
+    message says to assign the whole element."""
+    import invariants
+    with tempfile.TemporaryDirectory() as tmp:
+        game_src = os.path.join(tmp, 'ElemGame.cpp')
+        with open(game_src, 'w', encoding='utf-8') as f:
+            f.write(EDIT_HEAD + 'UE_MOD_PACKAGE("/Game/_ElytrasMods/ElemGame");\n'
+                    'struct FElemHolder {\n  UE_STRUCT_IN("/Game/_ElytrasMods/ElemGame");\n  TMap<FName, int32> In;\n};\n'
+                    'class UElemDef : public UPrimaryDataAsset {\npublic:\n  TMap<FName, int32> Score = {{"a", 1}};\n'
+                    '  TSet<int32> Ids = {1};\n  TArray<FElemHolder> Arr;\n};\n'
+                    'UElemDef ED_Elem = {.Score = {{"b", 2}}, .Arr = {{{{"q", 1}}}}};\n')
+        game = os.path.join(tmp, 'game', 'FSD', 'Content')
+        os.makedirs(os.path.join(game, '_ElytrasMods', 'ElemGame'))
+        proc = assetgen_compile([game_src, UEAPI, os.path.join(game, '_ElytrasMods', 'ElemGame')])
+        assert proc.returncode == 0, proc.stdout
+        decl = ('struct FElemHolder {\n  UE_STRUCT_IN("/Game/_ElytrasMods/ElemGame");\n  TMap<FName, int32> In;\n};\n'
+                'class UElemDef : public UPrimaryDataAsset {\npublic:\n  UE_CLASS("/Game/_ElytrasMods/ElemGame/UElemDef", "UElemDef_C");\n'
+                '  TMap<FName, int32> Score;\n  TSet<int32> Ids;\n  TArray<FElemHolder> Arr;\n};\n'
+                'UE_ASSET_AT(UElemDef, ED_Elem, "/Game/_ElytrasMods/ElemGame/ED_Elem");\n')
+        head = EDIT_HEAD + 'UE_MOD_PACKAGE("/Game/_ElytrasMods/ElemEdit");\n' + decl
+        os.makedirs(os.path.join(tmp, 'a'))
+        proc, content = compile_edit(os.path.join(tmp, 'a'), 'ElemEdit', head + 'UE_ASSET_EDITS {\n  ED_Elem.Score["c"] = 3;\n'
+                                     '  ED_Elem.Ids.Add(4);\n  ED_Elem.Score.Remove("a");\n}\n', game)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        cls = invariants.Package(os.path.join(game, '_ElytrasMods', 'ElemGame', 'UElemDef'))
+        cdo = cls.find('Default__UElemDef_C')
+        asset = invariants.Package(os.path.join(content, '_ElytrasMods', 'ElemGame', 'ED_Elem'))
+        ai = asset.find('ED_Elem')
+        got = {p: loaded_container(asset, ai, p, k, loaded_container(cls, cdo, p, k, set() if k == 'set' else {}))
+               for p, k in (('Score', 'map'), ('Ids', 'set'))}
+        assert got == {'Score': {'b': 2, 'c': 3}, 'Ids': {1, 4}}, got
+        os.makedirs(os.path.join(tmp, 'b'))
+        proc, _ = compile_edit(os.path.join(tmp, 'b'), 'ElemEdit', head + 'UE_ASSET_EDITS { ED_Elem.Arr[0].In["x"] = 1; }\n', game)
+        assert proc.returncode != 0 and 'inside an array\'s element or a native struct cannot be changed on its own yet; assign the whole element' in proc.stdout, proc.stdout
+    print('ok  ElemEdit: UE_ASSET_EDITS puts, adds and removes one element of an asset\'s TMap / TSet, merged into its delta '
+          'over the archetype; one inside an array\'s element is refused')
 
 
 GRUNT = '#include "UeApi/Game/ENE_Spider_Grunt_Normal_C.h"\n'
@@ -11806,7 +12282,9 @@ if not globals().get('EDITS_EXPLORE'):     # set by the dev loop's exploration d
     edit_whole_containers()
     print('ok  MapPatch: a patch\'s whole TSet / TMap loads as written, a property or one inside a struct (by a member '
           'path or in a whole struct): the archetype\'s elements it drops are listed as removed; a key given twice '
-          'holds its last value, an FString key compared without case')
+          'holds its last value, an FString key compared without case; one element put, added or removed loads as '
+          'the C++ map\'s operator[], Add and Remove leave it')
+    edit_elements()
     class_default_edits()
     print("ok  ClassDefaults: UE_ASSET_EDIT and UE_PATCH write a class into a cooked package: a new import created first, "
           "the patched class's own as its export")

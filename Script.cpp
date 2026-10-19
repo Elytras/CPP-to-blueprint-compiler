@@ -691,7 +691,7 @@ void FScript::FieldPath(const std::vector<std::string>& Path, FIndex Owner)
     // On disk: segment count, segments, owning object. In memory: one pointer.
     Ar.I32(int32(Path.size()));
     for (const std::string& Segment : Path) Ar.Name(Segment);
-    Ar.Idx(Owner);
+    Ar.Idx(!Path.empty() && IsFrameMember(Path.back(), Owner) ? MemberClass : Owner);
     Memory += kMemObjectRef;
 }
 
@@ -704,13 +704,13 @@ void FScript::NullFieldPath()
 
 void FScript::LocalVariable(const std::string& PropertyName, FIndex Owner)
 {
-    Op(EX_LocalVariable);
+    Op(IsFrameMember(PropertyName, Owner) ? EX_InstanceVariable : EX_LocalVariable);
     FieldPath(PropertyName, Owner);
 }
 
 void FScript::LocalOutVariable(const std::string& PropertyName, FIndex Owner)
 {
-    Op(EX_LocalOutVariable);
+    Op(IsFrameMember(PropertyName, Owner) ? EX_InstanceVariable : EX_LocalOutVariable);
     FieldPath(PropertyName, Owner);
 }
 
@@ -755,6 +755,9 @@ void FScript::Context(const std::function<void(FScript&)>& ObjectExpr,
 
     // Skip count is MEMORY bytes, so the inner expression is built and measured separately first.
     FScript Inner(Ar.Owner());
+    Inner.FrameMembers = FrameMembers;
+    Inner.FrameOwner = FrameOwner;
+    Inner.MemberClass = MemberClass;
     ContextExpr(Inner);
 
     Ar.I32(Inner.MemorySize());
@@ -812,6 +815,13 @@ void FScript::LocalFinalFunction(FIndex Function)
 void FScript::LetValueOnPersistentFrame(const std::string& PropertyName, FIndex UberGraph,
                                         const std::function<void(FScript&)>& Value)
 {
+    if (IsFrameMember(PropertyName, UberGraph))
+    {
+        const EExprToken LetOp = FrameMembers->at(PropertyName);
+        const FIndex Class = MemberClass;
+        Let(LetOp, PropertyName, Class, [&](FScript& V) { V.InstanceVariable(PropertyName, Class); }, Value);
+        return;
+    }
     Op(EX_LetValueOnPersistentFrame);
     FieldPath(PropertyName, UberGraph);
     Value(*this);

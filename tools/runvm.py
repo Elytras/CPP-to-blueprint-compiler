@@ -171,6 +171,20 @@ class VM:
         types = runscript.props_of(s.base, owner) if owner in s.exports else {}
         return cleared(types.get(n.rvalue.split('.')[-1]))
 
+    def is_ubergraph(s, fn, _cache={}):
+        """Whether fn runs on the persistent frame: an ExecuteUbergraph_ with FUNC_UbergraphFunction, as ProcessEvent and
+        CallFunction look for one (ScriptCore.cpp). A patch's ubergraph has none: it is not its class's UberGraphFunction,
+        so the engine would hand it a fresh frame (GetPersistentUberGraphFrame), and its frame is members of the class."""
+        if not fn.startswith('ExecuteUbergraph_'): return False
+        if (s.base, fn) not in _cache:
+            import invariants
+            p = invariants.Package(s.base)
+            i = p.find(fn)
+            st = p.struct(i) if i is not None else None
+            # One of another package (a parent's, run on a subclass's object) is a class's own, as the editor makes it.
+            _cache[s.base, fn] = st is None or bool(st.function_flags & 0x8000)
+        return _cache[s.base, fn]
+
     def script(s, fn):
         if fn not in s.scripts:
             stmts = runscript.script_of(s.base, fn)
@@ -182,8 +196,9 @@ class VM:
         if isinstance(me, Obj) and me.cls != s.self.cls and me.cls in s.classes:
             return s.peer(me.cls).call(fn, *args, on=me, **parms)
         stmts, at, names = s.script(fn)
-        env = s.frame(me, fn) if fn.startswith('ExecuteUbergraph_') else {}   # the persistent frame
-        if not fn.startswith('ExecuteUbergraph_'):
+        persistent = s.is_ubergraph(fn)
+        env = s.frame(me, fn) if persistent else {}   # the persistent frame
+        if not persistent:
             # A frame starts zeroed, its locals constructed under FUNC_HasDefaults (ScriptCore.cpp 909-916): a struct
             # local is a struct of zeros, or what InitializeValue leaves in it (runscript.frame_defaults: FTransform's
             # identity, FHitResult's Time 1, a UserDefinedStruct's defaults), which a Make Struct's temp holds. A
@@ -217,6 +232,7 @@ class VM:
             if o == 0x2E:
                 v = ev(n.kids[0]); return v if s.isa(v, n.val) else None
             if o in (0x52, 0x54, 0x55):                     # an interface cast: the object behind it, if it is of the class
+                if o != 0x55 and n.val == 'Interface': return None     # ImplementsInterface(UInterface) is false, Class.cpp 4651
                 v = ev(n.kids[0]); return v if v not in (None, 0) and s.isa(v, n.val) else None
             if o == 0x51: return ev(n.kids[0])              # EX_InterfaceContext: the object behind the interface
             if o == 0x38:                                   # CST_ObjectToBool / CST_InterfaceToBool: GetObject() != null
@@ -235,6 +251,11 @@ class VM:
                 if isinstance(base, dict) and n.val not in base and 'Data' in base:      # an array view of an address:
                     return [s.mem[base['Data'] - 0x20].outer]                          # UObjectBase::OuterPrivate
                 return base.get(n.val, 0) if isinstance(base, dict) else 0
+            if o == 0x6B and n.kids[0].op == 0x42 and runscript.view_of(n.kids[0].val):
+                at = ev(n.kids[0].kids[0]).get('Data', 0)
+                if at - 0x20 not in s.mem:                  # raw memory, not an object's OuterPrivate (above)
+                    size, read, _ = runscript.view_of(n.kids[0].val)
+                    return read(at + ev(n.kids[1]) * size)
             if o == 0x6B: return ev(n.kids[0])[ev(n.kids[1])]
             name = n.val
             if o in (0x1B, 0x45, 0x1C, 0x46, 0x68) and name in s.exports and (ctx is me or ctx.cls == s.self.cls):
@@ -290,6 +311,12 @@ class VM:
             if dest.op == 0x19:
                 obj = ev(dest.kids[0], ctx)
                 return lambda v: obj is not None and store(dest.kids[1], v, obj)
+            if dest.op == 0x6B and dest.kids[0].op == 0x42 and runscript.view_of(dest.kids[0].val):
+                at = ev(dest.kids[0].kids[0], ctx).get('Data', 0)
+                if at - 0x20 not in s.mem:                  # raw memory: a store through a pointer
+                    size, _, write = runscript.view_of(dest.kids[0].val)
+                    at += ev(dest.kids[1], ctx) * size
+                    return lambda v: write(at, v)
             if dest.op == 0x6B:
                 arr, i = ev(dest.kids[0], ctx), ev(dest.kids[1], ctx)
                 return lambda v: (arr.__setitem__(i, v), s.log.append(('set', ctx, dest.kids[0].val)))
