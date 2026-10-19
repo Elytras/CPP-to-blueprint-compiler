@@ -243,7 +243,10 @@ class Body:
         if op == 0x42: return s.member(n)
         if op == 0x6B: return E('%s[%s]' % (s.expr(n.kids[0]).at(P_PRIMARY), s.expr(n.kids[1]).text))
         if op == 0x2E: return E('Cast<%s>(%s)' % (s.fx.types.cls(s.pkg, next(o[1] for o in n.ops if o[0] == 'obj'), s.fx.asset), s.expr(n.kids[0]).text))
-        if op == 0x13: return E('TSubclassOf<%s>(%s)' % (s.fx.types.cls(s.pkg, next(o[1] for o in n.ops if o[0] == 'obj'), s.fx.asset), s.expr(n.kids[0]).text))
+        if op == 0x13:      # Cast To Class: a TSubclassOf conversion alone is unchecked, so the check is spelled out
+            # ponytail: the value is evaluated twice; fine for the variables the cast node reads
+            c, x = s.fx.types.cls(s.pkg, next(o[1] for o in n.ops if o[0] == 'obj'), s.fx.asset), s.expr(n.kids[0]).text
+            return E('(UKismetMathLibrary::ClassIsChildOf(%s, %s::StaticClass()) ? TSubclassOf<%s>(%s) : TSubclassOf<%s>(nullptr))' % (x, c, c, x, c))
         if op in (0x52, 0x54):
             return E('TScriptInterface<%s>(%s)' % (s.fx.types.cls(s.pkg, next(o[1] for o in n.ops if o[0] == 'obj'), s.fx.asset), s.expr(n.kids[0]).text))
         if op == 0x55: return E('Cast<%s>(%s)' % (s.fx.types.cls(s.pkg, next(o[1] for o in n.ops if o[0] == 'obj'), s.fx.asset), s.expr(n.kids[0]).text))
