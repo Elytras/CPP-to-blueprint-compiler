@@ -267,7 +267,7 @@ def kept_source(mod, bp):
 
 def place_kept(mod, bp, stage_fsd):
     """A mod's `kept` packages - assets it ships as they were cooked, which no source of it builds (textures, fonts,
-    a widget with animations) - into its FSD tree for the pak. `paths` lists /Game package paths or folders. Hard
+    a data asset no source fills) - into its FSD tree for the pak. `paths` lists /Game package paths or folders. Hard
     links where the volume allows: a texture folder runs to gigabytes. Returns how many files it placed."""
     kept = mod.get("kept")
     if not kept:

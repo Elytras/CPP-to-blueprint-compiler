@@ -3,8 +3,9 @@
                       [--only <package path prefix>]
 
 A decompiler from cooked UE 4.27 Blueprint packages back to AssetGen C++: every UserDefinedEnum, UserDefinedStruct,
-Blueprint interface and Blueprint class under each --mod root becomes a header (the declaration) and, for a class with
-code, a .cpp (the bodies), laid out in folders that mirror the package paths, so `bpbuild` cooks them back to the same
+Blueprint interface, Blueprint class and widget Blueprint (its tree, event bindings and render-transform animations
+laid out in its constructor) under each --mod root becomes a header (the declaration) and, for a class with code, a
+.cpp (the bodies), laid out in folders that mirror the package paths, so `bpbuild` cooks them back to the same
 paths. Each mod gets an umbrella header that includes everything in dependency order and a <ModName>.cpp holding its
 UE_MOD_PACKAGE.
 

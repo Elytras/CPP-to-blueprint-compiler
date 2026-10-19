@@ -72,6 +72,8 @@ class Values:
         if ty in ('ByteProperty', 'EnumProperty'):
             if len(b) == 1: return str(b[0])
             entry = s.name_at(pkg, b, 0)
+            if prop is None and t and t.get('enum', 'None') != 'None':     # a widget's or a slot's: the tag names its enum
+                return s.cx.enum_of_tag(t['enum'], entry)
             return s.cx.enum_by_name(pkg, prop, entry)
         if ty in ('ObjectProperty', 'ClassProperty', 'InterfaceProperty'):
             idx = struct.unpack('<i', b[:4])[0]
@@ -352,6 +354,17 @@ class Ctx:
             if len(owners) == 1: return '%s::%s' % (owners[0], short)
         return '/* bpdecomp: %s */ {}' % entry
 
+    def enum_of_tag(s, enum, entry):
+        """An enum tag's value by the enum name the tag carries, for a tag with no property at hand: a mod enum of that
+        name, else UeApi's."""
+        short = entry.split('::', 1)[-1]
+        for a in s.m.assets.values():
+            if a.kind == 'enum' and a.pkg.exports[a.export]['name'] == enum:
+                for (n, val), raw in zip(s.run.enum_entries(a), s.run.enum_raw(a)):
+                    if raw == short: return '%s::%s' % (s.types.spell_mod(a, s.asset), n)
+        cpp = next((v[0] for (top, name), v in s.api.enums.items() if name == enum), None)
+        return '%s::%s' % (cpp, short) if cpp else '/* bpdecomp: %s */ {}' % entry
+
     # objects
     def object_ref(s, body, idx):
         return s.object_ref_static(s.pkg, idx, s.asset)
@@ -420,6 +433,7 @@ class Ctx:
                                     if '&' in ty and 'const' not in ty: info.out.add(k)
                             return info
                 if cls is not None: sig = s.run.find_mod_function(cls, fname)
+                nsig = None
                 if cls is None and not info.static:
                     t = body.type_of(obj)
                     if t and t.endswith('*'):
@@ -431,6 +445,14 @@ class Ctx:
                             for k, (ty, _n) in enumerate(params):
                                 info.hints.append(body.hint_of_ctype(ty))
                                 if '&' in ty and 'const' not in ty: info.out.add(k)
+                if not sig and not nsig and obj.op in B.VARS:    # an engine class's method (UWidget's SetVisibility): UeApi's types
+                    p, ppkg = body.prop_of_var(obj)
+                    native = s.types.cls(ppkg, p.ref, s.asset) if p is not None and p.type == 'ObjectProperty' else None
+                    nsig = next((r for c in (s.m.ancestors(native.split('::')[-1]) if native else [])
+                                 for r in [s.run.native_sig(c, fname, nargs)] if r), None)
+                    if nsig:
+                        info.hints = [body.hint_of_ctype(ty) for ty, _ in nsig[1]]
+                        info.out = {k for k, (ty, _) in enumerate(nsig[1]) if '&' in ty and 'const' not in ty}
             if sig: s.apply_mod_sig(body, info, *sig)
             return info
         fidx = next(o[1] for o in n.ops if o[0] == 'obj')
@@ -476,6 +498,8 @@ class Ctx:
             if fname in ('Map_Keys', 'Map_Values', 'Set_ToArray'): info.out.add(1)
         info.pure = info.lib in B.PURE_MATH or (info.container and '_' in fname and fname.split('_', 1)[1] in
                                                   ('Length', 'Get', 'Contains', 'Find', 'IsValidIndex', 'LastIndex'))
+        if obj is None and not info.static and fname == body.method:
+            info.super_call = True      # Parent: PreConstruct, an engine class's event; unqualified it would recurse
         return info
 
     def apply_mod_sig(s, body, info, fpkg, st):
@@ -658,9 +682,9 @@ class Run:
             if cands:
                 exact = [c for c in cands if len(c[1]) == nargs]
                 res = exact[0] if exact else max(cands, key=lambda c: len(c[1]))
-        if res is None and cls.startswith('Game::') is False:
-            # a game class may declare it on a parent: try the parent named in the header
-            pass
+        base = s.api.bases.get(cls.split('::')[-1])
+        if res is None and base:            # declared on a parent: UBorder's SetVisibility is UWidget's
+            res = s.native_sig(base, fn, nargs)
         s._native_sig[key] = res
         return res
 

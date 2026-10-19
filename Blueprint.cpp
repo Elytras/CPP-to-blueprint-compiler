@@ -3,6 +3,7 @@
 #include "Uncooked.h"
 
 #include <algorithm>
+#include <array>
 
 namespace Uasset
 {
@@ -415,7 +416,16 @@ void FBlueprintClass::Finish()
     const int32 RowFirstWidget = RowTree + 1;
     const int32 RowFirstWidgetSlot = RowFirstWidget + int32(Widgets.size());
     const int32 NumTreeRows = Widgets.empty() ? 0 : 1 + int32(Widgets.size() + WidgetSlots.size());
-    const int32 RowRootTemplate = RowTree + NumTreeRows;
+    /* Then each widget animation: the WidgetAnimation, its MovieScene, and a track and its section per widget it keys. */
+    const int32 RowFirstAnimation = RowTree + NumTreeRows;
+    std::vector<int32> AnimationRows;
+    int32 NumAnimationRows = 0;
+    for (const FAnimation& A : Animations)
+    {
+        AnimationRows.push_back(RowFirstAnimation + NumAnimationRows);
+        NumAnimationRows += 2 + 2 * int32(A.Tracks.size());
+    }
+    const int32 RowRootTemplate = RowFirstAnimation + NumAnimationRows;
     const int32 RowScsNode = RowRootTemplate + 1;
     /* Each UE_COMPONENT takes two rows, archetype then node, so the SCS lands after them all. */
     const int32 RowFirstComponent = RowScsNode + 1;
@@ -485,6 +495,12 @@ void FBlueprintClass::Finish()
     }
     const bool bHasTree = !Widgets.empty();
     if (bHasTree) Class.CreateBeforeSer.push_back(Exp(RowTree).V);      // listed first, as Basic_FlatButton_C lists it
+    std::vector<FIndex> AnimationObjects;
+    for (const int32 Row : AnimationRows)
+    {
+        AnimationObjects.push_back(Exp(Row));
+        Class.CreateBeforeSer.push_back(Exp(Row).V);
+    }
     std::vector<FIndex> Templates;              // the Timelines list, after the bindings as BP_FragilePlatform_C lists them
     for (const int32 Row : TimelineRows)
     {
@@ -543,6 +559,12 @@ void FBlueprintClass::Finish()
                 }
                 StructArray(V, "Bindings", "DelegateRuntimeBinding", int32(WidgetBindings.size()), Elements);
             }, "StructProperty");
+        /* UWidgetBlueprintGeneratedClass::InitializeWidgetStatic sets each animation variable by its MovieScene's name. */
+        if (!AnimationObjects.empty())
+            Tag(Ar, "Animations", "ArrayProperty", [=](FArc& V) {
+                V.I32(int32(AnimationObjects.size()));
+                for (const FIndex& A : AnimationObjects) V.Idx(A);
+            }, "ObjectProperty");
         if (!SlotNames.empty())
             Tag(Ar, "NamedSlots", "ArrayProperty", [=](FArc& V) {
                 V.I32(int32(SlotNames.size()));
@@ -969,6 +991,182 @@ void FBlueprintClass::Finish()
                 Ar.Bool(false);
             };
             P.AddExport(std::move(E));
+        }
+    }
+
+    /* Each widget animation, as the editor cooked BasicCheckbox's AnimateXHover (ElytrasModManager): the class's
+       <Name>_INST WidgetAnimation, its MovieScene <Name>, a MovieScene2DTransformTrack per widget it keys and that track's
+       one MovieScene2DTransformSection, all RF_Transactional. The MovieScene possesses each widget by a GUID that
+       AnimationBindings names with the widget's name, which UWidgetAnimation::LocateBoundObjects looks up in the user
+       widget's tree. No CompiledData is written: with none, the first play compiles the sequence (a compiled-data entry
+       with no signature is volatile, MovieSceneCompiledVolatilityManager.cpp 35-50), and a track rebuilds its evaluation
+       field whenever its EvaluationFieldGuid is not its Signature (MovieSceneTrack.cpp 369-380). So every signed object
+       gets a signature, seeded by the class, the animation and its keys: a zero one would match the zero a fresh entry
+       holds, and nothing would ever compile. Channels a track does not key are left out: one evaluates only when it is
+       in the section's TransformMask and has data (MovieScene2DTransformSection.cpp 237-245). */
+    std::map<std::string, FIndex> AnimTemplates;    // one import of each class's default object, for every animation
+    for (size_t AI = 0; AI < Animations.size(); ++AI)
+    {
+        const FAnimation A = Animations[AI];
+        const int32 Row = AnimationRows[AI];
+        const FIndex Inst = Exp(Row), Scene = Exp(Row + 1);
+        std::string Seed = A.Name + ":" + std::to_string(A.EndFrame);
+        for (const FAnimTrack& T : A.Tracks)
+        {
+            Seed += "|" + T.Widget;
+            for (int32 C = 0; C < 7; ++C)
+                for (const FAnimKey& K : T.Channels[C])
+                    Seed += ":" + std::to_string(C) + "," + std::to_string(K.Frame) + "," + std::to_string(K.Value) + ","
+                          + std::to_string(K.Arrive) + "," + std::to_string(K.Leave) + "," + std::to_string(K.Interp);
+        }
+        auto Guid = [Cls = ClassName, Seed](const std::string& Of, uint32 (&Out)[4]) { ScsNodeGuid(Cls, "animation." + Of + "." + Seed, Out); };
+        auto Range = [](FArc& V, int32 End) {          // TRange<FFrameNumber>: [0, End), each bound its type then its value
+            V.U8(1); V.I32(0);                          // ERangeBoundTypes::Inclusive
+            V.U8(0); V.I32(End);                        // ERangeBoundTypes::Exclusive
+        };
+        auto Obj = [&](const char* Package, const char* Of, FIndex Outer, const std::string& Name) {
+            FExport E;
+            E.ClassIndex = EngineClass(Package, Of);
+            FIndex& Template = AnimTemplates[Of];
+            if (!Template.V) Template = Imp(P.AddImport({ Package, Of, PackageImport(Package), std::string("Default__") + Of }));
+            E.TemplateIndex = Template;
+            E.OuterIndex = Outer;
+            E.ObjectName = Name;
+            E.ObjectFlags = RF_Transactional;
+            E.SerBeforeCreate = { E.ClassIndex.V, E.TemplateIndex.V };
+            E.CreateBeforeCreate = { Outer.V };
+            return E;
+        };
+        std::vector<std::array<uint32, 4>> Possessed;
+        for (const FAnimTrack& T : A.Tracks)
+        {
+            uint32 G[4];
+            Guid("possessable." + T.Widget, G);
+            Possessed.push_back({ G[0], G[1], G[2], G[3] });
+        }
+
+        FExport Animation = Obj("/Script/UMG", "WidgetAnimation", Exp(RowClass), A.Name + "_INST");
+        Animation.CreateBeforeSer = { Scene.V };
+        Animation.Serialize = [=](FArc& Ar) {
+            Tag(Ar, "MovieScene", "ObjectProperty", [=](FArc& V) { V.Idx(Scene); });
+            Tag(Ar, "AnimationBindings", "ArrayProperty", [&](FArc& V) {
+                FArc Elements(V.Owner());
+                for (size_t T = 0; T < A.Tracks.size(); ++T)
+                {
+                    const uint32 G[4] = { Possessed[T][0], Possessed[T][1], Possessed[T][2], Possessed[T][3] };
+                    Tag(Elements, "WidgetName", "NameProperty", [&](FArc& E) { E.Name(A.Tracks[T].Widget); });
+                    Tag(Elements, "SlotWidgetName", "NameProperty", [&](FArc& E) { E.Name("None"); });
+                    Tag(Elements, "AnimationGuid", "StructProperty", [&](FArc& E) { E.Guid(G); }, "Guid");
+                    TagBool(Elements, "bIsRootWidget", false);
+                    TagEnd(Elements);
+                }
+                StructArray(V, "AnimationBindings", "WidgetAnimationBinding", int32(A.Tracks.size()), Elements);
+            }, "StructProperty");
+            uint32 Signature[4];
+            Guid("sequence", Signature);
+            Tag(Ar, "Signature", "StructProperty", [&](FArc& V) { V.Guid(Signature); }, "Guid");
+            TagEnd(Ar);
+            Ar.Bool(false);
+        };
+        P.AddExport(std::move(Animation));
+
+        FExport MovieScene = Obj("/Script/MovieScene", "MovieScene", Inst, A.Name);
+        for (size_t T = 0; T < A.Tracks.size(); ++T) MovieScene.CreateBeforeSer.push_back(Exp(Row + 2 + 2 * int32(T)).V);
+        for (const FAnimTrack& T : A.Tracks) MovieScene.CreateBeforeSer.push_back(T.WidgetClass.V);
+        MovieScene.Serialize = [=](FArc& Ar) {
+            Tag(Ar, "Possessables", "ArrayProperty", [&](FArc& V) {
+                FArc Elements(V.Owner());
+                for (size_t T = 0; T < A.Tracks.size(); ++T)
+                {
+                    const uint32 G[4] = { Possessed[T][0], Possessed[T][1], Possessed[T][2], Possessed[T][3] };
+                    const uint32 Zero[4] = { 0, 0, 0, 0 };
+                    Tag(Elements, "Tags", "ArrayProperty", [](FArc& E) { E.I32(0); }, "NameProperty");
+                    Tag(Elements, "Guid", "StructProperty", [&](FArc& E) { E.Guid(G); }, "Guid");
+                    Tag(Elements, "Name", "StrProperty", [&](FArc& E) { E.Str(A.Tracks[T].Widget); });
+                    Tag(Elements, "PossessedObjectClass", "ObjectProperty", [&](FArc& E) { E.Idx(A.Tracks[T].WidgetClass); });
+                    Tag(Elements, "ParentGuid", "StructProperty", [&](FArc& E) { E.Guid(Zero); }, "Guid");
+                    TagEnd(Elements);
+                }
+                StructArray(V, "Possessables", "MovieScenePossessable", int32(A.Tracks.size()), Elements);
+            }, "StructProperty");
+            Tag(Ar, "ObjectBindings", "ArrayProperty", [&](FArc& V) {
+                FArc Elements(V.Owner());
+                for (size_t T = 0; T < A.Tracks.size(); ++T)
+                {
+                    const uint32 G[4] = { Possessed[T][0], Possessed[T][1], Possessed[T][2], Possessed[T][3] };
+                    Tag(Elements, "ObjectGuid", "StructProperty", [&](FArc& E) { E.Guid(G); }, "Guid");
+                    Tag(Elements, "BindingName", "StrProperty", [&](FArc& E) { E.Str(A.Tracks[T].Widget); });
+                    Tag(Elements, "Tracks", "ArrayProperty", [&](FArc& E) { E.I32(1); E.Idx(Exp(Row + 2 + 2 * int32(T))); }, "ObjectProperty");
+                    TagEnd(Elements);
+                }
+                StructArray(V, "ObjectBindings", "MovieSceneBinding", int32(A.Tracks.size()), Elements);
+            }, "StructProperty");
+            Tag(Ar, "PlaybackRange", "StructProperty", [&](FArc& V) { Range(V, A.EndFrame); }, "MovieSceneFrameRange");
+            uint32 Signature[4];
+            Guid("moviescene", Signature);
+            Tag(Ar, "Signature", "StructProperty", [&](FArc& V) { V.Guid(Signature); }, "Guid");
+            TagEnd(Ar);
+            Ar.Bool(false);
+        };
+        P.AddExport(std::move(MovieScene));
+
+        for (size_t T = 0; T < A.Tracks.size(); ++T)
+        {
+            const FIndex TrackRow = Exp(Row + 2 + 2 * int32(T)), SectionRow = Exp(Row + 3 + 2 * int32(T));
+            FExport Track = Obj("/Script/UMG", "MovieScene2DTransformTrack", Scene, "MovieScene2DTransformTrack_" + std::to_string(T));
+            Track.CreateBeforeSer = { SectionRow.V };
+            Track.Serialize = [=](FArc& Ar) {
+                Tag(Ar, "PropertyBinding", "StructProperty", [](FArc& V) {
+                    Tag(V, "PropertyName", "NameProperty", [](FArc& E) { E.Name("RenderTransform"); });
+                    Tag(V, "PropertyPath", "NameProperty", [](FArc& E) { E.Name("RenderTransform"); });
+                    TagBool(V, "bCanUseClassLookup", true);
+                    TagEnd(V);
+                }, "MovieScenePropertyBinding");
+                Tag(Ar, "Sections", "ArrayProperty", [=](FArc& V) { V.I32(1); V.Idx(SectionRow); }, "ObjectProperty");
+                uint32 Signature[4];
+                Guid("track." + A.Tracks[T].Widget, Signature);
+                Tag(Ar, "Signature", "StructProperty", [&](FArc& V) { V.Guid(Signature); }, "Guid");
+                TagEnd(Ar);
+                Ar.Bool(false);
+            };
+            P.AddExport(std::move(Track));
+
+            FExport Section = Obj("/Script/UMG", "MovieScene2DTransformSection", TrackRow, "MovieScene2DTransformSection_0");
+            Section.Serialize = [=](FArc& Ar) {
+                /* FMovieSceneFloatChannel::Serialize (MovieSceneFloatChannel.cpp 1085-1166): the extrapolations, the times
+                   and the 28-byte FMovieSceneFloatValues as sized arrays, the default, the tick resolution. */
+                static const struct { const char* Name; int32 Index; } Channels[7] = {
+                    { "Translation", 0 }, { "Translation", 1 }, { "Rotation", 0 }, { "Scale", 0 }, { "Scale", 1 },
+                    { "Shear", 0 }, { "Shear", 1 } };
+                for (int32 C = 0; C < 7; ++C)
+                {
+                    const std::vector<FAnimKey>& Keys = A.Tracks[T].Channels[C];
+                    if (Keys.empty()) continue;
+                    Tag(Ar, Channels[C].Name, "StructProperty", [&](FArc& V) {
+                        V.U8(4); V.U8(4);                           // Pre/PostInfinityExtrap: RCCE_Constant
+                        V.I32(4); V.I32(int32(Keys.size()));
+                        for (const FAnimKey& K : Keys) V.I32(K.Frame);
+                        V.I32(28); V.I32(int32(Keys.size()));
+                        for (const FAnimKey& K : Keys)
+                        {
+                            const float Fields[5] = { K.Value, K.Arrive, K.Leave, 0.0f, 0.0f };   // the two weights unused
+                            V.Raw(Fields, sizeof(Fields));
+                            V.U8(0); V.U8(0); V.U8(0); V.U8(0);     // TangentWeightMode RCTWM_WeightedNone, padding
+                            V.U8(K.Interp); V.U8(K.TangentMode); V.U8(0); V.U8(0);
+                        }
+                        V.Raw("\0\0\0\0", 4);                       // DefaultValue
+                        V.Bool(false);                              // bHasDefaultValue
+                        V.I32(60000); V.I32(1);                     // TickResolution
+                    }, "MovieSceneFloatChannel", Channels[C].Index);
+                }
+                Tag(Ar, "SectionRange", "StructProperty", [&](FArc& V) { Range(V, A.EndFrame); }, "MovieSceneFrameRange");
+                uint32 Signature[4];
+                Guid("section." + A.Tracks[T].Widget, Signature);
+                Tag(Ar, "Signature", "StructProperty", [&](FArc& V) { V.Guid(Signature); }, "Guid");
+                TagEnd(Ar);
+                Ar.Bool(false);
+            };
+            P.AddExport(std::move(Section));
         }
     }
 
