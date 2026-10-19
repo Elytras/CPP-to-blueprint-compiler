@@ -4868,6 +4868,22 @@ def spawn_relative():
     print('ok  SpawnTest: a bare relative source path finds X::StaticClass() qualifiers')
 
 
+def spawn_unity():
+    """Compiled through a unity file elsewhere that includes SpawnTest.cpp by its absolute path, as bpbuild compiles a
+    mod: the qualifiers are read from the included source, so `Gear::USpawnGear::StaticClass()` is still the mod class
+    and not the UObject it inherits StaticClass from (the bug that made a mod's memberless base class cook as AActor)."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        unity = os.path.join(tmp, 'SpawnTest.unity.cpp')
+        with open(unity, 'w', encoding='utf-8') as f:
+            f.write('#include "%s"\n' % os.path.join(TESTS, 'SpawnTest.cpp').replace('\\', '/'))
+        proc = assetgen_compile([unity, UEAPI, tmp])
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        vm = VM(os.path.join(tmp, 'SpawnTest'), {})
+        assert (vm.call('OwnClass'), vm.call('GearClass')) == ('SpawnTest_C', 'USpawnGear_C')
+    print('ok  SpawnTest: a unity file that includes the source finds X::StaticClass() qualifiers')
+
+
 def outer_runs():
     """GetTypedOuter / GetOutermostTypedOuter over a faked outer chain: nearest / farthest outer of the kind, the
     object itself never a candidate, null when there is none; and no function of their own."""
@@ -4925,6 +4941,7 @@ await_values()
 delegate_targets()
 spawn_runs()
 spawn_relative()
+spawn_unity()
 outer_runs()
 
 
