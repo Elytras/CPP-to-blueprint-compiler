@@ -504,9 +504,12 @@ def link_mods(run, model, per_mod):
     for m in model.mods:            # every class says where it is cooked: kept assets of it and other mods name it so
         for o in [o for o in per_mod[m.name] if o.a.kind == 'class']:
             name = o.a.pkg.exports[o.a.export]['name']
-            o.header = re.sub(r'(\nclass %s\b[^\n]*\{\n(?:.*\n)*?public:\n)' % re.escape(o.a.cpp),
-                                  lambda mm: mm.group(1) + '    UE_CLASS("%s", "%s");\n' % (o.a.path, name),
-                                  o.header, count=1)
+            line = '    UE_CLASS("%s", "%s");\n' % (o.a.path, name)
+            o.header, n = re.subn(r'(\nclass %s\b[^\n]*\{\n(?:.*\n)*?public:\n)' % re.escape(o.a.cpp),
+                                  lambda mm: mm.group(1) + line, o.header, count=1)
+            if not n:               # a class with no members has no public: section yet
+                o.header = re.sub(r'(\nclass %s\b[^\n]*\{\n(?:.*\n)*?)(\};\n)' % re.escape(o.a.cpp),
+                                  lambda mm: mm.group(1) + 'public:\n' + line + mm.group(2), o.header, count=1)
 
 
 def write_mod(run, mod, outs, out_dir):
