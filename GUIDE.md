@@ -1623,7 +1623,7 @@ An interface stub is a Blueprint Interface asset with one function graph per fun
 included. A Blueprint made in the editor lists it under Class Settings > Implemented Interfaces and implements its
 functions as it would any interface's. Cooked by the editor, that Blueprint names the interface the mod's pak cooks, so
 mount the mod's pak beside it: a call through the interface, from the mod's code or from a Blueprint, then reaches the
-editor Blueprint's implementation (checked in the editor, not yet in the game). The interface's variables are AssetGen's own idea and are left out of the stub, so
+editor Blueprint's implementation; this has been run in DRG. The interface's variables are AssetGen's own idea and are left out of the stub, so
 an editor Blueprint that implements the interface does not get them. An interface that extends another of the mod's
 has that one's stub as its parent.
 
@@ -1632,7 +1632,7 @@ To use the stubs:
 1. Point `api_dir` at your UE 4.27 project's `Content` folder, or copy the stubs from `out/api/Content`.
 2. Open the project. Stubs of a function library, of actor and object classes, of interfaces, and of structs and enums
    have been loaded and re-saved in UE 4.27.2 with no errors. A Blueprint made in the editor against an interface stub
-   implements it, compiles and cooks.
+   has been cooked and run in the game, its implementation called by the mod through the interface.
 3. Call the mod's functions from your Blueprints.
 4. Do not ship the stubs. Keep their folder out of your cook, and install the mod's own pak beside yours. UE's
    "Directories to never cook" packaging setting should keep them out; that has not been tested.

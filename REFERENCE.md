@@ -4429,7 +4429,7 @@ Notes:
 - A track over a curve asset names it, as the editor's External Curve does: the class holds no curve of its own for
   it, and the asset loads with the class. Its keys are the asset's, so a game curve plays what the game has. The
   timeline's length is still its own (or its last key's, with LastKeyframe), not the curve's. Such a track and a curve
-  of the mod's own match the game's cooked layout offline; neither has been run in the game yet.
+  of the mod's own have been loaded in DRG, each external track holding its asset.
 - `Fade->SetFloatCurve(Curve, "Alpha")` hands a track another curve at run time, the track named like its variable.
 
 ## Interfaces
@@ -4595,7 +4595,7 @@ Notes:
 | `class IBoth : public IAimable, public IMarkable` | Refused: "an interface extends one interface at most". A UClass has one super. | Refused |
 | `class IActorish : public AActor { public: UE_INTERFACE; };` | Refused: "IActorish extends AActor, which is not an interface". An interface's only base is another interface, the mod's or the game's. | Refused |
 | `UE_COMPONENT(UStaticMeshComponent, Hull);` on an interface | Refused: "an interface cannot declare a UE_COMPONENT". Declare it on the implementing actor. | Refused |
-| `generate_api: true` with a `UE_INTERFACE` | The interface's editor API stub is a Blueprint Interface asset at the interface's own path, so a Blueprint made in the UE 4.27 editor can list it under Implemented Interfaces and implement its functions. Cooked by the editor, that Blueprint uses the interface the mod's pak cooks: a call through the interface, from the mod or from another Blueprint, runs its implementation. That call has not been run in the game yet. The interface's variables are not in the stub, since the editor's interfaces hold none, so an editor Blueprint that implements it does not have them. See [Editor API stubs](GUIDE.md#editor-api-stubs). | Yes |
+| `generate_api: true` with a `UE_INTERFACE` | The interface's editor API stub is a Blueprint Interface asset at the interface's own path, so a Blueprint made in the UE 4.27 editor can list it under Implemented Interfaces and implement its functions. Cooked by the editor, that Blueprint uses the interface the mod's pak cooks: a call through the interface, from the mod or from another Blueprint, runs its implementation. In DRG, a mod's call through the interface ran an editor-made Blueprint's implementation. The interface's variables are not in the stub, since the editor's interfaces hold none, so an editor Blueprint that implements it does not have them. See [Editor API stubs](GUIDE.md#editor-api-stubs). | Yes |
 
 ```cpp
 class IAimable {
