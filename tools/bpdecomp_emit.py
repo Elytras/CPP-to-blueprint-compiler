@@ -562,9 +562,10 @@ def write_mod(run, mod, outs, out_dir):
     for ns, items in sorted(by_ns.items()):
         al.append('%s%s\n%s' % (ns_open(list(ns)), '\n'.join(items), ns_close(list(ns))))
     open(os.path.join(root, 'Assets.h'), 'w', encoding='utf-8', newline='\n').write(''.join(al))
+    cpps = sorted(rel_file(mod, o.a, '.cpp').replace(os.sep, '/') for o in seq if o.cpp)
     open(os.path.join(root, mod.name + '.cpp'), 'w', encoding='utf-8', newline='\n').write(
-        '// The mod\'s package: every source of %s compiles as one translation unit, so it is declared once, here.\n'
-        '#include "%s"\n\nUE_MOD_PACKAGE("%s");\n' % (mod.name, umbrella, mod.root))
+        '// The mod\'s package and its one translation unit: mods.yaml lists this file, which takes in every other source.\n'
+        '#include "%s"\n\nUE_MOD_PACKAGE("%s");\n\n%s' % (umbrella, mod.root, ''.join('#include "%s"\n' % c for c in cpps)))
 
 
 def main():

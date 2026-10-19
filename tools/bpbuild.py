@@ -241,6 +241,59 @@ def stage_bundle(files, stage_fsd):
         shutil.copy2(src, to)
 
 
+def kept_source(mod, bp):
+    """The Content folder a mod's `kept` packages come from: `kept.from` itself, or, for a .pak, its extraction under
+    build/<mod>/kept, made once and again only when the pak changes."""
+    src = os.path.abspath(os.path.join(bp, os.path.expandvars(mod["kept"]["from"])))
+    if os.path.isdir(src):
+        root = src
+    else:
+        root = os.path.join(bp, "build", mod["name"], "kept")
+        stamp = os.path.join(root, ".pak")
+        want = "%s %d %d" % (src, os.path.getsize(src), int(os.path.getmtime(src)))
+        if read_text(stamp) != want:
+            shutil.rmtree(root, ignore_errors=True)
+            os.makedirs(root)
+            proc = subprocess.run([UNREALPAK, src, "-Extract", root], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                  text=True, errors="replace")
+            if proc.returncode != 0:
+                sys.exit("kept: UnrealPak could not extract %s:\n%s" % (src, proc.stdout[-2000:]))
+            io.open(stamp, "w", encoding="utf-8").write(want)
+    for sub in ("Content", os.path.join("FSD", "Content")):
+        if os.path.isdir(os.path.join(root, sub)):
+            return os.path.join(root, sub)
+    return root
+
+
+def place_kept(mod, bp, stage_fsd):
+    """A mod's `kept` packages - assets it ships as they were cooked, which no source of it builds (textures, fonts,
+    a widget with animations) - into its FSD tree for the pak. `paths` lists /Game package paths or folders. Hard
+    links where the volume allows: a texture folder runs to gigabytes. Returns how many files it placed."""
+    kept = mod.get("kept")
+    if not kept:
+        return 0
+    content = kept_source(mod, bp)
+    n = 0
+    for path in kept.get("paths") or []:
+        rel = path[len("/Game/"):] if path.startswith("/Game/") else path.lstrip("/")
+        base = os.path.join(content, *rel.split("/"))
+        files = [os.path.join(r, f) for r, _d, fs in os.walk(base) for f in fs] if os.path.isdir(base) else \
+            [base + ext for ext in (".uasset", ".uexp", ".ubulk", ".umap") if os.path.exists(base + ext)]
+        if not files:
+            sys.exit("%s: kept path %s is not in %s" % (mod["name"], path, content))
+        for f in files:
+            to = os.path.join(stage_fsd, "Content", os.path.relpath(f, content))
+            os.makedirs(os.path.dirname(to), exist_ok=True)
+            if os.path.exists(to):
+                os.remove(to)
+            try:
+                os.link(f, to)
+            except OSError:
+                shutil.copy2(f, to)
+            n += 1
+    return n
+
+
 def staged_assets(stage_content):
     if not os.path.isdir(stage_content):
         return []
@@ -521,7 +574,11 @@ def main():
             # they share, the last one's copy winning with only its own bodies. So several .cpp files compile as
             # a generated file that #includes them all - each still resolves its quoted includes from its own folder.
             # ponytail: a unity build, so file-local names (static, anonymous namespaces) must not clash across files.
-            cpps = [s for s in sources if s.endswith(".cpp")]
+            # The listed .cpp files only: one reached through an #include (a mod whose main file takes in the
+            # rest) is in `sources` for staleness, and compiled where it is included.
+            listed = {os.path.normcase(os.path.abspath(p)) for e in mod.get("sources") or []
+                      for p in (glob.glob(os.path.join(bp, e)) if glob.has_magic(e) else [os.path.join(bp, e)])}
+            cpps = [s for s in sources if s.endswith(".cpp") and os.path.normcase(os.path.abspath(s)) in listed]
             unit = cpps[0]
             if len(cpps) > 1:
                 unit = os.path.join(bp, "build", name, name + ".unity.cpp")
@@ -599,6 +656,8 @@ def main():
             failed.append(name)
             continue
         stage_bundle(bundle, stage_fsd)
+        if mod.get("kept"):     # after the deps: a kept package wins over a rebuilt one of the same path
+            print("%-16s kept     %d files" % (name, place_kept(mod, bp, stage_fsd)))
         if not os.path.isdir(os.path.dirname(pak)):
             os.makedirs(os.path.dirname(pak))
         if run_unrealpak(stage_fsd, pak):
