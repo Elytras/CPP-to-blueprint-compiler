@@ -3097,6 +3097,113 @@ def pointer_behaviour():
     print('ok  PointerTest: Advance, Bump (out-parm), Check, signed byte reads, discarded intrinsics, uint32 reads refused; FDeref synthesized')
 
 
+def pointer_more():
+    """PointerMore: a whole struct, a 16-bit value and a double through a pointer; the address of a struct member; a
+    reference return as an address the call reads and writes through; memory reads before and after a latent wait."""
+    import math, runscript, struct
+    from runvm import VM, Obj, latent_call
+    base, A = asset('PointerMore'), 0x7FF600001000
+
+    def put(a, fmt, *v):
+        for i, b in enumerate(struct.pack(fmt, *v)): runscript.MEM[a + i] = b
+
+    def get(a, fmt): return struct.unpack(fmt, bytes(runscript.MEM.get(a + i, 0) for i in range(struct.calcsize(fmt))))
+    runscript.MEM.clear()
+    # Whole structs: a copy out, a store in, element I, a copy between two places, a mod struct with padding.
+    put(A, '<fff', 1.5, 2.5, 3.5)
+    assert run(base, 'ReadVec', P=A)[0] == {'X': 1.5, 'Y': 2.5, 'Z': 3.5}
+    run(base, 'WriteVec', P=A + 12, X=7.0)
+    assert get(A + 12, '<fff') == (7.0, 8.0, 9.0) and get(A, '<fff') == (1.5, 2.5, 3.5)
+    assert run(base, 'SumAt', P=A, I=1)[0] == 24.0
+    run(base, 'CopyVec', To=A + 24, From=A)
+    assert get(A + 24, '<fff') == (1.5, 2.5, 3.5)
+    pkg = '/Game/_ElytrasMods/PointerMore/FPair'
+    fa, fb = runscript.mod_field(pkg, 'A'), runscript.mod_field(pkg, 'B')
+    runscript.STRUCT_VIEWS['FPair'] = (16, [(fa, 0, '<i'), (fb, 8, '<q')])
+    put(A + 40, '<iiq', 5, -1, 1 << 40 | 9)      # the padding after A is not a member
+    assert run(base, 'ReadPair', P=A + 40)[0] == {fa: 5, fb: 1 << 40 | 9}
+    run(base, 'SwapPair', P=A + 40)
+    assert get(A + 40, '<i')[0] == 9 and get(A + 48, '<q')[0] == 5
+    # 16-bit values: two bytes, an int16 sign-extended; a store writes two bytes and no more.
+    for v in (0, 1, 0x7FFF, 0x8000, 0xFFFF, 0x1234):
+        runscript.MEM.clear()
+        put(A, '<HH', v, 0xFFFF - v)
+        assert run(base, 'ReadU16', P=A)[0] == v, v
+        assert run(base, 'ReadI16', P=A, I=1)[0] == struct.unpack('<h', struct.pack('<H', 0xFFFF - v))[0], v
+        put(A + 8, '<I', 0xAAAAAAAA)
+        run(base, 'WriteU16', P=A + 8, V=v - 70000)
+        assert get(A + 8, '<HH') == ((v - 70000) & 0xFFFF, 0xAAAA), v
+    for v in (-1, 0, 0x7FFF, -0x8000):
+        put(A, '<h', v)
+        run(base, 'BumpI16', P=A)
+        assert get(A, '<h')[0] == (v + 1 + 0x8000) % 0x10000 - 0x8000, v
+
+    # A double reads as the float nearest it, as C++'s conversion gives (a tie to even); one below FLT_MIN reads 0.
+    def f32(d):
+        try: f = struct.unpack('<f', struct.pack('<f', d))[0]
+        except OverflowError: return math.copysign(math.inf, d)
+        return math.copysign(0.0, d) if 0 < abs(f) < 2.0 ** -126 else f
+    same = lambda x, y: x == y and math.copysign(1, x) == math.copysign(1, y)
+    for d in (0.0, -0.0, 1.0, -2.5, math.pi, 0.1, 1e-30, 1e30, 3.4028235e38, 3.5e38, 1e300, -1e-300, 1e-40, math.inf,
+              -math.inf, 2.0 ** -126, 16777217.0, 16777219.0, 1.0000000596046448, 1.0000001788139343, 3.4028235677973366e38):
+        put(A, '<d', d)
+        assert same(run(base, 'ReadDouble', P=A)[0], f32(d)), d
+    put(A, '<d', math.nan)
+    assert math.isnan(run(base, 'ReadDouble', P=A)[0])
+    for f in (0.0, -0.0, 1.0, -2.5, 0.1, 3.4e38, 2.0 ** -126, math.inf, -math.inf):
+        run(base, 'WriteDouble', P=A, V=f32(f))
+        assert same(get(A, '<d')[0], f32(f)), f
+    # The address of a struct member: its offset in the game's layout, through any number of members and elements.
+    assert [run(base, fn, P=A)[0] - A for fn in ('AddrOfY', 'AddrOfB', 'AddrOfNested', 'AddrThroughRef')] == [4, 8, 12, 4]
+    assert run(base, 'AddrOfElementMember', P=A, I=2)[0] - A == 2 * 16 + 4 + 4
+    put(A, '<fff', 1.0, 2.0, 3.0)
+    run(base, 'SetZ', P=A, Z=9.0)
+    assert get(A, '<fff') == (1.0, 2.0, 9.0)
+    # A reference return is the place: assigned, updated once, bound to a reference, read.
+    runscript.MEM.clear()
+    put(A, '<iii', 10, 20, 30)
+    assert run(base, 'SlotUse', P=A)[0] == 7 + 40 and get(A, '<iii') == (15, 40, 7)
+    put(A, '<ffffff', 1, 2, 3, 4, 5, 6)
+    assert run(base, 'VecAtUse', P=A)[0] == 44.0 and get(A, '<ffffff') == (4, 40, 6, 4, 5, 6)
+    # A const T& return is a copy: the value at the call.
+    put(A, '<i', 21)
+    assert run(base, 'ConstRefUse', P=A)[0] == 42
+    # Reads in a function that waits, one before the wait and one after it, of memory that changed in between; writes.
+    runscript.MEM.clear()
+    put(A, '<ii', 11, 22)
+    vm = VM(base, {'Delay': latent_call})
+    vm.call('ReadAcrossDelay', P=A)
+    assert vm.self.vars == {'Seen': 11} and len(vm.latent) == 1, vm.self.vars
+    put(A, '<ii', 33, 44)
+    vm.fire()
+    assert vm.self.vars == {'Seen': 11, 'SeenLater': 44}, vm.self.vars
+    assert get(A + 8, '<i')[0] == 45 and get(A + 12, '<fff') == (11.0, 0.5, 0.25)
+    kinds = {'Pawn': {'Pawn', 'Actor'}}
+    far = Obj('Actor', Obj('Level')); near = Obj('Pawn', far); comp = Obj('SceneComponent', near)
+    vm = VM(base, {'Delay': latent_call}, isa=lambda o, c: isinstance(o, Obj) and c in kinds.get(o.cls, {o.cls}))
+    vm.call('OuterAcrossDelay', comp)
+    assert not vm.self.vars
+    vm.fire()
+    assert vm.self.vars['OuterSeen'] is near and vm.self.vars['OwnerSeen'] is near, vm.self.vars
+    runscript.MEM.clear()
+    # What the game checks (bpcheck): the Self* functions point into a TArray of their own, which runscript's MEM does
+    # not hold, so their cases are C++'s answers, written here.
+    if '--cases' in sys.argv:
+        cls = '/Game/_ElytrasMods/PointerMore/PointerMore'
+        CASES.extend({'mod': 'PointerMore', 'class': cls, 'fn': fn, 'args': {}, 'self': {}, 'ret': ret, 'env': {}}
+                     for fn, ret in (('SelfWhole', 604.0), ('SelfMemberAddr', 25), ('SelfRefReturn', 32.0)))
+    # The refusals that stay: a Blueprint variable has no address, to take or to return; an engine struct whose
+    # reflected members do not add up to its size has no member offsets to trust.
+    refused('RefLocal', '  int32 &Bad() { int32 L = 3; return L; }\n', 'returns a reference to L, a local')
+    refused('RefParm', '  int32 &Bad(int32 &V) { return V; }\n', 'returns a reference to V, a parameter')
+    refused('AddrLocalMember', '  int64 Bad() { FVector V; return (int64)&V.Y; }\n', 'a Blueprint variable has none')
+    refused('AddrHitMember', '  int64 Bad(FHitResult *H) { return (int64)&H->Distance; }\n',
+            "the address of FHitResult::Distance: FHitResult's reflected members take")
+    assert 'PointerMore::FirstOf returns const int32&: a Blueprint function returns a copy' in LOGS['PointerMore']
+    print('ok  PointerMore: whole structs, 16-bit values and doubles through a pointer, struct member addresses, '
+          'reference returns, memory reads across a latent wait; the refusals that stay')
+
+
 mod_enum()
 constants()
 types_behaviour()
@@ -3106,6 +3213,7 @@ string_behaviour()
 struct_behaviour()
 check('StructTest', 'MakeNative', lambda D: D + 0.5, [dict(D=d) for d in (0.0, 4.0)])
 pointer_behaviour()
+pointer_more()
 
 
 def map_pairs(pkg, tag):

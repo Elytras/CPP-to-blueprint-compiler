@@ -1084,11 +1084,13 @@ object's address, and `(AActor *)Addr` reads an address back as an object. `size
 layout, so pointer arithmetic steps by the game's sizes. `&Items[I]` is the address of a `TArray` element. For explicit
 reads and casts, AssetGen's `include/Intrin.h` adds `__PtrCast__`, `__AddrOf__` and the `__Read64__` family.
 
-A read takes the pointee's size. `int32`, `int64`, `float`, `uint8`, `bool`, enums, `FName`, `FString`, `FText` and
-object or class pointers can be read. A whole struct can be neither read nor written; reach its members with `P->X`,
-which touches only that member. A `uint32` read is refused, since Blueprint has no unsigned 32-bit integer. A Blueprint
-variable has no address, so `&Local` is refused. Every access goes through a small scratch struct, `FDeref`, which the
-compiler cooks beside your class the first time you use a pointer; you do not declare it.
+A read takes the pointee's size. `int32`, `int64`, `float`, `uint8`, `bool`, enums, `FName`, `FString`, `FText`,
+object or class pointers and whole structs can be read and written; `P->X` touches only that member, and `&P->X` is
+its address. A `uint16` or `int16` reads as an int32 and a `double` as the nearest float, since Blueprint has neither
+type. A `uint32` read is refused, since Blueprint has no unsigned 32-bit integer. A Blueprint variable has no address,
+so `&Local` is refused. A function returning `T&` returns an address, and its call is the memory there. Every access
+goes through a small scratch struct, `FDeref`, which the compiler cooks beside your class the first time you use a
+pointer; you do not declare it.
 
 ```cpp
 TArray<FVector> Points = {{1, 2, 3}, {4, 5, 6}};
@@ -1109,8 +1111,6 @@ Watch for:
 
 - Nothing checks an address. A wrong address or offset reads garbage or crashes the game, with no soft failure. Take
   offsets from the game you target, and prefer a reflected property or function whenever one exists.
-- A pointer read in a function that makes a latent call (`Delay`, `LoadAsset`, `UE_AWAIT`) is refused. Move the read
-  into a function that does not wait, and call it.
 - `&Obj->Member`, `FText` through a pointer and `__ClassOf__` call helper code that AssetGen does not ship.
   [Pointers and memory](REFERENCE.md#pointers-and-memory) says what to supply. Without it, only `&Obj->Member` fails
   the build; the other two compile without a warning.
@@ -1166,6 +1166,7 @@ hundreds of MB; it streams from clang through a pipe and is never written to dis
 | each namespace-scope data asset (`UCaveTuning CT_Easy = {...};`) | always |
 | `<Ns>__<Name>`, a class whose default object holds a namespace-scope variable | when a function uses the variable |
 | `FDeref`, the scratch struct that raw pointer reads go through | when the source reads through a pointer and does not declare `FDeref` itself |
+| `FDerefView_<Struct>`, the view a whole struct is read and written through | when the source reads or writes that struct whole through a pointer |
 | two structs per map type walked in place, `FMapSlot_TMap_<K>_<V>` and `FMapSlots_TMap_<K>_<V>`, and a wrapper struct per container nested in another container | when the code needs one |
 | each game package an edit names, at its own path, printed as `edit -> <package>.uasset (the game's, edited: ...)` | when the source has a `UE_ASSET_EDIT`, `UE_ASSET_EDITS` or `UE_PATCH` |
 
@@ -1944,13 +1945,6 @@ each topic.
 
 **Refused with a message.** The compile stops, and the section linked says what to write instead.
 
-- The address of a struct member, `&S.Member` or `&Pv->X`. Through a pointer, add the member's offset yourself:
-  `(int64)Pv + 4` is the address of `Pv->Y` for an `FVector *Pv`. See
-  [Pointers and memory](REFERENCE.md#pointers-and-memory).
-- A reference return, `int32 &Slot(int32 I)`. Return a value or a pointer. See [Functions](REFERENCE.md#functions).
-- A read through a pointer, `GetOuter()` and `GetTypedOuter` included, in a function that also waits. Read in a
-  separate method that does not wait, or keep the value in a member before the wait. See
-  [Pointers and memory](REFERENCE.md#pointers-and-memory).
 - A game asset's values as build-time constants. The `UeAssets` headers name every asset but hold none of its values.
   Read a value in the game through the asset's pointer, `(&UeAssets::...::ED_Spider_Grunt)->SpawnAmountModifier`. See
   [Game assets](REFERENCE.md#game-assets).

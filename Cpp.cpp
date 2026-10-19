@@ -66,7 +66,7 @@ std::string ModFieldName(const std::string& StructPkg, const std::string& Field)
 bool IsInternalViewStruct(const std::string& CppName)
 {
     return CppName == "FDeref" || CppName == "FDerefTextView" || CppName.compare(0, 9, "FMapSlot_") == 0
-        || CppName.compare(0, 10, "FMapSlots_") == 0;
+        || CppName.compare(0, 10, "FMapSlots_") == 0 || CppName.compare(0, 11, "FDerefView_") == 0;
 }
 
 const Json* First(const Json& N)
@@ -1114,7 +1114,7 @@ struct FCallIR
     uint64 EmptiedArgs = 0;             // bit I: argument I is a native's out TArray, emptied just before the call: see HoistCallArgs
     std::string VirtualName;            // a generated class's own instance method: EX_VirtualFunction resolves it by name at run time
     bool bLocal = false;                // EX_LocalVirtualFunction / EX_LocalFinalFunction: a script function that is no RPC
-    std::string View;                   // __RefAtInline__: the TArray field of the view struct in Extra
+    std::string View;                   // __RefAtInline__, __DerefRead*__: the TArray field of the view struct in Extra
     std::shared_ptr<int32> Resume;      // __AwaitPoint__: receives the ubergraph offset the awaited event re-enters at
     bool bStrongOnFrame = false;        // its result is RF_StrongRefOnFrame, so a persistent frame holding it keeps it
     bool bFrameHeld = false;            // ... and nothing else does: see HeldProxies
@@ -1208,6 +1208,7 @@ const char* ViewFieldOf(const std::string& DerefIntrinsic)
                                                    "Kilobyte";
 }
 
+bool IsReinterpret(const std::string& Intrinsic);
 /* SelfExp: the enclosing function's export index, FFieldPath owner of its params and locals. */
 bool EmitArgs(FScript& S, const std::vector<FArgIR>& Args, FIndex SelfExp, std::string* Err);
 FArgIR NotOf(FArgIR V, FBlueprintClass& BP);
@@ -1315,13 +1316,13 @@ bool EmitArg(FScript& S, const FArgIR& A, FIndex SelfExp, std::string* Err)
             S.ObjectConst(SelfExp);
             return true;
         }
-        if (A.Sub->Intrinsic == "__AddrOf__" || A.Sub->Intrinsic == "__NameIndex__" || A.Sub->Intrinsic == "__AsObject__")
+        if (IsReinterpret(A.Sub->Intrinsic))
         {
             /* StructMember with a donor field at Offset_Internal=0 copies ElementSize bytes straight out
                of the argument's own storage: ScreenMessageString.Key (8) / IntPoint.X (4 = ComparisonIndex) /
                DebugDisplayProperty.obj (8, an int64 read back as a UObject*). */
             const std::string InnerField = A.Sub->Intrinsic == "__AddrOf__" ? "Key"
-                                         : A.Sub->Intrinsic == "__AsObject__" ? "obj" : "X";
+                                         : A.Sub->Intrinsic == "__AsObject__" ? "obj" : "X";     // IntPoint.X, Vector.X
             if (A.Sub->Args.size() != 1)
             {
                 if (Err) *Err = A.Sub->Intrinsic + " takes exactly one argument";
@@ -1335,21 +1336,19 @@ bool EmitArg(FScript& S, const FArgIR& A, FIndex SelfExp, std::string* Err)
             if (!bInnerOk) { if (Err) *Err = SubErr; return false; }
             return true;
         }
-        if (A.Sub->Intrinsic == "__DerefReadI64__" || A.Sub->Intrinsic == "__DerefReadI32__"
-            || A.Sub->Intrinsic == "__DerefReadF__" || A.Sub->Intrinsic == "__DerefReadU8__"
-            || A.Sub->Intrinsic == "__DerefReadStr__" || A.Sub->Intrinsic == "__DerefReadText__")
+        if (A.Sub->Intrinsic.compare(0, 11, "__DerefRead") == 0)
         {
             /* Hoisted Read: outer StructMember reads the view struct's TArray<T> at offset 0 out of
                the caller's FDeref __DerefScratch__ (Num=1, Data=<addr>). ArrayGetByRef then copies
                InnerProp.ElementSize bytes from Data[0] into the caller's dest. No class-owner check
                is involved (StructMemberContext + ArrayGetByRef are both guard-free). */
-            const char* ViewField = ViewFieldOf(A.Sub->Intrinsic);
+            const std::string ViewField = A.Sub->View;
             const FIndex ViewStruct = A.Sub->Extra;
             S.ArrayGetByRef(
                 [&](FScript& O)
                 {
                     O.StructMember(ViewField, ViewStruct,
-                        [&](FScript& I) { I.LocalVariable("__DerefScratch__", SelfExp); });
+                        [&](FScript& I) { I.LocalVariable(A.S, SelfExp); });
                 },
                 [&](FScript& I) { I.IntZero(); });
             return true;
@@ -1547,6 +1546,7 @@ struct FReadViewSpec
     const char* ResultType;         // C++ type of the tmp local receiving the read
     const char* ViewStructPkg;
     const char* ViewStructName;     // an engine ScriptStruct whose first member is TArray<T>
+    const char* ViewField = nullptr;    // that TArray member, when ViewFieldOf(DerefIntrinsic) does not name it
 };
 
 /* __ReadObject__ / __ReadName__ share the int64 view: both are 8-byte scalars whose
@@ -1665,6 +1665,7 @@ private:
     bool LayoutOf(const std::string& QualType, int32* Size, int32* Align, std::string* Err);
     bool NeedsResultLocal(const std::string& Type, int32 Depth = 0);
     bool StructLayout(const FRecord& R, int32* Size, int32* Align, std::string* Err);
+    bool MemberOffset(const std::string& StructType, const std::string& Member, int32* Offset, std::string* Err);
     bool LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FStmtIR>& Out,
                    std::vector<FPropertyDef>& Locals, std::string* Err);
 
@@ -1846,10 +1847,17 @@ private:
     bool IsRawPointer(std::string QualType) const;
     void NormalizePointers(Json& N) const;
     bool IsDerefLvalue(const Json& N) const;
+    std::string RefReturnOf(const Json& Call) const;
+    bool LowerRefReturn(const Json& Value, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
+    std::string CurRefReturn;           // the function being lowered returns this as a non-const T&: its address
     bool IsEagerSafe(const Json& N) const;
     void ArgumentsInPlace(std::vector<FStmtIR>& Body, const std::vector<std::string>& Binds, const Json& Def,
                           const std::vector<std::string>& BindIds, std::vector<FPropertyDef>& Locals);
-    const FReadViewSpec* ViewFor(const std::string& Pointee) const;
+    const FReadViewSpec* ViewFor(const std::string& Pointee);
+    /* A whole struct through a pointer: the view `FDerefView_<T> { TArray<T> __View_<T>__; }`, cooked beside the class
+       like the map-slot views, since no engine struct starts with a TArray of the mod's (or most engine) structs. */
+    struct FStructView { std::string Type, Pkg, Name, Field; FReadViewSpec Spec; };
+    std::map<std::string, FStructView> StructViews;     // pointee -> its view
     bool LowerAddress(const Json& Lvalue, FBlueprintClass& BP, FArgIR& Out, std::string* Pointee, std::string* Err);
     bool ReadThrough(FArgIR Addr, const std::string& Pointee, FBlueprintClass& BP, FArgIR& Out, std::string* Err);
     bool RefThrough(FArgIR Addr, const std::string& Pointee, FArgIR& Out, std::string* Err);
@@ -1924,6 +1932,10 @@ private:
                        std::vector<FStmtIR>& OutPre, std::string* Err);
     bool HoistRefAt(FArgIR& A, FBlueprintClass& BP, std::vector<FPropertyDef>& Locals,
                     std::vector<FStmtIR>& OutPre, std::string* Err);
+    bool HoistWideRead(FArgIR& A, FBlueprintClass& BP, std::vector<FPropertyDef>& Locals,
+                       std::vector<FStmtIR>& OutPre, std::string* Err);
+    bool SplitWideWrite(FStmtIR& St, FBlueprintClass& BP, std::vector<FPropertyDef>& Locals,
+                        std::vector<FStmtIR>& Out, std::string* Err);
     bool HoistBranch(FArgIR& A, FBlueprintClass& BP, std::vector<FPropertyDef>& Locals,
                      std::vector<FStmtIR>& OutPre, std::string* Err, const FArgIR* Dest = nullptr,
                      const FPropertyDef* DestProp = nullptr);
@@ -2598,7 +2610,8 @@ struct FLocalRenamer
         if (!Seen.insert(&A).second) return;
         if (A.K == FArgIR::LocalOut && To.count(A.S)) A.K = FArgIR::Local;
         if (A.K == FArgIR::Local || A.K == FArgIR::LocalOut
-            || (A.K == FArgIR::Call && A.Sub && A.Sub->Intrinsic == "__RefAtInline__")) Name(A.S);
+            || (A.K == FArgIR::Call && A.Sub && (A.Sub->Intrinsic == "__RefAtInline__"
+                                                 || A.Sub->Intrinsic.compare(0, 11, "__DerefRead") == 0))) Name(A.S);
         if (A.Sub) Call(*A.Sub);
         if (A.Base) Arg(*A.Base);
     }
@@ -4783,7 +4796,8 @@ bool IsUnreferenceable(const Json& Parm, const Json& Arg)
 /* The intrinsics that read their operand's storage through a StructMember donor field. */
 bool IsReinterpret(const std::string& Intrinsic)
 {
-    return Intrinsic == "__AddrOf__" || Intrinsic == "__AsObject__" || Intrinsic == "__NameIndex__";
+    return Intrinsic == "__AddrOf__" || Intrinsic == "__AsObject__" || Intrinsic == "__NameIndex__"
+        || Intrinsic == "__AsFloat__" || Intrinsic == "__FloatBits__";
 }
 
 /* Whether an operand leaves MostRecentProperty and its storage behind, as a StructMember reinterpretation
@@ -5117,10 +5131,49 @@ bool FCompiler::IsEagerSafe(const Json& N) const
     return false;
 }
 
-/* `*P`, `P[i]` on a raw pointer, `__PtrCast__<T&>(A)`, and a reference local that keeps an address. */
+/* A call of a mod function that returns a non-const T& (DESIGN.md, "Reference returns"): its Blueprint function returns
+   the address, so the call is memory, as `*P` is. The pointee, else empty. */
+std::string FCompiler::RefReturnOf(const Json& Call) const
+{
+    const std::string K = Kind(Call);
+    if ((K != "CallExpr" && K != "CXXMemberCallExpr") || Call.value("valueCategory", std::string()) != "lvalue") return std::string();
+    const std::string T = TypeOf(Call);
+    if (T.compare(0, 6, "const ") == 0) return std::string();
+    const Json* Callee = Strip(First(Call));
+    const std::string Id = !Callee ? std::string()
+                         : Kind(*Callee) == "MemberExpr" ? Callee->value("referencedMemberDecl", std::string())
+                         : Kind(*Callee) == "DeclRefExpr" ? (*Callee)["referencedDecl"].value("id", std::string()) : std::string();
+    const auto Owner = MethodOwner.find(Id);
+    const FRecord* R = Owner == MethodOwner.end() ? nullptr : Find(Owner->second);
+    const std::string Fn = Kind(*Callee) == "MemberExpr" ? Name(*Callee) : Name((*Callee)["referencedDecl"]);
+    if (!R || R->UePackage.compare(0, 8, "/Script/") == 0 || R->Inlines.count(Id) || !R->Methods.count(Fn) || IsInlineMethod(*R, Fn)) return std::string();
+    return StripTypeKeywords(T);
+}
+
+/* `return E;` in a function that returns a non-const T&: the address of E. A Blueprint variable has none to give, and
+   in C++ the reference would dangle (a local, a by-value parameter) or be the caller's variable (a T& parameter). */
+bool FCompiler::LowerRefReturn(const Json& Value, FBlueprintClass& BP, FArgIR& Out, std::string* Err)
+{
+    const Json* Bare = PeelLvalue(&Value);
+    std::string Pointee;
+    if (Bare && LowerAddress(*Bare, BP, Out, &Pointee, Err)) return true;
+    const Json* Root = Bare ? PlaceRoot(Bare) : nullptr;
+    const Json* D = Root && Kind(*Root) == "DeclRefExpr" ? &(*Root)["referencedDecl"] : nullptr;
+    if (D && (Kind(*D) == "ParmVarDecl" || Kind(*D) == "VarDecl") && !RefAddr.count(D->value("id", std::string())))
+        *Err = "returns a reference to " + Name(*D) + ", a " + (Kind(*D) == "ParmVarDecl" ? "parameter" : "local")
+             + ": a Blueprint variable has no address to return; return a pointer, or a value, or a reference into "
+               "memory, a TArray element or an object's member";
+    else
+        *Err = "a reference return gives the address of what it returns: " + *Err;
+    return false;
+}
+
+/* `*P`, `P[i]` on a raw pointer, `__PtrCast__<T&>(A)`, a reference local that keeps an address, and a call that
+   returns a reference. */
 bool FCompiler::IsDerefLvalue(const Json& N) const
 {
     const std::string K = Kind(N);
+    if (!RefReturnOf(N).empty()) return true;
     if (K == "UnaryOperator") return N.value("opcode", std::string()) == "*";
     if (K == "ArraySubscriptExpr") return true;
     if (K == "DeclRefExpr") return RefAddr.count(N["referencedDecl"].value("id", std::string())) != 0;
@@ -5131,7 +5184,7 @@ bool FCompiler::IsDerefLvalue(const Json& N) const
 
 /* The __Read*__ that loads a Pointee. It also sizes a __RefAt__'s view: a callee copying the view's element
    into a buffer sized for the Pointee needs the two to agree, so no view means no whole-value access. */
-const FReadViewSpec* FCompiler::ViewFor(const std::string& PointeeType) const
+const FReadViewSpec* FCompiler::ViewFor(const std::string& PointeeType)
 {
     const std::string P = StripTypeKeywords(PointeeType);
     const char* Read = nullptr;
@@ -5149,15 +5202,53 @@ const FReadViewSpec* FCompiler::ViewFor(const std::string& PointeeType) const
     else if (P == "FName") Read = "__ReadName__";
     else if (P == "FString") Read = "__ReadString__";
     else if (P == "FText") Read = "__ReadText__";
-    return Read ? FindReadView(Read) : nullptr;
+    if (Read) return FindReadView(Read);
+    const FRecord* SR = Structs.count(P) ? nullptr : Find(P);
+    if (!Structs.count(P) && !(SR && SR->bIsStruct && !IsInternalViewStruct(SR->CppName))) return nullptr;
+    if (auto It = StructViews.find(P); It != StructViews.end()) return &It->second.Spec;
+    const std::string Tag = TypeTag(P);
+    FStructView& V = StructViews[P];
+    V.Type = P;
+    V.Name = "FDerefView_" + Tag;
+    V.Pkg = ModPackage + "/" + V.Name;
+    V.Field = "__View_" + Tag + "__";
+    V.Spec = { "__ReadStruct__", "__DerefReadView__", V.Type.c_str(), V.Pkg.c_str(), V.Name.c_str(), V.Field.c_str() };
+    SlotAst[V.Name] = Json::array({ Json{ { "kind", "FieldDecl" }, { "name", V.Field },
+                                          { "type", Json{ { "qualType", "TArray<" + P + ">" } } } } });
+    FRecord& R = SlotStructs[V.Name];
+    R.CppName = R.UeName = V.Name;
+    R.UePackage = V.Pkg;
+    R.bIsStruct = R.bIsLocal = true;
+    for (const Json& F : SlotAst[V.Name]) R.Fields.push_back(&F);
+    return &V.Spec;
+}
+
+/* A pointee with no view of its own: its read intrinsic (HoistWideRead), else null. */
+const char* IsWideScalar(const std::string& P)
+{
+    if (P == "uint16" || P == "unsigned short") return "__ReadU16__";
+    if (P == "int16" || P == "short") return "__ReadI16__";
+    return P == "double" ? "__ReadF64__" : nullptr;
 }
 
 /* The value at Addr: a __Read*__, which the hoist pass loads into a temp. */
 bool FCompiler::ReadThrough(FArgIR Addr, const std::string& Pointee, FBlueprintClass& BP, FArgIR& Out, std::string* Err)
 {
     const FReadViewSpec* V = ViewFor(Pointee);
-    if (!V) { *Err = "TODO: a whole " + Pointee + " through a pointer; P->Member reaches its members"; return false; }
     const std::string P = StripTypeKeywords(Pointee);
+    /* No engine struct starts with a TArray of these, and Kismet has neither type: a 16-bit value is two byte reads, a
+       double its two int32 halves made into a float (HoistWideRead). */
+    if (const char* Wide = IsWideScalar(P))
+    {
+        Out = FArgIR();
+        Out.K = FArgIR::Call;
+        Out.InnerType = std::strcmp(Wide, "__ReadF64__") == 0 ? "float" : "int32";
+        Out.Sub = std::make_shared<FCallIR>();
+        Out.Sub->Intrinsic = Wide;
+        Out.Sub->Args.push_back(std::move(Addr));
+        return true;
+    }
+    if (!V) { *Err = "TODO: a whole " + Pointee + " through a pointer; P->Member reaches its members"; return false; }
     /* The int32 view would read it signed: 0xFFFFFFFF would widen and compare as -1. */
     if (P == "uint32" || P == "unsigned int")
     { *Err = "TODO: reading a uint32 through a pointer (Kismet has no unsigned 32-bit int); read it as int32 or int64"; return false; }
@@ -5194,7 +5285,8 @@ bool FCompiler::ReadThrough(FArgIR Addr, const std::string& Pointee, FBlueprintC
 /* The memory at Addr as an lvalue: a __RefAt__, whose hoist types its view by the Pointee. */
 bool FCompiler::RefThrough(FArgIR Addr, const std::string& Pointee, FArgIR& Out, std::string* Err)
 {
-    if (!ViewFor(Pointee)) { *Err = "TODO: a whole " + Pointee + " through a pointer; P->Member reaches its members"; return false; }
+    if (!IsWideScalar(StripTypeKeywords(Pointee)) && !ViewFor(Pointee))
+    { *Err = "TODO: a whole " + Pointee + " through a pointer; P->Member reaches its members"; return false; }
     Out = FArgIR();
     Out.K = FArgIR::Call;
     Out.InnerType = StripTypeKeywords(Pointee);
@@ -5260,6 +5352,16 @@ bool FCompiler::LowerAddress(const Json& Lvalue, FBlueprintClass& BP, FArgIR& Ou
         PlusOffset(std::move(Ptr), std::move(Offset));
         return true;
     }
+    if (const std::string Ref = N ? RefReturnOf(*N) : std::string(); !Ref.empty())
+    {
+        *Pointee = Ref;
+        Out = FArgIR();
+        Out.K = FArgIR::Call;
+        Out.Sub = std::make_shared<FCallIR>();
+        if (!LowerCall(*N, BP, *Out.Sub, Err)) return false;
+        Out.InnerType = "int64";
+        return true;
+    }
     if (K == "CallExpr" && IsDerefLvalue(*N))
     {
         *Pointee = StripTypeKeywords(TypeOf(*N));
@@ -5290,6 +5392,24 @@ bool FCompiler::LowerAddress(const Json& Lvalue, FBlueprintClass& BP, FArgIR& Ou
         Array.InnerType = "class UObject *";    // a TArray's first 8 bytes are its Data pointer, read as __AddrOf__ reads one
         if (!ConvertArg("int64", BP, Array, Err)) return false;
         PlusOffset(std::move(Array), std::move(Offset));
+        return true;
+    }
+    /* `&S.Member`, `&P->Member`: where S sits (or what P holds) plus the member's offset in the game's layout. A struct
+       that is a Blueprint variable has no address, and LowerAddress of it says so. */
+    if (const Json* Base = K == "MemberExpr" ? Nth(*N, 0) : nullptr;
+        Base && (!N->value("isArrow", false) || !PointeeOf(*Base).empty()))
+    {
+        FArgIR At;
+        std::string Struct;
+        if (N->value("isArrow", false)) { Struct = PointeeOf(*Base); if (!LowerArg(*Base, BP, At, Err)) return false; }
+        else if (!LowerAddress(*Base, BP, At, &Struct, Err)) return false;
+        FArgIR Offset;
+        Offset.K = FArgIR::Int64;
+        int32 Off = 0;
+        if (!MemberOffset(Struct, N->value("name", std::string()), &Off, Err)) return false;
+        Offset.I64 = Off;
+        PlusOffset(std::move(At), std::move(Offset));
+        *Pointee = StripTypeKeywords(TypeOf(*N));
         return true;
     }
     if (K == "MemberExpr" && N->value("isArrow", false))
@@ -5458,6 +5578,12 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
     }
     if (K == "CXXThisExpr") { Out.K = FArgIR::Self; return true; }
     if (K == "CXXNullPtrLiteralExpr") { Out.K = FArgIR::NullObj; return true; }
+    if (!RefReturnOf(*N).empty())
+    {
+        FArgIR Addr;
+        std::string Pointee;
+        return LowerAddress(*N, BP, Addr, &Pointee, Err) && ReadThrough(std::move(Addr), Pointee, BP, Out, Err);
+    }
     if (K == "UnaryExprOrTypeTraitExpr" && (N->value("name", std::string()) == "sizeof" || N->value("name", std::string()) == "alignof"))
     {
         /* The game's layout, not the host compiler's: clang sizes the UeApi stand-ins, which are not the real types. */
@@ -8945,7 +9071,11 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 std::string VarType = TypeOf(D);
                 FStmtIR Ds;
                 const Json* RefInit = First(D) ? PeelLvalue(First(D)) : nullptr;
-                if (!VarType.empty() && VarType.back() == '&' && RefInit && Kind(*RefInit) != "MaterializeTemporaryExpr")
+                /* A const T& bound to a call that returns a copy (any but a reference return) is a copy. */
+                const bool bCopiedCall = RefInit && VarType.compare(0, 6, "const ") == 0 && RefReturnOf(*RefInit).empty()
+                                      && (Kind(*RefInit) == "CallExpr" || Kind(*RefInit) == "CXXMemberCallExpr");
+                if (!VarType.empty() && VarType.back() == '&' && RefInit && Kind(*RefInit) != "MaterializeTemporaryExpr"
+                    && !bCopiedCall)
                 {
                     /* `T& R = V` is another name for V; `T& R = *P` keeps the address in an int64 local. A `const T& R`
                        bound to a temporary falls through to a copy, which lives as long. */
@@ -9216,8 +9346,16 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 FArgIR Addr;
                 std::string Pointee;
                 St.K = FStmtIR::Assign;
-                bOk = LowerAddress(*Lhs, BP, Addr, &Pointee, Err) && RefThrough(std::move(Addr), Pointee, St.Var, Err)
-                   && LowerArg(*Rhs, BP, St.Value, Err);
+                bOk = LowerAddress(*Lhs, BP, Addr, &Pointee, Err) && RefThrough(std::move(Addr), Pointee, St.Var, Err);
+                /* A 16-bit or double store takes an int32 or a float (SplitWideWrite), which no Kismet type narrows or
+                   widens to: the conversion C++ makes to the pointee is the store itself. */
+                const Json* Value = Rhs;
+                if (IsWideScalar(StripTypeKeywords(Pointee)))
+                    while ((Kind(*Value) == "ImplicitCastExpr" || Kind(*Value) == "CStyleCastExpr" || Kind(*Value) == "CXXStaticCastExpr"
+                            || Kind(*Value) == "CXXFunctionalCastExpr" || Kind(*Value) == "ParenExpr")
+                           && First(*Value) && StripTypeKeywords(TypeOf(*Value)) == StripTypeKeywords(Pointee))
+                        Value = First(*Value);
+                bOk = bOk && LowerArg(*Value, BP, St.Value, Err);
             }
             else if (const Json* Elem = LK == "MemberExpr" ? MapElementUnder(Rooted) : nullptr)
             {
@@ -9352,13 +9490,15 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             if (First(*S))
             {
                 St.bHasValue = true;
-                bOk = LowerArg(*First(*S), BP, St.Value, Err);
+                bOk = CurRefReturn.empty() ? LowerArg(*First(*S), BP, St.Value, Err)
+                                           : LowerRefReturn(*First(*S), BP, St.Value, Err);
             }
             /* Leaving by-reference TMap range-fors: the value is taken first (it may still change theirs), then each
                loop's value goes back into its map, innermost first. */
             if (bOk && !WriteBacks.empty())
             {
-                const std::string RetTy = St.bHasValue ? StripTypeKeywords(TypeOf(*First(*S))) : std::string();
+                const std::string RetTy = !St.bHasValue ? std::string() : !CurRefReturn.empty() ? std::string("int64")
+                                        : StripTypeKeywords(TypeOf(*First(*S)));
                 if (!RetTy.empty() && RetTy != "void")
                 {
                     const std::string Temp = "__Ret" + std::to_string(ReadTmpCounter++) + "__";
@@ -12372,6 +12512,24 @@ bool FCompiler::HoistReadCall(FArgIR& A, const FReadViewSpec& V, FBlueprintClass
     TmpPD.PropertyFlags &= ~uint64(CPF_Parm | CPF_BlueprintVisible | CPF_BlueprintReadOnly);
     Locals.push_back(TmpPD);
 
+    /* A waiting function has no prologue: its code starts at whichever segment its stub enters, and the scratch is
+       renamed into the ubergraph's frame with the segment's other locals. So each read primes Num itself. */
+    if (bMadeLatentCall)
+    {
+        FStmtIR Num;
+        Num.K = FStmtIR::Assign;
+        Num.Var.K = FArgIR::Member;
+        Num.Var.S = "Num";
+        Num.Var.Owner = DerefStruct;
+        Num.Var.LetOp = EX_Let;
+        Num.Var.Base = std::make_shared<FArgIR>();
+        Num.Var.Base->K = FArgIR::Local;
+        Num.Var.Base->S = "__DerefScratch__";
+        Num.Value.K = FArgIR::Int;
+        Num.Value.I = 1;
+        OutPre.push_back(std::move(Num));
+    }
+
     /* Statement 1: __DerefScratch__.Data = <Addr>. */
     FStmtIR WriteData;
     WriteData.K = FStmtIR::Assign;
@@ -12394,7 +12552,9 @@ bool FCompiler::HoistReadCall(FArgIR& A, const FReadViewSpec& V, FBlueprintClass
     ReadTmp.bAssignLocal = true;
     ReadTmp.Value.K = FArgIR::Call;
     ReadTmp.Value.Sub = std::make_shared<FCallIR>();
+    ReadTmp.Value.S = "__DerefScratch__";      // the scratch it reads, renamed with the locals in a waiting function
     ReadTmp.Value.Sub->Intrinsic = V.DerefIntrinsic;
+    ReadTmp.Value.Sub->View = V.ViewField ? V.ViewField : ViewFieldOf(V.DerefIntrinsic);
     ReadTmp.Value.Sub->Extra = BP.ScriptStruct(V.ViewStructPkg, V.ViewStructName);
     /* ponytail: a mod-owned view is { TArray<T> Data; }, 16 bytes. */
     if (std::strncmp(V.ViewStructPkg, "/Game/", 6) == 0) KeepStructLoaded(ReadTmp.Value.Sub->Extra, V.ViewStructName, 16);
@@ -12454,10 +12614,12 @@ bool FCompiler::HoistReadsInArg(FArgIR& A, FBlueprintClass& BP,
        an already-materialised inner temp. */
     if (!HoistCallArgs(*A.Sub, BP, Locals, OutPre, Err)) return false;
 
-    if (const FReadViewSpec* V = FindReadView(A.Sub->Intrinsic))
+    if (const FReadViewSpec* V = A.Sub->Intrinsic == "__ReadStruct__" ? ViewFor(A.InnerType) : FindReadView(A.Sub->Intrinsic))
         return HoistReadCall(A, *V, BP, Locals, OutPre, Err);
     if (A.Sub->Intrinsic == "__RefAt__")
         return HoistRefAt(A, BP, Locals, OutPre, Err);
+    if (A.Sub->Intrinsic == "__ReadU16__" || A.Sub->Intrinsic == "__ReadI16__" || A.Sub->Intrinsic == "__ReadF64__")
+        return HoistWideRead(A, BP, Locals, OutPre, Err);
     if (IsReinterpret(A.Sub->Intrinsic) && A.Sub->Args.size() == 1)
         return HoistOperand(A.Sub->Args[0], BP, Locals, OutPre, Err);
     return true;
@@ -12555,6 +12717,10 @@ bool FCompiler::HoistRefAt(FArgIR& A, FBlueprintClass& BP, std::vector<FProperty
         return false;
     }
     if (!HasDerefStruct(Err)) return false;
+    /* SplitWideWrite takes their stores; any other use of the place would get the 8-byte view below. */
+    if (IsWideScalar(StripTypeKeywords(A.InnerType)))
+    { *Err = "a " + StripTypeKeywords(A.InnerType) + " through a pointer is read or assigned, not passed by reference: "
+             "pass its value"; return false; }
     const FIndex DerefStruct = BP.ScriptStruct(ModPackage + "/FDeref", "FDeref");
     const std::string Scratch = "__RefScratch" + std::to_string(ReadTmpCounter++) + "__";
     FPropertyDef PD = StructParam(Scratch, DerefStruct, "FDeref", 16, 0);
@@ -12593,8 +12759,144 @@ bool FCompiler::HoistRefAt(FArgIR& A, FBlueprintClass& BP, std::vector<FProperty
     A.Sub = std::make_shared<FCallIR>();
     A.Sub->Intrinsic = "__RefAtInline__";
     A.Sub->Extra = BP.ScriptStruct(V->ViewStructPkg, V->ViewStructName);
-    A.Sub->View = ViewFieldOf(V->DerefIntrinsic);
+    A.Sub->View = V->ViewField ? V->ViewField : ViewFieldOf(V->DerefIntrinsic);
     if (std::strncmp(V->ViewStructPkg, "/Game/", 6) == 0) KeepStructLoaded(A.Sub->Extra, V->ViewStructName, 16);
+    return true;
+}
+
+/* Kismet int32 math for the wide reads and writes below. */
+FArgIR IntK(int32 V) { FArgIR A; A.K = FArgIR::Int; A.I = V; A.InnerType = "int32"; return A; }
+FArgIR MathK(FBlueprintClass& BP, const char* Fn, std::vector<FArgIR> Args, const char* Type = "int32")
+{
+    FArgIR C;
+    C.K = FArgIR::Call;
+    C.InnerType = Type;
+    C.Sub = std::make_shared<FCallIR>();
+    C.Sub->Fn = BP.EngineFunction("/Script/Engine", "KismetMathLibrary", Fn);
+    C.Sub->bPure = true;
+    C.Sub->Args = std::move(Args);
+    return C;
+}
+FArgIR IntrinsicK(const char* Name, FArgIR Arg, const char* Type, FIndex Extra = {})
+{
+    FArgIR C;
+    C.K = FArgIR::Call;
+    C.InnerType = Type;
+    C.Sub = std::make_shared<FCallIR>();
+    C.Sub->Intrinsic = Name;
+    C.Sub->Extra = Extra;
+    C.Sub->Args.push_back(std::move(Arg));
+    return C;
+}
+/* The address plus Off bytes. */
+FArgIR AtK(FBlueprintClass& BP, const FArgIR& Addr, int64 Off)
+{
+    if (Off == 0) return Addr;
+    FArgIR O;
+    O.K = FArgIR::Int64;
+    O.I64 = Off;
+    return MathK(BP, "Add_Int64Int64", { Addr, O }, "int64");
+}
+
+/* A 16-bit value or a double through a pointer, which no view reads: a uint16 is its low byte plus 256 times its high
+   one (an int16 then sign-extended), and a double is made into the float nearest it from its two int32 halves, as
+   C++'s conversion does. The address is evaluated once. */
+bool FCompiler::HoistWideRead(FArgIR& A, FBlueprintClass& BP, std::vector<FPropertyDef>& Locals,
+                              std::vector<FStmtIR>& OutPre, std::string* Err)
+{
+    const std::string Which = A.Sub->Intrinsic;
+    FArgIR Addr = std::move(A.Sub->Args[0]);
+    Addr.InnerType = "int64";
+    if (!HoistOperand(Addr, BP, Locals, OutPre, Err)) return false;
+    auto Math = [&](const char* Fn, std::vector<FArgIR> Args) { return MathK(BP, Fn, std::move(Args)); };
+    if (Which != "__ReadF64__")
+    {
+        auto Byte = [&](int64 Off) { return Math("Conv_ByteToInt", { IntrinsicK("__ReadByte__", AtK(BP, Addr, Off), "uint8") }); };
+        A = Math("Add_IntInt", { Byte(0), Math("Multiply_IntInt", { Byte(1), IntK(256) }) });
+        if (Which == "__ReadI16__") A = Math("Subtract_IntInt", { Math("Xor_IntInt", { A, IntK(0x8000) }), IntK(0x8000) });
+        return HoistReadsInArg(A, BP, Locals, OutPre, Err);
+    }
+    /* Each half once, and the exponent once: they are read in several places below. */
+    FArgIR Lo = IntrinsicK("__Read32__", AtK(BP, Addr, 0), "int32"), Hi = IntrinsicK("__Read32__", AtK(BP, Addr, 4), "int32");
+    if (!HoistReadsInArg(Lo, BP, Locals, OutPre, Err) || !HoistReadsInArg(Hi, BP, Locals, OutPre, Err)) return false;
+    Lo.InnerType = Hi.InnerType = "int32";
+    FArgIR E = Math("Divide_IntInt", { Math("And_IntInt", { Hi, IntK(0x7FF00000) }), IntK(0x100000) });
+    if (!HoistOperand(E, BP, Locals, OutPre, Err, true)) return false;
+    /* The float's 23 mantissa bits are the double's top 23 (Hi's 20, then Lo's top 3), rounded to nearest, a tie to
+       even: the next bit is added unless it is a tie (nothing set below it) and the kept bits are already even. A carry
+       out of them steps the exponent, which the sum below does by itself.
+       ponytail: a result below FLT_MIN reads as 0, not as the denormal C++ gives. */
+    FArgIR Halfway = Math("Divide_IntInt", { Math("And_IntInt", { Lo, IntK(0x10000000) }), IntK(0x10000000) });
+    FArgIR Sticky = Math("NotEqual_IntInt", { Math("And_IntInt", { Lo, IntK(0x0FFFFFFF) }), IntK(0) });
+    FArgIR Odd = Math("NotEqual_IntInt", { Math("And_IntInt", { Lo, IntK(0x20000000) }), IntK(0) });
+    Sticky.InnerType = Odd.InnerType = "bool";
+    FArgIR NotTie = Math("BooleanOR", { Sticky, Odd });
+    NotTie.InnerType = "bool";
+    const FArgIR M = Math("Add_IntInt", {
+        Math("Add_IntInt", { Math("Multiply_IntInt", { Math("And_IntInt", { Hi, IntK(0xFFFFF) }), IntK(8) }),
+                             Math("And_IntInt", { Math("Divide_IntInt", { Math("And_IntInt", { Lo, IntK(int32(0xE0000000u)) }),
+                                                                         IntK(0x20000000) }), IntK(7) }) }),
+        Math("SelectInt", { Halfway, IntK(0), NotTie }) });
+    const FArgIR Body = Math("Add_IntInt", { Math("Multiply_IntInt", { Math("Subtract_IntInt", { E, IntK(1023 - 127) }),
+                                                                       IntK(0x800000) }), M });
+    auto Select = [&](FArgIR Picked, FArgIR Other, FArgIR Cond)
+    {
+        FArgIR C = Math("SelectInt", { std::move(Picked), std::move(Other), std::move(Cond) });
+        return C;
+    };
+    auto Cmp = [&](const char* Fn, int32 V) { FArgIR C = Math(Fn, { E, IntK(V) }); C.InnerType = "bool"; return C; };
+    FArgIR AnyMantissa = Math("NotEqual_IntInt", { Math("Or_IntInt", { Math("And_IntInt", { Hi, IntK(0xFFFFF) }), Lo }), IntK(0) });
+    AnyMantissa.InnerType = "bool";
+    const FArgIR NanOrInf = Math("Or_IntInt", { IntK(0x7F800000), Select(IntK(0x400000), IntK(0), AnyMantissa) });
+    const FArgIR Magnitude = Select(NanOrInf, Select(IntK(0x7F800000), Select(IntK(0), Body, Cmp("LessEqual_IntInt", 1023 - 127)),
+                                                     Cmp("GreaterEqual_IntInt", 1023 + 128)),
+                                    Cmp("EqualEqual_IntInt", 0x7FF));
+    FArgIR Bits = Math("Or_IntInt", { Magnitude, Math("And_IntInt", { Hi, IntK(int32(0x80000000u)) }) });
+    A = IntrinsicK("__AsFloat__", std::move(Bits), "float", BP.ScriptStruct("/Script/CoreUObject", "Vector"));
+    return HoistReadsInArg(A, BP, Locals, OutPre, Err);
+}
+
+/* `*P = V` of a 16-bit value (its two bytes) or a double (the float V widened, written as its two int32 halves). V is
+   evaluated first, then the address, as C++17 orders an assignment. The parts are plain statements for the caller to
+   hoist. */
+bool FCompiler::SplitWideWrite(FStmtIR& St, FBlueprintClass& BP, std::vector<FPropertyDef>& Locals,
+                               std::vector<FStmtIR>& Out, std::string* Err)
+{
+    const bool bDouble = StripTypeKeywords(St.Var.InnerType) == "double";
+    FArgIR Value = std::move(St.Value), Addr = std::move(St.Var.Sub->Args[0]);
+    Value.InnerType = bDouble ? "float" : "int32";
+    Addr.InnerType = "int64";
+    if (!HoistOperand(Value, BP, Locals, Out, Err, true) || !HoistOperand(Addr, BP, Locals, Out, Err, true)) return false;
+    auto Math = [&](const char* Fn, std::vector<FArgIR> Args) { return MathK(BP, Fn, std::move(Args)); };
+    auto Store = [&](int64 Off, const char* Type, FArgIR V)
+    {
+        FStmtIR W;
+        W.K = FStmtIR::Assign;
+        W.Var = IntrinsicK("__RefAt__", AtK(BP, Addr, Off), Type);
+        W.Value = std::move(V);
+        Out.push_back(std::move(W));
+    };
+    if (!bDouble)
+    {
+        /* The high byte is V >> 8 as C++ shifts: the low bits cleared, then divided. */
+        Store(0, "uint8", MathK(BP, "Conv_IntToByte", { Value }, "uint8"));
+        Store(1, "uint8", MathK(BP, "Conv_IntToByte", { Math("Divide_IntInt", { Math("And_IntInt", { Value, IntK(int32(0xFFFFFF00u)) }),
+                                                                                IntK(256) }) }, "uint8"));
+        return true;
+    }
+    FArgIR Bits = IntrinsicK("__FloatBits__", Value, "int32", BP.ScriptStruct("/Script/CoreUObject", "IntPoint"));
+    if (!HoistOperand(Bits, BP, Locals, Out, Err, true)) return false;
+    FArgIR E = Math("Divide_IntInt", { Math("And_IntInt", { Bits, IntK(0x7F800000) }), IntK(0x800000) });
+    if (!HoistOperand(E, BP, Locals, Out, Err, true)) return false;
+    auto Is = [&](int32 V) { FArgIR C = Math("EqualEqual_IntInt", { E, IntK(V) }); C.InnerType = "bool"; return C; };
+    /* ponytail: a float below FLT_MIN is written as 0, not as the double it widens to. */
+    const FArgIR Mantissa = Math("SelectInt", { IntK(0), Math("And_IntInt", { Bits, IntK(0x7FFFFF) }), Is(0) });
+    const FArgIR Exp = Math("SelectInt", { IntK(0x7FF), Math("SelectInt", { IntK(0), Math("Add_IntInt", { E, IntK(1023 - 127) }), Is(0) }),
+                                           Is(0xFF) });
+    Store(0, "int32", Math("Multiply_IntInt", { Math("And_IntInt", { Mantissa, IntK(7) }), IntK(0x20000000) }));
+    Store(4, "int32", Math("Or_IntInt", { Math("Or_IntInt", { Math("And_IntInt", { Bits, IntK(int32(0x80000000u)) }),
+                                                              Math("Multiply_IntInt", { Exp, IntK(0x100000) }) }),
+                                          Math("Divide_IntInt", { Mantissa, IntK(8) }) }));
     return true;
 }
 
@@ -12606,7 +12908,9 @@ bool ContainsRead(const FArgIR& A)
     if (A.K == FArgIR::DynCast && A.Sub) return ContainsRead(A.Sub->Args[0]);
     if (A.K != FArgIR::Call || !A.Sub) return false;
     if (A.Sub->Target && ContainsRead(*A.Sub->Target)) return true;
-    if (FindReadView(A.Sub->Intrinsic) || A.Sub->Intrinsic == "__RefAt__" || IsBranch(A.Sub->Intrinsic)
+    if (FindReadView(A.Sub->Intrinsic) || A.Sub->Intrinsic == "__ReadStruct__" || A.Sub->Intrinsic == "__RefAt__"
+        || A.Sub->Intrinsic == "__ReadU16__" || A.Sub->Intrinsic == "__ReadI16__" || A.Sub->Intrinsic == "__ReadF64__"
+        || IsBranch(A.Sub->Intrinsic)
         || A.Sub->Intrinsic == "__Inline__") return true;
     if (IsReinterpret(A.Sub->Intrinsic) && A.Sub->Args.size() == 1 && !IsStored(A.Sub->Args[0])) return true;
     for (const FArgIR& CA : A.Sub->Args) if (ContainsRead(CA)) return true;
@@ -12754,6 +13058,21 @@ bool FCompiler::HoistReadsInList(std::vector<FStmtIR>& Stmts, FBlueprintClass& B
             if (!HoistBranch(St.Value, BP, Locals, Pre, Err, &St.Var, &DestProp)) return false;
             for (FStmtIR& P : Pre) Out.push_back(std::move(P));
             if (St.Value.K != FArgIR::Local || St.Value.S != St.Var.S) Out.push_back(std::move(St));
+            continue;
+        }
+        /* `*P = V` of a 16-bit value or a double: statements of their own, each then hoisted as any other. */
+        if (St.K == FStmtIR::Assign && St.Var.K == FArgIR::Call && St.Var.Sub && St.Var.Sub->Intrinsic == "__RefAt__"
+            && IsWideScalar(St.Var.InnerType))
+        {
+            std::vector<FStmtIR> Split;
+            if (!SplitWideWrite(St, BP, Locals, Split, Err)) return false;
+            for (FStmtIR& Part : Split)
+            {
+                std::vector<FStmtIR> PartPre;
+                if (!HoistReadsInStmt(Part, BP, Locals, PartPre, Err)) return false;
+                for (FStmtIR& P : PartPre) Out.push_back(std::move(P));
+                Out.push_back(std::move(Part));
+            }
             continue;
         }
         if (!HoistReadsInStmt(St, BP, Locals, Pre, Err)) return false;
@@ -14377,6 +14696,40 @@ bool FCompiler::StructLayout(const FRecord& R, int32* Size, int32* Align, std::s
     }
     *Align = MaxAlign;
     *Size = std::max(1, (Offset + MaxAlign - 1) / MaxAlign * MaxAlign);
+    return true;
+}
+
+/* Where Member sits in a struct: its members at their natural alignment, as UStruct::Link lays out a mod's (StructLayout).
+   An engine struct's are its reflected members, laid out the same way, which is right only when nothing unreflected sits
+   between them: trusted when they add up to the struct's size in the game. */
+bool FCompiler::MemberOffset(const std::string& StructType, const std::string& Member, int32* Offset, std::string* Err)
+{
+    const std::string T = StripTypeKeywords(StructType);
+    std::vector<std::pair<std::string, std::string>> Fields;     // (type, name)
+    int32 GameSize = -1;
+    if (auto S = Structs.find(T); S != Structs.end()) { Fields = S->second.Fields; GameSize = S->second.Size; }
+    else if (const FRecord* R = Find(T); R && R->bIsStruct)
+        for (const Json* F : R->Fields) Fields.emplace_back(TypeOf(*F), Name(*F));
+    else { *Err = "TODO: the address of a member of " + T + ", which is not a struct"; return false; }
+    int32 At = 0, MaxAlign = 1, Found = -1;
+    for (const auto& [Type, Name] : Fields)
+    {
+        int32 Size = 0, Align = 1;
+        if (!LayoutOf(Type, &Size, &Align, Err)) return false;
+        At = (At + Align - 1) / Align * Align;
+        if (Name == Member) Found = At;
+        At += Size;
+        MaxAlign = std::max(MaxAlign, Align);
+    }
+    if (Found < 0) { *Err = "the address of " + T + "::" + Member + ", a member the compiler does not see in " + T; return false; }
+    if (const int32 Size = std::max(1, (At + MaxAlign - 1) / MaxAlign * MaxAlign); GameSize >= 0 && Size != GameSize)
+    {
+        *Err = "TODO: the address of " + T + "::" + Member + ": " + T + "'s reflected members take " + std::to_string(Size)
+             + " bytes and it takes " + std::to_string(GameSize) + " in the game, so something unreflected moves them; add "
+               "the member's offset to the struct's address yourself";
+        return false;
+    }
+    *Offset = Found;
     return true;
 }
 
@@ -17549,11 +17902,21 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
             while (!RetType.empty() && (RetType.back() == ' ' || RetType.back() == '\t'))
                 RetType.pop_back();
         }
+        /* A reference return (DESIGN.md): a non-const T& returns the address, and every call is memory at it; a const T&
+           returns a copy. */
+        CurRefReturn.clear();
         if (!RetType.empty() && RetType.back() == '&')
         {
-            *Err = R.CppName + "::" + Fn.Name + " returns " + RetType + ": a reference return is refused until what it "
-                   "means to a C++ caller is specified; return a value or a pointer";
-            return false;
+            RetType.pop_back();
+            while (!RetType.empty() && RetType.back() == ' ') RetType.pop_back();
+            if (RetType.compare(0, 6, "const ") == 0)
+                printf("  warning: %s::%s returns %s&: a Blueprint function returns a copy, which a caller keeping the "
+                       "reference does not see change\n", R.CppName.c_str(), Fn.Name.c_str(), RetType.c_str());
+            else
+            {
+                CurRefReturn = StripTypeKeywords(RetType);
+                RetType = "int64";
+            }
         }
         if (!RetType.empty() && RetType != "void")
         {
@@ -17855,8 +18218,6 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
                 printf("  warning: %s::%s waits, and an object of this class finds its world only through its Outer: make "
                        "it with an actor or component as Outer, or the call does nothing and the function never resumes\n",
                        R.CppName.c_str(), Fn.Name.c_str());
-            if (bScratchNeeded)
-            { *Err = R.CppName + "::" + Fn.Name + ": TODO: a pointer read in a function that makes a latent call"; return false; }
             WarnFrameWeakLocals(Stmts, R.CppName + "::" + Fn.Name);
             FSegment Seg{ Fn.Name, Super, {}, Locals, Stmts, Flags, {}, Completions };
             Seg.Parms.assign(Params.begin(), Params.end() - Locals.size());

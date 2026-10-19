@@ -1077,7 +1077,8 @@ copies it, as in C++.
 | `Home.Z = Twice.X + 1;` | Reads and writes a member in place (Break Struct, Set Members in Struct). | Yes |
 | `Nested.Inner.Kills += 1;` | Nested members work to any depth, in place. | Yes |
 | `K2_GetActorLocation().X` | A member of a struct a call returns. The value is stored in a temporary and read from there. | Yes |
-| `&S.Kills` | Not yet: a Blueprint variable has no address. See [Pointers and memory](#pointers-and-memory). | Not yet |
+| `&S.Kills` with a member `S` | The address of S, found at run time through the ReadProperty helper as `&Member` is, plus Kills' offset in the struct. Without the helper the build stops ("include ReadProperty.h"). See [Pointers and memory](#pointers-and-memory). | Yes |
+| `&S.Kills` with a local or parameter `S` | Refused: a Blueprint variable has no address ("a Blueprint variable has none the VM hands out"). | Refused |
 
 ### Making struct values
 
@@ -1868,7 +1869,7 @@ function then has two properties both named X.
 | `int32 &Slot = Slots[I];` | A TArray element (of this object or another), `*P` or `P[I]`: the reference keeps the place's address in a hidden int64 local, and reads and writes go straight to that memory. | Yes |
 | `const FVector &Home = K2_GetActorLocation();` | A `const T&` bound to a temporary is a copy, which lives as long as the reference. | Yes |
 | `int32 &R = Other->Score;` | Another object's field has no Blueprint reference, so R keeps the field's address, found by name at run time as `&Other->Score` is. That needs the ReadProperty class you supply (see [Pointers and memory](#pointers-and-memory)); without one the build stops ("include ReadProperty.h"). The `const` and `auto &` forms, and `O->Score` through a local pointer, are the same. Without the helper, write to the field directly, or pass it to an inline function's `T&` parameter, which binds the field itself. | Yes |
-| `float &X = Other->Loc.X;` | Refused ("the address of MemberExpr"): a member of another object's struct has no address the VM hands out. | Refused |
+| `float &X = Other->Loc.X;` | X keeps the address of Loc, found by name at run time as `&Other->Loc` is, plus X's offset. That needs the ReadProperty class, as the row above does. | Yes |
 
 ```cpp
 int32 Count;
@@ -1894,9 +1895,10 @@ Notes:
 
 - A reference that holds an address behaves like C++'s. If the array grows or shrinks after the reference is taken,
   it may point at freed memory. Take the reference after any Add or Remove, or index the array again.
-- A reference that holds the address of a struct or a TArray is usable only through its members. With
-  `FVector &V = Pts[0];`, `V.X = 2.f` works, but `FVector C = V;` is refused ("a whole FVector through a pointer"), and
-  so is a TArray function called on a `TArray<int32> &`.
+- A reference that holds the address of a struct reads and writes it as `*P` does: with `FVector &V = Pts[0];`,
+  `V.X = 2.f` writes the member and `FVector C = V;` copies the struct. A reference to a TArray is usable only through
+  its elements: a TArray function called on a `TArray<int32> &` is refused ("a whole TArray<int32> through a
+  pointer").
 
 ### Other declarations
 
@@ -2134,7 +2136,9 @@ Notes:
 |---|---|---|
 | `FVector Offset(float Up) { return ...; }` | The return type becomes the function's ReturnValue output. Any type a variable can have may be returned, and a caller can read a member of a returned struct directly: `GetTransform().Translation.Y`. | Yes |
 | `auto Half(int32 V) { return V / 2; }` | A deduced return type becomes the Blueprint function's return type. | Yes |
-| `int32 &Slot(int32 I)` | Refused: `a reference return is refused until what it means to a C++ caller is specified`. Return a value or a pointer. | Not yet |
+| `int32 &Slot(int32 I) { return Slots[I]; }` | Returns the address of what it returns, and each call is the memory there, as `*P` is: `Slot(2) = 7` writes the element, `Slot(2) += 1` calls Slot once, `int32 &R = Slot(2);` keeps the address, `Slot(2).X` reaches a member. The returned thing needs an address: a TArray element, memory through a pointer, a member of either, another object's member (through ReadProperty). A Blueprint caller, such as the editor, sees an int64: the address. | Yes |
+| `int32 &Bad() { int32 L = 3; return L; }` | Refused: "returns a reference to L, a local: a Blueprint variable has no address to return". A by-value parameter and a `T&` parameter are refused the same way. Return a value or a pointer. | Refused |
+| `const FString &Name() { return Names[0]; }` | Returns a copy: the function's ReturnValue is an FString. The build warns ("returns const FString&: a Blueprint function returns a copy"): a caller that keeps the reference does not see the original change later. | Warns |
 | `int32 ByVal(TArray<int32> A)` | An input pin. The callee gets its own copy, containers and structs included, and its writes stay in the callee. | Yes |
 | `void Around(int32 A, int32 &Lo, int32 &Hi)` | A pass-by-reference pin: writes reach the caller's variable, member or array element. This is how a function returns several values. | Yes |
 | `int32 Plus1(const int32 &A)` | Passed by reference, with no copy. A literal or computed argument is first stored in a hidden local, as the editor's compiler does, because the VM needs an address. | Yes |
@@ -2164,6 +2168,9 @@ Notes:
   runs RandomInteger at each call that leaves `Max` out.
 - A `T&` parameter bound to another object's member (`Add5(O->N)`) is passed through that object, which the engine
   treats as a reference. This case has not been run.
+- What a reference return means follows the declaration, not the body, so a class shared through `UE_CLASS` returns the
+  same thing to every mod that calls it. An inline function that returns `T&` is expanded instead, and its call is the
+  place it returns, as before.
 
 ### Reference parameters and copy-back
 
@@ -3329,7 +3336,7 @@ Notes:
 | `Obj->GetOuter()` | Reads the object's outer pointer from memory, with no engine call. On a null object it crashes, as in C++. For a null-safe call, use `UKismetSystemLibrary::GetOuterObject(Obj)`. | Yes |
 | `GetTypedOuter<AActor>(Obj)` | From `Objects.h`: the nearest outer of `Obj` that is a `T`, or null. `Obj` itself is never a candidate, and a null `Obj` gives null. Each step is one outer read and one Cast. | Yes |
 | `GetOutermostTypedOuter<ULevel>(Obj)` | From `Objects.h`: the same walk, keeping the farthest outer that is a `T`. | Yes |
-| `GetOuter()` or `GetTypedOuter<T>()` in a function that waits (`Delay`, `UE_AWAIT`) | Not yet: refused with "a pointer read in a function that makes a latent call". Do the walk in a separate function that does not wait, or loop over `UKismetSystemLibrary::GetOuterObject`, which is an engine call. | Not yet |
+| `GetOuter()` or `GetTypedOuter<T>()` in a function that waits (`Delay`, `UE_AWAIT`) | Reads the outer when the line runs, before the wait or after the function resumes. | Yes |
 | `Obj->IsA(AActor::StaticClass())` | Get Class, then Class Is Child Of: `UKismetMathLibrary::ClassIsChildOf(UGameplayStatics::GetObjectClass(Obj), Class)`. False on a null object. Needs `UeApi/Engine.h`. | Yes |
 | `Class->IsChildOf(AActor::StaticClass())` | Class Is Child Of (`UKismetMathLibrary::ClassIsChildOf`). False on a null class. | Yes |
 | `Obj->Class` | Refused by clang: "no member named 'Class' in 'UObject'". The SDK declares none of UObject's raw fields (`Class`, `Outer`, `Name`). Use the helpers above. | Refused |
@@ -5023,7 +5030,7 @@ Notes:
 | `void SayLater(const FString &Msg)` with a Delay inside | Msg is copied into the event graph's frame when the method is called, through EX_LocalOutVariable, as the editor's event stubs copy one (a ReceiveHit's `const FHitResult &Hit`); the code after the wait reads that copy. | Yes |
 | `void FillLater(int32 &Out)` with a Delay inside | Refused with the CountLater message: a write after the wait would land in the frame's copy, the caller having gone on. Store the result in a member. | Refused |
 | a Delay in a `UObject` child class | Warns: "finds its world only through its Outer". Actor, ActorComponent, UserWidget, GameInstance and Subsystem classes have a world of their own; any other object uses its Outer's. Make the object with an actor or component as its Outer, or the wait does nothing and the method never resumes. The editor offers Delay only where the class has a world. | Warns |
-| `V = __Read64__(Addr);` in a method that waits | Refused: "a pointer read in a function that makes a latent call". Move the read into a separate non-inline method that does not wait, and call that. See [Pointers and memory](#pointers-and-memory). `GetOuter()` and `GetTypedOuter` read memory too and are refused the same way (see [Working with other objects](#working-with-other-objects)). | Not yet |
+| `V = __Read64__(Addr);` in a method that waits | Reads the memory when the line runs: a read after the wait sees what the memory holds then. Writes through a pointer, `GetOuter()` and `GetTypedOuter` work the same way. See [Pointers and memory](#pointers-and-memory). | Yes |
 | `void ExecuteUbergraph_Door(int32 EntryPoint);` | Refused: "ExecuteUbergraph_<Class> is the name of a class's ubergraph". The engine resumes a class's latent calls through that function, found by name on the object, so a method of that name in the class or a subclass would catch them. | Refused |
 
 ```cpp
@@ -5231,7 +5238,10 @@ Notes:
 | `(int64)*(void **)Addr` | A pointer to a raw pointer reads a plain int64 address. | Yes |
 | `int64 V = *(uint32 *)Addr;` | Not built: Kismet has no unsigned 32-bit integer, and an int32 read would make 0xFFFFFFFF compare as -1. Refused with "reading a uint32 through a pointer". Read an int32 and mask it, as below. | Not yet |
 | `*(uint32 *)Addr = 5;` | Refused with "no Kismet conversion from int to uint32". Write through an int32 pointer: `*(int32 *)Addr = 5;`. | Refused |
-| `FVector V = *Pv;`, `*Pv = FVector(1.0f, 2.0f, 3.0f);` | A whole struct has no read or write through a pointer, and neither do a double and a uint16. Refused with "a whole FVector through a pointer" ("a whole double", ...). Read and write the members with `Pv->X`. | Not yet |
+| `FVector V = *Pv;`, `*Pv = FVector(1.0f, 2.0f, 3.0f);`, `Pv[1] = *Pv;` | Reads, writes or copies the whole struct, at its size in the game: 12 bytes for an FVector. A struct holding an FString or a TArray is copied deeply, as C++'s copy is. Any struct a variable can be works, the mod's own included. | Yes |
+| `int32 V = *P16;`, `*P16 = 7;` with `uint16 *P16` or `int16 *P16` | Two bytes. A read is an int32, since Blueprint has no 16-bit integer: 0 to 65535 for uint16, sign-extended for int16. A write stores the value's low 16 bits and touches nothing past them. | Yes |
+| `float F = (float)*Pd;`, `*Pd = F;` with `double *Pd` | Blueprint has no double, so a read gives the float nearest the double, rounded as C++ converts it, and a write stores the float widened to a double. A value below the smallest normal float (about 1.2e-38) reads as 0 and is written as 0, where C++ keeps a denormal. | Yes |
+| `TArray<int32> A = *Pa;`, `TSet`, `TMap` | Refused with "a whole TArray<int32> through a pointer". Index the elements through the pointer's own data, or copy the container in a function that owns it. | Refused |
 
 ```cpp
 TArray<int32> Items;
@@ -5255,8 +5265,12 @@ int64 Unsigned(uint32 *P) {
 
 Notes:
 
-- A read takes the pointee's size in the game: 8 bytes for int64, uint64, FName and any pointer; 4 for int32 and
-  float; 1 for int8, uint8 and bool; an enum's underlying size (1, 4 or 8); 16 for FString; 24 for FText.
+- A read takes the pointee's size in the game: 8 bytes for int64, uint64, double, FName and any pointer; 4 for int32
+  and float; 2 for int16 and uint16; 1 for int8, uint8 and bool; an enum's underlying size (1, 4 or 8); 16 for
+  FString; 24 for FText; a struct's size (see sizeof below).
+- A whole struct goes through a struct the compiler cooks beside the class, `FDerefView_<Struct>`, as it cooks
+  FDeref. Ship it with the class.
+- A double is converted with integer math on its two halves, about 35 Kismet calls a read.
 - The uint32 message also suggests an int64 read. An int64 read takes 8 bytes, so it includes the 4 bytes after the
   value. Use it only when the 8 bytes really are an int64.
 
@@ -5274,7 +5288,7 @@ float Lift() {
   Points.Add(FVector(1.0f, 2.0f, 3.0f));
   FVector *V = &Points[0];
   V->Z = V->Z + 100.0f;                 // writes Points[0].Z in place
-  float *Y = (float *)((int64)V + 4);   // FVector::Y is 4 bytes in
+  float *Y = &V->Y;                     // 4 bytes in
   return *Y + (*V).X;
 }
 ```
@@ -5301,8 +5315,10 @@ Notes:
 | `&MakeArr()[0]` | Refused with "the address of an element needs an array variable". Store the array in a local first. | Refused |
 | `&*P`, `&P[I]` | P itself, and P + I × sizeof(pointee). Nothing is read. | Yes |
 | `&Obj->Member`, `&Member` | The address of an object's property (`&Member` is one of the class's own), looked up by name at run time. Needs a class named ReadProperty that you supply (see Helper code you supply, below). The result is 0 when the object's class has no such property. | Yes |
-| `&V.X`, `&Pv->X` | The address of a struct member is not built. Refused with "the address of MemberExpr" for a struct variable, and "the address of a member of int64" through a pointer. Add the offset yourself: `(int64)Pv + 4` is the address of `Pv->Y` for an FVector. | Not yet |
-| `&Local`, `&Param` | A local or a parameter is a Blueprint variable, which has no address the VM hands out. Refused with "a Blueprint variable has none the VM hands out". Point into an object, a TArray element or memory through a pointer instead. | Refused |
+| `&Pv->Y`, `&(*Pv).Y`, `&Items[I].Y`, `&R.Y` | The address of a struct member: where the struct sits plus the member's offset in the game's layout, through any number of members (`&P[I].Inner.Y`). The struct may be memory through a pointer, a TArray element, a reference that keeps an address, or a call that returns a reference. | Yes |
+| `&Obj->Loc.Y`, `&Loc.Y` | The same, with the struct's address found at run time through ReadProperty, as `&Obj->Member`'s is. | Yes |
+| `&H->Distance` with `FHitResult *H` | An engine struct's members are placed from its reflected ones, which is right only when nothing unreflected sits between them. When they do not add up to the struct's size, the build stops: "FHitResult's reflected members take 112 bytes and it takes 136 in the game". Add the offset yourself, from the game's SDK. | Refused |
+| `&Local`, `&Param`, `&V.X` of a local struct | A local or a parameter is a Blueprint variable, which has no address the VM hands out. Refused with "a Blueprint variable has none the VM hands out". Point into an object, a TArray element or memory through a pointer instead. | Refused |
 | `&this->K` with `static inline int32 K = 3;` | An inline class variable has no storage: each use is its initializer. Refused with "a static variable has no address". A bare `&K` gets the Blueprint-variable message instead. | Refused |
 
 ```cpp
@@ -5324,7 +5340,8 @@ Notes:
   function's world-context parameter, or self when it has none. `&Member` on the class's own object passes self as Obj.
 - Without a class named ReadProperty in scope, the build fails with "`&Obj->Member` finds the member at run time
   through ReadProperty::GetPropertyAddress: include ReadProperty.h". The build does not check the function it calls.
-- Only an object's members have a run-time lookup. A struct member's address is the "Not yet" row above.
+- Only an object's members have a run-time lookup. A struct member's offset is known when the mod is built: from the
+  mod's own layout for its structs, from the reflected members for an engine struct.
 - `float &R = Other->CustomTimeDilation;` makes the same GetPropertyAddress call and keeps the address it returns.
   Without a ReadProperty class it is refused with the same message, after `reference R: `. Reference locals are in
   [Locals](#locals).
@@ -5337,7 +5354,7 @@ Notes:
 | `int32 &Alias = Local;` | Another name for the variable, with no storage of its own. Writes reach the original. | Yes |
 | `const FString &R = MakeName();` | A `const T&` bound to a temporary is an ordinary local holding a copy. | Yes |
 | `Bump(*P);` with `void Bump(int32 &V)` | Passes the memory itself, so the callee's writes land at the address. A T& parameter of a mod function is an out-parameter in the Blueprint. | Yes |
-| `int32 &Get(int32 *P) { return *P; }` | A reference return is not built. Refused with "a reference return is refused"; return a value or a pointer. | Not yet |
+| `int32 &Get(int32 *P) { return *P; }` | Returns the address P holds, so `Get(P) = 5` writes there and `Get(P)` reads there. Reference returns are in [Functions](#parameters-and-return-values). | Yes |
 
 ```cpp
 void Bump(int32 &V) { V = V + 1; }
@@ -5398,17 +5415,16 @@ Notes:
 | You write | What it does | Status |
 |---|---|---|
 | `while (*Q != 0) { ++Q; }` | A condition that reads memory is read again before every iteration, as in C++. The compiler writes the loop as `while (true) { if (!Cond) break; ... }`. | Yes |
-| `Value = *P;` in a function that also calls `Delay(1.0f)` | A function that makes a latent call runs in a generated event graph, where a memory read is not built. Refused with "a pointer read in a function that makes a latent call". Do the read in a function that does not wait and is not `inline`, and call it. An inline function is expanded into the caller, so its read is refused the same way. | Not yet |
+| `Value = *P;` in a function that also calls `Delay(1.0f)` | Reads when the line runs. A function that waits runs in a generated event graph, and its locals, P included, live in that graph's frame, so a read after the wait uses the same P. Writes and inline functions work the same way. | Yes |
 
 ```cpp
 int64 Addr = 0;
 int64 Value = 0;
 
-int64 ReadNow() { return *(int64 *)Addr; }
-
 void Poll() {
-  Value = ReadNow();   // the read runs in a function that does not wait
+  Value = *(int64 *)Addr;    // now
   UKismetSystemLibrary::Delay(1.0f);
+  Value = *(int64 *)Addr;    // a second later
 }
 
 int32 CountNonZero(int32 *Q) {
@@ -5423,10 +5439,8 @@ int32 CountNonZero(int32 *Q) {
 
 Notes:
 
-- The refusal covers a read such as `*P`, the `__Read*__` intrinsics, and `Obj->GetOuter()`, which reads the outer
-  from memory (see [Working with other objects](#working-with-other-objects)). A write through a pointer and a
-  `P->X` read are not refused in such a function, but nothing has checked how they behave there. Latent functions
-  are in [Latent calls](#latent-calls).
+- The memory can change while the function waits, as it can in C++ between two reads. Latent functions are in
+  [Latent calls](#latent-calls).
 - Reads and writes are not checked. The VM does no bounds or validity check, so a wrong address reads garbage or
   raises an access violation in the game process. There is no soft failure. Check what you can first: that an object
   is valid, and that a property exists and has the type you expect.
@@ -5564,8 +5578,7 @@ UClass *ClassOfObject(UObject *Obj) {
 
 Notes:
 
-- The reads work exactly like `*P` on the matching pointer type, with the same rules: nothing checks the address,
-  and a function that makes a latent call cannot contain one.
+- The reads work exactly like `*P` on the matching pointer type, with the same rules: nothing checks the address.
 
 ### __PtrCast__
 
@@ -6228,9 +6241,15 @@ and where the feature is described. In each group, the messages you are most lik
   C++ runs that class's own version;
   by name the call would reach the object's override. Fix: call it by name if the override is what you want, or move
   the code into a function of another name and call that. See [Overrides and parent calls](#overrides-and-parent-calls).
-- `<Class>::<Function> returns <Type>: a reference return is refused until what it means to a C++ caller is specified;
-  return a value or a pointer`: Not yet. A method that returns `T&`, such as `int32 &Slot(int32 I)` or
-  `int32 &Get(int32 *P) { return *P; }`. Fix: return a value, or a pointer. See [Functions](#functions).
+- `<Class>::<Function>: returns a reference to <Name>, a local` (or `a parameter`)`: a Blueprint variable has no
+  address to return; ...`: a function returning `T&` whose `return` names a local or a parameter. C++ would dangle
+  for a local or a by-value parameter; a `T&` parameter's address is not one a Blueprint can hand out. Fix: return a
+  pointer, a value, or a reference into memory, a TArray element or an object's member. See [Functions](#functions).
+- `<Class>::<Function>: a reference return gives the address of what it returns: <why>`: the returned expression has
+  no address, such as a call's value. `<why>` says what was missing. Fix: as above.
+- `warning: <Class>::<Function> returns const <Type>&: a Blueprint function returns a copy`: a `const T&` return. The
+  value is right at the call; a caller keeping the reference does not see the original change. Fix: nothing, or
+  return a non-const reference or a pointer if the caller must follow the original.
 - `<Class>::<Method>: TODO: an overload set may not mix inline and non-inline functions`: a call to a non-inline
   overload of a name whose overload with the most parameters is inline. A name keeps one Blueprint function, the
   overload with the most parameters. When that overload is inline, the class makes no Blueprint function for the name,
@@ -6920,21 +6939,22 @@ so the retail game prints nothing. See [Strings and text](#strings-and-text) and
 
 ### Pointers, memory and intrinsics
 
-- `TODO: a whole <Type> through a pointer; P->Member reaches its members`: a whole struct or container read, written
-  or passed through a raw pointer, as in `FVector V = *Pv;` or `*Pv = FVector(1.0f, 2.0f, 3.0f);`. Only integers,
-  float, bool, enums, FName, FString, FText and pointers are read whole. Fix: go member by member, `Pv->X = 1.0f;`.
+- `TODO: a whole <Type> through a pointer; P->Member reaches its members`: a whole container read, written or
+  passed through a raw pointer or a reference that keeps an address, as in `TArray<int32> A = *Pa;` or `R.Num()` with
+  `TArray<int32> &R = *Pa;`. Structs, integers, float, double, bool, enums, FName, FString, FText and pointers are
+  read whole. Fix: reach the elements through the container's data, or work on the container where it is a variable.
   See [Pointers and memory](#pointers-and-memory).
 - ``TODO: the address of <ExprKind>: a Blueprint variable has none the VM hands out; point into an object
   (`(uint8*)Obj`), a TArray element (`&Items[I]`) or memory through a pointer``: the address of a local, a parameter
-  or a member of a struct value, as in `&Count` or `&V.X`. `<ExprKind>` is clang's name for the expression, such as
-  DeclRefExpr or MemberExpr. The address of a struct member is Not yet: it is refused with this message. Fix: point
-  into an object, an array element or memory through a pointer, as the message says. For a struct reached through a
-  pointer, add the member's offset yourself: `(int64)Pv + 4` is the address of `Pv->Y`. See
+  or a member of a local struct, as in `&Count` or `&V.X`. `<ExprKind>` is clang's name for the expression, such as
+  DeclRefExpr. Fix: point into an object, an array element or memory through a pointer, as the message says. See
   [Pointers and memory](#pointers-and-memory).
-- `TODO: the address of a member of <Type>, which is not an object class`: Not yet. `&Pv->X` through a struct
-  pointer. The message names `int64`, because AssetGen holds the pointer as an address. Fix: add the member's offset
-  to the pointer, `(int64)Pv + 4` for FVector's Y, or read and write `Pv->X` directly. See
-  [Pointers and memory](#pointers-and-memory).
+- `TODO: the address of <Struct>::<Member>: <Struct>'s reflected members take <N> bytes and it takes <M> in the game,
+  so something unreflected moves them; add the member's offset to the struct's address yourself`: `&P->Member` on an
+  engine struct whose reflected members do not account for its whole layout, such as FHitResult. Fix: take the
+  offset from the game's SDK dump and add it, `(int64)H + 8`. See [Pointers and memory](#pointers-and-memory).
+- `TODO: the address of a member of <Type>, which is not a struct`: `&X.M` where the compiler knows X's type as
+  neither a struct nor an object class. Fix: give the pointer its real type.
 - `` `&Obj->Member` finds the member at run time through ReadProperty::GetPropertyAddress: include ReadProperty.h ``:
   `&Obj->Member`, or `&Member` on the object itself, with no class named ReadProperty in scope. A cooked property
   carries no offset, so the address is looked up at run time by a function of that class, which AssetGen does not
@@ -6943,10 +6963,6 @@ so the retail game prints nothing. See [Strings and text](#strings-and-text) and
   `int64 GetPropertyAddress(UObject *Target, FName PropName, UObject *WorldContextObject = nullptr)`, and build the mod
   that defines it. For a reference, read the member into a local instead. See
   [Pointers and memory](#pointers-and-memory).
-- `<Class>::<Function>: TODO: a pointer read in a function that makes a latent call`: Not yet. A read through a
-  pointer (`*P`, a `__Read*__` intrinsic, or `GetOuter()`, which reads memory) in a method that also makes a latent
-  call or uses UE_AWAIT is refused. Fix: do the read in a separate method with no latent call and call it, or store
-  the value in a member before the wait. See [Pointers and memory](#pointers-and-memory).
 - `TODO: reading a uint32 through a pointer (Kismet has no unsigned 32-bit int); read it as int32 or int64`: `*P` on a
   `uint32 *`. Reading it as an int64 reads 8 bytes, which is only right when the memory really holds an int64. Fix:
   read it as int32 and accept the sign, or widen and mask it:

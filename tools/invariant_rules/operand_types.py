@@ -648,7 +648,7 @@ def is_call(n): return n.op in CALLS or (n.op in (0x19, 0x1A) and is_call(n.kids
 # own Blueprints hold none): an engine struct whose member at offset 0 has the width it wants - __AddrOf__ reads
 # ScreenMessageString.Key (the first 8 bytes of any value: an object's pointer, an array's data), __NameIndex__
 # IntPoint.X, __AsObject__ DebugDisplayProperty.obj (an int64 read back as a UObject*) (Cpp.cpp 822-841, 2481-2496,
-# 4926-4930); the kReadViews, a TArray<T> at offset 0 read over an FDeref scratch whose Data is a raw address (1030-1062,
+# 4926-4930), __FloatBits__ IntPoint.X over a float and __AsFloat__ Vector.X over an int32 (float_pun); the kReadViews, a TArray<T> at offset 0 read over an FDeref scratch whose Data is a raw address (1030-1062,
 # ViewFieldOf 705-713, HoistRefAt 8009-8064); and its own view structs - FDeref, FDerefTextView, FMapSlot_* /
 # FMapSlots_* (a TMap's storage read as a TArray), FNC_* (a one-member struct wrapping a nested container) (58-66,
 # 1466-1475). The VM applies a member's offset and copies a value with no type check (ScriptCore.cpp
@@ -695,7 +695,15 @@ def is_view_ty(t):
 def member_pun(pkg, T, n):
     """An EX_StructMemberContext that is one of AssetGen's views: a view member, a member of a struct read through a
     raw address (`P->Field`), or a member of a view struct."""
-    return view_member(pkg, n) or raw_read(pkg, n.kids[0]) or is_view_ty(T.of(n.kids[0]))
+    return view_member(pkg, n) or raw_read(pkg, n.kids[0]) or is_view_ty(T.of(n.kids[0])) or float_pun(pkg, T, n)
+
+
+def float_pun(pkg, T, n):
+    """__AsFloat__: Vector.X over an int32, its 4 bytes read as a float (a double read through a pointer, Cpp.cpp
+    HoistWideRead). Only over an int32: Vector.X over a Vector is no pun, and over anything else is a wrong owner."""
+    n = _member_expr(n)
+    return (n.op == 0x42 and (pkg.path(n.ops[0][2]) or '').lower() == '/script/coreuobject.vector'
+            and n.ops[0][1][-1].lower() == 'x' and storage(T.of(n.kids[0])) == 'i4')
 
 
 def value_pun(pkg, T, value, slot):

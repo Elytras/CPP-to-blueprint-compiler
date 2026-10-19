@@ -235,6 +235,11 @@ class VM:
                 if isinstance(base, dict) and n.val not in base and 'Data' in base:      # an array view of an address:
                     return [s.mem[base['Data'] - 0x20].outer]                          # UObjectBase::OuterPrivate
                 return base.get(n.val, 0) if isinstance(base, dict) else 0
+            if o == 0x6B and n.kids[0].op == 0x42 and runscript.view_of(n.kids[0].val):
+                at = ev(n.kids[0].kids[0]).get('Data', 0)
+                if at - 0x20 not in s.mem:                  # raw memory, not an object's OuterPrivate (above)
+                    size, read, _ = runscript.view_of(n.kids[0].val)
+                    return read(at + ev(n.kids[1]) * size)
             if o == 0x6B: return ev(n.kids[0])[ev(n.kids[1])]
             name = n.val
             if o in (0x1B, 0x45, 0x1C, 0x46, 0x68) and name in s.exports and (ctx is me or ctx.cls == s.self.cls):
@@ -290,6 +295,12 @@ class VM:
             if dest.op == 0x19:
                 obj = ev(dest.kids[0], ctx)
                 return lambda v: obj is not None and store(dest.kids[1], v, obj)
+            if dest.op == 0x6B and dest.kids[0].op == 0x42 and runscript.view_of(dest.kids[0].val):
+                at = ev(dest.kids[0].kids[0], ctx).get('Data', 0)
+                if at - 0x20 not in s.mem:                  # raw memory: a store through a pointer
+                    size, _, write = runscript.view_of(dest.kids[0].val)
+                    at += ev(dest.kids[1], ctx) * size
+                    return lambda v: write(at, v)
             if dest.op == 0x6B:
                 arr, i = ev(dest.kids[0], ctx), ev(dest.kids[1], ctx)
                 return lambda v: (arr.__setitem__(i, v), s.log.append(('set', ctx, dest.kids[0].val)))
