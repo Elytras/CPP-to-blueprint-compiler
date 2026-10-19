@@ -1,4 +1,5 @@
-﻿// Layout transcribed from UE4.27 PackageFileSummary.cpp / LinkerSave.cpp / UnrealNames.cpp.
+﻿// Layout transcribed from UE4.27 PackageFileSummary.cpp / LinkerSave.cpp / UnrealNames.cpp, and the UE5.6 ones
+// for EEngine::UE56 (DESIGN.md S40).
 #include "Package.h"
 #include "Script.h"
 
@@ -13,11 +14,16 @@ namespace
 {
 constexpr uint32 kPackageFileTag = 0x9E2A83C1;
 constexpr int32 kLegacyFileVersion = -7;
+constexpr int32 kLegacyFileVersionUE5 = -9;     // 5.6: FileVersionUE5, SavedHash, the -9 early-exit contract
 constexpr uint32 kPkgFilterEditorOnly = 0x80000000;
 constexpr int32 kImportEntrySize = 28;
 constexpr int32 kExportEntrySize = 104;
 /* Uncooked: FObjectImport grows an editor-only PackageName FName (VER_UE4_NON_OUTER_PACKAGE_IMPORT). */
 constexpr int32 kUncookedImportEntrySize = 36;
+/* 5.6 rows (ObjectResource.cpp): an import adds bImportOptional; an export drops its PackageGuid, adds
+   bIsInheritedInstance and bGeneratePublicHash, and, in a tagged package, the script properties' start and end. */
+constexpr int32 kImportEntrySizeUE5 = 32;
+constexpr int32 kExportEntrySizeUE5 = 112;
 
 /* Measured on a 4.27.2 editor-saved package. The editor refuses unversioned non-cooked content, and
    a missing custom version reads as "oldest", which silently flips serializers onto legacy branches -
@@ -178,8 +184,34 @@ void FArc::Guid(const uint32 (&G)[4])
     for (uint32 V : G) U32(V);
 }
 
+/* 5.6 FPropertyTag (PropertyTag.cpp, PROPERTY_TAG_COMPLETE_TYPE_NAME): the type is an FPropertyTypeName, a pre-order
+   list of (FName, int32 inner count) nodes, and a flags byte follows the size. The loader matches a struct or an
+   enum by the name in the first parameter only (CanSerializeFromTypeName), so the package node AddPath would add
+   after it is left out. ponytail: no struct guid node and no BinaryOrNative flag, which only the editor reads; an
+   array or set of structs also needs the struct's name here (5.6 has no inner tag), which Tag's callers do not pass
+   yet (S40 step 4). */
+namespace
+{
+constexpr uint8 kTagHasArrayIndex = 0x01;
+constexpr uint8 kTagBoolTrue = 0x10;
+
+void TypeNode(FArc& Ar, const std::string& Name, int32 Inner)
+{
+    Ar.Name(Name);
+    Ar.I32(Inner);
+}
+}   // namespace
+
 void TagBool(FArc& Ar, const std::string& Name, bool Value)
 {
+    if (IsUE5())
+    {
+        Ar.Name(Name);
+        TypeNode(Ar, "BoolProperty", 0);
+        Ar.I32(0);                                // Size: the value is the flag
+        Ar.U8(Value ? kTagBoolTrue : 0);
+        return;
+    }
     Ar.Name(Name);
     Ar.Name("BoolProperty");
     Ar.I32(0);                                    // Size
@@ -205,6 +237,30 @@ void Tag(FArc& Ar, const std::string& Name, const std::string& Type,
     FArc Scratch(Ar.Owner());
     Value(Scratch);
 
+    if (IsUE5())
+    {
+        Ar.Name(Name);
+        const std::string Id = TagId(Type);
+        if (Type == "StructProperty" || ((Type == "ByteProperty" || Type == "EnumProperty") && !StructName.empty()
+                                         && StructName != "None"))
+        { TypeNode(Ar, Id, 1); TypeNode(Ar, StructName, 0); }
+        else if (Type == "ArrayProperty" || Type == "SetProperty")
+        { TypeNode(Ar, Id, 1); TypeNode(Ar, TagId(StructName), 0); }
+        else if (Type == "MapProperty")
+        {
+            const size_t Comma = StructName.find(',');
+            TypeNode(Ar, Id, 2);
+            TypeNode(Ar, TagId(StructName.substr(0, Comma)), 0);
+            TypeNode(Ar, TagId(StructName.substr(Comma + 1)), 0);
+        }
+        else
+            TypeNode(Ar, Id, 0);
+        Ar.I32(int32(Scratch.B.size()));
+        Ar.U8(ArrayIndex ? kTagHasArrayIndex : 0);
+        if (ArrayIndex) Ar.I32(ArrayIndex);
+        Ar.Append(Scratch);
+        return;
+    }
     Ar.Name(Name);
     Ar.Name(TagId(Type));
     Ar.I32(int32(Scratch.B.size()));
@@ -227,6 +283,8 @@ void Tag(FArc& Ar, const std::string& Name, const std::string& Type,
     Ar.U8(0);                                     // HasPropertyGuid
     Ar.Append(Scratch);
 }
+
+EEngine GEngine = EEngine::UE427;
 
 /* ---- FPackage ---- */
 
@@ -351,9 +409,13 @@ bool FPackage::Save(const std::string& OutBaseNoExt, std::string* Err) const
     const int32 NumImports = int32(std::count_if(ImportFold.begin(), ImportFold.end(), [](int32 V) { return V < 0; }));
 
     // Pass one: run every payload only to collect FNames.
+    /* 5.6 writes one SerializationControlExtensions byte before every object's own tag list (Class.cpp,
+       SerializeVersionedTaggedProperties, bIsUClass), and every export's payload starts with that list. */
+    const bool bUE5 = IsUE5();
     for (const FExport& E : Exports)
     {
         FArc Discard(Self);
+        if (bUE5) Discard.U8(0);
         E.Serialize(Discard);
     }
 
@@ -379,14 +441,17 @@ bool FPackage::Save(const std::string& OutBaseNoExt, std::string* Err) const
 
     // Pass two: real bytes, and every object each payload names (Recording), for its preload dependencies below.
     std::vector<std::vector<uint8>> Payloads;
+    std::vector<int64> PropsEnd;
     std::vector<std::vector<int32>> Named(Exports.size());
     Payloads.reserve(Exports.size());
     for (size_t I = 0; I < Exports.size(); ++I)
     {
         FArc Ar(Self);
+        if (bUE5) Ar.U8(0);
         Self->Recording = &Named[I];
         Exports[I].Serialize(Ar);
         Self->Recording = nullptr;
+        PropsEnd.push_back(Ar.PropsEnd);
         Payloads.push_back(std::move(Ar.B));
     }
 
@@ -412,8 +477,9 @@ bool FPackage::Save(const std::string& OutBaseNoExt, std::string* Err) const
         ImportTable.Idx(I.Outer);
         ImportTable.Name(I.ObjectName);
         if (bUncooked) ImportTable.Name("None");    // PackageName: only set for a package override
+        if (bUE5) ImportTable.Bool(false);          // bImportOptional
     }
-    const int32 ImportEntrySize = bUncooked ? kUncookedImportEntrySize : kImportEntrySize;
+    const int32 ImportEntrySize = bUE5 ? kImportEntrySizeUE5 : bUncooked ? kUncookedImportEntrySize : kImportEntrySize;
     if (ImportTable.B.size() != size_t(ImportEntrySize) * size_t(NumImports))
         return Fail("import entry size drifted");
 
@@ -532,7 +598,56 @@ bool FPackage::Save(const std::string& OutBaseNoExt, std::string* Err) const
         int64 BulkDataStart = 0;
     } Off;
 
+    /* 5.6's cooked summary (PackageFileSummary.cpp), every version field zero as RC's own packages have them. */
+    auto WriteSummaryUE5 = [&](const FOffsets& O) {
+        FArc S(Self);
+        S.U32(kPackageFileTag);
+        S.I32(kLegacyFileVersionUE5);
+        S.I32(0);                                   // LegacyUE3Version
+        S.I32(0);                                   // FileVersionUE4
+        S.I32(0);                                   // FileVersionUE5
+        S.I32(0);                                   // FileVersionLicenseeUE4
+        for (int32 I = 0; I < 5; ++I) S.U32(I < 4 ? PkgGuid[I] : 0);   // SavedHash (FIoHash, 20 bytes): the guid, padded
+        S.I32(O.TotalHeaderSize);
+        S.I32(0);                                   // CustomVersion count
+        S.Str(PackageName);                         // PackageName (FolderName in 4.27)
+        S.U32(kPkgFilterEditorOnly | 0x200);        // PKG_Cooked too, as RC's packages carry it
+        S.I32(int32(Names.size()));
+        S.I32(O.NameOff);
+        S.I32(0); S.I32(O.ImportOff);               // SoftObjectPaths: none, offset at the imports as RC's are
+        S.I32(0); S.I32(0);                         // GatherableTextData count/offset
+        S.I32(int32(Exports.size()));
+        S.I32(O.ExportOff);
+        S.I32(NumImports);
+        S.I32(O.ImportOff);
+        S.I32(0); S.I32(O.DependsOff);              // CellExports
+        S.I32(0); S.I32(O.DependsOff);              // CellImports
+        S.I32(0);                                   // MetaDataOffset
+        S.I32(O.DependsOff);
+        S.I32(0); S.I32(0);                         // SoftPackageReferences count/offset
+        S.I32(0);                                   // SearchableNamesOffset
+        S.I32(0);                                   // ThumbnailTableOffset
+        S.I32(1);                                   // Generations count
+        S.I32(int32(Exports.size()));
+        S.I32(int32(Names.size()));
+        for (int32 I = 0; I < 2; ++I) { S.U16(0); S.U16(0); S.U16(0); S.U32(0); S.I32(0); }   // the two engine versions
+        S.U32(0);                                   // CompressionFlags
+        S.I32(0);                                   // CompressedChunks
+        S.U32(PackageSource);
+        S.I32(0);                                   // AdditionalPackagesToCook
+        S.I32(O.AssetRegistryOff);
+        S.I64(O.BulkDataStart);
+        S.I32(0);                                   // WorldTileInfoDataOffset
+        S.I32(0);                                   // ChunkIDs
+        S.I32(PreloadCount);
+        S.I32(O.PreloadOff);
+        S.I32(int32(Names.size()));                 // NamesReferencedFromExportDataCount
+        S.I64(-1);                                  // PayloadTocOffset
+        S.I32(-1);                                  // DataResourceOffset
+        return S.B;
+    };
     auto WriteSummary = [&](const FOffsets& O) {
+        if (bUE5) return WriteSummaryUE5(O);
         FArc S(Self);
         S.U32(kPackageFileTag);
         S.I32(kLegacyFileVersion);
@@ -626,11 +741,12 @@ bool FPackage::Save(const std::string& OutBaseNoExt, std::string* Err) const
         I32Into(DepBlock, 0);                       // SoftPackageUsedInGame: no soft references
     }
 
+    const int32 ExportEntrySize = bUE5 ? kExportEntrySizeUE5 : kExportEntrySize;
     const int32 SummarySize = int32(WriteSummary(Off).size());
     Off.NameOff = SummarySize;
     Off.ImportOff = Off.NameOff + int32(NameTable.size());
     Off.ExportOff = Off.ImportOff + int32(ImportTable.B.size());
-    Off.DependsOff = Off.ExportOff + kExportEntrySize * int32(Exports.size());
+    Off.DependsOff = Off.ExportOff + ExportEntrySize * int32(Exports.size());
     Off.AssetRegistryOff = Off.DependsOff + 4 * int32(Exports.size());
     Off.PreloadOff = Off.AssetRegistryOff
                    + (bUncooked ? 8 + int32(RegistryRows.size()) + int32(DepBlock.size()) : 4);
@@ -658,15 +774,24 @@ bool FPackage::Save(const std::string& OutBaseNoExt, std::string* Err) const
         ExportTable.Bool(false);                    // bForcedExport
         ExportTable.Bool(false);                    // bNotForClient
         ExportTable.Bool(false);                    // bNotForServer
-        for (int32 J = 0; J < 4; ++J) ExportTable.U32(0);   // PackageGuid
+        if (bUE5) ExportTable.Bool(false);          // bIsInheritedInstance
+        else for (int32 J = 0; J < 4; ++J) ExportTable.U32(0);   // PackageGuid
         ExportTable.U32(0);                         // PackageFlags
         ExportTable.Bool(false);                    // bNotAlwaysLoadedForEditorGame
         ExportTable.Bool(E.bIsAsset);
+        if (bUE5) ExportTable.Bool(false);          // bGeneratePublicHash
         ExportTable.I32(FirstDep[I]);
         for (const std::vector<int32>& List : Deps[I]) ExportTable.I32(int32(List.size()));
+        if (bUE5)
+        {
+            /* Relative to the payload: the tags start at 0 (MarkScriptSerializationStart runs before the control
+               byte) and end past their None. A non-shipping loader check()s both (LinkerLoad.cpp 6434, 6463). */
+            ExportTable.I64(0);
+            ExportTable.I64(PropsEnd[I] < 0 ? 0 : PropsEnd[I]);
+        }
     }
-    if (ExportTable.B.size() != size_t(kExportEntrySize) * Exports.size())
-        return Fail("export entry size drifted from 104 bytes");
+    if (ExportTable.B.size() != size_t(ExportEntrySize) * Exports.size())
+        return Fail("export entry size drifted");
 
     std::vector<uint8> Header = WriteSummary(Off);
     Header.insert(Header.end(), NameTable.begin(), NameTable.end());

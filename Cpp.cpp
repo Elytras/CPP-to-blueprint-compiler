@@ -19887,6 +19887,15 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
        UeDefaultSubobjects and no UeClassTail, which reads the same as a Blueprint with none of either. */
     UeApiWithoutGame = Stamp.contains("game") && Stamp["game"].is_boolean() && Stamp["game"].get<bool>() ? std::string()
                                                                                                           : IncludeDir;
+    /* S40: the engine the UeApi's dump is of, which every package this compile writes is laid out for. A stamp from
+       before S40 has none and is DRG's 4.27. */
+    const std::string Engine = Stamp.contains("ue") && Stamp["ue"].is_string() ? Stamp["ue"].get<std::string>() : "4.27";
+    if (Engine != "4.27" && Engine != "5.6")
+    {
+        *Err = IncludeDir + " is a UE " + Engine + " UeApi; assetgen writes UE 4.27 and 5.6 packages only";
+        return false;
+    }
+    Uasset::GEngine = Engine == "5.6" ? Uasset::EEngine::UE56 : Uasset::EEngine::UE427;
     if (!ParseClangAst(ClangCommand(SourcePath, IncludeDir), SourcePath, &Doc, Err)) return false;
 
     if (!LoadTables(IncludeDir, Err)) return false;
@@ -20123,6 +20132,13 @@ bool FCompiler::Run(const std::string& SourcePath, const std::string& IncludeDir
     if (RegistryRows.empty())
     {
         printf("  %-14s -> none (no assets of its own)\n", "registry");
+        return true;
+    }
+    /* S40: the registry writer is 4.27's format, and RC's community mod paks ship none (their classes are found by a
+       ScanPathsSynchronous over the mounted packages, DESIGN.md S40). One in a pak would shadow the game's. */
+    if (Uasset::IsUE5())
+    {
+        printf("  %-14s -> none (UE5: the mounted packages are scanned instead)\n", "registry");
         return true;
     }
     std::string RegistryDir = OutDir;
