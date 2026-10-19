@@ -6718,24 +6718,54 @@ std::vector<uint8> FCompiler::NativeTail(const FRecord* Component) const
 /* The mod directory's .h / .cpp sources, read on the first call, in the order of their names' UTF-8 bytes.
    NamedQualifier takes the first source that fits, so the order cannot be directory_iterator's: that is the
    filesystem's, sorted on NTFS but hashed on ext4. */
+static std::string CanonicalPath(const std::filesystem::path& P)
+{
+    std::error_code Ec;
+    return std::filesystem::weakly_canonical(P, Ec).string();
+}
+
+/* The files Root reaches by quoted includes, Root among them, by canonical path: each one's path and text. A UeApi
+   header is generated and no mod's, so a path through a UeApi folder is not followed. */
+static std::map<std::string, std::pair<std::filesystem::path, std::string>> ReachedByIncludes(const std::filesystem::path& Root)
+{
+    namespace fs = std::filesystem;
+    std::map<std::string, std::pair<fs::path, std::string>> Reached;
+    for (std::vector<fs::path> Todo{ Root }; !Todo.empty();)
+    {
+        const fs::path File = Todo.back();
+        Todo.pop_back();
+        std::error_code Ec;
+        if (!fs::is_regular_file(File, Ec) || Reached.count(CanonicalPath(File))) continue;
+        if (std::any_of(File.begin(), File.end(), [](const fs::path& Part) { return Part == "UeApi"; })) continue;
+        const std::string Text = ReadText(File.string());
+        for (size_t At = 0; (At = Text.find("#include", At)) != std::string::npos; At += 8)
+        {
+            const size_t Open = Text.find_first_of("\"<\n", At + 8);
+            if (Open == std::string::npos || Text[Open] != '"') continue;
+            const size_t Close = Text.find('"', Open + 1);
+            if (Close != std::string::npos) Todo.push_back(File.parent_path() / fs::path(Text.substr(Open + 1, Close - Open - 1)));
+        }
+        Reached[CanonicalPath(File)] = { File, Text };
+    }
+    return Reached;
+}
+
+/* The mod's own sources: those beside the compiled one, and those it reaches by quoted includes. bpbuild compiles a
+   unity file that includes each .cpp of a mod by its absolute path, so a mod in subfolders is only found that way. */
 const std::vector<std::string>& FCompiler::ModSources() const
 {
     if (SourceTexts.empty())
     {
         std::error_code Ec;
-        std::vector<std::pair<std::string, std::filesystem::path>> Files;
+        std::map<std::string, std::filesystem::path> Files;     // by canonical path: a file in both lists is read once
         for (const auto& E : std::filesystem::directory_iterator(SourceDir, Ec))
         {
             const std::string Ext = E.path().extension().string();
             if (!E.is_regular_file() || (Ext != ".h" && Ext != ".hpp" && Ext != ".cpp")) continue;
-            Files.emplace_back(E.path().filename().u8string(), E.path());
+            Files.emplace(CanonicalPath(E.path()), E.path());
         }
-        std::sort(Files.begin(), Files.end());
-        for (const auto& File : Files)
-        {
-            std::ifstream F(File.second, std::ios::binary);
-            SourceTexts.emplace_back(std::istreambuf_iterator<char>(F), std::istreambuf_iterator<char>());
-        }
+        for (const auto& [Key, Entry] : ReachedByIncludes(SourceFile)) Files.emplace(Key, Entry.first);
+        for (const auto& File : Files) SourceTexts.push_back(ReadText(File.second.string()));
     }
     return SourceTexts;
 }
@@ -6743,7 +6773,7 @@ const std::vector<std::string>& FCompiler::ModSources() const
 /* The AST keeps no file of a declaration (DroppedAstKey), and the leaf UE_FINAL_AS declares is spelled in UeMeta.h, so
    the text says where the macro was written: the compiled source and the files it includes by a quoted path that
    resolves beside the including one (bpbuild's unity file includes each .cpp of a mod by its absolute path), read as
-   text. A UeApi header is generated and no mod's, so a path through a UeApi folder is not followed. A macro written
+   text (ReachedByIncludes). A macro written
    through another macro is not found; the caller then takes the compiler's old answer.
    A site is the shared one when the owner sees it too: a header that a source of the owner's, beside it and outside
    this compile, includes. A source is the owner's when its UE_MOD_PACKAGE is Owner, or when it has none and every
@@ -6761,29 +6791,8 @@ std::vector<bool> FCompiler::FinalAsSites(const std::string& Base, const std::st
         while (Begin > 0 && IsIdent(S[Begin - 1])) --Begin;
         return S.substr(Begin, End - Begin);
     };
-    auto Canonical = [](const fs::path& P) { std::error_code Ec; return fs::weakly_canonical(P, Ec).string(); };
-    /* The files Root reaches by quoted includes, Root among them, by canonical path. */
-    auto Reach = [&](const fs::path& Root) {
-        std::map<std::string, std::pair<fs::path, std::string>> Reached;
-        for (std::vector<fs::path> Todo{ Root }; !Todo.empty();)
-        {
-            const fs::path File = Todo.back();
-            Todo.pop_back();
-            std::error_code Ec;
-            if (!fs::is_regular_file(File, Ec) || Reached.count(Canonical(File))) continue;
-            if (std::any_of(File.begin(), File.end(), [](const fs::path& Part) { return Part == "UeApi"; })) continue;
-            const std::string Text = ReadText(File.string());
-            for (size_t At = 0; (At = Text.find("#include", At)) != std::string::npos; At += 8)
-            {
-                const size_t Open = Text.find_first_of("\"<\n", At + 8);
-                if (Open == std::string::npos || Text[Open] != '"') continue;
-                const size_t Close = Text.find('"', Open + 1);
-                if (Close != std::string::npos) Todo.push_back(File.parent_path() / fs::path(Text.substr(Open + 1, Close - Open - 1)));
-            }
-            Reached[Canonical(File)] = { File, Text };
-        }
-        return Reached;
-    };
+    auto Canonical = CanonicalPath;
+    auto Reach = ReachedByIncludes;
     /* The path a source's UE_MOD_PACKAGE names, or empty. */
     auto PackageIn = [&](const std::string& Text) {
         for (size_t At = 0; (At = Text.find("UE_MOD_PACKAGE", At)) != std::string::npos; At += 14)
