@@ -116,8 +116,8 @@ def func_exports(a):
     for i, e in enumerate(pkg.exports):
         if e['outer'] != a.export + 1: continue
         k = pkg.class_of(i + 1)
-        if k in ('Function', 'DelegateFunction') and not e['name'].endswith('__DelegateSignature'):
-            out.append((i, k))        # a dispatcher's signature is its UE_DISPATCHER line
+        if k in ('Function', 'DelegateFunction') and not pkg.struct(i).function_flags & FUNC_Delegate:
+            out.append((i, k))        # a dispatcher's signature is its UE_DISPATCHER line; a bound event (BndEvt__) is a method
     return out
 
 
@@ -164,9 +164,11 @@ class ClassEmit:
         for p in st.props:
             if p.type in ('MulticastInlineDelegateProperty', 'MulticastDelegateProperty'): dispatchers[p.name] = p
         s.components()
+        s.widget_layout()
         s.member_props(dispatchers)
         s.functions(funcs, ug, dispatchers)
         s.class_defaults()
+        if s.ctor: s.members.append(('public', '%s() {\n%s    }' % (a.cpp, ''.join('        %s\n' % l for l in s.ctor))))
         return s.write()
 
     # -- members
@@ -176,7 +178,7 @@ class ClassEmit:
         vals = Values(s.cx)
         for p in s.st.props:
             if p.name == 'UberGraphFrame': continue
-            if p.name in s.component_vars: continue
+            if p.name in s.component_vars or p.name in s.widget_vars: continue
             if p.name in dispatchers:
                 sig = s.run.types.params(s.pkg, p.ref, s.a)
                 ps = ', '.join('%s %s' % (t, ident(n)) for t, n, _ in sig[1]) if sig else ''
@@ -204,6 +206,8 @@ class ClassEmit:
                 s.members.append(('public', '%s %s%s;' % (ty, cpp, init)))
         for name, t in own_defaults.items():
             if name == 'UberGraphFrame': continue
+            if s.a.kind == 'widget' and name in ('bHasScriptImplementedTick', 'bHasScriptImplementedPaint'):
+                continue                # AssetGen sets both from the class's own Tick and OnPaint, as the compiler does
             v = vals.tag(s.pkg, t, s.inherited_prop(name), s.a)
             if v is None: continue
             s.defaults += field_assigns(ident(name), v)
@@ -256,6 +260,150 @@ class ClassEmit:
                 for t in pkg.tags(tmpl - 1):
                     v = vals.tag(pkg, t, None, s.a)
                     if v is not None: s.defaults += field_assigns('%s->%s' % (cpp, ident(t['name'])), v)
+
+    # -- a widget class: its tree, its widgets' event bindings and its animations (S39)
+
+    LAYOUT_TAGS = {'Slot', 'Slots', 'bIsVariable', 'Parent', 'Content'}     # the tree's links, which the layout makes
+    CHANNELS = {('Translation', 0): 'Translation.X', ('Translation', 1): 'Translation.Y', ('Rotation', 0): 'Angle',
+                ('Scale', 0): 'Scale.X', ('Scale', 1): 'Scale.Y', ('Shear', 0): 'Shear.X', ('Shear', 1): 'Shear.Y'}
+
+    def widget_layout(s):
+        """A widget class as AssetGen's widget layout: a UE_WIDGET for each widget of the tree, the root first and each
+        panel before what it holds, and a UE_ANIMATION for each animation; a constructor that adds each widget to its
+        panel and sets the members of each widget and slot, binds the widgets' events and keys the animations. The
+        variables these are, are left out of member_props."""
+        s.widget_vars, s.ctor = set(), []
+        if s.a.kind != 'widget': return
+        pkg, a, ci = s.pkg, s.a, s.a.export + 1
+        ref = lambda t: struct.unpack('<i', bytes(t['value'])[:4])[0]
+        def refs(t):
+            v = bytes(t['value']) if t else b'\0\0\0\0'
+            return list(struct.unpack_from('<%di' % struct.unpack_from('<i', v)[0], v, 4))
+        vals = Values(s.cx)
+        decls = []
+        def assign(lhs, t):
+            v = vals.tag(pkg, t, None, a)
+            if v is not None: s.ctor.extend(field_assigns(lhs, v))
+        def uses(cls_idx):          # a mod widget class nested here: its header first, for its members
+            o = s.run.model.asset_of_object(pkg.path(cls_idx))
+            if o is not None: s.out.deps.add(o.path)
+        tree = next((i for i, e in enumerate(pkg.exports) if e['outer'] == ci and pkg.class_of(i + 1) == 'WidgetTree'), None)
+        placed = set()
+        def walk(w):
+            placed.add(w)
+            e = pkg.exports[w]
+            name = ident(e['name'])
+            uses(e['cls'])
+            decls.append('UE_WIDGET(%s, %s);' % (s.run.types.cls(pkg, e['cls'], a), name))
+            s.widget_vars.add(e['name'])
+            for t in pkg.tags(w):
+                if t['name'] not in s.LAYOUT_TAGS: assign('%s->%s' % (name, ident(t['name'])), t)
+            for sl in refs(pkg.tag(w, 'Slots')):
+                tags = pkg.tags(sl - 1)
+                child = ref(next(t for t in tags if t['name'] == 'Content')) - 1
+                cname = ident(pkg.exports[child]['name'])
+                own = [t for t in tags if t['name'] not in s.LAYOUT_TAGS]
+                if own:
+                    scls = s.run.types.cls(pkg, pkg.exports[sl - 1]['cls'], a)
+                    local = cname + '_Slot'
+                    s.ctor.append('%s *%s = Cast<%s>(%s->AddChild(%s));' % (scls, local, scls, name, cname))
+                    for t in own: assign('%s->%s' % (local, ident(t['name'])), t)
+                else:
+                    s.ctor.append('%s->AddChild(%s);' % (name, cname))
+                walk(child)
+        if tree is not None and pkg.tag(tree, 'RootWidget'):
+            walk(ref(pkg.tag(tree, 'RootWidget')) - 1)
+        for i, e in enumerate(pkg.exports):
+            if tree is not None and e['outer'] == tree + 1 and i not in placed:
+                s.notes.append('%s: widget %s is in no panel of the tree; left out' % (a.path, e['name']))
+        if pkg.tag(a.export, 'Bindings'):
+            s.notes.append('%s: property bindings (UE_BIND) not decompiled' % a.path)
+        cdb = next((i for i, e in enumerate(pkg.exports) if e['outer'] == ci and pkg.class_of(i + 1) == 'ComponentDelegateBinding'), None)
+        for b in s.struct_list(cdb, 'ComponentDelegateBindings') if cdb is not None else []:
+            s.ctor.append('%s->%s.Add(this, &%s::%s);' % (ident(b['ComponentPropertyName']), ident(b['DelegatePropertyName']),
+                                                          a.cpp, ident(b['FunctionNameToBind'])))
+        for inst in refs(pkg.tag(a.export, 'Animations')):
+            scene = ref(pkg.tag(inst - 1, 'MovieScene')) - 1
+            anim = pkg.exports[scene]['name']
+            s.widget_vars.add(anim)
+            lo_t, lo, hi_t, end = struct.unpack_from('<BiBi', bytes(pkg.tag(scene, 'PlaybackRange')['value']))
+            if (lo_t, lo, hi_t) != (1, 0, 0):
+                s.notes.append('%s: animation %s plays from frame %d, not 0; played from 0' % (a.path, anim, lo))
+            last = -1
+            for b in s.struct_list(scene, 'ObjectBindings'):
+                for track in b.get('Tracks', []):
+                    ti = track - 1
+                    prop = s.struct_list(ti, 'PropertyBinding', single=True)
+                    if pkg.class_of(track) != 'MovieScene2DTransformTrack' or prop.get('PropertyName') != 'RenderTransform':
+                        s.notes.append('%s: animation %s: a %s track of %s not decompiled; AssetGen keys RenderTransform only'
+                                       % (a.path, anim, pkg.class_of(track), b['BindingName']))
+                        continue
+                    for sec in refs(pkg.tag(ti, 'Sections')):
+                        for t in pkg.tags(sec - 1):
+                            if t.get('struct') != 'MovieSceneFloatChannel': continue
+                            keys = s.float_channel(bytes(t['value']), '%s %s.%s' % (anim, b['BindingName'], t['name']))
+                            if not keys: continue
+                            last = max(last, keys[-1][0])
+                            s.ctor.append('UE_KEYS(%s, %s->RenderTransform.%s, %s);' % (
+                                ident(anim), ident(b['BindingName']), s.CHANNELS[(t['name'], t['index'])],
+                                ', '.join(s.key_text(*k) for k in keys)))
+            decls.append('UE_ANIMATION(%s%s);' % (ident(anim), '' if end == last + 1 else ', %s' % B.cfloat(end / 60000)))
+        s.members[0:0] = [('public', d) for d in decls]
+
+    def float_channel(s, v, what):
+        """An FMovieSceneFloatChannel as its Serialize wrote it: [(frame, value, arrive, leave, interp, tangent mode)]
+        at 60000 ticks a second. What UE_KEYS cannot say is noted."""
+        pre, post = v[0], v[1]
+        _, n = struct.unpack_from('<ii', v, 2)
+        frames = struct.unpack_from('<%di' % n, v, 10)
+        at = 10 + 4 * n + 8
+        keys = []
+        for k in range(n):
+            value, arrive, leave, _aw, _lw, weight, interp, tmode = struct.unpack_from('<5fBxxxBB', v, at + 28 * k)
+            keys.append((frames[k], value, arrive, leave, interp, tmode))
+            if weight: s.notes.append('%s: %s: weighted tangents dropped' % (s.a.path, what))
+            if tmode == 2: s.notes.append('%s: %s: a broken tangent kept as its leave slope' % (s.a.path, what))
+        has_default = struct.unpack_from('<i', v, at + 28 * n + 4)[0]
+        if pre != 4 or post != 4 or has_default or struct.unpack_from('<ii', v, at + 28 * n + 8) != (60000, 1):
+            s.notes.append('%s: %s: extrapolation, default value or tick rate not decompiled' % (s.a.path, what))
+        return keys
+
+    @staticmethod
+    def key_text(frame, value, arrive, leave, interp, tmode):
+        """A UE_KEYS key, (time, value[, Constant | Cubic[, slope]]): the time the shortest that lands on the frame, the
+        slope (value per second) only where the tangent is not Auto."""
+        num = lambda x: B.cfloat(x)[:-1]
+        t = next(u for u in ('%.*g' % (d, frame / 60000) for d in range(1, 12)) if round(float(u) * 60000) == frame)
+        out = [t, num(value)]
+        if interp == 1: out.append('Constant')
+        elif interp == 2:
+            out.append('Cubic')
+            if tmode: out.append(num(leave * 60000))
+        return '(%s)' % ', '.join(out)
+
+    def struct_list(s, i, name, single=False):
+        """Export i's tag `name`, an array of structs (or with single, one struct), as [{member: value}]: names and
+        strings as str, object references and arrays of them as package indices, anything else as its bytes."""
+        t = s.pkg.tag(i, name)
+        if t is None: return {} if single else []
+        def read(at):
+            tl = s.pkg.tags(i, at)
+            out = {}
+            for x in tl:
+                v = bytes(x['value'])
+                if x['type'] == 'NameProperty': out[x['name']] = s.name_tag(x)
+                elif x['type'] == 'StrProperty': out[x['name']] = read_fstring(v, 0)[0]
+                elif x['type'] == 'ObjectProperty': out[x['name']] = struct.unpack('<i', v)[0]
+                elif x['type'] == 'ArrayProperty' and x['inner'] == 'ObjectProperty':
+                    out[x['name']] = list(struct.unpack_from('<%di' % struct.unpack_from('<i', v)[0], v, 4))
+                else: out[x['name']] = v
+            return out, tl.end
+        if single: return read(t['at'])[0]
+        at, out = t['at'] + 4 + 49, []      # past the count and the elements' one inner StructProperty tag
+        for _ in range(struct.unpack_from('<i', bytes(t['value']))[0]):
+            e, at = read(at)
+            out.append(e)
+        return out
 
     def name_tag(s, t):
         if t is None: return None
@@ -425,10 +573,6 @@ class ClassEmit:
             lines.append('class %s%s {\npublic:\n    UE_INTERFACE;\n' % (a.cpp, ' : public ' + iparent[0] if iparent else ''))
         else:
             lines.append('class %s : %s {\n' % (a.cpp, ', '.join('public ' + b for b in bases)))
-        partial = [d for d in s.defaults if re.match(r'^[\w>-]+\.\w', d)]
-        for d in partial:          # UE_DEFAULTS sets a member whole; a native struct's single field has no spelling
-            s.notes.append('%s: default `%s` dropped: UE_DEFAULTS cannot set one field of a native struct' % (a.path, d))
-        s.defaults = [d for d in s.defaults if d not in partial]
         if s.defaults and not is_iface:
             lines.append('    UE_DEFAULTS {\n%s    }\n' % ''.join('        %s\n' % d for d in s.defaults))
         for access in ('public', 'protected', 'private'):
@@ -497,12 +641,12 @@ def link_mods(run, model, per_mod):
     for m in model.mods:
         for n in model.mods:
             if n is m: continue
-            classes = [o for o in per_mod[n.name] if o.a.kind == 'class']
+            classes = [o for o in per_mod[n.name] if o.a.kind in ('class', 'widget')]
             if not any(re.search(r'(?<![\w:])%s\b' % re.escape('::'.join(o.a.ns + [o.a.cpp])), texts[m.name])
                        for o in classes): continue
             run.mod_needs[m.name].append(n.name)
     for m in model.mods:            # every class says where it is cooked: kept assets of it and other mods name it so
-        for o in [o for o in per_mod[m.name] if o.a.kind == 'class']:
+        for o in [o for o in per_mod[m.name] if o.a.kind in ('class', 'widget')]:
             name = o.a.pkg.exports[o.a.export]['name']
             line = '    UE_CLASS("%s", "%s");\n' % (o.a.path, name)
             o.header, n = re.subn(r'(\nclass %s\b[^\n]*\{\n(?:.*\n)*?public:\n)' % re.escape(o.a.cpp),
@@ -584,7 +728,7 @@ def main():
     per_mod = defaultdict(list)
     raw = []
     for a in model.assets.values():
-        if a.path in run.keep or a.kind in ('raw', 'data', 'widget'):
+        if a.path in run.keep or a.kind in ('raw', 'data'):
             raw.append(a); continue
         try:
             o = {'enum': emit_enum, 'struct': emit_struct}.get(a.kind, emit_class)(run, a)
