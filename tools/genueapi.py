@@ -377,7 +377,8 @@ OP_FN = re.compile(r"^(%s)_(\w+)$" % "|".join(OPS))
 
 
 def operator_extra(params):
-    return [(0.0001 if "Tolerance" in n else 0.0) if t == "float" else (False if t == "bool" else 0) for t, n in params]
+    return [single(t, 0.0001 if "Tolerance" in n else 0.0) if t in ("float", "double") else (False if t == "bool" else 0)
+            for t, n in params]
 
 
 def operators(classes):
@@ -391,7 +392,9 @@ def operators(classes):
             m = OP_FN.match(fname)
             if not (m and is_static and len(params) >= 2):
                 continue
-            lhs, rhs = params[0][0], params[1][0]
+            if UE5 and "float" in (params[0][0], params[1][0]):     # a native float operand (Multiply_LinearColorFloat)
+                continue
+            lhs, rhs = real(params[0][0]), real(params[1][0])
             if soft_template(conv_kind(lhs) or "") and conv_kind(lhs) == conv_kind(rhs):
                 lhs, rhs = conv_kind(lhs), conv_kind(rhs)
             elif lhs not in STRUCTS and rhs not in STRUCTS and lhs not in CONV_STRUCTS:
@@ -1117,7 +1120,28 @@ def parse_header(path):
 
 
 CONV = re.compile(r"^Conv_(\w+)To(\w+)$")
-CONV_SCALARS = ("FString", "FName", "FText", "int", "int64", "float", "bool", "uint8", "class UObject*")
+CONV_SCALARS = ("FString", "FName", "FText", "int", "int64", "float", "double", "bool", "uint8", "class UObject*")
+# S40: a UE5 dump's Blueprint real is a double (LWC), which the compiler names "float", the type a mod writes; set by
+# main from the dump's engine. A native `float` parameter stays float, and its constant a F32 (EX_FloatConst).
+UE5 = False
+
+
+class F32(float):
+    """A constant for a native `float` parameter of a UE5 function, written {"float": v}: the compiler's plain number
+    there is a double."""
+    def __repr__(self):
+        return '{"float": %r}' % float(self)
+    __str__ = __repr__
+
+
+def real(t):
+    """The compiler's name for scalar spelling t: a UE5 double is its "float"."""
+    return "float" if UE5 and t == "double" else t
+
+
+def single(t, v):
+    """Constant v for a parameter spelled t, marked F32 where UE5 keeps it a 4-byte float."""
+    return F32(v) if UE5 and t == "float" else v
 # Conv_RotatorToVector: a rotator is not implicitly a direction. Conv_Int64ToString: only Modio has it;
 # the compiler goes through Conv_Int64ToText + Conv_TextToString instead.
 # The filters below leave out the rest of 4.27's Conv_s, each for a reason: Conv_FloatToText's RoundingMode has no default
@@ -1133,8 +1157,10 @@ SOFT = {"TSoftObjectPtr": "TSoftObjectPtr<UObject>", "TSoftClassPtr": "TSoftClas
 def conv_kind(t):
     """The name Conv.json gives a Conv_'s value or result of mapped type t, as the compiler's Canon names a value's
     type; None where AssetGen converts no such value."""
+    if UE5 and t == "float":    # a native 4-byte float, no Blueprint real: the compiler casts it where it meets one
+        return None
     if t in CONV_SCALARS or t in STRUCTS:
-        return t
+        return real(t)
     if t.startswith("TSubclassOf<"):
         return "class UObject*"
     tpl = t.split("<", 1)[0]
@@ -1170,7 +1196,7 @@ def conversions(classes):
                 continue
             if any(n not in CONV_DEFAULTS for _, n in params[1:]):
                 continue
-            extra = [CONV_DEFAULTS[n] for _, n in params[1:]]
+            extra = [single(t, CONV_DEFAULTS[n]) for t, n in params[1:]]
             found.setdefault((src, dst), (k.path, k.ue_name, fname, extra, ref_positions(k.ue_name, fname, params)))
     return found
 
@@ -1570,6 +1596,8 @@ def main():
     if len(args) < 2 or ("--game" in sys.argv and not game_dir):
         sys.exit(__doc__.strip().splitlines()[-1])
     sdk_dir, out_dir = args[0], args[1]
+    global UE5
+    UE5 = dump_identity(sdk_dir)[0] != "4.27"
 
     for name in sorted(f for f in os.listdir(sdk_dir) if f.endswith("_structs.hpp")):
         parse_structs(os.path.join(sdk_dir, name), name[: -len("_structs.hpp")])
@@ -1959,9 +1987,15 @@ def main():
     if os.path.normcase(os.path.realpath(hand)) != os.path.normcase(os.path.realpath(out_dir)):
         for name in ("UeMeta.h", "Types.h"):
             shutil.copyfile(os.path.join(hand, name), os.path.join(out_dir, name))
+    # S40: UE5's real arithmetic is KismetMathLibrary's X_DoubleDouble, where the compiler names 4.27's X_FloatFloat; the
+    # map is the dump's, so a name UE5 kept (Percent_FloatFloat) stays.
+    math = dict(("%s_FloatFloat" % fn[:-len("_DoubleDouble")], fn) for k in classes
+                if k.path == "/Script/Engine" and k.ue_name == "KismetMathLibrary"
+                for is_static, _, fn, _ in k.funcs if is_static and fn.endswith("_DoubleDouble")) if UE5 else {}
     io.open(os.path.join(out_dir, "Version.json"), "w", encoding="utf-8", newline="\n").write(
-        '{"genueapi": %d, "game": %s, "ue": "%s", "project": "%s"}\n'
-        % ((GENUEAPI_VERSION, "true" if game_dir else "false") + dump_identity(sdk_dir)))
+        '{"genueapi": %d, "game": %s, "ue": "%s", "project": "%s"%s}\n'
+        % ((GENUEAPI_VERSION, "true" if game_dir else "false") + dump_identity(sdk_dir)
+           + ((', "math": ' + json.dumps(math, sort_keys=True)) if math else "",)))
     if not game_dir:
         print("  no --game: no game Blueprint's default subobjects or tail, so the compiler refuses a class deriving "
               "from one")
