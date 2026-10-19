@@ -42,6 +42,13 @@ public:
     if (Current) return Current->GetPriority();
     return 0;
   }
+
+  /* An interface value is an IInterface, Conv_InterfaceToObject's parameter, as it is: a cast to UInterface would
+     always come out empty (ImplementsInterface is false for UInterface itself). */
+  bool Tracks(class AActor *Other) {
+    TScriptInterface<ITargetable> Seen = Other;
+    return UKismetSystemLibrary::IsValid(UKismetSystemLibrary::Conv_InterfaceToObject(Seen));
+  }
 };
 
 /*

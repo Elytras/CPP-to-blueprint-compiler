@@ -3393,6 +3393,18 @@ def interface_calls():
     print('ok  IfaceTest: interface calls go by name; the cast names ITargetable; Marks is read where Beacon holds it')
 
 
+def interface_to_object():
+    """IfaceTest: Spotter.Tracks hands an interface value to Conv_InterfaceToObject as it is. A cast to UInterface
+    on the way would come out empty, ImplementsInterface being false for it, which once emptied ElytrasModManager's
+    interface registry in game."""
+    vm = VM(os.path.join(os.path.dirname(asset('IfaceTest')), 'Spotter'),
+            {'Conv_InterfaceToObject': lambda vm, ctx, i: i},
+            isa=lambda o, cls: isinstance(o, Obj) and cls in ('ITargetable_C', o.cls))
+    assert vm.call('Tracks', Other=Obj('Turret_C')) is True
+    assert vm.call('Tracks', Other=None) is False
+    print('ok  IfaceTest: an interface value reaches Conv_InterfaceToObject uncast')
+
+
 def inherited_defaults():
     """OverrideTest: UE_DEFAULTS on an inherited SCS component (a handler record on the parent's node), on a native
     parent's component (its default subobject) and on an inherited plain property (a tag on this CDO)."""
@@ -4467,6 +4479,7 @@ def edit_staleness():
 interfaces()
 interface_bodies()
 interface_calls()
+interface_to_object()
 inherited_defaults()
 parent_call()
 pure_virtual()

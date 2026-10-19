@@ -232,6 +232,7 @@ class VM:
             if o == 0x2E:
                 v = ev(n.kids[0]); return v if s.isa(v, n.val) else None
             if o in (0x52, 0x54, 0x55):                     # an interface cast: the object behind it, if it is of the class
+                if o != 0x55 and n.val == 'Interface': return None     # ImplementsInterface(UInterface) is false, Class.cpp 4651
                 v = ev(n.kids[0]); return v if v not in (None, 0) and s.isa(v, n.val) else None
             if o == 0x51: return ev(n.kids[0])              # EX_InterfaceContext: the object behind the interface
             if o == 0x38:                                   # CST_ObjectToBool / CST_InterfaceToBool: GetObject() != null

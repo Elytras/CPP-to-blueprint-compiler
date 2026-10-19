@@ -4070,6 +4070,10 @@ bool FCompiler::ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgI
         const FRecord* IR = Find(ToIface);
         if (!IR || (!bFromIface && FromKind != SK_Object)) { *Err = "no conversion from " + From + " to " + To; return false; }
         if (bFromIface && Find(FromIface) == IR) return true;
+        /* Every interface is an IInterface (Conv_InterfaceToObject's parameter), and the value goes as it is, as the
+           Kismet compiler passes it. A cast would null it: ImplementsInterface is false for UInterface itself
+           (Class.cpp 4651), which emptied ElytrasModManager's interface registry. */
+        if (bFromIface && IR->UePackage == "/Script/CoreUObject" && IR->UeName == "Interface") return true;
         FArgIR Operand = Arg;
         Arg = FArgIR();
         Arg.K = FArgIR::DynCast;
