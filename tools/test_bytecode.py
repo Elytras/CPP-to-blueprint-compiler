@@ -6408,6 +6408,27 @@ def func_static_above():
 
 
 func_static_above()
+
+
+def override_ref_spell():
+    """OverrideRefSpell: an override's reference parameter spelled qualified, its parent's short, is one type, so the
+    override links to its parent's function; two enums sharing a short name stay two types and the override is refused."""
+    here = os.path.dirname(asset('OverrideRefSpell'))
+    kid, base = os.path.join(here, 'OrsB', 'OrsKid'), os.path.join(here, 'OrsA', 'OrsBase')
+    for b in (kid, base): keeps_invariants(b)
+    pkg = invariants.Package(kid)
+    st = pkg.struct(pkg.find('Check'))
+    assert st.super and pkg.path(st.super).endswith('/OrsBase.OrsBase_C:Check'), 'OrsKid::Check has no super'
+    refused('OverrideRefClash', '', 'it replaces is',
+            top='namespace OrcA { enum class EOrcMode : uint8 { A, B }; UE_ENUM(EOrcMode); }\n'
+                'namespace OrcB { enum class EOrcMode : uint8 { A, B }; UE_ENUM(EOrcMode); }\n'
+                'class OrcRoot : public AActor {\npublic:\n  void Check(OrcA::EOrcMode &M) {}\n};\n'
+                'class OrcKid : public OrcRoot {\npublic:\n  void Check(OrcB::EOrcMode &M) {}\n};\n')
+
+
+override_ref_spell()
+print('ok  OverrideRefSpell: a reference parameter spelled short in the parent and qualified in the override is one '
+      'type; two enums of one short name stay two')
 print('ok  FuncStaticHide: a function named like a mod ancestor\'s static is refused unless it is a static, whose super '
       'is that one')
 

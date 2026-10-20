@@ -1764,6 +1764,8 @@ private:
                            std::string* Err);
     /* A delegate type as one key however it is spelled: `TDelegate<void(int32)>` and `TDelegate<void (int)>` are one. */
     std::string DelegateKey(const std::string& Type) const;
+    /* A function's signature as the engine tells two apart: its return type, then each parameter's, one key per type. */
+    std::vector<std::string> SignatureOf(const Json& Fn) const;
     /* Whether N names a function class For's own signature functions must stay clear of, up and down its chain. */
     bool SignatureNameTaken(const FRecord& For, const std::string& N) const;
     /* The name of the signature function class In gives `TDelegate<...>` Type: the one it made, or the one a class
@@ -3839,17 +3841,15 @@ std::string FCompiler::Unreplicable(const Json& Typed, int32 Depth) const
 /* A function's signature as the engine tells two apart (IsSignatureCompatibleWith, Class.cpp:5882): the return type and
    each parameter's, typedefs resolved, `const`, `class`, `struct` and `enum` dropped, a const reference read as the
    value it passes, and TEnum<E> read as the E it is to the compiler (StripTypeKeywords), so an override may spell either.
-   Names do not count. */
-std::vector<std::string> SignatureOf(const Json& Fn)
+   Names do not count. clang desugars no reference or pointer (only the type's top), so `ETemperature&` inside the
+   enum's namespace and `::Ns::ETemperature&` outside it come as spelled: each goes through DelegateKey, which names a
+   class by its record and an enum by its package, and a short name only when one type has it. */
+std::vector<std::string> FCompiler::SignatureOf(const Json& Fn) const
 {
-    auto Norm = [](std::string T, bool bParm) {
+    auto Norm = [&](std::string T, bool bParm) {
         const bool bConstRef = bParm && T.compare(0, 6, "const ") == 0 && !T.empty() && T.back() == '&';
-        for (const char* Kw : { "const ", "struct ", "class ", "enum " })
-            for (size_t At; (At = T.find(Kw)) != std::string::npos;) T.erase(At, strlen(Kw));
-        T.erase(std::remove(T.begin(), T.end(), ' '), T.end());
-        for (size_t At, Close; (At = T.find("TEnum<")) != std::string::npos && (Close = T.find('>', At)) != std::string::npos;)
-            T.erase(Close, 1).erase(At, 6);
-        if (bConstRef) T.pop_back();
+        T = DelegateKey(T);
+        if (bConstRef && !T.empty() && T.back() == '&') T.pop_back();
         return T;
     };
     const std::string FnType = DesugaredTypeOf(Fn);
