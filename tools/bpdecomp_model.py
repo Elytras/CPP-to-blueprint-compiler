@@ -81,6 +81,8 @@ class Api:
                 if f.endswith('.h'): s._scan('Game/' + f)
         types = json.load(open(os.path.join(ueapi, 'Types.json'), encoding='utf-8'))
         s.structs = {(v['package'], v['name']): k for k, v in types['structs'].items()}
+        # a game Blueprint's struct (UE_GAME_STRUCT): an aggregate, its members by their authored names
+        s.structs.update(((v['package'], v['name']), k) for k, v in types.get('game_structs', {}).items())
         s.fields = {v['name']: dict((n, ty) for ty, n in v.get('fields', [])) for v in types['structs'].values()}
         # an engine struct whose UeApi stub has a constructor over every member (its fields in order, the base's first):
         # no aggregate, so its value is that constructor call, not designated braces

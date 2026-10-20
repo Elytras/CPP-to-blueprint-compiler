@@ -49,7 +49,8 @@ CONTAINER = re.compile(r"^(?:const\s+)?(TArray|TSet|TMap)<(.*)>\s*&?$")
 # 2: "game".
 # 3: <D>__UeDispatcher on each native dispatcher, NotCallable.json, and main's TEnum spellings of native enum fields.
 # 4: UeTemplateSubobjects, the objects instanced under a game Blueprint's component templates.
-GENUEAPI_VERSION = 4
+# 5: UeIchRecords, the inherited components a game Blueprint has a template of its own for.
+GENUEAPI_VERSION = 5
 
 
 def dump_identity(sdk_dir):
@@ -77,7 +78,9 @@ NO_STRUCT_LITERAL = ("TDelegate<", "TMulticast", "TScriptInterface<")    # EX_St
 CTOR_PARAMS = {"FColor": ("uint8 R", "uint8 G", "uint8 B", "uint8 A = 255")}
 # The engine's converting constructors a value needs: a Niagara variable's handle is made from the type definition it
 # names, which is what the cook writes for it (AssetGen reads the argument as the handle's value).
-CTOR_EXTRA = {"FNiagaraTypeDefinitionHandle": "FNiagaraTypeDefinitionHandle(const struct FNiagaraTypeDefinition &) {}"}
+# A wildcard struct parameter (SetStructurePropertyByName's) takes any struct, which AssetGen passes as it is.
+CTOR_EXTRA = {"FNiagaraTypeDefinitionHandle": "FNiagaraTypeDefinitionHandle(const struct FNiagaraTypeDefinition &) {}",
+              "FGenericStruct": "template <class T> FGenericStruct(const T &) {}"}
 INCLUDE = re.compile(r'^#include\s+"(\w+)_classes\.hpp"')
 
 SCALARS = {
@@ -191,6 +194,9 @@ class Struct(object):
         self.link = []           # the names EX_StructConst writes, in PropertyLink order: see resolve_structs
         self.complete = False    # every reflected field is emitted, so a constructor over all of them exists
         self.pkg = path[len("/Script/"):]
+        self.is_game = False     # a game Blueprint's struct (UserDefinedStruct), Game/<cpp>.h: see game_structs
+        self.real = {}           # a game struct's member -> its engine name, `MinAmount_13_06D0...`
+        self.inits = {}          # a game struct's member -> its default instance's value, where that is not the zero
 
 
 class Enum(object):
@@ -206,6 +212,7 @@ BP_ENUMS = set()     # the C++ names of the game's Blueprint enums (UserDefinedE
 ENUM_DECL = re.compile(r"^enum class (\w+) : (\w+)\s*$")
 ENUM_VALUE = re.compile(r"^\t(\w+)\s*=\s*(-?\d+),?\s*$")
 STRUCT_COMMENT = re.compile(r"^// ScriptStruct (\S+)\.(\w+)\s*$")
+GAME_STRUCT_COMMENT = re.compile(r"^// UserDefinedStruct (/Game/\S+)\.(\w+)\s*$")
 STRUCT_SIZE = re.compile(r"^// 0x([0-9A-Fa-f]+) \(0x([0-9A-Fa-f]+) - 0x([0-9A-Fa-f]+)\)")
 # Dumper-7 writes alignas(N) when the struct's MinAlignment is more than its members give (FQuat, FPlane).
 STRUCT_DECL = re.compile(r"^struct (?:alignas\((0x[0-9A-Fa-f]+)\)\s+)?(\w+)(?:\s+final)?(?:\s*:\s*public\s+(\w+))?\s*$")
@@ -229,6 +236,10 @@ def parse_structs(path, pkg):
         if m:
             pending = ("struct", m.group(1), m.group(2))
             continue
+        m = GAME_STRUCT_COMMENT.match(line)
+        if m:
+            pending = ("gstruct", m.group(1), m.group(2))
+            continue
         m = STRUCT_SIZE.match(line)
         if m:
             size = int(m.group(2), 16)
@@ -246,9 +257,11 @@ def parse_structs(path, pkg):
         m = STRUCT_DECL.match(line)
         if m:
             cur_struct, cur_enum = None, None
-            if pending and pending[0] == "struct" and pending[1].startswith("/Script/"):
+            if pending and (pending[0] == "struct" and pending[1].startswith("/Script/") or pending[0] == "gstruct"):
                 cur_struct = STRUCTS[m.group(2)] = Struct(m.group(2), m.group(3) or "", pending[1], pending[2], size)
                 cur_struct.explicit_align = int(m.group(1), 16) if m.group(1) else 1
+                if pending[0] == "gstruct":
+                    cur_struct.is_game, cur_struct.pkg = True, "Game/" + m.group(2)
             pending = None
             continue
         if line.startswith("};"):
@@ -266,6 +279,63 @@ def parse_structs(path, pkg):
                 # The flag comment, `(Edit, Transient, ...)`, or a bitfield's `(BitIndex: .., PropSize: .. (flags))`.
                 transient = bool(TRANSIENT.search(line[line.index("//"):]))
                 cur_struct.raw_fields.append(("bool" if m.group(3) else m.group(1), m.group(2), transient))
+
+
+def game_structs(own, content):
+    """Keeps a game Blueprint's struct (UserDefinedStruct) where AssetGen can import it as it is: every member mapped,
+    each joined to its engine name (`MinAmount_13_06D0...`) off the object dump, in order, and its default instance -
+    which a cooked value's tags are against, and which the header says as initializers - read off the game's package
+    (--game) and of kinds an initializer can say. Drops the rest, and then each struct holding a dropped one."""
+    import invariants
+    import struct
+    dropped = []
+    for st in [s for s in STRUCTS.values() if s.is_game]:
+        names = [n for _, ns in sorted(REAL_FIELDS.get(st.path + "." + st.ue_name, {}).items()) for n in ns]
+        why = "ours" if st.path.startswith(own) else "no --game" if not content else None
+        if not why and not (st.complete and len(names) == len(st.raw_fields) == len(st.fields)
+                            and all(is_spelling_of(n, r) for (_, n), r in zip(st.fields, names))):
+            why = "members"
+        if not why:
+            st.real = dict((n, r) for (_, n), r in zip(st.fields, names))
+            base = os.path.join(content, st.path[len("/Game/"):].split(".")[0])
+            p = invariants.Package(base) if os.path.exists(base + ".uasset") else None
+            ex = [i for i in range(len(p.exports)) if p.class_of(i + 1) == "UserDefinedStruct"] if p else []
+            if not ex:
+                why = "no package"
+            else:
+                by_real = dict((r, n) for n, r in st.real.items())
+                types = dict((n, t) for t, n in st.fields)
+                for t in p.struct(ex[0]).defaults:
+                    n, v = by_real.get(t["name"]), bytes(t["value"])
+                    if t["type"] == "BoolProperty":
+                        if t["bool"]:
+                            st.inits[n] = "true"
+                    elif not any(v):
+                        continue
+                    elif t["type"] == "IntProperty":
+                        st.inits[n] = str(struct.unpack("<i", v)[0])
+                    elif t["type"] == "FloatProperty":
+                        st.inits[n] = repr(struct.unpack("<f", v)[0]) + "f"
+                    elif t["type"] == "ByteProperty" and t.get("enum") == "None" and types.get(n) == "uint8":
+                        st.inits[n] = str(v[0])
+                    else:
+                        # ponytail: the scalars only; a struct, text, soft path, enum or array default drops the struct
+                        why = "a %s default" % t["type"]
+                        break
+        if why:
+            dropped.append((st.cpp, why))
+            del STRUCTS[st.cpp]
+    while True:
+        held = [st for st in STRUCTS.values() if st.is_game and any(d not in STRUCTS for d in
+                [w for t, _ in st.fields for w in re.findall(r"\bF\w+", t) if w != st.cpp])]
+        if not held:
+            break
+        for st in held:
+            dropped.append((st.cpp, "holds a dropped one"))
+            del STRUCTS[st.cpp]
+    kept = sum(1 for st in STRUCTS.values() if st.is_game)
+    print("  game structs: %d kept, %d left out (%s)" % (kept, len(dropped), ", ".join(
+        "%s %d" % (w, c) for w, c in collections.Counter(w for _, w in dropped).most_common())))
 
 
 def resolve_structs():
@@ -361,6 +431,12 @@ def beside(pkg, target):
 
 def emit_struct(st, conv_names, methods, spell):
     body = ["struct %s%s" % (st.cpp, (" : public %s" % st.base) if st.base in STRUCTS else ""), "{"]
+    if st.is_game:
+        body.append('    UE_GAME_STRUCT("%s", "%s");' % (st.path, st.ue_name))
+        body += ["    %s %s%s;" % (t, n, " = " + st.inits[n] if n in st.inits else "") for t, n in st.fields]
+        body += hidden(['static constexpr const char* %s__UeName = "%s";' % (n, st.real[n]) for _, n in st.fields])
+        body.append("};")
+        return "\n".join(body)
     base = STRUCTS.get(st.base)
     own = st.fields[len(base.fields):] if base else st.fields
     for t, n in own:
@@ -456,7 +532,7 @@ def write_types(out_dir):
                 ', "form": "%s"' % e.form if e.form else "", "," if i + 1 < len(ens) else "")
              for i, e in enumerate(ens)]
     rows += ['  },', '  "structs": {']
-    sts = sorted(STRUCTS.values(), key=lambda t: t.cpp)
+    sts = sorted((t for t in STRUCTS.values() if not t.is_game), key=lambda t: t.cpp)
     for i, st in enumerate(sts):
         fields = ", ".join('["%s", "%s"]' % (t, n) for t, n in st.fields)
         # A literal's member order where it is not `fields`': a struct with a super and members of its own, or one with
@@ -466,6 +542,11 @@ def write_types(out_dir):
         rows.append('    "%s": {"package": "%s", "name": "%s", "size": %d, "align": %d, "complete": %s, "fields": [%s]%s}%s'
                     % (st.cpp, st.path, st.ue_name, st.size, struct_align(st), "true" if st.complete else "false",
                        fields, link, "," if i + 1 < len(sts) else ""))
+    gs = sorted((t for t in STRUCTS.values() if t.is_game), key=lambda t: t.cpp)
+    rows += ['  },', '  "game_structs": {']
+    rows += ['    "%s": {"package": "%s", "name": "%s", "fields": [%s]}%s'
+             % (st.cpp, st.path, st.ue_name, ", ".join('["%s", "%s", "%s"]' % (t, n, st.real[n]) for t, n in st.fields),
+                "," if i + 1 < len(gs) else "") for i, st in enumerate(gs)]
     rows += ['  }', '}']
     io.open(os.path.join(out_dir, "Types.json"), "w", encoding="utf-8", newline="\n").write("\n".join(rows) + "\n")
     print("  types: %d enums (%d enum class, %d TEnumAsByte), %d structs (%d complete)"
@@ -754,7 +835,8 @@ def read_real_fields(sdk_dir):
             continue
         m = DUMP_OBJECT.match(line)
         owner = m.group(2).rstrip("\r\n") if m else None
-        cur = REAL_FIELDS.setdefault(owner, {}) if m and m.group(1).endswith("Class") else None
+        cur = REAL_FIELDS.setdefault(owner, {}) if m and (m.group(1).endswith("Class") or m.group(1) == "UserDefinedStruct") \
+            else None
         sig = SIGNATURES.setdefault(owner, []) if m and m.group(1) in ("DelegateFunction", "SparseDelegateFunction") else None
         sub = DUMP_SUBOBJECT.match(m.group(2).rstrip("\r\n")) if m else None
         if sub:
@@ -1382,8 +1464,9 @@ def write_out_arrays(out_dir):
 
 
 SCRIPT_INHERIT = 0x4AA1364E         # CLASS_ScriptInherit, ObjectMacros.h:249-259
-RF_ARCHETYPE_OBJECT, RF_DEFAULT_SUBOBJECT = 0x20, 0x40000
+RF_ARCHETYPE_OBJECT, RF_DEFAULT_SUBOBJECT, RF_INHERITABLE_COMPONENT_TEMPLATE = 0x20, 0x40000, 0x400000
 GAME_SUBOBJECTS = {}                # game Blueprint class path -> ["<class path> <name>"] under its CDO (scan_game)
+GAME_ICH_RECORDS = {}               # game Blueprint class path -> [<Var>]: its InheritableComponentHandler's templates (scan_game)
 GAME_TEMPLATE_SUBOBJECTS = {}       # game Blueprint class path -> ["<class path> <Var>_GEN_VARIABLE:<name>"] (scan_game)
 GAME_MEMBER_SUBOBJECTS = {}         # (native class path, member's engine name lowered) -> {subobject names} (scan_game)
 OBJECT_PATH = "/Script/CoreUObject.Object"
@@ -1448,6 +1531,14 @@ def scan_game(content, container_members):
                     # class (its own SCS nodes' and its overrides of inherited ones): a child's object of the same name
                     # and class there is archetyped on it (UObjectArchetype.cpp 64-83), ProjectileAttack_GEN_VARIABLE:
                     # NormalProjectileAttack_0 in ENE_ShootingPlant_C.
+                    # Each inherited component it has a record of its own for: the template the ICH makes is the
+                    # class's `<Var>_GEN_VARIABLE`, flagged RF_InheritableComponentTemplate (Blueprint
+                    # InheritableComponentHandler.cpp, CreateOverridenComponentTemplate). A child's template of that
+                    # component is archetyped on it, not on the owner's (UObjectArchetype.cpp 83-108).
+                    GAME_ICH_RECORDS[p.path(i + 1)] = [
+                        x["name"][:-len("_GEN_VARIABLE")] for x in p.exports
+                        if x["outer"] == i + 1 and x["flags"] & RF_INHERITABLE_COMPONENT_TEMPLATE
+                        and x["name"].endswith("_GEN_VARIABLE")]
                     GAME_TEMPLATE_SUBOBJECTS[p.path(i + 1)] = [
                         "%s %s" % (p.path(x["cls"]), name_path(p, k + 1, i + 1)) for k, x in enumerate(p.exports)
                         if x["flags"] & RF_ARCHETYPE_OBJECT and x["outer"] != i + 1 and under(p, x, i + 1)
@@ -1646,6 +1737,7 @@ def main():
     for name in sorted(f for f in os.listdir(sdk_dir) if f.endswith("_structs.hpp")):
         parse_structs(os.path.join(sdk_dir, name), name[: -len("_structs.hpp")])
     resolve_structs()
+    read_real_fields(sdk_dir)
 
     headers = sorted(f for f in os.listdir(sdk_dir) if f.endswith("_classes.hpp"))
     classes, totals, pathless = [], dict((k, 0) for k in KINDS), 0
@@ -1654,7 +1746,7 @@ def main():
     own = ("/Game/_ElytrasMods/_NestedContainerStructs/",) + tuple(sorted(set(
         m + "/" for f in os.listdir(mod_dir) if f.endswith((".cpp", ".h"))
         for m in re.findall(r'UE_MOD_PACKAGE\("([^"]+)"', io.open(os.path.join(mod_dir, f), encoding="utf-8-sig").read()))))
-    read_real_fields(sdk_dir)
+    game_structs(own, game_dir)
     read_ref_parms(sdk_dir)
     for name in headers:
         found, skipped, _ = parse_header(os.path.join(sdk_dir, name))
@@ -1696,6 +1788,7 @@ def main():
     for k in classes:
         k.default_subobjects = GAME_SUBOBJECTS.get(k.path + "." + k.ue_name, []) if k.is_bp else []
         k.template_subobjects = GAME_TEMPLATE_SUBOBJECTS.get(k.path + "." + k.ue_name, []) if k.is_bp else []
+        k.ich_records = GAME_ICH_RECORDS.get(k.path + "." + k.ue_name, []) if k.is_bp else []
     tails = class_tails(classes, by_name, game)
     ifaces = native_interfaces(classes, by_name, game, overrides)
     ordered, seen = [], set()
@@ -1734,6 +1827,9 @@ def main():
         deps[st.pkg].update(ENUMS[t].pkg for t, _ in st.fields if t in ENUMS and ENUMS[t].pkg != st.pkg)
     for k in ordered:
         for t in [t for _, r, _, ps in k.funcs for t in [r] + [pt for pt, _ in ps]] + [t for t, _ in k.fields]:
+            for w in re.findall(r"\bF\w+", t):
+                if w != t and w in STRUCTS and STRUCTS[w].is_game:
+                    deps[k.header].add(STRUCTS[w].pkg)
             if t in STRUCTS and STRUCTS[t].pkg != k.header:
                 deps[k.header].add(STRUCTS[t].pkg)
             elif t in ENUMS and ENUMS[t].pkg != k.header:
@@ -1864,6 +1960,9 @@ def main():
                 # name can hold a space): a child is serialized after each.
                 marks.append('static constexpr const char* UeDefaultSubobjects = "%s";'
                              % c_literal(";".join(k.default_subobjects)))
+            if k.ich_records:
+                # The inherited components it has a template of its own for, by node name, ';'.
+                marks.append('static constexpr const char* UeIchRecords = "%s";' % c_literal(";".join(k.ich_records)))
             if k.template_subobjects:
                 # The objects instanced under its component templates, "<class path> <Var>_GEN_VARIABLE:<name>", ';'.
                 marks.append('static constexpr const char* UeTemplateSubobjects = "%s";'
@@ -1975,8 +2074,8 @@ def main():
                 body.append("using %s = %s;" % (k.ue_name, k.emit))
                 aliased += 1
 
-        title = ("Blueprint class " + pkg[len("Game/"):]) if pkg.startswith("Game/") \
-            else "Package /Script/" + pkg
+        title = ("Blueprint struct " if pkg[len("Game/"):] in STRUCTS else "Blueprint class ") + pkg[len("Game/"):] \
+            if pkg.startswith("Game/") else "Package /Script/" + pkg
         out = ["#pragma once",
                "/*",
                "%s, generated by AssetGen/tools/genueapi.py. Do not edit." % title,

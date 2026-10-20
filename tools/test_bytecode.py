@@ -7393,8 +7393,81 @@ def native_struct_forms():
         assert want in src, (want, proc.stdout[-2000:] + proc.stderr[-2000:], src)
 
 
+GAME_STRUCT_SRC = EDIT_HEAD + '''#include "UeApi/Game/ENE_EnemySpawner_C.h"
+UE_MOD_PACKAGE("/Game/_ElytrasMods/GameStructs");
+class GsSpawner : public ENE_EnemySpawner_C {
+public:
+  TArray<FEnemySpawnWave> Waves = {{.MinAmount = 2, .MaxAmount = 5}};
+  UE_DEFAULTS { Spawns = {{.MaxAmount = 3}}; }
+  int32 Total() { int32 N = 0; for (const FEnemySpawnWave &W : Waves) N += W.MaxAmount; return N; }
+};
+'''
+
+
+def game_struct():
+    """A game Blueprint's struct (UE_GAME_STRUCT, FEnemySpawnWave off /Game/Enemies/EnemySpawner/EnemySpawnWave): imported
+    as the game's UserDefinedStruct, never cooked, its members by their engine names, in a mod member's default, an
+    inherited one's (ENE_EnemySpawner_C's Spawns) and a function; bpdecomp reads the defaults back as written."""
+    tmp, out, _ = compile_to(GAME_STRUCT_SRC, 'GameStructs')
+    assert sorted(os.listdir(out)) == ['GsSpawner.uasset', 'GsSpawner.uexp'], os.listdir(out)
+    pkg = os.path.join(out, 'GsSpawner')
+    imports = import_paths(pkg, classes=True)
+    assert any(p == '/Game/Enemies/EnemySpawner/EnemySpawnWave.EnemySpawnWave' and c.endswith('.UserDefinedStruct')
+               for p, c in imports), imports
+    names = dumpexp.load(pkg)[3]
+    assert 'MinAmount_13_06D0A5444939F28386FC9E92C4FD6798' in names and 'MaxAmount_8_D0B530CD40F0329178B69FBE1DC6C4B5' in names, names
+    dec = os.path.join(tmp, 'dec')
+    proc = subprocess.run([sys.executable, '-I', '-c',
+                           'import sys; sys.path.insert(0, %r); import bpdecomp_model; '
+                           'bpdecomp_model.Api.__init__.__defaults__ = (%r,); import bpdecomp_emit; bpdecomp_emit.main()'
+                           % (HERE, os.path.abspath(UEAPI)), os.path.join(tmp, 'FSD', 'Content'), dec,
+                           '--mod', '/Game/_ElytrasMods/GameStructs=GS'], capture_output=True, text=True)
+    src = ''.join(open(os.path.join(dec, 'GS', f), encoding='utf-8-sig').read() for f in os.listdir(os.path.join(dec, 'GS'))
+                  if f.endswith('.h'))
+    shutil.rmtree(tmp, ignore_errors=True)
+    for want in ('FEnemySpawnWave{.EnemyDescriptor = nullptr, .MinAmount = 2, .MaxAmount = 5}',
+                 'FEnemySpawnWave{.EnemyDescriptor = nullptr, .MinAmount = 0, .MaxAmount = 3}'):
+        assert want in src, (want, proc.stdout[-2000:] + proc.stderr[-2000:], src)
+
+
+WILDCARD_SET_SRC = EDIT_HEAD + '''UE_MOD_PACKAGE("/Game/_ElytrasMods/WildSet");
+struct FWsPair { UE_STRUCT; TMap<FName, FVector> Spots; };
+class WsSetter : public AActor {
+public:
+  FVector V;
+  TMap<FName, FVector> M;
+  TArray<FVector> Arr;
+  FWsPair P;
+  void Go(AActor *A) {
+    UKismetSystemLibrary::SetStructurePropertyByName(A, "V", V);
+    UBlueprintMapLibrary::SetMapPropertyByName(A, "M", (TMap<int, int>&)P.Spots);
+    UKismetArrayLibrary::SetArrayPropertyByName(A, "Arr", (TArray<int>&)Arr);
+  }
+};
+'''
+
+
+def wildcard_setters():
+    """A wildcard parameter takes any struct or container, from under the cast that lets clang pass it (or, for
+    SetStructurePropertyByName, FGenericStruct's template constructor): the thunk reads the argument's own property, so
+    the variable itself is passed, as the editor's pin wired to it is."""
+    tmp, out, _ = compile_to(WILDCARD_SET_SRC, 'WildSet')
+    try:
+        pkg = os.path.join(out, 'WsSetter')
+        text = dump('walkscript.py', pkg, export_index(pkg, 'Go'))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    for fn, arg in (('SetStructurePropertyByName', r'InstanceVariable\s+V@'), ('SetMapPropertyByName', r'StructMemberContext\s+Spots_'),
+                    ('SetArrayPropertyByName', r'InstanceVariable\s+Arr@')):
+        assert re.search(r"Function'%s'\s*\n(?:.*\n){2}.*%s" % (fn, arg), text), (fn, text)
+
+
+wildcard_setters()
+print("ok  WildSet: a struct, a struct's map member and an array go to the wildcard setters as themselves")
+game_struct()
+print('ok  GameStructs:a game Blueprint struct imported by its engine names, in defaults and a loop; bpdecomp reads it back')
 native_struct_forms()
-print('ok  NativeForms: GameplayTagContainer and the Niagara parameter store in their own forms, StaticStructOf, UE_KEEP; '
+print('ok  NativeForms:GameplayTagContainer and the Niagara parameter store in their own forms, StaticStructOf, UE_KEEP; '
       'bpdecomp reads each back as written')
 derived_literal('Angle', '/Script/Engine.LightmassDirectionalLightSettings')
 # What EX_StructConst writes of each struct the Transient tests build, in PropertyLink order: never the Transient member.
@@ -9019,6 +9092,26 @@ comp_tick()
 comp_tick_component()
 comp_tick_patch()
 comp_override_chain()
+
+
+def ich_game_between():
+    """A game Blueprint between the class and a component's owner with a record of its own for it (UeIchRecords):
+    ENE_Spider_ExploderTank_C's InheritableComponentHandler holds a template of ENE_PF_SpiderBase_C's `enemy`, so a
+    child's override is archetyped on that one (GetArchetype finds it first), not on the owner's node."""
+    src = EDIT_HEAD + ('#include "UeApi/Game/ENE_Spider_ExploderTank_C.h"\nUE_MOD_PACKAGE("/Game/_ElytrasMods/IchBetween");\n'
+                       'class IchKid : public ENE_Spider_ExploderTank_C {\npublic:\n  UE_DEFAULTS { enemy->KillShout = nullptr; }\n};\n')
+    tmp, out, _ = compile_to(src, 'IchBetween')
+    try:
+        p, ci = class_pkg(os.path.join(out, 'IchKid'))
+        e = p.exports[template(p, ci, 'enemy')]
+        want = '/Game/Enemies/Spider/ExploderTank/ENE_Spider_ExploderTank.ENE_Spider_ExploderTank_C:Enemy_GEN_VARIABLE'
+        assert p.path(e['tmpl']).lower() == want.lower(), p.path(e['tmpl'])
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print('ok  IchBetween: an override template is archetyped on a game Blueprint\'s record between, not the owner\'s node')
+
+
+ich_game_between()
 mod_component()
 comp_root_keep()
 comp_char_root()

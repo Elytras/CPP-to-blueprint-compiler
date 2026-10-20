@@ -1005,6 +1005,7 @@ struct FRecord
     std::map<std::string, std::string> Dispatchers; // `<X>__UeDispatcher`: a native dispatcher -> "Assignable Callable", what of them it is
     std::vector<std::pair<std::string, std::string>> DefaultSubobjects;    // UeDefaultSubobjects: (name, class path), a game Blueprint CDO's
     std::vector<std::pair<std::string, std::string>> TemplateSubobjects;   // UeTemplateSubobjects: (path under the class, class path)
+    std::set<std::string> IchRecords;   // UeIchRecords: the inherited components a game Blueprint has a template of, lower case
     std::map<std::string, std::string> TypeAliases; // `using Leaf = Game::...::Leaf;` in the class body
     std::set<std::string> FinalMethods;             // `virtual T F() final`: no subclass has an F of its own
     std::set<std::string> Forwarders;               // Methods AssetGen declared, not the source: see SynthesizeForwarders
@@ -2292,7 +2293,7 @@ private:
     /* The UeApi folder when genueapi wrote it without --game (Version.json "game": false), else empty: it then lists
        no game Blueprint's default subobjects or tail, so Generate refuses a class deriving from one. */
     std::string UeApiWithoutGame;
-    int32 UeApiStamp = 0;       // Version.json's genueapi: 4 lists UeTemplateSubobjects, which UE_INSTANCED reads
+    int32 UeApiStamp = 0;       // Version.json's genueapi: 4 lists UeTemplateSubobjects, which UE_INSTANCED reads; 5 UeIchRecords
     /* While a UE_DEFAULTS block is lowered: a value that is an object instanced there (UE_INSTANCED, or a local holding
        one) -> its FDefaultValue (Instanced set); false for any other value, with Err set for one it refuses. */
     std::function<bool(const Json&, FDefaultValue&, bool&)> InstancedValue;
@@ -2826,6 +2827,29 @@ bool HasWildcardParams(const std::string& Class, const std::string& Fn)
     return It != Wild.end() && It->second.count(Fn) != 0;
 }
 
+/* A wildcard parameter as UeApi spells it - FGenericStruct, TArray<int>, TSet<int>, TMap<int, int> - takes any struct or
+   container: the thunk steps the argument and reads its type off Stack.MostRecentProperty. So the value goes as it is,
+   from under the cast or conversion that let clang pass it (`(TMap<int, int>&)Spots`, FGenericStruct's template
+   constructor), or null where the argument is no such thing. */
+const Json* WildcardOperand(const std::string& ParmType, const Json* Arg)
+{
+    std::string T = StripTypeKeywords(ParmType);
+    if (T.compare(0, 6, "const ") == 0) T = T.substr(6);
+    if (T != "FGenericStruct" && T != "TArray<int>" && T != "TSet<int>" && T != "TMap<int, int>") return nullptr;
+    for (const Json* W = Arg; W;)
+    {
+        const std::string K = Kind(*W);
+        if (K == "CStyleCastExpr" || K == "CXXReinterpretCastExpr" || K == "CXXStaticCastExpr" || K == "CXXFunctionalCastExpr"
+            || (K == "CXXConstructExpr" && W->contains("inner") && (*W)["inner"].size() == 1))
+            return First(*W);
+        if (K != "ImplicitCastExpr" && K != "ParenExpr" && K != "MaterializeTemporaryExpr" && K != "CXXBindTemporaryExpr"
+            && K != "ExprWithCleanups")
+            return nullptr;
+        W = First(*W);
+    }
+    return nullptr;
+}
+
 /* Gives each static call of a wildcard native (HasWildcardParams) its class's default object as context, so EmitCall
    writes EX_Context(Default__<Class>, EX_FinalFunction) where it would write EX_CallMath. When an argument names no
    property - a container of a None object - the thunk sets bArrayContextFailed and returns with its other arguments
@@ -3180,6 +3204,16 @@ bool FCompiler::Collect(std::string* Err)
                         if (End > At) R.Interfaces.push_back(List.substr(At, End - At));
                     }
             }
+            else if (Kind(C) == "VarDecl" && Name(C) == "UeIchRecords")
+            {
+                std::string List;
+                if (FindLiteral(C, List))
+                    for (size_t At = 0, End; At < List.size(); At = End + 1)
+                    {
+                        End = std::min(List.find(';', At), List.size());
+                        if (End > At) R.IchRecords.insert(Lower(List.substr(At, End - At)));
+                    }
+            }
             else if (Kind(C) == "VarDecl" && (Name(C) == "UeDefaultSubobjects" || Name(C) == "UeTemplateSubobjects"))
             {
                 /* Every default subobject and archetype a game Blueprint's CDO exports, at any depth, "<class path>
@@ -3200,7 +3234,12 @@ bool FCompiler::Collect(std::string* Err)
             {
                 R.bIsStruct = true;
                 std::string Owner;
-                if (FindLiteral(C, Owner))
+                if (FindLiteral(C, Owner) && Owner.find(':') != std::string::npos)     // UE_GAME_STRUCT: "<package>:<name>"
+                {
+                    R.UePackage = Owner.substr(0, Owner.find(':'));
+                    R.UeName = Owner.substr(Owner.find(':') + 1);
+                }
+                else if (!Owner.empty())
                 {
                     R.UePackage = PathIn(Owner, R.CppName);
                     R.UeName = LeafOf(R.CppName);
@@ -7715,6 +7754,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
     if (const int32 Bound = bIntrinsic ? 0 : LowerBoundArgs(CallExprNode, BP, Out, Err)) return Bound > 0;
     const FRecord* ParmsOwner = nullptr;    // the class whose function's parameters the arguments fill, a delegate's below
     bool bSingleParms = false;              // UE5: a native's, whose float parameters take 4-byte floats (S40)
+    bool bWildcard = false;                 // a native with wildcard parameters (HasWildcardParams): see WildcardOperand
     if (bIntrinsic)
     {
         Out.Intrinsic = MethodName;
@@ -7962,6 +8002,7 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
         Out.Fn = BP.EngineFunction(CalleePackage, CalleeName, UeNameOf(Called, MethodName));
         if (!Out.bReceiverIsArg) ParmsOwner = R;
         bSingleParms = IsSingleNative(*R);
+        bWildcard = Called->IsNative() && HasWildcardParams(CalleeName, UeNameOf(Called, MethodName));
         Out.bScript = CalleePackage.compare(0, 6, "/Game/") == 0;
         Out.bInstance = !bStatic;
         /* Each makes its proxy with NewObject, flags it RF_StrongRefOnFrame and roots it nowhere else
@@ -8016,7 +8057,8 @@ bool FCompiler::LowerCall(const Json& CallExprNode, FBlueprintClass& BP, FCallIR
             FIndex Sig;
             return ImportedParamSignature(*Owner, Method, I, BP, &Sig) ? Sig : Null();
         });
-        bOk = LowerArg(*Arg, BP, A, Err);
+        const Json* Wild = bWildcard ? WildcardOperand(ParmType, Arg) : nullptr;
+        bOk = LowerArg(Wild ? *Wild : *Arg, BP, A, Err);
         if (bOk && bSingleParms && I < CalledParms.size()) bOk = SingleArg(TypeOf(*CalledParms[I]), MethodName, BP, A, Err);
         if (bOk) Out.Args.push_back(A);
         Defaulted.push_back(Kind(C) == "CXXDefaultArgExpr");
@@ -19174,9 +19216,11 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         for (const FInstSpec& S : Specs)
             if (S.Root.empty()) BP.AddParentSubobject(S.Path, PackageOf(*S.Class), ClassOf(*S.Class));
     }
-    /* Whether A, a mod class (cooked here, or a UE_COOKED or another mod's one read off its header), has a record of
-       its own for Owner's component Comp: its UE_DEFAULTS reach through it, or instance an object under it. */
+    /* Whether A has a record of its own for Owner's component Comp. A game Blueprint has one where its
+       InheritableComponentHandler holds a template of it (UeIchRecords); a mod class (cooked here, or a UE_COOKED or
+       another mod's one read off its header) where its UE_DEFAULTS reach through it, or instance an object under it. */
     auto OverridesComponent = [&](const FRecord& A, const FRecord& Owner, const std::string& Comp) {
+        if (A.IchRecords.count(Lower(UeNameOf(&Owner, Comp)))) return true;
         const Json* Body = nullptr;
         if (A.Defaults && !A.bIsPatch) ForEach(*A.Defaults, [&](const Json& C) { if (Kind(C) == "CompoundStmt") Body = &C; });
         bool bHit = false;
@@ -19192,11 +19236,26 @@ bool FCompiler::Generate(const FRecord& R, const std::string& OutDir, std::strin
         for (const FInstSpec& S : Specs) bHit = bHit || (!S.Root.empty() && Lower(S.Root) == Lower(UeNameOf(&Owner, Comp)));
         return bHit;
     };
+    /* A game Blueprint between this class and Owner may have a record of Owner's component, which only a genueapi 5
+       UeApi lists: an older one would archetype the template past it, silently. */
+    auto StaleBetween = [&](const FRecord& Owner, const std::string& Comp) {
+        if (UeApiStamp >= 5) return false;
+        for (const FRecord* A = Find(R.Base); A && A != &Owner; A = A->Base.empty() ? nullptr : Find(A->Base))
+            if (A->IsNative() && !A->Defaults && A->UePackage.compare(0, 6, "/Game/") == 0)
+            {
+                *Err = R.CppName + "::UE_DEFAULTS: " + Comp + " is " + Owner.CppName + "'s component and " + A->CppName
+                     + " a game Blueprint between, whose record of it only a UeApi of genueapi version 5 lists - "
+                       "regenerate it with AssetGen/tools/genueapi.py";
+                return true;
+            }
+        return false;
+    };
     for (const auto& Entry : ComponentOverrides)
     {
         /* The parent's own archetype, imported as a subobject of its class, is the record's template:
            the tags this class writes on top of it are exactly the overridden values. */
         const FRecord& Owner = *Entry.second.Owner;
+        if (StaleBetween(Owner, Entry.first)) return false;
         const FRecord* CR = ComponentClassOf(Owner, Entry.first);
         if (!CR) { *Err = R.CppName + "::UE_DEFAULTS: cannot resolve the class of " + Entry.first; return false; }
 

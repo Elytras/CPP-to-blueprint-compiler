@@ -460,7 +460,9 @@ class Body:
             if i in want:
                 e = s.coerce(e, s.type_of(a), want[i][0], lvalue=want[i][1] or a.op in VARS, out=want[i][1])
             if i < len(info.ptypes):
-                e = s.coerce(e, s.type_of(a), info.ptypes[i], lvalue=i in info.out or a.op in VARS, out=i in info.out)
+                # a struct's member is an lvalue too: `(TMap<int, int>&)Transformed.ActorTransform` for a wildcard
+                e = s.coerce(e, s.type_of(a), info.ptypes[i], lvalue=i in info.out or a.op in VARS or a.op == 0x42,
+                             out=i in info.out)
                 if i in info.out and a.op in VARS and e.text == s.var(a):
                     p, _pkg = s.prop_of_var(a)
                     if p is not None and p.flags & CPF_ConstParm and p.flags & CPF_Parm:
