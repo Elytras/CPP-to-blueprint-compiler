@@ -6506,7 +6506,7 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
         const std::string CalleeName = (CalleeNode && Kind(*CalleeNode) == "DeclRefExpr")
             ? (*CalleeNode)["referencedDecl"].value("name", std::string())
             : std::string();
-        if (CalleeName == "StaticClass")
+        if (CalleeName == "StaticClass" || CalleeName == "StaticClassOf")
         {
             const FRecord* R = StaticClassOf(*CalleeNode, OuterType);
             if (!R) { *Err = "StaticClass() on an unknown class"; return false; }
@@ -7166,6 +7166,17 @@ const FRecord* FCompiler::NamedQualifier(const Json& Ref) const
    (NewObject<T>'s default argument), when that is more derived. Lowering a call and a default both ask here. */
 const FRecord* FCompiler::StaticClassOf(const Json& Callee, const std::string& Slot) const
 {
+    if (Callee["referencedDecl"].value("name", std::string()) == "StaticClassOf")
+    {
+        /* `StaticClassOf<X>()` (UeMeta.h): the dump keeps no template argument, but X is the specialization's
+           parameter, `UClass *(X *)`. */
+        const std::string Fn = Callee.value("type", Json::object()).value("qualType", std::string());
+        const size_t Open = Fn.rfind('('), Star = Fn.rfind('*');
+        if (Open == std::string::npos || Star == std::string::npos || Star < Open) return nullptr;
+        std::string X = StripTypeKeywords(Fn.substr(Open + 1, Star - Open - 1));
+        while (!X.empty() && X.back() == ' ') X.pop_back();
+        return Find(X);
+    }
     auto Owner = MethodOwner.find(Callee["referencedDecl"].value("id", std::string()));
     const FRecord* R = Owner == MethodOwner.end() ? nullptr : Find(Owner->second);
     std::string Arg;
@@ -14711,7 +14722,9 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
        Blueprint's /Game/<Path>.<Name>_C, or to this class's own export. A TSubclassOf takes its class or a subclass, all
        the editor's class picker offers; UeApi's converts from any class, so the rest is refused here. */
     if (const Json* Callee = PD.Type == "ClassProperty" && K == "CallExpr" ? Strip(First(*Init)) : nullptr;
-        Callee && Kind(*Callee) == "DeclRefExpr" && (*Callee)["referencedDecl"].value("name", std::string()) == "StaticClass")
+        Callee && Kind(*Callee) == "DeclRefExpr"
+        && ((*Callee)["referencedDecl"].value("name", std::string()) == "StaticClass"
+            || (*Callee)["referencedDecl"].value("name", std::string()) == "StaticClassOf"))
     {
         /* The slot: what the value converts to (an element's TSubclassOf), else the member's own type. */
         std::string Slot = TypeOf(*Whole), Meta;

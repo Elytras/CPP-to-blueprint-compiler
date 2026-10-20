@@ -7312,6 +7312,30 @@ def derived_struct_conv():
 
 derived_struct_conv()
 print('ok  DerivedStructConv: FVector_NetQuantize takes FVector\'s Conv_VectorToTransform, and passes as an FVector')
+
+
+def static_class_of_declared():
+    """Two classes whose defaults name each other's class: `StaticClassOf<MutEgg>()` on a class only declared so far is
+    MutEgg_C, as a default and as a value, where `MutEgg::StaticClass()` needs MutEgg complete."""
+    import dumpexp
+    tmp, out, _ = compile_to(EDIT_HEAD + 'UE_MOD_PACKAGE("/Game/_ElytrasMods/Mut");\nclass MutEgg;\n'
+                             'class MutHen : public AActor {\npublic:\n  TSubclassOf<AActor> Egg = StaticClassOf<MutEgg>();\n'
+                             '  UClass *Which() { return StaticClassOf<MutEgg>(); }\n};\n'
+                             'class MutEgg : public AActor {\npublic:\n  TSubclassOf<AActor> Hen = MutHen::StaticClass();\n};\n',
+                             'Mut')
+    for cls, member, other in (('MutHen', 'Egg', 'MutEgg'), ('MutEgg', 'Hen', 'MutHen')):
+        base = os.path.join(out, cls)
+        imports, exports = dumpexp.load(base)[4:6]
+        cdo = dump('dumptags.py', base, [e['name'] for e in exports].index('Default__%s_C' % cls))
+        idx = int(re.search(r'%s \[0\] ObjectProperty size=4: index (-\d+)' % member, cdo).group(1))
+        assert imports[-idx - 1] == "BlueprintGeneratedClass'%s_C'" % other, (cls, imports, cdo)
+    text = dump('walkscript.py', os.path.join(out, 'MutHen'), export_index(os.path.join(out, 'MutHen'), 'Which'))
+    shutil.rmtree(tmp, ignore_errors=True)
+    assert re.search(r"ObjectConst\s+imp\[\d+\]:BlueprintGeneratedClass'MutEgg_C'", text), text
+
+
+static_class_of_declared()
+print('ok  StaticClassOf: StaticClassOf<X>() on a class only declared names X_C, so two classes\' defaults name each other')
 derived_literal('Angle', '/Script/Engine.LightmassDirectionalLightSettings')
 # What EX_StructConst writes of each struct the Transient tests build, in PropertyLink order: never the Transient member.
 TRANSIENT_LINK = {'MaterialAttributesInput': ['OutputIndex', 'InputName', 'ExpressionName'], 'TimerHandle': []}

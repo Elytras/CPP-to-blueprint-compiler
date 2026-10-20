@@ -3273,6 +3273,7 @@ Notes:
 | `NewObject<UEnemyContext>(this)` | A helper's default `T::StaticClass()` argument names `T`. | Yes |
 | `UKismetSystemLibrary::DoesImplementInterface(Obj, IAimable::StaticClass())`, on one of the mod's own interfaces | Names the interface's class (`IAimable_C`), as `ITargetable::StaticClass()` names a game interface's. `UE_INTERFACE` declares the `StaticClass`; it is no function of the interface asset. | Yes |
 | `Weapons::Rifle::StaticClass()` | Names `Rifle_C`: the qualifier is read in as many parts as it is written with. So does an alias, `using RifleT = Weapons::Rifle;` then `RifleT::StaticClass()`, as [examples/GameBlueprintChild.cpp](examples/GameBlueprintChild.cpp) does. | Yes |
+| `StaticClassOf<Egg>()`, with `class Egg;` declared before | `Egg::StaticClass()` where Egg is only declared so far, as a value and as a default. Two classes whose defaults name each other's class (`Hen` holds `TSubclassOf<AActor> EggClass`, `Egg` holds Hen's class) cannot both have the other complete, and clang needs a class complete for `X::StaticClass()`; a template argument need only be declared. | Yes |
 
 ```cpp
 #include "../include/Objects.h"
@@ -5916,6 +5917,7 @@ listed here is refused with "unimplemented intrinsic".
 | `(T *)Soft` | Resolve Soft Reference: the object or class, null unless it is loaded. | [Types](#types) |
 | `TSoftObjectPtr<T>`, `TSoftClassPtr<T>` | Soft Object and Soft Class References. A default is the asset's path. | [Types](#types) |
 | `T::StaticClass()` | The class as a constant, and as a default. On a mod class, that class, its name qualified or not (`Ns::T::StaticClass()`). | [Types](#types), [Creating objects](#creating-objects), [Classes and variables](#classes-and-variables) |
+| `StaticClassOf<T>()` | `T::StaticClass()` on a class only declared so far. | [Creating objects](#creating-objects) |
 | `TSubclassOf<T>`, `UClass *` | Class References. `TSubclassOf<T>` takes T and its subclasses. | [Types](#types) |
 | `UE_ASSET_ALL(Class)` | Declares `All`: soft pointers to every UE_ASSET_AT of Class or a subclass in this namespace and the ones inside it, filled in at build time. | [Game assets](#game-assets) |
 | `UE_ASSET_AT(Class, Name, Path)` | Names an asset that another package holds, the game's or another mod's, so that `&Name` points at it. | [Game assets](#game-assets) |
