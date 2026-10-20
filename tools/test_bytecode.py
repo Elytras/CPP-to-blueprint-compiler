@@ -7336,6 +7336,66 @@ def static_class_of_declared():
 
 static_class_of_declared()
 print('ok  StaticClassOf: StaticClassOf<X>() on a class only declared names X_C, so two classes\' defaults name each other')
+
+
+NATIVE_FORMS_SRC = EDIT_HEAD + '''#include "UeApi/Niagara.h"
+UE_MOD_PACKAGE("/Game/_ElytrasMods/NativeForms");
+class NfFx : public AActor {
+public:
+  UE_COMPONENT(UNiagaraComponent, Fx);
+  TArray<FTerrainPlacementBox> Boxes = {FTerrainPlacementBox(FVector(1, 2, 3), FVector(4, 5, 6), ETerrainPlacementBoxType::Terrain, UE_KEEP)};
+  UE_DEFAULTS {
+    Fx->OverrideParameters.UserParameterRedirects = {{FNiagaraVariable("Radius", FNiagaraTypeDefinition(StaticStructOf<FNiagaraFloat>(), 2), {}),
+                                                      FNiagaraVariable("User.Radius", FNiagaraTypeDefinition(StaticStructOf<FNiagaraFloat>(), 2), {})}};
+    Fx->OverrideParameters.SortedParameterOffsets = {FNiagaraVariableWithOffset("User.Radius", FNiagaraTypeDefinition(StaticStructOf<FNiagaraFloat>(), 2), 0)};
+    Fx->OverrideParameters.ParameterData = {0, 0, 32, 66};
+  }
+  UObject *Which() { return StaticStructOf<FNiagaraFloat>(); }
+};
+class NfTags : public ATaggedActor {
+public:
+  UE_DEFAULTS { GameplayTags = FGameplayTagContainer({FGameplayTag("Enemy.Type.Regular"), FGameplayTag("Creatures.Glyphids")}, {}); }
+};
+'''
+
+
+def native_struct_forms():
+    """Engine structs with a serialized form of their own (WithSerializer), written as the engine reads them, and read
+    back by bpdecomp as the source that wrote them: FGameplayTagContainer (its tags' count and FNames), a Niagara
+    component's parameter store (FNiagaraVariable / FNiagaraVariableWithOffset: the Name, the type definition as tags,
+    then VarData or the Offset), StaticStructOf<T>() as a ScriptStruct import, and UE_KEEP leaving a constructor
+    argument's member unwritten (FTerrainPlacementBox's bHighResCheck keeps the engine's value)."""
+    import dumpexp, struct
+    tmp, out, _ = compile_to(NATIVE_FORMS_SRC, 'NativeForms')
+    names = dumpexp.load(os.path.join(out, 'NfTags'))[3]
+    cdo = dump('dumptags.py', os.path.join(out, 'NfTags'), exports_of(os.path.join(out, 'NfTags')).index('Default__NfTags_C'))
+    payload = re.search(r'GameplayTags \[0\] StructProperty size=20 struct=GameplayTagContainer: ([0-9a-f]+)', cdo).group(1)
+    raw = bytes.fromhex(payload)
+    assert struct.unpack_from('<i', raw, 0)[0] == 2 and names[struct.unpack_from('<i', raw, 4)[0]] == 'Enemy.Type.Regular', cdo
+    fx = os.path.join(out, 'NfFx')
+    text = dump('walkscript.py', fx, export_index(fx, 'Which'))
+    assert re.search(r"ObjectConst\s+imp\[\d+\]:ScriptStruct'NiagaraFloat'", text), text
+    boxes = dump('dumptags.py', fx, exports_of(fx).index('Default__NfFx_C'))
+    assert 'PlacementType' in boxes and 'bHighResCheck' not in boxes, boxes
+    dec = os.path.join(tmp, 'dec')
+    proc = subprocess.run([sys.executable, '-I', '-c',
+                           'import sys; sys.path.insert(0, %r); import bpdecomp_model; '
+                           'bpdecomp_model.Api.__init__.__defaults__ = (%r,); import bpdecomp_emit; bpdecomp_emit.main()'
+                           % (HERE, os.path.abspath(UEAPI)), os.path.join(tmp, 'FSD', 'Content'), dec,
+                           '--mod', '/Game/_ElytrasMods/NativeForms=NF'], capture_output=True, text=True)
+    src = ''.join(open(os.path.join(dec, 'NF', f), encoding='utf-8-sig').read() for f in os.listdir(os.path.join(dec, 'NF'))
+                  if f.endswith('.h'))
+    shutil.rmtree(tmp, ignore_errors=True)
+    for want in ('FGameplayTagContainer({FGameplayTag("Enemy.Type.Regular"), FGameplayTag("Creatures.Glyphids")}, {})',
+                 'FNiagaraVariable("User.Radius", FNiagaraTypeDefinition(StaticStructOf<FNiagaraFloat>(), 2), {})',
+                 'FNiagaraVariableWithOffset("User.Radius", FNiagaraTypeDefinition(StaticStructOf<FNiagaraFloat>(), 2), 0)',
+                 'ETerrainPlacementBoxType::Terrain, UE_KEEP)'):
+        assert want in src, (want, proc.stdout[-2000:] + proc.stderr[-2000:], src)
+
+
+native_struct_forms()
+print('ok  NativeForms: GameplayTagContainer and the Niagara parameter store in their own forms, StaticStructOf, UE_KEEP; '
+      'bpdecomp reads each back as written')
 derived_literal('Angle', '/Script/Engine.LightmassDirectionalLightSettings')
 # What EX_StructConst writes of each struct the Transient tests build, in PropertyLink order: never the Transient member.
 TRANSIENT_LINK = {'MaterialAttributesInput': ['OutputIndex', 'InputName', 'ExpressionName'], 'TimerHandle': []}

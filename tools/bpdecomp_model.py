@@ -81,6 +81,12 @@ class Api:
                 if f.endswith('.h'): s._scan('Game/' + f)
         types = json.load(open(os.path.join(ueapi, 'Types.json'), encoding='utf-8'))
         s.structs = {(v['package'], v['name']): k for k, v in types['structs'].items()}
+        s.fields = {v['name']: dict((n, ty) for ty, n in v.get('fields', [])) for v in types['structs'].values()}
+        # an engine struct whose UeApi stub has a constructor over every member (its fields in order, the base's first):
+        # no aggregate, so its value is that constructor call, not designated braces
+        s.ctor_fields = {v['name']: [n for _, n in v['fields']] for v in types['structs'].values()
+                         if v.get('complete') and v.get('fields')}
+        s.struct_cpp = {v['name']: k for k, v in types['structs'].items()}
         s.enums = {(v['package'], v['name']): (k, v.get('form')) for k, v in types['enums'].items()}
         s.ops = {}
         for o in json.load(open(os.path.join(ueapi, 'Ops.json'), encoding='utf-8')):

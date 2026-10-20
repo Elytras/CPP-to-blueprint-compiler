@@ -25,6 +25,9 @@ from bpdecomp_model import *
 
 # ---- tagged values (class defaults, struct defaults, component templates, data assets)
 
+# Engine structs serialized in a form of their own (WithSerializer), not as tags: Values.native_form reads each.
+NATIVE_FORMS = ('GameplayTagContainer', 'NiagaraVariableBase', 'NiagaraVariable', 'NiagaraVariableWithOffset')
+
 IMMUTABLE = {'Vector': ('<fff', 'FVector'), 'Vector2D': ('<ff', 'FVector2D'), 'Rotator': ('<fff', 'FRotator'),
              'Vector4': ('<ffff', 'FVector4'), 'Quat': ('<ffff', 'FQuat'), 'IntPoint': ('<ii', 'FIntPoint'),
              'IntVector': ('<iii', 'FIntVector'), 'LinearColor': ('<ffff', 'FLinearColor'), 'Guid': ('<IIII', 'FGuid')}
@@ -46,10 +49,11 @@ RF_ArchetypeObject, RF_DefaultSubObject = 0x20, 0x40000
 def instanced_export(pkg, i):
     """Whether export i is an object instanced in a class's defaults (UE_INSTANCED): an archetype under the CDO, under
     a component template (<Var>_GEN_VARIABLE), or under another such object, and neither a default subobject nor a
-    template itself."""
+    template itself. RF_ArchetypeObject need not be set: an inherited component's override template holds its instanced
+    object without it (ENE_Spider_Tank_Teleporter's StabAttack DamageComponent_0, flags 0x9), the template above it
+    making it one."""
     e = pkg.exports[i]
-    if not e['outer'] or not e['flags'] & RF_ArchetypeObject or e['flags'] & RF_DefaultSubObject \
-            or e['name'].endswith('_GEN_VARIABLE'):
+    if not e['outer'] or e['flags'] & RF_DefaultSubObject or e['name'].endswith('_GEN_VARIABLE'):
         return False
     o = pkg.exports[e['outer'] - 1] if e['outer'] > 0 else None
     while o is not None and not (o['name'].startswith('Default__') or o['name'].endswith('_GEN_VARIABLE')):
@@ -108,36 +112,63 @@ class Values:
             n = struct.unpack_from('<i', b, 4 if ty == 'SetProperty' else 0)[0]
             o = 8 if ty == 'SetProperty' else 4
             itype = t['inner'] if t else inner.type
-            items, o = s.elements(pkg, itype, b, o, n, inner, cur)
+            items, o = s.elements(pkg, itype, b, o, n, inner, cur, s.hint_args(t, 1))
             return '{%s}' % ', '.join(items)
         if ty == 'MapProperty':
             kp, vp = (prop.subs + [None, None])[:2] if prop is not None else (None, None)
             n = struct.unpack_from('<i', b, 4)[0]
             o = 8
             out = []
+            kh, vh = (s.hint_args(t, 2) + [None, None])[:2] if kp is None else (None, None)
             for _ in range(n):
-                k, o = s.elements(pkg, t['inner'], b, o, 1, kp, cur)
-                v, o = s.elements(pkg, t['value_type'], b, o, 1, vp, cur)
+                k, o = s.elements(pkg, t['inner'], b, o, 1, kp, cur, [kh])
+                v, o = s.elements(pkg, t['value_type'], b, o, 1, vp, cur, [vh])
                 out.append('{%s, %s}' % (k[0], v[0]))
             return '{%s}' % ', '.join(out)
         raise ValueError('a %s' % ty)
 
-    def elements(s, pkg, ty, b, o, n, prop, cur):
+    @staticmethod
+    def hint_args(t, want):
+        """The struct names (UeApi's, no F) of a container's element types, off the C++ type hint struct_from_tags
+        gives a native struct's member (TMap<FNiagaraVariable, FNiagaraVariable>); None where there is none."""
+        m = re.match(r'\s*T(?:Array|Set|Map)<(.*)>\s*$', (t or {}).get('cpp', ''))
+        if not m: return [None] * want
+        args, depth, cur_ = [], 0, ''
+        for ch in m.group(1):
+            if ch == ',' and depth == 0: args.append(cur_); cur_ = ''; continue
+            depth += (ch == '<') - (ch == '>'); cur_ += ch
+        args.append(cur_)
+        out = [m2.group(1) if (m2 := re.match(r'^(?:struct\s+)?F(\w+)$', a.strip())) else None for a in args]
+        return (out + [None] * want)[:want]
+
+    def elements(s, pkg, ty, b, o, n, prop, cur, hint=None):
+        # a container's element is written whole, so an engine struct in it is its constructor call (struct_from_tags)
+        s.in_element = getattr(s, 'in_element', 0) + 1
+        try: return s._elements(pkg, ty, b, o, n, prop, cur, hint)
+        finally: s.in_element -= 1
+
+    def _elements(s, pkg, ty, b, o, n, prop, cur, hint=None):
         out = []
-        if ty == 'StructProperty' and n and prop is not None:
-            sname = s.cx.struct_short_name(tpkg(prop, pkg), prop.ref)
-            if sname not in IMMUTABLE and n and o + 8 <= len(b) and s._looks_tag(pkg, b, o):
-                # an array of structs leads with one tag for its inner property
+        if ty == 'StructProperty' and n:
+            sname = s.cx.struct_short_name(tpkg(prop, pkg), prop.ref) if prop is not None else (hint or [None])[0]
+            if o + 8 <= len(b) and s._looks_tag(pkg, b, o):
+                # an array of structs leads with one tag for its inner property, of any struct (PropertyArray.cpp 205);
+                # its StructName is the type where no member says it (a native struct's array UeApi has no member for)
                 tl = s.read_tag(pkg, b, o)
+                sname = sname or tl['struct']
                 o = tl['next'] - tl['size']     # its size spans the elements, which follow it
+            if sname is None: raise ValueError('an element of %s' % ty)
+            ref = prop.ref if prop is not None else None
             for _ in range(n):
-                if sname in IMMUTABLE:
+                if sname in NATIVE_FORMS:
+                    v, o = s.native_form(pkg, sname, b, o, cur); out.append(v)
+                elif sname in IMMUTABLE:
                     fmt, cpp = IMMUTABLE[sname]
                     size = struct.calcsize(fmt)
                     out.append(s.struct_value(pkg, sname, b[o:o + size], prop, cur)); o += size
                 else:
                     tags, o = s.read_tags(pkg, b, o)
-                    out.append(s.struct_from_tags(pkg, prop.ref, tags, cur, tp=tpkg(prop, pkg)))
+                    out.append(s.struct_from_tags(pkg, ref, tags, cur, None if ref else sname, tp=tpkg(prop, pkg)))
             return out, o
         for _ in range(n):
             if ty == 'IntProperty': out.append(str(struct.unpack_from('<i', b, o)[0])); o += 4
@@ -215,9 +246,40 @@ class Values:
             bb, g, r, a = b[:4]
             return 'FColor(%d, %d, %d, %d)' % (r, g, bb, a)
         if sname == 'DateTime': return 'FDateTime(%d)' % struct.unpack('<q', b[:8])[0]
+        if sname in NATIVE_FORMS: return s.native_form(pkg, sname, b, 0, cur)[0]
         tags, _ = s.read_tags(pkg, b, 0)
         ref = prop.ref if prop is not None else None
         return s.struct_from_tags(pkg, ref, tags, cur, sname, tp=tpkg(prop, pkg))
+
+    def native_form(s, pkg, sname, b, o, cur):
+        """(C++ value, offset after it) of a NATIVE_FORMS struct at b[o:]: FGameplayTagContainer::Serialize writes its
+        tags' count and FNames; a Niagara variable its Name, its type definition as tags (ClassStructOrEnum,
+        UnderlyingType), then FNiagaraVariable its VarData and FNiagaraVariableWithOffset its Offset."""
+        if sname == 'GameplayTagContainer':
+            n = struct.unpack_from('<i', b, o)[0]; o += 4
+            tags = []
+            for _ in range(n):
+                tags.append('FGameplayTag(%s)' % B.cstring(s.name_at(pkg, b, o))); o += 8
+            return 'FGameplayTagContainer({%s}, {})' % ', '.join(tags), o
+        name = s.name_at(pkg, b, o); o += 8
+        tdef, o = s.read_tags(pkg, b, o)
+        by = {t['name']: bytes(t['value']) for t in tdef}
+        idx = struct.unpack('<i', by['ClassStructOrEnum'][:4])[0] if 'ClassStructOrEnum' in by else 0
+        under = struct.unpack('<H', by['UnderlyingType'][:2])[0] if 'UnderlyingType' in by else 0
+        if not idx: obj = 'nullptr'
+        else:
+            path = pkg.path(idx)
+            top, _, short = path.partition('.')
+            if pkg.class_of(idx) == 'ScriptStruct' and s.cx.api.struct_cpp.get(short):
+                obj = 'StaticStructOf<%s>()' % s.cx.api.struct_cpp[short]
+            else: obj = s.object(pkg, idx, cur)
+        args = [B.cstring(name) if name != 'None' else 'FName()', 'FNiagaraTypeDefinition(%s, %d)' % (obj, under)]
+        if sname == 'NiagaraVariable':
+            n = struct.unpack_from('<i', b, o)[0]; o += 4
+            args.append('{%s}' % ', '.join(str(x) for x in b[o:o + n])); o += n
+        elif sname == 'NiagaraVariableWithOffset':
+            args.append(str(struct.unpack_from('<i', b, o)[0])); o += 4
+        return 'F%s(%s)' % (sname, ', '.join(args)), o
 
     def struct_from_tags(s, pkg, ref, tags, cur, sname=None, tp=None):
         tp = tp or pkg
@@ -225,13 +287,23 @@ class Values:
         if (sname or (tp.path(ref).rsplit('.', 1)[-1] if ref else None)) == 'Transform':
             return s.transform(pkg, tags, cur)
         parts = []
+        uname = sname or (tp.path(ref).rsplit('.', 1)[-1] if ref else '')
+        fields = s.cx.api.fields.get(uname, {})
         for t in tags:
             mp = members.get(t['name']) if members else None
-            mpkg = members.pkg if members else pkg
+            if mp is None and t['name'] in fields: t = dict(t, cpp=fields[t['name']])     # a native struct's member
             v = s.value(pkg, t['type'], bytes(t['value']), mp, cur, t)
-            parts.append('.%s = %s' % (ident(authored(t['name'])), v))
+            parts.append((t['name'], v))
         tname = s.cx.types.struct(tp, ref, cur) if ref else 'F' + (sname or '')
-        return '%s{%s}' % (tname, ', '.join(parts))
+        native = not ref or tp.path(ref).startswith('/Script/')
+        order = s.cx.api.ctor_fields.get(uname) if getattr(s, 'in_element', 0) and native else None
+        if order and uname != 'Color' and all(n in order for n, _ in parts):
+            # its constructor, every member in order; one the cooked value leaves out is UE_KEEP, unwritten, so it
+            # holds what the engine's constructor sets, as the cooked value does
+            given = dict(parts)
+            if not given: return '%s()' % tname
+            return '%s(%s)' % (tname, ', '.join(given.get(n, 'UE_KEEP') for n in order))
+        return '%s{%s}' % (tname, ', '.join('.%s = %s' % (ident(authored(n)), v) for n, v in parts))
 
     def transform(s, pkg, tags, cur):
         """An FTransform written as tags, as its constructor: a member left out holds the identity's."""
