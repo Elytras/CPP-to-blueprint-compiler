@@ -7245,6 +7245,28 @@ def weak_field_read():
 weak_field_read()
 print('ok  WeakFieldRead: FDamageData\'s weak members read as objects (StructMemberContext); writing one is refused')
 
+
+def game_enum_static_arg():
+    """A game function library's static with a Blueprint enum parameter (DRGLib's LIB_F_Log_C::AddLogEntry, whose
+    LogSeverity is LIB_E_LogSeverity) is in UeApi, the enum a uint8, and a call passes the byte. Only a UeApi from a
+    dump with DRGLib loaded has the class; a vanilla one skips."""
+    hdr = os.path.join(UEAPI, 'Game', 'LIB_F_Log_C.h')
+    if not os.path.exists(hdr):
+        return 'skipped: this UeApi has no DRGLib'
+    assert 'AddLogEntry' in open(hdr, encoding='utf-8-sig').read(), 'LIB_F_Log_C.h has no AddLogEntry'
+    tmp, out, _ = compile_to('#include "UeApi/Types.h"\n#include "UeApi/Engine.h"\n#include "UeApi/Game/LIB_F_Log_C.h"\n'
+                             'UE_MOD_PACKAGE("/Game/_ElytrasMods/GameEnumStaticArg");\n'
+                             'class GameEnumStaticArg : public AActor {\npublic:\n  void Log(uint8 Severity) {\n'
+                             '    LIB_F_Log_C::AddLogEntry(nullptr, Severity, FString("P"), FString("E"), this);\n  }\n};\n',
+                             'GameEnumStaticArg')
+    base = os.path.join(out, 'GameEnumStaticArg')
+    text = dump('walkscript.py', base, export_index(base, 'Log'))
+    shutil.rmtree(tmp, ignore_errors=True)
+    assert re.search(r"Function'AddLogEntry'\s*\n.*\n.*LocalVariable\s+Severity@", text), text
+    return 'a call passes its uint8'
+
+
+print('ok  GameEnumStaticArg: LIB_F_Log_C::AddLogEntry, a Blueprint enum parameter as uint8 - %s' % game_enum_static_arg())
 derived_literal('Angle', '/Script/Engine.LightmassDirectionalLightSettings')
 # What EX_StructConst writes of each struct the Transient tests build, in PropertyLink order: never the Transient member.
 TRANSIENT_LINK = {'MaterialAttributesInput': ['OutputIndex', 'InputName', 'ExpressionName'], 'TimerHandle': []}

@@ -198,6 +198,8 @@ class Enum(object):
 
 
 ENUM_COMMENT = re.compile(r"^// Enum (\S+)\.(\w+)\s*$")
+BP_ENUM_COMMENT = re.compile(r"^// UserDefinedEnum (\S+)\.(\w+)\s*$")
+BP_ENUMS = set()     # the C++ names of the game's Blueprint enums (UserDefinedEnum), filled by parse_structs
 ENUM_DECL = re.compile(r"^enum class (\w+) : (\w+)\s*$")
 ENUM_VALUE = re.compile(r"^\t(\w+)\s*=\s*(-?\d+),?\s*$")
 STRUCT_COMMENT = re.compile(r"^// ScriptStruct (\S+)\.(\w+)\s*$")
@@ -216,6 +218,10 @@ def parse_structs(path, pkg):
         if m:
             pending = ("enum", m.group(1), m.group(2))
             continue
+        m = BP_ENUM_COMMENT.match(line)
+        if m:
+            pending = ("bpenum", m.group(1), m.group(2))
+            continue
         m = STRUCT_COMMENT.match(line)
         if m:
             pending = ("struct", m.group(1), m.group(2))
@@ -230,6 +236,8 @@ def parse_structs(path, pkg):
             if pending and pending[0] == "enum" and "/" not in pending[1]:
                 cur_enum = ENUMS[m.group(1)] = Enum(m.group(1), pkg, m.group(2))
                 cur_enum.ue_name = pending[2]     # `TextureGroup`, where Dumper-7 says ETextureGroup
+            elif pending and pending[0] == "bpenum":
+                BP_ENUMS.add(m.group(1))
             pending = None
             continue
         m = STRUCT_DECL.match(line)
@@ -1117,8 +1125,15 @@ def parse_header(path):
         if not m:
             continue
         cur.raw_funcs.append((m.group(2), m.group(3), m.group(4)))
-        ret = map_type(m.group(2))
-        params = parse_params(m.group(4))
+        ret_raw, params_raw = m.group(2), m.group(4)
+        if m.group(1):
+            # ponytail: a static's Blueprint enum is passed as the byte the VM passes (a function library's static has no
+            # override to carry the property's Enum to). Every other member of one stays out, and the enum has no C++
+            # type: that needs its cooked NewEnumeratorN names off --game, as Dumper-7 writes the display names (TODO.md).
+            as_byte = lambda t: re.sub(r"\b(E\w+)\b", lambda e: "uint8" if e.group(1) in BP_ENUMS else e.group(1), t)
+            ret_raw, params_raw = as_byte(ret_raw), as_byte(params_raw)
+        ret = map_type(ret_raw)
+        params = parse_params(params_raw)
         if ret in KINDS or isinstance(params, str):
             skipped[ret if ret in KINDS else params] += 1
             continue
