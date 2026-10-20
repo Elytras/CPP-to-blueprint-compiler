@@ -2997,10 +2997,10 @@ def types_defaults():
 def native_struct_values():
     """A struct the engine reads in its own binary form, which WriteValue does not write (it writes tags), gets no
     value: not as a default, and not as a UE_STRUCT member, whose default instance holds every member's."""
-    refused('NativeDefault', '  FGameplayTagContainer Labels = {};\n', 'GameplayTagContainer value in its own binary form')
+    refused('NativeDefault', '  FPerPlatformFloat Scale = {};\n', 'PerPlatformFloat value in its own binary form')
     refused('NativeMember', '  int32 X = 0;\n', "a UE_STRUCT's defaults hold every member's",
-            top='struct FTagHolder {\n  UE_STRUCT;\n  FGameplayTagContainer Tags;\n};\n')
-    print('ok  a GameplayTagContainer value is refused, as a default and as a UE_STRUCT member')
+            top='struct FScaleHolder {\n  UE_STRUCT;\n  FPerPlatformFloat Scale;\n};\n')
+    print('ok  a PerPlatformFloat value is refused, as a default and as a UE_STRUCT member')
 
 
 def string_behaviour():
