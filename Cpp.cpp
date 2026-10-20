@@ -4265,7 +4265,17 @@ bool FCompiler::ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgI
         const FConv* Out = FindConv(Via, To);
         if (In && Out) { ApplyConv(*In, BP, Arg); ApplyConv(*Out, BP, Arg); return true; }
     }
-    if (Structs.count(From) && Structs.count(To)) return true;
+    /* A struct derived from another converts as its base does: `FTransform(Hit.Location)`, an FVector_NetQuantize, is
+       Conv_VectorToTransform, as the editor's Vector pin takes it. As itself, a struct passes where its base or a struct
+       derived from it is wanted (the same leading bytes); to any other struct it would be the wrong bytes. */
+    auto Derives = [&](const std::string& Kid, const std::string& Of) {
+        for (const FRecord* R = Find(Kid); R && !R->Base.empty(); R = Find(R->Base))
+            if (StripTypeKeywords(R->Base) == Of || (Find(R->Base) && Find(R->Base) == Find(Of))) return true;
+        return false;
+    };
+    for (const FRecord* R = Find(From); R && !R->Base.empty(); R = Find(R->Base))
+        if (const FConv* Up = FindConv(StripTypeKeywords(R->Base), To)) { ApplyConv(*Up, BP, Arg); return true; }
+    if (Structs.count(From) && Structs.count(To) && (Derives(From, To) || Derives(To, From))) return true;
     *Err = "no Kismet conversion from " + From + " to " + To;
     return false;
 }
@@ -6222,7 +6232,17 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             /* `I->Fn()`: the call's object is EX_InterfaceContext(I). */
             Out.K = FArgIR::InterfaceCtx;
             Out.Base = std::make_shared<FArgIR>();
-            return LowerArg(*Lhs, BP, *Out.Base, Err);
+            if (!LowerArg(*Lhs, BP, *Out.Base, Err)) return false;
+            /* `TScriptInterface<ITargetable>(Player)->Fn()`: the editor's call of an interface function on an object
+               whose class implements it natively (measured on EEE's BP_ElectricCloud) is EX_InterfaceContext of the
+               object itself, with no cast: execInterfaceContext only takes the object out of the 16 bytes it steps. */
+            if (Out.Base->K == FArgIR::DynCast && Out.Base->CastOp == EX_ObjToInterfaceCast && Out.Base->Sub
+                && Out.Base->Sub->Args.size() == 1)
+            {
+                FArgIR Obj = std::move(Out.Base->Sub->Args[0]);
+                *Out.Base = std::move(Obj);
+            }
+            return true;
         }
         if (std::string Weak; OpName == "operator->" && Lhs && TemplateArg(StripTypeKeywords(TypeOf(*Lhs)), "TWeakObjectPtr", &Weak))
         {

@@ -7273,6 +7273,45 @@ def game_enum_static_arg():
 
 
 print('ok  GameEnumStaticArg: LIB_F_Log_C::AddLogEntry, a Blueprint enum parameter as uint8 - %s' % game_enum_static_arg())
+
+
+def object_through_interface():
+    """`TScriptInterface<ITargetable>(Player)->Fn()` on an object UeApi does not know implements the interface is the
+    editor's call of it: InterfaceContext of the object itself, no ObjToInterfaceCast (execInterfaceContext takes the object
+    out of what it steps). Cast<T> of a weak member is DynamicCast of its StructMemberContext."""
+    tmp, out, _ = compile_to(EDIT_HEAD + 'UE_MOD_PACKAGE("/Game/_ElytrasMods/ObjThroughIface");\n'
+                             'class ObjThroughIface : public AActor {\npublic:\n  UHealthComponentBase *H = nullptr;\n'
+                             '  AProjectileBase *P = nullptr;\n  void Go(APlayerCharacter *Player, FDamageData Data) {\n'
+                             '    H = TScriptInterface<ITargetable>(Player)->GetTargetHealthComponent();\n'
+                             '    P = Cast<AProjectileBase>(Data.DamageCauser);\n  }\n};\n', 'ObjThroughIface')
+    base = os.path.join(out, 'ObjThroughIface')
+    text = dump('walkscript.py', base, export_index(base, 'Go'))
+    shutil.rmtree(tmp, ignore_errors=True)
+    assert 'ObjToInterfaceCast' not in text, text
+    assert re.search(r"InterfaceContext\s*\n.*LocalVariable\s+Player@(.*\n)*.*VirtualFunction\s+GetTargetHealthComponent", text), text
+    assert re.search(r"DynamicCast\s+imp\[\d+\]:Class'ProjectileBase'\s*\n.*StructMemberContext\s+DamageCauser@", text), text
+
+
+object_through_interface()
+print('ok  ObjThroughIface: TScriptInterface<I>(Obj)->Fn() is InterfaceContext(Obj); Cast<T> of a weak member casts its read')
+
+
+def derived_struct_conv():
+    """A struct passes where its base's conversion is wanted: FHitResult's FVector_NetQuantize Location to a const
+    FTransform& is Conv_VectorToTransform, as FVector's is; to an FVector it passes as is."""
+    tmp, out, _ = compile_to(EDIT_HEAD + 'UE_MOD_PACKAGE("/Game/_ElytrasMods/DerivedStructConv");\n'
+                             'class DerivedStructConv : public AActor {\npublic:\n  FTransform T;\n  FVector V;\n'
+                             '  void Take(const FTransform &X) { T = X; }\n'
+                             '  void Go(FHitResult Hit) { Take(Hit.Location); V = Hit.ImpactPoint; }\n};\n', 'DerivedStructConv')
+    base = os.path.join(out, 'DerivedStructConv')
+    text = dump('walkscript.py', base, export_index(base, 'Go'))
+    shutil.rmtree(tmp, ignore_errors=True)
+    assert re.search(r"Function'Conv_VectorToTransform'\s*\n.*StructMemberContext\s+Location@", text), text
+    assert re.search(r"Let\s+V@.*\n.*\n.*StructMemberContext\s+ImpactPoint@", text), text
+
+
+derived_struct_conv()
+print('ok  DerivedStructConv: FVector_NetQuantize takes FVector\'s Conv_VectorToTransform, and passes as an FVector')
 derived_literal('Angle', '/Script/Engine.LightmassDirectionalLightSettings')
 # What EX_StructConst writes of each struct the Transient tests build, in PropertyLink order: never the Transient member.
 TRANSIENT_LINK = {'MaterialAttributesInput': ['OutputIndex', 'InputName', 'ExpressionName'], 'TimerHandle': []}

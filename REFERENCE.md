@@ -618,7 +618,7 @@ Notes:
 | `Raw = Kind; Kind = Raw;` | Each converts to the other. Nothing checks at run time that the class in `Raw` derives from `AActor`. | Yes |
 | `TSubclassOf<AActor> Kind = AActor::StaticClass();` | The class as the default. `TSubclassOf<APawn> Kind = AActor::StaticClass();` is refused: a class the `TSubclassOf` does not take. See [Classes and variables](#classes-and-variables). | Yes |
 | `TScriptInterface<IHealth> Health;` | An Interface variable: [Interfaces](#interfaces). | Yes |
-| `Data.Instigator->K2_GetPawn()`, `AActor *A = Data.DamageCauser;`, `if (Data.Component)` on a game struct's `TWeakObjectPtr` member (FDamageData's) | Reads it like an object reference, as the editor's Break node does: EX_StructMemberContext of the member, whose read hands out the object, None once it is gone. Assigning one is refused ("an assignment to a TWeakObjectPtr member"): the game's are read-only, and EX_Let would store an object into the weak pointer's bytes. | Yes |
+| `Data.Instigator->K2_GetPawn()`, `AActor *A = Data.DamageCauser;`, `if (Data.Component)`, `Cast<AProjectileBase>(Data.DamageCauser)` on a game struct's `TWeakObjectPtr` member (FDamageData's) | Reads it like an object reference, as the editor's Break node does: EX_StructMemberContext of the member, whose read hands out the object, None once it is gone. Assigning one is refused ("an assignment to a TWeakObjectPtr member"): the game's are read-only, and EX_Let would store an object into the weak pointer's bytes. | Yes |
 | `TWeakObjectPtr<AActor> Last;` | Refused: "TODO: unimplemented property Last" (a member or local of the mod's own). Keep an object pointer and test it with `if (Obj)`, or keep a soft reference. | Refused |
 
 Notes:
@@ -724,6 +724,7 @@ Notes:
 | `A / B` with `int32 A`, `float B` | `A` converts to float, then a float divide. | Yes |
 | `(bool)F`, `bool B = Count;` | True when nonzero, as in C++. An int32 goes through ToBool (integer) (Conv_IntToBool); a float, int64, byte or enum is compared with zero, so a NaN is true. Conditions of every type: [Statements and control flow](#statements-and-control-flow). | Yes |
 | `+`, `%`, `<<`, `~` and the other operators | The Kismet math nodes: [Operators](#operators). A shift amount must be a constant, and `%` on int64 is refused. | Yes |
+| `Take(Hit.Location)` with `Take(const FTransform&)`, `FVector V = Hit.ImpactPoint;` | A struct derived from another (FVector_NetQuantize from FVector) takes its base's conversion node, here Conv_VectorToTransform, and passes where its base is wanted as is. | Yes |
 
 ```cpp
 int32 Count;
@@ -4542,6 +4543,7 @@ declares and implements one.
 | `TScriptInterface<IAimable> Target = Mark;` | Converts one interface value to another. The result is empty if the object behind it does not implement the target interface. Converting to the same interface is a plain copy. | Yes |
 | `Health.GetObject()` | The object behind the interface. GetObject() is the only method a TScriptInterface has. | Yes |
 | `Current->GetPriority()` | Calls the interface function on the object behind it, with the interface value as Target. The implementation is whatever that object has under that name. | Yes |
+| `TScriptInterface<ITargetable>(Player)->GetTargetHealthComponent()` | Calls the interface function on an object directly, as the editor does when the object's class implements the interface: InterfaceContext of the object, with no Cast To in between. The way to call a game interface's function on a game object, since UeApi does not record which interfaces a game class implements. | Yes |
 | `if (Seen)`, `!Seen`, `Seen == nullptr`, `Seen != nullptr`, `Seen ? A : B` | Whether an object is behind the interface. | Yes |
 | `Health = nullptr;`, `TakeIface(nullptr)` | The null interface. It clears both halves of the value. | Yes |
 | `Cast<IAimable>(Other)` | Refused for a mod interface: "Cast<> to an unknown class". Write `TScriptInterface<IAimable> I = Other;` instead. | Refused |
