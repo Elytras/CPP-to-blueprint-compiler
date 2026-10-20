@@ -1193,6 +1193,10 @@ void ZeroAll() {
 | You write | What it does | Status |
 |---|---|---|
 | `FFloatInterval Delay = FFloatInterval(1, 5);` | A constructor call as a member default. It is written into Class Defaults. | Yes |
+| `FTerrainPlacementBox(Min, Max, ETerrainPlacementBoxType::Terrain, UE_KEEP)` | `UE_KEEP` for a constructor argument leaves that member unwritten, so it holds what the engine's constructor sets, as braces leave out a member of a struct with no constructor. Only where the value starts fresh: a container's element, a class's own default. bpdecomp writes it for a member the cooked value leaves out. | Yes |
+| `GameplayTags = FGameplayTagContainer({FGameplayTag("Enemy.Type.Regular")}, {});` | Written in the container's own form, its tags' FNames (FGameplayTagContainer::Serialize); ParentTags is rebuilt by the engine at load. | Yes |
+| `Fx->OverrideParameters.SortedParameterOffsets = {FNiagaraVariableWithOffset("User.Radius", FNiagaraTypeDefinition(StaticStructOf<FNiagaraFloat>(), 2), 0)};` | A Niagara component's parameter store, as the cook writes it: each FNiagaraVariable / FNiagaraVariableWithOffset in its own form (the Name, the type definition, then VarData or the Offset), and `UserParameterRedirects` a TMap of them. A handle is given as the FNiagaraTypeDefinition it names; `StaticStructOf<T>()` is the struct of its values. | Yes |
+| `.ClassStructOrEnum = StaticStructOf<FNiagaraFloat>()`, `UObject *S = StaticStructOf<FLinearColor>();` | A struct's UScriptStruct as an object: the engine struct's `/Script` one, or a UE_STRUCT's asset. | Yes |
 | `FVector Offset = {0, 0, 50};` | Positional braces as a default. | Yes |
 | `FNested Deep = {.Inner = {.Time = 1.5f}, .Stamp = 7};` | Designated braces, nested. Members left out are zero, or take their own default initializer. | Yes |
 | `FHitResult Mine = {.Distance = 5.0f};` | Designated (or positional) braces of an engine struct whose header has no constructor: the members given are written, the ones left out are not, so they hold what the engine's constructor sets (`FHitResult::Time` is 1), as the editor's Make Struct leaves them. | Yes |
@@ -6196,6 +6200,9 @@ and where the feature is described. In each group, the messages you are most lik
   whole-struct literal cannot hold, such as weak pointers, delegates or bitfields. The SDK gives such structs no
   constructor that takes every member, so clang usually refuses the call first. Fix: designated braces, as the message
   shows, `FHitResult H = { .Time = 0.5f };`. Members you leave out keep the struct's defaults. See [Structs](#structs).
+- `<Member>: the engine reads a <Struct> value in its own binary form, which AssetGen does not write yet; leave the value out`:
+  a default of an engine struct with a native serializer whose form AssetGen does not know (SoftObjectPath, PerPlatformFloat,
+  RichCurveKey and the like). GameplayTagContainer and the Niagara variables are written. Fix: leave the value out.
 - `<Struct> literal must give every field (<N>)`, `<Struct> takes one value per member (<N>), in declaration order:
   <Member>` and `<Type> has no member for value <N>`: rare. A struct value is built with a constructor call or braces
   that give a different number of values than the struct has members. Fix: designated braces that name the members you

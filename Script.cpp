@@ -234,6 +234,62 @@ namespace
 void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D);
 void WriteDefaultTagInner(FArc& Ar, const FPropertyDef& P);
 
+/* A struct the engine serializes in a form of its own (WithSerializer), not as tags, whose form AssetGen knows; false for
+   any other. FGameplayTagContainer::Serialize writes its tags, each tag its FName; FNiagaraTypeDefinitionHandle the
+   definition it names, as tags; FNiagaraVariableBase its Name, then its handle, and FNiagaraVariable its VarData after
+   that, FNiagaraVariableWithOffset its Offset (each measured on EEE's cooked cloud stores). A member the value does not
+   give is its zero. */
+bool WriteNativeForm(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
+{
+    const std::string& S = P.StructName;
+    if (S != "GameplayTagContainer" && S != "NiagaraTypeDefinitionHandle" && S != "NiagaraVariableBase"
+        && S != "NiagaraVariable" && S != "NiagaraVariableWithOffset")
+        return false;
+    const auto& Members = D.Members ? D.Members : P.Members;
+    auto Member = [&](const char* Name) -> const FPropertyDef* {
+        if (D.K == FDefaultValue::Struct && Members)
+            for (const FPropertyDef& M : *Members) if (M.Name == Name) return &M;
+        return nullptr;
+    };
+    if (S == "GameplayTagContainer")
+    {
+        const FPropertyDef* Tags = Member("GameplayTags");
+        V.I32(Tags ? int32(Tags->Default.Items.size()) : 0);
+        if (Tags)
+            for (const FDefaultValue& Tag : Tags->Default.Items)
+            {
+                std::string Name = "None";
+                if (Tag.Members)
+                    for (const FPropertyDef& M : *Tag.Members)
+                        if (M.Name == "TagName" && M.Default.K == FDefaultValue::Str && !M.Default.S.empty()) Name = M.Default.S;
+                V.Name(Name);
+            }
+        return true;
+    }
+    if (S == "NiagaraTypeDefinitionHandle")
+    {
+        if (D.K == FDefaultValue::Struct && Members) for (const FPropertyDef& M : *Members) WriteDefaultTagInner(V, M);
+        TagEnd(V);
+        return true;
+    }
+    const FPropertyDef* Name = Member("Name");
+    V.Name(Name && Name->Default.K == FDefaultValue::Str && !Name->Default.S.empty() ? Name->Default.S : std::string("None"));
+    if (const FPropertyDef* H = Member("TypeDefHandle")) WriteValue(V, *H, H->Default);
+    else TagEnd(V);
+    if (S == "NiagaraVariable")
+    {
+        const FPropertyDef* Data = Member("VarData");
+        V.I32(Data ? int32(Data->Default.Items.size()) : 0);
+        if (Data) for (const FDefaultValue& B : Data->Default.Items) V.U8(uint8(B.I));
+    }
+    else if (S == "NiagaraVariableWithOffset")
+    {
+        const FPropertyDef* Offset = Member("Offset");
+        V.I32(Offset ? int32(Offset->Default.I) : 0);
+    }
+    return true;
+}
+
 void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
 {
     const bool bSet = D.K != FDefaultValue::None;
@@ -243,6 +299,7 @@ void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
         else if (P.Type == "FloatProperty") { const float F = float(D.F); V.Raw(&F, 4); }
         else if (P.Type == "DoubleProperty") V.Raw(&D.F, 8);
         else if (P.Type == "Int64Property") V.I64(D.I);
+        else if (P.Type == "UInt16Property") V.U16(uint16(D.I));
         else if (P.Type == "EnumProperty") V.Name(D.K == FDefaultValue::Str ? D.S : P.EnumZero);
         else if (P.Type == "ByteProperty") { if (P.StructName.empty()) V.U8(uint8(D.I)); else V.Name(D.K == FDefaultValue::Str ? D.S : P.EnumZero); }   // an enum byte is its enumerator's name
         else if (P.Type == "StrProperty") WriteFStringValue(V, D.S);
@@ -293,6 +350,7 @@ void WriteValue(FArc& V, const FPropertyDef& P, const FDefaultValue& D)
             }
             V.Append(Elements);
         }
+        else if (P.Type == "StructProperty" && WriteNativeForm(V, P, D)) {}
         else if (P.Type == "StructProperty")
         {
             const int32 Native = NativeStructSize(P.StructName);
@@ -364,9 +422,9 @@ bool NativeUnwritten(const std::string& StructName)
 {
     // ponytail: the census's list; a native struct the pak holds no value of is not in it
     static const char* const Unwritten[] = {
-        "GameplayTagContainer", "SoftObjectPath", "SoftClassPath", "PerPlatformFloat", "PerPlatformInt", "RichCurveKey",
+        "SoftObjectPath", "SoftClassPath", "PerPlatformFloat", "PerPlatformInt", "RichCurveKey",
         "KeyHandleMap", "FontData", "FontCharacter", "ColorMaterialInput", "ScalarMaterialInput", "VectorMaterialInput",
-        "MaterialAttributesInput", "NiagaraVariable", "NiagaraVariableBase", "NiagaraVariableWithOffset",
+        "MaterialAttributesInput",
         "MovieSceneFloatChannel", "MovieSceneFrameRange", "MovieSceneEvaluationFieldEntityTree",
         "SkeletalMeshSamplingLODBuiltData", "LevelSequenceObjectReferenceMap", "UniqueNetIdRepl", "ModioUIColorRef" };
     return std::find(std::begin(Unwritten), std::end(Unwritten), StructName) != std::end(Unwritten);

@@ -2108,6 +2108,8 @@ private:
     const FRecord* NamedQualifier(const Json& Ref) const;
     /* The class a StaticClass call names, Callee its DeclRefExpr and Slot the type it fills; null when unknown. */
     const FRecord* StaticClassOf(const Json& Callee, const std::string& Slot) const;
+    const FRecord* TemplateParamOf(const Json& Callee) const;
+    FIndex StructObjectOf(const FRecord& R, FBlueprintClass& BP) const;
     /* `Base::Method()` on this: the record the qualifier names, read back the same way, else null. */
     const FRecord* MemberQualifier(const Json& Member) const;
     /* The qualifier written right before a member's name, whatever the object is written as, else empty. */
@@ -6516,6 +6518,15 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             Out.Class = R;
             return true;
         }
+        if (CalleeName == "StaticStructOf")
+        {
+            const FRecord* R = TemplateParamOf(*CalleeNode);
+            if (!R || !R->bIsStruct) { *Err = "StaticStructOf<>() of an unknown struct"; return false; }
+            Out.K = FArgIR::ObjConst;
+            Out.Owner = StructObjectOf(*R, BP);
+            Out.InnerType = "UScriptStruct *";
+            return true;
+        }
         if (CalleeName == "Cast")
         {
             std::string Target = StripTypeKeywords(TypeOf(*N));
@@ -7161,22 +7172,31 @@ const FRecord* FCompiler::NamedQualifier(const Json& Ref) const
     return nullptr;
 }
 
+/* `StaticClassOf<X>()`, `StaticStructOf<X>()` (UeMeta.h): the dump keeps no template argument, but X is the
+   specialization's parameter, `UClass *(X *)`. */
+const FRecord* FCompiler::TemplateParamOf(const Json& Callee) const
+{
+    const std::string Fn = Callee.value("type", Json::object()).value("qualType", std::string());
+    const size_t Open = Fn.rfind('('), Star = Fn.rfind('*');
+    if (Open == std::string::npos || Star == std::string::npos || Star < Open) return nullptr;
+    std::string X = StripTypeKeywords(Fn.substr(Open + 1, Star - Open - 1));
+    while (!X.empty() && X.back() == ' ') X.pop_back();
+    return Find(X);
+}
+
+/* The import of a struct's UScriptStruct: an engine struct's /Script one, a UE_STRUCT's UserDefinedStruct. */
+FIndex FCompiler::StructObjectOf(const FRecord& R, FBlueprintClass& BP) const
+{
+    if (auto S = Structs.find(R.CppName); S != Structs.end()) return BP.ScriptStruct(S->second.Package, S->second.UeName);
+    return BP.ScriptStruct(PackageOf(R), ClassOf(R));
+}
+
 /* StaticClass is declared once, by UE_CLASS on a native class, so the decl names AActor for every mod actor that
    inherits it. The class meant is the qualifier (`AMine::StaticClass()`), else the class a TSubclassOf<X> Slot asks for
    (NewObject<T>'s default argument), when that is more derived. Lowering a call and a default both ask here. */
 const FRecord* FCompiler::StaticClassOf(const Json& Callee, const std::string& Slot) const
 {
-    if (Callee["referencedDecl"].value("name", std::string()) == "StaticClassOf")
-    {
-        /* `StaticClassOf<X>()` (UeMeta.h): the dump keeps no template argument, but X is the specialization's
-           parameter, `UClass *(X *)`. */
-        const std::string Fn = Callee.value("type", Json::object()).value("qualType", std::string());
-        const size_t Open = Fn.rfind('('), Star = Fn.rfind('*');
-        if (Open == std::string::npos || Star == std::string::npos || Star < Open) return nullptr;
-        std::string X = StripTypeKeywords(Fn.substr(Open + 1, Star - Open - 1));
-        while (!X.empty() && X.back() == ' ') X.pop_back();
-        return Find(X);
-    }
+    if (Callee["referencedDecl"].value("name", std::string()) == "StaticClassOf") return TemplateParamOf(Callee);
     auto Owner = MethodOwner.find(Callee["referencedDecl"].value("id", std::string()));
     const FRecord* R = Owner == MethodOwner.end() ? nullptr : Find(Owner->second);
     std::string Arg;
@@ -14348,6 +14368,15 @@ bool FCompiler::AssetRef(const Json& N, FBlueprintClass& BP, FIndex* Out)
 
 /* Whether R's header declares a constructor, defaulted ones included: clang adds an implicit one to a struct that is
    only value-initialised. */
+/* An argument that is UE_KEEP (UeMeta.h): the member left as the engine's constructor makes it. */
+static bool IsKeepArg(const Json& E)
+{
+    if (E.value("type", Json::object()).value("qualType", std::string()).find("UeKeep__") != std::string::npos) return true;
+    bool bKeep = false;
+    ForEach(E, [&](const Json& C) { bKeep = bKeep || IsKeepArg(C); });
+    return bKeep;
+}
+
 static bool DeclaresCtor(const FRecord& R)
 {
     return std::any_of(R.Ctors.begin(), R.Ctors.end(), [](const Json* C) { return !C->value("isImplicit", false); });
@@ -14359,7 +14388,7 @@ static void ZeroDefault(FPropertyDef& PD)
 {
     FDefaultValue& D = PD.Default;
     const std::string& T = PD.Type;
-    if (T == "IntProperty" || T == "Int64Property" || (T == "ByteProperty" && PD.StructName.empty())) { D.K = FDefaultValue::Int; D.I = 0; }
+    if (T == "IntProperty" || T == "Int64Property" || T == "UInt16Property" || (T == "ByteProperty" && PD.StructName.empty())) { D.K = FDefaultValue::Int; D.I = 0; }
     else if (T == "FloatProperty" || T == "DoubleProperty") { D.K = FDefaultValue::Float; D.F = 0.0; }
     else if (T == "BoolProperty") { D.K = FDefaultValue::Bool; D.I = 0; }
     else if (T == "ByteProperty" || T == "EnumProperty") { D.K = FDefaultValue::Str; D.S = PD.EnumZero; }
@@ -14741,6 +14770,17 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
         PD.Default.Object = ClassImportOf(*C, BP);
         return true;
     }
+    /* `StaticStructOf<X>()`: the struct object, as the cook writes a Niagara type definition's ClassStructOrEnum. */
+    if (const Json* Callee = PD.Type == "ObjectProperty" && K == "CallExpr" ? Strip(First(*Init)) : nullptr;
+        Callee && Kind(*Callee) == "DeclRefExpr"
+        && (*Callee)["referencedDecl"].value("name", std::string()) == "StaticStructOf")
+    {
+        const FRecord* S = TemplateParamOf(*Callee);
+        if (!S || !S->bIsStruct) { *Err = Name(F) + ": StaticStructOf<>() of an unknown struct"; return false; }
+        PD.Default.K = FDefaultValue::Obj;
+        PD.Default.Object = StructObjectOf(*S, BP);
+        return true;
+    }
     /* A soft pointer's default is its path, "/Game/Dir/Pkg" meaning Pkg.Pkg as UE_ASSET_AT's does. */
     if (std::string Path; (PD.Type == "SoftObjectProperty" || PD.Type == "SoftClassProperty") && FindLiteral(*Init, Path))
     {
@@ -14783,17 +14823,34 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
     {
         const FRecord* SR = Find(StripTypeKeywords(TypeOf(*Init)));
         if (!SR) { *Err = "unknown struct type in an initializer: " + TypeOf(*Init); return false; }
+        /* `FNiagaraTypeDefinitionHandle(Type)`, the engine's converting constructor (UeApi's, a FNiagaraTypeDefinition
+           given where a handle is wanted): the handle serializes as the definition it names, so that is its value. */
+        if (const Json* Def = SR->UeName == "NiagaraTypeDefinitionHandle" && K != "InitListExpr" && First(*Init)
+                              && !Nth(*Init, 1) ? Strip(First(*Init)) : nullptr;
+            Def && StripTypeKeywords(TypeOf(*Def)) == "FNiagaraTypeDefinition")
+        {
+            FPropertyDef TD = PD;
+            if (!LowerDefault(F, TD, BP, Err, Def, bKeepZero)) return false;
+            PD.Members = TD.Members;
+            PD.Default = TD.Default;
+            return true;
+        }
+        /* A derived struct's value gives its base's members first, as its UeApi constructor takes them (FNiagaraVariable:
+           FNiagaraVariableBase's Name and TypeDefHandle, then its own VarData). */
+        std::vector<const Json*> Fields;
+        for (const FRecord* B = SR; B; B = B->Base.empty() ? nullptr : Find(B->Base))
+            Fields.insert(Fields.begin(), B->Fields.begin(), B->Fields.end());
         std::vector<std::string> Names;
-        for (const Json* SF : SR->Fields) Names.push_back(Name(*SF));
+        for (const Json* SF : Fields) Names.push_back(Name(*SF));
         const std::vector<const Json*> Args = StructArgs(*Init, SR, Names);
         /* `{}` of an engine struct whose header declares no constructor is its value-initialisation too, which the
            braces spell member by member: `FHitResult Hit = {};` holds Time 1, as FHitResult() does. */
         if (K == "InitListExpr" && SR->IsNative() && !DeclaresCtor(*SR)
             && std::all_of(Args.begin(), Args.end(), [](const Json* A) { return IsUnsetInit(*A); }))
             return !bKeepZero || ValueInitStruct(*SR, /*bZeros=*/false, Name(F), PD, BP, Err);
-        if (Args.size() != SR->Fields.size())
+        if (Args.size() != Fields.size())
         {
-            *Err = SR->CppName + " takes one value per member (" + std::to_string(SR->Fields.size())
+            *Err = SR->CppName + " takes one value per member (" + std::to_string(Fields.size())
                  + "), in declaration order: " + Name(F);
             return false;
         }
@@ -14818,20 +14875,21 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
                                                   ? StructArgs(*WasParentInit, SR, Names) : std::vector<const Json*>();
         const bool bParentHere = !bKeepZero || (bWasParentFresh && (!WasParentInit || ParentArgs.size() == Names.size()));
         /* Braces that give some members and leave the rest out (`{.Distance = 5.0f}`; `{}` gives none). */
-        const bool bSomeGiven = std::any_of(Args.begin(), Args.end(), [](const Json* A) { return !IsUnsetInit(*A); });
+        const bool bSomeGiven = std::any_of(Args.begin(), Args.end(), [](const Json* A) { return !IsUnsetInit(*A) && !IsKeepArg(*A); });
         auto Members = std::make_shared<std::vector<FPropertyDef>>();
         for (size_t I = 0; I < Args.size(); ++I)
         {
-            if (std::string Weak; TemplateArg(TypeOf(*SR->Fields[I]), "TWeakObjectPtr", &Weak)) continue;     // as above
+            if (std::string Weak; TemplateArg(TypeOf(*Fields[I]), "TWeakObjectPtr", &Weak)) continue;     // as above
             FPropertyDef MD;
-            const std::string MName = UeNameOf(SR, Name(*SR->Fields[I]));
-            if (!TypeToProperty(TypeOf(*SR->Fields[I]), MName, 0, "member " + MName + " of " + SR->CppName,
+            const std::string MName = UeNameOf(SR, Name(*Fields[I]));
+            if (!TypeToProperty(TypeOf(*Fields[I]), MName, 0, "member " + MName + " of " + SR->CppName,
                                 BP, &MD, Err))
                 return false;
             /* Every member is written, so a zero is a value here and not "leave it out". One the braces leave out
                but that has a default of its own (CXXDefaultInitExpr) takes that default, as in C++. */
             const Json* A = Kind(*Args[I]) == "CXXDefaultInitExpr" ? nullptr : Args[I];
-            bLeftOutMember = bSomeGiven && IsUnsetInit(*Args[I]);
+            const bool bKeep = IsKeepArg(*Args[I]);
+            bLeftOutMember = bSomeGiven && (IsUnsetInit(*Args[I]) || bKeep);
             /* The parent's value of a member given here is fresh where the parent's struct is and the member starts as
                the engine makes it: a UE_STRUCT's member with an initializer of its own (`Hit = {.Time = 0.5f}`) holds
                that in the parent, and braces given for it are a new value over it. The parent's member was made by
@@ -14839,9 +14897,9 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
                there (`In = {.K = 4}`) are followed down, so what they leave out is still fresh under it (In.Hit). */
             const Json* const Given = I < ParentArgs.size() && ParentArgs[I] && !IsUnsetInit(*ParentArgs[I])
                                     ? Strip(ParentArgs[I]) : nullptr;
-            const Json* const Made = Given ? Given : Strip(First(*SR->Fields[I]));
+            const Json* const Made = Given ? Given : Strip(First(*Fields[I]));
             const FRecord* const MemberStruct = Made && Kind(*Made) == "InitListExpr" && !StartsFresh(Made)
-                                              ? Find(StripTypeKeywords(TypeOf(*SR->Fields[I]))) : nullptr;
+                                              ? Find(StripTypeKeywords(TypeOf(*Fields[I]))) : nullptr;
             const bool bFollow = MemberStruct && MemberStruct->bIsStruct;
             bParentFresh = bParentHere && ((!A || IsUnsetInit(*A)) ? !Given : (StartsFresh(Made) || bFollow));
             ParentInit = bParentFresh && bFollow ? Made : nullptr;
@@ -14851,29 +14909,29 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
                the braces of a UE_DEFAULTS statement leave out is over the parent's value, which may be the fresh one
                (bParentFresh). */
             bFreshValue = (bWasFresh || !bKeepZero || (bLeftOutMember && bParentFresh))
-                       && !(A && (!SR->IsNative() || SR->IsModStruct()) && First(*SR->Fields[I]));
+                       && !(A && (!SR->IsNative() || SR->IsModStruct()) && First(*Fields[I]));
             /* Braces of an engine struct whose header declares no constructor are the editor's Make Struct: a member
                they leave out keeps what the engine's constructor sets, which no header says (FHitResult's Time 1). A
                fresh value holds it with no tag; over another it cannot be written. A struct written as raw bytes
                (NativeStructSize: FBox, FPlane, whose constructors set nothing) has every member, its zero. Another
                mod's struct (UE_STRUCT_IN) is no engine struct: its header says each member's value, and one with an
                initializer (CXXDefaultInitExpr, A null) takes it. */
-            if (bLeftOutMember && A && !SR->IsModStruct() && SR->IsNative() && !DeclaresCtor(*SR)
+            if (bLeftOutMember && A && !SR->IsModStruct() && SR->IsNative() && (!DeclaresCtor(*SR) || bKeep)
                 && !NativeStructSize(PD.StructName))
             {
                 if (!bFreshValue)
                 {
-                    *Err = Name(F) + "." + Name(*SR->Fields[I]) + ", left out of the braces, holds what the engine's "
+                    *Err = Name(F) + "." + Name(*Fields[I]) + ", left out of the braces, holds what the engine's "
                          + SR->CppName + " constructor sets, which its header does not say, so AssetGen cannot write it "
                            "over the value already there; give it in the braces, or leave the statement out to keep that value";
                     return false;
                 }
                 continue;
             }
-            if (!LowerDefault(*SR->Fields[I], MD, BP, Err, A, /*bKeepZero=*/true))
+            if (!LowerDefault(*Fields[I], MD, BP, Err, A, /*bKeepZero=*/true))
             {
                 /* A message about the member says whose: `H.Hit: ...`, `H.Hit, left out ...`. */
-                const std::string Member = Name(*SR->Fields[I]);
+                const std::string Member = Name(*Fields[I]);
                 if (Err->compare(0, Member.size() + 1, Member + ":") == 0 || Err->compare(0, Member.size() + 1, Member + ".") == 0
                     || Err->compare(0, Member.size() + 1, Member + ",") == 0)
                     *Err = Name(F) + "." + *Err;
@@ -14890,7 +14948,7 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
     const std::string& T = PD.Type;
     /* A number is whatever the initializer comes to: `40`, `-1.5f`, `kMax * 2 + 1`, `1 << 3 | 2`. An enum-typed
        byte keeps its named-constant path below. */
-    if (FConstVal V; (T == "IntProperty" || T == "Int64Property" || (T == "ByteProperty" && PD.StructName.empty())
+    if (FConstVal V; (T == "IntProperty" || T == "Int64Property" || T == "UInt16Property" || (T == "ByteProperty" && PD.StructName.empty())
                       || T == "FloatProperty" || T == "DoubleProperty" || T == "BoolProperty") && FoldConst(*Whole, V))
     {
         const double Num = V.Num();
@@ -15072,7 +15130,7 @@ bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& P
                 "MovieSceneEvaluationOperand", "MovieSceneObjectBindingID", "MovieSceneTrackInstanceInput",
                 "NavAgentProperties", "NiagaraAssetVersion", "NiagaraDataSetID", "NiagaraEmitterNameSettingsRef",
                 "NiagaraFunctionSignature", "NiagaraID", "NiagaraTypeDefinition", "NiagaraVMExecutableDataId",
-                "NiagaraVariableBase", "PolygonGroupID", "PolygonID", "PrimaryAssetId", "PrimaryAssetType", "RigElementKey",
+                "NiagaraVariable", "NiagaraVariableBase", "PolygonGroupID", "PolygonID", "PrimaryAssetId", "PrimaryAssetType", "RigElementKey",
                 "RigElementKeyCollection", "SlateFontInfo", "SolverTrailingData", "TimerHandle", "Timespan", "TriangleID",
                 "Vector", "Vector2D", "Vector4", "VertexID", "VertexInstanceID", "SoftObjectPath", "SoftClassPath",
                 "Vector_NetQuantize", "Vector_NetQuantize10", "Vector_NetQuantize100", "Vector_NetQuantizeNormal" };
@@ -15140,6 +15198,15 @@ bool FCompiler::TypeToProperty(const std::string& QualType, const std::string& P
     if (Type == "int64" || Type == "long long") { *Out = Int64Param(PName, ExtraFlags); return true; }
     if (Type == "bool") { *Out = BoolParam(PName, ExtraFlags); return true; }
     if (Type == "uint8" || Type == "unsigned char") { *Out = ByteParam(PName, ExtraFlags); return true; }
+    /* A native struct's uint16 member, for its tag in a value AssetGen writes (FNiagaraTypeDefinition::UnderlyingType). No
+       Blueprint variable is one, so a mod's own is still refused. */
+    if ((Type == "uint16" || Type == "unsigned short") && Where.compare(0, 7, "member ") == 0)
+    {
+        *Out = IntParam(PName, ExtraFlags);
+        Out->Type = "UInt16Property";
+        Out->ElementSize = 2;
+        return true;
+    }
     if (Type == "char *" || Type == "char*" || Type == "FString")
     { *Out = StringParam(PName, ExtraFlags); return true; }
     if (Type == "FName") { *Out = NameParam(PName, ExtraFlags); return true; }

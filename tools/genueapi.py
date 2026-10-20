@@ -75,6 +75,9 @@ NO_STRUCT_LITERAL = ("TDelegate<", "TMulticast", "TScriptInterface<")    # EX_St
 # The engine's C++ constructor where it takes the members in another order than the reflected one (FColor's are B, G,
 # R, A in memory). The stub takes them the C++ way, and AssetGen puts each argument on the member its parameter names.
 CTOR_PARAMS = {"FColor": ("uint8 R", "uint8 G", "uint8 B", "uint8 A = 255")}
+# The engine's converting constructors a value needs: a Niagara variable's handle is made from the type definition it
+# names, which is what the cook writes for it (AssetGen reads the argument as the handle's value).
+CTOR_EXTRA = {"FNiagaraTypeDefinitionHandle": "FNiagaraTypeDefinitionHandle(const struct FNiagaraTypeDefinition &) {}"}
 INCLUDE = re.compile(r'^#include\s+"(\w+)_classes\.hpp"')
 
 SCALARS = {
@@ -370,6 +373,8 @@ def emit_struct(st, conv_names, methods, spell):
     if st.complete:
         params = CTOR_PARAMS.get(st.cpp) or ["%s %s" % (t, n) for t, n in st.fields]
         body.append("    %s(%s) {}" % (st.cpp, ", ".join(params)))
+    if st.cpp in CTOR_EXTRA:
+        body.append("    " + CTOR_EXTRA[st.cpp])
     if st.cpp in conv_names:
         body.append("    UE_CONV_%s" % st.cpp)
     lines, marks = method_lines(methods, spell)
