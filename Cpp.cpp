@@ -83,6 +83,7 @@ const Json* Nth(const Json& N, size_t I)
 
 std::string StripTypeKeywords(std::string T);
 std::string WithoutElaboration(std::string T);
+bool IsStructValueType(const std::string& QualType);
 bool IsTEnumType(std::string T, const std::string& Of = "TEnum");
 const Json* PeelLvalue(const Json* N);
 bool IsFixedOperand(const Json& N);
@@ -1491,6 +1492,14 @@ bool EmitArg(FScript& S, const FArgIR& A, FIndex SelfExp, std::string* Err)
             if (Err) *Err = "TODO: unimplemented intrinsic " + A.Sub->Intrinsic;
             return false;
         }
+        /* A struct the call on another object yields, used where it stands (an argument, a member's struct): with the
+           object None, its slot keeps what it started as - a native's default-constructed parameter (an FVector's
+           garbage, an FTransform's identity, ScriptMacros.h PARAM_PASSED_BY_VAL), a script callee's struct default
+           (InitializeValue_InContainer) - where the editor's local of it reads zero. The callee's ReturnValue as the
+           context's r-value has ProcessContextOpcode clear the slot (ScriptCore.cpp 2950-2953). A scalar, an object
+           or a container starts zeroed already. */
+        if ((A.Sub->Target || A.Sub->Context.V) && A.Sub->Fn.V && IsStructValueType(A.InnerType))
+            return EmitCall(S, *A.Sub, SelfExp, Err, FFieldRef{ "ReturnValue", A.Sub->Fn });
         return EmitCall(S, *A.Sub, SelfExp, Err);
     }
     if (Err) *Err = "internal: unknown argument kind";
@@ -3973,6 +3982,15 @@ bool IsInt64Type(const std::string& QualType)
 bool IsObjectType(const std::string& QualType)
 {
     return !QualType.empty() && QualType.back() == '*';
+}
+
+/* A struct value (FTransform, a mod's UE_STRUCT), not text, a container, a template or a pointer. */
+bool IsStructValueType(const std::string& QualType)
+{
+    std::string T = StripTypeKeywords(QualType);
+    T = T.substr(T.rfind(':') == std::string::npos ? 0 : T.rfind(':') + 1);
+    return T.size() > 1 && T[0] == 'F' && T.find_first_of("<*&") == std::string::npos && T != "FString" && T != "FName"
+        && T != "FText";
 }
 
 /* S40: KismetMathLibrary's UE5 name for a 4.27 X_FloatFloat (X_DoubleDouble), from the UeApi's Version.json "math"; a

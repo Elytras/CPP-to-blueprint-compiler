@@ -7200,6 +7200,33 @@ def derived_literal(fn, struct):
 
 ctx_null_call()
 print('ok  CtxNullCall: a call through a None object zeroes its Let destination (the context names its r-value)')
+
+CTX_STRUCT_ARG_SRC = EDIT_HEAD + '''UE_MOD_PACKAGE("/Game/_ElytrasMods/CtxStructArg");
+class CtxStructArg final : public AActor {
+public:
+  CtxStructArg *Peer;
+  FVector Scale;
+  UE_PURE FVector Where() const { return Scale; }
+  void Folded() { FVector S = Peer->Where(); Scale = S * 2.0f; }
+  void Direct() { Scale = Peer->Where() * 2.0f; }
+};
+'''
+
+
+def ctx_struct_arg():
+    """A struct a call on another object yields, passed straight to a call - written so, or a single-use local
+    ForwardSingleUse folds in - names the callee's ReturnValue as the context's r-value: with the object None, a native's
+    parameter is default-constructed and a script callee's is the struct's default, where the editor's local reads zero
+    (the context_rvalue rule)."""
+    tmp, out, _ = compile_to(CTX_STRUCT_ARG_SRC, 'CtxStructArg')
+    try:
+        vmsem_holds(os.path.join(out, 'CtxStructArg'), 'context_rvalue')
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print('ok  CtxStructArg: a struct from a call on another object, as an argument, is zeroed when the object is None')
+
+
+ctx_struct_arg()
 drop_result()
 print('ok  DropResult: a discarded FString / TArray result lands in a local, not the 64-byte statement buffer')
 out_array_reset()
