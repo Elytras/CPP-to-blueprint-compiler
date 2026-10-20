@@ -70,6 +70,7 @@ def class_refs(t):
 def split_args(text):
     return [a.strip() for a in split_params(text)]
 FIELD = re.compile(r"^\t([A-Za-z_][\w:<>,\*& ()\"]*?)\s+([A-Za-z_]\w*)\s*(:\s*\d+)?;\s*//")
+WEAK = re.compile(r"^TWeakObjectPtr<class\s+(\w+)>$")     # a native struct's weak member, of a native class
 NO_STRUCT_LITERAL = ("TDelegate<", "TMulticast", "TScriptInterface<")    # EX_StructConst has no zero for these
 # The engine's C++ constructor where it takes the members in another order than the reflected one (FColor's are B, G,
 # R, A in memory). The stub takes them the C++ way, and AssetGen puts each argument on the member its parameter names.
@@ -273,6 +274,13 @@ def resolve_structs():
         own, link, complete = [], [], base.complete if base else True
         for raw, name, transient in st.raw_fields:
             mapped = map_type(raw)
+            weak = WEAK.match(raw.strip())
+            if weak:
+                # Read like an object (Types.h's TWeakObjectPtr), as a Break node does. No literal: EX_StructConst would
+                # write an object into the weak pointer's bytes.
+                own.append(("TWeakObjectPtr<class %s>" % weak.group(1), name))
+                complete = False
+                continue
             if mapped in KINDS or mapped == "void" or any(s in mapped for s in NO_STRUCT_LITERAL):
                 complete = False
                 continue

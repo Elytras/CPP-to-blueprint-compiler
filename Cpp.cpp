@@ -6031,6 +6031,13 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
                 Out.InnerType = "bool";
                 return true;
             }
+            if (std::string Weak; TemplateArg(StripTypeKeywords(TypeOf(*Obj)), "TWeakObjectPtr", &Weak))
+            {
+                /* `AActor *A = Data.DamageCauser`: the read is the object already (operator-> above). */
+                if (!LowerArg(*Obj, BP, Out, Err)) return false;
+                Out.InnerType = StripTypeKeywords(TypeOf(*N));
+                return true;
+            }
             return LowerArg(*Obj, BP, Out, Err) && ConvertArg(TypeOf(*N), BP, Out, Err);
         }
         const Json* Obj = Callee ? Strip(First(*Callee)) : nullptr;
@@ -6216,6 +6223,14 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             Out.K = FArgIR::InterfaceCtx;
             Out.Base = std::make_shared<FArgIR>();
             return LowerArg(*Lhs, BP, *Out.Base, Err);
+        }
+        if (std::string Weak; OpName == "operator->" && Lhs && TemplateArg(StripTypeKeywords(TypeOf(*Lhs)), "TWeakObjectPtr", &Weak))
+        {
+            /* `Data.Instigator->Fn()`: reading a WeakObjectProperty hands the object out (CopyCompleteValueToScriptVM
+               of TFObjectPropertyBase<FWeakObjectPtr>), so the read is the call's object, as for a plain pointer. */
+            if (!LowerArg(*Lhs, BP, Out, Err)) return false;
+            Out.InnerType = StripTypeKeywords(Weak) + " *";
+            return true;
         }
         std::string SetElem;
         if ((OpName == "operator+" || OpName == "operator-" || OpName == "operator&") && Lhs && Rhs
@@ -9659,6 +9674,10 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                 Rhs = Nth(*S, 2);
             }
             if (!Lhs || !Rhs) { *Err = "assignment with a missing side"; bOk = false; return; }
+            /* A WeakObjectProperty is only read (Types.h): EX_Let would store the object the right side's read hands
+               out into the weak pointer's own bytes, an FWeakObjectPtr's index and serial number. */
+            if (std::string Weak; TemplateArg(StripTypeKeywords(TypeOf(*Lhs)), "TWeakObjectPtr", &Weak))
+            { *Err = "an assignment to a TWeakObjectPtr member: AssetGen only reads one, as the game's Blueprints do"; bOk = false; return; }
 
             /* `(Bump(), N) = G();`, `(N = M) = G();`: the store goes to N (AssignedPlace). G() first, as C++17
                sequences an assignment's right side before its left ([expr.ass]/1), then the comma's left side or the

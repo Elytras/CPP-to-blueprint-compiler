@@ -618,7 +618,8 @@ Notes:
 | `Raw = Kind; Kind = Raw;` | Each converts to the other. Nothing checks at run time that the class in `Raw` derives from `AActor`. | Yes |
 | `TSubclassOf<AActor> Kind = AActor::StaticClass();` | The class as the default. `TSubclassOf<APawn> Kind = AActor::StaticClass();` is refused: a class the `TSubclassOf` does not take. See [Classes and variables](#classes-and-variables). | Yes |
 | `TScriptInterface<IHealth> Health;` | An Interface variable: [Interfaces](#interfaces). | Yes |
-| `TWeakObjectPtr<AActor> Last;` | Refused by clang (`no template named 'TWeakObjectPtr'`): the SDK has no weak or lazy pointer. Keep an object pointer and test it with `if (Obj)`, or keep a soft reference. | Refused |
+| `Data.Instigator->K2_GetPawn()`, `AActor *A = Data.DamageCauser;`, `if (Data.Component)` on a game struct's `TWeakObjectPtr` member (FDamageData's) | Reads it like an object reference, as the editor's Break node does: EX_StructMemberContext of the member, whose read hands out the object, None once it is gone. Assigning one is refused ("an assignment to a TWeakObjectPtr member"): the game's are read-only, and EX_Let would store an object into the weak pointer's bytes. | Yes |
+| `TWeakObjectPtr<AActor> Last;` | Refused: "TODO: unimplemented property Last" (a member or local of the mod's own). Keep an object pointer and test it with `if (Obj)`, or keep a soft reference. | Refused |
 
 Notes:
 - A class that the headers only forward-declare cannot be a variable's type. The message says which `UeApi/Game/...`

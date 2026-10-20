@@ -7224,6 +7224,27 @@ def iface_static_class():
 
 iface_static_class()
 print('ok  IfaceStaticClass: IIscMark::StaticClass() on a mod interface names IIscMark_C')
+
+
+def weak_field_read():
+    """WeakFieldRead: a native struct's TWeakObjectPtr member is EX_StructMemberContext of it, read like an object: the
+    object of a call, the value an object variable is set to, IsValid's argument. Assigning one, and a weak variable of
+    the mod's own, are refused."""
+    base = asset('WeakFieldRead')
+    keeps_invariants(base)
+    text = dump('walkscript.py', base, export_index(base, 'Take'))
+    member = r"StructMemberContext\s+%s@imp\[\d+\]:ScriptStruct'%s'"
+    assert re.search(r"Context\s+skip.*\n.*" + member % ('Instigator', 'DamageData') + r"(.*\n)*.*FinalFunction\s+imp\[\d+\]:Function'K2_GetPawn'", text), text
+    assert re.search(r"LetObj\s*\n.*Causer@.*\n.*" + member % ('DamageCauser', 'DamageData'), text), text
+    assert re.search(r"Function'IsValid'\s*\n.*" + member % ('Component', 'DamageDataBase'), text), text
+    refused('WeakFieldWrite', '  void Take(FDamageData Data) { Data.Instigator = Data.Instigator; }\n',
+            'an assignment to a TWeakObjectPtr member')
+    refused('WeakFieldOwn', '  TWeakObjectPtr<AActor> Mine;\n', 'unimplemented property Mine')
+
+
+weak_field_read()
+print('ok  WeakFieldRead: FDamageData\'s weak members read as objects (StructMemberContext); writing one is refused')
+
 derived_literal('Angle', '/Script/Engine.LightmassDirectionalLightSettings')
 # What EX_StructConst writes of each struct the Transient tests build, in PropertyLink order: never the Transient member.
 TRANSIENT_LINK = {'MaterialAttributesInput': ['OutputIndex', 'InputName', 'ExpressionName'], 'TimerHandle': []}
