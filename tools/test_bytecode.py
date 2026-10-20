@@ -3228,8 +3228,14 @@ def pointer_more():
     refused('RefLocal', '  int32 &Bad() { int32 L = 3; return L; }\n', 'returns a reference to L, a local')
     refused('RefParm', '  int32 &Bad(int32 &V) { return V; }\n', 'returns a reference to V, a parameter')
     refused('AddrLocalMember', '  int64 Bad() { FVector V; return (int64)&V.Y; }\n', 'a Blueprint variable has none')
-    refused('AddrHitMember', '  int64 Bad(FHitResult *H) { return (int64)&H->Distance; }\n',
-            "the address of FHitResult::Distance: FHitResult's reflected members take")
+    refused('AddrCurveMember', '  int64 Bad(FRuntimeCurveLinearColor *C) { return (int64)&C->ExternalCurve; }\n',
+            "the address of FRuntimeCurveLinearColor::ExternalCurve: FRuntimeCurveLinearColor's reflected members take")
+    # FHitResult's do add up once its three weak members are in UeApi: Distance is at 0x8 (Engine_structs.hpp).
+    tmp, out, _ = compile_to(EDIT_HEAD + 'UE_MOD_PACKAGE("/Game/_ElytrasMods/AddrHitMember");\n'
+                             'class AddrHitMember : public AActor {\npublic:\n'
+                             '  int64 Good(FHitResult *H) { return (int64)&H->Distance; }\n};\n', 'AddrHitMember')
+    assert run(os.path.join(out, 'AddrHitMember'), 'Good', H=4096)[0] == 4104
+    shutil.rmtree(tmp, ignore_errors=True)
     assert 'PointerMore::FirstOf returns const int32&: a Blueprint function returns a copy' in LOGS['PointerMore']
     print('ok  PointerMore: whole structs, 16-bit values and doubles through a pointer, struct member addresses, '
           'reference returns, memory reads across a latent wait; the refusals that stay')

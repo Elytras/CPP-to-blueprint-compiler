@@ -14385,6 +14385,9 @@ bool FCompiler::ValueInitStruct(const FRecord& SR, bool bZeros, const std::strin
     for (const FRecord* R : Chain)
         for (const Json* SF : R->Fields)
         {
+            /* A native struct's weak member (FHitResult's PhysMaterial) is only read; no braces can give it a value
+               (TWeakObjectPtr has no constructor), so its tag is left out and it stays None, as the struct makes it. */
+            if (std::string Weak; TemplateArg(TypeOf(*SF), "TWeakObjectPtr", &Weak)) continue;
             FPropertyDef MD;
             const std::string MName = UeNameOf(R, Name(*SF));
             if (!TypeToProperty(TypeOf(*SF), MName, 0, "member " + MName + " of " + R->CppName, BP, &MD, Err)) return false;
@@ -14786,6 +14789,7 @@ bool FCompiler::LowerDefault(const Json& F, FPropertyDef& PD, FBlueprintClass& B
         auto Members = std::make_shared<std::vector<FPropertyDef>>();
         for (size_t I = 0; I < Args.size(); ++I)
         {
+            if (std::string Weak; TemplateArg(TypeOf(*SR->Fields[I]), "TWeakObjectPtr", &Weak)) continue;     // as above
             FPropertyDef MD;
             const std::string MName = UeNameOf(SR, Name(*SR->Fields[I]));
             if (!TypeToProperty(TypeOf(*SR->Fields[I]), MName, 0, "member " + MName + " of " + SR->CppName,
@@ -15547,6 +15551,7 @@ bool FCompiler::LayoutOf(const std::string& QualType, int32* Size, int32* Align,
     if (Enums.count(T)) { *Size = 1; *Align = 1; return true; }
     std::string Inner;
     if (TemplateArg(T, "TSubclassOf", &Inner)) { *Size = 8; *Align = 8; return true; }
+    if (TemplateArg(T, "TWeakObjectPtr", &Inner)) { *Size = 8; *Align = 4; return true; }      // FWeakObjectPtr: two int32
     if (TemplateArg(T, "TArray", &Inner) || TemplateArg(T, "TScriptInterface", &Inner)) { *Size = 16; *Align = 8; return true; }
     if (TemplateArg(T, "TSet", &Inner) || TemplateArg(T, "TMap", &Inner)) { *Size = 80; *Align = 8; return true; }
     if (TemplateArg(T, "TSoftObjectPtr", &Inner) || TemplateArg(T, "TSoftClassPtr", &Inner)) { *Size = 40; *Align = 8; return true; }

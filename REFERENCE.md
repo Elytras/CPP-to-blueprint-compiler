@@ -5429,7 +5429,7 @@ Notes:
 | `&Obj->Member`, `&Member` | The address of an object's property (`&Member` is one of the class's own), looked up by name at run time. Needs a class named ReadProperty that you supply (see Helper code you supply, below). The result is 0 when the object's class has no such property. | Yes |
 | `&Pv->Y`, `&(*Pv).Y`, `&Items[I].Y`, `&R.Y` | The address of a struct member: where the struct sits plus the member's offset in the game's layout, through any number of members (`&P[I].Inner.Y`). The struct may be memory through a pointer, a TArray element, a reference that keeps an address, or a call that returns a reference. | Yes |
 | `&Obj->Loc.Y`, `&Loc.Y` | The same, with the struct's address found at run time through ReadProperty, as `&Obj->Member`'s is. | Yes |
-| `&H->Distance` with `FHitResult *H` | An engine struct's members are placed from its reflected ones, which is right only when nothing unreflected sits between them. When they do not add up to the struct's size, the build stops: "FHitResult's reflected members take 112 bytes and it takes 136 in the game". Add the offset yourself, from the game's SDK. | Refused |
+| `&C->ExternalCurve` with `FRuntimeCurveLinearColor *C` | An engine struct's members are placed from its reflected ones, which is right only when nothing unreflected sits between them. When the ones UeApi has do not add up to the struct's size, the build stops: "FRuntimeCurveLinearColor's reflected members take 8 bytes and it takes 520 in the game" (its `ColorCurves` array is not in UeApi). Add the offset yourself, from the game's SDK. `&H->Distance` on an `FHitResult *H` is placed, as its weak members are in UeApi. | Refused |
 | `&Local`, `&Param`, `&V.X` of a local struct | A local or a parameter is a Blueprint variable, which has no address the VM hands out. Refused with "a Blueprint variable has none the VM hands out". Point into an object, a TArray element or memory through a pointer instead. | Refused |
 | `&this->K` with `static inline int32 K = 3;` | An inline class variable has no storage: each use is its initializer. Refused with "a static variable has no address". A bare `&K` gets the Blueprint-variable message instead. | Refused |
 
@@ -7114,7 +7114,7 @@ so the retail game prints nothing. See [Strings and text](#strings-and-text) and
   [Pointers and memory](#pointers-and-memory).
 - `TODO: the address of <Struct>::<Member>: <Struct>'s reflected members take <N> bytes and it takes <M> in the game,
   so something unreflected moves them; add the member's offset to the struct's address yourself`: `&P->Member` on an
-  engine struct whose reflected members do not account for its whole layout, such as FHitResult. Fix: take the
+  engine struct whose reflected members do not account for its whole layout, such as FRuntimeCurveLinearColor. Fix: take the
   offset from the game's SDK dump and add it, `(int64)H + 8`. See [Pointers and memory](#pointers-and-memory).
 - `TODO: the address of a member of <Type>, which is not a struct`: `&X.M` where the compiler knows X's type as
   neither a struct nor an object class. Fix: give the pointer its real type.
