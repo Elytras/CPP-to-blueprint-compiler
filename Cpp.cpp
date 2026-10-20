@@ -3271,6 +3271,11 @@ bool FCompiler::Collect(std::string* Err)
                 /* Not a UFunction: AssetGen reads its assignments as defaults, never lowers them. */
                 R.Defaults = &C;
             }
+            else if (Kind(C) == "CXXMethodDecl" && R.bIsInterface && Name(C) == "StaticClass")
+            {
+                /* UE_INTERFACE's: no function of the interface, only what `IFoo::StaticClass()` resolves through. */
+                MethodOwner[C.value("id", std::string())] = R.CppName;
+            }
             else if (Kind(C) == "CXXMethodDecl" && C.contains("name") && !C.value("isImplicit", false))
             {
                 /* genueapi's overload without the world context shares the name; the longer one is the UFunction. */

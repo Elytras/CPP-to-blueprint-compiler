@@ -3268,6 +3268,7 @@ Notes:
 |---|---|---|
 | `Spawner::StaticClass()`, on one of the mod's own classes | Names that class (`Spawner_C`), as the editor's class picker does, although C++ finds the `StaticClass` of the engine parent. It also works written through a macro in the mod's own source. | Yes |
 | `NewObject<UEnemyContext>(this)` | A helper's default `T::StaticClass()` argument names `T`. | Yes |
+| `UKismetSystemLibrary::DoesImplementInterface(Obj, IAimable::StaticClass())`, on one of the mod's own interfaces | Names the interface's class (`IAimable_C`), as `ITargetable::StaticClass()` names a game interface's. `UE_INTERFACE` declares the `StaticClass`; it is no function of the interface asset. | Yes |
 | `Weapons::Rifle::StaticClass()` | Names `Rifle_C`: the qualifier is read in as many parts as it is written with. So does an alias, `using RifleT = Weapons::Rifle;` then `RifleT::StaticClass()`, as [examples/GameBlueprintChild.cpp](examples/GameBlueprintChild.cpp) does. | Yes |
 
 ```cpp

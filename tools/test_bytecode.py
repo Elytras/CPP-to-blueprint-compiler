@@ -7208,6 +7208,22 @@ local_ctor_flags()
 print('ok  LocalCtorFlags: FUNC_HasDefaults on a function with an FHitResult / FTransform / FText / TMap local')
 iface_cast_slot()
 print('ok  IfaceCastSlot: Cast<IHealth> takes the object out of its 16-byte interface value')
+
+
+def iface_static_class():
+    """IfaceStaticClass: a mod interface's StaticClass() is its class as a constant, in a return and a call's argument,
+    and no function of the interface."""
+    base = asset('IfaceStaticClass')
+    keeps_invariants(base)
+    iface = os.path.join(os.path.dirname(base), 'IIscMark')
+    assert 'StaticClass' not in exports_of(iface), exports_of(iface)
+    for fn in ('Which', 'Has'):
+        text = dump('walkscript.py', base, export_index(base, fn))
+        assert re.search(r"ObjectConst\s+imp\[\d+\]:BlueprintGeneratedClass'IIscMark_C'", text), (fn, text)
+
+
+iface_static_class()
+print('ok  IfaceStaticClass: IIscMark::StaticClass() on a mod interface names IIscMark_C')
 derived_literal('Angle', '/Script/Engine.LightmassDirectionalLightSettings')
 # What EX_StructConst writes of each struct the Transient tests build, in PropertyLink order: never the Transient member.
 TRANSIENT_LINK = {'MaterialAttributesInput': ['OutputIndex', 'InputName', 'ExpressionName'], 'TimerHandle': []}
