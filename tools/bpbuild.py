@@ -426,20 +426,28 @@ def write_vs_filters(bp):
         elif f.endswith(".h"):
             rows.append(("ClInclude", f, "Helpers"))
     # A mod in its own folder (`MyMod/`) gets a filter of its own under Mods (`Mods\MyMod`), nested as the folders
-    # are. Its GUID is derived from the name, so a rewrite does not churn it.
+    # are; everything under `Tests/` (the test mods and each mod's behaviour tests, .py included) goes under Tests
+    # instead. Generated headers and build output are skipped at any depth (a game's own `RC/UeApi` is thousands of
+    # files). A filter's GUID is derived from its name, so a rewrite does not churn it.
     filters = list(VS_FILTERS)
+    def add_filter(folder):
+        filters.append((folder, str(uuid.uuid5(uuid.NAMESPACE_URL, "bpmods:" + folder.lower()))))
     for root, dirs, files in os.walk(bp):
-        dirs[:] = sorted((d for d in dirs if root != bp or d not in ("build", "out") + GENERATED), key=str.lower)
+        dirs[:] = sorted((d for d in dirs if d not in ("build", "out", "__pycache__") + GENERATED), key=str.lower)
         if root != bp:
-            folder = "Mods\\" + os.path.relpath(root, bp)
-            filters.append((folder, str(uuid.uuid5(uuid.NAMESPACE_URL, "bpmods:" + folder.lower()))))
+            rel = os.path.relpath(root, bp)
+            test = rel.split(os.sep)[0] == "Tests"
+            folder = rel if test else "Mods\\" + rel
+            if folder != "Tests":
+                add_filter(folder)
             for f in sorted(files, key=str.lower):
-                if f.endswith((".cpp", ".h")):
-                    rows.append(("ClCompile" if f.endswith(".cpp") else "ClInclude",
-                                 os.path.relpath(os.path.join(root, f), bp), folder))
+                if f.endswith((".cpp", ".h")) or (test and f.endswith(".py")):
+                    kind = "ClCompile" if f.endswith(".cpp") else "ClInclude" if f.endswith(".h") else "None"
+                    rows.append((kind, os.path.relpath(os.path.join(root, f), bp), folder))
     # The compiler's own test mods (their headers and tests/ast too, not the test run's build/) and the headers any mod
     # may include live beside it, in AssetGen.
-    for sub, folder in (("tests", "Tests"), ("include", "Helpers")):
+    add_filter("Tests\\AssetGen")
+    for sub, folder in (("tests", "Tests\\AssetGen"), ("include", "Helpers")):
         d = os.path.join(bp, "..", "AssetGen", sub)
         for root, dirs, files in os.walk(d):
             dirs[:] = sorted((x for x in dirs if x != "build"), key=str.lower)
