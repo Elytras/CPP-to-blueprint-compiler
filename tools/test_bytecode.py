@@ -3155,6 +3155,32 @@ def mod_enum():
     print('ok  TypesTest: int32 / int64 enums cook as EnumProperty over Int / Int64Property')
 
 
+def enum_labels():
+    """`__UeEnumNames`: an enumerator keeps its C++ name, takes a cooked one, or a label: the DisplayNameMap holds the
+    labelled and renamed ones (keyed by cooked name), and nothing for the rest."""
+    import struct
+    path = os.path.join(os.path.dirname(asset('EnumLabels')), 'ELabel')
+    names = dumpexp.load(path)[3]
+    proves('mod-enums-ue.static-constexpr-const-char-emood-ueenumnames')
+    for n in ('ELabel::None_', 'ELabel::Hit_Override', 'ELabel::Plain', 'ELabel::NewEnumerator7'):
+        assert n in names, (n, names)
+    tags = dump('dumptags.py', path, '0')
+    raw = bytes.fromhex(tags.split('value=TextProperty:')[1].split()[0])
+    count, at, shown = struct.unpack_from('<i', raw, 4)[0], 8, {}
+
+    def fstr(at):
+        n = struct.unpack_from('<i', raw, at)[0]
+        return raw[at + 4:at + 4 + n - 1].decode() if n > 0 else '', at + 4 + max(n, 0)
+    for _ in range(count):
+        key = names[struct.unpack_from('<i', raw, at)[0]]
+        at += 8 + 4 + 1                     # FName, the text's flags, its history type (Base)
+        _ns, at = fstr(at)
+        _key, at = fstr(at)
+        shown[key], at = fstr(at)
+    assert shown == {'None_': 'None', 'Hit_Override': 'Hit Override', 'NewEnumerator7': 'Old'}, shown
+    print('ok  EnumLabels: __UeEnumNames labels and renames enumerators; the rest keep their C++ names')
+
+
 def fnv(s):
     h = 2166136261
     for c in s.encode(): h = ((h ^ c) * 16777619) & 0xFFFFFFFF
@@ -3754,6 +3780,7 @@ def pointer_more():
 
 
 mod_enum()
+enum_labels()
 constants()
 types_behaviour()
 types_defaults()
