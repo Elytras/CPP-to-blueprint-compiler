@@ -782,7 +782,9 @@ UE's C++ API: `Add`, `Contains`, `Find(Key, Out)`, `Keys(OutArray)`, `Num()` and
 through reference parameters. `Map[Key]` reads with the Find node: you get a copy of the value, or the value type's
 default for a missing key, and nothing is added. `Map[Key] = V`, `+=` and `++` store with the Add node. A range-for
 with `auto& [Key, Value]` walks the map where it lives, so a write to `Value` changes the map. A range-for over a
-call, `for (int32 X : GetItems())`, runs the call once and walks its result. A container inside a
+call, `for (int32 X : GetItems())`, runs the call once and walks its result.
+`for (auto &[Item, Index] : Items.Enumerate())` gives each element where it lives together with its index, which the
+body cannot assign; `const auto &` makes Item read-only too. A container inside a
 container works through a generated wrapper struct ([Containers](REFERENCE.md#containers) says where it is cooked).
 A container of objects passes where one of a base class is wanted, as the editor links an Actor array pin to an Object
 array one: a `TArray<APawn *>` for a `const TArray<AActor *>&` or by-value parameter, or assigned to a

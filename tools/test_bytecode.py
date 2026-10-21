@@ -8100,6 +8100,52 @@ covariant_containers()
 print('ok  CovariantContainers: TArray / TSet / TMap of objects pass where a base class\'s is wanted (parameters, '
       'members, locals, a struct member, returns, an engine parameter); interfaces, downcasts, unrelated and scalar '
       'types and a non-const reference are refused  (8 refusals)')
+
+
+def range_enumerate():
+    """RangeEnumerate: `for (auto& [Item, Index] : Items.Enumerate())` writes through Item into the array (a struct
+    element's member, an array inside a struct) with Index counting from 0; const reads in place, a copy changes
+    nothing, return / continue / nesting keep each loop's own index, and the length is read once. Clang refuses a write
+    to the index in every form of the loop and a write through a const Item; Enumerate() outside a range-for is
+    refused, and a TSet has none."""
+    base = asset('RangeEnumerate')
+    keeps_invariants(base)
+    proves('range-for-over.for-auto-item-index-items')
+
+    def ran(fn, items, **parms):
+        mine = {'Items': list(items)}
+        return run(base, fn, self_vars=mine, **parms)[0], mine['Items']
+    assert ran('Bump', [1, 2, 3]) == (None, [1, 12, 23])
+    mine = {'Points': [{'X': 0.0, 'Y': 0.0, 'Z': 9.0}, {'X': 1.0, 'Y': 1.0, 'Z': 9.0}]}
+    run(base, 'Lift', self_vars=mine)
+    assert [p['Z'] for p in mine['Points']] == [0.0, 1.0], mine
+    assert ran('Weighted', [5, 6, 7]) == (6 + 14, [5, 6, 7])
+    assert ran('Copies', [5, 6, 7]) == (18 + 3, [5, 6, 7]), 'a by-value Item wrote back'
+    assert [ran('Find', [5, 6, 7], X=x)[0] for x in (5, 7, 4)] == [0, 2, -1]
+    assert ran('Odd', [1, 2, 3, 4, 5])[0] == 2 + 4
+    assert ran('Pairs', [1, 2, 1, 1, 3])[0] == 3
+    assert ran('Grow', [4, 5]) == (1, [4, 5, 4, 5])
+    mine = {'Items': [1, 2, 3], 'Bag': {}}
+    run(base, 'Deep', self_vars=mine)
+    assert list(mine['Bag'].values()) == [[1, 102, 203]], mine['Bag']
+    proves('range-for-over.index-0', 'range-for-over.auto-e-items-enumerate')
+    const = r"cannot assign to variable '%s' with const-qualified type 'const %s"
+    for mod, body, pattern in (
+            ('EnIndex', 'for (auto &[Item, Index] : Items.Enumerate()) Index = 0;', const % ('Index', 'int32')),
+            ('EnIndexInc', 'for (auto &[Item, Index] : Items.Enumerate()) ++Index;', const % ('Index', 'int32')),
+            ('EnIndexCopy', 'for (auto [Item, Index] : Items.Enumerate()) Index += 1;', const % ('Index', 'int32')),
+            ('EnConstItem', 'for (const auto &[Item, Index] : Items.Enumerate()) Item = 0;', const % ('Item', 'int')),
+            ('EnConstMember', 'for (const auto &[P, I] : Points.Enumerate()) P.Z = 1;', const % ('P', 'FVector')),
+            ('EnSet', 'for (auto &[Item, Index] : Seen.Enumerate()) {}', r"no member named 'Enumerate' in 'TSet<int>'"),
+            ('EnLocal', 'auto E = Items.Enumerate();', r'unimplemented local E: TEnumerated<int>')):
+        refused_naming(mod, '  TArray<int32> Items;\n  TArray<FVector> Points;\n  TSet<int32> Seen;\n'
+                            '  void F() { %s }\n' % body, pattern)
+
+
+range_enumerate()
+print('ok  RangeEnumerate: Items.Enumerate() binds each element in place and its index; const and by-value forms, '
+      'return / continue / nesting, an array in a struct; writes to the index or a const element are refused  '
+      '(7 refusals)')
 set_operators()
 print('ok  SetOperators: set + - & are Set_Union / Set_Difference / Set_Intersection, chained and in a loop')
 no_world_warning()

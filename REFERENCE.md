@@ -1758,6 +1758,9 @@ a build a loop that never ends hangs the game instead of being stopped.
 | <a id="range-for-over.for-int32-x-items"></a>`for (int32 X : Items)` | The editor's ForEachLoop: the array is walked by index, and X is a fresh copy on each pass, so assigning to X never changes the array. | Yes |
 | <a id="range-for-over.for-int32-x-items-2"></a>`for (int32 &X : Items)` | X is another name for `Items[Index]`, so writes land in the array. `const T&` and `auto&&` work the same way. ForEachLoop's element is a copy, so it has no equivalent. | Yes |
 | <a id="range-for-over.for-auto-x-y-points"></a>`for (auto [X, Y] : Points)` | A structured binding over TArray or TSet elements is refused ("a structured binding over a TArray"). Bind the element, `for (const FIntPoint &P : Points)`, and read `P.X`. | Refused |
+| <a id="range-for-over.for-auto-item-index-items"></a>`for (auto &[Item, Index] : Items.Enumerate())` | The element and its index together, walked by index like `for (int32 &X : Items)`: Item is `Items[Index]` where it lives, so writes land in the array (a struct element's members too), and Index counts from 0. `const auto&` reads in place; `auto [Item, Index]` copies the element on each pass. A method, because `auto &[A, B] : Items` already means unpacking each element. TArray only. | Yes |
+| <a id="range-for-over.index-0"></a>`Index = 0;`, `++Index` in that loop; `Item = 0;` under `const auto &[Item, Index]` | Refused by clang: `cannot assign to variable 'Index' with const-qualified type 'const int32'`, and the same for a const Item. The index is the loop's own, so no form of the loop lets the body change it. | Refused |
+| <a id="range-for-over.auto-e-items-enumerate"></a>`auto E = Items.Enumerate();` | Refused ("unimplemented local E: TEnumerated<int>"): Enumerate() is only a range-for's range. `S.Enumerate()` on a TSet or TMap is clang's "no member named 'Enumerate'". | Refused |
 
 ```cpp
 TArray<int32> Items;
