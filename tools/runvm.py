@@ -125,6 +125,8 @@ class VM:
         s.base, s.natives, s.objects = base, dict(natives or {}), objects if objects is not None else {}
         s.exports = {e['name'] for e in dumpexp.load(base)[5]}
         s.self = Obj(os.path.basename(base) + '_C', **self_vars)
+        # The class default object, which a static call runs on (an EX_ObjectConst of it): this VM's self.
+        s.objects.setdefault('Default__' + s.self.cls, s.self)
         s.frames, s.latent, s.binds, s.log, s.scripts, s.mem = {}, [], [], [], {}, {}
         s.isa = isa or (lambda o, cls: isinstance(o, Obj) and o.cls == cls)
         s.null_rvalues = False      # True: an EX_Context on None does what ProcessContextOpcode does (none_context)
@@ -265,6 +267,28 @@ class VM:
                     if runscript.same_case(key, ev(key), v): return ev(res)
                 raise SystemExit('vm: SwitchValue at mem %d: no case is %r, a script exception in game' % (n.mem, v))
             name = n.val
+            lib = runscript.library_of(s.base, n)
+            if lib and name not in s.natives and name not in globals().get('OUT_NATIVES', ()):   # a test's fake wins
+                # A function library's static in another package of the build: its own function runs, on its class's
+                # default object, in a VM of that package; its reference parameters write back as an own call's do.
+                cls = os.path.basename(lib[0]) + '_C'
+                s.classes.setdefault(cls, lib[0])
+                s._peers.setdefault(s.self.cls, s)         # the library's calls back on this object run here
+                v = s.peer(cls)
+                v.ref_params = s.ref_params
+                vals = [ev(a) for a in n.kids]
+                first = len(v.env_log)
+                r = v.call(lib[1], *vals)
+                if s.ref_params: v.ref_writeback(lib[1], n.kids, v.env_log[first], store)
+                return None if r is STALE and not keep else r
+            back = s._peers.get(ctx.cls) if isinstance(ctx, Obj) and ctx.cls != s.self.cls and o != 0x68 else None
+            if back is not None and name in back.exports:
+                # A call from a library's VM on an object of a class that called into it: that class's function runs.
+                vals = [ev(a) for a in n.kids]
+                first = len(back.env_log)
+                r = back.call(name, *vals, on=ctx)
+                if s.ref_params and back.ref_params: back.ref_writeback(name, n.kids, back.env_log[first], store)
+                return None if r is STALE and not keep else r
             if o in (0x1B, 0x45, 0x1C, 0x46, 0x68) and name in s.exports and (ctx is me or ctx.cls == s.self.cls):
                 # A reference argument is stepped with no result buffer (ProcessScriptFunction): it must be a variable.
                 for parm, a in zip(s.script(name)[2], n.kids):
@@ -331,7 +355,7 @@ class VM:
             if isinstance(st, (dict, runscript.Slot, runscript.Free)): return lambda v: st.__setitem__(dest.val, v)
             return lambda v: store(dest, v, ctx)
 
-        pc = 0
+        pc, flow = 0, []                                    # flow: the execution-flow stack, as runscript keeps it
         for _ in range(100000):
             n = stmts[pc]; o = n.op; pc += 1
             named = o == 0xF and n.kids[1].op == 0x2F and s.struct_const \
@@ -384,6 +408,11 @@ class VM:
             elif o == 7:
                 if not ev(n.kids[0]): pc = at[n.val]
             elif o == 0x4E: pc = at[ev(n.kids[0])]
+            elif o == 0x4C: flow.append(n.val)              # PushExecutionFlow
+            elif o == 0x4D or (o == 0x4F and not ev(n.kids[0])):    # PopExecutionFlow / PopExecutionFlowIfNot
+                if not flow: raise SystemExit('vm: pop from an empty flow stack in ' + fn)
+                pc = at[flow.pop()]
+            elif o == 0x4F: pass
             elif o == 4: return None if n.kids[0].op == 0xB else ev(n.kids[0], keep=True)
             elif o == 0x31: store(n.kids[0], [ev(k) for k in n.kids[1:]])   # SetArray: the variable, emptied, then each element
             elif o != 0xB: ev(n)
