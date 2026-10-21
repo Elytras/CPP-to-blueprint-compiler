@@ -2839,6 +2839,85 @@ print('ok  FinalAsTest: UE_FINAL_AS over another mod\'s base in a header of this
       'owner\'s sources include it is not')
 
 
+# ---- NaturalForms
+
+def natural_forms():
+    """Forms written as C++ writes them. A function library's static is called, not copied in, unless it is
+    [[gnu::always_inline]] (copied in, the function kept) or `inline` (copied in, no function). `==` / `!=` over bytes
+    compare the bytes, and keep C++'s answer for a constant that is no byte. A `switch` runs as C++'s does, a value no
+    case names included (runscript stops on an EX_SwitchValue that matches no case: a LogScript warning in game)."""
+    lib = asset('NaturalForms')
+    user = os.path.join(os.path.dirname(lib), 'NfUser')
+    named = lambda base, fn: {name for name, _ in calls_in(base, fn)}
+    vm = VM(lib)
+    vm.objects['Default__NaturalForms_C'] = vm.self                 # a library call runs on the class default object
+    for v in (-7, 0, 5, 2**29):
+        assert vm.call('UseLib', V=v) == i32(2 * v + 3 * v + cdiv(v, 2)), v
+    assert 'Twice' in named(lib, 'UseLib') and 'Thrice' not in named(lib, 'UseLib'), calls_in(lib, 'UseLib')
+    assert {'Twice', 'Thrice', 'UseLib'} <= set(exports_of(lib)) and 'Half' not in exports_of(lib), exports_of(lib)
+    assert 'Twice' in named(user, 'CallsLib') and 'Thrice' not in named(user, 'CallsLib'), calls_in(user, 'CallsLib')
+    runscript.MATH['Twice'] = lambda v: i32(v * 2)
+    try:
+        for v in (-7, 0, 5):
+            assert run(user, 'CallsLib', V=v)[0] == 5 * v, v
+    finally:
+        del runscript.MATH['Twice']
+    print('ok  NaturalForms: a library static is called unless always_inline; an inline one has no function')
+
+    def chk(fn, oracle, cases, self_vars=None):
+        for parms in cases:
+            mine = dict(self_vars or {})
+            got = run(user, fn, self_vars=mine, **parms)[0]
+            want = oracle(**parms, **(self_vars or {}))
+            assert got == want, '%s(%s) = %r, want %r' % (fn, parms, got, want)
+
+    B = (0, 1, 7, 9, 200, 254, 255)
+    chk('ByteEq', lambda A, B: (A == B) + 10 * (A != B), [dict(A=a, B=b) for a in B for b in (0, 7, 255)])
+    chk('ByteConst', lambda A: (A == 255) + 10 * (A != 0) + 1000, [dict(A=a) for a in B])
+    chk('MoodIs', lambda M: (M == 200) + 10 * (M != 7), [dict(M=m) for m in B])
+    chk('PlainIs', lambda A: (A == 9) + 10 * (A != 0), [dict(A=a) for a in B])
+    for b in (0, 7, 200):
+        for m in (0, 7, 200):
+            chk('MemberIs', lambda Byte, Mood: (Byte == Mood) + 10 * (Byte == 7), [{}], dict(Byte=b, Mood=m))
+    for fn in ('ByteEq', 'MoodIs', 'PlainIs', 'MemberIs'):
+        assert 'Conv_ByteToInt' not in named(user, fn) and named(user, fn) & {'EqualEqual_ByteByte', 'NotEqual_ByteByte'}, \
+            (fn, calls_in(user, fn))
+    print('ok  NaturalForms: == / != over bytes compare the bytes')
+
+    chk('Wide', lambda V: {1: 10, 5000000000: 20, -7: 30}.get(V, 0),
+        [dict(V=v) for v in (1, 5000000000, -7, 0, 5000000000 & 0xFFFFFFFF, 2**40, -2**63)])
+    chk('OnMood', lambda M: {0: 11, 7: 10, 200: 100}.get(M, 0), [dict(M=m) for m in (0, 3, 7, 200, 255)])
+    chk('OnWide', lambda W: {-5: 1, 100000: 3}.get(W, -1), [dict(W=w) for w in (-5, 0, 7, 100000, -2**31)])
+    chk('OnlyDefault', lambda V: i32(V * 2), [dict(V=v) for v in (-3, 0, 2**30)])
+    chk('Empty', lambda V: V + 1, [dict(V=v) for v in (-3, 0, 41)])
+    chk('Nested', lambda A, B: (1 if B == 0 else 3 if B == 1 else 2) if A == 0 else 4 if A == 1 else 5,
+        [dict(A=a, B=b) for a in (-1, 0, 1, 2) for b in (-1, 0, 1, 2)])
+    pick = lambda v: {2: 20, 3: 30}.get(v, 0)
+    chk('PickTwice', lambda A, B: pick(A) * 100 + pick(B), [dict(A=a, B=b) for a in (1, 2, 3) for b in (0, 2, 3)])
+
+    def in_loop(N):
+        r = 0
+        for i in range(N):
+            k = i % 4
+            if k == 0: continue
+            if k == 1: r += 1; continue
+            if k == 3: r += 100
+            r += 10
+        return r
+    chk('InLoop', in_loop, [dict(N=n) for n in (0, 1, 2, 4, 9, 30)])
+    for code, want in ((4, 40), (9, 90), (5, -1)):
+        vm = VM(user, {'Delay': latent_call}, Stage=0, Seen=0)
+        vm.call('Waits', Code=code)
+        assert vm.self.vars['Stage'] == 1 and len(vm.latent) == 1, vm.self.vars
+        vm.fire(0)
+        assert vm.self.vars == dict(Stage=want, Seen=1), (code, vm.self.vars)
+    print('ok  NaturalForms: switch on int, int64, byte and enum values, with fallthrough, break, continue, nesting, '
+          'an inline expanded twice and a wait')
+
+
+natural_forms()
+
+
 # ---- NestedTest
 
 def nested_containers():

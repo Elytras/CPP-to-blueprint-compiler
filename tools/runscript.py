@@ -595,6 +595,12 @@ CONTAINERS = {
 BARE_CONTAINERS = {'ArrayProperty', 'SetProperty', 'MapProperty'}
 
 
+def same_case(key, k, v):
+    """An EX_SwitchValue case matches by its index property's Identical: an FName's compares the comparison index, so
+    a NameConst case ignores case, as EqualEqual_NameName does."""
+    return str(k).lower() == str(v).lower() if key.op == 0x21 else k == v
+
+
 def run(base, function, self_vars=None, **parms):
     stmts = script_of(base, function)
     at = {n.mem: i for i, n in enumerate(stmts)}
@@ -697,7 +703,7 @@ def run(base, function, self_vars=None, **parms):
                 raise SystemExit('SwitchValue at mem %d: its index (op %02x) leaves no address' % (n.mem, n.kids[0].op))
             v = ev(n.kids[0])
             for key, res in n.val:
-                if ev(key) == v: return ev(res)
+                if same_case(key, ev(key), v): return ev(res)
             raise SystemExit('SwitchValue at mem %d: no case is %r, a script exception in game' % (n.mem, v))
         raise SystemExit('unsupported expression op %02x at mem %d' % (o, n.mem))
 

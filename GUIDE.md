@@ -38,7 +38,7 @@ Each piece of C++ becomes the Blueprint construct the editor would have made:
 | `UE_PURE int32 Doubled() const { ... }` | A pure function, drawn without exec pins |
 | Static methods of a class deriving `UBlueprintFunctionLibrary` | A Blueprint Function Library |
 | A variable at namespace scope, `int32 Total = 0;` | No Blueprint has globals: a class that AssetGen generates holds it in its default object |
-| `if`, `switch`, `for`, `while` | The Branch node, Switch on Int / Enum, the ForLoop and WhileLoop macros, compiled to jumps |
+| `if`, `switch`, `for`, `while` | The Branch node, Switch on Int / Enum (one jump through a table), the ForLoop and WhileLoop macros, compiled to jumps |
 | `Cast<APawn>(Obj)` | The Cast To node |
 | `UKismetSystemLibrary::Delay(2.0f);` | A latent node: the function becomes part of the class's event graph and resumes when the delay ends |
 
@@ -335,7 +335,9 @@ reaches the same body.
 
 `UE_PURE` makes a pure function, drawn without exec pins. A `T&` parameter is an output, a pass-by-reference pin. A
 `static` method runs on the class default object (the instance that holds Class Defaults), which has no world, so give
-it a `UObject *WorldContextObject` parameter if it calls the engine. A method that waits follows extra rules, in
+it a `UObject *WorldContextObject` parameter if it calls the engine. A static of a function library
+(`UBlueprintFunctionLibrary`) is always called, as the editor's library nodes are, unless you mark it
+`[[gnu::always_inline]]` to have its body copied into each caller, or make it `inline` to have no function at all. A method that waits follows extra rules, in
 [Timers, waiting and input](#timers-waiting-and-input).
 
 ```cpp

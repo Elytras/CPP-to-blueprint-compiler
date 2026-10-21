@@ -257,6 +257,13 @@ class VM:
                     size, read, _ = runscript.view_of(n.kids[0].val)
                     return read(at + ev(n.kids[1]) * size)
             if o == 0x6B: return ev(n.kids[0])[ev(n.kids[1])]
+            if o == 0x69:                                   # SwitchValue, as runscript runs it: a miss is a script exception
+                if n.kids[0].op not in runscript.ADDRESSABLE:
+                    raise SystemExit('vm: SwitchValue at mem %d: its index (op %02x) leaves no address' % (n.mem, n.kids[0].op))
+                v = ev(n.kids[0])
+                for key, res in n.val:
+                    if runscript.same_case(key, ev(key), v): return ev(res)
+                raise SystemExit('vm: SwitchValue at mem %d: no case is %r, a script exception in game' % (n.mem, v))
             name = n.val
             if o in (0x1B, 0x45, 0x1C, 0x46, 0x68) and name in s.exports and (ctx is me or ctx.cls == s.self.cls):
                 # A reference argument is stepped with no result buffer (ProcessScriptFunction): it must be a variable.

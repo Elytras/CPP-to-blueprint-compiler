@@ -704,7 +704,8 @@ uint32 AccessFlagsOf(const Json& Decl)
     return Flags;
 }
 
-/* An attribute clang put on the declaration: `final` (FinalAttr), `noinline` in any spelling (NoInlineAttr). */
+/* An attribute clang put on the declaration: `final` (FinalAttr), `noinline` or `always_inline` in any spelling
+   (NoInlineAttr, AlwaysInlineAttr). */
 bool HasAttr(const Json& Decl, const char* AttrKind)
 {
     bool bHas = false;
@@ -1295,11 +1296,9 @@ struct FStmtIR
     bool bConstCond = false;                        // While: Cond is a constant (PruneConstBranches), so no test is emitted
     bool bJumpOut = false;                          // If: Then is one break / continue, taken when Cond is FALSE: a
                                                     // single JumpIfNot straight to where it goes
-    std::vector<FArgIR> CaseTests;                  // Switch: per case, true when the value does NOT match
+    std::vector<FArgIR> CaseConsts;                 // Switch: each case's constant, of the temp's type; case I labels I
     int32 LabelId = -1;                             // Label: the case it marks, -1 if no value can; Switch: the default's label, or -1;
                                                     // Goto / GotoLabel: the label, unique in the class
-    std::vector<int64> CaseValues;                  // Switch: each case's constant, in CaseTests order
-    int32 SwitchWidth = 4;                          // Switch: the value's size, 1 / 4 / 8; 0 for an FName
     FArgIR SwitchValue;                             // Switch: the temp the value was stored in
     bool bAssignLocal = false;
     bool bAssignOutParm = false;
@@ -2642,100 +2641,48 @@ void EmitStmts(const std::vector<FStmtIR>& Stmts, FScript& S, FIndex SelfExp, FL
 
         case FStmtIR::Switch:
         {
-            /* The case values split into runs, then the body in order, so a case with no `break` falls through.
-               A run of 3+ cases whose range is at most 4x its case count (int32 / uint8 only) is a jump table: a
-               bounds check that skips to the next run, then EX_ComputedJump to Table + (Value - Min) * 5, a table
-               of 5-byte EX_Jumps, the way the ubergraph entry dispatches. A 5-byte slot against a ~30-byte compare
-               keeps a hole-y table smaller than the chain. The other cases are one JumpIfNot(Value != Case) each,
-               straight to their label. A miss goes to `default`, or past the body.
-               ponytail: runs are tried in order, a binary search over their bounds if switches grow many runs. */
-            const size_t NumCases = St.CaseTests.size();
-            struct FRun { int64 Min, Max; std::vector<size_t> Cases; };
-            std::vector<FRun> Runs;
-            std::vector<size_t> Singles;
-            if (St.SwitchWidth == 1 || St.SwitchWidth == 4)
-            {
-                std::vector<size_t> Order(NumCases);
-                for (size_t I = 0; I < NumCases; ++I) Order[I] = I;
-                std::sort(Order.begin(), Order.end(), [&](size_t L, size_t R) { return St.CaseValues[L] < St.CaseValues[R]; });
-                for (size_t I : Order)
-                {
-                    const int64 V = St.CaseValues[I];
-                    if (!Runs.empty() && V - Runs.back().Min + 1 <= int64(Runs.back().Cases.size() + 1) * 4 && V - Runs.back().Min < 1024)
-                    { Runs.back().Max = V; Runs.back().Cases.push_back(I); }
-                    else Runs.push_back({ V, V, { I } });
-                }
-                for (auto It = Runs.begin(); It != Runs.end();)
-                    if (It->Cases.size() < 3) { Singles.insert(Singles.end(), It->Cases.begin(), It->Cases.end()); It = Runs.erase(It); }
-                    else ++It;
-                std::sort(Singles.begin(), Singles.end());      // source order, as the chain always was
-            }
+            /* One evaluation and one jump: EX_ComputedJump on an EX_SwitchValue over the value's temp, each case's
+               result the code offset of its label, the default's that of `default` or of the end. execSwitchValue
+               (ScriptCore.cpp 2519) compares each case with the temp where it lies, by Identical, so a byte, an int,
+               an int64 and a name alike, and evaluates the matched result alone. The body follows in order, so a case
+               with no `break` falls through. The offsets are patched once the body is emitted: nothing moves code
+               after that, and ThreadJumps rewrites only jump operands.
+               A value no case matches must not reach the default term: execSwitchValue throws a script exception
+               first (2565-2575), which in game logs a LogScript warning and a stack trace on every miss. So the last
+               case's value is the temp itself, which always matches, and its result is the miss's offset. */
+            const size_t NumCases = St.CaseConsts.size();
+            std::vector<int32> CaseAt(NumCases), MissAt;
+            if (NumCases == 0) MissAt.push_back(S.Jump(0));
             else
-                for (size_t I = 0; I < NumCases; ++I) Singles.push_back(I);
-
+                S.ComputedJump([&](FScript& C) {
+                    auto Offset = [&C](int32& At) { C.Op(EX_IntConst); At = C.StorageSize(); C.RawInt32(0); };
+                    C.Op(EX_SwitchValue);
+                    const uint16 Count = uint16(NumCases + 1);
+                    C.Raw(&Count, sizeof Count, sizeof Count);
+                    const int32 ToEnd = C.StorageSize();
+                    C.RawInt32(0);
+                    EmitArg(C, St.SwitchValue, SelfExp, nullptr);
+                    for (size_t I = 0; I <= NumCases; ++I)
+                    {
+                        EmitArg(C, I < NumCases ? St.CaseConsts[I] : St.SwitchValue, SelfExp, nullptr);
+                        const int32 ToNext = C.StorageSize();
+                        C.RawInt32(0);
+                        Offset(I < NumCases ? CaseAt[I] : MissAt.emplace_back());
+                        C.PatchJumpTarget(ToNext, C.MemorySize());
+                    }
+                    Offset(MissAt.emplace_back());          // the default term, never reached
+                    C.PatchJumpTarget(ToEnd, C.MemorySize());
+                });
             FLoopPatches Inner;
             std::vector<int32> LabelAt(NumCases + 1, -1);
-            std::vector<std::pair<int32, size_t>> ToLabel;              // a patch, and the case it jumps to
-            std::vector<std::pair<int32, int64>> TableEntries;          // a table slot, and its value
-            int32 Miss = 0;
-            FArgIR Value = St.SwitchValue;
-            if (!Runs.empty() && St.SwitchWidth == 1)
-            {
-                FArgIR Byte = Value;
-                Value = FArgIR();
-                Value.K = FArgIR::Call;
-                Value.Sub = std::make_shared<FCallIR>();
-                Value.Sub->Fn = St.Call.Fn;             // Conv_ByteToInt, resolved when lowering
-                Value.Sub->Args = { Byte };
-            }
-            auto Int = [](int64 V) { FArgIR A; A.K = FArgIR::Int; A.I = int32(V); return A; };
-            auto Bool = [](bool V) { FArgIR A; A.K = FArgIR::Bool; A.B = V; return A; };
-            for (const FRun& Run : Runs)
-            {
-                FArgIR InRange;
-                InRange.K = FArgIR::Call;
-                InRange.Sub = std::make_shared<FCallIR>();
-                InRange.Sub->Fn = St.Call.Extra;        // InRange_IntInt
-                InRange.Sub->Args = { Value, Int(Run.Min), Int(Run.Max), Bool(true), Bool(true) };
-                const int32 NextRun = S.JumpIfNot(0, [&InRange, SelfExp](FScript& C) { EmitArg(C, InRange, SelfExp, nullptr); });
-
-                /* Offset = Value * 5 + (Table - Min * 5); the constant is patched once the table's offset is known. */
-                int32 BaseAt = 0;
-                S.ComputedJump([&](FScript& C) {
-                    C.CallMath(St.Call.Extra2);         // Add_IntInt
-                    C.CallMath(St.Target.Fn);           // Multiply_IntInt
-                    EmitArg(C, Value, SelfExp, nullptr);
-                    C.IntConst(5);
-                    C.EndFunctionParms();
-                    C.Op(EX_IntConst);
-                    BaseAt = C.StorageSize();
-                    C.RawInt32(0);
-                    C.EndFunctionParms();
-                });
-                S.PatchJumpTarget(BaseAt, int32(S.MemorySize() - Run.Min * 5));
-                for (int64 V = Run.Min; V <= Run.Max; ++V) TableEntries.push_back({ S.Jump(0), V });
-                S.PatchJumpTarget(NextRun, S.MemorySize());
-            }
-            for (size_t I : Singles)
-            {
-                const FArgIR& Test = St.CaseTests[I];
-                ToLabel.push_back({ S.JumpIfNot(0, [&Test, SelfExp](FScript& C) { EmitArg(C, Test, SelfExp, nullptr); }), I });
-            }
-            Miss = S.Jump(0);
             for (const FStmtIR& B : *St.Body)
             {
                 if (B.K == FStmtIR::Label) { if (B.LabelId >= 0) LabelAt[B.LabelId] = S.MemorySize(); continue; }
                 EmitStmts({ B }, S, SelfExp, &Inner, Returns);
             }
             const int32 End = S.MemorySize();
-            const int32 MissTarget = St.LabelId >= 0 ? LabelAt[St.LabelId] : End;
-            S.PatchJumpTarget(Miss, MissTarget);
-            for (const auto& [Patch, Case] : ToLabel) S.PatchJumpTarget(Patch, LabelAt[Case]);
-            for (const auto& [Patch, V] : TableEntries)
-            {
-                const auto Hit = std::find(St.CaseValues.begin(), St.CaseValues.end(), V);
-                S.PatchJumpTarget(Patch, Hit == St.CaseValues.end() ? MissTarget : LabelAt[Hit - St.CaseValues.begin()]);
-            }
+            for (int32 P : MissAt) S.PatchJumpTarget(P, St.LabelId >= 0 ? LabelAt[St.LabelId] : End);
+            for (size_t I = 0; I < NumCases; ++I) S.PatchJumpTarget(CaseAt[I], LabelAt[I]);
             for (int32 P : Inner.Breaks) S.PatchJumpTarget(P, End);
             if (Loop) for (int32 P : Inner.Continues) Loop->Continues.push_back(P);
             break;
@@ -2821,7 +2768,7 @@ struct FLocalRenamer
             Call(St.Target);
             Call(St.Call);
             for (FArgIR* A : { &St.Var, &St.Value, &St.Cond, &St.SwitchValue }) Arg(*A);
-            for (FArgIR& A : St.CaseTests) Arg(A);
+            for (FArgIR& A : St.CaseConsts) Arg(A);
             for (auto* L : { &St.Then, &St.Else, &St.Body, &St.Inc, &St.Trailer }) if (*L) List(**L);
         }
     }
@@ -2919,7 +2866,7 @@ struct FWildcardContexts
             Call(St.Target);
             Call(St.Call);
             for (FArgIR* A : { &St.Var, &St.Value, &St.Cond, &St.SwitchValue }) Arg(*A);
-            for (FArgIR& A : St.CaseTests) Arg(A);
+            for (FArgIR& A : St.CaseConsts) Arg(A);
             for (auto* L : { &St.Then, &St.Else, &St.Body, &St.Inc, &St.Trailer }) if (*L) List(**L);
         }
     }
@@ -6913,6 +6860,35 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             Out.Sub->Args = { std::move(L), std::move(R) };
             return true;
         }
+        /* `X != Y` over bytes (a uint8, a byte enum, `(uint8)E::A`, a constant 0..255): C++ promotes both sides to int,
+           a Conv_ByteToInt each and an int compare. Equality is the same either way, so it is EqualEqual_ByteByte /
+           NotEqual_ByteByte, the editor's == on bytes and enums. A constant that is no byte (`X == 300`) keeps the int
+           compare, which C++ answers false. */
+        struct FByteSide { const Json* Value = nullptr; int64 Const = -1; };
+        auto ByteSide = [this](const Json* S) {
+            FByteSide B;
+            const Json* In = S && Kind(*S) == "ImplicitCastExpr" && S->value("castKind", std::string()) == "IntegralCast" ? First(*S) : S;
+            if (FConstVal V; S && FoldConst(*S, V) && !V.bFloat && V.I >= 0 && V.I <= 255) B.Const = V.I;
+            else if (In && Canon(TypeOf(*In)) == "uint8") B.Value = In;
+            return B;
+        };
+        const FByteSide LB = Op == "==" || Op == "!=" ? ByteSide(LhsRaw) : FByteSide(), RB = LB.Value || LB.Const >= 0 ? ByteSide(RhsRaw) : FByteSide();
+        if ((LB.Value || RB.Value) && (RB.Value || RB.Const >= 0) && Canon(TypeOf(*LhsRaw)) != "uint8")
+        {
+            FArgIR L, R;
+            for (auto [Side, A] : { std::pair{ &LB, &L }, std::pair{ &RB, &R } })
+                if (Side->Value) { if (!LowerArg(*Side->Value, BP, *A, Err)) return false; }
+                else { A->K = FArgIR::Byte; A->I = int32(Side->Const); }
+            Out = FArgIR();
+            Out.K = FArgIR::Call;
+            Out.InnerType = "bool";
+            Out.Sub = std::make_shared<FCallIR>();
+            Out.Sub->Fn = BP.EngineFunction("/Script/Engine", "KismetMathLibrary", Op == "==" ? "EqualEqual_ByteByte" : "NotEqual_ByteByte");
+            Out.Sub->bScript = false;
+            Out.Sub->bPure = true;
+            Out.Sub->Args = { std::move(L), std::move(R) };
+            return true;
+        }
         if (Op == "&&" || Op == "||")
         {
             /* Short-circuit: the hoist pass turns this into `T = L; if (T) T = R;` (or `if (!T)`), so R's calls
@@ -8460,7 +8436,7 @@ void NamesRead(const std::vector<FStmtIR>& Stmts, std::set<std::string>& Out, bo
         NamesRead(St.Call, Out);
         if (bStoresRead || !((St.K == FStmtIR::Assign || St.K == FStmtIR::Decl) && St.Var.K == FArgIR::Local)) NamesRead(St.Var, Out);
         for (const FArgIR* A : { &St.Value, &St.Cond, &St.SwitchValue }) NamesRead(*A, Out);
-        for (const FArgIR& A : St.CaseTests) NamesRead(A, Out);
+        for (const FArgIR& A : St.CaseConsts) NamesRead(A, Out);
         for (const auto* L : { &St.Then, &St.Else, &St.Body, &St.Inc, &St.Trailer }) if (*L) NamesRead(**L, Out, bStoresRead);
     }
 }
@@ -8487,7 +8463,7 @@ void EachCall(const std::vector<FStmtIR>& Stmts, const std::function<void(const 
         EachCall(St.Target, Visit);
         EachCall(St.Call, Visit);
         for (const FArgIR* A : { &St.Var, &St.Value, &St.Cond, &St.SwitchValue }) EachCall(*A, Visit);
-        for (const FArgIR& A : St.CaseTests) EachCall(A, Visit);
+        for (const FArgIR& A : St.CaseConsts) EachCall(A, Visit);
         for (const auto* L : { &St.Then, &St.Else, &St.Body, &St.Inc, &St.Trailer }) if (*L) EachCall(**L, Visit);
     }
 }
@@ -8732,7 +8708,7 @@ void FCompiler::CoalesceTemps(std::vector<FStmtIR>& Stmts, std::vector<FProperty
         Call(St.Target, bBodies);
         Call(St.Call, bBodies);
         for (const FArgIR* A : { &St.Var, &St.Value, &St.Cond, &St.SwitchValue }) Arg(*A, bBodies);
-        for (const FArgIR& A : St.CaseTests) Arg(A, bBodies);
+        for (const FArgIR& A : St.CaseConsts) Arg(A, bBodies);
     };
     /* A loop's head (condition, increment, break trailer) is recorded by diffing the span map around its walk. */
     auto Snapshot = [&]() { std::map<std::string, int32> M; for (auto& [N, S] : Spans) M[N] = S.Last; return M; };
@@ -8849,7 +8825,7 @@ void FCompiler::CoalesceTemps(std::vector<FStmtIR>& Stmts, std::vector<FProperty
             RCall(St.Target);
             RCall(St.Call);
             for (FArgIR* A : { &St.Var, &St.Value, &St.Cond, &St.SwitchValue }) RArg(*A);
-            for (FArgIR& A : St.CaseTests) RArg(A);
+            for (FArgIR& A : St.CaseConsts) RArg(A);
             for (auto* L : { &St.Then, &St.Else, &St.Body, &St.Inc, &St.Trailer }) if (*L) RWalk(**L);
             if (IsLocalCopy(St) && St.Var.S == St.Value.S) List.erase(List.begin() + I--);
         }
@@ -9562,7 +9538,7 @@ void FCompiler::WarnFrameWeakLocals(const std::vector<FStmtIR>& Stmts, const std
         LocalsRead(St.Call, Reads);
         LocalsRead(St.Target, Reads);
         for (const FArgIR* A : { &St.Value, &St.Cond, &St.SwitchValue }) LocalsRead(*A, Reads);
-        for (const FArgIR& A : St.CaseTests) LocalsRead(A, Reads);
+        for (const FArgIR& A : St.CaseConsts) LocalsRead(A, Reads);
         if (!bStore) LocalsRead(St.Var, Reads);
         for (const std::string& R : Reads)
             if (Classes.count(R) && S.Bits.count(R) && (S.Bits[R] & Crossed)) Warned.insert(R);
@@ -10269,8 +10245,6 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             if (auto E = bName ? Enums.end() : Enums.find(StripTypeKeywords(TypeOf(*Strip(Cond)))); E != Enums.end())
                 Width = E->second.Underlying == "int32" ? 4 : E->second.Underlying == "int64" ? 8 : 1;
             const std::string TempTy = bName ? "FName" : Width == 1 ? "uint8" : Width == 8 ? "int64" : "int32";
-            const char* NotEqual = bName ? "NotEqual_NameName" : Width == 1 ? "NotEqual_ByteByte"
-                                 : Width == 8 ? "NotEqual_Int64Int64" : "NotEqual_IntInt";
             /* The promoted value of a byte is 0..255 (-128..127 signed): a case outside that never matches, and its
                ByteConst would wrap onto one that does. */
             const std::string ByteTy = Width == 1 ? StripTypeKeywords(TypeOf(*Strip(Cond))) : std::string();
@@ -10341,18 +10315,9 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
                     }
                     else if (Width == 8) { Const.K = FArgIR::Int64; Const.I64 = V; }
                     else { Const.K = FArgIR::Int; Const.I = int32(V); }
-                    FArgIR Value0;
-                    Value0.K = FArgIR::Local;
-                    Value0.S = Temp;
-                    FArgIR Test;
-                    Test.K = FArgIR::Call;
-                    Test.InnerType = "bool";
-                    Test.Sub = std::make_shared<FCallIR>();
-                    Test.Sub->Fn = BP.EngineFunction("/Script/Engine", "KismetMathLibrary", NotEqual);
-                    Test.Sub->Args = { Value0, Const };
-                    L.LabelId = int32(St.CaseTests.size());
-                    St.CaseTests.push_back(std::move(Test));
-                    St.CaseValues.push_back(V);
+                    if (St.CaseConsts.size() == 0xFFFE) { *Err = "a `switch` holds at most 65534 cases (EX_SwitchValue)"; return false; }
+                    L.LabelId = int32(St.CaseConsts.size());
+                    St.CaseConsts.push_back(std::move(Const));
                 }
                 St.Body->push_back(L);
                 return !Sub || Flatten(*Sub);
@@ -10361,16 +10326,9 @@ bool FCompiler::LowerBody(const Json& Body, FBlueprintClass& BP, std::vector<FSt
             --SwitchDepth;
             if (!bOk) return;
             for (FStmtIR& B : *St.Body)
-                if (B.K == FStmtIR::Label && B.LabelId == -2) B.LabelId = St.LabelId = int32(St.CaseTests.size());
-            /* The helpers a dense table needs, imported whether or not the emitter picks the table. ponytail: an
-               unused import is a name-map entry, not a load. */
-            St.SwitchWidth = Width;
+                if (B.K == FStmtIR::Label && B.LabelId == -2) B.LabelId = St.LabelId = int32(St.CaseConsts.size());
             St.SwitchValue.K = FArgIR::Local;
             St.SwitchValue.S = Temp;
-            St.Call.Fn = BP.EngineFunction("/Script/Engine", "KismetMathLibrary", "Conv_ByteToInt");
-            St.Call.Extra = BP.EngineFunction("/Script/Engine", "KismetMathLibrary", "InRange_IntInt");
-            St.Call.Extra2 = BP.EngineFunction("/Script/Engine", "KismetMathLibrary", "Add_IntInt");
-            St.Target.Fn = BP.EngineFunction("/Script/Engine", "KismetMathLibrary", "Multiply_IntInt");
         }
         else if (K == "CXXForRangeStmt")
         {
@@ -10671,7 +10629,7 @@ int32 Mentions(const FStmtIR& St, const std::string& Name)
 {
     int32 N = Mentions(St.Target, Name) + Mentions(St.Call, Name) + Mentions(St.Var, Name);
     for (const FArgIR* A : { &St.Value, &St.Cond, &St.SwitchValue }) N += Mentions(*A, Name);
-    for (const FArgIR& A : St.CaseTests) N += Mentions(A, Name);
+    for (const FArgIR& A : St.CaseConsts) N += Mentions(A, Name);
     for (const auto* L : { &St.Then, &St.Else, &St.Body, &St.Inc, &St.Trailer }) if (*L) N += Mentions(**L, Name);
     return N;
 }
@@ -11677,7 +11635,8 @@ bool FCompiler::IsFinalFunction(const FRecord& A, const std::string& Method) con
 
 /* Every call whose body is known here expands, unless: the function is not a Blueprint function of this mod with a
    body; it or an ancestor's version is an RPC, authority only or cosmetic, or overrides an engine function (the
-   engine's routing must see the call); it is noinline or UE_NO_OPTIMIZE, or the caller is UE_NO_OPTIMIZE; it is
+   engine's routing must see the call); it is noinline or UE_NO_OPTIMIZE, or the caller is UE_NO_OPTIMIZE; it is a
+   function library's static without always_inline; it is
    the function being compiled or expanded already (recursion stays a call); it makes a latent call or an await,
    which would move the caller into the ubergraph, or holds a goto, which turns the caller's optimizer off; it makes
    a qualified call to a parent's function that is not copied in, bound from its own class (CopyableDef); or the
@@ -11710,6 +11669,13 @@ const Json* FCompiler::CopyableDef(const FRecord& In, const std::string& Method)
     if (!Body) return nullptr;
     for (const Json* D : { Decl->second, Def })
         if (HasAttr(*D, "NoInlineAttr") || IsNoOptDecl(*D)) return nullptr;
+    /* A function library's static is a function its callers call, as the editor's library nodes are: it is copied in
+       only when the source asks, with `[[gnu::always_inline]]` (an `inline` one has no function and always expands). */
+    bool bLibrary = false;
+    for (const FRecord* A = &In; A && !bLibrary; A = A->Base.empty() ? nullptr : Find(A->Base))
+        bLibrary = A->UeName == "BlueprintFunctionLibrary";
+    if (bLibrary && IsStaticDecl(*Decl->second) && !HasAttr(*Decl->second, "AlwaysInlineAttr") && !HasAttr(*Def, "AlwaysInlineAttr"))
+        return nullptr;
     for (const FRecord* A = &In; A; A = A->Base.empty() ? nullptr : Find(A->Base))
     {
         auto M = A->Methods.find(Method);
