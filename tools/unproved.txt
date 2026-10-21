@@ -224,7 +224,6 @@ instanced-objects.ue-instanced-6
 instanced-objects.an-object-under-a-game
 objects-and-widgets.newobject-uobject-this-kind
 objects-and-widgets.newobject-aactor-this
-validity-and-comparison.if-obj
 validity-and-comparison.obj-nullptr
 validity-and-comparison.hit-this
 validity-and-comparison.target-target-initiallifespan-0

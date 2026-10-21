@@ -4184,7 +4184,11 @@ bool FCompiler::ConvertArg(const std::string& ToType, FBlueprintClass& BP, FArgI
         Arg.InnerType = "bool";
         return true;
     }
-    if (ToKind == SK_Bool && FromKind == SK_Object)
+    /* A `T *const &` parameter holds an object too: StrKindOf stops at the reference. */
+    std::string HeldPtr = Held;
+    if (HeldPtr.size() >= 5 && HeldPtr.compare(HeldPtr.size() - 5, 5, "const") == 0) HeldPtr.erase(HeldPtr.size() - 5);
+    while (!HeldPtr.empty() && HeldPtr.back() == ' ') HeldPtr.pop_back();
+    if (ToKind == SK_Bool && (FromKind == SK_Object || (FromKind == SK_None && !HeldPtr.empty() && HeldPtr.back() == '*')))
     {
         /* `if (Obj)` tests the object the way a Blueprint does, so a pending-kill object is false too. */
         WrapInCall(Arg, BP.EngineFunction("/Script/Engine", "KismetSystemLibrary", "IsValid"));

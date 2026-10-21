@@ -2266,6 +2266,37 @@ check('InlineTest', 'InPlace', lambda V: V * 3 + 1 + V + 1, [dict(V=v) for v in 
 check('InlineTest', 'ConstThenVar', lambda V: 6 + V * 2 + clamp(V, 0, 5) + clamp(2, V, 9) + 4 + V - 1, [dict(V=v) for v in (-3, 0, 4, 12)])
 
 
+# ---- FMathTest
+
+def fmath_nodes():
+    """FMath.h: each spelling is the math node of its argument type, and gives that node's value."""
+    import math
+    check('FMathTest', 'MaxInt', lambda A, B: max(A, B), [dict(A=a, B=b) for a, b in ((1, 2), (-5, -9), (7, 7))])
+    check('FMathTest', 'MaxFloat', lambda A, B: max(A, B), [dict(A=a, B=b) for a, b in ((1.5, 2.0), (-0.25, -4.0))])
+    check('FMathTest', 'ClampAbs', lambda V: clamp(V, 0, 10) + abs(V - 3), [dict(V=v) for v in (-4, 0, 3, 12)])
+    check('FMathTest', 'FloatMix', lambda A, B: min(abs(A), B) + clamp(A, -1.0, 1.0) + math.fmod(A, 2.0),
+          [dict(A=a, B=b) for a, b in ((-3.5, 1.0), (0.5, 4.0), (2.0, 0.25))])
+    for fn, parms, nodes in (('MaxInt', dict(A=1, B=2), {'Max'}), ('MaxFloat', dict(A=1.0, B=2.0), {'FMax'}),
+                             ('ClampAbs', dict(V=1), {'Clamp', 'Abs_Int'}),
+                             ('FloatMix', dict(A=1.0, B=2.0), {'FMin', 'Abs', 'FClamp', 'Percent_FloatFloat'})):
+        del runscript.CALLS[:]
+        run(asset('FMathTest'), fn, **parms)
+        called = {c[0] for c in runscript.CALLS}
+        assert nodes <= called, (fn, nodes, called)
+    print('ok  FMathTest: each FMath spelling calls its node')
+
+
+proves('math-and-utility.fmath-h')
+fmath_nodes()
+
+
+# ---- RefObjBool
+
+proves('validity-and-comparison.if-obj')
+check('RefObjBool', 'Tested', lambda A: 1 if A else 2, [dict(A='Obj'), dict(A=None)])
+check('RefObjBool', 'Negated', lambda A: 4 if A else 3, [dict(A='Obj'), dict(A=None)])
+
+
 def inline_members():
     """Side effects through an inline body land on self, once per expansion, whatever Counter started at."""
     for v in (0, 2, -4, 2**30):

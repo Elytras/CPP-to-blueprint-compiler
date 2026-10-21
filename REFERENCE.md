@@ -2440,7 +2440,8 @@ Notes:
 | <a id="math-and-utility.ukismetmathlibrary-clamp-v-0-10"></a>`UKismetMathLibrary::Clamp(V, 0, 10)` | Math is the engine's Blueprint math library, the functions behind the editor's math nodes: Clamp, FClamp, Min, FMin, FMax, Abs, Sqrt, Sin, Cos, Lerp, FInterpTo, RandomInteger, RandomFloatInRange and the rest of `UKismetMathLibrary` in `UeApi/Engine.h`. Each call is a direct library call. | Yes |
 | <a id="math-and-utility.a-b"></a>`A + B`, `A < B`, `Dir * 2.0f` | Operators on numbers and vectors need no written call: they become the math library's operator functions; see [Operators](#operators). | Yes |
 | <a id="math-and-utility.s-x"></a>`S == "x"` on an FString | Ignores case, as FString's `==` does in UE C++; see [Strings and text](#strings-and-text). | Yes |
-| <a id="math-and-utility.fmath-clamp-v-0-10"></a>`FMath::Clamp(V, 0, 10)` | clang error `use of undeclared identifier 'FMath'`: FMath is not part of the reflected API, so UeApi does not declare it. Use UKismetMathLibrary. | Refused |
+| <a id="math-and-utility.fmath-h"></a>`FMath::Clamp(V, 0, 10)`, `FMath::Max(A, B)`, `FMath::Abs(X)` with `#include "../include/FMath.h"` | UE C++'s spellings from `AssetGen/include/FMath.h`. Each is an inline function whose body is the math node for its argument type: `FMath::Max` is Max for int32, MaxInt64 for int64 and FMax for float, as UE's template picks the arithmetic. Two arguments of different types are ambiguous, as they are a deduction error in UE. The header has Max, Min, Clamp, Abs, Sign, Square, Sqrt, Pow, Exp, Loge, Fmod (Percent_FloatFloat), Frac, FloorToInt, CeilToInt, RoundToInt, TruncToInt, the trigonometry, DegreesToRadians, RadiansToDegrees, Lerp, IsNearlyEqual, RandRange, FRandRange, FRand and RandHelper. | Yes |
+| <a id="math-and-utility.fmath-clamp-v-0-10"></a>`FMath::Clamp(V, 0, 10)` without FMath.h | clang error `use of undeclared identifier 'FMath'`: the engine's FMath is not part of the reflected API, so UeApi does not declare it. | Refused |
 | <a id="math-and-utility.std-min-a-b"></a>`std::min(A, B)`, `std::sqrt(X)`, `__builtin_sqrtf(X)` | Refused, even with `#include <algorithm>` or `<cmath>` (`call to an unknown function`): a mod has no C++ standard library to call into. Use UKismetMathLibrary, or write the helper as an inline function. | Refused |
 | <a id="math-and-utility.if-constexpr-is-same-t"></a>`if constexpr (__is_same(T, int32))`, `static_assert(__is_same(int32, int))` | clang's type-trait builtins work in place of `<type_traits>` where clang decides them at build time. | Yes |
 | <a id="math-and-utility.bool-b-is-same-a"></a>`bool B = __is_same(A, B);`, `if (__is_same(A, B))`, `return __is_same(A, B) ? 1 : 0;` | The constant true or false, compared through aliases and typedefs as clang compares types: `__is_same(int32, int)` is true. | Yes |
@@ -6376,8 +6377,9 @@ and where the feature is described. In each group, the messages you are most lik
   built, use `consteval`. See [Inline functions and templates](#inline-functions-and-templates) and
   [Calling engine and game functions](#calling-engine-and-game-functions).
 - `use of undeclared identifier 'FMath'`: clang's message. UE's native FMath is not part of the reflected API, and a
-  mod has no C++ standard library to call. Fix: call UKismetMathLibrary, as in
-  `UKismetMathLibrary::Clamp(V, 0, 10)`. See [Calling engine and game functions](#calling-engine-and-game-functions).
+  mod has no C++ standard library to call. Fix: include `AssetGen/include/FMath.h`, whose FMath functions are the
+  math nodes, or call UKismetMathLibrary, as in `UKismetMathLibrary::Clamp(V, 0, 10)`. See
+  [Calling engine and game functions](#calling-engine-and-game-functions).
 - `only virtual member functions can be marked 'override'`: clang's message, for `override` on an event override,
   `void ReceiveTick(float DeltaSeconds) override`. UeApi declares engine functions non-virtual. Fix: leave `override`
   off. The name alone makes the override. See [Overrides and parent calls](#overrides-and-parent-calls).
