@@ -434,7 +434,8 @@ Watch for:
   [Multiplayer](#multiplayer)).
 - A pure function whose result you do not use is removed, and clang warns
   `ignoring return value of function declared with pure attribute`. An array the engine fills must have the
-  parameter's exact type: `TArray<AActor *>`, not `TArray<APlayerCharacter *>`.
+  parameter's exact type: `TArray<AActor *>`, not `TArray<APlayerCharacter *>`. An array it only reads, a
+  `const TArray<AActor *>&`, takes a `TArray<APlayerCharacter *>`.
 
 Full rules: [Calling engine and game functions](REFERENCE.md#calling-engine-and-game-functions),
 [Working with other objects](REFERENCE.md#working-with-other-objects). Examples:
@@ -783,6 +784,10 @@ default for a missing key, and nothing is added. `Map[Key] = V`, `+=` and `++` s
 with `auto& [Key, Value]` walks the map where it lives, so a write to `Value` changes the map. A range-for over a
 call, `for (int32 X : GetItems())`, runs the call once and walks its result. A container inside a
 container works through a generated wrapper struct ([Containers](REFERENCE.md#containers) says where it is cooked).
+A container of objects passes where one of a base class is wanted, as the editor links an Actor array pin to an Object
+array one: a `TArray<APawn *>` for a `const TArray<AActor *>&` or by-value parameter, or assigned to a
+`TArray<UObject *>`. It works the same for a `TSet`, and for a `TMap` whose key and value are each the same type or an
+upcast. Interfaces, downcasts and other element types are refused, and so is a non-const `TArray<AActor *>&`.
 
 ```cpp
 enum class ERank : uint8 { Rookie, Veteran, Legend };

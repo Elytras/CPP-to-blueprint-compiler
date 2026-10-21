@@ -8042,6 +8042,64 @@ print("ok  OutArrayReset: a native's out TArray is emptied just before the call 
       "call found")
 set_to_array_append()
 print('ok  SetToArrayAppend: ToArray and a set range-for empty the array Set_ToArray appends to')
+
+
+def covariant_containers():
+    """CovariantContainers: an array, set or map of objects passes where one of a base class is wanted, the same
+    pointers. Clang refuses the rest, naming both types: an interface element (as a pointer or a TScriptInterface), a
+    downcast, an unrelated class, a scalar of another type, a map whose value is a downcast, and a non-const reference,
+    through which a UObject could be written into the Actor array."""
+    base = asset('CovariantContainers')
+    keeps_invariants(base)
+    proves('container-variables.tarray-uobject-all-actors')
+    a, b, p = Obj('Actor'), Obj('Actor'), Obj('Pawn')
+    avg = lambda vm, ctx, arr: {'X': float(len(arr)), 'Y': 0.0, 'Z': 0.0}
+
+    def fresh(**more):
+        return VM(base, natives={'GetActorArrayAverageLocation': avg}, Actors=[a, b], Pawns=[p], ActorSet=[a],
+                  ByName={'x': a, 'y': b, 'z': p}, Scores={a: 1, b: 2}, Owners={a: p}, Objs=[a, b, p], **more)
+    assert fresh().call('Calls') == 2 + 10 * 1 + 100 * 2 + 1000 * 3 + 10000 * 1
+    assert fresh().call('TwoSteps') == 1 and fresh().call('Element') is a
+    vm = fresh()
+    assert vm.call('Copied') == 2 and vm.self.vars['Actors'] == [], 'Snapshot saw the emptied source, not a copy'
+    assert fresh().call('Locals') == 2 + 10 * 1 + 100 * 2
+    assert fresh().call('Returned') == [a, b] and fresh().call('FromCall') == 1
+    # runscript: runvm's VM loses a write through a mod function's non-const TArray& (same-type too); runscript keeps it
+    assert run(base, 'Filled', self_vars={'Pawns': [7]})[0] == 1
+    assert (fresh().call('Either', bActors=True), fresh().call('Either', bActors=False)) == (2, 3)
+    assert fresh().call('Engine') == {'X': 1.0, 'Y': 0.0, 'Z': 0.0}
+    vm = fresh()
+    vm.call('Stores')
+    got = vm.self.vars
+    assert (got['Objs'], got['ObjSet'], got['ObjByName'], got['ObjOwners']) == ([a, b], [a], {'x': a, 'y': b, 'z': p}, {a: p}), got
+    assert list(got['Holder'].values()) == [[p]], got['Holder']
+    iface = 'class IScorable {\npublic:\n  UE_INTERFACE;\n  int32 Points();\n};\n' \
+            'class Nugget : public AActor, public IScorable {\npublic:\n  int32 Points() { return 5; }\n};\n'
+    proves('container-variables.tarray-iscorable', 'container-variables.fill-actors')
+    for mod, body, pattern in (
+            ('CovIfacePtr', 'TArray<Nugget *> Ns;\n  int32 N(const TArray<IScorable *> &A) { return A.Num(); }\n'
+                            '  int32 F() { return N(Ns); }', r"'TArray<Nugget \*>' to 'const TArray<IScorable \*>'"),
+            ('CovIface', 'TArray<Nugget *> Ns;\n  int32 N(const TArray<TScriptInterface<IScorable>> &A) { return A.Num(); }\n'
+                         '  int32 F() { return N(Ns); }', r"'TArray<Nugget \*>' to 'const TArray<TScriptInterface<IScorable>>'"),
+            ('CovDown', 'TArray<UObject *> Os;\n  int32 N(const TArray<AActor *> &A) { return A.Num(); }\n'
+                        '  int32 F() { return N(Os); }', r"'TArray<UObject \*>' to 'const TArray<AActor \*>'"),
+            ('CovSetDown', 'TSet<UObject *> S;\n  void F() { TSet<AActor *> T = S; }', r"'TSet<UObject \*>' to 'TSet<AActor \*>'"),
+            ('CovUnrelated', 'TArray<AActor *> As;\n  int32 N(TArray<UActorComponent *> A) { return A.Num(); }\n'
+                             '  int32 F() { return N(As); }', r"'TArray<AActor \*>' to 'TArray<UActorComponent \*>'"),
+            ('CovScalar', 'TArray<int32> Is;\n  int32 N(const TArray<int64> &A) { return A.Num(); }\n'
+                          '  int32 F() { return N(Is); }', r"'TArray<int32>' to 'const TArray<int64>'"),
+            ('CovMapDown', 'TMap<FName, UObject *> M;\n  int32 N(const TMap<FName, AActor *> &A) { return A.Num(); }\n'
+                           '  int32 F() { return N(M); }', r"'TMap<\[\.\.\.\], UObject \*>' to 'const TMap<\[\.\.\.\], AActor \*>'"),
+            ('CovMutRef', 'TArray<AActor *> As;\n  void N(TArray<UObject *> &A) { A.Clear(); }\n  void F() { N(As); }',
+             r"non-const lvalue reference to type 'TArray<UObject \*>' cannot bind to a value of unrelated type "
+             r"'TArray<AActor \*>'")):
+        refused_naming(mod, '  %s\n' % body, pattern, top=iface)
+
+
+covariant_containers()
+print('ok  CovariantContainers: TArray / TSet / TMap of objects pass where a base class\'s is wanted (parameters, '
+      'members, locals, a struct member, returns, an engine parameter); interfaces, downcasts, unrelated and scalar '
+      'types and a non-const reference are refused  (8 refusals)')
 set_operators()
 print('ok  SetOperators: set + - & are Set_Union / Set_Difference / Set_Intersection, chained and in a loop')
 no_world_warning()
