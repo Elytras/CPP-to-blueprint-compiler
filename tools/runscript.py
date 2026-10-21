@@ -74,7 +74,7 @@ class P(W):
             if n.val == 1: k.extend(s.node() for _ in range(3))
             elif n.val in (2, 3): k.append(s.node())
             elif n.val != 0: raise SystemExit('unsupported text literal type %d at mem %d' % (n.val, mem))
-        elif op in (0x19, 0x1A): k.append(s.node()); s.i32(); s.fieldpath(); k.append(s.node())
+        elif op in (0x12, 0x19, 0x1A): k.append(s.node()); s.i32(); s.fieldpath(); k.append(s.node())
         elif op == 0xF: s.fieldpath(); k.append(s.node()); k.append(s.node())
         elif op in (0x14, 0x5F, 0x6B): k.append(s.node()); k.append(s.node())
         elif op in (0x1B, 0x45): n.val = s.name(); s.args(k)

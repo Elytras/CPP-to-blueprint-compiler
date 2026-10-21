@@ -876,15 +876,6 @@ def write_mod(run, mod, outs, out_dir):
     for h in sorted(used | run.extra_includes.get(mod.name, set())): lines.append('#include "../UeApi/%s"\n' % h)
     for n in run.mod_needs.get(mod.name, ()): lines.append('#include "../%s/%s.h"     // another mod\n' % (n, n))
     lines.append('\n')
-    if getattr(run, 'class_defaults_used', False):
-        lines.append('// The Get Class Defaults node, which AssetGen does not compile yet (EX_ClassContext): the class default object,\n'
-                     '// found by its path, /Game/A/B.B_C -> /Game/A/B.Default__B_C. bpdecomp writes it.\n'
-                     '#ifndef BPDECOMP_CLASS_DEFAULTS\n#define BPDECOMP_CLASS_DEFAULTS\n'
-                     'inline UObject* ClassDefaults(UClass* Class) {\n'
-                     '    return UKismetSystemLibrary::LoadAsset_Blocking(UKismetSystemLibrary::Conv_SoftObjPathToSoftObjRef(\n'
-                     '        UKismetSystemLibrary::MakeSoftObjectPath(UKismetStringLibrary::Replace(\n'
-                     '            UKismetSystemLibrary::GetPathName(Class), ".", ".Default__", ESearchCase::CaseSensitive))));\n'
-                     '}\n#endif\n\n')
     for ns, items in sorted(fwd.items()):
         lines.append('%s%s\n%s' % (ns_open(list(ns)), '\n'.join(items), ns_close(list(ns))))
     lines.append('\n#include "Assets.h"\n\n')

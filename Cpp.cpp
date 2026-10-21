@@ -1061,7 +1061,7 @@ struct FCallIR;
 struct FArgIR
 {
     enum EKind { Self, Int, Int64, Float, Bool, Byte, Str, Name, Text, Field, Local, LocalOut, Member, Call, NullObj, StructLit,
-                 ObjConst, SoftPath, DynCast, Index, Delegate, InterfaceCtx, LatentInfo } K = Self;
+                 ObjConst, SoftPath, DynCast, Index, Delegate, InterfaceCtx, ClassCtx, LatentInfo } K = Self;
     int32 I = 0;            // Int / Byte: the value; StructLit: the struct's size
     int64 I64 = 0;
     double F = 0.0;         // Float: a Blueprint real, a double on UE5 (S40) and rounded to float when written for 4.27
@@ -1077,7 +1077,8 @@ struct FArgIR
     std::string InnerType;          // clang type of the expression this was lowered from
     std::shared_ptr<FCallIR> Sub;   // Call: the call; StructLit: Args holds one value per reflected field, in order
     std::shared_ptr<FArgIR> Base;   // Member: the struct-valued expression; Index: the array variable (Sub->Args[0] is the index);
-                                    // Field: the object, when not self; InterfaceCtx: the interface value
+                                    // Field: the object, when not self; InterfaceCtx: the interface value;
+                                    // ClassCtx: the class whose default object it is
     const FRecord* Class = nullptr; // ObjConst of `X::StaticClass()`: X, for what a spawn or construct is asked to make
 };
 
@@ -1253,10 +1254,27 @@ bool EmitArg(FScript& S, const FArgIR& A, FIndex SelfExp, std::string* Err);
 
 /* A value stored into Dest: a call on another object names Dest as its context's r-value, as the editor's does
    (KismetCompilerVMBackend.cpp 1241-1244), so a None object leaves Dest cleared, not holding its old value. */
+/* A class's default object itself (FArgIR::ClassCtx): EX_Self run inside EX_ClassContext, which steps it with the
+   default object as the context, so it writes that object (execSelf, ScriptCore.cpp 2846-2863). RValue as for EmitCall:
+   a None class clears it. */
+bool EmitClassDefault(FScript& S, const FArgIR& A, FIndex SelfExp, std::string* Err,
+                      const std::optional<FFieldRef>& RValue = std::nullopt)
+{
+    if (!A.Base) { if (Err) *Err = "internal: ClassCtx arg has no class"; return false; }
+    bool bOk = true;
+    std::string SubErr;
+    S.Context([&](FScript& O) { bOk = EmitArg(O, *A.Base, SelfExp, &SubErr); }, [](FScript& C) { C.Self(); },
+              RValue, EX_ClassContext);
+    if (!bOk && Err) *Err = SubErr;
+    return bOk;
+}
+
 void EmitValueInto(FScript& S, const FArgIR& Value, FIndex SelfExp, const std::optional<FFieldRef>& Dest)
 {
     if (Value.K == FArgIR::Call && Value.Sub && Value.Sub->Intrinsic.empty() && (Value.Sub->Target || Value.Sub->Context.V))
         EmitCall(S, *Value.Sub, SelfExp, nullptr, Dest);
+    else if (Value.K == FArgIR::ClassCtx)
+        EmitClassDefault(S, Value, SelfExp, nullptr, Dest);
     else
         EmitArg(S, Value, SelfExp, nullptr);
 }
@@ -1365,6 +1383,7 @@ bool EmitArg(FScript& S, const FArgIR& A, FIndex SelfExp, std::string* Err)
         if (!bOk && Err) *Err = SubErr;
         return bOk;
     }
+    case FArgIR::ClassCtx: return EmitClassDefault(S, A, SelfExp, Err);
     case FArgIR::StructLit:
     {
         if (!A.Sub) { if (Err) *Err = "internal: StructLit arg has no members"; return false; }
@@ -1397,11 +1416,14 @@ bool EmitArg(FScript& S, const FArgIR& A, FIndex SelfExp, std::string* Err)
     case FArgIR::Field:
     {
         if (!A.Base) { S.InstanceVariable(A.S, A.Owner); return true; }
-        /* Another object's property: the rvalue names it, so a null object reads as zero. */
+        /* Another object's property: the rvalue names it, so a null object reads as zero. A class default object's is
+           read in EX_ClassContext of its class, as the editor's Get Class Defaults node reads it. */
         bool bOk = true;
         std::string SubErr;
-        S.Context([&](FScript& O) { bOk = EmitArg(O, *A.Base, SelfExp, &SubErr); },
-                  [&](FScript& C) { C.InstanceVariable(A.S, A.Owner); }, FFieldRef{ A.S, A.Owner });
+        const FArgIR& Obj = A.Base->K == FArgIR::ClassCtx && A.Base->Base ? *A.Base->Base : *A.Base;
+        S.Context([&](FScript& O) { bOk = EmitArg(O, Obj, SelfExp, &SubErr); },
+                  [&](FScript& C) { C.InstanceVariable(A.S, A.Owner); }, FFieldRef{ A.S, A.Owner },
+                  &Obj == A.Base.get() ? EX_Context : EX_ClassContext);
         if (!bOk && Err) *Err = SubErr;
         return bOk;
     }
@@ -1613,14 +1635,20 @@ bool EmitCall(FScript& S, const FCallIR& Call, FIndex SelfExp, std::string* Err,
     {
         bool bOk = true;
         std::string SubErr;
+        const bool bOnDefaults = Call.Target && Call.Target->K == FArgIR::ClassCtx && Call.Target->Base;
         S.Context(
-            [&](FScript& O) { if (Call.Target) EmitArg(O, *Call.Target, SelfExp, &SubErr); else O.ObjectConst(Call.Context); },
+            [&](FScript& O)
+            {
+                if (bOnDefaults) EmitArg(O, *Call.Target->Base, SelfExp, &SubErr);
+                else if (Call.Target) EmitArg(O, *Call.Target, SelfExp, &SubErr);
+                else O.ObjectConst(Call.Context);
+            },
             [&](FScript& C)
             {
                 EmitCallOp(C, Call);
                 bOk = EmitArgs(C, Call.Args, SelfExp, &SubErr);
                 C.EndFunctionParms();
-            }, RValue);
+            }, RValue, bOnDefaults ? EX_ClassContext : EX_Context);
         if (!bOk && Err) *Err = SubErr;
         return bOk;
     }
@@ -2129,6 +2157,7 @@ private:
     const FRecord* NamedQualifier(const Json& Ref) const;
     /* The class a StaticClass call names, Callee its DeclRefExpr and Slot the type it fills; null when unknown. */
     const FRecord* StaticClassOf(const Json& Callee, const std::string& Slot) const;
+    const FRecord* HeldClassOf(const Json& ClassExpr) const;
     const FRecord* TemplateParamOf(const Json& Callee) const;
     FIndex StructObjectOf(const FRecord& R, FBlueprintClass& BP) const;
     /* `Base::Method()` on this: the record the qualifier names, read back the same way, else null. */
@@ -6640,6 +6669,28 @@ bool FCompiler::LowerArgRaw(const Json& Node, const std::string& OuterType, FBlu
             }
             return true;
         }
+        if (CalleeName == "GetDefault" || CalleeName == "GetMutableDefault")
+        {
+            /* `GetDefault<T>(Class)`: Class's default object (see EmitArg's ClassCtx). EX_ClassContext reads it as a T
+               with no cast, so Class must hold a T: a property read off another class's object reads foreign memory. */
+            std::string Target = StripTypeKeywords(TypeOf(*N));
+            while (!Target.empty() && (Target.back() == '*' || Target.back() == ' ')) Target.pop_back();
+            const FRecord* R = Find(Target);
+            const Json* ClassArg = Nth(*N, 1);
+            if (!R || R->bIsStruct || !ClassArg) { *Err = CalleeName + "<> of an unknown class: " + Target; return false; }
+            const FRecord* Held = HeldClassOf(*ClassArg);
+            if (R->CppName != "UObject" && (!Held || (Held != R && !IsSubclassOf(*Held, *R))))
+            {
+                *Err = CalleeName + "<" + LeafOf(R->CppName) + ">(Class) reads Class's default object as a " + LeafOf(R->CppName)
+                     + ", and Class may hold " + (Held ? LeafOf(Held->CppName) + ", which is not one" : std::string("any class"))
+                     + ": pass a TSubclassOf<" + LeafOf(R->CppName) + ">";
+                return false;
+            }
+            Out.K = FArgIR::ClassCtx;
+            Out.InnerType = R->CppName + " *";
+            Out.Base = std::make_shared<FArgIR>();
+            return LowerArg(*ClassArg, BP, *Out.Base, Err);
+        }
         if (CalleeName == "__ClassOf__")
         {
             /* `__ClassOf__(x)` lowers to Cur::GetParmClassName(<this function>, FName("x")); x is never
@@ -7340,6 +7391,27 @@ const FRecord* FCompiler::StaticClassOf(const Json& Callee, const std::string& S
     else if (TemplateArg(StripTypeKeywords(Slot), "TSubclassOf", &Arg))
         if (const FRecord* S = Find(StripTypeKeywords(Arg)); S && R && S != R && IsSubclassOf(*S, *R)) R = S;
     return R;
+}
+
+/* The class a class value is known to hold at least: a TSubclassOf<X>'s X (seen through its conversion to UClass *, and
+   an explicit `TSubclassOf<X>(Raw)` is the writer's word for it), or X for `X::StaticClass()`. Null for a bare UClass *. */
+const FRecord* FCompiler::HeldClassOf(const Json& ClassExpr) const
+{
+    const Json* E = &ClassExpr;
+    for (const Json* Next = E; Next; )
+    {
+        E = Next;
+        if (std::string Of; TemplateArg(StripTypeKeywords(TypeOf(*E)), "TSubclassOf", &Of)) return Find(StripTypeKeywords(Of));
+        /* One wrapper at a time (Strip's), so a TSubclassOf anywhere in the chain is seen. */
+        const Json* M = Kind(*E) == "CXXMemberCallExpr" ? Strip(First(*E)) : nullptr;
+        Next = M && Kind(*M) == "MemberExpr" && Name(*M).rfind("operator ", 0) == 0 ? First(*M) : Strip(E) != E ? First(*E) : nullptr;
+    }
+    const Json* Callee = Kind(*E) == "CallExpr" ? Strip(First(*E)) : nullptr;
+    if (Callee && Kind(*Callee) == "DeclRefExpr"
+        && ((*Callee)["referencedDecl"].value("name", std::string()) == "StaticClass"
+            || (*Callee)["referencedDecl"].value("name", std::string()) == "StaticClassOf"))
+        return StaticClassOf(*Callee, std::string());
+    return nullptr;
 }
 
 /* A MemberExpr on an implicit this begins at its qualifier when it has one and at the member's own name when not
@@ -13383,7 +13455,7 @@ bool FCompiler::HoistReadsInArg(FArgIR& A, FBlueprintClass& BP,
        base leaves behind. A call leaves none, and a native one writes its return value through that null. */
     if (A.K == FArgIR::Member && A.Base)
         return HoistReadsInArg(*A.Base, BP, Locals, OutPre, Err) && HoistOperand(*A.Base, BP, Locals, OutPre, Err);
-    if ((A.K == FArgIR::Field || A.K == FArgIR::InterfaceCtx) && A.Base)
+    if ((A.K == FArgIR::Field || A.K == FArgIR::InterfaceCtx || A.K == FArgIR::ClassCtx) && A.Base)
         return HoistReadsInArg(*A.Base, BP, Locals, OutPre, Err);
     if (A.K == FArgIR::Index && A.Base && A.Sub && A.Sub->Args.size() == 1)
     {
@@ -13714,7 +13786,8 @@ bool FCompiler::SplitWideWrite(FStmtIR& St, FBlueprintClass& BP, std::vector<FPr
 
 bool ContainsRead(const FArgIR& A)
 {
-    if ((A.K == FArgIR::Member || A.K == FArgIR::Field || A.K == FArgIR::InterfaceCtx) && A.Base) return ContainsRead(*A.Base);
+    if ((A.K == FArgIR::Member || A.K == FArgIR::Field || A.K == FArgIR::InterfaceCtx || A.K == FArgIR::ClassCtx) && A.Base)
+        return ContainsRead(*A.Base);
     if (A.K == FArgIR::Index && A.Base && A.Sub && A.Sub->Args.size() == 1)
         return ContainsRead(*A.Base) || ContainsRead(A.Sub->Args[0]);
     if (A.K == FArgIR::DynCast && A.Sub) return ContainsRead(A.Sub->Args[0]);
@@ -13735,7 +13808,7 @@ bool FCompiler::PinObject(FArgIR& Obj, const FArgIR* After, size_t NumAfter, FBl
                           std::vector<FPropertyDef>& Locals, std::vector<FStmtIR>& OutPre, std::string* Err)
 {
     if (std::none_of(After, After + NumAfter, [](const FArgIR& A) { return ContainsRead(A); })) return true;
-    if (Obj.K == FArgIR::InterfaceCtx && Obj.Base) return PinObject(*Obj.Base, After, NumAfter, BP, Locals, OutPre, Err);
+    if ((Obj.K == FArgIR::InterfaceCtx || Obj.K == FArgIR::ClassCtx) && Obj.Base) return PinObject(*Obj.Base, After, NumAfter, BP, Locals, OutPre, Err);
     if (Obj.K == FArgIR::Self || Obj.K == FArgIR::ObjConst || Obj.K == FArgIR::NullObj) return true;
     if (Obj.K == FArgIR::Local && std::none_of(After, After + NumAfter, [&](const FArgIR& A) { return Mentions(A, Obj.S) > 0; }))
         return true;

@@ -7908,6 +7908,44 @@ def ctx_null_call():
     vmsem_holds(base, 'context_rvalue')
 
 
+def class_ctx():
+    """GetDefault<T>(Class): a member read and a call on a class's default object run in EX_ClassContext(Class), which
+    steps them with that object as the context (execClassContext, ScriptCore.cpp 2209-2256), and the object itself is
+    EX_Self run there, which writes P_THIS (execSelf, 2846-2863). A None class clears the destination, as EX_Context's
+    r-value does. Class must be known to hold a T: a bare UClass * is refused unless T is UObject."""
+    base = asset('ClassCtx')
+    vm = VM(base, Score=1, Calls=0, Seen=3, Kind=None, Held=None)
+    own = vm.objects['Default__ClassCtx_C'] = Obj('ClassCtx_C', Score=5, Calls=0)
+    kid = vm.objects['Default__Kid_C'] = Obj('Kid_C', Score=9)
+    proves('properties-of-other.getdefault-amyenemy-kind-health')
+    assert (vm.call('ScoreOf', 'ClassCtx_C'), vm.call('ScoreOf', 'Kid_C'), vm.call('OwnScore'), vm.call('RawScore', 'Kid_C'))         == (5, 9, 5, 9)
+    vm.self.vars['Kind'] = 'Kid_C'
+    vm.call('Remember')
+    assert vm.self.vars['Seen'] == 9, vm.self.vars
+    assert (vm.call('BumpDefaults', 'ClassCtx_C'), vm.call('BumpDefaults', 'ClassCtx_C')) == (1, 2), own.vars
+    assert own.vars['Calls'] == 2 and vm.self.vars['Calls'] == 0, (own.vars, vm.self.vars)
+    proves('properties-of-other.uobject-defaults')
+    assert vm.call('DefaultsOf', 'Kid_C') is kid
+    vm.call('Hold')
+    assert vm.self.vars['Held'] is kid, vm.self.vars
+    vm.null_rvalues = True
+    vm.self.vars['Kind'] = None
+    vm.call('Remember')
+    vm.call('Hold')
+    assert (vm.self.vars['Seen'], vm.self.vars['Held']) == (0, None), vm.self.vars
+    assert (vm.call('ScoreOf', None), vm.call('DefaultsOf', None)) == (0, None)
+    assert len(vm.accessed_none) == 4, vm.accessed_none
+    vmsem_holds(base, *(set(vmsem_rules.VMSEM_RULES) - set(KNOWN_RULES)))
+    refused('CcRaw', '  int32 Hp = 3;
+  int32 Of(UClass *C) { return GetDefault<CcRaw>(C)->Hp; }
+',
+            'GetDefault<CcRaw>(Class) reads Class's default object as a CcRaw, and Class may hold any class')
+    refused('CcWide', '  int32 Hp = 3;
+  int32 Of(TSubclassOf<AActor> C) { return GetDefault<CcWide>(C)->Hp; }
+',
+            'and Class may hold AActor, which is not one')
+
+
 def drop_result():
     """A call whose FString / TArray result a statement throws away needs a local to land in: the statement buffer is
     64 raw bytes nothing constructs or destroys (ScriptCore.cpp 1058, 1120). The calls still run, each once."""
@@ -8032,6 +8070,9 @@ def derived_literal(fn, struct):
 
 ctx_null_call()
 print('ok  CtxNullCall: a call through a None object zeroes its Let destination (the context names its r-value)')
+class_ctx()
+print("ok  ClassCtx: GetDefault<T>(Class) reads and calls in EX_ClassContext, its object is EX_Self there; a None class "
+      "reads zero; a class not known to hold a T is refused")
 
 CTX_STRUCT_ARG_SRC = EDIT_HEAD + '''UE_MOD_PACKAGE("/Game/_ElytrasMods/CtxStructArg");
 class CtxStructArg final : public AActor {
