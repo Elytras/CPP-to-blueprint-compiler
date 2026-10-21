@@ -1699,9 +1699,10 @@ void FBlueprintClass::FinishCurve(FIndex Class, FIndex ClassCdo, const FTimeline
 /* Measured on DRG's ENU_TextCase: the tags (the editor's DisplayNameMap), no GUID, then UEnum::Names as
    (FName, int64) pairs ending in the _MAX entry, then CppForm 1 (Namespaced). Nothing outside WITH_EDITOR
    reads the names' shape, so they are the C++ ones rather than the editor's NewEnumeratorN.
-   No DisplayNameMap unless an enumerator is cooked under another name (`__UeEnumNames`): UEnum::GetDisplayNameTextByIndex
-   then falls back to the enumerator's own name. With one, each renamed enumerator's display name is its C++ name, the
-   map's text as the editor writes it (no flags, a Base history: empty namespace, a 32-hex key, the string). */
+   No DisplayNameMap unless an enumerator is cooked under another name or given a display name (`__UeEnumNames`):
+   UEnum::GetDisplayNameTextByIndex then falls back to the enumerator's own name. With one, each renamed or labelled
+   enumerator's display name is its label, else its C++ name, the map's text as the editor writes it (no flags, a Base
+   history: empty namespace, a 32-hex key, the string). */
 void FBlueprintClass::FinishEnum(const std::vector<std::pair<std::string, int64>>& Enumerators,
                                  const std::vector<std::pair<std::string, std::string>>& DisplayNames)
 {

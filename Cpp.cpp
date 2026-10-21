@@ -16101,12 +16101,13 @@ bool FCompiler::GenerateEnum(const std::string& Enum, const std::string& OutDir,
     FBlueprintClass BP(P, Name, "", "", false);
     if (ApiDir && !BP.WriteApiEnum(*ApiDir, ModEnums[Enum], Err)) return false;
     std::vector<std::pair<std::string, int64>> Cooked;
-    std::vector<std::pair<std::string, std::string>> Display;     // cooked name -> display name, for a renamed one
+    std::vector<std::pair<std::string, std::string>> Display;     // cooked name -> display name, for a renamed or labelled one
     for (const auto& [Cpp, Value] : ModEnums[Enum])
     {
         Cooked.push_back({ Enums[Enum].UeEntry(Cpp), Value });
         const auto Shown = Enums[Enum].UeDisplay.find(Cpp);
-        if (Cooked.back().first != Cpp) Display.push_back({ Cooked.back().first, Shown != Enums[Enum].UeDisplay.end() ? Shown->second : Cpp });
+        if (Cooked.back().first != Cpp || Shown != Enums[Enum].UeDisplay.end())
+            Display.push_back({ Cooked.back().first, Shown != Enums[Enum].UeDisplay.end() ? Shown->second : Cpp });
     }
     BP.FinishEnum(Cooked, Display);
     if (!SavePackage(P, OutDir, PackageName, Err)) return false;
